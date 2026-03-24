@@ -232,11 +232,12 @@ pub trait PduHint: Send + Sync {
 - [x] `ReadCursor<'a>` -- zero-copy 바이트 읽기 커서
 - [x] `WriteCursor<'a>` -- 바이트 쓰기 커서
 - [x] `WriteBuf` -- 동적 크기 쓰기 버퍼
-- [x] `Encode` trait + derive 헬퍼
+- [x] `Encode` trait
+- [ ] `Encode` derive 매크로 (수동 구현으로 충분한 동안 보류)
 - [x] `Decode<'de>` trait + `DecodeOwned` trait
 - [x] `EncodeError`, `DecodeError` 타입
-- [ ] `IntoOwned` trait (borrowed → owned 변환)
-- [ ] `AsAny` trait (다운캐스팅 지원)
+- [x] `IntoOwned` trait (borrowed → owned 변환)
+- [x] `AsAny` trait (다운캐스팅 지원)
 - [x] 편의 함수: `encode_vec()`, `decode()`, `encode_buf()`
 
 ### 4.2 `justrdp-pdu` -- Protocol Data Units
@@ -248,10 +249,10 @@ pub trait PduHint: Send + Sync {
 - [x] `TpktHeader::find_size()` -- PduHint 구현
 
 **X.224 / TPDU (ISO 8073):**
-- [ ] `ConnectionRequest` -- CR TPDU (cookie, routing token, nego flags) *(struct 정의됨, encode/decode 미구현)*
-- [ ] `ConnectionConfirm` -- CC TPDU (selected protocol, flags) *(struct 정의됨, encode/decode 미구현)*
+- [x] `ConnectionRequest` -- CR TPDU (cookie, routing token, nego flags)
+- [x] `ConnectionConfirm` -- CC TPDU (selected protocol, flags)
 - [x] `DataTransfer` -- DT TPDU (data wrapping)
-- [ ] `DisconnectRequest` -- DR TPDU
+- [x] `DisconnectRequest` -- DR TPDU
 
 **Negotiation:**
 - [x] `NegotiationRequest` -- 요청 프로토콜 (RDP/TLS/CredSSP/RDSTLS/AAD)

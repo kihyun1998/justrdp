@@ -1,7 +1,21 @@
 #![forbid(unsafe_code)]
 
+use core::any::Any;
+
 use crate::cursor::{ReadCursor, WriteCursor};
 use crate::error::{DecodeResult, EncodeResult};
+
+/// Object-safe trait for downcasting trait objects to concrete types.
+///
+/// Implement this on any trait object that needs runtime type inspection
+/// (e.g., dynamic PDU dispatch, channel processors).
+pub trait AsAny: Any {
+    /// Return `self` as `&dyn Any` for downcasting.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Return `self` as `&mut dyn Any` for mutable downcasting.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
 
 /// Trait for types that can be encoded into a byte buffer.
 ///
@@ -36,6 +50,18 @@ pub trait Decode<'de>: Sized {
 pub trait DecodeOwned: Sized {
     /// Decode this value from the given read cursor, producing an owned result.
     fn decode_owned(src: &mut ReadCursor<'_>) -> DecodeResult<Self>;
+}
+
+/// Trait for converting a borrowed type into its owned counterpart.
+///
+/// This enables zero-copy decode followed by optional conversion to an owned
+/// type that no longer borrows from the input buffer.
+pub trait IntoOwned {
+    /// The owned version of this type.
+    type Owned: 'static;
+
+    /// Convert this (possibly borrowed) value into a fully owned value.
+    fn into_owned(self) -> Self::Owned;
 }
 
 // Blanket impl: anything that implements Decode<'de> for all lifetimes also implements DecodeOwned.

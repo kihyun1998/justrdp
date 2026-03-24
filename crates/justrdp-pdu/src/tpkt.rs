@@ -193,4 +193,18 @@ mod tests {
         let buf = [0x03, 0x00];
         assert_eq!(hint.find_size(&buf), None);
     }
+
+    #[test]
+    fn tpkt_length_too_small() {
+        // Length = 2, which is less than TPKT_HEADER_SIZE (4)
+        let buf = [0x03, 0x00, 0x00, 0x02];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(TpktHeader::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn tpkt_hint_empty() {
+        let hint = TpktHint;
+        assert_eq!(hint.find_size(&[]), None);
+    }
 }

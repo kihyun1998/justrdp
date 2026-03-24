@@ -16,7 +16,7 @@ mod encode;
 mod error;
 
 pub use cursor::{ReadCursor, WriteCursor};
-pub use encode::{Decode, Encode};
+pub use encode::{AsAny, Decode, DecodeOwned, Encode, IntoOwned};
 pub use error::{DecodeError, DecodeErrorKind, DecodeResult, EncodeError, EncodeErrorKind, EncodeResult};
 
 #[cfg(feature = "alloc")]

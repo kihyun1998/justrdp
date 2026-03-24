@@ -377,23 +377,219 @@ impl<'de> Decode<'de> for NegotiationFailure {
     }
 }
 
+/// Fixed header size for X.224 CR/CC/DR TPDUs (LI + code + dst-ref + src-ref + class).
+const X224_FIXED_HEADER_SIZE: usize = 7;
+
+/// Cookie prefix in Connection Request.
+const COOKIE_PREFIX: &[u8] = b"Cookie: mstshash=";
+
+/// Routing token prefix (MS Terminal Services).
+const ROUTING_TOKEN_PREFIX: &[u8] = b"Cookie: msts=";
+
+/// Cookie/token line terminator.
+const CR_LF: &[u8] = b"\r\n";
+
+/// The connection-level data carried in an X.224 Connection Request variable field.
+///
+/// Per MS-RDPBCGR 2.2.1.1, the variable data can contain either:
+/// - A cookie: `"Cookie: mstshash=<value>\r\n"`
+/// - A routing token: `"Cookie: msts=<value>\r\n"`
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionRequestData {
+    /// RDP cookie (`mstshash=<value>`). Only the value part is stored.
+    Cookie(alloc::string::String),
+    /// Routing token (`msts=<value>`). Raw value bytes.
+    RoutingToken(alloc::vec::Vec<u8>),
+}
+
 /// X.224 Connection Request (CR) TPDU.
 ///
 /// Sent by the client to initiate an RDP connection. May contain:
 /// - A routing token or cookie (for load balancing)
 /// - A negotiation request (requested security protocols)
+///
+/// Wire format:
+/// ```text
+/// ┌────┬──────┬─────────┬─────────┬───────┬──────────────┬─────────────┐
+/// │ LI │ 0xE0 │ DST-REF │ SRC-REF │ CLASS │ cookie/token │ nego req    │
+/// │ 1B │  1B  │   2B    │   2B    │  1B   │  variable    │ 8B (opt)    │
+/// └────┴──────┴─────────┴─────────┴───────┴──────────────┴─────────────┘
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionRequest {
-    /// Optional cookie (e.g., "Cookie: mstshash=username\r\n").
+    /// Optional cookie or routing token.
     #[cfg(feature = "alloc")]
-    pub cookie: Option<alloc::string::String>,
+    pub data: Option<ConnectionRequestData>,
     /// Negotiation request (security protocol selection).
     pub negotiation: Option<NegotiationRequest>,
+}
+
+impl ConnectionRequest {
+    /// Create a connection request with negotiation only.
+    pub fn new(negotiation: Option<NegotiationRequest>) -> Self {
+        Self {
+            #[cfg(feature = "alloc")]
+            data: None,
+            negotiation,
+        }
+    }
+
+    /// Create a connection request with cookie and negotiation.
+    #[cfg(feature = "alloc")]
+    pub fn with_cookie(cookie: alloc::string::String, negotiation: Option<NegotiationRequest>) -> Self {
+        Self {
+            data: Some(ConnectionRequestData::Cookie(cookie)),
+            negotiation,
+        }
+    }
+
+    /// Create a connection request with routing token and negotiation.
+    #[cfg(feature = "alloc")]
+    pub fn with_routing_token(token: alloc::vec::Vec<u8>, negotiation: Option<NegotiationRequest>) -> Self {
+        Self {
+            data: Some(ConnectionRequestData::RoutingToken(token)),
+            negotiation,
+        }
+    }
+
+    /// Compute the variable-length portion size (cookie/token + negotiation).
+    fn variable_size(&self) -> usize {
+        let mut size = 0;
+        #[cfg(feature = "alloc")]
+        match &self.data {
+            Some(ConnectionRequestData::Cookie(cookie)) => {
+                // "Cookie: mstshash=" + cookie + "\r\n"
+                size += COOKIE_PREFIX.len() + cookie.len() + CR_LF.len();
+            }
+            Some(ConnectionRequestData::RoutingToken(token)) => {
+                // "Cookie: msts=" + token + "\r\n"
+                size += ROUTING_TOKEN_PREFIX.len() + token.len() + CR_LF.len();
+            }
+            None => {}
+        }
+        if self.negotiation.is_some() {
+            size += NegotiationRequest::SIZE;
+        }
+        size
+    }
+}
+
+impl Encode for ConnectionRequest {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        // LI = total size - 1 (LI byte itself is excluded)
+        let li = (X224_FIXED_HEADER_SIZE - 1 + self.variable_size()) as u8;
+        dst.write_u8(li, "ConnectionRequest::li")?;
+        dst.write_u8(TpduCode::ConnectionRequest as u8, "ConnectionRequest::code")?;
+        dst.write_u16_be(0, "ConnectionRequest::dst_ref")?; // DST-REF = 0
+        dst.write_u16_be(0, "ConnectionRequest::src_ref")?; // SRC-REF = 0
+        dst.write_u8(0, "ConnectionRequest::class")?; // Class 0
+
+        #[cfg(feature = "alloc")]
+        match &self.data {
+            Some(ConnectionRequestData::Cookie(cookie)) => {
+                dst.write_slice(COOKIE_PREFIX, "ConnectionRequest::cookie_prefix")?;
+                dst.write_slice(cookie.as_bytes(), "ConnectionRequest::cookie")?;
+                dst.write_slice(CR_LF, "ConnectionRequest::cookie_crlf")?;
+            }
+            Some(ConnectionRequestData::RoutingToken(token)) => {
+                dst.write_slice(ROUTING_TOKEN_PREFIX, "ConnectionRequest::token_prefix")?;
+                dst.write_slice(token, "ConnectionRequest::routing_token")?;
+                dst.write_slice(CR_LF, "ConnectionRequest::token_crlf")?;
+            }
+            None => {}
+        }
+
+        if let Some(ref nego) = self.negotiation {
+            nego.encode(dst)?;
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "X224ConnectionRequest"
+    }
+
+    fn size(&self) -> usize {
+        X224_FIXED_HEADER_SIZE + self.variable_size()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<'de> Decode<'de> for ConnectionRequest {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let li = src.read_u8("ConnectionRequest::li")? as usize;
+        let start_pos = src.pos();
+
+        let code = src.read_u8("ConnectionRequest::code")?;
+        if TpduCode::from_byte(code)? != TpduCode::ConnectionRequest {
+            return Err(DecodeError::unexpected_value(
+                "ConnectionRequest",
+                "code",
+                "expected 0xE0",
+            ));
+        }
+
+        let _dst_ref = src.read_u16_be("ConnectionRequest::dst_ref")?;
+        let _src_ref = src.read_u16_be("ConnectionRequest::src_ref")?;
+        let _class = src.read_u8("ConnectionRequest::class")?;
+
+        // Remaining bytes within LI
+        let consumed = src.pos() - start_pos;
+        let remaining_in_li = li.saturating_sub(consumed);
+
+        let mut data = None;
+        let mut negotiation = None;
+
+        if remaining_in_li > 0 {
+            let var_data = src.peek_remaining();
+            let var_data = if var_data.len() > remaining_in_li {
+                &var_data[..remaining_in_li]
+            } else {
+                var_data
+            };
+
+            // Check for cookie ("Cookie: mstshash=...") or routing token ("Cookie: msts=...")
+            if var_data.starts_with(COOKIE_PREFIX) {
+                if let Some(crlf_pos) = find_crlf(var_data) {
+                    let value = &var_data[COOKIE_PREFIX.len()..crlf_pos];
+                    data = Some(ConnectionRequestData::Cookie(
+                        alloc::string::String::from_utf8_lossy(value).into_owned(),
+                    ));
+                    src.skip(crlf_pos + CR_LF.len(), "ConnectionRequest::cookie")?;
+                }
+            } else if var_data.starts_with(ROUTING_TOKEN_PREFIX) {
+                if let Some(crlf_pos) = find_crlf(var_data) {
+                    let value = &var_data[ROUTING_TOKEN_PREFIX.len()..crlf_pos];
+                    data = Some(ConnectionRequestData::RoutingToken(value.into()));
+                    src.skip(crlf_pos + CR_LF.len(), "ConnectionRequest::routing_token")?;
+                }
+            }
+
+            // Check if negotiation request follows
+            let consumed_now = src.pos() - start_pos;
+            let left = li.saturating_sub(consumed_now);
+            if left >= NegotiationRequest::SIZE {
+                negotiation = Some(NegotiationRequest::decode(src)?);
+            }
+        }
+
+        Ok(Self { data, negotiation })
+    }
 }
 
 /// X.224 Connection Confirm (CC) TPDU.
 ///
 /// Sent by the server in response to a Connection Request.
+///
+/// Wire format:
+/// ```text
+/// ┌────┬──────┬─────────┬─────────┬───────┬─────────────────────┐
+/// │ LI │ 0xD0 │ DST-REF │ SRC-REF │ CLASS │ nego resp/failure   │
+/// │ 1B │  1B  │   2B    │   2B    │  1B   │ 8B (opt)            │
+/// └────┴──────┴─────────┴─────────┴───────┴─────────────────────┘
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionConfirm {
     /// Negotiation response (selected protocol) or failure.
@@ -407,6 +603,204 @@ pub enum ConnectionConfirmNegotiation {
     Response(NegotiationResponse),
     /// Failed negotiation.
     Failure(NegotiationFailure),
+}
+
+impl ConnectionConfirm {
+    /// Create a connection confirm with a negotiation response.
+    pub fn success(response: NegotiationResponse) -> Self {
+        Self {
+            negotiation: Some(ConnectionConfirmNegotiation::Response(response)),
+        }
+    }
+
+    /// Create a connection confirm with a negotiation failure.
+    pub fn failure(failure: NegotiationFailure) -> Self {
+        Self {
+            negotiation: Some(ConnectionConfirmNegotiation::Failure(failure)),
+        }
+    }
+
+    /// Create a connection confirm with no negotiation data (legacy RDP security).
+    pub fn legacy() -> Self {
+        Self { negotiation: None }
+    }
+
+    fn variable_size(&self) -> usize {
+        match &self.negotiation {
+            Some(ConnectionConfirmNegotiation::Response(_)) => NegotiationResponse::SIZE,
+            Some(ConnectionConfirmNegotiation::Failure(_)) => NegotiationFailure::SIZE,
+            None => 0,
+        }
+    }
+}
+
+impl Encode for ConnectionConfirm {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        let li = (X224_FIXED_HEADER_SIZE - 1 + self.variable_size()) as u8;
+        dst.write_u8(li, "ConnectionConfirm::li")?;
+        dst.write_u8(TpduCode::ConnectionConfirm as u8, "ConnectionConfirm::code")?;
+        dst.write_u16_be(0, "ConnectionConfirm::dst_ref")?;
+        dst.write_u16_be(0, "ConnectionConfirm::src_ref")?;
+        dst.write_u8(0, "ConnectionConfirm::class")?;
+
+        match &self.negotiation {
+            Some(ConnectionConfirmNegotiation::Response(resp)) => resp.encode(dst)?,
+            Some(ConnectionConfirmNegotiation::Failure(fail)) => fail.encode(dst)?,
+            None => {}
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "X224ConnectionConfirm"
+    }
+
+    fn size(&self) -> usize {
+        X224_FIXED_HEADER_SIZE + self.variable_size()
+    }
+}
+
+impl<'de> Decode<'de> for ConnectionConfirm {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let li = src.read_u8("ConnectionConfirm::li")? as usize;
+        let start_pos = src.pos();
+
+        let code = src.read_u8("ConnectionConfirm::code")?;
+        if TpduCode::from_byte(code)? != TpduCode::ConnectionConfirm {
+            return Err(DecodeError::unexpected_value(
+                "ConnectionConfirm",
+                "code",
+                "expected 0xD0",
+            ));
+        }
+
+        let _dst_ref = src.read_u16_be("ConnectionConfirm::dst_ref")?;
+        let _src_ref = src.read_u16_be("ConnectionConfirm::src_ref")?;
+        let _class = src.read_u8("ConnectionConfirm::class")?;
+
+        let consumed = src.pos() - start_pos;
+        let remaining_in_li = li.saturating_sub(consumed);
+
+        let negotiation = if remaining_in_li >= 8 {
+            let nego_type = src.peek_u8("ConnectionConfirm::nego_type")?;
+            match nego_type {
+                NEGO_RESPONSE_TYPE => {
+                    Some(ConnectionConfirmNegotiation::Response(NegotiationResponse::decode(src)?))
+                }
+                NEGO_FAILURE_TYPE => {
+                    Some(ConnectionConfirmNegotiation::Failure(NegotiationFailure::decode(src)?))
+                }
+                _ => {
+                    return Err(DecodeError::unexpected_value(
+                        "ConnectionConfirm",
+                        "negotiation_type",
+                        "expected 0x02 or 0x03",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Self { negotiation })
+    }
+}
+
+/// X.224 Disconnect Request (DR) TPDU.
+///
+/// Wire format:
+/// ```text
+/// ┌────┬──────┬─────────┬─────────┬────────┐
+/// │ LI │ 0x80 │ DST-REF │ SRC-REF │ REASON │
+/// │ 1B │  1B  │   2B    │   2B    │   1B   │
+/// └────┴──────┴─────────┴─────────┴────────┘
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisconnectRequest {
+    /// Disconnect reason code.
+    pub reason: DisconnectReason,
+}
+
+/// X.224 disconnect reason codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DisconnectReason {
+    /// Not specified.
+    NotSpecified = 0,
+    /// Congestion at TSAP.
+    CongestionAtTsap = 1,
+    /// Session entity not attached to TSAP.
+    SessionNotAttached = 2,
+    /// Address unknown.
+    AddressUnknown = 3,
+}
+
+impl DisconnectReason {
+    /// Parse from a byte value.
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            1 => Self::CongestionAtTsap,
+            2 => Self::SessionNotAttached,
+            3 => Self::AddressUnknown,
+            _ => Self::NotSpecified,
+        }
+    }
+}
+
+/// Disconnect Request header size (LI + code + dst-ref + src-ref + reason = 7).
+pub const DISCONNECT_REQUEST_SIZE: usize = 7;
+
+impl DisconnectRequest {
+    /// Create a new disconnect request.
+    pub fn new(reason: DisconnectReason) -> Self {
+        Self { reason }
+    }
+}
+
+impl Encode for DisconnectRequest {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_u8(6, "DisconnectRequest::li")?; // LI = 6 (7 - 1)
+        dst.write_u8(TpduCode::DisconnectRequest as u8, "DisconnectRequest::code")?;
+        dst.write_u16_be(0, "DisconnectRequest::dst_ref")?;
+        dst.write_u16_be(0, "DisconnectRequest::src_ref")?;
+        dst.write_u8(self.reason as u8, "DisconnectRequest::reason")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "X224DisconnectRequest"
+    }
+
+    fn size(&self) -> usize {
+        DISCONNECT_REQUEST_SIZE
+    }
+}
+
+impl<'de> Decode<'de> for DisconnectRequest {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let _li = src.read_u8("DisconnectRequest::li")?;
+        let code = src.read_u8("DisconnectRequest::code")?;
+        if TpduCode::from_byte(code)? != TpduCode::DisconnectRequest {
+            return Err(DecodeError::unexpected_value(
+                "DisconnectRequest",
+                "code",
+                "expected 0x80",
+            ));
+        }
+        let _dst_ref = src.read_u16_be("DisconnectRequest::dst_ref")?;
+        let _src_ref = src.read_u16_be("DisconnectRequest::src_ref")?;
+        let reason = src.read_u8("DisconnectRequest::reason")?;
+
+        Ok(Self {
+            reason: DisconnectReason::from_u8(reason),
+        })
+    }
+}
+
+/// Find the position of "\r\n" in a byte slice.
+fn find_crlf(data: &[u8]) -> Option<usize> {
+    data.windows(2).position(|w| w == CR_LF)
 }
 
 #[cfg(test)]
@@ -478,4 +872,278 @@ mod tests {
         assert!(!proto.contains(SecurityProtocol::AAD));
         assert_eq!(proto.bits(), 0x03);
     }
+
+    // ── Connection Request tests ──
+
+    #[test]
+    fn connection_request_with_cookie_and_nego_roundtrip() {
+        let cr = ConnectionRequest::with_cookie(
+            "testuser".into(),
+            Some(NegotiationRequest::new(SecurityProtocol::HYBRID)),
+        );
+
+        let size = cr.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        cr.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ConnectionRequest::decode(&mut cursor).unwrap();
+        match &decoded.data {
+            Some(ConnectionRequestData::Cookie(c)) => assert_eq!(c, "testuser"),
+            other => panic!("expected Cookie, got {:?}", other),
+        }
+        assert!(decoded.negotiation.is_some());
+        assert_eq!(
+            decoded.negotiation.unwrap().protocols,
+            SecurityProtocol::HYBRID,
+        );
+    }
+
+    #[test]
+    fn connection_request_with_routing_token_roundtrip() {
+        let token = b"12345678.PC01.domain.com".to_vec();
+        let cr = ConnectionRequest::with_routing_token(
+            token.clone(),
+            Some(NegotiationRequest::new(SecurityProtocol::SSL)),
+        );
+
+        let size = cr.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        cr.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ConnectionRequest::decode(&mut cursor).unwrap();
+        match &decoded.data {
+            Some(ConnectionRequestData::RoutingToken(t)) => assert_eq!(t, &token),
+            other => panic!("expected RoutingToken, got {:?}", other),
+        }
+        assert_eq!(
+            decoded.negotiation.unwrap().protocols,
+            SecurityProtocol::SSL,
+        );
+    }
+
+    #[test]
+    fn connection_request_nego_only_roundtrip() {
+        let cr = ConnectionRequest::new(Some(NegotiationRequest::new(
+            SecurityProtocol::SSL.union(SecurityProtocol::HYBRID),
+        )));
+
+        let size = cr.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        cr.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ConnectionRequest::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.data, None);
+        assert!(decoded.negotiation.is_some());
+        let proto = decoded.negotiation.unwrap().protocols;
+        assert!(proto.contains(SecurityProtocol::SSL));
+        assert!(proto.contains(SecurityProtocol::HYBRID));
+    }
+
+    #[test]
+    fn connection_request_minimal_roundtrip() {
+        let cr = ConnectionRequest::new(None);
+
+        let size = cr.size();
+        assert_eq!(size, X224_FIXED_HEADER_SIZE);
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        cr.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ConnectionRequest::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.data, None);
+        assert_eq!(decoded.negotiation, None);
+    }
+
+    // ── Connection Confirm tests ──
+
+    #[test]
+    fn connection_confirm_success_roundtrip() {
+        let cc = ConnectionConfirm::success(NegotiationResponse {
+            flags: NegotiationResponseFlags::EXTENDED_CLIENT_DATA,
+            protocol: SecurityProtocol::HYBRID,
+        });
+
+        let size = cc.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        cc.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ConnectionConfirm::decode(&mut cursor).unwrap();
+        match decoded.negotiation {
+            Some(ConnectionConfirmNegotiation::Response(resp)) => {
+                assert_eq!(resp.protocol, SecurityProtocol::HYBRID);
+                assert!(resp.flags.contains(NegotiationResponseFlags::EXTENDED_CLIENT_DATA));
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn connection_confirm_failure_roundtrip() {
+        let cc = ConnectionConfirm::failure(NegotiationFailure {
+            code: NegotiationFailureCode::HybridRequiredByServer,
+        });
+
+        let size = cc.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        cc.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ConnectionConfirm::decode(&mut cursor).unwrap();
+        match decoded.negotiation {
+            Some(ConnectionConfirmNegotiation::Failure(f)) => {
+                assert_eq!(f.code, NegotiationFailureCode::HybridRequiredByServer);
+            }
+            other => panic!("expected Failure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn connection_confirm_legacy_roundtrip() {
+        let cc = ConnectionConfirm::legacy();
+
+        let size = cc.size();
+        assert_eq!(size, X224_FIXED_HEADER_SIZE);
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        cc.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ConnectionConfirm::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.negotiation, None);
+    }
+
+    // ── Disconnect Request tests ──
+
+    #[test]
+    fn disconnect_request_roundtrip() {
+        let dr = DisconnectRequest::new(DisconnectReason::CongestionAtTsap);
+
+        let mut buf = [0u8; DISCONNECT_REQUEST_SIZE];
+        let mut cursor = WriteCursor::new(&mut buf);
+        dr.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DisconnectRequest::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.reason, DisconnectReason::CongestionAtTsap);
+    }
+
+    #[test]
+    fn disconnect_request_not_specified() {
+        let dr = DisconnectRequest::new(DisconnectReason::NotSpecified);
+
+        let mut buf = [0u8; DISCONNECT_REQUEST_SIZE];
+        let mut cursor = WriteCursor::new(&mut buf);
+        dr.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DisconnectRequest::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.reason, DisconnectReason::NotSpecified);
+    }
+
+    // ── Error path tests ──
+
+    #[test]
+    fn connection_request_truncated_header() {
+        // Only 3 bytes - not enough for the fixed header after LI
+        let buf = [0x06, 0xE0, 0x00];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(ConnectionRequest::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn connection_request_wrong_tpdu_code() {
+        // Valid LI but wrong code (0xD0 = CC instead of CR)
+        let buf = [0x06, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(ConnectionRequest::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn connection_confirm_wrong_tpdu_code() {
+        // Valid LI but wrong code (0xE0 = CR instead of CC)
+        let buf = [0x06, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(ConnectionConfirm::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn connection_confirm_invalid_nego_type() {
+        // Valid CC header + 8 bytes of invalid negotiation type (0xFF)
+        let mut buf = [0u8; 15];
+        buf[0] = 0x0E; // LI = 14
+        buf[1] = 0xD0; // CC code
+        // dst-ref, src-ref, class = 0
+        buf[7] = 0xFF; // invalid negotiation type
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(ConnectionConfirm::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn disconnect_request_wrong_tpdu_code() {
+        let buf = [0x06, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(DisconnectRequest::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn disconnect_request_truncated() {
+        // Only 4 bytes - need 7
+        let buf = [0x06, 0x80, 0x00, 0x00];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(DisconnectRequest::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn data_transfer_wrong_li() {
+        // LI should be 2, but we give 3
+        let buf = [0x03, 0xF0, 0x80];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(DataTransfer::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn data_transfer_wrong_code() {
+        let buf = [0x02, 0xE0, 0x80];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(DataTransfer::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn negotiation_request_wrong_type() {
+        let buf = [0xFF, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(NegotiationRequest::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn negotiation_response_wrong_type() {
+        let buf = [0xFF, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(NegotiationResponse::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn negotiation_failure_unknown_code() {
+        // Valid type byte but unknown failure code 0xFF
+        let buf = [0x03, 0x00, 0x08, 0x00, 0xFF, 0x00, 0x00, 0x00];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(NegotiationFailure::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn tpdu_code_unknown() {
+        // 0x50 is not a valid TPDU code
+        assert!(TpduCode::from_byte(0x50).is_err());
+    }
+
 }
