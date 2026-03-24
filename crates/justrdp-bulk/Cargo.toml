@@ -1,0 +1,19 @@
+[package]
+name = "justrdp-bulk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Bulk compression/decompression (MPPC, NCRUSH, XCRUSH) for JustRDP"
+keywords = ["rdp", "compression", "mppc"]
+categories = ["no-std", "compression"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc"]
+std = ["alloc", "justrdp-core/std"]
+
+[dependencies]
+justrdp-core.workspace = true

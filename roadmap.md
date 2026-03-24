@@ -229,35 +229,35 @@ pub trait PduHint: Send + Sync {
 
 **구현 항목:**
 
-- [ ] `ReadCursor<'a>` -- zero-copy 바이트 읽기 커서
-- [ ] `WriteCursor<'a>` -- 바이트 쓰기 커서
-- [ ] `WriteBuf` -- 동적 크기 쓰기 버퍼
-- [ ] `Encode` trait + derive 헬퍼
-- [ ] `Decode<'de>` trait + `DecodeOwned` trait
-- [ ] `EncodeError`, `DecodeError` 타입
+- [x] `ReadCursor<'a>` -- zero-copy 바이트 읽기 커서
+- [x] `WriteCursor<'a>` -- 바이트 쓰기 커서
+- [x] `WriteBuf` -- 동적 크기 쓰기 버퍼
+- [x] `Encode` trait + derive 헬퍼
+- [x] `Decode<'de>` trait + `DecodeOwned` trait
+- [x] `EncodeError`, `DecodeError` 타입
 - [ ] `IntoOwned` trait (borrowed → owned 변환)
 - [ ] `AsAny` trait (다운캐스팅 지원)
-- [ ] 편의 함수: `encode_vec()`, `decode()`, `encode_buf()`
+- [x] 편의 함수: `encode_vec()`, `decode()`, `encode_buf()`
 
 ### 4.2 `justrdp-pdu` -- Protocol Data Units
 
 #### 4.2.1 Transport Layer PDUs
 
 **TPKT (RFC 1006):**
-- [ ] `TpktHeader` -- 4바이트 TCP 프레이밍 (version=3, reserved=0, length)
-- [ ] `TpktHeader::find_size()` -- PduHint 구현
+- [x] `TpktHeader` -- 4바이트 TCP 프레이밍 (version=3, reserved=0, length)
+- [x] `TpktHeader::find_size()` -- PduHint 구현
 
 **X.224 / TPDU (ISO 8073):**
-- [ ] `ConnectionRequest` -- CR TPDU (cookie, routing token, nego flags)
-- [ ] `ConnectionConfirm` -- CC TPDU (selected protocol, flags)
-- [ ] `DataTransfer` -- DT TPDU (data wrapping)
+- [ ] `ConnectionRequest` -- CR TPDU (cookie, routing token, nego flags) *(struct 정의됨, encode/decode 미구현)*
+- [ ] `ConnectionConfirm` -- CC TPDU (selected protocol, flags) *(struct 정의됨, encode/decode 미구현)*
+- [x] `DataTransfer` -- DT TPDU (data wrapping)
 - [ ] `DisconnectRequest` -- DR TPDU
 
 **Negotiation:**
-- [ ] `NegotiationRequest` -- 요청 프로토콜 (RDP/TLS/CredSSP/RDSTLS/AAD)
-- [ ] `NegotiationResponse` -- 선택된 프로토콜, 서버 플래그
-- [ ] `NegotiationFailure` -- 실패 코드 (SSL_REQUIRED, HYBRID_REQUIRED 등)
-- [ ] `SecurityProtocol` flags 열거형
+- [x] `NegotiationRequest` -- 요청 프로토콜 (RDP/TLS/CredSSP/RDSTLS/AAD)
+- [x] `NegotiationResponse` -- 선택된 프로토콜, 서버 플래그
+- [x] `NegotiationFailure` -- 실패 코드 (SSL_REQUIRED, HYBRID_REQUIRED 등)
+- [x] `SecurityProtocol` flags 열거형
 
 **Pre-Connection Blob (PCB):**
 - [ ] `PreConnectionBlob` -- 로드밸런서/연결 브로커용 사전 연결 데이터
@@ -1843,7 +1843,7 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 ## 20. Definition of Done (per Phase)
 
 ### Phase 1 -- Foundation
-- [ ] `justrdp-core`: `Encode`/`Decode` trait 구현 및 100% 단위 테스트
+- [x] `justrdp-core`: `Encode`/`Decode` trait 구현 및 100% 단위 테스트
 - [ ] `justrdp-pdu`: 모든 TPKT/X.224/MCS/GCC PDU roundtrip 테스트 통과
 - [ ] `justrdp-pdu`: 30종 Capability Set 인코딩/디코딩 통과
 - [ ] `justrdp-pdu`: Fast-Path 입출력 PDU roundtrip 테스트 통과

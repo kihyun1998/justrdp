@@ -1,0 +1,18 @@
+[package]
+name = "justrdp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core encoding/decoding traits and cursor types for JustRDP"
+keywords = ["rdp", "pdu", "encode", "decode"]
+categories = ["no-std", "encoding"]
+
+[features]
+default = ["alloc"]
+alloc = []
+std = ["alloc"]
+
+[dependencies]

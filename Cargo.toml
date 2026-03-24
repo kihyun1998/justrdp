@@ -1,6 +1,23 @@
-[package]
-name = "justrdp"
+[workspace]
+members = [
+    "crates/justrdp-core",
+    "crates/justrdp-pdu",
+    "crates/justrdp-bulk",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+authors = ["Ki Hyun Park"]
+repository = "https://github.com/justrdp/justrdp"
+description = "A pure Rust, production-grade RDP protocol implementation"
+keywords = ["rdp", "remote-desktop", "protocol"]
+categories = ["network-programming"]
 
-[dependencies]
+[workspace.dependencies]
+justrdp-core = { path = "crates/justrdp-core", version = "0.1.0" }
+justrdp-pdu = { path = "crates/justrdp-pdu", version = "0.1.0" }
+justrdp-bulk = { path = "crates/justrdp-bulk", version = "0.1.0" }

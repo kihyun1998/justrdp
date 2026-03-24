@@ -3,5 +3,19 @@
 version = 4
 
 [[package]]
-name = "justrdp"
+name = "justrdp-bulk"
 version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+]
+
+[[package]]
+name = "justrdp-core"
+version = "0.1.0"
+
+[[package]]
+name = "justrdp-pdu"
+version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+]

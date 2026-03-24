@@ -1,0 +1,19 @@
+[package]
+name = "justrdp-pdu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "RDP Protocol Data Unit definitions for JustRDP"
+keywords = ["rdp", "pdu", "protocol"]
+categories = ["no-std", "encoding"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc"]
+std = ["alloc", "justrdp-core/std"]
+
+[dependencies]
+justrdp-core.workspace = true
