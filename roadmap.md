@@ -261,27 +261,27 @@ pub trait PduHint: Send + Sync {
 - [x] `SecurityProtocol` flags 열거형
 
 **Pre-Connection Blob (PCB):**
-- [ ] `PreConnectionBlob` -- 로드밸런서/연결 브로커용 사전 연결 데이터
-- [ ] PCB v1: Correlation ID
-- [ ] PCB v2: Correlation ID + Target name
-- [ ] Connection Request 이전에 전송, 로드밸런서가 올바른 세션 호스트로 라우팅하기 위해 사용
+- [x] `PreConnectionBlob` -- 로드밸런서/연결 브로커용 사전 연결 데이터
+- [x] PCB v1: Correlation ID
+- [x] PCB v2: Correlation ID + Target name
+- [x] Connection Request 이전에 전송, 로드밸런서가 올바른 세션 호스트로 라우팅하기 위해 사용
 
 #### 4.2.2 MCS Layer (T.125)
 
 **BER/PER 인코딩:**
-- [ ] BER encoder/decoder (MCS Connect Initial/Response용)
-- [ ] PER encoder/decoder (MCS Domain PDU용)
-- [ ] ASN.1 기본 타입: INTEGER, OCTET STRING, OBJECT IDENTIFIER, SEQUENCE, CHOICE, ENUMERATED
+- [x] BER encoder/decoder (MCS Connect Initial/Response용)
+- [x] PER encoder/decoder (MCS Domain PDU용)
+- [x] ASN.1 기본 타입: INTEGER, OCTET STRING, OBJECT IDENTIFIER, SEQUENCE, CHOICE, ENUMERATED
 
 **MCS PDUs:**
-- [ ] `McsConnectInitial` -- 도메인 파라미터 + GCC payload
-- [ ] `McsConnectResponse` -- 결과 + GCC payload
-- [ ] `McsErectDomainRequest`
-- [ ] `McsAttachUserRequest` / `McsAttachUserConfirm`
-- [ ] `McsChannelJoinRequest` / `McsChannelJoinConfirm`
-- [ ] `McsSendDataRequest` / `McsSendDataIndication`
-- [ ] `McsDisconnectProviderUltimatum`
-- [ ] `DomainParameters` (max channels, max users, max tokens, etc.)
+- [x] `McsConnectInitial` -- 도메인 파라미터 + GCC payload
+- [x] `McsConnectResponse` -- 결과 + GCC payload
+- [x] `McsErectDomainRequest`
+- [x] `McsAttachUserRequest` / `McsAttachUserConfirm`
+- [x] `McsChannelJoinRequest` / `McsChannelJoinConfirm`
+- [x] `McsSendDataRequest` / `McsSendDataIndication`
+- [x] `McsDisconnectProviderUltimatum`
+- [x] `DomainParameters` (max channels, max users, max tokens, etc.)
 
 #### 4.2.3 GCC Layer (T.124)
 
