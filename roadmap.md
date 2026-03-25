@@ -399,54 +399,54 @@ pub trait PduHint: Send + Sync {
 #### 4.2.5 Fast-Path PDUs
 
 **Fast-Path Output (서버 → 클라이언트):**
-- [ ] `FastPathOutputHeader` -- action, numEvents, length, encryption
-- [ ] `FastPathBitmapUpdate` -- 비트맵 데이터 배열
-- [ ] `FastPathPaletteUpdate`
-- [ ] `FastPathSurfaceCommands` -- SetSurfaceBits / StreamSurfaceBits / FrameMarker
-- [ ] `FastPathPointerUpdate` -- Position / System / Color / New / Cached / Large
-- [ ] `FastPathOrdersUpdate` -- Drawing order 배열
+- [x] `FastPathOutputHeader` -- action, numEvents, length, encryption
+- [x] `FastPathBitmapUpdate` -- 비트맵 데이터 배열 *(FastPathOutputUpdate로 통합)*
+- [x] `FastPathPaletteUpdate` *(FastPathOutputUpdate로 통합)*
+- [x] `FastPathSurfaceCommands` -- SetSurfaceBits / StreamSurfaceBits / FrameMarker *(FastPathOutputUpdate로 통합)*
+- [x] `FastPathPointerUpdate` -- Position / System / Color / New / Cached / Large *(FastPathOutputUpdate로 통합)*
+- [x] `FastPathOrdersUpdate` -- Drawing order 배열 *(FastPathOutputUpdate로 통합)*
 
 **Fast-Path Input (클라이언트 → 서버):**
-- [ ] `FastPathInputHeader`
-- [ ] `FastPathKeyboardEvent` (scancode)
-- [ ] `FastPathUnicodeKeyboardEvent`
-- [ ] `FastPathMouseEvent`
-- [ ] `FastPathExtendedMouseEvent`
-- [ ] `FastPathRelativeMouseEvent`
-- [ ] `FastPathSyncEvent`
-- [ ] `FastPathQoeTimestampEvent`
+- [x] `FastPathInputHeader`
+- [x] `FastPathKeyboardEvent` (scancode)
+- [x] `FastPathUnicodeKeyboardEvent`
+- [x] `FastPathMouseEvent`
+- [x] `FastPathExtendedMouseEvent`
+- [ ] `FastPathRelativeMouseEvent` *(Phase 2 -- 드물게 사용)*
+- [x] `FastPathSyncEvent`
+- [x] `FastPathQoeTimestampEvent`
 
 #### 4.2.6 Drawing Orders (MS-RDPEGDI)
 
 **Primary Drawing Orders (22종):**
-- [ ] `DstBlt`, `PatBlt`, `ScrBlt`, `OpaqueRect`
-- [ ] `MultiDstBlt`, `MultiPatBlt`, `MultiScrBlt`, `MultiOpaqueRect`
-- [ ] `DrawNineGrid`, `MultiDrawNineGrid`
-- [ ] `LineTo`, `Polyline`
-- [ ] `MemBlt`, `Mem3Blt`
-- [ ] `SaveBitmap`
-- [ ] `GlyphIndex`, `FastIndex`, `FastGlyph`
-- [ ] `EllipseSc`, `EllipseCb`
-- [ ] `OrderInfo` -- 바운딩 rect, 필드 존재 플래그, delta 인코딩
+- [x] `DstBlt`, `PatBlt`, `ScrBlt`, `OpaqueRect` *(PrimaryOrder + PrimaryOrderType enum, raw body)*
+- [x] `MultiDstBlt`, `MultiPatBlt`, `MultiScrBlt`, `MultiOpaqueRect` *(PrimaryOrder)*
+- [x] `DrawNineGrid`, `MultiDrawNineGrid` *(PrimaryOrder)*
+- [x] `LineTo`, `Polyline` *(PrimaryOrder)*
+- [x] `MemBlt`, `Mem3Blt` *(PrimaryOrder)*
+- [x] `SaveBitmap` *(PrimaryOrder)*
+- [x] `GlyphIndex`, `FastIndex`, `FastGlyph` *(PrimaryOrder)*
+- [x] `EllipseSc`, `EllipseCb` *(PrimaryOrder)*
+- [x] `OrderInfo` -- 바운딩 rect, 필드 존재 플래그, delta 인코딩 *(BoundsRect + field_flags)*
 
 **Secondary Drawing Orders (Cache):**
-- [ ] `CacheBitmapV1` / `CacheBitmapV2` / `CacheBitmapV3`
-- [ ] `CacheColorTable`
-- [ ] `CacheGlyph` / `CacheGlyphV2`
-- [ ] `CacheBrush`
+- [x] `CacheBitmapV1` / `CacheBitmapV2` / `CacheBitmapV3` *(SecondaryOrder + SecondaryOrderType)*
+- [x] `CacheColorTable` *(SecondaryOrder)*
+- [x] `CacheGlyph` / `CacheGlyphV2` *(SecondaryOrder)*
+- [x] `CacheBrush` *(SecondaryOrder)*
 
 **Alternate Secondary Orders:**
-- [ ] `CreateOffscreenBitmap` / `DeleteOffscreenBitmap`
-- [ ] `SwitchSurface`
-- [ ] `FrameMarker` (begin/end)
-- [ ] `StreamBitmapFirst` / `StreamBitmapNext`
+- [x] `CreateOffscreenBitmap` / `DeleteOffscreenBitmap` *(AlternateSecondaryOrder)*
+- [x] `SwitchSurface` *(AlternateSecondaryOrder)*
+- [x] `FrameMarker` (begin/end) *(AlternateSecondaryOrder)*
+- [x] `StreamBitmapFirst` / `StreamBitmapNext` *(AlternateSecondaryOrder)*
 
 #### 4.2.7 Cryptographic Primitives
 
-- [ ] RC4 encrypt/decrypt (Standard RDP Security)
-- [ ] RSA public key operations (서버 인증서 검증, 키 교환)
-- [ ] MD5, SHA-1, SHA-256, HMAC (세션 키 파생)
-- [ ] FIPS 140-1 triple-DES (FIPS 호환 모드)
+- [x] RC4 encrypt/decrypt (Standard RDP Security)
+- [x] RSA public key operations (서버 인증서 검증, 키 교환) *(trait 추상화, 구현 주입)*
+- [x] MD5, SHA-1, SHA-256, HMAC (세션 키 파생)
+- [x] FIPS 140-1 triple-DES (FIPS 호환 모드) *(trait 추상화, 구현 주입)*
 
 ---
 

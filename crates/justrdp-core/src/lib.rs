@@ -11,6 +11,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod crypto;
 mod cursor;
 mod encode;
 mod error;
