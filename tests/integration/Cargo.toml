@@ -1,0 +1,16 @@
+[package]
+name = "justrdp-integration-tests"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "rdp-connect-test"
+path = "src/main.rs"
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-pdu.workspace = true
+justrdp-connector.workspace = true
+justrdp-tls.workspace = true

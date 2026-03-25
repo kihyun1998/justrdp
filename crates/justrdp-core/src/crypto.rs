@@ -17,6 +17,8 @@
 //! RSA and FIPS triple-DES are complex and best provided by external crates.
 //! We define traits so they can be injected.
 
+use alloc::vec;
+
 // ── RC4 ──
 
 /// RC4 stream cipher state.
@@ -52,6 +54,132 @@ impl Rc4 {
             *byte ^= k;
         }
     }
+}
+
+// ── MD4 ──
+
+/// MD4 hash (128-bit / 16 bytes). Required for NTLM NT hash (NTOWF).
+pub struct Md4 {
+    state: [u32; 4],
+    count: u64,
+    buffer: [u8; 64],
+    buf_len: usize,
+}
+
+impl Md4 {
+    pub fn new() -> Self {
+        Self {
+            state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
+            count: 0,
+            buffer: [0u8; 64],
+            buf_len: 0,
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        let mut offset = 0;
+        self.count += data.len() as u64;
+
+        if self.buf_len > 0 {
+            let needed = 64 - self.buf_len;
+            if data.len() < needed {
+                self.buffer[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+            self.buffer[self.buf_len..64].copy_from_slice(&data[..needed]);
+            md4_transform(&mut self.state, &self.buffer);
+            offset = needed;
+            self.buf_len = 0;
+        }
+
+        while offset + 64 <= data.len() {
+            let block: [u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            md4_transform(&mut self.state, &block);
+            offset += 64;
+        }
+
+        if offset < data.len() {
+            let remaining = data.len() - offset;
+            self.buffer[..remaining].copy_from_slice(&data[offset..]);
+            self.buf_len = remaining;
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; 16] {
+        let bit_count = self.count * 8;
+        self.update(&[0x80]);
+        while self.buf_len != 56 {
+            self.update(&[0x00]);
+        }
+        self.update(&bit_count.to_le_bytes());
+
+        let mut result = [0u8; 16];
+        for (i, &word) in self.state.iter().enumerate() {
+            result[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        result
+    }
+}
+
+/// Compute MD4 hash of data.
+pub fn md4(data: &[u8]) -> [u8; 16] {
+    let mut hasher = Md4::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+fn md4_transform(state: &mut [u32; 4], block: &[u8; 64]) {
+    let mut m = [0u32; 16];
+    for i in 0..16 {
+        m[i] = u32::from_le_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+    }
+
+    let (mut a, mut b, mut c, mut d) = (state[0], state[1], state[2], state[3]);
+
+    // Round 1: F(b,c,d) = (b & c) | (!b & d)
+    for &(k, s) in &[
+        (0, 3), (1, 7), (2, 11), (3, 19), (4, 3), (5, 7), (6, 11), (7, 19),
+        (8, 3), (9, 7), (10, 11), (11, 19), (12, 3), (13, 7), (14, 11), (15, 19),
+    ] {
+        let f = (b & c) | ((!b) & d);
+        let temp = a.wrapping_add(f).wrapping_add(m[k]).rotate_left(s);
+        a = d;
+        d = c;
+        c = b;
+        b = temp;
+    }
+
+    // Round 2: G(b,c,d) = (b & c) | (b & d) | (c & d), constant 0x5A827999
+    for &(k, s) in &[
+        (0, 3), (4, 5), (8, 9), (12, 13), (1, 3), (5, 5), (9, 9), (13, 13),
+        (2, 3), (6, 5), (10, 9), (14, 13), (3, 3), (7, 5), (11, 9), (15, 13),
+    ] {
+        let g = (b & c) | (b & d) | (c & d);
+        let temp = a.wrapping_add(g).wrapping_add(m[k]).wrapping_add(0x5A827999).rotate_left(s);
+        a = d;
+        d = c;
+        c = b;
+        b = temp;
+    }
+
+    // Round 3: H(b,c,d) = b ^ c ^ d, constant 0x6ED9EBA1
+    for &(k, s) in &[
+        (0, 3), (8, 9), (4, 11), (12, 15), (2, 3), (10, 9), (6, 11), (14, 15),
+        (1, 3), (9, 9), (5, 11), (13, 15), (3, 3), (11, 9), (7, 11), (15, 15),
+    ] {
+        let h = b ^ c ^ d;
+        let temp = a.wrapping_add(h).wrapping_add(m[k]).wrapping_add(0x6ED9EBA1).rotate_left(s);
+        a = d;
+        d = c;
+        c = b;
+        b = temp;
+    }
+
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
 }
 
 // ── MD5 ──
@@ -445,21 +573,18 @@ fn hmac_generic<const HASH_LEN: usize, const BLOCK_SIZE: usize>(
     }
 
     // Concatenate ipad + data and hash
-    // We need a dynamic buffer here since data is variable length
-    let mut combined = [0u8; 1024]; // should be enough for RDP
+    let mut combined = vec![0u8; BLOCK_SIZE + data.len()];
     combined[..BLOCK_SIZE].copy_from_slice(&inner_input);
-    let total = BLOCK_SIZE + data.len();
-    combined[BLOCK_SIZE..total].copy_from_slice(data);
-    let inner_hash = hash_fn(&combined[..total]);
+    combined[BLOCK_SIZE..].copy_from_slice(data);
+    let inner_hash = hash_fn(&combined);
 
-    // Outer: key XOR opad
-    let mut outer_input = [0u8; BLOCK_SIZE];
+    // Outer: key XOR opad + inner hash
+    let mut outer = vec![0u8; BLOCK_SIZE + HASH_LEN];
     for i in 0..BLOCK_SIZE {
-        outer_input[i] = key_block[i] ^ 0x5C;
+        outer[i] = key_block[i] ^ 0x5C;
     }
-    combined[..BLOCK_SIZE].copy_from_slice(&outer_input);
-    combined[BLOCK_SIZE..BLOCK_SIZE + HASH_LEN].copy_from_slice(&inner_hash);
-    hash_fn(&combined[..BLOCK_SIZE + HASH_LEN])
+    outer[BLOCK_SIZE..].copy_from_slice(&inner_hash);
+    hash_fn(&outer)
 }
 
 // ── RSA / Triple-DES traits ──
@@ -484,6 +609,31 @@ pub trait TripleDes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RFC 1320 test vectors for MD4
+    #[test]
+    fn md4_empty() {
+        assert_eq!(
+            md4(b""),
+            [0x31, 0xd6, 0xcf, 0xe0, 0xd1, 0x6a, 0xe9, 0x31, 0xb7, 0x3c, 0x59, 0xd7, 0xe0, 0xc0, 0x89, 0xc0]
+        );
+    }
+
+    #[test]
+    fn md4_abc() {
+        assert_eq!(
+            md4(b"abc"),
+            [0xa4, 0x48, 0x01, 0x7a, 0xaf, 0x21, 0xd8, 0x52, 0x5f, 0xc1, 0x0a, 0xe8, 0x7a, 0xa6, 0x72, 0x9d]
+        );
+    }
+
+    #[test]
+    fn md4_message_digest() {
+        assert_eq!(
+            md4(b"message digest"),
+            [0xd9, 0x13, 0x0a, 0x81, 0x64, 0x54, 0x9f, 0xe8, 0x18, 0x87, 0x48, 0x06, 0xe1, 0xc7, 0x01, 0x4b]
+        );
+    }
 
     // RFC 1321 test vectors for MD5
     #[test]

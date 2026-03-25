@@ -10,6 +10,8 @@ pub use justrdp_core::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 
 pub mod gcc;
 pub mod mcs;
+#[cfg(feature = "alloc")]
+pub mod ntlm;
 pub mod pcb;
 pub mod rdp;
 pub mod tpkt;

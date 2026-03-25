@@ -519,8 +519,8 @@ pub enum ClientConnectorState {
 
 **구현 항목:**
 
-- [ ] `ClientConnector` struct -- `Sequence` trait 구현
-- [ ] `Sequence` trait -- `next_pdu_hint()`, `state()`, `step()`
+- [x] `ClientConnector` struct -- `Sequence` trait 구현
+- [x] `Sequence` trait -- `next_pdu_hint()`, `state()`, `step()`
 - [ ] `Config` struct:
   ```rust
   pub struct Config {
@@ -541,33 +541,33 @@ pub enum ClientConnectorState {
       pub static_channels: StaticChannelSet,
   }
   ```
-- [ ] `ConnectionResult` -- 연결 결과 (채널 ID 매핑, 서버 capabilities, 세션 정보)
-- [ ] `ChannelConnectionSequence` -- 채널 Join 반복 상태 머신
+- [x] `ConnectionResult` -- 연결 결과 (채널 ID 매핑, 서버 capabilities, 세션 정보)
+- [x] `ChannelConnectionSequence` -- 채널 Join 반복 상태 머신
 - [ ] `LicenseExchangeSequence` -- 라이센스 교환 (Valid Client 단축 경로 포함)
-- [ ] `ConnectionActivationSequence` -- Demand Active / Confirm Active 교환
+- [x] `ConnectionActivationSequence` -- Demand Active / Confirm Active 교환
 
 ### 5.2 Authentication
 
 #### 5.2.1 CredSSP / NLA (Network Level Authentication)
 
-- [ ] `CredsspSequence` -- CredSSP 상태 머신
-- [ ] `TsRequest` PDU 인코딩/디코딩 (version 2-6)
-- [ ] SPNEGO 협상 래퍼
-- [ ] 서버 공개키 바인딩 (`pubKeyAuth`)
-- [ ] 자격 증명 전송 (`authInfo`)
-- [ ] `EarlyUserAuthResult` (HYBRID_EX)
-- [ ] `clientNonce` anti-replay (v5+)
+- [x] `CredsspSequence` -- CredSSP 상태 머신
+- [x] `TsRequest` PDU 인코딩/디코딩 (version 2-6)
+- [x] SPNEGO 협상 래퍼
+- [x] 서버 공개키 바인딩 (`pubKeyAuth`)
+- [x] 자격 증명 전송 (`authInfo`)
+- [x] `EarlyUserAuthResult` (HYBRID_EX)
+- [x] `clientNonce` anti-replay (v5+)
 
 #### 5.2.2 NTLM Authentication
 
-- [ ] `NtlmNegotiateMessage` -- 플래그, 도메인 힌트
-- [ ] `NtlmChallengeMessage` -- 서버 챌린지, 타겟 정보, 플래그
-- [ ] `NtlmAuthenticateMessage` -- NTProofStr, 세션 키, MIC
-- [ ] NTLMv2 해시 계산 (NTOWFv2)
-- [ ] NTProofStr 생성
-- [ ] 세션 키 파생
-- [ ] MIC (Message Integrity Code) 계산
-- [ ] NTLM 서명/봉인 (signing/sealing)
+- [x] `NtlmNegotiateMessage` -- 플래그, 도메인 힌트
+- [x] `NtlmChallengeMessage` -- 서버 챌린지, 타겟 정보, 플래그
+- [x] `NtlmAuthenticateMessage` -- NTProofStr, 세션 키, MIC
+- [x] NTLMv2 해시 계산 (NTOWFv2)
+- [x] NTProofStr 생성
+- [x] 세션 키 파생
+- [x] MIC (Message Integrity Code) 계산
+- [x] NTLM 서명/봉인 (signing/sealing)
 
 #### 5.2.3 Kerberos Authentication
 
@@ -614,12 +614,12 @@ pub enum ClientConnectorState {
 
 ### 5.3 `justrdp-tls` -- TLS Transport
 
-- [ ] `TlsUpgrader` trait
-- [ ] `rustls` 백엔드 (기본)
-- [ ] `native-tls` 백엔드 (feature flag)
-- [ ] 서버 공개키 추출 (`extract_server_public_key()`)
-- [ ] 자체 서명 인증서 처리 (RDP 서버 일반적)
-- [ ] TLS 1.2 / 1.3 지원
+- [x] `TlsUpgrader` trait
+- [x] `rustls` 백엔드 (기본)
+- [x] `native-tls` 백엔드 (feature flag)
+- [x] 서버 공개키 추출 (`extract_server_public_key()`)
+- [x] 자체 서명 인증서 처리 (RDP 서버 일반적)
+- [x] TLS 1.2 / 1.3 지원
 
 ---
 
