@@ -286,25 +286,25 @@ pub trait PduHint: Send + Sync {
 #### 4.2.3 GCC Layer (T.124)
 
 **Conference Create:**
-- [ ] `ConferenceCreateRequest` -- PER-encoded, wraps client data blocks
-- [ ] `ConferenceCreateResponse` -- PER-encoded, wraps server data blocks
+- [x] `ConferenceCreateRequest` -- PER-encoded, wraps client data blocks
+- [x] `ConferenceCreateResponse` -- PER-encoded, wraps server data blocks
 
 **Client Data Blocks:**
-- [ ] `ClientCoreData` -- RDP 버전, 해상도, 색상 깊이, 키보드 타입/레이아웃, 클라이언트 이름, 성능 플래그, 연결 타입, 서버 선택 프로토콜
-- [ ] `ClientSecurityData` -- 암호화 방법, 암호화 레벨
-- [ ] `ClientNetworkData` -- 요청 채널 목록 (이름 + 옵션)
-- [ ] `ClientClusterData` -- 세션 리다이렉션, 클러스터 플래그
-- [ ] `ClientMonitorData` -- 모니터 정의 (좌표, primary 플래그)
-- [ ] `ClientMonitorExtendedData` -- 물리 크기, 방향, 스케일링
-- [ ] `ClientMessageChannelData` -- 메시지 채널 지원
-- [ ] `ClientMultitransportChannelData` -- UDP 멀티트랜스포트 플래그
+- [x] `ClientCoreData` -- RDP 버전, 해상도, 색상 깊이, 키보드 타입/레이아웃, 클라이언트 이름, 성능 플래그, 연결 타입, 서버 선택 프로토콜
+- [x] `ClientSecurityData` -- 암호화 방법, 암호화 레벨
+- [x] `ClientNetworkData` -- 요청 채널 목록 (이름 + 옵션)
+- [x] `ClientClusterData` -- 세션 리다이렉션, 클러스터 플래그
+- [x] `ClientMonitorData` -- 모니터 정의 (좌표, primary 플래그)
+- [x] `ClientMonitorExtendedData` -- 물리 크기, 방향, 스케일링
+- [x] `ClientMessageChannelData` -- 메시지 채널 지원
+- [x] `ClientMultitransportChannelData` -- UDP 멀티트랜스포트 플래그
 
 **Server Data Blocks:**
-- [ ] `ServerCoreData` -- RDP 버전, 요청 프로토콜, earlyCapabilityFlags
-- [ ] `ServerSecurityData` -- 암호화 방법, 서버 인증서/공개키
-- [ ] `ServerNetworkData` -- 할당된 채널 ID 목록
-- [ ] `ServerMessageChannelData`
-- [ ] `ServerMultitransportChannelData`
+- [x] `ServerCoreData` -- RDP 버전, 요청 프로토콜, earlyCapabilityFlags
+- [x] `ServerSecurityData` -- 암호화 방법, 서버 인증서/공개키
+- [x] `ServerNetworkData` -- 할당된 채널 ID 목록
+- [x] `ServerMessageChannelData`
+- [x] `ServerMultitransportChannelData`
 
 #### 4.2.4 RDP Core PDUs
 
