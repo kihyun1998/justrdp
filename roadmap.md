@@ -412,7 +412,7 @@ pub trait PduHint: Send + Sync {
 - [x] `FastPathUnicodeKeyboardEvent`
 - [x] `FastPathMouseEvent`
 - [x] `FastPathExtendedMouseEvent`
-- [ ] `FastPathRelativeMouseEvent` *(Phase 2 -- 드물게 사용)*
+- [x] `FastPathRelativeMouseEvent`
 - [x] `FastPathSyncEvent`
 - [x] `FastPathQoeTimestampEvent`
 

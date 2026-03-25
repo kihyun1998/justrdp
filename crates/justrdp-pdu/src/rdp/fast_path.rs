@@ -264,6 +264,7 @@ pub enum FastPathInputEventCode {
     MouseX = 0x2,
     Sync = 0x3,
     Unicode = 0x4,
+    RelativeMouse = 0x5,
     QoeTimestamp = 0x6,
 }
 
@@ -275,6 +276,7 @@ impl FastPathInputEventCode {
             0x2 => Ok(Self::MouseX),
             0x3 => Ok(Self::Sync),
             0x4 => Ok(Self::Unicode),
+            0x5 => Ok(Self::RelativeMouse),
             0x6 => Ok(Self::QoeTimestamp),
             _ => Err(DecodeError::unexpected_value(
                 "FastPathInputEventCode",
@@ -407,6 +409,46 @@ impl<'de> Decode<'de> for FastPathMouseXEvent {
     }
 }
 
+/// Relative mouse input event (eventCode = 0x5).
+///
+/// MS-RDPBCGR 2.2.8.1.2.2.5: carries signed delta coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastPathRelativeMouseEvent {
+    pub event_flags: u8,
+    pub x_delta: i16,
+    pub y_delta: i16,
+}
+
+impl Encode for FastPathRelativeMouseEvent {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        let header = (self.event_flags & 0x1F)
+            | ((FastPathInputEventCode::RelativeMouse as u8) << 5);
+        dst.write_u8(header, "FastPathRelativeMouseEvent::eventHeader")?;
+        dst.write_i16_le(self.x_delta, "FastPathRelativeMouseEvent::xDelta")?;
+        dst.write_i16_le(self.y_delta, "FastPathRelativeMouseEvent::yDelta")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str { "FastPathRelativeMouseEvent" }
+    fn size(&self) -> usize { 5 }
+}
+
+impl<'de> Decode<'de> for FastPathRelativeMouseEvent {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let header = src.read_u8("FastPathRelativeMouseEvent::eventHeader")?;
+        let event_flags = header & 0x1F;
+        let code = (header >> 5) & 0x07;
+        if code != FastPathInputEventCode::RelativeMouse as u8 {
+            return Err(DecodeError::unexpected_value(
+                "FastPathRelativeMouseEvent", "eventCode", "expected RelativeMouse event code",
+            ));
+        }
+        let x_delta = src.read_i16_le("FastPathRelativeMouseEvent::xDelta")?;
+        let y_delta = src.read_i16_le("FastPathRelativeMouseEvent::yDelta")?;
+        Ok(Self { event_flags, x_delta, y_delta })
+    }
+}
+
 /// Synchronize input event (eventCode = 0x3).
 ///
 /// The eventFlags field contains the toggle key states directly.
@@ -517,6 +559,7 @@ pub enum FastPathInputEvent {
     Scancode(FastPathScancodeEvent),
     Mouse(FastPathMouseEvent),
     MouseX(FastPathMouseXEvent),
+    RelativeMouse(FastPathRelativeMouseEvent),
     Sync(FastPathSyncEvent),
     Unicode(FastPathUnicodeEvent),
     QoeTimestamp(FastPathQoeTimestampEvent),
@@ -528,6 +571,7 @@ impl Encode for FastPathInputEvent {
             FastPathInputEvent::Scancode(e) => e.encode(dst),
             FastPathInputEvent::Mouse(e) => e.encode(dst),
             FastPathInputEvent::MouseX(e) => e.encode(dst),
+            FastPathInputEvent::RelativeMouse(e) => e.encode(dst),
             FastPathInputEvent::Sync(e) => e.encode(dst),
             FastPathInputEvent::Unicode(e) => e.encode(dst),
             FastPathInputEvent::QoeTimestamp(e) => e.encode(dst),
@@ -541,6 +585,7 @@ impl Encode for FastPathInputEvent {
             FastPathInputEvent::Scancode(e) => e.size(),
             FastPathInputEvent::Mouse(e) => e.size(),
             FastPathInputEvent::MouseX(e) => e.size(),
+            FastPathInputEvent::RelativeMouse(e) => e.size(),
             FastPathInputEvent::Sync(e) => e.size(),
             FastPathInputEvent::Unicode(e) => e.size(),
             FastPathInputEvent::QoeTimestamp(e) => e.size(),
@@ -562,6 +607,9 @@ impl<'de> Decode<'de> for FastPathInputEvent {
             }
             FastPathInputEventCode::MouseX => {
                 Ok(FastPathInputEvent::MouseX(FastPathMouseXEvent::decode(src)?))
+            }
+            FastPathInputEventCode::RelativeMouse => {
+                Ok(FastPathInputEvent::RelativeMouse(FastPathRelativeMouseEvent::decode(src)?))
             }
             FastPathInputEventCode::Sync => {
                 Ok(FastPathInputEvent::Sync(FastPathSyncEvent::decode(src)?))
@@ -748,6 +796,31 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         let decoded = FastPathSyncEvent::decode(&mut cursor).unwrap();
         assert_eq!(decoded, evt);
+    }
+
+    #[test]
+    fn relative_mouse_event_roundtrip() {
+        let evt = FastPathRelativeMouseEvent { event_flags: 0, x_delta: -10, y_delta: 25 };
+        let buf = roundtrip_encode(&evt);
+        assert_eq!(buf.len(), 5);
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = FastPathRelativeMouseEvent::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, evt);
+    }
+
+    #[test]
+    fn relative_mouse_generic_dispatch() {
+        let evt = FastPathRelativeMouseEvent { event_flags: 0x03, x_delta: 100, y_delta: -50 };
+        let buf = roundtrip_encode(&evt);
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = FastPathInputEvent::decode(&mut cursor).unwrap();
+        match decoded {
+            FastPathInputEvent::RelativeMouse(e) => {
+                assert_eq!(e.x_delta, 100);
+                assert_eq!(e.y_delta, -50);
+            }
+            other => panic!("expected RelativeMouse, got {:?}", other),
+        }
     }
 
     #[test]
