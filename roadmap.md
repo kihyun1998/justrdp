@@ -309,92 +309,92 @@ pub trait PduHint: Send + Sync {
 #### 4.2.4 RDP Core PDUs
 
 **Client Info:**
-- [ ] `ClientInfoPdu` -- 사용자 이름, 비밀번호, 도메인, 셸, 작업 디렉터리
-- [ ] `ExtendedClientInfo` -- 자동 재연결 쿠키, 성능 플래그, 타임존, 클라이언트 주소, 압축 타입
+- [x] `ClientInfoPdu` -- 사용자 이름, 비밀번호, 도메인, 셸, 작업 디렉터리
+- [x] `ExtendedClientInfo` -- 자동 재연결 쿠키, 성능 플래그, 타임존, 클라이언트 주소, 압축 타입
 
 **Licensing (MS-RDPELE):**
-- [ ] `LicenseRequest`
-- [ ] `PlatformChallenge` / `PlatformChallengeResponse`
-- [ ] `NewLicense` / `UpgradeLicense`
-- [ ] `LicenseInfo`
-- [ ] `LicenseErrorMessage` (STATUS_VALID_CLIENT 포함)
+- [x] `LicenseRequest` *(LicenseGenericPdu로 처리)*
+- [x] `PlatformChallenge` / `PlatformChallengeResponse` *(LicenseGenericPdu로 처리)*
+- [x] `NewLicense` / `UpgradeLicense` *(LicenseGenericPdu로 처리)*
+- [x] `LicenseInfo` *(LicenseGenericPdu로 처리)*
+- [x] `LicenseErrorMessage` (STATUS_VALID_CLIENT 포함)
 
 **Capability Sets (30종):**
-- [ ] `GeneralCapability` -- OS 타입, 프로토콜 버전, 압축 타입, extraFlags
-- [ ] `BitmapCapability` -- 해상도, 색상 깊이, bitmap 압축 지원
-- [ ] `OrderCapability` -- 지원 drawing order 배열 (32바이트), 협상 플래그
-- [ ] `BitmapCacheCapability` (Rev1) -- 3개 캐시
-- [ ] `BitmapCacheRev2Capability` -- 5개 캐시, persistent caching
-- [ ] `ControlCapability`
-- [ ] `ActivationCapability`
-- [ ] `PointerCapability` -- 포인터 캐시 크기, 컬러/라지 포인터 지원
-- [ ] `ShareCapability`
-- [ ] `ColorCacheCapability`
-- [ ] `SoundCapability` -- 비프 지원
-- [ ] `InputCapability` -- scancode/unicode/fastpath/mouse 플래그
-- [ ] `FontCapability`
-- [ ] `BrushCapability`
-- [ ] `GlyphCacheCapability` -- 10개 글리프 캐시 크기
-- [ ] `OffscreenCacheCapability`
-- [ ] `BitmapCacheHostSupportCapability`
-- [ ] `VirtualChannelCapability` -- 압축, 청크 크기
-- [ ] `DrawNineGridCacheCapability`
-- [ ] `DrawGdiPlusCapability`
-- [ ] `RailCapability` -- RemoteApp 플래그
-- [ ] `WindowCapability` -- RAIL 윈도우 관리
-- [ ] `DesktopCompositionCapability`
-- [ ] `MultifragmentUpdateCapability` -- 최대 요청 크기
-- [ ] `LargePointerCapability` -- 96x96 / 384x384
-- [ ] `SurfaceCommandsCapability` -- SetSurfaceBits, FrameMarker
-- [ ] `BitmapCodecsCapability` -- NSCodec, RemoteFX, JPEG 코덱 협상
-- [ ] `FrameAcknowledgeCapability`
+- [x] `GeneralCapability` -- OS 타입, 프로토콜 버전, 압축 타입, extraFlags
+- [x] `BitmapCapability` -- 해상도, 색상 깊이, bitmap 압축 지원
+- [x] `OrderCapability` -- 지원 drawing order 배열 (32바이트), 협상 플래그
+- [x] `BitmapCacheCapability` (Rev1) -- 3개 캐시
+- [x] `BitmapCacheRev2Capability` -- 5개 캐시, persistent caching
+- [x] `ControlCapability`
+- [x] `ActivationCapability`
+- [x] `PointerCapability` -- 포인터 캐시 크기, 컬러/라지 포인터 지원
+- [x] `ShareCapability`
+- [x] `ColorCacheCapability`
+- [x] `SoundCapability` -- 비프 지원
+- [x] `InputCapability` -- scancode/unicode/fastpath/mouse 플래그
+- [x] `FontCapability`
+- [x] `BrushCapability`
+- [x] `GlyphCacheCapability` -- 10개 글리프 캐시 크기
+- [x] `OffscreenCacheCapability`
+- [x] `BitmapCacheHostSupportCapability`
+- [x] `VirtualChannelCapability` -- 압축, 청크 크기
+- [x] `DrawNineGridCacheCapability`
+- [x] `DrawGdiPlusCapability`
+- [x] `RailCapability` -- RemoteApp 플래그
+- [x] `WindowCapability` -- RAIL 윈도우 관리
+- [x] `DesktopCompositionCapability`
+- [x] `MultifragmentUpdateCapability` -- 최대 요청 크기
+- [x] `LargePointerCapability` -- 96x96 / 384x384
+- [x] `SurfaceCommandsCapability` -- SetSurfaceBits, FrameMarker
+- [x] `BitmapCodecsCapability` -- NSCodec, RemoteFX, JPEG 코덱 협상
+- [x] `FrameAcknowledgeCapability`
 
 **Connection Finalization PDUs:**
-- [ ] `SynchronizePdu`
-- [ ] `ControlPdu` (Cooperate / RequestControl / GrantedControl)
-- [ ] `PersistentKeyListPdu`
-  - [ ] Key1 / Key2 쌍 (64비트 식별자)으로 캐시 엔트리 참조
-  - [ ] 5개 캐시에 대한 엔트리 수 (numEntriesCache0~4)
-  - [ ] 총 엔트리 수 (totalEntriesCache0~4)
-  - [ ] PERSIST_FIRST_PDU / PERSIST_LAST_PDU 플래그 (대량 키 목록 분할 전송)
-  - [ ] 서버 응답: 캐시된 비트맵 재전송 생략으로 재연결 속도 향상
-- [ ] `FontListPdu` / `FontMapPdu`
+- [x] `SynchronizePdu`
+- [x] `ControlPdu` (Cooperate / RequestControl / GrantedControl)
+- [x] `PersistentKeyListPdu`
+  - [x] Key1 / Key2 쌍 (64비트 식별자)으로 캐시 엔트리 참조
+  - [x] 5개 캐시에 대한 엔트리 수 (numEntriesCache0~4)
+  - [x] 총 엔트리 수 (totalEntriesCache0~4)
+  - [x] PERSIST_FIRST_PDU / PERSIST_LAST_PDU 플래그 (대량 키 목록 분할 전송)
+  - [x] 서버 응답: 캐시된 비트맵 재전송 생략으로 재연결 속도 향상
+- [x] `FontListPdu` / `FontMapPdu`
 
 **Deactivation-Reactivation Sequence:**
-- [ ] `DeactivateAllPdu` -- 서버가 세션 비활성화 (해상도 변경, 재협상 등)
-- [ ] Demand Active → Confirm Active 재협상
-- [ ] Connection Finalization 재수행
-- [ ] 채널 상태 유지 (채널 재생성 불필요)
-- [ ] 그래픽 캐시 무효화 여부 판단
+- [x] `DeactivateAllPdu` -- 서버가 세션 비활성화 (해상도 변경, 재협상 등)
+- [x] Demand Active → Confirm Active 재협상 *(DemandActivePdu / ConfirmActivePdu 구현)*
+- [ ] Connection Finalization 재수행 *(상태 머신 레벨, Phase 2에서 구현)*
+- [ ] 채널 상태 유지 (채널 재생성 불필요) *(상태 머신 레벨)*
+- [ ] 그래픽 캐시 무효화 여부 판단 *(상태 머신 레벨)*
 
 **Share Data PDUs (활성 세션):**
-- [ ] `ShareDataHeader` -- pduType2, compressedType, compressedLength
+- [x] `ShareDataHeader` -- pduType2, compressedType, compressedLength
 - [ ] `UpdatePdu` -- Orders / Bitmap / Palette / Synchronize
 - [ ] `PointerUpdatePdu` -- System / Color / New / Cached / Large
-- [ ] `InputEventPdu` -- 입력 이벤트 배열
-- [ ] `SuppressOutputPdu`
-- [ ] `RefreshRectPdu`
-- [ ] `ShutdownRequestPdu` / `ShutdownDeniedPdu`
-- [ ] `SaveSessionInfoPdu` -- Logon / AutoReconnect
-- [ ] `SetErrorInfoPdu` -- 300+ disconnect reason 코드
+- [x] `InputEventPdu` -- 입력 이벤트 배열
+- [x] `SuppressOutputPdu`
+- [x] `RefreshRectPdu`
+- [x] `ShutdownRequestPdu` / `ShutdownDeniedPdu`
+- [x] `SaveSessionInfoPdu` -- Logon / AutoReconnect
+- [x] `SetErrorInfoPdu` -- 300+ disconnect reason 코드
 - [ ] `SetKeyboardIndicatorsPdu`
 - [ ] `SetKeyboardImeStatusPdu`
-- [ ] `MonitorLayoutPdu`
+- [x] `MonitorLayoutPdu`
 
 **Auto-Detect PDUs (Network Characteristics Detection):**
-- [ ] `AutoDetectRequest` / `AutoDetectResponse`
-- [ ] RTT Measure Request/Response (requestType 0x0001/0x1001)
-- [ ] Bandwidth Measure Start (requestType 0x0014)
-- [ ] Bandwidth Measure Payload (requestType 0x0002)
-- [ ] Bandwidth Measure Stop (requestType 0x002B/0x0429)
-- [ ] Bandwidth Measure Results (responseType 0x003B/0x0003)
-- [ ] Network Characteristics Result (requestType 0x0840/0x0880/0x08C0)
-  - [ ] baseRTT, bandwidth, averageRTT
-- [ ] Connect-Time vs. Continuous Auto-Detect 구분
-- [ ] `AutoDetectSequence` -- 상태 머신 (RTT → Bandwidth → Result)
+- [x] `AutoDetectRequest` / `AutoDetectResponse` *(AutoDetectPdu로 통합 처리)*
+- [x] RTT Measure Request/Response (requestType 0x0001/0x1001)
+- [x] Bandwidth Measure Start (requestType 0x0014)
+- [x] Bandwidth Measure Payload (requestType 0x0002)
+- [x] Bandwidth Measure Stop (requestType 0x002B/0x0429)
+- [x] Bandwidth Measure Results (responseType 0x003B/0x0003)
+- [x] Network Characteristics Result (requestType 0x0840/0x0880/0x08C0)
+  - [x] baseRTT, bandwidth, averageRTT
+- [x] Connect-Time vs. Continuous Auto-Detect 구분
+- [ ] `AutoDetectSequence` -- 상태 머신 (RTT → Bandwidth → Result) *(상태 머신 레벨, Phase 2)*
 
 **Multitransport PDUs:**
-- [ ] `InitiateMultitransportRequest` / `MultitransportResponse`
+- [x] `InitiateMultitransportRequest` / `MultitransportResponse`
 
 #### 4.2.5 Fast-Path PDUs
 

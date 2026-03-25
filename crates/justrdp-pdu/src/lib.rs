@@ -11,5 +11,6 @@ pub use justrdp_core::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 pub mod gcc;
 pub mod mcs;
 pub mod pcb;
+pub mod rdp;
 pub mod tpkt;
 pub mod x224;
