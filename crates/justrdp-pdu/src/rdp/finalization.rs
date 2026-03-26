@@ -792,6 +792,34 @@ mod tests {
         assert!(ControlAction::from_u16(0xFFFF).is_err());
     }
 
+    #[test]
+    fn control_pdu_detach_roundtrip() {
+        let pdu = ControlPdu { action: ControlAction::Detach, grant_id: 0, control_id: 0 };
+        let mut buf = [0u8; CONTROL_PDU_SIZE];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        assert_eq!(ControlPdu::decode(&mut cursor).unwrap().action, ControlAction::Detach);
+    }
+
+    #[test]
+    fn persistent_key_list_zero_keys() {
+        let pdu = PersistentKeyListPdu {
+            num_entries: [0; 5],
+            total_entries: [0; 5],
+            flags: 0x03, // FIRST | LAST
+            keys: alloc::vec![],
+        };
+        let size = pdu.size();
+        assert_eq!(size, PERSISTENT_KEY_LIST_HEADER_SIZE);
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = PersistentKeyListPdu::decode(&mut cursor).unwrap();
+        assert!(decoded.keys.is_empty());
+    }
+
     // ── Derive macro test ──
 
     #[derive(Debug, Clone, PartialEq, Eq, crate::DeriveEncode, crate::DeriveDecode)]

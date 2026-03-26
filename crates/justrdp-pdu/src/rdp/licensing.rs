@@ -290,4 +290,19 @@ mod tests {
     fn license_error_unknown_code() {
         assert!(LicenseErrorCode::from_u32(0xFFFF).is_err());
     }
+
+    #[test]
+    fn license_error_valid_client_wire_format() {
+        let msg = LicenseErrorMessage::valid_client();
+        let mut buf = alloc::vec![0u8; msg.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        msg.encode(&mut cursor).unwrap();
+
+        assert_eq!(buf[0], 0xFF);  // ErrorAlert
+        assert_eq!(buf[1], 0x80);  // EXTENDED_ERROR_MSG_SUPPORTED
+        assert_eq!(&buf[2..4], &[0x10, 0x00]); // msg_size = 16 LE
+        assert_eq!(&buf[4..8], &[0x07, 0x00, 0x00, 0x00]); // STATUS_VALID_CLIENT
+        assert_eq!(&buf[8..12], &[0x02, 0x00, 0x00, 0x00]); // ST_NO_TRANSITION
+        assert_eq!(&buf[12..16], &[0x04, 0x00, 0x00, 0x00]); // BB_ERROR_BLOB, len=0
+    }
 }

@@ -1025,7 +1025,7 @@ impl<'de> Decode<'de> for LargePointerCapability {
     }
 }
 
-/// Surface Commands Capability Set (MS-RDPBCGR 2.2.7.2.9).
+/// Surface Commands Capability Set (MS-RDPBCGR 2.2.7.2.12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceCommandsCapability {
     pub cmd_flags: u32,

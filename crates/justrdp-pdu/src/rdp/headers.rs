@@ -272,6 +272,20 @@ mod tests {
     fn share_data_unknown_type() {
         assert!(ShareDataPduType::from_u8(0xFF).is_err());
     }
+
+    #[test]
+    fn share_control_all_types_roundtrip() {
+        use ShareControlPduType::*;
+        for pdu_type in [DemandActivePdu, ConfirmActivePdu, DeactivateAllPdu, Data, ServerRedirect] {
+            let hdr = ShareControlHeader { total_length: 6, pdu_type, pdu_source: 0x03EC };
+            let mut buf = [0u8; SHARE_CONTROL_HEADER_SIZE];
+            let mut cursor = WriteCursor::new(&mut buf);
+            hdr.encode(&mut cursor).unwrap();
+            let mut cursor = ReadCursor::new(&buf);
+            let decoded = ShareControlHeader::decode(&mut cursor).unwrap();
+            assert_eq!(decoded.pdu_type, pdu_type, "failed for {:?}", pdu_type);
+        }
+    }
 }
 
 // ── Slow-Path Update PDU (MS-RDPBCGR 2.2.9.1.1.3) ──
