@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Big unsigned integer arithmetic for DH/RSA.
 //!
 //! Provides a minimal `BigUint` implementation sufficient for:
@@ -505,5 +507,41 @@ mod tests {
         assert_eq!(BigUint::from_u32(1).bit_len(), 1);
         assert_eq!(BigUint::from_u32(255).bit_len(), 8);
         assert_eq!(BigUint::from_u32(256).bit_len(), 9);
+    }
+
+    #[test]
+    fn from_le_bytes_roundtrip() {
+        let bytes = [0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01];
+        let n = BigUint::from_le_bytes(&bytes);
+        let out = n.to_le_bytes();
+        assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn le_be_consistency() {
+        // Same number in LE and BE
+        let le = [0x01, 0x02, 0x03, 0x04]; // 0x04030201
+        let be = [0x04, 0x03, 0x02, 0x01]; // 0x04030201
+        let n_le = BigUint::from_le_bytes(&le);
+        let n_be = BigUint::from_be_bytes(&be);
+        assert_eq!(n_le, n_be);
+    }
+
+    #[test]
+    fn mod_exp_boundary_exponents() {
+        let base = BigUint::from_u32(7);
+        let m = BigUint::from_u32(13);
+        // x^0 mod m = 1
+        assert_eq!(base.mod_exp(&BigUint::from_u32(0), &m), BigUint::from_u32(1));
+        // x^1 mod m = x mod m
+        assert_eq!(base.mod_exp(&BigUint::from_u32(1), &m), BigUint::from_u32(7));
+    }
+
+    #[test]
+    fn sub_to_zero() {
+        let a = BigUint::from_u32(42);
+        let b = BigUint::from_u32(42);
+        let c = a.sub(&b);
+        assert!(c.is_zero());
     }
 }

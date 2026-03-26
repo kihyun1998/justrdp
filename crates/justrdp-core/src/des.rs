@@ -464,4 +464,24 @@ mod tests {
         // Ciphertext should differ from plaintext
         assert_ne!(ct, plaintext);
     }
+
+    #[test]
+    fn triple_des_nist_sp800_67_known_ciphertext() {
+        // NIST SP 800-67 Appendix B
+        // Key1=0123456789ABCDEF, Key2=23456789ABCDEF01, Key3=456789ABCDEF0123
+        // Plaintext="The qufc" (0x5468652071756663)
+        // Expected ciphertext=0xA826FD8CE53B855F
+        let key: [u8; 24] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+            0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01,
+            0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23,
+        ];
+        let plaintext: [u8; 8] = [0x54, 0x68, 0x65, 0x20, 0x71, 0x75, 0x66, 0x63];
+        let expected_ct: [u8; 8] = [0xA8, 0x26, 0xFD, 0x8C, 0xE5, 0x3B, 0x85, 0x5F];
+
+        let cipher = TripleDes::new(&key);
+        let ct = cipher.encrypt_block(&plaintext);
+        assert_eq!(ct, expected_ct);
+        assert_eq!(cipher.decrypt_block(&expected_ct), plaintext);
+    }
 }

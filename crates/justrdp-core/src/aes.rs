@@ -582,6 +582,8 @@ pub fn krb5_aes_string_to_key(password: &[u8], salt: &[u8], iterations: u32, key
 /// Ke = DK(base_key, usage_number || 0xAA)
 pub fn krb5_derive_ke(base_key: &[u8], usage: i32) -> Vec<u8> {
     let key_len = base_key.len();
+    assert!(key_len == 16 || key_len == 32,
+        "krb5_derive_ke: base_key must be 16 (AES-128) or 32 (AES-256) bytes, got {key_len}");
     let mut constant = vec![0u8; 5];
     constant[0] = (usage >> 24) as u8;
     constant[1] = (usage >> 16) as u8;
@@ -601,6 +603,8 @@ pub fn krb5_derive_ke(base_key: &[u8], usage: i32) -> Vec<u8> {
 /// Ki = DK(base_key, usage_number || 0x55)
 pub fn krb5_derive_ki(base_key: &[u8], usage: i32) -> Vec<u8> {
     let key_len = base_key.len();
+    assert!(key_len == 16 || key_len == 32,
+        "krb5_derive_ki: base_key must be 16 (AES-128) or 32 (AES-256) bytes, got {key_len}");
     let mut constant = vec![0u8; 5];
     constant[0] = (usage >> 24) as u8;
     constant[1] = (usage >> 16) as u8;
@@ -854,6 +858,30 @@ mod tests {
             aes_cts_decrypt(&aes, &iv, &mut data);
             assert_eq!(data, plaintext, "CTS roundtrip failed for size {size}");
         }
+    }
+
+    #[test]
+    fn aes_cts_rfc3962_section6_17bytes() {
+        // RFC 3962 Section 6, Case 2: 17-byte plaintext
+        let key: [u8; 16] = [
+            0x63, 0x68, 0x69, 0x63, 0x6b, 0x65, 0x6e, 0x20,
+            0x74, 0x65, 0x72, 0x69, 0x79, 0x61, 0x6b, 0x69,
+        ];
+        let iv = [0u8; 16];
+        let pt: [u8; 17] = [
+            0x49, 0x20, 0x77, 0x6f, 0x75, 0x6c, 0x64, 0x20,
+            0x6c, 0x69, 0x6b, 0x65, 0x20, 0x74, 0x68, 0x65, 0x20,
+        ];
+        let expected_ct: [u8; 17] = [
+            0xc6, 0x35, 0x35, 0x68, 0xf2, 0xbf, 0x8c, 0xb4,
+            0xd8, 0xa5, 0x80, 0x36, 0x2d, 0xa7, 0xff, 0x7f, 0x97,
+        ];
+        let aes = Aes128::new(&key);
+        let mut data = pt;
+        aes_cts_encrypt(&aes, &iv, &mut data);
+        assert_eq!(data, expected_ct);
+        aes_cts_decrypt(&aes, &iv, &mut data);
+        assert_eq!(data, pt);
     }
 
     #[test]

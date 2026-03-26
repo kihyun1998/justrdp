@@ -281,4 +281,23 @@ mod tests {
         assert_eq!(key.key_size(), 64);
         assert_eq!(key.public_key().key_size(), 64);
     }
+
+    #[test]
+    fn rsa_public_encrypt_rdp_known_answer() {
+        // Textbook RSA: n=33, e=3. plaintext=2 → 2^3 mod 33 = 8
+        let pub_key = RsaPublicKey {
+            n: BigUint::from_u32(33),
+            e: BigUint::from_u32(3),
+        };
+        let ct = rsa_public_encrypt_rdp(&pub_key, &[0x02]); // 2 in LE
+        assert_eq!(ct[0], 0x08); // 8 in LE
+    }
+
+    #[test]
+    fn rsa_verify_wrong_length_signature() {
+        let key = test_512bit_key();
+        let pub_key = key.public_key();
+        assert!(!rsa_verify_sha256(&pub_key, b"data", &[0u8; 32])); // too short
+        assert!(!rsa_verify_sha256(&pub_key, b"data", &[])); // empty
+    }
 }

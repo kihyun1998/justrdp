@@ -735,4 +735,74 @@ mod tests {
              0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7]
         );
     }
+
+    // ── RC4 RFC 6229 known-answer test ──
+
+    #[test]
+    fn rc4_known_answer_encrypt_decrypt() {
+        // RC4 known test: key="Key", plaintext="Plaintext"
+        // Expected ciphertext from OpenSSL reference: BBF316E8D940AF0AD3
+        let mut data = *b"Plaintext";
+        let mut rc4 = Rc4::new(b"Key");
+        rc4.process(&mut data);
+        assert_eq!(data, [0xBB, 0xF3, 0x16, 0xE8, 0xD9, 0x40, 0xAF, 0x0A, 0xD3]);
+
+        // Decrypt back
+        let mut rc4 = Rc4::new(b"Key");
+        rc4.process(&mut data);
+        assert_eq!(&data, b"Plaintext");
+    }
+
+    // ── HMAC long-key branch ──
+
+    #[test]
+    fn hmac_md5_long_key() {
+        // RFC 2104 Test Case 3: key > 64 bytes triggers hash-key path
+        let key = vec![0xAAu8; 80];
+        let data = b"Test Using Larger Than Block-Size Key - Hash Key First";
+        let result = hmac_md5(&key, data);
+        assert_eq!(result, [
+            0x6b, 0x1a, 0xb7, 0xfe, 0x4b, 0xd7, 0xbf, 0x8f,
+            0x0b, 0x62, 0xe6, 0xce, 0x61, 0xb9, 0xd0, 0xcd,
+        ]);
+    }
+
+    // ── SHA-256 incremental update ──
+
+    #[test]
+    fn sha256_incremental_matches_oneshot() {
+        let data = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+        let oneshot = sha256(data);
+        let mut h = Sha256::new();
+        h.update(&data[..28]);
+        h.update(&data[28..]);
+        let incremental = h.finalize();
+        assert_eq!(oneshot, incremental);
+        // FIPS 180-2 known answer for this 56-byte input
+        assert_eq!(oneshot, [
+            0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8,
+            0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60, 0x39,
+            0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67,
+            0xf6, 0xec, 0xed, 0xd4, 0x19, 0xdb, 0x06, 0xc1,
+        ]);
+    }
+
+    // ── MD5 padding boundary test ──
+
+    #[test]
+    fn md5_56_byte_boundary() {
+        // 56 bytes forces extra padding block (message + 0x80 = 57 > 56)
+        let input = vec![b'a'; 56];
+        let result = md5(&input);
+        // Known-answer: MD5("a" * 56)
+        assert_eq!(result, [
+            0x3B, 0x0C, 0x8A, 0xC7, 0x03, 0xF8, 0x28, 0xB0,
+            0x4C, 0x6C, 0x19, 0x70, 0x06, 0xD1, 0x72, 0x18,
+        ]);
+        // Also verify incremental == oneshot
+        let mut h = Md5::new();
+        h.update(&input[..32]);
+        h.update(&input[32..]);
+        assert_eq!(h.finalize(), result);
+    }
 }

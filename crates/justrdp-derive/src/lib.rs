@@ -150,7 +150,7 @@ pub fn derive_encode(input: TokenStream) -> TokenStream {
                 size_stmts.push(quote! { 4 });
             }
             FieldKind::Bytes(n) => {
-                encode_stmts.push(quote! { dst.write_slice(&self.#field_name, #ctx)?; });
+                encode_stmts.push(quote! { dst.write_slice(&self.#field_name[..#n], #ctx)?; });
                 size_stmts.push(quote! { #n });
             }
             FieldKind::Rest => {

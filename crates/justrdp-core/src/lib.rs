@@ -57,10 +57,15 @@ pub fn decode<'de, T: Decode<'de>>(bytes: &'de [u8]) -> DecodeResult<T> {
 }
 
 /// Helper function to encode a value into an existing [`WriteBuf`].
+///
+/// **Note**: This always writes from the start of the buffer (offset 0).
+/// It is designed for single-PDU encoding, not accumulating multiple PDUs.
+/// The buffer is resized to exactly `value.size()` bytes before writing.
+/// For appending multiple PDUs, use `encode_vec` and concatenate.
 #[cfg(feature = "alloc")]
 pub fn encode_buf<T: Encode>(value: &T, buf: &mut WriteBuf) -> EncodeResult<usize> {
     let size = value.size();
-    buf.ensure_capacity(size);
+    buf.resize(size);
     let mut cursor = WriteCursor::new(buf.as_mut_slice());
     value.encode(&mut cursor)?;
     Ok(size)
