@@ -521,7 +521,7 @@ pub enum ClientConnectorState {
 
 - [x] `ClientConnector` struct -- `Sequence` trait 구현
 - [x] `Sequence` trait -- `next_pdu_hint()`, `state()`, `step()`
-- [ ] `Config` struct:
+- [x] `Config` struct:
   ```rust
   pub struct Config {
       pub credentials: Credentials,
@@ -543,7 +543,7 @@ pub enum ClientConnectorState {
   ```
 - [x] `ConnectionResult` -- 연결 결과 (채널 ID 매핑, 서버 capabilities, 세션 정보)
 - [x] `ChannelConnectionSequence` -- 채널 Join 반복 상태 머신
-- [ ] `LicenseExchangeSequence` -- 라이센스 교환 (Valid Client 단축 경로 포함)
+- [x] `LicenseExchangeSequence` -- 라이센스 교환 (Valid Client 단축 경로 포함)
 - [x] `ConnectionActivationSequence` -- Demand Active / Confirm Active 교환
 
 ### 5.2 Authentication
