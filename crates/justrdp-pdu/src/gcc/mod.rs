@@ -399,4 +399,69 @@ mod tests {
         assert_eq!(btype, 0xC001);
         assert_eq!(blen, 100);
     }
+
+    #[test]
+    fn conference_create_request_empty_user_data() {
+        let ccr = ConferenceCreateRequest::new(alloc::vec![]);
+        let size = ccr.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        ccr.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ConferenceCreateRequest::decode(&mut cursor).unwrap();
+        assert!(decoded.user_data.is_empty());
+    }
+
+    #[test]
+    fn conference_create_request_large_payload() {
+        // Payload >= 128 bytes exercises PER long-form length
+        let payload = alloc::vec![0xAB; 200];
+        let ccr = ConferenceCreateRequest::new(payload.clone());
+        let size = ccr.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        ccr.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ConferenceCreateRequest::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.user_data, payload);
+    }
+
+    #[test]
+    fn conference_create_response_bad_h221_key() {
+        let ccr = ConferenceCreateResponse::new(alloc::vec![0x01]);
+        let size = ccr.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        ccr.encode(&mut cursor).unwrap();
+
+        // Corrupt "McDn" key
+        for i in 0..buf.len() - 4 {
+            if &buf[i..i+4] == b"McDn" {
+                buf[i] = 0xFF;
+                break;
+            }
+        }
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(ConferenceCreateResponse::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn conference_create_request_wire_format() {
+        let ccr = ConferenceCreateRequest::new(alloc::vec![0xAB]);
+        let size = ccr.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        ccr.encode(&mut cursor).unwrap();
+
+        // OID key type
+        assert_eq!(&buf[0..2], &[0x00, 0x05]);
+        // T.124 OID
+        assert_eq!(&buf[2..7], &[0x00, 0x14, 0x7C, 0x00, 0x01]);
+        // PER long-form flag in connectPDU length
+        assert_eq!(buf[7] & 0x80, 0x80);
+        // H.221 key "Duca" somewhere in the buffer
+        assert!(buf.windows(4).any(|w| w == b"Duca"));
+    }
 }

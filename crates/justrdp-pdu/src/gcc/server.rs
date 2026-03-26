@@ -419,4 +419,40 @@ mod tests {
         let decoded = ServerMultitransportChannelData::decode(&mut cursor).unwrap();
         assert_eq!(decoded.flags, 0x05);
     }
+
+    #[test]
+    fn server_core_data_one_optional_field() {
+        let mut sc = ServerCoreData::new(0x00080004);
+        sc.client_requested_protocols = Some(0x03);
+        sc.early_capability_flags = None;
+
+        let size = sc.size();
+        assert_eq!(size, DATA_BLOCK_HEADER_SIZE + 4 + 4);
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        sc.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ServerCoreData::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.client_requested_protocols, Some(0x03));
+        assert_eq!(decoded.early_capability_flags, None);
+    }
+
+    #[test]
+    fn server_network_data_zero_channels() {
+        let sn = ServerNetworkData {
+            mcs_channel_id: 0x03EC,
+            channel_ids: alloc::vec![],
+        };
+        let size = sn.size();
+        assert_eq!(size, DATA_BLOCK_HEADER_SIZE + 2 + 2); // header + mcsChId + count
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        sn.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ServerNetworkData::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.mcs_channel_id, 0x03EC);
+        assert!(decoded.channel_ids.is_empty());
+    }
 }

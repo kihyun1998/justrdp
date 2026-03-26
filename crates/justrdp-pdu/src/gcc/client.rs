@@ -858,4 +858,28 @@ mod tests {
         let ch = ChannelDef::new("rdpsnd", 0);
         assert_eq!(ch.name_str(), "rdpsnd");
     }
+
+    #[test]
+    fn client_network_data_zero_channels() {
+        let net = ClientNetworkData { channels: alloc::vec![] };
+        let size = net.size();
+        assert_eq!(size, DATA_BLOCK_HEADER_SIZE + 4); // header + channelCount
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        net.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ClientNetworkData::decode(&mut cursor).unwrap();
+        assert!(decoded.channels.is_empty());
+    }
+
+    #[test]
+    fn channel_def_7char_boundary() {
+        let ch = ChannelDef::new("1234567", 0);
+        assert_eq!(ch.name_str(), "1234567");
+
+        // 8+ chars should be truncated to 7
+        let ch = ChannelDef::new("12345678", 0);
+        assert_eq!(ch.name_str(), "1234567");
+    }
 }
