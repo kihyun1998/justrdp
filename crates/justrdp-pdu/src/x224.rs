@@ -246,10 +246,12 @@ impl NegotiationResponseFlags {
     pub const EXTENDED_CLIENT_DATA: Self = Self(0x01);
     /// Graphics Pipeline Extension supported.
     pub const DYNVC_GFX: Self = Self(0x02);
-    /// Restricted Admin mode supported.
-    pub const RESTRICTED_ADMIN: Self = Self(0x04);
-    /// Redirected Authentication supported.
-    pub const REDIRECTED_AUTH: Self = Self(0x08);
+    /// Reserved (0x04).
+    pub const RESERVED: Self = Self(0x04);
+    /// Restricted Admin mode supported (MS-RDPBCGR 2.2.1.2.1).
+    pub const RESTRICTED_ADMIN: Self = Self(0x08);
+    /// Redirected Authentication supported (MS-RDPBCGR 2.2.1.2.1).
+    pub const REDIRECTED_AUTH: Self = Self(0x10);
 
     /// Create from raw bits.
     pub fn from_bits(bits: u8) -> Self {
@@ -601,6 +603,17 @@ impl<'de> Decode<'de> for ConnectionRequest {
             let left = li.saturating_sub(consumed_now);
             if left >= NegotiationRequest::SIZE {
                 negotiation = Some(NegotiationRequest::decode(src)?);
+
+                // Skip Correlation Info if present (36 bytes, MS-RDPBCGR 2.2.1.1.2)
+                if let Some(ref nego) = negotiation {
+                    if nego.flags.contains(NegotiationRequestFlags::CORRELATION_INFO_PRESENT) {
+                        let consumed_after = src.pos() - start_pos;
+                        let left_after = li.saturating_sub(consumed_after);
+                        if left_after >= 36 {
+                            src.skip(36, "ConnectionRequest::correlationInfo")?;
+                        }
+                    }
+                }
             }
         }
 

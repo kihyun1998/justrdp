@@ -92,7 +92,9 @@ impl Encode for PreConnectionBlob {
         dst.write_u32_le(cb_size, "PCB::cbSize")?;
         dst.write_u32_le(PCB_FLAGS, "PCB::flags")?;
         dst.write_u16_le(self.version(), "PCB::version")?;
-        dst.write_u16_le(0, "PCB::id")?; // reserved
+        // cbTargetName: byte length of targetName field (0 for v1, target wire size for v2)
+        let cb_target_name = self.target_wire_size() as u16;
+        dst.write_u16_le(cb_target_name, "PCB::cbTargetName")?;
         dst.write_slice(&self.correlation_id, "PCB::correlationId")?;
 
         #[cfg(feature = "alloc")]
@@ -128,7 +130,7 @@ impl<'de> Decode<'de> for PreConnectionBlob {
         let cb_size = src.read_u32_le("PCB::cbSize")? as usize;
         let _flags = src.read_u32_le("PCB::flags")?;
         let version = src.read_u16_le("PCB::version")?;
-        let _id = src.read_u16_le("PCB::id")?;
+        let cb_target_name = src.read_u16_le("PCB::cbTargetName")? as usize;
 
         if version != PCB_VERSION_1 && version != PCB_VERSION_2 {
             return Err(DecodeError::unexpected_value(
@@ -143,13 +145,17 @@ impl<'de> Decode<'de> for PreConnectionBlob {
         correlation_id.copy_from_slice(id_bytes);
 
         let target = if version == PCB_VERSION_2 {
-            // Remaining bytes are UTF-16LE target name (including null terminator)
-            let remaining = cb_size.saturating_sub(PCB_V1_FIXED_SIZE);
-            if remaining < 2 {
-                return Err(DecodeError::invalid_value("PreConnectionBlob", "target_size"));
+            // Use cbTargetName for target size, fallback to cbSize-based calculation
+            let target_size = if cb_target_name > 0 {
+                cb_target_name
+            } else {
+                cb_size.saturating_sub(PCB_V1_FIXED_SIZE)
+            };
+            if target_size < 2 {
+                return Err(DecodeError::invalid_value("PreConnectionBlob", "cbTargetName"));
             }
 
-            let target_bytes = src.read_slice(remaining, "PCB::target")?;
+            let target_bytes = src.read_slice(target_size, "PCB::target")?;
             // Decode UTF-16LE, strip null terminator
             let u16_units: alloc::vec::Vec<u16> = target_bytes
                 .chunks_exact(2)
