@@ -587,25 +587,6 @@ fn hmac_generic<const HASH_LEN: usize, const BLOCK_SIZE: usize>(
     hash_fn(&outer)
 }
 
-// ── RSA / Triple-DES traits ──
-
-/// Trait for RSA public key operations (injected by I/O layer).
-pub trait RsaPublicKey {
-    /// Encrypt data with the public key (PKCS#1 v1.5).
-    fn encrypt(&self, plaintext: &[u8], output: &mut [u8]) -> Result<usize, &'static str>;
-
-    /// Verify a signature.
-    fn verify(&self, message: &[u8], signature: &[u8]) -> Result<bool, &'static str>;
-}
-
-/// Trait for Triple-DES operations (FIPS mode).
-pub trait TripleDes {
-    /// Encrypt a block (8 bytes).
-    fn encrypt_block(&self, plaintext: &[u8; 8]) -> [u8; 8];
-    /// Decrypt a block (8 bytes).
-    fn decrypt_block(&self, ciphertext: &[u8; 8]) -> [u8; 8];
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

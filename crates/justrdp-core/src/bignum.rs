@@ -77,6 +77,61 @@ impl BigUint {
         }
     }
 
+    /// Create from little-endian bytes.
+    pub fn from_le_bytes(bytes: &[u8]) -> Self {
+        // Strip trailing zeros
+        let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
+        let bytes = &bytes[..end];
+
+        if bytes.is_empty() {
+            return Self::zero();
+        }
+
+        let n_limbs = (bytes.len() + 3) / 4;
+        let mut limbs = vec![0u32; n_limbs];
+
+        for (i, &b) in bytes.iter().enumerate() {
+            limbs[i / 4] |= (b as u32) << ((i % 4) * 8);
+        }
+
+        let mut r = Self { limbs };
+        r.normalize();
+        r
+    }
+
+    /// Convert to little-endian bytes.
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        if self.is_zero() {
+            return vec![0];
+        }
+
+        let mut bytes = Vec::new();
+        for &limb in &self.limbs {
+            bytes.push(limb as u8);
+            bytes.push((limb >> 8) as u8);
+            bytes.push((limb >> 16) as u8);
+            bytes.push((limb >> 24) as u8);
+        }
+
+        // Strip trailing zeros
+        while bytes.len() > 1 && *bytes.last().unwrap() == 0 {
+            bytes.pop();
+        }
+
+        bytes
+    }
+
+    /// Convert to little-endian bytes, padded to `len` bytes.
+    pub fn to_le_bytes_padded(&self, len: usize) -> Vec<u8> {
+        let bytes = self.to_le_bytes();
+        if bytes.len() >= len {
+            return bytes[..len].to_vec();
+        }
+        let mut padded = bytes;
+        padded.resize(len, 0);
+        padded
+    }
+
     /// Convert to big-endian bytes, padded to `len` bytes.
     pub fn to_be_bytes_padded(&self, len: usize) -> Vec<u8> {
         let bytes = self.to_be_bytes();

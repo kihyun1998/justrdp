@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use justrdp_core::{Decode, Encode, PduHint, ReadCursor, WriteBuf, WriteCursor};
 
 use justrdp_pdu::gcc::client::{ClientClusterData, ClientCoreData, ClientNetworkData, ClientSecurityData};
-use justrdp_pdu::gcc::server::{ServerCoreData, ServerNetworkData, ServerSecurityData};
+use justrdp_pdu::gcc::server::{ServerCoreData, ServerNetworkData};
 use justrdp_pdu::gcc::{
     ConferenceCreateRequest, ConferenceCreateResponse, ServerDataBlockType, DATA_BLOCK_HEADER_SIZE,
 };
@@ -28,6 +28,12 @@ use justrdp_pdu::rdp::capabilities::{
 };
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
 use justrdp_pdu::rdp::finalization::{ControlAction, ControlPdu, FontListPdu, SynchronizePdu};
+use justrdp_pdu::rdp::server_certificate;
+use justrdp_pdu::rdp::standard_security::{
+    self, RdpSecurityContext,
+    SEC_ENCRYPT, SEC_EXCHANGE_PKT,
+    ENCRYPTION_METHOD_FIPS, ENCRYPTION_LEVEL_NONE,
+};
 use justrdp_pdu::rdp::headers::{
     ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
 };
@@ -79,6 +85,18 @@ pub struct ClientConnector {
     channels_to_join: Vec<u16>,
     /// Current index into `channels_to_join` for the join loop.
     join_index: usize,
+
+    // ── Standard RDP Security state ──
+    /// Server random (32 bytes) from ServerSecurityData.
+    server_random: Option<[u8; 32]>,
+    /// Server encryption method from ServerSecurityData.
+    server_encryption_method: u32,
+    /// Server encryption level from ServerSecurityData.
+    server_encryption_level: u32,
+    /// Parsed server RSA public key.
+    server_public_key: Option<server_certificate::ServerRsaPublicKey>,
+    /// RC4-based security context (active after Security Exchange).
+    security_context: Option<RdpSecurityContext>,
 }
 
 impl ClientConnector {
@@ -96,6 +114,11 @@ impl ClientConnector {
             channel_ids: Vec::new(),
             channels_to_join: Vec::new(),
             join_index: 0,
+            server_random: None,
+            server_encryption_method: 0,
+            server_encryption_level: 0,
+            server_public_key: None,
+            security_context: None,
         }
     }
 
@@ -302,7 +325,31 @@ impl ClientConnector {
                     let _core = ServerCoreData::decode(&mut block_cursor)?;
                 }
                 t if t == ServerDataBlockType::SecurityData as u16 => {
-                    let _sec = ServerSecurityData::decode(&mut block_cursor)?;
+                    // Re-decode from full block (SecurityData decode expects header)
+                    // We already stripped the header, so parse fields directly.
+                    let encryption_method = block_cursor.read_u32_le("SecData::method")?;
+                    let encryption_level = block_cursor.read_u32_le("SecData::level")?;
+
+                    self.server_encryption_method = encryption_method;
+                    self.server_encryption_level = encryption_level;
+
+                    let remaining = body_length.saturating_sub(8);
+                    if remaining >= 8 && encryption_method != 0 && encryption_level != ENCRYPTION_LEVEL_NONE {
+                        let random_len = block_cursor.read_u32_le("SecData::randomLen")? as usize;
+                        let cert_len = block_cursor.read_u32_le("SecData::certLen")? as usize;
+                        let random = block_cursor.read_slice(random_len, "SecData::random")?;
+                        let cert_data = block_cursor.read_slice(cert_len, "SecData::cert")?;
+
+                        if random_len == 32 {
+                            let mut sr = [0u8; 32];
+                            sr.copy_from_slice(random);
+                            self.server_random = Some(sr);
+                        }
+
+                        // Parse server certificate to extract RSA public key
+                        let cert = server_certificate::parse_server_certificate(cert_data)?;
+                        self.server_public_key = Some(cert.public_key);
+                    }
                 }
                 t if t == ServerDataBlockType::NetworkData as u16 => {
                     let net = ServerNetworkData::decode(&mut block_cursor)?;
@@ -395,6 +442,9 @@ impl ClientConnector {
         self.join_index += 1;
         if self.join_index < self.channels_to_join.len() {
             self.state = ClientConnectorState::ChannelConnectionSendJoinRequest;
+        } else if self.uses_standard_rdp_security() {
+            // Standard RDP Security: send Security Exchange PDU first
+            self.state = ClientConnectorState::SecurityExchangeSendClientRandom;
         } else {
             self.state = ClientConnectorState::SecureSettingsExchange;
         }
@@ -402,24 +452,125 @@ impl ClientConnector {
         Ok(Written::nothing())
     }
 
-    fn step_secure_settings_exchange(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
-        let info = ClientInfoPdu::new(&self.config.domain, &self.config.username, &self.config.password);
+    /// Whether this connection uses Standard RDP Security (not TLS/NLA).
+    fn uses_standard_rdp_security(&self) -> bool {
+        self.selected_protocol == SecurityProtocol::RDP
+            && self.server_encryption_method != 0
+            && self.server_encryption_level != ENCRYPTION_LEVEL_NONE
+    }
 
-        // Build security header + client info as inner payload
-        let info_size = info.size();
-        let inner_size = BASIC_SECURITY_HEADER_SIZE + info_size;
+    /// Send Security Exchange PDU: encrypted client random.
+    ///
+    /// MS-RDPBCGR 2.2.1.10: The client generates a 32-byte random, encrypts it
+    /// with the server's RSA public key, and sends it in a Security Exchange PDU.
+    /// Then derives session keys from (client_random + server_random).
+    fn step_security_exchange_send_client_random(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+        let server_key = self.server_public_key.as_ref()
+            .ok_or_else(|| ConnectorError::general("no server public key for security exchange"))?;
+        let server_random = self.server_random
+            .ok_or_else(|| ConnectorError::general("no server random for security exchange"))?;
+
+        // Generate 32-byte client random
+        // For now, use a deterministic placeholder — the caller should inject randomness.
+        // TODO: Accept random source from caller (via Config or trait).
+        let client_random: [u8; 32] = {
+            // Simple PRNG seeded from server random (NOT cryptographically secure).
+            // Real implementation should use OS randomness.
+            let mut cr = [0u8; 32];
+            let seed = &server_random;
+            for i in 0..32 {
+                cr[i] = seed[i] ^ (i as u8).wrapping_mul(0x5A).wrapping_add(0x36);
+            }
+            cr
+        };
+
+        // Encrypt client random with server's RSA public key
+        let encrypted_random = standard_security::encrypt_client_random(server_key, &client_random);
+
+        // Build Security Exchange PDU
+        // Header: flags(2) + flagsHi(2) = SEC_EXCHANGE_PKT
+        // Body: length(4 LE) + encrypted_random
+        let encrypted_len = encrypted_random.len();
+        let inner_size = BASIC_SECURITY_HEADER_SIZE + 4 + encrypted_len;
         let mut inner = vec![0u8; inner_size];
         {
             let mut cursor = WriteCursor::new(&mut inner);
-            // Security header: flags(2) + flagsHi(2)
-            cursor.write_u16_le(SEC_INFO_PKT, "SecurityHeader::flags")?;
-            cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-            info.encode(&mut cursor)?;
+            cursor.write_u16_le(SEC_EXCHANGE_PKT, "SecExchange::flags")?;
+            cursor.write_u16_le(0, "SecExchange::flagsHi")?;
+            cursor.write_u32_le(encrypted_len as u32, "SecExchange::length")?;
+            cursor.write_slice(&encrypted_random, "SecExchange::encryptedRandom")?;
         }
 
         let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
-        self.state = ClientConnectorState::LicensingWait;
+
+        // Derive session keys
+        if self.server_encryption_method == ENCRYPTION_METHOD_FIPS {
+            // FIPS mode: use 3DES + SHA-1
+            // TODO: Wire up FipsSecurityContext when FIPS flow is fully tested
+            return Err(ConnectorError::general("FIPS Standard RDP Security not yet fully wired"));
+        }
+
+        let keys = standard_security::derive_session_keys(
+            &client_random,
+            &server_random,
+            self.server_encryption_method,
+        );
+
+        // Determine if salted MAC should be used
+        // SEC_SECURE_CHECKSUM is used when the server supports it (RDP 5.2+)
+        let use_salted_mac = true; // Modern servers support this
+
+        self.security_context = Some(RdpSecurityContext::new(keys, use_salted_mac));
+        self.state = ClientConnectorState::SecureSettingsExchange;
+
         Ok(Written::new(size))
+    }
+
+    fn step_secure_settings_exchange(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+        let info = ClientInfoPdu::new(&self.config.domain, &self.config.username, &self.config.password);
+
+        if let Some(ref mut sec_ctx) = self.security_context {
+            // Standard RDP Security: encrypt the Client Info PDU
+            let info_size = info.size();
+            let mut info_bytes = vec![0u8; info_size];
+            {
+                let mut cursor = WriteCursor::new(&mut info_bytes);
+                info.encode(&mut cursor)?;
+            }
+
+            // Encrypt and get MAC
+            let mac = sec_ctx.encrypt(&mut info_bytes);
+
+            // Build: flags(2) + flagsHi(2) + MAC(8) + encrypted_data
+            let inner_size = BASIC_SECURITY_HEADER_SIZE + 8 + info_bytes.len();
+            let mut inner = vec![0u8; inner_size];
+            {
+                let mut cursor = WriteCursor::new(&mut inner);
+                cursor.write_u16_le(SEC_INFO_PKT | SEC_ENCRYPT, "SecurityHeader::flags")?;
+                cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+                cursor.write_slice(&mac, "SecurityHeader::mac")?;
+                cursor.write_slice(&info_bytes, "SecurityHeader::encryptedData")?;
+            }
+
+            let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
+            self.state = ClientConnectorState::LicensingWait;
+            Ok(Written::new(size))
+        } else {
+            // TLS/NLA mode: send unencrypted (basic security header only)
+            let info_size = info.size();
+            let inner_size = BASIC_SECURITY_HEADER_SIZE + info_size;
+            let mut inner = vec![0u8; inner_size];
+            {
+                let mut cursor = WriteCursor::new(&mut inner);
+                cursor.write_u16_le(SEC_INFO_PKT, "SecurityHeader::flags")?;
+                cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+                info.encode(&mut cursor)?;
+            }
+
+            let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
+            self.state = ClientConnectorState::LicensingWait;
+            Ok(Written::new(size))
+        }
     }
 
     fn step_licensing_wait(&mut self, input: &[u8]) -> ConnectorResult<Written> {
@@ -797,6 +948,9 @@ impl Sequence for ClientConnector {
             }
             ClientConnectorState::ChannelConnectionWaitJoinConfirm => {
                 self.step_wait_join_confirm(input)
+            }
+            ClientConnectorState::SecurityExchangeSendClientRandom => {
+                self.step_security_exchange_send_client_random(output)
             }
             ClientConnectorState::SecureSettingsExchange => {
                 self.step_secure_settings_exchange(output)

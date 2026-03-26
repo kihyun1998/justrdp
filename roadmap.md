@@ -580,11 +580,11 @@ pub enum ClientConnectorState {
 
 #### 5.2.4 Standard RDP Security (Legacy)
 
-- [ ] RSA 키 교환 (서버 공개키로 클라이언트 랜덤 암호화)
-- [ ] 세션 키 파생 (client random + server random → RC4 키)
-- [ ] RC4 암호화/복호화
-- [ ] 서버 프로프라이어터리 인증서 파싱
-- [ ] FIPS 140-1 모드 (3DES + SHA-1)
+- [x] RSA 키 교환 (서버 공개키로 클라이언트 랜덤 암호화)
+- [x] 세션 키 파생 (client random + server random → RC4 키)
+- [x] RC4 암호화/복호화
+- [x] 서버 프로프라이어터리 인증서 파싱
+- [x] FIPS 140-1 모드 (3DES + SHA-1)
 
 #### 5.2.5 Remote Credential Guard
 

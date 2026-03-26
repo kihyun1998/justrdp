@@ -107,6 +107,28 @@ pub fn rsa_sign_sha256(key: &RsaPrivateKey, data: &[u8]) -> Vec<u8> {
     s.to_be_bytes_padded(k)
 }
 
+/// RSA raw public-key operation for RDP Standard Security.
+///
+/// RDP uses a non-standard RSA encryption scheme:
+/// 1. Input is in little-endian byte order
+/// 2. Zero-padded to modulus size
+/// 3. Compute m^e mod n
+/// 4. Output is in little-endian byte order
+///
+/// Reference: MS-RDPBCGR 5.3.4.1
+pub fn rsa_public_encrypt_rdp(key: &RsaPublicKey, plaintext: &[u8]) -> Vec<u8> {
+    let k = key.key_size();
+
+    // RDP sends data in little-endian: convert LE input to BigUint
+    let m = BigUint::from_le_bytes(plaintext);
+
+    // RSA public key operation: c = m^e mod n
+    let c = m.mod_exp(&key.e, &key.n);
+
+    // Output in little-endian, padded to modulus size
+    c.to_le_bytes_padded(k)
+}
+
 /// Verify an RSA PKCS#1 v1.5 (SHA-256) signature.
 ///
 /// 1. Compute s^e mod n to recover the padded message

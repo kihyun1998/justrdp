@@ -9,3 +9,7 @@ pub mod fast_path;
 pub mod finalization;
 pub mod headers;
 pub mod licensing;
+#[cfg(feature = "alloc")]
+pub mod server_certificate;
+#[cfg(feature = "alloc")]
+pub mod standard_security;

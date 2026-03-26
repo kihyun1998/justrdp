@@ -14,6 +14,8 @@ extern crate alloc;
 pub mod aes;
 pub mod bignum;
 pub mod crypto;
+#[cfg(feature = "alloc")]
+pub mod des;
 pub mod dh;
 pub mod rsa;
 mod cursor;

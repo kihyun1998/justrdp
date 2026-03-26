@@ -41,6 +41,10 @@ pub enum ClientConnectorState {
     /// Wait for Channel Join Confirm.
     ChannelConnectionWaitJoinConfirm,
 
+    // ── Phase 6: RDP Security Exchange (Standard RDP Security only) ──
+    /// Send Security Exchange PDU (encrypted client random).
+    SecurityExchangeSendClientRandom,
+
     // ── Phase 7: Secure Settings Exchange ──
     /// Send Client Info PDU.
     SecureSettingsExchange,
@@ -93,6 +97,7 @@ impl ClientConnectorState {
             Self::ChannelConnectionWaitAttachConfirm => "ChannelConnectionWaitAttachConfirm",
             Self::ChannelConnectionSendJoinRequest => "ChannelConnectionSendJoinRequest",
             Self::ChannelConnectionWaitJoinConfirm => "ChannelConnectionWaitJoinConfirm",
+            Self::SecurityExchangeSendClientRandom => "SecurityExchangeSendClientRandom",
             Self::SecureSettingsExchange => "SecureSettingsExchange",
             Self::LicensingWait => "LicensingWait",
             Self::CapabilitiesWaitDemandActive => "CapabilitiesWaitDemandActive",
@@ -120,6 +125,7 @@ impl ClientConnectorState {
                 | Self::ChannelConnectionSendErectDomain
                 | Self::ChannelConnectionSendAttachUser
                 | Self::ChannelConnectionSendJoinRequest
+                | Self::SecurityExchangeSendClientRandom
                 | Self::SecureSettingsExchange
                 | Self::CapabilitiesSendConfirmActive
                 | Self::FinalizationSendSynchronize
