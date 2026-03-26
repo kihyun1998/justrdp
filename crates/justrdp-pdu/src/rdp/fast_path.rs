@@ -21,6 +21,12 @@ pub const FASTPATH_OUTPUT_SECURE_CHECKSUM: u8 = 0x02;
 /// Fast-Path Input action value (bits 0-1 of first byte).
 pub const FASTPATH_INPUT_ACTION_FASTPATH: u8 = 0x00;
 
+/// Fast-Path Input encryption flag (bits 6-7).
+pub const FASTPATH_INPUT_ENCRYPTED: u8 = 0x01;
+
+/// Fast-Path Input secure checksum flag (bits 6-7).
+pub const FASTPATH_INPUT_SECURE_CHECKSUM: u8 = 0x02;
+
 // ── Fast-Path Output Update Types ──
 
 /// Fast-Path update types (lower 4 bits of updateHeader).
@@ -117,25 +123,36 @@ pub struct FastPathOutputHeader {
 
 impl Encode for FastPathOutputHeader {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        // If num_events > 15, encode 0 in the 4-bit slot; extended byte follows length
+        let hdr_num = if self.num_events > 15 { 0 } else { self.num_events };
         let byte0 = (self.action & 0x03)
-            | ((self.num_events & 0x0F) << 2)
+            | ((hdr_num & 0x0F) << 2)
             | ((self.flags & 0x03) << 6);
         dst.write_u8(byte0, "FastPathOutputHeader::byte0")?;
         encode_length(dst, self.length)?;
+        if self.num_events > 15 {
+            dst.write_u8(self.num_events, "FastPathOutputHeader::numEventsExt")?;
+        }
         Ok(())
     }
 
     fn name(&self) -> &'static str { "FastPathOutputHeader" }
-    fn size(&self) -> usize { 1 + length_field_size(self.length) }
+    fn size(&self) -> usize {
+        1 + length_field_size(self.length) + if self.num_events > 15 { 1 } else { 0 }
+    }
 }
 
 impl<'de> Decode<'de> for FastPathOutputHeader {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let byte0 = src.read_u8("FastPathOutputHeader::byte0")?;
         let action = byte0 & 0x03;
-        let num_events = (byte0 >> 2) & 0x0F;
+        let mut num_events = (byte0 >> 2) & 0x0F;
         let flags = (byte0 >> 6) & 0x03;
         let length = decode_length(src)?;
+        // Extended numEvents: if 4-bit field is 0, read extra byte
+        if num_events == 0 {
+            num_events = src.read_u8("FastPathOutputHeader::numEventsExt")?;
+        }
         Ok(Self { action, num_events, flags, length })
     }
 }
@@ -230,25 +247,34 @@ pub struct FastPathInputHeader {
 
 impl Encode for FastPathInputHeader {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        let hdr_num = if self.num_events > 15 { 0 } else { self.num_events };
         let byte0 = (self.action & 0x03)
-            | ((self.num_events & 0x0F) << 2)
+            | ((hdr_num & 0x0F) << 2)
             | ((self.flags & 0x03) << 6);
         dst.write_u8(byte0, "FastPathInputHeader::byte0")?;
         encode_length(dst, self.length)?;
+        if self.num_events > 15 {
+            dst.write_u8(self.num_events, "FastPathInputHeader::numEventsExt")?;
+        }
         Ok(())
     }
 
     fn name(&self) -> &'static str { "FastPathInputHeader" }
-    fn size(&self) -> usize { 1 + length_field_size(self.length) }
+    fn size(&self) -> usize {
+        1 + length_field_size(self.length) + if self.num_events > 15 { 1 } else { 0 }
+    }
 }
 
 impl<'de> Decode<'de> for FastPathInputHeader {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let byte0 = src.read_u8("FastPathInputHeader::byte0")?;
         let action = byte0 & 0x03;
-        let num_events = (byte0 >> 2) & 0x0F;
+        let mut num_events = (byte0 >> 2) & 0x0F;
         let flags = (byte0 >> 6) & 0x03;
         let length = decode_length(src)?;
+        if num_events == 0 {
+            num_events = src.read_u8("FastPathInputHeader::numEventsExt")?;
+        }
         Ok(Self { action, num_events, flags, length })
     }
 }
@@ -596,7 +622,7 @@ impl Encode for FastPathInputEvent {
 impl<'de> Decode<'de> for FastPathInputEvent {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         // Peek the event header to determine the event code.
-        let header = src.peek_remaining()[0];
+        let header = src.peek_u8("FastPathInputEvent::header")?;
         let code = (header >> 5) & 0x07;
         match FastPathInputEventCode::from_u8(code)? {
             FastPathInputEventCode::Scancode => {
@@ -911,5 +937,83 @@ mod tests {
         encode_length(&mut cursor, 0x1234).unwrap();
         let mut cursor = ReadCursor::new(&buf);
         assert_eq!(decode_length(&mut cursor).unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn length_boundary_0x7f_single_byte() {
+        let mut buf = [0u8; 1];
+        let mut cursor = WriteCursor::new(&mut buf);
+        encode_length(&mut cursor, 0x7F).unwrap();
+        assert_eq!(buf[0], 0x7F);
+        let mut cursor = ReadCursor::new(&buf);
+        assert_eq!(decode_length(&mut cursor).unwrap(), 0x7F);
+    }
+
+    #[test]
+    fn length_boundary_0x80_two_bytes() {
+        let mut buf = [0u8; 2];
+        let mut cursor = WriteCursor::new(&mut buf);
+        encode_length(&mut cursor, 0x80).unwrap();
+        assert_eq!(buf[0] & 0x80, 0x80); // high bit set
+        let mut cursor = ReadCursor::new(&buf);
+        assert_eq!(decode_length(&mut cursor).unwrap(), 0x80);
+    }
+
+    #[test]
+    fn length_max_0x7fff() {
+        let mut buf = [0u8; 2];
+        let mut cursor = WriteCursor::new(&mut buf);
+        encode_length(&mut cursor, 0x7FFF).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        assert_eq!(decode_length(&mut cursor).unwrap(), 0x7FFF);
+    }
+
+    #[test]
+    fn input_header_extended_num_events() {
+        // num_events = 20 (> 15) uses extended byte
+        let hdr = FastPathInputHeader {
+            action: FASTPATH_INPUT_ACTION_FASTPATH,
+            num_events: 20,
+            flags: 0,
+            length: 100,
+        };
+        let size = hdr.size();
+        let mut buf = vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        hdr.encode(&mut cursor).unwrap();
+
+        // 4-bit field in byte0 should be 0
+        assert_eq!((buf[0] >> 2) & 0x0F, 0);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = FastPathInputHeader::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.num_events, 20);
+    }
+
+    #[test]
+    fn input_header_num_events_15_max_4bit() {
+        let hdr = FastPathInputHeader {
+            action: FASTPATH_INPUT_ACTION_FASTPATH,
+            num_events: 15,
+            flags: 0,
+            length: 50,
+        };
+        let mut buf = vec![0u8; hdr.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        hdr.encode(&mut cursor).unwrap();
+
+        // 4-bit field should be 15 (0x0F), no extended byte
+        assert_eq!((buf[0] >> 2) & 0x0F, 15);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = FastPathInputHeader::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.num_events, 15);
+    }
+
+    #[test]
+    fn generic_input_event_empty_input_returns_error() {
+        let buf: &[u8] = &[];
+        let mut cursor = ReadCursor::new(buf);
+        assert!(FastPathInputEvent::decode(&mut cursor).is_err());
     }
 }
