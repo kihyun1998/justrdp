@@ -244,7 +244,8 @@ pub fn read_octet_string<'a>(src: &mut ReadCursor<'a>, ctx: &'static str) -> Dec
 
 // ── Object Identifier ──
 
-/// T.125 MCS protocol OID: { iso(1) member-body(2) us(840) 113556 mcs(1) }.
+/// T.124 ITU-T OID: { itu-t(0) recommendation(0) t(20) 124 version(0) 1 }.
+/// Used as the key in GCC Conference Create Request/Response.
 pub const MCS_OID: &[u8] = &[0x00, 0x05, 0x00, 0x14, 0x7C, 0x00, 0x01];
 
 /// Size of a BER-encoded OBJECT IDENTIFIER.
@@ -288,12 +289,16 @@ pub fn read_sequence_tag(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeR
 }
 
 /// Write an application-constructed tag + length.
+///
+/// Only supports tag numbers 0-30 (single-byte BER tag).
+/// For tag numbers > 30, use `write_high_tag` instead.
 pub fn write_application_tag(
     dst: &mut WriteCursor<'_>,
     tag_number: u8,
     content_len: usize,
     ctx: &'static str,
 ) -> EncodeResult<()> {
+    assert!(tag_number <= 30, "write_application_tag: tag {tag_number} > 30, use write_high_tag instead");
     let tag = TAG_APPLICATION_CONSTRUCTED | tag_number;
     write_tag(dst, tag, ctx)?;
     write_length(dst, content_len, ctx)?;
@@ -457,5 +462,36 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         // Try to read as INTEGER (wrong tag)
         assert!(read_integer(&mut cursor, "test").is_err());
+    }
+
+    #[test]
+    fn read_length_unsupported_3byte() {
+        // 0x83 = 3 bytes follow (unsupported)
+        let buf = [0x83, 0x00, 0x01, 0x00];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(read_length(&mut cursor, "test").is_err());
+    }
+
+    #[test]
+    fn read_integer_zero_length() {
+        let buf = [TAG_INTEGER, 0x00]; // INTEGER with length=0
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(read_integer(&mut cursor, "test").is_err());
+    }
+
+    #[test]
+    fn read_integer_overlength() {
+        let buf = [TAG_INTEGER, 0x09, 0,0,0,0,0,0,0,0,0]; // length=9 > 8
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(read_integer(&mut cursor, "test").is_err());
+    }
+
+    #[test]
+    fn ber_length_zero() {
+        let mut buf = [0u8; 1];
+        let mut cursor = WriteCursor::new(&mut buf);
+        write_length(&mut cursor, 0, "test").unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        assert_eq!(read_length(&mut cursor, "test").unwrap(), 0);
     }
 }

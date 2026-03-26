@@ -31,7 +31,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields, LitInt};
+use syn::{Data, DeriveInput, Fields, LitInt, parse_macro_input};
 
 /// Parsed `#[pdu(...)]` attribute.
 #[derive(Debug)]
@@ -58,15 +58,42 @@ fn parse_pdu_attr(field: &syn::Field) -> Option<FieldKind> {
         let mut result = None;
 
         let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("u8") { result = Some(FieldKind::U8); return Ok(()); }
-            if meta.path.is_ident("u16_le") { result = Some(FieldKind::U16Le); return Ok(()); }
-            if meta.path.is_ident("u16_be") { result = Some(FieldKind::U16Be); return Ok(()); }
-            if meta.path.is_ident("u32_le") { result = Some(FieldKind::U32Le); return Ok(()); }
-            if meta.path.is_ident("u32_be") { result = Some(FieldKind::U32Be); return Ok(()); }
-            if meta.path.is_ident("u64_le") { result = Some(FieldKind::U64Le); return Ok(()); }
-            if meta.path.is_ident("i16_le") { result = Some(FieldKind::I16Le); return Ok(()); }
-            if meta.path.is_ident("i32_le") { result = Some(FieldKind::I32Le); return Ok(()); }
-            if meta.path.is_ident("rest") { result = Some(FieldKind::Rest); return Ok(()); }
+            if meta.path.is_ident("u8") {
+                result = Some(FieldKind::U8);
+                return Ok(());
+            }
+            if meta.path.is_ident("u16_le") {
+                result = Some(FieldKind::U16Le);
+                return Ok(());
+            }
+            if meta.path.is_ident("u16_be") {
+                result = Some(FieldKind::U16Be);
+                return Ok(());
+            }
+            if meta.path.is_ident("u32_le") {
+                result = Some(FieldKind::U32Le);
+                return Ok(());
+            }
+            if meta.path.is_ident("u32_be") {
+                result = Some(FieldKind::U32Be);
+                return Ok(());
+            }
+            if meta.path.is_ident("u64_le") {
+                result = Some(FieldKind::U64Le);
+                return Ok(());
+            }
+            if meta.path.is_ident("i16_le") {
+                result = Some(FieldKind::I16Le);
+                return Ok(());
+            }
+            if meta.path.is_ident("i32_le") {
+                result = Some(FieldKind::I32Le);
+                return Ok(());
+            }
+            if meta.path.is_ident("rest") {
+                result = Some(FieldKind::Rest);
+                return Ok(());
+            }
             if meta.path.is_ident("bytes") {
                 let value = meta.value()?;
                 let lit: LitInt = value.parse()?;
@@ -113,8 +140,12 @@ pub fn derive_encode(input: TokenStream) -> TokenStream {
         let field_name = field.ident.as_ref().unwrap();
         let ctx = format!("{}::{}", name_str, field_name);
 
-        let kind = parse_pdu_attr(field)
-            .unwrap_or_else(|| panic!("Field `{}` in `{}` is missing #[pdu(...)] attribute", field_name, name_str));
+        let kind = parse_pdu_attr(field).unwrap_or_else(|| {
+            panic!(
+                "Field `{}` in `{}` is missing #[pdu(...)] attribute",
+                field_name, name_str
+            )
+        });
 
         match kind {
             FieldKind::U8 => {
@@ -206,8 +237,12 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
         let field_name = field.ident.as_ref().unwrap();
         let ctx = format!("{}::{}", name_str, field_name);
 
-        let kind = parse_pdu_attr(field)
-            .unwrap_or_else(|| panic!("Field `{}` in `{}` is missing #[pdu(...)] attribute", field_name, name_str));
+        let kind = parse_pdu_attr(field).unwrap_or_else(|| {
+            panic!(
+                "Field `{}` in `{}` is missing #[pdu(...)] attribute",
+                field_name, name_str
+            )
+        });
 
         field_names.push(field_name.clone());
 

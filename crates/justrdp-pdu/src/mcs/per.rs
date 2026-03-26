@@ -61,6 +61,11 @@ pub fn read_choice(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<
 
 // ── Integer (constrained whole number) ──
 
+/// Size of a PER constrained INTEGER (u16) on wire.
+pub fn sizeof_integer_u16(value: u16) -> usize {
+    if value < 0x4000 { 2 } else { 4 }
+}
+
 /// Write a PER constrained INTEGER (u16).
 ///
 /// For values < 0x4000 (14 bits): write 2 bytes BE (high 2 bits clear = short form).
@@ -85,7 +90,7 @@ pub fn write_integer_u16(dst: &mut WriteCursor<'_>, value: u16, ctx: &'static st
 /// Long form: first byte has bit 6 set (0x40) → read length(1) + value(2).
 pub fn read_integer_u16(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<u16> {
     let first = src.read_u8(ctx)?;
-    if first & 0x40 == 0 {
+    if first & 0xC0 == 0 {
         // Short form: combine first byte with second byte
         let second = src.read_u8(ctx)?;
         Ok(u16::from_be_bytes([first, second]))
@@ -265,5 +270,31 @@ mod tests {
 
         let mut cursor = ReadCursor::new(&buf);
         assert_eq!(read_octet_string(&mut cursor, "test").unwrap(), data);
+    }
+
+    #[test]
+    fn per_integer_u16_known_answer_wire_bytes() {
+        // Short form max: 0x3FFF → [0x3F, 0xFF]
+        let mut buf = [0u8; 2];
+        write_integer_u16(&mut WriteCursor::new(&mut buf), 0x3FFF, "t").unwrap();
+        assert_eq!(&buf, &[0x3F, 0xFF]);
+
+        // Long form min: 0x4000 → [0x40, 0x02, 0x40, 0x00]
+        let mut buf = [0u8; 4];
+        write_integer_u16(&mut WriteCursor::new(&mut buf), 0x4000, "t").unwrap();
+        assert_eq!(&buf, &[0x40, 0x02, 0x40, 0x00]);
+
+        // Long form max: 0xFFFF → [0x40, 0x02, 0xFF, 0xFF]
+        let mut buf = [0u8; 4];
+        write_integer_u16(&mut WriteCursor::new(&mut buf), 0xFFFF, "t").unwrap();
+        assert_eq!(&buf, &[0x40, 0x02, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn sizeof_integer_u16_correct() {
+        assert_eq!(sizeof_integer_u16(0), 2);
+        assert_eq!(sizeof_integer_u16(0x3FFF), 2);
+        assert_eq!(sizeof_integer_u16(0x4000), 4);
+        assert_eq!(sizeof_integer_u16(0xFFFF), 4);
     }
 }

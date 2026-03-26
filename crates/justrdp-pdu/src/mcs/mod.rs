@@ -533,7 +533,8 @@ impl Encode for ChannelJoinRequest {
     }
 
     fn size(&self) -> usize {
-        5 // choice(1) + initiator(2) + channelId(2)
+        1 + per::sizeof_integer_u16(self.initiator.saturating_sub(1001) as u16)
+          + per::sizeof_integer_u16(self.channel_id)
     }
 }
 
@@ -585,7 +586,10 @@ impl Encode for ChannelJoinConfirm {
     }
 
     fn size(&self) -> usize {
-        1 + 1 + 2 + 2 + if self.channel_id.is_some() { 2 } else { 0 }
+        1 + 1 // choice + result
+          + per::sizeof_integer_u16(self.initiator.saturating_sub(1001) as u16)
+          + per::sizeof_integer_u16(self.requested)
+          + if let Some(ch) = self.channel_id { per::sizeof_integer_u16(ch) } else { 0 }
     }
 }
 
@@ -642,7 +646,10 @@ impl Encode for SendDataRequest<'_> {
     }
 
     fn size(&self) -> usize {
-        1 + 2 + 2 + 1 + per::sizeof_octet_string(self.user_data.len())
+        1 + per::sizeof_integer_u16(self.initiator.saturating_sub(1001) as u16)
+          + per::sizeof_integer_u16(self.channel_id)
+          + 1 // data priority
+          + per::sizeof_octet_string(self.user_data.len())
     }
 }
 
@@ -691,7 +698,10 @@ impl Encode for SendDataIndication<'_> {
     }
 
     fn size(&self) -> usize {
-        1 + 2 + 2 + 1 + per::sizeof_octet_string(self.user_data.len())
+        1 + per::sizeof_integer_u16(self.initiator.saturating_sub(1001) as u16)
+          + per::sizeof_integer_u16(self.channel_id)
+          + 1 // data priority
+          + per::sizeof_octet_string(self.user_data.len())
     }
 }
 
@@ -835,6 +845,7 @@ fn read_high_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn domain_parameters_roundtrip() {
@@ -1083,5 +1094,62 @@ mod tests {
 
         let mut cursor = ReadCursor::new(&buf);
         assert!(ConnectResponse::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn connect_initial_outer_tag_wire_bytes() {
+        let ci = ConnectInitial {
+            calling_domain_selector: vec![1],
+            called_domain_selector: vec![1],
+            upward_flag: true,
+            target_parameters: DomainParameters::client_default(),
+            minimum_parameters: DomainParameters::min_default(),
+            maximum_parameters: DomainParameters::max_default(),
+            user_data: vec![0x42],
+        };
+        let mut buf = alloc::vec![0u8; ci.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        ci.encode(&mut cursor).unwrap();
+        // T.125 APPLICATION 101 CONSTRUCTED = 0x7F, 0x65
+        assert_eq!(buf[0], 0x7F);
+        assert_eq!(buf[1], 0x65);
+    }
+
+    #[test]
+    fn channel_join_confirm_no_channel_id() {
+        let cjc = ChannelJoinConfirm {
+            result: 8, // failure
+            initiator: 1007,
+            requested: 1003,
+            channel_id: None,
+        };
+        let size = cjc.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        cjc.encode(&mut cursor).unwrap();
+        // optional bit must be clear
+        assert_eq!(buf[0] & 0x02, 0);
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ChannelJoinConfirm::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.channel_id, None);
+    }
+
+    #[test]
+    fn disconnect_provider_all_reasons_including_token_purged() {
+        for reason in [
+            DisconnectReason::DomainDisconnected,
+            DisconnectReason::ProviderInitiated,
+            DisconnectReason::TokenPurged,
+            DisconnectReason::UserRequested,
+            DisconnectReason::ChannelPurged,
+        ] {
+            let dpu = DisconnectProviderUltimatum { reason };
+            let mut buf = [0u8; 2];
+            let mut cursor = WriteCursor::new(&mut buf);
+            dpu.encode(&mut cursor).unwrap();
+            let mut cursor = ReadCursor::new(&buf);
+            let decoded = DisconnectProviderUltimatum::decode(&mut cursor).unwrap();
+            assert_eq!(decoded.reason, reason, "reason {:?} roundtrip failed", reason);
+        }
     }
 }
