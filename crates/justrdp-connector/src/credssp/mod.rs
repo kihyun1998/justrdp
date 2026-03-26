@@ -9,6 +9,8 @@
 //! 4. Server responds with pubKeyAuth verification
 //! 5. Client sends encrypted credentials in TsRequest
 
+pub mod gss_wrap;
+pub mod kerberos;
 pub mod spnego;
 pub mod ts_request;
 

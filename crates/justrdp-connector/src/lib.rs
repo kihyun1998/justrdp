@@ -21,6 +21,10 @@ mod state;
 
 pub use config::{Config, ConfigBuilder};
 pub use connector::ClientConnector;
+pub use credssp::gss_wrap::{gss_unwrap, gss_wrap};
+pub use credssp::kerberos::{
+    frame_kdc_message, unframe_kdc_message, KerberosRandom, KerberosSequence, KerberosState,
+};
 pub use credssp::{CredsspRandom, CredsspSequence, CredsspState};
 pub use error::{ConnectorError, ConnectorErrorKind, ConnectorResult};
 pub use result::{ConnectionResult, Written};

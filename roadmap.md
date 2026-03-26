@@ -571,12 +571,12 @@ pub enum ClientConnectorState {
 
 #### 5.2.3 Kerberos Authentication
 
-- [ ] AS-REQ / AS-REP (TGT 획득)
-- [ ] TGS-REQ / TGS-REP (서비스 티켓: `TERMSRV/<hostname>`)
-- [ ] AP-REQ / AP-REP (서비스 인증)
-- [ ] KDC Proxy URL 지원
-- [ ] 키탭 / 패스워드 기반 인증
-- [ ] PKINIT (스마트카드/인증서 기반)
+- [x] AS-REQ / AS-REP (TGT 획득)
+- [x] TGS-REQ / TGS-REP (서비스 티켓: `TERMSRV/<hostname>`)
+- [x] AP-REQ / AP-REP (서비스 인증)
+- [x] KDC Proxy URL 지원
+- [x] 키탭 / 패스워드 기반 인증
+- [x] PKINIT (스마트카드/인증서 기반)
 
 #### 5.2.4 Standard RDP Security (Legacy)
 

@@ -8,7 +8,11 @@ extern crate alloc;
 pub use justrdp_core::{self as core, Decode, Encode, ReadCursor, WriteCursor};
 pub use justrdp_core::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 
+#[cfg(feature = "alloc")]
+pub mod cms;
 pub mod gcc;
+#[cfg(feature = "alloc")]
+pub mod kerberos;
 pub mod mcs;
 #[cfg(feature = "alloc")]
 pub mod ntlm;
