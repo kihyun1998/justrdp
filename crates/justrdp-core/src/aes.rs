@@ -318,133 +318,31 @@ pub fn aes_cts_encrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [
         prev = block;
     }
 
-    // Process last two blocks with CTS
-    let pn_off = (n_full - 1) * 16; // penultimate plaintext
-    let last_off = n_full * 16;     // last plaintext (may be short)
-
-    // Encrypt penultimate block
-    let mut pn_block = [0u8; 16];
-    pn_block.copy_from_slice(&data[pn_off..pn_off + 16]);
-    xor_block(&mut pn_block, &prev);
-    cipher.encrypt(&mut pn_block);
-
-    // Pad last block with bytes from encrypted penultimate
-    let mut last_block = [0u8; 16];
-    last_block[..last_len].copy_from_slice(&data[last_off..last_off + last_len]);
-    last_block[last_len..].copy_from_slice(&pn_block[last_len..]);
-    xor_block(&mut last_block, &[0u8; 16]); // no XOR needed; this is CTS specific
-    // Actually XOR with zero is noop. For CTS, the last plaintext block is padded
-    // with the ciphertext of the penultimate block, then encrypted.
-
-    // Wait, let me re-do CTS properly:
-    // CTS encrypt:
-    //   1. CBC encrypt all blocks except last two
-    //   2. Pn = CBC encrypt of penultimate plaintext (using prev as IV)
-    //   3. Pad last plaintext Pm with bytes from Pn: Pm_padded = Pm || Pn[len(Pm):]
-    //   4. Cn-1 = encrypt(Pm_padded XOR Pn)  -- wait, no
+    // CTS: handle last two blocks (RFC 3962 Section 5)
     //
-    // Actually, CTS per RFC 3962:
-    //   Cn-1 = E(Pn-1 XOR prev)  (this is pn_block above)
-    //   Pad Pn to 16 bytes using tail of Cn-1: Pn_padded = Pn || Cn-1[m:]
-    //   Cn = E(Pn_padded XOR Cn-1)  -- wait, no that's also wrong
-    //
-    // Let me just implement it correctly:
-    // For n >= 2 blocks:
-    //   Process blocks 0..n-2 with normal CBC
-    //   E(n-1) = AES_ECB(P(n-1) XOR C(n-2))  -- call this Cn_minus1
-    //   Pn_padded = Pn || Cn_minus1[m..16]    -- pad last block with tail of Cn_minus1
-    //   Cn = AES_ECB(Pn_padded XOR Cn_minus1) -- NO, not XOR with Cn_minus1
-    //
-    // Actually the RFC 3962 CTS mode is CBC-CS3 (as per NIST SP 800-38A Addendum):
-    //   For the last two blocks Pn-1 and Pn (where Pn may be short):
-    //   1. Cn_star = E_K(Pn-1 XOR Cn-2)   -- encrypt penultimate with CBC
-    //   2. Cn = head(Cn_star, m)           -- Cn is truncated Cn_star
-    //   3. Pad Pn: Pn_padded = Pn || tail(Cn_star, 16-m)
-    //   4. Cn-1 = E_K(Pn_padded XOR Cn_star)  -- wait, XOR with what?
-    //
-    // I keep getting confused. Let me just use the standard algorithm:
-    //
-    // CBC-CTS encrypt (last two blocks):
-    //   prev = last CBC ciphertext (or IV if only 2 blocks total)
-    //   Cn_star = AES(Pn-1 XOR prev)
-    //   Cn = Cn_star[0..m]  (truncated to last block's original length)
-    //   Pn_pad = Pn || Cn_star[m..16]
-    //   Cn-1 = AES(Pn_pad XOR Cn_star)  -- hmm, that uses Cn_star as both key material and XOR
-    //
-    // No. Let me look at this more carefully. The correct CBC-CTS (CS3) is:
-    //
-    //   Encrypt:
-    //     For i = 0 to n-3: Ci = E(Pi XOR C(i-1)) with C(-1) = IV
-    //     Cn_star = E(P(n-2) XOR C(n-3))
-    //     Cn-1 = E(Pn_padded XOR Cn_star) where Pn_padded = Pn || Cn_star[m..16]
-    //     Cn = Cn_star[0..m]   -- the ciphertext is Cn-1 followed by Cn (swapped!)
-    //     Output: C0 || C1 || ... || C(n-3) || Cn-1 || Cn
-    //
-    // No wait, that doesn't look right either. Let me just use a known reference.
+    // Algorithm:
+    //   1. CBC encrypt all n-1 complete blocks → C[0]..C[n-2] done above, C[n-1] below
+    //   2. Pad last plaintext P[n] with zeros to 16 bytes
+    //   3. C[n] = E(P[n]_padded XOR C[n-1])
+    //   4. Output swap: C[n] at penultimate position, C[n-1] truncated to m bytes at last
+    let pn_off = (n_full - 1) * 16;
+    let last_off = n_full * 16;
 
-    // Reset and redo CTS properly. The above partial computation is wrong.
-    // I'll recalculate from scratch.
-    let _ = pn_block;
-    let _ = last_block;
-
-    // Re-read data since we may have partially modified it
-    // Actually we only modified blocks 0..n_full-2 with CBC above, which is correct.
-    // Now handle the last two blocks.
-
-    // Penultimate plaintext
-    let mut pn = [0u8; 16];
-    pn.copy_from_slice(&data[pn_off..pn_off + 16]);
-    xor_block(&mut pn, &prev);
-    cipher.encrypt(&mut pn);
-    // pn is now E(P_{n-1} XOR prev) = Cn_star
-
-    // Last plaintext (possibly short)
-    let mut last_padded = pn; // start with Cn_star, then overwrite first m bytes
-    last_padded[..last_len].copy_from_slice(&data[last_off..last_off + last_len]);
-
-    // Cn-1 = E(last_padded XOR Cn_star)? No...
-    // Let me just follow the exact algorithm from RFC 3962 section 5:
-    //
-    //   1. Encrypt the first n-1 blocks as normal CBC
-    //   2. Xor the last plaintext block (padded with zeros to 16 bytes)
-    //      with the (n-1)th ciphertext
-    //   3. Encrypt the result to get Cn-1
-    //   4. Cn = first m bytes of the (n-1)th ciphertext
-    //   5. Output is: C0..Cn-2, Cn-1, Cn  (note: swapped last two)
-
-    // Wait, the RFC 3962 actually says (Section 5):
-    //
-    // To encrypt, do CBC over the first (n-1) blocks to get C[1] through C[n-1].
-    // For the last partial block:
-    //   Pad the plaintext to a full block with zeros.
-    //   XOR with C[n-1].
-    //   Encrypt to get C[n].
-    //   C[n-1] is truncated to len(P[n]) bytes.
-    //
-    // So the output is C[1] ... C[n-1]_truncated ... C[n]
-    // But the ciphertext is rearranged: the last full block is C[n] and the
-    // truncated block is C[n-1].
-
-    // Let me just implement this correctly now:
-
-    // Step 1: CBC encrypt blocks 0 through n_full-1 (all complete blocks)
-    // We already did 0 through n_full-2. Now do block n_full-1:
+    // CBC encrypt penultimate block → C[n-1]
     let mut cn_minus1 = [0u8; 16];
     cn_minus1.copy_from_slice(&data[pn_off..pn_off + 16]);
     xor_block(&mut cn_minus1, &prev);
     cipher.encrypt(&mut cn_minus1);
-    // cn_minus1 is now C[n-1]
 
-    // Step 2: Pad last plaintext with zeros, XOR with C[n-1], encrypt
-    let mut last_plain = [0u8; 16];
-    last_plain[..last_len].copy_from_slice(&data[last_off..last_off + last_len]);
-    xor_block(&mut last_plain, &cn_minus1);
-    cipher.encrypt(&mut last_plain);
-    // last_plain is now C[n]
+    // Pad last plaintext with zeros, XOR with C[n-1], encrypt → C[n]
+    let mut last_padded = [0u8; 16];
+    last_padded[..last_len].copy_from_slice(&data[last_off..last_off + last_len]);
+    xor_block(&mut last_padded, &cn_minus1);
+    cipher.encrypt(&mut last_padded);
 
-    // Step 3: Write output with swap: C[n] at penultimate position, C[n-1] truncated at last
-    data[pn_off..pn_off + 16].copy_from_slice(&last_plain); // C[n]
-    data[last_off..last_off + last_len].copy_from_slice(&cn_minus1[..last_len]); // C[n-1] truncated
+    // Write output: C[n] at penultimate, C[n-1] truncated at last
+    data[pn_off..pn_off + 16].copy_from_slice(&last_padded);
+    data[last_off..last_off + last_len].copy_from_slice(&cn_minus1[..last_len]);
 }
 
 /// AES-CTS decrypt in place.
@@ -926,6 +824,36 @@ mod tests {
         aes_cts_encrypt(&aes, &iv, &mut data);
         aes_cts_decrypt(&aes, &iv, &mut data);
         assert_eq!(data, plaintext);
+    }
+
+    #[test]
+    fn aes_cts_three_blocks_roundtrip() {
+        // 3 blocks (48 bytes) — exercises the n_full-1 CBC + CTS path
+        let key = [0x63u8; 16];
+        let iv = [0u8; 16];
+        let plaintext: Vec<u8> = (0..48).collect();
+        let mut data = plaintext.clone();
+        let aes = Aes128::new(&key);
+        aes_cts_encrypt(&aes, &iv, &mut data);
+        assert_ne!(data, plaintext);
+        aes_cts_decrypt(&aes, &iv, &mut data);
+        assert_eq!(data, plaintext);
+    }
+
+    #[test]
+    fn aes_cts_multi_sizes_roundtrip() {
+        // Test multiple sizes to exercise all code paths
+        let key = [0x42u8; 16];
+        let iv = [0u8; 16];
+        let aes = Aes128::new(&key);
+
+        for size in [16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 100, 256] {
+            let plaintext: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
+            let mut data = plaintext.clone();
+            aes_cts_encrypt(&aes, &iv, &mut data);
+            aes_cts_decrypt(&aes, &iv, &mut data);
+            assert_eq!(data, plaintext, "CTS roundtrip failed for size {size}");
+        }
     }
 
     #[test]

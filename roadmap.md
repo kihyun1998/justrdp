@@ -363,22 +363,22 @@ pub trait PduHint: Send + Sync {
 **Deactivation-Reactivation Sequence:**
 - [x] `DeactivateAllPdu` -- 서버가 세션 비활성화 (해상도 변경, 재협상 등)
 - [x] Demand Active → Confirm Active 재협상 *(DemandActivePdu / ConfirmActivePdu 구현)*
-- [ ] Connection Finalization 재수행 *(상태 머신 레벨, Phase 2에서 구현)*
-- [ ] 채널 상태 유지 (채널 재생성 불필요) *(상태 머신 레벨)*
-- [ ] 그래픽 캐시 무효화 여부 판단 *(상태 머신 레벨)*
+- [x] Connection Finalization 재수행 *(DeactivateAllPdu → CapabilitiesWaitDemandActive 재진입)*
+- [x] 채널 상태 유지 (채널 재생성 불필요) *(채널 ID 보존)*
+- [ ] 그래픽 캐시 무효화 여부 판단 *(Phase 3 graphics에서 구현)*
 
 **Share Data PDUs (활성 세션):**
 - [x] `ShareDataHeader` -- pduType2, compressedType, compressedLength
-- [ ] `UpdatePdu` -- Orders / Bitmap / Palette / Synchronize
-- [ ] `PointerUpdatePdu` -- System / Color / New / Cached / Large
+- [x] `UpdatePdu` -- Orders / Bitmap / Palette / Synchronize *(SlowPathUpdatePdu, type + raw body)*
+- [x] `PointerUpdatePdu` -- System / Color / New / Cached / Large *(SlowPathPointerUpdatePdu, type + raw body)*
 - [x] `InputEventPdu` -- 입력 이벤트 배열
 - [x] `SuppressOutputPdu`
 - [x] `RefreshRectPdu`
 - [x] `ShutdownRequestPdu` / `ShutdownDeniedPdu`
 - [x] `SaveSessionInfoPdu` -- Logon / AutoReconnect
 - [x] `SetErrorInfoPdu` -- 300+ disconnect reason 코드
-- [ ] `SetKeyboardIndicatorsPdu`
-- [ ] `SetKeyboardImeStatusPdu`
+- [x] `SetKeyboardIndicatorsPdu`
+- [x] `SetKeyboardImeStatusPdu`
 - [x] `MonitorLayoutPdu`
 
 **Auto-Detect PDUs (Network Characteristics Detection):**
@@ -422,12 +422,13 @@ pub trait PduHint: Send + Sync {
 - [x] `DstBlt`, `PatBlt`, `ScrBlt`, `OpaqueRect` *(PrimaryOrder + PrimaryOrderType enum, raw body)*
 - [x] `MultiDstBlt`, `MultiPatBlt`, `MultiScrBlt`, `MultiOpaqueRect` *(PrimaryOrder)*
 - [x] `DrawNineGrid`, `MultiDrawNineGrid` *(PrimaryOrder)*
-- [x] `LineTo`, `Polyline` *(PrimaryOrder)*
+- [x] `LineTo`, `Polyline`, `PolygonSc`, `PolygonCb` *(PrimaryOrder)*
 - [x] `MemBlt`, `Mem3Blt` *(PrimaryOrder)*
 - [x] `SaveBitmap` *(PrimaryOrder)*
 - [x] `GlyphIndex`, `FastIndex`, `FastGlyph` *(PrimaryOrder)*
 - [x] `EllipseSc`, `EllipseCb` *(PrimaryOrder)*
-- [x] `OrderInfo` -- 바운딩 rect, 필드 존재 플래그, delta 인코딩 *(BoundsRect + field_flags)*
+- [x] `OrderInfo` -- 바운딩 rect, 필드 존재 플래그 *(BoundsRect + field_flags, body는 raw bytes)*
+- [ ] Primary order 필드별 파싱 + delta encoding *(Phase 3에서 구현)*
 
 **Secondary Drawing Orders (Cache):**
 - [x] `CacheBitmapV1` / `CacheBitmapV2` / `CacheBitmapV3` *(SecondaryOrder + SecondaryOrderType)*
@@ -444,9 +445,11 @@ pub trait PduHint: Send + Sync {
 #### 4.2.7 Cryptographic Primitives
 
 - [x] RC4 encrypt/decrypt (Standard RDP Security)
-- [x] RSA public key operations (서버 인증서 검증, 키 교환) *(trait 추상화, 구현 주입)*
+- [x] RSA public key operations (서버 인증서 검증, 키 교환, RDP raw encrypt)
+- [x] MD4 (NTLM NT hash)
 - [x] MD5, SHA-1, SHA-256, HMAC (세션 키 파생)
-- [x] FIPS 140-1 triple-DES (FIPS 호환 모드) *(trait 추상화, 구현 주입)*
+- [x] FIPS 140-1 triple-DES + CBC mode
+- [x] AES-128/256 ECB, CBC, CTS (Kerberos)
 
 ---
 

@@ -61,27 +61,41 @@ pub fn read_choice(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<
 
 // ── Integer (constrained whole number) ──
 
-/// Write a PER constrained INTEGER.
+/// Write a PER constrained INTEGER (u16).
 ///
-/// For RDP/MCS, integers typically fit in 16 bits with a range constraint.
-/// `value` should already be offset from the minimum.
+/// For values < 0x4000 (14 bits): write 2 bytes directly.
+/// For values >= 0x4000: write length determinant (0x02) + 2 bytes.
 pub fn write_integer_u16(dst: &mut WriteCursor<'_>, value: u16, ctx: &'static str) -> EncodeResult<()> {
     if value < 0x4000 {
-        // 2 bytes, high bit clear = short form
+        // Short form: 2 bytes, high bits clear
         dst.write_u16_be(value, ctx)?;
     } else {
-        return Err(justrdp_core::EncodeError::other(ctx, "PER integer too large"));
+        // Long form: length(1) + value(2)
+        dst.write_u8(0x02, ctx)?; // length = 2 bytes
+        dst.write_u16_be(value, ctx)?;
     }
     Ok(())
 }
 
 /// Read a PER constrained INTEGER (u16).
+///
+/// Handles both short form (< 0x4000, 2 bytes) and long form (>= 0x4000, 1+2 bytes).
 pub fn read_integer_u16(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<u16> {
     let value = src.read_u16_be(ctx)?;
-    if value & 0xC000 != 0 {
-        return Err(DecodeError::invalid_value(ctx, "PER integer high bits set"));
+    if value & 0xC000 == 0 {
+        // Short form
+        Ok(value)
+    } else {
+        // First byte might be a length determinant
+        // Reinterpret: first byte = length (should be 0x02), second byte = high byte of value
+        let len = (value >> 8) as u8;
+        let hi = (value & 0xFF) as u8;
+        if len != 0x02 {
+            return Err(DecodeError::invalid_value(ctx, "PER integer unexpected length"));
+        }
+        let lo = src.read_u8(ctx)?;
+        Ok(u16::from_be_bytes([hi, lo]))
     }
-    Ok(value)
 }
 
 // ── Enumerated ──

@@ -2,6 +2,8 @@
 
 //! RDP Share Control and Share Data PDU headers -- MS-RDPBCGR 2.2.8.1
 
+use alloc::vec::Vec;
+
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_core::{DecodeError, DecodeResult, EncodeResult};
 
@@ -269,5 +271,133 @@ mod tests {
     #[test]
     fn share_data_unknown_type() {
         assert!(ShareDataPduType::from_u8(0xFF).is_err());
+    }
+}
+
+// ── Slow-Path Update PDU (MS-RDPBCGR 2.2.9.1.1.3) ──
+
+/// Slow-path update type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum SlowPathUpdateType {
+    Orders = 0x0000,
+    Bitmap = 0x0001,
+    Palette = 0x0002,
+    Synchronize = 0x0003,
+}
+
+impl SlowPathUpdateType {
+    pub fn from_u16(val: u16) -> DecodeResult<Self> {
+        match val {
+            0 => Ok(Self::Orders),
+            1 => Ok(Self::Bitmap),
+            2 => Ok(Self::Palette),
+            3 => Ok(Self::Synchronize),
+            _ => Err(DecodeError::unexpected_value("SlowPathUpdateType", "type", "unknown")),
+        }
+    }
+}
+
+/// Slow-Path Graphics Update PDU (pduType2 = Update).
+///
+/// MS-RDPBCGR 2.2.9.1.1.3
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowPathUpdatePdu {
+    pub update_type: SlowPathUpdateType,
+    /// Raw update data (type-specific).
+    pub data: Vec<u8>,
+}
+
+impl<'de> Decode<'de> for SlowPathUpdatePdu {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let update_type = SlowPathUpdateType::from_u16(src.read_u16_le("UpdatePdu::type")?)?;
+        let remaining = src.remaining();
+        let data = src.read_slice(remaining, "UpdatePdu::data")?.to_vec();
+        Ok(Self { update_type, data })
+    }
+}
+
+// ── Slow-Path Pointer Update PDU (MS-RDPBCGR 2.2.9.1.1.4) ──
+
+/// Slow-path pointer update type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum SlowPathPointerUpdateType {
+    Position = 0x0003,
+    System = 0x0001,
+    Color = 0x0006,
+    Cached = 0x0007,
+    New = 0x0008,
+    Large = 0x0009,
+}
+
+impl SlowPathPointerUpdateType {
+    pub fn from_u16(val: u16) -> DecodeResult<Self> {
+        match val {
+            0x0003 => Ok(Self::Position),
+            0x0001 => Ok(Self::System),
+            0x0006 => Ok(Self::Color),
+            0x0007 => Ok(Self::Cached),
+            0x0008 => Ok(Self::New),
+            0x0009 => Ok(Self::Large),
+            _ => Err(DecodeError::unexpected_value("PointerUpdateType", "type", "unknown")),
+        }
+    }
+}
+
+/// Slow-Path Pointer Update PDU (pduType2 = Pointer).
+///
+/// MS-RDPBCGR 2.2.9.1.1.4
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowPathPointerUpdatePdu {
+    pub update_type: SlowPathPointerUpdateType,
+    /// Raw pointer data (type-specific).
+    pub data: Vec<u8>,
+}
+
+impl<'de> Decode<'de> for SlowPathPointerUpdatePdu {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let update_type = SlowPathPointerUpdateType::from_u16(src.read_u16_le("PointerPdu::type")?)?;
+        let _pad2 = src.read_u16_le("PointerPdu::pad2")?;
+        let remaining = src.remaining();
+        let data = src.read_slice(remaining, "PointerPdu::data")?.to_vec();
+        Ok(Self { update_type, data })
+    }
+}
+
+// ── Set Keyboard Indicators PDU (MS-RDPBCGR 2.2.8.2.1.1) ──
+
+/// Set Keyboard Indicators PDU (pduType2 = SetKeyboardIndicators).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetKeyboardIndicatorsPdu {
+    /// LED flags: bit 0 = Scroll Lock, bit 1 = Num Lock, bit 2 = Caps Lock.
+    pub led_flags: u16,
+}
+
+impl<'de> Decode<'de> for SetKeyboardIndicatorsPdu {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let _unit_id = src.read_u16_le("KbdIndicators::unitId")?;
+        let led_flags = src.read_u16_le("KbdIndicators::ledFlags")?;
+        Ok(Self { led_flags })
+    }
+}
+
+// ── Set Keyboard IME Status PDU (MS-RDPBCGR 2.2.8.2.2.1) ──
+
+/// Set Keyboard IME Status PDU (pduType2 = SetKeyboardImeStatus).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetKeyboardImeStatusPdu {
+    /// IME state.
+    pub ime_state: u16,
+    /// IME conversion mode.
+    pub ime_conv_mode: u32,
+}
+
+impl<'de> Decode<'de> for SetKeyboardImeStatusPdu {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let _unit_id = src.read_u16_le("KbdImeStatus::unitId")?;
+        let ime_state = src.read_u16_le("KbdImeStatus::imeState")?;
+        let ime_conv_mode = src.read_u32_le("KbdImeStatus::imeConvMode")?;
+        Ok(Self { ime_state, ime_conv_mode })
     }
 }
