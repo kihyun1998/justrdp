@@ -39,6 +39,14 @@ pub struct Config {
     pub keyboard_layout: u32,
     /// Keyboard type. Default: 4 (IBM enhanced 101/102).
     pub keyboard_type: u32,
+    /// Keyboard subtype. Default: 0.
+    pub keyboard_subtype: u32,
+    /// Color depth in bits per pixel. Default: 16.
+    pub color_depth: u16,
+    /// Client build number sent in version info. Default: 22621 (Windows 11 22H2).
+    pub client_build: u32,
+    /// Auto-reconnect cookie from a previous session (optional).
+    pub auto_reconnect_cookie: Option<Vec<u8>>,
     /// Requested security protocol(s).
     pub security_protocol: SecurityProtocol,
     /// RDP cookie for load balancing (optional).
@@ -73,6 +81,10 @@ impl Config {
                 desktop_height: 768,
                 keyboard_layout: 0x0409,
                 keyboard_type: 4,
+                keyboard_subtype: 0,
+                color_depth: 16,
+                client_build: 22621,
+                auto_reconnect_cookie: None,
                 security_protocol: SecurityProtocol::SSL.union(SecurityProtocol::HYBRID),
                 cookie: None,
                 client_name: String::new(),

@@ -2,6 +2,7 @@
 
 //! Connector error types.
 
+use alloc::string::String;
 use core::fmt;
 
 use justrdp_core::{DecodeError, EncodeError};
@@ -30,6 +31,11 @@ pub enum ConnectorErrorKind {
     InvalidState,
     /// Licensing error from server.
     LicensingError(LicenseErrorCode),
+    /// Server requested redirect to another host.
+    ServerRedirect {
+        /// Target hostname/IP from the redirect packet.
+        target: String,
+    },
     /// General protocol violation.
     General(&'static str),
 }
@@ -93,6 +99,9 @@ impl fmt::Display for ConnectorError {
             ConnectorErrorKind::InvalidState => write!(f, "invalid connector state"),
             ConnectorErrorKind::LicensingError(code) => {
                 write!(f, "licensing error: {code:?}")
+            }
+            ConnectorErrorKind::ServerRedirect { target } => {
+                write!(f, "server redirect to: {target}")
             }
             ConnectorErrorKind::General(msg) => write!(f, "{msg}"),
         }

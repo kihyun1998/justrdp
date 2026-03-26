@@ -30,7 +30,7 @@ use justrdp_pdu::rdp::client_info::ClientInfoPdu;
 use justrdp_pdu::rdp::finalization::{ControlAction, ControlPdu, FontListPdu, SynchronizePdu};
 use justrdp_pdu::rdp::server_certificate;
 use justrdp_pdu::rdp::standard_security::{
-    self, RdpSecurityContext,
+    self, FipsSecurityContext, RdpSecurityContext,
     SEC_ENCRYPT, SEC_EXCHANGE_PKT,
     ENCRYPTION_METHOD_FIPS, ENCRYPTION_LEVEL_NONE,
 };
@@ -112,8 +112,18 @@ pub struct ClientConnector {
     server_rdp_version: u32,
     /// Parsed server RSA public key.
     server_public_key: Option<server_certificate::ServerRsaPublicKey>,
-    /// RC4-based security context (active after Security Exchange).
-    security_context: Option<RdpSecurityContext>,
+    /// Security context for Standard RDP Security (RC4 or FIPS).
+    security_mode: SecurityMode,
+}
+
+/// Standard RDP Security mode (none for TLS/NLA).
+enum SecurityMode {
+    /// No Standard RDP Security (TLS/NLA).
+    None,
+    /// RC4-based Standard RDP Security (40/56/128-bit).
+    Rc4(RdpSecurityContext),
+    /// FIPS 140-1 mode (3DES-CBC + SHA-1 HMAC).
+    Fips(FipsSecurityContext),
 }
 
 impl ClientConnector {
@@ -136,7 +146,7 @@ impl ClientConnector {
             server_encryption_level: 0,
             server_rdp_version: 0,
             server_public_key: None,
-            security_context: None,
+            security_mode: SecurityMode::None,
         }
     }
 
@@ -597,33 +607,38 @@ impl ClientConnector {
     /// For Standard RDP Security: strips security header (flags + flagsHi + MAC),
     /// decrypts the payload, and returns (flags, decrypted_data).
     /// For TLS/NLA: strips basic security header and returns raw data.
-    fn decrypt_server_data<'a>(&mut self, user_data: &'a [u8]) -> ConnectorResult<(u16, Vec<u8>)> {
+    fn decrypt_server_data(&mut self, user_data: &[u8]) -> ConnectorResult<(u16, Vec<u8>)> {
         let mut inner = ReadCursor::new(user_data);
         let flags = inner.read_u16_le("SecurityHeader::flags")?;
         let _flags_hi = inner.read_u16_le("SecurityHeader::flagsHi")?;
 
-        if let Some(ref mut sec_ctx) = self.security_context {
-            if flags & SEC_ENCRYPT != 0 {
-                // Encrypted: read 8-byte MAC then decrypt remaining data
+        match &mut self.security_mode {
+            SecurityMode::Rc4(ctx) if flags & SEC_ENCRYPT != 0 => {
                 let mac_bytes = inner.read_slice(8, "SecurityHeader::mac")?;
                 let mut mac = [0u8; 8];
                 mac.copy_from_slice(mac_bytes);
                 let remaining = inner.remaining();
                 let encrypted = inner.read_slice(remaining, "SecurityHeader::encryptedData")?;
                 let mut data = encrypted.to_vec();
-                let _valid = sec_ctx.decrypt(&mut data, &mac);
+                let _valid = ctx.decrypt(&mut data, &mac);
                 Ok((flags, data))
-            } else {
-                // Not encrypted (e.g., licensing with SEC_LICENSE_PKT only)
+            }
+            SecurityMode::Fips(ctx) if flags & SEC_ENCRYPT != 0 => {
+                let mac_bytes = inner.read_slice(8, "SecurityHeader::mac")?;
+                let mut mac = [0u8; 8];
+                mac.copy_from_slice(mac_bytes);
+                let pad_len = inner.read_u8("SecurityHeader::padLen")?;
+                let remaining = inner.remaining();
+                let encrypted = inner.read_slice(remaining, "SecurityHeader::encryptedData")?;
+                let (data, _valid) = ctx.decrypt(encrypted, &mac, pad_len);
+                Ok((flags, data))
+            }
+            _ => {
+                // No encryption or SEC_ENCRYPT not set
                 let remaining = inner.remaining();
                 let data = inner.read_slice(remaining, "SecurityHeader::data")?;
                 Ok((flags, data.to_vec()))
             }
-        } else {
-            // TLS/NLA: no encryption, return remaining data
-            let remaining = inner.remaining();
-            let data = inner.read_slice(remaining, "SecurityHeader::data")?;
-            Ok((flags, data.to_vec()))
         }
     }
 
@@ -636,23 +651,41 @@ impl ClientConnector {
         payload: &[u8],
         output: &mut WriteBuf,
     ) -> ConnectorResult<usize> {
-        if let Some(ref mut sec_ctx) = self.security_context {
-            let mut data = payload.to_vec();
-            let mac = sec_ctx.encrypt(&mut data);
+        match &mut self.security_mode {
+            SecurityMode::Rc4(ctx) => {
+                let mut data = payload.to_vec();
+                let mac = ctx.encrypt(&mut data);
 
-            // Build: flags(2) + flagsHi(2) + MAC(8) + encrypted_data
-            let inner_size = BASIC_SECURITY_HEADER_SIZE + 8 + data.len();
-            let mut inner = vec![0u8; inner_size];
-            {
-                let mut cursor = WriteCursor::new(&mut inner);
-                cursor.write_u16_le(SEC_ENCRYPT, "SecurityHeader::flags")?;
-                cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-                cursor.write_slice(&mac, "SecurityHeader::mac")?;
-                cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
+                let inner_size = BASIC_SECURITY_HEADER_SIZE + 8 + data.len();
+                let mut inner = vec![0u8; inner_size];
+                {
+                    let mut cursor = WriteCursor::new(&mut inner);
+                    cursor.write_u16_le(SEC_ENCRYPT, "SecurityHeader::flags")?;
+                    cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+                    cursor.write_slice(&mac, "SecurityHeader::mac")?;
+                    cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
+                }
+                encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
             }
-            encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
-        } else {
-            encode_mcs_send_data(self.user_channel_id, self.io_channel_id, payload, output)
+            SecurityMode::Fips(ctx) => {
+                let (ciphertext, mac, pad_len) = ctx.encrypt(payload);
+
+                // FIPS header: flags(2) + flagsHi(2) + padLen(1) + MAC(8) + encrypted_data
+                let inner_size = 4 + 1 + 8 + ciphertext.len();
+                let mut inner = vec![0u8; inner_size];
+                {
+                    let mut cursor = WriteCursor::new(&mut inner);
+                    cursor.write_u16_le(SEC_ENCRYPT, "SecurityHeader::flags")?;
+                    cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+                    cursor.write_u8(pad_len, "SecurityHeader::padLen")?;
+                    cursor.write_slice(&mac, "SecurityHeader::mac")?;
+                    cursor.write_slice(&ciphertext, "SecurityHeader::encryptedData")?;
+                }
+                encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
+            }
+            SecurityMode::None => {
+                encode_mcs_send_data(self.user_channel_id, self.io_channel_id, payload, output)
+            }
         }
     }
 
@@ -692,24 +725,23 @@ impl ClientConnector {
 
         let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
 
-        // Derive session keys
+        // Derive session keys and create security context
         if self.server_encryption_method == ENCRYPTION_METHOD_FIPS {
-            // FIPS mode: use 3DES + SHA-1
-            // TODO: Wire up FipsSecurityContext when FIPS flow is fully tested
-            return Err(ConnectorError::general("FIPS Standard RDP Security not yet fully wired"));
+            let fips_keys = standard_security::derive_fips_session_keys(
+                &client_random,
+                &server_random,
+            );
+            self.security_mode = SecurityMode::Fips(FipsSecurityContext::new(fips_keys));
+        } else {
+            let keys = standard_security::derive_session_keys(
+                &client_random,
+                &server_random,
+                self.server_encryption_method,
+            );
+            // SEC_SECURE_CHECKSUM is available on RDP 5.2+ (version >= 0x00080004)
+            let use_salted_mac = self.server_rdp_version >= 0x00080004;
+            self.security_mode = SecurityMode::Rc4(RdpSecurityContext::new(keys, use_salted_mac));
         }
-
-        let keys = standard_security::derive_session_keys(
-            &client_random,
-            &server_random,
-            self.server_encryption_method,
-        );
-
-        // Determine if salted MAC should be used
-        // SEC_SECURE_CHECKSUM is available on RDP 5.2+ (version >= 0x00080004)
-        let use_salted_mac = self.server_rdp_version >= 0x00080004;
-
-        self.security_context = Some(RdpSecurityContext::new(keys, use_salted_mac));
         self.state = ClientConnectorState::SecureSettingsExchange;
 
         Ok(Written::new(size))
@@ -719,51 +751,82 @@ impl ClientConnector {
         let info = ClientInfoPdu::new(&self.config.domain, &self.config.username, &self.config.password)
             .with_performance_flags(self.config.performance_flags);
 
-        if let Some(ref mut sec_ctx) = self.security_context {
-            // Standard RDP Security: encrypt the Client Info PDU
-            let info_size = info.size();
-            let mut info_bytes = vec![0u8; info_size];
-            {
-                let mut cursor = WriteCursor::new(&mut info_bytes);
-                info.encode(&mut cursor)?;
-            }
+        // Encode Client Info PDU
+        let info_bytes = justrdp_core::encode_vec(&info)?;
 
-            // Encrypt and get MAC
-            let mac = sec_ctx.encrypt(&mut info_bytes);
+        // Build security header + info
+        let is_encrypted = !matches!(self.security_mode, SecurityMode::None);
+        let sec_flags = if is_encrypted { SEC_INFO_PKT | SEC_ENCRYPT } else { SEC_INFO_PKT };
 
-            // Build: flags(2) + flagsHi(2) + MAC(8) + encrypted_data
-            let inner_size = BASIC_SECURITY_HEADER_SIZE + 8 + info_bytes.len();
-            let mut inner = vec![0u8; inner_size];
+        if is_encrypted {
+            // Standard RDP Security: encrypt via security context
+            // Build: SEC_INFO_PKT header + encrypted info
+            // We need to build the header separately since encrypt_and_send_mcs adds its own SEC_ENCRYPT header
+            let mut payload = vec![0u8; BASIC_SECURITY_HEADER_SIZE];
             {
-                let mut cursor = WriteCursor::new(&mut inner);
-                cursor.write_u16_le(SEC_INFO_PKT | SEC_ENCRYPT, "SecurityHeader::flags")?;
+                let mut cursor = WriteCursor::new(&mut payload);
+                cursor.write_u16_le(SEC_INFO_PKT, "SecurityHeader::infoFlag")?;
                 cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-                cursor.write_slice(&mac, "SecurityHeader::mac")?;
-                cursor.write_slice(&info_bytes, "SecurityHeader::encryptedData")?;
             }
+            // For Client Info with Standard RDP Security, the encryption wraps the info PDU
+            // but SEC_INFO_PKT is ORed with SEC_ENCRYPT in the security header
+            // Use encrypt_and_send_mcs which adds SEC_ENCRYPT + MAC
+            // But we need SEC_INFO_PKT flag too. Let me handle this properly:
 
-            let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
-            self.state = ClientConnectorState::LicensingWait;
-            Ok(Written::new(size))
+            // Actually for Client Info: the security header flags = SEC_INFO_PKT | SEC_ENCRYPT
+            // The entire info PDU is the encrypted payload
+            match &mut self.security_mode {
+                SecurityMode::Rc4(ctx) => {
+                    let mut data = info_bytes.clone();
+                    let mac = ctx.encrypt(&mut data);
+                    let inner_size = BASIC_SECURITY_HEADER_SIZE + 8 + data.len();
+                    let mut inner = vec![0u8; inner_size];
+                    {
+                        let mut cursor = WriteCursor::new(&mut inner);
+                        cursor.write_u16_le(sec_flags, "SecurityHeader::flags")?;
+                        cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+                        cursor.write_slice(&mac, "SecurityHeader::mac")?;
+                        cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
+                    }
+                    let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
+                    self.state = ClientConnectorState::LicensingWait;
+                    Ok(Written::new(size))
+                }
+                SecurityMode::Fips(ctx) => {
+                    let (ciphertext, mac, pad_len) = ctx.encrypt(&info_bytes);
+                    let inner_size = 4 + 1 + 8 + ciphertext.len();
+                    let mut inner = vec![0u8; inner_size];
+                    {
+                        let mut cursor = WriteCursor::new(&mut inner);
+                        cursor.write_u16_le(sec_flags, "SecurityHeader::flags")?;
+                        cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+                        cursor.write_u8(pad_len, "SecurityHeader::padLen")?;
+                        cursor.write_slice(&mac, "SecurityHeader::mac")?;
+                        cursor.write_slice(&ciphertext, "SecurityHeader::encryptedData")?;
+                    }
+                    let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
+                    self.state = ClientConnectorState::LicensingWait;
+                    Ok(Written::new(size))
+                }
+                SecurityMode::None => unreachable!(),
+            }
         } else {
             // TLS/NLA mode: send unencrypted (basic security header only)
-            let info_size = info.size();
-            let inner_size = BASIC_SECURITY_HEADER_SIZE + info_size;
+            let inner_size = BASIC_SECURITY_HEADER_SIZE + info_bytes.len();
             let mut inner = vec![0u8; inner_size];
             {
                 let mut cursor = WriteCursor::new(&mut inner);
                 cursor.write_u16_le(SEC_INFO_PKT, "SecurityHeader::flags")?;
                 cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-                info.encode(&mut cursor)?;
+                cursor.write_slice(&info_bytes, "SecurityHeader::encryptedData")?;
             }
-
             let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
             self.state = ClientConnectorState::LicensingWait;
             Ok(Written::new(size))
         }
     }
 
-    fn step_licensing_wait(&mut self, input: &[u8]) -> ConnectorResult<Written> {
+    fn step_licensing_wait(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
         let mut cursor = ReadCursor::new(input);
         let _tpkt = TpktHeader::decode(&mut cursor)?;
         let _dt = DataTransfer::decode(&mut cursor)?;
@@ -803,9 +866,36 @@ impl ClientConnector {
                     })
                 }
             }
+            LicenseMsgType::LicenseRequest | LicenseMsgType::PlatformChallenge => {
+                // Server requires licensing negotiation.
+                // Respond with ErrorAlert: ERR_NO_LICENSE_SERVER / ST_TOTAL_ABORT.
+                // Most servers will then send STATUS_VALID_CLIENT or disconnect.
+                let error_msg = build_license_error_response();
+
+                let inner_size = BASIC_SECURITY_HEADER_SIZE + error_msg.len();
+                let mut inner_buf = vec![0u8; inner_size];
+                {
+                    let mut cursor = WriteCursor::new(&mut inner_buf);
+                    cursor.write_u16_le(SEC_LICENSE_PKT, "LicenseResp::flags")?;
+                    cursor.write_u16_le(0, "LicenseResp::flagsHi")?;
+                    cursor.write_slice(&error_msg, "LicenseResp::data")?;
+                }
+
+                let size = encode_mcs_send_data(
+                    self.user_channel_id, self.io_channel_id, &inner_buf, output,
+                )?;
+
+                // Stay in LicensingWait for server's response
+                Ok(Written::new(size))
+            }
+            LicenseMsgType::NewLicense | LicenseMsgType::UpgradeLicense => {
+                // Server granted a license — licensing complete
+                self.state = ClientConnectorState::CapabilitiesWaitDemandActive;
+                Ok(Written::nothing())
+            }
             _ => {
-                // Full licensing negotiation not supported yet
-                Err(ConnectorError::general("full licensing negotiation not supported"))
+                // Unknown licensing PDU — skip and wait
+                Ok(Written::nothing())
             }
         }
     }
@@ -818,7 +908,7 @@ impl ClientConnector {
         let sdi = SendDataIndication::decode(&mut cursor)?;
 
         // Decrypt if Standard RDP Security
-        let decrypted = if self.security_context.is_some() {
+        let decrypted = if !matches!(self.security_mode, SecurityMode::None) {
             let (_flags, data) = self.decrypt_server_data(sdi.user_data)?;
             data
         } else {
@@ -881,7 +971,7 @@ impl ClientConnector {
                 suppress_output_support: 1,
             }),
             CapabilitySet::Bitmap(BitmapCapability {
-                preferred_bits_per_pixel: 16,
+                preferred_bits_per_pixel: self.config.color_depth,
                 receive1_bit_per_pixel: 1,
                 receive4_bits_per_pixel: 1,
                 receive8_bits_per_pixel: 1,
@@ -919,7 +1009,7 @@ impl ClientConnector {
                 pad2: 0,
                 keyboard_layout: self.config.keyboard_layout,
                 keyboard_type: self.config.keyboard_type,
-                keyboard_sub_type: 0,
+                keyboard_sub_type: self.config.keyboard_subtype,
                 keyboard_function_key: 12,
                 ime_file_name: [0u8; 64],
             }),
@@ -1080,7 +1170,7 @@ impl ClientConnector {
         let sdi = SendDataIndication::decode(&mut cursor)?;
 
         // Decrypt if Standard RDP Security
-        let decrypted = if self.security_context.is_some() {
+        let decrypted = if !matches!(self.security_mode, SecurityMode::None) {
             let (_flags, data) = self.decrypt_server_data(sdi.user_data)?;
             data
         } else {
@@ -1091,8 +1181,15 @@ impl ClientConnector {
 
         let sc_hdr = ShareControlHeader::decode(&mut inner)?;
 
+        if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
+            // Deactivation-Reactivation: go back to capabilities exchange
+            // MS-RDPBCGR 1.3.1.3
+            self.state = ClientConnectorState::CapabilitiesWaitDemandActive;
+            return Ok(Written::nothing());
+        }
+
         if sc_hdr.pdu_type != ShareControlPduType::Data {
-            // Not a data PDU — could be Deactivate All, etc.
+            // Unknown non-data PDU — stay in same state
             return Ok(Written::nothing());
         }
 
@@ -1106,6 +1203,23 @@ impl ClientConnector {
         self.state = next_state;
         Ok(Written::nothing())
     }
+}
+
+/// Build a licensing ErrorAlert response (ERR_NO_LICENSE_SERVER / ST_TOTAL_ABORT).
+///
+/// This tells the server that the client cannot fulfill the license request.
+/// Most servers will respond with STATUS_VALID_CLIENT or disconnect.
+fn build_license_error_response() -> Vec<u8> {
+    // LicensePreamble(4) + errorCode(4) + stateTransition(4) + errorInfo blob(4)
+    let mut buf = vec![0u8; 16];
+    buf[0] = LicenseMsgType::ErrorAlert as u8;  // msgType
+    buf[1] = 0x80; // flags: EXTENDED_ERROR_MSG_SUPPORTED
+    buf[2..4].copy_from_slice(&16u16.to_le_bytes()); // msgSize
+    buf[4..8].copy_from_slice(&0x0006u32.to_le_bytes()); // ERR_NO_LICENSE_SERVER
+    buf[8..12].copy_from_slice(&0x0001u32.to_le_bytes()); // ST_TOTAL_ABORT
+    buf[12..14].copy_from_slice(&0x0004u16.to_le_bytes()); // BB_ERROR_BLOB
+    buf[14..16].copy_from_slice(&0u16.to_le_bytes()); // blob length = 0
+    buf
 }
 
 impl Sequence for ClientConnector {
@@ -1181,7 +1295,7 @@ impl Sequence for ClientConnector {
                 self.step_secure_settings_exchange(output)
             }
             ClientConnectorState::LicensingWait => {
-                self.step_licensing_wait(input)
+                self.step_licensing_wait(input, output)
             }
             ClientConnectorState::CapabilitiesWaitDemandActive => {
                 self.step_capabilities_wait_demand_active(input)
