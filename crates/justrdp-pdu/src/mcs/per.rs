@@ -63,14 +63,16 @@ pub fn read_choice(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<
 
 /// Write a PER constrained INTEGER (u16).
 ///
-/// For values < 0x4000 (14 bits): write 2 bytes directly.
-/// For values >= 0x4000: write length determinant (0x02) + 2 bytes.
+/// For values < 0x4000 (14 bits): write 2 bytes BE (high 2 bits clear = short form).
+/// For values >= 0x4000: write 0x40 marker + length(1) + value(2).
+/// The 0x40 prefix (bit 14 set, bit 15 clear) signals long form per PER conventions.
 pub fn write_integer_u16(dst: &mut WriteCursor<'_>, value: u16, ctx: &'static str) -> EncodeResult<()> {
     if value < 0x4000 {
-        // Short form: 2 bytes, high bits clear
+        // Short form: 2 bytes BE, high 2 bits are 0
         dst.write_u16_be(value, ctx)?;
     } else {
-        // Long form: length(1) + value(2)
+        // Long form: 0x40 marker + 0x02 (length=2) + value(2 bytes BE)
+        dst.write_u8(0x40, ctx)?; // bit 14 set = long form
         dst.write_u8(0x02, ctx)?; // length = 2 bytes
         dst.write_u16_be(value, ctx)?;
     }
@@ -79,22 +81,22 @@ pub fn write_integer_u16(dst: &mut WriteCursor<'_>, value: u16, ctx: &'static st
 
 /// Read a PER constrained INTEGER (u16).
 ///
-/// Handles both short form (< 0x4000, 2 bytes) and long form (>= 0x4000, 1+2 bytes).
+/// Short form: first byte has bit 7+6 both clear → read 2 bytes BE as u16.
+/// Long form: first byte has bit 6 set (0x40) → read length(1) + value(2).
 pub fn read_integer_u16(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<u16> {
-    let value = src.read_u16_be(ctx)?;
-    if value & 0xC000 == 0 {
-        // Short form
-        Ok(value)
+    let first = src.read_u8(ctx)?;
+    if first & 0x40 == 0 {
+        // Short form: combine first byte with second byte
+        let second = src.read_u8(ctx)?;
+        Ok(u16::from_be_bytes([first, second]))
     } else {
-        // First byte might be a length determinant
-        // Reinterpret: first byte = length (should be 0x02), second byte = high byte of value
-        let len = (value >> 8) as u8;
-        let hi = (value & 0xFF) as u8;
+        // Long form: first byte is marker (0x40), next is length, then value
+        let len = src.read_u8(ctx)?;
         if len != 0x02 {
             return Err(DecodeError::invalid_value(ctx, "PER integer unexpected length"));
         }
-        let lo = src.read_u8(ctx)?;
-        Ok(u16::from_be_bytes([hi, lo]))
+        let value = src.read_u16_be(ctx)?;
+        Ok(value)
     }
 }
 
@@ -219,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_u16_roundtrip() {
+    fn integer_u16_short_form_roundtrip() {
         for &val in &[0u16, 1, 100, 0x3FFF] {
             let mut buf = [0u8; 2];
             let mut cursor = WriteCursor::new(&mut buf);
@@ -227,6 +229,19 @@ mod tests {
 
             let mut cursor = ReadCursor::new(&buf);
             assert_eq!(read_integer_u16(&mut cursor, "test").unwrap(), val);
+        }
+    }
+
+    #[test]
+    fn integer_u16_long_form_roundtrip() {
+        for &val in &[0x4000u16, 0x4001, 0x8000, 0xFFFF] {
+            let mut buf = [0u8; 4];
+            let mut cursor = WriteCursor::new(&mut buf);
+            write_integer_u16(&mut cursor, val, "test").unwrap();
+
+            let mut cursor = ReadCursor::new(&buf);
+            assert_eq!(read_integer_u16(&mut cursor, "test").unwrap(), val,
+                "long form roundtrip failed for {val:#06x}");
         }
     }
 
