@@ -292,11 +292,9 @@ impl Encode for NegotiateMessage {
         dst.write_u16_le(workstation_bytes.len() as u16, "Workstation::MaxLen")?;
         dst.write_u32_le(workstation_offset, "Workstation::Offset")?;
 
-        // Version
+        // Version (only if NEGOTIATE_VERSION flag is set)
         if let Some(ref ver) = self.version {
             ver.encode(dst)?;
-        } else {
-            dst.write_slice(&[0u8; 8], "Version::empty")?;
         }
 
         // Payload
