@@ -365,7 +365,6 @@ pub trait PduHint: Send + Sync {
 - [x] Demand Active → Confirm Active 재협상 *(DemandActivePdu / ConfirmActivePdu 구현)*
 - [x] Connection Finalization 재수행 *(DeactivateAllPdu → CapabilitiesWaitDemandActive 재진입)*
 - [x] 채널 상태 유지 (채널 재생성 불필요) *(채널 ID 보존)*
-- [ ] 그래픽 캐시 무효화 여부 판단 *(Phase 3 graphics에서 구현)*
 
 **Share Data PDUs (활성 세션):**
 - [x] `ShareDataHeader` -- pduType2, compressedType, compressedLength
@@ -391,7 +390,6 @@ pub trait PduHint: Send + Sync {
 - [x] Network Characteristics Result (requestType 0x0840/0x0880/0x08C0)
   - [x] baseRTT, bandwidth, averageRTT
 - [x] Connect-Time vs. Continuous Auto-Detect 구분
-- [ ] `AutoDetectSequence` -- 상태 머신 (RTT → Bandwidth → Result) *(상태 머신 레벨, Phase 2)*
 
 **Multitransport PDUs:**
 - [x] `InitiateMultitransportRequest` / `MultitransportResponse`
@@ -428,7 +426,6 @@ pub trait PduHint: Send + Sync {
 - [x] `GlyphIndex`, `FastIndex`, `FastGlyph` *(PrimaryOrder)*
 - [x] `EllipseSc`, `EllipseCb` *(PrimaryOrder)*
 - [x] `OrderInfo` -- 바운딩 rect, 필드 존재 플래그 *(BoundsRect + field_flags, body는 raw bytes)*
-- [ ] Primary order 필드별 파싱 + delta encoding *(Phase 3에서 구현)*
 
 **Secondary Drawing Orders (Cache):**
 - [x] `CacheBitmapV1` / `CacheBitmapV2` / `CacheBitmapV3` *(SecondaryOrder + SecondaryOrderType)*
@@ -629,6 +626,12 @@ pub enum ClientConnectorState {
 ## 6. Phase 3 -- Graphics Pipeline
 
 > **목표**: 서버에서 보내는 그래픽 데이터를 완전히 디코딩하여 RGBA 프레임 버퍼로 변환.
+
+### Prerequisites (Phase 1/2에서 이관)
+
+- [ ] Primary order 필드별 파싱 + delta encoding *(Phase 1 drawing orders body 파싱)*
+- [ ] 그래픽 캐시 무효화 여부 판단 *(Deactivation-Reactivation 시)*
+- [ ] `AutoDetectSequence` 상태 머신 (RTT → Bandwidth → Result)
 
 ### 6.1 `justrdp-graphics` -- Image Processing & Codecs
 
