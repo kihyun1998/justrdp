@@ -866,4 +866,132 @@ mod tests {
         let decoded = DeriveTestRest::decode(&mut cursor).unwrap();
         assert_eq!(decoded, pdu);
     }
+
+    #[test]
+    fn derive_rest_empty_payload() {
+        let pdu = DeriveTestRest { header: 0x0000, payload: vec![] };
+        assert_eq!(pdu.size(), 2);
+
+        let mut buf = [0u8; 2];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DeriveTestRest::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+        assert!(decoded.payload.is_empty());
+    }
+
+    // ── Pad test ──
+
+    #[derive(Debug, Clone, PartialEq, Eq, crate::DeriveEncode, crate::DeriveDecode)]
+    struct DeriveTestPad {
+        #[pdu(u8)]
+        tag: u8,
+        #[pdu(pad = 3)]
+        _reserved: (),
+        #[pdu(u8)]
+        value: u8,
+    }
+
+    #[test]
+    fn derive_pad_encode_decode() {
+        let pdu = DeriveTestPad { tag: 0x01, _reserved: (), value: 0x02 };
+        assert_eq!(pdu.size(), 5); // 1 + 3 + 1
+
+        let mut buf = [0u8; 5];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        assert_eq!(&buf[1..4], &[0x00, 0x00, 0x00]); // pad bytes are zero
+
+        // Non-zero bytes in pad position are silently skipped on decode
+        buf[1] = 0xFF; buf[2] = 0xFF; buf[3] = 0xFF;
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DeriveTestPad::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.tag, 0x01);
+        assert_eq!(decoded.value, 0x02);
+    }
+
+    // ── Big-endian test ──
+
+    #[derive(Debug, Clone, PartialEq, Eq, crate::DeriveEncode, crate::DeriveDecode)]
+    struct DeriveTestBe {
+        #[pdu(u16_be)]
+        a: u16,
+        #[pdu(u32_be)]
+        b: u32,
+    }
+
+    #[test]
+    fn derive_be_wire_order() {
+        let pdu = DeriveTestBe { a: 0x1234, b: 0xDEADBEEF };
+        assert_eq!(pdu.size(), 6);
+
+        let mut buf = [0u8; 6];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        assert_eq!(&buf[0..2], &[0x12, 0x34]); // big-endian MSB first
+        assert_eq!(&buf[2..6], &[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DeriveTestBe::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    // ── Signed integer test ──
+
+    #[derive(Debug, Clone, PartialEq, Eq, crate::DeriveEncode, crate::DeriveDecode)]
+    struct DeriveTestSigned {
+        #[pdu(i16_le)]
+        a: i16,
+        #[pdu(i32_le)]
+        b: i32,
+    }
+
+    #[test]
+    fn derive_signed_negative_roundtrip() {
+        let pdu = DeriveTestSigned { a: -1, b: -2147483648 }; // -1, i32::MIN
+        assert_eq!(pdu.size(), 6);
+
+        let mut buf = [0u8; 6];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        assert_eq!(&buf[0..2], &[0xFF, 0xFF]); // -1 as i16 LE
+        assert_eq!(&buf[2..6], &[0x00, 0x00, 0x00, 0x80]); // i32::MIN LE
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DeriveTestSigned::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    // ── u64 test ──
+
+    #[derive(Debug, Clone, PartialEq, Eq, crate::DeriveEncode, crate::DeriveDecode)]
+    struct DeriveTestU64 {
+        #[pdu(u64_le)]
+        val: u64,
+    }
+
+    #[test]
+    fn derive_u64_roundtrip() {
+        let pdu = DeriveTestU64 { val: 0xDEADBEEF_CAFEBABE };
+        assert_eq!(pdu.size(), 8);
+
+        let mut buf = [0u8; 8];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DeriveTestU64::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    // ── Truncated input test ──
+
+    #[test]
+    fn derive_truncated_input_returns_error() {
+        let buf = [0x34, 0x12, 0xEF, 0xBE, 0xAD, 0xDE]; // 6 bytes, needs 7
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(DeriveTestPdu::decode(&mut cursor).is_err());
+    }
 }

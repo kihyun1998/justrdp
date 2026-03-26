@@ -27,7 +27,7 @@
 //! | `#[pdu(i16_le)]` / `#[pdu(i32_le)]` | 2 / 4 |
 //! | `#[pdu(bytes = N)]` | N (fixed array) |
 //! | `#[pdu(rest)]` | dynamic (Vec<u8>) |
-//! | `#[pdu(pad = N)]` | N (zeros on encode, skip on decode) |
+//! | `#[pdu(pad = N)]` | N (zeros on encode, skip on decode). Field type must impl `Default`. Use `()` for padding fields. |
 
 use proc_macro::TokenStream;
 use quote::quote;
