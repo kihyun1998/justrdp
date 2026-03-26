@@ -588,21 +588,21 @@ pub enum ClientConnectorState {
 
 #### 5.2.5 Remote Credential Guard
 
-- [ ] 자격증명 위임 없이 Kerberos 기반 SSO
-- [ ] CredSSP에서 자격증명을 서버로 전송하지 않음 (MITM 방지)
-- [ ] 클라이언트가 Kerberos 서비스 티켓만 전달
-- [ ] `PROTOCOL_RDSTLS` negotiation flag
-- [ ] Remote Credential Guard 활성화 시 `TSSmartCardCreds` 대신 `RemoteGuardPackageCred` 전송
-- [ ] Compound Identity 지원 (디바이스 클레임 포함)
+- [x] 자격증명 위임 없이 Kerberos 기반 SSO
+- [x] CredSSP에서 자격증명을 서버로 전송하지 않음 (MITM 방지)
+- [x] 클라이언트가 Kerberos 서비스 티켓만 전달
+- [x] `PROTOCOL_RDSTLS` negotiation flag
+- [x] Remote Credential Guard 활성화 시 `TSSmartCardCreds` 대신 `RemoteGuardPackageCred` 전송
+- [x] Compound Identity 지원 (디바이스 클레임 포함)
 
 #### 5.2.6 Restricted Admin Mode
 
-- [ ] 서버에 자격증명을 저장하지 않는 관리자 모드
-- [ ] Pass-the-Hash 위험 감소 (관리자 자격증명이 원격 세션에 캐시되지 않음)
-- [ ] CredSSP에서 빈 자격증명 전송
-- [ ] `RESTRICTED_ADMIN_MODE_REQUIRED` 플래그
-- [ ] 네트워크 리소스 접근 시 서버의 머신 계정 사용
-- [ ] 관리자 그룹 멤버십 필수
+- [x] 서버에 자격증명을 저장하지 않는 관리자 모드
+- [x] Pass-the-Hash 위험 감소 (관리자 자격증명이 원격 세션에 캐시되지 않음)
+- [x] CredSSP에서 빈 자격증명 전송
+- [x] `RESTRICTED_ADMIN_MODE_REQUIRED` 플래그
+- [x] 네트워크 리소스 접근 시 서버의 머신 계정 사용
+- [x] 관리자 그룹 멤버십 필수
 
 #### 5.2.7 Azure AD Authentication (RDSTLS/AAD)
 

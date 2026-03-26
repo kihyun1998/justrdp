@@ -23,6 +23,16 @@ pub enum ClientConnectorState {
     /// Caller performs CredSSP/NLA, then signals completion.
     CredSsp,
 
+    // ── Phase 3b: RDSTLS (Remote Credential Guard) ──
+    /// Send RDSTLS Capabilities to server.
+    RdstlsSendCapabilities,
+    /// Wait for server RDSTLS Capabilities.
+    RdstlsWaitCapabilities,
+    /// Send RDSTLS Authentication Request.
+    RdstlsSendAuthRequest,
+    /// Wait for RDSTLS Authentication Response.
+    RdstlsWaitAuthResponse,
+
     // ── Phase 4: Basic Settings Exchange ──
     /// Send MCS Connect Initial with GCC client data.
     BasicSettingsExchangeSendInitial,
@@ -90,6 +100,10 @@ impl ClientConnectorState {
             Self::ConnectionInitiationWaitConfirm => "ConnectionInitiationWaitConfirm",
             Self::SecurityUpgrade => "SecurityUpgrade",
             Self::CredSsp => "CredSsp",
+            Self::RdstlsSendCapabilities => "RdstlsSendCapabilities",
+            Self::RdstlsWaitCapabilities => "RdstlsWaitCapabilities",
+            Self::RdstlsSendAuthRequest => "RdstlsSendAuthRequest",
+            Self::RdstlsWaitAuthResponse => "RdstlsWaitAuthResponse",
             Self::BasicSettingsExchangeSendInitial => "BasicSettingsExchangeSendInitial",
             Self::BasicSettingsExchangeWaitResponse => "BasicSettingsExchangeWaitResponse",
             Self::ChannelConnectionSendErectDomain => "ChannelConnectionSendErectDomain",
@@ -121,6 +135,8 @@ impl ClientConnectorState {
             Self::ConnectionInitiation
                 | Self::SecurityUpgrade
                 | Self::CredSsp
+                | Self::RdstlsSendCapabilities
+                | Self::RdstlsSendAuthRequest
                 | Self::BasicSettingsExchangeSendInitial
                 | Self::ChannelConnectionSendErectDomain
                 | Self::ChannelConnectionSendAttachUser

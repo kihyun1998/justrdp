@@ -151,11 +151,34 @@ pub const NEGO_RESPONSE_TYPE: u8 = 0x02;
 /// Negotiation failure type byte.
 pub const NEGO_FAILURE_TYPE: u8 = 0x03;
 
+/// Negotiation Request flags (MS-RDPBCGR 2.2.1.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NegotiationRequestFlags(u8);
+
+impl NegotiationRequestFlags {
+    /// No flags.
+    pub const NONE: Self = Self(0x00);
+    /// Restricted Admin Mode Required.
+    /// When set, the server must support Restricted Admin Mode.
+    pub const RESTRICTED_ADMIN_MODE_REQUIRED: Self = Self(0x01);
+    /// Redirected Authentication Mode Required.
+    pub const REDIRECTED_AUTHENTICATION_MODE_REQUIRED: Self = Self(0x02);
+    /// Correlation Info Present.
+    pub const CORRELATION_INFO_PRESENT: Self = Self(0x08);
+
+    pub fn bits(&self) -> u8 { self.0 }
+    pub fn from_bits(bits: u8) -> Self { Self(bits) }
+    pub fn contains(&self, other: Self) -> bool { (self.0 & other.0) == other.0 }
+    pub fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
+}
+
 /// RDP Negotiation Request (sent inside X.224 Connection Request).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiationRequest {
     /// Requested security protocols.
     pub protocols: SecurityProtocol,
+    /// Request flags.
+    pub flags: NegotiationRequestFlags,
 }
 
 impl NegotiationRequest {
@@ -164,14 +187,19 @@ impl NegotiationRequest {
 
     /// Create a new negotiation request.
     pub fn new(protocols: SecurityProtocol) -> Self {
-        Self { protocols }
+        Self { protocols, flags: NegotiationRequestFlags::NONE }
+    }
+
+    /// Create a negotiation request with flags.
+    pub fn with_flags(protocols: SecurityProtocol, flags: NegotiationRequestFlags) -> Self {
+        Self { protocols, flags }
     }
 }
 
 impl Encode for NegotiationRequest {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         dst.write_u8(NEGO_REQUEST_TYPE, "NegotiationRequest::type")?;
-        dst.write_u8(0x00, "NegotiationRequest::flags")?; // flags
+        dst.write_u8(self.flags.bits(), "NegotiationRequest::flags")?;
         dst.write_u16_le(8, "NegotiationRequest::length")?; // length = 8
         dst.write_u32_le(self.protocols.bits(), "NegotiationRequest::protocols")?;
         Ok(())
@@ -196,12 +224,13 @@ impl<'de> Decode<'de> for NegotiationRequest {
                 "expected 0x01",
             ));
         }
-        let _flags = src.read_u8("NegotiationRequest::flags")?;
+        let flags = src.read_u8("NegotiationRequest::flags")?;
         let _length = src.read_u16_le("NegotiationRequest::length")?;
         let protocols = src.read_u32_le("NegotiationRequest::protocols")?;
 
         Ok(Self {
             protocols: SecurityProtocol::from_bits(protocols),
+            flags: NegotiationRequestFlags::from_bits(flags),
         })
     }
 }
@@ -218,9 +247,9 @@ impl NegotiationResponseFlags {
     /// Graphics Pipeline Extension supported.
     pub const DYNVC_GFX: Self = Self(0x02);
     /// Restricted Admin mode supported.
-    pub const RESTRICTED_ADMIN: Self = Self(0x08);
+    pub const RESTRICTED_ADMIN: Self = Self(0x04);
     /// Redirected Authentication supported.
-    pub const REDIRECTED_AUTH: Self = Self(0x10);
+    pub const REDIRECTED_AUTH: Self = Self(0x08);
 
     /// Create from raw bits.
     pub fn from_bits(bits: u8) -> Self {
@@ -832,6 +861,43 @@ mod tests {
         assert_eq!(decoded.protocols.bits(), req.protocols.bits());
         assert!(decoded.protocols.contains(SecurityProtocol::SSL));
         assert!(decoded.protocols.contains(SecurityProtocol::HYBRID));
+        assert_eq!(decoded.flags, NegotiationRequestFlags::NONE);
+    }
+
+    #[test]
+    fn negotiation_request_restricted_admin_flag() {
+        let req = NegotiationRequest::with_flags(
+            SecurityProtocol::HYBRID,
+            NegotiationRequestFlags::RESTRICTED_ADMIN_MODE_REQUIRED,
+        );
+        let mut buf = [0u8; 8];
+        let mut cursor = WriteCursor::new(&mut buf);
+        req.encode(&mut cursor).unwrap();
+
+        // flags byte is at offset 1
+        assert_eq!(buf[1], 0x01);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = NegotiationRequest::decode(&mut cursor).unwrap();
+        assert!(decoded.flags.contains(NegotiationRequestFlags::RESTRICTED_ADMIN_MODE_REQUIRED));
+        assert!(decoded.protocols.contains(SecurityProtocol::HYBRID));
+    }
+
+    #[test]
+    fn negotiation_request_redirected_auth_flag() {
+        let req = NegotiationRequest::with_flags(
+            SecurityProtocol::RDSTLS,
+            NegotiationRequestFlags::REDIRECTED_AUTHENTICATION_MODE_REQUIRED,
+        );
+        let mut buf = [0u8; 8];
+        let mut cursor = WriteCursor::new(&mut buf);
+        req.encode(&mut cursor).unwrap();
+
+        assert_eq!(buf[1], 0x02);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = NegotiationRequest::decode(&mut cursor).unwrap();
+        assert!(decoded.flags.contains(NegotiationRequestFlags::REDIRECTED_AUTHENTICATION_MODE_REQUIRED));
     }
 
     #[test]

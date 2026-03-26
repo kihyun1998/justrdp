@@ -9,6 +9,19 @@ use justrdp_pdu::gcc::client::ChannelDef;
 use justrdp_pdu::rdp::client_info::PerformanceFlags;
 use justrdp_pdu::x224::SecurityProtocol;
 
+/// Authentication mode for the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Standard password-based authentication (default).
+    Password,
+    /// Remote Credential Guard: Kerberos-based SSO without password delegation.
+    /// The client's Kerberos service ticket is forwarded instead of credentials.
+    RemoteCredentialGuard,
+    /// Restricted Admin: no credentials are sent to the server.
+    /// The session uses the server's machine account for network resources.
+    RestrictedAdmin,
+}
+
 /// RDP connection configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -36,6 +49,13 @@ pub struct Config {
     pub channels: Vec<ChannelDef>,
     /// Performance flags.
     pub performance_flags: PerformanceFlags,
+    /// Authentication mode.
+    pub auth_mode: AuthMode,
+    /// Kerberos AP-REQ token for Remote Credential Guard.
+    /// Must be provided when auth_mode is RemoteCredentialGuard.
+    pub kerberos_token: Option<Vec<u8>>,
+    /// Device Kerberos AP-REQ token for Compound Identity (optional).
+    pub device_kerberos_token: Option<Vec<u8>>,
 }
 
 impl Config {
@@ -55,6 +75,9 @@ impl Config {
                 client_name: String::new(),
                 channels: Vec::new(),
                 performance_flags: PerformanceFlags::from_bits(0),
+                auth_mode: AuthMode::Password,
+                kerberos_token: None,
+                device_kerberos_token: None,
             },
         }
     }
@@ -118,6 +141,46 @@ impl ConfigBuilder {
     /// Set performance flags.
     pub fn performance_flags(mut self, flags: PerformanceFlags) -> Self {
         self.config.performance_flags = flags;
+        self
+    }
+
+    /// Set authentication mode.
+    pub fn auth_mode(mut self, mode: AuthMode) -> Self {
+        self.config.auth_mode = mode;
+        self
+    }
+
+    /// Enable Remote Credential Guard with a Kerberos AP-REQ token.
+    ///
+    /// Sets auth mode to RemoteCredentialGuard and protocol to RDSTLS.
+    /// The `kerberos_token` is the AP-REQ obtained from the KDC for the target server.
+    pub fn remote_credential_guard(mut self, kerberos_token: Vec<u8>) -> Self {
+        self.config.auth_mode = AuthMode::RemoteCredentialGuard;
+        self.config.security_protocol = SecurityProtocol::RDSTLS;
+        self.config.kerberos_token = Some(kerberos_token);
+        self
+    }
+
+    /// Set a device Kerberos token for Compound Identity (optional).
+    ///
+    /// Used with Remote Credential Guard to include device claims
+    /// in the authentication for conditional access evaluation.
+    pub fn device_kerberos_token(mut self, token: Vec<u8>) -> Self {
+        self.config.device_kerberos_token = Some(token);
+        self
+    }
+
+    /// Enable Restricted Admin mode.
+    ///
+    /// Forces HYBRID (CredSSP/NLA) protocol since Restricted Admin requires NLA.
+    pub fn restricted_admin(mut self) -> Self {
+        self.config.auth_mode = AuthMode::RestrictedAdmin;
+        // Restricted Admin requires CredSSP (HYBRID)
+        if !self.config.security_protocol.contains(SecurityProtocol::HYBRID)
+            && !self.config.security_protocol.contains(SecurityProtocol::HYBRID_EX)
+        {
+            self.config.security_protocol = SecurityProtocol::HYBRID;
+        }
         self
     }
 

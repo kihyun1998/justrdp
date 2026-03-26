@@ -64,6 +64,21 @@ const BASIC_SECURITY_HEADER_SIZE: usize = 4;
 /// TPKT hint for PDU boundary detection.
 static TPKT_HINT: TpktHint = TpktHint;
 
+/// RDSTLS PDU hint: reads version(2) + dataType(2) + pduLength(2), uses pduLength as total size.
+struct RdstlsHint;
+
+impl PduHint for RdstlsHint {
+    fn find_size(&self, bytes: &[u8]) -> Option<(bool, usize)> {
+        if bytes.len() < 6 {
+            return None;
+        }
+        let pdu_length = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        Some((false, pdu_length))
+    }
+}
+
+static RDSTLS_HINT: RdstlsHint = RdstlsHint;
+
 /// RDP client connection state machine.
 ///
 /// Drives the full RDP connection sequence without performing I/O.
@@ -154,7 +169,18 @@ impl ClientConnector {
     // ── State handlers ──
 
     fn step_connection_initiation(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
-        let nego = NegotiationRequest::new(self.config.security_protocol);
+        use justrdp_pdu::x224::NegotiationRequestFlags;
+
+        let flags = match self.config.auth_mode {
+            crate::config::AuthMode::RestrictedAdmin => {
+                NegotiationRequestFlags::RESTRICTED_ADMIN_MODE_REQUIRED
+            }
+            crate::config::AuthMode::RemoteCredentialGuard => {
+                NegotiationRequestFlags::REDIRECTED_AUTHENTICATION_MODE_REQUIRED
+            }
+            crate::config::AuthMode::Password => NegotiationRequestFlags::NONE,
+        };
+        let nego = NegotiationRequest::with_flags(self.config.security_protocol, flags);
 
         let cr = if let Some(ref cookie) = self.config.cookie {
             ConnectionRequest::with_cookie(cookie.clone(), Some(nego))
@@ -190,6 +216,25 @@ impl ClientConnector {
             }
         }
 
+        // Validate server supports the requested auth mode
+        match self.config.auth_mode {
+            crate::config::AuthMode::RestrictedAdmin => {
+                if !self.server_nego_flags.contains(NegotiationResponseFlags::RESTRICTED_ADMIN) {
+                    return Err(ConnectorError::general(
+                        "server does not support Restricted Admin Mode",
+                    ));
+                }
+            }
+            crate::config::AuthMode::RemoteCredentialGuard => {
+                if !self.server_nego_flags.contains(NegotiationResponseFlags::REDIRECTED_AUTH) {
+                    return Err(ConnectorError::general(
+                        "server does not support Remote Credential Guard (Redirected Authentication)",
+                    ));
+                }
+            }
+            crate::config::AuthMode::Password => {}
+        }
+
         // Transition based on selected protocol
         if self.selected_protocol != SecurityProtocol::RDP {
             self.state = ClientConnectorState::SecurityUpgrade;
@@ -202,7 +247,10 @@ impl ClientConnector {
 
     fn step_security_upgrade(&mut self) -> ConnectorResult<Written> {
         // Caller has completed TLS handshake
-        if self.selected_protocol.contains(SecurityProtocol::HYBRID)
+        if self.selected_protocol.contains(SecurityProtocol::RDSTLS) {
+            // RDSTLS: Remote Credential Guard or Azure AD path
+            self.state = ClientConnectorState::RdstlsSendCapabilities;
+        } else if self.selected_protocol.contains(SecurityProtocol::HYBRID)
             || self.selected_protocol.contains(SecurityProtocol::HYBRID_EX)
         {
             self.state = ClientConnectorState::CredSsp;
@@ -214,6 +262,86 @@ impl ClientConnector {
 
     fn step_credssp(&mut self) -> ConnectorResult<Written> {
         // Caller has completed NLA/CredSSP
+        self.state = ClientConnectorState::BasicSettingsExchangeSendInitial;
+        Ok(Written::nothing())
+    }
+
+    // ── RDSTLS (Remote Credential Guard) ──
+
+    fn step_rdstls_send_capabilities(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+        use justrdp_pdu::rdp::rdstls::RdstlsCapabilities;
+
+        let caps = RdstlsCapabilities::new();
+        let size = caps.size();
+        output.ensure_capacity(size);
+        let mut cursor = WriteCursor::new(output.as_mut_slice());
+        caps.encode(&mut cursor)?;
+
+        self.state = ClientConnectorState::RdstlsWaitCapabilities;
+        Ok(Written::new(size))
+    }
+
+    fn step_rdstls_wait_capabilities(&mut self, input: &[u8]) -> ConnectorResult<Written> {
+        use justrdp_pdu::rdp::rdstls::{RdstlsCapabilities, RDSTLS_VERSION_1};
+
+        let mut cursor = ReadCursor::new(input);
+        let server_caps = RdstlsCapabilities::decode(&mut cursor)?;
+
+        // Verify server supports RDSTLS v1
+        if server_caps.supported_versions & RDSTLS_VERSION_1 == 0 {
+            return Err(ConnectorError::general(
+                "server does not support RDSTLS version 1",
+            ));
+        }
+
+        self.state = ClientConnectorState::RdstlsSendAuthRequest;
+        Ok(Written::nothing())
+    }
+
+    fn step_rdstls_send_auth_request(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+        use justrdp_pdu::rdp::rdstls::RdstlsAuthenticationRequest;
+        use justrdp_pdu::ntlm::messages::to_utf16le;
+
+        let req = match self.config.auth_mode {
+            crate::config::AuthMode::RemoteCredentialGuard => {
+                let token = self.config.kerberos_token.as_ref()
+                    .ok_or_else(|| ConnectorError::general(
+                        "Remote Credential Guard requires a Kerberos token (set via Config)",
+                    ))?;
+                RdstlsAuthenticationRequest::kerberos(token.clone())
+            }
+            crate::config::AuthMode::RestrictedAdmin => {
+                RdstlsAuthenticationRequest::password(&[], &[], &[])
+            }
+            crate::config::AuthMode::Password => {
+                RdstlsAuthenticationRequest::password(
+                    &to_utf16le(&self.config.domain),
+                    &to_utf16le(&self.config.username),
+                    &to_utf16le(&self.config.password),
+                )
+            }
+        };
+
+        let size = req.size();
+        output.ensure_capacity(size);
+        let mut cursor = WriteCursor::new(output.as_mut_slice());
+        req.encode(&mut cursor)?;
+
+        self.state = ClientConnectorState::RdstlsWaitAuthResponse;
+        Ok(Written::new(size))
+    }
+
+    fn step_rdstls_wait_auth_response(&mut self, input: &[u8]) -> ConnectorResult<Written> {
+        use justrdp_pdu::rdp::rdstls::RdstlsAuthenticationResponse;
+
+        let mut cursor = ReadCursor::new(input);
+        let resp = RdstlsAuthenticationResponse::decode(&mut cursor)?;
+
+        if resp.result_code != 0 {
+            return Err(ConnectorError::general("RDSTLS authentication failed"));
+        }
+
+        // Authentication succeeded — proceed to basic settings exchange
         self.state = ClientConnectorState::BasicSettingsExchangeSendInitial;
         Ok(Written::nothing())
     }
@@ -909,6 +1037,12 @@ impl Sequence for ClientConnector {
     fn next_pdu_hint(&self) -> Option<&dyn PduHint> {
         if self.state.is_send_state() || self.state == ClientConnectorState::Connected {
             None
+        } else if matches!(
+            self.state,
+            ClientConnectorState::RdstlsWaitCapabilities
+                | ClientConnectorState::RdstlsWaitAuthResponse
+        ) {
+            Some(&RDSTLS_HINT)
         } else {
             Some(&TPKT_HINT)
         }
@@ -927,6 +1061,18 @@ impl Sequence for ClientConnector {
             }
             ClientConnectorState::CredSsp => {
                 self.step_credssp()
+            }
+            ClientConnectorState::RdstlsSendCapabilities => {
+                self.step_rdstls_send_capabilities(output)
+            }
+            ClientConnectorState::RdstlsWaitCapabilities => {
+                self.step_rdstls_wait_capabilities(input)
+            }
+            ClientConnectorState::RdstlsSendAuthRequest => {
+                self.step_rdstls_send_auth_request(output)
+            }
+            ClientConnectorState::RdstlsWaitAuthResponse => {
+                self.step_rdstls_wait_auth_response(input)
             }
             ClientConnectorState::BasicSettingsExchangeSendInitial => {
                 self.step_basic_settings_send_initial(output)

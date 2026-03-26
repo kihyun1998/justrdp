@@ -51,6 +51,39 @@ pub enum CredsspState {
     Done,
 }
 
+// ── Credential types (MS-CSSP 2.2.1.2) ──
+
+/// A supplemental credential package (e.g., device Kerberos token for Compound Identity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupplementalCred {
+    /// Package name (e.g., "Kerberos").
+    pub package_name: Vec<u8>,
+    /// Credential buffer (e.g., device AP-REQ token).
+    pub cred_buffer: Vec<u8>,
+}
+
+/// Credential type for TSCredentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialType {
+    /// TSPasswordCreds (credType = 1): send domain/username/password.
+    Password,
+    /// TSRemoteGuardCreds (credType = 6): Remote Credential Guard.
+    /// Contains Kerberos AP-REQ token for SSO without password delegation.
+    /// Optionally includes supplemental credentials for Compound Identity
+    /// (device claims via device Kerberos token).
+    RemoteGuard {
+        /// Kerberos AP-REQ token bytes (user logon credential).
+        kerberos_token: Vec<u8>,
+        /// Supplemental credentials for Compound Identity.
+        /// Typically contains a device Kerberos AP-REQ token so the server
+        /// can evaluate device-based conditional access policies.
+        supplemental_creds: Vec<SupplementalCred>,
+    },
+    /// Restricted Admin (credType = 1 with empty credentials).
+    /// No credentials are sent to the server.
+    RestrictedAdmin,
+}
+
 /// Random bytes needed by CredSSP (caller must generate cryptographically).
 pub struct CredsspRandom {
     /// 32-byte client nonce (for CredSSP v5+).
@@ -72,6 +105,9 @@ pub struct CredsspSequence {
     // Random values (from caller)
     random: CredsspRandom,
 
+    /// Credential type to send (password, Remote Guard, or Restricted Admin).
+    credential_type: CredentialType,
+
     // CredSSP version negotiation
     /// Negotiated CredSSP version: min(client_max, server_version).
     negotiated_version: u32,
@@ -89,7 +125,7 @@ pub struct CredsspSequence {
 }
 
 impl CredsspSequence {
-    /// Create a new CredSSP sequence.
+    /// Create a new CredSSP sequence with password credentials.
     ///
     /// `server_public_key` is the DER-encoded SubjectPublicKeyInfo from the TLS certificate.
     /// `random` contains cryptographically random bytes (caller must generate).
@@ -102,6 +138,22 @@ impl CredsspSequence {
         random: CredsspRandom,
         use_hybrid_ex: bool,
     ) -> Self {
+        Self::with_credential_type(
+            username, password, domain, server_public_key, random,
+            use_hybrid_ex, CredentialType::Password,
+        )
+    }
+
+    /// Create a new CredSSP sequence with a specific credential type.
+    pub fn with_credential_type(
+        username: &str,
+        password: &str,
+        domain: &str,
+        server_public_key: Vec<u8>,
+        random: CredsspRandom,
+        use_hybrid_ex: bool,
+        credential_type: CredentialType,
+    ) -> Self {
         Self {
             state: CredsspState::SendNegoToken,
             username: username.as_bytes().to_vec(),
@@ -109,6 +161,7 @@ impl CredsspSequence {
             domain: domain.as_bytes().to_vec(),
             server_public_key,
             random,
+            credential_type,
             negotiated_version: ts_request::TS_REQUEST_MAX_VERSION,
             use_hybrid_ex,
             negotiate_bytes: Vec::new(),
@@ -395,7 +448,22 @@ impl CredsspSequence {
     }
 
     /// Build TSCredentials ASN.1 DER structure (MS-CSSP 2.2.1.2).
+    ///
+    /// Supports:
+    /// - credType 1: TSPasswordCreds (password auth)
+    /// - credType 6: TSRemoteGuardCreds (Remote Credential Guard)
     fn build_ts_credentials(&self) -> Vec<u8> {
+        match &self.credential_type {
+            CredentialType::Password => self.build_ts_password_creds(),
+            CredentialType::RemoteGuard { kerberos_token, supplemental_creds } => {
+                build_ts_remote_guard_creds(kerberos_token, supplemental_creds)
+            }
+            CredentialType::RestrictedAdmin => self.build_ts_restricted_admin_creds(),
+        }
+    }
+
+    /// Build TSCredentials with TSPasswordCreds (credType = 1).
+    fn build_ts_password_creds(&self) -> Vec<u8> {
         let username = core::str::from_utf8(&self.username).unwrap_or("");
         let password = core::str::from_utf8(&self.password).unwrap_or("");
         let domain = core::str::from_utf8(&self.domain).unwrap_or("");
@@ -424,6 +492,79 @@ impl CredsspSequence {
         creds_body.extend(der_context_tag(1, &der_octet_string(&pass_creds)));
         der_sequence(&creds_body)
     }
+
+    /// Build TSCredentials for Restricted Admin (credType = 1, empty password).
+    fn build_ts_restricted_admin_creds(&self) -> Vec<u8> {
+        // Restricted Admin: send empty credentials
+        let mut pass_creds_body = Vec::new();
+        pass_creds_body.extend(der_context_tag(0, &der_octet_string(&[]))); // empty domain
+        pass_creds_body.extend(der_context_tag(1, &der_octet_string(&[]))); // empty user
+        pass_creds_body.extend(der_context_tag(2, &der_octet_string(&[]))); // empty password
+        let pass_creds = der_sequence(&pass_creds_body);
+
+        let mut creds_body = Vec::new();
+        creds_body.extend(der_context_tag(0, &der_integer(1)));
+        creds_body.extend(der_context_tag(1, &der_octet_string(&pass_creds)));
+        der_sequence(&creds_body)
+    }
+}
+
+// ── Remote Credential Guard (MS-CSSP 2.2.1.2.3) ──
+
+/// Build TSCredentials with TSRemoteGuardCreds (credType = 6).
+///
+/// ```text
+/// TSRemoteGuardPackageCred ::= SEQUENCE {
+///   packageName [0] OCTET STRING (UTF-8 "Kerberos"),
+///   credBuffer  [1] OCTET STRING (AP-REQ token)
+/// }
+///
+/// TSRemoteGuardCreds ::= SEQUENCE {
+///   logonCred          [0] TSRemoteGuardPackageCred,
+///   supplementalCreds  [1] SEQUENCE OF TSRemoteGuardPackageCred OPTIONAL
+/// }
+///
+/// TSCredentials ::= SEQUENCE {
+///   credType    [0] INTEGER (6),
+///   credentials [1] OCTET STRING (TSRemoteGuardCreds)
+/// }
+/// ```
+fn build_ts_remote_guard_creds(
+    kerberos_token: &[u8],
+    supplemental_creds: &[SupplementalCred],
+) -> Vec<u8> {
+    // TSRemoteGuardPackageCred for Kerberos (logon credential)
+    let logon_cred = build_package_cred(b"Kerberos", kerberos_token);
+
+    // TSRemoteGuardCreds
+    let mut guard_creds_body = Vec::new();
+    guard_creds_body.extend(der_context_tag(0, &logon_cred));
+
+    // supplementalCreds [1] SEQUENCE OF TSRemoteGuardPackageCred OPTIONAL
+    // Used for Compound Identity (device claims via device Kerberos token)
+    if !supplemental_creds.is_empty() {
+        let mut seq_body = Vec::new();
+        for cred in supplemental_creds {
+            seq_body.extend(build_package_cred(&cred.package_name, &cred.cred_buffer));
+        }
+        guard_creds_body.extend(der_context_tag(1, &der_sequence(&seq_body)));
+    }
+
+    let guard_creds = der_sequence(&guard_creds_body);
+
+    // TSCredentials
+    let mut creds_body = Vec::new();
+    creds_body.extend(der_context_tag(0, &der_integer(6))); // credType = 6
+    creds_body.extend(der_context_tag(1, &der_octet_string(&guard_creds)));
+    der_sequence(&creds_body)
+}
+
+/// Build a single TSRemoteGuardPackageCred.
+fn build_package_cred(package_name: &[u8], cred_buffer: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend(der_context_tag(0, &der_octet_string(package_name)));
+    body.extend(der_context_tag(1, &der_octet_string(cred_buffer)));
+    der_sequence(&body)
 }
 
 // ── ASN.1 DER helpers ──
@@ -646,5 +787,67 @@ mod tests {
         // Should get BIT STRING contents (14 bytes including unused-bits byte)
         assert_eq!(result.len(), 14);
         assert_eq!(result[0], 0x00); // unused bits byte
+    }
+
+    #[test]
+    fn build_ts_remote_guard_credentials() {
+        let token = vec![0x60, 0x82, 0x01, 0x00]; // mock AP-REQ
+        let creds = super::build_ts_remote_guard_creds(&token, &[]);
+
+        assert_eq!(creds[0], 0x30); // outer SEQUENCE
+        // Verify credType = 6 is encoded
+        // Find the INTEGER value inside context [0]
+        assert!(creds.len() > 10);
+        // Should contain "Kerberos" package name
+        assert!(creds.windows(8).any(|w| w == b"Kerberos"));
+    }
+
+    #[test]
+    fn build_ts_credentials_remote_guard() {
+        let seq = CredsspSequence::with_credential_type(
+            "admin", "", "CORP", vec![], test_random(), false,
+            CredentialType::RemoteGuard { kerberos_token: vec![0xAA; 16], supplemental_creds: vec![] },
+        );
+        let creds = seq.build_ts_credentials();
+        assert_eq!(creds[0], 0x30); // SEQUENCE
+        assert!(creds.windows(8).any(|w| w == b"Kerberos"));
+    }
+
+    #[test]
+    fn build_ts_credentials_restricted_admin() {
+        let seq = CredsspSequence::with_credential_type(
+            "", "", "", vec![], test_random(), false,
+            CredentialType::RestrictedAdmin,
+        );
+        let creds = seq.build_ts_credentials();
+        assert_eq!(creds[0], 0x30); // SEQUENCE
+        // Should be relatively short (empty credentials)
+        assert!(creds.len() < 30);
+    }
+
+    #[test]
+    fn build_ts_credentials_compound_identity() {
+        let device_token = vec![0xDD; 32]; // mock device AP-REQ
+        let seq = CredsspSequence::with_credential_type(
+            "admin", "", "CORP", vec![], test_random(), false,
+            CredentialType::RemoteGuard {
+                kerberos_token: vec![0xAA; 16],
+                supplemental_creds: vec![
+                    SupplementalCred {
+                        package_name: b"Kerberos".to_vec(),
+                        cred_buffer: device_token.clone(),
+                    },
+                ],
+            },
+        );
+        let creds = seq.build_ts_credentials();
+        assert_eq!(creds[0], 0x30); // SEQUENCE
+        // Should contain "Kerberos" twice (logon + supplemental)
+        let kerberos_count = creds.windows(8)
+            .filter(|w| *w == b"Kerberos")
+            .count();
+        assert_eq!(kerberos_count, 2);
+        // Should contain the device token
+        assert!(creds.windows(32).any(|w| w == device_token.as_slice()));
     }
 }
