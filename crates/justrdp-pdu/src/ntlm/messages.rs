@@ -194,12 +194,12 @@ pub struct NtlmVersion {
 }
 
 impl NtlmVersion {
-    /// Windows 10 version for client identification.
+    /// Windows 10/11 version for client identification.
     pub fn windows_10() -> Self {
         Self {
             major: 10,
             minor: 0,
-            build: 19041,
+            build: 22621, // Windows 11 22H2
             revision: 15,
         }
     }
@@ -262,12 +262,13 @@ impl Encode for NegotiateMessage {
 
     fn size(&self) -> usize {
         // Signature(8) + MessageType(4) + NegotiateFlags(4) +
-        // DomainNameFields(8) + WorkstationFields(8) + Version(8)
+        // DomainNameFields(8) + WorkstationFields(8) = 32
+        // + Version(8) only if NEGOTIATE_VERSION flag is set
         // + domain payload + workstation payload
-        let payload_offset = 40;
+        let header_size = if self.version.is_some() { 40 } else { 32 };
         let domain_bytes = self.domain_name.as_bytes();
         let workstation_bytes = self.workstation.as_bytes();
-        payload_offset + domain_bytes.len() + workstation_bytes.len()
+        header_size + domain_bytes.len() + workstation_bytes.len()
     }
 
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
@@ -275,7 +276,7 @@ impl Encode for NegotiateMessage {
         dst.write_u32_le(NTLM_NEGOTIATE, "MessageType")?;
         dst.write_u32_le(self.flags.bits(), "NegotiateFlags")?;
 
-        let payload_offset: u32 = 40;
+        let payload_offset: u32 = if self.version.is_some() { 40 } else { 32 };
         let domain_bytes = self.domain_name.as_bytes();
         let workstation_bytes = self.workstation.as_bytes();
 

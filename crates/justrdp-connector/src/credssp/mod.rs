@@ -415,14 +415,23 @@ impl CredsspSequence {
     /// - other non-zero = error
     /// - 0 = success (proceed with RDP connection)
     fn step_wait_early_user_auth(&mut self, input: &[u8]) -> ConnectorResult<Vec<u8>> {
-        // EarlyUserAuthResult is a raw 4-byte NTSTATUS, not a TsRequest.
-        if input.len() < 4 {
+        // EarlyUserAuthResult can be either:
+        // - A raw 4-byte NTSTATUS (MS-CSSP 2.2.1.1, older servers)
+        // - Wrapped in a TsRequest (some Windows server versions)
+        // Try TsRequest first, fallback to raw 4-byte NTSTATUS.
+        if let Ok(ts_req) = TsRequest::decode(input) {
+            if let Some(code) = ts_req.error_code {
+                if code != 0 {
+                    return Err(ConnectorError::general("EarlyUserAuthResult: authentication failed"));
+                }
+            }
+        } else if input.len() >= 4 {
+            let status = u32::from_le_bytes(input[..4].try_into().unwrap());
+            if status != 0 {
+                return Err(ConnectorError::general("EarlyUserAuthResult: authentication failed"));
+            }
+        } else {
             return Err(ConnectorError::general("EarlyUserAuthResult too short"));
-        }
-
-        let status = u32::from_le_bytes(input[..4].try_into().unwrap());
-        if status != 0 {
-            return Err(ConnectorError::general("EarlyUserAuthResult: authentication failed"));
         }
 
         self.state = CredsspState::Done;

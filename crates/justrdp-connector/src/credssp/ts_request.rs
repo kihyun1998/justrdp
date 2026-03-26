@@ -125,13 +125,14 @@ impl TsRequest {
                     ts_request.error_code = Some(der_read_integer(data, &mut pos)?);
                 }
                 5 => {
-                    // clientNonce OCTET STRING
+                    // clientNonce OCTET STRING (must be exactly 32 bytes)
                     let octet = der_read_octet_string(data, &mut pos)?;
-                    if octet.len() == 32 {
-                        let mut nonce = [0u8; 32];
-                        nonce.copy_from_slice(&octet);
-                        ts_request.client_nonce = Some(nonce);
+                    if octet.len() != 32 {
+                        return Err("clientNonce must be exactly 32 bytes");
                     }
+                    let mut nonce = [0u8; 32];
+                    nonce.copy_from_slice(&octet);
+                    ts_request.client_nonce = Some(nonce);
                 }
                 _ => {
                     // Unknown field — skip

@@ -67,6 +67,7 @@ pub struct KerberosSequence {
     etype: i32,           // negotiated encryption type
     // KDC exchange state
     nonce: u32,
+    tgs_nonce: u32,
     tgt_session_key: Vec<u8>,
     tgt_ticket: Option<Ticket>,
     service_session_key: Vec<u8>,
@@ -87,7 +88,10 @@ pub struct KerberosSequence {
 
 /// Random values needed by the Kerberos sequence.
 pub struct KerberosRandom {
+    /// Nonce for AS-REQ (RFC 4120: each request should use a fresh nonce).
     pub nonce: u32,
+    /// Separate nonce for TGS-REQ.
+    pub tgs_nonce: u32,
     pub confounder_as: [u8; 16],
     pub confounder_tgs_auth: [u8; 16],
     pub confounder_ap_auth: [u8; 16],
@@ -116,6 +120,7 @@ impl KerberosSequence {
             client_key: Vec::new(),
             etype: ETYPE_AES256_CTS_HMAC_SHA1,
             nonce: random.nonce,
+            tgs_nonce: random.tgs_nonce,
             tgt_session_key: Vec::new(),
             tgt_ticket: None,
             service_session_key: Vec::new(),
@@ -123,7 +128,7 @@ impl KerberosSequence {
             salt: Vec::new(),
             iterations: 4096,
             ap_req_bytes: Vec::new(),
-            subkey: random.subkey,
+            subkey: random.subkey.clone(),
             seq_number: random.seq_number,
             pkinit_config: None,
             dh_private_key: None,
@@ -150,6 +155,7 @@ impl KerberosSequence {
             client_key: Vec::new(),
             etype: ETYPE_AES256_CTS_HMAC_SHA1,
             nonce: random.nonce,
+            tgs_nonce: random.tgs_nonce,
             tgt_session_key: Vec::new(),
             tgt_ticket: None,
             service_session_key: Vec::new(),
@@ -414,7 +420,7 @@ impl KerberosSequence {
             realm: self.domain.clone(),
             sname: Some(PrincipalName::service(b"TERMSRV", &self.hostname)),
             till: b"20370913024805Z".to_vec(),
-            nonce: self.nonce,
+            nonce: self.tgs_nonce,
             etype: vec![ETYPE_AES256_CTS_HMAC_SHA1, ETYPE_AES128_CTS_HMAC_SHA1],
         };
 
@@ -496,7 +502,7 @@ impl KerberosSequence {
                 let enc_part = EncKdcRepPart::decode(&decrypted)
                     .map_err(|_| ConnectorError::general("EncTGSRepPart decode failed"))?;
 
-                if enc_part.nonce != self.nonce {
+                if enc_part.nonce != self.tgs_nonce {
                     return Err(ConnectorError::general("TGS-REP nonce mismatch"));
                 }
 
@@ -820,6 +826,7 @@ mod tests {
     fn build_as_req_produces_valid_structure() {
         let random = KerberosRandom {
             nonce: 12345,
+            tgs_nonce: 54321,
             confounder_as: [0; 16],
             confounder_tgs_auth: [0; 16],
             confounder_ap_auth: [0; 16],
@@ -851,6 +858,7 @@ mod tests {
     fn kerberos_initial_state() {
         let random = KerberosRandom {
             nonce: 0,
+            tgs_nonce: 0,
             confounder_as: [0; 16],
             confounder_tgs_auth: [0; 16],
             confounder_ap_auth: [0; 16],
@@ -867,6 +875,7 @@ mod tests {
     fn pkinit_initial_state() {
         let random = KerberosRandom {
             nonce: 42,
+            tgs_nonce: 43,
             confounder_as: [0; 16],
             confounder_tgs_auth: [0; 16],
             confounder_ap_auth: [0; 16],
@@ -894,6 +903,7 @@ mod tests {
     fn pkinit_build_as_req_produces_output() {
         let random = KerberosRandom {
             nonce: 12345,
+            tgs_nonce: 54321,
             confounder_as: [0; 16],
             confounder_tgs_auth: [0; 16],
             confounder_ap_auth: [0; 16],

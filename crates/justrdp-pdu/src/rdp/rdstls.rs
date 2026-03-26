@@ -106,7 +106,12 @@ impl Encode for RdstlsCapabilities {
 
 impl<'de> Decode<'de> for RdstlsCapabilities {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
-        let _version = src.read_u16_le("RdstlsCap::version")?;
+        let version = src.read_u16_le("RdstlsCap::version")?;
+        if version != RDSTLS_VERSION_1 {
+            return Err(DecodeError::unexpected_value(
+                "RdstlsCapabilities", "version", "expected RDSTLS version 1",
+            ));
+        }
         let data_type = src.read_u16_le("RdstlsCap::dataType")?;
         if data_type != RdstlsDataType::Capabilities as u16 {
             return Err(DecodeError::unexpected_value(
@@ -234,7 +239,12 @@ impl Encode for RdstlsAuthenticationRequest {
 
 impl<'de> Decode<'de> for RdstlsAuthenticationRequest {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
-        let _version = src.read_u16_le("RdstlsAuth::version")?;
+        let version = src.read_u16_le("RdstlsAuth::version")?;
+        if version != RDSTLS_VERSION_1 {
+            return Err(DecodeError::unexpected_value(
+                "RdstlsAuthReq", "version", "expected RDSTLS version 1",
+            ));
+        }
         let msg_type = src.read_u16_le("RdstlsAuth::dataType")?;
         if msg_type != RdstlsDataType::AuthenticationRequest as u16 {
             return Err(DecodeError::unexpected_value(
@@ -297,7 +307,12 @@ impl Encode for RdstlsAuthenticationResponse {
 
 impl<'de> Decode<'de> for RdstlsAuthenticationResponse {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
-        let _version = src.read_u16_le("RdstlsResp::version")?;
+        let version = src.read_u16_le("RdstlsResp::version")?;
+        if version != RDSTLS_VERSION_1 {
+            return Err(DecodeError::unexpected_value(
+                "RdstlsAuthResp", "version", "expected RDSTLS version 1",
+            ));
+        }
         let msg_type = src.read_u16_le("RdstlsResp::dataType")?;
         if msg_type != RdstlsDataType::AuthenticationResponse as u16 {
             return Err(DecodeError::unexpected_value(

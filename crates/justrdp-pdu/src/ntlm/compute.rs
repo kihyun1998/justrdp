@@ -12,12 +12,16 @@ use super::messages::{to_utf16le, AvId, AvPair};
 /// Compute NTOWFv2: HMAC_MD5(MD4(UTF16LE(password)), UTF16LE(UPPER(user) + domain))
 ///
 /// MS-NLMP 3.3.2
+///
+/// Note: MS-NLMP specifies OEM uppercase (ASCII uppercase only).
+/// Unicode case folding (e.g., German sharp-s ß → SS) is NOT applied.
 pub fn ntowfv2(password: &str, user: &str, domain: &str) -> [u8; 16] {
     let password_utf16 = to_utf16le(password);
     let nt_hash = md4(&password_utf16);
 
+    // OEM uppercase: only convert ASCII a-z to A-Z
     let upper_user: alloc::string::String =
-        user.chars().map(|c| c.to_uppercase().next().unwrap_or(c)).collect();
+        user.chars().map(|c| if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c }).collect();
     let concat = alloc::format!("{}{}", upper_user, domain);
     let user_domain_utf16 = to_utf16le(&concat);
 
