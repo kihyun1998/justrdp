@@ -33,6 +33,8 @@ use crate::error::{ConnectorError, ConnectorErrorKind, ConnectorResult};
 
 /// CredSSP Client-To-Server hash magic string (MS-CSSP 3.1.5, v5+).
 const CLIENT_SERVER_HASH_MAGIC: &[u8] = b"CredSSP Client-To-Server Binding Hash\0";
+/// CredSSP Server-To-Client hash magic string (MS-CSSP 3.1.5, v5+).
+const SERVER_CLIENT_HASH_MAGIC: &[u8] = b"CredSSP Server-To-Client Binding Hash\0";
 
 /// CredSSP sequence state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +124,10 @@ pub struct CredsspSequence {
     pub send_signing_key: [u8; 16],
     send_sealing_rc4: Option<Rc4>,
     send_seq_num: u32,
+    // Receive signing/sealing state (for server pubKeyAuth verification)
+    recv_signing_key: [u8; 16],
+    recv_sealing_rc4: Option<Rc4>,
+    recv_seq_num: u32,
 }
 
 impl CredsspSequence {
@@ -170,6 +176,9 @@ impl CredsspSequence {
             send_signing_key: [0u8; 16],
             send_sealing_rc4: None,
             send_seq_num: 0,
+            recv_signing_key: [0u8; 16],
+            recv_sealing_rc4: None,
+            recv_seq_num: 0,
         }
     }
 
@@ -302,9 +311,14 @@ impl CredsspSequence {
         let authenticate_bytes = authenticate.to_bytes();
 
         // Initialize persistent signing/sealing keys from ExportedSessionKey
+        // Client-to-server (send)
         self.send_signing_key = signing::signing_key(&self.exported_session_key, true);
         let seal_key = signing::sealing_key(&self.exported_session_key, true);
         self.send_sealing_rc4 = Some(Rc4::new(&seal_key));
+        // Server-to-client (receive) — for pubKeyAuth verification
+        self.recv_signing_key = signing::signing_key(&self.exported_session_key, false);
+        let recv_seal_key = signing::sealing_key(&self.exported_session_key, false);
+        self.recv_sealing_rc4 = Some(Rc4::new(&recv_seal_key));
 
         // Compute pubKeyAuth
         let pub_key_auth = self.compute_pub_key_auth()?;
@@ -336,10 +350,42 @@ impl CredsspSequence {
             }
         }
 
-        // Server should have sent pubKeyAuth with ServerClientHash
-        // For a complete implementation we'd verify it. For now, proceed.
-        if server_ts.pub_key_auth.is_none() {
-            return Err(ConnectorError::general("server TsRequest missing pubKeyAuth"));
+        let server_pub_key_auth = server_ts.pub_key_auth
+            .ok_or_else(|| ConnectorError::general("server TsRequest missing pubKeyAuth"))?;
+
+        // Decrypt server's pubKeyAuth
+        let decrypted = self.ntlm_decrypt(&server_pub_key_auth)?;
+
+        // Verify server's hash
+        let subject_public_key = extract_subject_public_key(&self.server_public_key)
+            .ok_or_else(|| ConnectorError::general(
+                "failed to extract SubjectPublicKey from SPKI for verification",
+            ))?;
+
+        if self.negotiated_version >= 5 {
+            // v5+: server sends SHA256("CredSSP Server-To-Client Binding Hash\0" + Nonce + SubjectPublicKey)
+            let mut hasher = Sha256::new();
+            hasher.update(SERVER_CLIENT_HASH_MAGIC);
+            hasher.update(&self.random.client_nonce);
+            hasher.update(&subject_public_key);
+            let expected = hasher.finalize();
+
+            if decrypted != expected.as_slice() {
+                return Err(ConnectorError::general(
+                    "server pubKeyAuth verification failed (v5+ hash mismatch)",
+                ));
+            }
+        } else {
+            // v2-v4: server sends SubjectPublicKey + 1 (first byte incremented)
+            let mut expected = subject_public_key;
+            if !expected.is_empty() {
+                expected[0] = expected[0].wrapping_add(1);
+            }
+            if decrypted != expected {
+                return Err(ConnectorError::general(
+                    "server pubKeyAuth verification failed (v2-v4 key mismatch)",
+                ));
+            }
         }
 
         self.state = CredsspState::SendCredentials;
@@ -417,22 +463,29 @@ impl CredsspSequence {
     /// 2. Encrypt message data with persistent RC4 stream
     /// 3. Encrypt first 8 bytes of digest with same RC4 stream (continued)
     /// 4. Build: Version(4) + Checksum(8) + SeqNum(4) + EncryptedData
+    /// NTLM seal (encrypt + sign) per MS-NLMP 3.4.4.2.1.
+    ///
+    /// With NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+    /// 1. RC4-encrypt message data (advances RC4 stream)
+    /// 2. Compute HMAC-MD5(SigningKey, SeqNum + **original plaintext**)
+    /// 3. RC4-encrypt first 8 bytes of HMAC (continues RC4 stream)
+    /// 4. Build: Version(4) + Checksum(8) + SeqNum(4) + EncryptedData
     fn ntlm_encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
         let rc4 = self.send_sealing_rc4.as_mut().expect("sealing key not initialized");
         let seq_num = self.send_seq_num;
         self.send_seq_num += 1;
 
-        // Step 1: Compute digest HMAC_MD5(SigningKey, SeqNum + plaintext)
+        // Step 1: RC4-encrypt message data first
+        let mut encrypted = plaintext.to_vec();
+        rc4.process(&mut encrypted);
+
+        // Step 2: Compute HMAC over SeqNum + original plaintext
         let mut hmac_input = vec![0u8; 4 + plaintext.len()];
         hmac_input[..4].copy_from_slice(&seq_num.to_le_bytes());
         hmac_input[4..].copy_from_slice(plaintext);
         let digest = hmac_md5(&self.send_signing_key, &hmac_input);
 
-        // Step 2: Encrypt message data (advances RC4 state)
-        let mut encrypted = plaintext.to_vec();
-        rc4.process(&mut encrypted);
-
-        // Step 3: Encrypt first 8 bytes of digest (continues RC4 state)
+        // Step 3: RC4-encrypt first 8 bytes of HMAC (continues RC4 stream)
         let mut checksum = [0u8; 8];
         checksum.copy_from_slice(&digest[..8]);
         rc4.process(&mut checksum);
@@ -445,6 +498,47 @@ impl CredsspSequence {
         result[16..].copy_from_slice(&encrypted);
 
         result
+    }
+
+    /// NTLM unseal (decrypt + verify) per MS-NLMP 3.4.4.2.1.
+    ///
+    /// Input: signature(16) + encrypted_data
+    /// Returns decrypted plaintext, or error if MAC verification fails.
+    fn ntlm_decrypt(&mut self, sealed: &[u8]) -> ConnectorResult<Vec<u8>> {
+        if sealed.len() < 16 {
+            return Err(ConnectorError::general("NTLM sealed message too short"));
+        }
+
+        let rc4 = self.recv_sealing_rc4.as_mut()
+            .ok_or_else(|| ConnectorError::general("receive sealing key not initialized"))?;
+        let seq_num = self.recv_seq_num;
+        self.recv_seq_num += 1;
+
+        let checksum_encrypted = &sealed[4..12];
+        let _seq_from_msg = &sealed[12..16];
+        let encrypted_data = &sealed[16..];
+
+        // Step 1: RC4-decrypt message data
+        let mut plaintext = encrypted_data.to_vec();
+        rc4.process(&mut plaintext);
+
+        // Step 2: Compute HMAC over SeqNum + decrypted plaintext
+        let mut hmac_input = vec![0u8; 4 + plaintext.len()];
+        hmac_input[..4].copy_from_slice(&seq_num.to_le_bytes());
+        hmac_input[4..].copy_from_slice(&plaintext);
+        let digest = hmac_md5(&self.recv_signing_key, &hmac_input);
+
+        // Step 3: RC4-encrypt first 8 bytes of HMAC to get expected checksum
+        let mut expected_checksum = [0u8; 8];
+        expected_checksum.copy_from_slice(&digest[..8]);
+        rc4.process(&mut expected_checksum);
+
+        // Step 4: Verify checksum
+        if expected_checksum != checksum_encrypted {
+            return Err(ConnectorError::general("NTLM MAC verification failed"));
+        }
+
+        Ok(plaintext)
     }
 
     /// Build TSCredentials ASN.1 DER structure (MS-CSSP 2.2.1.2).

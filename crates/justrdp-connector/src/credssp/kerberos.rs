@@ -81,6 +81,8 @@ pub struct KerberosSequence {
     // PKINIT state
     pkinit_config: Option<PkinitConfig>,
     dh_private_key: Option<BigUint>,
+    /// Client DH nonce for PKINIT key derivation.
+    client_dh_nonce: Option<Vec<u8>>,
 }
 
 /// Random values needed by the Kerberos sequence.
@@ -92,6 +94,9 @@ pub struct KerberosRandom {
     pub subkey: Vec<u8>,
     pub seq_number: u32,
     pub timestamp_usec: u32,
+    /// Client DH nonce for PKINIT key derivation (RFC 4556 3.2.3.1).
+    /// Should be 32 bytes of random data when using DH key agreement.
+    pub client_dh_nonce: [u8; 32],
 }
 
 impl KerberosSequence {
@@ -122,6 +127,7 @@ impl KerberosSequence {
             seq_number: random.seq_number,
             pkinit_config: None,
             dh_private_key: None,
+            client_dh_nonce: None,
         }
     }
 
@@ -155,6 +161,7 @@ impl KerberosSequence {
             seq_number: random.seq_number,
             pkinit_config: Some(config),
             dh_private_key: None,
+            client_dh_nonce: Some(random.client_dh_nonce.to_vec()),
         }
     }
 
@@ -286,6 +293,7 @@ impl KerberosSequence {
                 pa_checksum: Some(pa_checksum),
             },
             client_public_value: Some(dh_spki),
+            client_dh_nonce: self.client_dh_nonce.clone(),
         };
 
         let auth_pack_der = auth_pack.encode();
@@ -399,11 +407,36 @@ impl KerberosSequence {
         let tgt = self.tgt_ticket.as_ref()
             .ok_or_else(|| ConnectorError::general("no TGT available"))?;
 
-        // Build the Authenticator for PA-TGS-REQ
+        // Build TGS-REQ body first (needed for authenticator checksum)
+        let req_body = KdcReqBody {
+            kdc_options: KDC_OPT_FORWARDABLE | KDC_OPT_RENEWABLE | KDC_OPT_CANONICALIZE,
+            cname: None, // derived from TGT
+            realm: self.domain.clone(),
+            sname: Some(PrincipalName::service(b"TERMSRV", &self.hostname)),
+            till: b"20370913024805Z".to_vec(),
+            nonce: self.nonce,
+            etype: vec![ETYPE_AES256_CTS_HMAC_SHA1, ETYPE_AES128_CTS_HMAC_SHA1],
+        };
+
+        // Checksum of req_body for PA-TGS-REQ (RFC 4120 7.2.1)
+        let body_bytes = req_body.encode();
+        let cksum_value = krb5_aes_checksum(
+            &self.tgt_session_key,
+            KEY_USAGE_TGS_REQ_PA_TGS_REQ_CKSUM,
+            &body_bytes,
+        );
+
+        // Checksum type: HMAC-SHA1-96-AES256 = 16, HMAC-SHA1-96-AES128 = 15
+        let cksumtype = if self.etype == ETYPE_AES256_CTS_HMAC_SHA1 { 16 } else { 15 };
+
+        // Build the Authenticator for PA-TGS-REQ with checksum
         let authenticator = Authenticator {
             crealm: self.domain.clone(),
             cname: PrincipalName::principal(&self.username),
-            cksum: None,
+            cksum: Some(Checksum {
+                cksumtype,
+                checksum: cksum_value,
+            }),
             cusec: usec,
             ctime: timestamp.to_vec(),
             subkey: None,
@@ -430,27 +463,6 @@ impl KerberosSequence {
         };
 
         let ap_req_bytes = ap_req.encode();
-
-        // Build TGS-REQ body
-        let req_body = KdcReqBody {
-            kdc_options: KDC_OPT_FORWARDABLE | KDC_OPT_RENEWABLE | KDC_OPT_CANONICALIZE,
-            cname: None, // derived from TGT
-            realm: self.domain.clone(),
-            sname: Some(PrincipalName::service(b"TERMSRV", &self.hostname)),
-            till: b"20370913024805Z".to_vec(),
-            nonce: self.nonce,
-            etype: vec![ETYPE_AES256_CTS_HMAC_SHA1, ETYPE_AES128_CTS_HMAC_SHA1],
-        };
-
-        // Checksum of req_body for PA-TGS-REQ
-        let body_bytes = req_body.encode();
-        let cksum = krb5_aes_checksum(
-            &self.tgt_session_key,
-            KEY_USAGE_TGS_REQ_PA_TGS_REQ_CKSUM,
-            &body_bytes,
-        );
-
-        let _ = cksum; // TODO: add checksum to authenticator if needed
 
         let padata = vec![
             PaData::new(PA_TGS_REQ, ap_req_bytes),
@@ -509,11 +521,13 @@ impl KerberosSequence {
             .ok_or_else(|| ConnectorError::general("no service ticket"))?;
 
         // Build GSS checksum (RFC 4121 section 4.1.1)
+        // Layout:
+        //   Bytes 0-15:  channel bindings MD5 hash (16 bytes, all zeros when not using EPA)
+        //   Bytes 16-19: GSS flags (little-endian u32)
+        //   Bytes 20-23: delegation option identifier (0 = no delegation)
         let mut gss_cksum = vec![0u8; 24];
-        // Bytes 0-3: channel binding length (16)
-        gss_cksum[0] = 16;
-        // Bytes 4-19: channel binding hash (zeros for no EPA)
-        // Bytes 20-23: GSS flags
+        // Bytes 0-15: all zeros (no channel bindings)
+        // Bytes 16-19: GSS flags
         let gss_flags: u32 = 0x3E; // mutual|replay|sequence|integ|conf
         gss_cksum[16] = (gss_flags & 0xFF) as u8;
         gss_cksum[17] = ((gss_flags >> 8) & 0xFF) as u8;
@@ -581,15 +595,9 @@ impl KerberosSequence {
         let ap_rep = ApRep::decode(ap_rep_data)
             .map_err(|_| ConnectorError::general("AP-REP decode failed"))?;
 
-        // Decrypt with service session key (or subkey)
-        let decrypt_key = if !self.subkey.is_empty() {
-            &self.subkey
-        } else {
-            &self.service_session_key
-        };
-
+        // Decrypt with service session key (RFC 4120 3.2.5: always session key from ticket)
         let decrypted = krb5_aes_decrypt(
-            decrypt_key,
+            &self.service_session_key,
             KEY_USAGE_AP_REP_ENC_PART,
             &ap_rep.enc_part.cipher,
         ).ok_or_else(|| ConnectorError::general("AP-REP decrypt failed"))?;
@@ -646,31 +654,40 @@ impl KerberosSequence {
         let shared_secret = dh_compute_shared(&kdc_public, dh_private, &p);
         let shared_bytes = shared_secret.to_be_bytes_padded(OakleyGroup14::key_size());
 
-        // Derive reply key: random-to-key(truncate(shared_secret, key_len))
-        // For AES-256: key_len = 32, for AES-128: key_len = 16
+        // Derive reply key per RFC 4556 section 3.2.3.1
         let key_len = if self.etype == ETYPE_AES256_CTS_HMAC_SHA1 { 32 } else { 16 };
 
-        // RFC 4556 section 3.2.3.1: octetstring2key
-        // For AES etypes, we derive the key using the first key_len bytes of:
-        // SHA1(DHSharedSecret || "pkinit")
-        // But actually we need to use the key derivation properly.
-        //
-        // Per RFC 4556 Appendix B / RFC 3961:
-        // 1. truncate = random-to-key(shared_bytes[0..key_len])
-        //    For AES, random-to-key is identity on first key_len bytes.
-        // 2. But when serverDHNonce is present, use:
-        //    x = SHA-256(DHSharedSecret || clientDHNonce || serverDHNonce)
-        //    key = random-to-key(x[0..key_len])
-        //
-        // Simplified: just take the first key_len bytes of the shared secret
-        // as the base key material and derive via DK.
-        let reply_key = if shared_bytes.len() >= key_len {
-            shared_bytes[..key_len].to_vec()
+        let reply_key = if let Some(ref server_nonce) = dh_rep.server_dh_nonce {
+            // When serverDHNonce is present (RFC 4556 3.2.3.1):
+            // x = octetstring2key(DHSharedSecret || clientDHNonce || serverDHNonce)
+            //
+            // For AES etypes, octetstring2key uses SHA-256 to produce key material:
+            // 1. Concatenate: DHSharedSecret || clientDHNonce || serverDHNonce
+            // 2. Apply iterative SHA-256 hashing to produce key_len bytes
+            // 3. random-to-key is identity for AES
+            let client_nonce = self.client_dh_nonce.as_ref()
+                .ok_or_else(|| ConnectorError::general("PKINIT: no client DH nonce"))?;
+
+            let mut hash_input = Vec::new();
+            hash_input.extend_from_slice(&shared_bytes);
+            hash_input.extend_from_slice(client_nonce);
+            hash_input.extend_from_slice(server_nonce);
+
+            // Per RFC 4556: truncate(SHA-256(shared || cnonce || snonce), key_len)
+            // For 32-byte keys: full SHA-256 output
+            // For 16-byte keys: first 16 bytes
+            let hash = justrdp_core::crypto::sha256(&hash_input);
+            hash[..key_len].to_vec()
         } else {
-            // Pad with zeros if needed (shouldn't happen for 2048-bit DH)
-            let mut k = shared_bytes.clone();
-            k.resize(key_len, 0);
-            k
+            // No serverDHNonce: truncate(DHSharedSecret, key_len)
+            // Per RFC 4556: random-to-key(DHSharedSecret[0..key_len])
+            if shared_bytes.len() >= key_len {
+                shared_bytes[..key_len].to_vec()
+            } else {
+                let mut k = shared_bytes.clone();
+                k.resize(key_len, 0);
+                k
+            }
         };
 
         Ok(reply_key)
@@ -809,6 +826,7 @@ mod tests {
             subkey: vec![0x42; 32],
             seq_number: 1,
             timestamp_usec: 0,
+            client_dh_nonce: [0u8; 32],
         };
 
         let seq = KerberosSequence::new("user", "pass", "EXAMPLE.COM", "server.example.com", random);
@@ -839,6 +857,7 @@ mod tests {
             subkey: vec![0; 16],
             seq_number: 0,
             timestamp_usec: 0,
+            client_dh_nonce: [0u8; 32],
         };
         let seq = KerberosSequence::new("user", "pass", "REALM", "host", random);
         assert_eq!(*seq.state(), KerberosState::SendAsReq);
@@ -854,6 +873,7 @@ mod tests {
             subkey: vec![0x55; 32],
             seq_number: 1,
             timestamp_usec: 0,
+            client_dh_nonce: [0u8; 32],
         };
 
         let config = PkinitConfig {
@@ -880,6 +900,7 @@ mod tests {
             subkey: vec![0x42; 32],
             seq_number: 1,
             timestamp_usec: 0,
+            client_dh_nonce: [0u8; 32],
         };
 
         // Use the valid 512-bit test key from rsa.rs tests

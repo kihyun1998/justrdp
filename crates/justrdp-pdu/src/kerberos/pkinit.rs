@@ -70,13 +70,16 @@ impl PkAuthenticator {
 
 /// AuthPack ::= SEQUENCE {
 ///     pkAuthenticator   [0] PKAuthenticator,
-///     clientPublicValue [1] SubjectPublicKeyInfo OPTIONAL  -- DH public key
+///     clientPublicValue [1] SubjectPublicKeyInfo OPTIONAL,
+///     clientDHNonce     [2] OCTET STRING OPTIONAL
 /// }
 #[derive(Debug, Clone)]
 pub struct AuthPack {
     pub pk_authenticator: PkAuthenticator,
     /// DER-encoded SubjectPublicKeyInfo for DH.
     pub client_public_value: Option<Vec<u8>>,
+    /// Client DH nonce for key derivation (RFC 4556 3.2.3.1).
+    pub client_dh_nonce: Option<Vec<u8>>,
 }
 
 impl AuthPack {
@@ -92,6 +95,12 @@ impl AuthPack {
             if let Some(ref spki) = self.client_public_value {
                 let t1 = build_context_tag(1, |w| w.write_raw(spki));
                 w.write_raw(&t1);
+            }
+
+            // [2] clientDHNonce OPTIONAL
+            if let Some(ref nonce) = self.client_dh_nonce {
+                let t2 = build_context_tag(2, |w| w.write_octet_string(nonce));
+                w.write_raw(&t2);
             }
         })
     }
@@ -239,6 +248,7 @@ mod tests {
                 pa_checksum: None,
             },
             client_public_value: Some(vec![0x30, 0x03, 0x01, 0x02, 0x03]),
+            client_dh_nonce: None,
         };
         let encoded = pack.encode();
         assert_eq!(encoded[0], TAG_SEQUENCE);

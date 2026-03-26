@@ -220,22 +220,26 @@ fn derive_final_key(key_material: &[u8], client_random: &[u8], server_random: &[
     md5.finalize()
 }
 
-/// Reduce to 40-bit effective key: first 5 bytes, rest set to 0xD1269E.
+/// Reduce to 40-bit effective key (MS-RDPBCGR 5.3.5.1).
+///
+/// 8-byte RC4 key: First5Bytes(key) || 0xD1 || 0x26 || 0x9E
 fn finalize_key_40bit(key: &[u8; 16]) -> [u8; 16] {
     let mut out = [0u8; 16];
-    out[0] = 0xD1;
-    out[1] = 0x26;
-    out[2] = 0x9E;
-    out[3..8].copy_from_slice(&key[..5]);
-    // bytes 8..16 are zero
+    out[..5].copy_from_slice(&key[..5]);
+    out[5] = 0xD1;
+    out[6] = 0x26;
+    out[7] = 0x9E;
+    // bytes 8..16 are zero (not used, RC4 key_len = 8)
     out
 }
 
-/// Reduce to 56-bit effective key: first 7 bytes, byte 0 set to 0xD1.
+/// Reduce to 56-bit effective key (MS-RDPBCGR 5.3.5.1).
+///
+/// 8-byte RC4 key: First7Bytes(key) || 0xD1
 fn finalize_key_56bit(key: &[u8; 16]) -> [u8; 16] {
     let mut out = [0u8; 16];
-    out[0] = 0xD1;
-    out[1..8].copy_from_slice(&key[..7]);
+    out[..7].copy_from_slice(&key[..7]);
+    out[7] = 0xD1;
     out
 }
 
@@ -485,41 +489,45 @@ impl RdpSecurityContext {
 /// EncryptKey = SHA1(ServerRandom + ClientRandom)[0..24] split for 3DES
 /// ```
 ///
-/// Actually MS-RDPBCGR FIPS key derivation:
+/// Derive FIPS session keys per MS-RDPBCGR 5.3.5.2.
+///
 /// ```text
-/// HashValue1 = SHA1(ClientRandom[0..16] + ServerRandom[0..16])
-/// HashValue2 = SHA1(ClientRandom[16..32] + ServerRandom[16..32])
-/// FinalHash = HashValue1[0..16] + HashValue2[0..16] = 32 bytes
-/// EncryptKey = FinalHash[0..24] (168-bit 3DES key)
-/// DecryptKey = same derivation with reversed order
-/// MACKey = FinalHash[0..16]
+/// MACKey:
+///   S = SHA1(ClientRandom + ServerRandom)
+///   MACKey128 = First128Bits(S)
+///
+/// EncryptKey (client→server, 168 bits = 24 bytes):
+///   S1 = SHA1(ClientRandom[0..16] + ServerRandom[0..16])
+///   S2 = SHA1(ClientRandom[16..32] + ServerRandom[16..32])
+///   EncryptKey168 = S1[0..20] + S2[0..4]
+///
+/// DecryptKey (server→client, 168 bits = 24 bytes):
+///   S3 = SHA1(ServerRandom[0..16] + ClientRandom[0..16])
+///   S4 = SHA1(ServerRandom[16..32] + ClientRandom[16..32])
+///   DecryptKey168 = S3[0..20] + S4[0..4]
 /// ```
 pub fn derive_fips_session_keys(
     client_random: &[u8; 32],
     server_random: &[u8; 32],
 ) -> FipsSessionKeys {
-    // MS-RDPBCGR 5.3.5.2
-    // S3 = SHA1(ClientRandom + ServerRandom), take first 32 bytes across two hashes
-    let hash1 = crypto::sha1(&[&client_random[..16], &server_random[..16]].concat());
-    let hash2 = crypto::sha1(&[&client_random[16..], &server_random[16..]].concat());
-
-    // Encryption key material: use server→client direction
-    let enc_hash1 = crypto::sha1(&[&server_random[..16], &client_random[..16]].concat());
-    let enc_hash2 = crypto::sha1(&[&server_random[16..], &client_random[16..]].concat());
-
-    // MAC key: first 16 bytes of hash1
+    // MAC key: SHA1(ClientRandom + ServerRandom), first 16 bytes
+    let mac_hash = crypto::sha1(&[client_random.as_slice(), server_random.as_slice()].concat());
     let mut mac_key = [0u8; 16];
-    mac_key.copy_from_slice(&hash1[..16]);
+    mac_key.copy_from_slice(&mac_hash[..16]);
 
-    // 3DES encrypt key (24 bytes): hash2[0..20] + enc_hash1[0..4]
+    // Encrypt key (client→server): 24 bytes from two SHA1 hashes
+    let s1 = crypto::sha1(&[&client_random[..16], &server_random[..16]].concat());
+    let s2 = crypto::sha1(&[&client_random[16..], &server_random[16..]].concat());
     let mut encrypt_key = [0u8; 24];
-    encrypt_key[..20].copy_from_slice(&hash2);
-    encrypt_key[20..24].copy_from_slice(&enc_hash1[..4]);
+    encrypt_key[..20].copy_from_slice(&s1);
+    encrypt_key[20..24].copy_from_slice(&s2[..4]);
 
-    // 3DES decrypt key (24 bytes): enc_hash1[0..20] + enc_hash2[0..4]
+    // Decrypt key (server→client): 24 bytes from two SHA1 hashes (reversed order)
+    let s3 = crypto::sha1(&[&server_random[..16], &client_random[..16]].concat());
+    let s4 = crypto::sha1(&[&server_random[16..], &client_random[16..]].concat());
     let mut decrypt_key = [0u8; 24];
-    decrypt_key[..20].copy_from_slice(&enc_hash1);
-    decrypt_key[20..24].copy_from_slice(&enc_hash2[..4]);
+    decrypt_key[..20].copy_from_slice(&s3);
+    decrypt_key[20..24].copy_from_slice(&s4[..4]);
 
     FipsSessionKeys {
         mac_key,
@@ -685,10 +693,10 @@ mod tests {
 
         let keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_40BIT);
         assert_eq!(keys.key_len, 8);
-        // 40-bit keys: first 3 bytes are salt
-        assert_eq!(keys.encrypt_key[0], 0xD1);
-        assert_eq!(keys.encrypt_key[1], 0x26);
-        assert_eq!(keys.encrypt_key[2], 0x9E);
+        // 40-bit keys: 5 key bytes + salt 0xD1269E at bytes 5-7
+        assert_eq!(keys.encrypt_key[5], 0xD1);
+        assert_eq!(keys.encrypt_key[6], 0x26);
+        assert_eq!(keys.encrypt_key[7], 0x9E);
     }
 
     #[test]

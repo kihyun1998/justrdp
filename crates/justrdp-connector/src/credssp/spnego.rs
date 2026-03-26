@@ -63,9 +63,17 @@ pub fn wrap_negotiate(ntlm_token: &[u8]) -> Vec<u8> {
 /// }
 /// ```
 pub fn wrap_authenticate(ntlm_token: &[u8]) -> Vec<u8> {
+    // [0] negState ENUMERATED accept-incomplete (1)
+    let neg_state = der_context_tag(0, &der_enumerated(1));
+    // [2] responseToken OCTET STRING
     let response_token = der_octet_string(ntlm_token);
     let response_token_tagged = der_context_tag(2, &response_token);
-    let neg_token_resp = der_sequence(&response_token_tagged);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&neg_state);
+    body.extend_from_slice(&response_token_tagged);
+
+    let neg_token_resp = der_sequence(&body);
     der_context_tag(1, &neg_token_resp)
 }
 
@@ -141,6 +149,10 @@ fn der_context_tag(tag: u8, content: &[u8]) -> Vec<u8> {
     r.extend(der_length(content.len()));
     r.extend_from_slice(content);
     r
+}
+
+fn der_enumerated(value: u8) -> Vec<u8> {
+    vec![0x0A, 0x01, value]
 }
 
 fn der_octet_string(data: &[u8]) -> Vec<u8> {

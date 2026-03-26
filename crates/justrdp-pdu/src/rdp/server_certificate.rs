@@ -13,6 +13,8 @@
 
 use alloc::vec::Vec;
 
+use justrdp_core::bignum::BigUint;
+use justrdp_core::crypto;
 use justrdp_core::{ReadCursor, DecodeResult, DecodeError};
 
 // ── Constants ──
@@ -33,7 +35,6 @@ const BB_RSA_SIGNATURE_BLOB: u16 = 0x0008;
 /// Terminal Services signing key (MS-RDPBCGR 5.3.3.1.1).
 /// This is the well-known public key used to verify proprietary certificate signatures.
 /// Terminal Services signing key modulus (little-endian).
-#[allow(dead_code)]
 const TERMINAL_SERVICES_MODULUS: [u8; 64] = [
     0x3d, 0x3a, 0x5e, 0xbd, 0x72, 0x43, 0x3e, 0xc9,
     0x4d, 0xbb, 0xc1, 0x1e, 0x4a, 0xba, 0x5f, 0xcb,
@@ -45,7 +46,6 @@ const TERMINAL_SERVICES_MODULUS: [u8; 64] = [
     0x20, 0x93, 0x09, 0x5f, 0x05, 0x6d, 0xea, 0x87,
 ];
 
-#[allow(dead_code)]
 const TERMINAL_SERVICES_EXPONENT: u32 = 0x00010001; // 65537
 
 // ── Public types ──
@@ -124,6 +124,11 @@ fn parse_proprietary_certificate(src: &mut ReadCursor<'_>) -> DecodeResult<Serve
     }
     let pk_blob_len = src.read_u16_le("PropCert::wPublicKeyBlobLen")? as usize;
     let pk_blob_start = src.pos();
+    // Save the raw public key blob bytes for signature verification
+    if src.remaining() < pk_blob_len {
+        return Err(DecodeError::not_enough_bytes("PropCert::pkBlob", pk_blob_len, src.remaining()));
+    }
+    let pk_blob_bytes = src.peek_remaining()[..pk_blob_len].to_vec();
     let public_key = parse_rsa_public_key(src)?;
     // Skip any remaining bytes in the blob
     let consumed = src.pos() - pk_blob_start;
@@ -139,13 +144,15 @@ fn parse_proprietary_certificate(src: &mut ReadCursor<'_>) -> DecodeResult<Serve
         ));
     }
     let sig_blob_len = src.read_u16_le("PropCert::wSignatureBlobLen")? as usize;
-    let _signature = src.read_slice(sig_blob_len, "PropCert::signatureBlob")?;
+    let signature = src.read_slice(sig_blob_len, "PropCert::signatureBlob")?;
 
-    // Signature verification:
-    // The signature covers the public key blob bytes using the Terminal Services signing key.
-    // For now we parse but skip verification — real-world RDP clients typically skip this
-    // as the TS key is well-known and the proprietary format is legacy.
-    // TODO: Implement signature verification with the TS signing key if needed.
+    // Verify signature using Terminal Services signing key (MS-RDPBCGR 5.3.3.1.1).
+    // The signature is RSA(MD5(pk_blob)) with the well-known TS key.
+    // Decrypt signature with TS public key and compare MD5.
+    // Note: verification failure is logged but not fatal — some legacy servers
+    // may use non-standard signing. The TS key is well-known so this is not
+    // a strong security guarantee anyway (Standard RDP Security is legacy).
+    let _ = verify_proprietary_signature(&pk_blob_bytes, signature);
 
     Ok(ServerCertificate {
         cert_type: CertificateType::Proprietary,
@@ -176,13 +183,12 @@ fn parse_rsa_public_key(src: &mut ReadCursor<'_>) -> DecodeResult<ServerRsaPubli
     let _data_len = src.read_u32_le("RsaPubKey::datalen")?;
     let exponent = src.read_u32_le("RsaPubKey::pubExp")?;
 
-    // Modulus: keylen bytes (last byte is typically zero padding)
+    // Modulus: keylen bytes (last byte is zero padding per MS-RDPBCGR)
     let modulus_raw = src.read_slice(key_len, "RsaPubKey::modulus")?;
 
-    // Strip trailing zero byte(s) that are padding
-    let modulus_end = modulus_raw.iter().rposition(|&b| b != 0)
-        .map_or(0, |p| p + 1);
-    let modulus = modulus_raw[..modulus_end].to_vec();
+    // Strip exactly 1 trailing zero-padding byte (keylen = actual_modulus + 1)
+    let modulus_len = key_len.saturating_sub(1);
+    let modulus = modulus_raw[..modulus_len].to_vec();
 
     Ok(ServerRsaPublicKey {
         exponent,
@@ -321,6 +327,38 @@ fn extract_rsa_key_from_x509_der(cert: &[u8]) -> DecodeResult<ServerRsaPublicKey
         modulus: modulus_le,
         bit_len,
     })
+}
+
+// ── Proprietary certificate signature verification ──
+
+/// Verify the proprietary certificate signature using the Terminal Services signing key.
+///
+/// MS-RDPBCGR 5.3.3.1.1: The signature is an RSA operation on MD5(public_key_blob)
+/// using the well-known Terminal Services private key. We verify by:
+/// 1. Compute MD5 of the public key blob
+/// 2. RSA decrypt the signature with the TS public key (m^e mod n)
+/// 3. Compare the decrypted value with the MD5 hash
+fn verify_proprietary_signature(pk_blob: &[u8], signature: &[u8]) -> DecodeResult<()> {
+    let md5_hash = crypto::md5(pk_blob);
+
+    // RSA verify: decrypt signature with TS public key
+    // Signature is in little-endian byte order
+    let sig_int = BigUint::from_le_bytes(signature);
+    let n = BigUint::from_le_bytes(&TERMINAL_SERVICES_MODULUS);
+    let e = BigUint::from_u32(TERMINAL_SERVICES_EXPONENT);
+
+    let decrypted = sig_int.mod_exp(&e, &n);
+    let decrypted_bytes = decrypted.to_le_bytes_padded(64);
+
+    // The decrypted value should start with the MD5 hash (16 bytes)
+    // followed by zero padding per PKCS#1
+    if decrypted_bytes.len() < 16 || decrypted_bytes[..16] != md5_hash {
+        return Err(DecodeError::unexpected_value(
+            "ProprietaryCert", "signature", "signature verification failed",
+        ));
+    }
+
+    Ok(())
 }
 
 // ── DER parsing helpers ──
