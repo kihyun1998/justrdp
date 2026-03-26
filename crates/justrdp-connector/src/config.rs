@@ -56,6 +56,9 @@ pub struct Config {
     pub kerberos_token: Option<Vec<u8>>,
     /// Device Kerberos AP-REQ token for Compound Identity (optional).
     pub device_kerberos_token: Option<Vec<u8>>,
+    /// Client random for Standard RDP Security key exchange (32 bytes).
+    /// Must be cryptographically random. If None, Standard RDP Security is not available.
+    pub client_random: Option<[u8; 32]>,
 }
 
 impl Config {
@@ -78,6 +81,7 @@ impl Config {
                 auth_mode: AuthMode::Password,
                 kerberos_token: None,
                 device_kerberos_token: None,
+                client_random: None,
             },
         }
     }
@@ -181,6 +185,12 @@ impl ConfigBuilder {
         {
             self.config.security_protocol = SecurityProtocol::HYBRID;
         }
+        self
+    }
+
+    /// Set the client random for Standard RDP Security (32 bytes, must be cryptographic random).
+    pub fn client_random(mut self, random: [u8; 32]) -> Self {
+        self.config.client_random = Some(random);
         self
     }
 

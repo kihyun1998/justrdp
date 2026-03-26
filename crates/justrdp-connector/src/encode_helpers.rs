@@ -106,7 +106,7 @@ pub fn wrap_share_data(
     let hdr = ShareDataHeader {
         share_id,
         stream_id: 1, // STREAM_LOW
-        uncompressed_length: (inner.len() + SHARE_DATA_HEADER_SIZE) as u16,
+        uncompressed_length: inner.len() as u16,
         pdu_type2,
         compressed_type: 0,
         compressed_length: 0,

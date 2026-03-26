@@ -118,6 +118,14 @@ impl ClientInfoPdu {
             }),
         }
     }
+
+    /// Set performance flags.
+    pub fn with_performance_flags(mut self, flags: PerformanceFlags) -> Self {
+        if let Some(ref mut extra) = self.extra {
+            extra.performance_flags = flags;
+        }
+        self
+    }
 }
 
 /// Encode a string as UTF-16LE bytes (without null terminator size, but WITH null on wire).

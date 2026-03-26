@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use justrdp_core::{Decode, Encode, PduHint, ReadCursor, WriteBuf, WriteCursor};
 
 use justrdp_pdu::gcc::client::{ClientClusterData, ClientCoreData, ClientNetworkData, ClientSecurityData};
-use justrdp_pdu::gcc::server::{ServerCoreData, ServerNetworkData};
+use justrdp_pdu::gcc::server::ServerNetworkData;
 use justrdp_pdu::gcc::{
     ConferenceCreateRequest, ConferenceCreateResponse, ServerDataBlockType, DATA_BLOCK_HEADER_SIZE,
 };
@@ -108,6 +108,8 @@ pub struct ClientConnector {
     server_encryption_method: u32,
     /// Server encryption level from ServerSecurityData.
     server_encryption_level: u32,
+    /// Server RDP version from ServerCoreData (for salted MAC decision).
+    server_rdp_version: u32,
     /// Parsed server RSA public key.
     server_public_key: Option<server_certificate::ServerRsaPublicKey>,
     /// RC4-based security context (active after Security Exchange).
@@ -132,6 +134,7 @@ impl ClientConnector {
             server_random: None,
             server_encryption_method: 0,
             server_encryption_level: 0,
+            server_rdp_version: 0,
             server_public_key: None,
             security_context: None,
         }
@@ -450,7 +453,9 @@ impl ClientConnector {
 
             match block_type {
                 t if t == ServerDataBlockType::CoreData as u16 => {
-                    let _core = ServerCoreData::decode(&mut block_cursor)?;
+                    // Body is already stripped of header; read version directly
+                    let version = block_cursor.read_u32_le("CoreData::version")?;
+                    self.server_rdp_version = version;
                 }
                 t if t == ServerDataBlockType::SecurityData as u16 => {
                     // Re-decode from full block (SecurityData decode expects header)
@@ -587,6 +592,70 @@ impl ClientConnector {
             && self.server_encryption_level != ENCRYPTION_LEVEL_NONE
     }
 
+    /// Decrypt server PDU user_data when using Standard RDP Security.
+    ///
+    /// For Standard RDP Security: strips security header (flags + flagsHi + MAC),
+    /// decrypts the payload, and returns (flags, decrypted_data).
+    /// For TLS/NLA: strips basic security header and returns raw data.
+    fn decrypt_server_data<'a>(&mut self, user_data: &'a [u8]) -> ConnectorResult<(u16, Vec<u8>)> {
+        let mut inner = ReadCursor::new(user_data);
+        let flags = inner.read_u16_le("SecurityHeader::flags")?;
+        let _flags_hi = inner.read_u16_le("SecurityHeader::flagsHi")?;
+
+        if let Some(ref mut sec_ctx) = self.security_context {
+            if flags & SEC_ENCRYPT != 0 {
+                // Encrypted: read 8-byte MAC then decrypt remaining data
+                let mac_bytes = inner.read_slice(8, "SecurityHeader::mac")?;
+                let mut mac = [0u8; 8];
+                mac.copy_from_slice(mac_bytes);
+                let remaining = inner.remaining();
+                let encrypted = inner.read_slice(remaining, "SecurityHeader::encryptedData")?;
+                let mut data = encrypted.to_vec();
+                let _valid = sec_ctx.decrypt(&mut data, &mac);
+                Ok((flags, data))
+            } else {
+                // Not encrypted (e.g., licensing with SEC_LICENSE_PKT only)
+                let remaining = inner.remaining();
+                let data = inner.read_slice(remaining, "SecurityHeader::data")?;
+                Ok((flags, data.to_vec()))
+            }
+        } else {
+            // TLS/NLA: no encryption, return remaining data
+            let remaining = inner.remaining();
+            let data = inner.read_slice(remaining, "SecurityHeader::data")?;
+            Ok((flags, data.to_vec()))
+        }
+    }
+
+    /// Encrypt and send a PDU via MCS when using Standard RDP Security.
+    ///
+    /// For Standard RDP Security: encrypts data, adds security header with MAC.
+    /// For TLS/NLA: sends raw data (no security header added).
+    fn encrypt_and_send_mcs(
+        &mut self,
+        payload: &[u8],
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<usize> {
+        if let Some(ref mut sec_ctx) = self.security_context {
+            let mut data = payload.to_vec();
+            let mac = sec_ctx.encrypt(&mut data);
+
+            // Build: flags(2) + flagsHi(2) + MAC(8) + encrypted_data
+            let inner_size = BASIC_SECURITY_HEADER_SIZE + 8 + data.len();
+            let mut inner = vec![0u8; inner_size];
+            {
+                let mut cursor = WriteCursor::new(&mut inner);
+                cursor.write_u16_le(SEC_ENCRYPT, "SecurityHeader::flags")?;
+                cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+                cursor.write_slice(&mac, "SecurityHeader::mac")?;
+                cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
+            }
+            encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
+        } else {
+            encode_mcs_send_data(self.user_channel_id, self.io_channel_id, payload, output)
+        }
+    }
+
     /// Send Security Exchange PDU: encrypted client random.
     ///
     /// MS-RDPBCGR 2.2.1.10: The client generates a 32-byte random, encrypts it
@@ -598,19 +667,11 @@ impl ClientConnector {
         let server_random = self.server_random
             .ok_or_else(|| ConnectorError::general("no server random for security exchange"))?;
 
-        // Generate 32-byte client random
-        // For now, use a deterministic placeholder — the caller should inject randomness.
-        // TODO: Accept random source from caller (via Config or trait).
-        let client_random: [u8; 32] = {
-            // Simple PRNG seeded from server random (NOT cryptographically secure).
-            // Real implementation should use OS randomness.
-            let mut cr = [0u8; 32];
-            let seed = &server_random;
-            for i in 0..32 {
-                cr[i] = seed[i] ^ (i as u8).wrapping_mul(0x5A).wrapping_add(0x36);
-            }
-            cr
-        };
+        // Client random must be provided via Config (cryptographically random)
+        let client_random = self.config.client_random
+            .ok_or_else(|| ConnectorError::general(
+                "Standard RDP Security requires client_random in Config (use ConfigBuilder::client_random())",
+            ))?;
 
         // Encrypt client random with server's RSA public key
         let encrypted_random = standard_security::encrypt_client_random(server_key, &client_random);
@@ -645,8 +706,8 @@ impl ClientConnector {
         );
 
         // Determine if salted MAC should be used
-        // SEC_SECURE_CHECKSUM is used when the server supports it (RDP 5.2+)
-        let use_salted_mac = true; // Modern servers support this
+        // SEC_SECURE_CHECKSUM is available on RDP 5.2+ (version >= 0x00080004)
+        let use_salted_mac = self.server_rdp_version >= 0x00080004;
 
         self.security_context = Some(RdpSecurityContext::new(keys, use_salted_mac));
         self.state = ClientConnectorState::SecureSettingsExchange;
@@ -655,7 +716,8 @@ impl ClientConnector {
     }
 
     fn step_secure_settings_exchange(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
-        let info = ClientInfoPdu::new(&self.config.domain, &self.config.username, &self.config.password);
+        let info = ClientInfoPdu::new(&self.config.domain, &self.config.username, &self.config.password)
+            .with_performance_flags(self.config.performance_flags);
 
         if let Some(ref mut sec_ctx) = self.security_context {
             // Standard RDP Security: encrypt the Client Info PDU
@@ -708,11 +770,9 @@ impl ClientConnector {
 
         // Decode MCS SendDataIndication
         let sdi = SendDataIndication::decode(&mut cursor)?;
-        let mut inner = ReadCursor::new(sdi.user_data);
 
-        // Read security header
-        let flags = inner.read_u16_le("SecurityHeader::flags")?;
-        let _flags_hi = inner.read_u16_le("SecurityHeader::flagsHi")?;
+        // Decrypt if Standard RDP Security
+        let (flags, decrypted) = self.decrypt_server_data(sdi.user_data)?;
 
         if flags & SEC_LICENSE_PKT == 0 {
             // Not a licensing PDU — could be auto-detect or something else.
@@ -721,6 +781,7 @@ impl ClientConnector {
         }
 
         // Decode license preamble
+        let mut inner = ReadCursor::new(&decrypted);
         let preamble = LicensePreamble::decode(&mut inner)?;
 
         match preamble.msg_type {
@@ -755,7 +816,16 @@ impl ClientConnector {
         let _dt = DataTransfer::decode(&mut cursor)?;
 
         let sdi = SendDataIndication::decode(&mut cursor)?;
-        let mut inner = ReadCursor::new(sdi.user_data);
+
+        // Decrypt if Standard RDP Security
+        let decrypted = if self.security_context.is_some() {
+            let (_flags, data) = self.decrypt_server_data(sdi.user_data)?;
+            data
+        } else {
+            sdi.user_data.to_vec()
+        };
+
+        let mut inner = ReadCursor::new(&decrypted);
 
         // Decode Share Control Header
         let sc_hdr = ShareControlHeader::decode(&mut inner)?;
@@ -778,7 +848,7 @@ impl ClientConnector {
     fn step_capabilities_send_confirm_active(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         let confirm = ConfirmActivePdu {
             share_id: self.share_id,
-            originator_id: 0x03EA, // user channel ID + 1001 convention
+            originator_id: self.user_channel_id,
             source_descriptor: vec![0x4D, 0x53, 0x54, 0x53, 0x43, 0x00], // "MSTSC\0"
             capability_sets: self.build_client_capabilities(),
         };
@@ -790,7 +860,7 @@ impl ClientConnector {
             &confirm_bytes,
         );
 
-        let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &sc_payload, output)?;
+        let size = self.encrypt_and_send_mcs(&sc_payload, output)?;
         self.state = ClientConnectorState::FinalizationSendSynchronize;
         Ok(Written::new(size))
     }
@@ -941,7 +1011,7 @@ impl ClientConnector {
             self.user_channel_id,
             &sd_payload,
         );
-        let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &sc_payload, output)?;
+        let size = self.encrypt_and_send_mcs(&sc_payload, output)?;
         self.state = next_state;
         Ok(Written::new(size))
     }
@@ -1008,7 +1078,16 @@ impl ClientConnector {
         let _dt = DataTransfer::decode(&mut cursor)?;
 
         let sdi = SendDataIndication::decode(&mut cursor)?;
-        let mut inner = ReadCursor::new(sdi.user_data);
+
+        // Decrypt if Standard RDP Security
+        let decrypted = if self.security_context.is_some() {
+            let (_flags, data) = self.decrypt_server_data(sdi.user_data)?;
+            data
+        } else {
+            sdi.user_data.to_vec()
+        };
+
+        let mut inner = ReadCursor::new(&decrypted);
 
         let sc_hdr = ShareControlHeader::decode(&mut inner)?;
 
