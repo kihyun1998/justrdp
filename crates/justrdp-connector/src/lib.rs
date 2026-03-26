@@ -19,7 +19,10 @@ mod result;
 mod sequence;
 mod state;
 
-pub use config::{AuthMode, Config, ConfigBuilder};
+pub use config::{
+    AuthMode, BitmapCodecConfig, ColorDepth, CompressionConfig, Config, ConfigBuilder,
+    Credentials, DesktopSize, KeyboardType, StaticChannelSet,
+};
 pub use connector::ClientConnector;
 pub use credssp::gss_wrap::{gss_unwrap, gss_wrap};
 pub use credssp::kerberos::{

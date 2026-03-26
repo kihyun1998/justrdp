@@ -9,6 +9,157 @@ use justrdp_pdu::gcc::client::ChannelDef;
 use justrdp_pdu::rdp::client_info::PerformanceFlags;
 use justrdp_pdu::x224::SecurityProtocol;
 
+/// Authentication credentials.
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    /// Username.
+    pub username: String,
+    /// Password.
+    pub password: String,
+}
+
+/// Desktop size in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopSize {
+    /// Width in pixels.
+    pub width: u16,
+    /// Height in pixels.
+    pub height: u16,
+}
+
+impl DesktopSize {
+    pub fn new(width: u16, height: u16) -> Self {
+        Self { width, height }
+    }
+}
+
+/// Keyboard type (MS-RDPBCGR 2.2.1.3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum KeyboardType {
+    /// IBM PC/XT or compatible (83-key).
+    IbmPcXt = 1,
+    /// Olivetti "ICO" (102-key).
+    OlivettiIco = 2,
+    /// IBM PC/AT (84-key) or similar.
+    IbmPcAt = 3,
+    /// IBM enhanced (101- or 102-key).
+    IbmEnhanced = 4,
+    /// Nokia 1050 or similar.
+    Nokia1050 = 5,
+    /// Nokia 9140 or similar.
+    Nokia9140 = 6,
+    /// Japanese keyboard.
+    Japanese = 7,
+}
+
+impl KeyboardType {
+    /// Convert from a raw u32 value, defaulting to IbmEnhanced.
+    pub fn from_u32(val: u32) -> Self {
+        match val {
+            1 => Self::IbmPcXt,
+            2 => Self::OlivettiIco,
+            3 => Self::IbmPcAt,
+            4 => Self::IbmEnhanced,
+            5 => Self::Nokia1050,
+            6 => Self::Nokia9140,
+            7 => Self::Japanese,
+            _ => Self::IbmEnhanced,
+        }
+    }
+
+    /// Get the raw u32 value.
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Color depth for the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum ColorDepth {
+    Bpp8 = 8,
+    Bpp15 = 15,
+    Bpp16 = 16,
+    Bpp24 = 24,
+    Bpp32 = 32,
+}
+
+impl ColorDepth {
+    /// Get the raw bits-per-pixel value.
+    pub fn as_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+/// Bitmap codec configuration (placeholder for future codec negotiation).
+#[derive(Debug, Clone, Default)]
+pub struct BitmapCodecConfig {
+    /// Whether RemoteFX (RFX) codec is enabled.
+    pub remotefx: bool,
+    /// Whether NSCodec is enabled.
+    pub nscodec: bool,
+}
+
+/// Compression configuration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompressionConfig {
+    /// Whether bulk compression is enabled.
+    pub enabled: bool,
+}
+
+/// A set of static virtual channels to request.
+#[derive(Debug, Clone)]
+pub struct StaticChannelSet {
+    /// Channel definitions.
+    channels: Vec<ChannelDef>,
+}
+
+impl StaticChannelSet {
+    /// Create an empty channel set.
+    pub fn new() -> Self {
+        Self {
+            channels: Vec::new(),
+        }
+    }
+
+    /// Add a channel definition.
+    pub fn push(&mut self, channel: ChannelDef) {
+        self.channels.push(channel);
+    }
+
+    /// Get the channel definitions as a slice.
+    pub fn as_slice(&self) -> &[ChannelDef] {
+        &self.channels
+    }
+
+    /// Whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+
+    /// Number of channels.
+    pub fn len(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// Iterate over channel definitions.
+    pub fn iter(&self) -> core::slice::Iter<'_, ChannelDef> {
+        self.channels.iter()
+    }
+
+    /// Convert into the inner Vec.
+    pub fn into_vec(self) -> Vec<ChannelDef> {
+        self.channels
+    }
+}
+
+impl Default for StaticChannelSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Authentication mode for the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
@@ -25,38 +176,38 @@ pub enum AuthMode {
 /// RDP connection configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Domain name (empty string if none).
-    pub domain: String,
-    /// Username.
-    pub username: String,
-    /// Password.
-    pub password: String,
-    /// Desktop width in pixels.
-    pub desktop_width: u16,
-    /// Desktop height in pixels.
-    pub desktop_height: u16,
-    /// Keyboard layout (LCID). Default: 0x0409 (US English).
-    pub keyboard_layout: u32,
-    /// Keyboard type. Default: 4 (IBM enhanced 101/102).
-    pub keyboard_type: u32,
+    /// Authentication credentials.
+    pub credentials: Credentials,
+    /// Domain name (None if none).
+    pub domain: Option<String>,
+    /// Desktop size in pixels.
+    pub desktop_size: DesktopSize,
+    /// Color depth.
+    pub color_depth: ColorDepth,
+    /// Keyboard type.
+    pub keyboard_type: KeyboardType,
     /// Keyboard subtype. Default: 0.
     pub keyboard_subtype: u32,
-    /// Color depth in bits per pixel. Default: 16.
-    pub color_depth: u16,
-    /// Client build number sent in version info. Default: 22621 (Windows 11 22H2).
-    pub client_build: u32,
-    /// Auto-reconnect cookie from a previous session (optional).
-    pub auto_reconnect_cookie: Option<Vec<u8>>,
-    /// Requested security protocol(s).
-    pub security_protocol: SecurityProtocol,
-    /// RDP cookie for load balancing (optional).
-    pub cookie: Option<String>,
+    /// Keyboard layout (LCID). Default: 0x0409 (US English).
+    pub keyboard_layout: u32,
     /// Client name sent to server.
     pub client_name: String,
-    /// Static virtual channels to request.
-    pub channels: Vec<ChannelDef>,
+    /// Client build number sent in version info. Default: 22621 (Windows 11 22H2).
+    pub client_build: u32,
+    /// Requested security protocol(s).
+    pub security_protocol: SecurityProtocol,
     /// Performance flags.
     pub performance_flags: PerformanceFlags,
+    /// Auto-reconnect cookie from a previous session (optional).
+    pub auto_reconnect_cookie: Option<Vec<u8>>,
+    /// Bitmap codec configuration.
+    pub bitmap_codecs: BitmapCodecConfig,
+    /// Compression configuration.
+    pub compression: CompressionConfig,
+    /// Static virtual channels to request.
+    pub static_channels: StaticChannelSet,
+    /// RDP cookie for load balancing (optional).
+    pub cookie: Option<String>,
     /// Authentication mode.
     pub auth_mode: AuthMode,
     /// Kerberos AP-REQ token for Remote Credential Guard.
@@ -74,22 +225,25 @@ impl Config {
     pub fn builder(username: &str, password: &str) -> ConfigBuilder {
         ConfigBuilder {
             config: Config {
-                domain: String::new(),
-                username: String::from(username),
-                password: String::from(password),
-                desktop_width: 1024,
-                desktop_height: 768,
-                keyboard_layout: 0x0409,
-                keyboard_type: 4,
+                credentials: Credentials {
+                    username: String::from(username),
+                    password: String::from(password),
+                },
+                domain: None,
+                desktop_size: DesktopSize::new(1024, 768),
+                color_depth: ColorDepth::Bpp16,
+                keyboard_type: KeyboardType::IbmEnhanced,
                 keyboard_subtype: 0,
-                color_depth: 16,
-                client_build: 22621,
-                auto_reconnect_cookie: None,
-                security_protocol: SecurityProtocol::SSL.union(SecurityProtocol::HYBRID),
-                cookie: None,
+                keyboard_layout: 0x0409,
                 client_name: String::new(),
-                channels: Vec::new(),
+                client_build: 22621,
+                security_protocol: SecurityProtocol::SSL.union(SecurityProtocol::HYBRID),
                 performance_flags: PerformanceFlags::from_bits(0),
+                auto_reconnect_cookie: None,
+                bitmap_codecs: BitmapCodecConfig::default(),
+                compression: CompressionConfig::default(),
+                static_channels: StaticChannelSet::new(),
+                cookie: None,
                 auth_mode: AuthMode::Password,
                 kerberos_token: None,
                 device_kerberos_token: None,
@@ -107,14 +261,19 @@ pub struct ConfigBuilder {
 impl ConfigBuilder {
     /// Set the domain.
     pub fn domain(mut self, domain: &str) -> Self {
-        self.config.domain = String::from(domain);
+        self.config.domain = Some(String::from(domain));
         self
     }
 
     /// Set the desktop resolution.
     pub fn desktop_size(mut self, width: u16, height: u16) -> Self {
-        self.config.desktop_width = width;
-        self.config.desktop_height = height;
+        self.config.desktop_size = DesktopSize::new(width, height);
+        self
+    }
+
+    /// Set the color depth.
+    pub fn color_depth(mut self, depth: ColorDepth) -> Self {
+        self.config.color_depth = depth;
         self
     }
 
@@ -125,7 +284,7 @@ impl ConfigBuilder {
     }
 
     /// Set the keyboard type.
-    pub fn keyboard_type(mut self, kb_type: u32) -> Self {
+    pub fn keyboard_type(mut self, kb_type: KeyboardType) -> Self {
         self.config.keyboard_type = kb_type;
         self
     }
@@ -150,7 +309,7 @@ impl ConfigBuilder {
 
     /// Add a static virtual channel.
     pub fn channel(mut self, name: &str, options: u32) -> Self {
-        self.config.channels.push(ChannelDef::new(name, options));
+        self.config.static_channels.push(ChannelDef::new(name, options));
         self
     }
 
@@ -163,6 +322,24 @@ impl ConfigBuilder {
     /// Set authentication mode.
     pub fn auth_mode(mut self, mode: AuthMode) -> Self {
         self.config.auth_mode = mode;
+        self
+    }
+
+    /// Enable RemoteFX bitmap codec.
+    pub fn remotefx(mut self, enabled: bool) -> Self {
+        self.config.bitmap_codecs.remotefx = enabled;
+        self
+    }
+
+    /// Enable NSCodec bitmap codec.
+    pub fn nscodec(mut self, enabled: bool) -> Self {
+        self.config.bitmap_codecs.nscodec = enabled;
+        self
+    }
+
+    /// Enable bulk compression.
+    pub fn compression(mut self, enabled: bool) -> Self {
+        self.config.compression.enabled = enabled;
         self
     }
 
@@ -197,6 +374,12 @@ impl ConfigBuilder {
         {
             self.config.security_protocol = SecurityProtocol::HYBRID;
         }
+        self
+    }
+
+    /// Set the auto-reconnect cookie from a previous session.
+    pub fn auto_reconnect_cookie(mut self, cookie: Vec<u8>) -> Self {
+        self.config.auto_reconnect_cookie = Some(cookie);
         self
     }
 

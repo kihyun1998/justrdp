@@ -28,7 +28,7 @@ impl Written {
 }
 
 /// Result of a successful RDP connection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionResult {
     /// MCS I/O channel ID (from ServerNetworkData).
     pub io_channel_id: u16,
@@ -42,4 +42,6 @@ pub struct ConnectionResult {
     pub channel_ids: Vec<(String, u16)>,
     /// Security protocol selected during negotiation.
     pub selected_protocol: SecurityProtocol,
+    /// Session ID from the server (0 if not provided).
+    pub session_id: u32,
 }

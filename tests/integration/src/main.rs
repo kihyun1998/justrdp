@@ -64,7 +64,7 @@ fn main() {
         &mut connector,
         &mut raw_stream,
         &mut output,
-        &ClientConnectorState::SecurityUpgrade,
+        &ClientConnectorState::EnhancedSecurityUpgrade,
         "Connection Initiation",
     );
 
@@ -94,7 +94,7 @@ fn main() {
     let server_public_key = tls_result.server_public_key;
 
     // Phase 3: CredSSP/NLA (if needed)
-    if next_state == ClientConnectorState::CredSsp {
+    if next_state == ClientConnectorState::CredsspNegoTokens {
         println!("[*] Starting CredSSP/NLA...");
 
         // Generate random values for CredSSP
@@ -226,10 +226,15 @@ fn main() {
             }
         }
 
-        // Signal connector that CredSSP is done
-        output.clear();
-        connector.step(&[], &mut output).unwrap(); // CredSsp → BasicSettingsExchangeSendInitial
-        println!("[*] Connector state: {:?}", connector.state());
+        // Advance through all CredSSP states to BasicSettingsExchangeSendInitial
+        loop {
+            output.clear();
+            connector.step(&[], &mut output).unwrap();
+            println!("[*] Connector state: {:?}", connector.state());
+            if *connector.state() == ClientConnectorState::BasicSettingsExchangeSendInitial {
+                break;
+            }
+        }
     }
 
     // Phase 4+: Drive remaining connection sequence over TLS
@@ -240,7 +245,7 @@ fn main() {
         "RDP Connection",
     );
 
-    if *connector.state() == ClientConnectorState::Connected {
+    if connector.state().is_connected() {
         println!("[+] RDP connection established successfully!");
         if let Some(result) = connector.result() {
             println!("    IO Channel: {}", result.io_channel_id);
@@ -388,7 +393,7 @@ fn drive_connector_tls<S: Read + Write>(
     phase_name: &str,
 ) {
     loop {
-        if *connector.state() == ClientConnectorState::Connected {
+        if connector.state().is_connected() {
             break;
         }
 

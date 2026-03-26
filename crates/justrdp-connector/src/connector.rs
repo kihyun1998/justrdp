@@ -100,6 +100,8 @@ pub struct ClientConnector {
     channels_to_join: Vec<u16>,
     /// Current index into `channels_to_join` for the join loop.
     join_index: usize,
+    /// Whether we are in the "send" sub-phase of channel join (true) or "wait" (false).
+    channel_join_sending: bool,
 
     // ── Standard RDP Security state ──
     /// Server random (32 bytes) from ServerSecurityData.
@@ -114,6 +116,8 @@ pub struct ClientConnector {
     server_public_key: Option<server_certificate::ServerRsaPublicKey>,
     /// Security context for Standard RDP Security (RC4 or FIPS).
     security_mode: SecurityMode,
+    /// Session ID from server.
+    session_id: u32,
 }
 
 /// Standard RDP Security mode (none for TLS/NLA).
@@ -130,7 +134,7 @@ impl ClientConnector {
     /// Create a new connector with the given configuration.
     pub fn new(config: Config) -> Self {
         Self {
-            state: ClientConnectorState::ConnectionInitiation,
+            state: ClientConnectorState::ConnectionInitiationSendRequest,
             config,
             selected_protocol: SecurityProtocol::RDP,
             server_nego_flags: NegotiationResponseFlags::NONE,
@@ -141,12 +145,14 @@ impl ClientConnector {
             channel_ids: Vec::new(),
             channels_to_join: Vec::new(),
             join_index: 0,
+            channel_join_sending: true,
             server_random: None,
             server_encryption_method: 0,
             server_encryption_level: 0,
             server_rdp_version: 0,
             server_public_key: None,
             security_mode: SecurityMode::None,
+            session_id: 0,
         }
     }
 
@@ -156,32 +162,16 @@ impl ClientConnector {
     }
 
     /// Get the connection result (only valid after reaching `Connected` state).
-    pub fn result(&self) -> Option<ConnectionResult> {
-        if self.state != ClientConnectorState::Connected {
-            return None;
+    pub fn result(&self) -> Option<&ConnectionResult> {
+        match &self.state {
+            ClientConnectorState::Connected { result } => Some(result),
+            _ => None,
         }
-
-        let channel_ids = self
-            .config
-            .channels
-            .iter()
-            .zip(self.channel_ids.iter())
-            .map(|(def, &id)| (String::from(def.name_str()), id))
-            .collect();
-
-        Some(ConnectionResult {
-            io_channel_id: self.io_channel_id,
-            user_channel_id: self.user_channel_id,
-            share_id: self.share_id,
-            server_capabilities: self.server_capabilities.clone(),
-            channel_ids,
-            selected_protocol: self.selected_protocol,
-        })
     }
 
     // ── State handlers ──
 
-    fn step_connection_initiation(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+    fn step_connection_initiation_send_request(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         use justrdp_pdu::x224::NegotiationRequestFlags;
 
         let flags = match self.config.auth_mode {
@@ -250,7 +240,7 @@ impl ClientConnector {
 
         // Transition based on selected protocol
         if self.selected_protocol != SecurityProtocol::RDP {
-            self.state = ClientConnectorState::SecurityUpgrade;
+            self.state = ClientConnectorState::EnhancedSecurityUpgrade;
         } else {
             self.state = ClientConnectorState::BasicSettingsExchangeSendInitial;
         }
@@ -258,7 +248,7 @@ impl ClientConnector {
         Ok(Written::nothing())
     }
 
-    fn step_security_upgrade(&mut self) -> ConnectorResult<Written> {
+    fn step_enhanced_security_upgrade(&mut self) -> ConnectorResult<Written> {
         // Caller has completed TLS handshake
         if self.selected_protocol.contains(SecurityProtocol::RDSTLS) {
             // RDSTLS: Remote Credential Guard or Azure AD path
@@ -266,15 +256,40 @@ impl ClientConnector {
         } else if self.selected_protocol.contains(SecurityProtocol::HYBRID)
             || self.selected_protocol.contains(SecurityProtocol::HYBRID_EX)
         {
-            self.state = ClientConnectorState::CredSsp;
+            self.state = ClientConnectorState::CredsspNegoTokens;
         } else {
             self.state = ClientConnectorState::BasicSettingsExchangeSendInitial;
         }
         Ok(Written::nothing())
     }
 
-    fn step_credssp(&mut self) -> ConnectorResult<Written> {
-        // Caller has completed NLA/CredSSP
+    // ── Phase 3: CredSSP states (caller-driven) ──
+
+    fn step_credssp_nego_tokens(&mut self) -> ConnectorResult<Written> {
+        // Caller performs SPNEGO token exchange externally.
+        // Transition to PubKeyAuth after caller signals completion.
+        self.state = ClientConnectorState::CredsspPubKeyAuth;
+        Ok(Written::nothing())
+    }
+
+    fn step_credssp_pub_key_auth(&mut self) -> ConnectorResult<Written> {
+        // Caller performs public key authentication externally.
+        self.state = ClientConnectorState::CredsspCredentials;
+        Ok(Written::nothing())
+    }
+
+    fn step_credssp_credentials(&mut self) -> ConnectorResult<Written> {
+        // Caller sends encrypted credentials externally.
+        if self.selected_protocol.contains(SecurityProtocol::HYBRID_EX) {
+            self.state = ClientConnectorState::CredsspEarlyUserAuth;
+        } else {
+            self.state = ClientConnectorState::BasicSettingsExchangeSendInitial;
+        }
+        Ok(Written::nothing())
+    }
+
+    fn step_credssp_early_user_auth(&mut self) -> ConnectorResult<Written> {
+        // Caller receives EarlyUserAuthResult externally.
         self.state = ClientConnectorState::BasicSettingsExchangeSendInitial;
         Ok(Written::nothing())
     }
@@ -315,6 +330,8 @@ impl ClientConnector {
         use justrdp_pdu::rdp::rdstls::RdstlsAuthenticationRequest;
         use justrdp_pdu::ntlm::messages::to_utf16le;
 
+        let domain_str = self.config.domain.as_deref().unwrap_or("");
+
         let req = match self.config.auth_mode {
             crate::config::AuthMode::RemoteCredentialGuard => {
                 let token = self.config.kerberos_token.as_ref()
@@ -328,9 +345,9 @@ impl ClientConnector {
             }
             crate::config::AuthMode::Password => {
                 RdstlsAuthenticationRequest::password(
-                    &to_utf16le(&self.config.domain),
-                    &to_utf16le(&self.config.username),
-                    &to_utf16le(&self.config.password),
+                    &to_utf16le(domain_str),
+                    &to_utf16le(&self.config.credentials.username),
+                    &to_utf16le(&self.config.credentials.password),
                 )
             }
         };
@@ -361,9 +378,9 @@ impl ClientConnector {
 
     fn step_basic_settings_send_initial(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         // Build GCC client data blocks
-        let mut core_data = ClientCoreData::new(self.config.desktop_width, self.config.desktop_height);
+        let mut core_data = ClientCoreData::new(self.config.desktop_size.width, self.config.desktop_size.height);
         core_data.keyboard_layout = self.config.keyboard_layout;
-        core_data.keyboard_type = self.config.keyboard_type;
+        core_data.keyboard_type = self.config.keyboard_type.as_u32();
         core_data.client_name = self.config.client_name.clone();
         core_data.server_selected_protocol = Some(self.selected_protocol.bits());
 
@@ -376,9 +393,9 @@ impl ClientConnector {
 
         // Encode client data blocks
         let mut client_data_size = core_data.size() + security_data.size() + cluster_data.size();
-        if !self.config.channels.is_empty() {
+        if !self.config.static_channels.is_empty() {
             let net_data = ClientNetworkData {
-                channels: self.config.channels.clone(),
+                channels: self.config.static_channels.as_slice().to_vec(),
             };
             client_data_size += net_data.size();
         }
@@ -389,9 +406,9 @@ impl ClientConnector {
             core_data.encode(&mut cursor)?;
             security_data.encode(&mut cursor)?;
             cluster_data.encode(&mut cursor)?;
-            if !self.config.channels.is_empty() {
+            if !self.config.static_channels.is_empty() {
                 let net_data = ClientNetworkData {
-                    channels: self.config.channels.clone(),
+                    channels: self.config.static_channels.as_slice().to_vec(),
                 };
                 net_data.encode(&mut cursor)?;
             }
@@ -438,7 +455,7 @@ impl ClientConnector {
         // Parse server data blocks
         self.parse_server_data_blocks(&gcc.user_data)?;
 
-        self.state = ClientConnectorState::ChannelConnectionSendErectDomain;
+        self.state = ClientConnectorState::ChannelConnectionSendErectDomainRequest;
         Ok(Written::nothing())
     }
 
@@ -468,8 +485,6 @@ impl ClientConnector {
                     self.server_rdp_version = version;
                 }
                 t if t == ServerDataBlockType::SecurityData as u16 => {
-                    // Re-decode from full block (SecurityData decode expects header)
-                    // We already stripped the header, so parse fields directly.
                     let encryption_method = block_cursor.read_u32_le("SecData::method")?;
                     let encryption_level = block_cursor.read_u32_le("SecData::level")?;
 
@@ -508,19 +523,19 @@ impl ClientConnector {
         Ok(())
     }
 
-    fn step_send_erect_domain(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+    fn step_send_erect_domain_request(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         let pdu = ErectDomainRequest {
             sub_height: 0,
             sub_interval: 0,
         };
         let size = encode_slow_path(&pdu, output)?;
-        self.state = ClientConnectorState::ChannelConnectionSendAttachUser;
+        self.state = ClientConnectorState::ChannelConnectionSendAttachUserRequest;
         Ok(Written::new(size))
     }
 
-    fn step_send_attach_user(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+    fn step_send_attach_user_request(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         let size = encode_slow_path(&AttachUserRequest, output)?;
-        self.state = ClientConnectorState::ChannelConnectionWaitAttachConfirm;
+        self.state = ClientConnectorState::ChannelConnectionWaitAttachUserConfirm;
         Ok(Written::new(size))
     }
 
@@ -550,49 +565,55 @@ impl ClientConnector {
             self.channels_to_join.push(ch_id);
         }
         self.join_index = 0;
+        self.channel_join_sending = true;
 
-        self.state = ClientConnectorState::ChannelConnectionSendJoinRequest;
+        self.state = ClientConnectorState::ChannelConnectionChannelJoin;
         Ok(Written::nothing())
     }
 
-    fn step_send_join_request(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
-        let channel_id = self.channels_to_join[self.join_index];
-        let pdu = ChannelJoinRequest {
-            initiator: self.user_channel_id,
-            channel_id,
-        };
-        let size = encode_slow_path(&pdu, output)?;
-        self.state = ClientConnectorState::ChannelConnectionWaitJoinConfirm;
-        Ok(Written::new(size))
-    }
-
-    fn step_wait_join_confirm(&mut self, input: &[u8]) -> ConnectorResult<Written> {
-        let mut cursor = ReadCursor::new(input);
-        let _tpkt = TpktHeader::decode(&mut cursor)?;
-        let _dt = DataTransfer::decode(&mut cursor)?;
-        let confirm = ChannelJoinConfirm::decode(&mut cursor)?;
-
-        if confirm.result != 0 {
-            let expected_channel = self.channels_to_join[self.join_index];
-            return Err(ConnectorError {
-                kind: ConnectorErrorKind::ChannelJoinFailure {
-                    channel_id: expected_channel,
-                    result: confirm.result,
-                },
-            });
-        }
-
-        self.join_index += 1;
-        if self.join_index < self.channels_to_join.len() {
-            self.state = ClientConnectorState::ChannelConnectionSendJoinRequest;
-        } else if self.uses_standard_rdp_security() {
-            // Standard RDP Security: send Security Exchange PDU first
-            self.state = ClientConnectorState::SecurityExchangeSendClientRandom;
+    /// ChannelConnectionChannelJoin: alternates between sending Join Request
+    /// and waiting for Join Confirm for each channel in `channels_to_join`.
+    fn step_channel_join(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
+        if self.channel_join_sending {
+            // Send Join Request for current channel
+            let channel_id = self.channels_to_join[self.join_index];
+            let pdu = ChannelJoinRequest {
+                initiator: self.user_channel_id,
+                channel_id,
+            };
+            let size = encode_slow_path(&pdu, output)?;
+            self.channel_join_sending = false;
+            Ok(Written::new(size))
         } else {
-            self.state = ClientConnectorState::SecureSettingsExchange;
-        }
+            // Wait for Join Confirm
+            let mut cursor = ReadCursor::new(input);
+            let _tpkt = TpktHeader::decode(&mut cursor)?;
+            let _dt = DataTransfer::decode(&mut cursor)?;
+            let confirm = ChannelJoinConfirm::decode(&mut cursor)?;
 
-        Ok(Written::nothing())
+            if confirm.result != 0 {
+                let expected_channel = self.channels_to_join[self.join_index];
+                return Err(ConnectorError {
+                    kind: ConnectorErrorKind::ChannelJoinFailure {
+                        channel_id: expected_channel,
+                        result: confirm.result,
+                    },
+                });
+            }
+
+            self.join_index += 1;
+            if self.join_index < self.channels_to_join.len() {
+                // More channels to join
+                self.channel_join_sending = true;
+            } else if self.uses_standard_rdp_security() {
+                // Standard RDP Security: send Security Exchange PDU first
+                self.state = ClientConnectorState::SecurityCommencement;
+            } else {
+                self.state = ClientConnectorState::SecureSettingsExchange;
+            }
+
+            Ok(Written::nothing())
+        }
     }
 
     /// Whether this connection uses Standard RDP Security (not TLS/NLA).
@@ -694,7 +715,7 @@ impl ClientConnector {
     /// MS-RDPBCGR 2.2.1.10: The client generates a 32-byte random, encrypts it
     /// with the server's RSA public key, and sends it in a Security Exchange PDU.
     /// Then derives session keys from (client_random + server_random).
-    fn step_security_exchange_send_client_random(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+    fn step_security_commencement(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         let server_key = self.server_public_key.as_ref()
             .ok_or_else(|| ConnectorError::general("no server public key for security exchange"))?;
         let server_random = self.server_random
@@ -748,7 +769,8 @@ impl ClientConnector {
     }
 
     fn step_secure_settings_exchange(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
-        let info = ClientInfoPdu::new(&self.config.domain, &self.config.username, &self.config.password)
+        let domain_str = self.config.domain.as_deref().unwrap_or("");
+        let info = ClientInfoPdu::new(domain_str, &self.config.credentials.username, &self.config.credentials.password)
             .with_performance_flags(self.config.performance_flags);
 
         // Encode Client Info PDU
@@ -759,22 +781,6 @@ impl ClientConnector {
         let sec_flags = if is_encrypted { SEC_INFO_PKT | SEC_ENCRYPT } else { SEC_INFO_PKT };
 
         if is_encrypted {
-            // Standard RDP Security: encrypt via security context
-            // Build: SEC_INFO_PKT header + encrypted info
-            // We need to build the header separately since encrypt_and_send_mcs adds its own SEC_ENCRYPT header
-            let mut payload = vec![0u8; BASIC_SECURITY_HEADER_SIZE];
-            {
-                let mut cursor = WriteCursor::new(&mut payload);
-                cursor.write_u16_le(SEC_INFO_PKT, "SecurityHeader::infoFlag")?;
-                cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-            }
-            // For Client Info with Standard RDP Security, the encryption wraps the info PDU
-            // but SEC_INFO_PKT is ORed with SEC_ENCRYPT in the security header
-            // Use encrypt_and_send_mcs which adds SEC_ENCRYPT + MAC
-            // But we need SEC_INFO_PKT flag too. Let me handle this properly:
-
-            // Actually for Client Info: the security header flags = SEC_INFO_PKT | SEC_ENCRYPT
-            // The entire info PDU is the encrypted payload
             match &mut self.security_mode {
                 SecurityMode::Rc4(ctx) => {
                     let mut data = info_bytes.clone();
@@ -789,7 +795,7 @@ impl ClientConnector {
                         cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
                     }
                     let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
-                    self.state = ClientConnectorState::LicensingWait;
+                    self.state = ClientConnectorState::ConnectTimeAutoDetection;
                     Ok(Written::new(size))
                 }
                 SecurityMode::Fips(ctx) => {
@@ -805,7 +811,7 @@ impl ClientConnector {
                         cursor.write_slice(&ciphertext, "SecurityHeader::encryptedData")?;
                     }
                     let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
-                    self.state = ClientConnectorState::LicensingWait;
+                    self.state = ClientConnectorState::ConnectTimeAutoDetection;
                     Ok(Written::new(size))
                 }
                 SecurityMode::None => unreachable!(),
@@ -821,12 +827,20 @@ impl ClientConnector {
                 cursor.write_slice(&info_bytes, "SecurityHeader::encryptedData")?;
             }
             let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
-            self.state = ClientConnectorState::LicensingWait;
+            self.state = ClientConnectorState::ConnectTimeAutoDetection;
             Ok(Written::new(size))
         }
     }
 
-    fn step_licensing_wait(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
+    /// Phase 8: Connect-Time Auto-Detection.
+    /// MS-RDPBCGR 1.3.1.1: server may optionally send auto-detect PDUs.
+    /// Currently a pass-through; transitions immediately to licensing.
+    fn step_connect_time_auto_detection(&mut self) -> ConnectorResult<Written> {
+        self.state = ClientConnectorState::LicensingExchange;
+        Ok(Written::nothing())
+    }
+
+    fn step_licensing_exchange(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
         let mut cursor = ReadCursor::new(input);
         let _tpkt = TpktHeader::decode(&mut cursor)?;
         let _dt = DataTransfer::decode(&mut cursor)?;
@@ -849,16 +863,13 @@ impl ClientConnector {
 
         match preamble.msg_type {
             LicenseMsgType::ErrorAlert => {
-                // Decode the error message
-                // We need to re-parse from after the security header, with the preamble included
-                // But we already consumed the preamble, so decode the rest
                 let error_code_val = inner.read_u32_le("LicenseError::errorCode")?;
                 let error_code = justrdp_pdu::rdp::licensing::LicenseErrorCode::from_u32(error_code_val)?;
                 let _state_transition = inner.read_u32_le("LicenseError::stateTransition")?;
 
                 if error_code == LicenseErrorCode::StatusValidClient {
-                    // Licensing complete
-                    self.state = ClientConnectorState::CapabilitiesWaitDemandActive;
+                    // Licensing complete — skip to capabilities
+                    self.state = ClientConnectorState::MultitransportBootstrapping;
                     Ok(Written::nothing())
                 } else {
                     Err(ConnectorError {
@@ -869,7 +880,6 @@ impl ClientConnector {
             LicenseMsgType::LicenseRequest | LicenseMsgType::PlatformChallenge => {
                 // Server requires licensing negotiation.
                 // Respond with ErrorAlert: ERR_NO_LICENSE_SERVER / ST_TOTAL_ABORT.
-                // Most servers will then send STATUS_VALID_CLIENT or disconnect.
                 let error_msg = build_license_error_response();
 
                 let inner_size = BASIC_SECURITY_HEADER_SIZE + error_msg.len();
@@ -885,12 +895,12 @@ impl ClientConnector {
                     self.user_channel_id, self.io_channel_id, &inner_buf, output,
                 )?;
 
-                // Stay in LicensingWait for server's response
+                // Stay in LicensingExchange for server's response
                 Ok(Written::new(size))
             }
             LicenseMsgType::NewLicense | LicenseMsgType::UpgradeLicense => {
                 // Server granted a license — licensing complete
-                self.state = ClientConnectorState::CapabilitiesWaitDemandActive;
+                self.state = ClientConnectorState::MultitransportBootstrapping;
                 Ok(Written::nothing())
             }
             _ => {
@@ -898,6 +908,14 @@ impl ClientConnector {
                 Ok(Written::nothing())
             }
         }
+    }
+
+    /// Phase 10: Multitransport Bootstrapping.
+    /// MS-RDPBCGR 2.2.15.1: server may optionally initiate multitransport.
+    /// Currently a pass-through; transitions immediately to capabilities exchange.
+    fn step_multitransport_bootstrapping(&mut self) -> ConnectorResult<Written> {
+        self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
+        Ok(Written::nothing())
     }
 
     fn step_capabilities_wait_demand_active(&mut self, input: &[u8]) -> ConnectorResult<Written> {
@@ -929,9 +947,10 @@ impl ClientConnector {
         // Decode Demand Active PDU
         let demand = DemandActivePdu::decode(&mut inner)?;
         self.share_id = demand.share_id;
+        self.session_id = demand.session_id;
         self.server_capabilities = demand.capability_sets;
 
-        self.state = ClientConnectorState::CapabilitiesSendConfirmActive;
+        self.state = ClientConnectorState::CapabilitiesExchangeSendConfirmActive;
         Ok(Written::nothing())
     }
 
@@ -951,7 +970,7 @@ impl ClientConnector {
         );
 
         let size = self.encrypt_and_send_mcs(&sc_payload, output)?;
-        self.state = ClientConnectorState::FinalizationSendSynchronize;
+        self.state = ClientConnectorState::ConnectionFinalizationSendSynchronize;
         Ok(Written::new(size))
     }
 
@@ -971,12 +990,12 @@ impl ClientConnector {
                 suppress_output_support: 1,
             }),
             CapabilitySet::Bitmap(BitmapCapability {
-                preferred_bits_per_pixel: self.config.color_depth,
+                preferred_bits_per_pixel: self.config.color_depth.as_u16(),
                 receive1_bit_per_pixel: 1,
                 receive4_bits_per_pixel: 1,
                 receive8_bits_per_pixel: 1,
-                desktop_width: self.config.desktop_width,
-                desktop_height: self.config.desktop_height,
+                desktop_width: self.config.desktop_size.width,
+                desktop_height: self.config.desktop_size.height,
                 pad2a: 0,
                 desktop_resize_flag: 1,
                 bitmap_compression_flag: 1,
@@ -1008,7 +1027,7 @@ impl ClientConnector {
                 input_flags: 0x0035, // INPUT_FLAG_SCANCODES | INPUT_FLAG_MOUSEX | INPUT_FLAG_UNICODE | INPUT_FLAG_FASTPATH_INPUT2
                 pad2: 0,
                 keyboard_layout: self.config.keyboard_layout,
-                keyboard_type: self.config.keyboard_type,
+                keyboard_type: self.config.keyboard_type.as_u32(),
                 keyboard_sub_type: self.config.keyboard_subtype,
                 keyboard_function_key: 12,
                 ime_file_name: [0u8; 64],
@@ -1114,7 +1133,7 @@ impl ClientConnector {
         self.step_send_finalization_pdu(
             ShareDataPduType::Synchronize,
             &pdu,
-            ClientConnectorState::FinalizationSendCooperate,
+            ClientConnectorState::ConnectionFinalizationSendCooperate,
             output,
         )
     }
@@ -1128,7 +1147,7 @@ impl ClientConnector {
         self.step_send_finalization_pdu(
             ShareDataPduType::Control,
             &pdu,
-            ClientConnectorState::FinalizationSendRequestControl,
+            ClientConnectorState::ConnectionFinalizationSendRequestControl,
             output,
         )
     }
@@ -1142,9 +1161,20 @@ impl ClientConnector {
         self.step_send_finalization_pdu(
             ShareDataPduType::Control,
             &pdu,
-            ClientConnectorState::FinalizationSendFontList,
+            ClientConnectorState::ConnectionFinalizationSendPersistentKeyList,
             output,
         )
+    }
+
+    /// Send Persistent Key List PDU (MS-RDPBCGR 2.2.1.17).
+    ///
+    /// Currently sends an empty persistent key list (no cached bitmaps).
+    /// This is a required step in the finalization sequence.
+    fn step_finalization_send_persistent_key_list(&mut self, _output: &mut WriteBuf) -> ConnectorResult<Written> {
+        // For now, skip persistent key list (no bitmap cache) and go straight to font list.
+        // A full implementation would send cached bitmap keys here.
+        self.state = ClientConnectorState::ConnectionFinalizationSendFontList;
+        Ok(Written::nothing())
     }
 
     fn step_finalization_send_font_list(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
@@ -1152,7 +1182,7 @@ impl ClientConnector {
         self.step_send_finalization_pdu(
             ShareDataPduType::FontList,
             &pdu,
-            ClientConnectorState::FinalizationWaitSynchronize,
+            ClientConnectorState::ConnectionFinalizationWaitSynchronize,
             output,
         )
     }
@@ -1184,7 +1214,7 @@ impl ClientConnector {
         if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
             // Deactivation-Reactivation: go back to capabilities exchange
             // MS-RDPBCGR 1.3.1.3
-            self.state = ClientConnectorState::CapabilitiesWaitDemandActive;
+            self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
             return Ok(Written::nothing());
         }
 
@@ -1202,6 +1232,67 @@ impl ClientConnector {
 
         self.state = next_state;
         Ok(Written::nothing())
+    }
+
+    /// Wait for Font Map PDU and transition to Connected.
+    fn step_finalization_wait_font_map(&mut self, input: &[u8]) -> ConnectorResult<Written> {
+        let mut cursor = ReadCursor::new(input);
+        let _tpkt = TpktHeader::decode(&mut cursor)?;
+        let _dt = DataTransfer::decode(&mut cursor)?;
+
+        let sdi = SendDataIndication::decode(&mut cursor)?;
+
+        let decrypted = if !matches!(self.security_mode, SecurityMode::None) {
+            let (_flags, data) = self.decrypt_server_data(sdi.user_data)?;
+            data
+        } else {
+            sdi.user_data.to_vec()
+        };
+
+        let mut inner = ReadCursor::new(&decrypted);
+        let sc_hdr = ShareControlHeader::decode(&mut inner)?;
+
+        if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
+            self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
+            return Ok(Written::nothing());
+        }
+
+        if sc_hdr.pdu_type != ShareControlPduType::Data {
+            return Ok(Written::nothing());
+        }
+
+        let sd_hdr = ShareDataHeader::decode(&mut inner)?;
+
+        if sd_hdr.pdu_type2 != ShareDataPduType::FontMap {
+            return Ok(Written::nothing());
+        }
+
+        // Font Map received — connection complete
+        self.transition_to_connected();
+        Ok(Written::nothing())
+    }
+
+    /// Build the ConnectionResult and transition to Connected state.
+    fn transition_to_connected(&mut self) {
+        let channel_ids = self
+            .config
+            .static_channels
+            .iter()
+            .zip(self.channel_ids.iter())
+            .map(|(def, &id)| (String::from(def.name_str()), id))
+            .collect();
+
+        let result = ConnectionResult {
+            io_channel_id: self.io_channel_id,
+            user_channel_id: self.user_channel_id,
+            share_id: self.share_id,
+            server_capabilities: self.server_capabilities.clone(),
+            channel_ids,
+            selected_protocol: self.selected_protocol,
+            session_id: self.session_id,
+        };
+
+        self.state = ClientConnectorState::Connected { result };
     }
 }
 
@@ -1228,7 +1319,7 @@ impl Sequence for ClientConnector {
     }
 
     fn next_pdu_hint(&self) -> Option<&dyn PduHint> {
-        if self.state.is_send_state() || self.state == ClientConnectorState::Connected {
+        if self.state.is_send_state() || self.state.is_connected() {
             None
         } else if matches!(
             self.state,
@@ -1236,6 +1327,16 @@ impl Sequence for ClientConnector {
                 | ClientConnectorState::RdstlsWaitAuthResponse
         ) {
             Some(&RDSTLS_HINT)
+        } else if matches!(
+            self.state,
+            ClientConnectorState::ChannelConnectionChannelJoin
+        ) {
+            // In channel join: hint depends on sub-phase
+            if self.channel_join_sending {
+                None // send sub-phase
+            } else {
+                Some(&TPKT_HINT) // wait sub-phase
+            }
         } else {
             Some(&TPKT_HINT)
         }
@@ -1243,17 +1344,26 @@ impl Sequence for ClientConnector {
 
     fn step(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
         match self.state {
-            ClientConnectorState::ConnectionInitiation => {
-                self.step_connection_initiation(output)
+            ClientConnectorState::ConnectionInitiationSendRequest => {
+                self.step_connection_initiation_send_request(output)
             }
             ClientConnectorState::ConnectionInitiationWaitConfirm => {
                 self.step_connection_initiation_wait_confirm(input)
             }
-            ClientConnectorState::SecurityUpgrade => {
-                self.step_security_upgrade()
+            ClientConnectorState::EnhancedSecurityUpgrade => {
+                self.step_enhanced_security_upgrade()
             }
-            ClientConnectorState::CredSsp => {
-                self.step_credssp()
+            ClientConnectorState::CredsspNegoTokens => {
+                self.step_credssp_nego_tokens()
+            }
+            ClientConnectorState::CredsspPubKeyAuth => {
+                self.step_credssp_pub_key_auth()
+            }
+            ClientConnectorState::CredsspCredentials => {
+                self.step_credssp_credentials()
+            }
+            ClientConnectorState::CredsspEarlyUserAuth => {
+                self.step_credssp_early_user_auth()
             }
             ClientConnectorState::RdstlsSendCapabilities => {
                 self.step_rdstls_send_capabilities(output)
@@ -1273,77 +1383,79 @@ impl Sequence for ClientConnector {
             ClientConnectorState::BasicSettingsExchangeWaitResponse => {
                 self.step_basic_settings_wait_response(input)
             }
-            ClientConnectorState::ChannelConnectionSendErectDomain => {
-                self.step_send_erect_domain(output)
+            ClientConnectorState::ChannelConnectionSendErectDomainRequest => {
+                self.step_send_erect_domain_request(output)
             }
-            ClientConnectorState::ChannelConnectionSendAttachUser => {
-                self.step_send_attach_user(output)
+            ClientConnectorState::ChannelConnectionSendAttachUserRequest => {
+                self.step_send_attach_user_request(output)
             }
-            ClientConnectorState::ChannelConnectionWaitAttachConfirm => {
+            ClientConnectorState::ChannelConnectionWaitAttachUserConfirm => {
                 self.step_wait_attach_user_confirm(input)
             }
-            ClientConnectorState::ChannelConnectionSendJoinRequest => {
-                self.step_send_join_request(output)
+            ClientConnectorState::ChannelConnectionChannelJoin => {
+                self.step_channel_join(input, output)
             }
-            ClientConnectorState::ChannelConnectionWaitJoinConfirm => {
-                self.step_wait_join_confirm(input)
-            }
-            ClientConnectorState::SecurityExchangeSendClientRandom => {
-                self.step_security_exchange_send_client_random(output)
+            ClientConnectorState::SecurityCommencement => {
+                self.step_security_commencement(output)
             }
             ClientConnectorState::SecureSettingsExchange => {
                 self.step_secure_settings_exchange(output)
             }
-            ClientConnectorState::LicensingWait => {
-                self.step_licensing_wait(input, output)
+            ClientConnectorState::ConnectTimeAutoDetection => {
+                self.step_connect_time_auto_detection()
             }
-            ClientConnectorState::CapabilitiesWaitDemandActive => {
+            ClientConnectorState::LicensingExchange => {
+                self.step_licensing_exchange(input, output)
+            }
+            ClientConnectorState::MultitransportBootstrapping => {
+                self.step_multitransport_bootstrapping()
+            }
+            ClientConnectorState::CapabilitiesExchangeWaitDemandActive => {
                 self.step_capabilities_wait_demand_active(input)
             }
-            ClientConnectorState::CapabilitiesSendConfirmActive => {
+            ClientConnectorState::CapabilitiesExchangeSendConfirmActive => {
                 self.step_capabilities_send_confirm_active(output)
             }
-            ClientConnectorState::FinalizationSendSynchronize => {
+            ClientConnectorState::ConnectionFinalizationSendSynchronize => {
                 self.step_finalization_send_synchronize(output)
             }
-            ClientConnectorState::FinalizationSendCooperate => {
+            ClientConnectorState::ConnectionFinalizationSendCooperate => {
                 self.step_finalization_send_cooperate(output)
             }
-            ClientConnectorState::FinalizationSendRequestControl => {
+            ClientConnectorState::ConnectionFinalizationSendRequestControl => {
                 self.step_finalization_send_request_control(output)
             }
-            ClientConnectorState::FinalizationSendFontList => {
+            ClientConnectorState::ConnectionFinalizationSendPersistentKeyList => {
+                self.step_finalization_send_persistent_key_list(output)
+            }
+            ClientConnectorState::ConnectionFinalizationSendFontList => {
                 self.step_finalization_send_font_list(output)
             }
-            ClientConnectorState::FinalizationWaitSynchronize => {
+            ClientConnectorState::ConnectionFinalizationWaitSynchronize => {
                 self.step_finalization_wait_pdu(
                     input,
                     ShareDataPduType::Synchronize,
-                    ClientConnectorState::FinalizationWaitCooperate,
+                    ClientConnectorState::ConnectionFinalizationWaitCooperate,
                 )
             }
-            ClientConnectorState::FinalizationWaitCooperate => {
+            ClientConnectorState::ConnectionFinalizationWaitCooperate => {
                 self.step_finalization_wait_pdu(
                     input,
                     ShareDataPduType::Control,
-                    ClientConnectorState::FinalizationWaitGrantedControl,
+                    ClientConnectorState::ConnectionFinalizationWaitGrantedControl,
                 )
             }
-            ClientConnectorState::FinalizationWaitGrantedControl => {
+            ClientConnectorState::ConnectionFinalizationWaitGrantedControl => {
                 self.step_finalization_wait_pdu(
                     input,
                     ShareDataPduType::Control,
-                    ClientConnectorState::FinalizationWaitFontMap,
+                    ClientConnectorState::ConnectionFinalizationWaitFontMap,
                 )
             }
-            ClientConnectorState::FinalizationWaitFontMap => {
-                self.step_finalization_wait_pdu(
-                    input,
-                    ShareDataPduType::FontMap,
-                    ClientConnectorState::Connected,
-                )
+            ClientConnectorState::ConnectionFinalizationWaitFontMap => {
+                self.step_finalization_wait_font_map(input)
             }
-            ClientConnectorState::Connected => {
+            ClientConnectorState::Connected { .. } => {
                 Err(ConnectorError {
                     kind: ConnectorErrorKind::InvalidState,
                 })
@@ -1361,7 +1473,7 @@ mod tests {
     fn new_connector_starts_at_connection_initiation() {
         let config = Config::builder("user", "pass").build();
         let connector = ClientConnector::new(config);
-        assert_eq!(*connector.state(), ClientConnectorState::ConnectionInitiation);
+        assert_eq!(*connector.state(), ClientConnectorState::ConnectionInitiationSendRequest);
     }
 
     #[test]
@@ -1387,7 +1499,7 @@ mod tests {
     fn send_states_return_no_hint() {
         let config = Config::builder("user", "pass").build();
         let connector = ClientConnector::new(config);
-        // ConnectionInitiation is a send state
+        // ConnectionInitiationSendRequest is a send state
         assert!(connector.next_pdu_hint().is_none());
     }
 
@@ -1409,12 +1521,15 @@ mod tests {
     #[test]
     fn config_builder_defaults() {
         let config = Config::builder("testuser", "testpass").build();
-        assert_eq!(config.username, "testuser");
-        assert_eq!(config.password, "testpass");
-        assert_eq!(config.desktop_width, 1024);
-        assert_eq!(config.desktop_height, 768);
+        assert_eq!(config.credentials.username, "testuser");
+        assert_eq!(config.credentials.password, "testpass");
+        assert_eq!(config.desktop_size.width, 1024);
+        assert_eq!(config.desktop_size.height, 768);
         assert_eq!(config.keyboard_layout, 0x0409);
-        assert!(config.channels.is_empty());
+        assert!(config.static_channels.is_empty());
+        assert_eq!(config.color_depth, crate::config::ColorDepth::Bpp16);
+        assert_eq!(config.keyboard_type, crate::config::KeyboardType::IbmEnhanced);
+        assert!(config.domain.is_none());
     }
 
     #[test]
@@ -1426,12 +1541,12 @@ mod tests {
             .channel("rdpdr", 0x80800000)
             .build();
 
-        assert_eq!(config.domain, "TESTDOMAIN");
-        assert_eq!(config.desktop_width, 1920);
-        assert_eq!(config.desktop_height, 1080);
+        assert_eq!(config.domain.as_deref(), Some("TESTDOMAIN"));
+        assert_eq!(config.desktop_size.width, 1920);
+        assert_eq!(config.desktop_size.height, 1080);
         assert_eq!(config.keyboard_layout, 0x0412);
-        assert_eq!(config.channels.len(), 1);
-        assert_eq!(config.channels[0].name_str(), "rdpdr");
+        assert_eq!(config.static_channels.len(), 1);
+        assert_eq!(config.static_channels.as_slice()[0].name_str(), "rdpdr");
     }
 
     #[test]
@@ -1483,7 +1598,7 @@ mod tests {
         output.clear();
         let written = connector.step(&cc_buf, &mut output).unwrap();
         assert_eq!(written.size, 0);
-        assert_eq!(*connector.state(), ClientConnectorState::SecurityUpgrade);
+        assert_eq!(*connector.state(), ClientConnectorState::EnhancedSecurityUpgrade);
     }
 
     #[test]
@@ -1492,12 +1607,12 @@ mod tests {
         let mut connector = ClientConnector::new(config);
 
         // Manually set state and protocol
-        connector.state = ClientConnectorState::SecurityUpgrade;
+        connector.state = ClientConnectorState::EnhancedSecurityUpgrade;
         connector.selected_protocol = SecurityProtocol::HYBRID;
 
         let mut output = WriteBuf::new();
         connector.step(&[], &mut output).unwrap();
-        assert_eq!(*connector.state(), ClientConnectorState::CredSsp);
+        assert_eq!(*connector.state(), ClientConnectorState::CredsspNegoTokens);
     }
 
     #[test]
@@ -1505,7 +1620,7 @@ mod tests {
         let config = Config::builder("user", "pass").build();
         let mut connector = ClientConnector::new(config);
 
-        connector.state = ClientConnectorState::SecurityUpgrade;
+        connector.state = ClientConnectorState::EnhancedSecurityUpgrade;
         connector.selected_protocol = SecurityProtocol::SSL;
 
         let mut output = WriteBuf::new();
@@ -1517,18 +1632,40 @@ mod tests {
     }
 
     #[test]
-    fn credssp_to_basic_settings() {
+    fn credssp_full_sequence() {
         let config = Config::builder("user", "pass").build();
         let mut connector = ClientConnector::new(config);
-
-        connector.state = ClientConnectorState::CredSsp;
-
         let mut output = WriteBuf::new();
+
+        // CredsspNegoTokens → CredsspPubKeyAuth
+        connector.state = ClientConnectorState::CredsspNegoTokens;
         connector.step(&[], &mut output).unwrap();
-        assert_eq!(
-            *connector.state(),
-            ClientConnectorState::BasicSettingsExchangeSendInitial
-        );
+        assert_eq!(*connector.state(), ClientConnectorState::CredsspPubKeyAuth);
+
+        // CredsspPubKeyAuth → CredsspCredentials
+        connector.step(&[], &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::CredsspCredentials);
+
+        // CredsspCredentials → BasicSettingsExchangeSendInitial (non-HYBRID_EX)
+        connector.selected_protocol = SecurityProtocol::HYBRID;
+        connector.step(&[], &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::BasicSettingsExchangeSendInitial);
+    }
+
+    #[test]
+    fn credssp_hybrid_ex_includes_early_user_auth() {
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        let mut output = WriteBuf::new();
+
+        connector.state = ClientConnectorState::CredsspCredentials;
+        connector.selected_protocol = SecurityProtocol::HYBRID_EX;
+
+        connector.step(&[], &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::CredsspEarlyUserAuth);
+
+        connector.step(&[], &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::BasicSettingsExchangeSendInitial);
     }
 
     #[test]
@@ -1560,10 +1697,53 @@ mod tests {
     fn connected_state_returns_error() {
         let config = Config::builder("user", "pass").build();
         let mut connector = ClientConnector::new(config);
-        connector.state = ClientConnectorState::Connected;
+        connector.state = ClientConnectorState::Connected {
+            result: ConnectionResult {
+                io_channel_id: 0,
+                user_channel_id: 0,
+                share_id: 0,
+                server_capabilities: Vec::new(),
+                channel_ids: Vec::new(),
+                selected_protocol: SecurityProtocol::RDP,
+                session_id: 0,
+            },
+        };
 
         let mut output = WriteBuf::new();
         let result = connector.step(&[], &mut output);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn connect_time_auto_detection_pass_through() {
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        let mut output = WriteBuf::new();
+
+        connector.state = ClientConnectorState::ConnectTimeAutoDetection;
+        connector.step(&[], &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::LicensingExchange);
+    }
+
+    #[test]
+    fn multitransport_bootstrapping_pass_through() {
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        let mut output = WriteBuf::new();
+
+        connector.state = ClientConnectorState::MultitransportBootstrapping;
+        connector.step(&[], &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::CapabilitiesExchangeWaitDemandActive);
+    }
+
+    #[test]
+    fn persistent_key_list_transitions_to_font_list() {
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        let mut output = WriteBuf::new();
+
+        connector.state = ClientConnectorState::ConnectionFinalizationSendPersistentKeyList;
+        connector.step(&[], &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationSendFontList);
     }
 }

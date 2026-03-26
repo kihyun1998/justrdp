@@ -2,7 +2,11 @@
 
 //! Client connector state machine states.
 
+use crate::result::ConnectionResult;
+
 /// State of the RDP client connection sequence.
+///
+/// Follows MS-RDPBCGR 1.3.1.1 connection sequence phases.
 ///
 /// Convention:
 /// - `Send*` states produce output (caller provides empty input `&[]`)
@@ -11,17 +15,23 @@
 pub enum ClientConnectorState {
     // ── Phase 1: Connection Initiation ──
     /// Send X.224 Connection Request (no input needed).
-    ConnectionInitiation,
+    ConnectionInitiationSendRequest,
     /// Wait for X.224 Connection Confirm from server.
     ConnectionInitiationWaitConfirm,
 
     // ── Phase 2: Security Upgrade (external) ──
     /// Caller performs TLS handshake, then signals completion.
-    SecurityUpgrade,
+    EnhancedSecurityUpgrade,
 
-    // ── Phase 3: NLA/CredSSP (external) ──
-    /// Caller performs CredSSP/NLA, then signals completion.
-    CredSsp,
+    // ── Phase 3: NLA/CredSSP ──
+    /// CredSSP SPNEGO negotiation tokens exchange.
+    CredsspNegoTokens,
+    /// CredSSP public key authentication.
+    CredsspPubKeyAuth,
+    /// CredSSP encrypted credentials transfer.
+    CredsspCredentials,
+    /// CredSSP early user authorization result (HYBRID_EX only).
+    CredsspEarlyUserAuth,
 
     // ── Phase 3b: RDSTLS (Remote Credential Guard) ──
     /// Send RDSTLS Capabilities to server.
@@ -41,90 +51,106 @@ pub enum ClientConnectorState {
 
     // ── Phase 5: Channel Connection ──
     /// Send Erect Domain Request.
-    ChannelConnectionSendErectDomain,
+    ChannelConnectionSendErectDomainRequest,
     /// Send Attach User Request.
-    ChannelConnectionSendAttachUser,
+    ChannelConnectionSendAttachUserRequest,
     /// Wait for Attach User Confirm.
-    ChannelConnectionWaitAttachConfirm,
-    /// Send Channel Join Request for the next channel.
-    ChannelConnectionSendJoinRequest,
-    /// Wait for Channel Join Confirm.
-    ChannelConnectionWaitJoinConfirm,
+    ChannelConnectionWaitAttachUserConfirm,
+    /// Channel Join loop: send Join Request / wait Join Confirm for each channel.
+    ChannelConnectionChannelJoin,
 
-    // ── Phase 6: RDP Security Exchange (Standard RDP Security only) ──
-    /// Send Security Exchange PDU (encrypted client random).
-    SecurityExchangeSendClientRandom,
+    // ── Phase 6: Security Commencement (Standard RDP Security only) ──
+    /// Send Security Exchange PDU (encrypted client random) and derive session keys.
+    SecurityCommencement,
 
     // ── Phase 7: Secure Settings Exchange ──
     /// Send Client Info PDU.
     SecureSettingsExchange,
 
+    // ── Phase 8: Connect-Time Auto-Detection ──
+    /// Optional server-initiated auto-detection (MS-RDPBCGR 1.3.1.1, phase 8).
+    ConnectTimeAutoDetection,
+
     // ── Phase 9: Licensing ──
-    /// Wait for licensing PDU from server.
-    LicensingWait,
+    /// License exchange with server (Valid Client shortcut or full negotiation).
+    LicensingExchange,
+
+    // ── Phase 10: Multitransport Bootstrapping ──
+    /// Optional multitransport bootstrapping (MS-RDPBCGR 2.2.15.1).
+    MultitransportBootstrapping,
 
     // ── Phase 11: Capabilities Exchange ──
     /// Wait for Demand Active PDU from server.
-    CapabilitiesWaitDemandActive,
+    CapabilitiesExchangeWaitDemandActive,
     /// Send Confirm Active PDU.
-    CapabilitiesSendConfirmActive,
+    CapabilitiesExchangeSendConfirmActive,
 
     // ── Phase 12: Connection Finalization ──
     /// Send Synchronize PDU.
-    FinalizationSendSynchronize,
+    ConnectionFinalizationSendSynchronize,
     /// Send Control(Cooperate) PDU.
-    FinalizationSendCooperate,
+    ConnectionFinalizationSendCooperate,
     /// Send Control(RequestControl) PDU.
-    FinalizationSendRequestControl,
+    ConnectionFinalizationSendRequestControl,
+    /// Send Persistent Key List PDU (bitmap cache keys).
+    ConnectionFinalizationSendPersistentKeyList,
     /// Send Font List PDU.
-    FinalizationSendFontList,
+    ConnectionFinalizationSendFontList,
     /// Wait for server Synchronize PDU.
-    FinalizationWaitSynchronize,
+    ConnectionFinalizationWaitSynchronize,
     /// Wait for server Control(Cooperate) PDU.
-    FinalizationWaitCooperate,
+    ConnectionFinalizationWaitCooperate,
     /// Wait for server Control(GrantedControl) PDU.
-    FinalizationWaitGrantedControl,
+    ConnectionFinalizationWaitGrantedControl,
     /// Wait for server Font Map PDU.
-    FinalizationWaitFontMap,
+    ConnectionFinalizationWaitFontMap,
 
     // ── Terminal ──
     /// Connection established successfully.
-    Connected,
+    Connected {
+        /// Connection result with channel IDs, server capabilities, etc.
+        result: ConnectionResult,
+    },
 }
 
 impl ClientConnectorState {
     /// Returns a human-readable name for this state.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::ConnectionInitiation => "ConnectionInitiation",
+            Self::ConnectionInitiationSendRequest => "ConnectionInitiationSendRequest",
             Self::ConnectionInitiationWaitConfirm => "ConnectionInitiationWaitConfirm",
-            Self::SecurityUpgrade => "SecurityUpgrade",
-            Self::CredSsp => "CredSsp",
+            Self::EnhancedSecurityUpgrade => "EnhancedSecurityUpgrade",
+            Self::CredsspNegoTokens => "CredsspNegoTokens",
+            Self::CredsspPubKeyAuth => "CredsspPubKeyAuth",
+            Self::CredsspCredentials => "CredsspCredentials",
+            Self::CredsspEarlyUserAuth => "CredsspEarlyUserAuth",
             Self::RdstlsSendCapabilities => "RdstlsSendCapabilities",
             Self::RdstlsWaitCapabilities => "RdstlsWaitCapabilities",
             Self::RdstlsSendAuthRequest => "RdstlsSendAuthRequest",
             Self::RdstlsWaitAuthResponse => "RdstlsWaitAuthResponse",
             Self::BasicSettingsExchangeSendInitial => "BasicSettingsExchangeSendInitial",
             Self::BasicSettingsExchangeWaitResponse => "BasicSettingsExchangeWaitResponse",
-            Self::ChannelConnectionSendErectDomain => "ChannelConnectionSendErectDomain",
-            Self::ChannelConnectionSendAttachUser => "ChannelConnectionSendAttachUser",
-            Self::ChannelConnectionWaitAttachConfirm => "ChannelConnectionWaitAttachConfirm",
-            Self::ChannelConnectionSendJoinRequest => "ChannelConnectionSendJoinRequest",
-            Self::ChannelConnectionWaitJoinConfirm => "ChannelConnectionWaitJoinConfirm",
-            Self::SecurityExchangeSendClientRandom => "SecurityExchangeSendClientRandom",
+            Self::ChannelConnectionSendErectDomainRequest => "ChannelConnectionSendErectDomainRequest",
+            Self::ChannelConnectionSendAttachUserRequest => "ChannelConnectionSendAttachUserRequest",
+            Self::ChannelConnectionWaitAttachUserConfirm => "ChannelConnectionWaitAttachUserConfirm",
+            Self::ChannelConnectionChannelJoin => "ChannelConnectionChannelJoin",
+            Self::SecurityCommencement => "SecurityCommencement",
             Self::SecureSettingsExchange => "SecureSettingsExchange",
-            Self::LicensingWait => "LicensingWait",
-            Self::CapabilitiesWaitDemandActive => "CapabilitiesWaitDemandActive",
-            Self::CapabilitiesSendConfirmActive => "CapabilitiesSendConfirmActive",
-            Self::FinalizationSendSynchronize => "FinalizationSendSynchronize",
-            Self::FinalizationSendCooperate => "FinalizationSendCooperate",
-            Self::FinalizationSendRequestControl => "FinalizationSendRequestControl",
-            Self::FinalizationSendFontList => "FinalizationSendFontList",
-            Self::FinalizationWaitSynchronize => "FinalizationWaitSynchronize",
-            Self::FinalizationWaitCooperate => "FinalizationWaitCooperate",
-            Self::FinalizationWaitGrantedControl => "FinalizationWaitGrantedControl",
-            Self::FinalizationWaitFontMap => "FinalizationWaitFontMap",
-            Self::Connected => "Connected",
+            Self::ConnectTimeAutoDetection => "ConnectTimeAutoDetection",
+            Self::LicensingExchange => "LicensingExchange",
+            Self::MultitransportBootstrapping => "MultitransportBootstrapping",
+            Self::CapabilitiesExchangeWaitDemandActive => "CapabilitiesExchangeWaitDemandActive",
+            Self::CapabilitiesExchangeSendConfirmActive => "CapabilitiesExchangeSendConfirmActive",
+            Self::ConnectionFinalizationSendSynchronize => "ConnectionFinalizationSendSynchronize",
+            Self::ConnectionFinalizationSendCooperate => "ConnectionFinalizationSendCooperate",
+            Self::ConnectionFinalizationSendRequestControl => "ConnectionFinalizationSendRequestControl",
+            Self::ConnectionFinalizationSendPersistentKeyList => "ConnectionFinalizationSendPersistentKeyList",
+            Self::ConnectionFinalizationSendFontList => "ConnectionFinalizationSendFontList",
+            Self::ConnectionFinalizationWaitSynchronize => "ConnectionFinalizationWaitSynchronize",
+            Self::ConnectionFinalizationWaitCooperate => "ConnectionFinalizationWaitCooperate",
+            Self::ConnectionFinalizationWaitGrantedControl => "ConnectionFinalizationWaitGrantedControl",
+            Self::ConnectionFinalizationWaitFontMap => "ConnectionFinalizationWaitFontMap",
+            Self::Connected { .. } => "Connected",
         }
     }
 
@@ -132,22 +158,33 @@ impl ClientConnectorState {
     pub fn is_send_state(&self) -> bool {
         matches!(
             self,
-            Self::ConnectionInitiation
-                | Self::SecurityUpgrade
-                | Self::CredSsp
+            Self::ConnectionInitiationSendRequest
+                | Self::EnhancedSecurityUpgrade
+                | Self::CredsspNegoTokens
+                | Self::CredsspPubKeyAuth
+                | Self::CredsspCredentials
+                | Self::CredsspEarlyUserAuth
                 | Self::RdstlsSendCapabilities
                 | Self::RdstlsSendAuthRequest
                 | Self::BasicSettingsExchangeSendInitial
-                | Self::ChannelConnectionSendErectDomain
-                | Self::ChannelConnectionSendAttachUser
-                | Self::ChannelConnectionSendJoinRequest
-                | Self::SecurityExchangeSendClientRandom
+                | Self::ChannelConnectionSendErectDomainRequest
+                | Self::ChannelConnectionSendAttachUserRequest
+                | Self::ChannelConnectionChannelJoin
+                | Self::SecurityCommencement
                 | Self::SecureSettingsExchange
-                | Self::CapabilitiesSendConfirmActive
-                | Self::FinalizationSendSynchronize
-                | Self::FinalizationSendCooperate
-                | Self::FinalizationSendRequestControl
-                | Self::FinalizationSendFontList
+                | Self::ConnectTimeAutoDetection
+                | Self::MultitransportBootstrapping
+                | Self::CapabilitiesExchangeSendConfirmActive
+                | Self::ConnectionFinalizationSendSynchronize
+                | Self::ConnectionFinalizationSendCooperate
+                | Self::ConnectionFinalizationSendRequestControl
+                | Self::ConnectionFinalizationSendPersistentKeyList
+                | Self::ConnectionFinalizationSendFontList
         )
+    }
+
+    /// Whether this is the terminal Connected state.
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
     }
 }
