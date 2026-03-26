@@ -1225,4 +1225,49 @@ mod tests {
         assert!(TpduCode::from_byte(0x50).is_err());
     }
 
+    #[test]
+    fn negotiation_failure_all_codes_roundtrip() {
+        use NegotiationFailureCode::*;
+        let codes = [
+            SslRequiredByServer, SslNotAllowedByServer, SslCertNotOnServer,
+            InconsistentFlags, HybridRequiredByServer, SslWithUserAuthRequired,
+        ];
+        for code in codes {
+            let fail = NegotiationFailure { code };
+            let mut buf = [0u8; 8];
+            let mut w = WriteCursor::new(&mut buf);
+            fail.encode(&mut w).unwrap();
+            let decoded = NegotiationFailure::decode(&mut ReadCursor::new(&buf)).unwrap();
+            assert_eq!(decoded.code, code);
+        }
+    }
+
+    #[test]
+    fn disconnect_request_all_reasons_roundtrip() {
+        use DisconnectReason::*;
+        for reason in [NotSpecified, CongestionAtTsap, SessionNotAttached, AddressUnknown] {
+            let dr = DisconnectRequest::new(reason);
+            let mut buf = [0u8; DISCONNECT_REQUEST_SIZE];
+            let mut w = WriteCursor::new(&mut buf);
+            dr.encode(&mut w).unwrap();
+            let decoded = DisconnectRequest::decode(&mut ReadCursor::new(&buf)).unwrap();
+            assert_eq!(decoded.reason, reason);
+        }
+    }
+
+    #[test]
+    fn disconnect_reason_unknown_byte_maps_to_not_specified() {
+        let buf = [0x06, 0x80, 0x00, 0x00, 0x00, 0x00, 0xFF]; // reason=0xFF
+        let decoded = DisconnectRequest::decode(&mut ReadCursor::new(&buf)).unwrap();
+        assert_eq!(decoded.reason, DisconnectReason::NotSpecified);
+    }
+
+    #[test]
+    fn negotiation_response_flags_restricted_admin_value() {
+        // Verify RESTRICTED_ADMIN = 0x08, REDIRECTED_AUTH = 0x10 per MS-RDPBCGR 2.2.1.2.1
+        assert_eq!(NegotiationResponseFlags::RESTRICTED_ADMIN.bits(), 0x08);
+        assert_eq!(NegotiationResponseFlags::REDIRECTED_AUTH.bits(), 0x10);
+        assert_eq!(NegotiationResponseFlags::RESERVED.bits(), 0x04);
+    }
+
 }

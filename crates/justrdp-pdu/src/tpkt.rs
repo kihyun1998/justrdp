@@ -207,4 +207,38 @@ mod tests {
         let hint = TpktHint;
         assert_eq!(hint.find_size(&[]), None);
     }
+
+    #[test]
+    fn tpkt_wire_format_known_answer() {
+        // Verify exact wire bytes (catches endianness bugs that roundtrip misses)
+        let header = TpktHeader::new(0x002A); // length=42
+        let mut buf = [0u8; 4];
+        let mut cursor = WriteCursor::new(&mut buf);
+        header.encode(&mut cursor).unwrap();
+        assert_eq!(&buf, &[0x03, 0x00, 0x00, 0x2A]); // version=3, reserved=0, length BE
+    }
+
+    #[test]
+    fn tpkt_minimum_valid_length() {
+        // length == 4 (header only, zero payload)
+        let buf = [0x03, 0x00, 0x00, 0x04];
+        let mut cursor = ReadCursor::new(&buf);
+        let header = TpktHeader::decode(&mut cursor).unwrap();
+        assert_eq!(header.length, 4);
+        assert_eq!(header.payload_length(), 0);
+    }
+
+    #[test]
+    fn tpkt_hint_fast_path_long_partial() {
+        // bit 7 set → two-byte form, but only 2 bytes available (need 3)
+        let hint = TpktHint;
+        let buf = [0x00, 0x81];
+        assert_eq!(hint.find_size(&buf), None);
+    }
+
+    #[test]
+    fn tpkt_hint_fast_path_one_byte() {
+        let hint = TpktHint;
+        assert_eq!(hint.find_size(&[0x00]), None);
+    }
 }

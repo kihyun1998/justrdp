@@ -240,4 +240,33 @@ mod tests {
         assert_eq!(decoded.correlation_id, id);
         assert_eq!(decoded.target.as_deref(), Some(""));
     }
+
+    #[test]
+    fn pcb_v2_cb_target_name_wire_value() {
+        let id = [0x42; CORRELATION_ID_SIZE];
+        let pcb = PreConnectionBlob::v2(id, "HOST".into());
+
+        let mut buf = alloc::vec![0u8; pcb.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pcb.encode(&mut cursor).unwrap();
+
+        // cbTargetName is at offset 10-11 (after cbSize(4) + flags(4) + version(2))
+        let cb_target_name = u16::from_le_bytes([buf[10], buf[11]]);
+        // "HOST" = 4 chars + null = 5 UTF-16 code units = 10 bytes
+        assert_eq!(cb_target_name, 10);
+    }
+
+    #[test]
+    fn pcb_v1_cb_target_name_is_zero() {
+        let id = [0x11; CORRELATION_ID_SIZE];
+        let pcb = PreConnectionBlob::v1(id);
+
+        let mut buf = alloc::vec![0u8; pcb.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pcb.encode(&mut cursor).unwrap();
+
+        // cbTargetName should be 0 for v1
+        let cb_target_name = u16::from_le_bytes([buf[10], buf[11]]);
+        assert_eq!(cb_target_name, 0);
+    }
 }
