@@ -24,14 +24,20 @@ pub const TS_SECONDARY: u8 = 0x02;
 pub const ORDER_TYPE_CHANGE: u8 = 0x08;
 /// Bounds flag -- bounding rectangle follows the order type (bit 2).
 pub const TS_BOUNDS: u8 = 0x04;
+/// Delta coordinates flag (bit 4).
+pub const TS_DELTA_COORDINATES: u8 = 0x10;
 /// Zero bounds deltas flag (bit 5).
 pub const TS_ZERO_BOUNDS_DELTAS: u8 = 0x20;
+/// Zero field byte bit 0 (bit 6) — first fieldFlags byte is zero and omitted.
+pub const TS_ZERO_FIELD_BYTE_BIT0: u8 = 0x40;
+/// Zero field byte bit 1 (bit 7) — second fieldFlags byte is zero and omitted.
+pub const TS_ZERO_FIELD_BYTE_BIT1: u8 = 0x80;
 
 // ════════════════════════════════════════════════════════════════════
 // Primary Drawing Orders
 // ════════════════════════════════════════════════════════════════════
 
-/// The 22 primary drawing order types (MS-RDPEGDI 2.2.2.2.1.1.2).
+/// The 22 primary drawing order types (MS-RDPEGDI 2.2.2.1.1.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PrimaryOrderType {
@@ -94,12 +100,13 @@ impl PrimaryOrderType {
 }
 
 /// Bounding rectangle for primary drawing orders (MS-RDPEGDI 2.2.2.2.1.1.1).
+/// TS_RECTANGLE16: four UINT16 fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundsRect {
-    pub left: i16,
-    pub top: i16,
-    pub right: i16,
-    pub bottom: i16,
+    pub left: u16,
+    pub top: u16,
+    pub right: u16,
+    pub bottom: u16,
 }
 
 /// Encoded size of BoundsRect when written as full coordinates (no delta encoding).
@@ -107,10 +114,10 @@ pub const BOUNDS_RECT_SIZE: usize = 8;
 
 impl Encode for BoundsRect {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        dst.write_i16_le(self.left, "BoundsRect::left")?;
-        dst.write_i16_le(self.top, "BoundsRect::top")?;
-        dst.write_i16_le(self.right, "BoundsRect::right")?;
-        dst.write_i16_le(self.bottom, "BoundsRect::bottom")?;
+        dst.write_u16_le(self.left, "BoundsRect::left")?;
+        dst.write_u16_le(self.top, "BoundsRect::top")?;
+        dst.write_u16_le(self.right, "BoundsRect::right")?;
+        dst.write_u16_le(self.bottom, "BoundsRect::bottom")?;
         Ok(())
     }
 
@@ -120,10 +127,10 @@ impl Encode for BoundsRect {
 
 impl<'de> Decode<'de> for BoundsRect {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
-        let left = src.read_i16_le("BoundsRect::left")?;
-        let top = src.read_i16_le("BoundsRect::top")?;
-        let right = src.read_i16_le("BoundsRect::right")?;
-        let bottom = src.read_i16_le("BoundsRect::bottom")?;
+        let left = src.read_u16_le("BoundsRect::left")?;
+        let top = src.read_u16_le("BoundsRect::top")?;
+        let right = src.read_u16_le("BoundsRect::right")?;
+        let bottom = src.read_u16_le("BoundsRect::bottom")?;
         Ok(Self { left, top, right, bottom })
     }
 }
@@ -151,15 +158,13 @@ impl Encode for PrimaryOrder {
         dst.write_u8(control_flags, "PrimaryOrder::controlFlags")?;
         dst.write_u8(self.order_type as u8, "PrimaryOrder::orderType")?;
 
-        // fieldFlags: encode as 1, 2, or 3 bytes depending on value.
-        if self.field_flags <= 0xFF {
-            dst.write_u8(self.field_flags as u8, "PrimaryOrder::fieldFlags[0]")?;
-        } else if self.field_flags <= 0xFFFF {
-            dst.write_u8(self.field_flags as u8, "PrimaryOrder::fieldFlags[0]")?;
+        // fieldFlags: encode as 1, 2, or 3 bytes per order type (spec-driven, not value-driven).
+        let ff_bytes = field_flags_byte_count(self.order_type);
+        dst.write_u8(self.field_flags as u8, "PrimaryOrder::fieldFlags[0]")?;
+        if ff_bytes >= 2 {
             dst.write_u8((self.field_flags >> 8) as u8, "PrimaryOrder::fieldFlags[1]")?;
-        } else {
-            dst.write_u8(self.field_flags as u8, "PrimaryOrder::fieldFlags[0]")?;
-            dst.write_u8((self.field_flags >> 8) as u8, "PrimaryOrder::fieldFlags[1]")?;
+        }
+        if ff_bytes >= 3 {
             dst.write_u8((self.field_flags >> 16) as u8, "PrimaryOrder::fieldFlags[2]")?;
         }
 
@@ -177,14 +182,8 @@ impl Encode for PrimaryOrder {
 
     fn size(&self) -> usize {
         let mut sz = 1 /* controlFlags */ + 1 /* orderType */;
-        // fieldFlags size
-        if self.field_flags <= 0xFF {
-            sz += 1;
-        } else if self.field_flags <= 0xFFFF {
-            sz += 2;
-        } else {
-            sz += 3;
-        }
+        // fieldFlags size (type-driven)
+        sz += field_flags_byte_count(self.order_type);
         if self.bounds.is_some() {
             sz += BOUNDS_RECT_SIZE;
         }
@@ -241,9 +240,14 @@ impl<'de> Decode<'de> for PrimaryOrder {
             field_flags |= (b as u32) << (i * 8);
         }
 
-        // Bounds.
+        // Bounds: only present when TS_BOUNDS is set AND TS_ZERO_BOUNDS_DELTAS is NOT set.
         let bounds = if control_flags & TS_BOUNDS != 0 {
-            Some(BoundsRect::decode(src)?)
+            if control_flags & TS_ZERO_BOUNDS_DELTAS != 0 {
+                // Bounds are implicitly zero (no data on wire)
+                Some(BoundsRect { left: 0, top: 0, right: 0, bottom: 0 })
+            } else {
+                Some(BoundsRect::decode(src)?)
+            }
         } else {
             None
         };
@@ -261,27 +265,37 @@ impl<'de> Decode<'de> for PrimaryOrder {
 // Secondary Drawing Orders (Cache Orders)
 // ════════════════════════════════════════════════════════════════════
 
-/// Secondary drawing order types (MS-RDPEGDI 2.2.2.2.1.2).
+/// Secondary drawing order types (MS-RDPEGDI 2.2.2.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SecondaryOrderType {
-    CacheBitmapV1 = 0x00,
+    /// TS_CACHE_BITMAP_UNCOMPRESSED (V1 uncompressed).
+    CacheBitmapV1Uncompressed = 0x00,
+    /// TS_CACHE_COLOR_TABLE.
     CacheColorTable = 0x01,
-    CacheBitmapV2Uncompressed = 0x02,
-    CacheBitmapV2Compressed = 0x03,
-    CacheGlyph = 0x04,
+    /// TS_CACHE_BITMAP_COMPRESSED (V1 compressed).
+    CacheBitmapV1Compressed = 0x02,
+    /// TS_CACHE_GLYPH.
+    CacheGlyph = 0x03,
+    /// TS_CACHE_BITMAP_UNCOMPRESSED_REV2.
+    CacheBitmapV2Uncompressed = 0x04,
+    /// TS_CACHE_BITMAP_COMPRESSED_REV2.
+    CacheBitmapV2Compressed = 0x05,
+    /// TS_CACHE_BRUSH.
     CacheBrush = 0x07,
+    /// TS_CACHE_BITMAP_COMPRESSED_REV3.
     CacheBitmapV3 = 0x08,
 }
 
 impl SecondaryOrderType {
     pub fn from_u8(val: u8) -> DecodeResult<Self> {
         match val {
-            0x00 => Ok(Self::CacheBitmapV1),
+            0x00 => Ok(Self::CacheBitmapV1Uncompressed),
             0x01 => Ok(Self::CacheColorTable),
-            0x02 => Ok(Self::CacheBitmapV2Uncompressed),
-            0x03 => Ok(Self::CacheBitmapV2Compressed),
-            0x04 => Ok(Self::CacheGlyph),
+            0x02 => Ok(Self::CacheBitmapV1Compressed),
+            0x03 => Ok(Self::CacheGlyph),
+            0x04 => Ok(Self::CacheBitmapV2Uncompressed),
+            0x05 => Ok(Self::CacheBitmapV2Compressed),
             0x07 => Ok(Self::CacheBrush),
             0x08 => Ok(Self::CacheBitmapV3),
             _ => Err(DecodeError::unexpected_value(
@@ -381,39 +395,57 @@ impl<'de> Decode<'de> for SecondaryOrder {
 // Alternate Secondary Drawing Orders
 // ════════════════════════════════════════════════════════════════════
 
-/// Alternate secondary drawing order types (MS-RDPEGDI 2.2.2.2.1.3).
+/// Alternate secondary drawing order types (MS-RDPEGDI 2.2.2.3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AlternateSecondaryOrderType {
+    /// TS_ALTSEC_SWITCH_SURFACE.
+    SwitchSurface = 0x00,
+    /// TS_ALTSEC_CREATE_OFFSCR_BITMAP.
     CreateOffscreenBitmap = 0x01,
-    SwitchSurface = 0x02,
+    /// TS_ALTSEC_STREAM_BITMAP_FIRST.
+    StreamBitmapFirst = 0x02,
+    /// TS_ALTSEC_STREAM_BITMAP_NEXT.
+    StreamBitmapNext = 0x03,
+    /// TS_ALTSEC_CREATE_NINEGRID_BITMAP.
     CreateNineGridBitmap = 0x04,
-    StreamBitmapFirst = 0x06,
-    StreamBitmapNext = 0x07,
-    DrawGdiPlusFirst = 0x08,
-    DrawGdiPlusNext = 0x09,
-    DrawGdiPlusEnd = 0x0A,
-    DrawGdiPlusCacheFirst = 0x0B,
-    DrawGdiPlusCacheNext = 0x0C,
-    DrawGdiPlusCacheEnd = 0x0D,
-    FrameMarker = 0x0E,
+    /// TS_ALTSEC_GDIP_FIRST.
+    DrawGdiPlusFirst = 0x05,
+    /// TS_ALTSEC_GDIP_NEXT.
+    DrawGdiPlusNext = 0x06,
+    /// TS_ALTSEC_GDIP_END.
+    DrawGdiPlusEnd = 0x07,
+    /// TS_ALTSEC_GDIP_CACHE_FIRST.
+    DrawGdiPlusCacheFirst = 0x08,
+    /// TS_ALTSEC_GDIP_CACHE_NEXT.
+    DrawGdiPlusCacheNext = 0x09,
+    /// TS_ALTSEC_GDIP_CACHE_END.
+    DrawGdiPlusCacheEnd = 0x0A,
+    /// TS_ALTSEC_WINDOW.
+    Window = 0x0B,
+    /// TS_ALTSEC_COMPDESK_FIRST.
+    CompDeskFirst = 0x0C,
+    /// TS_ALTSEC_FRAME_MARKER.
+    FrameMarker = 0x0D,
 }
 
 impl AlternateSecondaryOrderType {
     pub fn from_u8(val: u8) -> DecodeResult<Self> {
         match val {
+            0x00 => Ok(Self::SwitchSurface),
             0x01 => Ok(Self::CreateOffscreenBitmap),
-            0x02 => Ok(Self::SwitchSurface),
+            0x02 => Ok(Self::StreamBitmapFirst),
+            0x03 => Ok(Self::StreamBitmapNext),
             0x04 => Ok(Self::CreateNineGridBitmap),
-            0x06 => Ok(Self::StreamBitmapFirst),
-            0x07 => Ok(Self::StreamBitmapNext),
-            0x08 => Ok(Self::DrawGdiPlusFirst),
-            0x09 => Ok(Self::DrawGdiPlusNext),
-            0x0A => Ok(Self::DrawGdiPlusEnd),
-            0x0B => Ok(Self::DrawGdiPlusCacheFirst),
-            0x0C => Ok(Self::DrawGdiPlusCacheNext),
-            0x0D => Ok(Self::DrawGdiPlusCacheEnd),
-            0x0E => Ok(Self::FrameMarker),
+            0x05 => Ok(Self::DrawGdiPlusFirst),
+            0x06 => Ok(Self::DrawGdiPlusNext),
+            0x07 => Ok(Self::DrawGdiPlusEnd),
+            0x08 => Ok(Self::DrawGdiPlusCacheFirst),
+            0x09 => Ok(Self::DrawGdiPlusCacheNext),
+            0x0A => Ok(Self::DrawGdiPlusCacheEnd),
+            0x0B => Ok(Self::Window),
+            0x0C => Ok(Self::CompDeskFirst),
+            0x0D => Ok(Self::FrameMarker),
             _ => Err(DecodeError::unexpected_value(
                 "AlternateSecondaryOrderType",
                 "orderType",
@@ -551,11 +583,12 @@ mod tests {
     #[test]
     fn secondary_order_type_roundtrip_all() {
         let types: &[(u8, SecondaryOrderType)] = &[
-            (0x00, SecondaryOrderType::CacheBitmapV1),
+            (0x00, SecondaryOrderType::CacheBitmapV1Uncompressed),
             (0x01, SecondaryOrderType::CacheColorTable),
-            (0x02, SecondaryOrderType::CacheBitmapV2Uncompressed),
-            (0x03, SecondaryOrderType::CacheBitmapV2Compressed),
-            (0x04, SecondaryOrderType::CacheGlyph),
+            (0x02, SecondaryOrderType::CacheBitmapV1Compressed),
+            (0x03, SecondaryOrderType::CacheGlyph),
+            (0x04, SecondaryOrderType::CacheBitmapV2Uncompressed),
+            (0x05, SecondaryOrderType::CacheBitmapV2Compressed),
             (0x07, SecondaryOrderType::CacheBrush),
             (0x08, SecondaryOrderType::CacheBitmapV3),
         ];
@@ -569,7 +602,7 @@ mod tests {
     #[test]
     fn secondary_order_type_unknown() {
         assert!(SecondaryOrderType::from_u8(0xFF).is_err());
-        assert!(SecondaryOrderType::from_u8(0x05).is_err());
+        assert!(SecondaryOrderType::from_u8(0x06).is_err()); // gap between CacheBitmapV2Compressed(0x05) and CacheBrush(0x07)
     }
 
     // ── AlternateSecondaryOrderType enum ──
@@ -577,18 +610,20 @@ mod tests {
     #[test]
     fn alt_secondary_order_type_roundtrip_all() {
         let types: &[(u8, AlternateSecondaryOrderType)] = &[
+            (0x00, AlternateSecondaryOrderType::SwitchSurface),
             (0x01, AlternateSecondaryOrderType::CreateOffscreenBitmap),
-            (0x02, AlternateSecondaryOrderType::SwitchSurface),
+            (0x02, AlternateSecondaryOrderType::StreamBitmapFirst),
+            (0x03, AlternateSecondaryOrderType::StreamBitmapNext),
             (0x04, AlternateSecondaryOrderType::CreateNineGridBitmap),
-            (0x06, AlternateSecondaryOrderType::StreamBitmapFirst),
-            (0x07, AlternateSecondaryOrderType::StreamBitmapNext),
-            (0x08, AlternateSecondaryOrderType::DrawGdiPlusFirst),
-            (0x09, AlternateSecondaryOrderType::DrawGdiPlusNext),
-            (0x0A, AlternateSecondaryOrderType::DrawGdiPlusEnd),
-            (0x0B, AlternateSecondaryOrderType::DrawGdiPlusCacheFirst),
-            (0x0C, AlternateSecondaryOrderType::DrawGdiPlusCacheNext),
-            (0x0D, AlternateSecondaryOrderType::DrawGdiPlusCacheEnd),
-            (0x0E, AlternateSecondaryOrderType::FrameMarker),
+            (0x05, AlternateSecondaryOrderType::DrawGdiPlusFirst),
+            (0x06, AlternateSecondaryOrderType::DrawGdiPlusNext),
+            (0x07, AlternateSecondaryOrderType::DrawGdiPlusEnd),
+            (0x08, AlternateSecondaryOrderType::DrawGdiPlusCacheFirst),
+            (0x09, AlternateSecondaryOrderType::DrawGdiPlusCacheNext),
+            (0x0A, AlternateSecondaryOrderType::DrawGdiPlusCacheEnd),
+            (0x0B, AlternateSecondaryOrderType::Window),
+            (0x0C, AlternateSecondaryOrderType::CompDeskFirst),
+            (0x0D, AlternateSecondaryOrderType::FrameMarker),
         ];
         for &(raw, expected) in types {
             let parsed = AlternateSecondaryOrderType::from_u8(raw).unwrap();
@@ -599,7 +634,7 @@ mod tests {
 
     #[test]
     fn alt_secondary_order_type_unknown() {
-        assert!(AlternateSecondaryOrderType::from_u8(0x00).is_err());
+        assert!(AlternateSecondaryOrderType::from_u8(0x0E).is_err()); // 0x0E is past FrameMarker(0x0D)
         assert!(AlternateSecondaryOrderType::from_u8(0xFF).is_err());
     }
 
@@ -607,7 +642,7 @@ mod tests {
 
     #[test]
     fn bounds_rect_roundtrip() {
-        let bounds = BoundsRect { left: -10, top: 20, right: 300, bottom: -400 };
+        let bounds = BoundsRect { left: 10, top: 20, right: 300, bottom: 400 };
         let buf = roundtrip_encode(&bounds);
         assert_eq!(buf.len(), BOUNDS_RECT_SIZE);
 
@@ -695,7 +730,7 @@ mod tests {
         // Minimum viable: 0 data bytes.  orderLength wraps due to -7 adjustment
         // but the roundtrip must still work.
         let order = SecondaryOrder {
-            order_type: SecondaryOrderType::CacheBitmapV1,
+            order_type: SecondaryOrderType::CacheBitmapV1Uncompressed,
             extra_flags: 0,
             data: vec![0xAA; 4],
         };
@@ -738,12 +773,12 @@ mod tests {
 
     #[test]
     fn alt_secondary_control_flags_encoding() {
-        // FrameMarker (0x0E) should be encoded in bits 2-7: 0x0E << 2 = 0x38
+        // FrameMarker (0x0D) should be encoded in bits 2-7: 0x0D << 2 = 0x34
         let order = AlternateSecondaryOrder {
             order_type: AlternateSecondaryOrderType::FrameMarker,
             data: vec![],
         };
         let buf = roundtrip_encode(&order);
-        assert_eq!(buf[0], 0x0E << 2);
+        assert_eq!(buf[0], 0x0D << 2);
     }
 }
