@@ -791,4 +791,79 @@ mod tests {
     fn control_action_unknown() {
         assert!(ControlAction::from_u16(0xFFFF).is_err());
     }
+
+    // ── Derive macro test ──
+
+    #[derive(Debug, Clone, PartialEq, Eq, crate::DeriveEncode, crate::DeriveDecode)]
+    struct DeriveTestPdu {
+        #[pdu(u16_le)]
+        field_a: u16,
+        #[pdu(u32_le)]
+        field_b: u32,
+        #[pdu(u8)]
+        field_c: u8,
+    }
+
+    #[test]
+    fn derive_encode_decode_roundtrip() {
+        let pdu = DeriveTestPdu { field_a: 0x1234, field_b: 0xDEADBEEF, field_c: 0x42 };
+        assert_eq!(pdu.size(), 7); // 2 + 4 + 1
+
+        let mut buf = [0u8; 7];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+
+        // Check wire format
+        assert_eq!(buf[0..2], [0x34, 0x12]); // u16 LE
+        assert_eq!(buf[2..6], [0xEF, 0xBE, 0xAD, 0xDE]); // u32 LE
+        assert_eq!(buf[6], 0x42); // u8
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DeriveTestPdu::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, crate::DeriveEncode, crate::DeriveDecode)]
+    struct DeriveTestBytes {
+        #[pdu(u8)]
+        tag: u8,
+        #[pdu(bytes = 4)]
+        data: [u8; 4],
+    }
+
+    #[test]
+    fn derive_bytes_roundtrip() {
+        let pdu = DeriveTestBytes { tag: 0xFF, data: [1, 2, 3, 4] };
+        assert_eq!(pdu.size(), 5);
+
+        let mut buf = [0u8; 5];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DeriveTestBytes::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, crate::DeriveEncode, crate::DeriveDecode)]
+    struct DeriveTestRest {
+        #[pdu(u16_le)]
+        header: u16,
+        #[pdu(rest)]
+        payload: Vec<u8>,
+    }
+
+    #[test]
+    fn derive_rest_roundtrip() {
+        let pdu = DeriveTestRest { header: 0xABCD, payload: vec![1, 2, 3, 4, 5] };
+        assert_eq!(pdu.size(), 7); // 2 + 5
+
+        let mut buf = vec![0u8; 7];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = DeriveTestRest::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
 }

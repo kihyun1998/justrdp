@@ -233,7 +233,7 @@ pub trait PduHint: Send + Sync {
 - [x] `WriteCursor<'a>` -- 바이트 쓰기 커서
 - [x] `WriteBuf` -- 동적 크기 쓰기 버퍼
 - [x] `Encode` trait
-- [ ] `Encode` derive 매크로 (수동 구현으로 충분한 동안 보류)
+- [x] `Encode` / `Decode` derive 매크로 (`justrdp-derive` 크레이트, `#[pdu(...)]` 속성)
 - [x] `Decode<'de>` trait + `DecodeOwned` trait
 - [x] `EncodeError`, `DecodeError` 타입
 - [x] `IntoOwned` trait (borrowed → owned 변환)

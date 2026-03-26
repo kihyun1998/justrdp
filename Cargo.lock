@@ -184,6 +184,15 @@ name = "justrdp-core"
 version = "0.1.0"
 
 [[package]]
+name = "justrdp-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "justrdp-integration-tests"
 version = "0.0.0"
 dependencies = [
@@ -198,6 +207,7 @@ name = "justrdp-pdu"
 version = "0.1.0"
 dependencies = [
  "justrdp-core",
+ "justrdp-derive",
 ]
 
 [[package]]
