@@ -300,7 +300,13 @@ pub fn compute_mac(mac_key: &[u8; 16], data: &[u8]) -> [u8; 8] {
 
 /// Compute salted MAC (SEC_SECURE_CHECKSUM) -- MS-RDPBCGR 5.3.6.1.2.
 ///
-/// Same as standard MAC but includes the encryption use count (sequence number).
+/// ```text
+/// SHAComponent = SHA1(MACKeyN + Pad1 + EncryptionCount(LE32) + Data)
+/// MACSignature = First64Bits(MD5(MACKeyN + Pad2 + SHAComponent))
+/// ```
+///
+/// The key difference from the standard MAC is that EncryptionCount
+/// replaces DataLength in the SHA1 input.
 pub fn compute_salted_mac(
     mac_key: &[u8; 16],
     data: &[u8],
@@ -309,15 +315,13 @@ pub fn compute_salted_mac(
     let pad1 = [0x36u8; 40];
     let pad2 = [0x5Cu8; 48];
 
-    let data_len = (data.len() as u32).to_le_bytes();
     let seq_bytes = seq_number.to_le_bytes();
 
     let mut sha1 = Sha1::new();
     sha1.update(mac_key);
     sha1.update(&pad1);
-    sha1.update(&data_len);
+    sha1.update(&seq_bytes); // EncryptionCount replaces DataLength
     sha1.update(data);
-    sha1.update(&seq_bytes);
     let sha_result = sha1.finalize();
 
     let mut md5 = Md5::new();
@@ -491,49 +495,81 @@ impl RdpSecurityContext {
 ///
 /// Derive FIPS session keys per MS-RDPBCGR 5.3.5.2.
 ///
-/// ```text
-/// MACKey:
-///   S = SHA1(ClientRandom + ServerRandom)
-///   MACKey128 = First128Bits(S)
-///
-/// EncryptKey (client→server, 168 bits = 24 bytes):
-///   S1 = SHA1(ClientRandom[0..16] + ServerRandom[0..16])
-///   S2 = SHA1(ClientRandom[16..32] + ServerRandom[16..32])
-///   EncryptKey168 = S1[0..20] + S2[0..4]
-///
-/// DecryptKey (server→client, 168 bits = 24 bytes):
-///   S3 = SHA1(ServerRandom[0..16] + ClientRandom[0..16])
-///   S4 = SHA1(ServerRandom[16..32] + ClientRandom[16..32])
-///   DecryptKey168 = S3[0..20] + S4[0..4]
-/// ```
+/// Steps:
+/// 1. SHA-1 of split halves → 160-bit temp keys
+/// 2. Expand 160→168 bits by appending first byte
+/// 3. Expand 168→192 bits with DES parity insertion
+/// 4. MACKey = SHA1(DecryptKeyT + EncryptKeyT)
 pub fn derive_fips_session_keys(
     client_random: &[u8; 32],
     server_random: &[u8; 32],
 ) -> FipsSessionKeys {
-    // MAC key: SHA1(ClientRandom + ServerRandom), first 16 bytes
-    let mac_hash = crypto::sha1(&[client_random.as_slice(), server_random.as_slice()].concat());
+    // Step 1: Generate 160-bit temp keys
+    // Client encrypt key (= server decrypt key): SHA1(Last128Bits(CR) + Last128Bits(SR))
+    let encrypt_key_t = crypto::sha1(&[&client_random[16..], &server_random[16..]].concat());
+    // Client decrypt key (= server encrypt key): SHA1(First128Bits(CR) + First128Bits(SR))
+    let decrypt_key_t = crypto::sha1(&[&client_random[..16], &server_random[..16]].concat());
+
+    // Step 2: Expand 160→168 bits (append first byte)
+    let mut encrypt_168 = [0u8; 21];
+    encrypt_168[..20].copy_from_slice(&encrypt_key_t);
+    encrypt_168[20] = encrypt_key_t[0];
+
+    let mut decrypt_168 = [0u8; 21];
+    decrypt_168[..20].copy_from_slice(&decrypt_key_t);
+    decrypt_168[20] = decrypt_key_t[0];
+
+    // Step 3: Expand 168→192 bits with DES odd-parity (3 × 8-byte DES keys)
+    let encrypt_key = des_parity_expand_168(&encrypt_168);
+    let decrypt_key = des_parity_expand_168(&decrypt_168);
+
+    // Step 4: MAC key = SHA1(DecryptKeyT + EncryptKeyT), first 16 bytes
+    let mac_hash = crypto::sha1(&[decrypt_key_t.as_slice(), encrypt_key_t.as_slice()].concat());
     let mut mac_key = [0u8; 16];
     mac_key.copy_from_slice(&mac_hash[..16]);
-
-    // Encrypt key (client→server): 24 bytes from two SHA1 hashes
-    let s1 = crypto::sha1(&[&client_random[..16], &server_random[..16]].concat());
-    let s2 = crypto::sha1(&[&client_random[16..], &server_random[16..]].concat());
-    let mut encrypt_key = [0u8; 24];
-    encrypt_key[..20].copy_from_slice(&s1);
-    encrypt_key[20..24].copy_from_slice(&s2[..4]);
-
-    // Decrypt key (server→client): 24 bytes from two SHA1 hashes (reversed order)
-    let s3 = crypto::sha1(&[&server_random[..16], &client_random[..16]].concat());
-    let s4 = crypto::sha1(&[&server_random[16..], &client_random[16..]].concat());
-    let mut decrypt_key = [0u8; 24];
-    decrypt_key[..20].copy_from_slice(&s3);
-    decrypt_key[20..24].copy_from_slice(&s4[..4]);
 
     FipsSessionKeys {
         mac_key,
         encrypt_key,
         decrypt_key,
     }
+}
+
+/// Expand a 168-bit (21-byte) key to 192 bits (24 bytes) with DES odd-parity.
+///
+/// MS-RDPBCGR 5.3.5.2: Insert a zero-bit after every 7 bits, then apply
+/// DES odd-parity to each byte's LSB.
+fn des_parity_expand_168(key_168: &[u8; 21]) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    // Process 168 bits → 24 bytes (each 7-bit group → 1 byte with parity)
+    // Extract 7 bits at a time from the bit stream and set odd parity
+    for i in 0..24 {
+        let bit_offset = i * 7;
+        let byte_idx = bit_offset / 8;
+        let bit_idx = bit_offset % 8;
+
+        // Extract 7 bits spanning byte boundary
+        let val = if bit_idx <= 1 {
+            // Fits in one byte
+            (key_168[byte_idx] >> (1 - bit_idx)) & 0x7F
+        } else {
+            // Spans two bytes
+            let hi = (key_168[byte_idx] as u16) << 8;
+            let lo = if byte_idx + 1 < key_168.len() {
+                key_168[byte_idx + 1] as u16
+            } else {
+                0
+            };
+            let combined = hi | lo;
+            ((combined >> (9 - bit_idx)) & 0x7F) as u8
+        };
+
+        // Place 7 bits in high bits, set LSB for odd parity
+        let byte_val = val << 1;
+        let ones = byte_val.count_ones();
+        out[i] = if ones % 2 == 0 { byte_val | 1 } else { byte_val };
+    }
+    out
 }
 
 /// FIPS session keys (3DES + SHA-1 HMAC).
@@ -596,8 +632,8 @@ impl FipsSecurityContext {
         // Compute HMAC over plaintext
         let mac = compute_fips_mac(&self.keys.mac_key, plaintext);
 
-        // PKCS#5 padding: pad to 8-byte boundary
-        let pad_len = (8 - (plaintext.len() % 8)) % 8;
+        // PKCS#5 padding: always add 1-8 bytes (no outer % 8)
+        let pad_len = 8 - (plaintext.len() % 8);
         let total_len = plaintext.len() + pad_len;
         let mut padded = Vec::with_capacity(total_len);
         padded.extend_from_slice(plaintext);
@@ -776,8 +812,11 @@ mod tests {
 
     #[test]
     fn fips_key_derivation() {
-        let cr = [0x11u8; 32];
-        let sr = [0x22u8; 32];
+        // Use randoms with distinct first/last halves so encrypt ≠ decrypt
+        let mut cr = [0u8; 32];
+        for i in 0..32 { cr[i] = i as u8; }
+        let mut sr = [0u8; 32];
+        for i in 0..32 { sr[i] = (0x80 + i) as u8; }
 
         let fips = derive_fips_session_keys(&cr, &sr);
         assert_eq!(fips.mac_key.len(), 16);
@@ -787,6 +826,78 @@ mod tests {
         // Deterministic
         let fips2 = derive_fips_session_keys(&cr, &sr);
         assert_eq!(fips.mac_key, fips2.mac_key);
+        assert_eq!(fips.encrypt_key, fips2.encrypt_key);
+        assert_eq!(fips.decrypt_key, fips2.decrypt_key);
+
+        // Encrypt and decrypt keys should differ (different halves of randoms)
+        assert_ne!(fips.encrypt_key, fips.decrypt_key);
+
+        // All DES key bytes should have odd parity
+        for &byte in fips.encrypt_key.iter().chain(fips.decrypt_key.iter()) {
+            assert_eq!(byte.count_ones() % 2, 1,
+                "DES key byte 0x{:02X} does not have odd parity", byte);
+        }
+    }
+
+    #[test]
+    fn des_parity_expand_produces_odd_parity() {
+        // Every byte in a DES parity-expanded key must have odd parity
+        let key_168 = [0xD1, 0x5E, 0xC4, 0x7E, 0xDA, 0x12, 0x34,
+                       0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11,
+                       0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let expanded = des_parity_expand_168(&key_168);
+        assert_eq!(expanded.len(), 24);
+
+        // Every byte must have odd parity (odd number of 1-bits)
+        for (i, &byte) in expanded.iter().enumerate() {
+            assert_eq!(byte.count_ones() % 2, 1,
+                "byte {} (0x{:02X}) does not have odd parity", i, byte);
+        }
+    }
+
+    #[test]
+    fn fips_encrypt_block_aligned_input() {
+        // Test PKCS#5 padding when input is exactly block-aligned (8 bytes)
+        // Should add a full 8-byte padding block
+        let cr = [0xAAu8; 32];
+        let sr = [0xBBu8; 32];
+        let keys = derive_fips_session_keys(&cr, &sr);
+
+        let enc_keys = keys.clone();
+        let dec_keys = FipsSessionKeys {
+            mac_key: keys.mac_key,
+            encrypt_key: keys.decrypt_key,
+            decrypt_key: keys.encrypt_key,
+        };
+
+        let mut enc_ctx = FipsSecurityContext::new(enc_keys);
+        let mut dec_ctx = FipsSecurityContext::new(dec_keys);
+
+        // 8 bytes = block-aligned → PKCS#5 adds 8 bytes of padding (value 0x08)
+        let original = b"12345678";
+        let (ciphertext, mac, pad_len) = enc_ctx.encrypt(original);
+        assert_eq!(pad_len, 8, "block-aligned input should get 8 bytes of PKCS#5 padding");
+        assert_eq!(ciphertext.len(), 16, "8 bytes + 8 padding = 16 bytes ciphertext");
+
+        let (plaintext, valid) = dec_ctx.decrypt(&ciphertext, &mac, pad_len);
+        assert!(valid);
+        assert_eq!(&plaintext[..], &original[..]);
+    }
+
+    #[test]
+    fn salted_mac_uses_seq_not_datalen() {
+        // Verify salted MAC changes with seq number, not just data length
+        let mac_key = [0x42u8; 16];
+        let data = b"test data";
+
+        let mac_seq0 = compute_salted_mac(&mac_key, data, 0);
+        let mac_seq1 = compute_salted_mac(&mac_key, data, 1);
+        let mac_std = compute_mac(&mac_key, data);
+
+        // Salted MACs should differ by seq
+        assert_ne!(mac_seq0, mac_seq1);
+        // Salted MAC should differ from standard MAC (different SHA1 input)
+        assert_ne!(mac_seq0, mac_std);
     }
 
     #[test]

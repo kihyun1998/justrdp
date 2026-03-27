@@ -645,10 +645,11 @@ impl ClientConnector {
                 Ok((flags, data))
             }
             SecurityMode::Fips(ctx) if flags & SEC_ENCRYPT != 0 => {
+                // MS-RDPBCGR TS_SECURITY_HEADER2: padLen(1) then dataSignature(8)
+                let pad_len = inner.read_u8("SecurityHeader::padLen")?;
                 let mac_bytes = inner.read_slice(8, "SecurityHeader::mac")?;
                 let mut mac = [0u8; 8];
                 mac.copy_from_slice(mac_bytes);
-                let pad_len = inner.read_u8("SecurityHeader::padLen")?;
                 let remaining = inner.remaining();
                 let encrypted = inner.read_slice(remaining, "SecurityHeader::encryptedData")?;
                 let (data, _valid) = ctx.decrypt(encrypted, &mac, pad_len);
