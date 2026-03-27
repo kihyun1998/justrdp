@@ -59,6 +59,7 @@ pub const AP_OPT_MUTUAL_REQUIRED: u32 = 0x20000000;
 
 /// Key usage numbers (RFC 3961 section 7.5.1).
 pub const KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP: i32 = 1;
+pub const KEY_USAGE_AS_REP_ENC_PART: i32 = 3;
 pub const KEY_USAGE_TGS_REQ_AUTHENTICATOR: i32 = 7;
 pub const KEY_USAGE_AP_REQ_AUTHENTICATOR: i32 = 11;
 pub const KEY_USAGE_AP_REP_ENC_PART: i32 = 12;

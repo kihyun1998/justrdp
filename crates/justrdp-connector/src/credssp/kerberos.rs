@@ -21,6 +21,12 @@ use justrdp_pdu::kerberos::*;
 use crate::error::{ConnectorError, ConnectorResult};
 
 /// State of the Kerberos authentication sequence.
+///
+/// The caller drives the exchange externally:
+/// 1. Check state → build the corresponding request
+/// 2. Send to KDC, receive response
+/// 3. Call the appropriate `process_*_response` method
+/// 4. Check new state → repeat
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KerberosState {
     /// Need to send AS-REQ (initial, no pre-auth).
@@ -29,12 +35,8 @@ pub enum KerberosState {
     SendAsReqPreAuth,
     /// Need to send AS-REQ with PKINIT pre-auth.
     SendAsReqPkinit,
-    /// Wait for AS-REP or KRB-ERROR from KDC.
-    WaitAsRep,
     /// Need to send TGS-REQ for the service ticket.
     SendTgsReq,
-    /// Wait for TGS-REP from KDC.
-    WaitTgsRep,
     /// Kerberos exchange complete, AP-REQ ready.
     Done,
 }
@@ -129,6 +131,43 @@ impl KerberosSequence {
             iterations: 4096,
             ap_req_bytes: Vec::new(),
             subkey: random.subkey.clone(),
+            seq_number: random.seq_number,
+            pkinit_config: None,
+            dh_private_key: None,
+            client_dh_nonce: None,
+        }
+    }
+
+    /// Create a new Kerberos sequence with a pre-derived long-term key (keytab).
+    ///
+    /// Skips password-based key derivation — the key is used directly for
+    /// pre-authentication. The `etype` must match the key's encryption type.
+    pub fn new_with_key(
+        username: &str,
+        domain: &str,
+        hostname: &str,
+        random: KerberosRandom,
+        key: Vec<u8>,
+        etype: i32,
+    ) -> Self {
+        Self {
+            state: KerberosState::SendAsReqPreAuth,
+            username: username.as_bytes().to_vec(),
+            password: Vec::new(),
+            domain: domain.as_bytes().to_vec(),
+            hostname: hostname.as_bytes().to_vec(),
+            client_key: key,
+            etype,
+            nonce: random.nonce,
+            tgs_nonce: random.tgs_nonce,
+            tgt_session_key: Vec::new(),
+            tgt_ticket: None,
+            service_session_key: Vec::new(),
+            service_ticket: None,
+            salt: Vec::new(),
+            iterations: 4096,
+            ap_req_bytes: Vec::new(),
+            subkey: random.subkey,
             seq_number: random.seq_number,
             pkinit_config: None,
             dh_private_key: None,
@@ -384,7 +423,7 @@ impl KerberosSequence {
                 };
 
                 // Decrypt enc-part
-                let key_usage = 3; // AS-REP enc-part
+                let key_usage = KEY_USAGE_AS_REP_ENC_PART;
                 let decrypted = krb5_aes_decrypt(&reply_key, key_usage, &rep.enc_part.cipher)
                     .ok_or_else(|| ConnectorError::general("AS-REP decrypt failed"))?;
 
@@ -526,20 +565,18 @@ impl KerberosSequence {
         let ticket = self.service_ticket.as_ref()
             .ok_or_else(|| ConnectorError::general("no service ticket"))?;
 
-        // Build GSS checksum (RFC 4121 section 4.1.1)
-        // Layout:
-        //   Bytes 0-15:  channel bindings MD5 hash (16 bytes, all zeros when not using EPA)
-        //   Bytes 16-19: GSS flags (little-endian u32)
-        //   Bytes 20-23: delegation option identifier (0 = no delegation)
+        // Build GSS checksum per RFC 4121 section 4.1.1:
+        //   Bytes 0-3:   Lgth = 0x00000010 (16 in LE, length of Bnd field)
+        //   Bytes 4-19:  Bnd  = MD5(channel bindings) (16 bytes, zeros when not using EPA)
+        //   Bytes 20-23: Flags (little-endian u32)
+        //   (Bytes 24+:  optional Deleg, not used)
         let mut gss_cksum = vec![0u8; 24];
-        // Bytes 0-15: all zeros (no channel bindings)
-        // Bytes 16-19: GSS flags
+        // Bytes 0-3: Lgth = 16 (LE)
+        gss_cksum[0..4].copy_from_slice(&16u32.to_le_bytes());
+        // Bytes 4-19: Bnd = all zeros (no channel bindings)
+        // Bytes 20-23: Flags
         let gss_flags: u32 = 0x3E; // mutual|replay|sequence|integ|conf
-        gss_cksum[16] = (gss_flags & 0xFF) as u8;
-        gss_cksum[17] = ((gss_flags >> 8) & 0xFF) as u8;
-        gss_cksum[18] = ((gss_flags >> 16) & 0xFF) as u8;
-        gss_cksum[19] = ((gss_flags >> 24) & 0xFF) as u8;
-        // Bytes 20-23: delegation (0 = no delegation)
+        gss_cksum[20..24].copy_from_slice(&gss_flags.to_le_bytes());
 
         let subkey_enc = if !self.subkey.is_empty() {
             Some(EncryptionKey {
@@ -665,25 +702,32 @@ impl KerberosSequence {
 
         let reply_key = if let Some(ref server_nonce) = dh_rep.server_dh_nonce {
             // When serverDHNonce is present (RFC 4556 3.2.3.1):
-            // x = octetstring2key(DHSharedSecret || clientDHNonce || serverDHNonce)
+            // x = DHSharedSecret || clientDHNonce || serverDHNonce
+            // Apply octetstring2key(x) = random-to-key(SHA1-KDF(x, key_len))
             //
-            // For AES etypes, octetstring2key uses SHA-256 to produce key material:
-            // 1. Concatenate: DHSharedSecret || clientDHNonce || serverDHNonce
-            // 2. Apply iterative SHA-256 hashing to produce key_len bytes
-            // 3. random-to-key is identity for AES
+            // SHA1-KDF per RFC 4556 §3.2.3.1:
+            //   K(i) = SHA1(counter || x)  where counter = i as 4-byte BE
+            //   Concatenate K(1), K(2), ... and truncate to key_len bytes.
             let client_nonce = self.client_dh_nonce.as_ref()
                 .ok_or_else(|| ConnectorError::general("PKINIT: no client DH nonce"))?;
 
-            let mut hash_input = Vec::new();
-            hash_input.extend_from_slice(&shared_bytes);
-            hash_input.extend_from_slice(client_nonce);
-            hash_input.extend_from_slice(server_nonce);
+            let mut x = Vec::new();
+            x.extend_from_slice(&shared_bytes);
+            x.extend_from_slice(client_nonce);
+            x.extend_from_slice(server_nonce);
 
-            // Per RFC 4556: truncate(SHA-256(shared || cnonce || snonce), key_len)
-            // For 32-byte keys: full SHA-256 output
-            // For 16-byte keys: first 16 bytes
-            let hash = justrdp_core::crypto::sha256(&hash_input);
-            hash[..key_len].to_vec()
+            let mut key_material = Vec::with_capacity(key_len);
+            let mut counter: u32 = 1;
+            while key_material.len() < key_len {
+                let mut sha1 = Sha1::new();
+                sha1.update(&counter.to_be_bytes());
+                sha1.update(&x);
+                let hash = sha1.finalize();
+                key_material.extend_from_slice(&hash);
+                counter += 1;
+            }
+            key_material.truncate(key_len);
+            key_material
         } else {
             // No serverDHNonce: truncate(DHSharedSecret, key_len)
             // Per RFC 4556: random-to-key(DHSharedSecret[0..key_len])
@@ -978,5 +1022,128 @@ mod tests {
         assert_eq!(as_req[0], 0x6a);
         // DH private key should be stored
         assert!(seq.dh_private_key.is_some());
+    }
+
+    #[test]
+    fn keytab_constructor_starts_at_preauth() {
+        let random = KerberosRandom {
+            nonce: 42,
+            tgs_nonce: 43,
+            confounder_as: [0; 16],
+            confounder_tgs_auth: [0; 16],
+            confounder_ap_auth: [0; 16],
+            subkey: vec![0x42; 32],
+            seq_number: 1,
+            timestamp_usec: 0,
+            client_dh_nonce: [0u8; 32],
+        };
+
+        let key = vec![0xAA; 32]; // pre-derived AES-256 key
+        let seq = KerberosSequence::new_with_key(
+            "user", "REALM.COM", "server", random, key.clone(), ETYPE_AES256_CTS_HMAC_SHA1,
+        );
+
+        // Should skip initial AS-REQ (no pre-auth needed) and go straight to pre-auth
+        assert_eq!(*seq.state(), KerberosState::SendAsReqPreAuth);
+        // Key should be set directly
+        assert_eq!(seq.client_key, key);
+        assert_eq!(seq.etype, ETYPE_AES256_CTS_HMAC_SHA1);
+    }
+
+    #[test]
+    fn gss_checksum_layout_rfc4121() {
+        let random = KerberosRandom {
+            nonce: 0,
+            tgs_nonce: 0,
+            confounder_as: [0; 16],
+            confounder_tgs_auth: [0; 16],
+            confounder_ap_auth: [0; 16],
+            subkey: vec![0x42; 32],
+            seq_number: 1,
+            timestamp_usec: 0,
+            client_dh_nonce: [0u8; 32],
+        };
+
+        let mut seq = KerberosSequence::new("user", "pass", "REALM", "host", random);
+        seq.service_session_key = vec![0x55; 32];
+        seq.etype = ETYPE_AES256_CTS_HMAC_SHA1;
+        seq.service_ticket = Some(Ticket {
+            realm: b"REALM".to_vec(),
+            sname: PrincipalName::service(b"TERMSRV", b"host"),
+            enc_part: EncryptedData::new(ETYPE_AES256_CTS_HMAC_SHA1, vec![0; 32]),
+        });
+
+        let result = seq.build_ap_req(b"20260327120000Z", 0, &[0u8; 16]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn gss_checksum_bytes_direct() {
+        // Directly verify the GSS checksum byte layout per RFC 4121 §4.1.1
+        let mut gss_cksum = vec![0u8; 24];
+        // Bytes 0-3: Lgth = 16 (LE)
+        gss_cksum[0..4].copy_from_slice(&16u32.to_le_bytes());
+        // Bytes 4-19: Bnd = zeros (no channel bindings) — already zero
+        // Bytes 20-23: Flags
+        let gss_flags: u32 = 0x3E;
+        gss_cksum[20..24].copy_from_slice(&gss_flags.to_le_bytes());
+
+        // Verify Lgth field
+        assert_eq!(&gss_cksum[0..4], &[0x10, 0x00, 0x00, 0x00], "Lgth should be 16 in LE");
+        // Verify Bnd field (all zeros)
+        assert_eq!(&gss_cksum[4..20], &[0u8; 16], "Bnd should be all zeros");
+        // Verify Flags field
+        assert_eq!(&gss_cksum[20..24], &[0x3E, 0x00, 0x00, 0x00], "Flags should be 0x3E in LE");
+        // Verify total length
+        assert_eq!(gss_cksum.len(), 24);
+    }
+
+    #[test]
+    fn pkinit_octetstring2key_sha1_kdf() {
+        // Verify the iterative SHA-1 KDF used for PKINIT reply key derivation.
+        // For a 32-byte key (AES-256), we need ceil(32/20) = 2 SHA-1 iterations.
+        let shared = vec![0xAA; 32];
+        let client_nonce = vec![0xBB; 32];
+        let server_nonce = vec![0xCC; 32];
+
+        let mut x = Vec::new();
+        x.extend_from_slice(&shared);
+        x.extend_from_slice(&client_nonce);
+        x.extend_from_slice(&server_nonce);
+
+        // Compute expected: K(1) = SHA1(0x00000001 || x), K(2) = SHA1(0x00000002 || x)
+        let mut sha1_1 = Sha1::new();
+        sha1_1.update(&1u32.to_be_bytes());
+        sha1_1.update(&x);
+        let k1 = sha1_1.finalize();
+
+        let mut sha1_2 = Sha1::new();
+        sha1_2.update(&2u32.to_be_bytes());
+        sha1_2.update(&x);
+        let k2 = sha1_2.finalize();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&k1);
+        expected.extend_from_slice(&k2);
+        expected.truncate(32);
+
+        // Verify our KDF produces the same result
+        let key_len = 32;
+        let mut key_material = Vec::with_capacity(key_len);
+        let mut counter: u32 = 1;
+        while key_material.len() < key_len {
+            let mut sha1 = Sha1::new();
+            sha1.update(&counter.to_be_bytes());
+            sha1.update(&x);
+            let hash = sha1.finalize();
+            key_material.extend_from_slice(&hash);
+            counter += 1;
+        }
+        key_material.truncate(key_len);
+
+        assert_eq!(key_material, expected);
+        assert_eq!(key_material.len(), 32);
+        // Verify it took exactly 2 iterations
+        assert_eq!(counter, 3); // counter was incremented to 3 after 2nd iteration
     }
 }

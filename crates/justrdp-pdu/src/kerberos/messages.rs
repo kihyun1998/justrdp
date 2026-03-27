@@ -637,21 +637,10 @@ impl EncKdcRepPart {
         let key_data = t0.read_remaining();
         let key = EncryptionKey::decode(key_data)?;
 
-        // Skip [1] last-req, [2] nonce is at [7]
-        // We need to skip optional fields until we find [7]
-        // Use optional reading
-        let _t1 = seq_reader.read_optional_context_tag(1)?; // last-req
-        let _t2 = seq_reader.read_optional_context_tag(2)?; // nonce... wait
-
-        // Actually the field numbers are:
-        // [0] key, [1] last-req, [2] nonce, [3] key-expiration, [4] flags,
-        // [5] authtime, [6] starttime, [7] endtime, [8] renew-till,
-        // [9] srealm, [10] sname, [11] caddr
-
-        // Wait, RFC 4120 says EncKDCRepPart has:
-        // key [0], last-req [1], nonce [2], key-expiration [3] OPTIONAL,
-        // flags [4], authtime [5], starttime [6] OPTIONAL, endtime [7],
-        // renew-till [8] OPTIONAL, srealm [9], sname [10], caddr [11] OPTIONAL
+        // RFC 4120: EncKDCRepPart fields:
+        // [0] key, [1] last-req, [2] nonce, [3] key-expiration OPTIONAL,
+        // [4] flags, [5] authtime, [6] starttime OPTIONAL, [7] endtime,
+        // [8] renew-till OPTIONAL, [9] srealm, [10] sname, [11] caddr OPTIONAL
 
         // [1] last-req (skip)
         let _t1 = seq_reader.read_optional_context_tag(1)?;
