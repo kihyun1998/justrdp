@@ -33,6 +33,14 @@ pub enum ClientConnectorState {
     /// CredSSP early user authorization result (HYBRID_EX only).
     CredsspEarlyUserAuth,
 
+    // ── Phase 3a: Azure AD Authentication (RDSAAD) ──
+    /// Wait for server nonce JSON PDU.
+    AadWaitServerNonce,
+    /// Send authentication request with RDP Assertion (JWS).
+    AadSendAuthRequest,
+    /// Wait for authentication result from server.
+    AadWaitAuthResult,
+
     // ── Phase 3b: RDSTLS (Remote Credential Guard) ──
     /// Send RDSTLS Capabilities to server.
     RdstlsSendCapabilities,
@@ -124,6 +132,9 @@ impl ClientConnectorState {
             Self::CredsspPubKeyAuth => "CredsspPubKeyAuth",
             Self::CredsspCredentials => "CredsspCredentials",
             Self::CredsspEarlyUserAuth => "CredsspEarlyUserAuth",
+            Self::AadWaitServerNonce => "AadWaitServerNonce",
+            Self::AadSendAuthRequest => "AadSendAuthRequest",
+            Self::AadWaitAuthResult => "AadWaitAuthResult",
             Self::RdstlsSendCapabilities => "RdstlsSendCapabilities",
             Self::RdstlsWaitCapabilities => "RdstlsWaitCapabilities",
             Self::RdstlsSendAuthRequest => "RdstlsSendAuthRequest",
@@ -164,6 +175,7 @@ impl ClientConnectorState {
                 | Self::CredsspPubKeyAuth
                 | Self::CredsspCredentials
                 | Self::CredsspEarlyUserAuth
+                | Self::AadSendAuthRequest
                 | Self::RdstlsSendCapabilities
                 | Self::RdstlsSendAuthRequest
                 | Self::BasicSettingsExchangeSendInitial

@@ -12,6 +12,8 @@
 extern crate alloc;
 
 pub mod aes;
+#[cfg(feature = "alloc")]
+pub mod base64url;
 pub mod bignum;
 pub mod crypto;
 #[cfg(feature = "alloc")]

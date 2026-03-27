@@ -171,6 +171,34 @@ pub enum AuthMode {
     /// Restricted Admin: no credentials are sent to the server.
     /// The session uses the server's machine account for network resources.
     RestrictedAdmin,
+    /// Azure AD authentication (PROTOCOL_RDSAAD).
+    /// Requires pre-acquired OAuth2 access token and AAD nonce.
+    AzureAd,
+}
+
+/// Azure AD authentication configuration.
+///
+/// The caller is responsible for the OAuth2 token acquisition (HTTP calls)
+/// before constructing this config. The connector uses these values to
+/// build the RDP Assertion (JWS) during the RDSAAD handshake.
+#[derive(Debug, Clone)]
+pub struct AadConfig {
+    /// Pre-acquired OAuth2 RDP access token (PoP token from Azure AD).
+    pub access_token: String,
+    /// Resource URI / scope used for token acquisition.
+    /// E.g., `ms-device-service://termsrv.wvd.microsoft.com/name/<host>/user_impersonation`
+    pub resource_uri: String,
+    /// AAD nonce from `POST /common/oauth2/token` with `grant_type=srv_challenge`.
+    pub aad_nonce: String,
+    /// RSA-2048 PoP private key for signing the RDP Assertion.
+    pub pop_key: justrdp_core::rsa::RsaPrivateKey,
+    /// RSA modulus (big-endian bytes) for JWK representation.
+    pub pop_key_n: Vec<u8>,
+    /// RSA public exponent (big-endian bytes) for JWK representation.
+    pub pop_key_e: Vec<u8>,
+    /// Unix timestamp (seconds since epoch) for the assertion.
+    /// Caller must provide since no_std has no clock.
+    pub timestamp: u64,
 }
 
 /// RDP connection configuration.
@@ -218,6 +246,9 @@ pub struct Config {
     /// Client random for Standard RDP Security key exchange (32 bytes).
     /// Must be cryptographically random. If None, Standard RDP Security is not available.
     pub client_random: Option<[u8; 32]>,
+    /// Azure AD authentication configuration.
+    /// Must be provided when auth_mode is AzureAd.
+    pub aad_config: Option<AadConfig>,
 }
 
 impl Config {
@@ -248,6 +279,7 @@ impl Config {
                 kerberos_token: None,
                 device_kerberos_token: None,
                 client_random: None,
+                aad_config: None,
             },
         }
     }
@@ -360,6 +392,17 @@ impl ConfigBuilder {
     /// in the authentication for conditional access evaluation.
     pub fn device_kerberos_token(mut self, token: Vec<u8>) -> Self {
         self.config.device_kerberos_token = Some(token);
+        self
+    }
+
+    /// Enable Azure AD authentication (PROTOCOL_RDSAAD).
+    ///
+    /// The caller must pre-acquire the OAuth2 access token, AAD nonce,
+    /// and generate the RSA-2048 PoP key pair before calling this method.
+    pub fn azure_ad(mut self, config: AadConfig) -> Self {
+        self.config.auth_mode = AuthMode::AzureAd;
+        self.config.security_protocol = SecurityProtocol::SSL.union(SecurityProtocol::AAD);
+        self.config.aad_config = Some(config);
         self
     }
 

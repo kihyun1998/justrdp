@@ -10,6 +10,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+mod aad;
 mod config;
 mod connector;
 pub mod credssp;
@@ -20,7 +21,7 @@ mod sequence;
 mod state;
 
 pub use config::{
-    AuthMode, BitmapCodecConfig, ColorDepth, CompressionConfig, Config, ConfigBuilder,
+    AadConfig, AuthMode, BitmapCodecConfig, ColorDepth, CompressionConfig, Config, ConfigBuilder,
     Credentials, DesktopSize, KeyboardType, StaticChannelSet,
 };
 pub use connector::ClientConnector;

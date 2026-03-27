@@ -606,11 +606,11 @@ pub enum ClientConnectorState {
 
 #### 5.2.7 Azure AD Authentication (RDSTLS/AAD)
 
-- [ ] OAuth2 device code flow
-- [ ] Azure AD 토큰 획득
-- [ ] RDSTLS 프로토콜 핸드셰이크
-- [ ] Azure AD Join 시나리오 (Hybrid Azure AD Join 포함)
-- [ ] ARM (Azure Resource Manager) 엔드포인트 해석
+- [x] OAuth2 device code flow (caller 책임, connector는 토큰 수신만)
+- [x] Azure AD 토큰 획득 (caller 책임, AadConfig으로 전달)
+- [x] RDSAAD 프로토콜 핸드셰이크 (ServerNonce → AuthRequest/JWS → AuthResult)
+- [x] Azure AD Join 시나리오 (Hybrid Azure AD Join 포함) -- PROTOCOL_RDSAAD 지원
+- [ ] ARM (Azure Resource Manager) 엔드포인트 해석 (caller-side HTTP, 미구현)
 
 ### 5.3 `justrdp-tls` -- TLS Transport
 

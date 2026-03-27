@@ -79,6 +79,24 @@ impl PduHint for RdstlsHint {
 
 static RDSTLS_HINT: RdstlsHint = RdstlsHint;
 
+/// AAD JSON PDU hint: scans for the first `}` brace to determine PDU boundary.
+/// RDSAAD PDUs are flat JSON objects over TLS with no binary framing.
+struct AadJsonHint;
+
+impl PduHint for AadJsonHint {
+    fn find_size(&self, bytes: &[u8]) -> Option<(bool, usize)> {
+        // Flat JSON PDU ends at the first `}` — return immediately on match
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'}' {
+                return Some((false, i + 1));
+            }
+        }
+        None
+    }
+}
+
+static AAD_JSON_HINT: AadJsonHint = AadJsonHint;
+
 /// RDP client connection state machine.
 ///
 /// Drives the full RDP connection sequence without performing I/O.
@@ -118,6 +136,8 @@ pub struct ClientConnector {
     security_mode: SecurityMode,
     /// Session ID from server.
     session_id: u32,
+    /// Stored RDP Assertion JSON for AAD auth (built after receiving server nonce).
+    aad_auth_request_json: Option<alloc::string::String>,
 }
 
 /// Standard RDP Security mode (none for TLS/NLA).
@@ -153,6 +173,7 @@ impl ClientConnector {
             server_public_key: None,
             security_mode: SecurityMode::None,
             session_id: 0,
+            aad_auth_request_json: None,
         }
     }
 
@@ -194,6 +215,10 @@ impl ClientConnector {
             crate::config::AuthMode::RestrictedAdmin => {
                 crate::credssp::CredentialType::RestrictedAdmin
             }
+            crate::config::AuthMode::AzureAd => {
+                // AAD auth does not use CredSSP; return Password as fallback
+                crate::credssp::CredentialType::Password
+            }
             crate::config::AuthMode::Password => {
                 crate::credssp::CredentialType::Password
             }
@@ -213,6 +238,7 @@ impl ClientConnector {
                 NegotiationRequestFlags::REDIRECTED_AUTHENTICATION_MODE_REQUIRED
             }
             crate::config::AuthMode::Password => NegotiationRequestFlags::NONE,
+            crate::config::AuthMode::AzureAd => NegotiationRequestFlags::NONE,
         };
         let nego = NegotiationRequest::with_flags(self.config.security_protocol, flags);
 
@@ -266,6 +292,9 @@ impl ClientConnector {
                     ));
                 }
             }
+            crate::config::AuthMode::AzureAd => {
+                // AAD auth is indicated by selected protocol containing AAD flag
+            }
             crate::config::AuthMode::Password => {}
         }
 
@@ -281,7 +310,10 @@ impl ClientConnector {
 
     fn step_enhanced_security_upgrade(&mut self) -> ConnectorResult<Written> {
         // Caller has completed TLS handshake
-        if self.selected_protocol.contains(SecurityProtocol::RDSTLS) {
+        if self.selected_protocol.contains(SecurityProtocol::AAD) {
+            // Azure AD: wait for server nonce (JSON over raw TLS)
+            self.state = ClientConnectorState::AadWaitServerNonce;
+        } else if self.selected_protocol.contains(SecurityProtocol::RDSTLS) {
             // RDSTLS: Remote Credential Guard or Azure AD path
             self.state = ClientConnectorState::RdstlsSendCapabilities;
         } else if self.selected_protocol.contains(SecurityProtocol::HYBRID)
@@ -321,6 +353,56 @@ impl ClientConnector {
 
     fn step_credssp_early_user_auth(&mut self) -> ConnectorResult<Written> {
         // Caller receives EarlyUserAuthResult externally.
+        self.state = ClientConnectorState::BasicSettingsExchangeSendInitial;
+        Ok(Written::nothing())
+    }
+
+    // ── Azure AD Authentication (RDSAAD) ──
+
+    fn step_aad_wait_server_nonce(&mut self, input: &[u8]) -> ConnectorResult<Written> {
+        // Parse server nonce JSON: {"ts_nonce":"<nonce>"}
+        let json_str = core::str::from_utf8(input)
+            .map_err(|_| ConnectorError::general("AAD server nonce is not valid UTF-8"))?;
+
+        let server_nonce = crate::aad::extract_json_string_value(json_str, "ts_nonce")
+            .ok_or_else(|| ConnectorError::general("AAD server nonce missing ts_nonce field"))?;
+
+        // Build RDP Assertion from config + server nonce
+        let aad_config = self.config.aad_config.as_ref()
+            .ok_or_else(|| ConnectorError::general("AAD config not set"))?;
+
+        let assertion = crate::aad::build_rdp_assertion(aad_config, server_nonce);
+        let auth_json = crate::aad::build_auth_request_json(&assertion);
+        self.aad_auth_request_json = Some(auth_json);
+
+        self.state = ClientConnectorState::AadSendAuthRequest;
+        Ok(Written::nothing())
+    }
+
+    fn step_aad_send_auth_request(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+        let json = self.aad_auth_request_json.take()
+            .ok_or_else(|| ConnectorError::general("AAD auth request JSON not built"))?;
+
+        let bytes = json.as_bytes();
+        output.ensure_capacity(bytes.len());
+        output.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+
+        self.state = ClientConnectorState::AadWaitAuthResult;
+        Ok(Written::new(bytes.len()))
+    }
+
+    fn step_aad_wait_auth_result(&mut self, input: &[u8]) -> ConnectorResult<Written> {
+        let json_str = core::str::from_utf8(input)
+            .map_err(|_| ConnectorError::general("AAD auth result is not valid UTF-8"))?;
+
+        let result_code = crate::aad::extract_json_integer_value(json_str, "authentication_result")
+            .ok_or_else(|| ConnectorError::general("AAD auth result missing authentication_result field"))?;
+
+        if result_code != 0 {
+            return Err(ConnectorError::general("AAD authentication failed"));
+        }
+
+        // Success — proceed to basic settings exchange
         self.state = ClientConnectorState::BasicSettingsExchangeSendInitial;
         Ok(Written::nothing())
     }
@@ -373,11 +455,10 @@ impl ClientConnector {
                     ))?;
                 RdstlsAuthenticationRequest::kerberos(token.clone())
             }
-            crate::config::AuthMode::RestrictedAdmin => {
-                // Should not reach here — RestrictedAdmin forces HYBRID protocol,
-                // which routes through CredSSP, not RDSTLS.
+            crate::config::AuthMode::RestrictedAdmin | crate::config::AuthMode::AzureAd => {
+                // RestrictedAdmin uses HYBRID (CredSSP), AzureAd uses RDSAAD — neither uses RDSTLS.
                 return Err(ConnectorError::general(
-                    "Restricted Admin does not use RDSTLS (internal routing error)",
+                    "this auth mode does not use RDSTLS (internal routing error)",
                 ));
             }
             crate::config::AuthMode::Password => {
@@ -1361,6 +1442,12 @@ impl Sequence for ClientConnector {
             None
         } else if matches!(
             self.state,
+            ClientConnectorState::AadWaitServerNonce
+                | ClientConnectorState::AadWaitAuthResult
+        ) {
+            Some(&AAD_JSON_HINT)
+        } else if matches!(
+            self.state,
             ClientConnectorState::RdstlsWaitCapabilities
                 | ClientConnectorState::RdstlsWaitAuthResponse
         ) {
@@ -1402,6 +1489,15 @@ impl Sequence for ClientConnector {
             }
             ClientConnectorState::CredsspEarlyUserAuth => {
                 self.step_credssp_early_user_auth()
+            }
+            ClientConnectorState::AadWaitServerNonce => {
+                self.step_aad_wait_server_nonce(input)
+            }
+            ClientConnectorState::AadSendAuthRequest => {
+                self.step_aad_send_auth_request(output)
+            }
+            ClientConnectorState::AadWaitAuthResult => {
+                self.step_aad_wait_auth_result(input)
             }
             ClientConnectorState::RdstlsSendCapabilities => {
                 self.step_rdstls_send_capabilities(output)

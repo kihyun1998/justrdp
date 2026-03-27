@@ -216,7 +216,6 @@ version = "0.1.0"
 dependencies = [
  "native-tls",
  "rustls",
- "rustls-pki-types",
  "webpki-roots 0.26.11",
 ]
 
