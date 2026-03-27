@@ -56,6 +56,9 @@ pub fn wrap_negotiate(ntlm_token: &[u8]) -> Vec<u8> {
 
 /// Wrap an NTLM Authenticate token in SPNEGO NegTokenResp.
 ///
+/// Per RFC 4178: the client's final Authenticate message omits negState,
+/// as this is the last token in the NTLM exchange.
+///
 /// Structure:
 /// ```text
 /// [1] NegTokenResp SEQUENCE {
@@ -63,17 +66,11 @@ pub fn wrap_negotiate(ntlm_token: &[u8]) -> Vec<u8> {
 /// }
 /// ```
 pub fn wrap_authenticate(ntlm_token: &[u8]) -> Vec<u8> {
-    // [0] negState ENUMERATED accept-incomplete (1)
-    let neg_state = der_context_tag(0, &der_enumerated(1));
-    // [2] responseToken OCTET STRING
+    // [2] responseToken OCTET STRING (no negState per RFC 4178 for final token)
     let response_token = der_octet_string(ntlm_token);
     let response_token_tagged = der_context_tag(2, &response_token);
 
-    let mut body = Vec::new();
-    body.extend_from_slice(&neg_state);
-    body.extend_from_slice(&response_token_tagged);
-
-    let neg_token_resp = der_sequence(&body);
+    let neg_token_resp = der_sequence(&response_token_tagged);
     der_context_tag(1, &neg_token_resp)
 }
 
@@ -149,10 +146,6 @@ fn der_context_tag(tag: u8, content: &[u8]) -> Vec<u8> {
     r.extend(der_length(content.len()));
     r.extend_from_slice(content);
     r
-}
-
-fn der_enumerated(value: u8) -> Vec<u8> {
-    vec![0x0A, 0x01, value]
 }
 
 fn der_octet_string(data: &[u8]) -> Vec<u8> {
@@ -235,5 +228,39 @@ mod tests {
 
         let extracted = unwrap_challenge(&resp).unwrap();
         assert_eq!(extracted, challenge);
+    }
+
+    #[test]
+    fn unwrap_challenge_with_neg_state_and_supported_mech() {
+        // Build a realistic server NegTokenResp with [0] negState, [1] supportedMech, [2] responseToken
+        let challenge = b"ntlm_challenge_bytes";
+
+        // [0] negState ENUMERATED accept-incomplete (1)
+        let neg_state = der_context_tag(0, &[0x0A, 0x01, 0x01]);
+        // [1] supportedMech OID (NTLMSSP: 1.3.6.1.4.1.311.2.2.10)
+        let supported_mech = der_context_tag(1, &[0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0A]);
+        // [2] responseToken OCTET STRING
+        let response_token = der_context_tag(2, &der_octet_string(challenge));
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&neg_state);
+        body.extend_from_slice(&supported_mech);
+        body.extend_from_slice(&response_token);
+        let seq = der_sequence(&body);
+        let resp = der_context_tag(1, &seq);
+
+        let extracted = unwrap_challenge(&resp).unwrap();
+        assert_eq!(extracted, challenge, "should extract responseToken despite [0] and [1] fields");
+    }
+
+    #[test]
+    fn unwrap_challenge_missing_response_token() {
+        // NegTokenResp with only [0] negState, no [2] responseToken
+        let neg_state = der_context_tag(0, &[0x0A, 0x01, 0x01]);
+        let seq = der_sequence(&neg_state);
+        let resp = der_context_tag(1, &seq);
+
+        let result = unwrap_challenge(&resp);
+        assert!(result.is_err(), "should fail when responseToken is missing");
     }
 }

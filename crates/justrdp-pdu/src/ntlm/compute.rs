@@ -108,7 +108,8 @@ pub fn compute_response(
     temp.extend_from_slice(&time.to_le_bytes()); // TimeStamp
     temp.extend_from_slice(client_challenge); // ChallengeFromClient
     temp.extend_from_slice(&[0u8; 4]); // Reserved3
-    temp.extend_from_slice(target_info); // AvPairs (already includes MsvAvEOL terminator)
+    temp.extend_from_slice(target_info); // AvPairs (includes MsvAvEOL terminator)
+    temp.extend_from_slice(&[0u8; 4]); // Z(4) trailing pad per MS-NLMP 3.3.2
 
     // NTProofStr = HMAC_MD5(ResponseKeyNT, ServerChallenge + temp)
     let mut nt_proof_input = Vec::with_capacity(8 + temp.len());
@@ -208,6 +209,57 @@ mod tests {
         assert!(nt_response.len() >= 16);
         assert_eq!(lm_response.len(), 24);
         assert_eq!(session_base_key.len(), 16);
+    }
+
+    /// MS-NLMP 4.2.4: NTLMv2 NTProofStr, SessionBaseKey, LmProofStr KAT.
+    ///
+    /// Test vectors from MS-NLMP sections 4.2.4.1 through 4.2.4.2.
+    /// TargetInfo = MsvAvNbDomainName("Domain") + MsvAvNbComputerName("Server") + MsvAvEOL.
+    /// The temp blob includes a trailing Z(4) after the AV_PAIRS (per 4.2.4.1.3).
+    #[test]
+    fn compute_response_kat_ms_nlmp_4_2_4() {
+        let response_key = ntowfv2("Password", "User", "Domain");
+        let server_challenge: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        let client_challenge: [u8; 8] = [0xaa; 8];
+        let time: u64 = 0;
+
+        // MS-NLMP 4.2.4: TargetInfo (ServerName) from CHALLENGE_MESSAGE
+        // MsvAvNbDomainName(0x0002, "Domain") + MsvAvNbComputerName(0x0001, "Server") + MsvAvEOL
+        #[rustfmt::skip]
+        let target_info: &[u8] = &[
+            0x02, 0x00, 0x0c, 0x00, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61, 0x00, 0x69, 0x00, 0x6e, 0x00,
+            0x01, 0x00, 0x0c, 0x00, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76, 0x00, 0x65, 0x00, 0x72, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let (nt_response, lm_response, session_base_key) =
+            compute_response(&response_key, &server_challenge, &client_challenge, time, target_info, false);
+
+        // MS-NLMP 4.2.4.2.2: NTProofStr (first 16 bytes of NtChallengeResponse)
+        assert_eq!(
+            &nt_response[..16],
+            &[0x68, 0xcd, 0x0a, 0xb8, 0x51, 0xe5, 0x1c, 0x96,
+              0xaa, 0xbc, 0x92, 0x7b, 0xeb, 0xef, 0x6a, 0x1c],
+            "NTProofStr does not match MS-NLMP 4.2.4.2.2"
+        );
+
+        // MS-NLMP 4.2.4.1.2: SessionBaseKey
+        assert_eq!(
+            session_base_key,
+            [0x8d, 0xe4, 0x0c, 0xca, 0xdb, 0xc1, 0x4a, 0x82,
+             0xf1, 0x5c, 0xb0, 0xad, 0x0d, 0xe9, 0x5c, 0xa3],
+            "SessionBaseKey does not match MS-NLMP 4.2.4.1.2"
+        );
+
+        // MS-NLMP 4.2.4.2.1: LMv2 Response (no timestamp → LmProofStr + ClientChallenge)
+        assert_eq!(lm_response.len(), 24);
+        assert_eq!(
+            &lm_response[..16],
+            &[0x86, 0xc3, 0x50, 0x97, 0xac, 0x9c, 0xec, 0x10,
+              0x25, 0x54, 0x76, 0x4a, 0x57, 0xcc, 0xcc, 0x19],
+            "LmProofStr does not match MS-NLMP 4.2.4.2.1"
+        );
+        assert_eq!(&lm_response[16..], &[0xaa; 8]);
     }
 
     #[test]

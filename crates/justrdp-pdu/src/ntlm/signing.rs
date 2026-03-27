@@ -138,14 +138,13 @@ impl NtlmSigningContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     #[test]
     fn signing_key_derivation() {
         let session_key = [0x55u8; 16];
         let key = signing_key(&session_key, true);
-        // Should produce a valid 16-byte key
         assert_eq!(key.len(), 16);
-        // Client and server keys should differ
         let server_key = signing_key(&session_key, false);
         assert_ne!(key, server_key);
     }
@@ -159,15 +158,79 @@ mod tests {
         assert_ne!(key, server_key);
     }
 
+    /// MS-NLMP 4.2.4.4: SignKey/SealKey KAT with ExportedSessionKey.
+    ///
+    /// ExportedSessionKey = RandomSessionKey = 0x55 repeated (since KEY_EXCH is set).
+    #[test]
+    fn signing_key_kat_ms_nlmp_4_2_4_4() {
+        let session_key: [u8; 16] = [0x55; 16];
+
+        // MS-NLMP 4.2.4.4: ClientSigningKey
+        let client_sign = signing_key(&session_key, true);
+        assert_eq!(
+            client_sign,
+            [0x47, 0x88, 0xdc, 0x86, 0x1b, 0x47, 0x82, 0xf3,
+             0x5d, 0x43, 0xfd, 0x98, 0xfe, 0x1a, 0x2d, 0x39],
+            "ClientSigningKey does not match MS-NLMP 4.2.4.4"
+        );
+    }
+
+    #[test]
+    fn sealing_key_kat_ms_nlmp_4_2_4_4() {
+        let session_key: [u8; 16] = [0x55; 16];
+
+        // MS-NLMP 4.2.4.4: ClientSealingKey
+        let client_seal = sealing_key(&session_key, true);
+        assert_eq!(
+            client_seal,
+            [0x59, 0xf6, 0x00, 0x97, 0x3c, 0xc4, 0x96, 0x0a,
+             0x25, 0x48, 0x0a, 0x7c, 0x19, 0x6e, 0x4c, 0x58],
+            "ClientSealingKey does not match MS-NLMP 4.2.4.4"
+        );
+    }
+
+    /// MS-NLMP 4.2.4.4: Sealing (GSS_WrapEx) with ESS — Unicode "Plaintext".
+    ///
+    /// This tests both encryption and MAC (the spec only provides a combined seal+sign example).
+    #[test]
+    fn seal_kat_ms_nlmp_4_2_4_4() {
+        let session_key: [u8; 16] = [0x55; 16];
+        let mut ctx = NtlmSigningContext::new(&session_key, true);
+
+        // MS-NLMP 4.2.4.4: Plaintext = Unicode "Plaintext"
+        #[rustfmt::skip]
+        let mut message: Vec<u8> = vec![
+            0x50, 0x00, 0x6c, 0x00, 0x61, 0x00, 0x69, 0x00,
+            0x6e, 0x00, 0x74, 0x00, 0x65, 0x00, 0x78, 0x00,
+            0x74, 0x00,
+        ];
+        let mac = ctx.seal(&mut message);
+
+        // MS-NLMP 4.2.4.4: Sealed (encrypted) data
+        assert_eq!(
+            message,
+            [0x54, 0xe5, 0x01, 0x65, 0xbf, 0x19, 0x36, 0xdc,
+             0x99, 0x60, 0x20, 0xc1, 0x81, 0x1b, 0x0f, 0x06,
+             0xfb, 0x5f],
+            "Sealed message does not match MS-NLMP 4.2.4.4"
+        );
+        assert_eq!(u32::from_le_bytes(mac[..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(mac[12..16].try_into().unwrap()), 0);
+        // MAC Checksum
+        assert_eq!(
+            &mac[4..12],
+            &[0x7f, 0xb3, 0x8e, 0xc5, 0xc5, 0x5d, 0x49, 0x76],
+            "Sealing MAC checksum does not match MS-NLMP 4.2.4.4"
+        );
+    }
+
     #[test]
     fn sign_produces_valid_mac() {
         let session_key = [0x55u8; 16];
         let mut ctx = NtlmSigningContext::new(&session_key, true);
 
         let mac = ctx.sign(b"Hello, World!");
-        // Version should be 1
         assert_eq!(u32::from_le_bytes(mac[..4].try_into().unwrap()), 1);
-        // SeqNum should be 0 (was 0 before sign, incremented after)
         assert_eq!(u32::from_le_bytes(mac[12..16].try_into().unwrap()), 0);
     }
 

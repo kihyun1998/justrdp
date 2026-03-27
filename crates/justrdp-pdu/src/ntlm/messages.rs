@@ -400,6 +400,11 @@ impl ChallengeMessage {
 // ── AUTHENTICATE_MESSAGE (MS-NLMP 2.2.1.3) ──
 
 /// NTLM Authenticate message (Type 3).
+///
+/// The `version` field is always present in the wire format because
+/// the MIC field (at offset 72) requires Version (at offset 64) to be
+/// present to maintain correct offsets. Per MS-NLMP 2.2.1.3, Version
+/// is present when NTLMSSP_NEGOTIATE_VERSION is set, and MIC requires it.
 #[derive(Debug, Clone)]
 pub struct AuthenticateMessage {
     pub flags: NegotiateFlags,
@@ -409,7 +414,8 @@ pub struct AuthenticateMessage {
     pub user_name: Vec<u8>,
     pub workstation: Vec<u8>,
     pub encrypted_random_session_key: Vec<u8>,
-    pub version: Option<NtlmVersion>,
+    /// NTLM version info (always encoded; required for correct MIC offset).
+    pub version: NtlmVersion,
     /// 16-byte MIC (set after initial encode, then re-encoded).
     pub mic: [u8; 16],
 }
@@ -497,12 +503,11 @@ impl AuthenticateMessage {
         buf[offset..offset + 4].copy_from_slice(&self.flags.bits().to_le_bytes());
         offset += 4;
 
-        // Version (8 bytes)
-        if let Some(ref ver) = self.version {
+        // Version (8 bytes, always present)
+        {
             let mut ver_buf = [0u8; 8];
             let mut cursor = WriteCursor::new(&mut ver_buf);
-            // Ignore error — buffer is always big enough
-            let _ = ver.encode(&mut cursor);
+            let _ = self.version.encode(&mut cursor);
             buf[offset..offset + 8].copy_from_slice(&ver_buf);
         }
         offset += 8;
@@ -594,7 +599,7 @@ mod tests {
             user_name: to_utf16le("User"),
             workstation: to_utf16le("WORKSTATION"),
             encrypted_random_session_key: vec![0; 16],
-            version: None,
+            version: NtlmVersion::windows_10(),
             mic: [0xAA; 16],
         };
 
