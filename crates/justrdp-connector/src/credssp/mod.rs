@@ -574,9 +574,10 @@ impl CredsspSequence {
                 build_ts_remote_guard_creds(kerberos_token, supplemental_creds)
             }
             CredentialType::RestrictedAdmin => {
-                // Should not be called — RestrictedAdmin omits authInfo in step_send_credentials.
-                // Fallback: return empty TSPasswordCreds for safety.
-                self.build_ts_password_creds()
+                // Must never be called — RestrictedAdmin omits authInfo entirely
+                // in step_send_credentials. Return empty bytes as a safety fallback
+                // to avoid leaking real credentials if this path is ever reached.
+                Vec::new()
             }
         }
     }

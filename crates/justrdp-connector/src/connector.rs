@@ -363,6 +363,8 @@ impl ClientConnector {
 
         let domain_str = self.config.domain.as_deref().unwrap_or("");
 
+        // Note: RestrictedAdmin uses HYBRID (CredSSP), never RDSTLS.
+        // Only RemoteCredentialGuard and Password reach this RDSTLS path.
         let req = match self.config.auth_mode {
             crate::config::AuthMode::RemoteCredentialGuard => {
                 let token = self.config.kerberos_token.as_ref()
@@ -372,7 +374,11 @@ impl ClientConnector {
                 RdstlsAuthenticationRequest::kerberos(token.clone())
             }
             crate::config::AuthMode::RestrictedAdmin => {
-                RdstlsAuthenticationRequest::password(&[], &[], &[])
+                // Should not reach here — RestrictedAdmin forces HYBRID protocol,
+                // which routes through CredSSP, not RDSTLS.
+                return Err(ConnectorError::general(
+                    "Restricted Admin does not use RDSTLS (internal routing error)",
+                ));
             }
             crate::config::AuthMode::Password => {
                 RdstlsAuthenticationRequest::password(
@@ -1777,5 +1783,73 @@ mod tests {
         connector.state = ClientConnectorState::ConnectionFinalizationSendPersistentKeyList;
         connector.step(&[], &mut output).unwrap();
         assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationSendFontList);
+    }
+
+    #[test]
+    fn restricted_admin_sets_nego_flag() {
+        let config = Config::builder("admin", "pass")
+            .restricted_admin()
+            .build();
+        let mut connector = ClientConnector::new(config);
+        let mut output = WriteBuf::new();
+
+        // Send Connection Request
+        let written = connector.step(&[], &mut output).unwrap();
+        let buf = &output.as_mut_slice()[..written.size];
+
+        // The negotiation request is the last 8 bytes of the X.224 CR PDU:
+        //   type(1) + flags(1) + length(2 LE) + protocols(4 LE)
+        // type = 0x01 (TYPE_RDP_NEG_REQ), length = 0x0008
+        assert!(buf.len() >= 8, "output too short for negotiation request");
+        let neg_offset = buf.len() - 8;
+        assert_eq!(buf[neg_offset], 0x01, "negotiation request type should be 0x01");
+        let neg_len = u16::from_le_bytes([buf[neg_offset + 2], buf[neg_offset + 3]]);
+        assert_eq!(neg_len, 0x0008, "negotiation request length should be 8");
+        let flags = buf[neg_offset + 1];
+        assert_eq!(flags & 0x01, 0x01,
+            "RESTRICTED_ADMIN_MODE_REQUIRED flag not set (flags=0x{:02X})", flags);
+    }
+
+    #[test]
+    fn restricted_admin_rejects_unsupported_server() {
+        let config = Config::builder("admin", "pass")
+            .restricted_admin()
+            .build();
+        let mut connector = ClientConnector::new(config);
+        let mut output = WriteBuf::new();
+
+        // Send Connection Request
+        connector.step(&[], &mut output).unwrap();
+
+        // Build server response WITHOUT RESTRICTED_ADMIN flag
+        let cc = ConnectionConfirm::success(justrdp_pdu::x224::NegotiationResponse {
+            flags: NegotiationResponseFlags::NONE, // No RESTRICTED_ADMIN
+            protocol: SecurityProtocol::HYBRID,
+        });
+
+        let cc_size = cc.size();
+        let tpkt = TpktHeader::for_payload(cc_size);
+        let total = TPKT_HEADER_SIZE + cc_size;
+        let mut cc_buf = vec![0u8; total];
+        {
+            let mut cursor = WriteCursor::new(&mut cc_buf);
+            tpkt.encode(&mut cursor).unwrap();
+            cc.encode(&mut cursor).unwrap();
+        }
+
+        // Should return error because server doesn't support Restricted Admin
+        output.clear();
+        let result = connector.step(&cc_buf, &mut output);
+        assert!(result.is_err(), "should reject server without RESTRICTED_ADMIN support");
+    }
+
+    #[test]
+    fn credssp_credential_type_restricted_admin() {
+        let config = Config::builder("admin", "pass")
+            .restricted_admin()
+            .build();
+        let connector = ClientConnector::new(config);
+        let cred_type = connector.credssp_credential_type();
+        assert!(matches!(cred_type, crate::credssp::CredentialType::RestrictedAdmin));
     }
 }
