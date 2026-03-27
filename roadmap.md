@@ -610,7 +610,10 @@ pub enum ClientConnectorState {
 - [x] Azure AD 토큰 획득 (caller 책임, AadConfig으로 전달)
 - [x] RDSAAD 프로토콜 핸드셰이크 (ServerNonce → AuthRequest/JWS → AuthResult)
 - [x] Azure AD Join 시나리오 (Hybrid Azure AD Join 포함) -- PROTOCOL_RDSAAD 지원
-- [ ] ARM (Azure Resource Manager) 엔드포인트 해석 (caller-side HTTP, 미구현)
+
+> **참고**: ARM (Azure Resource Manager) 엔드포인트 해석은 justrdp의 범위 밖입니다.
+> AVD/Windows 365 사용 시 caller가 직접 ARM API를 호출하여 hostname/device ID를 알아낸 뒤
+> `AadConfig.resource_uri`에 전달해야 합니다. 일반 Windows Server 연결에는 불필요합니다.
 
 ### 5.3 `justrdp-tls` -- TLS Transport
 
