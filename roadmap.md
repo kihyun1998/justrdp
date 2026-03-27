@@ -632,9 +632,9 @@ pub enum ClientConnectorState {
 
 ### Prerequisites (Phase 1/2에서 이관)
 
-- [ ] Primary order 필드별 파싱 + delta encoding *(Phase 1 drawing orders body 파싱)*
-- [ ] 그래픽 캐시 무효화 여부 판단 *(Deactivation-Reactivation 시)*
-- [ ] `AutoDetectSequence` 상태 머신 (RTT → Bandwidth → Result)
+- [x] Primary order 필드별 파싱 + delta encoding (DstBlt, PatBlt, ScrBlt, OpaqueRect, MemBlt, LineTo)
+- [x] 그래픽 캐시 무효화 여부 판단 (`deactivation_count` 시그널 + `PrimaryOrderHistory::reset()`)
+- [x] `AutoDetectSequence` 상태 머신 (wait state로 변경, 서버 PDU를 licensing에 전달)
 
 ### 6.1 `justrdp-graphics` -- Image Processing & Codecs
 

@@ -597,7 +597,7 @@ impl ClientConnector {
     fn parse_server_data_blocks(&mut self, data: &[u8]) -> ConnectorResult<()> {
         let mut cursor = ReadCursor::new(data);
 
-        while cursor.len() >= DATA_BLOCK_HEADER_SIZE {
+        while cursor.remaining() >= DATA_BLOCK_HEADER_SIZE {
             let block_type = cursor.read_u16_le("ServerDataBlock::type")?;
             let block_length = cursor.read_u16_le("ServerDataBlock::length")? as usize;
 
@@ -606,7 +606,7 @@ impl ClientConnector {
             }
 
             let body_length = block_length - DATA_BLOCK_HEADER_SIZE;
-            if cursor.len() < body_length {
+            if cursor.remaining() < body_length {
                 break;
             }
 
@@ -1911,6 +1911,27 @@ mod tests {
         connector.state = ClientConnectorState::ConnectionFinalizationSendPersistentKeyList;
         connector.step(&[], &mut output).unwrap();
         assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationSendFontList);
+    }
+
+    #[test]
+    fn parse_server_message_channel_data() {
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+
+        // Build server data blocks with MessageChannelData (type=0x0C04)
+        // Block header: type(u16 LE) + length(u16 LE) + body
+        // MessageChannelData body: mcs_message_channel_id (u16 LE)
+        let mut data = Vec::new();
+        // ServerMessageChannelData block: type=0x0C04, length=6 (header+body), channelId=0x03F0
+        data.extend_from_slice(&0x0C04u16.to_le_bytes()); // type
+        data.extend_from_slice(&0x0006u16.to_le_bytes()); // length = 6 (4 header + 2 body)
+        data.extend_from_slice(&0x03F0u16.to_le_bytes()); // mcs_message_channel_id = 1008
+
+        assert_eq!(data.len(), 6, "test data should be 6 bytes");
+        assert!(connector.mcs_message_channel_id.is_none());
+        connector.parse_server_data_blocks(&data).unwrap();
+        assert_eq!(connector.mcs_message_channel_id, Some(0x03F0));
+        assert_eq!(connector.mcs_message_channel_id(), Some(0x03F0));
     }
 
     #[test]

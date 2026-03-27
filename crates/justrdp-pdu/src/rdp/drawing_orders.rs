@@ -218,7 +218,7 @@ fn field_flags_byte_count(order_type: PrimaryOrderType) -> usize {
         PrimaryOrderType::PatBlt           // 12 fields
         | PrimaryOrderType::LineTo         // 10 fields
         | PrimaryOrderType::MemBlt         // 9 fields
-        | PrimaryOrderType::MultiDrawNineGrid // 7 fields → actually 1, but spec says 2 (has extra fields)
+        | PrimaryOrderType::MultiDrawNineGrid // 9 fields → 2 bytes
         | PrimaryOrderType::MultiPatBlt    // 14 fields
         | PrimaryOrderType::MultiScrBlt    // 9 fields
         | PrimaryOrderType::MultiOpaqueRect // 9 fields
@@ -278,6 +278,431 @@ impl<'de> Decode<'de> for PrimaryOrder {
 
         Ok(Self { order_type, field_flags, bounds, data })
     }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Primary Drawing Order Field-Level Parsing (MS-RDPEGDI 2.2.2.2.1.1.2)
+// ════════════════════════════════════════════════════════════════════
+
+/// Number of fields per primary order type.
+pub fn field_count(order_type: PrimaryOrderType) -> usize {
+    match order_type {
+        PrimaryOrderType::DstBlt => 5,
+        PrimaryOrderType::PatBlt => 12,
+        PrimaryOrderType::ScrBlt => 7,
+        PrimaryOrderType::DrawNineGrid => 5,
+        PrimaryOrderType::MultiDrawNineGrid => 9, // MS-RDPEGDI 2.2.2.2.1.1.2.16: 9 fields (2-byte fieldFlags)
+        PrimaryOrderType::LineTo => 10,
+        PrimaryOrderType::OpaqueRect => 7,
+        PrimaryOrderType::SaveBitmap => 6,
+        PrimaryOrderType::MemBlt => 9,
+        PrimaryOrderType::Mem3Blt => 16,
+        PrimaryOrderType::MultiDstBlt => 7,
+        PrimaryOrderType::MultiPatBlt => 14,
+        PrimaryOrderType::MultiScrBlt => 9,
+        PrimaryOrderType::MultiOpaqueRect => 9,
+        PrimaryOrderType::FastIndex => 15,
+        PrimaryOrderType::PolygonSc => 7,
+        PrimaryOrderType::PolygonCb => 13,
+        PrimaryOrderType::Polyline => 7,
+        PrimaryOrderType::FastGlyph => 15,
+        PrimaryOrderType::EllipseSc => 7,
+        PrimaryOrderType::EllipseCb => 13,
+        PrimaryOrderType::GlyphIndex => 22,
+    }
+}
+
+/// Maximum number of fields any primary order can have.
+pub const MAX_ORDER_FIELDS: usize = 22;
+/// Number of distinct primary order types.
+pub const ORDER_TYPE_COUNT: usize = 22;
+
+/// Decode a COORD_FIELD value (MS-RDPEGDI 2.2.2.2.1.1.1.1).
+///
+/// When `delta_mode` is true (TS_DELTA_COORDINATES set), reads 1-byte signed delta.
+/// Otherwise reads 2-byte signed LE absolute value.
+pub fn decode_coord_field(src: &mut ReadCursor<'_>, delta_mode: bool, prev: i16) -> DecodeResult<i16> {
+    if delta_mode {
+        let delta = src.read_u8("COORD_FIELD::delta")? as i8;
+        Ok(prev.wrapping_add(delta as i16))
+    } else {
+        let val = src.read_i16_le("COORD_FIELD::absolute")?;
+        Ok(val)
+    }
+}
+
+// ── Typed primary order bodies ──
+
+/// DstBlt order — MS-RDPEGDI 2.2.2.2.1.1.2.1 (5 fields)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DstBltOrder {
+    pub left: i16,
+    pub top: i16,
+    pub width: i16,
+    pub height: i16,
+    pub rop: u8,
+}
+
+/// PatBlt order — MS-RDPEGDI 2.2.2.2.1.1.2.3 (12 fields)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PatBltOrder {
+    pub left: i16,
+    pub top: i16,
+    pub width: i16,
+    pub height: i16,
+    pub rop: u8,
+    pub back_color: [u8; 3],
+    pub fore_color: [u8; 3],
+    pub brush_org_x: i8,
+    pub brush_org_y: i8,
+    pub brush_style: u8,
+    pub brush_hatch: u8,
+    pub brush_extra: [u8; 7],
+}
+
+/// ScrBlt order — MS-RDPEGDI 2.2.2.2.1.1.2.7 (7 fields)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrBltOrder {
+    pub left: i16,
+    pub top: i16,
+    pub width: i16,
+    pub height: i16,
+    pub rop: u8,
+    pub src_left: i16,
+    pub src_top: i16,
+}
+
+/// OpaqueRect order — MS-RDPEGDI 2.2.2.2.1.1.2.5 (7 fields)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpaqueRectOrder {
+    pub left: i16,
+    pub top: i16,
+    pub width: i16,
+    pub height: i16,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+/// MemBlt order — MS-RDPEGDI 2.2.2.2.1.1.2.9 (9 fields)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemBltOrder {
+    pub cache_id: u16,
+    pub left: i16,
+    pub top: i16,
+    pub width: i16,
+    pub height: i16,
+    pub rop: u8,
+    pub src_left: i16,
+    pub src_top: i16,
+    pub cache_index: u16,
+}
+
+/// LineTo order — MS-RDPEGDI 2.2.2.2.1.1.2.11 (10 fields)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LineToOrder {
+    pub back_mode: u16,
+    pub start_x: i16,
+    pub start_y: i16,
+    pub end_x: i16,
+    pub end_y: i16,
+    pub back_color: [u8; 3],
+    pub rop2: u8,
+    pub pen_style: u8,
+    pub pen_width: u8,
+    pub pen_color: [u8; 3],
+}
+
+/// Primary drawing order history for stateful decoding.
+///
+/// MS-RDPEGDI 3.2.1.1: clients must maintain per-order field arrays
+/// and current bounds/order state across a sequence of primary orders.
+#[derive(Debug, Clone)]
+pub struct PrimaryOrderHistory {
+    /// Last order type (initial: PatBlt per MS-RDPEGDI 3.2.1.1).
+    pub last_order_type: PrimaryOrderType,
+    /// Current bounding rectangle (initial: all zeros).
+    pub current_bounds: BoundsRect,
+    /// Per-order field value storage (i32 for all fields, coerced as needed).
+    fields: [[i32; MAX_ORDER_FIELDS]; ORDER_TYPE_COUNT],
+}
+
+impl Default for PrimaryOrderHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PrimaryOrderHistory {
+    pub fn new() -> Self {
+        Self {
+            last_order_type: PrimaryOrderType::PatBlt,
+            current_bounds: BoundsRect { left: 0, top: 0, right: 0, bottom: 0 },
+            fields: [[0i32; MAX_ORDER_FIELDS]; ORDER_TYPE_COUNT],
+        }
+    }
+
+    /// Get a mutable reference to the field array for a given order type.
+    fn fields_mut(&mut self, order_type: PrimaryOrderType) -> &mut [i32; MAX_ORDER_FIELDS] {
+        let idx = order_type_index(order_type);
+        &mut self.fields[idx]
+    }
+
+    /// Get a reference to the field array for a given order type.
+    pub fn fields_ref(&self, order_type: PrimaryOrderType) -> &[i32; MAX_ORDER_FIELDS] {
+        let idx = order_type_index(order_type);
+        &self.fields[idx]
+    }
+
+    /// Reset all history state (on Deactivation-Reactivation).
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// Map PrimaryOrderType to array index (0-21).
+fn order_type_index(t: PrimaryOrderType) -> usize {
+    match t {
+        PrimaryOrderType::DstBlt => 0,
+        PrimaryOrderType::PatBlt => 1,
+        PrimaryOrderType::ScrBlt => 2,
+        PrimaryOrderType::DrawNineGrid => 3,
+        PrimaryOrderType::MultiDrawNineGrid => 4, // 9 fields
+        PrimaryOrderType::LineTo => 5,
+        PrimaryOrderType::OpaqueRect => 6,
+        PrimaryOrderType::SaveBitmap => 7,
+        PrimaryOrderType::MemBlt => 8,
+        PrimaryOrderType::Mem3Blt => 9,
+        PrimaryOrderType::MultiDstBlt => 10,
+        PrimaryOrderType::MultiPatBlt => 11,
+        PrimaryOrderType::MultiScrBlt => 12,
+        PrimaryOrderType::MultiOpaqueRect => 13,
+        PrimaryOrderType::FastIndex => 14,
+        PrimaryOrderType::PolygonSc => 15,
+        PrimaryOrderType::PolygonCb => 16,
+        PrimaryOrderType::Polyline => 17,
+        PrimaryOrderType::FastGlyph => 18,
+        PrimaryOrderType::EllipseSc => 19,
+        PrimaryOrderType::EllipseCb => 20,
+        PrimaryOrderType::GlyphIndex => 21,
+    }
+}
+
+/// Decode a DstBlt order from field data.
+pub fn decode_dstblt(
+    src: &mut ReadCursor<'_>,
+    field_flags: u32,
+    delta: bool,
+    history: &mut PrimaryOrderHistory,
+) -> DecodeResult<DstBltOrder> {
+    let f = history.fields_mut(PrimaryOrderType::DstBlt);
+
+    if field_flags & 0x01 != 0 { f[0] = decode_coord_field(src, delta, f[0] as i16)? as i32; }
+    if field_flags & 0x02 != 0 { f[1] = decode_coord_field(src, delta, f[1] as i16)? as i32; }
+    if field_flags & 0x04 != 0 { f[2] = decode_coord_field(src, delta, f[2] as i16)? as i32; }
+    if field_flags & 0x08 != 0 { f[3] = decode_coord_field(src, delta, f[3] as i16)? as i32; }
+    if field_flags & 0x10 != 0 { f[4] = src.read_u8("DstBlt::bRop")? as i32; }
+
+    Ok(DstBltOrder {
+        left: f[0] as i16,
+        top: f[1] as i16,
+        width: f[2] as i16,
+        height: f[3] as i16,
+        rop: f[4] as u8,
+    })
+}
+
+/// Decode a PatBlt order from field data.
+pub fn decode_patblt(
+    src: &mut ReadCursor<'_>,
+    field_flags: u32,
+    delta: bool,
+    history: &mut PrimaryOrderHistory,
+) -> DecodeResult<PatBltOrder> {
+    let f = history.fields_mut(PrimaryOrderType::PatBlt);
+
+    if field_flags & 0x0001 != 0 { f[0] = decode_coord_field(src, delta, f[0] as i16)? as i32; }
+    if field_flags & 0x0002 != 0 { f[1] = decode_coord_field(src, delta, f[1] as i16)? as i32; }
+    if field_flags & 0x0004 != 0 { f[2] = decode_coord_field(src, delta, f[2] as i16)? as i32; }
+    if field_flags & 0x0008 != 0 { f[3] = decode_coord_field(src, delta, f[3] as i16)? as i32; }
+    if field_flags & 0x0010 != 0 { f[4] = src.read_u8("PatBlt::bRop")? as i32; }
+    if field_flags & 0x0020 != 0 {
+        let r = src.read_u8("PatBlt::backColor[0]")?;
+        let g = src.read_u8("PatBlt::backColor[1]")?;
+        let b = src.read_u8("PatBlt::backColor[2]")?;
+        f[5] = ((r as i32) << 16) | ((g as i32) << 8) | (b as i32);
+    }
+    if field_flags & 0x0040 != 0 {
+        let r = src.read_u8("PatBlt::foreColor[0]")?;
+        let g = src.read_u8("PatBlt::foreColor[1]")?;
+        let b = src.read_u8("PatBlt::foreColor[2]")?;
+        f[6] = ((r as i32) << 16) | ((g as i32) << 8) | (b as i32);
+    }
+    if field_flags & 0x0080 != 0 { f[7] = src.read_u8("PatBlt::brushOrgX")? as i8 as i32; }
+    if field_flags & 0x0100 != 0 { f[8] = src.read_u8("PatBlt::brushOrgY")? as i8 as i32; }
+    if field_flags & 0x0200 != 0 { f[9] = src.read_u8("PatBlt::brushStyle")? as i32; }
+    if field_flags & 0x0400 != 0 { f[10] = src.read_u8("PatBlt::brushHatch")? as i32; }
+    if field_flags & 0x0800 != 0 {
+        for i in 0..7 {
+            let b = src.read_u8("PatBlt::brushExtra")?;
+            // Store brush extra bytes in upper bits of f[11]..f[17] area
+            // For simplicity, pack all 7 bytes into fields 11-17
+            if i < MAX_ORDER_FIELDS - 11 {
+                f[11 + i] = b as i32;
+            }
+        }
+    }
+
+    Ok(PatBltOrder {
+        left: f[0] as i16,
+        top: f[1] as i16,
+        width: f[2] as i16,
+        height: f[3] as i16,
+        rop: f[4] as u8,
+        back_color: [(f[5] >> 16) as u8, (f[5] >> 8) as u8, f[5] as u8],
+        fore_color: [(f[6] >> 16) as u8, (f[6] >> 8) as u8, f[6] as u8],
+        brush_org_x: f[7] as i8,
+        brush_org_y: f[8] as i8,
+        brush_style: f[9] as u8,
+        brush_hatch: f[10] as u8,
+        brush_extra: [
+            f[11] as u8, f[12] as u8, f[13] as u8, f[14] as u8,
+            f[15] as u8, f[16] as u8, f[17] as u8,
+        ],
+    })
+}
+
+/// Decode an OpaqueRect order from field data.
+pub fn decode_opaque_rect(
+    src: &mut ReadCursor<'_>,
+    field_flags: u32,
+    delta: bool,
+    history: &mut PrimaryOrderHistory,
+) -> DecodeResult<OpaqueRectOrder> {
+    let f = history.fields_mut(PrimaryOrderType::OpaqueRect);
+
+    if field_flags & 0x01 != 0 { f[0] = decode_coord_field(src, delta, f[0] as i16)? as i32; }
+    if field_flags & 0x02 != 0 { f[1] = decode_coord_field(src, delta, f[1] as i16)? as i32; }
+    if field_flags & 0x04 != 0 { f[2] = decode_coord_field(src, delta, f[2] as i16)? as i32; }
+    if field_flags & 0x08 != 0 { f[3] = decode_coord_field(src, delta, f[3] as i16)? as i32; }
+    // Color is encoded as 3 separate bytes (R, G, B)
+    if field_flags & 0x10 != 0 { f[4] = src.read_u8("OpaqueRect::red")? as i32; }
+    if field_flags & 0x20 != 0 { f[5] = src.read_u8("OpaqueRect::green")? as i32; }
+    if field_flags & 0x40 != 0 { f[6] = src.read_u8("OpaqueRect::blue")? as i32; }
+
+    Ok(OpaqueRectOrder {
+        left: f[0] as i16,
+        top: f[1] as i16,
+        width: f[2] as i16,
+        height: f[3] as i16,
+        red: f[4] as u8,
+        green: f[5] as u8,
+        blue: f[6] as u8,
+    })
+}
+
+/// Decode a ScrBlt order from field data.
+pub fn decode_scrblt(
+    src: &mut ReadCursor<'_>,
+    field_flags: u32,
+    delta: bool,
+    history: &mut PrimaryOrderHistory,
+) -> DecodeResult<ScrBltOrder> {
+    let f = history.fields_mut(PrimaryOrderType::ScrBlt);
+
+    if field_flags & 0x01 != 0 { f[0] = decode_coord_field(src, delta, f[0] as i16)? as i32; }
+    if field_flags & 0x02 != 0 { f[1] = decode_coord_field(src, delta, f[1] as i16)? as i32; }
+    if field_flags & 0x04 != 0 { f[2] = decode_coord_field(src, delta, f[2] as i16)? as i32; }
+    if field_flags & 0x08 != 0 { f[3] = decode_coord_field(src, delta, f[3] as i16)? as i32; }
+    if field_flags & 0x10 != 0 { f[4] = src.read_u8("ScrBlt::bRop")? as i32; }
+    if field_flags & 0x20 != 0 { f[5] = decode_coord_field(src, delta, f[5] as i16)? as i32; }
+    if field_flags & 0x40 != 0 { f[6] = decode_coord_field(src, delta, f[6] as i16)? as i32; }
+
+    Ok(ScrBltOrder {
+        left: f[0] as i16,
+        top: f[1] as i16,
+        width: f[2] as i16,
+        height: f[3] as i16,
+        rop: f[4] as u8,
+        src_left: f[5] as i16,
+        src_top: f[6] as i16,
+    })
+}
+
+/// Decode a MemBlt order from field data.
+pub fn decode_memblt(
+    src: &mut ReadCursor<'_>,
+    field_flags: u32,
+    delta: bool,
+    history: &mut PrimaryOrderHistory,
+) -> DecodeResult<MemBltOrder> {
+    let f = history.fields_mut(PrimaryOrderType::MemBlt);
+
+    if field_flags & 0x0001 != 0 { f[0] = src.read_u16_le("MemBlt::cacheId")? as i32; }
+    if field_flags & 0x0002 != 0 { f[1] = decode_coord_field(src, delta, f[1] as i16)? as i32; }
+    if field_flags & 0x0004 != 0 { f[2] = decode_coord_field(src, delta, f[2] as i16)? as i32; }
+    if field_flags & 0x0008 != 0 { f[3] = decode_coord_field(src, delta, f[3] as i16)? as i32; }
+    if field_flags & 0x0010 != 0 { f[4] = decode_coord_field(src, delta, f[4] as i16)? as i32; }
+    if field_flags & 0x0020 != 0 { f[5] = src.read_u8("MemBlt::bRop")? as i32; }
+    if field_flags & 0x0040 != 0 { f[6] = decode_coord_field(src, delta, f[6] as i16)? as i32; }
+    if field_flags & 0x0080 != 0 { f[7] = decode_coord_field(src, delta, f[7] as i16)? as i32; }
+    if field_flags & 0x0100 != 0 { f[8] = src.read_u16_le("MemBlt::cacheIndex")? as i32; }
+
+    Ok(MemBltOrder {
+        cache_id: f[0] as u16,
+        left: f[1] as i16,
+        top: f[2] as i16,
+        width: f[3] as i16,
+        height: f[4] as i16,
+        rop: f[5] as u8,
+        src_left: f[6] as i16,
+        src_top: f[7] as i16,
+        cache_index: f[8] as u16,
+    })
+}
+
+/// Decode a LineTo order from field data.
+pub fn decode_lineto(
+    src: &mut ReadCursor<'_>,
+    field_flags: u32,
+    delta: bool,
+    history: &mut PrimaryOrderHistory,
+) -> DecodeResult<LineToOrder> {
+    let f = history.fields_mut(PrimaryOrderType::LineTo);
+
+    if field_flags & 0x0001 != 0 { f[0] = src.read_u16_le("LineTo::backMode")? as i32; }
+    if field_flags & 0x0002 != 0 { f[1] = decode_coord_field(src, delta, f[1] as i16)? as i32; }
+    if field_flags & 0x0004 != 0 { f[2] = decode_coord_field(src, delta, f[2] as i16)? as i32; }
+    if field_flags & 0x0008 != 0 { f[3] = decode_coord_field(src, delta, f[3] as i16)? as i32; }
+    if field_flags & 0x0010 != 0 { f[4] = decode_coord_field(src, delta, f[4] as i16)? as i32; }
+    if field_flags & 0x0020 != 0 {
+        let r = src.read_u8("LineTo::backColor[0]")?;
+        let g = src.read_u8("LineTo::backColor[1]")?;
+        let b = src.read_u8("LineTo::backColor[2]")?;
+        f[5] = ((r as i32) << 16) | ((g as i32) << 8) | (b as i32);
+    }
+    if field_flags & 0x0040 != 0 { f[6] = src.read_u8("LineTo::bRop2")? as i32; }
+    if field_flags & 0x0080 != 0 { f[7] = src.read_u8("LineTo::penStyle")? as i32; }
+    if field_flags & 0x0100 != 0 { f[8] = src.read_u8("LineTo::penWidth")? as i32; }
+    if field_flags & 0x0200 != 0 {
+        let r = src.read_u8("LineTo::penColor[0]")?;
+        let g = src.read_u8("LineTo::penColor[1]")?;
+        let b = src.read_u8("LineTo::penColor[2]")?;
+        f[9] = ((r as i32) << 16) | ((g as i32) << 8) | (b as i32);
+    }
+
+    Ok(LineToOrder {
+        back_mode: f[0] as u16,
+        start_x: f[1] as i16,
+        start_y: f[2] as i16,
+        end_x: f[3] as i16,
+        end_y: f[4] as i16,
+        back_color: [(f[5] >> 16) as u8, (f[5] >> 8) as u8, f[5] as u8],
+        rop2: f[6] as u8,
+        pen_style: f[7] as u8,
+        pen_width: f[8] as u8,
+        pen_color: [(f[9] >> 16) as u8, (f[9] >> 8) as u8, f[9] as u8],
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -800,5 +1225,226 @@ mod tests {
         };
         let buf = roundtrip_encode(&order);
         assert_eq!(buf[0], 0x0D << 2);
+    }
+
+    // ── Primary Order Field Parsing Tests ──
+
+    #[test]
+    fn field_count_matches_field_flags_byte_count_all_22() {
+        // Verify consistency: field_flags_byte_count == ceil((field_count+1)/8) for ALL 22 types
+        let all_orders = [
+            PrimaryOrderType::DstBlt, PrimaryOrderType::PatBlt, PrimaryOrderType::ScrBlt,
+            PrimaryOrderType::DrawNineGrid, PrimaryOrderType::MultiDrawNineGrid,
+            PrimaryOrderType::LineTo, PrimaryOrderType::OpaqueRect, PrimaryOrderType::SaveBitmap,
+            PrimaryOrderType::MemBlt, PrimaryOrderType::Mem3Blt, PrimaryOrderType::MultiDstBlt,
+            PrimaryOrderType::MultiPatBlt, PrimaryOrderType::MultiScrBlt,
+            PrimaryOrderType::MultiOpaqueRect, PrimaryOrderType::FastIndex,
+            PrimaryOrderType::PolygonSc, PrimaryOrderType::PolygonCb, PrimaryOrderType::Polyline,
+            PrimaryOrderType::FastGlyph, PrimaryOrderType::EllipseSc, PrimaryOrderType::EllipseCb,
+            PrimaryOrderType::GlyphIndex,
+        ];
+        assert_eq!(all_orders.len(), ORDER_TYPE_COUNT, "must test all 22 order types");
+
+        for &ot in &all_orders {
+            let fc = field_count(ot);
+            let expected_bytes = (fc + 8) / 8; // ceil((fc+1)/8) simplified
+            let actual_bytes = field_flags_byte_count(ot);
+            assert_eq!(actual_bytes, expected_bytes,
+                "field_flags_byte_count mismatch for {:?}: fields={}, expected={}, got={}",
+                ot, fc, expected_bytes, actual_bytes);
+        }
+    }
+
+    #[test]
+    fn decode_dstblt_absolute() {
+        let mut history = PrimaryOrderHistory::new();
+        // DstBlt: 5 fields, all absolute (no delta mode)
+        // field_flags = 0x1F (all 5 fields present)
+        let data: &[u8] = &[
+            0x0A, 0x00, // left = 10
+            0x14, 0x00, // top = 20
+            0x64, 0x00, // width = 100
+            0x32, 0x00, // height = 50
+            0xCC,       // rop = 0xCC (SRCCOPY)
+        ];
+        let mut cursor = ReadCursor::new(data);
+        let order = decode_dstblt(&mut cursor, 0x1F, false, &mut history).unwrap();
+
+        assert_eq!(order.left, 10);
+        assert_eq!(order.top, 20);
+        assert_eq!(order.width, 100);
+        assert_eq!(order.height, 50);
+        assert_eq!(order.rop, 0xCC);
+    }
+
+    #[test]
+    fn decode_dstblt_delta() {
+        let mut history = PrimaryOrderHistory::new();
+        // Set previous values
+        {
+            let f = history.fields_mut(PrimaryOrderType::DstBlt);
+            f[0] = 100; // prev left
+            f[1] = 200; // prev top
+            f[2] = 50;  // prev width
+            f[3] = 30;  // prev height
+            f[4] = 0xAA; // prev rop
+        }
+
+        // Delta: left += 5, top -= 3, only fields 0 and 1 present
+        let data: &[u8] = &[0x05, 0xFD]; // delta=5, delta=-3
+        let mut cursor = ReadCursor::new(data);
+        let order = decode_dstblt(&mut cursor, 0x03, true, &mut history).unwrap();
+
+        assert_eq!(order.left, 105);  // 100 + 5
+        assert_eq!(order.top, 197);   // 200 + (-3)
+        assert_eq!(order.width, 50);  // unchanged
+        assert_eq!(order.height, 30); // unchanged
+        assert_eq!(order.rop, 0xAA);  // unchanged
+    }
+
+    #[test]
+    fn decode_opaque_rect_all_fields() {
+        let mut history = PrimaryOrderHistory::new();
+        let data: &[u8] = &[
+            0x00, 0x00, // left = 0
+            0x00, 0x00, // top = 0
+            0x80, 0x07, // width = 1920
+            0x38, 0x04, // height = 1080
+            0xFF, 0x00, 0x00, // red, green, blue
+        ];
+        let mut cursor = ReadCursor::new(data);
+        let order = decode_opaque_rect(&mut cursor, 0x7F, false, &mut history).unwrap();
+
+        assert_eq!(order.width, 1920);
+        assert_eq!(order.height, 1080);
+        assert_eq!(order.red, 0xFF);
+        assert_eq!(order.green, 0x00);
+        assert_eq!(order.blue, 0x00);
+    }
+
+    #[test]
+    fn decode_scrblt_partial_fields() {
+        let mut history = PrimaryOrderHistory::new();
+        // Only fields 0 (left) and 4 (rop) present (field_flags = 0x11)
+        let data: &[u8] = &[
+            0x0A, 0x00, // left = 10
+            0xCC,       // rop
+        ];
+        let mut cursor = ReadCursor::new(data);
+        let order = decode_scrblt(&mut cursor, 0x11, false, &mut history).unwrap();
+
+        assert_eq!(order.left, 10);
+        assert_eq!(order.top, 0);     // default from history
+        assert_eq!(order.rop, 0xCC);
+    }
+
+    #[test]
+    fn history_preserves_across_calls() {
+        let mut history = PrimaryOrderHistory::new();
+
+        // First DstBlt: set all fields
+        let data1: &[u8] = &[0x0A, 0x00, 0x14, 0x00, 0x64, 0x00, 0x32, 0x00, 0xCC];
+        let mut c1 = ReadCursor::new(data1);
+        let o1 = decode_dstblt(&mut c1, 0x1F, false, &mut history).unwrap();
+        assert_eq!(o1.left, 10);
+
+        // Second DstBlt: only update left with delta
+        let data2: &[u8] = &[0x05]; // delta = +5
+        let mut c2 = ReadCursor::new(data2);
+        let o2 = decode_dstblt(&mut c2, 0x01, true, &mut history).unwrap();
+
+        assert_eq!(o2.left, 15);     // 10 + 5
+        assert_eq!(o2.top, 20);      // preserved from first call
+        assert_eq!(o2.width, 100);   // preserved
+        assert_eq!(o2.height, 50);   // preserved
+        assert_eq!(o2.rop, 0xCC);    // preserved
+    }
+
+    #[test]
+    fn history_reset_clears_all() {
+        let mut history = PrimaryOrderHistory::new();
+
+        // Set some values
+        let f = history.fields_mut(PrimaryOrderType::DstBlt);
+        f[0] = 42;
+        history.last_order_type = PrimaryOrderType::ScrBlt;
+
+        // Reset
+        history.reset();
+
+        assert_eq!(history.last_order_type, PrimaryOrderType::PatBlt);
+        let f = history.fields_ref(PrimaryOrderType::DstBlt);
+        assert_eq!(f[0], 0);
+    }
+
+    #[test]
+    fn decode_memblt_all_fields() {
+        let mut history = PrimaryOrderHistory::new();
+        let data: &[u8] = &[
+            0x01, 0x00, // cache_id = 1
+            0x0A, 0x00, // left = 10
+            0x14, 0x00, // top = 20
+            0x40, 0x00, // width = 64
+            0x40, 0x00, // height = 64
+            0xCC,       // rop = 0xCC
+            0x00, 0x00, // src_left = 0
+            0x00, 0x00, // src_top = 0
+            0x05, 0x00, // cache_index = 5
+        ];
+        let mut cursor = ReadCursor::new(data);
+        let order = decode_memblt(&mut cursor, 0x01FF, false, &mut history).unwrap();
+
+        assert_eq!(order.cache_id, 1);
+        assert_eq!(order.left, 10);
+        assert_eq!(order.width, 64);
+        assert_eq!(order.rop, 0xCC);
+        assert_eq!(order.cache_index, 5);
+    }
+
+    #[test]
+    fn decode_lineto_partial() {
+        let mut history = PrimaryOrderHistory::new();
+        // Only start_x (field 1) and end_x (field 3) present: field_flags = 0x000A
+        let data: &[u8] = &[
+            0x64, 0x00, // start_x = 100
+            0xC8, 0x00, // end_x = 200
+        ];
+        let mut cursor = ReadCursor::new(data);
+        let order = decode_lineto(&mut cursor, 0x000A, false, &mut history).unwrap();
+
+        assert_eq!(order.start_x, 100);
+        assert_eq!(order.end_x, 200);
+        assert_eq!(order.start_y, 0); // default
+        assert_eq!(order.end_y, 0);   // default
+    }
+
+    #[test]
+    fn decode_patblt_basic() {
+        let mut history = PrimaryOrderHistory::new();
+        // Fields 0-4: left, top, width, height, rop (field_flags = 0x1F)
+        let data: &[u8] = &[
+            0x0A, 0x00, // left = 10
+            0x14, 0x00, // top = 20
+            0x64, 0x00, // width = 100
+            0x32, 0x00, // height = 50
+            0xF0,       // rop = 0xF0 (PATCOPY)
+        ];
+        let mut cursor = ReadCursor::new(data);
+        let order = decode_patblt(&mut cursor, 0x001F, false, &mut history).unwrap();
+
+        assert_eq!(order.left, 10);
+        assert_eq!(order.top, 20);
+        assert_eq!(order.width, 100);
+        assert_eq!(order.height, 50);
+        assert_eq!(order.rop, 0xF0);
+    }
+
+    #[test]
+    fn coord_field_delta_wrapping() {
+        // Test wrapping: prev = 32767 (i16::MAX), delta = +1 → wraps to -32768
+        let data: &[u8] = &[0x01]; // delta = +1
+        let mut cursor = ReadCursor::new(data);
+        let result = decode_coord_field(&mut cursor, true, i16::MAX).unwrap();
+        assert_eq!(result, i16::MIN); // wrapping add
     }
 }
