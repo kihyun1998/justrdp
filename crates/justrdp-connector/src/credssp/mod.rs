@@ -58,7 +58,7 @@ pub enum CredsspState {
 /// A supplemental credential package (e.g., device Kerberos token for Compound Identity).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupplementalCred {
-    /// Package name (e.g., "Kerberos").
+    /// Package name in UTF-16LE (e.g., `to_utf16le("Kerberos")`).
     pub package_name: Vec<u8>,
     /// Credential buffer (e.g., device AP-REQ token).
     pub cred_buffer: Vec<u8>,
@@ -620,7 +620,7 @@ impl CredsspSequence {
 ///
 /// ```text
 /// TSRemoteGuardPackageCred ::= SEQUENCE {
-///   packageName [0] OCTET STRING (UTF-8 "Kerberos"),
+///   packageName [0] OCTET STRING (UTF-16LE),
 ///   credBuffer  [1] OCTET STRING (AP-REQ token)
 /// }
 ///
@@ -639,7 +639,9 @@ fn build_ts_remote_guard_creds(
     supplemental_creds: &[SupplementalCred],
 ) -> Vec<u8> {
     // TSRemoteGuardPackageCred for Kerberos (logon credential)
-    let logon_cred = build_package_cred(b"Kerberos", kerberos_token);
+    // packageName is UTF-16LE per MS-CSSP 2.2.1.2.3 (UNICODE-STRING)
+    let kerberos_utf16 = to_utf16le("Kerberos");
+    let logon_cred = build_package_cred(&kerberos_utf16, kerberos_token);
 
     // TSRemoteGuardCreds
     let mut guard_creds_body = Vec::new();
@@ -650,6 +652,7 @@ fn build_ts_remote_guard_creds(
     if !supplemental_creds.is_empty() {
         let mut seq_body = Vec::new();
         for cred in supplemental_creds {
+            // packageName should be UTF-16LE; caller provides raw bytes
             seq_body.extend(build_package_cred(&cred.package_name, &cred.cred_buffer));
         }
         guard_creds_body.extend(der_context_tag(1, &der_sequence(&seq_body)));
@@ -900,11 +903,10 @@ mod tests {
         let creds = super::build_ts_remote_guard_creds(&token, &[]);
 
         assert_eq!(creds[0], 0x30); // outer SEQUENCE
-        // Verify credType = 6 is encoded
-        // Find the INTEGER value inside context [0]
         assert!(creds.len() > 10);
-        // Should contain "Kerberos" package name
-        assert!(creds.windows(8).any(|w| w == b"Kerberos"));
+        // Should contain "Kerberos" as UTF-16LE
+        let kerberos_utf16 = to_utf16le("Kerberos");
+        assert!(creds.windows(kerberos_utf16.len()).any(|w| w == kerberos_utf16.as_slice()));
     }
 
     #[test]
@@ -915,7 +917,8 @@ mod tests {
         );
         let creds = seq.build_ts_credentials();
         assert_eq!(creds[0], 0x30); // SEQUENCE
-        assert!(creds.windows(8).any(|w| w == b"Kerberos"));
+        let kerberos_utf16 = to_utf16le("Kerberos");
+        assert!(creds.windows(kerberos_utf16.len()).any(|w| w == kerberos_utf16.as_slice()));
     }
 
     #[test]
@@ -1074,13 +1077,14 @@ mod tests {
     #[test]
     fn build_ts_credentials_compound_identity() {
         let device_token = vec![0xDD; 32]; // mock device AP-REQ
+        let kerberos_utf16 = to_utf16le("Kerberos");
         let seq = CredsspSequence::with_credential_type(
             "admin", "", "CORP", vec![], test_random(), false,
             CredentialType::RemoteGuard {
                 kerberos_token: vec![0xAA; 16],
                 supplemental_creds: vec![
                     SupplementalCred {
-                        package_name: b"Kerberos".to_vec(),
+                        package_name: kerberos_utf16.clone(),
                         cred_buffer: device_token.clone(),
                     },
                 ],
@@ -1088,9 +1092,9 @@ mod tests {
         );
         let creds = seq.build_ts_credentials();
         assert_eq!(creds[0], 0x30); // SEQUENCE
-        // Should contain "Kerberos" twice (logon + supplemental)
-        let kerberos_count = creds.windows(8)
-            .filter(|w| *w == b"Kerberos")
+        // Should contain "Kerberos" (UTF-16LE) twice (logon + supplemental)
+        let kerberos_count = creds.windows(kerberos_utf16.len())
+            .filter(|w| *w == kerberos_utf16.as_slice())
             .count();
         assert_eq!(kerberos_count, 2);
         // Should contain the device token

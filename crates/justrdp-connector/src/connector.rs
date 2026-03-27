@@ -169,6 +169,37 @@ impl ClientConnector {
         }
     }
 
+    /// Get the CredSSP credential type based on the auth mode.
+    ///
+    /// Used by the caller when constructing a `CredsspSequence` during the
+    /// CredSSP/NLA phase (HYBRID/HYBRID_EX protocol).
+    pub fn credssp_credential_type(&self) -> crate::credssp::CredentialType {
+        match self.config.auth_mode {
+            crate::config::AuthMode::RemoteCredentialGuard => {
+                let kerberos_token = self.config.kerberos_token.clone().unwrap_or_default();
+                let supplemental_creds = if let Some(ref device_token) = self.config.device_kerberos_token {
+                    use justrdp_pdu::ntlm::messages::to_utf16le;
+                    alloc::vec![crate::credssp::SupplementalCred {
+                        package_name: to_utf16le("Kerberos"),
+                        cred_buffer: device_token.clone(),
+                    }]
+                } else {
+                    alloc::vec![]
+                };
+                crate::credssp::CredentialType::RemoteGuard {
+                    kerberos_token,
+                    supplemental_creds,
+                }
+            }
+            crate::config::AuthMode::RestrictedAdmin => {
+                crate::credssp::CredentialType::RestrictedAdmin
+            }
+            crate::config::AuthMode::Password => {
+                crate::credssp::CredentialType::Password
+            }
+        }
+    }
+
     // ── State handlers ──
 
     fn step_connection_initiation_send_request(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {

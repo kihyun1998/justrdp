@@ -59,6 +59,11 @@ pub enum RdstlsAuthDataType {
     Password = 0x0001,
     /// Auto-reconnect cookie.
     AutoReconnectCookie = 0x0002,
+    /// Redirected authentication (Remote Credential Guard).
+    ///
+    /// MS-RDPBCGR 2.2.23.2: When REDIRECTED_AUTHENTICATION_MODE is active,
+    /// the auth data contains the Kerberos AP-REQ token directly.
+    RedirectedAuthentication = 0x0003,
 }
 
 // ── Header ──
@@ -179,9 +184,12 @@ impl RdstlsAuthenticationRequest {
     }
 
     /// Create an auth request with a Kerberos token for Remote Credential Guard.
+    ///
+    /// Uses `RedirectedAuthentication` (0x0003) data type.
+    /// The auth data contains the raw Kerberos AP-REQ token.
     pub fn kerberos(kerberos_token: Vec<u8>) -> Self {
         Self {
-            data_type: RdstlsAuthDataType::Password as u16, // Still uses password type
+            data_type: RdstlsAuthDataType::RedirectedAuthentication as u16,
             redirect_flags: None,
             redirect_guid: None,
             auth_data: kerberos_token,
@@ -411,6 +419,7 @@ mod tests {
 
         let mut cursor = ReadCursor::new(&buf);
         let decoded = RdstlsAuthenticationRequest::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.data_type, RdstlsAuthDataType::RedirectedAuthentication as u16);
         assert_eq!(decoded.auth_data, token);
     }
 
