@@ -114,6 +114,8 @@ pub struct ClientConnector {
     server_capabilities: Vec<CapabilitySet>,
     /// Channel IDs assigned by server (from ServerNetworkData).
     channel_ids: Vec<u16>,
+    /// MCS message channel ID (for Auto-Detect PDUs).
+    mcs_message_channel_id: Option<u16>,
     /// All channels to join: [user_channel_id, io_channel_id, ...channel_ids].
     channels_to_join: Vec<u16>,
     /// Current index into `channels_to_join` for the join loop.
@@ -138,6 +140,8 @@ pub struct ClientConnector {
     session_id: u32,
     /// Stored RDP Assertion JSON for AAD auth (built after receiving server nonce).
     aad_auth_request_json: Option<alloc::string::String>,
+    /// Number of Deactivation-Reactivation cycles (for cache invalidation signaling).
+    deactivation_count: u32,
 }
 
 /// Standard RDP Security mode (none for TLS/NLA).
@@ -163,6 +167,7 @@ impl ClientConnector {
             share_id: 0,
             server_capabilities: Vec::new(),
             channel_ids: Vec::new(),
+            mcs_message_channel_id: None,
             channels_to_join: Vec::new(),
             join_index: 0,
             channel_join_sending: true,
@@ -174,12 +179,24 @@ impl ClientConnector {
             security_mode: SecurityMode::None,
             session_id: 0,
             aad_auth_request_json: None,
+            deactivation_count: 0,
         }
     }
 
     /// Get the negotiated security protocol.
     pub fn selected_protocol(&self) -> SecurityProtocol {
         self.selected_protocol
+    }
+
+    /// Get the number of Deactivation-Reactivation cycles.
+    /// Callers should check this to know if caches need to be invalidated.
+    pub fn deactivation_count(&self) -> u32 {
+        self.deactivation_count
+    }
+
+    /// Get the MCS message channel ID (for Auto-Detect PDUs).
+    pub fn mcs_message_channel_id(&self) -> Option<u16> {
+        self.mcs_message_channel_id
     }
 
     /// Get the connection result (only valid after reaching `Connected` state).
@@ -632,6 +649,11 @@ impl ClientConnector {
                     self.io_channel_id = net.mcs_channel_id;
                     self.channel_ids = net.channel_ids;
                 }
+                t if t == ServerDataBlockType::MessageChannelData as u16 => {
+                    // ServerMessageChannelData: mcs_message_channel_id (u16 LE)
+                    let msg_channel_id = block_cursor.read_u16_le("MsgChannelData::channelId")?;
+                    self.mcs_message_channel_id = Some(msg_channel_id);
+                }
                 _ => {
                     // Unknown block type — skip
                 }
@@ -952,11 +974,17 @@ impl ClientConnector {
     }
 
     /// Phase 8: Connect-Time Auto-Detection.
-    /// MS-RDPBCGR 1.3.1.1: server may optionally send auto-detect PDUs.
-    /// Currently a pass-through; transitions immediately to licensing.
-    fn step_connect_time_auto_detection(&mut self) -> ConnectorResult<Written> {
+    ///
+    /// MS-RDPBCGR 1.3.1.1: server may optionally send auto-detect PDUs on the
+    /// message channel. Most servers skip this and send the licensing PDU directly.
+    ///
+    /// Current behavior: forward the received PDU to the licensing handler.
+    /// The licensing handler already handles non-license PDUs gracefully.
+    /// TODO: implement full auto-detect sequence (RTT, bandwidth measurement).
+    fn step_connect_time_auto_detection(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
+        // Transition to licensing and let it process this PDU
         self.state = ClientConnectorState::LicensingExchange;
-        Ok(Written::nothing())
+        self.step_licensing_exchange(input, output)
     }
 
     fn step_licensing_exchange(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
@@ -1332,7 +1360,8 @@ impl ClientConnector {
 
         if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
             // Deactivation-Reactivation: go back to capabilities exchange
-            // MS-RDPBCGR 1.3.1.3
+            // MS-RDPBCGR 1.3.1.3 — caller should check deactivation_count() to flush caches
+            self.deactivation_count += 1;
             self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
             return Ok(Written::nothing());
         }
@@ -1372,6 +1401,7 @@ impl ClientConnector {
         let sc_hdr = ShareControlHeader::decode(&mut inner)?;
 
         if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
+            self.deactivation_count += 1;
             self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
             return Ok(Written::nothing());
         }
@@ -1536,7 +1566,7 @@ impl Sequence for ClientConnector {
                 self.step_secure_settings_exchange(output)
             }
             ClientConnectorState::ConnectTimeAutoDetection => {
-                self.step_connect_time_auto_detection()
+                self.step_connect_time_auto_detection(input, output)
             }
             ClientConnectorState::LicensingExchange => {
                 self.step_licensing_exchange(input, output)
@@ -1849,14 +1879,16 @@ mod tests {
     }
 
     #[test]
-    fn connect_time_auto_detection_pass_through() {
-        let config = Config::builder("user", "pass").build();
-        let mut connector = ClientConnector::new(config);
-        let mut output = WriteBuf::new();
+    fn connect_time_auto_detection_is_wait_state() {
+        let _config = Config::builder("user", "pass").build();
 
-        connector.state = ClientConnectorState::ConnectTimeAutoDetection;
-        connector.step(&[], &mut output).unwrap();
-        assert_eq!(*connector.state(), ClientConnectorState::LicensingExchange);
+        // ConnectTimeAutoDetection is a wait state (server sends first)
+        assert!(!ClientConnectorState::ConnectTimeAutoDetection.is_send_state());
+
+        // When in this state, next_pdu_hint should return TPKT hint (wait for server PDU)
+        let mut conn2 = ClientConnector::new(Config::builder("u", "p").build());
+        conn2.state = ClientConnectorState::ConnectTimeAutoDetection;
+        assert!(conn2.next_pdu_hint().is_some());
     }
 
     #[test]

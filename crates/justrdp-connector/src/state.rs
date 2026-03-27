@@ -184,7 +184,6 @@ impl ClientConnectorState {
                 | Self::ChannelConnectionChannelJoin
                 | Self::SecurityCommencement
                 | Self::SecureSettingsExchange
-                | Self::ConnectTimeAutoDetection
                 | Self::MultitransportBootstrapping
                 | Self::CapabilitiesExchangeSendConfirmActive
                 | Self::ConnectionFinalizationSendSynchronize

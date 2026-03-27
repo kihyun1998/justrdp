@@ -197,22 +197,41 @@ impl Encode for PrimaryOrder {
 /// Most orders use 3 bytes (up to 24 flag bits).  Simpler orders that
 /// have fewer fields need only 1 or 2 bytes.  This helper returns the
 /// byte count used during decoding.
+/// Field flags byte count per order type.
+///
+/// Formula: `ceil((field_count + 1) / 8)` per MS-RDPEGDI 2.2.2.2.1.1.2.
 fn field_flags_byte_count(order_type: PrimaryOrderType) -> usize {
     match order_type {
-        // Orders with <= 8 fields → 1 byte
-        PrimaryOrderType::DstBlt
-        | PrimaryOrderType::ScrBlt
-        | PrimaryOrderType::DrawNineGrid => 1,
+        // 1 byte: orders with <= 7 fields (ceil((n+1)/8) = 1 when n <= 7)
+        PrimaryOrderType::DstBlt           // 5 fields
+        | PrimaryOrderType::ScrBlt         // 7 fields
+        | PrimaryOrderType::DrawNineGrid   // 5 fields
+        | PrimaryOrderType::OpaqueRect     // 7 fields
+        | PrimaryOrderType::SaveBitmap     // 6 fields
+        | PrimaryOrderType::MultiDstBlt    // 7 fields
+        | PrimaryOrderType::Polyline       // 7 fields
+        | PrimaryOrderType::PolygonSc      // 7 fields
+        | PrimaryOrderType::EllipseSc      // 7 fields
+        => 1,
 
-        // Orders with <= 16 fields → 2 bytes
-        PrimaryOrderType::PatBlt
-        | PrimaryOrderType::OpaqueRect
-        | PrimaryOrderType::LineTo
-        | PrimaryOrderType::SaveBitmap
-        | PrimaryOrderType::MemBlt => 2,
+        // 2 bytes: orders with 8-15 fields
+        PrimaryOrderType::PatBlt           // 12 fields
+        | PrimaryOrderType::LineTo         // 10 fields
+        | PrimaryOrderType::MemBlt         // 9 fields
+        | PrimaryOrderType::MultiDrawNineGrid // 7 fields → actually 1, but spec says 2 (has extra fields)
+        | PrimaryOrderType::MultiPatBlt    // 14 fields
+        | PrimaryOrderType::MultiScrBlt    // 9 fields
+        | PrimaryOrderType::MultiOpaqueRect // 9 fields
+        | PrimaryOrderType::FastIndex      // 15 fields
+        | PrimaryOrderType::PolygonCb      // 13 fields
+        | PrimaryOrderType::FastGlyph      // 15 fields
+        | PrimaryOrderType::EllipseCb      // 13 fields
+        => 2,
 
-        // Everything else → 3 bytes
-        _ => 3,
+        // 3 bytes: orders with 16+ fields
+        PrimaryOrderType::Mem3Blt          // 16 fields
+        | PrimaryOrderType::GlyphIndex     // 22 fields
+        => 3,
     }
 }
 
@@ -673,9 +692,10 @@ mod tests {
 
     #[test]
     fn primary_order_roundtrip_with_bounds() {
+        // OpaqueRect has 7 fields → 1-byte fieldFlags (max 0x7F)
         let order = PrimaryOrder {
             order_type: PrimaryOrderType::OpaqueRect,
-            field_flags: 0x01FF,
+            field_flags: 0x7F, // all 7 fields present
             bounds: Some(BoundsRect { left: 0, top: 0, right: 1920, bottom: 1080 }),
             data: vec![0x01, 0x02],
         };
@@ -684,7 +704,7 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         let decoded = PrimaryOrder::decode(&mut cursor).unwrap();
         assert_eq!(decoded.order_type, PrimaryOrderType::OpaqueRect);
-        assert_eq!(decoded.field_flags, 0x01FF);
+        assert_eq!(decoded.field_flags, 0x7F);
         assert_eq!(decoded.bounds.unwrap().right, 1920);
         assert_eq!(decoded.data, vec![0x01, 0x02]);
     }
