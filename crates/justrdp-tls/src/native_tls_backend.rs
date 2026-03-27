@@ -40,7 +40,7 @@ impl Default for NativeTlsUpgrader {
 impl TlsUpgrader for NativeTlsUpgrader {
     type Stream = native_tls::TlsStream<Box<dyn ReadWrite>>;
 
-    fn upgrade<S: Read + Write>(
+    fn upgrade<S: Read + Write + 'static>(
         &self,
         stream: S,
         server_name: &str,
