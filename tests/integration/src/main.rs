@@ -161,14 +161,6 @@ fn main() {
                     if n == 0 {
                         panic!("server closed connection during CredSSP");
                     }
-                    // Hex dump for debugging
-                    print!("    hex: ");
-                    for b in &buf[..n.min(64)] {
-                        print!("{:02x} ", b);
-                    }
-                    if n > 64 { print!("..."); }
-                    println!();
-
                     let response = match credssp.step(&buf[..n]) {
                         Ok(r) => r,
                         Err(e) => {
@@ -326,12 +318,6 @@ fn drive_connector_until(
                 total,
                 connector.state()
             );
-            for chunk in buf[..total].chunks(32) {
-                print!("    ");
-                for b in chunk { print!("{:02x} ", b); }
-                println!();
-            }
-
             output.clear();
             let written = connector
                 .step(&buf[..total], output)
@@ -407,18 +393,15 @@ fn drive_connector_tls<S: Read + Write>(
         if hint.is_none() {
             // Send state
             output.clear();
-            let pre_state = format!("{:?}", connector.state());
             let written = connector
                 .step(&[], output)
-                .unwrap_or_else(|e| {
-                    panic!("[{}] step failed (send, was {}): {}", phase_name, pre_state, e);
-                });
+                .unwrap_or_else(|e| panic!("[{}] step failed: {}", phase_name, e));
 
             if written.size > 0 {
                 let data = &output.as_mut_slice()[..written.size];
                 println!(
-                    "[*] {} sent {} bytes (was: {} now: {:?})",
-                    phase_name, written.size, pre_state, connector.state()
+                    "[*] {} sent {} bytes (state: {:?})",
+                    phase_name, written.size, connector.state()
                 );
                 stream
                     .write_all(data)
@@ -456,12 +439,6 @@ fn drive_connector_tls<S: Read + Write>(
                 total,
                 connector.state()
             );
-            for chunk in buf[..total].chunks(32) {
-                print!("    ");
-                for b in chunk { print!("{:02x} ", b); }
-                println!();
-            }
-
             output.clear();
             let written = connector
                 .step(&buf[..total], output)

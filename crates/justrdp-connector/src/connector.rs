@@ -1117,18 +1117,6 @@ impl ClientConnector {
 
         let confirm_bytes = justrdp_core::encode_vec(&confirm)?;
 
-        // DEBUG: dump ConfirmActive body for diagnosis
-        #[cfg(debug_assertions)]
-        {
-            extern crate std;
-            std::eprintln!("[DBG] ConfirmActive body: {} bytes, {} caps", confirm_bytes.len(), confirm.capability_sets.len());
-            for chunk in confirm_bytes.chunks(32) {
-                std::eprint!("  ");
-                for b in chunk { std::eprint!("{:02x} ", b); }
-                std::eprintln!();
-            }
-        }
-
         let sc_payload = wrap_share_control(
             ShareControlPduType::ConfirmActivePdu,
             self.user_channel_id,
