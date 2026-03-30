@@ -68,7 +68,7 @@ fn main() {
         "Connection Initiation",
     );
 
-    println!("[+] Security upgrade required (protocol: TLS/NLA)");
+    println!("[+] Security upgrade required (protocol: {:?})", connector.selected_protocol());
 
     // Phase 2: TLS Upgrade
     // Signal the connector that we're about to do TLS
@@ -146,13 +146,6 @@ fn main() {
                     };
                     if !response.is_empty() {
                         println!("[*] CredSSP send authenticate+pubKeyAuth: {} bytes", response.len());
-                        // Dump first 100 bytes of outgoing TsRequest
-                        print!("    out hex: ");
-                        for b in &response[..response.len().min(100)] {
-                            print!("{:02x} ", b);
-                        }
-                        println!("...");
-
                         tls_stream.write_all(&response).expect("TLS write failed");
                         tls_stream.flush().expect("TLS flush failed");
                     }

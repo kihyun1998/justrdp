@@ -186,6 +186,16 @@ impl CredsspSequence {
         &self.state
     }
 
+    /// Debug accessor: current send sequence number.
+    pub fn send_seq_num(&self) -> u32 {
+        self.send_seq_num
+    }
+
+    /// Debug accessor: negotiated CredSSP version.
+    pub fn negotiated_version(&self) -> u32 {
+        self.negotiated_version
+    }
+
     /// Step the CredSSP sequence.
     pub fn step(&mut self, input: &[u8]) -> ConnectorResult<Vec<u8>> {
         match self.state {
@@ -209,8 +219,7 @@ impl CredsspSequence {
 
         let mut ts_request = TsRequest::new();
         ts_request.nego_tokens = Some(spnego_token);
-        // Always include clientNonce; server version determines if it's used for pubKeyAuth.
-        ts_request.client_nonce = Some(self.random.client_nonce);
+        // Per MS-CSSP 3.1.5: clientNonce is sent with the Authenticate TsRequest, not here.
 
         self.state = CredsspState::WaitChallenge;
         Ok(ts_request.encode())
@@ -318,7 +327,7 @@ impl CredsspSequence {
             mic: [0u8; 16], // Zeroed for MIC computation
         };
 
-        // Compute MIC: HMAC_MD5(ExportedSessionKey, Negotiate + Challenge + Authenticate_with_zeroed_MIC)
+        // Compute MIC: HMAC_MD5(ExportedSessionKey, Negotiate + Challenge + Authenticate_zeroed_MIC)
         let auth_bytes_zeroed_mic = authenticate.to_bytes();
         let mic = compute_mic(
             &self.exported_session_key,
@@ -329,21 +338,34 @@ impl CredsspSequence {
         authenticate.mic = mic;
         let authenticate_bytes = authenticate.to_bytes();
 
-        // Initialize persistent signing/sealing keys from ExportedSessionKey
-        // Client-to-server (send)
         self.send_signing_key = signing::signing_key(&self.exported_session_key, true);
         let seal_key = signing::sealing_key(&self.exported_session_key, true);
         self.send_sealing_rc4 = Some(Rc4::new(&seal_key));
-        // Server-to-client (receive) — for pubKeyAuth verification
         self.recv_signing_key = signing::signing_key(&self.exported_session_key, false);
         let recv_seal_key = signing::sealing_key(&self.exported_session_key, false);
         self.recv_sealing_rc4 = Some(Rc4::new(&recv_seal_key));
 
-        // Compute pubKeyAuth
-        let pub_key_auth = self.compute_pub_key_auth()?;
+        // mechListMIC uses a TEMPORARY RC4 (seq=0), then RC4 state is restored.
+        // pubKeyAuth uses the main RC4 at initial state (seq=1, since seq continues).
+        let mech_list_mic = {
+            let mut temp_rc4 = Rc4::new(&seal_key);
+            let mech_types = spnego::mech_types_bytes();
+            let mut hmac_input = vec![0u8; 4 + mech_types.len()];
+            hmac_input[4..].copy_from_slice(&mech_types);
+            let digest = hmac_md5(&self.send_signing_key, &hmac_input);
+            let mut checksum = [0u8; 8];
+            checksum.copy_from_slice(&digest[..8]);
+            temp_rc4.process(&mut checksum);
+            let mut mac = [0u8; 16];
+            mac[..4].copy_from_slice(&1u32.to_le_bytes());
+            mac[4..12].copy_from_slice(&checksum);
+            mac
+        };
+        // seq_num continues past mechListMIC
+        self.send_seq_num = 1;
 
-        // Wrap Authenticate in SPNEGO NegTokenResp
-        let spnego_token = spnego::wrap_authenticate(&authenticate_bytes);
+        let pub_key_auth = self.compute_pub_key_auth()?;
+        let spnego_token = spnego::wrap_authenticate(&authenticate_bytes, Some(&mech_list_mic));
 
         // Build TsRequest with negoTokens AND pubKeyAuth (MS-CSSP 3.1.5: sent together)
         let mut ts_request = TsRequest::new();
@@ -369,10 +391,27 @@ impl CredsspSequence {
             }
         }
 
+        // Process server's SPNEGO NegTokenResp (may contain mechListMIC).
+        // If the server sent mechListMIC, we must verify it and advance recv_seq_num
+        // before verifying pubKeyAuth (which the server sent at seq=1).
+        // Process server's SPNEGO mechListMIC.
+        // Per MS-SPNG: after mechListMIC, RC4 state is restored to initial.
+        // seq_num continues (mechListMIC=0, pubKeyAuth=1).
+        if let Some(ref nego_tokens) = server_ts.nego_tokens {
+            if let Ok(resp) = justrdp_pdu::kerberos::spnego::NegTokenResp::decode(nego_tokens) {
+                if let Some(ref mic_bytes) = resp.mech_list_mic {
+                    self.ntlm_verify_mic(mic_bytes, &spnego::mech_types_bytes())?;
+                    // Restore recv RC4 to initial state (per MS-SPNG save/restore)
+                    let recv_seal_key = signing::sealing_key(&self.exported_session_key, false);
+                    self.recv_sealing_rc4 = Some(Rc4::new(&recv_seal_key));
+                }
+            }
+        }
+
         let server_pub_key_auth = server_ts.pub_key_auth
             .ok_or_else(|| ConnectorError::general("server TsRequest missing pubKeyAuth"))?;
 
-        // Decrypt server's pubKeyAuth
+        // Decrypt server's pubKeyAuth (seq follows after mechListMIC verification)
         let decrypted = self.ntlm_decrypt(&server_pub_key_auth)?;
 
         // Verify server's hash — use same key bytes as compute_pub_key_auth
@@ -475,7 +514,7 @@ impl CredsspSequence {
     /// v2-v4: encrypt SubjectPublicKey
     /// v5+: encrypt SHA256("CredSSP Client-To-Server Binding Hash\0" + Nonce + SubjectPublicKey)
     fn compute_pub_key_auth(&mut self) -> ConnectorResult<Vec<u8>> {
-        // For v2-v4: encrypt SubjectPublicKey (BIT STRING contents with unused-bits byte)
+        // For v2-v4: encrypt SubjectPublicKey (BIT STRING value, without unused-bits byte)
         // For v5+: SHA256(magic + nonce + SubjectPublicKey)
         let subject_public_key = extract_subject_public_key(&self.server_public_key)
             .ok_or_else(|| ConnectorError::general(
@@ -493,6 +532,62 @@ impl CredsspSequence {
             // v2-v4: encrypt SubjectPublicKey directly
             Ok(self.ntlm_encrypt(&subject_public_key))
         }
+    }
+
+    /// NTLM sign (MAC only, no encryption) per MS-NLMP 3.4.4.2.
+    ///
+    /// Used for SPNEGO mechListMIC (GSS_GetMIC).
+    /// Returns 16-byte MAC: Version(4) + Checksum(8) + SeqNum(4).
+    fn ntlm_sign(&mut self, message: &[u8]) -> [u8; 16] {
+        let rc4 = self.send_sealing_rc4.as_mut().expect("sealing key not initialized");
+        let seq_num = self.send_seq_num;
+        self.send_seq_num += 1;
+
+        // HMAC_MD5(SigningKey, SeqNum + Message)
+        let mut hmac_input = vec![0u8; 4 + message.len()];
+        hmac_input[..4].copy_from_slice(&seq_num.to_le_bytes());
+        hmac_input[4..].copy_from_slice(message);
+        let digest = hmac_md5(&self.send_signing_key, &hmac_input);
+
+        // RC4-encrypt first 8 bytes of HMAC
+        let mut checksum = [0u8; 8];
+        checksum.copy_from_slice(&digest[..8]);
+        rc4.process(&mut checksum);
+
+        // Build MAC: Version(0x00000001) + Checksum(8) + SeqNum(4)
+        let mut mac = [0u8; 16];
+        mac[..4].copy_from_slice(&1u32.to_le_bytes());
+        mac[4..12].copy_from_slice(&checksum);
+        mac[12..16].copy_from_slice(&seq_num.to_le_bytes());
+
+        mac
+    }
+
+    /// Verify a received NTLM MAC (mechListMIC from server) using the recv context.
+    fn ntlm_verify_mic(&mut self, received_mac: &[u8], message: &[u8]) -> ConnectorResult<()> {
+        if received_mac.len() != 16 {
+            return Err(ConnectorError::general("mechListMIC must be 16 bytes"));
+        }
+        let rc4 = self.recv_sealing_rc4.as_mut()
+            .ok_or_else(|| ConnectorError::general("recv sealing key not initialized"))?;
+        let seq_num = self.recv_seq_num;
+        self.recv_seq_num += 1;
+
+        // Recompute: HMAC_MD5(RecvSigningKey, SeqNum + message)
+        let mut hmac_input = vec![0u8; 4 + message.len()];
+        hmac_input[..4].copy_from_slice(&seq_num.to_le_bytes());
+        hmac_input[4..].copy_from_slice(message);
+        let digest = hmac_md5(&self.recv_signing_key, &hmac_input);
+
+        // RC4-encrypt first 8 bytes
+        let mut expected_checksum = [0u8; 8];
+        expected_checksum.copy_from_slice(&digest[..8]);
+        rc4.process(&mut expected_checksum);
+
+        if &received_mac[4..12] != &expected_checksum {
+            return Err(ConnectorError::general("server mechListMIC verification failed"));
+        }
+        Ok(())
     }
 
     /// NTLM encrypt (seal) a message: produces signature(16) + encrypted_data.
@@ -778,11 +873,14 @@ fn extract_subject_public_key(spki: &[u8]) -> Option<Vec<u8>> {
     }
     pos += 1;
     let len = der_read_content_length(spki, &mut pos)?;
-    if pos + len > spki.len() {
+    if pos + len > spki.len() || len == 0 {
         return None;
     }
 
-    Some(spki[pos..pos + len].to_vec())
+    // Skip the BIT STRING "unused bits" byte (always 0x00 for keys).
+    // MS-CSSP uses the SubjectPublicKey VALUE (the actual key bits),
+    // not the DER encoding. Windows CRYPT_BIT_BLOB.pbData excludes this byte.
+    Some(spki[pos + 1..pos + len].to_vec())
 }
 
 /// Skip a DER length field, returning the length value.
@@ -852,7 +950,8 @@ mod tests {
 
         let ts_req = TsRequest::decode(&output).unwrap();
         assert!(ts_req.nego_tokens.is_some());
-        assert!(ts_req.client_nonce.is_some());
+        // clientNonce is sent with Authenticate TsRequest, not here (MS-CSSP 3.1.5)
+        assert!(ts_req.client_nonce.is_none());
         assert_eq!(*seq.state(), CredsspState::WaitChallenge);
     }
 
@@ -916,9 +1015,9 @@ mod tests {
         ];
 
         let result = extract_subject_public_key(&spki).unwrap();
-        // Should get BIT STRING contents (14 bytes including unused-bits byte)
-        assert_eq!(result.len(), 14);
-        assert_eq!(result[0], 0x00); // unused bits byte
+        // Should get BIT STRING value WITHOUT unused-bits byte (13 bytes)
+        assert_eq!(result.len(), 13);
+        assert_eq!(result[0], 0x30); // RSA key SEQUENCE tag (not 0x00 unused bits)
     }
 
     #[test]
@@ -1041,7 +1140,8 @@ mod tests {
         seq.negotiated_version = 4;
         let auth_v4 = seq.compute_pub_key_auth().unwrap();
         // signature(16) + encrypted_data(14 = BIT STRING content length)
-        assert_eq!(auth_v4.len(), 16 + 14);
+        // signature(16) + encrypted_data(13 = BIT STRING content without unused bits byte)
+        assert_eq!(auth_v4.len(), 16 + 13);
     }
 
     // ── Test #8: EarlyUserAuthResult success and error paths ──
@@ -1123,5 +1223,151 @@ mod tests {
         assert_eq!(kerberos_count, 2);
         // Should contain the device token
         assert!(creds.windows(32).any(|w| w == device_token.as_slice()));
+    }
+
+    // ── Test: mechListMIC + pubKeyAuth roundtrip (client↔server simulation) ──
+
+    /// Simulate the server-side verification of mechListMIC and pubKeyAuth.
+    ///
+    /// This verifies that the seq_num ordering (mechListMIC=0, pubKeyAuth=1) is
+    /// consistent between the client's sign/seal and the server's verify/unseal.
+    #[test]
+    fn mech_list_mic_and_pub_key_auth_roundtrip() {
+        let key = [0x55u8; 16];
+        let mech_types = spnego::mech_types_bytes();
+        let pub_key_data = b"fake SubjectPublicKey for testing";
+
+        // ── Client side: mechListMIC (seq=0) then pubKeyAuth (seq=1) ──
+        let mut client = CredsspSequence::new("user", "pass", "", vec![], test_random(), false);
+        client.exported_session_key = key;
+        client.send_signing_key = signing::signing_key(&key, true);
+        let send_seal_key = signing::sealing_key(&key, true);
+        client.send_sealing_rc4 = Some(Rc4::new(&send_seal_key));
+
+        let client_mic = client.ntlm_sign(&mech_types);   // seq_num=0
+        let client_sealed = client.ntlm_encrypt(pub_key_data); // seq_num=1
+
+        assert_eq!(client.send_seq_num, 2);
+        assert_eq!(u32::from_le_bytes(client_mic[12..16].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(client_sealed[12..16].try_into().unwrap()), 1);
+
+        // ── Server side: verify mechListMIC (seq=0) then unseal pubKeyAuth (seq=1) ──
+        // Server uses client-to-server keys for verification (same direction).
+        let server_sign_key = signing::signing_key(&key, true);
+        let server_seal_key = signing::sealing_key(&key, true);
+        let mut server_rc4 = Rc4::new(&server_seal_key);
+        let mut server_seq_num: u32 = 0;
+
+        // Verify mechListMIC (sign-only, no decryption)
+        {
+            let seq_num = server_seq_num;
+            server_seq_num += 1;
+
+            // Recompute HMAC_MD5(SigningKey, SeqNum + mechTypes)
+            let mut hmac_input = vec![0u8; 4 + mech_types.len()];
+            hmac_input[..4].copy_from_slice(&seq_num.to_le_bytes());
+            hmac_input[4..].copy_from_slice(&mech_types);
+            let digest = hmac_md5(&server_sign_key, &hmac_input);
+
+            // RC4-encrypt first 8 bytes (advances server RC4 stream)
+            let mut expected_checksum = [0u8; 8];
+            expected_checksum.copy_from_slice(&digest[..8]);
+            server_rc4.process(&mut expected_checksum);
+
+            // Compare with client's mechListMIC
+            assert_eq!(&client_mic[..4], &1u32.to_le_bytes(), "version mismatch");
+            assert_eq!(&client_mic[4..12], &expected_checksum, "mechListMIC checksum mismatch");
+            assert_eq!(&client_mic[12..16], &seq_num.to_le_bytes(), "mechListMIC seq_num mismatch");
+        }
+
+        // Unseal pubKeyAuth (decrypt + verify)
+        {
+            let seq_num = server_seq_num;
+            // server_seq_num += 1;
+
+            let encrypted_data = &client_sealed[16..];
+            let client_checksum = &client_sealed[4..12];
+
+            // Step 1: RC4-decrypt message data
+            let mut plaintext = encrypted_data.to_vec();
+            server_rc4.process(&mut plaintext);
+
+            assert_eq!(plaintext, pub_key_data, "pubKeyAuth decryption mismatch");
+
+            // Step 2: HMAC over SeqNum + decrypted plaintext
+            let mut hmac_input = vec![0u8; 4 + plaintext.len()];
+            hmac_input[..4].copy_from_slice(&seq_num.to_le_bytes());
+            hmac_input[4..].copy_from_slice(&plaintext);
+            let digest = hmac_md5(&server_sign_key, &hmac_input);
+
+            // Step 3: RC4-encrypt checksum
+            let mut expected_checksum = [0u8; 8];
+            expected_checksum.copy_from_slice(&digest[..8]);
+            server_rc4.process(&mut expected_checksum);
+
+            assert_eq!(client_checksum, &expected_checksum, "pubKeyAuth MAC mismatch");
+        }
+    }
+
+    /// Same test but with reversed order (pubKeyAuth=0, mechListMIC=1).
+    /// Both orders should produce internally-consistent results — but only
+    /// one matches what the server expects. This test verifies the crypto
+    /// is self-consistent for both orderings.
+    #[test]
+    fn pub_key_auth_then_mech_list_mic_roundtrip() {
+        let key = [0x55u8; 16];
+        let mech_types = spnego::mech_types_bytes();
+        let pub_key_data = b"fake SubjectPublicKey for testing";
+
+        // ── Client side: pubKeyAuth (seq=0) then mechListMIC (seq=1) ──
+        let mut client = CredsspSequence::new("user", "pass", "", vec![], test_random(), false);
+        client.exported_session_key = key;
+        client.send_signing_key = signing::signing_key(&key, true);
+        let send_seal_key = signing::sealing_key(&key, true);
+        client.send_sealing_rc4 = Some(Rc4::new(&send_seal_key));
+
+        let client_sealed = client.ntlm_encrypt(pub_key_data); // seq_num=0
+        let client_mic = client.ntlm_sign(&mech_types);        // seq_num=1
+
+        // ── Server side: unseal pubKeyAuth (seq=0) then verify mechListMIC (seq=1) ──
+        let server_sign_key = signing::signing_key(&key, true);
+        let server_seal_key = signing::sealing_key(&key, true);
+        let mut server_rc4 = Rc4::new(&server_seal_key);
+        let mut server_seq_num: u32 = 0;
+
+        // Unseal pubKeyAuth first
+        {
+            let seq_num = server_seq_num;
+            server_seq_num += 1;
+
+            let mut plaintext = client_sealed[16..].to_vec();
+            server_rc4.process(&mut plaintext);
+            assert_eq!(plaintext, pub_key_data);
+
+            let mut hmac_input = vec![0u8; 4 + plaintext.len()];
+            hmac_input[..4].copy_from_slice(&seq_num.to_le_bytes());
+            hmac_input[4..].copy_from_slice(&plaintext);
+            let digest = hmac_md5(&server_sign_key, &hmac_input);
+
+            let mut expected_checksum = [0u8; 8];
+            expected_checksum.copy_from_slice(&digest[..8]);
+            server_rc4.process(&mut expected_checksum);
+            assert_eq!(&client_sealed[4..12], &expected_checksum, "pubKeyAuth MAC mismatch (order B)");
+        }
+
+        // Verify mechListMIC second
+        {
+            let seq_num = server_seq_num;
+
+            let mut hmac_input = vec![0u8; 4 + mech_types.len()];
+            hmac_input[..4].copy_from_slice(&seq_num.to_le_bytes());
+            hmac_input[4..].copy_from_slice(&mech_types);
+            let digest = hmac_md5(&server_sign_key, &hmac_input);
+
+            let mut expected_checksum = [0u8; 8];
+            expected_checksum.copy_from_slice(&digest[..8]);
+            server_rc4.process(&mut expected_checksum);
+            assert_eq!(&client_mic[4..12], &expected_checksum, "mechListMIC checksum mismatch (order B)");
+        }
     }
 }

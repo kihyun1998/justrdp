@@ -42,8 +42,20 @@ pub fn modify_target_info(server_target_info: &[u8]) -> Vec<u8> {
     let has_timestamp = pairs.iter().any(|p| p.id == AvId::MsvAvTimestamp as u16);
 
     if has_timestamp {
-        // TODO: Re-enable MsvAvFlags MIC_PROVIDED after MIC bug is fixed
-        // For now, skip setting MsvAvFlags so server doesn't check MIC
+        // MS-NLMP 3.1.5.1.2: Set MsvAvFlags bit 0x02 (MIC_PROVIDED).
+        let flags_idx = pairs.iter().position(|p| p.id == AvId::MsvAvFlags as u16);
+        if let Some(idx) = flags_idx {
+            if pairs[idx].value.len() >= 4 {
+                let mut flags = u32::from_le_bytes(pairs[idx].value[..4].try_into().unwrap());
+                flags |= 0x02;
+                pairs[idx].value = flags.to_le_bytes().to_vec();
+            }
+        } else {
+            pairs.push(AvPair {
+                id: AvId::MsvAvFlags as u16,
+                value: 0x0002u32.to_le_bytes().to_vec(),
+            });
+        }
     }
 
     // Add MsvAvChannelBindings = Z(16) if not present
@@ -270,10 +282,66 @@ mod tests {
         let modified = modify_target_info(&original);
         let result = AvPair::parse_list(&modified).unwrap();
 
-        // Should have: NbDomainName, Timestamp, ChannelBindings, TargetName
-        // Note: MsvAvFlags MIC_PROVIDED is temporarily disabled (MIC bug)
+        // Should have: NbDomainName, Timestamp, Flags(0x02), ChannelBindings, TargetName
+        assert!(result.iter().any(|p| p.id == AvId::MsvAvFlags as u16));
         assert!(result.iter().any(|p| p.id == AvId::MsvAvChannelBindings as u16));
         assert!(result.iter().any(|p| p.id == AvId::MsvAvTargetName as u16));
+
+        // MsvAvFlags should have bit 0x02 set
+        let flags_pair = result.iter().find(|p| p.id == AvId::MsvAvFlags as u16).unwrap();
+        let flags = u32::from_le_bytes(flags_pair.value[..4].try_into().unwrap());
+        assert_eq!(flags & 0x02, 0x02);
+    }
+
+    /// Verify NTProofStr against actual wire bytes from a real server connection.
+    /// If this fails, NTLM authentication will fail (NTProofStr mismatch).
+    #[test]
+    fn verify_ntproofstr_against_wire_dump() {
+        // Exact values from integration test against WIN-SDMVHM60SAC
+        let password = "qweQWEqwe!";
+        let username = "rdptest";
+        let domain = "WIN-SDMVHM60SAC";
+
+        let server_challenge: [u8; 8] = [0x23, 0x14, 0x02, 0xe3, 0xbd, 0x2b, 0xdc, 0xf4];
+        let client_challenge: [u8; 8] = [0x35, 0xaf, 0x90, 0xe9, 0x6c, 0x4c, 0xc6, 0xeb];
+        let timestamp: u64 = u64::from_le_bytes([0x29, 0x0c, 0x55, 0x32, 0xf0, 0xbf, 0xdc, 0x01]);
+
+        #[rustfmt::skip]
+        let server_target_info: &[u8] = &[
+            0x02, 0x00, 0x1e, 0x00,
+            0x57, 0x00, 0x49, 0x00, 0x4e, 0x00, 0x2d, 0x00, 0x53, 0x00, 0x44, 0x00, 0x4d, 0x00, 0x56, 0x00,
+            0x48, 0x00, 0x4d, 0x00, 0x36, 0x00, 0x30, 0x00, 0x53, 0x00, 0x41, 0x00, 0x43, 0x00,
+            0x01, 0x00, 0x1e, 0x00,
+            0x57, 0x00, 0x49, 0x00, 0x4e, 0x00, 0x2d, 0x00, 0x53, 0x00, 0x44, 0x00, 0x4d, 0x00, 0x56, 0x00,
+            0x48, 0x00, 0x4d, 0x00, 0x36, 0x00, 0x30, 0x00, 0x53, 0x00, 0x41, 0x00, 0x43, 0x00,
+            0x04, 0x00, 0x1e, 0x00,
+            0x57, 0x00, 0x49, 0x00, 0x4e, 0x00, 0x2d, 0x00, 0x53, 0x00, 0x44, 0x00, 0x4d, 0x00, 0x56, 0x00,
+            0x48, 0x00, 0x4d, 0x00, 0x36, 0x00, 0x30, 0x00, 0x53, 0x00, 0x41, 0x00, 0x43, 0x00,
+            0x03, 0x00, 0x1e, 0x00,
+            0x57, 0x00, 0x49, 0x00, 0x4e, 0x00, 0x2d, 0x00, 0x53, 0x00, 0x44, 0x00, 0x4d, 0x00, 0x56, 0x00,
+            0x48, 0x00, 0x4d, 0x00, 0x36, 0x00, 0x30, 0x00, 0x53, 0x00, 0x41, 0x00, 0x43, 0x00,
+            0x07, 0x00, 0x08, 0x00,
+            0x29, 0x0c, 0x55, 0x32, 0xf0, 0xbf, 0xdc, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let response_key = ntowfv2(password, username, domain);
+        let modified_target_info = modify_target_info(server_target_info);
+
+        let (nt_response, _, _) = compute_response(
+            &response_key, &server_challenge, &client_challenge,
+            timestamp, &modified_target_info, true,
+        );
+
+        let nt_proof_str = &nt_response[..16];
+
+        // Wire NTProofStr extracted from actual server connection
+        assert_eq!(
+            nt_proof_str,
+            &[0xd5, 0xbb, 0xd7, 0x4f, 0x26, 0x79, 0x23, 0xc1,
+              0xf2, 0xf1, 0xd5, 0xc0, 0x8e, 0xda, 0xd0, 0x62],
+            "NTProofStr mismatch — NTLM authentication would fail on server"
+        );
     }
 
     #[test]

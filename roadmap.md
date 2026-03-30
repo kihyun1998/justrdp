@@ -566,7 +566,7 @@ pub enum ClientConnectorState {
 - [x] NTLMv2 해시 계산 (NTOWFv2)
 - [x] NTProofStr 생성
 - [x] 세션 키 파생
-- [ ] MIC (Message Integrity Code) 계산 -- `MsvAvFlags MIC_PROVIDED` 설정 시 서버 검증 실패 버그
+- [x] MIC (Message Integrity Code) 계산 -- SPNEGO mechListMIC 누락이 원인. MsvAvFlags MIC_PROVIDED 재활성화 + mechListMIC 추가로 수정
 - [x] NTLM 서명/봉인 (signing/sealing)
 - [x] 빈 도메인 시 서버 `NbDomainName` 자동 사용 (로컬 계정 지원)
 
@@ -623,7 +623,7 @@ pub enum ClientConnectorState {
 > 아래 항목을 실서버(192.168.136.136)로 단계별 검증 필요.
 
 **NTLM 잔여 버그:**
-- [ ] MIC 버그 수정 -- `modify_target_info`에서 `MsvAvFlags MIC_PROVIDED` 설정 시 서버 MIC 검증 실패. 현재 workaround: MsvAvFlags 미설정 (MIC 비활성화)
+- [x] MIC 버그 수정 -- 원인: SPNEGO mechListMIC 누락 (MS-SPNG 요구사항). `wrap_authenticate`에 mechListMIC 추가, `ntlm_sign` 메서드 추가, MsvAvFlags MIC_PROVIDED 재활성화
 - [ ] MIC 활성화 후 CredSSP v6 접속 재검증
 
 **BasicSettingsExchange (connector Phase 4):**

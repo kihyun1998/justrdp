@@ -54,23 +54,41 @@ pub fn wrap_negotiate(ntlm_token: &[u8]) -> Vec<u8> {
     result
 }
 
+/// Return the DER-encoded mechTypes SEQUENCE from NegTokenInit.
+///
+/// This is `SEQUENCE { OID NTLMSSP }` — needed for SPNEGO mechListMIC computation.
+pub fn mech_types_bytes() -> Vec<u8> {
+    der_sequence(NTLMSSP_OID)
+}
+
 /// Wrap an NTLM Authenticate token in SPNEGO NegTokenResp.
 ///
-/// Per RFC 4178: the client's final Authenticate message omits negState,
-/// as this is the last token in the NTLM exchange.
+/// When `mech_list_mic` is provided (MIC_PROVIDED is set), includes `[3] mechListMIC`
+/// per MS-SPNG: required when AUTHENTICATE_MESSAGE contains a non-zero MIC.
 ///
 /// Structure:
 /// ```text
 /// [1] NegTokenResp SEQUENCE {
-///   [2] responseToken OCTET STRING { ntlm_authenticate }
+///   [2] responseToken OCTET STRING { ntlm_authenticate },
+///   [3] mechListMIC OCTET STRING { mic } (optional)
 /// }
 /// ```
-pub fn wrap_authenticate(ntlm_token: &[u8]) -> Vec<u8> {
-    // [2] responseToken OCTET STRING (no negState per RFC 4178 for final token)
+pub fn wrap_authenticate(ntlm_token: &[u8], mech_list_mic: Option<&[u8]>) -> Vec<u8> {
+    let mut body = Vec::new();
+
+    // [2] responseToken OCTET STRING
     let response_token = der_octet_string(ntlm_token);
     let response_token_tagged = der_context_tag(2, &response_token);
+    body.extend_from_slice(&response_token_tagged);
 
-    let neg_token_resp = der_sequence(&response_token_tagged);
+    // [3] mechListMIC OCTET STRING (per MS-SPNG, required when MIC_PROVIDED is set)
+    if let Some(mic) = mech_list_mic {
+        let mic_octet = der_octet_string(mic);
+        let mic_tagged = der_context_tag(3, &mic_octet);
+        body.extend_from_slice(&mic_tagged);
+    }
+
+    let neg_token_resp = der_sequence(&body);
     der_context_tag(1, &neg_token_resp)
 }
 
@@ -210,11 +228,25 @@ mod tests {
     #[test]
     fn wrap_authenticate_produces_neg_token_resp() {
         let token = b"test_auth_token";
-        let resp = wrap_authenticate(token);
+        let resp = wrap_authenticate(token, None);
 
         // Should start with [1] context tag
         assert_eq!(resp[0] & 0xE0, 0xA0); // Context-specific
         assert_eq!(resp[0] & 0x1F, 1);     // Tag number 1
+    }
+
+    #[test]
+    fn wrap_authenticate_with_mech_list_mic() {
+        let token = b"test_auth_token";
+        let mic = [0xAA; 16];
+        let resp = wrap_authenticate(token, Some(&mic));
+
+        // Should start with [1] context tag
+        assert_eq!(resp[0] & 0xE0, 0xA0);
+        assert_eq!(resp[0] & 0x1F, 1);
+
+        // Should contain the MIC bytes somewhere in the output
+        assert!(resp.windows(16).any(|w| w == &mic));
     }
 
     #[test]
