@@ -566,8 +566,9 @@ pub enum ClientConnectorState {
 - [x] NTLMv2 해시 계산 (NTOWFv2)
 - [x] NTProofStr 생성
 - [x] 세션 키 파생
-- [x] MIC (Message Integrity Code) 계산
+- [ ] MIC (Message Integrity Code) 계산 -- `MsvAvFlags MIC_PROVIDED` 설정 시 서버 검증 실패 버그
 - [x] NTLM 서명/봉인 (signing/sealing)
+- [x] 빈 도메인 시 서버 `NbDomainName` 자동 사용 (로컬 계정 지원)
 
 #### 5.2.3 Kerberos Authentication
 
@@ -615,7 +616,31 @@ pub enum ClientConnectorState {
 > AVD/Windows 365 사용 시 caller가 직접 ARM API를 호출하여 hostname/device ID를 알아낸 뒤
 > `AadConfig.resource_uri`에 전달해야 합니다. 일반 Windows Server 연결에는 불필요합니다.
 
-### 5.3 `justrdp-tls` -- TLS Transport
+### 5.3 실서버 연결 시퀀스 검증
+
+> CredSSP/NLA 핸드셰이크 성공 확인 (2026-03-30).
+> BasicSettingsExchange 이후 서버가 연결을 끊는 문제 발견.
+> 아래 항목을 실서버(192.168.136.136)로 단계별 검증 필요.
+
+**NTLM 잔여 버그:**
+- [ ] MIC 버그 수정 -- `modify_target_info`에서 `MsvAvFlags MIC_PROVIDED` 설정 시 서버 MIC 검증 실패. 현재 workaround: MsvAvFlags 미설정 (MIC 비활성화)
+- [ ] MIC 활성화 후 CredSSP v6 접속 재검증
+
+**BasicSettingsExchange (connector Phase 4):**
+- [ ] MCS Connect Initial GCC 블록 실서버 호환성 검증 -- 현재 377바이트 전송 후 서버가 RST
+- [ ] 서버 응답(MCS Connect Response) 파싱 확인
+- [ ] GCC Client Core Data: 버전, 데스크톱 크기, 색상 깊이, 키보드 레이아웃
+- [ ] GCC Client Security Data: 암호화 메서드 협상
+- [ ] GCC Client Network Data: 정적 채널 정의
+
+**Post-NLA 연결 시퀀스 (connector Phase 5-12):**
+- [ ] Channel Connection: Erect Domain → Attach User → Channel Join 루프
+- [ ] Secure Settings Exchange: Client Info PDU (NLA 모드 암호화 방식)
+- [ ] Licensing: Valid Client 단축 경로 실서버 검증
+- [ ] Capabilities Exchange: Demand Active → Confirm Active
+- [ ] Connection Finalization → `Connected` 상태 도달
+
+### 5.4 `justrdp-tls` -- TLS Transport
 
 - [x] `TlsUpgrader` trait
 - [x] `rustls` 백엔드 (기본)
@@ -1863,6 +1888,9 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 - [ ] 문서: 모든 public API에 `///` doc comment
 
 ### Phase 2 -- Connection
+- [x] CredSSP/NLA 핸드셰이크 성공 (Windows Server, NTLM v6)
+- [ ] NTLM MIC 버그 수정 후 MIC 활성화 상태로 접속 성공
+- [ ] BasicSettingsExchange → Connection Finalization 전체 시퀀스 → `Connected` 도달
 - [ ] Windows Server 2019/2022에 NLA(CredSSP+NTLM) 연결 성공
 - [ ] Windows 10/11에 NLA 연결 성공
 - [ ] xrdp에 TLS 연결 성공

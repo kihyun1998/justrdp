@@ -249,8 +249,27 @@ impl CredsspSequence {
         let av_pairs = AvPair::parse_list(&challenge.target_info)
             .map_err(|_| ConnectorError::general("failed to parse AV_PAIRS"))?;
 
-        // Use user-supplied domain for NTOWFv2 (can be empty for workgroup servers)
-        let response_key = ntowfv2(password, username, domain_str);
+        // MS-NLMP 3.1.5.1.2: If user didn't supply a domain, use the server's
+        // NbDomainName from target_info.  Windows SAM stores NTOWFv2 hashes with
+        // the machine's NETBIOS name as domain for local accounts.
+        let effective_domain: alloc::string::String = if domain_str.is_empty() {
+            if let Some(nb) = AvPair::find(&av_pairs, AvId::MsvAvNbDomainName) {
+                // Decode UTF-16LE
+                nb.value
+                    .chunks_exact(2)
+                    .filter_map(|c| {
+                        let ch = u16::from_le_bytes([c[0], c[1]]);
+                        char::from_u32(ch as u32)
+                    })
+                    .collect()
+            } else {
+                alloc::string::String::new()
+            }
+        } else {
+            alloc::string::String::from(domain_str)
+        };
+
+        let response_key = ntowfv2(password, username, &effective_domain);
 
         let has_timestamp = av_pairs.iter().any(|p| p.id == AvId::MsvAvTimestamp as u16);
 
@@ -272,8 +291,8 @@ impl CredsspSequence {
             &challenge.server_challenge,
             &self.random.client_challenge,
             time,
-            &modified_target_info,  // Use MODIFIED target_info (with MsvAvFlags, etc.)
-            has_timestamp,          // When true, LM response = Z(24)
+            &modified_target_info,
+            has_timestamp,
         );
 
         // Key exchange: for NTLMv2, KeyExchangeKey = SessionBaseKey
@@ -291,7 +310,7 @@ impl CredsspSequence {
             flags: negotiated_flags,
             lm_response,
             nt_response,
-            domain_name: to_utf16le(domain_str),
+            domain_name: to_utf16le(&effective_domain),
             user_name: to_utf16le(username),
             workstation: Vec::new(),
             encrypted_random_session_key,
@@ -356,7 +375,7 @@ impl CredsspSequence {
         // Decrypt server's pubKeyAuth
         let decrypted = self.ntlm_decrypt(&server_pub_key_auth)?;
 
-        // Verify server's hash
+        // Verify server's hash — use same key bytes as compute_pub_key_auth
         let subject_public_key = extract_subject_public_key(&self.server_public_key)
             .ok_or_else(|| ConnectorError::general(
                 "failed to extract SubjectPublicKey from SPKI for verification",
@@ -456,13 +475,14 @@ impl CredsspSequence {
     /// v2-v4: encrypt SubjectPublicKey
     /// v5+: encrypt SHA256("CredSSP Client-To-Server Binding Hash\0" + Nonce + SubjectPublicKey)
     fn compute_pub_key_auth(&mut self) -> ConnectorResult<Vec<u8>> {
+        // For v2-v4: encrypt SubjectPublicKey (BIT STRING contents with unused-bits byte)
+        // For v5+: SHA256(magic + nonce + SubjectPublicKey)
         let subject_public_key = extract_subject_public_key(&self.server_public_key)
             .ok_or_else(|| ConnectorError::general(
                 "failed to extract SubjectPublicKey from SPKI",
             ))?;
 
         if self.negotiated_version >= 5 {
-            // v5+: SHA256 hash
             let mut hasher = Sha256::new();
             hasher.update(CLIENT_SERVER_HASH_MAGIC);
             hasher.update(&self.random.client_nonce);
@@ -470,7 +490,7 @@ impl CredsspSequence {
             let hash = hasher.finalize();
             Ok(self.ntlm_encrypt(&hash))
         } else {
-            // v2-v4: encrypt SubjectPublicKey
+            // v2-v4: encrypt SubjectPublicKey directly
             Ok(self.ntlm_encrypt(&subject_public_key))
         }
     }
@@ -736,6 +756,9 @@ fn der_integer(value: u32) -> Vec<u8> {
 /// ```
 ///
 /// Returns the BIT STRING contents (including the leading unused-bits byte).
+///
+/// MS-CSSP 3.1.5.2.1: the SubjectPublicKey includes "the initial octet
+/// that encodes the number of unused bits".
 fn extract_subject_public_key(spki: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 0;
 

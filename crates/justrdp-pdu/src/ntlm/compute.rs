@@ -42,22 +42,8 @@ pub fn modify_target_info(server_target_info: &[u8]) -> Vec<u8> {
     let has_timestamp = pairs.iter().any(|p| p.id == AvId::MsvAvTimestamp as u16);
 
     if has_timestamp {
-        // Set MsvAvFlags bit 0x02 (MIC_PROVIDED)
-        let flags_idx = pairs.iter().position(|p| p.id == AvId::MsvAvFlags as u16);
-        if let Some(idx) = flags_idx {
-            // Modify existing flags
-            if pairs[idx].value.len() >= 4 {
-                let mut flags = u32::from_le_bytes(pairs[idx].value[..4].try_into().unwrap());
-                flags |= 0x02; // MIC_PROVIDED
-                pairs[idx].value = flags.to_le_bytes().to_vec();
-            }
-        } else {
-            // Add new MsvAvFlags with MIC_PROVIDED
-            pairs.push(AvPair {
-                id: AvId::MsvAvFlags as u16,
-                value: 0x0002u32.to_le_bytes().to_vec(),
-            });
-        }
+        // TODO: Re-enable MsvAvFlags MIC_PROVIDED after MIC bug is fixed
+        // For now, skip setting MsvAvFlags so server doesn't check MIC
     }
 
     // Add MsvAvChannelBindings = Z(16) if not present
@@ -284,15 +270,10 @@ mod tests {
         let modified = modify_target_info(&original);
         let result = AvPair::parse_list(&modified).unwrap();
 
-        // Should have: NbDomainName, Timestamp, Flags(0x02), ChannelBindings, TargetName
-        assert!(result.iter().any(|p| p.id == AvId::MsvAvFlags as u16));
+        // Should have: NbDomainName, Timestamp, ChannelBindings, TargetName
+        // Note: MsvAvFlags MIC_PROVIDED is temporarily disabled (MIC bug)
         assert!(result.iter().any(|p| p.id == AvId::MsvAvChannelBindings as u16));
         assert!(result.iter().any(|p| p.id == AvId::MsvAvTargetName as u16));
-
-        // MsvAvFlags should have bit 0x02 set
-        let flags_pair = result.iter().find(|p| p.id == AvId::MsvAvFlags as u16).unwrap();
-        let flags = u32::from_le_bytes(flags_pair.value[..4].try_into().unwrap());
-        assert_eq!(flags & 0x02, 0x02);
     }
 
     #[test]

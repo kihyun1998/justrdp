@@ -137,7 +137,6 @@ fn main() {
                     if n == 0 {
                         panic!("server closed connection during CredSSP");
                     }
-
                     let response = match credssp.step(&buf[..n]) {
                         Ok(r) => r,
                         Err(e) => {
