@@ -687,8 +687,8 @@ pub enum ClientConnectorState {
 > **requires**: 없음 (순수 알고리즘, `no_std`)
 > **검증**: RFC/스펙 테스트 벡터 + roundtrip
 
-- [ ] `Mppc8kDecompressor` -- MPPC 8K 슬라이딩 윈도우 (RDP 4.0)
-- [ ] `Mppc64kDecompressor` -- MPPC 64K 슬라이딩 윈도우 (RDP 5.0)
+- [x] `Mppc8kDecompressor` -- MPPC 8K 슬라이딩 윈도우 (RDP 4.0)
+- [x] `Mppc64kDecompressor` -- MPPC 64K 슬라이딩 윈도우 (RDP 5.0)
 - [ ] `NcrushDecompressor` -- NCRUSH (RDP 6.0, Huffman 기반)
 - [ ] `XcrushDecompressor` -- XCRUSH (RDP 6.1, LZNT1 + match finder)
 - [ ] `ZgfxDecompressor` / `ZgfxCompressor` -- RDP8 벌크 압축 (RDPEGFX용)
