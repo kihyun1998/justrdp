@@ -181,7 +181,8 @@ impl ClientConnectorState {
                 | Self::BasicSettingsExchangeSendInitial
                 | Self::ChannelConnectionSendErectDomainRequest
                 | Self::ChannelConnectionSendAttachUserRequest
-                | Self::ChannelConnectionChannelJoin
+                // ChannelConnectionChannelJoin excluded: it alternates send/wait,
+                // handled by channel_join_sending flag in next_pdu_hint()
                 | Self::SecurityCommencement
                 | Self::SecureSettingsExchange
                 | Self::MultitransportBootstrapping

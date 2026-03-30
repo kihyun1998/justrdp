@@ -407,24 +407,19 @@ fn drive_connector_tls<S: Read + Write>(
         if hint.is_none() {
             // Send state
             output.clear();
+            let pre_state = format!("{:?}", connector.state());
             let written = connector
                 .step(&[], output)
-                .unwrap_or_else(|e| panic!("[{}] step failed: {}", phase_name, e));
+                .unwrap_or_else(|e| {
+                    panic!("[{}] step failed (send, was {}): {}", phase_name, pre_state, e);
+                });
 
             if written.size > 0 {
                 let data = &output.as_mut_slice()[..written.size];
                 println!(
-                    "[*] {} sent {} bytes (state: {:?})",
-                    phase_name,
-                    written.size,
-                    connector.state()
+                    "[*] {} sent {} bytes (was: {} now: {:?})",
+                    phase_name, written.size, pre_state, connector.state()
                 );
-                // Hex dump for debugging
-                for chunk in data.chunks(32) {
-                    print!("    ");
-                    for b in chunk { print!("{:02x} ", b); }
-                    println!();
-                }
                 stream
                     .write_all(data)
                     .unwrap_or_else(|e| panic!("[{}] write failed: {}", phase_name, e));
