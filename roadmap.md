@@ -620,35 +620,45 @@ pub enum ClientConnectorState {
 
 > 실서버: Windows Server 2019 build 17763 (192.168.136.136), 계정: rdptest
 > xfreerdp(WSL)로 동일 서버 접속 성공 확인 완료.
+>
+> **참고**: 아래 단계의 connector 코드는 대부분 구현되어 있었으나 실서버와의 호환성 버그가 있었음.
+> 단위 테스트만으로는 발견 불가능한 와이어 레벨 인코딩 오류들이 주원인.
+> `rdp-debugger` 에이전트와 xfreerdp 바이트 비교로 디버깅.
 
 **CredSSP/NLA (완료 2026-03-30):**
-- [x] MIC 버그 수정 -- 3가지 원인: (1) SubjectPublicKey에 BIT STRING unused bits 0x00 포함, (2) MsvAvFlags+MIC+mechListMIC 미구현 (CVE-2019-1040 패치 이후 필수), (3) 서버 응답 mechListMIC 미처리 + recv RC4 미복원
-- [x] MIC 활성화 후 CredSSP v6 접속 재검증 -- 성공
-- [x] mechListMIC seq_num 순서: temp RC4(seq=0) → pubKeyAuth(seq=1), 서버도 동일 순서 확인
+- [x] SubjectPublicKey BIT STRING unused bits 0x00 제거
+- [x] MsvAvFlags MIC_PROVIDED + NTLM MIC + SPNEGO mechListMIC 구현 (CVE-2019-1040 필수)
+- [x] 서버 응답 mechListMIC 검증 + recv RC4 save/restore
+- [x] CredSSP v6 접속 성공
 
 **BasicSettingsExchange (완료 2026-03-30):**
-- [x] GCC ConferenceCreateRequest PER 프리앰블 수정 -- T.124 PER 인코딩 8바이트 상수 교체
-- [x] CS_CORE 필드 확장 -- RDP 10.0+ 필드 5개 추가 (desktopPhysicalWidth/Height, orientation, scaleFactor), version V5Plus→V10_12, supportedColorDepths 0x000F, cluster flags VERSION5
-- [x] GCC ConferenceCreateResponse 파싱 수정 -- ConnectGCCPDU choice byte(0x14) 누락, PER tag unconstrained integer 인코딩, ServerNetworkData header 중복 읽기 수정
-- [x] MCS Connect Response (104 bytes) 파싱 성공, 서버 IO channel=1003 확인
+- [x] GCC ConferenceCreateRequest PER 프리앰블 8바이트 수정
+- [x] CS_CORE: V10_12 버전, RDP 10.0+ 필드 5개, supportedColorDepths 0x000F, cluster VERSION5
+- [x] GCC ConferenceCreateResponse PER 파싱 수정 (choice byte, tag, ServerNetworkData)
 
-**Channel Connection (진행 중):**
-- [x] Erect Domain Request 전송 (12 bytes)
-- [x] Attach User Request 전송 (8 bytes) → Confirm 수신 (11 bytes)
-- [ ] Channel Join 루프 -- 현재 에러: "TpktHeader not enough bytes" (서버 응답 읽기 불완전)
-  - 원인: integration test의 read 루프가 Channel Join Confirm을 완전히 읽지 못함
-  - 수정 필요: drive_connector_tls의 read 로직 또는 PDU hint 매칭 개선
+**Channel Connection (완료 2026-03-30):**
+- [x] ErectDomain + AttachUser + ChannelJoin(x2) 성공
+- [x] `is_send_state()` 분류 오류 수정 — ChannelJoin의 send/wait 교대 동작 복구
 
-**Post-NLA 연결 시퀀스 (미착수):**
-- [ ] Secure Settings Exchange: Client Info PDU (NLA 모드 — `INFO_FORCE_ENCRYPTED_CS_PDU` 플래그 필요?)
-- [ ] Licensing: Valid Client 단축 경로 실서버 검증
-- [ ] Capabilities Exchange: Demand Active → Confirm Active
-- [ ] Connection Finalization → `Connected` 상태 도달
+**SecureSettingsExchange ~ Licensing (완료 2026-03-30):**
+- [x] Client Info PDU 전송 (273 bytes) — 서버 수락
+- [x] Licensing 교환 성공 (34 bytes 양방향)
+
+**Capabilities Exchange (완료 2026-03-30):**
+- [x] Server Demand Active 수신 (472 bytes)
+- [x] Client Confirm Active 전송 (425 bytes)
+
+**Connection Finalization (진행 중):**
+- [x] Synchronize, Cooperate, RequestControl, FontList 전송
+- [x] Server Synchronize 수신 (36 bytes)
+- [ ] Server Cooperate + Control Granted + FontMap 수신 → `Connected` 상태 도달
+  - 현재 상태: `ConnectionFinalizationWaitSynchronize`에서 36 bytes 수신 후 서버 RST
+  - 원인 추정: 서버가 추가 PDU를 보내기 전에 연결을 끊거나, Finalization 응답 파싱 오류
 
 **잔여 기술 부채:**
-- [ ] GCC ConferenceCreateResponse encode/decode roundtrip 테스트 깨짐 (`#[ignore]` 처리됨) -- PER connectPDU length 인코딩 정렬 필요
-- [ ] integration test 디버그 hex dump 코드 정리 (커밋 전 제거)
-- [ ] PRNG: `simple_random_seed()`가 동일 나노초에 같은 시드 생성 가능 -- OS 랜덤(`getrandom`) 사용 권장
+- [ ] GCC ConferenceCreateResponse roundtrip 테스트 (`#[ignore]`) — PER 인코딩 정렬
+- [ ] integration test 디버그 hex dump 코드 정리
+- [ ] PRNG `simple_random_seed()` → OS 랜덤(`getrandom`) 교체 권장
 
 ### 5.4 `justrdp-tls` -- TLS Transport
 
