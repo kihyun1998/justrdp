@@ -623,8 +623,8 @@ pub enum ClientConnectorState {
 > 아래 항목을 실서버(192.168.136.136)로 단계별 검증 필요.
 
 **NTLM 잔여 버그:**
-- [x] MIC 버그 수정 -- 원인: SPNEGO mechListMIC 누락 (MS-SPNG 요구사항). `wrap_authenticate`에 mechListMIC 추가, `ntlm_sign` 메서드 추가, MsvAvFlags MIC_PROVIDED 재활성화
-- [ ] MIC 활성화 후 CredSSP v6 접속 재검증
+- [x] MIC 버그 수정 -- 3가지 원인: (1) SubjectPublicKey에 BIT STRING unused bits 0x00 포함, (2) MsvAvFlags+MIC+mechListMIC 미구현, (3) 서버 응답 mechListMIC 미처리 + recv RC4 미복원
+- [x] MIC 활성화 후 CredSSP v6 접속 재검증 -- Windows Server 2019에서 성공 확인 (2026-03-30)
 
 **BasicSettingsExchange (connector Phase 4):**
 - [ ] MCS Connect Initial GCC 블록 실서버 호환성 검증 -- 현재 377바이트 전송 후 서버가 RST
