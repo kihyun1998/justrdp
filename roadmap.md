@@ -658,7 +658,7 @@ pub enum ClientConnectorState {
 **잔여 기술 부채:**
 - [x] GCC ConferenceCreateResponse roundtrip 테스트 — UD prefix 3바이트로 수정, `#[ignore]` 제거
 - [x] integration test 디버그 hex dump 코드 정리
-- [ ] PRNG `simple_random_seed()` → OS 랜덤(`getrandom`) 교체 권장
+- [x] PRNG `simple_random_seed()` → OS 랜덤(`getrandom`) 교체
 
 ### 5.4 `justrdp-tls` -- TLS Transport
 
