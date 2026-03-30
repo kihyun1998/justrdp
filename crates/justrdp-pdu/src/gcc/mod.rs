@@ -319,7 +319,7 @@ impl<'de> Decode<'de> for ConferenceCreateResponse {
         // result (PER enumerated, bit-packed, 1 byte)
         let _result = src.read_u8("GccCResp::result")?;
 
-        // numberOfSets(1) + choice(1) + h221 constrained length(1) + padding/reserved(1) = 4 bytes
+        // numberOfSets(1) + choice(1) + h221 constrained length(1) = 3 bytes
         src.skip(GCC_CONF_RESPONSE_UD_PREFIX.len(), "GccCResp::userDataPrefix")?;
 
         // H.221 key (always 4 bytes, PER constrained min=4)

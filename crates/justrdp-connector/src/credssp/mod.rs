@@ -350,15 +350,24 @@ impl CredsspSequence {
         let mech_list_mic = {
             let mut temp_rc4 = Rc4::new(&seal_key);
             let mech_types = spnego::mech_types_bytes();
+            let seq_num: u32 = 0;
+
+            // HMAC_MD5(SigningKey, SeqNum + mechTypes)
             let mut hmac_input = vec![0u8; 4 + mech_types.len()];
+            hmac_input[..4].copy_from_slice(&seq_num.to_le_bytes());
             hmac_input[4..].copy_from_slice(&mech_types);
             let digest = hmac_md5(&self.send_signing_key, &hmac_input);
+
+            // RC4-encrypt first 8 bytes of HMAC
             let mut checksum = [0u8; 8];
             checksum.copy_from_slice(&digest[..8]);
             temp_rc4.process(&mut checksum);
+
+            // Build MAC: Version(4) + Checksum(8) + SeqNum(4)
             let mut mac = [0u8; 16];
             mac[..4].copy_from_slice(&1u32.to_le_bytes());
             mac[4..12].copy_from_slice(&checksum);
+            mac[12..16].copy_from_slice(&seq_num.to_le_bytes());
             mac
         };
         // seq_num continues past mechListMIC
@@ -850,10 +859,9 @@ fn der_integer(value: u32) -> Vec<u8> {
 /// }
 /// ```
 ///
-/// Returns the BIT STRING contents (including the leading unused-bits byte).
-///
-/// MS-CSSP 3.1.5.2.1: the SubjectPublicKey includes "the initial octet
-/// that encodes the number of unused bits".
+/// Returns the BIT STRING value with the unused-bits byte removed.
+/// Windows CRYPT_BIT_BLOB.pbData excludes this byte, and MS-CSSP
+/// pubKeyAuth uses this representation for hashing/encryption.
 fn extract_subject_public_key(spki: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 0;
 
