@@ -656,7 +656,7 @@ pub enum ClientConnectorState {
 - [x] **RDP 연결 수립 완료** — Windows Server 2019에서 Connected 상태 확인
 
 **잔여 기술 부채:**
-- [ ] GCC ConferenceCreateResponse roundtrip 테스트 (`#[ignore]`) — PER 인코딩 정렬
+- [x] GCC ConferenceCreateResponse roundtrip 테스트 — UD prefix 3바이트로 수정, `#[ignore]` 제거
 - [ ] integration test 디버그 hex dump 코드 정리
 - [ ] PRNG `simple_random_seed()` → OS 랜덤(`getrandom`) 교체 권장
 
