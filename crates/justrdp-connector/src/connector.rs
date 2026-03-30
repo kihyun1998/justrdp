@@ -1110,7 +1110,7 @@ impl ClientConnector {
     fn step_capabilities_send_confirm_active(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         let confirm = ConfirmActivePdu {
             share_id: self.share_id,
-            originator_id: self.user_channel_id,
+            originator_id: 0x03EA, // MS-RDPBCGR 2.2.1.13.2: MUST be server channel ID
             source_descriptor: vec![0x4D, 0x53, 0x54, 0x53, 0x43, 0x00], // "MSTSC\0"
             capability_sets: self.build_client_capabilities(),
         };
