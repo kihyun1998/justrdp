@@ -108,12 +108,13 @@ const GCC_CONF_CREATE_PREAMBLE: &[u8] = &[
 
 /// PER-encoded ConferenceCreateResponse userData prefix.
 ///
-/// After nodeID(2) + tag(1) + result(1), the response has:
+/// After nodeID(2) + tag(len+value) + result(1), the response has:
 /// ```text
-/// 00 01    padding + numberOfSets(1)
-/// C0 00    choice(0xC0)=h221NonStandard + octet_string_length(4-4=0)
+/// 01       numberOfSets(1)
+/// C0       choice(0xC0)=h221NonStandard, value present
+/// 00       octet_string_length(4-4=0, PER constrained min=4)
 /// ```
-const GCC_CONF_RESPONSE_UD_PREFIX: &[u8] = &[0x00, 0x01, 0xC0, 0x00];
+const GCC_CONF_RESPONSE_UD_PREFIX: &[u8] = &[0x01, 0xC0, 0x00];
 
 /// H.221 non-standard key for Microsoft ("Duca").
 const H221_CS_KEY: &[u8] = b"Duca";
@@ -318,10 +319,8 @@ impl<'de> Decode<'de> for ConferenceCreateResponse {
         // result (PER enumerated, bit-packed, 1 byte)
         let _result = src.read_u8("GccCResp::result")?;
 
-        // numberOfSets (1 byte) + choice (0xC0) + h221 constrained length (0x00 = 4-4=0)
-        let _num_sets = src.read_u8("GccCResp::numSets")?;
-        let _choice = src.read_u8("GccCResp::h221Choice")?;
-        let _h221_len = src.read_u8("GccCResp::h221Len")?;
+        // numberOfSets(1) + choice(1) + h221 constrained length(1) + padding/reserved(1) = 4 bytes
+        src.skip(GCC_CONF_RESPONSE_UD_PREFIX.len(), "GccCResp::userDataPrefix")?;
 
         // H.221 key (always 4 bytes, PER constrained min=4)
         let key = src.read_slice(H221_SC_KEY.len(), "GccCResp::h221Key")?;
@@ -373,7 +372,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: encode/decode PER preamble roundtrip needs alignment
     fn conference_create_response_roundtrip() {
         let user_data = alloc::vec![0xAA, 0xBB, 0xCC];
         let ccr = ConferenceCreateResponse::new(user_data.clone());
