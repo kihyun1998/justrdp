@@ -14,3 +14,4 @@ justrdp-core.workspace = true
 justrdp-pdu.workspace = true
 justrdp-connector.workspace = true
 justrdp-tls.workspace = true
+getrandom = "0.2"

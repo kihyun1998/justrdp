@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use justrdp_connector::{
     ClientConnector, ClientConnectorState, Config, CredsspRandom, CredsspSequence, CredsspState,
@@ -339,40 +339,23 @@ fn drive_connector_until(
     }
 }
 
-// ── Simple random byte generation using system time ──
-
-fn simple_random_seed() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-}
-
-fn fill_random(buf: &mut [u8]) {
-    let mut state = simple_random_seed();
-    for byte in buf.iter_mut() {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        *byte = state as u8;
-    }
-}
+// ── Cryptographic random byte generation ──
 
 fn generate_random_bytes_8() -> [u8; 8] {
     let mut buf = [0u8; 8];
-    fill_random(&mut buf);
+    getrandom::getrandom(&mut buf).expect("OS random failed");
     buf
 }
 
 fn generate_random_bytes_16() -> [u8; 16] {
     let mut buf = [0u8; 16];
-    fill_random(&mut buf);
+    getrandom::getrandom(&mut buf).expect("OS random failed");
     buf
 }
 
 fn generate_random_bytes_32() -> [u8; 32] {
     let mut buf = [0u8; 32];
-    fill_random(&mut buf);
+    getrandom::getrandom(&mut buf).expect("OS random failed");
     buf
 }
 
