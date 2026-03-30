@@ -648,12 +648,12 @@ pub enum ClientConnectorState {
 - [x] Server Demand Active 수신 (472 bytes)
 - [x] Client Confirm Active 전송 (425 bytes)
 
-**Connection Finalization (진행 중):**
+**Connection Finalization (완료 2026-03-30):**
 - [x] Synchronize, Cooperate, RequestControl, FontList 전송
-- [x] Server Synchronize 수신 (36 bytes)
-- [ ] Server Cooperate + Control Granted + FontMap 수신 → `Connected` 상태 도달
-  - 현재 상태: `ConnectionFinalizationWaitSynchronize`에서 36 bytes 수신 후 서버 RST
-  - 원인 추정: 서버가 추가 PDU를 보내기 전에 연결을 끊거나, Finalization 응답 파싱 오류
+- [x] Server Synchronize + Cooperate + GrantedControl + FontMap 수신 → `Connected` 도달
+- [x] ConfirmActive originatorId 수정 (user channel → 0x03EA server channel)
+- [x] Order capability: orderSupport[32] 채움 + desktopSaveSize + textFlags (ERRINFO_BADCAPABILITIES 해결)
+- [x] **RDP 연결 수립 완료** — Windows Server 2019에서 Connected 상태 확인
 
 **잔여 기술 부채:**
 - [ ] GCC ConferenceCreateResponse roundtrip 테스트 (`#[ignore]`) — PER 인코딩 정렬
