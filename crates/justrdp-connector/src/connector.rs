@@ -1116,6 +1116,19 @@ impl ClientConnector {
         };
 
         let confirm_bytes = justrdp_core::encode_vec(&confirm)?;
+
+        // DEBUG: dump ConfirmActive body for diagnosis
+        #[cfg(debug_assertions)]
+        {
+            extern crate std;
+            std::eprintln!("[DBG] ConfirmActive body: {} bytes, {} caps", confirm_bytes.len(), confirm.capability_sets.len());
+            for chunk in confirm_bytes.chunks(32) {
+                std::eprint!("  ");
+                for b in chunk { std::eprint!("{:02x} ", b); }
+                std::eprintln!();
+            }
+        }
+
         let sc_payload = wrap_share_control(
             ShareControlPduType::ConfirmActivePdu,
             self.user_channel_id,
@@ -1135,7 +1148,7 @@ impl ClientConnector {
                 protocol_version: 0x0200,
                 pad2: 0,
                 general_compression_types: 0,
-                extra_flags: 0x040D, // FASTPATH_OUTPUT_SUPPORTED | LONG_CREDENTIALS_SUPPORTED | AUTORECONNECT_SUPPORTED | NO_BITMAP_COMPRESSION_HDR
+                extra_flags: 0x041D, // FASTPATH_OUTPUT_SUPPORTED | LONG_CREDENTIALS_SUPPORTED | AUTORECONNECT_SUPPORTED | ENC_SALTED_CHECKSUM | NO_BITMAP_COMPRESSION_HDR
                 update_capability_flag: 0,
                 remote_unshare_flag: 0,
                 general_compression_level: 0,
@@ -1165,12 +1178,29 @@ impl ClientConnector {
                 pad2a: 0,
                 maximum_order_level: 1,
                 number_fonts: 0,
-                order_flags: 0x0022, // NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT
-                order_support: [0u8; 32],
-                text_flags: 0,
+                order_flags: 0x002A, // NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT | COLORINDEXSUPPORT
+                order_support: {
+                    // Minimal order support matching FreeRDP defaults
+                    let mut os = [0u8; 32];
+                    os[0] = 1;  // TS_NEG_DSTBLT_INDEX
+                    os[1] = 1;  // TS_NEG_PATBLT_INDEX
+                    os[2] = 1;  // TS_NEG_SCRBLT_INDEX
+                    os[3] = 1;  // TS_NEG_MEMBLT_INDEX (v1)
+                    os[4] = 1;  // TS_NEG_MEM3BLT_INDEX (v1)
+                    os[8] = 1;  // TS_NEG_LINETO_INDEX
+                    os[15] = 1; // TS_NEG_MULTIDSTBLT_INDEX
+                    os[16] = 1; // TS_NEG_MULTIPATBLT_INDEX
+                    os[17] = 1; // TS_NEG_MULTISCRBLT_INDEX
+                    os[18] = 1; // TS_NEG_MULTIOPAQUERECT_INDEX
+                    os[22] = 1; // TS_NEG_POLYLINE_INDEX
+                    os[25] = 1; // TS_NEG_ELLIPSE_SC_INDEX
+                    os[27] = 1; // TS_NEG_INDEX_INDEX
+                    os
+                },
+                text_flags: 0x06A1,
                 order_support_ex_flags: 0,
                 pad4b: 0,
-                desktop_save_size: 0,
+                desktop_save_size: 0x38400, // 230400 = 320*240*3
                 pad2b: 0,
                 pad2c: 0,
                 text_ansi_code_page: 0,
