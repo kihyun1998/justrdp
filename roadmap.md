@@ -12,12 +12,12 @@
 3. [Crate Structure](#3-crate-structure)
 4. [Phase 1 -- Foundation (Core Protocol)](#4-phase-1----foundation-core-protocol)
 5. [Phase 2 -- Connection & Authentication](#5-phase-2----connection--authentication)
-6. [Phase 3 -- Graphics Pipeline](#6-phase-3----graphics-pipeline)
-7. [Phase 4 -- Virtual Channels](#7-phase-4----virtual-channels)
-8. [Phase 5 -- Advanced Features](#8-phase-5----advanced-features)
-9. [Phase 6 -- Transport Extensions](#9-phase-6----transport-extensions)
-10. [Phase 7 -- Server-Side](#10-phase-7----server-side)
-11. [Phase 8 -- Ecosystem & Bindings](#11-phase-8----ecosystem--bindings)
+6. [Phase 3 -- Standalone Codecs & Primitives](#6-phase-3----standalone-codecs--primitives)
+7. [Phase 4 -- Session Core & Channel Frameworks](#7-phase-4----session-core--channel-frameworks)
+8. [Phase 5 -- Channel Implementations](#8-phase-5----channel-implementations)
+9. [Phase 6 -- Advanced Features & Integration](#9-phase-6----advanced-features--integration)
+10. [Phase 7 -- Transport Extensions](#10-phase-7----transport-extensions)
+11. [Phase 8 -- Server-Side & Ecosystem](#11-phase-8----server-side--ecosystem)
 12. [Protocol Specifications Reference](#12-protocol-specifications-reference)
 13. [Public API Design](#13-public-api-design)
 14. [Testing Strategy](#14-testing-strategy)
@@ -671,9 +671,10 @@ pub enum ClientConnectorState {
 
 ---
 
-## 6. Phase 3 -- Graphics Pipeline
+## 6. Phase 3 -- Standalone Codecs & Primitives
 
-> **목표**: 서버에서 보내는 그래픽 데이터를 완전히 디코딩하여 RGBA 프레임 버퍼로 변환.
+> **목표**: Connected 상태 없이 단독 구현+테스트 가능한 코덱, 압축, 입력 처리, 파서.
+> 모두 `no_std` + unit test로 검증. 서버 연결 불필요.
 
 ### Prerequisites (Phase 1/2에서 이관)
 
@@ -681,24 +682,44 @@ pub enum ClientConnectorState {
 - [x] 그래픽 캐시 무효화 여부 판단 (`deactivation_count` 시그널 + `PrimaryOrderHistory::reset()`)
 - [x] `AutoDetectSequence` 상태 머신 (wait state로 변경, 서버 PDU를 licensing에 전달)
 
-### 6.1 `justrdp-graphics` -- Image Processing & Codecs
+### 6.1 `justrdp-bulk` -- Bulk Compression
 
-#### 6.1.1 Legacy Bitmap Codecs
+> **requires**: 없음 (순수 알고리즘, `no_std`)
+> **검증**: RFC/스펙 테스트 벡터 + roundtrip
 
-**Interleaved RLE (RDP 4.0/5.0):**
+- [ ] `Mppc8kDecompressor` -- MPPC 8K 슬라이딩 윈도우 (RDP 4.0)
+- [ ] `Mppc64kDecompressor` -- MPPC 64K 슬라이딩 윈도우 (RDP 5.0)
+- [ ] `NcrushDecompressor` -- NCRUSH (RDP 6.0, Huffman 기반)
+- [ ] `XcrushDecompressor` -- XCRUSH (RDP 6.1, LZNT1 + match finder)
+- [ ] `ZgfxDecompressor` / `ZgfxCompressor` -- RDP8 벌크 압축 (RDPEGFX용)
+- [ ] `BulkCompressor` -- 통합 압축기 (자동 알고리즘 선택)
+- [ ] 모든 구현 zero unsafe, `no_std`
+
+### 6.2 `justrdp-graphics` -- Legacy Bitmap Codecs
+
+> **requires**: 없음 (순수 디코더, `no_std`)
+> **검증**: 알려진 비트맵 → 디코딩 → 픽셀 비교
+
+#### 6.2.1 Interleaved RLE (RDP 4.0/5.0)
+
 - [ ] `RleDecoder` -- Run-Length Encoding 디코딩
 - [ ] 8bpp, 15bpp, 16bpp, 24bpp 지원
 - [ ] 포어그라운드/백그라운드 런, 컬러 런, FGBG 이미지, 세트 런, 디더링 런
 
-**Planar Codec:**
+#### 6.2.2 Planar Codec
+
 - [ ] `PlanarDecoder` -- RLE 기반 평면 비트맵 디코딩
 - [ ] Alpha / Red / Green / Blue 평면 분리
 - [ ] 평면 내 RLE 디코딩
 
-**RDP 6.0 Bitmap Compression:**
+#### 6.2.3 RDP 6.0 Bitmap Compression
+
 - [ ] `Rdp6Decoder` / `Rdp6Encoder` -- 비트맵 스트림 디코딩/인코딩
 
-#### 6.1.2 RemoteFX (RFX) Codec
+### 6.3 `justrdp-graphics` -- RemoteFX (RFX) Codec
+
+> **requires**: 없음 (순수 수학/코덱, `no_std`)
+> **검증**: 알려진 타일 데이터 → 파이프라인 → 픽셀 비교
 
 전체 파이프라인:
 ```
@@ -721,14 +742,18 @@ RFX 비트스트림
 - [ ] RFX 타일 (64x64) 관리
 - [ ] Progressive RFX (단계적 품질 향상)
 
-#### 6.1.3 NSCodec
+### 6.4 `justrdp-graphics` -- NSCodec
+
+> **requires**: 없음 (순수 디코더, `no_std`)
 
 - [ ] `NsCodecDecoder` -- NSCodec 디코딩
 - [ ] 채널 분리 (ARGB 채널별 독립 처리)
 - [ ] NSCodec RLE 디코딩
 - [ ] ChromaSubsampling 처리
 
-#### 6.1.4 ClearCodec
+### 6.5 `justrdp-graphics` -- ClearCodec
+
+> **requires**: 없음 (순수 디코더, `no_std`)
 
 - [ ] `ClearCodecDecoder` -- ClearCodec 디코딩
 - [ ] Residual Layer (잔차 레이어)
@@ -736,25 +761,18 @@ RFX 비트스트림
 - [ ] Subcodec Layer (서브코덱 레이어)
 - [ ] Glyph 캐싱
 
-#### 6.1.5 H.264/AVC
+### 6.6 Image Processing Utilities
 
-- [ ] AVC420 디코딩 (YUV 4:2:0)
-- [ ] AVC444 디코딩 (YUV 4:4:4, 두 AVC420 결합)
-- [ ] AVC444v2 디코딩
-- [ ] 순수 Rust H.264 디코더 통합 또는 trait 추상화
-- [ ] 하드웨어 가속 백엔드 trait
+> **requires**: 없음 (`no_std`)
 
-#### 6.1.6 Bulk Compression (`justrdp-bulk`)
+- [ ] 사각형 처리 (교집합, 합집합, 분할)
+- [ ] 이미지 diff (변경 영역 감지, 서버용)
+- [ ] 색상 공간 변환 (RGB ↔ BGR, RGBA ↔ BGRA 등)
+- [ ] 스케일링/리사이징
 
-- [ ] `Mppc8kDecompressor` -- MPPC 8K 슬라이딩 윈도우 (RDP 4.0)
-- [ ] `Mppc64kDecompressor` -- MPPC 64K 슬라이딩 윈도우 (RDP 5.0)
-- [ ] `NcrushDecompressor` -- NCRUSH (RDP 6.0, Huffman 기반)
-- [ ] `XcrushDecompressor` -- XCRUSH (RDP 6.1, LZNT1 + match finder)
-- [ ] `ZgfxDecompressor` / `ZgfxCompressor` -- RDP8 벌크 압축 (RDPEGFX용)
-- [ ] `BulkCompressor` -- 통합 압축기 (자동 알고리즘 선택)
-- [ ] 모든 구현 zero unsafe, `no_std`
+### 6.7 Pointer/Cursor Processing
 
-#### 6.1.7 Pointer/Cursor Processing
+> **requires**: 없음 (순수 디코더, `no_std`)
 
 - [ ] `PointerDecoder` -- 포인터 비트맵 디코딩
 - [ ] 1bpp, 24bpp, 32bpp 포인터
@@ -762,19 +780,270 @@ RFX 비트스트림
 - [ ] Large pointer (384x384) 지원
 - [ ] 포인터 캐시 관리
 
-#### 6.1.8 Image Processing Utilities
+### 6.8 `justrdp-input` -- Input Event Management
 
-- [ ] 사각형 처리 (교집합, 합집합, 분할)
-- [ ] 이미지 diff (변경 영역 감지, 서버용)
-- [ ] 색상 공간 변환 (RGB ↔ BGR, RGBA ↔ BGRA 등)
-- [ ] 스케일링/리사이징
+> **requires**: 없음 (순수 상태 머신, `no_std`)
+> **검증**: unit test로 상태 diff 검증
 
-### 6.2 `justrdp-egfx` -- Graphics Pipeline Extension (RDPEGFX)
+- [ ] `InputDatabase` -- 키보드 + 마우스 상태 추적
+- [ ] 키보드: 512-bit 비트필드 (모든 스캔코드 상태)
+- [ ] 마우스: 5 버튼 + 위치 + 휠 상태
+- [ ] 상태 diff 기반 이벤트 생성 (중복 이벤트 방지)
+- [ ] `Operation` enum:
+  ```rust
+  pub enum Operation {
+      KeyPressed(Scancode),
+      KeyReleased(Scancode),
+      UnicodeKeyPressed(u16),
+      UnicodeKeyReleased(u16),
+      MouseButtonPressed(MouseButton),
+      MouseButtonReleased(MouseButton),
+      MouseMove(u16, u16),
+      WheelRotations(i16),
+      HorizontalWheelRotations(i16),
+  }
+  ```
+- [ ] `Scancode` 타입 (extended flag 포함)
+- [ ] `synchronize_event()` -- 잠금 키 동기화
+
+### 6.9 `.rdp` File Support
+
+> **requires**: 없음 (순수 파서, `no_std` 호환)
+
+- [ ] `.rdp` 파일 포맷 파서/라이터
+- [ ] 모든 표준 설정 키 지원
+- [ ] `no_std` 호환
+
+---
+
+## 7. Phase 4 -- Session Core & Channel Frameworks
+
+> **목표**: Active Session 수신 루프와 SVC/DVC 프레임워크 구축.
+> 이 Phase가 완료되어야 서버에서 오는 PDU를 받아 채널로 디스패치할 수 있음.
+
+### 7.1 `justrdp-session` -- Active Session Processing
+
+> **requires**: Phase 2 (Connected 상태), Phase 3 bulk compression
+> **검증**: integration test로 실서버에서 Fast-Path/Slow-Path 프레임 수신 확인
+
+- [ ] `ActiveStage` -- 활성 세션 프로세서
+- [ ] Fast-Path 입력 프레임 생성
+- [ ] Fast-Path 출력 프레임 파싱 + 벌크 해제
+- [ ] X.224/Slow-Path 프레임 파싱
+- [ ] 프레임 단편화/재조립 (`CompleteData`)
+- [ ] 출력 디스패치:
+  ```rust
+  pub enum ActiveStageOutput {
+      ResponseFrame(Vec<u8>),
+      GraphicsUpdate { region: Rectangle, data: Vec<u8> },
+      PointerDefault,
+      PointerHidden,
+      PointerPosition { x: u16, y: u16 },
+      PointerBitmap(DecodedPointer),
+      Terminate(GracefulDisconnectReason),
+      DeactivateAll(DeactivationReactivation),
+      Resize { width: u16, height: u16 },
+  }
+  ```
+- [ ] 세션 Deactivation-Reactivation 처리
+- [ ] Graceful shutdown 시퀀스
+
+### 7.2 `justrdp-svc` -- Static Virtual Channel Framework
+
+> **requires**: 7.1 (세션에서 MCS 채널 데이터를 수신해야 함)
+> **검증**: PDU roundtrip + chunking/dechunking unit test, integration test로 채널 데이터 수신 확인
+
+```rust
+/// Static Virtual Channel 프로세서
+pub trait SvcProcessor: AsAny + Debug + Send {
+    fn channel_name(&self) -> ChannelName;
+    fn start(&mut self) -> PduResult<Vec<SvcMessage>>;
+    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>>;
+    fn compression_condition(&self) -> CompressionCondition { CompressionCondition::WhenRdpDataIsCompressed }
+}
+```
+
+**구현 항목:**
+- [ ] `SvcProcessor` trait
+- [ ] `SvcClientProcessor` / `SvcServerProcessor` marker traits
+- [ ] `StaticChannelSet` -- TypeId 기반 채널 집합
+- [ ] `ChannelPduHeader` -- 플래그(FIRST/LAST/SHOW_PROTOCOL/SUSPEND/RESUME), 총 길이
+- [ ] 자동 chunking (기본 1600바이트) / dechunking
+- [ ] MCS `SendDataRequest` / `SendDataIndication` 래핑
+- [ ] 채널 ID ↔ 채널 이름 매핑
+
+### 7.3 `justrdp-dvc` -- Dynamic Virtual Channel Framework
+
+> **requires**: 7.2 (DVC는 DRDYNVC SVC 위에서 동작)
+> **검증**: PDU roundtrip + DataFirst/Data 재조립 unit test
+
+```rust
+/// Dynamic Virtual Channel 프로세서
+pub trait DvcProcessor: AsAny + Send {
+    fn channel_name(&self) -> &str;
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>>;
+    fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>>;
+    fn close(&mut self, channel_id: u32);
+}
+```
+
+**구현 항목:**
+- [ ] `DvcProcessor` trait
+- [ ] `DrdynvcClient` -- 클라이언트 측 DVC 호스트
+- [ ] `DrdynvcServer` -- 서버 측 DVC 호스트
+- [ ] Capability negotiation (v1/v2/v3)
+- [ ] Channel Create/Close 시퀀스
+- [ ] DataFirst/Data 재조립 (`CompleteData`)
+- [ ] 우선순위 지원 (v2: high/medium/low/lowest)
+- [ ] 압축 지원 (v2: DYNVC_DATA_FIRST_COMPRESSED, DYNVC_DATA_COMPRESSED)
+- [ ] Soft-Sync (v3: 멀티트랜스포트 간 채널 마이그레이션)
+
+---
+
+## 8. Phase 5 -- Channel Implementations
+
+> **목표**: 클립보드, 파일 공유, 오디오, 디스플레이 제어, EGFX 등 채널별 구현.
+> Phase 4의 SVC/DVC 프레임워크 위에 각 채널 프로세서를 구현.
+
+### 8.1 `justrdp-cliprdr` -- Clipboard Channel (MS-RDPECLIP)
+
+> **requires**: 7.2 SVC 프레임워크
+> **검증**: PDU roundtrip + integration test (실서버 클립보드 교환)
+
+**SVC 이름**: `CLIPRDR`
+
+```rust
+pub trait CliprdrBackend: Send {
+    fn on_format_list(&mut self, formats: &[ClipboardFormat]) -> ClipboardResult<FormatListResponse>;
+    fn on_format_data_request(&mut self, format_id: u32) -> ClipboardResult<FormatDataResponse>;
+    fn on_format_data_response(&mut self, data: &[u8], is_success: bool);
+    fn on_file_contents_request(&mut self, request: &FileContentsRequest) -> ClipboardResult<FileContentsResponse>;
+    fn on_file_contents_response(&mut self, response: &FileContentsResponse);
+    fn on_lock(&mut self, lock_id: u32);
+    fn on_unlock(&mut self, lock_id: u32);
+}
+```
+
+**구현 항목:**
+- [ ] `Cliprdr<R: Role>` -- Generic 클립보드 프로세서 (Client/Server)
+- [ ] 초기화 시퀀스 (Capabilities → Monitor Ready → Format List)
+- [ ] Format List PDU (포맷 ID + 이름)
+- [ ] Format Data Request/Response PDU
+- [ ] File Contents Request/Response PDU (FILECONTENTS_SIZE / FILECONTENTS_RANGE)
+- [ ] Temporary Directory PDU
+- [ ] Lock/Unlock Clipboard Data PDU
+- [ ] Long format names 지원
+- [ ] 표준 포맷: CF_TEXT, CF_UNICODETEXT, CF_DIB, CF_HDROP
+
+### 8.2 `justrdp-rdpsnd` -- Audio Output (MS-RDPEA)
+
+> **requires**: 7.2 SVC 프레임워크 (SVC 모드), 7.3 DVC 프레임워크 (DVC 모드)
+> **검증**: PDU roundtrip + integration test (실서버 오디오 수신)
+
+**SVC 이름**: `RDPSND` / **DVC 이름**: `AUDIO_PLAYBACK_DVC`, `AUDIO_PLAYBACK_LOSSY_DVC`
+
+**구현 항목:**
+- [ ] 초기화 시퀀스 (Formats → Quality Mode → Training)
+- [ ] 오디오 포맷 협상
+- [ ] Wave/Wave2 PDU 수신 및 디코딩
+- [ ] WaveConfirm PDU 전송 (타임스탬프 동기화)
+- [ ] 볼륨/피치 제어
+- [ ] DVC 전송 모드 (reliable / lossy)
+- [ ] 지원 코덱:
+  - [ ] PCM (raw)
+  - [ ] MS-ADPCM
+  - [ ] IMA-ADPCM
+  - [ ] AAC
+  - [ ] Opus
+
+### 8.3 `justrdp-rdpdr` -- Device Redirection (MS-RDPEFS)
+
+> **requires**: 7.2 SVC 프레임워크
+> **검증**: PDU roundtrip + integration test (실서버 드라이브 리다이렉션)
+
+**SVC 이름**: `RDPDR`
+
+```rust
+pub trait RdpdrBackend: Send {
+    fn device_list(&self) -> Vec<DeviceAnnounce>;
+    fn create(&mut self, device_id: u32, path: &str, desired_access: u32, create_disposition: u32) -> IoResult<FileHandle>;
+    fn read(&mut self, handle: FileHandle, offset: u64, length: u32) -> IoResult<Vec<u8>>;
+    fn write(&mut self, handle: FileHandle, offset: u64, data: &[u8]) -> IoResult<u32>;
+    fn close(&mut self, handle: FileHandle) -> IoResult<()>;
+    fn query_information(&mut self, handle: FileHandle, info_class: u32) -> IoResult<FileInformation>;
+    fn query_directory(&mut self, handle: FileHandle, pattern: &str) -> IoResult<Vec<DirectoryEntry>>;
+    fn query_volume_information(&mut self, device_id: u32, info_class: u32) -> IoResult<VolumeInformation>;
+    fn device_control(&mut self, handle: FileHandle, ioctl_code: u32, input: &[u8]) -> IoResult<Vec<u8>>;
+    fn lock(&mut self, handle: FileHandle, offset: u64, length: u64, exclusive: bool) -> IoResult<()>;
+    fn unlock(&mut self, handle: FileHandle, offset: u64, length: u64) -> IoResult<()>;
+}
+```
+
+**구현 항목:**
+- [ ] 초기화 시퀀스 (Announce → Name → Capability → Device List)
+- [ ] 디바이스 타입: Filesystem, Serial, Parallel, Printer, Smartcard
+- [ ] IRP (I/O Request Packet) 처리:
+  - [ ] IRP_MJ_CREATE / CLOSE / READ / WRITE
+  - [ ] IRP_MJ_DEVICE_CONTROL (IOCTL)
+  - [ ] IRP_MJ_QUERY_INFORMATION / SET_INFORMATION
+  - [ ] IRP_MJ_QUERY_VOLUME_INFORMATION / SET_VOLUME_INFORMATION
+  - [ ] IRP_MJ_DIRECTORY_CONTROL (Query / Notify)
+  - [ ] IRP_MJ_LOCK_CONTROL
+- [ ] 드라이브 리다이렉션 (`with_drives()`, `add_drive()`)
+- [ ] 스마트카드 리다이렉션 (`with_smartcard()`, MS-RDPESC)
+  - [ ] NDR/RPCE 인코딩
+  - [ ] SCard API 래핑
+- [ ] 프린터 리다이렉션 (MS-RDPEPC)
+
+### 8.4 `justrdp-displaycontrol` -- Display Control (MS-RDPEDISP)
+
+> **requires**: 7.3 DVC 프레임워크
+> **검증**: PDU roundtrip + integration test (동적 리사이즈)
+
+**DVC 이름**: `Microsoft::Windows::RDS::DisplayControl`
+
+**구현 항목:**
+- [ ] Capabilities PDU 수신 (최대 모니터 수, 최대 해상도)
+- [ ] Monitor Layout PDU 전송:
+  ```rust
+  pub struct MonitorLayoutEntry {
+      pub flags: MonitorFlags,   // PRIMARY
+      pub left: i32,
+      pub top: i32,
+      pub width: u32,
+      pub height: u32,
+      pub physical_width: u32,   // mm
+      pub physical_height: u32,  // mm
+      pub orientation: Orientation, // 0, 90, 180, 270
+      pub desktop_scale_factor: u32,
+      pub device_scale_factor: u32,
+  }
+  ```
+- [ ] 동적 리사이즈
+- [ ] 멀티모니터 레이아웃 변경
+
+### 8.5 `justrdp-rdpeai` -- Audio Input (MS-RDPEAI)
+
+> **requires**: 7.3 DVC 프레임워크
+> **검증**: PDU roundtrip
+
+**DVC 이름**: `AUDIO_INPUT`
+
+**구현 항목:**
+- [ ] 버전 교환
+- [ ] 오디오 포맷 협상
+- [ ] Open/Close 시퀀스
+- [ ] 오디오 캡처 데이터 전송
+- [ ] 포맷 변경
+
+### 8.6 `justrdp-egfx` -- Graphics Pipeline Extension (RDPEGFX)
+
+> **requires**: 7.3 DVC 프레임워크 + Phase 3 코덱들 (RFX, ClearCodec, Planar, ZGFX)
+> **검증**: PDU roundtrip + integration test (실서버에서 GFX 프레임 수신 → 디코딩)
 
 **DVC 이름**: `Microsoft::Windows::RDS::Graphics`
 
 ```rust
-/// GFX 이벤트 핸들러
 pub trait GfxHandler: Send {
     fn on_create_surface(&mut self, surface_id: u16, width: u16, height: u16, pixel_format: PixelFormat);
     fn on_delete_surface(&mut self, surface_id: u16);
@@ -810,256 +1079,10 @@ pub trait GfxHandler: Send {
 - [ ] 코덱 디스패치 (Uncompressed, ClearCodec, Planar, RFX, H.264, Alpha)
 - [ ] ZGFX 압축/해제 통합
 
-### 6.3 `justrdp-session` -- Active Session Processing
+### 8.7 `justrdp-rail` -- RemoteApp (MS-RDPERP)
 
-- [ ] `ActiveStage` -- 활성 세션 프로세서
-- [ ] Fast-Path 입력 프레임 생성
-- [ ] Fast-Path 출력 프레임 파싱 + 벌크 해제
-- [ ] X.224/Slow-Path 프레임 파싱
-- [ ] 프레임 단편화/재조립 (`CompleteData`)
-- [ ] 출력 디스패치:
-  ```rust
-  pub enum ActiveStageOutput {
-      ResponseFrame(Vec<u8>),
-      GraphicsUpdate { region: Rectangle, data: Vec<u8> },
-      PointerDefault,
-      PointerHidden,
-      PointerPosition { x: u16, y: u16 },
-      PointerBitmap(DecodedPointer),
-      Terminate(GracefulDisconnectReason),
-      DeactivateAll(DeactivationReactivation),
-      Resize { width: u16, height: u16 },
-  }
-  ```
-- [ ] 세션 Deactivation-Reactivation 처리
-- [ ] Graceful shutdown 시퀀스
-- [ ] Auto-Reconnect 시퀀스
-
-### 6.4 `justrdp-input` -- Input Event Management
-
-- [ ] `InputDatabase` -- 키보드 + 마우스 상태 추적
-- [ ] 키보드: 512-bit 비트필드 (모든 스캔코드 상태)
-- [ ] 마우스: 5 버튼 + 위치 + 휠 상태
-- [ ] 상태 diff 기반 이벤트 생성 (중복 이벤트 방지)
-- [ ] `Operation` enum:
-  ```rust
-  pub enum Operation {
-      KeyPressed(Scancode),
-      KeyReleased(Scancode),
-      UnicodeKeyPressed(u16),
-      UnicodeKeyReleased(u16),
-      MouseButtonPressed(MouseButton),
-      MouseButtonReleased(MouseButton),
-      MouseMove(u16, u16),
-      WheelRotations(i16),
-      HorizontalWheelRotations(i16),
-  }
-  ```
-- [ ] `Scancode` 타입 (extended flag 포함)
-- [ ] `synchronize_event()` -- 잠금 키 동기화
-- [ ] 터치/펜 입력 매핑 (MS-RDPEI)
-
----
-
-## 7. Phase 4 -- Virtual Channels
-
-> **목표**: 클립보드, 파일 공유, 오디오 등 사용자 경험에 핵심적인 채널 구현.
-
-### 7.1 `justrdp-svc` -- Static Virtual Channel Framework
-
-```rust
-/// Static Virtual Channel 프로세서
-pub trait SvcProcessor: AsAny + Debug + Send {
-    /// 채널 이름 (8자 ASCII, 예: "CLIPRDR\0")
-    fn channel_name(&self) -> ChannelName;
-    /// 채널 개시 시 전송할 초기 메시지
-    fn start(&mut self) -> PduResult<Vec<SvcMessage>>;
-    /// 수신 데이터 처리
-    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>>;
-    /// 압축 조건
-    fn compression_condition(&self) -> CompressionCondition { CompressionCondition::WhenRdpDataIsCompressed }
-}
-```
-
-**구현 항목:**
-- [ ] `SvcProcessor` trait
-- [ ] `SvcClientProcessor` / `SvcServerProcessor` marker traits
-- [ ] `StaticChannelSet` -- TypeId 기반 채널 집합
-- [ ] `ChannelPduHeader` -- 플래그(FIRST/LAST/SHOW_PROTOCOL/SUSPEND/RESUME), 총 길이
-- [ ] 자동 chunking (기본 1600바이트) / dechunking
-- [ ] MCS `SendDataRequest` / `SendDataIndication` 래핑
-- [ ] 채널 ID ↔ 채널 이름 매핑
-
-### 7.2 `justrdp-dvc` -- Dynamic Virtual Channel Framework
-
-```rust
-/// Dynamic Virtual Channel 프로세서
-pub trait DvcProcessor: AsAny + Send {
-    fn channel_name(&self) -> &str;
-    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>>;
-    fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>>;
-    fn close(&mut self, channel_id: u32);
-}
-```
-
-**구현 항목:**
-- [ ] `DvcProcessor` trait
-- [ ] `DrdynvcClient` -- 클라이언트 측 DVC 호스트
-- [ ] `DrdynvcServer` -- 서버 측 DVC 호스트
-- [ ] Capability negotiation (v1/v2/v3)
-- [ ] Channel Create/Close 시퀀스
-- [ ] DataFirst/Data 재조립 (`CompleteData`)
-- [ ] 우선순위 지원 (v2: high/medium/low/lowest)
-- [ ] 압축 지원 (v2: DYNVC_DATA_FIRST_COMPRESSED, DYNVC_DATA_COMPRESSED)
-- [ ] Soft-Sync (v3: 멀티트랜스포트 간 채널 마이그레이션)
-
-### 7.3 `justrdp-cliprdr` -- Clipboard Channel (MS-RDPECLIP)
-
-**SVC 이름**: `CLIPRDR`
-
-```rust
-pub trait CliprdrBackend: Send {
-    /// 서버 클립보드 변경 시 호출 (서버 → 클라이언트 방향 copy)
-    fn on_format_list(&mut self, formats: &[ClipboardFormat]) -> ClipboardResult<FormatListResponse>;
-    /// 데이터 요청 시 호출
-    fn on_format_data_request(&mut self, format_id: u32) -> ClipboardResult<FormatDataResponse>;
-    /// 데이터 수신 시 호출
-    fn on_format_data_response(&mut self, data: &[u8], is_success: bool);
-    /// 파일 콘텐츠 요청 시 호출
-    fn on_file_contents_request(&mut self, request: &FileContentsRequest) -> ClipboardResult<FileContentsResponse>;
-    /// 파일 콘텐츠 수신 시 호출
-    fn on_file_contents_response(&mut self, response: &FileContentsResponse);
-    /// 클립보드 잠금/해제
-    fn on_lock(&mut self, lock_id: u32);
-    fn on_unlock(&mut self, lock_id: u32);
-}
-```
-
-**구현 항목:**
-- [ ] `Cliprdr<R: Role>` -- Generic 클립보드 프로세서 (Client/Server)
-- [ ] 초기화 시퀀스 (Capabilities → Monitor Ready → Format List)
-- [ ] Format List PDU (포맷 ID + 이름)
-- [ ] Format Data Request/Response PDU
-- [ ] File Contents Request/Response PDU (FILECONTENTS_SIZE / FILECONTENTS_RANGE)
-- [ ] Temporary Directory PDU
-- [ ] Lock/Unlock Clipboard Data PDU
-- [ ] Long format names 지원
-- [ ] 표준 포맷: CF_TEXT, CF_UNICODETEXT, CF_DIB, CF_HDROP
-- [ ] `justrdp-cliprdr-native`:
-  - [ ] Windows: Win32 Clipboard API 통합
-  - [ ] Linux: X11 Selection / Wayland data-device
-  - [ ] macOS: NSPasteboard
-
-### 7.4 `justrdp-rdpdr` -- Device Redirection (MS-RDPEFS)
-
-**SVC 이름**: `RDPDR`
-
-```rust
-pub trait RdpdrBackend: Send {
-    /// 디바이스 목록 반환
-    fn device_list(&self) -> Vec<DeviceAnnounce>;
-    /// 파일 생성/열기
-    fn create(&mut self, device_id: u32, path: &str, desired_access: u32, create_disposition: u32) -> IoResult<FileHandle>;
-    /// 파일 읽기
-    fn read(&mut self, handle: FileHandle, offset: u64, length: u32) -> IoResult<Vec<u8>>;
-    /// 파일 쓰기
-    fn write(&mut self, handle: FileHandle, offset: u64, data: &[u8]) -> IoResult<u32>;
-    /// 파일 닫기
-    fn close(&mut self, handle: FileHandle) -> IoResult<()>;
-    /// 파일 정보 조회
-    fn query_information(&mut self, handle: FileHandle, info_class: u32) -> IoResult<FileInformation>;
-    /// 디렉터리 열거
-    fn query_directory(&mut self, handle: FileHandle, pattern: &str) -> IoResult<Vec<DirectoryEntry>>;
-    /// 볼륨 정보 조회
-    fn query_volume_information(&mut self, device_id: u32, info_class: u32) -> IoResult<VolumeInformation>;
-    /// 디바이스 IOCTL
-    fn device_control(&mut self, handle: FileHandle, ioctl_code: u32, input: &[u8]) -> IoResult<Vec<u8>>;
-    /// 파일 잠금
-    fn lock(&mut self, handle: FileHandle, offset: u64, length: u64, exclusive: bool) -> IoResult<()>;
-    fn unlock(&mut self, handle: FileHandle, offset: u64, length: u64) -> IoResult<()>;
-}
-```
-
-**구현 항목:**
-- [ ] 초기화 시퀀스 (Announce → Name → Capability → Device List)
-- [ ] 디바이스 타입: Filesystem, Serial, Parallel, Printer, Smartcard
-- [ ] IRP (I/O Request Packet) 처리:
-  - [ ] IRP_MJ_CREATE / CLOSE / READ / WRITE
-  - [ ] IRP_MJ_DEVICE_CONTROL (IOCTL)
-  - [ ] IRP_MJ_QUERY_INFORMATION / SET_INFORMATION
-  - [ ] IRP_MJ_QUERY_VOLUME_INFORMATION / SET_VOLUME_INFORMATION
-  - [ ] IRP_MJ_DIRECTORY_CONTROL (Query / Notify)
-  - [ ] IRP_MJ_LOCK_CONTROL
-- [ ] 드라이브 리다이렉션 (`with_drives()`, `add_drive()`)
-- [ ] 스마트카드 리다이렉션 (`with_smartcard()`, MS-RDPESC)
-  - [ ] NDR/RPCE 인코딩
-  - [ ] SCard API 래핑
-- [ ] 프린터 리다이렉션 (MS-RDPEPC)
-- [ ] `justrdp-rdpdr-native`:
-  - [ ] 네이티브 파일시스템 백엔드
-
-### 7.5 `justrdp-rdpsnd` -- Audio Output (MS-RDPEA)
-
-**SVC 이름**: `RDPSND` / **DVC 이름**: `AUDIO_PLAYBACK_DVC`, `AUDIO_PLAYBACK_LOSSY_DVC`
-
-**구현 항목:**
-- [ ] 초기화 시퀀스 (Formats → Quality Mode → Training)
-- [ ] 오디오 포맷 협상
-- [ ] Wave/Wave2 PDU 수신 및 디코딩
-- [ ] WaveConfirm PDU 전송 (타임스탬프 동기화)
-- [ ] 볼륨/피치 제어
-- [ ] DVC 전송 모드 (reliable / lossy)
-- [ ] 지원 코덱:
-  - [ ] PCM (raw)
-  - [ ] MS-ADPCM
-  - [ ] IMA-ADPCM
-  - [ ] AAC
-  - [ ] Opus
-- [ ] `justrdp-rdpsnd-native`:
-  - [ ] Windows: WASAPI
-  - [ ] Linux: PulseAudio / PipeWire
-  - [ ] macOS: CoreAudio
-
-### 7.6 `justrdp-rdpeai` -- Audio Input (MS-RDPEAI)
-
-**DVC 이름**: `AUDIO_INPUT`
-
-**구현 항목:**
-- [ ] 버전 교환
-- [ ] 오디오 포맷 협상
-- [ ] Open/Close 시퀀스
-- [ ] 오디오 캡처 데이터 전송
-- [ ] 포맷 변경
-- [ ] `justrdp-rdpeai-native`:
-  - [ ] Windows: WASAPI 캡처
-  - [ ] Linux: PulseAudio / PipeWire 캡처
-  - [ ] macOS: CoreAudio 캡처
-
-### 7.7 `justrdp-displaycontrol` -- Display Control (MS-RDPEDISP)
-
-**DVC 이름**: `Microsoft::Windows::RDS::DisplayControl`
-
-**구현 항목:**
-- [ ] Capabilities PDU 수신 (최대 모니터 수, 최대 해상도)
-- [ ] Monitor Layout PDU 전송:
-  ```rust
-  pub struct MonitorLayoutEntry {
-      pub flags: MonitorFlags,   // PRIMARY
-      pub left: i32,
-      pub top: i32,
-      pub width: u32,
-      pub height: u32,
-      pub physical_width: u32,   // mm
-      pub physical_height: u32,  // mm
-      pub orientation: Orientation, // 0, 90, 180, 270
-      pub desktop_scale_factor: u32,
-      pub device_scale_factor: u32,
-  }
-  ```
-- [ ] 동적 리사이즈
-- [ ] 멀티모니터 레이아웃 변경
-
-### 7.8 `justrdp-rail` -- RemoteApp (MS-RDPERP)
+> **requires**: 7.2 SVC 프레임워크, 8.6 EGFX (`MapSurfaceToWindow` 연동)
+> **검증**: PDU roundtrip
 
 **SVC 이름**: `RAIL`
 
@@ -1082,13 +1105,48 @@ pub trait RdpdrBackend: Send {
   - [ ] Notification Icon Order
 - [ ] EGFX 연동: `MapSurfaceToWindow` / `MapSurfaceToScaledWindow`
 
+### 8.8 H.264/AVC Codec
+
+> **requires**: 없음 (순수 디코더), 하지만 8.6 EGFX 연동 시 실질적 테스트 가능
+> **검증**: 알려진 NAL 유닛 디코딩, EGFX WireToSurface로 end-to-end 확인
+
+- [ ] AVC420 디코딩 (YUV 4:2:0)
+- [ ] AVC444 디코딩 (YUV 4:4:4, 두 AVC420 결합)
+- [ ] AVC444v2 디코딩
+- [ ] 순수 Rust H.264 디코더 통합 또는 trait 추상화
+- [ ] 하드웨어 가속 백엔드 trait
+
+### 8.9 Native Platform Backends
+
+> **requires**: 각 채널 구현 (8.1~8.5)
+> **검증**: 각 플랫폼에서 실서버 연결 후 기능 확인
+
+- [ ] `justrdp-cliprdr-native`:
+  - [ ] Windows: Win32 Clipboard API 통합
+  - [ ] Linux: X11 Selection / Wayland data-device
+  - [ ] macOS: NSPasteboard
+- [ ] `justrdp-rdpdr-native`:
+  - [ ] 네이티브 파일시스템 백엔드
+- [ ] `justrdp-rdpsnd-native`:
+  - [ ] Windows: WASAPI
+  - [ ] Linux: PulseAudio / PipeWire
+  - [ ] macOS: CoreAudio
+- [ ] `justrdp-rdpeai-native`:
+  - [ ] Windows: WASAPI 캡처
+  - [ ] Linux: PulseAudio / PipeWire 캡처
+  - [ ] macOS: CoreAudio 캡처
+
 ---
 
-## 8. Phase 5 -- Advanced Features
+## 9. Phase 6 -- Advanced Features & Integration
 
-> **목표**: 프로덕션 수준의 완성도. 엔터프라이즈 환경에서 요구하는 모든 기능.
+> **목표**: 프로덕션 수준의 완성도. 엔터프라이즈 환경에서 요구하는 기능.
+> Phase 4/5의 세션+채널 인프라 위에 구축.
 
-### 8.1 Multi-Monitor Support
+### 9.1 Multi-Monitor Support
+
+> **requires**: 8.6 EGFX (`ResetGraphics`), 8.4 DisplayControl
+> **검증**: integration test (다중 모니터 레이아웃 전송 → 서버 응답)
 
 - [ ] Client Monitor Data (GCC) -- 최대 16개 모니터 정의
 - [ ] Client Monitor Extended Data -- 물리 크기, DPI, 방향
@@ -1097,36 +1155,30 @@ pub trait RdpdrBackend: Send {
 - [ ] 가상 데스크톱 좌표 처리 (음수 좌표 포함)
 - [ ] DPI 스케일링
 
-### 8.2 Auto-Reconnect
+### 9.2 Auto-Reconnect
+
+> **requires**: 7.1 세션 (Save Session Info PDU 수신), Phase 2 커넥터
+> **검증**: integration test (연결 끊기 → 자동 재연결)
 
 - [ ] Auto-Reconnect Cookie 저장/복원 (Save Session Info PDU)
 - [ ] ARC (Auto-Reconnect Cookie) 랜덤 생성
 - [ ] ClientAutoReconnectPacket 전송 (Client Info PDU 내)
 - [ ] 네트워크 끊김 감지 및 자동 재연결 시퀀스
 
-### 8.3 Session Redirection
+### 9.3 Session Redirection
+
+> **requires**: 7.1 세션 (Redirection PDU 수신), Phase 2 커넥터
+> **검증**: integration test (로드밸런서 환경)
 
 - [ ] Server Redirection PDU 파싱
 - [ ] 리다이렉션 주소/로드밸런싱 정보 추출
 - [ ] Routing Token / Cookie 전달
 - [ ] 새 연결로의 자동 리다이렉트
 
-### 8.4 USB Redirection (MS-RDPEUSB)
+### 9.4 Touch Input (MS-RDPEI)
 
-- [ ] USB 디바이스 열거
-- [ ] URB (USB Request Block) 포워딩
-- [ ] 디바이스 핫플러그 알림
-- [ ] USB over RDPDR 전송
-
-### 8.5 Pen/Stylus Input (MS-RDPEPS)
-
-**DVC 이름**: `Microsoft::Windows::RDS::Pen`
-
-- [ ] 펜 프레임 PDU
-- [ ] 압력, 기울기, 회전 데이터
-- [ ] 펜 타입 (펜, 지우개)
-
-### 8.6 Touch Input (MS-RDPEI)
+> **requires**: 7.3 DVC 프레임워크
+> **검증**: PDU roundtrip
 
 **DVC 이름**: `Microsoft::Windows::RDS::Input`
 
@@ -1135,13 +1187,41 @@ pub trait RdpdrBackend: Send {
 - [ ] 터치 접촉 영역, 방향
 - [ ] 터치 이벤트 (down, move, up, cancel)
 
-### 8.7 Camera Redirection (MS-RDPECAM)
+### 9.5 Pen/Stylus Input (MS-RDPEPS)
 
-- [ ] 카메라 디바이스 열거
-- [ ] 미디어 타입 협상
-- [ ] 프레임 스트리밍
+> **requires**: 7.3 DVC 프레임워크
+> **검증**: PDU roundtrip
 
-### 8.8 Video Optimized Remoting (MS-RDPEVOR)
+**DVC 이름**: `Microsoft::Windows::RDS::Pen`
+
+- [ ] 펜 프레임 PDU
+- [ ] 압력, 기울기, 회전 데이터
+- [ ] 펜 타입 (펜, 지우개)
+
+### 9.6 Smartcard Authentication (PKINIT)
+
+> **requires**: Phase 2 Kerberos, 8.3 RDPDR 스마트카드 리다이렉션
+> **검증**: 스마트카드 로그인 integration test
+
+- [ ] PKCS#11 인터페이스
+- [ ] 인증서 기반 Kerberos (PKINIT)
+- [ ] 스마트카드 리더 열거
+- [ ] PIN 입력 인터페이스
+
+### 9.7 USB Redirection (MS-RDPEUSB)
+
+> **requires**: 7.3 DVC 프레임워크, 8.3 RDPDR
+> **검증**: USB 디바이스 열거 integration test
+
+- [ ] USB 디바이스 열거
+- [ ] URB (USB Request Block) 포워딩
+- [ ] 디바이스 핫플러그 알림
+- [ ] USB over RDPDR 전송
+
+### 9.8 Video Optimized Remoting (MS-RDPEVOR)
+
+> **requires**: 7.3 DVC, 8.8 H.264, 9.11 Geometry Tracking
+> **검증**: 비디오 스트림 수신 integration test
 
 **DVC 이름**: `Microsoft::Windows::RDS::Video::Control`, `Microsoft::Windows::RDS::Video::Data`
 
@@ -1150,14 +1230,19 @@ pub trait RdpdrBackend: Send {
 - [ ] H.264 비디오 데이터 전송
 - [ ] 프레젠테이션 요청/응답
 
-### 8.9 Desktop Composition (MS-RDPECR2)
+### 9.9 Camera Redirection (MS-RDPECAM)
 
-- [ ] Composited Remoting V2 프로토콜
-- [ ] 데스크톱 컴포지션 리다이렉션 (DWM 통합)
-- [ ] CAPSETTYPE_COMPDESK capability set과 연동
-- [ ] 서버측 DWM 컴포지션 활성화/비활성화 제어
+> **requires**: 7.3 DVC 프레임워크
+> **검증**: 카메라 디바이스 열거 integration test
 
-### 8.10 Video Redirection (MS-RDPEV)
+- [ ] 카메라 디바이스 열거
+- [ ] 미디어 타입 협상
+- [ ] 프레임 스트리밍
+
+### 9.10 Video Redirection (MS-RDPEV)
+
+> **requires**: 7.3 DVC 프레임워크
+> **검증**: PDU roundtrip
 
 **DVC 이름**: `TSMF` (TS Multimedia Framework)
 
@@ -1168,21 +1253,10 @@ pub trait RdpdrBackend: Send {
 - [ ] 스트림 타이밍 동기화 (presentation timestamp)
 - [ ] 레거시 비디오 리다이렉션 (RDPEVOR 이전 방식)
 
-### 8.11 Multiparty Virtual Channel (MS-RDPEMC)
+### 9.11 Geometry Tracking (RDPGFX)
 
-- [ ] 다자 RDP 세션 (여러 클라이언트가 하나의 세션 공유)
-- [ ] Shadow 세션 (관리자가 사용자 세션 모니터링/제어)
-- [ ] View-only / Interactive 모드
-- [ ] 제어 권한 요청/승인 시퀀스
-
-### 8.12 Plug and Play Device Redirection (MS-RDPEPNP)
-
-- [ ] PnP 디바이스 열거 (클라이언트 → 서버)
-- [ ] 디바이스 추가/제거 알림
-- [ ] 디바이스 드라이버 매칭 (서버 측)
-- [ ] 디바이스 인스턴스 리다이렉션
-
-### 8.13 Geometry Tracking (RDPGFX)
+> **requires**: 7.3 DVC 프레임워크, 8.6 EGFX
+> **검증**: PDU roundtrip
 
 **DVC 이름**: `Microsoft::Windows::RDS::Geometry::v08.01`
 
@@ -1190,58 +1264,48 @@ pub trait RdpdrBackend: Send {
 - [ ] 렌더링 영역 추적 (비디오 오버레이 위치)
 - [ ] RDPEVOR과 연동하여 비디오 위치 동기화
 
-### 8.14 `.rdp` File Support
+### 9.12 Desktop Composition (MS-RDPECR2)
 
-- [ ] `.rdp` 파일 포맷 파서/라이터
-- [ ] 모든 표준 설정 키 지원
-- [ ] `no_std` 호환
+> **requires**: 7.3 DVC 프레임워크
+> **검증**: PDU roundtrip
 
-### 8.15 Smartcard Authentication (PKINIT)
+- [ ] Composited Remoting V2 프로토콜
+- [ ] 데스크톱 컴포지션 리다이렉션 (DWM 통합)
+- [ ] CAPSETTYPE_COMPDESK capability set과 연동
+- [ ] 서버측 DWM 컴포지션 활성화/비활성화 제어
 
-- [ ] PKCS#11 인터페이스
-- [ ] 인증서 기반 Kerberos (PKINIT)
-- [ ] 스마트카드 리더 열거
-- [ ] PIN 입력 인터페이스
+### 9.13 Multiparty Virtual Channel (MS-RDPEMC)
+
+> **requires**: 7.3 DVC 프레임워크, 7.1 세션
+> **검증**: Shadow 세션 integration test
+
+- [ ] 다자 RDP 세션 (여러 클라이언트가 하나의 세션 공유)
+- [ ] Shadow 세션 (관리자가 사용자 세션 모니터링/제어)
+- [ ] View-only / Interactive 모드
+- [ ] 제어 권한 요청/승인 시퀀스
+
+### 9.14 Plug and Play Device Redirection (MS-RDPEPNP)
+
+> **requires**: 7.3 DVC 프레임워크
+> **검증**: PDU roundtrip
+
+- [ ] PnP 디바이스 열거 (클라이언트 → 서버)
+- [ ] 디바이스 추가/제거 알림
+- [ ] 디바이스 드라이버 매칭 (서버 측)
+- [ ] 디바이스 인스턴스 리다이렉션
 
 ---
 
-## 9. Phase 6 -- Transport Extensions
+## 10. Phase 7 -- Transport Extensions
 
 > **목표**: WAN 환경에서의 성능 최적화, 방화벽/프록시 통과.
+> Phase 4 세션과 병렬 진행 가능 (독립 네트워크 레이어).
 
-### 9.1 UDP Transport (MS-RDPEUDP)
+### 10.1 RD Gateway (MS-TSGU)
 
-**구현 항목:**
-- [ ] 3-way 핸드셰이크 (SYN → SYN+ACK → ACK)
-- [ ] `RdpeudpSocket` -- UDP 소켓 추상화
-- [ ] Reliable 모드:
-  - [ ] 시퀀스 번호 관리
-  - [ ] 재전송 타이머 (RTO)
-  - [ ] 혼잡 제어 (congestion window)
-  - [ ] FEC (Forward Error Correction)
-  - [ ] 순서 보장
-  - [ ] TLS over UDP
-- [ ] Lossy 모드:
-  - [ ] FEC only (재전송 없음)
-  - [ ] DTLS
-- [ ] ACK/NACK 처리
-- [ ] MTU 협상
-- [ ] 프로토콜 버전 1/2/3 지원
-
-### 9.2 Multitransport (MS-RDPEMT)
-
-**구현 항목:**
-- [ ] `InitiateMultitransportRequest` 수신 (메인 TCP 연결 통해)
-- [ ] UDP 연결 수립
-- [ ] TLS/DTLS 핸드셰이크 (UDP 위)
-- [ ] `TunnelCreateRequest` PDU (requestId + securityCookie)
-- [ ] `TunnelCreateResponse` PDU
-- [ ] DVC를 UDP 트랜스포트로 라우팅
-- [ ] 트랜스포트 간 DVC Soft-Sync 마이그레이션
-
-### 9.3 RD Gateway (MS-TSGU)
-
-**구현 항목:**
+> **requires**: Phase 2 (NTLM/Kerberos 인증), justrdp-tls
+> **검증**: 게이트웨이 경유 실서버 연결 integration test
+> **참고**: 세션 내용과 무관한 터널 레이어이므로 Phase 4/5와 병렬 진행 가능
 
 **HTTP Transport (신규, 권장):**
 - [ ] Handshake Request/Response
@@ -1276,16 +1340,54 @@ pub trait RdpdrBackend: Send {
 - [ ] UDP side channel
 - [ ] 다중 게이트웨이 장애 조치
 
+### 10.2 UDP Transport (MS-RDPEUDP)
+
+> **requires**: Phase 2 (Connected), justrdp-tls (DTLS)
+> **검증**: UDP 핸드셰이크 integration test
+
+**구현 항목:**
+- [ ] 3-way 핸드셰이크 (SYN → SYN+ACK → ACK)
+- [ ] `RdpeudpSocket` -- UDP 소켓 추상화
+- [ ] Reliable 모드:
+  - [ ] 시퀀스 번호 관리
+  - [ ] 재전송 타이머 (RTO)
+  - [ ] 혼잡 제어 (congestion window)
+  - [ ] FEC (Forward Error Correction)
+  - [ ] 순서 보장
+  - [ ] TLS over UDP
+- [ ] Lossy 모드:
+  - [ ] FEC only (재전송 없음)
+  - [ ] DTLS
+- [ ] ACK/NACK 처리
+- [ ] MTU 협상
+- [ ] 프로토콜 버전 1/2/3 지원
+
+### 10.3 Multitransport (MS-RDPEMT)
+
+> **requires**: 10.2 UDP Transport, 7.3 DVC 프레임워크 (Soft-Sync)
+> **검증**: UDP 사이드 채널로 DVC 라우팅 integration test
+
+**구현 항목:**
+- [ ] `InitiateMultitransportRequest` 수신 (메인 TCP 연결 통해)
+- [ ] UDP 연결 수립
+- [ ] TLS/DTLS 핸드셰이크 (UDP 위)
+- [ ] `TunnelCreateRequest` PDU (requestId + securityCookie)
+- [ ] `TunnelCreateResponse` PDU
+- [ ] DVC를 UDP 트랜스포트로 라우팅
+- [ ] 트랜스포트 간 DVC Soft-Sync 마이그레이션
+
 ---
 
-## 10. Phase 7 -- Server-Side
+## 11. Phase 8 -- Server-Side & Ecosystem
 
-> **목표**: JustRDP로 RDP 서버를 구축할 수 있도록 서버 측 구현 제공.
+> **목표**: 서버 구현 + Rust 외부 생태계 바인딩.
+> Phase 3~6의 클라이언트 구현이 대부분 완료된 후 진행.
 
-### 10.1 `justrdp-acceptor` -- Server Connection Acceptance
+### 11.1 `justrdp-acceptor` -- Server Connection Acceptance
+
+> **requires**: Phase 2 (커넥터의 미러), Phase 3 코덱들 (서버 인코딩)
 
 ```rust
-/// 서버 연결 수락 상태 머신
 pub struct ServerAcceptor {
     state: ServerAcceptorState,
     config: ServerConfig,
@@ -1317,11 +1419,12 @@ pub enum ServerAcceptorState {
 - [ ] 서버 측 Capability Set 생성
 - [ ] 채널 ID 할당
 
-### 10.2 `justrdp-server` -- Extensible Server Skeleton
+### 11.2 `justrdp-server` -- Extensible Server Skeleton
+
+> **requires**: 11.1 Acceptor, Phase 3 코덱 (RFX 인코딩), 8.6 EGFX
 
 ```rust
 pub trait RdpServerDisplayHandler: Send {
-    /// 프레임 버퍼 업데이트 시 호출 (서버 → 클라이언트 렌더링)
     fn get_display_update(&mut self) -> Option<DisplayUpdate>;
     fn get_display_size(&self) -> (u16, u16);
 }
@@ -1347,13 +1450,9 @@ pub trait RdpServerSoundHandler: Send { /* ... */ }
 - [ ] 세션 관리 (disconnect, reconnect)
 - [ ] 서버 사이드 GFX 인코딩 파이프라인
 
----
+### 11.3 `justrdp-web` -- WASM Bindings
 
-## 11. Phase 8 -- Ecosystem & Bindings
-
-> **목표**: Rust 이외의 생태계에서도 JustRDP를 사용할 수 있도록 바인딩 및 도구 제공.
-
-### 11.1 `justrdp-web` -- WASM Bindings
+> **requires**: Phase 3 코덱 (`no_std`), Phase 4/5 세션+채널
 
 - [ ] `wasm-bindgen` 기반 JavaScript API
 - [ ] WebSocket 전송 (브라우저 환경)
@@ -1362,14 +1461,18 @@ pub trait RdpServerSoundHandler: Send { /* ... */ }
 - [ ] 클립보드 API 통합 (Clipboard API)
 - [ ] 오디오 재생 (Web Audio API)
 
-### 11.2 `justrdp-ffi` -- C/Python FFI Bindings
+### 11.4 `justrdp-ffi` -- C/Python FFI Bindings
+
+> **requires**: Phase 4/5 세션+채널
 
 - [ ] Diplomat 기반 C FFI
 - [ ] PyO3 기반 Python 바인딩
 - [ ] 타입 안전 opaque handle 패턴
 - [ ] 콜백 기반 비동기 인터페이스
 
-### 11.3 `justrdp-client` -- Reference Client Binary
+### 11.5 `justrdp-client` -- Reference Client Binary
+
+> **requires**: Phase 3~6 (전체 클라이언트 파이프라인)
 
 - [ ] CLI 인터페이스 (clap)
 - [ ] `.rdp` 파일 지원
@@ -1383,7 +1486,9 @@ pub trait RdpServerSoundHandler: Send { /* ... */ }
 - [ ] 게이트웨이 연결 지원
 - [ ] 세션 녹화/재생 (디버깅용)
 
-### 11.4 `justrdp-gateway` -- RD Gateway Server
+### 11.6 `justrdp-gateway` -- RD Gateway Server
+
+> **requires**: 10.1 RD Gateway 프로토콜, 11.1 Server Acceptor
 
 - [ ] HTTP/HTTPS 기반 게이트웨이
 - [ ] WebSocket 전송 지원
@@ -1392,7 +1497,9 @@ pub trait RdpServerSoundHandler: Send { /* ... */ }
 - [ ] 백엔드 RDP 서버 프록시
 - [ ] 세션 모니터링
 
-### 11.5 `justrdp-proxy` -- RDP Proxy
+### 11.7 `justrdp-proxy` -- RDP Proxy
+
+> **requires**: 11.1 Server Acceptor, Phase 2 Connector
 
 - [ ] 투명 프록시 (세션 녹화, 감사)
 - [ ] 프로토콜 변환
@@ -1411,38 +1518,38 @@ pub trait RdpServerSoundHandler: Send { /* ... */ }
 | MS-RDPEGDI | Graphics Device Interface Acceleration | 1 | **Critical** |
 | MS-CSSP | Credential Security Support Provider | 2 | **Critical** |
 | MS-NLMP | NT LAN Manager Protocol | 2 | **Critical** |
+| MS-SPNG | SPNEGO Extension | 2 | **Critical** |
 | MS-RDPELE | Licensing Extension | 2 | High |
-| MS-RDPEGFX | Graphics Pipeline Extension | 3 | **Critical** |
 | MS-RDPRFX | RemoteFX Codec Extension | 3 | **Critical** |
 | MS-RDPNSC | NSCodec Extension | 3 | High |
 | MS-RDPEDYC | Dynamic Virtual Channel Extension | 4 | **Critical** |
-| MS-RDPECLIP | Clipboard Virtual Channel Extension | 4 | **Critical** |
-| MS-RDPEFS | File System Virtual Channel Extension | 4 | High |
-| MS-RDPESC | Smart Card Virtual Channel Extension | 4 | Medium |
-| MS-RDPEA | Audio Output Virtual Channel Extension | 4 | High |
-| MS-RDPEAI | Audio Input Virtual Channel Extension | 4 | Medium |
-| MS-RDPEDISP | Display Update Virtual Channel Extension | 4 | High |
-| MS-RDPERP | Remote Programs (RAIL) | 4 | Medium |
-| MS-KILE | Kerberos Protocol Extensions | 5 | High |
-| MS-RDPEUDP | UDP Transport Extension | 6 | Medium |
-| MS-RDPEMT | Multitransport Extension | 6 | Medium |
-| MS-TSGU | Terminal Services Gateway | 6 | High |
-| MS-RDPEI | Input Virtual Channel Extension (Touch) | 5 | Medium |
-| MS-RDPEPS | Pen Remoting | 5 | Low |
-| MS-RDPECAM | Camera Device Redirection | 5 | Low |
-| MS-RDPEVOR | Video Optimized Remoting | 5 | Medium |
-| MS-RDPEUSB | USB Devices Virtual Channel Extension | 5 | Low |
-| MS-RDPEPC | Printer Cache Extension | 5 | Low |
-| MS-RDPESP | Serial/Parallel Port Virtual Channel | 4 | Low |
-| MS-RDPEPNP | Plug and Play Device Redirection | 5 | Low |
-| MS-RDPECR2 | Composited Remoting V2 | 5 | Low |
-| MS-RDPEV | Video Redirection Virtual Channel (TSMF) | 5 | Low |
-| MS-RDPEMC | Multiparty Virtual Channel Extension | 5 | Low |
-| MS-RDPEECO | Extensible Output Channel Extension | 5 | Low |
-| MS-RDPEXPS | Extended Presentation Session | 5 | Low |
-| MS-RDPEDC | Desktop Composition Virtual Channel | 5 | Low |
-| MS-RDPEAR | Audio Redirection (newer) | 5 | Low |
-| MS-SPNG | SPNEGO Extension | 2 | **Critical** |
+| MS-RDPEGFX | Graphics Pipeline Extension | 5 | **Critical** |
+| MS-RDPECLIP | Clipboard Virtual Channel Extension | 5 | **Critical** |
+| MS-RDPEFS | File System Virtual Channel Extension | 5 | High |
+| MS-RDPEA | Audio Output Virtual Channel Extension | 5 | High |
+| MS-RDPEDISP | Display Update Virtual Channel Extension | 5 | High |
+| MS-RDPESC | Smart Card Virtual Channel Extension | 5 | Medium |
+| MS-RDPEAI | Audio Input Virtual Channel Extension | 5 | Medium |
+| MS-RDPERP | Remote Programs (RAIL) | 5 | Medium |
+| MS-RDPESP | Serial/Parallel Port Virtual Channel | 5 | Low |
+| MS-KILE | Kerberos Protocol Extensions | 6 | High |
+| MS-RDPEI | Input Virtual Channel Extension (Touch) | 6 | Medium |
+| MS-RDPEPS | Pen Remoting | 6 | Low |
+| MS-RDPEVOR | Video Optimized Remoting | 6 | Medium |
+| MS-RDPEUSB | USB Devices Virtual Channel Extension | 6 | Low |
+| MS-RDPECAM | Camera Device Redirection | 6 | Low |
+| MS-RDPEPC | Printer Cache Extension | 6 | Low |
+| MS-RDPEPNP | Plug and Play Device Redirection | 6 | Low |
+| MS-RDPECR2 | Composited Remoting V2 | 6 | Low |
+| MS-RDPEV | Video Redirection Virtual Channel (TSMF) | 6 | Low |
+| MS-RDPEMC | Multiparty Virtual Channel Extension | 6 | Low |
+| MS-RDPEECO | Extensible Output Channel Extension | 6 | Low |
+| MS-RDPEXPS | Extended Presentation Session | 6 | Low |
+| MS-RDPEDC | Desktop Composition Virtual Channel | 6 | Low |
+| MS-RDPEAR | Audio Redirection (newer) | 6 | Low |
+| MS-TSGU | Terminal Services Gateway | 7 | High |
+| MS-RDPEUDP | UDP Transport Extension | 7 | Medium |
+| MS-RDPEMT | Multitransport Extension | 7 | Medium |
 
 ### Additional Standards
 
