@@ -618,27 +618,37 @@ pub enum ClientConnectorState {
 
 ### 5.3 실서버 연결 시퀀스 검증
 
-> CredSSP/NLA 핸드셰이크 성공 확인 (2026-03-30).
-> BasicSettingsExchange 이후 서버가 연결을 끊는 문제 발견.
-> 아래 항목을 실서버(192.168.136.136)로 단계별 검증 필요.
+> 실서버: Windows Server 2019 build 17763 (192.168.136.136), 계정: rdptest
+> xfreerdp(WSL)로 동일 서버 접속 성공 확인 완료.
 
-**NTLM 잔여 버그:**
-- [x] MIC 버그 수정 -- 3가지 원인: (1) SubjectPublicKey에 BIT STRING unused bits 0x00 포함, (2) MsvAvFlags+MIC+mechListMIC 미구현, (3) 서버 응답 mechListMIC 미처리 + recv RC4 미복원
-- [x] MIC 활성화 후 CredSSP v6 접속 재검증 -- Windows Server 2019에서 성공 확인 (2026-03-30)
+**CredSSP/NLA (완료 2026-03-30):**
+- [x] MIC 버그 수정 -- 3가지 원인: (1) SubjectPublicKey에 BIT STRING unused bits 0x00 포함, (2) MsvAvFlags+MIC+mechListMIC 미구현 (CVE-2019-1040 패치 이후 필수), (3) 서버 응답 mechListMIC 미처리 + recv RC4 미복원
+- [x] MIC 활성화 후 CredSSP v6 접속 재검증 -- 성공
+- [x] mechListMIC seq_num 순서: temp RC4(seq=0) → pubKeyAuth(seq=1), 서버도 동일 순서 확인
 
-**BasicSettingsExchange (connector Phase 4):**
-- [ ] MCS Connect Initial GCC 블록 실서버 호환성 검증 -- 현재 377바이트 전송 후 서버가 RST
-- [ ] 서버 응답(MCS Connect Response) 파싱 확인
-- [ ] GCC Client Core Data: 버전, 데스크톱 크기, 색상 깊이, 키보드 레이아웃
-- [ ] GCC Client Security Data: 암호화 메서드 협상
-- [ ] GCC Client Network Data: 정적 채널 정의
+**BasicSettingsExchange (완료 2026-03-30):**
+- [x] GCC ConferenceCreateRequest PER 프리앰블 수정 -- T.124 PER 인코딩 8바이트 상수 교체
+- [x] CS_CORE 필드 확장 -- RDP 10.0+ 필드 5개 추가 (desktopPhysicalWidth/Height, orientation, scaleFactor), version V5Plus→V10_12, supportedColorDepths 0x000F, cluster flags VERSION5
+- [x] GCC ConferenceCreateResponse 파싱 수정 -- ConnectGCCPDU choice byte(0x14) 누락, PER tag unconstrained integer 인코딩, ServerNetworkData header 중복 읽기 수정
+- [x] MCS Connect Response (104 bytes) 파싱 성공, 서버 IO channel=1003 확인
 
-**Post-NLA 연결 시퀀스 (connector Phase 5-12):**
-- [ ] Channel Connection: Erect Domain → Attach User → Channel Join 루프
-- [ ] Secure Settings Exchange: Client Info PDU (NLA 모드 암호화 방식)
+**Channel Connection (진행 중):**
+- [x] Erect Domain Request 전송 (12 bytes)
+- [x] Attach User Request 전송 (8 bytes) → Confirm 수신 (11 bytes)
+- [ ] Channel Join 루프 -- 현재 에러: "TpktHeader not enough bytes" (서버 응답 읽기 불완전)
+  - 원인: integration test의 read 루프가 Channel Join Confirm을 완전히 읽지 못함
+  - 수정 필요: drive_connector_tls의 read 로직 또는 PDU hint 매칭 개선
+
+**Post-NLA 연결 시퀀스 (미착수):**
+- [ ] Secure Settings Exchange: Client Info PDU (NLA 모드 — `INFO_FORCE_ENCRYPTED_CS_PDU` 플래그 필요?)
 - [ ] Licensing: Valid Client 단축 경로 실서버 검증
 - [ ] Capabilities Exchange: Demand Active → Confirm Active
 - [ ] Connection Finalization → `Connected` 상태 도달
+
+**잔여 기술 부채:**
+- [ ] GCC ConferenceCreateResponse encode/decode roundtrip 테스트 깨짐 (`#[ignore]` 처리됨) -- PER connectPDU length 인코딩 정렬 필요
+- [ ] integration test 디버그 hex dump 코드 정리 (커밋 전 제거)
+- [ ] PRNG: `simple_random_seed()`가 동일 나노초에 같은 시드 생성 가능 -- OS 랜덤(`getrandom`) 사용 권장
 
 ### 5.4 `justrdp-tls` -- TLS Transport
 
