@@ -522,12 +522,12 @@ impl ClientConnector {
         let security_data = ClientSecurityData::new();
 
         let cluster_data = ClientClusterData {
-            flags: 0x0000_000D, // REDIRECTION_SUPPORTED | REDIRECTION_VERSION3
+            flags: 0x0000_0011, // REDIRECTION_SUPPORTED | (REDIRECTION_VERSION5 << 2)
             redirected_session_id: 0,
         };
 
-        // Encode client data blocks
-        let mut client_data_size = core_data.size() + security_data.size() + cluster_data.size();
+        // Encode client data blocks (order: Core → Cluster → Security → Net per FreeRDP)
+        let mut client_data_size = core_data.size() + cluster_data.size() + security_data.size();
         if !self.config.static_channels.is_empty() {
             let net_data = ClientNetworkData {
                 channels: self.config.static_channels.as_slice().to_vec(),
@@ -539,8 +539,8 @@ impl ClientConnector {
         {
             let mut cursor = WriteCursor::new(&mut client_data);
             core_data.encode(&mut cursor)?;
-            security_data.encode(&mut cursor)?;
             cluster_data.encode(&mut cursor)?;
+            security_data.encode(&mut cursor)?;
             if !self.config.static_channels.is_empty() {
                 let net_data = ClientNetworkData {
                     channels: self.config.static_channels.as_slice().to_vec(),
@@ -645,9 +645,15 @@ impl ClientConnector {
                     }
                 }
                 t if t == ServerDataBlockType::NetworkData as u16 => {
-                    let net = ServerNetworkData::decode(&mut block_cursor)?;
-                    self.io_channel_id = net.mcs_channel_id;
-                    self.channel_ids = net.channel_ids;
+                    // Parse body directly (header already consumed by parse_server_data_blocks)
+                    let mcs_channel_id = block_cursor.read_u16_le("NetData::mcsChannelId")?;
+                    let count = block_cursor.read_u16_le("NetData::channelCount")? as usize;
+                    let mut channel_ids = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        channel_ids.push(block_cursor.read_u16_le("NetData::channelId")?);
+                    }
+                    self.io_channel_id = mcs_channel_id;
+                    self.channel_ids = channel_ids;
                 }
                 t if t == ServerDataBlockType::MessageChannelData as u16 => {
                     // ServerMessageChannelData: mcs_message_channel_id (u16 LE)

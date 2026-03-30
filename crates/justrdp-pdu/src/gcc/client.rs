@@ -181,6 +181,12 @@ pub struct ClientCoreData {
     pub connection_type: Option<u8>,
     pub pad1: Option<u8>,
     pub server_selected_protocol: Option<u32>,
+    // RDP 10.0+ fields
+    pub desktop_physical_width: Option<u32>,
+    pub desktop_physical_height: Option<u32>,
+    pub desktop_orientation: Option<u16>,
+    pub desktop_scale_factor: Option<u32>,
+    pub device_scale_factor: Option<u32>,
 }
 
 /// Fixed size of ClientCoreData up to imeFileName.
@@ -190,13 +196,13 @@ impl ClientCoreData {
     /// Create with typical defaults for an RDP 5+ connection.
     pub fn new(width: u16, height: u16) -> Self {
         Self {
-            version: RdpVersion::V5Plus,
+            version: RdpVersion::V10_12,
             desktop_width: width,
             desktop_height: height,
             color_depth: ColorDepth::Bpp8,
             sas_sequence: 0xAA03, // RNS_UD_SAS_DEL
             keyboard_layout: 0x0409, // US English
-            client_build: 2600,
+            client_build: 22621,
             client_name: String::new(),
             keyboard_type: 4, // IBM enhanced (101/102)
             keyboard_sub_type: 0,
@@ -206,12 +212,17 @@ impl ClientCoreData {
             client_product_id: Some(1),
             serial_number: Some(0),
             high_color_depth: Some(HighColorDepth::Bpp16),
-            supported_color_depths: Some(SupportedColorDepths::BPP24),
+            supported_color_depths: Some(SupportedColorDepths::from_bits(0x000F)),
             early_capability_flags: Some(EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU),
             client_dig_product_id: Some([0u8; 64]),
             connection_type: Some(0),
             pad1: Some(0),
             server_selected_protocol: Some(0),
+            desktop_physical_width: Some(0),
+            desktop_physical_height: Some(0),
+            desktop_orientation: Some(0),
+            desktop_scale_factor: Some(0),
+            device_scale_factor: Some(0),
         }
     }
 
@@ -227,6 +238,11 @@ impl ClientCoreData {
         if self.connection_type.is_some() { size += 1; } else { return size; }
         if self.pad1.is_some() { size += 1; } else { return size; }
         if self.server_selected_protocol.is_some() { size += 4; } else { return size; }
+        if self.desktop_physical_width.is_some() { size += 4; } else { return size; }
+        if self.desktop_physical_height.is_some() { size += 4; } else { return size; }
+        if self.desktop_orientation.is_some() { size += 2; } else { return size; }
+        if self.desktop_scale_factor.is_some() { size += 4; } else { return size; }
+        if self.device_scale_factor.is_some() { size += 4; } else { return size; }
         size
     }
 }
@@ -271,6 +287,11 @@ impl Encode for ClientCoreData {
         if let Some(v) = self.connection_type { dst.write_u8(v, "ClientCoreData::connectionType")?; } else { return Ok(()); }
         if let Some(v) = self.pad1 { dst.write_u8(v, "ClientCoreData::pad1")?; } else { return Ok(()); }
         if let Some(v) = self.server_selected_protocol { dst.write_u32_le(v, "ClientCoreData::serverSelectedProtocol")?; } else { return Ok(()); }
+        if let Some(v) = self.desktop_physical_width { dst.write_u32_le(v, "ClientCoreData::desktopPhysicalWidth")?; } else { return Ok(()); }
+        if let Some(v) = self.desktop_physical_height { dst.write_u32_le(v, "ClientCoreData::desktopPhysicalHeight")?; } else { return Ok(()); }
+        if let Some(v) = self.desktop_orientation { dst.write_u16_le(v, "ClientCoreData::desktopOrientation")?; } else { return Ok(()); }
+        if let Some(v) = self.desktop_scale_factor { dst.write_u32_le(v, "ClientCoreData::desktopScaleFactor")?; } else { return Ok(()); }
+        if let Some(v) = self.device_scale_factor { dst.write_u32_le(v, "ClientCoreData::deviceScaleFactor")?; } else { return Ok(()); }
 
         Ok(())
     }
@@ -335,6 +356,11 @@ impl<'de> Decode<'de> for ClientCoreData {
         let connection_type = if rem!() >= 1 { Some(src.read_u8("ClientCoreData::connectionType")?) } else { None };
         let pad1 = if rem!() >= 1 { Some(src.read_u8("ClientCoreData::pad1")?) } else { None };
         let server_selected_protocol = if rem!() >= 4 { Some(src.read_u32_le("ClientCoreData::serverSelectedProtocol")?) } else { None };
+        let desktop_physical_width = if rem!() >= 4 { Some(src.read_u32_le("ClientCoreData::desktopPhysicalWidth")?) } else { None };
+        let desktop_physical_height = if rem!() >= 4 { Some(src.read_u32_le("ClientCoreData::desktopPhysicalHeight")?) } else { None };
+        let desktop_orientation = if rem!() >= 2 { Some(src.read_u16_le("ClientCoreData::desktopOrientation")?) } else { None };
+        let desktop_scale_factor = if rem!() >= 4 { Some(src.read_u32_le("ClientCoreData::desktopScaleFactor")?) } else { None };
+        let device_scale_factor = if rem!() >= 4 { Some(src.read_u32_le("ClientCoreData::deviceScaleFactor")?) } else { None };
 
         // Skip any remaining unknown fields
         let leftover = rem!();
@@ -347,6 +373,8 @@ impl<'de> Decode<'de> for ClientCoreData {
             post_beta2_color_depth, client_product_id, serial_number,
             high_color_depth, supported_color_depths, early_capability_flags,
             client_dig_product_id, connection_type, pad1, server_selected_protocol,
+            desktop_physical_width, desktop_physical_height, desktop_orientation,
+            desktop_scale_factor, device_scale_factor,
         })
     }
 }
@@ -712,7 +740,7 @@ mod tests {
         assert_eq!(decoded.desktop_width, 1920);
         assert_eq!(decoded.desktop_height, 1080);
         assert_eq!(decoded.client_name, "TESTPC");
-        assert_eq!(decoded.version, RdpVersion::V5Plus);
+        assert_eq!(decoded.version, RdpVersion::V10_12);
         assert_eq!(decoded.server_selected_protocol, Some(0x02));
     }
 

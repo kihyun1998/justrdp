@@ -218,12 +218,20 @@ fn main() {
             }
         }
 
-        // Advance through all CredSSP states to BasicSettingsExchangeSendInitial
+        // Advance through remaining CredSSP states, sending any output to server
         loop {
             output.clear();
             connector.step(&[], &mut output).unwrap();
-            println!("[*] Connector state: {:?}", connector.state());
-            if *connector.state() == ClientConnectorState::BasicSettingsExchangeSendInitial {
+            let state = connector.state().clone();
+            println!("[*] Connector state: {:?}", state);
+            // Send any output produced (e.g., CredSSP Credentials TsRequest)
+            let out_slice = output.as_mut_slice();
+            if !out_slice.is_empty() {
+                println!("[*] Sending {} bytes for state transition", out_slice.len());
+                tls_stream.write_all(out_slice).expect("TLS write failed");
+                tls_stream.flush().expect("TLS flush failed");
+            }
+            if state == ClientConnectorState::BasicSettingsExchangeSendInitial {
                 break;
             }
         }
@@ -318,6 +326,11 @@ fn drive_connector_until(
                 total,
                 connector.state()
             );
+            for chunk in buf[..total].chunks(32) {
+                print!("    ");
+                for b in chunk { print!("{:02x} ", b); }
+                println!();
+            }
 
             output.clear();
             let written = connector
@@ -399,16 +412,23 @@ fn drive_connector_tls<S: Read + Write>(
                 .unwrap_or_else(|e| panic!("[{}] step failed: {}", phase_name, e));
 
             if written.size > 0 {
-                stream
-                    .write_all(&output.as_mut_slice()[..written.size])
-                    .unwrap_or_else(|e| panic!("[{}] write failed: {}", phase_name, e));
-                stream.flush().unwrap();
+                let data = &output.as_mut_slice()[..written.size];
                 println!(
                     "[*] {} sent {} bytes (state: {:?})",
                     phase_name,
                     written.size,
                     connector.state()
                 );
+                // Hex dump for debugging
+                for chunk in data.chunks(32) {
+                    print!("    ");
+                    for b in chunk { print!("{:02x} ", b); }
+                    println!();
+                }
+                stream
+                    .write_all(data)
+                    .unwrap_or_else(|e| panic!("[{}] write failed: {}", phase_name, e));
+                stream.flush().unwrap();
             }
         } else {
             // Wait state: read from network
@@ -441,6 +461,11 @@ fn drive_connector_tls<S: Read + Write>(
                 total,
                 connector.state()
             );
+            for chunk in buf[..total].chunks(32) {
+                print!("    ");
+                for b in chunk { print!("{:02x} ", b); }
+                println!();
+            }
 
             output.clear();
             let written = connector
