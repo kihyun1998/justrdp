@@ -8,6 +8,9 @@
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
+pub mod clearcodec;
+
+#[cfg(feature = "alloc")]
 pub mod nscodec;
 
 #[cfg(feature = "alloc")]

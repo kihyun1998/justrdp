@@ -754,11 +754,11 @@ RFX 비트스트림
 
 > **requires**: 없음 (순수 디코더, `no_std`)
 
-- [ ] `ClearCodecDecoder` -- ClearCodec 디코딩
-- [ ] Residual Layer (잔차 레이어)
-- [ ] Band Layer (밴드 레이어)
-- [ ] Subcodec Layer (서브코덱 레이어)
-- [ ] Glyph 캐싱
+- [x] `ClearCodecDecoder` -- ClearCodec 디코딩
+- [x] Residual Layer (잔차 레이어)
+- [x] Band Layer (밴드 레이어)
+- [x] Subcodec Layer (서브코덱 레이어)
+- [x] Glyph 캐싱
 
 ### 6.6 Image Processing Utilities
 
