@@ -227,6 +227,15 @@ name = "justrdp-rdpfile"
 version = "0.1.0"
 
 [[package]]
+name = "justrdp-session"
+version = "0.1.0"
+dependencies = [
+ "justrdp-bulk",
+ "justrdp-core",
+ "justrdp-pdu",
+]
+
+[[package]]
 name = "justrdp-tls"
 version = "0.1.0"
 dependencies = [

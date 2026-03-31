@@ -825,27 +825,28 @@ RFX 비트스트림
 > **requires**: Phase 2 (Connected 상태), Phase 3 bulk compression
 > **검증**: integration test로 실서버에서 Fast-Path/Slow-Path 프레임 수신 확인
 
-- [ ] `ActiveStage` -- 활성 세션 프로세서
-- [ ] Fast-Path 입력 프레임 생성
-- [ ] Fast-Path 출력 프레임 파싱 + 벌크 해제
-- [ ] X.224/Slow-Path 프레임 파싱
-- [ ] 프레임 단편화/재조립 (`CompleteData`)
-- [ ] 출력 디스패치:
+- [x] `ActiveStage` -- 활성 세션 프로세서
+- [x] Fast-Path 입력 프레임 생성
+- [x] Fast-Path 출력 프레임 파싱 + 벌크 해제
+- [x] X.224/Slow-Path 프레임 파싱
+- [x] 프레임 단편화/재조립 (`CompleteData`)
+- [x] 출력 디스패치:
   ```rust
   pub enum ActiveStageOutput {
       ResponseFrame(Vec<u8>),
-      GraphicsUpdate { region: Rectangle, data: Vec<u8> },
+      GraphicsUpdate { update_code: FastPathUpdateType, data: Vec<u8> },
       PointerDefault,
       PointerHidden,
       PointerPosition { x: u16, y: u16 },
-      PointerBitmap(DecodedPointer),
+      PointerBitmap { pointer_type: u8, data: Vec<u8> },
       Terminate(GracefulDisconnectReason),
       DeactivateAll(DeactivationReactivation),
-      Resize { width: u16, height: u16 },
+      SaveSessionInfo { info_type: u32, data: Vec<u8> },
+      ChannelData { channel_id: u16, data: Vec<u8> },
   }
   ```
-- [ ] 세션 Deactivation-Reactivation 처리
-- [ ] Graceful shutdown 시퀀스
+- [x] 세션 Deactivation-Reactivation 처리
+- [x] Graceful shutdown 시퀀스
 
 ### 7.2 `justrdp-svc` -- Static Virtual Channel Framework
 

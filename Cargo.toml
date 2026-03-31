@@ -8,6 +8,7 @@ members = [
     "crates/justrdp-input",
     "crates/justrdp-rdpfile",
     "crates/justrdp-connector",
+    "crates/justrdp-session",
     "crates/justrdp-tls",
     "tests/integration",
 ]
@@ -33,4 +34,5 @@ justrdp-derive = { path = "crates/justrdp-derive", version = "0.1.0" }
 justrdp-graphics = { path = "crates/justrdp-graphics", version = "0.1.0" }
 justrdp-input = { path = "crates/justrdp-input", version = "0.1.0" }
 justrdp-rdpfile = { path = "crates/justrdp-rdpfile", version = "0.1.0" }
+justrdp-session = { path = "crates/justrdp-session", version = "0.1.0" }
 justrdp-tls = { path = "crates/justrdp-tls", version = "0.1.0" }
