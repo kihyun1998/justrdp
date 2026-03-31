@@ -764,10 +764,10 @@ RFX 비트스트림
 
 > **requires**: 없음 (`no_std`)
 
-- [ ] 사각형 처리 (교집합, 합집합, 분할)
-- [ ] 이미지 diff (변경 영역 감지, 서버용)
-- [ ] 색상 공간 변환 (RGB ↔ BGR, RGBA ↔ BGRA 등)
-- [ ] 스케일링/리사이징
+- [x] 사각형 처리 (교집합, 합집합, 분할)
+- [x] 이미지 diff (변경 영역 감지, 서버용)
+- [x] 색상 공간 변환 (RGB ↔ BGR, RGBA ↔ BGRA 등)
+- [x] 스케일링/리사이징
 
 ### 6.7 Pointer/Cursor Processing
 

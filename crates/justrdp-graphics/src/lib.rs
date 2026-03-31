@@ -21,3 +21,6 @@ pub mod rfx;
 
 #[cfg(feature = "alloc")]
 pub mod rle;
+
+#[cfg(feature = "alloc")]
+pub mod utils;
