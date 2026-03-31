@@ -784,11 +784,11 @@ RFX 비트스트림
 > **requires**: 없음 (순수 상태 머신, `no_std`)
 > **검증**: unit test로 상태 diff 검증
 
-- [ ] `InputDatabase` -- 키보드 + 마우스 상태 추적
-- [ ] 키보드: 512-bit 비트필드 (모든 스캔코드 상태)
-- [ ] 마우스: 5 버튼 + 위치 + 휠 상태
-- [ ] 상태 diff 기반 이벤트 생성 (중복 이벤트 방지)
-- [ ] `Operation` enum:
+- [x] `InputDatabase` -- 키보드 + 마우스 상태 추적
+- [x] 키보드: 512-bit 비트필드 (모든 스캔코드 상태)
+- [x] 마우스: 5 버튼 + 위치 + 휠 상태
+- [x] 상태 diff 기반 이벤트 생성 (중복 이벤트 방지)
+- [x] `Operation` enum:
   ```rust
   pub enum Operation {
       KeyPressed(Scancode),
@@ -802,8 +802,8 @@ RFX 비트스트림
       HorizontalWheelRotations(i16),
   }
   ```
-- [ ] `Scancode` 타입 (extended flag 포함)
-- [ ] `synchronize_event()` -- 잠금 키 동기화
+- [x] `Scancode` 타입 (extended flag 포함)
+- [x] `synchronize_event()` -- 잠금 키 동기화
 
 ### 6.9 `.rdp` File Support
 
