@@ -12,3 +12,6 @@ pub mod mppc;
 
 #[cfg(feature = "alloc")]
 pub mod ncrush;
+
+#[cfg(feature = "alloc")]
+pub mod xcrush;
