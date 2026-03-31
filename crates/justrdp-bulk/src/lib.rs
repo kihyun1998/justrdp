@@ -15,3 +15,6 @@ pub mod ncrush;
 
 #[cfg(feature = "alloc")]
 pub mod xcrush;
+
+#[cfg(feature = "alloc")]
+pub mod zgfx;
