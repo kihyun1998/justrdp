@@ -18,3 +18,6 @@ pub mod xcrush;
 
 #[cfg(feature = "alloc")]
 pub mod zgfx;
+
+#[cfg(feature = "alloc")]
+pub mod bulk;
