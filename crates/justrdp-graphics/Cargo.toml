@@ -1,0 +1,19 @@
+[package]
+name = "justrdp-graphics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Bitmap codec implementations (Interleaved RLE, Planar, RDP6) for JustRDP"
+keywords = ["rdp", "bitmap", "rle"]
+categories = ["no-std", "encoding"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc"]
+std = ["alloc", "justrdp-core/std"]
+
+[dependencies]
+justrdp-core.workspace = true

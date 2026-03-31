@@ -702,15 +702,15 @@ pub enum ClientConnectorState {
 
 #### 6.2.1 Interleaved RLE (RDP 4.0/5.0)
 
-- [ ] `RleDecoder` -- Run-Length Encoding 디코딩
-- [ ] 8bpp, 15bpp, 16bpp, 24bpp 지원
-- [ ] 포어그라운드/백그라운드 런, 컬러 런, FGBG 이미지, 세트 런, 디더링 런
+- [x] `RleDecoder` -- Run-Length Encoding 디코딩
+- [x] 8bpp, 15bpp, 16bpp, 24bpp 지원
+- [x] 포어그라운드/백그라운드 런, 컬러 런, FGBG 이미지, 세트 런, 디더링 런
 
 #### 6.2.2 Planar Codec
 
-- [ ] `PlanarDecoder` -- RLE 기반 평면 비트맵 디코딩
-- [ ] Alpha / Red / Green / Blue 평면 분리
-- [ ] 평면 내 RLE 디코딩
+- [x] `PlanarDecoder` -- RLE 기반 평면 비트맵 디코딩
+- [x] Alpha / Red / Green / Blue 평면 분리
+- [x] 평면 내 RLE 디코딩
 
 #### 6.2.3 RDP 6.0 Bitmap Compression
 
