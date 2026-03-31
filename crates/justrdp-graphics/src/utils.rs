@@ -493,4 +493,103 @@ mod tests {
         let dst = scale_nearest(&[], 0, 0, 2, 2);
         assert_eq!(dst.len(), 16);
     }
+
+    // ── Gap tests ──
+
+    #[test]
+    fn rect_adjacent_x_no_intersect() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(10, 0, 10, 10);
+        assert!(!a.intersects(&b));
+        assert!(a.intersection(&b).is_none());
+    }
+
+    #[test]
+    fn rect_adjacent_y_no_intersect() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(0, 10, 10, 10);
+        assert!(!a.intersects(&b));
+        assert!(a.intersection(&b).is_none());
+    }
+
+    #[test]
+    fn rect_subtract_top_edge_cut() {
+        let a = Rect::new(0, 0, 10, 10);
+        let cut = Rect::new(0, 0, 10, 4);
+        let result = a.subtract(&cut);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], Rect::new(0, 4, 10, 6));
+    }
+
+    #[test]
+    fn rect_subtract_corner_cut() {
+        let a = Rect::new(0, 0, 10, 10);
+        let cut = Rect::new(0, 0, 4, 4);
+        let result = a.subtract(&cut);
+        assert_eq!(result.len(), 2);
+        let total: u32 = result.iter().map(|r| r.width as u32 * r.height as u32).sum();
+        assert_eq!(total, 84); // 100 - 16
+    }
+
+    #[test]
+    fn rect_contains_empty_self() {
+        let empty = Rect::new(5, 5, 0, 0);
+        let nonempty = Rect::new(0, 0, 10, 10);
+        assert!(!empty.contains(&nonempty));
+    }
+
+    #[test]
+    fn diff_tiles_non_aligned_width() {
+        let w: usize = 5;
+        let h: usize = 4;
+        let old = vec![0x00u8; w * h * 4];
+        let mut new_img = old.clone();
+        // Change pixel at (4, 0)
+        new_img[(0 * w + 4) * 4] = 0xFF;
+        let changed = diff_tiles(&old, &new_img, w as u16, h as u16, 2);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0], Rect::new(4, 0, 1, 2));
+    }
+
+    #[test]
+    fn diff_tiles_non_aligned_height() {
+        let w: usize = 4;
+        let h: usize = 5;
+        let old = vec![0x00u8; w * h * 4];
+        let mut new_img = old.clone();
+        new_img[(4 * w + 0) * 4] = 0xFF;
+        let changed = diff_tiles(&old, &new_img, w as u16, h as u16, 2);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0], Rect::new(0, 4, 2, 1));
+    }
+
+    #[test]
+    fn scale_nearest_asymmetric() {
+        // 3×1 → 6×1: [A, B, C] → [A, A, B, B, C, C]
+        let a = [0x11u8, 0x22, 0x33, 0xFF];
+        let b = [0x44u8, 0x55, 0x66, 0xFF];
+        let c = [0x77u8, 0x88, 0x99, 0xFF];
+        let mut src = Vec::new();
+        src.extend_from_slice(&a);
+        src.extend_from_slice(&b);
+        src.extend_from_slice(&c);
+        let dst = scale_nearest(&src, 3, 1, 6, 1);
+        assert_eq!(&dst[0..4], &a);
+        assert_eq!(&dst[4..8], &a);
+        assert_eq!(&dst[8..12], &b);
+        assert_eq!(&dst[12..16], &b);
+        assert_eq!(&dst[16..20], &c);
+        assert_eq!(&dst[20..24], &c);
+    }
+
+    #[test]
+    fn swap_rb_non_multiple_of_4() {
+        // Length 6: only first pixel (4 bytes) gets swapped, bytes 4-5 untouched
+        let mut buf = [0x11, 0x22, 0x33, 0xFF, 0xAA, 0xBB];
+        swap_rb_inplace(&mut buf);
+        assert_eq!(buf[0], 0x33);
+        assert_eq!(buf[2], 0x11);
+        assert_eq!(buf[4], 0xAA); // untouched
+        assert_eq!(buf[5], 0xBB);
+    }
 }
