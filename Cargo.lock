@@ -223,6 +223,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-rdpfile"
+version = "0.1.0"
+
+[[package]]
 name = "justrdp-tls"
 version = "0.1.0"
 dependencies = [

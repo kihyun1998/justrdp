@@ -1,0 +1,17 @@
+[package]
+name = "justrdp-rdpfile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "RDP file (.rdp) parser and writer for JustRDP"
+keywords = ["rdp", "config", "parser"]
+categories = ["no-std", "parser-implementations"]
+
+[features]
+default = ["alloc"]
+alloc = []
+
+[dependencies]
