@@ -48,6 +48,12 @@ pub struct PointerShape {
     pub hotspot_y: u16,
     /// BGRA pixels, top-down row-major, `width * height * 4` bytes.
     pub pixels: Vec<u8>,
+    /// Invert mask: 1 bit per pixel (packed, MSB-first), `ceil(width * height / 8)` bytes.
+    /// A set bit means the pixel should be XOR-blended with the destination
+    /// (AND=1, XOR=non-black). The `pixels` field contains the XOR color for
+    /// these pixels (typically white). Callers that support invert cursors
+    /// should check this mask; others can ignore it and render opaque.
+    pub xor_mask: Vec<u8>,
 }
 
 // ── Stride calculation ──
@@ -172,6 +178,7 @@ pub fn decode_pointer(
             hotspot_x,
             hotspot_y,
             pixels: Vec::new(),
+            xor_mask: Vec::new(),
         });
     }
 
@@ -195,7 +202,10 @@ pub fn decode_pointer(
         return Err(PointerError::MaskSizeMismatch);
     }
 
-    let mut pixels = vec![0u8; w * h * 4];
+    let pixel_count = w * h;
+    let mut pixels = vec![0u8; pixel_count * 4];
+    let invert_mask_bytes = (pixel_count + 7) / 8;
+    let mut invert_mask = vec![0u8; invert_mask_bytes];
 
     for y in 0..h {
         // Bottom-up: wire row 0 = bottom row
@@ -212,32 +222,39 @@ pub fn decode_pointer(
 
         for x in 0..w {
             let (b, g, r, mut a) = extract_xor_pixel(xor_row, x, xor_bpp);
+            let mut is_invert = false;
 
             if use_and_mask {
                 let and_bit = extract_and_bit(and_row, x);
                 if and_bit == 0 {
-                    // Opaque: use XOR pixel color
-                    // BUT if XOR is black → transparent
                     if b == 0 && g == 0 && r == 0 {
-                        a = 0;
+                        a = 0; // transparent
                     } else {
-                        a = 0xFF;
+                        a = 0xFF; // opaque
                     }
                 } else {
                     // AND=1: transparent or invert
-                    // XOR=black → transparent; XOR=white → invert (treat as opaque white)
                     if b == 0 && g == 0 && r == 0 {
-                        a = 0;
+                        a = 0; // transparent
+                    } else {
+                        a = 0xFF; // invert pixel — mark in xor_mask
+                        is_invert = true;
                     }
-                    // else: keep XOR color with full alpha (invert cursor representation)
                 }
             }
 
-            let dst = (y * w + x) * 4;
+            let pixel_idx = y * w + x;
+            let dst = pixel_idx * 4;
             pixels[dst] = b;
             pixels[dst + 1] = g;
             pixels[dst + 2] = r;
             pixels[dst + 3] = a;
+
+            if is_invert {
+                let byte_idx = pixel_idx / 8;
+                let bit_idx = 7 - (pixel_idx % 8);
+                invert_mask[byte_idx] |= 1 << bit_idx;
+            }
         }
     }
 
@@ -247,6 +264,7 @@ pub fn decode_pointer(
         hotspot_x,
         hotspot_y,
         pixels,
+        xor_mask: invert_mask,
     })
 }
 
@@ -330,8 +348,8 @@ mod tests {
         let xor = [0xFF, 0x00, 0x00, 0x00]; // 3 bytes + 1 pad = stride 4
         let and = [0x00, 0x00]; // AND bit 0 = 0 → opaque
         let shape = decode_pointer(1, 1, 0, 0, 24, &xor, &and).unwrap();
-        // Non-black XOR with AND=0 → alpha=0xFF
         assert_eq!(shape.pixels, [0xFF, 0x00, 0x00, 0xFF]);
+        assert_eq!(shape.xor_mask[0], 0, "no invert pixels");
     }
 
     #[test]
@@ -419,6 +437,7 @@ mod tests {
             width: 1, height: 1,
             hotspot_x: 0, hotspot_y: 0,
             pixels: vec![0xFF; 4],
+            xor_mask: vec![0],
         };
         cache.set(0, shape.clone()).unwrap();
         let retrieved = cache.get(0).unwrap();
@@ -444,6 +463,7 @@ mod tests {
             width: 1, height: 1,
             hotspot_x: 0, hotspot_y: 0,
             pixels: vec![0xFF; 4],
+            xor_mask: vec![0],
         };
         cache.set(0, shape).unwrap();
         cache.clear();
@@ -461,11 +481,13 @@ mod tests {
 
     #[test]
     fn and_1_xor_white_invert_24bpp() {
-        // AND=1, XOR=white → invert cursor → opaque white pixel
+        // AND=1, XOR=white → invert cursor → opaque white + invert bit set
         let xor = [0xFF, 0xFF, 0xFF, 0x00]; // stride=4
         let and = [0x80, 0x00]; // bit 7 = 1
         let shape = decode_pointer(1, 1, 0, 0, 24, &xor, &and).unwrap();
         assert_eq!(shape.pixels, [0xFF, 0xFF, 0xFF, 0xFF]);
+        // Invert mask: bit 0 (pixel 0) should be set
+        assert_eq!(shape.xor_mask[0] & 0x80, 0x80, "invert bit must be set");
     }
 
     #[test]
@@ -507,8 +529,8 @@ mod tests {
         let xor = [0x80, 0x00]; // bit 7 = 1 → white
         let and = [0x80, 0x00]; // AND=1
         let shape = decode_pointer(1, 1, 0, 0, 1, &xor, &and).unwrap();
-        // Invert: opaque white
         assert_eq!(shape.pixels, [0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(shape.xor_mask[0] & 0x80, 0x80, "invert bit must be set");
     }
 
     #[test]
@@ -536,8 +558,8 @@ mod tests {
     #[test]
     fn cache_overwrite() {
         let mut cache = PointerCache::new(4);
-        let a = PointerShape { width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, pixels: vec![0xAA; 4] };
-        let b = PointerShape { width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, pixels: vec![0xBB; 4] };
+        let a = PointerShape { width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, pixels: vec![0xAA; 4], xor_mask: vec![0] };
+        let b = PointerShape { width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, pixels: vec![0xBB; 4], xor_mask: vec![0] };
         cache.set(2, a).unwrap();
         cache.set(2, b).unwrap();
         assert_eq!(cache.get(2).unwrap().pixels, vec![0xBB; 4]);
