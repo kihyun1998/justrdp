@@ -773,11 +773,11 @@ RFX 비트스트림
 
 > **requires**: 없음 (순수 디코더, `no_std`)
 
-- [ ] `PointerDecoder` -- 포인터 비트맵 디코딩
-- [ ] 1bpp, 24bpp, 32bpp 포인터
-- [ ] XOR/AND 마스크 처리
-- [ ] Large pointer (384x384) 지원
-- [ ] 포인터 캐시 관리
+- [x] `PointerDecoder` -- 포인터 비트맵 디코딩
+- [x] 1bpp, 24bpp, 32bpp 포인터
+- [x] XOR/AND 마스크 처리
+- [x] Large pointer (384x384) 지원
+- [x] 포인터 캐시 관리
 
 ### 6.8 `justrdp-input` -- Input Event Management
 

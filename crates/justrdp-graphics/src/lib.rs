@@ -17,6 +17,9 @@ pub mod nscodec;
 pub mod planar;
 
 #[cfg(feature = "alloc")]
+pub mod pointer;
+
+#[cfg(feature = "alloc")]
 pub mod rfx;
 
 #[cfg(feature = "alloc")]
