@@ -745,10 +745,10 @@ RFX 비트스트림
 
 > **requires**: 없음 (순수 디코더, `no_std`)
 
-- [ ] `NsCodecDecoder` -- NSCodec 디코딩
-- [ ] 채널 분리 (ARGB 채널별 독립 처리)
-- [ ] NSCodec RLE 디코딩
-- [ ] ChromaSubsampling 처리
+- [x] `NsCodecDecoder` -- NSCodec 디코딩
+- [x] 채널 분리 (ARGB 채널별 독립 처리)
+- [x] NSCodec RLE 디코딩
+- [x] ChromaSubsampling 처리
 
 ### 6.5 `justrdp-graphics` -- ClearCodec
 

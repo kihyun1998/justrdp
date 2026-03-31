@@ -8,6 +8,9 @@
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
+pub mod nscodec;
+
+#[cfg(feature = "alloc")]
 pub mod planar;
 
 #[cfg(feature = "alloc")]
