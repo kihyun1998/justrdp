@@ -365,4 +365,58 @@ mod tests {
             assert_eq!(decoded, input, "RLGR {mode:?} mixed roundtrip failed");
         }
     }
+
+    #[test]
+    fn encode_decode_roundtrip_gradient() {
+        let encoder = RfxEncoder::new(RlgrMode::Rlgr3);
+        let decoder = RfxDecoder::new(RlgrMode::Rlgr3);
+        let quant = identity_quant();
+
+        let mut bgra = alloc::vec![0u8; TILE_COEFFICIENTS * 4];
+        for row in 0..64usize {
+            for col in 0..64usize {
+                let v = (col * 4) as u8;
+                let idx = (row * 64 + col) * 4;
+                bgra[idx] = v;
+                bgra[idx + 1] = v;
+                bgra[idx + 2] = v;
+                bgra[idx + 3] = 0xFF;
+            }
+        }
+
+        let (y_data, cb_data, cr_data) = encoder.encode_tile(&bgra, &quant, &quant, &quant).unwrap();
+        let mut dst = Vec::new();
+        decoder.decode_tile(&y_data, &cb_data, &cr_data, &quant, &quant, &quant, &mut dst).unwrap();
+
+        for i in 0..TILE_COEFFICIENTS {
+            let col = i % 64;
+            let expected = (col * 4) as i32;
+            let r = dst[i * 4 + 2] as i32;
+            assert!((r - expected).abs() <= 4, "R={r} expected~{expected} at pixel {i}");
+        }
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_lossy_quant() {
+        let encoder = RfxEncoder::new(RlgrMode::Rlgr3);
+        let decoder = RfxDecoder::new(RlgrMode::Rlgr3);
+        let quant = CodecQuant::from_bytes(&[0x88, 0x88, 0x88, 0x88, 0x88]); // q=8, shift=2
+
+        let mut bgra = alloc::vec![0u8; TILE_COEFFICIENTS * 4];
+        for i in 0..TILE_COEFFICIENTS {
+            bgra[i * 4] = 128;
+            bgra[i * 4 + 1] = 128;
+            bgra[i * 4 + 2] = 128;
+            bgra[i * 4 + 3] = 0xFF;
+        }
+
+        let (y_data, cb_data, cr_data) = encoder.encode_tile(&bgra, &quant, &quant, &quant).unwrap();
+        let mut dst = Vec::new();
+        decoder.decode_tile(&y_data, &cb_data, &cr_data, &quant, &quant, &quant, &mut dst).unwrap();
+
+        for i in 0..TILE_COEFFICIENTS {
+            let r = dst[i * 4 + 2] as i32;
+            assert!((r - 128).abs() <= 8, "R={r} at pixel {i}");
+        }
+    }
 }

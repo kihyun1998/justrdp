@@ -109,10 +109,13 @@ fn update_param(param: &mut i32, delta: i32) -> i32 {
 /// Convert 2*|x| - sign(x) representation to signed integer.
 /// If twoMs is odd → negative: -(twoMs + 1) / 2
 /// If twoMs is even → non-negative: twoMs / 2
+///
+/// Uses i32 intermediate to avoid overflow on boundary values.
 #[inline]
 fn get_int_from_2mag_sign(two_ms: u32) -> i16 {
     if two_ms & 1 != 0 {
-        -(((two_ms + 1) >> 1) as i16)
+        let mag = ((two_ms + 1) >> 1) as i32;
+        (-mag) as i16
     } else {
         (two_ms >> 1) as i16
     }
@@ -350,12 +353,15 @@ impl BitWriter {
 
 /// Convert a signed integer to 2MagSign representation.
 /// `Get2MagSign(x) = 2*|x| - (x < 0 ? 1 : 0)`
+///
+/// Uses i32 intermediate to avoid overflow on `i16::MIN`.
 #[inline]
 fn get_2mag_sign(x: i16) -> u32 {
-    if x >= 0 {
-        (x as u32) * 2
+    let x32 = x as i32;
+    if x32 >= 0 {
+        (x32 as u32) * 2
     } else {
-        ((-x) as u32) * 2 - 1
+        ((-x32) as u32) * 2 - 1
     }
 }
 
@@ -486,7 +492,7 @@ impl RlgrEncoder {
                 }
                 // Mixed: no update
 
-                pos += 2;
+                pos += core::cmp::min(2, values.len() - pos);
             }
         }
         pos
@@ -754,5 +760,92 @@ mod tests {
             let decoded = decoder.decode(&encoded, 2).unwrap();
             assert_eq!(decoded, input, "RLGR3 value {val} failed");
         }
+    }
+
+    // ── Gap tests ──
+
+    #[test]
+    fn get_2mag_sign_boundary_i16_min() {
+        // i16::MIN = -32768 → should be 2*32768 - 1 = 65535
+        assert_eq!(get_2mag_sign(i16::MIN), 65535);
+        assert_eq!(get_2mag_sign(i16::MAX), 65534);
+    }
+
+    #[test]
+    fn two_mag_sign_roundtrip_full_range() {
+        for val in i16::MIN..=i16::MAX {
+            let two_ms = get_2mag_sign(val);
+            let back = get_int_from_2mag_sign(two_ms);
+            assert_eq!(back, val, "roundtrip failed for {val}");
+        }
+    }
+
+    #[test]
+    fn bit_writer_partial_byte_flush() {
+        let mut writer = BitWriter::new();
+        writer.write_bits(9, 0b101101001);
+        let data = writer.finish();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0], 0b10110100);
+        assert_eq!(data[1], 0b10000000);
+    }
+
+    #[test]
+    fn bit_writer_finish_empty() {
+        let writer = BitWriter::new();
+        let data = writer.finish();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn rlgr3_encode_decode_both_nonzero_pairs() {
+        let pairs = vec![3i16, -5, 7, -2, 4, -1, 9, -3];
+        let encoder = RlgrEncoder::new(RlgrMode::Rlgr3);
+        let decoder = RlgrDecoder::new(RlgrMode::Rlgr3);
+        let encoded = encoder.encode(&pairs);
+        let decoded = decoder.decode(&encoded, pairs.len()).unwrap();
+        assert_eq!(decoded, pairs);
+    }
+
+    #[test]
+    fn rlgr1_encode_decode_rl_gr_rl_transition() {
+        let mut input = Vec::new();
+        input.extend(vec![0i16; 3]);
+        for v in [1i16, -1, 2, -2, 3, -3, 4, -4, 5, -5] {
+            input.push(v);
+        }
+        input.extend(vec![0i16; 20]);
+        input.push(7);
+        input.extend(vec![0i16; 10]);
+
+        for mode in [RlgrMode::Rlgr1, RlgrMode::Rlgr3] {
+            let encoder = RlgrEncoder::new(mode);
+            let decoder = RlgrDecoder::new(mode);
+            let encoded = encoder.encode(&input);
+            let decoded = decoder.decode(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input, "RL→GR→RL failed for {mode:?}");
+        }
+    }
+
+    #[test]
+    fn rlgr1_encode_decode_large_zero_run() {
+        let mut input = vec![0i16; 2048];
+        input.push(1);
+        input.extend(vec![0i16; 2047]);
+        let encoder = RlgrEncoder::new(RlgrMode::Rlgr1);
+        let decoder = RlgrDecoder::new(RlgrMode::Rlgr1);
+        let encoded = encoder.encode(&input);
+        let decoded = decoder.decode(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn rlgr3_encode_decode_odd_length() {
+        let input = vec![42i16, -7, 3];
+        let encoder = RlgrEncoder::new(RlgrMode::Rlgr3);
+        let decoder = RlgrDecoder::new(RlgrMode::Rlgr3);
+        let encoded = encoder.encode(&input);
+        let decoded = decoder.decode(&encoded, 3).unwrap();
+        assert_eq!(decoded, input);
     }
 }
