@@ -714,7 +714,7 @@ pub enum ClientConnectorState {
 
 #### 6.2.3 RDP 6.0 Bitmap Compression
 
-- [ ] `Rdp6Decoder` / `Rdp6Encoder` -- 비트맵 스트림 디코딩/인코딩
+- [x] `Rdp6Decoder` / `Rdp6Encoder` -- 비트맵 스트림 디코딩/인코딩
 
 ### 6.3 `justrdp-graphics` -- RemoteFX (RFX) Codec
 

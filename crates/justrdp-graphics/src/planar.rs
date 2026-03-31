@@ -12,13 +12,13 @@ use core::fmt;
 // ── FormatHeader bit masks (MS-RDPEGDI §2.2.2.5.1) ──
 
 /// Color Loss Level mask — bits [0-2].
-const FORMAT_HEADER_CLL_MASK: u8 = 0x07;
+pub const FORMAT_HEADER_CLL_MASK: u8 = 0x07;
 /// Chroma subsampling flag — bit [3].
-const FORMAT_HEADER_CS: u8 = 0x08;
+pub const FORMAT_HEADER_CS: u8 = 0x08;
 /// RLE compression flag — bit [4].
-const FORMAT_HEADER_RLE: u8 = 0x10;
+pub const FORMAT_HEADER_RLE: u8 = 0x10;
 /// No-alpha flag — bit [5]; alpha plane absent, assumed 0xFF.
-const FORMAT_HEADER_NA: u8 = 0x20;
+pub const FORMAT_HEADER_NA: u8 = 0x20;
 
 // ── Error type ──
 
@@ -421,6 +421,266 @@ impl PlanarDecompressor {
 impl Default for PlanarDecompressor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Encoder ──
+
+/// Encoder configuration for the Planar Codec.
+#[derive(Debug, Clone)]
+pub struct PlanarEncoderConfig {
+    /// Use per-plane RLE compression (recommended: true).
+    pub use_rle: bool,
+    /// Skip the alpha plane (set NA flag; alpha assumed 0xFF).
+    pub skip_alpha: bool,
+}
+
+impl Default for PlanarEncoderConfig {
+    fn default() -> Self {
+        Self {
+            use_rle: true,
+            skip_alpha: true,
+        }
+    }
+}
+
+/// Encode a delta value using the LSB-sign scheme (MS-RDPEGDI §3.1.9.2).
+/// positive/zero → even byte, negative → odd byte.
+///
+/// Note: the scheme represents magnitudes 0–127 only. Deltas with
+/// |magnitude| > 127 are truncated (matching FreeRDP behavior).
+#[inline]
+fn encode_delta(delta: i16) -> u8 {
+    if delta >= 0 {
+        ((delta as u16) << 1) as u8
+    } else {
+        (((-delta) as u16) << 1 | 1) as u8
+    }
+}
+
+/// Encode one RLE-compressed color plane (MS-RDPEGDI §3.1.9.2).
+///
+/// First scanline uses absolute values; subsequent scanlines use delta encoding.
+fn encode_plane_rle(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    for row in 0..height {
+        let row_start = row * width;
+        let is_first_row = row == 0;
+
+        // Build the values to encode for this scanline
+        let mut values = Vec::with_capacity(width);
+        for col in 0..width {
+            let idx = row_start + col;
+            if is_first_row {
+                values.push(plane[idx]);
+            } else {
+                let prev = plane[(row - 1) * width + col] as i16;
+                let curr = plane[idx] as i16;
+                let delta = curr - prev;
+                values.push(encode_delta(delta));
+            }
+        }
+
+        // Encode values into RLE segments
+        encode_scanline_rle(&values, out);
+    }
+}
+
+/// Encode a single scanline of values into RDP6_RLE_SEGMENT sequences.
+fn encode_scanline_rle(values: &[u8], out: &mut Vec<u8>) {
+    let len = values.len();
+    let mut pos = 0;
+
+    while pos < len {
+        // Find how many distinct (raw) values we need before a run starts
+        let raw_start = pos;
+        let mut raw_end = pos;
+
+        // Scan for a run of >= 3 identical values
+        while raw_end < len {
+            let remaining = len - raw_end;
+            if remaining >= 3 && values[raw_end] == values[raw_end + 1] && values[raw_end] == values[raw_end + 2] {
+                break; // Found a run start
+            }
+            raw_end += 1;
+        }
+
+        // Emit raw-only segments for raw_start..raw_end (max 15 raw per segment)
+        let total_raw = raw_end - raw_start;
+        let mut raw_emitted = 0;
+
+        while raw_emitted < total_raw {
+            let chunk = core::cmp::min(15, total_raw - raw_emitted);
+            // controlByte: cRawBytes=chunk, nRunLength=0
+            let control = (chunk as u8) << 4;
+            out.push(control);
+            for i in 0..chunk {
+                out.push(values[raw_start + raw_emitted + i]);
+            }
+            raw_emitted += chunk;
+        }
+        pos = raw_end;
+
+        if pos >= len {
+            break;
+        }
+
+        // Count the run length
+        let run_val = values[pos];
+        let run_start = pos;
+        while pos < len && values[pos] == run_val {
+            pos += 1;
+        }
+        let run_len = pos - run_start;
+
+        // Emit the run. We need at least some raw bytes to establish the run value,
+        // unless the run value matches the last emitted raw byte.
+        // Strategy: emit 1 raw byte + (run_len - 1) run, or use extended encodings.
+        emit_run_segments(run_val, run_len, out);
+    }
+}
+
+/// Emit RLE segments for a run of identical values.
+///
+/// Each segment must include at least 1 raw byte to establish the run
+/// value, because the decoder resets the base value per segment.
+/// Extended run modes (nRunLength=1,2) use base value 0, so they are
+/// only used when the value IS 0.
+fn emit_run_segments(value: u8, mut run_len: usize, out: &mut Vec<u8>) {
+    while run_len > 0 {
+        if value == 0 && run_len >= 16 {
+            // Can use extended modes (base value = 0 matches our value)
+            if run_len >= 32 {
+                let excess = core::cmp::min(run_len - 32, 15);
+                let control = ((excess as u8) << 4) | 2;
+                out.push(control);
+                run_len -= 32 + excess;
+            } else {
+                let excess = core::cmp::min(run_len - 16, 15);
+                let control = ((excess as u8) << 4) | 1;
+                out.push(control);
+                run_len -= 16 + excess;
+            }
+        } else if run_len >= 4 {
+            // 1 raw byte + up to 15 run = 16 values per segment.
+            // min(run_len-1, 15) >= 3 since run_len >= 4, so nRunLength is always >= 3
+            // (never hits reserved long-run codes 1 or 2).
+            let run_part = core::cmp::min(run_len - 1, 15);
+            let control = (1u8 << 4) | (run_part as u8);
+            out.push(control);
+            out.push(value);
+            run_len -= 1 + run_part;
+        } else {
+            // Small remainder (1-3): emit as raw bytes
+            let control = (run_len as u8) << 4;
+            out.push(control);
+            for _ in 0..run_len {
+                out.push(value);
+            }
+            run_len = 0;
+        }
+    }
+}
+
+/// Write a raw (non-RLE) plane: just copy width * height bytes.
+fn encode_plane_raw(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
+    let total = width * height;
+    out.extend_from_slice(&plane[..total]);
+}
+
+/// RDP 6.0 Planar Bitmap compressor (MS-RDPEGDI §3.1.9).
+///
+/// Produces `RDP6_BITMAP_STREAM` bytes from BGRA pixel input.
+#[derive(Debug, Clone)]
+pub struct PlanarCompressor {
+    config: PlanarEncoderConfig,
+}
+
+impl PlanarCompressor {
+    /// Create a new Planar compressor with the given configuration.
+    pub fn new(config: PlanarEncoderConfig) -> Self {
+        Self { config }
+    }
+
+    /// Compress BGRA pixels into an RDP6_BITMAP_STREAM.
+    ///
+    /// # Arguments
+    ///
+    /// * `bgra` - Input pixels in BGRA order, `width * height * 4` bytes
+    /// * `width` - Bitmap width in pixels
+    /// * `height` - Bitmap height in pixels
+    ///
+    /// # Returns
+    ///
+    /// The compressed `RDP6_BITMAP_STREAM` bytes.
+    pub fn compress(
+        &self,
+        bgra: &[u8],
+        width: u16,
+        height: u16,
+    ) -> Result<Vec<u8>, PlanarError> {
+        let w = width as usize;
+        let h = height as usize;
+        let pixel_count = w * h;
+
+        if bgra.len() < pixel_count * 4 {
+            return Err(PlanarError::OutputOverflow);
+        }
+
+        let mut out = Vec::new();
+
+        // Build FormatHeader
+        let mut format_header: u8 = 0;
+        if self.config.use_rle {
+            format_header |= FORMAT_HEADER_RLE;
+        }
+        if self.config.skip_alpha {
+            format_header |= FORMAT_HEADER_NA;
+        }
+        // CLL=0 (ARGB mode), CS=0 (no chroma subsampling)
+        out.push(format_header);
+
+        if pixel_count == 0 {
+            return Ok(out);
+        }
+
+        // Split BGRA into planes
+        let mut alpha_plane = vec![0u8; pixel_count];
+        let mut red_plane = vec![0u8; pixel_count];
+        let mut green_plane = vec![0u8; pixel_count];
+        let mut blue_plane = vec![0u8; pixel_count];
+
+        for i in 0..pixel_count {
+            let base = i * 4;
+            blue_plane[i] = bgra[base];
+            green_plane[i] = bgra[base + 1];
+            red_plane[i] = bgra[base + 2];
+            alpha_plane[i] = bgra[base + 3];
+        }
+
+        // Encode planes
+        if self.config.use_rle {
+            if !self.config.skip_alpha {
+                encode_plane_rle(&alpha_plane, w, h, &mut out);
+            }
+            encode_plane_rle(&red_plane, w, h, &mut out);
+            encode_plane_rle(&green_plane, w, h, &mut out);
+            encode_plane_rle(&blue_plane, w, h, &mut out);
+        } else {
+            if !self.config.skip_alpha {
+                encode_plane_raw(&alpha_plane, w, h, &mut out);
+            }
+            encode_plane_raw(&red_plane, w, h, &mut out);
+            encode_plane_raw(&green_plane, w, h, &mut out);
+            encode_plane_raw(&blue_plane, w, h, &mut out);
+            // Pad byte (mandatory per spec §2.2.2.5.1)
+            out.push(0x00);
+        }
+
+        Ok(out)
     }
 }
 
@@ -1056,5 +1316,313 @@ mod tests {
         let src = [0x20, 0xAB, 0xCD, 0xEF]; // header + R + G + B, no pad
         let result = decompress(&src, 1, 1);
         assert_eq!(result, Err(PlanarError::TruncatedStream));
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Encoder tests
+    // ═══════════════════════════════════════════════════════════════
+
+    fn compress_rle(bgra: &[u8], w: u16, h: u16) -> Vec<u8> {
+        let enc = PlanarCompressor::new(PlanarEncoderConfig {
+            use_rle: true,
+            skip_alpha: true,
+        });
+        enc.compress(bgra, w, h).unwrap()
+    }
+
+    fn compress_raw(bgra: &[u8], w: u16, h: u16) -> Vec<u8> {
+        let enc = PlanarCompressor::new(PlanarEncoderConfig {
+            use_rle: false,
+            skip_alpha: true,
+        });
+        enc.compress(bgra, w, h).unwrap()
+    }
+
+    // ── encode_delta helper ──
+
+    #[test]
+    fn encode_delta_values() {
+        assert_eq!(encode_delta(0), 0x00);
+        assert_eq!(encode_delta(1), 0x02);
+        assert_eq!(encode_delta(5), 0x0A);
+        assert_eq!(encode_delta(-1), 0x03);
+        assert_eq!(encode_delta(-5), 0x0B);
+        assert_eq!(encode_delta(127), 0xFE);
+        assert_eq!(encode_delta(-127), 0xFF);
+    }
+
+    // ── encode/decode delta roundtrip ──
+
+    #[test]
+    fn delta_encode_decode_roundtrip() {
+        for delta in -127..=127i16 {
+            let encoded = encode_delta(delta);
+            let decoded = decode_delta(encoded);
+            assert_eq!(decoded, delta, "delta {delta} roundtrip failed");
+        }
+    }
+
+    // ── Compressor → Decompressor roundtrip (RLE, 1x1) ──
+
+    #[test]
+    fn roundtrip_rle_1x1() {
+        let bgra = [0xEF, 0xCD, 0xAB, 0xFF]; // B=0xEF, G=0xCD, R=0xAB, A=0xFF
+        let compressed = compress_rle(&bgra, 1, 1);
+        let result = decompress(&compressed, 1, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Roundtrip (RLE, 4x1 solid color) ──
+
+    #[test]
+    fn roundtrip_rle_4x1_solid() {
+        let pixel = [0x11, 0x22, 0x33, 0xFF];
+        let bgra: Vec<u8> = pixel.iter().copied().cycle().take(16).collect();
+        let compressed = compress_rle(&bgra, 4, 1);
+        let result = decompress(&compressed, 4, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Roundtrip (RLE, 4x2 gradient) ──
+
+    #[test]
+    fn roundtrip_rle_4x2_gradient() {
+        let bgra: Vec<u8> = (0..8u8)
+            .flat_map(|i| [i * 30, i * 20, i * 10, 0xFF])
+            .collect();
+        let compressed = compress_rle(&bgra, 4, 2);
+        let result = decompress(&compressed, 4, 2).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Roundtrip (Raw mode, 2x2) ──
+
+    #[test]
+    fn roundtrip_raw_2x2() {
+        let bgra = [
+            0x10, 0x20, 0x30, 0xFF,
+            0x40, 0x50, 0x60, 0xFF,
+            0x70, 0x80, 0x90, 0xFF,
+            0xA0, 0xB0, 0xC0, 0xFF,
+        ];
+        let compressed = compress_raw(&bgra, 2, 2);
+        let result = decompress(&compressed, 2, 2).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Roundtrip (RLE with alpha) ──
+
+    #[test]
+    fn roundtrip_rle_with_alpha() {
+        let enc = PlanarCompressor::new(PlanarEncoderConfig {
+            use_rle: true,
+            skip_alpha: false,
+        });
+        let bgra = [
+            0x10, 0x20, 0x30, 0x80,
+            0x40, 0x50, 0x60, 0xC0,
+        ];
+        let compressed = enc.compress(&bgra, 2, 1).unwrap();
+        let result = decompress(&compressed, 2, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Roundtrip large (16x16 varied) ──
+
+    #[test]
+    fn roundtrip_rle_16x16() {
+        let mut bgra = vec![0u8; 16 * 16 * 4];
+        for y in 0..16u8 {
+            for x in 0..16u8 {
+                let base = (y as usize * 16 + x as usize) * 4;
+                bgra[base] = x.wrapping_mul(17);     // B
+                bgra[base + 1] = y.wrapping_mul(13);  // G
+                bgra[base + 2] = (x ^ y).wrapping_mul(7); // R
+                bgra[base + 3] = 0xFF;                // A
+            }
+        }
+        let compressed = compress_rle(&bgra, 16, 16);
+        let result = decompress(&compressed, 16, 16).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Roundtrip with long runs (all same color) ──
+
+    #[test]
+    fn roundtrip_rle_64x1_uniform() {
+        let pixel = [0xAA, 0xBB, 0xCC, 0xFF];
+        let bgra: Vec<u8> = pixel.iter().copied().cycle().take(64 * 4).collect();
+        let compressed = compress_rle(&bgra, 64, 1);
+        let result = decompress(&compressed, 64, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Empty bitmap ──
+
+    #[test]
+    fn encoder_empty_bitmap() {
+        let compressed = compress_rle(&[], 0, 0);
+        // Should have just the format header
+        assert_eq!(compressed.len(), 1);
+    }
+
+    // ── Format header correctness ──
+
+    #[test]
+    fn encoder_format_header_rle_na() {
+        let compressed = compress_rle(&[0, 0, 0, 0xFF], 1, 1);
+        // RLE=1, NA=1 → 0x30
+        assert_eq!(compressed[0], 0x30);
+    }
+
+    #[test]
+    fn encoder_format_header_raw_na() {
+        let compressed = compress_raw(&[0, 0, 0, 0xFF], 1, 1);
+        // RLE=0, NA=1 → 0x20
+        assert_eq!(compressed[0], 0x20);
+    }
+
+    #[test]
+    fn encoder_format_header_rle_with_alpha() {
+        let enc = PlanarCompressor::new(PlanarEncoderConfig {
+            use_rle: true,
+            skip_alpha: false,
+        });
+        let compressed = enc.compress(&[0, 0, 0, 0x80], 1, 1).unwrap();
+        // RLE=1, NA=0 → 0x10
+        assert_eq!(compressed[0], 0x10);
+    }
+
+    // ── Run of exactly 3 ──
+
+    #[test]
+    fn roundtrip_rle_run_of_exactly_3() {
+        // Scanline with 2 distinct + 3 identical + 1 distinct in G channel
+        let bgra: Vec<u8> = vec![
+            0x00, 0x10, 0x00, 0xFF,
+            0x00, 0x20, 0x00, 0xFF,
+            0x00, 0xAA, 0x00, 0xFF,
+            0x00, 0xAA, 0x00, 0xFF,
+            0x00, 0xAA, 0x00, 0xFF,
+            0x00, 0x30, 0x00, 0xFF,
+        ];
+        let compressed = compress_rle(&bgra, 6, 1);
+        let result = decompress(&compressed, 6, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Compression ratio ──
+
+    #[test]
+    fn compression_ratio_uniform_color() {
+        let pixel = [0x55u8, 0x55, 0x55, 0xFF];
+        let bgra: Vec<u8> = pixel.iter().copied().cycle().take(64 * 4).collect();
+        let compressed = compress_rle(&bgra, 64, 1);
+        // Compressed planes must be smaller than raw (3 planes × 64 = 192 bytes)
+        assert!(compressed.len() - 1 < 192, "no compression: {} bytes", compressed.len());
+    }
+
+    // ── Extended run modes (value=0) boundary values ──
+
+    fn make_black_bgra(n: usize) -> Vec<u8> {
+        // Black pixels with alpha=0xFF (encoder skips alpha, decoder fills 0xFF)
+        let mut bgra = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            bgra.extend_from_slice(&[0x00, 0x00, 0x00, 0xFF]);
+        }
+        bgra
+    }
+
+    #[test]
+    fn roundtrip_rle_zero_run_exactly_16() {
+        let bgra = make_black_bgra(16);
+        let compressed = compress_rle(&bgra, 16, 1);
+        let result = decompress(&compressed, 16, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    #[test]
+    fn roundtrip_rle_zero_run_exactly_32() {
+        let bgra = make_black_bgra(32);
+        let compressed = compress_rle(&bgra, 32, 1);
+        let result = decompress(&compressed, 32, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    #[test]
+    fn roundtrip_rle_zero_run_exactly_47() {
+        let bgra = make_black_bgra(47);
+        let compressed = compress_rle(&bgra, 47, 1);
+        let result = decompress(&compressed, 47, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    #[test]
+    fn roundtrip_rle_zero_run_48() {
+        let bgra = make_black_bgra(48);
+        let compressed = compress_rle(&bgra, 48, 1);
+        let result = decompress(&compressed, 48, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Run boundary: 16 and 17 non-zero values ──
+
+    #[test]
+    fn roundtrip_rle_run_of_16_nonzero() {
+        let pixel = [0xDD, 0x00, 0x00, 0xFF];
+        let bgra: Vec<u8> = pixel.iter().copied().cycle().take(16 * 4).collect();
+        let compressed = compress_rle(&bgra, 16, 1);
+        let result = decompress(&compressed, 16, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    #[test]
+    fn roundtrip_rle_run_of_17_nonzero() {
+        let pixel = [0xDD, 0x00, 0x00, 0xFF];
+        let bgra: Vec<u8> = pixel.iter().copied().cycle().take(17 * 4).collect();
+        let compressed = compress_rle(&bgra, 17, 1);
+        let result = decompress(&compressed, 17, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Mixed raw + run pattern ──
+
+    #[test]
+    fn roundtrip_rle_mixed_raw_and_run() {
+        // [0x10, 0x20, 0xAA, 0xAA, 0xAA, 0xAA] in B channel
+        let bgra: Vec<u8> = vec![
+            0x10, 0x00, 0x00, 0xFF,
+            0x20, 0x00, 0x00, 0xFF,
+            0xAA, 0x00, 0x00, 0xFF,
+            0xAA, 0x00, 0x00, 0xFF,
+            0xAA, 0x00, 0x00, 0xFF,
+            0xAA, 0x00, 0x00, 0xFF,
+        ];
+        let compressed = compress_rle(&bgra, 6, 1);
+        let result = decompress(&compressed, 6, 1).unwrap();
+        assert_eq!(result, bgra);
+    }
+
+    // ── Input buffer too small ──
+
+    #[test]
+    fn compress_input_too_small() {
+        let enc = PlanarCompressor::new(PlanarEncoderConfig::default());
+        let result = enc.compress(&[0u8; 4], 2, 1);
+        assert_eq!(result, Err(PlanarError::OutputOverflow));
+    }
+
+    // ── Raw mode with alpha ──
+
+    #[test]
+    fn roundtrip_raw_with_alpha() {
+        let enc = PlanarCompressor::new(PlanarEncoderConfig {
+            use_rle: false,
+            skip_alpha: false,
+        });
+        let bgra = [0x10, 0x20, 0x30, 0x80, 0x40, 0x50, 0x60, 0xC0];
+        let compressed = enc.compress(&bgra, 2, 1).unwrap();
+        let result = decompress(&compressed, 2, 1).unwrap();
+        assert_eq!(result, bgra);
     }
 }
