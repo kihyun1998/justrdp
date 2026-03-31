@@ -689,7 +689,7 @@ pub enum ClientConnectorState {
 
 - [x] `Mppc8kDecompressor` -- MPPC 8K 슬라이딩 윈도우 (RDP 4.0)
 - [x] `Mppc64kDecompressor` -- MPPC 64K 슬라이딩 윈도우 (RDP 5.0)
-- [ ] `NcrushDecompressor` -- NCRUSH (RDP 6.0, Huffman 기반)
+- [x] `NcrushDecompressor` -- NCRUSH (RDP 6.0, Huffman 기반)
 - [ ] `XcrushDecompressor` -- XCRUSH (RDP 6.1, LZNT1 + match finder)
 - [ ] `ZgfxDecompressor` / `ZgfxCompressor` -- RDP8 벌크 압축 (RDPEGFX용)
 - [ ] `BulkCompressor` -- 통합 압축기 (자동 알고리즘 선택)

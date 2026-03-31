@@ -62,7 +62,7 @@ impl fmt::Display for DecompressError {
 
 // ── Bitstream reader (MSB-first) ──
 
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
     /// Bits remaining in the current accumulator.
@@ -72,7 +72,7 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         let mut reader = Self {
             data,
             byte_pos: 0,
@@ -84,7 +84,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Fill the accumulator from the input bytes.
-    fn fill(&mut self) {
+    pub(crate) fn fill(&mut self) {
         while self.bits_left <= 24 && self.byte_pos < self.data.len() {
             self.acc |= (self.data[self.byte_pos] as u32) << (24 - self.bits_left);
             self.bits_left += 8;
@@ -93,18 +93,18 @@ impl<'a> BitReader<'a> {
     }
 
     /// Number of bits still available (accumulator + unread bytes).
-    fn remaining(&self) -> u32 {
+    pub(crate) fn remaining(&self) -> u32 {
         self.bits_left + ((self.data.len() - self.byte_pos) as u32) * 8
     }
 
     /// Peek at the top `n` bits without consuming them.
-    fn peek(&self, n: u32) -> u32 {
+    pub(crate) fn peek(&self, n: u32) -> u32 {
         debug_assert!(n <= 32 && n > 0);
         self.acc >> (32 - n)
     }
 
     /// Consume `n` bits and return them.
-    fn read(&mut self, n: u32) -> Result<u32, DecompressError> {
+    pub(crate) fn read_bits(&mut self, n: u32) -> Result<u32, DecompressError> {
         if self.remaining() < n {
             return Err(DecompressError::TruncatedBitstream);
         }
@@ -116,7 +116,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Check if any bits remain.
-    fn has_bits(&self) -> bool {
+    pub(crate) fn has_bits(&self) -> bool {
         self.remaining() > 0
     }
 }
@@ -285,7 +285,7 @@ fn decompress_bitstream<const HISTORY_SIZE: usize>(
             if reader.remaining() < 8 {
                 break;
             }
-            let val = reader.read(8)? as u8; // top bit is 0, so value is in 0x00..0x7F
+            let val = reader.read_bits(8)? as u8; // top bit is 0, so value is in 0x00..0x7F
             if *offset >= HISTORY_SIZE {
                 return Err(DecompressError::HistoryOverflow);
             }
@@ -303,7 +303,7 @@ fn decompress_bitstream<const HISTORY_SIZE: usize>(
                 if reader.remaining() < 9 {
                     break;
                 }
-                let bits = reader.read(9)?;
+                let bits = reader.read_bits(9)?;
                 let val = (0x80 | (bits & 0x7F)) as u8;
                 if *offset >= HISTORY_SIZE {
                     return Err(DecompressError::HistoryOverflow);
@@ -366,8 +366,8 @@ fn decode_copy_offset<const HISTORY_SIZE: usize>(
             if reader.remaining() < 16 {
                 return Err(DecompressError::TruncatedBitstream);
             }
-            reader.read(3)?;
-            let payload = reader.read(13)? as usize;
+            reader.read_bits(3)?;
+            let payload = reader.read_bits(13)? as usize;
             return Ok(payload + 320);
         }
 
@@ -381,16 +381,16 @@ fn decode_copy_offset<const HISTORY_SIZE: usize>(
             if reader.remaining() < 12 {
                 return Err(DecompressError::TruncatedBitstream);
             }
-            reader.read(4)?;
-            let payload = reader.read(8)? as usize;
+            reader.read_bits(4)?;
+            let payload = reader.read_bits(8)? as usize;
             Ok(payload + 64)
         } else {
             // 1111 + 6 bits → offset 0..63
             if reader.remaining() < 10 {
                 return Err(DecompressError::TruncatedBitstream);
             }
-            reader.read(4)?;
-            let payload = reader.read(6)? as usize;
+            reader.read_bits(4)?;
+            let payload = reader.read_bits(6)? as usize;
             Ok(payload)
         }
     } else {
@@ -405,8 +405,8 @@ fn decode_copy_offset<const HISTORY_SIZE: usize>(
             if reader.remaining() < 19 {
                 return Err(DecompressError::TruncatedBitstream);
             }
-            reader.read(3)?;
-            let payload = reader.read(16)? as usize;
+            reader.read_bits(3)?;
+            let payload = reader.read_bits(16)? as usize;
             return Ok(payload + 2368);
         }
 
@@ -420,8 +420,8 @@ fn decode_copy_offset<const HISTORY_SIZE: usize>(
             if reader.remaining() < 15 {
                 return Err(DecompressError::TruncatedBitstream);
             }
-            reader.read(4)?;
-            let payload = reader.read(11)? as usize;
+            reader.read_bits(4)?;
+            let payload = reader.read_bits(11)? as usize;
             return Ok(payload + 320);
         }
 
@@ -435,16 +435,16 @@ fn decode_copy_offset<const HISTORY_SIZE: usize>(
             if reader.remaining() < 13 {
                 return Err(DecompressError::TruncatedBitstream);
             }
-            reader.read(5)?;
-            let payload = reader.read(8)? as usize;
+            reader.read_bits(5)?;
+            let payload = reader.read_bits(8)? as usize;
             Ok(payload + 64)
         } else {
             // 11111 + 6 bits → offset 0..63
             if reader.remaining() < 11 {
                 return Err(DecompressError::TruncatedBitstream);
             }
-            reader.read(5)?;
-            let payload = reader.read(6)? as usize;
+            reader.read_bits(5)?;
+            let payload = reader.read_bits(6)? as usize;
             Ok(payload)
         }
     }
@@ -476,10 +476,10 @@ fn decode_length_of_match<const HISTORY_SIZE: usize>(
         let bit = reader.peek(1);
         if bit == 0 {
             // Consume the terminating 0 bit
-            reader.read(1)?;
+            reader.read_bits(1)?;
             break;
         }
-        reader.read(1)?;
+        reader.read_bits(1)?;
         ones += 1;
         if ones >= max_rows as u32 {
             // Last row has no terminating 0 bit; the row index is `ones`
@@ -507,7 +507,7 @@ fn decode_length_of_match<const HISTORY_SIZE: usize>(
     if reader.remaining() < extra_bits {
         return Err(DecompressError::TruncatedBitstream);
     }
-    let payload = reader.read(extra_bits)? as usize;
+    let payload = reader.read_bits(extra_bits)? as usize;
     let base = 1usize << (ones + 1); // 2^(ones+1)
     Ok(base + payload)
 }

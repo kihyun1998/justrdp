@@ -9,3 +9,6 @@ extern crate alloc;
 
 #[cfg(feature = "alloc")]
 pub mod mppc;
+
+#[cfg(feature = "alloc")]
+pub mod ncrush;
