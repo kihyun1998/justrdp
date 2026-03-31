@@ -732,15 +732,14 @@ RFX 비트스트림
   → RGBA 프레임 버퍼 출력
 ```
 
-- [ ] `RlgrDecoder` / `RlgrEncoder` -- RLGR1, RLGR3 모드
-- [ ] `SubbandReconstructor` -- 계수 재배치
-- [ ] `Dequantizer` -- 양자화 테이블 적용
-- [ ] `DwtTransform` -- 2D DWT (forward/inverse)
-- [ ] `ColorConverter` -- YCbCr ↔ RGBA
-- [ ] `RfxDecoder` -- 전체 파이프라인 조합
-- [ ] `RfxEncoder` -- 서버/프록시용 인코딩 파이프라인
-- [ ] RFX 타일 (64x64) 관리
-- [ ] Progressive RFX (단계적 품질 향상)
+- [x] `RlgrDecoder` / `RlgrEncoder` -- RLGR1, RLGR3 모드
+- [x] `SubbandReconstructor` -- 계수 재배치
+- [x] `Dequantizer` -- 양자화 테이블 적용
+- [x] `DwtTransform` -- 2D DWT (forward/inverse)
+- [x] `ColorConverter` -- YCbCr ↔ RGBA
+- [x] `RfxDecoder` -- 전체 파이프라인 조합
+- [x] `RfxEncoder` -- 서버/프록시용 인코딩 파이프라인
+- [x] RFX 타일 (64x64) 관리
 
 ### 6.4 `justrdp-graphics` -- NSCodec
 
@@ -1078,6 +1077,7 @@ pub trait GfxHandler: Send {
 - [ ] `FrameAcknowledge` PDU
 - [ ] 코덱 디스패치 (Uncompressed, ClearCodec, Planar, RFX, H.264, Alpha)
 - [ ] ZGFX 압축/해제 통합
+- [ ] Progressive RFX (단계적 품질 향상, MS-RDPEGFX)
 
 ### 8.7 `justrdp-rail` -- RemoteApp (MS-RDPERP)
 

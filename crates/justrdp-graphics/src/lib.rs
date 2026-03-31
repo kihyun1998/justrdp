@@ -11,4 +11,7 @@ extern crate alloc;
 pub mod planar;
 
 #[cfg(feature = "alloc")]
+pub mod rfx;
+
+#[cfg(feature = "alloc")]
 pub mod rle;
