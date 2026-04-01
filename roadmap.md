@@ -831,8 +831,8 @@ pub trait AudioDecoder: Send {
 - [x] IMA-ADPCM -- `wSamplesPerBlock` 기반 블록 디코딩 (RFC 2361)
 - [x] AAC -- HEAACWAVEINFO 파싱, ADTS 프레임 길이 추출
 - [x] Opus -- OpusHead 파싱 (RFC 7845)
-- [ ] `AudioDecoder` trait -- 통합 디코더 인터페이스
-- [ ] 포맷별 디코더 팩토리 (`AudioFormat` → `Box<dyn AudioDecoder>`)
+- [x] `AudioDecoder` trait -- 통합 디코더 인터페이스 (`justrdp-audio`)
+- [x] 포맷별 디코더 팩토리 (`make_decoder(AudioFormat) → Box<dyn AudioDecoder>`, `justrdp-rdpsnd`)
 
 ---
 
@@ -970,7 +970,7 @@ pub trait CliprdrBackend: Send {
   - [ ] `RdpsndDvcClient` -- `DvcProcessor` 구현 (`AUDIO_PLAYBACK_DVC`)
   - [ ] Lossy DVC 채널 (`AUDIO_PLAYBACK_LOSSY_DVC`) 지원
   - [ ] SVC/DVC 공통 로직 추출 (PDU 처리, 상태 머신 공유)
-- [ ] 코덱 → `justrdp-audio` crate (Phase 3 코덱 패턴, `justrdp-bulk`/`justrdp-graphics` 동일 구조)
+- [x] 코덱 → `justrdp-audio` crate (Phase 3 코덱 패턴, `justrdp-bulk`/`justrdp-graphics` 동일 구조)
 
 ### 8.3 `justrdp-rdpdr` -- Device Redirection (MS-RDPEFS)
 

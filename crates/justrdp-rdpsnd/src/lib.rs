@@ -15,9 +15,13 @@ pub mod pdu;
 #[cfg(feature = "alloc")]
 mod backend;
 #[cfg(feature = "alloc")]
+mod decoder;
+#[cfg(feature = "alloc")]
 mod processor;
 
 #[cfg(feature = "alloc")]
 pub use backend::RdpsndBackend;
+#[cfg(feature = "alloc")]
+pub use decoder::make_decoder;
 #[cfg(feature = "alloc")]
 pub use processor::RdpsndClient;
