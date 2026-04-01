@@ -14,6 +14,7 @@ members = [
     "crates/justrdp-tls",
     "crates/justrdp-cliprdr",
     "crates/justrdp-rdpsnd",
+    "crates/justrdp-audio",
     "tests/integration",
 ]
 resolver = "3"
@@ -44,3 +45,4 @@ justrdp-svc = { path = "crates/justrdp-svc", version = "0.1.0" }
 justrdp-tls = { path = "crates/justrdp-tls", version = "0.1.0" }
 justrdp-cliprdr = { path = "crates/justrdp-cliprdr", version = "0.1.0" }
 justrdp-rdpsnd = { path = "crates/justrdp-rdpsnd", version = "0.1.0" }
+justrdp-audio = { path = "crates/justrdp-audio", version = "0.1.0" }

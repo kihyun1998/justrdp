@@ -826,12 +826,12 @@ pub trait AudioDecoder: Send {
 }
 ```
 
+- [x] PCM -- passthrough (포맷 변환: u8/i16/i24/f32 → i16)
+- [x] MS-ADPCM -- `ADPCMACOEF` 테이블 기반 블록 디코딩 (RFC 2361)
+- [x] IMA-ADPCM -- `wSamplesPerBlock` 기반 블록 디코딩 (RFC 2361)
+- [x] AAC -- HEAACWAVEINFO 파싱, ADTS 프레임 길이 추출
+- [x] Opus -- OpusHead 파싱 (RFC 7845)
 - [ ] `AudioDecoder` trait -- 통합 디코더 인터페이스
-- [ ] PCM -- passthrough (포맷 변환: u8/i16/i24/f32 → i16)
-- [ ] MS-ADPCM -- `ADPCMACOEF` 테이블 기반 블록 디코딩 (RFC 2361)
-- [ ] IMA-ADPCM -- `wSamplesPerBlock` 기반 블록 디코딩 (RFC 2361)
-- [ ] AAC -- HEAACWAVEFORMAT 파싱, raw ADTS/LATM 프레임 추출
-- [ ] Opus -- OpusHead 파싱 + Opus 프레임 추출 (RFC 7845)
 - [ ] 포맷별 디코더 팩토리 (`AudioFormat` → `Box<dyn AudioDecoder>`)
 
 ---
