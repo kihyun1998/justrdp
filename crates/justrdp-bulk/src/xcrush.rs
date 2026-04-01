@@ -45,6 +45,8 @@ pub struct XcrushDecompressor {
     l1_history: Box<[u8]>,
     l1_history_offset: usize,
     l2: Mppc64kDecompressor,
+    /// Reusable buffer for Level-2 decompression output, avoiding per-call allocation.
+    l2_buf: Vec<u8>,
 }
 
 impl XcrushDecompressor {
@@ -54,6 +56,7 @@ impl XcrushDecompressor {
             l1_history: vec![0u8; L1_HISTORY_SIZE].into_boxed_slice(),
             l1_history_offset: 0,
             l2: Mppc64kDecompressor::new(),
+            l2_buf: Vec::new(),
         }
     }
 
@@ -88,28 +91,33 @@ impl XcrushDecompressor {
             self.reset_l1();
         }
 
-        // Step 3: L2 decompression (conditional)
-        let l1_input: &[u8];
-        let mut l2_buf = Vec::new();
+        // Step 3: L2 decompression (conditional).
+        // Take the reusable buffer out of `self` to avoid borrow conflicts
+        // with the L1 methods that need `&mut self`.
+        let mut l2_buf = core::mem::take(&mut self.l2_buf);
+        l2_buf.clear();
 
-        if l1_flags & L1_INNER_COMPRESSION != 0 {
-            // Pass payload through MPPC 64K decompressor
+        let use_l2 = l1_flags & L1_INNER_COMPRESSION != 0;
+        if use_l2 {
             self.l2.decompress(payload, l2_flags, &mut l2_buf)?;
-            l1_input = &l2_buf;
-        } else {
-            // No L2 compression; use payload directly
-            l1_input = payload;
         }
+        let l1_input = if use_l2 { &l2_buf[..] } else { payload };
 
         // Step 4: L1 decompression
-        if l1_flags & L1_NO_COMPRESSION != 0 {
+        let result = if l1_flags & L1_NO_COMPRESSION != 0 {
             self.copy_literals(l1_input, dst)
         } else if l1_flags & L1_COMPRESSED != 0 {
             self.decompress_l1(l1_input, dst)
         } else {
-            // Neither flag set — treat as raw pass-through
-            self.copy_literals(l1_input, dst)
-        }
+            // Neither L1_COMPRESSED nor L1_NO_COMPRESSION is set.
+            // This is an unspecified protocol state — return an error
+            // rather than silently treating data as raw.
+            Err(DecompressError::InvalidFlags)
+        };
+
+        // Return the buffer to `self` for reuse in future calls.
+        self.l2_buf = l2_buf;
+        result
     }
 
     /// Copy raw literals into L1 history and output.

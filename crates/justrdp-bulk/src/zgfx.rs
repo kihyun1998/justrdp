@@ -79,6 +79,12 @@ struct Token {
     value_base: u32,
 }
 
+/// IMPORTANT: This table MUST be sorted by `(prefix_length, prefix_code)` in
+/// ascending order. The `decode_compressed` loop does a linear scan,
+/// accumulating prefix bits one at a time. Correct matching depends on shorter
+/// prefixes being checked before longer ones, and within the same length,
+/// codes being in ascending order so that accumulated bits are compared in the
+/// right sequence. Reordering entries will produce silent wrong output.
 #[rustfmt::skip]
 static TOKEN_TABLE: &[Token] = &[
     Token { prefix_length: 1, prefix_code:   0, value_bits:  8, token_type: TOKEN_LITERAL, value_base:        0 },
@@ -189,7 +195,9 @@ impl<'a> ZgfxBits<'a> {
     /// pre-loaded bytes so `read_raw_byte()` starts at the correct
     /// byte boundary (for UNENCODED path).
     fn align_byte(&mut self) {
-        // Rewind pre-loaded full bytes back to the input stream
+        // Rewind pre-loaded full bytes back to the input stream.
+        // Safety: `fill()` increments `pos` for each byte loaded into the
+        // accumulator, so `pos >= full_bytes_in_acc` is always true here.
         let full_bytes_in_acc = self.acc_bits / 8;
         if full_bytes_in_acc > 0 {
             self.pos -= full_bytes_in_acc as usize;
@@ -369,6 +377,11 @@ impl ZgfxDecompressor {
                         let distance = token.value_base
                             + bits.get_bits(token.value_bits as u32)?;
 
+                        // `>` (not `>=`): distance == HISTORY_SIZE is valid
+                        // and references the oldest byte in the ring buffer.
+                        // The index computation `(history_index + HISTORY_SIZE
+                        // - distance) % HISTORY_SIZE` yields `history_index`
+                        // when distance == HISTORY_SIZE.
                         if distance as usize > HISTORY_SIZE {
                             return Err(ZgfxError::InvalidToken);
                         }
@@ -431,6 +444,9 @@ impl ZgfxDecompressor {
         }
         let mut count: usize = 4;
         let mut extra: u32 = 2;
+        // The guard `extra > 20` limits doubling to at most 20 iterations.
+        // Starting from count=4, doubling 20 times gives 4 * 2^20 = 4,194,304
+        // which fits in usize on both 32-bit and 64-bit platforms (max ~4 MB).
         while bits.get_bits(1)? == 1 {
             count *= 2;
             extra += 1;

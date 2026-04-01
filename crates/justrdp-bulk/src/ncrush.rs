@@ -279,7 +279,11 @@ impl NcrushDecompressor {
             self.reset();
         }
 
-        // Step 2: PACKET_AT_FRONT — compact last 32KB to front (FreeRDP behavior)
+        // Step 2: PACKET_AT_FRONT — compact last 32KB to front (FreeRDP behavior).
+        // Per MS-RDPEGDI §3.1.8.1, the server sets PACKET_AT_FRONT only when
+        // HistoryOffset >= 65000, so offset >= 32768 is guaranteed in conforming
+        // streams. The `else 0` branch handles malformed packets defensively
+        // (no panic, history state becomes meaningless but safe).
         if flags & PACKET_AT_FRONT != 0 {
             self.history.copy_within(32768..HISTORY_SIZE, 0);
             self.offset = if self.offset >= 32768 {
@@ -299,6 +303,11 @@ impl NcrushDecompressor {
     }
 
     /// Copy uncompressed data into history and output.
+    ///
+    /// Unlike MPPC which uses linear addressing with an overflow check,
+    /// NCRUSH uses a circular buffer (modular arithmetic via `HISTORY_MASK`).
+    /// Offset wraps around silently when it reaches `HISTORY_SIZE`, which is
+    /// the intended design for the 64K ring buffer.
     fn copy_literal(&mut self, src: &[u8], dst: &mut Vec<u8>) -> Result<(), DecompressError> {
         for &b in src {
             self.history[self.offset & HISTORY_MASK] = b;
@@ -361,6 +370,11 @@ impl NcrushDecompressor {
                     } else {
                         0
                     };
+                    // The spec (MS-RDPEGDI §3.1.8.1.4.1 Table 3) defines
+                    // copy-offset symbols as distance = Base + extra_bits.
+                    // Distances are 1-based in the spec, but our history uses
+                    // 0-based indexing, so we subtract 1 to convert to a
+                    // 0-based distance for the `do_copy` source calculation.
                     let copy_offset =
                         COPY_OFFSET_BASE[lut_idx] as usize + stream_bits as usize - 1;
 

@@ -48,6 +48,10 @@ pub enum DecompressError {
     InvalidCopyOffset,
     /// Decompressed output exceeds history buffer size.
     HistoryOverflow,
+    /// Compression type nibble is not a recognized algorithm.
+    UnknownCompressionType,
+    /// Unrecognized flag combination (neither compressed nor raw).
+    InvalidFlags,
 }
 
 impl fmt::Display for DecompressError {
@@ -56,6 +60,8 @@ impl fmt::Display for DecompressError {
             Self::TruncatedBitstream => write!(f, "MPPC: truncated bitstream"),
             Self::InvalidCopyOffset => write!(f, "MPPC: invalid copy offset (zero)"),
             Self::HistoryOverflow => write!(f, "MPPC: history buffer overflow"),
+            Self::UnknownCompressionType => write!(f, "bulk: unknown compression type"),
+            Self::InvalidFlags => write!(f, "bulk: invalid compression flags"),
         }
     }
 }
@@ -108,9 +114,14 @@ impl<'a> BitReader<'a> {
         if self.remaining() < n {
             return Err(DecompressError::TruncatedBitstream);
         }
+        // Ensure the accumulator holds at least `n` bits before peeking.
+        // After fill(), bits_left >= min(n, total_available). Since we
+        // already checked remaining() >= n, fill() guarantees bits_left >= n
+        // for any n <= 32.
+        self.fill();
         let val = self.peek(n);
         self.acc <<= n;
-        self.bits_left = self.bits_left.saturating_sub(n);
+        self.bits_left -= n;
         self.fill();
         Ok(val)
     }
@@ -273,6 +284,11 @@ fn decompress_bitstream<const HISTORY_SIZE: usize>(
     offset: &mut usize,
     dst: &mut Vec<u8>,
 ) -> Result<(), DecompressError> {
+    // Copy tokens use masked (wrapping) index for the read source, while
+    // literals use linear addressing with an overflow check. Both paths
+    // advance `*offset` linearly; the mask is only applied to compute the
+    // source index for back-references. The overflow check at `*offset +
+    // length > HISTORY_SIZE` ensures we never write past the buffer.
     let mask: usize = HISTORY_SIZE - 1;
     let mut reader = BitReader::new(src);
     let start_offset = *offset;
@@ -334,7 +350,11 @@ fn decompress_bitstream<const HISTORY_SIZE: usize>(
         }
     }
 
-    // Append the decompressed region to output
+    // Append the decompressed region to output.
+    // Note: on error, this line is not reached, so `dst` remains unchanged.
+    // However `history[start_offset..*offset]` may contain partial writes if
+    // an error occurred mid-loop. The caller should treat the decompressor
+    // state as undefined after an error and reset before reuse.
     dst.extend_from_slice(&history[start_offset..*offset]);
     Ok(())
 }
@@ -355,7 +375,8 @@ fn decode_copy_offset<const HISTORY_SIZE: usize>(
     reader: &mut BitReader<'_>,
 ) -> Result<usize, DecompressError> {
     if HISTORY_SIZE == HISTORY_SIZE_8K {
-        // Already consumed nothing; we know top 2 bits are '11'
+        // Top 2 bits of the accumulator are '11' (verified by caller's
+        // `top2` check). No bits have been consumed yet.
         // Check for '110' (3 bits)
         if reader.remaining() < 3 {
             return Err(DecompressError::TruncatedBitstream);

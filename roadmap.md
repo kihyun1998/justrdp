@@ -682,7 +682,7 @@ pub enum ClientConnectorState {
 - [x] 그래픽 캐시 무효화 여부 판단 (`deactivation_count` 시그널 + `PrimaryOrderHistory::reset()`)
 - [x] `AutoDetectSequence` 상태 머신 (wait state로 변경, 서버 PDU를 licensing에 전달)
 
-### 6.1 `justrdp-bulk` -- Bulk Compression
+### 6.1 `justrdp-bulk` -- Bulk Compression (재검증 완료)
 
 > **requires**: 없음 (순수 알고리즘, `no_std`)
 > **검증**: RFC/스펙 테스트 벡터 + roundtrip

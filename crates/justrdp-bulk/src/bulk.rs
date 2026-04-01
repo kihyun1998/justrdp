@@ -91,7 +91,7 @@ impl BulkDecompressor {
                 // The outer compressedType is only used to identify the algorithm.
                 self.xcrush.decompress(src, dst)
             }
-            _ => Err(DecompressError::TruncatedBitstream),
+            _ => Err(DecompressError::UnknownCompressionType),
         }
     }
 }
@@ -162,7 +162,7 @@ mod tests {
         let mut out = Vec::new();
         let flags = PACKET_COMPRESSED | 0x0F; // type nibble 0x0F = unsupported
         let result = bulk.decompress(flags, b"data", &mut out);
-        assert!(result.is_err());
+        assert_eq!(result, Err(DecompressError::UnknownCompressionType));
     }
 
     #[test]
