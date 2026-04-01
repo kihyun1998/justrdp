@@ -1,0 +1,20 @@
+[package]
+name = "justrdp-svc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Static Virtual Channel framework for JustRDP"
+keywords = ["rdp", "virtual-channel", "svc"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc", "justrdp-pdu/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-pdu/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-pdu.workspace = true

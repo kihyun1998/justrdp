@@ -864,13 +864,13 @@ pub trait SvcProcessor: AsAny + Debug + Send {
 ```
 
 **구현 항목:**
-- [ ] `SvcProcessor` trait
-- [ ] `SvcClientProcessor` / `SvcServerProcessor` marker traits
-- [ ] `StaticChannelSet` -- TypeId 기반 채널 집합
-- [ ] `ChannelPduHeader` -- 플래그(FIRST/LAST/SHOW_PROTOCOL/SUSPEND/RESUME), 총 길이
-- [ ] 자동 chunking (기본 1600바이트) / dechunking
-- [ ] MCS `SendDataRequest` / `SendDataIndication` 래핑
-- [ ] 채널 ID ↔ 채널 이름 매핑
+- [x] `SvcProcessor` trait
+- [x] `SvcClientProcessor` / `SvcServerProcessor` marker traits
+- [x] `StaticChannelSet` -- TypeId 기반 채널 집합
+- [x] `ChannelPduHeader` -- 플래그(FIRST/LAST/SHOW_PROTOCOL/SUSPEND/RESUME), 총 길이
+- [x] 자동 chunking (기본 1600바이트) / dechunking
+- [x] MCS `SendDataRequest` / `SendDataIndication` 래핑
+- [x] 채널 ID ↔ 채널 이름 매핑
 
 ### 7.3 `justrdp-dvc` -- Dynamic Virtual Channel Framework
 

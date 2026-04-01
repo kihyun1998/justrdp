@@ -15,3 +15,4 @@ pub mod rdstls;
 pub mod server_certificate;
 #[cfg(feature = "alloc")]
 pub mod standard_security;
+pub mod svc;

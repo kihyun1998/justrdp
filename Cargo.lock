@@ -236,6 +236,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-svc"
+version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+ "justrdp-pdu",
+]
+
+[[package]]
 name = "justrdp-tls"
 version = "0.1.0"
 dependencies = [
