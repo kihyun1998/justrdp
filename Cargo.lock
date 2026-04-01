@@ -172,6 +172,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-cliprdr"
+version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+ "justrdp-svc",
+]
+
+[[package]]
 name = "justrdp-connector"
 version = "0.1.0"
 dependencies = [

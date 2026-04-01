@@ -890,7 +890,6 @@ pub trait DvcProcessor: AsAny + Send {
 **구현 항목:**
 - [x] `DvcProcessor` trait
 - [x] `DrdynvcClient` -- 클라이언트 측 DVC 호스트
-- [ ] `DrdynvcServer` -- 서버 측 DVC 호스트
 - [x] Capability negotiation (v1/v2/v3)
 - [x] Channel Create/Close 시퀀스
 - [x] DataFirst/Data 재조립 (`CompleteData`)
@@ -923,15 +922,15 @@ pub trait CliprdrBackend: Send {
 ```
 
 **구현 항목:**
-- [ ] `Cliprdr<R: Role>` -- Generic 클립보드 프로세서 (Client/Server)
-- [ ] 초기화 시퀀스 (Capabilities → Monitor Ready → Format List)
-- [ ] Format List PDU (포맷 ID + 이름)
-- [ ] Format Data Request/Response PDU
-- [ ] File Contents Request/Response PDU (FILECONTENTS_SIZE / FILECONTENTS_RANGE)
-- [ ] Temporary Directory PDU
-- [ ] Lock/Unlock Clipboard Data PDU
-- [ ] Long format names 지원
-- [ ] 표준 포맷: CF_TEXT, CF_UNICODETEXT, CF_DIB, CF_HDROP
+- [x] `Cliprdr<R: Role>` -- Generic 클립보드 프로세서 (Client/Server)
+- [x] 초기화 시퀀스 (Capabilities → Monitor Ready → Format List)
+- [x] Format List PDU (포맷 ID + 이름)
+- [x] Format Data Request/Response PDU
+- [x] File Contents Request/Response PDU (FILECONTENTS_SIZE / FILECONTENTS_RANGE)
+- [x] Temporary Directory PDU
+- [x] Lock/Unlock Clipboard Data PDU
+- [x] Long format names 지원
+- [x] 표준 포맷: CF_TEXT, CF_UNICODETEXT, CF_DIB, CF_HDROP
 
 ### 8.2 `justrdp-rdpsnd` -- Audio Output (MS-RDPEA)
 
@@ -1418,6 +1417,7 @@ pub enum ServerAcceptorState {
 - [ ] CredSSP 서버 측 (자격증명 수신)
 - [ ] 서버 측 Capability Set 생성
 - [ ] 채널 ID 할당
+- [ ] `DrdynvcServer` -- 서버 측 DVC 호스트 (Phase 4에서 이동)
 
 ### 11.2 `justrdp-server` -- Extensible Server Skeleton
 
