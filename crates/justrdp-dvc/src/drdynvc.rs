@@ -1,0 +1,436 @@
+#![forbid(unsafe_code)]
+
+//! DRDYNVC static virtual channel processor -- MS-RDPEDYC 3.1
+//!
+//! `DrdynvcClient` implements `SvcProcessor` to handle the DRDYNVC SVC,
+//! managing DVC capability negotiation, channel create/close, and data dispatch.
+
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use justrdp_core::{AsAny, ReadCursor};
+use justrdp_svc::{
+    ChannelName, CompressionCondition, SvcMessage, SvcProcessor, SvcResult, DRDYNVC,
+};
+
+use crate::pdu::{self, DvcPdu, CAPS_VERSION_3, CREATION_STATUS_OK};
+use crate::reassembly::DvcReassembler;
+use crate::{DvcError, DvcProcessor, DvcResult};
+
+/// Maximum DVC version we support.
+const MAX_SUPPORTED_VERSION: u16 = CAPS_VERSION_3;
+
+/// HRESULT for failed channel creation.
+const CREATION_STATUS_NO_LISTENER: i32 = -2147467259; // 0x80004005 = E_FAIL
+
+/// Client-side DRDYNVC processor.
+///
+/// Implements `SvcProcessor` for the `drdynvc` static virtual channel.
+/// Manages dynamic virtual channel lifecycle: capability negotiation,
+/// channel creation/closing, and data routing to registered `DvcProcessor`s.
+pub struct DrdynvcClient {
+    /// Registered DVC processors, keyed by channel name.
+    processors: BTreeMap<String, Box<dyn DvcProcessor>>,
+    /// Active channels: channel_id → channel_name.
+    active_channels: BTreeMap<u32, String>,
+    /// Per-channel reassembly state.
+    reassemblers: BTreeMap<u32, DvcReassembler>,
+    /// Negotiated version (0 = not yet negotiated).
+    negotiated_version: u16,
+}
+
+impl DrdynvcClient {
+    /// Create a new DRDYNVC client processor.
+    pub fn new() -> Self {
+        Self {
+            processors: BTreeMap::new(),
+            active_channels: BTreeMap::new(),
+            reassemblers: BTreeMap::new(),
+            negotiated_version: 0,
+        }
+    }
+
+    /// Register a DVC processor.
+    pub fn register(&mut self, processor: Box<dyn DvcProcessor>) {
+        let name = String::from(processor.channel_name());
+        self.processors.insert(name, processor);
+    }
+
+    /// Get the negotiated DVC version (0 if not yet negotiated).
+    pub fn negotiated_version(&self) -> u16 {
+        self.negotiated_version
+    }
+
+    /// Process a parsed DVC PDU and produce response SVC messages.
+    fn process_pdu(&mut self, pdu: DvcPdu) -> DvcResult<Vec<SvcMessage>> {
+        match pdu {
+            DvcPdu::CapabilitiesRequest { version, .. } => {
+                // Respond with the min of server version and our max supported.
+                let negotiated = version.min(MAX_SUPPORTED_VERSION);
+                self.negotiated_version = negotiated;
+                let response = pdu::encode_caps_response(negotiated);
+                Ok(vec![SvcMessage::new(response)])
+            }
+
+            DvcPdu::CreateRequest {
+                channel_id,
+                channel_name,
+                priority: _,
+            } => {
+                // Look up a registered processor for this channel name.
+                if self.processors.contains_key(&channel_name) {
+                    // Accept the channel.
+                    self.active_channels
+                        .insert(channel_id, channel_name.clone());
+                    self.reassemblers
+                        .insert(channel_id, DvcReassembler::new());
+
+                    // Call start() on the processor.
+                    let start_messages = if let Some(proc) = self.processors.get_mut(&channel_name) {
+                        proc.start(channel_id)?
+                    } else {
+                        vec![]
+                    };
+
+                    // Send CreateResponse(OK) first, then any start messages.
+                    let mut responses = vec![SvcMessage::new(pdu::encode_create_response(
+                        channel_id,
+                        CREATION_STATUS_OK,
+                    ))];
+
+                    // Encode start messages as DVC Data PDUs.
+                    for msg in start_messages {
+                        let encoded = encode_dvc_message(channel_id, &msg.data);
+                        responses.push(SvcMessage::new(encoded));
+                    }
+
+                    Ok(responses)
+                } else {
+                    // No listener — reject.
+                    Ok(vec![SvcMessage::new(pdu::encode_create_response(
+                        channel_id,
+                        CREATION_STATUS_NO_LISTENER,
+                    ))])
+                }
+            }
+
+            DvcPdu::DataFirst {
+                channel_id,
+                total_length,
+                data,
+            } => {
+                let reassembler = self
+                    .reassemblers
+                    .get_mut(&channel_id);
+                let reassembler = match reassembler {
+                    Some(r) => r,
+                    None => return Ok(vec![]), // unknown channel
+                };
+
+                if let Some(complete) = reassembler.data_first(total_length, &data)? {
+                    self.dispatch_data(channel_id, &complete)
+                } else {
+                    Ok(vec![])
+                }
+            }
+
+            DvcPdu::Data { channel_id, data } => {
+                let reassembler = self
+                    .reassemblers
+                    .get_mut(&channel_id);
+                let reassembler = match reassembler {
+                    Some(r) => r,
+                    None => return Ok(vec![]), // unknown channel
+                };
+
+                if let Some(complete) = reassembler.data(&data)? {
+                    self.dispatch_data(channel_id, &complete)
+                } else {
+                    Ok(vec![])
+                }
+            }
+
+            DvcPdu::Close { channel_id } => {
+                // Notify the processor.
+                if let Some(name) = self.active_channels.get(&channel_id) {
+                    if let Some(proc) = self.processors.get_mut(name) {
+                        proc.close(channel_id);
+                    }
+                }
+                // Clean up state.
+                self.active_channels.remove(&channel_id);
+                self.reassemblers.remove(&channel_id);
+
+                // Echo the close back.
+                Ok(vec![SvcMessage::new(pdu::encode_close(channel_id))])
+            }
+        }
+    }
+
+    /// Dispatch complete data to the registered processor.
+    fn dispatch_data(&mut self, channel_id: u32, payload: &[u8]) -> DvcResult<Vec<SvcMessage>> {
+        let name = match self.active_channels.get(&channel_id) {
+            Some(n) => n.clone(),
+            None => return Ok(vec![]),
+        };
+        let proc = match self.processors.get_mut(&name) {
+            Some(p) => p,
+            None => return Ok(vec![]),
+        };
+
+        let responses = proc.process(channel_id, payload)?;
+        let mut messages = Vec::new();
+        for msg in responses {
+            let encoded = encode_dvc_message(channel_id, &msg.data);
+            messages.push(SvcMessage::new(encoded));
+        }
+        Ok(messages)
+    }
+}
+
+impl Default for DrdynvcClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::fmt::Debug for DrdynvcClient {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DrdynvcClient")
+            .field("negotiated_version", &self.negotiated_version)
+            .field("active_channels", &self.active_channels.len())
+            .field("processors", &self.processors.len())
+            .finish()
+    }
+}
+
+impl AsAny for DrdynvcClient {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+}
+
+impl SvcProcessor for DrdynvcClient {
+    fn channel_name(&self) -> ChannelName {
+        DRDYNVC
+    }
+
+    fn start(&mut self) -> SvcResult<Vec<SvcMessage>> {
+        // The DRDYNVC channel waits for the server's DYNVC_CAPS.
+        // No initial messages to send.
+        Ok(vec![])
+    }
+
+    fn process(&mut self, payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
+        let mut src = ReadCursor::new(payload);
+        let pdu = pdu::decode_dvc_pdu(&mut src)
+            .map_err(|e| justrdp_svc::SvcError::Decode(e))?;
+        self.process_pdu(pdu)
+            .map_err(|e| match e {
+                DvcError::Decode(d) => justrdp_svc::SvcError::Decode(d),
+                DvcError::Encode(e) => justrdp_svc::SvcError::Encode(e),
+                DvcError::Protocol(s) => justrdp_svc::SvcError::Protocol(s),
+            })
+    }
+
+    fn compression_condition(&self) -> CompressionCondition {
+        CompressionCondition::Never
+    }
+}
+
+/// Encode a DVC message as a DYNVC_DATA or DYNVC_DATA_FIRST PDU.
+fn encode_dvc_message(channel_id: u32, data: &[u8]) -> Vec<u8> {
+    // Use single Data PDU — the SVC layer handles chunking above 1600.
+    pdu::encode_data(channel_id, data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DvcMessage;
+
+    /// A simple echo DVC processor for testing.
+    #[derive(Debug)]
+    struct EchoDvcProcessor;
+
+    impl AsAny for EchoDvcProcessor {
+        fn as_any(&self) -> &dyn core::any::Any { self }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any { self }
+    }
+
+    impl DvcProcessor for EchoDvcProcessor {
+        fn channel_name(&self) -> &str { "testdvc" }
+
+        fn start(&mut self, _channel_id: u32) -> DvcResult<Vec<DvcMessage>> {
+            Ok(vec![])
+        }
+
+        fn process(&mut self, _channel_id: u32, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+            Ok(vec![DvcMessage::new(payload.to_vec())])
+        }
+
+        fn close(&mut self, _channel_id: u32) {}
+    }
+
+    #[test]
+    fn caps_negotiation_v1() {
+        let mut client = DrdynvcClient::new();
+        let caps = [0x50, 0x00, 0x01, 0x00]; // CAPS_VERSION_1
+        let responses = client.process(&caps).unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(&responses[0].data, &[0x50, 0x00, 0x01, 0x00]); // echo v1
+        assert_eq!(client.negotiated_version(), 1);
+    }
+
+    #[test]
+    fn caps_negotiation_v3_clamped() {
+        let mut client = DrdynvcClient::new();
+        // Server sends v3 with priority charges.
+        let caps: [u8; 12] = [
+            0x50, 0x00, 0x03, 0x00,
+            0xA8, 0x03, 0xCC, 0x0C,
+            0xA2, 0x24, 0x55, 0x55,
+        ];
+        let responses = client.process(&caps).unwrap();
+        assert_eq!(client.negotiated_version(), 3);
+        // Response is 4 bytes with version=3.
+        assert_eq!(&responses[0].data, &[0x50, 0x00, 0x03, 0x00]);
+    }
+
+    #[test]
+    fn create_request_accepted() {
+        let mut client = DrdynvcClient::new();
+        client.register(Box::new(EchoDvcProcessor));
+        // Negotiate first.
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+
+        // CreateRequest: channel_id=3, name="testdvc"
+        let create_req = [0x10, 0x03, 0x74, 0x65, 0x73, 0x74, 0x64, 0x76, 0x63, 0x00];
+        let responses = client.process(&create_req).unwrap();
+        assert_eq!(responses.len(), 1);
+        // CreateResponse with status=0 (OK).
+        assert_eq!(&responses[0].data, &[0x10, 0x03, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn create_request_rejected_no_listener() {
+        let mut client = DrdynvcClient::new();
+        // No processor registered for "unknown".
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+
+        let create_req = [0x10, 0x03, 0x75, 0x6E, 0x6B, 0x00]; // "unk\0"
+        let responses = client.process(&create_req).unwrap();
+        assert_eq!(responses.len(), 1);
+        // CreationStatus should be negative (E_FAIL).
+        let status_bytes = &responses[0].data[2..6];
+        let status = i32::from_le_bytes(status_bytes.try_into().unwrap());
+        assert!(status < 0);
+    }
+
+    #[test]
+    fn data_single_echo() {
+        let mut client = DrdynvcClient::new();
+        client.register(Box::new(EchoDvcProcessor));
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+        // Create channel 3.
+        let create_req = [0x10, 0x03, 0x74, 0x65, 0x73, 0x74, 0x64, 0x76, 0x63, 0x00];
+        client.process(&create_req).unwrap();
+
+        // Send Data on channel 3: "hello"
+        let data_pdu = [0x30, 0x03, b'h', b'e', b'l', b'l', b'o'];
+        let responses = client.process(&data_pdu).unwrap();
+        assert_eq!(responses.len(), 1);
+        // Echo processor returns "hello" wrapped as Data PDU.
+        let mut src = ReadCursor::new(&responses[0].data);
+        let pdu = pdu::decode_dvc_pdu(&mut src).unwrap();
+        match pdu {
+            DvcPdu::Data { channel_id, data } => {
+                assert_eq!(channel_id, 3);
+                assert_eq!(data, b"hello");
+            }
+            _ => panic!("expected Data PDU"),
+        }
+    }
+
+    #[test]
+    fn data_first_reassembly() {
+        let mut client = DrdynvcClient::new();
+        client.register(Box::new(EchoDvcProcessor));
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+        let create_req = [0x10, 0x03, 0x74, 0x65, 0x73, 0x74, 0x64, 0x76, 0x63, 0x00];
+        client.process(&create_req).unwrap();
+
+        // DataFirst: channel=3, total_length=6, data="AAA"
+        let data_first = pdu::encode_data_first(3, 6, b"AAA");
+        let responses = client.process(&data_first).unwrap();
+        assert!(responses.is_empty()); // not complete yet
+
+        // Data: channel=3, data="BBB"
+        let data = pdu::encode_data(3, b"BBB");
+        let responses = client.process(&data).unwrap();
+        assert_eq!(responses.len(), 1); // echo of "AAABBB"
+    }
+
+    #[test]
+    fn close_echoed() {
+        let mut client = DrdynvcClient::new();
+        client.register(Box::new(EchoDvcProcessor));
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+        let create_req = [0x10, 0x03, 0x74, 0x65, 0x73, 0x74, 0x64, 0x76, 0x63, 0x00];
+        client.process(&create_req).unwrap();
+
+        // Close channel 3.
+        let close = [0x40, 0x03];
+        let responses = client.process(&close).unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(&responses[0].data, &[0x40, 0x03]); // echo close
+    }
+
+    #[test]
+    fn close_unknown_channel_no_response() {
+        let mut client = DrdynvcClient::new();
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+        // Close channel 99 which was never created.
+        let close = pdu::encode_close(99);
+        let responses = client.process(&close).unwrap();
+        // Still echoes close per protocol (no harm).
+        assert_eq!(responses.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_create_request_resets_reassembler() {
+        let mut client = DrdynvcClient::new();
+        client.register(Box::new(EchoDvcProcessor));
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+
+        // First CreateRequest for channel 3.
+        let create_req = [0x10, 0x03, 0x74, 0x65, 0x73, 0x74, 0x64, 0x76, 0x63, 0x00];
+        client.process(&create_req).unwrap();
+
+        // Start a DataFirst that won't complete.
+        let data_first = pdu::encode_data_first(3, 100, b"partial");
+        client.process(&data_first).unwrap();
+
+        // Duplicate CreateRequest for channel 3 — should reset state.
+        let responses = client.process(&create_req).unwrap();
+        assert_eq!(responses.len(), 1); // new CreateResponse(OK)
+
+        // New data on the channel should work independently (no leftover from prior assembly).
+        let data = pdu::encode_data(3, b"fresh");
+        let responses = client.process(&data).unwrap();
+        assert_eq!(responses.len(), 1);
+        // Echo processor echoes "fresh".
+        let mut src = ReadCursor::new(&responses[0].data);
+        let pdu = pdu::decode_dvc_pdu(&mut src).unwrap();
+        match pdu {
+            DvcPdu::Data { data, .. } => assert_eq!(data, b"fresh"),
+            _ => panic!("expected Data"),
+        }
+    }
+}

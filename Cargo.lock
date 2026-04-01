@@ -193,6 +193,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-dvc"
+version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+ "justrdp-svc",
+]
+
+[[package]]
 name = "justrdp-graphics"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,20 @@
+[package]
+name = "justrdp-dvc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Dynamic Virtual Channel framework for JustRDP"
+keywords = ["rdp", "dynamic-virtual-channel", "dvc"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc", "justrdp-svc/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-svc/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-svc.workspace = true

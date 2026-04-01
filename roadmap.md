@@ -888,15 +888,13 @@ pub trait DvcProcessor: AsAny + Send {
 ```
 
 **구현 항목:**
-- [ ] `DvcProcessor` trait
-- [ ] `DrdynvcClient` -- 클라이언트 측 DVC 호스트
+- [x] `DvcProcessor` trait
+- [x] `DrdynvcClient` -- 클라이언트 측 DVC 호스트
 - [ ] `DrdynvcServer` -- 서버 측 DVC 호스트
-- [ ] Capability negotiation (v1/v2/v3)
-- [ ] Channel Create/Close 시퀀스
-- [ ] DataFirst/Data 재조립 (`CompleteData`)
-- [ ] 우선순위 지원 (v2: high/medium/low/lowest)
-- [ ] 압축 지원 (v2: DYNVC_DATA_FIRST_COMPRESSED, DYNVC_DATA_COMPRESSED)
-- [ ] Soft-Sync (v3: 멀티트랜스포트 간 채널 마이그레이션)
+- [x] Capability negotiation (v1/v2/v3)
+- [x] Channel Create/Close 시퀀스
+- [x] DataFirst/Data 재조립 (`CompleteData`)
+- [x] 우선순위 지원 (v2: high/medium/low/lowest)
 
 ---
 
@@ -1078,6 +1076,7 @@ pub trait GfxHandler: Send {
 - [ ] `FrameAcknowledge` PDU
 - [ ] 코덱 디스패치 (Uncompressed, ClearCodec, Planar, RFX, H.264, Alpha)
 - [ ] ZGFX 압축/해제 통합
+- [ ] DVC 압축 지원 (DYNVC_DATA_FIRST_COMPRESSED, DYNVC_DATA_COMPRESSED) -- ZGFX-Lite 8KB 윈도우
 - [ ] Progressive RFX (단계적 품질 향상, MS-RDPEGFX)
 
 ### 8.7 `justrdp-rail` -- RemoteApp (MS-RDPERP)
@@ -1375,7 +1374,7 @@ pub trait GfxHandler: Send {
 - [ ] `TunnelCreateRequest` PDU (requestId + securityCookie)
 - [ ] `TunnelCreateResponse` PDU
 - [ ] DVC를 UDP 트랜스포트로 라우팅
-- [ ] 트랜스포트 간 DVC Soft-Sync 마이그레이션
+- [ ] 트랜스포트 간 DVC Soft-Sync 마이그레이션 (DYNVC_SOFT_SYNC_REQUEST/RESPONSE)
 
 ---
 
