@@ -4,7 +4,10 @@
 //!
 //! Implements the ICT (Irreversible Color Transform) between RGB and YCbCr.
 
-use super::TILE_COEFFICIENTS;
+use super::{RfxError, TILE_COEFFICIENTS};
+
+/// Required byte length for a BGRA tile buffer (64×64×4 = 16384).
+pub const TILE_BGRA_SIZE: usize = TILE_COEFFICIENTS * 4;
 
 /// Color converter for RemoteFX (ICT transform).
 pub struct ColorConverter;
@@ -17,13 +20,20 @@ impl ColorConverter {
     /// * `y_plane` - Y component (level-shifted, range ~[-128, 127])
     /// * `cb_plane` - Cb component
     /// * `cr_plane` - Cr component
-    /// * `dst` - Output BGRA buffer, must be at least 4096×4 bytes
+    /// * `dst` - Output BGRA buffer, must be at least `TILE_BGRA_SIZE` (16384) bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns `RfxError::BufferTooSmall` if `dst` is shorter than `TILE_BGRA_SIZE`.
     pub fn ycbcr_to_bgra(
         y_plane: &[i16; TILE_COEFFICIENTS],
         cb_plane: &[i16; TILE_COEFFICIENTS],
         cr_plane: &[i16; TILE_COEFFICIENTS],
         dst: &mut [u8],
-    ) {
+    ) -> Result<(), RfxError> {
+        if dst.len() < TILE_BGRA_SIZE {
+            return Err(RfxError::BufferTooSmall);
+        }
         for i in 0..TILE_COEFFICIENTS {
             // Level-shift Y back up by 128
             let y = y_plane[i] as i32 + 128;
@@ -44,22 +54,30 @@ impl ColorConverter {
             dst[base + 2] = r;
             dst[base + 3] = 0xFF; // Alpha
         }
+        Ok(())
     }
 
     /// Convert BGRA pixels to YCbCr planes (MS-RDPRFX §3.1.8.1.3).
     ///
     /// # Arguments
     ///
-    /// * `bgra` - Input BGRA pixels (4096×4 bytes)
+    /// * `bgra` - Input BGRA pixels, must be at least `TILE_BGRA_SIZE` (16384) bytes
     /// * `y_plane` - Output Y component (level-shifted)
     /// * `cb_plane` - Output Cb component
     /// * `cr_plane` - Output Cr component
+    ///
+    /// # Errors
+    ///
+    /// Returns `RfxError::BufferTooSmall` if `bgra` is shorter than `TILE_BGRA_SIZE`.
     pub fn bgra_to_ycbcr(
         bgra: &[u8],
         y_plane: &mut [i16; TILE_COEFFICIENTS],
         cb_plane: &mut [i16; TILE_COEFFICIENTS],
         cr_plane: &mut [i16; TILE_COEFFICIENTS],
-    ) {
+    ) -> Result<(), RfxError> {
+        if bgra.len() < TILE_BGRA_SIZE {
+            return Err(RfxError::BufferTooSmall);
+        }
         for i in 0..TILE_COEFFICIENTS {
             let base = i * 4;
             let b = bgra[base] as i32;
@@ -70,10 +88,13 @@ impl ColorConverter {
             // Y  = ((1225 * R + 2404 * G + 467 * B) >> 12) - 128
             // Cb = ((-691 * R - 1357 * G + 2048 * B) >> 12)
             // Cr = ((2048 * R - 1715 * G - 333 * B) >> 12)
+            // Intermediate range: max = 255*(1225+2404+467)+2048 = 1_046_528, fits i32.
+            // After >>12 and -128: result range is [-128, 127], fits i16 without truncation.
             y_plane[i] = (((1225 * r + 2404 * g + 467 * b + 2048) >> 12) - 128) as i16;
             cb_plane[i] = ((-691 * r - 1357 * g + 2048 * b + 2048) >> 12) as i16;
             cr_plane[i] = ((2048 * r - 1715 * g - 333 * b + 2048) >> 12) as i16;
         }
+        Ok(())
     }
 }
 
@@ -101,7 +122,7 @@ mod tests {
         let cr = [0i16; TILE_COEFFICIENTS];
         let mut dst = [0u8; TILE_COEFFICIENTS * 4];
 
-        ColorConverter::ycbcr_to_bgra(&y, &cb, &cr, &mut dst);
+        ColorConverter::ycbcr_to_bgra(&y, &cb, &cr, &mut dst).unwrap();
 
         assert_eq!(dst[0], 128); // B
         assert_eq!(dst[1], 128); // G
@@ -124,7 +145,7 @@ mod tests {
         let mut cb = [0i16; TILE_COEFFICIENTS];
         let mut cr = [0i16; TILE_COEFFICIENTS];
 
-        ColorConverter::bgra_to_ycbcr(&bgra, &mut y, &mut cb, &mut cr);
+        ColorConverter::bgra_to_ycbcr(&bgra, &mut y, &mut cb, &mut cr).unwrap();
 
         // Y should be ~0 (128 - 128 = 0), Cb and Cr should be ~0
         assert!((y[0] as i32).abs() <= 1);
@@ -146,10 +167,10 @@ mod tests {
         let mut cb = [0i16; TILE_COEFFICIENTS];
         let mut cr = [0i16; TILE_COEFFICIENTS];
 
-        ColorConverter::bgra_to_ycbcr(&bgra, &mut y, &mut cb, &mut cr);
+        ColorConverter::bgra_to_ycbcr(&bgra, &mut y, &mut cb, &mut cr).unwrap();
 
         let mut result = [0u8; TILE_COEFFICIENTS * 4];
-        ColorConverter::ycbcr_to_bgra(&y, &cb, &cr, &mut result);
+        ColorConverter::ycbcr_to_bgra(&y, &cb, &cr, &mut result).unwrap();
 
         // Should be close to original (within rounding error)
         for i in 0..TILE_COEFFICIENTS {
@@ -170,7 +191,7 @@ mod tests {
         let cr = [127i16; TILE_COEFFICIENTS]; // Large positive Cr
 
         let mut dst = [0u8; TILE_COEFFICIENTS * 4];
-        ColorConverter::ycbcr_to_bgra(&y, &cb, &cr, &mut dst);
+        ColorConverter::ycbcr_to_bgra(&y, &cb, &cr, &mut dst).unwrap();
 
         // R = 255 + large → clamped to 255
         assert_eq!(dst[2], 255);
@@ -200,10 +221,10 @@ mod tests {
             let mut y = [0i16; TILE_COEFFICIENTS];
             let mut cb = [0i16; TILE_COEFFICIENTS];
             let mut cr = [0i16; TILE_COEFFICIENTS];
-            ColorConverter::bgra_to_ycbcr(&bgra, &mut y, &mut cb, &mut cr);
+            ColorConverter::bgra_to_ycbcr(&bgra, &mut y, &mut cb, &mut cr).unwrap();
 
             let mut result = [0u8; TILE_COEFFICIENTS * 4];
-            ColorConverter::ycbcr_to_bgra(&y, &cb, &cr, &mut result);
+            ColorConverter::ycbcr_to_bgra(&y, &cb, &cr, &mut result).unwrap();
 
             let diff_r = (result[2] as i32 - r as i32).abs();
             let diff_g = (result[1] as i32 - g as i32).abs();

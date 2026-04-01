@@ -16,6 +16,8 @@ use core::fmt;
 pub enum PointerError {
     TruncatedData,
     UnsupportedBpp(u16),
+    /// Pointer dimensions exceed the maximum (384×384, MS-RDPBCGR §2.2.9.1.1.4.4).
+    DimensionTooLarge,
     InvalidCacheIndex(u16),
     EmptyCacheSlot(u16),
     MaskSizeMismatch,
@@ -26,6 +28,7 @@ impl fmt::Display for PointerError {
         match self {
             Self::TruncatedData => write!(f, "Pointer: truncated data"),
             Self::UnsupportedBpp(bpp) => write!(f, "Pointer: unsupported bpp {bpp}"),
+            Self::DimensionTooLarge => write!(f, "Pointer: dimensions exceed 384×384"),
             Self::InvalidCacheIndex(idx) => write!(f, "Pointer: invalid cache index {idx}"),
             Self::EmptyCacheSlot(idx) => write!(f, "Pointer: empty cache slot {idx}"),
             Self::MaskSizeMismatch => write!(f, "Pointer: mask size mismatch"),
@@ -53,7 +56,7 @@ pub struct PointerShape {
     /// (AND=1, XOR=non-black). The `pixels` field contains the XOR color for
     /// these pixels (typically white). Callers that support invert cursors
     /// should check this mask; others can ignore it and render opaque.
-    pub xor_mask: Vec<u8>,
+    pub invert_mask: Vec<u8>,
 }
 
 // ── Stride calculation ──
@@ -71,15 +74,16 @@ fn and_mask_stride(width: usize) -> usize {
 }
 
 /// XOR mask stride for a given width and bpp (padded to 2-byte boundary).
+/// XOR mask stride for a given width and bpp (padded to 2-byte boundary).
+/// Only called after bpp is validated to be in {1, 16, 24, 32}.
 fn xor_mask_stride(width: usize, bpp: u16) -> usize {
     let bytes_per_row = match bpp {
         1 => (width + 7) / 8,
-        4 => (width + 1) / 2,
-        8 => width,
         16 => width * 2,
         24 => width * 3,
         32 => width * 4,
-        _ => width * 4,
+        // Caller must validate bpp before calling this function.
+        _ => unreachable!("xor_mask_stride called with unsupported bpp: {bpp}"),
     };
     padded_stride(bytes_per_row)
 }
@@ -101,6 +105,20 @@ fn extract_xor_pixel(row: &[u8], x: usize, bpp: u16) -> (u8, u8, u8, u8) {
                 (0, 0, 0, 0xFF)
             }
         }
+        16 => {
+            let off = x * 2;
+            if off + 2 <= row.len() {
+                let word = u16::from_le_bytes([row[off], row[off + 1]]);
+                // BGR565: bits[4:0]=B(5), bits[10:5]=G(6), bits[15:11]=R(5)
+                // Shift to 8-bit: B<<3, G via (word>>3)&0xFC, R via (word>>8)&0xF8
+                let b = ((word & 0x001F) << 3) as u8;
+                let g = ((word >> 3) & 0xFC) as u8;
+                let r = ((word >> 8) & 0xF8) as u8;
+                (b, g, r, 0xFF)
+            } else {
+                (0, 0, 0, 0xFF)
+            }
+        }
         24 => {
             let off = x * 3;
             if off + 3 <= row.len() {
@@ -115,19 +133,6 @@ fn extract_xor_pixel(row: &[u8], x: usize, bpp: u16) -> (u8, u8, u8, u8) {
                 (row[off], row[off + 1], row[off + 2], row[off + 3])
             } else {
                 (0, 0, 0, 0)
-            }
-        }
-        16 => {
-            let off = x * 2;
-            if off + 2 <= row.len() {
-                let word = u16::from_le_bytes([row[off], row[off + 1]]);
-                // BGR565
-                let b = ((word & 0x001F) << 3) as u8;
-                let g = ((word >> 3) & 0xFC) as u8;
-                let r = ((word >> 8) & 0xF8) as u8;
-                (b, g, r, 0xFF)
-            } else {
-                (0, 0, 0, 0xFF)
             }
         }
         _ => (0, 0, 0, 0xFF),
@@ -152,13 +157,13 @@ fn extract_and_bit(row: &[u8], x: usize) -> u8 {
 ///
 /// # Arguments
 ///
-/// * `width` - Pointer width in pixels
-/// * `height` - Pointer height in pixels
+/// * `width` - Pointer width in pixels (max 384)
+/// * `height` - Pointer height in pixels (max 384)
 /// * `hotspot_x` - Hotspot X
 /// * `hotspot_y` - Hotspot Y
 /// * `xor_bpp` - Color depth of XOR mask (1, 16, 24, or 32)
 /// * `xor_mask` - XOR mask data (bottom-up scanlines)
-/// * `and_mask` - AND mask data (1bpp bottom-up scanlines)
+/// * `and_mask` - AND mask data (1bpp bottom-up scanlines; ignored for 32bpp)
 pub fn decode_pointer(
     width: u16,
     height: u16,
@@ -178,8 +183,14 @@ pub fn decode_pointer(
             hotspot_x,
             hotspot_y,
             pixels: Vec::new(),
-            xor_mask: Vec::new(),
+            invert_mask: Vec::new(),
         });
+    }
+
+    // MS-RDPBCGR §2.2.9.1.1.4.4: large pointer max is 384×384
+    const MAX_POINTER_DIM: usize = 384;
+    if w > MAX_POINTER_DIM || h > MAX_POINTER_DIM {
+        return Err(PointerError::DimensionTooLarge);
     }
 
     match xor_bpp {
@@ -192,8 +203,8 @@ pub fn decode_pointer(
     let and_stride = and_mask_stride(w);
     let use_and_mask = xor_bpp != 32; // 32bpp uses alpha from XOR data
 
-    let expected_xor = xor_stride * h;
-    let expected_and = and_stride * h;
+    let expected_xor = xor_stride.checked_mul(h).ok_or(PointerError::DimensionTooLarge)?;
+    let expected_and = and_stride.checked_mul(h).ok_or(PointerError::DimensionTooLarge)?;
 
     if xor_mask.len() < expected_xor {
         return Err(PointerError::MaskSizeMismatch);
@@ -202,10 +213,15 @@ pub fn decode_pointer(
         return Err(PointerError::MaskSizeMismatch);
     }
 
-    let pixel_count = w * h;
+    let pixel_count = w.checked_mul(h).ok_or(PointerError::DimensionTooLarge)?;
     let mut pixels = vec![0u8; pixel_count * 4];
-    let invert_mask_bytes = (pixel_count + 7) / 8;
-    let mut invert_mask = vec![0u8; invert_mask_bytes];
+    // Only allocate invert_mask when AND mask is used (non-32bpp).
+    // For 32bpp, alpha comes directly from XOR data and invert is never set.
+    let mut invert_mask = if use_and_mask {
+        vec![0u8; (pixel_count + 7) / 8]
+    } else {
+        Vec::new()
+    };
 
     for y in 0..h {
         // Bottom-up: wire row 0 = bottom row
@@ -237,7 +253,7 @@ pub fn decode_pointer(
                     if b == 0 && g == 0 && r == 0 {
                         a = 0; // transparent
                     } else {
-                        a = 0xFF; // invert pixel — mark in xor_mask
+                        a = 0xFF; // invert pixel — mark in invert_mask
                         is_invert = true;
                     }
                 }
@@ -264,20 +280,24 @@ pub fn decode_pointer(
         hotspot_x,
         hotspot_y,
         pixels,
-        xor_mask: invert_mask,
+        invert_mask,
     })
 }
 
 // ── Pointer cache ──
 
 /// Pointer shape cache.
+#[derive(Debug, Clone)]
 pub struct PointerCache {
     slots: Vec<Option<PointerShape>>,
 }
 
 impl PointerCache {
     /// Create a new cache with the given capacity.
+    ///
+    /// A capacity of 0 produces an empty cache where all operations return `InvalidCacheIndex`.
     pub fn new(capacity: usize) -> Self {
+        debug_assert!(capacity > 0, "PointerCache created with zero capacity");
         let mut slots = Vec::with_capacity(capacity);
         slots.resize_with(capacity, || None);
         Self { slots }
@@ -349,7 +369,7 @@ mod tests {
         let and = [0x00, 0x00]; // AND bit 0 = 0 → opaque
         let shape = decode_pointer(1, 1, 0, 0, 24, &xor, &and).unwrap();
         assert_eq!(shape.pixels, [0xFF, 0x00, 0x00, 0xFF]);
-        assert_eq!(shape.xor_mask[0], 0, "no invert pixels");
+        assert_eq!(shape.invert_mask[0], 0, "no invert pixels");
     }
 
     #[test]
@@ -437,7 +457,7 @@ mod tests {
             width: 1, height: 1,
             hotspot_x: 0, hotspot_y: 0,
             pixels: vec![0xFF; 4],
-            xor_mask: vec![0],
+            invert_mask: vec![0],
         };
         cache.set(0, shape.clone()).unwrap();
         let retrieved = cache.get(0).unwrap();
@@ -463,7 +483,7 @@ mod tests {
             width: 1, height: 1,
             hotspot_x: 0, hotspot_y: 0,
             pixels: vec![0xFF; 4],
-            xor_mask: vec![0],
+            invert_mask: vec![0],
         };
         cache.set(0, shape).unwrap();
         cache.clear();
@@ -487,7 +507,7 @@ mod tests {
         let shape = decode_pointer(1, 1, 0, 0, 24, &xor, &and).unwrap();
         assert_eq!(shape.pixels, [0xFF, 0xFF, 0xFF, 0xFF]);
         // Invert mask: bit 0 (pixel 0) should be set
-        assert_eq!(shape.xor_mask[0] & 0x80, 0x80, "invert bit must be set");
+        assert_eq!(shape.invert_mask[0] & 0x80, 0x80, "invert bit must be set");
     }
 
     #[test]
@@ -530,7 +550,7 @@ mod tests {
         let and = [0x80, 0x00]; // AND=1
         let shape = decode_pointer(1, 1, 0, 0, 1, &xor, &and).unwrap();
         assert_eq!(shape.pixels, [0xFF, 0xFF, 0xFF, 0xFF]);
-        assert_eq!(shape.xor_mask[0] & 0x80, 0x80, "invert bit must be set");
+        assert_eq!(shape.invert_mask[0] & 0x80, 0x80, "invert bit must be set");
     }
 
     #[test]
@@ -558,8 +578,8 @@ mod tests {
     #[test]
     fn cache_overwrite() {
         let mut cache = PointerCache::new(4);
-        let a = PointerShape { width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, pixels: vec![0xAA; 4], xor_mask: vec![0] };
-        let b = PointerShape { width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, pixels: vec![0xBB; 4], xor_mask: vec![0] };
+        let a = PointerShape { width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, pixels: vec![0xAA; 4], invert_mask: vec![0] };
+        let b = PointerShape { width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, pixels: vec![0xBB; 4], invert_mask: vec![0] };
         cache.set(2, a).unwrap();
         cache.set(2, b).unwrap();
         assert_eq!(cache.get(2).unwrap().pixels, vec![0xBB; 4]);
@@ -575,5 +595,20 @@ mod tests {
     fn bpp_8_rejected() {
         let result = decode_pointer(1, 1, 0, 0, 8, &[0; 2], &[0; 2]);
         assert_eq!(result, Err(PointerError::UnsupportedBpp(8)));
+    }
+
+    #[test]
+    fn decode_zero_width_nonzero_height() {
+        // width=0, height=5 → early return with empty pixels
+        let shape = decode_pointer(0, 5, 0, 0, 32, &[], &[]).unwrap();
+        assert!(shape.pixels.is_empty());
+        assert_eq!(shape.width, 0);
+        assert_eq!(shape.height, 5);
+    }
+
+    #[test]
+    fn decode_nonzero_width_zero_height() {
+        let shape = decode_pointer(5, 0, 0, 0, 32, &[], &[]).unwrap();
+        assert!(shape.pixels.is_empty());
     }
 }

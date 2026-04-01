@@ -104,10 +104,13 @@ const BLACK: u8 = 0xFE;
 
 // ── Pixel helpers ──
 
-/// Read a pixel value from a byte slice (little-endian).
+/// Read a pixel value from a byte slice (little-endian) with bounds checking.
 #[inline]
-fn read_pixel(buf: &[u8], offset: usize, pixel_size: usize) -> u32 {
-    match pixel_size {
+fn read_pixel(buf: &[u8], offset: usize, pixel_size: usize) -> Result<u32, RleError> {
+    if offset + pixel_size > buf.len() {
+        return Err(RleError::OutputOverflow);
+    }
+    let val = match pixel_size {
         1 => u32::from(buf[offset]),
         2 => u32::from(u16::from_le_bytes([buf[offset], buf[offset + 1]])),
         3 => {
@@ -115,8 +118,10 @@ fn read_pixel(buf: &[u8], offset: usize, pixel_size: usize) -> u32 {
                 | (u32::from(buf[offset + 1]) << 8)
                 | (u32::from(buf[offset + 2]) << 16)
         }
-        _ => 0,
-    }
+        // pixel_size is always 1, 2, or 3 from BitsPerPixel::pixel_size()
+        _ => unreachable!(),
+    };
+    Ok(val)
 }
 
 /// Write a pixel value to a byte slice (little-endian).
@@ -134,7 +139,8 @@ fn write_pixel(buf: &mut [u8], offset: usize, pixel_size: usize, value: u32) {
             buf[offset + 1] = (value >> 8) as u8;
             buf[offset + 2] = (value >> 16) as u8;
         }
-        _ => {}
+        // pixel_size is always 1, 2, or 3 from BitsPerPixel::pixel_size()
+        _ => unreachable!(),
     }
 }
 
@@ -176,13 +182,14 @@ impl<'a> StreamReader<'a> {
         Ok(val)
     }
 
-    /// Read a pixel (1, 2, or 3 bytes depending on pixel_size).
+    /// Read a pixel (1, 2, or 3 bytes depending on pixel_size) from the compressed stream.
     #[inline]
     fn read_pixel(&mut self, pixel_size: usize) -> Result<u32, RleError> {
         if self.pos + pixel_size > self.data.len() {
             return Err(RleError::TruncatedStream);
         }
-        let val = read_pixel(self.data, self.pos, pixel_size);
+        // read_pixel won't fail: bounds already checked above
+        let val = read_pixel(self.data, self.pos, pixel_size)?;
         self.pos += pixel_size;
         Ok(val)
     }
@@ -303,7 +310,7 @@ fn write_bg_run(
         if first_line {
             write_pixel(dst, *dest, pixel_size, fg_pel);
         } else {
-            let above = read_pixel(dst, *dest - row_delta, pixel_size);
+            let above = read_pixel(dst, *dest - row_delta, pixel_size)?;
             write_pixel(dst, *dest, pixel_size, above ^ fg_pel);
         }
         *dest += pixel_size;
@@ -318,7 +325,7 @@ fn write_bg_run(
             // Black pixel = 0
             write_pixel(dst, *dest, pixel_size, 0);
         } else {
-            let above = read_pixel(dst, *dest - row_delta, pixel_size);
+            let above = read_pixel(dst, *dest - row_delta, pixel_size)?;
             write_pixel(dst, *dest, pixel_size, above);
         }
         *dest += pixel_size;
@@ -344,7 +351,7 @@ fn write_fg_run(
         if first_line {
             write_pixel(dst, *dest, pixel_size, fg_pel);
         } else {
-            let above = read_pixel(dst, *dest - row_delta, pixel_size);
+            let above = read_pixel(dst, *dest - row_delta, pixel_size)?;
             write_pixel(dst, *dest, pixel_size, above ^ fg_pel);
         }
         *dest += pixel_size;
@@ -379,7 +386,7 @@ fn write_fgbg_image(
                 if first_line {
                     write_pixel(dst, *dest, pixel_size, fg_pel);
                 } else {
-                    let above = read_pixel(dst, *dest - row_delta, pixel_size);
+                    let above = read_pixel(dst, *dest - row_delta, pixel_size)?;
                     write_pixel(dst, *dest, pixel_size, above ^ fg_pel);
                 }
             } else {
@@ -387,7 +394,7 @@ fn write_fgbg_image(
                 if first_line {
                     write_pixel(dst, *dest, pixel_size, 0);
                 } else {
-                    let above = read_pixel(dst, *dest - row_delta, pixel_size);
+                    let above = read_pixel(dst, *dest - row_delta, pixel_size)?;
                     write_pixel(dst, *dest, pixel_size, above);
                 }
             }
@@ -418,14 +425,14 @@ fn write_fgbg_image_fixed(
             if first_line {
                 write_pixel(dst, *dest, pixel_size, fg_pel);
             } else {
-                let above = read_pixel(dst, *dest - row_delta, pixel_size);
+                let above = read_pixel(dst, *dest - row_delta, pixel_size)?;
                 write_pixel(dst, *dest, pixel_size, above ^ fg_pel);
             }
         } else {
             if first_line {
                 write_pixel(dst, *dest, pixel_size, 0);
             } else {
-                let above = read_pixel(dst, *dest - row_delta, pixel_size);
+                let above = read_pixel(dst, *dest - row_delta, pixel_size)?;
                 write_pixel(dst, *dest, pixel_size, above);
             }
         }
@@ -471,8 +478,13 @@ impl RleDecompressor {
         dst: &mut Vec<u8>,
     ) -> Result<(), RleError> {
         let pixel_size = bpp.pixel_size();
-        let row_delta = width as usize * pixel_size;
-        let total_size = row_delta * height as usize;
+        let row_delta = (width as usize).checked_mul(pixel_size).ok_or(RleError::OutputOverflow)?;
+        let total_size = row_delta.checked_mul(height as usize).ok_or(RleError::OutputOverflow)?;
+
+        if width == 0 || height == 0 {
+            dst.clear();
+            return Ok(());
+        }
 
         dst.clear();
         dst.resize(total_size, 0);
@@ -484,7 +496,8 @@ impl RleDecompressor {
         let mut first_line = true;
 
         while !reader.is_empty() {
-            // Update first_line flag
+            // Update first_line flag: transitions to false once dest crosses the first scanline.
+            // Placed before header read so each order sees the correct flag for its starting position.
             if first_line && dest >= row_delta {
                 first_line = false;
                 insert_fg_pel = false;
@@ -559,7 +572,7 @@ impl RleDecompressor {
                     insert_fg_pel = false;
                 }
 
-                // 0xA0–0xBF: reserved/undefined
+                // 0xA0–0xBF: reserved/undefined (MS-RDPBCGR §2.2.9.1.1.3.1.2.4 — no order defined)
                 0xA0..=0xBF => {
                     return Err(RleError::UnknownOrderCode(header));
                 }
@@ -767,8 +780,9 @@ impl RleDecompressor {
 }
 
 impl Default for RleDecompressor {
+    #[inline]
     fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 

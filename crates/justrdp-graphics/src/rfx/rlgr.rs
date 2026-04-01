@@ -16,6 +16,15 @@ const DN_GR: i32 = 6;
 const UQ_GR: i32 = 3;
 const DQ_GR: i32 = 3;
 
+/// Initial adaptive state for kp and krp (MS-RDPRFX §3.1.8.1.7.3, initial conditions).
+const INITIAL_KP: i32 = 1 << LSGR;
+
+/// Maximum allowed leading-zero count in GR code to prevent overflow on `vk << kr`.
+/// With kr max = KPMAX >> LSGR = 10, `vk << 10` overflows u32 when vk >= 2^22 = 4_194_304.
+/// We use 2^22 - 1 as the bound, which is far beyond any legitimate coefficient value
+/// (max 2MagSign for i16 is 65535, so max vk with kr=0 is 65535).
+const MAX_GR_LEADING_ZEROS: u32 = (1 << 22) - 1;
+
 /// RLGR mode selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RlgrMode {
@@ -154,9 +163,9 @@ impl RlgrDecoder {
         let mut reader = BitReader::new(data);
         let mut output = Vec::with_capacity(num_values);
 
-        // Initialize state
-        let mut kp: i32 = 1 << LSGR; // kp = 8
-        let mut krp: i32 = 1 << LSGR; // krp = 8
+        // Initialize adaptive state (MS-RDPRFX §3.1.8.1.7.3, initial conditions)
+        let mut kp: i32 = INITIAL_KP;
+        let mut krp: i32 = INITIAL_KP;
 
         while output.len() < num_values {
             let k = kp >> LSGR;
@@ -170,6 +179,9 @@ impl RlgrDecoder {
             }
         }
 
+        // Safety net: truncate is a no-op in normal paths since the while loop
+        // terminates at exactly num_values, but guards against any edge case
+        // where RL/GR mode functions overshoot by a single value.
         output.truncate(num_values);
         Ok(output)
     }
@@ -276,10 +288,14 @@ impl RlgrDecoder {
     /// (MS-RDPRFX §3.1.8.1.7.3: leading 0-bits terminated by a 1-bit.)
     fn decode_gr_code(&self, reader: &mut BitReader<'_>, krp: &mut i32) -> u32 {
         let kr = (*krp >> LSGR) as u32;
+        debug_assert!(kr <= 10, "kr out of expected range: {kr}");
 
-        // Count leading 0-bits (terminated by a 1-bit)
+        // Count leading 0-bits (terminated by a 1-bit).
+        // Bound vk to prevent overflow on `vk << kr` with malformed streams.
+        // With kr max = 10, vk must be < 2^(32-10) = 4M to avoid shift overflow.
+        // MAX_GR_LEADING_ZEROS (32) is a conservative safety limit.
         let mut vk: u32 = 0;
-        while reader.bits_remaining() > 0 {
+        while reader.bits_remaining() > 0 && vk < MAX_GR_LEADING_ZEROS {
             let bit = reader.read_bit();
             if bit == 0 {
                 vk += 1;
@@ -290,7 +306,13 @@ impl RlgrDecoder {
 
         // Read kr bits as remainder
         let remainder = reader.read_bits(kr);
-        let mag = (vk << kr) | remainder;
+        // vk is capped at MAX_GR_LEADING_ZEROS (32) and kr <= 10.
+        // For vk < 22 and kr <= 10: vk << kr fits u32. For larger vk (malformed stream),
+        // use checked_shl to saturate instead of wrapping.
+        let mag = match vk.checked_shl(kr) {
+            Some(shifted) => shifted | remainder,
+            None => u32::MAX,
+        };
 
         // Update krp (MS-RDPRFX §3.1.8.1.7.3)
         if vk == 0 {
@@ -382,8 +404,9 @@ impl RlgrEncoder {
     /// Encode signed coefficients into an RLGR bitstream.
     pub fn encode(&self, values: &[i16]) -> Vec<u8> {
         let mut writer = BitWriter::new();
-        let mut kp: i32 = 1 << LSGR; // kp = 8
-        let mut krp: i32 = 1 << LSGR; // krp = 8
+        // Initialize adaptive state (MS-RDPRFX §3.1.8.1.7.3, initial conditions)
+        let mut kp: i32 = INITIAL_KP;
+        let mut krp: i32 = INITIAL_KP;
         let mut pos = 0;
 
         while pos < values.len() {
@@ -471,6 +494,9 @@ impl RlgrEncoder {
             }
             RlgrMode::Rlgr3 => {
                 let val1 = values[pos];
+                // For odd-length input, pad val2 with 0. The decoder only pushes val2
+                // if output.len() < max_values, so this trailing zero is silently discarded
+                // on decode, preserving the original odd-length sequence.
                 let val2 = if pos + 1 < values.len() { values[pos + 1] } else { 0 };
 
                 let two_ms1 = get_2mag_sign(val1);

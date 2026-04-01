@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! RDP 6.0 Planar Bitmap Codec (MS-RDPEGDI §3.1.9).
+//! RDP 6.0 Planar Bitmap Codec.
 //!
-//! Decompresses planar-encoded bitmaps where each color plane (A, R, G, B)
+//! - Decoder: MS-RDPEGDI §3.1.9
+//! - Encoder: MS-RDPEGDI §3.1.9.2
+//!
+//! Decompresses/compresses planar-encoded bitmaps where each color plane (A, R, G, B)
 //! is stored separately with optional RLE compression and delta encoding.
 
 use alloc::vec;
@@ -22,7 +25,7 @@ pub const FORMAT_HEADER_NA: u8 = 0x20;
 
 // ── Error type ──
 
-/// Planar codec decompression error.
+/// Planar codec error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanarError {
     /// Compressed stream ended unexpectedly.
@@ -33,6 +36,8 @@ pub enum PlanarError {
     InvalidFormatHeader(u8),
     /// Decompressed output exceeds the expected buffer size.
     OutputOverflow,
+    /// Input buffer is too small for the given dimensions.
+    InputTooSmall,
 }
 
 impl fmt::Display for PlanarError {
@@ -42,11 +47,15 @@ impl fmt::Display for PlanarError {
             Self::InvalidControlByte => write!(f, "Planar: zero control byte"),
             Self::InvalidFormatHeader(h) => write!(f, "Planar: invalid format header 0x{h:02X}"),
             Self::OutputOverflow => write!(f, "Planar: output buffer overflow"),
+            Self::InputTooSmall => write!(f, "Planar: input buffer too small"),
         }
     }
 }
 
-// ── Stream reader (reusable helper) ──
+// ── Stream reader ──
+// NOTE: intentionally duplicated from rle.rs — each module uses its own error type,
+// and the methods differ (rle needs read_pixel/read_u16_le, planar needs read_exact).
+// A generic StreamReader adds complexity without meaningful deduplication.
 
 struct StreamReader<'a> {
     data: &'a [u8],
@@ -315,15 +324,16 @@ impl PlanarDecompressor {
     ) -> Result<(), PlanarError> {
         let w = width as usize;
         let h = height as usize;
-        let pixel_count = w * h;
-        let total_output = pixel_count * 4;
+        let pixel_count = w.checked_mul(h).ok_or(PlanarError::OutputOverflow)?;
+        let total_output = pixel_count.checked_mul(4).ok_or(PlanarError::OutputOverflow)?;
+
+        if pixel_count == 0 {
+            dst.clear();
+            return Ok(());
+        }
 
         dst.clear();
         dst.resize(total_output, 0);
-
-        if pixel_count == 0 {
-            return Ok(());
-        }
 
         let mut reader = StreamReader::new(src);
 
@@ -334,7 +344,8 @@ impl PlanarDecompressor {
         let rle = format_header & FORMAT_HEADER_RLE != 0;
         let na = format_header & FORMAT_HEADER_NA != 0;
 
-        // Validate: CS requires CLL > 0
+        // Validate: CS requires CLL > 0 (MS-RDPEGDI §2.2.2.5.1).
+        // CS=1 with CLL=0 is undefined — chroma subsampling without color loss makes no sense.
         if cs && cll == 0 {
             return Err(PlanarError::InvalidFormatHeader(format_header));
         }
@@ -397,7 +408,9 @@ impl PlanarDecompressor {
                 plane4_raw
             };
 
-            // Color Loss Reduction inverse: left-shift by CLL
+            // Color Loss Reduction inverse: left-shift by CLL.
+            // Co and Cg are stored as signed bytes; interpret via i8 to preserve sign
+            // before widening to i16 for the shift and subsequent color conversion.
             let mut co_plane = vec![0i16; pixel_count];
             let mut cg_plane = vec![0i16; pixel_count];
             for i in 0..pixel_count {
@@ -466,12 +479,14 @@ fn encode_plane_rle(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>
         return;
     }
 
+    // Reuse a single scratch buffer across all scanlines to avoid per-row allocation.
+    let mut values = Vec::with_capacity(width);
+
     for row in 0..height {
         let row_start = row * width;
         let is_first_row = row == 0;
 
-        // Build the values to encode for this scanline
-        let mut values = Vec::with_capacity(width);
+        values.clear();
         for col in 0..width {
             let idx = row_start + col;
             if is_first_row {
@@ -484,7 +499,6 @@ fn encode_plane_rle(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>
             }
         }
 
-        // Encode values into RLE segments
         encode_scanline_rle(&values, out);
     }
 }
@@ -548,7 +562,8 @@ fn encode_scanline_rle(values: &[u8], out: &mut Vec<u8>) {
 /// Each segment must include at least 1 raw byte to establish the run
 /// value, because the decoder resets the base value per segment.
 /// Extended run modes (nRunLength=1,2) use base value 0, so they are
-/// only used when the value IS 0.
+/// only used when value==0. This covers both absolute 0 (first row)
+/// and delta=0 (copy from above on subsequent rows).
 fn emit_run_segments(value: u8, mut run_len: usize, out: &mut Vec<u8>) {
     while run_len > 0 {
         if value == 0 && run_len >= 16 {
@@ -599,6 +614,12 @@ pub struct PlanarCompressor {
     config: PlanarEncoderConfig,
 }
 
+impl Default for PlanarCompressor {
+    fn default() -> Self {
+        Self::new(PlanarEncoderConfig::default())
+    }
+}
+
 impl PlanarCompressor {
     /// Create a new Planar compressor with the given configuration.
     pub fn new(config: PlanarEncoderConfig) -> Self {
@@ -624,10 +645,11 @@ impl PlanarCompressor {
     ) -> Result<Vec<u8>, PlanarError> {
         let w = width as usize;
         let h = height as usize;
-        let pixel_count = w * h;
+        let pixel_count = w.checked_mul(h).ok_or(PlanarError::OutputOverflow)?;
+        let required_len = pixel_count.checked_mul(4).ok_or(PlanarError::OutputOverflow)?;
 
-        if bgra.len() < pixel_count * 4 {
-            return Err(PlanarError::OutputOverflow);
+        if bgra.len() < required_len {
+            return Err(PlanarError::InputTooSmall);
         }
 
         let mut out = Vec::new();
@@ -1609,7 +1631,7 @@ mod tests {
     fn compress_input_too_small() {
         let enc = PlanarCompressor::new(PlanarEncoderConfig::default());
         let result = enc.compress(&[0u8; 4], 2, 1);
-        assert_eq!(result, Err(PlanarError::OutputOverflow));
+        assert_eq!(result, Err(PlanarError::InputTooSmall));
     }
 
     // ── Raw mode with alpha ──

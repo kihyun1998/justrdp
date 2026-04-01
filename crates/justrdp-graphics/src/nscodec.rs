@@ -5,16 +5,20 @@
 //! Decodes NSCodec-compressed bitmaps using AYCoCg color space with
 //! per-channel RLE compression and optional chroma subsampling.
 
+use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
 // ── Constants ──
 
-/// Fixed header size: 4×u32 + u8 + u8 + u16 = 20 bytes.
+/// Fixed header size (MS-RDPNSC §2.2.1):
+/// LumaPlaneByteCount(4) + OrangeChromaPlaneByteCount(4) +
+/// GreenChromaPlaneByteCount(4) + AlphaPlaneByteCount(4) +
+/// ColorLossLevel(1) + ChromaSubsamplingLevel(1) + Reserved(2) = 20 bytes.
 const STREAM_HEADER_SIZE: usize = 20;
 
-/// EndData size at the end of each RLE-compressed plane.
+/// EndData size at the end of each RLE-compressed plane (MS-RDPNSC §2.2.2.1).
 const ENDDATA_SIZE: usize = 4;
 
 // ── Error type ──
@@ -102,19 +106,24 @@ fn round_up_2(n: usize) -> usize {
 }
 
 /// Compute expected raw plane sizes.
+///
+/// Returns `(luma_w, luma_h, chroma_w, chroma_h, expected_luma, expected_chroma)`.
+/// Uses checked arithmetic to prevent overflow on 32-bit targets.
 fn plane_dimensions(
     width: usize,
     height: usize,
     subsampling: bool,
-) -> (usize, usize, usize, usize, usize, usize) {
-    // (luma_w, luma_h, chroma_w, chroma_h, expected_luma, expected_chroma)
+) -> Result<(usize, usize, usize, usize, usize, usize), NsCodecError> {
     if subsampling {
         let luma_w = round_up_8(width);
         let chroma_w = luma_w / 2;
         let chroma_h = round_up_2(height) / 2;
-        (luma_w, height, chroma_w, chroma_h, luma_w * height, chroma_w * chroma_h)
+        let expected_luma = luma_w.checked_mul(height).ok_or(NsCodecError::TruncatedStream)?;
+        let expected_chroma = chroma_w.checked_mul(chroma_h).ok_or(NsCodecError::TruncatedStream)?;
+        Ok((luma_w, height, chroma_w, chroma_h, expected_luma, expected_chroma))
     } else {
-        (width, height, width, height, width * height, width * height)
+        let expected = width.checked_mul(height).ok_or(NsCodecError::TruncatedStream)?;
+        Ok((width, height, width, height, expected, expected))
     }
 }
 
@@ -136,19 +145,20 @@ fn decode_plane_rle(src: &[u8], expected_size: usize) -> Result<Vec<u8>, NsCodec
     let mut pos = 0;
 
     while pos < segments_end {
-        // Check if this is a run segment: byte[0] == byte[1]
+        // Check if this is a run segment: byte[0] == byte[1].
+        // When only 1 byte remains before EndData, it is always a literal.
         if pos + 1 < segments_end && src[pos] == src[pos + 1] {
-            // Run segment
-            let run_value = src[pos];
-            if pos + 2 >= segments_end {
+            // Run segment: need at least 3 bytes (value, value, factor1)
+            if pos + 3 > src.len() {
                 return Err(NsCodecError::TruncatedStream);
             }
+            let run_value = src[pos];
             let factor1 = src[pos + 2];
 
             let run_length;
             if factor1 == 0xFF {
-                // Long run: read u32 LE
-                if pos + 6 >= segments_end {
+                // Long run: need 7 bytes total (value, value, 0xFF, u32_le)
+                if pos + 7 > src.len() {
                     return Err(NsCodecError::TruncatedStream);
                 }
                 run_length = u32::from_le_bytes([
@@ -164,9 +174,12 @@ fn decode_plane_rle(src: &[u8], expected_size: usize) -> Result<Vec<u8>, NsCodec
                 pos += 3;
             }
 
-            for _ in 0..run_length {
-                output.push(run_value);
+            // Guard: reject runs that would exceed the expected plane size
+            if output.len() + run_length > expected_size {
+                return Err(NsCodecError::RleOutputMismatch);
             }
+            let new_len = output.len() + run_length;
+            output.resize(new_len, run_value);
         } else {
             // Literal segment: single byte
             output.push(src[pos]);
@@ -224,7 +237,7 @@ fn clamp_u8(val: i16) -> u8 {
 /// NSCodec bitmap decompressor (MS-RDPNSC).
 ///
 /// Stateless: each call to [`decompress`](Self::decompress) is independent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NsCodecDecompressor;
 
 impl NsCodecDecompressor {
@@ -250,15 +263,16 @@ impl NsCodecDecompressor {
     ) -> Result<(), NsCodecError> {
         let w = width as usize;
         let h = height as usize;
-        let pixel_count = w * h;
-        let total_output = pixel_count * 4;
+        let pixel_count = w.checked_mul(h).ok_or(NsCodecError::TruncatedStream)?;
+        let total_output = pixel_count.checked_mul(4).ok_or(NsCodecError::TruncatedStream)?;
+
+        if pixel_count == 0 {
+            dst.clear();
+            return Ok(());
+        }
 
         dst.clear();
         dst.resize(total_output, 0);
-
-        if pixel_count == 0 {
-            return Ok(());
-        }
 
         // Step 1: Parse header
         let header = parse_header(src)?;
@@ -266,7 +280,7 @@ impl NsCodecDecompressor {
 
         // Compute expected sizes
         let (luma_w, _luma_h, chroma_w, chroma_h, expected_luma, expected_chroma) =
-            plane_dimensions(w, h, header.chroma_subsampling);
+            plane_dimensions(w, h, header.chroma_subsampling)?;
         let expected_alpha = pixel_count;
 
         // Validate byte counts
@@ -283,11 +297,14 @@ impl NsCodecDecompressor {
             return Err(NsCodecError::PlaneByteCountTooLarge);
         }
 
-        // Step 2: Decode each plane
+        // Step 2: Decode each plane — use checked_add to prevent overflow on 32-bit targets
         let luma_end = header.luma_byte_count as usize;
-        let co_end = luma_end + header.orange_chroma_byte_count as usize;
-        let cg_end = co_end + header.green_chroma_byte_count as usize;
-        let alpha_end = cg_end + header.alpha_byte_count as usize;
+        let co_end = luma_end.checked_add(header.orange_chroma_byte_count as usize)
+            .ok_or(NsCodecError::TruncatedStream)?;
+        let cg_end = co_end.checked_add(header.green_chroma_byte_count as usize)
+            .ok_or(NsCodecError::TruncatedStream)?;
+        let alpha_end = cg_end.checked_add(header.alpha_byte_count as usize)
+            .ok_or(NsCodecError::TruncatedStream)?;
 
         if alpha_end > data.len() {
             return Err(NsCodecError::TruncatedStream);
@@ -302,21 +319,22 @@ impl NsCodecDecompressor {
             None
         };
 
-        // Decode planes (raw or RLE)
+        // Decode planes (raw or RLE). Cow::Borrowed for raw, Cow::Owned for RLE.
         let y_plane = decode_plane(luma_data, expected_luma)?;
         let co_plane_raw = decode_plane(co_data, expected_chroma)?;
         let cg_plane_raw = decode_plane(cg_data, expected_chroma)?;
-        let alpha_plane = if let Some(ad) = alpha_data {
+        let alpha_plane: Cow<'_, [u8]> = if let Some(ad) = alpha_data {
             decode_plane(ad, expected_alpha)?
         } else {
-            vec![0xFF; expected_alpha]
+            Cow::Owned(vec![0xFF; expected_alpha])
         };
 
         // Step 3: Chroma super-sampling (if active)
-        let (co_full, cg_full) = if header.chroma_subsampling {
+        // super_sample returns Vec, so we use Cow::Owned for the upsampled path.
+        let (co_full, cg_full): (Cow<'_, [u8]>, Cow<'_, [u8]>) = if header.chroma_subsampling {
             let co = super_sample(&co_plane_raw, chroma_w, chroma_h, luma_w, h);
             let cg = super_sample(&cg_plane_raw, chroma_w, chroma_h, luma_w, h);
-            (co, cg)
+            (Cow::Owned(co), Cow::Owned(cg))
         } else {
             (co_plane_raw, cg_plane_raw)
         };
@@ -335,12 +353,13 @@ impl NsCodecDecompressor {
                 };
 
                 let y = y_plane[plane_idx] as i16;
+                // co_full/cg_full are luma_w-wide when subsampling, w-wide otherwise.
                 // Color loss recovery: treat as signed i8 then left-shift
                 let co = (co_full[plane_idx] as i8 as i16) << cll;
                 let cg = (cg_full[plane_idx] as i8 as i16) << cll;
                 let a = alpha_plane[pixel_idx];
 
-                // AYCoCg → RGB (MS-RDPEGDI §3.1.9.1.2)
+                // AYCoCg → RGB (MS-RDPNSC §3.1.8.2.1)
                 let r = clamp_u8(y + (co >> 1) - (cg >> 1));
                 let g = clamp_u8(y + (cg >> 1));
                 let b = clamp_u8(y - (co >> 1) - (cg >> 1));
@@ -358,13 +377,16 @@ impl NsCodecDecompressor {
 }
 
 /// Decode a single plane: raw if byte_count == expected_size, else RLE.
-fn decode_plane(data: &[u8], expected_size: usize) -> Result<Vec<u8>, NsCodecError> {
+///
+/// Returns `Cow::Borrowed` for raw planes (avoiding a copy) and
+/// `Cow::Owned` for RLE-decompressed planes.
+fn decode_plane<'a>(data: &'a [u8], expected_size: usize) -> Result<Cow<'a, [u8]>, NsCodecError> {
     if data.len() == expected_size {
-        // Raw plane
-        Ok(data.to_vec())
+        // Raw plane — borrow directly, no allocation
+        Ok(Cow::Borrowed(data))
     } else {
         // RLE compressed
-        decode_plane_rle(data, expected_size)
+        Ok(Cow::Owned(decode_plane_rle(data, expected_size)?))
     }
 }
 
@@ -380,7 +402,7 @@ impl Default for NsCodecDecompressor {
 mod tests {
     use super::*;
 
-    fn decompress(src: &[u8], w: u16, h: u16) -> Result<Vec<u8>, NsCodecError> {
+    fn run_decompress(src: &[u8], w: u16, h: u16) -> Result<Vec<u8>, NsCodecError> {
         let decoder = NsCodecDecompressor::new();
         let mut dst = Vec::new();
         decoder.decompress(src, w, h, &mut dst)?;
@@ -499,7 +521,7 @@ mod tests {
 
     #[test]
     fn plane_dimensions_no_subsampling() {
-        let (lw, lh, cw, ch, el, ec) = plane_dimensions(15, 10, false);
+        let (lw, lh, cw, ch, el, ec) = plane_dimensions(15, 10, false).unwrap();
         assert_eq!((lw, lh), (15, 10));
         assert_eq!((cw, ch), (15, 10));
         assert_eq!(el, 150);
@@ -508,7 +530,7 @@ mod tests {
 
     #[test]
     fn plane_dimensions_with_subsampling() {
-        let (lw, lh, cw, ch, el, ec) = plane_dimensions(15, 10, true);
+        let (lw, lh, cw, ch, el, ec) = plane_dimensions(15, 10, true).unwrap();
         assert_eq!(lw, 16); // round_up_8(15)
         assert_eq!(lh, 10);
         assert_eq!(cw, 8);  // 16 / 2
@@ -537,7 +559,7 @@ mod tests {
         src.push(0);   // Co
         src.push(0);   // Cg
 
-        let result = decompress(&src, 1, 1).unwrap();
+        let result = run_decompress(&src, 1, 1).unwrap();
         // Y=128, Co=0<<1=0, Cg=0<<1=0 → R=128, G=128, B=128
         assert_eq!(result[0], 128); // B
         assert_eq!(result[1], 128); // G
@@ -559,7 +581,7 @@ mod tests {
         src.push(0);
         src.extend_from_slice(&[0, 0]);
 
-        let result = decompress(&src, 0, 0).unwrap();
+        let result = run_decompress(&src, 0, 0).unwrap();
         assert!(result.is_empty());
     }
 
@@ -567,7 +589,7 @@ mod tests {
 
     #[test]
     fn truncated_header() {
-        let result = decompress(&[0; 10], 1, 1);
+        let result = run_decompress(&[0; 10], 1, 1);
         assert_eq!(result, Err(NsCodecError::TruncatedStream));
     }
 
@@ -575,7 +597,7 @@ mod tests {
 
     #[test]
     fn rle_spec_vector_orange_chroma() {
-        // MS-RDPNSC §4: Orange Chroma plane, 7 bytes → 40 bytes output
+        // MS-RDPNSC §4.1: Orange Chroma plane, 7 bytes → 40 bytes output
         // [0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22]
         // Run: [0x22, 0x22, 0x22] → factor1=0x22=34, run=36
         // EndData: [0x22, 0x22, 0x22, 0x22]
@@ -587,7 +609,7 @@ mod tests {
 
     #[test]
     fn rle_spec_vector_green_chroma() {
-        // MS-RDPNSC §4: Green Chroma, 11 bytes → 40 bytes
+        // MS-RDPNSC §4.1: Green Chroma, 11 bytes → 40 bytes
         // [0x37, 0x37, 0x19, 0x36, 0x37, 0x37, 0x06, 0x37, 0x37, 0x37, 0x37]
         // Run: [0x37, 0x37, 0x19] → factor1=0x19=25, run=27
         // Literal: [0x36]
@@ -605,7 +627,7 @@ mod tests {
 
     #[test]
     fn rle_spec_vector_alpha() {
-        // MS-RDPNSC §4: Alpha, 7 bytes → 150 bytes
+        // MS-RDPNSC §4.1: Alpha, 7 bytes → 150 bytes
         // [0xFF, 0xFF, 0x90, 0xFF, 0xFF, 0xFF, 0xFF]
         // Run: [0xFF, 0xFF, 0x90] → factor1=0x90=144, run=146
         // EndData: [0xFF, 0xFF, 0xFF, 0xFF]
@@ -628,7 +650,7 @@ mod tests {
         src.push(0);
         src.extend_from_slice(&[0, 0]);
 
-        let result = decompress(&src, 1, 1);
+        let result = run_decompress(&src, 1, 1);
         assert_eq!(result, Err(NsCodecError::PlaneByteCountTooLarge));
     }
 
@@ -649,7 +671,7 @@ mod tests {
         src.push(0);   // Cg
         src.push(0x80); // Alpha = 128
 
-        let result = decompress(&src, 1, 1).unwrap();
+        let result = run_decompress(&src, 1, 1).unwrap();
         assert_eq!(result[3], 0x80); // A=128
     }
 
@@ -672,7 +694,7 @@ mod tests {
         src.extend_from_slice(&[0x10, 0x00]);    // Co
         src.extend_from_slice(&[0x20, 0x00]);    // Cg
 
-        let result = decompress(&src, 2, 1).unwrap();
+        let result = run_decompress(&src, 2, 1).unwrap();
         assert_eq!(result[0], 80);   // pixel0 B
         assert_eq!(result[1], 160);  // pixel0 G
         assert_eq!(result[2], 112);  // pixel0 R
@@ -699,7 +721,7 @@ mod tests {
         src.extend(core::iter::repeat(0u8).take(chroma_count));
         src.extend(core::iter::repeat(0u8).take(chroma_count));
 
-        let result = decompress(&src, 2, 2).unwrap();
+        let result = run_decompress(&src, 2, 2).unwrap();
         for px in 0..4 {
             assert_eq!(result[px * 4], 100, "pixel {px} B");
             assert_eq!(result[px * 4 + 1], 100, "pixel {px} G");
@@ -723,7 +745,7 @@ mod tests {
         src.extend(core::iter::repeat(0u8).take(10)); // Co
         src.extend(core::iter::repeat(0u8).take(10)); // Cg
 
-        let result = decompress(&src, 10, 1).unwrap();
+        let result = run_decompress(&src, 10, 1).unwrap();
         for px in 0..10 {
             assert_eq!(result[px * 4 + 2], 0xAA, "pixel {px} R");
         }
@@ -741,7 +763,7 @@ mod tests {
         src.push(7); src.push(0); src.extend_from_slice(&[0, 0]);
         src.push(200); src.push(0x01); src.push(0x01);
 
-        let result = decompress(&src, 1, 1).unwrap();
+        let result = run_decompress(&src, 1, 1).unwrap();
         assert_eq!(result[0], 72);   // B
         assert_eq!(result[1], 255);  // G (saturated)
         assert_eq!(result[2], 200);  // R
@@ -766,7 +788,7 @@ mod tests {
         src.extend(core::iter::repeat(0u8).take(chroma_count));
         src.extend(core::iter::repeat(0u8).take(chroma_count));
 
-        let result = decompress(&src, 3, 2).unwrap();
+        let result = run_decompress(&src, 3, 2).unwrap();
         let expected_y = [10u8, 20, 30, 40, 50, 60];
         for (px, &y) in expected_y.iter().enumerate() {
             assert_eq!(result[px * 4 + 2], y, "pixel {px} R");

@@ -8,19 +8,19 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-// ── Constants ──
+// ── Constants (MS-RDPEGFX §2.2.4.1) ──
 
-const FLAG_GLYPH_INDEX: u8 = 0x01;
-const FLAG_GLYPH_HIT: u8 = 0x02;
-const FLAG_CACHE_RESET: u8 = 0x04;
+const FLAG_GLYPH_INDEX: u8 = 0x01;  // MS-RDPEGFX §2.2.4.1 — CLEARCODEC_FLAG_GLYPH_INDEX
+const FLAG_GLYPH_HIT: u8 = 0x02;    // MS-RDPEGFX §2.2.4.1 — CLEARCODEC_FLAG_GLYPH_HIT
+const FLAG_CACHE_RESET: u8 = 0x04;   // MS-RDPEGFX §2.2.4.1 — CLEARCODEC_FLAG_CACHE_RESET
 
-const MAX_GLYPH_INDEX: u16 = 3999;
+const MAX_GLYPH_INDEX: u16 = 3999;   // MS-RDPEGFX §2.2.4.1
 const GLYPH_STORAGE_SIZE: usize = 4000;
-const VBAR_STORAGE_SIZE: usize = 32768;
-const SHORT_VBAR_STORAGE_SIZE: usize = 16384;
-const MAX_BAND_HEIGHT: usize = 52;
+const VBAR_STORAGE_SIZE: usize = 32768;       // MS-RDPEGFX §2.2.4.1.1.2
+const SHORT_VBAR_STORAGE_SIZE: usize = 16384; // MS-RDPEGFX §2.2.4.1.1.2
+const MAX_BAND_HEIGHT: usize = 52;            // MS-RDPEGFX §2.2.4.1.1.2
 
-const COMPOSITE_HEADER_SIZE: usize = 12;
+const COMPOSITE_HEADER_SIZE: usize = 12; // MS-RDPEGFX §2.2.4.1.1
 
 // ── Error type ──
 
@@ -31,9 +31,13 @@ pub enum ClearCodecError {
     InvalidFlags(u8),
     InvalidGlyphIndex(u16),
     EmptyGlyphSlot(u16),
+    EmptyVBarSlot(u16),
     InvalidRunLength,
+    InvalidBandCoordinates,
     BandHeightExceeded,
     InvalidSubCodecId(u8),
+    InvalidRlexPaletteCount(u8),
+    InvalidRlexIndex,
     BitmapDataTooLarge,
     InvalidShortVBar,
     OutputOverflow,
@@ -46,9 +50,13 @@ impl fmt::Display for ClearCodecError {
             Self::InvalidFlags(v) => write!(f, "ClearCodec: invalid flags 0x{v:02X}"),
             Self::InvalidGlyphIndex(v) => write!(f, "ClearCodec: invalid glyph index {v}"),
             Self::EmptyGlyphSlot(v) => write!(f, "ClearCodec: empty glyph slot {v}"),
+            Self::EmptyVBarSlot(v) => write!(f, "ClearCodec: empty VBar slot {v}"),
             Self::InvalidRunLength => write!(f, "ClearCodec: invalid run length (zero)"),
+            Self::InvalidBandCoordinates => write!(f, "ClearCodec: invalid band coordinates"),
             Self::BandHeightExceeded => write!(f, "ClearCodec: band height > 52"),
             Self::InvalidSubCodecId(v) => write!(f, "ClearCodec: invalid subcodec ID {v}"),
+            Self::InvalidRlexPaletteCount(v) => write!(f, "ClearCodec: invalid RLEX palette count {v}"),
+            Self::InvalidRlexIndex => write!(f, "ClearCodec: invalid RLEX stop/suite index"),
             Self::BitmapDataTooLarge => write!(f, "ClearCodec: bitmap data too large"),
             Self::InvalidShortVBar => write!(f, "ClearCodec: invalid short VBar"),
             Self::OutputOverflow => write!(f, "ClearCodec: output overflow"),
@@ -59,7 +67,10 @@ impl fmt::Display for ClearCodecError {
 // ── Run-length decoding (shared by residual and RLEX) ──
 
 /// Read a ClearCodec run-length factor (1, 3, or 7 bytes).
-fn read_run_length(src: &[u8], pos: &mut usize) -> Result<u32, ClearCodecError> {
+///
+/// When `allow_zero` is false, a decoded run length of 0 returns `InvalidRunLength`.
+/// RLEX subcodec uses `allow_zero = true` because run_length=0 means "suite only, no run".
+fn read_run_length(src: &[u8], pos: &mut usize, allow_zero: bool) -> Result<u32, ClearCodecError> {
     if *pos >= src.len() {
         return Err(ClearCodecError::TruncatedStream);
     }
@@ -67,7 +78,7 @@ fn read_run_length(src: &[u8], pos: &mut usize) -> Result<u32, ClearCodecError> 
     *pos += 1;
 
     if factor1 < 0xFF {
-        if factor1 == 0 {
+        if factor1 == 0 && !allow_zero {
             return Err(ClearCodecError::InvalidRunLength);
         }
         return Ok(factor1 as u32);
@@ -81,7 +92,7 @@ fn read_run_length(src: &[u8], pos: &mut usize) -> Result<u32, ClearCodecError> 
     *pos += 2;
 
     if factor2 < 0xFFFF {
-        if factor2 == 0 {
+        if factor2 == 0 && !allow_zero {
             return Err(ClearCodecError::InvalidRunLength);
         }
         return Ok(factor2 as u32);
@@ -94,7 +105,7 @@ fn read_run_length(src: &[u8], pos: &mut usize) -> Result<u32, ClearCodecError> 
     let factor3 = u32::from_le_bytes([src[*pos], src[*pos + 1], src[*pos + 2], src[*pos + 3]]);
     *pos += 4;
 
-    if factor3 == 0 {
+    if factor3 == 0 && !allow_zero {
         return Err(ClearCodecError::InvalidRunLength);
     }
     Ok(factor3)
@@ -148,7 +159,7 @@ fn decode_residual(
         let r = data[pos + 2];
         pos += 3;
 
-        let run_length = read_run_length(data, &mut pos)? as usize;
+        let run_length = read_run_length(data, &mut pos, false)? as usize;
 
         for _ in 0..run_length {
             if pixel_pos >= pixel_count {
@@ -190,7 +201,7 @@ fn decode_bands(
         let red_bkg = read_u8(data, &mut pos)?;
 
         if x_end < x_start {
-            return Err(ClearCodecError::TruncatedStream);
+            return Err(ClearCodecError::InvalidBandCoordinates);
         }
         if y_end < y_start || (y_end - y_start + 1) > MAX_BAND_HEIGHT {
             return Err(ClearCodecError::BandHeightExceeded);
@@ -207,12 +218,13 @@ fn decode_bands(
 
             // Determine VBar type from bit pattern
             if header_word & 0x8000 != 0 {
-                // VBAR_CACHE_HIT: bit 15 = 1
+                // VBAR_CACHE_HIT: bit 15 = 1 (MS-RDPEGFX §2.2.4.1.1.2)
                 let vbar_index = (header_word & 0x7FFF) as usize;
-                if vbar_index < vbar_storage.len() && !vbar_storage[vbar_index].is_empty() {
-                    let vbar = &vbar_storage[vbar_index];
-                    write_vbar_to_output(output, width, x_pos, y_start, band_height, vbar);
+                if vbar_index >= vbar_storage.len() || vbar_storage[vbar_index].is_empty() {
+                    return Err(ClearCodecError::EmptyVBarSlot(vbar_index as u16));
                 }
+                let vbar = &vbar_storage[vbar_index];
+                write_vbar_to_output(output, width, x_pos, y_start, band_height, vbar);
                 // No cursor update on cache hit
             } else if header_word & 0xC000 == 0x4000 {
                 // SHORT_VBAR_CACHE_HIT: bits[15:14] = 0b01
@@ -258,14 +270,7 @@ fn decode_bands(
                 let short_pixels = data[pos..pos + short_byte_count].to_vec();
                 pos += short_byte_count;
 
-                // Store short VBar
-                let short_cursor = *short_vbar_cursor as usize;
-                if short_cursor < short_vbar_storage.len() {
-                    short_vbar_storage[short_cursor] = short_pixels.clone();
-                }
-                *short_vbar_cursor = ((*short_vbar_cursor) + 1) % SHORT_VBAR_STORAGE_SIZE as u16;
-
-                // Reconstruct full VBar
+                // Reconstruct full VBar (before moving short_pixels into storage)
                 let full_vbar = build_full_vbar(
                     &short_pixels,
                     short_vbar_y_on,
@@ -276,6 +281,13 @@ fn decode_bands(
                 );
 
                 write_vbar_to_output(output, width, x_pos, y_start, band_height, &full_vbar);
+
+                // Store short VBar (move — no clone needed)
+                let short_cursor = *short_vbar_cursor as usize;
+                if short_cursor < short_vbar_storage.len() {
+                    short_vbar_storage[short_cursor] = short_pixels;
+                }
+                *short_vbar_cursor = ((*short_vbar_cursor) + 1) % SHORT_VBAR_STORAGE_SIZE as u16;
 
                 // Store full VBar
                 let cursor = *vbar_cursor as usize;
@@ -307,6 +319,7 @@ fn reconstruct_vbar_from_short(
     build_full_vbar(short_pixels, short_vbar_y_on, band_height, blue_bkg, green_bkg, red_bkg)
 }
 
+#[inline]
 fn build_full_vbar(
     short_pixels: &[u8],
     short_vbar_y_on: usize,
@@ -337,6 +350,7 @@ fn build_full_vbar(
     full
 }
 
+#[inline]
 fn write_vbar_to_output(
     output: &mut [u8],
     width: usize,
@@ -352,7 +366,7 @@ fn write_vbar_to_output(
         }
         let dst_base = ((y_start + y) * width + x) * 3;
         if dst_base + 3 > output.len() {
-            break;
+            break; // destination out of bounds — stop writing
         }
         output[dst_base] = vbar[src_base];
         output[dst_base + 1] = vbar[src_base + 1];
@@ -377,7 +391,10 @@ fn decode_subcodecs(
         let bitmap_data_byte_count = read_u32_le(data, &mut pos)? as usize;
         let sub_codec_id = read_u8(data, &mut pos)?;
 
-        if bitmap_data_byte_count > 3 * sc_width * sc_height {
+        let max_bitmap_size = sc_width.checked_mul(sc_height)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or(ClearCodecError::BitmapDataTooLarge)?;
+        if bitmap_data_byte_count > max_bitmap_size {
             return Err(ClearCodecError::BitmapDataTooLarge);
         }
         if pos + bitmap_data_byte_count > data.len() {
@@ -465,14 +482,15 @@ fn decode_subcodec_rlex(
     width: usize,
     height: usize,
 ) -> Result<Vec<u8>, ClearCodecError> {
-    let pixel_count = width * height;
-    let mut output = vec![0u8; pixel_count * 3];
+    let pixel_count = width.checked_mul(height).ok_or(ClearCodecError::BitmapDataTooLarge)?;
+    let buf_size = pixel_count.checked_mul(3).ok_or(ClearCodecError::BitmapDataTooLarge)?;
+    let mut output = vec![0u8; buf_size];
     let mut pos = 0;
 
-    // Read palette
+    // Read palette (MS-RDPEGFX §2.2.4.1.1.3.1.1: paletteCount in [1, 127])
     let palette_count = read_u8(data, &mut pos)? as usize;
     if palette_count == 0 || palette_count > 127 {
-        return Err(ClearCodecError::InvalidSubCodecId(0x02)); // reuse error for bad RLEX
+        return Err(ClearCodecError::InvalidRlexPaletteCount(palette_count as u8));
     }
 
     let mut palette = Vec::with_capacity(palette_count);
@@ -484,9 +502,15 @@ fn decode_subcodec_rlex(
         pos += 3;
     }
 
-    // Compute bit widths
+    // Compute bit widths for stop_index extraction.
+    // palette_count is in [1, 127], so palette_count-1 is in [0, 126].
+    // leading_zeros(126) = 25, so stop_index_bits is at most 32-25 = 7.
+    // Guard: if stop_index_bits >= 8, the u8 shift would overflow.
     let stop_index_bits = if palette_count <= 1 { 0 } else { 32 - ((palette_count - 1) as u32).leading_zeros() };
-    let stop_index_mask = (1u8 << stop_index_bits) - 1;
+    if stop_index_bits >= 8 {
+        return Err(ClearCodecError::InvalidRlexPaletteCount(palette_count as u8));
+    }
+    let stop_index_mask = if stop_index_bits == 0 { 0u8 } else { (1u8 << stop_index_bits) - 1 };
 
     let mut pixel_pos = 0;
 
@@ -496,39 +520,16 @@ fn decode_subcodec_rlex(
         let suite_depth = (combined >> stop_index_bits) as usize;
 
         if stop_index >= palette_count {
-            return Err(ClearCodecError::OutputOverflow);
+            return Err(ClearCodecError::InvalidRlexIndex);
         }
         if stop_index < suite_depth {
-            return Err(ClearCodecError::OutputOverflow);
+            return Err(ClearCodecError::InvalidRlexIndex);
         }
         let start_index = stop_index - suite_depth;
 
         // Read run length (0 is valid for RLEX — means no run, just suite)
         let run_length = if pos < data.len() {
-            let factor1 = data[pos];
-            pos += 1;
-            if factor1 == 0 {
-                0u32
-            } else if factor1 < 0xFF {
-                factor1 as u32
-            } else {
-                // Extended
-                if pos + 2 > data.len() {
-                    return Err(ClearCodecError::TruncatedStream);
-                }
-                let factor2 = u16::from_le_bytes([data[pos], data[pos + 1]]);
-                pos += 2;
-                if factor2 < 0xFFFF {
-                    factor2 as u32
-                } else {
-                    if pos + 4 > data.len() {
-                        return Err(ClearCodecError::TruncatedStream);
-                    }
-                    let factor3 = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                    pos += 4;
-                    factor3
-                }
-            }
+            read_run_length(data, &mut pos, true)?
         } else {
             0
         };
@@ -599,7 +600,12 @@ impl ClearCodecDecoder {
     ) -> Result<Vec<u8>, ClearCodecError> {
         let w = width as usize;
         let h = height as usize;
-        let pixel_count = w * h;
+
+        if w == 0 || h == 0 {
+            return Ok(Vec::new());
+        }
+
+        let pixel_count = w.checked_mul(h).ok_or(ClearCodecError::BitmapDataTooLarge)?;
 
         if src.len() < 2 {
             return Err(ClearCodecError::TruncatedStream);
@@ -607,12 +613,14 @@ impl ClearCodecDecoder {
 
         let mut pos = 0;
         let flags = read_u8(src, &mut pos)?;
+        // Sequence number: not used for decoding, consumed to advance the cursor.
         let _seq_number = read_u8(src, &mut pos)?;
 
-        // Cache reset
+        // Cache reset (MS-RDPEGFX §2.2.4): resets VBar caches and glyph cache
         if flags & FLAG_CACHE_RESET != 0 {
             self.vbar_cursor = 0;
             self.short_vbar_cursor = 0;
+            self.glyph_storage.fill(None);
         }
 
         // Glyph index
@@ -640,7 +648,8 @@ impl ClearCodecDecoder {
         }
 
         // Decode composite payload
-        let mut output = vec![0u8; pixel_count * 3];
+        let output_size = pixel_count.checked_mul(3).ok_or(ClearCodecError::BitmapDataTooLarge)?;
+        let mut output = vec![0u8; output_size];
 
         if pos + COMPOSITE_HEADER_SIZE > src.len() {
             return Err(ClearCodecError::TruncatedStream);
@@ -650,9 +659,12 @@ impl ClearCodecDecoder {
         let bands_byte_count = read_u32_le(src, &mut pos)? as usize;
         let subcodec_byte_count = read_u32_le(src, &mut pos)? as usize;
 
-        let residual_end = pos + residual_byte_count;
-        let bands_end = residual_end + bands_byte_count;
-        let subcodec_end = bands_end + subcodec_byte_count;
+        let residual_end = pos.checked_add(residual_byte_count)
+            .ok_or(ClearCodecError::TruncatedStream)?;
+        let bands_end = residual_end.checked_add(bands_byte_count)
+            .ok_or(ClearCodecError::TruncatedStream)?;
+        let subcodec_end = bands_end.checked_add(subcodec_byte_count)
+            .ok_or(ClearCodecError::TruncatedStream)?;
 
         if subcodec_end > src.len() {
             return Err(ClearCodecError::TruncatedStream);
@@ -682,12 +694,15 @@ impl ClearCodecDecoder {
             decode_subcodecs(&src[bands_end..subcodec_end], &mut output, w)?;
         }
 
-        // Store glyph
+        // Store glyph and return. When glyph caching is active, store the output
+        // and return a clone (symmetric with the glyph-hit path which also clones).
         if let Some(idx) = glyph_index {
-            self.glyph_storage[idx as usize] = Some(output.clone());
+            self.glyph_storage[idx as usize] = Some(output);
+            // Clone from cache — one allocation instead of two
+            Ok(self.glyph_storage[idx as usize].as_ref().unwrap().clone())
+        } else {
+            Ok(output)
         }
-
-        Ok(output)
     }
 }
 
@@ -1023,5 +1038,50 @@ mod tests {
         let mut decoder = ClearCodecDecoder::new();
         let result = decoder.decode(&msg, 1, 53);
         assert_eq!(result, Err(ClearCodecError::BandHeightExceeded));
+    }
+
+    // ── FLAG_GLYPH_HIT without FLAG_GLYPH_INDEX ──
+
+    #[test]
+    fn glyph_hit_without_index_flag() {
+        let mut decoder = ClearCodecDecoder::new();
+        // FLAG_GLYPH_HIT set but FLAG_GLYPH_INDEX not set → InvalidFlags
+        let msg = vec![FLAG_GLYPH_HIT, 0x00];
+        let result = decoder.decode(&msg, 1, 1);
+        assert_eq!(result, Err(ClearCodecError::InvalidFlags(FLAG_GLYPH_HIT)));
+    }
+
+    // ── RLEX with single-color palette ──
+
+    #[test]
+    fn subcodec_rlex_single_palette() {
+        // 2×1, palette_count=1, color=green.
+        // stop_index_bits=0, so combined byte is entirely suite_depth.
+        // Segment: combined=0x00 (suite_depth=0, stop_index=0), run=2
+        // → 2×green (run) + 1×green (suite of [0..=0]) = 3... but we need 2 pixels.
+        // Actually: run=1, suite [0..=0] = 1 pixel. Total = 2.
+        let mut bitmap_data = Vec::new();
+        bitmap_data.push(1u8); // paletteCount = 1
+        bitmap_data.extend_from_slice(&[0x00, 0xFF, 0x00]); // palette[0] = green
+        bitmap_data.push(0x00); // combined: stop=0, suite_depth=0
+        bitmap_data.push(1u8);  // run=1
+        // Total: 1 (run) + 1 (suite [0..=0]) = 2 pixels
+
+        let mut subcodec = Vec::new();
+        subcodec.extend_from_slice(&0u16.to_le_bytes());
+        subcodec.extend_from_slice(&0u16.to_le_bytes());
+        subcodec.extend_from_slice(&2u16.to_le_bytes()); // width=2
+        subcodec.extend_from_slice(&1u16.to_le_bytes()); // height=1
+        subcodec.extend_from_slice(&(bitmap_data.len() as u32).to_le_bytes());
+        subcodec.push(0x02); // RLEX
+        subcodec.extend_from_slice(&bitmap_data);
+
+        let mut msg = make_header(0x00, 0x00, None);
+        msg.extend(make_composite(&[], &[], &subcodec));
+
+        let mut decoder = ClearCodecDecoder::new();
+        let result = decoder.decode(&msg, 2, 1).unwrap();
+        assert_eq!(result[0..3], [0x00, 0xFF, 0x00]); // green
+        assert_eq!(result[3..6], [0x00, 0xFF, 0x00]); // green
     }
 }

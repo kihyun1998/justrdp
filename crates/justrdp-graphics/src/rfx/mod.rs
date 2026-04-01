@@ -4,6 +4,13 @@
 //!
 //! Implements the full RFX decode/encode pipeline:
 //! RLGR → Subband Reconstruction → Dequantization → Inverse DWT → YCbCr→RGB
+//!
+//! # Stack usage
+//!
+//! Each component decode/encode allocates ~24 KB on the stack for working buffers
+//! (`[i32; 4096]` + `[i16; 4096]`). With 3 components this peaks at ~24 KB per call
+//! (components are processed sequentially, not simultaneously). Callers on constrained
+//! embedded targets should ensure sufficient stack space.
 
 pub mod color;
 pub mod dwt;
@@ -19,7 +26,7 @@ use self::color::ColorConverter;
 use self::dwt::DwtTransform;
 use self::quant::{dequantize, quantize, CodecQuant};
 use self::rlgr::{RlgrDecoder, RlgrEncoder, RlgrMode};
-use self::subband::SubbandReconstructor;
+use self::subband::{decompose, reconstruct};
 
 /// Tile dimension (always 64×64 in RFX).
 pub const TILE_SIZE: usize = 64;
@@ -30,20 +37,17 @@ pub const TILE_COEFFICIENTS: usize = TILE_SIZE * TILE_SIZE;
 /// RFX codec error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RfxError {
-    /// RLGR bitstream error.
+    /// RLGR bitstream error (truncated or malformed).
     RlgrError,
-    /// Invalid quantization index.
-    InvalidQuantIndex(u8),
-    /// Invalid quantization value.
-    InvalidQuantValue(u8),
+    /// A provided buffer is too small for a 64×64 tile.
+    BufferTooSmall,
 }
 
 impl fmt::Display for RfxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RlgrError => write!(f, "RFX: RLGR decode error"),
-            Self::InvalidQuantIndex(idx) => write!(f, "RFX: invalid quant index {idx}"),
-            Self::InvalidQuantValue(val) => write!(f, "RFX: invalid quant value {val}"),
+            Self::BufferTooSmall => write!(f, "RFX: buffer too small for tile"),
         }
     }
 }
@@ -89,9 +93,8 @@ impl RfxDecoder {
         let cr_plane = self.decode_component(cr_data, quant_cr)?;
 
         // Color conversion: YCbCr → BGRA
-        dst.clear();
         dst.resize(TILE_COEFFICIENTS * 4, 0);
-        ColorConverter::ycbcr_to_bgra(&y_plane, &cb_plane, &cr_plane, dst);
+        ColorConverter::ycbcr_to_bgra(&y_plane, &cb_plane, &cr_plane, dst)?;
 
         Ok(())
     }
@@ -107,15 +110,18 @@ impl RfxDecoder {
         let decoder = RlgrDecoder::new(self.mode);
         let decoded = decoder.decode(data, TILE_COEFFICIENTS).map_err(|_| RfxError::RlgrError)?;
 
-        // Copy to fixed-size array
-        let len = core::cmp::min(decoded.len(), TILE_COEFFICIENTS);
-        for i in 0..len {
+        // Reject truncated RLGR output — zero-padding would silently corrupt the tile
+        if decoded.len() < TILE_COEFFICIENTS {
+            return Err(RfxError::RlgrError);
+        }
+
+        for i in 0..TILE_COEFFICIENTS {
             coeffs[i] = decoded[i];
         }
 
         // Step 2: Subband reconstruction (flat array → 2D coefficient matrix)
         let mut matrix = [0i32; TILE_COEFFICIENTS];
-        SubbandReconstructor::reconstruct(&coeffs, &mut matrix);
+        reconstruct(&coeffs, &mut matrix);
 
         // Step 3: Dequantization
         dequantize(&mut matrix, quant);
@@ -170,7 +176,7 @@ impl RfxEncoder {
         let mut y_plane = [0i16; TILE_COEFFICIENTS];
         let mut cb_plane = [0i16; TILE_COEFFICIENTS];
         let mut cr_plane = [0i16; TILE_COEFFICIENTS];
-        ColorConverter::bgra_to_ycbcr(bgra, &mut y_plane, &mut cb_plane, &mut cr_plane);
+        ColorConverter::bgra_to_ycbcr(bgra, &mut y_plane, &mut cb_plane, &mut cr_plane)?;
 
         // Step 2-5: Encode each component
         let y_data = self.encode_component(&y_plane, quant_y);
@@ -196,7 +202,7 @@ impl RfxEncoder {
 
         // Step 5: Subband decomposition (2D matrix → flat array)
         let mut flat = [0i16; TILE_COEFFICIENTS];
-        SubbandReconstructor::decompose(&matrix, &mut flat);
+        decompose(&matrix, &mut flat);
 
         // Step 6: RLGR encode
         let encoder = RlgrEncoder::new(self.mode);

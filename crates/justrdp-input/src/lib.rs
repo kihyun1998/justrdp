@@ -8,7 +8,10 @@
 // Scancode
 // ══════════════════════════════════════════════════════════════
 
-/// A keyboard scancode with an extended flag (MS-RDPBCGR §2.2.8.1.1.3.1.1.1).
+/// A keyboard scancode with an extended flag.
+///
+/// - Slow-path: MS-RDPBCGR §2.2.8.1.1.3.1.1.1 (TS_KEYBOARD_EVENT)
+/// - Fast-path: MS-RDPBCGR §2.2.8.1.2.2.1 (TS_FP_KEYBOARD_EVENT)
 ///
 /// The 8-bit scancode + extended bit covers the full PC/AT keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,12 +30,19 @@ impl Scancode {
 
     /// Convert to a 9-bit index (0–511) for bitfield storage.
     #[inline]
-    pub const fn index(&self) -> usize {
+    #[must_use]
+    pub const fn index(self) -> usize {
         (self.code as usize) | if self.extended { 256 } else { 0 }
     }
 
-    /// Create from a 9-bit index.
-    pub const fn from_index(index: usize) -> Self {
+    /// Create from a 9-bit index. `index` must be in `0..512`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= 512`.
+    #[must_use]
+    pub fn from_index(index: usize) -> Self {
+        assert!(index < 512, "Scancode index out of range: {index}");
         Self {
             code: (index & 0xFF) as u8,
             extended: index & 256 != 0,
@@ -68,7 +78,7 @@ impl MouseButton {
     }
 
     /// All button variants for iteration.
-    const ALL: [MouseButton; 5] = [
+    pub const ALL: [MouseButton; 5] = [
         Self::Left,
         Self::Right,
         Self::Middle,
@@ -82,7 +92,7 @@ impl MouseButton {
 // ══════════════════════════════════════════════════════════════
 
 /// An input operation generated from state diff.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
     KeyPressed(Scancode),
     KeyReleased(Scancode),
@@ -90,17 +100,49 @@ pub enum Operation {
     UnicodeKeyReleased(u16),
     MouseButtonPressed(MouseButton),
     MouseButtonReleased(MouseButton),
-    MouseMove(u16, u16),
+    /// Absolute mouse move to (x, y).
+    MouseMove { x: u16, y: u16 },
+    /// Relative mouse movement — MS-RDPBCGR §2.2.8.1.1.3.1.1.3.
+    RelativeMouseMove { dx: i16, dy: i16 },
+    /// Vertical wheel rotation (positive = up).
     WheelRotations(i16),
+    /// Horizontal wheel rotation (positive = right).
     HorizontalWheelRotations(i16),
+    /// Lock key synchronization event (MS-RDPBCGR §2.2.8.1.1.3.1.1.5).
+    SynchronizeEvent(LockKeys),
+}
+
+impl Operation {
+    /// Create a wheel rotation operation. Stateless — always produces an event.
+    #[must_use]
+    pub fn wheel_rotations(delta: i16) -> Self {
+        Self::WheelRotations(delta)
+    }
+
+    /// Create a horizontal wheel rotation operation. Stateless — always produces an event.
+    #[must_use]
+    pub fn horizontal_wheel_rotations(delta: i16) -> Self {
+        Self::HorizontalWheelRotations(delta)
+    }
+
+    /// Create a relative mouse move operation. Stateless — always produces an event.
+    #[must_use]
+    pub fn relative_mouse_move(dx: i16, dy: i16) -> Self {
+        Self::RelativeMouseMove { dx, dy }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════
 // Lock key flags (for synchronize_event)
 // ══════════════════════════════════════════════════════════════
 
-/// Lock key state flags (MS-RDPBCGR §2.2.1.14).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Lock key state flags.
+///
+/// - Slow-path: MS-RDPBCGR §2.2.1.14 (Synchronize PDU)
+/// - Fast-path: MS-RDPBCGR §2.2.8.1.1.3.1.1.5 (TS_FP_SYNC_EVENT toggleFlags)
+///
+/// Both contexts use the same bit encoding for scroll/num/caps/kana locks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct LockKeys {
     pub scroll_lock: bool,
     pub num_lock: bool,
@@ -135,7 +177,7 @@ impl LockKeys {
 // ══════════════════════════════════════════════════════════════
 
 /// 512-bit bitfield tracking all keyboard scancode states.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct KeyboardState {
     bits: [u64; 8], // 8 × 64 = 512 bits
 }
@@ -175,7 +217,7 @@ impl KeyboardState {
 // ══════════════════════════════════════════════════════════════
 
 /// Mouse button + position state.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MouseState {
     buttons: u8, // 5 bits for 5 buttons
     x: u16,
@@ -200,16 +242,25 @@ impl MouseState {
             self.buttons &= !(1 << button.index());
         }
     }
+
+    fn release_all(&mut self) {
+        self.buttons = 0;
+    }
 }
 
 // ══════════════════════════════════════════════════════════════
 // InputDatabase
 // ══════════════════════════════════════════════════════════════
 
+/// Maximum number of operations that `release_all` can produce:
+/// 512 scancodes + 5 mouse buttons.
+pub const MAX_RELEASE_OPS: usize = 512 + MouseButton::ALL.len();
+
 /// Input state tracker with diff-based event generation.
 ///
 /// Tracks keyboard (512 scancodes) and mouse (5 buttons + position)
 /// state, generating [`Operation`] events only when state actually changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputDatabase {
     keyboard: KeyboardState,
     mouse: MouseState,
@@ -284,7 +335,7 @@ impl InputDatabase {
         }
         self.mouse.x = x;
         self.mouse.y = y;
-        Some(Operation::MouseMove(x, y))
+        Some(Operation::MouseMove { x, y })
     }
 
     /// Get the current mouse position.
@@ -292,21 +343,15 @@ impl InputDatabase {
         (self.mouse.x, self.mouse.y)
     }
 
-    /// Process a mouse wheel rotation. Always generates an event (wheel is stateless).
-    pub fn wheel_rotations(&self, delta: i16) -> Operation {
-        Operation::WheelRotations(delta)
-    }
-
-    /// Process a horizontal wheel rotation.
-    pub fn horizontal_wheel_rotations(&self, delta: i16) -> Operation {
-        Operation::HorizontalWheelRotations(delta)
-    }
-
-    /// Generate a synchronize event with the given lock key state.
-    /// Updates internal lock key tracking.
-    pub fn synchronize_event(&mut self, locks: LockKeys) -> LockKeys {
+    /// Update lock key state and generate a synchronize event.
+    ///
+    /// Unlike other state-mutating methods, this always produces an event even if
+    /// the lock state is unchanged. Per MS-RDPBCGR §2.2.8.1.1.3.1.1.5, synchronize
+    /// events must be sent unconditionally on focus acquisition to ensure client and
+    /// server lock key state is consistent.
+    pub fn synchronize_event(&mut self, locks: LockKeys) -> Operation {
         self.lock_keys = locks;
-        locks
+        Operation::SynchronizeEvent(locks)
     }
 
     /// Get the current lock key state.
@@ -315,29 +360,34 @@ impl InputDatabase {
     }
 
     /// Release all keys and buttons (e.g., on focus loss).
-    /// Returns operations for all released keys/buttons.
-    pub fn release_all(&mut self, ops: &mut [Operation; 517]) -> usize {
+    /// Returns the number of operations written to `ops`.
+    ///
+    /// Mouse position (`x`, `y`) is intentionally NOT reset — position is not
+    /// a "pressed" state and will be updated on the next `mouse_move` call.
+    pub fn release_all(&mut self, ops: &mut [Operation; MAX_RELEASE_OPS]) -> usize {
         let mut count = 0;
 
-        // Release all keyboard keys
+        // Release all keyboard keys (512 scancodes max)
         for i in 0..512 {
             let sc = Scancode::from_index(i);
             if self.keyboard.is_pressed(sc) {
+                debug_assert!(count < ops.len());
                 ops[count] = Operation::KeyReleased(sc);
                 count += 1;
             }
         }
 
-        // Release all mouse buttons
+        // Release all mouse buttons (5 buttons max)
         for &button in &MouseButton::ALL {
             if self.mouse.is_pressed(button) {
+                debug_assert!(count < ops.len());
                 ops[count] = Operation::MouseButtonReleased(button);
                 count += 1;
             }
         }
 
         self.keyboard.release_all();
-        self.mouse.buttons = 0;
+        self.mouse.release_all();
 
         count
     }
@@ -489,7 +539,7 @@ mod tests {
     fn mouse_move_generates_event() {
         let mut db = InputDatabase::new();
         let op = db.mouse_move(100, 200);
-        assert_eq!(op, Some(Operation::MouseMove(100, 200)));
+        assert_eq!(op, Some(Operation::MouseMove { x: 100, y: 200 }));
         assert_eq!(db.mouse_position(), (100, 200));
     }
 
@@ -505,15 +555,13 @@ mod tests {
 
     #[test]
     fn wheel_rotations_always_generates() {
-        let db = InputDatabase::new();
-        let op = db.wheel_rotations(-120);
+        let op = Operation::wheel_rotations(-120);
         assert_eq!(op, Operation::WheelRotations(-120));
     }
 
     #[test]
     fn horizontal_wheel_rotations() {
-        let db = InputDatabase::new();
-        let op = db.horizontal_wheel_rotations(120);
+        let op = Operation::horizontal_wheel_rotations(120);
         assert_eq!(op, Operation::HorizontalWheelRotations(120));
     }
 
@@ -523,7 +571,8 @@ mod tests {
     fn synchronize_event_updates_locks() {
         let mut db = InputDatabase::new();
         let locks = LockKeys { scroll_lock: false, num_lock: true, caps_lock: true, kana_lock: false };
-        db.synchronize_event(locks);
+        let op = db.synchronize_event(locks);
+        assert_eq!(op, Operation::SynchronizeEvent(locks));
         assert_eq!(db.lock_keys(), locks);
     }
 
@@ -536,7 +585,7 @@ mod tests {
         db.key_press(Scancode::new(0x1D, true));  // Right Ctrl
         db.mouse_button_press(MouseButton::Left);
 
-        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); 517];
+        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); MAX_RELEASE_OPS];
         let count = db.release_all(&mut ops);
 
         assert_eq!(count, 3);
@@ -548,7 +597,7 @@ mod tests {
     #[test]
     fn release_all_empty_state() {
         let mut db = InputDatabase::new();
-        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); 517];
+        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); MAX_RELEASE_OPS];
         let count = db.release_all(&mut ops);
         assert_eq!(count, 0);
     }
@@ -596,7 +645,7 @@ mod tests {
         db.mouse_button_press(MouseButton::X1);
         db.mouse_button_press(MouseButton::X2);
 
-        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); 517];
+        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); MAX_RELEASE_OPS];
         let count = db.release_all(&mut ops);
         assert_eq!(count, 4);
         let actual = &ops[..count];
@@ -612,7 +661,7 @@ mod tests {
         for &btn in &MouseButton::ALL {
             db.mouse_button_press(btn);
         }
-        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); 517];
+        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); MAX_RELEASE_OPS];
         let count = db.release_all(&mut ops);
         assert_eq!(count, 5);
         for &btn in &MouseButton::ALL {
@@ -643,22 +692,21 @@ mod tests {
     fn mouse_move_partial_axis() {
         let mut db = InputDatabase::new();
         db.mouse_move(100, 200);
-        assert_eq!(db.mouse_move(101, 200), Some(Operation::MouseMove(101, 200)));
-        assert_eq!(db.mouse_move(101, 201), Some(Operation::MouseMove(101, 201)));
+        assert_eq!(db.mouse_move(101, 200), Some(Operation::MouseMove { x: 101, y: 200 }));
+        assert_eq!(db.mouse_move(101, 201), Some(Operation::MouseMove { x: 101, y: 201 }));
     }
 
     #[test]
     fn mouse_move_back_to_origin() {
         let mut db = InputDatabase::new();
         db.mouse_move(100, 200);
-        assert_eq!(db.mouse_move(0, 0), Some(Operation::MouseMove(0, 0)));
+        assert_eq!(db.mouse_move(0, 0), Some(Operation::MouseMove { x: 0, y: 0 }));
     }
 
     #[test]
     fn wheel_boundary_deltas() {
-        let db = InputDatabase::new();
-        assert_eq!(db.wheel_rotations(0), Operation::WheelRotations(0));
-        assert_eq!(db.wheel_rotations(i16::MAX), Operation::WheelRotations(i16::MAX));
-        assert_eq!(db.wheel_rotations(i16::MIN), Operation::WheelRotations(i16::MIN));
+        assert_eq!(Operation::wheel_rotations(0), Operation::WheelRotations(0));
+        assert_eq!(Operation::wheel_rotations(i16::MAX), Operation::WheelRotations(i16::MAX));
+        assert_eq!(Operation::wheel_rotations(i16::MIN), Operation::WheelRotations(i16::MIN));
     }
 }

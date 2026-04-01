@@ -6,8 +6,9 @@ use super::TILE_SIZE;
 
 /// Quantization values for all 10 subbands (MS-RDPRFX §2.2.2.1.5).
 ///
-/// Each value is a 4-bit quantization factor in the range [6, 15].
-/// The shift amount is `value - 6`, ranging from 0 to 9.
+/// Each value is a 4-bit quantization factor in the range [0, 15].
+/// The shift amount is `value.saturating_sub(6)`, ranging from 0 to 9.
+/// Values below 6 are treated as shift=0 (no quantization loss).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodecQuant {
     pub ll3: u8,
@@ -70,7 +71,9 @@ impl CodecQuant {
             7 => self.hl1,
             8 => self.lh1,
             9 => self.hh1,
-            _ => 6,
+            // All 10 subband indices (0-9) are covered above.
+            // This is only reachable if SUBBAND_REGIONS has a wrong quant_idx.
+            _ => unreachable!("invalid subband index: {idx}"),
         };
         (q.saturating_sub(6)) as u32
     }
@@ -111,6 +114,7 @@ pub fn dequantize(matrix: &mut [i32; super::TILE_COEFFICIENTS], quant: &CodecQua
         for row in 0..region.height {
             for col in 0..region.width {
                 let idx = (region.row_start + row) * TILE_SIZE + (region.col_start + col);
+                debug_assert!(idx < super::TILE_COEFFICIENTS);
                 matrix[idx] <<= shift;
             }
         }
@@ -119,7 +123,8 @@ pub fn dequantize(matrix: &mut [i32; super::TILE_COEFFICIENTS], quant: &CodecQua
 
 /// Apply quantization to the 64×64 coefficient matrix in-place (encoder).
 ///
-/// Each subband's coefficients are right-shifted by `(quant_value - 6)` bits.
+/// Each subband's coefficients are arithmetic right-shifted by `(quant_value - 6)` bits.
+/// This is a lossy operation: negative odd values truncate toward -∞.
 pub fn quantize(matrix: &mut [i32; super::TILE_COEFFICIENTS], quant: &CodecQuant) {
     for region in &SUBBAND_REGIONS {
         let shift = quant.shift_for_subband(region.quant_idx);
@@ -129,6 +134,7 @@ pub fn quantize(matrix: &mut [i32; super::TILE_COEFFICIENTS], quant: &CodecQuant
         for row in 0..region.height {
             for col in 0..region.width {
                 let idx = (region.row_start + row) * TILE_SIZE + (region.col_start + col);
+                debug_assert!(idx < super::TILE_COEFFICIENTS);
                 matrix[idx] >>= shift;
             }
         }

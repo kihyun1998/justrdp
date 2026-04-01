@@ -18,7 +18,8 @@ struct SubbandInfo {
     col_start: usize,
 }
 
-/// Subband order in RLGR stream: LL3, HL3, LH3, HH3, HL2, LH2, HH2, HL1, LH1, HH1.
+/// Flat array layout: subband ordering in the RLGR coefficient array.
+/// Order: LL3, HL3, LH3, HH3, HL2, LH2, HH2, HL1, LH1, HH1.
 const SUBBANDS: [SubbandInfo; 10] = [
     SubbandInfo { flat_offset: 0,    count: 64,   width: 8,  row_start: 0,  col_start: 0 },   // LL3
     SubbandInfo { flat_offset: 64,   count: 64,   width: 8,  row_start: 0,  col_start: 8 },   // HL3
@@ -32,40 +33,43 @@ const SUBBANDS: [SubbandInfo; 10] = [
     SubbandInfo { flat_offset: 3072, count: 1024, width: 32, row_start: 32, col_start: 32 },  // HH1
 ];
 
-/// Subband reconstruction.
-pub struct SubbandReconstructor;
-
-impl SubbandReconstructor {
-    /// Place the flat 4096-element RLGR-decoded array into the 64×64 coefficient matrix.
-    ///
-    /// The flat array has subbands in order: LL3, HL3, LH3, HH3, HL2, LH2, HH2, HL1, LH1, HH1.
-    /// Each subband is placed at its correct position in the 2D DWT decomposition layout.
-    pub fn reconstruct(flat: &[i16], matrix: &mut [i32; super::TILE_COEFFICIENTS]) {
-        for sb in &SUBBANDS {
-            let height = sb.count / sb.width;
-            for row in 0..height {
-                for col in 0..sb.width {
-                    let flat_idx = sb.flat_offset + row * sb.width + col;
-                    let mat_row = sb.row_start + row;
-                    let mat_col = sb.col_start + col;
-                    matrix[mat_row * TILE_SIZE + mat_col] = flat[flat_idx] as i32;
-                }
+/// Place the flat 4096-element RLGR-decoded array into the 64×64 coefficient matrix.
+///
+/// The flat array has subbands in order: LL3, HL3, LH3, HH3, HL2, LH2, HH2, HL1, LH1, HH1.
+/// Each subband is placed at its correct position in the 2D DWT decomposition layout.
+pub fn reconstruct(
+    flat: &[i16; super::TILE_COEFFICIENTS],
+    matrix: &mut [i32; super::TILE_COEFFICIENTS],
+) {
+    for sb in &SUBBANDS {
+        let height = sb.count / sb.width;
+        for row in 0..height {
+            for col in 0..sb.width {
+                let flat_idx = sb.flat_offset + row * sb.width + col;
+                let mat_row = sb.row_start + row;
+                let mat_col = sb.col_start + col;
+                debug_assert!(mat_row < TILE_SIZE && mat_col < TILE_SIZE);
+                matrix[mat_row * TILE_SIZE + mat_col] = flat[flat_idx] as i32;
             }
         }
     }
+}
 
-    /// Extract subbands from a 64×64 coefficient matrix into a flat array.
-    /// (Inverse of `reconstruct`, used by the encoder.)
-    pub fn decompose(matrix: &[i32; super::TILE_COEFFICIENTS], flat: &mut [i16]) {
-        for sb in &SUBBANDS {
-            let height = sb.count / sb.width;
-            for row in 0..height {
-                for col in 0..sb.width {
-                    let flat_idx = sb.flat_offset + row * sb.width + col;
-                    let mat_row = sb.row_start + row;
-                    let mat_col = sb.col_start + col;
-                    flat[flat_idx] = matrix[mat_row * TILE_SIZE + mat_col] as i16;
-                }
+/// Extract subbands from a 64×64 coefficient matrix into a flat array.
+/// (Inverse of `reconstruct`, used by the encoder.)
+pub fn decompose(
+    matrix: &[i32; super::TILE_COEFFICIENTS],
+    flat: &mut [i16; super::TILE_COEFFICIENTS],
+) {
+    for sb in &SUBBANDS {
+        let height = sb.count / sb.width;
+        for row in 0..height {
+            for col in 0..sb.width {
+                let flat_idx = sb.flat_offset + row * sb.width + col;
+                let mat_row = sb.row_start + row;
+                let mat_col = sb.col_start + col;
+                debug_assert!(mat_row < TILE_SIZE && mat_col < TILE_SIZE);
+                flat[flat_idx] = matrix[mat_row * TILE_SIZE + mat_col] as i16;
             }
         }
     }
@@ -84,10 +88,10 @@ mod tests {
         }
 
         let mut matrix = [0i32; super::super::TILE_COEFFICIENTS];
-        SubbandReconstructor::reconstruct(&flat, &mut matrix);
+        reconstruct(&flat, &mut matrix);
 
         let mut flat2 = [0i16; super::super::TILE_COEFFICIENTS];
-        SubbandReconstructor::decompose(&matrix, &mut flat2);
+        decompose(&matrix, &mut flat2);
 
         assert_eq!(flat, flat2);
     }
@@ -115,7 +119,7 @@ mod tests {
         flat[7] = 99; // LL3[0,7]
 
         let mut matrix = [0i32; super::super::TILE_COEFFICIENTS];
-        SubbandReconstructor::reconstruct(&flat, &mut matrix);
+        reconstruct(&flat, &mut matrix);
 
         assert_eq!(matrix[0 * TILE_SIZE + 0], 42); // (0,0)
         assert_eq!(matrix[0 * TILE_SIZE + 7], 99); // (0,7)
@@ -127,7 +131,7 @@ mod tests {
         flat[3072] = 77; // HH1[0,0] → matrix[32,32]
 
         let mut matrix = [0i32; super::super::TILE_COEFFICIENTS];
-        SubbandReconstructor::reconstruct(&flat, &mut matrix);
+        reconstruct(&flat, &mut matrix);
 
         assert_eq!(matrix[32 * TILE_SIZE + 32], 77);
     }

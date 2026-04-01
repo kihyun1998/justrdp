@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Discrete Wavelet Transform (Le Gall 5/3) for RemoteFX (MS-RDPRFX §3.1.8.2.4).
+//! Le Gall 5/3 Discrete Wavelet Transform for RemoteFX.
+//!
+//! - Inverse DWT: MS-RDPRFX §3.1.8.2.4
+//! - Forward DWT: MS-RDPRFX §3.1.8.1.4
 
 use super::TILE_SIZE;
 
@@ -28,40 +31,48 @@ impl DwtTransform {
         Self::dwt_2d_level(matrix, size, 16);
     }
 
-    /// 2D inverse DWT for one level (MS-RDPRFX §3.1.8.2.4):
+    /// 2D inverse DWT for one level (Le Gall 5/3, MS-RDPRFX §3.1.8.2.4):
     /// First apply 1D IDWT vertically (columns), then horizontally (rows).
-    fn idwt_2d_level(matrix: &mut [i32; super::TILE_COEFFICIENTS], stride: usize, n: usize) {
+    ///
+    /// `buf_stride` is the full buffer width (always TILE_SIZE for a 64×64 tile).
+    /// `n` is the sub-matrix dimension being processed at this DWT level.
+    fn idwt_2d_level(matrix: &mut [i32; super::TILE_COEFFICIENTS], buf_stride: usize, n: usize) {
+        debug_assert!(n <= buf_stride && buf_stride <= TILE_SIZE);
         let mut temp = [0i32; TILE_SIZE];
         let mut col_buf = [0i32; TILE_SIZE];
 
         // Step 1: Vertical IDWT on each column
         for col in 0..n {
             for row in 0..n {
-                col_buf[row] = matrix[row * stride + col];
+                col_buf[row] = matrix[row * buf_stride + col];
             }
             Self::idwt_1d(&col_buf[..n], n / 2, &mut temp[..n]);
             for row in 0..n {
-                matrix[row * stride + col] = temp[row];
+                matrix[row * buf_stride + col] = temp[row];
             }
         }
 
         // Step 2: Horizontal IDWT on each row
         for row in 0..n {
-            let base = row * stride;
+            let base = row * buf_stride;
             Self::idwt_1d(&matrix[base..base + n], n / 2, &mut temp[..n]);
             matrix[base..base + n].copy_from_slice(&temp[..n]);
         }
     }
 
-    /// 2D forward DWT for one level (MS-RDPRFX §3.1.8.1.4):
+    /// 2D forward DWT for one level (Le Gall 5/3, MS-RDPRFX §3.1.8.1.4):
     /// First apply 1D DWT horizontally (rows), then vertically (columns).
-    fn dwt_2d_level(matrix: &mut [i32; super::TILE_COEFFICIENTS], stride: usize, n: usize) {
+    ///
+    /// `buf_stride` is the full buffer width (always TILE_SIZE for a 64×64 tile).
+    /// `n` is the sub-matrix dimension being processed at this DWT level.
+    fn dwt_2d_level(matrix: &mut [i32; super::TILE_COEFFICIENTS], buf_stride: usize, n: usize) {
+        debug_assert!(n <= buf_stride && buf_stride <= TILE_SIZE);
         let mut temp = [0i32; TILE_SIZE];
         let mut col_buf = [0i32; TILE_SIZE];
 
         // Step 1: Horizontal DWT on each row
         for row in 0..n {
-            let base = row * stride;
+            let base = row * buf_stride;
             let mut row_buf = [0i32; TILE_SIZE];
             row_buf[..n].copy_from_slice(&matrix[base..base + n]);
             Self::dwt_1d(&row_buf[..n], &mut temp[..n]);
@@ -71,21 +82,23 @@ impl DwtTransform {
         // Step 2: Vertical DWT on each column
         for col in 0..n {
             for row in 0..n {
-                col_buf[row] = matrix[row * stride + col];
+                col_buf[row] = matrix[row * buf_stride + col];
             }
             Self::dwt_1d(&col_buf[..n], &mut temp[..n]);
             for row in 0..n {
-                matrix[row * stride + col] = temp[row];
+                matrix[row * buf_stride + col] = temp[row];
             }
         }
     }
 
-    /// 1D inverse DWT (Le Gall 5/3 lifting).
+    /// 1D inverse DWT (Le Gall 5/3 lifting, MS-RDPRFX §3.1.8.2.4).
     ///
     /// Input layout: `[L0, L1, ..., L_{n/2-1}, H0, H1, ..., H_{n/2-1}]`
     /// Output: reconstructed signal of length n.
     fn idwt_1d(input: &[i32], half: usize, output: &mut [i32]) {
         let n = half * 2;
+        debug_assert_eq!(input.len(), n, "idwt_1d: input length mismatch");
+        debug_assert_eq!(output.len(), n, "idwt_1d: output length mismatch");
         if n == 0 {
             return;
         }
