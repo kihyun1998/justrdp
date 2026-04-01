@@ -250,6 +250,7 @@ version = "0.1.0"
 name = "justrdp-rdpsnd"
 version = "0.1.0"
 dependencies = [
+ "justrdp-audio",
  "justrdp-core",
  "justrdp-svc",
 ]
