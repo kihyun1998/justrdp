@@ -813,6 +813,27 @@ RFX 비트스트림
 - [x] 모든 표준 설정 키 지원
 - [x] `no_std` 호환
 
+### 6.10 `justrdp-audio` -- Audio Codecs
+
+> **requires**: 없음 (순수 코덱, `no_std`)
+> **검증**: 알려진 오디오 데이터 → 디코딩 → PCM 샘플 비교
+
+```rust
+pub trait AudioDecoder: Send {
+    fn decode(&mut self, input: &[u8], output: &mut [i16]) -> AudioResult<usize>;
+    fn sample_rate(&self) -> u32;
+    fn channels(&self) -> u16;
+}
+```
+
+- [ ] `AudioDecoder` trait -- 통합 디코더 인터페이스
+- [ ] PCM -- passthrough (포맷 변환: u8/i16/i24/f32 → i16)
+- [ ] MS-ADPCM -- `ADPCMACOEF` 테이블 기반 블록 디코딩 (RFC 2361)
+- [ ] IMA-ADPCM -- `wSamplesPerBlock` 기반 블록 디코딩 (RFC 2361)
+- [ ] AAC -- HEAACWAVEFORMAT 파싱, raw ADTS/LATM 프레임 추출
+- [ ] Opus -- OpusHead 파싱 + Opus 프레임 추출 (RFC 7845)
+- [ ] 포맷별 디코더 팩토리 (`AudioFormat` → `Box<dyn AudioDecoder>`)
+
 ---
 
 ## 7. Phase 4 -- Session Core & Channel Frameworks
@@ -940,18 +961,16 @@ pub trait CliprdrBackend: Send {
 **SVC 이름**: `RDPSND` / **DVC 이름**: `AUDIO_PLAYBACK_DVC`, `AUDIO_PLAYBACK_LOSSY_DVC`
 
 **구현 항목:**
-- [ ] 초기화 시퀀스 (Formats → Quality Mode → Training)
-- [ ] 오디오 포맷 협상
-- [ ] Wave/Wave2 PDU 수신 및 디코딩
-- [ ] WaveConfirm PDU 전송 (타임스탬프 동기화)
-- [ ] 볼륨/피치 제어
-- [ ] DVC 전송 모드 (reliable / lossy)
-- [ ] 지원 코덱:
-  - [ ] PCM (raw)
-  - [ ] MS-ADPCM
-  - [ ] IMA-ADPCM
-  - [ ] AAC
-  - [ ] Opus
+- [x] 초기화 시퀀스 (Formats → Quality Mode → Training)
+- [x] 오디오 포맷 협상
+- [x] Wave/Wave2 PDU 수신 및 디코딩
+- [x] WaveConfirm PDU 전송 (타임스탬프 동기화)
+- [x] 볼륨/피치 제어
+- [ ] DVC 전송 모드:
+  - [ ] `RdpsndDvcClient` -- `DvcProcessor` 구현 (`AUDIO_PLAYBACK_DVC`)
+  - [ ] Lossy DVC 채널 (`AUDIO_PLAYBACK_LOSSY_DVC`) 지원
+  - [ ] SVC/DVC 공통 로직 추출 (PDU 처리, 상태 머신 공유)
+- [ ] 코덱 → `justrdp-audio` crate (Phase 3 코덱 패턴, `justrdp-bulk`/`justrdp-graphics` 동일 구조)
 
 ### 8.3 `justrdp-rdpdr` -- Device Redirection (MS-RDPEFS)
 

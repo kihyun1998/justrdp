@@ -13,6 +13,7 @@ members = [
     "crates/justrdp-dvc",
     "crates/justrdp-tls",
     "crates/justrdp-cliprdr",
+    "crates/justrdp-rdpsnd",
     "tests/integration",
 ]
 resolver = "3"
@@ -42,3 +43,4 @@ justrdp-session = { path = "crates/justrdp-session", version = "0.1.0" }
 justrdp-svc = { path = "crates/justrdp-svc", version = "0.1.0" }
 justrdp-tls = { path = "crates/justrdp-tls", version = "0.1.0" }
 justrdp-cliprdr = { path = "crates/justrdp-cliprdr", version = "0.1.0" }
+justrdp-rdpsnd = { path = "crates/justrdp-rdpsnd", version = "0.1.0" }
