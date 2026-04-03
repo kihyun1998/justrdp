@@ -23,7 +23,9 @@ use crate::{DvcError, DvcProcessor, DvcResult};
 /// Maximum DVC version we support.
 const MAX_SUPPORTED_VERSION: u16 = CAPS_VERSION_3;
 
-/// HRESULT for failed channel creation.
+/// HRESULT for failed channel creation (no registered processor).
+/// MS-RDPEDYC 2.2.2.2: CreationStatus is HRESULT; E_FAIL (0x80004005) signals
+/// no registered listener for the requested channel name.
 const CREATION_STATUS_NO_LISTENER: i32 = -2147467259; // 0x80004005 = E_FAIL
 
 /// Client-side DRDYNVC processor.
@@ -80,20 +82,19 @@ impl DrdynvcClient {
                 channel_name,
                 priority: _,
             } => {
-                // Look up a registered processor for this channel name.
-                if self.processors.contains_key(&channel_name) {
+                if let Some(proc) = self.processors.get_mut(&channel_name) {
+                    // Close prior instance if this channel_id was already open.
+                    if self.active_channels.contains_key(&channel_id) {
+                        proc.close(channel_id);
+                    }
+
                     // Accept the channel.
                     self.active_channels
                         .insert(channel_id, channel_name.clone());
                     self.reassemblers
                         .insert(channel_id, DvcReassembler::new());
 
-                    // Call start() on the processor.
-                    let start_messages = if let Some(proc) = self.processors.get_mut(&channel_name) {
-                        proc.start(channel_id)?
-                    } else {
-                        vec![]
-                    };
+                    let start_messages = proc.start(channel_id)?;
 
                     // Send CreateResponse(OK) first, then any start messages.
                     let mut responses = vec![SvcMessage::new(pdu::encode_create_response(
@@ -101,10 +102,8 @@ impl DrdynvcClient {
                         CREATION_STATUS_OK,
                     ))];
 
-                    // Encode start messages as DVC Data PDUs.
                     for msg in start_messages {
-                        let encoded = encode_dvc_message(channel_id, &msg.data);
-                        responses.push(SvcMessage::new(encoded));
+                        responses.push(SvcMessage::new(pdu::encode_data(channel_id, &msg.data)));
                     }
 
                     Ok(responses)
@@ -154,18 +153,17 @@ impl DrdynvcClient {
             }
 
             DvcPdu::Close { channel_id } => {
-                // Notify the processor.
-                if let Some(name) = self.active_channels.get(&channel_id) {
-                    if let Some(proc) = self.processors.get_mut(name) {
+                // Only echo close for channels we actually have open.
+                if let Some(name) = self.active_channels.remove(&channel_id) {
+                    if let Some(proc) = self.processors.get_mut(&name) {
                         proc.close(channel_id);
                     }
+                    self.reassemblers.remove(&channel_id);
+                    Ok(vec![SvcMessage::new(pdu::encode_close(channel_id))])
+                } else {
+                    // Unknown channel — ignore per MS-RDPEDYC 3.1.5.1.4.
+                    Ok(vec![])
                 }
-                // Clean up state.
-                self.active_channels.remove(&channel_id);
-                self.reassemblers.remove(&channel_id);
-
-                // Echo the close back.
-                Ok(vec![SvcMessage::new(pdu::encode_close(channel_id))])
             }
         }
     }
@@ -184,8 +182,7 @@ impl DrdynvcClient {
         let responses = proc.process(channel_id, payload)?;
         let mut messages = Vec::new();
         for msg in responses {
-            let encoded = encode_dvc_message(channel_id, &msg.data);
-            messages.push(SvcMessage::new(encoded));
+            messages.push(SvcMessage::new(pdu::encode_data(channel_id, &msg.data)));
         }
         Ok(messages)
     }
@@ -229,25 +226,27 @@ impl SvcProcessor for DrdynvcClient {
 
     fn process(&mut self, payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
         let mut src = ReadCursor::new(payload);
-        let pdu = pdu::decode_dvc_pdu(&mut src)
-            .map_err(|e| justrdp_svc::SvcError::Decode(e))?;
-        self.process_pdu(pdu)
-            .map_err(|e| match e {
-                DvcError::Decode(d) => justrdp_svc::SvcError::Decode(d),
-                DvcError::Encode(e) => justrdp_svc::SvcError::Encode(e),
-                DvcError::Protocol(s) => justrdp_svc::SvcError::Protocol(s),
-            })
+        let mut all_responses = Vec::new();
+
+        // MS-RDPEDYC allows multiple DVC PDUs in a single SVC payload.
+        while src.remaining() > 0 {
+            let pdu = pdu::decode_dvc_pdu(&mut src)
+                .map_err(justrdp_svc::SvcError::Decode)?;
+            let responses = self.process_pdu(pdu)
+                .map_err(|e| match e {
+                    DvcError::Decode(d) => justrdp_svc::SvcError::Decode(d),
+                    DvcError::Encode(e) => justrdp_svc::SvcError::Encode(e),
+                    DvcError::Protocol(s) => justrdp_svc::SvcError::Protocol(s),
+                })?;
+            all_responses.extend(responses);
+        }
+
+        Ok(all_responses)
     }
 
     fn compression_condition(&self) -> CompressionCondition {
         CompressionCondition::Never
     }
-}
-
-/// Encode a DVC message as a DYNVC_DATA or DYNVC_DATA_FIRST PDU.
-fn encode_dvc_message(channel_id: u32, data: &[u8]) -> Vec<u8> {
-    // Use single Data PDU — the SVC layer handles chunking above 1600.
-    pdu::encode_data(channel_id, data)
 }
 
 #[cfg(test)]
@@ -396,11 +395,10 @@ mod tests {
     fn close_unknown_channel_no_response() {
         let mut client = DrdynvcClient::new();
         client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
-        // Close channel 99 which was never created.
+        // Close channel 99 which was never created — should be ignored.
         let close = pdu::encode_close(99);
         let responses = client.process(&close).unwrap();
-        // Still echoes close per protocol (no harm).
-        assert_eq!(responses.len(), 1);
+        assert!(responses.is_empty());
     }
 
     #[test]
