@@ -324,12 +324,13 @@ impl BigUint {
 
     /// Modular exponentiation: self^exp mod modulus.
     ///
-    /// Uses binary exponentiation with branchless conditional swap (double-and-add
-    /// variant) to avoid leaking the exponent via branch-prediction side-channels.
+    /// Uses Montgomery multiplication for the inner loop, ensuring all
+    /// multiply/reduce operations run in fixed time proportional to the
+    /// modulus width. The exponent bits are accessed via branchless
+    /// conditional swap to prevent branch-prediction side-channels.
     ///
-    /// **Note**: The underlying mul/rem operations are not fully constant-time
-    /// (they depend on operand magnitude). For production use with secret
-    /// exponents, a fixed-width constant-time bigint library is recommended.
+    /// Precomputation (Montgomery context setup) depends only on the modulus
+    /// (public), not on the exponent (secret).
     pub fn mod_exp(&self, exp: &Self, modulus: &Self) -> Self {
         if modulus.is_zero() {
             return Self::zero();
@@ -341,15 +342,44 @@ impl BigUint {
             return one.rem(modulus);
         }
 
+        // Montgomery requires odd modulus. RSA moduli and DH primes are always odd.
+        // For even modulus, fall back to non-Montgomery path.
+        if modulus.limbs[0] & 1 == 0 {
+            return self.mod_exp_basic(exp, modulus);
+        }
+
+        let base = self.rem(modulus);
+        let exp_bits = exp.bit_len();
+        let ctx = MontContext::new(modulus);
+        let w = ctx.width;
+
+        // Convert to Montgomery form: aR mod N
+        let mut r0 = ctx.to_mont(&one);
+        let mut r1 = ctx.to_mont(&base);
+
+        // Binary exponentiation with constant-time conditional swap.
+        // All mont_mul calls operate on fixed-width limb arrays.
+        for i in (0..exp_bits).rev() {
+            let bit = exp.bit(i);
+            ct_swap_limbs(&mut r0, &mut r1, bit, w);
+            r1 = ctx.mont_mul(&r0, &r1);
+            r0 = ctx.mont_mul(&r0, &r0);
+            ct_swap_limbs(&mut r0, &mut r1, bit, w);
+        }
+
+        // Convert back from Montgomery form
+        let result_limbs = ctx.from_mont(&r0);
+        let mut result = Self { limbs: result_limbs };
+        result.normalize();
+        result
+    }
+
+    /// Non-Montgomery fallback for even modulus (rare edge case).
+    fn mod_exp_basic(&self, exp: &Self, modulus: &Self) -> Self {
+        let one = Self::from_u32(1);
         let base = self.rem(modulus);
         let exp_bits = exp.bit_len();
 
-        // Montgomery ladder with conditional swap:
-        //   ct_swap(r0, r1, bit)   — swap if bit=1
-        //   r1 = r0 * r1 mod n    — always multiply
-        //   r0 = r0^2 mod n       — always square
-        //   ct_swap(r0, r1, bit)   — swap back
-        // This ensures identical operations regardless of each exponent bit.
         let mut r0 = one;
         let mut r1 = base;
 
@@ -360,18 +390,14 @@ impl BigUint {
             r0 = r0.mul(&r0).rem(modulus);
             Self::ct_swap(&mut r0, &mut r1, bit);
         }
-
         r0
     }
 
-    /// Branchless conditional swap: if `condition` is true, swap `a` and `b`
-    /// using XOR without any data-dependent branches.
+    /// Branchless conditional swap on BigUint (used by mod_exp_basic fallback).
     fn ct_swap(a: &mut Self, b: &mut Self, condition: bool) {
         let max_len = core::cmp::max(a.limbs.len(), b.limbs.len());
         a.limbs.resize(max_len, 0);
         b.limbs.resize(max_len, 0);
-
-        // mask = 0xFFFFFFFF if condition, 0x00000000 if not (branchless)
         let mask = (condition as u32).wrapping_neg();
         for i in 0..max_len {
             let diff = a.limbs[i] ^ b.limbs[i];
@@ -389,6 +415,154 @@ impl BigUint {
     pub fn zeroize(&mut self) {
         self.limbs.fill(0);
         core::hint::black_box(&self.limbs);
+    }
+}
+
+// ── Constant-time helpers ──
+
+/// Branchless conditional swap on fixed-width `Vec<u32>` limb arrays.
+fn ct_swap_limbs(a: &mut Vec<u32>, b: &mut Vec<u32>, condition: bool, width: usize) {
+    a.resize(width, 0);
+    b.resize(width, 0);
+    let mask = (condition as u32).wrapping_neg();
+    for i in 0..width {
+        let diff = a[i] ^ b[i];
+        let masked = diff & mask;
+        a[i] ^= masked;
+        b[i] ^= masked;
+    }
+}
+
+// ── Montgomery multiplication ──
+
+/// Montgomery multiplication context for constant-time modular arithmetic.
+///
+/// Converts operands to Montgomery form (aR mod N) where R = 2^(32*width),
+/// then performs multiplication without division. All operations iterate over
+/// a fixed number of limbs, preventing timing side-channels.
+struct MontContext {
+    /// Modulus limbs, zero-padded to `width`.
+    n: Vec<u32>,
+    /// Fixed limb width (number of u32 words in the modulus).
+    width: usize,
+    /// Montgomery parameter: -N[0]^{-1} mod 2^32.
+    n0_inv: u32,
+    /// R^2 mod N — used to convert values into Montgomery form.
+    r_squared: Vec<u32>,
+}
+
+impl MontContext {
+    /// Create a Montgomery context for the given odd modulus.
+    ///
+    /// Precomputation depends only on the modulus (public), not on any secret.
+    fn new(modulus: &BigUint) -> Self {
+        let width = modulus.limbs.len();
+        let mut n = modulus.limbs.clone();
+        n.resize(width, 0);
+
+        // Compute n0_inv = -N[0]^{-1} mod 2^32 via Newton's method.
+        // Each iteration doubles the correct bits: 1 → 2 → 4 → 8 → 16 → 32.
+        let n0 = n[0];
+        let mut inv: u32 = 1;
+        for _ in 0..5 {
+            inv = inv.wrapping_mul(2u32.wrapping_sub(n0.wrapping_mul(inv)));
+        }
+        let n0_inv = inv.wrapping_neg();
+
+        // Compute R^2 mod N where R = 2^(32*width).
+        // Repeated doubling: only depends on modulus (public), non-ct is acceptable.
+        let mut r_mod_n = BigUint::from_u32(1);
+        for _ in 0..(32 * width) {
+            r_mod_n = r_mod_n.shl1();
+            if r_mod_n >= *modulus {
+                r_mod_n = r_mod_n.sub(modulus);
+            }
+        }
+        let r_sq = r_mod_n.mul(&r_mod_n).rem(modulus);
+        let mut r_squared = r_sq.limbs;
+        r_squared.resize(width, 0);
+
+        Self { n, width, n0_inv, r_squared }
+    }
+
+    /// Montgomery multiplication: (a × b × R^{-1}) mod N.
+    ///
+    /// Both inputs must be in Montgomery form (width-padded limb arrays).
+    /// Always performs width × width multiply + width reduction passes.
+    fn mont_mul(&self, a: &[u32], b: &[u32]) -> Vec<u32> {
+        let w = self.width;
+
+        // Step 1: T = a × b (fixed-width schoolbook multiply)
+        let mut t = vec![0u32; 2 * w + 2];
+        for i in 0..w {
+            let ai = a[i] as u64;
+            let mut carry: u64 = 0;
+            for j in 0..w {
+                let sum = t[i + j] as u64 + ai * b[j] as u64 + carry;
+                t[i + j] = sum as u32;
+                carry = sum >> 32;
+            }
+            // Propagate carry (fixed iteration count: depends on i, not data)
+            for k in (i + w)..(2 * w + 2) {
+                let sum = t[k] as u64 + carry;
+                t[k] = sum as u32;
+                carry = sum >> 32;
+            }
+        }
+
+        // Step 2: Montgomery reduction — add multiples of N to make T divisible by R
+        for i in 0..w {
+            let u = t[i].wrapping_mul(self.n0_inv) as u64;
+            let mut carry: u64 = 0;
+            for j in 0..w {
+                let sum = t[i + j] as u64 + u * self.n[j] as u64 + carry;
+                t[i + j] = sum as u32;
+                carry = sum >> 32;
+            }
+            // Propagate carry (fixed iteration count)
+            for k in (i + w)..(2 * w + 2) {
+                let sum = t[k] as u64 + carry;
+                t[k] = sum as u32;
+                carry = sum >> 32;
+            }
+        }
+
+        // Step 3: Result = T >> (32*width) — the upper half
+        // The result can be up to 2N, fitting in w+1 limbs.
+        let mut result = vec![0u32; w + 1];
+        result[..w + 1].copy_from_slice(&t[w..2 * w + 1]);
+
+        // Step 4: Constant-time conditional subtraction (if result >= N, subtract N)
+        let mut borrow: u64 = 0;
+        let mut diff = vec![0u32; w + 1];
+        for k in 0..=w {
+            let nk = if k < w { self.n[k] } else { 0 };
+            let sub = (result[k] as u64).wrapping_sub(nk as u64).wrapping_sub(borrow);
+            diff[k] = sub as u32;
+            borrow = (sub >> 32) & 1;
+        }
+        // mask = 0xFFFFFFFF if no borrow (result >= N), 0 otherwise
+        let mask = (borrow as u32).wrapping_sub(1);
+        for k in 0..w {
+            result[k] = (diff[k] & mask) | (result[k] & !mask);
+        }
+
+        result.truncate(w);
+        result
+    }
+
+    /// Convert to Montgomery form: aR mod N.
+    fn to_mont(&self, a: &BigUint) -> Vec<u32> {
+        let mut a_padded = a.limbs.clone();
+        a_padded.resize(self.width, 0);
+        self.mont_mul(&a_padded, &self.r_squared)
+    }
+
+    /// Convert from Montgomery form: a × R^{-1} mod N.
+    fn from_mont(&self, a_mont: &[u32]) -> Vec<u32> {
+        let mut one = vec![0u32; self.width];
+        one[0] = 1;
+        self.mont_mul(a_mont, &one)
     }
 }
 
@@ -575,6 +749,20 @@ mod tests {
         assert_eq!(base.mod_exp(&BigUint::from_u32(0), &m), BigUint::from_u32(1));
         // x^1 mod m = x mod m
         assert_eq!(base.mod_exp(&BigUint::from_u32(1), &m), BigUint::from_u32(7));
+    }
+
+    #[test]
+    fn mont_vs_basic_mod_exp() {
+        // Test that Montgomery mod_exp matches basic mod_exp for a large prime
+        let p = BigUint::from_be_bytes(&[
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x43, // A large prime
+        ]);
+        let base = BigUint::from_u32(12345);
+        let exp = BigUint::from_u32(67890);
+
+        let mont_result = base.mod_exp(&exp, &p);
+        let basic_result = base.mod_exp_basic(&exp, &p);
+        assert_eq!(mont_result, basic_result, "Montgomery and basic mod_exp disagree");
     }
 
     #[test]
