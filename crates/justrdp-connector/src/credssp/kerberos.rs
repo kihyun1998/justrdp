@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Kerberos authentication sequence for CredSSP.
 //!
 //! Drives the KDC exchange (AS-REQ/AS-REP, TGS-REQ/TGS-REP) and
@@ -49,6 +51,13 @@ pub struct PkinitConfig {
     pub private_key: RsaPrivateKey,
     /// DH private exponent bytes (random, at least 32 bytes).
     pub dh_private_bytes: Vec<u8>,
+}
+
+impl Drop for PkinitConfig {
+    fn drop(&mut self) {
+        self.dh_private_bytes.fill(0);
+        core::hint::black_box(&self.dh_private_bytes);
+    }
 }
 
 /// Kerberos authentication sequence.
@@ -259,7 +268,7 @@ impl KerberosSequence {
     }
 
     /// Build an AS-REQ with pre-authentication (PA-ENC-TIMESTAMP).
-    pub fn build_as_req_preauth(&self, timestamp: &[u8], usec: u32, confounder: &[u8; 16]) -> Vec<u8> {
+    pub fn build_as_req_preauth(&self, timestamp: &[u8], usec: u32, confounder: &[u8; 16]) -> ConnectorResult<Vec<u8>> {
         // Encode the timestamp
         let ts_enc = encode_pa_enc_ts_enc(timestamp, usec);
 
@@ -269,7 +278,7 @@ impl KerberosSequence {
             KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP,
             &ts_enc,
             confounder,
-        ).expect("krb5_aes_encrypt: client key is already validated");
+        ).map_err(|_| ConnectorError::general("pre-auth encrypt failed: invalid client key"))?;
 
         let enc_data = EncryptedData::new(self.etype, encrypted);
 
@@ -289,7 +298,7 @@ impl KerberosSequence {
         ];
 
         let req = KdcReq::as_req(padata, req_body);
-        req.encode()
+        Ok(req.encode())
     }
 
     /// Build an AS-REQ with PKINIT pre-authentication (PA-PK-AS-REQ).
@@ -789,8 +798,9 @@ impl KerberosSequence {
 
     fn parse_etype_info2_inner(&mut self, data: &[u8]) -> ConnectorResult<()> {
         let mut reader = DerReader::new(data);
+        let mut fallback_entry: Option<ETypeInfo2Entry> = None;
         if let Ok(mut seq) = reader.read_sequence() {
-            // SEQUENCE OF ETYPE-INFO2-ENTRY
+            // SEQUENCE OF ETYPE-INFO2-ENTRY — prefer AES-256 over AES-128
             while !seq.is_empty() {
                 // Read each entry
                 let (tag, content) = seq.read_tlv()
@@ -808,16 +818,22 @@ impl KerberosSequence {
                     full.extend_from_slice(content);
 
                     if let Ok(entry) = ETypeInfo2Entry::decode(&full) {
-                        // Pick the first AES etype
-                        if entry.etype == ETYPE_AES256_CTS_HMAC_SHA1
-                            || entry.etype == ETYPE_AES128_CTS_HMAC_SHA1
-                        {
+                        // Prefer AES-256 over AES-128
+                        if entry.etype == ETYPE_AES256_CTS_HMAC_SHA1 {
                             self.apply_etype_info2_entry(&entry);
                             return Ok(());
+                        }
+                        if entry.etype == ETYPE_AES128_CTS_HMAC_SHA1 && fallback_entry.is_none() {
+                            fallback_entry = Some(entry);
                         }
                     }
                 }
             }
+        }
+
+        // Use AES-128 fallback if AES-256 was not available
+        if let Some(entry) = fallback_entry {
+            self.apply_etype_info2_entry(&entry);
         }
 
         // Default salt: REALM + username
@@ -836,16 +852,40 @@ impl KerberosSequence {
         }
         if let Some(ref params) = entry.s2kparams {
             if params.len() == 4 {
-                self.iterations = u32::from_be_bytes([params[0], params[1], params[2], params[3]]);
+                // Cap at 1M to prevent DoS from a rogue KDC
+                const MAX_KDF_ITERATIONS: u32 = 1_000_000;
+                self.iterations = u32::from_be_bytes([params[0], params[1], params[2], params[3]])
+                    .min(MAX_KDF_ITERATIONS);
             }
         }
+    }
+}
+
+impl Drop for KerberosSequence {
+    fn drop(&mut self) {
+        // Zeroize password and derived keys
+        self.password.fill(0);
+        core::hint::black_box(&self.password);
+        self.client_key.fill(0);
+        core::hint::black_box(&self.client_key);
+        self.tgt_session_key.fill(0);
+        core::hint::black_box(&self.tgt_session_key);
+        self.service_session_key.fill(0);
+        core::hint::black_box(&self.service_session_key);
+        self.subkey.fill(0);
+        core::hint::black_box(&self.subkey);
+        // Zeroize bearer credential and password-derived salt
+        self.ap_req_bytes.fill(0);
+        core::hint::black_box(&self.ap_req_bytes);
+        self.salt.fill(0);
+        core::hint::black_box(&self.salt);
     }
 }
 
 /// Frame a Kerberos message with the TCP 4-byte length prefix.
 /// KDC over TCP uses: [4-byte big-endian length][message].
 pub fn frame_kdc_message(msg: &[u8]) -> Vec<u8> {
-    let len = msg.len() as u32;
+    let len: u32 = msg.len().try_into().expect("KDC message exceeds u32::MAX");
     let mut framed = Vec::with_capacity(4 + msg.len());
     framed.extend_from_slice(&len.to_be_bytes());
     framed.extend_from_slice(msg);

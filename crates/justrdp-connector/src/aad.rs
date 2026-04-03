@@ -15,6 +15,7 @@ use justrdp_core::rsa::rsa_sign_sha256;
 // Note: sha256 is used for JWK thumbprint computation (not for JWS signing).
 
 use crate::config::AadConfig;
+use crate::error::{ConnectorError, ConnectorResult};
 
 /// Build the RDP Assertion (JWS Compact Serialization) for Azure AD auth.
 ///
@@ -22,7 +23,7 @@ use crate::config::AadConfig;
 ///
 /// The signature uses RSASSA-PKCS1-v1_5 with SHA-256 over the ASCII bytes
 /// of `header_b64 + "." + payload_b64`.
-pub fn build_rdp_assertion(config: &AadConfig, server_nonce: &str) -> String {
+pub fn build_rdp_assertion(config: &AadConfig, server_nonce: &str) -> ConnectorResult<String> {
     let thumbprint = compute_jwk_thumbprint(&config.pop_key_n, &config.pop_key_e);
     let jwk_json = build_jwk_json(&config.pop_key_n, &config.pop_key_e);
 
@@ -61,10 +62,10 @@ pub fn build_rdp_assertion(config: &AadConfig, server_nonce: &str) -> String {
     // RSASSA-PKCS1-v1_5 signature with SHA-256
     // Note: rsa_sign_sha256 internally computes SHA-256, so pass plaintext (not pre-hashed)
     let signature = rsa_sign_sha256(&config.pop_key, signing_input.as_bytes())
-        .expect("RSA key too small for PKCS#1 v1.5 SHA-256 signing");
+        .map_err(|_| ConnectorError::general("RSA key too small for PKCS#1 v1.5 SHA-256 signing"))?;
     let signature_b64 = base64url::encode_string(&signature);
 
-    format!("{}.{}.{}", header_b64, payload_b64, signature_b64)
+    Ok(format!("{}.{}.{}", header_b64, payload_b64, signature_b64))
 }
 
 /// Compute JWK Thumbprint per RFC 7638.
@@ -97,8 +98,20 @@ pub fn extract_json_string_value<'a>(json: &'a str, key: &str) -> Option<&'a str
     let search = format!(r#""{}":""#, key);
     let start = json.find(&search)? + search.len();
     let rest = &json[start..];
-    let end = rest.find('"')?;
-    Some(&rest[..end])
+    // Find closing `"` while skipping escaped `\"`
+    let mut i = 0;
+    let bytes = rest.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2; // skip escaped character
+            continue;
+        }
+        if bytes[i] == b'"' {
+            return Some(&rest[..i]);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Extract an integer value from a flat JSON object.
@@ -117,13 +130,17 @@ pub fn build_auth_request_json(jws: &str) -> String {
     format!(r#"{{"rdp_assertion":"{}"}}"#, jws)
 }
 
-/// Escape a string for JSON embedding (handles " and \).
+/// Escape a string for JSON embedding (RFC 8259 §7).
 fn json_escape(s: &str) -> String {
+    use core::fmt::Write;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             _ => out.push(c),
         }
     }
@@ -229,7 +246,7 @@ mod tests {
             timestamp: 1711540800,
         };
 
-        let assertion = build_rdp_assertion(&config, "server_nonce_123");
+        let assertion = build_rdp_assertion(&config, "server_nonce_123").unwrap();
 
         // JWS has exactly 3 dot-separated segments
         let parts: Vec<&str> = assertion.split('.').collect();
@@ -298,7 +315,7 @@ mod tests {
             timestamp: 1000000,
         };
 
-        let assertion = build_rdp_assertion(&config, "server_nonce");
+        let assertion = build_rdp_assertion(&config, "server_nonce").unwrap();
         let parts: Vec<&str> = assertion.split('.').collect();
         assert_eq!(parts.len(), 3);
 
@@ -357,7 +374,7 @@ mod tests {
             timestamp: 1000000,
         };
 
-        let assertion = build_rdp_assertion(&config, "snonce");
+        let assertion = build_rdp_assertion(&config, "snonce").unwrap();
         let parts: Vec<&str> = assertion.split('.').collect();
         let payload_bytes = base64url::decode(parts[1].as_bytes()).unwrap();
         let payload_str = core::str::from_utf8(&payload_bytes).unwrap();

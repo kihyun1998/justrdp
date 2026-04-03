@@ -9,7 +9,6 @@ use alloc::vec::Vec;
 use justrdp_core::{Decode, Encode, PduHint, ReadCursor, WriteBuf, WriteCursor};
 
 use justrdp_pdu::gcc::client::{ClientClusterData, ClientCoreData, ClientNetworkData, ClientSecurityData};
-use justrdp_pdu::gcc::server::ServerNetworkData;
 use justrdp_pdu::gcc::{
     ConferenceCreateRequest, ConferenceCreateResponse, ServerDataBlockType, DATA_BLOCK_HEADER_SIZE,
 };
@@ -27,12 +26,12 @@ use justrdp_pdu::rdp::capabilities::{
     VirtualChannelCapability,
 };
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
-use justrdp_pdu::rdp::finalization::{ControlAction, ControlPdu, FontListPdu, SynchronizePdu};
+use justrdp_pdu::rdp::finalization::{ControlAction, ControlPdu, FontListPdu, PersistentKeyListPdu, SynchronizePdu};
 use justrdp_pdu::rdp::server_certificate;
 use justrdp_pdu::rdp::standard_security::{
     self, FipsSecurityContext, RdpSecurityContext,
     SEC_ENCRYPT, SEC_EXCHANGE_PKT,
-    ENCRYPTION_METHOD_FIPS, ENCRYPTION_LEVEL_NONE,
+    ENCRYPTION_METHOD_FIPS, ENCRYPTION_LEVEL_NONE, ENCRYPTION_LEVEL_LOW,
 };
 use justrdp_pdu::rdp::headers::{
     ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
@@ -73,6 +72,10 @@ impl PduHint for RdstlsHint {
             return None;
         }
         let pdu_length = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        // Must include at least the 6-byte header; cap at 64 KiB
+        if pdu_length < 6 || pdu_length > 65536 {
+            return None;
+        }
         Some((false, pdu_length))
     }
 }
@@ -85,7 +88,12 @@ struct AadJsonHint;
 
 impl PduHint for AadJsonHint {
     fn find_size(&self, bytes: &[u8]) -> Option<(bool, usize)> {
-        // Flat JSON PDU ends at the first `}` — return immediately on match
+        // Flat JSON PDU ends at the first `}` — return immediately on match.
+        // Cap at 64 KiB to prevent unbounded buffering from a malicious server.
+        const MAX_AAD_PDU_SIZE: usize = 65536;
+        if bytes.len() > MAX_AAD_PDU_SIZE {
+            return None;
+        }
         for (i, &b) in bytes.iter().enumerate() {
             if b == b'}' {
                 return Some((false, i + 1));
@@ -288,7 +296,13 @@ impl ClientConnector {
                 self.server_nego_flags = response.flags;
             }
             None => {
-                // No negotiation response means standard RDP security
+                // No negotiation response means standard RDP security.
+                // Reject if client requested TLS/HYBRID to prevent downgrade attack.
+                if self.config.security_protocol != SecurityProtocol::RDP {
+                    return Err(ConnectorError::general(
+                        "server did not negotiate security protocol; refusing downgrade from TLS/HYBRID to RDP",
+                    ));
+                }
                 self.selected_protocol = SecurityProtocol::RDP;
             }
         }
@@ -388,7 +402,7 @@ impl ClientConnector {
         let aad_config = self.config.aad_config.as_ref()
             .ok_or_else(|| ConnectorError::general("AAD config not set"))?;
 
-        let assertion = crate::aad::build_rdp_assertion(aad_config, server_nonce);
+        let assertion = crate::aad::build_rdp_assertion(aad_config, server_nonce)?;
         let auth_json = crate::aad::build_auth_request_json(&assertion);
         self.aad_auth_request_json = Some(auth_json);
 
@@ -401,7 +415,7 @@ impl ClientConnector {
             .ok_or_else(|| ConnectorError::general("AAD auth request JSON not built"))?;
 
         let bytes = json.as_bytes();
-        output.ensure_capacity(bytes.len());
+        output.resize(bytes.len());
         output.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
 
         self.state = ClientConnectorState::AadWaitAuthResult;
@@ -431,7 +445,7 @@ impl ClientConnector {
 
         let caps = RdstlsCapabilities::new();
         let size = caps.size();
-        output.ensure_capacity(size);
+        output.resize(size);
         let mut cursor = WriteCursor::new(output.as_mut_slice());
         caps.encode(&mut cursor)?;
 
@@ -488,7 +502,7 @@ impl ClientConnector {
         };
 
         let size = req.size();
-        output.ensure_capacity(size);
+        output.resize(size);
         let mut cursor = WriteCursor::new(output.as_mut_slice());
         req.encode(&mut cursor)?;
 
@@ -630,14 +644,20 @@ impl ClientConnector {
                     if remaining >= 8 && encryption_method != 0 && encryption_level != ENCRYPTION_LEVEL_NONE {
                         let random_len = block_cursor.read_u32_le("SecData::randomLen")? as usize;
                         let cert_len = block_cursor.read_u32_le("SecData::certLen")? as usize;
+                        // MS-RDPBCGR 2.2.1.4.3: serverRandom MUST be exactly 32 bytes
+                        if random_len != 32 {
+                            return Err(ConnectorError::general("server random must be exactly 32 bytes"));
+                        }
+                        // Reasonable upper bound for server certificate
+                        if cert_len > 16 * 1024 {
+                            return Err(ConnectorError::general("server certificate length exceeds maximum"));
+                        }
                         let random = block_cursor.read_slice(random_len, "SecData::random")?;
                         let cert_data = block_cursor.read_slice(cert_len, "SecData::cert")?;
 
-                        if random_len == 32 {
-                            let mut sr = [0u8; 32];
-                            sr.copy_from_slice(random);
-                            self.server_random = Some(sr);
-                        }
+                        let mut sr = [0u8; 32];
+                        sr.copy_from_slice(random);
+                        self.server_random = Some(sr);
 
                         // Parse server certificate to extract RSA public key
                         let cert = server_certificate::parse_server_certificate(cert_data)?;
@@ -648,6 +668,10 @@ impl ClientConnector {
                     // Parse body directly (header already consumed by parse_server_data_blocks)
                     let mcs_channel_id = block_cursor.read_u16_le("NetData::mcsChannelId")?;
                     let count = block_cursor.read_u16_le("NetData::channelCount")? as usize;
+                    // MS-RDPBCGR 2.2.1.4.4: practical limit is 31 static channels + system channels
+                    if count > 64 {
+                        return Err(ConnectorError::general("server channel count exceeds maximum"));
+                    }
                     let mut channel_ids = Vec::with_capacity(count);
                     for _ in 0..count {
                         channel_ids.push(block_cursor.read_u16_le("NetData::channelId")?);
@@ -722,7 +746,8 @@ impl ClientConnector {
     fn step_channel_join(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
         if self.channel_join_sending {
             // Send Join Request for current channel
-            let channel_id = self.channels_to_join[self.join_index];
+            let channel_id = *self.channels_to_join.get(self.join_index)
+                .ok_or_else(|| ConnectorError::general("channel join index out of bounds"))?;
             let pdu = ChannelJoinRequest {
                 initiator: self.user_channel_id,
                 channel_id,
@@ -787,22 +812,38 @@ impl ClientConnector {
                 let remaining = inner.remaining();
                 let encrypted = inner.read_slice(remaining, "SecurityHeader::encryptedData")?;
                 let mut data = encrypted.to_vec();
-                let _valid = ctx.decrypt(&mut data, &mac);
+                let valid = ctx.decrypt(&mut data, &mac);
+                if !valid {
+                    return Err(ConnectorError::general("Standard RDP Security: MAC verification failed (RC4)"));
+                }
                 Ok((flags, data))
             }
             SecurityMode::Fips(ctx) if flags & SEC_ENCRYPT != 0 => {
-                // MS-RDPBCGR TS_SECURITY_HEADER2: padLen(1) then dataSignature(8)
-                let pad_len = inner.read_u8("SecurityHeader::padLen")?;
-                let mac_bytes = inner.read_slice(8, "SecurityHeader::mac")?;
+                // MS-RDPBCGR §5.3.6 TS_SECURITY_HEADER2: length(2) + version(1) + padLen(1) + dataSignature(8)
+                let _fips_length = inner.read_u16_le("FipsHeader::length")?;
+                let _fips_version = inner.read_u8("FipsHeader::version")?;
+                let pad_len = inner.read_u8("FipsHeader::padLen")?;
+                let mac_bytes = inner.read_slice(8, "FipsHeader::mac")?;
                 let mut mac = [0u8; 8];
                 mac.copy_from_slice(mac_bytes);
                 let remaining = inner.remaining();
                 let encrypted = inner.read_slice(remaining, "SecurityHeader::encryptedData")?;
-                let (data, _valid) = ctx.decrypt(encrypted, &mac, pad_len);
+                let (data, valid) = ctx.decrypt(encrypted, &mac, pad_len);
+                if !valid {
+                    return Err(ConnectorError::general("Standard RDP Security: MAC verification failed (FIPS)"));
+                }
                 Ok((flags, data))
             }
+            SecurityMode::Rc4(_) | SecurityMode::Fips(_)
+                if self.server_encryption_level != ENCRYPTION_LEVEL_LOW =>
+            {
+                // Encryption negotiated at CLIENT_COMPATIBLE/HIGH/FIPS but SEC_ENCRYPT
+                // not set — reject to prevent downgrade attack.
+                Err(ConnectorError::general("Standard RDP Security: SEC_ENCRYPT flag missing on encrypted session"))
+            }
             _ => {
-                // No encryption or SEC_ENCRYPT not set
+                // ENCRYPTION_LEVEL_LOW: server→client is not encrypted (MS-RDPBCGR 5.3.2).
+                // SecurityMode::None: TLS/NLA, no encryption layer.
                 let remaining = inner.remaining();
                 let data = inner.read_slice(remaining, "SecurityHeader::data")?;
                 Ok((flags, data.to_vec()))
@@ -838,16 +879,18 @@ impl ClientConnector {
             SecurityMode::Fips(ctx) => {
                 let (ciphertext, mac, pad_len) = ctx.encrypt(payload);
 
-                // FIPS header: flags(2) + flagsHi(2) + padLen(1) + MAC(8) + encrypted_data
-                let inner_size = 4 + 1 + 8 + ciphertext.len();
+                // MS-RDPBCGR §5.3.6: flags(2) + flagsHi(2) + length(2) + version(1) + padLen(1) + MAC(8) + data
+                let inner_size = 4 + 2 + 1 + 1 + 8 + ciphertext.len();
                 let mut inner = vec![0u8; inner_size];
                 {
                     let mut cursor = WriteCursor::new(&mut inner);
                     cursor.write_u16_le(SEC_ENCRYPT, "SecurityHeader::flags")?;
                     cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-                    cursor.write_u8(pad_len, "SecurityHeader::padLen")?;
-                    cursor.write_slice(&mac, "SecurityHeader::mac")?;
-                    cursor.write_slice(&ciphertext, "SecurityHeader::encryptedData")?;
+                    cursor.write_u16_le(0x0010, "FipsHeader::length")?;
+                    cursor.write_u8(0x01, "FipsHeader::version")?;
+                    cursor.write_u8(pad_len, "FipsHeader::padLen")?;
+                    cursor.write_slice(&mac, "FipsHeader::mac")?;
+                    cursor.write_slice(&ciphertext, "FipsHeader::encryptedData")?;
                 }
                 encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
             }
@@ -880,14 +923,16 @@ impl ClientConnector {
         // Build Security Exchange PDU
         // Header: flags(2) + flagsHi(2) = SEC_EXCHANGE_PKT
         // Body: length(4 LE) + encrypted_random
-        let encrypted_len = encrypted_random.len();
-        let inner_size = BASIC_SECURITY_HEADER_SIZE + 4 + encrypted_len;
+        let encrypted_len: u32 = encrypted_random.len()
+            .try_into()
+            .map_err(|_| ConnectorError::general("encrypted random too large"))?;
+        let inner_size = BASIC_SECURITY_HEADER_SIZE + 4 + encrypted_len as usize;
         let mut inner = vec![0u8; inner_size];
         {
             let mut cursor = WriteCursor::new(&mut inner);
             cursor.write_u16_le(SEC_EXCHANGE_PKT, "SecExchange::flags")?;
             cursor.write_u16_le(0, "SecExchange::flagsHi")?;
-            cursor.write_u32_le(encrypted_len as u32, "SecExchange::length")?;
+            cursor.write_u32_le(encrypted_len, "SecExchange::length")?;
             cursor.write_slice(&encrypted_random, "SecExchange::encryptedRandom")?;
         }
 
@@ -947,21 +992,26 @@ impl ClientConnector {
                 }
                 SecurityMode::Fips(ctx) => {
                     let (ciphertext, mac, pad_len) = ctx.encrypt(&info_bytes);
-                    let inner_size = 4 + 1 + 8 + ciphertext.len();
+                    // MS-RDPBCGR §5.3.6: flags(2) + flagsHi(2) + length(2) + version(1) + padLen(1) + MAC(8) + data
+                    let inner_size = 4 + 2 + 1 + 1 + 8 + ciphertext.len();
                     let mut inner = vec![0u8; inner_size];
                     {
                         let mut cursor = WriteCursor::new(&mut inner);
                         cursor.write_u16_le(sec_flags, "SecurityHeader::flags")?;
                         cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-                        cursor.write_u8(pad_len, "SecurityHeader::padLen")?;
-                        cursor.write_slice(&mac, "SecurityHeader::mac")?;
-                        cursor.write_slice(&ciphertext, "SecurityHeader::encryptedData")?;
+                        cursor.write_u16_le(0x0010, "FipsHeader::length")?;
+                        cursor.write_u8(0x01, "FipsHeader::version")?;
+                        cursor.write_u8(pad_len, "FipsHeader::padLen")?;
+                        cursor.write_slice(&mac, "FipsHeader::mac")?;
+                        cursor.write_slice(&ciphertext, "FipsHeader::encryptedData")?;
                     }
                     let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
                     self.state = ClientConnectorState::ConnectTimeAutoDetection;
                     Ok(Written::new(size))
                 }
-                SecurityMode::None => unreachable!(),
+                SecurityMode::None => {
+                    Err(ConnectorError::general("internal error: None security mode in encrypted path"))
+                }
             }
         } else {
             // TLS/NLA mode: send unencrypted (basic security header only)
@@ -1110,7 +1160,7 @@ impl ClientConnector {
     fn step_capabilities_send_confirm_active(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         let confirm = ConfirmActivePdu {
             share_id: self.share_id,
-            originator_id: 0x03EA, // MS-RDPBCGR 2.2.1.13.2: server channel ID (always 1002)
+            originator_id: self.io_channel_id, // MS-RDPBCGR 2.2.1.13.2: server channel ID
             source_descriptor: vec![0x4D, 0x53, 0x54, 0x53, 0x43, 0x00], // "MSTSC\0"
             capability_sets: self.build_client_capabilities(),
         };
@@ -1121,7 +1171,7 @@ impl ClientConnector {
             ShareControlPduType::ConfirmActivePdu,
             self.user_channel_id,
             &confirm_bytes,
-        );
+        )?;
 
         let size = self.encrypt_and_send_mcs(&sc_payload, output)?;
         self.state = ClientConnectorState::ConnectionFinalizationSendSynchronize;
@@ -1285,12 +1335,12 @@ impl ClientConnector {
         output: &mut WriteBuf,
     ) -> ConnectorResult<Written> {
         let inner_bytes = justrdp_core::encode_vec(inner)?;
-        let sd_payload = wrap_share_data(self.share_id, pdu_type2, &inner_bytes);
+        let sd_payload = wrap_share_data(self.share_id, pdu_type2, &inner_bytes)?;
         let sc_payload = wrap_share_control(
             ShareControlPduType::Data,
             self.user_channel_id,
             &sd_payload,
-        );
+        )?;
         let size = self.encrypt_and_send_mcs(&sc_payload, output)?;
         self.state = next_state;
         Ok(Written::new(size))
@@ -1341,11 +1391,20 @@ impl ClientConnector {
     ///
     /// Currently sends an empty persistent key list (no cached bitmaps).
     /// This is a required step in the finalization sequence.
-    fn step_finalization_send_persistent_key_list(&mut self, _output: &mut WriteBuf) -> ConnectorResult<Written> {
-        // For now, skip persistent key list (no bitmap cache) and go straight to font list.
-        // A full implementation would send cached bitmap keys here.
-        self.state = ClientConnectorState::ConnectionFinalizationSendFontList;
-        Ok(Written::nothing())
+    fn step_finalization_send_persistent_key_list(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
+        // MS-RDPBCGR 2.2.1.17: send empty persistent key list (no cached bitmaps).
+        let pdu = PersistentKeyListPdu {
+            num_entries: [0; 5],
+            total_entries: [0; 5],
+            flags: 0x03, // PERSIST_FIRST_PDU | PERSIST_LAST_PDU
+            keys: Vec::new(),
+        };
+        self.step_send_finalization_pdu(
+            ShareDataPduType::PersistentKeyList,
+            &pdu,
+            ClientConnectorState::ConnectionFinalizationSendFontList,
+            output,
+        )
     }
 
     fn step_finalization_send_font_list(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {

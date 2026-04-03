@@ -10,12 +10,21 @@ use justrdp_pdu::rdp::client_info::PerformanceFlags;
 use justrdp_pdu::x224::SecurityProtocol;
 
 /// Authentication credentials.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credentials {
     /// Username.
     pub username: String,
     /// Password.
     pub password: String,
+}
+
+impl core::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Desktop size in pixels.
@@ -181,7 +190,7 @@ pub enum AuthMode {
 /// The caller is responsible for the OAuth2 token acquisition (HTTP calls)
 /// before constructing this config. The connector uses these values to
 /// build the RDP Assertion (JWS) during the RDSAAD handshake.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AadConfig {
     /// Pre-acquired OAuth2 RDP access token (PoP token from Azure AD).
     pub access_token: String,
@@ -199,6 +208,18 @@ pub struct AadConfig {
     /// Unix timestamp (seconds since epoch) for the assertion.
     /// Caller must provide since no_std has no clock.
     pub timestamp: u64,
+}
+
+impl core::fmt::Debug for AadConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AadConfig")
+            .field("access_token", &"[REDACTED]")
+            .field("resource_uri", &self.resource_uri)
+            .field("aad_nonce", &"[REDACTED]")
+            .field("pop_key", &"[REDACTED]")
+            .field("timestamp", &self.timestamp)
+            .finish()
+    }
 }
 
 /// RDP connection configuration.

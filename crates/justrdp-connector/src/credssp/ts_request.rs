@@ -12,6 +12,10 @@ use alloc::vec::Vec;
 /// Sent in the initial TsRequest; the negotiated version is min(client, server).
 pub const TS_REQUEST_MAX_VERSION: u32 = 6;
 
+/// Maximum allowed size for individual TsRequest fields (256 KiB).
+/// Prevents excessive memory allocation from malformed/malicious server responses.
+const TS_REQUEST_MAX_FIELD_SIZE: usize = 256 * 1024;
+
 /// TsRequest PDU.
 #[derive(Debug, Clone)]
 pub struct TsRequest {
@@ -81,7 +85,13 @@ impl TsRequest {
 
     /// Decode TsRequest from DER bytes.
     pub fn decode(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() > TS_REQUEST_MAX_FIELD_SIZE {
+            return Err("TsRequest exceeds maximum allowed size");
+        }
         let mut pos = 0;
+        if data.is_empty() || data[0] != 0x30 {
+            return Err("expected SEQUENCE tag (0x30) for TsRequest");
+        }
         let (_, seq_end) = der_read_tag_length(data, &mut pos).ok_or("invalid outer SEQUENCE")?;
 
         let mut ts_request = TsRequest::new();
@@ -277,6 +287,9 @@ fn der_read_octet_string(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, &'stat
     let len = end - *pos;
     if *pos + len > data.len() {
         return Err("OCTET STRING truncated");
+    }
+    if len > TS_REQUEST_MAX_FIELD_SIZE {
+        return Err("OCTET STRING exceeds maximum allowed size");
     }
     let result = data[*pos..*pos + len].to_vec();
     *pos = end;

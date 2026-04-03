@@ -80,7 +80,7 @@ pub fn wrap_share_control(
     pdu_type: ShareControlPduType,
     pdu_source: u16,
     inner: &[u8],
-) -> Vec<u8> {
+) -> ConnectorResult<Vec<u8>> {
     let total_length = SHARE_CONTROL_HEADER_SIZE + inner.len();
     let hdr = ShareControlHeader {
         total_length: total_length as u16,
@@ -90,10 +90,9 @@ pub fn wrap_share_control(
 
     let mut buf = vec![0u8; total_length];
     let mut cursor = WriteCursor::new(&mut buf);
-    // These are infallible for correctly-sized buffers, but we unwrap for safety.
-    hdr.encode(&mut cursor).expect("share control header encode");
-    cursor.write_slice(inner, "share_control_inner").expect("share control inner");
-    buf
+    hdr.encode(&mut cursor)?;
+    cursor.write_slice(inner, "share_control_inner")?;
+    Ok(buf)
 }
 
 /// Build a ShareDataHeader + inner payload as bytes.
@@ -101,7 +100,7 @@ pub fn wrap_share_data(
     share_id: u32,
     pdu_type2: ShareDataPduType,
     inner: &[u8],
-) -> Vec<u8> {
+) -> ConnectorResult<Vec<u8>> {
     let total_length = SHARE_DATA_HEADER_SIZE + inner.len();
     let hdr = ShareDataHeader {
         share_id,
@@ -114,7 +113,7 @@ pub fn wrap_share_data(
 
     let mut buf = vec![0u8; total_length];
     let mut cursor = WriteCursor::new(&mut buf);
-    hdr.encode(&mut cursor).expect("share data header encode");
-    cursor.write_slice(inner, "share_data_inner").expect("share data inner");
-    buf
+    hdr.encode(&mut cursor)?;
+    cursor.write_slice(inner, "share_data_inner")?;
+    Ok(buf)
 }

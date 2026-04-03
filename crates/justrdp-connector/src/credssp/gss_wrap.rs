@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! GSS-API Wrap/Unwrap for Kerberos (RFC 4121).
 //!
 //! Implements the per-message GSS Wrap token format used by CredSSP
@@ -44,7 +46,7 @@ pub fn gss_wrap(
     confounder: &[u8; 16],
     is_initiator: bool,
     data: &[u8],
-) -> Vec<u8> {
+) -> ConnectorResult<Vec<u8>> {
     // Build flags
     let mut flags = FLAG_SEALED;
     if !is_initiator {
@@ -73,7 +75,7 @@ pub fn gss_wrap(
 
     // Encrypt: confounder(16) || plaintext, producing ciphertext || HMAC(12)
     let encrypted = krb5_aes_encrypt(key, key_usage, &plaintext, confounder)
-        .expect("gss_wrap: key must be valid AES-128 or AES-256");
+        .map_err(|_| ConnectorError::general("gss_wrap: key must be valid AES-128 or AES-256"))?;
 
     // Right-rotate the encrypted data by RRC positions
     let rotated = rotate_right(&encrypted, AES_RRC as usize);
@@ -85,7 +87,7 @@ pub fn gss_wrap(
     let mut token = Vec::with_capacity(GSS_WRAP_HEADER_SIZE + rotated.len());
     token.extend_from_slice(&output_header);
     token.extend_from_slice(&rotated);
-    token
+    Ok(token)
 }
 
 /// Unwrap (decrypt) a GSS Wrap token (RFC 4121).
@@ -95,6 +97,7 @@ pub fn gss_unwrap(
     key: &[u8],
     is_initiator: bool,
     token: &[u8],
+    expected_seq: u64,
 ) -> ConnectorResult<Vec<u8>> {
     if token.len() < GSS_WRAP_HEADER_SIZE {
         return Err(ConnectorError::general("GSS Wrap token too short"));
@@ -113,6 +116,12 @@ pub fn gss_unwrap(
     let ec = u16::from_be_bytes([token[4], token[5]]) as usize;
     let rrc = u16::from_be_bytes([token[6], token[7]]) as usize;
 
+    // RFC 4121 §4.2.6: verify sequence number to prevent replay
+    let seq_number = u64::from_be_bytes(token[8..16].try_into().unwrap());
+    if seq_number != expected_seq {
+        return Err(ConnectorError::general("GSS Wrap: sequence number mismatch"));
+    }
+
     let ciphertext = &token[GSS_WRAP_HEADER_SIZE..];
 
     // Undo right rotation
@@ -130,6 +139,11 @@ pub fn gss_unwrap(
     // Decrypt
     let decrypted = krb5_aes_decrypt(key, key_usage, &unrotated)
         .map_err(|_| ConnectorError::general("GSS Wrap: decryption failed"))?;
+
+    // RFC 4121 §4.2.4: EC must equal AES block size (16) for confidentiality
+    if ec != AES_EC as usize {
+        return Err(ConnectorError::general("GSS Wrap: unexpected EC value"));
+    }
 
     // decrypted = data || filler(ec bytes) || header(16 bytes)
     if decrypted.len() < ec + GSS_WRAP_HEADER_SIZE {
@@ -226,7 +240,7 @@ mod tests {
         let plaintext = b"Hello, CredSSP with Kerberos!";
 
         // Client (initiator) wraps
-        let token = gss_wrap(&key, 0, &confounder, true, plaintext);
+        let token = gss_wrap(&key, 0, &confounder, true, plaintext).unwrap();
 
         // Verify token starts with TOK_ID
         assert_eq!(token[0], 0x05);
@@ -239,7 +253,7 @@ mod tests {
         // for unwrap, is_initiator means "are WE the initiator" which determines
         // the key usage for the SENDER.
         // Since the client (initiator) wrapped it, the server unwraps with is_initiator=false.
-        let unwrapped = gss_unwrap(&key, false, &token).unwrap();
+        let unwrapped = gss_unwrap(&key, false, &token, 0).unwrap();
         assert_eq!(&unwrapped, plaintext);
     }
 
@@ -248,8 +262,8 @@ mod tests {
         let key = [0x55u8; 32];
         let confounder = [0x22u8; 16];
 
-        let token = gss_wrap(&key, 42, &confounder, true, b"");
-        let unwrapped = gss_unwrap(&key, false, &token).unwrap();
+        let token = gss_wrap(&key, 42, &confounder, true, b"").unwrap();
+        let unwrapped = gss_unwrap(&key, false, &token, 42).unwrap();
         assert!(unwrapped.is_empty());
     }
 
@@ -258,7 +272,7 @@ mod tests {
         let key = [0x33u8; 32];
         let confounder = [0x44u8; 16];
 
-        let token = gss_wrap(&key, 0x0102030405060708, &confounder, true, b"test");
+        let token = gss_wrap(&key, 0x0102030405060708, &confounder, true, b"test").unwrap();
 
         // Seq number is at bytes 8..16 in big-endian
         let seq = u64::from_be_bytes(token[8..16].try_into().unwrap());
@@ -272,8 +286,8 @@ mod tests {
         let confounder = [0x88u8; 16];
         let plaintext = b"AES-128 test data";
 
-        let token = gss_wrap(&key, 1, &confounder, true, plaintext);
-        let unwrapped = gss_unwrap(&key, false, &token).unwrap();
+        let token = gss_wrap(&key, 1, &confounder, true, plaintext).unwrap();
+        let unwrapped = gss_unwrap(&key, false, &token, 1).unwrap();
         assert_eq!(&unwrapped, plaintext);
     }
 }
