@@ -325,9 +325,12 @@ impl BigUint {
 
     /// Modular exponentiation: self^exp mod modulus.
     ///
-    /// Uses the Montgomery ladder algorithm for constant-time execution:
-    /// both branches perform the same operations (one multiply + one square)
-    /// regardless of each exponent bit, preventing timing side-channel attacks.
+    /// Uses Montgomery ladder with branchless conditional swap to avoid
+    /// leaking the exponent via branch-prediction or cache side-channels.
+    ///
+    /// **Note**: The underlying mul/rem operations are not fully constant-time
+    /// (they depend on operand magnitude). For production use with secret
+    /// exponents, a fixed-width constant-time bigint library is recommended.
     pub fn mod_exp(&self, exp: &Self, modulus: &Self) -> Self {
         if modulus.is_zero() {
             return Self::zero();
@@ -342,26 +345,48 @@ impl BigUint {
         let base = self.rem(modulus);
         let exp_bits = exp.bit_len();
 
-        // Montgomery ladder: constant-time modular exponentiation.
-        // Both branches perform identical work (multiply + square),
-        // only the assignment target differs.
-        let mut r0 = one;      // accumulates result
-        let mut r1 = base;     // base * result
+        // Montgomery ladder with conditional swap:
+        //   ct_swap(r0, r1, bit)   — swap if bit=1
+        //   r1 = r0 * r1 mod n    — always multiply
+        //   r0 = r0^2 mod n       — always square
+        //   ct_swap(r0, r1, bit)   — swap back
+        // This ensures identical operations regardless of each exponent bit.
+        let mut r0 = one;
+        let mut r1 = base;
 
         for i in (0..exp_bits).rev() {
-            if exp.bit(i) {
-                r0 = r0.mul(&r1).rem(modulus);
-                r1 = r1.mul(&r1).rem(modulus);
-            } else {
-                r1 = r0.mul(&r1).rem(modulus);
-                r0 = r0.mul(&r0).rem(modulus);
-            }
+            let bit = exp.bit(i);
+            Self::ct_swap(&mut r0, &mut r1, bit);
+            r1 = r0.mul(&r1).rem(modulus);
+            r0 = r0.mul(&r0).rem(modulus);
+            Self::ct_swap(&mut r0, &mut r1, bit);
         }
 
         r0
     }
 
+    /// Branchless conditional swap: if `condition` is true, swap `a` and `b`
+    /// using XOR without any data-dependent branches.
+    fn ct_swap(a: &mut Self, b: &mut Self, condition: bool) {
+        let max_len = core::cmp::max(a.limbs.len(), b.limbs.len());
+        a.limbs.resize(max_len, 0);
+        b.limbs.resize(max_len, 0);
+
+        // mask = 0xFFFFFFFF if condition, 0x00000000 if not (branchless)
+        let mask = (condition as u32).wrapping_neg();
+        for i in 0..max_len {
+            let diff = a.limbs[i] ^ b.limbs[i];
+            let masked = diff & mask;
+            a.limbs[i] ^= masked;
+            b.limbs[i] ^= masked;
+        }
+    }
+
     /// Zero out all limbs to prevent key material from lingering in memory.
+    ///
+    /// Uses `core::hint::black_box` as an optimization barrier. Note that this
+    /// is a best-effort defense; LTO or aggressive optimizers may still elide
+    /// the zeroing. For stronger guarantees, use the `zeroize` crate.
     pub fn zeroize(&mut self) {
         self.limbs.fill(0);
         core::hint::black_box(&self.limbs);

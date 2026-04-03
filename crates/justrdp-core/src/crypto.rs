@@ -21,6 +21,10 @@ use alloc::vec;
 // ── RC4 ──
 
 /// RC4 stream cipher state.
+///
+/// **WARNING**: RC4 is cryptographically broken. Use only for legacy
+/// Standard RDP Security (MS-RDPBCGR 5.3/5.4) compatibility.
+/// Prefer NLA/TLS for new connections.
 #[derive(Clone)]
 pub struct Rc4 {
     s: [u8; 256],
@@ -30,7 +34,11 @@ pub struct Rc4 {
 
 impl Rc4 {
     /// Initialize RC4 with the given key.
+    ///
+    /// # Panics
+    /// Panics if `key` is empty.
     pub fn new(key: &[u8]) -> Self {
+        assert!(!key.is_empty(), "RC4 key must not be empty");
         let mut s = [0u8; 256];
         for i in 0..256 {
             s[i] = i as u8;
@@ -65,19 +73,55 @@ impl Drop for Rc4 {
     }
 }
 
+// ── Common hash buffered-update logic ──
+
+/// Implements the standard 64-byte block-buffered `update()` method for hash functions.
+/// The only difference across MD4/MD5/SHA-1/SHA-256 is the transform function and state type.
+macro_rules! hash_update_impl {
+    ($self:ident, $data:ident, $transform:expr) => {{
+        let mut offset = 0;
+        $self.count += $data.len() as u64;
+
+        if $self.buf_len > 0 {
+            let needed = 64 - $self.buf_len;
+            if $data.len() < needed {
+                $self.buffer[$self.buf_len..$self.buf_len + $data.len()].copy_from_slice($data);
+                $self.buf_len += $data.len();
+                return;
+            }
+            $self.buffer[$self.buf_len..64].copy_from_slice(&$data[..needed]);
+            $transform(&mut $self.state, &$self.buffer);
+            offset = needed;
+            $self.buf_len = 0;
+        }
+
+        while offset + 64 <= $data.len() {
+            let mut block = [0u8; 64];
+            block.copy_from_slice(&$data[offset..offset + 64]);
+            $transform(&mut $self.state, &block);
+            offset += 64;
+        }
+
+        if offset < $data.len() {
+            let remaining = $data.len() - offset;
+            $self.buffer[..remaining].copy_from_slice(&$data[offset..]);
+            $self.buf_len = remaining;
+        }
+    }};
+}
+
 // ── MD4 ──
 
 /// MD4 hash (128-bit / 16 bytes). Required for NTLM NT hash (NTOWF).
+///
+/// **WARNING**: MD4 is cryptographically broken. Use only for NTLM NTOWF
+/// compatibility. Do not use for integrity verification or signatures.
 pub struct Md4 {
     state: [u32; 4],
     count: u64,
     buffer: [u8; 64],
     buf_len: usize,
 }
-
-// NOTE: The `update()` method body is intentionally duplicated across Md4/Md5/Sha1/Sha256.
-// In no_std without trait objects, the transform function differs per hash and cannot be
-// abstracted without a macro or generics. The duplication is acceptable for 4 fixed hash types.
 
 impl Md4 {
     /// Create a new MD4 hasher.
@@ -92,34 +136,7 @@ impl Md4 {
 
     /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
-        let mut offset = 0;
-        self.count += data.len() as u64;
-
-        if self.buf_len > 0 {
-            let needed = 64 - self.buf_len;
-            if data.len() < needed {
-                self.buffer[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
-                self.buf_len += data.len();
-                return;
-            }
-            self.buffer[self.buf_len..64].copy_from_slice(&data[..needed]);
-            md4_transform(&mut self.state, &self.buffer);
-            offset = needed;
-            self.buf_len = 0;
-        }
-
-        while offset + 64 <= data.len() {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&data[offset..offset + 64]);
-            md4_transform(&mut self.state, &block);
-            offset += 64;
-        }
-
-        if offset < data.len() {
-            let remaining = data.len() - offset;
-            self.buffer[..remaining].copy_from_slice(&data[offset..]);
-            self.buf_len = remaining;
-        }
+        hash_update_impl!(self, data, md4_transform);
     }
 
     /// Finalize and return the 16-byte MD4 hash.
@@ -224,34 +241,7 @@ impl Md5 {
 
     /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
-        let mut offset = 0;
-        self.count += data.len() as u64;
-
-        if self.buf_len > 0 {
-            let needed = 64 - self.buf_len;
-            if data.len() < needed {
-                self.buffer[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
-                self.buf_len += data.len();
-                return;
-            }
-            self.buffer[self.buf_len..64].copy_from_slice(&data[..needed]);
-            md5_transform(&mut self.state, &self.buffer);
-            offset = needed;
-            self.buf_len = 0;
-        }
-
-        while offset + 64 <= data.len() {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&data[offset..offset + 64]);
-            md5_transform(&mut self.state, &block);
-            offset += 64;
-        }
-
-        if offset < data.len() {
-            let remaining = data.len() - offset;
-            self.buffer[..remaining].copy_from_slice(&data[offset..]);
-            self.buf_len = remaining;
-        }
+        hash_update_impl!(self, data, md5_transform);
     }
 
     /// Finalize and return the 16-byte MD5 hash.
@@ -347,34 +337,7 @@ impl Sha1 {
 
     /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
-        let mut offset = 0;
-        self.count += data.len() as u64;
-
-        if self.buf_len > 0 {
-            let needed = 64 - self.buf_len;
-            if data.len() < needed {
-                self.buffer[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
-                self.buf_len += data.len();
-                return;
-            }
-            self.buffer[self.buf_len..64].copy_from_slice(&data[..needed]);
-            sha1_transform(&mut self.state, &self.buffer);
-            offset = needed;
-            self.buf_len = 0;
-        }
-
-        while offset + 64 <= data.len() {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&data[offset..offset + 64]);
-            sha1_transform(&mut self.state, &block);
-            offset += 64;
-        }
-
-        if offset < data.len() {
-            let remaining = data.len() - offset;
-            self.buffer[..remaining].copy_from_slice(&data[offset..]);
-            self.buf_len = remaining;
-        }
+        hash_update_impl!(self, data, sha1_transform);
     }
 
     /// Finalize and return the 20-byte SHA-1 hash.
@@ -412,12 +375,13 @@ fn sha1_transform(state: &mut [u32; 5], block: &[u8; 64]) {
 
     let (mut a, mut b, mut c, mut d, mut e) = (state[0], state[1], state[2], state[3], state[4]);
 
+    // FIPS 180-4 §4.2.1 — SHA-1 round constants
     for i in 0..80 {
         let (f, k) = match i {
-            0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-            20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
-            40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-            _ => (b ^ c ^ d, 0xCA62C1D6),
+            0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),   // floor(sqrt(2) × 2^30)
+            20..=39 => (b ^ c ^ d, 0x6ED9EBA1),                // floor(sqrt(3) × 2^30)
+            40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC), // floor(sqrt(5) × 2^30)
+            _ => (b ^ c ^ d, 0xCA62C1D6),                      // floor(sqrt(10) × 2^30)
         };
         let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
         e = d;
@@ -460,34 +424,7 @@ impl Sha256 {
 
     /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
-        let mut offset = 0;
-        self.count += data.len() as u64;
-
-        if self.buf_len > 0 {
-            let needed = 64 - self.buf_len;
-            if data.len() < needed {
-                self.buffer[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
-                self.buf_len += data.len();
-                return;
-            }
-            self.buffer[self.buf_len..64].copy_from_slice(&data[..needed]);
-            sha256_transform(&mut self.state, &self.buffer);
-            offset = needed;
-            self.buf_len = 0;
-        }
-
-        while offset + 64 <= data.len() {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&data[offset..offset + 64]);
-            sha256_transform(&mut self.state, &block);
-            offset += 64;
-        }
-
-        if offset < data.len() {
-            let remaining = data.len() - offset;
-            self.buffer[..remaining].copy_from_slice(&data[offset..]);
-            self.buf_len = remaining;
-        }
+        hash_update_impl!(self, data, sha256_transform);
     }
 
     /// Finalize and return the 32-byte SHA-256 hash.

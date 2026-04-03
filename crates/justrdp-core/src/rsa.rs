@@ -164,8 +164,10 @@ pub fn rsa_public_encrypt_rdp(key: &RsaPublicKey, plaintext: &[u8]) -> Vec<u8> {
 /// Verify an RSA PKCS#1 v1.5 (SHA-256) signature.
 ///
 /// 1. Compute s^e mod n to recover the padded message
-/// 2. Verify PKCS#1 v1.5 padding structure
-/// 3. Extract and compare the hash
+/// 2. Reconstruct expected padded message and compare in constant time
+///
+/// Note: `mod_exp` with a public exponent `e` is not timing-sensitive since
+/// `e` is publicly known (typically 65537).
 pub fn rsa_verify_sha256(key: &RsaPublicKey, data: &[u8], signature: &[u8]) -> bool {
     let k = key.key_size();
 
