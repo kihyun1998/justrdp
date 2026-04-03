@@ -7,21 +7,54 @@
 use crate::error::{AudioError, AudioResult};
 
 /// Adaptation table for delta updates -- 16 entries.
-/// AdaptationTable[nibble] * delta / 256 = new delta.
+/// `new_delta = AdaptationTable[nibble] * delta / 256`.
+/// Microsoft ADPCM codec specification (MSDN Multimedia Data Standards Update).
 const ADAPTATION_TABLE: [i32; 16] = [
     230, 230, 230, 230, 307, 409, 512, 614,
     768, 614, 512, 409, 307, 230, 230, 230,
 ];
 
 /// Default coefficient table (7 standard pairs).
+/// Microsoft ADPCM codec specification (MSDN Multimedia Data Standards Update).
 const DEFAULT_COEF1: [i16; 7] = [256, 512, 0, 192, 240, 460, 392];
 const DEFAULT_COEF2: [i16; 7] = [0, -256, 0, 64, 0, -208, -232];
 
-/// Fixed-point coefficient base (divisor).
+/// Fixed-point coefficient base (divisor = 2^8).
+/// Microsoft ADPCM codec specification (MSDN Multimedia Data Standards Update).
 const COEF_BASE: i32 = 256;
 
 /// Minimum delta value.
+/// Microsoft ADPCM codec specification (MSDN Multimedia Data Standards Update).
 const MIN_DELTA: i32 = 16;
+
+/// Maximum supported channels (mono or stereo).
+/// [MS-RDPEA] Section 2.2.2.1 — nChannels field.
+const MAX_CHANNELS: u16 = 2;
+
+/// Number of standard coefficient pairs used by MS-ADPCM.
+/// Microsoft ADPCM codec specification (MSDN Multimedia Data Standards Update).
+const NUM_DEFAULT_COEF: usize = 7;
+
+/// Bytes per coefficient pair (coef1: i16, coef2: i16).
+/// Microsoft ADPCM codec specification (MSDN Multimedia Data Standards Update).
+const COEF_PAIR_BYTES: usize = 4;
+
+/// Byte offset of first coefficient pair in extra_data
+/// (after wSamplesPerBlock(2) + wNumCoef(2)).
+/// Microsoft ADPCM codec specification (MSDN Multimedia Data Standards Update).
+const COEF_DATA_OFFSET: usize = 4;
+
+/// Mono block header size: bPredictor(1) + iDelta(2) + iSamp1(2) + iSamp2(2) = 7 bytes.
+/// Microsoft ADPCM codec specification (MSDN Multimedia Data Standards Update).
+const MONO_HEADER_BYTES: usize = 7;
+
+/// Parsed MS-ADPCM block header.
+struct BlockHeader {
+    predictor_idx: [u8; 2],
+    delta: [i32; 2],
+    samp1: [i32; 2],
+    samp2: [i32; 2],
+}
 
 /// MS-ADPCM decoder.
 #[derive(Debug, Clone)]
@@ -45,7 +78,13 @@ impl MsAdpcmDecoder {
         block_align: u16,
         extra_data: &[u8],
     ) -> AudioResult<Self> {
-        if extra_data.len() < 4 {
+        if n_channels == 0 || n_channels > MAX_CHANNELS {
+            return Err(AudioError::InvalidFormat(
+                "MS-ADPCM: only 1 or 2 channels supported",
+            ));
+        }
+
+        if extra_data.len() < COEF_DATA_OFFSET {
             return Err(AudioError::InvalidFormat("MS-ADPCM extra data too short"));
         }
 
@@ -53,22 +92,30 @@ impl MsAdpcmDecoder {
             u16::from_le_bytes([extra_data[0], extra_data[1]]);
         let num_coef = u16::from_le_bytes([extra_data[2], extra_data[3]]);
 
-        if num_coef < 7 {
+        if (num_coef as usize) < NUM_DEFAULT_COEF {
             return Err(AudioError::InvalidFormat("MS-ADPCM wNumCoef < 7"));
         }
 
-        let coef_data_len = num_coef as usize * 4;
-        if extra_data.len() < 4 + coef_data_len {
+        let coef_data_len = num_coef as usize * COEF_PAIR_BYTES;
+        if extra_data.len() < COEF_DATA_OFFSET + coef_data_len {
             return Err(AudioError::InvalidFormat(
                 "MS-ADPCM extra data too short for coefficients",
             ));
         }
 
-        // Parse coefficient pairs (use first 7).
+        // MS-ADPCM header embeds 2 seed samples (samp1, samp2), so minimum is 2.
+        if samples_per_block < 2 {
+            return Err(AudioError::InvalidFormat(
+                "MS-ADPCM: samples_per_block must be >= 2",
+            ));
+        }
+
+        // Only the first 7 coefficient pairs are used; these are the standard
+        // MS-ADPCM coefficients per the ACM spec. num_coef >= 7 guaranteed above.
         let mut coef1 = DEFAULT_COEF1;
         let mut coef2 = DEFAULT_COEF2;
-        for i in 0..7.min(num_coef as usize) {
-            let offset = 4 + i * 4;
+        for i in 0..NUM_DEFAULT_COEF {
+            let offset = COEF_DATA_OFFSET + i * COEF_PAIR_BYTES;
             coef1[i] = i16::from_le_bytes([extra_data[offset], extra_data[offset + 1]]);
             coef2[i] = i16::from_le_bytes([extra_data[offset + 2], extra_data[offset + 3]]);
         }
@@ -105,7 +152,49 @@ impl MsAdpcmDecoder {
 
     /// Block header size in bytes.
     fn header_size(&self) -> usize {
-        7 * self.n_channels as usize
+        MONO_HEADER_BYTES * self.n_channels as usize
+    }
+
+    /// Parse the block header fields for mono or stereo layout.
+    fn parse_header(&self, block: &[u8]) -> AudioResult<BlockHeader> {
+        let ch = self.n_channels as usize;
+        let mut hdr = BlockHeader {
+            predictor_idx: [0; 2],
+            delta: [0; 2],
+            samp1: [0; 2],
+            samp2: [0; 2],
+        };
+
+        if ch == 1 {
+            hdr.predictor_idx[0] = block[0];
+            hdr.delta[0] = i32::from(i16::from_le_bytes([block[1], block[2]]));
+            hdr.samp1[0] = i32::from(i16::from_le_bytes([block[3], block[4]]));
+            hdr.samp2[0] = i32::from(i16::from_le_bytes([block[5], block[6]]));
+        } else {
+            // Stereo: bPredictor[0], bPredictor[1], iDelta[0], iDelta[1], ...
+            hdr.predictor_idx[0] = block[0];
+            hdr.predictor_idx[1] = block[1];
+            hdr.delta[0] = i32::from(i16::from_le_bytes([block[2], block[3]]));
+            hdr.delta[1] = i32::from(i16::from_le_bytes([block[4], block[5]]));
+            hdr.samp1[0] = i32::from(i16::from_le_bytes([block[6], block[7]]));
+            hdr.samp1[1] = i32::from(i16::from_le_bytes([block[8], block[9]]));
+            hdr.samp2[0] = i32::from(i16::from_le_bytes([block[10], block[11]]));
+            hdr.samp2[1] = i32::from(i16::from_le_bytes([block[12], block[13]]));
+        }
+
+        // Validate predictor indices.
+        for c in 0..ch {
+            if hdr.predictor_idx[c] as usize >= NUM_DEFAULT_COEF {
+                return Err(AudioError::InvalidBlock("bPredictor out of range"));
+            }
+        }
+
+        // Clamp initial deltas.
+        for c in 0..ch {
+            hdr.delta[c] = hdr.delta[c].max(MIN_DELTA);
+        }
+
+        Ok(hdr)
     }
 
     /// Decode a single ADPCM block to i16 PCM samples.
@@ -128,73 +217,42 @@ impl MsAdpcmDecoder {
             });
         }
 
-        // Parse block header.
-        let mut predictor_idx = [0u8; 2];
-        let mut delta = [0i32; 2];
-        let mut samp1 = [0i32; 2];
-        let mut samp2 = [0i32; 2];
-
-        if ch == 1 {
-            predictor_idx[0] = block[0];
-            delta[0] = i16::from_le_bytes([block[1], block[2]]) as i32;
-            samp1[0] = i16::from_le_bytes([block[3], block[4]]) as i32;
-            samp2[0] = i16::from_le_bytes([block[5], block[6]]) as i32;
-        } else {
-            // Stereo: bPredictor[0], bPredictor[1], iDelta[0], iDelta[1], ...
-            predictor_idx[0] = block[0];
-            predictor_idx[1] = block[1];
-            delta[0] = i16::from_le_bytes([block[2], block[3]]) as i32;
-            delta[1] = i16::from_le_bytes([block[4], block[5]]) as i32;
-            samp1[0] = i16::from_le_bytes([block[6], block[7]]) as i32;
-            samp1[1] = i16::from_le_bytes([block[8], block[9]]) as i32;
-            samp2[0] = i16::from_le_bytes([block[10], block[11]]) as i32;
-            samp2[1] = i16::from_le_bytes([block[12], block[13]]) as i32;
-        }
-
-        // Validate predictor indices.
-        for c in 0..ch {
-            if predictor_idx[c] >= 7 {
-                return Err(AudioError::InvalidBlock("bPredictor out of range"));
-            }
-        }
-
-        // Clamp initial deltas.
-        for c in 0..ch {
-            delta[c] = delta[c].max(MIN_DELTA);
-        }
+        let hdr = self.parse_header(block)?;
+        let mut delta = hdr.delta;
+        let mut samp1 = hdr.samp1;
+        let mut samp2 = hdr.samp2;
 
         // Load coefficients.
         let mut c1 = [0i32; 2];
         let mut c2 = [0i32; 2];
         for c in 0..ch {
-            c1[c] = self.coef1[predictor_idx[c] as usize] as i32;
-            c2[c] = self.coef2[predictor_idx[c] as usize] as i32;
+            c1[c] = i32::from(self.coef1[hdr.predictor_idx[c] as usize]);
+            c2[c] = i32::from(self.coef2[hdr.predictor_idx[c] as usize]);
         }
 
         // Output initial samples: samp2 first, then samp1.
+        // These values originate from i16 wire fields widened to i32, always in range.
         let mut out_idx = 0;
-        if ch == 1 {
-            output[out_idx] = samp2[0] as i16;
-            out_idx += 1;
-            output[out_idx] = samp1[0] as i16;
-            out_idx += 1;
-        } else {
-            output[out_idx] = samp2[0] as i16;
-            output[out_idx + 1] = samp2[1] as i16;
-            out_idx += 2;
-            output[out_idx] = samp1[0] as i16;
-            output[out_idx + 1] = samp1[1] as i16;
-            out_idx += 2;
+        for c in 0..ch {
+            #[allow(clippy::cast_possible_truncation)]
+            { output[out_idx + c] = samp2[c] as i16; }
         }
+        out_idx += ch;
+        for c in 0..ch {
+            #[allow(clippy::cast_possible_truncation)]
+            { output[out_idx + c] = samp1[c] as i16; }
+        }
+        out_idx += ch;
 
         // Decode nibbles.
+        // MS-ADPCM packs samples upper-nibble-first within each byte.
+        // [MS-ADPCM] ACM codec specification.
         let nibble_data = &block[hdr_size..];
         for byte in nibble_data {
             if out_idx >= total_samples {
                 break;
             }
 
-            // Upper nibble first.
             let nibbles = [(*byte >> 4) & 0x0F, *byte & 0x0F];
 
             for &nibble in &nibbles {
@@ -214,22 +272,33 @@ impl MsAdpcmDecoder {
                     nibble as i32
                 };
 
-                // Predict.
-                let pred = (samp1[c] * c1[c] + samp2[c] * c2[c]) / COEF_BASE;
+                // Predict — use i64 throughout to prevent overflow when
+                // wire-supplied coefficients and samples are at extreme i16 values.
+                // Keep pred as i64 to avoid unnecessary i32 round-trip.
+                let pred = ((samp1[c] as i64 * c1[c] as i64
+                    + samp2[c] as i64 * c2[c] as i64)
+                    / COEF_BASE as i64)
+                    .clamp(-32768, 32767);
 
-                // Apply error.
-                let sample = (pred + signed * delta[c]).clamp(-32768, 32767);
+                // Apply error — delta can grow large via adaptation, so i64
+                // prevents overflow. signed is in [-8, 7], delta is i32.
+                let sample = (pred + signed as i64 * delta[c] as i64)
+                    .clamp(-32768, 32767) as i32;
 
-                output[out_idx] = sample as i16;
+                #[allow(clippy::cast_possible_truncation)]
+                { output[out_idx] = sample as i16; }
                 out_idx += 1;
 
                 // Update history.
                 samp2[c] = samp1[c];
                 samp1[c] = sample;
 
-                // Update delta.
-                delta[c] = (ADAPTATION_TABLE[nibble as usize] * delta[c]) / 256;
-                delta[c] = delta[c].max(MIN_DELTA);
+                // Update delta — use i64 to prevent overflow for large delta
+                // values, then clamp to i32 range before narrowing.
+                delta[c] = ((ADAPTATION_TABLE[nibble as usize] as i64
+                    * delta[c] as i64)
+                    / COEF_BASE as i64)
+                    .clamp(MIN_DELTA as i64, i32::MAX as i64) as i32;
             }
         }
 
@@ -393,5 +462,49 @@ mod tests {
         assert_eq!(output[1], 150); // R samp2
         assert_eq!(output[2], 100); // L samp1
         assert_eq!(output[3], 200); // R samp1
+    }
+
+    #[test]
+    fn ms_adpcm_reject_zero_channels() {
+        let extra = make_extra_data();
+        let err = MsAdpcmDecoder::new(0, 22050, 256, &extra).unwrap_err();
+        assert_eq!(
+            err,
+            AudioError::InvalidFormat("MS-ADPCM: only 1 or 2 channels supported")
+        );
+    }
+
+    #[test]
+    fn ms_adpcm_reject_three_channels() {
+        let extra = make_extra_data();
+        let err = MsAdpcmDecoder::new(3, 22050, 256, &extra).unwrap_err();
+        assert_eq!(
+            err,
+            AudioError::InvalidFormat("MS-ADPCM: only 1 or 2 channels supported")
+        );
+    }
+
+    #[test]
+    fn ms_adpcm_reject_samples_per_block_zero() {
+        let mut extra = make_extra_data();
+        extra[0] = 0; // wSamplesPerBlock = 0
+        extra[1] = 0;
+        let err = MsAdpcmDecoder::new(1, 22050, 256, &extra).unwrap_err();
+        assert_eq!(
+            err,
+            AudioError::InvalidFormat("MS-ADPCM: samples_per_block must be >= 2")
+        );
+    }
+
+    #[test]
+    fn ms_adpcm_reject_samples_per_block_one() {
+        let mut extra = make_extra_data();
+        extra[0] = 1; // wSamplesPerBlock = 1
+        extra[1] = 0;
+        let err = MsAdpcmDecoder::new(1, 22050, 256, &extra).unwrap_err();
+        assert_eq!(
+            err,
+            AudioError::InvalidFormat("MS-ADPCM: samples_per_block must be >= 2")
+        );
     }
 }

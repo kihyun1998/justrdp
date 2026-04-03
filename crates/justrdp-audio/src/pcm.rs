@@ -23,6 +23,9 @@ impl PcmDecoder {
         n_channels: u16,
         sample_rate: u32,
     ) -> AudioResult<Self> {
+        if n_channels == 0 {
+            return Err(AudioError::InvalidFormat("PCM: n_channels cannot be 0"));
+        }
         match bits_per_sample {
             8 | 16 | 24 | 32 => {}
             _ => return Err(AudioError::UnsupportedCodec),
@@ -53,9 +56,12 @@ impl PcmDecoder {
     ///
     /// Returns the number of samples written to `output`.
     pub fn decode(&self, input: &[u8], output: &mut [i16]) -> AudioResult<usize> {
+        // bps is always 1/2/3/4 since bits_per_sample is validated in new().
         let bps = self.bytes_per_sample();
-        if bps == 0 {
-            return Ok(0);
+        if input.len() % bps != 0 {
+            return Err(AudioError::InvalidBlock(
+                "PCM input length not aligned to sample size",
+            ));
         }
         let num_samples = input.len() / bps;
         if output.len() < num_samples {
@@ -80,21 +86,28 @@ impl PcmDecoder {
             24 => {
                 for (i, chunk) in input.chunks_exact(3).enumerate() {
                     // Sign-extend 24-bit to i32, then take upper 16 bits.
+                    // If bit 23 (sign) is set, OR with !0xFF_FFFF fills bits [31:24]
+                    // with 1s, completing the two's complement sign extension.
                     let v = (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
                     let v = if v & 0x80_0000 != 0 {
                         v | !0xFF_FFFF
                     } else {
                         v
                     };
-                    output[i] = (v >> 8) as i16;
+                    // v >> 8 fits in i16 after 24-bit sign extension.
+                    #[allow(clippy::cast_possible_truncation)]
+                    { output[i] = (v >> 8) as i16; }
                 }
             }
             32 => {
                 for (i, chunk) in input.chunks_exact(4).enumerate() {
                     let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    // Clamp to [-1.0, 1.0] and scale to i16.
+                    // Clamp to [-1.0, 1.0] and scale to full i16 range.
                     let clamped = if f.is_nan() { 0.0 } else { f.clamp(-1.0, 1.0) };
-                    output[i] = (clamped * 32767.0) as i16;
+                    // 1.0 * 32768 = 32768 which exceeds i16::MAX (32767);
+                    // clamp to [-32768, 32767] handles the boundary.
+                    #[allow(clippy::cast_possible_truncation)]
+                    { output[i] = (clamped * 32768.0).clamp(-32768.0, 32767.0) as i16; }
                 }
             }
             _ => return Err(AudioError::UnsupportedCodec),
@@ -152,8 +165,8 @@ mod tests {
         let mut output = [0i16; 3];
         let n = dec.decode(&input, &mut output).unwrap();
         assert_eq!(n, 3);
-        assert_eq!(output[0], 32767);  // clamped 2.0 → 1.0
-        assert_eq!(output[1], -32767); // clamped -2.0 → -1.0
+        assert_eq!(output[0], 32767);  // clamped 2.0 → 1.0, scaled to 32767
+        assert_eq!(output[1], -32768); // clamped -2.0 → -1.0, scaled to -32768
         assert_eq!(output[2], 0);      // NaN → 0
     }
 
@@ -199,5 +212,14 @@ mod tests {
     fn pcm_unsupported_bits() {
         let err = PcmDecoder::new(12, 1, 44100).unwrap_err();
         assert_eq!(err, AudioError::UnsupportedCodec);
+    }
+
+    #[test]
+    fn pcm_reject_zero_channels() {
+        let err = PcmDecoder::new(16, 0, 44100).unwrap_err();
+        assert_eq!(
+            err,
+            AudioError::InvalidFormat("PCM: n_channels cannot be 0")
+        );
     }
 }

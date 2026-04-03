@@ -11,6 +11,7 @@ use crate::error::{AudioError, AudioResult};
 const OPUS_HEAD_MAGIC: &[u8; 8] = b"OpusHead";
 
 /// Minimum OpusHead size (through channel_mapping_family).
+/// RFC 7845, Section 5.1.
 const OPUS_HEAD_MIN_SIZE: usize = 19;
 
 /// Parsed OpusHead identification header -- RFC 7845 Section 5.1.
@@ -30,10 +31,13 @@ pub struct OpusHead {
     pub channel_mapping_family: u8,
 }
 
+/// Opus fixed output sample rate -- RFC 7845, Section 5.1.
+const OPUS_DECODE_SAMPLE_RATE: u32 = 48_000;
+
 impl OpusHead {
     /// Opus always decodes at 48 kHz.
     pub fn decode_sample_rate(&self) -> u32 {
-        48000
+        OPUS_DECODE_SAMPLE_RATE
     }
 
     /// Number of output channels.

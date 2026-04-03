@@ -46,6 +46,9 @@ pub struct HeaacWaveInfo {
 }
 
 /// Minimum HEAACWAVEINFO extra data size.
+/// wPayloadType(2) + wAudioProfileLevelIndication(2) + wStructType(2) +
+/// wReserved1(2) + dwReserved2(4) = 12 bytes.
+/// [MS-RDPEA] Section 2.2.2.1.
 const HEAAC_MIN_SIZE: usize = 12;
 
 /// Parse HEAACWAVEINFO from AUDIO_FORMAT extra data.
@@ -68,26 +71,40 @@ pub fn parse_heaac_info(extra_data: &[u8]) -> AudioResult<HeaacWaveInfo> {
     })
 }
 
+/// Minimum ADTS frame size (7-byte fixed+variable header, protection_absent=1).
+/// ISO 14496-3, Section 1.A.3.1.
+const ADTS_MIN_FRAME_SIZE: usize = 7;
+
+/// Maximum ADTS frame size (13-bit aac_frame_length field max).
+/// ISO 14496-3, Section 1.A.3.1.
+const ADTS_MAX_FRAME_SIZE: usize = 8191;
+
 /// Extract the length of an ADTS frame from its header.
 ///
 /// Returns the total frame length (including header) if the data
 /// starts with a valid ADTS syncword, or `None` if invalid.
 pub fn adts_frame_length(data: &[u8]) -> Option<usize> {
-    if data.len() < 7 {
+    if data.len() < ADTS_MIN_FRAME_SIZE {
         return None;
     }
 
     // Check syncword: 0xFFF (12 bits).
+    // Note: layer (data[1] bits [2:1]) and protection_absent (data[1] bit 0) are
+    // not validated here — actual AAC decoding is delegated to an external decoder.
     if data[0] != 0xFF || (data[1] & 0xF0) != 0xF0 {
         return None;
     }
 
-    // frame_length is 13 bits at bytes 3-5.
+    // aac_frame_length is 13 bits spanning bytes 3-5:
+    //   data[3] bits [1:0]  = frame_length[12:11]
+    //   data[4] bits [7:0]  = frame_length[10:3]
+    //   data[5] bits [7:5]  = frame_length[2:0]
+    // ISO 14496-3, Section 1.A.3.1 (ADTS variable header).
     let frame_length = (((data[3] & 0x03) as usize) << 11)
         | ((data[4] as usize) << 3)
         | (((data[5] >> 5) & 0x07) as usize);
 
-    if frame_length < 7 || frame_length > 8191 {
+    if frame_length < ADTS_MIN_FRAME_SIZE || frame_length > ADTS_MAX_FRAME_SIZE {
         return None;
     }
 

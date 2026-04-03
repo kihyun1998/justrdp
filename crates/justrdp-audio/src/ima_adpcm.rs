@@ -7,6 +7,9 @@
 use crate::error::{AudioError, AudioResult};
 
 /// IMA step size table -- 89 entries.
+/// IMA Digital Audio Focus and Technical Working Group,
+/// "Recommended Practices for Enhancing Digital Audio Compatibility
+/// in Multimedia Systems", Revision 3.00, Appendix C.
 const IMA_STEP_TABLE: [i32; 89] = [
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
     19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
@@ -20,10 +23,35 @@ const IMA_STEP_TABLE: [i32; 89] = [
 ];
 
 /// IMA index adjustment table -- 16 entries (for nibble values 0-15).
+/// IMA Recommended Practices, Revision 3.00, Table of index changes.
 const IMA_INDEX_TABLE: [i32; 16] = [
     -1, -1, -1, -1, 2, 4, 6, 8,
     -1, -1, -1, -1, 2, 4, 6, 8,
 ];
+
+/// Maximum supported channels (mono or stereo).
+/// [MS-RDPEA] Section 2.2.2.1 — nChannels field.
+const MAX_CHANNELS: u16 = 2;
+
+/// Bytes per channel in the IMA-ADPCM block header: predictor(i16) + step_index(u8) + reserved(u8).
+/// IMA Recommended Practices, Revision 3.00, Section 6.
+const CHANNEL_HEADER_BYTES: usize = 4;
+
+/// Bytes per stereo nibble group (4 L bytes + 4 R bytes).
+/// IMA Recommended Practices, Revision 3.00, Section 6.
+const STEREO_GROUP_BYTES: usize = 8;
+
+/// Nibble data bytes per channel per stereo group (4 bytes = 8 nibbles).
+/// IMA Recommended Practices, Revision 3.00, Section 6.
+const NIBBLE_BYTES_PER_CHANNEL: usize = STEREO_GROUP_BYTES / 2;
+
+/// Samples decoded per channel per stereo group (4 bytes × 2 nibbles/byte).
+/// IMA Recommended Practices, Revision 3.00, Section 6.
+const SAMPLES_PER_GROUP: usize = 8;
+
+/// Maximum valid step_index (IMA_STEP_TABLE has 89 entries, indices 0..=88).
+/// IMA Recommended Practices, Revision 3.00, Appendix C.
+const MAX_STEP_INDEX: i32 = 88;
 
 /// Per-channel decoder state.
 #[derive(Debug, Clone)]
@@ -33,20 +61,25 @@ struct ChannelState {
 }
 
 impl ChannelState {
+    const ZERO: Self = Self { predictor: 0, step_index: 0 };
+
     fn new(predictor: i16, step_index: u8) -> AudioResult<Self> {
-        if step_index > 88 {
+        if i32::from(step_index) > MAX_STEP_INDEX {
             return Err(AudioError::InvalidBlock("step_index > 88"));
         }
         Ok(Self {
-            predictor: predictor as i32,
-            step_index: step_index as i32,
+            predictor: i32::from(predictor),
+            step_index: i32::from(step_index),
         })
     }
 
     /// Decode a single 4-bit nibble.
-    fn decode_nibble(&mut self, nibble: u8) -> i16 {
+    fn decode_nibble(&mut self, raw_nibble: u8) -> i16 {
+        // step_index is always in [0, 88], clamped on every update below.
+        debug_assert!(self.step_index >= 0 && self.step_index <= MAX_STEP_INDEX);
+        #[allow(clippy::cast_sign_loss)]
         let step = IMA_STEP_TABLE[self.step_index as usize];
-        let nibble = nibble & 0x0F;
+        let nibble = raw_nibble & 0x0F;
 
         // Compute diff using integer bit manipulation.
         let delta = nibble & 7;
@@ -73,9 +106,12 @@ impl ChannelState {
 
         // Update step index.
         self.step_index += IMA_INDEX_TABLE[nibble as usize];
-        self.step_index = self.step_index.clamp(0, 88);
+        self.step_index = self.step_index.clamp(0, MAX_STEP_INDEX);
 
-        self.predictor as i16
+        // Clamped to i16 range above.
+        #[allow(clippy::cast_possible_truncation)]
+        let result = self.predictor as i16;
+        result
     }
 }
 
@@ -98,6 +134,12 @@ impl ImaAdpcmDecoder {
         block_align: u16,
         extra_data: &[u8],
     ) -> AudioResult<Self> {
+        if n_channels == 0 || n_channels > MAX_CHANNELS {
+            return Err(AudioError::InvalidFormat(
+                "IMA-ADPCM: only 1 or 2 channels supported",
+            ));
+        }
+
         if extra_data.len() < 2 {
             return Err(AudioError::InvalidFormat(
                 "IMA-ADPCM extra data too short",
@@ -106,6 +148,13 @@ impl ImaAdpcmDecoder {
 
         let samples_per_block =
             u16::from_le_bytes([extra_data[0], extra_data[1]]);
+
+        // IMA-ADPCM header contains at least 1 predictor sample per channel.
+        if samples_per_block == 0 {
+            return Err(AudioError::InvalidFormat(
+                "IMA-ADPCM: samples_per_block cannot be 0",
+            ));
+        }
 
         Ok(Self {
             n_channels,
@@ -135,9 +184,9 @@ impl ImaAdpcmDecoder {
         self.samples_per_block
     }
 
-    /// Per-channel header size: 4 bytes (predictor i16 + step_index u8 + reserved u8).
+    /// Per-channel header size: predictor(i16) + step_index(u8) + reserved(u8).
     fn channel_header_size(&self) -> usize {
-        4 * self.n_channels as usize
+        CHANNEL_HEADER_BYTES * self.n_channels as usize
     }
 
     /// Decode a single IMA-ADPCM block to i16 PCM samples.
@@ -160,42 +209,29 @@ impl ImaAdpcmDecoder {
             });
         }
 
-        // Parse per-channel headers.
-        let mut states = [ChannelState { predictor: 0, step_index: 0 }; 1];
-        let mut states_stereo = [
-            ChannelState { predictor: 0, step_index: 0 },
-            ChannelState { predictor: 0, step_index: 0 },
-        ];
+        // Parse per-channel headers. Single 2-element array; only [0..ch] used.
+        let mut states = [ChannelState::ZERO, ChannelState::ZERO];
 
-        if ch == 1 {
-            let predictor = i16::from_le_bytes([block[0], block[1]]);
-            let step_index = block[2];
-            states[0] = ChannelState::new(predictor, step_index)?;
-        } else {
-            let pred_l = i16::from_le_bytes([block[0], block[1]]);
-            let step_l = block[2];
-            let pred_r = i16::from_le_bytes([block[4], block[5]]);
-            let step_r = block[6];
-            states_stereo[0] = ChannelState::new(pred_l, step_l)?;
-            states_stereo[1] = ChannelState::new(pred_r, step_r)?;
+        for c in 0..ch {
+            let base = c * CHANNEL_HEADER_BYTES;
+            let predictor = i16::from_le_bytes([block[base], block[base + 1]]);
+            let step_index = block[base + 2];
+            states[c] = ChannelState::new(predictor, step_index)?;
         }
 
+        // Output initial predictor values (sourced from i16 wire field, always in range).
         let mut out_idx = 0;
-
-        // Output initial predictor values.
-        if ch == 1 {
-            output[out_idx] = states[0].predictor as i16;
-            out_idx += 1;
-        } else {
-            output[out_idx] = states_stereo[0].predictor as i16;
-            output[out_idx + 1] = states_stereo[1].predictor as i16;
-            out_idx += 2;
+        for c in 0..ch {
+            #[allow(clippy::cast_possible_truncation)]
+            { output[out_idx + c] = states[c].predictor as i16; }
         }
+        out_idx += ch;
 
         let nibble_data = &block[hdr_size..];
 
         if ch == 1 {
-            // Mono: lower nibble first, then upper nibble.
+            // IMA-ADPCM (DVI order) packs samples lower-nibble-first within each byte.
+            // IMA Recommended Practices, Revision 3.00, Section 6.
             for &byte in nibble_data {
                 if out_idx >= total_samples {
                     break;
@@ -211,42 +247,30 @@ impl ImaAdpcmDecoder {
         } else {
             // Stereo: 4 bytes L nibbles, 4 bytes R nibbles, alternating groups.
             // Each 4-byte group = 8 nibbles = 8 samples for one channel.
-            // Decode into temp buffers then interleave into output.
+            // IMA-ADPCM (DVI order): lower nibble first within each byte.
             let mut data_offset = 0;
-            while out_idx < total_samples && data_offset + 8 <= nibble_data.len() {
-                // Decode 8 L samples from 4 bytes.
-                let mut l_samples = [0i16; 8];
-                let mut l_count = 0;
-                for i in 0..4 {
-                    let byte = nibble_data[data_offset + i];
-                    l_samples[l_count] = states_stereo[0].decode_nibble(byte & 0x0F);
-                    l_count += 1;
-                    l_samples[l_count] = states_stereo[0].decode_nibble(byte >> 4);
-                    l_count += 1;
-                }
-
-                // Decode 8 R samples from 4 bytes.
-                let mut r_samples = [0i16; 8];
-                let mut r_count = 0;
-                for i in 0..4 {
-                    let byte = nibble_data[data_offset + 4 + i];
-                    r_samples[r_count] = states_stereo[1].decode_nibble(byte & 0x0F);
-                    r_count += 1;
-                    r_samples[r_count] = states_stereo[1].decode_nibble(byte >> 4);
-                    r_count += 1;
+            while out_idx < total_samples && data_offset + STEREO_GROUP_BYTES <= nibble_data.len() {
+                // Decode SAMPLES_PER_GROUP L samples, then SAMPLES_PER_GROUP R samples.
+                let mut lr_samples = [[0i16; SAMPLES_PER_GROUP]; 2];
+                for c in 0..2 {
+                    for i in 0..NIBBLE_BYTES_PER_CHANNEL {
+                        let byte = nibble_data[data_offset + c * NIBBLE_BYTES_PER_CHANNEL + i];
+                        lr_samples[c][i * 2] = states[c].decode_nibble(byte & 0x0F);
+                        lr_samples[c][i * 2 + 1] = states[c].decode_nibble(byte >> 4);
+                    }
                 }
 
                 // Interleave L,R into output.
-                for i in 0..8 {
-                    if out_idx + 1 >= total_samples {
+                for i in 0..SAMPLES_PER_GROUP {
+                    if out_idx + 2 > total_samples {
                         break;
                     }
-                    output[out_idx] = l_samples[i];
-                    output[out_idx + 1] = r_samples[i];
+                    output[out_idx] = lr_samples[0][i];
+                    output[out_idx + 1] = lr_samples[1][i];
                     out_idx += 2;
                 }
 
-                data_offset += 8;
+                data_offset += STEREO_GROUP_BYTES;
             }
         }
 
@@ -308,7 +332,7 @@ mod tests {
     #[test]
     fn step_index_clamp_upper() {
         // step_index=88, nibble=0x7 → step_index = 88 + 8 = 96 → clamp to 88
-        let mut state = ChannelState { predictor: 0, step_index: 88 };
+        let mut state = ChannelState::new(0, 88).unwrap();
         state.decode_nibble(0x7);
         assert_eq!(state.step_index, 88);
     }
@@ -378,5 +402,32 @@ mod tests {
             assert_eq!(output[i], 100, "L sample at {i}");
             assert_eq!(output[i + 1], 200, "R sample at {i}+1");
         }
+    }
+
+    #[test]
+    fn ima_adpcm_reject_zero_channels() {
+        let err = ImaAdpcmDecoder::new(0, 22050, 256, &[5, 0]).unwrap_err();
+        assert_eq!(
+            err,
+            AudioError::InvalidFormat("IMA-ADPCM: only 1 or 2 channels supported")
+        );
+    }
+
+    #[test]
+    fn ima_adpcm_reject_three_channels() {
+        let err = ImaAdpcmDecoder::new(3, 22050, 256, &[5, 0]).unwrap_err();
+        assert_eq!(
+            err,
+            AudioError::InvalidFormat("IMA-ADPCM: only 1 or 2 channels supported")
+        );
+    }
+
+    #[test]
+    fn ima_adpcm_reject_samples_per_block_zero() {
+        let err = ImaAdpcmDecoder::new(1, 22050, 256, &[0, 0]).unwrap_err();
+        assert_eq!(
+            err,
+            AudioError::InvalidFormat("IMA-ADPCM: samples_per_block cannot be 0")
+        );
     }
 }

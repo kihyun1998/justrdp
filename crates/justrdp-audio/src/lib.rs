@@ -47,7 +47,8 @@ pub trait AudioDecoder: Send + core::fmt::Debug {
 
 impl AudioDecoder for PcmDecoder {
     fn decode(&mut self, input: &[u8], output: &mut [i16]) -> AudioResult<usize> {
-        // PcmDecoder::decode takes &self, delegate directly.
+        // PcmDecoder::decode takes &self (stateless), but AudioDecoder
+        // requires &mut self; the mutable borrow is unused here.
         PcmDecoder::decode(self, input, output)
     }
 
