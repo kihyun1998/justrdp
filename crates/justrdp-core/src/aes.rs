@@ -8,6 +8,16 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::error::{CryptoError, CryptoResult};
+
+// RFC 3961 §5.1 — key derivation usage constant suffixes
+const KRB5_PURPOSE_ENCRYPT: u8 = 0xAA;  // Ke (encryption sub-key)
+const KRB5_PURPOSE_INTEGRITY: u8 = 0x55; // Ki (integrity sub-key)
+const KRB5_PURPOSE_CHECKSUM: u8 = 0x99;  // Kc (checksum sub-key)
+
+/// HMAC-SHA1-96 truncated output length (RFC 3962 §5).
+const HMAC_SHA1_96_LEN: usize = 12;
+
 // ── AES S-box and constants ──
 
 const SBOX: [u8; 256] = [
@@ -118,6 +128,15 @@ impl Aes128 {
     }
 }
 
+impl Drop for Aes128 {
+    fn drop(&mut self) {
+        for rk in &mut self.round_keys {
+            rk.fill(0);
+        }
+        core::hint::black_box(&self.round_keys);
+    }
+}
+
 // ── AES-256 ──
 
 /// AES-256 block cipher.
@@ -166,6 +185,15 @@ impl Aes256 {
     /// Decrypt a single 16-byte block in place.
     pub fn decrypt_block(&self, block: &mut [u8; 16]) {
         aes_decrypt_block(block, &self.round_keys, 14);
+    }
+}
+
+impl Drop for Aes256 {
+    fn drop(&mut self) {
+        for rk in &mut self.round_keys {
+            rk.fill(0);
+        }
+        core::hint::black_box(&self.round_keys);
     }
 }
 
@@ -251,9 +279,11 @@ fn inv_mix_columns(s: &mut [u8; 16]) {
 
 // ── AES-CBC mode ──
 
-/// AES-CBC encrypt in place. `data` length must be a multiple of 16.
-pub fn aes_cbc_encrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [u8]) {
-    assert!(data.len() % 16 == 0 && !data.is_empty());
+/// AES-CBC encrypt in place. `data` length must be a non-empty multiple of 16.
+pub fn aes_cbc_encrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [u8]) -> CryptoResult<()> {
+    if data.is_empty() || data.len() % 16 != 0 {
+        return Err(CryptoError::InvalidDataLength);
+    }
     let mut prev = *iv;
     let mut offset = 0;
     while offset < data.len() {
@@ -265,11 +295,14 @@ pub fn aes_cbc_encrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [
         prev = block;
         offset += 16;
     }
+    Ok(())
 }
 
-/// AES-CBC decrypt in place. `data` length must be a multiple of 16.
-pub fn aes_cbc_decrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [u8]) {
-    assert!(data.len() % 16 == 0 && !data.is_empty());
+/// AES-CBC decrypt in place. `data` length must be a non-empty multiple of 16.
+pub fn aes_cbc_decrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [u8]) -> CryptoResult<()> {
+    if data.is_empty() || data.len() % 16 != 0 {
+        return Err(CryptoError::InvalidDataLength);
+    }
     let mut prev = *iv;
     let mut offset = 0;
     while offset < data.len() {
@@ -282,15 +315,18 @@ pub fn aes_cbc_decrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [
         prev = ct;
         offset += 16;
     }
+    Ok(())
 }
 
 // ── AES-CTS mode (RFC 3962) ──
 
 /// AES-CTS (Ciphertext Stealing) encrypt in place.
 /// Data must be at least 16 bytes. Used by Kerberos AES etypes.
-pub fn aes_cts_encrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [u8]) {
+pub fn aes_cts_encrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [u8]) -> CryptoResult<()> {
     let len = data.len();
-    assert!(len >= 16);
+    if len < 16 {
+        return Err(CryptoError::InvalidDataLength);
+    }
 
     if len == 16 {
         // Single block: just CBC
@@ -299,7 +335,7 @@ pub fn aes_cts_encrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [
         xor_block(&mut block, iv);
         cipher.encrypt(&mut block);
         data.copy_from_slice(&block);
-        return;
+        return Ok(());
     }
 
     // Pad to full blocks for CBC processing
@@ -343,13 +379,16 @@ pub fn aes_cts_encrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [
     // Write output: C[n] at penultimate, C[n-1] truncated at last
     data[pn_off..pn_off + 16].copy_from_slice(&last_padded);
     data[last_off..last_off + last_len].copy_from_slice(&cn_minus1[..last_len]);
+    Ok(())
 }
 
 /// AES-CTS decrypt in place.
 /// Data must be at least 16 bytes.
-pub fn aes_cts_decrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [u8]) {
+pub fn aes_cts_decrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [u8]) -> CryptoResult<()> {
     let len = data.len();
-    assert!(len >= 16);
+    if len < 16 {
+        return Err(CryptoError::InvalidDataLength);
+    }
 
     if len == 16 {
         let mut block = [0u8; 16];
@@ -357,7 +396,7 @@ pub fn aes_cts_decrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [
         cipher.decrypt(&mut block);
         xor_block(&mut block, iv);
         data.copy_from_slice(&block);
-        return;
+        return Ok(());
     }
 
     let n_full = (len - 1) / 16;
@@ -406,11 +445,14 @@ pub fn aes_cts_decrypt(cipher: &impl AesBlockCipher, iv: &[u8; 16], data: &mut [
     cipher.decrypt(&mut pn_plain);
     xor_block(&mut pn_plain, &prev);
     data[pn_off..pn_off + 16].copy_from_slice(&pn_plain);
+    Ok(())
 }
 
-/// Trait for AES block cipher operations.
+/// Trait for AES block cipher operations (128-bit block).
 pub trait AesBlockCipher {
+    /// Encrypt a single 16-byte block in place.
     fn encrypt(&self, block: &mut [u8; 16]);
+    /// Decrypt a single 16-byte block in place.
     fn decrypt(&self, block: &mut [u8; 16]);
 }
 
@@ -452,8 +494,8 @@ pub fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], iterations: u32, dk_len: u
         }
 
         let remaining = dk_len - result.len();
-        let to_copy = if remaining < 20 { remaining } else { 20 };
-        result.extend_from_slice(&t[..to_copy]);
+        let chunk_len = if remaining < 20 { remaining } else { 20 };
+        result.extend_from_slice(&t[..chunk_len]);
         block_num += 1;
     }
 
@@ -541,7 +583,9 @@ fn gcd_usize(mut a: usize, mut b: usize) -> usize {
 }
 
 fn lcm_usize(a: usize, b: usize) -> usize {
-    a / gcd_usize(a, b) * b
+    // Division first to reduce overflow risk, then checked multiply.
+    let d = a / gcd_usize(a, b);
+    d.checked_mul(b).expect("nfold: lcm overflow — input too large")
 }
 
 /// Kerberos string-to-key for AES etypes (RFC 3962).
@@ -549,7 +593,11 @@ fn lcm_usize(a: usize, b: usize) -> usize {
 /// string2key(password, salt, params) =
 ///     random-to-key(PBKDF2(password, salt, iterations, key_len))
 ///     then DK(key, "kerberos") to derive the final key.
-pub fn krb5_aes_string_to_key(password: &[u8], salt: &[u8], iterations: u32, key_len: usize) -> Vec<u8> {
+pub fn krb5_aes_string_to_key(password: &[u8], salt: &[u8], iterations: u32, key_len: usize) -> CryptoResult<Vec<u8>> {
+    // RFC 3962 §6 — AES-128 (key_len=16) and AES-256 (key_len=32)
+    if key_len != 16 && key_len != 32 {
+        return Err(CryptoError::InvalidKeySize);
+    }
     let tkey = pbkdf2_hmac_sha1(password, salt, iterations, key_len);
 
     // DK(tkey, "kerberos"): n-fold to block size (16), then ECB-chain encrypt
@@ -559,13 +607,15 @@ pub fn krb5_aes_string_to_key(password: &[u8], salt: &[u8], iterations: u32, key
 
     let mut derived = Vec::with_capacity(key_len);
     if key_len == 16 {
-        let cipher = Aes128::new(&tkey[..16].try_into().unwrap());
+        let key: [u8; 16] = tkey[..16].try_into().map_err(|_| CryptoError::InvalidKeySize)?;
+        let cipher = Aes128::new(&key);
         while derived.len() < key_len {
             cipher.encrypt_block(&mut block);
             derived.extend_from_slice(&block);
         }
     } else {
-        let cipher = Aes256::new(&tkey[..32].try_into().unwrap());
+        let key: [u8; 32] = tkey[..32].try_into().map_err(|_| CryptoError::InvalidKeySize)?;
+        let cipher = Aes256::new(&key);
         while derived.len() < key_len {
             cipher.encrypt_block(&mut block);
             derived.extend_from_slice(&block);
@@ -573,51 +623,47 @@ pub fn krb5_aes_string_to_key(password: &[u8], salt: &[u8], iterations: u32, key
     }
 
     derived.truncate(key_len);
-    derived
+    Ok(derived)
 }
 
 // ── Kerberos AES etype encrypt/decrypt (RFC 3962) ──
 
+/// Derive a Kerberos sub-key for a given usage and purpose byte.
+///
+/// `purpose_byte`: 0xAA for encryption (Ke), 0x55 for integrity (Ki), 0x99 for checksum (Kc).
+fn krb5_derive_subkey(base_key: &[u8], usage: i32, purpose_byte: u8) -> CryptoResult<Vec<u8>> {
+    let key_len = base_key.len();
+    if key_len != 16 && key_len != 32 {
+        return Err(CryptoError::InvalidKeySize);
+    }
+    let constant = [
+        (usage >> 24) as u8,
+        (usage >> 16) as u8,
+        (usage >> 8) as u8,
+        usage as u8,
+        purpose_byte,
+    ];
+    if key_len == 16 {
+        let key: [u8; 16] = base_key.try_into().map_err(|_| CryptoError::InvalidKeySize)?;
+        let cipher = Aes128::new(&key);
+        Ok(krb5_derive_key(&cipher, &constant, key_len))
+    } else {
+        let key: [u8; 32] = base_key.try_into().map_err(|_| CryptoError::InvalidKeySize)?;
+        let cipher = Aes256::new(&key);
+        Ok(krb5_derive_key(&cipher, &constant, key_len))
+    }
+}
+
 /// Derive the encryption sub-key Ke for a given key usage.
 /// Ke = DK(base_key, usage_number || 0xAA)
-pub fn krb5_derive_ke(base_key: &[u8], usage: i32) -> Vec<u8> {
-    let key_len = base_key.len();
-    assert!(key_len == 16 || key_len == 32,
-        "krb5_derive_ke: base_key must be 16 (AES-128) or 32 (AES-256) bytes, got {key_len}");
-    let mut constant = vec![0u8; 5];
-    constant[0] = (usage >> 24) as u8;
-    constant[1] = (usage >> 16) as u8;
-    constant[2] = (usage >> 8) as u8;
-    constant[3] = usage as u8;
-    constant[4] = 0xAA; // encrypt
-    if key_len == 16 {
-        let cipher = Aes128::new(base_key.try_into().unwrap());
-        krb5_derive_key(&cipher, &constant, key_len)
-    } else {
-        let cipher = Aes256::new(base_key.try_into().unwrap());
-        krb5_derive_key(&cipher, &constant, key_len)
-    }
+pub fn krb5_derive_ke(base_key: &[u8], usage: i32) -> CryptoResult<Vec<u8>> {
+    krb5_derive_subkey(base_key, usage, KRB5_PURPOSE_ENCRYPT)
 }
 
 /// Derive the integrity sub-key Ki for a given key usage.
 /// Ki = DK(base_key, usage_number || 0x55)
-pub fn krb5_derive_ki(base_key: &[u8], usage: i32) -> Vec<u8> {
-    let key_len = base_key.len();
-    assert!(key_len == 16 || key_len == 32,
-        "krb5_derive_ki: base_key must be 16 (AES-128) or 32 (AES-256) bytes, got {key_len}");
-    let mut constant = vec![0u8; 5];
-    constant[0] = (usage >> 24) as u8;
-    constant[1] = (usage >> 16) as u8;
-    constant[2] = (usage >> 8) as u8;
-    constant[3] = usage as u8;
-    constant[4] = 0x55; // integrity
-    if key_len == 16 {
-        let cipher = Aes128::new(base_key.try_into().unwrap());
-        krb5_derive_key(&cipher, &constant, key_len)
-    } else {
-        let cipher = Aes256::new(base_key.try_into().unwrap());
-        krb5_derive_key(&cipher, &constant, key_len)
-    }
+pub fn krb5_derive_ki(base_key: &[u8], usage: i32) -> CryptoResult<Vec<u8>> {
+    krb5_derive_subkey(base_key, usage, KRB5_PURPOSE_INTEGRITY)
 }
 
 /// AES-CTS-HMAC-SHA1-96 encrypt (RFC 3962).
@@ -626,9 +672,9 @@ pub fn krb5_derive_ki(base_key: &[u8], usage: i32) -> Vec<u8> {
 /// Output: encrypted_data + HMAC-SHA1-96 (12 bytes).
 ///
 /// `confounder` must be 16 random bytes.
-pub fn krb5_aes_encrypt(base_key: &[u8], usage: i32, plaintext: &[u8], confounder: &[u8; 16]) -> Vec<u8> {
-    let ke = krb5_derive_ke(base_key, usage);
-    let ki = krb5_derive_ki(base_key, usage);
+pub fn krb5_aes_encrypt(base_key: &[u8], usage: i32, plaintext: &[u8], confounder: &[u8; 16]) -> CryptoResult<Vec<u8>> {
+    let ke = krb5_derive_ke(base_key, usage)?;
+    let ki = krb5_derive_ki(base_key, usage)?;
 
     // Build plaintext: confounder + data
     let mut full = Vec::with_capacity(16 + plaintext.len());
@@ -637,90 +683,80 @@ pub fn krb5_aes_encrypt(base_key: &[u8], usage: i32, plaintext: &[u8], confounde
 
     // Compute HMAC-SHA1-96 over confounder + plaintext using Ki
     let hmac = crate::crypto::hmac_sha1(&ki, &full);
-    let checksum = &hmac[..12]; // truncate to 96 bits
+    let checksum = &hmac[..HMAC_SHA1_96_LEN];
 
     // Encrypt with AES-CTS using Ke, IV=0
     let iv = [0u8; 16];
     if ke.len() == 16 {
-        let cipher = Aes128::new(ke[..16].try_into().unwrap());
-        aes_cts_encrypt(&cipher, &iv, &mut full);
+        let key: [u8; 16] = ke[..16].try_into().map_err(|_| CryptoError::InvalidKeySize)?;
+        let cipher = Aes128::new(&key);
+        aes_cts_encrypt(&cipher, &iv, &mut full)?;
     } else {
-        let cipher = Aes256::new(ke[..32].try_into().unwrap());
-        aes_cts_encrypt(&cipher, &iv, &mut full);
+        let key: [u8; 32] = ke[..32].try_into().map_err(|_| CryptoError::InvalidKeySize)?;
+        let cipher = Aes256::new(&key);
+        aes_cts_encrypt(&cipher, &iv, &mut full)?;
     }
 
     // Output: ciphertext + 12-byte HMAC
     full.extend_from_slice(checksum);
-    full
+    Ok(full)
 }
 
 /// AES-CTS-HMAC-SHA1-96 decrypt (RFC 3962).
 ///
 /// Input: ciphertext + 12-byte HMAC.
 /// Returns decrypted plaintext (without the 16-byte confounder).
-/// Returns None if HMAC verification fails.
-pub fn krb5_aes_decrypt(base_key: &[u8], usage: i32, ciphertext_with_hmac: &[u8]) -> Option<Vec<u8>> {
-    if ciphertext_with_hmac.len() < 16 + 12 {
-        return None; // need at least confounder + HMAC
+///
+/// Returns `CryptoError::InvalidDataLength` if input is too short,
+/// `CryptoError::HmacVerifyFailed` if HMAC verification fails.
+pub fn krb5_aes_decrypt(base_key: &[u8], usage: i32, ciphertext_with_hmac: &[u8]) -> CryptoResult<Vec<u8>> {
+    if ciphertext_with_hmac.len() < 16 + HMAC_SHA1_96_LEN {
+        return Err(CryptoError::InvalidDataLength);
     }
 
-    let ke = krb5_derive_ke(base_key, usage);
-    let ki = krb5_derive_ki(base_key, usage);
+    let ke = krb5_derive_ke(base_key, usage)?;
+    let ki = krb5_derive_ki(base_key, usage)?;
 
-    let hmac_offset = ciphertext_with_hmac.len() - 12;
+    let hmac_offset = ciphertext_with_hmac.len() - HMAC_SHA1_96_LEN;
     let expected_hmac = &ciphertext_with_hmac[hmac_offset..];
     let mut encrypted = ciphertext_with_hmac[..hmac_offset].to_vec();
 
     // Decrypt with AES-CTS using Ke, IV=0
     let iv = [0u8; 16];
     if ke.len() == 16 {
-        let cipher = Aes128::new(ke[..16].try_into().unwrap());
-        aes_cts_decrypt(&cipher, &iv, &mut encrypted);
+        let key: [u8; 16] = ke[..16].try_into().map_err(|_| CryptoError::InvalidKeySize)?;
+        let cipher = Aes128::new(&key);
+        aes_cts_decrypt(&cipher, &iv, &mut encrypted)?;
     } else {
-        let cipher = Aes256::new(ke[..32].try_into().unwrap());
-        aes_cts_decrypt(&cipher, &iv, &mut encrypted);
+        let key: [u8; 32] = ke[..32].try_into().map_err(|_| CryptoError::InvalidKeySize)?;
+        let cipher = Aes256::new(&key);
+        aes_cts_decrypt(&cipher, &iv, &mut encrypted)?;
     }
 
     // Verify HMAC-SHA1-96 over decrypted data using Ki
     let hmac = crate::crypto::hmac_sha1(&ki, &encrypted);
-    let computed_hmac = &hmac[..12];
+    let computed_hmac = &hmac[..HMAC_SHA1_96_LEN];
 
     // Constant-time comparison
     let mut diff = 0u8;
-    for i in 0..12 {
+    for i in 0..HMAC_SHA1_96_LEN {
         diff |= expected_hmac[i] ^ computed_hmac[i];
     }
     if diff != 0 {
-        return None;
+        return Err(CryptoError::HmacVerifyFailed);
     }
 
     // Strip the 16-byte confounder
-    Some(encrypted[16..].to_vec())
+    Ok(encrypted[16..].to_vec())
 }
 
 /// Compute HMAC-SHA1-96-AES checksum (RFC 3962).
 ///
 /// Used for Kerberos checksums (cksumtype 15 for AES128, 16 for AES256).
-pub fn krb5_aes_checksum(base_key: &[u8], usage: i32, data: &[u8]) -> Vec<u8> {
-    let kc_constant = {
-        let mut c = vec![0u8; 5];
-        c[0] = (usage >> 24) as u8;
-        c[1] = (usage >> 16) as u8;
-        c[2] = (usage >> 8) as u8;
-        c[3] = usage as u8;
-        c[4] = 0x99; // checksum
-        c
-    };
-    let key_len = base_key.len();
-    let kc = if key_len == 16 {
-        let cipher = Aes128::new(base_key.try_into().unwrap());
-        krb5_derive_key(&cipher, &kc_constant, key_len)
-    } else {
-        let cipher = Aes256::new(base_key.try_into().unwrap());
-        krb5_derive_key(&cipher, &kc_constant, key_len)
-    };
+pub fn krb5_aes_checksum(base_key: &[u8], usage: i32, data: &[u8]) -> CryptoResult<Vec<u8>> {
+    let kc = krb5_derive_subkey(base_key, usage, KRB5_PURPOSE_CHECKSUM)?;
     let hmac = crate::crypto::hmac_sha1(&kc, data);
-    hmac[..12].to_vec() // truncate to 96 bits
+    Ok(hmac[..HMAC_SHA1_96_LEN].to_vec())
 }
 
 #[cfg(test)]
@@ -786,9 +822,9 @@ mod tests {
         let plaintext = [0x11u8; 48]; // 3 blocks
         let mut data = plaintext;
         let aes = Aes128::new(&key);
-        aes_cbc_encrypt(&aes, &iv, &mut data);
+        aes_cbc_encrypt(&aes, &iv, &mut data).unwrap();
         assert_ne!(data, plaintext);
-        aes_cbc_decrypt(&aes, &iv, &mut data);
+        aes_cbc_decrypt(&aes, &iv, &mut data).unwrap();
         assert_eq!(data, plaintext);
     }
 
@@ -799,9 +835,9 @@ mod tests {
         let plaintext = [0x44u8; 32]; // exactly 2 blocks
         let mut data = plaintext;
         let aes = Aes128::new(&key);
-        aes_cts_encrypt(&aes, &iv, &mut data);
+        aes_cts_encrypt(&aes, &iv, &mut data).unwrap();
         assert_ne!(data, plaintext);
-        aes_cts_decrypt(&aes, &iv, &mut data);
+        aes_cts_decrypt(&aes, &iv, &mut data).unwrap();
         assert_eq!(data, plaintext);
     }
 
@@ -812,9 +848,9 @@ mod tests {
         let plaintext: Vec<u8> = (0..37).collect(); // 2 blocks + 5 bytes
         let mut data = plaintext.clone();
         let aes = Aes128::new(&key);
-        aes_cts_encrypt(&aes, &iv, &mut data);
+        aes_cts_encrypt(&aes, &iv, &mut data).unwrap();
         assert_ne!(data, plaintext);
-        aes_cts_decrypt(&aes, &iv, &mut data);
+        aes_cts_decrypt(&aes, &iv, &mut data).unwrap();
         assert_eq!(data, plaintext);
     }
 
@@ -825,8 +861,8 @@ mod tests {
         let plaintext = [0xABu8; 16];
         let mut data = plaintext;
         let aes = Aes128::new(&key);
-        aes_cts_encrypt(&aes, &iv, &mut data);
-        aes_cts_decrypt(&aes, &iv, &mut data);
+        aes_cts_encrypt(&aes, &iv, &mut data).unwrap();
+        aes_cts_decrypt(&aes, &iv, &mut data).unwrap();
         assert_eq!(data, plaintext);
     }
 
@@ -838,9 +874,9 @@ mod tests {
         let plaintext: Vec<u8> = (0..48).collect();
         let mut data = plaintext.clone();
         let aes = Aes128::new(&key);
-        aes_cts_encrypt(&aes, &iv, &mut data);
+        aes_cts_encrypt(&aes, &iv, &mut data).unwrap();
         assert_ne!(data, plaintext);
-        aes_cts_decrypt(&aes, &iv, &mut data);
+        aes_cts_decrypt(&aes, &iv, &mut data).unwrap();
         assert_eq!(data, plaintext);
     }
 
@@ -854,8 +890,8 @@ mod tests {
         for size in [16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 100, 256] {
             let plaintext: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
             let mut data = plaintext.clone();
-            aes_cts_encrypt(&aes, &iv, &mut data);
-            aes_cts_decrypt(&aes, &iv, &mut data);
+            aes_cts_encrypt(&aes, &iv, &mut data).unwrap();
+            aes_cts_decrypt(&aes, &iv, &mut data).unwrap();
             assert_eq!(data, plaintext, "CTS roundtrip failed for size {size}");
         }
     }
@@ -878,9 +914,9 @@ mod tests {
         ];
         let aes = Aes128::new(&key);
         let mut data = pt;
-        aes_cts_encrypt(&aes, &iv, &mut data);
+        aes_cts_encrypt(&aes, &iv, &mut data).unwrap();
         assert_eq!(data, expected_ct);
-        aes_cts_decrypt(&aes, &iv, &mut data);
+        aes_cts_decrypt(&aes, &iv, &mut data).unwrap();
         assert_eq!(data, pt);
     }
 
@@ -948,7 +984,7 @@ mod tests {
             b"ATHENA.MIT.EDUraeburn",
             1,
             16,
-        );
+        ).unwrap();
         assert_eq!(
             key,
             vec![
@@ -967,7 +1003,7 @@ mod tests {
             b"ATHENA.MIT.EDUraeburn",
             1,
             32,
-        );
+        ).unwrap();
         assert_eq!(
             key,
             vec![
@@ -981,11 +1017,11 @@ mod tests {
 
     #[test]
     fn krb5_aes128_encrypt_decrypt_roundtrip() {
-        let key = krb5_aes_string_to_key(b"password", b"EXAMPLE.COMuser", 4096, 16);
+        let key = krb5_aes_string_to_key(b"password", b"EXAMPLE.COMuser", 4096, 16).unwrap();
         let plaintext = b"Hello Kerberos!";
         let confounder = [0x42u8; 16];
 
-        let encrypted = krb5_aes_encrypt(&key, 7, plaintext, &confounder);
+        let encrypted = krb5_aes_encrypt(&key, 7, plaintext, &confounder).unwrap();
         assert!(encrypted.len() > plaintext.len());
 
         let decrypted = krb5_aes_decrypt(&key, 7, &encrypted).unwrap();
@@ -994,33 +1030,33 @@ mod tests {
 
     #[test]
     fn krb5_aes256_encrypt_decrypt_roundtrip() {
-        let key = krb5_aes_string_to_key(b"password", b"EXAMPLE.COMuser", 4096, 32);
+        let key = krb5_aes_string_to_key(b"password", b"EXAMPLE.COMuser", 4096, 32).unwrap();
         let plaintext = b"Hello Kerberos AES-256!";
         let confounder = [0x37u8; 16];
 
-        let encrypted = krb5_aes_encrypt(&key, 11, plaintext, &confounder);
+        let encrypted = krb5_aes_encrypt(&key, 11, plaintext, &confounder).unwrap();
         let decrypted = krb5_aes_decrypt(&key, 11, &encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn krb5_aes_decrypt_bad_hmac_fails() {
-        let key = krb5_aes_string_to_key(b"password", b"EXAMPLE.COMuser", 4096, 16);
+        let key = krb5_aes_string_to_key(b"password", b"EXAMPLE.COMuser", 4096, 16).unwrap();
         let plaintext = b"test";
         let confounder = [0x01u8; 16];
 
-        let mut encrypted = krb5_aes_encrypt(&key, 1, plaintext, &confounder);
+        let mut encrypted = krb5_aes_encrypt(&key, 1, plaintext, &confounder).unwrap();
         // Corrupt the HMAC
         let len = encrypted.len();
         encrypted[len - 1] ^= 0xFF;
 
-        assert!(krb5_aes_decrypt(&key, 1, &encrypted).is_none());
+        assert!(krb5_aes_decrypt(&key, 1, &encrypted).is_err());
     }
 
     #[test]
     fn krb5_aes_checksum_produces_12_bytes() {
-        let key = krb5_aes_string_to_key(b"password", b"EXAMPLE.COMuser", 4096, 16);
-        let cksum = krb5_aes_checksum(&key, 6, b"some data to checksum");
+        let key = krb5_aes_string_to_key(b"password", b"EXAMPLE.COMuser", 4096, 16).unwrap();
+        let cksum = krb5_aes_checksum(&key, 6, b"some data to checksum").unwrap();
         assert_eq!(cksum.len(), 12);
     }
 }

@@ -3,19 +3,18 @@
 //! Cryptographic primitives for RDP -- MS-RDPBCGR 5.3/5.4
 //!
 //! Pure Rust implementations of the crypto algorithms needed for
-//! Standard RDP Security. In production, these should be replaced
-//! with well-audited crate implementations (e.g., `rc4`, `md-5`, `sha1`).
+//! Standard RDP Security -- MS-RDPBCGR 5.3/5.4.
+//!
+//! Intentionally implemented in pure Rust with zero external crypto
+//! dependencies, matching the project's design goal of no C dependencies.
 //!
 //! ## Algorithms
 //! - **RC4** -- Stream cipher for Standard RDP Security encryption
+//! - **MD4** -- 128-bit hash for NTLM NT hash (NTOWF)
 //! - **MD5** -- 128-bit hash for session key derivation
 //! - **SHA-1** -- 160-bit hash for session key derivation
 //! - **SHA-256** -- 256-bit hash (CredSSP)
 //! - **HMAC** -- Keyed hash for MAC generation
-//!
-//! ## RSA / Triple-DES
-//! RSA and FIPS triple-DES are complex and best provided by external crates.
-//! We define traits so they can be injected.
 
 use alloc::vec;
 
@@ -56,6 +55,16 @@ impl Rc4 {
     }
 }
 
+impl Drop for Rc4 {
+    fn drop(&mut self) {
+        self.s.fill(0);
+        self.i = 0;
+        self.j = 0;
+        // Optimization barrier: prevent compiler from eliding the zeroing
+        core::hint::black_box(&self.s);
+    }
+}
+
 // ── MD4 ──
 
 /// MD4 hash (128-bit / 16 bytes). Required for NTLM NT hash (NTOWF).
@@ -66,7 +75,12 @@ pub struct Md4 {
     buf_len: usize,
 }
 
+// NOTE: The `update()` method body is intentionally duplicated across Md4/Md5/Sha1/Sha256.
+// In no_std without trait objects, the transform function differs per hash and cannot be
+// abstracted without a macro or generics. The duplication is acceptable for 4 fixed hash types.
+
 impl Md4 {
+    /// Create a new MD4 hasher.
     pub fn new() -> Self {
         Self {
             state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
@@ -76,6 +90,7 @@ impl Md4 {
         }
     }
 
+    /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
         let mut offset = 0;
         self.count += data.len() as u64;
@@ -94,7 +109,8 @@ impl Md4 {
         }
 
         while offset + 64 <= data.len() {
-            let block: [u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let mut block = [0u8; 64];
+            block.copy_from_slice(&data[offset..offset + 64]);
             md4_transform(&mut self.state, &block);
             offset += 64;
         }
@@ -106,8 +122,9 @@ impl Md4 {
         }
     }
 
+    /// Finalize and return the 16-byte MD4 hash.
     pub fn finalize(mut self) -> [u8; 16] {
-        let bit_count = self.count * 8;
+        let bit_count = self.count.wrapping_mul(8);
         self.update(&[0x80]);
         while self.buf_len != 56 {
             self.update(&[0x00]);
@@ -150,7 +167,8 @@ fn md4_transform(state: &mut [u32; 4], block: &[u8; 64]) {
         b = temp;
     }
 
-    // Round 2: G(b,c,d) = (b & c) | (b & d) | (c & d), constant 0x5A827999
+    // Round 2: G(b,c,d) = (b & c) | (b & d) | (c & d)
+    // RFC 1320 §3.4 — Round 2 constant = floor(sqrt(2) × 2^30) = 0x5A827999
     for &(k, s) in &[
         (0, 3), (4, 5), (8, 9), (12, 13), (1, 3), (5, 5), (9, 9), (13, 13),
         (2, 3), (6, 5), (10, 9), (14, 13), (3, 3), (7, 5), (11, 9), (15, 13),
@@ -163,7 +181,8 @@ fn md4_transform(state: &mut [u32; 4], block: &[u8; 64]) {
         b = temp;
     }
 
-    // Round 3: H(b,c,d) = b ^ c ^ d, constant 0x6ED9EBA1
+    // Round 3: H(b,c,d) = b ^ c ^ d
+    // RFC 1320 §3.4 — Round 3 constant = floor(sqrt(3) × 2^30) = 0x6ED9EBA1
     for &(k, s) in &[
         (0, 3), (8, 9), (4, 11), (12, 15), (2, 3), (10, 9), (6, 11), (14, 15),
         (1, 3), (9, 9), (5, 11), (13, 15), (3, 3), (11, 9), (7, 11), (15, 15),
@@ -193,6 +212,7 @@ pub struct Md5 {
 }
 
 impl Md5 {
+    /// Create a new MD5 hasher.
     pub fn new() -> Self {
         Self {
             state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
@@ -202,6 +222,7 @@ impl Md5 {
         }
     }
 
+    /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
         let mut offset = 0;
         self.count += data.len() as u64;
@@ -220,7 +241,8 @@ impl Md5 {
         }
 
         while offset + 64 <= data.len() {
-            let block: [u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let mut block = [0u8; 64];
+            block.copy_from_slice(&data[offset..offset + 64]);
             md5_transform(&mut self.state, &block);
             offset += 64;
         }
@@ -232,8 +254,9 @@ impl Md5 {
         }
     }
 
+    /// Finalize and return the 16-byte MD5 hash.
     pub fn finalize(mut self) -> [u8; 16] {
-        let bit_count = self.count * 8;
+        let bit_count = self.count.wrapping_mul(8);
         // Padding
         self.update(&[0x80]);
         while self.buf_len != 56 {
@@ -312,6 +335,7 @@ pub struct Sha1 {
 }
 
 impl Sha1 {
+    /// Create a new SHA-1 hasher.
     pub fn new() -> Self {
         Self {
             state: [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
@@ -321,6 +345,7 @@ impl Sha1 {
         }
     }
 
+    /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
         let mut offset = 0;
         self.count += data.len() as u64;
@@ -339,7 +364,8 @@ impl Sha1 {
         }
 
         while offset + 64 <= data.len() {
-            let block: [u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let mut block = [0u8; 64];
+            block.copy_from_slice(&data[offset..offset + 64]);
             sha1_transform(&mut self.state, &block);
             offset += 64;
         }
@@ -351,8 +377,9 @@ impl Sha1 {
         }
     }
 
+    /// Finalize and return the 20-byte SHA-1 hash.
     pub fn finalize(mut self) -> [u8; 20] {
-        let bit_count = self.count * 8;
+        let bit_count = self.count.wrapping_mul(8);
         self.update(&[0x80]);
         while self.buf_len != 56 {
             self.update(&[0x00]);
@@ -418,6 +445,7 @@ pub struct Sha256 {
 }
 
 impl Sha256 {
+    /// Create a new SHA-256 hasher.
     pub fn new() -> Self {
         Self {
             state: [
@@ -430,6 +458,7 @@ impl Sha256 {
         }
     }
 
+    /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
         let mut offset = 0;
         self.count += data.len() as u64;
@@ -448,7 +477,8 @@ impl Sha256 {
         }
 
         while offset + 64 <= data.len() {
-            let block: [u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let mut block = [0u8; 64];
+            block.copy_from_slice(&data[offset..offset + 64]);
             sha256_transform(&mut self.state, &block);
             offset += 64;
         }
@@ -460,8 +490,9 @@ impl Sha256 {
         }
     }
 
+    /// Finalize and return the 32-byte SHA-256 hash.
     pub fn finalize(mut self) -> [u8; 32] {
-        let bit_count = self.count * 8;
+        let bit_count = self.count.wrapping_mul(8);
         self.update(&[0x80]);
         while self.buf_len != 56 {
             self.update(&[0x00]);
@@ -535,22 +566,18 @@ fn sha256_transform(state: &mut [u32; 8], block: &[u8; 64]) {
 
 /// HMAC-MD5.
 pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
-    hmac_generic::<16, 64>(key, data, md5_oneshot)
+    hmac_generic::<16, 64>(key, data, md5)
 }
 
 /// HMAC-SHA1.
 pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
-    hmac_generic::<20, 64>(key, data, sha1_oneshot)
+    hmac_generic::<20, 64>(key, data, sha1)
 }
 
 /// HMAC-SHA256.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    hmac_generic::<32, 64>(key, data, sha256_oneshot)
+    hmac_generic::<32, 64>(key, data, sha256)
 }
-
-fn md5_oneshot(data: &[u8]) -> [u8; 16] { md5(data) }
-fn sha1_oneshot(data: &[u8]) -> [u8; 20] { sha1(data) }
-fn sha256_oneshot(data: &[u8]) -> [u8; 32] { sha256(data) }
 
 /// Generic HMAC implementation.
 fn hmac_generic<const HASH_LEN: usize, const BLOCK_SIZE: usize>(
@@ -566,6 +593,7 @@ fn hmac_generic<const HASH_LEN: usize, const BLOCK_SIZE: usize>(
         key_block[..key.len()].copy_from_slice(key);
     }
 
+    // RFC 2104 §2 — ipad = 0x36 repeated, opad = 0x5C repeated
     // Inner: key XOR ipad
     let mut inner_input = [0u8; BLOCK_SIZE];
     for i in 0..BLOCK_SIZE {
@@ -584,7 +612,15 @@ fn hmac_generic<const HASH_LEN: usize, const BLOCK_SIZE: usize>(
         outer[i] = key_block[i] ^ 0x5C;
     }
     outer[BLOCK_SIZE..].copy_from_slice(&inner_hash);
-    hash_fn(&outer)
+    let result = hash_fn(&outer);
+
+    // Zeroize key material before returning
+    key_block.fill(0);
+    inner_input.fill(0);
+    core::hint::black_box(&key_block);
+    core::hint::black_box(&inner_input);
+
+    result
 }
 
 #[cfg(test)]

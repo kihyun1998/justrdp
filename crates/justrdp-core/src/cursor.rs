@@ -117,10 +117,13 @@ impl<'a> ReadCursor<'a> {
     /// Read a little-endian `u64` and advance the cursor.
     pub fn read_u64_le(&mut self, context: &'static str) -> DecodeResult<u64> {
         self.ensure(8, context)?;
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&self.bytes[self.pos..self.pos + 8]);
+        let p = self.pos;
+        let val = u64::from_le_bytes([
+            self.bytes[p], self.bytes[p + 1], self.bytes[p + 2], self.bytes[p + 3],
+            self.bytes[p + 4], self.bytes[p + 5], self.bytes[p + 6], self.bytes[p + 7],
+        ]);
         self.pos += 8;
-        Ok(u64::from_le_bytes(buf))
+        Ok(val)
     }
 
     /// Read a little-endian `i16` and advance the cursor.
@@ -236,8 +239,7 @@ impl<'a> WriteCursor<'a> {
     pub fn write_u16_le(&mut self, val: u16, context: &'static str) -> EncodeResult<()> {
         self.ensure(2, context)?;
         let bytes = val.to_le_bytes();
-        self.bytes[self.pos] = bytes[0];
-        self.bytes[self.pos + 1] = bytes[1];
+        self.bytes[self.pos..self.pos + 2].copy_from_slice(&bytes);
         self.pos += 2;
         Ok(())
     }
@@ -246,8 +248,7 @@ impl<'a> WriteCursor<'a> {
     pub fn write_u16_be(&mut self, val: u16, context: &'static str) -> EncodeResult<()> {
         self.ensure(2, context)?;
         let bytes = val.to_be_bytes();
-        self.bytes[self.pos] = bytes[0];
-        self.bytes[self.pos + 1] = bytes[1];
+        self.bytes[self.pos..self.pos + 2].copy_from_slice(&bytes);
         self.pos += 2;
         Ok(())
     }
@@ -283,8 +284,7 @@ impl<'a> WriteCursor<'a> {
     pub fn write_i16_le(&mut self, val: i16, context: &'static str) -> EncodeResult<()> {
         self.ensure(2, context)?;
         let bytes = val.to_le_bytes();
-        self.bytes[self.pos] = bytes[0];
-        self.bytes[self.pos + 1] = bytes[1];
+        self.bytes[self.pos..self.pos + 2].copy_from_slice(&bytes);
         self.pos += 2;
         Ok(())
     }
@@ -301,9 +301,7 @@ impl<'a> WriteCursor<'a> {
     /// Write `n` zero bytes and advance the cursor.
     pub fn write_zeros(&mut self, n: usize, context: &'static str) -> EncodeResult<()> {
         self.ensure(n, context)?;
-        for i in 0..n {
-            self.bytes[self.pos + i] = 0;
-        }
+        self.bytes[self.pos..self.pos + n].fill(0);
         self.pos += n;
         Ok(())
     }

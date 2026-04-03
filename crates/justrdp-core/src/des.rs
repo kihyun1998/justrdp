@@ -10,6 +10,8 @@
 
 use alloc::vec::Vec;
 
+use crate::error::{CryptoError, CryptoResult};
+
 // ── DES Tables ──
 
 /// Initial Permutation (IP).
@@ -145,11 +147,12 @@ const SBOXES: [[u8; 64]; 8] = [
 
 /// Apply a permutation table to a u64 value.
 fn permute(val: u64, table: &[u8], in_bits: u8) -> u64 {
+    let out_len = table.len();
     let mut result: u64 = 0;
     for (i, &pos) in table.iter().enumerate() {
         // pos is 1-based, referring to bit position in the input
         let bit = (val >> (in_bits - pos)) & 1;
-        result |= bit << (table.len() as u8 - 1 - i as u8);
+        result |= bit << (out_len - 1 - i);
     }
     result
 }
@@ -197,6 +200,7 @@ fn des_f(r: u32, subkey: u64) -> u32 {
     let xored = expanded ^ subkey;
 
     // S-box substitution: 48 bits → 32 bits
+    // FIPS 46-3 §3.2 — Bit offsets: S[0] at bits 47-42, S[1] at 41-36, ..., S[7] at 5-0
     let mut sbox_out: u32 = 0;
     for i in 0..8 {
         let offset = 42 - i * 6;
@@ -261,6 +265,11 @@ fn des_decrypt_block(block: u64, subkeys: &[u64; 16]) -> u64 {
     permute(pre_fp, &FP, 64)
 }
 
+/// XOR two 8-byte blocks in place.
+fn xor_block_8(a: &mut [u8; 8], b: &[u8; 8]) {
+    for i in 0..8 { a[i] ^= b[i]; }
+}
+
 // ── Public API ──
 
 /// Convert 8 bytes to u64.
@@ -283,8 +292,8 @@ fn u64_to_bytes(v: u64) -> [u8; 8] {
 /// Triple-DES (3DES EDE) cipher.
 ///
 /// Uses three 8-byte DES keys (K1, K2, K3) for a total of 24 bytes.
-/// - Encrypt: E_K1(D_K2(E_K3(plaintext)))
-/// - Decrypt: D_K3(E_K2(D_K1(ciphertext)))
+/// - Encrypt: C = E_K3(D_K2(E_K1(P)))  (NIST SP 800-67 EDE)
+/// - Decrypt: P = D_K1(E_K2(D_K3(C)))
 #[derive(Clone)]
 pub struct TripleDes {
     subkeys1: [u64; 16],
@@ -328,33 +337,36 @@ impl TripleDes {
 
     /// Encrypt data in CBC mode.
     ///
-    /// Input must be a multiple of 8 bytes. IV is 8 bytes.
+    /// Input must be a non-empty multiple of 8 bytes. IV is 8 bytes.
     /// Returns ciphertext (same length as input).
-    pub fn encrypt_cbc(&self, data: &[u8], iv: &[u8; 8]) -> Vec<u8> {
-        assert!(data.len() % 8 == 0, "data must be a multiple of 8 bytes");
+    pub fn encrypt_cbc(&self, data: &[u8], iv: &[u8; 8]) -> CryptoResult<Vec<u8>> {
+        if data.is_empty() || data.len() % 8 != 0 {
+            return Err(CryptoError::InvalidDataLength);
+        }
 
         let mut result = Vec::with_capacity(data.len());
         let mut prev = *iv;
 
         for chunk in data.chunks_exact(8) {
             let mut block = [0u8; 8];
-            for i in 0..8 {
-                block[i] = chunk[i] ^ prev[i];
-            }
+            block.copy_from_slice(chunk);
+            xor_block_8(&mut block, &prev);
             let encrypted = self.encrypt_block(&block);
             result.extend_from_slice(&encrypted);
             prev = encrypted;
         }
 
-        result
+        Ok(result)
     }
 
     /// Decrypt data in CBC mode.
     ///
-    /// Input must be a multiple of 8 bytes. IV is 8 bytes.
+    /// Input must be a non-empty multiple of 8 bytes. IV is 8 bytes.
     /// Returns plaintext (same length as input).
-    pub fn decrypt_cbc(&self, data: &[u8], iv: &[u8; 8]) -> Vec<u8> {
-        assert!(data.len() % 8 == 0, "data must be a multiple of 8 bytes");
+    pub fn decrypt_cbc(&self, data: &[u8], iv: &[u8; 8]) -> CryptoResult<Vec<u8>> {
+        if data.is_empty() || data.len() % 8 != 0 {
+            return Err(CryptoError::InvalidDataLength);
+        }
 
         let mut result = Vec::with_capacity(data.len());
         let mut prev = *iv;
@@ -362,16 +374,24 @@ impl TripleDes {
         for chunk in data.chunks_exact(8) {
             let mut ct_block = [0u8; 8];
             ct_block.copy_from_slice(chunk);
-            let decrypted = self.decrypt_block(&ct_block);
-            let mut plaintext = [0u8; 8];
-            for i in 0..8 {
-                plaintext[i] = decrypted[i] ^ prev[i];
-            }
+            let mut plaintext = self.decrypt_block(&ct_block);
+            xor_block_8(&mut plaintext, &prev);
             result.extend_from_slice(&plaintext);
             prev = ct_block;
         }
 
-        result
+        Ok(result)
+    }
+}
+
+impl Drop for TripleDes {
+    fn drop(&mut self) {
+        self.subkeys1.fill(0);
+        self.subkeys2.fill(0);
+        self.subkeys3.fill(0);
+        core::hint::black_box(&self.subkeys1);
+        core::hint::black_box(&self.subkeys2);
+        core::hint::black_box(&self.subkeys3);
     }
 }
 
@@ -434,11 +454,11 @@ mod tests {
         ]; // "Now is the time "
 
         let cipher = TripleDes::new(&key);
-        let ct = cipher.encrypt_cbc(&plaintext, &iv);
+        let ct = cipher.encrypt_cbc(&plaintext, &iv).unwrap();
         assert_eq!(ct.len(), 16);
         assert_ne!(&ct[..], &plaintext[..]);
 
-        let pt = cipher.decrypt_cbc(&ct, &iv);
+        let pt = cipher.decrypt_cbc(&ct, &iv).unwrap();
         assert_eq!(&pt[..], &plaintext[..]);
     }
 

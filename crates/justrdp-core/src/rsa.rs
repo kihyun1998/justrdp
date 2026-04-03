@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! RSA PKCS#1 v1.5 signing and verification for PKINIT.
 //!
 //! Implements RSA signature operations needed for PKINIT (RFC 4556):
@@ -9,6 +11,7 @@ use alloc::vec::Vec;
 
 use crate::bignum::BigUint;
 use crate::crypto::Sha256;
+use crate::error::{CryptoError, CryptoResult};
 
 /// RSA public key.
 #[derive(Clone, Debug)]
@@ -20,7 +23,9 @@ pub struct RsaPublicKey {
 }
 
 /// RSA private key (simple form: n, d).
-#[derive(Clone, Debug)]
+///
+/// Implements `Drop` to zeroize the private exponent `d` on destruction.
+#[derive(Clone)]
 pub struct RsaPrivateKey {
     /// Modulus n.
     pub n: BigUint,
@@ -28,6 +33,23 @@ pub struct RsaPrivateKey {
     pub d: BigUint,
     /// Public exponent e (for extracting public key).
     pub e: BigUint,
+}
+
+impl core::fmt::Debug for RsaPrivateKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RsaPrivateKey")
+            .field("n", &self.n)
+            .field("d", &"[REDACTED]")
+            .field("e", &self.e)
+            .finish()
+    }
+}
+
+impl Drop for RsaPrivateKey {
+    fn drop(&mut self) {
+        self.d.zeroize();
+        self.n.zeroize();
+    }
 }
 
 impl RsaPrivateKey {
@@ -60,6 +82,10 @@ impl RsaPublicKey {
 ///     digest          OCTET STRING
 /// }
 /// ```
+/// PKCS#1 v1.5 minimum overhead: 0x00 || 0x01 || PS (>=8 bytes) || 0x00 = 11 bytes.
+/// RFC 8017 §9.2.
+const PKCS1_V15_OVERHEAD: usize = 11;
+
 const SHA256_DIGEST_INFO_PREFIX: [u8; 19] = [
     0x30, 0x31, // SEQUENCE (49 bytes)
     0x30, 0x0d, // SEQUENCE (13 bytes) - AlgorithmIdentifier
@@ -75,7 +101,10 @@ const SHA256_DIGEST_INFO_PREFIX: [u8; 19] = [
 /// 2. Build DigestInfo = DER(AlgorithmIdentifier(sha256) || Hash)
 /// 3. Pad: 0x00 || 0x01 || PS(0xFF...) || 0x00 || DigestInfo
 /// 4. Convert to integer and compute m^d mod n
-pub fn rsa_sign_sha256(key: &RsaPrivateKey, data: &[u8]) -> Vec<u8> {
+///
+/// Returns `CryptoError::InvalidKeySize` if the key is too small for PKCS#1 v1.5
+/// with SHA-256 (minimum 62 bytes / 496 bits).
+pub fn rsa_sign_sha256(key: &RsaPrivateKey, data: &[u8]) -> CryptoResult<Vec<u8>> {
     let k = key.key_size();
 
     // Hash
@@ -88,23 +117,26 @@ pub fn rsa_sign_sha256(key: &RsaPrivateKey, data: &[u8]) -> Vec<u8> {
     digest_info.extend_from_slice(&SHA256_DIGEST_INFO_PREFIX);
     digest_info.extend_from_slice(&hash);
 
-    // PKCS#1 v1.5 padding
+    // PKCS#1 v1.5 padding: 0x00 || 0x01 || PS (>= 8 bytes of 0xFF) || 0x00 || DigestInfo
     let t_len = digest_info.len(); // 19 + 32 = 51
-    let ps_len = k - t_len - 3; // padding string length
+    // Minimum key size: t_len + 11 (3 framing bytes + 8 minimum PS bytes)
+    if k < t_len + PKCS1_V15_OVERHEAD {
+        return Err(CryptoError::InvalidKeySize);
+    }
+    let ps_len = k - t_len - 3;
 
     let mut em = vec![0u8; k];
     em[0] = 0x00;
     em[1] = 0x01;
-    for i in 0..ps_len {
-        em[2 + i] = 0xFF;
-    }
+    em[2..2 + ps_len].fill(0xFF);
     em[2 + ps_len] = 0x00;
     em[3 + ps_len..].copy_from_slice(&digest_info);
 
     // RSA private key operation: signature = em^d mod n
+    // SECURITY: mod_exp is non-constant-time; timing side-channel exists for private exponent.
     let m = BigUint::from_be_bytes(&em);
     let s = m.mod_exp(&key.d, &key.n);
-    s.to_be_bytes_padded(k)
+    Ok(s.to_be_bytes_padded(k))
 }
 
 /// RSA raw public-key operation for RDP Standard Security.
@@ -146,42 +178,38 @@ pub fn rsa_verify_sha256(key: &RsaPublicKey, data: &[u8], signature: &[u8]) -> b
     let m = s.mod_exp(&key.e, &key.n);
     let em = m.to_be_bytes_padded(k);
 
-    // Verify padding: 0x00 || 0x01 || PS || 0x00 || DigestInfo
-    if em.len() < 11 || em[0] != 0x00 || em[1] != 0x01 {
-        return false;
-    }
+    // Constant-time PKCS#1 v1.5 verification (RFC 8017 §8.2.2).
+    // Reconstruct expected padded message and compare in constant time,
+    // rather than parsing the padding (which leaks structure via timing).
 
-    // Find end of PS (0xFF bytes)
-    let mut i = 2;
-    while i < em.len() && em[i] == 0xFF {
-        i += 1;
-    }
-
-    if i < 10 || i >= em.len() || em[i] != 0x00 {
-        return false;
-    }
-
-    i += 1; // skip 0x00 separator
-
-    let digest_info = &em[i..];
-
-    // Check DigestInfo prefix
-    if digest_info.len() != SHA256_DIGEST_INFO_PREFIX.len() + 32 {
-        return false;
-    }
-
-    if &digest_info[..SHA256_DIGEST_INFO_PREFIX.len()] != SHA256_DIGEST_INFO_PREFIX.as_slice() {
-        return false;
-    }
-
-    let expected_hash = &digest_info[SHA256_DIGEST_INFO_PREFIX.len()..];
-
-    // Hash the data
+    // Hash the data first
     let mut hasher = Sha256::new();
     hasher.update(data);
     let actual_hash = hasher.finalize();
 
-    expected_hash == actual_hash
+    // Build expected EM: 0x00 || 0x01 || PS (0xFF...) || 0x00 || DigestInfo
+    let t_len = SHA256_DIGEST_INFO_PREFIX.len() + 32; // 19 + 32 = 51
+    if k < t_len + PKCS1_V15_OVERHEAD {
+        return false;
+    }
+    let ps_len = k - t_len - 3;
+
+    let mut expected_em = vec![0u8; k];
+    expected_em[0] = 0x00;
+    expected_em[1] = 0x01;
+    expected_em[2..2 + ps_len].fill(0xFF);
+    expected_em[2 + ps_len] = 0x00;
+    expected_em[3 + ps_len..3 + ps_len + SHA256_DIGEST_INFO_PREFIX.len()]
+        .copy_from_slice(&SHA256_DIGEST_INFO_PREFIX);
+    expected_em[3 + ps_len + SHA256_DIGEST_INFO_PREFIX.len()..]
+        .copy_from_slice(&actual_hash);
+
+    // Constant-time comparison of entire EM
+    let mut diff = 0u8;
+    for (a, b) in em.iter().zip(expected_em.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -250,7 +278,7 @@ mod tests {
         let key = test_512bit_key();
         let data = b"Hello, PKINIT!";
 
-        let signature = rsa_sign_sha256(&key, data);
+        let signature = rsa_sign_sha256(&key, data).unwrap();
         assert_eq!(signature.len(), 64); // 512-bit key = 64 bytes
 
         let public_key = key.public_key();
@@ -260,7 +288,7 @@ mod tests {
     #[test]
     fn rsa_verify_wrong_data_fails() {
         let key = test_512bit_key();
-        let signature = rsa_sign_sha256(&key, b"correct data");
+        let signature = rsa_sign_sha256(&key, b"correct data").unwrap();
 
         let public_key = key.public_key();
         assert!(!rsa_verify_sha256(&public_key, b"wrong data", &signature));

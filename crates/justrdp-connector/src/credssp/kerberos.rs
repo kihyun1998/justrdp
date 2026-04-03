@@ -269,7 +269,7 @@ impl KerberosSequence {
             KEY_USAGE_AS_REQ_PA_ENC_TIMESTAMP,
             &ts_enc,
             confounder,
-        );
+        ).expect("krb5_aes_encrypt: client key is already validated");
 
         let enc_data = EncryptedData::new(self.etype, encrypted);
 
@@ -302,7 +302,7 @@ impl KerberosSequence {
             .ok_or_else(|| ConnectorError::general("PKINIT config not set"))?;
 
         // Generate DH key pair
-        let kp = dh_generate_keypair(&config.dh_private_bytes);
+        let mut kp = dh_generate_keypair(&config.dh_private_bytes);
         let p = OakleyGroup14::prime();
         let g = OakleyGroup14::generator();
 
@@ -344,7 +344,8 @@ impl KerberosSequence {
         let auth_pack_der = auth_pack.encode();
 
         // Sign AuthPack with RSA private key
-        let signature = rsa_sign_sha256(&config.private_key, &auth_pack_der);
+        let signature = rsa_sign_sha256(&config.private_key, &auth_pack_der)
+            .map_err(|_| ConnectorError::general("RSA key too small for PKCS#1 v1.5 signing"))?;
 
         // Extract issuer and serial from client certificate
         let (issuer_der, serial_der) = cms::extract_cert_issuer_serial(&config.client_cert_der)
@@ -374,8 +375,9 @@ impl KerberosSequence {
             PaData::new(PA_PAC_REQUEST, encode_pa_pac_request(true)),
         ];
 
-        // Store DH private key for later shared secret computation
-        self.dh_private_key = Some(kp.private_key);
+        // Take DH private key for later shared secret computation
+        // (use mem::replace to move out of DhKeyPair which implements Drop)
+        self.dh_private_key = Some(core::mem::replace(&mut kp.private_key, BigUint::zero()));
 
         let req = KdcReq::as_req(padata, req_body);
         Ok(req.encode())
@@ -402,7 +404,7 @@ impl KerberosSequence {
                         &self.salt,
                         self.iterations,
                         key_len,
-                    );
+                    ).map_err(|_| ConnectorError::general("invalid AES key length for string-to-key"))?;
                     self.state = KerberosState::SendAsReqPreAuth;
                     Ok(())
                 } else {
@@ -425,7 +427,7 @@ impl KerberosSequence {
                 // Decrypt enc-part
                 let key_usage = KEY_USAGE_AS_REP_ENC_PART;
                 let decrypted = krb5_aes_decrypt(&reply_key, key_usage, &rep.enc_part.cipher)
-                    .ok_or_else(|| ConnectorError::general("AS-REP decrypt failed"))?;
+                    .map_err(|_| ConnectorError::general("AS-REP decrypt failed"))?;
 
                 // Decode EncKDCRepPart
                 let enc_part = EncKdcRepPart::decode(&decrypted)
@@ -469,7 +471,7 @@ impl KerberosSequence {
             &self.tgt_session_key,
             KEY_USAGE_TGS_REQ_PA_TGS_REQ_CKSUM,
             &body_bytes,
-        );
+        ).map_err(|_| ConnectorError::general("failed to compute TGS-REQ checksum"))?;
 
         // Checksum type: HMAC-SHA1-96-AES256 = 16, HMAC-SHA1-96-AES128 = 15
         let cksumtype = if self.etype == ETYPE_AES256_CTS_HMAC_SHA1 { 16 } else { 15 };
@@ -496,7 +498,7 @@ impl KerberosSequence {
             KEY_USAGE_TGS_REQ_AUTHENTICATOR,
             &auth_bytes,
             confounder,
-        );
+        ).map_err(|_| ConnectorError::general("failed to encrypt TGS-REQ authenticator"))?;
 
         let enc_auth = EncryptedData::new(self.etype, encrypted_auth);
 
@@ -536,7 +538,7 @@ impl KerberosSequence {
                     &self.tgt_session_key,
                     KEY_USAGE_TGS_REP_ENC_PART_SESSION_KEY,
                     &rep.enc_part.cipher,
-                ).ok_or_else(|| ConnectorError::general("TGS-REP decrypt failed"))?;
+                ).map_err(|_| ConnectorError::general("TGS-REP decrypt failed"))?;
 
                 let enc_part = EncKdcRepPart::decode(&decrypted)
                     .map_err(|_| ConnectorError::general("EncTGSRepPart decode failed"))?;
@@ -608,7 +610,7 @@ impl KerberosSequence {
             KEY_USAGE_AP_REQ_AUTHENTICATOR,
             &auth_bytes,
             confounder,
-        );
+        ).map_err(|_| ConnectorError::general("failed to encrypt AP-REQ authenticator"))?;
 
         let enc_auth = EncryptedData::new(self.etype, encrypted_auth);
 
@@ -643,7 +645,7 @@ impl KerberosSequence {
             &self.service_session_key,
             KEY_USAGE_AP_REP_ENC_PART,
             &ap_rep.enc_part.cipher,
-        ).ok_or_else(|| ConnectorError::general("AP-REP decrypt failed"))?;
+        ).map_err(|_| ConnectorError::general("AP-REP decrypt failed"))?;
 
         let enc_part = EncApRepPart::decode(&decrypted)
             .map_err(|_| ConnectorError::general("EncAPRepPart decode failed"))?;

@@ -37,10 +37,9 @@ pub fn encode(data: &[u8]) -> Vec<u8> {
 
 /// Encode bytes to Base64URL as a UTF-8 string (no padding).
 pub fn encode_string(data: &[u8]) -> alloc::string::String {
-    // SAFETY: ENCODE_TABLE only contains ASCII characters
+    // Invariant: ENCODE_TABLE only contains ASCII characters, so output is valid UTF-8.
     let bytes = encode(data);
-    // All bytes are ASCII, so this is valid UTF-8
-    alloc::string::String::from_utf8(bytes).unwrap_or_default()
+    alloc::string::String::from_utf8(bytes).expect("base64url output is always valid ASCII")
 }
 
 /// Decode Base64URL bytes. Tolerates both padded and unpadded input.

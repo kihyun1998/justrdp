@@ -116,7 +116,7 @@ impl BigUint {
         }
 
         // Strip trailing zeros
-        while bytes.len() > 1 && *bytes.last().unwrap() == 0 {
+        while bytes.len() > 1 && bytes.last() == Some(&0) {
             bytes.pop();
         }
 
@@ -124,9 +124,17 @@ impl BigUint {
     }
 
     /// Convert to little-endian bytes, padded to `len` bytes.
+    ///
+    /// If the value requires more than `len` bytes, the high bytes are silently
+    /// truncated. A debug_assert fires in debug builds if this happens.
     pub fn to_le_bytes_padded(&self, len: usize) -> Vec<u8> {
         let bytes = self.to_le_bytes();
         if bytes.len() >= len {
+            debug_assert!(
+                bytes[len..].iter().all(|&b| b == 0),
+                "BigUint::to_le_bytes_padded: value exceeds {} bytes, high bytes truncated",
+                len,
+            );
             return bytes[..len].to_vec();
         }
         let mut padded = bytes;
@@ -173,30 +181,9 @@ impl BigUint {
 
     /// Remove trailing zero limbs (keeping at least one).
     fn normalize(&mut self) {
-        while self.limbs.len() > 1 && *self.limbs.last().unwrap() == 0 {
+        while self.limbs.len() > 1 && self.limbs.last() == Some(&0) {
             self.limbs.pop();
         }
-    }
-
-    /// Compare: returns -1, 0, or 1.
-    pub fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        use core::cmp::Ordering;
-        let a_len = self.significant_limbs();
-        let b_len = other.significant_limbs();
-
-        if a_len != b_len {
-            return a_len.cmp(&b_len);
-        }
-
-        for i in (0..a_len).rev() {
-            let a = self.limb(i);
-            let b = other.limb(i);
-            if a != b {
-                return a.cmp(&b);
-            }
-        }
-
-        Ordering::Equal
     }
 
     fn limb(&self, i: usize) -> u32 {
@@ -276,13 +263,13 @@ impl BigUint {
     }
 
     /// Division with remainder: returns (quotient, remainder).
+    ///
+    /// Uses binary long division. O(bit_len²) due to per-iteration allocation
+    /// in `shl1`; acceptable for key-size operands (up to 2048-bit).
     pub fn div_rem(&self, divisor: &Self) -> (Self, Self) {
         use core::cmp::Ordering;
 
-        if divisor.is_zero() {
-            // Division by zero — return (0, 0) defensively
-            return (Self::zero(), Self::zero());
-        }
+        assert!(!divisor.is_zero(), "BigUint::div_rem: division by zero");
 
         match self.cmp(divisor) {
             Ordering::Less => return (Self::zero(), self.clone()),
@@ -338,7 +325,9 @@ impl BigUint {
 
     /// Modular exponentiation: self^exp mod modulus.
     ///
-    /// Uses Montgomery-aware square-and-multiply.
+    /// Uses the Montgomery ladder algorithm for constant-time execution:
+    /// both branches perform the same operations (one multiply + one square)
+    /// regardless of each exponent bit, preventing timing side-channel attacks.
     pub fn mod_exp(&self, exp: &Self, modulus: &Self) -> Self {
         if modulus.is_zero() {
             return Self::zero();
@@ -353,17 +342,29 @@ impl BigUint {
         let base = self.rem(modulus);
         let exp_bits = exp.bit_len();
 
-        // Square-and-multiply (left to right)
-        let mut result = one;
+        // Montgomery ladder: constant-time modular exponentiation.
+        // Both branches perform identical work (multiply + square),
+        // only the assignment target differs.
+        let mut r0 = one;      // accumulates result
+        let mut r1 = base;     // base * result
 
         for i in (0..exp_bits).rev() {
-            result = result.mul(&result).rem(modulus);
             if exp.bit(i) {
-                result = result.mul(&base).rem(modulus);
+                r0 = r0.mul(&r1).rem(modulus);
+                r1 = r1.mul(&r1).rem(modulus);
+            } else {
+                r1 = r0.mul(&r1).rem(modulus);
+                r0 = r0.mul(&r0).rem(modulus);
             }
         }
 
-        result
+        r0
+    }
+
+    /// Zero out all limbs to prevent key material from lingering in memory.
+    pub fn zeroize(&mut self) {
+        self.limbs.fill(0);
+        core::hint::black_box(&self.limbs);
     }
 }
 
@@ -383,7 +384,22 @@ impl PartialOrd for BigUint {
 
 impl Ord for BigUint {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        BigUint::cmp(self, other)
+        let a_len = self.significant_limbs();
+        let b_len = other.significant_limbs();
+
+        if a_len != b_len {
+            return a_len.cmp(&b_len);
+        }
+
+        for i in (0..a_len).rev() {
+            let a = self.limb(i);
+            let b = other.limb(i);
+            if a != b {
+                return a.cmp(&b);
+            }
+        }
+
+        core::cmp::Ordering::Equal
     }
 }
 

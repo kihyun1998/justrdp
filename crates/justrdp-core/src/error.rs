@@ -195,3 +195,29 @@ impl fmt::Display for DecodeError {
 
 /// Result type for decoding operations.
 pub type DecodeResult<T> = Result<T, DecodeError>;
+
+// ── Crypto Errors ──
+
+/// An error from a cryptographic operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptoError {
+    /// Key size is invalid for the operation.
+    InvalidKeySize,
+    /// Input data length is invalid (not block-aligned, too short, etc.).
+    InvalidDataLength,
+    /// HMAC verification failed (authentication error).
+    HmacVerifyFailed,
+}
+
+impl fmt::Display for CryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CryptoError::InvalidKeySize => write!(f, "invalid key size"),
+            CryptoError::InvalidDataLength => write!(f, "invalid data length"),
+            CryptoError::HmacVerifyFailed => write!(f, "HMAC verification failed"),
+        }
+    }
+}
+
+/// Result type for cryptographic operations.
+pub type CryptoResult<T> = Result<T, CryptoError>;

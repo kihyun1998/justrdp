@@ -72,7 +72,8 @@ pub fn gss_wrap(
     };
 
     // Encrypt: confounder(16) || plaintext, producing ciphertext || HMAC(12)
-    let encrypted = krb5_aes_encrypt(key, key_usage, &plaintext, confounder);
+    let encrypted = krb5_aes_encrypt(key, key_usage, &plaintext, confounder)
+        .expect("gss_wrap: key must be valid AES-128 or AES-256");
 
     // Right-rotate the encrypted data by RRC positions
     let rotated = rotate_right(&encrypted, AES_RRC as usize);
@@ -128,7 +129,7 @@ pub fn gss_unwrap(
 
     // Decrypt
     let decrypted = krb5_aes_decrypt(key, key_usage, &unrotated)
-        .ok_or_else(|| ConnectorError::general("GSS Wrap: decryption failed"))?;
+        .map_err(|_| ConnectorError::general("GSS Wrap: decryption failed"))?;
 
     // decrypted = data || filler(ec bytes) || header(16 bytes)
     if decrypted.len() < ec + GSS_WRAP_HEADER_SIZE {
