@@ -8,7 +8,6 @@
 #![doc = "- [`WriteBuf`] for dynamically-sized write buffers"]
 #![doc = "- Error types for encode/decode operations"]
 
-#[cfg(feature = "alloc")]
 extern crate alloc;
 
 pub mod aes;
@@ -26,7 +25,7 @@ mod error;
 
 pub use cursor::{ReadCursor, WriteCursor};
 pub use encode::{AsAny, Decode, DecodeOwned, Encode, IntoOwned};
-pub use error::{DecodeError, DecodeErrorKind, DecodeResult, EncodeError, EncodeErrorKind, EncodeResult};
+pub use error::{CryptoError, CryptoResult, DecodeError, DecodeErrorKind, DecodeResult, EncodeError, EncodeErrorKind, EncodeResult};
 
 #[cfg(feature = "alloc")]
 mod write_buf;

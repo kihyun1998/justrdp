@@ -639,8 +639,9 @@ impl FipsSecurityContext {
         padded.extend_from_slice(plaintext);
         padded.resize(total_len, pad_len as u8);
 
-        // 3DES-CBC encrypt
-        let ciphertext = self.encrypt_cipher.encrypt_cbc(&padded, &self.encrypt_iv);
+        // 3DES-CBC encrypt (data is always padded to block size above)
+        let ciphertext = self.encrypt_cipher.encrypt_cbc(&padded, &self.encrypt_iv)
+            .expect("FIPS encrypt: data is pre-padded to 8-byte block size");
 
         // Update IV: last 8 bytes of ciphertext
         if ciphertext.len() >= 8 {
@@ -663,8 +664,9 @@ impl FipsSecurityContext {
             self.decrypt_iv.copy_from_slice(&ciphertext[ciphertext.len() - 8..]);
         }
 
-        // 3DES-CBC decrypt
-        let decrypted = self.decrypt_cipher.decrypt_cbc(ciphertext, &iv);
+        // 3DES-CBC decrypt (ciphertext is always block-aligned from the protocol)
+        let decrypted = self.decrypt_cipher.decrypt_cbc(ciphertext, &iv)
+            .expect("FIPS decrypt: ciphertext is block-aligned");
 
         // Remove padding
         let data_len = decrypted.len().saturating_sub(pad_len as usize);

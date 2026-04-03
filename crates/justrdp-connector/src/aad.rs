@@ -60,7 +60,8 @@ pub fn build_rdp_assertion(config: &AadConfig, server_nonce: &str) -> String {
 
     // RSASSA-PKCS1-v1_5 signature with SHA-256
     // Note: rsa_sign_sha256 internally computes SHA-256, so pass plaintext (not pre-hashed)
-    let signature = rsa_sign_sha256(&config.pop_key, signing_input.as_bytes());
+    let signature = rsa_sign_sha256(&config.pop_key, signing_input.as_bytes())
+        .expect("RSA key too small for PKCS#1 v1.5 SHA-256 signing");
     let signature_b64 = base64url::encode_string(&signature);
 
     format!("{}.{}.{}", header_b64, payload_b64, signature_b64)

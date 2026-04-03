@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Diffie-Hellman key exchange for PKINIT.
 //!
 //! Implements DH key agreement using the well-known Oakley Group 14
@@ -34,6 +36,12 @@ pub struct DhKeyPair {
     pub private_key: BigUint,
     /// Public key (g^x mod p).
     pub public_key: BigUint,
+}
+
+impl Drop for DhKeyPair {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
 }
 
 /// Compute a DH public key: g^x mod p.
