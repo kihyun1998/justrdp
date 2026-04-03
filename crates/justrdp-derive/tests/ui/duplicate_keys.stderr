@@ -1,0 +1,5 @@
+error: only one pdu kind is allowed per field
+ --> tests/ui/duplicate_keys.rs:5:15
+  |
+5 |     #[pdu(u8, u16_le)]
+  |               ^^^^^^

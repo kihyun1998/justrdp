@@ -1,0 +1,5 @@
+error: no fields are allowed after #[pdu(rest)]
+ --> tests/ui/rest_not_last.rs:8:9
+  |
+8 |     pub trailing: u8,
+  |         ^^^^^^^^

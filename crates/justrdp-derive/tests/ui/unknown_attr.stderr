@@ -1,0 +1,5 @@
+error: unknown pdu attribute
+ --> tests/ui/unknown_attr.rs:5:11
+  |
+5 |     #[pdu(foo)]
+  |           ^^^

@@ -1,0 +1,5 @@
+error: pad value must be > 0
+ --> tests/ui/pad_zero.rs:5:11
+  |
+5 |     #[pdu(pad = 0)]
+  |           ^^^^^^^

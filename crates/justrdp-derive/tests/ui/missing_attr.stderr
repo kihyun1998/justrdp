@@ -1,0 +1,5 @@
+error: field `field` is missing #[pdu(...)] attribute
+ --> tests/ui/missing_attr.rs:5:5
+  |
+5 |     pub field: u8,
+  |     ^^^
