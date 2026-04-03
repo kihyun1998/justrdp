@@ -110,6 +110,25 @@ macro_rules! hash_update_impl {
     }};
 }
 
+/// Implements the standard Merkle-Damgård `finalize()` with padding and bit count.
+/// `$endian` is `to_le_bytes` (MD4/MD5) or `to_be_bytes` (SHA-1/SHA-256).
+macro_rules! hash_finalize_impl {
+    ($self:ident, $result_len:expr, $endian:ident) => {{
+        let bit_count = $self.count.wrapping_mul(8);
+        $self.update(&[0x80]);
+        while $self.buf_len != 56 {
+            $self.update(&[0x00]);
+        }
+        $self.update(&bit_count.$endian());
+
+        let mut result = [0u8; $result_len];
+        for (i, &word) in $self.state.iter().enumerate() {
+            result[i * 4..i * 4 + 4].copy_from_slice(&word.$endian());
+        }
+        result
+    }};
+}
+
 // ── MD4 ──
 
 /// MD4 hash (128-bit / 16 bytes). Required for NTLM NT hash (NTOWF).
@@ -141,18 +160,7 @@ impl Md4 {
 
     /// Finalize and return the 16-byte MD4 hash.
     pub fn finalize(mut self) -> [u8; 16] {
-        let bit_count = self.count.wrapping_mul(8);
-        self.update(&[0x80]);
-        while self.buf_len != 56 {
-            self.update(&[0x00]);
-        }
-        self.update(&bit_count.to_le_bytes());
-
-        let mut result = [0u8; 16];
-        for (i, &word) in self.state.iter().enumerate() {
-            result[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
-        }
-        result
+        hash_finalize_impl!(self, 16, to_le_bytes)
     }
 }
 
@@ -246,19 +254,7 @@ impl Md5 {
 
     /// Finalize and return the 16-byte MD5 hash.
     pub fn finalize(mut self) -> [u8; 16] {
-        let bit_count = self.count.wrapping_mul(8);
-        // Padding
-        self.update(&[0x80]);
-        while self.buf_len != 56 {
-            self.update(&[0x00]);
-        }
-        self.update(&bit_count.to_le_bytes());
-
-        let mut result = [0u8; 16];
-        for (i, &word) in self.state.iter().enumerate() {
-            result[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
-        }
-        result
+        hash_finalize_impl!(self, 16, to_le_bytes)
     }
 }
 
@@ -342,18 +338,7 @@ impl Sha1 {
 
     /// Finalize and return the 20-byte SHA-1 hash.
     pub fn finalize(mut self) -> [u8; 20] {
-        let bit_count = self.count.wrapping_mul(8);
-        self.update(&[0x80]);
-        while self.buf_len != 56 {
-            self.update(&[0x00]);
-        }
-        self.update(&bit_count.to_be_bytes());
-
-        let mut result = [0u8; 20];
-        for (i, &word) in self.state.iter().enumerate() {
-            result[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-        }
-        result
+        hash_finalize_impl!(self, 20, to_be_bytes)
     }
 }
 
@@ -429,18 +414,7 @@ impl Sha256 {
 
     /// Finalize and return the 32-byte SHA-256 hash.
     pub fn finalize(mut self) -> [u8; 32] {
-        let bit_count = self.count.wrapping_mul(8);
-        self.update(&[0x80]);
-        while self.buf_len != 56 {
-            self.update(&[0x00]);
-        }
-        self.update(&bit_count.to_be_bytes());
-
-        let mut result = [0u8; 32];
-        for (i, &word) in self.state.iter().enumerate() {
-            result[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-        }
-        result
+        hash_finalize_impl!(self, 32, to_be_bytes)
     }
 }
 

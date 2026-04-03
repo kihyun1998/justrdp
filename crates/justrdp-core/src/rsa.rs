@@ -95,6 +95,26 @@ const SHA256_DIGEST_INFO_PREFIX: [u8; 19] = [
     0x04, 0x20, // OCTET STRING (32 bytes)
 ];
 
+/// Build PKCS#1 v1.5 encoded message: 0x00 || 0x01 || PS (0xFF...) || 0x00 || DigestInfo.
+/// RFC 8017 §9.2 — returns None if key is too small.
+fn build_pkcs1_em(k: usize, hash: &[u8; 32]) -> Option<Vec<u8>> {
+    let t_len = SHA256_DIGEST_INFO_PREFIX.len() + 32;
+    if k < t_len + PKCS1_V15_OVERHEAD {
+        return None;
+    }
+    let ps_len = k - t_len - 3;
+
+    let mut em = vec![0u8; k];
+    em[0] = 0x00;
+    em[1] = 0x01;
+    em[2..2 + ps_len].fill(0xFF);
+    em[2 + ps_len] = 0x00;
+    em[3 + ps_len..3 + ps_len + SHA256_DIGEST_INFO_PREFIX.len()]
+        .copy_from_slice(&SHA256_DIGEST_INFO_PREFIX);
+    em[3 + ps_len + SHA256_DIGEST_INFO_PREFIX.len()..].copy_from_slice(hash);
+    Some(em)
+}
+
 /// Sign data with RSA PKCS#1 v1.5 (SHA-256).
 ///
 /// 1. Hash the data with SHA-256
@@ -112,25 +132,7 @@ pub fn rsa_sign_sha256(key: &RsaPrivateKey, data: &[u8]) -> CryptoResult<Vec<u8>
     hasher.update(data);
     let hash = hasher.finalize();
 
-    // Build DigestInfo
-    let mut digest_info = Vec::with_capacity(SHA256_DIGEST_INFO_PREFIX.len() + 32);
-    digest_info.extend_from_slice(&SHA256_DIGEST_INFO_PREFIX);
-    digest_info.extend_from_slice(&hash);
-
-    // PKCS#1 v1.5 padding: 0x00 || 0x01 || PS (>= 8 bytes of 0xFF) || 0x00 || DigestInfo
-    let t_len = digest_info.len(); // 19 + 32 = 51
-    // Minimum key size: t_len + 11 (3 framing bytes + 8 minimum PS bytes)
-    if k < t_len + PKCS1_V15_OVERHEAD {
-        return Err(CryptoError::InvalidKeySize);
-    }
-    let ps_len = k - t_len - 3;
-
-    let mut em = vec![0u8; k];
-    em[0] = 0x00;
-    em[1] = 0x01;
-    em[2..2 + ps_len].fill(0xFF);
-    em[2 + ps_len] = 0x00;
-    em[3 + ps_len..].copy_from_slice(&digest_info);
+    let em = build_pkcs1_em(k, &hash).ok_or(CryptoError::InvalidKeySize)?;
 
     // RSA private key operation: signature = em^d mod n
     // SECURITY: mod_exp is non-constant-time; timing side-channel exists for private exponent.
@@ -184,27 +186,15 @@ pub fn rsa_verify_sha256(key: &RsaPublicKey, data: &[u8], signature: &[u8]) -> b
     // Reconstruct expected padded message and compare in constant time,
     // rather than parsing the padding (which leaks structure via timing).
 
-    // Hash the data first
+    // Hash the data and build expected PKCS#1 v1.5 encoded message
     let mut hasher = Sha256::new();
     hasher.update(data);
     let actual_hash = hasher.finalize();
 
-    // Build expected EM: 0x00 || 0x01 || PS (0xFF...) || 0x00 || DigestInfo
-    let t_len = SHA256_DIGEST_INFO_PREFIX.len() + 32; // 19 + 32 = 51
-    if k < t_len + PKCS1_V15_OVERHEAD {
-        return false;
-    }
-    let ps_len = k - t_len - 3;
-
-    let mut expected_em = vec![0u8; k];
-    expected_em[0] = 0x00;
-    expected_em[1] = 0x01;
-    expected_em[2..2 + ps_len].fill(0xFF);
-    expected_em[2 + ps_len] = 0x00;
-    expected_em[3 + ps_len..3 + ps_len + SHA256_DIGEST_INFO_PREFIX.len()]
-        .copy_from_slice(&SHA256_DIGEST_INFO_PREFIX);
-    expected_em[3 + ps_len + SHA256_DIGEST_INFO_PREFIX.len()..]
-        .copy_from_slice(&actual_hash);
+    let expected_em = match build_pkcs1_em(k, &actual_hash) {
+        Some(em) => em,
+        None => return false,
+    };
 
     // Constant-time comparison of entire EM
     let mut diff = 0u8;

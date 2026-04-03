@@ -10,6 +10,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 /// Unsigned big integer, stored as little-endian base-2^32 limbs.
 #[derive(Clone, Debug)]
@@ -267,8 +268,6 @@ impl BigUint {
     /// Uses binary long division. O(bit_len²) due to per-iteration allocation
     /// in `shl1`; acceptable for key-size operands (up to 2048-bit).
     pub fn div_rem(&self, divisor: &Self) -> (Self, Self) {
-        use core::cmp::Ordering;
-
         assert!(!divisor.is_zero(), "BigUint::div_rem: division by zero");
 
         match self.cmp(divisor) {
@@ -325,8 +324,8 @@ impl BigUint {
 
     /// Modular exponentiation: self^exp mod modulus.
     ///
-    /// Uses Montgomery ladder with branchless conditional swap to avoid
-    /// leaking the exponent via branch-prediction or cache side-channels.
+    /// Uses binary exponentiation with branchless conditional swap (double-and-add
+    /// variant) to avoid leaking the exponent via branch-prediction side-channels.
     ///
     /// **Note**: The underlying mul/rem operations are not fully constant-time
     /// (they depend on operand magnitude). For production use with secret
@@ -395,20 +394,20 @@ impl BigUint {
 
 impl PartialEq for BigUint {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == core::cmp::Ordering::Equal
+        self.cmp(other) == Ordering::Equal
     }
 }
 
 impl Eq for BigUint {}
 
 impl PartialOrd for BigUint {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for BigUint {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         let a_len = self.significant_limbs();
         let b_len = other.significant_limbs();
 
@@ -424,7 +423,7 @@ impl Ord for BigUint {
             }
         }
 
-        core::cmp::Ordering::Equal
+        Ordering::Equal
     }
 }
 

@@ -6,6 +6,7 @@
 //! (2048-bit MODP group, RFC 3526) as required by PKINIT (RFC 4556).
 
 use crate::bignum::BigUint;
+use crate::error::{CryptoError, CryptoResult};
 
 /// Well-known Oakley Group 14 (2048-bit MODP, RFC 3526).
 ///
@@ -54,20 +55,29 @@ pub fn dh_compute_shared(other_public: &BigUint, my_private: &BigUint, p: &BigUi
     other_public.mod_exp(my_private, p)
 }
 
+/// Minimum DH private exponent length in bytes (256 bits).
+const DH_MIN_PRIVATE_LEN: usize = 32;
+
 /// Generate a DH key pair from a random private exponent.
 ///
 /// The caller must provide a cryptographically random `private_bytes`
 /// (at least 32 bytes, ideally 256 bytes for 2048-bit DH).
-pub fn dh_generate_keypair(private_bytes: &[u8]) -> DhKeyPair {
+///
+/// Returns `CryptoError::InvalidKeySize` if `private_bytes` is shorter than 32 bytes.
+pub fn dh_generate_keypair(private_bytes: &[u8]) -> CryptoResult<DhKeyPair> {
+    if private_bytes.len() < DH_MIN_PRIVATE_LEN {
+        return Err(CryptoError::InvalidKeySize);
+    }
+
     let p = OakleyGroup14::prime();
     let g = OakleyGroup14::generator();
     let x = BigUint::from_be_bytes(private_bytes).rem(&p);
     let public_key = dh_compute_public(&g, &x, &p);
 
-    DhKeyPair {
+    Ok(DhKeyPair {
         private_key: x,
         public_key,
-    }
+    })
 }
 
 // Oakley Group 14 prime (2048-bit), RFC 3526 Section 3.
@@ -139,7 +149,7 @@ mod tests {
     #[test]
     fn dh_generate_keypair_produces_valid_key() {
         let private_bytes = [0x42u8; 32];
-        let kp = dh_generate_keypair(&private_bytes);
+        let kp = dh_generate_keypair(&private_bytes).unwrap();
 
         let p = OakleyGroup14::prime();
         assert!(kp.public_key < p);

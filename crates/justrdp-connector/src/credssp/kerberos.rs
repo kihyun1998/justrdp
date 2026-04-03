@@ -302,7 +302,8 @@ impl KerberosSequence {
             .ok_or_else(|| ConnectorError::general("PKINIT config not set"))?;
 
         // Generate DH key pair
-        let mut kp = dh_generate_keypair(&config.dh_private_bytes);
+        let mut kp = dh_generate_keypair(&config.dh_private_bytes)
+            .map_err(|_| ConnectorError::general("DH private key too short (min 32 bytes)"))?;
         let p = OakleyGroup14::prime();
         let g = OakleyGroup14::generator();
 

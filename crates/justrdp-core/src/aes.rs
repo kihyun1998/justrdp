@@ -93,20 +93,24 @@ const fn gmul(mut a: u8, mut b: u8) -> u8 {
     result
 }
 
+/// FIPS 197 §5.1 — AES-128 uses 10 rounds, AES-256 uses 14 rounds.
+const AES128_ROUNDS: usize = 10;
+const AES256_ROUNDS: usize = 14;
+
 // ── AES-128 ──
 
 /// AES-128 block cipher.
 #[derive(Clone)]
 pub struct Aes128 {
-    round_keys: [[u8; 16]; 11],
+    round_keys: [[u8; 16]; AES128_ROUNDS + 1],
 }
 
 impl Aes128 {
     /// Create AES-128 with the given 16-byte key.
     pub fn new(key: &[u8; 16]) -> Self {
-        let mut rk = [[0u8; 16]; 11];
+        let mut rk = [[0u8; 16]; AES128_ROUNDS + 1];
         rk[0] = *key;
-        for i in 1..11 {
+        for i in 1..=AES128_ROUNDS {
             let prev = &rk[i - 1];
             let mut w = [prev[12], prev[13], prev[14], prev[15]];
             // RotWord + SubWord + Rcon
@@ -124,12 +128,12 @@ impl Aes128 {
 
     /// Encrypt a single 16-byte block in place.
     pub fn encrypt_block(&self, block: &mut [u8; 16]) {
-        aes_encrypt_block(block, &self.round_keys, 10);
+        aes_encrypt_block(block, &self.round_keys, AES128_ROUNDS);
     }
 
     /// Decrypt a single 16-byte block in place.
     pub fn decrypt_block(&self, block: &mut [u8; 16]) {
-        aes_decrypt_block(block, &self.round_keys, 10);
+        aes_decrypt_block(block, &self.round_keys, AES128_ROUNDS);
     }
 }
 
@@ -147,17 +151,17 @@ impl Drop for Aes128 {
 /// AES-256 block cipher.
 #[derive(Clone)]
 pub struct Aes256 {
-    round_keys: [[u8; 16]; 15],
+    round_keys: [[u8; 16]; AES256_ROUNDS + 1],
 }
 
 impl Aes256 {
     /// Create AES-256 with the given 32-byte key.
     pub fn new(key: &[u8; 32]) -> Self {
-        let mut rk = [[0u8; 16]; 15];
+        let mut rk = [[0u8; 16]; AES256_ROUNDS + 1];
         rk[0][..16].copy_from_slice(&key[..16]);
         rk[1][..16].copy_from_slice(&key[16..32]);
 
-        for i in 2..15 {
+        for i in 2..=AES256_ROUNDS {
             let prev = rk[i - 1];
             let pprev = rk[i - 2];
             if i % 2 == 0 {
@@ -184,12 +188,12 @@ impl Aes256 {
 
     /// Encrypt a single 16-byte block in place.
     pub fn encrypt_block(&self, block: &mut [u8; 16]) {
-        aes_encrypt_block(block, &self.round_keys, 14);
+        aes_encrypt_block(block, &self.round_keys, AES256_ROUNDS);
     }
 
     /// Decrypt a single 16-byte block in place.
     pub fn decrypt_block(&self, block: &mut [u8; 16]) {
-        aes_decrypt_block(block, &self.round_keys, 14);
+        aes_decrypt_block(block, &self.round_keys, AES256_ROUNDS);
     }
 }
 
