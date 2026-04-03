@@ -142,6 +142,14 @@ impl CliprdrClient {
         header: &ClipboardHeader,
         body: &mut ReadCursor<'_>,
     ) -> SvcResult<Vec<SvcMessage>> {
+        // Reject data-exchange PDUs before the handshake is complete.
+        if self.state != CliprdrState::Initialized {
+            match header.msg_type {
+                ClipboardMsgType::ClipCaps | ClipboardMsgType::MonitorReady => {}
+                _ => return Ok(Vec::new()),
+            }
+        }
+
         match header.msg_type {
             ClipboardMsgType::ClipCaps => {
                 let caps = ClipboardCapsPdu::decode(body)?;
@@ -158,10 +166,15 @@ impl CliprdrClient {
             }
 
             ClipboardMsgType::MonitorReady => {
-                self.state = CliprdrState::Initialized;
-                // Send our caps + temp dir. Format list will be sent by
-                // the application via send_format_list().
-                self.build_init_response()
+                if self.state == CliprdrState::WaitingForMonitorReady {
+                    self.state = CliprdrState::Initialized;
+                    // Send our caps, optional temp dir, and an empty format list
+                    // to complete the initialization sequence per MS-RDPECLIP 1.3.2.1.
+                    self.build_init_response()
+                } else {
+                    // Ignore duplicate MonitorReady to prevent capability re-negotiation.
+                    Ok(Vec::new())
+                }
             }
 
             ClipboardMsgType::FormatList => {
@@ -354,9 +367,9 @@ impl CliprdrClient {
         stream_id: u32,
         lindex: i32,
         offset: u64,
-        cb_requested: u32,
+        bytes_requested: u32,
     ) -> SvcResult<SvcMessage> {
-        let pdu = FileContentsRequestPdu::range_request(stream_id, lindex, offset, cb_requested);
+        let pdu = FileContentsRequestPdu::range_request(stream_id, lindex, offset, bytes_requested);
         Self::encode_pdu(&pdu)
     }
 

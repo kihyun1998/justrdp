@@ -10,6 +10,7 @@ mod file_contents;
 mod file_list;
 mod lock;
 mod temp_dir;
+mod util;
 
 pub use header::{ClipboardHeader, ClipboardMsgFlags, ClipboardMsgType};
 pub use caps::{

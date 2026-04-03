@@ -3,7 +3,7 @@
 //! Clipboard Capabilities PDU -- MS-RDPECLIP 2.2.2.1
 
 use justrdp_core::{ReadCursor, WriteCursor};
-use justrdp_core::{DecodeError, DecodeResult, EncodeResult};
+use justrdp_core::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 use justrdp_core::{Decode, Encode};
 
 use super::header::{ClipboardHeader, ClipboardMsgFlags, ClipboardMsgType, CLIPBOARD_HEADER_SIZE};
@@ -121,7 +121,7 @@ impl<'de> Decode<'de> for GeneralCapabilitySet {
             GeneralCapabilityFlags::from_bits(src.read_u32_le("GeneralCapabilitySet::generalFlags")?);
 
         // Skip any extra bytes beyond the known fields.
-        let extra = length as usize - GENERAL_CAPABILITY_SET_SIZE;
+        let extra = (length as usize).saturating_sub(GENERAL_CAPABILITY_SET_SIZE);
         if extra > 0 {
             src.skip(extra, "GeneralCapabilitySet::extra")?;
         }
@@ -149,9 +149,9 @@ impl ClipboardCapsPdu {
         Self { general }
     }
 
-    /// Data length (after the 8-byte clipboard header):
+    /// Payload length (after the 8-byte clipboard header):
     /// 2 (cCapabilitiesSets) + 2 (pad1) + capability set data.
-    fn data_len(&self) -> usize {
+    fn payload_len(&self) -> usize {
         4 + self.general.size()
     }
 }
@@ -159,10 +159,12 @@ impl ClipboardCapsPdu {
 impl Encode for ClipboardCapsPdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         // Clipboard header
+        let data_len = u32::try_from(self.payload_len())
+            .map_err(|_| EncodeError::invalid_value("ClipboardCapsPdu", "dataLen too large"))?;
         let header = ClipboardHeader::new(
             ClipboardMsgType::ClipCaps,
             ClipboardMsgFlags::NONE,
-            self.data_len() as u32,
+            data_len,
         );
         header.encode(dst)?;
 
@@ -180,14 +182,14 @@ impl Encode for ClipboardCapsPdu {
     }
 
     fn size(&self) -> usize {
-        CLIPBOARD_HEADER_SIZE + self.data_len()
+        CLIPBOARD_HEADER_SIZE + self.payload_len()
     }
 }
 
 impl<'de> Decode<'de> for ClipboardCapsPdu {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let count = src.read_u16_le("ClipboardCapsPdu::cCapabilitiesSets")?;
-        let _pad = src.read_u16_le("ClipboardCapsPdu::pad1")?;
+        src.skip(2, "ClipboardCapsPdu::pad1")?;
 
         if count == 0 {
             return Err(DecodeError::invalid_value(

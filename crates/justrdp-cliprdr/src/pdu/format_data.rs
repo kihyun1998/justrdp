@@ -4,10 +4,13 @@
 
 use alloc::vec::Vec;
 
-use justrdp_core::{Encode, ReadCursor, WriteCursor};
+use justrdp_core::{Encode, EncodeError, ReadCursor, WriteCursor};
 use justrdp_core::{DecodeResult, EncodeResult};
 
 use super::header::{ClipboardHeader, ClipboardMsgFlags, ClipboardMsgType, CLIPBOARD_HEADER_SIZE};
+
+/// Body size of FormatDataRequestPdu: requestedFormatId(4).
+const FORMAT_DATA_REQUEST_BODY_SIZE: u32 = 4;
 
 /// Format Data Request PDU -- MS-RDPECLIP 2.2.5.1
 ///
@@ -32,7 +35,7 @@ impl Encode for FormatDataRequestPdu {
         let header = ClipboardHeader::new(
             ClipboardMsgType::FormatDataRequest,
             ClipboardMsgFlags::NONE,
-            4,
+            FORMAT_DATA_REQUEST_BODY_SIZE,
         );
         header.encode(dst)?;
         dst.write_u32_le(
@@ -47,7 +50,7 @@ impl Encode for FormatDataRequestPdu {
     }
 
     fn size(&self) -> usize {
-        CLIPBOARD_HEADER_SIZE + 4
+        CLIPBOARD_HEADER_SIZE + FORMAT_DATA_REQUEST_BODY_SIZE as usize
     }
 }
 
@@ -73,25 +76,21 @@ pub enum FormatDataResponsePdu {
     Fail,
 }
 
-impl FormatDataResponsePdu {
-    fn data_len(&self) -> u32 {
-        match self {
-            Self::Ok(data) => data.len() as u32,
-            Self::Fail => 0,
-        }
-    }
-}
-
 impl Encode for FormatDataResponsePdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let flags = match self {
-            Self::Ok(_) => ClipboardMsgFlags::CB_RESPONSE_OK,
-            Self::Fail => ClipboardMsgFlags::CB_RESPONSE_FAIL,
+        let (flags, payload_len) = match self {
+            Self::Ok(data) => {
+                let len = u32::try_from(data.len()).map_err(|_| {
+                    EncodeError::invalid_value("FormatDataResponsePdu", "data too large")
+                })?;
+                (ClipboardMsgFlags::CB_RESPONSE_OK, len)
+            }
+            Self::Fail => (ClipboardMsgFlags::CB_RESPONSE_FAIL, 0),
         };
         let header = ClipboardHeader::new(
             ClipboardMsgType::FormatDataResponse,
             flags,
-            self.data_len(),
+            payload_len,
         );
         header.encode(dst)?;
         if let Self::Ok(data) = self {
@@ -105,7 +104,10 @@ impl Encode for FormatDataResponsePdu {
     }
 
     fn size(&self) -> usize {
-        CLIPBOARD_HEADER_SIZE + self.data_len() as usize
+        match self {
+            Self::Ok(data) => CLIPBOARD_HEADER_SIZE + data.len(),
+            Self::Fail => CLIPBOARD_HEADER_SIZE,
+        }
     }
 }
 
@@ -116,11 +118,22 @@ impl FormatDataResponsePdu {
         msg_flags: ClipboardMsgFlags,
         data_len: u32,
     ) -> DecodeResult<Self> {
+        // Cap payload to 64 MiB to prevent amplified allocation from untrusted header.
+        const MAX_FORMAT_DATA_LEN: u32 = 64 * 1024 * 1024;
         let is_ok = msg_flags.contains(ClipboardMsgFlags::CB_RESPONSE_OK);
-        if is_ok && data_len > 0 {
-            let data = src
-                .read_slice(data_len as usize, "FormatDataResponsePdu::requestedFormatData")?
-                .to_vec();
+        if is_ok {
+            let data = if data_len > 0 {
+                if data_len > MAX_FORMAT_DATA_LEN {
+                    return Err(justrdp_core::DecodeError::invalid_value(
+                        "FormatDataResponsePdu",
+                        "dataLen too large",
+                    ));
+                }
+                src.read_slice(data_len as usize, "FormatDataResponsePdu::requestedFormatData")?
+                    .to_vec()
+            } else {
+                alloc::vec![]
+            };
             Ok(Self::Ok(data))
         } else {
             Ok(Self::Fail)

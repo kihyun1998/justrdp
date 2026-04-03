@@ -18,6 +18,15 @@ pub enum ClipboardError {
     Other(&'static str),
 }
 
+impl core::fmt::Display for ClipboardError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Failed => f.write_str("clipboard operation failed"),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
 /// Response to a format list notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatListResponse {

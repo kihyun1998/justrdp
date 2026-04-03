@@ -5,10 +5,19 @@
 use alloc::vec::Vec;
 
 use justrdp_core::{ReadCursor, WriteCursor};
-use justrdp_core::{DecodeResult, EncodeResult};
+use justrdp_core::{DecodeResult, EncodeError, EncodeResult};
 use justrdp_core::Encode;
 
 use super::header::{ClipboardHeader, ClipboardMsgFlags, ClipboardMsgType, CLIPBOARD_HEADER_SIZE};
+
+/// Wire data length without clipDataId:
+/// streamId(4) + lindex(4) + flags(4) + positionLow(4) + positionHigh(4) + bytesRequested(4) = 24
+const REQUEST_DATA_LEN_BASE: u32 = 24;
+/// Wire data length with clipDataId appended.
+const REQUEST_DATA_LEN_WITH_CLIP_ID: u32 = 28;
+
+/// Wire size of the streamId field in a FileContentsResponse PDU.
+const RESPONSE_STREAM_ID_SIZE: u32 = 4;
 
 /// File contents operation type -- MS-RDPECLIP 2.2.5.3
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,13 +50,13 @@ pub struct FileContentsRequestPdu {
     /// Zero-based index into the file list.
     pub lindex: i32,
     /// Operation type: SIZE or RANGE.
-    pub dw_flags: FileContentsFlags,
+    pub flags: FileContentsFlags,
     /// Low 32 bits of byte offset (must be 0 for SIZE).
-    pub n_position_low: u32,
+    pub position_low: u32,
     /// High 32 bits of byte offset (must be 0 for SIZE).
-    pub n_position_high: u32,
+    pub position_high: u32,
     /// Bytes to read (must be 8 for SIZE).
-    pub cb_requested: u32,
+    pub bytes_requested: u32,
     /// Optional clip data ID (present only when lock/unlock is negotiated).
     pub clip_data_id: Option<u32>,
 }
@@ -58,10 +67,10 @@ impl FileContentsRequestPdu {
         Self {
             stream_id,
             lindex,
-            dw_flags: FileContentsFlags::SIZE,
-            n_position_low: 0,
-            n_position_high: 0,
-            cb_requested: 8,
+            flags: FileContentsFlags::SIZE,
+            position_low: 0,
+            position_high: 0,
+            bytes_requested: 8,
             clip_data_id: None,
         }
     }
@@ -71,15 +80,15 @@ impl FileContentsRequestPdu {
         stream_id: u32,
         lindex: i32,
         offset: u64,
-        cb_requested: u32,
+        bytes_requested: u32,
     ) -> Self {
         Self {
             stream_id,
             lindex,
-            dw_flags: FileContentsFlags::RANGE,
-            n_position_low: offset as u32,
-            n_position_high: (offset >> 32) as u32,
-            cb_requested,
+            flags: FileContentsFlags::RANGE,
+            position_low: offset as u32,
+            position_high: (offset >> 32) as u32,
+            bytes_requested,
             clip_data_id: None,
         }
     }
@@ -90,12 +99,12 @@ impl FileContentsRequestPdu {
         self
     }
 
-    /// Data length (after header): 24 or 28 bytes.
+    /// Data length (after header).
     fn data_len(&self) -> u32 {
         if self.clip_data_id.is_some() {
-            28
+            REQUEST_DATA_LEN_WITH_CLIP_ID
         } else {
-            24
+            REQUEST_DATA_LEN_BASE
         }
     }
 }
@@ -110,13 +119,13 @@ impl Encode for FileContentsRequestPdu {
         header.encode(dst)?;
         dst.write_u32_le(self.stream_id, "FileContentsRequestPdu::streamId")?;
         dst.write_i32_le(self.lindex, "FileContentsRequestPdu::lindex")?;
-        dst.write_u32_le(self.dw_flags.bits(), "FileContentsRequestPdu::dwFlags")?;
-        dst.write_u32_le(self.n_position_low, "FileContentsRequestPdu::nPositionLow")?;
+        dst.write_u32_le(self.flags.bits(), "FileContentsRequestPdu::flags")?;
+        dst.write_u32_le(self.position_low, "FileContentsRequestPdu::positionLow")?;
         dst.write_u32_le(
-            self.n_position_high,
-            "FileContentsRequestPdu::nPositionHigh",
+            self.position_high,
+            "FileContentsRequestPdu::positionHigh",
         )?;
-        dst.write_u32_le(self.cb_requested, "FileContentsRequestPdu::cbRequested")?;
+        dst.write_u32_le(self.bytes_requested, "FileContentsRequestPdu::bytesRequested")?;
         if let Some(id) = self.clip_data_id {
             dst.write_u32_le(id, "FileContentsRequestPdu::clipDataId")?;
         }
@@ -139,14 +148,14 @@ impl FileContentsRequestPdu {
     pub fn decode_body(src: &mut ReadCursor<'_>, data_len: u32) -> DecodeResult<Self> {
         let stream_id = src.read_u32_le("FileContentsRequestPdu::streamId")?;
         let lindex = src.read_i32_le("FileContentsRequestPdu::lindex")?;
-        let dw_flags =
-            FileContentsFlags::from_bits(src.read_u32_le("FileContentsRequestPdu::dwFlags")?);
-        let n_position_low = src.read_u32_le("FileContentsRequestPdu::nPositionLow")?;
-        let n_position_high = src.read_u32_le("FileContentsRequestPdu::nPositionHigh")?;
-        let cb_requested = src.read_u32_le("FileContentsRequestPdu::cbRequested")?;
+        let flags =
+            FileContentsFlags::from_bits(src.read_u32_le("FileContentsRequestPdu::flags")?);
+        let position_low = src.read_u32_le("FileContentsRequestPdu::positionLow")?;
+        let position_high = src.read_u32_le("FileContentsRequestPdu::positionHigh")?;
+        let bytes_requested = src.read_u32_le("FileContentsRequestPdu::bytesRequested")?;
 
-        // clipDataId is present if dataLen == 28 (vs 24)
-        let clip_data_id = if data_len >= 28 {
+        // clipDataId is present if dataLen >= 28 (vs base 24)
+        let clip_data_id = if data_len >= REQUEST_DATA_LEN_WITH_CLIP_ID {
             Some(src.read_u32_le("FileContentsRequestPdu::clipDataId")?)
         } else {
             None
@@ -155,10 +164,10 @@ impl FileContentsRequestPdu {
         Ok(Self {
             stream_id,
             lindex,
-            dw_flags,
-            n_position_low,
-            n_position_high,
-            cb_requested,
+            flags,
+            position_low,
+            position_high,
+            bytes_requested,
             clip_data_id,
         })
     }
@@ -205,10 +214,13 @@ impl Encode for FileContentsResponsePdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         let (flags, stream_id, data_len) = match self {
             Self::Ok { stream_id, data } => {
-                (ClipboardMsgFlags::CB_RESPONSE_OK, *stream_id, 4 + data.len() as u32)
+                let payload_len = u32::try_from(data.len()).map_err(|_| {
+                    EncodeError::invalid_value("FileContentsResponsePdu", "data too large")
+                })?;
+                (ClipboardMsgFlags::CB_RESPONSE_OK, *stream_id, RESPONSE_STREAM_ID_SIZE + payload_len)
             }
             Self::Fail { stream_id } => {
-                (ClipboardMsgFlags::CB_RESPONSE_FAIL, *stream_id, 4)
+                (ClipboardMsgFlags::CB_RESPONSE_FAIL, *stream_id, RESPONSE_STREAM_ID_SIZE)
             }
         };
 
@@ -231,8 +243,8 @@ impl Encode for FileContentsResponsePdu {
 
     fn size(&self) -> usize {
         match self {
-            Self::Ok { data, .. } => CLIPBOARD_HEADER_SIZE + 4 + data.len(),
-            Self::Fail { .. } => CLIPBOARD_HEADER_SIZE + 4,
+            Self::Ok { data, .. } => CLIPBOARD_HEADER_SIZE + RESPONSE_STREAM_ID_SIZE as usize + data.len(),
+            Self::Fail { .. } => CLIPBOARD_HEADER_SIZE + RESPONSE_STREAM_ID_SIZE as usize,
         }
     }
 }
@@ -244,13 +256,33 @@ impl FileContentsResponsePdu {
         msg_flags: ClipboardMsgFlags,
         data_len: u32,
     ) -> DecodeResult<Self> {
+        // Cap payload to 32 MiB to prevent amplified allocation from untrusted header.
+        // File content responses are expected to be chunked by the sender.
+        const MAX_FILE_CONTENTS_DATA_LEN: u32 = 32 * 1024 * 1024;
+        if data_len > MAX_FILE_CONTENTS_DATA_LEN {
+            return Err(justrdp_core::DecodeError::invalid_value(
+                "FileContentsResponsePdu",
+                "dataLen too large",
+            ));
+        }
+
+        if data_len < RESPONSE_STREAM_ID_SIZE {
+            return Err(justrdp_core::DecodeError::invalid_value(
+                "FileContentsResponsePdu",
+                "dataLen too small for streamId",
+            ));
+        }
+
         let stream_id = src.read_u32_le("FileContentsResponsePdu::streamId")?;
         let is_ok = msg_flags.contains(ClipboardMsgFlags::CB_RESPONSE_OK);
-        if is_ok && data_len > 4 {
-            let payload_len = data_len as usize - 4;
-            let data = src
-                .read_slice(payload_len, "FileContentsResponsePdu::data")?
-                .to_vec();
+        if is_ok {
+            let data = if data_len > RESPONSE_STREAM_ID_SIZE {
+                let payload_len = (data_len - RESPONSE_STREAM_ID_SIZE) as usize;
+                src.read_slice(payload_len, "FileContentsResponsePdu::data")?
+                    .to_vec()
+            } else {
+                alloc::vec![]
+            };
             Ok(Self::Ok { stream_id, data })
         } else {
             Ok(Self::Fail { stream_id })
@@ -288,8 +320,8 @@ mod tests {
         let decoded = FileContentsRequestPdu::decode_body(&mut cursor, 0x18).unwrap();
         assert_eq!(decoded.stream_id, 2);
         assert_eq!(decoded.lindex, 1);
-        assert_eq!(decoded.dw_flags, FileContentsFlags::SIZE);
-        assert_eq!(decoded.cb_requested, 8);
+        assert_eq!(decoded.flags, FileContentsFlags::SIZE);
+        assert_eq!(decoded.bytes_requested, 8);
         assert_eq!(decoded.clip_data_id, None);
     }
 

@@ -3,11 +3,12 @@
 //! Client Temporary Directory PDU -- MS-RDPECLIP 2.2.2.3
 
 use alloc::string::String;
-use alloc::vec::Vec;
 
 use justrdp_core::{ReadCursor, WriteCursor};
-use justrdp_core::{DecodeError, DecodeResult, EncodeResult};
+use justrdp_core::{DecodeResult, EncodeResult};
 use justrdp_core::Encode;
+
+use super::util;
 
 use super::header::{ClipboardHeader, ClipboardMsgFlags, ClipboardMsgType, CLIPBOARD_HEADER_SIZE};
 
@@ -48,15 +49,7 @@ impl Encode for TempDirectoryPdu {
 
         // Encode path as UTF-16LE into 520-byte buffer.
         let mut buf = [0u8; TEMP_DIR_BUFFER_SIZE];
-        let mut offset = 0;
-        for code_unit in self.temp_dir.encode_utf16() {
-            if offset + 2 > TEMP_DIR_BUFFER_SIZE - 2 {
-                break;
-            }
-            buf[offset] = code_unit as u8;
-            buf[offset + 1] = (code_unit >> 8) as u8;
-            offset += 2;
-        }
+        util::encode_utf16le_fixed(&self.temp_dir, &mut buf);
         dst.write_slice(&buf, "TempDirectoryPdu::wszTempDir")?;
         Ok(())
     }
@@ -74,20 +67,8 @@ impl TempDirectoryPdu {
     /// Decode from cursor after the clipboard header has been read.
     pub fn decode_body(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         let dir_bytes = src.read_slice(TEMP_DIR_BUFFER_SIZE, "TempDirectoryPdu::wszTempDir")?;
-
-        let mut code_units = Vec::new();
-        for chunk in dir_bytes.chunks_exact(2) {
-            let cu = u16::from_le_bytes([chunk[0], chunk[1]]);
-            if cu == 0 {
-                break;
-            }
-            code_units.push(cu);
-        }
-
-        let temp_dir = String::from_utf16(&code_units).map_err(|_| {
-            DecodeError::invalid_value("TempDirectoryPdu", "wszTempDir")
-        })?;
-
+        let temp_dir =
+            util::decode_utf16le_null_terminated(dir_bytes, "TempDirectoryPdu", "wszTempDir")?;
         Ok(Self { temp_dir })
     }
 }

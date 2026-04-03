@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use justrdp_core::{ReadCursor, WriteCursor};
-use justrdp_core::{DecodeError, DecodeResult, EncodeResult};
+use justrdp_core::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 use justrdp_core::{Decode, Encode};
 
 use super::header::{ClipboardHeader, ClipboardMsgFlags, ClipboardMsgType, CLIPBOARD_HEADER_SIZE};
@@ -119,11 +119,19 @@ impl<'de> Decode<'de> for LongFormatName {
         let format_id = src.read_u32_le("LongFormatName::formatId")?;
 
         // Read UTF-16LE code units until null terminator.
+        // Cap at 256 code units to prevent unbounded allocation from malformed data.
+        const MAX_FORMAT_NAME_CODE_UNITS: usize = 256;
         let mut code_units = Vec::new();
         loop {
             let cu = src.read_u16_le("LongFormatName::wszFormatName")?;
             if cu == 0 {
                 break;
+            }
+            if code_units.len() >= MAX_FORMAT_NAME_CODE_UNITS {
+                return Err(DecodeError::invalid_value(
+                    "LongFormatName",
+                    "wszFormatName too long",
+                ));
             }
             code_units.push(cu);
         }
@@ -170,10 +178,12 @@ impl FormatListPdu {
             Self::Short { ascii_names: true, .. } => ClipboardMsgFlags::CB_ASCII_NAMES,
             _ => ClipboardMsgFlags::NONE,
         };
+        let data_len = u32::try_from(self.data_len())
+            .map_err(|_| EncodeError::invalid_value("FormatListPdu", "dataLen too large"))?;
         let header = ClipboardHeader::new(
             ClipboardMsgType::FormatList,
             flags,
-            self.data_len() as u32,
+            data_len,
         );
         header.encode(dst)?;
         self.encode(dst)?;
@@ -189,18 +199,9 @@ impl FormatListPdu {
 impl Encode for FormatListPdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         match self {
-            Self::Short { entries, .. } => {
-                for entry in entries {
-                    entry.encode(dst)?;
-                }
-            }
-            Self::Long(entries) => {
-                for entry in entries {
-                    entry.encode(dst)?;
-                }
-            }
+            Self::Short { entries, .. } => entries.iter().try_for_each(|e| e.encode(dst)),
+            Self::Long(entries) => entries.iter().try_for_each(|e| e.encode(dst)),
         }
-        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -224,16 +225,26 @@ impl FormatListPdu {
         msg_flags: ClipboardMsgFlags,
         data_len: u32,
     ) -> DecodeResult<Self> {
+        // Cap data_len to prevent amplified allocation from untrusted header.
+        // 8 192 short entries × 36 bytes = 294 912 bytes ≈ 288 KiB.
+        const MAX_SHORT_FORMAT_ENTRIES: u32 = 8_192;
+        const MAX_FORMAT_LIST_DATA_LEN: u32 = MAX_SHORT_FORMAT_ENTRIES * SHORT_FORMAT_NAME_SIZE as u32;
+        if data_len > MAX_FORMAT_LIST_DATA_LEN {
+            return Err(DecodeError::invalid_value(
+                "FormatListPdu",
+                "dataLen too large",
+            ));
+        }
         let data_len = data_len as usize;
 
         if use_long_format_names {
+            // Read exactly data_len bytes and decode within that boundary
+            // to prevent overreading into the next PDU.
+            let data = src.read_slice(data_len, "FormatListPdu::longFormatData")?;
+            let mut sub = ReadCursor::new(data);
             let mut entries = Vec::new();
-            let start = src.remaining();
-            while start - src.remaining() < data_len {
-                if src.remaining() == 0 {
-                    break;
-                }
-                entries.push(LongFormatName::decode(src)?);
+            while sub.remaining() > 0 {
+                entries.push(LongFormatName::decode(&mut sub)?);
             }
             Ok(Self::Long(entries))
         } else {

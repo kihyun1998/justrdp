@@ -6,8 +6,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use justrdp_core::{ReadCursor, WriteCursor};
-use justrdp_core::{DecodeError, DecodeResult, EncodeResult};
+use justrdp_core::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 use justrdp_core::{Decode, Encode};
+
+use super::util;
 
 /// Size of a single CLIPRDR_FILEDESCRIPTOR -- MS-RDPECLIP 2.2.5.2.3.1
 const FILE_DESCRIPTOR_SIZE: usize = 592;
@@ -118,61 +120,35 @@ impl FileDescriptor {
     /// Set the file size and mark the size flag as valid.
     pub fn with_size(mut self, size: u64) -> Self {
         self.file_size = size;
-        self.flags = FileDescriptorFlags::from_bits(
-            self.flags.bits() | FileDescriptorFlags::FD_FILESIZE.bits(),
-        );
+        self.flags = self.flags.union(FileDescriptorFlags::FD_FILESIZE);
         self
     }
 
     /// Set file attributes and mark the attributes flag as valid.
     pub fn with_attributes(mut self, attrs: FileAttributes) -> Self {
         self.file_attributes = attrs;
-        self.flags = FileDescriptorFlags::from_bits(
-            self.flags.bits() | FileDescriptorFlags::FD_ATTRIBUTES.bits(),
-        );
+        self.flags = self.flags.union(FileDescriptorFlags::FD_ATTRIBUTES);
         self
     }
 
     /// Set last write time and mark the time flag as valid.
     pub fn with_last_write_time(mut self, time: u64) -> Self {
         self.last_write_time = time;
-        self.flags = FileDescriptorFlags::from_bits(
-            self.flags.bits() | FileDescriptorFlags::FD_WRITESTIME.bits(),
-        );
+        self.flags = self.flags.union(FileDescriptorFlags::FD_WRITESTIME);
         self
     }
 
     /// Encode file name as UTF-16LE into a 520-byte buffer.
     fn encode_file_name(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         let mut buf = [0u8; FILE_NAME_BUFFER_SIZE];
-        let mut offset = 0;
-        for code_unit in self.file_name.encode_utf16() {
-            if offset + 2 > FILE_NAME_BUFFER_SIZE - 2 {
-                // Truncate: leave room for null terminator.
-                break;
-            }
-            buf[offset] = code_unit as u8;
-            buf[offset + 1] = (code_unit >> 8) as u8;
-            offset += 2;
-        }
-        // Null terminator is already 0x00 0x00 from initialization.
+        util::encode_utf16le_fixed(&self.file_name, &mut buf);
         dst.write_slice(&buf, "FileDescriptor::fileName")?;
         Ok(())
     }
 
     /// Decode file name from a 520-byte UTF-16LE buffer.
     fn decode_file_name(name_bytes: &[u8]) -> DecodeResult<String> {
-        let mut code_units = Vec::new();
-        for chunk in name_bytes.chunks_exact(2) {
-            let cu = u16::from_le_bytes([chunk[0], chunk[1]]);
-            if cu == 0 {
-                break;
-            }
-            code_units.push(cu);
-        }
-        String::from_utf16(&code_units).map_err(|_| {
-            DecodeError::invalid_value("FileDescriptor", "fileName")
-        })
+        util::decode_utf16le_null_terminated(name_bytes, "FileDescriptor", "fileName")
     }
 }
 
@@ -245,7 +221,9 @@ impl FileListPdu {
 
 impl Encode for FileListPdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        dst.write_u32_le(self.files.len() as u32, "FileListPdu::cItems")?;
+        let count = u32::try_from(self.files.len())
+            .map_err(|_| EncodeError::invalid_value("FileListPdu", "cItems too large"))?;
+        dst.write_u32_le(count, "FileListPdu::cItems")?;
         for file in &self.files {
             file.encode(dst)?;
         }
@@ -261,9 +239,18 @@ impl Encode for FileListPdu {
     }
 }
 
+/// Maximum number of files in a single CLIPRDR_FILELIST.
+/// Caps pre-allocation to prevent amplified allocation from untrusted `cItems`.
+/// 16 384 × 592 bytes ≈ 9.7 MiB.
+const MAX_FILE_LIST_ENTRIES: usize = 16_384;
+
 impl<'de> Decode<'de> for FileListPdu {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
-        let count = src.read_u32_le("FileListPdu::cItems")? as usize;
+        let raw_count = src.read_u32_le("FileListPdu::cItems")?;
+        if raw_count as usize > MAX_FILE_LIST_ENTRIES {
+            return Err(DecodeError::invalid_value("FileListPdu", "cItems exceeds maximum"));
+        }
+        let count = raw_count as usize;
         let mut files = Vec::with_capacity(count);
         for _ in 0..count {
             files.push(FileDescriptor::decode(src)?);

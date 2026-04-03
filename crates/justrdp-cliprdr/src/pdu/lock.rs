@@ -99,6 +99,7 @@ impl UnlockClipDataPdu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use justrdp_core::Decode;
 
     use super::super::header::ClipboardHeader;
 
@@ -116,8 +117,6 @@ mod tests {
         let clip_data_id = cursor.read_u32_le("clipDataId").unwrap();
         assert_eq!(clip_data_id, 42);
     }
-
-    use justrdp_core::{Decode, ReadCursor};
 
     #[test]
     fn unlock_pdu_roundtrip() {
