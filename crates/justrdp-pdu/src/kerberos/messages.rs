@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Kerberos v5 message types (RFC 4120).
 
 use alloc::vec;

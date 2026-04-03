@@ -298,7 +298,9 @@ pub fn write_application_tag(
     content_len: usize,
     ctx: &'static str,
 ) -> EncodeResult<()> {
-    assert!(tag_number <= 30, "write_application_tag: tag {tag_number} > 30, use write_high_tag instead");
+    if tag_number > 30 {
+        return Err(justrdp_core::EncodeError::other(ctx, "tag > 30, use write_high_tag instead"));
+    }
     let tag = TAG_APPLICATION_CONSTRUCTED | tag_number;
     write_tag(dst, tag, ctx)?;
     write_length(dst, content_len, ctx)?;
@@ -317,8 +319,9 @@ pub fn read_application_tag(
 }
 
 /// Size of an application-constructed tag + length wrapper.
-pub fn sizeof_application_tag(tag_number: u8, content_len: usize) -> usize {
-    let _ = tag_number;
+///
+/// Only supports tag numbers 0-30 (single-byte BER tag).
+pub fn sizeof_application_tag(content_len: usize) -> usize {
     1 + ber_length_size(content_len) + content_len
 }
 

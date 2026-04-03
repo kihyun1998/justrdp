@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Minimal CMS (RFC 5652) SignedData for PKINIT.
 //!
 //! Implements just enough CMS to:

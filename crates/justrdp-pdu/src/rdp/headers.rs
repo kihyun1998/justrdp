@@ -315,6 +315,8 @@ impl SlowPathUpdateType {
 /// Slow-Path Graphics Update PDU (pduType2 = Update).
 ///
 /// MS-RDPBCGR 2.2.9.1.1.3
+///
+/// Decode-only: this is a server-to-client update; clients do not send this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlowPathUpdatePdu {
     pub update_type: SlowPathUpdateType,

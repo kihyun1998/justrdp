@@ -423,13 +423,15 @@ pub struct AuthenticateMessage {
 impl AuthenticateMessage {
     /// Encode to bytes. The MIC field position is at offset 72..88.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let header_size = 88; // Up to and including MIC
-        let payload_size = self.lm_response.len()
+        let header_size: usize = 88; // Up to and including MIC
+        let payload_size: usize = self.lm_response.len()
             + self.nt_response.len()
             + self.domain_name.len()
             + self.user_name.len()
             + self.workstation.len()
             + self.encrypted_random_session_key.len();
+        // Each field length must fit in u16 for NTLM wire format
+        debug_assert!(payload_size <= u16::MAX as usize, "NTLM payload exceeds u16 limit");
         let total = header_size + payload_size;
         let mut buf = vec![0u8; total];
 

@@ -509,7 +509,10 @@ impl ConnectionRequest {
 impl Encode for ConnectionRequest {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         // LI = total size - 1 (LI byte itself is excluded)
-        let li = (X224_FIXED_HEADER_SIZE - 1 + self.variable_size()) as u8;
+        let li_val = X224_FIXED_HEADER_SIZE - 1 + self.variable_size();
+        let li = u8::try_from(li_val).map_err(|_| {
+            justrdp_core::EncodeError::other("ConnectionRequest::li", "LI exceeds 255")
+        })?;
         dst.write_u8(li, "ConnectionRequest::li")?;
         dst.write_u8(TpduCode::ConnectionRequest as u8, "ConnectionRequest::code")?;
         dst.write_u16_be(0, "ConnectionRequest::dst_ref")?; // DST-REF = 0
@@ -678,7 +681,10 @@ impl ConnectionConfirm {
 
 impl Encode for ConnectionConfirm {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let li = (X224_FIXED_HEADER_SIZE - 1 + self.variable_size()) as u8;
+        let li_val = X224_FIXED_HEADER_SIZE - 1 + self.variable_size();
+        let li = u8::try_from(li_val).map_err(|_| {
+            justrdp_core::EncodeError::other("ConnectionConfirm::li", "LI exceeds 255")
+        })?;
         dst.write_u8(li, "ConnectionConfirm::li")?;
         dst.write_u8(TpduCode::ConnectionConfirm as u8, "ConnectionConfirm::code")?;
         dst.write_u16_be(0, "ConnectionConfirm::dst_ref")?;

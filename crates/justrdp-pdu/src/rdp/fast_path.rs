@@ -149,8 +149,9 @@ impl<'de> Decode<'de> for FastPathOutputHeader {
         let mut num_events = (byte0 >> 2) & 0x0F;
         let flags = (byte0 >> 6) & 0x03;
         let length = decode_length(src)?;
-        // Extended numEvents: if 4-bit field is 0, read extra byte
-        if num_events == 0 {
+        // Extended numEvents: if 4-bit field is 0 and there is remaining data, read extra byte
+        // MS-RDPBCGR 2.2.9.1.2: numEvents == 0 means extended byte follows the length field
+        if num_events == 0 && src.remaining() > 0 {
             num_events = src.read_u8("FastPathOutputHeader::numEventsExt")?;
         }
         Ok(Self { action, num_events, flags, length })

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Kerberos v5 authentication types (RFC 4120).
 //!
 //! Implements the ASN.1 structures needed for Kerberos authentication

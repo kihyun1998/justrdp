@@ -148,11 +148,7 @@ fn parse_proprietary_certificate(src: &mut ReadCursor<'_>) -> DecodeResult<Serve
 
     // Verify signature using Terminal Services signing key (MS-RDPBCGR 5.3.3.1.1).
     // The signature is RSA(MD5(pk_blob)) with the well-known TS key.
-    // Decrypt signature with TS public key and compare MD5.
-    // Note: verification failure is logged but not fatal — some legacy servers
-    // may use non-standard signing. The TS key is well-known so this is not
-    // a strong security guarantee anyway (Standard RDP Security is legacy).
-    let _ = verify_proprietary_signature(&pk_blob_bytes, signature);
+    verify_proprietary_signature(&pk_blob_bytes, signature)?;
 
     Ok(ServerCertificate {
         cert_type: CertificateType::Proprietary,
@@ -206,6 +202,12 @@ fn parse_x509_certificate_chain(src: &mut ReadCursor<'_>) -> DecodeResult<Server
     if num_certs == 0 {
         return Err(DecodeError::unexpected_value(
             "X509CertChain", "NumCertBlobs", "expected at least 1 certificate",
+        ));
+    }
+    // Cap at a reasonable limit to prevent excessive iteration from malicious input
+    if num_certs > 16 {
+        return Err(DecodeError::unexpected_value(
+            "X509CertChain", "NumCertBlobs", "too many certificates (max 16)",
         ));
     }
 
@@ -305,8 +307,13 @@ fn extract_rsa_key_from_x509_der(cert: &[u8]) -> DecodeResult<ServerRsaPublicKey
     let exp_len = der_read_length(cert, &mut pos)?;
 
     // Parse exponent (big-endian → u32)
+    if exp_len == 0 || exp_len > 4 {
+        return Err(DecodeError::unexpected_value(
+            "X509", "exponent length", "expected 1-4 bytes",
+        ));
+    }
     let mut exponent: u32 = 0;
-    for i in 0..exp_len.min(4) {
+    for i in 0..exp_len {
         exponent = (exponent << 8) | cert[pos + i] as u32;
     }
 
@@ -449,11 +456,9 @@ mod tests {
         data.extend_from_slice(&sig_len.to_le_bytes());               // wSignatureBlobLen
         data.extend_from_slice(&vec![0xAA; 64]);                      // signature data
 
-        let cert = parse_server_certificate(&data).unwrap();
-        assert_eq!(cert.cert_type, CertificateType::Proprietary);
-        assert_eq!(cert.public_key.exponent, 65537);
-        assert_eq!(cert.public_key.bit_len, 512);
-        assert_eq!(cert.public_key.modulus.len(), 64);
+        // Fake signature (0xAA) will fail verification
+        let result = parse_server_certificate(&data);
+        assert!(result.is_err(), "should fail with invalid signature");
     }
 
     #[test]

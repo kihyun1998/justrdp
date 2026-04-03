@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! KDC Proxy message encoding/decoding (MS-KKDCP).
 //!
 //! Wraps Kerberos messages for transport over HTTPS via a KDC Proxy.

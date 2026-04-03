@@ -143,7 +143,8 @@ pub fn derive_session_keys(
     ));
 
     // MAC key = first 16 bytes of session key blob
-    let mac_key: [u8; 16] = session_key_blob[..16].try_into().unwrap();
+    let mut mac_key = [0u8; 16];
+    mac_key.copy_from_slice(&session_key_blob[..16]);
 
     // Encryption/decryption keys depend on method
     match encryption_method {
@@ -640,8 +641,10 @@ impl FipsSecurityContext {
         padded.resize(total_len, pad_len as u8);
 
         // 3DES-CBC encrypt (data is always padded to block size above)
-        let ciphertext = self.encrypt_cipher.encrypt_cbc(&padded, &self.encrypt_iv)
-            .expect("FIPS encrypt: data is pre-padded to 8-byte block size");
+        let ciphertext = match self.encrypt_cipher.encrypt_cbc(&padded, &self.encrypt_iv) {
+            Ok(ct) => ct,
+            Err(_) => return (Vec::new(), [0u8; 8], 0),
+        };
 
         // Update IV: last 8 bytes of ciphertext
         if ciphertext.len() >= 8 {
@@ -665,8 +668,10 @@ impl FipsSecurityContext {
         }
 
         // 3DES-CBC decrypt (ciphertext is always block-aligned from the protocol)
-        let decrypted = self.decrypt_cipher.decrypt_cbc(ciphertext, &iv)
-            .expect("FIPS decrypt: ciphertext is block-aligned");
+        let decrypted = match self.decrypt_cipher.decrypt_cbc(ciphertext, &iv) {
+            Ok(pt) => pt,
+            Err(_) => return (Vec::new(), false),
+        };
 
         // Remove padding
         let data_len = decrypted.len().saturating_sub(pad_len as usize);

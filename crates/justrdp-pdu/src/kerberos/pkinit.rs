@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! PKINIT (RFC 4556) ASN.1 structures for certificate-based Kerberos authentication.
 //!
 //! Implements the client-side structures needed for PKINIT in the RDP CredSSP flow:

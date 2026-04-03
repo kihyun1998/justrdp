@@ -73,6 +73,7 @@ impl ColorDepth {
     pub fn from_u16(val: u16) -> Self {
         match val {
             0xCA00 => Self::Bpp4,
+            0xCA01 => Self::Bpp8,
             0xCA02 => Self::Bpp15,
             0xCA03 => Self::Bpp16,
             0xCA04 => Self::Bpp24,
@@ -99,6 +100,7 @@ impl HighColorDepth {
             0x0008 => Self::Bpp8,
             0x000F => Self::Bpp15,
             0x0010 => Self::Bpp16,
+            0x0018 => Self::Bpp24,
             _ => Self::Bpp24,
         }
     }

@@ -177,12 +177,18 @@ impl Encode for ClientInfoPdu {
             dst.write_u16_le(extra.client_address_family, "ExtInfo::addressFamily")?;
 
             let addr = utf16le_bytes(&extra.client_address);
-            dst.write_u16_le((addr.len() + 2) as u16, "ExtInfo::cbClientAddress")?; // includes null
+            let cb_addr = u16::try_from(addr.len() + 2).map_err(|_| {
+                justrdp_core::EncodeError::other("ExtInfo::cbClientAddress", "address too long for u16")
+            })?;
+            dst.write_u16_le(cb_addr, "ExtInfo::cbClientAddress")?;
             dst.write_slice(&addr, "ExtInfo::clientAddress")?;
             dst.write_u16_le(0, "ExtInfo::clientAddress_null")?;
 
             let dir = utf16le_bytes(&extra.client_dir);
-            dst.write_u16_le((dir.len() + 2) as u16, "ExtInfo::cbClientDir")?;
+            let cb_dir = u16::try_from(dir.len() + 2).map_err(|_| {
+                justrdp_core::EncodeError::other("ExtInfo::cbClientDir", "dir too long for u16")
+            })?;
+            dst.write_u16_le(cb_dir, "ExtInfo::cbClientDir")?;
             dst.write_slice(&dir, "ExtInfo::clientDir")?;
             dst.write_u16_le(0, "ExtInfo::clientDir_null")?;
 

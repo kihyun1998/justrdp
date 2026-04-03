@@ -635,7 +635,7 @@ impl Encode for SendDataRequest<'_> {
         dst.write_u8((DomainMcsPduType::SendDataRequest as u8) << 2, "SendDataRequest::choice")?;
         per::write_integer_u16(dst, self.initiator.saturating_sub(1001), "SendDataRequest::initiator")?;
         per::write_integer_u16(dst, self.channel_id, "SendDataRequest::channelId")?;
-        // Data priority (1 byte): high=0x70 is typical
+        // T.125 §11.33: dataPriority(high) + segmentation(begin|end) = 0b01_11_00_00 = 0x70
         dst.write_u8(0x70, "SendDataRequest::dataPriority")?;
         per::write_octet_string(dst, self.user_data, "SendDataRequest::userData")?;
         Ok(())
@@ -688,6 +688,7 @@ impl Encode for SendDataIndication<'_> {
         dst.write_u8((DomainMcsPduType::SendDataIndication as u8) << 2, "SendDataIndication::choice")?;
         per::write_integer_u16(dst, self.initiator.saturating_sub(1001), "SendDataIndication::initiator")?;
         per::write_integer_u16(dst, self.channel_id, "SendDataIndication::channelId")?;
+        // T.125 §11.33: dataPriority(high) + segmentation(begin|end) = 0x70
         dst.write_u8(0x70, "SendDataIndication::dataPriority")?;
         per::write_octet_string(dst, self.user_data, "SendDataIndication::userData")?;
         Ok(())

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! SPNEGO (RFC 4178) token encoding/decoding.
 //!
 //! SPNEGO wraps Kerberos AP-REQ/AP-REP tokens for use in CredSSP/NLA.

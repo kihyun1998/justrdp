@@ -36,9 +36,13 @@ impl TpktHeader {
     }
 
     /// Create a TPKT header for a payload of the given size.
+    ///
+    /// Panics if `payload_len + TPKT_HEADER_SIZE` exceeds `u16::MAX`.
     pub fn for_payload(payload_len: usize) -> Self {
+        let total = payload_len + TPKT_HEADER_SIZE;
+        assert!(total <= u16::MAX as usize, "TPKT payload too large: {total} > {}", u16::MAX);
         Self {
-            length: (payload_len + TPKT_HEADER_SIZE) as u16,
+            length: total as u16,
         }
     }
 

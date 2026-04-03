@@ -1221,41 +1221,50 @@ pub fn read_capability_set(src: &mut ReadCursor<'_>) -> DecodeResult<CapabilityS
     }
 
     let body_len = length - CAPABILITY_HEADER_SIZE;
+    let body_start = src.pos();
 
-    match CapabilitySetType::from_u16(cap_type_raw) {
-        Some(CapabilitySetType::General) => Ok(CapabilitySet::General(GeneralCapability::decode(src)?)),
-        Some(CapabilitySetType::Bitmap) => Ok(CapabilitySet::Bitmap(BitmapCapability::decode(src)?)),
-        Some(CapabilitySetType::Order) => Ok(CapabilitySet::Order(OrderCapability::decode(src)?)),
-        Some(CapabilitySetType::BitmapCache) => Ok(CapabilitySet::BitmapCache(BitmapCacheCapability::decode(src)?)),
-        Some(CapabilitySetType::Control) => Ok(CapabilitySet::Control(ControlCapability::decode(src)?)),
-        Some(CapabilitySetType::Activation) => Ok(CapabilitySet::Activation(ActivationCapability::decode(src)?)),
-        Some(CapabilitySetType::Pointer) => Ok(CapabilitySet::Pointer(PointerCapability::decode(src)?)),
-        Some(CapabilitySetType::Share) => Ok(CapabilitySet::Share(ShareCapability::decode(src)?)),
-        Some(CapabilitySetType::ColorCache) => Ok(CapabilitySet::ColorCache(ColorCacheCapability::decode(src)?)),
-        Some(CapabilitySetType::Sound) => Ok(CapabilitySet::Sound(SoundCapability::decode(src)?)),
-        Some(CapabilitySetType::Input) => Ok(CapabilitySet::Input(InputCapability::decode(src)?)),
-        Some(CapabilitySetType::Font) => Ok(CapabilitySet::Font(FontCapability::decode(src)?)),
-        Some(CapabilitySetType::Brush) => Ok(CapabilitySet::Brush(BrushCapability::decode(src)?)),
-        Some(CapabilitySetType::GlyphCache) => Ok(CapabilitySet::GlyphCache(GlyphCacheCapability::decode(src)?)),
-        Some(CapabilitySetType::OffscreenCache) => Ok(CapabilitySet::OffscreenCache(OffscreenCacheCapability::decode(src)?)),
-        Some(CapabilitySetType::BitmapCacheHostSupport) => Ok(CapabilitySet::BitmapCacheHostSupport(BitmapCacheHostSupportCapability::decode(src)?)),
-        Some(CapabilitySetType::BitmapCacheRev2) => Ok(CapabilitySet::BitmapCacheRev2(BitmapCacheRev2Capability::decode(src)?)),
-        Some(CapabilitySetType::VirtualChannel) => Ok(CapabilitySet::VirtualChannel(VirtualChannelCapability::decode_with_len(src, body_len)?)),
-        Some(CapabilitySetType::DrawNineGridCache) => Ok(CapabilitySet::DrawNineGridCache(DrawNineGridCacheCapability::decode(src)?)),
-        Some(CapabilitySetType::DrawGdiPlus) => Ok(CapabilitySet::DrawGdiPlus(DrawGdiPlusCapability::decode(src)?)),
-        Some(CapabilitySetType::Rail) => Ok(CapabilitySet::Rail(RailCapability::decode(src)?)),
-        Some(CapabilitySetType::Window) => Ok(CapabilitySet::Window(WindowCapability::decode(src)?)),
-        Some(CapabilitySetType::DesktopComposition) => Ok(CapabilitySet::DesktopComposition(DesktopCompositionCapability::decode(src)?)),
-        Some(CapabilitySetType::MultifragmentUpdate) => Ok(CapabilitySet::MultifragmentUpdate(MultifragmentUpdateCapability::decode(src)?)),
-        Some(CapabilitySetType::LargePointer) => Ok(CapabilitySet::LargePointer(LargePointerCapability::decode(src)?)),
-        Some(CapabilitySetType::SurfaceCommands) => Ok(CapabilitySet::SurfaceCommands(SurfaceCommandsCapability::decode(src)?)),
-        Some(CapabilitySetType::BitmapCodecs) => Ok(CapabilitySet::BitmapCodecs(BitmapCodecsCapability::decode_with_len(src, body_len)?)),
-        Some(CapabilitySetType::FrameAcknowledge) => Ok(CapabilitySet::FrameAcknowledge(FrameAcknowledgeCapability::decode(src)?)),
+    let cap = match CapabilitySetType::from_u16(cap_type_raw) {
+        Some(CapabilitySetType::General) => CapabilitySet::General(GeneralCapability::decode(src)?),
+        Some(CapabilitySetType::Bitmap) => CapabilitySet::Bitmap(BitmapCapability::decode(src)?),
+        Some(CapabilitySetType::Order) => CapabilitySet::Order(OrderCapability::decode(src)?),
+        Some(CapabilitySetType::BitmapCache) => CapabilitySet::BitmapCache(BitmapCacheCapability::decode(src)?),
+        Some(CapabilitySetType::Control) => CapabilitySet::Control(ControlCapability::decode(src)?),
+        Some(CapabilitySetType::Activation) => CapabilitySet::Activation(ActivationCapability::decode(src)?),
+        Some(CapabilitySetType::Pointer) => CapabilitySet::Pointer(PointerCapability::decode(src)?),
+        Some(CapabilitySetType::Share) => CapabilitySet::Share(ShareCapability::decode(src)?),
+        Some(CapabilitySetType::ColorCache) => CapabilitySet::ColorCache(ColorCacheCapability::decode(src)?),
+        Some(CapabilitySetType::Sound) => CapabilitySet::Sound(SoundCapability::decode(src)?),
+        Some(CapabilitySetType::Input) => CapabilitySet::Input(InputCapability::decode(src)?),
+        Some(CapabilitySetType::Font) => CapabilitySet::Font(FontCapability::decode(src)?),
+        Some(CapabilitySetType::Brush) => CapabilitySet::Brush(BrushCapability::decode(src)?),
+        Some(CapabilitySetType::GlyphCache) => CapabilitySet::GlyphCache(GlyphCacheCapability::decode(src)?),
+        Some(CapabilitySetType::OffscreenCache) => CapabilitySet::OffscreenCache(OffscreenCacheCapability::decode(src)?),
+        Some(CapabilitySetType::BitmapCacheHostSupport) => CapabilitySet::BitmapCacheHostSupport(BitmapCacheHostSupportCapability::decode(src)?),
+        Some(CapabilitySetType::BitmapCacheRev2) => CapabilitySet::BitmapCacheRev2(BitmapCacheRev2Capability::decode(src)?),
+        Some(CapabilitySetType::VirtualChannel) => CapabilitySet::VirtualChannel(VirtualChannelCapability::decode_with_len(src, body_len)?),
+        Some(CapabilitySetType::DrawNineGridCache) => CapabilitySet::DrawNineGridCache(DrawNineGridCacheCapability::decode(src)?),
+        Some(CapabilitySetType::DrawGdiPlus) => CapabilitySet::DrawGdiPlus(DrawGdiPlusCapability::decode(src)?),
+        Some(CapabilitySetType::Rail) => CapabilitySet::Rail(RailCapability::decode(src)?),
+        Some(CapabilitySetType::Window) => CapabilitySet::Window(WindowCapability::decode(src)?),
+        Some(CapabilitySetType::DesktopComposition) => CapabilitySet::DesktopComposition(DesktopCompositionCapability::decode(src)?),
+        Some(CapabilitySetType::MultifragmentUpdate) => CapabilitySet::MultifragmentUpdate(MultifragmentUpdateCapability::decode(src)?),
+        Some(CapabilitySetType::LargePointer) => CapabilitySet::LargePointer(LargePointerCapability::decode(src)?),
+        Some(CapabilitySetType::SurfaceCommands) => CapabilitySet::SurfaceCommands(SurfaceCommandsCapability::decode(src)?),
+        Some(CapabilitySetType::BitmapCodecs) => CapabilitySet::BitmapCodecs(BitmapCodecsCapability::decode_with_len(src, body_len)?),
+        Some(CapabilitySetType::FrameAcknowledge) => CapabilitySet::FrameAcknowledge(FrameAcknowledgeCapability::decode(src)?),
         None => {
             let data = src.read_slice(body_len, "CapabilitySet::unknown_body")?.into();
-            Ok(CapabilitySet::Unknown { cap_type: cap_type_raw, data })
+            CapabilitySet::Unknown { cap_type: cap_type_raw, data }
         }
+    };
+
+    // Skip any surplus bytes declared in lengthCapability but not consumed by the fixed-size decode
+    let consumed = src.pos() - body_start;
+    if body_len > consumed {
+        src.skip(body_len - consumed, "CapabilitySet::surplus")?;
     }
+
+    Ok(cap)
 }
 
 /// Write a single capability set (header + body) to the cursor.

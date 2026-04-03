@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Minimal ASN.1 DER encoder/decoder for Kerberos messages.
 //!
 //! Supports the subset of ASN.1 needed by RFC 4120:
