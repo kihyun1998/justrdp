@@ -12,13 +12,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::mppc::PACKET_COMPRESSED;
+
 // ── Constants (MS-RDPEGFX §2.2.5, §3.1.9.1) ──
 
 /// Compression type in RDP8_BULK_ENCODED_DATA header nibble.
 const PACKET_COMPR_TYPE_RDP8: u8 = 0x04;
-
-/// Payload is Huffman-compressed.
-const PACKET_COMPRESSED: u8 = 0x20;
 
 /// Single-segment descriptor byte.
 const SEGMENTED_SINGLE: u8 = 0xE0;
@@ -31,6 +30,18 @@ const HISTORY_SIZE: usize = 2_500_000;
 
 /// Maximum uncompressed bytes per segment.
 const MAX_SEGMENT_SIZE: usize = 65_535;
+
+/// Maximum total decompressed output per `decompress()` call (64 MB).
+///
+/// This prevents memory exhaustion from crafted inputs: a multipart packet
+/// can otherwise declare up to 4 GB via its `uncompressedSize` field.
+const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+
+/// Maximum extra doublings in `decode_match_count` (limits match count to ~4 MB).
+const MAX_MATCH_COUNT_EXTRA_BITS: u32 = 20;
+
+/// Bit-width of the byte-count field in the UNENCODED token path (MS-RDPEGFX §3.1.9.1.2).
+const UNENCODED_COUNT_BITS: u32 = 15;
 
 // ── Error type ──
 
@@ -49,6 +60,8 @@ pub enum ZgfxError {
     InvalidToken,
     /// Multipart output size doesn't match declared uncompressedSize.
     SizeMismatch,
+    /// Decompressed output exceeds `MAX_DECOMPRESSED_SIZE`.
+    DecompressedSizeExceeded,
 }
 
 impl fmt::Display for ZgfxError {
@@ -60,6 +73,9 @@ impl fmt::Display for ZgfxError {
             Self::InvalidCompressionType => write!(f, "ZGFX: invalid compression type"),
             Self::InvalidToken => write!(f, "ZGFX: invalid token in bitstream"),
             Self::SizeMismatch => write!(f, "ZGFX: output size mismatch"),
+            Self::DecompressedSizeExceeded => {
+                write!(f, "ZGFX: decompressed output exceeds maximum size")
+            }
         }
     }
 }
@@ -200,6 +216,12 @@ impl<'a> ZgfxBits<'a> {
         // accumulator, so `pos >= full_bytes_in_acc` is always true here.
         let full_bytes_in_acc = self.acc_bits / 8;
         if full_bytes_in_acc > 0 {
+            assert!(
+                self.pos >= full_bytes_in_acc as usize,
+                "align_byte: pos ({}) < full_bytes_in_acc ({})",
+                self.pos,
+                full_bytes_in_acc,
+            );
             self.pos -= full_bytes_in_acc as usize;
         }
         // Discard only the sub-byte remainder
@@ -213,6 +235,9 @@ impl<'a> ZgfxBits<'a> {
 
     /// Read one raw byte from the input (for UNENCODED path).
     fn read_raw_byte(&mut self) -> Result<u8, ZgfxError> {
+        if self.bits_remaining < 8 {
+            return Err(ZgfxError::TruncatedBitstream);
+        }
         if self.pos >= self.data_end {
             return Err(ZgfxError::TruncatedBitstream);
         }
@@ -220,6 +245,19 @@ impl<'a> ZgfxBits<'a> {
         self.pos += 1;
         self.bits_remaining -= 8;
         Ok(b)
+    }
+}
+
+// ── Shared ring-buffer write ──
+
+/// Write one byte to a ring buffer at `*index`, wrapping when it reaches
+/// the end of `history`. Used by both compressor and decompressor.
+#[inline]
+fn ring_write(history: &mut [u8], index: &mut usize, b: u8) {
+    history[*index] = b;
+    *index += 1;
+    if *index == history.len() {
+        *index = 0;
     }
 }
 
@@ -249,12 +287,20 @@ impl ZgfxDecompressor {
             return Err(ZgfxError::TruncatedInput);
         }
 
+        let dst_start = dst.len();
+        // The output budget is shared across all segments (single or multi).
+        // `decode_segment` and its callees check `dst.len() - dst_start`
+        // against `MAX_DECOMPRESSED_SIZE` after every write.
+        let output_limit = dst_start
+            .checked_add(MAX_DECOMPRESSED_SIZE)
+            .ok_or(ZgfxError::DecompressedSizeExceeded)?;
+
         match src[0] {
             SEGMENTED_SINGLE => {
                 if src.len() < 2 {
                     return Err(ZgfxError::TruncatedInput);
                 }
-                self.decode_segment(&src[1..], dst)
+                self.decode_segment(&src[1..], dst, output_limit)?;
             }
             SEGMENTED_MULTIPART => {
                 if src.len() < 7 {
@@ -265,7 +311,11 @@ impl ZgfxDecompressor {
                 let uncompressed_size =
                     u32::from_le_bytes([src[3], src[4], src[5], src[6]]) as usize;
 
-                let dst_start = dst.len();
+                // Reject unreasonably large declared sizes upfront.
+                if uncompressed_size > MAX_DECOMPRESSED_SIZE {
+                    return Err(ZgfxError::DecompressedSizeExceeded);
+                }
+
                 let mut offset = 7;
                 for _ in 0..segment_count {
                     if offset + 4 > src.len() {
@@ -278,29 +328,46 @@ impl ZgfxDecompressor {
                         src[offset + 3],
                     ]) as usize;
                     offset += 4;
-                    if offset + seg_size > src.len() {
+                    let seg_end = offset
+                        .checked_add(seg_size)
+                        .ok_or(ZgfxError::TruncatedInput)?;
+                    if seg_end > src.len() {
                         return Err(ZgfxError::TruncatedInput);
                     }
-                    self.decode_segment(&src[offset..offset + seg_size], dst)?;
-                    offset += seg_size;
+                    self.decode_segment(
+                        &src[offset..seg_end],
+                        dst,
+                        output_limit,
+                    )?;
+                    offset = seg_end;
                 }
 
                 let written = dst.len() - dst_start;
                 if written != uncompressed_size {
                     return Err(ZgfxError::SizeMismatch);
                 }
-
-                Ok(())
             }
-            _ => Err(ZgfxError::InvalidDescriptor),
+            _ => return Err(ZgfxError::InvalidDescriptor),
         }
+
+        Ok(())
+    }
+
+    /// Write one byte to the ring-buffer history.
+    #[inline]
+    fn write_history(&mut self, b: u8) {
+        ring_write(&mut self.history, &mut self.history_index, b);
     }
 
     /// Decode a single RDP8_BULK_ENCODED_DATA segment.
+    ///
+    /// `output_limit` is the absolute maximum `dst.len()` allowed; exceeding
+    /// it returns `DecompressedSizeExceeded`.
     fn decode_segment(
         &mut self,
         segment: &[u8],
         dst: &mut Vec<u8>,
+        output_limit: usize,
     ) -> Result<(), ZgfxError> {
         if segment.is_empty() {
             return Err(ZgfxError::TruncatedInput);
@@ -312,9 +379,9 @@ impl ZgfxDecompressor {
         let data = &segment[1..];
 
         if header & PACKET_COMPRESSED != 0 {
-            self.decode_compressed(data, dst)
+            self.decode_compressed(data, dst, output_limit)
         } else {
-            self.decode_uncompressed(data, dst)
+            self.decode_uncompressed(data, dst, output_limit)
         }
     }
 
@@ -323,13 +390,13 @@ impl ZgfxDecompressor {
         &mut self,
         data: &[u8],
         dst: &mut Vec<u8>,
+        output_limit: usize,
     ) -> Result<(), ZgfxError> {
+        if dst.len().saturating_add(data.len()) > output_limit {
+            return Err(ZgfxError::DecompressedSizeExceeded);
+        }
         for &b in data {
-            self.history[self.history_index] = b;
-            self.history_index += 1;
-            if self.history_index == HISTORY_SIZE {
-                self.history_index = 0;
-            }
+            self.write_history(b);
         }
         dst.extend_from_slice(data);
         Ok(())
@@ -340,6 +407,7 @@ impl ZgfxDecompressor {
         &mut self,
         encoded: &[u8],
         dst: &mut Vec<u8>,
+        output_limit: usize,
     ) -> Result<(), ZgfxError> {
         let mut bits = ZgfxBits::new(encoded)?;
 
@@ -366,11 +434,10 @@ impl ZgfxDecompressor {
                         } else {
                             token.value_base as u8
                         };
-                        self.history[self.history_index] = c;
-                        self.history_index += 1;
-                        if self.history_index == HISTORY_SIZE {
-                            self.history_index = 0;
+                        if dst.len() >= output_limit {
+                            return Err(ZgfxError::DecompressedSizeExceeded);
                         }
+                        self.write_history(c);
                         dst.push(c);
                     } else {
                         // Match distance
@@ -379,29 +446,28 @@ impl ZgfxDecompressor {
 
                         // `>` (not `>=`): distance == HISTORY_SIZE is valid
                         // and references the oldest byte in the ring buffer.
-                        // The index computation `(history_index + HISTORY_SIZE
-                        // - distance) % HISTORY_SIZE` yields `history_index`
-                        // when distance == HISTORY_SIZE.
                         if distance as usize > HISTORY_SIZE {
                             return Err(ZgfxError::InvalidToken);
                         }
 
                         if distance == 0 {
-                            // UNENCODED path
-                            let count = bits.get_bits(15)? as usize;
+                            // UNENCODED path (MS-RDPEGFX §3.1.9.1.2)
+                            let count = bits.get_bits(UNENCODED_COUNT_BITS)? as usize;
                             bits.align_byte();
                             for _ in 0..count {
-                                let c = bits.read_raw_byte()?;
-                                self.history[self.history_index] = c;
-                                self.history_index += 1;
-                                if self.history_index == HISTORY_SIZE {
-                                    self.history_index = 0;
+                                if dst.len() >= output_limit {
+                                    return Err(ZgfxError::DecompressedSizeExceeded);
                                 }
+                                let c = bits.read_raw_byte()?;
+                                self.write_history(c);
                                 dst.push(c);
                             }
                         } else {
                             // Match copy
                             let count = self.decode_match_count(&mut bits)?;
+                            if dst.len().saturating_add(count) > output_limit {
+                                return Err(ZgfxError::DecompressedSizeExceeded);
+                            }
                             let mut prev_index = (self.history_index + HISTORY_SIZE
                                 - distance as usize)
                                 % HISTORY_SIZE;
@@ -411,11 +477,7 @@ impl ZgfxDecompressor {
                                 if prev_index == HISTORY_SIZE {
                                     prev_index = 0;
                                 }
-                                self.history[self.history_index] = c;
-                                self.history_index += 1;
-                                if self.history_index == HISTORY_SIZE {
-                                    self.history_index = 0;
-                                }
+                                self.write_history(c);
                                 dst.push(c);
                             }
                         }
@@ -444,13 +506,13 @@ impl ZgfxDecompressor {
         }
         let mut count: usize = 4;
         let mut extra: u32 = 2;
-        // The guard `extra > 20` limits doubling to at most 20 iterations.
-        // Starting from count=4, doubling 20 times gives 4 * 2^20 = 4,194,304
-        // which fits in usize on both 32-bit and 64-bit platforms (max ~4 MB).
+        // The guard limits doubling to at most 19 iterations (extra starts
+        // at 2, fires at extra > 20). Max count from doubling alone is
+        // 4 * 2^19 = 2,097,152 (~2 MB), fitting in usize on all platforms.
         while bits.get_bits(1)? == 1 {
             count *= 2;
             extra += 1;
-            if extra > 20 {
+            if extra > MAX_MATCH_COUNT_EXTRA_BITS {
                 return Err(ZgfxError::TruncatedBitstream);
             }
         }
@@ -493,17 +555,26 @@ impl ZgfxCompressor {
         }
     }
 
+    /// Write one byte to the ring-buffer history.
+    #[inline]
+    fn write_history(&mut self, b: u8) {
+        ring_write(&mut self.history, &mut self.history_index, b);
+    }
+
     /// Compress input into an RDP_SEGMENTED_DATA structure.
     ///
     /// Uses pass-through encoding (no actual compression).
-    pub fn compress(&mut self, src: &[u8], dst: &mut Vec<u8>) {
+    /// Returns an error if `src` is too large for the multipart header fields.
+    pub fn compress(&mut self, src: &[u8], dst: &mut Vec<u8>) -> Result<(), ZgfxError> {
+        // Reject inputs that would overflow the u32 uncompressedSize field
+        // in the multipart header.
+        if src.len() > u32::MAX as usize {
+            return Err(ZgfxError::DecompressedSizeExceeded);
+        }
+
         // Update history
         for &b in src {
-            self.history[self.history_index] = b;
-            self.history_index += 1;
-            if self.history_index == HISTORY_SIZE {
-                self.history_index = 0;
-            }
+            self.write_history(b);
         }
 
         if src.len() <= MAX_SEGMENT_SIZE {
@@ -515,6 +586,9 @@ impl ZgfxCompressor {
             // Multi segment
             dst.push(SEGMENTED_MULTIPART);
             let segment_count = (src.len() + MAX_SEGMENT_SIZE - 1) / MAX_SEGMENT_SIZE;
+            if segment_count > u16::MAX as usize {
+                return Err(ZgfxError::DecompressedSizeExceeded);
+            }
             dst.extend_from_slice(&(segment_count as u16).to_le_bytes());
             dst.extend_from_slice(&(src.len() as u32).to_le_bytes());
 
@@ -528,6 +602,8 @@ impl ZgfxCompressor {
                 offset += chunk_len;
             }
         }
+
+        Ok(())
     }
 }
 
@@ -670,7 +746,7 @@ mod tests {
     fn compress_single_segment() {
         let mut comp = ZgfxCompressor::new();
         let mut out = Vec::new();
-        comp.compress(b"Hello", &mut out);
+        comp.compress(b"Hello", &mut out).unwrap();
 
         assert_eq!(out[0], SEGMENTED_SINGLE);
         assert_eq!(out[1], PACKET_COMPR_TYPE_RDP8);
@@ -682,7 +758,7 @@ mod tests {
         let mut comp = ZgfxCompressor::new();
         let input = vec![0x42u8; 70_000]; // > MAX_SEGMENT_SIZE
         let mut out = Vec::new();
-        comp.compress(&input, &mut out);
+        comp.compress(&input, &mut out).unwrap();
 
         assert_eq!(out[0], SEGMENTED_MULTIPART);
         let seg_count = u16::from_le_bytes([out[1], out[2]]);
@@ -698,7 +774,7 @@ mod tests {
         let original = b"Hello, ZGFX roundtrip test!";
         let mut comp = ZgfxCompressor::new();
         let mut compressed = Vec::new();
-        comp.compress(original, &mut compressed);
+        comp.compress(original, &mut compressed).unwrap();
 
         let mut dec = ZgfxDecompressor::new();
         let mut decompressed = Vec::new();
@@ -712,7 +788,7 @@ mod tests {
         let original: Vec<u8> = (0..70_000).map(|i| (i % 256) as u8).collect();
         let mut comp = ZgfxCompressor::new();
         let mut compressed = Vec::new();
-        comp.compress(&original, &mut compressed);
+        comp.compress(&original, &mut compressed).unwrap();
 
         let mut dec = ZgfxDecompressor::new();
         let mut decompressed = Vec::new();
@@ -743,96 +819,16 @@ mod tests {
 
     #[test]
     fn compressed_unencoded_path() {
-        // Build a compressed segment with distance=0 (UNENCODED) path.
-        // Token for distance=0: prefix 10001 (5 bits, code=17), valueBits=5, valueBase=0
-        // distance = 0 + GetBits(5) where all 5 bits are 0 → distance = 0
+        // UNENCODED token: distance=0, count=3, raw bytes "ABC".
         //
-        // Then: 15-bit count, byte-align, then raw bytes.
+        // Bit layout (MSB-first):
+        //   prefix 10001 (5 bits, code=17) + distance 00000 (5 bits) = 0
+        //   count 000000000000011 (15 bits) = 3
+        //   byte-align (7 padding bits)
+        //   raw: 0x41 0x42 0x43
         //
-        // Encoding: prefix 10001 (5 bits) + 00000 (5 bits, distance=0)
-        //         + 000000000000011 (15 bits, count=3)
-        //         + byte-align padding
-        //         + raw bytes: 0x41 0x42 0x43 ("ABC")
-        //         + last byte (padding count)
-        //
-        // Total prefix+distance+count = 5+5+15 = 25 bits.
-        // 25 bits = 3 bytes + 1 bit. Align to byte = discard 7 bits. But align_byte
-        // discards only sub-byte remainder from accumulator.
-        //
-        // Let me build this step by step:
-        // Bits: 10001 00000 000000000000011
-        //     = 10001_00000_000000000000011
-        //     = 1000100000 000000000000011
-        // That's 25 bits. Packed into bytes (MSB-first):
-        // Byte 0: 10001000 = 0x88
-        // Byte 1: 00000000 = 0x00
-        // Byte 2: 00000000 = 0x00
-        // Byte 3: 011xxxxx (remaining 3 bits + 5 padding for alignment)
-        //
-        // Wait, 25 bits = 3*8 + 1 bit. Byte 3 has 1 bit then 7 padding.
-        // Byte 3: 1xxxxxxx (the 25th bit is '1' from '...011')
-        //
-        // Actually let me be more careful:
-        // Bit  0: 1 (prefix)
-        // Bit  1: 0
-        // Bit  2: 0
-        // Bit  3: 0
-        // Bit  4: 1
-        // Bit  5: 0 (distance value bits)
-        // Bit  6: 0
-        // Bit  7: 0
-        // Byte 0 = 10001000 = 0x88
-        //
-        // Bit  8: 0
-        // Bit  9: 0
-        // Bit 10: 0 (count bits start here)
-        // Bit 11: 0
-        // Bit 12: 0
-        // Bit 13: 0
-        // Bit 14: 0
-        // Bit 15: 0
-        // Byte 1 = 00000000 = 0x00
-        //
-        // Bit 16: 0
-        // Bit 17: 0
-        // Bit 18: 0
-        // Bit 19: 0
-        // Bit 20: 0
-        // Bit 21: 0
-        // Bit 22: 0
-        // Bit 23: 1
-        // Byte 2 = 00000001 = 0x01
-        //
-        // Bit 24: 1 (last bit of count=3 = 0b000000000000011)
-        // Byte 3 = 1xxxxxxx (+ 7 padding for byte alignment)
-        //        = 10000000 = 0x80
-        //
-        // After align_byte: raw bytes follow.
-        // Byte 4: 0x41 ('A')
-        // Byte 5: 0x42 ('B')
-        // Byte 6: 0x43 ('C')
-        //
-        // Last byte (padding count): the padding was in byte 3 (7 bits),
-        // but in ZGFX the last byte of the entire encoded data is the padding count.
-        // Total encoded bytes = [0x88, 0x00, 0x01, 0x80, 0x41, 0x42, 0x43, padding_byte]
-        //
-        // The padding_byte tells how many bits to ignore from the total.
-        // Total bits in data bytes (excluding padding byte) = 7 * 8 = 56.
-        // Useful bits = 25 (header) + 7 (align padding) + 3*8 (raw bytes) = 56.
-        // So padding_byte = 0 (all 56 bits are "used").
-        // Wait: cBitsRemaining = 8 * (cbEncoded - 1) - lastByte.
-        // cbEncoded = 8 (bytes), lastByte = encoded[7].
-        // We want cBitsRemaining to cover all the useful bits.
-        // The 25 prefix/distance/count bits + 7 align bits + 24 raw bits = 56 bits.
-        // cBitsRemaining = 8 * 7 - lastByte = 56 - lastByte.
-        // We need cBitsRemaining = 56, so lastByte = 0.
-        //
-        // But wait: in the UNENCODED path, raw bytes are read via read_raw_byte()
-        // which decrements bits_remaining by 8 each time, NOT via get_bits.
-        // And the 7 align padding bits are discarded by align_byte which also
-        // decrements bits_remaining.
-        // So: 25 (get_bits) + 7 (align) + 24 (raw) = 56 bits total consumed.
-        // cBitsRemaining = 56 - 0 = 56. ✓
+        // Packed bytes: [0x88, 0x00, 0x01, 0x80, 0x41, 0x42, 0x43]
+        // Last byte = 0x00 (padding count: all 56 data bits are useful)
 
         let encoded: &[u8] = &[0x88, 0x00, 0x01, 0x80, 0x41, 0x42, 0x43, 0x00];
         let input: &[u8] = &{

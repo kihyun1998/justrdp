@@ -35,6 +35,10 @@ const L1_INNER_COMPRESSION: u8 = 0x10;
 /// L1 history buffer size: 2 MB (MS-RDPEGDI §3.1.8.2).
 const L1_HISTORY_SIZE: usize = 2_000_000;
 
+/// Byte size of one RDP61_MATCH_DETAILS record (MS-RDPEGDI §2.2.2.4.1):
+/// MatchLength(u16) + MatchOutputOffset(u16) + MatchHistoryOffset(u32) = 8 bytes.
+const MATCH_DETAIL_SIZE: usize = 8;
+
 // ── XcrushDecompressor ──
 
 /// XCRUSH two-stage decompressor (RDP 6.1).
@@ -122,7 +126,11 @@ impl XcrushDecompressor {
 
     /// Copy raw literals into L1 history and output.
     fn copy_literals(&mut self, data: &[u8], dst: &mut Vec<u8>) -> Result<(), DecompressError> {
-        if self.l1_history_offset + data.len() > L1_HISTORY_SIZE {
+        if self
+            .l1_history_offset
+            .checked_add(data.len())
+            .map_or(true, |end| end > L1_HISTORY_SIZE)
+        {
             return Err(DecompressError::HistoryOverflow);
         }
         self.l1_history[self.l1_history_offset..self.l1_history_offset + data.len()]
@@ -145,7 +153,7 @@ impl XcrushDecompressor {
         let match_count = u16::from_le_bytes([l1_input[0], l1_input[1]]) as usize;
 
         // Validate match details fit in the buffer
-        let details_size = match_count.checked_mul(8).ok_or(DecompressError::TruncatedBitstream)?;
+        let details_size = match_count.checked_mul(MATCH_DETAIL_SIZE).ok_or(DecompressError::TruncatedBitstream)?;
         let details_end = 2usize
             .checked_add(details_size)
             .ok_or(DecompressError::TruncatedBitstream)?;
@@ -159,7 +167,10 @@ impl XcrushDecompressor {
 
         // Process each match
         for i in 0..match_count {
-            let base = 2 + i * 8;
+            // details_end already validated via checked_mul above, so i*8
+            // is bounded by details_size. Use checked arithmetic for
+            // consistency with the guard above.
+            let base = 2 + i.checked_mul(MATCH_DETAIL_SIZE).ok_or(DecompressError::TruncatedBitstream)?;
             let match_length =
                 u16::from_le_bytes([l1_input[base], l1_input[base + 1]]) as usize;
             let match_output_offset =
@@ -182,23 +193,23 @@ impl XcrushDecompressor {
                 if literals_offset + gap > literals.len() {
                     return Err(DecompressError::TruncatedBitstream);
                 }
-                let literal_data = &literals[literals_offset..literals_offset + gap];
-                if self.l1_history_offset + gap > L1_HISTORY_SIZE {
-                    return Err(DecompressError::HistoryOverflow);
-                }
-                self.l1_history[self.l1_history_offset..self.l1_history_offset + gap]
-                    .copy_from_slice(literal_data);
-                self.l1_history_offset += gap;
-                dst.extend_from_slice(literal_data);
+                self.copy_literals(&literals[literals_offset..literals_offset + gap], dst)?;
                 output_offset += gap;
                 literals_offset += gap;
             }
 
-            // Validate match source
-            if match_history_offset + match_length > L1_HISTORY_SIZE {
+            // Validate match source (checked_add for 32-bit safety)
+            if match_history_offset
+                .checked_add(match_length)
+                .map_or(true, |end| end > L1_HISTORY_SIZE)
+            {
                 return Err(DecompressError::HistoryOverflow);
             }
-            if self.l1_history_offset + match_length > L1_HISTORY_SIZE {
+            if self
+                .l1_history_offset
+                .checked_add(match_length)
+                .map_or(true, |end| end > L1_HISTORY_SIZE)
+            {
                 return Err(DecompressError::HistoryOverflow);
             }
 
@@ -214,14 +225,7 @@ impl XcrushDecompressor {
 
         // Copy remaining literals after last match
         if literals_offset < literals.len() {
-            let remaining = &literals[literals_offset..];
-            if self.l1_history_offset + remaining.len() > L1_HISTORY_SIZE {
-                return Err(DecompressError::HistoryOverflow);
-            }
-            self.l1_history[self.l1_history_offset..self.l1_history_offset + remaining.len()]
-                .copy_from_slice(remaining);
-            self.l1_history_offset += remaining.len();
-            dst.extend_from_slice(remaining);
+            self.copy_literals(&literals[literals_offset..], dst)?;
         }
 
         Ok(())

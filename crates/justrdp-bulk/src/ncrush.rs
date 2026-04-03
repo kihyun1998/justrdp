@@ -18,6 +18,25 @@ pub const PACKET_COMPR_TYPE_RDP6: u8 = 0x2;
 const HISTORY_SIZE: usize = 65_536;
 const HISTORY_MASK: usize = HISTORY_SIZE - 1;
 
+/// Maximum total decompressed output per `decompress()` call (64 MB).
+/// Prevents memory exhaustion from crafted compressed packets.
+const MAX_NCRUSH_OUTPUT: usize = 64 * 1024 * 1024;
+
+/// Half of the history buffer — the compaction point (MS-RDPEGDI §3.1.8.1).
+/// When offset >= 65000, PACKET_AT_FRONT triggers compaction:
+/// `history[HISTORY_HALF..HISTORY_SIZE]` is copied to `history[0..]`
+/// and offset is adjusted by subtracting HISTORY_HALF.
+const HISTORY_HALF: usize = HISTORY_SIZE / 2;
+
+/// First copy-offset LEC symbol index (symbol 257 = lut_idx 0).
+const LEC_COPY_OFFSET_BASE_SYMBOL: usize = 257;
+
+/// First cached copy-offset LEC symbol index (symbols 289-292 → cache[0..4]).
+const LEC_CACHED_OFFSET_BASE_SYMBOL: usize = 289;
+/// Last cached copy-offset LEC symbol (= LEC_CACHED_OFFSET_BASE_SYMBOL + OFFSET_CACHE_SIZE - 1).
+const LEC_CACHED_OFFSET_LAST_SYMBOL: usize = LEC_CACHED_OFFSET_BASE_SYMBOL + OFFSET_CACHE_SIZE - 1;
+const _: () = assert!(LEC_CACHED_OFFSET_LAST_SYMBOL == 292);
+
 /// Number of LEC (Literal/EOS/CopyOffset) symbols.
 const NUM_LEC_SYMBOLS: usize = 294;
 /// Number of LOM (Length-of-Match) symbols.
@@ -285,9 +304,9 @@ impl NcrushDecompressor {
         // streams. The `else 0` branch handles malformed packets defensively
         // (no panic, history state becomes meaningless but safe).
         if flags & PACKET_AT_FRONT != 0 {
-            self.history.copy_within(32768..HISTORY_SIZE, 0);
-            self.offset = if self.offset >= 32768 {
-                self.offset - 32768
+            self.history.copy_within(HISTORY_HALF..HISTORY_SIZE, 0);
+            self.offset = if self.offset >= HISTORY_HALF {
+                self.offset - HISTORY_HALF
             } else {
                 0
             };
@@ -309,6 +328,9 @@ impl NcrushDecompressor {
     /// Offset wraps around silently when it reaches `HISTORY_SIZE`, which is
     /// the intended design for the 64K ring buffer.
     fn copy_literal(&mut self, src: &[u8], dst: &mut Vec<u8>) -> Result<(), DecompressError> {
+        if src.len() > MAX_NCRUSH_OUTPUT {
+            return Err(DecompressError::HistoryOverflow);
+        }
         for &b in src {
             self.history[self.offset & HISTORY_MASK] = b;
             self.offset = (self.offset + 1) & HISTORY_MASK;
@@ -324,6 +346,9 @@ impl NcrushDecompressor {
         dst: &mut Vec<u8>,
     ) -> Result<(), DecompressError> {
         let mut reader = BitReader::new(src);
+        let output_limit = dst.len()
+            .checked_add(MAX_NCRUSH_OUTPUT)
+            .ok_or(DecompressError::HistoryOverflow)?;
 
         loop {
             // Need at least the shortest LEC code (5 bits) to decode
@@ -353,6 +378,9 @@ impl NcrushDecompressor {
             match symbol {
                 // Literal byte (0-255)
                 0..=255 => {
+                    if dst.len() >= output_limit {
+                        return Err(DecompressError::HistoryOverflow);
+                    }
                     self.history[self.offset & HISTORY_MASK] = symbol as u8;
                     self.offset = (self.offset + 1) & HISTORY_MASK;
                     dst.push(symbol as u8);
@@ -363,7 +391,7 @@ impl NcrushDecompressor {
 
                 // New copy-offset (257-288)
                 257..=288 => {
-                    let lut_idx = symbol - 257;
+                    let lut_idx = symbol - LEC_COPY_OFFSET_BASE_SYMBOL;
                     let extra = COPY_OFFSET_BITS[lut_idx] as u32;
                     let stream_bits = if extra > 0 {
                         reader.read_bits(extra)?
@@ -375,24 +403,28 @@ impl NcrushDecompressor {
                     // Distances are 1-based in the spec, but our history uses
                     // 0-based indexing, so we subtract 1 to convert to a
                     // 0-based distance for the `do_copy` source calculation.
-                    let copy_offset =
-                        COPY_OFFSET_BASE[lut_idx] as usize + stream_bits as usize - 1;
+                    let copy_offset = (COPY_OFFSET_BASE[lut_idx] as usize
+                        + stream_bits as usize)
+                        .saturating_sub(1);
 
                     if copy_offset == 0 {
                         return Err(DecompressError::InvalidCopyOffset);
                     }
 
                     // Update offset cache: push new offset to front
-                    self.push_cache(copy_offset as u32);
+                    self.lru_insert(copy_offset as u32);
 
                     // Decode LOM and execute copy
                     let lom = self.decode_lom(&mut reader)?;
+                    if dst.len().saturating_add(lom) > output_limit {
+                        return Err(DecompressError::HistoryOverflow);
+                    }
                     self.do_copy(copy_offset, lom, dst);
                 }
 
                 // Cached copy-offset (289-292)
-                289..=292 => {
-                    let cache_idx = symbol - 289;
+                LEC_CACHED_OFFSET_BASE_SYMBOL..=LEC_CACHED_OFFSET_LAST_SYMBOL => {
+                    let cache_idx = symbol - LEC_CACHED_OFFSET_BASE_SYMBOL;
                     let copy_offset = self.cache[cache_idx] as usize;
                     if copy_offset == 0 {
                         return Err(DecompressError::InvalidCopyOffset);
@@ -403,6 +435,9 @@ impl NcrushDecompressor {
 
                     // Decode LOM and execute copy
                     let lom = self.decode_lom(&mut reader)?;
+                    if dst.len().saturating_add(lom) > output_limit {
+                        return Err(DecompressError::HistoryOverflow);
+                    }
                     self.do_copy(copy_offset, lom, dst);
                 }
 
@@ -450,7 +485,8 @@ impl NcrushDecompressor {
         Ok(LOM_BASE[lom_idx] as usize + stream_bits as usize)
     }
 
-    /// Execute a replicating copy from history buffer.
+    /// Execute a replicating copy from history ring buffer.
+    /// Same circular convention as `copy_literal` — offsets wrap via `HISTORY_MASK`.
     fn do_copy(&mut self, copy_offset: usize, lom: usize, dst: &mut Vec<u8>) {
         let src_start = self.offset.wrapping_sub(copy_offset) & HISTORY_MASK;
         for i in 0..lom {
@@ -462,8 +498,9 @@ impl NcrushDecompressor {
         }
     }
 
-    /// Push a new offset to the front of the cache, shifting others down.
-    fn push_cache(&mut self, offset: u32) {
+    /// LRU-insert an offset into the cache: promote if already present,
+    /// otherwise push to front and evict the oldest entry.
+    fn lru_insert(&mut self, offset: u32) {
         // Check if already in cache; if so, just promote
         for i in 0..OFFSET_CACHE_SIZE {
             if self.cache[i] == offset {
@@ -472,9 +509,9 @@ impl NcrushDecompressor {
             }
         }
         // Shift down and insert at front
-        self.cache[3] = self.cache[2];
-        self.cache[2] = self.cache[1];
-        self.cache[1] = self.cache[0];
+        for i in (1..OFFSET_CACHE_SIZE).rev() {
+            self.cache[i] = self.cache[i - 1];
+        }
         self.cache[0] = offset;
     }
 
@@ -647,20 +684,20 @@ mod tests {
         let mut dec = NcrushDecompressor::new();
 
         // Push 4 different offsets
-        dec.push_cache(10);
+        dec.lru_insert(10);
         assert_eq!(dec.cache, [10, 0, 0, 0]);
 
-        dec.push_cache(20);
+        dec.lru_insert(20);
         assert_eq!(dec.cache, [20, 10, 0, 0]);
 
-        dec.push_cache(30);
+        dec.lru_insert(30);
         assert_eq!(dec.cache, [30, 20, 10, 0]);
 
-        dec.push_cache(40);
+        dec.lru_insert(40);
         assert_eq!(dec.cache, [40, 30, 20, 10]);
 
         // Push a 5th offset — oldest (10) is dropped
-        dec.push_cache(50);
+        dec.lru_insert(50);
         assert_eq!(dec.cache, [50, 40, 30, 20]);
 
         // Promote cache[2] (30) to front
@@ -668,7 +705,7 @@ mod tests {
         assert_eq!(dec.cache, [30, 50, 40, 20]);
 
         // Push a duplicate (50) — should promote, not add new
-        dec.push_cache(50);
+        dec.lru_insert(50);
         assert_eq!(dec.cache, [50, 30, 40, 20]);
     }
 

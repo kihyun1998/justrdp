@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 #![doc = "Bulk compression and decompression for JustRDP."]
 #![doc = ""]
-#![doc = "Implements MPPC 8K, MPPC 64K, NCRUSH, and XCRUSH algorithms."]
+#![doc = "Implements MPPC 8K, MPPC 64K, NCRUSH, XCRUSH, and ZGFX (RDP 8.0) algorithms."]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;

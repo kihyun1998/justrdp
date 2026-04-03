@@ -37,6 +37,11 @@ pub const PACKET_COMPR_TYPE_64K: u8 = 0x1;
 const HISTORY_SIZE_8K: usize = 8_192;
 const HISTORY_SIZE_64K: usize = 65_536;
 
+/// Max LOM row count for 8K variant (MS-RDPBCGR §3.1.8.4.1.2.2).
+const LOM_MAX_ROWS_8K: u32 = 12;
+/// Max LOM row count for 64K variant (MS-RDPBCGR §3.1.8.4.2.2.2).
+const LOM_MAX_ROWS_64K: u32 = 15;
+
 // ── Error type ──
 
 /// Decompression error.
@@ -90,22 +95,31 @@ impl<'a> BitReader<'a> {
     }
 
     /// Fill the accumulator from the input bytes.
+    ///
+    /// Invariant: after `fill()`, `bits_left` is in `0..=32`.
     pub(crate) fn fill(&mut self) {
         while self.bits_left <= 24 && self.byte_pos < self.data.len() {
             self.acc |= (self.data[self.byte_pos] as u32) << (24 - self.bits_left);
             self.bits_left += 8;
             self.byte_pos += 1;
         }
+        debug_assert!(self.bits_left <= 32);
     }
 
     /// Number of bits still available (accumulator + unread bytes).
+    ///
+    /// The computation uses `u64` internally to avoid silent truncation
+    /// when `data.len()` exceeds ~512 MB on 64-bit targets, then saturates
+    /// to `u32::MAX` (sufficient for all protocol-level comparisons).
     pub(crate) fn remaining(&self) -> u32 {
-        self.bits_left + ((self.data.len() - self.byte_pos) as u32) * 8
+        let total = self.bits_left as u64
+            + ((self.data.len() - self.byte_pos) as u64) * 8;
+        total.min(u32::MAX as u64) as u32
     }
 
     /// Peek at the top `n` bits without consuming them.
     pub(crate) fn peek(&self, n: u32) -> u32 {
-        debug_assert!(n <= 32 && n > 0);
+        assert!(n > 0 && n <= 32);
         self.acc >> (32 - n)
     }
 
@@ -486,7 +500,11 @@ fn decode_copy_offset<const HISTORY_SIZE: usize>(
 fn decode_length_of_match<const HISTORY_SIZE: usize>(
     reader: &mut BitReader<'_>,
 ) -> Result<usize, DecompressError> {
-    let max_rows = if HISTORY_SIZE == HISTORY_SIZE_8K { 12 } else { 15 };
+    let max_rows = if HISTORY_SIZE == HISTORY_SIZE_8K {
+        LOM_MAX_ROWS_8K
+    } else {
+        LOM_MAX_ROWS_64K
+    };
 
     // Count leading 1-bits to determine the row
     let mut ones: u32 = 0;
@@ -503,17 +521,7 @@ fn decode_length_of_match<const HISTORY_SIZE: usize>(
         reader.read_bits(1)?;
         ones += 1;
         if ones >= max_rows as u32 {
-            // Last row has no terminating 0 bit; the row index is `ones`
-            // Actually, looking at the table more carefully:
-            // Row 0: '0' → L-o-M = 3 (ones=0)
-            // Row 1: '10' + 2 bits → L-o-M = 4..7 (ones=1)
-            // Row 2: '110' + 3 bits → L-o-M = 8..15 (ones=2)
-            // ...
-            // Row 11 (8K): '111111111110' + 12 bits → L-o-M = 4096..8191 (ones=11)
-            // We should not exceed max_rows-1 ones before a 0.
-            // If we do, it's a bitstream error. But actually the last valid row
-            // for 8K is ones=11 (row 12 in 1-indexed), terminated by '0'.
-            // There's no "unterminated" row in the spec.
+            // More consecutive 1-bits than the spec allows — malformed bitstream.
             return Err(DecompressError::TruncatedBitstream);
         }
     }
