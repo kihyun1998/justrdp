@@ -31,6 +31,7 @@ pub enum ClearCodecError {
     InvalidFlags(u8),
     InvalidGlyphIndex(u16),
     EmptyGlyphSlot(u16),
+    InvalidVBarIndex(u16),
     EmptyVBarSlot(u16),
     InvalidRunLength,
     InvalidBandCoordinates,
@@ -50,6 +51,7 @@ impl fmt::Display for ClearCodecError {
             Self::InvalidFlags(v) => write!(f, "ClearCodec: invalid flags 0x{v:02X}"),
             Self::InvalidGlyphIndex(v) => write!(f, "ClearCodec: invalid glyph index {v}"),
             Self::EmptyGlyphSlot(v) => write!(f, "ClearCodec: empty glyph slot {v}"),
+            Self::InvalidVBarIndex(v) => write!(f, "ClearCodec: invalid VBar index {v}"),
             Self::EmptyVBarSlot(v) => write!(f, "ClearCodec: empty VBar slot {v}"),
             Self::InvalidRunLength => write!(f, "ClearCodec: invalid run length (zero)"),
             Self::InvalidBandCoordinates => write!(f, "ClearCodec: invalid band coordinates"),
@@ -146,7 +148,7 @@ fn decode_residual(
     width: usize,
     height: usize,
 ) -> Result<(), ClearCodecError> {
-    let pixel_count = width * height;
+    let pixel_count = width.checked_mul(height).ok_or(ClearCodecError::BitmapDataTooLarge)?;
     let mut pos = 0;
     let mut pixel_pos = 0;
 
@@ -182,7 +184,7 @@ fn decode_bands(
     data: &[u8],
     output: &mut [u8],
     width: usize,
-    _height: usize,
+    height: usize,
     vbar_storage: &mut Vec<Vec<u8>>,
     vbar_cursor: &mut u16,
     short_vbar_storage: &mut Vec<Vec<u8>>,
@@ -207,6 +209,11 @@ fn decode_bands(
             return Err(ClearCodecError::BandHeightExceeded);
         }
 
+        // Validate band coordinates against frame dimensions
+        if x_end >= width || y_end >= height {
+            return Err(ClearCodecError::InvalidBandCoordinates);
+        }
+
         let band_height = y_end - y_start + 1;
         let vbar_count = x_end - x_start + 1;
 
@@ -220,14 +227,17 @@ fn decode_bands(
             if header_word & 0x8000 != 0 {
                 // VBAR_CACHE_HIT: bit 15 = 1 (MS-RDPEGFX §2.2.4.1.1.2)
                 let vbar_index = (header_word & 0x7FFF) as usize;
-                if vbar_index >= vbar_storage.len() || vbar_storage[vbar_index].is_empty() {
+                if vbar_index >= vbar_storage.len() {
+                    return Err(ClearCodecError::InvalidVBarIndex(vbar_index as u16));
+                }
+                if vbar_storage[vbar_index].is_empty() {
                     return Err(ClearCodecError::EmptyVBarSlot(vbar_index as u16));
                 }
                 let vbar = &vbar_storage[vbar_index];
-                write_vbar_to_output(output, width, x_pos, y_start, band_height, vbar);
+                write_vbar_to_output(output, width, x_pos, y_start, band_height, vbar)?;
                 // No cursor update on cache hit
-            } else if header_word & 0xC000 == 0x4000 {
-                // SHORT_VBAR_CACHE_HIT: bits[15:14] = 0b01
+            } else if header_word & 0x4000 != 0 {
+                // SHORT_VBAR_CACHE_HIT: bit 15=0 (checked above), bit 14=1
                 let short_vbar_index = (header_word & 0x3FFF) as usize;
                 let short_vbar_y_on = read_u8(data, &mut pos)? as usize;
 
@@ -240,9 +250,9 @@ fn decode_bands(
                     blue_bkg,
                     green_bkg,
                     red_bkg,
-                );
+                )?;
 
-                write_vbar_to_output(output, width, x_pos, y_start, band_height, &full_vbar);
+                write_vbar_to_output(output, width, x_pos, y_start, band_height, &full_vbar)?;
 
                 // Store full VBar
                 let cursor = *vbar_cursor as usize;
@@ -261,7 +271,9 @@ fn decode_bands(
                 }
 
                 let short_pixel_count = short_vbar_y_off - short_vbar_y_on;
-                let short_byte_count = short_pixel_count * 3;
+                // short_pixel_count is at most 63 (6-bit fields), so *3 <= 189, always safe.
+                let short_byte_count = short_pixel_count.checked_mul(3)
+                    .ok_or(ClearCodecError::TruncatedStream)?;
 
                 if pos + short_byte_count > data.len() {
                     return Err(ClearCodecError::TruncatedStream);
@@ -280,7 +292,7 @@ fn decode_bands(
                     red_bkg,
                 );
 
-                write_vbar_to_output(output, width, x_pos, y_start, band_height, &full_vbar);
+                write_vbar_to_output(output, width, x_pos, y_start, band_height, &full_vbar)?;
 
                 // Store short VBar (move — no clone needed)
                 let short_cursor = *short_vbar_cursor as usize;
@@ -310,13 +322,15 @@ fn reconstruct_vbar_from_short(
     blue_bkg: u8,
     green_bkg: u8,
     red_bkg: u8,
-) -> Vec<u8> {
-    let short_pixels = if short_vbar_index < short_vbar_storage.len() {
-        &short_vbar_storage[short_vbar_index]
-    } else {
-        &[][..]
-    };
-    build_full_vbar(short_pixels, short_vbar_y_on, band_height, blue_bkg, green_bkg, red_bkg)
+) -> Result<Vec<u8>, ClearCodecError> {
+    if short_vbar_index >= short_vbar_storage.len() {
+        return Err(ClearCodecError::InvalidVBarIndex(short_vbar_index as u16));
+    }
+    if short_vbar_storage[short_vbar_index].is_empty() {
+        return Err(ClearCodecError::EmptyVBarSlot(short_vbar_index as u16));
+    }
+    let short_pixels = &short_vbar_storage[short_vbar_index];
+    Ok(build_full_vbar(short_pixels, short_vbar_y_on, band_height, blue_bkg, green_bkg, red_bkg))
 }
 
 #[inline]
@@ -358,20 +372,21 @@ fn write_vbar_to_output(
     y_start: usize,
     band_height: usize,
     vbar: &[u8],
-) {
+) -> Result<(), ClearCodecError> {
     for y in 0..band_height {
         let src_base = y * 3;
         if src_base + 3 > vbar.len() {
-            break;
+            return Err(ClearCodecError::TruncatedStream);
         }
         let dst_base = ((y_start + y) * width + x) * 3;
         if dst_base + 3 > output.len() {
-            break; // destination out of bounds — stop writing
+            return Err(ClearCodecError::OutputOverflow);
         }
         output[dst_base] = vbar[src_base];
         output[dst_base + 1] = vbar[src_base + 1];
         output[dst_base + 2] = vbar[src_base + 2];
     }
+    Ok(())
 }
 
 // ── Subcodec Layer (MS-RDPEGFX §2.2.4.1.1.3) ──
@@ -407,12 +422,12 @@ fn decode_subcodecs(
         match sub_codec_id {
             0x00 => {
                 // Raw BGR
-                decode_subcodec_raw(bitmap_data, output, out_width, x_start, y_start, sc_width, sc_height);
+                decode_subcodec_raw(bitmap_data, output, out_width, x_start, y_start, sc_width, sc_height)?;
             }
             0x02 => {
                 // RLEX
                 let decoded = decode_subcodec_rlex(bitmap_data, sc_width, sc_height)?;
-                blit_bgr(&decoded, output, out_width, x_start, y_start, sc_width, sc_height);
+                blit_bgr(&decoded, output, out_width, x_start, y_start, sc_width, sc_height)?;
             }
             _ => {
                 return Err(ClearCodecError::InvalidSubCodecId(sub_codec_id));
@@ -431,22 +446,23 @@ fn decode_subcodec_raw(
     y_start: usize,
     sc_width: usize,
     sc_height: usize,
-) {
+) -> Result<(), ClearCodecError> {
     for row in 0..sc_height {
         for col in 0..sc_width {
             let src_base = (row * sc_width + col) * 3;
             if src_base + 3 > data.len() {
-                return;
+                return Err(ClearCodecError::TruncatedStream);
             }
             let dst_base = ((y_start + row) * out_width + (x_start + col)) * 3;
             if dst_base + 3 > output.len() {
-                continue;
+                return Err(ClearCodecError::OutputOverflow);
             }
             output[dst_base] = data[src_base];
             output[dst_base + 1] = data[src_base + 1];
             output[dst_base + 2] = data[src_base + 2];
         }
     }
+    Ok(())
 }
 
 fn blit_bgr(
@@ -457,22 +473,23 @@ fn blit_bgr(
     y_start: usize,
     sc_width: usize,
     sc_height: usize,
-) {
+) -> Result<(), ClearCodecError> {
     for row in 0..sc_height {
         for col in 0..sc_width {
             let src_base = (row * sc_width + col) * 3;
             if src_base + 3 > src.len() {
-                return;
+                return Err(ClearCodecError::TruncatedStream);
             }
             let dst_base = ((y_start + row) * dst_width + (x_start + col)) * 3;
             if dst_base + 3 > dst.len() {
-                continue;
+                return Err(ClearCodecError::OutputOverflow);
             }
             dst[dst_base] = src[src_base];
             dst[dst_base + 1] = src[src_base + 1];
             dst[dst_base + 2] = src[src_base + 2];
         }
     }
+    Ok(())
 }
 
 // ── RLEX Subcodec (MS-RDPEGFX §2.2.4.1.1.3.1.1) ──
@@ -527,12 +544,9 @@ fn decode_subcodec_rlex(
         }
         let start_index = stop_index - suite_depth;
 
-        // Read run length (0 is valid for RLEX — means no run, just suite)
-        let run_length = if pos < data.len() {
-            read_run_length(data, &mut pos, true)?
-        } else {
-            0
-        };
+        // Read run length (0 is valid for RLEX — means no run, just suite).
+        // Run-length field is always present (MS-RDPEGFX §2.2.4.1.1.3.1.1).
+        let run_length = read_run_length(data, &mut pos, true)?;
 
         // Emit run (repeat startIndex color)
         let run_color = &palette[start_index];

@@ -36,6 +36,8 @@ pub enum NsCodecError {
     InvalidChromaSubsamplingLevel(u8),
     /// RLE decode produced wrong output size.
     RleOutputMismatch,
+    /// Width × height overflows addressable space.
+    DimensionOverflow,
 }
 
 impl fmt::Display for NsCodecError {
@@ -46,6 +48,7 @@ impl fmt::Display for NsCodecError {
             Self::InvalidColorLossLevel(v) => write!(f, "NSCodec: invalid color loss level {v}"),
             Self::InvalidChromaSubsamplingLevel(v) => write!(f, "NSCodec: invalid chroma subsampling level {v}"),
             Self::RleOutputMismatch => write!(f, "NSCodec: RLE output size mismatch"),
+            Self::DimensionOverflow => write!(f, "NSCodec: dimension overflow"),
         }
     }
 }
@@ -118,11 +121,11 @@ fn plane_dimensions(
         let luma_w = round_up_8(width);
         let chroma_w = luma_w / 2;
         let chroma_h = round_up_2(height) / 2;
-        let expected_luma = luma_w.checked_mul(height).ok_or(NsCodecError::TruncatedStream)?;
-        let expected_chroma = chroma_w.checked_mul(chroma_h).ok_or(NsCodecError::TruncatedStream)?;
+        let expected_luma = luma_w.checked_mul(height).ok_or(NsCodecError::DimensionOverflow)?;
+        let expected_chroma = chroma_w.checked_mul(chroma_h).ok_or(NsCodecError::DimensionOverflow)?;
         Ok((luma_w, height, chroma_w, chroma_h, expected_luma, expected_chroma))
     } else {
-        let expected = width.checked_mul(height).ok_or(NsCodecError::TruncatedStream)?;
+        let expected = width.checked_mul(height).ok_or(NsCodecError::DimensionOverflow)?;
         Ok((width, height, width, height, expected, expected))
     }
 }
@@ -174,8 +177,9 @@ fn decode_plane_rle(src: &[u8], expected_size: usize) -> Result<Vec<u8>, NsCodec
                 pos += 3;
             }
 
-            // Guard: reject runs that would exceed the expected plane size
-            if output.len() + run_length > expected_size {
+            // Guard: reject runs that would exceed the expected plane size.
+            // Use checked_add to prevent wrapping on 32-bit targets.
+            if output.len().checked_add(run_length).map_or(true, |s| s > expected_size) {
                 return Err(NsCodecError::RleOutputMismatch);
             }
             let new_len = output.len() + run_length;
@@ -263,8 +267,8 @@ impl NsCodecDecompressor {
     ) -> Result<(), NsCodecError> {
         let w = width as usize;
         let h = height as usize;
-        let pixel_count = w.checked_mul(h).ok_or(NsCodecError::TruncatedStream)?;
-        let total_output = pixel_count.checked_mul(4).ok_or(NsCodecError::TruncatedStream)?;
+        let pixel_count = w.checked_mul(h).ok_or(NsCodecError::DimensionOverflow)?;
+        let total_output = pixel_count.checked_mul(4).ok_or(NsCodecError::DimensionOverflow)?;
 
         if pixel_count == 0 {
             dst.clear();
@@ -360,9 +364,11 @@ impl NsCodecDecompressor {
                 let a = alpha_plane[pixel_idx];
 
                 // AYCoCg → RGB (MS-RDPNSC §3.1.8.2.1)
-                let r = clamp_u8(y + (co >> 1) - (cg >> 1));
-                let g = clamp_u8(y + (cg >> 1));
-                let b = clamp_u8(y - (co >> 1) - (cg >> 1));
+                // After color loss recovery (<<cll), the inverse transform is:
+                // R = Y + Co - Cg, G = Y + Cg, B = Y - Co - Cg
+                let r = clamp_u8(y + co - cg);
+                let g = clamp_u8(y + cg);
+                let b = clamp_u8(y - co - cg);
 
                 let base = pixel_idx * 4;
                 dst[base] = b;
@@ -682,7 +688,7 @@ mod tests {
         // 2×1, CLL=1, no subsampling
         // Pixel 0: Y=128, Co=0x10 (i8=16), Cg=0x20 (i8=32)
         //   co_recovered = 16 << 1 = 32, cg_recovered = 32 << 1 = 64
-        //   R = clamp(128 + 16 - 32) = 112, G = clamp(128 + 32) = 160, B = clamp(128 - 16 - 32) = 80
+        //   R = clamp(128 + 32 - 64) = 96, G = clamp(128 + 64) = 192, B = clamp(128 - 32 - 64) = 32
         // Pixel 1: Y=200, Co=0, Cg=0 → gray 200
         let mut src = Vec::new();
         src.extend_from_slice(&2u32.to_le_bytes());
@@ -695,9 +701,9 @@ mod tests {
         src.extend_from_slice(&[0x20, 0x00]);    // Cg
 
         let result = run_decompress(&src, 2, 1).unwrap();
-        assert_eq!(result[0], 80);   // pixel0 B
-        assert_eq!(result[1], 160);  // pixel0 G
-        assert_eq!(result[2], 112);  // pixel0 R
+        assert_eq!(result[0], 32);   // pixel0 B = 128 - 32 - 64
+        assert_eq!(result[1], 192);  // pixel0 G = 128 + 64
+        assert_eq!(result[2], 96);   // pixel0 R = 128 + 32 - 64
         assert_eq!(result[3], 0xFF);
         assert_eq!(result[4], 200);  // pixel1 B
         assert_eq!(result[5], 200);  // pixel1 G
@@ -754,7 +760,7 @@ mod tests {
     #[test]
     fn decode_cll7_saturation() {
         // 1×1, CLL=7. Co=1 (i8) → 1<<7=128, Cg=1 → 128
-        // Y=200: R=200+64-64=200, G=200+64=264→255, B=200-64-64=72
+        // Y=200: R=200+128-128=200, G=200+128=328→255, B=200-128-128=-56→0
         let mut src = Vec::new();
         src.extend_from_slice(&1u32.to_le_bytes());
         src.extend_from_slice(&1u32.to_le_bytes());
@@ -764,9 +770,9 @@ mod tests {
         src.push(200); src.push(0x01); src.push(0x01);
 
         let result = run_decompress(&src, 1, 1).unwrap();
-        assert_eq!(result[0], 72);   // B
-        assert_eq!(result[1], 255);  // G (saturated)
-        assert_eq!(result[2], 200);  // R
+        assert_eq!(result[0], 0);    // B (clamped from -56)
+        assert_eq!(result[1], 255);  // G (saturated from 328)
+        assert_eq!(result[2], 200);  // R = 200+128-128
     }
 
     #[test]

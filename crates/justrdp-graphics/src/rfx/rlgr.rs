@@ -293,7 +293,7 @@ impl RlgrDecoder {
         // Count leading 0-bits (terminated by a 1-bit).
         // Bound vk to prevent overflow on `vk << kr` with malformed streams.
         // With kr max = 10, vk must be < 2^(32-10) = 4M to avoid shift overflow.
-        // MAX_GR_LEADING_ZEROS (32) is a conservative safety limit.
+        // MAX_GR_LEADING_ZEROS = 2^22 - 1 = 4_194_303, well beyond any legitimate value.
         let mut vk: u32 = 0;
         while reader.bits_remaining() > 0 && vk < MAX_GR_LEADING_ZEROS {
             let bit = reader.read_bit();
@@ -306,8 +306,8 @@ impl RlgrDecoder {
 
         // Read kr bits as remainder
         let remainder = reader.read_bits(kr);
-        // vk is capped at MAX_GR_LEADING_ZEROS (32) and kr <= 10.
-        // For vk < 22 and kr <= 10: vk << kr fits u32. For larger vk (malformed stream),
+        // vk is capped at MAX_GR_LEADING_ZEROS (4_194_303) and kr <= 10.
+        // For vk < 2^22 and kr <= 10: vk << kr fits u32. For larger vk (malformed stream),
         // use checked_shl to saturate instead of wrapping.
         let mag = match vk.checked_shl(kr) {
             Some(shifted) => shifted | remainder,
