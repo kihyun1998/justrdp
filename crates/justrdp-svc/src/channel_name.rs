@@ -33,8 +33,28 @@ impl ChannelName {
     }
 
     /// Create from an 8-byte wire representation.
-    pub fn from_wire(bytes: [u8; 8]) -> Self {
-        Self { bytes }
+    ///
+    /// Returns `None` if the name contains non-ASCII bytes or has
+    /// non-zero bytes after the null terminator
+    /// (MS-RDPBCGR 2.2.1.3.4.1: CHANNEL_DEF::name is a null-terminated ANSI string).
+    pub fn from_wire(bytes: [u8; 8]) -> Option<Self> {
+        let mut past_null = false;
+        for &b in &bytes {
+            if past_null {
+                if b != 0 {
+                    return None;
+                }
+            } else if b == 0 {
+                past_null = true;
+            } else if !b.is_ascii() {
+                return None;
+            }
+        }
+        // Must contain at least one null terminator (max 7 significant chars).
+        if !past_null {
+            return None;
+        }
+        Some(Self { bytes })
     }
 
     /// Get the wire representation.
@@ -43,10 +63,12 @@ impl ChannelName {
     }
 
     /// Get the name as a string slice (without null padding).
+    ///
+    /// ASCII-only content is guaranteed by both `new()` and `from_wire()`.
     pub fn as_str(&self) -> &str {
         let len = self.bytes.iter().position(|&b| b == 0).unwrap_or(8);
-        // Safety: constructor ensures ASCII-only content.
-        core::str::from_utf8(&self.bytes[..len]).unwrap_or("")
+        core::str::from_utf8(&self.bytes[..len])
+            .expect("ChannelName invariant: content is always valid ASCII")
     }
 }
 
@@ -97,8 +119,26 @@ mod tests {
 
     #[test]
     fn channel_name_from_wire() {
-        let name = ChannelName::from_wire(*b"rdpdr\0\0\0");
+        let name = ChannelName::from_wire(*b"rdpdr\0\0\0").unwrap();
         assert_eq!(name, RDPDR);
+    }
+
+    #[test]
+    fn channel_name_from_wire_non_ascii_rejected() {
+        assert!(ChannelName::from_wire([0xFF, 0x80, 0, 0, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn channel_name_from_wire_garbage_after_null_rejected() {
+        // Bytes after null terminator must also be null.
+        assert!(ChannelName::from_wire([b'a', 0, 0xFF, 0, 0, 0, 0, 0]).is_none());
+        assert!(ChannelName::from_wire([b'a', b'b', 0, 0, 0, 1, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn channel_name_from_wire_no_null_terminator_rejected() {
+        // All 8 bytes non-null — no room for null terminator.
+        assert!(ChannelName::from_wire(*b"abcdefgh").is_none());
     }
 
     #[test]

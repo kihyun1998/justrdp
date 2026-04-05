@@ -17,21 +17,23 @@ use justrdp_pdu::rdp::svc::{
 use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
 
-use crate::SvcResult;
+use crate::{SvcError, SvcResult};
+
+fn frame_size_overflow() -> SvcError {
+    SvcError::Protocol(alloc::string::String::from("frame size overflow"))
+}
 
 /// Chunk a message and produce wire-ready frames.
 ///
 /// Each frame is a complete TPKT + X.224 DT + MCS SendDataRequest + ChannelPduHeader + chunk_data.
 ///
-/// `initiator` is the client's MCS user channel ID.
-/// `channel_id` is the MCS channel ID for this virtual channel.
-/// `payload` is the complete uncompressed message data.
-/// `chunk_size` is the maximum chunk data size (default: [`CHANNEL_CHUNK_LENGTH`]).
-/// Chunk a message and produce wire-ready frames.
-///
-/// `show_protocol` forces `CHANNEL_FLAG_SHOW_PROTOCOL` on every chunk
-/// (required when `CHANNEL_OPTION_SHOW_PROTOCOL` is set for this channel,
-/// and always required for multi-chunk messages per MS-RDPBCGR 3.1.5.2.1).
+/// - `initiator`: the client's MCS user channel ID.
+/// - `channel_id`: the MCS channel ID for this virtual channel.
+/// - `payload`: the complete uncompressed message data.
+/// - `chunk_size`: maximum chunk data size (default: [`CHANNEL_CHUNK_LENGTH`]).
+/// - `show_protocol`: forces `CHANNEL_FLAG_SHOW_PROTOCOL` on every chunk
+///   (required when `CHANNEL_OPTION_SHOW_PROTOCOL` is set for this channel,
+///   and always required for multi-chunk messages per MS-RDPBCGR 3.1.5.2.1).
 pub fn chunk_and_encode(
     initiator: u16,
     channel_id: u16,
@@ -45,7 +47,9 @@ pub fn chunk_and_encode(
         chunk_size
     };
 
-    let total_length = payload.len() as u32;
+    let total_length = u32::try_from(payload.len()).map_err(|_| {
+        crate::SvcError::Protocol(alloc::format!("payload too large: {} bytes", payload.len()))
+    })?;
 
     if payload.is_empty() {
         let mut flags = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST;
@@ -56,11 +60,10 @@ pub fn chunk_and_encode(
         return Ok(vec![frame]);
     }
 
-    let chunks: Vec<&[u8]> = payload.chunks(chunk_size).collect();
-    let num_chunks = chunks.len();
+    let num_chunks = (payload.len() + chunk_size - 1) / chunk_size;
     let mut frames = Vec::with_capacity(num_chunks);
 
-    for (i, chunk_data) in chunks.iter().enumerate() {
+    for (i, chunk_data) in payload.chunks(chunk_size).enumerate() {
         let mut flags = 0u32;
         if i == 0 {
             flags |= CHANNEL_FLAG_FIRST;
@@ -101,7 +104,9 @@ fn encode_chunk_frame(
     };
 
     // MCS user data = ChannelPduHeader + chunk_data
-    let mcs_user_data_len = CHANNEL_PDU_HEADER_SIZE + chunk_data.len();
+    let mcs_user_data_len = CHANNEL_PDU_HEADER_SIZE
+        .checked_add(chunk_data.len())
+        .ok_or_else(frame_size_overflow)?;
     let mut mcs_user_data = vec![0u8; mcs_user_data_len];
     {
         let mut cursor = WriteCursor::new(&mut mcs_user_data);
@@ -116,8 +121,12 @@ fn encode_chunk_frame(
         user_data: &mcs_user_data,
     };
 
-    let mcs_size = DATA_TRANSFER_HEADER_SIZE + sdr.size();
-    let total_size = TPKT_HEADER_SIZE + mcs_size;
+    let mcs_size = DATA_TRANSFER_HEADER_SIZE
+        .checked_add(sdr.size())
+        .ok_or_else(frame_size_overflow)?;
+    let total_size = TPKT_HEADER_SIZE
+        .checked_add(mcs_size)
+        .ok_or_else(frame_size_overflow)?;
 
     let mut frame = vec![0u8; total_size];
     let mut cursor = WriteCursor::new(&mut frame);

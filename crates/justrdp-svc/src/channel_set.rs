@@ -8,7 +8,8 @@ use alloc::vec::Vec;
 
 use justrdp_core::{Decode, ReadCursor};
 use justrdp_pdu::rdp::svc::{
-    ChannelPduHeader, CHANNEL_CHUNK_LENGTH, CHANNEL_FLAG_SUSPEND, CHANNEL_FLAG_RESUME,
+    ChannelPduHeader, CHANNEL_CHUNK_LENGTH, CHANNEL_FLAG_FIRST, CHANNEL_FLAG_LAST,
+    CHANNEL_FLAG_SUSPEND, CHANNEL_FLAG_RESUME, CHANNEL_PDU_HEADER_SIZE,
 };
 
 use crate::chunk;
@@ -18,12 +19,17 @@ use crate::{ChannelName, SvcError, SvcMessage, SvcProcessor, SvcResult};
 /// Maximum number of static virtual channels (MS-RDPBCGR 2.2.1.3.4).
 const MAX_CHANNELS: usize = 31;
 
+/// Maximum chunk size (MS-RDPBCGR 2.2.7.1.10: VCCHUNKSIZE max = 16,776,960).
+const MAX_CHUNK_SIZE: usize = 16_776_960;
+
 /// A registered channel with its processor and dechunking state.
 struct ChannelEntry {
     processor: Box<dyn SvcProcessor>,
     dechunker: Dechunker,
-    /// Assigned MCS channel ID (0 if not yet assigned).
-    mcs_channel_id: u16,
+    /// Assigned MCS channel ID (`None` if not yet assigned).
+    mcs_channel_id: Option<u16>,
+    /// Whether CHANNEL_OPTION_SHOW_PROTOCOL is set for this channel.
+    show_protocol: bool,
 }
 
 /// Collection of static virtual channel processors.
@@ -52,18 +58,23 @@ impl StaticChannelSet {
     ///
     /// Use the `VCChunkSize` from the server's VirtualChannelCapability.
     /// If not called, defaults to [`CHANNEL_CHUNK_LENGTH`] (1600).
+    /// Zero is treated as the default; values above [`MAX_CHUNK_SIZE`] are clamped.
     pub fn set_chunk_size(&mut self, size: usize) {
-        self.chunk_size = size;
+        self.chunk_size = match size {
+            0 => CHANNEL_CHUNK_LENGTH,
+            s if s > MAX_CHUNK_SIZE => MAX_CHUNK_SIZE,
+            s => s,
+        };
     }
 
     /// Register a channel processor.
     ///
-    /// Returns an error if the maximum number of channels (31) is exceeded
+    /// Returns an error if the maximum number of channels is exceeded
     /// or a channel with the same name already exists.
     pub fn insert(&mut self, processor: Box<dyn SvcProcessor>) -> SvcResult<()> {
         if self.entries.len() >= MAX_CHANNELS {
-            return Err(SvcError::Protocol(String::from(
-                "maximum 31 static virtual channels",
+            return Err(SvcError::Protocol(alloc::format!(
+                "maximum {MAX_CHANNELS} static virtual channels",
             )));
         }
         let name = processor.channel_name();
@@ -75,7 +86,8 @@ impl StaticChannelSet {
         self.entries.push(ChannelEntry {
             processor,
             dechunker: Dechunker::new(),
-            mcs_channel_id: 0,
+            mcs_channel_id: None,
+            show_protocol: false,
         });
         Ok(())
     }
@@ -85,12 +97,22 @@ impl StaticChannelSet {
     /// `channel_ids` is the `ConnectionResult::channel_ids` mapping
     /// (channel_name, mcs_channel_id). Channels not present in the
     /// mapping will not be assigned an ID and will be ignored.
+    ///
+    /// Note: channel options (e.g., `CHANNEL_OPTION_SHOW_PROTOCOL`) must be
+    /// configured separately via [`set_show_protocol`](Self::set_show_protocol).
     pub fn assign_ids(&mut self, channel_ids: &[(String, u16)]) {
         for entry in &mut self.entries {
             let name = entry.processor.channel_name();
             if let Some((_, id)) = channel_ids.iter().find(|(n, _)| n.as_str() == name.as_str()) {
-                entry.mcs_channel_id = *id;
+                entry.mcs_channel_id = Some(*id);
             }
+        }
+    }
+
+    /// Set `CHANNEL_OPTION_SHOW_PROTOCOL` for a channel by name.
+    pub fn set_show_protocol(&mut self, name: ChannelName, show: bool) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.processor.channel_name() == name) {
+            entry.show_protocol = show;
         }
     }
 
@@ -105,17 +127,17 @@ impl StaticChannelSet {
     pub fn start_all(&mut self, user_channel_id: u16) -> SvcResult<Vec<(u16, Vec<Vec<u8>>)>> {
         let mut results = Vec::new();
         for entry in &mut self.entries {
-            if entry.mcs_channel_id == 0 {
+            let Some(channel_id) = entry.mcs_channel_id else {
                 continue; // not assigned
-            }
+            };
             let messages = entry.processor.start()?;
             if !messages.is_empty() {
-                let channel_id = entry.mcs_channel_id;
                 let frames = encode_messages(
                     user_channel_id,
                     channel_id,
                     &messages,
                     self.chunk_size,
+                    entry.show_protocol,
                 )?;
                 results.push((channel_id, frames));
             }
@@ -134,7 +156,7 @@ impl StaticChannelSet {
         user_channel_id: u16,
     ) -> SvcResult<Vec<Vec<u8>>> {
         // Decode ChannelPduHeader.
-        if raw_data.len() < 8 {
+        if raw_data.len() < CHANNEL_PDU_HEADER_SIZE {
             return Err(SvcError::Protocol(String::from(
                 "channel data too short for ChannelPduHeader",
             )));
@@ -143,12 +165,29 @@ impl StaticChannelSet {
         let hdr = ChannelPduHeader::decode(&mut src)?;
         let chunk_data = src.peek_remaining();
 
-        // Handle SUSPEND/RESUME (affects all channels).
+        // Find the channel entry index — only process data from known channels.
+        let entry_idx = match self.entries.iter().position(|e| e.mcs_channel_id == Some(channel_id)) {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()), // unknown channel, ignore
+        };
+
+        // Handle SUSPEND/RESUME (affects all channels, MS-RDPBCGR 2.2.6.1).
+        // SUSPEND/RESUME PDUs carry no data and must not set FIRST or LAST.
         if hdr.flags & CHANNEL_FLAG_SUSPEND != 0 {
+            if hdr.flags & (CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST) != 0 {
+                return Err(SvcError::Protocol(String::from(
+                    "SUSPEND combined with FIRST/LAST is invalid",
+                )));
+            }
             self.suspended = true;
             return Ok(Vec::new());
         }
         if hdr.flags & CHANNEL_FLAG_RESUME != 0 {
+            if hdr.flags & (CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST) != 0 {
+                return Err(SvcError::Protocol(String::from(
+                    "RESUME combined with FIRST/LAST is invalid",
+                )));
+            }
             self.suspended = false;
             return Ok(Vec::new());
         }
@@ -157,15 +196,7 @@ impl StaticChannelSet {
             return Ok(Vec::new());
         }
 
-        // Find the channel entry.
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|e| e.mcs_channel_id == channel_id);
-        let entry = match entry {
-            Some(e) => e,
-            None => return Ok(Vec::new()), // unknown channel, ignore
-        };
+        let entry = &mut self.entries[entry_idx];
 
         // Feed chunk to dechunker.
         let complete = entry.dechunker.process_chunk(hdr.length, hdr.flags, chunk_data)?;
@@ -176,7 +207,8 @@ impl StaticChannelSet {
             if responses.is_empty() {
                 return Ok(Vec::new());
             }
-            encode_messages(user_channel_id, channel_id, &responses, self.chunk_size)
+            let show_protocol = entry.show_protocol;
+            encode_messages(user_channel_id, channel_id, &responses, self.chunk_size, show_protocol)
         } else {
             Ok(Vec::new())
         }
@@ -189,14 +221,19 @@ impl StaticChannelSet {
         channel_id: u16,
         message: &SvcMessage,
     ) -> SvcResult<Vec<Vec<u8>>> {
-        chunk::chunk_and_encode(user_channel_id, channel_id, &message.data, self.chunk_size, false)
+        let show_protocol = self
+            .entries
+            .iter()
+            .find(|e| e.mcs_channel_id == Some(channel_id))
+            .map_or(false, |e| e.show_protocol);
+        chunk::chunk_and_encode(user_channel_id, channel_id, &message.data, self.chunk_size, show_protocol)
     }
 
     /// Get a reference to a processor by MCS channel ID.
     pub fn get_by_channel_id(&self, channel_id: u16) -> Option<&dyn SvcProcessor> {
         self.entries
             .iter()
-            .find(|e| e.mcs_channel_id == channel_id)
+            .find(|e| e.mcs_channel_id == Some(channel_id))
             .map(|e| &*e.processor)
     }
 
@@ -204,7 +241,7 @@ impl StaticChannelSet {
     pub fn get_by_channel_id_mut(&mut self, channel_id: u16) -> Option<&mut dyn SvcProcessor> {
         self.entries
             .iter_mut()
-            .find(|e| e.mcs_channel_id == channel_id)
+            .find(|e| e.mcs_channel_id == Some(channel_id))
             .map(|e| &mut *e.processor)
     }
 
@@ -220,8 +257,8 @@ impl StaticChannelSet {
     pub fn channel_id_for_name(&self, name: ChannelName) -> Option<u16> {
         self.entries
             .iter()
-            .find(|e| e.processor.channel_name() == name && e.mcs_channel_id != 0)
-            .map(|e| e.mcs_channel_id)
+            .find(|e| e.processor.channel_name() == name)
+            .and_then(|e| e.mcs_channel_id)
     }
 
     /// Number of registered channels.
@@ -264,10 +301,11 @@ fn encode_messages(
     channel_id: u16,
     messages: &[SvcMessage],
     chunk_size: usize,
+    show_protocol: bool,
 ) -> SvcResult<Vec<Vec<u8>>> {
     let mut all_frames = Vec::new();
     for msg in messages {
-        let frames = chunk::chunk_and_encode(user_channel_id, channel_id, &msg.data, chunk_size, false)?;
+        let frames = chunk::chunk_and_encode(user_channel_id, channel_id, &msg.data, chunk_size, show_protocol)?;
         all_frames.extend(frames);
     }
     Ok(all_frames)
@@ -310,7 +348,7 @@ mod tests {
     }
 
     fn make_channel_data(total_length: u32, flags: u32, data: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + data.len());
+        let mut buf = Vec::with_capacity(CHANNEL_PDU_HEADER_SIZE + data.len());
         buf.extend_from_slice(&total_length.to_le_bytes());
         buf.extend_from_slice(&flags.to_le_bytes());
         buf.extend_from_slice(data);
@@ -451,5 +489,77 @@ mod tests {
         let frames = set.process_incoming(1004, &raw2, 1007).unwrap();
         // Should echo back "AAABBB"
         assert!(!frames.is_empty());
+    }
+
+    #[test]
+    fn start_all_collects_initial_messages() {
+        let mut set = StaticChannelSet::new();
+        set.insert(Box::new(EchoProcessor {
+            name: ChannelName::new(b"echo"),
+        }))
+        .unwrap();
+        set.assign_ids(&[(String::from("echo"), 1004)]);
+
+        let results = set.start_all(1007).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1004);
+        assert!(!results[0].1.is_empty()); // should have frames for "init" message
+    }
+
+    #[test]
+    fn start_all_skips_unassigned() {
+        let mut set = StaticChannelSet::new();
+        set.insert(Box::new(EchoProcessor {
+            name: ChannelName::new(b"noid"),
+        }))
+        .unwrap();
+        // Don't assign any IDs.
+        let results = set.start_all(1007).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn set_chunk_size_zero_defaults() {
+        let mut set = StaticChannelSet::new();
+        set.set_chunk_size(0);
+        assert_eq!(set.chunk_size, CHANNEL_CHUNK_LENGTH);
+    }
+
+    #[test]
+    fn set_chunk_size_clamped_to_max() {
+        let mut set = StaticChannelSet::new();
+        set.set_chunk_size(usize::MAX);
+        assert_eq!(set.chunk_size, MAX_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn show_protocol_propagated_to_encode() {
+        use justrdp_core::{Decode, ReadCursor};
+        use justrdp_pdu::mcs::SendDataRequest;
+        use justrdp_pdu::rdp::svc::CHANNEL_FLAG_SHOW_PROTOCOL;
+        use justrdp_pdu::tpkt::TpktHeader;
+        use justrdp_pdu::x224::DataTransfer;
+
+        let mut set = StaticChannelSet::new();
+        set.insert(Box::new(EchoProcessor {
+            name: ChannelName::new(b"show"),
+        }))
+        .unwrap();
+        set.assign_ids(&[(String::from("show"), 1004)]);
+        set.set_show_protocol(ChannelName::new(b"show"), true);
+
+        // Single-chunk encode_message should set SHOW_PROTOCOL.
+        let msg = crate::SvcMessage::new(b"test".to_vec());
+        let frames = set.encode_message(1007, 1004, &msg).unwrap();
+        assert_eq!(frames.len(), 1);
+
+        let frame = &frames[0];
+        let mut src = ReadCursor::new(frame);
+        TpktHeader::decode(&mut src).unwrap();
+        DataTransfer::decode(&mut src).unwrap();
+        let sdr = SendDataRequest::decode(&mut src).unwrap();
+        let mut ud_src = ReadCursor::new(sdr.user_data);
+        let ch_hdr = ChannelPduHeader::decode(&mut ud_src).unwrap();
+        assert!(ch_hdr.flags & CHANNEL_FLAG_SHOW_PROTOCOL != 0);
     }
 }

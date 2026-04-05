@@ -14,6 +14,10 @@ use crate::{SvcError, SvcResult};
 /// Maximum reassembly buffer size (64 MiB safety cap).
 const MAX_REASSEMBLY_SIZE: u32 = 64 * 1024 * 1024;
 
+/// Initial reservation cap for multi-chunk reassembly (64 KiB).
+/// Prevents memory amplification from adversarial FIRST PDUs declaring large total_length.
+const INITIAL_REASSEMBLY_RESERVE: usize = 64 * 1024;
+
 /// Per-channel dechunking state machine.
 #[derive(Debug)]
 pub(crate) struct Dechunker {
@@ -60,12 +64,33 @@ impl Dechunker {
 
             if is_last {
                 // Single-chunk message: FIRST + LAST.
+                let chunk_len = u32::try_from(chunk_data.len()).map_err(|_| {
+                    SvcError::Protocol(alloc::format!(
+                        "chunk data too large: {} bytes",
+                        chunk_data.len()
+                    ))
+                })?;
+                if chunk_len != total_length {
+                    return Err(SvcError::Protocol(alloc::format!(
+                        "single-chunk size mismatch: expected {}, got {}",
+                        total_length,
+                        chunk_data.len()
+                    )));
+                }
                 self.assembling = false;
                 return Ok(Some(chunk_data.to_vec()));
             }
 
             // Multi-chunk: start assembling.
-            self.buffer.reserve(total_length as usize);
+            // Validate first chunk data doesn't exceed declared total.
+            if chunk_data.len() > total_length as usize {
+                return Err(SvcError::Protocol(alloc::format!(
+                    "first chunk data ({}) exceeds declared total_length ({})",
+                    chunk_data.len(),
+                    total_length
+                )));
+            }
+            self.buffer.reserve(core::cmp::min(total_length as usize, INITIAL_REASSEMBLY_RESERVE));
             self.buffer.extend_from_slice(chunk_data);
             self.assembling = true;
             Ok(None)
@@ -75,20 +100,44 @@ impl Dechunker {
                 // LAST without prior FIRST -- protocol violation; discard.
                 return Ok(None);
             }
+            let new_len = self.buffer.len().checked_add(chunk_data.len()).ok_or_else(|| {
+                SvcError::Protocol(alloc::string::String::from("chunk length overflow"))
+            })?;
+            if new_len > self.total_length as usize {
+                self.reset();
+                return Err(SvcError::Protocol(alloc::format!(
+                    "channel data exceeds declared total_length: {} > {}",
+                    new_len,
+                    self.total_length
+                )));
+            }
             self.buffer.extend_from_slice(chunk_data);
             self.assembling = false;
             let assembled = core::mem::take(&mut self.buffer);
+            let expected = self.total_length;
             // Validate total assembled length matches the declared total.
-            if assembled.len() != self.total_length as usize {
+            if assembled.len() != expected as usize {
+                self.total_length = 0;
                 return Err(SvcError::Protocol(alloc::format!(
                     "channel reassembly size mismatch: expected {}, got {}",
-                    self.total_length,
+                    expected,
                     assembled.len()
                 )));
             }
             Ok(Some(assembled))
         } else if self.assembling {
-            // Intermediate chunk.
+            // Intermediate chunk -- enforce total_length bound.
+            let new_len = self.buffer.len().checked_add(chunk_data.len()).ok_or_else(|| {
+                SvcError::Protocol(alloc::string::String::from("chunk length overflow"))
+            })?;
+            if new_len > self.total_length as usize {
+                self.reset();
+                return Err(SvcError::Protocol(alloc::format!(
+                    "channel data exceeds declared total_length: {} > {}",
+                    new_len,
+                    self.total_length
+                )));
+            }
             self.buffer.extend_from_slice(chunk_data);
             Ok(None)
         } else {
@@ -189,5 +238,32 @@ mod tests {
         let mut d = Dechunker::new();
         let r = d.process_chunk(5, CHANNEL_FLAG_LAST, b"alone").unwrap();
         assert_eq!(r, None);
+    }
+
+    #[test]
+    fn single_chunk_length_mismatch_rejected() {
+        let mut d = Dechunker::new();
+        // total_length says 100 but only 3 bytes of data.
+        let result = d.process_chunk(100, CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST, b"abc");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn multi_chunk_length_mismatch_rejected() {
+        let mut d = Dechunker::new();
+        // Declare total_length = 10, but send only 6 bytes total.
+        d.process_chunk(10, CHANNEL_FLAG_FIRST, b"AAA").unwrap();
+        let result = d.process_chunk(10, CHANNEL_FLAG_LAST, b"BBB");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn intermediate_chunk_exceeds_total_length_rejected() {
+        let mut d = Dechunker::new();
+        // Declare total_length = 6, then try to exceed it with intermediate chunks.
+        d.process_chunk(6, CHANNEL_FLAG_FIRST, b"AAA").unwrap();
+        // This intermediate chunk would make buffer 7 bytes, exceeding total_length of 6.
+        let result = d.process_chunk(6, 0, b"BBBB");
+        assert!(result.is_err());
     }
 }
