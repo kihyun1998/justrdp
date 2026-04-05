@@ -62,7 +62,7 @@ pub(crate) mod rustls_verifier {
                 SignatureScheme::RSA_PSS_SHA384,
                 SignatureScheme::RSA_PSS_SHA512,
                 SignatureScheme::ED25519,
-                SignatureScheme::RSA_PKCS1_SHA1,
+                SignatureScheme::ED448,
             ]
         }
     }

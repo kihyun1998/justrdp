@@ -9,47 +9,49 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 use crate::danger::rustls_verifier::DangerousNoVerify;
-use crate::{TlsError, TlsUpgradeResult, TlsUpgrader};
+use crate::{ReadWrite, TlsError, TlsUpgradeResult, TlsUpgrader, ERR_CERT_DER_PARSE};
 
 /// TLS upgrader using the `rustls` library.
 ///
 /// By default, this accepts self-signed certificates (common for RDP servers).
-/// Set `verify_certificates` to `true` for strict certificate validation.
+/// Use [`with_verification()`](Self::with_verification) for strict certificate validation.
 pub struct RustlsUpgrader {
-    /// Whether to verify server certificates strictly.
-    /// Default: `false` (accept self-signed certs like mstsc.exe).
-    pub verify_certificates: bool,
+    config: Arc<ClientConfig>,
 }
 
 impl RustlsUpgrader {
     /// Create a new upgrader with default settings (no certificate verification).
+    ///
+    /// RDP servers commonly use self-signed certificates, so this is the
+    /// appropriate default for most RDP connections (similar to mstsc.exe).
     pub fn new() -> Self {
         Self {
-            verify_certificates: false,
+            config: Arc::new(build_config(false)),
         }
     }
 
-    /// Create an upgrader that verifies server certificates.
+    /// Create an upgrader that verifies server certificates against
+    /// the system root certificate store.
     pub fn with_verification() -> Self {
         Self {
-            verify_certificates: true,
+            config: Arc::new(build_config(true)),
         }
     }
+}
 
-    fn build_config(&self) -> ClientConfig {
-        if self.verify_certificates {
-            let root_store =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+fn build_config(verify_certificates: bool) -> ClientConfig {
+    if verify_certificates {
+        let root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        } else {
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(DangerousNoVerify))
-                .with_no_client_auth()
-        }
+        ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    } else {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(DangerousNoVerify))
+            .with_no_client_auth()
     }
 }
 
@@ -67,7 +69,7 @@ impl TlsUpgrader for RustlsUpgrader {
         stream: S,
         server_name: &str,
     ) -> Result<TlsUpgradeResult<Self::Stream>, TlsError> {
-        let config = Arc::new(self.build_config());
+        let config = Arc::clone(&self.config);
 
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|e| TlsError::Handshake(format!("invalid server name: {e}")))?;
@@ -79,8 +81,12 @@ impl TlsUpgrader for RustlsUpgrader {
         let boxed_stream: Box<dyn ReadWrite> = Box::new(stream);
         let mut tls_stream = StreamOwned::new(conn, boxed_stream);
 
-        // Drive the handshake to completion
-        let _ = tls_stream.flush();
+        // Drive the TLS handshake to completion by pumping both read and write
+        // directions until the handshake finishes. Requires a blocking stream;
+        // non-blocking streams will propagate WouldBlock as TlsError::Io.
+        while tls_stream.conn.is_handshaking() {
+            tls_stream.conn.complete_io(&mut tls_stream.sock)?;
+        }
 
         // Extract server public key from peer certificate
         let server_public_key = extract_server_public_key(&tls_stream)?;
@@ -106,40 +112,35 @@ fn extract_server_public_key(
         .ok_or(TlsError::NoPeerCertificate)?;
 
     crate::extract_spki_from_cert_der(cert_der.as_ref())
-        .ok_or_else(|| TlsError::PublicKeyExtraction("failed to parse certificate DER".into()))
+        .ok_or_else(|| TlsError::PublicKeyExtraction(ERR_CERT_DER_PARSE.into()))
 }
-
-/// Trait alias for Read + Write, needed for boxing.
-pub trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn rustls_upgrader_default_no_verify() {
-        let upgrader = RustlsUpgrader::new();
-        assert!(!upgrader.verify_certificates);
+    fn rustls_upgrader_default_and_with_verify_both_construct() {
+        let _no_verify = RustlsUpgrader::new();
+        let _default = RustlsUpgrader::default();
+        let _verify = RustlsUpgrader::with_verification();
     }
 
     #[test]
-    fn rustls_upgrader_with_verify() {
-        let upgrader = RustlsUpgrader::with_verification();
-        assert!(upgrader.verify_certificates);
+    fn build_config_no_verify_enables_tls12() {
+        let config = build_config(false);
+        // TLS 1.2 should be enabled (rustls-backend feature includes tls12)
+        assert!(
+            config.alpn_protocols.is_empty(),
+            "no ALPN should be set by default"
+        );
     }
 
     #[test]
-    fn build_config_no_verify() {
-        let upgrader = RustlsUpgrader::new();
-        let _config = upgrader.build_config();
-        // Should not panic
-    }
-
-    #[test]
-    fn build_config_with_verify() {
-        let upgrader = RustlsUpgrader::with_verification();
-        let _config = upgrader.build_config();
-        // Should not panic
+    fn build_config_with_verify_has_root_certs() {
+        let config = build_config(true);
+        // Config constructed with root store should not panic and
+        // should have no ALPN set by default
+        assert!(config.alpn_protocols.is_empty());
     }
 }

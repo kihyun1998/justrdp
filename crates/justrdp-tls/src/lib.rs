@@ -74,8 +74,11 @@ pub trait TlsUpgrader {
     /// Perform TLS handshake and upgrade the given stream.
     ///
     /// `server_name` is used for SNI (Server Name Indication).
+    /// The provided stream **must be in blocking mode**. Non-blocking streams
+    /// are not supported and will result in an error.
+    ///
     /// RDP servers commonly use self-signed certificates, so implementations
-    /// should provide an option to skip certificate verification.
+    /// may provide an option to skip certificate verification.
     fn upgrade<S: Read + Write + 'static>(
         &self,
         stream: S,
@@ -83,12 +86,20 @@ pub trait TlsUpgrader {
     ) -> Result<TlsUpgradeResult<Self::Stream>, TlsError>;
 }
 
+/// Trait alias combining [`Read`] and [`Write`], used to box transport streams.
+pub trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
 // Re-export backend types
 #[cfg(feature = "rustls-backend")]
 pub use rustls_backend::RustlsUpgrader;
 
 #[cfg(feature = "native-tls-backend")]
 pub use native_tls_backend::NativeTlsUpgrader;
+
+// ── Shared constants ──
+
+pub(crate) const ERR_CERT_DER_PARSE: &str = "failed to parse certificate DER";
 
 // ── Shared X.509 DER parsing ──
 
@@ -173,6 +184,9 @@ pub fn extract_subject_public_key_from_spki(spki: &[u8]) -> Option<Vec<u8>> {
     if tag != 0x03 {
         return None; // not a BIT STRING
     }
+    if end > spki.len() {
+        return None;
+    }
 
     Some(spki[pos..end].to_vec())
 }
@@ -185,7 +199,7 @@ fn der_read_tag_length(data: &[u8], pos: &mut usize) -> Option<(u8, usize)> {
     *pos += 1;
 
     let length = der_read_length(data, pos)?;
-    let end = *pos + length;
+    let end = (*pos).checked_add(length)?;
     Some((tag, end))
 }
 
@@ -201,7 +215,7 @@ fn der_read_length(data: &[u8], pos: &mut usize) -> Option<usize> {
         Some(first as usize)
     } else {
         let num_bytes = (first & 0x7F) as usize;
-        if num_bytes == 0 || num_bytes > 4 || *pos + num_bytes > data.len() {
+        if num_bytes == 0 || num_bytes > 4 || (*pos).checked_add(num_bytes).map_or(true, |end| end > data.len()) {
             return None;
         }
         let mut length = 0usize;
@@ -226,6 +240,17 @@ fn der_skip_tlv(data: &[u8], pos: &mut usize) -> Option<()> {
 mod tests {
     use super::*;
 
+    /// DER length encoding helper shared across test builders.
+    fn der_len(len: usize) -> Vec<u8> {
+        if len < 0x80 {
+            vec![len as u8]
+        } else if len < 0x100 {
+            vec![0x81, len as u8]
+        } else {
+            vec![0x82, (len >> 8) as u8, len as u8]
+        }
+    }
+
     /// Build a minimal self-signed X.509 certificate DER with a known SPKI.
     /// Structure: Certificate SEQUENCE { TBSCertificate, sigAlgo, sigValue }
     /// TBSCertificate: [0] version, serialNumber, sigAlgo, issuer, validity, subject, SPKI
@@ -248,16 +273,6 @@ mod tests {
             r.push(0x00); // unused bits
             r.extend_from_slice(content);
             r
-        }
-        // Helper: DER length encoding
-        fn der_len(len: usize) -> Vec<u8> {
-            if len < 0x80 {
-                vec![len as u8]
-            } else if len < 0x100 {
-                vec![0x81, len as u8]
-            } else {
-                vec![0x82, (len >> 8) as u8, len as u8]
-            }
         }
         // Helper: context tag [0] EXPLICIT
         fn ctx0(content: &[u8]) -> Vec<u8> {
@@ -359,7 +374,7 @@ mod tests {
         tbs_body.extend_from_slice(&spki);
 
         let mut tbs = vec![0x30];
-        tbs.push(tbs_body.len() as u8);
+        tbs.extend(der_len(tbs_body.len()));
         tbs.extend_from_slice(&tbs_body);
 
         let outer_sig = vec![0x30, 0x05, 0x06, 0x03, 0x55, 0x04, 0x03];
@@ -411,5 +426,29 @@ mod tests {
     #[test]
     fn extract_subject_public_key_empty_returns_none() {
         assert!(extract_subject_public_key_from_spki(&[]).is_none());
+    }
+
+    #[test]
+    fn extract_subject_public_key_truncated_returns_none() {
+        // SEQUENCE with declared length 0x20 but only 2 bytes of content
+        assert!(extract_subject_public_key_from_spki(&[0x30, 0x20, 0x30, 0x00]).is_none());
+        // SEQUENCE header only, no content at all
+        assert!(extract_subject_public_key_from_spki(&[0x30, 0x05]).is_none());
+    }
+
+    #[test]
+    fn der_skip_tlv_rejects_oversized_length() {
+        // SEQUENCE with declared 4-byte length 0xFFFFFFFF but only 6 bytes total
+        let data = [0x30, 0x84, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut pos = 0;
+        assert!(der_skip_tlv(&data, &mut pos).is_none());
+    }
+
+    #[test]
+    fn der_read_length_rejects_5_byte_length() {
+        // 5-byte length encoding (num_bytes=5, exceeds the 4-byte cap)
+        let data = [0x30, 0x85, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let mut pos = 0;
+        assert!(der_read_tag_length(&data, &mut pos).is_none());
     }
 }

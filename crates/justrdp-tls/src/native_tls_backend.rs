@@ -4,15 +4,14 @@
 
 use std::io::{Read, Write};
 
-use crate::{TlsError, TlsUpgradeResult, TlsUpgrader};
+use crate::{ReadWrite, TlsError, TlsUpgradeResult, TlsUpgrader, ERR_CERT_DER_PARSE};
 
 /// TLS upgrader using the `native-tls` library (platform TLS).
 ///
 /// By default, this accepts self-signed certificates (common for RDP servers).
-/// Set `verify_certificates` to `true` for strict certificate validation.
+/// Use [`with_verification()`](Self::with_verification) for strict certificate validation.
 pub struct NativeTlsUpgrader {
-    /// Whether to verify server certificates strictly.
-    pub verify_certificates: bool,
+    verify_certificates: bool,
 }
 
 impl NativeTlsUpgrader {
@@ -59,7 +58,14 @@ impl TlsUpgrader for NativeTlsUpgrader {
         let boxed_stream: Box<dyn ReadWrite> = Box::new(stream);
         let tls_stream = connector
             .connect(server_name, boxed_stream)
-            .map_err(|e| TlsError::Handshake(e.to_string()))?;
+            .map_err(|e| match e {
+                native_tls::HandshakeError::Failure(err) => TlsError::Handshake(err.to_string()),
+                // Unreachable for blocking streams. Non-blocking streams are not
+                // supported — see TlsUpgrader::upgrade() doc.
+                native_tls::HandshakeError::WouldBlock(_) => {
+                    TlsError::Handshake("handshake would block (non-blocking stream not supported)".into())
+                }
+            })?;
 
         // Extract server public key from peer certificate
         let server_public_key = extract_native_tls_public_key(&tls_stream)?;
@@ -84,9 +90,45 @@ fn extract_native_tls_public_key(
     })?;
 
     crate::extract_spki_from_cert_der(&der)
-        .ok_or_else(|| TlsError::PublicKeyExtraction("failed to parse certificate DER".into()))
+        .ok_or_else(|| TlsError::PublicKeyExtraction(ERR_CERT_DER_PARSE.into()))
 }
 
-/// Trait alias for Read + Write.
-pub trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_tls_upgrader_default_no_verify() {
+        let upgrader = NativeTlsUpgrader::new();
+        assert!(!upgrader.verify_certificates);
+    }
+
+    #[test]
+    fn native_tls_upgrader_with_verify() {
+        let upgrader = NativeTlsUpgrader::with_verification();
+        assert!(upgrader.verify_certificates);
+    }
+
+    #[test]
+    fn native_tls_upgrader_default_trait() {
+        let upgrader = NativeTlsUpgrader::default();
+        assert!(!upgrader.verify_certificates);
+    }
+
+    #[test]
+    fn native_tls_connector_builds_no_verify() {
+        let mut builder = native_tls::TlsConnector::builder();
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+        let connector = builder.build();
+        assert!(connector.is_ok(), "connector should build with no-verify settings");
+    }
+
+    #[test]
+    fn native_tls_connector_builds_with_verify() {
+        let builder = native_tls::TlsConnector::builder();
+        let connector = builder.build();
+        assert!(connector.is_ok(), "connector should build with default verify settings");
+    }
+}
+
