@@ -21,6 +21,9 @@ use crate::pdu::{
 /// RDPSND protocol version we advertise.
 const CLIENT_VERSION: u16 = 0x0006;
 
+/// MS-RDPEA 2.2.2.3: Quality Mode PDU requires both sides at version >= 6.
+const QUALITY_MODE_MIN_VERSION: u16 = 6;
+
 /// Client-side RDPSND state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RdpsndState {
@@ -102,6 +105,7 @@ impl RdpsndClient {
                 self.handle_server_formats(&mut cursor)
             }
 
+            // MS-RDPEA 2.2.3.1: server may send Training at any time, not just WaitTraining.
             SndMsgType::Training => self.handle_training(&mut cursor, header.body_size),
 
             SndMsgType::Wave if self.state == RdpsndState::Active => {
@@ -130,6 +134,10 @@ impl RdpsndClient {
 
             SndMsgType::Close => {
                 self.backend.on_close();
+                // Reset state to allow server-initiated re-negotiation (MS-RDPEA).
+                self.state = RdpsndState::WaitServerFormats;
+                self.negotiated_formats.clear();
+                self.pending_wave_info = None;
                 Ok(Vec::new())
             }
 
@@ -162,15 +170,16 @@ impl RdpsndClient {
         // Build client response.
         let client_pdu = ClientAudioFormatsPdu {
             flags: ClientSndFlags::ALIVE.union(ClientSndFlags::VOLUME),
-            volume: 0xFFFF_FFFF, // Full volume both channels.
-            pitch: 0x0001_0000,  // 1.0x pitch.
+            volume: 0xFFFF_FFFF, // MS-RDPEA 2.2.2.2: full volume both channels
+            pitch: 0x0001_0000,  // MS-RDPEA 2.2.2.2: 1.0x pitch (fixed-point)
             version: CLIENT_VERSION,
             formats: self.negotiated_formats.clone(),
         };
         let mut messages = alloc::vec![Self::encode_pdu(&client_pdu)?];
 
-        // If both versions >= 6, send Quality Mode PDU.
-        if self.server_version >= 6 && CLIENT_VERSION >= 6 {
+        // MS-RDPEA 2.2.2.3: client MUST send Quality Mode PDU when both versions >= 6.
+        // CLIENT_VERSION is always 6, so only the server version needs checking.
+        if self.server_version >= QUALITY_MODE_MIN_VERSION {
             let quality = QualityModePdu::new(QualityMode::Dynamic);
             messages.push(Self::encode_pdu(&quality)?);
         }
@@ -207,10 +216,18 @@ impl RdpsndClient {
         cursor: &mut ReadCursor<'_>,
     ) -> SvcResult<Vec<SvcMessage>> {
         let wave_info = self.pending_wave_info.take().ok_or_else(|| {
-            justrdp_svc::SvcError::Protocol(alloc::string::String::from(
-                "Wave PDU without preceding WaveInfo",
+            justrdp_svc::SvcError::Protocol(alloc::format!(
+                "Wave PDU without preceding WaveInfo"
             ))
         })?;
+
+        if wave_info.format_no as usize >= self.negotiated_formats.len() {
+            return Err(justrdp_svc::SvcError::Protocol(alloc::format!(
+                "Wave format_no {} out of range (negotiated: {})",
+                wave_info.format_no,
+                self.negotiated_formats.len(),
+            )));
+        }
 
         let audio = decode_wave_data(cursor, &wave_info)?;
         self.backend
@@ -229,6 +246,15 @@ impl RdpsndClient {
         body_size: u16,
     ) -> SvcResult<Vec<SvcMessage>> {
         let wave2 = Wave2Pdu::decode_body(cursor, body_size)?;
+
+        if wave2.format_no as usize >= self.negotiated_formats.len() {
+            return Err(justrdp_svc::SvcError::Protocol(alloc::format!(
+                "Wave2 format_no {} out of range (negotiated: {})",
+                wave2.format_no,
+                self.negotiated_formats.len(),
+            )));
+        }
+
         self.backend
             .on_wave_data(wave2.format_no, &wave2.data, Some(wave2.audio_timestamp));
 

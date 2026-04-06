@@ -10,6 +10,10 @@ use justrdp_core::{Decode, DecodeResult, Encode, EncodeResult};
 /// Minimum AUDIO_FORMAT size (fixed fields, no extra data).
 const AUDIO_FORMAT_FIXED_SIZE: usize = 18;
 
+/// Maximum codec extra data size in bytes.
+/// Real codecs need at most ~64 bytes (MS-ADPCM: 32, IMA-ADPCM: 2, AAC/Opus: ~64).
+const MAX_EXTRA_DATA_SIZE: u16 = 256;
+
 /// Well-known audio format tags -- MS-RDPEA 2.2.1.1 / RFC 2361
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaveFormatTag(pub u16);
@@ -27,7 +31,7 @@ impl WaveFormatTag {
     pub const DVI_ADPCM: Self = Self(0x0011);
     /// AAC (MPEG-4).
     pub const AAC: Self = Self(0x00FF);
-    /// Opus codec.
+    /// Opus codec (de-facto RDP value used by FreeRDP; IANA WAVE_FORMAT_OPUS is 0x7164).
     pub const OPUS: Self = Self(0x704F);
 }
 
@@ -55,13 +59,24 @@ pub struct AudioFormat {
 
 impl AudioFormat {
     /// Create a PCM audio format.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_channels * (bits_per_sample / 8)` overflows u16,
+    /// or if the resulting `n_avg_bytes_per_sec` overflows u32.
     pub fn pcm(n_channels: u16, n_samples_per_sec: u32, bits_per_sample: u16) -> Self {
-        let block_align = n_channels * (bits_per_sample / 8);
+        let bytes_per_sample = bits_per_sample / 8;
+        let block_align = n_channels
+            .checked_mul(bytes_per_sample)
+            .expect("PCM block_align overflow: n_channels * bytes_per_sample exceeds u16");
+        let avg_bytes = n_samples_per_sec
+            .checked_mul(block_align as u32)
+            .expect("PCM n_avg_bytes_per_sec overflow");
         Self {
             format_tag: WaveFormatTag::PCM,
             n_channels,
             n_samples_per_sec,
-            n_avg_bytes_per_sec: n_samples_per_sec * block_align as u32,
+            n_avg_bytes_per_sec: avg_bytes,
             n_block_align: block_align,
             bits_per_sample,
             extra_data: Vec::new(),
@@ -77,7 +92,15 @@ impl Encode for AudioFormat {
         dst.write_u32_le(self.n_avg_bytes_per_sec, "AudioFormat::nAvgBytesPerSec")?;
         dst.write_u16_le(self.n_block_align, "AudioFormat::nBlockAlign")?;
         dst.write_u16_le(self.bits_per_sample, "AudioFormat::wBitsPerSample")?;
-        dst.write_u16_le(self.extra_data.len() as u16, "AudioFormat::cbSize")?;
+        let cb_size = u16::try_from(self.extra_data.len())
+            .map_err(|_| justrdp_core::EncodeError::invalid_value("AudioFormat", "cbSize too large"))?;
+        if cb_size > MAX_EXTRA_DATA_SIZE {
+            return Err(justrdp_core::EncodeError::invalid_value(
+                "AudioFormat",
+                "cbSize exceeds limit",
+            ));
+        }
+        dst.write_u16_le(cb_size, "AudioFormat::cbSize")?;
         if !self.extra_data.is_empty() {
             dst.write_slice(&self.extra_data, "AudioFormat::data")?;
         }
@@ -102,6 +125,12 @@ impl<'de> Decode<'de> for AudioFormat {
         let n_block_align = src.read_u16_le("AudioFormat::nBlockAlign")?;
         let bits_per_sample = src.read_u16_le("AudioFormat::wBitsPerSample")?;
         let cb_size = src.read_u16_le("AudioFormat::cbSize")?;
+        if cb_size > MAX_EXTRA_DATA_SIZE {
+            return Err(justrdp_core::DecodeError::invalid_value(
+                "AudioFormat",
+                "cbSize exceeds limit",
+            ));
+        }
         let extra_data = if cb_size > 0 {
             src.read_slice(cb_size as usize, "AudioFormat::data")?.to_vec()
         } else {
@@ -189,6 +218,23 @@ mod tests {
         let mut cursor = WriteCursor::new(&mut out);
         fmt.encode(&mut cursor).unwrap();
         assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_extra_data() {
+        // cbSize = 257 (> MAX_EXTRA_DATA_SIZE=256)
+        let mut bytes = alloc::vec![
+            0x01, 0x00, // wFormatTag = PCM
+            0x01, 0x00, // nChannels = 1
+            0x44, 0xAC, 0x00, 0x00, // nSamplesPerSec = 44100
+            0x88, 0x58, 0x01, 0x00, // nAvgBytesPerSec
+            0x02, 0x00, // nBlockAlign = 2
+            0x10, 0x00, // wBitsPerSample = 16
+            0x01, 0x01, // cbSize = 257
+        ];
+        bytes.extend_from_slice(&[0u8; 257]); // extra data
+        let mut cursor = ReadCursor::new(&bytes);
+        assert!(AudioFormat::decode(&mut cursor).is_err());
     }
 
     #[test]

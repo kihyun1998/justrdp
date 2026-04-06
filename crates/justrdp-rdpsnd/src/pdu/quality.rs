@@ -50,6 +50,8 @@ impl QualityModePdu {
     pub fn decode_body(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         let raw = src.read_u16_le("QualityModePdu::wQualityMode")?;
         let _reserved = src.read_u16_le("QualityModePdu::Reserved")?;
+        // Deliberate fallback: QualityMode is advisory (hint), so unknown values
+        // degrade gracefully to Dynamic rather than breaking the connection.
         let quality_mode = QualityMode::from_u16(raw).unwrap_or(QualityMode::Dynamic);
         Ok(Self { quality_mode })
     }

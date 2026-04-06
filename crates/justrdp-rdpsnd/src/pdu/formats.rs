@@ -13,6 +13,10 @@ use super::header::{SndHeader, SndMsgType, SND_HEADER_SIZE};
 /// Fixed body size for formats PDU (before the format array).
 const FORMATS_BODY_FIXED_SIZE: usize = 20;
 
+/// Maximum number of audio formats in a single PDU.
+/// Real servers advertise fewer than 100; cap to prevent DoS.
+const MAX_AUDIO_FORMATS: u16 = 256;
+
 /// Client sound capability flags -- MS-RDPEA 2.2.2.2
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientSndFlags(u32);
@@ -65,6 +69,12 @@ impl ServerAudioFormatsPdu {
         let _dw_pitch = src.read_u32_le("ServerFormats::dwPitch")?;
         let _w_dgram_port = src.read_u16_le("ServerFormats::wDGramPort")?;
         let num_formats = src.read_u16_le("ServerFormats::wNumberOfFormats")?;
+        if num_formats > MAX_AUDIO_FORMATS {
+            return Err(justrdp_core::DecodeError::invalid_value(
+                "ServerFormats",
+                "wNumberOfFormats exceeds limit",
+            ));
+        }
         let last_block_confirmed = src.read_u8("ServerFormats::cLastBlockConfirmed")?;
         let version = src.read_u16_le("ServerFormats::wVersion")?;
         let _pad = src.read_u8("ServerFormats::bPad")?;
@@ -105,14 +115,18 @@ impl ClientAudioFormatsPdu {
 
 impl Encode for ClientAudioFormatsPdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let header = SndHeader::new(SndMsgType::Formats, self.body_size() as u16);
+        let body_size = u16::try_from(self.body_size())
+            .map_err(|_| justrdp_core::EncodeError::invalid_value("ClientFormats", "body too large"))?;
+        let num_formats = u16::try_from(self.formats.len())
+            .map_err(|_| justrdp_core::EncodeError::invalid_value("ClientFormats", "too many formats"))?;
+        let header = SndHeader::new(SndMsgType::Formats, body_size);
         header.encode(dst)?;
         dst.write_u32_le(self.flags.bits(), "ClientFormats::dwFlags")?;
         dst.write_u32_le(self.volume, "ClientFormats::dwVolume")?;
         dst.write_u32_le(self.pitch, "ClientFormats::dwPitch")?;
-        // wDGramPort: big-endian per spec, 0 = no UDP
-        dst.write_u16_be(0, "ClientFormats::wDGramPort")?;
-        dst.write_u16_le(self.formats.len() as u16, "ClientFormats::wNumberOfFormats")?;
+        // MS-RDPEA 2.2.2.2: wDGramPort, 0 = no UDP
+        dst.write_u16_le(0, "ClientFormats::wDGramPort")?;
+        dst.write_u16_le(num_formats, "ClientFormats::wNumberOfFormats")?;
         dst.write_u8(0, "ClientFormats::cLastBlockConfirmed")?;
         dst.write_u16_le(self.version, "ClientFormats::wVersion")?;
         dst.write_u8(0, "ClientFormats::bPad")?;
@@ -209,6 +223,23 @@ mod tests {
         // Verify body size sum
         let computed_body: usize = 20 + pdu.formats.iter().map(|f| f.size()).sum::<usize>();
         assert_eq!(computed_body, 144);
+    }
+
+    #[test]
+    fn server_formats_rejects_too_many_formats() {
+        // wNumberOfFormats = 257 (> MAX_AUDIO_FORMATS=256)
+        let body = [
+            0x00, 0x00, 0x00, 0x00, // dwFlags
+            0x00, 0x00, 0x00, 0x00, // dwVolume
+            0x00, 0x00, 0x00, 0x00, // dwPitch
+            0x00, 0x00,             // wDGramPort
+            0x01, 0x01,             // wNumberOfFormats = 257
+            0x00,                   // cLastBlockConfirmed
+            0x06, 0x00,             // wVersion = 6
+            0x00,                   // bPad
+        ];
+        let mut cursor = ReadCursor::new(&body);
+        assert!(ServerAudioFormatsPdu::decode_body(&mut cursor).is_err());
     }
 
     #[test]

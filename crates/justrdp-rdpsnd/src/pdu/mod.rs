@@ -18,4 +18,4 @@ pub use quality::{QualityModePdu, QualityMode};
 pub use training::{TrainingPdu, TrainingConfirmPdu};
 pub use wave::{WaveInfoPdu, Wave2Pdu, decode_wave_data};
 pub use wave_confirm::WaveConfirmPdu;
-pub use volume::{VolumePdu, PitchPdu};
+pub use volume::VolumePdu;

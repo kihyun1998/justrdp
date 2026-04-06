@@ -31,8 +31,20 @@ pub struct WaveInfoPdu {
 impl WaveInfoPdu {
     /// Decode from cursor after the header has been read.
     ///
-    /// `body_size` from the header = 4 + total_audio_data_size.
+    /// MS-RDPEA 2.2.3.3: BodySize = 4 + total_audio_data_size,
+    /// where total_audio_data_size includes the 4 initial bytes in Data[].
+    /// Equivalently: remaining_wave_bytes = BodySize - 8, matching FreeRDP.
     pub fn decode_body(src: &mut ReadCursor<'_>, body_size: u16) -> DecodeResult<Self> {
+        // MS-RDPEA 2.2.3.3: BodySize = 4 + total_audio_size.
+        // Minimum valid BodySize is 8 (total_audio_size = 4 = initial_data only).
+        // Values 4..7 would give total_audio_size 0..3, which is less than the
+        // 4-byte initial_data and would cause data length inconsistency.
+        if body_size < 8 {
+            return Err(justrdp_core::DecodeError::invalid_value(
+                "WaveInfoPdu",
+                "body_size too small",
+            ));
+        }
         let timestamp = src.read_u16_le("WaveInfoPdu::wTimeStamp")?;
         let format_no = src.read_u16_le("WaveInfoPdu::wFormatNo")?;
         let block_no = src.read_u8("WaveInfoPdu::cBlockNo")?;
@@ -41,9 +53,10 @@ impl WaveInfoPdu {
         let mut initial_data = [0u8; 4];
         initial_data.copy_from_slice(initial_bytes);
 
-        // BodySize = 8 + (total_audio_size - 4) = 4 + total_audio_size
-        // So total_audio_size = BodySize - 4
-        let total_audio_size = body_size.saturating_sub(4) as usize;
+        // MS-RDPEA 2.2.3.3: BodySize = 4 + total_audio_size
+        // Body has 8 non-audio bytes + 4 initial audio bytes = 12 bytes on wire,
+        // but BodySize is overloaded to encode total audio size.
+        let total_audio_size = (body_size - 4) as usize;
 
         Ok(Self {
             timestamp,
@@ -55,7 +68,13 @@ impl WaveInfoPdu {
     }
 
     /// Size of the remaining Wave PDU data (after this WaveInfo PDU).
+    /// decode_body guarantees total_audio_size >= 4; saturating_sub guards
+    /// against direct construction with smaller values.
     pub fn remaining_wave_size(&self) -> usize {
+        debug_assert!(
+            self.total_audio_size >= 4,
+            "invariant: total_audio_size >= 4 (from decode_body)"
+        );
         self.total_audio_size.saturating_sub(4)
     }
 }
@@ -110,13 +129,19 @@ const WAVE2_FIXED_BODY_SIZE: usize = 12;
 impl Wave2Pdu {
     /// Decode from cursor after the header has been read.
     pub fn decode_body(src: &mut ReadCursor<'_>, body_size: u16) -> DecodeResult<Self> {
+        if (body_size as usize) < WAVE2_FIXED_BODY_SIZE {
+            return Err(justrdp_core::DecodeError::invalid_value(
+                "Wave2Pdu",
+                "body_size too small",
+            ));
+        }
         let timestamp = src.read_u16_le("Wave2Pdu::wTimeStamp")?;
         let format_no = src.read_u16_le("Wave2Pdu::wFormatNo")?;
         let block_no = src.read_u8("Wave2Pdu::cBlockNo")?;
         src.skip(3, "Wave2Pdu::bPad")?;
         let audio_timestamp = src.read_u32_le("Wave2Pdu::dwAudioTimeStamp")?;
 
-        let data_len = (body_size as usize).saturating_sub(WAVE2_FIXED_BODY_SIZE);
+        let data_len = (body_size as usize) - WAVE2_FIXED_BODY_SIZE;
         let data = if data_len > 0 {
             src.read_slice(data_len, "Wave2Pdu::Data")?.to_vec()
         } else {
@@ -136,7 +161,9 @@ impl Wave2Pdu {
 impl Encode for Wave2Pdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         let body_size = WAVE2_FIXED_BODY_SIZE + self.data.len();
-        let header = SndHeader::new(SndMsgType::Wave2, body_size as u16);
+        let body_size_u16 = u16::try_from(body_size)
+            .map_err(|_| justrdp_core::EncodeError::invalid_value("Wave2Pdu", "body too large"))?;
+        let header = SndHeader::new(SndMsgType::Wave2, body_size_u16);
         header.encode(dst)?;
         dst.write_u16_le(self.timestamp, "Wave2Pdu::wTimeStamp")?;
         dst.write_u16_le(self.format_no, "Wave2Pdu::wFormatNo")?;
@@ -182,6 +209,52 @@ mod tests {
         assert_eq!(pdu.initial_data, [1, 2, 3, 4]);
         assert_eq!(pdu.total_audio_size, 8);
         assert_eq!(pdu.remaining_wave_size(), 4);
+    }
+
+    #[test]
+    fn wave_info_body_size_too_small() {
+        let body = [0x00; 12];
+        let mut cursor = ReadCursor::new(&body);
+        // body_size=7 → total_audio_size would be 3 < 4 (initial_data), rejected
+        assert!(WaveInfoPdu::decode_body(&mut cursor, 7).is_err());
+    }
+
+    #[test]
+    fn wave_info_minimum_body_size() {
+        // body_size=8 → total_audio_size=4 (initial_data only, no remaining)
+        let body = [
+            0x00, 0x00, // timestamp
+            0x00, 0x00, // formatNo
+            0x00,       // blockNo
+            0x00, 0x00, 0x00, // pad
+            0x01, 0x02, 0x03, 0x04, // initial data
+        ];
+        let mut cursor = ReadCursor::new(&body);
+        let pdu = WaveInfoPdu::decode_body(&mut cursor, 8).unwrap();
+        assert_eq!(pdu.total_audio_size, 4);
+        assert_eq!(pdu.remaining_wave_size(), 0);
+    }
+
+    #[test]
+    fn wave2_body_size_too_small() {
+        let body = [0x00; 12];
+        let mut cursor = ReadCursor::new(&body);
+        assert!(Wave2Pdu::decode_body(&mut cursor, 11).is_err());
+    }
+
+    #[test]
+    fn wave2_minimum_body_size() {
+        // body_size=12 → zero audio data (minimum valid)
+        let body = [
+            0x00, 0x00, // timestamp
+            0x00, 0x00, // formatNo
+            0x00,       // blockNo
+            0x00, 0x00, 0x00, // pad
+            0x00, 0x00, 0x00, 0x00, // audioTimestamp
+        ];
+        let mut cursor = ReadCursor::new(&body);
+        let pdu = Wave2Pdu::decode_body(&mut cursor, 12).unwrap();
+        assert!(pdu.data.is_empty());
     }
 
     #[test]
