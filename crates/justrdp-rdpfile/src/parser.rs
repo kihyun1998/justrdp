@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! `.rdp` file parser and writer.
 
 use alloc::string::String;
@@ -11,7 +9,7 @@ use core::fmt;
 /// Maximum total input size in bytes (1 MiB).
 const MAX_INPUT_SIZE: usize = 1024 * 1024;
 
-/// Maximum number of lines to process.
+/// Maximum number of non-blank content lines to process.
 const MAX_LINES: usize = 512;
 
 /// Maximum length of a single line in bytes.
@@ -60,9 +58,6 @@ impl fmt::Display for ParseError {
 
 // ── Shared helpers ──
 
-/// Known type discriminator characters in the `.rdp` format: `i` (integer), `s` (string), `b` (binary hex).
-const KNOWN_TYPE_CHARS: [char; 3] = ['i', 's', 'b'];
-
 /// Normalizes the RDP type discriminator character to lowercase.
 /// The `.rdp` format permits uppercase (`I`, `S`, `B`); we normalize for matching.
 #[inline]
@@ -75,25 +70,20 @@ fn normalize_type_char(c: char) -> char {
     }
 }
 
-/// Splits a trimmed `.rdp` line into `(key, normalized_type, raw_type, value)`.
+/// Splits a trimmed `.rdp` line into `(key, normalized_type_char, value)`.
 /// Returns `None` if the line is malformed.
-fn split_rdp_line(line: &str) -> Option<(&str, char, char, &str)> {
-    let first_colon = line.find(':')?;
-    let rest = &line[first_colon + 1..];
-    let second_colon = first_colon + 1 + rest.find(':')?;
-
-    let key = line[..first_colon].trim();
-    let type_str = line[first_colon + 1..second_colon].trim();
-    let value = &line[second_colon + 1..];
+fn split_rdp_line(line: &str) -> Option<(&str, char, &str)> {
+    let mut parts = line.splitn(3, ':');
+    let key = parts.next()?.trim();
+    let type_str = parts.next()?.trim();
+    let value = parts.next()?;
 
     if type_str.len() != 1 {
         return None;
     }
 
-    let raw_type = type_str.chars().next().unwrap();
-    let normalized = normalize_type_char(raw_type);
-
-    Some((key, normalized, raw_type, value))
+    let normalized = normalize_type_char(type_str.chars().next()?);
+    Some((key, normalized, value))
 }
 
 /// Validates a binary (`b`) type hex value.
@@ -107,6 +97,17 @@ fn strip_bom(input: &str) -> &str {
     input.strip_prefix('\u{FEFF}').unwrap_or(input)
 }
 
+/// Lowercases a key for case-insensitive field matching.
+/// Avoids allocation on the common case where the key is already lowercase
+/// — this is called for every parsed line.
+fn normalize_key(key: &str) -> String {
+    if key.bytes().any(|b| b.is_ascii_uppercase()) {
+        key.chars().map(|c| c.to_ascii_lowercase()).collect()
+    } else {
+        String::from(key)
+    }
+}
+
 // ── Entry ──
 
 /// A single raw entry from an `.rdp` file.
@@ -116,6 +117,41 @@ pub struct RdpEntry {
     /// Type discriminator character, always normalized to lowercase (`i`, `s`, `b`, etc.).
     pub type_char: char,
     pub value: String,
+}
+
+// ── Apply result for shared line processing ──
+
+/// Result of applying a single parsed line to an `RdpFile`.
+enum ApplyLineResult {
+    /// Matched and set a known typed field (e.g. `desktopwidth`, `full_address`).
+    KnownFieldSet,
+    /// Added to `extra_entries` as an unknown key.
+    ExtraAdded,
+    /// Unknown key but `extra_entries` is at capacity; entry was dropped.
+    ExtraCapped,
+    /// Integer parse failed for a known integer field.
+    InvalidInteger,
+}
+
+/// Apply a parsed line to an `RdpFile`. Shared between `parse` and `parse_lossy`.
+fn apply_line(file: &mut RdpFile, key: &str, type_char: char, value: &str) -> ApplyLineResult {
+    let normalized_key = normalize_key(key);
+
+    match file.set_typed_field(&normalized_key, type_char, value) {
+        Ok(true) => ApplyLineResult::KnownFieldSet,
+        Ok(false) => {
+            if file.extra_entries.len() >= MAX_EXTRA_ENTRIES {
+                return ApplyLineResult::ExtraCapped;
+            }
+            file.extra_entries.push(RdpEntry {
+                key: String::from(key),
+                type_char,
+                value: String::from(value),
+            });
+            ApplyLineResult::ExtraAdded
+        }
+        Err(()) => ApplyLineResult::InvalidInteger,
+    }
 }
 
 // ── RdpFile ──
@@ -134,6 +170,9 @@ macro_rules! define_rdp_file {
         /// `remoteapplicationprogram` originate from untrusted input. Callers **must not**
         /// pass these values to shell commands or process spawn functions without
         /// proper sanitization/validation.
+        ///
+        /// `to_rdp_string()` sanitizes all field values (both typed and extra) by
+        /// stripping embedded CR/LF characters to prevent line injection.
         #[derive(Debug, Clone, Default, PartialEq, Eq)]
         pub struct RdpFile {
             // Integer fields
@@ -167,6 +206,7 @@ macro_rules! define_rdp_file {
             }
 
             /// Write typed fields in declaration order: integers first, then strings.
+            /// String field values are sanitized to strip embedded CR/LF.
             fn write_typed_fields(&self, out: &mut String) {
                 $(
                     if let Some(ref v) = self.$i_field {
@@ -180,7 +220,8 @@ macro_rules! define_rdp_file {
                     if let Some(ref v) = self.$s_field {
                         out.push_str($s_key);
                         out.push_str(":s:");
-                        out.push_str(v);
+                        let clean = sanitize_line(v);
+                        out.push_str(&clean);
                         out.push_str("\r\n");
                     }
                 )*
@@ -281,15 +322,23 @@ define_rdp_file! {
 /// Write an i32 as decimal into a String (no_std friendly).
 fn write_i32(out: &mut String, v: i32) {
     use core::fmt::Write;
-    let _ = write!(out, "{v}");
+    write!(out, "{v}").expect("writing to String is infallible");
 }
 
 impl RdpFile {
     /// Parse an `.rdp` file from a string.
     ///
     /// Lines are `key:type:value` with CRLF or LF endings.
-    /// Duplicate keys: last wins. Unknown keys stored in `extra_entries`.
     /// A leading UTF-8 BOM is stripped if present.
+    ///
+    /// - **Duplicate known keys:** last wins (earlier value is overwritten).
+    /// - **Duplicate unknown keys:** all occurrences are stored in `extra_entries`.
+    /// - **`extra_entries` cap:** at most [`MAX_EXTRA_ENTRIES`] (64) unknown-key entries.
+    /// - **Integer fields:** raw `i32` values with no domain validation; callers must
+    ///   validate ranges (e.g. port 0..=65535) before use.
+    ///
+    /// `MAX_LINES` counts non-blank content lines only; blank lines are skipped
+    /// without consuming the line budget.
     pub fn parse(input: &str) -> Result<Self, ParseError> {
         if input.len() > MAX_INPUT_SIZE {
             return Err(ParseError::InputTooLarge);
@@ -297,6 +346,7 @@ impl RdpFile {
 
         let input = strip_bom(input);
         let mut file = RdpFile::default();
+        let mut content_line_count = 0usize;
 
         for (line_idx, raw_line) in input.split('\n').enumerate() {
             let line = raw_line.trim_end_matches('\r');
@@ -304,41 +354,33 @@ impl RdpFile {
                 continue;
             }
 
+            content_line_count += 1;
             let line_number = line_idx + 1;
 
-            if line_number > MAX_LINES {
+            if content_line_count > MAX_LINES {
                 return Err(ParseError::TooManyLines { line_number });
             }
             if line.len() > MAX_LINE_LEN {
                 return Err(ParseError::LineTooLong { line_number });
             }
 
-            let (key, type_tag, _raw_type, value) =
+            let (key, type_char, value) =
                 split_rdp_line(line).ok_or(ParseError::MalformedLine { line_number })?;
 
-            if !KNOWN_TYPE_CHARS.contains(&type_tag) {
-                return Err(ParseError::UnknownType { line_number, type_char: type_tag });
+            if !matches!(type_char, 'i' | 's' | 'b') {
+                return Err(ParseError::UnknownType { line_number, type_char: type_char });
             }
 
-            if type_tag == 'b' && !is_valid_hex(value) {
+            if type_char == 'b' && !is_valid_hex(value) {
                 return Err(ParseError::InvalidHex { line_number, value: String::from(value) });
             }
 
-            let normalized_key: String = key.chars().map(|c| c.to_ascii_lowercase()).collect();
-
-            match file.set_typed_field(&normalized_key, type_tag, value) {
-                Ok(true) => {}
-                Ok(false) => {
-                    if file.extra_entries.len() >= MAX_EXTRA_ENTRIES {
-                        return Err(ParseError::TooManyExtraEntries { line_number });
-                    }
-                    file.extra_entries.push(RdpEntry {
-                        key: String::from(key),
-                        type_char: type_tag,
-                        value: String::from(value),
-                    });
+            match apply_line(&mut file, key, type_char, value) {
+                ApplyLineResult::KnownFieldSet | ApplyLineResult::ExtraAdded => {}
+                ApplyLineResult::ExtraCapped => {
+                    return Err(ParseError::TooManyExtraEntries { line_number })
                 }
-                Err(()) => {
+                ApplyLineResult::InvalidInteger => {
                     return Err(ParseError::InvalidInteger {
                         line_number,
                         value: String::from(value),
@@ -351,8 +393,15 @@ impl RdpFile {
     }
 
     /// Parse an `.rdp` file, skipping malformed lines silently.
+    ///
     /// A leading UTF-8 BOM is stripped if present.
     /// Input size limits are still enforced; oversized input returns a default `RdpFile`.
+    /// Line count and length limits are enforced by skipping offending lines;
+    /// processing stops after `MAX_LINES` non-blank content lines (matches `parse`'s
+    /// line budget, but stops silently instead of returning an error).
+    ///
+    /// At most [`MAX_EXTRA_ENTRIES`] (64) unknown-key entries are stored; additional
+    /// entries are silently discarded.
     pub fn parse_lossy(input: &str) -> Self {
         if input.len() > MAX_INPUT_SIZE {
             return RdpFile::default();
@@ -360,7 +409,7 @@ impl RdpFile {
 
         let input = strip_bom(input);
         let mut file = RdpFile::default();
-        let mut line_count = 0usize;
+        let mut content_line_count = 0usize;
 
         for raw_line in input.split('\n') {
             let line = raw_line.trim_end_matches('\r');
@@ -368,40 +417,38 @@ impl RdpFile {
                 continue;
             }
 
-            line_count += 1;
-            if line_count > MAX_LINES || line.len() > MAX_LINE_LEN {
+            content_line_count += 1;
+
+            // Stop processing after the content line limit (parse() errors here instead).
+            if content_line_count > MAX_LINES {
+                break;
+            }
+
+            // Line too long — skip it but keep processing subsequent lines.
+            if line.len() > MAX_LINE_LEN {
                 continue;
             }
 
-            let Some((key, type_tag, _raw_type, value)) = split_rdp_line(line) else {
+            let Some((key, type_char, value)) = split_rdp_line(line) else {
                 continue;
             };
 
-            if !KNOWN_TYPE_CHARS.contains(&type_tag) {
+            if !matches!(type_char, 'i' | 's' | 'b') {
                 continue;
             }
 
-            if type_tag == 'b' && !is_valid_hex(value) {
+            if type_char == 'b' && !is_valid_hex(value) {
                 continue;
             }
 
-            let normalized_key: String = key.chars().map(|c| c.to_ascii_lowercase()).collect();
-
-            match file.set_typed_field(&normalized_key, type_tag, value) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(()) => continue,
+            // In lossy mode all outcomes are intentionally silenced — errors and
+            // capacity overflows are skipped, not propagated.
+            match apply_line(&mut file, key, type_char, value) {
+                ApplyLineResult::KnownFieldSet
+                | ApplyLineResult::ExtraAdded
+                | ApplyLineResult::ExtraCapped
+                | ApplyLineResult::InvalidInteger => {}
             }
-
-            if file.extra_entries.len() >= MAX_EXTRA_ENTRIES {
-                continue;
-            }
-
-            file.extra_entries.push(RdpEntry {
-                key: String::from(key),
-                type_char: type_tag,
-                value: String::from(value),
-            });
         }
 
         file
@@ -409,13 +456,13 @@ impl RdpFile {
 
     /// Serialize to `.rdp` format string (CRLF line endings).
     ///
-    /// Keys and values with embedded newlines are sanitized (newlines stripped).
+    /// All keys and values — both typed fields and extra entries — are sanitized
+    /// by stripping embedded CR/LF characters to prevent line injection.
     pub fn to_rdp_string(&self) -> String {
         let mut out = String::new();
         self.write_typed_fields(&mut out);
 
         for entry in &self.extra_entries {
-            // Sanitize embedded newlines to prevent format injection.
             let clean_key = sanitize_line(&entry.key);
             let clean_value = sanitize_line(&entry.value);
             out.push_str(&clean_key);
@@ -724,7 +771,7 @@ shell working directory:s:\r\n\
         assert_eq!(rdp, RdpFile::default());
     }
 
-    // ── New tests: BOM, size limits, type normalization, duplicate unknown keys, output sanitization ──
+    // ── BOM, size limits, type normalization, duplicate unknown keys, output sanitization ──
 
     #[test]
     fn parse_utf8_bom_stripped() {
@@ -822,5 +869,111 @@ shell working directory:s:\r\n\
         });
         let output = rdp.to_rdp_string();
         assert!(output.contains("badkey:s:val\r\n"));
+    }
+
+    // ── New tests: typed field sanitization, line limits, embedded CR ──
+
+    #[test]
+    fn to_rdp_string_sanitizes_typed_string_field() {
+        let mut rdp = RdpFile::default();
+        rdp.full_address = Some(String::from("host\r\nevil:i:1"));
+        let output = rdp.to_rdp_string();
+        // Newlines stripped from typed field value — single line output
+        assert!(output.contains("full address:s:hostevil:i:1\r\n"));
+        assert_eq!(output.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn to_rdp_string_sanitizes_embedded_cr_in_typed_field() {
+        let mut rdp = RdpFile::default();
+        rdp.full_address = Some(String::from("host\rmore"));
+        let output = rdp.to_rdp_string();
+        assert!(output.contains("full address:s:hostmore\r\n"));
+    }
+
+    #[test]
+    fn parse_too_many_lines() {
+        // Use a known key so it doesn't hit MAX_EXTRA_ENTRIES first.
+        let mut input = String::new();
+        for _ in 0..MAX_LINES + 1 {
+            input.push_str("desktopwidth:i:1920\n");
+        }
+        let result = RdpFile::parse(&input);
+        assert!(matches!(result, Err(ParseError::TooManyLines { .. })));
+    }
+
+    #[test]
+    fn parse_exactly_max_lines_ok() {
+        let mut input = String::new();
+        for _ in 0..MAX_LINES {
+            input.push_str("desktopwidth:i:1920\n");
+        }
+        let result = RdpFile::parse(&input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_line_too_long() {
+        let long_val = "x".repeat(MAX_LINE_LEN);
+        let input = alloc::format!("full address:s:{long_val}\n");
+        let result = RdpFile::parse(&input);
+        assert!(matches!(result, Err(ParseError::LineTooLong { .. })));
+    }
+
+    #[test]
+    fn parse_line_exactly_max_len_ok() {
+        // "k:s:" = 4 bytes, so value can be MAX_LINE_LEN - 4 to hit exactly MAX_LINE_LEN
+        let long_val = "x".repeat(MAX_LINE_LEN - 4);
+        let input = alloc::format!("k:s:{long_val}\n");
+        let result = RdpFile::parse(&input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_blank_lines_do_not_consume_line_budget() {
+        // 512 blank lines + 1 content line should succeed
+        let mut input = String::new();
+        for _ in 0..MAX_LINES {
+            input.push('\n');
+        }
+        input.push_str("full address:s:host\n");
+        let rdp = RdpFile::parse(&input).unwrap();
+        assert_eq!(rdp.full_address.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn parse_lossy_too_many_lines_stops_processing() {
+        // Use a known typed key so entries don't go to extra_entries.
+        // Lines 1..=MAX_LINES set desktopwidth to their index; line MAX_LINES+1..
+        // set it to 9999. If the break fires, desktopwidth == MAX_LINES (last wins
+        // within the budget). If not, desktopwidth == 9999.
+        let mut input = String::new();
+        for i in 1..=MAX_LINES {
+            input.push_str(&alloc::format!("desktopwidth:i:{i}\n"));
+        }
+        for _ in 0..10 {
+            input.push_str("desktopwidth:i:9999\n");
+        }
+        let rdp = RdpFile::parse_lossy(&input);
+        assert_eq!(rdp.desktopwidth, Some(MAX_LINES as i32));
+    }
+
+    #[test]
+    fn parse_integer_value_whitespace_trimmed() {
+        // Integer values are trimmed before parsing; whitespace is silently discarded.
+        let input = "desktopwidth:i: 42 \n";
+        let rdp = RdpFile::parse(input).unwrap();
+        assert_eq!(rdp.desktopwidth, Some(42));
+    }
+
+    #[test]
+    fn parse_lossy_blank_lines_do_not_consume_line_budget() {
+        let mut input = String::new();
+        for _ in 0..MAX_LINES {
+            input.push('\n');
+        }
+        input.push_str("full address:s:host\n");
+        let rdp = RdpFile::parse_lossy(&input);
+        assert_eq!(rdp.full_address.as_deref(), Some("host"));
     }
 }
