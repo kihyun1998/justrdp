@@ -51,7 +51,7 @@ use justrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason};
 #[cfg(feature = "alloc")]
 use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathUpdateType};
 #[cfg(feature = "alloc")]
-use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
+use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE, TPKT_VERSION};
 #[cfg(feature = "alloc")]
 use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
 
@@ -67,7 +67,10 @@ pub enum GracefulDisconnectReason {
     /// Server sent SetErrorInfoPdu with a specific error code.
     ServerError(u32),
     /// Server sent MCS DisconnectProviderUltimatum.
-    ServerDisconnect(u8),
+    /// Value is MCS T.125 disconnect reason (0=DomainDisconnected..4=ChannelPurged).
+    ServerDisconnect(DisconnectReason),
+    /// Server sent a redirection PDU during active session.
+    ServerRedirect,
     /// Server denied our shutdown request.
     ShutdownDenied,
     /// User-initiated disconnect.
@@ -102,13 +105,19 @@ pub enum ActiveStageOutput {
     PointerPosition { x: u16, y: u16 },
     /// Server sends a pointer bitmap (color/new/large/cached).
     PointerBitmap {
-        /// Pointer update sub-type.
-        pointer_type: u8,
+        /// Pointer update sub-type (slow-path messageType u16 or fast-path update code).
+        pointer_type: u16,
         /// Raw pointer data for decoding with `justrdp-graphics` pointer decoder.
         data: Vec<u8>,
     },
     /// Server sent Deactivate All PDU -- caller must drive reactivation.
     DeactivateAll(DeactivationReactivation),
+    /// Server re-sent Demand Active PDU during active session (deactivation-reactivation).
+    /// Caller must re-run the capability exchange using the raw PDU bytes.
+    ServerReactivation {
+        /// Raw remaining bytes after the ShareControlHeader (the DemandActivePdu body).
+        raw_pdu: Vec<u8>,
+    },
     /// Session terminated.
     Terminate(GracefulDisconnectReason),
     /// Server sent Save Session Info (logon notification, auto-reconnect cookie, etc.).
@@ -173,7 +182,10 @@ pub struct SessionConfig {
 #[cfg(feature = "alloc")]
 pub struct ActiveStage {
     config: SessionConfig,
-    decompressor: BulkDecompressor,
+    /// Decompressor for slow-path data (separate context per MS-RDPBCGR 3.2.5.3).
+    slow_path_decompressor: BulkDecompressor,
+    /// Decompressor for fast-path data (separate context per MS-RDPBCGR 3.2.5.3).
+    fast_path_decompressor: BulkDecompressor,
     complete_data: CompleteData,
     /// Last error info received from server (for correlating with disconnect).
     last_error_info: u32,
@@ -185,7 +197,8 @@ impl ActiveStage {
     pub fn new(config: SessionConfig) -> Self {
         Self {
             config,
-            decompressor: BulkDecompressor::new(),
+            slow_path_decompressor: BulkDecompressor::new(),
+            fast_path_decompressor: BulkDecompressor::new(),
             complete_data: CompleteData::new(),
             last_error_info: 0,
         }
@@ -200,8 +213,9 @@ impl ActiveStage {
         }
 
         // Discriminate fast-path vs slow-path by first byte.
-        // MS-RDPBCGR 2.2.9.1.2: TPKT version byte is 0x03; fast-path action is 0x00.
-        if frame[0] == 0x03 {
+        // MS-RDPBCGR 2.2.1.1: TPKT version byte is 0x03.
+        // MS-RDPBCGR 2.2.9.1.2: fast-path action field occupies bits 0-1.
+        if frame[0] == TPKT_VERSION {
             self.process_slow_path(frame)
         } else {
             self.process_fast_path(frame)
@@ -248,7 +262,7 @@ impl ActiveStage {
     fn process_fast_path(&mut self, frame: &[u8]) -> SessionResult<Vec<ActiveStageOutput>> {
         fast_path_proc::process_fast_path_output(
             frame,
-            &mut self.decompressor,
+            &mut self.fast_path_decompressor,
             &mut self.complete_data,
         )
     }
@@ -259,7 +273,7 @@ impl ActiveStage {
         x224_proc::process_slow_path(
             frame,
             &self.config,
-            &mut self.decompressor,
+            &mut self.slow_path_decompressor,
             &mut self.last_error_info,
         )
     }

@@ -14,11 +14,15 @@ use justrdp_bulk::mppc::PACKET_COMPRESSED;
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_pdu::rdp::fast_path::{
     FastPathInputEvent, FastPathInputHeader, FastPathOutputHeader, FastPathOutputUpdate,
-    FastPathUpdateType, FASTPATH_INPUT_ACTION_FASTPATH,
+    FastPathUpdateType, FASTPATH_INPUT_ACTION_FASTPATH, FASTPATH_OUTPUT_ACTION_FASTPATH,
 };
 
 use crate::complete_data::{AssembledUpdate, CompleteData};
 use crate::{ActiveStageOutput, SessionError, SessionResult};
+
+/// Maximum decompressed output size (16 MiB).
+/// Prevents decompression bombs from causing unbounded heap growth.
+const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
 // ── Fast-Path Output Processing (server → client) ──
 
@@ -33,7 +37,17 @@ pub(crate) fn process_fast_path_output(
     let mut src = ReadCursor::new(frame);
 
     // Decode the fast-path output header.
-    let _header = FastPathOutputHeader::decode(&mut src)?;
+    // numEvents in the header is informational; updates are delimited by src.remaining().
+    // MS-RDPBCGR 2.2.9.1.2 §Remarks.
+    let header = FastPathOutputHeader::decode(&mut src)?;
+
+    // Validate action field (MS-RDPBCGR 2.2.9.1.2: must be FASTPATH_OUTPUT_ACTION_FASTPATH).
+    if header.action != FASTPATH_OUTPUT_ACTION_FASTPATH {
+        return Err(SessionError::Protocol(format!(
+            "fast-path output: unexpected action field 0x{:02X}",
+            header.action,
+        )));
+    }
 
     // NOTE: Encryption handling (Standard RDP Security) is not implemented here.
     // When Enhanced RDP Security (TLS/CredSSP) is active, the payload is in the clear.
@@ -43,43 +57,47 @@ pub(crate) fn process_fast_path_output(
     let mut outputs = Vec::new();
     while src.remaining() > 0 {
         let update = FastPathOutputUpdate::decode(&mut src)?;
-
-        // Decompress if needed (per-update, not per-frame).
-        // MS-RDPBCGR 2.2.9.1.2.1: compressionFlags present when compression field != 0.
-        let decompressed_data = if let Some(compression_flags) = update.compression_flags {
-            if compression_flags & PACKET_COMPRESSED != 0 {
-                let mut decompressed = Vec::new();
-                decompressor
-                    .decompress(compression_flags, &update.update_data, &mut decompressed)
-                    .map_err(|e| SessionError::Decompress(format!("{e:?}")))?;
-                Some(decompressed)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Build the update with possibly decompressed data for reassembly.
-        let effective_update = if let Some(ref data) = decompressed_data {
-            FastPathOutputUpdate {
-                update_code: update.update_code,
-                fragmentation: update.fragmentation,
-                compression: 0,
-                compression_flags: None,
-                update_data: data.clone(),
-            }
-        } else {
-            update
-        };
+        let update = decompress_update(update, decompressor)?;
 
         // Run through fragment reassembly.
-        if let Some(assembled) = complete_data.process_update(&effective_update) {
+        if let Some(assembled) = complete_data.process_update(&update) {
             dispatch_update(assembled, &mut outputs);
         }
     }
 
     Ok(outputs)
+}
+
+/// Decompress a fast-path output update if compression flags indicate it.
+/// MS-RDPBCGR 2.2.9.1.2.1: compressionFlags present when compression field != 0.
+fn decompress_update(
+    update: FastPathOutputUpdate,
+    decompressor: &mut BulkDecompressor,
+) -> SessionResult<FastPathOutputUpdate> {
+    let compression_flags = match update.compression_flags {
+        Some(f) if f & PACKET_COMPRESSED != 0 => f,
+        _ => return Ok(update),
+    };
+    // NOTE: The cap check is post-allocation because BulkDecompressor does not
+    // support an output size limit. In practice, MPPC/NCRUSH/XCRUSH are bounded
+    // by their internal history buffer sizes (8K-64K per call), so decompression
+    // cannot produce output larger than MAX_DECOMPRESSED_BYTES in a single call.
+    let mut decompressed = Vec::new();
+    decompressor
+        .decompress(compression_flags, &update.update_data, &mut decompressed)
+        .map_err(|e| SessionError::Decompress(format!("{e:?}")))?;
+    if decompressed.len() > MAX_DECOMPRESSED_BYTES {
+        return Err(SessionError::Protocol(alloc::string::String::from(
+            "fast-path decompressed payload exceeds size limit",
+        )));
+    }
+    Ok(FastPathOutputUpdate {
+        update_code: update.update_code,
+        fragmentation: update.fragmentation,
+        compression: 0,
+        compression_flags: None,
+        update_data: decompressed,
+    })
 }
 
 /// Dispatch a reassembled update to the appropriate output variant.
@@ -117,7 +135,7 @@ fn dispatch_update(update: AssembledUpdate, outputs: &mut Vec<ActiveStageOutput>
         | FastPathUpdateType::PointerNew
         | FastPathUpdateType::PointerLarge => {
             outputs.push(ActiveStageOutput::PointerBitmap {
-                pointer_type: update.update_code as u8,
+                pointer_type: update.update_code as u16,
                 data: update.data,
             });
         }
@@ -131,7 +149,15 @@ fn dispatch_update(update: AssembledUpdate, outputs: &mut Vec<ActiveStageOutput>
 /// The frame is ready to send over the wire (no additional wrapping needed).
 /// Encryption is NOT applied (assumes Enhanced RDP Security / TLS).
 pub(crate) fn encode_fast_path_input(events: &[FastPathInputEvent]) -> SessionResult<Vec<u8>> {
-    // First, encode all events into a scratch buffer to determine total size.
+    // Validate event count first (MS-RDPBCGR 2.2.8.1.2: numEvents is u8, 1..=255).
+    if events.is_empty() || events.len() > 255 {
+        return Err(SessionError::Protocol(
+            alloc::string::String::from("fast-path input: event count must be 1..=255"),
+        ));
+    }
+    let num_events = events.len() as u8;
+
+    // Encode all events into a scratch buffer to determine total size.
     let mut events_buf = Vec::new();
     for event in events {
         let size = event.size();
@@ -141,32 +167,33 @@ pub(crate) fn encode_fast_path_input(events: &[FastPathInputEvent]) -> SessionRe
         event.encode(&mut cursor)?;
     }
 
-    if events.is_empty() || events.len() > 255 {
-        return Err(SessionError::Protocol(
-            alloc::string::String::from("fast-path input: event count must be 1..=255"),
-        ));
-    }
-    let num_events = events.len() as u8;
+    // Build the header. The length field affects header size (1 byte if < 0x80,
+    // 2 bytes if >= 0x80), so we iterate: compute header size with a trial length,
+    // then recompute if the actual total crosses the short/long-form boundary.
+    let extended_byte: usize = if num_events > 15 { 1 } else { 0 };
+    // First estimate: assume short-form length (1 byte).
+    let header_base = 1 + extended_byte; // byte0 + optional numEventsExt
+    let trial_total = header_base + 1 + events_buf.len(); // +1 for short-form length
+    let total_length = if trial_total > 0x7F {
+        // Long-form length (2 bytes) — recalculate.
+        header_base + 2 + events_buf.len()
+    } else {
+        trial_total
+    };
 
-    // Build the header.
-    // Under TLS: no encryption flags, no dataSignature.
+    // Fast-path length uses PER variable-length encoding: max 0x7FFF (15 bits).
+    if total_length > 0x7FFF {
+        return Err(SessionError::Protocol(alloc::string::String::from(
+            "fast-path input: frame too large for 15-bit PER length field",
+        )));
+    }
+    let total_length_u16 = total_length as u16;
+
     let header = FastPathInputHeader {
         action: FASTPATH_INPUT_ACTION_FASTPATH,
         num_events,
         flags: 0, // no encryption under Enhanced RDP Security
-        length: 0, // placeholder, filled below
-    };
-
-    // Calculate total frame size.
-    let header_size = header.size();
-    let total_length = header_size + events_buf.len();
-
-    // Re-create header with correct length.
-    let header = FastPathInputHeader {
-        action: FASTPATH_INPUT_ACTION_FASTPATH,
-        num_events,
-        flags: 0,
-        length: total_length as u16,
+        length: total_length_u16,
     };
 
     // Encode the complete frame.
@@ -400,6 +427,30 @@ mod tests {
         // "extended byte follows" — producing a malformed frame.
         let result = encode_fast_path_input(&[]);
         assert!(matches!(result, Err(SessionError::Protocol(_))));
+    }
+
+    #[test]
+    fn encode_long_form_length_boundary() {
+        // Regression test: when total frame length >= 0x80, the header uses 2-byte
+        // length encoding. The old code miscalculated this, causing buffer overflow.
+        // 65 scancode events × 2 bytes = 130 bytes of events, pushing total past 0x80.
+        let events: Vec<_> = (0..65)
+            .map(|i| {
+                FastPathInputEvent::Scancode(FastPathScancodeEvent {
+                    event_flags: 0,
+                    key_code: (i & 0xFF) as u8,
+                })
+            })
+            .collect();
+        let frame = encode_fast_path_input(&events).unwrap();
+
+        // Verify the frame is parseable.
+        let mut cursor = ReadCursor::new(&frame);
+        let hdr = FastPathInputHeader::decode(&mut cursor).unwrap();
+        assert_eq!(hdr.num_events, 65);
+        assert_eq!(hdr.length as usize, frame.len());
+        // Remaining bytes should exactly equal the events.
+        assert_eq!(cursor.remaining(), 65 * 2);
     }
 
     #[test]

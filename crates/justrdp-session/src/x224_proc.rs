@@ -31,6 +31,27 @@ use crate::{
     SessionError, SessionResult,
 };
 
+// MS-RDPBCGR 2.2.9.1.1.3: slow-path update types
+const UPDATETYPE_ORDERS: u16 = 0x0000;
+const UPDATETYPE_BITMAP: u16 = 0x0001;
+const UPDATETYPE_PALETTE: u16 = 0x0002;
+const UPDATETYPE_SYNCHRONIZE: u16 = 0x0003;
+
+// MS-RDPBCGR 2.2.9.1.1.4: slow-path pointer message types
+const TS_PTRMSGTYPE_SYSTEM: u16 = 0x0001;
+const TS_PTRMSGTYPE_POSITION: u16 = 0x0003;
+
+// MS-RDPBCGR 2.2.9.1.1.4.3: system pointer type values
+const SYSPTR_NULL: u32 = 0x00000000;
+const SYSPTR_DEFAULT: u32 = 0x00007F00;
+
+// MS-RDPBCGR 2.2.8.1.1.1.2: stream priority
+const STREAM_LOW: u8 = 1;
+
+/// Maximum decompressed output size (16 MiB).
+/// Prevents decompression bombs from causing unbounded heap growth.
+const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+
 /// Process a complete slow-path frame (starts with TPKT version byte 0x03).
 pub(crate) fn process_slow_path(
     frame: &[u8],
@@ -41,7 +62,17 @@ pub(crate) fn process_slow_path(
     let mut src = ReadCursor::new(frame);
 
     // Layer 1: TPKT header (4 bytes)
-    let _tpkt = TpktHeader::decode(&mut src)?;
+    let tpkt = TpktHeader::decode(&mut src)?;
+
+    // Bound inner parsing to the TPKT-declared payload length (defense-in-depth).
+    let payload_len = tpkt.payload_length();
+    if src.remaining() < payload_len {
+        return Err(SessionError::Protocol(alloc::string::String::from(
+            "TPKT payload length exceeds frame size",
+        )));
+    }
+    let inner_bytes = &frame[TPKT_HEADER_SIZE..TPKT_HEADER_SIZE + payload_len];
+    let mut src = ReadCursor::new(inner_bytes);
 
     // Layer 2: X.224 Data Transfer (3 bytes)
     let _dt = DataTransfer::decode(&mut src)?;
@@ -65,7 +96,7 @@ pub(crate) fn process_slow_path(
             let reason = if *last_error_info != ERRINFO_NONE {
                 GracefulDisconnectReason::ServerError(*last_error_info)
             } else {
-                GracefulDisconnectReason::ServerDisconnect(dpu.reason as u8)
+                GracefulDisconnectReason::ServerDisconnect(dpu.reason)
             };
             Ok(vec![ActiveStageOutput::Terminate(reason)])
         }
@@ -123,19 +154,16 @@ fn process_rdp_data(
             )])
         }
         ShareControlPduType::DemandActivePdu => {
-            // Server re-sent Demand Active (reactivation).
-            // For now, signal as deactivation -- caller must drive the response.
-            // The raw data is in `src.peek_remaining()`.
-            Ok(vec![ActiveStageOutput::DeactivateAll(
-                DeactivationReactivation {
-                    share_id: 0, // will be re-read from DemandActivePdu by caller
-                },
-            )])
+            // Server re-sent Demand Active during active session (deactivation-reactivation).
+            // MS-RDPBCGR 3.2.5.3.3: caller must re-run capability exchange.
+            // Return the raw PDU body so caller can decode DemandActivePdu fields.
+            let raw_pdu = src.peek_remaining().to_vec();
+            Ok(vec![ActiveStageOutput::ServerReactivation { raw_pdu }])
         }
         ShareControlPduType::ServerRedirect => {
             // Server redirection during active session (rare).
             Ok(vec![ActiveStageOutput::Terminate(
-                GracefulDisconnectReason::ServerDisconnect(0),
+                GracefulDisconnectReason::ServerRedirect,
             )])
         }
         _ => Ok(vec![]),
@@ -159,10 +187,17 @@ fn process_share_data(
             src.remaining()
         };
         let compressed = src.read_slice(compressed_len, "ShareData::compressedPayload")?;
+        // NOTE: Cap check is post-allocation — see fast_path_proc::decompress_update
+        // for rationale on why this is safe with current decompressor implementations.
         let mut decompressed = Vec::new();
         decompressor
             .decompress(data_hdr.compressed_type, compressed, &mut decompressed)
             .map_err(|e| SessionError::Decompress(format!("{e:?}")))?;
+        if decompressed.len() > MAX_DECOMPRESSED_BYTES {
+            return Err(SessionError::Protocol(alloc::string::String::from(
+                "slow-path decompressed payload exceeds size limit",
+            )));
+        }
         decompressed
     } else {
         let remaining = src.remaining();
@@ -185,13 +220,11 @@ fn dispatch_pdu_type2(
                 return Ok(vec![]);
             }
             let update_type = u16::from_le_bytes([data[0], data[1]]);
-            // Map slow-path update type to FastPathUpdateType for unified output.
-            // MS-RDPBCGR 2.2.9.1.1.3: UPDATETYPE_ORDERS=0, BITMAP=1, PALETTE=2, SYNCHRONIZE=3
             let update_code = match update_type {
-                0x0000 => FastPathUpdateType::Orders,
-                0x0001 => FastPathUpdateType::Bitmap,
-                0x0002 => FastPathUpdateType::Palette,
-                0x0003 => FastPathUpdateType::Synchronize,
+                UPDATETYPE_ORDERS => FastPathUpdateType::Orders,
+                UPDATETYPE_BITMAP => FastPathUpdateType::Bitmap,
+                UPDATETYPE_PALETTE => FastPathUpdateType::Palette,
+                UPDATETYPE_SYNCHRONIZE => FastPathUpdateType::Synchronize,
                 _ => return Ok(vec![]),
             };
             Ok(vec![ActiveStageOutput::GraphicsUpdate {
@@ -200,44 +233,7 @@ fn dispatch_pdu_type2(
             }])
         }
 
-        ShareDataPduType::Pointer => {
-            // Slow-path pointer update: messageType(u16) + pad2(u16) + data
-            if data.len() < 4 {
-                return Ok(vec![]);
-            }
-            let msg_type = u16::from_le_bytes([data[0], data[1]]);
-            // Map to fast-path pointer types for unified output.
-            match msg_type {
-                0x0001 => {
-                    // TS_PTRMSGTYPE_SYSTEM: pointerType u32
-                    if data.len() >= 8 {
-                        let ptr_type = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                        if ptr_type == 0 {
-                            Ok(vec![ActiveStageOutput::PointerHidden])
-                        } else {
-                            Ok(vec![ActiveStageOutput::PointerDefault])
-                        }
-                    } else {
-                        Ok(vec![])
-                    }
-                }
-                0x0003 => {
-                    // TS_PTRMSGTYPE_POSITION: xPos(u16) + yPos(u16)
-                    if data.len() >= 8 {
-                        let x = u16::from_le_bytes([data[4], data[5]]);
-                        let y = u16::from_le_bytes([data[6], data[7]]);
-                        Ok(vec![ActiveStageOutput::PointerPosition { x, y }])
-                    } else {
-                        Ok(vec![])
-                    }
-                }
-                // Color(6), Cached(7), New(8), Large(9) -- pass raw data.
-                _ => Ok(vec![ActiveStageOutput::PointerBitmap {
-                    pointer_type: msg_type as u8,
-                    data: data[4..].to_vec(),
-                }]),
-            }
-        }
+        ShareDataPduType::Pointer => handle_pointer_pdu(data),
 
         ShareDataPduType::SetErrorInfo => {
             // MS-RDPBCGR 3.2.5.5: SetErrorInfo is informational -- the session is still
@@ -245,9 +241,8 @@ fn dispatch_pdu_type2(
             // DisconnectProviderUltimatum arrives (or TCP drops).
             let mut inner_src = ReadCursor::new(data);
             let pdu = SetErrorInfoPdu::decode(&mut inner_src)?;
-            if pdu.error_info != ERRINFO_NONE {
-                *last_error_info = pdu.error_info;
-            }
+            // Unconditionally update: ERRINFO_NONE (0) clears any prior error state.
+            *last_error_info = pdu.error_info;
             Ok(vec![])
         }
 
@@ -283,6 +278,44 @@ fn dispatch_pdu_type2(
     }
 }
 
+/// Handle slow-path pointer update PDU.
+/// MS-RDPBCGR 2.2.9.1.1.4: messageType(u16) + pad2(u16) + pointer data
+fn handle_pointer_pdu(data: &[u8]) -> SessionResult<Vec<ActiveStageOutput>> {
+    if data.len() < 4 {
+        return Ok(vec![]);
+    }
+    let msg_type = u16::from_le_bytes([data[0], data[1]]);
+    let payload = &data[4..]; // skip messageType + pad2
+
+    match msg_type {
+        TS_PTRMSGTYPE_SYSTEM => {
+            if payload.len() < 4 {
+                return Ok(vec![]);
+            }
+            let ptr_type = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            match ptr_type {
+                SYSPTR_NULL => Ok(vec![ActiveStageOutput::PointerHidden]),
+                SYSPTR_DEFAULT => Ok(vec![ActiveStageOutput::PointerDefault]),
+                // Unknown system pointer type — treat as default.
+                _ => Ok(vec![ActiveStageOutput::PointerDefault]),
+            }
+        }
+        TS_PTRMSGTYPE_POSITION => {
+            if payload.len() < 4 {
+                return Ok(vec![]);
+            }
+            let x = u16::from_le_bytes([payload[0], payload[1]]);
+            let y = u16::from_le_bytes([payload[2], payload[3]]);
+            Ok(vec![ActiveStageOutput::PointerPosition { x, y }])
+        }
+        // Color(6), Cached(7), New(8), Large(9) -- pass raw data with u16 type.
+        _ => Ok(vec![ActiveStageOutput::PointerBitmap {
+            pointer_type: msg_type,
+            data: payload.to_vec(),
+        }]),
+    }
+}
+
 // ── Encoding helpers ──
 
 /// Encode a graceful shutdown request PDU.
@@ -295,14 +328,14 @@ pub(crate) fn encode_shutdown_request(
     let inner = &[];
 
     // Wrap in ShareDataHeader
-    let share_data = wrap_share_data(share_id, ShareDataPduType::ShutdownRequest, inner);
+    let share_data = wrap_share_data(share_id, ShareDataPduType::ShutdownRequest, inner)?;
 
     // Wrap in ShareControlHeader
     let share_control = wrap_share_control(
         ShareControlPduType::Data,
         user_channel_id,
         &share_data,
-    );
+    )?;
 
     // Wrap in MCS SendDataRequest + X.224 DT + TPKT
     encode_mcs_send_data(user_channel_id, io_channel_id, &share_control)
@@ -313,19 +346,24 @@ fn wrap_share_control(
     pdu_type: ShareControlPduType,
     pdu_source: u16,
     inner: &[u8],
-) -> Vec<u8> {
+) -> SessionResult<Vec<u8>> {
     let total_length = SHARE_CONTROL_HEADER_SIZE + inner.len();
+    let total_length_u16 = u16::try_from(total_length).map_err(|_| {
+        SessionError::Protocol(alloc::string::String::from(
+            "ShareControlHeader: payload too large for u16 length field",
+        ))
+    })?;
     let hdr = ShareControlHeader {
-        total_length: total_length as u16,
+        total_length: total_length_u16,
         pdu_type,
         pdu_source,
     };
 
     let mut buf = vec![0u8; total_length];
     let mut cursor = WriteCursor::new(&mut buf);
-    hdr.encode(&mut cursor).expect("share control header encode");
-    cursor.write_slice(inner, "share_control_inner").expect("share control inner");
-    buf
+    hdr.encode(&mut cursor)?;
+    cursor.write_slice(inner, "share_control_inner")?;
+    Ok(buf)
 }
 
 /// Build a ShareDataHeader + inner payload as bytes.
@@ -333,12 +371,17 @@ fn wrap_share_data(
     share_id: u32,
     pdu_type2: ShareDataPduType,
     inner: &[u8],
-) -> Vec<u8> {
+) -> SessionResult<Vec<u8>> {
     let total_length = SHARE_DATA_HEADER_SIZE + inner.len();
+    let uncompressed_length = u16::try_from(inner.len()).map_err(|_| {
+        SessionError::Protocol(alloc::string::String::from(
+            "ShareDataHeader: payload too large for u16 uncompressed_length",
+        ))
+    })?;
     let hdr = ShareDataHeader {
         share_id,
-        stream_id: 1, // STREAM_LOW -- MS-RDPBCGR 2.2.8.1.1.1.2
-        uncompressed_length: inner.len() as u16,
+        stream_id: STREAM_LOW,
+        uncompressed_length,
         pdu_type2,
         compressed_type: 0,
         compressed_length: 0,
@@ -346,15 +389,15 @@ fn wrap_share_data(
 
     let mut buf = vec![0u8; total_length];
     let mut cursor = WriteCursor::new(&mut buf);
-    hdr.encode(&mut cursor).expect("share data header encode");
-    cursor.write_slice(inner, "share_data_inner").expect("share data inner");
-    buf
+    hdr.encode(&mut cursor)?;
+    cursor.write_slice(inner, "share_data_inner")?;
+    Ok(buf)
 }
 
 /// Encode a PDU wrapped in TPKT + X.224 DT + MCS SendDataRequest.
 fn encode_mcs_send_data(
-    initiator: u16,
-    channel_id: u16,
+    initiator: u16, // user_channel_id per MCS SendDataRequest semantics
+    channel_id: u16, // I/O channel
     inner: &[u8],
 ) -> SessionResult<Vec<u8>> {
     let sdr = SendDataRequest {
@@ -365,6 +408,13 @@ fn encode_mcs_send_data(
 
     let mcs_size = DATA_TRANSFER_HEADER_SIZE + sdr.size();
     let total_size = TPKT_HEADER_SIZE + mcs_size;
+
+    // Guard against TPKT length overflow (u16 max = 65535).
+    if total_size > u16::MAX as usize {
+        return Err(SessionError::Protocol(alloc::string::String::from(
+            "MCS frame too large for TPKT u16 length field",
+        )));
+    }
 
     let mut buf = vec![0u8; total_size];
     let mut cursor = WriteCursor::new(&mut buf);
@@ -390,14 +440,14 @@ mod tests {
         inner_body: &[u8],
     ) -> Vec<u8> {
         // Build ShareDataHeader + inner body
-        let share_data = wrap_share_data(share_id, pdu_type2, inner_body);
+        let share_data = wrap_share_data(share_id, pdu_type2, inner_body).unwrap();
 
         // Build ShareControlHeader + share_data
         let share_control = wrap_share_control(
             ShareControlPduType::Data,
             0x03EA, // server pdu_source
             &share_data,
-        );
+        ).unwrap();
 
         // Build SendDataIndication
         let sdi = SendDataIndication {
@@ -586,7 +636,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
             ActiveStageOutput::Terminate(GracefulDisconnectReason::ServerDisconnect(reason)) => {
-                assert_eq!(*reason, DisconnectReason::UserRequested as u8);
+                assert_eq!(*reason, DisconnectReason::UserRequested);
             }
             _ => panic!("expected Terminate(ServerDisconnect)"),
         }
@@ -655,7 +705,7 @@ mod tests {
             ShareControlPduType::DeactivateAllPdu,
             0x03EA,
             &deactivate_body,
-        );
+        ).unwrap();
 
         // Wrap in SendDataIndication + X.224 + TPKT.
         let sdi = SendDataIndication {
@@ -734,6 +784,274 @@ mod tests {
                 assert_eq!(data.as_slice(), b"order_data");
             }
             _ => panic!("expected GraphicsUpdate with Orders"),
+        }
+    }
+
+    #[test]
+    fn process_slow_path_palette_update() {
+        let config = test_config();
+        let mut body = vec![];
+        body.extend_from_slice(&UPDATETYPE_PALETTE.to_le_bytes());
+        body.extend_from_slice(b"palette_data");
+        let frame = build_slow_path_frame(
+            config.io_channel_id, config.share_id, ShareDataPduType::Update, &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::GraphicsUpdate { update_code, .. } => {
+                assert_eq!(*update_code, FastPathUpdateType::Palette);
+            }
+            _ => panic!("expected GraphicsUpdate with Palette"),
+        }
+    }
+
+    #[test]
+    fn process_slow_path_synchronize_update() {
+        let config = test_config();
+        let mut body = vec![];
+        body.extend_from_slice(&UPDATETYPE_SYNCHRONIZE.to_le_bytes());
+        body.extend_from_slice(b"sync_data");
+        let frame = build_slow_path_frame(
+            config.io_channel_id, config.share_id, ShareDataPduType::Update, &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::GraphicsUpdate { update_code, .. } => {
+                assert_eq!(*update_code, FastPathUpdateType::Synchronize);
+            }
+            _ => panic!("expected GraphicsUpdate with Synchronize"),
+        }
+    }
+
+    #[test]
+    fn process_slow_path_unknown_update_type_is_skipped() {
+        let config = test_config();
+        let mut body = vec![];
+        body.extend_from_slice(&0xFFFFu16.to_le_bytes()); // unknown update type
+        body.extend_from_slice(b"unknown_data");
+        let frame = build_slow_path_frame(
+            config.io_channel_id, config.share_id, ShareDataPduType::Update, &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn process_slow_path_system_pointer_default() {
+        let config = test_config();
+        let mut body = vec![];
+        body.extend_from_slice(&TS_PTRMSGTYPE_SYSTEM.to_le_bytes());
+        body.extend_from_slice(&0x0000u16.to_le_bytes()); // pad2
+        body.extend_from_slice(&SYSPTR_DEFAULT.to_le_bytes()); // 0x00007F00
+        let frame = build_slow_path_frame(
+            config.io_channel_id, config.share_id, ShareDataPduType::Pointer, &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], ActiveStageOutput::PointerDefault);
+    }
+
+    /// Helper: build a ShareControl-level frame (no ShareDataHeader) for non-Data PDU types.
+    fn build_share_control_frame(
+        io_channel_id: u16,
+        pdu_type: ShareControlPduType,
+        inner_body: &[u8],
+    ) -> Vec<u8> {
+        let share_control = wrap_share_control(pdu_type, 0x03EA, inner_body).unwrap();
+
+        let sdi = SendDataIndication {
+            initiator: 0x03EA,
+            channel_id: io_channel_id,
+            user_data: &share_control,
+        };
+        let mcs_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let total_size = TPKT_HEADER_SIZE + mcs_size;
+        let mut frame = vec![0u8; total_size];
+        let mut cursor = WriteCursor::new(&mut frame);
+        TpktHeader::for_payload(mcs_size).encode(&mut cursor).unwrap();
+        DataTransfer.encode(&mut cursor).unwrap();
+        sdi.encode(&mut cursor).unwrap();
+        frame
+    }
+
+    #[test]
+    fn process_demand_active_pdu_returns_server_reactivation() {
+        let config = test_config();
+
+        // Dummy DemandActivePdu body (share_id + capability data).
+        let mut demand_body = vec![];
+        demand_body.extend_from_slice(&0xCAFEBABEu32.to_le_bytes()); // shareId
+        demand_body.extend_from_slice(b"capability_data");
+
+        let frame = build_share_control_frame(
+            config.io_channel_id,
+            ShareControlPduType::DemandActivePdu,
+            &demand_body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::ServerReactivation { raw_pdu } => {
+                // The raw PDU should contain the demand_body bytes.
+                assert_eq!(raw_pdu, &demand_body);
+            }
+            other => panic!("expected ServerReactivation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn process_server_redirect_returns_terminate() {
+        let config = test_config();
+
+        // ServerRedirect with some dummy redirect data.
+        let redirect_body = b"redirect_data";
+        let frame = build_share_control_frame(
+            config.io_channel_id,
+            ShareControlPduType::ServerRedirect,
+            redirect_body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0],
+            ActiveStageOutput::Terminate(GracefulDisconnectReason::ServerRedirect)
+        );
+    }
+
+    #[test]
+    fn set_error_info_cleared_before_disconnect_uses_disconnect_reason() {
+        let config = test_config();
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+
+        // 1. SetErrorInfo with non-zero error code.
+        let body = 3u32.to_le_bytes();
+        let frame = build_slow_path_frame(config.io_channel_id, config.share_id, ShareDataPduType::SetErrorInfo, &body);
+        let _ = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(last_error_info, 3);
+
+        // 2. SetErrorInfo with ERRINFO_NONE — clears the error state.
+        let body = 0u32.to_le_bytes();
+        let frame = build_slow_path_frame(config.io_channel_id, config.share_id, ShareDataPduType::SetErrorInfo, &body);
+        let _ = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(last_error_info, 0, "ERRINFO_NONE must clear stored error");
+
+        // 3. DisconnectProviderUltimatum — should use ServerDisconnect, not ServerError.
+        let dpu = DisconnectProviderUltimatum {
+            reason: DisconnectReason::UserRequested,
+        };
+        let mcs_size = DATA_TRANSFER_HEADER_SIZE + dpu.size();
+        let total_size = TPKT_HEADER_SIZE + mcs_size;
+        let mut frame = vec![0u8; total_size];
+        let mut cursor = WriteCursor::new(&mut frame);
+        TpktHeader::for_payload(mcs_size).encode(&mut cursor).unwrap();
+        DataTransfer.encode(&mut cursor).unwrap();
+        dpu.encode(&mut cursor).unwrap();
+
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::Terminate(GracefulDisconnectReason::ServerDisconnect(reason)) => {
+                assert_eq!(*reason, DisconnectReason::UserRequested);
+            }
+            other => panic!("expected Terminate(ServerDisconnect), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn encode_disconnect_roundtrip() {
+        let config = test_config();
+        let stage = crate::ActiveStage::new(config);
+        let frame = stage.encode_disconnect().unwrap();
+
+        // Should be TPKT + X.224 DT + DPU.
+        assert_eq!(frame[0], justrdp_pdu::tpkt::TPKT_VERSION);
+        let mut src = ReadCursor::new(&frame);
+        let _tpkt = TpktHeader::decode(&mut src).unwrap();
+        let _dt = DataTransfer::decode(&mut src).unwrap();
+        let dpu = DisconnectProviderUltimatum::decode(&mut src).unwrap();
+        assert_eq!(dpu.reason, DisconnectReason::UserRequested);
+        assert_eq!(src.remaining(), 0);
+    }
+
+    #[test]
+    fn process_slow_path_truncated_pointer_position_is_dropped() {
+        let config = test_config();
+        // TS_PTRMSGTYPE_POSITION with only 2 bytes of payload (needs 4).
+        let mut body = vec![];
+        body.extend_from_slice(&TS_PTRMSGTYPE_POSITION.to_le_bytes());
+        body.extend_from_slice(&0x0000u16.to_le_bytes()); // pad2
+        body.extend_from_slice(&[0x00, 0x00]); // only 2 bytes, needs 4
+        let frame = build_slow_path_frame(
+            config.io_channel_id, config.share_id, ShareDataPduType::Pointer, &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn process_slow_path_truncated_system_pointer_is_dropped() {
+        let config = test_config();
+        // TS_PTRMSGTYPE_SYSTEM with only 2 bytes of payload (needs 4 for pointerType u32).
+        let mut body = vec![];
+        body.extend_from_slice(&TS_PTRMSGTYPE_SYSTEM.to_le_bytes());
+        body.extend_from_slice(&0x0000u16.to_le_bytes()); // pad2
+        body.extend_from_slice(&[0x00, 0x00]); // only 2 bytes, needs 4
+        let frame = build_slow_path_frame(
+            config.io_channel_id, config.share_id, ShareDataPduType::Pointer, &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn process_slow_path_pointer_bitmap_color() {
+        let config = test_config();
+        // TS_PTRMSGTYPE_COLOR (0x0006) with dummy data.
+        let mut body = vec![];
+        body.extend_from_slice(&0x0006u16.to_le_bytes()); // messageType = COLOR
+        body.extend_from_slice(&0x0000u16.to_le_bytes()); // pad2
+        body.extend_from_slice(b"color_pointer_data");
+        let frame = build_slow_path_frame(
+            config.io_channel_id, config.share_id, ShareDataPduType::Pointer, &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::PointerBitmap { pointer_type, data } => {
+                assert_eq!(*pointer_type, 0x0006);
+                assert_eq!(data.as_slice(), b"color_pointer_data");
+            }
+            other => panic!("expected PointerBitmap, got {:?}", other),
         }
     }
 }
