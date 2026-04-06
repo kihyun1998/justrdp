@@ -196,6 +196,10 @@ impl<'de> Decode<'de> for PersistentKeyListPdu {
         src.skip(3, "PersistentKeyList::pad")?;
 
         let total_keys: usize = num_entries.iter().map(|&n| n as usize).sum();
+        // MS-RDPBCGR 2.2.1.17: cap total keys to prevent excessive allocation
+        if total_keys > 16384 {
+            return Err(DecodeError::unexpected_value("PersistentKeyListPdu", "totalKeys", "exceeds maximum 16384"));
+        }
         let mut keys = Vec::with_capacity(total_keys);
         for _ in 0..total_keys {
             keys.push(PersistentKeyEntry {
@@ -500,6 +504,10 @@ impl Encode for MonitorLayoutPdu {
 impl<'de> Decode<'de> for MonitorLayoutPdu {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let count = src.read_u32_le("MonitorLayout::monitorCount")? as usize;
+        // MS-RDPBCGR 2.2.12.1: practical limit consistent with ClientMonitorData
+        if count > 16 {
+            return Err(DecodeError::unexpected_value("MonitorLayoutPdu", "monitorCount", "exceeds maximum 16"));
+        }
         let mut monitors = Vec::with_capacity(count);
         for _ in 0..count {
             monitors.push(MonitorLayoutEntry {

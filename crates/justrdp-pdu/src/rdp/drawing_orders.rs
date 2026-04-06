@@ -924,6 +924,9 @@ impl Encode for AlternateSecondaryOrder {
         // controlFlags: bits 2-7 = order type, bits 0-1 = 0 (not TS_STANDARD).
         let control_flags = (self.order_type as u8) << 2;
         dst.write_u8(control_flags, "AlternateSecondaryOrder::controlFlags")?;
+        if self.data.len() > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("AlternateSecondaryOrder", "data too large for u16"));
+        }
         let order_length = self.data.len() as u16;
         dst.write_u16_le(order_length, "AlternateSecondaryOrder::orderLength")?;
         dst.write_slice(&self.data, "AlternateSecondaryOrder::data")?;

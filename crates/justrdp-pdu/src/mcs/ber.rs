@@ -52,9 +52,11 @@ pub fn write_length(dst: &mut WriteCursor<'_>, length: usize, ctx: &'static str)
     } else if length <= 0xFF {
         dst.write_u8(0x81, ctx)?;
         dst.write_u8(length as u8, ctx)?;
-    } else {
+    } else if length <= u16::MAX as usize {
         dst.write_u8(0x82, ctx)?;
         dst.write_u16_be(length as u16, ctx)?;
+    } else {
+        return Err(justrdp_core::EncodeError::other(ctx, "BER length exceeds u16::MAX"));
     }
     Ok(())
 }

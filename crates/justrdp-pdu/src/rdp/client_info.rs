@@ -154,11 +154,16 @@ impl Encode for ClientInfoPdu {
         let workdir = utf16le_bytes(&self.working_dir);
 
         // Length fields (cbDomain, cbUserName, etc.) exclude null terminator
-        dst.write_u16_le(domain.len() as u16, "ClientInfo::cbDomain")?;
-        dst.write_u16_le(user.len() as u16, "ClientInfo::cbUserName")?;
-        dst.write_u16_le(pass.len() as u16, "ClientInfo::cbPassword")?;
-        dst.write_u16_le(shell.len() as u16, "ClientInfo::cbAlternateShell")?;
-        dst.write_u16_le(workdir.len() as u16, "ClientInfo::cbWorkingDir")?;
+        macro_rules! check_u16 {
+            ($val:expr, $ctx:expr) => {
+                u16::try_from($val).map_err(|_| justrdp_core::EncodeError::other($ctx, "too long for u16"))?
+            };
+        }
+        dst.write_u16_le(check_u16!(domain.len(), "ClientInfo::cbDomain"), "ClientInfo::cbDomain")?;
+        dst.write_u16_le(check_u16!(user.len(), "ClientInfo::cbUserName"), "ClientInfo::cbUserName")?;
+        dst.write_u16_le(check_u16!(pass.len(), "ClientInfo::cbPassword"), "ClientInfo::cbPassword")?;
+        dst.write_u16_le(check_u16!(shell.len(), "ClientInfo::cbAlternateShell"), "ClientInfo::cbAlternateShell")?;
+        dst.write_u16_le(check_u16!(workdir.len(), "ClientInfo::cbWorkingDir"), "ClientInfo::cbWorkingDir")?;
 
         // String data: each followed by null terminator (2 bytes for Unicode)
         dst.write_slice(&domain, "ClientInfo::domain")?;
@@ -203,7 +208,10 @@ impl Encode for ClientInfoPdu {
 
             // Auto-reconnect cookie
             if let Some(ref cookie) = extra.auto_reconnect_cookie {
-                dst.write_u16_le(cookie.len() as u16, "ExtInfo::cbAutoReconnectCookie")?;
+                let cb_cookie = u16::try_from(cookie.len()).map_err(|_| {
+                    justrdp_core::EncodeError::other("ExtInfo::cbAutoReconnectCookie", "cookie too long for u16")
+                })?;
+                dst.write_u16_le(cb_cookie, "ExtInfo::cbAutoReconnectCookie")?;
                 dst.write_slice(cookie, "ExtInfo::autoReconnectCookie")?;
             } else {
                 dst.write_u16_le(0, "ExtInfo::cbAutoReconnectCookie")?;

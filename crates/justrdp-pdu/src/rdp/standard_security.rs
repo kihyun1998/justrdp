@@ -458,7 +458,12 @@ impl RdpSecurityContext {
             self.decrypt_rc4 = Rc4::new(&self.keys.decrypt_key[..self.keys.key_len]);
         }
 
-        computed_mac == *expected_mac
+        // Constant-time comparison to prevent timing oracle attacks
+        let mut diff = 0u8;
+        for (a, b) in computed_mac.iter().zip(expected_mac.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
     }
 
     /// Get the current encryption method.

@@ -814,7 +814,7 @@ impl<'de> Decode<'de> for VirtualChannelCapability {
     }
 }
 
-/// Draw Nine Grid Cache Capability Set (MS-RDPBCGR 2.2.7.2.8).
+/// Draw Nine Grid Cache Capability Set (MS-RDPBCGR 2.2.7.2.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrawNineGridCacheCapability {
     pub draw_nine_grid_support_level: u32,
@@ -1347,6 +1347,9 @@ impl Encode for DemandActivePdu {
 
         dst.write_slice(&self.source_descriptor, "DemandActive::sourceDescriptor")?;
 
+        if self.capability_sets.len() > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("DemandActive", "too many capability sets for u16"));
+        }
         dst.write_u16_le(self.capability_sets.len() as u16, "DemandActive::numberCapabilities")?;
         dst.write_u16_le(0, "DemandActive::pad2")?;
 
@@ -1424,6 +1427,9 @@ impl Encode for ConfirmActivePdu {
 
         dst.write_slice(&self.source_descriptor, "ConfirmActive::sourceDescriptor")?;
 
+        if self.capability_sets.len() > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ConfirmActive", "too many capability sets for u16"));
+        }
         dst.write_u16_le(self.capability_sets.len() as u16, "ConfirmActive::numberCapabilities")?;
         dst.write_u16_le(0, "ConfirmActive::pad2")?;
 

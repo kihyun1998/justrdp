@@ -1020,6 +1020,54 @@ mod tests {
     }
 
     #[test]
+    fn output_header_num_events_zero_roundtrip() {
+        // num_events == 0 must use extended byte path
+        let hdr = FastPathOutputHeader {
+            action: 0,
+            num_events: 0,
+            flags: 0,
+            length: 10,
+        };
+        let size = hdr.size();
+        // Extended byte should be present: 1 (byte0) + 1 (length<0x80) + 1 (ext) = 3
+        assert_eq!(size, 3);
+
+        let mut buf = vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        hdr.encode(&mut cursor).unwrap();
+
+        // 4-bit field in byte0 should be 0
+        assert_eq!((buf[0] >> 2) & 0x0F, 0);
+        // Extended byte (last byte) should be 0
+        assert_eq!(buf[2], 0);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = FastPathOutputHeader::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.num_events, 0);
+        assert_eq!(decoded.length, 10);
+    }
+
+    #[test]
+    fn input_header_num_events_zero_roundtrip() {
+        let hdr = FastPathInputHeader {
+            action: FASTPATH_INPUT_ACTION_FASTPATH,
+            num_events: 0,
+            flags: 0,
+            length: 5,
+        };
+        let size = hdr.size();
+        assert_eq!(size, 3); // 1 + 1 + 1 (extended byte)
+
+        let mut buf = vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        hdr.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = FastPathInputHeader::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.num_events, 0);
+    }
+
+    #[test]
     fn generic_input_event_empty_input_returns_error() {
         let buf: &[u8] = &[];
         let mut cursor = ReadCursor::new(buf);

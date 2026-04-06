@@ -162,16 +162,19 @@ impl RdstlsAuthenticationRequest {
 
         // Domain
         let domain_with_null = append_null_utf16(domain);
+        assert!(domain_with_null.len() <= u16::MAX as usize, "RDSTLS domain too long for u16");
         auth_data.extend_from_slice(&(domain_with_null.len() as u16).to_le_bytes());
         auth_data.extend_from_slice(&domain_with_null);
 
         // Username
         let user_with_null = append_null_utf16(username);
+        assert!(user_with_null.len() <= u16::MAX as usize, "RDSTLS username too long for u16");
         auth_data.extend_from_slice(&(user_with_null.len() as u16).to_le_bytes());
         auth_data.extend_from_slice(&user_with_null);
 
         // Password
         let pass_with_null = append_null_utf16(password);
+        assert!(pass_with_null.len() <= u16::MAX as usize, "RDSTLS password too long for u16");
         auth_data.extend_from_slice(&(pass_with_null.len() as u16).to_le_bytes());
         auth_data.extend_from_slice(&pass_with_null);
 
@@ -213,7 +216,11 @@ impl RdstlsAuthenticationRequest {
 
 impl Encode for RdstlsAuthenticationRequest {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let total_len = self.size() as u16;
+        let size = self.size();
+        if size > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("RdstlsAuth", "pduLength exceeds u16"));
+        }
+        let total_len = size as u16;
         // Header
         dst.write_u16_le(RDSTLS_VERSION_1, "RdstlsAuth::version")?;
         dst.write_u16_le(RdstlsDataType::AuthenticationRequest as u16, "RdstlsAuth::dataType")?;
@@ -227,6 +234,9 @@ impl Encode for RdstlsAuthenticationRequest {
         }
 
         // Auth data length + data
+        if self.auth_data.len() > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("RdstlsAuth", "authData exceeds u16"));
+        }
         dst.write_u16_le(self.auth_data.len() as u16, "RdstlsAuth::authDataLen")?;
         dst.write_slice(&self.auth_data, "RdstlsAuth::authData")?;
 

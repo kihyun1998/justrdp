@@ -172,6 +172,9 @@ impl Encode for LicenseErrorMessage {
         dst.write_u32_le(self.state_transition as u32, "LicenseError::stateTransition")?;
         // Error info blob: wBlobType(2) + wBlobLen(2) + data
         dst.write_u16_le(0x0004, "LicenseError::blobType")?; // BB_ERROR_BLOB
+        if self.error_info.len() > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("LicenseError", "blobLen exceeds u16"));
+        }
         dst.write_u16_le(self.error_info.len() as u16, "LicenseError::blobLen")?;
         if !self.error_info.is_empty() {
             dst.write_slice(&self.error_info, "LicenseError::blobData")?;

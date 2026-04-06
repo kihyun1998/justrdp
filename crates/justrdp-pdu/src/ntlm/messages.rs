@@ -164,6 +164,7 @@ impl AvPair {
         let mut offset = 0;
 
         for p in pairs {
+            assert!(p.value.len() <= u16::MAX as usize, "AV_PAIR value exceeds u16");
             buf[offset..offset + 2].copy_from_slice(&p.id.to_le_bytes());
             buf[offset + 2..offset + 4].copy_from_slice(&(p.value.len() as u16).to_le_bytes());
             buf[offset + 4..offset + 4 + p.value.len()].copy_from_slice(&p.value);
@@ -431,7 +432,12 @@ impl AuthenticateMessage {
             + self.workstation.len()
             + self.encrypted_random_session_key.len();
         // Each field length must fit in u16 for NTLM wire format
-        debug_assert!(payload_size <= u16::MAX as usize, "NTLM payload exceeds u16 limit");
+        assert!(self.lm_response.len() <= u16::MAX as usize, "NTLM lm_response exceeds u16");
+        assert!(self.nt_response.len() <= u16::MAX as usize, "NTLM nt_response exceeds u16");
+        assert!(self.domain_name.len() <= u16::MAX as usize, "NTLM domain_name exceeds u16");
+        assert!(self.user_name.len() <= u16::MAX as usize, "NTLM user_name exceeds u16");
+        assert!(self.workstation.len() <= u16::MAX as usize, "NTLM workstation exceeds u16");
+        assert!(self.encrypted_random_session_key.len() <= u16::MAX as usize, "NTLM session_key exceeds u16");
         let total = header_size + payload_size;
         let mut buf = vec![0u8; total];
 
