@@ -5,6 +5,13 @@
 #![doc = "Tracks keyboard and mouse state, generates diff-based input events."]
 
 // ══════════════════════════════════════════════════════════════
+// Constants
+// ══════════════════════════════════════════════════════════════
+
+/// Total number of scancodes in the 9-bit space (8-bit code × extended flag).
+const SCANCODE_COUNT: usize = 512;
+
+// ══════════════════════════════════════════════════════════════
 // Scancode
 // ══════════════════════════════════════════════════════════════
 
@@ -35,6 +42,19 @@ impl Scancode {
         (self.code as usize) | if self.extended { 256 } else { 0 }
     }
 
+    /// Try to create from a 9-bit index. Returns `None` if `index >= 512`.
+    #[must_use]
+    pub const fn try_from_index(index: usize) -> Option<Self> {
+        if index < SCANCODE_COUNT {
+            Some(Self {
+                code: (index & 0xFF) as u8,
+                extended: index & 256 != 0,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Create from a 9-bit index. `index` must be in `0..512`.
     ///
     /// # Panics
@@ -42,10 +62,9 @@ impl Scancode {
     /// Panics if `index >= 512`.
     #[must_use]
     pub fn from_index(index: usize) -> Self {
-        assert!(index < 512, "Scancode index out of range: {index}");
-        Self {
-            code: (index & 0xFF) as u8,
-            extended: index & 256 != 0,
+        match Self::try_from_index(index) {
+            Some(sc) => sc,
+            None => panic!("Scancode index out of range"),
         }
     }
 }
@@ -96,7 +115,13 @@ impl MouseButton {
 pub enum Operation {
     KeyPressed(Scancode),
     KeyReleased(Scancode),
+    /// Unicode key press event (MS-RDPBCGR §2.2.8.1.1.3.1.1.2).
+    ///
+    /// Stateless — not tracked by [`InputDatabase`]. Callers construct this
+    /// variant directly; no deduplication is applied and [`InputDatabase::release_all`]
+    /// does not emit unicode key-release events.
     UnicodeKeyPressed(u16),
+    /// Unicode key release event. See [`Operation::UnicodeKeyPressed`].
     UnicodeKeyReleased(u16),
     MouseButtonPressed(MouseButton),
     MouseButtonReleased(MouseButton),
@@ -112,34 +137,14 @@ pub enum Operation {
     SynchronizeEvent(LockKeys),
 }
 
-impl Operation {
-    /// Create a wheel rotation operation. Stateless — always produces an event.
-    #[must_use]
-    pub fn wheel_rotations(delta: i16) -> Self {
-        Self::WheelRotations(delta)
-    }
-
-    /// Create a horizontal wheel rotation operation. Stateless — always produces an event.
-    #[must_use]
-    pub fn horizontal_wheel_rotations(delta: i16) -> Self {
-        Self::HorizontalWheelRotations(delta)
-    }
-
-    /// Create a relative mouse move operation. Stateless — always produces an event.
-    #[must_use]
-    pub fn relative_mouse_move(dx: i16, dy: i16) -> Self {
-        Self::RelativeMouseMove { dx, dy }
-    }
-}
-
 // ══════════════════════════════════════════════════════════════
 // Lock key flags (for synchronize_event)
 // ══════════════════════════════════════════════════════════════
 
 /// Lock key state flags.
 ///
-/// - Slow-path: MS-RDPBCGR §2.2.1.14 (Synchronize PDU)
-/// - Fast-path: MS-RDPBCGR §2.2.8.1.1.3.1.1.5 (TS_FP_SYNC_EVENT toggleFlags)
+/// - Slow-path: MS-RDPBCGR §2.2.8.1.1.3.1.1.5 (TS_SYNCHRONIZE_EVENT)
+/// - Fast-path: MS-RDPBCGR §2.2.8.1.2.2.5 (TS_FP_SYNC_EVENT)
 ///
 /// Both contexts use the same bit encoding for scroll/num/caps/kana locks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -151,6 +156,14 @@ pub struct LockKeys {
 }
 
 impl LockKeys {
+    /// All lock keys off.
+    pub const DEFAULT: Self = Self {
+        scroll_lock: false,
+        num_lock: false,
+        caps_lock: false,
+        kana_lock: false,
+    };
+
     /// Encode as u16 flags (MS-RDPBCGR §2.2.8.1.1.3.1.1.5).
     pub const fn to_flags(self) -> u16 {
         let mut flags = 0u16;
@@ -179,12 +192,12 @@ impl LockKeys {
 /// 512-bit bitfield tracking all keyboard scancode states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeyboardState {
-    bits: [u64; 8], // 8 × 64 = 512 bits
+    bits: [u64; SCANCODE_COUNT / 64],
 }
 
 impl KeyboardState {
     const fn new() -> Self {
-        Self { bits: [0; 8] }
+        Self { bits: [0; SCANCODE_COUNT / 64] }
     }
 
     #[inline]
@@ -208,7 +221,7 @@ impl KeyboardState {
     }
 
     fn release_all(&mut self) {
-        self.bits = [0; 8];
+        self.bits = [0; SCANCODE_COUNT / 64];
     }
 }
 
@@ -254,7 +267,12 @@ impl MouseState {
 
 /// Maximum number of operations that `release_all` can produce:
 /// 512 scancodes + 5 mouse buttons.
-pub const MAX_RELEASE_OPS: usize = 512 + MouseButton::ALL.len();
+pub const MAX_RELEASE_OPS: usize = SCANCODE_COUNT + MouseButton::ALL.len();
+
+// Compile-time proof: pin concrete values so future changes trigger a build failure.
+const _: () = assert!(SCANCODE_COUNT == 512);
+const _: () = assert!(MouseButton::ALL.len() == 5);
+const _: () = assert!(MAX_RELEASE_OPS == 517);
 
 /// Input state tracker with diff-based event generation.
 ///
@@ -268,17 +286,14 @@ pub struct InputDatabase {
 }
 
 impl InputDatabase {
-    /// Create a new input database with all keys/buttons released.
+    /// Create a new input database with all keys/buttons released and lock keys off.
+    ///
+    /// Callers should send a [`Self::synchronize_event`] on first focus to align server state.
     pub const fn new() -> Self {
         Self {
             keyboard: KeyboardState::new(),
             mouse: MouseState::new(),
-            lock_keys: LockKeys {
-                scroll_lock: false,
-                num_lock: false,
-                caps_lock: false,
-                kana_lock: false,
-            },
+            lock_keys: LockKeys::DEFAULT,
         }
     }
 
@@ -367,20 +382,20 @@ impl InputDatabase {
     pub fn release_all(&mut self, ops: &mut [Operation; MAX_RELEASE_OPS]) -> usize {
         let mut count = 0;
 
-        // Release all keyboard keys (512 scancodes max)
-        for i in 0..512 {
+        // Release all keyboard keys.
+        // Invariant: count ≤ pressed scancodes (at most SCANCODE_COUNT) + pressed
+        // buttons (at most 5) = MAX_RELEASE_OPS = ops.len(). Proved at compile time.
+        for i in 0..SCANCODE_COUNT {
             let sc = Scancode::from_index(i);
             if self.keyboard.is_pressed(sc) {
-                debug_assert!(count < ops.len());
                 ops[count] = Operation::KeyReleased(sc);
                 count += 1;
             }
         }
 
-        // Release all mouse buttons (5 buttons max)
+        // Release all mouse buttons.
         for &button in &MouseButton::ALL {
             if self.mouse.is_pressed(button) {
-                debug_assert!(count < ops.len());
                 ops[count] = Operation::MouseButtonReleased(button);
                 count += 1;
             }
@@ -554,15 +569,15 @@ mod tests {
     // ── Wheel ──
 
     #[test]
-    fn wheel_rotations_always_generates() {
-        let op = Operation::wheel_rotations(-120);
-        assert_eq!(op, Operation::WheelRotations(-120));
+    fn wheel_rotations_variant() {
+        assert_eq!(Operation::WheelRotations(-120), Operation::WheelRotations(-120));
+        assert_ne!(Operation::WheelRotations(-120), Operation::WheelRotations(120));
     }
 
     #[test]
-    fn horizontal_wheel_rotations() {
-        let op = Operation::horizontal_wheel_rotations(120);
-        assert_eq!(op, Operation::HorizontalWheelRotations(120));
+    fn horizontal_wheel_rotations_variant() {
+        assert_eq!(Operation::HorizontalWheelRotations(120), Operation::HorizontalWheelRotations(120));
+        assert_ne!(Operation::HorizontalWheelRotations(1), Operation::HorizontalWheelRotations(2));
     }
 
     // ── Synchronize ──
@@ -607,12 +622,12 @@ mod tests {
     #[test]
     fn all_512_scancodes() {
         let mut db = InputDatabase::new();
-        for i in 0..512 {
+        for i in 0..SCANCODE_COUNT {
             let sc = Scancode::from_index(i);
             assert!(db.key_press(sc).is_some());
             assert!(db.is_key_pressed(sc));
         }
-        for i in 0..512 {
+        for i in 0..SCANCODE_COUNT {
             let sc = Scancode::from_index(i);
             assert!(db.key_release(sc).is_some());
             assert!(!db.is_key_pressed(sc));
@@ -705,8 +720,57 @@ mod tests {
 
     #[test]
     fn wheel_boundary_deltas() {
-        assert_eq!(Operation::wheel_rotations(0), Operation::WheelRotations(0));
-        assert_eq!(Operation::wheel_rotations(i16::MAX), Operation::WheelRotations(i16::MAX));
-        assert_eq!(Operation::wheel_rotations(i16::MIN), Operation::WheelRotations(i16::MIN));
+        // Verify boundary values are representable.
+        let _ = Operation::WheelRotations(0);
+        let _ = Operation::WheelRotations(i16::MAX);
+        let _ = Operation::WheelRotations(i16::MIN);
+    }
+
+    // ── Additional gap tests ──
+
+    #[test]
+    fn relative_mouse_move_variant() {
+        let op = Operation::RelativeMouseMove { dx: -5, dy: 10 };
+        assert_eq!(op, Operation::RelativeMouseMove { dx: -5, dy: 10 });
+        assert_ne!(op, Operation::RelativeMouseMove { dx: 5, dy: 10 });
+    }
+
+    #[test]
+    fn synchronize_event_emits_unconditionally() {
+        let mut db = InputDatabase::new();
+        let locks = LockKeys { scroll_lock: false, num_lock: true, caps_lock: false, kana_lock: false };
+        let op1 = db.synchronize_event(locks);
+        let op2 = db.synchronize_event(locks); // same state — must still emit
+        assert_eq!(op1, Operation::SynchronizeEvent(locks));
+        assert_eq!(op2, Operation::SynchronizeEvent(locks));
+    }
+
+    #[test]
+    fn mouse_button_release_without_press_suppressed() {
+        let mut db = InputDatabase::new();
+        assert_eq!(db.mouse_button_release(MouseButton::Left), None);
+        assert_eq!(db.mouse_button_release(MouseButton::X2), None);
+    }
+
+    #[test]
+    fn initial_lock_keys_state() {
+        let db = InputDatabase::new();
+        assert_eq!(db.lock_keys(), LockKeys::default());
+        assert_eq!(db.lock_keys().to_flags(), 0);
+    }
+
+    #[test]
+    fn try_from_index_valid() {
+        for i in 0..512 {
+            assert!(Scancode::try_from_index(i).is_some());
+            assert_eq!(Scancode::try_from_index(i).unwrap(), Scancode::from_index(i));
+        }
+    }
+
+    #[test]
+    fn try_from_index_out_of_range() {
+        assert!(Scancode::try_from_index(512).is_none());
+        assert!(Scancode::try_from_index(1000).is_none());
+        assert!(Scancode::try_from_index(usize::MAX).is_none());
     }
 }
