@@ -31,8 +31,11 @@ impl ServerCoreData {
 
 impl Encode for ServerCoreData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let total = self.size() as u16;
-        write_block_header(dst, ServerDataBlockType::CoreData as u16, total, "ServerCoreData::header")?;
+        let size = self.size();
+        if size > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ServerCoreData", "size exceeds u16"));
+        }
+        write_block_header(dst, ServerDataBlockType::CoreData as u16, size as u16, "ServerCoreData::header")?;
         dst.write_u32_le(self.version, "ServerCoreData::version")?;
         if let Some(v) = self.client_requested_protocols {
             dst.write_u32_le(v, "ServerCoreData::clientRequestedProtocols")?;
@@ -112,8 +115,11 @@ impl ServerSecurityData {
 
 impl Encode for ServerSecurityData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let total = self.size() as u16;
-        write_block_header(dst, ServerDataBlockType::SecurityData as u16, total, "ServerSecurityData::header")?;
+        let size = self.size();
+        if size > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ServerSecurityData", "size exceeds u16"));
+        }
+        write_block_header(dst, ServerDataBlockType::SecurityData as u16, size as u16, "ServerSecurityData::header")?;
         dst.write_u32_le(self.encryption_method, "ServerSecurityData::encryptionMethod")?;
         dst.write_u32_le(self.encryption_level, "ServerSecurityData::encryptionLevel")?;
 
@@ -153,6 +159,13 @@ impl<'de> Decode<'de> for ServerSecurityData {
         let (server_random, server_certificate) = if remaining >= 8 {
             let random_len = src.read_u32_le("ServerSecurityData::serverRandomLen")? as usize;
             let cert_len = src.read_u32_le("ServerSecurityData::serverCertificateLen")? as usize;
+            // MS-RDPBCGR 2.2.1.4.3: server random is 32 bytes; certificate has a practical limit
+            if random_len > 64 {
+                return Err(DecodeError::unexpected_value("ServerSecurityData", "serverRandomLen", "exceeds maximum 64"));
+            }
+            if cert_len > 16384 {
+                return Err(DecodeError::unexpected_value("ServerSecurityData", "serverCertificateLen", "exceeds maximum 16384"));
+            }
             let random = src.read_slice(random_len, "ServerSecurityData::serverRandom")?.into();
             let cert = src.read_slice(cert_len, "ServerSecurityData::serverCertificate")?.into();
             (Some(random), Some(cert))
@@ -180,8 +193,11 @@ pub struct ServerNetworkData {
 
 impl Encode for ServerNetworkData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let total = self.size() as u16;
-        write_block_header(dst, ServerDataBlockType::NetworkData as u16, total, "ServerNetworkData::header")?;
+        let size = self.size();
+        if size > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ServerNetworkData", "size exceeds u16"));
+        }
+        write_block_header(dst, ServerDataBlockType::NetworkData as u16, size as u16, "ServerNetworkData::header")?;
         dst.write_u16_le(self.mcs_channel_id, "ServerNetworkData::mcsChannelId")?;
         dst.write_u16_le(self.channel_ids.len() as u16, "ServerNetworkData::channelCount")?;
         for &id in &self.channel_ids {
@@ -213,6 +229,10 @@ impl<'de> Decode<'de> for ServerNetworkData {
         }
         let mcs_channel_id = src.read_u16_le("ServerNetworkData::mcsChannelId")?;
         let count = src.read_u16_le("ServerNetworkData::channelCount")? as usize;
+        // MS-RDPBCGR 2.2.1.4.4: channelCount MUST be ≤ 31
+        if count > 31 {
+            return Err(DecodeError::unexpected_value("ServerNetworkData", "channelCount", "exceeds maximum 31"));
+        }
         let mut channel_ids = Vec::with_capacity(count);
         for _ in 0..count {
             channel_ids.push(src.read_u16_le("ServerNetworkData::channelId")?);

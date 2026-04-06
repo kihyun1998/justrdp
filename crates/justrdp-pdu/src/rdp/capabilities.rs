@@ -5,7 +5,6 @@
 //! Defines all 30 capability set types exchanged during the Demand Active /
 //! Confirm Active handshake, plus the wrapping PDU types.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
@@ -738,7 +737,7 @@ impl<'de> Decode<'de> for OffscreenCacheCapability {
     }
 }
 
-/// Bitmap Cache Host Support Capability Set (MS-RDPBCGR 2.2.7.2.1).
+/// Bitmap Cache Host Support Capability Set (MS-RDPBCGR 2.2.7.2.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitmapCacheHostSupportCapability {
     pub cache_version: u8,
@@ -1025,7 +1024,7 @@ impl<'de> Decode<'de> for LargePointerCapability {
     }
 }
 
-/// Surface Commands Capability Set (MS-RDPBCGR 2.2.7.2.12).
+/// Surface Commands Capability Set (MS-RDPBCGR 2.2.7.2.13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceCommandsCapability {
     pub cmd_flags: u32,
@@ -1053,7 +1052,7 @@ impl<'de> Decode<'de> for SurfaceCommandsCapability {
     }
 }
 
-/// Bitmap Codecs Capability Set (MS-RDPBCGR 2.2.7.2.10).
+/// Bitmap Codecs Capability Set (MS-RDPBCGR 2.2.7.2.14).
 ///
 /// The internal structure is variable-length and complex; stored as raw bytes for now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1077,7 +1076,7 @@ impl BitmapCodecsCapability {
     }
 }
 
-/// Frame Acknowledge Capability Set (MS-RDPBCGR 2.2.7.2.13).
+/// Frame Acknowledge Capability Set (MS-RDPBCGR 2.2.7.2.15).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameAcknowledgeCapability {
     pub max_unacknowledged_frame_count: u32,
@@ -1271,6 +1270,9 @@ pub fn read_capability_set(src: &mut ReadCursor<'_>) -> DecodeResult<CapabilityS
 pub fn write_capability_set(cap: &CapabilitySet, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
     let body_size = cap.body_size();
     let total_len = CAPABILITY_HEADER_SIZE + body_size;
+    if total_len > u16::MAX as usize {
+        return Err(justrdp_core::EncodeError::other("CapabilitySet", "capability too large for u16"));
+    }
 
     dst.write_u16_le(cap.cap_type(), "CapabilitySet::capabilitySetType")?;
     dst.write_u16_le(total_len as u16, "CapabilitySet::lengthCapability")?;
@@ -1328,12 +1330,19 @@ impl Encode for DemandActivePdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         dst.write_u32_le(self.share_id, "DemandActive::shareId")?;
 
+        if self.source_descriptor.len() > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("DemandActive", "sourceDescriptor too large for u16"));
+        }
         let source_desc_len = self.source_descriptor.len() as u16;
         dst.write_u16_le(source_desc_len, "DemandActive::lengthSourceDescriptor")?;
 
         // Compute combined capabilities length: numberCapabilities(2) + pad2(2) + all cap sets
         let caps_body_size: usize = self.capability_sets.iter().map(capability_set_size).sum();
-        let combined_len = (4 + caps_body_size) as u16;
+        let combined_raw = 4 + caps_body_size;
+        if combined_raw > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("DemandActive", "combined capabilities too large for u16"));
+        }
+        let combined_len = combined_raw as u16;
         dst.write_u16_le(combined_len, "DemandActive::lengthCombinedCapabilities")?;
 
         dst.write_slice(&self.source_descriptor, "DemandActive::sourceDescriptor")?;
@@ -1367,6 +1376,10 @@ impl<'de> Decode<'de> for DemandActivePdu {
         let _combined_len = src.read_u16_le("DemandActive::lengthCombinedCapabilities")?;
         let source_descriptor = src.read_slice(source_desc_len, "DemandActive::sourceDescriptor")?.into();
         let num_caps = src.read_u16_le("DemandActive::numberCapabilities")? as usize;
+        // Practical limit: RDP servers send at most ~30 capability sets
+        if num_caps > 64 {
+            return Err(justrdp_core::DecodeError::unexpected_value("DemandActivePdu", "numberCapabilities", "exceeds maximum 64"));
+        }
         let _pad2 = src.read_u16_le("DemandActive::pad2")?;
 
         let mut capability_sets = Vec::with_capacity(num_caps);
@@ -1395,11 +1408,18 @@ impl Encode for ConfirmActivePdu {
         dst.write_u32_le(self.share_id, "ConfirmActive::shareId")?;
         dst.write_u16_le(self.originator_id, "ConfirmActive::originatorId")?;
 
+        if self.source_descriptor.len() > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ConfirmActive", "sourceDescriptor too large for u16"));
+        }
         let source_desc_len = self.source_descriptor.len() as u16;
         dst.write_u16_le(source_desc_len, "ConfirmActive::lengthSourceDescriptor")?;
 
         let caps_body_size: usize = self.capability_sets.iter().map(capability_set_size).sum();
-        let combined_len = (4 + caps_body_size) as u16;
+        let combined_raw = 4 + caps_body_size;
+        if combined_raw > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ConfirmActive", "combined capabilities too large for u16"));
+        }
+        let combined_len = combined_raw as u16;
         dst.write_u16_le(combined_len, "ConfirmActive::lengthCombinedCapabilities")?;
 
         dst.write_slice(&self.source_descriptor, "ConfirmActive::sourceDescriptor")?;
@@ -1432,6 +1452,9 @@ impl<'de> Decode<'de> for ConfirmActivePdu {
         let _combined_len = src.read_u16_le("ConfirmActive::lengthCombinedCapabilities")?;
         let source_descriptor = src.read_slice(source_desc_len, "ConfirmActive::sourceDescriptor")?.into();
         let num_caps = src.read_u16_le("ConfirmActive::numberCapabilities")? as usize;
+        if num_caps > 64 {
+            return Err(justrdp_core::DecodeError::unexpected_value("ConfirmActivePdu", "numberCapabilities", "exceeds maximum 64"));
+        }
         let _pad2 = src.read_u16_le("ConfirmActive::pad2")?;
 
         let mut capability_sets = Vec::with_capacity(num_caps);

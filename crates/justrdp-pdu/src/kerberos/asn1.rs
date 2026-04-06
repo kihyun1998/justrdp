@@ -29,7 +29,6 @@ fn err_other(description: &'static str) -> DecodeError {
 
 // ── ASN.1 Tag Classes ──
 
-const _CLASS_UNIVERSAL: u8 = 0x00;
 const CLASS_APPLICATION: u8 = 0x40;
 const CLASS_CONTEXT: u8 = 0x80;
 const CONSTRUCTED: u8 = 0x20;
@@ -256,6 +255,10 @@ impl<'a> DerReader<'a> {
             for _ in 0..num_bytes {
                 len = (len << 8) | self.read_byte()? as usize;
             }
+            // Cap at TPKT maximum (65535) to prevent oversized allocations
+            if len > 65535 {
+                return Err(err_other("ASN.1 length exceeds maximum allowed"));
+            }
             Ok(len)
         }
     }
@@ -285,12 +288,8 @@ impl DerWriter {
         Self { buf: Vec::new() }
     }
 
-    pub fn into_inner(self) -> Vec<u8> {
-        self.buf
-    }
-
     /// Consume the writer and return the buffer.
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn into_inner(self) -> Vec<u8> {
         self.buf
     }
 

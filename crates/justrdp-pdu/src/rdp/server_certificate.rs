@@ -175,6 +175,10 @@ fn parse_rsa_public_key(src: &mut ReadCursor<'_>) -> DecodeResult<ServerRsaPubli
     }
 
     let key_len = src.read_u32_le("RsaPubKey::keylen")? as usize;
+    // MS-RDPBCGR: RSA key modulus is at most 4096 bits (512 bytes + 1 padding)
+    if key_len > 513 {
+        return Err(DecodeError::unexpected_value("RsaPublicKey", "keylen", "exceeds maximum 513"));
+    }
     let bit_len = src.read_u32_le("RsaPubKey::bitlen")?;
     let _data_len = src.read_u32_le("RsaPubKey::datalen")?;
     let exponent = src.read_u32_le("RsaPubKey::pubExp")?;
@@ -215,6 +219,10 @@ fn parse_x509_certificate_chain(src: &mut ReadCursor<'_>) -> DecodeResult<Server
     let mut last_cert_data = &[][..];
     for i in 0..num_certs {
         let cert_len = src.read_u32_le("X509Chain::cbCertSize")? as usize;
+        // Individual cert blob should not exceed the outer certificate limit
+        if cert_len > 16384 {
+            return Err(DecodeError::unexpected_value("X509CertChain", "cbCertSize", "exceeds maximum 16384"));
+        }
         let cert_data = src.read_slice(cert_len, "X509Chain::abCert")?;
         if i == num_certs - 1 {
             last_cert_data = cert_data;
@@ -399,6 +407,10 @@ fn der_read_length(data: &[u8], pos: &mut usize) -> DecodeResult<usize> {
             len = (len << 8) | data[*pos + i] as usize;
         }
         *pos += num_bytes;
+        // Cap at TPKT maximum to prevent oversized allocations
+        if len > 65535 {
+            return Err(DecodeError::unexpected_value("DER", "length", "exceeds maximum 65535"));
+        }
         Ok(len)
     }
 }

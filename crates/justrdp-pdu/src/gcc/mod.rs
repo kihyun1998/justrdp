@@ -11,7 +11,7 @@ pub mod server;
 use alloc::vec::Vec;
 
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
-use justrdp_core::{DecodeError, DecodeResult, EncodeResult};
+use justrdp_core::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 
 // ── Data Block Header ──
 
@@ -79,13 +79,11 @@ pub fn read_block_header(
 // PER-encoded with a specific prefix. The RDP implementation uses a fixed
 // preamble that we can match byte-for-byte.
 
-/// Fixed preamble for GCC Conference Create Request (PER-encoded).
-/// This encodes the T.124 ConnectData + ConnectGCCPDU + ConferenceCreateRequest
-/// wrapper up to the user data payload.
+/// Key type (0x0005 = object) + T.124 OID bytes.
+/// Written before the connectPDU length in ConferenceCreateRequest/Response.
 const GCC_CREATE_REQUEST_PREAMBLE: &[u8] = &[
     0x00, 0x05, // Key: object identifier
     0x00, 0x14, 0x7C, 0x00, 0x01, // OID: ITU-T T.124 (0.0.20.124.0.1)
-    // ConnectData::connectPDU (PER OCTET STRING, length filled at encode time)
 ];
 
 /// Minimum preamble before the connect PDU length.
@@ -115,6 +113,12 @@ const GCC_CONF_CREATE_PREAMBLE: &[u8] = &[
 /// 00       octet_string_length(4-4=0, PER constrained min=4)
 /// ```
 const GCC_CONF_RESPONSE_UD_PREFIX: &[u8] = &[0x01, 0xC0, 0x00];
+
+/// T.124: ConnectGCCPDU choice = conferenceCreateResponse + userData present.
+const GCC_CONF_RESPONSE_CHOICE: u8 = 0x14;
+
+/// T.124: nodeID raw PER value (nodeID - 1001, encoded BE).
+const GCC_CONF_RESPONSE_NODE_ID: u16 = 0x760A;
 
 /// H.221 non-standard key for Microsoft ("Duca").
 const H221_CS_KEY: &[u8] = b"Duca";
@@ -156,6 +160,9 @@ impl Encode for ConferenceCreateRequest {
 
         // connectPDU length (PER, 2 bytes)
         let cpdu_size = self.connect_pdu_size();
+        if cpdu_size > 0x3FFF {
+            return Err(EncodeError::other("GccCR::connectPduLen", "payload too large for PER 14-bit length"));
+        }
         dst.write_u16_be(cpdu_size as u16 | 0x8000, "GccCR::connectPduLen")?;
 
         // PER ConferenceCreateRequest fields + H.221 key selection
@@ -165,6 +172,9 @@ impl Encode for ConferenceCreateRequest {
         dst.write_slice(H221_CS_KEY, "GccCR::h221Key")?;
 
         // User data (PER length + data)
+        if self.user_data.len() > 0x3FFF {
+            return Err(EncodeError::other("GccCR::userDataLen", "payload too large for PER 14-bit length"));
+        }
         let ud_len = self.user_data.len() as u16;
         dst.write_u16_be(ud_len | 0x8000, "GccCR::userDataLen")?;
         dst.write_slice(&self.user_data, "GccCR::userData")?;
@@ -239,7 +249,7 @@ impl ConferenceCreateResponse {
 
     fn connect_pdu_size(&self) -> usize {
         // gccChoice(1) + nodeID(2) + tagLen(1) + tagVal(1) + result(1)
-        // + userData prefix(4) + key(4) + userData
+        // + userDataPrefix(3) + key(4) + userData
         1 + 2 + 1 + 1 + 1 + GCC_CONF_RESPONSE_UD_PREFIX.len() + H221_SC_KEY.len() + self.user_data_field_size()
     }
 
@@ -256,13 +266,17 @@ impl Encode for ConferenceCreateResponse {
 
         // connectPDU length
         let cpdu_size = self.connect_pdu_size();
+        if cpdu_size > 0x3FFF {
+            return Err(EncodeError::other("GccCResp::connectPduLen", "payload too large for PER 14-bit length"));
+        }
         dst.write_u16_be(cpdu_size as u16 | 0x8000, "GccCResp::connectPduLen")?;
 
         // ConnectGCCPDU choice byte: conferenceCreateResponse + userData present
-        dst.write_u8(0x14, "GccCResp::gccChoice")?;
+        // T.124: 0x14 = conferenceCreateResponse (choice index 0x14)
+        dst.write_u8(GCC_CONF_RESPONSE_CHOICE, "GccCResp::gccChoice")?;
 
         // nodeID (u16 PER, raw = nodeID - 1001)
-        dst.write_u16_be(0x760A, "GccCResp::nodeId")?;
+        dst.write_u16_be(GCC_CONF_RESPONSE_NODE_ID, "GccCResp::nodeId")?;
         // tag (PER unconstrained integer: 1-byte length + value)
         dst.write_u8(0x01, "GccCResp::tagLen")?;
         dst.write_u8(0x01, "GccCResp::tagValue")?;
@@ -276,6 +290,9 @@ impl Encode for ConferenceCreateResponse {
         dst.write_slice(H221_SC_KEY, "GccCResp::h221Key")?;
 
         // User data
+        if self.user_data.len() > 0x3FFF {
+            return Err(EncodeError::other("GccCResp::userDataLen", "payload too large for PER 14-bit length"));
+        }
         let ud_len = self.user_data.len() as u16;
         dst.write_u16_be(ud_len | 0x8000, "GccCResp::userDataLen")?;
         dst.write_slice(&self.user_data, "GccCResp::userData")?;
@@ -314,6 +331,10 @@ impl<'de> Decode<'de> for ConferenceCreateResponse {
 
         // tag (PER unconstrained integer: 1-byte length + value bytes)
         let tag_len = src.read_u8("GccCResp::tagLen")? as usize;
+        // T.124: tag is a single-byte PER integer, length must be 1
+        if tag_len != 1 {
+            return Err(DecodeError::unexpected_value("GccConferenceCreateResponse", "tagLen", "expected 1"));
+        }
         src.skip(tag_len, "GccCResp::tagValue")?;
 
         // result (PER enumerated, bit-packed, 1 byte)
@@ -341,15 +362,9 @@ impl<'de> Decode<'de> for ConferenceCreateResponse {
     }
 }
 
-/// Read a PER length determinant (1 or 2 bytes).
+/// Read a PER length determinant (delegates to mcs::per).
 fn read_per_length(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<usize> {
-    let first = src.read_u8(ctx)?;
-    if first & 0x80 == 0 {
-        Ok(first as usize)
-    } else {
-        let second = src.read_u8(ctx)?;
-        Ok((((first & 0x7F) as usize) << 8) | (second as usize))
-    }
+    crate::mcs::per::read_length(src, ctx)
 }
 
 #[cfg(test)]

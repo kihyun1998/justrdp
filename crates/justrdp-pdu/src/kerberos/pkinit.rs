@@ -133,7 +133,7 @@ pub fn build_dh_spki(p: &[u8], g: &[u8], public_value: &[u8]) -> Vec<u8> {
     let pub_key_int = {
         let mut w = DerWriter::new();
         w.write_integer_bytes(public_value);
-        w.into_bytes()
+        w.into_inner()
     };
 
     build_sequence(|w| {

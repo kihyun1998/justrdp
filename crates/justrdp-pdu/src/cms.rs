@@ -264,7 +264,7 @@ fn encode_der_length(len: usize) -> Vec<u8> {
 fn build_set<F: FnOnce(&mut DerWriter)>(f: F) -> Vec<u8> {
     let mut w = DerWriter::new();
     f(&mut w);
-    let content = w.into_bytes();
+    let content = w.into_inner();
     let mut result = vec![0x31]; // SET tag
     result.extend_from_slice(&encode_der_length(content.len()));
     result.extend_from_slice(&content);
@@ -308,7 +308,7 @@ mod tests {
         let fake_serial = {
             let mut w = DerWriter::new();
             w.write_integer(12345);
-            w.into_bytes()
+            w.into_inner()
         };
 
         let signer_info = build_signer_info(&fake_issuer, &fake_serial, &fake_signature);

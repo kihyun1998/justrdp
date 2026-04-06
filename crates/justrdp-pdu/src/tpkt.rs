@@ -40,7 +40,7 @@ impl TpktHeader {
     /// Panics if `payload_len + TPKT_HEADER_SIZE` exceeds `u16::MAX`.
     pub fn for_payload(payload_len: usize) -> Self {
         let total = payload_len + TPKT_HEADER_SIZE;
-        assert!(total <= u16::MAX as usize, "TPKT payload too large: {total} > {}", u16::MAX);
+        assert!(total <= TPKT_MAX_LENGTH, "TPKT payload too large: {total} > {TPKT_MAX_LENGTH}");
         Self {
             length: total as u16,
         }

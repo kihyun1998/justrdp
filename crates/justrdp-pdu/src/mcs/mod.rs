@@ -15,6 +15,12 @@ pub mod per;
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_core::{DecodeError, DecodeResult, EncodeResult};
 
+/// T.125 §11: User channel IDs start from 1001.
+const MCS_CHANNEL_ID_BASE: u16 = 1001;
+
+/// T.125 §11.33: dataPriority(high) + segmentation(begin|end) = 0b01_11_00_00.
+const MCS_DATA_PRIORITY_HIGH_UNSEGMENTED: u8 = 0x70;
+
 // ── Domain Parameters ──
 
 /// MCS Domain Parameters (used in Connect Initial / Response).
@@ -476,8 +482,8 @@ impl Encode for AttachUserConfirm {
         dst.write_u8(choice_byte, "AttachUserConfirm::choice")?;
         per::write_enumerated(dst, self.result, "AttachUserConfirm::result")?;
         if let Some(initiator) = self.initiator {
-            // User ID is channel_id - 1001
-            per::write_integer_u16(dst, initiator.saturating_sub(1001), "AttachUserConfirm::initiator")?;
+            // T.125: User ID is channel_id - MCS_CHANNEL_ID_BASE
+            per::write_integer_u16(dst, initiator.saturating_sub(MCS_CHANNEL_ID_BASE), "AttachUserConfirm::initiator")?;
         }
         Ok(())
     }
@@ -487,7 +493,9 @@ impl Encode for AttachUserConfirm {
     }
 
     fn size(&self) -> usize {
-        1 + 1 + if self.initiator.is_some() { 2 } else { 0 }
+        1 + 1 + if let Some(init) = self.initiator {
+            per::sizeof_integer_u16(init.saturating_sub(MCS_CHANNEL_ID_BASE))
+        } else { 0 }
     }
 }
 
@@ -505,7 +513,9 @@ impl<'de> Decode<'de> for AttachUserConfirm {
         let has_initiator = byte & 0x02 != 0;
         let result = per::read_enumerated(src, "AttachUserConfirm::result")?;
         let initiator = if has_initiator {
-            Some(per::read_integer_u16(src, "AttachUserConfirm::initiator")? + 1001)
+            Some(per::read_integer_u16(src, "AttachUserConfirm::initiator")?
+                .checked_add(MCS_CHANNEL_ID_BASE)
+                .ok_or_else(|| DecodeError::invalid_value("AttachUserConfirm", "initiator overflow"))?)
         } else {
             None
         };
@@ -523,7 +533,7 @@ pub struct ChannelJoinRequest {
 impl Encode for ChannelJoinRequest {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         dst.write_u8((DomainMcsPduType::ChannelJoinRequest as u8) << 2, "ChannelJoinRequest::choice")?;
-        per::write_integer_u16(dst, self.initiator.saturating_sub(1001), "ChannelJoinRequest::initiator")?;
+        per::write_integer_u16(dst, self.initiator.saturating_sub(MCS_CHANNEL_ID_BASE), "ChannelJoinRequest::initiator")?;
         per::write_integer_u16(dst, self.channel_id, "ChannelJoinRequest::channelId")?;
         Ok(())
     }
@@ -533,7 +543,7 @@ impl Encode for ChannelJoinRequest {
     }
 
     fn size(&self) -> usize {
-        1 + per::sizeof_integer_u16(self.initiator.saturating_sub(1001) as u16)
+        1 + per::sizeof_integer_u16(self.initiator.saturating_sub(MCS_CHANNEL_ID_BASE) as u16)
           + per::sizeof_integer_u16(self.channel_id)
     }
 }
@@ -548,7 +558,9 @@ impl<'de> Decode<'de> for ChannelJoinRequest {
                 "expected ChannelJoinRequest",
             ));
         }
-        let initiator = per::read_integer_u16(src, "ChannelJoinRequest::initiator")? + 1001;
+        let initiator = per::read_integer_u16(src, "ChannelJoinRequest::initiator")?
+            .checked_add(MCS_CHANNEL_ID_BASE)
+            .ok_or_else(|| DecodeError::invalid_value("ChannelJoinRequest", "initiator overflow"))?;
         let channel_id = per::read_integer_u16(src, "ChannelJoinRequest::channelId")?;
         Ok(Self {
             initiator,
@@ -573,7 +585,7 @@ impl Encode for ChannelJoinConfirm {
             | if has_channel { 0x02 } else { 0x00 };
         dst.write_u8(choice_byte, "ChannelJoinConfirm::choice")?;
         per::write_enumerated(dst, self.result, "ChannelJoinConfirm::result")?;
-        per::write_integer_u16(dst, self.initiator.saturating_sub(1001), "ChannelJoinConfirm::initiator")?;
+        per::write_integer_u16(dst, self.initiator.saturating_sub(MCS_CHANNEL_ID_BASE), "ChannelJoinConfirm::initiator")?;
         per::write_integer_u16(dst, self.requested, "ChannelJoinConfirm::requested")?;
         if let Some(channel_id) = self.channel_id {
             per::write_integer_u16(dst, channel_id, "ChannelJoinConfirm::channelId")?;
@@ -587,7 +599,7 @@ impl Encode for ChannelJoinConfirm {
 
     fn size(&self) -> usize {
         1 + 1 // choice + result
-          + per::sizeof_integer_u16(self.initiator.saturating_sub(1001) as u16)
+          + per::sizeof_integer_u16(self.initiator.saturating_sub(MCS_CHANNEL_ID_BASE) as u16)
           + per::sizeof_integer_u16(self.requested)
           + if let Some(ch) = self.channel_id { per::sizeof_integer_u16(ch) } else { 0 }
     }
@@ -606,7 +618,9 @@ impl<'de> Decode<'de> for ChannelJoinConfirm {
         }
         let has_channel = byte & 0x02 != 0;
         let result = per::read_enumerated(src, "ChannelJoinConfirm::result")?;
-        let initiator = per::read_integer_u16(src, "ChannelJoinConfirm::initiator")? + 1001;
+        let initiator = per::read_integer_u16(src, "ChannelJoinConfirm::initiator")?
+            .checked_add(MCS_CHANNEL_ID_BASE)
+            .ok_or_else(|| DecodeError::invalid_value("ChannelJoinConfirm", "initiator overflow"))?;
         let requested = per::read_integer_u16(src, "ChannelJoinConfirm::requested")?;
         let channel_id = if has_channel {
             Some(per::read_integer_u16(src, "ChannelJoinConfirm::channelId")?)
@@ -633,10 +647,9 @@ pub struct SendDataRequest<'a> {
 impl Encode for SendDataRequest<'_> {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         dst.write_u8((DomainMcsPduType::SendDataRequest as u8) << 2, "SendDataRequest::choice")?;
-        per::write_integer_u16(dst, self.initiator.saturating_sub(1001), "SendDataRequest::initiator")?;
+        per::write_integer_u16(dst, self.initiator.saturating_sub(MCS_CHANNEL_ID_BASE), "SendDataRequest::initiator")?;
         per::write_integer_u16(dst, self.channel_id, "SendDataRequest::channelId")?;
-        // T.125 §11.33: dataPriority(high) + segmentation(begin|end) = 0b01_11_00_00 = 0x70
-        dst.write_u8(0x70, "SendDataRequest::dataPriority")?;
+        dst.write_u8(MCS_DATA_PRIORITY_HIGH_UNSEGMENTED, "SendDataRequest::dataPriority")?;
         per::write_octet_string(dst, self.user_data, "SendDataRequest::userData")?;
         Ok(())
     }
@@ -646,7 +659,7 @@ impl Encode for SendDataRequest<'_> {
     }
 
     fn size(&self) -> usize {
-        1 + per::sizeof_integer_u16(self.initiator.saturating_sub(1001) as u16)
+        1 + per::sizeof_integer_u16(self.initiator.saturating_sub(MCS_CHANNEL_ID_BASE) as u16)
           + per::sizeof_integer_u16(self.channel_id)
           + 1 // data priority
           + per::sizeof_octet_string(self.user_data.len())
@@ -663,7 +676,9 @@ impl<'de> Decode<'de> for SendDataRequest<'de> {
                 "expected SendDataRequest",
             ));
         }
-        let initiator = per::read_integer_u16(src, "SendDataRequest::initiator")? + 1001;
+        let initiator = per::read_integer_u16(src, "SendDataRequest::initiator")?
+            .checked_add(MCS_CHANNEL_ID_BASE)
+            .ok_or_else(|| DecodeError::invalid_value("SendDataRequest", "initiator overflow"))?;
         let channel_id = per::read_integer_u16(src, "SendDataRequest::channelId")?;
         let _priority = src.read_u8("SendDataRequest::dataPriority")?;
         let user_data = per::read_octet_string(src, "SendDataRequest::userData")?;
@@ -686,10 +701,9 @@ pub struct SendDataIndication<'a> {
 impl Encode for SendDataIndication<'_> {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         dst.write_u8((DomainMcsPduType::SendDataIndication as u8) << 2, "SendDataIndication::choice")?;
-        per::write_integer_u16(dst, self.initiator.saturating_sub(1001), "SendDataIndication::initiator")?;
+        per::write_integer_u16(dst, self.initiator.saturating_sub(MCS_CHANNEL_ID_BASE), "SendDataIndication::initiator")?;
         per::write_integer_u16(dst, self.channel_id, "SendDataIndication::channelId")?;
-        // T.125 §11.33: dataPriority(high) + segmentation(begin|end) = 0x70
-        dst.write_u8(0x70, "SendDataIndication::dataPriority")?;
+        dst.write_u8(MCS_DATA_PRIORITY_HIGH_UNSEGMENTED, "SendDataIndication::dataPriority")?;
         per::write_octet_string(dst, self.user_data, "SendDataIndication::userData")?;
         Ok(())
     }
@@ -699,7 +713,7 @@ impl Encode for SendDataIndication<'_> {
     }
 
     fn size(&self) -> usize {
-        1 + per::sizeof_integer_u16(self.initiator.saturating_sub(1001) as u16)
+        1 + per::sizeof_integer_u16(self.initiator.saturating_sub(MCS_CHANNEL_ID_BASE) as u16)
           + per::sizeof_integer_u16(self.channel_id)
           + 1 // data priority
           + per::sizeof_octet_string(self.user_data.len())
@@ -716,7 +730,9 @@ impl<'de> Decode<'de> for SendDataIndication<'de> {
                 "expected SendDataIndication",
             ));
         }
-        let initiator = per::read_integer_u16(src, "SendDataIndication::initiator")? + 1001;
+        let initiator = per::read_integer_u16(src, "SendDataIndication::initiator")?
+            .checked_add(MCS_CHANNEL_ID_BASE)
+            .ok_or_else(|| DecodeError::invalid_value("SendDataIndication", "initiator overflow"))?;
         let channel_id = per::read_integer_u16(src, "SendDataIndication::channelId")?;
         let _priority = src.read_u8("SendDataIndication::dataPriority")?;
         let user_data = per::read_octet_string(src, "SendDataIndication::userData")?;
@@ -803,12 +819,9 @@ impl<'de> Decode<'de> for DisconnectProviderUltimatum {
 // ── High-tag BER helpers (for tags > 30) ──
 
 /// Size of a high-tag BER tag encoding.
-fn high_tag_size(tag_number: u8) -> usize {
-    if tag_number < 128 {
-        2 // class byte + 1 tag byte
-    } else {
-        3 // class byte + 2 tag bytes (not needed for MCS, but safe)
-    }
+/// MCS uses tags 101/102, always single-byte tag numbers (< 128).
+fn high_tag_size(_tag_number: u8) -> usize {
+    2 // class byte + 1 tag byte
 }
 
 /// Write a BER high-tag (tag number > 30).

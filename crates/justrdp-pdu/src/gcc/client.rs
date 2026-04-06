@@ -252,6 +252,9 @@ impl ClientCoreData {
 impl Encode for ClientCoreData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         let total = DATA_BLOCK_HEADER_SIZE + CLIENT_CORE_FIXED_SIZE + self.optional_size();
+        if total > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ClientCoreData", "size exceeds u16"));
+        }
         write_block_header(dst, ClientDataBlockType::CoreData as u16, total as u16, "ClientCoreData::header")?;
 
         dst.write_u32_le(self.version as u32, "ClientCoreData::version")?;
@@ -460,8 +463,11 @@ pub struct ClientNetworkData {
 
 impl Encode for ClientNetworkData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let total = self.size() as u16;
-        write_block_header(dst, ClientDataBlockType::NetworkData as u16, total, "ClientNetworkData::header")?;
+        let size = self.size();
+        if size > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ClientNetworkData", "size exceeds u16"));
+        }
+        write_block_header(dst, ClientDataBlockType::NetworkData as u16, size as u16, "ClientNetworkData::header")?;
         dst.write_u32_le(self.channels.len() as u32, "ClientNetworkData::channelCount")?;
         for ch in &self.channels {
             dst.write_slice(&ch.name, "ClientNetworkData::channelName")?;
@@ -484,6 +490,10 @@ impl<'de> Decode<'de> for ClientNetworkData {
             return Err(DecodeError::unexpected_value("ClientNetworkData", "type", "expected 0xC003"));
         }
         let count = src.read_u32_le("ClientNetworkData::channelCount")? as usize;
+        // MS-RDPBCGR 2.2.1.3.4: channelCount MUST be ≤ 31
+        if count > 31 {
+            return Err(DecodeError::unexpected_value("ClientNetworkData", "channelCount", "exceeds maximum 31"));
+        }
         let mut channels = Vec::with_capacity(count);
         for _ in 0..count {
             let name_bytes = src.read_slice(8, "ClientNetworkData::channelName")?;
@@ -552,8 +562,11 @@ pub struct ClientMonitorData {
 
 impl Encode for ClientMonitorData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let total = self.size() as u16;
-        write_block_header(dst, ClientDataBlockType::MonitorData as u16, total, "ClientMonitorData::header")?;
+        let size = self.size();
+        if size > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ClientMonitorData", "size exceeds u16"));
+        }
+        write_block_header(dst, ClientDataBlockType::MonitorData as u16, size as u16, "ClientMonitorData::header")?;
         dst.write_u32_le(0, "ClientMonitorData::flags")?; // reserved
         dst.write_u32_le(self.monitors.len() as u32, "ClientMonitorData::monitorCount")?;
         for m in &self.monitors {
@@ -581,6 +594,10 @@ impl<'de> Decode<'de> for ClientMonitorData {
         }
         let _flags = src.read_u32_le("ClientMonitorData::flags")?;
         let count = src.read_u32_le("ClientMonitorData::monitorCount")? as usize;
+        // MS-RDPBCGR 2.2.1.3.6: monitorCount MUST be ≤ 16
+        if count > 16 {
+            return Err(DecodeError::unexpected_value("ClientMonitorData", "monitorCount", "exceeds maximum 16"));
+        }
         let mut monitors = Vec::with_capacity(count);
         for _ in 0..count {
             monitors.push(MonitorDef {
@@ -615,8 +632,11 @@ pub struct ClientMonitorExtendedData {
 
 impl Encode for ClientMonitorExtendedData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let total = self.size() as u16;
-        write_block_header(dst, ClientDataBlockType::MonitorExtendedData as u16, total, "ClientMonitorExtendedData::header")?;
+        let size = self.size();
+        if size > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("ClientMonitorExtendedData", "size exceeds u16"));
+        }
+        write_block_header(dst, ClientDataBlockType::MonitorExtendedData as u16, size as u16, "ClientMonitorExtendedData::header")?;
         dst.write_u32_le(0, "ClientMonitorExtendedData::flags")?;
         dst.write_u32_le(20, "ClientMonitorExtendedData::monitorAttributeSize")?; // each attribute = 20 bytes
         dst.write_u32_le(self.monitors.len() as u32, "ClientMonitorExtendedData::monitorCount")?;
@@ -646,6 +666,10 @@ impl<'de> Decode<'de> for ClientMonitorExtendedData {
         let _flags = src.read_u32_le("ClientMonitorExtendedData::flags")?;
         let _attr_size = src.read_u32_le("ClientMonitorExtendedData::monitorAttributeSize")?;
         let count = src.read_u32_le("ClientMonitorExtendedData::monitorCount")? as usize;
+        // MS-RDPBCGR 2.2.1.3.9: monitorCount MUST be ≤ 16
+        if count > 16 {
+            return Err(DecodeError::unexpected_value("ClientMonitorExtendedData", "monitorCount", "exceeds maximum 16"));
+        }
         let mut monitors = Vec::with_capacity(count);
         for _ in 0..count {
             monitors.push(MonitorAttributeDef {

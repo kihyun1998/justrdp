@@ -123,14 +123,17 @@ pub struct FastPathOutputHeader {
 
 impl Encode for FastPathOutputHeader {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        // If num_events > 15, encode 0 in the 4-bit slot; extended byte follows length
-        let hdr_num = if self.num_events > 15 { 0 } else { self.num_events };
+        // MS-RDPBCGR 2.2.9.1.2: if num_events doesn't fit in 4 bits (1..15),
+        // encode 0 in the 4-bit slot and write an extended byte after the length.
+        // num_events == 0 also uses extended byte path since 0 in the slot signals "extended".
+        let use_extended = self.num_events > 15 || self.num_events == 0;
+        let hdr_num = if use_extended { 0 } else { self.num_events };
         let byte0 = (self.action & 0x03)
             | ((hdr_num & 0x0F) << 2)
             | ((self.flags & 0x03) << 6);
         dst.write_u8(byte0, "FastPathOutputHeader::byte0")?;
         encode_length(dst, self.length)?;
-        if self.num_events > 15 {
+        if use_extended {
             dst.write_u8(self.num_events, "FastPathOutputHeader::numEventsExt")?;
         }
         Ok(())
@@ -138,7 +141,8 @@ impl Encode for FastPathOutputHeader {
 
     fn name(&self) -> &'static str { "FastPathOutputHeader" }
     fn size(&self) -> usize {
-        1 + length_field_size(self.length) + if self.num_events > 15 { 1 } else { 0 }
+        let use_extended = self.num_events > 15 || self.num_events == 0;
+        1 + length_field_size(self.length) + if use_extended { 1 } else { 0 }
     }
 }
 
@@ -149,9 +153,8 @@ impl<'de> Decode<'de> for FastPathOutputHeader {
         let mut num_events = (byte0 >> 2) & 0x0F;
         let flags = (byte0 >> 6) & 0x03;
         let length = decode_length(src)?;
-        // Extended numEvents: if 4-bit field is 0 and there is remaining data, read extra byte
         // MS-RDPBCGR 2.2.9.1.2: numEvents == 0 means extended byte follows the length field
-        if num_events == 0 && src.remaining() > 0 {
+        if num_events == 0 {
             num_events = src.read_u8("FastPathOutputHeader::numEventsExt")?;
         }
         Ok(Self { action, num_events, flags, length })
@@ -187,6 +190,9 @@ impl Encode for FastPathOutputUpdate {
         dst.write_u8(header, "FastPathOutputUpdate::updateHeader")?;
         if let Some(cf) = self.compression_flags {
             dst.write_u8(cf, "FastPathOutputUpdate::compressionFlags")?;
+        }
+        if self.update_data.len() > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other("FastPathOutputUpdate", "update_data too large for u16"));
         }
         dst.write_u16_le(
             self.update_data.len() as u16,
@@ -248,13 +254,14 @@ pub struct FastPathInputHeader {
 
 impl Encode for FastPathInputHeader {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let hdr_num = if self.num_events > 15 { 0 } else { self.num_events };
+        let use_extended = self.num_events > 15 || self.num_events == 0;
+        let hdr_num = if use_extended { 0 } else { self.num_events };
         let byte0 = (self.action & 0x03)
             | ((hdr_num & 0x0F) << 2)
             | ((self.flags & 0x03) << 6);
         dst.write_u8(byte0, "FastPathInputHeader::byte0")?;
         encode_length(dst, self.length)?;
-        if self.num_events > 15 {
+        if use_extended {
             dst.write_u8(self.num_events, "FastPathInputHeader::numEventsExt")?;
         }
         Ok(())
@@ -262,7 +269,8 @@ impl Encode for FastPathInputHeader {
 
     fn name(&self) -> &'static str { "FastPathInputHeader" }
     fn size(&self) -> usize {
-        1 + length_field_size(self.length) + if self.num_events > 15 { 1 } else { 0 }
+        let use_extended = self.num_events > 15 || self.num_events == 0;
+        1 + length_field_size(self.length) + if use_extended { 1 } else { 0 }
     }
 }
 
@@ -896,9 +904,9 @@ mod tests {
     // ── Error tests ──
 
     #[test]
-    fn unknown_input_event_code_error() {
-        // eventCode = 0x5 (bits 5-7), which is not a valid code
-        let buf = [0x05 << 5]; // eventCode=5, eventFlags=0
+    fn relative_mouse_event_short_buffer_error() {
+        // eventCode = 0x5 (RelativeMouse) with insufficient data (needs x_delta/y_delta)
+        let buf = [0x05 << 5]; // eventCode=5, eventFlags=0, but no delta bytes
         let mut cursor = ReadCursor::new(&buf);
         let result = FastPathInputEvent::decode(&mut cursor);
         assert!(result.is_err());
