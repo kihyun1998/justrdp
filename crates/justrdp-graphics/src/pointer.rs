@@ -74,7 +74,6 @@ fn and_mask_stride(width: usize) -> usize {
 }
 
 /// XOR mask stride for a given width and bpp (padded to 2-byte boundary).
-/// XOR mask stride for a given width and bpp (padded to 2-byte boundary).
 /// Only called after bpp is validated to be in {1, 16, 24, 32}.
 fn xor_mask_stride(width: usize, bpp: u16) -> usize {
     let bytes_per_row = match bpp {
@@ -295,9 +294,12 @@ pub struct PointerCache {
 impl PointerCache {
     /// Create a new cache with the given capacity.
     ///
-    /// A capacity of 0 produces an empty cache where all operations return `InvalidCacheIndex`.
+    /// # Panics
+    ///
+    /// Panics if `capacity` is 0. A zero-capacity cache silently rejects all
+    /// operations, which is never the intended behavior.
     pub fn new(capacity: usize) -> Self {
-        debug_assert!(capacity > 0, "PointerCache created with zero capacity");
+        assert!(capacity > 0, "PointerCache created with zero capacity");
         let mut slots = Vec::with_capacity(capacity);
         slots.resize_with(capacity, || None);
         Self { slots }

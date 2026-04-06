@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Derive macros for JustRDP `Encode` and `Decode` traits.
 //!
 //! # Usage
@@ -25,12 +27,18 @@
 //! | `#[pdu(u32_le)]` / `#[pdu(u32_be)]` | 4 |
 //! | `#[pdu(u64_le)]` | 8 |
 //! | `#[pdu(i16_le)]` / `#[pdu(i32_le)]` | 2 / 4 |
-//! | `#[pdu(bytes = N)]` | N (fixed array) |
-//! | `#[pdu(rest)]` | dynamic (Vec<u8>) |
+//! | `#[pdu(bytes = N)]` | N (fixed array `[u8; N]`) |
+//! | `#[pdu(rest)]` | dynamic (`Vec<u8>`). **Must be the last field in the struct.** |
 //! | `#[pdu(pad = N)]` | N (zeros on encode, skip on decode). Field type must impl `Default`. Use `()` for padding fields. |
+//!
+//! ## Crate path
+//!
+//! The generated `impl` blocks reference `justrdp_core::` directly. The consuming
+//! crate must have `justrdp-core` as a dependency under its canonical name.
 
 use proc_macro::TokenStream;
 use quote::quote;
+use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Fields, LitInt, parse_macro_input};
 
 /// Parsed `#[pdu(...)]` attribute.
@@ -49,7 +57,21 @@ enum FieldKind {
     Pad(usize),
 }
 
-fn parse_pdu_attr(field: &syn::Field) -> Option<FieldKind> {
+/// A successfully parsed struct field with its resolved `#[pdu(...)]` kind.
+struct ParsedField {
+    ident: syn::Ident,
+    ctx: String,
+    kind: FieldKind,
+}
+
+/// Parse a `#[pdu(...)]` attribute on a struct field.
+///
+/// Returns a compile-time error if:
+/// - the field has no `#[pdu(...)]` attribute
+/// - the attribute is empty (`#[pdu()]`)
+/// - the attribute contains multiple or unrecognized keys
+/// - the attribute is syntactically malformed
+fn parse_pdu_attr(field: &syn::Field) -> Result<FieldKind, syn::Error> {
     for attr in &field.attrs {
         if !attr.path().is_ident("pdu") {
             continue;
@@ -57,7 +79,12 @@ fn parse_pdu_attr(field: &syn::Field) -> Option<FieldKind> {
 
         let mut result = None;
 
-        let _ = attr.parse_nested_meta(|meta| {
+        let parse_result = attr.parse_nested_meta(|meta| {
+            // Reject duplicate keys (e.g. `#[pdu(u8, u16_le)]`).
+            if result.is_some() {
+                return Err(meta.error("only one pdu kind is allowed per field"));
+            }
+
             if meta.path.is_ident("u8") {
                 result = Some(FieldKind::U8);
                 return Ok(());
@@ -98,6 +125,9 @@ fn parse_pdu_attr(field: &syn::Field) -> Option<FieldKind> {
                 let value = meta.value()?;
                 let lit: LitInt = value.parse()?;
                 let n: usize = lit.base10_parse()?;
+                if n == 0 {
+                    return Err(meta.error("bytes value must be > 0"));
+                }
                 result = Some(FieldKind::Bytes(n));
                 return Ok(());
             }
@@ -105,17 +135,99 @@ fn parse_pdu_attr(field: &syn::Field) -> Option<FieldKind> {
                 let value = meta.value()?;
                 let lit: LitInt = value.parse()?;
                 let n: usize = lit.base10_parse()?;
+                if n == 0 {
+                    return Err(meta.error("pad value must be > 0"));
+                }
                 result = Some(FieldKind::Pad(n));
                 return Ok(());
             }
             Err(meta.error("unknown pdu attribute"))
         });
 
-        if result.is_some() {
-            return result;
+        // Always propagate parse errors — trailing junk or unknown keys
+        // must be rejected even if a valid key was already matched.
+        parse_result?;
+
+        // Detect empty attribute: `#[pdu()]`
+        if let Some(kind) = result {
+            return Ok(kind);
         }
+
+        return Err(syn::Error::new_spanned(
+            attr,
+            "#[pdu(...)] must not be empty; expected one of: u8, u16_le, u16_be, \
+             u32_le, u32_be, u64_le, i16_le, i32_le, bytes = N, rest, pad = N",
+        ));
     }
-    None
+
+    Err(syn::Error::new(
+        field.span(),
+        format!(
+            "field `{}` is missing #[pdu(...)] attribute",
+            field
+                .ident
+                .as_ref()
+                .map(|i| i.to_string())
+                .unwrap_or_default()
+        ),
+    ))
+}
+
+/// Extract named fields from a struct [`DeriveInput`], returning a span-anchored
+/// compile error for enums, unions, tuple structs, and unit structs.
+fn extract_named_fields(
+    input: &DeriveInput,
+) -> Result<&syn::punctuated::Punctuated<syn::Field, syn::token::Comma>, syn::Error> {
+    match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(fields) => Ok(&fields.named),
+            _ => Err(syn::Error::new_spanned(
+                &input.ident,
+                "derive only supports structs with named fields",
+            )),
+        },
+        _ => Err(syn::Error::new_spanned(
+            &input.ident,
+            "derive only supports structs",
+        )),
+    }
+}
+
+/// Parse and validate all fields of a struct for derive.
+///
+/// Iterates named fields, resolves each `#[pdu(...)]` attribute, and enforces
+/// that `#[pdu(rest)]` appears only as the last field.
+fn parse_fields(input: &DeriveInput) -> Result<Vec<ParsedField>, syn::Error> {
+    let fields = extract_named_fields(input)?;
+    let name_str = input.ident.to_string();
+    let mut parsed = Vec::new();
+    let mut rest_seen = false;
+
+    for field in fields {
+        let ident = field
+            .ident
+            .as_ref()
+            .expect("named field must have ident — guarded by extract_named_fields")
+            .clone();
+        let ctx = format!("{name_str}::{ident}");
+
+        let kind = parse_pdu_attr(field)?;
+
+        if rest_seen {
+            return Err(syn::Error::new_spanned(
+                &ident,
+                "no fields are allowed after #[pdu(rest)]",
+            ));
+        }
+
+        if matches!(kind, FieldKind::Rest) {
+            rest_seen = true;
+        }
+
+        parsed.push(ParsedField { ident, ctx, kind });
+    }
+
+    Ok(parsed)
 }
 
 /// Derive `Encode` for a struct with `#[pdu(...)]` field attributes.
@@ -125,28 +237,20 @@ pub fn derive_encode(input: TokenStream) -> TokenStream {
     let name = &input.ident;
     let name_str = name.to_string();
 
-    let fields = match &input.data {
-        Data::Struct(data) => match &data.fields {
-            Fields::Named(fields) => &fields.named,
-            _ => panic!("Encode derive only supports named fields"),
-        },
-        _ => panic!("Encode derive only supports structs"),
+    let parsed = match parse_fields(&input) {
+        Ok(p) => p,
+        Err(e) => return e.to_compile_error().into(),
     };
 
     let mut encode_stmts = Vec::new();
     let mut size_stmts = Vec::new();
 
-    for field in fields {
-        let field_name = field.ident.as_ref().unwrap();
-        let ctx = format!("{}::{}", name_str, field_name);
-
-        let kind = parse_pdu_attr(field).unwrap_or_else(|| {
-            panic!(
-                "Field `{}` in `{}` is missing #[pdu(...)] attribute",
-                field_name, name_str
-            )
-        });
-
+    for ParsedField {
+        ident: field_name,
+        ctx,
+        kind,
+    } in &parsed
+    {
         match kind {
             FieldKind::U8 => {
                 encode_stmts.push(quote! { dst.write_u8(self.#field_name, #ctx)?; });
@@ -181,7 +285,10 @@ pub fn derive_encode(input: TokenStream) -> TokenStream {
                 size_stmts.push(quote! { 4 });
             }
             FieldKind::Bytes(n) => {
-                encode_stmts.push(quote! { dst.write_slice(&self.#field_name[..#n], #ctx)?; });
+                encode_stmts.push(quote! {
+                    assert_eq!(self.#field_name.len(), #n, "pdu(bytes = N): field length must equal N");
+                    dst.write_slice(&self.#field_name[..#n], #ctx)?;
+                });
                 size_stmts.push(quote! { #n });
             }
             FieldKind::Rest => {
@@ -220,30 +327,20 @@ pub fn derive_encode(input: TokenStream) -> TokenStream {
 pub fn derive_decode(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
-    let name_str = name.to_string();
-
-    let fields = match &input.data {
-        Data::Struct(data) => match &data.fields {
-            Fields::Named(fields) => &fields.named,
-            _ => panic!("Decode derive only supports named fields"),
-        },
-        _ => panic!("Decode derive only supports structs"),
+    let parsed = match parse_fields(&input) {
+        Ok(p) => p,
+        Err(e) => return e.to_compile_error().into(),
     };
 
     let mut decode_stmts = Vec::new();
     let mut field_names = Vec::new();
 
-    for field in fields {
-        let field_name = field.ident.as_ref().unwrap();
-        let ctx = format!("{}::{}", name_str, field_name);
-
-        let kind = parse_pdu_attr(field).unwrap_or_else(|| {
-            panic!(
-                "Field `{}` in `{}` is missing #[pdu(...)] attribute",
-                field_name, name_str
-            )
-        });
-
+    for ParsedField {
+        ident: field_name,
+        ctx,
+        kind,
+    } in &parsed
+    {
         field_names.push(field_name.clone());
 
         match kind {

@@ -566,7 +566,8 @@ impl RleDecompressor {
                 // Color Image: 0x80–0x9F
                 0x80..=0x9F => {
                     let run_length = extract_run_length_regular(header, &mut reader)?;
-                    let byte_count = run_length * pixel_size;
+                    let byte_count = run_length.checked_mul(pixel_size)
+                        .ok_or(RleError::OutputOverflow)?;
                     reader.read_bytes(dst, dest, byte_count)?;
                     dest += byte_count;
                     insert_fg_pel = false;
@@ -677,7 +678,8 @@ impl RleDecompressor {
 
                 MEGA_MEGA_COLOR_IMAGE => {
                     let run_length = extract_run_length_mega_mega(&mut reader)?;
-                    let byte_count = run_length * pixel_size;
+                    let byte_count = run_length.checked_mul(pixel_size)
+                        .ok_or(RleError::OutputOverflow)?;
                     reader.read_bytes(dst, dest, byte_count)?;
                     dest += byte_count;
                     insert_fg_pel = false;
@@ -977,6 +979,15 @@ mod tests {
         // LITE_SET_FG_FG_RUN with run=2: header = 0xC2, new fg = 0x1234
         let result = decompress_16bpp(&[0xC2, 0x34, 0x12], 2, 1).unwrap();
         assert_eq!(result, vec![0x34, 0x12, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn set_fg_fg_run_lite_mega_8bpp() {
+        // LITE_SET_FG_FG_RUN MEGA: header = 0xC0 (low nibble = 0), next byte = 0x02
+        // run_length = 2 + 16 = 18, new fg = 0x42
+        // On first line: writes 0x42 eighteen times
+        let result = decompress_8bpp(&[0xC0, 0x02, 0x42], 18, 1).unwrap();
+        assert_eq!(result, vec![0x42; 18]);
     }
 
     // ── Dithered Run ──

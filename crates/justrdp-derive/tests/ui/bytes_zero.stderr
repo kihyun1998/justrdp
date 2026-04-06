@@ -1,0 +1,5 @@
+error: bytes value must be > 0
+ --> tests/ui/bytes_zero.rs:5:11
+  |
+5 |     #[pdu(bytes = 0)]
+  |           ^^^^^^^^^

@@ -42,7 +42,7 @@ impl DvcReassembler {
         self.buffer.clear();
         self.expected_length = total_length;
 
-        if data.len() as u32 >= total_length {
+        if data.len() >= total_length as usize {
             // Complete message in a single DataFirst.
             self.assembling = false;
             Ok(Some(data[..total_length as usize].to_vec()))
@@ -59,13 +59,21 @@ impl DvcReassembler {
     /// Returns `Some(complete_payload)` when reassembly is complete.
     pub fn data(&mut self, data: &[u8]) -> DvcResult<Option<Vec<u8>>> {
         if !self.assembling {
-            // No prior DataFirst — treat as a complete single message.
+            // MS-RDPEDYC 3.1.5.2.2: standalone DYNVC_DATA without prior DataFirst
+            // is a valid complete single message (data ≤ 1590 bytes).
+            if data.len() > MAX_REASSEMBLY_SIZE as usize {
+                return Err(DvcError::Protocol(alloc::format!(
+                    "DVC standalone message too large: {} bytes", data.len()
+                )));
+            }
             return Ok(Some(data.to_vec()));
         }
 
-        self.buffer.extend_from_slice(data);
+        // Guard against buffer growing beyond expected_length.
+        let space = self.expected_length as usize - self.buffer.len();
+        self.buffer.extend_from_slice(&data[..data.len().min(space)]);
 
-        if self.buffer.len() as u32 >= self.expected_length {
+        if self.buffer.len() >= self.expected_length as usize {
             self.assembling = false;
             let result = self.buffer[..self.expected_length as usize].to_vec();
             self.buffer.clear();
@@ -75,13 +83,6 @@ impl DvcReassembler {
         }
     }
 
-    /// Reset reassembly state (e.g., on channel close).
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        self.buffer.clear();
-        self.expected_length = 0;
-        self.assembling = false;
-    }
 }
 
 #[cfg(test)]
@@ -128,13 +129,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_state() {
-        let mut r = DvcReassembler::new();
-        r.data_first(100, b"partial").unwrap();
-        r.reset();
-        // After reset, Data without DataFirst is treated as single.
-        let result = r.data(b"standalone").unwrap();
-        assert_eq!(result, Some(b"standalone".to_vec()));
+    fn new_reassembler_after_close() {
+        // On channel close, the reassembler is removed entirely.
+        // A new reassembler treats Data without DataFirst as single.
+        let r = DvcReassembler::new();
+        assert!(!r.assembling);
     }
 
     #[test]

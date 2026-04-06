@@ -17,8 +17,11 @@ pub const CMD_CLOSE: u8 = 0x04;
 pub const CMD_CAPS: u8 = 0x05;
 pub const CMD_DATA_FIRST_COMPRESSED: u8 = 0x06;
 pub const CMD_DATA_COMPRESSED: u8 = 0x07;
-pub const CMD_SOFT_SYNC_REQUEST: u8 = 0x08;
-pub const CMD_SOFT_SYNC_RESPONSE: u8 = 0x09;
+// Soft-Sync commands (MS-RDPEDYC 2.2.4). Not yet implemented — decoded
+// as unsupported so the client returns an explicit error rather than
+// falling into the "unknown command" path.
+pub(crate) const CMD_SOFT_SYNC_REQUEST: u8 = 0x08;
+pub(crate) const CMD_SOFT_SYNC_RESPONSE: u8 = 0x09;
 
 // ── Version constants ──
 
@@ -33,9 +36,10 @@ pub const CREATION_STATUS_OK: i32 = 0x00000000;
 
 // ── Header byte helpers ──
 
-/// Encode a DVC header byte: `(cmd << 4) | (sp << 2) | cb_id`.
+/// Encode a DVC header byte: `(cmd[7:4] | sp[3:2] | cb_id[1:0])`.
+/// MS-RDPEDYC 2.2
 pub fn encode_header(cmd: u8, sp: u8, cb_id: u8) -> u8 {
-    (cmd << 4) | ((sp & 0x03) << 2) | (cb_id & 0x03)
+    ((cmd & 0x0F) << 4) | ((sp & 0x03) << 2) | (cb_id & 0x03)
 }
 
 /// Decode a DVC header byte into `(cmd, sp, cb_id)`.
@@ -46,100 +50,86 @@ pub fn decode_header(byte: u8) -> (u8, u8, u8) {
     (cmd, sp, cb_id)
 }
 
-/// Determine the smallest `cbId` value for a channel ID.
-pub fn cb_id_for(channel_id: u32) -> u8 {
-    if channel_id <= 0xFF {
+// ── Variable-width integer helpers (MS-RDPEDYC 2.2) ──
+//
+// Both ChannelId and Length fields use the same 2-bit width selector
+// (0x00 → u8, 0x01 → u16, 0x02 → u32). The helpers below are shared.
+
+/// Determine the minimum 2-bit width selector for a value.
+///
+/// Used for both `cbId` (channel ID) and `Len` (length) fields.
+fn varint_width(value: u32) -> u8 {
+    if value <= 0xFF {
         0x00
-    } else if channel_id <= 0xFFFF {
+    } else if value <= 0xFFFF {
         0x01
     } else {
         0x02
     }
 }
 
-/// Number of bytes for a given `cbId` value.
+/// Number of bytes for a given 2-bit width selector.
 ///
-/// Returns 0 for invalid cbId (0x03). Callers should reject this case.
-pub fn cb_id_size(cb_id: u8) -> usize {
-    match cb_id {
+/// Returns 0 for invalid selector (0x03). Callers should reject this case.
+fn varint_size(selector: u8) -> usize {
+    match selector {
         0x00 => 1,
         0x01 => 2,
         0x02 => 4,
         _ => 0, // invalid per MS-RDPEDYC 2.2
     }
 }
+
+/// Read a variable-width integer from the cursor.
+fn read_varint(src: &mut ReadCursor<'_>, selector: u8, field: &'static str) -> DecodeResult<u32> {
+    match selector {
+        0x00 => Ok(src.read_u8(field)? as u32),
+        0x01 => Ok(src.read_u16_le(field)? as u32),
+        0x02 => Ok(src.read_u32_le(field)?),
+        _ => Err(DecodeError::unexpected_value("DVC", field, "invalid width selector 0x03")),
+    }
+}
+
+/// Write a variable-width integer to the cursor.
+fn write_varint(dst: &mut WriteCursor<'_>, value: u32, selector: u8, field: &'static str) -> EncodeResult<()> {
+    match selector {
+        0x00 => dst.write_u8(value as u8, field),
+        0x01 => dst.write_u16_le(value as u16, field),
+        0x02 => dst.write_u32_le(value, field),
+        _ => Err(justrdp_core::EncodeError::invalid_value(field, "invalid width selector 0x03")),
+    }
+}
+
+/// Determine the smallest `cbId` value for a channel ID.
+pub fn cb_id_for(channel_id: u32) -> u8 { varint_width(channel_id) }
+
+/// Number of bytes for a given `cbId` value.
+pub fn cb_id_size(cb_id: u8) -> usize { varint_size(cb_id) }
 
 /// Read a channel ID of the given `cbId` width.
 pub fn read_channel_id(src: &mut ReadCursor<'_>, cb_id: u8) -> DecodeResult<u32> {
-    match cb_id {
-        0x00 => Ok(src.read_u8("DVC::channelId")? as u32),
-        0x01 => Ok(src.read_u16_le("DVC::channelId")? as u32),
-        0x02 => Ok(src.read_u32_le("DVC::channelId")?),
-        _ => Err(DecodeError::unexpected_value("DVC", "cbId", "invalid cbId value 0x03")),
-    }
+    read_varint(src, cb_id, "DVC::channelId")
 }
 
 /// Write a channel ID with the given `cbId` width.
-///
-/// `cb_id` must be 0x00, 0x01, or 0x02. Value 0x03 is invalid per spec.
 pub fn write_channel_id(dst: &mut WriteCursor<'_>, channel_id: u32, cb_id: u8) -> EncodeResult<()> {
-    match cb_id {
-        0x00 => dst.write_u8(channel_id as u8, "DVC::channelId"),
-        0x01 => dst.write_u16_le(channel_id as u16, "DVC::channelId"),
-        0x02 => dst.write_u32_le(channel_id, "DVC::channelId"),
-        _ => Err(justrdp_core::EncodeError::invalid_value(
-            "DVC::channelId",
-            "invalid cbId value 0x03",
-        )),
-    }
+    write_varint(dst, channel_id, cb_id, "DVC::channelId")
 }
 
 /// Determine the smallest `Len` value for a length field.
-pub fn len_id_for(length: u32) -> u8 {
-    if length <= 0xFF {
-        0x00
-    } else if length <= 0xFFFF {
-        0x01
-    } else {
-        0x02
-    }
-}
+pub fn len_id_for(length: u32) -> u8 { varint_width(length) }
 
 /// Number of bytes for a given `Len` value.
-///
-/// Returns 0 for invalid len_id (0x03). Callers should reject this case.
-pub fn len_id_size(len_id: u8) -> usize {
-    match len_id {
-        0x00 => 1,
-        0x01 => 2,
-        0x02 => 4,
-        _ => 0, // invalid per MS-RDPEDYC 2.2
-    }
-}
+pub fn len_id_size(len_id: u8) -> usize { varint_size(len_id) }
 
 /// Read a length field of the given `Len` width.
 pub fn read_length(src: &mut ReadCursor<'_>, len_id: u8) -> DecodeResult<u32> {
-    match len_id {
-        0x00 => Ok(src.read_u8("DVC::length")? as u32),
-        0x01 => Ok(src.read_u16_le("DVC::length")? as u32),
-        0x02 => Ok(src.read_u32_le("DVC::length")?),
-        _ => Err(DecodeError::unexpected_value("DVC", "Len", "invalid Len value 0x03")),
-    }
+    read_varint(src, len_id, "DVC::length")
 }
 
 /// Write a length field with the given `Len` width.
-///
-/// `len_id` must be 0x00, 0x01, or 0x02. Value 0x03 is invalid per spec.
 pub fn write_length(dst: &mut WriteCursor<'_>, length: u32, len_id: u8) -> EncodeResult<()> {
-    match len_id {
-        0x00 => dst.write_u8(length as u8, "DVC::length"),
-        0x01 => dst.write_u16_le(length as u16, "DVC::length"),
-        0x02 => dst.write_u32_le(length, "DVC::length"),
-        _ => Err(justrdp_core::EncodeError::invalid_value(
-            "DVC::length",
-            "invalid Len value 0x03",
-        )),
-    }
+    write_varint(dst, length, len_id, "DVC::length")
 }
 
 // ── PDU types ──
@@ -191,7 +181,8 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
             // Server → Client: DYNVC_CAPS_VERSION1/2/3 (MS-RDPEDYC 2.2.1.1)
             let _pad = src.read_u8("DVC::capsPad")?;
             let version = src.read_u16_le("DVC::capsVersion")?;
-            let charges = if version >= CAPS_VERSION_2 && src.remaining() >= 8 {
+            // MS-RDPEDYC 2.2.1.1: v2/v3 MUST include 4 priority charge fields (8 bytes).
+            let charges = if version >= CAPS_VERSION_2 {
                 Some([
                     src.read_u16_le("DVC::priorityCharge0")?,
                     src.read_u16_le("DVC::priorityCharge1")?,
@@ -208,12 +199,14 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
             // Wire: Header + ChannelId + ChannelName (null-terminated)
             let channel_id = read_channel_id(src, cb_id)?;
             let remaining = src.peek_remaining();
-            let name_end = remaining.iter().position(|&b| b == 0).unwrap_or(remaining.len());
+            // MS-RDPEDYC 2.2.2.1: channel name MUST be null-terminated.
+            let name_end = remaining.iter().position(|&b| b == 0)
+                .ok_or_else(|| DecodeError::unexpected_value("DVC", "channelName", "missing null terminator"))?;
             let name_bytes = &remaining[..name_end];
             let channel_name = core::str::from_utf8(name_bytes)
                 .map_err(|_| DecodeError::unexpected_value("DVC", "channelName", "invalid UTF-8"))?;
             let channel_name = String::from(channel_name);
-            let skip = if name_end < remaining.len() { name_end + 1 } else { name_end };
+            let skip = name_end + 1; // include the null terminator
             src.skip(skip, "DVC::channelName")?;
             Ok(DvcPdu::CreateRequest {
                 channel_id,
@@ -242,23 +235,14 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
             let channel_id = read_channel_id(src, cb_id)?;
             Ok(DvcPdu::Close { channel_id })
         }
-        // Compressed variants (v3) — for now, decode as Data/DataFirst with raw payload.
-        CMD_DATA_FIRST_COMPRESSED => {
-            let channel_id = read_channel_id(src, cb_id)?;
-            let total_length = read_length(src, sp)?;
-            let data = src.peek_remaining().to_vec();
-            src.skip(data.len(), "DVC::compressedDataFirst")?;
-            Ok(DvcPdu::DataFirst {
-                channel_id,
-                total_length,
-                data,
-            })
+        // Compressed variants (v3) — not yet supported.
+        // Silently decoding compressed payload as plain data would corrupt the stream.
+        CMD_DATA_FIRST_COMPRESSED | CMD_DATA_COMPRESSED => {
+            Err(DecodeError::unsupported("DVC", "compressed DVC data is not yet supported"))
         }
-        CMD_DATA_COMPRESSED => {
-            let channel_id = read_channel_id(src, cb_id)?;
-            let data = src.peek_remaining().to_vec();
-            src.skip(data.len(), "DVC::compressedData")?;
-            Ok(DvcPdu::Data { channel_id, data })
+        // Soft-Sync (MS-RDPEDYC 2.2.4) — not yet supported.
+        CMD_SOFT_SYNC_REQUEST | CMD_SOFT_SYNC_RESPONSE => {
+            Err(DecodeError::unsupported("DVC", "Soft-Sync is not yet supported"))
         }
         _ => Err(DecodeError::unexpected_value("DVC", "Cmd", "unknown DVC command")),
     }
@@ -281,9 +265,9 @@ pub fn encode_create_response(channel_id: u32, creation_status: i32) -> Vec<u8> 
     let size = 1 + cb_id_size(cb_id) + 4;
     let mut buf = alloc::vec![0u8; size];
     let mut cursor = WriteCursor::new(&mut buf);
-    cursor.write_u8(encode_header(CMD_CREATE, 0, cb_id), "DVC::header").unwrap();
-    write_channel_id(&mut cursor, channel_id, cb_id).unwrap();
-    cursor.write_i32_le(creation_status, "DVC::creationStatus").unwrap();
+    cursor.write_u8(encode_header(CMD_CREATE, 0, cb_id), "DVC::header").expect("pre-sized buffer");
+    write_channel_id(&mut cursor, channel_id, cb_id).expect("pre-sized buffer");
+    cursor.write_i32_le(creation_status, "DVC::creationStatus").expect("pre-sized buffer");
     buf
 }
 
@@ -293,9 +277,9 @@ pub fn encode_data(channel_id: u32, data: &[u8]) -> Vec<u8> {
     let size = 1 + cb_id_size(cb_id) + data.len();
     let mut buf = alloc::vec![0u8; size];
     let mut cursor = WriteCursor::new(&mut buf);
-    cursor.write_u8(encode_header(CMD_DATA, 0, cb_id), "DVC::header").unwrap();
-    write_channel_id(&mut cursor, channel_id, cb_id).unwrap();
-    cursor.write_slice(data, "DVC::data").unwrap();
+    cursor.write_u8(encode_header(CMD_DATA, 0, cb_id), "DVC::header").expect("pre-sized buffer");
+    write_channel_id(&mut cursor, channel_id, cb_id).expect("pre-sized buffer");
+    cursor.write_slice(data, "DVC::data").expect("pre-sized buffer");
     buf
 }
 
@@ -306,10 +290,10 @@ pub fn encode_data_first(channel_id: u32, total_length: u32, data: &[u8]) -> Vec
     let size = 1 + cb_id_size(cb_id) + len_id_size(len_id) + data.len();
     let mut buf = alloc::vec![0u8; size];
     let mut cursor = WriteCursor::new(&mut buf);
-    cursor.write_u8(encode_header(CMD_DATA_FIRST, len_id, cb_id), "DVC::header").unwrap();
-    write_channel_id(&mut cursor, channel_id, cb_id).unwrap();
-    write_length(&mut cursor, total_length, len_id).unwrap();
-    cursor.write_slice(data, "DVC::data").unwrap();
+    cursor.write_u8(encode_header(CMD_DATA_FIRST, len_id, cb_id), "DVC::header").expect("pre-sized buffer");
+    write_channel_id(&mut cursor, channel_id, cb_id).expect("pre-sized buffer");
+    write_length(&mut cursor, total_length, len_id).expect("pre-sized buffer");
+    cursor.write_slice(data, "DVC::data").expect("pre-sized buffer");
     buf
 }
 
@@ -319,8 +303,8 @@ pub fn encode_close(channel_id: u32) -> Vec<u8> {
     let size = 1 + cb_id_size(cb_id);
     let mut buf = alloc::vec![0u8; size];
     let mut cursor = WriteCursor::new(&mut buf);
-    cursor.write_u8(encode_header(CMD_CLOSE, 0, cb_id), "DVC::header").unwrap();
-    write_channel_id(&mut cursor, channel_id, cb_id).unwrap();
+    cursor.write_u8(encode_header(CMD_CLOSE, 0, cb_id), "DVC::header").expect("pre-sized buffer");
+    write_channel_id(&mut cursor, channel_id, cb_id).expect("pre-sized buffer");
     buf
 }
 

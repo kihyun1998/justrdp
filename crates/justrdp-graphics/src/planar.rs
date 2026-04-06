@@ -210,7 +210,7 @@ fn decode_plane_raw(
     width: usize,
     height: usize,
 ) -> Result<(), PlanarError> {
-    let total = width * height;
+    let total = width.checked_mul(height).ok_or(PlanarError::OutputOverflow)?;
     if total == 0 {
         return Ok(());
     }
@@ -363,7 +363,7 @@ impl PlanarDecompressor {
         let mut plane3_raw;                       // G or Co (possibly subsampled)
         let mut plane4_raw;                       // B or Cg (possibly subsampled)
 
-        let chroma_size = chroma_w * chroma_h;
+        let chroma_size = chroma_w.checked_mul(chroma_h).ok_or(PlanarError::OutputOverflow)?;
         plane3_raw = vec![0u8; chroma_size];
         plane4_raw = vec![0u8; chroma_size];
 
@@ -460,14 +460,16 @@ impl Default for PlanarEncoderConfig {
 /// Encode a delta value using the LSB-sign scheme (MS-RDPEGDI §3.1.9.2).
 /// positive/zero → even byte, negative → odd byte.
 ///
-/// Note: the scheme represents magnitudes 0–127 only. Deltas with
-/// |magnitude| > 127 are truncated (matching FreeRDP behavior).
+/// The wire format stores magnitudes in 7 bits, so only deltas in [-127, 127]
+/// are representable. Larger deltas are clamped to the nearest representable
+/// value, introducing minor loss for high-contrast pixel transitions.
 #[inline]
 fn encode_delta(delta: i16) -> u8 {
-    if delta >= 0 {
-        ((delta as u16) << 1) as u8
+    let clamped = delta.clamp(-127, 127);
+    if clamped >= 0 {
+        (clamped as u8) << 1
     } else {
-        (((-delta) as u16) << 1 | 1) as u8
+        ((-clamped) as u8) << 1 | 1
     }
 }
 
@@ -602,7 +604,9 @@ fn emit_run_segments(value: u8, mut run_len: usize, out: &mut Vec<u8>) {
 
 /// Write a raw (non-RLE) plane: just copy width * height bytes.
 fn encode_plane_raw(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
-    let total = width * height;
+    // Defensive: use saturating_mul so a wrapping product on 32-bit targets
+    // causes an out-of-bounds panic rather than silent truncation.
+    let total = width.saturating_mul(height);
     out.extend_from_slice(&plane[..total]);
 }
 
@@ -1382,6 +1386,25 @@ mod tests {
             let decoded = decode_delta(encoded);
             assert_eq!(decoded, delta, "delta {delta} roundtrip failed");
         }
+    }
+
+    #[test]
+    fn encode_delta_clamp_at_boundary() {
+        // Wire format supports magnitudes 0–127 only (7 bits).
+        // Deltas beyond [-127, 127] are clamped to the nearest representable value.
+        // delta=128 → clamped to 127 → encoded as 127<<1 = 0xFE → decodes as +127
+        assert_eq!(encode_delta(128), 0xFE);
+        assert_eq!(decode_delta(encode_delta(128)), 127);
+        // delta=-128 → clamped to -127 → encoded as 127<<1|1 = 0xFF → decodes as -127
+        assert_eq!(encode_delta(-128), 0xFF);
+        assert_eq!(decode_delta(encode_delta(-128)), -127);
+        // delta=255 → clamped to 127
+        assert_eq!(decode_delta(encode_delta(255)), 127);
+        // delta=-255 → clamped to -127
+        assert_eq!(decode_delta(encode_delta(-255)), -127);
+        // Max representable values roundtrip exactly
+        assert_eq!(decode_delta(encode_delta(127)), 127);
+        assert_eq!(decode_delta(encode_delta(-127)), -127);
     }
 
     // ── Compressor → Decompressor roundtrip (RLE, 1x1) ──
