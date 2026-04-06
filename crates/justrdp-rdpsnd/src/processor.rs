@@ -5,48 +5,18 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use justrdp_core::{AsAny, Decode, Encode, ReadCursor, WriteCursor};
+use justrdp_core::AsAny;
 use justrdp_svc::{
     ChannelName, CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor, SvcResult,
     RDPSND,
 };
 
 use crate::backend::RdpsndBackend;
-use crate::pdu::{
-    AudioFormat, ClientAudioFormatsPdu, ClientSndFlags, QualityMode, QualityModePdu,
-    ServerAudioFormatsPdu, SndHeader, SndMsgType, TrainingConfirmPdu, TrainingPdu,
-    VolumePdu, Wave2Pdu, WaveConfirmPdu, WaveInfoPdu, decode_wave_data,
-};
+use crate::engine::{RdpsndCore, RdpsndError};
 
-/// RDPSND protocol version we advertise.
-const CLIENT_VERSION: u16 = 0x0006;
-
-/// MS-RDPEA 2.2.2.3: Quality Mode PDU requires both sides at version >= 6.
-const QUALITY_MODE_MIN_VERSION: u16 = 6;
-
-/// Client-side RDPSND state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RdpsndState {
-    /// Waiting for server's Audio Formats PDU.
-    WaitServerFormats,
-    /// Sent client formats, waiting for Training PDU.
-    WaitTraining,
-    /// Received WaveInfo, waiting for the following Wave PDU data.
-    WaitWaveData,
-    /// Active: audio data may flow.
-    Active,
-}
-
-/// Client-side RDPSND processor.
+/// Client-side RDPSND processor (SVC transport).
 pub struct RdpsndClient {
-    state: RdpsndState,
-    backend: Box<dyn RdpsndBackend>,
-    /// Server's protocol version.
-    server_version: u16,
-    /// Negotiated audio formats (intersection).
-    negotiated_formats: Vec<AudioFormat>,
-    /// Pending WaveInfo (when waiting for Wave PDU).
-    pending_wave_info: Option<WaveInfoPdu>,
+    core: RdpsndCore,
 }
 
 impl AsAny for RdpsndClient {
@@ -62,206 +32,32 @@ impl AsAny for RdpsndClient {
 impl core::fmt::Debug for RdpsndClient {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RdpsndClient")
-            .field("state", &self.state)
-            .field("server_version", &self.server_version)
-            .field("negotiated_formats_count", &self.negotiated_formats.len())
+            .field("core", &self.core)
             .finish()
     }
 }
 
 impl RdpsndClient {
-    /// Create a new RDPSND client processor.
+    /// Create a new RDPSND client processor (SVC mode, version 6).
     pub fn new(backend: Box<dyn RdpsndBackend>) -> Self {
         Self {
-            state: RdpsndState::WaitServerFormats,
-            backend,
-            server_version: 0,
-            negotiated_formats: Vec::new(),
-            pending_wave_info: None,
+            core: RdpsndCore::new_svc(backend),
         }
     }
+}
 
-    /// Encode a PDU into an SvcMessage.
-    fn encode_pdu<T: Encode>(pdu: &T) -> SvcResult<SvcMessage> {
-        let mut buf = alloc::vec![0u8; pdu.size()];
-        let mut cursor = WriteCursor::new(&mut buf);
-        pdu.encode(&mut cursor)?;
-        Ok(SvcMessage::new(buf))
+/// Convert `RdpsndError` to `SvcError`.
+fn to_svc_error(e: RdpsndError) -> justrdp_svc::SvcError {
+    match e {
+        RdpsndError::Decode(d) => justrdp_svc::SvcError::Decode(d),
+        RdpsndError::Encode(e) => justrdp_svc::SvcError::Encode(e),
+        RdpsndError::Protocol(s) => justrdp_svc::SvcError::Protocol(s),
     }
+}
 
-    /// Handle incoming PDU based on current state.
-    fn handle_pdu(&mut self, payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
-        let mut cursor = ReadCursor::new(payload);
-
-        // Special case: if we're waiting for Wave data (no header).
-        if self.state == RdpsndState::WaitWaveData {
-            return self.handle_wave_data(&mut cursor);
-        }
-
-        let header = SndHeader::decode(&mut cursor)?;
-
-        match header.msg_type {
-            SndMsgType::Formats if self.state == RdpsndState::WaitServerFormats => {
-                self.handle_server_formats(&mut cursor)
-            }
-
-            // MS-RDPEA 2.2.3.1: server may send Training at any time, not just WaitTraining.
-            SndMsgType::Training => self.handle_training(&mut cursor, header.body_size),
-
-            SndMsgType::Wave if self.state == RdpsndState::Active => {
-                self.handle_wave_info(&mut cursor, header.body_size)
-            }
-
-            SndMsgType::Wave2 if self.state == RdpsndState::Active => {
-                self.handle_wave2(&mut cursor, header.body_size)
-            }
-
-            SndMsgType::WaveConfirm => {
-                // Server shouldn't send this to client; ignore.
-                Ok(Vec::new())
-            }
-
-            SndMsgType::SetVolume => {
-                let vol = VolumePdu::decode_body(&mut cursor)?;
-                self.backend.on_volume(&vol);
-                Ok(Vec::new())
-            }
-
-            SndMsgType::SetPitch => {
-                // Client MUST ignore pitch per spec.
-                Ok(Vec::new())
-            }
-
-            SndMsgType::Close => {
-                self.backend.on_close();
-                // Reset state to allow server-initiated re-negotiation (MS-RDPEA).
-                self.state = RdpsndState::WaitServerFormats;
-                self.negotiated_formats.clear();
-                self.pending_wave_info = None;
-                Ok(Vec::new())
-            }
-
-            SndMsgType::QualityMode => {
-                // Server shouldn't send this; ignore.
-                Ok(Vec::new())
-            }
-
-            // UDP-only or unknown: skip.
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    fn handle_server_formats(
-        &mut self,
-        cursor: &mut ReadCursor<'_>,
-    ) -> SvcResult<Vec<SvcMessage>> {
-        let server_pdu = ServerAudioFormatsPdu::decode_body(cursor)?;
-        self.server_version = server_pdu.version;
-
-        // Ask backend which formats to support.
-        let supported_indices = self.backend.on_server_formats(&server_pdu.formats);
-
-        // Build negotiated format list (intersection).
-        self.negotiated_formats = supported_indices
-            .iter()
-            .filter_map(|&i| server_pdu.formats.get(i).cloned())
-            .collect();
-
-        // Build client response.
-        let client_pdu = ClientAudioFormatsPdu {
-            flags: ClientSndFlags::ALIVE.union(ClientSndFlags::VOLUME),
-            volume: 0xFFFF_FFFF, // MS-RDPEA 2.2.2.2: full volume both channels
-            pitch: 0x0001_0000,  // MS-RDPEA 2.2.2.2: 1.0x pitch (fixed-point)
-            version: CLIENT_VERSION,
-            formats: self.negotiated_formats.clone(),
-        };
-        let mut messages = alloc::vec![Self::encode_pdu(&client_pdu)?];
-
-        // MS-RDPEA 2.2.2.3: client MUST send Quality Mode PDU when both versions >= 6.
-        // CLIENT_VERSION is always 6, so only the server version needs checking.
-        if self.server_version >= QUALITY_MODE_MIN_VERSION {
-            let quality = QualityModePdu::new(QualityMode::Dynamic);
-            messages.push(Self::encode_pdu(&quality)?);
-        }
-
-        self.state = RdpsndState::WaitTraining;
-        Ok(messages)
-    }
-
-    fn handle_training(
-        &mut self,
-        cursor: &mut ReadCursor<'_>,
-        body_size: u16,
-    ) -> SvcResult<Vec<SvcMessage>> {
-        let training = TrainingPdu::decode_body(cursor, body_size)?;
-        let confirm = TrainingConfirmPdu::from_training(&training);
-
-        self.state = RdpsndState::Active;
-        Ok(alloc::vec![Self::encode_pdu(&confirm)?])
-    }
-
-    fn handle_wave_info(
-        &mut self,
-        cursor: &mut ReadCursor<'_>,
-        body_size: u16,
-    ) -> SvcResult<Vec<SvcMessage>> {
-        let wave_info = WaveInfoPdu::decode_body(cursor, body_size)?;
-        self.pending_wave_info = Some(wave_info);
-        self.state = RdpsndState::WaitWaveData;
-        Ok(Vec::new())
-    }
-
-    fn handle_wave_data(
-        &mut self,
-        cursor: &mut ReadCursor<'_>,
-    ) -> SvcResult<Vec<SvcMessage>> {
-        let wave_info = self.pending_wave_info.take().ok_or_else(|| {
-            justrdp_svc::SvcError::Protocol(alloc::format!(
-                "Wave PDU without preceding WaveInfo"
-            ))
-        })?;
-
-        if wave_info.format_no as usize >= self.negotiated_formats.len() {
-            return Err(justrdp_svc::SvcError::Protocol(alloc::format!(
-                "Wave format_no {} out of range (negotiated: {})",
-                wave_info.format_no,
-                self.negotiated_formats.len(),
-            )));
-        }
-
-        let audio = decode_wave_data(cursor, &wave_info)?;
-        self.backend
-            .on_wave_data(wave_info.format_no, &audio, None);
-
-        self.state = RdpsndState::Active;
-
-        // Send Wave Confirm.
-        let confirm = WaveConfirmPdu::new(wave_info.timestamp, wave_info.block_no);
-        Ok(alloc::vec![Self::encode_pdu(&confirm)?])
-    }
-
-    fn handle_wave2(
-        &mut self,
-        cursor: &mut ReadCursor<'_>,
-        body_size: u16,
-    ) -> SvcResult<Vec<SvcMessage>> {
-        let wave2 = Wave2Pdu::decode_body(cursor, body_size)?;
-
-        if wave2.format_no as usize >= self.negotiated_formats.len() {
-            return Err(justrdp_svc::SvcError::Protocol(alloc::format!(
-                "Wave2 format_no {} out of range (negotiated: {})",
-                wave2.format_no,
-                self.negotiated_formats.len(),
-            )));
-        }
-
-        self.backend
-            .on_wave_data(wave2.format_no, &wave2.data, Some(wave2.audio_timestamp));
-
-        // Send Wave Confirm.
-        let confirm = WaveConfirmPdu::new(wave2.timestamp, wave2.block_no);
-        Ok(alloc::vec![Self::encode_pdu(&confirm)?])
-    }
+/// Wrap raw byte buffers into `SvcMessage`s.
+fn to_svc_messages(bufs: Vec<Vec<u8>>) -> Vec<SvcMessage> {
+    bufs.into_iter().map(SvcMessage::new).collect()
 }
 
 impl SvcProcessor for RdpsndClient {
@@ -275,7 +71,10 @@ impl SvcProcessor for RdpsndClient {
     }
 
     fn process(&mut self, payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
-        self.handle_pdu(payload)
+        self.core
+            .handle_pdu(payload)
+            .map(to_svc_messages)
+            .map_err(to_svc_error)
     }
 
     fn compression_condition(&self) -> CompressionCondition {
@@ -284,3 +83,113 @@ impl SvcProcessor for RdpsndClient {
 }
 
 impl SvcClientProcessor for RdpsndClient {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
+
+    use crate::pdu::{AudioFormat, SndHeader, SndMsgType, Wave2Pdu, WaveConfirmPdu};
+
+    struct MockBackend;
+
+    impl crate::backend::RdpsndBackend for MockBackend {
+        fn on_server_formats(&mut self, server_formats: &[AudioFormat]) -> Vec<usize> {
+            (0..server_formats.len()).collect()
+        }
+        fn on_wave_data(&mut self, _: u16, _: &[u8], _: Option<u32>) {}
+        fn on_volume(&mut self, _: &crate::pdu::VolumePdu) {}
+        fn on_close(&mut self) {}
+    }
+
+    fn build_server_formats(ver: u16) -> Vec<u8> {
+        let pcm = AudioFormat::pcm(2, 44100, 16);
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.push(0xFF);
+        body.extend_from_slice(&ver.to_le_bytes());
+        body.push(0x00);
+        let mut fmt_buf = vec![0u8; pcm.size()];
+        let mut cursor = WriteCursor::new(&mut fmt_buf);
+        pcm.encode(&mut cursor).unwrap();
+        body.extend_from_slice(&fmt_buf);
+
+        let body_size = body.len() as u16;
+        let mut pdu = Vec::new();
+        pdu.push(SndMsgType::Formats as u8);
+        pdu.push(0x00);
+        pdu.extend_from_slice(&body_size.to_le_bytes());
+        pdu.extend_from_slice(&body);
+        pdu
+    }
+
+    fn build_training(timestamp: u16) -> Vec<u8> {
+        let mut pdu = Vec::new();
+        pdu.push(SndMsgType::Training as u8);
+        pdu.push(0x00);
+        pdu.extend_from_slice(&4u16.to_le_bytes());
+        pdu.extend_from_slice(&timestamp.to_le_bytes());
+        pdu.extend_from_slice(&0u16.to_le_bytes());
+        pdu
+    }
+
+    #[test]
+    fn svc_client_full_init_sequence() {
+        let mut client = RdpsndClient::new(Box::new(MockBackend));
+        client.start().unwrap();
+
+        // Server sends Formats (version 6).
+        let responses = client.process(&build_server_formats(6)).unwrap();
+        assert_eq!(responses.len(), 2, "expected ClientFormats + QualityMode");
+
+        // Verify client advertises version 6 (SVC mode).
+        let body_start = &responses[0].data[4..];
+        let version_offset = 4 + 4 + 4 + 2 + 2 + 1; // 17
+        let version =
+            u16::from_le_bytes([body_start[version_offset], body_start[version_offset + 1]]);
+        assert_eq!(version, 0x0006, "SVC client should advertise version 6");
+
+        // Server sends Training.
+        let responses = client.process(&build_training(42)).unwrap();
+        assert_eq!(responses.len(), 1);
+        let mut cursor = ReadCursor::new(&responses[0].data);
+        let header = SndHeader::decode(&mut cursor).unwrap();
+        assert_eq!(header.msg_type, SndMsgType::Training);
+
+        // Server sends Wave2.
+        let wave2 = Wave2Pdu {
+            timestamp: 100,
+            format_no: 0,
+            block_no: 7,
+            audio_timestamp: 5000,
+            data: vec![0x01, 0x02],
+        };
+        let mut buf = vec![0u8; wave2.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        wave2.encode(&mut cursor).unwrap();
+        let responses = client.process(&buf).unwrap();
+        assert_eq!(responses.len(), 1);
+        let mut cursor = ReadCursor::new(&responses[0].data);
+        let header = SndHeader::decode(&mut cursor).unwrap();
+        assert_eq!(header.msg_type, SndMsgType::WaveConfirm);
+        let wc = WaveConfirmPdu::decode_body(&mut cursor).unwrap();
+        assert_eq!(wc.timestamp, 100);
+        assert_eq!(wc.confirmed_block_no, 7);
+    }
+
+    #[test]
+    fn svc_no_quality_mode_when_server_version_below_6() {
+        let mut client = RdpsndClient::new(Box::new(MockBackend));
+        client.start().unwrap();
+
+        // Server sends Formats with version 5 (< 6).
+        let responses = client.process(&build_server_formats(5)).unwrap();
+        // Should only get ClientFormats, no QualityMode.
+        assert_eq!(responses.len(), 1, "no QualityMode when server version < 6");
+    }
+}

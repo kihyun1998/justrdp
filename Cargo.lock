@@ -260,6 +260,7 @@ version = "0.1.0"
 dependencies = [
  "justrdp-audio",
  "justrdp-core",
+ "justrdp-dvc",
  "justrdp-svc",
 ]
 

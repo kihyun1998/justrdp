@@ -43,6 +43,11 @@ pub enum SndMsgType {
 }
 
 impl SndMsgType {
+    /// Check if a byte value is a known RDPSND message type.
+    pub fn is_valid(value: u8) -> bool {
+        Self::from_u8(value).is_some()
+    }
+
     /// Try to convert a u8 to a SndMsgType.
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {

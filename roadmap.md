@@ -1000,10 +1000,10 @@ pub trait CliprdrBackend: Send {
 - [x] Wave/Wave2 PDU 수신 및 디코딩
 - [x] WaveConfirm PDU 전송 (타임스탬프 동기화)
 - [x] 볼륨/피치 제어
-- [ ] DVC 전송 모드:
-  - [ ] `RdpsndDvcClient` -- `DvcProcessor` 구현 (`AUDIO_PLAYBACK_DVC`)
-  - [ ] Lossy DVC 채널 (`AUDIO_PLAYBACK_LOSSY_DVC`) 지원
-  - [ ] SVC/DVC 공통 로직 추출 (PDU 처리, 상태 머신 공유)
+- [x] DVC 전송 모드:
+  - [x] `RdpsndDvcClient` -- `DvcProcessor` 구현 (`AUDIO_PLAYBACK_DVC`)
+  - [x] Lossy DVC 채널 (`AUDIO_PLAYBACK_LOSSY_DVC`) 지원
+  - [x] SVC/DVC 공통 로직 추출 (PDU 처리, 상태 머신 공유)
 - [x] 코덱 → `justrdp-audio` crate (Phase 3 코덱 패턴, `justrdp-bulk`/`justrdp-graphics` 동일 구조)
 
 ### 8.3 `justrdp-rdpdr` -- Device Redirection (MS-RDPEFS)
