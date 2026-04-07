@@ -29,6 +29,9 @@ pub mod rle;
 #[cfg(feature = "alloc")]
 pub mod utils;
 
+#[cfg(feature = "alloc")]
+pub mod avc;
+
 // ── Public re-exports for primary types ──
 
 #[cfg(feature = "alloc")]
@@ -50,3 +53,10 @@ pub use utils::{
 
 #[cfg(feature = "alloc")]
 pub use pointer::{decode_pointer, PointerCache, PointerError, PointerShape};
+
+#[cfg(feature = "alloc")]
+pub use avc::{
+    AvcDecoder, AvcError, Yuv420Frame, Yuv444Planes,
+    combine_avc444_planes, combine_avc444v2_planes,
+    yuv420_to_bgra, yuv444_to_bgra,
+};

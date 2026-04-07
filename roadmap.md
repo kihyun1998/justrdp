@@ -1170,11 +1170,11 @@ pub trait GfxHandler: Send {
 > **requires**: 없음 (순수 디코더), 하지만 8.6 EGFX 연동 시 실질적 테스트 가능
 > **검증**: 알려진 NAL 유닛 디코딩, EGFX WireToSurface로 end-to-end 확인
 
-- [ ] AVC420 디코딩 (YUV 4:2:0)
-- [ ] AVC444 디코딩 (YUV 4:4:4, 두 AVC420 결합)
-- [ ] AVC444v2 디코딩
-- [ ] 순수 Rust H.264 디코더 통합 또는 trait 추상화
-- [ ] 하드웨어 가속 백엔드 trait
+- [x] AVC420 디코딩 (YUV 4:2:0)
+- [x] AVC444 디코딩 (YUV 4:4:4, 두 AVC420 결합)
+- [x] AVC444v2 디코딩
+- [x] 순수 Rust H.264 디코더 통합 또는 trait 추상화
+- [x] 하드웨어 가속 백엔드 trait
 
 ### 8.9 Native Platform Backends
 

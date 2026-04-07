@@ -8,6 +8,7 @@ mod bitmap;
 mod draw;
 mod cache;
 mod frame;
+pub mod avc;
 
 pub use caps::*;
 pub use surface::*;
@@ -15,6 +16,7 @@ pub use bitmap::*;
 pub use draw::*;
 pub use cache::*;
 pub use frame::*;
+pub use avc::*;
 
 // ── Command IDs (MS-RDPEGFX 2.2.1.5) ──
 
