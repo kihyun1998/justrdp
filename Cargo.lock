@@ -267,6 +267,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-rdpeai"
+version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+ "justrdp-dvc",
+ "justrdp-rdpsnd",
+]
+
+[[package]]
 name = "justrdp-rdpfile"
 version = "0.1.0"
 

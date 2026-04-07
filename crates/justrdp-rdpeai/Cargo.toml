@@ -1,0 +1,21 @@
+[package]
+name = "justrdp-rdpeai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Audio Input Virtual Channel (MS-RDPEAI) for JustRDP"
+keywords = ["rdp", "audio-input", "rdpeai"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc", "justrdp-dvc/alloc", "justrdp-rdpsnd/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-dvc/std", "justrdp-rdpsnd/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-dvc.workspace = true
+justrdp-rdpsnd.workspace = true

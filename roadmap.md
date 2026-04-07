@@ -1087,11 +1087,11 @@ pub trait RdpdrBackend: Send {
 
 **구현 항목:**
 
-- [ ] 버전 교환
-- [ ] 오디오 포맷 협상
-- [ ] Open/Close 시퀀스
-- [ ] 오디오 캡처 데이터 전송
-- [ ] 포맷 변경
+- [x] 버전 교환
+- [x] 오디오 포맷 협상
+- [x] Open/Close 시퀀스
+- [x] 오디오 캡처 데이터 전송
+- [x] 포맷 변경
 
 ### 8.6 `justrdp-egfx` -- Graphics Pipeline Extension (RDPEGFX)
 
