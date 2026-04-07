@@ -1,0 +1,20 @@
+[package]
+name = "justrdp-rdpdr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Device Redirection (MS-RDPEFS) for JustRDP"
+keywords = ["rdp", "rdpdr", "device-redirection"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc", "justrdp-svc/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-svc/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-svc.workspace = true

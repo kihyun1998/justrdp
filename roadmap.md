@@ -152,7 +152,7 @@ Network Layer
 | `justrdp-session`        | 활성 세션 처리                     | `ActiveStage`, `ActiveStageOutput`, `FastPathProcessor`, `X224Processor`                                   |
 | `justrdp-input`          | 입력 이벤트 관리                   | `InputDatabase`, `Operation`, `Scancode`, `FastPathInputEvent`                                             |
 | `justrdp-cliprdr`        | 클립보드 채널                      | `Cliprdr<Role>`, `CliprdrBackend`, `FormatList`, `FormatDataRequest`                                       |
-| `justrdp-rdpdr`          | 디바이스 리다이렉션                | `Rdpdr`, `RdpdrBackend`, `DeviceIoRequest`, `DeviceIoResponse`                                             |
+| `justrdp-rdpdr`          | 디바이스 리다이렉션                | `RdpdrClient`, `RdpdrBackend`, `DeviceIoRequest`, `DeviceIoResponse`, `IrpRequest`, `DeviceAnnounce`       |
 | `justrdp-rdpsnd`         | 오디오 출력                        | `RdpsndClient`, `RdpsndServer`, `AudioFormat`, `WaveData`                                                  |
 | `justrdp-rdpeai`         | 오디오 입력                        | `AudioInputClient`, `AudioInputServer`                                                                     |
 | `justrdp-egfx`           | 그래픽스 파이프라인                | `GfxClient`, `GfxServer`, `GfxHandler`, `Surface`, `FrameAck`                                              |
@@ -1031,20 +1031,24 @@ pub trait RdpdrBackend: Send {
 
 **구현 항목:**
 
-- [ ] 초기화 시퀀스 (Announce → Name → Capability → Device List)
-- [ ] 디바이스 타입: Filesystem, Serial, Parallel, Printer, Smartcard
-- [ ] IRP (I/O Request Packet) 처리:
-  - [ ] IRP_MJ_CREATE / CLOSE / READ / WRITE
-  - [ ] IRP_MJ_DEVICE_CONTROL (IOCTL)
-  - [ ] IRP_MJ_QUERY_INFORMATION / SET_INFORMATION
-  - [ ] IRP_MJ_QUERY_VOLUME_INFORMATION / SET_VOLUME_INFORMATION
-  - [ ] IRP_MJ_DIRECTORY_CONTROL (Query / Notify)
-  - [ ] IRP_MJ_LOCK_CONTROL
-- [ ] 드라이브 리다이렉션 (`with_drives()`, `add_drive()`)
-- [ ] 스마트카드 리다이렉션 (`with_smartcard()`, MS-RDPESC)
-  - [ ] NDR/RPCE 인코딩
-  - [ ] SCard API 래핑
-- [ ] 프린터 리다이렉션 (MS-RDPEPC)
+- [x] 초기화 시퀀스 (Announce → Name → Capability → Device List)
+- [x] 디바이스 타입: Filesystem, Serial, Parallel, Printer, Smartcard
+- [x] IRP (I/O Request Packet) 처리:
+  - [x] IRP_MJ_CREATE / CLOSE / READ / WRITE
+  - [x] IRP_MJ_DEVICE_CONTROL (IOCTL)
+  - [x] IRP_MJ_QUERY_INFORMATION / SET_INFORMATION
+  - [x] IRP_MJ_QUERY_VOLUME_INFORMATION / SET_VOLUME_INFORMATION
+  - [x] IRP_MJ_DIRECTORY_CONTROL (Query / Notify)
+  - [x] IRP_MJ_LOCK_CONTROL
+- [x] 드라이브 리다이렉션 (`DeviceAnnounce::filesystem()`, `build_device_list_announce()`)
+- [x] 스마트카드 리다이렉션 (MS-RDPESC)
+  - [x] NDR/RPCE 인코딩 (`scard::ndr`)
+  - [x] SCard IOCTL 상수 (`scard::constants`, 48 IOCTL codes)
+  - [x] `ScardBackend` trait (`scard::backend`, 17 SCard API methods)
+- [x] 프린터 리다이렉션 (MS-RDPEPC)
+  - [x] `PrinterDeviceData` (DR_PRN_DEVICE_ANNOUNCE DeviceData)
+  - [x] `PrinterUsingXpsPdu` (DR_PRN_USING_XPS)
+  - [x] `PrinterCacheDataPdu` (DR_PRN_CACHE_DATA)
 
 ### 8.4 `justrdp-displaycontrol` -- Display Control (MS-RDPEDISP)
 
