@@ -1,0 +1,20 @@
+[package]
+name = "justrdp-rail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Remote Programs (RAIL / MS-RDPERP) for JustRDP"
+keywords = ["rdp", "rail", "remoteapp"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc", "justrdp-svc/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-svc/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-svc.workspace = true

@@ -1147,23 +1147,23 @@ pub trait GfxHandler: Send {
 
 **구현 항목:**
 
-- [ ] RAIL Handshake
-- [ ] Client Status PDU
-- [ ] Exec Request/Result PDU (원격 앱 실행)
-- [ ] System Parameters PDU (양방향)
-- [ ] Window Activate/Deactivate PDU
-- [ ] System Menu / System Command PDU
-- [ ] Notification Icon Event PDU
-- [ ] Get AppId Request/Response PDU
-- [ ] Language Bar Info PDU
-- [ ] Window Cloak PDU
-- [ ] Snap Arrange PDU
-- [ ] Z-Order Sync PDU
-- [ ] Window Information Orders (Alternate Secondary):
-  - [ ] New/Existing Window Order
-  - [ ] Delete Window Order
-  - [ ] Notification Icon Order
-- [ ] EGFX 연동: `MapSurfaceToWindow` / `MapSurfaceToScaledWindow`
+- [x] RAIL Handshake
+- [x] Client Status PDU
+- [x] Exec Request/Result PDU (원격 앱 실행)
+- [x] System Parameters PDU (양방향)
+- [x] Window Activate/Deactivate PDU
+- [x] System Menu / System Command PDU
+- [x] Notification Icon Event PDU
+- [x] Get AppId Request/Response PDU
+- [x] Language Bar Info PDU
+- [x] Window Cloak PDU
+- [x] Snap Arrange PDU
+- [x] Z-Order Sync PDU
+- [x] Window Information Orders (Alternate Secondary):
+  - [x] New/Existing Window Order
+  - [x] Delete Window Order
+  - [x] Notification Icon Order
+- [x] EGFX 연동: `MapSurfaceToWindow` / `MapSurfaceToScaledWindow`
 
 ### 8.8 H.264/AVC Codec
 

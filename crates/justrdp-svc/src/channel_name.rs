@@ -94,6 +94,8 @@ pub const RDPSND: ChannelName = ChannelName::new(b"rdpsnd");
 pub const RDPDR: ChannelName = ChannelName::new(b"rdpdr");
 /// Dynamic Virtual Channel transport.
 pub const DRDYNVC: ChannelName = ChannelName::new(b"drdynvc");
+/// Remote Programs (RAIL) channel.
+pub const RAIL: ChannelName = ChannelName::new(b"rail");
 
 #[cfg(test)]
 mod tests {
