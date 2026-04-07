@@ -18,6 +18,7 @@ members = [
     "crates/justrdp-audio",
     "crates/justrdp-displaycontrol",
     "crates/justrdp-rdpeai",
+    "crates/justrdp-egfx",
     "tests/integration",
 ]
 resolver = "3"
@@ -52,3 +53,4 @@ justrdp-rdpsnd = { path = "crates/justrdp-rdpsnd", version = "0.1.0" }
 justrdp-audio = { path = "crates/justrdp-audio", version = "0.1.0" }
 justrdp-displaycontrol = { path = "crates/justrdp-displaycontrol", version = "0.1.0" }
 justrdp-rdpeai = { path = "crates/justrdp-rdpeai", version = "0.1.0" }
+justrdp-egfx = { path = "crates/justrdp-egfx", version = "0.1.0" }

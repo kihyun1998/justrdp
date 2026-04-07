@@ -229,6 +229,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-egfx"
+version = "0.1.0"
+dependencies = [
+ "justrdp-bulk",
+ "justrdp-core",
+ "justrdp-dvc",
+]
+
+[[package]]
 name = "justrdp-graphics"
 version = "0.1.0"
 dependencies = [

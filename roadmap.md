@@ -1119,22 +1119,22 @@ pub trait GfxHandler: Send {
 
 **구현 항목:**
 
-- [ ] Capability negotiation (v8.0 ~ v10.7)
-- [ ] `WireToSurface1` PDU -- 코덱 기반 비트맵 전송
-- [ ] `WireToSurface2` PDU -- 컨텍스트 기반 비트맵 전송
-- [ ] `DeleteEncodingContext` PDU
-- [ ] `SolidFill` PDU
-- [ ] `SurfaceToSurface` PDU
-- [ ] `SurfaceToCache` / `CacheToSurface` / `EvictCacheEntry` PDU
-- [ ] `CacheImportOffer` / `CacheImportReply` PDU
-- [ ] `CreateSurface` / `DeleteSurface` PDU
-- [ ] `ResetGraphics` PDU
-- [ ] `MapSurfaceToOutput` / `MapSurfaceToScaledOutput` PDU
-- [ ] `MapSurfaceToWindow` / `MapSurfaceToScaledWindow` PDU (RAIL)
-- [ ] `StartFrame` / `EndFrame` PDU
-- [ ] `FrameAcknowledge` PDU
+- [x] Capability negotiation (v8.0 ~ v10.7)
+- [x] `WireToSurface1` PDU -- 코덱 기반 비트맵 전송
+- [x] `WireToSurface2` PDU -- 컨텍스트 기반 비트맵 전송
+- [x] `DeleteEncodingContext` PDU
+- [x] `SolidFill` PDU
+- [x] `SurfaceToSurface` PDU
+- [x] `SurfaceToCache` / `CacheToSurface` / `EvictCacheEntry` PDU
+- [x] `CacheImportOffer` / `CacheImportReply` PDU
+- [x] `CreateSurface` / `DeleteSurface` PDU
+- [x] `ResetGraphics` PDU
+- [x] `MapSurfaceToOutput` / `MapSurfaceToScaledOutput` PDU
+- [x] `MapSurfaceToWindow` / `MapSurfaceToScaledWindow` PDU (RAIL)
+- [x] `StartFrame` / `EndFrame` PDU
+- [x] `FrameAcknowledge` PDU
 - [ ] 코덱 디스패치 (Uncompressed, ClearCodec, Planar, RFX, H.264, Alpha)
-- [ ] ZGFX 압축/해제 통합
+- [x] ZGFX 압축/해제 통합
 - [ ] DVC 압축 지원 (DYNVC_DATA_FIRST_COMPRESSED, DYNVC_DATA_COMPRESSED) -- ZGFX-Lite 8KB 윈도우
 - [ ] Progressive RFX (단계적 품질 향상, MS-RDPEGFX)
 
