@@ -1059,8 +1059,8 @@ pub trait RdpdrBackend: Send {
 
 **구현 항목:**
 
-- [ ] Capabilities PDU 수신 (최대 모니터 수, 최대 해상도)
-- [ ] Monitor Layout PDU 전송:
+- [x] Capabilities PDU 수신 (최대 모니터 수, 최대 해상도)
+- [x] Monitor Layout PDU 전송:
   ```rust
   pub struct MonitorLayoutEntry {
       pub flags: MonitorFlags,   // PRIMARY
@@ -1075,8 +1075,8 @@ pub trait RdpdrBackend: Send {
       pub device_scale_factor: u32,
   }
   ```
-- [ ] 동적 리사이즈
-- [ ] 멀티모니터 레이아웃 변경
+- [x] 동적 리사이즈
+- [x] 멀티모니터 레이아웃 변경
 
 ### 8.5 `justrdp-rdpeai` -- Audio Input (MS-RDPEAI)
 

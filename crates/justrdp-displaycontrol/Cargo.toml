@@ -1,0 +1,20 @@
+[package]
+name = "justrdp-displaycontrol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Display Control Virtual Channel (MS-RDPEDISP) for JustRDP"
+keywords = ["rdp", "display-control", "rdpedisp"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc", "justrdp-dvc/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-dvc/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-dvc.workspace = true

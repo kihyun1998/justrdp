@@ -213,6 +213,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-displaycontrol"
+version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+ "justrdp-dvc",
+]
+
+[[package]]
 name = "justrdp-dvc"
 version = "0.1.0"
 dependencies = [
