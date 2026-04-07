@@ -224,6 +224,7 @@ dependencies = [
 name = "justrdp-dvc"
 version = "0.1.0"
 dependencies = [
+ "justrdp-bulk",
  "justrdp-core",
  "justrdp-svc",
 ]

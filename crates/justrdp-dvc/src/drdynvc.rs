@@ -11,6 +11,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use justrdp_bulk::zgfx::ZgfxDecompressor;
 use justrdp_core::{AsAny, ReadCursor};
 use justrdp_svc::{
     ChannelName, CompressionCondition, SvcMessage, SvcProcessor, SvcResult, DRDYNVC,
@@ -22,6 +23,9 @@ use crate::{DvcError, DvcProcessor, DvcResult};
 
 /// Maximum DVC version we support.
 const MAX_SUPPORTED_VERSION: u16 = CAPS_VERSION_3;
+
+/// Maximum number of simultaneously open DVC channels.
+const MAX_ACTIVE_CHANNELS: usize = 256;
 
 /// HRESULT for failed channel creation (no registered processor).
 /// MS-RDPEDYC 2.2.2.2: CreationStatus is HRESULT; E_FAIL (0x80004005) signals
@@ -40,6 +44,8 @@ pub struct DrdynvcClient {
     active_channels: BTreeMap<u32, String>,
     /// Per-channel reassembly state.
     reassemblers: BTreeMap<u32, DvcReassembler>,
+    /// Per-channel ZGFX Lite decompressors for compressed DVC data (v3).
+    decompressors: BTreeMap<u32, ZgfxDecompressor>,
     /// Negotiated version (0 = not yet negotiated).
     negotiated_version: u16,
 }
@@ -51,6 +57,7 @@ impl DrdynvcClient {
             processors: BTreeMap::new(),
             active_channels: BTreeMap::new(),
             reassemblers: BTreeMap::new(),
+            decompressors: BTreeMap::new(),
             negotiated_version: 0,
         }
     }
@@ -83,6 +90,16 @@ impl DrdynvcClient {
                 priority: _,
             } => {
                 if let Some(proc) = self.processors.get_mut(&channel_name) {
+                    // Reject if too many channels are already open.
+                    if !self.active_channels.contains_key(&channel_id)
+                        && self.active_channels.len() >= MAX_ACTIVE_CHANNELS
+                    {
+                        return Ok(vec![SvcMessage::new(pdu::encode_create_response(
+                            channel_id,
+                            CREATION_STATUS_NO_LISTENER,
+                        ))]);
+                    }
+
                     // Close prior instance if this channel_id was already open.
                     if self.active_channels.contains_key(&channel_id) {
                         proc.close(channel_id);
@@ -93,6 +110,11 @@ impl DrdynvcClient {
                         .insert(channel_id, channel_name.clone());
                     self.reassemblers
                         .insert(channel_id, DvcReassembler::new());
+                    // Create a per-channel decompressor for v3 compressed data.
+                    if self.negotiated_version >= CAPS_VERSION_3 {
+                        self.decompressors
+                            .insert(channel_id, ZgfxDecompressor::new_lite());
+                    }
 
                     let start_messages = proc.start(channel_id)?;
 
@@ -120,36 +142,24 @@ impl DrdynvcClient {
                 channel_id,
                 total_length,
                 data,
-            } => {
-                let reassembler = self
-                    .reassemblers
-                    .get_mut(&channel_id);
-                let reassembler = match reassembler {
-                    Some(r) => r,
-                    None => return Ok(vec![]), // unknown channel
-                };
-
-                if let Some(complete) = reassembler.data_first(total_length, &data)? {
-                    self.dispatch_data(channel_id, &complete)
-                } else {
-                    Ok(vec![])
-                }
-            }
+            } => self.handle_data_fragment(channel_id, Some(total_length), &data),
 
             DvcPdu::Data { channel_id, data } => {
-                let reassembler = self
-                    .reassemblers
-                    .get_mut(&channel_id);
-                let reassembler = match reassembler {
-                    Some(r) => r,
-                    None => return Ok(vec![]), // unknown channel
-                };
+                self.handle_data_fragment(channel_id, None, &data)
+            }
 
-                if let Some(complete) = reassembler.data(&data)? {
-                    self.dispatch_data(channel_id, &complete)
-                } else {
-                    Ok(vec![])
-                }
+            DvcPdu::DataFirstCompressed {
+                channel_id,
+                total_length,
+                data,
+            } => {
+                let decompressed = self.decompress_chunk(channel_id, &data)?;
+                self.handle_data_fragment(channel_id, Some(total_length), &decompressed)
+            }
+
+            DvcPdu::DataCompressed { channel_id, data } => {
+                let decompressed = self.decompress_chunk(channel_id, &data)?;
+                self.handle_data_fragment(channel_id, None, &decompressed)
             }
 
             DvcPdu::Close { channel_id } => {
@@ -159,6 +169,7 @@ impl DrdynvcClient {
                         proc.close(channel_id);
                     }
                     self.reassemblers.remove(&channel_id);
+                    self.decompressors.remove(&channel_id);
                     Ok(vec![SvcMessage::new(pdu::encode_close(channel_id))])
                 } else {
                     // Unknown channel — ignore per MS-RDPEDYC 3.1.5.1.4.
@@ -166,6 +177,40 @@ impl DrdynvcClient {
                 }
             }
         }
+    }
+
+    /// Feed a data fragment into reassembly and dispatch if complete.
+    fn handle_data_fragment(
+        &mut self,
+        channel_id: u32,
+        total_length: Option<u32>,
+        data: &[u8],
+    ) -> DvcResult<Vec<SvcMessage>> {
+        let reassembler = match self.reassemblers.get_mut(&channel_id) {
+            Some(r) => r,
+            None => return Ok(vec![]),
+        };
+        let complete = match total_length {
+            Some(len) => reassembler.data_first(len, data)?,
+            None => reassembler.data(data)?,
+        };
+        if let Some(payload) = complete {
+            self.dispatch_data(channel_id, &payload)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Decompress a compressed DVC data chunk using the per-channel ZGFX Lite decompressor.
+    fn decompress_chunk(&mut self, channel_id: u32, data: &[u8]) -> DvcResult<Vec<u8>> {
+        let decompressor = self.decompressors.get_mut(&channel_id).ok_or_else(|| {
+            DvcError::Protocol(String::from("compressed data on channel without decompressor"))
+        })?;
+        let mut output = Vec::new();
+        decompressor
+            .decompress(data, &mut output)
+            .map_err(|e| DvcError::Protocol(alloc::format!("DVC decompression failed: {e:?}")))?;
+        Ok(output)
     }
 
     /// Dispatch complete data to the registered processor.

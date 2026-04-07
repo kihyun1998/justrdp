@@ -1133,10 +1133,10 @@ pub trait GfxHandler: Send {
 - [x] `MapSurfaceToWindow` / `MapSurfaceToScaledWindow` PDU (RAIL)
 - [x] `StartFrame` / `EndFrame` PDU
 - [x] `FrameAcknowledge` PDU
-- [ ] 코덱 디스패치 (Uncompressed, ClearCodec, Planar, RFX, H.264, Alpha)
+- [x] 코덱 디스패치 (Uncompressed, ClearCodec, Planar, RFX, H.264, Alpha)
 - [x] ZGFX 압축/해제 통합
-- [ ] DVC 압축 지원 (DYNVC_DATA_FIRST_COMPRESSED, DYNVC_DATA_COMPRESSED) -- ZGFX-Lite 8KB 윈도우
-- [ ] Progressive RFX (단계적 품질 향상, MS-RDPEGFX)
+- [x] DVC 압축 지원 (DYNVC_DATA_FIRST_COMPRESSED, DYNVC_DATA_COMPRESSED) -- ZGFX-Lite 8KB 윈도우
+- [x] Progressive RFX (단계적 품질 향상, MS-RDPEGFX)
 
 ### 8.7 `justrdp-rail` -- RemoteApp (MS-RDPERP)
 

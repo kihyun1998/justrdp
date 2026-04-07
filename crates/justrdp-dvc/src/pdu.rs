@@ -164,6 +164,17 @@ pub enum DvcPdu {
         channel_id: u32,
         data: Vec<u8>,
     },
+    /// Compressed first data fragment (v3, RDP8 Lite).
+    DataFirstCompressed {
+        channel_id: u32,
+        total_length: u32,
+        data: Vec<u8>,
+    },
+    /// Compressed data continuation/complete (v3, RDP8 Lite).
+    DataCompressed {
+        channel_id: u32,
+        data: Vec<u8>,
+    },
     /// Close a dynamic virtual channel.
     Close { channel_id: u32 },
 }
@@ -235,10 +246,26 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
             let channel_id = read_channel_id(src, cb_id)?;
             Ok(DvcPdu::Close { channel_id })
         }
-        // Compressed variants (v3) — not yet supported.
-        // Silently decoding compressed payload as plain data would corrupt the stream.
-        CMD_DATA_FIRST_COMPRESSED | CMD_DATA_COMPRESSED => {
-            Err(DecodeError::unsupported("DVC", "compressed DVC data is not yet supported"))
+        CMD_DATA_FIRST_COMPRESSED => {
+            // Same layout as CMD_DATA_FIRST, but data is RDP8 Lite compressed.
+            // MS-RDPEDYC 2.2.3.3: Sp field encodes Len (length-field width).
+            let channel_id = read_channel_id(src, cb_id)?;
+            let total_length = read_length(src, sp)?;
+            let data = src.peek_remaining().to_vec();
+            src.skip(data.len(), "DVC::dataFirstCompressedPayload")?;
+            Ok(DvcPdu::DataFirstCompressed {
+                channel_id,
+                total_length,
+                data,
+            })
+        }
+        CMD_DATA_COMPRESSED => {
+            // Same layout as CMD_DATA, but data is RDP8 Lite compressed.
+            // MS-RDPEDYC 2.2.3.4: Sp field is unused (ignore).
+            let channel_id = read_channel_id(src, cb_id)?;
+            let data = src.peek_remaining().to_vec();
+            src.skip(data.len(), "DVC::dataCompressedPayload")?;
+            Ok(DvcPdu::DataCompressed { channel_id, data })
         }
         // Soft-Sync (MS-RDPEDYC 2.2.4) — not yet supported.
         CMD_SOFT_SYNC_REQUEST | CMD_SOFT_SYNC_RESPONSE => {

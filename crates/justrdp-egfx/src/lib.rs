@@ -27,7 +27,7 @@ pub mod pdu;
 mod client;
 
 #[cfg(feature = "alloc")]
-pub use client::GfxClient;
+pub use client::{GfxClient, GfxHandler};
 
 #[cfg(feature = "alloc")]
 pub use pdu::{

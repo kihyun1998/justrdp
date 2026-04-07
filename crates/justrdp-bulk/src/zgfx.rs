@@ -16,8 +16,14 @@ use crate::mppc::PACKET_COMPRESSED;
 
 // ── Constants (MS-RDPEGFX §2.2.5, §3.1.9.1) ──
 
-/// Compression type in RDP8_BULK_ENCODED_DATA header nibble.
+/// Compression type in RDP8_BULK_ENCODED_DATA header nibble (full ZGFX).
 const PACKET_COMPR_TYPE_RDP8: u8 = 0x04;
+
+/// Compression type for RDP8 Lite (DVC compressed data, MS-RDPEDYC 2.2.3).
+const PACKET_COMPR_TYPE_RDP8_LITE: u8 = 0x06;
+
+/// History ring buffer size for RDP8 Lite: 8,192 bytes.
+const HISTORY_SIZE_LITE: usize = 8_192;
 
 /// Single-segment descriptor byte.
 const SEGMENTED_SINGLE: u8 = 0xE0;
@@ -264,18 +270,41 @@ fn ring_write(history: &mut [u8], index: &mut usize, b: u8) {
 // ── ZgfxDecompressor ──
 
 /// ZGFX (RDP8) decompressor.
+///
+/// Supports both full RDP8 (ZGFX, 2.5 MB history) and RDP8 Lite
+/// (DVC compressed data, 8 KB history).
 pub struct ZgfxDecompressor {
     history: Box<[u8]>,
     history_index: usize,
+    /// Accepted compression type nibble (0x04 for full, 0x06 for lite).
+    compr_type: u8,
 }
 
 impl ZgfxDecompressor {
-    /// Create a new decompressor with zeroed history.
+    /// Create a new full ZGFX decompressor (2.5 MB history, type 0x04).
     pub fn new() -> Self {
         Self {
             history: vec![0u8; HISTORY_SIZE].into_boxed_slice(),
             history_index: 0,
+            compr_type: PACKET_COMPR_TYPE_RDP8,
         }
+    }
+
+    /// Create a new RDP8 Lite decompressor (8 KB history, type 0x06).
+    ///
+    /// Used for DVC compressed data (MS-RDPEDYC 2.2.3.3/2.2.3.4).
+    pub fn new_lite() -> Self {
+        Self {
+            history: vec![0u8; HISTORY_SIZE_LITE].into_boxed_slice(),
+            history_index: 0,
+            compr_type: PACKET_COMPR_TYPE_RDP8_LITE,
+        }
+    }
+
+    /// Reset the decompressor state without reallocating the history buffer.
+    pub fn reset(&mut self) {
+        self.history.fill(0);
+        self.history_index = 0;
     }
 
     /// Decompress an RDP_SEGMENTED_DATA structure.
@@ -373,7 +402,7 @@ impl ZgfxDecompressor {
             return Err(ZgfxError::TruncatedInput);
         }
         let header = segment[0];
-        if header & 0x0F != PACKET_COMPR_TYPE_RDP8 {
+        if header & 0x0F != self.compr_type {
             return Err(ZgfxError::InvalidCompressionType);
         }
         let data = &segment[1..];
@@ -446,7 +475,8 @@ impl ZgfxDecompressor {
 
                         // `>` (not `>=`): distance == HISTORY_SIZE is valid
                         // and references the oldest byte in the ring buffer.
-                        if distance as usize > HISTORY_SIZE {
+                        // distance == history.len() references the oldest byte in the ring.
+        if distance as usize > self.history.len() {
                             return Err(ZgfxError::InvalidToken);
                         }
 
@@ -468,13 +498,14 @@ impl ZgfxDecompressor {
                             if dst.len().saturating_add(count) > output_limit {
                                 return Err(ZgfxError::DecompressedSizeExceeded);
                             }
-                            let mut prev_index = (self.history_index + HISTORY_SIZE
+                            let hist_size = self.history.len();
+                            let mut prev_index = (self.history_index + hist_size
                                 - distance as usize)
-                                % HISTORY_SIZE;
+                                % hist_size;
                             for _ in 0..count {
                                 let c = self.history[prev_index];
                                 prev_index += 1;
-                                if prev_index == HISTORY_SIZE {
+                                if prev_index == hist_size {
                                     prev_index = 0;
                                 }
                                 self.write_history(c);
@@ -858,5 +889,74 @@ mod tests {
         let mut out = Vec::new();
         let result = dec.decompress(input, &mut out);
         assert_eq!(result, Err(ZgfxError::TruncatedBitstream));
+    }
+
+    // ── RDP8 Lite (new_lite) tests ──
+
+    #[test]
+    fn lite_uncompressed_roundtrip() {
+        // SEGMENTED_SINGLE + RDP8 Lite header (type 0x06, not compressed) + data
+        let input: &[u8] = &[
+            0xE0, // SEGMENTED_SINGLE
+            0x06, // PACKET_COMPR_TYPE_RDP8_LITE, not compressed
+            0x48, 0x65, 0x6C, 0x6C, 0x6F, // "Hello"
+        ];
+        let mut dec = ZgfxDecompressor::new_lite();
+        let mut out = Vec::new();
+        dec.decompress(input, &mut out).unwrap();
+        assert_eq!(out, b"Hello");
+    }
+
+    #[test]
+    fn lite_rejects_full_compr_type() {
+        // Lite decompressor should reject type 0x04 (full RDP8)
+        let input: &[u8] = &[
+            0xE0,
+            0x04, // PACKET_COMPR_TYPE_RDP8 — wrong for Lite
+            0x48, 0x65,
+        ];
+        let mut dec = ZgfxDecompressor::new_lite();
+        let mut out = Vec::new();
+        assert_eq!(
+            dec.decompress(input, &mut out),
+            Err(ZgfxError::InvalidCompressionType)
+        );
+    }
+
+    #[test]
+    fn full_rejects_lite_compr_type() {
+        // Full decompressor should reject type 0x06 (Lite)
+        let input: &[u8] = &[
+            0xE0,
+            0x06, // PACKET_COMPR_TYPE_RDP8_LITE — wrong for full
+            0x48, 0x65,
+        ];
+        let mut dec = ZgfxDecompressor::new();
+        let mut out = Vec::new();
+        assert_eq!(
+            dec.decompress(input, &mut out),
+            Err(ZgfxError::InvalidCompressionType)
+        );
+    }
+
+    #[test]
+    fn lite_history_size() {
+        let dec = ZgfxDecompressor::new_lite();
+        assert_eq!(dec.history.len(), 8_192);
+    }
+
+    #[test]
+    fn reset_preserves_mode() {
+        let mut dec = ZgfxDecompressor::new_lite();
+        // Write some data
+        let input: &[u8] = &[0xE0, 0x06, 0x41, 0x42, 0x43];
+        let mut out = Vec::new();
+        dec.decompress(input, &mut out).unwrap();
+        assert_eq!(dec.history_index, 3);
+
+        dec.reset();
+        assert_eq!(dec.history_index, 0);
+        assert_eq!(dec.history.len(), 8_192); // still Lite
+        assert_eq!(dec.compr_type, PACKET_COMPR_TYPE_RDP8_LITE);
     }
 }
