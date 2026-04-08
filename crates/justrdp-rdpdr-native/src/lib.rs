@@ -48,14 +48,14 @@ const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
 const STATUS_DISK_FULL: u32 = 0xC000_007F;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
-// ── Lock operation flags (MS-SMB2 2.2.26) ─────────────────────────────────
+// ── Lock operation flags (MS-RDPEFS, aligned with Windows SL_ constants) ──
 
-/// Shared (read) lock. If not set, exclusive (write) lock.
-const LOCK_SHARED: u32 = 0x0000_0001;
+/// Exclusive lock. If not set, shared (read) lock.
+const SL_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
 /// Return immediately if lock cannot be acquired.
-const LOCK_FAIL_IMMEDIATELY: u32 = 0x0000_0002;
+const SL_FAIL_IMMEDIATELY: u32 = 0x0000_0004;
 /// Release the lock. If not set, acquire it.
-const LOCK_UNLOCK: u32 = 0x0000_0004;
+const SL_LOCK_RELEASE: u32 = 0x0000_0020;
 
 /// Maximum bytes for a single read request (4 MiB).
 const MAX_READ_BYTES: u32 = 4 * 1024 * 1024;
@@ -615,16 +615,16 @@ impl RdpdrBackend for NativeFilesystemBackend {
             .get(&file_id)
             .ok_or(DeviceIoError::no_such_file())?;
 
-        let is_unlock = operation & LOCK_UNLOCK != 0;
-        let is_shared = operation & LOCK_SHARED != 0;
-        let fail_immediately = operation & LOCK_FAIL_IMMEDIATELY != 0;
+        let is_unlock = operation & SL_LOCK_RELEASE != 0;
+        let is_exclusive = operation & SL_EXCLUSIVE_LOCK != 0;
+        let fail_immediately = operation & SL_FAIL_IMMEDIATELY != 0;
 
         for &(offset, length) in locks {
             if is_unlock {
                 unlock_file(&entry.file, offset, length)
                     .map_err(|e| Self::map_io_error(&e))?;
             } else {
-                lock_file(&entry.file, offset, length, is_shared, fail_immediately)
+                lock_file(&entry.file, offset, length, !is_exclusive, fail_immediately)
                     .map_err(|e| Self::map_io_error(&e))?;
             }
         }
@@ -1572,12 +1572,12 @@ mod tests {
         // Exclusive lock, fail immediately
         let locks = vec![(0u64, 100u64)];
         backend
-            .lock_control(1, resp.file_id, LOCK_FAIL_IMMEDIATELY, &locks)
+            .lock_control(1, resp.file_id, SL_EXCLUSIVE_LOCK | SL_FAIL_IMMEDIATELY, &locks)
             .unwrap();
 
         // Unlock
         backend
-            .lock_control(1, resp.file_id, LOCK_UNLOCK, &locks)
+            .lock_control(1, resp.file_id, SL_LOCK_RELEASE, &locks)
             .unwrap();
 
         backend.close(1, resp.file_id).unwrap();
@@ -1593,20 +1593,20 @@ mod tests {
             .create(1, "\\shared.txt", 0x8000_0000, 1, 0, 0)
             .unwrap();
 
-        // Shared lock, fail immediately
+        // Shared lock (no SL_EXCLUSIVE_LOCK), fail immediately
         let locks = vec![(0u64, 50u64)];
         backend
             .lock_control(
                 1,
                 resp.file_id,
-                LOCK_SHARED | LOCK_FAIL_IMMEDIATELY,
+                SL_FAIL_IMMEDIATELY, // no SL_EXCLUSIVE_LOCK = shared
                 &locks,
             )
             .unwrap();
 
         // Unlock
         backend
-            .lock_control(1, resp.file_id, LOCK_UNLOCK, &locks)
+            .lock_control(1, resp.file_id, SL_LOCK_RELEASE, &locks)
             .unwrap();
 
         backend.close(1, resp.file_id).unwrap();
