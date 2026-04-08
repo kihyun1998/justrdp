@@ -1,0 +1,31 @@
+[package]
+name = "justrdp-cliprdr-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native OS clipboard backend for Clipboard Redirection (MS-RDPECLIP)"
+keywords = ["rdp", "clipboard", "native"]
+categories = ["os"]
+
+[features]
+default = []
+x11 = ["dep:x11-clipboard"]
+wayland = ["dep:wl-clipboard-rs"]
+
+[dependencies]
+justrdp-cliprdr = { workspace = true, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-clipboard = { version = "0.9", optional = true }
+wl-clipboard-rs = { version = "0.9", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData"] }

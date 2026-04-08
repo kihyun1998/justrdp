@@ -29,6 +29,8 @@ mod backend;
 mod processor;
 
 #[cfg(feature = "alloc")]
-pub use backend::{CliprdrBackend, FormatDataResponse, FormatListResponse};
+pub use backend::{
+    CliprdrBackend, ClipboardError, ClipboardResult, FormatDataResponse, FormatListResponse,
+};
 #[cfg(feature = "alloc")]
 pub use processor::CliprdrClient;

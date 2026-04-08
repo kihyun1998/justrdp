@@ -20,6 +20,10 @@ members = [
     "crates/justrdp-rdpeai",
     "crates/justrdp-egfx",
     "crates/justrdp-rail",
+    "crates/justrdp-rdpdr-native",
+    "crates/justrdp-cliprdr-native",
+    "crates/justrdp-rdpsnd-native",
+    "crates/justrdp-rdpeai-native",
     "tests/integration",
 ]
 resolver = "3"
@@ -56,3 +60,7 @@ justrdp-displaycontrol = { path = "crates/justrdp-displaycontrol", version = "0.
 justrdp-rdpeai = { path = "crates/justrdp-rdpeai", version = "0.1.0" }
 justrdp-egfx = { path = "crates/justrdp-egfx", version = "0.1.0" }
 justrdp-rail = { path = "crates/justrdp-rail", version = "0.1.0" }
+justrdp-rdpdr-native = { path = "crates/justrdp-rdpdr-native", version = "0.1.0" }
+justrdp-cliprdr-native = { path = "crates/justrdp-cliprdr-native", version = "0.1.0" }
+justrdp-rdpsnd-native = { path = "crates/justrdp-rdpsnd-native", version = "0.1.0" }
+justrdp-rdpeai-native = { path = "crates/justrdp-rdpeai-native", version = "0.1.0" }

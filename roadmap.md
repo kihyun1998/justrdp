@@ -1181,20 +1181,43 @@ pub trait GfxHandler: Send {
 > **requires**: 각 채널 구현 (8.1~8.5)
 > **검증**: 각 플랫폼에서 실서버 연결 후 기능 확인
 
-- [ ] `justrdp-cliprdr-native`:
-  - [ ] Windows: Win32 Clipboard API 통합
-  - [ ] Linux: X11 Selection / Wayland data-device
-  - [ ] macOS: NSPasteboard
-- [ ] `justrdp-rdpdr-native`:
-  - [ ] 네이티브 파일시스템 백엔드
-- [ ] `justrdp-rdpsnd-native`:
-  - [ ] Windows: WASAPI
-  - [ ] Linux: PulseAudio / PipeWire
-  - [ ] macOS: CoreAudio
-- [ ] `justrdp-rdpeai-native`:
-  - [ ] Windows: WASAPI 캡처
-  - [ ] Linux: PulseAudio / PipeWire 캡처
-  - [ ] macOS: CoreAudio 캡처
+- [x] `justrdp-cliprdr-native`:
+  - [x] Windows: Win32 Clipboard API 통합
+  - [x] Linux: X11 Selection / Wayland data-device
+  - [x] macOS: NSPasteboard
+  - **Known limitations:**
+    - 텍스트(CF_UNICODETEXT/CF_TEXT)만 지원; 이미지/파일 전송 미구현
+    - macOS `unsafe` 블록 세분화 필요 (NSPasteboard main-thread 제약)
+    - `ClipboardError::Other(&'static str)` → `String` 변경 시 에러 context 보존 가능
+- [x] `justrdp-rdpdr-native`:
+  - [x] 네이티브 파일시스템 백엔드
+  - **Known limitations:**
+    - `notify_change_directory` / `lock_control` 미구현 (STATUS_NOT_SUPPORTED 반환)
+    - symlink 검증 미구현 (canonicalize + starts_with 가드 필요)
+    - rename TOCTOU race (플랫폼별 atomic rename API 필요)
+    - `set_information(FILE_BASIC_INFORMATION)` 타임스탬프 반영 미구현 (STATUS_SUCCESS로 수용만 함)
+    - volume info `bytes_per_sector`/`sectors_per_cluster` Windows에서 하드코딩 (GetDiskFreeSpaceW 필요)
+- [x] `justrdp-rdpsnd-native`:
+  - [x] Windows: waveOut API
+  - [x] Linux: PulseAudio / PipeWire
+  - [x] macOS: CoreAudio (AudioQueue)
+  - **Known limitations:**
+    - macOS: AudioQueue buffer leak (callback 미등록으로 enqueue된 버퍼 미해제)
+    - macOS: byte_size u32 truncation 미방어 (MAX_DECODE_SAMPLES로 간접 방어)
+    - Windows: waveOut 패닉 시 ManuallyDrop 미적용 (현재 패닉 경로 없음)
+    - Windows: WasapiOutput 이름이 실제 API(waveOut)와 불일치
+    - PulseAudio: per-stream 볼륨 미지원 (시스템 레벨 볼륨만 가능)
+- [x] `justrdp-rdpeai-native`:
+  - [x] Windows: waveIn 캡처
+  - [x] Linux: PulseAudio / PipeWire 캡처
+  - [x] macOS: CoreAudio (AudioQueue Input) 캡처
+  - **Known limitations:**
+    - macOS: Arc raw pointer leak in close() (shared_raw 필드 추가 필요)
+    - macOS: AudioQueueAllocateBuffer/EnqueueBuffer 반환값 미검사
+    - macOS: read() condvar 타임아웃 없음 (무한 블록 가능)
+    - macOS: ring buffer 크기 제한 없음 (read 지연 시 무한 증가)
+    - `packet_byte_size()` overflow 미방어 (checked_mul 필요)
+    - 플랫폼 테스트 부재 (하드웨어 의존)
 
 ---
 

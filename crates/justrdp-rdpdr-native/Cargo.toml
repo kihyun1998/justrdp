@@ -1,0 +1,25 @@
+[package]
+name = "justrdp-rdpdr-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native filesystem backend for Device Redirection (MS-RDPEFS)"
+keywords = ["rdp", "rdpdr", "filesystem"]
+categories = ["os"]
+
+[dependencies]
+justrdp-rdpdr = { workspace = true, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
