@@ -56,6 +56,13 @@ const LOCK_UNLOCK: u32 = 0x0000_0004;
 /// Maximum bytes for a single read request (4 MiB).
 const MAX_READ_BYTES: u32 = 4 * 1024 * 1024;
 
+// FILE_ACTION constants (MS-FSCC 2.4.42)
+#[allow(dead_code)]
+const FILE_ACTION_ADDED: u32 = 0x0000_0001;
+#[allow(dead_code)]
+const FILE_ACTION_REMOVED: u32 = 0x0000_0002;
+const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
+
 // ── NativeFilesystemBackend ────────────────────────────────────────────────
 
 /// A native filesystem backend that shares a local directory as an RDP
@@ -568,12 +575,26 @@ impl RdpdrBackend for NativeFilesystemBackend {
     fn notify_change_directory(
         &mut self,
         _device_id: u32,
-        _file_id: FileHandle,
+        file_id: FileHandle,
         _watch_tree: bool,
         _completion_filter: u32,
     ) -> DeviceIoResult<Vec<u8>> {
-        // Not implemented — deferred to future work.
-        Err(DeviceIoError::not_supported())
+        let entry = self
+            .handles
+            .get(&file_id)
+            .ok_or(DeviceIoError::no_such_file())?;
+
+        if !entry.is_dir {
+            return Err(DeviceIoError::new(STATUS_NOT_A_DIRECTORY));
+        }
+
+        // Block until a filesystem change is detected in the directory.
+        let changed_name = wait_for_directory_change(&entry.path)
+            .map_err(|_| DeviceIoError::unsuccessful())?;
+
+        // Encode a single FILE_NOTIFY_INFORMATION entry.
+        // FILE_ACTION_MODIFIED (0x03) is a safe default for all change types.
+        Ok(encode_notify_info(&changed_name, FILE_ACTION_MODIFIED))
     }
 
     fn lock_control(
@@ -607,6 +628,229 @@ impl RdpdrBackend for NativeFilesystemBackend {
 }
 
 // ── Platform-specific helpers ─────────────────────────────────────────────
+
+// ── FILE_NOTIFY_INFORMATION encoding ──────────────────────────────────────
+
+/// Encode a single FILE_NOTIFY_INFORMATION entry (MS-FSCC 2.4.42).
+///
+/// Layout:
+/// - NextEntryOffset: u32 LE (0 = last entry)
+/// - Action: u32 LE
+/// - FileNameLength: u32 LE (bytes)
+/// - FileName: UTF-16LE
+fn encode_notify_info(filename: &str, action: u32) -> Vec<u8> {
+    let name_utf16 = path::encode_utf16le(filename);
+    let name_len = name_utf16.len() as u32;
+
+    let mut buf = Vec::with_capacity(12 + name_utf16.len());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset = 0 (single entry)
+    buf.extend_from_slice(&action.to_le_bytes()); // Action
+    buf.extend_from_slice(&name_len.to_le_bytes()); // FileNameLength
+    buf.extend_from_slice(&name_utf16); // FileName (UTF-16LE)
+
+    buf
+}
+
+// ── Directory change notification ─────────────────────────────────────────
+
+/// Block until a change is detected in the given directory.
+/// Returns the name of the first changed file/entry, or "." if unknown.
+#[cfg(target_os = "macos")]
+fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
+    use std::os::unix::io::AsRawFd;
+
+    let dir_file = fs::File::open(dir)?;
+    let fd = dir_file.as_raw_fd();
+
+    // SAFETY: Creating a kqueue file descriptor. Returns -1 on failure.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Watch for NOTE_WRITE (files added/removed/renamed) on the directory fd.
+    let changelist = libc::kevent {
+        ident: fd as usize,
+        filter: libc::EVFILT_VNODE,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+        fflags: libc::NOTE_WRITE | libc::NOTE_ATTRIB | libc::NOTE_RENAME,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+
+    let mut eventlist: libc::kevent = unsafe { std::mem::zeroed() };
+
+    // Set a timeout of 30 seconds to prevent indefinite blocking.
+    let timeout = libc::timespec {
+        tv_sec: 30,
+        tv_nsec: 0,
+    };
+
+    // SAFETY: kq is a valid kqueue fd, changelist and eventlist are valid pointers.
+    let nev = unsafe {
+        libc::kevent(
+            kq,
+            &changelist,
+            1,
+            &mut eventlist,
+            1,
+            &timeout,
+        )
+    };
+
+    // SAFETY: Closing the kqueue fd.
+    unsafe {
+        libc::close(kq);
+    }
+
+    if nev < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if nev == 0 {
+        // Timeout — return a generic change to unblock the caller.
+        return Ok(".".to_string());
+    }
+
+    // kqueue doesn't tell us WHICH file changed, just that the directory was modified.
+    // Return "." as a generic indicator.
+    Ok(".".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+
+    // SAFETY: Creating an inotify instance.
+    let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if inotify_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mask = libc::IN_CREATE
+        | libc::IN_DELETE
+        | libc::IN_MODIFY
+        | libc::IN_MOVED_FROM
+        | libc::IN_MOVED_TO
+        | libc::IN_ATTRIB;
+
+    // SAFETY: Adding a watch on a valid inotify fd with a valid C path.
+    let wd = unsafe { libc::inotify_add_watch(inotify_fd, c_path.as_ptr(), mask as u32) };
+    if wd < 0 {
+        unsafe { libc::close(inotify_fd); }
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Set a read timeout using poll.
+    let mut pollfd = libc::pollfd {
+        fd: inotify_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    // SAFETY: Polling a valid fd with a 30-second timeout.
+    let ret = unsafe { libc::poll(&mut pollfd, 1, 30_000) };
+
+    if ret <= 0 {
+        unsafe {
+            libc::inotify_rm_watch(inotify_fd, wd);
+            libc::close(inotify_fd);
+        }
+        if ret == 0 {
+            return Ok(".".to_string()); // Timeout
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Read the event to get the filename.
+    let mut buf = [0u8; 4096];
+    // SAFETY: Reading from a valid inotify fd into a valid buffer.
+    let n = unsafe {
+        libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+    };
+
+    unsafe {
+        libc::inotify_rm_watch(inotify_fd, wd);
+        libc::close(inotify_fd);
+    }
+
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Parse the first inotify_event to extract the filename.
+    if n as usize >= std::mem::size_of::<libc::inotify_event>() {
+        // SAFETY: We have at least inotify_event bytes. Reading the len field.
+        let event = unsafe { &*(buf.as_ptr() as *const libc::inotify_event) };
+        if event.len > 0 {
+            let name_start = std::mem::size_of::<libc::inotify_event>();
+            let name_end = name_start + event.len as usize;
+            if name_end <= n as usize {
+                let name_bytes = &buf[name_start..name_end];
+                // Trim trailing nulls
+                let name = std::str::from_utf8(
+                    &name_bytes[..name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len())]
+                )
+                .unwrap_or(".");
+                return Ok(name.to_string());
+            }
+        }
+    }
+
+    Ok(".".to_string())
+}
+
+#[cfg(windows)]
+fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    // SAFETY: Calling FindFirstChangeNotificationW with a valid wide string path.
+    let handle = unsafe {
+        windows_sys::Win32::Storage::FileSystem::FindFirstChangeNotificationW(
+            wide.as_ptr(),
+            0, // don't watch subtree
+            windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE_FILE_NAME
+                | windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE_DIR_NAME
+                | windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE_SIZE
+                | windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE_LAST_WRITE,
+        )
+    };
+
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Wait for the notification (30-second timeout).
+    // SAFETY: handle is valid.
+    let wait_result = unsafe {
+        windows_sys::Win32::System::Threading::WaitForSingleObject(handle, 30_000)
+    };
+
+    // SAFETY: Closing the notification handle.
+    unsafe {
+        windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification(handle);
+    }
+
+    match wait_result {
+        0 => Ok(".".to_string()), // WAIT_OBJECT_0 — change detected
+        0x102 => Ok(".".to_string()), // WAIT_TIMEOUT
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn wait_for_directory_change(_dir: &std::path::Path) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "directory change notification not supported on this platform",
+    ))
+}
 
 // ── Atomic rename (no-replace) ────────────────────────────────────────────
 

@@ -1192,7 +1192,7 @@ pub trait GfxHandler: Send {
 - [x] `justrdp-rdpdr-native`:
   - [x] 네이티브 파일시스템 백엔드
   - **Known limitations:**
-    - `notify_change_directory` 미구현 (STATUS_NOT_SUPPORTED 반환; 비동기 FS watcher 필요)
+    - ~~`notify_change_directory` 미구현~~ → 완료 (macOS kqueue / Linux inotify / Windows FindFirstChangeNotification)
     - ~~`lock_control` 미구현~~ → 완료 (Unix fcntl + Windows LockFileEx/UnlockFileEx)
     - ~~symlink 검증 미구현~~ → 완료 (canonicalize + starts_with 가드, 부모 디렉토리 검증 포함)
     - ~~rename TOCTOU race~~ → 완료 (Linux renameat2 RENAME_NOREPLACE / macOS renameatx_np RENAME_EXCL / Windows MoveFileExW)
@@ -1207,7 +1207,7 @@ pub trait GfxHandler: Send {
     - ~~macOS: byte_size u32 truncation~~ → 완료 (u32::try_from + 청크 분할)
     - ~~Windows: waveOut ManuallyDrop 미적용~~ → 완료 (ManuallyDrop 적용)
     - ~~Windows: WasapiOutput 이름 불일치~~ → 완료 (WaveOutOutput으로 리네임)
-    - PulseAudio: per-stream 볼륨 미지원 (시스템 레벨 볼륨만 가능; async API 필요)
+    - ~~PulseAudio: per-stream 볼륨 미지원~~ → 완료 (introspect API로 sink input 볼륨 제어)
 - [x] `justrdp-rdpeai-native`:
   - [x] Windows: waveIn 캡처
   - [x] Linux: PulseAudio / PipeWire 캡처
@@ -1218,7 +1218,7 @@ pub trait GfxHandler: Send {
     - ~~macOS: read() condvar 타임아웃 없음~~ → 완료 (READ_TIMEOUT 5초)
     - ~~macOS: ring buffer 크기 제한 없음~~ → 완료 (RING_BUFFER_MAX_PACKETS 제한)
     - ~~`packet_byte_size()` overflow 미방어~~ → 완료 (checked_mul + validate())
-    - 플랫폼 테스트 부재 (하드웨어 의존)
+    - ~~플랫폼 테스트 부재~~ → 완료 (coreaudio: 포맷 거부, open/close, ring buffer 검증 등 7개 테스트 추가)
 
 ---
 

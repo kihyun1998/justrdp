@@ -61,7 +61,7 @@ unsafe extern "C" fn output_callback(
 ) {
     // SAFETY: `user_data` is a `&BufferPool` pointer created in `open()` and
     // remains valid for the lifetime of the audio queue.
-    let pool = &*(user_data as *const BufferPool);
+    let pool = unsafe { &*(user_data as *const BufferPool) };
 
     if let Ok(mut available) = pool.available.lock() {
         available.push_back(buffer);
@@ -80,8 +80,8 @@ pub struct CoreAudioOutput {
     queue: AudioQueueRef,
     /// Buffer pool shared with the output callback. Boxed for stable address.
     pool: Box<BufferPool>,
-    sample_rate: u32,
-    channels: u16,
+    _sample_rate: u32,
+    _channels: u16,
 }
 
 // SAFETY: `AudioQueueRef` is a pointer to an OS-managed opaque type.
@@ -185,8 +185,8 @@ impl NativeAudioOutput for CoreAudioOutput {
         Ok(Self {
             queue,
             pool,
-            sample_rate,
-            channels,
+            _sample_rate: sample_rate,
+            _channels: channels,
         })
     }
 

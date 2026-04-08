@@ -25,7 +25,7 @@ libpulse-binding = { version = "2.28", optional = true }
 libpulse-simple-binding = { version = "2.28", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-coreaudio-sys = { version = "0.2", optional = true, default-features = false, features = ["audio_unit", "core_audio"] }
+coreaudio-sys = { version = "0.2", optional = true, default-features = false, features = ["audio_unit", "audio_toolbox", "core_audio"] }
 
 [features]
 default = []

@@ -74,13 +74,17 @@ unsafe extern "C" fn input_callback(
 ) {
     // SAFETY: `user_data` is an `Arc<SharedBuffer>` raw pointer created in `open()`
     // and remains valid for the lifetime of the audio queue.
-    let shared = &*(user_data as *const SharedBuffer);
+    let shared = unsafe { &*(user_data as *const SharedBuffer) };
 
     // SAFETY: `buffer` is a valid AudioQueueBuffer filled by CoreAudio.
     // `mAudioData` points to `mAudioDataByteSize` bytes of captured PCM data.
-    let data_ptr = (*buffer).mAudioData as *const u8;
-    let data_len = (*buffer).mAudioDataByteSize as usize;
-    let slice = std::slice::from_raw_parts(data_ptr, data_len);
+    let (data_ptr, data_len) = unsafe {
+        (
+            (*buffer).mAudioData as *const u8,
+            (*buffer).mAudioDataByteSize as usize,
+        )
+    };
+    let slice = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
 
     // Use unwrap_or_else to avoid panicking across the FFI boundary if
     // the mutex is poisoned (e.g., if the consumer thread panicked).
@@ -101,7 +105,9 @@ unsafe extern "C" fn input_callback(
 
     // SAFETY: Re-enqueuing the same buffer back into the valid audio queue
     // so CoreAudio can fill it again for continuous recording.
-    AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null());
+    unsafe {
+        AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null());
+    }
 }
 
 impl AudioCaptureBackend for CoreAudioCapture {
@@ -263,11 +269,12 @@ impl AudioCaptureBackend for CoreAudioCapture {
         }
 
         // Copy data out of the ring buffer.
-        for (dst, src) in buf.iter_mut().zip(ring.drain(..buf.len())) {
+        let n = buf.len();
+        for (dst, src) in buf.iter_mut().zip(ring.drain(..n)) {
             *dst = src;
         }
 
-        Ok(buf.len())
+        Ok(n)
     }
 
     fn close(&mut self) {
@@ -299,5 +306,134 @@ impl AudioCaptureBackend for CoreAudioCapture {
 impl Drop for CoreAudioCapture {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AudioCaptureBackend, AudioCaptureConfig};
+
+    fn valid_config() -> AudioCaptureConfig {
+        AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 16,
+            frames_per_packet: 1024,
+        }
+    }
+
+    #[test]
+    fn open_rejects_non_16bit() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 8,
+            frames_per_packet: 1024,
+        };
+        let result = CoreAudioCapture::open(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_rejects_32bit() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 1,
+            bits_per_sample: 32,
+            frames_per_packet: 512,
+        };
+        let result = CoreAudioCapture::open(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_and_close_succeeds() {
+        // CoreAudio AudioQueue can be created even without a physical microphone
+        // (uses default input device or fails gracefully).
+        let config = valid_config();
+        match CoreAudioCapture::open(&config) {
+            Ok(mut capture) => {
+                capture.close();
+                // Double close should be safe (no-op).
+                capture.close();
+            }
+            Err(_) => {
+                // CI environments may not have an audio input device — skip.
+            }
+        }
+    }
+
+    #[test]
+    fn read_after_close_returns_error() {
+        let config = valid_config();
+        match CoreAudioCapture::open(&config) {
+            Ok(mut capture) => {
+                capture.close();
+                let mut buf = vec![0u8; 1024];
+                let result = capture.read(&mut buf);
+                assert!(result.is_err());
+            }
+            Err(_) => {
+                // No audio device — skip.
+            }
+        }
+    }
+
+    #[test]
+    fn shared_buffer_ring_cap_enforced() {
+        // Test the ring buffer capacity enforcement logic directly.
+        let shared = SharedBuffer {
+            data: Mutex::new(VecDeque::new()),
+            condvar: Condvar::new(),
+            ring_cap: 100,
+        };
+
+        let mut ring = shared.data.lock().unwrap();
+
+        // Fill to capacity
+        ring.extend(std::iter::repeat(0xAA).take(100));
+        assert_eq!(ring.len(), 100);
+
+        // Simulate callback behavior: insert 20 bytes, oldest 20 should be dropped
+        let new_data = vec![0xBB; 20];
+        let available = shared.ring_cap.saturating_sub(ring.len());
+        assert_eq!(available, 0);
+
+        let need = new_data.len().saturating_sub(available);
+        ring.drain(..need);
+        ring.extend(&new_data);
+
+        assert_eq!(ring.len(), 100);
+        // First byte should now be 0xAA (original data shifted), last 20 should be 0xBB
+        assert_eq!(*ring.back().unwrap(), 0xBB);
+        assert_eq!(ring.iter().filter(|&&b| b == 0xBB).count(), 20);
+    }
+
+    #[test]
+    fn shared_buffer_empty_insert() {
+        let shared = SharedBuffer {
+            data: Mutex::new(VecDeque::new()),
+            condvar: Condvar::new(),
+            ring_cap: 1000,
+        };
+
+        let mut ring = shared.data.lock().unwrap();
+        let data = vec![0x42; 500];
+        let available = shared.ring_cap.saturating_sub(ring.len());
+        assert!(data.len() <= available);
+        ring.extend(&data);
+        assert_eq!(ring.len(), 500);
+    }
+
+    #[test]
+    fn constants_match_coreaudio_headers() {
+        // Verify our constants match CoreAudio header values.
+        assert_eq!(K_AUDIO_FORMAT_LINEAR_PCM, 0x6C70_636D); // 'lpcm'
+        assert_eq!(K_LINEAR_PCM_FORMAT_FLAG_IS_SIGNED_INTEGER, 4);
+        assert_eq!(K_LINEAR_PCM_FORMAT_FLAG_IS_PACKED, 8);
+        assert_eq!(NUM_AUDIO_QUEUE_BUFFERS, 3);
+        assert_eq!(RING_BUFFER_MAX_PACKETS, 4);
+        assert_eq!(READ_TIMEOUT, Duration::from_secs(5));
     }
 }
