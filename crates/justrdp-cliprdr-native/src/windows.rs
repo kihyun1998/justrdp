@@ -9,7 +9,7 @@ use clipboard_win::{get_clipboard, set_clipboard};
 use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, LongFormatName};
 use justrdp_cliprdr::{ClipboardError, ClipboardResult, FormatDataResponse, FormatListResponse};
 
-use crate::common::{self, is_image_format, is_text_format, rdp_bytes_to_utf8, utf8_to_rdp};
+use crate::common::{self, is_image_format, is_text_format, looks_like_dib, rdp_bytes_to_utf8, utf8_to_rdp};
 
 /// Windows clipboard backend.
 ///
@@ -57,13 +57,9 @@ impl WindowsClipboard {
             return;
         }
 
-        // Try image first (DIB data has a BITMAPINFOHEADER starting with biSize >= 40)
-        if data.len() >= 40 {
-            let bi_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            if bi_size >= 40 {
-                let _ = set_clipboard(Bitmap, data);
-                return;
-            }
+        if looks_like_dib(data) {
+            let _ = set_clipboard(Bitmap, data);
+            return;
         }
 
         // Fall back to text

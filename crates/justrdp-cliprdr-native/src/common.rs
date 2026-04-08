@@ -10,8 +10,8 @@ pub const CF_TEXT: u32 = 0x0001;
 pub const CF_DIB: u32 = 0x0008;
 pub const CF_UNICODETEXT: u32 = 0x000D;
 
-/// Maximum clipboard data size to decode (4 MiB).
-const MAX_CLIPBOARD_DECODE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum clipboard data size (4 MiB). Applied to both read and decode paths.
+pub(crate) const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Convert RDP clipboard data to a UTF-8 string.
 ///
@@ -20,7 +20,7 @@ const MAX_CLIPBOARD_DECODE_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// Returns `None` if data exceeds 4 MiB or is invalid.
 pub fn rdp_to_utf8(data: &[u8], format_id: u32) -> Option<String> {
-    if data.len() > MAX_CLIPBOARD_DECODE_BYTES {
+    if data.len() > MAX_CLIPBOARD_BYTES {
         return None;
     }
 
@@ -107,10 +107,53 @@ pub fn is_supported_format(format_id: u32) -> bool {
 /// Minimum size of a BITMAPINFOHEADER (MS-WMF 2.2.2.3).
 const BITMAPINFOHEADER_SIZE: usize = 40;
 
+/// Valid biBitCount values for a BITMAPINFOHEADER.
+const VALID_BIT_COUNTS: &[u16] = &[0, 1, 4, 8, 16, 24, 32];
+
+/// Check if `data` looks like a valid CF_DIB payload.
+///
+/// Validates: minimum size, biSize fits in data, biBitCount is a valid value.
+/// This avoids false positives from text data being misidentified as DIB.
+pub fn looks_like_dib(data: &[u8]) -> bool {
+    if data.len() < BITMAPINFOHEADER_SIZE {
+        return false;
+    }
+    let bi_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if (bi_size as usize) < BITMAPINFOHEADER_SIZE || (bi_size as usize) > data.len() {
+        return false;
+    }
+    // Validate biBitCount (offset 14-15 in BITMAPINFOHEADER)
+    let bit_count = u16::from_le_bytes([data[14], data[15]]);
+    VALID_BIT_COUNTS.contains(&bit_count)
+}
+
+/// Compute the color table size in bytes for a DIB header.
+///
+/// For biBitCount <= 8, the color table has `biClrUsed` entries (or
+/// `1 << biBitCount` if biClrUsed is 0). Each entry is 4 bytes (RGBQUAD).
+fn color_table_size(dib: &[u8]) -> u32 {
+    if dib.len() < BITMAPINFOHEADER_SIZE {
+        return 0;
+    }
+    let bit_count = u16::from_le_bytes([dib[14], dib[15]]);
+    if bit_count > 8 {
+        return 0; // No color table for 16/24/32-bit
+    }
+    let clr_used = u32::from_le_bytes([dib[32], dib[33], dib[34], dib[35]]);
+    let entries = if clr_used > 0 {
+        clr_used
+    } else if bit_count > 0 {
+        1u32 << bit_count
+    } else {
+        0
+    };
+    entries * 4 // Each RGBQUAD is 4 bytes
+}
+
 /// Convert RDP CF_DIB data to BMP file data.
 ///
-/// CF_DIB = BITMAPINFOHEADER + pixel data.
-/// BMP = BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER + pixel data.
+/// CF_DIB = BITMAPINFOHEADER [+ color table] + pixel data.
+/// BMP = BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER [+ color table] + pixel data.
 pub fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     if dib.len() < BITMAPINFOHEADER_SIZE {
         return None;
@@ -121,8 +164,9 @@ pub fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
+    let ct_size = color_table_size(dib);
     let file_size = (14 + dib.len()) as u32;
-    let data_offset = 14 + bi_size;
+    let data_offset = 14 + bi_size + ct_size;
 
     let mut bmp = Vec::with_capacity(14 + dib.len());
     // BITMAPFILEHEADER (14 bytes)
@@ -130,7 +174,7 @@ pub fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     bmp.extend_from_slice(&file_size.to_le_bytes());
     bmp.extend_from_slice(&[0, 0, 0, 0]); // reserved
     bmp.extend_from_slice(&data_offset.to_le_bytes());
-    // DIB data (BITMAPINFOHEADER + pixels)
+    // DIB data (BITMAPINFOHEADER + [color table +] pixels)
     bmp.extend_from_slice(dib);
 
     Some(bmp)
@@ -316,5 +360,84 @@ mod tests {
     #[test]
     fn bmp_to_dib_too_short() {
         assert!(bmp_to_dib(&[0x42, 0x4D]).is_none()); // Just signature, no data
+    }
+
+    #[test]
+    fn dib_to_bmp_palettized_8bit() {
+        // 8-bit palettized DIB with 256 color table entries.
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&2i32.to_le_bytes()); // biWidth
+        dib.extend_from_slice(&1i32.to_le_bytes()); // biHeight
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&8u16.to_le_bytes()); // biBitCount = 8
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression (BI_RGB)
+        dib.extend_from_slice(&4u32.to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&256u32.to_le_bytes()); // biClrUsed = 256
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        // Color table: 256 * 4 = 1024 bytes
+        dib.extend(std::iter::repeat(0u8).take(1024));
+        // Pixel data: 2 pixels + 2 padding = 4 bytes
+        dib.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+
+        let bmp = dib_to_bmp(&dib).unwrap();
+        // bfOffBits = 14 (file header) + 40 (info header) + 1024 (color table) = 1078
+        let bf_off_bits = u32::from_le_bytes(bmp[10..14].try_into().unwrap());
+        assert_eq!(bf_off_bits, 1078);
+
+        // Roundtrip
+        let recovered = bmp_to_dib(&bmp).unwrap();
+        assert_eq!(recovered, dib);
+    }
+
+    #[test]
+    fn looks_like_dib_valid_24bit() {
+        let mut dib = vec![0u8; 44]; // 40 header + 4 pixels
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        dib[14..16].copy_from_slice(&24u16.to_le_bytes()); // biBitCount
+        assert!(looks_like_dib(&dib));
+    }
+
+    #[test]
+    fn looks_like_dib_rejects_text() {
+        // "Hello" in UTF-16LE — bi_size = u32 of [0x48, 0x00, 0x65, 0x00] = 6619208
+        let data = b"H\x00e\x00l\x00l\x00o\x00 \x00w\x00o\x00r\x00l\x00d\x00!\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        // bi_size = 6619208 which is > data.len(), so biSize check fails
+        assert!(!looks_like_dib(data));
+    }
+
+    #[test]
+    fn looks_like_dib_rejects_invalid_bitcount() {
+        let mut dib = vec![0u8; 44];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        dib[14..16].copy_from_slice(&13u16.to_le_bytes()); // biBitCount = 13 (invalid)
+        assert!(!looks_like_dib(&dib));
+    }
+
+    #[test]
+    fn looks_like_dib_too_short() {
+        assert!(!looks_like_dib(&[0u8; 39]));
+    }
+
+    #[test]
+    fn accept_supported_format_list_with_dib() {
+        let formats = vec![LongFormatName {
+            format_id: CF_DIB,
+            format_name: String::new(),
+        }];
+        let result = accept_supported_format_list(&formats).unwrap();
+        assert_eq!(result, FormatListResponse::Ok);
+    }
+
+    #[test]
+    fn accept_supported_format_list_rejects_unsupported() {
+        let formats = vec![LongFormatName {
+            format_id: 0x9999,
+            format_name: String::new(),
+        }];
+        let result = accept_supported_format_list(&formats).unwrap();
+        assert_eq!(result, FormatListResponse::Fail);
     }
 }

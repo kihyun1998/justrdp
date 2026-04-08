@@ -7,7 +7,7 @@ use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, Long
 use justrdp_cliprdr::{ClipboardError, ClipboardResult, FormatDataResponse, FormatListResponse};
 use x11_clipboard::Clipboard as X11Clip;
 
-use crate::common::{self, bmp_to_dib, dib_to_bmp, rdp_bytes_to_utf8, utf8_to_rdp};
+use crate::common::{self, bmp_to_dib, dib_to_bmp, looks_like_dib, rdp_bytes_to_utf8, utf8_to_rdp};
 
 /// X11 clipboard timeout for selection reads.
 const X11_CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -60,16 +60,8 @@ impl X11Clipboard {
         }
 
         if common::is_image_format(format_id) {
-            // Read image/bmp from X11 clipboard via custom atom.
-            let bmp_atom = self
-                .clip
-                .getter
-                .connection
-                .intern_atom(false, b"image/bmp")
-                .map_err(|_| ClipboardError::Failed)?
-                .reply()
-                .map_err(|_| ClipboardError::Failed)?
-                .atom;
+            let bmp_atom = intern_bmp_atom(&self.clip.getter.connection)
+                .ok_or(ClipboardError::Failed)?;
 
             let atoms = &self.clip.getter.atoms;
             let bmp_bytes = self
@@ -90,25 +82,12 @@ impl X11Clipboard {
             return;
         }
 
-        // Try image first
-        if data.len() >= 40 {
-            let bi_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            if bi_size >= 40 {
-                if let Some(bmp) = dib_to_bmp(data) {
-                    let bmp_atom = self
-                        .clip
-                        .setter
-                        .connection
-                        .intern_atom(false, b"image/bmp")
-                        .ok()
-                        .and_then(|cookie| cookie.reply().ok())
-                        .map(|reply| reply.atom);
-
-                    if let Some(atom) = bmp_atom {
-                        let atoms = &self.clip.setter.atoms;
-                        let _ = self.clip.store(atoms.clipboard, atom, &bmp);
-                        return;
-                    }
+        if looks_like_dib(data) {
+            if let Some(bmp) = dib_to_bmp(data) {
+                if let Some(atom) = intern_bmp_atom(&self.clip.setter.connection) {
+                    let atoms = &self.clip.setter.atoms;
+                    let _ = self.clip.store(atoms.clipboard, atom, &bmp);
+                    return;
                 }
             }
         }
@@ -132,4 +111,19 @@ impl X11Clipboard {
     pub fn on_lock(&mut self, _lock_id: u32) {}
 
     pub fn on_unlock(&mut self, _lock_id: u32) {}
+}
+
+/// Intern the `image/bmp` MIME atom, returning `None` on failure.
+fn intern_bmp_atom(conn: &x11_clipboard::xcb::Connection) -> Option<x11_clipboard::xcb::x::Atom> {
+    use x11_clipboard::xcb::Xid;
+    let cookie = conn.send_request(&x11_clipboard::xcb::x::InternAtom {
+        only_if_exists: false,
+        name: b"image/bmp",
+    });
+    let reply = conn.wait_for_reply(cookie).ok()?;
+    let atom = reply.atom();
+    if atom.is_none() {
+        return None;
+    }
+    Some(atom)
 }

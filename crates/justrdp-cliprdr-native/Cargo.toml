@@ -27,5 +27,5 @@ wl-clipboard-rs = { version = "0.9", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
-objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSBitmapImageRep"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData", "NSDictionary"] }

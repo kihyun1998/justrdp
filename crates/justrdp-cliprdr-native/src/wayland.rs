@@ -8,10 +8,9 @@ use std::io::Read;
 use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, LongFormatName};
 use justrdp_cliprdr::{ClipboardError, ClipboardResult, FormatDataResponse, FormatListResponse};
 
-use crate::common::{self, bmp_to_dib, dib_to_bmp, rdp_bytes_to_utf8, utf8_to_rdp};
+use crate::common::{self, bmp_to_dib, dib_to_bmp, looks_like_dib, rdp_bytes_to_utf8, utf8_to_rdp};
 
-/// Maximum clipboard data to read from the compositor pipe (4 MiB).
-const MAX_CLIPBOARD_READ_BYTES: u64 = 4 * 1024 * 1024;
+use crate::common::MAX_CLIPBOARD_BYTES;
 
 /// Wayland clipboard backend.
 ///
@@ -47,7 +46,7 @@ impl WaylandClipboard {
                     .map_err(|_| ClipboardError::Failed)?;
 
             let mut text = String::new();
-            pipe.take(MAX_CLIPBOARD_READ_BYTES)
+            pipe.take(MAX_CLIPBOARD_BYTES as u64)
                 .read_to_string(&mut text)
                 .map_err(|_| ClipboardError::Failed)?;
 
@@ -66,7 +65,7 @@ impl WaylandClipboard {
             .map_err(|_| ClipboardError::Failed)?;
 
             let mut bmp_bytes = Vec::new();
-            pipe.take(MAX_CLIPBOARD_READ_BYTES)
+            pipe.take(MAX_CLIPBOARD_BYTES as u64)
                 .read_to_end(&mut bmp_bytes)
                 .map_err(|_| ClipboardError::Failed)?;
 
@@ -85,18 +84,14 @@ impl WaylandClipboard {
 
         use wl_clipboard_rs::copy::{MimeType, Options, Source};
 
-        // Try image first
-        if data.len() >= 40 {
-            let bi_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            if bi_size >= 40 {
-                if let Some(bmp) = dib_to_bmp(data) {
-                    let opts = Options::new();
-                    let _ = opts.copy(
-                        Source::Bytes(bmp.into()),
-                        MimeType::Specific("image/bmp"),
-                    );
-                    return;
-                }
+        if looks_like_dib(data) {
+            if let Some(bmp) = dib_to_bmp(data) {
+                let opts = Options::new();
+                let _ = opts.copy(
+                    Source::Bytes(bmp.into()),
+                    MimeType::Specific("image/bmp"),
+                );
+                return;
             }
         }
 
