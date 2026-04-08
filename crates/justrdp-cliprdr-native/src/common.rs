@@ -131,13 +131,13 @@ pub fn looks_like_dib(data: &[u8]) -> bool {
 ///
 /// For biBitCount <= 8, the color table has `biClrUsed` entries (or
 /// `1 << biBitCount` if biClrUsed is 0). Each entry is 4 bytes (RGBQUAD).
-fn color_table_size(dib: &[u8]) -> u32 {
+fn color_table_size(dib: &[u8]) -> Option<u32> {
     if dib.len() < BITMAPINFOHEADER_SIZE {
-        return 0;
+        return Some(0);
     }
     let bit_count = u16::from_le_bytes([dib[14], dib[15]]);
     if bit_count > 8 {
-        return 0; // No color table for 16/24/32-bit
+        return Some(0); // No color table for 16/24/32-bit
     }
     let clr_used = u32::from_le_bytes([dib[32], dib[33], dib[34], dib[35]]);
     let entries = if clr_used > 0 {
@@ -147,7 +147,7 @@ fn color_table_size(dib: &[u8]) -> u32 {
     } else {
         0
     };
-    entries * 4 // Each RGBQUAD is 4 bytes
+    entries.checked_mul(4) // Each RGBQUAD is 4 bytes
 }
 
 /// Convert RDP CF_DIB data to BMP file data.
@@ -164,7 +164,7 @@ pub fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    let ct_size = color_table_size(dib);
+    let ct_size = color_table_size(dib)?;
     let file_size = u32::try_from(dib.len()).ok()?.checked_add(14)?;
     let data_offset = 14u32.checked_add(bi_size)?.checked_add(ct_size)?;
 
@@ -390,6 +390,42 @@ mod tests {
         // Roundtrip
         let recovered = bmp_to_dib(&bmp).unwrap();
         assert_eq!(recovered, dib);
+    }
+
+    #[test]
+    fn dib_to_bmp_palettized_4bit_implicit() {
+        // 4-bit palettized DIB with biClrUsed=0 (implicit 16-entry color table).
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&4i32.to_le_bytes()); // biWidth
+        dib.extend_from_slice(&1i32.to_le_bytes()); // biHeight
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&4u16.to_le_bytes()); // biBitCount = 4
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression
+        dib.extend_from_slice(&4u32.to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed = 0 (implicit)
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        // Color table: 16 entries * 4 = 64 bytes
+        dib.extend(std::iter::repeat(0u8).take(64));
+        // Pixel data: 4 pixels (2 bytes) + 2 padding = 4 bytes
+        dib.extend_from_slice(&[0x12, 0x34, 0x00, 0x00]);
+
+        let bmp = dib_to_bmp(&dib).unwrap();
+        // bfOffBits = 14 + 40 + 64 = 118
+        let bf_off_bits = u32::from_le_bytes(bmp[10..14].try_into().unwrap());
+        assert_eq!(bf_off_bits, 118);
+    }
+
+    #[test]
+    fn color_table_overflow_rejected() {
+        // biClrUsed = 0x40000001 would overflow entries*4. Should return None.
+        let mut dib = vec![0u8; 44];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        dib[14..16].copy_from_slice(&8u16.to_le_bytes()); // biBitCount = 8
+        dib[32..36].copy_from_slice(&0x4000_0001u32.to_le_bytes()); // biClrUsed overflow
+        assert!(dib_to_bmp(&dib).is_none());
     }
 
     #[test]

@@ -8,9 +8,10 @@ use std::io::Read;
 use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, LongFormatName};
 use justrdp_cliprdr::{ClipboardError, ClipboardResult, FormatDataResponse, FormatListResponse};
 
-use crate::common::{self, bmp_to_dib, dib_to_bmp, looks_like_dib, rdp_bytes_to_utf8, utf8_to_rdp};
-
-use crate::common::MAX_CLIPBOARD_BYTES;
+use crate::common::{
+    self, bmp_to_dib, dib_to_bmp, looks_like_dib, rdp_bytes_to_utf8, utf8_to_rdp,
+    MAX_CLIPBOARD_BYTES,
+};
 
 /// Wayland clipboard backend.
 ///

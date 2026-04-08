@@ -3,6 +3,7 @@
 //! Provides text (CF_TEXT, CF_UNICODETEXT) and image (CF_DIB) clipboard
 //! integration via NSPasteboard.
 
+// Required: brings AnyThread trait into scope so NSBitmapImageRep::alloc() resolves.
 use objc2::AnyThread;
 use objc2_app_kit::NSPasteboard;
 use objc2_foundation::NSString;
@@ -108,8 +109,12 @@ fn write_pasteboard_text(text: &str) -> bool {
 /// Copy `NSData` bytes into a `Vec<u8>`. Returns `None` if data exceeds
 /// the clipboard size limit to prevent unbounded allocation.
 fn nsdata_to_vec(data: &objc2_foundation::NSData) -> Option<Vec<u8>> {
+    nsdata_to_vec_with_limit(data, MAX_CLIPBOARD_BYTES)
+}
+
+fn nsdata_to_vec_with_limit(data: &objc2_foundation::NSData, max_bytes: usize) -> Option<Vec<u8>> {
     let len = data.length();
-    if len > MAX_CLIPBOARD_BYTES {
+    if len > max_bytes {
         return None;
     }
     let mut bytes = vec![0u8; len];
@@ -161,7 +166,8 @@ fn tiff_data_to_dib(tiff_data: &objc2_foundation::NSData) -> Option<Vec<u8>> {
         rep.representationUsingType_properties(NSBitmapImageFileType::BMP, &properties)
     }?;
 
-    let bytes = nsdata_to_vec(&bmp_data)?;
+    // Use the TIFF limit for the BMP output since image data expands during conversion.
+    let bytes = nsdata_to_vec_with_limit(&bmp_data, MAX_TIFF_BYTES)?;
     bmp_to_dib(&bytes)
 }
 
