@@ -3,6 +3,7 @@
 //! Uses the Win32 `waveOut*` API family from `winmm.dll` for PCM audio playback.
 //! This is simpler than full WASAPI COM and works well for RDP audio output.
 
+use std::mem::ManuallyDrop;
 use std::ptr;
 
 use windows_sys::Win32::Media::Audio::{
@@ -16,7 +17,7 @@ use crate::error::{NativeAudioError, NativeAudioResult};
 use crate::output::NativeAudioOutput;
 
 /// Windows waveOut audio output device.
-pub struct WasapiOutput {
+pub struct WaveOutOutput {
     handle: HWAVEOUT,
     _sample_rate: u32,
     _channels: u16,
@@ -25,9 +26,9 @@ pub struct WasapiOutput {
 // SAFETY: HWAVEOUT is a raw handle to a waveOut device. The Win32 waveOut API
 // is thread-safe for the operations we use (write, set volume, close), and we
 // ensure exclusive access through `&mut self` on all methods.
-unsafe impl Send for WasapiOutput {}
+unsafe impl Send for WaveOutOutput {}
 
-impl NativeAudioOutput for WasapiOutput {
+impl NativeAudioOutput for WaveOutOutput {
     fn open(sample_rate: u32, channels: u16, bits_per_sample: u16) -> NativeAudioResult<Self> {
         let block_align = channels
             .checked_mul(bits_per_sample / 8)
@@ -81,7 +82,11 @@ impl NativeAudioOutput for WasapiOutput {
         }
 
         // Convert i16 samples to little-endian bytes.
-        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        // Use ManuallyDrop to prevent the Vec from being dropped while waveOut
+        // is still reading from it during asynchronous playback.
+        let bytes = ManuallyDrop::new(
+            samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>()
+        );
 
         let mut header = WAVEHDR {
             lpData: bytes.as_ptr() as *mut u8,
@@ -98,9 +103,11 @@ impl NativeAudioOutput for WasapiOutput {
 
         // SAFETY: header points to valid data that outlives the playback; we busy-wait
         // for completion before returning, ensuring the buffer is not freed prematurely.
+        // ManuallyDrop ensures `bytes` is not dropped even if we panic during playback.
         unsafe {
             let res = waveOutPrepareHeader(self.handle, &mut header, header_size);
             if res != MMSYSERR_NOERROR {
+                ManuallyDrop::into_inner(bytes);
                 return Err(NativeAudioError::WriteError(format!(
                     "waveOutPrepareHeader failed with error code {res}"
                 )));
@@ -110,6 +117,7 @@ impl NativeAudioOutput for WasapiOutput {
             if res != MMSYSERR_NOERROR {
                 // SAFETY: header was prepared, so we must unprepare it before returning.
                 waveOutUnprepareHeader(self.handle, &mut header, header_size);
+                ManuallyDrop::into_inner(bytes);
                 return Err(NativeAudioError::WriteError(format!(
                     "waveOutWrite failed with error code {res}"
                 )));
@@ -129,8 +137,9 @@ impl NativeAudioOutput for WasapiOutput {
                 }
             }
 
-            // SAFETY: playback is complete (WHDR_DONE set), safe to unprepare.
+            // SAFETY: playback is complete (WHDR_DONE set), safe to unprepare and free.
             waveOutUnprepareHeader(self.handle, &mut header, header_size);
+            ManuallyDrop::into_inner(bytes);
         }
 
         Ok(())
@@ -160,7 +169,7 @@ impl NativeAudioOutput for WasapiOutput {
     }
 }
 
-impl Drop for WasapiOutput {
+impl Drop for WaveOutOutput {
     fn drop(&mut self) {
         self.close();
     }

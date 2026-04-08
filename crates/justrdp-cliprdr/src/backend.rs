@@ -14,8 +14,8 @@ pub type ClipboardResult<T> = Result<T, ClipboardError>;
 pub enum ClipboardError {
     /// The requested operation failed.
     Failed,
-    /// A custom error message.
-    Other(&'static str),
+    /// A custom error message with context.
+    Other(alloc::string::String),
 }
 
 impl core::fmt::Display for ClipboardError {

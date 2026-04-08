@@ -44,6 +44,15 @@ const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
 const STATUS_DISK_FULL: u32 = 0xC000_007F;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
+// ── Lock operation flags (MS-SMB2 2.2.26) ─────────────────────────────────
+
+/// Shared (read) lock. If not set, exclusive (write) lock.
+const LOCK_SHARED: u32 = 0x0000_0001;
+/// Return immediately if lock cannot be acquired.
+const LOCK_FAIL_IMMEDIATELY: u32 = 0x0000_0002;
+/// Release the lock. If not set, acquire it.
+const LOCK_UNLOCK: u32 = 0x0000_0004;
+
 /// Maximum bytes for a single read request (4 MiB).
 const MAX_READ_BYTES: u32 = 4 * 1024 * 1024;
 
@@ -393,17 +402,20 @@ impl RdpdrBackend for NativeFilesystemBackend {
                 let new_path = rdp_to_local(&self.root_path, &new_name)
                     .ok_or(DeviceIoError::access_denied())?;
 
-                if new_path.exists() && !replace_if_exists {
-                    return Err(DeviceIoError::new(STATUS_OBJECT_NAME_COLLISION));
-                }
-
                 // Create parent directories if needed
                 if let Some(parent) = new_path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
 
-                fs::rename(&entry.path, &new_path)
-                    .map_err(|e| Self::map_io_error(&e))?;
+                if replace_if_exists {
+                    fs::rename(&entry.path, &new_path)
+                        .map_err(|e| Self::map_io_error(&e))?;
+                } else {
+                    // Atomic rename without replacement using platform-specific APIs
+                    // to avoid TOCTOU race between exists() check and rename().
+                    rename_exclusive(&entry.path, &new_path)
+                        .map_err(|e| Self::map_io_error(&e))?;
+                }
 
                 // Update the stored path
                 let entry = self
@@ -416,14 +428,19 @@ impl RdpdrBackend for NativeFilesystemBackend {
             }
 
             FILE_BASIC_INFORMATION => {
-                // Validate the PDU format
-                let _info = parse_basic_info_set(data)
+                let info = parse_basic_info_set(data)
                     .ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
 
-                // Accept without modifying timestamps. Returning STATUS_SUCCESS
-                // (not STATUS_NOT_SUPPORTED) because Windows clients set timestamps
-                // during file copy; returning an error would break file operations.
-                // Platform-specific timestamp APIs can be added in the future.
+                let entry = self
+                    .handles
+                    .get(&file_id)
+                    .ok_or(DeviceIoError::no_such_file())?;
+
+                // Apply timestamps using platform-specific APIs.
+                // Value 0 means "don't change", value -1 means "don't update
+                // on subsequent ops" — both are treated as no-op here.
+                set_file_times(&entry.path, &info);
+
                 Ok(())
             }
 
@@ -562,13 +579,396 @@ impl RdpdrBackend for NativeFilesystemBackend {
     fn lock_control(
         &mut self,
         _device_id: u32,
-        _file_id: FileHandle,
-        _operation: u32,
-        _locks: &[(u64, u64)],
+        file_id: FileHandle,
+        operation: u32,
+        locks: &[(u64, u64)],
     ) -> DeviceIoResult<()> {
-        // Not implemented — deferred to future work.
-        Err(DeviceIoError::not_supported())
+        let entry = self
+            .handles
+            .get(&file_id)
+            .ok_or(DeviceIoError::no_such_file())?;
+
+        let is_unlock = operation & LOCK_UNLOCK != 0;
+        let is_shared = operation & LOCK_SHARED != 0;
+        let fail_immediately = operation & LOCK_FAIL_IMMEDIATELY != 0;
+
+        for &(offset, length) in locks {
+            if is_unlock {
+                unlock_file(&entry.file, offset, length)
+                    .map_err(|e| Self::map_io_error(&e))?;
+            } else {
+                lock_file(&entry.file, offset, length, is_shared, fail_immediately)
+                    .map_err(|e| Self::map_io_error(&e))?;
+            }
+        }
+
+        Ok(())
     }
+}
+
+// ── Platform-specific helpers ─────────────────────────────────────────────
+
+// ── Atomic rename (no-replace) ────────────────────────────────────────────
+
+/// Rename a file/directory atomically, failing if the destination exists.
+///
+/// Uses platform-specific APIs to avoid TOCTOU race between an existence
+/// check and the rename operation.
+#[cfg(target_os = "linux")]
+fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from_c = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let to_c = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+
+    // SAFETY: Calling libc renameat2 with valid C strings and AT_FDCWD.
+    // RENAME_NOREPLACE (1) fails atomically if destination exists.
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from_c = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let to_c = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+
+    // SAFETY: Calling libc renameatx_np with valid C strings and AT_FDCWD.
+    // RENAME_EXCL (0x0004) fails atomically if destination exists.
+    let ret = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    // SAFETY: Calling MoveFileExW with valid null-terminated wide strings.
+    // Flags = 0 means no MOVEFILE_REPLACE_EXISTING — fails if destination exists.
+    let ret = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            0, // no replace
+        )
+    };
+
+    if ret != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    // Fallback: best-effort check + rename. Small TOCTOU window remains.
+    if to.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "destination already exists",
+        ));
+    }
+    fs::rename(from, to)
+}
+
+// ── File timestamp setting ────────────────────────────────────────────────
+
+/// Set file timestamps from a FILE_BASIC_INFORMATION structure.
+///
+/// Timestamps with value 0 or -1 are skipped (meaning "don't change").
+#[cfg(unix)]
+fn set_file_times(path: &std::path::Path, info: &fs_info::BasicInfoSet) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let access_time = filetime_to_timespec(info.last_access_time);
+    let mod_time = filetime_to_timespec(info.last_write_time);
+
+    let times = [access_time, mod_time];
+
+    // SAFETY: Calling utimensat with a valid C string path and valid timespec array.
+    // AT_FDCWD resolves relative paths from the current directory.
+    unsafe {
+        libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
+    }
+}
+
+#[cfg(unix)]
+fn filetime_to_timespec(filetime: i64) -> libc::timespec {
+    // 0 = don't change, -1 = don't update on subsequent ops
+    if filetime <= 0 {
+        return libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        };
+    }
+
+    // FILETIME: 100-nanosecond intervals since 1601-01-01
+    // Unix epoch offset: 116_444_736_000_000_000
+    const FILETIME_UNIX_OFFSET: i64 = 116_444_736_000_000_000;
+
+    let relative = filetime - FILETIME_UNIX_OFFSET;
+    let secs = relative / 10_000_000;
+    let nsecs = (relative % 10_000_000) * 100;
+
+    if secs < 0 {
+        // Before Unix epoch — set to epoch (best effort)
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }
+    } else {
+        libc::timespec {
+            tv_sec: secs as libc::time_t,
+            tv_nsec: nsecs as libc::c_long,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn set_file_times(path: &std::path::Path, info: &fs_info::BasicInfoSet) {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    // Open with FILE_WRITE_ATTRIBUTES to set timestamps.
+    // SAFETY: Calling Windows API with valid null-terminated wide string.
+    let handle = unsafe {
+        windows_sys::Win32::Storage::FileSystem::CreateFileW(
+            wide.as_ptr(),
+            0x0100, // FILE_WRITE_ATTRIBUTES
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+            std::ptr::null(),
+            windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return;
+    }
+
+    let creation = filetime_or_null(info.creation_time);
+    let access = filetime_or_null(info.last_access_time);
+    let write = filetime_or_null(info.last_write_time);
+
+    // SAFETY: handle is valid and FILETIME pointers are valid or null.
+    unsafe {
+        windows_sys::Win32::Storage::FileSystem::SetFileTime(
+            handle,
+            creation.as_ref().map_or(std::ptr::null(), |ft| ft),
+            access.as_ref().map_or(std::ptr::null(), |ft| ft),
+            write.as_ref().map_or(std::ptr::null(), |ft| ft),
+        );
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+    }
+}
+
+#[cfg(windows)]
+fn filetime_or_null(ft: i64) -> Option<windows_sys::Win32::Foundation::FILETIME> {
+    if ft <= 0 {
+        None
+    } else {
+        Some(windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: ft as u32,
+            dwHighDateTime: (ft >> 32) as u32,
+        })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_file_times(_path: &std::path::Path, _info: &fs_info::BasicInfoSet) {
+    // No platform API available — accept silently.
+}
+
+// ── File locking ──────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn lock_file(
+    file: &std::fs::File,
+    offset: u64,
+    length: u64,
+    shared: bool,
+    fail_immediately: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let lock_type = if shared { libc::F_RDLCK } else { libc::F_WRLCK };
+    let cmd = if fail_immediately {
+        libc::F_SETLK
+    } else {
+        libc::F_SETLKW
+    };
+
+    let flock = libc::flock {
+        l_type: lock_type as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: offset as libc::off_t,
+        l_len: length as libc::off_t,
+        l_pid: 0,
+    };
+
+    // SAFETY: file descriptor is valid, flock struct is properly initialized.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), cmd, &flock) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let flock = libc::flock {
+        l_type: libc::F_UNLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: offset as libc::off_t,
+        l_len: length as libc::off_t,
+        l_pid: 0,
+    };
+
+    // SAFETY: file descriptor is valid, flock struct is properly initialized.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &flock) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn lock_file(
+    file: &std::fs::File,
+    offset: u64,
+    length: u64,
+    shared: bool,
+    fail_immediately: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut flags = 0u32;
+    if !shared {
+        flags |= windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK;
+    }
+    if fail_immediately {
+        flags |= windows_sys::Win32::Storage::FileSystem::LOCKFILE_FAIL_IMMEDIATELY;
+    }
+
+    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.Anonymous.Anonymous.Offset = offset as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+
+    // SAFETY: file handle is valid, OVERLAPPED is properly initialized.
+    let ret = unsafe {
+        windows_sys::Win32::Storage::FileSystem::LockFileEx(
+            file.as_raw_handle() as _,
+            flags,
+            0,
+            length as u32,
+            (length >> 32) as u32,
+            &mut overlapped,
+        )
+    };
+
+    if ret != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.Anonymous.Anonymous.Offset = offset as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+
+    // SAFETY: file handle is valid, OVERLAPPED is properly initialized.
+    let ret = unsafe {
+        windows_sys::Win32::Storage::FileSystem::UnlockFileEx(
+            file.as_raw_handle() as _,
+            0,
+            length as u32,
+            (length >> 32) as u32,
+            &mut overlapped,
+        )
+    };
+
+    if ret != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_file(
+    _file: &std::fs::File,
+    _offset: u64,
+    _length: u64,
+    _shared: bool,
+    _fail_immediately: bool,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file locking not supported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unlock_file(_file: &std::fs::File, _offset: u64, _length: u64) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file locking not supported on this platform",
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -836,6 +1236,124 @@ mod tests {
         assert!(!NativeFilesystemBackend::pattern_matches("*.txt", "hello.doc"));
         assert!(NativeFilesystemBackend::pattern_matches("test?", "test1"));
         assert!(!NativeFilesystemBackend::pattern_matches("test?", "test12"));
+    }
+
+    // ── Rename ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn rename_exclusive_fails_if_destination_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("src.txt"), b"data").unwrap();
+        fs::write(dir.path().join("dst.txt"), b"existing").unwrap();
+
+        let mut backend = make_backend(&dir);
+        let resp = backend
+            .create(1, "\\src.txt", 0x4000_0000, 1, 0, 0)
+            .unwrap();
+
+        // Build FILE_RENAME_INFORMATION with replace_if_exists = false
+        let name = "\\dst.txt";
+        let name_utf16: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut data = Vec::new();
+        data.push(0x00); // ReplaceIfExists = false
+        data.extend_from_slice(&[0, 0, 0]); // Reserved
+        data.extend_from_slice(&0u32.to_le_bytes()); // RootDirectory
+        data.extend_from_slice(&(name_utf16.len() as u32).to_le_bytes());
+        data.extend_from_slice(&name_utf16);
+
+        let err = backend
+            .set_information(1, resp.file_id, FILE_RENAME_INFORMATION, &data)
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_OBJECT_NAME_COLLISION);
+
+        backend.close(1, resp.file_id).unwrap();
+    }
+
+    #[test]
+    fn rename_with_replace_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("src.txt"), b"new data").unwrap();
+        fs::write(dir.path().join("dst.txt"), b"old data").unwrap();
+
+        let mut backend = make_backend(&dir);
+        let resp = backend
+            .create(1, "\\src.txt", 0x4000_0000, 1, 0, 0)
+            .unwrap();
+
+        // Build FILE_RENAME_INFORMATION with replace_if_exists = true
+        let name = "\\dst.txt";
+        let name_utf16: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut data = Vec::new();
+        data.push(0x01); // ReplaceIfExists = true
+        data.extend_from_slice(&[0, 0, 0]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&(name_utf16.len() as u32).to_le_bytes());
+        data.extend_from_slice(&name_utf16);
+
+        backend
+            .set_information(1, resp.file_id, FILE_RENAME_INFORMATION, &data)
+            .unwrap();
+
+        backend.close(1, resp.file_id).unwrap();
+
+        // dst.txt should now contain the new data
+        assert!(!dir.path().join("src.txt").exists());
+        assert_eq!(fs::read(dir.path().join("dst.txt")).unwrap(), b"new data");
+    }
+
+    // ── Lock control ──────────────────────────────────────────────────
+
+    #[test]
+    fn lock_and_unlock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lock.txt"), b"lockable").unwrap();
+
+        let mut backend = make_backend(&dir);
+        let resp = backend
+            .create(1, "\\lock.txt", 0x4000_0000, 1, 0, 0)
+            .unwrap();
+
+        // Exclusive lock, fail immediately
+        let locks = vec![(0u64, 100u64)];
+        backend
+            .lock_control(1, resp.file_id, LOCK_FAIL_IMMEDIATELY, &locks)
+            .unwrap();
+
+        // Unlock
+        backend
+            .lock_control(1, resp.file_id, LOCK_UNLOCK, &locks)
+            .unwrap();
+
+        backend.close(1, resp.file_id).unwrap();
+    }
+
+    #[test]
+    fn shared_lock_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("shared.txt"), b"data").unwrap();
+
+        let mut backend = make_backend(&dir);
+        let resp = backend
+            .create(1, "\\shared.txt", 0x8000_0000, 1, 0, 0)
+            .unwrap();
+
+        // Shared lock, fail immediately
+        let locks = vec![(0u64, 50u64)];
+        backend
+            .lock_control(
+                1,
+                resp.file_id,
+                LOCK_SHARED | LOCK_FAIL_IMMEDIATELY,
+                &locks,
+            )
+            .unwrap();
+
+        // Unlock
+        backend
+            .lock_control(1, resp.file_id, LOCK_UNLOCK, &locks)
+            .unwrap();
+
+        backend.close(1, resp.file_id).unwrap();
     }
 
     // ── Unsupported operations ─────────────────────────────────────────

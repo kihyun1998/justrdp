@@ -1188,15 +1188,16 @@ pub trait GfxHandler: Send {
   - **Known limitations:**
     - 텍스트(CF_UNICODETEXT/CF_TEXT)만 지원; 이미지/파일 전송 미구현
     - ~~macOS `unsafe` 블록 세분화 필요~~ → 완료 (objc2 safe API 확인, unsafe 제거)
-    - `ClipboardError::Other(&'static str)` → `String` 변경 시 에러 context 보존 가능
+    - ~~`ClipboardError::Other(&'static str)` → `String` 변경~~ → 완료 (에러 context 보존 가능)
 - [x] `justrdp-rdpdr-native`:
   - [x] 네이티브 파일시스템 백엔드
   - **Known limitations:**
-    - `notify_change_directory` / `lock_control` 미구현 (STATUS_NOT_SUPPORTED 반환)
-    - symlink 검증 미구현 (canonicalize + starts_with 가드 필요)
-    - rename TOCTOU race (플랫폼별 atomic rename API 필요)
-    - `set_information(FILE_BASIC_INFORMATION)` 타임스탬프 반영 미구현 (STATUS_SUCCESS로 수용만 함)
-    - volume info `bytes_per_sector`/`sectors_per_cluster` Windows에서 하드코딩 (GetDiskFreeSpaceW 필요)
+    - `notify_change_directory` 미구현 (STATUS_NOT_SUPPORTED 반환; 비동기 FS watcher 필요)
+    - ~~`lock_control` 미구현~~ → 완료 (Unix fcntl + Windows LockFileEx/UnlockFileEx)
+    - ~~symlink 검증 미구현~~ → 완료 (canonicalize + starts_with 가드, 부모 디렉토리 검증 포함)
+    - ~~rename TOCTOU race~~ → 완료 (Linux renameat2 RENAME_NOREPLACE / macOS renameatx_np RENAME_EXCL / Windows MoveFileExW)
+    - ~~`set_information(FILE_BASIC_INFORMATION)` 타임스탬프 반영 미구현~~ → 완료 (Unix utimensat / Windows SetFileTime)
+    - ~~volume info `bytes_per_sector`/`sectors_per_cluster` 하드코딩~~ → 완료 (Windows GetDiskFreeSpaceW, Unix statvfs)
 - [x] `justrdp-rdpsnd-native`:
   - [x] Windows: waveOut API
   - [x] Linux: PulseAudio / PipeWire
@@ -1204,9 +1205,9 @@ pub trait GfxHandler: Send {
   - **Known limitations:**
     - ~~macOS: AudioQueue buffer leak~~ → 완료 (buffer pool 패턴 + output callback 도입)
     - ~~macOS: byte_size u32 truncation~~ → 완료 (u32::try_from + 청크 분할)
-    - Windows: waveOut 패닉 시 ManuallyDrop 미적용 (현재 패닉 경로 없음)
-    - Windows: WasapiOutput 이름이 실제 API(waveOut)와 불일치
-    - PulseAudio: per-stream 볼륨 미지원 (시스템 레벨 볼륨만 가능)
+    - ~~Windows: waveOut ManuallyDrop 미적용~~ → 완료 (ManuallyDrop 적용)
+    - ~~Windows: WasapiOutput 이름 불일치~~ → 완료 (WaveOutOutput으로 리네임)
+    - PulseAudio: per-stream 볼륨 미지원 (시스템 레벨 볼륨만 가능; async API 필요)
 - [x] `justrdp-rdpeai-native`:
   - [x] Windows: waveIn 캡처
   - [x] Linux: PulseAudio / PipeWire 캡처

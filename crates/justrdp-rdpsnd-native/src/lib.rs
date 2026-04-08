@@ -6,7 +6,7 @@
 //!
 //! # Platform Support
 //!
-//! - **Windows**: WASAPI (always available)
+//! - **Windows**: waveOut API (always available)
 //! - **Linux**: PulseAudio/PipeWire (feature `pulseaudio`)
 //! - **macOS**: CoreAudio (feature `coreaudio`)
 //!
@@ -40,7 +40,7 @@ pub use output::NativeAudioOutput;
 // Platform-specific type aliases for convenient use.
 
 #[cfg(target_os = "windows")]
-pub type PlatformAudioBackend = NativeAudioBackend<wasapi::WasapiOutput>;
+pub type PlatformAudioBackend = NativeAudioBackend<wasapi::WaveOutOutput>;
 
 #[cfg(all(target_os = "linux", feature = "pulseaudio"))]
 pub type PlatformAudioBackend = NativeAudioBackend<pulseaudio::PulseAudioOutput>;

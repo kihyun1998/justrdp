@@ -78,7 +78,7 @@ impl WaylandClipboard {
         &mut self,
         _request: &FileContentsRequestPdu,
     ) -> ClipboardResult<FileContentsResponsePdu> {
-        Err(ClipboardError::Other("file transfer not supported"))
+        Err(ClipboardError::Other("file transfer not supported".into()))
     }
 
     pub fn on_file_contents_response(&mut self, _response: &FileContentsResponsePdu) {}

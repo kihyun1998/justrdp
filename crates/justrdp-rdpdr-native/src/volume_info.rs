@@ -60,12 +60,35 @@ impl DiskSpace {
             return None;
         }
 
+        // Query actual bytes_per_sector and sectors_per_cluster from the filesystem.
+        let mut sectors_per_cluster: u32 = 0;
+        let mut bytes_per_sector: u32 = 0;
+        let mut _number_of_free_clusters: u32 = 0;
+        let mut _total_number_of_clusters: u32 = 0;
+
+        // SAFETY: Calling Windows API with valid null-terminated wide string and valid pointers.
+        let ret2 = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW(
+                wide.as_ptr(),
+                &mut sectors_per_cluster,
+                &mut bytes_per_sector,
+                &mut _number_of_free_clusters,
+                &mut _total_number_of_clusters,
+            )
+        };
+
+        // If GetDiskFreeSpaceW fails, fall back to reasonable defaults.
+        if ret2 == 0 {
+            sectors_per_cluster = 8;
+            bytes_per_sector = 512;
+        }
+
         Some(DiskSpace {
             total_bytes: total_number_of_bytes,
             free_bytes: total_number_of_free_bytes,
             available_bytes: free_bytes_available_to_caller,
-            bytes_per_sector: 512,
-            sectors_per_cluster: 8, // 4096 byte clusters
+            bytes_per_sector,
+            sectors_per_cluster,
         })
     }
 

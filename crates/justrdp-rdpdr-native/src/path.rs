@@ -7,7 +7,11 @@ use std::path::{Component, Path, PathBuf};
 /// replaces backslashes with the OS path separator, and validates that
 /// no `..` components are present (to prevent directory traversal).
 ///
-/// Returns `None` if the path attempts directory traversal.
+/// Additionally, if the resolved path exists, it is canonicalized and
+/// verified to remain within the root directory. This prevents symlink-based
+/// escapes (e.g., a symlink inside root pointing to `/etc`).
+///
+/// Returns `None` if the path attempts directory traversal or escapes root.
 pub fn rdp_to_local(root: &Path, rdp_path: &str) -> Option<PathBuf> {
     // Strip trailing null characters (RDP paths from UTF-16LE may have them)
     let trimmed = rdp_path.trim_end_matches('\0');
@@ -36,7 +40,31 @@ pub fn rdp_to_local(root: &Path, rdp_path: &str) -> Option<PathBuf> {
         }
     }
 
-    Some(root.join(relative))
+    let joined = root.join(relative);
+
+    // Symlink validation: if the path exists, canonicalize it and verify
+    // it remains within root. This prevents symlinks from escaping the
+    // shared directory (e.g., /shared/link -> /etc/passwd).
+    if joined.exists() {
+        let canonical = joined.canonicalize().ok()?;
+        let root_canonical = root.canonicalize().ok()?;
+        if !canonical.starts_with(&root_canonical) {
+            return None;
+        }
+    } else {
+        // For new files, verify the parent directory stays within root.
+        if let Some(parent) = joined.parent() {
+            if parent.exists() {
+                let parent_canonical = parent.canonicalize().ok()?;
+                let root_canonical = root.canonicalize().ok()?;
+                if !parent_canonical.starts_with(&root_canonical) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(joined)
 }
 
 /// Convert a local filename to UTF-16LE bytes (no null terminator).
@@ -113,6 +141,41 @@ mod tests {
         let root = Path::new("/mnt/share");
         let result = rdp_to_local(root, "/dir/file.txt").unwrap();
         assert_eq!(result, root.join("dir/file.txt"));
+    }
+
+    #[test]
+    fn symlink_escape_rejected() {
+        // Create a temp dir structure with a symlink pointing outside root.
+        let root_dir = std::env::temp_dir().join(format!(
+            "justrdp_symlink_test_root_{}", std::process::id()
+        ));
+        let outside_dir = std::env::temp_dir().join(format!(
+            "justrdp_symlink_test_outside_{}", std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root_dir);
+        let _ = std::fs::create_dir_all(&outside_dir);
+        let _ = std::fs::write(outside_dir.join("secret.txt"), b"secret");
+
+        // Create a symlink inside root pointing to outside_dir
+        let link_path = root_dir.join("escape");
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&outside_dir, &link_path);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::os::windows::fs::symlink_dir(&outside_dir, &link_path);
+        }
+
+        // The symlink itself exists inside root, but resolves outside
+        if link_path.exists() {
+            let result = rdp_to_local(&root_dir, r"\escape\secret.txt");
+            assert!(result.is_none(), "symlink escape should be rejected");
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&outside_dir);
     }
 
     #[test]
