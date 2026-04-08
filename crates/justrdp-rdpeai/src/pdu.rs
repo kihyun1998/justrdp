@@ -96,11 +96,13 @@ impl<'de> Decode<'de> for VersionPdu {
             ));
         }
         let version = src.read_u32_le("VersionPdu::Version")?;
-        if !matches!(version, SNDIN_VERSION_1 | SNDIN_VERSION_2) {
+        // Accept any non-zero version. The state machine negotiates via
+        // min(server, client), so unknown future versions are handled there.
+        if version == 0 {
             return Err(DecodeError::unexpected_value(
                 "VersionPdu",
                 "Version",
-                "expected 0x00000001 or 0x00000002",
+                "version must be non-zero",
             ));
         }
         Ok(Self { version })
@@ -483,10 +485,18 @@ mod tests {
     }
 
     #[test]
-    fn version_invalid_rejected() {
-        let buf = [0x01, 0x03, 0x00, 0x00, 0x00]; // version 3
+    fn version_zero_rejected() {
+        let buf = [0x01, 0x00, 0x00, 0x00, 0x00]; // version 0
         let mut src = ReadCursor::new(&buf);
         assert!(VersionPdu::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn version_future_accepted() {
+        let buf = [0x01, 0x03, 0x00, 0x00, 0x00]; // version 3 (future)
+        let mut src = ReadCursor::new(&buf);
+        let decoded = VersionPdu::decode(&mut src).unwrap();
+        assert_eq!(decoded.version, 3);
     }
 
     #[test]

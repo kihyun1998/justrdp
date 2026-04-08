@@ -20,6 +20,8 @@ unsafe impl Send for PulseAudioCapture {}
 
 impl AudioCaptureBackend for PulseAudioCapture {
     fn open(config: &AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
+        config.validate()?;
+
         if config.bits_per_sample != 16 {
             return Err(AudioCaptureError::FormatNotSupported);
         }
@@ -71,5 +73,11 @@ impl AudioCaptureBackend for PulseAudioCapture {
         // Drop the Simple handle to release the PulseAudio connection.
         // Simple implements Drop which calls pa_simple_free().
         self.simple.take();
+    }
+}
+
+impl Drop for PulseAudioCapture {
+    fn drop(&mut self) {
+        self.close();
     }
 }

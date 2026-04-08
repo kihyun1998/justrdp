@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::ptr;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use coreaudio_sys::{
     AudioQueueAllocateBuffer, AudioQueueBufferRef, AudioQueueDispose, AudioQueueEnqueueBuffer,
@@ -14,27 +15,44 @@ use crate::{AudioCaptureBackend, AudioCaptureConfig, AudioCaptureError};
 
 // Audio format constants from CoreAudio headers.
 // `kAudioFormatLinearPCM` = 'lpcm' = 0x6C70636D
+// Reference: CoreAudio/CoreAudioTypes.h — kAudioFormatLinearPCM
 const K_AUDIO_FORMAT_LINEAR_PCM: u32 = 0x6C70_636D;
 
 // Linear PCM format flags.
-const K_LINEAR_PCM_FORMAT_FLAG_IS_SIGNED_INTEGER: u32 = 1 << 2; // kAudioFormatFlagIsSignedInteger
-const K_LINEAR_PCM_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3; // kAudioFormatFlagIsPacked
+// Reference: CoreAudio/CoreAudioTypes.h — kAudioFormatFlagIsSignedInteger, kAudioFormatFlagIsPacked
+const K_LINEAR_PCM_FORMAT_FLAG_IS_SIGNED_INTEGER: u32 = 1 << 2;
+const K_LINEAR_PCM_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
+
+/// Number of AudioQueue buffers for continuous recording.
+const NUM_AUDIO_QUEUE_BUFFERS: usize = 3;
+
+/// Maximum ring buffer size: 4x the packet size. Data beyond this is dropped.
+const RING_BUFFER_MAX_PACKETS: usize = 4;
+
+/// Timeout for `read()` condvar wait.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared ring buffer between the AudioQueue callback and the `read()` caller.
 struct SharedBuffer {
     data: Mutex<VecDeque<u8>>,
     condvar: Condvar,
+    /// Maximum ring buffer capacity in bytes (set once in `open()`).
+    ring_cap: usize,
 }
 
 /// CoreAudio capture using the AudioQueue input API.
 pub struct CoreAudioCapture {
     queue: AudioQueueRef,
     shared: Arc<SharedBuffer>,
+    /// Raw pointer given to CoreAudio as `user_data`; reclaimed in `close()`.
+    shared_raw: *const SharedBuffer,
 }
 
 // SAFETY: `AudioQueueRef` is a pointer to an OS-managed opaque type.
 // CoreAudio audio queues can be used from any thread once created;
 // the AudioQueue API is documented as thread-safe for enqueue operations.
+// `shared_raw` is only dereferenced by the CoreAudio callback thread and
+// reclaimed in `close()` after the queue is disposed.
 unsafe impl Send for CoreAudioCapture {}
 
 /// AudioQueue input callback invoked by CoreAudio when a buffer is filled.
@@ -64,9 +82,22 @@ unsafe extern "C" fn input_callback(
     let data_len = (*buffer).mAudioDataByteSize as usize;
     let slice = std::slice::from_raw_parts(data_ptr, data_len);
 
-    let mut ring = shared.data.lock().unwrap();
-    ring.extend(slice);
-    shared.condvar.notify_one();
+    // Use unwrap_or_else to avoid panicking across the FFI boundary if
+    // the mutex is poisoned (e.g., if the consumer thread panicked).
+    if let Ok(mut ring) = shared.data.lock() {
+        // Enforce ring buffer capacity: drop oldest data if full.
+        let available = shared.ring_cap.saturating_sub(ring.len());
+        if slice.len() <= available {
+            ring.extend(slice);
+        } else {
+            // Drop oldest bytes to make room.
+            let need = slice.len().saturating_sub(available);
+            ring.drain(..need);
+            ring.extend(slice);
+        }
+        shared.condvar.notify_one();
+    }
+    // If lock fails (poisoned), silently drop the audio data rather than panicking.
 
     // SAFETY: Re-enqueuing the same buffer back into the valid audio queue
     // so CoreAudio can fill it again for continuous recording.
@@ -75,11 +106,16 @@ unsafe extern "C" fn input_callback(
 
 impl AudioCaptureBackend for CoreAudioCapture {
     fn open(config: &AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
+        config.validate()?;
+
         if config.bits_per_sample != 16 {
             return Err(AudioCaptureError::FormatNotSupported);
         }
 
-        let bytes_per_frame = (config.channels as u32) * 2;
+        let bytes_per_sample = (config.bits_per_sample / 8) as u32;
+        let bytes_per_frame = (config.channels as u32)
+            .checked_mul(bytes_per_sample)
+            .ok_or(AudioCaptureError::FormatNotSupported)?;
 
         let format = AudioStreamBasicDescription {
             mSampleRate: config.sample_rate as f64,
@@ -90,13 +126,19 @@ impl AudioCaptureBackend for CoreAudioCapture {
             mFramesPerPacket: 1,
             mBytesPerFrame: bytes_per_frame,
             mChannelsPerFrame: config.channels as u32,
-            mBitsPerChannel: 16,
+            mBitsPerChannel: config.bits_per_sample as u32,
             mReserved: 0,
         };
+
+        let packet_size = config.packet_byte_size();
+        let ring_cap = packet_size
+            .checked_mul(RING_BUFFER_MAX_PACKETS)
+            .ok_or(AudioCaptureError::FormatNotSupported)?;
 
         let shared = Arc::new(SharedBuffer {
             data: Mutex::new(VecDeque::new()),
             condvar: Condvar::new(),
+            ring_cap,
         });
 
         let mut queue: AudioQueueRef = ptr::null_mut();
@@ -131,22 +173,41 @@ impl AudioCaptureBackend for CoreAudioCapture {
             )));
         }
 
-        // Allocate and enqueue 3 buffers for continuous recording.
-        let buf_size = config.packet_byte_size() as u32;
+        // Allocate and enqueue buffers for continuous recording.
+        let buf_size = u32::try_from(packet_size)
+            .map_err(|_| AudioCaptureError::FormatNotSupported)?;
 
-        for _ in 0..3 {
+        for _ in 0..NUM_AUDIO_QUEUE_BUFFERS {
             let mut buffer: AudioQueueBufferRef = ptr::null_mut();
 
-            // SAFETY: Allocating a buffer from a valid audio queue. `buf_size` is
-            // the capacity in bytes, and `buffer` receives the allocated pointer.
-            unsafe {
-                AudioQueueAllocateBuffer(queue, buf_size, &mut buffer);
+            // SAFETY: Allocating a buffer from a valid audio queue.
+            let alloc_status = unsafe {
+                AudioQueueAllocateBuffer(queue, buf_size, &mut buffer)
+            };
+
+            if alloc_status != 0 {
+                unsafe {
+                    AudioQueueDispose(queue, 1);
+                    Arc::from_raw(shared_ptr);
+                }
+                return Err(AudioCaptureError::DeviceError(format!(
+                    "AudioQueueAllocateBuffer failed with status {alloc_status}"
+                )));
             }
 
             // SAFETY: Enqueuing a freshly allocated buffer into the valid queue.
-            // CoreAudio will fill it with captured audio data and invoke the callback.
-            unsafe {
-                AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null());
+            let enqueue_status = unsafe {
+                AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null())
+            };
+
+            if enqueue_status != 0 {
+                unsafe {
+                    AudioQueueDispose(queue, 1);
+                    Arc::from_raw(shared_ptr);
+                }
+                return Err(AudioCaptureError::DeviceError(format!(
+                    "AudioQueueEnqueueBuffer failed with status {enqueue_status}"
+                )));
             }
         }
 
@@ -166,20 +227,44 @@ impl AudioCaptureBackend for CoreAudioCapture {
             )));
         }
 
-        Ok(Self { queue, shared })
+        Ok(Self {
+            queue,
+            shared,
+            shared_raw: shared_ptr,
+        })
     }
 
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, AudioCaptureError> {
-        let mut ring = self.shared.data.lock().unwrap();
+        if self.queue.is_null() {
+            return Err(AudioCaptureError::ReadError("device closed".into()));
+        }
 
-        // Block until the ring buffer has enough data to fill `buf`.
+        let mut ring = self
+            .shared
+            .data
+            .lock()
+            .map_err(|_| AudioCaptureError::ReadError("shared buffer poisoned".into()))?;
+
+        // Block until the ring buffer has enough data to fill `buf`, with timeout.
         while ring.len() < buf.len() {
-            ring = self.shared.condvar.wait(ring).unwrap();
+            let (guard, wait_result) = self
+                .shared
+                .condvar
+                .wait_timeout(ring, READ_TIMEOUT)
+                .map_err(|_| AudioCaptureError::ReadError("shared buffer poisoned".into()))?;
+
+            ring = guard;
+
+            if wait_result.timed_out() && ring.len() < buf.len() {
+                return Err(AudioCaptureError::ReadError(
+                    "CoreAudio capture timed out after 5 seconds".into(),
+                ));
+            }
         }
 
         // Copy data out of the ring buffer.
-        for byte in buf.iter_mut() {
-            *byte = ring.pop_front().unwrap();
+        for (dst, src) in buf.iter_mut().zip(ring.drain(..buf.len())) {
+            *dst = src;
         }
 
         Ok(buf.len())
@@ -190,11 +275,23 @@ impl AudioCaptureBackend for CoreAudioCapture {
             // SAFETY: Stopping and disposing a valid audio queue.
             // `AudioQueueStop` with `1` (true) means immediate stop.
             // `AudioQueueDispose` with `1` (true) disposes immediately.
+            // After `AudioQueueDispose` returns, the callback is guaranteed
+            // not to fire again, so it is safe to reclaim `shared_raw`.
             unsafe {
                 AudioQueueStop(self.queue, 1);
                 AudioQueueDispose(self.queue, 1);
             }
             self.queue = ptr::null_mut();
+
+            // SAFETY: Reclaiming the Arc raw pointer that was leaked in `open()`
+            // via `Arc::into_raw`. The callback can no longer access it after
+            // `AudioQueueDispose` has returned.
+            if !self.shared_raw.is_null() {
+                unsafe {
+                    Arc::from_raw(self.shared_raw);
+                }
+                self.shared_raw = ptr::null();
+            }
         }
     }
 }

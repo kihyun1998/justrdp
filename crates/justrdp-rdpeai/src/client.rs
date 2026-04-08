@@ -442,11 +442,24 @@ mod tests {
     }
 
     #[test]
-    fn version_invalid_rejected() {
+    fn version_future_negotiates_down() {
         let mut client = AudioInputClient::new();
         client.start(1).unwrap();
 
+        // Server sends version 3 (future); client supports 2.
+        // Negotiated = min(3, 2) = 2.
         let payload = make_version_payload(3);
+        let msgs = client.process(1, &payload).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(client.negotiated_version, SNDIN_VERSION_2);
+    }
+
+    #[test]
+    fn version_zero_rejected() {
+        let mut client = AudioInputClient::new();
+        client.start(1).unwrap();
+
+        let payload = make_version_payload(0);
         assert!(client.process(1, &payload).is_err());
     }
 

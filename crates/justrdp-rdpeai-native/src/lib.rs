@@ -1,3 +1,7 @@
+// Deny unsafe by default; platform backends with FFI (`wavein`, `coreaudio`)
+// override to `#[allow(unsafe_code)]` at the module level.
+#![deny(unsafe_code)]
+
 //! Native audio capture backends for justrdp-rdpeai (MS-RDPEAI).
 //!
 //! Provides [`AudioCaptureBackend`] trait and platform implementations that
@@ -27,12 +31,15 @@
 //! ```
 
 #[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
 mod wavein;
 
 #[cfg(all(target_os = "linux", feature = "pulseaudio"))]
+#[allow(unsafe_code)]
 mod pulse;
 
 #[cfg(all(target_os = "macos", feature = "coreaudio"))]
+#[allow(unsafe_code)]
 mod coreaudio;
 
 use std::fmt;
@@ -51,13 +58,44 @@ pub struct AudioCaptureConfig {
 }
 
 impl AudioCaptureConfig {
-    /// Byte size of one complete audio packet.
+    /// Validate that the configuration has sane values.
+    ///
+    /// Returns `FormatNotSupported` if any field is zero or `bits_per_sample`
+    /// is not a multiple of 8.
+    pub fn validate(&self) -> Result<(), AudioCaptureError> {
+        if self.sample_rate == 0
+            || self.channels == 0
+            || self.bits_per_sample == 0
+            || self.bits_per_sample % 8 != 0
+            || self.frames_per_packet == 0
+        {
+            return Err(AudioCaptureError::FormatNotSupported);
+        }
+        // Ensure packet_byte_size() won't overflow.
+        self.checked_packet_byte_size()
+            .ok_or(AudioCaptureError::FormatNotSupported)?;
+        Ok(())
+    }
+
+    /// Byte size of one complete audio packet, returning `None` on overflow.
     ///
     /// `frames_per_packet * channels * (bits_per_sample / 8)`
+    pub fn checked_packet_byte_size(&self) -> Option<usize> {
+        let bytes_per_sample = (self.bits_per_sample as usize) / 8;
+        (self.frames_per_packet as usize)
+            .checked_mul(self.channels as usize)?
+            .checked_mul(bytes_per_sample)
+    }
+
+    /// Byte size of one complete audio packet.
+    ///
+    /// # Panics
+    ///
+    /// Panics on overflow. Prefer [`checked_packet_byte_size()`] or call
+    /// [`validate()`] first.
     pub fn packet_byte_size(&self) -> usize {
-        self.frames_per_packet as usize
-            * self.channels as usize
-            * (self.bits_per_sample as usize / 8)
+        self.checked_packet_byte_size()
+            .expect("packet_byte_size overflow — call validate() first")
     }
 }
 
@@ -141,5 +179,111 @@ mod tests {
         };
         // 512 * 1 * 2 = 1024
         assert_eq!(config.packet_byte_size(), 1024);
+    }
+
+    #[test]
+    fn packet_byte_size_mono_8bit() {
+        let config = AudioCaptureConfig {
+            sample_rate: 8000,
+            channels: 1,
+            bits_per_sample: 8,
+            frames_per_packet: 256,
+        };
+        // 256 * 1 * 1 = 256
+        assert_eq!(config.packet_byte_size(), 256);
+    }
+
+    #[test]
+    fn packet_byte_size_zero_frames() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 16,
+            frames_per_packet: 0,
+        };
+        assert_eq!(config.packet_byte_size(), 0);
+    }
+
+    #[test]
+    fn checked_packet_byte_size_max_values() {
+        // With u32 frames * u16 channels * u16 bytes_per_sample, the maximum
+        // product (~2^59) fits in 64-bit usize but overflows 32-bit.
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: u16::MAX,
+            bits_per_sample: 16,
+            frames_per_packet: u32::MAX,
+        };
+        #[cfg(target_pointer_width = "64")]
+        assert!(config.checked_packet_byte_size().is_some());
+        #[cfg(target_pointer_width = "32")]
+        assert!(config.checked_packet_byte_size().is_none());
+    }
+
+    #[test]
+    fn validate_rejects_zero_channels() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 0,
+            bits_per_sample: 16,
+            frames_per_packet: 1024,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_sample_rate() {
+        let config = AudioCaptureConfig {
+            sample_rate: 0,
+            channels: 2,
+            bits_per_sample: 16,
+            frames_per_packet: 1024,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_byte_aligned_bits() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 12,
+            frames_per_packet: 1024,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_bits_per_sample() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 0,
+            frames_per_packet: 1024,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn validate_rejects_overflow_32bit() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: u16::MAX,
+            bits_per_sample: 32,
+            frames_per_packet: u32::MAX,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_config() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 16,
+            frames_per_packet: 1024,
+        };
+        assert!(config.validate().is_ok());
     }
 }

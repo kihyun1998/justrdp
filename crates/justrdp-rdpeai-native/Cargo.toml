@@ -14,7 +14,7 @@ categories = ["multimedia::audio"]
 justrdp-rdpeai = { workspace = true, features = ["std"] }
 justrdp-rdpsnd = { workspace = true, features = ["std"] }
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Media_Audio",
 ] }

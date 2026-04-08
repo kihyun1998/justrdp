@@ -1,6 +1,7 @@
 //! Windows waveIn audio capture backend.
 
 use std::ptr;
+use std::sync::atomic::{self, Ordering};
 
 use windows_sys::Win32::Media::Audio::{
     waveInAddBuffer, waveInClose, waveInOpen, waveInPrepareHeader, waveInReset, waveInStart,
@@ -10,6 +11,11 @@ use windows_sys::Win32::Media::Audio::{
 use windows_sys::Win32::Media::MMSYSERR_NOERROR;
 
 use crate::{AudioCaptureBackend, AudioCaptureConfig, AudioCaptureError};
+
+/// Polling interval for waiting on WHDR_DONE.
+const WAVEIN_POLL_INTERVAL_MS: u64 = 1;
+/// Maximum iterations before timeout (5 seconds = 5000 × 1 ms).
+const WAVEIN_TIMEOUT_ITERS: u32 = 5_000;
 
 /// Windows waveIn audio capture backend.
 ///
@@ -23,9 +29,7 @@ pub struct WaveInCapture {
 
 impl AudioCaptureBackend for WaveInCapture {
     fn open(config: &AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
-        if config.bits_per_sample == 0 || config.bits_per_sample % 8 != 0 {
-            return Err(AudioCaptureError::FormatNotSupported);
-        }
+        config.validate()?;
 
         let block_align = config
             .channels
@@ -105,6 +109,9 @@ impl AudioCaptureBackend for WaveInCapture {
             if !self.started {
                 let res = waveInStart(self.handle);
                 if res != MMSYSERR_NOERROR {
+                    // SAFETY: waveInReset returns all pending buffers to the app
+                    // (marks them WHDR_DONE) so we can safely unprepare.
+                    waveInReset(self.handle);
                     waveInUnprepareHeader(self.handle, &mut header, header_size);
                     return Err(AudioCaptureError::DeviceError(format!(
                         "waveInStart failed: {res}"
@@ -114,23 +121,34 @@ impl AudioCaptureBackend for WaveInCapture {
             }
 
             // Poll for WHDR_DONE with 5-second timeout.
-            // Use addr_of! + read_unaligned for safe field access via raw pointer.
+            // SAFETY: The waveIn driver writes `dwFlags` from outside the Rust
+            // memory model. We use `addr_of!` + `read_unaligned` to avoid
+            // forming a `&` reference to a field under concurrent OS mutation
+            // (Stacked Borrows aliasing rules). An acquire fence ensures the
+            // compiler does not hoist or elide the read.
             let flags_ptr = ptr::addr_of!(header.dwFlags);
             let mut timed_out = false;
             let mut iters = 0u32;
-            while ptr::read_unaligned(flags_ptr) & WHDR_DONE == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            loop {
+                atomic::fence(Ordering::Acquire);
+                if ptr::read_unaligned(flags_ptr) & WHDR_DONE != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(WAVEIN_POLL_INTERVAL_MS));
                 iters += 1;
-                if iters >= 5_000 {
+                if iters >= WAVEIN_TIMEOUT_ITERS {
                     // SAFETY: waveInReset marks all pending buffers as done (MSDN).
+                    // After reset, recording is stopped; waveInStart must be
+                    // called again before the next buffer can be filled.
                     waveInReset(self.handle);
+                    self.started = false;
                     timed_out = true;
                     break;
                 }
             }
 
             let recorded_ptr = ptr::addr_of!(header.dwBytesRecorded);
-            let bytes_recorded = ptr::read_unaligned(recorded_ptr) as usize;
+            let bytes_recorded = (ptr::read_unaligned(recorded_ptr) as usize).min(buf.len());
 
             // SAFETY: unprepare the header to release driver resources.
             waveInUnprepareHeader(self.handle, &mut header, header_size);
