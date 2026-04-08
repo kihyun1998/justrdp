@@ -7,9 +7,10 @@ use std::path::{Component, Path, PathBuf};
 /// replaces backslashes with the OS path separator, and validates that
 /// no `..` components are present (to prevent directory traversal).
 ///
-/// Additionally, if the resolved path exists, it is canonicalized and
-/// verified to remain within the root directory. This prevents symlink-based
-/// escapes (e.g., a symlink inside root pointing to `/etc`).
+/// On Unix, symlink validation is performed atomically using `open()` + fd-based
+/// path resolution to prevent TOCTOU races between existence checks and
+/// canonicalization. On other platforms, a best-effort canonicalize + starts_with
+/// check is used.
 ///
 /// Returns `None` if the path attempts directory traversal or escapes root.
 pub fn rdp_to_local(root: &Path, rdp_path: &str) -> Option<PathBuf> {
@@ -42,29 +43,130 @@ pub fn rdp_to_local(root: &Path, rdp_path: &str) -> Option<PathBuf> {
 
     let joined = root.join(relative);
 
-    // Symlink validation: if the path exists, canonicalize it and verify
-    // it remains within root. This prevents symlinks from escaping the
-    // shared directory (e.g., /shared/link -> /etc/passwd).
-    if joined.exists() {
-        let canonical = joined.canonicalize().ok()?;
+    // Validate the resolved path remains within root.
+    validate_within_root(&joined, root)
+}
+
+/// Validate that `path` resolves within `root`, returning `Some(path)` if valid.
+///
+/// Uses fd-based path resolution on Unix to avoid TOCTOU races between
+/// existence checks and symlink resolution.
+#[cfg(unix)]
+fn validate_within_root(path: &Path, root: &Path) -> Option<PathBuf> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // If root itself cannot be canonicalized (e.g., doesn't exist), fall back
+    // to component-level validation only.
+    let root_canonical = match root.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return Some(path.to_path_buf()),
+    };
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+
+    // Open the path atomically — open() follows all symlinks in a single
+    // syscall, eliminating the TOCTOU window between exists() and canonicalize().
+    // O_RDONLY is used because O_PATH is Linux-specific.
+    // O_NOFOLLOW is NOT set so symlinks ARE followed (we want the resolved target).
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+
+    if fd >= 0 {
+        // Path exists — get its real path from the fd.
+        let real_path = fd_to_path(fd);
+        unsafe {
+            libc::close(fd);
+        }
+
+        let real = real_path?;
+        if !real.starts_with(&root_canonical) {
+            return None;
+        }
+        return Some(path.to_path_buf());
+    }
+
+    // open() failed — path likely doesn't exist.
+    // Validate the parent directory atomically instead.
+    if let Some(parent) = path.parent() {
+        let c_parent = CString::new(parent.as_os_str().as_bytes()).ok()?;
+        let parent_fd = unsafe {
+            libc::open(
+                c_parent.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+
+        if parent_fd >= 0 {
+            let parent_real = fd_to_path(parent_fd);
+            unsafe {
+                libc::close(parent_fd);
+            }
+
+            let real = parent_real?;
+            if !real.starts_with(&root_canonical) {
+                return None;
+            }
+        }
+        // If parent also doesn't exist, we rely on the component validation
+        // above (no .., no absolute paths) as a best-effort guard.
+    }
+
+    Some(path.to_path_buf())
+}
+
+/// Get the canonical filesystem path for an open file descriptor.
+#[cfg(target_os = "macos")]
+fn fd_to_path(fd: std::os::unix::io::RawFd) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: fd is a valid open file descriptor, buf has PATH_MAX capacity.
+    // F_GETPATH writes the null-terminated canonical path into the buffer.
+    let ret = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
+    if ret < 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(PathBuf::from(OsStr::from_bytes(&buf[..len])))
+}
+
+/// Get the canonical filesystem path for an open file descriptor.
+#[cfg(target_os = "linux")]
+fn fd_to_path(fd: std::os::unix::io::RawFd) -> Option<PathBuf> {
+    let proc_path = format!("/proc/self/fd/{fd}");
+    std::fs::read_link(proc_path).ok()
+}
+
+/// Get the canonical filesystem path for an open file descriptor.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn fd_to_path(_fd: std::os::unix::io::RawFd) -> Option<PathBuf> {
+    // No portable way to get a path from an fd on other Unix systems.
+    // Fall back to None, which causes the parent to skip validation
+    // (relying only on component-level checks).
+    None
+}
+
+/// Best-effort validation on non-Unix platforms (Windows uses different APIs).
+#[cfg(not(unix))]
+fn validate_within_root(path: &Path, root: &Path) -> Option<PathBuf> {
+    if path.exists() {
+        let canonical = path.canonicalize().ok()?;
         let root_canonical = root.canonicalize().ok()?;
         if !canonical.starts_with(&root_canonical) {
             return None;
         }
-    } else {
-        // For new files, verify the parent directory stays within root.
-        if let Some(parent) = joined.parent() {
-            if parent.exists() {
-                let parent_canonical = parent.canonicalize().ok()?;
-                let root_canonical = root.canonicalize().ok()?;
-                if !parent_canonical.starts_with(&root_canonical) {
-                    return None;
-                }
+    } else if let Some(parent) = path.parent() {
+        if parent.exists() {
+            let parent_canonical = parent.canonicalize().ok()?;
+            let root_canonical = root.canonicalize().ok()?;
+            if !parent_canonical.starts_with(&root_canonical) {
+                return None;
             }
         }
     }
 
-    Some(joined)
+    Some(path.to_path_buf())
 }
 
 /// Convert a local filename to UTF-16LE bytes (no null terminator).
@@ -147,10 +249,12 @@ mod tests {
     fn symlink_escape_rejected() {
         // Create a temp dir structure with a symlink pointing outside root.
         let root_dir = std::env::temp_dir().join(format!(
-            "justrdp_symlink_test_root_{}", std::process::id()
+            "justrdp_symlink_test_root_{}",
+            std::process::id()
         ));
         let outside_dir = std::env::temp_dir().join(format!(
-            "justrdp_symlink_test_outside_{}", std::process::id()
+            "justrdp_symlink_test_outside_{}",
+            std::process::id()
         ));
         let _ = std::fs::create_dir_all(&root_dir);
         let _ = std::fs::create_dir_all(&outside_dir);
