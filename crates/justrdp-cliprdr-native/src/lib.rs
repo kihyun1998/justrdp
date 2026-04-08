@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Native OS clipboard backend for Clipboard Redirection (MS-RDPECLIP).
 //!
 //! Provides [`NativeClipboard`] which implements [`CliprdrBackend`] using
@@ -31,7 +33,10 @@ mod x11;
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 mod wayland;
 
+// macOS backend uses unsafe for NSData::getBytes_length and
+// NSBitmapImageRep::representationUsingType_properties FFI calls.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 mod macos;
 
 use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, LongFormatName};

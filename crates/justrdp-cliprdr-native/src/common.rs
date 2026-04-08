@@ -160,13 +160,13 @@ pub fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     }
 
     let bi_size = u32::from_le_bytes(dib[0..4].try_into().ok()?);
-    if (bi_size as usize) < BITMAPINFOHEADER_SIZE {
+    if (bi_size as usize) < BITMAPINFOHEADER_SIZE || (bi_size as usize) > dib.len() {
         return None;
     }
 
     let ct_size = color_table_size(dib);
-    let file_size = (14 + dib.len()) as u32;
-    let data_offset = 14 + bi_size + ct_size;
+    let file_size = u32::try_from(dib.len()).ok()?.checked_add(14)?;
+    let data_offset = 14u32.checked_add(bi_size)?.checked_add(ct_size)?;
 
     let mut bmp = Vec::with_capacity(14 + dib.len());
     // BITMAPFILEHEADER (14 bytes)

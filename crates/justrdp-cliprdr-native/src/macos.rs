@@ -142,9 +142,16 @@ fn read_pasteboard_image() -> Option<Vec<u8>> {
     None
 }
 
+/// Maximum TIFF data size to process (32 MiB).
+const MAX_TIFF_BYTES: usize = 32 * 1024 * 1024;
+
 fn tiff_data_to_dib(tiff_data: &objc2_foundation::NSData) -> Option<Vec<u8>> {
     use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
     use objc2_foundation::NSDictionary;
+
+    if tiff_data.length() > MAX_TIFF_BYTES {
+        return None;
+    }
 
     let rep = NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), tiff_data)?;
 
