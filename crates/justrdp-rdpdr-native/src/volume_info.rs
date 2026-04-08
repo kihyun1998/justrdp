@@ -94,7 +94,8 @@ impl DiskSpace {
 
     #[cfg(unix)]
     fn query_impl(path: &Path) -> Option<DiskSpace> {
-        let c_path = std::ffi::CString::new(path.to_str()?).ok()?;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
 
         // SAFETY: `statvfs` is called with a valid null-terminated C string and a valid pointer.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };

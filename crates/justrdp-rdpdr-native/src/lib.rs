@@ -1,3 +1,7 @@
+// Platform-specific modules use unsafe for libc/windows-sys FFI.
+#![deny(unsafe_code)]
+#![allow(unsafe_code)] // FFI functions in this file require unsafe.
+
 //! Native filesystem backend for Device Redirection (MS-RDPEFS).
 //!
 //! Provides [`NativeFilesystemBackend`] which implements [`RdpdrBackend`]
@@ -57,10 +61,6 @@ const LOCK_UNLOCK: u32 = 0x0000_0004;
 const MAX_READ_BYTES: u32 = 4 * 1024 * 1024;
 
 // FILE_ACTION constants (MS-FSCC 2.4.42)
-#[allow(dead_code)]
-const FILE_ACTION_ADDED: u32 = 0x0000_0001;
-#[allow(dead_code)]
-const FILE_ACTION_REMOVED: u32 = 0x0000_0002;
 const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
 
 // ── NativeFilesystemBackend ────────────────────────────────────────────────
@@ -409,9 +409,12 @@ impl RdpdrBackend for NativeFilesystemBackend {
                 let new_path = rdp_to_local(&self.root_path, &new_name)
                     .ok_or(DeviceIoError::access_denied())?;
 
-                // Create parent directories if needed
+                // Only create the immediate parent if missing — do not create
+                // deep directory trees from untrusted server input.
                 if let Some(parent) = new_path.parent() {
-                    let _ = fs::create_dir_all(parent);
+                    if !parent.exists() {
+                        fs::create_dir(parent).map_err(|e| Self::map_io_error(&e))?;
+                    }
                 }
 
                 if replace_if_exists {
@@ -446,7 +449,10 @@ impl RdpdrBackend for NativeFilesystemBackend {
                 // Apply timestamps using platform-specific APIs.
                 // Value 0 means "don't change", value -1 means "don't update
                 // on subsequent ops" — both are treated as no-op here.
-                set_file_times(&entry.path, &info);
+                // Best-effort: timestamp setting failures are not fatal.
+                // Windows clients set timestamps during file copy and some
+                // platforms silently reject certain timestamp values.
+                let _ = set_file_times(&entry.path, &info);
 
                 Ok(())
             }
@@ -783,9 +789,10 @@ fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
     }
 
     // Parse the first inotify_event to extract the filename.
+    // Use read_unaligned because buf is a [u8] array with 1-byte alignment,
+    // but inotify_event has 4-byte aligned fields.
     if n as usize >= std::mem::size_of::<libc::inotify_event>() {
-        // SAFETY: We have at least inotify_event bytes. Reading the len field.
-        let event = unsafe { &*(buf.as_ptr() as *const libc::inotify_event) };
+        let event = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const libc::inotify_event) };
         if event.len > 0 {
             let name_start = std::mem::size_of::<libc::inotify_event>();
             let name_end = name_start + event.len as usize;
@@ -994,16 +1001,21 @@ fn filetime_to_timespec(filetime: i64) -> libc::timespec {
     const FILETIME_UNIX_OFFSET: i64 = 116_444_736_000_000_000;
 
     let relative = filetime - FILETIME_UNIX_OFFSET;
+
+    if relative < 0 {
+        // Before Unix epoch — set to epoch (best effort).
+        // We check `relative` instead of just `secs` to avoid negative tv_nsec
+        // from the modulo operation (POSIX requires tv_nsec >= 0).
+        return libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+    }
+
     let secs = relative / 10_000_000;
     let nsecs = (relative % 10_000_000) * 100;
 
-    if secs < 0 {
-        // Before Unix epoch — set to epoch (best effort)
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        }
-    } else {
+    {
         libc::timespec {
             tv_sec: secs as libc::time_t,
             tv_nsec: nsecs as libc::c_long,

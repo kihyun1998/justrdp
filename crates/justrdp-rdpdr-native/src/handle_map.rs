@@ -64,10 +64,20 @@ impl HandleMap {
             return None;
         }
 
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-
-        // Skip 0 — it is reserved.
+        // Find the next unused ID, skipping 0 (reserved) and any IDs
+        // that are still in use. Wrap-around collision is prevented by
+        // scanning past occupied IDs (safe given MAX_OPEN_HANDLES << u32::MAX).
+        let mut id = self.next_id;
+        loop {
+            if id != 0 && !self.map.contains_key(&id) {
+                break;
+            }
+            id = id.wrapping_add(1);
+            if id == self.next_id {
+                return None; // All IDs exhausted (unreachable with MAX_OPEN_HANDLES)
+            }
+        }
+        self.next_id = id.wrapping_add(1);
         if self.next_id == 0 {
             self.next_id = 1;
         }
