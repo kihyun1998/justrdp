@@ -1,11 +1,14 @@
 //! CoreAudio audio output backend for macOS.
 
+use std::collections::VecDeque;
 use std::ptr;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use coreaudio_sys::{
     AudioQueueAllocateBuffer, AudioQueueBufferRef, AudioQueueDispose, AudioQueueEnqueueBuffer,
     AudioQueueNewOutput, AudioQueueRef, AudioQueueSetParameter, AudioQueueStart, AudioQueueStop,
-    AudioStreamBasicDescription, AudioQueueFreeBuffer,
+    AudioStreamBasicDescription,
 };
 
 use crate::error::{NativeAudioError, NativeAudioResult};
@@ -22,9 +25,61 @@ const K_LINEAR_PCM_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3; // kAudioFormatFlagIsPac
 // AudioQueue parameter IDs.
 const K_AUDIO_QUEUE_PARAM_VOLUME: u32 = 1; // kAudioQueueParam_Volume
 
-/// CoreAudio output using the AudioQueue (blocking enqueue) API.
+/// Number of pre-allocated AudioQueue buffers in the pool.
+///
+/// A small pool (3 buffers) allows double-buffering with one spare.
+/// Buffers are returned to the pool by the output callback after playback.
+const NUM_BUFFERS: usize = 3;
+
+/// Buffer size in bytes for each pre-allocated AudioQueue buffer.
+/// 16384 bytes ≈ 4096 stereo 16-bit samples ≈ ~93ms at 44.1 kHz.
+const BUFFER_SIZE: u32 = 16384;
+
+/// Timeout for waiting on a buffer from the pool.
+/// If CoreAudio stops returning buffers (device disconnect, audio route change),
+/// we return an error instead of blocking indefinitely.
+const BUFFER_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Shared buffer pool between the AudioQueue callback and `write_samples()`.
+struct BufferPool {
+    available: Mutex<VecDeque<AudioQueueBufferRef>>,
+    condvar: Condvar,
+}
+
+/// AudioQueue output callback invoked by CoreAudio after a buffer finishes playback.
+///
+/// Returns the buffer to the shared pool so `write_samples()` can reuse it.
+///
+/// # Safety
+///
+/// This function is called by CoreAudio with valid queue and buffer pointers.
+/// `user_data` must point to a valid `BufferPool` that outlives the audio queue.
+unsafe extern "C" fn output_callback(
+    user_data: *mut std::ffi::c_void,
+    _queue: AudioQueueRef,
+    buffer: AudioQueueBufferRef,
+) {
+    // SAFETY: `user_data` is a `&BufferPool` pointer created in `open()` and
+    // remains valid for the lifetime of the audio queue.
+    let pool = &*(user_data as *const BufferPool);
+
+    if let Ok(mut available) = pool.available.lock() {
+        available.push_back(buffer);
+        pool.condvar.notify_one();
+    }
+    // If lock fails (poisoned), silently drop — the buffer stays in the queue's
+    // ownership and will be freed by `AudioQueueDispose`.
+}
+
+/// CoreAudio output using the AudioQueue API with a pre-allocated buffer pool.
+///
+/// Buffers are allocated once in `open()` and cycled through the pool:
+/// `write_samples()` takes a buffer → fills it → enqueues it → callback returns it.
+/// `AudioQueueDispose` frees all buffers when the queue is torn down.
 pub struct CoreAudioOutput {
     queue: AudioQueueRef,
+    /// Buffer pool shared with the output callback. Boxed for stable address.
+    pool: Box<BufferPool>,
     sample_rate: u32,
     channels: u16,
 }
@@ -32,6 +87,7 @@ pub struct CoreAudioOutput {
 // SAFETY: `AudioQueueRef` is a pointer to an OS-managed opaque type.
 // CoreAudio audio queues can be used from any thread once created;
 // the AudioQueue API is documented as thread-safe for enqueue operations.
+// `pool` is behind a Mutex and Condvar, which are Send+Sync.
 unsafe impl Send for CoreAudioOutput {}
 
 impl NativeAudioOutput for CoreAudioOutput {
@@ -55,19 +111,26 @@ impl NativeAudioOutput for CoreAudioOutput {
             mReserved: 0,
         };
 
+        let pool = Box::new(BufferPool {
+            available: Mutex::new(VecDeque::with_capacity(NUM_BUFFERS)),
+            condvar: Condvar::new(),
+        });
+
+        let pool_ptr: *const BufferPool = &*pool;
         let mut queue: AudioQueueRef = ptr::null_mut();
 
-        // SAFETY: `AudioQueueNewOutput` is called with a valid format description
-        // and a valid output pointer. We pass no callback (synchronous enqueue mode),
-        // NULL run loop (uses internal thread), and no flags.
+        // SAFETY: `AudioQueueNewOutput` is called with a valid format description,
+        // a valid callback function, and a valid user-data pointer (`pool_ptr`).
+        // The pool is Box-pinned so the pointer remains stable. We pass NULL
+        // for the run loop (uses internal thread) and no flags.
         let status = unsafe {
             AudioQueueNewOutput(
                 &format,
-                None,             // no callback — we use synchronous enqueue
-                ptr::null_mut(),  // callback user data
-                ptr::null_mut(),  // run loop (NULL = internal)
-                ptr::null(),      // run loop mode
-                0,                // flags (reserved, must be 0)
+                Some(output_callback),
+                pool_ptr as *mut std::ffi::c_void,
+                ptr::null_mut(), // run loop (NULL = internal)
+                ptr::null(),     // run loop mode
+                0,               // flags (reserved, must be 0)
                 &mut queue,
             )
         };
@@ -78,7 +141,34 @@ impl NativeAudioOutput for CoreAudioOutput {
             )));
         }
 
+        // Pre-allocate buffers and add them to the available pool.
+        {
+            let mut available = pool.available.lock().unwrap();
+            for _ in 0..NUM_BUFFERS {
+                let mut buffer: AudioQueueBufferRef = ptr::null_mut();
+
+                // SAFETY: Allocating a buffer from a valid audio queue.
+                let alloc_status = unsafe {
+                    AudioQueueAllocateBuffer(queue, BUFFER_SIZE, &mut buffer)
+                };
+
+                if alloc_status != 0 {
+                    // SAFETY: Disposing a valid queue. `1` = immediate (don't drain).
+                    // AudioQueueDispose frees all allocated buffers.
+                    unsafe {
+                        AudioQueueDispose(queue, 1);
+                    }
+                    return Err(NativeAudioError::DeviceError(format!(
+                        "AudioQueueAllocateBuffer failed with status {alloc_status}"
+                    )));
+                }
+
+                available.push_back(buffer);
+            }
+        }
+
         // SAFETY: `queue` is valid after successful `AudioQueueNewOutput`.
+        // Buffers are pre-allocated and available in the pool.
         // Passing NULL for the start time means "start immediately".
         let status = unsafe { AudioQueueStart(queue, ptr::null()) };
 
@@ -94,6 +184,7 @@ impl NativeAudioOutput for CoreAudioOutput {
 
         Ok(Self {
             queue,
+            pool,
             sample_rate,
             channels,
         })
@@ -106,45 +197,22 @@ impl NativeAudioOutput for CoreAudioOutput {
 
         let byte_size = samples.len() * 2;
 
-        let mut buffer: AudioQueueBufferRef = ptr::null_mut();
+        let byte_size_u32 = u32::try_from(byte_size).map_err(|_| {
+            NativeAudioError::WriteError(format!(
+                "sample buffer too large for AudioQueue: {byte_size} bytes exceeds u32::MAX"
+            ))
+        })?;
 
-        // SAFETY: Allocating a buffer from a valid audio queue.
-        // `byte_size` is the capacity in bytes.
-        let status = unsafe {
-            AudioQueueAllocateBuffer(self.queue, byte_size as u32, &mut buffer)
-        };
-
-        if status != 0 {
-            return Err(NativeAudioError::WriteError(format!(
-                "AudioQueueAllocateBuffer failed with status {status}"
-            )));
-        }
-
-        // SAFETY: `buffer` is valid after successful allocation and has at least
-        // `byte_size` bytes of capacity. We copy the i16 PCM data as raw bytes.
-        unsafe {
-            let buf_data = (*buffer).mAudioData as *mut u8;
-            ptr::copy_nonoverlapping(samples.as_ptr() as *const u8, buf_data, byte_size);
-            (*buffer).mAudioDataByteSize = byte_size as u32;
-        }
-
-        // SAFETY: Enqueuing a properly filled buffer into a valid queue.
-        // The buffer will be freed by the queue after playback.
-        let status = unsafe {
-            AudioQueueEnqueueBuffer(self.queue, buffer, 0, ptr::null())
-        };
-
-        if status != 0 {
-            // SAFETY: Freeing the buffer we allocated since enqueue failed.
-            unsafe {
-                AudioQueueFreeBuffer(self.queue, buffer);
+        if byte_size_u32 > BUFFER_SIZE {
+            // Split into chunks that fit in a single pool buffer.
+            let chunk_samples = (BUFFER_SIZE as usize) / 2;
+            for chunk in samples.chunks(chunk_samples) {
+                self.write_samples_single(chunk)?;
             }
-            return Err(NativeAudioError::WriteError(format!(
-                "AudioQueueEnqueueBuffer failed with status {status}"
-            )));
+            return Ok(());
         }
 
-        Ok(())
+        self.write_samples_single(samples)
     }
 
     fn set_volume(&mut self, left: u16, right: u16) {
@@ -162,15 +230,81 @@ impl NativeAudioOutput for CoreAudioOutput {
     fn close(&mut self) {
         if !self.queue.is_null() {
             // SAFETY: Stopping and disposing a valid audio queue.
-            // `AudioQueueStop` with `0` (false) means asynchronous stop — it
-            // drains any remaining buffers before stopping.
-            // `AudioQueueDispose` with `0` (false) also drains before disposing.
+            // `AudioQueueStop` with `1` (true) means synchronous/immediate stop —
+            // all pending callbacks complete before it returns, so we can safely
+            // dispose the queue knowing no callback will fire afterward.
+            // `AudioQueueDispose` with `1` (true) disposes immediately and frees
+            // all allocated buffers.
             unsafe {
-                AudioQueueStop(self.queue, 0);
-                AudioQueueDispose(self.queue, 0);
+                AudioQueueStop(self.queue, 1);
+                AudioQueueDispose(self.queue, 1);
             }
             self.queue = ptr::null_mut();
         }
+    }
+}
+
+impl CoreAudioOutput {
+    /// Write a single chunk of samples using a buffer from the pool.
+    ///
+    /// The chunk must fit within `BUFFER_SIZE` bytes.
+    fn write_samples_single(&mut self, samples: &[i16]) -> NativeAudioResult<()> {
+        let byte_size = samples.len() * 2;
+        debug_assert!(byte_size <= BUFFER_SIZE as usize, "chunk too large for buffer pool");
+
+        // Wait for an available buffer from the pool, with timeout.
+        let buffer = {
+            let mut available = self
+                .pool
+                .available
+                .lock()
+                .map_err(|_| NativeAudioError::WriteError("buffer pool poisoned".into()))?;
+
+            while available.is_empty() {
+                let (guard, wait_result) = self
+                    .pool
+                    .condvar
+                    .wait_timeout(available, BUFFER_WAIT_TIMEOUT)
+                    .map_err(|_| NativeAudioError::WriteError("buffer pool poisoned".into()))?;
+
+                available = guard;
+
+                if wait_result.timed_out() && available.is_empty() {
+                    return Err(NativeAudioError::WriteError(
+                        "buffer pool timeout: audio device may be disconnected".into(),
+                    ));
+                }
+            }
+
+            available.pop_front().unwrap()
+        };
+
+        // SAFETY: `buffer` is a valid AudioQueueBuffer from our pool with at least
+        // `BUFFER_SIZE` bytes of capacity. `byte_size <= BUFFER_SIZE` is guaranteed
+        // by the caller (`write_samples` splits larger inputs into chunks).
+        unsafe {
+            let buf_data = (*buffer).mAudioData as *mut u8;
+            ptr::copy_nonoverlapping(samples.as_ptr() as *const u8, buf_data, byte_size);
+            (*buffer).mAudioDataByteSize = byte_size as u32;
+        }
+
+        // SAFETY: Enqueuing a properly filled buffer into a valid queue.
+        // After playback, the output callback returns this buffer to the pool.
+        let status = unsafe {
+            AudioQueueEnqueueBuffer(self.queue, buffer, 0, ptr::null())
+        };
+
+        if status != 0 {
+            // Return the buffer to the pool since enqueue failed.
+            if let Ok(mut available) = self.pool.available.lock() {
+                available.push_back(buffer);
+            }
+            return Err(NativeAudioError::WriteError(format!(
+                "AudioQueueEnqueueBuffer failed with status {status}"
+            )));
+        }
+
+        Ok(())
     }
 }
 

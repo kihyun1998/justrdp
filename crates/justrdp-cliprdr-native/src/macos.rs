@@ -76,31 +76,23 @@ impl MacosClipboard {
 
 /// Read plain text from the macOS general pasteboard.
 ///
-/// # Safety
-/// NSPasteboard must be accessed from the main thread. The caller is
-/// responsible for ensuring this function is invoked on the main thread.
+/// **Thread safety**: `NSPasteboard` must be accessed from the main thread.
+/// The caller is responsible for ensuring this function is invoked on the
+/// main thread.
 fn read_pasteboard_text() -> Option<String> {
-    // SAFETY: objc2 NSPasteboard calls require main-thread access.
-    // The CliprdrBackend caller must ensure main-thread invocation.
-    unsafe {
-        let pasteboard = NSPasteboard::generalPasteboard();
-        let ns_string_type = NSString::from_str(UTI_PLAIN_TEXT);
-        let result = pasteboard.stringForType(&ns_string_type)?;
-        Some(result.to_string())
-    }
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let ns_string_type = NSString::from_str(UTI_PLAIN_TEXT);
+    let result = pasteboard.stringForType(&ns_string_type)?;
+    Some(result.to_string())
 }
 
 /// Write plain text to the macOS general pasteboard.
 ///
-/// # Safety
-/// Same main-thread requirement as `read_pasteboard_text`.
+/// **Thread safety**: Same main-thread requirement as [`read_pasteboard_text`].
 fn write_pasteboard_text(text: &str) -> bool {
-    // SAFETY: objc2 NSPasteboard calls require main-thread access.
-    unsafe {
-        let pasteboard = NSPasteboard::generalPasteboard();
-        pasteboard.clearContents();
-        let ns_string = NSString::from_str(text);
-        let ns_string_type = NSString::from_str(UTI_PLAIN_TEXT);
-        pasteboard.setString_forType(&ns_string, &ns_string_type)
-    }
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    let ns_string = NSString::from_str(text);
+    let ns_string_type = NSString::from_str(UTI_PLAIN_TEXT);
+    pasteboard.setString_forType(&ns_string, &ns_string_type)
 }

@@ -1187,7 +1187,7 @@ pub trait GfxHandler: Send {
   - [x] macOS: NSPasteboard
   - **Known limitations:**
     - 텍스트(CF_UNICODETEXT/CF_TEXT)만 지원; 이미지/파일 전송 미구현
-    - macOS `unsafe` 블록 세분화 필요 (NSPasteboard main-thread 제약)
+    - ~~macOS `unsafe` 블록 세분화 필요~~ → 완료 (objc2 safe API 확인, unsafe 제거)
     - `ClipboardError::Other(&'static str)` → `String` 변경 시 에러 context 보존 가능
 - [x] `justrdp-rdpdr-native`:
   - [x] 네이티브 파일시스템 백엔드
@@ -1202,8 +1202,8 @@ pub trait GfxHandler: Send {
   - [x] Linux: PulseAudio / PipeWire
   - [x] macOS: CoreAudio (AudioQueue)
   - **Known limitations:**
-    - macOS: AudioQueue buffer leak (callback 미등록으로 enqueue된 버퍼 미해제)
-    - macOS: byte_size u32 truncation 미방어 (MAX_DECODE_SAMPLES로 간접 방어)
+    - ~~macOS: AudioQueue buffer leak~~ → 완료 (buffer pool 패턴 + output callback 도입)
+    - ~~macOS: byte_size u32 truncation~~ → 완료 (u32::try_from + 청크 분할)
     - Windows: waveOut 패닉 시 ManuallyDrop 미적용 (현재 패닉 경로 없음)
     - Windows: WasapiOutput 이름이 실제 API(waveOut)와 불일치
     - PulseAudio: per-stream 볼륨 미지원 (시스템 레벨 볼륨만 가능)
@@ -1212,11 +1212,11 @@ pub trait GfxHandler: Send {
   - [x] Linux: PulseAudio / PipeWire 캡처
   - [x] macOS: CoreAudio (AudioQueue Input) 캡처
   - **Known limitations:**
-    - macOS: Arc raw pointer leak in close() (shared_raw 필드 추가 필요)
-    - macOS: AudioQueueAllocateBuffer/EnqueueBuffer 반환값 미검사
-    - macOS: read() condvar 타임아웃 없음 (무한 블록 가능)
-    - macOS: ring buffer 크기 제한 없음 (read 지연 시 무한 증가)
-    - `packet_byte_size()` overflow 미방어 (checked_mul 필요)
+    - ~~macOS: Arc raw pointer leak in close()~~ → 완료 (shared_raw 필드 + close() 회수)
+    - ~~macOS: AudioQueueAllocateBuffer/EnqueueBuffer 반환값 미검사~~ → 완료
+    - ~~macOS: read() condvar 타임아웃 없음~~ → 완료 (READ_TIMEOUT 5초)
+    - ~~macOS: ring buffer 크기 제한 없음~~ → 완료 (RING_BUFFER_MAX_PACKETS 제한)
+    - ~~`packet_byte_size()` overflow 미방어~~ → 완료 (checked_mul + validate())
     - 플랫폼 테스트 부재 (하드웨어 의존)
 
 ---
