@@ -7,6 +7,7 @@ use justrdp_cliprdr::{ClipboardResult, FormatListResponse};
 
 // Standard clipboard format IDs -- MS-RDPECLIP 2.2.1
 pub const CF_TEXT: u32 = 0x0001;
+pub const CF_DIB: u32 = 0x0008;
 pub const CF_UNICODETEXT: u32 = 0x000D;
 
 /// Maximum clipboard data size to decode (4 MiB).
@@ -93,6 +94,62 @@ pub fn is_text_format(format_id: u32) -> bool {
     matches!(format_id, CF_TEXT | CF_UNICODETEXT)
 }
 
+/// Check if a format ID is an image format we support.
+pub fn is_image_format(format_id: u32) -> bool {
+    format_id == CF_DIB
+}
+
+/// Check if a format ID is any format we support (text or image).
+pub fn is_supported_format(format_id: u32) -> bool {
+    is_text_format(format_id) || is_image_format(format_id)
+}
+
+/// Minimum size of a BITMAPINFOHEADER (MS-WMF 2.2.2.3).
+const BITMAPINFOHEADER_SIZE: usize = 40;
+
+/// Convert RDP CF_DIB data to BMP file data.
+///
+/// CF_DIB = BITMAPINFOHEADER + pixel data.
+/// BMP = BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER + pixel data.
+pub fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
+    if dib.len() < BITMAPINFOHEADER_SIZE {
+        return None;
+    }
+
+    let bi_size = u32::from_le_bytes(dib[0..4].try_into().ok()?);
+    if (bi_size as usize) < BITMAPINFOHEADER_SIZE {
+        return None;
+    }
+
+    let file_size = (14 + dib.len()) as u32;
+    let data_offset = 14 + bi_size;
+
+    let mut bmp = Vec::with_capacity(14 + dib.len());
+    // BITMAPFILEHEADER (14 bytes)
+    bmp.extend_from_slice(&[0x42, 0x4D]); // 'BM' signature
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&[0, 0, 0, 0]); // reserved
+    bmp.extend_from_slice(&data_offset.to_le_bytes());
+    // DIB data (BITMAPINFOHEADER + pixels)
+    bmp.extend_from_slice(dib);
+
+    Some(bmp)
+}
+
+/// Convert BMP file data to RDP CF_DIB data.
+///
+/// Strips the 14-byte BITMAPFILEHEADER, leaving BITMAPINFOHEADER + pixels.
+pub fn bmp_to_dib(bmp: &[u8]) -> Option<Vec<u8>> {
+    if bmp.len() < 14 + BITMAPINFOHEADER_SIZE {
+        return None;
+    }
+    // Verify BMP signature
+    if bmp[0] != 0x42 || bmp[1] != 0x4D {
+        return None;
+    }
+    Some(bmp[14..].to_vec())
+}
+
 /// Decode RDP clipboard bytes into UTF-8, auto-detecting the format.
 ///
 /// Tries `CF_UNICODETEXT` first when the buffer length is even (UTF-16LE
@@ -105,9 +162,11 @@ pub fn rdp_bytes_to_utf8(data: &[u8]) -> Option<String> {
     }
 }
 
-/// Accept a format list if it contains any text format we support.
-pub fn accept_text_format_list(formats: &[LongFormatName]) -> ClipboardResult<FormatListResponse> {
-    if formats.iter().any(|f| is_text_format(f.format_id)) {
+/// Accept a format list if it contains any supported format (text or image).
+pub fn accept_supported_format_list(
+    formats: &[LongFormatName],
+) -> ClipboardResult<FormatListResponse> {
+    if formats.iter().any(|f| is_supported_format(f.format_id)) {
         Ok(FormatListResponse::Ok)
     } else {
         Ok(FormatListResponse::Fail)
@@ -197,6 +256,65 @@ mod tests {
     fn is_text_format_check() {
         assert!(is_text_format(CF_TEXT));
         assert!(is_text_format(CF_UNICODETEXT));
-        assert!(!is_text_format(0x0008)); // CF_DIB
+        assert!(!is_text_format(CF_DIB));
+    }
+
+    #[test]
+    fn is_image_format_check() {
+        assert!(is_image_format(CF_DIB));
+        assert!(!is_image_format(CF_TEXT));
+        assert!(!is_image_format(CF_UNICODETEXT));
+    }
+
+    #[test]
+    fn is_supported_format_check() {
+        assert!(is_supported_format(CF_TEXT));
+        assert!(is_supported_format(CF_UNICODETEXT));
+        assert!(is_supported_format(CF_DIB));
+        assert!(!is_supported_format(0x9999));
+    }
+
+    #[test]
+    fn dib_to_bmp_roundtrip() {
+        // Create a minimal valid DIB (BITMAPINFOHEADER, 1x1 pixel, 24-bit)
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&1i32.to_le_bytes()); // biWidth
+        dib.extend_from_slice(&1i32.to_le_bytes()); // biHeight
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression (BI_RGB)
+        dib.extend_from_slice(&4u32.to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        dib.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00]); // 1 pixel BGR + padding
+
+        let bmp = dib_to_bmp(&dib).unwrap();
+        assert_eq!(bmp[0], 0x42); // 'B'
+        assert_eq!(bmp[1], 0x4D); // 'M'
+        assert_eq!(bmp.len(), 14 + dib.len());
+
+        // Roundtrip: BMP back to DIB
+        let recovered = bmp_to_dib(&bmp).unwrap();
+        assert_eq!(recovered, dib);
+    }
+
+    #[test]
+    fn dib_to_bmp_too_short() {
+        assert!(dib_to_bmp(&[0; 39]).is_none()); // Less than BITMAPINFOHEADER
+    }
+
+    #[test]
+    fn bmp_to_dib_invalid_signature() {
+        let mut data = vec![0u8; 54]; // 14 + 40
+        data[0] = 0x00; // Wrong signature
+        assert!(bmp_to_dib(&data).is_none());
+    }
+
+    #[test]
+    fn bmp_to_dib_too_short() {
+        assert!(bmp_to_dib(&[0x42, 0x4D]).is_none()); // Just signature, no data
     }
 }

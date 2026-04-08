@@ -1,19 +1,20 @@
 //! Windows native clipboard backend using `clipboard-win` crate.
 //!
-//! Provides text clipboard integration (CF_TEXT, CF_UNICODETEXT) via Win32 API.
+//! Provides text (CF_TEXT, CF_UNICODETEXT) and image (CF_DIB) clipboard
+//! integration via Win32 API.
 
-use clipboard_win::formats::Unicode;
+use clipboard_win::formats::{Bitmap, Unicode};
 use clipboard_win::{get_clipboard, set_clipboard};
 
 use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, LongFormatName};
 use justrdp_cliprdr::{ClipboardError, ClipboardResult, FormatDataResponse, FormatListResponse};
 
-use crate::common::{self, is_text_format, rdp_bytes_to_utf8, utf8_to_rdp};
+use crate::common::{self, is_image_format, is_text_format, rdp_bytes_to_utf8, utf8_to_rdp};
 
 /// Windows clipboard backend.
 ///
 /// Uses the `clipboard-win` crate to read from and write to the local
-/// Windows clipboard. Currently supports text formats only.
+/// Windows clipboard. Supports text and image formats.
 pub struct WindowsClipboard;
 
 impl WindowsClipboard {
@@ -22,12 +23,12 @@ impl WindowsClipboard {
         Ok(Self)
     }
 
-    /// Accept the format list if it contains any text format.
+    /// Accept the format list if it contains any supported format.
     pub fn on_format_list(
         &mut self,
         formats: &[LongFormatName],
     ) -> ClipboardResult<FormatListResponse> {
-        common::accept_text_format_list(formats)
+        common::accept_supported_format_list(formats)
     }
 
     /// Read from the local clipboard and encode for the requested format.
@@ -35,13 +36,19 @@ impl WindowsClipboard {
         &mut self,
         format_id: u32,
     ) -> ClipboardResult<FormatDataResponse> {
-        if !is_text_format(format_id) {
-            return Ok(FormatDataResponse::Fail);
+        if is_text_format(format_id) {
+            let text: String = get_clipboard(Unicode).map_err(|_| ClipboardError::Failed)?;
+            let data = utf8_to_rdp(&text, format_id).ok_or(ClipboardError::Failed)?;
+            return Ok(FormatDataResponse::Ok(data));
         }
 
-        let text: String = get_clipboard(Unicode).map_err(|_| ClipboardError::Failed)?;
-        let data = utf8_to_rdp(&text, format_id).ok_or(ClipboardError::Failed)?;
-        Ok(FormatDataResponse::Ok(data))
+        if is_image_format(format_id) {
+            // Get CF_DIB data directly from the Windows clipboard.
+            let dib: Vec<u8> = get_clipboard(Bitmap).map_err(|_| ClipboardError::Failed)?;
+            return Ok(FormatDataResponse::Ok(dib));
+        }
+
+        Ok(FormatDataResponse::Fail)
     }
 
     /// Decode server data and write to the local clipboard.
@@ -49,6 +56,17 @@ impl WindowsClipboard {
         if !is_success {
             return;
         }
+
+        // Try image first (DIB data has a BITMAPINFOHEADER starting with biSize >= 40)
+        if data.len() >= 40 {
+            let bi_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            if bi_size >= 40 {
+                let _ = set_clipboard(Bitmap, data);
+                return;
+            }
+        }
+
+        // Fall back to text
         if let Some(text) = rdp_bytes_to_utf8(data) {
             let _ = set_clipboard(Unicode, &text);
         }

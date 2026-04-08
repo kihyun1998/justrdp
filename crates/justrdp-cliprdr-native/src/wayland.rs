@@ -1,13 +1,14 @@
 //! Wayland clipboard backend for RDP clipboard redirection.
 //!
 //! Uses the `wl-clipboard-rs` crate to interact with the Wayland clipboard.
+//! Supports text (CF_TEXT, CF_UNICODETEXT) and image (CF_DIB via BMP) formats.
 
 use std::io::Read;
 
 use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, LongFormatName};
 use justrdp_cliprdr::{ClipboardError, ClipboardResult, FormatDataResponse, FormatListResponse};
 
-use crate::common::{self, rdp_bytes_to_utf8, utf8_to_rdp};
+use crate::common::{self, bmp_to_dib, dib_to_bmp, rdp_bytes_to_utf8, utf8_to_rdp};
 
 /// Maximum clipboard data to read from the compositor pipe (4 MiB).
 const MAX_CLIPBOARD_READ_BYTES: u64 = 4 * 1024 * 1024;
@@ -25,12 +26,12 @@ impl WaylandClipboard {
         Ok(Self)
     }
 
-    /// Accept the format list if it contains any text format.
+    /// Accept the format list if it contains any supported format.
     pub fn on_format_list(
         &mut self,
         formats: &[LongFormatName],
     ) -> ClipboardResult<FormatListResponse> {
-        common::accept_text_format_list(formats)
+        common::accept_supported_format_list(formats)
     }
 
     /// Read from the Wayland clipboard and encode for the requested format.
@@ -38,24 +39,42 @@ impl WaylandClipboard {
         &mut self,
         format_id: u32,
     ) -> ClipboardResult<FormatDataResponse> {
-        if !common::is_text_format(format_id) {
-            return Ok(FormatDataResponse::Fail);
-        }
+        if common::is_text_format(format_id) {
+            use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
 
-        use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
+            let (pipe, _mime) =
+                get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text)
+                    .map_err(|_| ClipboardError::Failed)?;
 
-        let (pipe, _mime) =
-            get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text)
+            let mut text = String::new();
+            pipe.take(MAX_CLIPBOARD_READ_BYTES)
+                .read_to_string(&mut text)
                 .map_err(|_| ClipboardError::Failed)?;
 
-        // Cap read size to prevent memory exhaustion from a misbehaving compositor.
-        let mut text = String::new();
-        pipe.take(MAX_CLIPBOARD_READ_BYTES)
-            .read_to_string(&mut text)
+            let data = utf8_to_rdp(&text, format_id).ok_or(ClipboardError::Failed)?;
+            return Ok(FormatDataResponse::Ok(data));
+        }
+
+        if common::is_image_format(format_id) {
+            use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
+
+            let (mut pipe, _mime) = get_contents(
+                ClipboardType::Regular,
+                Seat::Unspecified,
+                MimeType::Specific("image/bmp"),
+            )
             .map_err(|_| ClipboardError::Failed)?;
 
-        let data = utf8_to_rdp(&text, format_id).ok_or(ClipboardError::Failed)?;
-        Ok(FormatDataResponse::Ok(data))
+            let mut bmp_bytes = Vec::new();
+            pipe.take(MAX_CLIPBOARD_READ_BYTES)
+                .read_to_end(&mut bmp_bytes)
+                .map_err(|_| ClipboardError::Failed)?;
+
+            let dib = bmp_to_dib(&bmp_bytes).ok_or(ClipboardError::Failed)?;
+            return Ok(FormatDataResponse::Ok(dib));
+        }
+
+        Ok(FormatDataResponse::Fail)
     }
 
     /// Decode server data and copy to the Wayland clipboard.
@@ -66,10 +85,24 @@ impl WaylandClipboard {
 
         use wl_clipboard_rs::copy::{MimeType, Options, Source};
 
+        // Try image first
+        if data.len() >= 40 {
+            let bi_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            if bi_size >= 40 {
+                if let Some(bmp) = dib_to_bmp(data) {
+                    let opts = Options::new();
+                    let _ = opts.copy(
+                        Source::Bytes(bmp.into()),
+                        MimeType::Specific("image/bmp"),
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Fall back to text
         if let Some(text) = rdp_bytes_to_utf8(data) {
             let opts = Options::new();
-            // Fire-and-forget: compositor write failure cannot be propagated
-            // (on_format_data_response returns ()).
             let _ = opts.copy(Source::Bytes(text.into_bytes().into()), MimeType::Text);
         }
     }

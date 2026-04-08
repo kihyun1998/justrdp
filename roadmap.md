@@ -1186,7 +1186,8 @@ pub trait GfxHandler: Send {
   - [x] Linux: X11 Selection / Wayland data-device
   - [x] macOS: NSPasteboard
   - **Known limitations:**
-    - 텍스트(CF_UNICODETEXT/CF_TEXT)만 지원; 이미지/파일 전송 미구현
+    - ~~텍스트만 지원; 이미지 미구현~~ → 완료 (CF_DIB 이미지 지원, macOS TIFF→BMP 변환, X11/Wayland BMP, Windows CF_DIB 직접 처리)
+    - 파일 전송(CFSTR_FILEDESCRIPTOR/FILECONTENTS) 미구현
     - ~~macOS `unsafe` 블록 세분화 필요~~ → 완료 (objc2 safe API 확인, unsafe 제거)
     - ~~`ClipboardError::Other(&'static str)` → `String` 변경~~ → 완료 (에러 context 보존 가능)
 - [x] `justrdp-rdpdr-native`:
