@@ -42,6 +42,128 @@ impl DesktopSize {
     }
 }
 
+/// Monitor configuration for multi-monitor support (MS-RDPBCGR 2.2.1.3.6, 2.2.1.3.9).
+///
+/// Each monitor defines a rectangular region in virtual desktop coordinates.
+/// The primary monitor's upper-left corner must be at (0, 0). Other monitors
+/// use signed coordinates relative to the primary (negative values allowed for
+/// monitors to the left or above).
+///
+/// Coordinates are **inclusive**: a 1920×1080 monitor at origin has
+/// `left=0, top=0, right=1919, bottom=1079`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorConfig {
+    /// X-coordinate of upper-left corner (signed, relative to primary).
+    pub left: i32,
+    /// Y-coordinate of upper-left corner (signed, relative to primary).
+    pub top: i32,
+    /// X-coordinate of lower-right corner (inclusive).
+    pub right: i32,
+    /// Y-coordinate of lower-right corner (inclusive).
+    pub bottom: i32,
+    /// Whether this is the primary monitor. Exactly one monitor must be primary.
+    pub is_primary: bool,
+    /// Physical width in millimeters (0 = unknown, server ignores < 10 or > 10000).
+    pub physical_width_mm: u32,
+    /// Physical height in millimeters (0 = unknown, server ignores < 10 or > 10000).
+    pub physical_height_mm: u32,
+    /// Display orientation in degrees: 0, 90, 180, or 270.
+    pub orientation: u32,
+    /// Desktop scale factor percentage (100–500). Default: 100.
+    pub desktop_scale_factor: u32,
+    /// Device scale factor percentage: 100, 140, or 180. Default: 100.
+    pub device_scale_factor: u32,
+}
+
+impl MonitorConfig {
+    /// Create a primary monitor at origin with the given dimensions.
+    ///
+    /// Width and height are in pixels. Coordinates are set to
+    /// `(0, 0, width-1, height-1)` with default scale factors.
+    /// Values exceeding 32766 are rejected at connect time by the connector.
+    pub fn primary(width: u32, height: u32) -> Self {
+        Self {
+            left: 0,
+            top: 0,
+            right: width.saturating_sub(1).min(i32::MAX as u32) as i32,
+            bottom: height.saturating_sub(1).min(i32::MAX as u32) as i32,
+            is_primary: true,
+            physical_width_mm: 0,
+            physical_height_mm: 0,
+            orientation: 0,
+            desktop_scale_factor: 100,
+            device_scale_factor: 100,
+        }
+    }
+
+    /// Create a secondary monitor at the given position.
+    ///
+    /// Values exceeding 32766 are rejected at connect time by the connector.
+    pub fn secondary(left: i32, top: i32, width: u32, height: u32) -> Self {
+        let w = width.saturating_sub(1).min(i32::MAX as u32) as i32;
+        let h = height.saturating_sub(1).min(i32::MAX as u32) as i32;
+        Self {
+            left,
+            top,
+            right: left.saturating_add(w),
+            bottom: top.saturating_add(h),
+            is_primary: false,
+            physical_width_mm: 0,
+            physical_height_mm: 0,
+            orientation: 0,
+            desktop_scale_factor: 100,
+            device_scale_factor: 100,
+        }
+    }
+
+    /// Set the physical dimensions in millimeters.
+    pub fn with_physical_size(mut self, width_mm: u32, height_mm: u32) -> Self {
+        self.physical_width_mm = width_mm;
+        self.physical_height_mm = height_mm;
+        self
+    }
+
+    /// Set the display orientation.
+    ///
+    /// Valid values per MS-RDPBCGR 2.2.1.3.10.1:
+    /// 0 (landscape), 90 (portrait), 180 (landscape flipped), 270 (portrait flipped).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `degrees` is not one of 0, 90, 180, 270.
+    pub fn with_orientation(mut self, degrees: u32) -> Self {
+        assert!(
+            matches!(degrees, 0 | 90 | 180 | 270),
+            "orientation must be 0, 90, 180, or 270 (got {degrees})"
+        );
+        self.orientation = degrees;
+        self
+    }
+
+    /// Set the DPI scale factors.
+    ///
+    /// Per MS-RDPBCGR 2.2.1.3.10.1:
+    /// - `desktop_scale`: 100–500 (percentage)
+    /// - `device_scale`: 100, 140, or 180 (percentage)
+    ///
+    /// # Panics
+    ///
+    /// Panics if values are out of spec range.
+    pub fn with_scale(mut self, desktop_scale: u32, device_scale: u32) -> Self {
+        assert!(
+            (100..=500).contains(&desktop_scale),
+            "desktop_scale_factor must be 100–500 (got {desktop_scale})"
+        );
+        assert!(
+            matches!(device_scale, 100 | 140 | 180),
+            "device_scale_factor must be 100, 140, or 180 (got {device_scale})"
+        );
+        self.desktop_scale_factor = desktop_scale;
+        self.device_scale_factor = device_scale;
+        self
+    }
+}
+
 /// Keyboard type (MS-RDPBCGR 2.2.1.3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -270,6 +392,15 @@ pub struct Config {
     /// Azure AD authentication configuration.
     /// Must be provided when auth_mode is AzureAd.
     pub aad_config: Option<AadConfig>,
+    /// Multi-monitor layout (MS-RDPBCGR 2.2.1.3.6).
+    ///
+    /// When two or more monitors are configured, CS_MONITOR and CS_MONITOR_EX
+    /// GCC blocks are sent during the Basic Settings Exchange. The connector
+    /// overrides the negotiated desktop dimensions with the bounding rectangle
+    /// of all monitors; the `desktop_size` field itself is not modified.
+    ///
+    /// When empty (default), single-monitor mode is used with `desktop_size`.
+    pub monitors: Vec<MonitorConfig>,
 }
 
 impl Config {
@@ -301,6 +432,7 @@ impl Config {
                 device_kerberos_token: None,
                 client_random: None,
                 aad_config: None,
+                monitors: Vec::new(),
             },
         }
     }
@@ -450,6 +582,22 @@ impl ConfigBuilder {
     /// Set the client random for Standard RDP Security (32 bytes, must be cryptographic random).
     pub fn client_random(mut self, random: [u8; 32]) -> Self {
         self.config.client_random = Some(random);
+        self
+    }
+
+    /// Add a monitor to the multi-monitor layout.
+    ///
+    /// When two or more monitors are configured, CS_MONITOR and CS_MONITOR_EX
+    /// blocks are sent during the GCC Basic Settings Exchange. The bounding
+    /// rectangle of all monitors replaces the `desktop_size` setting.
+    pub fn monitor(mut self, config: MonitorConfig) -> Self {
+        self.config.monitors.push(config);
+        self
+    }
+
+    /// Set the full multi-monitor layout, replacing any previously added monitors.
+    pub fn monitors(mut self, configs: Vec<MonitorConfig>) -> Self {
+        self.config.monitors = configs;
         self
     }
 

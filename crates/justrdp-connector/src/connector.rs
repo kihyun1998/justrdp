@@ -8,7 +8,10 @@ use alloc::vec::Vec;
 
 use justrdp_core::{Decode, Encode, PduHint, ReadCursor, WriteBuf, WriteCursor};
 
-use justrdp_pdu::gcc::client::{ClientClusterData, ClientCoreData, ClientNetworkData, ClientSecurityData};
+use justrdp_pdu::gcc::client::{
+    ClientClusterData, ClientCoreData, ClientMonitorData, ClientMonitorExtendedData,
+    ClientNetworkData, ClientSecurityData, EarlyCapabilityFlags, MonitorAttributeDef, MonitorDef,
+};
 use justrdp_pdu::gcc::{
     ConferenceCreateRequest, ConferenceCreateResponse, ServerDataBlockType, DATA_BLOCK_HEADER_SIZE,
 };
@@ -44,6 +47,18 @@ use justrdp_pdu::x224::{
 };
 
 use crate::config::Config;
+
+// ── Multi-monitor constants (MS-RDPBCGR 2.2.1.3.6) ──────────────────────────
+
+/// TS_MONITOR_PRIMARY flag in TS_MONITOR_DEF.flags (MS-RDPBCGR 2.2.1.3.6.1).
+const TS_MONITOR_PRIMARY: u32 = 0x0000_0001;
+/// Maximum number of monitors in CS_MONITOR (MS-RDPBCGR 2.2.1.3.6).
+const MAX_MONITOR_COUNT: usize = 16;
+/// Minimum virtual desktop dimension per axis (MS-RDPBCGR 2.2.1.3.6).
+const VD_MIN_DIM: i64 = 200;
+/// Maximum virtual desktop dimension per axis (MS-RDPBCGR 2.2.1.3.6).
+const VD_MAX_DIM: i64 = 32766;
+
 use crate::encode_helpers::{
     encode_connection_request, encode_mcs_send_data, encode_slow_path,
     wrap_share_control, wrap_share_data,
@@ -150,6 +165,9 @@ pub struct ClientConnector {
     aad_auth_request_json: Option<alloc::string::String>,
     /// Number of Deactivation-Reactivation cycles (for cache invalidation signaling).
     deactivation_count: u32,
+    /// Effective desktop size for multi-monitor (bounding rect) or single-monitor.
+    /// Set during BasicSettingsExchangeSendInitial, used in ConfirmActivePdu.
+    active_desktop_size: Option<crate::config::DesktopSize>,
 }
 
 /// Standard RDP Security mode (none for TLS/NLA).
@@ -188,6 +206,7 @@ impl ClientConnector {
             session_id: 0,
             aad_auth_request_json: None,
             deactivation_count: 0,
+            active_desktop_size: None,
         }
     }
 
@@ -525,6 +544,118 @@ impl ClientConnector {
         Ok(Written::nothing())
     }
 
+    /// Build CS_MONITOR + CS_MONITOR_EX blocks if multi-monitor is active.
+    ///
+    /// Returns `(None, None)` when single-monitor mode should be used.
+    /// Mutates `core_data` to override desktop dimensions and set the
+    /// SUPPORT_MONITOR_LAYOUT_PDU flag when multi-monitor is active.
+    fn build_monitor_blocks(
+        &self,
+        core_data: &mut ClientCoreData,
+    ) -> ConnectorResult<(Option<ClientMonitorData>, Option<ClientMonitorExtendedData>)> {
+        // MS-RDPBCGR 2.2.1.3.6: CS_MONITOR is only sent with ≥ 2 monitors and when
+        // the server advertised EXTENDED_CLIENT_DATA_SUPPORTED. Single-monitor sessions
+        // use CS_CORE desktopWidth/desktopHeight only — sending CS_MONITOR with
+        // monitorCount=1 is spec-legal but adds no value and breaks some servers.
+        let send_monitors = self.config.monitors.len() >= 2
+            && self.server_nego_flags.contains(NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+
+        if !send_monitors {
+            return Ok((None, None));
+        }
+
+        let monitors = &self.config.monitors;
+
+        // MS-RDPBCGR 2.2.1.3.6: monitorCount MUST NOT exceed 16
+        if monitors.len() > MAX_MONITOR_COUNT {
+            return Err(ConnectorError::general(
+                "monitor count exceeds maximum of 16",
+            ));
+        }
+
+        // Validate: exactly one primary at (0, 0)
+        let primary_count = monitors.iter().filter(|m| m.is_primary).count();
+        if primary_count != 1 {
+            return Err(ConnectorError::general(
+                "multi-monitor config must have exactly one primary monitor",
+            ));
+        }
+        let primary = monitors.iter().find(|m| m.is_primary).unwrap();
+        if primary.left != 0 || primary.top != 0 {
+            return Err(ConnectorError::general(
+                "primary monitor upper-left must be at (0, 0)",
+            ));
+        }
+
+        // Validate per-monitor geometry: reject inverted rectangles
+        for m in monitors.iter() {
+            if m.right < m.left || m.bottom < m.top {
+                return Err(ConnectorError::general(
+                    "monitor has inverted coordinates (right < left or bottom < top)",
+                ));
+            }
+        }
+
+        // Compute bounding rectangle (MS-RDPBCGR 2.2.1.3.6)
+        let min_left = monitors.iter().map(|m| m.left).min().unwrap();
+        let min_top = monitors.iter().map(|m| m.top).min().unwrap();
+        let max_right = monitors.iter().map(|m| m.right).max().unwrap();
+        let max_bottom = monitors.iter().map(|m| m.bottom).max().unwrap();
+
+        // right/bottom are inclusive, so width = max_right - min_left + 1
+        let vd_width = (max_right as i64) - (min_left as i64) + 1;
+        let vd_height = (max_bottom as i64) - (min_top as i64) + 1;
+
+        if vd_width < VD_MIN_DIM || vd_height < VD_MIN_DIM {
+            return Err(ConnectorError::general(
+                "virtual desktop dimensions must be at least 200×200",
+            ));
+        }
+        if vd_width > VD_MAX_DIM || vd_height > VD_MAX_DIM {
+            return Err(ConnectorError::general(
+                "virtual desktop dimensions must not exceed 32766×32766",
+            ));
+        }
+
+        // Override desktop size with bounding rectangle
+        core_data.desktop_width = vd_width as u16;
+        core_data.desktop_height = vd_height as u16;
+
+        // Set SUPPORT_MONITOR_LAYOUT_PDU flag (MS-RDPBCGR 2.2.1.3.2)
+        let existing = core_data.early_capability_flags.unwrap_or(EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU);
+        core_data.early_capability_flags = Some(EarlyCapabilityFlags::from_bits(
+            existing.bits() | EarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU.bits(),
+        ));
+
+        // Build CS_MONITOR (TS_UD_CS_MONITOR)
+        let monitor_defs: Vec<MonitorDef> = monitors
+            .iter()
+            .map(|m| MonitorDef {
+                left: m.left,
+                top: m.top,
+                right: m.right,
+                bottom: m.bottom,
+                flags: if m.is_primary { TS_MONITOR_PRIMARY } else { 0 },
+            })
+            .collect();
+        let cs_monitor = ClientMonitorData { monitors: monitor_defs };
+
+        // Build CS_MONITOR_EX (TS_UD_CS_MONITOR_EX)
+        let monitor_attrs: Vec<MonitorAttributeDef> = monitors
+            .iter()
+            .map(|m| MonitorAttributeDef {
+                physical_width: m.physical_width_mm,
+                physical_height: m.physical_height_mm,
+                orientation: m.orientation,
+                desktop_scale_factor: m.desktop_scale_factor,
+                device_scale_factor: m.device_scale_factor,
+            })
+            .collect();
+        let cs_monitor_ex = ClientMonitorExtendedData { monitors: monitor_attrs };
+
+        Ok((Some(cs_monitor), Some(cs_monitor_ex)))
+    }
+
     fn step_basic_settings_send_initial(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         // Build GCC client data blocks
         let mut core_data = ClientCoreData::new(self.config.desktop_size.width, self.config.desktop_size.height);
@@ -533,6 +664,14 @@ impl ClientConnector {
         core_data.client_name = self.config.client_name.clone();
         core_data.server_selected_protocol = Some(self.selected_protocol.bits());
 
+        let (monitor_data, monitor_ext_data) = self.build_monitor_blocks(&mut core_data)?;
+
+        // Store effective desktop size for use in ConfirmActivePdu (BitmapCapability)
+        self.active_desktop_size = Some(crate::config::DesktopSize {
+            width: core_data.desktop_width,
+            height: core_data.desktop_height,
+        });
+
         let security_data = ClientSecurityData::new();
 
         let cluster_data = ClientClusterData {
@@ -540,14 +679,21 @@ impl ClientConnector {
             redirected_session_id: 0,
         };
 
-        // Encode client data blocks (order: Core → Cluster → Security → Net per FreeRDP)
-        let mut client_data_size = core_data.size() + cluster_data.size() + security_data.size();
-        if !self.config.static_channels.is_empty() {
-            let net_data = ClientNetworkData {
+        // Build optional blocks once, then measure + encode (avoids double construction)
+        let net_data = if !self.config.static_channels.is_empty() {
+            Some(ClientNetworkData {
                 channels: self.config.static_channels.as_slice().to_vec(),
-            };
-            client_data_size += net_data.size();
-        }
+            })
+        } else {
+            None
+        };
+
+        // Compute total client data size
+        // Block order: Core → Cluster → Security → Net → Monitor → MonitorEx
+        let mut client_data_size = core_data.size() + cluster_data.size() + security_data.size();
+        if let Some(ref nd) = net_data { client_data_size += nd.size(); }
+        if let Some(ref md) = monitor_data { client_data_size += md.size(); }
+        if let Some(ref mex) = monitor_ext_data { client_data_size += mex.size(); }
 
         let mut client_data = vec![0u8; client_data_size];
         {
@@ -555,12 +701,9 @@ impl ClientConnector {
             core_data.encode(&mut cursor)?;
             cluster_data.encode(&mut cursor)?;
             security_data.encode(&mut cursor)?;
-            if !self.config.static_channels.is_empty() {
-                let net_data = ClientNetworkData {
-                    channels: self.config.static_channels.as_slice().to_vec(),
-                };
-                net_data.encode(&mut cursor)?;
-            }
+            if let Some(ref nd) = net_data { nd.encode(&mut cursor)?; }
+            if let Some(ref md) = monitor_data { md.encode(&mut cursor)?; }
+            if let Some(ref mex) = monitor_ext_data { mex.encode(&mut cursor)?; }
         }
 
         // Wrap in GCC ConferenceCreateRequest
@@ -1193,20 +1336,23 @@ impl ClientConnector {
                 refresh_rect_support: 1,
                 suppress_output_support: 1,
             }),
-            CapabilitySet::Bitmap(BitmapCapability {
-                preferred_bits_per_pixel: self.config.color_depth.as_u16(),
-                receive1_bit_per_pixel: 1,
-                receive4_bits_per_pixel: 1,
-                receive8_bits_per_pixel: 1,
-                desktop_width: self.config.desktop_size.width,
-                desktop_height: self.config.desktop_size.height,
-                pad2a: 0,
-                desktop_resize_flag: 1,
-                bitmap_compression_flag: 1,
-                high_color_flags: 0,
-                drawing_flags: 0x08 | 0x10 | 0x20, // DRAW_ALLOW_DYNAMIC_COLOR_FIDELITY | DRAW_ALLOW_COLOR_SUBSAMPLING | DRAW_ALLOW_SKIP_ALPHA
-                multiple_rectangle_support: 1,
-                pad2b: 0,
+            CapabilitySet::Bitmap({
+                let ds = self.active_desktop_size.unwrap_or(self.config.desktop_size);
+                BitmapCapability {
+                    preferred_bits_per_pixel: self.config.color_depth.as_u16(),
+                    receive1_bit_per_pixel: 1,
+                    receive4_bits_per_pixel: 1,
+                    receive8_bits_per_pixel: 1,
+                    desktop_width: ds.width,
+                    desktop_height: ds.height,
+                    pad2a: 0,
+                    desktop_resize_flag: 1,
+                    bitmap_compression_flag: 1,
+                    high_color_flags: 0,
+                    drawing_flags: 0x08 | 0x10 | 0x20, // DRAW_ALLOW_DYNAMIC_COLOR_FIDELITY | DRAW_ALLOW_COLOR_SUBSAMPLING | DRAW_ALLOW_SKIP_ALPHA
+                    multiple_rectangle_support: 1,
+                    pad2b: 0,
+                }
             }),
             CapabilitySet::Order(OrderCapability {
                 terminal_descriptor: [0u8; 16],
@@ -2083,5 +2229,269 @@ mod tests {
         let connector = ClientConnector::new(config);
         let cred_type = connector.credssp_credential_type();
         assert!(matches!(cred_type, crate::credssp::CredentialType::RestrictedAdmin));
+    }
+
+    // ── Multi-monitor tests ──────────────────────────────────────────────
+
+    use crate::config::MonitorConfig;
+
+    /// Helper: create a connector in BasicSettingsExchangeSendInitial state.
+    fn monitor_connector(config: Config, nego_flags: NegotiationResponseFlags) -> ClientConnector {
+        let mut c = ClientConnector::new(config);
+        c.state = ClientConnectorState::BasicSettingsExchangeSendInitial;
+        c.selected_protocol = SecurityProtocol::HYBRID;
+        c.server_nego_flags = nego_flags;
+        c
+    }
+
+    /// Helper: step connector through BasicSettingsExchangeSendInitial and return output bytes.
+    fn step_gcc(connector: &mut ClientConnector) -> Vec<u8> {
+        let mut output = WriteBuf::new();
+        let written = connector.step(&[], &mut output).unwrap();
+        output.as_mut_slice()[..written.size].to_vec()
+    }
+
+    #[test]
+    fn multi_monitor_gcc_includes_cs_monitor_and_cs_monitor_ex() {
+        // Two monitors: primary 1920×1080 at origin, secondary to the right
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor(MonitorConfig::secondary(1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+
+        let buf = step_gcc(&mut connector);
+
+        assert!(buf.windows(2).any(|w| w == [0x05, 0xC0]), "output should contain CS_MONITOR (0xC005)");
+        assert!(buf.windows(2).any(|w| w == [0x08, 0xC0]), "output should contain CS_MONITOR_EX (0xC008)");
+    }
+
+    #[test]
+    fn single_monitor_omits_cs_monitor_blocks() {
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+
+        let buf = step_gcc(&mut connector);
+        assert!(!buf.windows(2).any(|w| w == [0x05, 0xC0]), "single monitor should omit CS_MONITOR");
+    }
+
+    #[test]
+    fn multi_monitor_without_extended_client_data_omits_blocks() {
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor(MonitorConfig::secondary(1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::NONE);
+
+        let buf = step_gcc(&mut connector);
+        assert!(!buf.windows(2).any(|w| w == [0x05, 0xC0]), "should omit CS_MONITOR without EXTENDED_CLIENT_DATA");
+    }
+
+    #[test]
+    fn multi_monitor_rejects_no_primary() {
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::secondary(0, 0, 1920, 1080))
+            .monitor(MonitorConfig::secondary(1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let mut output = WriteBuf::new();
+        assert!(connector.step(&[], &mut output).is_err());
+    }
+
+    #[test]
+    fn multi_monitor_rejects_primary_not_at_origin() {
+        let config = Config::builder("user", "pass")
+            .monitor({
+                let mut m = MonitorConfig::primary(1920, 1080);
+                m.left = 100;
+                m.top = 100;
+                m.right = 2019;
+                m.bottom = 1179;
+                m
+            })
+            .monitor(MonitorConfig::secondary(1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let mut output = WriteBuf::new();
+        assert!(connector.step(&[], &mut output).is_err());
+    }
+
+    #[test]
+    fn multi_monitor_negative_coordinates() {
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor(MonitorConfig::secondary(-1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+
+        let buf = step_gcc(&mut connector);
+        assert!(buf.windows(2).any(|w| w == [0x05, 0xC0]), "negative coords should produce valid CS_MONITOR");
+    }
+
+    #[test]
+    fn multi_monitor_rejects_two_primaries() {
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor({
+                let mut m = MonitorConfig::primary(1920, 1080);
+                m.left = 1920;
+                m.right = 3839;
+                m
+            })
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let mut output = WriteBuf::new();
+        assert!(connector.step(&[], &mut output).is_err());
+    }
+
+    #[test]
+    fn multi_monitor_rejects_too_small_virtual_desktop() {
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(50, 50))
+            .monitor(MonitorConfig::secondary(50, 0, 50, 50))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let mut output = WriteBuf::new();
+        assert!(connector.step(&[], &mut output).is_err());
+    }
+
+    #[test]
+    fn multi_monitor_rejects_exceeding_16_monitors() {
+        let mut config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080));
+        for i in 1..=16 {
+            config = config.monitor(MonitorConfig::secondary(1920 * i, 0, 1920, 1080));
+        }
+        let mut connector = monitor_connector(config.build(), NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let mut output = WriteBuf::new();
+        assert!(connector.step(&[], &mut output).is_err());
+    }
+
+    #[test]
+    fn multi_monitor_rejects_inverted_rectangle() {
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor(MonitorConfig {
+                left: 1920,
+                top: 0,
+                right: 1919, // inverted: right < left
+                bottom: 1079,
+                is_primary: false,
+                physical_width_mm: 0,
+                physical_height_mm: 0,
+                orientation: 0,
+                desktop_scale_factor: 100,
+                device_scale_factor: 100,
+            })
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let mut output = WriteBuf::new();
+        assert!(connector.step(&[], &mut output).is_err(), "should reject inverted monitor rectangle");
+    }
+
+    #[test]
+    fn multi_monitor_desktop_size_equals_bounding_rect() {
+        // Two 1920×1080 monitors side-by-side → bounding rect = 3840×1080
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor(MonitorConfig::secondary(1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+
+        step_gcc(&mut connector);
+
+        // active_desktop_size should be set to the bounding rect
+        let ds = connector.active_desktop_size.unwrap();
+        assert_eq!(ds.width, 3840, "bounding rect width should be 3840");
+        assert_eq!(ds.height, 1080, "bounding rect height should be 1080");
+    }
+
+    #[test]
+    fn multi_monitor_sets_support_monitor_layout_pdu_flag() {
+        // Verify the monitor path sets SUPPORT_MONITOR_LAYOUT_PDU and overrides
+        // desktop size. We decode through all protocol layers to reach CS_CORE.
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor(MonitorConfig::secondary(1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+
+        let buf = step_gcc(&mut connector);
+
+        // Decode: TPKT → X.224 DT → MCS ConnectInitial → GCC ConferenceCreateResponse → user data
+        let mut cursor = ReadCursor::new(&buf);
+        let _tpkt = TpktHeader::decode(&mut cursor).unwrap();
+        let _dt = DataTransfer::decode(&mut cursor).unwrap();
+        let ci = ConnectInitial::decode(&mut cursor).unwrap();
+        let gcc = ConferenceCreateRequest::decode(&mut ReadCursor::new(&ci.user_data)).unwrap();
+
+        // First block in GCC user data is CS_CORE
+        let mut gcc_cursor = ReadCursor::new(&gcc.user_data);
+        let core = ClientCoreData::decode(&mut gcc_cursor).unwrap();
+
+        // Verify earlyCapabilityFlags contains SUPPORT_MONITOR_LAYOUT_PDU
+        let flags = core.early_capability_flags.expect("earlyCapabilityFlags should be set");
+        assert!(
+            flags.contains(EarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU),
+            "earlyCapabilityFlags should include SUPPORT_MONITOR_LAYOUT_PDU (0x0040), got 0x{:04X}",
+            flags.bits()
+        );
+
+        // Verify desktopWidth/desktopHeight = bounding rect of 2×1920×1080
+        assert_eq!(core.desktop_width, 3840);
+        assert_eq!(core.desktop_height, 1080);
+    }
+
+    #[test]
+    fn monitor_config_builder_methods() {
+        let m = MonitorConfig::primary(1920, 1080)
+            .with_physical_size(527, 296)
+            .with_orientation(90)
+            .with_scale(150, 140);
+
+        assert_eq!(m.left, 0);
+        assert_eq!(m.top, 0);
+        assert_eq!(m.right, 1919);
+        assert_eq!(m.bottom, 1079);
+        assert!(m.is_primary);
+        assert_eq!(m.physical_width_mm, 527);
+        assert_eq!(m.physical_height_mm, 296);
+        assert_eq!(m.orientation, 90);
+        assert_eq!(m.desktop_scale_factor, 150);
+        assert_eq!(m.device_scale_factor, 140);
+    }
+
+    #[test]
+    #[should_panic(expected = "orientation must be 0, 90, 180, or 270")]
+    fn monitor_config_rejects_invalid_orientation() {
+        MonitorConfig::primary(1920, 1080).with_orientation(45);
+    }
+
+    #[test]
+    #[should_panic(expected = "desktop_scale_factor must be 100–500")]
+    fn monitor_config_rejects_invalid_desktop_scale() {
+        MonitorConfig::primary(1920, 1080).with_scale(50, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "device_scale_factor must be 100, 140, or 180")]
+    fn monitor_config_rejects_invalid_device_scale() {
+        MonitorConfig::primary(1920, 1080).with_scale(100, 200);
+    }
+
+    #[test]
+    fn monitor_config_bulk_setter() {
+        let monitors = vec![
+            MonitorConfig::primary(1920, 1080),
+            MonitorConfig::secondary(1920, 0, 1920, 1080),
+        ];
+        let config = Config::builder("user", "pass")
+            .monitors(monitors)
+            .build();
+        assert_eq!(config.monitors.len(), 2);
+        assert!(config.monitors[0].is_primary);
+        assert!(!config.monitors[1].is_primary);
     }
 }

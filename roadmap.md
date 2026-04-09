@@ -1233,12 +1233,32 @@ pub trait GfxHandler: Send {
 > **requires**: 8.6 EGFX (`ResetGraphics`), 8.4 DisplayControl
 > **검증**: integration test (다중 모니터 레이아웃 전송 → 서버 응답)
 
-- [ ] Client Monitor Data (GCC) -- 최대 16개 모니터 정의
-- [ ] Client Monitor Extended Data -- 물리 크기, DPI, 방향
-- [ ] Monitor Layout PDU 수신 (서버 → 클라이언트)
-- [ ] EGFX `ResetGraphics` 모니터 매핑
-- [ ] 가상 데스크톱 좌표 처리 (음수 좌표 포함)
-- [ ] DPI 스케일링
+**PDU (완료):**
+
+- [x] `ClientMonitorData` (GCC CS_MONITOR 0xC005) -- 최대 16개 `MonitorDef` (justrdp-pdu)
+- [x] `ClientMonitorExtendedData` (GCC CS_MONITOR_EX 0xC008) -- `MonitorAttributeDef` (justrdp-pdu)
+- [x] `MonitorLayoutPdu` 수신 구조체 (MS-RDPBCGR 2.2.12.1, justrdp-pdu)
+- [x] EGFX `ResetGraphicsPdu` + `GfxMonitorDef` (justrdp-egfx)
+- [x] `DisplayControlClient` + `MonitorLayoutPdu` 전송 (justrdp-displaycontrol)
+
+**Connector 통합:**
+
+- [x] `Config`에 `monitors: Vec<MonitorConfig>` 추가 (좌표, DPI, 물리크기, primary, orientation)
+- [x] `ConfigBuilder::monitor()` / `monitors()` 빌더 메서드
+- [x] GCC Basic Settings에 `ClientMonitorData` + `ClientMonitorExtendedData` 전송
+- [x] `ClientCoreData`에 `SUPPORT_MONITOR_LAYOUT_PDU` 플래그 설정
+- [x] 단일 모니터일 때 Monitor Data 블록 생략 (기존 동작 유지)
+
+**세션 중 모니터 변경:**
+
+- [ ] Finalization 단계에서 `MonitorLayoutPdu` 수신 → 콜백/이벤트 전달
+- [ ] EGFX `ResetGraphics` 모니터 매핑 (서버 재구성 시)
+- [ ] `DisplayControlClient`로 런타임 모니터 레이아웃 변경 전송
+
+**좌표 & 스케일링:**
+
+- [ ] 가상 데스크톱 좌표 처리 (음수 좌표, bounding rect 계산)
+- [ ] DPI 스케일링 조율 (GCC Extended Data ↔ DisplayControl 간 일관성)
 
 ### 9.2 Auto-Reconnect
 

@@ -22,7 +22,7 @@ mod state;
 
 pub use config::{
     AadConfig, AuthMode, BitmapCodecConfig, ColorDepth, CompressionConfig, Config, ConfigBuilder,
-    Credentials, DesktopSize, KeyboardType, StaticChannelSet,
+    Credentials, DesktopSize, KeyboardType, MonitorConfig, StaticChannelSet,
 };
 pub use connector::ClientConnector;
 pub use credssp::gss_wrap::{gss_unwrap, gss_wrap};
