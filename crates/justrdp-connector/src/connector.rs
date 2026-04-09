@@ -585,7 +585,8 @@ impl ClientConnector {
                 "multi-monitor config must have exactly one primary monitor",
             ));
         }
-        let primary = monitors.iter().find(|m| m.is_primary).unwrap();
+        let primary = monitors.iter().find(|m| m.is_primary)
+            .expect("exactly one primary guaranteed by primary_count check");
         if primary.left != 0 || primary.top != 0 {
             return Err(ConnectorError::general(
                 "primary monitor upper-left must be at (0, 0)",
@@ -602,10 +603,14 @@ impl ClientConnector {
         }
 
         // Compute bounding rectangle (MS-RDPBCGR 2.2.1.3.6)
-        let min_left = monitors.iter().map(|m| m.left).min().unwrap();
-        let min_top = monitors.iter().map(|m| m.top).min().unwrap();
-        let max_right = monitors.iter().map(|m| m.right).max().unwrap();
-        let max_bottom = monitors.iter().map(|m| m.bottom).max().unwrap();
+        let min_left = monitors.iter().map(|m| m.left).min()
+            .expect("monitors non-empty; guarded by len >= 2");
+        let min_top = monitors.iter().map(|m| m.top).min()
+            .expect("monitors non-empty; guarded by len >= 2");
+        let max_right = monitors.iter().map(|m| m.right).max()
+            .expect("monitors non-empty; guarded by len >= 2");
+        let max_bottom = monitors.iter().map(|m| m.bottom).max()
+            .expect("monitors non-empty; guarded by len >= 2");
 
         // right/bottom are inclusive, so width = max_right - min_left + 1
         let vd_width = (max_right as i64) - (min_left as i64) + 1;
@@ -670,6 +675,42 @@ impl ClientConnector {
         core_data.server_selected_protocol = Some(self.selected_protocol.bits());
 
         let (monitor_data, monitor_ext_data) = self.build_monitor_blocks(&mut core_data)?;
+
+        // Populate CS_CORE DPI fields from the primary monitor (MS-RDPBCGR 2.2.1.3.2).
+        // These describe the primary display for both single- and multi-monitor sessions.
+        if let Some(primary) = self.config.monitors.iter().find(|m| m.is_primary) {
+            core_data.desktop_physical_width = Some(primary.physical_width_mm);
+            core_data.desktop_physical_height = Some(primary.physical_height_mm);
+            // CS_CORE desktopOrientation is u16; MonitorConfig.orientation is u32.
+            // All valid values (0, 90, 180, 270) fit in u16.
+            core_data.desktop_orientation = Some(primary.orientation as u16);
+            core_data.desktop_scale_factor = Some(primary.desktop_scale_factor);
+            core_data.device_scale_factor = Some(primary.device_scale_factor);
+
+            // Single-monitor: override CS_CORE desktopWidth/Height from the monitor's
+            // actual dimensions, applying the same bounds as the multi-monitor path.
+            if self.config.monitors.len() == 1 {
+                if primary.left != 0 || primary.top != 0 {
+                    return Err(ConnectorError::general(
+                        "primary monitor upper-left must be at (0, 0)",
+                    ));
+                }
+                let w = primary.right as i64 - primary.left as i64 + 1;
+                let h = primary.bottom as i64 - primary.top as i64 + 1;
+                if w < VD_MIN_DIM || h < VD_MIN_DIM {
+                    return Err(ConnectorError::general(
+                        "single monitor dimensions must be at least 200×200",
+                    ));
+                }
+                if w > VD_MAX_DIM || h > VD_MAX_DIM {
+                    return Err(ConnectorError::general(
+                        "single monitor dimensions must not exceed 32766×32766",
+                    ));
+                }
+                core_data.desktop_width = w as u16;
+                core_data.desktop_height = h as u16;
+            }
+        }
 
         // Store effective desktop size for use in ConfirmActivePdu (BitmapCapability)
         self.active_desktop_size = Some(crate::config::DesktopSize {
@@ -2528,5 +2569,135 @@ mod tests {
         assert_eq!(config.monitors.len(), 2);
         assert!(config.monitors[0].is_primary);
         assert!(!config.monitors[1].is_primary);
+    }
+
+    #[test]
+    fn multi_monitor_negative_left_bounding_rect() {
+        // Secondary monitor to the LEFT of primary: left=-1920
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor(MonitorConfig::secondary(-1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let _ = step_gcc(&mut connector);
+        // Bounding rect: min_left=-1920, max_right=1919, width=3840
+        let ds = connector.active_desktop_size.unwrap();
+        assert_eq!(ds.width, 3840);
+        assert_eq!(ds.height, 1080);
+    }
+
+    #[test]
+    fn multi_monitor_negative_top_bounding_rect() {
+        // Secondary monitor ABOVE primary: top=-1080
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor(MonitorConfig::secondary(0, -1080, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let _ = step_gcc(&mut connector);
+        // Bounding rect: min_top=-1080, max_bottom=1079, height=2160
+        let ds = connector.active_desktop_size.unwrap();
+        assert_eq!(ds.width, 1920);
+        assert_eq!(ds.height, 2160);
+    }
+
+    #[test]
+    fn single_monitor_config_overrides_desktop_size() {
+        // desktop_size defaults to 1024×768, but monitor says 1920×1080
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080).with_scale(150, 100))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let _ = step_gcc(&mut connector);
+        // active_desktop_size should reflect the single monitor, not config.desktop_size
+        let ds = connector.active_desktop_size.unwrap();
+        assert_eq!(ds.width, 1920);
+        assert_eq!(ds.height, 1080);
+    }
+
+    #[test]
+    fn cs_core_dpi_populated_from_primary() {
+        let config = Config::builder("user", "pass")
+            .monitor(
+                MonitorConfig::primary(1920, 1080)
+                    .with_physical_size(530, 300)
+                    .with_orientation(90)
+                    .with_scale(150, 140),
+            )
+            .monitor(MonitorConfig::secondary(1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+
+        let buf = step_gcc(&mut connector);
+
+        // Decode the GCC to find CS_CORE and verify DPI fields
+        let mut cursor = ReadCursor::new(&buf);
+        let _tpkt = TpktHeader::decode(&mut cursor).unwrap();
+        let _dt = DataTransfer::decode(&mut cursor).unwrap();
+        let ci = ConnectInitial::decode(&mut cursor).unwrap();
+        let gcc = ConferenceCreateRequest::decode(&mut ReadCursor::new(&ci.user_data)).unwrap();
+        let core = ClientCoreData::decode(&mut ReadCursor::new(&gcc.user_data)).unwrap();
+
+        assert_eq!(core.desktop_physical_width, Some(530));
+        assert_eq!(core.desktop_physical_height, Some(300));
+        assert_eq!(core.desktop_orientation, Some(90));
+        assert_eq!(core.desktop_scale_factor, Some(150));
+        assert_eq!(core.device_scale_factor, Some(140));
+    }
+
+    #[test]
+    fn to_display_layout_fields_conversion() {
+        let m = MonitorConfig::primary(1920, 1080)
+            .with_physical_size(530, 300)
+            .with_orientation(90)
+            .with_scale(150, 140);
+        let (flags, left, top, width, height, pw, ph, orient, ds, devs) = m.to_display_layout_fields();
+        assert_eq!(flags, 0x0000_0001); // PRIMARY
+        assert_eq!(left, 0);
+        assert_eq!(top, 0);
+        assert_eq!(width, 1920);
+        assert_eq!(height, 1080);
+        assert_eq!(pw, 530);
+        assert_eq!(ph, 300);
+        assert_eq!(orient, 90);
+        assert_eq!(ds, 150);
+        assert_eq!(devs, 140);
+    }
+
+    #[test]
+    fn to_display_layout_fields_secondary_negative() {
+        let m = MonitorConfig::secondary(-1920, 0, 1920, 1080);
+        let (flags, left, top, width, height, _, _, _, _, _) = m.to_display_layout_fields();
+        assert_eq!(flags, 0); // not primary
+        assert_eq!(left, -1920);
+        assert_eq!(top, 0);
+        assert_eq!(width, 1920);
+        assert_eq!(height, 1080);
+    }
+
+    #[test]
+    fn single_monitor_rejects_too_small() {
+        // Width 199 < VD_MIN_DIM (200)
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(199, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let mut output = WriteBuf::new();
+        let result = connector.step(&[], &mut output);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn single_monitor_rejects_too_large() {
+        // Width 32767 > VD_MAX_DIM (32766)
+        let mut m = MonitorConfig::primary(32766, 1080);
+        m.right = 32766; // width = 32767
+        let config = Config::builder("user", "pass")
+            .monitor(m)
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+        let mut output = WriteBuf::new();
+        let result = connector.step(&[], &mut output);
+        assert!(result.is_err());
     }
 }

@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 
 use justrdp_pdu::gcc::client::ChannelDef;
 use justrdp_pdu::rdp::client_info::PerformanceFlags;
+use justrdp_pdu::rdp::finalization::TS_MONITOR_PRIMARY;
 use justrdp_pdu::x224::SecurityProtocol;
 
 /// Authentication credentials.
@@ -161,6 +162,31 @@ impl MonitorConfig {
         self.desktop_scale_factor = desktop_scale;
         self.device_scale_factor = device_scale;
         self
+    }
+    /// Convert to display-control–compatible fields for `DisplayControlClient::set_monitor_layout()`.
+    ///
+    /// Returns `(flags, left, top, width, height, physical_width, physical_height,
+    /// orientation, desktop_scale_factor, device_scale_factor)` matching the
+    /// MS-RDPEDISP 2.2.2.2.1 `DISPLAYCONTROL_MONITOR_LAYOUT` entry layout.
+    ///
+    /// The bounding-box coordinates (left/top/right/bottom) are converted to
+    /// left/top + width/height as used by the DisplayControl protocol.
+    pub fn to_display_layout_fields(&self) -> (u32, i32, i32, u32, u32, u32, u32, u32, u32, u32) {
+        let flags = if self.is_primary { TS_MONITOR_PRIMARY } else { 0 };
+        let width = (self.right as i64 - self.left as i64 + 1).clamp(0, u32::MAX as i64) as u32;
+        let height = (self.bottom as i64 - self.top as i64 + 1).clamp(0, u32::MAX as i64) as u32;
+        (
+            flags,
+            self.left,
+            self.top,
+            width,
+            height,
+            self.physical_width_mm,
+            self.physical_height_mm,
+            self.orientation,
+            self.desktop_scale_factor,
+            self.device_scale_factor,
+        )
     }
 }
 

@@ -664,7 +664,13 @@ impl<'de> Decode<'de> for ClientMonitorExtendedData {
             return Err(DecodeError::unexpected_value("ClientMonitorExtendedData", "type", "expected 0xC008"));
         }
         let _flags = src.read_u32_le("ClientMonitorExtendedData::flags")?;
-        let _attr_size = src.read_u32_le("ClientMonitorExtendedData::monitorAttributeSize")?;
+        let attr_size = src.read_u32_le("ClientMonitorExtendedData::monitorAttributeSize")?;
+        // MS-RDPBCGR 2.2.1.3.9: monitorAttributeSize MUST be 20
+        if attr_size != 20 {
+            return Err(DecodeError::unexpected_value(
+                "ClientMonitorExtendedData", "monitorAttributeSize", "expected 20",
+            ));
+        }
         let count = src.read_u32_le("ClientMonitorExtendedData::monitorCount")? as usize;
         // MS-RDPBCGR 2.2.1.3.9: monitorCount MUST be ≤ 16
         if count > 16 {

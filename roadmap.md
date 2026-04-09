@@ -1257,8 +1257,8 @@ pub trait GfxHandler: Send {
 
 **좌표 & 스케일링:**
 
-- [ ] 가상 데스크톱 좌표 처리 (음수 좌표, bounding rect 계산)
-- [ ] DPI 스케일링 조율 (GCC Extended Data ↔ DisplayControl 간 일관성)
+- [x] 가상 데스크톱 좌표 처리 (음수 좌표, bounding rect 계산)
+- [x] DPI 스케일링 조율 (GCC Extended Data ↔ DisplayControl 간 일관성)
 
 **테스트 보강 (추후):**
 
