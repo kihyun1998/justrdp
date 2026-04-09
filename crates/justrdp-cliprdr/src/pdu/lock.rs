@@ -6,6 +6,9 @@ use justrdp_core::{DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor};
 
 use super::header::{ClipboardHeader, ClipboardMsgFlags, ClipboardMsgType, CLIPBOARD_HEADER_SIZE};
 
+/// Size of the clipDataId field in bytes.
+const CLIP_DATA_ID_SIZE: u32 = 4;
+
 /// Lock Clipboard Data PDU -- MS-RDPECLIP 2.2.4.1
 ///
 /// 12 bytes total: 8-byte header + 4-byte clipDataId.
@@ -27,7 +30,7 @@ impl Encode for LockClipDataPdu {
         let header = ClipboardHeader::new(
             ClipboardMsgType::LockClipData,
             ClipboardMsgFlags::NONE,
-            4,
+            CLIP_DATA_ID_SIZE,
         );
         header.encode(dst)?;
         dst.write_u32_le(self.clip_data_id, "LockClipDataPdu::clipDataId")?;
@@ -39,7 +42,7 @@ impl Encode for LockClipDataPdu {
     }
 
     fn size(&self) -> usize {
-        CLIPBOARD_HEADER_SIZE + 4
+        CLIPBOARD_HEADER_SIZE + CLIP_DATA_ID_SIZE as usize
     }
 }
 
@@ -72,7 +75,7 @@ impl Encode for UnlockClipDataPdu {
         let header = ClipboardHeader::new(
             ClipboardMsgType::UnlockClipData,
             ClipboardMsgFlags::NONE,
-            4,
+            CLIP_DATA_ID_SIZE,
         );
         header.encode(dst)?;
         dst.write_u32_le(self.clip_data_id, "UnlockClipDataPdu::clipDataId")?;
@@ -84,7 +87,7 @@ impl Encode for UnlockClipDataPdu {
     }
 
     fn size(&self) -> usize {
-        CLIPBOARD_HEADER_SIZE + 4
+        CLIPBOARD_HEADER_SIZE + CLIP_DATA_ID_SIZE as usize
     }
 }
 

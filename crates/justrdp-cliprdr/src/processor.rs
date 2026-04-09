@@ -44,6 +44,9 @@ pub struct CliprdrClient {
     negotiated_flags: GeneralCapabilityFlags,
     /// Optional temporary directory path.
     temp_dir: Option<String>,
+    /// Format ID of the most recent outgoing FormatDataRequest, used to
+    /// correlate the response with the requested format for dispatch.
+    pending_format_data_request: Option<u32>,
 }
 
 impl AsAny for CliprdrClient {
@@ -79,6 +82,7 @@ impl CliprdrClient {
                 .union(GeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED),
             negotiated_flags: GeneralCapabilityFlags::NONE,
             temp_dir: None,
+            pending_format_data_request: None,
         }
     }
 
@@ -130,7 +134,7 @@ impl CliprdrClient {
 
         // Send an empty format list to complete initialization.
         // MS-RDPECLIP 1.3.2.1: client MUST send Format List after caps.
-        let format_list = self.build_format_list_pdu(&[])?;
+        let format_list = self.build_format_list_message(&[])?;
         messages.push(format_list);
 
         Ok(messages)
@@ -194,6 +198,10 @@ impl CliprdrClient {
                         .collect(),
                 };
 
+                // Backend errors are degraded to Fail — the client must always
+                // respond to a format list even if the backend is broken.
+                // This is intentionally different from on_file_contents_request,
+                // which propagates errors to produce a typed failure PDU.
                 let response = self
                     .backend
                     .on_format_list(&formats)
@@ -207,12 +215,19 @@ impl CliprdrClient {
             }
 
             ClipboardMsgType::FormatListResponse => {
-                // Acknowledgement from server for our format list. Nothing to do.
+                // MS-RDPECLIP 1.3.2.1: check if the server accepted our format list.
+                let resp = FormatListResponsePdu::decode_from_flags(header.msg_flags);
+                if !resp.accepted {
+                    // Server rejected our format list. Per spec, subsequent data
+                    // requests for this format list may fail. Log and continue —
+                    // there is no recovery action for the client.
+                }
                 Ok(Vec::new())
             }
 
             ClipboardMsgType::FormatDataRequest => {
                 let request = FormatDataRequestPdu::decode_body(body)?;
+                // Backend errors are degraded to Fail (see on_format_list comment).
                 let response = self
                     .backend
                     .on_format_data_request(request.requested_format_id)
@@ -235,7 +250,8 @@ impl CliprdrClient {
                     FormatDataResponsePdu::Ok(d) => (d.as_slice(), true),
                     FormatDataResponsePdu::Fail => (&[][..], false),
                 };
-                self.backend.on_format_data_response(data, is_success);
+                let format_id = self.pending_format_data_request.take();
+                self.backend.on_format_data_response(data, is_success, format_id);
                 Ok(Vec::new())
             }
 
@@ -303,6 +319,186 @@ impl SvcProcessor for CliprdrClient {
 
 impl SvcClientProcessor for CliprdrClient {}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use justrdp_core::{Encode, WriteCursor};
+    use crate::pdu::{
+        ClipboardCapsPdu, ClipboardHeader, ClipboardMsgFlags, ClipboardMsgType,
+        GeneralCapabilityFlags, GeneralCapabilitySet, CB_CAPS_VERSION_2,
+    };
+
+    /// A minimal backend that records calls for test assertions.
+    struct MockBackend {
+        format_list_called: bool,
+        format_data_request_id: Option<u32>,
+        format_data_response_data: Option<Vec<u8>>,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                format_list_called: false,
+                format_data_request_id: None,
+                format_data_response_data: None,
+            }
+        }
+    }
+
+    impl crate::CliprdrBackend for MockBackend {
+        fn on_format_list(&mut self, _formats: &[LongFormatName]) -> crate::ClipboardResult<crate::FormatListResponse> {
+            self.format_list_called = true;
+            Ok(crate::FormatListResponse::Ok)
+        }
+
+        fn on_format_data_request(&mut self, format_id: u32) -> crate::ClipboardResult<crate::FormatDataResponse> {
+            self.format_data_request_id = Some(format_id);
+            Ok(crate::FormatDataResponse::Ok(vec![0x42]))
+        }
+
+        fn on_format_data_response(&mut self, data: &[u8], _is_success: bool, _format_id: Option<u32>) {
+            self.format_data_response_data = Some(data.to_vec());
+        }
+
+        // on_file_contents_request, on_file_contents_response, on_lock, on_unlock
+        // use default trait implementations.
+    }
+
+    /// Encode a PDU to bytes.
+    fn encode_pdu(pdu: &impl Encode) -> Vec<u8> {
+        let mut buf = vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        buf
+    }
+
+    /// Build server Caps PDU bytes with given flags.
+    fn server_caps_bytes(flags: GeneralCapabilityFlags) -> Vec<u8> {
+        let caps = ClipboardCapsPdu::new(GeneralCapabilitySet::new(CB_CAPS_VERSION_2, flags));
+        encode_pdu(&caps)
+    }
+
+    /// Build Monitor Ready PDU bytes.
+    fn monitor_ready_bytes() -> Vec<u8> {
+        let header = ClipboardHeader::new(
+            ClipboardMsgType::MonitorReady,
+            ClipboardMsgFlags::NONE,
+            0,
+        );
+        encode_pdu(&header)
+    }
+
+    /// Build Format List Response PDU bytes with given flags.
+    fn format_list_response_bytes(flags: ClipboardMsgFlags) -> Vec<u8> {
+        let header = ClipboardHeader::new(
+            ClipboardMsgType::FormatListResponse,
+            flags,
+            0,
+        );
+        encode_pdu(&header)
+    }
+
+    fn new_client() -> CliprdrClient {
+        CliprdrClient::new(Box::new(MockBackend::new()))
+    }
+
+    /// Complete the handshake: send server Caps → MonitorReady.
+    /// Returns the init response messages from MonitorReady.
+    fn complete_handshake(client: &mut CliprdrClient) -> Vec<SvcMessage> {
+        let caps = server_caps_bytes(GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES);
+        client.process(&caps).unwrap();
+        let ready = monitor_ready_bytes();
+        client.process(&ready).unwrap()
+    }
+
+    #[test]
+    fn initialization_sequence() {
+        let mut client = new_client();
+
+        // 1. Server sends Caps
+        let caps = server_caps_bytes(
+            GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+                .union(GeneralCapabilityFlags::STREAM_FILECLIP_ENABLED),
+        );
+        let msgs = client.process(&caps).unwrap();
+        assert!(msgs.is_empty(), "no response to server caps");
+
+        // 2. Server sends Monitor Ready → client responds with caps + format list
+        let ready = monitor_ready_bytes();
+        let msgs = client.process(&ready).unwrap();
+        // Client should send: Caps PDU + empty Format List PDU (at minimum 2 messages)
+        assert!(msgs.len() >= 2, "expected at least 2 init messages, got {}", msgs.len());
+    }
+
+    #[test]
+    fn capability_flag_negotiation() {
+        let mut client = new_client();
+
+        // Server offers only USE_LONG_FORMAT_NAMES
+        let caps = server_caps_bytes(GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES);
+        client.process(&caps).unwrap();
+
+        // Negotiated = local AND remote
+        assert!(client.use_long_format_names());
+
+        // Client local_flags includes STREAM_FILECLIP_ENABLED, but server doesn't
+        assert!(!client.negotiated_flags.contains(GeneralCapabilityFlags::STREAM_FILECLIP_ENABLED));
+    }
+
+    #[test]
+    fn data_exchange_rejected_before_initialization() {
+        let mut client = new_client();
+
+        // Send a FormatDataRequest before handshake — should be silently dropped
+        let header = ClipboardHeader::new(
+            ClipboardMsgType::FormatDataRequest,
+            ClipboardMsgFlags::NONE,
+            4,
+        );
+        let mut buf = encode_pdu(&header);
+        buf.extend_from_slice(&0x0001u32.to_le_bytes()); // requested format ID
+
+        let msgs = client.process(&buf).unwrap();
+        assert!(msgs.is_empty(), "data exchange before init should be dropped");
+    }
+
+    #[test]
+    fn duplicate_monitor_ready_ignored() {
+        let mut client = new_client();
+
+        // Complete handshake
+        let init_msgs = complete_handshake(&mut client);
+        assert!(!init_msgs.is_empty());
+
+        // Duplicate MonitorReady → should be ignored
+        let ready = monitor_ready_bytes();
+        let msgs = client.process(&ready).unwrap();
+        assert!(msgs.is_empty(), "duplicate MonitorReady should be ignored");
+    }
+
+    #[test]
+    fn format_list_response_ok_accepted() {
+        let mut client = new_client();
+        complete_handshake(&mut client);
+
+        let resp = format_list_response_bytes(ClipboardMsgFlags::CB_RESPONSE_OK);
+        let msgs = client.process(&resp).unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn format_list_response_fail_handled() {
+        let mut client = new_client();
+        complete_handshake(&mut client);
+
+        // Server rejects our format list — should not panic or error
+        let resp = format_list_response_bytes(ClipboardMsgFlags::CB_RESPONSE_FAIL);
+        let msgs = client.process(&resp).unwrap();
+        assert!(msgs.is_empty());
+    }
+}
+
 // Public API for sending clipboard data proactively.
 impl CliprdrClient {
     /// Build a format list message to send to the server.
@@ -310,14 +506,14 @@ impl CliprdrClient {
     /// Call this when the local clipboard content changes.
     /// Respects the negotiated format name length variant.
     pub fn build_format_list(&self, formats: &[LongFormatName]) -> SvcResult<SvcMessage> {
-        self.build_format_list_pdu(formats)
+        self.build_format_list_message(formats)
     }
 
     /// Internal: build a format list SvcMessage respecting negotiated flags.
     ///
     /// MS-RDPECLIP 2.2.3.1: If CB_USE_LONG_FORMAT_NAMES is set by both sides,
     /// use Long Format Name variant; otherwise use Short Format Name variant.
-    fn build_format_list_pdu(&self, formats: &[LongFormatName]) -> SvcResult<SvcMessage> {
+    fn build_format_list_message(&self, formats: &[LongFormatName]) -> SvcResult<SvcMessage> {
         let pdu = if self.use_long_format_names() {
             FormatListPdu::Long(formats.to_vec())
         } else {
@@ -334,7 +530,10 @@ impl CliprdrClient {
     }
 
     /// Build a format data request message.
-    pub fn build_format_data_request(&self, format_id: u32) -> SvcResult<SvcMessage> {
+    ///
+    /// Stores the format_id so the response can be correlated with the request.
+    pub fn build_format_data_request(&mut self, format_id: u32) -> SvcResult<SvcMessage> {
+        self.pending_format_data_request = Some(format_id);
         let pdu = FormatDataRequestPdu::new(format_id);
         Self::encode_pdu(&pdu)
     }

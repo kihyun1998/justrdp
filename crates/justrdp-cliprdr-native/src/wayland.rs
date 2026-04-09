@@ -46,7 +46,7 @@ impl WaylandClipboard {
                 get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text)
                     .map_err(|_| ClipboardError::Failed)?;
 
-            let mut text = String::new();
+            let mut text = String::with_capacity(4096);
             pipe.take(MAX_CLIPBOARD_BYTES as u64)
                 .read_to_string(&mut text)
                 .map_err(|_| ClipboardError::Failed)?;
@@ -65,7 +65,7 @@ impl WaylandClipboard {
             )
             .map_err(|_| ClipboardError::Failed)?;
 
-            let mut bmp_bytes = Vec::new();
+            let mut bmp_bytes = Vec::with_capacity(4096);
             pipe.take(MAX_CLIPBOARD_BYTES as u64)
                 .read_to_end(&mut bmp_bytes)
                 .map_err(|_| ClipboardError::Failed)?;
@@ -78,14 +78,15 @@ impl WaylandClipboard {
     }
 
     /// Decode server data and copy to the Wayland clipboard.
-    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool) {
+    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool, format_id: Option<u32>) {
         if !is_success {
             return;
         }
 
         use wl_clipboard_rs::copy::{MimeType, Options, Source};
 
-        if looks_like_dib(data) {
+        // Use the negotiated format_id when available; fall back to content heuristic.
+        if format_id == Some(common::CF_DIB) || (format_id.is_none() && looks_like_dib(data)) {
             if let Some(bmp) = dib_to_bmp(data) {
                 let opts = Options::new();
                 let _ = opts.copy(

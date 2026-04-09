@@ -59,20 +59,27 @@ pub trait CliprdrBackend: Send {
     fn on_format_data_request(&mut self, format_id: u32) -> ClipboardResult<FormatDataResponse>;
 
     /// Called when the remote side responds with clipboard data.
-    fn on_format_data_response(&mut self, data: &[u8], is_success: bool);
+    ///
+    /// `format_id` is the format that was originally requested, or `None` if
+    /// the processor could not correlate the response with a prior request.
+    fn on_format_data_response(&mut self, data: &[u8], is_success: bool, format_id: Option<u32>);
 
     /// Called when the remote side requests file contents.
+    ///
+    /// Default implementation rejects with an error (file transfer not supported).
     fn on_file_contents_request(
         &mut self,
-        request: &FileContentsRequestPdu,
-    ) -> ClipboardResult<FileContentsResponsePdu>;
+        _request: &FileContentsRequestPdu,
+    ) -> ClipboardResult<FileContentsResponsePdu> {
+        Err(ClipboardError::Other(alloc::string::String::from("file transfer not supported")))
+    }
 
     /// Called when the remote side responds with file contents.
-    fn on_file_contents_response(&mut self, response: &FileContentsResponsePdu);
+    fn on_file_contents_response(&mut self, _response: &FileContentsResponsePdu) {}
 
     /// Called when the remote side locks clipboard data.
-    fn on_lock(&mut self, lock_id: u32);
+    fn on_lock(&mut self, _lock_id: u32) {}
 
     /// Called when the remote side unlocks clipboard data.
-    fn on_unlock(&mut self, lock_id: u32);
+    fn on_unlock(&mut self, _lock_id: u32) {}
 }

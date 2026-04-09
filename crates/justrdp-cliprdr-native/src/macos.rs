@@ -47,6 +47,19 @@ unsafe extern "C" {
 /// If already on the main thread, the closure is called directly to
 /// avoid deadlocking `dispatch_sync`. Otherwise, dispatches via GCD's
 /// main queue.
+///
+/// # Panics
+///
+/// Panics if the closure panics (the panic is caught and re-raised on
+/// the calling thread to avoid undefined behavior across the FFI boundary).
+/// Also panics if `dispatch_sync_f` returns without invoking the trampoline.
+///
+/// # Preconditions
+///
+/// - `F` and `R` must be `Send` (enforced by trait bounds).
+/// - Must not be called recursively from within a `dispatch_sync` callback
+///   on the main queue (deadlock).
+#[allow(unsafe_code)]
 fn on_main_thread<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send,
@@ -62,15 +75,15 @@ where
     }
 
     // Dispatch to the main queue synchronously.
-    let mut result: Option<R> = None;
-    let result_ptr: *mut Option<R> = &mut result;
+    let mut result: Option<Result<R, Box<dyn std::any::Any + Send>>> = None;
+    let result_ptr: *mut Option<Result<R, Box<dyn std::any::Any + Send>>> = &mut result;
 
     // Pack the closure and result pointer into a context struct.
     // Both are valid for the lifetime of this function because
     // dispatch_sync blocks until the work completes.
     struct Context<F, R> {
         f: Option<F>,
-        result_ptr: *mut Option<R>,
+        result_ptr: *mut Option<Result<R, Box<dyn std::any::Any + Send>>>,
     }
 
     // SAFETY: Context is only accessed by the trampoline on the main thread,
@@ -91,8 +104,11 @@ where
         // dispatch_sync guarantees this function completes before the caller returns.
         let ctx = unsafe { &mut *(context as *mut Context<F, R>) };
         let f = ctx.f.take().unwrap();
+        // Catch panics to avoid undefined behavior when a panic crosses the
+        // C FFI boundary (dispatch_sync_f → trampoline).
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         unsafe {
-            *ctx.result_ptr = Some(f());
+            *ctx.result_ptr = Some(outcome);
         }
     }
 
@@ -108,7 +124,10 @@ where
         );
     }
 
-    result.unwrap()
+    match result.expect("dispatch_sync_f did not invoke the trampoline") {
+        Ok(value) => value,
+        Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+    }
 }
 
 // ── MacosClipboard ────────────────────────────────────────────────────────
@@ -154,12 +173,13 @@ impl MacosClipboard {
         Ok(FormatDataResponse::Fail)
     }
 
-    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool) {
+    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool, format_id: Option<u32>) {
         if !is_success {
             return;
         }
 
-        if looks_like_dib(data) {
+        // Use the negotiated format_id when available; fall back to content heuristic.
+        if format_id == Some(common::CF_DIB) || (format_id.is_none() && looks_like_dib(data)) {
             let data_owned = data.to_vec();
             let written = on_main_thread(move || write_pasteboard_image(&data_owned));
             if written {
@@ -212,19 +232,13 @@ fn nsdata_to_vec(data: &objc2_foundation::NSData) -> Option<Vec<u8>> {
 }
 
 fn nsdata_to_vec_with_limit(data: &objc2_foundation::NSData, max_bytes: usize) -> Option<Vec<u8>> {
-    let len = data.length();
-    if len > max_bytes {
+    // Use `as_bytes()` to get a single-snapshot slice, avoiding TOCTOU between
+    // `length()` and `getBytes_length()` if NSData is mutated concurrently.
+    let bytes = data.as_bytes();
+    if bytes.len() > max_bytes {
         return None;
     }
-    let mut bytes = vec![0u8; len];
-    // SAFETY: `bytes` is allocated to exactly `len` bytes above.
-    unsafe {
-        data.getBytes_length(
-            std::ptr::NonNull::new(bytes.as_mut_ptr().cast()).unwrap(),
-            len,
-        );
-    }
-    Some(bytes)
+    Some(bytes.to_vec())
 }
 
 fn read_pasteboard_image() -> Option<Vec<u8>> {
@@ -249,6 +263,7 @@ fn read_pasteboard_image() -> Option<Vec<u8>> {
 /// Maximum TIFF data size to process (32 MiB).
 const MAX_TIFF_BYTES: usize = 32 * 1024 * 1024;
 
+#[allow(unsafe_code)]
 fn tiff_data_to_dib(tiff_data: &objc2_foundation::NSData) -> Option<Vec<u8>> {
     use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
     use objc2_foundation::NSDictionary;

@@ -33,10 +33,9 @@ mod x11;
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 mod wayland;
 
-// macOS backend uses unsafe for NSData::getBytes_length and
-// NSBitmapImageRep::representationUsingType_properties FFI calls.
+// macOS backend uses unsafe for GCD dispatch and NSBitmapImageRep FFI calls.
+// Individual functions use #[allow(unsafe_code)] rather than the whole module.
 #[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
 mod macos;
 
 use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, LongFormatName};
@@ -102,8 +101,8 @@ impl CliprdrBackend for NativeClipboard {
         self.inner.on_format_data_request(format_id)
     }
 
-    fn on_format_data_response(&mut self, data: &[u8], is_success: bool) {
-        self.inner.on_format_data_response(data, is_success);
+    fn on_format_data_response(&mut self, data: &[u8], is_success: bool, format_id: Option<u32>) {
+        self.inner.on_format_data_response(data, is_success, format_id);
     }
 
     fn on_file_contents_request(
@@ -126,9 +125,14 @@ impl CliprdrBackend for NativeClipboard {
     }
 }
 
+// Note: The trait now provides default implementations for on_file_contents_request,
+// on_file_contents_response, on_lock, and on_unlock. We still override them here to
+// delegate to the platform-specific implementations for consistency.
+
 #[cfg(test)]
 mod tests {
     use super::common::*;
+    use justrdp_cliprdr::pdu::format_id::{CF_TEXT, CF_UNICODETEXT};
 
     #[test]
     fn common_roundtrip_unicode() {

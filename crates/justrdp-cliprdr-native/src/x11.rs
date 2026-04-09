@@ -77,12 +77,13 @@ impl X11Clipboard {
     }
 
     /// Decode server data and write to the X11 CLIPBOARD selection.
-    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool) {
+    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool, format_id: Option<u32>) {
         if !is_success {
             return;
         }
 
-        if looks_like_dib(data) {
+        // Use the negotiated format_id when available; fall back to content heuristic.
+        if format_id == Some(common::CF_DIB) || (format_id.is_none() && looks_like_dib(data)) {
             if let Some(bmp) = dib_to_bmp(data) {
                 if let Some(atom) = intern_bmp_atom(&self.clip.setter.connection) {
                     let atoms = &self.clip.setter.atoms;

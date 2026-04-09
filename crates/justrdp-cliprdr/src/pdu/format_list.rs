@@ -240,6 +240,9 @@ impl FormatListPdu {
         if use_long_format_names {
             // Read exactly data_len bytes and decode within that boundary
             // to prevent overreading into the next PDU.
+            // Note: Each LongFormatName has a minimum wire size of 6 bytes
+            // (formatId:4 + null terminator:2), so MAX_FORMAT_LIST_DATA_LEN
+            // caps this at ~49 152 entries. No separate entry count limit needed.
             let data = src.read_slice(data_len, "FormatListPdu::longFormatData")?;
             let mut sub = ReadCursor::new(data);
             let mut entries = Vec::new();
@@ -268,24 +271,36 @@ impl FormatListPdu {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatListResponsePdu {
     /// Whether the format list was accepted.
-    pub is_ok: bool,
+    pub accepted: bool,
 }
 
 impl FormatListResponsePdu {
     /// Create a successful response.
     pub fn ok() -> Self {
-        Self { is_ok: true }
+        Self { accepted: true }
     }
 
     /// Create a failed response.
     pub fn fail() -> Self {
-        Self { is_ok: false }
+        Self { accepted: false }
+    }
+}
+
+impl FormatListResponsePdu {
+    /// Decode from the clipboard header flags.
+    ///
+    /// The response PDU has no body; the accept/reject state is encoded
+    /// in the header's `msgFlags` field.
+    pub fn decode_from_flags(msg_flags: ClipboardMsgFlags) -> Self {
+        Self {
+            accepted: msg_flags.contains(ClipboardMsgFlags::CB_RESPONSE_OK),
+        }
     }
 }
 
 impl Encode for FormatListResponsePdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let flags = if self.is_ok {
+        let flags = if self.accepted {
             ClipboardMsgFlags::CB_RESPONSE_OK
         } else {
             ClipboardMsgFlags::CB_RESPONSE_FAIL

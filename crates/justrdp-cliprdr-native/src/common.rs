@@ -2,13 +2,11 @@
 //!
 //! Handles RDP clipboard format ID mapping and UTF-16LE ↔ UTF-8 conversion.
 
+// Re-export format IDs from the canonical source (MS-RDPECLIP 1.3.1.2).
+pub(crate) use justrdp_cliprdr::pdu::format_id::{CF_DIB, CF_TEXT, CF_UNICODETEXT};
+
 use justrdp_cliprdr::pdu::LongFormatName;
 use justrdp_cliprdr::{ClipboardResult, FormatListResponse};
-
-// Standard clipboard format IDs -- MS-RDPECLIP 2.2.1
-pub const CF_TEXT: u32 = 0x0001;
-pub const CF_DIB: u32 = 0x0008;
-pub const CF_UNICODETEXT: u32 = 0x000D;
 
 /// Maximum clipboard data size (4 MiB). Applied to both read and decode paths.
 pub(crate) const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
@@ -119,7 +117,11 @@ pub fn looks_like_dib(data: &[u8]) -> bool {
         return false;
     }
     let bi_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if (bi_size as usize) < BITMAPINFOHEADER_SIZE || (bi_size as usize) > data.len() {
+    let bi_size_usize = match usize::try_from(bi_size) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if bi_size_usize < BITMAPINFOHEADER_SIZE || bi_size_usize > data.len() {
         return false;
     }
     // Validate biBitCount (offset 14-15 in BITMAPINFOHEADER)
@@ -127,17 +129,28 @@ pub fn looks_like_dib(data: &[u8]) -> bool {
     VALID_BIT_COUNTS.contains(&bit_count)
 }
 
+/// BI_BITFIELDS compression — 3 DWORD color masks (12 bytes) before pixel data.
+const BI_BITFIELDS: u32 = 3;
+
 /// Compute the color table size in bytes for a DIB header.
 ///
 /// For biBitCount <= 8, the color table has `biClrUsed` entries (or
 /// `1 << biBitCount` if biClrUsed is 0). Each entry is 4 bytes (RGBQUAD).
+///
+/// For 16/32-bit with BI_BITFIELDS compression, 3 DWORD color masks (12 bytes)
+/// precede the pixel data (MS-WMF 2.2.2.3).
 fn color_table_size(dib: &[u8]) -> Option<u32> {
     if dib.len() < BITMAPINFOHEADER_SIZE {
-        return Some(0);
+        return None;
     }
     let bit_count = u16::from_le_bytes([dib[14], dib[15]]);
     if bit_count > 8 {
-        return Some(0); // No color table for 16/24/32-bit
+        // For 16bpp and 32bpp with BI_BITFIELDS, there are 3 DWORD color masks.
+        let compression = u32::from_le_bytes([dib[16], dib[17], dib[18], dib[19]]);
+        if compression == BI_BITFIELDS && (bit_count == 16 || bit_count == 32) {
+            return Some(12); // 3 × 4-byte color masks
+        }
+        return Some(0);
     }
     let clr_used = u32::from_le_bytes([dib[32], dib[33], dib[34], dib[35]]);
     let entries = if clr_used > 0 {
@@ -160,7 +173,8 @@ pub fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     }
 
     let bi_size = u32::from_le_bytes(dib[0..4].try_into().ok()?);
-    if (bi_size as usize) < BITMAPINFOHEADER_SIZE || (bi_size as usize) > dib.len() {
+    let bi_size_usize = usize::try_from(bi_size).ok()?;
+    if bi_size_usize < BITMAPINFOHEADER_SIZE || bi_size_usize > dib.len() {
         return None;
     }
 
@@ -198,7 +212,12 @@ pub fn bmp_to_dib(bmp: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Tries `CF_UNICODETEXT` first when the buffer length is even (UTF-16LE
 /// requires byte pairs), then falls back to `CF_TEXT`.
-pub fn rdp_bytes_to_utf8(data: &[u8]) -> Option<String> {
+///
+/// **Ambiguity note**: An even-length ASCII buffer that happens to be valid
+/// UTF-16LE will be decoded as Unicode rather than ANSI. This is acceptable
+/// because the only caller is the `on_format_data_response` fallback path
+/// when the negotiated `format_id` is unavailable.
+pub(crate) fn rdp_bytes_to_utf8(data: &[u8]) -> Option<String> {
     if data.len() % 2 == 0 {
         rdp_to_utf8(data, CF_UNICODETEXT).or_else(|| rdp_to_utf8(data, CF_TEXT))
     } else {
@@ -419,6 +438,67 @@ mod tests {
     }
 
     #[test]
+    fn dib_to_bmp_bi_bitfields_16bpp() {
+        // 16bpp BI_BITFIELDS DIB — color masks (12 bytes) before pixel data.
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&1i32.to_le_bytes()); // biWidth
+        dib.extend_from_slice(&1i32.to_le_bytes()); // biHeight
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&16u16.to_le_bytes()); // biBitCount = 16
+        dib.extend_from_slice(&3u32.to_le_bytes()); // biCompression = BI_BITFIELDS
+        dib.extend_from_slice(&4u32.to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        // Color masks: R=0xF800, G=0x07E0, B=0x001F (3 × 4 bytes = 12)
+        dib.extend_from_slice(&0x0000_F800u32.to_le_bytes());
+        dib.extend_from_slice(&0x0000_07E0u32.to_le_bytes());
+        dib.extend_from_slice(&0x0000_001Fu32.to_le_bytes());
+        // Pixel data: 1 pixel (2 bytes) + 2 padding = 4 bytes
+        dib.extend_from_slice(&[0xFF, 0x7F, 0x00, 0x00]);
+
+        let bmp = dib_to_bmp(&dib).unwrap();
+        // bfOffBits = 14 (file header) + 40 (info header) + 12 (color masks) = 66
+        let bf_off_bits = u32::from_le_bytes(bmp[10..14].try_into().unwrap());
+        assert_eq!(bf_off_bits, 66);
+
+        // Roundtrip
+        let recovered = bmp_to_dib(&bmp).unwrap();
+        assert_eq!(recovered, dib);
+    }
+
+    #[test]
+    fn dib_to_bmp_bi_rgb_24bpp_no_color_masks() {
+        // 24bpp BI_RGB — no color masks.
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&1i32.to_le_bytes()); // biWidth
+        dib.extend_from_slice(&1i32.to_le_bytes()); // biHeight
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&24u16.to_le_bytes()); // biBitCount = 24
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+        dib.extend_from_slice(&4u32.to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        dib.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00]); // 1 pixel BGR + pad
+
+        let bmp = dib_to_bmp(&dib).unwrap();
+        // bfOffBits = 14 + 40 + 0 = 54 (no color table for 24-bit BI_RGB)
+        let bf_off_bits = u32::from_le_bytes(bmp[10..14].try_into().unwrap());
+        assert_eq!(bf_off_bits, 54);
+    }
+
+    #[test]
+    fn color_table_size_short_input_returns_none() {
+        // Input shorter than BITMAPINFOHEADER should return None.
+        assert!(color_table_size(&[0u8; 39]).is_none());
+    }
+
+    #[test]
     fn color_table_overflow_rejected() {
         // biClrUsed = 0x40000001 would overflow entries*4. Should return None.
         let mut dib = vec![0u8; 44];
@@ -455,6 +535,46 @@ mod tests {
     #[test]
     fn looks_like_dib_too_short() {
         assert!(!looks_like_dib(&[0u8; 39]));
+    }
+
+    // ── rdp_bytes_to_utf8 tests ──
+
+    #[test]
+    fn rdp_bytes_to_utf8_even_utf16le() {
+        // "Hi" in UTF-16LE + null = even-length, decodes as CF_UNICODETEXT
+        let data = [0x48, 0x00, 0x69, 0x00, 0x00, 0x00];
+        let result = rdp_bytes_to_utf8(&data).unwrap();
+        assert_eq!(result, "Hi");
+    }
+
+    #[test]
+    fn rdp_bytes_to_utf8_odd_length_falls_back_to_text() {
+        // Odd-length buffer → must use CF_TEXT path
+        let data = b"Hello";
+        let result = rdp_bytes_to_utf8(data).unwrap();
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn rdp_bytes_to_utf8_even_ascii_decoded_as_utf16() {
+        // "AB" in UTF-16LE = [0x41, 0x00, 0x42, 0x00] — even-length
+        let data = [0x41, 0x00, 0x42, 0x00];
+        let result = rdp_bytes_to_utf8(&data).unwrap();
+        // Should decode as UTF-16LE first → "AB"
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn rdp_bytes_to_utf8_oversized_returns_none() {
+        let data = vec![0u8; 5 * 1024 * 1024]; // 5 MiB > 4 MiB limit
+        assert!(rdp_bytes_to_utf8(&data).is_none());
+    }
+
+    #[test]
+    fn rdp_bytes_to_utf8_empty() {
+        let result = rdp_bytes_to_utf8(&[]);
+        // Empty even-length buffer → CF_UNICODETEXT with empty string
+        assert_eq!(result, Some(String::new()));
     }
 
     #[test]

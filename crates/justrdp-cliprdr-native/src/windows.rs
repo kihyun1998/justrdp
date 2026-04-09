@@ -52,17 +52,17 @@ impl WindowsClipboard {
     }
 
     /// Decode server data and write to the local clipboard.
-    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool) {
+    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool, format_id: Option<u32>) {
         if !is_success {
             return;
         }
 
-        if looks_like_dib(data) {
+        // Use the negotiated format_id when available; fall back to content heuristic.
+        if format_id == Some(common::CF_DIB) || (format_id.is_none() && looks_like_dib(data)) {
             let _ = set_clipboard(Bitmap, data);
             return;
         }
 
-        // Fall back to text
         if let Some(text) = rdp_bytes_to_utf8(data) {
             let _ = set_clipboard(Unicode, &text);
         }
@@ -76,8 +76,6 @@ impl WindowsClipboard {
     }
 
     pub fn on_file_contents_response(&mut self, _response: &FileContentsResponsePdu) {}
-
     pub fn on_lock(&mut self, _lock_id: u32) {}
-
     pub fn on_unlock(&mut self, _lock_id: u32) {}
 }
