@@ -11,8 +11,6 @@ keywords = ["rdp", "audio-input", "capture"]
 categories = ["multimedia::audio"]
 
 [dependencies]
-justrdp-rdpeai = { workspace = true, features = ["std"] }
-justrdp-rdpsnd = { workspace = true, features = ["std"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [

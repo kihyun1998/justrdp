@@ -31,6 +31,11 @@ impl AudioCaptureBackend for WaveInCapture {
     fn open(config: &AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
         config.validate()?;
 
+        if config.bits_per_sample != 16 {
+            return Err(AudioCaptureError::FormatNotSupported);
+        }
+
+        // bits_per_sample is guaranteed byte-aligned and non-zero by validate().
         let block_align = config
             .channels
             .checked_mul(config.bits_per_sample / 8)
@@ -74,7 +79,8 @@ impl AudioCaptureBackend for WaveInCapture {
         let buf_len = u32::try_from(buf.len())
             .map_err(|_| AudioCaptureError::ReadError("buffer too large".into()))?;
 
-        let header_size = std::mem::size_of::<WAVEHDR>() as u32;
+        let header_size = u32::try_from(std::mem::size_of::<WAVEHDR>())
+            .map_err(|_| AudioCaptureError::ReadError("WAVEHDR size overflow".into()))?;
 
         let mut header = WAVEHDR {
             lpData: buf.as_mut_ptr(),
@@ -99,6 +105,12 @@ impl AudioCaptureBackend for WaveInCapture {
             // SAFETY: header was successfully prepared.
             let res = waveInAddBuffer(self.handle, &mut header, header_size);
             if res != MMSYSERR_NOERROR {
+                // If recording was active, stop the device to avoid silent data
+                // loss from a running device with no buffers queued.
+                if self.started {
+                    waveInStop(self.handle);
+                    self.started = false;
+                }
                 waveInUnprepareHeader(self.handle, &mut header, header_size);
                 return Err(AudioCaptureError::ReadError(format!(
                     "waveInAddBuffer failed: {res}"
@@ -122,16 +134,18 @@ impl AudioCaptureBackend for WaveInCapture {
 
             // Poll for WHDR_DONE with 5-second timeout.
             // SAFETY: The waveIn driver writes `dwFlags` from outside the Rust
-            // memory model. We use `addr_of!` + `read_unaligned` to avoid
+            // memory model. We use `addr_of!` + `read_volatile` to avoid
             // forming a `&` reference to a field under concurrent OS mutation
-            // (Stacked Borrows aliasing rules). An acquire fence ensures the
-            // compiler does not hoist or elide the read.
+            // (Stacked Borrows aliasing rules). `read_volatile` forces a
+            // re-read each iteration — without it, the compiler may hoist the
+            // load out of the loop in release builds. The acquire fence
+            // provides additional ordering for dependent data (dwBytesRecorded).
             let flags_ptr = ptr::addr_of!(header.dwFlags);
             let mut timed_out = false;
             let mut iters = 0u32;
             loop {
                 atomic::fence(Ordering::Acquire);
-                if ptr::read_unaligned(flags_ptr) & WHDR_DONE != 0 {
+                if ptr::read_volatile(flags_ptr) & WHDR_DONE != 0 {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(WAVEIN_POLL_INTERVAL_MS));
@@ -148,7 +162,7 @@ impl AudioCaptureBackend for WaveInCapture {
             }
 
             let recorded_ptr = ptr::addr_of!(header.dwBytesRecorded);
-            let bytes_recorded = (ptr::read_unaligned(recorded_ptr) as usize).min(buf.len());
+            let bytes_recorded = (ptr::read_volatile(recorded_ptr) as usize).min(buf.len());
 
             // SAFETY: unprepare the header to release driver resources.
             waveInUnprepareHeader(self.handle, &mut header, header_size);
@@ -186,3 +200,65 @@ impl Drop for WaveInCapture {
 // SAFETY: HWAVEIN is a raw handle. waveIn API is safe from any thread
 // with exclusive access, enforced by &mut self on all methods.
 unsafe impl Send for WaveInCapture {}
+
+#[cfg(test)]
+mod tests {
+    use crate::{AudioCaptureBackend, AudioCaptureConfig};
+    use super::*;
+
+    #[test]
+    fn open_rejects_non_16bit() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 8,
+            frames_per_packet: 1024,
+        };
+        let result = WaveInCapture::open(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_rejects_32bit() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 1,
+            bits_per_sample: 32,
+            frames_per_packet: 512,
+        };
+        let result = WaveInCapture::open(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_rejects_zero_channels() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 0,
+            bits_per_sample: 16,
+            frames_per_packet: 1024,
+        };
+        let result = WaveInCapture::open(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_and_close_succeeds() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 16,
+            frames_per_packet: 1024,
+        };
+        match WaveInCapture::open(&config) {
+            Ok(mut capture) => {
+                capture.close();
+                // Double close should be safe (no-op).
+                capture.close();
+            }
+            Err(_) => {
+                // CI environments may not have an audio input device — skip.
+            }
+        }
+    }
+}

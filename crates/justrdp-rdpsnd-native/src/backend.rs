@@ -18,9 +18,6 @@ const DECODE_BUFFER_SECS: usize = 2;
 /// Maximum decoded PCM buffer size in samples.
 const MAX_DECODE_SAMPLES: usize = MAX_SAMPLE_RATE_HZ * MAX_CHANNELS * DECODE_BUFFER_SECS;
 
-/// Maximum iterations for waveOut busy-wait (5 seconds at 1ms sleep).
-pub(crate) const MAX_WRITE_WAIT_ITERS: u32 = 5_000;
-
 /// Codec tags we can decode (PCM, MS-ADPCM, IMA-ADPCM).
 fn is_decodable(format: &AudioFormat) -> bool {
     matches!(
@@ -42,6 +39,10 @@ pub struct NativeAudioBackend<O: NativeAudioOutput> {
     decoders: HashMap<u16, Box<dyn AudioDecoder>>,
     /// Platform audio output device (lazily opened on first audio data).
     output: Option<O>,
+    /// Sample rate of the currently open output device.
+    output_sample_rate: u32,
+    /// Channel count of the currently open output device.
+    output_channels: u16,
     /// Reusable decode buffer.
     decode_buf: Vec<i16>,
 }
@@ -59,6 +60,8 @@ impl<O: NativeAudioOutput> NativeAudioBackend<O> {
             format_map: HashMap::new(),
             decoders: HashMap::new(),
             output: None,
+            output_sample_rate: 0,
+            output_channels: 0,
             decode_buf: vec![0i16; MAX_DECODE_SAMPLES],
         }
     }
@@ -95,6 +98,10 @@ impl<O: NativeAudioOutput + 'static> RdpsndBackend for NativeAudioBackend<O> {
 
         let mut supported_indices = Vec::new();
         for (i, format) in server_formats.iter().enumerate() {
+            // Server format index must fit in u16 (MS-RDPEA format_no field).
+            if i > u16::MAX as usize {
+                break;
+            }
             if is_decodable(format) {
                 supported_indices.push(i);
                 // Store with the server's original index as key
@@ -107,7 +114,8 @@ impl<O: NativeAudioOutput + 'static> RdpsndBackend for NativeAudioBackend<O> {
 
     fn on_wave_data(&mut self, format_no: u16, data: &[u8], _audio_timestamp: Option<u32>) {
         // Ensure decoder exists for this server format index
-        if self.ensure_decoder(format_no).is_err() {
+        if let Err(e) = self.ensure_decoder(format_no) {
+            eprintln!("[rdpsnd-native] failed to create decoder for format {format_no}: {e}");
             return;
         }
 
@@ -122,27 +130,54 @@ impl<O: NativeAudioOutput + 'static> RdpsndBackend for NativeAudioBackend<O> {
 
         let n_samples = match decoder.decode(data, &mut self.decode_buf) {
             Ok(n) => n,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("[rdpsnd-native] decode failed for format {format_no}: {e}");
+                return;
+            }
         };
 
         if n_samples == 0 {
             return;
         }
 
-        // Clamp to buffer size to prevent out-of-bounds
+        debug_assert!(
+            n_samples <= self.decode_buf.len(),
+            "decoder returned {n_samples} samples but buffer is {}",
+            self.decode_buf.len()
+        );
         let n_samples = n_samples.min(self.decode_buf.len());
 
-        // Ensure output is open
+        // If format changed (different sample rate or channel count), close the
+        // current device so it can be reopened with the correct parameters.
+        // MS-RDPEA allows the server to switch format_no between Wave PDUs.
+        if self.output.is_some()
+            && (sample_rate != self.output_sample_rate || channels != self.output_channels)
+        {
+            if let Some(output) = self.output.as_mut() {
+                output.close();
+            }
+            self.output = None;
+        }
+
+        // Ensure output is open with the correct format
         if self.output.is_none() {
             match O::open(sample_rate, channels, 16) {
-                Ok(output) => self.output = Some(output),
-                Err(_) => return,
+                Ok(output) => {
+                    self.output = Some(output);
+                    self.output_sample_rate = sample_rate;
+                    self.output_channels = channels;
+                }
+                Err(e) => {
+                    eprintln!("[rdpsnd-native] failed to open audio device: {e}");
+                    return;
+                }
             }
         }
 
         // Write samples; on failure close device so it can be re-opened next time
         if let Some(output) = self.output.as_mut() {
-            if output.write_samples(&self.decode_buf[..n_samples]).is_err() {
+            if let Err(e) = output.write_samples(&self.decode_buf[..n_samples]) {
+                eprintln!("[rdpsnd-native] write failed: {e}");
                 output.close();
                 self.output = None;
             }
@@ -160,6 +195,8 @@ impl<O: NativeAudioOutput + 'static> RdpsndBackend for NativeAudioBackend<O> {
             output.close();
         }
         self.output = None;
+        self.output_sample_rate = 0;
+        self.output_channels = 0;
         self.decoders.clear();
     }
 }
@@ -296,6 +333,45 @@ mod tests {
 
         let indices = backend.on_server_formats(&formats);
         assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn format_change_reopens_device() {
+        /// Mock output — format change is verified via backend's tracked params.
+        #[derive(Debug)]
+        struct TrackingOutput;
+
+        impl NativeAudioOutput for TrackingOutput {
+            fn open(_sample_rate: u32, _channels: u16, _bits: u16) -> Result<Self, NativeAudioError> {
+                Ok(Self)
+            }
+            fn write_samples(&mut self, _: &[i16]) -> Result<(), NativeAudioError> {
+                Ok(())
+            }
+            fn set_volume(&mut self, _: u16, _: u16) {}
+            fn close(&mut self) {}
+        }
+
+        let mut backend = NativeAudioBackend::<TrackingOutput>::new();
+
+        // Register two different PCM formats
+        let formats = vec![
+            AudioFormat::pcm(2, 44100, 16), // format 0: stereo 44100
+            AudioFormat::pcm(1, 22050, 16), // format 1: mono 22050
+        ];
+        backend.on_server_formats(&formats);
+
+        // Send audio with format 0 → opens device at 44100 Hz stereo
+        backend.on_wave_data(0, &[0x00, 0x01, 0x00, 0x01], None);
+        assert!(backend.output.is_some());
+        assert_eq!(backend.output_sample_rate, 44100);
+        assert_eq!(backend.output_channels, 2);
+
+        // Send audio with format 1 → should reopen device at 22050 Hz mono
+        backend.on_wave_data(1, &[0x00, 0x01], None);
+        assert!(backend.output.is_some());
+        assert_eq!(backend.output_sample_rate, 22050);
+        assert_eq!(backend.output_channels, 1);
     }
 
     #[test]

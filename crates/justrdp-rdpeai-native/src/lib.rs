@@ -139,6 +139,9 @@ pub trait AudioCaptureBackend: Send {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, AudioCaptureError>;
 
     /// Close the capture device and release resources.
+    ///
+    /// This method is idempotent — calling it multiple times is safe and has
+    /// no effect after the first call. `Drop` also calls `close()`.
     fn close(&mut self);
 }
 
@@ -152,6 +155,16 @@ pub type NativeCapture = pulse::PulseAudioCapture;
 
 #[cfg(all(target_os = "macos", feature = "coreaudio"))]
 pub type NativeCapture = coreaudio::CoreAudioCapture;
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(target_os = "linux", feature = "pulseaudio"),
+    all(target_os = "macos", feature = "coreaudio"),
+)))]
+compile_error!(
+    "justrdp-rdpeai-native: no audio capture backend available for this target. \
+     On Linux, enable the `pulseaudio` feature. On macOS, enable `coreaudio`."
+);
 
 #[cfg(test)]
 mod tests {

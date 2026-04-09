@@ -454,8 +454,6 @@ name = "justrdp-rdpeai-native"
 version = "0.1.0"
 dependencies = [
  "coreaudio-sys",
- "justrdp-rdpeai",
- "justrdp-rdpsnd",
  "libpulse-binding",
  "libpulse-simple-binding",
  "windows-sys 0.59.0",

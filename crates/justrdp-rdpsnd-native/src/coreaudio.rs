@@ -1,5 +1,7 @@
 //! CoreAudio audio output backend for macOS.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use std::collections::VecDeque;
 use std::ptr;
 use std::sync::{Condvar, Mutex};
@@ -80,19 +82,19 @@ pub struct CoreAudioOutput {
     queue: AudioQueueRef,
     /// Buffer pool shared with the output callback. Boxed for stable address.
     pool: Box<BufferPool>,
-    _sample_rate: u32,
-    _channels: u16,
 }
 
 // SAFETY: `AudioQueueRef` is a pointer to an OS-managed opaque type.
 // CoreAudio audio queues can be used from any thread once created;
 // the AudioQueue API is documented as thread-safe for enqueue operations.
 // `pool` is behind a Mutex and Condvar, which are Send+Sync.
+// NOTE: `Sync` is intentionally NOT implemented — concurrent calls via `&self`
+// are not safe because AudioQueue operations on the same queue are not re-entrant.
 unsafe impl Send for CoreAudioOutput {}
 
 impl NativeAudioOutput for CoreAudioOutput {
     fn open(sample_rate: u32, channels: u16, bits_per_sample: u16) -> NativeAudioResult<Self> {
-        if bits_per_sample != 16 {
+        if bits_per_sample != 16 || channels == 0 || sample_rate == 0 {
             return Err(NativeAudioError::FormatNotSupported);
         }
 
@@ -182,12 +184,7 @@ impl NativeAudioOutput for CoreAudioOutput {
             )));
         }
 
-        Ok(Self {
-            queue,
-            pool,
-            _sample_rate: sample_rate,
-            _channels: channels,
-        })
+        Ok(Self { queue, pool })
     }
 
     fn write_samples(&mut self, samples: &[i16]) -> NativeAudioResult<()> {
@@ -195,7 +192,9 @@ impl NativeAudioOutput for CoreAudioOutput {
             return Ok(());
         }
 
-        let byte_size = samples.len() * 2;
+        let byte_size = samples.len().checked_mul(std::mem::size_of::<i16>()).ok_or_else(|| {
+            NativeAudioError::WriteError("sample buffer size overflow".into())
+        })?;
 
         let byte_size_u32 = u32::try_from(byte_size).map_err(|_| {
             NativeAudioError::WriteError(format!(
@@ -205,7 +204,7 @@ impl NativeAudioOutput for CoreAudioOutput {
 
         if byte_size_u32 > BUFFER_SIZE {
             // Split into chunks that fit in a single pool buffer.
-            let chunk_samples = (BUFFER_SIZE as usize) / 2;
+            let chunk_samples = (BUFFER_SIZE as usize) / std::mem::size_of::<i16>();
             for chunk in samples.chunks(chunk_samples) {
                 self.write_samples_single(chunk)?;
             }
@@ -249,7 +248,9 @@ impl CoreAudioOutput {
     ///
     /// The chunk must fit within `BUFFER_SIZE` bytes.
     fn write_samples_single(&mut self, samples: &[i16]) -> NativeAudioResult<()> {
-        let byte_size = samples.len() * 2;
+        let byte_size = samples.len().checked_mul(std::mem::size_of::<i16>()).ok_or_else(|| {
+            NativeAudioError::WriteError("chunk size overflow".into())
+        })?;
         debug_assert!(byte_size <= BUFFER_SIZE as usize, "chunk too large for buffer pool");
 
         // Wait for an available buffer from the pool, with timeout.
@@ -283,9 +284,14 @@ impl CoreAudioOutput {
         // `BUFFER_SIZE` bytes of capacity. `byte_size <= BUFFER_SIZE` is guaranteed
         // by the caller (`write_samples` splits larger inputs into chunks).
         unsafe {
+            debug_assert!(
+                byte_size <= (*buffer).mAudioDataBytesCapacity as usize,
+                "byte_size ({byte_size}) exceeds buffer capacity ({})",
+                (*buffer).mAudioDataBytesCapacity
+            );
             let buf_data = (*buffer).mAudioData as *mut u8;
             ptr::copy_nonoverlapping(samples.as_ptr() as *const u8, buf_data, byte_size);
-            (*buffer).mAudioDataByteSize = byte_size as u32;
+            (*buffer).mAudioDataByteSize = u32::try_from(byte_size).expect("byte_size exceeds u32 — contract violated");
         }
 
         // SAFETY: Enqueuing a properly filled buffer into a valid queue.
@@ -311,5 +317,61 @@ impl CoreAudioOutput {
 impl Drop for CoreAudioOutput {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify volume averaging formula: (left + right) / (2 * 65535) → 0.0..=1.0.
+    #[test]
+    fn volume_average_boundaries() {
+        // Both mute → 0.0
+        let avg = ((0u16 as f32) + (0u16 as f32)) / (2.0 * 65535.0);
+        assert_eq!(avg, 0.0);
+
+        // Both max → 1.0
+        let avg = ((0xFFFFu16 as f32) + (0xFFFFu16 as f32)) / (2.0 * 65535.0);
+        assert!((avg - 1.0).abs() < f32::EPSILON);
+
+        // Left max, right mute → 0.5
+        let avg = ((0xFFFFu16 as f32) + (0u16 as f32)) / (2.0 * 65535.0);
+        assert!((avg - 0.5).abs() < 0.001);
+
+        // Mid-point both channels → 0.5
+        let avg = ((0x7FFFu16 as f32) + (0x8000u16 as f32)) / (2.0 * 65535.0);
+        assert!((avg - 0.5).abs() < 0.001);
+    }
+
+    /// Verify open() rejects invalid formats.
+    #[test]
+    fn open_rejects_invalid_formats() {
+        // Non-16-bit
+        assert!(CoreAudioOutput::open(44100, 2, 8).is_err());
+        // Zero channels
+        assert!(CoreAudioOutput::open(44100, 0, 16).is_err());
+        // Zero sample rate
+        assert!(CoreAudioOutput::open(0, 2, 16).is_err());
+    }
+
+    /// Verify chunk splitting boundary: samples exactly at BUFFER_SIZE should not split.
+    #[test]
+    fn chunk_split_boundary() {
+        let chunk_samples = (BUFFER_SIZE as usize) / std::mem::size_of::<i16>();
+        // Exactly BUFFER_SIZE bytes → should NOT trigger splitting
+        assert_eq!(chunk_samples * std::mem::size_of::<i16>(), BUFFER_SIZE as usize);
+
+        // One more sample → should trigger splitting into 2 chunks
+        let samples = chunk_samples + 1;
+        let byte_size = samples * std::mem::size_of::<i16>();
+        assert!(byte_size > BUFFER_SIZE as usize);
+
+        // Verify chunks iterator produces correct count
+        let data = vec![0i16; samples];
+        let chunks: Vec<_> = data.chunks(chunk_samples).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), chunk_samples);
+        assert_eq!(chunks[1].len(), 1);
     }
 }

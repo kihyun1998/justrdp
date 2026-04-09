@@ -6,9 +6,11 @@
 //!
 //! # Platform Support
 //!
-//! - **Windows**: waveOut API (always available)
-//! - **Linux**: PulseAudio/PipeWire (feature `pulseaudio`)
-//! - **macOS**: CoreAudio (feature `coreaudio`)
+//! - **Windows**: waveOut API (enabled automatically on `cfg(windows)`)
+//! - **Linux**: PulseAudio/PipeWire (requires feature `pulseaudio`)
+//! - **macOS**: CoreAudio (requires feature `coreaudio`)
+//!
+//! On unsupported platforms, the `PlatformAudioBackend` type alias is not defined.
 //!
 //! # Example
 //!
@@ -24,7 +26,7 @@ mod backend;
 mod error;
 mod output;
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 mod wasapi;
 
 #[cfg(all(target_os = "linux", feature = "pulseaudio"))]
@@ -39,7 +41,7 @@ pub use output::NativeAudioOutput;
 
 // Platform-specific type aliases for convenient use.
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 pub type PlatformAudioBackend = NativeAudioBackend<wasapi::WaveOutOutput>;
 
 #[cfg(all(target_os = "linux", feature = "pulseaudio"))]

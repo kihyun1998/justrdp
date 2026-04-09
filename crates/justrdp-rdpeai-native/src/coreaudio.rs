@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::ptr;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coreaudio_sys::{
     AudioQueueAllocateBuffer, AudioQueueBufferRef, AudioQueueDispose, AudioQueueEnqueueBuffer,
@@ -16,12 +16,15 @@ use crate::{AudioCaptureBackend, AudioCaptureConfig, AudioCaptureError};
 // Audio format constants from CoreAudio headers.
 // `kAudioFormatLinearPCM` = 'lpcm' = 0x6C70636D
 // Reference: CoreAudio/CoreAudioTypes.h — kAudioFormatLinearPCM
-const K_AUDIO_FORMAT_LINEAR_PCM: u32 = 0x6C70_636D;
+const AUDIO_FORMAT_LINEAR_PCM: u32 = 0x6C70_636D;
 
 // Linear PCM format flags.
 // Reference: CoreAudio/CoreAudioTypes.h — kAudioFormatFlagIsSignedInteger, kAudioFormatFlagIsPacked
-const K_LINEAR_PCM_FORMAT_FLAG_IS_SIGNED_INTEGER: u32 = 1 << 2;
-const K_LINEAR_PCM_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
+// kAudioFormatFlagIsBigEndian (1 << 1) is intentionally absent → little-endian output,
+// matching MS-RDPEAI's expected PCM byte order.
+// kAudioFormatFlagIsFloat (1 << 0) is also absent → signed integer, not floating-point.
+const LINEAR_PCM_FORMAT_FLAG_IS_SIGNED_INTEGER: u32 = 1 << 2;
+const LINEAR_PCM_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
 
 /// Number of AudioQueue buffers for continuous recording.
 const NUM_AUDIO_QUEUE_BUFFERS: usize = 3;
@@ -78,10 +81,13 @@ unsafe extern "C" fn input_callback(
 
     // SAFETY: `buffer` is a valid AudioQueueBuffer filled by CoreAudio.
     // `mAudioData` points to `mAudioDataByteSize` bytes of captured PCM data.
+    // Clamp to `mAudioDataCapacityInBytes` to guard against a buggy driver
+    // reporting more bytes than the buffer can hold (prevents OOB read).
     let (data_ptr, data_len) = unsafe {
+        let cap = (*buffer).mAudioDataCapacityInBytes as usize;
         (
             (*buffer).mAudioData as *const u8,
-            (*buffer).mAudioDataByteSize as usize,
+            ((*buffer).mAudioDataByteSize as usize).min(cap),
         )
     };
     let slice = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
@@ -90,24 +96,34 @@ unsafe extern "C" fn input_callback(
     // the mutex is poisoned (e.g., if the consumer thread panicked).
     if let Ok(mut ring) = shared.data.lock() {
         // Enforce ring buffer capacity: drop oldest data if full.
-        let available = shared.ring_cap.saturating_sub(ring.len());
-        if slice.len() <= available {
-            ring.extend(slice);
+        if slice.len() >= shared.ring_cap {
+            // Single callback delivers more data than the entire ring — keep newest.
+            ring.clear();
+            ring.extend(&slice[slice.len() - shared.ring_cap..]);
         } else {
-            // Drop oldest bytes to make room.
-            let need = slice.len().saturating_sub(available);
-            ring.drain(..need);
-            ring.extend(slice);
+            let available = shared.ring_cap.saturating_sub(ring.len());
+            if slice.len() <= available {
+                ring.extend(slice);
+            } else {
+                // Drop oldest bytes to make room.
+                let need = slice.len().saturating_sub(available);
+                ring.drain(..need);
+                ring.extend(slice);
+            }
         }
         shared.condvar.notify_one();
-    }
-    // If lock fails (poisoned), silently drop the audio data rather than panicking.
 
-    // SAFETY: Re-enqueuing the same buffer back into the valid audio queue
-    // so CoreAudio can fill it again for continuous recording.
-    unsafe {
-        AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null());
+        // SAFETY: Re-enqueuing the same buffer back into the valid audio queue
+        // so CoreAudio can fill it again for continuous recording.
+        // Only re-enqueue when the lock succeeded; on poisoned mutex we let
+        // the buffer stay un-enqueued so recording stalls rather than risking
+        // a use-after-free race with close().
+        unsafe {
+            AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null());
+        }
     }
+    // If lock fails (poisoned), silently drop the audio data and do not
+    // re-enqueue. Recording will stall, and read() will return a timeout error.
 }
 
 impl AudioCaptureBackend for CoreAudioCapture {
@@ -125,9 +141,9 @@ impl AudioCaptureBackend for CoreAudioCapture {
 
         let format = AudioStreamBasicDescription {
             mSampleRate: config.sample_rate as f64,
-            mFormatID: K_AUDIO_FORMAT_LINEAR_PCM,
-            mFormatFlags: K_LINEAR_PCM_FORMAT_FLAG_IS_SIGNED_INTEGER
-                | K_LINEAR_PCM_FORMAT_FLAG_IS_PACKED,
+            mFormatID: AUDIO_FORMAT_LINEAR_PCM,
+            mFormatFlags: LINEAR_PCM_FORMAT_FLAG_IS_SIGNED_INTEGER
+                | LINEAR_PCM_FORMAT_FLAG_IS_PACKED,
             mBytesPerPacket: bytes_per_frame,
             mFramesPerPacket: 1,
             mBytesPerFrame: bytes_per_frame,
@@ -140,6 +156,11 @@ impl AudioCaptureBackend for CoreAudioCapture {
         let ring_cap = packet_size
             .checked_mul(RING_BUFFER_MAX_PACKETS)
             .ok_or(AudioCaptureError::FormatNotSupported)?;
+
+        // Validate buf_size fits u32 before creating any OS resources,
+        // so we don't need mid-open() cleanup if this fails.
+        let buf_size = u32::try_from(packet_size)
+            .map_err(|_| AudioCaptureError::FormatNotSupported)?;
 
         let shared = Arc::new(SharedBuffer {
             data: Mutex::new(VecDeque::new()),
@@ -180,64 +201,73 @@ impl AudioCaptureBackend for CoreAudioCapture {
         }
 
         // Allocate and enqueue buffers for continuous recording.
-        let buf_size = u32::try_from(packet_size)
-            .map_err(|_| AudioCaptureError::FormatNotSupported)?;
+        // (`buf_size` was validated above, before any OS resources were created.)
+        //
+        // Scope guard: on any error path below, dispose the queue and reclaim
+        // the Arc raw pointer. This eliminates duplicated teardown code.
+        let mut queue_armed = true;
 
-        for _ in 0..NUM_AUDIO_QUEUE_BUFFERS {
-            let mut buffer: AudioQueueBufferRef = ptr::null_mut();
+        let result = (|| -> Result<(), AudioCaptureError> {
+            for _ in 0..NUM_AUDIO_QUEUE_BUFFERS {
+                let mut buffer: AudioQueueBufferRef = ptr::null_mut();
 
-            // SAFETY: Allocating a buffer from a valid audio queue.
-            let alloc_status = unsafe {
-                AudioQueueAllocateBuffer(queue, buf_size, &mut buffer)
-            };
+                // SAFETY: Allocating a buffer from a valid audio queue.
+                let alloc_status = unsafe {
+                    AudioQueueAllocateBuffer(queue, buf_size, &mut buffer)
+                };
 
-            if alloc_status != 0 {
+                if alloc_status != 0 {
+                    return Err(AudioCaptureError::DeviceError(format!(
+                        "AudioQueueAllocateBuffer failed with status {alloc_status}"
+                    )));
+                }
+
+                // SAFETY: Enqueuing a freshly allocated buffer into the valid queue.
+                let enqueue_status = unsafe {
+                    AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null())
+                };
+
+                if enqueue_status != 0 {
+                    return Err(AudioCaptureError::DeviceError(format!(
+                        "AudioQueueEnqueueBuffer failed with status {enqueue_status}"
+                    )));
+                }
+            }
+
+            // SAFETY: `queue` is valid after successful `AudioQueueNewInput`.
+            // Passing NULL for the start time means "start immediately".
+            let status = unsafe { AudioQueueStart(queue, ptr::null()) };
+
+            if status != 0 {
+                return Err(AudioCaptureError::DeviceError(format!(
+                    "AudioQueueStart failed with status {status}"
+                )));
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                let _ = queue_armed; // disarm — success, no cleanup needed
+                Ok(Self {
+                    queue,
+                    shared,
+                    shared_raw: shared_ptr,
+                })
+            }
+            Err(e) => {
+                // SAFETY: Disposing the queue frees all its allocated buffers.
+                // Then reclaim the Arc raw pointer leaked via `into_raw`.
+                // (Reaching this arm means the closure returned Err, so the
+                // queue is always live and needs cleanup.)
                 unsafe {
                     AudioQueueDispose(queue, 1);
                     Arc::from_raw(shared_ptr);
                 }
-                return Err(AudioCaptureError::DeviceError(format!(
-                    "AudioQueueAllocateBuffer failed with status {alloc_status}"
-                )));
-            }
-
-            // SAFETY: Enqueuing a freshly allocated buffer into the valid queue.
-            let enqueue_status = unsafe {
-                AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null())
-            };
-
-            if enqueue_status != 0 {
-                unsafe {
-                    AudioQueueDispose(queue, 1);
-                    Arc::from_raw(shared_ptr);
-                }
-                return Err(AudioCaptureError::DeviceError(format!(
-                    "AudioQueueEnqueueBuffer failed with status {enqueue_status}"
-                )));
+                Err(e)
             }
         }
-
-        // SAFETY: `queue` is valid after successful `AudioQueueNewInput`.
-        // Passing NULL for the start time means "start immediately".
-        let status = unsafe { AudioQueueStart(queue, ptr::null()) };
-
-        if status != 0 {
-            // SAFETY: Disposing a valid queue (`1` = immediate, don't drain)
-            // and reclaiming the Arc raw pointer.
-            unsafe {
-                AudioQueueDispose(queue, 1);
-                Arc::from_raw(shared_ptr);
-            }
-            return Err(AudioCaptureError::DeviceError(format!(
-                "AudioQueueStart failed with status {status}"
-            )));
-        }
-
-        Ok(Self {
-            queue,
-            shared,
-            shared_raw: shared_ptr,
-        })
     }
 
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, AudioCaptureError> {
@@ -252,27 +282,37 @@ impl AudioCaptureBackend for CoreAudioCapture {
             .map_err(|_| AudioCaptureError::ReadError("shared buffer poisoned".into()))?;
 
         // Block until the ring buffer has enough data to fill `buf`, with timeout.
+        // Track cumulative elapsed time to prevent spurious wakeups from
+        // extending the total wait beyond READ_TIMEOUT.
+        let deadline = Instant::now() + READ_TIMEOUT;
         while ring.len() < buf.len() {
-            let (guard, wait_result) = self
-                .shared
-                .condvar
-                .wait_timeout(ring, READ_TIMEOUT)
-                .map_err(|_| AudioCaptureError::ReadError("shared buffer poisoned".into()))?;
-
-            ring = guard;
-
-            if wait_result.timed_out() && ring.len() < buf.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(AudioCaptureError::ReadError(
                     "CoreAudio capture timed out after 5 seconds".into(),
                 ));
             }
+
+            let (guard, _) = self
+                .shared
+                .condvar
+                .wait_timeout(ring, remaining)
+                .map_err(|_| AudioCaptureError::ReadError("shared buffer poisoned".into()))?;
+
+            ring = guard;
+            // On timeout or spurious wakeup, the `remaining.is_zero()` check
+            // at the top of the next iteration handles the deadline.
         }
 
-        // Copy data out of the ring buffer.
+        // Copy data out of the ring buffer using bulk memcpy.
         let n = buf.len();
-        for (dst, src) in buf.iter_mut().zip(ring.drain(..n)) {
-            *dst = src;
+        let (front, back) = ring.as_slices();
+        let front_n = front.len().min(n);
+        buf[..front_n].copy_from_slice(&front[..front_n]);
+        if front_n < n {
+            buf[front_n..n].copy_from_slice(&back[..n - front_n]);
         }
+        ring.drain(..n);
 
         Ok(n)
     }
@@ -411,6 +451,31 @@ mod tests {
     }
 
     #[test]
+    fn shared_buffer_oversized_slice() {
+        // When a single callback delivers more data than ring_cap,
+        // only the newest ring_cap bytes should be retained.
+        let shared = SharedBuffer {
+            data: Mutex::new(VecDeque::new()),
+            condvar: Condvar::new(),
+            ring_cap: 50,
+        };
+
+        let mut ring = shared.data.lock().unwrap();
+        ring.extend(std::iter::repeat(0xAA).take(30));
+
+        // Simulate oversized callback data (100 bytes > ring_cap 50).
+        let slice: Vec<u8> = (0..100).collect();
+        if slice.len() >= shared.ring_cap {
+            ring.clear();
+            ring.extend(&slice[slice.len() - shared.ring_cap..]);
+        }
+        assert_eq!(ring.len(), 50);
+        // Should contain the last 50 bytes of slice (50..100).
+        assert_eq!(ring[0], 50);
+        assert_eq!(*ring.back().unwrap(), 99);
+    }
+
+    #[test]
     fn shared_buffer_empty_insert() {
         let shared = SharedBuffer {
             data: Mutex::new(VecDeque::new()),
@@ -429,9 +494,9 @@ mod tests {
     #[test]
     fn constants_match_coreaudio_headers() {
         // Verify our constants match CoreAudio header values.
-        assert_eq!(K_AUDIO_FORMAT_LINEAR_PCM, 0x6C70_636D); // 'lpcm'
-        assert_eq!(K_LINEAR_PCM_FORMAT_FLAG_IS_SIGNED_INTEGER, 4);
-        assert_eq!(K_LINEAR_PCM_FORMAT_FLAG_IS_PACKED, 8);
+        assert_eq!(AUDIO_FORMAT_LINEAR_PCM, 0x6C70_636D); // 'lpcm'
+        assert_eq!(LINEAR_PCM_FORMAT_FLAG_IS_SIGNED_INTEGER, 4);
+        assert_eq!(LINEAR_PCM_FORMAT_FLAG_IS_PACKED, 8);
         assert_eq!(NUM_AUDIO_QUEUE_BUFFERS, 3);
         assert_eq!(RING_BUFFER_MAX_PACKETS, 4);
         assert_eq!(READ_TIMEOUT, Duration::from_secs(5));

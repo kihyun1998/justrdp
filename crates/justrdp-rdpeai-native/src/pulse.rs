@@ -13,9 +13,10 @@ pub struct PulseAudioCapture {
     simple: Option<Simple>,
 }
 
-// SAFETY: PulseAudio Simple API wraps a C `pa_simple*` pointer. The Simple
-// API is safe to use from any thread with exclusive access, which is enforced
-// by the `&mut self` requirement on all methods.
+// SAFETY: PulseAudio Simple API wraps a C `pa_simple*` pointer. The PA docs
+// state that pa_simple is NOT thread-safe for concurrent calls. Safety is
+// upheld because all methods require `&mut self`, preventing concurrent access
+// in safe Rust.
 unsafe impl Send for PulseAudioCapture {}
 
 impl AudioCaptureBackend for PulseAudioCapture {
@@ -49,7 +50,7 @@ impl AudioCaptureBackend for PulseAudioCapture {
             None,                // default channel map
             None,                // default buffering
         )
-        .map_err(|e| AudioCaptureError::DeviceError(e.to_string().unwrap_or_default()))?;
+        .map_err(|e| AudioCaptureError::DeviceError(format!("{e}")))?;
 
         Ok(Self {
             simple: Some(simple),
@@ -64,7 +65,7 @@ impl AudioCaptureBackend for PulseAudioCapture {
 
         simple
             .read(buf)
-            .map_err(|e| AudioCaptureError::ReadError(e.to_string().unwrap_or_default()))?;
+            .map_err(|e| AudioCaptureError::ReadError(format!("{e}")))?;
 
         Ok(buf.len())
     }
@@ -79,5 +80,47 @@ impl AudioCaptureBackend for PulseAudioCapture {
 impl Drop for PulseAudioCapture {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{AudioCaptureBackend, AudioCaptureConfig};
+    use super::*;
+
+    #[test]
+    fn open_rejects_non_16bit() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 8,
+            frames_per_packet: 1024,
+        };
+        let result = PulseAudioCapture::open(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_rejects_32bit() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 1,
+            bits_per_sample: 32,
+            frames_per_packet: 512,
+        };
+        let result = PulseAudioCapture::open(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_rejects_zero_channels() {
+        let config = AudioCaptureConfig {
+            sample_rate: 44100,
+            channels: 0,
+            bits_per_sample: 16,
+            frames_per_packet: 1024,
+        };
+        let result = PulseAudioCapture::open(&config);
+        assert!(result.is_err());
     }
 }
