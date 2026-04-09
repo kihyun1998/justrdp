@@ -1260,10 +1260,10 @@ pub trait GfxHandler: Send {
 - [x] 가상 데스크톱 좌표 처리 (음수 좌표, bounding rect 계산)
 - [x] DPI 스케일링 조율 (GCC Extended Data ↔ DisplayControl 간 일관성)
 
-**테스트 보강 (추후):**
+**테스트 보강:**
 
-- [ ] Session 통합 테스트: TPKT→X.224→MCS→ShareData 와이어 프레임으로 `ServerMonitorLayout` 출력 검증
-- [ ] Connector 통합 테스트: Finalization 중 MonitorLayoutPdu 주입 → `ConnectionResult.server_monitor_layout` 검증
+- [x] Session 통합 테스트: TPKT→X.224→MCS→ShareData 와이어 프레임으로 `ServerMonitorLayout` 출력 검증
+- [x] Connector 통합 테스트: Finalization 중 MonitorLayoutPdu 주입 → `ConnectionResult.server_monitor_layout` 검증
 
 ### 9.2 Auto-Reconnect
 

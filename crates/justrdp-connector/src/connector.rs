@@ -2700,4 +2700,101 @@ mod tests {
         let result = connector.step(&[], &mut output);
         assert!(result.is_err());
     }
+
+    /// Build a server-to-client slow-path frame (TPKT + X.224 DT + MCS SDI + ShareControl + ShareData).
+    fn build_server_data_frame(
+        io_channel_id: u16,
+        share_id: u32,
+        pdu_type2: ShareDataPduType,
+        body: &[u8],
+    ) -> Vec<u8> {
+        use justrdp_pdu::mcs::SendDataIndication;
+        use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
+        use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
+
+        let sd = wrap_share_data(share_id, pdu_type2, body).unwrap();
+        let sc = wrap_share_control(ShareControlPduType::Data, 0x03EA, &sd).unwrap();
+        let sdi = SendDataIndication {
+            initiator: 0x03EA,
+            channel_id: io_channel_id,
+            user_data: &sc,
+        };
+        let mcs_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let mut frame = vec![0u8; TPKT_HEADER_SIZE + mcs_size];
+        let mut cursor = WriteCursor::new(&mut frame);
+        TpktHeader::for_payload(mcs_size).encode(&mut cursor).unwrap();
+        DataTransfer.encode(&mut cursor).unwrap();
+        sdi.encode(&mut cursor).unwrap();
+        frame
+    }
+
+    #[test]
+    fn finalization_stores_monitor_layout_in_connection_result() {
+        use justrdp_pdu::rdp::finalization::{FontListPdu, MonitorLayoutPdu, SynchronizePdu, ControlPdu, ControlAction};
+
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+
+        // Set up connector in finalization wait state
+        connector.state = ClientConnectorState::ConnectionFinalizationWaitSynchronize;
+        connector.io_channel_id = 1003;
+        connector.user_channel_id = 1007;
+        connector.share_id = 0x00040006;
+
+        let mut output = WriteBuf::new();
+
+        // Server sends MonitorLayoutPdu (arrives before Synchronize — stored, state unchanged)
+        let monitor_pdu = MonitorLayoutPdu {
+            monitors: vec![
+                MonitorLayoutEntry { left: 0, top: 0, right: 1919, bottom: 1079, flags: TS_MONITOR_PRIMARY },
+                MonitorLayoutEntry { left: 1920, top: 0, right: 3839, bottom: 1079, flags: 0 },
+            ],
+        };
+        let monitor_body = justrdp_core::encode_vec(&monitor_pdu).unwrap();
+        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::MonitorLayoutPdu, &monitor_body);
+        connector.step(&frame, &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitSynchronize);
+
+        // Server sends Synchronize → advance to WaitCooperate
+        let sync = SynchronizePdu { message_type: 1, target_user: 1003 };
+        let sync_body = justrdp_core::encode_vec(&sync).unwrap();
+        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::Synchronize, &sync_body);
+        connector.step(&frame, &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitCooperate);
+
+        // Server sends Control(Cooperate) → advance to WaitGrantedControl
+        let coop = ControlPdu { action: ControlAction::Cooperate, grant_id: 0, control_id: 0 };
+        let coop_body = justrdp_core::encode_vec(&coop).unwrap();
+        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::Control, &coop_body);
+        connector.step(&frame, &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitGrantedControl);
+
+        // Server sends Control(GrantedControl) → advance to WaitFontMap
+        let grant = ControlPdu { action: ControlAction::GrantedControl, grant_id: 1007, control_id: 1007 };
+        let grant_body = justrdp_core::encode_vec(&grant).unwrap();
+        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::Control, &grant_body);
+        connector.step(&frame, &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitFontMap);
+
+        // Server sends FontMap → transition to Connected (FontMapPdu = FontListPdu)
+        let font_map = FontListPdu::default_request();
+        let fm_body = justrdp_core::encode_vec(&font_map).unwrap();
+        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::FontMap, &fm_body);
+        connector.step(&frame, &mut output).unwrap();
+
+        // Verify Connected state with monitor layout
+        match connector.state() {
+            ClientConnectorState::Connected { result } => {
+                let layout = result.server_monitor_layout.as_ref()
+                    .expect("server_monitor_layout should be populated");
+                assert_eq!(layout.len(), 2);
+                assert_eq!(layout[0].left, 0);
+                assert_eq!(layout[0].right, 1919);
+                assert_eq!(layout[0].flags, TS_MONITOR_PRIMARY);
+                assert_eq!(layout[1].left, 1920);
+                assert_eq!(layout[1].right, 3839);
+            }
+            other => panic!("expected Connected, got {:?}", other),
+        }
+    }
 }

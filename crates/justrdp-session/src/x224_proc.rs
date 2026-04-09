@@ -1057,4 +1057,44 @@ mod tests {
             other => panic!("expected PointerBitmap, got {:?}", other),
         }
     }
+
+    #[test]
+    fn process_monitor_layout_pdu_emits_server_monitor_layout() {
+        use justrdp_pdu::rdp::finalization::{MonitorLayoutEntry, MonitorLayoutPdu, TS_MONITOR_PRIMARY};
+
+        // Build a MonitorLayoutPdu with two monitors
+        let pdu = MonitorLayoutPdu {
+            monitors: vec![
+                MonitorLayoutEntry { left: 0, top: 0, right: 1919, bottom: 1079, flags: TS_MONITOR_PRIMARY },
+                MonitorLayoutEntry { left: -1920, top: 0, right: -1, bottom: 1079, flags: 0 },
+            ],
+        };
+        let pdu_body = justrdp_core::encode_vec(&pdu).unwrap();
+
+        let config = test_config();
+        let frame = build_slow_path_frame(
+            config.io_channel_id,
+            config.share_id,
+            ShareDataPduType::MonitorLayoutPdu,
+            &pdu_body,
+        );
+
+        let mut decompressor = justrdp_bulk::bulk::BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::ServerMonitorLayout { monitors } => {
+                assert_eq!(monitors.len(), 2);
+                assert_eq!(monitors[0].left, 0);
+                assert_eq!(monitors[0].right, 1919);
+                assert_eq!(monitors[0].flags, TS_MONITOR_PRIMARY);
+                assert_eq!(monitors[1].left, -1920);
+                assert_eq!(monitors[1].right, -1);
+                assert_eq!(monitors[1].flags, 0);
+            }
+            other => panic!("expected ServerMonitorLayout, got {:?}", other),
+        }
+    }
 }
