@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use justrdp_pdu::rdp::capabilities::CapabilitySet;
+use justrdp_pdu::rdp::finalization::MonitorLayoutEntry;
 use justrdp_pdu::x224::SecurityProtocol;
 
 /// Number of bytes written to the output buffer by a `step()` call.
@@ -44,4 +45,10 @@ pub struct ConnectionResult {
     pub selected_protocol: SecurityProtocol,
     /// Session ID from the server (0 if not provided).
     pub session_id: u32,
+    /// Server monitor layout received during capabilities exchange (MS-RDPBCGR 2.2.12.1).
+    ///
+    /// The server sends this optional PDU after the Demand Active PDU when the client
+    /// set `SUPPORT_MONITOR_LAYOUT_PDU` in `earlyCapabilityFlags`. `None` if the server
+    /// did not send a Monitor Layout PDU during the connection sequence.
+    pub server_monitor_layout: Option<Vec<MonitorLayoutEntry>>,
 }

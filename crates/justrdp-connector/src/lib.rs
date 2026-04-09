@@ -31,6 +31,7 @@ pub use credssp::kerberos::{
 };
 pub use credssp::{CredentialType, CredsspRandom, CredsspSequence, CredsspState};
 pub use error::{ConnectorError, ConnectorErrorKind, ConnectorResult};
+pub use justrdp_pdu::rdp::finalization::MonitorLayoutEntry;
 pub use result::{ConnectionResult, Written};
 pub use sequence::Sequence;
 pub use state::ClientConnectorState;

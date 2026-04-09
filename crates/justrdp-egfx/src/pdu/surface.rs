@@ -104,6 +104,9 @@ impl GfxMonitorDef {
 
 impl Encode for GfxMonitorDef {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        if self.right < self.left || self.bottom < self.top {
+            return Err(justrdp_core::EncodeError::invalid_value("GfxMonitorDef", "inverted bounding box"));
+        }
         dst.write_i32_le(self.left, "GfxMonitorDef::left")?;
         dst.write_i32_le(self.top, "GfxMonitorDef::top")?;
         dst.write_i32_le(self.right, "GfxMonitorDef::right")?;
@@ -123,13 +126,18 @@ impl Encode for GfxMonitorDef {
 
 impl<'de> Decode<'de> for GfxMonitorDef {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
-        Ok(Self {
+        let entry = Self {
             left: src.read_i32_le("GfxMonitorDef::left")?,
             top: src.read_i32_le("GfxMonitorDef::top")?,
             right: src.read_i32_le("GfxMonitorDef::right")?,
             bottom: src.read_i32_le("GfxMonitorDef::bottom")?,
             flags: src.read_u32_le("GfxMonitorDef::flags")?,
-        })
+        };
+        // Reject inverted bounding boxes (right < left or bottom < top)
+        if entry.right < entry.left || entry.bottom < entry.top {
+            return Err(DecodeError::invalid_value("GfxMonitorDef", "inverted bounding box"));
+        }
+        Ok(entry)
     }
 }
 
@@ -148,6 +156,8 @@ impl ResetGraphicsPdu {
     pub const FIXED_PDU_LENGTH: u32 = 340;
     /// Max monitors (MS-RDPEGFX 2.2.2.14).
     pub const MAX_MONITOR_COUNT: u32 = 16;
+    /// Maximum surface width or height (MS-RDPEGFX 2.2.2.14).
+    pub const MAX_SURFACE_DIM: u32 = 32_766;
     /// Body = width(4) + height(4) + monitorCount(4) + monitors + pad = 332.
     const BODY_SIZE: usize = Self::FIXED_PDU_LENGTH as usize - RdpgfxHeader::WIRE_SIZE;
 }
@@ -156,6 +166,15 @@ impl<'de> Decode<'de> for ResetGraphicsPdu {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let width = src.read_u32_le("ResetGraphics::width")?;
         let height = src.read_u32_le("ResetGraphics::height")?;
+
+        // MS-RDPEGFX 2.2.2.14: width and height MUST be > 0 and ≤ MAX_SURFACE_DIM.
+        if width == 0 || width > Self::MAX_SURFACE_DIM {
+            return Err(DecodeError::invalid_value("ResetGraphics", "width"));
+        }
+        if height == 0 || height > Self::MAX_SURFACE_DIM {
+            return Err(DecodeError::invalid_value("ResetGraphics", "height"));
+        }
+
         let monitor_count = src.read_u32_le("ResetGraphics::monitorCount")?;
 
         if monitor_count > Self::MAX_MONITOR_COUNT {
@@ -167,8 +186,10 @@ impl<'de> Decode<'de> for ResetGraphicsPdu {
             monitors.push(GfxMonitorDef::decode(src)?);
         }
 
-        // Skip pad bytes: 332 - 12 - monitorCount*20
-        let pad_len = Self::BODY_SIZE - 12 - (monitor_count as usize * GfxMonitorDef::WIRE_SIZE);
+        // Skip pad bytes: BODY_SIZE - 12 - monitorCount*20
+        let pad_len = Self::BODY_SIZE
+            .checked_sub(12 + monitor_count as usize * GfxMonitorDef::WIRE_SIZE)
+            .ok_or_else(|| DecodeError::invalid_value("ResetGraphics", "pad underflow"))?;
         let _pad = src.read_slice(pad_len, "ResetGraphics::pad")?;
 
         Ok(Self {
@@ -181,6 +202,17 @@ impl<'de> Decode<'de> for ResetGraphicsPdu {
 
 impl Encode for ResetGraphicsPdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        // MS-RDPEGFX 2.2.2.14: width/height must be > 0 and ≤ MAX_SURFACE_DIM, monitors ≤ 16.
+        if self.width == 0 || self.width > Self::MAX_SURFACE_DIM {
+            return Err(justrdp_core::EncodeError::invalid_value("ResetGraphics", "width"));
+        }
+        if self.height == 0 || self.height > Self::MAX_SURFACE_DIM {
+            return Err(justrdp_core::EncodeError::invalid_value("ResetGraphics", "height"));
+        }
+        if self.monitors.len() > Self::MAX_MONITOR_COUNT as usize {
+            return Err(justrdp_core::EncodeError::invalid_value("ResetGraphics", "monitorCount"));
+        }
+
         dst.write_u32_le(self.width, "ResetGraphics::width")?;
         dst.write_u32_le(self.height, "ResetGraphics::height")?;
         dst.write_u32_le(self.monitors.len() as u32, "ResetGraphics::monitorCount")?;
@@ -189,8 +221,10 @@ impl Encode for ResetGraphicsPdu {
             m.encode(dst)?;
         }
 
-        // Pad to fill 332 bytes total body
-        let pad_len = Self::BODY_SIZE - 12 - (self.monitors.len() * GfxMonitorDef::WIRE_SIZE);
+        // Pad to fill BODY_SIZE bytes total body
+        let pad_len = Self::BODY_SIZE
+            .checked_sub(12 + self.monitors.len() * GfxMonitorDef::WIRE_SIZE)
+            .ok_or_else(|| justrdp_core::EncodeError::invalid_value("ResetGraphics", "pad underflow"))?;
         let zeros = vec![0u8; pad_len];
         dst.write_slice(&zeros, "ResetGraphics::pad")?;
         Ok(())
@@ -524,5 +558,170 @@ mod tests {
         pdu.encode(&mut dst).unwrap();
         let mut src = ReadCursor::new(&buf);
         assert_eq!(MapSurfaceToScaledWindowPdu::decode(&mut src).unwrap(), pdu);
+    }
+
+    // Helper: craft raw ResetGraphicsPdu body bytes for decode testing.
+    fn craft_reset_graphics_body(width: u32, height: u32, monitor_count: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; ResetGraphicsPdu::BODY_SIZE];
+        let mut dst = WriteCursor::new(&mut buf);
+        dst.write_u32_le(width, "ResetGraphics::width").unwrap();
+        dst.write_u32_le(height, "ResetGraphics::height").unwrap();
+        dst.write_u32_le(monitor_count, "ResetGraphics::monitorCount").unwrap();
+        // Rest is zeros (pad + fake monitor data)
+        buf
+    }
+
+    #[test]
+    fn reset_graphics_encode_rejects_zero_width() {
+        let pdu = ResetGraphicsPdu { width: 0, height: 600, monitors: vec![] };
+        let mut buf = vec![0u8; pdu.size()];
+        let mut dst = WriteCursor::new(&mut buf);
+        assert!(pdu.encode(&mut dst).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_encode_rejects_zero_height() {
+        let pdu = ResetGraphicsPdu { width: 800, height: 0, monitors: vec![] };
+        let mut buf = vec![0u8; pdu.size()];
+        let mut dst = WriteCursor::new(&mut buf);
+        assert!(pdu.encode(&mut dst).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_encode_rejects_exceeding_width() {
+        let pdu = ResetGraphicsPdu { width: 32767, height: 600, monitors: vec![] };
+        let mut buf = vec![0u8; pdu.size()];
+        let mut dst = WriteCursor::new(&mut buf);
+        assert!(pdu.encode(&mut dst).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_encode_rejects_exceeding_height() {
+        let pdu = ResetGraphicsPdu { width: 800, height: 32767, monitors: vec![] };
+        let mut buf = vec![0u8; pdu.size()];
+        let mut dst = WriteCursor::new(&mut buf);
+        assert!(pdu.encode(&mut dst).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_decode_rejects_zero_width() {
+        let buf = craft_reset_graphics_body(0, 600, 0);
+        let mut src = ReadCursor::new(&buf);
+        assert!(ResetGraphicsPdu::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_decode_rejects_zero_height() {
+        let buf = craft_reset_graphics_body(800, 0, 0);
+        let mut src = ReadCursor::new(&buf);
+        assert!(ResetGraphicsPdu::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_decode_rejects_exceeding_width() {
+        let buf = craft_reset_graphics_body(32767, 600, 0);
+        let mut src = ReadCursor::new(&buf);
+        assert!(ResetGraphicsPdu::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_decode_rejects_exceeding_height() {
+        let buf = craft_reset_graphics_body(800, 32767, 0);
+        let mut src = ReadCursor::new(&buf);
+        assert!(ResetGraphicsPdu::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_decode_rejects_too_many_monitors() {
+        let buf = craft_reset_graphics_body(800, 600, 17);
+        let mut src = ReadCursor::new(&buf);
+        assert!(ResetGraphicsPdu::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_accepts_max_valid_dimensions() {
+        let pdu = ResetGraphicsPdu { width: 32766, height: 32766, monitors: vec![] };
+        let mut buf = vec![0u8; pdu.size()];
+        let mut dst = WriteCursor::new(&mut buf);
+        pdu.encode(&mut dst).unwrap();
+        let mut src = ReadCursor::new(&buf);
+        let decoded = ResetGraphicsPdu::decode(&mut src).unwrap();
+        assert_eq!(decoded.width, 32766);
+        assert_eq!(decoded.height, 32766);
+    }
+
+    #[test]
+    fn reset_graphics_encode_rejects_too_many_monitors() {
+        let pdu = ResetGraphicsPdu {
+            width: 800,
+            height: 600,
+            monitors: vec![GfxMonitorDef { left: 0, top: 0, right: 0, bottom: 0, flags: 0 }; 17],
+        };
+        let mut buf = vec![0u8; 800]; // oversized buffer
+        let mut dst = WriteCursor::new(&mut buf);
+        assert!(pdu.encode(&mut dst).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_roundtrip_max_monitors() {
+        // 16 monitors → pad_len = 0 (boundary case)
+        let monitors: Vec<GfxMonitorDef> = (0..16)
+            .map(|i| GfxMonitorDef {
+                left: i * 1920,
+                top: 0,
+                right: (i + 1) * 1920 - 1,
+                bottom: 1079,
+                flags: if i == 0 { 1 } else { 0 },
+            })
+            .collect();
+        let pdu = ResetGraphicsPdu {
+            width: 30720,
+            height: 1080,
+            monitors,
+        };
+        assert_eq!(pdu.size(), 332);
+        let mut buf = vec![0u8; pdu.size()];
+        let mut dst = WriteCursor::new(&mut buf);
+        pdu.encode(&mut dst).unwrap();
+        let mut src = ReadCursor::new(&buf);
+        let decoded = ResetGraphicsPdu::decode(&mut src).unwrap();
+        assert_eq!(decoded.width, 30720);
+        assert_eq!(decoded.monitors.len(), 16);
+        assert_eq!(decoded.monitors[0].flags, 1);
+        assert_eq!(decoded.monitors[15].left, 15 * 1920);
+    }
+
+    #[test]
+    fn gfx_monitor_def_encode_rejects_inverted_bbox() {
+        let def = GfxMonitorDef { left: 100, top: 0, right: 0, bottom: 1079, flags: 1 };
+        let mut buf = vec![0u8; GfxMonitorDef::WIRE_SIZE];
+        let mut dst = WriteCursor::new(&mut buf);
+        assert!(def.encode(&mut dst).is_err());
+    }
+
+    #[test]
+    fn gfx_monitor_def_decode_rejects_inverted_bbox() {
+        // left=100, top=0, right=0, bottom=1079, flags=1 → right < left
+        let mut buf = vec![0u8; GfxMonitorDef::WIRE_SIZE];
+        let mut dst = WriteCursor::new(&mut buf);
+        dst.write_i32_le(100, "left").unwrap();
+        dst.write_i32_le(0, "top").unwrap();
+        dst.write_i32_le(0, "right").unwrap();
+        dst.write_i32_le(1079, "bottom").unwrap();
+        dst.write_u32_le(1, "flags").unwrap();
+        let mut src = ReadCursor::new(&buf);
+        assert!(GfxMonitorDef::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn reset_graphics_encode_rejects_inverted_monitor() {
+        let pdu = ResetGraphicsPdu {
+            width: 1920,
+            height: 1080,
+            monitors: vec![GfxMonitorDef { left: 100, top: 0, right: 0, bottom: 1079, flags: 1 }],
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        let mut dst = WriteCursor::new(&mut buf);
+        assert!(pdu.encode(&mut dst).is_err());
     }
 }

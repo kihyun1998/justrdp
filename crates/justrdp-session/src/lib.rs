@@ -47,6 +47,8 @@ use justrdp_bulk::bulk::BulkDecompressor;
 #[cfg(feature = "alloc")]
 use justrdp_core::{Encode, WriteCursor};
 #[cfg(feature = "alloc")]
+use justrdp_pdu::rdp::finalization::MonitorLayoutEntry;
+#[cfg(feature = "alloc")]
 use justrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason};
 #[cfg(feature = "alloc")]
 use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathUpdateType};
@@ -129,6 +131,16 @@ pub enum ActiveStageOutput {
     ChannelData {
         channel_id: u16,
         data: Vec<u8>,
+    },
+    /// Server sent a Monitor Layout PDU (MS-RDPBCGR 2.2.12.1).
+    ///
+    /// Contains the server's current monitor arrangement. Emitted during the active
+    /// session when the server reconfigures monitors (e.g., after a display control
+    /// layout change triggers deactivation-reactivation).
+    ServerMonitorLayout {
+        /// Monitor definitions: left/top/right/bottom (inclusive bounding box, signed)
+        /// and flags (`TS_MONITOR_PRIMARY` = 0x0000_0001).
+        monitors: Vec<MonitorLayoutEntry>,
     },
 }
 

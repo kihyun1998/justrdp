@@ -231,6 +231,32 @@ impl DrdynvcClient {
         }
         Ok(messages)
     }
+
+    /// Send data on an open DVC channel from the application side.
+    ///
+    /// Use this when a `DvcProcessor` produces a message outside of the normal
+    /// server-initiated flow (e.g., `DisplayControlClient::take_pending_message()`).
+    /// Returns an `SvcMessage` ready to be sent on the `drdynvc` static channel.
+    ///
+    /// Returns `Err` if `channel_id` is not currently open.
+    pub fn send_on_channel(&mut self, channel_id: u32, data: &[u8]) -> DvcResult<SvcMessage> {
+        if !self.active_channels.contains_key(&channel_id) {
+            return Err(DvcError::Protocol(String::from(
+                "send_on_channel: channel not open",
+            )));
+        }
+        Ok(SvcMessage::new(pdu::encode_data(channel_id, data)))
+    }
+
+    /// Look up the channel ID for a registered processor by name.
+    ///
+    /// Returns `None` if no channel with that name is currently open.
+    pub fn channel_id_by_name(&self, name: &str) -> Option<u32> {
+        self.active_channels
+            .iter()
+            .find(|(_, n)| n.as_str() == name)
+            .map(|(&id, _)| id)
+    }
 }
 
 impl Default for DrdynvcClient {
@@ -475,5 +501,52 @@ mod tests {
             DvcPdu::Data { data, .. } => assert_eq!(data, b"fresh"),
             _ => panic!("expected Data"),
         }
+    }
+
+    #[test]
+    fn send_on_channel_open_channel() {
+        let mut client = DrdynvcClient::new();
+        client.register(Box::new(EchoDvcProcessor));
+
+        // Negotiate caps
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+        // CreateRequest: channel_id=3, name="testdvc"
+        let create_req = [0x10, 0x03, 0x74, 0x65, 0x73, 0x74, 0x64, 0x76, 0x63, 0x00];
+        client.process(&create_req).unwrap();
+
+        // Send data proactively
+        let msg = client.send_on_channel(3, b"hello").unwrap();
+        let mut src = ReadCursor::new(&msg.data);
+        let decoded = pdu::decode_dvc_pdu(&mut src).unwrap();
+        match decoded {
+            DvcPdu::Data { channel_id, data } => {
+                assert_eq!(channel_id, 3);
+                assert_eq!(data, b"hello");
+            }
+            _ => panic!("expected Data"),
+        }
+    }
+
+    #[test]
+    fn send_on_channel_closed_channel_returns_error() {
+        let mut client = DrdynvcClient::new();
+        assert!(client.send_on_channel(99, b"data").is_err());
+    }
+
+    #[test]
+    fn channel_id_by_name_lookup() {
+        let mut client = DrdynvcClient::new();
+        client.register(Box::new(EchoDvcProcessor));
+
+        // Not open yet
+        assert_eq!(client.channel_id_by_name("testdvc"), None);
+
+        // Negotiate + open channel
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+        let create_req = [0x10, 0x03, 0x74, 0x65, 0x73, 0x74, 0x64, 0x76, 0x63, 0x00];
+        client.process(&create_req).unwrap();
+
+        assert_eq!(client.channel_id_by_name("testdvc"), Some(3));
+        assert_eq!(client.channel_id_by_name("nonexistent"), None);
     }
 }

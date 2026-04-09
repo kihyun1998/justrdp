@@ -29,7 +29,10 @@ use justrdp_pdu::rdp::capabilities::{
     VirtualChannelCapability,
 };
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
-use justrdp_pdu::rdp::finalization::{ControlAction, ControlPdu, FontListPdu, PersistentKeyListPdu, SynchronizePdu};
+use justrdp_pdu::rdp::finalization::{
+    ControlAction, ControlPdu, FontListPdu, MonitorLayoutEntry, MonitorLayoutPdu,
+    PersistentKeyListPdu, SynchronizePdu, TS_MONITOR_PRIMARY,
+};
 use justrdp_pdu::rdp::server_certificate;
 use justrdp_pdu::rdp::standard_security::{
     self, FipsSecurityContext, RdpSecurityContext,
@@ -50,8 +53,6 @@ use crate::config::Config;
 
 // ── Multi-monitor constants (MS-RDPBCGR 2.2.1.3.6) ──────────────────────────
 
-/// TS_MONITOR_PRIMARY flag in TS_MONITOR_DEF.flags (MS-RDPBCGR 2.2.1.3.6.1).
-const TS_MONITOR_PRIMARY: u32 = 0x0000_0001;
 /// Maximum number of monitors in CS_MONITOR (MS-RDPBCGR 2.2.1.3.6).
 const MAX_MONITOR_COUNT: usize = 16;
 /// Minimum virtual desktop dimension per axis (MS-RDPBCGR 2.2.1.3.6).
@@ -168,6 +169,9 @@ pub struct ClientConnector {
     /// Effective desktop size for multi-monitor (bounding rect) or single-monitor.
     /// Set during BasicSettingsExchangeSendInitial, used in ConfirmActivePdu.
     active_desktop_size: Option<crate::config::DesktopSize>,
+    /// Server monitor layout received during capabilities exchange / finalization
+    /// (MS-RDPBCGR 2.2.12.1). Stored here until transition_to_connected().
+    server_monitor_layout: Option<Vec<MonitorLayoutEntry>>,
 }
 
 /// Standard RDP Security mode (none for TLS/NLA).
@@ -207,6 +211,7 @@ impl ClientConnector {
             aad_auth_request_json: None,
             deactivation_count: 0,
             active_desktop_size: None,
+            server_monitor_layout: None,
         }
     }
 
@@ -1285,8 +1290,11 @@ impl ClientConnector {
         let sc_hdr = ShareControlHeader::decode(&mut inner)?;
 
         if sc_hdr.pdu_type != ShareControlPduType::DemandActivePdu {
-            // Could be a server-side PDU before Demand Active (e.g., Deactivate All)
-            // For now, stay in current state
+            // Handle data PDUs (e.g., MonitorLayoutPdu) that may arrive before Demand Active.
+            if sc_hdr.pdu_type == ShareControlPduType::Data {
+                let sd_hdr = ShareDataHeader::decode(&mut inner)?;
+                let _ = self.try_store_monitor_layout(sd_hdr.pdu_type2, &mut inner)?;
+            }
             return Ok(Written::nothing());
         }
 
@@ -1473,6 +1481,23 @@ impl ClientConnector {
         ]
     }
 
+    /// If the ShareData PDU type is MonitorLayoutPdu, decode and store it.
+    /// MS-RDPBCGR 2.2.12.1: last-write-wins if server sends multiple layouts.
+    /// Returns `true` if it was a MonitorLayoutPdu (consumed from `inner`).
+    fn try_store_monitor_layout(
+        &mut self,
+        pdu_type2: ShareDataPduType,
+        inner: &mut ReadCursor<'_>,
+    ) -> ConnectorResult<bool> {
+        if pdu_type2 == ShareDataPduType::MonitorLayoutPdu {
+            let layout = MonitorLayoutPdu::decode(inner)?;
+            self.server_monitor_layout = Some(layout.monitors);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn step_send_finalization_pdu<T: Encode>(
         &mut self,
         pdu_type2: ShareDataPduType,
@@ -1590,7 +1615,7 @@ impl ClientConnector {
         if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
             // Deactivation-Reactivation: go back to capabilities exchange
             // MS-RDPBCGR 1.3.1.3 — caller should check deactivation_count() to flush caches
-            self.deactivation_count += 1;
+            self.deactivation_count = self.deactivation_count.saturating_add(1);
             self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
             return Ok(Written::nothing());
         }
@@ -1601,6 +1626,10 @@ impl ClientConnector {
         }
 
         let sd_hdr = ShareDataHeader::decode(&mut inner)?;
+
+        if self.try_store_monitor_layout(sd_hdr.pdu_type2, &mut inner)? {
+            return Ok(Written::nothing());
+        }
 
         if sd_hdr.pdu_type2 != expected_type {
             // Not the expected finalization PDU — stay in same state
@@ -1630,7 +1659,7 @@ impl ClientConnector {
         let sc_hdr = ShareControlHeader::decode(&mut inner)?;
 
         if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
-            self.deactivation_count += 1;
+            self.deactivation_count = self.deactivation_count.saturating_add(1);
             self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
             return Ok(Written::nothing());
         }
@@ -1640,6 +1669,10 @@ impl ClientConnector {
         }
 
         let sd_hdr = ShareDataHeader::decode(&mut inner)?;
+
+        if self.try_store_monitor_layout(sd_hdr.pdu_type2, &mut inner)? {
+            return Ok(Written::nothing());
+        }
 
         if sd_hdr.pdu_type2 != ShareDataPduType::FontMap {
             return Ok(Written::nothing());
@@ -1668,6 +1701,7 @@ impl ClientConnector {
             channel_ids,
             selected_protocol: self.selected_protocol,
             session_id: self.session_id,
+            server_monitor_layout: self.server_monitor_layout.take(),
         };
 
         self.state = ClientConnectorState::Connected { result };
@@ -2099,6 +2133,7 @@ mod tests {
                 channel_ids: Vec::new(),
                 selected_protocol: SecurityProtocol::RDP,
                 session_id: 0,
+                server_monitor_layout: None,
             },
         };
 

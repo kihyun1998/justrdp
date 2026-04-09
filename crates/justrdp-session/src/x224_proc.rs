@@ -17,7 +17,7 @@ use justrdp_pdu::mcs::{
 };
 use justrdp_pdu::rdp::fast_path::FastPathUpdateType;
 use justrdp_pdu::rdp::finalization::{
-    DeactivateAllPdu, SaveSessionInfoPdu, SetErrorInfoPdu, ERRINFO_NONE,
+    DeactivateAllPdu, MonitorLayoutPdu, SaveSessionInfoPdu, SetErrorInfoPdu, ERRINFO_NONE,
 };
 use justrdp_pdu::rdp::headers::{
     ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
@@ -267,10 +267,13 @@ fn dispatch_pdu_type2(
         | ShareDataPduType::FontMap
         | ShareDataPduType::FontList => Ok(vec![]),
 
-        // Monitor layout -- could be used for resize notification.
+        // Monitor layout — server reconfigured monitors (MS-RDPBCGR 2.2.12.1).
         ShareDataPduType::MonitorLayoutPdu => {
-            // For now, pass through as-is. Caller can decode if needed.
-            Ok(vec![])
+            let mut inner_src = ReadCursor::new(data);
+            let pdu = MonitorLayoutPdu::decode(&mut inner_src)?;
+            Ok(vec![ActiveStageOutput::ServerMonitorLayout {
+                monitors: pdu.monitors,
+            }])
         }
 
         // All other pduType2 values -- skip gracefully.

@@ -8,7 +8,7 @@
 use alloc::vec::Vec;
 
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
-use justrdp_core::{DecodeError, DecodeResult, EncodeResult};
+use justrdp_core::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 
 // ── Synchronize PDU ──
 
@@ -475,25 +475,40 @@ pub struct MonitorLayoutPdu {
     pub monitors: Vec<MonitorLayoutEntry>,
 }
 
-/// Monitor layout entry.
+/// TS_MONITOR_PRIMARY flag for [`MonitorLayoutEntry::flags`] (MS-RDPBCGR 2.2.1.3.6.1).
+pub const TS_MONITOR_PRIMARY: u32 = 0x0000_0001;
+
+/// Monitor layout entry — TS_MONITOR_DEF (MS-RDPBCGR 2.2.1.3.6.1).
+///
+/// Wire order: left(i32), top(i32), right(i32), bottom(i32), flags(u32).
+/// Coordinates are inclusive bounding-box corners (right = left + width - 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorLayoutEntry {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
     pub flags: u32,
-    pub left: u32,
-    pub top: u32,
-    pub width: u32,
-    pub height: u32,
 }
 
 impl Encode for MonitorLayoutPdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        // MS-RDPBCGR 2.2.12.1: defensive cap consistent with CS_MONITOR maximum
+        if self.monitors.len() > 16 {
+            return Err(EncodeError::invalid_value("MonitorLayoutPdu", "monitorCount"));
+        }
+        for m in &self.monitors {
+            if m.right < m.left || m.bottom < m.top {
+                return Err(EncodeError::invalid_value("MonitorLayoutEntry", "inverted bounding box"));
+            }
+        }
         dst.write_u32_le(self.monitors.len() as u32, "MonitorLayout::monitorCount")?;
         for m in &self.monitors {
+            dst.write_i32_le(m.left, "MonitorLayout::left")?;
+            dst.write_i32_le(m.top, "MonitorLayout::top")?;
+            dst.write_i32_le(m.right, "MonitorLayout::right")?;
+            dst.write_i32_le(m.bottom, "MonitorLayout::bottom")?;
             dst.write_u32_le(m.flags, "MonitorLayout::flags")?;
-            dst.write_u32_le(m.left, "MonitorLayout::left")?;
-            dst.write_u32_le(m.top, "MonitorLayout::top")?;
-            dst.write_u32_le(m.width, "MonitorLayout::width")?;
-            dst.write_u32_le(m.height, "MonitorLayout::height")?;
         }
         Ok(())
     }
@@ -510,13 +525,18 @@ impl<'de> Decode<'de> for MonitorLayoutPdu {
         }
         let mut monitors = Vec::with_capacity(count);
         for _ in 0..count {
-            monitors.push(MonitorLayoutEntry {
+            let entry = MonitorLayoutEntry {
+                left: src.read_i32_le("MonitorLayout::left")?,
+                top: src.read_i32_le("MonitorLayout::top")?,
+                right: src.read_i32_le("MonitorLayout::right")?,
+                bottom: src.read_i32_le("MonitorLayout::bottom")?,
                 flags: src.read_u32_le("MonitorLayout::flags")?,
-                left: src.read_u32_le("MonitorLayout::left")?,
-                top: src.read_u32_le("MonitorLayout::top")?,
-                width: src.read_u32_le("MonitorLayout::width")?,
-                height: src.read_u32_le("MonitorLayout::height")?,
-            });
+            };
+            // Reject inverted bounding boxes (right < left or bottom < top)
+            if entry.right < entry.left || entry.bottom < entry.top {
+                return Err(DecodeError::invalid_value("MonitorLayoutEntry", "inverted bounding box"));
+            }
+            monitors.push(entry);
         }
         Ok(Self { monitors })
     }
@@ -785,7 +805,7 @@ mod tests {
     #[test]
     fn monitor_layout_roundtrip() {
         let pdu = MonitorLayoutPdu {
-            monitors: vec![MonitorLayoutEntry { flags: 1, left: 0, top: 0, width: 1920, height: 1080 }],
+            monitors: vec![MonitorLayoutEntry { left: 0, top: 0, right: 1919, bottom: 1079, flags: 1 }],
         };
         let size = pdu.size();
         let mut buf = vec![0u8; size];
@@ -793,6 +813,96 @@ mod tests {
         pdu.encode(&mut cursor).unwrap();
         let mut cursor = ReadCursor::new(&buf);
         assert_eq!(MonitorLayoutPdu::decode(&mut cursor).unwrap(), pdu);
+    }
+
+    #[test]
+    fn monitor_layout_negative_coordinates() {
+        // Secondary monitor to the left of primary: left=-1920, right=-1
+        let pdu = MonitorLayoutPdu {
+            monitors: vec![
+                MonitorLayoutEntry { left: 0, top: 0, right: 1919, bottom: 1079, flags: 1 },
+                MonitorLayoutEntry { left: -1920, top: 0, right: -1, bottom: 1079, flags: 0 },
+            ],
+        };
+        let size = pdu.size();
+        let mut buf = vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = MonitorLayoutPdu::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+        assert_eq!(decoded.monitors[1].left, -1920);
+        assert_eq!(decoded.monitors[1].right, -1);
+    }
+
+    #[test]
+    fn monitor_layout_empty() {
+        let pdu = MonitorLayoutPdu { monitors: vec![] };
+        assert_eq!(pdu.size(), 4);
+        let mut buf = vec![0u8; 4];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = MonitorLayoutPdu::decode(&mut cursor).unwrap();
+        assert!(decoded.monitors.is_empty());
+    }
+
+    #[test]
+    fn monitor_layout_roundtrip_max_monitors() {
+        // 16 monitors (accept boundary): total size = 4 + 16*20 = 324 bytes
+        let monitors: Vec<MonitorLayoutEntry> = (0..16i32)
+            .map(|i| MonitorLayoutEntry {
+                left: i * 1920,
+                top: 0,
+                right: (i + 1) * 1920 - 1,
+                bottom: 1079,
+                flags: if i == 0 { 1 } else { 0 },
+            })
+            .collect();
+        let pdu = MonitorLayoutPdu { monitors };
+        assert_eq!(pdu.size(), 4 + 16 * 20);
+        let mut buf = vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = MonitorLayoutPdu::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.monitors.len(), 16);
+        assert_eq!(decoded.monitors[0].flags, 1);
+        assert_eq!(decoded.monitors[15].left, 15 * 1920);
+    }
+
+    #[test]
+    fn monitor_layout_rejects_too_many_monitors() {
+        // Hand-craft wire bytes with monitorCount=17
+        let mut buf = vec![0u8; 4];
+        buf[0] = 17; // monitorCount = 17 (LE)
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(MonitorLayoutPdu::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn monitor_layout_encode_rejects_inverted_bounding_box() {
+        let pdu = MonitorLayoutPdu {
+            monitors: vec![MonitorLayoutEntry { left: 100, top: 0, right: 0, bottom: 1079, flags: 1 }],
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        assert!(pdu.encode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn monitor_layout_decode_rejects_inverted_bounding_box() {
+        // Hand-craft wire bytes: monitorCount=1, left=100, top=0, right=0, bottom=1079, flags=1
+        let mut buf = vec![0u8; 24];
+        let mut cursor = WriteCursor::new(&mut buf);
+        cursor.write_u32_le(1, "mc").unwrap(); // monitorCount
+        cursor.write_i32_le(100, "left").unwrap();
+        cursor.write_i32_le(0, "top").unwrap();
+        cursor.write_i32_le(0, "right").unwrap(); // right < left → inverted
+        cursor.write_i32_le(1079, "bottom").unwrap();
+        cursor.write_u32_le(1, "flags").unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(MonitorLayoutPdu::decode(&mut cursor).is_err());
     }
 
     #[test]

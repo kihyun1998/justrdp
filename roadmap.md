@@ -1251,14 +1251,19 @@ pub trait GfxHandler: Send {
 
 **세션 중 모니터 변경:**
 
-- [ ] Finalization 단계에서 `MonitorLayoutPdu` 수신 → 콜백/이벤트 전달
-- [ ] EGFX `ResetGraphics` 모니터 매핑 (서버 재구성 시)
-- [ ] `DisplayControlClient`로 런타임 모니터 레이아웃 변경 전송
+- [x] Finalization 단계에서 `MonitorLayoutPdu` 수신 → 콜백/이벤트 전달
+- [x] EGFX `ResetGraphics` 모니터 매핑 (서버 재구성 시)
+- [x] `DisplayControlClient`로 런타임 모니터 레이아웃 변경 전송
 
 **좌표 & 스케일링:**
 
 - [ ] 가상 데스크톱 좌표 처리 (음수 좌표, bounding rect 계산)
 - [ ] DPI 스케일링 조율 (GCC Extended Data ↔ DisplayControl 간 일관성)
+
+**테스트 보강 (추후):**
+
+- [ ] Session 통합 테스트: TPKT→X.224→MCS→ShareData 와이어 프레임으로 `ServerMonitorLayout` 출력 검증
+- [ ] Connector 통합 테스트: Finalization 중 MonitorLayoutPdu 주입 → `ConnectionResult.server_monitor_layout` 검증
 
 ### 9.2 Auto-Reconnect
 
