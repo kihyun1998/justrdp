@@ -47,7 +47,7 @@ use justrdp_bulk::bulk::BulkDecompressor;
 #[cfg(feature = "alloc")]
 use justrdp_core::{Encode, WriteCursor};
 #[cfg(feature = "alloc")]
-use justrdp_pdu::rdp::finalization::MonitorLayoutEntry;
+use justrdp_pdu::rdp::finalization::{MonitorLayoutEntry, SaveSessionInfoData};
 #[cfg(feature = "alloc")]
 use justrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason};
 #[cfg(feature = "alloc")]
@@ -124,8 +124,7 @@ pub enum ActiveStageOutput {
     Terminate(GracefulDisconnectReason),
     /// Server sent Save Session Info (logon notification, auto-reconnect cookie, etc.).
     SaveSessionInfo {
-        info_type: u32,
-        data: Vec<u8>,
+        data: SaveSessionInfoData,
     },
     /// Server sent a PDU on a virtual channel.
     ChannelData {

@@ -9,6 +9,8 @@ use justrdp_pdu::rdp::capabilities::CapabilitySet;
 use justrdp_pdu::rdp::finalization::MonitorLayoutEntry;
 use justrdp_pdu::x224::SecurityProtocol;
 
+use crate::config::ArcCookie;
+
 /// Number of bytes written to the output buffer by a `step()` call.
 #[derive(Debug, Clone, Copy)]
 pub struct Written {
@@ -51,4 +53,13 @@ pub struct ConnectionResult {
     /// set `SUPPORT_MONITOR_LAYOUT_PDU` in `earlyCapabilityFlags`. `None` if the server
     /// did not send a Monitor Layout PDU during the connection sequence.
     pub server_monitor_layout: Option<Vec<MonitorLayoutEntry>>,
+    /// Server-issued Auto-Reconnect Cookie received during the connection sequence
+    /// (MS-RDPBCGR 2.2.4.2).
+    ///
+    /// Most servers send the ARC cookie *after* the connection sequence completes,
+    /// inside a Save Session Info PDU during the active session — extract those via
+    /// `ActiveStageOutput::SaveSessionInfo` and `SaveSessionInfoData::arc_cookie()`.
+    /// This field captures the rare case where the server sends it during the
+    /// finalization phase. `None` if no cookie was received during the connection.
+    pub server_arc_cookie: Option<ArcCookie>,
 }

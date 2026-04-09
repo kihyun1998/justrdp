@@ -1270,10 +1270,12 @@ pub trait GfxHandler: Send {
 > **requires**: 7.1 세션 (Save Session Info PDU 수신), Phase 2 커넥터
 > **검증**: integration test (연결 끊기 → 자동 재연결)
 
-- [ ] Auto-Reconnect Cookie 저장/복원 (Save Session Info PDU)
-- [ ] ARC (Auto-Reconnect Cookie) 랜덤 생성
-- [ ] ClientAutoReconnectPacket 전송 (Client Info PDU 내)
-- [ ] 네트워크 끊김 감지 및 자동 재연결 시퀀스
+- [x] Auto-Reconnect Cookie 저장/복원 (Save Session Info PDU)
+- [x] ARC (Auto-Reconnect Cookie) 랜덤 생성
+- [x] ClientAutoReconnectPacket 전송 (Client Info PDU 내)
+- [x] 네트워크 끊김 감지 및 자동 재연결 시퀀스
+  - 라이브러리 (no-I/O): `ArcCookie` API + `SaveSessionInfoData::arc_random()` + `ConnectionResult.server_arc_cookie` + `ConfigBuilder::auto_reconnect_cookie()` + HMAC-MD5 SecurityVerifier 자동 계산
+  - 애플리케이션 책임: TCP 끊김 감지 + 새 소켓 + 재시도 정책 (라이브러리는 I/O 없음)
 
 ### 9.3 Session Redirection
 

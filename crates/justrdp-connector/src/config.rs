@@ -10,6 +10,58 @@ use justrdp_pdu::rdp::client_info::PerformanceFlags;
 use justrdp_pdu::rdp::finalization::TS_MONITOR_PRIMARY;
 use justrdp_pdu::x224::SecurityProtocol;
 
+/// Opaque Auto-Reconnect Cookie received from the server (MS-RDPBCGR 2.2.4.2).
+///
+/// Stores `LogonId` and `ArcRandomBits` from `ARC_SC_PRIVATE_PACKET`.
+/// Pass this to `ConfigBuilder::auto_reconnect_cookie()` to enable automatic reconnection.
+///
+/// `Debug` redacts `arc_random_bits` to prevent accidental secret leakage in logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArcCookie {
+    /// Session ID from the server's ARC_SC_PRIVATE_PACKET.
+    pub logon_id: u32,
+    /// 16-byte random key used to compute the HMAC-MD5 SecurityVerifier.
+    pub arc_random_bits: [u8; 16],
+}
+
+impl core::fmt::Debug for ArcCookie {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ArcCookie")
+            .field("logon_id", &self.logon_id)
+            .field("arc_random_bits", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl ArcCookie {
+    /// Construct an `ArcCookie` from the (logon_id, arc_random_bits) pair extracted
+    /// from a server `SaveSessionInfoData::arc_random()` call.
+    ///
+    /// # Reconnect flow
+    /// ```ignore
+    /// use justrdp_session::ActiveStageOutput;
+    /// use justrdp_connector::ArcCookie;
+    ///
+    /// for output in session.process(&frame)? {
+    ///     if let ActiveStageOutput::SaveSessionInfo { data } = output {
+    ///         if let Some((logon_id, arc_random_bits)) = data.arc_random() {
+    ///             let cookie = ArcCookie::new(logon_id, arc_random_bits);
+    ///             store_cookie_for_reconnect(cookie);
+    ///         }
+    ///     }
+    /// }
+    /// // Later, on disconnect:
+    /// let new_config = previous_config.to_builder()
+    ///     .auto_reconnect_cookie(stored_cookie)
+    ///     .build();
+    /// let connector = ClientConnector::new(new_config);
+    /// // Drive the new connector through the connection sequence...
+    /// ```
+    pub fn new(logon_id: u32, arc_random_bits: [u8; 16]) -> Self {
+        Self { logon_id, arc_random_bits }
+    }
+}
+
 /// Authentication credentials.
 #[derive(Clone)]
 pub struct Credentials {
@@ -396,7 +448,9 @@ pub struct Config {
     /// Performance flags.
     pub performance_flags: PerformanceFlags,
     /// Auto-reconnect cookie from a previous session (optional).
-    pub auto_reconnect_cookie: Option<Vec<u8>>,
+    /// When set, the connector computes an HMAC-MD5 SecurityVerifier and includes
+    /// an ARC_CS_PRIVATE_PACKET in the Client Info PDU (MS-RDPBCGR 5.5).
+    pub auto_reconnect_cookie: Option<ArcCookie>,
     /// Bitmap codec configuration.
     pub bitmap_codecs: BitmapCodecConfig,
     /// Compression configuration.
@@ -600,7 +654,10 @@ impl ConfigBuilder {
     }
 
     /// Set the auto-reconnect cookie from a previous session.
-    pub fn auto_reconnect_cookie(mut self, cookie: Vec<u8>) -> Self {
+    ///
+    /// The connector will compute the HMAC-MD5 SecurityVerifier and include an
+    /// ARC_CS_PRIVATE_PACKET in the Client Info PDU during reconnection.
+    pub fn auto_reconnect_cookie(mut self, cookie: ArcCookie) -> Self {
         self.config.auto_reconnect_cookie = Some(cookie);
         self
     }

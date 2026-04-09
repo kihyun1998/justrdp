@@ -250,7 +250,6 @@ fn dispatch_pdu_type2(
             let mut inner_src = ReadCursor::new(data);
             let pdu = SaveSessionInfoPdu::decode(&mut inner_src)?;
             Ok(vec![ActiveStageOutput::SaveSessionInfo {
-                info_type: pdu.info_type,
                 data: pdu.info_data,
             }])
         }
@@ -543,12 +542,13 @@ mod tests {
     }
 
     #[test]
-    fn process_save_session_info() {
+    fn process_save_session_info_plain_notify() {
+        use justrdp_pdu::rdp::finalization::SaveSessionInfoData;
         let config = test_config();
-        // info_type=0 (LOGON), followed by dummy data
+        // info_type = INFOTYPE_LOGON_PLAINNOTIFY (0x02) + 576 bytes pad
         let mut body = vec![];
-        body.extend_from_slice(&0u32.to_le_bytes()); // info_type = INFO_TYPE_LOGON
-        body.extend_from_slice(b"logon_data");
+        body.extend_from_slice(&2u32.to_le_bytes()); // INFOTYPE_LOGON_PLAINNOTIFY
+        body.extend_from_slice(&[0u8; 576]); // 576-byte pad
         let frame = build_slow_path_frame(config.io_channel_id, config.share_id, ShareDataPduType::SaveSessionInfo, &body);
 
         let mut decompressor = BulkDecompressor::new();
@@ -556,9 +556,8 @@ mod tests {
         let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
-            ActiveStageOutput::SaveSessionInfo { info_type, data } => {
-                assert_eq!(*info_type, 0);
-                assert_eq!(data, b"logon_data");
+            ActiveStageOutput::SaveSessionInfo { data } => {
+                assert_eq!(*data, SaveSessionInfoData::PlainNotify);
             }
             _ => panic!("expected SaveSessionInfo"),
         }
@@ -1095,6 +1094,50 @@ mod tests {
                 assert_eq!(monitors[1].flags, 0);
             }
             other => panic!("expected ServerMonitorLayout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn process_save_session_info_extended_with_arc() {
+        use justrdp_pdu::rdp::finalization::{
+            SaveSessionInfoData, INFOTYPE_LOGON_EXTENDED_INFO,
+            LOGON_EX_AUTORECONNECTCOOKIE, AUTO_RECONNECT_VERSION_1, ARC_PACKET_LEN,
+        };
+        let config = test_config();
+
+        // Build body: infoType(4) + Length(2) + FieldsPresent(4) + cbFieldData(4) + ARC(28) + Pad(570)
+        let mut body = vec![];
+        body.extend_from_slice(&INFOTYPE_LOGON_EXTENDED_INFO.to_le_bytes());
+        // Length = 2 + 4 + (4 + 28) = 38
+        body.extend_from_slice(&38u16.to_le_bytes());
+        body.extend_from_slice(&LOGON_EX_AUTORECONNECTCOOKIE.to_le_bytes());
+        body.extend_from_slice(&28u32.to_le_bytes()); // cbFieldData
+        body.extend_from_slice(&ARC_PACKET_LEN.to_le_bytes()); // cbLen = 28
+        body.extend_from_slice(&AUTO_RECONNECT_VERSION_1.to_le_bytes()); // version = 1
+        body.extend_from_slice(&0x42u32.to_le_bytes()); // logonId
+        body.extend_from_slice(&[0xDD; 16]); // arcRandomBits
+        body.extend_from_slice(&[0u8; 570]); // pad
+
+        let frame = build_slow_path_frame(
+            config.io_channel_id, config.share_id,
+            ShareDataPduType::SaveSessionInfo, &body,
+        );
+        let mut decompressor = justrdp_bulk::bulk::BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::SaveSessionInfo { data } => {
+                match data {
+                    SaveSessionInfoData::Extended(ext) => {
+                        let arc = ext.auto_reconnect_cookie.as_ref().unwrap();
+                        assert_eq!(arc.logon_id, 0x42);
+                        assert_eq!(arc.arc_random_bits, [0xDD; 16]);
+                    }
+                    other => panic!("expected Extended, got {:?}", other),
+                }
+            }
+            other => panic!("expected SaveSessionInfo, got {:?}", other),
         }
     }
 }

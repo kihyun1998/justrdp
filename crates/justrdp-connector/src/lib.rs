@@ -21,8 +21,8 @@ mod sequence;
 mod state;
 
 pub use config::{
-    AadConfig, AuthMode, BitmapCodecConfig, ColorDepth, CompressionConfig, Config, ConfigBuilder,
-    Credentials, DesktopSize, KeyboardType, MonitorConfig, StaticChannelSet,
+    AadConfig, ArcCookie, AuthMode, BitmapCodecConfig, ColorDepth, CompressionConfig, Config,
+    ConfigBuilder, Credentials, DesktopSize, KeyboardType, MonitorConfig, StaticChannelSet,
 };
 pub use connector::ClientConnector;
 pub use credssp::gss_wrap::{gss_unwrap, gss_wrap};
@@ -31,7 +31,9 @@ pub use credssp::kerberos::{
 };
 pub use credssp::{CredentialType, CredsspRandom, CredsspSequence, CredsspState};
 pub use error::{ConnectorError, ConnectorErrorKind, ConnectorResult};
-pub use justrdp_pdu::rdp::finalization::MonitorLayoutEntry;
+pub use justrdp_pdu::rdp::finalization::{
+    ArcCsPrivatePacket, ArcScPrivatePacket, MonitorLayoutEntry, SaveSessionInfoData,
+};
 pub use result::{ConnectionResult, Written};
 pub use sequence::Sequence;
 pub use state::ClientConnectorState;

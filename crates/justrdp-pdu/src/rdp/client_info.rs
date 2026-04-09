@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_core::{DecodeResult, EncodeResult};
 
+use crate::rdp::finalization::{ArcCsPrivatePacket, ARC_CS_PRIVATE_PACKET_SIZE};
+
 /// Client Info flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InfoFlags(u32);
@@ -90,7 +92,7 @@ pub struct ExtendedClientInfo {
     pub client_address: String,
     pub client_dir: String,
     pub performance_flags: PerformanceFlags,
-    pub auto_reconnect_cookie: Option<Vec<u8>>,
+    pub auto_reconnect_cookie: Option<ArcCsPrivatePacket>,
 }
 
 impl ClientInfoPdu {
@@ -206,13 +208,10 @@ impl Encode for ClientInfoPdu {
             // Performance flags
             dst.write_u32_le(extra.performance_flags.bits(), "ExtInfo::performanceFlags")?;
 
-            // Auto-reconnect cookie
+            // Auto-reconnect cookie (MS-RDPBCGR 2.2.1.11.1.1.1)
             if let Some(ref cookie) = extra.auto_reconnect_cookie {
-                let cb_cookie = u16::try_from(cookie.len()).map_err(|_| {
-                    justrdp_core::EncodeError::other("ExtInfo::cbAutoReconnectCookie", "cookie too long for u16")
-                })?;
-                dst.write_u16_le(cb_cookie, "ExtInfo::cbAutoReconnectCookie")?;
-                dst.write_slice(cookie, "ExtInfo::autoReconnectCookie")?;
+                dst.write_u16_le(ARC_CS_PRIVATE_PACKET_SIZE as u16, "ExtInfo::cbAutoReconnectCookie")?;
+                cookie.encode(dst)?;
             } else {
                 dst.write_u16_le(0, "ExtInfo::cbAutoReconnectCookie")?;
             }
@@ -240,8 +239,8 @@ impl Encode for ClientInfoPdu {
             size += 4; // clientSessionId
             size += 4; // performanceFlags
             size += 2; // cbAutoReconnectCookie
-            if let Some(ref cookie) = extra.auto_reconnect_cookie {
-                size += cookie.len();
+            if extra.auto_reconnect_cookie.is_some() {
+                size += ARC_CS_PRIVATE_PACKET_SIZE;
             }
         }
         size
@@ -302,10 +301,15 @@ impl<'de> Decode<'de> for ClientInfoPdu {
 
             let auto_reconnect_cookie = if src.remaining() >= 2 {
                 let cb = src.read_u16_le("ExtInfo::cbAutoReconnectCookie")? as usize;
-                if cb > 0 && src.remaining() >= cb {
-                    Some(src.read_slice(cb, "ExtInfo::autoReconnectCookie")?.into())
-                } else {
+                if cb == 0 {
                     None
+                } else if cb == ARC_CS_PRIVATE_PACKET_SIZE {
+                    // MS-RDPBCGR 2.2.1.11.1.1.1: MUST be 0 or 0x001C (28)
+                    Some(ArcCsPrivatePacket::decode(src)?)
+                } else {
+                    return Err(justrdp_core::DecodeError::unexpected_value(
+                        "ExtInfo", "cbAutoReconnectCookie", "must be 0 or 28",
+                    ));
                 }
             } else { None };
 
@@ -409,5 +413,45 @@ mod tests {
         assert!(flags.contains(InfoFlags::UNICODE));
         assert!(flags.contains(InfoFlags::MOUSE));
         assert!(!flags.contains(InfoFlags::AUTOLOGON));
+    }
+
+    #[test]
+    fn client_info_with_arc_cookie_roundtrip() {
+        let mut info = ClientInfoPdu::new("DOM", "usr", "pwd");
+        let arc = ArcCsPrivatePacket {
+            logon_id: 0x42,
+            security_verifier: [0xCC; 16],
+        };
+        info.extra.as_mut().unwrap().auto_reconnect_cookie = Some(arc);
+
+        let size = info.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        info.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = ClientInfoPdu::decode(&mut cursor).unwrap();
+        let cookie = decoded.extra.unwrap().auto_reconnect_cookie.unwrap();
+        assert_eq!(cookie.logon_id, 0x42);
+        assert_eq!(cookie.security_verifier, [0xCC; 16]);
+    }
+
+    #[test]
+    fn client_info_arc_cookie_invalid_size_rejected() {
+        // Build a ClientInfoPdu with cbAutoReconnectCookie = 5 (invalid)
+        let info = ClientInfoPdu::new("", "", "");
+        let size = info.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        info.encode(&mut cursor).unwrap();
+
+        // Find cbAutoReconnectCookie (last 2 bytes in the encoded buffer for no-cookie case)
+        // and set it to 5 (invalid)
+        let len = buf.len();
+        buf[len - 2] = 5; // cbAutoReconnectCookie = 5
+        buf[len - 1] = 0;
+
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(ClientInfoPdu::decode(&mut cursor).is_err());
     }
 }
