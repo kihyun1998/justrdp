@@ -1,6 +1,5 @@
-// Platform-specific modules use unsafe for libc/windows-sys FFI.
-#![deny(unsafe_code)]
-#![allow(unsafe_code)] // FFI functions in this file require unsafe.
+//! Requires unsafe for libc and windows-sys FFI. All unsafe blocks are individually documented.
+#![allow(unsafe_code)]
 
 //! Native filesystem backend for Device Redirection (MS-RDPEFS).
 //!
@@ -60,6 +59,9 @@ const SL_LOCK_RELEASE: u32 = 0x0000_0020;
 /// Maximum bytes for a single read request (4 MiB).
 const MAX_READ_BYTES: u32 = 4 * 1024 * 1024;
 
+/// Maximum bytes for a single write request (4 MiB).
+const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
+
 // FILE_ACTION constants (MS-FSCC 2.4.42)
 const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
 
@@ -90,12 +92,28 @@ pub struct NativeFilesystemBackend {
 impl NativeFilesystemBackend {
     /// Create a new native filesystem backend.
     ///
-    /// - `root_path`: Local directory to share.
+    /// - `root_path`: Local directory to share. Must exist and be a directory.
     /// - `device_id`: Client-assigned unique device ID.
     /// - `dos_name`: DOS drive name (e.g., `"C:"`), max 7 chars.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dos_name` exceeds 7 characters or if `root_path` is not an
+    /// existing directory.
     pub fn new(root_path: impl Into<PathBuf>, device_id: u32, dos_name: &str) -> Self {
+        assert!(
+            dos_name.len() <= 7,
+            "dos_name must be at most 7 characters, got {}",
+            dos_name.len()
+        );
+        let root_path = root_path.into();
+        assert!(
+            root_path.is_dir(),
+            "root_path must be an existing directory: {:?}",
+            root_path
+        );
         Self {
-            root_path: root_path.into(),
+            root_path,
             device_id,
             dos_name: dos_name.to_string(),
             display_name: None,
@@ -157,7 +175,7 @@ impl NativeFilesystemBackend {
     fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
         let mut pi = 0;
         let mut ti = 0;
-        let mut star_pi = usize::MAX;
+        let mut star_pi: Option<usize> = None;
         let mut star_ti = 0;
 
         while ti < text.len() {
@@ -167,11 +185,11 @@ impl NativeFilesystemBackend {
                 pi += 1;
                 ti += 1;
             } else if pi < pattern.len() && pattern[pi] == b'*' {
-                star_pi = pi;
+                star_pi = Some(pi);
                 star_ti = ti;
                 pi += 1;
-            } else if star_pi != usize::MAX {
-                pi = star_pi + 1;
+            } else if let Some(sp) = star_pi {
+                pi = sp + 1;
                 star_ti += 1;
                 ti = star_ti;
             } else {
@@ -184,6 +202,61 @@ impl NativeFilesystemBackend {
         }
 
         pi == pattern.len()
+    }
+
+    /// Maximum directory entries to buffer (prevents memory exhaustion from
+    /// adversarial directories, e.g., millions of files).
+    const MAX_DIR_ENTRIES: usize = 100_000;
+
+    /// Read a directory and build enumeration state.
+    fn populate_dir_state(dir_path: &std::path::Path, path: Option<&str>) -> DirState {
+        let pattern = path
+            .map(|p| p.trim_start_matches('\\').trim_start_matches('/'))
+            .unwrap_or("*");
+
+        let mut entries = Vec::new();
+
+        // Add "." and ".." entries first
+        if Self::pattern_matches(pattern, ".") {
+            if let Ok(meta) = fs::metadata(dir_path) {
+                entries.push(DirEntry {
+                    name: ".".to_string(),
+                    metadata: meta,
+                });
+            }
+        }
+        if Self::pattern_matches(pattern, "..") {
+            let parent_meta = dir_path
+                .parent()
+                .and_then(|p| fs::metadata(p).ok())
+                .or_else(|| fs::metadata(dir_path).ok());
+            if let Some(meta) = parent_meta {
+                entries.push(DirEntry {
+                    name: "..".to_string(),
+                    metadata: meta,
+                });
+            }
+        }
+
+        // Read directory contents (capped at MAX_DIR_ENTRIES)
+        if let Ok(read_dir) = fs::read_dir(dir_path) {
+            for dir_entry in read_dir.flatten() {
+                if entries.len() >= Self::MAX_DIR_ENTRIES {
+                    break;
+                }
+                let name = dir_entry.file_name().to_string_lossy().to_string();
+                if Self::pattern_matches(pattern, &name) {
+                    if let Ok(meta) = dir_entry.metadata() {
+                        entries.push(DirEntry { name, metadata: meta });
+                    }
+                }
+            }
+        }
+
+        DirState {
+            entries,
+            cursor: 0,
+        }
     }
 }
 
@@ -249,13 +322,14 @@ impl RdpdrBackend for NativeFilesystemBackend {
             .remove(&file_id)
             .ok_or(DeviceIoError::no_such_file())?;
 
-        // Handle delete-on-close
+        // Handle delete-on-close: remove after handle is dropped, then report any error.
         if entry.delete_on_close {
-            if entry.is_dir {
-                let _ = fs::remove_dir(&entry.path);
+            let result = if entry.is_dir {
+                fs::remove_dir(&entry.path)
             } else {
-                let _ = fs::remove_file(&entry.path);
-            }
+                fs::remove_file(&entry.path)
+            };
+            result.map_err(|e| Self::map_io_error(&e))?;
         }
 
         Ok(())
@@ -305,6 +379,12 @@ impl RdpdrBackend for NativeFilesystemBackend {
             .file
             .seek(SeekFrom::Start(offset))
             .map_err(|e| Self::map_io_error(&e))?;
+
+        let data = if data.len() > MAX_WRITE_BYTES {
+            &data[..MAX_WRITE_BYTES]
+        } else {
+            data
+        };
 
         entry
             .file
@@ -357,106 +437,10 @@ impl RdpdrBackend for NativeFilesystemBackend {
         data: &[u8],
     ) -> DeviceIoResult<()> {
         match fs_information_class {
-            FILE_END_OF_FILE_INFORMATION => {
-                let new_size = parse_end_of_file(data)
-                    .ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
-
-                let entry = self
-                    .handles
-                    .get(&file_id)
-                    .ok_or(DeviceIoError::no_such_file())?;
-
-                if entry.is_dir {
-                    return Err(DeviceIoError::new(STATUS_INVALID_PARAMETER));
-                }
-
-                entry
-                    .file
-                    .set_len(new_size)
-                    .map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::Other {
-                            DeviceIoError::new(STATUS_DISK_FULL)
-                        } else {
-                            Self::map_io_error(&e)
-                        }
-                    })?;
-
-                Ok(())
-            }
-
-            FILE_DISPOSITION_INFORMATION => {
-                let delete = parse_disposition(data)
-                    .ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
-
-                let entry = self
-                    .handles
-                    .get_mut(&file_id)
-                    .ok_or(DeviceIoError::no_such_file())?;
-
-                entry.delete_on_close = delete;
-                Ok(())
-            }
-
-            FILE_RENAME_INFORMATION => {
-                let (replace_if_exists, new_name) = parse_rename(data)
-                    .ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
-
-                let entry = self
-                    .handles
-                    .get(&file_id)
-                    .ok_or(DeviceIoError::no_such_file())?;
-
-                let new_path = rdp_to_local(&self.root_path, &new_name)
-                    .ok_or(DeviceIoError::access_denied())?;
-
-                // Only create the immediate parent if missing — do not create
-                // deep directory trees from untrusted server input.
-                if let Some(parent) = new_path.parent() {
-                    if !parent.exists() {
-                        fs::create_dir(parent).map_err(|e| Self::map_io_error(&e))?;
-                    }
-                }
-
-                if replace_if_exists {
-                    fs::rename(&entry.path, &new_path)
-                        .map_err(|e| Self::map_io_error(&e))?;
-                } else {
-                    // Atomic rename without replacement using platform-specific APIs
-                    // to avoid TOCTOU race between exists() check and rename().
-                    rename_exclusive(&entry.path, &new_path)
-                        .map_err(|e| Self::map_io_error(&e))?;
-                }
-
-                // Update the stored path
-                let entry = self
-                    .handles
-                    .get_mut(&file_id)
-                    .ok_or(DeviceIoError::no_such_file())?;
-                entry.path = new_path;
-
-                Ok(())
-            }
-
-            FILE_BASIC_INFORMATION => {
-                let info = parse_basic_info_set(data)
-                    .ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
-
-                let entry = self
-                    .handles
-                    .get(&file_id)
-                    .ok_or(DeviceIoError::no_such_file())?;
-
-                // Apply timestamps using platform-specific APIs.
-                // Value 0 means "don't change", value -1 means "don't update
-                // on subsequent ops" — both are treated as no-op here.
-                // Best-effort: timestamp setting failures are not fatal.
-                // Windows clients set timestamps during file copy and some
-                // platforms silently reject certain timestamp values.
-                let _ = set_file_times(&entry.path, &info);
-
-                Ok(())
-            }
-
+            FILE_END_OF_FILE_INFORMATION => self.apply_end_of_file(file_id, data),
+            FILE_DISPOSITION_INFORMATION => self.apply_disposition(file_id, data),
+            FILE_RENAME_INFORMATION => self.apply_rename(file_id, data),
+            FILE_BASIC_INFORMATION => self.apply_basic_info(file_id, data),
             _ => Err(DeviceIoError::not_supported()),
         }
     }
@@ -507,55 +491,7 @@ impl RdpdrBackend for NativeFilesystemBackend {
         }
 
         if initial_query {
-            // Read the directory and build the enumeration state
-            let pattern = path
-                .map(|p| p.trim_start_matches('\\').trim_start_matches('/'))
-                .unwrap_or("*");
-
-            let mut entries = Vec::new();
-
-            // Add "." and ".." entries first
-            if Self::pattern_matches(pattern, ".") {
-                if let Ok(meta) = fs::metadata(&entry.path) {
-                    entries.push(DirEntry {
-                        name: ".".to_string(),
-                        metadata: meta,
-                    });
-                }
-            }
-            if Self::pattern_matches(pattern, "..") {
-                let parent_meta = entry
-                    .path
-                    .parent()
-                    .and_then(|p| fs::metadata(p).ok())
-                    .or_else(|| fs::metadata(&entry.path).ok());
-                if let Some(meta) = parent_meta {
-                    entries.push(DirEntry {
-                        name: "..".to_string(),
-                        metadata: meta,
-                    });
-                }
-            }
-
-            // Read directory contents
-            if let Ok(read_dir) = fs::read_dir(&entry.path) {
-                for dir_entry in read_dir.flatten() {
-                    let name = dir_entry.file_name().to_string_lossy().to_string();
-                    if Self::pattern_matches(pattern, &name) {
-                        if let Ok(meta) = dir_entry.metadata() {
-                            entries.push(DirEntry {
-                                name,
-                                metadata: meta,
-                            });
-                        }
-                    }
-                }
-            }
-
-            entry.dir_state = Some(DirState {
-                entries,
-                cursor: 0,
-            });
+            entry.dir_state = Some(Self::populate_dir_state(&entry.path, path));
         }
 
         // Return the next entry from the enumeration
@@ -594,7 +530,10 @@ impl RdpdrBackend for NativeFilesystemBackend {
             return Err(DeviceIoError::new(STATUS_NOT_A_DIRECTORY));
         }
 
-        // Block until a filesystem change is detected in the directory.
+        // NOTE: This call blocks the current thread for up to 30 seconds waiting
+        // for a filesystem change event. Callers must invoke this method from a
+        // dedicated blocking thread — not from an async executor or the main
+        // RDP processing loop.
         let changed_name = wait_for_directory_change(&entry.path)
             .map_err(|_| DeviceIoError::unsuccessful())?;
 
@@ -633,9 +572,109 @@ impl RdpdrBackend for NativeFilesystemBackend {
     }
 }
 
+// ── set_information helpers ───────────────────────────────────────────────
+
+impl NativeFilesystemBackend {
+    /// `&self` suffices because `File::set_len` takes `&File` (interior mutability);
+    /// no handle map mutation is needed.
+    fn apply_end_of_file(&self, file_id: FileHandle, data: &[u8]) -> DeviceIoResult<()> {
+        let new_size =
+            parse_end_of_file(data).ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
+
+        let entry = self
+            .handles
+            .get(&file_id)
+            .ok_or(DeviceIoError::no_such_file())?;
+
+        if entry.is_dir {
+            return Err(DeviceIoError::new(STATUS_INVALID_PARAMETER));
+        }
+
+        entry.file.set_len(new_size).map_err(|e| {
+            // Check for platform-specific disk-full error codes.
+            #[cfg(unix)]
+            let is_disk_full = e.raw_os_error() == Some(libc::ENOSPC);
+            #[cfg(windows)]
+            let is_disk_full = e.raw_os_error() == Some(112); // ERROR_DISK_FULL
+            #[cfg(not(any(unix, windows)))]
+            let is_disk_full = false;
+
+            if is_disk_full {
+                DeviceIoError::new(STATUS_DISK_FULL)
+            } else {
+                Self::map_io_error(&e)
+            }
+        })
+    }
+
+    fn apply_disposition(&mut self, file_id: FileHandle, data: &[u8]) -> DeviceIoResult<()> {
+        let delete =
+            parse_disposition(data).ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
+
+        let entry = self
+            .handles
+            .get_mut(&file_id)
+            .ok_or(DeviceIoError::no_such_file())?;
+
+        entry.delete_on_close = delete;
+        Ok(())
+    }
+
+    fn apply_rename(&mut self, file_id: FileHandle, data: &[u8]) -> DeviceIoResult<()> {
+        let (replace_if_exists, new_name) =
+            parse_rename(data).ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
+
+        let entry = self
+            .handles
+            .get(&file_id)
+            .ok_or(DeviceIoError::no_such_file())?;
+
+        let new_path =
+            rdp_to_local(&self.root_path, &new_name).ok_or(DeviceIoError::access_denied())?;
+
+        if replace_if_exists {
+            fs::rename(&entry.path, &new_path).map_err(|e| Self::map_io_error(&e))?;
+        } else {
+            // Atomic rename without replacement using platform-specific APIs
+            // to avoid TOCTOU race between exists() check and rename().
+            rename_exclusive(&entry.path, &new_path).map_err(|e| Self::map_io_error(&e))?;
+        }
+
+        // Update the stored path
+        let entry = self
+            .handles
+            .get_mut(&file_id)
+            .ok_or(DeviceIoError::no_such_file())?;
+        entry.path = new_path;
+
+        Ok(())
+    }
+
+    fn apply_basic_info(&self, file_id: FileHandle, data: &[u8]) -> DeviceIoResult<()> {
+        let info =
+            parse_basic_info_set(data).ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
+
+        let entry = self
+            .handles
+            .get(&file_id)
+            .ok_or(DeviceIoError::no_such_file())?;
+
+        // Apply timestamps using platform-specific APIs.
+        // Value 0 means "don't change", value -1 means "don't update
+        // on subsequent ops" — both are treated as no-op here.
+        // Best-effort: timestamp setting failures are not fatal.
+        let _ = set_file_times(&entry.file, &info);
+
+        Ok(())
+    }
+}
+
 // ── Platform-specific helpers ─────────────────────────────────────────────
 
 // ── FILE_NOTIFY_INFORMATION encoding ──────────────────────────────────────
+
+/// FILE_NOTIFY_INFORMATION fixed header size (before FileName).
+const NOTIFY_INFO_HEADER: usize = 12;
 
 /// Encode a single FILE_NOTIFY_INFORMATION entry (MS-FSCC 2.4.42).
 ///
@@ -648,7 +687,7 @@ fn encode_notify_info(filename: &str, action: u32) -> Vec<u8> {
     let name_utf16 = path::encode_utf16le(filename);
     let name_len = name_utf16.len() as u32;
 
-    let mut buf = Vec::with_capacity(12 + name_utf16.len());
+    let mut buf = Vec::with_capacity(NOTIFY_INFO_HEADER + name_utf16.len());
     buf.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset = 0 (single entry)
     buf.extend_from_slice(&action.to_le_bytes()); // Action
     buf.extend_from_slice(&name_len.to_le_bytes()); // FileNameLength
@@ -789,13 +828,19 @@ fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
     }
 
     // Parse the first inotify_event to extract the filename.
+    // NOTE: Only the first event is parsed. If the kernel batches multiple events
+    // into a single read() call (standard inotify behavior), subsequent events are
+    // ignored. This is acceptable because we only need one change name as a hint.
     // Use read_unaligned because buf is a [u8] array with 1-byte alignment,
     // but inotify_event has 4-byte aligned fields.
     if n as usize >= std::mem::size_of::<libc::inotify_event>() {
         let event = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const libc::inotify_event) };
         if event.len > 0 {
             let name_start = std::mem::size_of::<libc::inotify_event>();
-            let name_end = name_start + event.len as usize;
+            let name_end = match name_start.checked_add(event.len as usize) {
+                Some(end) => end,
+                None => return Ok(".".to_string()),
+            };
             if name_end <= n as usize {
                 let name_bytes = &buf[name_start..name_end];
                 // Trim trailing nulls
@@ -861,19 +906,22 @@ fn wait_for_directory_change(_dir: &std::path::Path) -> std::io::Result<String> 
 
 // ── Atomic rename (no-replace) ────────────────────────────────────────────
 
+/// Convert a `Path` to a `CString` for FFI calls on Unix.
+#[cfg(unix)]
+fn path_to_cstring(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))
+}
+
 /// Rename a file/directory atomically, failing if the destination exists.
 ///
 /// Uses platform-specific APIs to avoid TOCTOU race between an existence
 /// check and the rename operation.
 #[cfg(target_os = "linux")]
 fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let from_c = CString::new(from.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
-    let to_c = CString::new(to.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let from_c = path_to_cstring(from)?;
+    let to_c = path_to_cstring(to)?;
 
     // SAFETY: Calling libc renameat2 with valid C strings and AT_FDCWD.
     // RENAME_NOREPLACE (1) fails atomically if destination exists.
@@ -896,13 +944,8 @@ fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Re
 
 #[cfg(target_os = "macos")]
 fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let from_c = CString::new(from.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
-    let to_c = CString::new(to.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let from_c = path_to_cstring(from)?;
+    let to_c = path_to_cstring(to)?;
 
     // SAFETY: Calling libc renameatx_np with valid C strings and AT_FDCWD.
     // RENAME_EXCL (0x0004) fails atomically if destination exists.
@@ -948,15 +991,13 @@ fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Re
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    // Fallback: best-effort check + rename. Small TOCTOU window remains.
-    if to.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "destination already exists",
-        ));
-    }
-    fs::rename(from, to)
+fn rename_exclusive(_from: &std::path::Path, _to: &std::path::Path) -> std::io::Result<()> {
+    // No atomic rename-exclusive available on this platform.
+    // Return Unsupported rather than silently degrading to a racy check+rename.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic rename-exclusive not supported on this platform",
+    ))
 }
 
 // ── File timestamp setting ────────────────────────────────────────────────
@@ -964,25 +1005,19 @@ fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Re
 /// Set file timestamps from a FILE_BASIC_INFORMATION structure.
 ///
 /// Timestamps with value 0 or -1 are skipped (meaning "don't change").
+/// Uses `futimens` on the open fd to avoid rename-race issues with path-based APIs.
 #[cfg(unix)]
-fn set_file_times(path: &std::path::Path, info: &fs_info::BasicInfoSet) {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+fn set_file_times(file: &std::fs::File, info: &fs_info::BasicInfoSet) {
+    use std::os::unix::io::AsRawFd;
 
     let access_time = filetime_to_timespec(info.last_access_time);
     let mod_time = filetime_to_timespec(info.last_write_time);
 
     let times = [access_time, mod_time];
 
-    // SAFETY: Calling utimensat with a valid C string path and valid timespec array.
-    // AT_FDCWD resolves relative paths from the current directory.
+    // SAFETY: fd is a valid open file descriptor, times is a valid [timespec; 2].
     unsafe {
-        libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
+        libc::futimens(file.as_raw_fd(), times.as_ptr());
     }
 }
 
@@ -996,11 +1031,7 @@ fn filetime_to_timespec(filetime: i64) -> libc::timespec {
         };
     }
 
-    // FILETIME: 100-nanosecond intervals since 1601-01-01
-    // Unix epoch offset: 116_444_736_000_000_000
-    const FILETIME_UNIX_OFFSET: i64 = 116_444_736_000_000_000;
-
-    let relative = filetime - FILETIME_UNIX_OFFSET;
+    let relative = filetime - fs_info::FILETIME_UNIX_EPOCH_OFFSET;
 
     if relative < 0 {
         // Before Unix epoch — set to epoch (best effort).
@@ -1015,52 +1046,29 @@ fn filetime_to_timespec(filetime: i64) -> libc::timespec {
     let secs = relative / 10_000_000;
     let nsecs = (relative % 10_000_000) * 100;
 
-    {
-        libc::timespec {
-            tv_sec: secs as libc::time_t,
-            tv_nsec: nsecs as libc::c_long,
-        }
+    libc::timespec {
+        tv_sec: secs as libc::time_t,
+        tv_nsec: nsecs as libc::c_long,
     }
 }
 
 #[cfg(windows)]
-fn set_file_times(path: &std::path::Path, info: &fs_info::BasicInfoSet) {
-    use std::os::windows::ffi::OsStrExt;
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-
-    // Open with FILE_WRITE_ATTRIBUTES to set timestamps.
-    // SAFETY: Calling Windows API with valid null-terminated wide string.
-    let handle = unsafe {
-        windows_sys::Win32::Storage::FileSystem::CreateFileW(
-            wide.as_ptr(),
-            0x0100, // FILE_WRITE_ATTRIBUTES
-            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
-                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
-            std::ptr::null(),
-            windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
-            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-        return;
-    }
+fn set_file_times(file: &std::fs::File, info: &fs_info::BasicInfoSet) {
+    use std::os::windows::io::AsRawHandle;
 
     let creation = filetime_or_null(info.creation_time);
     let access = filetime_or_null(info.last_access_time);
     let write = filetime_or_null(info.last_write_time);
 
-    // SAFETY: handle is valid and FILETIME pointers are valid or null.
+    // SAFETY: file handle is valid, FILETIME pointers are valid or null.
+    // Using the open file handle directly avoids rename-race issues.
     unsafe {
         windows_sys::Win32::Storage::FileSystem::SetFileTime(
-            handle,
+            file.as_raw_handle() as _,
             creation.as_ref().map_or(std::ptr::null(), |ft| ft),
             access.as_ref().map_or(std::ptr::null(), |ft| ft),
             write.as_ref().map_or(std::ptr::null(), |ft| ft),
         );
-        windows_sys::Win32::Foundation::CloseHandle(handle);
     }
 }
 
@@ -1077,7 +1085,7 @@ fn filetime_or_null(ft: i64) -> Option<windows_sys::Win32::Foundation::FILETIME>
 }
 
 #[cfg(not(any(unix, windows)))]
-fn set_file_times(_path: &std::path::Path, _info: &fs_info::BasicInfoSet) {
+fn set_file_times(_file: &std::fs::File, _info: &fs_info::BasicInfoSet) {
     // No platform API available — accept silently.
 }
 

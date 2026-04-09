@@ -11,6 +11,7 @@ const FILE_DEVICE_DISK: u32 = 0x0000_0007;
 const FILE_DEVICE_IS_MOUNTED: u32 = 0x0000_0020;
 
 // FileSystemAttributes -- MS-FSCC 2.5.2
+#[cfg(unix)]
 const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
@@ -110,7 +111,8 @@ impl DiskSpace {
             free_bytes: stat.f_bfree as u64 * frsize,
             available_bytes: stat.f_bavail as u64 * frsize,
             bytes_per_sector: 512,
-            sectors_per_cluster: (stat.f_frsize as u32) / 512,
+            // Ensure at least 1 sector per cluster even if f_frsize < 512
+            sectors_per_cluster: std::cmp::max(1, stat.f_frsize as u32 / 512),
         })
     }
 
@@ -137,8 +139,10 @@ pub fn encode_volume_info(volume_label: &str) -> Vec<u8> {
 
     // VolumeCreationTime (8 bytes) — 0 (unknown)
     buf.extend_from_slice(&0i64.to_le_bytes());
-    // VolumeSerialNumber (4 bytes)
-    buf.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+    // VolumeSerialNumber (4 bytes) — fixed value; distinct volumes can be
+    // differentiated by label if needed.
+    const VOLUME_SERIAL_NUMBER: u32 = 0x1234_5678;
+    buf.extend_from_slice(&VOLUME_SERIAL_NUMBER.to_le_bytes());
     // VolumeLabelLength (4 bytes)
     buf.extend_from_slice(&label_len.to_le_bytes());
     // SupportsObjects (1 byte)
@@ -212,14 +216,20 @@ pub fn encode_attribute_info(fs_name: &str) -> Vec<u8> {
     let name_bytes = encode_utf16le(fs_name);
     let name_len = name_bytes.len() as u32;
 
+    // On Windows, NTFS is case-insensitive by default, so omit FILE_CASE_SENSITIVE_SEARCH.
+    // On Unix-like systems, filesystems are typically case-sensitive.
+    #[cfg(unix)]
     let attributes = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK;
+    #[cfg(not(unix))]
+    let attributes = FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK;
 
     let mut buf = Vec::with_capacity(12 + name_bytes.len());
 
     // FileSystemAttributes (4 bytes)
     buf.extend_from_slice(&attributes.to_le_bytes());
-    // MaximumComponentNameLength (4 bytes)
-    buf.extend_from_slice(&255i32.to_le_bytes());
+    // MaximumComponentNameLength (4 bytes) — MS-FSCC 2.5.1
+    const MAX_COMPONENT_NAME_LENGTH: i32 = 255;
+    buf.extend_from_slice(&MAX_COMPONENT_NAME_LENGTH.to_le_bytes());
     // FileSystemNameLength (4 bytes)
     buf.extend_from_slice(&name_len.to_le_bytes());
     // FileSystemName (variable)
@@ -351,11 +361,14 @@ mod tests {
         assert_eq!(buf.len(), 20);
 
         let attrs = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        // Unix includes FILE_CASE_SENSITIVE_SEARCH (0x01), Windows does not.
+        #[cfg(unix)]
         assert_eq!(
             attrs,
             FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK
         );
-        assert_eq!(attrs, 0x07);
+        #[cfg(not(unix))]
+        assert_eq!(attrs, FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK);
 
         let max_component = i32::from_le_bytes(buf[4..8].try_into().unwrap());
         assert_eq!(max_component, 255);

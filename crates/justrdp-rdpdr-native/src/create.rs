@@ -22,9 +22,6 @@ const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
-#[allow(dead_code)]
-const DELETE: u32 = 0x0001_0000;
-
 // ── CreateOptions constants (MS-SMB2 2.2.13) ───────────────────────────────
 
 pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
@@ -103,32 +100,35 @@ fn open_directory(
     create_disposition: u32,
     delete_on_close: bool,
 ) -> io::Result<OpenResult> {
-    let existed = path.exists();
-
     match create_disposition {
         FILE_CREATE => {
-            if existed {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "directory already exists",
-                ));
+            // Atomic: create_dir fails with AlreadyExists if the directory exists.
+            match fs::create_dir(path) {
+                Ok(()) => {
+                    let file = open_dir_handle(path)?;
+                    Ok(OpenResult {
+                        file,
+                        is_dir: true,
+                        information: FILE_CREATED,
+                        delete_on_close,
+                    })
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+                Err(e) => {
+                    // Parent may not exist — try create_dir_all then re-check atomically.
+                    fs::create_dir_all(path).map_err(|_| e)?;
+                    let file = open_dir_handle(path)?;
+                    Ok(OpenResult {
+                        file,
+                        is_dir: true,
+                        information: FILE_CREATED,
+                        delete_on_close,
+                    })
+                }
             }
-            fs::create_dir_all(path)?;
-            let file = open_dir_handle(path)?;
-            Ok(OpenResult {
-                file,
-                is_dir: true,
-                information: FILE_CREATED,
-                delete_on_close,
-            })
         }
         FILE_OPEN => {
-            if !existed || !path.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "directory not found",
-                ));
-            }
+            // Atomic: open_dir_handle fails with NotFound if it doesn't exist.
             let file = open_dir_handle(path)?;
             Ok(OpenResult {
                 file,
@@ -138,25 +138,28 @@ fn open_directory(
             })
         }
         FILE_OPEN_IF => {
-            if !existed {
-                fs::create_dir_all(path)?;
+            // Try to open first; if not found, create and report.
+            match open_dir_handle(path) {
+                Ok(file) => Ok(OpenResult {
+                    file,
+                    is_dir: true,
+                    information: FILE_OPENED,
+                    delete_on_close,
+                }),
+                Err(_) => {
+                    fs::create_dir_all(path)?;
+                    let file = open_dir_handle(path)?;
+                    Ok(OpenResult {
+                        file,
+                        is_dir: true,
+                        information: FILE_CREATED,
+                        delete_on_close,
+                    })
+                }
             }
-            let file = open_dir_handle(path)?;
-            Ok(OpenResult {
-                file,
-                is_dir: true,
-                information: if existed { FILE_OPENED } else { FILE_CREATED },
-                delete_on_close,
-            })
         }
         FILE_OVERWRITE => {
-            // FILE_OVERWRITE: directory must exist (same as FILE_OPEN for dirs)
-            if !existed || !path.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "directory not found",
-                ));
-            }
+            // Directory must exist — open atomically (same as FILE_OPEN for dirs).
             let file = open_dir_handle(path)?;
             Ok(OpenResult {
                 file,
@@ -166,25 +169,31 @@ fn open_directory(
             })
         }
         FILE_SUPERSEDE | FILE_OVERWRITE_IF => {
-            // Supersede/overwrite-if for directories: open if exists, create if not.
-            if !existed {
-                fs::create_dir_all(path)?;
-            }
-            let file = open_dir_handle(path)?;
-            let information = if existed {
-                match create_disposition {
-                    FILE_SUPERSEDE => FILE_SUPERSEDED,
-                    _ => FILE_OVERWRITTEN,
+            // Open if exists, create if not. Infer information from which path succeeded.
+            match open_dir_handle(path) {
+                Ok(file) => {
+                    let information = match create_disposition {
+                        FILE_SUPERSEDE => FILE_SUPERSEDED,
+                        _ => FILE_OVERWRITTEN,
+                    };
+                    Ok(OpenResult {
+                        file,
+                        is_dir: true,
+                        information,
+                        delete_on_close,
+                    })
                 }
-            } else {
-                FILE_CREATED
-            };
-            Ok(OpenResult {
-                file,
-                is_dir: true,
-                information,
-                delete_on_close,
-            })
+                Err(_) => {
+                    fs::create_dir_all(path)?;
+                    let file = open_dir_handle(path)?;
+                    Ok(OpenResult {
+                        file,
+                        is_dir: true,
+                        information: FILE_CREATED,
+                        delete_on_close,
+                    })
+                }
+            }
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -209,8 +218,6 @@ fn open_regular_file(
         != 0
         || !need_write; // default to read if no specific flags
 
-    let existed = path.exists();
-
     let mut opts = OpenOptions::new();
     opts.read(need_read).write(need_write);
 
@@ -218,80 +225,131 @@ fn open_regular_file(
         opts.append(true);
     }
 
-    #[allow(clippy::needless_late_init)]
-    let information;
-
     match create_disposition {
         FILE_SUPERSEDE => {
-            // Create if not exists, truncate if exists.
-            opts.create(true).truncate(true);
-            information = if existed {
-                FILE_SUPERSEDED
-            } else {
-                FILE_CREATED
-            };
+            // Try create_new first to distinguish created vs superseded atomically.
+            opts.write(true).create_new(true);
+            match opts.open(path) {
+                Ok(file) => Ok(OpenResult {
+                    file,
+                    is_dir: false,
+                    information: FILE_CREATED,
+                    delete_on_close,
+                }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // File existed — reopen with truncate.
+                    let mut opts2 = OpenOptions::new();
+                    opts2.read(need_read).write(true).truncate(true);
+                    let file = opts2.open(path)?;
+                    Ok(OpenResult {
+                        file,
+                        is_dir: false,
+                        information: FILE_SUPERSEDED,
+                        delete_on_close,
+                    })
+                }
+                Err(e) => Err(e),
+            }
         }
         FILE_OPEN => {
-            // Open existing only.
-            if !existed {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
-            }
-            information = FILE_OPENED;
+            // Open existing only — open() fails with NotFound atomically.
+            let file = opts.open(path)?;
+            Ok(OpenResult {
+                file,
+                is_dir: false,
+                information: FILE_OPENED,
+                delete_on_close,
+            })
         }
         FILE_CREATE => {
-            // Create new, fail if exists.
+            // Create new, fail if exists — create_new is atomic.
             opts.create_new(true);
-            // create_new requires write
             if !need_write {
                 opts.write(true);
             }
-            information = FILE_CREATED;
+            let file = opts.open(path)?;
+            Ok(OpenResult {
+                file,
+                is_dir: false,
+                information: FILE_CREATED,
+                delete_on_close,
+            })
         }
         FILE_OPEN_IF => {
-            // Open or create.
-            opts.create(true);
-            // create requires write
+            // Try create_new to detect creation atomically.
             if !need_write {
                 opts.write(true);
             }
-            information = if existed { FILE_OPENED } else { FILE_CREATED };
+            opts.create_new(true);
+            match opts.open(path) {
+                Ok(file) => Ok(OpenResult {
+                    file,
+                    is_dir: false,
+                    information: FILE_CREATED,
+                    delete_on_close,
+                }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // File existed — open normally.
+                    let mut opts2 = OpenOptions::new();
+                    opts2.read(need_read).write(need_write);
+                    let file = opts2.open(path)?;
+                    Ok(OpenResult {
+                        file,
+                        is_dir: false,
+                        information: FILE_OPENED,
+                        delete_on_close,
+                    })
+                }
+                Err(e) => Err(e),
+            }
         }
         FILE_OVERWRITE => {
-            // Open existing + truncate.
-            if !existed {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
-            }
+            // Open existing + truncate — open() fails with NotFound atomically.
             opts.truncate(true);
-            // truncate requires write
             if !need_write {
                 opts.write(true);
             }
-            information = FILE_OVERWRITTEN;
+            let file = opts.open(path)?;
+            Ok(OpenResult {
+                file,
+                is_dir: false,
+                information: FILE_OVERWRITTEN,
+                delete_on_close,
+            })
         }
         FILE_OVERWRITE_IF => {
-            // Create or truncate.
-            opts.create(true).truncate(true);
-            information = if existed {
-                FILE_OVERWRITTEN
-            } else {
-                FILE_CREATED
-            };
+            // Try create_new to detect creation atomically.
+            if !need_write {
+                opts.write(true);
+            }
+            opts.create_new(true);
+            match opts.open(path) {
+                Ok(file) => Ok(OpenResult {
+                    file,
+                    is_dir: false,
+                    information: FILE_CREATED,
+                    delete_on_close,
+                }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // File existed — reopen with truncate.
+                    let mut opts2 = OpenOptions::new();
+                    opts2.read(need_read).write(true).truncate(true);
+                    let file = opts2.open(path)?;
+                    Ok(OpenResult {
+                        file,
+                        is_dir: false,
+                        information: FILE_OVERWRITTEN,
+                        delete_on_close,
+                    })
+                }
+                Err(e) => Err(e),
+            }
         }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid create disposition",
-            ));
-        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid create disposition",
+        )),
     }
-
-    let file = opts.open(path)?;
-    Ok(OpenResult {
-        file,
-        is_dir: false,
-        information,
-        delete_on_close,
-    })
 }
 
 #[cfg(test)]

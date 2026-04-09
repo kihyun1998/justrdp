@@ -16,7 +16,7 @@ use justrdp_rdpdr::pdu::irp::{
 // ── FILETIME ────────────────────────────────────────────────────────────────
 
 /// 100-nanosecond intervals between 1601-01-01 and 1970-01-01.
-const FILETIME_UNIX_EPOCH_OFFSET: i64 = 116_444_736_000_000_000;
+pub(crate) const FILETIME_UNIX_EPOCH_OFFSET: i64 = 116_444_736_000_000_000;
 
 /// Convert a `SystemTime` to Windows FILETIME (i64).
 ///
@@ -126,13 +126,16 @@ fn is_readonly(metadata: &Metadata) -> bool {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Default allocation unit size in bytes (standard 4 KiB block).
+pub const ALLOCATION_UNIT_BYTES: u64 = 4096;
+
 /// Round `size` up to the nearest `block_size` multiple.
 pub fn align_allocation(size: u64, block_size: u64) -> i64 {
     if block_size == 0 || size == 0 {
         return 0;
     }
     let aligned = size.div_ceil(block_size) * block_size;
-    aligned as i64
+    i64::try_from(aligned).unwrap_or(i64::MAX)
 }
 
 fn time_to_filetime_or_zero(time: std::io::Result<SystemTime>) -> i64 {
@@ -174,7 +177,7 @@ pub fn encode_standard_info(metadata: &Metadata) -> Vec<u8> {
 
     let is_dir = metadata.is_dir();
     let file_size = if is_dir { 0 } else { metadata.len() };
-    let allocation_size = align_allocation(file_size, 4096);
+    let allocation_size = align_allocation(file_size, ALLOCATION_UNIT_BYTES);
 
     buf.extend_from_slice(&allocation_size.to_le_bytes()); // AllocationSize
     buf.extend_from_slice(&(file_size as i64).to_le_bytes()); // EndOfFile

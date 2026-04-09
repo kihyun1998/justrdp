@@ -56,11 +56,12 @@ fn validate_within_root(path: &Path, root: &Path) -> Option<PathBuf> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    // If root itself cannot be canonicalized (e.g., doesn't exist), fall back
-    // to component-level validation only.
+    // If root itself cannot be canonicalized (e.g., doesn't exist or permission
+    // denied), reject the path entirely — symlink escape validation is meaningless
+    // without a canonical root reference.
     let root_canonical = match root.canonicalize() {
         Ok(c) => c,
-        Err(_) => return Some(path.to_path_buf()),
+        Err(_) => return None,
     };
 
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -139,7 +140,7 @@ fn fd_to_path(fd: std::os::unix::io::RawFd) -> Option<PathBuf> {
 }
 
 /// Get the canonical filesystem path for an open file descriptor.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn fd_to_path(_fd: std::os::unix::io::RawFd) -> Option<PathBuf> {
     // No portable way to get a path from an fd on other Unix systems.
     // Fall back to None, which causes the parent to skip validation

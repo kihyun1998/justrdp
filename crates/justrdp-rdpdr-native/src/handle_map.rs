@@ -120,10 +120,14 @@ impl Default for HandleMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_file() -> (File, PathBuf) {
-        let path = std::env::temp_dir().join(format!("justrdp_test_{}", std::process::id()));
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "justrdp_hmap_test_{}_{}", std::process::id(), id
+        ));
         let file = File::create(&path).expect("failed to create temp file");
         (file, path)
     }

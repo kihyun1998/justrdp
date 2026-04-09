@@ -15,14 +15,15 @@ use justrdp_rdpdr::pdu::irp::{
     FILE_NAMES_INFORMATION,
 };
 
-use crate::fs_info::{align_allocation, metadata_to_attributes_with_name, system_time_to_filetime};
+use crate::fs_info::{
+    align_allocation, metadata_to_attributes_with_name, system_time_to_filetime,
+    ALLOCATION_UNIT_BYTES,
+};
 use crate::path::encode_utf16le;
 
 // ── Alignment ──────────────────────────────────────────────────────────────
 
-/// Round `n` up to the next 8-byte boundary.
-#[inline]
-/// Round `n` up to the next 8-byte boundary (used by `encode_dir_entries`).
+/// Round `n` up to the next 8-byte boundary (used by `encode_dir_entries` in tests).
 #[cfg(test)]
 fn align8(n: usize) -> usize {
     (n + 7) & !7
@@ -65,8 +66,8 @@ pub fn encode_dir_entry(
 /// Encode multiple directory entries into a single buffer with 8-byte alignment.
 ///
 /// Each entry's `NextEntryOffset` is set correctly. Last entry has `NextEntryOffset = 0`.
-#[cfg(test)]
 /// Returns `None` for unsupported information classes or if `entries` is empty.
+#[cfg(test)]
 pub fn encode_dir_entries(
     fs_information_class: u32,
     entries: &[(String, Metadata)],
@@ -110,9 +111,9 @@ pub fn encode_dir_entries(
 
 // ── Entry encoders ─────────────────────────────────────────────────────────
 
-/// Encode FILE_DIRECTORY_INFORMATION (class 1).
+/// Write the 60-byte common header shared by classes 1, 2, and 3.
 ///
-/// Layout (64 bytes header + FileName):
+/// Layout:
 /// ```text
 /// NextEntryOffset  (u32)  offset  0
 /// FileIndex        (u32)  offset  4
@@ -123,15 +124,13 @@ pub fn encode_dir_entries(
 /// EndOfFile        (i64)  offset 40
 /// AllocationSize   (i64)  offset 48
 /// FileAttributes   (u32)  offset 56
-/// FileNameLength   (u32)  offset 60
-/// FileName         (var)  offset 64
 /// ```
-fn encode_file_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
-    let file_name_bytes = encode_utf16le(name);
-    let file_name_length = file_name_bytes.len() as u32;
-
-    let mut buf = Vec::with_capacity(DIR_INFO_HEADER + file_name_bytes.len());
-
+fn write_common_dir_header(
+    buf: &mut Vec<u8>,
+    name: &str,
+    metadata: &Metadata,
+    file_name_length: u32,
+) {
     let (creation, last_access, last_write, change) = extract_times(metadata);
     let end_of_file = file_size(metadata);
     let allocation_size = compute_allocation_size(metadata);
@@ -157,52 +156,30 @@ fn encode_file_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
     buf.extend_from_slice(&attrs.to_le_bytes());
     // FileNameLength
     buf.extend_from_slice(&file_name_length.to_le_bytes());
-    // FileName
-    buf.extend_from_slice(&file_name_bytes);
+}
 
+/// Encode FILE_DIRECTORY_INFORMATION (class 1).
+///
+/// Header: 64 bytes (common 60 + FileNameLength 4) + FileName.
+fn encode_file_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
+    let file_name_bytes = encode_utf16le(name);
+    let mut buf = Vec::with_capacity(DIR_INFO_HEADER + file_name_bytes.len());
+    write_common_dir_header(&mut buf, name, metadata, file_name_bytes.len() as u32);
+    buf.extend_from_slice(&file_name_bytes);
     buf
 }
 
 /// Encode FILE_FULL_DIRECTORY_INFORMATION (class 2).
 ///
-/// Same as class 1 with an additional EaSize (u32) field after FileNameLength.
+/// Same as class 1 with an additional EaSize (u32) field.
 /// Header: 68 bytes + FileName.
 fn encode_file_full_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
     let file_name_bytes = encode_utf16le(name);
-    let file_name_length = file_name_bytes.len() as u32;
-
     let mut buf = Vec::with_capacity(FULL_DIR_INFO_HEADER + file_name_bytes.len());
-
-    let (creation, last_access, last_write, change) = extract_times(metadata);
-    let end_of_file = file_size(metadata);
-    let allocation_size = compute_allocation_size(metadata);
-    let attrs = metadata_to_attributes_with_name(metadata, name);
-
-    // NextEntryOffset
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // FileIndex
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // CreationTime
-    buf.extend_from_slice(&creation.to_le_bytes());
-    // LastAccessTime
-    buf.extend_from_slice(&last_access.to_le_bytes());
-    // LastWriteTime
-    buf.extend_from_slice(&last_write.to_le_bytes());
-    // ChangeTime
-    buf.extend_from_slice(&change.to_le_bytes());
-    // EndOfFile
-    buf.extend_from_slice(&end_of_file.to_le_bytes());
-    // AllocationSize
-    buf.extend_from_slice(&allocation_size.to_le_bytes());
-    // FileAttributes
-    buf.extend_from_slice(&attrs.to_le_bytes());
-    // FileNameLength
-    buf.extend_from_slice(&file_name_length.to_le_bytes());
+    write_common_dir_header(&mut buf, name, metadata, file_name_bytes.len() as u32);
     // EaSize
     buf.extend_from_slice(&0u32.to_le_bytes());
-    // FileName
     buf.extend_from_slice(&file_name_bytes);
-
     buf
 }
 
@@ -213,35 +190,8 @@ fn encode_file_full_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
 /// Header: 94 bytes + FileName.
 fn encode_file_both_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
     let file_name_bytes = encode_utf16le(name);
-    let file_name_length = file_name_bytes.len() as u32;
-
     let mut buf = Vec::with_capacity(BOTH_DIR_INFO_HEADER + file_name_bytes.len());
-
-    let (creation, last_access, last_write, change) = extract_times(metadata);
-    let end_of_file = file_size(metadata);
-    let allocation_size = compute_allocation_size(metadata);
-    let attrs = metadata_to_attributes_with_name(metadata, name);
-
-    // NextEntryOffset
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // FileIndex
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // CreationTime
-    buf.extend_from_slice(&creation.to_le_bytes());
-    // LastAccessTime
-    buf.extend_from_slice(&last_access.to_le_bytes());
-    // LastWriteTime
-    buf.extend_from_slice(&last_write.to_le_bytes());
-    // ChangeTime
-    buf.extend_from_slice(&change.to_le_bytes());
-    // EndOfFile
-    buf.extend_from_slice(&end_of_file.to_le_bytes());
-    // AllocationSize
-    buf.extend_from_slice(&allocation_size.to_le_bytes());
-    // FileAttributes
-    buf.extend_from_slice(&attrs.to_le_bytes());
-    // FileNameLength
-    buf.extend_from_slice(&file_name_length.to_le_bytes());
+    write_common_dir_header(&mut buf, name, metadata, file_name_bytes.len() as u32);
     // EaSize
     buf.extend_from_slice(&0u32.to_le_bytes());
     // ShortNameLength
@@ -250,9 +200,7 @@ fn encode_file_both_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
     buf.push(0u8);
     // ShortName (24 bytes, zero-filled)
     buf.extend_from_slice(&[0u8; 24]);
-    // FileName
     buf.extend_from_slice(&file_name_bytes);
-
     buf
 }
 
@@ -316,13 +264,13 @@ fn file_size(metadata: &Metadata) -> i64 {
     }
 }
 
-/// Compute the allocation size (rounded up to 4096-byte blocks).
+/// Compute the allocation size (rounded up to [`ALLOCATION_UNIT_BYTES`] blocks).
 /// Directories report 0.
 fn compute_allocation_size(metadata: &Metadata) -> i64 {
     if metadata.is_dir() {
         0
     } else {
-        align_allocation(metadata.len(), 4096)
+        align_allocation(metadata.len(), ALLOCATION_UNIT_BYTES)
     }
 }
 
