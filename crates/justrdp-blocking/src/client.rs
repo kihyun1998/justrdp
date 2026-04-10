@@ -100,7 +100,16 @@ impl Write for Transport {
 /// High-level synchronous RDP client.
 pub struct RdpClient {
     transport: Option<Transport>,
-    session: Option<ActiveStage>,
+    /// Active session processor.
+    ///
+    /// Boxed because `ActiveStage` carries two `BulkDecompressor` instances
+    /// (slow-path and fast-path) and each one inlines a 64 KiB MPPC64K
+    /// history buffer plus a 64 KiB NCRUSH history buffer plus an 8 KiB
+    /// MPPC8K history. With both decompressors that's ~272 KiB inline; if
+    /// it lived directly on `RdpClient`, the struct would blow Windows'
+    /// default 1 MiB stack as soon as it crossed two nested method frames
+    /// without NRVO. Heap-allocating it keeps `RdpClient` small.
+    session: Option<Box<ActiveStage>>,
     reconnect_policy: ReconnectPolicy,
     scratch: Vec<u8>,
     /// Events produced by a single `session.process()` call that have
@@ -308,7 +317,7 @@ impl RdpClient {
             channel_ids: result.channel_ids.clone(),
         };
         let channel_ids = result.channel_ids.clone();
-        let session = ActiveStage::new(session_config);
+        let session = Box::new(ActiveStage::new(session_config));
 
         // Wire SVC processors. Each processor declares a channel_name();
         // assign_ids matches that against the connector's negotiated MCS

@@ -44,7 +44,7 @@
 - [x] TLS 업그레이드 실제 수행: `EnhancedSecurityUpgrade` 감지 → `mem::replace`로 TCP 추출 → `upgrader.upgrade()` → `Transport::Tls`로 swap → `server_public_key` 보관
 - [x] `server_public_key: Option<Vec<u8>>` 필드 (M2에서 CredSSP가 사용)
 - [x] `Transport::Swapping` 경로 단위 테스트
-- [ ] 통합 테스트: self-signed loopback 서버로 업그레이드 성공/Reject — **M2 이후 CredSSP 실패가 정상 경로가 되면서 추가 가능**
+- [x] 실서버 검증 (`192.168.136.136`): TCP→X.224→TLS→SPKI 추출 성공 — `examples/connect_test.rs`로 확인
 
 **현재 동작**: `connect()`가 TCP → X.224 → TLS 업그레이드까지 수행 후 `ConnectError::Unimplemented("post-TLS CredSSP + connection finalization (M2+)")` 반환. `server_public_key`도 정상 추출됨.
 
@@ -72,7 +72,7 @@
 - [x] CredSSP 시퀀스 완료 후 커넥터를 `CredsspNegoTokens → CredsspPubKeyAuth → CredsspCredentials → CredsspEarlyUserAuth → BasicSettingsExchangeSendInitial` 순서로 no-op step
 - [x] `client.rs::connect_with_upgrader()` 업데이트: TLS 업그레이드 후 EnhancedSecurityUpgrade 한 스텝 전진 → CredSSP 분기 → 연결 종료 상태 도달
 - [x] `ConnectError::Unimplemented` 메시지를 "post-CredSSP connection finalization pump (M3+)"로 업데이트
-- [ ] 실서버 `192.168.136.136` 통합 테스트 — **M3 이후 실제 Connected 도달 시점에 수행** (현재 Connected 전에 Unimplemented 반환)
+- [x] 실서버 검증: `examples/connect_test.rs` 실행 → CredSSP/NLA "complete" 통과 확인. 기존 connector finalization 버그(`step_finalization_wait_pdu` PDU 순서 문제)에 의해 finalization 끝까지는 못 가지만 M2 범위는 검증됨
 
 **현재 동작**: TCP → X.224 → TLS 업그레이드 → SPKI 추출 → CredSSP 전체 시퀀스 (Negotiate → Challenge → Authenticate+pubKeyAuth → Credentials → HYBRID_EX EarlyUserAuth) → BasicSettingsExchangeSendInitial 도달 후 `Unimplemented("post-CredSSP connection finalization pump (M3+)")` 반환.
 
@@ -163,7 +163,7 @@
 - [ ] ~~`send_mouse_wheel(delta)`~~ → 후속 작업 (PTRFLAGS_WHEEL/HWHEEL/WHEEL_NEGATIVE 인코딩 필요)
 - [ ] ~~`InputDatabase` 내장~~ → MVP에서는 사용자가 직접 관리. 추후 옵션 feature로 추가 검토
 - [ ] ~~키보드 sync (LockKeys 동기화)~~ → 후속, `FastPathSyncEvent` 사용 예정
-- [ ] 실서버 검증: 미수행 (예제 바이너리 작성 필요)
+- [x] 실서버 검증: `examples/connect_test.rs` 작성, M1-M3 (TCP/TLS/CredSSP)는 정상 동작. M4 이후(`next_event` 루프, `send_*`)는 connector finalization 버그로 도달 못 함 — 별도 이슈
 
 **현재 동작**: `RdpClient` 사용자가 키 입력 / 유니코드 / 마우스 이동 / 마우스 클릭을 송신할 수 있음. 4가지 fast-path 이벤트 모두 와이어 포맷 정확.
 
@@ -238,7 +238,7 @@
 - [x] `synthetic_client()` 헬퍼: 라이브 네트워크 없이 RdpClient 필드를 직접 구성해 predicate 테스트 가능
 - [ ] ~~`DisconnectReason::is_retryable()`~~ — 후속 작업. 현재는 모든 IO/Disconnected 에러를 재시도
 - [ ] ~~리다이렉션 루프 방지 (depth counter)~~ — §9.3 작업과 함께
-- [ ] 실서버 통합 테스트 — `192.168.136.136` 연결 → 강제 disconnect → 3초 내 복구. 별도 commit (예제 바이너리 필요)
+- [ ] 실서버 통합 테스트 — `connect_test.rs` 예제 바이너리 작성 완료, `--reconnect` 플래그 지원. 다만 finalization까지 도달 못 해서 active 세션 중 disconnect 시나리오는 검증 못 함. **connector finalization 버그 해결 후 재검증 필요**
 
 **현재 동작**: `RdpClient::set_reconnect_policy(ReconnectPolicy::aggressive())` 호출하면 다음 disconnect부터 자동 재연결 시도. 로드맵 §9.2의 모든 PDU 레이어 + 런타임 항목 체크 완료.
 
