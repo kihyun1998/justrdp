@@ -695,11 +695,10 @@ pub enum ClientConnectorState {
 - [x] 서버 공개키 추출 (`extract_server_public_key()`)
 - [x] 자체 서명 인증서 처리 (RDP 서버 일반적)
 - [x] TLS 1.2 / 1.3 지원
-- [ ] **`ServerCertVerifier` trait** — unknown/self-signed 인증서에 대한 사용자 결정 훅
-  - `verify(&self, cert_der: &[u8], server_name: &str) -> CertDecision`
-  - `CertDecision { Accept, Reject, AcceptOnce }`
-  - 기본 구현체: `AcceptAll`(경고), `SystemRoots`(OS 루트), `Pinned`(지문 비교)
-  - rustls `ServerCertVerifier`를 래핑하여 TLS 업그레이드 시점에 주입
+- [x] **`ServerCertVerifier` trait** — `verify(&self, cert_der, server_name) -> CertDecision { Accept, Reject, AcceptOnce }`
+  - [x] `AcceptAll` (mstsc.exe 기본), `PinnedSpki` (SHA-256 SPKI 핀닝, constant-time 비교)
+  - [x] rustls `VerifierBridge` 래핑 (`with_verifier(Arc<dyn ServerCertVerifier>)`)
+  - [x] native-tls post-handshake verification path (M1 follow-up)
 
 ### 5.5 `justrdp-blocking` -- Synchronous I/O Runtime
 
@@ -806,12 +805,13 @@ pub enum RdpEvent {
   - [x] `last_arc_cookie` 자동 캡처 (`SaveSessionInfoData::arc_random()`) + `Config::auto_reconnect_cookie` 재사용
   - [x] `RdpEvent::Reconnecting { attempt }` / `Reconnected` 방출
   - [x] `can_reconnect()` 사전 검사 (정책 활성 + cookie 있음 + SVC 비어 있음)
-  - [ ] `DisconnectReason::is_retryable()` 매핑 (§21.6) — 현재는 모든 IO 에러 재시도, 후속 작업
-- [ ] **Session Redirection 자동 리다이렉트** (9.3 미착수)
-  - [ ] Redirection PDU 수신 시 현재 소켓 종료
-  - [ ] 새 target address로 `TcpStream::connect` 재수립
-  - [ ] Routing Token/Cookie를 새 `Config`에 주입
-  - [ ] `RdpEvent::Redirected` 방출
+  - [x] `is_error_info_retryable(code) -> bool` — user intent / policy / transient / license / broker 5-way 분류. blocking의 `next_event` Terminate 분기에서 `try_reconnect` 게이트로 연결
+- [x] **Session Redirection 자동 리다이렉트** (§9.3 3-phase 완료)
+  - [x] Redirection PDU 수신 시 현재 소켓 종료 (finalization wait에서 ShareControlPduType::ServerRedirect 감지)
+  - [x] Target 주소 파싱 (UTF-16LE → SocketAddr, LB_TARGET_NET_ADDRESS / LB_TARGET_NET_ADDRESSES fallback)
+  - [x] Routing Token/Cookie를 새 `Config.routing_token`에 주입 (X.224 routingToken field)
+  - [x] `RdpEvent::Redirected { target }` 방출 (handshake 루프 탈출 후 one-shot event)
+  - [x] 리다이렉션 루프 방지 (MAX_REDIRECTS = 5)
 - [ ] **License persistence** (9.15 미착수)
   - [ ] `FileLicenseStore` 구현 (`~/.justrdp/licenses/{server}_{hwid}.bin`)
   - [ ] `Config::license_store()` 빌더 메서드
@@ -823,12 +823,12 @@ pub enum RdpEvent {
 - [x] **에러 처리** (M1~M6 누적)
   - [x] `ConnectError` enum (`Tcp` / `Tls` / `Connector` / `UnexpectedEof` / `FrameTooLarge` / `ChannelSetup` / `Unimplemented`)
   - [x] `RuntimeError` enum (`Io` / `Session` / `FrameTooLarge` / `Disconnected` / `Unimplemented`)
-  - [ ] `DisconnectReason` 정밀 매핑 (§21.6)
-- [ ] **Integration tests** (실서버 검증 잔여)
+  - [x] `is_error_info_retryable(code)` 분류 (user intent / policy / transient / license / broker 5-way)
+- [ ] **Integration tests** (일부 잔여)
   - [ ] xrdp Docker 컨테이너 E2E (CI)
-  - [ ] Windows RDS E2E (manual, `192.168.136.136`)
-  - [ ] Auto-reconnect: 연결 수립 → 소켓 강제 종료 → 3초 내 복구
-  - [ ] Session redirection: mock broker로 302 스타일 리다이렉션 검증
+  - [x] Windows RDS E2E (manual, `192.168.136.136`) — connect_test 예제로 양방향 활성 세션 검증 (GraphicsUpdate + PointerBitmap + 입력 송신)
+  - [x] Auto-reconnect: `test_drop_transport()` → `Reconnecting` → `Reconnected` → 정상 재개 (420ms)
+  - [x] Session redirection: connector-level wire-format injection test 2개 (WaitSynchronize + WaitFontMap 양쪽에서 LB cookie / TARGET_NET_ADDRESS 검증)
 
 ---
 
@@ -1418,7 +1418,7 @@ pub trait GfxHandler: Send {
 - [x] `next_event()` 자동 reconnect 진입 (Disconnected/Io → try_reconnect)
 - [x] 재연결 전제 조건 (`can_reconnect()`): policy.max_attempts > 0 AND last_arc_cookie.is_some() AND svc_set.is_empty()
 - [x] SVC processor와 reconnect 상호 배제 (MVP: stateful processors는 자동 재연결 시 부활 불가)
-- [ ] `DisconnectReason` → 재연결 가능 여부 판단 (§21.6) — 현재는 모든 IO 에러를 재시도. retryable 판단은 후속 작업
+- [x] `is_error_info_retryable(code)` → 재연결 가능 여부 판단 (§21.6 분류): user intent / policy denial → 비재시도; transient (timeout, OOM, protocol error) → 재시도; licensing / broker → 비재시도
 
 ### 9.3 Session Redirection ✅
 
