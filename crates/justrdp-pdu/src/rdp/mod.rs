@@ -12,6 +12,8 @@ pub mod licensing;
 #[cfg(feature = "alloc")]
 pub mod rdstls;
 #[cfg(feature = "alloc")]
+pub mod redirection;
+#[cfg(feature = "alloc")]
 pub mod server_certificate;
 #[cfg(feature = "alloc")]
 pub mod standard_security;
