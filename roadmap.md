@@ -1457,7 +1457,52 @@ pub trait GfxHandler: Send {
 - [x] `send_synchronize(LockKeys)` — `FastPathSyncEvent` 연결 완료
 - [x] `InputDatabase` 상태 관리 내부화 — 고수준 상태추적 API 완료
 - [x] PK-encrypted password cookie 투명 전달 — `password_cookie()` 생성자 + Config 필드 + Connector 분기 + Blocking 감지 완료 (클라이언트는 복호화 안함, 투명 전달)
-- [ ] mock broker 통합 테스트 — TcpListener + 가짜 RDP handshake로 redirect path E2E 검증 (§9.3 런타임)
+#### 9.3.5 Mock Broker 통합 테스트
+
+> **목적**: Session Redirection E2E 검증 — `TcpListener` 2개 (broker + target)로 redirect path 전체 경로를 실 TCP 위에서 테스트
+> **파일**: `crates/justrdp-blocking/tests/mock_redirect.rs`
+> **실행**: `cargo test -p justrdp-blocking --test mock_redirect`
+
+**설계 결정:**
+- X.224 Confirm에서 `SSL`만 negotiate → `EnhancedSecurityUpgrade` 후 곧바로 GCC로 진입 (CredSSP 전체 스킵)
+- `NoopTlsUpgrader` 구현 — TLS 핸드셰이크 없이 raw TCP passthrough, dummy `server_public_key` 반환
+- `connect_with_upgrader()`에 주입하여 실 TLS 없이 테스트
+
+**Phase 1 — MockRdpServer 골격:**
+- [x] `NoopUpgrader` 구현 (`TlsUpgrader` trait, `PassthroughStream` 래퍼로 TLS 건너뜀)
+- [x] `MockMode` enum — `Broker { target_addr, lb_info }` / `Target`
+- [x] `run_mock_handshake()` — accept 후 12단계 핸드셰이크 + 모드별 finalization
+- [x] `start_mock_server()` — `TcpListener` bind + thread spawn
+
+**Phase 2 — 핸드셰이크 응답 시퀀스:**
+- [x] Read X.224 CR → Write X.224 CC (`ConnectionConfirm`, `SSL` only, TPKT 직접 래핑)
+- [x] [NoopUpgrader passthrough]
+- [x] Read MCS Connect Initial → Write MCS Connect Response (GCC Core/Security/Network, 블록 헤더 자동 포함)
+- [x] Read Erect Domain Request (consume)
+- [x] Read Attach User Request → Write `AttachUserConfirm` (initiator=1007)
+- [x] Read Channel Join Request ×2 → Write `ChannelJoinConfirm` ×2
+- [x] Read Client Info PDU → Write `LicenseErrorMessage::valid_client()` (SEC_LICENSE_PKT 플래그)
+- [x] Write `DemandActivePdu` (GeneralCapability only)
+- [x] Read Confirm Active (consume)
+- [x] Read Synchronize + Control Cooperate + Control Request + Font List (consume 4개)
+- [x] **Broker 모드**: Write `ServerRedirectionPdu` (LB_LOAD_BALANCE_INFO + LB_TARGET_NET_ADDRESS)
+- [x] **Target 모드**: Write Synchronize + Cooperate + Granted Control + Font Map → Connected
+
+**Phase 3 — Redirect E2E 테스트:**
+- [x] `test_direct_connect_to_target` — target mock 직접 연결 성공 (redirect 없이)
+- [x] `test_redirect_broker_to_target` — broker→target redirect 성공, `RdpEvent::Redirected` 수신, target IP 확인
+
+**Phase 4 — Edge case 테스트:**
+- [x] `test_max_redirect_depth_exceeded` — 7개 broker 체인, 6번째 redirect에서 `too many redirects` 에러 확인
+- [x] `test_redirect_no_target_address` — LB_TARGET_NET_ADDRESS 없이 redirect → 원래 주소 fallback → TCP 에러 (broker gone)
+- [ ] `test_redirect_with_pk_encrypted_password` — `LB_PASSWORD_IS_PK_ENCRYPTED` 감지 확인 (RDSTLS 핸드셰이크 필요, 후속)
+
+**재사용 코드:**
+- `TpktHeader::for_payload()`, `DataTransfer`, `SendDataIndication` — 프레임 조립
+- `ConnectionConfirm`, `ConnectResponse`, `AttachUserConfirm`, `ChannelJoinConfirm` — Encode impls
+- `DemandActivePdu`, `SynchronizePdu`, `ControlPdu`, `FontListPdu` — finalization PDUs
+- `encode_vec()` — 범용 PDU 직렬화
+- `connector.rs:2794` `build_server_data_frame()` 패턴 참조
 
 ### 9.4 Touch Input (MS-RDPEI)
 
