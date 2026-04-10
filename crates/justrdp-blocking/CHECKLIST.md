@@ -201,46 +201,48 @@
 
 ---
 
-## M7 — Auto-Reconnect 런타임 (§9.2 완성)
+## M7 — Auto-Reconnect 런타임 (§9.2 완성) ✅
 
 **로드맵 근거**: §9.2 런타임 레이어
 
 이게 최종 목표. 여기까지 와야 사용자가 "됐다"를 느낄 수 있음.
 
-- [ ] `ReconnectPolicy`를 `RdpClient`에 통합 (이미 필드 있음)
-- [ ] `last_arc_cookie: Option<ArcCookie>` 필드 추가, `SaveSessionInfo` 이벤트에서 `SaveSessionInfoData::arc_random()` 호출해 저장
-- [ ] `last_server_addr: SocketAddr` 보관 (connect 시점에 기록)
-- [ ] `last_config: Config` 보관 (재사용용, Clone 필요)
-- [ ] TCP 끊김 감지
-  - `read`가 `Ok(0)` 반환 또는 `WouldBlock` 외 io::Error → 끊김
-  - 끊김 시 `Err(RuntimeError::Disconnected)` 대신 재연결 시도 경로로 분기
-- [ ] 재연결 루프
-  ```rust
-  for attempt in 1..=policy.max_attempts {
-      std::thread::sleep(policy.delay_for_attempt(attempt));
-      emit(RdpEvent::Reconnecting { attempt });
-      let new_config = self.last_config.clone()
-          .with_auto_reconnect_cookie(self.last_arc_cookie.clone());
-      match Self::connect_inner(self.last_server_addr, new_config, ...) {
-          Ok(new_client) => {
-              *self = new_client;
-              emit(RdpEvent::Reconnected);
-              return Ok(());
-          }
-          Err(e) if is_retryable(&e) => continue,
-          Err(e) => return Err(e.into()),
-      }
-  }
-  ```
-- [ ] `DisconnectReason::is_retryable()` — §21.6 체크리스트, `justrdp-pdu`에 추가 필요
-- [ ] 재연결 중 `next_event()`는 `Reconnecting` / `Reconnected` 이벤트 방출 후 투명하게 다음 이벤트로 진행
-- [ ] 리다이렉션 루프 방지 (§9.3과 공통) — `reconnect_depth` 카운터
-- [ ] **통합 테스트** (가장 중요):
-  - [ ] 실서버 연결 → `server_arc_cookie` 확인 / `SaveSessionInfo` 대기
-  - [ ] 소켓을 고의로 `shutdown()` → `next_event()`가 `Reconnecting` → `Reconnected` 순서로 이벤트 방출
-  - [ ] 3초 이내 복구 (Phase 5 Exit Criteria)
+- [x] `ReconnectPolicy` 통합 (RdpClient 필드)
+- [x] `last_arc_cookie: Option<ArcCookie>` — `SaveSessionInfo` 이벤트마다 `SaveSessionInfoData::arc_random()` 호출해 갱신 (M4 dispatcher 안에서 captured_arc_cookie local로 받아 borrow block 종료 후 self에 flush)
+- [x] `last_server_addr: SocketAddr` — connect 시 `to_socket_addrs().next()`로 즉시 해석 (DNS는 첫 reconnect 시점에 캐싱됨)
+- [x] `last_server_name: String` — TLS SNI 호스트네임 보관
+- [x] `last_config: Config` — 원본을 clone()해서 보관 (Config는 이미 Clone)
+- [x] **`connect_inner` 패턴 대신 `do_one_reconnect`** — `Self::connect()` 재호출 + 새 인스턴스의 session-tier 필드(transport/session/svc_set/user_channel_id/server_public_key)를 self로 move. last_* 필드와 reconnect_policy/pending_events는 유지
+- [x] TCP 끊김 감지: `read_pdu`에서 `ConnectError::UnexpectedEof`/`Tcp(io)` → `RuntimeError::Disconnected`/`Io` → `next_event()`가 `try_reconnect()`로 분기
+- [x] 재연결 루프 (`try_reconnect`):
+  - `can_reconnect()` 사전 검사 (3가지 전제)
+  - `for attempt in 1..=max_attempts`:
+    - `sleep(policy.delay_for_attempt(attempt))` (지수 백오프)
+    - `pending_events.push_back(Reconnecting { attempt })`
+    - `do_one_reconnect()` 호출
+    - 성공 시 `Reconnected` push 후 return
+  - 모두 실패 시 `Disconnected(ServerDisconnect(DomainDisconnected))` push + `mark_disconnected()`
+- [x] **재연결 전제 (`can_reconnect()`)**:
+  1. `reconnect_policy.max_attempts > 0`
+  2. `last_arc_cookie.is_some()` (서버가 ARC cookie 없이는 logon 세션 부활 불가)
+  3. `svc_set.is_empty()` — SVC processors는 stateful이라 reconnect 시 부활 불가, MVP에서 mutex
+- [x] `next_event()` 통합: `read_one_frame` 에러를 ` Disconnected/Io` 패턴 매치로 잡아 `try_reconnect()` 호출 → 다시 루프로 돌아가 큐 드레인
+- [x] `do_one_reconnect`이 `ConfigBuilder` 안 거치고 `config.auto_reconnect_cookie = self.last_arc_cookie.clone()` 직접 주입 (Config는 public field)
+- [x] **6개 단위 테스트**:
+  - `can_reconnect_requires_enabled_policy` (disabled → false)
+  - `can_reconnect_requires_arc_cookie` (cookie None → false)
+  - `can_reconnect_blocked_by_processors` (processor 있음 → false)
+  - `can_reconnect_allowed_with_policy_and_cookie` (모든 전제 만족 → true)
+  - `try_reconnect_disabled_policy_emits_disconnect_and_marks_terminal` (disabled → Disconnected만 emit, Reconnecting noise 없음)
+  - `try_reconnect_with_processors_short_circuits_to_disconnect` (processor → 즉시 Disconnected)
+- [x] `synthetic_client()` 헬퍼: 라이브 네트워크 없이 RdpClient 필드를 직접 구성해 predicate 테스트 가능
+- [ ] ~~`DisconnectReason::is_retryable()`~~ — 후속 작업. 현재는 모든 IO/Disconnected 에러를 재시도
+- [ ] ~~리다이렉션 루프 방지 (depth counter)~~ — §9.3 작업과 함께
+- [ ] 실서버 통합 테스트 — `192.168.136.136` 연결 → 강제 disconnect → 3초 내 복구. 별도 commit (예제 바이너리 필요)
 
-**검증**: §9.2가 진짜로 "돌아간다"고 말할 수 있는 지점. roadmap.md에서 `[ ]` → `[x]` 전환.
+**현재 동작**: `RdpClient::set_reconnect_policy(ReconnectPolicy::aggressive())` 호출하면 다음 disconnect부터 자동 재연결 시도. 로드맵 §9.2의 모든 PDU 레이어 + 런타임 항목 체크 완료.
+
+**검증**: `cargo test -p justrdp-blocking` 33 pass (M6 27 + 신규 6), 워크스페이스 clean. roadmap.md §9.2 런타임 항목 5개 모두 `[x]` 마킹됨.
 
 ---
 

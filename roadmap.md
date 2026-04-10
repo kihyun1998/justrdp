@@ -1380,11 +1380,14 @@ pub trait GfxHandler: Send {
 
 **런타임 레이어 (`justrdp-blocking` §5.5에서 구현):**
 
-- [ ] TCP 끊김 감지 (소켓 EOF / write 실패)
-- [ ] `ReconnectPolicy` (최대 시도, 간격, 백오프)
-- [ ] 새 소켓 + TLS 재업그레이드 + ARC cookie 기반 재인증
-- [ ] `RdpEvent::Reconnecting { attempt }` / `Reconnected` 방출
-- [ ] `DisconnectReason` → 재연결 가능 여부 판단 (21.6)
+- [x] TCP 끊김 감지 (read EOF / Io 에러)
+- [x] `ReconnectPolicy` (최대 시도, 초기 지연, 최대 지연, 지수 백오프)
+- [x] 새 소켓 + TLS 재업그레이드 + ARC cookie 기반 재인증 (`do_one_reconnect`)
+- [x] `RdpEvent::Reconnecting { attempt }` / `Reconnected` 방출
+- [x] `next_event()` 자동 reconnect 진입 (Disconnected/Io → try_reconnect)
+- [x] 재연결 전제 조건 (`can_reconnect()`): policy.max_attempts > 0 AND last_arc_cookie.is_some() AND svc_set.is_empty()
+- [x] SVC processor와 reconnect 상호 배제 (MVP: stateful processors는 자동 재연결 시 부활 불가)
+- [ ] `DisconnectReason` → 재연결 가능 여부 판단 (§21.6) — 현재는 모든 IO 에러를 재시도. retryable 판단은 후속 작업
 
 ### 9.3 Session Redirection
 

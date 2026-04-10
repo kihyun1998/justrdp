@@ -10,10 +10,10 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 
-use justrdp_connector::{ClientConnector, ClientConnectorState, Config, Sequence};
+use justrdp_connector::{ArcCookie, ClientConnector, ClientConnectorState, Config, Sequence};
 use justrdp_core::WriteBuf;
 use justrdp_input::{MouseButton, Scancode};
 use justrdp_pdu::rdp::fast_path::{
@@ -124,6 +124,20 @@ pub struct RdpClient {
     /// keys against the same certificate).
     #[allow(dead_code)]
     server_public_key: Option<Vec<u8>>,
+    /// Resolved server address from the initial connect, used by M7
+    /// auto-reconnect to skip the DNS step on retry.
+    last_server_addr: SocketAddr,
+    /// SNI hostname captured at the initial connect, reused by M7
+    /// auto-reconnect when re-running the TLS handshake.
+    last_server_name: String,
+    /// Config snapshot taken before the connector consumed the original.
+    /// On reconnect, this is cloned and the latest ARC cookie is injected
+    /// before being handed to a new `ClientConnector`.
+    last_config: Config,
+    /// Most recent Auto-Reconnect Cookie surfaced via SaveSessionInfo
+    /// (MS-RDPBCGR 5.5). `None` until the server has logged the user in
+    /// and emitted a logon-info PDU containing the ARC random bits.
+    last_arc_cookie: Option<ArcCookie>,
 }
 
 impl RdpClient {
@@ -188,7 +202,23 @@ impl RdpClient {
         U: TlsUpgrader,
         U::Stream: 'static,
     {
-        let tcp = TcpStream::connect(server)?;
+        // Resolve the server address eagerly so M7 auto-reconnect can
+        // skip DNS on retry. Multi-A-record DNS is collapsed to the first
+        // resolved address — applications that need round-robin failover
+        // should resolve themselves and pass a SocketAddr.
+        let last_server_addr = server
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| {
+                ConnectError::Tcp(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "no socket addresses resolved from `server` argument",
+                ))
+            })?;
+        let last_server_name = server_name.to_string();
+        let last_config = config.clone();
+
+        let tcp = TcpStream::connect(last_server_addr)?;
         let mut connector = ClientConnector::new(config);
         let mut transport = Transport::Tcp(tcp);
 
@@ -307,6 +337,12 @@ impl RdpClient {
         }
         transport.flush().map_err(ConnectError::Tcp)?;
 
+        // If the connector captured an ARC cookie during the connection
+        // sequence (rare — most servers send it later inside an active
+        // SaveSessionInfo PDU), seed last_arc_cookie with it so a very
+        // early disconnect can still trigger M7 auto-reconnect.
+        let last_arc_cookie = result.server_arc_cookie.clone();
+
         Ok(Self {
             transport: Some(transport),
             session: Some(session),
@@ -317,6 +353,10 @@ impl RdpClient {
             svc_set,
             user_channel_id,
             server_public_key,
+            last_server_addr,
+            last_server_name,
+            last_config,
+            last_arc_cookie,
         })
     }
 
@@ -337,6 +377,13 @@ impl RdpClient {
     ///
     /// `ResponseFrame` outputs are written back to the transport before any
     /// event is returned; they never surface to callers.
+    ///
+    /// If a [`ReconnectPolicy`] has been set via
+    /// [`set_reconnect_policy`](Self::set_reconnect_policy) and the transport
+    /// drops mid-session, this method will attempt automatic reconnection
+    /// (using the captured ARC cookie) before surfacing the disconnect.
+    /// Each attempt produces a [`RdpEvent::Reconnecting`] event; on success
+    /// a final [`RdpEvent::Reconnected`] event is queued and the loop resumes.
     pub fn next_event(&mut self) -> Result<Option<RdpEvent>, RuntimeError> {
         loop {
             if let Some(event) = self.pending_events.pop_front() {
@@ -345,7 +392,18 @@ impl RdpClient {
             if self.disconnected {
                 return Ok(None);
             }
-            self.read_one_frame()?;
+            match self.read_one_frame() {
+                Ok(()) => continue,
+                Err(RuntimeError::Disconnected) | Err(RuntimeError::Io(_)) => {
+                    // Transport-level error: attempt M7 auto-reconnect.
+                    // try_reconnect pushes Reconnecting/Reconnected (or
+                    // Disconnected on failure) into pending_events and
+                    // updates self in place on success.
+                    self.try_reconnect();
+                    // Loop again to drain whatever try_reconnect queued.
+                }
+                Err(other) => return Err(other),
+            }
         }
     }
 
@@ -366,6 +424,10 @@ impl RdpClient {
         let mut should_disconnect = false;
         let mut svc_responses: Vec<Vec<u8>> = Vec::new();
         let user_channel_id = self.user_channel_id;
+        // Local mutable carry for the ARC cookie because the inner borrow
+        // block holds a &mut on self.session and cannot also touch
+        // self.last_arc_cookie. Flushed after the block ends.
+        let mut captured_arc_cookie: Option<ArcCookie> = None;
 
         {
             let transport = self
@@ -403,6 +465,14 @@ impl RdpClient {
                         local_events.push(RdpEvent::PointerBitmap { pointer_type, data });
                     }
                     ActiveStageOutput::SaveSessionInfo { data } => {
+                        // M7: opportunistically capture the Auto-Reconnect
+                        // Cookie if the server bundled one in this PDU.
+                        // The cookie remains valid across the lifetime of
+                        // the logon session, so we overwrite the previous
+                        // value rather than ignoring updates.
+                        if let Some((logon_id, arc_random_bits)) = data.arc_random() {
+                            captured_arc_cookie = Some(ArcCookie::new(logon_id, arc_random_bits));
+                        }
                         local_events.push(RdpEvent::SaveSessionInfo(data));
                     }
                     ActiveStageOutput::ServerMonitorLayout { monitors } => {
@@ -507,6 +577,11 @@ impl RdpClient {
             transport.flush().map_err(RuntimeError::Io)?;
         }
 
+        // Persist ARC cookie outside the inner borrow block.
+        if let Some(cookie) = captured_arc_cookie {
+            self.last_arc_cookie = Some(cookie);
+        }
+
         self.pending_events.extend(local_events);
         if should_disconnect {
             self.mark_disconnected();
@@ -518,6 +593,104 @@ impl RdpClient {
         self.disconnected = true;
         self.transport.take();
         self.session.take();
+    }
+
+    /// Attempt to reconnect after a transport-level failure.
+    ///
+    /// Pushes one [`RdpEvent::Reconnecting`] per attempt, then either
+    /// [`RdpEvent::Reconnected`] on success or [`RdpEvent::Disconnected`]
+    /// on terminal failure. The session is fully reset and ready for
+    /// further [`next_event`] calls when this returns.
+    ///
+    /// Pre-conditions for reconnect to be attempted:
+    /// - `reconnect_policy.max_attempts > 0`
+    /// - `last_arc_cookie.is_some()` (the server requires the ARC cookie
+    ///   to associate the new socket with the existing logon session)
+    /// - `svc_set.is_empty()` — SVC processors carry per-session state
+    ///   that cannot be revived from a stored Config alone, so reconnect
+    ///   is mutually exclusive with channel registration in this MVP
+    fn try_reconnect(&mut self) {
+        if !self.can_reconnect() {
+            self.pending_events.push_back(RdpEvent::Disconnected(
+                GracefulDisconnectReason::ServerDisconnect(
+                    justrdp_pdu::mcs::DisconnectReason::DomainDisconnected,
+                ),
+            ));
+            self.mark_disconnected();
+            return;
+        }
+
+        // Drop the dead transport eagerly so a flapping reconnect loop
+        // doesn't accidentally reuse a half-closed socket.
+        self.transport.take();
+        self.session.take();
+
+        let max_attempts = self.reconnect_policy.max_attempts;
+        for attempt in 1..=max_attempts {
+            let delay = self.reconnect_policy.delay_for_attempt(attempt);
+            if delay > std::time::Duration::ZERO {
+                std::thread::sleep(delay);
+            }
+            self.pending_events
+                .push_back(RdpEvent::Reconnecting { attempt });
+
+            match self.do_one_reconnect() {
+                Ok(()) => {
+                    self.pending_events.push_back(RdpEvent::Reconnected);
+                    return;
+                }
+                Err(_e) => {
+                    // Try again on the next iteration. Errors are
+                    // intentionally swallowed here; if all attempts fail
+                    // the loop falls through to the disconnect path.
+                }
+            }
+        }
+
+        // All attempts exhausted.
+        self.pending_events.push_back(RdpEvent::Disconnected(
+            GracefulDisconnectReason::ServerDisconnect(
+                justrdp_pdu::mcs::DisconnectReason::DomainDisconnected,
+            ),
+        ));
+        self.mark_disconnected();
+    }
+
+    fn can_reconnect(&self) -> bool {
+        self.reconnect_policy.max_attempts > 0
+            && self.last_arc_cookie.is_some()
+            && self.svc_set.is_empty()
+    }
+
+    /// Perform one full reconnection attempt: TCP + TLS + CredSSP +
+    /// connection finalization, using the saved server address, server
+    /// name, and config (with the latest ARC cookie injected).
+    ///
+    /// On success, the session-related fields on `self` are replaced
+    /// with the new connection's values; the "last_*" remembered fields
+    /// stay intact for the next reconnect attempt.
+    fn do_one_reconnect(&mut self) -> Result<(), ConnectError> {
+        let mut config = self.last_config.clone();
+        config.auto_reconnect_cookie = self.last_arc_cookie.clone();
+
+        // Reuse the simple connect() path. This rebuilds a fresh
+        // RustlsUpgrader with AcceptAll — applications that need a
+        // pinned verifier across reconnects must use a custom verifier
+        // factory (not yet exposed).
+        let new_client =
+            Self::connect(self.last_server_addr, &self.last_server_name, config)?;
+
+        // Move the new client's "session" fields into self while keeping
+        // the existing reconnect_policy, last_*, and pending_events.
+        self.transport = new_client.transport;
+        self.session = new_client.session;
+        self.svc_set = new_client.svc_set;
+        self.user_channel_id = new_client.user_channel_id;
+        self.server_public_key = new_client.server_public_key;
+        self.last_arc_cookie = new_client.last_arc_cookie.or_else(|| self.last_arc_cookie.clone());
+        self.scratch.clear();
+        self.disconnected = false;
+        Ok(())
     }
 
     /// Send a single keyboard scancode press or release.
@@ -939,5 +1112,112 @@ mod tests {
 
         assert!(set.get_by_channel_id(9999).is_none());
         assert!(set.get_by_channel_id(1004).is_some());
+    }
+
+    // ── M7 auto-reconnect ──
+
+    /// Build a `RdpClient` instance directly for predicate-only tests.
+    /// `connect()` requires a real network so we hand-construct the
+    /// fields here. The transport/session are `None` to mirror the
+    /// "just disconnected, no live session" state where `try_reconnect`
+    /// is actually called.
+    fn synthetic_client(
+        policy: ReconnectPolicy,
+        cookie: Option<ArcCookie>,
+        with_processor: bool,
+    ) -> RdpClient {
+        let mut svc_set = SvcChannelSet::new();
+        if with_processor {
+            svc_set
+                .insert(Box::new(RecordingProcessor::default()))
+                .unwrap();
+        }
+        RdpClient {
+            transport: None,
+            session: None,
+            reconnect_policy: policy,
+            scratch: Vec::new(),
+            pending_events: VecDeque::new(),
+            disconnected: false,
+            svc_set,
+            user_channel_id: 1007,
+            server_public_key: None,
+            last_server_addr: "127.0.0.1:3389".parse().unwrap(),
+            last_server_name: StdString::from("localhost"),
+            last_config: justrdp_connector::Config::builder("u", "p").build(),
+            last_arc_cookie: cookie,
+        }
+    }
+
+    fn dummy_cookie() -> ArcCookie {
+        ArcCookie::new(0xDEAD_BEEF, [0xAAu8; 16])
+    }
+
+    #[test]
+    fn can_reconnect_requires_enabled_policy() {
+        let client = synthetic_client(ReconnectPolicy::disabled(), Some(dummy_cookie()), false);
+        assert!(!client.can_reconnect(), "disabled policy must veto");
+    }
+
+    #[test]
+    fn can_reconnect_requires_arc_cookie() {
+        let client = synthetic_client(ReconnectPolicy::aggressive(), None, false);
+        assert!(!client.can_reconnect(), "missing ARC cookie must veto");
+    }
+
+    #[test]
+    fn can_reconnect_blocked_by_processors() {
+        // SVC processors carry per-session state that cannot be revived
+        // from a saved Config alone, so reconnect is mutually exclusive
+        // with channel registration in the MVP.
+        let client = synthetic_client(
+            ReconnectPolicy::aggressive(),
+            Some(dummy_cookie()),
+            true,
+        );
+        assert!(
+            !client.can_reconnect(),
+            "presence of SVC processors must veto reconnect"
+        );
+    }
+
+    #[test]
+    fn can_reconnect_allowed_with_policy_and_cookie() {
+        let client = synthetic_client(
+            ReconnectPolicy::aggressive(),
+            Some(dummy_cookie()),
+            false,
+        );
+        assert!(client.can_reconnect());
+    }
+
+    #[test]
+    fn try_reconnect_disabled_policy_emits_disconnect_and_marks_terminal() {
+        let mut client = synthetic_client(ReconnectPolicy::disabled(), None, false);
+        client.try_reconnect();
+
+        assert!(client.disconnected);
+        // Exactly one Disconnected event in the queue, no Reconnecting noise.
+        assert_eq!(client.pending_events.len(), 1);
+        assert!(matches!(
+            client.pending_events.front(),
+            Some(RdpEvent::Disconnected(_))
+        ));
+    }
+
+    #[test]
+    fn try_reconnect_with_processors_short_circuits_to_disconnect() {
+        let mut client = synthetic_client(
+            ReconnectPolicy::aggressive(),
+            Some(dummy_cookie()),
+            true,
+        );
+        client.try_reconnect();
+        assert!(client.disconnected);
+        assert_eq!(client.pending_events.len(), 1);
+        assert!(matches!(
+            client.pending_events.front(),
+            Some(RdpEvent::Disconnected(_))
+        ));
     }
 }
