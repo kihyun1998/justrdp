@@ -457,8 +457,16 @@ pub struct Config {
     pub compression: CompressionConfig,
     /// Static virtual channels to request.
     pub static_channels: StaticChannelSet,
-    /// RDP cookie for load balancing (optional).
+    /// RDP cookie for load balancing (optional, "Cookie: mstshash=" form).
     pub cookie: Option<String>,
+    /// X.224 routing token from a Server Redirection PDU
+    /// (`LB_LOAD_BALANCE_INFO`, MS-RDPBCGR 2.2.13.1).
+    ///
+    /// When set, the connector emits the bytes verbatim as the X.224
+    /// Connection Request `routingToken` field instead of the
+    /// `Cookie: mstshash=` form. Takes priority over the `cookie` field.
+    /// Set this on the *new* connection after consuming a redirect PDU.
+    pub routing_token: Option<Vec<u8>>,
     /// Authentication mode.
     pub auth_mode: AuthMode,
     /// Kerberos AP-REQ token for Remote Credential Guard.
@@ -507,6 +515,7 @@ impl Config {
                 compression: CompressionConfig::default(),
                 static_channels: StaticChannelSet::new(),
                 cookie: None,
+                routing_token: None,
                 auth_mode: AuthMode::Password,
                 kerberos_token: None,
                 device_kerberos_token: None,
@@ -563,6 +572,16 @@ impl ConfigBuilder {
     /// Set the RDP cookie for load balancing.
     pub fn cookie(mut self, cookie: &str) -> Self {
         self.config.cookie = Some(String::from(cookie));
+        self
+    }
+
+    /// Set the X.224 routing token from a Server Redirection PDU.
+    ///
+    /// When set, the connector uses the bytes verbatim as the
+    /// `routingToken` field of the X.224 Connection Request, taking
+    /// priority over [`cookie`](Self::cookie).
+    pub fn routing_token(mut self, token: Vec<u8>) -> Self {
+        self.config.routing_token = Some(token);
         self
     }
 

@@ -215,7 +215,7 @@ impl RdpClient {
         // skip DNS on retry. Multi-A-record DNS is collapsed to the first
         // resolved address — applications that need round-robin failover
         // should resolve themselves and pass a SocketAddr.
-        let last_server_addr = server
+        let initial_addr = server
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| {
@@ -224,100 +224,171 @@ impl RdpClient {
                     "no socket addresses resolved from `server` argument",
                 ))
             })?;
-        let last_server_name = server_name.to_string();
-        let last_config = config.clone();
 
-        let tcp = TcpStream::connect(last_server_addr)?;
-        let mut connector = ClientConnector::new(config);
-        let mut transport = Transport::Tcp(tcp);
+        // 9.3 Session Redirection: the handshake may need to be re-run
+        // against a different target if the broker sends a redirection
+        // PDU. We loop here so the same `upgrader` instance can be
+        // reused across redirects (its trait method takes &self).
+        let mut current_addr = initial_addr;
+        let current_name = server_name.to_string();
+        let mut current_config = config;
+        let mut redirect_depth: u32 = 0;
+        const MAX_REDIRECTS: u32 = 5;
 
-        // Phase 1: drive the connector until it hits the TLS upgrade point.
-        drive_until_state_change(&mut connector, &mut transport, |s| {
-            matches!(
-                s,
-                ClientConnectorState::EnhancedSecurityUpgrade
-                    | ClientConnectorState::Connected { .. }
-            )
-        })?;
+        // Outputs of one successful (non-redirected) handshake. Filled in
+        // by the loop body once the connector reaches Connected without
+        // server_redirection.
+        let (mut transport, server_public_key, last_arc_cookie, result_for_session): (
+            Transport,
+            Option<Vec<u8>>,
+            Option<ArcCookie>,
+            ResultForSession,
+        ) = loop {
+            let tcp = TcpStream::connect(current_addr)?;
+            // Clone the config so we can rebuild ClientConnector on the
+            // next iteration if a redirect is detected.
+            let mut connector = ClientConnector::new(current_config.clone());
+            let mut transport = Transport::Tcp(tcp);
 
-        // Phase 2: perform TLS upgrade if the connector asked for it.
-        let server_public_key = if matches!(
-            connector.state(),
-            ClientConnectorState::EnhancedSecurityUpgrade
-        ) {
-            let tcp = match std::mem::replace(&mut transport, Transport::Swapping) {
-                Transport::Tcp(s) => s,
-                _ => {
-                    return Err(ConnectError::Unimplemented(
-                        "unexpected transport variant before TLS upgrade",
-                    ));
-                }
-            };
-            let upgraded = upgrader.upgrade(tcp, server_name)?;
-            transport = Transport::Tls(Box::new(upgraded.stream));
-            Some(upgraded.server_public_key)
-        } else {
-            None
-        };
-
-        // Phase 3 (M2): if the negotiated protocol is HYBRID/HYBRID_EX, the
-        // connector now sits in `EnhancedSecurityUpgrade`. Step it once
-        // (the connector's send-state for that phase is a pure transition)
-        // so we can see whether it advances into a Credssp* state or skips
-        // straight to BasicSettingsExchange.
-        drive_until_state_change(&mut connector, &mut transport, |s| {
-            !matches!(s, ClientConnectorState::EnhancedSecurityUpgrade)
-        })?;
-
-        if matches!(
-            connector.state(),
-            ClientConnectorState::CredsspNegoTokens
-                | ClientConnectorState::CredsspPubKeyAuth
-                | ClientConnectorState::CredsspCredentials
-        ) {
-            // Clone the SPKI for CredSSP; the original is retained on the
-            // RdpClient for potential reuse during M7 auto-reconnect.
-            let server_pub_key = server_public_key
-                .as_ref()
-                .cloned()
-                .ok_or(ConnectError::Unimplemented(
-                    "CredSSP requires a TLS upgrade to capture server_public_key",
-                ))?;
-            // run_credssp_sequence handles all token I/O over the TLS stream;
-            // the connector's Credssp* states are just internal markers and
-            // are advanced (no-op transitions) below.
-            run_credssp_sequence(&connector, &mut transport, server_pub_key)?;
+            // Phase 1: drive to TLS upgrade point.
             drive_until_state_change(&mut connector, &mut transport, |s| {
-                !matches!(
+                matches!(
                     s,
-                    ClientConnectorState::CredsspNegoTokens
-                        | ClientConnectorState::CredsspPubKeyAuth
-                        | ClientConnectorState::CredsspCredentials
-                        | ClientConnectorState::CredsspEarlyUserAuth
+                    ClientConnectorState::EnhancedSecurityUpgrade
+                        | ClientConnectorState::Connected { .. }
                 )
             })?;
-        }
 
-        // Phase 4 (M3): BasicSettingsExchange → ChannelConnection →
-        // SecureSettings → Licensing → Capabilities → Finalization → Connected.
-        // The connector owns all of this internally; we just pump bytes.
-        drive_until_state_change(&mut connector, &mut transport, |s| s.is_connected())?;
+            // Phase 2: TLS upgrade if needed.
+            let server_public_key = if matches!(
+                connector.state(),
+                ClientConnectorState::EnhancedSecurityUpgrade
+            ) {
+                let tcp = match std::mem::replace(&mut transport, Transport::Swapping) {
+                    Transport::Tcp(s) => s,
+                    _ => {
+                        return Err(ConnectError::Unimplemented(
+                            "unexpected transport variant before TLS upgrade",
+                        ));
+                    }
+                };
+                let upgraded = upgrader.upgrade(tcp, &current_name)?;
+                transport = Transport::Tls(Box::new(upgraded.stream));
+                Some(upgraded.server_public_key)
+            } else {
+                None
+            };
 
-        // The connector is now in `Connected { result }`. Convert the
-        // resulting channel layout into a SessionConfig so the caller can
-        // drive the active session via ActiveStage.
-        let result = connector.result().ok_or_else(|| {
-            ConnectError::Unimplemented("connector reached Connected but result() returned None")
-        })?;
-        let user_channel_id = result.user_channel_id;
-        let session_config = SessionConfig {
-            io_channel_id: result.io_channel_id,
-            user_channel_id: result.user_channel_id,
-            share_id: result.share_id,
-            channel_ids: result.channel_ids.clone(),
+            // Phase 3: Step past EnhancedSecurityUpgrade then run CredSSP if needed.
+            drive_until_state_change(&mut connector, &mut transport, |s| {
+                !matches!(s, ClientConnectorState::EnhancedSecurityUpgrade)
+            })?;
+
+            if matches!(
+                connector.state(),
+                ClientConnectorState::CredsspNegoTokens
+                    | ClientConnectorState::CredsspPubKeyAuth
+                    | ClientConnectorState::CredsspCredentials
+            ) {
+                let server_pub_key = server_public_key
+                    .as_ref()
+                    .cloned()
+                    .ok_or(ConnectError::Unimplemented(
+                        "CredSSP requires a TLS upgrade to capture server_public_key",
+                    ))?;
+                run_credssp_sequence(&connector, &mut transport, server_pub_key)?;
+                drive_until_state_change(&mut connector, &mut transport, |s| {
+                    !matches!(
+                        s,
+                        ClientConnectorState::CredsspNegoTokens
+                            | ClientConnectorState::CredsspPubKeyAuth
+                            | ClientConnectorState::CredsspCredentials
+                            | ClientConnectorState::CredsspEarlyUserAuth
+                    )
+                })?;
+            }
+
+            // Phase 4: BasicSettings → ... → Finalization → Connected.
+            drive_until_state_change(&mut connector, &mut transport, |s| s.is_connected())?;
+
+            let result = connector.result().ok_or_else(|| {
+                ConnectError::Unimplemented(
+                    "connector reached Connected but result() returned None",
+                )
+            })?;
+
+            // 9.3 redirect dispatch: if the connector captured a Server
+            // Redirection PDU, the current transport is unusable — drop
+            // it, build a fresh Config from the redirect target, and
+            // restart the handshake. Otherwise fall through with the
+            // values needed to construct RdpClient.
+            if let Some(redir) = result.server_redirection.clone() {
+                redirect_depth += 1;
+                if redirect_depth > MAX_REDIRECTS {
+                    return Err(ConnectError::Tcp(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("too many redirects ({MAX_REDIRECTS} max) — aborting"),
+                    )));
+                }
+
+                // Drop the current transport explicitly so the OS sends
+                // FIN to the broker before we open the next socket.
+                drop(transport);
+
+                // Decide the next target. Priority:
+                //   1. LB_TARGET_NET_ADDRESS (UTF-16LE host string)
+                //   2. LB_TARGET_NET_ADDRESSES first entry
+                //   3. fall through to current_addr (LB cookie only)
+                let new_addr = parse_redirect_target(&redir, current_addr.port())
+                    .unwrap_or(current_addr);
+
+                // Build the next Config: clone the previous one, blow
+                // away routing_token / cookie / arc_cookie so they don't
+                // collide with the redirect-supplied LB info, and inject
+                // the new routing token if the broker provided one.
+                let mut next_config = current_config.clone();
+                next_config.routing_token = redir.load_balance_info.clone();
+                next_config.cookie = None;
+                next_config.auto_reconnect_cookie = None;
+
+                current_addr = new_addr;
+                current_config = next_config;
+                continue;
+            }
+
+            // No redirect — break out with everything we need.
+            let user_channel_id = result.user_channel_id;
+            let session_config = SessionConfig {
+                io_channel_id: result.io_channel_id,
+                user_channel_id,
+                share_id: result.share_id,
+                channel_ids: result.channel_ids.clone(),
+            };
+            let server_arc_cookie = result.server_arc_cookie.clone();
+            break (
+                transport,
+                server_public_key,
+                server_arc_cookie,
+                ResultForSession {
+                    session_config,
+                    user_channel_id,
+                    channel_ids: result.channel_ids.clone(),
+                    redirect_depth,
+                },
+            );
         };
-        let channel_ids = result.channel_ids.clone();
-        let session = Box::new(ActiveStage::new(session_config));
+
+        // From here on, the loop has exited with a usable transport
+        // pointing at the (post-redirect) target. The remaining setup
+        // (ActiveStage, SVC processors, RdpClient construction) is
+        // identical to the pre-9.3 path.
+        let last_server_addr = current_addr;
+        let last_server_name = current_name;
+        let last_config = current_config;
+
+        let user_channel_id = result_for_session.user_channel_id;
+        let channel_ids = result_for_session.channel_ids;
+        let session = Box::new(ActiveStage::new(result_for_session.session_config));
 
         // Wire SVC processors. Each processor declares a channel_name();
         // assign_ids matches that against the connector's negotiated MCS
@@ -333,8 +404,7 @@ impl RdpClient {
         svc_set.assign_ids(&channel_ids);
 
         // Run start_all to collect any initial frames each processor wants
-        // to send (e.g. CLIPRDR Capability Request, RDPDR Server Announce
-        // Reply). The frames are already MCS+TPKT wrapped so they go
+        // to send. The frames are already MCS+TPKT wrapped so they go
         // straight onto the wire.
         let start_results = svc_set
             .start_all(user_channel_id)
@@ -346,18 +416,24 @@ impl RdpClient {
         }
         transport.flush().map_err(ConnectError::Tcp)?;
 
-        // If the connector captured an ARC cookie during the connection
-        // sequence (rare — most servers send it later inside an active
-        // SaveSessionInfo PDU), seed last_arc_cookie with it so a very
-        // early disconnect can still trigger M7 auto-reconnect.
-        let last_arc_cookie = result.server_arc_cookie.clone();
+        // If we followed one or more redirects to reach this target,
+        // queue a single `Redirected` event so the caller can observe it
+        // through the normal `next_event` loop. The target string is
+        // best-effort: a "host:port" rendering of the final SocketAddr
+        // we landed on.
+        let mut pending_events = VecDeque::new();
+        if result_for_session.redirect_depth > 0 {
+            pending_events.push_back(RdpEvent::Redirected {
+                target: format!("{}", last_server_addr),
+            });
+        }
 
         Ok(Self {
             transport: Some(transport),
             session: Some(session),
             reconnect_policy: ReconnectPolicy::disabled(),
             scratch: Vec::new(),
-            pending_events: VecDeque::new(),
+            pending_events,
             disconnected: false,
             svc_set,
             user_channel_id,
@@ -814,6 +890,78 @@ impl RdpClient {
     pub fn test_set_arc_cookie(&mut self, cookie: ArcCookie) {
         self.last_arc_cookie = Some(cookie);
     }
+}
+
+/// Local helper struct used to thread session-tier outputs out of the
+/// 9.3 redirect loop. The loop builds this on the final non-redirected
+/// iteration and the surrounding code consumes it once to construct
+/// the public `RdpClient` value.
+struct ResultForSession {
+    session_config: SessionConfig,
+    user_channel_id: u16,
+    channel_ids: Vec<(String, u16)>,
+    /// Number of redirects we followed to reach this target. The
+    /// surrounding `connect_with_upgrader` uses this to decide whether
+    /// to emit a one-shot `RdpEvent::Redirected` after the handshake.
+    redirect_depth: u32,
+}
+
+/// Parse a Server Redirection PDU's target address fields into a
+/// concrete [`SocketAddr`].
+///
+/// Tries `LB_TARGET_NET_ADDRESS` first, then the first entry of
+/// `LB_TARGET_NET_ADDRESSES`. The address bytes are UTF-16LE, possibly
+/// null-terminated. The string may be a bare IPv4/IPv6 literal or
+/// `host:port`; if no port is present in the string we use
+/// `default_port`. Returns `None` on parse failure (caller falls back
+/// to the previous target).
+fn parse_redirect_target(
+    redir: &justrdp_pdu::rdp::redirection::ServerRedirectionPdu,
+    default_port: u16,
+) -> Option<SocketAddr> {
+    let bytes = redir
+        .target_net_address
+        .as_deref()
+        .or_else(|| {
+            redir
+                .target_net_addresses
+                .as_ref()
+                .and_then(|tna| tna.addresses.first().map(|a| a.address.as_slice()))
+        })?;
+    let text = utf16le_to_string(bytes)?;
+    parse_addr_with_default_port(text.trim_end_matches('\0'), default_port)
+}
+
+/// Decode a UTF-16LE byte slice into a `String`. Stops at the first
+/// embedded NUL. Returns `None` on odd byte count or invalid surrogate.
+fn utf16le_to_string(bytes: &[u8]) -> Option<String> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let u = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if u == 0 {
+            break;
+        }
+        units.push(u);
+    }
+    String::from_utf16(&units).ok()
+}
+
+/// Parse `host[:port]` into a `SocketAddr`, falling back to
+/// `default_port` if no port is given. Accepts bare IPv4/IPv6 and
+/// `host:port` forms.
+fn parse_addr_with_default_port(text: &str, default_port: u16) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    if let Ok(ip) = text.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, default_port));
+    }
+    let with_port = format!("{text}:{default_port}");
+    with_port.to_socket_addrs().ok()?.next()
 }
 
 // ── Pure event-building helpers (testable without a live session) ──
@@ -1334,6 +1482,77 @@ mod tests {
         client.disconnected = true;
         let event = client.next_event().expect("next_event must succeed");
         assert!(event.is_none(), "expected Ok(None) after disconnect");
+    }
+
+    // ── 9.3 Session Redirection helpers ──
+
+    use justrdp_pdu::rdp::redirection::{
+        ServerRedirectionPdu, TargetNetAddress, TargetNetAddresses, LB_TARGET_NET_ADDRESS,
+        LB_TARGET_NET_ADDRESSES,
+    };
+
+    fn utf16le_bytes(s: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        // null terminator
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    #[test]
+    fn utf16le_to_string_handles_null_terminator() {
+        let bytes = utf16le_bytes("hello");
+        assert_eq!(utf16le_to_string(&bytes).unwrap(), "hello");
+    }
+
+    #[test]
+    fn utf16le_to_string_rejects_odd_length() {
+        let bytes = vec![0x68, 0x00, 0x65];
+        assert!(utf16le_to_string(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_addr_default_port_for_bare_ipv4() {
+        let addr = parse_addr_with_default_port("192.168.1.10", 3389).unwrap();
+        assert_eq!(addr.port(), 3389);
+        assert_eq!(addr.ip().to_string(), "192.168.1.10");
+    }
+
+    #[test]
+    fn parse_addr_keeps_explicit_port() {
+        let addr = parse_addr_with_default_port("10.0.0.5:9000", 3389).unwrap();
+        assert_eq!(addr.port(), 9000);
+    }
+
+    #[test]
+    fn parse_redirect_target_uses_target_net_address() {
+        let mut redir = ServerRedirectionPdu::default();
+        redir.redir_flags = LB_TARGET_NET_ADDRESS;
+        redir.target_net_address = Some(utf16le_bytes("192.168.1.50"));
+        let addr = parse_redirect_target(&redir, 3389).unwrap();
+        assert_eq!(addr.ip().to_string(), "192.168.1.50");
+        assert_eq!(addr.port(), 3389);
+    }
+
+    #[test]
+    fn parse_redirect_target_falls_back_to_target_net_addresses() {
+        let mut redir = ServerRedirectionPdu::default();
+        redir.redir_flags = LB_TARGET_NET_ADDRESSES;
+        redir.target_net_addresses = Some(TargetNetAddresses {
+            addresses: vec![TargetNetAddress {
+                address: utf16le_bytes("10.0.0.99"),
+            }],
+        });
+        let addr = parse_redirect_target(&redir, 3389).unwrap();
+        assert_eq!(addr.ip().to_string(), "10.0.0.99");
+    }
+
+    #[test]
+    fn parse_redirect_target_returns_none_when_no_address() {
+        let redir = ServerRedirectionPdu::default();
+        assert!(parse_redirect_target(&redir, 3389).is_none());
     }
 
     #[test]

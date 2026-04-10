@@ -315,7 +315,13 @@ impl ClientConnector {
         };
         let nego = NegotiationRequest::with_flags(self.config.security_protocol, flags);
 
-        let cr = if let Some(ref cookie) = self.config.cookie {
+        // routing_token (LB_LOAD_BALANCE_INFO from a redirection PDU)
+        // takes priority over the mstshash cookie. This matches what
+        // mstsc and FreeRDP do when re-establishing a session against a
+        // Connection Broker after a redirect.
+        let cr = if let Some(ref token) = self.config.routing_token {
+            ConnectionRequest::with_routing_token(token.clone(), Some(nego))
+        } else if let Some(ref cookie) = self.config.cookie {
             ConnectionRequest::with_cookie(cookie.clone(), Some(nego))
         } else {
             ConnectionRequest::new(Some(nego))

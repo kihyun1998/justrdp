@@ -1420,33 +1420,37 @@ pub trait GfxHandler: Send {
 - [x] SVC processor와 reconnect 상호 배제 (MVP: stateful processors는 자동 재연결 시 부활 불가)
 - [ ] `DisconnectReason` → 재연결 가능 여부 판단 (§21.6) — 현재는 모든 IO 에러를 재시도. retryable 판단은 후속 작업
 
-### 9.3 Session Redirection
+### 9.3 Session Redirection ✅
 
 > **requires**: 7.1 세션 (Redirection PDU 수신), Phase 2 커넥터, **5.5 `justrdp-blocking`** (실제 리다이렉트)
 > **검증**: `justrdp-blocking` integration test (mock broker 기반 로드밸런서 시나리오)
 
-**PDU 레이어 (`justrdp-pdu`):**
+**PDU 레이어 (`justrdp-pdu`):** — `crates/justrdp-pdu/src/rdp/redirection.rs`
 
-- [ ] `ServerRedirectionPdu` 파싱 (MS-RDPBCGR 2.2.13.1)
-- [ ] `EnhancedSecurityServerRedirectionPdu` (MS-RDPBCGR 2.2.13.2)
-- [ ] `RedirectionFlags` 비트필드 (TargetNetAddress, LoadBalanceInfo, Username, Domain, Password, TargetFQDN, TargetNetBiosName, TargetNetAddresses, ClientTsvUrl, ServerCertificate 등)
-- [ ] Routing Token / LB Info 바이트 배열 추출
-- [ ] 비밀번호 cookie 암호화 처리 (RC4 / 서버 공개키)
+- [x] `ServerRedirectionPdu` 파싱 (MS-RDPBCGR 2.2.13.1) — 전체 12바이트 헤더 + 11개 optional field, 16개 LB_* flag 상수, `TargetNetAddress` / `TargetNetAddresses` substructs
+- [x] Enhanced Security 변형 (MS-RDPBCGR 2.2.13.3.1) — Connector가 `ShareControlHeader.pdu_type == ServerRedirect` 분기에서 2바이트 pad 후 본문 파싱
+- [x] `RedirFlags` 16개 비트 모두 정의 (TargetNetAddress, LoadBalanceInfo, Username, Domain, Password, DontStoreUsername, SmartcardLogon, NoRedirect, TargetFQDN, TargetNetBiosName, TargetNetAddresses, ClientTsvUrl, ServerTsvCapable, PasswordIsPkEncrypted, RedirectionGuid, TargetCertificate)
+- [x] Routing Token / LB Info 바이트 배열 추출 (raw `Vec<u8>` — 바이트 그대로 보존, 호출자가 해석)
+- [ ] ~~비밀번호 cookie 암호화 처리 (RC4 / 서버 공개키)~~ → 현재는 raw bytes로 보존만 (RDSTLS 재인증은 후속)
+- [x] 11개 단위 테스트 (header roundtrip, magic 거부, 절단/오버런 거부, 단일/복수 field, TargetNetAddresses 구조, 64KB sanity cap, padding 소비)
 
 **Connector 레이어 (`justrdp-connector`):**
 
-- [ ] `ConnectionResult.server_redirection` 필드로 노출
-- [ ] `ConfigBuilder::routing_token()` / `redirection_cookie()` 빌더
-- [ ] Routing Token을 다음 연결의 X.224 Connection Request에 주입 (PCB 또는 cookie)
+- [x] `ConnectionResult.server_redirection: Option<ServerRedirectionPdu>` 필드 노출
+- [x] `Config.routing_token: Option<Vec<u8>>` + `ConfigBuilder::routing_token(Vec<u8>)` 메서드
+- [x] Routing Token을 X.224 Connection Request `routingToken` field에 주입 (mstshash cookie보다 우선)
+- [x] `step_finalization_wait_pdu` / `step_finalization_wait_font_map` 양쪽에서 `ShareControlPduType::ServerRedirect` 감지 + 2바이트 pad 소비 + 본문 파싱 + `transition_to_connected()` 호출
 
-**런타임 레이어 (`justrdp-blocking` §5.5에서 구현):**
+**런타임 레이어 (`justrdp-blocking` §5.5):**
 
-- [ ] Redirection PDU 수신 시 현재 세션 종료
-- [ ] Target 주소로 새 TCP 연결 수립 (IPv4/IPv6/FQDN 우선순위)
-- [ ] 새 `Config`에 routing token + 선택적 자격증명 주입
-- [ ] `RdpClient` 재시작 (내부적으로 투명)
-- [ ] `RdpEvent::Redirected { target }` 방출
-- [ ] 리다이렉션 루프 방지 (최대 depth 제한)
+- [x] `connect_with_upgrader`가 핸드셰이크 루프 (max 5 depth) — 각 iteration마다 새 TCP/TLS/CredSSP/finalization 수행
+- [x] `result.server_redirection.is_some()` 감지 시: 현재 transport drop → routing token + 새 target으로 다음 iteration
+- [x] Target 주소 파싱 (`parse_redirect_target`): `LB_TARGET_NET_ADDRESS` 우선, fallback `LB_TARGET_NET_ADDRESSES[0]`, UTF-16LE → `String` → `SocketAddr` (default port 재사용)
+- [x] 새 `Config` 빌드: 이전 config clone + routing_token = LB info + cookie/auto_reconnect_cookie 클리어 (콜리전 방지)
+- [x] `RdpEvent::Redirected { target }` 방출 (성공 핸드셰이크 후 한 번)
+- [x] 리다이렉션 루프 방지 — `MAX_REDIRECTS = 5`, 초과 시 `ConnectError::Tcp(Other)` 반환
+- [x] 7개 단위 테스트 (utf16 디코딩, IPv4 default port, 명시 port, target_net_address path, target_net_addresses fallback, 빈 PDU None 반환, 절단 거부)
+- [ ] 실서버 통합 테스트 — mock broker 필요, 후속
 
 ### 9.4 Touch Input (MS-RDPEI)
 
