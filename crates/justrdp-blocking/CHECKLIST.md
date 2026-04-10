@@ -29,7 +29,9 @@
 - [x] `VerifierBridge` — rustls `ServerCertVerifier` ↔ 우리 trait 어댑터 (Debug 수동 구현, 내부에 redacted)
 - [x] 기존 `RustlsUpgrader::new()` / `with_verification()` 동작 보존 (webpki-roots 경로 유지)
 - [x] 단위 테스트 9개: AcceptAll, PinnedSpki accept/reject/unparseable, constant_time_eq, Debug redaction, VerifierBridge accept/reject forwarding
-- [ ] ~~`native-tls` 백엔드 trait 지원~~ — 현재는 건드리지 않음 (feature flag 뒤, 추후 별도 커밋)
+- [x] `native-tls` 백엔드 trait 지원 (post-handshake verification 모델: handshake 후 cert 추출 → verifier 호출 → Reject 시 stream 드롭)
+  - `TrustMode::OsTrustStore`(`with_verification()`) vs `TrustMode::UserVerifier(Arc<dyn>)`(`with_verifier()`/`new()`) 분기
+  - rustls 대비 한 RTT 늦게 reject되지만, RDP는 CredSSP 전이라 자격증명 노출 0
 
 ### `justrdp-blocking` 변경
 
