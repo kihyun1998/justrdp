@@ -99,16 +99,24 @@ pub fn read_tag_raw(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult
 
 // ── Integer ──
 
-/// Compute the minimum number of bytes needed to encode a signed integer.
+/// Compute the minimum number of bytes needed to encode a signed integer in BER.
 fn int_byte_count(value: i64) -> usize {
     if value >= -128 && value <= 127 {
         1
-    } else if value >= -32768 && value <= 32767 {
+    } else if value >= -32_768 && value <= 32_767 {
         2
     } else if value >= -8_388_608 && value <= 8_388_607 {
         3
-    } else {
+    } else if value >= -2_147_483_648 && value <= 2_147_483_647 {
         4
+    } else if value >= -549_755_813_888 && value <= 549_755_813_887 {
+        5
+    } else if value >= -140_737_488_355_328 && value <= 140_737_488_355_327 {
+        6
+    } else if value >= -36_028_797_018_963_968 && value <= 36_028_797_018_963_967 {
+        7
+    } else {
+        8
     }
 }
 
@@ -489,6 +497,21 @@ mod tests {
         let buf = [TAG_INTEGER, 0x09, 0,0,0,0,0,0,0,0,0]; // length=9 > 8
         let mut cursor = ReadCursor::new(&buf);
         assert!(read_integer(&mut cursor, "test").is_err());
+    }
+
+    #[test]
+    fn integer_u32_max_roundtrip() {
+        // u32::MAX (4294967295) needs 5 bytes in BER signed encoding
+        // because the high bit of the 4th byte would be set (negative).
+        let val = u32::MAX as i64;
+        let size = sizeof_integer(val);
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        write_integer(&mut cursor, val, "test").unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = read_integer_u32(&mut cursor, "test").unwrap();
+        assert_eq!(decoded, u32::MAX);
     }
 
     #[test]

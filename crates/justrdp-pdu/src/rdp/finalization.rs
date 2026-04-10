@@ -12,10 +12,13 @@ use justrdp_core::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 
 // ── Synchronize PDU ──
 
+/// `SYNCMSGTYPE_SYNC` — the only valid value for `SynchronizePdu::message_type`. MS-RDPBCGR 2.2.1.14
+pub const SYNCMSGTYPE_SYNC: u16 = 1;
+
 /// Synchronize PDU data (2.2.1.14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SynchronizePdu {
-    pub message_type: u16, // always 1 (SYNCMSGTYPE_SYNC)
+    pub message_type: u16, // SYNCMSGTYPE_SYNC (1)
     pub target_user: u16,
 }
 
@@ -97,6 +100,13 @@ impl<'de> Decode<'de> for ControlPdu {
 
 // ── Font List / Font Map PDU ──
 
+/// `FONTLIST_FIRST` flag — MS-RDPBCGR 2.2.1.18
+pub const FONTLIST_FIRST: u16 = 0x0001;
+/// `FONTLIST_LAST` flag — MS-RDPBCGR 2.2.1.18
+pub const FONTLIST_LAST: u16 = 0x0002;
+/// Default font entry size — MS-RDPBCGR 2.2.1.18
+pub const FONTLIST_ENTRY_SIZE: u16 = 0x0032;
+
 /// Font List PDU data (2.2.1.18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FontListPdu {
@@ -112,8 +122,8 @@ impl FontListPdu {
         Self {
             number_fonts: 0,
             total_num_fonts: 0,
-            list_flags: 0x0003, // FONTLIST_FIRST | FONTLIST_LAST
-            entry_size: 0x0032,
+            list_flags: FONTLIST_FIRST | FONTLIST_LAST,
+            entry_size: FONTLIST_ENTRY_SIZE,
         }
     }
 }
@@ -553,8 +563,15 @@ pub const AUTO_RECONNECT_VERSION_1: u32 = 0x0000_0001;
 /// Fixed length of ARC_SC/CS_PRIVATE_PACKET (MS-RDPBCGR 2.2.4.2 / 2.2.4.3).
 pub const ARC_PACKET_LEN: u32 = 0x0000_001C; // 28
 
+/// TS_LOGON_INFO fixed size: cbDomain(4) + Domain(52) + cbUserName(4) + UserName(512) + SessionId(4).
+/// MS-RDPBCGR 2.2.10.1.1.1
+const LOGON_INFO_V1_FIXED_SIZE: usize = 4 + 52 + 4 + 512 + 4; // 576
+
 /// TS_LOGON_INFO_VERSION_2 fixed portion size (MS-RDPBCGR 2.2.10.1.1.2).
 const LOGON_INFO_V2_FIXED_SIZE: u32 = 576;
+
+/// TS_LOGON_INFO_VERSION_2 version field. MS-RDPBCGR 2.2.10.1.1.2
+const LOGON_INFO_V2_VERSION: u16 = 0x0001;
 
 /// TS_LOGON_INFO_PLAINNOTIFY payload size (MS-RDPBCGR 2.2.10.1.1.3).
 const LOGON_INFO_PLAINNOTIFY_SIZE: usize = 576;
@@ -704,7 +721,7 @@ impl Encode for SaveSessionInfoPdu {
     fn name(&self) -> &'static str { "SaveSessionInfoPdu" }
     fn size(&self) -> usize {
         4 + match &self.info_data {
-            SaveSessionInfoData::LogonV1(_) => 576, // 4+52+4+512+4 (cbDomain+Domain+cbUserName+UserName+SessionId)
+            SaveSessionInfoData::LogonV1(_) => LOGON_INFO_V1_FIXED_SIZE,
             SaveSessionInfoData::LogonV2(v2) => {
                 LOGON_INFO_V2_FIXED_SIZE as usize + v2.domain.len() + v2.user_name.len()
             }
@@ -783,8 +800,8 @@ fn decode_logon_v1(src: &mut ReadCursor<'_>) -> DecodeResult<LogonInfoV1> {
 // ── LogonInfoV2 helpers (MS-RDPBCGR 2.2.10.1.1.2) ──
 
 fn encode_logon_v2(v2: &LogonInfoV2, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-    // Version MUST be 0x0001
-    dst.write_u16_le(0x0001, "LogonV2::version")?;
+    // Version MUST be LOGON_INFO_V2_VERSION (MS-RDPBCGR 2.2.10.1.1.2)
+    dst.write_u16_le(LOGON_INFO_V2_VERSION, "LogonV2::version")?;
     // Size MUST be 576 (fixed portion)
     dst.write_u32_le(LOGON_INFO_V2_FIXED_SIZE, "LogonV2::size")?;
     dst.write_u32_le(v2.session_id, "LogonV2::sessionId")?;
@@ -800,7 +817,7 @@ fn encode_logon_v2(v2: &LogonInfoV2, dst: &mut WriteCursor<'_>) -> EncodeResult<
 
 fn decode_logon_v2(src: &mut ReadCursor<'_>) -> DecodeResult<LogonInfoV2> {
     let version = src.read_u16_le("LogonV2::version")?;
-    if version != 0x0001 {
+    if version != LOGON_INFO_V2_VERSION {
         return Err(DecodeError::unexpected_value("LogonInfoV2", "version", "must be 0x0001"));
     }
     let size = src.read_u32_le("LogonV2::size")?;
@@ -831,7 +848,7 @@ fn logon_extended_size(ext: &LogonInfoExtended) -> usize {
     // Length(u16) + FieldsPresent(u32) + LogonFields + Pad(570)
     let mut fields_size = 0usize;
     if ext.auto_reconnect_cookie.is_some() {
-        fields_size += 4 + ARC_CS_PRIVATE_PACKET_SIZE; // cbFieldData + ARC_SC_PRIVATE_PACKET
+        fields_size += 4 + ARC_SC_PRIVATE_PACKET_SIZE; // cbFieldData + ARC_SC_PRIVATE_PACKET
     }
     if ext.logon_errors.is_some() {
         fields_size += 4 + 8; // cbFieldData + LogonErrorsInfo
@@ -858,7 +875,7 @@ fn encode_logon_extended(ext: &LogonInfoExtended, dst: &mut WriteCursor<'_>) -> 
 
     // ARC field MUST precede logon errors per MS-RDPBCGR 2.2.10.1.1.4 field ordering.
     if let Some(ref arc) = ext.auto_reconnect_cookie {
-        dst.write_u32_le(ARC_CS_PRIVATE_PACKET_SIZE as u32, "LogonField::cbFieldData")?;
+        dst.write_u32_le(ARC_SC_PRIVATE_PACKET_SIZE as u32, "LogonField::cbFieldData")?;
         dst.write_u32_le(ARC_PACKET_LEN, "ArcSc::cbLen")?;
         dst.write_u32_le(AUTO_RECONNECT_VERSION_1, "ArcSc::version")?;
         dst.write_u32_le(arc.logon_id, "ArcSc::logonId")?;
@@ -891,7 +908,7 @@ fn decode_logon_extended(src: &mut ReadCursor<'_>) -> DecodeResult<LogonInfoExte
     // ARC cookie first per MS-RDPBCGR 2.2.10.1.1.4 field ordering.
     let auto_reconnect_cookie = if fields_present & LOGON_EX_AUTORECONNECTCOOKIE != 0 {
         let cb_field = src.read_u32_le("LogonField::cbFieldData")? as usize;
-        if cb_field < ARC_CS_PRIVATE_PACKET_SIZE {
+        if cb_field < ARC_SC_PRIVATE_PACKET_SIZE {
             return Err(DecodeError::unexpected_value("LogonInfoExtended", "cbFieldData", "ARC field too small"));
         }
         let cb_len = src.read_u32_le("ArcSc::cbLen")?;
@@ -950,6 +967,8 @@ fn decode_logon_extended(src: &mut ReadCursor<'_>) -> DecodeResult<LogonInfoExte
 // ── ArcCsPrivatePacket Encode/Decode (MS-RDPBCGR 2.2.4.3) ──
 
 pub const ARC_CS_PRIVATE_PACKET_SIZE: usize = 28;
+/// Both ARC_SC and ARC_CS packets share the same 28-byte wire format.
+pub const ARC_SC_PRIVATE_PACKET_SIZE: usize = ARC_CS_PRIVATE_PACKET_SIZE;
 
 impl Encode for ArcCsPrivatePacket {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
@@ -2073,5 +2092,67 @@ mod tests {
             }
             _ => panic!("expected Extended"),
         }
+    }
+
+    #[test]
+    fn set_error_info_pdu_roundtrip() {
+        let pdu = SetErrorInfoPdu { error_info: 0x0000_0001 };
+        let mut buf = [0u8; 4];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = SetErrorInfoPdu::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[test]
+    fn play_sound_pdu_roundtrip() {
+        let pdu = PlaySoundPdu { duration_ms: 1000, frequency_hz: 440 };
+        let mut buf = [0u8; 8];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = PlaySoundPdu::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[test]
+    fn suppress_output_pdu_allow_roundtrip() {
+        let pdu = SuppressOutputPdu {
+            allow_display_updates: 1,
+            left: Some(0), top: Some(0), right: Some(1920), bottom: Some(1080),
+        };
+        let size = pdu.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = SuppressOutputPdu::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[test]
+    fn suppress_output_pdu_suppress_roundtrip() {
+        let pdu = SuppressOutputPdu {
+            allow_display_updates: 0,
+            left: None, top: None, right: None, bottom: None,
+        };
+        let size = pdu.size();
+        let mut buf = alloc::vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = SuppressOutputPdu::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.allow_display_updates, 0);
+    }
+
+    #[test]
+    fn derive_session_keys_unsupported_method_rejected() {
+        // FIPS method should be rejected (use derive_fips_session_keys instead)
+        use crate::rdp::standard_security::{derive_session_keys, ENCRYPTION_METHOD_FIPS};
+        let cr = [0x11u8; 32];
+        let sr = [0x22u8; 32];
+        assert!(derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_FIPS).is_err());
+        assert!(derive_session_keys(&cr, &sr, 0xFFFF).is_err());
     }
 }

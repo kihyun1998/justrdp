@@ -741,15 +741,20 @@ impl KerberosSequence {
             key_material.truncate(key_len);
             key_material
         } else {
-            // No serverDHNonce: truncate(DHSharedSecret, key_len)
-            // Per RFC 4556: random-to-key(DHSharedSecret[0..key_len])
-            if shared_bytes.len() >= key_len {
-                shared_bytes[..key_len].to_vec()
-            } else {
-                let mut k = shared_bytes.clone();
-                k.resize(key_len, 0);
-                k
+            // No serverDHNonce: apply octetstring2key per RFC 4556 §3.2.3.1.
+            // Same SHA1-KDF loop but with only DHSharedSecret as input (no nonces).
+            let mut key_material = Vec::with_capacity(key_len);
+            let mut counter: u32 = 1;
+            while key_material.len() < key_len {
+                let mut sha1 = Sha1::new();
+                sha1.update(&counter.to_be_bytes());
+                sha1.update(&shared_bytes);
+                let hash = sha1.finalize();
+                key_material.extend_from_slice(&hash);
+                counter += 1;
             }
+            key_material.truncate(key_len);
+            key_material
         };
 
         Ok(reply_key)
@@ -863,6 +868,13 @@ impl KerberosSequence {
 
 impl Drop for KerberosSequence {
     fn drop(&mut self) {
+        // Zeroize identity fields (PII)
+        self.username.fill(0);
+        core::hint::black_box(&self.username);
+        self.domain.fill(0);
+        core::hint::black_box(&self.domain);
+        self.hostname.fill(0);
+        core::hint::black_box(&self.hostname);
         // Zeroize password and derived keys
         self.password.fill(0);
         core::hint::black_box(&self.password);
@@ -879,17 +891,27 @@ impl Drop for KerberosSequence {
         core::hint::black_box(&self.ap_req_bytes);
         self.salt.fill(0);
         core::hint::black_box(&self.salt);
+        // Zeroize DH private key (BigUint holds the DH private exponent)
+        if let Some(ref mut key) = self.dh_private_key {
+            key.zeroize();
+        }
+        // Zeroize client DH nonce
+        if let Some(ref mut nonce) = self.client_dh_nonce {
+            nonce.fill(0);
+            core::hint::black_box(nonce);
+        }
     }
 }
 
 /// Frame a Kerberos message with the TCP 4-byte length prefix.
-/// KDC over TCP uses: [4-byte big-endian length][message].
-pub fn frame_kdc_message(msg: &[u8]) -> Vec<u8> {
-    let len: u32 = msg.len().try_into().expect("KDC message exceeds u32::MAX");
+/// KDC over TCP uses: [4-byte big-endian length][message] (RFC 4120 §7.2.2).
+pub fn frame_kdc_message(msg: &[u8]) -> ConnectorResult<Vec<u8>> {
+    let len: u32 = msg.len().try_into()
+        .map_err(|_| ConnectorError::general("KDC message exceeds u32::MAX"))?;
     let mut framed = Vec::with_capacity(4 + msg.len());
     framed.extend_from_slice(&len.to_be_bytes());
     framed.extend_from_slice(msg);
-    framed
+    Ok(framed)
 }
 
 /// Extract a Kerberos message from a TCP-framed buffer.
@@ -934,7 +956,7 @@ mod tests {
     #[test]
     fn frame_unframe_roundtrip() {
         let msg = b"hello kerberos";
-        let framed = frame_kdc_message(msg);
+        let framed = frame_kdc_message(msg).unwrap();
         assert_eq!(framed.len(), 4 + msg.len());
         let (unframed, consumed) = unframe_kdc_message(&framed).unwrap();
         assert_eq!(unframed, msg);

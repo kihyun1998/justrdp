@@ -366,8 +366,18 @@ fn verify_proprietary_signature(pk_blob: &[u8], signature: &[u8]) -> DecodeResul
     let decrypted_bytes = decrypted.to_le_bytes_padded(64);
 
     // The decrypted value should start with the MD5 hash (16 bytes)
-    // followed by zero padding per PKCS#1
-    if decrypted_bytes.len() < 16 || decrypted_bytes[..16] != md5_hash {
+    // followed by zero padding per PKCS#1.
+    // Use constant-time comparison to prevent timing oracle attacks.
+    if decrypted_bytes.len() < 16 {
+        return Err(DecodeError::unexpected_value(
+            "ProprietaryCert", "signature", "signature verification failed",
+        ));
+    }
+    let mut diff = 0u8;
+    for (a, b) in decrypted_bytes[..16].iter().zip(md5_hash.iter()) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
         return Err(DecodeError::unexpected_value(
             "ProprietaryCert", "signature", "signature verification failed",
         ));

@@ -95,6 +95,15 @@ pub struct ExtendedClientInfo {
     pub auto_reconnect_cookie: Option<ArcCsPrivatePacket>,
 }
 
+impl Drop for ClientInfoPdu {
+    fn drop(&mut self) {
+        // Zero password bytes to prevent lingering secrets in heap memory.
+        let mut bytes = core::mem::take(&mut self.password).into_bytes();
+        bytes.fill(0);
+        core::hint::black_box(&bytes);
+    }
+}
+
 impl ClientInfoPdu {
     /// Create a basic Unicode client info.
     pub fn new(domain: &str, user_name: &str, password: &str) -> Self {
@@ -431,7 +440,8 @@ mod tests {
 
         let mut cursor = ReadCursor::new(&buf);
         let decoded = ClientInfoPdu::decode(&mut cursor).unwrap();
-        let cookie = decoded.extra.unwrap().auto_reconnect_cookie.unwrap();
+        let extra = decoded.extra.as_ref().unwrap();
+        let cookie = extra.auto_reconnect_cookie.as_ref().unwrap();
         assert_eq!(cookie.logon_id, 0x42);
         assert_eq!(cookie.security_verifier, [0xCC; 16]);
     }

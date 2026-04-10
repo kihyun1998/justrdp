@@ -28,8 +28,7 @@ pub const PCB_FLAGS: u32 = 0;
 /// Size of the correlation ID field.
 pub const CORRELATION_ID_SIZE: usize = 16;
 
-/// Fixed size of PCB v1: cbSize(4) + flags(4) + version(2) + id(2) + correlationId(16) = 28
-/// Note: the `id` field is actually 2 bytes (unused, set to 0).
+/// Fixed size of PCB v1: cbSize(4) + flags(4) + version(2) + cbTargetName(2) + correlationId(16) = 28
 pub const PCB_V1_FIXED_SIZE: usize = 4 + 4 + 2 + 2 + CORRELATION_ID_SIZE;
 
 /// Pre-Connection Blob.

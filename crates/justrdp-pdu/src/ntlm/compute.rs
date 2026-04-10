@@ -17,7 +17,7 @@ use super::messages::{to_utf16le, AvId, AvPair};
 /// Unicode case folding (e.g., German sharp-s ß → SS) is NOT applied.
 pub fn ntowfv2(password: &str, user: &str, domain: &str) -> [u8; 16] {
     let password_utf16 = to_utf16le(password);
-    let nt_hash = md4(&password_utf16);
+    let mut nt_hash = md4(&password_utf16);
 
     // OEM uppercase: only convert ASCII a-z to A-Z
     let upper_user: alloc::string::String =
@@ -25,7 +25,11 @@ pub fn ntowfv2(password: &str, user: &str, domain: &str) -> [u8; 16] {
     let concat = alloc::format!("{}{}", upper_user, domain);
     let user_domain_utf16 = to_utf16le(&concat);
 
-    hmac_md5(&nt_hash, &user_domain_utf16)
+    let result = hmac_md5(&nt_hash, &user_domain_utf16);
+    // Zero the intermediate NT hash (pass-the-hash equivalent credential)
+    nt_hash = [0u8; 16];
+    core::hint::black_box(&nt_hash);
+    result
 }
 
 /// Modify the server's target_info for NTLMv2 response computation.

@@ -149,41 +149,39 @@ pub struct RdstlsAuthenticationRequest {
 
 impl RdstlsAuthenticationRequest {
     /// Create a new password-based auth request.
+    ///
+    /// Returns `Err` if any field exceeds u16::MAX bytes.
     pub fn password(
         domain: &[u8],
         username: &[u8],
         password: &[u8],
-    ) -> Self {
+    ) -> EncodeResult<Self> {
         // Password auth data format:
         // Domain (UTF-16LE, null-terminated, len u16 LE)
         // Username (UTF-16LE, null-terminated, len u16 LE)
         // Password (UTF-16LE, null-terminated, len u16 LE)
         let mut auth_data = Vec::new();
 
-        // Domain
-        let domain_with_null = append_null_utf16(domain);
-        assert!(domain_with_null.len() <= u16::MAX as usize, "RDSTLS domain too long for u16");
-        auth_data.extend_from_slice(&(domain_with_null.len() as u16).to_le_bytes());
-        auth_data.extend_from_slice(&domain_with_null);
+        macro_rules! append_field {
+            ($data:expr, $name:expr) => {{
+                let with_null = append_null_utf16($data);
+                let len = u16::try_from(with_null.len())
+                    .map_err(|_| justrdp_core::EncodeError::other($name, "field too long for u16"))?;
+                auth_data.extend_from_slice(&len.to_le_bytes());
+                auth_data.extend_from_slice(&with_null);
+            }};
+        }
 
-        // Username
-        let user_with_null = append_null_utf16(username);
-        assert!(user_with_null.len() <= u16::MAX as usize, "RDSTLS username too long for u16");
-        auth_data.extend_from_slice(&(user_with_null.len() as u16).to_le_bytes());
-        auth_data.extend_from_slice(&user_with_null);
+        append_field!(domain, "RDSTLS::domain");
+        append_field!(username, "RDSTLS::username");
+        append_field!(password, "RDSTLS::password");
 
-        // Password
-        let pass_with_null = append_null_utf16(password);
-        assert!(pass_with_null.len() <= u16::MAX as usize, "RDSTLS password too long for u16");
-        auth_data.extend_from_slice(&(pass_with_null.len() as u16).to_le_bytes());
-        auth_data.extend_from_slice(&pass_with_null);
-
-        Self {
+        Ok(Self {
             data_type: RdstlsAuthDataType::Password as u16,
             redirect_flags: None,
             redirect_guid: None,
             auth_data,
-        }
+        })
     }
 
     /// Create an auth request with a Kerberos token for Remote Credential Guard.
@@ -404,7 +402,7 @@ mod tests {
         let domain = b"C\x00O\x00R\x00P\x00"; // "CORP" in UTF-16LE
         let user = b"a\x00d\x00m\x00i\x00n\x00"; // "admin"
         let pass = b"p\x00a\x00s\x00s\x00"; // "pass"
-        let req = RdstlsAuthenticationRequest::password(domain, user, pass);
+        let req = RdstlsAuthenticationRequest::password(domain, user, pass).unwrap();
 
         let size = req.size();
         let mut buf = vec![0u8; size];

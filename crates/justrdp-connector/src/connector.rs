@@ -71,12 +71,16 @@ use crate::result::{ConnectionResult, Written};
 use crate::sequence::Sequence;
 use crate::state::ClientConnectorState;
 
-/// Security header flags.
+/// Security header flags (MS-RDPBCGR 2.2.8.1.1.2.1 TS_SECURITY_HEADER).
 const SEC_INFO_PKT: u16 = 0x0040;
 const SEC_LICENSE_PKT: u16 = 0x0080;
 
 /// Security header size for TLS/NLA connections (basic header only).
 const BASIC_SECURITY_HEADER_SIZE: usize = 4;
+
+/// FIPS security header size: flags(2) + flagsHi(2) + length(2) + version(1) + padLen(1) + MAC(8).
+/// MS-RDPBCGR §5.3.6.1.2 (TS_SECURITY_HEADER2).
+const FIPS_SECURITY_HEADER_SIZE: usize = 16;
 
 /// TPKT hint for PDU boundary detection.
 static TPKT_HINT: TpktHint = TpktHint;
@@ -185,6 +189,20 @@ pub struct ClientConnector {
     /// usable on this transport — the caller must reconnect to the
     /// target indicated by the PDU.
     server_redirection: Option<ServerRedirectionPdu>,
+}
+
+/// Result of classifying a finalization-phase PDU.
+enum FinalizationPduResult {
+    /// A data PDU was received (carries the ShareDataPduType for matching).
+    DataPdu(ShareDataPduType),
+    /// Server sent a DeactivateAll PDU.
+    DeactivateAll,
+    /// Server sent a ServerRedirect PDU.
+    Redirect(ServerRedirectionPdu),
+    /// Informational PDU consumed (SetErrorInfo, SaveSessionInfo, MonitorLayout).
+    Informational,
+    /// Non-data PDU of unknown type — stay in current state.
+    Unexpected,
 }
 
 /// Standard RDP Security mode (none for TLS/NLA).
@@ -551,7 +569,7 @@ impl ClientConnector {
                     &to_utf16le(domain_str),
                     &to_utf16le(&self.config.credentials.username),
                     &to_utf16le(&self.config.credentials.password),
-                )
+                )?
             }
         };
 
@@ -750,8 +768,9 @@ impl ClientConnector {
 
         let security_data = ClientSecurityData::new();
 
+        // MS-RDPBCGR 2.2.1.3.5: REDIRECTION_SUPPORTED(0x01) | REDIRECTION_VERSION5(0x04 << 2)
         let cluster_data = ClientClusterData {
-            flags: 0x0000_0011, // REDIRECTION_SUPPORTED | (REDIRECTION_VERSION5 << 2)
+            flags: 0x0000_0011,
             redirected_session_id: 0,
         };
 
@@ -1054,15 +1073,27 @@ impl ClientConnector {
                 Ok((flags, data))
             }
             SecurityMode::Rc4(_) | SecurityMode::Fips(_)
-                if self.server_encryption_level != ENCRYPTION_LEVEL_LOW =>
+                if self.server_encryption_level == ENCRYPTION_LEVEL_LOW =>
             {
+                // ENCRYPTION_LEVEL_LOW: server→client is not encrypted (MS-RDPBCGR 5.3.2).
+                // Note: FIPS mode (ENCRYPTION_LEVEL_FIPS=4) should never pair with
+                // ENCRYPTION_LEVEL_LOW; reject that invalid combination.
+                if matches!(self.security_mode, SecurityMode::Fips(_)) {
+                    return Err(ConnectorError::general(
+                        "Standard RDP Security: FIPS mode is incompatible with ENCRYPTION_LEVEL_LOW",
+                    ));
+                }
+                let remaining = inner.remaining();
+                let data = inner.read_slice(remaining, "SecurityHeader::data")?;
+                Ok((flags, data.to_vec()))
+            }
+            SecurityMode::Rc4(_) | SecurityMode::Fips(_) => {
                 // Encryption negotiated at CLIENT_COMPATIBLE/HIGH/FIPS but SEC_ENCRYPT
                 // not set — reject to prevent downgrade attack.
                 Err(ConnectorError::general("Standard RDP Security: SEC_ENCRYPT flag missing on encrypted session"))
             }
-            _ => {
-                // ENCRYPTION_LEVEL_LOW: server→client is not encrypted (MS-RDPBCGR 5.3.2).
-                // SecurityMode::None: TLS/NLA, no encryption layer.
+            SecurityMode::None => {
+                // TLS/NLA: no encryption layer.
                 let remaining = inner.remaining();
                 let data = inner.read_slice(remaining, "SecurityHeader::data")?;
                 Ok((flags, data.to_vec()))
@@ -1074,9 +1105,12 @@ impl ClientConnector {
     ///
     /// For Standard RDP Security: encrypts data, adds security header with MAC.
     /// For TLS/NLA: sends raw data (no security header added).
+    ///
+    /// `extra_sec_flags` is OR-ed into the security header flags (e.g. `SEC_INFO_PKT`).
     fn encrypt_and_send_mcs(
         &mut self,
         payload: &[u8],
+        extra_sec_flags: u16,
         output: &mut WriteBuf,
     ) -> ConnectorResult<usize> {
         match &mut self.security_mode {
@@ -1088,7 +1122,7 @@ impl ClientConnector {
                 let mut inner = vec![0u8; inner_size];
                 {
                     let mut cursor = WriteCursor::new(&mut inner);
-                    cursor.write_u16_le(SEC_ENCRYPT, "SecurityHeader::flags")?;
+                    cursor.write_u16_le(SEC_ENCRYPT | extra_sec_flags, "SecurityHeader::flags")?;
                     cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
                     cursor.write_slice(&mac, "SecurityHeader::mac")?;
                     cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
@@ -1099,11 +1133,11 @@ impl ClientConnector {
                 let (ciphertext, mac, pad_len) = ctx.encrypt(payload);
 
                 // MS-RDPBCGR §5.3.6: flags(2) + flagsHi(2) + length(2) + version(1) + padLen(1) + MAC(8) + data
-                let inner_size = 4 + 2 + 1 + 1 + 8 + ciphertext.len();
+                let inner_size = FIPS_SECURITY_HEADER_SIZE + ciphertext.len();
                 let mut inner = vec![0u8; inner_size];
                 {
                     let mut cursor = WriteCursor::new(&mut inner);
-                    cursor.write_u16_le(SEC_ENCRYPT, "SecurityHeader::flags")?;
+                    cursor.write_u16_le(SEC_ENCRYPT | extra_sec_flags, "SecurityHeader::flags")?;
                     cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
                     cursor.write_u16_le(0x0010, "FipsHeader::length")?;
                     cursor.write_u8(0x01, "FipsHeader::version")?;
@@ -1114,7 +1148,20 @@ impl ClientConnector {
                 encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
             }
             SecurityMode::None => {
-                encode_mcs_send_data(self.user_channel_id, self.io_channel_id, payload, output)
+                if extra_sec_flags != 0 {
+                    // TLS/NLA: send basic security header with extra flags only
+                    let inner_size = BASIC_SECURITY_HEADER_SIZE + payload.len();
+                    let mut inner = vec![0u8; inner_size];
+                    {
+                        let mut cursor = WriteCursor::new(&mut inner);
+                        cursor.write_u16_le(extra_sec_flags, "SecurityHeader::flags")?;
+                        cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+                        cursor.write_slice(payload, "SecurityHeader::data")?;
+                    }
+                    encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
+                } else {
+                    encode_mcs_send_data(self.user_channel_id, self.io_channel_id, payload, output)
+                }
             }
         }
     }
@@ -1169,7 +1216,7 @@ impl ClientConnector {
                 &client_random,
                 &server_random,
                 self.server_encryption_method,
-            );
+            ).map_err(crate::error::ConnectorError::general)?;
             // SEC_SECURE_CHECKSUM is available on RDP 5.2+ (version >= 0x00080004)
             let use_salted_mac = self.server_rdp_version >= 0x00080004;
             self.security_mode = SecurityMode::Rc4(RdpSecurityContext::new(keys, use_salted_mac));
@@ -1205,65 +1252,11 @@ impl ClientConnector {
         // Encode Client Info PDU
         let info_bytes = justrdp_core::encode_vec(&info)?;
 
-        // Build security header + info
-        let is_encrypted = !matches!(self.security_mode, SecurityMode::None);
-        let sec_flags = if is_encrypted { SEC_INFO_PKT | SEC_ENCRYPT } else { SEC_INFO_PKT };
-
-        if is_encrypted {
-            match &mut self.security_mode {
-                SecurityMode::Rc4(ctx) => {
-                    let mut data = info_bytes.clone();
-                    let mac = ctx.encrypt(&mut data);
-                    let inner_size = BASIC_SECURITY_HEADER_SIZE + 8 + data.len();
-                    let mut inner = vec![0u8; inner_size];
-                    {
-                        let mut cursor = WriteCursor::new(&mut inner);
-                        cursor.write_u16_le(sec_flags, "SecurityHeader::flags")?;
-                        cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-                        cursor.write_slice(&mac, "SecurityHeader::mac")?;
-                        cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
-                    }
-                    let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
-                    self.state = ClientConnectorState::ConnectTimeAutoDetection;
-                    Ok(Written::new(size))
-                }
-                SecurityMode::Fips(ctx) => {
-                    let (ciphertext, mac, pad_len) = ctx.encrypt(&info_bytes);
-                    // MS-RDPBCGR §5.3.6: flags(2) + flagsHi(2) + length(2) + version(1) + padLen(1) + MAC(8) + data
-                    let inner_size = 4 + 2 + 1 + 1 + 8 + ciphertext.len();
-                    let mut inner = vec![0u8; inner_size];
-                    {
-                        let mut cursor = WriteCursor::new(&mut inner);
-                        cursor.write_u16_le(sec_flags, "SecurityHeader::flags")?;
-                        cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-                        cursor.write_u16_le(0x0010, "FipsHeader::length")?;
-                        cursor.write_u8(0x01, "FipsHeader::version")?;
-                        cursor.write_u8(pad_len, "FipsHeader::padLen")?;
-                        cursor.write_slice(&mac, "FipsHeader::mac")?;
-                        cursor.write_slice(&ciphertext, "FipsHeader::encryptedData")?;
-                    }
-                    let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
-                    self.state = ClientConnectorState::ConnectTimeAutoDetection;
-                    Ok(Written::new(size))
-                }
-                SecurityMode::None => {
-                    Err(ConnectorError::general("internal error: None security mode in encrypted path"))
-                }
-            }
-        } else {
-            // TLS/NLA mode: send unencrypted (basic security header only)
-            let inner_size = BASIC_SECURITY_HEADER_SIZE + info_bytes.len();
-            let mut inner = vec![0u8; inner_size];
-            {
-                let mut cursor = WriteCursor::new(&mut inner);
-                cursor.write_u16_le(SEC_INFO_PKT, "SecurityHeader::flags")?;
-                cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
-                cursor.write_slice(&info_bytes, "SecurityHeader::encryptedData")?;
-            }
-            let size = encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)?;
-            self.state = ClientConnectorState::ConnectTimeAutoDetection;
-            Ok(Written::new(size))
-        }
+        // Send Client Info PDU with SEC_INFO_PKT flag.
+        // encrypt_and_send_mcs handles encryption (RC4/FIPS) or plain (TLS/NLA).
+        let size = self.encrypt_and_send_mcs(&info_bytes, SEC_INFO_PKT, output)?;
+        self.state = ClientConnectorState::ConnectTimeAutoDetection;
+        Ok(Written::new(size))
     }
 
     /// Phase 8: Connect-Time Auto-Detection.
@@ -1418,7 +1411,7 @@ impl ClientConnector {
             &confirm_bytes,
         )?;
 
-        let size = self.encrypt_and_send_mcs(&sc_payload, output)?;
+        let size = self.encrypt_and_send_mcs(&sc_payload, 0, output)?;
         self.state = ClientConnectorState::ConnectionFinalizationSendSynchronize;
         Ok(Written::new(size))
     }
@@ -1619,14 +1612,14 @@ impl ClientConnector {
             self.user_channel_id,
             &sd_payload,
         )?;
-        let size = self.encrypt_and_send_mcs(&sc_payload, output)?;
+        let size = self.encrypt_and_send_mcs(&sc_payload, 0, output)?;
         self.state = next_state;
         Ok(Written::new(size))
     }
 
     fn step_finalization_send_synchronize(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         let pdu = SynchronizePdu {
-            message_type: 1, // SYNCMSGTYPE_SYNC
+            message_type: 1, // SYNCMSGTYPE_SYNC (MS-RDPBCGR 2.2.1.14.1)
             target_user: self.io_channel_id,
         };
         self.step_send_finalization_pdu(
@@ -1690,12 +1683,8 @@ impl ClientConnector {
         )
     }
 
-    fn step_finalization_wait_pdu(
-        &mut self,
-        input: &[u8],
-        expected_type: ShareDataPduType,
-        next_state: ClientConnectorState,
-    ) -> ConnectorResult<Written> {
+    /// Classification of a received finalization PDU.
+    fn decode_finalization_pdu(&mut self, input: &[u8]) -> ConnectorResult<FinalizationPduResult> {
         let mut cursor = ReadCursor::new(input);
         let _tpkt = TpktHeader::decode(&mut cursor)?;
         let _dt = DataTransfer::decode(&mut cursor)?;
@@ -1711,49 +1700,33 @@ impl ClientConnector {
         };
 
         let mut inner = ReadCursor::new(&decrypted);
-
         let sc_hdr = ShareControlHeader::decode(&mut inner)?;
 
         if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
-            // Deactivation-Reactivation: go back to capabilities exchange
-            // MS-RDPBCGR 1.3.1.3 — caller should check deactivation_count() to flush caches
-            self.deactivation_count = self.deactivation_count.saturating_add(1);
-            self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
-            return Ok(Written::nothing());
+            return Ok(FinalizationPduResult::DeactivateAll);
         }
 
         if sc_hdr.pdu_type == ShareControlPduType::ServerRedirect {
             // MS-RDPBCGR 2.2.13.3.1 (Enhanced Security Server Redirection):
             // ShareControlHeader (already consumed) + 2-byte pad + RDP_SERVER_REDIRECTION_PACKET.
-            // Stash the redirection so transition_to_connected exposes it on
-            // ConnectionResult and stop the finalization sequence — the
-            // caller is expected to switch transports.
             let _pad2 = inner.read_u16_le("ServerRedirect::pad2")?;
             let redir = ServerRedirectionPdu::decode(&mut inner)?;
-            self.server_redirection = Some(redir);
-            self.transition_to_connected();
-            return Ok(Written::nothing());
+            return Ok(FinalizationPduResult::Redirect(redir));
         }
 
         if sc_hdr.pdu_type != ShareControlPduType::Data {
-            // Unknown non-data PDU — stay in same state
-            return Ok(Written::nothing());
+            return Ok(FinalizationPduResult::Unexpected);
         }
 
         let sd_hdr = ShareDataHeader::decode(&mut inner)?;
 
         if self.try_store_monitor_layout(sd_hdr.pdu_type2, &mut inner)? {
-            return Ok(Written::nothing());
+            return Ok(FinalizationPduResult::Informational);
         }
 
-        // Informational PDUs that may interleave with the finalization
-        // sequence. SetErrorInfo with non-ERRINFO_NONE means the server
-        // already detected a fatal problem in our preceding PDUs and is
-        // about to reset the connection — surface as a connector error
-        // so the caller does not silently hang on the next read.
-        // SaveSessionInfo can carry the logon ARC cookie; we drop it
-        // here because the connector cannot emit events, and ActiveStage
-        // will re-surface any subsequent SaveSessionInfo PDUs.
+        // Informational PDUs that may interleave with the finalization sequence.
+        // SetErrorInfo with non-ERRINFO_NONE means the server already detected
+        // a fatal problem — surface as a connector error.
         if sd_hdr.pdu_type2 == ShareDataPduType::SetErrorInfo {
             let pdu = SetErrorInfoPdu::decode(&mut inner)?;
             if pdu.error_info != ERRINFO_NONE {
@@ -1761,90 +1734,66 @@ impl ClientConnector {
                     "server reported fatal error_info during finalization",
                 ));
             }
-            return Ok(Written::nothing());
+            return Ok(FinalizationPduResult::Informational);
         }
         if sd_hdr.pdu_type2 == ShareDataPduType::SaveSessionInfo {
-            return Ok(Written::nothing());
+            return Ok(FinalizationPduResult::Informational);
         }
 
-        if sd_hdr.pdu_type2 != expected_type {
-            // Not the expected finalization PDU and not an informational
-            // PDU we recognize — stay in the same state. With a buffered
-            // transport reader the next iteration will pick up the
-            // expected PDU; without one, the caller may hang.
-            return Ok(Written::nothing());
-        }
+        Ok(FinalizationPduResult::DataPdu(sd_hdr.pdu_type2))
+    }
 
-        self.state = next_state;
+    fn step_finalization_wait_pdu(
+        &mut self,
+        input: &[u8],
+        expected_type: ShareDataPduType,
+        next_state: ClientConnectorState,
+    ) -> ConnectorResult<Written> {
+        let pdu_type = self.decode_finalization_pdu(input)?;
+
+        match pdu_type {
+            FinalizationPduResult::DataPdu(t) if t == expected_type => {
+                self.state = next_state;
+            }
+            FinalizationPduResult::Redirect(redir) => {
+                self.server_redirection = Some(redir);
+                self.transition_to_connected();
+            }
+            FinalizationPduResult::DeactivateAll => {
+                // Deactivation-Reactivation: go back to capabilities exchange
+                // MS-RDPBCGR 1.3.1.3 — caller should check deactivation_count() to flush caches
+                self.deactivation_count = self.deactivation_count.saturating_add(1);
+                self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
+            }
+            _ => {
+                // Informational, unexpected, or non-matching data PDU — stay in same state
+            }
+        }
         Ok(Written::nothing())
     }
 
     /// Wait for Font Map PDU and transition to Connected.
     fn step_finalization_wait_font_map(&mut self, input: &[u8]) -> ConnectorResult<Written> {
-        let mut cursor = ReadCursor::new(input);
-        let _tpkt = TpktHeader::decode(&mut cursor)?;
-        let _dt = DataTransfer::decode(&mut cursor)?;
+        // Decode the incoming PDU using the shared finalization logic.
+        let pdu_type = self.decode_finalization_pdu(input)?;
 
-        let sdi = SendDataIndication::decode(&mut cursor)?;
-
-        let decrypted = if !matches!(self.security_mode, SecurityMode::None) {
-            let (_flags, data) = self.decrypt_server_data(sdi.user_data)?;
-            data
-        } else {
-            sdi.user_data.to_vec()
-        };
-
-        let mut inner = ReadCursor::new(&decrypted);
-        let sc_hdr = ShareControlHeader::decode(&mut inner)?;
-
-        if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
-            self.deactivation_count = self.deactivation_count.saturating_add(1);
-            self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
-            return Ok(Written::nothing());
-        }
-
-        if sc_hdr.pdu_type == ShareControlPduType::ServerRedirect {
-            // Mirror of step_finalization_wait_pdu — see that function
-            // for the MS-RDPBCGR 2.2.13.3.1 framing rationale.
-            let _pad2 = inner.read_u16_le("ServerRedirect::pad2")?;
-            let redir = ServerRedirectionPdu::decode(&mut inner)?;
-            self.server_redirection = Some(redir);
-            self.transition_to_connected();
-            return Ok(Written::nothing());
-        }
-
-        if sc_hdr.pdu_type != ShareControlPduType::Data {
-            return Ok(Written::nothing());
-        }
-
-        let sd_hdr = ShareDataHeader::decode(&mut inner)?;
-
-        if self.try_store_monitor_layout(sd_hdr.pdu_type2, &mut inner)? {
-            return Ok(Written::nothing());
-        }
-
-        // Same informational PDU handling as step_finalization_wait_pdu —
-        // Windows servers can interleave SetErrorInfo (heartbeat) and
-        // SaveSessionInfo (logon notification) with the FontMap PDU.
-        if sd_hdr.pdu_type2 == ShareDataPduType::SetErrorInfo {
-            let pdu = SetErrorInfoPdu::decode(&mut inner)?;
-            if pdu.error_info != ERRINFO_NONE {
-                return Err(ConnectorError::general(
-                    "server reported fatal error_info while waiting for FontMap",
-                ));
+        match pdu_type {
+            FinalizationPduResult::DataPdu(t) if t == ShareDataPduType::FontMap => {
+                // Font Map received — connection complete
+                self.transition_to_connected();
             }
-            return Ok(Written::nothing());
+            FinalizationPduResult::Redirect(redir) => {
+                self.server_redirection = Some(redir);
+                self.transition_to_connected();
+            }
+            FinalizationPduResult::DeactivateAll => {
+                self.deactivation_count = self.deactivation_count.saturating_add(1);
+                self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
+            }
+            _ => {
+                // Informational, unexpected, or non-FontMap data PDU — stay in current state
+            }
         }
-        if sd_hdr.pdu_type2 == ShareDataPduType::SaveSessionInfo {
-            return Ok(Written::nothing());
-        }
-
-        if sd_hdr.pdu_type2 != ShareDataPduType::FontMap {
-            return Ok(Written::nothing());
-        }
-
-        // Font Map received — connection complete
-        self.transition_to_connected();
         Ok(Written::nothing())
     }
 

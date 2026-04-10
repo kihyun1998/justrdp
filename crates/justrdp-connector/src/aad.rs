@@ -73,22 +73,21 @@ pub fn build_rdp_assertion(config: &AadConfig, server_nonce: &str) -> ConnectorR
 /// For RSA keys: `SHA-256({"e":"<e_b64>","kty":"RSA","n":"<n_b64>"})` → Base64URL
 /// Keys must be in lexicographic order (e, kty, n).
 pub fn compute_jwk_thumbprint(n: &[u8], e: &[u8]) -> String {
-    let canonical = build_canonical_jwk_json(n, e);
+    // RFC 7638 §3: canonical JWK JSON with keys in lexicographic order, minified.
+    // build_jwk_json already produces keys in order (e, kty, n) — do NOT reorder.
+    let canonical = build_jwk_json(n, e);
     let hash = sha256(canonical.as_bytes());
     base64url::encode_string(&hash)
 }
 
-/// Build the full JWK JSON object for the `cnf` field.
+/// Build the JWK JSON object.
+///
+/// Field order MUST remain lexicographic (e, kty, n) per RFC 7638 §3, since
+/// this output is also used for thumbprint computation.
 pub fn build_jwk_json(n: &[u8], e: &[u8]) -> String {
     let n_b64 = base64url::encode_string(n);
     let e_b64 = base64url::encode_string(e);
     format!(r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#, e_b64, n_b64)
-}
-
-/// Build canonical JWK JSON for thumbprint (RFC 7638 §3: lexicographic order, minified).
-fn build_canonical_jwk_json(n: &[u8], e: &[u8]) -> String {
-    // Lexicographic order: e, kty, n
-    build_jwk_json(n, e)
 }
 
 /// Extract a string value from a flat JSON object.

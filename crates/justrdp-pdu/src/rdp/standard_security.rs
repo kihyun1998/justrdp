@@ -106,13 +106,13 @@ fn salted_hash(
 
 /// Derive the initial session keys from client and server randoms.
 ///
-/// Returns `(mac_key, initial_encrypt_key, initial_decrypt_key)`.
-/// All keys are 16 bytes; they may be truncated based on encryption method.
+/// Returns `Err` for unsupported encryption methods (e.g., FIPS — use
+/// `derive_fips_session_keys` instead).
 pub fn derive_session_keys(
     client_random: &[u8; 32],
     server_random: &[u8; 32],
     encryption_method: u32,
-) -> SessionKeys {
+) -> Result<SessionKeys, &'static str> {
     // PreMasterSecret: first 24 bytes of ClientRandom + first 24 bytes of ServerRandom
     let mut pre_master_secret = [0u8; 48];
     pre_master_secret[..24].copy_from_slice(&client_random[..24]);
@@ -155,7 +155,7 @@ pub fn derive_session_keys(
             let initial_encrypt = derive_final_key(&session_key_blob[32..48], client_random, server_random);
             let initial_decrypt = derive_final_key(&session_key_blob[16..32], client_random, server_random);
 
-            SessionKeys {
+            Ok(SessionKeys {
                 mac_key: mac_key_5,
                 encrypt_key: finalize_key_40bit(&initial_encrypt),
                 decrypt_key: finalize_key_40bit(&initial_decrypt),
@@ -163,14 +163,14 @@ pub fn derive_session_keys(
                 decrypt_update_key: finalize_key_40bit(&initial_decrypt),
                 key_len: 8, // RC4 with 8-byte effective key (5 known + 3 salt)
                 encryption_method,
-            }
+            })
         }
         ENCRYPTION_METHOD_56BIT => {
             let mac_key_7 = finalize_key_56bit(&mac_key);
             let initial_encrypt = derive_final_key(&session_key_blob[32..48], client_random, server_random);
             let initial_decrypt = derive_final_key(&session_key_blob[16..32], client_random, server_random);
 
-            SessionKeys {
+            Ok(SessionKeys {
                 mac_key: mac_key_7,
                 encrypt_key: finalize_key_56bit(&initial_encrypt),
                 decrypt_key: finalize_key_56bit(&initial_decrypt),
@@ -178,13 +178,13 @@ pub fn derive_session_keys(
                 decrypt_update_key: finalize_key_56bit(&initial_decrypt),
                 key_len: 8,
                 encryption_method,
-            }
+            })
         }
         ENCRYPTION_METHOD_128BIT => {
             let initial_encrypt = derive_final_key(&session_key_blob[32..48], client_random, server_random);
             let initial_decrypt = derive_final_key(&session_key_blob[16..32], client_random, server_random);
 
-            SessionKeys {
+            Ok(SessionKeys {
                 mac_key,
                 encrypt_key: initial_encrypt,
                 decrypt_key: initial_decrypt,
@@ -192,22 +192,10 @@ pub fn derive_session_keys(
                 decrypt_update_key: initial_decrypt,
                 key_len: 16,
                 encryption_method,
-            }
+            })
         }
         _ => {
-            // Unsupported method, return 128-bit as default
-            let initial_encrypt = derive_final_key(&session_key_blob[32..48], client_random, server_random);
-            let initial_decrypt = derive_final_key(&session_key_blob[16..32], client_random, server_random);
-
-            SessionKeys {
-                mac_key,
-                encrypt_key: initial_encrypt,
-                decrypt_key: initial_decrypt,
-                encrypt_update_key: initial_encrypt,
-                decrypt_update_key: initial_decrypt,
-                key_len: 16,
-                encryption_method,
-            }
+            Err("unsupported encryption method (use derive_fips_session_keys for FIPS)")
         }
     }
 }
@@ -245,6 +233,8 @@ fn finalize_key_56bit(key: &[u8; 16]) -> [u8; 16] {
 }
 
 /// Derived session keys.
+///
+/// Key material is zeroed on drop to prevent lingering secrets in memory.
 #[derive(Clone)]
 pub struct SessionKeys {
     pub mac_key: [u8; 16],
@@ -257,6 +247,24 @@ pub struct SessionKeys {
     /// Effective key length for RC4 (8 for 40/56-bit, 16 for 128-bit).
     pub key_len: usize,
     pub encryption_method: u32,
+}
+
+impl Drop for SessionKeys {
+    fn drop(&mut self) {
+        self.mac_key = [0u8; 16];
+        self.encrypt_key = [0u8; 16];
+        self.decrypt_key = [0u8; 16];
+        self.encrypt_update_key = [0u8; 16];
+        self.decrypt_update_key = [0u8; 16];
+    }
+}
+
+impl Drop for FipsSessionKeys {
+    fn drop(&mut self) {
+        self.mac_key = [0u8; 16];
+        self.encrypt_key = [0u8; 24];
+        self.decrypt_key = [0u8; 24];
+    }
 }
 
 // ── MAC Signature (MS-RDPBCGR 5.3.6.1) ──
@@ -722,10 +730,10 @@ mod tests {
         let cr = [0x11u8; 32];
         let sr = [0x22u8; 32];
 
-        let keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_128BIT);
+        let keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_128BIT).unwrap();
         assert_eq!(keys.key_len, 16);
         // Keys should be deterministic
-        let keys2 = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_128BIT);
+        let keys2 = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_128BIT).unwrap();
         assert_eq!(keys.mac_key, keys2.mac_key);
         assert_eq!(keys.encrypt_key, keys2.encrypt_key);
         assert_eq!(keys.decrypt_key, keys2.decrypt_key);
@@ -739,7 +747,7 @@ mod tests {
         let cr = [0x11u8; 32];
         let sr = [0x22u8; 32];
 
-        let keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_40BIT);
+        let keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_40BIT).unwrap();
         assert_eq!(keys.key_len, 8);
         // 40-bit keys: 5 key bytes + salt 0xD1269E at bytes 5-7
         assert_eq!(keys.encrypt_key[5], 0xD1);
@@ -768,7 +776,7 @@ mod tests {
         let cr = [0xAAu8; 32];
         let sr = [0xBBu8; 32];
 
-        let keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_128BIT);
+        let keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_128BIT).unwrap();
         let mut enc_ctx = RdpSecurityContext::new(keys.clone(), false);
 
         // For decryption, swap encrypt/decrypt keys (server uses opposite direction)
@@ -796,7 +804,7 @@ mod tests {
     fn key_update_at_4096() {
         let cr = [0xCCu8; 32];
         let sr = [0xDDu8; 32];
-        let keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_128BIT);
+        let keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_128BIT).unwrap();
         let original_encrypt_key = keys.encrypt_key;
 
         let mut ctx = RdpSecurityContext::new(keys, false);

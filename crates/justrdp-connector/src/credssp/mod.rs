@@ -327,6 +327,19 @@ impl CredsspSequence {
             .bits() & challenge.flags.bits();
         let negotiated_flags = NegotiateFlags::from_bits(negotiated_flags);
 
+        // Validate that required security flags survived negotiation.
+        // Without these, signing/sealing will produce incorrect output or
+        // silently degrade to a weaker protection level.
+        const REQUIRED: u32 =
+            NegotiateFlags::NEGOTIATE_EXTENDED_SESSIONSECURITY.bits()
+            | NegotiateFlags::NEGOTIATE_SEAL.bits()
+            | NegotiateFlags::NEGOTIATE_KEY_EXCH.bits();
+        if negotiated_flags.bits() & REQUIRED != REQUIRED {
+            return Err(ConnectorError::general(
+                "NTLM negotiation failed: server stripped required flags (EXTENDED_SESSIONSECURITY, SEAL, KEY_EXCH)",
+            ));
+        }
+
         // Build Authenticate message (with MIC zeroed for initial encoding)
         let mut authenticate = AuthenticateMessage {
             flags: negotiated_flags,
@@ -341,7 +354,7 @@ impl CredsspSequence {
         };
 
         // Compute MIC: HMAC_MD5(ExportedSessionKey, Negotiate + Challenge + Authenticate_zeroed_MIC)
-        let auth_bytes_zeroed_mic = authenticate.to_bytes();
+        let auth_bytes_zeroed_mic = authenticate.to_bytes()?;
         let mic = compute_mic(
             &self.exported_session_key,
             &self.negotiate_bytes,
@@ -349,7 +362,7 @@ impl CredsspSequence {
             &auth_bytes_zeroed_mic,
         );
         authenticate.mic = mic;
-        let authenticate_bytes = authenticate.to_bytes();
+        let authenticate_bytes = authenticate.to_bytes()?;
 
         self.send_signing_key = signing::signing_key(&self.exported_session_key, true);
         let seal_key = signing::sealing_key(&self.exported_session_key, true);
@@ -479,7 +492,7 @@ impl CredsspSequence {
         // MS-CSSP 3.1.5: Restricted Admin omits authInfo entirely;
         // all other modes encrypt and send TSCredentials.
         if !matches!(self.credential_type, CredentialType::RestrictedAdmin) {
-            let ts_credentials = self.build_ts_credentials();
+            let ts_credentials = self.build_ts_credentials()?;
             let encrypted = self.ntlm_encrypt(&ts_credentials)?;
             ts_request.auth_info = Some(encrypted);
         }
@@ -498,15 +511,28 @@ impl CredsspSequence {
     /// - `AUTHZ_SUCCESS` (0x00000000) = success (proceed with RDP connection)
     /// - `LOGON_FAILED_OTHER` (0x00000001) = auth failed
     /// - other non-zero = error
+    ///
+    /// Some server implementations wrap the result in a TsRequest (ASN.1 SEQUENCE,
+    /// leading byte 0x30). We try the raw 4-byte form first to avoid a byte-value
+    /// collision where a raw status starting with 0x30 is misclassified as a TsRequest.
     fn step_wait_early_user_auth(&mut self, input: &[u8]) -> ConnectorResult<Vec<u8>> {
-        // EarlyUserAuthResult is a raw 4-byte LE UINT32 (MS-RDPBCGR 5.4.2.2).
-        // Some server implementations may wrap it in a TsRequest (starts with 0x30 SEQUENCE).
-        // Note: a raw status value starting with byte 0x30 (e.g., status=0x00000030)
-        // would be misclassified as a TsRequest; this is benign since such status
-        // codes are not defined by the spec and the TsRequest fallback treats missing
-        // errorCode as success.
-        if input.first() == Some(&0x30) {
-            // Looks like a TsRequest — try to decode
+        if input.len() < 4 {
+            return Err(ConnectorError::general("EarlyUserAuthResult too short"));
+        }
+
+        // MS-RDPBCGR 5.4.2.2: the server sends a raw 4-byte LE UINT32.
+        // Some implementations wrap the result in a TsRequest (ASN.1 SEQUENCE,
+        // leading byte 0x30). Discriminate by length: exactly 4 bytes is always
+        // the raw form; longer payloads try TsRequest first, falling back to raw.
+        let raw_status = u32::from_le_bytes(input[..4].try_into().unwrap());
+
+        if input.len() == 4 {
+            // Exactly 4 bytes — always a raw status code.
+            if raw_status != 0 {
+                return Err(ConnectorError::general("EarlyUserAuthResult: authentication failed"));
+            }
+        } else if input.first() == Some(&0x30) {
+            // Longer payload starting with ASN.1 SEQUENCE tag — try TsRequest.
             if let Ok(ts_req) = TsRequest::decode(input) {
                 match ts_req.error_code {
                     Some(0) => {} // explicit success
@@ -517,15 +543,17 @@ impl CredsspSequence {
                         return Err(ConnectorError::general("EarlyUserAuthResult: errorCode absent in TsRequest"));
                     }
                 }
-            }
-        } else if input.len() >= 4 {
-            // Raw 4-byte LE UINT32
-            let status = u32::from_le_bytes(input[..4].try_into().unwrap());
-            if status != 0 {
-                return Err(ConnectorError::general("EarlyUserAuthResult: authentication failed"));
+            } else {
+                // TsRequest decode failed — fall back to raw status
+                if raw_status != 0 {
+                    return Err(ConnectorError::general("EarlyUserAuthResult: authentication failed"));
+                }
             }
         } else {
-            return Err(ConnectorError::general("EarlyUserAuthResult too short"));
+            // Longer payload but not a TsRequest — fall back to raw status
+            if raw_status != 0 {
+                return Err(ConnectorError::general("EarlyUserAuthResult: authentication failed"));
+            }
         }
 
         self.state = CredsspState::Done;
@@ -708,26 +736,29 @@ impl CredsspSequence {
     /// - credType 6: TSRemoteGuardCreds (Remote Credential Guard)
     ///
     /// Note: RestrictedAdmin omits authInfo entirely (handled in step_send_credentials).
-    fn build_ts_credentials(&self) -> Vec<u8> {
+    fn build_ts_credentials(&self) -> ConnectorResult<Vec<u8>> {
         match &self.credential_type {
             CredentialType::Password => self.build_ts_password_creds(),
             CredentialType::RemoteGuard { kerberos_token, supplemental_creds } => {
-                build_ts_remote_guard_creds(kerberos_token, supplemental_creds)
+                Ok(build_ts_remote_guard_creds(kerberos_token, supplemental_creds))
             }
             CredentialType::RestrictedAdmin => {
                 // Must never be called — RestrictedAdmin omits authInfo entirely
                 // in step_send_credentials. Return empty bytes as a safety fallback
                 // to avoid leaking real credentials if this path is ever reached.
-                Vec::new()
+                Ok(Vec::new())
             }
         }
     }
 
     /// Build TSCredentials with TSPasswordCreds (credType = 1).
-    fn build_ts_password_creds(&self) -> Vec<u8> {
-        let username = core::str::from_utf8(&self.username).unwrap_or("");
-        let password = core::str::from_utf8(&self.password).unwrap_or("");
-        let domain = core::str::from_utf8(&self.domain).unwrap_or("");
+    fn build_ts_password_creds(&self) -> ConnectorResult<Vec<u8>> {
+        let username = core::str::from_utf8(&self.username)
+            .map_err(|_| ConnectorError::general("username is not valid UTF-8"))?;
+        let password = core::str::from_utf8(&self.password)
+            .map_err(|_| ConnectorError::general("password is not valid UTF-8"))?;
+        let domain = core::str::from_utf8(&self.domain)
+            .map_err(|_| ConnectorError::general("domain is not valid UTF-8"))?;
 
         let domain_utf16 = to_utf16le(domain);
         let user_utf16 = to_utf16le(username);
@@ -751,15 +782,19 @@ impl CredsspSequence {
         let mut creds_body = Vec::new();
         creds_body.extend(der_context_tag(0, &der_integer(1)));
         creds_body.extend(der_context_tag(1, &der_octet_string(&pass_creds)));
-        der_sequence(&creds_body)
+        Ok(der_sequence(&creds_body))
     }
 }
 
 impl Drop for CredsspSequence {
     fn drop(&mut self) {
-        // Zeroize password
+        // Zeroize credentials
+        self.username.fill(0);
+        core::hint::black_box(&self.username);
         self.password.fill(0);
         core::hint::black_box(&self.password);
+        self.domain.fill(0);
+        core::hint::black_box(&self.domain);
         // Zeroize session keys
         self.exported_session_key.fill(0);
         core::hint::black_box(&self.exported_session_key);
@@ -1002,7 +1037,7 @@ mod tests {
     #[test]
     fn build_ts_credentials() {
         let seq = CredsspSequence::new("admin", "password123", "CORP", vec![], test_random(), false);
-        let creds = seq.build_ts_credentials();
+        let creds = seq.build_ts_credentials().unwrap();
 
         assert_eq!(creds[0], 0x30); // SEQUENCE tag
         assert!(creds.len() > 10);
@@ -1082,7 +1117,7 @@ mod tests {
             "admin", "", "CORP", vec![], test_random(), false,
             CredentialType::RemoteGuard { kerberos_token: vec![0xAA; 16], supplemental_creds: vec![] },
         );
-        let creds = seq.build_ts_credentials();
+        let creds = seq.build_ts_credentials().unwrap();
         assert_eq!(creds[0], 0x30); // SEQUENCE
         let kerberos_utf16 = to_utf16le("Kerberos");
         assert!(creds.windows(kerberos_utf16.len()).any(|w| w == kerberos_utf16.as_slice()));
@@ -1258,7 +1293,7 @@ mod tests {
                 ],
             },
         );
-        let creds = seq.build_ts_credentials();
+        let creds = seq.build_ts_credentials().unwrap();
         assert_eq!(creds[0], 0x30); // SEQUENCE
         // Should contain "Kerberos" (UTF-16LE) twice (logon + supplemental)
         let kerberos_count = creds.windows(kerberos_utf16.len())

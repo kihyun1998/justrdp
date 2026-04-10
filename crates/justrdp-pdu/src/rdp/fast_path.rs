@@ -7,25 +7,42 @@ use alloc::vec::Vec;
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_core::{DecodeError, DecodeResult, EncodeResult};
 
-// ── Constants ──
+// ── Constants (MS-RDPBCGR 2.2.9) ──
 
-/// Fast-Path Output action value (bits 0-1 of first byte).
+/// Fast-Path Output action value (bits 0-1 of first byte). MS-RDPBCGR 2.2.9.1.2
 pub const FASTPATH_OUTPUT_ACTION_FASTPATH: u8 = 0x00;
 
-/// Fast-Path Output encryption flag.
+/// Fast-Path Output encryption flag. MS-RDPBCGR 2.2.9.1.2
 pub const FASTPATH_OUTPUT_ENCRYPTED: u8 = 0x01;
 
-/// Fast-Path Output secure checksum flag.
+/// Fast-Path Output secure checksum flag. MS-RDPBCGR 2.2.9.1.2
 pub const FASTPATH_OUTPUT_SECURE_CHECKSUM: u8 = 0x02;
 
-/// Fast-Path Input action value (bits 0-1 of first byte).
+/// Fast-Path Input action value (bits 0-1 of first byte). MS-RDPBCGR 2.2.8.1.2
 pub const FASTPATH_INPUT_ACTION_FASTPATH: u8 = 0x00;
 
-/// Fast-Path Input encryption flag (bits 6-7).
+/// Fast-Path Input encryption flag (bits 6-7). MS-RDPBCGR 2.2.8.1.2
 pub const FASTPATH_INPUT_ENCRYPTED: u8 = 0x01;
 
-/// Fast-Path Input secure checksum flag (bits 6-7).
+/// Fast-Path Input secure checksum flag (bits 6-7). MS-RDPBCGR 2.2.8.1.2
 pub const FASTPATH_INPUT_SECURE_CHECKSUM: u8 = 0x02;
+
+// ── Input event wire sizes ──
+
+/// Scancode event: eventHeader(1) + keyCode(1). MS-RDPBCGR 2.2.8.1.2.2.1
+pub const FASTPATH_SCANCODE_EVENT_SIZE: usize = 2;
+/// Mouse event: eventHeader(1) + pointerFlags(2) + xPos(2) + yPos(2). MS-RDPBCGR 2.2.8.1.2.2.3
+pub const FASTPATH_MOUSE_EVENT_SIZE: usize = 7;
+/// Extended mouse event: eventHeader(1) + pointerFlags(2) + xPos(2) + yPos(2). MS-RDPBCGR 2.2.8.1.2.2.4
+pub const FASTPATH_MOUSEX_EVENT_SIZE: usize = 7;
+/// Relative mouse event: eventHeader(1) + xDelta(2) + yDelta(2). MS-RDPBCGR 2.2.8.1.2.2.5
+pub const FASTPATH_RELATIVE_MOUSE_EVENT_SIZE: usize = 5;
+/// Sync event: eventHeader(1). MS-RDPBCGR 2.2.8.1.2.2.6
+pub const FASTPATH_SYNC_EVENT_SIZE: usize = 1;
+/// Unicode event: eventHeader(1) + unicodeCode(2). MS-RDPBCGR 2.2.8.1.2.2.2
+pub const FASTPATH_UNICODE_EVENT_SIZE: usize = 3;
+/// QoE Timestamp event: eventHeader(1) + timestamp(4). MS-RDPBCGR 2.2.8.1.2.2.7
+pub const FASTPATH_QOE_TIMESTAMP_EVENT_SIZE: usize = 5;
 
 // ── Fast-Path Output Update Types ──
 
@@ -346,7 +363,7 @@ impl Encode for FastPathScancodeEvent {
     }
 
     fn name(&self) -> &'static str { "FastPathScancodeEvent" }
-    fn size(&self) -> usize { 2 }
+    fn size(&self) -> usize { FASTPATH_SCANCODE_EVENT_SIZE }
 }
 
 impl<'de> Decode<'de> for FastPathScancodeEvent {
@@ -385,7 +402,7 @@ impl Encode for FastPathMouseEvent {
     }
 
     fn name(&self) -> &'static str { "FastPathMouseEvent" }
-    fn size(&self) -> usize { 7 }
+    fn size(&self) -> usize { FASTPATH_MOUSE_EVENT_SIZE }
 }
 
 impl<'de> Decode<'de> for FastPathMouseEvent {
@@ -426,7 +443,7 @@ impl Encode for FastPathMouseXEvent {
     }
 
     fn name(&self) -> &'static str { "FastPathMouseXEvent" }
-    fn size(&self) -> usize { 7 }
+    fn size(&self) -> usize { FASTPATH_MOUSEX_EVENT_SIZE }
 }
 
 impl<'de> Decode<'de> for FastPathMouseXEvent {
@@ -467,7 +484,7 @@ impl Encode for FastPathRelativeMouseEvent {
     }
 
     fn name(&self) -> &'static str { "FastPathRelativeMouseEvent" }
-    fn size(&self) -> usize { 5 }
+    fn size(&self) -> usize { FASTPATH_RELATIVE_MOUSE_EVENT_SIZE }
 }
 
 impl<'de> Decode<'de> for FastPathRelativeMouseEvent {
@@ -503,7 +520,7 @@ impl Encode for FastPathSyncEvent {
     }
 
     fn name(&self) -> &'static str { "FastPathSyncEvent" }
-    fn size(&self) -> usize { 1 }
+    fn size(&self) -> usize { FASTPATH_SYNC_EVENT_SIZE }
 }
 
 impl<'de> Decode<'de> for FastPathSyncEvent {
@@ -537,7 +554,7 @@ impl Encode for FastPathUnicodeEvent {
     }
 
     fn name(&self) -> &'static str { "FastPathUnicodeEvent" }
-    fn size(&self) -> usize { 3 }
+    fn size(&self) -> usize { FASTPATH_UNICODE_EVENT_SIZE }
 }
 
 impl<'de> Decode<'de> for FastPathUnicodeEvent {
@@ -572,7 +589,7 @@ impl Encode for FastPathQoeTimestampEvent {
     }
 
     fn name(&self) -> &'static str { "FastPathQoeTimestampEvent" }
-    fn size(&self) -> usize { 5 }
+    fn size(&self) -> usize { FASTPATH_QOE_TIMESTAMP_EVENT_SIZE }
 }
 
 impl<'de> Decode<'de> for FastPathQoeTimestampEvent {

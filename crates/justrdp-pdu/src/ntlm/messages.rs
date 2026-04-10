@@ -154,6 +154,9 @@ impl AvPair {
     }
 
     /// Encode AV_PAIR list to bytes (including MsvAvEOL terminator).
+    ///
+    /// Panics if any pair value exceeds u16::MAX. All real NTLM AV_PAIR values
+    /// are far below this limit.
     pub fn encode_list(pairs: &[AvPair]) -> Vec<u8> {
         let mut size = 4; // EOL terminator
         for p in pairs {
@@ -164,7 +167,7 @@ impl AvPair {
         let mut offset = 0;
 
         for p in pairs {
-            assert!(p.value.len() <= u16::MAX as usize, "AV_PAIR value exceeds u16");
+            debug_assert!(p.value.len() <= u16::MAX as usize, "AV_PAIR value exceeds u16");
             buf[offset..offset + 2].copy_from_slice(&p.id.to_le_bytes());
             buf[offset + 2..offset + 4].copy_from_slice(&(p.value.len() as u16).to_le_bytes());
             buf[offset + 4..offset + 4 + p.value.len()].copy_from_slice(&p.value);
@@ -423,7 +426,9 @@ pub struct AuthenticateMessage {
 
 impl AuthenticateMessage {
     /// Encode to bytes. The MIC field position is at offset 72..88.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    ///
+    /// Returns `Err` if any field exceeds u16::MAX.
+    pub fn to_bytes(&self) -> EncodeResult<Vec<u8>> {
         let header_size: usize = 88; // Up to and including MIC
         let payload_size: usize = self.lm_response.len()
             + self.nt_response.len()
@@ -432,12 +437,19 @@ impl AuthenticateMessage {
             + self.workstation.len()
             + self.encrypted_random_session_key.len();
         // Each field length must fit in u16 for NTLM wire format
-        assert!(self.lm_response.len() <= u16::MAX as usize, "NTLM lm_response exceeds u16");
-        assert!(self.nt_response.len() <= u16::MAX as usize, "NTLM nt_response exceeds u16");
-        assert!(self.domain_name.len() <= u16::MAX as usize, "NTLM domain_name exceeds u16");
-        assert!(self.user_name.len() <= u16::MAX as usize, "NTLM user_name exceeds u16");
-        assert!(self.workstation.len() <= u16::MAX as usize, "NTLM workstation exceeds u16");
-        assert!(self.encrypted_random_session_key.len() <= u16::MAX as usize, "NTLM session_key exceeds u16");
+        macro_rules! check_u16 {
+            ($field:expr, $name:expr) => {
+                if $field.len() > u16::MAX as usize {
+                    return Err(justrdp_core::EncodeError::other($name, "field exceeds u16"));
+                }
+            };
+        }
+        check_u16!(self.lm_response, "NTLM::lm_response");
+        check_u16!(self.nt_response, "NTLM::nt_response");
+        check_u16!(self.domain_name, "NTLM::domain_name");
+        check_u16!(self.user_name, "NTLM::user_name");
+        check_u16!(self.workstation, "NTLM::workstation");
+        check_u16!(self.encrypted_random_session_key, "NTLM::session_key");
         let total = header_size + payload_size;
         let mut buf = vec![0u8; total];
 
@@ -534,7 +546,7 @@ impl AuthenticateMessage {
         buf[key_offset..key_offset + self.encrypted_random_session_key.len()]
             .copy_from_slice(&self.encrypted_random_session_key);
 
-        buf
+        Ok(buf)
     }
 
     /// The byte offset of the MIC field in the encoded message.
@@ -611,7 +623,7 @@ mod tests {
             mic: [0xAA; 16],
         };
 
-        let bytes = msg.to_bytes();
+        let bytes = msg.to_bytes().unwrap();
         // MIC at offset 72..88 should be our 0xAA bytes
         assert_eq!(&bytes[72..88], &[0xAA; 16]);
     }

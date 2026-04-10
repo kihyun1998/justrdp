@@ -169,6 +169,10 @@ pub fn read_padding(src: &mut ReadCursor<'_>, count: usize, ctx: &'static str) -
 /// Write a PER numeric string of known length.
 /// RDP uses this for simple fixed strings like "1" in ConferenceCreateRequest.
 pub fn write_numeric_string(dst: &mut WriteCursor<'_>, value: &[u8], ctx: &'static str) -> EncodeResult<()> {
+    // Validate that all bytes are ASCII digits
+    if !value.iter().all(|&b| b.is_ascii_digit()) {
+        return Err(justrdp_core::EncodeError::other(ctx, "numeric string contains non-digit byte"));
+    }
     // Length (1 byte for the number of characters minus 1)
     write_length(dst, value.len(), ctx)?;
     // Packed: 4 bits per digit, so 2 digits per byte

@@ -113,6 +113,14 @@ pub fn gss_unwrap(
         return Err(ConnectorError::general("GSS Wrap: only sealed tokens supported"));
     }
 
+    // Verify directional flag consistency (RFC 4121 §4.2.6.1):
+    // If we are the initiator, the token should be from the acceptor (flag set).
+    // If we are the acceptor, the token should be from the initiator (flag clear).
+    let sent_by_acceptor = flags & FLAG_SENT_BY_ACCEPTOR != 0;
+    if is_initiator != sent_by_acceptor {
+        return Err(ConnectorError::general("GSS Wrap: directional flag mismatch"));
+    }
+
     let ec = u16::from_be_bytes([token[4], token[5]]) as usize;
     let rrc = u16::from_be_bytes([token[6], token[7]]) as usize;
 

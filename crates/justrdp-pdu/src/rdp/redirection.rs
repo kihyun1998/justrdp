@@ -272,13 +272,11 @@ impl<'de> Decode<'de> for ServerRedirectionPdu {
         read_optional!(LB_PASSWORD, password, "password");
         read_optional!(LB_TARGET_FQDN, target_fqdn, "targetFQDN");
         read_optional!(LB_TARGET_NETBIOS_NAME, target_netbios_name, "targetNetBiosName");
-        read_optional!(LB_CLIENT_TSV_URL, tsv_url, "tsvUrl");
-        read_optional!(LB_REDIRECTION_GUID, redirection_guid, "redirectionGuid");
-        read_optional!(LB_TARGET_CERTIFICATE, target_certificate, "targetCertificate");
 
         // TargetNetAddresses is a structured field, not a length-prefixed
         // blob, so it must be decoded with its own parser instead of the
-        // macro. Per spec it appears AFTER the certificate block.
+        // macro. Per MS-RDPBCGR 2.2.13.1 it appears AFTER TargetNetBiosName
+        // and BEFORE TsvUrl.
         if redir_flags & LB_TARGET_NET_ADDRESSES != 0 {
             // Read the outer length prefix (4 bytes), then the
             // structured TARGET_NET_ADDRESSES body of that length.
@@ -301,6 +299,10 @@ impl<'de> Decode<'de> for ServerRedirectionPdu {
             let mut inner = ReadCursor::new(inner_bytes);
             pdu.target_net_addresses = Some(TargetNetAddresses::decode(&mut inner)?);
         }
+
+        read_optional!(LB_CLIENT_TSV_URL, tsv_url, "tsvUrl");
+        read_optional!(LB_REDIRECTION_GUID, redirection_guid, "redirectionGuid");
+        read_optional!(LB_TARGET_CERTIFICATE, target_certificate, "targetCertificate");
 
         // Skip any trailing padding bytes up to `length`. The spec
         // allows up to 8 bytes of alignment pad here.
