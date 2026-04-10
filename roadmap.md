@@ -717,83 +717,114 @@ pub enum ClientConnectorState {
 - 선택 의존성: `justrdp-svc`/`justrdp-dvc`/`justrdp-cliprdr`/`justrdp-rdpdr`/`justrdp-rdpsnd`/`justrdp-egfx` (feature flags)
 - I/O 모델: 동기 블로킹 (`TcpStream::read`/`write`), 옵션 타임아웃
 
-**High-Level API:**
+**High-Level API (M1~M7 기준 실제 시그니처):**
 
 ```rust
 pub struct RdpClient { /* ... */ }
 
 impl RdpClient {
-    pub fn connect(config: Config) -> Result<Self, ConnectError>;
+    // Connect — 4가지 진입점, 각각 다른 trade-off
+    pub fn connect<A: ToSocketAddrs>(server: A, server_name: &str, config: Config) -> Result<Self, ConnectError>;
+    pub fn connect_with_verifier<A>(server: A, server_name: &str, config: Config, verifier: Arc<dyn ServerCertVerifier>) -> Result<Self, ConnectError>;
+    pub fn connect_with_processors<A>(server: A, server_name: &str, config: Config, processors: Vec<Box<dyn SvcProcessor>>) -> Result<Self, ConnectError>;
+    pub fn connect_with_upgrader<A, U: TlsUpgrader>(server: A, server_name: &str, config: Config, upgrader: U, processors: Vec<Box<dyn SvcProcessor>>) -> Result<Self, ConnectError>;
+
+    // Active session loop
     pub fn next_event(&mut self) -> Result<Option<RdpEvent>, RuntimeError>;
-    pub fn send_keyboard(&mut self, scancode: Scancode, pressed: bool) -> Result<()>;
-    pub fn send_unicode(&mut self, ch: char, pressed: bool) -> Result<()>;
-    pub fn send_mouse(&mut self, x: u16, y: u16, buttons: MouseButtons) -> Result<()>;
-    pub fn resize(&mut self, width: u16, height: u16) -> Result<()>;
-    pub fn disconnect(self) -> Result<()>;
+    pub fn set_reconnect_policy(&mut self, policy: ReconnectPolicy);
+
+    // Input
+    pub fn send_keyboard(&mut self, scancode: Scancode, pressed: bool) -> Result<(), RuntimeError>;
+    pub fn send_unicode(&mut self, ch: char, pressed: bool) -> Result<(), RuntimeError>;
+    pub fn send_mouse_move(&mut self, x: u16, y: u16) -> Result<(), RuntimeError>;
+    pub fn send_mouse_button(&mut self, button: MouseButton, pressed: bool, x: u16, y: u16) -> Result<(), RuntimeError>;
+
+    pub fn disconnect(self) -> Result<(), RuntimeError>;
 }
 
 pub enum RdpEvent {
-    GraphicsUpdate { region: Rect, bitmap: Bitmap },
-    PointerUpdate(PointerUpdate),
-    ClipboardFormatList(Vec<ClipboardFormat>),
-    Clipboard(ClipboardEvent),
+    // Graphics + pointer
+    GraphicsUpdate { update_code: FastPathUpdateType, data: Vec<u8> },
+    PointerDefault, PointerHidden,
+    PointerPosition { x: u16, y: u16 },
+    PointerBitmap { pointer_type: u16, data: Vec<u8> },
+    // Keyboard / IME / sound (M4b)
     KeyboardIndicators { scroll: bool, num: bool, caps: bool, kana: bool },
     ImeStatus { state: u32, convert: u32 },
     PlaySound { frequency: u32, duration_ms: u32 },
     SuppressOutput { allow: bool },
-    Reconnecting { reason: DisconnectReason, attempt: u32 },
+    // Session info / monitor / channel passthrough
+    SaveSessionInfo(SaveSessionInfoData),
+    ServerMonitorLayout { monitors: Vec<MonitorLayoutEntry> },
+    ChannelData { channel_id: u16, data: Vec<u8> },
+    // Lifecycle (M7 + future 9.3)
+    Reconnecting { attempt: u32 },
     Reconnected,
-    Redirected { target: String },
-    Disconnected(DisconnectReason),
+    Redirected { target: String },           // 9.3 미구현
+    Disconnected(GracefulDisconnectReason),
 }
 ```
 
+> **차이 노트**: `send_mouse(x, y, buttons)` 단일 함수 대신 `send_mouse_move` + `send_mouse_button` 분리. `resize()`는 미구현 (DisplayControl/MonitorLayout DVC 확장 필요). `Reconnecting`은 attempt 카운터만 포함 (reason은 별도 Disconnected 이벤트로).
+
 **구현 항목:**
 
-- [ ] **연결 수립 펌프**
-  - [ ] `TcpStream::connect` + 타임아웃
-  - [ ] `ClientConnector::step()` 루프 구동 (`next_pdu_hint` 기반 프레임 읽기)
-  - [ ] `EnhancedSecurityUpgrade` 상태 감지 시 `justrdp-tls::upgrade()` 호출
-  - [ ] `EarlyUserAuthResult` 4바이트 수신 (HYBRID_EX)
-  - [ ] `ServerCertVerifier` 콜백 주입 (5.4)
-- [ ] **ActiveStage 펌프**
-  - [ ] Fast-path/slow-path 프레임 read/write 루프
-  - [ ] `BulkDecompressor` 상태를 세션 수명 동안 유지 (슬로우패스/패스트패스 분리)
-  - [ ] `ActiveStageOutput::ResponseFrame` → 소켓 write
-  - [ ] `ActiveStageOutput::GraphicsUpdate` → `RdpEvent::GraphicsUpdate`
-  - [ ] `ActiveStageOutput::PointerUpdate` → `RdpEvent::PointerUpdate`
-  - [ ] `SuppressOutputPdu` 디코드 → `RdpEvent::SuppressOutput`
-  - [ ] `SetKeyboardIndicatorsPdu` / `SetKeyboardImeStatusPdu` → 이벤트 방출 (OS API 호출은 앱 책임)
-  - [ ] `PlaySoundPdu` (type 34) → `RdpEvent::PlaySound`
-- [ ] **입력 송신**
-  - [ ] 키보드/유니코드/마우스 헬퍼 (fast-path input PDU 생성 + write)
-  - [ ] `InputDatabase` 상태 관리 내부화
-- [ ] **채널 이벤트 배선**
-  - [ ] SVC/DVC processor 등록 API (`RdpClient::register_svc()`, `register_dvc()`)
-  - [ ] Clipboard/Drive/Audio processor → `RdpEvent` 변환
-- [ ] **Auto-Reconnect 실제 재연결** (9.2 완성)
-  - [ ] TCP disconnect 감지 (read 0 / write error)
-  - [ ] 재시도 정책 (`ReconnectPolicy { max_attempts, interval, backoff }`)
-  - [ ] `server_arc_cookie` 기반 `ConfigBuilder::auto_reconnect_cookie()` 재사용
-  - [ ] `RdpEvent::Reconnecting` / `Reconnected` 방출
-  - [ ] 재연결 가능 여부 판단 (21.6 disconnect code 매핑 사용)
-- [ ] **Session Redirection 자동 리다이렉트** (9.3 완성)
+> 진척 요약: M1~M7 마일스톤 모두 완료 (`crates/justrdp-blocking/CHECKLIST.md` 참조). 33개 단위 테스트 통과. 실서버 통합 테스트만 잔여.
+
+- [x] **연결 수립 펌프** (M1~M3, 커밋 `5fd0864` / `cc331ed` / `8846565`)
+  - [x] `TcpStream::connect` (eager `to_socket_addrs` 해석으로 reconnect 시 DNS 스킵)
+  - [x] `ClientConnector::step()` 루프 구동 (`drive_until_state_change` 헬퍼)
+  - [x] `EnhancedSecurityUpgrade` → `Transport::Swapping` → TLS 업그레이드 → `Transport::Tls`
+  - [x] `EarlyUserAuthResult` 4바이트/TsRequest fallback 분기 (HYBRID_EX)
+  - [x] `ServerCertVerifier` 콜백 주입 (rustls + native-tls 양쪽)
+  - [ ] TCP / TLS 핸드셰이크 타임아웃 — 후속 (현재는 OS 기본값)
+- [x] **ActiveStage 펌프** (M4, 커밋 `03ed1da` + `a829d72`)
+  - [x] Fast-path/slow-path 자동 분기 (`TpktHint`가 첫 바이트 보고 dispatch)
+  - [x] `BulkDecompressor` 상태 세션 수명 동안 유지 (`ActiveStage` 내부에 슬로우/패스트패스 별도 컨텍스트)
+  - [x] `ActiveStageOutput::ResponseFrame` → 즉시 소켓 write
+  - [x] `GraphicsUpdate` / `Pointer*` / `SaveSessionInfo` / `ServerMonitorLayout` / `ChannelData` → `RdpEvent` 매핑
+  - [x] `SuppressOutputPdu` 디코드 → `RdpEvent::SuppressOutput { allow }`
+  - [x] `SetKeyboardIndicatorsPdu` → `RdpEvent::KeyboardIndicators { scroll, num, caps, kana }` (OS LED는 앱 책임)
+  - [x] `SetKeyboardImeStatusPdu` → `RdpEvent::ImeStatus`
+  - [x] `PlaySoundPdu` (type 34) → `RdpEvent::PlaySound { frequency, duration_ms }` (justrdp-pdu에 PDU 신규 추가)
+- [x] **입력 송신** (M5, 커밋 `78f3bf6`)
+  - [x] `send_keyboard(scancode, pressed)` — `FastPathScancodeEvent` (KBDFLAGS_RELEASE/EXTENDED)
+  - [x] `send_unicode(ch, pressed)` — BMP 한정, 서로게이트 페어는 `Unimplemented`
+  - [x] `send_mouse_move(x, y)` — `PTRFLAGS_MOVE`
+  - [x] `send_mouse_button(button, pressed, x, y)` — Left/Right/Middle (`PTRFLAGS_BUTTON1/2/3 + DOWN`)
+  - [ ] `send_mouse_wheel(delta)` — 후속 (PTRFLAGS_WHEEL/HWHEEL/WHEEL_NEGATIVE 인코딩 필요)
+  - [ ] `send_synchronize(LockKeys)` — 후속 (`FastPathSyncEvent`)
+  - [ ] `InputDatabase` 상태 관리 내부화 — MVP는 사용자가 직접 관리
+- [x] **채널 이벤트 배선** (M6, 커밋 `0067c17`)
+  - [x] `RdpClient::connect_with_processors(server, name, config, processors)` — SVC processor 등록
+  - [x] `read_one_frame`의 `ChannelData` 분기: 등록된 processor 있으면 dispatch + 응답 frame write, 없으면 raw passthrough
+  - [x] DVC 지원: `DrdynvcClient`가 `SvcProcessor` 구현이라 박싱해서 SVC로 등록하면 자동 동작
+  - [x] Clipboard/Drive/Audio processor → 사용자가 직접 인스턴스화 후 등록 (라이브러리는 dispatch만 담당)
+- [x] **Auto-Reconnect 실제 재연결** (M7, 커밋 `0ba4c3b`, **§9.2 완성**)
+  - [x] TCP disconnect 감지 (`read_pdu` 에러 → `RuntimeError::Disconnected`/`Io` → `try_reconnect`)
+  - [x] `ReconnectPolicy` (`max_attempts` + `initial_delay` + `max_delay` + 지수 `backoff`)
+  - [x] `last_arc_cookie` 자동 캡처 (`SaveSessionInfoData::arc_random()`) + `Config::auto_reconnect_cookie` 재사용
+  - [x] `RdpEvent::Reconnecting { attempt }` / `Reconnected` 방출
+  - [x] `can_reconnect()` 사전 검사 (정책 활성 + cookie 있음 + SVC 비어 있음)
+  - [ ] `DisconnectReason::is_retryable()` 매핑 (§21.6) — 현재는 모든 IO 에러 재시도, 후속 작업
+- [ ] **Session Redirection 자동 리다이렉트** (9.3 미착수)
   - [ ] Redirection PDU 수신 시 현재 소켓 종료
   - [ ] 새 target address로 `TcpStream::connect` 재수립
   - [ ] Routing Token/Cookie를 새 `Config`에 주입
   - [ ] `RdpEvent::Redirected` 방출
-- [ ] **License persistence** (9.15 연동)
+- [ ] **License persistence** (9.15 미착수)
   - [ ] `FileLicenseStore` 구현 (`~/.justrdp/licenses/{server}_{hwid}.bin`)
   - [ ] `Config::license_store()` 빌더 메서드
-- [ ] **`.rdp` 파일 로딩** (`justrdp-rdpfile` 통합)
+- [ ] **`.rdp` 파일 로딩** (`justrdp-rdpfile` 통합 미착수)
   - [ ] `Config::from_rdp_file(path)` 편의 생성자
-- [ ] **관찰성**
+- [ ] **관찰성** (미착수)
   - [ ] `tracing` crate 지원 (feature flag)
   - [ ] 연결 단계별 span
-- [ ] **에러 처리**
-  - [ ] `ConnectError` / `RuntimeError` enum
-  - [ ] `DisconnectReason` 매핑 (21.6)
-- [ ] **Integration tests**
+- [x] **에러 처리** (M1~M6 누적)
+  - [x] `ConnectError` enum (`Tcp` / `Tls` / `Connector` / `UnexpectedEof` / `FrameTooLarge` / `ChannelSetup` / `Unimplemented`)
+  - [x] `RuntimeError` enum (`Io` / `Session` / `FrameTooLarge` / `Disconnected` / `Unimplemented`)
+  - [ ] `DisconnectReason` 정밀 매핑 (§21.6)
+- [ ] **Integration tests** (실서버 검증 잔여)
   - [ ] xrdp Docker 컨테이너 E2E (CI)
   - [ ] Windows RDS E2E (manual, `192.168.136.136`)
   - [ ] Auto-reconnect: 연결 수립 → 소켓 강제 종료 → 3초 내 복구
