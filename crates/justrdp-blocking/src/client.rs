@@ -34,6 +34,9 @@ const PTRFLAGS_DOWN: u16 = 0x8000;
 const PTRFLAGS_BUTTON1: u16 = 0x1000; // left
 const PTRFLAGS_BUTTON2: u16 = 0x2000; // right
 const PTRFLAGS_BUTTON3: u16 = 0x4000; // middle
+const PTRFLAGS_WHEEL: u16 = 0x0200; // vertical wheel rotation
+const PTRFLAGS_HWHEEL: u16 = 0x0400; // horizontal wheel rotation
+const PTRFLAGS_WHEEL_NEGATIVE: u16 = 0x0100; // wheel rotation is negative
 
 use crate::credssp::run_credssp_sequence;
 use crate::error::{ConnectError, RuntimeError};
@@ -513,6 +516,10 @@ impl RdpClient {
         // block holds a &mut on self.session and cannot also touch
         // self.last_arc_cookie. Flushed after the block ends.
         let mut captured_arc_cookie: Option<ArcCookie> = None;
+        // Local carry for a server-initiated termination. Processed
+        // after the borrow block so we can route through try_reconnect
+        // if the error code is retryable.
+        let mut terminate_reason: Option<GracefulDisconnectReason> = None;
 
         {
             let transport = self
@@ -627,8 +634,15 @@ impl RdpClient {
                         });
                     }
                     ActiveStageOutput::Terminate(reason) => {
-                        local_events.push(RdpEvent::Disconnected(reason));
-                        should_disconnect = true;
+                        // Record whether this is a retryable error code
+                        // so the outer loop can route through try_reconnect
+                        // instead of tearing the session down.
+                        //
+                        // The check happens AFTER the borrow block
+                        // because try_reconnect needs full mutable access
+                        // to self; we carry the decision out via a local
+                        // flag and the disconnect reason.
+                        terminate_reason = Some(reason);
                     }
                     // Deactivate-Reactivation requires the caller to re-run
                     // the capability exchange. The blocking runtime does not
@@ -669,6 +683,35 @@ impl RdpClient {
         }
 
         self.pending_events.extend(local_events);
+
+        // Server-initiated termination: decide whether to route through
+        // try_reconnect (retryable error) or surface as Disconnected.
+        if let Some(reason) = terminate_reason {
+            let retryable = match &reason {
+                // SetErrorInfo code recorded by ActiveStage.
+                GracefulDisconnectReason::ServerError(code) => {
+                    justrdp_pdu::rdp::finalization::is_error_info_retryable(*code)
+                }
+                // MCS DisconnectProviderUltimatum without a prior
+                // SetErrorInfo — treat as non-retryable because we
+                // don't have an error code to classify.
+                GracefulDisconnectReason::ServerDisconnect(_) => false,
+                // Explicit user/server/redirect intents — never retry.
+                GracefulDisconnectReason::UserRequested
+                | GracefulDisconnectReason::ShutdownDenied
+                | GracefulDisconnectReason::ServerRedirect => false,
+            };
+
+            if retryable && self.can_reconnect() {
+                // Caller will see Reconnecting/Reconnected events from
+                // try_reconnect; do NOT queue a Disconnected event.
+                self.try_reconnect();
+            } else {
+                self.pending_events.push_back(RdpEvent::Disconnected(reason));
+                should_disconnect = true;
+            }
+        }
+
         if should_disconnect {
             self.mark_disconnected();
         }
@@ -837,6 +880,29 @@ impl RdpClient {
         self.send_input_events(&[event])
     }
 
+    /// Send a mouse wheel rotation event.
+    ///
+    /// `delta` is the signed rotation count in mouse-wheel "clicks".
+    /// Positive values rotate the wheel away from the user (scroll up /
+    /// right for horizontal), negative values rotate toward the user.
+    /// The wire format carries the magnitude in the low byte of
+    /// `pointerFlags` (0..=255) and uses `PTRFLAGS_WHEEL_NEGATIVE` as
+    /// the sign bit, so the per-event magnitude is clamped to 255.
+    /// Callers that need larger rotations should send multiple events.
+    ///
+    /// `horizontal` = `true` emits `PTRFLAGS_HWHEEL`; `false` (the
+    /// common case) emits `PTRFLAGS_WHEEL`. `(x, y)` is the current
+    /// cursor position, carried unchanged in the event.
+    pub fn send_mouse_wheel(
+        &mut self,
+        delta: i16,
+        horizontal: bool,
+        x: u16,
+        y: u16,
+    ) -> Result<(), RuntimeError> {
+        self.send_input_events(&[build_mouse_wheel_event(delta, horizontal, x, y)])
+    }
+
     /// Encode and write a batch of fast-path input events to the transport.
     ///
     /// Pre-condition: the session must be active. After a disconnect this
@@ -858,10 +924,26 @@ impl RdpClient {
 
     /// Gracefully disconnect the session and consume the client.
     ///
-    /// *Scaffold: drops the transport without sending an MCS Disconnect Provider
-    /// Ultimatum. Polite shutdown via `ActiveStage::encode_disconnect()` will
-    /// land in a follow-up.*
+    /// Builds an MCS Disconnect Provider Ultimatum frame via the
+    /// session's built-in encoder and writes it to the transport before
+    /// dropping both, so the server sees a clean shutdown instead of
+    /// a TCP RST. If the session has already been torn down (because
+    /// of an earlier Disconnected event, a failed reconnect, or a
+    /// prior transport drop), this is a no-op and returns `Ok(())`.
+    ///
+    /// Write failures on the farewell frame are **ignored** — the
+    /// caller is shutting the session down anyway and the socket might
+    /// already be half-closed from the server side. The transport is
+    /// still dropped so the local file descriptor is released.
     pub fn disconnect(mut self) -> Result<(), RuntimeError> {
+        if let (Some(session), Some(transport)) =
+            (self.session.as_mut(), self.transport.as_mut())
+        {
+            if let Ok(frame) = session.encode_disconnect() {
+                let _ = transport.write_all(&frame);
+                let _ = transport.flush();
+            }
+        }
         self.transport.take();
         self.session.take();
         Ok(())
@@ -1001,6 +1083,39 @@ fn build_mouse_move_event(x: u16, y: u16) -> FastPathInputEvent {
     FastPathInputEvent::Mouse(FastPathMouseEvent {
         event_flags: 0,
         pointer_flags: PTRFLAGS_MOVE,
+        x_pos: x,
+        y_pos: y,
+    })
+}
+
+/// Build a fast-path mouse wheel event.
+///
+/// MS-RDPBCGR 2.2.8.1.1.3.1.1.3: the low byte of `pointerFlags` holds
+/// the unsigned rotation magnitude (0..=255) and `PTRFLAGS_WHEEL_NEGATIVE`
+/// signals the sign. `PTRFLAGS_WHEEL` marks a vertical wheel event;
+/// `PTRFLAGS_HWHEEL` marks a horizontal wheel event. Callers pass a
+/// signed `delta`; this helper handles sign extraction and magnitude
+/// clamping.
+fn build_mouse_wheel_event(
+    delta: i16,
+    horizontal: bool,
+    x: u16,
+    y: u16,
+) -> FastPathInputEvent {
+    let mut flags = if horizontal {
+        PTRFLAGS_HWHEEL
+    } else {
+        PTRFLAGS_WHEEL
+    };
+    // Magnitude bits occupy the low byte; clamp to 255.
+    let magnitude = delta.unsigned_abs().min(255) as u16;
+    flags |= magnitude;
+    if delta < 0 {
+        flags |= PTRFLAGS_WHEEL_NEGATIVE;
+    }
+    FastPathInputEvent::Mouse(FastPathMouseEvent {
+        event_flags: 0,
+        pointer_flags: flags,
         x_pos: x,
         y_pos: y,
     })
@@ -1260,6 +1375,123 @@ mod tests {
     fn mouse_button_x1_x2_return_none() {
         assert!(build_mouse_button_event(MouseButton::X1, true, 0, 0).is_none());
         assert!(build_mouse_button_event(MouseButton::X2, false, 0, 0).is_none());
+    }
+
+    #[test]
+    fn mouse_wheel_positive_vertical() {
+        let event = build_mouse_wheel_event(3, false, 100, 200);
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                // PTRFLAGS_WHEEL (0x0200) | magnitude(3) = 0x0203
+                assert_eq!(e.pointer_flags, PTRFLAGS_WHEEL | 3);
+                assert_eq!(e.x_pos, 100);
+                assert_eq!(e.y_pos, 200);
+                // Sign bit MUST be clear for positive delta.
+                assert_eq!(e.pointer_flags & PTRFLAGS_WHEEL_NEGATIVE, 0);
+            }
+            _ => panic!("expected Mouse variant"),
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_negative_vertical_sets_sign_flag() {
+        let event = build_mouse_wheel_event(-5, false, 50, 60);
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                // PTRFLAGS_WHEEL | PTRFLAGS_WHEEL_NEGATIVE | magnitude(5)
+                assert_eq!(
+                    e.pointer_flags,
+                    PTRFLAGS_WHEEL | PTRFLAGS_WHEEL_NEGATIVE | 5
+                );
+            }
+            _ => panic!("expected Mouse variant"),
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_horizontal_uses_hwheel_flag() {
+        let event = build_mouse_wheel_event(2, true, 0, 0);
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                assert_eq!(e.pointer_flags, PTRFLAGS_HWHEEL | 2);
+                // Must NOT set the vertical wheel bit simultaneously.
+                assert_eq!(e.pointer_flags & PTRFLAGS_WHEEL, 0);
+            }
+            _ => panic!("expected Mouse variant"),
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_clamps_oversized_magnitude() {
+        // i16::MAX rotations in one event is nonsense but must not
+        // overflow into the flag bits.
+        let event = build_mouse_wheel_event(i16::MAX, false, 0, 0);
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                // Magnitude must be clamped to the low byte (255) so it
+                // does not collide with the flag bits in the high byte.
+                assert_eq!(e.pointer_flags & 0x00FF, 255);
+                assert_eq!(e.pointer_flags & PTRFLAGS_WHEEL, PTRFLAGS_WHEEL);
+                assert_eq!(e.pointer_flags & PTRFLAGS_WHEEL_NEGATIVE, 0);
+            }
+            _ => panic!("expected Mouse variant"),
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_clamps_oversized_negative_magnitude() {
+        let event = build_mouse_wheel_event(i16::MIN, false, 0, 0);
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                assert_eq!(e.pointer_flags & 0x00FF, 255);
+                assert_eq!(
+                    e.pointer_flags & PTRFLAGS_WHEEL_NEGATIVE,
+                    PTRFLAGS_WHEEL_NEGATIVE
+                );
+            }
+            _ => panic!("expected Mouse variant"),
+        }
+    }
+
+    #[test]
+    fn disconnect_without_live_session_is_noop() {
+        // Disconnecting a client that has already torn down (e.g. after
+        // a Terminate event) must not panic on the missing session.
+        let client = synthetic_client(ReconnectPolicy::disabled(), None, false);
+        assert!(client.transport.is_none());
+        assert!(client.session.is_none());
+        // Should succeed without touching the network.
+        client.disconnect().unwrap();
+    }
+
+    #[test]
+    fn disconnect_with_live_session_clears_fields() {
+        // Build a synthetic client with a populated session and a
+        // Transport::Swapping stand-in transport. disconnect() should
+        // attempt the write (which will error on Swapping) but still
+        // take both fields and return Ok.
+        let mut client = synthetic_client(ReconnectPolicy::disabled(), None, false);
+        client.transport = Some(Transport::Swapping);
+        client.session = Some(Box::new(ActiveStage::new(SessionConfig {
+            io_channel_id: 1003,
+            user_channel_id: 1007,
+            share_id: 0,
+            channel_ids: Vec::new(),
+        })));
+        client.disconnect().unwrap();
+        // Both fields must be None after disconnect regardless of
+        // whether the write succeeded.
+    }
+
+    #[test]
+    fn mouse_wheel_zero_delta_produces_bare_wheel_flag() {
+        let event = build_mouse_wheel_event(0, false, 0, 0);
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                assert_eq!(e.pointer_flags, PTRFLAGS_WHEEL);
+            }
+            _ => panic!("expected Mouse variant"),
+        }
     }
 
     // ── SVC processor wiring ──

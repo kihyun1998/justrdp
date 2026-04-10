@@ -297,8 +297,8 @@ M1 (TLS + CertVerifier)
   - `finalization_wait_font_map_handles_server_redirect`: WaitFontMap 상태에서 LB_TARGET_NET_ADDRESS 포함 frame 주입 → 동일 검증
 - [ ] §9.3 RC4 비밀번호 cookie 복호화 (RDSTLS auth)
 - [ ] §9.3 진짜 mock broker (TcpListener + 가짜 RDP handshake) — 너무 무거움 (500+ 줄), 후속 작업
-- [ ] `DisconnectReason::is_retryable()` 정밀 매핑 (§21.6)
-- [ ] `send_mouse_wheel(delta)`
+- [x] `DisconnectReason::is_retryable()` 정밀 매핑 — `justrdp_pdu::rdp::finalization::is_error_info_retryable(u32)` + blocking `next_event`의 Terminate 분기에서 `try_reconnect` 게이트로 연결
+- [x] `send_mouse_wheel(delta, horizontal, x, y)` — PTRFLAGS_WHEEL / PTRFLAGS_HWHEEL / PTRFLAGS_WHEEL_NEGATIVE 인코딩, 매그니튜드 0..=255 클램프
+- [x] `disconnect()`가 MCS Disconnect Provider Ultimatum 전송 — `ActiveStage::encode_disconnect()` 경유, 쓰기 실패는 무시 (소켓이 이미 half-closed일 수 있음)
 - [ ] `send_synchronize(LockKeys)` for FastPathSyncEvent
-- [ ] `disconnect()`가 MCS Disconnect Provider Ultimatum 전송 (현재 단순 drop)
 - [ ] `InputDatabase` 내장 (선택, feature flag)

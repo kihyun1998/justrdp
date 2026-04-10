@@ -375,13 +375,70 @@ pub struct SetErrorInfoPdu {
     pub error_info: u32,
 }
 
-/// Common error codes.
+/// Common error codes (MS-RDPBCGR 2.2.5.1.1, Set Error Info PDU).
 pub const ERRINFO_NONE: u32 = 0x0000_0000;
 pub const ERRINFO_RPC_INITIATED_DISCONNECT: u32 = 0x0000_0001;
 pub const ERRINFO_RPC_INITIATED_LOGOFF: u32 = 0x0000_0002;
 pub const ERRINFO_IDLE_TIMEOUT: u32 = 0x0000_0003;
 pub const ERRINFO_LOGON_TIMEOUT: u32 = 0x0000_0004;
 pub const ERRINFO_DISCONNECTED_BY_OTHER: u32 = 0x0000_0005;
+pub const ERRINFO_OUT_OF_MEMORY: u32 = 0x0000_0006;
+pub const ERRINFO_SERVER_DENIED_CONNECTION: u32 = 0x0000_0007;
+pub const ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES: u32 = 0x0000_0009;
+pub const ERRINFO_SERVER_FRESH_CREDENTIALS_REQUIRED: u32 = 0x0000_000A;
+pub const ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER: u32 = 0x0000_000B;
+pub const ERRINFO_LOGOFF_BY_USER: u32 = 0x0000_000C;
+
+/// Classify a `SetErrorInfoPdu::error_info` code as retryable or not.
+///
+/// Retryable codes are transient failures where re-opening the
+/// connection (typically with the Auto-Reconnect Cookie) has a
+/// reasonable chance of succeeding. Non-retryable codes indicate
+/// either a deliberate user/administrator action (logoff, kick) or a
+/// policy-driven denial (insufficient privileges, license failure,
+/// credential refresh required) where a plain reconnect would just
+/// hit the same wall.
+///
+/// See roadmap §21.6 for the full code table.
+///
+/// Used by `justrdp-blocking::RdpClient::next_event` to gate the
+/// auto-reconnect path when the server initiates a clean termination
+/// via SetErrorInfo + DisconnectProviderUltimatum.
+pub const fn is_error_info_retryable(code: u32) -> bool {
+    match code {
+        // No error — this isn't a real disconnect reason.
+        ERRINFO_NONE => true,
+
+        // Administrator / user initiated — user intent is to leave.
+        ERRINFO_RPC_INITIATED_DISCONNECT
+        | ERRINFO_RPC_INITIATED_LOGOFF
+        | ERRINFO_DISCONNECTED_BY_OTHER
+        | ERRINFO_SERVER_DENIED_CONNECTION
+        | ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES
+        | ERRINFO_SERVER_FRESH_CREDENTIALS_REQUIRED
+        | ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER
+        | ERRINFO_LOGOFF_BY_USER => false,
+
+        // Transient server-side failures — reconnect often succeeds.
+        ERRINFO_IDLE_TIMEOUT | ERRINFO_LOGON_TIMEOUT | ERRINFO_OUT_OF_MEMORY => true,
+
+        // Licensing errors (0x100C..=0x1015) — persistent and usually
+        // won't clear on retry without operator intervention.
+        0x0000_100C..=0x0000_1015 => false,
+
+        // Protocol / encryption failures (0x1000..=0x100B) — usually
+        // transient bugs or MITM artifacts; let reconnect try once.
+        0x0000_1000..=0x0000_100B => true,
+
+        // Connection Broker / redirection codes (0x0400..=0x040F) are
+        // informational: the client should be doing a redirect, not a
+        // retry. Mark as non-retryable so we don't loop.
+        0x0000_0400..=0x0000_040F => false,
+
+        // Unknown / future codes — assume transient and retry once.
+        _ => true,
+    }
+}
 
 impl Encode for SetErrorInfoPdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
@@ -1179,6 +1236,66 @@ mod tests {
         pdu.encode(&mut cursor).unwrap();
         let mut cursor = ReadCursor::new(&buf);
         assert_eq!(SetErrorInfoPdu::decode(&mut cursor).unwrap(), pdu);
+    }
+
+    #[test]
+    fn is_error_info_retryable_classifies_user_actions_as_final() {
+        // User / admin initiated disconnects: no retry.
+        assert!(!is_error_info_retryable(ERRINFO_RPC_INITIATED_DISCONNECT));
+        assert!(!is_error_info_retryable(ERRINFO_RPC_INITIATED_LOGOFF));
+        assert!(!is_error_info_retryable(ERRINFO_DISCONNECTED_BY_OTHER));
+        assert!(!is_error_info_retryable(ERRINFO_LOGOFF_BY_USER));
+        assert!(!is_error_info_retryable(ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER));
+    }
+
+    #[test]
+    fn is_error_info_retryable_classifies_policy_denials_as_final() {
+        assert!(!is_error_info_retryable(ERRINFO_SERVER_DENIED_CONNECTION));
+        assert!(!is_error_info_retryable(ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES));
+        assert!(!is_error_info_retryable(ERRINFO_SERVER_FRESH_CREDENTIALS_REQUIRED));
+    }
+
+    #[test]
+    fn is_error_info_retryable_classifies_transient_failures_as_retryable() {
+        assert!(is_error_info_retryable(ERRINFO_NONE));
+        assert!(is_error_info_retryable(ERRINFO_IDLE_TIMEOUT));
+        assert!(is_error_info_retryable(ERRINFO_LOGON_TIMEOUT));
+        assert!(is_error_info_retryable(ERRINFO_OUT_OF_MEMORY));
+    }
+
+    #[test]
+    fn is_error_info_retryable_classifies_license_errors_as_final() {
+        // 0x100C..=0x1015 range (licensing)
+        assert!(!is_error_info_retryable(0x100C));
+        assert!(!is_error_info_retryable(0x100D));
+        assert!(!is_error_info_retryable(0x1010));
+        assert!(!is_error_info_retryable(0x1015));
+    }
+
+    #[test]
+    fn is_error_info_retryable_classifies_protocol_errors_as_retryable() {
+        // 0x1000..=0x100B (encryption / decryption failures) are transient.
+        assert!(is_error_info_retryable(0x1000));
+        assert!(is_error_info_retryable(0x1005));
+        assert!(is_error_info_retryable(0x100B));
+    }
+
+    #[test]
+    fn is_error_info_retryable_classifies_connection_broker_as_final() {
+        // 0x0400..=0x040F (Connection Broker / redirection codes)
+        // should trigger a redirect path, not a plain retry loop.
+        assert!(!is_error_info_retryable(0x0400));
+        assert!(!is_error_info_retryable(0x0408));
+        assert!(!is_error_info_retryable(0x040F));
+    }
+
+    #[test]
+    fn is_error_info_retryable_unknown_codes_default_to_retryable() {
+        // Future codes are treated as transient — fail open. If the
+        // server keeps emitting the same unknown code, the reconnect
+        // policy's max_attempts cap bounds the retry loop.
+        assert!(is_error_info_retryable(0xDEAD_BEEF));
+        assert!(is_error_info_retryable(0x9999));
     }
 
     #[test]
