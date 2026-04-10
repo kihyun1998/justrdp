@@ -2926,6 +2926,156 @@ mod tests {
         }
     }
 
+    /// Build a ServerRedirectionPdu wire body by hand. The PDU has no
+    /// `Encode` impl (it is server-to-client only), so we construct the
+    /// 12-byte fixed header plus a `LB_LOAD_BALANCE_INFO` block in raw
+    /// bytes for the integration test.
+    fn build_redirect_body_with_lb_info(session_id: u32, lb_info: &[u8]) -> Vec<u8> {
+        use justrdp_pdu::rdp::redirection::{LB_LOAD_BALANCE_INFO, SEC_REDIRECTION_PKT};
+        let mut body = Vec::new();
+        body.extend_from_slice(&SEC_REDIRECTION_PKT.to_le_bytes());
+        // length: 12-byte header + 4-byte length prefix + lb_info
+        let total_length = (12 + 4 + lb_info.len()) as u16;
+        body.extend_from_slice(&total_length.to_le_bytes());
+        body.extend_from_slice(&session_id.to_le_bytes());
+        body.extend_from_slice(&LB_LOAD_BALANCE_INFO.to_le_bytes());
+        body.extend_from_slice(&(lb_info.len() as u32).to_le_bytes());
+        body.extend_from_slice(lb_info);
+        body
+    }
+
+    /// Wrap a ServerRedirectionPdu body in the Enhanced Security frame
+    /// (MS-RDPBCGR 2.2.13.3.1): TPKT + X.224 DT + MCS SDI + ShareControlHeader
+    /// (type=ServerRedirect) + 2-byte pad + body.
+    fn build_server_redirect_frame(io_channel_id: u16, redir_body: &[u8]) -> Vec<u8> {
+        use justrdp_pdu::mcs::SendDataIndication;
+        use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
+        use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
+
+        // ShareControl payload = pad2(2) + redir_body
+        let mut sc_inner = Vec::with_capacity(2 + redir_body.len());
+        sc_inner.extend_from_slice(&[0u8; 2]);
+        sc_inner.extend_from_slice(redir_body);
+
+        let sc = wrap_share_control(ShareControlPduType::ServerRedirect, 0x03EA, &sc_inner)
+            .expect("share_control wrap");
+        let sdi = SendDataIndication {
+            initiator: 0x03EA,
+            channel_id: io_channel_id,
+            user_data: &sc,
+        };
+        let mcs_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let mut frame = vec![0u8; TPKT_HEADER_SIZE + mcs_size];
+        let mut cursor = WriteCursor::new(&mut frame);
+        TpktHeader::for_payload(mcs_size).encode(&mut cursor).unwrap();
+        DataTransfer.encode(&mut cursor).unwrap();
+        sdi.encode(&mut cursor).unwrap();
+        frame
+    }
+
+    #[test]
+    fn finalization_wait_pdu_handles_server_redirect() {
+        // Integration test for roadmap 9.3: a Connection Broker can send
+        // a ServerRedirection PDU at any point during the finalization
+        // wait sequence. The connector must:
+        //   1. Recognize ShareControlPduType::ServerRedirect
+        //   2. Skip the 2-byte pad
+        //   3. Decode ServerRedirectionPdu via the justrdp-pdu module
+        //   4. Stash it on self.server_redirection
+        //   5. Transition immediately to Connected so the caller can
+        //      observe the redirect target instead of hanging on the
+        //      next read.
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+
+        // Set up connector mid-finalization (waiting for Synchronize).
+        connector.state = ClientConnectorState::ConnectionFinalizationWaitSynchronize;
+        connector.io_channel_id = 1003;
+        connector.user_channel_id = 1007;
+        connector.share_id = 0x00040006;
+
+        // Build a ServerRedirectionPdu carrying just an LB cookie.
+        let lb_cookie = b"Cookie: msts=BROKER123\r\n";
+        let redir_body = build_redirect_body_with_lb_info(0xDEAD_BEEF, lb_cookie);
+        let frame = build_server_redirect_frame(connector.io_channel_id, &redir_body);
+
+        let mut output = WriteBuf::new();
+        connector.step(&frame, &mut output).unwrap();
+
+        // The connector must now be in Connected state with the
+        // redirection PDU exposed on the result.
+        match connector.state() {
+            ClientConnectorState::Connected { result } => {
+                let redir = result
+                    .server_redirection
+                    .as_ref()
+                    .expect("server_redirection should be Some");
+                assert_eq!(redir.session_id, 0xDEAD_BEEF);
+                assert_eq!(
+                    redir.load_balance_info.as_deref(),
+                    Some(lb_cookie.as_slice()),
+                    "LB cookie should round-trip through the wire format and the decoder"
+                );
+                // Other optional fields should be absent.
+                assert!(redir.target_net_address.is_none());
+                assert!(redir.target_net_addresses.is_none());
+            }
+            other => panic!(
+                "expected Connected with server_redirection, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn finalization_wait_font_map_handles_server_redirect() {
+        // Mirror of the WaitSynchronize test for the WaitFontMap branch.
+        // Both finalization wait functions must handle the redirect — a
+        // broker may send the redirect mid-finalization at either point.
+        use justrdp_pdu::rdp::redirection::{LB_TARGET_NET_ADDRESS, SEC_REDIRECTION_PKT};
+
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        connector.state = ClientConnectorState::ConnectionFinalizationWaitFontMap;
+        connector.io_channel_id = 1003;
+        connector.user_channel_id = 1007;
+        connector.share_id = 0x00040006;
+
+        // Build a redirection body with LB_TARGET_NET_ADDRESS pointing
+        // at a UTF-16LE address string.
+        let addr_utf16: Vec<u8> = "192.168.50.50\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let mut redir_body = Vec::new();
+        redir_body.extend_from_slice(&SEC_REDIRECTION_PKT.to_le_bytes());
+        let total_length = (12 + 4 + addr_utf16.len()) as u16;
+        redir_body.extend_from_slice(&total_length.to_le_bytes());
+        redir_body.extend_from_slice(&42u32.to_le_bytes());
+        redir_body.extend_from_slice(&LB_TARGET_NET_ADDRESS.to_le_bytes());
+        redir_body.extend_from_slice(&(addr_utf16.len() as u32).to_le_bytes());
+        redir_body.extend_from_slice(&addr_utf16);
+
+        let frame = build_server_redirect_frame(connector.io_channel_id, &redir_body);
+        let mut output = WriteBuf::new();
+        connector.step(&frame, &mut output).unwrap();
+
+        match connector.state() {
+            ClientConnectorState::Connected { result } => {
+                let redir = result
+                    .server_redirection
+                    .as_ref()
+                    .expect("server_redirection should be Some");
+                assert_eq!(redir.session_id, 42);
+                assert_eq!(redir.target_net_address.as_deref(), Some(addr_utf16.as_slice()));
+            }
+            other => panic!(
+                "expected Connected with server_redirection, got {:?}",
+                other
+            ),
+        }
+    }
+
     #[test]
     fn arc_security_verifier_hmac_md5() {
         // MS-RDPBCGR 5.5: SecurityVerifier = HMAC_MD5(key=ArcRandomBits, data=ClientRandom)

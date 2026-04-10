@@ -237,7 +237,7 @@
   - `try_reconnect_with_processors_short_circuits_to_disconnect` (processor → 즉시 Disconnected)
 - [x] `synthetic_client()` 헬퍼: 라이브 네트워크 없이 RdpClient 필드를 직접 구성해 predicate 테스트 가능
 - [ ] ~~`DisconnectReason::is_retryable()`~~ — 후속 작업. 현재는 모든 IO/Disconnected 에러를 재시도
-- [ ] ~~리다이렉션 루프 방지 (depth counter)~~ — §9.3 작업과 함께
+- [x] 리다이렉션 루프 방지 (depth counter) — §9.3 작업에서 `MAX_REDIRECTS = 5` 구현 (commit `eff6416`)
 - [x] 실서버 통합 테스트 — `192.168.136.136`에서 `connect_test.rs --reconnect` 실행 결과:
   - 초기 연결 73ms 만에 `Connected` 도달
   - 10개 이벤트 후 `test_drop_transport()` → 다음 read에서 `Disconnected` → `try_reconnect()` 진입
@@ -279,10 +279,26 @@ M1 (TLS + CertVerifier)
 
 ## 커밋 후 진행할 것
 
-- [ ] 로드맵 §9.2 체크박스 업데이트 (`[x]` 변경)
-- [ ] 로드맵 §5.5 체크박스 진척 반영
+- [x] 로드맵 §9.2 체크박스 업데이트 — M7 commit `0ba4c3b`에서 PDU 레이어 4 + 런타임 5 = 9개 항목 모두 `[x]` 마킹
+- [x] 로드맵 §5.5 체크박스 진척 반영 — commit `1f4ba6f`에서 §5.5 본문을 M1-M7 진척과 동기화 (4 connect API + 17 RdpEvent variant 등 실제 시그니처로 갱신)
 - [x] `test-gap-finder` 에이전트로 커버리지 점검 → critical 3개 + important 5개 갭 식별, 8개 신규 테스트 추가 (33 → 41 pass)
   - transport: fast-path 분기 + ASN.1 3·4바이트 long-form + indefinite-length 거부
   - client: `mark_disconnected` 부작용 / `next_event` post-disconnect 단락 + 큐 드레인 / `connect_error_to_runtime` 매핑 / `Transport::Swapping` ErrorKind 구체 검증
   - 미수행: `WaitEarlyUserAuth` raw 4-byte 분기 (CredsspSequence mocking 필요, 별도 작업)
-- [ ] §9.3 Session Redirection (Task #4) 착수 — M7 완료 후에는 이 경로가 훨씬 짧음 (대부분의 재연결 인프라 재사용)
+- [x] §9.3 Session Redirection (Task #4) — 3-phase로 완료
+  - Phase 1 (`a6724ed`): `ServerRedirectionPdu` 디코더 + 11개 unit test
+  - Phase 2 (`fbd9004`): connector 통합 (`ConnectionResult.server_redirection` + finalization wait 함수의 `ShareControlPduType::ServerRedirect` 분기)
+  - Phase 3 (`eff6416`): blocking 자동 리다이렉트 루프 (max 5 depth) + UTF-16LE 타겟 파싱 + `RdpEvent::Redirected` 방출 + 7개 unit test
+
+## 잔여 follow-up
+
+- [x] §9.3 connector integration test — wire-format injection으로 redirect path end-to-end 검증 (connector test 2개 추가, total 113)
+  - `finalization_wait_pdu_handles_server_redirect`: WaitSynchronize 상태에서 LB cookie 포함 ServerRedirect frame 주입 → state == Connected, server_redirection.session_id/load_balance_info 검증
+  - `finalization_wait_font_map_handles_server_redirect`: WaitFontMap 상태에서 LB_TARGET_NET_ADDRESS 포함 frame 주입 → 동일 검증
+- [ ] §9.3 RC4 비밀번호 cookie 복호화 (RDSTLS auth)
+- [ ] §9.3 진짜 mock broker (TcpListener + 가짜 RDP handshake) — 너무 무거움 (500+ 줄), 후속 작업
+- [ ] `DisconnectReason::is_retryable()` 정밀 매핑 (§21.6)
+- [ ] `send_mouse_wheel(delta)`
+- [ ] `send_synchronize(LockKeys)` for FastPathSyncEvent
+- [ ] `disconnect()`가 MCS Disconnect Provider Ultimatum 전송 (현재 단순 drop)
+- [ ] `InputDatabase` 내장 (선택, feature flag)
