@@ -327,6 +327,44 @@ impl RdpClient {
                     ActiveStageOutput::ChannelData { channel_id, data } => {
                         local_events.push(RdpEvent::ChannelData { channel_id, data });
                     }
+                    ActiveStageOutput::KeyboardIndicators { led_flags } => {
+                        local_events.push(RdpEvent::KeyboardIndicators {
+                            scroll: led_flags & 0x0001 != 0,
+                            num: led_flags & 0x0002 != 0,
+                            caps: led_flags & 0x0004 != 0,
+                            kana: led_flags & 0x0008 != 0,
+                        });
+                    }
+                    ActiveStageOutput::KeyboardImeStatus {
+                        ime_state,
+                        ime_conv_mode,
+                    } => {
+                        local_events.push(RdpEvent::ImeStatus {
+                            state: ime_state as u32,
+                            convert: ime_conv_mode,
+                        });
+                    }
+                    ActiveStageOutput::PlaySound {
+                        duration_ms,
+                        frequency_hz,
+                    } => {
+                        local_events.push(RdpEvent::PlaySound {
+                            frequency: frequency_hz,
+                            duration_ms,
+                        });
+                    }
+                    ActiveStageOutput::SuppressOutput {
+                        allow_display_updates,
+                        rect: _,
+                    } => {
+                        // The dirty rectangle is currently dropped; the
+                        // event signals only pause/resume. Future versions
+                        // may extend RdpEvent::SuppressOutput with the rect
+                        // for callers that want to invalidate a region.
+                        local_events.push(RdpEvent::SuppressOutput {
+                            allow: allow_display_updates,
+                        });
+                    }
                     ActiveStageOutput::Terminate(reason) => {
                         local_events.push(RdpEvent::Disconnected(reason));
                         should_disconnect = true;

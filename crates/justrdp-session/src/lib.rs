@@ -141,6 +141,50 @@ pub enum ActiveStageOutput {
         /// and flags (`TS_MONITOR_PRIMARY` = 0x0000_0001).
         monitors: Vec<MonitorLayoutEntry>,
     },
+    /// Server sent a Set Keyboard Indicators PDU (MS-RDPBCGR 2.2.8.2.1.1).
+    ///
+    /// Updates the client's CapsLock / NumLock / ScrollLock / Kana state to
+    /// match the server's keyboard model. The runtime forwards the raw flag
+    /// bits; whether and how to apply them to OS-level LEDs is the caller's
+    /// responsibility (Linux X11/Wayland, Windows SetKeyboardState, etc.).
+    KeyboardIndicators {
+        /// Raw led flags. Bit 0 = Scroll Lock, bit 1 = Num Lock,
+        /// bit 2 = Caps Lock, bit 3 = Kana Lock.
+        led_flags: u16,
+    },
+    /// Server sent a Set Keyboard IME Status PDU (MS-RDPBCGR 2.2.8.2.2.1).
+    ///
+    /// Used by East Asian language stacks to mirror IME activation state
+    /// (open/closed) and conversion mode between server and client.
+    KeyboardImeStatus {
+        /// IME open state (non-zero = open).
+        ime_state: u16,
+        /// IME conversion mode bitfield (language-specific).
+        ime_conv_mode: u32,
+    },
+    /// Server sent a Play Sound PDU (MS-RDPBCGR 2.2.9.1.1.5.1).
+    ///
+    /// Instructs the client to emit a system beep. Most clients ignore this
+    /// in favor of audio redirection over RDPSND, but it remains the only
+    /// way to play a beep before the audio channel is up.
+    PlaySound {
+        /// Duration of the beep in milliseconds.
+        duration_ms: u32,
+        /// Frequency of the beep in hertz.
+        frequency_hz: u32,
+    },
+    /// Server sent a Suppress Output PDU (MS-RDPBCGR 2.2.11.3).
+    ///
+    /// Tells the client to pause (`allow_display_updates == false`) or resume
+    /// (`true`) painting display updates. When resuming, the server includes
+    /// an inclusive rectangle that should be considered dirty and repainted.
+    SuppressOutput {
+        /// `true` if the client should allow display updates, `false` to pause.
+        allow_display_updates: bool,
+        /// Optional dirty rectangle `(left, top, right, bottom)` accompanying
+        /// a resume signal. `None` when display updates are being paused.
+        rect: Option<(u16, u16, u16, u16)>,
+    },
 }
 
 /// Session processing error.

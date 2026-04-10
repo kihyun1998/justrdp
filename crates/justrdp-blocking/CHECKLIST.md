@@ -103,38 +103,44 @@
 
 ---
 
-## M4 — ActiveStage 펌프 + RdpEvent 매핑
+## M4 — ActiveStage 펌프 + RdpEvent 매핑 ✅
 
 **로드맵 근거**: §5.5 "ActiveStage 펌프"
 
-- [ ] `next_event()` 구현
-  - 내부 상태: `pending_events: VecDeque<RdpEvent>` — 한 프레임에서 여러 이벤트 나오면 큐잉
-  - 큐가 비어있으면: `read_pdu(transport, TpktHint 또는 FastPathHint, scratch)` → `session.process(&frame)` → 결과를 큐에 push
-  - 큐에서 pop해서 반환
-- [ ] Fast-path vs slow-path 프레이밍 구분
-  - 첫 바이트 `0x03` = TPKT, 아니면 fast-path
-  - `TpktHint`는 이미 있음, fast-path hint는 `justrdp-pdu`에 있는지 확인 — 없으면 inline 2바이트 read
-- [ ] `ActiveStageOutput` → `RdpEvent` 변환
-  - [ ] `ResponseFrame(bytes)` → 즉시 `transport.write_all()` (이벤트 방출 안 함)
-  - [ ] `GraphicsUpdate { update_code, data }` → `RdpEvent::GraphicsUpdate`
-  - [ ] `PointerDefault` / `PointerHidden` / `PointerPosition` / `PointerBitmap` 1:1 매핑
-  - [ ] `SaveSessionInfo { data }` → `RdpEvent::SaveSessionInfo(data)` + ARC cookie는 `self.last_arc_cookie`에 저장 (M7에서 사용)
-  - [ ] `ServerMonitorLayout { monitors }` → `RdpEvent::ServerMonitorLayout`
-  - [ ] `ChannelData { channel_id, data }` → 일단 `RdpEvent::ChannelData`로 패스스루 (SVC/DVC 라우팅은 M5)
-  - [ ] `Terminate(reason)` → `RdpEvent::Disconnected(reason)` + 내부 상태를 Disconnected로
-  - [ ] `DeactivateAll` / `ServerReactivation` → 일단 unimplemented!()로 두거나 Disconnected로 (MVP에서는 스킵)
-- [ ] `next_event()`가 `Ok(None)` 반환하는 조건 정의 — disconnect 후 이벤트 소진
-- [ ] 에러 전파: `SessionError` → `RuntimeError::Session`
+### M4a (commit 03ed1da)
 
-### 누락된 PDU 이벤트 (감사 보고서 #17-19)
+- [x] `next_event()` 구현 + `pending_events: VecDeque<RdpEvent>` 큐
+- [x] `read_one_frame()` — 한 프레임 읽고 `session.process()` 호출, ResponseFrame은 즉시 write, 나머지는 큐로
+- [x] Fast-path/slow-path 자동 분기 — `TpktHint`가 첫 바이트(`0x03` 또는 fast-path action) 보고 dispatch
+- [x] 보로우 체커: `transport`/`session` field borrow를 작은 블록 안에 가두고, 이벤트는 local Vec → 블록 종료 후 `self.pending_events`로 flush
+- [x] `ResponseFrame(bytes)` → 즉시 transport.write_all (이벤트 방출 X)
+- [x] `GraphicsUpdate` / `PointerDefault` / `PointerHidden` / `PointerPosition` / `PointerBitmap` 1:1 매핑
+- [x] `SaveSessionInfo { data }` → `RdpEvent::SaveSessionInfo(data)` (ARC cookie 추출은 M7)
+- [x] `ServerMonitorLayout` 1:1 매핑
+- [x] `ChannelData` 패스스루 (SVC/DVC 라우팅은 M6)
+- [x] `Terminate(reason)` → `RdpEvent::Disconnected(reason)` + `disconnected = true`
+- [x] `DeactivateAll`/`ServerReactivation` → MVP는 `Disconnected(ShutdownDenied)`로 surface (실제 reactivation은 추후 마일스톤)
+- [x] `next_event()`가 disconnect 후 큐 소진 시 `Ok(None)` 반환
+- [x] `connect_error_to_runtime()` 헬퍼: `read_pdu`의 `ConnectError` → `RuntimeError`
 
-- [ ] `SuppressOutputPdu` — 현재 `ActiveStageOutput`에 없음. `justrdp-session` 쪽에 variant 추가 필요
-- [ ] `SetKeyboardIndicatorsPdu` / `SetKeyboardImeStatusPdu` — 동일
-- [ ] `PlaySoundPdu` (type 34) — 동일
-  - 이 4개는 blocking만으로는 못 함. `justrdp-session`에 먼저 `ActiveStageOutput` 변형 추가 → blocking에서 `RdpEvent` 매핑
-  - MVP에서는 생략하고 별도 커밋으로 미룰 수 있음
+### M4b (이번 커밋) — 누락된 4종 PDU 추가
 
-**검증**: 실서버 연결 후 마우스 커서 이동 이벤트 수신 + `GraphicsUpdate` 바이트 수 로깅.
+- [x] `justrdp-pdu`: `PlaySoundPdu` 신규 (MS-RDPBCGR 2.2.9.1.1.5.1, duration_ms + frequency_hz LE u32 × 2)
+  - [x] roundtrip + 0값 + 와이어 바이트 검증 테스트 2개
+- [x] `justrdp-session::ActiveStageOutput`에 4 variant 추가:
+  - `KeyboardIndicators { led_flags }`
+  - `KeyboardImeStatus { ime_state, ime_conv_mode }`
+  - `PlaySound { duration_ms, frequency_hz }`
+  - `SuppressOutput { allow_display_updates, rect: Option<(u16,u16,u16,u16)> }`
+- [x] `dispatch_pdu_type2`에 4 dispatcher arm 추가 (`SetKeyboardIndicators`/`SetKeyboardImeStatus`/`PlaySound`/`SuppressOutput`)
+- [x] 5개 단위 테스트 추가 (KeyboardIndicators, KeyboardImeStatus, PlaySound, SuppressOutput resume + pause)
+- [x] `justrdp-blocking`: 4 variant → `RdpEvent` 매핑
+  - led_flags 비트 분해 (Scroll/Num/Caps/Kana → bool 4개)
+  - SuppressOutput rect는 현재 드롭, allow만 surface
+
+**현재 동작**: `connect()` Ok → `next_event()` 루프로 GraphicsUpdate, Pointer*, KeyboardIndicators, ImeStatus, PlaySound, SuppressOutput, ChannelData, SaveSessionInfo, ServerMonitorLayout, Disconnected 모두 surface 가능. 실서버 검증 가능 시점.
+
+**검증**: `cargo test -p justrdp-pdu -p justrdp-session -p justrdp-blocking` — pdu 신규 2 + session 53 (기존 48 + 신규 5) + blocking 14, 워크스페이스 clean.
 
 ---
 

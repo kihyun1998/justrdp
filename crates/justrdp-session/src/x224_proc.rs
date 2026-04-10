@@ -17,11 +17,12 @@ use justrdp_pdu::mcs::{
 };
 use justrdp_pdu::rdp::fast_path::FastPathUpdateType;
 use justrdp_pdu::rdp::finalization::{
-    DeactivateAllPdu, MonitorLayoutPdu, SaveSessionInfoPdu, SetErrorInfoPdu, ERRINFO_NONE,
+    DeactivateAllPdu, MonitorLayoutPdu, PlaySoundPdu, SaveSessionInfoPdu, SetErrorInfoPdu,
+    SuppressOutputPdu, ERRINFO_NONE,
 };
 use justrdp_pdu::rdp::headers::{
-    ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
-    SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE,
+    SetKeyboardImeStatusPdu, SetKeyboardIndicatorsPdu, ShareControlHeader, ShareControlPduType,
+    ShareDataHeader, ShareDataPduType, SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE,
 };
 use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
@@ -272,6 +273,50 @@ fn dispatch_pdu_type2(
             let pdu = MonitorLayoutPdu::decode(&mut inner_src)?;
             Ok(vec![ActiveStageOutput::ServerMonitorLayout {
                 monitors: pdu.monitors,
+            }])
+        }
+
+        // Keyboard indicators (CapsLock/NumLock/ScrollLock/Kana) — MS-RDPBCGR 2.2.8.2.1.1.
+        ShareDataPduType::SetKeyboardIndicators => {
+            let mut inner_src = ReadCursor::new(data);
+            let pdu = SetKeyboardIndicatorsPdu::decode(&mut inner_src)?;
+            Ok(vec![ActiveStageOutput::KeyboardIndicators {
+                led_flags: pdu.led_flags,
+            }])
+        }
+
+        // Keyboard IME status — MS-RDPBCGR 2.2.8.2.2.1.
+        ShareDataPduType::SetKeyboardImeStatus => {
+            let mut inner_src = ReadCursor::new(data);
+            let pdu = SetKeyboardImeStatusPdu::decode(&mut inner_src)?;
+            Ok(vec![ActiveStageOutput::KeyboardImeStatus {
+                ime_state: pdu.ime_state,
+                ime_conv_mode: pdu.ime_conv_mode,
+            }])
+        }
+
+        // Play sound (system beep) — MS-RDPBCGR 2.2.9.1.1.5.1.
+        ShareDataPduType::PlaySound => {
+            let mut inner_src = ReadCursor::new(data);
+            let pdu = PlaySoundPdu::decode(&mut inner_src)?;
+            Ok(vec![ActiveStageOutput::PlaySound {
+                duration_ms: pdu.duration_ms,
+                frequency_hz: pdu.frequency_hz,
+            }])
+        }
+
+        // Suppress output / display update pause/resume — MS-RDPBCGR 2.2.11.3.
+        ShareDataPduType::SuppressOutput => {
+            let mut inner_src = ReadCursor::new(data);
+            let pdu = SuppressOutputPdu::decode(&mut inner_src)?;
+            let allow = pdu.allow_display_updates != 0;
+            let rect = match (pdu.left, pdu.top, pdu.right, pdu.bottom) {
+                (Some(l), Some(t), Some(r), Some(b)) => Some((l, t, r, b)),
+                _ => None,
+            };
+            Ok(vec![ActiveStageOutput::SuppressOutput {
+                allow_display_updates: allow,
+                rect,
             }])
         }
 
@@ -761,6 +806,150 @@ mod tests {
         let mut stage = crate::ActiveStage::new(config);
         let outputs = stage.process(&[]).unwrap();
         assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn process_set_keyboard_indicators_emits_event() {
+        let config = test_config();
+        // SetKeyboardIndicatorsPdu wire layout: <unitId u16><ledFlags u16>.
+        // ledFlags = 0b0111 → Scroll + Num + Caps lit; bit 3 (Kana) clear.
+        let mut body = vec![];
+        body.extend_from_slice(&0u16.to_le_bytes());      // unitId
+        body.extend_from_slice(&0x0007u16.to_le_bytes()); // ledFlags
+
+        let frame = build_slow_path_frame(
+            config.io_channel_id,
+            config.share_id,
+            ShareDataPduType::SetKeyboardIndicators,
+            &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::KeyboardIndicators { led_flags } => {
+                assert_eq!(*led_flags, 0x0007);
+            }
+            other => panic!("expected KeyboardIndicators, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_set_keyboard_ime_status_emits_event() {
+        let config = test_config();
+        // SetKeyboardImeStatusPdu wire layout: <unitId u16><imeState u16><imeConvMode u32>.
+        let mut body = vec![];
+        body.extend_from_slice(&0u16.to_le_bytes());            // unitId
+        body.extend_from_slice(&0x0001u16.to_le_bytes());       // imeState = open
+        body.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());   // imeConvMode
+
+        let frame = build_slow_path_frame(
+            config.io_channel_id,
+            config.share_id,
+            ShareDataPduType::SetKeyboardImeStatus,
+            &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::KeyboardImeStatus { ime_state, ime_conv_mode } => {
+                assert_eq!(*ime_state, 0x0001);
+                assert_eq!(*ime_conv_mode, 0xDEADBEEF);
+            }
+            other => panic!("expected KeyboardImeStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_play_sound_emits_event() {
+        let config = test_config();
+        // PlaySoundPdu wire layout: <duration_ms u32><frequency_hz u32>.
+        let mut body = vec![];
+        body.extend_from_slice(&250u32.to_le_bytes()); // duration
+        body.extend_from_slice(&880u32.to_le_bytes()); // frequency
+
+        let frame = build_slow_path_frame(
+            config.io_channel_id,
+            config.share_id,
+            ShareDataPduType::PlaySound,
+            &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::PlaySound { duration_ms, frequency_hz } => {
+                assert_eq!(*duration_ms, 250);
+                assert_eq!(*frequency_hz, 880);
+            }
+            other => panic!("expected PlaySound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_suppress_output_resume_emits_rect() {
+        let config = test_config();
+        // SuppressOutputPdu wire layout when allow != 0:
+        //   <allow u8><pad 3><left u16><top u16><right u16><bottom u16>
+        let mut body = vec![1u8];          // allow = 1 (resume)
+        body.extend_from_slice(&[0u8; 3]); // padding
+        body.extend_from_slice(&0u16.to_le_bytes());     // left
+        body.extend_from_slice(&0u16.to_le_bytes());     // top
+        body.extend_from_slice(&1919u16.to_le_bytes()); // right
+        body.extend_from_slice(&1079u16.to_le_bytes()); // bottom
+
+        let frame = build_slow_path_frame(
+            config.io_channel_id,
+            config.share_id,
+            ShareDataPduType::SuppressOutput,
+            &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::SuppressOutput { allow_display_updates, rect } => {
+                assert!(*allow_display_updates);
+                assert_eq!(*rect, Some((0, 0, 1919, 1079)));
+            }
+            other => panic!("expected SuppressOutput resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_suppress_output_pause_omits_rect() {
+        let config = test_config();
+        // allow = 0 (pause): no rect bytes follow.
+        let mut body = vec![0u8];
+        body.extend_from_slice(&[0u8; 3]);
+
+        let frame = build_slow_path_frame(
+            config.io_channel_id,
+            config.share_id,
+            ShareDataPduType::SuppressOutput,
+            &body,
+        );
+
+        let mut decompressor = BulkDecompressor::new();
+        let mut last_error_info = 0u32;
+        let outputs = process_slow_path(&frame, &config, &mut decompressor, &mut last_error_info).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::SuppressOutput { allow_display_updates, rect } => {
+                assert!(!*allow_display_updates);
+                assert_eq!(*rect, None);
+            }
+            other => panic!("expected SuppressOutput pause, got {other:?}"),
+        }
     }
 
     #[test]

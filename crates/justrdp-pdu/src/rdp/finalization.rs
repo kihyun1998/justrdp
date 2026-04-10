@@ -282,6 +282,45 @@ impl<'de> Decode<'de> for InputEventPdu {
     }
 }
 
+// ── Play Sound PDU ──
+
+/// Play Sound PDU Data (MS-RDPBCGR 2.2.9.1.1.5.1).
+///
+/// Sent by the server to instruct the client to play a system beep with
+/// a specific duration and frequency. Both fields are little-endian UINT32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaySoundPdu {
+    /// Duration of the beep, in milliseconds.
+    pub duration_ms: u32,
+    /// Frequency of the beep, in hertz.
+    pub frequency_hz: u32,
+}
+
+impl Encode for PlaySoundPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_u32_le(self.duration_ms, "PlaySound::duration")?;
+        dst.write_u32_le(self.frequency_hz, "PlaySound::frequency")?;
+        Ok(())
+    }
+    fn name(&self) -> &'static str {
+        "PlaySoundPdu"
+    }
+    fn size(&self) -> usize {
+        8
+    }
+}
+
+impl<'de> Decode<'de> for PlaySoundPdu {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let duration_ms = src.read_u32_le("PlaySound::duration")?;
+        let frequency_hz = src.read_u32_le("PlaySound::frequency")?;
+        Ok(Self {
+            duration_ms,
+            frequency_hz,
+        })
+    }
+}
+
 // ── Suppress Output PDU ──
 
 /// Suppress Output PDU (2.2.11.3).
@@ -1168,6 +1207,36 @@ mod tests {
         pdu.encode(&mut cursor).unwrap();
         let mut cursor = ReadCursor::new(&buf);
         assert_eq!(SuppressOutputPdu::decode(&mut cursor).unwrap(), pdu);
+    }
+
+    #[test]
+    fn play_sound_roundtrip() {
+        let pdu = PlaySoundPdu {
+            duration_ms: 250,
+            frequency_hz: 880,
+        };
+        let size = pdu.size();
+        assert_eq!(size, 8);
+        let mut buf = vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        // Wire format: <duration LE u32><frequency LE u32>
+        assert_eq!(buf, [0xFA, 0x00, 0x00, 0x00, 0x70, 0x03, 0x00, 0x00]);
+        let mut cursor = ReadCursor::new(&buf);
+        assert_eq!(PlaySoundPdu::decode(&mut cursor).unwrap(), pdu);
+    }
+
+    #[test]
+    fn play_sound_zero_values_roundtrip() {
+        let pdu = PlaySoundPdu {
+            duration_ms: 0,
+            frequency_hz: 0,
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&buf);
+        assert_eq!(PlaySoundPdu::decode(&mut cursor).unwrap(), pdu);
     }
 
     #[test]
