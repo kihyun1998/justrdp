@@ -45,7 +45,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use justrdp_blocking::{RdpClient, RdpEvent, ReconnectPolicy};
-use justrdp_connector::Config;
+use justrdp_connector::{ArcCookie, Config};
 use justrdp_input::{MouseButton, Scancode};
 
 #[derive(Debug, Default)]
@@ -175,11 +175,20 @@ fn main() -> ExitCode {
     if args.reconnect {
         client.set_reconnect_policy(ReconnectPolicy::aggressive());
         println!("[*] reconnect policy: aggressive (5 attempts, 1s/2s/4s/8s/10s backoff)");
+        // Many RDS deployments do not advertise an Auto-Reconnect Cookie
+        // unless the relevant Group Policy is on, so seed a synthetic one
+        // to exercise the can_reconnect predicate. The actual reconnect
+        // will likely fail at the server side because this cookie is
+        // bogus, but we still observe the Reconnecting → Reconnected /
+        // Disconnected control flow that M7 wires up.
+        client.test_set_arc_cookie(ArcCookie::new(0xDEAD_BEEF, [0x42u8; 16]));
+        println!("[*] injected synthetic ARC cookie for reconnect-loop validation");
     }
 
     let mut event_count: u32 = 0;
     let mut graphics_bytes: u64 = 0;
     let mut input_sent = false;
+    let mut transport_dropped = false;
     let mut session_started = Instant::now();
 
     loop {
@@ -288,6 +297,15 @@ fn main() -> ExitCode {
             } else {
                 println!("[*] input batch sent (mouse move + 'a' press/release)");
             }
+        }
+
+        // M7 validation: after a few events, simulate a transport drop
+        // and watch for the Reconnecting/Reconnected/Disconnected sequence.
+        // We only do this once per session and only when --reconnect is set.
+        if args.reconnect && !transport_dropped && event_count >= 10 {
+            transport_dropped = true;
+            println!("[*] simulating transport drop to exercise M7 reconnect");
+            client.test_drop_transport();
         }
 
         if event_count >= args.max_events {

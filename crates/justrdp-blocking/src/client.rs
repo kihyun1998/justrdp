@@ -790,6 +790,30 @@ impl RdpClient {
         self.session.take();
         Ok(())
     }
+
+    /// **Test-only**: drop the underlying transport without telling the
+    /// server. The next [`next_event`](Self::next_event) call will see
+    /// [`RuntimeError::Disconnected`] and route through the auto-reconnect
+    /// path (if a [`ReconnectPolicy`] is enabled). Used by examples and
+    /// integration tests to simulate a network drop without involving
+    /// real packet loss.
+    #[doc(hidden)]
+    pub fn test_drop_transport(&mut self) {
+        self.transport.take();
+        self.session.take();
+    }
+
+    /// **Test-only**: inject an Auto-Reconnect Cookie into the client.
+    ///
+    /// Required when validating M7 reconnect against an RDP server that
+    /// does not advertise an ARC cookie in its `SaveSessionInfo` PDU
+    /// (e.g. Windows RDS without the auto-reconnect Group Policy enabled).
+    /// Without this, [`can_reconnect`](Self::can_reconnect) returns false
+    /// and `try_reconnect` short-circuits to a synthetic Disconnected.
+    #[doc(hidden)]
+    pub fn test_set_arc_cookie(&mut self, cookie: ArcCookie) {
+        self.last_arc_cookie = Some(cookie);
+    }
 }
 
 // ── Pure event-building helpers (testable without a live session) ──

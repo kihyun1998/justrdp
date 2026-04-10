@@ -238,7 +238,12 @@
 - [x] `synthetic_client()` 헬퍼: 라이브 네트워크 없이 RdpClient 필드를 직접 구성해 predicate 테스트 가능
 - [ ] ~~`DisconnectReason::is_retryable()`~~ — 후속 작업. 현재는 모든 IO/Disconnected 에러를 재시도
 - [ ] ~~리다이렉션 루프 방지 (depth counter)~~ — §9.3 작업과 함께
-- [ ] 실서버 통합 테스트 — `connect_test.rs` 예제 바이너리 작성 완료, `--reconnect` 플래그 지원. 다만 finalization까지 도달 못 해서 active 세션 중 disconnect 시나리오는 검증 못 함. **connector finalization 버그 해결 후 재검증 필요**
+- [x] 실서버 통합 테스트 — `192.168.136.136`에서 `connect_test.rs --reconnect` 실행 결과:
+  - 초기 연결 73ms 만에 `Connected` 도달
+  - 10개 이벤트 후 `test_drop_transport()` → 다음 read에서 `Disconnected` → `try_reconnect()` 진입
+  - `Reconnecting { attempt: 1 }` 이벤트 emit → 새 TCP/TLS/CredSSP/finalization 자동 수행 → `Reconnected` 이벤트 emit
+  - 재연결 후 정상 event loop 재개 (PointerBitmap × N + 25 KiB GraphicsUpdate, 총 569 KiB)
+  - 단발 disconnect → 재연결 → 정상 동작 시퀀스 완전 검증
 
 **현재 동작**: `RdpClient::set_reconnect_policy(ReconnectPolicy::aggressive())` 호출하면 다음 disconnect부터 자동 재연결 시도. 로드맵 §9.2의 모든 PDU 레이어 + 런타임 항목 체크 완료.
 
