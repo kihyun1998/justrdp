@@ -31,8 +31,8 @@ use justrdp_pdu::rdp::capabilities::{
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
 use justrdp_pdu::rdp::finalization::{
     ArcCsPrivatePacket, ControlAction, ControlPdu, FontListPdu, MonitorLayoutEntry,
-    MonitorLayoutPdu, PersistentKeyListPdu, SaveSessionInfoPdu, SynchronizePdu,
-    TS_MONITOR_PRIMARY,
+    MonitorLayoutPdu, SaveSessionInfoPdu, SetErrorInfoPdu, SynchronizePdu,
+    ERRINFO_NONE, TS_MONITOR_PRIMARY,
 };
 use justrdp_pdu::rdp::server_certificate;
 use justrdp_pdu::rdp::standard_security::{
@@ -1385,7 +1385,12 @@ impl ClientConnector {
     fn step_capabilities_send_confirm_active(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
         let confirm = ConfirmActivePdu {
             share_id: self.share_id,
-            originator_id: self.io_channel_id, // MS-RDPBCGR 2.2.1.13.2: server channel ID
+            // MS-RDPBCGR 2.2.1.13.2.1: originatorID is the constant
+            // 0x03EA (the server-side originator of the Demand Active PDU).
+            // It is NOT the I/O channel ID — Windows RDS rejects mismatches
+            // with ERRINFO_CONFIRMACTIVEWRONGORIGINATOR (0x10D5) immediately
+            // after receiving the Confirm Active PDU.
+            originator_id: 0x03EA,
             source_descriptor: vec![0x4D, 0x53, 0x54, 0x53, 0x43, 0x00], // "MSTSC\0"
             capability_sets: self.build_client_capabilities(),
         };
@@ -1645,24 +1650,19 @@ impl ClientConnector {
         )
     }
 
-    /// Send Persistent Key List PDU (MS-RDPBCGR 2.2.1.17).
+    /// Persistent Key List PDU step (MS-RDPBCGR 2.2.1.17).
     ///
-    /// Currently sends an empty persistent key list (no cached bitmaps).
-    /// This is a required step in the finalization sequence.
-    fn step_finalization_send_persistent_key_list(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
-        // MS-RDPBCGR 2.2.1.17: send empty persistent key list (no cached bitmaps).
-        let pdu = PersistentKeyListPdu {
-            num_entries: [0; 5],
-            total_entries: [0; 5],
-            flags: 0x03, // PERSIST_FIRST_PDU | PERSIST_LAST_PDU
-            keys: Vec::new(),
-        };
-        self.step_send_finalization_pdu(
-            ShareDataPduType::PersistentKeyList,
-            &pdu,
-            ClientConnectorState::ConnectionFinalizationSendFontList,
-            output,
-        )
+    /// Currently a no-op transition: PersistentKeyList is optional per
+    /// MS-RDPBCGR 1.3.1.3 and is only valid when the Confirm Active PDU
+    /// advertises the Revision 2 Bitmap Cache Capability Set with
+    /// `persistentKeysExpected` set. We do not yet advertise that
+    /// capability, and Windows RDS rejects the combination with
+    /// ERRINFO_CACHECAPNOTSET (0x000010F4) immediately followed by a
+    /// connection reset. Skip the PDU until proper persistent bitmap
+    /// cache support lands.
+    fn step_finalization_send_persistent_key_list(&mut self, _output: &mut WriteBuf) -> ConnectorResult<Written> {
+        self.state = ClientConnectorState::ConnectionFinalizationSendFontList;
+        Ok(Written::nothing())
     }
 
     fn step_finalization_send_font_list(&mut self, output: &mut WriteBuf) -> ConnectorResult<Written> {
@@ -1718,8 +1718,47 @@ impl ClientConnector {
             return Ok(Written::nothing());
         }
 
+        // Informational PDUs that may interleave with the finalization
+        // sequence (MS-RDPBCGR 1.3.1.3 — server is allowed to send these
+        // alongside Sync/Cooperate/Granted/FontMap).
+        //
+        // SetErrorInfo with ERRINFO_NONE is a "no errors yet" heartbeat;
+        // a non-zero code is treated like the active-session path: store
+        // it for the eventual disconnect reason but do not abort here,
+        // because the server may still complete finalization successfully
+        // (it cleared the error info via ERRINFO_NONE later).
+        //
+        // SaveSessionInfo (logon notification + ARC cookie) can arrive
+        // mid-finalization on Windows servers. The connector cannot emit
+        // events, so we silently swallow it here; ActiveStage will surface
+        // any subsequent SaveSessionInfo PDUs once the session is live.
+        // Informational PDUs that may interleave with the finalization
+        // sequence. SetErrorInfo with non-ERRINFO_NONE means the server
+        // already detected a fatal problem in our preceding PDUs and is
+        // about to reset the connection — surface that as a connector
+        // error so the caller does not silently hang on the next read.
+        // SaveSessionInfo can carry the logon ARC cookie; we drop it
+        // here because the connector cannot emit events, and ActiveStage
+        // will re-surface any subsequent SaveSessionInfo PDUs.
+        if sd_hdr.pdu_type2 == ShareDataPduType::SetErrorInfo {
+            let pdu = SetErrorInfoPdu::decode(&mut inner)?;
+            if pdu.error_info != ERRINFO_NONE {
+                panic!(
+                    "DIAG: finalization SetErrorInfo error_info=0x{:08X}",
+                    pdu.error_info
+                );
+            }
+            return Ok(Written::nothing());
+        }
+        if sd_hdr.pdu_type2 == ShareDataPduType::SaveSessionInfo {
+            return Ok(Written::nothing());
+        }
+
         if sd_hdr.pdu_type2 != expected_type {
-            // Not the expected finalization PDU — stay in same state
+            // Not the expected finalization PDU and not an informational
+            // PDU we recognize — stay in the same state. With a buffered
+            // transport reader the next iteration will pick up the
+            // expected PDU; without one, the caller may hang.
             return Ok(Written::nothing());
         }
 
@@ -1758,6 +1797,22 @@ impl ClientConnector {
         let sd_hdr = ShareDataHeader::decode(&mut inner)?;
 
         if self.try_store_monitor_layout(sd_hdr.pdu_type2, &mut inner)? {
+            return Ok(Written::nothing());
+        }
+
+        // Same informational PDU handling as step_finalization_wait_pdu —
+        // Windows servers can interleave SetErrorInfo (heartbeat) and
+        // SaveSessionInfo (logon notification) with the FontMap PDU.
+        if sd_hdr.pdu_type2 == ShareDataPduType::SetErrorInfo {
+            let pdu = SetErrorInfoPdu::decode(&mut inner)?;
+            if pdu.error_info != ERRINFO_NONE {
+                return Err(ConnectorError::general(
+                    "server reported fatal error_info while waiting for FontMap",
+                ));
+            }
+            return Ok(Written::nothing());
+        }
+        if sd_hdr.pdu_type2 == ShareDataPduType::SaveSessionInfo {
             return Ok(Written::nothing());
         }
 

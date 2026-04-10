@@ -451,6 +451,7 @@ impl RdpClient {
             let n = read_pdu(transport, &TpktHint, &mut self.scratch)
                 .map_err(connect_error_to_runtime)?;
             let outputs = session.process(&self.scratch[..n])?;
+            self.scratch.drain(..n);
 
             for output in outputs {
                 match output {
@@ -875,6 +876,12 @@ fn connect_error_to_runtime(err: ConnectError) -> RuntimeError {
 
 /// Drive the connector step loop, forwarding bytes to/from `transport`,
 /// until `stop_when(connector.state())` returns `true`.
+///
+/// `scratch` is held across iterations because [`read_pdu`] may pull
+/// more bytes off the socket than the current PDU consumes (Windows
+/// servers regularly pipeline multiple finalization PDUs into a single
+/// TCP frame). The leftover bytes are drained after each `step()` so
+/// the next iteration sees the next PDU already buffered.
 fn drive_until_state_change<F>(
     connector: &mut ClientConnector,
     transport: &mut Transport,
@@ -895,6 +902,7 @@ where
         if let Some(hint) = hint {
             let n = read_pdu(transport, hint, &mut scratch)?;
             let _written = connector.step(&scratch[..n], &mut output)?;
+            scratch.drain(..n);
         } else {
             output.clear();
             let _written = connector.step(&[], &mut output)?;

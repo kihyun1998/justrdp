@@ -21,14 +21,18 @@ pub const MAX_PDU_SIZE: usize = 16 * 1024 * 1024;
 /// Read exactly one PDU from `reader` into `scratch`, using `hint` to
 /// determine the frame size.
 ///
-/// Returns the complete PDU bytes as a slice of `scratch` (`&scratch[..len]`).
+/// Returns the size of the PDU now sitting at `scratch[..size]`. The
+/// caller MUST call `scratch.drain(..size)` (or equivalent) after
+/// consuming the PDU; `read_pdu` does NOT clear the buffer at the
+/// start, because a single TCP read can return multiple pipelined PDUs
+/// and the bytes following the first one would otherwise be lost.
+///
 /// On EOF mid-frame returns [`ConnectError::UnexpectedEof`].
 pub fn read_pdu<R: Read>(
     reader: &mut R,
     hint: &dyn PduHint,
     scratch: &mut Vec<u8>,
 ) -> Result<usize, ConnectError> {
-    scratch.clear();
     let mut tmp = [0u8; 4096];
 
     loop {

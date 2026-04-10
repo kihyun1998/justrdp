@@ -257,9 +257,13 @@ static LOM_TABLE: [u16; LOM_TABLE_SIZE] =
 // ── NcrushDecompressor ──
 
 /// NCRUSH decompressor (RDP 6.0).
+///
+/// History buffer is heap-allocated to avoid blowing the stack when
+/// `NcrushDecompressor` is held by value (see `Mppc8kDecompressor` for
+/// the full rationale).
 #[derive(Debug)]
 pub struct NcrushDecompressor {
-    history: [u8; HISTORY_SIZE],
+    history: alloc::boxed::Box<[u8; HISTORY_SIZE]>,
     offset: usize,
     /// LRU cache of 4 most recent copy-offsets.
     cache: [u32; OFFSET_CACHE_SIZE],
@@ -268,8 +272,12 @@ pub struct NcrushDecompressor {
 impl NcrushDecompressor {
     /// Create a new decompressor with zeroed history.
     pub fn new() -> Self {
+        let history: alloc::boxed::Box<[u8; HISTORY_SIZE]> = alloc::vec![0u8; HISTORY_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .expect("vec length matches HISTORY_SIZE");
         Self {
-            history: [0u8; HISTORY_SIZE],
+            history,
             offset: 0,
             cache: [0u32; OFFSET_CACHE_SIZE],
         }

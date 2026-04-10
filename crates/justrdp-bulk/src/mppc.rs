@@ -7,6 +7,8 @@
 //! - MS-RDPBCGR §3.1.8.4.2 (64K variant)
 //! - RFC 2118 (Microsoft Point-to-Point Compression Protocol)
 
+use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -149,19 +151,30 @@ impl<'a> BitReader<'a> {
 // ── MPPC 8K Decompressor (MS-RDPBCGR §3.1.8.4.1) ──
 
 /// MPPC 8K sliding-window decompressor (RDP 4.0).
+///
+/// The history buffer is heap-allocated (`Box<[u8; HISTORY_SIZE_8K]>`)
+/// to keep the struct's stack footprint minimal — without this, callers
+/// that hold an `Mppc8kDecompressor` by value (e.g. inside `BulkDecompressor`,
+/// which itself often lives inside `ActiveStage`) blow Windows' default
+/// 1 MiB stack as soon as a few of those are constructed in nested
+/// debug-mode call frames.
 #[derive(Debug)]
 pub struct Mppc8kDecompressor {
-    history: [u8; HISTORY_SIZE_8K],
+    history: Box<[u8; HISTORY_SIZE_8K]>,
     offset: usize,
 }
 
 impl Mppc8kDecompressor {
     /// Create a new decompressor with zeroed history.
     pub fn new() -> Self {
-        Self {
-            history: [0u8; HISTORY_SIZE_8K],
-            offset: 0,
-        }
+        // Allocate the history on the heap directly via Vec to avoid the
+        // intermediate `[u8; N]` value sitting on the stack inside
+        // `Box::new(...)`.
+        let history: Box<[u8; HISTORY_SIZE_8K]> = vec![0u8; HISTORY_SIZE_8K]
+            .into_boxed_slice()
+            .try_into()
+            .expect("vec length matches HISTORY_SIZE_8K");
+        Self { history, offset: 0 }
     }
 
     /// Reinitialize history buffer and offset.
@@ -195,13 +208,13 @@ impl Mppc8kDecompressor {
         if flags & PACKET_COMPRESSED != 0 {
             decompress_bitstream::<HISTORY_SIZE_8K>(
                 src,
-                &mut self.history,
+                self.history.as_mut_slice(),
                 &mut self.offset,
                 dst,
             )
         } else {
             // Uncompressed: copy verbatim into history
-            copy_literal(src, &mut self.history, &mut self.offset, HISTORY_SIZE_8K, dst)
+            copy_literal(src, self.history.as_mut_slice(), &mut self.offset, HISTORY_SIZE_8K, dst)
         }
     }
 }
@@ -215,17 +228,25 @@ impl Default for Mppc8kDecompressor {
 // ── MPPC 64K Decompressor (MS-RDPBCGR §3.1.8.4.2) ──
 
 /// MPPC 64K sliding-window decompressor (RDP 5.0).
+///
+/// History buffer is heap-allocated for the same reason as
+/// [`Mppc8kDecompressor`]. The 64 KiB inline buffer is the single
+/// largest contributor to `BulkDecompressor`'s stack footprint.
 #[derive(Debug)]
 pub struct Mppc64kDecompressor {
-    history: [u8; HISTORY_SIZE_64K],
+    history: Box<[u8; HISTORY_SIZE_64K]>,
     offset: usize,
 }
 
 impl Mppc64kDecompressor {
     /// Create a new decompressor with zeroed history.
     pub fn new() -> Self {
+        let history: Box<[u8; HISTORY_SIZE_64K]> = vec![0u8; HISTORY_SIZE_64K]
+            .into_boxed_slice()
+            .try_into()
+            .expect("vec length matches HISTORY_SIZE_64K");
         Self {
-            history: [0u8; HISTORY_SIZE_64K],
+            history,
             offset: 0,
         }
     }
@@ -254,12 +275,12 @@ impl Mppc64kDecompressor {
         if flags & PACKET_COMPRESSED != 0 {
             decompress_bitstream::<HISTORY_SIZE_64K>(
                 src,
-                &mut self.history,
+                self.history.as_mut_slice(),
                 &mut self.offset,
                 dst,
             )
         } else {
-            copy_literal(src, &mut self.history, &mut self.offset, HISTORY_SIZE_64K, dst)
+            copy_literal(src, self.history.as_mut_slice(), &mut self.offset, HISTORY_SIZE_64K, dst)
         }
     }
 }
