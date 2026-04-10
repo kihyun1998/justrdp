@@ -93,7 +93,7 @@
 - [x] `RdpClient::connect*()` 전체 시그니처 `Ok(Self { ... })` 반환
   - `transport: Some(transport)`, `session: Some(active_stage)`, `reconnect_policy: disabled()`, `scratch: Vec::new()`, `server_public_key` 보관
 - [x] `server_public_key`를 clone해서 CredSSP에 전달, 원본은 RdpClient에 보관 (M7 auto-reconnect 재사용 대비)
-- [ ] ~~`disconnect()`가 MCS DisconnectProviderUltimatum 전송~~ → M4 이후로 연기 (`ActiveStage::encode_disconnect()` API는 이미 있음, 지금은 transport drop만 수행)
+- [x] `disconnect()`가 MCS DisconnectProviderUltimatum 전송 — `ActiveStage::encode_disconnect()` 경유, best-effort write (commit `839897c`)
 
 **현재 동작**: TCP → X.224 → TLS 업그레이드 → CredSSP → BasicSettings → ChannelConnection → Capabilities → Finalization → `Connected` → `RdpClient { session: Some(ActiveStage) }` 반환. **`connect()`가 처음으로 `Ok`를 반환함.**
 
@@ -160,9 +160,9 @@
   - unicode BMP / release / supplementary plane rejection (3)
   - mouse move (1)
   - mouse button left press / right release / middle press / X1/X2 None (4)
-- [ ] ~~`send_mouse_wheel(delta)`~~ → 후속 작업 (PTRFLAGS_WHEEL/HWHEEL/WHEEL_NEGATIVE 인코딩 필요)
-- [ ] ~~`InputDatabase` 내장~~ → MVP에서는 사용자가 직접 관리. 추후 옵션 feature로 추가 검토
-- [ ] ~~키보드 sync (LockKeys 동기화)~~ → 후속, `FastPathSyncEvent` 사용 예정
+- [x] `send_mouse_wheel(delta, horizontal, x, y)` — PTRFLAGS_WHEEL/HWHEEL/WHEEL_NEGATIVE 인코딩, 매그니튜드 0..=255 클램프 (commit `839897c`)
+- ~~`InputDatabase` 내장~~ → roadmap.md §5.5로 이관
+- ~~키보드 sync (LockKeys 동기화)~~ → roadmap.md §5.5로 이관
 - [x] 실서버 검증: `examples/connect_test.rs` 작성, M1-M3 (TCP/TLS/CredSSP)는 정상 동작. M4 이후(`next_event` 루프, `send_*`)는 connector finalization 버그로 도달 못 함 — 별도 이슈
 
 **현재 동작**: `RdpClient` 사용자가 키 입력 / 유니코드 / 마우스 이동 / 마우스 클릭을 송신할 수 있음. 4가지 fast-path 이벤트 모두 와이어 포맷 정확.
@@ -236,7 +236,7 @@
   - `try_reconnect_disabled_policy_emits_disconnect_and_marks_terminal` (disabled → Disconnected만 emit, Reconnecting noise 없음)
   - `try_reconnect_with_processors_short_circuits_to_disconnect` (processor → 즉시 Disconnected)
 - [x] `synthetic_client()` 헬퍼: 라이브 네트워크 없이 RdpClient 필드를 직접 구성해 predicate 테스트 가능
-- [ ] ~~`DisconnectReason::is_retryable()`~~ — 후속 작업. 현재는 모든 IO/Disconnected 에러를 재시도
+- [x] `is_error_info_retryable(code)` — user intent / policy / transient / license / broker 5-way 분류 + blocking `next_event` Terminate 분기 연동 (commit `839897c`)
 - [x] 리다이렉션 루프 방지 (depth counter) — §9.3 작업에서 `MAX_REDIRECTS = 5` 구현 (commit `eff6416`)
 - [x] 실서버 통합 테스트 — `192.168.136.136`에서 `connect_test.rs --reconnect` 실행 결과:
   - 초기 연결 73ms 만에 `Connected` 도달
@@ -290,15 +290,12 @@ M1 (TLS + CertVerifier)
   - Phase 2 (`fbd9004`): connector 통합 (`ConnectionResult.server_redirection` + finalization wait 함수의 `ShareControlPduType::ServerRedirect` 분기)
   - Phase 3 (`eff6416`): blocking 자동 리다이렉트 루프 (max 5 depth) + UTF-16LE 타겟 파싱 + `RdpEvent::Redirected` 방출 + 7개 unit test
 
-## 잔여 follow-up
+## 잔여 follow-up (모두 roadmap.md로 이관 완료)
 
-- [x] §9.3 connector integration test — wire-format injection으로 redirect path end-to-end 검증 (connector test 2개 추가, total 113)
-  - `finalization_wait_pdu_handles_server_redirect`: WaitSynchronize 상태에서 LB cookie 포함 ServerRedirect frame 주입 → state == Connected, server_redirection.session_id/load_balance_info 검증
-  - `finalization_wait_font_map_handles_server_redirect`: WaitFontMap 상태에서 LB_TARGET_NET_ADDRESS 포함 frame 주입 → 동일 검증
-- [ ] §9.3 RC4 비밀번호 cookie 복호화 (RDSTLS auth)
-- [ ] §9.3 진짜 mock broker (TcpListener + 가짜 RDP handshake) — 너무 무거움 (500+ 줄), 후속 작업
-- [x] `DisconnectReason::is_retryable()` 정밀 매핑 — `justrdp_pdu::rdp::finalization::is_error_info_retryable(u32)` + blocking `next_event`의 Terminate 분기에서 `try_reconnect` 게이트로 연결
-- [x] `send_mouse_wheel(delta, horizontal, x, y)` — PTRFLAGS_WHEEL / PTRFLAGS_HWHEEL / PTRFLAGS_WHEEL_NEGATIVE 인코딩, 매그니튜드 0..=255 클램프
-- [x] `disconnect()`가 MCS Disconnect Provider Ultimatum 전송 — `ActiveStage::encode_disconnect()` 경유, 쓰기 실패는 무시 (소켓이 이미 half-closed일 수 있음)
-- [ ] `send_synchronize(LockKeys)` for FastPathSyncEvent
-- [ ] `InputDatabase` 내장 (선택, feature flag)
+- [x] §9.3 connector integration test (2개)
+- [x] `is_retryable()` 정밀 매핑 (commit `839897c`)
+- [x] `send_mouse_wheel` (commit `839897c`)
+- [x] `disconnect()` MCS DPU (commit `839897c`)
+- 나머지 미구현 항목은 roadmap.md §5.5 / §9.3에서 추적:
+  - §5.5: `send_synchronize(LockKeys)`, `InputDatabase` 내장
+  - §9.3: RC4 password cookie 복호화, mock broker 통합 테스트

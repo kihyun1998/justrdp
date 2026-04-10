@@ -791,9 +791,9 @@ pub enum RdpEvent {
   - [x] `send_unicode(ch, pressed)` — BMP 한정, 서로게이트 페어는 `Unimplemented`
   - [x] `send_mouse_move(x, y)` — `PTRFLAGS_MOVE`
   - [x] `send_mouse_button(button, pressed, x, y)` — Left/Right/Middle (`PTRFLAGS_BUTTON1/2/3 + DOWN`)
-  - [ ] `send_mouse_wheel(delta)` — 후속 (PTRFLAGS_WHEEL/HWHEEL/WHEEL_NEGATIVE 인코딩 필요)
+  - [x] `send_mouse_wheel(delta, horizontal, x, y)` — PTRFLAGS_WHEEL / PTRFLAGS_HWHEEL / PTRFLAGS_WHEEL_NEGATIVE, 매그니튜드 0..=255 클램프
   - [ ] `send_synchronize(LockKeys)` — 후속 (`FastPathSyncEvent`)
-  - [ ] `InputDatabase` 상태 관리 내부화 — MVP는 사용자가 직접 관리
+  - [ ] `InputDatabase` 상태 관리 내부화 — MVP는 사용자가 직접 관리, 추후 옵션 feature flag
 - [x] **채널 이벤트 배선** (M6, 커밋 `0067c17`)
   - [x] `RdpClient::connect_with_processors(server, name, config, processors)` — SVC processor 등록
   - [x] `read_one_frame`의 `ChannelData` 분기: 등록된 processor 있으면 dispatch + 응답 frame write, 없으면 raw passthrough
@@ -1450,7 +1450,7 @@ pub trait GfxHandler: Send {
 - [x] `RdpEvent::Redirected { target }` 방출 (성공 핸드셰이크 후 한 번)
 - [x] 리다이렉션 루프 방지 — `MAX_REDIRECTS = 5`, 초과 시 `ConnectError::Tcp(Other)` 반환
 - [x] 7개 단위 테스트 (utf16 디코딩, IPv4 default port, 명시 port, target_net_address path, target_net_addresses fallback, 빈 PDU None 반환, 절단 거부)
-- [ ] 실서버 통합 테스트 — mock broker 필요, 후속
+- [ ] 실서버 통합 테스트 — mock broker (TcpListener + 가짜 RDP handshake) 필요. 진짜 Connection Broker 환경 또는 synthetic wire-frame 주입
 
 ### 9.4 Touch Input (MS-RDPEI)
 
