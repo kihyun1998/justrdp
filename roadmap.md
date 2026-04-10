@@ -792,8 +792,8 @@ pub enum RdpEvent {
   - [x] `send_mouse_move(x, y)` — `PTRFLAGS_MOVE`
   - [x] `send_mouse_button(button, pressed, x, y)` — Left/Right/Middle (`PTRFLAGS_BUTTON1/2/3 + DOWN`)
   - [x] `send_mouse_wheel(delta, horizontal, x, y)` — PTRFLAGS_WHEEL / PTRFLAGS_HWHEEL / PTRFLAGS_WHEEL_NEGATIVE, 매그니튜드 0..=255 클램프
-  - [ ] `send_synchronize(LockKeys)` — 후속 (`FastPathSyncEvent`) → §9.3 하단 잔여 작업에서 추적
-  - [ ] `InputDatabase` 상태 관리 내부화 — MVP는 사용자 직접 관리 → §9.3 하단 잔여 작업에서 추적
+  - [x] `send_synchronize(LockKeys)` — `FastPathSyncEvent` 연결 완료
+  - [x] `InputDatabase` 상태 관리 내부화 — 고수준 상태추적 API 완료 (`key_press/release`, `button_press/release`, `move_mouse`, `synchronize`, `release_all_input`)
 - [x] **채널 이벤트 배선** (M6, 커밋 `0067c17`)
   - [x] `RdpClient::connect_with_processors(server, name, config, processors)` — SVC processor 등록
   - [x] `read_one_frame`의 `ChannelData` 분기: 등록된 processor 있으면 dispatch + 응답 frame write, 없으면 raw passthrough
@@ -1454,9 +1454,9 @@ pub trait GfxHandler: Send {
 
 **`justrdp-blocking` 잔여 후속 작업 (CHECKLIST.md에서 이관):**
 
-- [ ] `send_synchronize(LockKeys)` — `FastPathSyncEvent` 연결 (§5.5 입력 헬퍼)
-- [ ] `InputDatabase` 상태 관리 내부화 — MVP는 사용자 직접 관리, 추후 옵션 feature flag (§5.5)
-- [ ] RC4 비밀번호 cookie 복호화 — RDSTLS auth PDU 경유 (§9.3 PDU 레이어)
+- [x] `send_synchronize(LockKeys)` — `FastPathSyncEvent` 연결 완료
+- [x] `InputDatabase` 상태 관리 내부화 — 고수준 상태추적 API 완료
+- [x] PK-encrypted password cookie 투명 전달 — `password_cookie()` 생성자 + Config 필드 + Connector 분기 + Blocking 감지 완료 (클라이언트는 복호화 안함, 투명 전달)
 - [ ] mock broker 통합 테스트 — TcpListener + 가짜 RDP handshake로 redirect path E2E 검증 (§9.3 런타임)
 
 ### 9.4 Touch Input (MS-RDPEI)

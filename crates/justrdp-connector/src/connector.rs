@@ -565,11 +565,23 @@ impl ClientConnector {
                 ));
             }
             crate::config::AuthMode::Password => {
-                RdstlsAuthenticationRequest::password(
-                    &to_utf16le(domain_str),
-                    &to_utf16le(&self.config.credentials.username),
-                    &to_utf16le(&self.config.credentials.password),
-                )?
+                // If the config carries a PK-encrypted password blob from a
+                // Server Redirection PDU, send it verbatim via RDSTLS instead
+                // of encoding the cleartext password.
+                if let Some(blob) = &self.config.redirection_password_blob {
+                    let guid = self.config.redirection_guid.as_deref().unwrap_or(&[]);
+                    let username = &to_utf16le(&self.config.credentials.username);
+                    let domain = &to_utf16le(domain_str);
+                    RdstlsAuthenticationRequest::password_cookie(
+                        guid, username, domain, blob,
+                    )?
+                } else {
+                    RdstlsAuthenticationRequest::password(
+                        &to_utf16le(domain_str),
+                        &to_utf16le(&self.config.credentials.username),
+                        &to_utf16le(&self.config.credentials.password),
+                    )?
+                }
             }
         };
 

@@ -423,7 +423,7 @@ impl core::fmt::Debug for AadConfig {
 }
 
 /// RDP connection configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Authentication credentials.
     pub credentials: Credentials,
@@ -480,6 +480,20 @@ pub struct Config {
     /// Azure AD authentication configuration.
     /// Must be provided when auth_mode is AzureAd.
     pub aad_config: Option<AadConfig>,
+    /// Opaque PK-encrypted password blob from a Server Redirection PDU
+    /// (`LB_PASSWORD_IS_PK_ENCRYPTED`, MS-RDPBCGR 2.2.13.1).
+    ///
+    /// When set, the RDSTLS authentication request sends these bytes
+    /// verbatim as the `Password` field instead of the cleartext password.
+    /// The client never decrypts this blob — it is passed through to the
+    /// target RD Session Host which decrypts it with its private key.
+    pub redirection_password_blob: Option<Vec<u8>>,
+    /// Redirection GUID from a Server Redirection PDU
+    /// (`LB_REDIRECTION_GUID`, MS-RDPBCGR 2.2.13.1).
+    ///
+    /// Sent in the RDSTLS authentication request when
+    /// `redirection_password_blob` is present.
+    pub redirection_guid: Option<Vec<u8>>,
     /// Multi-monitor layout (MS-RDPBCGR 2.2.1.3.6).
     ///
     /// When two or more monitors are configured, CS_MONITOR and CS_MONITOR_EX
@@ -489,6 +503,26 @@ pub struct Config {
     ///
     /// When empty (default), single-monitor mode is used with `desktop_size`.
     pub monitors: Vec<MonitorConfig>,
+}
+
+impl core::fmt::Debug for Config {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Config")
+            .field("credentials", &self.credentials)
+            .field("domain", &self.domain)
+            .field("desktop_size", &self.desktop_size)
+            .field("color_depth", &self.color_depth)
+            .field("keyboard_type", &self.keyboard_type)
+            .field("keyboard_layout", &self.keyboard_layout)
+            .field("client_name", &self.client_name)
+            .field("security_protocol", &self.security_protocol)
+            .field("auth_mode", &self.auth_mode)
+            .field("routing_token", &self.routing_token.as_ref().map(|t| t.len()))
+            .field("redirection_password_blob", &self.redirection_password_blob.as_ref().map(|_| "[REDACTED]"))
+            .field("redirection_guid", &self.redirection_guid)
+            .field("monitors", &self.monitors)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
@@ -521,6 +555,8 @@ impl Config {
                 device_kerberos_token: None,
                 client_random: None,
                 aad_config: None,
+                redirection_password_blob: None,
+                redirection_guid: None,
                 monitors: Vec::new(),
             },
         }
@@ -700,6 +736,23 @@ impl ConfigBuilder {
     /// Set the full multi-monitor layout, replacing any previously added monitors.
     pub fn monitors(mut self, configs: Vec<MonitorConfig>) -> Self {
         self.config.monitors = configs;
+        self
+    }
+
+    /// Set the PK-encrypted password blob from a Server Redirection PDU.
+    ///
+    /// When set, the RDSTLS authentication request sends these bytes as
+    /// the opaque password field. Also switches the security protocol to
+    /// RDSTLS automatically.
+    pub fn redirection_password_blob(mut self, blob: Vec<u8>) -> Self {
+        self.config.redirection_password_blob = Some(blob);
+        self.config.security_protocol = SecurityProtocol::RDSTLS;
+        self
+    }
+
+    /// Set the redirection GUID from a Server Redirection PDU.
+    pub fn redirection_guid(mut self, guid: Vec<u8>) -> Self {
+        self.config.redirection_guid = Some(guid);
         self
     }
 

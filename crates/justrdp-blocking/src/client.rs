@@ -15,9 +15,10 @@ use std::sync::Arc;
 
 use justrdp_connector::{ArcCookie, ClientConnector, ClientConnectorState, Config, Sequence};
 use justrdp_core::WriteBuf;
-use justrdp_input::{MouseButton, Scancode};
+use justrdp_input::{InputDatabase, LockKeys, MouseButton, Operation, Scancode, MAX_RELEASE_OPS};
 use justrdp_pdu::rdp::fast_path::{
-    FastPathInputEvent, FastPathMouseEvent, FastPathScancodeEvent, FastPathUnicodeEvent,
+    FastPathInputEvent, FastPathMouseEvent, FastPathScancodeEvent, FastPathSyncEvent,
+    FastPathUnicodeEvent,
 };
 use justrdp_pdu::tpkt::TpktHint;
 use justrdp_session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionConfig};
@@ -150,6 +151,9 @@ pub struct RdpClient {
     /// (MS-RDPBCGR 5.5). `None` until the server has logged the user in
     /// and emitted a logon-info PDU containing the ARC random bits.
     last_arc_cookie: Option<ArcCookie>,
+    /// Input state tracker. Deduplicates key/button presses, tracks mouse
+    /// position, and supports batch release on focus loss.
+    input_db: InputDatabase,
 }
 
 impl RdpClient {
@@ -354,6 +358,35 @@ impl RdpClient {
                 next_config.cookie = None;
                 next_config.auto_reconnect_cookie = None;
 
+                // When the broker sends a PK-encrypted password blob,
+                // the redirected connection must use RDSTLS to pass it
+                // through to the target RD Session Host.
+                if redir.redir_flags & justrdp_pdu::rdp::redirection::LB_PASSWORD_IS_PK_ENCRYPTED != 0 {
+                    // Only switch to RDSTLS when the password blob is
+                    // actually present; if the flag is set but the field
+                    // is absent, fall through to the normal auth path.
+                    if let Some(pw) = &redir.password {
+                        next_config.redirection_password_blob = Some(pw.clone());
+                        next_config.security_protocol =
+                            justrdp_pdu::x224::SecurityProtocol::RDSTLS;
+                        if let Some(guid) = &redir.redirection_guid {
+                            next_config.redirection_guid = Some(guid.clone());
+                        }
+                    }
+                }
+
+                // Override username/domain from the redirect PDU if provided.
+                if let Some(ref u) = redir.username {
+                    if let Some(name) = utf16le_to_string(u) {
+                        next_config.credentials.username = name;
+                    }
+                }
+                if let Some(ref d) = redir.domain {
+                    if let Some(dom) = utf16le_to_string(d) {
+                        next_config.domain = Some(dom);
+                    }
+                }
+
                 current_addr = new_addr;
                 current_config = next_config;
                 continue;
@@ -445,6 +478,7 @@ impl RdpClient {
             last_server_name,
             last_config,
             last_arc_cookie,
+            input_db: InputDatabase::new(),
         })
     }
 
@@ -903,6 +937,191 @@ impl RdpClient {
         self.send_input_events(&[build_mouse_wheel_event(delta, horizontal, x, y)])
     }
 
+    /// Send a synchronize event to inform the server of the current lock-key
+    /// state (Scroll Lock, Num Lock, Caps Lock, Kana Lock).
+    ///
+    /// Per MS-RDPBCGR §2.2.8.1.2.2.5, this should be sent whenever the
+    /// client window receives input focus.
+    pub fn send_synchronize(&mut self, lock_keys: LockKeys) -> Result<(), RuntimeError> {
+        self.send_input_events(&[build_sync_event(lock_keys)])
+    }
+
+    // ── State-tracked input API ──
+    //
+    // These methods go through the internal `InputDatabase` which deduplicates
+    // events (e.g. suppresses a second key-press when the key is already held)
+    // and tracks the current input state. Prefer these over the raw `send_*`
+    // methods above when the caller cannot easily track input state itself.
+
+    /// Record a key press and send the event. Returns `Ok(false)` if the
+    /// key was already held (duplicate suppressed, nothing sent).
+    pub fn key_press(&mut self, scancode: Scancode) -> Result<bool, RuntimeError> {
+        if let Some(op) = self.input_db.key_press(scancode) {
+            self.send_operation(op)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Record a key release and send the event. Returns `Ok(false)` if the
+    /// key was not held (duplicate suppressed, nothing sent).
+    pub fn key_release(&mut self, scancode: Scancode) -> Result<bool, RuntimeError> {
+        if let Some(op) = self.input_db.key_release(scancode) {
+            self.send_operation(op)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Record a mouse button press and send the event. Returns `Ok(false)`
+    /// if the button was already held.
+    ///
+    /// `x` / `y` are the cursor coordinates at the time of the click;
+    /// the `InputDatabase` does not track position for button events —
+    /// the caller must supply it.
+    pub fn button_press(
+        &mut self,
+        button: MouseButton,
+        x: u16,
+        y: u16,
+    ) -> Result<bool, RuntimeError> {
+        if self.input_db.mouse_button_press(button).is_some() {
+            self.send_mouse_button(button, true, x, y)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Record a mouse button release and send the event. Returns `Ok(false)`
+    /// if the button was not held.
+    pub fn button_release(
+        &mut self,
+        button: MouseButton,
+        x: u16,
+        y: u16,
+    ) -> Result<bool, RuntimeError> {
+        if self.input_db.mouse_button_release(button).is_some() {
+            self.send_mouse_button(button, false, x, y)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Record a mouse move and send the event. Returns `Ok(false)` if the
+    /// position has not changed.
+    pub fn move_mouse(&mut self, x: u16, y: u16) -> Result<bool, RuntimeError> {
+        if self.input_db.mouse_move(x, y).is_some() {
+            self.send_mouse_move(x, y)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Update lock-key state and send a synchronize event. This always
+    /// sends an event (per RDP spec, synchronize is unconditional on
+    /// focus gain).
+    pub fn synchronize(&mut self, lock_keys: LockKeys) -> Result<(), RuntimeError> {
+        let op = self.input_db.synchronize_event(lock_keys);
+        self.send_operation(op)
+    }
+
+    /// Release all held keys and mouse buttons, sending the appropriate
+    /// release events. Call this when the client window loses focus.
+    /// Returns the number of release events sent.
+    pub fn release_all_input(&mut self) -> Result<usize, RuntimeError> {
+        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); MAX_RELEASE_OPS];
+        let count = self.input_db.release_all(&mut ops);
+        // Build all events before sending so a partial-send failure cannot
+        // leave InputDatabase cleared while the server still sees keys held.
+        let (mx, my) = self.input_db.mouse_position();
+        let events: Vec<FastPathInputEvent> = ops[..count]
+            .iter()
+            .filter_map(|op| match *op {
+                Operation::KeyReleased(sc) => Some(build_scancode_event(sc, false)),
+                Operation::MouseButtonReleased(btn) => {
+                    // X1/X2 require a MouseX fast-path event which is not
+                    // yet implemented; skip them rather than sending a bogus
+                    // substitute event that would leave the server confused.
+                    build_mouse_button_event(btn, false, mx, my)
+                }
+                _ => unreachable!("release_all only emits release operations"),
+            })
+            .collect();
+        let sent = events.len();
+        self.send_input_events(&events)?;
+        Ok(sent)
+    }
+
+    /// Check whether a key is currently held (per `InputDatabase` state).
+    pub fn is_key_pressed(&self, scancode: Scancode) -> bool {
+        self.input_db.is_key_pressed(scancode)
+    }
+
+    /// Check whether a mouse button is currently held.
+    pub fn is_button_pressed(&self, button: MouseButton) -> bool {
+        self.input_db.is_mouse_button_pressed(button)
+    }
+
+    /// Current mouse position as tracked by the `InputDatabase`.
+    pub fn mouse_position(&self) -> (u16, u16) {
+        self.input_db.mouse_position()
+    }
+
+    /// Current lock-key state as tracked by the `InputDatabase`.
+    pub fn lock_keys(&self) -> LockKeys {
+        self.input_db.lock_keys()
+    }
+
+    /// Convert an [`Operation`] from the `InputDatabase` into a fast-path
+    /// event and send it over the wire.
+    fn send_operation(&mut self, op: Operation) -> Result<(), RuntimeError> {
+        let event = match op {
+            Operation::KeyPressed(sc) => build_scancode_event(sc, true),
+            Operation::KeyReleased(sc) => build_scancode_event(sc, false),
+            Operation::UnicodeKeyPressed(code) => {
+                FastPathInputEvent::Unicode(FastPathUnicodeEvent {
+                    event_flags: 0,
+                    unicode_code: code,
+                })
+            }
+            Operation::UnicodeKeyReleased(code) => {
+                FastPathInputEvent::Unicode(FastPathUnicodeEvent {
+                    event_flags: KBDFLAGS_RELEASE,
+                    unicode_code: code,
+                })
+            }
+            Operation::MouseButtonPressed(btn) => {
+                let (x, y) = self.input_db.mouse_position();
+                return self.send_mouse_button(btn, true, x, y);
+            }
+            Operation::MouseButtonReleased(btn) => {
+                let (x, y) = self.input_db.mouse_position();
+                return self.send_mouse_button(btn, false, x, y);
+            }
+            Operation::MouseMove { x, y } => build_mouse_move_event(x, y),
+            Operation::RelativeMouseMove { .. } => {
+                return Err(RuntimeError::Unimplemented(
+                    "RelativeMouseMove not yet wired to fast-path relative mouse event",
+                ));
+            }
+            Operation::WheelRotations(delta) => {
+                let (wx, wy) = self.input_db.mouse_position();
+                build_mouse_wheel_event(delta, false, wx, wy)
+            }
+            Operation::HorizontalWheelRotations(delta) => {
+                let (wx, wy) = self.input_db.mouse_position();
+                build_mouse_wheel_event(delta, true, wx, wy)
+            }
+            Operation::SynchronizeEvent(locks) => build_sync_event(locks),
+        };
+        self.send_input_events(&[event])
+    }
+
     /// Encode and write a batch of fast-path input events to the transport.
     ///
     /// Pre-condition: the session must be active. After a disconnect this
@@ -1142,6 +1361,16 @@ fn build_mouse_button_event(
         x_pos: x,
         y_pos: y,
     }))
+}
+
+/// Build a fast-path synchronize event from lock-key state.
+///
+/// MS-RDPBCGR §2.2.8.1.2.2.5: eventFlags bits 0-3 carry the toggle states
+/// (scroll, num, caps, kana).
+fn build_sync_event(lock_keys: LockKeys) -> FastPathInputEvent {
+    FastPathInputEvent::Sync(FastPathSyncEvent {
+        event_flags: (lock_keys.to_flags() & 0x0F) as u8,
+    })
 }
 
 /// Translate a transport-level [`ConnectError`] (used during the handshake)
@@ -1494,6 +1723,197 @@ mod tests {
         }
     }
 
+    // ── Sync event helpers ──
+
+    #[test]
+    fn sync_event_all_off() {
+        let event = build_sync_event(LockKeys::DEFAULT);
+        match event {
+            FastPathInputEvent::Sync(e) => assert_eq!(e.event_flags, 0x00),
+            _ => panic!("expected Sync variant"),
+        }
+    }
+
+    #[test]
+    fn sync_event_all_on() {
+        let lock_keys = LockKeys {
+            scroll_lock: true,
+            num_lock: true,
+            caps_lock: true,
+            kana_lock: true,
+        };
+        let event = build_sync_event(lock_keys);
+        match event {
+            FastPathInputEvent::Sync(e) => assert_eq!(e.event_flags, 0x0F),
+            _ => panic!("expected Sync variant"),
+        }
+    }
+
+    #[test]
+    fn sync_event_caps_only() {
+        let lock_keys = LockKeys {
+            caps_lock: true,
+            ..LockKeys::DEFAULT
+        };
+        let event = build_sync_event(lock_keys);
+        match event {
+            FastPathInputEvent::Sync(e) => assert_eq!(e.event_flags, 0x04),
+            _ => panic!("expected Sync variant"),
+        }
+    }
+
+    #[test]
+    fn sync_event_num_and_scroll() {
+        let lock_keys = LockKeys {
+            scroll_lock: true,
+            num_lock: true,
+            ..LockKeys::DEFAULT
+        };
+        let event = build_sync_event(lock_keys);
+        match event {
+            FastPathInputEvent::Sync(e) => assert_eq!(e.event_flags, 0x03),
+            _ => panic!("expected Sync variant"),
+        }
+    }
+
+    // ── InputDatabase integration ──
+
+    #[test]
+    fn key_press_deduplication() {
+        let mut db = InputDatabase::new();
+        let a = Scancode::new(0x1E, false);
+        // First press produces an event.
+        assert!(db.key_press(a).is_some());
+        // Second press is deduplicated.
+        assert!(db.key_press(a).is_none());
+    }
+
+    #[test]
+    fn key_release_deduplication() {
+        let mut db = InputDatabase::new();
+        let a = Scancode::new(0x1E, false);
+        // Release without press is suppressed.
+        assert!(db.key_release(a).is_none());
+        db.key_press(a);
+        assert!(db.key_release(a).is_some());
+        // Double release is suppressed.
+        assert!(db.key_release(a).is_none());
+    }
+
+    #[test]
+    fn mouse_move_deduplication() {
+        let mut db = InputDatabase::new();
+        assert!(db.mouse_move(100, 200).is_some());
+        // Same position is suppressed.
+        assert!(db.mouse_move(100, 200).is_none());
+        // Different position produces event.
+        assert!(db.mouse_move(101, 200).is_some());
+    }
+
+    #[test]
+    fn mouse_button_deduplication() {
+        let mut db = InputDatabase::new();
+        assert!(db.mouse_button_press(MouseButton::Left).is_some());
+        assert!(db.mouse_button_press(MouseButton::Left).is_none());
+        assert!(db.mouse_button_release(MouseButton::Left).is_some());
+        assert!(db.mouse_button_release(MouseButton::Left).is_none());
+    }
+
+    #[test]
+    fn synchronize_always_emits() {
+        let mut db = InputDatabase::new();
+        let locks = LockKeys::DEFAULT;
+        // Even with default state, synchronize always produces an event.
+        let op = db.synchronize_event(locks);
+        assert!(matches!(op, Operation::SynchronizeEvent(_)));
+        // Calling again still produces an event.
+        let op2 = db.synchronize_event(locks);
+        assert!(matches!(op2, Operation::SynchronizeEvent(_)));
+    }
+
+    #[test]
+    fn release_all_releases_held_keys_and_buttons() {
+        let mut db = InputDatabase::new();
+        let a = Scancode::new(0x1E, false);
+        let b = Scancode::new(0x30, false);
+        db.key_press(a);
+        db.key_press(b);
+        db.mouse_button_press(MouseButton::Left);
+
+        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); MAX_RELEASE_OPS];
+        let count = db.release_all(&mut ops);
+        assert_eq!(count, 3, "2 keys + 1 button = 3 releases");
+
+        // After release, everything is clear.
+        assert!(!db.is_key_pressed(a));
+        assert!(!db.is_key_pressed(b));
+        assert!(!db.is_mouse_button_pressed(MouseButton::Left));
+    }
+
+    #[test]
+    fn send_operation_maps_scancode_press() {
+        let op = Operation::KeyPressed(Scancode::new(0x1E, false));
+        let event = match op {
+            Operation::KeyPressed(sc) => build_scancode_event(sc, true),
+            _ => unreachable!(),
+        };
+        match event {
+            FastPathInputEvent::Scancode(e) => {
+                assert_eq!(e.key_code, 0x1E);
+                assert_eq!(e.event_flags & KBDFLAGS_RELEASE, 0);
+            }
+            _ => panic!("expected Scancode variant"),
+        }
+    }
+
+    #[test]
+    fn send_operation_maps_scancode_release() {
+        let op = Operation::KeyReleased(Scancode::new(0x1E, true));
+        let event = match op {
+            Operation::KeyReleased(sc) => build_scancode_event(sc, false),
+            _ => unreachable!(),
+        };
+        match event {
+            FastPathInputEvent::Scancode(e) => {
+                assert_eq!(e.key_code, 0x1E);
+                assert_ne!(e.event_flags & KBDFLAGS_RELEASE, 0);
+                assert_ne!(e.event_flags & KBDFLAGS_EXTENDED, 0);
+            }
+            _ => panic!("expected Scancode variant"),
+        }
+    }
+
+    #[test]
+    fn send_operation_maps_sync() {
+        let locks = LockKeys {
+            num_lock: true,
+            caps_lock: true,
+            ..LockKeys::DEFAULT
+        };
+        let event = build_sync_event(locks);
+        match event {
+            FastPathInputEvent::Sync(e) => assert_eq!(e.event_flags, 0x06),
+            _ => panic!("expected Sync variant"),
+        }
+    }
+
+    #[test]
+    fn state_queries_track_input() {
+        let mut db = InputDatabase::new();
+        let a = Scancode::new(0x1E, false);
+        assert!(!db.is_key_pressed(a));
+        db.key_press(a);
+        assert!(db.is_key_pressed(a));
+
+        assert!(!db.is_mouse_button_pressed(MouseButton::Right));
+        db.mouse_button_press(MouseButton::Right);
+        assert!(db.is_mouse_button_pressed(MouseButton::Right));
+
+        assert_eq!(db.mouse_position(), (0, 0));
+        db.mouse_move(320, 240);
+        assert_eq!(db.mouse_position(), (320, 240));
+    }
+
     // ── SVC processor wiring ──
 
     use justrdp_svc::{ChannelName, CompressionCondition, SvcMessage, SvcResult};
@@ -1603,6 +2023,7 @@ mod tests {
             last_server_name: StdString::from("localhost"),
             last_config: justrdp_connector::Config::builder("u", "p").build(),
             last_arc_cookie: cookie,
+            input_db: InputDatabase::new(),
         }
     }
 

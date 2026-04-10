@@ -184,6 +184,49 @@ impl RdstlsAuthenticationRequest {
         })
     }
 
+    /// Create a password-based auth request for a redirected connection.
+    ///
+    /// Unlike [`password()`](Self::password), the fields come directly from a
+    /// `ServerRedirectionPdu` and the password blob is opaque (PK-encrypted by
+    /// the Connection Broker). All byte slices are sent verbatim — no
+    /// UTF-16LE re-encoding or null-termination is applied.
+    ///
+    /// MS-RDPBCGR §2.2.17.2: RDSTLS Authentication Request with Password Credentials.
+    pub fn password_cookie(
+        redirection_guid: &[u8],
+        username: &[u8],
+        domain: &[u8],
+        password_blob: &[u8],
+    ) -> EncodeResult<Self> {
+        // Wire layout inside auth_data:
+        //   RedirectionGuidLength (u16) + RedirectionGuid
+        //   UserNameLength (u16) + UserName
+        //   DomainLength (u16) + Domain
+        //   PasswordLength (u16) + Password
+        let mut auth_data = Vec::new();
+
+        macro_rules! append_raw {
+            ($data:expr, $name:expr) => {{
+                let len = u16::try_from($data.len())
+                    .map_err(|_| justrdp_core::EncodeError::other($name, "field too long for u16"))?;
+                auth_data.extend_from_slice(&len.to_le_bytes());
+                auth_data.extend_from_slice($data);
+            }};
+        }
+
+        append_raw!(redirection_guid, "RDSTLS::redirectionGuid");
+        append_raw!(username, "RDSTLS::userName");
+        append_raw!(domain, "RDSTLS::domain");
+        append_raw!(password_blob, "RDSTLS::password");
+
+        Ok(Self {
+            data_type: RdstlsAuthDataType::Password as u16,
+            redirect_flags: None,
+            redirect_guid: None,
+            auth_data,
+        })
+    }
+
     /// Create an auth request with a Kerberos token for Remote Credential Guard.
     ///
     /// Uses `RedirectedAuthentication` (0x0003) data type.
@@ -448,5 +491,65 @@ mod tests {
         assert_eq!(decoded.redirect_flags, Some(0x01));
         assert_eq!(decoded.redirect_guid, Some(guid));
         assert_eq!(decoded.auth_data, cookie);
+    }
+
+    #[test]
+    fn auth_request_password_cookie_roundtrip() {
+        let guid = vec![0x42u8; 48]; // simulated Base64-GUID in UTF-16LE
+        let user = b"a\x00d\x00m\x00i\x00n\x00\x00\x00"; // "admin" UTF-16LE null-terminated
+        let domain = b"C\x00O\x00R\x00P\x00\x00\x00"; // "CORP"
+        let blob = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE]; // opaque PK-encrypted blob
+
+        let req = RdstlsAuthenticationRequest::password_cookie(
+            &guid, user, domain, &blob,
+        ).unwrap();
+
+        assert_eq!(req.data_type, RdstlsAuthDataType::Password as u16);
+
+        let size = req.size();
+        let mut buf = vec![0u8; size];
+        let mut cursor = WriteCursor::new(&mut buf);
+        req.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = RdstlsAuthenticationRequest::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.data_type, RdstlsAuthDataType::Password as u16);
+        assert_eq!(decoded.auth_data, req.auth_data, "auth_data must round-trip");
+    }
+
+    #[test]
+    fn password_cookie_preserves_opaque_blob_verbatim() {
+        // Verify the password blob is NOT re-encoded or null-terminated.
+        let guid = b"";
+        let user = b"";
+        let domain = b"";
+        let blob = vec![0x01, 0x02, 0x03];
+
+        let req = RdstlsAuthenticationRequest::password_cookie(
+            guid, user, domain, &blob,
+        ).unwrap();
+
+        // auth_data layout: 4 × (u16 len + data)
+        // guid: 0x0000
+        // user: 0x0000
+        // domain: 0x0000
+        // password: 0x0300 + [01, 02, 03]
+        let expected: Vec<u8> = vec![
+            0x00, 0x00, // guid len = 0
+            0x00, 0x00, // user len = 0
+            0x00, 0x00, // domain len = 0
+            0x03, 0x00, // password len = 3
+            0x01, 0x02, 0x03, // password blob verbatim
+        ];
+        assert_eq!(req.auth_data, expected);
+    }
+
+    #[test]
+    fn password_cookie_rejects_oversized_field() {
+        let huge = vec![0u8; 65537]; // > u16::MAX
+        let result = RdstlsAuthenticationRequest::password_cookie(
+            &huge, b"", b"", b"",
+        );
+        assert!(result.is_err(), "must reject field > u16::MAX");
     }
 }
