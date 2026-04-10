@@ -2,10 +2,11 @@
 
 //! [`RdpClient`] — high-level synchronous RDP client.
 //!
-//! The scaffold compiles end-to-end. As of M1, `connect()` drives the
-//! connector through the TLS upgrade point, performs the handshake via
-//! a user-supplied [`TlsUpgrader`], and then hands back an
-//! [`ConnectError::Unimplemented`] for the post-TLS pump (M2 onwards).
+//! As of M3, `connect()` runs the full connection sequence through to the
+//! `Connected` state and constructs an [`ActiveStage`] from the resulting
+//! channel IDs and share ID, so [`RdpClient::connect`] now returns `Ok`
+//! on success. The active-session pump ([`RdpClient::next_event`] and
+//! the input helpers) is still stubbed — see M4 in CHECKLIST.md.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use justrdp_connector::{ClientConnector, ClientConnectorState, Config, Sequence};
 use justrdp_core::WriteBuf;
 use justrdp_input::Scancode;
-use justrdp_session::ActiveStage;
+use justrdp_session::{ActiveStage, SessionConfig};
 use justrdp_tls::{AcceptAll, ReadWrite, RustlsUpgrader, ServerCertVerifier, TlsUpgrader};
 
 use crate::credssp::run_credssp_sequence;
@@ -85,7 +86,9 @@ pub struct RdpClient {
     session: Option<ActiveStage>,
     reconnect_policy: ReconnectPolicy,
     scratch: Vec<u8>,
-    /// Server public key captured at TLS upgrade (for CredSSP pubKeyAuth in M2).
+    /// Server public key captured at TLS upgrade. Consumed by CredSSP and
+    /// retained for M7 auto-reconnect (which may need to re-derive session
+    /// keys against the same certificate).
     #[allow(dead_code)]
     server_public_key: Option<Vec<u8>>,
 }
@@ -179,9 +182,14 @@ impl RdpClient {
                 | ClientConnectorState::CredsspPubKeyAuth
                 | ClientConnectorState::CredsspCredentials
         ) {
-            let server_pub_key = server_public_key.ok_or(ConnectError::Unimplemented(
-                "CredSSP requires a TLS upgrade to capture server_public_key",
-            ))?;
+            // Clone the SPKI for CredSSP; the original is retained on the
+            // RdpClient for potential reuse during M7 auto-reconnect.
+            let server_pub_key = server_public_key
+                .as_ref()
+                .cloned()
+                .ok_or(ConnectError::Unimplemented(
+                    "CredSSP requires a TLS upgrade to capture server_public_key",
+                ))?;
             // run_credssp_sequence handles all token I/O over the TLS stream;
             // the connector's Credssp* states are just internal markers and
             // are advanced (no-op transitions) below.
@@ -197,12 +205,32 @@ impl RdpClient {
             })?;
         }
 
-        // Phase 4 (M3+): BasicSettingsExchange → ChannelConnection →
-        // CapabilitiesExchange → ConnectionFinalization → Connected.
-        drop(transport);
-        Err(ConnectError::Unimplemented(
-            "post-CredSSP connection finalization pump (M3+)",
-        ))
+        // Phase 4 (M3): BasicSettingsExchange → ChannelConnection →
+        // SecureSettings → Licensing → Capabilities → Finalization → Connected.
+        // The connector owns all of this internally; we just pump bytes.
+        drive_until_state_change(&mut connector, &mut transport, |s| s.is_connected())?;
+
+        // The connector is now in `Connected { result }`. Convert the
+        // resulting channel layout into a SessionConfig so the caller can
+        // drive the active session via ActiveStage.
+        let result = connector.result().ok_or_else(|| {
+            ConnectError::Unimplemented("connector reached Connected but result() returned None")
+        })?;
+        let session_config = SessionConfig {
+            io_channel_id: result.io_channel_id,
+            user_channel_id: result.user_channel_id,
+            share_id: result.share_id,
+            channel_ids: result.channel_ids.clone(),
+        };
+        let session = ActiveStage::new(session_config);
+
+        Ok(Self {
+            transport: Some(transport),
+            session: Some(session),
+            reconnect_policy: ReconnectPolicy::disabled(),
+            scratch: Vec::new(),
+            server_public_key,
+        })
     }
 
     /// Set the [`ReconnectPolicy`] to consult when the session drops.

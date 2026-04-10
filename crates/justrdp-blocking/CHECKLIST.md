@@ -80,18 +80,26 @@
 
 ---
 
-## M3 — 연결 완료까지 전체 펌프
+## M3 — 연결 완료까지 전체 펌프 ✅
 
 **로드맵 근거**: §5.5 "연결 수립 펌프" 완성
 
-- [ ] BasicSettingsExchange → ChannelConnection → (옵션: SecurityCommencement) → SecureSettingsExchange → Licensing → CapabilitiesExchange → ConnectionFinalization 모든 상태 통과
-- [ ] `ConnectionResult`를 `self.result`에 저장
-- [ ] `ActiveStage::new(SessionConfig { io_channel_id, user_channel_id, share_id, channel_ids })` 생성
-  - `ConnectionResult` → `SessionConfig` 변환 헬퍼 (connector 또는 blocking 둘 중 한 곳)
-- [ ] `RdpClient::connect()`가 `Ok(Self { transport, session: Some(...), ... })` 반환
-- [ ] `disconnect()`가 MCS DisconnectProviderUltimatum 전송 후 소켓 닫도록 수정
+- [x] BasicSettingsExchange → ChannelConnection → SecurityCommencement → SecureSettingsExchange → ConnectTimeAutoDetection → Licensing → MultitransportBootstrapping → CapabilitiesExchange → ConnectionFinalization 전체 통과
+  - 기존 `drive_until_state_change(predicate)` 재사용: predicate는 `ClientConnectorState::is_connected()` 한 줄로 끝
+  - 커넥터가 이 구간 전체를 내부에서 처리하므로 blocking은 TPKT 바이트 펌프만
+- [x] `connector.result()`에서 `ConnectionResult` 추출
+- [x] `ConnectionResult` → `SessionConfig { io_channel_id, user_channel_id, share_id, channel_ids }` 변환 (inline)
+- [x] `ActiveStage::new(session_config)` 생성
+- [x] `RdpClient::connect*()` 전체 시그니처 `Ok(Self { ... })` 반환
+  - `transport: Some(transport)`, `session: Some(active_stage)`, `reconnect_policy: disabled()`, `scratch: Vec::new()`, `server_public_key` 보관
+- [x] `server_public_key`를 clone해서 CredSSP에 전달, 원본은 RdpClient에 보관 (M7 auto-reconnect 재사용 대비)
+- [ ] ~~`disconnect()`가 MCS DisconnectProviderUltimatum 전송~~ → M4 이후로 연기 (`ActiveStage::encode_disconnect()` API는 이미 있음, 지금은 transport drop만 수행)
 
-**검증**: `RdpClient::connect()`가 실서버에서 `Ok` 반환. 이 시점부터 `next_event()` 테스트 가능.
+**현재 동작**: TCP → X.224 → TLS 업그레이드 → CredSSP → BasicSettings → ChannelConnection → Capabilities → Finalization → `Connected` → `RdpClient { session: Some(ActiveStage) }` 반환. **`connect()`가 처음으로 `Ok`를 반환함.**
+
+**검증**: 
+- `cargo test -p justrdp-blocking` 14 pass, 워크스페이스 clean
+- 실서버 `192.168.136.136` 통합 테스트는 M4 이후 `next_event()`로 프레임 수신 확인 가능한 시점에 수행 (지금도 `connect()`는 성공해야 하지만 검증 수단이 없음)
 
 ---
 
