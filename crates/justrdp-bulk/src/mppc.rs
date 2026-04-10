@@ -39,6 +39,16 @@ pub const PACKET_COMPR_TYPE_64K: u8 = 0x1;
 const HISTORY_SIZE_8K: usize = 8_192;
 const HISTORY_SIZE_64K: usize = 65_536;
 
+// History sizes must be powers of two for the `& mask` wrapping trick.
+const _: () = assert!(
+    HISTORY_SIZE_8K.is_power_of_two() && HISTORY_SIZE_64K.is_power_of_two(),
+    "HISTORY_SIZE must be a power of two"
+);
+
+/// Maximum total decompressed output per `decompress()` call (16 MiB).
+/// Prevents memory exhaustion from crafted packets, consistent with NCRUSH.
+const MAX_MPPC_OUTPUT: usize = 16 * 1024 * 1024;
+
 /// Max LOM row count for 8K variant (MS-RDPBCGR §3.1.8.4.1.2.2).
 const LOM_MAX_ROWS_8K: u32 = 12;
 /// Max LOM row count for 64K variant (MS-RDPBCGR §3.1.8.4.2.2.2).
@@ -120,8 +130,13 @@ impl<'a> BitReader<'a> {
     }
 
     /// Peek at the top `n` bits without consuming them.
+    ///
+    /// # Panics
+    /// Panics if `n` is 0 or exceeds 32 (precondition for valid bit extraction).
+    #[track_caller]
     pub(crate) fn peek(&self, n: u32) -> u32 {
-        assert!(n > 0 && n <= 32);
+        debug_assert!(n > 0 && n <= 32, "peek({n}): n must be in 1..=32");
+        debug_assert!(self.bits_left >= n, "peek({n}): only {} bits in accumulator", self.bits_left);
         self.acc >> (32 - n)
     }
 
@@ -257,7 +272,7 @@ impl Mppc64kDecompressor {
         self.offset = 0;
     }
 
-    /// Decompress a packet. See [`Mppc8kDecompressor::decompress`] for details.
+    /// Decompress a packet. See [`Mppc8kDecompressor::decompress()`] for details.
     pub fn decompress(
         &mut self,
         src: &[u8],
@@ -340,6 +355,9 @@ fn decompress_bitstream<const HISTORY_SIZE: usize>(
             if *offset >= HISTORY_SIZE {
                 return Err(DecompressError::HistoryOverflow);
             }
+            if (*offset - start_offset) >= MAX_MPPC_OUTPUT {
+                return Err(DecompressError::HistoryOverflow);
+            }
             history[*offset] = val;
             *offset += 1;
         } else {
@@ -359,6 +377,9 @@ fn decompress_bitstream<const HISTORY_SIZE: usize>(
                 if *offset >= HISTORY_SIZE {
                     return Err(DecompressError::HistoryOverflow);
                 }
+                if (*offset - start_offset) >= MAX_MPPC_OUTPUT {
+                    return Err(DecompressError::HistoryOverflow);
+                }
                 history[*offset] = val;
                 *offset += 1;
             } else {
@@ -370,6 +391,9 @@ fn decompress_bitstream<const HISTORY_SIZE: usize>(
                 let length = decode_length_of_match::<HISTORY_SIZE>(&mut reader)?;
 
                 if *offset + length > HISTORY_SIZE {
+                    return Err(DecompressError::HistoryOverflow);
+                }
+                if (*offset - start_offset).saturating_add(length) > MAX_MPPC_OUTPUT {
                     return Err(DecompressError::HistoryOverflow);
                 }
 
@@ -541,7 +565,7 @@ fn decode_length_of_match<const HISTORY_SIZE: usize>(
         }
         reader.read_bits(1)?;
         ones += 1;
-        if ones >= max_rows as u32 {
+        if ones >= max_rows {
             // More consecutive 1-bits than the spec allows — malformed bitstream.
             return Err(DecompressError::TruncatedBitstream);
         }

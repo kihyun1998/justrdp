@@ -22,10 +22,7 @@ use crate::mppc::{
     PACKET_COMPR_TYPE_64K, PACKET_COMPR_TYPE_8K,
 };
 use crate::ncrush::{NcrushDecompressor, PACKET_COMPR_TYPE_RDP6};
-use crate::xcrush::XcrushDecompressor;
-
-/// XCRUSH compression type nibble (MS-RDPBCGR §2.2.8.1.1.1.2).
-const PACKET_COMPR_TYPE_RDP61: u8 = 0x03;
+use crate::xcrush::{XcrushDecompressor, PACKET_COMPR_TYPE_RDP61};
 
 /// Unified bulk decompressor for standard RDP compression algorithms.
 ///
@@ -57,6 +54,15 @@ impl BulkDecompressor {
             ncrush: NcrushDecompressor::new(),
             xcrush: XcrushDecompressor::new(),
         }
+    }
+
+    /// Reset all decompressor states (including XCRUSH L2).
+    /// Call after an error to restore a consistent state before reuse.
+    pub fn reset_all(&mut self) {
+        self.mppc8k.reset();
+        self.mppc64k.reset();
+        self.ncrush.reset();
+        self.xcrush.reset_all();
     }
 
     /// Decompress a PDU payload.

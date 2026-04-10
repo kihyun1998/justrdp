@@ -15,6 +15,9 @@ use alloc::vec::Vec;
 
 use crate::mppc::{DecompressError, Mppc64kDecompressor};
 
+/// XCRUSH compression type nibble (MS-RDPBCGR §2.2.8.1.1.1.2).
+pub const PACKET_COMPR_TYPE_RDP61: u8 = 0x03;
+
 // ── Level-1 compression flags (MS-RDPEGDI §2.2.2.4.1) ──
 
 /// MatchCount and MatchDetails are present; at least one match exists.
@@ -38,6 +41,10 @@ const L1_HISTORY_SIZE: usize = 2_000_000;
 /// Byte size of one RDP61_MATCH_DETAILS record (MS-RDPEGDI §2.2.2.4.1):
 /// MatchLength(u16) + MatchOutputOffset(u16) + MatchHistoryOffset(u32) = 8 bytes.
 const MATCH_DETAIL_SIZE: usize = 8;
+
+/// Maximum total decompressed output per `decompress()` call (16 MiB).
+/// Prevents memory exhaustion from crafted packets, consistent with NCRUSH/ZGFX.
+const MAX_XCRUSH_OUTPUT: usize = 16 * 1024 * 1024;
 
 // ── XcrushDecompressor ──
 
@@ -68,6 +75,13 @@ impl XcrushDecompressor {
     pub fn reset_l1(&mut self) {
         self.l1_history.fill(0);
         self.l1_history_offset = 0;
+    }
+
+    /// Reset both L1 and L2 decompressor states.
+    /// Use after an error to restore a fully consistent state.
+    pub fn reset_all(&mut self) {
+        self.reset_l1();
+        self.l2.reset();
     }
 
     /// Decompress an XCRUSH packet.
@@ -107,11 +121,15 @@ impl XcrushDecompressor {
         }
         let l1_input = if use_l2 { &l2_buf[..] } else { payload };
 
+        let output_limit = dst.len()
+            .checked_add(MAX_XCRUSH_OUTPUT)
+            .ok_or(DecompressError::HistoryOverflow)?;
+
         // Step 4: L1 decompression
         let result = if l1_flags & L1_NO_COMPRESSION != 0 {
-            self.copy_literals(l1_input, dst)
+            self.copy_literals(l1_input, dst, output_limit)
         } else if l1_flags & L1_COMPRESSED != 0 {
-            self.decompress_l1(l1_input, dst)
+            self.decompress_l1(l1_input, dst, output_limit)
         } else {
             // Neither L1_COMPRESSED nor L1_NO_COMPRESSION is set.
             // This is an unspecified protocol state — return an error
@@ -125,12 +143,20 @@ impl XcrushDecompressor {
     }
 
     /// Copy raw literals into L1 history and output.
-    fn copy_literals(&mut self, data: &[u8], dst: &mut Vec<u8>) -> Result<(), DecompressError> {
+    fn copy_literals(
+        &mut self,
+        data: &[u8],
+        dst: &mut Vec<u8>,
+        output_limit: usize,
+    ) -> Result<(), DecompressError> {
         if self
             .l1_history_offset
             .checked_add(data.len())
             .map_or(true, |end| end > L1_HISTORY_SIZE)
         {
+            return Err(DecompressError::HistoryOverflow);
+        }
+        if dst.len().saturating_add(data.len()) > output_limit {
             return Err(DecompressError::HistoryOverflow);
         }
         self.l1_history[self.l1_history_offset..self.l1_history_offset + data.len()]
@@ -145,6 +171,7 @@ impl XcrushDecompressor {
         &mut self,
         l1_input: &[u8],
         dst: &mut Vec<u8>,
+        output_limit: usize,
     ) -> Result<(), DecompressError> {
         // Read MatchCount (u16 LE) from first 2 bytes
         if l1_input.len() < 2 {
@@ -193,7 +220,7 @@ impl XcrushDecompressor {
                 if literals_offset + gap > literals.len() {
                     return Err(DecompressError::TruncatedBitstream);
                 }
-                self.copy_literals(&literals[literals_offset..literals_offset + gap], dst)?;
+                self.copy_literals(&literals[literals_offset..literals_offset + gap], dst, output_limit)?;
                 output_offset += gap;
                 literals_offset += gap;
             }
@@ -213,6 +240,11 @@ impl XcrushDecompressor {
                 return Err(DecompressError::HistoryOverflow);
             }
 
+            // Output size limit check
+            if dst.len().saturating_add(match_length) > output_limit {
+                return Err(DecompressError::HistoryOverflow);
+            }
+
             // Copy match from history (byte-by-byte for potential overlap)
             for j in 0..match_length {
                 let b = self.l1_history[match_history_offset + j];
@@ -225,7 +257,7 @@ impl XcrushDecompressor {
 
         // Copy remaining literals after last match
         if literals_offset < literals.len() {
-            self.copy_literals(&literals[literals_offset..], dst)?;
+            self.copy_literals(&literals[literals_offset..], dst, output_limit)?;
         }
 
         Ok(())
@@ -297,7 +329,9 @@ mod tests {
         ];
 
         let mut out = Vec::new();
-        dec.decompress_l1(l1_input, &mut out).unwrap();
+        // Calls private method directly to pre-stage L1 history without a full wire packet.
+        let limit = out.len() + MAX_XCRUSH_OUTPUT;
+        dec.decompress_l1(l1_input, &mut out, limit).unwrap();
 
         // Expected output: "klmnodefghijklabcdu"
         assert_eq!(out, b"klmnodefghijklabcdu");

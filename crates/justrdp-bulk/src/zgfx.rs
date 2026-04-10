@@ -37,7 +37,7 @@ const HISTORY_SIZE: usize = 2_500_000;
 /// Maximum uncompressed bytes per segment.
 const MAX_SEGMENT_SIZE: usize = 65_535;
 
-/// Maximum total decompressed output per `decompress()` call (64 MB).
+/// Maximum total decompressed output per `decompress()` call (16 MiB).
 ///
 /// This prevents memory exhaustion from crafted inputs: a multipart packet
 /// can otherwise declare up to 4 GB via its `uncompressedSize` field.
