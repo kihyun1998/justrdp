@@ -276,7 +276,6 @@ mod tests {
 
         let header = FastPathOutputHeader {
             action: 0,
-            num_events: 1,
             flags: 0,
             length: 0, // placeholder
         };
@@ -285,7 +284,6 @@ mod tests {
         let total_size = header.size() + update.size();
         let header = FastPathOutputHeader {
             action: 0,
-            num_events: 1,
             flags: 0,
             length: total_size as u16,
         };
@@ -325,14 +323,12 @@ mod tests {
 
         let header = FastPathOutputHeader {
             action: 0,
-            num_events: 1,
             flags: 0,
             length: 0,
         };
         let total_size = header.size() + update.size();
         let header = FastPathOutputHeader {
             action: 0,
-            num_events: 1,
             flags: 0,
             length: total_size as u16,
         };
@@ -365,12 +361,11 @@ mod tests {
             };
 
             let header = FastPathOutputHeader {
-                action: 0, num_events: 1, flags: 0, length: 0,
+                action: 0, flags: 0, length: 0,
             };
             let total_size = header.size() + update.size();
             let header = FastPathOutputHeader {
-                action: 0, num_events: 1, flags: 0,
-                length: total_size as u16,
+                action: 0, flags: 0, length: total_size as u16,
             };
 
             let mut frame = vec![0u8; total_size];
@@ -464,12 +459,11 @@ mod tests {
         };
 
         let header = FastPathOutputHeader {
-            action: 0, num_events: 1, flags: 0, length: 0,
+            action: 0, flags: 0, length: 0,
         };
         let total_size = header.size() + update.size();
         let header = FastPathOutputHeader {
-            action: 0, num_events: 1, flags: 0,
-            length: total_size as u16,
+            action: 0, flags: 0, length: total_size as u16,
         };
 
         let mut frame = vec![0u8; total_size];

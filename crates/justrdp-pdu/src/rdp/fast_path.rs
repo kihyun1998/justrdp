@@ -103,18 +103,28 @@ impl Fragmentation {
 
 /// Fast-Path Output Header (first byte + length).
 ///
+/// MS-RDPBCGR 2.2.9.1.2 (Server Fast-Path Update PDU). Bit layout:
+///
 /// ```text
-/// ┌──────────────────────────────────────────┬─────────────┐
-/// │ byte 0: action(2) | numEvents(4) | flags(2)           │
-/// │ byte 1-2: length (1 or 2 bytes)                        │
-/// └──────────────────────────────────────────┴─────────────┘
+/// ┌──────────────────────────────────────────────────┐
+/// │ byte 0: action(2) | reserved(4) | flags(2)       │
+/// │ byte 1: length1                                  │
+/// │ byte 2: length2 (optional, when length1 has high bit set) │
+/// └──────────────────────────────────────────────────┘
 /// ```
+///
+/// **Important:** Unlike the *input* header (`FastPathInputHeader`), the
+/// output header's middle 4 bits are **reserved** — they are not a
+/// `numEvents` field, and there is no extended-byte mechanism following
+/// the length. Server Fast-Path Update PDUs are length-delimited and the
+/// number of inner updates is determined by parsing until `length` bytes
+/// are exhausted (per MS-RDPBCGR 2.2.9.1.2 Remarks). Reading bits 2-5 as
+/// `numEvents` and chasing an extended byte misaligns the cursor by one
+/// byte and causes garbage parsing of every subsequent field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FastPathOutputHeader {
     /// Action field (bits 0-1), should be FASTPATH_OUTPUT_ACTION_FASTPATH.
     pub action: u8,
-    /// Number of update PDUs (bits 2-5).
-    pub num_events: u8,
     /// Encryption flags (bits 6-7).
     pub flags: u8,
     /// Total length of the fast-path output PDU.
@@ -123,26 +133,18 @@ pub struct FastPathOutputHeader {
 
 impl Encode for FastPathOutputHeader {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        // MS-RDPBCGR 2.2.9.1.2: if num_events doesn't fit in 4 bits (1..15),
-        // encode 0 in the 4-bit slot and write an extended byte after the length.
-        // num_events == 0 also uses extended byte path since 0 in the slot signals "extended".
-        let use_extended = self.num_events > 15 || self.num_events == 0;
-        let hdr_num = if use_extended { 0 } else { self.num_events };
-        let byte0 = (self.action & 0x03)
-            | ((hdr_num & 0x0F) << 2)
-            | ((self.flags & 0x03) << 6);
+        // Bits 2-5 are reserved per spec; always emit zero.
+        let byte0 = (self.action & 0x03) | ((self.flags & 0x03) << 6);
         dst.write_u8(byte0, "FastPathOutputHeader::byte0")?;
         encode_length(dst, self.length)?;
-        if use_extended {
-            dst.write_u8(self.num_events, "FastPathOutputHeader::numEventsExt")?;
-        }
         Ok(())
     }
 
-    fn name(&self) -> &'static str { "FastPathOutputHeader" }
+    fn name(&self) -> &'static str {
+        "FastPathOutputHeader"
+    }
     fn size(&self) -> usize {
-        let use_extended = self.num_events > 15 || self.num_events == 0;
-        1 + length_field_size(self.length) + if use_extended { 1 } else { 0 }
+        1 + length_field_size(self.length)
     }
 }
 
@@ -150,14 +152,14 @@ impl<'de> Decode<'de> for FastPathOutputHeader {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let byte0 = src.read_u8("FastPathOutputHeader::byte0")?;
         let action = byte0 & 0x03;
-        let mut num_events = (byte0 >> 2) & 0x0F;
+        // bits 2-5 reserved per MS-RDPBCGR 2.2.9.1.2 — ignore.
         let flags = (byte0 >> 6) & 0x03;
         let length = decode_length(src)?;
-        // MS-RDPBCGR 2.2.9.1.2: numEvents == 0 means extended byte follows the length field
-        if num_events == 0 {
-            num_events = src.read_u8("FastPathOutputHeader::numEventsExt")?;
-        }
-        Ok(Self { action, num_events, flags, length })
+        Ok(Self {
+            action,
+            flags,
+            length,
+        })
     }
 }
 
@@ -743,7 +745,6 @@ mod tests {
     fn fast_path_output_header_roundtrip_short_length() {
         let hdr = FastPathOutputHeader {
             action: FASTPATH_OUTPUT_ACTION_FASTPATH,
-            num_events: 3,
             flags: 0,
             length: 50,
         };
@@ -758,7 +759,6 @@ mod tests {
     fn fast_path_output_header_roundtrip_long_length() {
         let hdr = FastPathOutputHeader {
             action: FASTPATH_OUTPUT_ACTION_FASTPATH,
-            num_events: 5,
             flags: FASTPATH_OUTPUT_ENCRYPTED,
             length: 300,
         };
@@ -767,6 +767,34 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         let decoded = FastPathOutputHeader::decode(&mut cursor).unwrap();
         assert_eq!(decoded, hdr);
+    }
+
+    #[test]
+    fn fast_path_output_header_decodes_zero_reserved_without_extended_byte() {
+        // Regression test: real Windows servers send the reserved 4 bits
+        // in the output header as zero. Earlier versions of this decoder
+        // misread the reserved bits as a numEvents field and tried to
+        // consume an extended-byte after the length, shifting the cursor
+        // by one byte and producing garbage decodes for the inner update
+        // structures (e.g. ERRINFO_FastPathOutputUpdate::updateData
+        // NotEnoughBytes against a real RDP server).
+        //
+        // Wire bytes from a real Windows RDS server (192.168.136.136):
+        //   00 9e ca 01 c4 1e 01 00 ...
+        //   ^^                        action=0, reserved=0, flags=0
+        //      ^^ ^^                  length = 0x9e/0xca two-byte form = 7882
+        //            ^^               first update header (Bitmap, frag=0, comp=0)
+        //               ^^ ^^         first update size LE u16 = 0x1ec4 = 7876
+        //                     ...     7876 bytes of bitmap update data
+        let bytes: [u8; 3] = [0x00, 0x9e, 0xca];
+        let mut cursor = ReadCursor::new(&bytes);
+        let hdr = FastPathOutputHeader::decode(&mut cursor).unwrap();
+        assert_eq!(hdr.action, 0);
+        assert_eq!(hdr.flags, 0);
+        assert_eq!(hdr.length, 7882);
+        // The cursor must be positioned exactly after the length field —
+        // no extended numEvents byte was consumed.
+        assert_eq!(cursor.pos(), 3);
     }
 
     // ── Input Header roundtrip ──
@@ -1020,30 +1048,27 @@ mod tests {
     }
 
     #[test]
-    fn output_header_num_events_zero_roundtrip() {
-        // num_events == 0 must use extended byte path
+    fn output_header_reserved_bits_round_trip_as_zero() {
+        // The output header has no num_events field — bits 2-5 are reserved
+        // and MUST be encoded as zero per MS-RDPBCGR 2.2.9.1.2.
         let hdr = FastPathOutputHeader {
             action: 0,
-            num_events: 0,
             flags: 0,
             length: 10,
         };
         let size = hdr.size();
-        // Extended byte should be present: 1 (byte0) + 1 (length<0x80) + 1 (ext) = 3
-        assert_eq!(size, 3);
+        // No extended byte: 1 (byte0) + 1 (length<0x80) = 2
+        assert_eq!(size, 2);
 
         let mut buf = vec![0u8; size];
         let mut cursor = WriteCursor::new(&mut buf);
         hdr.encode(&mut cursor).unwrap();
 
-        // 4-bit field in byte0 should be 0
+        // Reserved 4-bit slot in byte0 must be zero.
         assert_eq!((buf[0] >> 2) & 0x0F, 0);
-        // Extended byte (last byte) should be 0
-        assert_eq!(buf[2], 0);
 
         let mut cursor = ReadCursor::new(&buf);
         let decoded = FastPathOutputHeader::decode(&mut cursor).unwrap();
-        assert_eq!(decoded.num_events, 0);
         assert_eq!(decoded.length, 10);
     }
 
