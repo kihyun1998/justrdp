@@ -22,6 +22,10 @@ pub enum ConnectError {
     UnexpectedEof,
     /// Hit the runtime-defined read limit while framing a PDU (possible DoS).
     FrameTooLarge(usize),
+    /// SVC channel registration or initial `start_all` failed
+    /// (duplicate channel name, max channels exceeded, or processor
+    /// returned an encode error from `start()`).
+    ChannelSetup(String),
     /// Functionality not yet implemented in this scaffold.
     Unimplemented(&'static str),
 }
@@ -34,6 +38,7 @@ impl fmt::Display for ConnectError {
             Self::Connector(e) => write!(f, "connector error: {e:?}"),
             Self::UnexpectedEof => f.write_str("server closed connection during handshake"),
             Self::FrameTooLarge(n) => write!(f, "PDU frame too large: {n} bytes"),
+            Self::ChannelSetup(msg) => write!(f, "SVC channel setup failed: {msg}"),
             Self::Unimplemented(what) => write!(f, "not implemented: {what}"),
         }
     }

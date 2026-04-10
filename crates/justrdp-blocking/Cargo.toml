@@ -20,6 +20,7 @@ justrdp-core = { workspace = true, features = ["alloc", "std"] }
 justrdp-pdu.workspace = true
 justrdp-connector.workspace = true
 justrdp-session.workspace = true
+justrdp-svc.workspace = true
 justrdp-input.workspace = true
 justrdp-tls.workspace = true
 getrandom = "0.2"

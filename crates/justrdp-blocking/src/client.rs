@@ -21,6 +21,7 @@ use justrdp_pdu::rdp::fast_path::{
 };
 use justrdp_pdu::tpkt::TpktHint;
 use justrdp_session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionConfig};
+use justrdp_svc::{StaticChannelSet as SvcChannelSet, SvcProcessor};
 use justrdp_tls::{AcceptAll, ReadWrite, RustlsUpgrader, ServerCertVerifier, TlsUpgrader};
 
 // MS-RDPBCGR 2.2.8.1.2.2.1 keyboard event flags (5-bit field).
@@ -109,6 +110,15 @@ pub struct RdpClient {
     /// Set once the session has reached a terminal state. Further calls
     /// to [`next_event`] return `Ok(None)` without touching the network.
     disconnected: bool,
+    /// Registered SVC processors. Populated at connect time from the
+    /// `processors` argument and consulted in [`Self::read_one_frame`]
+    /// when an MCS channel data PDU arrives. Empty if the caller did not
+    /// register any processors — in which case `RdpEvent::ChannelData`
+    /// is emitted as a raw passthrough.
+    svc_set: SvcChannelSet,
+    /// MCS user channel ID, captured from the connection result. Needed
+    /// to wrap outgoing SVC frames with `SendDataRequest`.
+    user_channel_id: u16,
     /// Server public key captured at TLS upgrade. Consumed by CredSSP and
     /// retained for M7 auto-reconnect (which may need to re-derive session
     /// keys against the same certificate).
@@ -118,7 +128,8 @@ pub struct RdpClient {
 
 impl RdpClient {
     /// Perform the full connection sequence using the default
-    /// [`RustlsUpgrader`] with [`AcceptAll`] (mstsc.exe-like behavior).
+    /// [`RustlsUpgrader`] with [`AcceptAll`] (mstsc.exe-like behavior)
+    /// and no SVC processors.
     pub fn connect<A: ToSocketAddrs>(
         server: A,
         server_name: &str,
@@ -139,18 +150,38 @@ impl RdpClient {
         verifier: Arc<dyn ServerCertVerifier>,
     ) -> Result<Self, ConnectError> {
         let upgrader = RustlsUpgrader::with_verifier(verifier);
-        Self::connect_with_upgrader(server, server_name, config, upgrader)
+        Self::connect_with_upgrader(server, server_name, config, upgrader, Vec::new())
     }
 
-    /// Perform the connection sequence using an arbitrary [`TlsUpgrader`].
+    /// Perform the connection sequence with a list of SVC processors.
     ///
-    /// Used by tests and by callers who want full control over the TLS stack
-    /// (e.g. `native-tls` backend).
+    /// Channel names declared by each processor must also be present in
+    /// `config.static_channels` so the connector advertises them during
+    /// the BasicSettingsExchange — otherwise the server will not allocate
+    /// MCS channel IDs and the processors will be silently ignored.
+    ///
+    /// To use Dynamic Virtual Channels, wrap your `DvcProcessor` instances
+    /// in a [`DrdynvcClient`](justrdp_dvc::DrdynvcClient) and box that as
+    /// the `drdynvc` SVC processor.
+    pub fn connect_with_processors<A: ToSocketAddrs>(
+        server: A,
+        server_name: &str,
+        config: Config,
+        processors: Vec<Box<dyn SvcProcessor>>,
+    ) -> Result<Self, ConnectError> {
+        let upgrader = RustlsUpgrader::with_verifier(Arc::new(AcceptAll));
+        Self::connect_with_upgrader(server, server_name, config, upgrader, processors)
+    }
+
+    /// Perform the connection sequence using an arbitrary [`TlsUpgrader`]
+    /// and a list of SVC processors. Used by tests and by callers who want
+    /// full control over the TLS stack (e.g. `native-tls` backend).
     pub fn connect_with_upgrader<A, U>(
         server: A,
         server_name: &str,
         config: Config,
         upgrader: U,
+        processors: Vec<Box<dyn SvcProcessor>>,
     ) -> Result<Self, ConnectError>
     where
         A: ToSocketAddrs,
@@ -239,13 +270,42 @@ impl RdpClient {
         let result = connector.result().ok_or_else(|| {
             ConnectError::Unimplemented("connector reached Connected but result() returned None")
         })?;
+        let user_channel_id = result.user_channel_id;
         let session_config = SessionConfig {
             io_channel_id: result.io_channel_id,
             user_channel_id: result.user_channel_id,
             share_id: result.share_id,
             channel_ids: result.channel_ids.clone(),
         };
+        let channel_ids = result.channel_ids.clone();
         let session = ActiveStage::new(session_config);
+
+        // Wire SVC processors. Each processor declares a channel_name();
+        // assign_ids matches that against the connector's negotiated MCS
+        // channel IDs. Processors whose channel name was not advertised
+        // in config.static_channels (and therefore not allocated by the
+        // server) get no ID and are silently inert.
+        let mut svc_set = SvcChannelSet::new();
+        for processor in processors {
+            svc_set
+                .insert(processor)
+                .map_err(|e| ConnectError::ChannelSetup(format!("{e:?}")))?;
+        }
+        svc_set.assign_ids(&channel_ids);
+
+        // Run start_all to collect any initial frames each processor wants
+        // to send (e.g. CLIPRDR Capability Request, RDPDR Server Announce
+        // Reply). The frames are already MCS+TPKT wrapped so they go
+        // straight onto the wire.
+        let start_results = svc_set
+            .start_all(user_channel_id)
+            .map_err(|e| ConnectError::ChannelSetup(format!("{e:?}")))?;
+        for (_chan_id, frames) in start_results {
+            for frame in frames {
+                transport.write_all(&frame).map_err(ConnectError::Tcp)?;
+            }
+        }
+        transport.flush().map_err(ConnectError::Tcp)?;
 
         Ok(Self {
             transport: Some(transport),
@@ -254,6 +314,8 @@ impl RdpClient {
             scratch: Vec::new(),
             pending_events: VecDeque::new(),
             disconnected: false,
+            svc_set,
+            user_channel_id,
             server_public_key,
         })
     }
@@ -291,11 +353,19 @@ impl RdpClient {
     /// push every resulting event onto `pending_events`. Frames produced
     /// by `ActiveStageOutput::ResponseFrame` are written immediately and
     /// never queued.
+    ///
+    /// `ChannelData` PDUs are routed through the SVC processor set: if a
+    /// registered processor handles the channel, its response frames are
+    /// written immediately and no `RdpEvent::ChannelData` is emitted. If
+    /// no processor matches, the raw bytes are surfaced as
+    /// `RdpEvent::ChannelData` for the caller to handle directly.
     fn read_one_frame(&mut self) -> Result<(), RuntimeError> {
         // Local accumulators so the borrows on self.transport / self.session
         // can be released before we touch self.pending_events / self.disconnected.
         let mut local_events: Vec<RdpEvent> = Vec::new();
         let mut should_disconnect = false;
+        let mut svc_responses: Vec<Vec<u8>> = Vec::new();
+        let user_channel_id = self.user_channel_id;
 
         {
             let transport = self
@@ -339,7 +409,28 @@ impl RdpClient {
                         local_events.push(RdpEvent::ServerMonitorLayout { monitors });
                     }
                     ActiveStageOutput::ChannelData { channel_id, data } => {
-                        local_events.push(RdpEvent::ChannelData { channel_id, data });
+                        // Try to dispatch to a registered SVC processor
+                        // first. If one matches, capture its response
+                        // frames for write-back below; the raw event is
+                        // suppressed because the processor "owns" the
+                        // channel. If no processor matches, fall through
+                        // to a raw passthrough event so callers can still
+                        // observe traffic on un-registered channels.
+                        let handled = self.svc_set.get_by_channel_id(channel_id).is_some();
+                        if handled {
+                            let frames = self
+                                .svc_set
+                                .process_incoming(channel_id, &data, user_channel_id)
+                                .map_err(|e| {
+                                    RuntimeError::Io(io::Error::new(
+                                        io::ErrorKind::Other,
+                                        format!("SVC processor failed: {e:?}"),
+                                    ))
+                                })?;
+                            svc_responses.extend(frames);
+                        } else {
+                            local_events.push(RdpEvent::ChannelData { channel_id, data });
+                        }
                     }
                     ActiveStageOutput::KeyboardIndicators { led_flags } => {
                         local_events.push(RdpEvent::KeyboardIndicators {
@@ -400,6 +491,20 @@ impl RdpClient {
                     }
                 }
             }
+        }
+
+        // Flush any SVC processor responses produced by the loop above.
+        // We do this *after* the local-borrow block so the borrow on
+        // self.transport from read_pdu() has been released.
+        if !svc_responses.is_empty() {
+            let transport = self
+                .transport
+                .as_mut()
+                .ok_or(RuntimeError::Disconnected)?;
+            for frame in svc_responses {
+                transport.write_all(&frame).map_err(RuntimeError::Io)?;
+            }
+            transport.flush().map_err(RuntimeError::Io)?;
         }
 
         self.pending_events.extend(local_events);
@@ -757,5 +862,82 @@ mod tests {
     fn mouse_button_x1_x2_return_none() {
         assert!(build_mouse_button_event(MouseButton::X1, true, 0, 0).is_none());
         assert!(build_mouse_button_event(MouseButton::X2, false, 0, 0).is_none());
+    }
+
+    // ── SVC processor wiring ──
+
+    use justrdp_svc::{ChannelName, CompressionCondition, SvcMessage, SvcResult};
+    use std::string::String as StdString;
+
+    /// Minimal SvcProcessor that records every payload it sees and echoes
+    /// `b"reply"` back. Used to verify M6's dispatch contract without
+    /// standing up a real connection.
+    #[derive(Debug, Default)]
+    struct RecordingProcessor {
+        seen: Vec<Vec<u8>>,
+    }
+
+    impl justrdp_core::AsAny for RecordingProcessor {
+        fn as_any(&self) -> &dyn core::any::Any { self }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any { self }
+    }
+
+    impl SvcProcessor for RecordingProcessor {
+        fn channel_name(&self) -> ChannelName {
+            ChannelName::new(b"echo")
+        }
+        fn start(&mut self) -> SvcResult<Vec<SvcMessage>> {
+            Ok(Vec::new())
+        }
+        fn process(&mut self, payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
+            self.seen.push(payload.to_vec());
+            Ok(vec![SvcMessage::new(b"reply".to_vec())])
+        }
+        fn compression_condition(&self) -> CompressionCondition {
+            CompressionCondition::Never
+        }
+    }
+
+    /// Build a single-chunk channel data payload that the SVC framework
+    /// will hand to its processor as `b"hello"`.
+    fn channel_data_payload(payload: &[u8]) -> Vec<u8> {
+        use justrdp_pdu::rdp::svc::{CHANNEL_FLAG_FIRST, CHANNEL_FLAG_LAST};
+        let total = payload.len() as u32;
+        let flags = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST;
+        let mut buf = Vec::with_capacity(8 + payload.len());
+        buf.extend_from_slice(&total.to_le_bytes());
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn svc_set_dispatches_to_registered_processor() {
+        // Replicate the M6 wiring path on a bare SvcChannelSet so we can
+        // assert the contract without a live RdpClient.
+        let mut set = SvcChannelSet::new();
+        set.insert(Box::new(RecordingProcessor::default())).unwrap();
+        set.assign_ids(&[(StdString::from("echo"), 1004)]);
+
+        let raw = channel_data_payload(b"hello");
+        let response_frames = set.process_incoming(1004, &raw, 1007).unwrap();
+        // Recording processor returns one SvcMessage; framework wraps it
+        // as a single MCS frame ready for the wire.
+        assert_eq!(response_frames.len(), 1);
+    }
+
+    #[test]
+    fn svc_set_unknown_channel_returns_no_frames() {
+        // M6's read_one_frame path checks `get_by_channel_id().is_some()`
+        // before calling process_incoming. This test guards the underlying
+        // SvcChannelSet behavior we rely on: if the channel ID is not
+        // registered, get_by_channel_id returns None and the raw passthrough
+        // path triggers in client.rs.
+        let mut set = SvcChannelSet::new();
+        set.insert(Box::new(RecordingProcessor::default())).unwrap();
+        set.assign_ids(&[(StdString::from("echo"), 1004)]);
+
+        assert!(set.get_by_channel_id(9999).is_none());
+        assert!(set.get_by_channel_id(1004).is_some());
     }
 }

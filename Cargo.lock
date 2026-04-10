@@ -317,6 +317,7 @@ dependencies = [
  "justrdp-input",
  "justrdp-pdu",
  "justrdp-session",
+ "justrdp-svc",
  "justrdp-tls",
 ]
 

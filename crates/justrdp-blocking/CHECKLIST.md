@@ -171,14 +171,33 @@
 
 ---
 
-## M6 — (선택) SVC/DVC 라우팅
+## M6 — SVC/DVC 라우팅 ✅
 
-MVP에서는 생략 가능. 필요해질 때 추가.
+**핵심 발견**: `justrdp-svc::StaticChannelSet`이 이미 모든 dispatch 로직을 갖추고 있음 (insert / assign_ids / start_all / process_incoming). DVC는 별도 작업 불필요 — `DrdynvcClient` 자체가 `SvcProcessor` 구현이라 사용자가 그걸 박싱해서 SVC로 등록하면 자동으로 DVC가 동작함.
 
-- [ ] `RdpClient::register_svc(name: &str, processor: Box<dyn SvcProcessor>)`
-- [ ] `RdpClient::register_dvc(...)`
-- [ ] `ChannelData` 이벤트를 processor로 라우팅 (이벤트는 raw 패스스루 유지)
-- [ ] processor 출력 PDU를 `transport.write_all()`로 전송
+- [x] `justrdp-svc` 의존성 추가
+- [x] `RdpClient`에 `svc_set: SvcChannelSet` + `user_channel_id: u16` 필드
+- [x] **`ConnectError::ChannelSetup(String)` 신규 variant** — 채널 등록 / start_all 실패 보고용
+- [x] `connect_with_upgrader` 시그니처에 `processors: Vec<Box<dyn SvcProcessor>>` 추가
+  - 기존 `connect`, `connect_with_verifier`는 `Vec::new()` forward
+- [x] **신규 `connect_with_processors(server, name, config, processors)`** convenience 메서드
+- [x] 연결 직후 시퀀스:
+  1. `svc_set.insert(processor)` 모두 등록 (실패 시 ChannelSetup 에러)
+  2. `svc_set.assign_ids(&result.channel_ids)` — 서버가 할당한 MCS ID와 매칭
+  3. `svc_set.start_all(user_channel_id)` — 각 processor의 초기 메시지 (CLIPRDR Capability Request, RDPDR Server Announce Reply 등) 수집
+  4. 반환된 frame들 (이미 MCS+TPKT 래핑됨) 즉시 transport.write_all
+- [x] `read_one_frame`의 `ChannelData { channel_id, data }` 분기:
+  - `svc_set.get_by_channel_id(channel_id).is_some()` → 등록된 processor 있음 → `process_incoming`로 dispatch, 응답 frame들 전송, **`RdpEvent::ChannelData` emission 안 함**
+  - 없으면 → 기존대로 raw passthrough 이벤트
+- [x] 보로우 체커 우회: `svc_responses: Vec<Vec<u8>>` local accumulator → 내부 borrow block 종료 후 transport 재취득해서 flush
+- [x] DVC 지원: 사용자가 `DrdynvcClient::new()` → `register(dvc_processor)` → `Box::new(drdynvc)` → `connect_with_processors(...)` 패턴으로 자동 동작
+- [x] 단위 테스트 2개 추가:
+  - `RecordingProcessor` (echo SVC) → `SvcChannelSet`이 dispatch 하고 응답 frame 1개 반환 검증
+  - `get_by_channel_id` 미등록 ID → None (raw passthrough 경로 보장)
+
+**현재 동작**: clipboard, drive redirection, audio, RemoteApp 등 모든 SVC/DVC 채널을 사용자가 등록하고 사용 가능. M4의 raw `ChannelData` 패스스루는 처리되지 않은 채널에만 적용.
+
+**검증**: `cargo test -p justrdp-blocking` 27 pass (M5 25 + 신규 2), 워크스페이스 clean.
 
 ---
 
