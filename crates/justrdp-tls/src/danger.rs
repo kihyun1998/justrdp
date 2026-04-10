@@ -12,11 +12,12 @@ pub(crate) mod rustls_verifier {
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 
-    /// A certificate verifier that accepts any server certificate.
+    /// Signature-verification pass-through for rustls.
     ///
-    /// This is appropriate for RDP connections where the server typically
-    /// uses a self-signed certificate. The connection is still encrypted,
-    /// but server identity is not verified.
+    /// `verify_server_cert` is intentionally **not** used — [`VerifierBridge`]
+    /// owns the certificate trust decision and delegates only TLS signature
+    /// verification here. If `verify_server_cert` is called, it returns an
+    /// error to surface the unexpected code path immediately.
     #[derive(Debug)]
     pub struct DangerousNoVerify;
 
@@ -29,7 +30,11 @@ pub(crate) mod rustls_verifier {
             _ocsp_response: &[u8],
             _now: UnixTime,
         ) -> Result<ServerCertVerified, Error> {
-            Ok(ServerCertVerified::assertion())
+            // This should never be called; VerifierBridge dispatches
+            // trust decisions through the user's ServerCertVerifier.
+            Err(Error::General(
+                "DangerousNoVerify::verify_server_cert called unexpectedly".into(),
+            ))
         }
 
         fn verify_tls12_signature(
@@ -64,6 +69,33 @@ pub(crate) mod rustls_verifier {
                 SignatureScheme::ED25519,
                 SignatureScheme::ED448,
             ]
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use rustls::pki_types::CertificateDer;
+
+        #[test]
+        fn verify_server_cert_returns_error() {
+            let v = DangerousNoVerify;
+            let cert = CertificateDer::from(vec![0u8; 10]);
+            let name = ServerName::try_from("example.com").unwrap();
+            let result = v.verify_server_cert(&cert, &[], &name, &[], UnixTime::now());
+            assert!(result.is_err(), "verify_server_cert must return error — VerifierBridge owns trust decisions");
+        }
+
+        // Note: verify_tls12_signature and verify_tls13_signature cannot be
+        // unit-tested in isolation because DigitallySignedStruct::new is private.
+        // They are exercised indirectly through VerifierBridge in rustls_backend tests.
+
+        #[test]
+        fn supported_verify_schemes_is_non_empty() {
+            let v = DangerousNoVerify;
+            let schemes = v.supported_verify_schemes();
+            assert!(!schemes.is_empty(), "must advertise at least one scheme");
+            assert!(schemes.contains(&SignatureScheme::RSA_PKCS1_SHA256));
         }
     }
 }

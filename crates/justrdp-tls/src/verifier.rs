@@ -20,7 +20,9 @@ pub enum CertDecision {
     /// Trust this certificate only for the current session.
     ///
     /// The TLS handshake proceeds identically to `Accept`; the distinction is
-    /// semantic — callers that persist trust should not persist `AcceptOnce`.
+    /// a **semantic marker only** — this crate does not track sessions or enforce
+    /// the "once" constraint. It is the caller's responsibility not to persist
+    /// an `AcceptOnce` result across sessions.
     AcceptOnce,
 }
 
@@ -200,8 +202,10 @@ mod tests {
         fn der_len(len: usize) -> Vec<u8> {
             if len < 0x80 {
                 vec![len as u8]
-            } else {
+            } else if len < 0x100 {
                 vec![0x81, len as u8]
+            } else {
+                vec![0x82, (len >> 8) as u8, len as u8]
             }
         }
         fn seq(content: &[u8]) -> Vec<u8> {

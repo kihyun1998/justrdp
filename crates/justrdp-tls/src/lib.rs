@@ -103,6 +103,7 @@ pub use native_tls_backend::NativeTlsUpgrader;
 // ── Shared constants ──
 
 pub(crate) const ERR_CERT_DER_PARSE: &str = "failed to parse certificate DER";
+pub(crate) const ERR_CERT_REJECTED: &str = "certificate rejected by ServerCertVerifier";
 
 // ── Shared X.509 DER parsing ──
 
@@ -129,32 +130,46 @@ pub(crate) const ERR_CERT_DER_PARSE: &str = "failed to parse certificate DER";
 pub fn extract_spki_from_cert_der(cert: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 0;
 
-    // Outer SEQUENCE (Certificate)
-    let (_, _cert_end) = der_read_tag_length(cert, &mut pos)?;
+    // Outer SEQUENCE (Certificate) — RFC 5280 §4.1
+    let (_, cert_end) = der_read_tag_length(cert, &mut pos)?;
+    if cert_end > cert.len() {
+        return None;
+    }
 
-    // TBSCertificate SEQUENCE
-    let (_, _tbs_end) = der_read_tag_length(cert, &mut pos)?;
+    // TBSCertificate SEQUENCE — RFC 5280 §4.1.2
+    let (_, tbs_end) = der_read_tag_length(cert, &mut pos)?;
+    if tbs_end > cert_end {
+        return None;
+    }
 
-    // version [0] EXPLICIT (optional, skip if present)
-    if pos < cert.len() && cert[pos] == 0xA0 {
+    // version [0] EXPLICIT (optional, skip if present) — RFC 5280 §4.1.2.1
+    if pos < tbs_end && cert[pos] == 0xA0 {
         let (_, _) = der_read_tag_length(cert, &mut pos)?;
         der_skip_tlv(cert, &mut pos)?;
     }
 
-    // serialNumber - skip
+    // serialNumber — RFC 5280 §4.1.2.2
     der_skip_tlv(cert, &mut pos)?;
-    // signature AlgorithmIdentifier - skip
+    if pos > tbs_end { return None; }
+    // signature AlgorithmIdentifier — RFC 5280 §4.1.2.3
     der_skip_tlv(cert, &mut pos)?;
-    // issuer Name - skip
+    if pos > tbs_end { return None; }
+    // issuer Name — RFC 5280 §4.1.2.4
     der_skip_tlv(cert, &mut pos)?;
-    // validity Validity - skip
+    if pos > tbs_end { return None; }
+    // validity Validity — RFC 5280 §4.1.2.5
     der_skip_tlv(cert, &mut pos)?;
-    // subject Name - skip
+    if pos > tbs_end { return None; }
+    // subject Name — RFC 5280 §4.1.2.6
     der_skip_tlv(cert, &mut pos)?;
+    if pos > tbs_end { return None; }
 
-    // subjectPublicKeyInfo - extract complete TLV
+    // subjectPublicKeyInfo — RFC 5280 §4.1.2.7
     let spki_start = pos;
     der_skip_tlv(cert, &mut pos)?;
+    if pos > tbs_end {
+        return None;
+    }
 
     Some(cert[spki_start..pos].to_vec())
 }
@@ -162,33 +177,42 @@ pub fn extract_spki_from_cert_der(cert: &[u8]) -> Option<Vec<u8>> {
 /// Extract the SubjectPublicKey BIT STRING value from a DER-encoded SubjectPublicKeyInfo.
 ///
 /// ```text
-/// SubjectPublicKeyInfo ::= SEQUENCE {
+/// SubjectPublicKeyInfo ::= SEQUENCE {          -- RFC 5280 §4.1.2.7
 ///     algorithm            AlgorithmIdentifier,
 ///     subjectPublicKey     BIT STRING
 /// }
 /// ```
 ///
 /// Returns the BIT STRING contents (including the leading unused-bits byte).
-/// This is the value MS-CSSP refers to as "SubjectPublicKey sub-field".
+/// This is the value MS-CSSP §3.1.5 refers to as "SubjectPublicKey sub-field"
+/// used for `pubKeyAuth` channel binding.
 pub fn extract_subject_public_key_from_spki(spki: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 0;
 
-    // Outer SEQUENCE (SubjectPublicKeyInfo)
-    let (tag, _seq_end) = der_read_tag_length(spki, &mut pos)?;
+    // Outer SEQUENCE (SubjectPublicKeyInfo) — RFC 5280 §4.1.2.7
+    // 0x30 = SEQUENCE tag (ITU-T X.690 §8.9)
+    let (tag, seq_end) = der_read_tag_length(spki, &mut pos)?;
     if tag != 0x30 {
         return None; // not a SEQUENCE
     }
+    if seq_end > spki.len() {
+        return None;
+    }
 
-    // AlgorithmIdentifier - skip
+    // AlgorithmIdentifier — RFC 5280 §4.1.1.2
     der_skip_tlv(spki, &mut pos)?;
+    if pos > seq_end {
+        return None;
+    }
 
-    // subjectPublicKey BIT STRING - extract value
+    // subjectPublicKey BIT STRING — RFC 5280 §4.1.2.7
+    // 0x03 = BIT STRING tag (ITU-T X.690 §8.6)
     let (tag, end) = der_read_tag_length(spki, &mut pos)?;
     if tag != 0x03 {
         return None; // not a BIT STRING
     }
-    if end > spki.len() {
-        return None;
+    if end > seq_end {
+        return None; // BIT STRING extends beyond SEQUENCE boundary
     }
 
     Some(spki[pos..end].to_vec())
@@ -206,6 +230,10 @@ fn der_read_tag_length(data: &[u8], pos: &mut usize) -> Option<(u8, usize)> {
     Some((tag, end))
 }
 
+/// DER long-form length: up to 4 bytes covers 2^32-1, sufficient for any real X.509 certificate.
+/// (ITU-T X.690 §8.1.3.5)
+const DER_MAX_LENGTH_BYTES: usize = 4;
+
 fn der_read_length(data: &[u8], pos: &mut usize) -> Option<usize> {
     if *pos >= data.len() {
         return None;
@@ -218,7 +246,7 @@ fn der_read_length(data: &[u8], pos: &mut usize) -> Option<usize> {
         Some(first as usize)
     } else {
         let num_bytes = (first & 0x7F) as usize;
-        if num_bytes == 0 || num_bytes > 4 || (*pos).checked_add(num_bytes).map_or(true, |end| end > data.len()) {
+        if num_bytes == 0 || num_bytes > DER_MAX_LENGTH_BYTES || (*pos).checked_add(num_bytes).map_or(true, |end| end > data.len()) {
             return None;
         }
         let mut length = 0usize;
@@ -322,23 +350,13 @@ mod tests {
         ];
         let mut bitstr = vec![0x03];
         let bs_len = pub_key_bytes.len() + 1;
-        if bs_len < 0x80 {
-            bitstr.push(bs_len as u8);
-        } else {
-            bitstr.push(0x81);
-            bitstr.push(bs_len as u8);
-        }
+        bitstr.extend(der_len(bs_len));
         bitstr.push(0x00); // unused bits
         bitstr.extend_from_slice(pub_key_bytes);
 
         let total_len = algo.len() + bitstr.len();
         let mut spki = vec![0x30];
-        if total_len < 0x80 {
-            spki.push(total_len as u8);
-        } else {
-            spki.push(0x81);
-            spki.push(total_len as u8);
-        }
+        spki.extend(der_len(total_len));
         spki.extend_from_slice(&algo);
         spki.extend_from_slice(&bitstr);
         spki
@@ -448,10 +466,42 @@ mod tests {
     }
 
     #[test]
+    fn der_read_length_rejects_indefinite_form() {
+        // 0x80 = BER indefinite-length form, rejected per DER rules (ITU-T X.690 §10.1)
+        let data = [0x30, 0x80, 0x00, 0x00];
+        let mut pos = 0;
+        assert!(der_read_tag_length(&data, &mut pos).is_none());
+    }
+
+    #[test]
     fn der_read_length_rejects_5_byte_length() {
         // 5-byte length encoding (num_bytes=5, exceeds the 4-byte cap)
         let data = [0x30, 0x85, 0x01, 0x00, 0x00, 0x00, 0x00];
         let mut pos = 0;
         assert!(der_read_tag_length(&data, &mut pos).is_none());
+    }
+
+    #[test]
+    fn extract_spki_rejects_corrupted_tbs_length() {
+        // Build a valid cert, then corrupt the TBSCertificate length to extend
+        // past the outer Certificate SEQUENCE boundary. The parser must reject
+        // this rather than returning data from outer certificate fields.
+        let pub_key = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let spki = build_test_spki(&pub_key);
+        let mut cert = build_test_cert(&spki);
+
+        // The TBS SEQUENCE starts after the outer SEQUENCE tag+length.
+        // Find the TBS length byte(s) and inflate them.
+        let outer_tag_len_size = if cert[1] < 0x80 { 2 } else { 2 + (cert[1] & 0x7F) as usize };
+        let tbs_len_offset = outer_tag_len_size + 1; // skip TBS tag (0x30)
+        // Set TBS length to a value that exceeds cert_end
+        cert[tbs_len_offset] = 0x84;
+        // Insert 4-byte length = 0xFFFFFFFF (far exceeds cert)
+        cert.splice(tbs_len_offset + 1..tbs_len_offset + 1, [0xFF, 0xFF, 0xFF, 0xFF]);
+
+        assert!(
+            extract_spki_from_cert_der(&cert).is_none(),
+            "corrupted TBS length must cause rejection"
+        );
     }
 }

@@ -13,7 +13,7 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureSch
 
 use crate::danger::rustls_verifier::DangerousNoVerify;
 use crate::verifier::{CertDecision, ServerCertVerifier};
-use crate::{AcceptAll, ReadWrite, TlsError, TlsUpgradeResult, TlsUpgrader, ERR_CERT_DER_PARSE};
+use crate::{AcceptAll, ReadWrite, TlsError, TlsUpgradeResult, TlsUpgrader, ERR_CERT_DER_PARSE, ERR_CERT_REJECTED};
 
 /// TLS upgrader using the `rustls` library.
 ///
@@ -173,14 +173,12 @@ impl RustlsServerCertVerifier for VerifierBridge {
     ) -> Result<ServerCertVerified, rustls::Error> {
         let sn = match server_name {
             ServerName::DnsName(dns) => dns.as_ref().to_string(),
-            ServerName::IpAddress(ip) => format!("{ip:?}"),
+            ServerName::IpAddress(ip) => std::net::IpAddr::from(*ip).to_string(),
             _ => String::new(),
         };
         match self.user.verify(end_entity.as_ref(), &sn) {
             CertDecision::Accept | CertDecision::AcceptOnce => Ok(ServerCertVerified::assertion()),
-            CertDecision::Reject => Err(rustls::Error::General(
-                "certificate rejected by ServerCertVerifier".into(),
-            )),
+            CertDecision::Reject => Err(rustls::Error::General(ERR_CERT_REJECTED.into())),
         }
     }
 
@@ -258,5 +256,63 @@ mod tests {
         let name = ServerName::try_from("example.com").unwrap();
         let result = bridge.verify_server_cert(&cert, &[], &name, &[], UnixTime::now());
         assert!(result.is_ok(), "AcceptAll must produce a verified assertion");
+    }
+
+    /// Verifier that returns AcceptOnce for testing the semantic marker path.
+    struct AcceptOnceVerifier;
+    impl ServerCertVerifier for AcceptOnceVerifier {
+        fn verify(&self, _cert_der: &[u8], _server_name: &str) -> CertDecision {
+            CertDecision::AcceptOnce
+        }
+    }
+
+    #[test]
+    fn verifier_bridge_forwards_accept_once_decision() {
+        let bridge = VerifierBridge::new(Arc::new(AcceptOnceVerifier));
+
+        let cert = CertificateDer::from(vec![0u8; 10]);
+        let name = ServerName::try_from("example.com").unwrap();
+        let result = bridge.verify_server_cert(&cert, &[], &name, &[], UnixTime::now());
+        assert!(result.is_ok(), "AcceptOnce must also produce a verified assertion");
+    }
+
+    #[test]
+    fn verifier_bridge_supported_schemes_non_empty() {
+        let bridge = VerifierBridge::new(Arc::new(AcceptAll));
+        let schemes = bridge.supported_verify_schemes();
+        assert!(!schemes.is_empty(), "must advertise at least one scheme");
+        assert!(schemes.contains(&SignatureScheme::RSA_PKCS1_SHA256));
+    }
+
+    /// Recording verifier that captures the server_name it receives.
+    struct RecordingVerifier {
+        captured: std::sync::Mutex<Option<String>>,
+    }
+    impl RecordingVerifier {
+        fn new() -> Self {
+            Self { captured: std::sync::Mutex::new(None) }
+        }
+        fn captured_name(&self) -> String {
+            self.captured.lock().unwrap().clone().unwrap()
+        }
+    }
+    impl ServerCertVerifier for RecordingVerifier {
+        fn verify(&self, _cert_der: &[u8], server_name: &str) -> CertDecision {
+            *self.captured.lock().unwrap() = Some(server_name.to_string());
+            CertDecision::Accept
+        }
+    }
+
+    #[test]
+    fn verifier_bridge_ip_address_format() {
+        let recorder = Arc::new(RecordingVerifier::new());
+        let bridge = VerifierBridge::new(Arc::clone(&recorder) as Arc<dyn ServerCertVerifier>);
+        let cert = CertificateDer::from(vec![0u8; 10]);
+
+        // IPv4 address must be passed as plain dotted-decimal, not Debug format
+        let name = ServerName::try_from("192.168.1.1".to_string()).unwrap();
+        let _ = bridge.verify_server_cert(&cert, &[], &name, &[], UnixTime::now());
+        assert_eq!(recorder.captured_name(), "192.168.1.1",
+            "IP address must be formatted as plain string, not Debug");
     }
 }

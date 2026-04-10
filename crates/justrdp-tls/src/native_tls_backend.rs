@@ -27,7 +27,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use crate::verifier::{CertDecision, ServerCertVerifier};
-use crate::{AcceptAll, ReadWrite, TlsError, TlsUpgradeResult, TlsUpgrader, ERR_CERT_DER_PARSE};
+use crate::{AcceptAll, ReadWrite, TlsError, TlsUpgradeResult, TlsUpgrader, ERR_CERT_DER_PARSE, ERR_CERT_REJECTED};
 
 /// Trust mode for [`NativeTlsUpgrader`].
 enum TrustMode {
@@ -127,10 +127,7 @@ impl TlsUpgrader for NativeTlsUpgrader {
             match verifier.verify(&cert_der, server_name) {
                 CertDecision::Accept | CertDecision::AcceptOnce => {}
                 CertDecision::Reject => {
-                    drop(tls_stream);
-                    return Err(TlsError::Handshake(
-                        "certificate rejected by ServerCertVerifier".into(),
-                    ));
+                    return Err(TlsError::Handshake(ERR_CERT_REJECTED.into()));
                 }
             }
         }

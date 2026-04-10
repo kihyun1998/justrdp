@@ -59,10 +59,11 @@ mod rustls_tests {
         let upgrader = RustlsUpgrader::with_verification();
         let result = upgrader.upgrade(stream, RDP_TEST_SERVER_NAME);
 
-        assert!(
-            result.is_err(),
-            "with_verification should reject self-signed cert"
-        );
+        match &result {
+            Err(justrdp_tls::TlsError::Handshake(_)) => {} // expected
+            Err(other) => panic!("expected TlsError::Handshake, got: {other:?}"),
+            Ok(_) => panic!("with_verification should reject self-signed cert"),
+        }
     }
 
     #[test]
@@ -141,10 +142,11 @@ mod native_tls_tests {
         let upgrader = NativeTlsUpgrader::with_verification();
         let result = upgrader.upgrade(stream, RDP_TEST_SERVER_NAME);
 
-        assert!(
-            result.is_err(),
-            "with_verification should reject self-signed cert"
-        );
+        match &result {
+            Err(justrdp_tls::TlsError::Handshake(_)) => {} // expected
+            Err(other) => panic!("expected TlsError::Handshake, got: {other:?}"),
+            Ok(_) => panic!("with_verification should reject self-signed cert"),
+        }
     }
 
     #[test]
