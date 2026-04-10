@@ -308,6 +308,18 @@ name = "justrdp-audio"
 version = "0.1.0"
 
 [[package]]
+name = "justrdp-blocking"
+version = "0.1.0"
+dependencies = [
+ "justrdp-connector",
+ "justrdp-core",
+ "justrdp-input",
+ "justrdp-pdu",
+ "justrdp-session",
+ "justrdp-tls",
+]
+
+[[package]]
 name = "justrdp-bulk"
 version = "0.1.0"
 dependencies = [

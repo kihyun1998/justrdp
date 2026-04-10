@@ -1,0 +1,24 @@
+[package]
+name = "justrdp-blocking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Synchronous std::net-based I/O runtime for JustRDP (RdpClient, reconnect, redirect)"
+keywords = ["rdp", "blocking", "client"]
+categories = ["network-programming"]
+
+[features]
+default = ["rustls"]
+rustls = ["justrdp-tls/rustls-backend"]
+native-tls = ["justrdp-tls/native-tls-backend"]
+
+[dependencies]
+justrdp-core = { workspace = true, features = ["alloc", "std"] }
+justrdp-pdu.workspace = true
+justrdp-connector.workspace = true
+justrdp-session.workspace = true
+justrdp-input.workspace = true
+justrdp-tls.workspace = true
