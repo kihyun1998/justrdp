@@ -34,6 +34,7 @@ use justrdp_pdu::rdp::finalization::{
     MonitorLayoutPdu, SaveSessionInfoPdu, SetErrorInfoPdu, SynchronizePdu,
     ERRINFO_NONE, TS_MONITOR_PRIMARY,
 };
+use justrdp_pdu::rdp::redirection::ServerRedirectionPdu;
 use justrdp_pdu::rdp::server_certificate;
 use justrdp_pdu::rdp::standard_security::{
     self, FipsSecurityContext, RdpSecurityContext,
@@ -177,6 +178,13 @@ pub struct ClientConnector {
     /// during the connection sequence (MS-RDPBCGR 2.2.4.2). Most servers send the
     /// cookie *after* connection completes; this field captures the rare in-sequence case.
     server_arc_cookie: Option<crate::config::ArcCookie>,
+    /// Server Redirection Packet captured during finalization (MS-RDPBCGR
+    /// 2.2.13.1). When `Some`, the connector still transitions to
+    /// `Connected` so the caller can read the redirect target via
+    /// `ConnectionResult.server_redirection`, but no actual session is
+    /// usable on this transport — the caller must reconnect to the
+    /// target indicated by the PDU.
+    server_redirection: Option<ServerRedirectionPdu>,
 }
 
 /// Standard RDP Security mode (none for TLS/NLA).
@@ -218,6 +226,7 @@ impl ClientConnector {
             active_desktop_size: None,
             server_monitor_layout: None,
             server_arc_cookie: None,
+            server_redirection: None,
         }
     }
 
@@ -1707,6 +1716,19 @@ impl ClientConnector {
             return Ok(Written::nothing());
         }
 
+        if sc_hdr.pdu_type == ShareControlPduType::ServerRedirect {
+            // MS-RDPBCGR 2.2.13.3.1 (Enhanced Security Server Redirection):
+            // ShareControlHeader (already consumed) + 2-byte pad + RDP_SERVER_REDIRECTION_PACKET.
+            // Stash the redirection so transition_to_connected exposes it on
+            // ConnectionResult and stop the finalization sequence — the
+            // caller is expected to switch transports.
+            let _pad2 = inner.read_u16_le("ServerRedirect::pad2")?;
+            let redir = ServerRedirectionPdu::decode(&mut inner)?;
+            self.server_redirection = Some(redir);
+            self.transition_to_connected();
+            return Ok(Written::nothing());
+        }
+
         if sc_hdr.pdu_type != ShareControlPduType::Data {
             // Unknown non-data PDU — stay in same state
             return Ok(Written::nothing());
@@ -1719,34 +1741,19 @@ impl ClientConnector {
         }
 
         // Informational PDUs that may interleave with the finalization
-        // sequence (MS-RDPBCGR 1.3.1.3 — server is allowed to send these
-        // alongside Sync/Cooperate/Granted/FontMap).
-        //
-        // SetErrorInfo with ERRINFO_NONE is a "no errors yet" heartbeat;
-        // a non-zero code is treated like the active-session path: store
-        // it for the eventual disconnect reason but do not abort here,
-        // because the server may still complete finalization successfully
-        // (it cleared the error info via ERRINFO_NONE later).
-        //
-        // SaveSessionInfo (logon notification + ARC cookie) can arrive
-        // mid-finalization on Windows servers. The connector cannot emit
-        // events, so we silently swallow it here; ActiveStage will surface
-        // any subsequent SaveSessionInfo PDUs once the session is live.
-        // Informational PDUs that may interleave with the finalization
         // sequence. SetErrorInfo with non-ERRINFO_NONE means the server
         // already detected a fatal problem in our preceding PDUs and is
-        // about to reset the connection — surface that as a connector
-        // error so the caller does not silently hang on the next read.
+        // about to reset the connection — surface as a connector error
+        // so the caller does not silently hang on the next read.
         // SaveSessionInfo can carry the logon ARC cookie; we drop it
         // here because the connector cannot emit events, and ActiveStage
         // will re-surface any subsequent SaveSessionInfo PDUs.
         if sd_hdr.pdu_type2 == ShareDataPduType::SetErrorInfo {
             let pdu = SetErrorInfoPdu::decode(&mut inner)?;
             if pdu.error_info != ERRINFO_NONE {
-                panic!(
-                    "DIAG: finalization SetErrorInfo error_info=0x{:08X}",
-                    pdu.error_info
-                );
+                return Err(ConnectorError::general(
+                    "server reported fatal error_info during finalization",
+                ));
             }
             return Ok(Written::nothing());
         }
@@ -1787,6 +1794,16 @@ impl ClientConnector {
         if sc_hdr.pdu_type == ShareControlPduType::DeactivateAllPdu {
             self.deactivation_count = self.deactivation_count.saturating_add(1);
             self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
+            return Ok(Written::nothing());
+        }
+
+        if sc_hdr.pdu_type == ShareControlPduType::ServerRedirect {
+            // Mirror of step_finalization_wait_pdu — see that function
+            // for the MS-RDPBCGR 2.2.13.3.1 framing rationale.
+            let _pad2 = inner.read_u16_le("ServerRedirect::pad2")?;
+            let redir = ServerRedirectionPdu::decode(&mut inner)?;
+            self.server_redirection = Some(redir);
+            self.transition_to_connected();
             return Ok(Written::nothing());
         }
 
@@ -1845,6 +1862,7 @@ impl ClientConnector {
             session_id: self.session_id,
             server_monitor_layout: self.server_monitor_layout.take(),
             server_arc_cookie: self.server_arc_cookie.take(),
+            server_redirection: self.server_redirection.take(),
         };
 
         self.state = ClientConnectorState::Connected { result };
@@ -2278,6 +2296,7 @@ mod tests {
                 session_id: 0,
                 server_monitor_layout: None,
                 server_arc_cookie: None,
+                server_redirection: None,
             },
         };
 

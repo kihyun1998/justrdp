@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 
 use justrdp_pdu::rdp::capabilities::CapabilitySet;
 use justrdp_pdu::rdp::finalization::MonitorLayoutEntry;
+use justrdp_pdu::rdp::redirection::ServerRedirectionPdu;
 use justrdp_pdu::x224::SecurityProtocol;
 
 use crate::config::ArcCookie;
@@ -62,4 +63,14 @@ pub struct ConnectionResult {
     /// This field captures the rare case where the server sends it during the
     /// finalization phase. `None` if no cookie was received during the connection.
     pub server_arc_cookie: Option<ArcCookie>,
+    /// Server Redirection Packet (MS-RDPBCGR 2.2.13.1) received during the
+    /// connection sequence.
+    ///
+    /// When present, the connection has reached `Connected` but the server
+    /// is asking the client to disconnect and reconnect to a different
+    /// target (Connection Broker / load-balancer scenario). I/O runtimes
+    /// like `justrdp-blocking` should detect this and switch to the new
+    /// target instead of treating the session as live. `None` for normal
+    /// connections.
+    pub server_redirection: Option<ServerRedirectionPdu>,
 }
