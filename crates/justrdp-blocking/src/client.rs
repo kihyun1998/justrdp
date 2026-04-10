@@ -15,10 +15,24 @@ use std::sync::Arc;
 
 use justrdp_connector::{ClientConnector, ClientConnectorState, Config, Sequence};
 use justrdp_core::WriteBuf;
-use justrdp_input::Scancode;
+use justrdp_input::{MouseButton, Scancode};
+use justrdp_pdu::rdp::fast_path::{
+    FastPathInputEvent, FastPathMouseEvent, FastPathScancodeEvent, FastPathUnicodeEvent,
+};
 use justrdp_pdu::tpkt::TpktHint;
 use justrdp_session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionConfig};
 use justrdp_tls::{AcceptAll, ReadWrite, RustlsUpgrader, ServerCertVerifier, TlsUpgrader};
+
+// MS-RDPBCGR 2.2.8.1.2.2.1 keyboard event flags (5-bit field).
+const KBDFLAGS_RELEASE: u8 = 0x01;
+const KBDFLAGS_EXTENDED: u8 = 0x02;
+
+// MS-RDPBCGR 2.2.8.1.2.2.3 pointer flags (16-bit pointerFlags field).
+const PTRFLAGS_MOVE: u16 = 0x0800;
+const PTRFLAGS_DOWN: u16 = 0x8000;
+const PTRFLAGS_BUTTON1: u16 = 0x1000; // left
+const PTRFLAGS_BUTTON2: u16 = 0x2000; // right
+const PTRFLAGS_BUTTON3: u16 = 0x4000; // middle
 
 use crate::credssp::run_credssp_sequence;
 use crate::error::{ConnectError, RuntimeError};
@@ -401,18 +415,81 @@ impl RdpClient {
         self.session.take();
     }
 
-    /// Send a single key press/release.
+    /// Send a single keyboard scancode press or release.
     ///
-    /// *Scaffold: always returns [`RuntimeError::Unimplemented`] until M5.*
-    pub fn send_keyboard(&mut self, _scancode: Scancode, _pressed: bool) -> Result<(), RuntimeError> {
-        Err(RuntimeError::Unimplemented("send_keyboard"))
+    /// Encodes a fast-path scancode input event with the appropriate
+    /// `KBDFLAGS_RELEASE` / `KBDFLAGS_EXTENDED` flags and writes it to
+    /// the active session transport.
+    pub fn send_keyboard(
+        &mut self,
+        scancode: Scancode,
+        pressed: bool,
+    ) -> Result<(), RuntimeError> {
+        self.send_input_events(&[build_scancode_event(scancode, pressed)])
     }
 
-    /// Send a mouse movement or button event.
+    /// Send a single Unicode key press or release (BMP code points only).
     ///
-    /// *Scaffold: always returns [`RuntimeError::Unimplemented`] until M5.*
-    pub fn send_mouse(&mut self, _x: u16, _y: u16) -> Result<(), RuntimeError> {
-        Err(RuntimeError::Unimplemented("send_mouse"))
+    /// Code points outside the Basic Multilingual Plane (i.e. above U+FFFF)
+    /// require UTF-16 surrogate pairs and are not yet handled — calling this
+    /// with such a `char` returns [`RuntimeError::Unimplemented`].
+    pub fn send_unicode(&mut self, ch: char, pressed: bool) -> Result<(), RuntimeError> {
+        let event = build_unicode_event(ch, pressed).ok_or(RuntimeError::Unimplemented(
+            "send_unicode: surrogate pairs (code points > U+FFFF)",
+        ))?;
+        self.send_input_events(&[event])
+    }
+
+    /// Send an absolute mouse position update.
+    ///
+    /// Sends a fast-path mouse event with [`PTRFLAGS_MOVE`] and the new
+    /// `(x, y)` coordinates. Coordinates are in the desktop coordinate
+    /// space negotiated during the connection sequence (see
+    /// [`ConnectionResult`](justrdp_connector::ConnectionResult)).
+    pub fn send_mouse_move(&mut self, x: u16, y: u16) -> Result<(), RuntimeError> {
+        self.send_input_events(&[build_mouse_move_event(x, y)])
+    }
+
+    /// Send a mouse button press or release at the given coordinates.
+    ///
+    /// `(x, y)` is included because the fast-path mouse event always
+    /// carries a position; pass the cursor's current location.
+    /// X1/X2 buttons are not yet supported by this helper (the wire
+    /// format requires a separate `MouseX` event with different flag
+    /// constants); calling with `MouseButton::X1` or `X2` returns
+    /// [`RuntimeError::Unimplemented`].
+    pub fn send_mouse_button(
+        &mut self,
+        button: MouseButton,
+        pressed: bool,
+        x: u16,
+        y: u16,
+    ) -> Result<(), RuntimeError> {
+        let event = build_mouse_button_event(button, pressed, x, y).ok_or(
+            RuntimeError::Unimplemented(
+                "send_mouse_button: X1/X2 require a fast-path MouseX event",
+            ),
+        )?;
+        self.send_input_events(&[event])
+    }
+
+    /// Encode and write a batch of fast-path input events to the transport.
+    ///
+    /// Pre-condition: the session must be active. After a disconnect this
+    /// returns [`RuntimeError::Disconnected`] without touching the network.
+    fn send_input_events(&mut self, events: &[FastPathInputEvent]) -> Result<(), RuntimeError> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or(RuntimeError::Disconnected)?;
+        let transport = self
+            .transport
+            .as_mut()
+            .ok_or(RuntimeError::Disconnected)?;
+        let frame = session.encode_input_events(events)?;
+        transport.write_all(&frame).map_err(RuntimeError::Io)?;
+        transport.flush().map_err(RuntimeError::Io)?;
+        Ok(())
     }
 
     /// Gracefully disconnect the session and consume the client.
@@ -425,6 +502,71 @@ impl RdpClient {
         self.session.take();
         Ok(())
     }
+}
+
+// ── Pure event-building helpers (testable without a live session) ──
+
+/// Build a fast-path scancode input event from an [`InputDatabase`]-style
+/// scancode + press/release flag.
+fn build_scancode_event(scancode: Scancode, pressed: bool) -> FastPathInputEvent {
+    let mut event_flags = 0u8;
+    if !pressed {
+        event_flags |= KBDFLAGS_RELEASE;
+    }
+    if scancode.extended {
+        event_flags |= KBDFLAGS_EXTENDED;
+    }
+    FastPathInputEvent::Scancode(FastPathScancodeEvent {
+        event_flags,
+        key_code: scancode.code,
+    })
+}
+
+/// Build a fast-path Unicode key event. Returns `None` for code points
+/// outside the BMP (which would require a UTF-16 surrogate pair).
+fn build_unicode_event(ch: char, pressed: bool) -> Option<FastPathInputEvent> {
+    let code = u32::from(ch);
+    if code > u16::MAX as u32 {
+        return None;
+    }
+    let event_flags = if pressed { 0 } else { KBDFLAGS_RELEASE };
+    Some(FastPathInputEvent::Unicode(FastPathUnicodeEvent {
+        event_flags,
+        unicode_code: code as u16,
+    }))
+}
+
+/// Build a fast-path mouse-move event with [`PTRFLAGS_MOVE`].
+fn build_mouse_move_event(x: u16, y: u16) -> FastPathInputEvent {
+    FastPathInputEvent::Mouse(FastPathMouseEvent {
+        event_flags: 0,
+        pointer_flags: PTRFLAGS_MOVE,
+        x_pos: x,
+        y_pos: y,
+    })
+}
+
+/// Build a fast-path mouse button press/release event. Returns `None` for
+/// `MouseButton::X1` / `X2`, which require a separate `MouseX` event type.
+fn build_mouse_button_event(
+    button: MouseButton,
+    pressed: bool,
+    x: u16,
+    y: u16,
+) -> Option<FastPathInputEvent> {
+    let button_flag = match button {
+        MouseButton::Left => PTRFLAGS_BUTTON1,
+        MouseButton::Right => PTRFLAGS_BUTTON2,
+        MouseButton::Middle => PTRFLAGS_BUTTON3,
+        MouseButton::X1 | MouseButton::X2 => return None,
+    };
+    let down_flag = if pressed { PTRFLAGS_DOWN } else { 0 };
+    Some(FastPathInputEvent::Mouse(FastPathMouseEvent {
+        event_flags: 0,
+        pointer_flags: button_flag | down_flag,
+        x_pos: x,
+        y_pos: y,
+    }))
 }
 
 /// Translate a transport-level [`ConnectError`] (used during the handshake)
@@ -491,5 +633,129 @@ mod tests {
         assert!(t.read(&mut buf).is_err());
         assert!(t.write(b"hi").is_err());
         assert!(t.flush().is_err());
+    }
+
+    // ── Input helper unit tests ──
+
+    #[test]
+    fn scancode_event_press_basic() {
+        let event = build_scancode_event(Scancode::new(0x1E, false), true);
+        match event {
+            FastPathInputEvent::Scancode(e) => {
+                assert_eq!(e.event_flags, 0);
+                assert_eq!(e.key_code, 0x1E);
+            }
+            _ => panic!("expected Scancode variant"),
+        }
+    }
+
+    #[test]
+    fn scancode_event_release_sets_release_flag() {
+        let event = build_scancode_event(Scancode::new(0x1E, false), false);
+        match event {
+            FastPathInputEvent::Scancode(e) => {
+                assert_eq!(e.event_flags, KBDFLAGS_RELEASE);
+            }
+            _ => panic!("expected Scancode variant"),
+        }
+    }
+
+    #[test]
+    fn scancode_event_extended_sets_extended_flag() {
+        // Extended scancode (e.g. cursor keys) released
+        let event = build_scancode_event(Scancode::new(0x4B, true), false);
+        match event {
+            FastPathInputEvent::Scancode(e) => {
+                assert_eq!(e.event_flags, KBDFLAGS_RELEASE | KBDFLAGS_EXTENDED);
+                assert_eq!(e.key_code, 0x4B);
+            }
+            _ => panic!("expected Scancode variant"),
+        }
+    }
+
+    #[test]
+    fn unicode_event_bmp_press_succeeds() {
+        let event = build_unicode_event('가', true).expect("BMP code point");
+        match event {
+            FastPathInputEvent::Unicode(e) => {
+                assert_eq!(e.event_flags, 0);
+                assert_eq!(e.unicode_code, 0xAC00);
+            }
+            _ => panic!("expected Unicode variant"),
+        }
+    }
+
+    #[test]
+    fn unicode_event_release_sets_release_flag() {
+        let event = build_unicode_event('A', false).unwrap();
+        match event {
+            FastPathInputEvent::Unicode(e) => {
+                assert_eq!(e.event_flags, KBDFLAGS_RELEASE);
+                assert_eq!(e.unicode_code, 0x41);
+            }
+            _ => panic!("expected Unicode variant"),
+        }
+    }
+
+    #[test]
+    fn unicode_event_supplementary_plane_returns_none() {
+        // U+1F600 (😀) is outside the BMP and needs a surrogate pair.
+        let event = build_unicode_event('😀', true);
+        assert!(event.is_none(), "supplementary code points must return None");
+    }
+
+    #[test]
+    fn mouse_move_event_sets_move_flag_and_position() {
+        let event = build_mouse_move_event(1024, 768);
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                assert_eq!(e.pointer_flags, PTRFLAGS_MOVE);
+                assert_eq!(e.x_pos, 1024);
+                assert_eq!(e.y_pos, 768);
+                assert_eq!(e.event_flags, 0);
+            }
+            _ => panic!("expected Mouse variant"),
+        }
+    }
+
+    #[test]
+    fn mouse_button_press_left() {
+        let event = build_mouse_button_event(MouseButton::Left, true, 100, 200).unwrap();
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                assert_eq!(e.pointer_flags, PTRFLAGS_BUTTON1 | PTRFLAGS_DOWN);
+                assert_eq!(e.x_pos, 100);
+                assert_eq!(e.y_pos, 200);
+            }
+            _ => panic!("expected Mouse variant"),
+        }
+    }
+
+    #[test]
+    fn mouse_button_release_right_omits_down_flag() {
+        let event = build_mouse_button_event(MouseButton::Right, false, 0, 0).unwrap();
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                assert_eq!(e.pointer_flags, PTRFLAGS_BUTTON2);
+            }
+            _ => panic!("expected Mouse variant"),
+        }
+    }
+
+    #[test]
+    fn mouse_button_middle_uses_button3_flag() {
+        let event = build_mouse_button_event(MouseButton::Middle, true, 50, 50).unwrap();
+        match event {
+            FastPathInputEvent::Mouse(e) => {
+                assert_eq!(e.pointer_flags, PTRFLAGS_BUTTON3 | PTRFLAGS_DOWN);
+            }
+            _ => panic!("expected Mouse variant"),
+        }
+    }
+
+    #[test]
+    fn mouse_button_x1_x2_return_none() {
+        assert!(build_mouse_button_event(MouseButton::X1, true, 0, 0).is_none());
+        assert!(build_mouse_button_event(MouseButton::X2, false, 0, 0).is_none());
     }
 }

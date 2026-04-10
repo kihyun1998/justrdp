@@ -144,20 +144,30 @@
 
 ---
 
-## M5 — 입력 송신 헬퍼
+## M5 — 입력 송신 헬퍼 ✅
 
 **로드맵 근거**: §5.5 "입력 송신"
 
-- [ ] `send_keyboard(scancode, pressed)` 구현
-  - `justrdp_input::InputDatabase`를 `RdpClient` 필드로 보유
-  - scancode → `FastPathInputEvent` 변환
-  - `session.encode_input_events(&[event])` → `transport.write_all()`
-- [ ] `send_unicode(ch, pressed)` 추가
-- [ ] `send_mouse(x, y, buttons: MouseButtons)` 구현 (현재 시그니처에 buttons 없음 — 수정)
-- [ ] `send_mouse_wheel(delta)` 추가 (선택)
-- [ ] `InputDatabase` 상태 추적 (modifier keys, sync 이벤트) — `justrdp-input` API 활용
+- [x] `send_keyboard(scancode, pressed)` — `FastPathScancodeEvent` (KBDFLAGS_RELEASE/EXTENDED)
+- [x] `send_unicode(ch, pressed)` — BMP code point만 지원, 서로게이트 페어 (U+10000+)는 `Unimplemented`
+- [x] `send_mouse_move(x, y)` — `FastPathMouseEvent` with PTRFLAGS_MOVE
+- [x] `send_mouse_button(button, pressed, x, y)` — Left/Right/Middle만 (X1/X2는 `MouseX` event 필요, `Unimplemented`)
+- [x] 모든 헬퍼는 `session.encode_input_events()` → `transport.write_all()` + `flush()` 패턴
+- [x] `Session`/`Transport` 어느 쪽이라도 `None`이면 `RuntimeError::Disconnected` 즉시 반환
+- [x] Pure 이벤트 빌더 함수 4개 추출 (`build_scancode_event`, `build_unicode_event`, `build_mouse_move_event`, `build_mouse_button_event`) — 라이브 세션 없이 단위 테스트 가능
+- [x] 11개 단위 테스트 추가:
+  - scancode press/release/extended (3)
+  - unicode BMP / release / supplementary plane rejection (3)
+  - mouse move (1)
+  - mouse button left press / right release / middle press / X1/X2 None (4)
+- [ ] ~~`send_mouse_wheel(delta)`~~ → 후속 작업 (PTRFLAGS_WHEEL/HWHEEL/WHEEL_NEGATIVE 인코딩 필요)
+- [ ] ~~`InputDatabase` 내장~~ → MVP에서는 사용자가 직접 관리. 추후 옵션 feature로 추가 검토
+- [ ] ~~키보드 sync (LockKeys 동기화)~~ → 후속, `FastPathSyncEvent` 사용 예정
+- [ ] 실서버 검증: 미수행 (예제 바이너리 작성 필요)
 
-**검증**: 실서버에서 notepad 열고 키보드 입력 반영 확인.
+**현재 동작**: `RdpClient` 사용자가 키 입력 / 유니코드 / 마우스 이동 / 마우스 클릭을 송신할 수 있음. 4가지 fast-path 이벤트 모두 와이어 포맷 정확.
+
+**검증**: `cargo test -p justrdp-blocking` 25 pass (14 기존 + 11 신규), 워크스페이스 clean.
 
 ---
 
