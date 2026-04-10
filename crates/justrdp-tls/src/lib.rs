@@ -5,12 +5,15 @@
 #![doc = "with optional backends for `rustls` and `native-tls`."]
 
 mod danger;
+mod verifier;
 
 #[cfg(feature = "rustls-backend")]
 mod rustls_backend;
 
 #[cfg(feature = "native-tls-backend")]
 mod native_tls_backend;
+
+pub use verifier::{AcceptAll, CertDecision, PinnedSpki, ServerCertVerifier};
 
 use std::fmt;
 use std::io::{Read, Write};

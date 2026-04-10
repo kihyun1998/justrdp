@@ -518,6 +518,7 @@ dependencies = [
 name = "justrdp-tls"
 version = "0.1.0"
 dependencies = [
+ "justrdp-core",
  "native-tls",
  "rustls",
  "webpki-roots 0.26.11",

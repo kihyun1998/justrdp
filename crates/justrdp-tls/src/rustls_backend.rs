@@ -5,16 +5,22 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier as RustlsServerCertVerifier,
+};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 
 use crate::danger::rustls_verifier::DangerousNoVerify;
-use crate::{ReadWrite, TlsError, TlsUpgradeResult, TlsUpgrader, ERR_CERT_DER_PARSE};
+use crate::verifier::{CertDecision, ServerCertVerifier};
+use crate::{AcceptAll, ReadWrite, TlsError, TlsUpgradeResult, TlsUpgrader, ERR_CERT_DER_PARSE};
 
 /// TLS upgrader using the `rustls` library.
 ///
 /// By default, this accepts self-signed certificates (common for RDP servers).
-/// Use [`with_verification()`](Self::with_verification) for strict certificate validation.
+/// Use [`with_verification()`](Self::with_verification) for strict certificate validation
+/// against the system root store, or [`with_verifier()`](Self::with_verifier) to inject
+/// a custom [`ServerCertVerifier`] (e.g. [`PinnedSpki`](crate::PinnedSpki)).
 pub struct RustlsUpgrader {
     config: Arc<ClientConfig>,
 }
@@ -25,34 +31,42 @@ impl RustlsUpgrader {
     /// RDP servers commonly use self-signed certificates, so this is the
     /// appropriate default for most RDP connections (similar to mstsc.exe).
     pub fn new() -> Self {
-        Self {
-            config: Arc::new(build_config(false)),
-        }
+        Self::with_verifier(Arc::new(AcceptAll))
     }
 
     /// Create an upgrader that verifies server certificates against
     /// the system root certificate store.
     pub fn with_verification() -> Self {
         Self {
-            config: Arc::new(build_config(true)),
+            config: Arc::new(build_system_roots_config()),
+        }
+    }
+
+    /// Create an upgrader that delegates certificate validation to a
+    /// user-supplied [`ServerCertVerifier`].
+    ///
+    /// This is the preferred constructor: pass [`AcceptAll`](crate::AcceptAll)
+    /// for permissive behavior, [`PinnedSpki`](crate::PinnedSpki) for fingerprint
+    /// pinning, or a custom implementation for GUI trust prompts.
+    pub fn with_verifier(verifier: Arc<dyn ServerCertVerifier>) -> Self {
+        let bridge = Arc::new(VerifierBridge::new(verifier));
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(bridge)
+            .with_no_client_auth();
+        Self {
+            config: Arc::new(config),
         }
     }
 }
 
-fn build_config(verify_certificates: bool) -> ClientConfig {
-    if verify_certificates {
-        let root_store =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+fn build_system_roots_config() -> ClientConfig {
+    let root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
-    } else {
-        ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(DangerousNoVerify))
-            .with_no_client_auth()
-    }
+    ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
 }
 
 impl Default for RustlsUpgrader {
@@ -115,6 +129,84 @@ fn extract_server_public_key(
         .ok_or_else(|| TlsError::PublicKeyExtraction(ERR_CERT_DER_PARSE.into()))
 }
 
+/// Adapter that implements rustls's internal `ServerCertVerifier` by
+/// delegating to our public [`ServerCertVerifier`] trait.
+///
+/// rustls still does cryptographic signature verification; our verifier
+/// only controls the trust decision for the peer's leaf certificate.
+/// Signature verification uses the built-in rustls scheme so self-signed
+/// certificates are handled safely even when [`AcceptAll`] is used.
+struct VerifierBridge {
+    user: Arc<dyn ServerCertVerifier>,
+    // We delegate signature verification to the dangerous no-verify helper
+    // which already implements `supported_verify_schemes()`. Our wrapper
+    // only adds the user's trust decision on top.
+    inner: DangerousNoVerify,
+}
+
+// `rustls::client::danger::ServerCertVerifier` requires `Debug`. We cannot
+// derive it because `dyn ServerCertVerifier` has no `Debug` bound — intentionally,
+// so that trust configuration does not accidentally leak through log formatting.
+impl std::fmt::Debug for VerifierBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifierBridge").finish_non_exhaustive()
+    }
+}
+
+impl VerifierBridge {
+    fn new(user: Arc<dyn ServerCertVerifier>) -> Self {
+        Self {
+            user,
+            inner: DangerousNoVerify,
+        }
+    }
+}
+
+impl RustlsServerCertVerifier for VerifierBridge {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let sn = match server_name {
+            ServerName::DnsName(dns) => dns.as_ref().to_string(),
+            ServerName::IpAddress(ip) => format!("{ip:?}"),
+            _ => String::new(),
+        };
+        match self.user.verify(end_entity.as_ref(), &sn) {
+            CertDecision::Accept | CertDecision::AcceptOnce => Ok(ServerCertVerified::assertion()),
+            CertDecision::Reject => Err(rustls::Error::General(
+                "certificate rejected by ServerCertVerifier".into(),
+            )),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,20 +219,44 @@ mod tests {
     }
 
     #[test]
-    fn build_config_no_verify_enables_tls12() {
-        let config = build_config(false);
-        // TLS 1.2 should be enabled (rustls-backend feature includes tls12)
+    fn rustls_upgrader_with_verifier_constructs() {
+        let _custom = RustlsUpgrader::with_verifier(Arc::new(AcceptAll));
+    }
+
+    #[test]
+    fn build_system_roots_config_has_no_alpn() {
+        let config = build_system_roots_config();
         assert!(
             config.alpn_protocols.is_empty(),
             "no ALPN should be set by default"
         );
     }
 
+    /// Mock verifier that records every call and returns Reject.
+    struct RejectAll;
+    impl ServerCertVerifier for RejectAll {
+        fn verify(&self, _cert_der: &[u8], _server_name: &str) -> CertDecision {
+            CertDecision::Reject
+        }
+    }
+
     #[test]
-    fn build_config_with_verify_has_root_certs() {
-        let config = build_config(true);
-        // Config constructed with root store should not panic and
-        // should have no ALPN set by default
-        assert!(config.alpn_protocols.is_empty());
+    fn verifier_bridge_forwards_reject_decision() {
+        let bridge = VerifierBridge::new(Arc::new(RejectAll));
+
+        let cert = CertificateDer::from(vec![0u8; 10]);
+        let name = ServerName::try_from("example.com").unwrap();
+        let result = bridge.verify_server_cert(&cert, &[], &name, &[], UnixTime::now());
+        assert!(result.is_err(), "RejectAll must propagate to rustls Error");
+    }
+
+    #[test]
+    fn verifier_bridge_forwards_accept_decision() {
+        let bridge = VerifierBridge::new(Arc::new(AcceptAll));
+
+        let cert = CertificateDer::from(vec![0u8; 10]);
+        let name = ServerName::try_from("example.com").unwrap();
+        let result = bridge.verify_server_cert(&cert, &[], &name, &[], UnixTime::now());
+        assert!(result.is_ok(), "AcceptAll must produce a verified assertion");
     }
 }

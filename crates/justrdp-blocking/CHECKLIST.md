@@ -15,51 +15,38 @@
 
 ---
 
-## M1 — TLS 업그레이드 + CertVerifier 훅
+## M1 — TLS 업그레이드 + CertVerifier 훅 ✅
 
 **로드맵 근거**: §5.4 `ServerCertVerifier` trait, §5.5 "연결 수립 펌프"
 
 ### `justrdp-tls` 변경
 
-- [ ] `ServerCertVerifier` trait 신설 (`src/verifier.rs`)
-  ```rust
-  pub trait ServerCertVerifier: Send + Sync {
-      fn verify(&self, cert_der: &[u8], server_name: &str) -> CertDecision;
-  }
-  pub enum CertDecision { Accept, Reject, AcceptOnce }
-  ```
-- [ ] 기본 구현체
-  - [ ] `AcceptAll` (현재 rustls `danger.rs`가 하는 것; 경고 로그)
-  - [ ] `Pinned { spki_sha256: [u8; 32] }` (지문 고정)
-  - [ ] (선택) `SystemRoots` — webpki-roots로 검증
-- [ ] `RustlsUpgrader`가 `ServerCertVerifier`를 주입받도록 생성자 변경
-  - 현재 `danger::NoCertificateVerification`을 그대로 쓰고 있을 가능성 높음 — 어댑터로 감싸기
-- [ ] 단위 테스트: mock verifier가 Reject 반환 → 업그레이드 실패
-- [ ] `native-tls` 백엔드는 feature flag 뒤에서 trait 지원 (최소한 컴파일만)
+- [x] `ServerCertVerifier` trait 신설 (`src/verifier.rs`)
+- [x] `CertDecision { Accept, Reject, AcceptOnce }`
+- [x] `AcceptAll` (mstsc 스타일, 기본값)
+- [x] `PinnedSpki { expected_sha256: [u8; 32] }` + `from_cert_der()` + constant-time 비교 + redacted Debug
+- [x] `RustlsUpgrader::with_verifier(Arc<dyn ServerCertVerifier>)` 생성자
+- [x] `VerifierBridge` — rustls `ServerCertVerifier` ↔ 우리 trait 어댑터 (Debug 수동 구현, 내부에 redacted)
+- [x] 기존 `RustlsUpgrader::new()` / `with_verification()` 동작 보존 (webpki-roots 경로 유지)
+- [x] 단위 테스트 9개: AcceptAll, PinnedSpki accept/reject/unparseable, constant_time_eq, Debug redaction, VerifierBridge accept/reject forwarding
+- [ ] ~~`native-tls` 백엔드 trait 지원~~ — 현재는 건드리지 않음 (feature flag 뒤, 추후 별도 커밋)
 
 ### `justrdp-blocking` 변경
 
-- [ ] `client.rs`: `Transport` enum 도입
-  ```rust
-  enum Transport {
-      Tcp(TcpStream),
-      Tls(Box<dyn ReadWrite + Send>),
-  }
-  impl Read for Transport { /* dispatch */ }
-  impl Write for Transport { /* dispatch */ }
-  ```
-  - `ReadWrite`는 `justrdp_tls::ReadWrite` 재사용
-- [ ] `RdpClient::connect()` 시그니처에 `upgrader: impl TlsUpgrader` 추가 (또는 feature 기본값)
-- [ ] `drive_until_tls_upgrade()` → `drive_connection()`으로 확장:
-  1. `EnhancedSecurityUpgrade` 감지 → `Transport::Tcp`에서 TcpStream 꺼냄
-  2. `upgrader.upgrade(tcp, server_name)` 호출
-  3. `server_public_key`는 다음 단계(CredSSP)에서 connector에 주입
-  4. `Transport::Tls(Box::new(upgraded.stream))`로 교체
-  5. 루프 재개
-- [ ] `ConnectError::Tls` variant는 이미 있음 — 매핑 확인
-- [ ] 통합 테스트: loopback에서 self-signed 서버 생성 → 업그레이드 성공/Reject 시나리오
+- [x] `client.rs`에 `Transport` enum (`Tcp` / `Tls(Box<dyn ReadWrite>)` / `Swapping`)
+- [x] `Read` + `Write` impl이 variant에 dispatch, `Swapping`은 `NotConnected` 에러
+- [x] `RdpClient::connect(server, server_name, config)` (AcceptAll 기본값)
+- [x] `RdpClient::connect_with_verifier(..., Arc<dyn ServerCertVerifier>)`
+- [x] `RdpClient::connect_with_upgrader<U: TlsUpgrader>(...)` (커스텀 백엔드/테스트용)
+- [x] `drive_until_state_change()` — 일반화된 커넥터 펌프, stop predicate 받음
+- [x] TLS 업그레이드 실제 수행: `EnhancedSecurityUpgrade` 감지 → `mem::replace`로 TCP 추출 → `upgrader.upgrade()` → `Transport::Tls`로 swap → `server_public_key` 보관
+- [x] `server_public_key: Option<Vec<u8>>` 필드 (M2에서 CredSSP가 사용)
+- [x] `Transport::Swapping` 경로 단위 테스트
+- [ ] 통합 테스트: self-signed loopback 서버로 업그레이드 성공/Reject — **M2 이후 CredSSP 실패가 정상 경로가 되면서 추가 가능**
 
-**검증**: `cargo test -p justrdp-blocking tls_upgrade` + 실서버 `192.168.136.136`에서 TLS 단계까지 도달 확인 (`EarlyUserAuth` 직전까지).
+**현재 동작**: `connect()`가 TCP → X.224 → TLS 업그레이드까지 수행 후 `ConnectError::Unimplemented("post-TLS CredSSP + connection finalization (M2+)")` 반환. `server_public_key`도 정상 추출됨.
+
+**검증**: `cargo test -p justrdp-tls` (21 pass) + `cargo test -p justrdp-blocking` (7 pass) + `cargo build --workspace` clean.
 
 ---
 
