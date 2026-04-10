@@ -1495,7 +1495,7 @@ pub trait GfxHandler: Send {
 **Phase 4 — Edge case 테스트:**
 - [x] `test_max_redirect_depth_exceeded` — 7개 broker 체인, 6번째 redirect에서 `too many redirects` 에러 확인
 - [x] `test_redirect_no_target_address` — LB_TARGET_NET_ADDRESS 없이 redirect → 원래 주소 fallback → TCP 에러 (broker gone)
-- [ ] `test_redirect_with_pk_encrypted_password` — `LB_PASSWORD_IS_PK_ENCRYPTED` 감지 확인 (RDSTLS 핸드셰이크 필요, 후속)
+- [x] `test_redirect_with_pk_encrypted_password` — broker가 PK-encrypted blob 전송 → target X.224 CR에서 `SecurityProtocol::RDSTLS` 확인
 
 **재사용 코드:**
 - `TpktHeader::for_payload()`, `DataTransfer`, `SendDataIndication` — 프레임 조립

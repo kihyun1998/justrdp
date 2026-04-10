@@ -241,16 +241,36 @@ fn build_mcs_connect_response() -> Vec<u8> {
     wrap_tpkt_dt(&resp_bytes)
 }
 
+/// Extra fields for the redirect PDU.
+#[derive(Default)]
+struct RedirectFields {
+    password: Option<Vec<u8>>,
+    redirection_guid: Option<Vec<u8>>,
+}
+
 /// Build a ServerRedirectionPdu frame (Enhanced Security variant).
 ///
 /// If `target_addr` is empty, `LB_TARGET_NET_ADDRESS` is not set in the flags.
 fn build_redirect_frame(target_addr: &str, lb_info: &[u8]) -> Vec<u8> {
-    use justrdp_pdu::rdp::redirection::{LB_LOAD_BALANCE_INFO, LB_TARGET_NET_ADDRESS};
+    build_redirect_frame_ext(target_addr, lb_info, &RedirectFields::default())
+}
+
+fn build_redirect_frame_ext(target_addr: &str, lb_info: &[u8], extra: &RedirectFields) -> Vec<u8> {
+    use justrdp_pdu::rdp::redirection::{
+        LB_LOAD_BALANCE_INFO, LB_PASSWORD, LB_PASSWORD_IS_PK_ENCRYPTED,
+        LB_REDIRECTION_GUID, LB_TARGET_NET_ADDRESS,
+    };
 
     let has_target = !target_addr.is_empty();
     let mut flags: u32 = LB_LOAD_BALANCE_INFO;
     if has_target {
         flags |= LB_TARGET_NET_ADDRESS;
+    }
+    if extra.password.is_some() {
+        flags |= LB_PASSWORD | LB_PASSWORD_IS_PK_ENCRYPTED;
+    }
+    if extra.redirection_guid.is_some() {
+        flags |= LB_REDIRECTION_GUID;
     }
 
     let mut body = Vec::new();
@@ -261,7 +281,9 @@ fn build_redirect_frame(target_addr: &str, lb_info: &[u8]) -> Vec<u8> {
     body.extend_from_slice(&0u32.to_le_bytes()); // session_id
     body.extend_from_slice(&flags.to_le_bytes()); // redir_flags
 
-    // LB_TARGET_NET_ADDRESS (if present): length(u32) + UTF-16LE null-terminated
+    // Fields must be in flag-bit order per the decoder.
+
+    // LB_TARGET_NET_ADDRESS (flag bit 0)
     if has_target {
         let mut target_utf16 = Vec::new();
         for ch in target_addr.encode_utf16() {
@@ -272,9 +294,26 @@ fn build_redirect_frame(target_addr: &str, lb_info: &[u8]) -> Vec<u8> {
         body.extend_from_slice(&target_utf16);
     }
 
-    // LB_LOAD_BALANCE_INFO: length(u32) + data
+    // LB_LOAD_BALANCE_INFO (flag bit 1)
     body.extend_from_slice(&(lb_info.len() as u32).to_le_bytes());
     body.extend_from_slice(lb_info);
+
+    // LB_USERNAME (bit 2) — not set, skip
+    // LB_DOMAIN (bit 3) — not set, skip
+
+    // LB_PASSWORD (bit 4)
+    if let Some(pw) = &extra.password {
+        body.extend_from_slice(&(pw.len() as u32).to_le_bytes());
+        body.extend_from_slice(pw);
+    }
+
+    // bits 5-13: skip (not set)
+
+    // LB_REDIRECTION_GUID (bit 15)
+    if let Some(guid) = &extra.redirection_guid {
+        body.extend_from_slice(&(guid.len() as u32).to_le_bytes());
+        body.extend_from_slice(guid);
+    }
 
     // length = total bytes from flags(2) onward (inclusive of flags+length themselves)
     let total = body.len() as u16;
@@ -313,6 +352,12 @@ enum MockMode {
     Broker {
         target_addr: String,
         lb_info: Vec<u8>,
+    },
+    /// Like Broker, but with extra redirect fields (password blob, GUID).
+    BrokerExt {
+        target_addr: String,
+        lb_info: Vec<u8>,
+        extra: RedirectFields,
     },
     /// Complete finalization normally (Sync, Cooperate, Granted, FontMap).
     Target,
@@ -415,10 +460,12 @@ fn run_mock_handshake(mut stream: TcpStream, mode: MockMode) -> io::Result<()> {
     // 14. Mode-dependent response
     match mode {
         MockMode::Broker { target_addr, lb_info } => {
-            // Send ServerRedirectionPdu
             let frame = build_redirect_frame(&target_addr, &lb_info);
             stream.write_all(&frame)?;
-            // Client will disconnect after processing the redirect
+        }
+        MockMode::BrokerExt { target_addr, lb_info, extra } => {
+            let frame = build_redirect_frame_ext(&target_addr, &lb_info, &extra);
+            stream.write_all(&frame)?;
         }
         MockMode::Target => {
             // Complete finalization: Synchronize + Cooperate + Granted + FontMap
@@ -647,4 +694,63 @@ fn test_redirect_no_target_address() {
     }
 
     let _ = broker_server.join();
+}
+
+#[test]
+fn test_redirect_with_pk_encrypted_password() {
+    use justrdp_pdu::x224::ConnectionRequest;
+    use std::sync::mpsc;
+
+    // Target that reads X.224 CR and reports the requested protocols, then drops.
+    let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel::<Option<SecurityProtocol>>();
+
+    let target_handle = thread::spawn(move || {
+        let (mut stream, _) = target_listener.accept().unwrap();
+        let cr_pdu = read_pdu(&mut stream).unwrap();
+        let mut cursor = ReadCursor::new(&cr_pdu);
+        let _tpkt = TpktHeader::decode(&mut cursor).unwrap();
+        let cr = ConnectionRequest::decode(&mut cursor).unwrap();
+        let proto = cr.negotiation.map(|n| n.protocols);
+        tx.send(proto).unwrap();
+        // Drop the stream — client will get a connection error.
+    });
+
+    // Broker sends redirect with PK-encrypted password blob.
+    let target_str = format!("{}:{}", target_addr.ip(), target_addr.port());
+    let (broker_addr, broker_server) = start_mock_server(MockMode::BrokerExt {
+        target_addr: target_str,
+        lb_info: b"pk-test".to_vec(),
+        extra: RedirectFields {
+            password: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            redirection_guid: Some(vec![0x42; 16]),
+        },
+    });
+
+    let config = Config::builder("user", "pass")
+        .security_protocol(SecurityProtocol::SSL)
+        .build();
+
+    // Connection will fail because the target mock doesn't complete the
+    // handshake — that's fine. We just need to verify that the client
+    // switched to RDSTLS for the redirected connection.
+    let _result = RdpClient::connect_with_upgrader(
+        broker_addr,
+        "localhost",
+        config,
+        NoopUpgrader,
+        vec![],
+    );
+
+    // Check what protocol the client requested from the target.
+    let requested = rx.recv().expect("target should have received X.224 CR");
+    let proto = requested.expect("negotiation should be present in CR");
+    assert!(
+        proto.contains(SecurityProtocol::RDSTLS),
+        "client should request RDSTLS after PK-encrypted redirect, got: {proto:?}",
+    );
+
+    let _ = broker_server.join();
+    let _ = target_handle.join();
 }
