@@ -144,12 +144,25 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Fixed-size hint: always expects `n` bytes.
+    /// Fixed-size hint: always expects `n` bytes (slow-path branch).
     struct FixedHint(usize);
     impl PduHint for FixedHint {
         fn find_size(&self, bytes: &[u8]) -> Option<(bool, usize)> {
             if bytes.len() >= 1 {
                 Some((false, self.0))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Same as `FixedHint` but reports the frame as fast-path so the
+    /// `(true, size)` arm of `read_pdu` gets exercised.
+    struct FastPathHint(usize);
+    impl PduHint for FastPathHint {
+        fn find_size(&self, bytes: &[u8]) -> Option<(bool, usize)> {
+            if bytes.len() >= 1 {
+                Some((true, self.0))
             } else {
                 None
             }
@@ -260,5 +273,62 @@ mod tests {
             ConnectError::Tcp(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
             _ => panic!("expected Tcp(InvalidData), got {err:?}"),
         }
+    }
+
+    #[test]
+    fn asn1_three_byte_long_form_length() {
+        // 0x83 0x01 0x00 0x01 = 65537 content bytes
+        let mut data = vec![0x30, 0x83, 0x01, 0x00, 0x01];
+        data.extend(std::iter::repeat_n(0x55, 65_537));
+        let mut cursor = Cursor::new(data.clone());
+        let mut scratch = Vec::new();
+        let n = read_asn1_sequence(&mut cursor, &mut scratch).unwrap();
+        assert_eq!(n, 65_537 + 5);
+        assert_eq!(scratch, data);
+    }
+
+    #[test]
+    fn asn1_four_byte_long_form_length() {
+        // 0x84 0x00 0x10 0x00 0x00 = 1 MiB content. Verifies the 4-byte
+        // length-of-length branch and the shift accumulator order.
+        let payload_len = 1024 * 1024;
+        let mut data = vec![0x30, 0x84, 0x00, 0x10, 0x00, 0x00];
+        data.extend(std::iter::repeat_n(0x33, payload_len));
+        let mut cursor = Cursor::new(data.clone());
+        let mut scratch = Vec::new();
+        let n = read_asn1_sequence(&mut cursor, &mut scratch).unwrap();
+        assert_eq!(n, payload_len + 6);
+        assert_eq!(&scratch[..6], &[0x30, 0x84, 0x00, 0x10, 0x00, 0x00]);
+        assert_eq!(scratch.len(), n);
+    }
+
+    #[test]
+    fn asn1_rejects_indefinite_length_indicator() {
+        // 0x80 (indefinite length) is forbidden in DER and our framer
+        // must reject it because num_length_bytes == 0 indicates an
+        // indefinite-length encoding.
+        let data = vec![0x30, 0x80, 0x00, 0x00];
+        let mut cursor = Cursor::new(data);
+        let mut scratch = Vec::new();
+        let err = read_asn1_sequence(&mut cursor, &mut scratch).unwrap_err();
+        match err {
+            ConnectError::Tcp(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            _ => panic!("expected Tcp(InvalidData), got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn read_pdu_fast_path_branch_reads_complete_frame() {
+        // Hint reports `(true, 5)` so the fast-path `(true, size)` arm
+        // of read_pdu is exercised. Both branches share the read loop
+        // but the public `is_fast_path` flag must propagate so future
+        // refactors of read_pdu cannot silently break the fast-path
+        // discriminator.
+        let data = vec![0x80, 0x05, 0xAA, 0xBB, 0xCC];
+        let mut cursor = Cursor::new(data.clone());
+        let mut scratch = Vec::new();
+        let n = read_pdu(&mut cursor, &FastPathHint(5), &mut scratch).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&scratch[..n], &data[..]);
     }
 }

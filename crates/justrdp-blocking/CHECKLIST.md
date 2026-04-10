@@ -276,5 +276,8 @@ M1 (TLS + CertVerifier)
 
 - [ ] 로드맵 §9.2 체크박스 업데이트 (`[x]` 변경)
 - [ ] 로드맵 §5.5 체크박스 진척 반영
-- [ ] `test-gap-finder` 에이전트로 커버리지 점검
+- [x] `test-gap-finder` 에이전트로 커버리지 점검 → critical 3개 + important 5개 갭 식별, 8개 신규 테스트 추가 (33 → 41 pass)
+  - transport: fast-path 분기 + ASN.1 3·4바이트 long-form + indefinite-length 거부
+  - client: `mark_disconnected` 부작용 / `next_event` post-disconnect 단락 + 큐 드레인 / `connect_error_to_runtime` 매핑 / `Transport::Swapping` ErrorKind 구체 검증
+  - 미수행: `WaitEarlyUserAuth` raw 4-byte 분기 (CredsspSequence mocking 필요, 별도 작업)
 - [ ] §9.3 Session Redirection (Task #4) 착수 — M7 완료 후에는 이 경로가 훨씬 짧음 (대부분의 재연결 인프라 재사용)

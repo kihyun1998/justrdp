@@ -912,14 +912,50 @@ mod tests {
     use super::*;
 
     /// `Transport::Swapping` must return an error on any I/O attempt so
-    /// that a partially-swapped client never silently drops bytes.
+    /// that a partially-swapped client never silently drops bytes. The
+    /// ErrorKind matters because callers may inspect it — pin to
+    /// `NotConnected` so a future change to a different kind has to be
+    /// deliberate.
     #[test]
     fn swapping_transport_errors_on_read_and_write() {
         let mut t = Transport::Swapping;
         let mut buf = [0u8; 4];
-        assert!(t.read(&mut buf).is_err());
-        assert!(t.write(b"hi").is_err());
-        assert!(t.flush().is_err());
+        let r = t.read(&mut buf).unwrap_err();
+        assert_eq!(r.kind(), io::ErrorKind::NotConnected);
+        let w = t.write(b"hi").unwrap_err();
+        assert_eq!(w.kind(), io::ErrorKind::NotConnected);
+        let f = t.flush().unwrap_err();
+        assert_eq!(f.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn connect_error_to_runtime_maps_each_variant() {
+        // Tcp -> Io
+        let io_err = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        match connect_error_to_runtime(ConnectError::Tcp(io_err)) {
+            RuntimeError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+            other => panic!("expected Io, got {other:?}"),
+        }
+        // UnexpectedEof -> Disconnected
+        assert!(matches!(
+            connect_error_to_runtime(ConnectError::UnexpectedEof),
+            RuntimeError::Disconnected
+        ));
+        // FrameTooLarge -> FrameTooLarge
+        match connect_error_to_runtime(ConnectError::FrameTooLarge(42)) {
+            RuntimeError::FrameTooLarge(n) => assert_eq!(n, 42),
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+        // Anything else falls into the catch-all Io with a descriptive
+        // message — pinning the catch-all so future ConnectError variants
+        // do not silently degrade to Io without us noticing.
+        match connect_error_to_runtime(ConnectError::Unimplemented("xyz")) {
+            RuntimeError::Io(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::Other);
+                assert!(e.to_string().contains("xyz"));
+            }
+            other => panic!("expected Io fallback, got {other:?}"),
+        }
     }
 
     // ── Input helper unit tests ──
@@ -1228,5 +1264,60 @@ mod tests {
             client.pending_events.front(),
             Some(RdpEvent::Disconnected(_))
         ));
+    }
+
+    #[test]
+    fn mark_disconnected_takes_transport_and_session() {
+        // Build a synthetic client whose transport/session are populated
+        // (using Transport::Swapping as a stand-in — its only requirement
+        // is that the Option be `Some`). After mark_disconnected we
+        // expect both fields to be None and the disconnected flag set.
+        let mut client = synthetic_client(ReconnectPolicy::disabled(), None, false);
+        client.transport = Some(Transport::Swapping);
+        // ActiveStage is heap-allocated; we can't easily fabricate one
+        // without a real SessionConfig, but we can stub the field by
+        // wrapping a fresh ActiveStage built from a dummy SessionConfig.
+        let session_config = SessionConfig {
+            io_channel_id: 1003,
+            user_channel_id: 1007,
+            share_id: 0,
+            channel_ids: Vec::new(),
+        };
+        client.session = Some(Box::new(ActiveStage::new(session_config)));
+
+        client.mark_disconnected();
+
+        assert!(client.disconnected, "disconnected flag must be set");
+        assert!(client.transport.is_none(), "transport must be taken");
+        assert!(client.session.is_none(), "session must be taken");
+    }
+
+    #[test]
+    fn next_event_after_disconnect_returns_none_without_io() {
+        // Once disconnected == true, next_event must short-circuit to
+        // Ok(None) without touching the (already-None) transport. This
+        // guards against a regression where the loop tries to read from
+        // a missing transport and panics on the unwrap.
+        let mut client = synthetic_client(ReconnectPolicy::disabled(), None, false);
+        client.disconnected = true;
+        let event = client.next_event().expect("next_event must succeed");
+        assert!(event.is_none(), "expected Ok(None) after disconnect");
+    }
+
+    #[test]
+    fn next_event_drains_pending_queue_before_disconnect_check() {
+        // Even with disconnected == true, queued events should be
+        // returned in FIFO order before the (terminal) None.
+        let mut client = synthetic_client(ReconnectPolicy::disabled(), None, false);
+        client.disconnected = true;
+        client.pending_events.push_back(RdpEvent::Reconnected);
+        client.pending_events.push_back(RdpEvent::PointerDefault);
+
+        let first = client.next_event().unwrap();
+        assert!(matches!(first, Some(RdpEvent::Reconnected)));
+        let second = client.next_event().unwrap();
+        assert!(matches!(second, Some(RdpEvent::PointerDefault)));
+        let third = client.next_event().unwrap();
+        assert!(third.is_none(), "queue empty + disconnected should yield None");
     }
 }
