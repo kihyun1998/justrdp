@@ -226,6 +226,15 @@ impl ClientConnector {
         self.selected_protocol
     }
 
+    /// Get a reference to the connector's [`Config`].
+    ///
+    /// Useful for I/O runtimes (e.g. `justrdp-blocking`) that need to read
+    /// credentials, domain, or `auth_mode` after the connector has taken
+    /// ownership of the config.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// Get the number of Deactivation-Reactivation cycles.
     /// Callers should check this to know if caches need to be invalidated.
     pub fn deactivation_count(&self) -> u32 {

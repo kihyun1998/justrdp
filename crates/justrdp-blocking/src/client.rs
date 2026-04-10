@@ -17,6 +17,7 @@ use justrdp_input::Scancode;
 use justrdp_session::ActiveStage;
 use justrdp_tls::{AcceptAll, ReadWrite, RustlsUpgrader, ServerCertVerifier, TlsUpgrader};
 
+use crate::credssp::run_credssp_sequence;
 use crate::error::{ConnectError, RuntimeError};
 use crate::event::RdpEvent;
 use crate::reconnect::ReconnectPolicy;
@@ -163,14 +164,44 @@ impl RdpClient {
             None
         };
 
-        // Phase 3 (M2+): post-TLS CredSSP + connection finalization pump.
-        // Explicitly drop the upgraded transport here so rustc doesn't warn
-        // about an unread assignment — M2 will replace this with the pump
-        // loop that actually consumes `transport` and `server_public_key`.
+        // Phase 3 (M2): if the negotiated protocol is HYBRID/HYBRID_EX, the
+        // connector now sits in `EnhancedSecurityUpgrade`. Step it once
+        // (the connector's send-state for that phase is a pure transition)
+        // so we can see whether it advances into a Credssp* state or skips
+        // straight to BasicSettingsExchange.
+        drive_until_state_change(&mut connector, &mut transport, |s| {
+            !matches!(s, ClientConnectorState::EnhancedSecurityUpgrade)
+        })?;
+
+        if matches!(
+            connector.state(),
+            ClientConnectorState::CredsspNegoTokens
+                | ClientConnectorState::CredsspPubKeyAuth
+                | ClientConnectorState::CredsspCredentials
+        ) {
+            let server_pub_key = server_public_key.ok_or(ConnectError::Unimplemented(
+                "CredSSP requires a TLS upgrade to capture server_public_key",
+            ))?;
+            // run_credssp_sequence handles all token I/O over the TLS stream;
+            // the connector's Credssp* states are just internal markers and
+            // are advanced (no-op transitions) below.
+            run_credssp_sequence(&connector, &mut transport, server_pub_key)?;
+            drive_until_state_change(&mut connector, &mut transport, |s| {
+                !matches!(
+                    s,
+                    ClientConnectorState::CredsspNegoTokens
+                        | ClientConnectorState::CredsspPubKeyAuth
+                        | ClientConnectorState::CredsspCredentials
+                        | ClientConnectorState::CredsspEarlyUserAuth
+                )
+            })?;
+        }
+
+        // Phase 4 (M3+): BasicSettingsExchange → ChannelConnection →
+        // CapabilitiesExchange → ConnectionFinalization → Connected.
         drop(transport);
-        let _ = server_public_key;
         Err(ConnectError::Unimplemented(
-            "post-TLS CredSSP + connection finalization (M2+)",
+            "post-CredSSP connection finalization pump (M3+)",
         ))
     }
 

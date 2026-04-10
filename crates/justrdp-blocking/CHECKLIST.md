@@ -52,23 +52,31 @@
 
 ---
 
-## M2 — CredSSP 토큰 pump-through
+## M2 — CredSSP 토큰 pump-through ✅
 
 **로드맵 근거**: §5.2 Authentication (완료된 PDU 레이어), §5.5 런타임
 
-커넥터의 CredSSP 시퀀스는 이미 구현되어 있음. blocking은 그저 I/O를 밀어주기만 하면 됨.
+**발견**: 커넥터의 `Credssp*` 상태들은 모두 `is_send_state() == true`이며 `step(&[])` 호출 시 단순 no-op 전환만 수행. 실제 CredSSP 토큰 교환은 `CredsspSequence` (별도 객체)가 담당하고, 호출자가 TLS 스트림 위에서 I/O를 직접 구동해야 함. blocking은 이 외부 시퀀스를 래핑.
 
-- [ ] `drive_connection()` 루프가 `CredsspNegoTokens`/`CredsspPubKeyAuth`/`CredsspCredentials` 상태에서 올바르게 동작하는지 확인
-  - TPKT 프레이밍이 아닌 경우가 있는지 확인 (CredSSP는 TLS record 위에 ASN.1 SEQUENCE)
-  - `connector.next_pdu_hint()`가 적절한 hint 반환하는지 확인 — 없으면 `CredsspTsRequestHint` 같은 것을 커넥터 쪽에 추가해야 함 (또는 blocking이 임시로 boundary 감지)
-- [ ] `CredsspEarlyUserAuth` 상태: TLS 위에서 **정확히 4바이트** 수신 후 커넥터에 전달
-  - 이건 일반 `read_pdu`로 안 됨 — 별도 분기 필요
-  - HYBRID_EX 선택 시에만
-- [ ] `TlsUpgradeResult::server_public_key`를 `CredsspSequence::new()`에 어떻게 전달하는지 확인
-  - 현재 커넥터가 이 값을 어디에서 받는지 `connector.rs` 검토
-  - blocking에서 `connector`에 setter가 있다면 호출, 없으면 커넥터 API 보강 필요
+- [x] `src/credssp.rs` 신규 모듈: `run_credssp_sequence(connector, transport, server_public_key)`
+- [x] `CredsspRandom` 생성 (OS 랜덤 `getrandom`)
+- [x] `ClientConnector::config()` 접근자 추가 (connector에 작은 API 보강) — 자격증명/도메인/auth_mode 읽기용
+- [x] `connector.credssp_credential_type()` 활용 (Password / RestrictedAdmin / RemoteGuard 분기)
+- [x] HYBRID_EX 감지: `connector.selected_protocol().contains(SecurityProtocol::HYBRID_EX)`
+- [x] `read_asn1_sequence()` 프레이머 (`transport.rs`) — DER 길이 인코딩 short/long form 모두 지원, 16 MiB 상한
+  - [x] short form (0x30 0xLL ...): 7개 테스트 케이스
+  - [x] long form 1바이트 (0x30 0x81 0xLL): 테스트
+  - [x] long form 2바이트 (0x30 0x82 0xHH 0xLL): 테스트 (1024 바이트)
+  - [x] non-SEQUENCE 거부, oversized, mid-frame EOF, 5-byte length indicator 거부
+- [x] `WaitEarlyUserAuth` 분기: 첫 바이트 peek → `0x30`이면 TsRequest fallback, 아니면 4바이트 raw status code
+- [x] CredSSP 시퀀스 완료 후 커넥터를 `CredsspNegoTokens → CredsspPubKeyAuth → CredsspCredentials → CredsspEarlyUserAuth → BasicSettingsExchangeSendInitial` 순서로 no-op step
+- [x] `client.rs::connect_with_upgrader()` 업데이트: TLS 업그레이드 후 EnhancedSecurityUpgrade 한 스텝 전진 → CredSSP 분기 → 연결 종료 상태 도달
+- [x] `ConnectError::Unimplemented` 메시지를 "post-CredSSP connection finalization pump (M3+)"로 업데이트
+- [ ] 실서버 `192.168.136.136` 통합 테스트 — **M3 이후 실제 Connected 도달 시점에 수행** (현재 Connected 전에 Unimplemented 반환)
 
-**검증**: NTLM 흐름으로 `192.168.136.136`에서 `CredsspCredentials` 완료 도달.
+**현재 동작**: TCP → X.224 → TLS 업그레이드 → SPKI 추출 → CredSSP 전체 시퀀스 (Negotiate → Challenge → Authenticate+pubKeyAuth → Credentials → HYBRID_EX EarlyUserAuth) → BasicSettingsExchangeSendInitial 도달 후 `Unimplemented("post-CredSSP connection finalization pump (M3+)")` 반환.
+
+**검증**: `cargo test -p justrdp-blocking` 14 pass (기존 7 + ASN.1 7개), `cargo build --workspace` clean.
 
 ---
 

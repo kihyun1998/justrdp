@@ -22,3 +22,4 @@ justrdp-connector.workspace = true
 justrdp-session.workspace = true
 justrdp-input.workspace = true
 justrdp-tls.workspace = true
+getrandom = "0.2"

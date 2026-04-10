@@ -36,6 +36,7 @@
 //! ```
 
 mod client;
+mod credssp;
 mod error;
 mod event;
 mod reconnect;

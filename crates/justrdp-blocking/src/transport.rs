@@ -1,11 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! Synchronous framing helper.
+//! Synchronous framing helpers.
 //!
-//! Reads exactly one PDU from a [`Read`] source using a
-//! [`justrdp_core::PduHint`] to determine the frame boundary.
+//! - [`read_pdu`] reads exactly one PDU using a [`justrdp_core::PduHint`].
+//! - [`read_asn1_sequence`] reads exactly one DER-encoded ASN.1 SEQUENCE
+//!   (used by CredSSP, which wraps every TsRequest as a top-level SEQUENCE).
+//! - [`read_exact_or_eof`] is a small `read_exact` wrapper that maps EOF to
+//!   [`ConnectError::UnexpectedEof`] instead of `io::Error`.
 
-use std::io::Read;
+use std::io::{self as io, Read};
 
 use justrdp_core::PduHint;
 
@@ -60,6 +63,82 @@ pub fn write_all<W: std::io::Write>(writer: &mut W, bytes: &[u8]) -> Result<(), 
     Ok(())
 }
 
+/// `read_exact` that converts EOF to [`ConnectError::UnexpectedEof`].
+pub(crate) fn read_exact_or_eof<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+) -> Result<(), ConnectError> {
+    match reader.read_exact(buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(ConnectError::UnexpectedEof),
+        Err(e) => Err(ConnectError::Tcp(e)),
+    }
+}
+
+/// Read exactly one DER-encoded ASN.1 SEQUENCE (`0x30 <length> <content>`)
+/// from `reader` into `scratch`.
+///
+/// CredSSP wraps every TsRequest in a top-level SEQUENCE, and TLS records
+/// can split or coalesce these arbitrarily, so we cannot rely on a single
+/// `read()` call returning exactly one TsRequest.
+///
+/// Returns the total number of bytes written to `scratch` (header + content).
+pub fn read_asn1_sequence<R: Read>(
+    reader: &mut R,
+    scratch: &mut Vec<u8>,
+) -> Result<usize, ConnectError> {
+    scratch.clear();
+
+    // Read the SEQUENCE tag and the first length byte.
+    scratch.resize(2, 0);
+    read_exact_or_eof(reader, &mut scratch[..2])?;
+
+    if scratch[0] != 0x30 {
+        return Err(ConnectError::Tcp(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expected ASN.1 SEQUENCE tag (0x30), got 0x{:02x}",
+                scratch[0]
+            ),
+        )));
+    }
+
+    // Decode DER length: 1 byte (< 0x80) or N+1 bytes (0x8N indicator + N).
+    let first_len = scratch[1];
+    let content_length = if first_len < 0x80 {
+        first_len as usize
+    } else {
+        let num_length_bytes = (first_len & 0x7F) as usize;
+        if num_length_bytes == 0 || num_length_bytes > 4 {
+            return Err(ConnectError::Tcp(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid ASN.1 length byte: 0x{first_len:02x}"),
+            )));
+        }
+        let header_pos = scratch.len();
+        scratch.resize(header_pos + num_length_bytes, 0);
+        read_exact_or_eof(reader, &mut scratch[header_pos..])?;
+        let mut len = 0usize;
+        for &b in &scratch[header_pos..header_pos + num_length_bytes] {
+            len = (len << 8) | b as usize;
+        }
+        len
+    };
+
+    let header_size = scratch.len();
+    let total = header_size
+        .checked_add(content_length)
+        .ok_or(ConnectError::FrameTooLarge(usize::MAX))?;
+    if total > MAX_PDU_SIZE {
+        return Err(ConnectError::FrameTooLarge(total));
+    }
+
+    scratch.resize(total, 0);
+    read_exact_or_eof(reader, &mut scratch[header_size..])?;
+    Ok(total)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +180,85 @@ mod tests {
         let mut scratch = Vec::new();
         let err = read_pdu(&mut cursor, &FixedHint(10), &mut scratch).unwrap_err();
         assert!(matches!(err, ConnectError::UnexpectedEof));
+    }
+
+    #[test]
+    fn asn1_short_form_length() {
+        // SEQUENCE with 5 content bytes: 0x30 0x05 <5 bytes>
+        let data = vec![0x30, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let mut cursor = Cursor::new(data.clone());
+        let mut scratch = Vec::new();
+        let n = read_asn1_sequence(&mut cursor, &mut scratch).unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(&scratch[..n], &data[..]);
+    }
+
+    #[test]
+    fn asn1_one_byte_long_form_length() {
+        // 0x81 0xC8 = 200 bytes content
+        let mut data = vec![0x30, 0x81, 0xC8];
+        data.extend_from_slice(&vec![0x42; 200]);
+        let mut cursor = Cursor::new(data.clone());
+        let mut scratch = Vec::new();
+        let n = read_asn1_sequence(&mut cursor, &mut scratch).unwrap();
+        assert_eq!(n, 203);
+        assert_eq!(&scratch[..], &data[..]);
+    }
+
+    #[test]
+    fn asn1_two_byte_long_form_length() {
+        // 0x82 0x04 0x00 = 1024 bytes content
+        let mut data = vec![0x30, 0x82, 0x04, 0x00];
+        data.extend_from_slice(&vec![0x77; 1024]);
+        let mut cursor = Cursor::new(data.clone());
+        let mut scratch = Vec::new();
+        let n = read_asn1_sequence(&mut cursor, &mut scratch).unwrap();
+        assert_eq!(n, 1028);
+        assert_eq!(scratch, data);
+    }
+
+    #[test]
+    fn asn1_rejects_non_sequence_tag() {
+        let data = vec![0x04, 0x01, 0xAA]; // OCTET STRING, not SEQUENCE
+        let mut cursor = Cursor::new(data);
+        let mut scratch = Vec::new();
+        let err = read_asn1_sequence(&mut cursor, &mut scratch).unwrap_err();
+        match err {
+            ConnectError::Tcp(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            _ => panic!("expected Tcp(InvalidData), got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn asn1_rejects_oversized_length() {
+        // Claims 0xFFFFFFFF content bytes — way over MAX_PDU_SIZE (16 MiB)
+        let data = vec![0x30, 0x84, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut cursor = Cursor::new(data);
+        let mut scratch = Vec::new();
+        let err = read_asn1_sequence(&mut cursor, &mut scratch).unwrap_err();
+        assert!(matches!(err, ConnectError::FrameTooLarge(_)));
+    }
+
+    #[test]
+    fn asn1_eof_mid_content_returns_unexpected_eof() {
+        // Claims 10 bytes but only 3 follow
+        let data = vec![0x30, 0x0A, 0x01, 0x02, 0x03];
+        let mut cursor = Cursor::new(data);
+        let mut scratch = Vec::new();
+        let err = read_asn1_sequence(&mut cursor, &mut scratch).unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEof));
+    }
+
+    #[test]
+    fn asn1_rejects_5_byte_length_indicator() {
+        // 0x85 = 5 following length bytes (we cap at 4)
+        let data = vec![0x30, 0x85, 0x01, 0x02, 0x03, 0x04, 0x05];
+        let mut cursor = Cursor::new(data);
+        let mut scratch = Vec::new();
+        let err = read_asn1_sequence(&mut cursor, &mut scratch).unwrap_err();
+        match err {
+            ConnectError::Tcp(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            _ => panic!("expected Tcp(InvalidData), got {err:?}"),
+        }
     }
 }
