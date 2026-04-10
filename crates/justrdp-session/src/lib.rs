@@ -60,6 +60,41 @@ use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
 #[cfg(feature = "alloc")]
 use complete_data::CompleteData;
 
+// ── Shared constants and helpers ──
+
+/// Maximum decompressed output size (16 MiB).
+/// Shared between fast-path and slow-path processors to prevent decompression bombs.
+#[cfg(feature = "alloc")]
+pub(crate) const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Decompress data with a size cap. Returns an error if the decompressed output
+/// exceeds [`MAX_DECOMPRESSED_BYTES`].
+///
+/// **Defense-in-depth:** Current algorithms (MPPC, NCRUSH, XCRUSH, ZGFX) already
+/// enforce internal output caps ≤ 16 MiB, so the post-decompression check here is
+/// a safety net. If a new algorithm is added to `BulkDecompressor` without an
+/// internal cap, this check prevents unbounded heap growth.
+///
+/// `context` is a label for error messages (e.g. "fast-path" or "slow-path").
+#[cfg(feature = "alloc")]
+pub(crate) fn decompress_checked(
+    compression_flags: u8,
+    data: &[u8],
+    decompressor: &mut BulkDecompressor,
+    context: &str,
+) -> SessionResult<Vec<u8>> {
+    let mut decompressed = Vec::new();
+    decompressor
+        .decompress(compression_flags, data, &mut decompressed)
+        .map_err(|e| SessionError::Decompress(alloc::format!("{e:?}")))?;
+    if decompressed.len() > MAX_DECOMPRESSED_BYTES {
+        return Err(SessionError::Protocol(alloc::format!(
+            "{context} decompressed payload exceeds size limit",
+        )));
+    }
+    Ok(decompressed)
+}
+
 // ── Public types ──
 
 /// Disconnect reason for [`ActiveStageOutput::Terminate`].
@@ -157,8 +192,8 @@ pub enum ActiveStageOutput {
     /// Used by East Asian language stacks to mirror IME activation state
     /// (open/closed) and conversion mode between server and client.
     KeyboardImeStatus {
-        /// IME open state (non-zero = open).
-        ime_state: u16,
+        /// IME open state (non-zero = open). MS-RDPBCGR 2.2.8.2.2.1: DWORD.
+        ime_state: u32,
         /// IME conversion mode bitfield (language-specific).
         ime_conv_mode: u32,
     },
@@ -199,6 +234,18 @@ pub enum SessionError {
     Decompress(String),
     /// Protocol violation.
     Protocol(String),
+}
+
+#[cfg(feature = "alloc")]
+impl core::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Decode(e) => write!(f, "decode error: {e}"),
+            Self::Encode(e) => write!(f, "encode error: {e}"),
+            Self::Decompress(msg) => write!(f, "decompression error: {msg}"),
+            Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
+        }
+    }
 }
 
 #[cfg(feature = "alloc")]
@@ -301,7 +348,7 @@ impl ActiveStage {
         let inner_size = DATA_TRANSFER_HEADER_SIZE + dpu.size();
         let mut buf = vec![0u8; TPKT_HEADER_SIZE + inner_size];
         let mut cursor = WriteCursor::new(&mut buf);
-        TpktHeader::for_payload(inner_size).encode(&mut cursor)?;
+        TpktHeader::try_for_payload(inner_size)?.encode(&mut cursor)?;
         DataTransfer.encode(&mut cursor)?;
         dpu.encode(&mut cursor)?;
         Ok(buf)

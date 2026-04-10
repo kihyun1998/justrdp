@@ -403,16 +403,17 @@ impl<'de> Decode<'de> for SetKeyboardIndicatorsPdu {
 /// Set Keyboard IME Status PDU (pduType2 = SetKeyboardImeStatus).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetKeyboardImeStatusPdu {
-    /// IME state.
-    pub ime_state: u16,
-    /// IME conversion mode.
+    /// IME state (MS-RDPBCGR 2.2.8.2.2.1: DWORD, non-zero = open).
+    pub ime_state: u32,
+    /// IME conversion mode bitfield (DWORD).
     pub ime_conv_mode: u32,
 }
 
 impl<'de> Decode<'de> for SetKeyboardImeStatusPdu {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let _unit_id = src.read_u16_le("KbdImeStatus::unitId")?;
-        let ime_state = src.read_u16_le("KbdImeStatus::imeState")?;
+        // MS-RDPBCGR 2.2.8.2.2.1: ImeState is a 4-byte DWORD.
+        let ime_state = src.read_u32_le("KbdImeStatus::imeState")?;
         let ime_conv_mode = src.read_u32_le("KbdImeStatus::imeConvMode")?;
         Ok(Self { ime_state, ime_conv_mode })
     }

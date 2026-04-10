@@ -102,7 +102,9 @@ impl CompleteData {
     }
 
     fn reset(&mut self) {
-        self.buffer.clear();
+        // Use Vec::new() instead of clear() to release the backing allocation,
+        // preventing large peak-capacity buffers from persisting after abandoned assemblies.
+        self.buffer = Vec::new();
         self.update_code = None;
     }
 }

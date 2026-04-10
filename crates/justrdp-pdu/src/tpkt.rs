@@ -37,13 +37,27 @@ impl TpktHeader {
 
     /// Create a TPKT header for a payload of the given size.
     ///
-    /// Panics if `payload_len + TPKT_HEADER_SIZE` exceeds `u16::MAX`.
-    pub fn for_payload(payload_len: usize) -> Self {
-        let total = payload_len + TPKT_HEADER_SIZE;
-        assert!(total <= TPKT_MAX_LENGTH, "TPKT payload too large: {total} > {TPKT_MAX_LENGTH}");
-        Self {
-            length: total as u16,
+    /// Returns `Err` if `payload_len + TPKT_HEADER_SIZE` exceeds `u16::MAX`.
+    /// Prefer this in production code to avoid panics in `no_std` environments.
+    pub fn try_for_payload(payload_len: usize) -> Result<Self, DecodeError> {
+        let total = payload_len.checked_add(TPKT_HEADER_SIZE).unwrap_or(usize::MAX);
+        if total > TPKT_MAX_LENGTH {
+            return Err(DecodeError::invalid_value(
+                "TpktHeader",
+                "payload too large for u16 length field",
+            ));
         }
+        Ok(Self {
+            length: total as u16,
+        })
+    }
+
+    /// Create a TPKT header for a payload of the given size.
+    ///
+    /// Panics if `payload_len + TPKT_HEADER_SIZE` exceeds `u16::MAX`.
+    /// Use [`try_for_payload`](Self::try_for_payload) in production code.
+    pub fn for_payload(payload_len: usize) -> Self {
+        Self::try_for_payload(payload_len).expect("TPKT payload too large")
     }
 
     /// Returns the payload length (total length minus header).
@@ -161,6 +175,12 @@ mod tests {
         let header = TpktHeader::for_payload(100);
         assert_eq!(header.length, 104);
         assert_eq!(header.payload_length(), 100);
+    }
+
+    #[test]
+    fn tpkt_try_for_payload_too_large() {
+        assert!(TpktHeader::try_for_payload(TPKT_MAX_LENGTH).is_err());
+        assert!(TpktHeader::try_for_payload(usize::MAX).is_err());
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub fn encode_connection_request(cr: &ConnectionRequest, output: &mut WriteBuf) 
     output.resize(total_size);
     let mut cursor = WriteCursor::new(output.as_mut_slice());
 
-    TpktHeader::for_payload(payload_size).encode(&mut cursor)?;
+    TpktHeader::try_for_payload(payload_size)?.encode(&mut cursor)?;
     cr.encode(&mut cursor)?;
 
     Ok(total_size)
@@ -42,7 +42,7 @@ pub fn encode_slow_path(payload: &dyn Encode, output: &mut WriteBuf) -> Connecto
     output.resize(total_size);
     let mut cursor = WriteCursor::new(output.as_mut_slice());
 
-    TpktHeader::for_payload(inner_size).encode(&mut cursor)?;
+    TpktHeader::try_for_payload(inner_size)?.encode(&mut cursor)?;
     DataTransfer.encode(&mut cursor)?;
     payload.encode(&mut cursor)?;
 
@@ -68,7 +68,7 @@ pub fn encode_mcs_send_data(
     output.resize(total_size);
     let mut cursor = WriteCursor::new(output.as_mut_slice());
 
-    TpktHeader::for_payload(mcs_size).encode(&mut cursor)?;
+    TpktHeader::try_for_payload(mcs_size)?.encode(&mut cursor)?;
     DataTransfer.encode(&mut cursor)?;
     sdr.encode(&mut cursor)?;
 

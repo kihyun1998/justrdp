@@ -18,9 +18,9 @@ pub const PACKET_COMPR_TYPE_RDP6: u8 = 0x2;
 const HISTORY_SIZE: usize = 65_536;
 const HISTORY_MASK: usize = HISTORY_SIZE - 1;
 
-/// Maximum total decompressed output per `decompress()` call (64 MB).
-/// Prevents memory exhaustion from crafted compressed packets.
-const MAX_NCRUSH_OUTPUT: usize = 64 * 1024 * 1024;
+/// Maximum total decompressed output per `decompress()` call (16 MiB).
+/// Aligned with session-layer cap to prevent heap spikes from crafted packets.
+const MAX_NCRUSH_OUTPUT: usize = 16 * 1024 * 1024;
 
 /// Half of the history buffer — the compaction point (MS-RDPEGDI §3.1.8.1).
 /// When offset >= 65000, PACKET_AT_FRONT triggers compaction:
@@ -308,16 +308,14 @@ impl NcrushDecompressor {
 
         // Step 2: PACKET_AT_FRONT — compact last 32KB to front (FreeRDP behavior).
         // Per MS-RDPEGDI §3.1.8.1, the server sets PACKET_AT_FRONT only when
-        // HistoryOffset >= 65000, so offset >= 32768 is guaranteed in conforming
-        // streams. The `else 0` branch handles malformed packets defensively
-        // (no panic, history state becomes meaningless but safe).
+        // HistoryOffset >= 65000, so offset >= HISTORY_HALF is guaranteed in
+        // conforming streams. Reject malformed packets where offset < HISTORY_HALF.
         if flags & PACKET_AT_FRONT != 0 {
+            if self.offset < HISTORY_HALF {
+                return Err(DecompressError::InvalidFlags);
+            }
             self.history.copy_within(HISTORY_HALF..HISTORY_SIZE, 0);
-            self.offset = if self.offset >= HISTORY_HALF {
-                self.offset - HISTORY_HALF
-            } else {
-                0
-            };
+            self.offset -= HISTORY_HALF;
             self.cache = [0u32; OFFSET_CACHE_SIZE];
         }
 
@@ -408,9 +406,10 @@ impl NcrushDecompressor {
                     };
                     // The spec (MS-RDPEGDI §3.1.8.1.4.1 Table 3) defines
                     // copy-offset symbols as distance = Base + extra_bits.
-                    // Distances are 1-based in the spec, but our history uses
-                    // 0-based indexing, so we subtract 1 to convert to a
-                    // 0-based distance for the `do_copy` source calculation.
+                    // COPY_OFFSET_BASE values are 1-indexed: Base=1 maps to
+                    // copy_offset=0 (current write head, invalid). We subtract 1
+                    // to convert to a 0-based backward distance for `do_copy`,
+                    // where copy_offset=1 means "1 byte back".
                     let copy_offset = (COPY_OFFSET_BASE[lut_idx] as usize
                         + stream_bits as usize)
                         .saturating_sub(1);
@@ -424,6 +423,7 @@ impl NcrushDecompressor {
 
                     // Decode LOM and execute copy
                     let lom = self.decode_lom(&mut reader)?;
+                    debug_assert!(lom <= 65536, "LOM {lom} exceeds spec maximum");
                     if dst.len().saturating_add(lom) > output_limit {
                         return Err(DecompressError::HistoryOverflow);
                     }
@@ -443,6 +443,7 @@ impl NcrushDecompressor {
 
                     // Decode LOM and execute copy
                     let lom = self.decode_lom(&mut reader)?;
+                    debug_assert!(lom <= 65536, "LOM {lom} exceeds spec maximum");
                     if dst.len().saturating_add(lom) > output_limit {
                         return Err(DecompressError::HistoryOverflow);
                     }
@@ -760,12 +761,13 @@ mod tests {
     }
 
     /// Test that copy-offset 0 (symbol 257, lut_idx=0) returns InvalidCopyOffset.
+    ///
+    /// COPY_OFFSET_BASE values are 1-indexed: Base=1 with 0 extra bits gives
+    /// raw distance=1, which after the -1 conversion becomes copy_offset=0
+    /// (the current write head — undefined). This is correctly rejected.
     #[test]
     fn copy_offset_zero_rejected() {
-        // Symbol 257 has HUFF_LEN_LEC[257]=13, COPY_OFFSET_BITS[0]=0, COPY_OFFSET_BASE[0]=1
-        // copy_offset = 1 + 0 - 1 = 0 → InvalidCopyOffset
         let code_257 = find_canonical_code(257);
-        // We also need a valid LOM after it, but the error should fire before LOM decode.
         // Just encode symbol 257 (13 bits) + padding.
         let bits: u64 = (code_257 as u64) << (64 - 13);
         let data: Vec<u8> = (0..2).map(|i| ((bits >> (56 - i * 8)) & 0xFF) as u8).collect();

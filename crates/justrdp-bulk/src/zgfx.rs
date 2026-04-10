@@ -41,7 +41,7 @@ const MAX_SEGMENT_SIZE: usize = 65_535;
 ///
 /// This prevents memory exhaustion from crafted inputs: a multipart packet
 /// can otherwise declare up to 4 GB via its `uncompressedSize` field.
-const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+const MAX_DECOMPRESSED_SIZE: usize = 16 * 1024 * 1024;
 
 /// Maximum extra doublings in `decode_match_count` (limits match count to ~4 MB).
 const MAX_MATCH_COUNT_EXTRA_BITS: u32 = 20;
@@ -216,18 +216,16 @@ impl<'a> ZgfxBits<'a> {
     /// Discard remaining bits in the accumulator and rewind any
     /// pre-loaded bytes so `read_raw_byte()` starts at the correct
     /// byte boundary (for UNENCODED path).
-    fn align_byte(&mut self) {
+    fn align_byte(&mut self) -> Result<(), ZgfxError> {
         // Rewind pre-loaded full bytes back to the input stream.
-        // Safety: `fill()` increments `pos` for each byte loaded into the
-        // accumulator, so `pos >= full_bytes_in_acc` is always true here.
+        // `fill()` increments `pos` for each byte loaded into the accumulator,
+        // so `pos >= full_bytes_in_acc` should always hold. Return an error
+        // instead of panicking if a malformed packet violates this invariant.
         let full_bytes_in_acc = self.acc_bits / 8;
         if full_bytes_in_acc > 0 {
-            assert!(
-                self.pos >= full_bytes_in_acc as usize,
-                "align_byte: pos ({}) < full_bytes_in_acc ({})",
-                self.pos,
-                full_bytes_in_acc,
-            );
+            if self.pos < full_bytes_in_acc as usize {
+                return Err(ZgfxError::TruncatedBitstream);
+            }
             self.pos -= full_bytes_in_acc as usize;
         }
         // Discard only the sub-byte remainder
@@ -237,6 +235,7 @@ impl<'a> ZgfxBits<'a> {
         }
         self.acc_bits = 0;
         self.acc = 0;
+        Ok(())
     }
 
     /// Read one raw byte from the input (for UNENCODED path).
@@ -459,7 +458,8 @@ impl ZgfxDecompressor {
                     if token.token_type == TOKEN_LITERAL {
                         // Literal byte
                         let c = if token.value_bits > 0 {
-                            (token.value_base + bits.get_bits(token.value_bits as u32)?) as u8
+                            let val = token.value_base + bits.get_bits(token.value_bits as u32)?;
+                            u8::try_from(val).map_err(|_| ZgfxError::InvalidToken)?
                         } else {
                             token.value_base as u8
                         };
@@ -473,17 +473,16 @@ impl ZgfxDecompressor {
                         let distance = token.value_base
                             + bits.get_bits(token.value_bits as u32)?;
 
-                        // `>` (not `>=`): distance == HISTORY_SIZE is valid
+                        // `>` (not `>=`): distance == history.len() is valid
                         // and references the oldest byte in the ring buffer.
-                        // distance == history.len() references the oldest byte in the ring.
-        if distance as usize > self.history.len() {
+                        if distance as usize > self.history.len() {
                             return Err(ZgfxError::InvalidToken);
                         }
 
                         if distance == 0 {
                             // UNENCODED path (MS-RDPEGFX §3.1.9.1.2)
                             let count = bits.get_bits(UNENCODED_COUNT_BITS)? as usize;
-                            bits.align_byte();
+                            bits.align_byte()?;
                             for _ in 0..count {
                                 if dst.len() >= output_limit {
                                     return Err(ZgfxError::DecompressedSizeExceeded);
@@ -626,7 +625,9 @@ impl ZgfxCompressor {
             let mut offset = 0;
             while offset < src.len() {
                 let chunk_len = (src.len() - offset).min(MAX_SEGMENT_SIZE);
-                let seg_size = (chunk_len + 1) as u32; // +1 for header byte
+                let seg_size = chunk_len
+                    .checked_add(1) // +1 for header byte
+                    .ok_or(ZgfxError::DecompressedSizeExceeded)? as u32;
                 dst.extend_from_slice(&seg_size.to_le_bytes());
                 dst.push(PACKET_COMPR_TYPE_RDP8); // header: not compressed
                 dst.extend_from_slice(&src[offset..offset + chunk_len]);

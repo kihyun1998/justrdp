@@ -20,9 +20,10 @@ use justrdp_pdu::rdp::fast_path::{
 use crate::complete_data::{AssembledUpdate, CompleteData};
 use crate::{ActiveStageOutput, SessionError, SessionResult};
 
-/// Maximum decompressed output size (16 MiB).
-/// Prevents decompression bombs from causing unbounded heap growth.
-const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of events that fit in the 4-bit numEvents nibble of fpInputHeader
+/// (bits 2-5, max 0xF = 15). Beyond this, an extended numEvents byte is required.
+/// MS-RDPBCGR 2.2.8.1.2.
+const FASTPATH_MAX_EVENTS_IN_HEADER: u8 = 15;
 
 // ── Fast-Path Output Processing (server → client) ──
 
@@ -49,9 +50,10 @@ pub(crate) fn process_fast_path_output(
         )));
     }
 
-    // NOTE: Encryption handling (Standard RDP Security) is not implemented here.
-    // When Enhanced RDP Security (TLS/CredSSP) is active, the payload is in the clear.
-    // The flags field (FASTPATH_OUTPUT_ENCRYPTED) should not be set under TLS.
+    // TODO(MS-RDPBCGR 5.3.6): Standard RDP Security fast-path encryption is not handled;
+    // FASTPATH_OUTPUT_ENCRYPTED must be checked and decrypted before update parsing
+    // when Standard Security is in use. Currently only Enhanced RDP Security (TLS/CredSSP)
+    // is supported, where the payload is in the clear.
 
     // Parse the update array from remaining bytes.
     let mut outputs = Vec::new();
@@ -78,19 +80,12 @@ fn decompress_update(
         Some(f) if f & PACKET_COMPRESSED != 0 => f,
         _ => return Ok(update),
     };
-    // NOTE: The cap check is post-allocation because BulkDecompressor does not
-    // support an output size limit. In practice, MPPC/NCRUSH/XCRUSH are bounded
-    // by their internal history buffer sizes (8K-64K per call), so decompression
-    // cannot produce output larger than MAX_DECOMPRESSED_BYTES in a single call.
-    let mut decompressed = Vec::new();
-    decompressor
-        .decompress(compression_flags, &update.update_data, &mut decompressed)
-        .map_err(|e| SessionError::Decompress(format!("{e:?}")))?;
-    if decompressed.len() > MAX_DECOMPRESSED_BYTES {
-        return Err(SessionError::Protocol(alloc::string::String::from(
-            "fast-path decompressed payload exceeds size limit",
-        )));
-    }
+    let decompressed = crate::decompress_checked(
+        compression_flags,
+        &update.update_data,
+        decompressor,
+        "fast-path",
+    )?;
     Ok(FastPathOutputUpdate {
         update_code: update.update_code,
         fragmentation: update.fragmentation,
@@ -170,7 +165,7 @@ pub(crate) fn encode_fast_path_input(events: &[FastPathInputEvent]) -> SessionRe
     // Build the header. The length field affects header size (1 byte if < 0x80,
     // 2 bytes if >= 0x80), so we iterate: compute header size with a trial length,
     // then recompute if the actual total crosses the short/long-form boundary.
-    let extended_byte: usize = if num_events > 15 { 1 } else { 0 };
+    let extended_byte: usize = if num_events > FASTPATH_MAX_EVENTS_IN_HEADER { 1 } else { 0 };
     // First estimate: assume short-form length (1 byte).
     let header_base = 1 + extended_byte; // byte0 + optional numEventsExt
     let trial_total = header_base + 1 + events_buf.len(); // +1 for short-form length
@@ -476,5 +471,71 @@ mod tests {
         let outputs =
             process_fast_path_output(&frame, &mut decompressor, &mut complete_data).unwrap();
         assert!(outputs.is_empty(), "truncated PointerPosition must be silently dropped");
+    }
+
+    /// Helper: build a complete fast-path output frame from a single update.
+    fn build_fast_path_output_frame(update: &FastPathOutputUpdate) -> Vec<u8> {
+        let header_placeholder = FastPathOutputHeader { action: 0, flags: 0, length: 0 };
+        let total_size = header_placeholder.size() + update.size();
+        let header = FastPathOutputHeader { action: 0, flags: 0, length: total_size as u16 };
+        let mut frame = vec![0u8; total_size];
+        let mut cursor = WriteCursor::new(&mut frame);
+        header.encode(&mut cursor).unwrap();
+        update.encode(&mut cursor).unwrap();
+        frame
+    }
+
+    #[test]
+    fn encode_exact_short_long_form_boundary() {
+        // Regression: when trial_total == 0x80 exactly, the code must switch to
+        // long-form length (2 bytes). Verify the boundary is handled correctly.
+        // 1 header + 1 extended + 2 long-form length = 4 bytes overhead.
+        // We need events_buf.len() such that 1+1+1+events = 0x80 → events = 125 bytes.
+        // 62 scancode events × 2 bytes = 124; + 1 mouse event (7 bytes) = 131 → too many.
+        // Actually: short form = header_base + 1 + events. header_base for >15 events = 2.
+        // trial_total = 2 + 1 + events_len. We want trial_total = 0x80 = 128.
+        // So events_len = 125 bytes. But scancode = 2 bytes each.
+        // 62 events = 124, need 1 more byte — not possible with whole events.
+        // Instead, target trial_total = 0x81 to confirm long-form is used.
+        // 63 scancode events × 2 = 126 bytes. trial_total = 2+1+126 = 129 (0x81) > 0x7F.
+        // Long-form: total = 2+2+126 = 130 (0x82).
+        let events: Vec<_> = (0..63)
+            .map(|i| FastPathInputEvent::Scancode(FastPathScancodeEvent {
+                event_flags: 0,
+                key_code: (i & 0xFF) as u8,
+            }))
+            .collect();
+        let frame = encode_fast_path_input(&events).unwrap();
+
+        let mut cursor = ReadCursor::new(&frame);
+        let hdr = FastPathInputHeader::decode(&mut cursor).unwrap();
+        assert_eq!(hdr.num_events, 63);
+        assert_eq!(hdr.length as usize, frame.len());
+        // Verify long-form was used (length >= 0x80)
+        assert!(hdr.length >= 0x80, "should use long-form length encoding");
+    }
+
+    #[test]
+    fn process_fast_path_output_via_helper() {
+        // Verify the build_fast_path_output_frame helper produces parseable frames.
+        let update = FastPathOutputUpdate {
+            update_code: FastPathUpdateType::Bitmap,
+            fragmentation: Fragmentation::Single,
+            compression: 0,
+            compression_flags: None,
+            update_data: b"test_data".to_vec(),
+        };
+        let frame = build_fast_path_output_frame(&update);
+        let mut decompressor = BulkDecompressor::new();
+        let mut complete_data = CompleteData::new();
+        let outputs = process_fast_path_output(&frame, &mut decompressor, &mut complete_data).unwrap();
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            ActiveStageOutput::GraphicsUpdate { update_code, data } => {
+                assert_eq!(*update_code, FastPathUpdateType::Bitmap);
+                assert_eq!(data.as_slice(), b"test_data");
+            }
+            _ => panic!("expected GraphicsUpdate"),
+        }
     }
 }

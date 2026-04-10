@@ -130,7 +130,7 @@ fn encode_chunk_frame(
 
     let mut frame = vec![0u8; total_size];
     let mut cursor = WriteCursor::new(&mut frame);
-    TpktHeader::for_payload(mcs_size).encode(&mut cursor)?;
+    TpktHeader::try_for_payload(mcs_size)?.encode(&mut cursor)?;
     DataTransfer.encode(&mut cursor)?;
     sdr.encode(&mut cursor)?;
 
