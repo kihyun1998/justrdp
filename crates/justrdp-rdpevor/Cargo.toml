@@ -1,0 +1,21 @@
+[package]
+name = "justrdp-rdpevor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Video Optimized Remoting Virtual Channel Extension (MS-RDPEVOR) for JustRDP"
+keywords = ["rdp", "video", "rdpevor", "dvc", "h264"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc", "justrdp-dvc/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-dvc/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-dvc.workspace = true
+justrdp-rdpegt.workspace = true
