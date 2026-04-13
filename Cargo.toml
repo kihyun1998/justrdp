@@ -23,6 +23,7 @@ members = [
     "crates/justrdp-rdpeusb",
     "crates/justrdp-rdpegt",
     "crates/justrdp-rdpevor",
+    "crates/justrdp-rdpecam",
     "crates/justrdp-pkinit-card",
     "crates/justrdp-egfx",
     "crates/justrdp-rail",
@@ -69,6 +70,7 @@ justrdp-rdpei = { path = "crates/justrdp-rdpei", version = "0.1.0" }
 justrdp-rdpeusb = { path = "crates/justrdp-rdpeusb", version = "0.1.0" }
 justrdp-rdpegt = { path = "crates/justrdp-rdpegt", version = "0.1.0" }
 justrdp-rdpevor = { path = "crates/justrdp-rdpevor", version = "0.1.0" }
+justrdp-rdpecam = { path = "crates/justrdp-rdpecam", version = "0.1.0" }
 justrdp-pkinit-card = { path = "crates/justrdp-pkinit-card", version = "0.1.0" }
 justrdp-egfx = { path = "crates/justrdp-egfx", version = "0.1.0" }
 justrdp-rail = { path = "crates/justrdp-rail", version = "0.1.0" }

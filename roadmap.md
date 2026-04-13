@@ -1757,10 +1757,16 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 > **requires**: 7.3 DVC 프레임워크
 > **검증**: 카메라 디바이스 열거 integration test
+> **크레이트**: `justrdp-rdpecam`
 
-- [ ] 카메라 디바이스 열거
-- [ ] 미디어 타입 협상
-- [ ] 프레임 스트리밍
+**DVC 이름**: `RDCamera_Device_Enumerator` (고정) + per-device 동적 채널
+
+- [x] Step 0: Spec Analysis → `specs/ms-rdpecam-checklist.md`
+- [x] Step 1: Crate Skeleton (no_std, forbid unsafe, module stubs: constants/pdu/{header,enumeration,device,stream,capture,property}/camera/enumerator/device)
+- [x] Step 2: PDUs — `SharedMsgHeader` helpers + 24 messages (Success/Error response, SelectVersion req/resp, Device Added/Removed, Activate/Deactivate, StreamList req/resp, MediaTypeList req/resp, CurrentMediaType req/resp, StartStreams, StopStreams, Sample req/resp, SampleError, PropertyList req/resp, PropertyValue req/resp, SetPropertyValue), `ErrorCode`/`MediaFormat`/`PropertySet`/`PropertyMode` forward-compat enums, spec §4.x test vectors (§4.1.1/§4.1.2 SelectVersion, §4.2.1 Mock Camera, §4.4.4 StreamList, §4.4.6 MediaTypeList, §4.5.1 StartStreams, §4.6.2 PropertyList, §4.6.4 PropertyValue), 75 roundtrip + 경계값 + cap 테스트 (spec §4.21 PROPERTY_DESCRIPTION 크기 체크리스트 오타 수정: 18→19바이트)
+- [ ] Step 3: `CameraHost` trait + `RdpecamEnumeratorClient` + `RdpecamDeviceClient` DVC processors, per-device 동적 채널 open, property get/set delegation
+- [ ] Step 4: Integration test (tests/flow.rs) — 버전 협상 → 디바이스 추가 → 스트림 리스트 → 미디어 타입 선택 → Start → Sample → Stop → 디바이스 제거
+- [ ] Step 5: impl-verifier + code-reviewer + security-scanner
 
 ### 9.10 Video Redirection (MS-RDPEV)
 

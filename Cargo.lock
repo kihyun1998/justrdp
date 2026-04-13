@@ -484,6 +484,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-rdpecam"
+version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+ "justrdp-dvc",
+]
+
+[[package]]
 name = "justrdp-rdpegt"
 version = "0.1.0"
 dependencies = [
