@@ -2757,6 +2757,196 @@ mod tests {
         assert!(PenFrame::decode(&mut src).is_err());
     }
 
+    // ── Pen cursor-integrity tests (test-gap-finder Critical) ──
+
+    #[test]
+    fn pen_contact_x_y_different_form_sizes_roundtrip() {
+        // x in 1-byte form (|mag| <= 0x1F), y in 3-byte form.
+        // Catches cursor advance bugs in the decoder.
+        let c = PenContact {
+            device_id: 0,
+            x: 10,
+            y: 0x0020_0000,
+            contact_flags: ContactFlags::DOWN | ContactFlags::INRANGE | ContactFlags::INCONTACT,
+            pen_flags: None,
+            pressure: None,
+            rotation: None,
+            tilt_x: None,
+            tilt_y: None,
+        };
+        let bytes = encode_to_vec(&c);
+        let mut src = ReadCursor::new(&bytes);
+        let decoded = PenContact::decode(&mut src).unwrap();
+        assert_eq!(decoded.x, 10);
+        assert_eq!(decoded.y, 0x0020_0000);
+    }
+
+    #[test]
+    fn pen_contact_rotation_form_boundary() {
+        // rotation uses TWO_BYTE_UNSIGNED: 127 → 1 byte, 128 → 2 bytes.
+        for r in [127u16, 128u16] {
+            let c = PenContact {
+                rotation: Some(r),
+                tilt_x: Some(45),
+                ..minimal_pen()
+            };
+            let bytes = encode_to_vec(&c);
+            let mut src = ReadCursor::new(&bytes);
+            let decoded = PenContact::decode(&mut src).unwrap();
+            assert_eq!(decoded.rotation, Some(r));
+            assert_eq!(decoded.tilt_x, Some(45), "tilt_x corrupted after rotation={r}");
+        }
+    }
+
+    #[test]
+    fn pen_contact_tilt_form_boundary() {
+        // tiltX/tiltY TWO_BYTE_SIGNED: |63| → 1 byte, |64| → 2 bytes.
+        for (tx, ty) in [(63i16, -63i16), (64i16, -64i16), (-63i16, 64i16)] {
+            let c = PenContact {
+                tilt_x: Some(tx),
+                tilt_y: Some(ty),
+                ..minimal_pen()
+            };
+            let bytes = encode_to_vec(&c);
+            let mut src = ReadCursor::new(&bytes);
+            let decoded = PenContact::decode(&mut src).unwrap();
+            assert_eq!(decoded.tilt_x, Some(tx));
+            assert_eq!(
+                decoded.tilt_y,
+                Some(ty),
+                "tilt_y corrupted after tilt_x form boundary tx={tx}"
+            );
+        }
+    }
+
+    #[test]
+    fn pen_contact_partial_fields_combinations() {
+        let base = minimal_pen();
+        let cases = [
+            PenContact {
+                pressure: Some(100),
+                tilt_x: Some(30),
+                ..base.clone()
+            },
+            PenContact {
+                rotation: Some(200),
+                tilt_y: Some(-40),
+                ..base.clone()
+            },
+            PenContact {
+                pen_flags: Some(PenFlags::ERASER_PRESSED),
+                rotation: Some(128),
+                tilt_x: Some(64),
+                ..base.clone()
+            },
+            PenContact {
+                pressure: Some(512),
+                rotation: Some(127),
+                tilt_x: Some(63),
+                tilt_y: Some(-63),
+                ..base.clone()
+            },
+        ];
+        for c in &cases {
+            let bytes = encode_to_vec(c);
+            let mut src = ReadCursor::new(&bytes);
+            assert_eq!(&PenContact::decode(&mut src).unwrap(), c);
+        }
+    }
+
+    // ── Decode-side rejection (impl-verifier MEDIUM/LOW) ──
+
+    #[test]
+    fn pen_contact_decode_rejects_invalid_contact_flags() {
+        // Minimal pen contact with contactFlags = 0x01 (DOWN alone, invalid).
+        let bytes: [u8; 5] = [0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut src = ReadCursor::new(&bytes);
+        assert!(PenContact::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn pen_contact_decode_rejects_over_range_pressure() {
+        // pressure=1024 valid → patch encoded bytes to 1025, expect decode fail.
+        let c = PenContact {
+            pressure: Some(1024),
+            ..minimal_pen()
+        };
+        let mut bytes = encode_to_vec(&c);
+        // Layout: [dev, fp=0x02, x=0, y=0, flags=0x19, pressure bytes...]
+        // pressure=1024=0x400: FOUR_BYTE_UNSIGNED 2-byte form = [0x44, 0x00]
+        assert_eq!(bytes[5..7], [0x44, 0x00]);
+        bytes[6] = 0x01; // → 1025
+        let mut src = ReadCursor::new(&bytes);
+        assert!(PenContact::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn pen_contact_decode_rejects_over_range_rotation() {
+        let c = PenContact {
+            rotation: Some(359),
+            ..minimal_pen()
+        };
+        let mut bytes = encode_to_vec(&c);
+        // rotation=359=0x167: TWO_BYTE_UNSIGNED 2-byte = [0x81, 0x67]
+        assert_eq!(bytes[5..7], [0x81, 0x67]);
+        bytes[6] = 0x68; // → 360
+        let mut src = ReadCursor::new(&bytes);
+        assert!(PenContact::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn pen_contact_decode_rejects_over_range_tilt() {
+        let c = PenContact {
+            tilt_x: Some(90),
+            ..minimal_pen()
+        };
+        let mut bytes = encode_to_vec(&c);
+        // tilt_x=90: TWO_BYTE_SIGNED 2-byte pos = [0x80, 0x5A]
+        assert_eq!(bytes[5..7], [0x80, 0x5A]);
+        bytes[6] = 0x5B; // → 91
+        let mut src = ReadCursor::new(&bytes);
+        assert!(PenContact::decode(&mut src).is_err());
+    }
+
+    // ── PenEventPdu edge cases (test-gap-finder Low) ──
+
+    #[test]
+    fn pen_event_pdu_zero_frames_roundtrip() {
+        let pdu = PenEventPdu {
+            encode_time: 0,
+            frames: vec![],
+        };
+        let bytes = encode_to_vec(&pdu);
+        assert_eq!(PenEventPdu::decode_from(&bytes).unwrap(), pdu);
+    }
+
+    #[test]
+    fn pen_event_pdu_length_matches_full_optional_contact() {
+        let pdu = PenEventPdu {
+            encode_time: 1000,
+            frames: vec![PenFrame {
+                frame_offset: 0,
+                contacts: vec![PenContact {
+                    device_id: 0,
+                    x: 1920,
+                    y: 1080,
+                    contact_flags: ContactFlags::DOWN
+                        | ContactFlags::INRANGE
+                        | ContactFlags::INCONTACT,
+                    pen_flags: Some(PenFlags::BARREL_PRESSED | PenFlags::INVERTED),
+                    pressure: Some(1024),
+                    rotation: Some(359),
+                    tilt_x: Some(-90),
+                    tilt_y: Some(90),
+                }],
+            }],
+        };
+        let bytes = encode_to_vec(&pdu);
+        let pdu_length = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        assert_eq!(pdu_length as usize, bytes.len());
+        assert_eq!(pdu_length as usize, pdu.size());
+    }
+
     #[test]
     fn header_accepts_exact_minimum_pdu_length() {
         // pdu_length = 6 is valid (header-only PDU, e.g., SUSPEND).

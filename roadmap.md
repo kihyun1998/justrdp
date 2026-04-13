@@ -1590,10 +1590,10 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
   - [ ] 버전 게이트: `negotiated_version >= V200` 아니면 에러
   - [ ] V300 multipen injection 플래그 활성 요건 검증
 
-- [ ] **Step 3 — Verification**
-  - [ ] `@impl-verifier` — 스펙 1:1 대조 (§9.4 갭 패턴 재사용으로 축소)
-  - [ ] `@test-gap-finder` — pen 특유의 누락 체크
-  - [ ] 전체 테스트 통과 + 워크스페이스 clean 빌드 확인
+- [x] **Step 3 — Verification** (120 tests ✅, clean workspace)
+  - [x] `@impl-verifier` — 33/35 PASS (2 테스트 커버리지 갭만, 구현은 스펙 정확)
+  - [x] `@test-gap-finder` — Critical 4 + Medium 3 갭 식별 및 전부 보강
+  - [x] 추가된 테스트: x/y 가변 form 교차, rotation 127/128 form 경계, tilt ±63/±64 form 경계, partial fieldsPresent 조합 (4종), decode-side out-of-range 거부 (invalid flags, pressure, rotation, tilt), pen_event_pdu zero frames + full-optional pdu_length, close()가 pen 상태 리셋 확인, 재연결 시 pen 상태 재협상, send_pen_event 큐 cap
 
 ### 9.6 Smartcard Authentication (PKINIT)
 

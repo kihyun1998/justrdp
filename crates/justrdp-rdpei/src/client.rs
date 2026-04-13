@@ -904,6 +904,34 @@ mod tests {
     }
 
     #[test]
+    fn second_sc_ready_updates_pen_state() {
+        // First handshake V200 → pen allowed.
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        assert!(c.pen_input_allowed());
+        // Second SC_READY claims V100 → pen must be disallowed after re-negotiation.
+        c.process(1, &sc_ready(crate::pdu::RDPINPUT_PROTOCOL_V100, None))
+            .unwrap();
+        assert!(!c.pen_input_allowed());
+        assert!(!c.multipen_active());
+    }
+
+    #[test]
+    fn send_pen_event_queue_cap_enforced() {
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            max_pending_messages: 1,
+            ..Default::default()
+        });
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.send_pen_event(0, alloc::vec![single_pen_frame(0)]).unwrap();
+        // Second push exceeds cap (queue holds 1).
+        assert!(c.send_pen_event(0, alloc::vec![single_pen_frame(0)]).is_err());
+        // Drain and retry.
+        assert_eq!(c.take_pending_messages().len(), 1);
+        assert!(c.send_pen_event(0, alloc::vec![single_pen_frame(0)]).is_ok());
+    }
+
+    #[test]
     fn inbound_pen_event_ignored() {
         let mut c = RdpeiDvcClient::new();
         c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
@@ -992,6 +1020,11 @@ mod tests {
             c.take_pending_messages().is_empty(),
             "close() must clear outbound queue"
         );
+        assert_eq!(c.negotiated_version(), None);
+        assert_eq!(c.server_features(), None);
+        assert!(!c.is_input_suspended());
+        assert!(!c.pen_input_allowed(), "close() must reset pen_input_allowed");
+        assert!(!c.multipen_active(), "close() must reset multipen_active");
         assert_eq!(c.negotiated_version(), None);
         assert_eq!(c.server_features(), None);
         assert!(!c.is_input_suspended());
