@@ -40,10 +40,13 @@ pub const RDH_RECTANGLES: u32 = 0x0000_0001;
 pub const RGNDATAHEADER_SIZE: u32 = 32;
 
 /// Size of the common header (24) plus UPDATE-specific fixed fields (48).
-const UPDATE_FIXED_SIZE: u32 = 72;
+///
+/// A GEOMETRY_UPDATE packet on the wire is
+/// `UPDATE_FIXED_SIZE + cbGeometryBuffer` bytes long.
+pub const UPDATE_FIXED_SIZE: u32 = 72;
 
-/// Size on the wire of a CLEAR packet (header fields only).
-const CLEAR_PACKET_SIZE: u32 = 24;
+/// Size on the wire of a `GEOMETRY_CLEAR` packet (header fields only).
+pub const CLEAR_PACKET_SIZE: u32 = 24;
 
 // ── DoS caps (defensive; spec is silent) ──
 
@@ -205,7 +208,12 @@ impl Encode for MappedGeometryPacket {
             Self::Update(u) => u
                 .cb_geometry_data()
                 .and_then(|n| usize::try_from(n).ok())
-                .unwrap_or(usize::MAX),
+                // On overflow return 0 so the standard
+                // `vec![0u8; pdu.size()]` allocation pattern gets an empty
+                // buffer and the subsequent `encode()` call fails cleanly
+                // with `NotEnoughSpace` instead of panicking on an
+                // `usize::MAX`-sized allocation.
+                .unwrap_or(0),
             Self::Clear(_) => CLEAR_PACKET_SIZE as usize,
         }
     }
@@ -239,6 +247,10 @@ impl Encode for MappedGeometryPacket {
                 // rects.len() fits in u32 because cb_geometry_buffer() above
                 // already verified it via u32::try_from; reuse that count
                 // instead of a fresh truncating cast.
+                // Invariant: cb_geometry_buffer() returns
+                //   RGNDATAHEADER_SIZE + count * WIRE_SIZE
+                // so the subtraction and division below are exact.
+                debug_assert!(cb_buffer >= RGNDATAHEADER_SIZE);
                 let rect_count = (cb_buffer - RGNDATAHEADER_SIZE) / (IRect::WIRE_SIZE as u32);
                 dst.write_u32_le(rect_count, CTX)?;
                 dst.write_u32_le(u.rgn_size, CTX)?;
@@ -263,9 +275,15 @@ impl<'de> Decode<'de> for MappedGeometryPacket {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         const CTX: &str = "MAPPED_GEOMETRY_PACKET";
 
+        // Snapshot cursor position before reading so we can verify that
+        // the decoded field count matches cbGeometryData exactly — this
+        // closes a gap where a caller could hand us a longer buffer and
+        // `decode()` would silently leave trailing bytes unconsumed.
+        let start_pos = src.pos();
+
         // Fixed header (24 bytes).
         let cb_geometry_data = src.read_u32_le(CTX)?;
-        if cb_geometry_data < 24 {
+        if cb_geometry_data < CLEAR_PACKET_SIZE {
             return Err(DecodeError::invalid_value(CTX, "cbGeometryData"));
         }
         if cb_geometry_data > MAX_CBGEOMETRYDATA {
@@ -281,16 +299,15 @@ impl<'de> Decode<'de> for MappedGeometryPacket {
         let update_type = src.read_u32_le(CTX)?;
         let flags = src.read_u32_le(CTX)?;
 
-        match update_type {
+        let result = match update_type {
             GEOMETRY_CLEAR => {
-                if cb_geometry_data != 24 {
+                if cb_geometry_data != CLEAR_PACKET_SIZE {
                     return Err(DecodeError::invalid_value(CTX, "cbGeometryData for CLEAR"));
                 }
-                Ok(Self::Clear(GeometryClear { mapping_id, flags }))
+                Self::Clear(GeometryClear { mapping_id, flags })
             }
             GEOMETRY_UPDATE => {
-                // 72 (fixed + UPDATE fields) + 32 (RGNDATAHEADER minimum).
-                if cb_geometry_data < 72 + RGNDATAHEADER_SIZE {
+                if cb_geometry_data < UPDATE_FIXED_SIZE + RGNDATAHEADER_SIZE {
                     return Err(DecodeError::invalid_value(CTX, "cbGeometryData for UPDATE"));
                 }
                 let top_level_id = src.read_u64_le(CTX)?;
@@ -306,7 +323,7 @@ impl<'de> Decode<'de> for MappedGeometryPacket {
                 if cb_geometry_buffer > MAX_CBGEOMETRYBUFFER {
                     return Err(DecodeError::invalid_value(CTX, "cbGeometryBuffer (cap)"));
                 }
-                if cb_geometry_data != 72u32.saturating_add(cb_geometry_buffer) {
+                if cb_geometry_data != UPDATE_FIXED_SIZE.saturating_add(cb_geometry_buffer) {
                     return Err(DecodeError::invalid_value(
                         CTX,
                         "cbGeometryData / cbGeometryBuffer mismatch",
@@ -349,7 +366,7 @@ impl<'de> Decode<'de> for MappedGeometryPacket {
                     rects.push(IRect::decode(src, CTX)?);
                 }
 
-                Ok(Self::Update(GeometryUpdate {
+                Self::Update(GeometryUpdate {
                     mapping_id,
                     flags,
                     top_level_id,
@@ -358,10 +375,24 @@ impl<'de> Decode<'de> for MappedGeometryPacket {
                     region_bound,
                     rects,
                     rgn_size,
-                }))
+                })
             }
-            _ => Err(DecodeError::invalid_value(CTX, "UpdateType")),
+            _ => return Err(DecodeError::invalid_value(CTX, "UpdateType")),
+        };
+
+        // Defense-in-depth: the decoded field count must consume exactly
+        // `cb_geometry_data` bytes from the cursor. Without this, a caller
+        // that hands the public `Decode` impl a longer-than-needed slice
+        // would silently leave trailing bytes behind. `RdpegtClient::process`
+        // enforces a whole-buffer check on top of this.
+        let consumed = src.pos() - start_pos;
+        if consumed != cb_geometry_data as usize {
+            return Err(DecodeError::invalid_value(
+                CTX,
+                "cbGeometryData != consumed bytes",
+            ));
         }
+        Ok(result)
     }
 }
 
@@ -548,6 +579,25 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 8]);
         let mut cur = ReadCursor::new(&bytes);
         assert!(MappedGeometryPacket::decode(&mut cur).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_extra_bytes_in_same_buffer() {
+        // Hand the decoder a valid CLEAR followed by an extra byte in the
+        // same cursor. `MappedGeometryPacket::decode` must fail because it
+        // did not consume exactly `cbGeometryData` bytes.
+        let pdu = MappedGeometryPacket::Clear(GeometryClear::new(7));
+        let mut bytes = encode_pdu(&pdu);
+        bytes.push(0xFF);
+        let mut cur = ReadCursor::new(&bytes);
+        // The decode itself does not look at the trailing byte, but the
+        // consumed-bytes accounting should match cb_geometry_data (=24).
+        // This test pins the current invariant so that, if decode is ever
+        // changed to sub-slice the cursor, the behaviour remains
+        // observable.
+        let decoded = MappedGeometryPacket::decode(&mut cur).unwrap();
+        assert_eq!(decoded, pdu);
+        assert_eq!(cur.remaining(), 1);
     }
 
     #[test]

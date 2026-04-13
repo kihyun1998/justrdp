@@ -161,8 +161,17 @@ impl DvcProcessor for RdpegtClient {
         Ok(Vec::new())
     }
 
-    fn close(&mut self, _channel_id: u32) {
+    fn close(&mut self, channel_id: u32) {
+        // DvcProcessor::close has no return type, so a mismatched
+        // channel_id cannot surface an error — but silently wiping
+        // state that belongs to a still-open channel is worse than a
+        // no-op. Match the hard channel-id policy enforced by
+        // `process()` and ignore close calls for foreign channels.
+        if self.open && channel_id != self.channel_id {
+            return;
+        }
         self.geometries.clear();
+        self.channel_id = 0;
         self.open = false;
     }
 }
