@@ -23,10 +23,10 @@ pub use client::{RdpeiClientConfig, RdpeiDvcClient};
 
 #[cfg(feature = "alloc")]
 pub use pdu::{
-    ContactFlags, CsReadyFlags, CsReadyPdu, DismissHoveringContactPdu, FieldsPresent,
-    ResumeInputPdu, RdpeiHeader, ScReadyFlags, ScReadyPdu, SuspendInputPdu, TouchContact,
-    TouchEventPdu, TouchFrame, EVENTID_CS_READY, EVENTID_DISMISS_HOVERING_TOUCH_CONTACT,
-    EVENTID_RESUME_INPUT, EVENTID_SC_READY, EVENTID_SUSPEND_INPUT, EVENTID_TOUCH,
-    RDPINPUT_PROTOCOL_V100, RDPINPUT_PROTOCOL_V101, RDPINPUT_PROTOCOL_V200,
-    RDPINPUT_PROTOCOL_V300,
+    ContactFlags, ContactRect, CsReadyFlags, CsReadyPdu, DismissHoveringContactPdu,
+    FieldsPresent, RdpeiHeader, ResumeInputPdu, ScReadyFlags, ScReadyPdu, SuspendInputPdu,
+    TouchContact, TouchEventPdu, TouchFrame, EVENTID_CS_READY,
+    EVENTID_DISMISS_HOVERING_TOUCH_CONTACT, EVENTID_RESUME_INPUT, EVENTID_SC_READY,
+    EVENTID_SUSPEND_INPUT, EVENTID_TOUCH, RDPINPUT_PROTOCOL_V100, RDPINPUT_PROTOCOL_V101,
+    RDPINPUT_PROTOCOL_V200, RDPINPUT_PROTOCOL_V300, SC_READY_MULTIPEN_INJECTION_SUPPORTED,
 };

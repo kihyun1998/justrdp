@@ -1547,10 +1547,10 @@ pub trait GfxHandler: Send {
   - [x] 클라 발신 event ID (CS_READY/TOUCH/DISMISS_HOVERING)가 inbound로 도착 시 무시 (§3.1.5.1)
   - [ ] `Connector`/세션 레이어 등록 경로 — Step 4에서 통합 테스트와 함께
 
-- [ ] **Step 4 — 검증**
-  - [ ] mock DVC 전송 통합 테스트 (SC_READY 수신 → CS_READY 송신 → touch frame 송신 순서 확인)
-  - [ ] `@impl-verifier` 로 스펙 1:1 대조
-  - [ ] `@test-gap-finder` 로 누락 케이스 점검
+- [x] **Step 4 — 검증** (77 tests ✅, clean workspace build)
+  - [x] `@impl-verifier` 로 스펙 1:1 대조 → 3개 실질 이슈 수정 (TouchFrame::size 절단, ContactRect 미재노출, 무의미한 assertion)
+  - [x] `@test-gap-finder` Critical 갭 보강 — partial fields_present 조합 6개, FOUR_BYTE_UNSIGNED boundary wire bytes, x/y 다른 form 크기 16개 조합, ScReadyPdu pduLength-gated features (V200/V300 edge), CsReady/Suspend/Resume 잘못된 length 거부
+  - [x] DvcProcessor 트레이트 객체 경유 full-flow 테스트 (vtable dispatch 검증)
 
 **참고 구현 패턴**:
 - `justrdp-rdpsnd` (DVC 모드): `RdpsndDvcClient`, 상태 머신, 버전 교환

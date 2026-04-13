@@ -812,7 +812,11 @@ impl Encode for TouchFrame {
     }
 
     fn size(&self) -> usize {
-        let count = self.contacts.len() as u16;
+        // Saturate to u16::MAX for oversized vectors; `encode()` will reject
+        // them via `u16::try_from`, so exact size() only matters when encode
+        // succeeds (len <= u16::MAX). Keeps the size()/encode() invariant
+        // correct on the success path.
+        let count = u16::try_from(self.contacts.len()).unwrap_or(u16::MAX);
         let mut n = two_byte_unsigned_size(count);
         n += eight_byte_unsigned_size(self.frame_offset);
         for c in &self.contacts {
@@ -854,7 +858,7 @@ pub struct TouchEventPdu {
 
 impl TouchEventPdu {
     fn body_size(&self) -> usize {
-        let frame_count = self.frames.len() as u16;
+        let frame_count = u16::try_from(self.frames.len()).unwrap_or(u16::MAX);
         let mut n = four_byte_unsigned_size(self.encode_time);
         n += two_byte_unsigned_size(frame_count);
         for f in &self.frames {
@@ -1667,5 +1671,280 @@ mod tests {
         let buf = [0x01u8, 0x00, 0x05, 0x00, 0x00, 0x00]; // pdu_length = 5 < 6
         let mut src = ReadCursor::new(&buf);
         assert!(RdpeiHeader::decode(&mut src).is_err());
+    }
+
+    // ── Critical gap tests (from @test-gap-finder) ──
+
+    // 1. Partial `fields_present` combinations — each optional field alone
+    //    and every pair, to exercise all decoder branches independently.
+
+    #[test]
+    fn touch_contact_rect_only_roundtrip() {
+        let c = TouchContact {
+            contact_id: 1,
+            x: 500,
+            y: -200,
+            contact_flags: ContactFlags::UPDATE
+                | ContactFlags::INRANGE
+                | ContactFlags::INCONTACT,
+            contact_rect: Some(ContactRect {
+                left: -10,
+                top: -20,
+                right: 10,
+                bottom: 20,
+            }),
+            orientation: None,
+            pressure: None,
+        };
+        let bytes = encode_to_vec(&c);
+        // fieldsPresent byte must encode only CONTACTRECT (0x01).
+        assert_eq!(bytes[1] & 0x7F, FieldsPresent::CONTACTRECT as u8);
+        let mut src = ReadCursor::new(&bytes);
+        assert_eq!(TouchContact::decode(&mut src).unwrap(), c);
+    }
+
+    #[test]
+    fn touch_contact_orientation_only_roundtrip() {
+        let c = TouchContact {
+            contact_id: 2,
+            x: 10,
+            y: 20,
+            contact_flags: ContactFlags::UPDATE | ContactFlags::INRANGE,
+            contact_rect: None,
+            orientation: Some(45),
+            pressure: None,
+        };
+        let bytes = encode_to_vec(&c);
+        assert_eq!(bytes[1] & 0x7F, FieldsPresent::ORIENTATION as u8);
+        let mut src = ReadCursor::new(&bytes);
+        assert_eq!(TouchContact::decode(&mut src).unwrap(), c);
+    }
+
+    #[test]
+    fn touch_contact_pressure_only_roundtrip() {
+        let c = TouchContact {
+            contact_id: 3,
+            x: 0,
+            y: 0,
+            contact_flags: ContactFlags::DOWN
+                | ContactFlags::INRANGE
+                | ContactFlags::INCONTACT,
+            contact_rect: None,
+            orientation: None,
+            pressure: Some(512),
+        };
+        let bytes = encode_to_vec(&c);
+        assert_eq!(bytes[1] & 0x7F, FieldsPresent::PRESSURE as u8);
+        let mut src = ReadCursor::new(&bytes);
+        assert_eq!(TouchContact::decode(&mut src).unwrap(), c);
+    }
+
+    #[test]
+    fn touch_contact_rect_and_orientation_no_pressure() {
+        let c = TouchContact {
+            contact_rect: Some(ContactRect {
+                left: -1,
+                top: -2,
+                right: 3,
+                bottom: 4,
+            }),
+            orientation: Some(270),
+            pressure: None,
+            ..minimal_contact()
+        };
+        let bytes = encode_to_vec(&c);
+        assert_eq!(
+            bytes[1] & 0x7F,
+            (FieldsPresent::CONTACTRECT | FieldsPresent::ORIENTATION) as u8
+        );
+        let mut src = ReadCursor::new(&bytes);
+        assert_eq!(TouchContact::decode(&mut src).unwrap(), c);
+    }
+
+    #[test]
+    fn touch_contact_rect_and_pressure_no_orientation() {
+        let c = TouchContact {
+            contact_rect: Some(ContactRect {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            }),
+            orientation: None,
+            pressure: Some(100),
+            ..minimal_contact()
+        };
+        let bytes = encode_to_vec(&c);
+        assert_eq!(
+            bytes[1] & 0x7F,
+            (FieldsPresent::CONTACTRECT | FieldsPresent::PRESSURE) as u8
+        );
+        let mut src = ReadCursor::new(&bytes);
+        assert_eq!(TouchContact::decode(&mut src).unwrap(), c);
+    }
+
+    #[test]
+    fn touch_contact_orientation_and_pressure_no_rect() {
+        let c = TouchContact {
+            contact_rect: None,
+            orientation: Some(90),
+            pressure: Some(800),
+            ..minimal_contact()
+        };
+        let bytes = encode_to_vec(&c);
+        assert_eq!(
+            bytes[1] & 0x7F,
+            (FieldsPresent::ORIENTATION | FieldsPresent::PRESSURE) as u8
+        );
+        let mut src = ReadCursor::new(&bytes);
+        assert_eq!(TouchContact::decode(&mut src).unwrap(), c);
+    }
+
+    // 2. FOUR_BYTE_UNSIGNED boundary wire-byte patterns.
+
+    #[test]
+    fn four_byte_unsigned_boundary_wire_bytes() {
+        let cases: [(u32, &[u8]); 8] = [
+            (0x00, &[0x00]),
+            (0x3F, &[0x3F]),
+            (0x40, &[0x40, 0x40]),
+            (0x3FFF, &[0x7F, 0xFF]),
+            (0x0000_4000, &[0x80, 0x40, 0x00]),
+            (0x003F_FFFF, &[0xBF, 0xFF, 0xFF]),
+            (0x0040_0000, &[0xC0, 0x40, 0x00, 0x00]),
+            (0x3FFF_FFFF, &[0xFF, 0xFF, 0xFF, 0xFF]),
+        ];
+        for (value, expected) in cases {
+            let mut buf = [0u8; 4];
+            let mut dst = WriteCursor::new(&mut buf);
+            encode_four_byte_unsigned(&mut dst, value, "t").unwrap();
+            assert_eq!(&buf[..expected.len()], expected, "encode {value:#x}");
+            let mut src = ReadCursor::new(expected);
+            assert_eq!(
+                decode_four_byte_unsigned(&mut src, "t").unwrap(),
+                value,
+                "decode {value:#x}"
+            );
+        }
+    }
+
+    // 3. TouchContact with x and y in different FOUR_BYTE_SIGNED forms.
+    //    Catches off-by-one cursor-advance bugs in the decoder.
+
+    #[test]
+    fn touch_contact_x_y_different_form_sizes() {
+        // x=5 (1-byte form, mag<=0x1F), y=5000 (2-byte form, mag<=0x1FFF).
+        let c = TouchContact {
+            contact_id: 0,
+            x: 5,
+            y: 5000,
+            contact_flags: ContactFlags::UP,
+            contact_rect: None,
+            orientation: None,
+            pressure: None,
+        };
+        let bytes = encode_to_vec(&c);
+        let mut src = ReadCursor::new(&bytes);
+        let decoded = TouchContact::decode(&mut src).unwrap();
+        assert_eq!(decoded.x, 5);
+        assert_eq!(decoded.y, 5000);
+    }
+
+    #[test]
+    fn touch_contact_x_y_mixed_signs_and_forms() {
+        // x=-0x1FFF (2-byte form), y=0x1F_FFFF (3-byte form).
+        let c = TouchContact {
+            x: -0x1FFF,
+            y: 0x1F_FFFF,
+            ..minimal_contact()
+        };
+        let bytes = encode_to_vec(&c);
+        let mut src = ReadCursor::new(&bytes);
+        let decoded = TouchContact::decode(&mut src).unwrap();
+        assert_eq!(decoded.x, -0x1FFF);
+        assert_eq!(decoded.y, 0x1F_FFFF);
+    }
+
+    #[test]
+    fn touch_contact_x_y_all_four_form_combinations() {
+        // Every pair of (x_form, y_form) ∈ {1,2,3,4} bytes — verifies the
+        // decoder's cursor advance is independent of x's encoded length.
+        let mags: [i32; 4] = [0x10, 0x1000, 0x0010_0000, 0x1000_0000];
+        for &xv in &mags {
+            for &yv in &mags {
+                let c = TouchContact {
+                    x: xv,
+                    y: -yv,
+                    ..minimal_contact()
+                };
+                let bytes = encode_to_vec(&c);
+                let mut src = ReadCursor::new(&bytes);
+                let decoded = TouchContact::decode(&mut src).unwrap();
+                assert_eq!(decoded.x, xv, "x for ({xv:#x},{yv:#x})");
+                assert_eq!(decoded.y, -yv, "y for ({xv:#x},{yv:#x})");
+            }
+        }
+    }
+
+    // 4. ScReadyPdu — presence of `supportedFeatures` is driven by pduLength,
+    //    not by protocol_version (MS-RDPEI 2.2.3.1 uses SHOULD).
+
+    #[test]
+    fn sc_ready_v200_with_pdu_length_14_reads_features() {
+        // Server is V200 but (non-conformant or future) sends pdu_length=14.
+        // Decoder must still read supportedFeatures — presence is
+        // pduLength-gated per spec SHOULD, not version-gated.
+        let pdu = ScReadyPdu {
+            protocol_version: RDPINPUT_PROTOCOL_V200,
+            supported_features: Some(0),
+        };
+        let bytes = encode_to_vec(&pdu);
+        assert_eq!(bytes.len(), 14);
+        let decoded = ScReadyPdu::decode_from(&bytes).unwrap();
+        assert_eq!(decoded.protocol_version, RDPINPUT_PROTOCOL_V200);
+        assert_eq!(decoded.supported_features, Some(0));
+    }
+
+    #[test]
+    fn sc_ready_v300_with_pdu_length_10_yields_no_features() {
+        // V300 server omits supportedFeatures (spec SHOULD — not MUST).
+        let pdu = ScReadyPdu {
+            protocol_version: RDPINPUT_PROTOCOL_V300,
+            supported_features: None,
+        };
+        let bytes = encode_to_vec(&pdu);
+        assert_eq!(bytes.len(), 10);
+        let decoded = ScReadyPdu::decode_from(&bytes).unwrap();
+        assert_eq!(decoded.protocol_version, RDPINPUT_PROTOCOL_V300);
+        assert_eq!(decoded.supported_features, None);
+    }
+
+    // Additional cheap negatives surfaced by the gap analysis.
+
+    #[test]
+    fn cs_ready_decode_wrong_length_rejected() {
+        // Build a CS_READY with pduLength=15 (wrong; must be 16).
+        let buf = [
+            0x02, 0x00, 0x0F, 0x00, 0x00, 0x00, // header with wrong length
+            0, 0, 0, 0, 0, 0, 1, 0, 0xA, 0,
+        ];
+        assert!(CsReadyPdu::decode_from(&buf).is_err());
+    }
+
+    #[test]
+    fn suspend_resume_decode_wrong_length_rejected() {
+        let bad_suspend = [0x04u8, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00];
+        assert!(SuspendInputPdu::decode_from(&bad_suspend).is_err());
+        let bad_resume = [0x05u8, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00];
+        assert!(ResumeInputPdu::decode_from(&bad_resume).is_err());
+    }
+
+    #[test]
+    fn header_accepts_exact_minimum_pdu_length() {
+        // pdu_length = 6 is valid (header-only PDU, e.g., SUSPEND).
+        let buf = [0x04u8, 0x00, 0x06, 0x00, 0x00, 0x00];
+        let mut src = ReadCursor::new(&buf);
+        let h = RdpeiHeader::decode(&mut src).unwrap();
+        assert_eq!(h.pdu_length, 6);
     }
 }

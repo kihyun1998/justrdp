@@ -601,16 +601,68 @@ mod tests {
         assert!(!c.is_input_suspended(), "second SC_READY must reset suspend flag");
     }
 
+    // ── Trait-object dispatch (DvcProcessor) ──
+
+    #[test]
+    fn dvc_processor_trait_object_full_flow() {
+        // Drive the full handshake through `&mut dyn DvcProcessor` to verify
+        // vtable dispatch (channel_name / start / process / close).
+        let mut owner = RdpeiDvcClient::new();
+        let dyn_proc: &mut dyn DvcProcessor = &mut owner;
+
+        assert_eq!(dyn_proc.channel_name(), "Microsoft::Windows::RDS::Input");
+        assert!(dyn_proc.start(1).unwrap().is_empty());
+
+        let sc_bytes = sc_ready(RDPINPUT_PROTOCOL_V200, None);
+        let msgs = dyn_proc.process(1, &sc_bytes).unwrap();
+        assert_eq!(msgs.len(), 1);
+        // Decoded CS_READY negotiated to V200.
+        let cs = CsReadyPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(cs.protocol_version, RDPINPUT_PROTOCOL_V200);
+
+        // SUSPEND via trait object.
+        let suspended = dyn_proc.process(1, &suspend()).unwrap();
+        assert!(suspended.is_empty());
+
+        dyn_proc.close(1);
+        // Post-close: not ready.
+        assert!(!owner.is_ready());
+    }
+
+    #[test]
+    fn take_pending_messages_idempotent() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.dismiss_hovering_contact(1).unwrap();
+        assert_eq!(c.take_pending_messages().len(), 1);
+        // Second call after drain returns empty.
+        assert!(c.take_pending_messages().is_empty());
+    }
+
+    #[test]
+    fn custom_max_touch_contacts_reflected_in_cs_ready() {
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            max_touch_contacts: 256,
+            ..Default::default()
+        });
+        let msgs = c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        let cs = CsReadyPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(cs.max_touch_contacts, 256);
+    }
+
     #[test]
     fn close_resets_state() {
         let mut c = RdpeiDvcClient::new();
         c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
         c.dismiss_hovering_contact(1).unwrap();
         assert!(c.is_ready());
-        assert!(!c.take_pending_messages().is_empty() || c.take_pending_messages().is_empty());
 
         c.close(1);
         assert!(!c.is_ready());
+        assert!(
+            c.take_pending_messages().is_empty(),
+            "close() must clear outbound queue"
+        );
         assert_eq!(c.negotiated_version(), None);
         assert_eq!(c.server_features(), None);
         assert!(!c.is_input_suspended());
