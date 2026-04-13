@@ -1558,14 +1558,42 @@ pub trait GfxHandler: Send {
 
 ### 9.5 Pen/Stylus Input (MS-RDPEPS)
 
-> **requires**: 7.3 DVC 프레임워크
-> **검증**: PDU roundtrip
+> **requires**: 9.4 Touch Input (MS-RDPEI V200+) ✅
+> **검증**: PDU roundtrip + mock DVC integration
 
-**DVC 이름**: `Microsoft::Windows::RDS::Pen`
+**정정**: MS-RDPEPS 라는 별도 스펙/채널은 존재하지 않습니다. Pen 입력은
+MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
+`EVENTID_PEN = 0x0008` 이벤트로 추가됩니다. `justrdp-rdpei` 크레이트를
+**확장**하는 작업이며, 별도 크레이트가 아닙니다.
 
-- [ ] 펜 프레임 PDU
-- [ ] 압력, 기울기, 회전 데이터
-- [ ] 펜 타입 (펜, 지우개)
+**기존 재사용**: `RdpeiHeader`, 가변 정수 코덱(2/4/8-byte), `ScReadyPdu`/
+`CsReadyPdu` 협상, `RdpeiDvcClient` 상태 머신, DoS cap 패턴.
+
+**구현 단계** (3단계, §9.4 패턴 축약):
+
+- [x] **Step 1 — Spec Analysis (mini)**: `@spec-checker` MS-RDPEI
+  §2.2.3.7+ 의 pen 확장 부분만 분석하여 기존 체크리스트
+  (`specs/ms-rdpei-checklist.md` §11–21) 에 append ✅
+  - `EVENTID_PEN = 0x0008` PDU 래퍼 구조
+  - `RDPINPUT_PEN_CONTACT` 필드 (penContactId, fieldsPresent, x, y, penFlags, 선택: pressure, rotation, tiltX, tiltY)
+  - `PEN_FLAGS_*` 비트 및 유효 조합
+  - `PEN_FIELDS_PRESENT_*` 비트
+  - V200 vs V300 feature 분기 (multipen injection)
+  - 최대 펜 contact 수 / 최대 프레임 수 (스펙 vs 정책)
+
+- [ ] **Step 2 — Implementation** (`crates/justrdp-rdpei/src/pdu.rs` + `client.rs`)
+  - [ ] `PenContact { pen_contact_id, x, y, pen_flags, pressure, rotation, tilt_x, tilt_y }` + Encode/Decode + 유효 flag 조합 validation
+  - [ ] `PenFrame { frame_offset, contacts: Vec<PenContact> }` (재사용 가능한 경우 `TouchFrame` 과 제네릭화 검토, 단순 중복이 나으면 중복)
+  - [ ] `PenEventPdu { encode_time, frames }` — eventId=0x0008
+  - [ ] 가변 정수 재사용, DoS cap 재사용 (`MAX_CONTACTS_PER_FRAME`/`MAX_FRAMES_PER_EVENT` 공용)
+  - [ ] `RdpeiDvcClient::send_pen_event(encode_time, frames)` API 추가
+  - [ ] 버전 게이트: `negotiated_version >= V200` 아니면 에러
+  - [ ] V300 multipen injection 플래그 활성 요건 검증
+
+- [ ] **Step 3 — Verification**
+  - [ ] `@impl-verifier` — 스펙 1:1 대조 (§9.4 갭 패턴 재사용으로 축소)
+  - [ ] `@test-gap-finder` — pen 특유의 누락 체크
+  - [ ] 전체 테스트 통과 + 워크스페이스 clean 빌드 확인
 
 ### 9.6 Smartcard Authentication (PKINIT)
 
