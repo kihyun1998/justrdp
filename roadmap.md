@@ -1595,15 +1595,75 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
   - [x] `@test-gap-finder` — Critical 4 + Medium 3 갭 식별 및 전부 보강
   - [x] 추가된 테스트: x/y 가변 form 교차, rotation 127/128 form 경계, tilt ±63/±64 form 경계, partial fieldsPresent 조합 (4종), decode-side out-of-range 거부 (invalid flags, pressure, rotation, tilt), pen_event_pdu zero frames + full-optional pdu_length, close()가 pen 상태 리셋 확인, 재연결 시 pen 상태 재협상, send_pen_event 큐 cap
 
-### 9.6 Smartcard Authentication (PKINIT)
+### 9.6 Smartcard Authentication (PKINIT — local card source)
 
-> **requires**: Phase 2 Kerberos, 8.3 RDPDR 스마트카드 리다이렉션
-> **검증**: 스마트카드 로그인 integration test
+> **requires**: §5.2.3 PKINIT (✅ ASN.1 + KerberosSequence 완성),
+> RFC 4556 (PKINIT for Kerberos)
+> **검증**: Mock provider 기반 PKINIT AS-REQ 생성 unit test +
+> `pcsc` crate 컴파일 통과 (실 하드웨어 검증은 추후)
 
-- [ ] PKCS#11 인터페이스
-- [ ] 인증서 기반 Kerberos (PKINIT)
-- [ ] 스마트카드 리더 열거
-- [ ] PIN 입력 인터페이스
+**정정 사항**:
+- 기존 `[ ] 인증서 기반 Kerberos (PKINIT)` 항목은 §5.2.3 line 600 과
+  **완전 중복**. ASN.1, AS-REQ/AS-REP 처리, DH 합의는 모두 구현됨
+  (`crates/justrdp-pdu/src/kerberos/pkinit.rs` 295줄 +
+  `crates/justrdp-connector/src/credssp/kerberos.rs::new_pkinit`).
+- 8.3 RDPDR `ScardBackend` (✅ 구현됨)는 **서버로 카드를 redirect**
+  하는 용도 (server-side). §9.6 는 **클라이언트가 자기 카드로 PKINIT**
+  하는 용도 (client-side). 두 코드 경로는 분리되며, 공통점은 미래에
+  PC/SC native binding 을 공유할 수 있다는 정도임.
+- 따라서 §9.6 의 실제 간극은: `PkinitConfig` 가 현재 raw DER cert + raw
+  `RsaPrivateKey` 만 받음 → **카드/HSM 소스 추상화 trait + 어댑터**
+  필요.
+
+**범위 (재정의)**:
+
+`SmartcardProvider` trait 으로 cert 추출/PIN/서명 작업을 추상화하고,
+`PkinitConfig` 가 옵션으로 provider 를 받도록 확장. Phase 1 은
+하드웨어 없이 완결, Phase 2 는 `pcsc` crate 어댑터를 작성하되 컴파일
++ 단위 테스트만 통과 (실 하드웨어 검증 TODO).
+
+**Phase 1 — 추상화 + Mock + PKINIT 통합 (하드웨어 불필요)**
+
+- [ ] **Step 0** — 로드맵 정정 (이 작업)
+- [ ] **Step 1** — `@spec-checker` mini: RFC 4556 클라이언트 측
+      cert/key 요구사항 (어떤 ASN.1 구조에 cert 가 들어가는지, signing
+      이 어디서 일어나는지) 확인. 기존 PKINIT 코드와 1:1 매핑.
+- [ ] **Step 2** — `crates/justrdp-pkinit-card/` 신규 크레이트
+  - [ ] `SmartcardProvider` trait (list_readers, select_card,
+        get_certificate_der, sign_with_pin)
+  - [ ] `CardHandle` 추상 핸들
+  - [ ] `MockSmartcardProvider` — 하드코딩 test fixture cert + key
+        반환 (옵션 B: `tests/fixtures/test_cert.der`,
+        `test_key.pkcs8.der` 사전 생성하여 commit)
+- [ ] **Step 3** — `PkinitConfig` 확장
+  - [ ] `from_provider(provider, reader, pin)` 빌더
+  - [ ] `KerberosSequence::new_pkinit` 가 provider 경유 cert/sign
+        호출하도록 분기
+  - [ ] 기존 raw cert + RsaPrivateKey 경로는 보존 (backward compat)
+- [ ] **Step 4** — Phase 1 검증
+  - [ ] Mock provider 기반 AS-REQ 생성 unit test (PA-PK-AS-REQ
+        구조 검증)
+  - [ ] `@impl-verifier` 로 RFC 4556 1:1 대조
+
+**Phase 2 — Native PC/SC backend (실 하드웨어 검증 TODO)**
+
+- [ ] **Step 5** — `crates/justrdp-pkinit-card-pcsc/` 또는
+      `pkinit-card` 내 feature gate
+  - [ ] `pcsc` crate 의존성 추가 (cross-platform: WinSCard /
+        pcsc-lite / CryptoTokenKit 자동 선택)
+  - [ ] `PcscSmartcardProvider` impl `SmartcardProvider`
+  - [ ] APDU 시퀀스: SELECT AID → VERIFY (PIN) → INTERNAL
+        AUTHENTICATE 또는 PSO COMPUTE DIGITAL SIGNATURE
+  - [ ] 카드 종류: PIV (NIST SP 800-73) 우선, GIDS / OpenPGP 는
+        후속
+  - [ ] **명시적 untested 마킹**: doc comment + `#[cfg(test)]`
+        에서 mock 만 검증, 실 카드 통합은 README TODO 로 분리
+
+- [ ] **Step 6** — 최종 검증
+  - [ ] `@code-reviewer` (Phase 1 + Phase 2 양쪽)
+  - [ ] `@security-scanner` (PIN 처리, 메모리 zeroize, 카드 핸들
+        라이프타임)
+  - [ ] 워크스페이스 clean 빌드 + 전체 테스트 통과
 
 ### 9.7 USB Redirection (MS-RDPEUSB)
 
