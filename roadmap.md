@@ -1736,15 +1736,62 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 ### 9.8 Video Optimized Remoting (MS-RDPEVOR)
 
-> **requires**: 7.3 DVC, 8.8 H.264, 9.11 Geometry Tracking
-> **검증**: 비디오 스트림 수신 integration test
+> **requires**: 7.3 DVC ✅, 8.8 H.264 ✅ (trait), **9.11 MS-RDPEGT 선행 필수**
+> **검증**: Control/Data 2채널 핸드셰이크 + H.264 frame delivery integration test (mock decoder)
+> **크레이트**: `justrdp-rdpevor` (신규)
 
-**DVC 이름**: `Microsoft::Windows::RDS::Video::Control`, `Microsoft::Windows::RDS::Video::Data`
+**DVC 이름**:
+- `Microsoft::Windows::RDS::Video::Control` — TSMM 제어 채널
+- `Microsoft::Windows::RDS::Video::Data` — H.264 NAL 프레임 데이터 채널
 
-- [ ] 비디오 스트림 생성/삭제
-- [ ] 지오메트리 업데이트
-- [ ] H.264 비디오 데이터 전송
-- [ ] 프레젠테이션 요청/응답
+#### Step 0: Spec Analysis
+- [ ] `@spec-checker §9.8 MS-RDPEVOR` 실행 → `specs/ms-rdpevor-checklist.md` 생성
+- [ ] TSMM_PACKET 공통 헤더 (cbSize/PacketType) 와이어 포맷 추출
+- [ ] PresentationId ↔ MappedGeometry 연관 규칙 확인
+- [ ] DoS caps 결정 (최대 frame size, 최대 동시 presentation 수)
+
+#### Step 1: Crate Skeleton
+- [ ] `crates/justrdp-rdpevor/` 생성 (no_std, forbid unsafe)
+- [ ] `Cargo.toml`, `lib.rs`, `pdu.rs`, `control.rs`, `data.rs`, `client.rs` 골격
+- [ ] Workspace `Cargo.toml` members + workspace deps 등록
+
+#### Step 2: TSMM Control PDUs (pdu.rs)
+- [ ] `TSMM_PACKET_HEADER` (cbSize, PacketType)
+- [ ] `TSMM_PRESENTATION_REQUEST` (PresentationId, Version, SourceWidth/Height, ScaledWidth/Height, hnsTimestampOffset, GeometryMappingId, VideoSubtypeId, cbExtra, pExtraData)
+- [ ] `TSMM_PRESENTATION_RESPONSE` (PresentationId, ResponseFlags)
+- [ ] `TSMM_CLIENT_NOTIFICATION` (PresentationId, NotificationType, cbData, NotificationData)
+- [ ] `TSMM_VIDEO_DATA` (PresentationId, Version, Flags, cbData, pSample)
+- [ ] `VideoSubtypeId` (MEDIASUBTYPE GUID 상수: H264, NV12, YV12 등)
+- [ ] PacketType enum (PRESENTATION_REQUEST=1, PRESENTATION_RESPONSE=2, CLIENT_NOTIFICATION=3, VIDEO_DATA=4)
+- [ ] 모든 PDU Encode/Decode + roundtrip 테스트
+
+#### Step 3: H.264 Decoder Abstraction
+- [ ] `VideoDecoder` trait (submit_nal, pull_frame, reset) — 기존 8.8의 H.264 backend trait와 통합 또는 별도
+- [ ] `MockVideoDecoder` (테스트용, 프레임 수만 카운트)
+- [ ] Feature-gate 실제 디코더 백엔드 (옵션)
+
+#### Step 4: Control/Data 2-Channel Client (client.rs)
+- [ ] `RdpevorControlClient` — DVC processor for `::Video::Control`
+  - [ ] PresentationRequest 수신 → GeometryMappingId 조회 (Step 5 연동)
+  - [ ] PresentationResponse 송신 (Accept/Reject)
+  - [ ] ClientNotification 송신 (Framerate override, Video disabled 등)
+- [ ] `RdpevorDataClient` — DVC processor for `::Video::Data`
+  - [ ] VIDEO_DATA 수신 → cbData 경계 검증 → VideoDecoder.submit_nal()
+  - [ ] Presentation 생명주기 관리 (active presentation map)
+- [ ] `RdpevorGeometryHost` trait — Geometry Tracking 연동 bridge (9.11이 제공)
+
+#### Step 5: Geometry Integration
+- [ ] `GeometryMappingId` resolver 후크 (9.11 MS-RDPEGT에서 주입)
+- [ ] Presentation → mapped rect lookup 테스트 (mock geometry host)
+
+#### Step 6: Integration Test
+- [ ] End-to-end: Control handshake → Presentation 오픈 → N × VIDEO_DATA → Client notification → Presentation 종료
+- [ ] 잘못된 PresentationId / 미지 PacketType silent-ignore 검증
+- [ ] 프레임 size cap 초과 → 채널 닫기
+
+#### Step 7: Verification
+- [ ] `@impl-verifier` → 0 FAIL
+- [ ] `@code-reviewer` + `@security-scanner` → 이슈 0건 (또는 문서화)
 
 ### 9.9 Camera Redirection (MS-RDPECAM)
 
@@ -1769,16 +1816,20 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [ ] 스트림 타이밍 동기화 (presentation timestamp)
 - [ ] 레거시 비디오 리다이렉션 (RDPEVOR 이전 방식)
 
-### 9.11 Geometry Tracking (RDPGFX)
+### 9.11 Geometry Tracking (MS-RDPEGT) ✅
 
-> **requires**: 7.3 DVC 프레임워크, 8.6 EGFX
-> **검증**: PDU roundtrip
+> **requires**: 7.3 DVC ✅
+> **검증**: PDU roundtrip + RDPEVOR 연동용 host trait
+> **크레이트**: `justrdp-rdpegt` ✅
+> **참고**: 스펙은 MS-RDPEGT (Geometry Tracking), RDPGFX와 별개
 
 **DVC 이름**: `Microsoft::Windows::RDS::Geometry::v08.01`
 
-- [ ] 지오메트리 업데이트 PDU
-- [ ] 렌더링 영역 추적 (비디오 오버레이 위치)
-- [ ] RDPEVOR과 연동하여 비디오 위치 동기화
+- [x] Step 0: Spec Analysis → `specs/ms-rdpegt-checklist.md`
+- [x] Step 1: Crate Skeleton (no_std, forbid unsafe)
+- [x] Step 2: PDUs — `MappedGeometryPacket` (Update/Clear), `IRect`, `RGNDATAHEADER`, `cbGeometryData == 72 + cbGeometryBuffer` (no trailing Reserved byte), §4.1 120B vector roundtrip
+- [x] Step 3: `RdpegtClient` DVC processor, `GeometryEntry` map, `GeometryLookup` trait for RDPEVOR
+- [x] Step 4: impl-verifier 0 FAIL (after fixes), code-reviewer + security-scanner clean (23/23 tests, DoS caps, MAX_ACTIVE_MAPPINGS boundary test, trailing-byte rejection, pre-start guard)
 
 ### 9.12 Desktop Composition (MS-RDPECR2)
 
