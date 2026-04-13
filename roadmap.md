@@ -1673,11 +1673,17 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
         `Context::establish` / `Card::transmit` 경로는 하드웨어 검증
         TODO
 
-- [ ] **Step 6** — 최종 검증
-  - [ ] `@code-reviewer` (Phase 1 + Phase 2 양쪽)
-  - [ ] `@security-scanner` (PIN 처리, 메모리 zeroize, 카드 핸들
-        라이프타임)
-  - [ ] 워크스페이스 clean 빌드 + 전체 테스트 통과
+- [x] **Step 6** — 최종 검증 (3 agents 병렬)
+  - [x] `@impl-verifier` — 42/44 PASS, 2 minor (PIV chaining 61 XX
+        TODO + decode test gap)
+  - [x] `@code-reviewer` — 9 issues, 핵심만 수정 (에러 정보 보존,
+        magic numbers, 0x63C0 promotion, 데드코드 마킹)
+  - [x] `@security-scanner` — 0 Critical, 4 Warning + 6 Info,
+        실질 항목 전부 수정 (BER 파서 bounds, PIN APDU zeroize,
+        Mock Drop, constant-time PIN 비교, 빈 cert 거부, 스테일
+        보안 주석 정정, version 주석 정정)
+  - [x] 워크스페이스 clean 빌드 + 전체 테스트 통과
+        (rsa 9 / pkinit-card 30 / connector pkinit 6)
 
 ### 9.7 USB Redirection (MS-RDPEUSB)
 

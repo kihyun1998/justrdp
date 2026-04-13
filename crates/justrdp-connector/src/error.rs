@@ -4,6 +4,8 @@
 
 use core::fmt;
 
+extern crate alloc;
+
 use justrdp_core::{DecodeError, EncodeError};
 use justrdp_pdu::mcs::ConnectResponseResult;
 use justrdp_pdu::rdp::licensing::LicenseErrorCode;
@@ -32,6 +34,10 @@ pub enum ConnectorErrorKind {
     LicensingError(LicenseErrorCode),
     /// General protocol violation.
     General(&'static str),
+    /// General protocol violation with a runtime-formatted message.
+    /// Use this when the cause is dynamic (e.g., wraps a downstream
+    /// error's Display impl).
+    GeneralOwned(alloc::string::String),
 }
 
 /// Connector error with state context.
@@ -44,6 +50,12 @@ impl ConnectorError {
     pub fn general(msg: &'static str) -> Self {
         Self {
             kind: ConnectorErrorKind::General(msg),
+        }
+    }
+
+    pub fn general_owned(msg: alloc::string::String) -> Self {
+        Self {
+            kind: ConnectorErrorKind::GeneralOwned(msg),
         }
     }
 
@@ -95,6 +107,7 @@ impl fmt::Display for ConnectorError {
                 write!(f, "licensing error: {code:?}")
             }
             ConnectorErrorKind::General(msg) => write!(f, "{msg}"),
+            ConnectorErrorKind::GeneralOwned(msg) => write!(f, "{msg}"),
         }
     }
 }

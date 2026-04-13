@@ -3,8 +3,9 @@
 //! Cross-platform PC/SC smartcard backend (Phase 2).
 //!
 //! **STATUS: COMPILE-TESTED ONLY.** This module builds against the
-//! `pcsc` crate (which transparently dispatches to WinSCard on
-//! Windows, pcsc-lite on Linux/BSD, and CryptoTokenKit on macOS) and
+//! `pcsc` crate (resolved version 2.9 at workspace lock time, which
+//! transparently dispatches to WinSCard on Windows, pcsc-lite on
+//! Linux/BSD, and CryptoTokenKit on macOS) and
 //! its pure-Rust APDU helpers are unit-tested, but the live PC/SC
 //! call paths (`Context::establish`, `Card::transmit`) have **not**
 //! been validated against real hardware. Treat as a starting skeleton.
@@ -66,6 +67,12 @@ pub const PIV_RSA_2048_MODULUS_BYTES: usize = 256;
 
 /// Maximum APDU response length we accept in a single transmit (Le=0).
 pub const MAX_APDU_RESPONSE: usize = 4096;
+
+/// Response buffer size for SELECT (FCI is small).
+const SELECT_RSP_BUF: usize = 256;
+
+/// Response buffer size for VERIFY (only SW1/SW2).
+const VERIFY_RSP_BUF: usize = 16;
 
 // ── Pure APDU helpers (unit-testable, no PC/SC dependency) ──
 
@@ -223,11 +230,13 @@ pub fn parse_general_authenticate_response(rsp: &[u8]) -> Result<Vec<u8>, Smartc
 
 /// Map a PIV VERIFY status word pair to a `SmartcardError`. PIV
 /// returns `63 CX` where X is the remaining tries on a wrong-PIN, and
-/// `69 83` for a blocked card.
+/// `69 83` for a blocked card. `63 C0` (zero remaining tries) is
+/// promoted to `PinBlocked` so callers don't have to special-case it.
 pub fn classify_verify_sw(sw1: u8, sw2: u8) -> Option<SmartcardError> {
     match (sw1, sw2) {
         (0x90, 0x00) => None,
-        (0x63, c) if (0xC0..=0xCF).contains(&c) => Some(SmartcardError::PinIncorrect {
+        (0x63, 0xC0) => Some(SmartcardError::PinBlocked),
+        (0x63, c) if (0xC1..=0xCF).contains(&c) => Some(SmartcardError::PinIncorrect {
             remaining_tries: Some(c & 0x0F),
         }),
         (0x69, 0x83) => Some(SmartcardError::PinBlocked),
@@ -261,7 +270,10 @@ pub fn parse_piv_certificate_envelope(body: &[u8]) -> Result<Vec<u8>, SmartcardE
     let mut i = 0;
     while i < inner.len() {
         let tag = inner[i];
-        let (len, hdr) = parse_ber_length(&inner[i + 1..])
+        let rest = inner
+            .get(i + 1..)
+            .ok_or_else(|| SmartcardError::Other("inner TLV truncated".to_string()))?;
+        let (len, hdr) = parse_ber_length(rest)
             .ok_or_else(|| SmartcardError::Other("inner TLV bad length".to_string()))?;
         let val_start = i + 1 + hdr;
         let val_end = val_start
@@ -338,7 +350,7 @@ impl PcscSmartcardProvider {
 
         // Select PIV application.
         let select = build_select_piv_apdu();
-        let mut rsp_buf = [0u8; 256];
+        let mut rsp_buf = [0u8; SELECT_RSP_BUF];
         let rsp = card
             .transmit(&select, &mut rsp_buf)
             .map_err(|e| SmartcardError::Other(format!("SELECT PIV transmit: {e:?}")))?;
@@ -367,12 +379,19 @@ impl SmartcardProvider for PcscSmartcardProvider {
     }
 
     fn verify_pin(&mut self, pin: &[u8]) -> Result<(), SmartcardError> {
-        let apdu = build_verify_pin_apdu(pin)
+        let mut apdu = build_verify_pin_apdu(pin)
             .ok_or_else(|| SmartcardError::Other("PIN must be 1..=8 bytes".to_string()))?;
-        let mut rsp_buf = [0u8; 16];
-        let rsp = self
+        let mut rsp_buf = [0u8; VERIFY_RSP_BUF];
+        let result = self
             .card
             .transmit(&apdu, &mut rsp_buf)
+            .map(|rsp| (rsp.len(), rsp.first().copied().unwrap_or(0), rsp));
+        // Zero the APDU buffer immediately — it contains the PIN bytes
+        // padded with 0xFF. SHOULD per `SmartcardProvider::verify_pin`
+        // contract. We do this regardless of transmit success.
+        apdu.fill(0);
+        let rsp = result
+            .map(|(_, _, rsp)| rsp)
             .map_err(|e| SmartcardError::Other(format!("VERIFY transmit: {e:?}")))?;
         if rsp.len() < 2 {
             return Err(SmartcardError::Other("VERIFY: short response".to_string()));
@@ -607,6 +626,13 @@ mod tests {
     #[test]
     fn classify_verify_sw_pin_blocked() {
         let err = classify_verify_sw(0x69, 0x83).unwrap();
+        assert_eq!(err, SmartcardError::PinBlocked);
+    }
+
+    #[test]
+    fn classify_verify_sw_63c0_promoted_to_blocked() {
+        // `63 C0` means zero remaining tries → effectively blocked.
+        let err = classify_verify_sw(0x63, 0xC0).unwrap();
         assert_eq!(err, SmartcardError::PinBlocked);
     }
 

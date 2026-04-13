@@ -407,13 +407,21 @@ impl KerberosSequence {
             // Matches PIV (NIST SP 800-73-4 §3.3.2) and PKCS#11
             // CKM_RSA_PKCS pre-hashed mode. RFC 4556 §3.2.1 + spec memo
             // specs/pkinit-smartcard-notes.md.
+            let end_entity = provider.get_certificate();
+            if end_entity.is_empty() {
+                return Err(ConnectorError::general(
+                    "smartcard provider returned an empty certificate",
+                ));
+            }
             let mut hasher = Sha256::new();
             hasher.update(&auth_pack_der);
             let digest = hasher.finalize();
-            let sig = provider
-                .sign_digest(&digest)
-                .map_err(|_| ConnectorError::general("smartcard sign_digest failed"))?;
-            let mut chain: Vec<Vec<u8>> = vec![provider.get_certificate()];
+            let sig = provider.sign_digest(&digest).map_err(|e| {
+                ConnectorError::general_owned(alloc::format!(
+                    "smartcard sign_digest failed: {e}"
+                ))
+            })?;
+            let mut chain: Vec<Vec<u8>> = vec![end_entity];
             chain.extend(provider.get_intermediate_chain());
             (chain, sig)
         } else {
@@ -426,7 +434,11 @@ impl KerberosSequence {
 
         // Extract issuer and serial from end-entity certificate.
         let (issuer_der, serial_der) = cms::extract_cert_issuer_serial(&cert_chain[0])
-            .map_err(|_| ConnectorError::general("failed to parse client certificate"))?;
+            .map_err(|e| {
+                ConnectorError::general_owned(alloc::format!(
+                    "failed to parse client certificate: {e:?}"
+                ))
+            })?;
 
         // Build CMS SignerInfo.
         let signer_info = cms::build_signer_info(&issuer_der, &serial_der, &signature);
@@ -1193,6 +1205,46 @@ mod tests {
         assert_eq!(as_req[0], 0x6a);
         // DH private key was stored host-side.
         assert!(seq.dh_private_key.is_some());
+    }
+
+    #[test]
+    fn pkinit_smartcard_provider_empty_certificate_rejected() {
+        // A malicious / misconfigured provider returning an empty cert
+        // must be rejected with a clear error before any signing.
+        use justrdp_pkinit_card::{SmartcardError, SmartcardProvider};
+
+        struct EmptyCertProvider;
+        impl SmartcardProvider for EmptyCertProvider {
+            fn get_certificate(&self) -> Vec<u8> {
+                Vec::new()
+            }
+            fn get_intermediate_chain(&self) -> Vec<Vec<u8>> {
+                Vec::new()
+            }
+            fn verify_pin(&mut self, _pin: &[u8]) -> Result<(), SmartcardError> {
+                Ok(())
+            }
+            fn sign_digest(&self, _digest: &[u8]) -> Result<Vec<u8>, SmartcardError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let random = KerberosRandom {
+            nonce: 99,
+            tgs_nonce: 100,
+            confounder_as: [0; 16],
+            confounder_tgs_auth: [0; 16],
+            confounder_ap_auth: [0; 16],
+            subkey: vec![0x42; 32],
+            seq_number: 1,
+            timestamp_usec: 0,
+            client_dh_nonce: [0u8; 32],
+        };
+        let config = PkinitConfig::from_provider(Box::new(EmptyCertProvider), vec![0x42; 32]);
+        let mut seq =
+            KerberosSequence::new_pkinit("alice", "REALM.COM", "server", random, config);
+        let result = seq.build_as_req_pkinit(b"20260326120000Z", 0);
+        assert!(result.is_err(), "empty cert must be rejected");
     }
 
     #[test]

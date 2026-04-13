@@ -134,7 +134,7 @@ impl SmartcardProvider for MockSmartcardProvider {
 
     fn verify_pin(&mut self, pin: &[u8]) -> Result<(), SmartcardError> {
         match &self.expected_pin {
-            Some(expected) if expected.as_slice() != pin => {
+            Some(expected) if !ct_eq(expected.as_slice(), pin) => {
                 Err(SmartcardError::PinIncorrect { remaining_tries: Some(2) })
             }
             _ => {
@@ -158,11 +158,35 @@ impl SmartcardProvider for MockSmartcardProvider {
 }
 
 fn format_crypto_error(e: justrdp_core::CryptoError) -> String {
-    // CryptoError doesn't impl Display in no_std; use Debug.
+    // TODO: switch to `{e}` once justrdp-core::CryptoError implements Display.
     let mut s = String::new();
     use core::fmt::Write;
     let _ = write!(s, "{e:?}");
     s
+}
+
+/// Constant-time byte-slice equality. Returns `true` iff `a` and `b`
+/// have the same length and every byte matches. The branch on `len`
+/// itself is not constant-time across different-length inputs, but
+/// equal-length comparisons run in time independent of the contents.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+impl Drop for MockSmartcardProvider {
+    fn drop(&mut self) {
+        if let Some(ref mut p) = self.expected_pin {
+            p.fill(0);
+        }
+        // RsaPrivateKey has its own Drop that zeroes n/d/e.
+    }
 }
 
 #[cfg(test)]
