@@ -1687,13 +1687,52 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 ### 9.7 USB Redirection (MS-RDPEUSB)
 
-> **requires**: 7.3 DVC 프레임워크, 8.3 RDPDR
-> **검증**: USB 디바이스 열거 integration test
+> **requires**: 7.3 DVC 프레임워크 (RDPDR 불필요 — URBDRC DVC 직접 사용)
+> **검증**: capability exchange + ADD_DEVICE + URB_COMPLETION roundtrip (mock)
 
-- [ ] USB 디바이스 열거
-- [ ] URB (USB Request Block) 포워딩
-- [ ] 디바이스 핫플러그 알림
-- [ ] USB over RDPDR 전송
+**DVC 이름**: `URBDRC` (Control), per-device sub-channel name = interface ID
+
+**구현 범위 결정 (하드웨어 없음, 전구현)**:
+- 커넥션/열거 레이어는 완전 구현 + mock 테스트
+- 실제 호스트 USB 스택 연동 제외 (`UrbHandler` trait만 노출 → 상위 레이어 선택)
+
+**Steps**:
+- [x] **Step 0**: 로드맵 정정 (이 블록)
+- [x] **Step 1**: `@spec-checker MS-RDPEUSB` → `specs/ms-rdpeusb-checklist.md` (683 lines)
+- [x] **Step 2**: `justrdp-rdpeusb` 크레이트 — PDU 레이어 (`pdu.rs` + `ts_urb.rs`)
+  - [x] Shared header (30-bit InterfaceID + 2-bit Mask 패킹, 8B response / 12B request)
+  - [x] RIM_EXCHANGE_CAPABILITY_REQUEST/RESPONSE
+  - [x] CHANNEL_CREATED
+  - [x] ADD_VIRTUAL_CHANNEL, ADD_DEVICE (+ USB_DEVICE_CAPABILITIES 28B)
+  - [x] INTERNAL_IO_CONTROL, IO_CONTROL
+  - [x] QUERY_DEVICE_TEXT / QUERY_DEVICE_TEXT_RSP
+  - [x] REGISTER_REQUEST_CALLBACK
+  - [x] TRANSFER_IN_REQUEST / TRANSFER_OUT_REQUEST
+  - [x] URB_COMPLETION / URB_COMPLETION_NO_DATA / IOCONTROL_COMPLETION
+  - [x] CANCEL_REQUEST
+  - [x] RETRACT_DEVICE
+  - [x] TS_URB 15 variants (SelectConfiguration, SelectInterface, PipeRequest, BulkOrInterrupt, IsochTransfer, ControlTransfer/Ex, Feature/Descriptor/Status/Vendor/GetConfig/GetInterface/OsFeatureDescriptor)
+  - [x] DoS 캡 (transferBufferLength=16MiB, IoCtl=64KiB, isoch packets=1024, pipes=64, 문자열 캡 등)
+- [x] **Step 3**: DVC client state machine (`UrbdrcClient`) + `UrbHandler` trait
+  - [x] Control channel: WaitCapabilityRequest → WaitServerChannelCreated → Ready
+  - [x] 디바이스 dispatch + `UsbDevice → RequestCompletion` 매핑
+  - [x] `UrbHandler` trait (호스트 USB 스택 추상화) + `MockUrbHandler`
+  - [x] Out-of-sequence / replay 방어 (state guard, dispatch guard)
+- [x] **Step 4**: `@impl-verifier` — 141 PASS / 2 FAIL → fixed
+  - [x] IOCONTROL_COMPLETION ERROR_INSUFFICIENT_BUFFER 경로 (§2.2.7.1 OutputBufferSize == request.OutputBufferSize)
+  - [x] `handle_query_device_text` 파라미터 이름 수정 (`request_id` → `message_id`)
+- [x] **Step 5**: code-reviewer + security-scanner
+  - [x] HIGH-1 (sec): `TsUsbdInterfaceInformation::decode` checked_mul + try_from
+  - [x] HIGH-2 (sec): local cap guard before `vec![0; output_max]`
+  - [x] MEDIUM-2 (sec): dispatch guard for device msgs pre-Ready
+  - [x] MEDIUM-3 (sec): Utf16String/Multisz wire_cch/bytes saturating
+  - [x] handle_capability / handle_channel_created replay 방어 state guard
+  - [x] `urb_result.len() as u16` 오버플로 체크 (2 곳)
+  - [x] Dead code 정리 (`saw_nul`, `let _ = (header, expected_fid)`, `let _ = information`)
+  - [x] `#[must_use]` 추가
+- [x] **Step 6+7**: replay/pre-Ready 테스트 3개 추가 + 커밋
+  - [x] 42 tests (41 unit + 1 integration) / 0 failures
+  - [x] 워크스페이스 clean build
 
 ### 9.8 Video Optimized Remoting (MS-RDPEVOR)
 
