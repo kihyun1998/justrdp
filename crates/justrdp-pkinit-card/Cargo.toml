@@ -1,0 +1,26 @@
+[package]
+name = "justrdp-pkinit-card"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Smartcard / HSM abstraction for client-side PKINIT in JustRDP"
+keywords = ["rdp", "pkinit", "smartcard", "kerberos"]
+categories = ["network-programming", "authentication"]
+
+[features]
+default = ["alloc", "mock"]
+alloc = ["justrdp-core/alloc", "justrdp-pdu/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-pdu/std"]
+mock = []
+# Phase 2: cross-platform PC/SC native backend. Untested without real
+# hardware — the code compiles and the unit tests pass against an
+# in-memory APDU stub, but real-card validation is a TODO.
+pcsc = ["dep:pcsc"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-pdu.workspace = true
+pcsc = { version = "2.8", optional = true }

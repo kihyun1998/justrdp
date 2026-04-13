@@ -12,9 +12,10 @@ categories = ["no-std", "network-programming"]
 
 [features]
 default = ["alloc"]
-alloc = ["justrdp-core/alloc", "justrdp-pdu/alloc"]
-std = ["alloc", "justrdp-core/std", "justrdp-pdu/std"]
+alloc = ["justrdp-core/alloc", "justrdp-pdu/alloc", "justrdp-pkinit-card/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-pdu/std", "justrdp-pkinit-card/std"]
 
 [dependencies]
 justrdp-core.workspace = true
 justrdp-pdu.workspace = true
+justrdp-pkinit-card.workspace = true

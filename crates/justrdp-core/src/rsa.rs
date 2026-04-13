@@ -125,16 +125,24 @@ fn build_pkcs1_em(k: usize, hash: &[u8; 32]) -> Option<Vec<u8>> {
 /// Returns `CryptoError::InvalidKeySize` if the key is too small for PKCS#1 v1.5
 /// with SHA-256 (minimum 62 bytes / 496 bits).
 pub fn rsa_sign_sha256(key: &RsaPrivateKey, data: &[u8]) -> CryptoResult<Vec<u8>> {
-    let k = key.key_size();
-
-    // Hash
     let mut hasher = Sha256::new();
     hasher.update(data);
     let hash = hasher.finalize();
+    rsa_sign_sha256_digest(key, &hash)
+}
 
-    let em = build_pkcs1_em(k, &hash).ok_or(CryptoError::InvalidKeySize)?;
-
-    // RSA private key operation: signature = em^d mod n
+/// Sign a pre-computed SHA-256 digest with RSA PKCS#1 v1.5.
+///
+/// This is the primitive used by the smartcard provider abstraction
+/// (`SmartcardProvider::sign_digest` in `justrdp-pkinit-card`): the host
+/// computes the digest, the card (or mock) applies PKCS#1 v1.5 padding +
+/// RSA private-key exponentiation. Matches PIV (NIST SP 800-73-4 §3.3.2)
+/// and PKCS#11 `CKM_RSA_PKCS` with pre-hashed input.
+///
+/// Returns `CryptoError::InvalidKeySize` if the key is too small.
+pub fn rsa_sign_sha256_digest(key: &RsaPrivateKey, digest: &[u8; 32]) -> CryptoResult<Vec<u8>> {
+    let k = key.key_size();
+    let em = build_pkcs1_em(k, digest).ok_or(CryptoError::InvalidKeySize)?;
     // SECURITY: mod_exp is non-constant-time; timing side-channel exists for private exponent.
     let m = BigUint::from_be_bytes(&em);
     let s = m.mod_exp(&key.d, &key.n);

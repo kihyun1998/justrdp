@@ -1624,22 +1624,26 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 **Phase 1 — 추상화 + Mock + PKINIT 통합 (하드웨어 불필요)**
 
-- [ ] **Step 0** — 로드맵 정정 (이 작업)
-- [ ] **Step 1** — `@spec-checker` mini: RFC 4556 클라이언트 측
-      cert/key 요구사항 (어떤 ASN.1 구조에 cert 가 들어가는지, signing
-      이 어디서 일어나는지) 확인. 기존 PKINIT 코드와 1:1 매핑.
-- [ ] **Step 2** — `crates/justrdp-pkinit-card/` 신규 크레이트
-  - [ ] `SmartcardProvider` trait (list_readers, select_card,
-        get_certificate_der, sign_with_pin)
-  - [ ] `CardHandle` 추상 핸들
-  - [ ] `MockSmartcardProvider` — 하드코딩 test fixture cert + key
-        반환 (옵션 B: `tests/fixtures/test_cert.der`,
-        `test_key.pkcs8.der` 사전 생성하여 commit)
-- [ ] **Step 3** — `PkinitConfig` 확장
-  - [ ] `from_provider(provider, reader, pin)` 빌더
-  - [ ] `KerberosSequence::new_pkinit` 가 provider 경유 cert/sign
-        호출하도록 분기
-  - [ ] 기존 raw cert + RsaPrivateKey 경로는 보존 (backward compat)
+- [x] **Step 0** — 로드맵 정정 ✅
+- [x] **Step 1** — `@spec-checker` mini: trait shape locked
+      (`specs/pkinit-smartcard-notes.md`) ✅
+- [x] **Step 2** — `crates/justrdp-pkinit-card/` 신규 크레이트
+      (8 mock tests ✅)
+  - [x] `SmartcardProvider` trait — `get_certificate`,
+        `get_intermediate_chain`, `verify_pin`, `sign_digest`
+        (reader enumeration은 concrete provider 생성자 책임)
+  - [x] `SmartcardError` enum (PinIncorrect/Blocked/CardRemoved/...)
+  - [x] `MockSmartcardProvider` — 임베디드 minimal X.509 + 512-bit
+        RSA test key (외부 fixture 파일 없음, in-code 생성)
+- [x] **Step 3** — `PkinitConfig` 확장 (5 connector tests ✅)
+  - [x] `from_provider(provider, dh_bytes)` 빌더
+  - [x] `build_as_req_pkinit` 가 provider 있으면 host SHA-256 +
+        `provider.sign_digest()` + `[end_entity, ...intermediates]`
+        chain 사용
+  - [x] `smartcard_provider: None` 시 기존 raw key 경로 유지
+        (backward compat)
+  - [x] `justrdp-core::rsa::rsa_sign_sha256_digest` helper 추가
+        (hash 단계 분리)
 - [ ] **Step 4** — Phase 1 검증
   - [ ] Mock provider 기반 AS-REQ 생성 unit test (PA-PK-AS-REQ
         구조 검증)

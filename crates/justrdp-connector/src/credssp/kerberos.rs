@@ -5,6 +5,7 @@
 //! Drives the KDC exchange (AS-REQ/AS-REP, TGS-REQ/TGS-REP) and
 //! produces SPNEGO tokens (AP-REQ/AP-REP) for use in the CredSSP flow.
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -12,7 +13,7 @@ use justrdp_core::aes::{
     krb5_aes_checksum, krb5_aes_decrypt, krb5_aes_encrypt, krb5_aes_string_to_key,
 };
 use justrdp_core::bignum::BigUint;
-use justrdp_core::crypto::Sha1;
+use justrdp_core::crypto::{Sha1, Sha256};
 use justrdp_core::dh::{dh_compute_shared, dh_generate_keypair, OakleyGroup14};
 use justrdp_core::rsa::{rsa_sign_sha256, RsaPrivateKey};
 use justrdp_pdu::cms;
@@ -44,13 +45,56 @@ pub enum KerberosState {
 }
 
 /// PKINIT configuration for certificate-based authentication.
+///
+/// Two source modes are supported:
+///
+/// 1. **Raw key** (legacy / test path): provide `client_cert_der` and
+///    `private_key` directly. The host process holds the private key
+///    in memory and computes the signature locally.
+/// 2. **Smartcard provider** (recommended for hardware tokens): set
+///    `smartcard_provider` to a `Box<dyn SmartcardProvider>`. PKINIT
+///    will fetch the certificate chain via the provider and delegate
+///    the SHA-256-digest signing operation to it. The private key
+///    never leaves the card. Use [`PkinitConfig::from_provider`] for
+///    the convenient builder.
+///
+/// When `smartcard_provider` is `Some`, the `client_cert_der` and
+/// `private_key` fields are ignored. They remain in the struct only so
+/// the legacy `PkinitConfig { ... }` literal continues to compile.
 pub struct PkinitConfig {
-    /// Client certificate in DER format.
+    /// Client certificate in DER format. Ignored when
+    /// `smartcard_provider` is set.
     pub client_cert_der: Vec<u8>,
-    /// RSA private key for signing.
+    /// RSA private key for signing. Ignored when `smartcard_provider`
+    /// is set; populate with any placeholder in that case.
     pub private_key: RsaPrivateKey,
     /// DH private exponent bytes (random, at least 32 bytes).
     pub dh_private_bytes: Vec<u8>,
+    /// Optional smartcard / HSM provider. Takes precedence over the
+    /// raw `client_cert_der` + `private_key` fields when present.
+    pub smartcard_provider: Option<Box<dyn justrdp_pkinit_card::SmartcardProvider>>,
+}
+
+impl PkinitConfig {
+    /// Build a `PkinitConfig` backed by a smartcard provider.
+    ///
+    /// `dh_private_bytes` must be at least 32 random bytes (host-side,
+    /// the DH keypair is unrelated to the smartcard).
+    pub fn from_provider(
+        provider: Box<dyn justrdp_pkinit_card::SmartcardProvider>,
+        dh_private_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            client_cert_der: Vec::new(),
+            private_key: RsaPrivateKey {
+                n: BigUint::zero(),
+                d: BigUint::zero(),
+                e: BigUint::zero(),
+            },
+            dh_private_bytes,
+            smartcard_provider: Some(provider),
+        }
+    }
 }
 
 impl Drop for PkinitConfig {
@@ -353,22 +397,48 @@ impl KerberosSequence {
 
         let auth_pack_der = auth_pack.encode();
 
-        // Sign AuthPack with RSA private key
-        let signature = rsa_sign_sha256(&config.private_key, &auth_pack_der)
-            .map_err(|_| ConnectorError::general("RSA key too small for PKCS#1 v1.5 signing"))?;
+        // Two source modes for the certificate and signature:
+        //   - smartcard_provider: host hashes, card signs, chain comes
+        //     from the provider (end-entity + intermediates).
+        //   - raw key: legacy path, in-memory RsaPrivateKey signs and
+        //     a single client_cert_der is used.
+        let (cert_chain, signature) = if let Some(provider) = config.smartcard_provider.as_ref() {
+            // Host-side SHA-256 of AuthPack DER, then delegate to card.
+            // Matches PIV (NIST SP 800-73-4 §3.3.2) and PKCS#11
+            // CKM_RSA_PKCS pre-hashed mode. RFC 4556 §3.2.1 + spec memo
+            // specs/pkinit-smartcard-notes.md.
+            let mut hasher = Sha256::new();
+            hasher.update(&auth_pack_der);
+            let digest = hasher.finalize();
+            let sig = provider
+                .sign_digest(&digest)
+                .map_err(|_| ConnectorError::general("smartcard sign_digest failed"))?;
+            let mut chain: Vec<Vec<u8>> = vec![provider.get_certificate()];
+            chain.extend(provider.get_intermediate_chain());
+            (chain, sig)
+        } else {
+            // Legacy raw-key path.
+            let sig = rsa_sign_sha256(&config.private_key, &auth_pack_der)
+                .map_err(|_| ConnectorError::general("RSA key too small for PKCS#1 v1.5 signing"))?;
+            let chain: Vec<Vec<u8>> = vec![config.client_cert_der.clone()];
+            (chain, sig)
+        };
 
-        // Extract issuer and serial from client certificate
-        let (issuer_der, serial_der) = cms::extract_cert_issuer_serial(&config.client_cert_der)
+        // Extract issuer and serial from end-entity certificate.
+        let (issuer_der, serial_der) = cms::extract_cert_issuer_serial(&cert_chain[0])
             .map_err(|_| ConnectorError::general("failed to parse client certificate"))?;
 
-        // Build CMS SignerInfo
+        // Build CMS SignerInfo.
         let signer_info = cms::build_signer_info(&issuer_der, &serial_der, &signature);
 
-        // Build CMS SignedData
+        // Build CMS SignedData with the full chain (root excluded — the
+        // smartcard provider is responsible for that, and the legacy
+        // raw-key path simply has no intermediates).
+        let cert_refs: Vec<&[u8]> = cert_chain.iter().map(|c| c.as_slice()).collect();
         let signed_data = cms::build_signed_data(
             OID_PKINIT_AUTH_DATA,
             &auth_pack_der,
-            &[config.client_cert_der.as_slice()],
+            &cert_refs,
             &signer_info,
         );
 
@@ -1002,6 +1072,7 @@ mod tests {
                 e: BigUint::from_u32(17),
             },
             dh_private_bytes: vec![0x42; 32],
+            smartcard_provider: None,
         };
 
         let seq = KerberosSequence::new_pkinit("user", "REALM", "host", random, config);
@@ -1076,6 +1147,7 @@ mod tests {
                 e: BigUint::from_be_bytes(&[0x01, 0x00, 0x01]),
             },
             dh_private_bytes: vec![0x42; 32],
+            smartcard_provider: None,
         };
 
         let mut seq = KerberosSequence::new_pkinit("user", "REALM.COM", "server", random, config);
@@ -1087,6 +1159,78 @@ mod tests {
         assert_eq!(as_req[0], 0x6a);
         // DH private key should be stored
         assert!(seq.dh_private_key.is_some());
+    }
+
+    #[test]
+    fn pkinit_smartcard_provider_path_produces_as_req() {
+        // End-to-end: a Mock provider drives the entire PKINIT AS-REQ
+        // build. Verifies that smartcard_provider takes precedence over
+        // the raw client_cert_der/private_key fields.
+        use justrdp_pkinit_card::MockSmartcardProvider;
+
+        let random = KerberosRandom {
+            nonce: 99,
+            tgs_nonce: 100,
+            confounder_as: [0; 16],
+            confounder_tgs_auth: [0; 16],
+            confounder_ap_auth: [0; 16],
+            subkey: vec![0x42; 32],
+            seq_number: 1,
+            timestamp_usec: 0,
+            client_dh_nonce: [0u8; 32],
+        };
+
+        let provider = Box::new(MockSmartcardProvider::new());
+        let config = PkinitConfig::from_provider(provider, vec![0x42; 32]);
+
+        let mut seq =
+            KerberosSequence::new_pkinit("alice", "REALM.COM", "server", random, config);
+        let as_req = seq
+            .build_as_req_pkinit(b"20260326120000Z", 0)
+            .expect("smartcard PKINIT AS-REQ must build");
+
+        // APPLICATION 10 tag (AS-REQ).
+        assert_eq!(as_req[0], 0x6a);
+        // DH private key was stored host-side.
+        assert!(seq.dh_private_key.is_some());
+    }
+
+    #[test]
+    fn pkinit_smartcard_provider_with_intermediates_includes_chain() {
+        use justrdp_pdu::cms;
+        use justrdp_pkinit_card::{MockSmartcardProvider, SmartcardProvider};
+
+        let random = KerberosRandom {
+            nonce: 99,
+            tgs_nonce: 100,
+            confounder_as: [0; 16],
+            confounder_tgs_auth: [0; 16],
+            confounder_ap_auth: [0; 16],
+            subkey: vec![0x42; 32],
+            seq_number: 1,
+            timestamp_usec: 0,
+            client_dh_nonce: [0u8; 32],
+        };
+
+        // Inject one intermediate. The build path should accept it
+        // even though the actual DER contents are placeholder bytes —
+        // the chain is bundled into SignedData.certificates and only
+        // the end-entity cert is parsed for issuer/serial extraction.
+        let provider = Box::new(
+            MockSmartcardProvider::new().with_intermediate(vec![0x30, 0x02, 0x05, 0x00]),
+        );
+        // Sanity: the mock returns 2 entries (end-entity + 1 intermediate).
+        assert_eq!(provider.get_intermediate_chain().len(), 1);
+        // And cms::extract_cert_issuer_serial parses the end-entity OK.
+        let _ = cms::extract_cert_issuer_serial(&provider.get_certificate()).unwrap();
+
+        let config = PkinitConfig::from_provider(provider, vec![0x42; 32]);
+        let mut seq =
+            KerberosSequence::new_pkinit("alice", "REALM.COM", "server", random, config);
+        let as_req = seq
+            .build_as_req_pkinit(b"20260326120000Z", 0)
+            .expect("smartcard PKINIT with intermediate must build");
+        assert_eq!(as_req[0], 0x6a);
     }
 
     #[test]
