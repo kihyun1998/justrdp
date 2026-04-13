@@ -95,6 +95,20 @@ const SHA256_DIGEST_INFO_PREFIX: [u8; 19] = [
     0x04, 0x20, // OCTET STRING (32 bytes)
 ];
 
+/// Build a PKCS#1 v1.5 encoded message for SHA-256 digests, exposed for
+/// smartcard backends that perform raw RSA on the card and require the
+/// host to do the padding (PIV NIST SP 800-73-4 §3.3.2).
+///
+/// `modulus_size_bytes` is the RSA modulus size in bytes (e.g. 256 for
+/// RSA-2048). Returns `None` if the modulus is too small to fit the
+/// PKCS#1 v1.5 envelope around a SHA-256 DigestInfo.
+pub fn pkcs1_v15_pad_sha256_digest(
+    modulus_size_bytes: usize,
+    digest: &[u8; 32],
+) -> Option<Vec<u8>> {
+    build_pkcs1_em(modulus_size_bytes, digest)
+}
+
 /// Build PKCS#1 v1.5 encoded message: 0x00 || 0x01 || PS (0xFF...) || 0x00 || DigestInfo.
 /// RFC 8017 §9.2 — returns None if key is too small.
 fn build_pkcs1_em(k: usize, hash: &[u8; 32]) -> Option<Vec<u8>> {

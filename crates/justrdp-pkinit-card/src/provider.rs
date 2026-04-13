@@ -55,8 +55,7 @@ impl core::fmt::Display for SmartcardError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for SmartcardError {}
+impl core::error::Error for SmartcardError {}
 
 /// Source of a client certificate and signing capability for PKINIT.
 ///

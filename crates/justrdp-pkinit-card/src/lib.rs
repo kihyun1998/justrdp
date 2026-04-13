@@ -41,7 +41,7 @@ pub mod provider;
 pub mod mock;
 
 #[cfg(feature = "pcsc")]
-pub mod pcsc;
+pub mod pcsc_backend;
 
 #[cfg(feature = "alloc")]
 pub use provider::{SmartcardError, SmartcardProvider};
@@ -50,4 +50,4 @@ pub use provider::{SmartcardError, SmartcardProvider};
 pub use mock::MockSmartcardProvider;
 
 #[cfg(feature = "pcsc")]
-pub use pcsc::PcscSmartcardProvider;
+pub use pcsc_backend::PcscSmartcardProvider;

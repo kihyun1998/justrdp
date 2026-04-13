@@ -1651,17 +1651,27 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 **Phase 2 — Native PC/SC backend (실 하드웨어 검증 TODO)**
 
-- [ ] **Step 5** — `crates/justrdp-pkinit-card-pcsc/` 또는
-      `pkinit-card` 내 feature gate
-  - [ ] `pcsc` crate 의존성 추가 (cross-platform: WinSCard /
-        pcsc-lite / CryptoTokenKit 자동 선택)
-  - [ ] `PcscSmartcardProvider` impl `SmartcardProvider`
-  - [ ] APDU 시퀀스: SELECT AID → VERIFY (PIN) → INTERNAL
-        AUTHENTICATE 또는 PSO COMPUTE DIGITAL SIGNATURE
-  - [ ] 카드 종류: PIV (NIST SP 800-73) 우선, GIDS / OpenPGP 는
-        후속
-  - [ ] **명시적 untested 마킹**: doc comment + `#[cfg(test)]`
-        에서 mock 만 검증, 실 카드 통합은 README TODO 로 분리
+- [x] **Step 5** — `pkinit-card` `pcsc` feature gate (29 tests ✅)
+  - [x] `pcsc` crate optional 의존 (Windows WinSCard / Linux pcsc-lite
+        / macOS CryptoTokenKit 자동 dispatch)
+  - [x] `PcscSmartcardProvider` impl `SmartcardProvider` — `open()`
+        은 PC/SC 컨텍스트 → 리더 enumerate → SELECT PIV AID → 인증서
+        캐싱
+  - [x] APDU 시퀀스: SELECT (00 A4 04 00 + AID) → VERIFY (00 20 00 80
+        + 8-byte 0xFF padded PIN) → GENERAL AUTHENTICATE
+        (00 87 07 9A + 7C-wrapped padded message, 확장 Lc/Le)
+  - [x] 카드 프로파일: PIV (NIST SP 800-73-4) 전용, key 9A
+        (Authentication), object 5F C1 05 (Auth cert)
+  - [x] PKCS#1 v1.5 padding 호스트 측 (`pkcs1_v15_pad_sha256_digest`),
+        카드는 raw RSA만 수행
+  - [x] BER-TLV helper (push/parse, short/long form 4 sizes), PIV
+        envelope (53/70/71/FE) parser, GENERAL AUTH 응답 (7C/82) parser
+  - [x] PIV VERIFY SW classification (63 CX → tries 카운트, 69 83 →
+        blocked)
+  - [x] **명시적 UNTESTED 마킹**: 모듈 doc comment 최상단 + 각 live
+        method doc — pure APDU helpers는 21 unit tests로 검증, 실
+        `Context::establish` / `Card::transmit` 경로는 하드웨어 검증
+        TODO
 
 - [ ] **Step 6** — 최종 검증
   - [ ] `@code-reviewer` (Phase 1 + Phase 2 양쪽)

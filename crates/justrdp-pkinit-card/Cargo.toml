@@ -16,9 +16,10 @@ alloc = ["justrdp-core/alloc", "justrdp-pdu/alloc"]
 std = ["alloc", "justrdp-core/std", "justrdp-pdu/std"]
 mock = []
 # Phase 2: cross-platform PC/SC native backend. Untested without real
-# hardware — the code compiles and the unit tests pass against an
-# in-memory APDU stub, but real-card validation is a TODO.
-pcsc = ["dep:pcsc"]
+# hardware — the pure APDU helpers are unit-tested but the live
+# Context::establish / Card::transmit paths are unverified. Enabling
+# this feature requires `std` (the `pcsc` crate is not no_std).
+pcsc = ["dep:pcsc", "std"]
 
 [dependencies]
 justrdp-core.workspace = true
