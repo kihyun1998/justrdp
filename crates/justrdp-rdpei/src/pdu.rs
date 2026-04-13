@@ -610,6 +610,30 @@ pub const VALID_CONTACT_FLAG_COMBINATIONS: [u32; 8] = [
     ContactFlags::UPDATE | ContactFlags::INRANGE,                  // 0x0A
 ];
 
+/// Shared `contactFlags` combination check for both touch and pen
+/// contacts (spec §2.2.3.7.1.1 explicitly shares §3.1.1.1 with touch).
+fn validate_contact_flags_encode(flags: u32, context: &'static str) -> Result<(), EncodeError> {
+    if !VALID_CONTACT_FLAG_COMBINATIONS.contains(&flags) {
+        Err(EncodeError::invalid_value(
+            context,
+            "contactFlags not a valid combination",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_contact_flags_decode(flags: u32, context: &'static str) -> Result<(), DecodeError> {
+    if !VALID_CONTACT_FLAG_COMBINATIONS.contains(&flags) {
+        Err(DecodeError::invalid_value(
+            context,
+            "contactFlags not a valid combination",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// `orientation` maximum (degrees). MS-RDPEI 2.2.3.3.1.1
 pub const ORIENTATION_MAX: u32 = 359;
 /// `pressure` maximum (normalized). MS-RDPEI 2.2.3.3.1.1
@@ -673,12 +697,7 @@ impl TouchContact {
     }
 
     fn validate(&self) -> Result<(), EncodeError> {
-        if !VALID_CONTACT_FLAG_COMBINATIONS.contains(&self.contact_flags) {
-            return Err(EncodeError::invalid_value(
-                "TouchContact",
-                "contactFlags not a valid combination",
-            ));
-        }
+        validate_contact_flags_encode(self.contact_flags, "TouchContact")?;
         if let Some(o) = self.orientation
             && o > ORIENTATION_MAX
         {
@@ -756,12 +775,7 @@ impl<'de> Decode<'de> for TouchContact {
         let x = decode_four_byte_signed(src, "TouchContact::X")?;
         let y = decode_four_byte_signed(src, "TouchContact::Y")?;
         let contact_flags = decode_four_byte_unsigned(src, "TouchContact::ContactFlags")?;
-        if !VALID_CONTACT_FLAG_COMBINATIONS.contains(&contact_flags) {
-            return Err(DecodeError::invalid_value(
-                "TouchContact",
-                "contactFlags not a valid combination",
-            ));
-        }
+        validate_contact_flags_decode(contact_flags, "TouchContact")?;
         let contact_rect = if fields_present & FieldsPresent::CONTACTRECT != 0 {
             Some(ContactRect {
                 left: decode_two_byte_signed(src, "TouchContact::ContactRectLeft")?,
@@ -969,8 +983,12 @@ impl PenFieldsPresent {
     pub const PENFLAGS: u16 = 0x0001;
     pub const PRESSURE: u16 = 0x0002;
     pub const ROTATION: u16 = 0x0004;
-    pub const TILTX: u16 = 0x0008;
-    pub const TILTY: u16 = 0x0010;
+    pub const TILT_X: u16 = 0x0008;
+    pub const TILT_Y: u16 = 0x0010;
+    /// Mask of all spec-defined bits. Unknown bits are rejected at decode
+    /// time because we cannot know the wire-size of unspecified optional
+    /// fields — silently ignoring them would desync subsequent contacts.
+    pub const ALL: u16 = Self::PENFLAGS | Self::PRESSURE | Self::ROTATION | Self::TILT_X | Self::TILT_Y;
 }
 
 /// `penFlags` bit flags. MS-RDPEI 2.2.3.7.1.1
@@ -1042,21 +1060,16 @@ impl PenContact {
             m |= PenFieldsPresent::ROTATION;
         }
         if self.tilt_x.is_some() {
-            m |= PenFieldsPresent::TILTX;
+            m |= PenFieldsPresent::TILT_X;
         }
         if self.tilt_y.is_some() {
-            m |= PenFieldsPresent::TILTY;
+            m |= PenFieldsPresent::TILT_Y;
         }
         m
     }
 
     fn validate(&self) -> Result<(), EncodeError> {
-        if !VALID_CONTACT_FLAG_COMBINATIONS.contains(&self.contact_flags) {
-            return Err(EncodeError::invalid_value(
-                "PenContact",
-                "contactFlags not a valid combination",
-            ));
-        }
+        validate_contact_flags_encode(self.contact_flags, "PenContact")?;
         if let Some(p) = self.pressure
             && p > PEN_PRESSURE_MAX
         {
@@ -1144,15 +1157,19 @@ impl<'de> Decode<'de> for PenContact {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let device_id = src.read_u8("PenContact::DeviceId")?;
         let fields_present = decode_two_byte_unsigned(src, "PenContact::FieldsPresent")?;
+        // Reject unknown fieldsPresent bits: we cannot know the wire-size
+        // of unspecified optional fields, so tolerating them would desync
+        // subsequent contacts. MS-RDPEI 2.2.3.7.1.1 defines exactly 5 bits.
+        if fields_present & !PenFieldsPresent::ALL != 0 {
+            return Err(DecodeError::invalid_value(
+                "PenContact",
+                "fieldsPresent has unknown bits",
+            ));
+        }
         let x = decode_four_byte_signed(src, "PenContact::X")?;
         let y = decode_four_byte_signed(src, "PenContact::Y")?;
         let contact_flags = decode_four_byte_unsigned(src, "PenContact::ContactFlags")?;
-        if !VALID_CONTACT_FLAG_COMBINATIONS.contains(&contact_flags) {
-            return Err(DecodeError::invalid_value(
-                "PenContact",
-                "contactFlags not a valid combination",
-            ));
-        }
+        validate_contact_flags_decode(contact_flags, "PenContact")?;
         let pen_flags = if fields_present & PenFieldsPresent::PENFLAGS != 0 {
             Some(decode_four_byte_unsigned(src, "PenContact::PenFlags")?)
         } else {
@@ -1176,7 +1193,7 @@ impl<'de> Decode<'de> for PenContact {
         } else {
             None
         };
-        let tilt_x = if fields_present & PenFieldsPresent::TILTX != 0 {
+        let tilt_x = if fields_present & PenFieldsPresent::TILT_X != 0 {
             let t = decode_two_byte_signed(src, "PenContact::TiltX")?;
             if !(PEN_TILT_MIN..=PEN_TILT_MAX).contains(&t) {
                 return Err(DecodeError::invalid_value("PenContact", "tiltX out of range"));
@@ -1185,7 +1202,7 @@ impl<'de> Decode<'de> for PenContact {
         } else {
             None
         };
-        let tilt_y = if fields_present & PenFieldsPresent::TILTY != 0 {
+        let tilt_y = if fields_present & PenFieldsPresent::TILT_Y != 0 {
             let t = decode_two_byte_signed(src, "PenContact::TiltY")?;
             if !(PEN_TILT_MIN..=PEN_TILT_MAX).contains(&t) {
                 return Err(DecodeError::invalid_value("PenContact", "tiltY out of range"));
@@ -2855,6 +2872,18 @@ mod tests {
     }
 
     // ── Decode-side rejection (impl-verifier MEDIUM/LOW) ──
+
+    #[test]
+    fn pen_contact_decode_rejects_unknown_fields_present_bits() {
+        // device_id=0, fieldsPresent=0x0020 (bit 5, undefined),
+        // x=0, y=0, contact_flags=0x19.
+        // fieldsPresent 0x0020 > 0x7F, so encodes as 2-byte TWO_BYTE_UNSIGNED:
+        // [0x80, 0x20]. Unknown bits must be rejected at decode time so
+        // subsequent contacts don't desync.
+        let bytes: [u8; 6] = [0x00, 0x80, 0x20, 0x00, 0x00, 0x19];
+        let mut src = ReadCursor::new(&bytes);
+        assert!(PenContact::decode(&mut src).is_err());
+    }
 
     #[test]
     fn pen_contact_decode_rejects_invalid_contact_flags() {

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Touch Input DVC client -- MS-RDPEI 3.2
+//! Touch and Pen Input DVC client -- MS-RDPEI 3.2
 //!
 //! `RdpeiDvcClient` implements [`DvcProcessor`] for the
 //! `Microsoft::Windows::RDS::Input` dynamic virtual channel. It negotiates
@@ -213,25 +213,35 @@ impl RdpeiDvcClient {
         if self.input_suspended {
             return Err(String::from("input transmission is suspended"));
         }
+        if frames.is_empty() {
+            return Err(String::from("pen event must contain at least one frame"));
+        }
         for frame in &frames {
             if frame.contacts.len() > MAX_PEN_CONTACTS_PER_FRAME as usize {
-                return Err(String::from("pen frame exceeds MAX_PEN_CONTACTS_PER_FRAME"));
+                return Err(format!(
+                    "pen frame has {} contacts, max is {}",
+                    frame.contacts.len(),
+                    MAX_PEN_CONTACTS_PER_FRAME
+                ));
             }
             if !self.multipen_active {
                 // Single-pen mode: only device_id = 0 permitted.
-                if frame.contacts.iter().any(|c| c.device_id != 0) {
-                    return Err(String::from(
-                        "device_id must be 0 when multipen is not active",
+                if let Some(bad) = frame.contacts.iter().find(|c| c.device_id != 0) {
+                    return Err(format!(
+                        "device_id {} must be 0 when multipen is not active",
+                        bad.device_id
                     ));
                 }
                 if frame.contacts.len() > 1 {
-                    return Err(String::from(
-                        "single-pen mode permits at most 1 contact per frame",
+                    return Err(format!(
+                        "single-pen mode permits 1 contact per frame, got {}",
+                        frame.contacts.len()
                     ));
                 }
-            } else if frame.contacts.iter().any(|c| c.device_id > 3) {
-                return Err(String::from(
-                    "device_id must be <= 3 when multipen is active",
+            } else if let Some(bad) = frame.contacts.iter().find(|c| c.device_id > 3) {
+                return Err(format!(
+                    "device_id {} must be <= 3 when multipen is active",
+                    bad.device_id
                 ));
             }
         }
@@ -283,6 +293,11 @@ impl RdpeiDvcClient {
 
     /// Handle SC_READY: store negotiated version, queue CS_READY response.
     fn handle_sc_ready(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        // Preemptive reset: if decode fails midway (malformed SC_READY),
+        // previous-session pen state must not leak through and let the
+        // caller keep sending pen events under stale negotiation.
+        self.pen_input_allowed = false;
+        self.multipen_active = false;
         let sc_ready = ScReadyPdu::decode_from(payload).map_err(DvcError::Decode)?;
         let negotiated = core::cmp::min(sc_ready.protocol_version, self.config.client_max_version);
         self.negotiated_version = Some(negotiated);
@@ -913,6 +928,40 @@ mod tests {
         c.process(1, &sc_ready(crate::pdu::RDPINPUT_PROTOCOL_V100, None))
             .unwrap();
         assert!(!c.pen_input_allowed());
+        assert!(!c.multipen_active());
+    }
+
+    #[test]
+    fn send_pen_event_rejects_empty_frames() {
+        // Prevents callers from burning the outbound cap on no-op PDUs.
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        assert!(c.send_pen_event(0, alloc::vec![]).is_err());
+    }
+
+    #[test]
+    fn malformed_second_sc_ready_resets_pen_state() {
+        // After a valid V200 handshake, a malformed SC_READY body (valid
+        // header but unrecognized pdu_length) must not leave the client
+        // in pen_input_allowed=true with stale negotiation. The
+        // preemptive reset in handle_sc_ready guarantees this.
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        assert!(c.pen_input_allowed());
+        // 11-byte SC_READY: valid header with pdu_length=11 (neither 10
+        // nor 14), so ScReadyPdu::decode_from rejects after reading
+        // protocolVersion. By then, preemptive reset has fired.
+        let bad_body = [
+            0x01, 0x00, // eventId = SC_READY
+            0x0B, 0x00, 0x00, 0x00, // pduLength = 11 (invalid)
+            0x00, 0x00, 0x02, 0x00, // protocolVersion = V200
+            0x00, // bogus trailing byte
+        ];
+        assert!(c.process(1, &bad_body).is_err());
+        assert!(
+            !c.pen_input_allowed(),
+            "pen_input_allowed must reset when SC_READY decode fails"
+        );
         assert!(!c.multipen_active());
     }
 
