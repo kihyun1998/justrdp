@@ -353,6 +353,12 @@ pub struct RdpeiHeader {
 
 impl RdpeiHeader {
     /// Decode the header.
+    ///
+    /// Validates `pdu_length >= HEADER_SIZE` and that the claimed body
+    /// length fits in the remaining cursor bytes — a malicious server
+    /// cannot use an oversized `pdu_length` as a DoS knob (this would
+    /// otherwise be caught only downstream, leaving the check fragile for
+    /// future PDUs that loop on `pdu_length`).
     pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         let event_id = src.read_u16_le("RdpeiHeader::EventId")?;
         let pdu_length = src.read_u32_le("RdpeiHeader::PduLength")?;
@@ -360,6 +366,13 @@ impl RdpeiHeader {
             return Err(DecodeError::invalid_value(
                 "RdpeiHeader",
                 "PduLength < 6",
+            ));
+        }
+        let body_len = (pdu_length as usize) - HEADER_SIZE;
+        if body_len > src.remaining() {
+            return Err(DecodeError::invalid_value(
+                "RdpeiHeader",
+                "PduLength exceeds payload",
             ));
         }
         Ok(Self {
@@ -380,17 +393,12 @@ impl RdpeiHeader {
 // RDPINPUT_SC_READY_PDU (MS-RDPEI 2.2.3.1) — server → client
 // =============================================================================
 
-/// `supportedFeatures` bit: multipen injection.
-/// MS-RDPEI 2.2.3.1
-pub const SC_READY_MULTIPEN_INJECTION_SUPPORTED: u32 = 0x0000_0001;
-
-/// Marker for all `supportedFeatures` flag bits.
-/// MS-RDPEI 2.2.3.1
+/// Namespace for `supportedFeatures` flag bits. MS-RDPEI 2.2.3.1
 pub struct ScReadyFlags;
 
 impl ScReadyFlags {
     /// Multipen injection supported by the server.
-    pub const MULTIPEN_INJECTION_SUPPORTED: u32 = SC_READY_MULTIPEN_INJECTION_SUPPORTED;
+    pub const MULTIPEN_INJECTION_SUPPORTED: u32 = 0x0000_0001;
 }
 
 /// RDPINPUT_SC_READY_PDU (server → client).
@@ -598,6 +606,16 @@ pub const VALID_CONTACT_FLAG_COMBINATIONS: [u32; 8] = [
 pub const ORIENTATION_MAX: u32 = 359;
 /// `pressure` maximum (normalized). MS-RDPEI 2.2.3.3.1.1
 pub const PRESSURE_MAX: u32 = 1024;
+
+/// Decode-time ceiling on `contactCount` per frame. The spec leaves the
+/// upper bound at TWO_BYTE_UNSIGNED_INTEGER max (0x7FFF), which would let a
+/// malicious server force a multi-GB `Vec::with_capacity`. 256 matches the
+/// project's roadmap policy and exceeds typical hardware contact limits.
+pub const MAX_CONTACTS_PER_FRAME: u16 = 256;
+
+/// Decode-time ceiling on `frameCount` per `TouchEventPdu`. Same rationale
+/// as `MAX_CONTACTS_PER_FRAME`.
+pub const MAX_FRAMES_PER_EVENT: u16 = 256;
 
 /// A single touch contact within a `TouchFrame`.
 ///
@@ -829,6 +847,12 @@ impl Encode for TouchFrame {
 impl<'de> Decode<'de> for TouchFrame {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let count = decode_two_byte_unsigned(src, "TouchFrame::ContactCount")?;
+        if count > MAX_CONTACTS_PER_FRAME {
+            return Err(DecodeError::invalid_value(
+                "TouchFrame",
+                "contactCount exceeds MAX_CONTACTS_PER_FRAME",
+            ));
+        }
         let frame_offset = decode_eight_byte_unsigned(src, "TouchFrame::FrameOffset")?;
         let mut contacts = Vec::with_capacity(count as usize);
         for _ in 0..count {
@@ -880,6 +904,12 @@ impl TouchEventPdu {
         }
         let encode_time = decode_four_byte_unsigned(&mut src, "TouchEventPdu::EncodeTime")?;
         let frame_count = decode_two_byte_unsigned(&mut src, "TouchEventPdu::FrameCount")?;
+        if frame_count > MAX_FRAMES_PER_EVENT {
+            return Err(DecodeError::invalid_value(
+                "TouchEventPdu",
+                "frameCount exceeds MAX_FRAMES_PER_EVENT",
+            ));
+        }
         let mut frames = Vec::with_capacity(frame_count as usize);
         for _ in 0..frame_count {
             frames.push(TouchFrame::decode(&mut src)?);
@@ -1321,7 +1351,7 @@ mod tests {
     fn sc_ready_v300_with_features_roundtrip() {
         let pdu = ScReadyPdu {
             protocol_version: RDPINPUT_PROTOCOL_V300,
-            supported_features: Some(SC_READY_MULTIPEN_INJECTION_SUPPORTED),
+            supported_features: Some(ScReadyFlags::MULTIPEN_INJECTION_SUPPORTED),
         };
         assert_eq!(pdu.size(), 14);
         let bytes = encode_to_vec(&pdu);
@@ -1937,6 +1967,67 @@ mod tests {
         assert!(SuspendInputPdu::decode_from(&bad_suspend).is_err());
         let bad_resume = [0x05u8, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00];
         assert!(ResumeInputPdu::decode_from(&bad_resume).is_err());
+    }
+
+    // Security: DoS guards on decode-time allocations.
+
+    #[test]
+    fn header_rejects_pdu_length_exceeding_payload() {
+        // Header claims pdu_length = 100 but only 6 bytes supplied.
+        let buf = [0x04u8, 0x00, 0x64, 0x00, 0x00, 0x00];
+        let mut src = ReadCursor::new(&buf);
+        assert!(RdpeiHeader::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn touch_frame_rejects_contact_count_over_cap() {
+        // Hand-craft a TouchFrame body with contactCount = 0x7FFF (TWO_BYTE
+        // unsigned max, well above MAX_CONTACTS_PER_FRAME).
+        let mut buf = alloc::vec![0u8; 16];
+        let mut dst = WriteCursor::new(&mut buf);
+        // contactCount = 0x7FFF → [0xFF, 0xFF]
+        encode_two_byte_unsigned(&mut dst, 0x7FFF, "t").unwrap();
+        // frameOffset = 0 → [0x00]
+        encode_eight_byte_unsigned(&mut dst, 0, "t").unwrap();
+        let mut src = ReadCursor::new(&buf);
+        assert!(TouchFrame::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn touch_event_pdu_rejects_frame_count_over_cap() {
+        // Header + encodeTime(1 byte = 0) + frameCount = 0x7FFF.
+        let mut buf = alloc::vec![0u8; 32];
+        let mut dst = WriteCursor::new(&mut buf);
+        RdpeiHeader {
+            event_id: EVENTID_TOUCH,
+            pdu_length: 10, // header(6) + encodeTime(1) + frameCount(2) + ...
+        }
+        .encode(&mut dst)
+        .unwrap();
+        encode_four_byte_unsigned(&mut dst, 0, "t").unwrap();
+        encode_two_byte_unsigned(&mut dst, 0x7FFF, "t").unwrap();
+        // Truncate buf to what we actually wrote.
+        let written = 6 + 1 + 2;
+        assert!(TouchEventPdu::decode_from(&buf[..written]).is_err());
+    }
+
+    #[test]
+    fn touch_frame_accepts_contact_count_at_cap() {
+        // Build a minimal-contact TouchFrame with exactly MAX_CONTACTS_PER_FRAME contacts.
+        let contacts: Vec<TouchContact> = (0..MAX_CONTACTS_PER_FRAME)
+            .map(|i| TouchContact {
+                contact_id: (i & 0xFF) as u8,
+                ..minimal_contact()
+            })
+            .collect();
+        let frame = TouchFrame {
+            frame_offset: 0,
+            contacts,
+        };
+        let bytes = encode_to_vec(&frame);
+        let mut src = ReadCursor::new(&bytes);
+        let decoded = TouchFrame::decode(&mut src).unwrap();
+        assert_eq!(decoded.contacts.len(), MAX_CONTACTS_PER_FRAME as usize);
     }
 
     #[test]

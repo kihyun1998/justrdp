@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -155,7 +156,7 @@ impl RdpeiDvcClient {
             frames,
         };
         self.enqueue_pdu(&pdu)
-            .map_err(|_| String::from("failed to encode TouchEventPdu"))?;
+            .map_err(|e| format!("failed to encode TouchEventPdu: {e:?}"))?;
         Ok(())
     }
 
@@ -170,7 +171,7 @@ impl RdpeiDvcClient {
         }
         let pdu = DismissHoveringContactPdu { contact_id };
         self.enqueue_pdu(&pdu)
-            .map_err(|_| String::from("failed to encode DismissHoveringContactPdu"))?;
+            .map_err(|e| format!("failed to encode DismissHoveringContactPdu: {e:?}"))?;
         Ok(())
     }
 
@@ -312,7 +313,7 @@ mod tests {
     use super::*;
     use crate::pdu::{
         ContactFlags, CsReadyFlags, RDPINPUT_PROTOCOL_V101, RDPINPUT_PROTOCOL_V300,
-        SC_READY_MULTIPEN_INJECTION_SUPPORTED, TouchContact, TouchFrame,
+        ScReadyFlags, TouchContact, TouchFrame,
     };
 
     fn encode<E: Encode>(pdu: &E) -> Vec<u8> {
@@ -385,7 +386,7 @@ mod tests {
         let msgs = c
             .process(
                 1,
-                &sc_ready(RDPINPUT_PROTOCOL_V300, Some(SC_READY_MULTIPEN_INJECTION_SUPPORTED)),
+                &sc_ready(RDPINPUT_PROTOCOL_V300, Some(ScReadyFlags::MULTIPEN_INJECTION_SUPPORTED)),
             )
             .unwrap();
         let cs = CsReadyPdu::decode_from(&msgs[0].data).unwrap();
@@ -393,7 +394,7 @@ mod tests {
         assert_eq!(c.negotiated_version(), Some(RDPINPUT_PROTOCOL_V200));
         assert_eq!(
             c.server_features(),
-            Some(SC_READY_MULTIPEN_INJECTION_SUPPORTED)
+            Some(ScReadyFlags::MULTIPEN_INJECTION_SUPPORTED)
         );
     }
 
