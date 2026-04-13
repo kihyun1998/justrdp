@@ -16,9 +16,28 @@ pub enum VideoDecodeError {
 }
 
 /// Pluggable H.264 video decoder used by the VIDEO_DATA pipeline.
+///
+/// ## Lifecycle contract
+///
+/// A single `VideoDecoder` instance is owned by one
+/// [`RdpevorControlClient`](crate::RdpevorControlClient) and therefore
+/// shared across every presentation accepted on that Control channel.
+/// MS-RDPEVOR allows the server to run multiple concurrent presentations
+/// (`MAX_CONCURRENT_PRESENTATIONS`), so implementations **MUST** tolerate
+/// `initialize()` being called again without an intervening `shutdown()`
+/// when a second presentation is accepted while a prior one is still
+/// active. The recommended pattern is to treat every `initialize()` as a
+/// full reset of internal codec state.
+///
+/// `shutdown()` is invoked exactly once from the control client, on the
+/// transition where the last active presentation stops or when the DVC
+/// channel closes. It **MUST** be idempotent so it can also fire on a
+/// channel teardown that follows a decoder initialization failure.
 pub trait VideoDecoder: Send {
-    /// Called once when a presentation is accepted. `extra_data` is the
+    /// Called when a presentation is accepted. `extra_data` is the
     /// concatenation of SPS and PPS NAL units from `PresentationRequest`.
+    /// May be called more than once per decoder instance (see trait-
+    /// level lifecycle contract).
     fn initialize(
         &mut self,
         width: u32,
@@ -34,7 +53,8 @@ pub trait VideoDecoder: Send {
         keyframe: bool,
     ) -> Result<(), VideoDecodeError>;
 
-    /// Called when the presentation is stopped.
+    /// Called when the presentation is stopped or the Control DVC
+    /// closes. Implementations **MUST** be idempotent.
     fn shutdown(&mut self);
 }
 

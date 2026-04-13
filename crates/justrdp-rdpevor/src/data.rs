@@ -193,7 +193,12 @@ impl RdpevorDataClient {
             .entry(vd.sample_number)
             .or_insert_with(|| PendingSample::new(vd.packets_in_sample));
         if entry.packets_in_sample != vd.packets_in_sample {
-            // Inconsistent fragmentation → drop the sample.
+            // Inconsistent fragmentation → drop the existing sample.
+            // This branch only ever fires for a pre-existing slot: a
+            // freshly-inserted entry from the `or_insert_with` above
+            // would have `packets_in_sample == vd.packets_in_sample` by
+            // construction. The subtraction therefore drains the
+            // already-counted bytes of the prior fragments.
             if let Some(old) = r.samples.remove(&vd.sample_number) {
                 r.bytes_in_flight = r.bytes_in_flight.saturating_sub(old.total_bytes());
             }
@@ -225,6 +230,9 @@ impl RdpevorDataClient {
             return Ok(());
         }
 
+        // Re-fetch the entry: the byte-budget branch above may call
+        // `r.samples.remove`, which invalidates any live mutable
+        // reference obtained before the check.
         let entry = r
             .samples
             .get_mut(&vd.sample_number)
@@ -240,9 +248,13 @@ impl RdpevorDataClient {
             let pending = r.samples.remove(&vd.sample_number).unwrap();
             r.bytes_in_flight = r.bytes_in_flight.saturating_sub(pending.total_bytes());
             let ts = if pending.has_timestamp { Some(pending.hns_timestamp) } else { None };
-            let keyframe = pending.keyframe;
+            // Rename to avoid shadowing the outer per-fragment `keyframe`
+            // binding — this value is the OR of every fragment's flag
+            // for the whole assembled sample.
+            let assembled_keyframe = pending.keyframe;
             let bytes = pending.assemble();
-            self.sink.on_sample(vd.presentation_id, bytes, ts, keyframe);
+            self.sink
+                .on_sample(vd.presentation_id, bytes, ts, assembled_keyframe);
         }
         Ok(())
     }
@@ -298,7 +310,9 @@ impl DvcProcessor for RdpevorDataClient {
     }
 
     fn close(&mut self, channel_id: u32) {
-        if self.open && channel_id != self.channel_id {
+        // Ignore close calls for a foreign channel or when the client is
+        // already closed. Matches the `process()` channel-id contract.
+        if !self.open || channel_id != self.channel_id {
             return;
         }
         self.pending.clear();
@@ -317,7 +331,6 @@ mod tests {
     use crate::pdu::{encode_to_vec, TSMM_VIDEO_DATA_FLAG_HAS_TIMESTAMPS};
     use alloc::sync::Arc;
     use alloc::vec;
-    use core::any::Any;
 
     /// Test sink that records samples into a shared Mutex-guarded Vec.
     /// We use `std::sync::Mutex` so the sink is `Send` without `unsafe`.
@@ -342,9 +355,13 @@ mod tests {
         }
     }
 
-    // Keep compiler happy about any-trait reachability.
-    #[allow(dead_code)]
-    fn _assert_send(_: &dyn Any) {}
+    // Compile-time assertion that `RdpevorDataClient` stays `Send`; a
+    // regression (e.g. adding a non-`Send` field) will fail to compile
+    // here instead of at the `DvcProcessor` registration site.
+    const _: fn() = || {
+        fn assert_send<T: Send>() {}
+        assert_send::<RdpevorDataClient>();
+    };
 
     fn setup() -> (RdpevorDataClient, Arc<SampleLog>) {
         let samples: Arc<SampleLog> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -457,6 +474,31 @@ mod tests {
         c.close(20);
         assert!(!c.is_open());
         assert_eq!(c.pending_samples_for(1), 0);
+    }
+
+    #[test]
+    fn bytes_in_flight_zero_after_reassembly_completes() {
+        let (mut c, samples) = setup();
+        let f1 = make_vd(3, 0, 77, 1, 2, vec![0xAA, 0xBB, 0xCC]);
+        let f2 = make_vd(3, 0, 77, 2, 2, vec![0xDD, 0xEE]);
+        c.process(20, &f1).unwrap();
+        assert_eq!(c.pending_bytes_for(3), 3);
+        c.process(20, &f2).unwrap();
+        // Sample emitted; bytes_in_flight must drop back to 0.
+        assert_eq!(samples.lock().unwrap().len(), 1);
+        assert_eq!(c.pending_bytes_for(3), 0);
+        assert_eq!(c.pending_samples_for(3), 0);
+    }
+
+    #[test]
+    fn close_on_already_closed_client_is_noop() {
+        let (mut c, _) = setup();
+        c.close(20);
+        assert!(!c.is_open());
+        // Calling close() again with any channel id must not panic and
+        // must not re-open the client.
+        c.close(999);
+        assert!(!c.is_open());
     }
 
     #[test]

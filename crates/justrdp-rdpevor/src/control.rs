@@ -207,7 +207,9 @@ impl DvcProcessor for RdpevorControlClient {
     }
 
     fn close(&mut self, channel_id: u32) {
-        if self.open && channel_id != self.channel_id {
+        // Ignore close calls for a foreign channel or when the client is
+        // already closed. Matches the `process()` channel-id contract.
+        if !self.open || channel_id != self.channel_id {
             return;
         }
         // Shut down the decoder exactly once iff it was initialised, so
