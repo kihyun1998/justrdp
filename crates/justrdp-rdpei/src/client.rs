@@ -42,6 +42,11 @@ pub struct RdpeiClientConfig {
     pub cs_ready_flags: u32,
     /// Maximum simultaneous touch contacts the client reports. Default: 10.
     pub max_touch_contacts: u16,
+    /// Upper bound on the internal outbound queue. When the queue is full,
+    /// `send_touch_event` and `dismiss_hovering_contact` return an error
+    /// instead of pushing, preventing unbounded growth if the application
+    /// forgets to call `take_pending_messages`. Default: 1024.
+    pub max_pending_messages: usize,
 }
 
 impl Default for RdpeiClientConfig {
@@ -50,6 +55,7 @@ impl Default for RdpeiClientConfig {
             client_max_version: RDPINPUT_PROTOCOL_V200,
             cs_ready_flags: 0,
             max_touch_contacts: 10,
+            max_pending_messages: 1024,
         }
     }
 }
@@ -187,6 +193,11 @@ impl RdpeiDvcClient {
     // ── Internals ──
 
     fn enqueue_pdu<E: Encode>(&mut self, pdu: &E) -> DvcResult<()> {
+        if self.outbound.len() >= self.config.max_pending_messages {
+            return Err(DvcError::Protocol(String::from(
+                "RDPEI outbound queue is full (max_pending_messages)",
+            )));
+        }
         let msg = encode_pdu(pdu)?;
         self.outbound.push(msg);
         Ok(())
@@ -628,6 +639,23 @@ mod tests {
         dyn_proc.close(1);
         // Post-close: not ready.
         assert!(!owner.is_ready());
+    }
+
+    #[test]
+    fn outbound_queue_cap_enforced() {
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            max_pending_messages: 2,
+            ..Default::default()
+        });
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.dismiss_hovering_contact(1).unwrap();
+        c.dismiss_hovering_contact(2).unwrap();
+        // Third push exceeds the cap.
+        assert!(c.dismiss_hovering_contact(3).is_err());
+        // Drain and retry — should succeed again.
+        let drained = c.take_pending_messages();
+        assert_eq!(drained.len(), 2);
+        assert!(c.dismiss_hovering_contact(3).is_ok());
     }
 
     #[test]

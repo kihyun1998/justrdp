@@ -591,6 +591,12 @@ impl ContactFlags {
 ///
 /// MS-RDPEI 2.2.3.3.1.1 "The contactFlags field MUST be set to one of the
 /// following combinations".
+///
+/// **Strict rejection policy**: both the encoder and decoder reject any
+/// combination not in this list. This is spec-correct for MS-RDPEI V100
+/// through V300. If a future MS-RDPEI revision adds new combinations,
+/// extend this array — do not relax the check to "accept anything",
+/// because a lenient decoder would mask protocol bugs in tests.
 pub const VALID_CONTACT_FLAG_COMBINATIONS: [u32; 8] = [
     ContactFlags::UP,                                              // 0x04
     ContactFlags::UP | ContactFlags::CANCELED,                     // 0x24
@@ -1967,6 +1973,70 @@ mod tests {
         assert!(SuspendInputPdu::decode_from(&bad_suspend).is_err());
         let bad_resume = [0x05u8, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00];
         assert!(ResumeInputPdu::decode_from(&bad_resume).is_err());
+    }
+
+    // ── Medium test gaps (boundary wire-byte patterns not asserted earlier) ──
+
+    #[test]
+    fn eight_byte_unsigned_boundary_wire_bytes() {
+        // Upper edge of 1-byte form (c=0, val1=0x1F)
+        let mut buf = [0u8; 8];
+        encode_eight_byte_unsigned(&mut WriteCursor::new(&mut buf), 0x1F, "t").unwrap();
+        assert_eq!(buf[..1], [0x1F]);
+        // Lower edge of 2-byte form (c=1, val1=0, val2=0x20)
+        let mut buf = [0u8; 8];
+        encode_eight_byte_unsigned(&mut WriteCursor::new(&mut buf), 0x20, "t").unwrap();
+        assert_eq!(buf[..2], [0x20, 0x20]);
+        // Upper edge of 2-byte form
+        let mut buf = [0u8; 8];
+        encode_eight_byte_unsigned(&mut WriteCursor::new(&mut buf), 0x1FFF, "t").unwrap();
+        assert_eq!(buf[..2], [0x3F, 0xFF]);
+        // Lower edge of 3-byte form
+        let mut buf = [0u8; 8];
+        encode_eight_byte_unsigned(&mut WriteCursor::new(&mut buf), 0x2000, "t").unwrap();
+        assert_eq!(buf[..3], [0x40, 0x20, 0x00]);
+        // Upper edge of 8-byte form
+        let mut buf = [0u8; 8];
+        encode_eight_byte_unsigned(&mut WriteCursor::new(&mut buf), 0x1FFF_FFFF_FFFF_FFFF, "t")
+            .unwrap();
+        assert_eq!(buf, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn two_byte_signed_positive_wire_bytes() {
+        // Positive counterpart of the spec example `-0x1A1B → [0xDA, 0x1B]`.
+        // Same c bit, s=0 → first byte = 0x80 | 0x1A = 0x9A.
+        let mut buf = [0u8; 2];
+        encode_two_byte_signed(&mut WriteCursor::new(&mut buf), 0x1A1B, "t").unwrap();
+        assert_eq!(buf, [0x9A, 0x1B]);
+        // Positive 1-byte form (c=0, s=0, val1=2) → 0x02.
+        let mut buf = [0u8; 2];
+        encode_two_byte_signed(&mut WriteCursor::new(&mut buf), 0x0002, "t").unwrap();
+        assert_eq!(buf[..1], [0x02]);
+    }
+
+    #[test]
+    fn touch_event_pdu_length_tracks_encode_time_form_transitions() {
+        // As encode_time crosses form boundaries, pdu_length in the header
+        // must shift by exactly one byte.
+        let base_frame = TouchFrame {
+            frame_offset: 0,
+            contacts: vec![minimal_contact()],
+        };
+        let size_at = |encode_time: u32| -> u32 {
+            let pdu = TouchEventPdu {
+                encode_time,
+                frames: vec![base_frame.clone()],
+            };
+            let bytes = encode_to_vec(&pdu);
+            u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]])
+        };
+        // 0x3F (1-byte) → 0x40 (2-byte): pdu_length grows by 1.
+        assert_eq!(size_at(0x40) - size_at(0x3F), 1);
+        // 0x3FFF → 0x4000: another +1.
+        assert_eq!(size_at(0x4000) - size_at(0x3FFF), 1);
+        // 0x3FFFFF → 0x400000: another +1.
+        assert_eq!(size_at(0x0040_0000) - size_at(0x003F_FFFF), 1);
     }
 
     // Security: DoS guards on decode-time allocations.
