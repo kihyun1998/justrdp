@@ -111,8 +111,10 @@ impl MockSmartcardProvider {
     }
 
     /// Whether `verify_pin` has been called successfully on this
-    /// provider. Mock-only inspection helper.
-    pub fn is_pin_verified(&self) -> bool {
+    /// provider. Test-only inspection helper — gated behind
+    /// `#[cfg(test)]` so the public API stays minimal.
+    #[cfg(test)]
+    pub(crate) fn is_pin_verified(&self) -> bool {
         self.pin_verified
     }
 }
