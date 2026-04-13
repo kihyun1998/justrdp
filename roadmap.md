@@ -1506,15 +1506,55 @@ pub trait GfxHandler: Send {
 
 ### 9.4 Touch Input (MS-RDPEI)
 
-> **requires**: 7.3 DVC 프레임워크
-> **검증**: PDU roundtrip
+> **requires**: 7.3 DVC 프레임워크 ✅
+> **검증**: PDU roundtrip + mock DVC 통합 테스트
 
 **DVC 이름**: `Microsoft::Windows::RDS::Input`
 
-- [ ] 터치 프레임 PDU
-- [ ] 멀티터치 포인트 (최대 256개)
-- [ ] 터치 접촉 영역, 방향
-- [ ] 터치 이벤트 (down, move, up, cancel)
+**구현 단계** (CLAUDE.md Implementation Flow 준수):
+
+- [x] **Step 1 — Spec Analysis**: `@spec-checker 9.4 Touch Input (MS-RDPEI)` → `specs/ms-rdpei-checklist.md`
+  - MS-RDPEI §2.2 PDU 포맷 전수조사 (RDPINPUT_HEADER, eventId/pduLength)
+  - 버전/capability 교환: `EVENTID_SC_READY` (0x01), `EVENTID_CS_READY` (0x02)
+  - 터치 이벤트: `EVENTID_TOUCH` (0x03), `EVENTID_SUSPEND_TOUCH` (0x04), `EVENTID_RESUME_TOUCH` (0x05), `EVENTID_DISMISS_HOVERING_CONTACT` (0x06)
+  - 프로토콜 버전 상수: `RDPINPUT_PROTOCOL_V1` / `V10` / `V101` / `V200` / `V300`
+  - TWO_BYTE_UNSIGNED_INTEGER / FOUR_BYTE_UNSIGNED_INTEGER / EIGHT_BYTE_UNSIGNED_INTEGER 가변 인코딩 규칙
+  - RDPINPUT_CONTACT_DATA 필드 (contactId, fieldsPresent, x/y, contactFlags, contactRectLeft/Top/Right/Bottom, orientation, pressure)
+  - contactFlags 비트: `DOWN` / `UPDATE` / `UP` / `INRANGE` / `INCONTACT` / `CANCELED`
+  - 최대 제약: 256 contacts, 256 frames per PDU
+
+- [x] **Step 2 — PDU 구현** (`crates/justrdp-rdpei/src/pdu.rs`, 39 tests ✅)
+  - [x] `RdpeiHeader { event_id: u16, pdu_length: u32 }` + Encode/Decode
+  - [x] 가변 길이 정수 헬퍼 (2/4/8-byte unsigned + 2/4-byte signed, all spec examples verified)
+  - [x] `ScReadyPdu { protocol_version: u32, supported_features: Option<u32> }` (pdu_length로 V300 features 판별)
+  - [x] `CsReadyPdu { flags: u32, protocol_version: u32, max_touch_contacts: u16 }` (fixed 16 bytes)
+  - [x] `TouchContact { contact_id, x, y, contact_flags, contact_rect, orientation, pressure }` + 8개 유효 `contactFlags` 조합 validation
+  - [x] `TouchFrame { frame_offset, contacts }`
+  - [x] `TouchEventPdu { encode_time, frames }`
+  - [x] `SuspendInputPdu` / `ResumeInputPdu` (header-only)
+  - [x] `DismissHoveringContactPdu { contact_id }`
+  - [x] roundtrip + 경계 테스트 (0 frames, 가변 정수 form 전환, orientation/pressure bounds, invalid flag 거부)
+
+- [x] **Step 3 — DVC Processor** (`crates/justrdp-rdpei/src/client.rs`, 20 tests ✅)
+  - [x] `RdpeiDvcClient` — `DvcProcessor` 구현 (`DisplayControlClient` 패턴)
+  - [x] 채널명 상수: `Microsoft::Windows::RDS::Input`
+  - [x] 상태 머신: `WaitScReady` → `Ready` (SC_READY 수신 시 CS_READY 즉시 반환)
+  - [x] 공개 API: `send_touch_event(encode_time, frames)`, `dismiss_hovering_contact(id)`, `take_pending_messages()`
+  - [x] 프로토콜 버전 협상 (min(server, client_max_version), 기본 client_max = V200)
+  - [x] V100 협상 시 `DISABLE_TIMESTAMP_INJECTION` flag 자동 제거 (스펙 SHOULD NOT)
+  - [x] Suspend/Resume: `SUSPEND_INPUT` 수신 시 `send_touch_event` 차단 (ADM `InputTransmissionSuspended`)
+  - [x] 재연결 시나리오: 두 번째 SC_READY 수신 시 CS_READY 재송신 + suspend flag 리셋
+  - [x] 클라 발신 event ID (CS_READY/TOUCH/DISMISS_HOVERING)가 inbound로 도착 시 무시 (§3.1.5.1)
+  - [ ] `Connector`/세션 레이어 등록 경로 — Step 4에서 통합 테스트와 함께
+
+- [ ] **Step 4 — 검증**
+  - [ ] mock DVC 전송 통합 테스트 (SC_READY 수신 → CS_READY 송신 → touch frame 송신 순서 확인)
+  - [ ] `@impl-verifier` 로 스펙 1:1 대조
+  - [ ] `@test-gap-finder` 로 누락 케이스 점검
+
+**참고 구현 패턴**:
+- `justrdp-rdpsnd` (DVC 모드): `RdpsndDvcClient`, 상태 머신, 버전 교환
+- `justrdp-displaycontrol`: DVC 채널명 상수, PDU 헤더 공유 패턴
 
 ### 9.5 Pen/Stylus Input (MS-RDPEPS)
 

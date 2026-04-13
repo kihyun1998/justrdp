@@ -19,6 +19,7 @@ members = [
     "crates/justrdp-audio",
     "crates/justrdp-displaycontrol",
     "crates/justrdp-rdpeai",
+    "crates/justrdp-rdpei",
     "crates/justrdp-egfx",
     "crates/justrdp-rail",
     "crates/justrdp-rdpdr-native",
@@ -60,6 +61,7 @@ justrdp-rdpsnd = { path = "crates/justrdp-rdpsnd", version = "0.1.0" }
 justrdp-audio = { path = "crates/justrdp-audio", version = "0.1.0" }
 justrdp-displaycontrol = { path = "crates/justrdp-displaycontrol", version = "0.1.0" }
 justrdp-rdpeai = { path = "crates/justrdp-rdpeai", version = "0.1.0" }
+justrdp-rdpei = { path = "crates/justrdp-rdpei", version = "0.1.0" }
 justrdp-egfx = { path = "crates/justrdp-egfx", version = "0.1.0" }
 justrdp-rail = { path = "crates/justrdp-rail", version = "0.1.0" }
 justrdp-rdpdr-native = { path = "crates/justrdp-rdpdr-native", version = "0.1.0" }

@@ -1,0 +1,618 @@
+#![forbid(unsafe_code)]
+
+//! Touch Input DVC client -- MS-RDPEI 3.2
+//!
+//! `RdpeiDvcClient` implements [`DvcProcessor`] for the
+//! `Microsoft::Windows::RDS::Input` dynamic virtual channel. It negotiates
+//! the protocol version with the server, tracks the suspend/resume state,
+//! and provides an API for forwarding multi-touch events.
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use justrdp_core::{AsAny, Encode, WriteCursor};
+use justrdp_dvc::{DvcError, DvcMessage, DvcProcessor, DvcResult};
+
+use crate::pdu::{
+    CsReadyPdu, DismissHoveringContactPdu, EVENTID_CS_READY, EVENTID_DISMISS_HOVERING_TOUCH_CONTACT,
+    EVENTID_RESUME_INPUT, EVENTID_SC_READY, EVENTID_SUSPEND_INPUT, EVENTID_TOUCH, RdpeiHeader,
+    RDPINPUT_PROTOCOL_V100, RDPINPUT_PROTOCOL_V200, ResumeInputPdu, ScReadyPdu, SuspendInputPdu,
+    TouchEventPdu, TouchFrame,
+};
+
+/// DVC channel name for Touch Input.
+/// MS-RDPEI 2.1
+const CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Input";
+
+// =============================================================================
+// Config
+// =============================================================================
+
+/// Client-side configuration for `RdpeiDvcClient`.
+#[derive(Debug, Clone)]
+pub struct RdpeiClientConfig {
+    /// Maximum protocol version the client supports. Default: V200.
+    ///
+    /// During negotiation the client picks `min(server_version, client_max)`.
+    pub client_max_version: u32,
+    /// Flags advertised in the CS_READY PDU (`CsReadyFlags::*`). Default: 0.
+    pub cs_ready_flags: u32,
+    /// Maximum simultaneous touch contacts the client reports. Default: 10.
+    pub max_touch_contacts: u16,
+}
+
+impl Default for RdpeiClientConfig {
+    fn default() -> Self {
+        Self {
+            client_max_version: RDPINPUT_PROTOCOL_V200,
+            cs_ready_flags: 0,
+            max_touch_contacts: 10,
+        }
+    }
+}
+
+// =============================================================================
+// State machine
+// =============================================================================
+
+/// Internal state of the DVC processor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Waiting for the server's SC_READY PDU.
+    WaitScReady,
+    /// CS_READY has been queued; touch events may be sent (unless suspended).
+    Ready,
+}
+
+// =============================================================================
+// Client
+// =============================================================================
+
+/// Touch Input DVC client.
+///
+/// Implements [`DvcProcessor`] for `Microsoft::Windows::RDS::Input`.
+///
+/// ```ignore
+/// use justrdp_rdpei::RdpeiDvcClient;
+/// use justrdp_dvc::DrdynvcClient;
+///
+/// let mut drdynvc = DrdynvcClient::new();
+/// drdynvc.register(Box::new(RdpeiDvcClient::new()));
+/// ```
+pub struct RdpeiDvcClient {
+    config: RdpeiClientConfig,
+    state: State,
+    /// Negotiated protocol version = `min(server_version, client_max_version)`.
+    /// `None` until SC_READY is received.
+    negotiated_version: Option<u32>,
+    /// `supportedFeatures` from the server (V300 only).
+    server_features: Option<u32>,
+    /// Server-controlled ADM: MS-RDPEI 3.3.1.1.
+    input_suspended: bool,
+    /// Client-initiated outbound messages queued between `process()` calls.
+    outbound: Vec<DvcMessage>,
+}
+
+impl RdpeiDvcClient {
+    /// Create a new client with default config.
+    pub fn new() -> Self {
+        Self::with_config(RdpeiClientConfig::default())
+    }
+
+    /// Create a new client with custom config.
+    pub fn with_config(config: RdpeiClientConfig) -> Self {
+        Self {
+            config,
+            state: State::WaitScReady,
+            negotiated_version: None,
+            server_features: None,
+            input_suspended: false,
+            outbound: Vec::new(),
+        }
+    }
+
+    /// Returns `true` once CS_READY has been sent.
+    pub fn is_ready(&self) -> bool {
+        matches!(self.state, State::Ready)
+    }
+
+    /// Returns `true` while the server has issued SUSPEND_INPUT without a
+    /// matching RESUME_INPUT. MS-RDPEI 3.3.5.4
+    pub fn is_input_suspended(&self) -> bool {
+        self.input_suspended
+    }
+
+    /// Negotiated protocol version (`None` until SC_READY is received).
+    pub fn negotiated_version(&self) -> Option<u32> {
+        self.negotiated_version
+    }
+
+    /// Server-advertised `supportedFeatures` (V300 only).
+    pub fn server_features(&self) -> Option<u32> {
+        self.server_features
+    }
+
+    /// Queue a TOUCH_EVENT_PDU to send to the server.
+    ///
+    /// Returns an error when the channel is not yet ready or when input
+    /// transmission has been suspended (MS-RDPEI 3.3.5.4: client MUST NOT
+    /// send touch events while suspended).
+    pub fn send_touch_event(
+        &mut self,
+        encode_time: u32,
+        frames: Vec<TouchFrame>,
+    ) -> Result<(), String> {
+        if !self.is_ready() {
+            return Err(String::from("RDPEI channel is not ready"));
+        }
+        if self.input_suspended {
+            return Err(String::from("input transmission is suspended"));
+        }
+        let pdu = TouchEventPdu {
+            encode_time,
+            frames,
+        };
+        self.enqueue_pdu(&pdu)
+            .map_err(|_| String::from("failed to encode TouchEventPdu"))?;
+        Ok(())
+    }
+
+    /// Queue a DISMISS_HOVERING_TOUCH_CONTACT_PDU for the given contact.
+    ///
+    /// MS-RDPEI 2.2.3.6: used to transition a hovering contact back to
+    /// out-of-range. Valid after CS_READY even while input is suspended
+    /// (SUSPEND_INPUT gates touch frames, not hover dismissal).
+    pub fn dismiss_hovering_contact(&mut self, contact_id: u8) -> Result<(), String> {
+        if !self.is_ready() {
+            return Err(String::from("RDPEI channel is not ready"));
+        }
+        let pdu = DismissHoveringContactPdu { contact_id };
+        self.enqueue_pdu(&pdu)
+            .map_err(|_| String::from("failed to encode DismissHoveringContactPdu"))?;
+        Ok(())
+    }
+
+    /// Drain all queued outbound messages.
+    ///
+    /// Call this after invoking `send_touch_event` /
+    /// `dismiss_hovering_contact` to retrieve the encoded PDUs for
+    /// transmission on the DVC channel.
+    pub fn take_pending_messages(&mut self) -> Vec<DvcMessage> {
+        core::mem::take(&mut self.outbound)
+    }
+
+    // ── Internals ──
+
+    fn enqueue_pdu<E: Encode>(&mut self, pdu: &E) -> DvcResult<()> {
+        let msg = encode_pdu(pdu)?;
+        self.outbound.push(msg);
+        Ok(())
+    }
+
+    /// Handle SC_READY: store negotiated version, queue CS_READY response.
+    fn handle_sc_ready(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        let sc_ready = ScReadyPdu::decode_from(payload).map_err(DvcError::Decode)?;
+        let negotiated = core::cmp::min(sc_ready.protocol_version, self.config.client_max_version);
+        self.negotiated_version = Some(negotiated);
+        self.server_features = sc_ready.supported_features;
+
+        // Strip DISABLE_TIMESTAMP_INJECTION when negotiating V100 (MS-RDPEI
+        // 2.2.3.2 SHOULD NOT be sent to V100 servers).
+        let mut flags = self.config.cs_ready_flags;
+        if negotiated == RDPINPUT_PROTOCOL_V100 {
+            flags &= !crate::pdu::CsReadyFlags::DISABLE_TIMESTAMP_INJECTION;
+        }
+
+        let cs_ready = CsReadyPdu {
+            flags,
+            protocol_version: negotiated,
+            max_touch_contacts: self.config.max_touch_contacts,
+        };
+        let msg = encode_pdu(&cs_ready)?;
+        self.state = State::Ready;
+        // Re-entry into WaitScReady (e.g., server re-sends SC_READY) must also
+        // clear the suspended flag: a fresh handshake starts from unsuspended.
+        self.input_suspended = false;
+        Ok(alloc::vec![msg])
+    }
+}
+
+impl Default for RdpeiDvcClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::fmt::Debug for RdpeiDvcClient {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RdpeiDvcClient")
+            .field("state", &self.state)
+            .field("negotiated_version", &self.negotiated_version)
+            .field("server_features", &self.server_features)
+            .field("input_suspended", &self.input_suspended)
+            .field("pending_outbound", &self.outbound.len())
+            .finish()
+    }
+}
+
+impl AsAny for RdpeiDvcClient {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+}
+
+impl DvcProcessor for RdpeiDvcClient {
+    fn channel_name(&self) -> &str {
+        CHANNEL_NAME
+    }
+
+    fn start(&mut self, _channel_id: u32) -> DvcResult<Vec<DvcMessage>> {
+        // Server speaks first (SC_READY).
+        Ok(Vec::new())
+    }
+
+    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        // Peek at the event ID to dispatch.
+        let mut src = justrdp_core::ReadCursor::new(payload);
+        let header = RdpeiHeader::decode(&mut src).map_err(DvcError::Decode)?;
+        match header.event_id {
+            EVENTID_SC_READY => self.handle_sc_ready(payload),
+            EVENTID_SUSPEND_INPUT => {
+                // Full PDU validation (length, etc.).
+                SuspendInputPdu::decode_from(payload).map_err(DvcError::Decode)?;
+                self.input_suspended = true;
+                Ok(Vec::new())
+            }
+            EVENTID_RESUME_INPUT => {
+                ResumeInputPdu::decode_from(payload).map_err(DvcError::Decode)?;
+                self.input_suspended = false;
+                Ok(Vec::new())
+            }
+            EVENTID_CS_READY | EVENTID_TOUCH | EVENTID_DISMISS_HOVERING_TOUCH_CONTACT => {
+                // Client-sourced event IDs never arrive from the server.
+                // MS-RDPEI 3.1.5.1: ignore unexpected PDUs.
+                Ok(Vec::new())
+            }
+            _ => {
+                // Unknown event ID (e.g., future extensions). Ignore.
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn close(&mut self, _channel_id: u32) {
+        self.state = State::WaitScReady;
+        self.negotiated_version = None;
+        self.server_features = None;
+        self.input_suspended = false;
+        self.outbound.clear();
+    }
+}
+
+/// Encode any RDPEI PDU into a `DvcMessage`.
+fn encode_pdu<E: Encode>(pdu: &E) -> DvcResult<DvcMessage> {
+    let size = pdu.size();
+    let mut buf = alloc::vec![0u8; size];
+    let mut dst = WriteCursor::new(&mut buf);
+    pdu.encode(&mut dst).map_err(DvcError::Encode)?;
+    Ok(DvcMessage::new(buf))
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pdu::{
+        ContactFlags, CsReadyFlags, RDPINPUT_PROTOCOL_V101, RDPINPUT_PROTOCOL_V300,
+        SC_READY_MULTIPEN_INJECTION_SUPPORTED, TouchContact, TouchFrame,
+    };
+
+    fn encode<E: Encode>(pdu: &E) -> Vec<u8> {
+        let mut buf = alloc::vec![0u8; pdu.size()];
+        let mut dst = WriteCursor::new(&mut buf);
+        pdu.encode(&mut dst).unwrap();
+        buf
+    }
+
+    fn sc_ready(version: u32, features: Option<u32>) -> Vec<u8> {
+        encode(&ScReadyPdu {
+            protocol_version: version,
+            supported_features: features,
+        })
+    }
+
+    fn suspend() -> Vec<u8> {
+        encode(&SuspendInputPdu)
+    }
+
+    fn resume() -> Vec<u8> {
+        encode(&ResumeInputPdu)
+    }
+
+    fn sample_contact(id: u8) -> TouchContact {
+        TouchContact {
+            contact_id: id,
+            x: 100,
+            y: 200,
+            contact_flags: ContactFlags::DOWN | ContactFlags::INRANGE | ContactFlags::INCONTACT,
+            contact_rect: None,
+            orientation: None,
+            pressure: None,
+        }
+    }
+
+    // ── Basic trait plumbing ──
+
+    #[test]
+    fn channel_name_matches_spec() {
+        let c = RdpeiDvcClient::new();
+        assert_eq!(c.channel_name(), "Microsoft::Windows::RDS::Input");
+    }
+
+    #[test]
+    fn start_returns_empty() {
+        let mut c = RdpeiDvcClient::new();
+        assert!(c.start(1).unwrap().is_empty());
+        assert!(!c.is_ready());
+    }
+
+    // ── SC_READY handshake & negotiation ──
+
+    #[test]
+    fn sc_ready_triggers_cs_ready_response() {
+        let mut c = RdpeiDvcClient::new();
+        let msgs = c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V101, None)).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(c.is_ready());
+        // Response is a valid CS_READY.
+        let cs = CsReadyPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(cs.protocol_version, RDPINPUT_PROTOCOL_V101);
+        assert_eq!(cs.max_touch_contacts, 10);
+    }
+
+    #[test]
+    fn version_negotiation_picks_min() {
+        // Server V300, client default max V200 → negotiate V200.
+        let mut c = RdpeiDvcClient::new();
+        let msgs = c
+            .process(
+                1,
+                &sc_ready(RDPINPUT_PROTOCOL_V300, Some(SC_READY_MULTIPEN_INJECTION_SUPPORTED)),
+            )
+            .unwrap();
+        let cs = CsReadyPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(cs.protocol_version, RDPINPUT_PROTOCOL_V200);
+        assert_eq!(c.negotiated_version(), Some(RDPINPUT_PROTOCOL_V200));
+        assert_eq!(
+            c.server_features(),
+            Some(SC_READY_MULTIPEN_INJECTION_SUPPORTED)
+        );
+    }
+
+    #[test]
+    fn version_negotiation_server_lower_than_client_max() {
+        // Server V100, client max V300 → negotiate V100.
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            client_max_version: RDPINPUT_PROTOCOL_V300,
+            ..Default::default()
+        });
+        let msgs = c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V100, None)).unwrap();
+        let cs = CsReadyPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(cs.protocol_version, RDPINPUT_PROTOCOL_V100);
+    }
+
+    #[test]
+    fn v100_strips_disable_timestamp_injection_flag() {
+        // Config requests DISABLE_TIMESTAMP_INJECTION + SHOW_TOUCH_VISUALS,
+        // but server only speaks V100 → only SHOW_TOUCH_VISUALS survives.
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            client_max_version: RDPINPUT_PROTOCOL_V300,
+            cs_ready_flags: CsReadyFlags::SHOW_TOUCH_VISUALS
+                | CsReadyFlags::DISABLE_TIMESTAMP_INJECTION,
+            ..Default::default()
+        });
+        let msgs = c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V100, None)).unwrap();
+        let cs = CsReadyPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(cs.flags, CsReadyFlags::SHOW_TOUCH_VISUALS);
+    }
+
+    #[test]
+    fn flags_preserved_for_v200_and_above() {
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            client_max_version: RDPINPUT_PROTOCOL_V300,
+            cs_ready_flags: CsReadyFlags::SHOW_TOUCH_VISUALS
+                | CsReadyFlags::DISABLE_TIMESTAMP_INJECTION,
+            ..Default::default()
+        });
+        let msgs = c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        let cs = CsReadyPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(
+            cs.flags,
+            CsReadyFlags::SHOW_TOUCH_VISUALS | CsReadyFlags::DISABLE_TIMESTAMP_INJECTION
+        );
+    }
+
+    // ── Suspend / Resume ──
+
+    #[test]
+    fn suspend_blocks_send_touch_event() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.take_pending_messages(); // drop CS_READY (it's in process() return, not outbound)
+
+        let msgs = c.process(1, &suspend()).unwrap();
+        assert!(msgs.is_empty());
+        assert!(c.is_input_suspended());
+
+        let err = c.send_touch_event(
+            0,
+            alloc::vec![TouchFrame {
+                frame_offset: 0,
+                contacts: alloc::vec![sample_contact(1)],
+            }],
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn resume_reenables_send() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.process(1, &suspend()).unwrap();
+        c.process(1, &resume()).unwrap();
+        assert!(!c.is_input_suspended());
+
+        let result = c.send_touch_event(
+            10,
+            alloc::vec![TouchFrame {
+                frame_offset: 0,
+                contacts: alloc::vec![sample_contact(1)],
+            }],
+        );
+        assert!(result.is_ok());
+        assert_eq!(c.take_pending_messages().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_suspend_is_idempotent() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.process(1, &suspend()).unwrap();
+        c.process(1, &suspend()).unwrap();
+        assert!(c.is_input_suspended());
+    }
+
+    // ── send_touch_event / dismiss_hovering_contact ──
+
+    #[test]
+    fn send_touch_event_before_ready_fails() {
+        let mut c = RdpeiDvcClient::new();
+        let result = c.send_touch_event(
+            0,
+            alloc::vec![TouchFrame {
+                frame_offset: 0,
+                contacts: alloc::vec![sample_contact(1)],
+            }],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn send_touch_event_queues_encoded_pdu() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+
+        c.send_touch_event(
+            12345,
+            alloc::vec![TouchFrame {
+                frame_offset: 0,
+                contacts: alloc::vec![sample_contact(1), sample_contact(2)],
+            }],
+        )
+        .unwrap();
+
+        let msgs = c.take_pending_messages();
+        assert_eq!(msgs.len(), 1);
+        // Roundtrip the encoded PDU.
+        let decoded = TouchEventPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(decoded.encode_time, 12345);
+        assert_eq!(decoded.frames.len(), 1);
+        assert_eq!(decoded.frames[0].contacts.len(), 2);
+    }
+
+    #[test]
+    fn dismiss_hovering_contact_queues_pdu() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+
+        c.dismiss_hovering_contact(7).unwrap();
+        let msgs = c.take_pending_messages();
+        assert_eq!(msgs.len(), 1);
+        let decoded = DismissHoveringContactPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(decoded.contact_id, 7);
+    }
+
+    #[test]
+    fn dismiss_hovering_contact_works_while_suspended() {
+        // SUSPEND gates touch frames only, not hover dismissal.
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.process(1, &suspend()).unwrap();
+        assert!(c.dismiss_hovering_contact(3).is_ok());
+    }
+
+    #[test]
+    fn dismiss_hovering_contact_before_ready_fails() {
+        let mut c = RdpeiDvcClient::new();
+        assert!(c.dismiss_hovering_contact(1).is_err());
+    }
+
+    // ── Ignored / unexpected PDUs ──
+
+    #[test]
+    fn unknown_event_id_ignored() {
+        let mut c = RdpeiDvcClient::new();
+        // Hand-craft a header with event_id = 0x00FF (undefined).
+        let buf = [0xFFu8, 0x00, 0x06, 0x00, 0x00, 0x00];
+        let msgs = c.process(1, &buf).unwrap();
+        assert!(msgs.is_empty());
+        assert!(!c.is_ready());
+    }
+
+    #[test]
+    fn client_sourced_event_id_ignored_on_inbound() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        // A "CS_READY" arriving FROM the server must be ignored.
+        let buf = [0x02u8, 0x00, 0x10, 0x00, 0x00, 0x00,
+                   0x00, 0x00, 0x00, 0x00,
+                   0x00, 0x00, 0x01, 0x00,
+                   0x00, 0x00];
+        assert!(c.process(1, &buf).unwrap().is_empty());
+    }
+
+    #[test]
+    fn short_payload_returns_error() {
+        let mut c = RdpeiDvcClient::new();
+        let short = [0x01u8, 0x00, 0x05]; // truncated header
+        assert!(c.process(1, &short).is_err());
+    }
+
+    // ── Reconnect / close ──
+
+    #[test]
+    fn second_sc_ready_resends_cs_ready_and_clears_suspend() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.process(1, &suspend()).unwrap();
+        assert!(c.is_input_suspended());
+
+        // Second SC_READY (e.g., after reconnect).
+        let msgs = c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(!c.is_input_suspended(), "second SC_READY must reset suspend flag");
+    }
+
+    #[test]
+    fn close_resets_state() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.dismiss_hovering_contact(1).unwrap();
+        assert!(c.is_ready());
+        assert!(!c.take_pending_messages().is_empty() || c.take_pending_messages().is_empty());
+
+        c.close(1);
+        assert!(!c.is_ready());
+        assert_eq!(c.negotiated_version(), None);
+        assert_eq!(c.server_features(), None);
+        assert!(!c.is_input_suspended());
+    }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "justrdp-rdpei"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Touch Input Virtual Channel Extension (MS-RDPEI) for JustRDP"
+keywords = ["rdp", "touch", "rdpei"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc", "justrdp-dvc/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-dvc/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-dvc.workspace = true
