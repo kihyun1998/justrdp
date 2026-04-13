@@ -59,6 +59,14 @@ pub const MAX_CBSAMPLE: u32 = 1_048_576;
 pub const MAX_CBEXTRA: u32 = 65_536;
 pub const MAX_PACKETS_IN_SAMPLE: u16 = 1024;
 pub const MAX_PENDING_REASSEMBLY_SAMPLES: usize = 32;
+/// Hard byte budget for in-flight reassembly state, per presentation.
+///
+/// The count-based cap (`MAX_PENDING_REASSEMBLY_SAMPLES`) on its own is
+/// insufficient because a single slot can accumulate up to
+/// `MAX_PACKETS_IN_SAMPLE × MAX_CBSAMPLE` bytes. This cap bounds the
+/// actual heap footprint an attacker can hold per presentation at
+/// approximately 32 MiB.
+pub const MAX_PER_PRESENTATION_REASSEMBLY_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SCALED_WIDTH: u32 = 1920;
 pub const MAX_SCALED_HEIGHT: u32 = 1080;
 pub const MAX_DESIRED_FRAMERATE: u32 = 30;

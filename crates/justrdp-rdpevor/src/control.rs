@@ -38,6 +38,11 @@ pub type BoxedGeometryLookup = Box<dyn GeometryLookup + Send>;
 /// Client-side processor for the Control DVC.
 pub struct RdpevorControlClient {
     decoder: Box<dyn VideoDecoder>,
+    /// Tracks whether `decoder.initialize()` has been called without a
+    /// matching `shutdown()`. Used to guarantee shutdown-on-close even
+    /// when `active` becomes empty via an error path (e.g. decoder init
+    /// succeeded but a subsequent validation failed).
+    decoder_initialized: bool,
     geometry: Option<BoxedGeometryLookup>,
     active: BTreeMap<u8, PresentationEntry>,
     channel_id: u32,
@@ -58,6 +63,7 @@ impl RdpevorControlClient {
     pub fn new(decoder: Box<dyn VideoDecoder>) -> Self {
         Self {
             decoder,
+            decoder_initialized: false,
             geometry: None,
             active: BTreeMap::new(),
             channel_id: 0,
@@ -113,6 +119,7 @@ impl RdpevorControlClient {
                     .map_err(|_| {
                         DvcError::Protocol(String::from("RDPEVOR: decoder init failed"))
                     })?;
+                self.decoder_initialized = true;
                 self.active.insert(
                     req.presentation_id,
                     PresentationEntry {
@@ -126,8 +133,14 @@ impl RdpevorControlClient {
                 Ok(Some(PresentationResponse::new(req.presentation_id)))
             }
             TSMM_VIDEO_PLAYBACK_COMMAND_STOP => {
-                if self.active.remove(&req.presentation_id).is_some() {
+                if self.active.remove(&req.presentation_id).is_some()
+                    && self.active.is_empty()
+                    && self.decoder_initialized
+                {
+                    // Shut the single shared decoder down once no
+                    // presentation still needs it.
                     self.decoder.shutdown();
+                    self.decoder_initialized = false;
                 }
                 Ok(None)
             }
@@ -152,6 +165,15 @@ impl DvcProcessor for RdpevorControlClient {
     }
 
     fn start(&mut self, channel_id: u32) -> DvcResult<Vec<DvcMessage>> {
+        // DRDYNVC may re-create this channel. If an earlier lifetime left
+        // the decoder initialised, shut it down before accepting the new
+        // channel so we never leak a half-initialised decoder across DVC
+        // instances.
+        if self.decoder_initialized {
+            self.decoder.shutdown();
+            self.decoder_initialized = false;
+        }
+        self.active.clear();
         self.channel_id = channel_id;
         self.open = true;
         Ok(Vec::new())
@@ -184,15 +206,19 @@ impl DvcProcessor for RdpevorControlClient {
         }
     }
 
-    fn close(&mut self, _channel_id: u32) {
-        // A single decoder instance is shared across all presentations; the
-        // trait contract treats `shutdown` as idempotent and per-channel,
-        // so call it exactly once on channel close regardless of how many
-        // presentations were still active.
-        if !self.active.is_empty() {
+    fn close(&mut self, channel_id: u32) {
+        if self.open && channel_id != self.channel_id {
+            return;
+        }
+        // Shut down the decoder exactly once iff it was initialised, so
+        // that the error path (decoder init succeeded but a later step
+        // failed) is also covered.
+        if self.decoder_initialized {
             self.decoder.shutdown();
+            self.decoder_initialized = false;
         }
         self.active.clear();
+        self.channel_id = 0;
         self.open = false;
     }
 }

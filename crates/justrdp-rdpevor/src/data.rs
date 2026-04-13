@@ -16,8 +16,8 @@ use justrdp_dvc::{DvcError, DvcMessage, DvcProcessor, DvcResult};
 
 use crate::pdu::{
     VideoData, DATA_CHANNEL_NAME, MAX_CONCURRENT_PRESENTATIONS,
-    MAX_PENDING_REASSEMBLY_SAMPLES, TSMM_VIDEO_DATA_FLAG_HAS_TIMESTAMPS,
-    TSMM_VIDEO_DATA_FLAG_KEYFRAME,
+    MAX_PENDING_REASSEMBLY_SAMPLES, MAX_PER_PRESENTATION_REASSEMBLY_BYTES,
+    TSMM_VIDEO_DATA_FLAG_HAS_TIMESTAMPS, TSMM_VIDEO_DATA_FLAG_KEYFRAME,
 };
 
 /// Destination for reassembled video samples.
@@ -64,13 +64,24 @@ impl PendingSample {
         }
         out
     }
+
+    fn total_bytes(&self) -> usize {
+        self.fragments.values().map(Vec::len).sum()
+    }
+}
+
+// Per-presentation reassembly state with a running byte budget.
+#[derive(Default)]
+struct PresentationReassembly {
+    samples: BTreeMap<u32, PendingSample>,
+    bytes_in_flight: usize,
 }
 
 /// Client-side processor for the Data DVC.
 pub struct RdpevorDataClient {
     sink: Box<dyn VideoSink>,
     /// Per-presentation, per-SampleNumber reassembly state.
-    pending: BTreeMap<u8, BTreeMap<u32, PendingSample>>,
+    pending: BTreeMap<u8, PresentationReassembly>,
     /// Presentation IDs that received a matching `Start` on the Control
     /// channel. VIDEO_DATA for unknown/inactive IDs is discarded per
     /// MS-RDPEVOR §3.2.5.1. The upstream coordinator is responsible for
@@ -108,7 +119,15 @@ impl RdpevorDataClient {
     }
 
     pub fn pending_samples_for(&self, presentation_id: u8) -> usize {
-        self.pending.get(&presentation_id).map_or(0, BTreeMap::len)
+        self.pending
+            .get(&presentation_id)
+            .map_or(0, |r| r.samples.len())
+    }
+
+    pub fn pending_bytes_for(&self, presentation_id: u8) -> usize {
+        self.pending
+            .get(&presentation_id)
+            .map_or(0, |r| r.bytes_in_flight)
     }
 
     /// Mark a presentation id as active so that subsequent VIDEO_DATA is
@@ -155,21 +174,29 @@ impl RdpevorDataClient {
         }
 
         // Multi-fragment: insert into reassembly buffer.
-        let per_presentation = self.pending.entry(vd.presentation_id).or_default();
-        if per_presentation.len() >= MAX_PENDING_REASSEMBLY_SAMPLES
-            && !per_presentation.contains_key(&vd.sample_number)
+        let r = self.pending.entry(vd.presentation_id).or_default();
+
+        // Enforce the count cap first: evict the oldest pending sample if
+        // we would otherwise exceed it when inserting a new SampleNumber.
+        if r.samples.len() >= MAX_PENDING_REASSEMBLY_SAMPLES
+            && !r.samples.contains_key(&vd.sample_number)
         {
-            // Drop the oldest pending sample to keep the cap.
-            if let Some(&oldest) = per_presentation.keys().next() {
-                per_presentation.remove(&oldest);
+            if let Some(&oldest) = r.samples.keys().next() {
+                if let Some(old) = r.samples.remove(&oldest) {
+                    r.bytes_in_flight = r.bytes_in_flight.saturating_sub(old.total_bytes());
+                }
             }
         }
-        let entry = per_presentation
+
+        let entry = r
+            .samples
             .entry(vd.sample_number)
             .or_insert_with(|| PendingSample::new(vd.packets_in_sample));
         if entry.packets_in_sample != vd.packets_in_sample {
             // Inconsistent fragmentation → drop the sample.
-            per_presentation.remove(&vd.sample_number);
+            if let Some(old) = r.samples.remove(&vd.sample_number) {
+                r.bytes_in_flight = r.bytes_in_flight.saturating_sub(old.total_bytes());
+            }
             return Ok(());
         }
         if has_timestamp {
@@ -184,23 +211,40 @@ impl RdpevorDataClient {
             // without touching the already-buffered fragment.
             return Ok(());
         }
-        entry
-            .fragments
-            .insert(vd.current_packet_index, vd.sample);
+        // Enforce the per-presentation byte budget BEFORE inserting the
+        // new fragment. An attacker that repeatedly sends first fragments
+        // of ever-new SampleNumbers would otherwise grow pending state
+        // without bound.
+        let frag_len = vd.sample.len();
+        if r.bytes_in_flight.saturating_add(frag_len) > MAX_PER_PRESENTATION_REASSEMBLY_BYTES {
+            // Drop this fragment and the sample it belongs to; the peer
+            // will retransmit or request a keyframe on timeout.
+            if let Some(old) = r.samples.remove(&vd.sample_number) {
+                r.bytes_in_flight = r.bytes_in_flight.saturating_sub(old.total_bytes());
+            }
+            return Ok(());
+        }
 
-        if entry.is_complete() {
-            let pending = per_presentation.remove(&vd.sample_number).unwrap();
+        let entry = r
+            .samples
+            .get_mut(&vd.sample_number)
+            .expect("sample just inserted above");
+        entry.fragments.insert(vd.current_packet_index, vd.sample);
+        r.bytes_in_flight += frag_len;
+
+        let complete = r
+            .samples
+            .get(&vd.sample_number)
+            .is_some_and(PendingSample::is_complete);
+        if complete {
+            let pending = r.samples.remove(&vd.sample_number).unwrap();
+            r.bytes_in_flight = r.bytes_in_flight.saturating_sub(pending.total_bytes());
             let ts = if pending.has_timestamp { Some(pending.hns_timestamp) } else { None };
             let keyframe = pending.keyframe;
             let bytes = pending.assemble();
             self.sink.on_sample(vd.presentation_id, bytes, ts, keyframe);
         }
         Ok(())
-    }
-
-    /// Drop all pending reassembly state for a presentation (e.g. on Stop).
-    pub fn forget_presentation(&mut self, presentation_id: u8) {
-        self.pending.remove(&presentation_id);
     }
 }
 
@@ -219,6 +263,13 @@ impl DvcProcessor for RdpevorDataClient {
     }
 
     fn start(&mut self, channel_id: u32) -> DvcResult<Vec<DvcMessage>> {
+        // DRDYNVC may re-create this channel; drop any state that belonged
+        // to a previous lifetime so the new channel starts clean. In
+        // particular, stale entries in `active` would otherwise let
+        // previously-registered presentation ids bypass the gating check
+        // on the re-opened channel.
+        self.pending.clear();
+        self.active.clear();
         self.channel_id = channel_id;
         self.open = true;
         Ok(Vec::new())
@@ -246,8 +297,13 @@ impl DvcProcessor for RdpevorDataClient {
         Ok(Vec::new())
     }
 
-    fn close(&mut self, _channel_id: u32) {
+    fn close(&mut self, channel_id: u32) {
+        if self.open && channel_id != self.channel_id {
+            return;
+        }
         self.pending.clear();
+        self.active.clear();
+        self.channel_id = 0;
         self.open = false;
     }
 }
@@ -366,12 +422,12 @@ mod tests {
     }
 
     #[test]
-    fn forget_presentation_drops_pending() {
+    fn unregister_presentation_drops_pending() {
         let (mut c, _) = setup();
         let f1 = make_vd(3, 0, 9, 1, 3, vec![0xAA]);
         c.process(20, &f1).unwrap();
         assert_eq!(c.pending_samples_for(3), 1);
-        c.forget_presentation(3);
+        c.unregister_presentation(3);
         assert_eq!(c.pending_samples_for(3), 0);
     }
 
@@ -401,6 +457,39 @@ mod tests {
         c.close(20);
         assert!(!c.is_open());
         assert_eq!(c.pending_samples_for(1), 0);
+    }
+
+    #[test]
+    fn close_then_reopen_drops_stale_active_gate() {
+        let (mut c, samples) = setup();
+        // pid 3 is registered in setup(); close the channel.
+        c.close(20);
+        // Re-open the channel.
+        c.start(20).unwrap();
+        // VIDEO_DATA for the previously-registered pid 3 must now be
+        // silently discarded because `active` was flushed on close/start.
+        let bytes = make_vd(3, 0, 1, 1, 1, vec![0xAA]);
+        c.process(20, &bytes).unwrap();
+        assert!(samples.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_presentation_byte_budget_caps_pending_state() {
+        use crate::pdu::{MAX_CBSAMPLE, MAX_PER_PRESENTATION_REASSEMBLY_BYTES};
+        let (mut c, samples) = setup();
+        // Use max-size (1 MiB) fragments across a 40-fragment sample.
+        // With the 32 MiB per-presentation budget, the sample cannot be
+        // reassembled; the cap trips well before all 40 fragments fit.
+        let body = vec![0u8; MAX_CBSAMPLE as usize];
+        for idx in 1..=40u16 {
+            let bytes = make_vd(3, 0, 100, idx, 40, body.clone());
+            c.process(20, &bytes).unwrap();
+        }
+        // Sample never completed, sink never called.
+        assert!(samples.lock().unwrap().is_empty());
+        // The cap is the hard invariant: bytes_in_flight MUST NOT exceed
+        // the budget at any observable point.
+        assert!(c.pending_bytes_for(3) <= MAX_PER_PRESENTATION_REASSEMBLY_BYTES);
     }
 
     #[test]
