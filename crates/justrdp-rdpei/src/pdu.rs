@@ -998,8 +998,14 @@ impl PenFlags {
     pub const BARREL_PRESSED: u32 = 0x0000_0001;
     pub const ERASER_PRESSED: u32 = 0x0000_0002;
     pub const INVERTED: u32 = 0x0000_0004;
-    /// Mask of all spec-defined bits; other bits in a decoded value should
-    /// be preserved for forward compatibility.
+    /// Mask of all spec-defined bits. Exposed at the crate root so that
+    /// callers wrapping raw hardware input can filter out unknown bits
+    /// before calling `send_pen_event` if strict bit-hygiene is required.
+    /// The library itself does NOT enforce this mask on encode/decode —
+    /// MS-RDPEI §2.2.3.7.1.1 reserves the unused bits for future pen
+    /// features, so we preserve them as-is for forward compatibility
+    /// (contrast with `PenFieldsPresent::ALL`, which IS enforced because
+    /// unknown presence bits would desync the wire format).
     pub const ALL: u32 = Self::BARREL_PRESSED | Self::ERASER_PRESSED | Self::INVERTED;
 }
 
@@ -1070,6 +1076,11 @@ impl PenContact {
 
     fn validate(&self) -> Result<(), EncodeError> {
         validate_contact_flags_encode(self.contact_flags, "PenContact")?;
+        // Note: `pen_flags` intentionally has no range check. MS-RDPEI
+        // §2.2.3.7.1.1 defines only 3 bits but reserves the rest for
+        // forward compatibility, so we pass any u32 through unchanged.
+        // Callers who want strict filtering can mask with `PenFlags::ALL`
+        // before calling `send_pen_event`.
         if let Some(p) = self.pressure
             && p > PEN_PRESSURE_MAX
         {
