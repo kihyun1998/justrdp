@@ -1582,13 +1582,13 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
   - 최대 펜 contact 수 / 최대 프레임 수 (스펙 vs 정책)
 
 - [x] **Step 2 — Implementation** (`crates/justrdp-rdpei/src/pdu.rs` + `client.rs`, 108 tests ✅)
-  - [ ] `PenContact { pen_contact_id, x, y, pen_flags, pressure, rotation, tilt_x, tilt_y }` + Encode/Decode + 유효 flag 조합 validation
-  - [ ] `PenFrame { frame_offset, contacts: Vec<PenContact> }` (재사용 가능한 경우 `TouchFrame` 과 제네릭화 검토, 단순 중복이 나으면 중복)
-  - [ ] `PenEventPdu { encode_time, frames }` — eventId=0x0008
-  - [ ] 가변 정수 재사용, DoS cap 재사용 (`MAX_CONTACTS_PER_FRAME`/`MAX_FRAMES_PER_EVENT` 공용)
-  - [ ] `RdpeiDvcClient::send_pen_event(encode_time, frames)` API 추가
-  - [ ] 버전 게이트: `negotiated_version >= V200` 아니면 에러
-  - [ ] V300 multipen injection 플래그 활성 요건 검증
+  - [x] `PenContact { device_id, x, y, contact_flags, pen_flags, pressure, rotation, tilt_x, tilt_y }` + Encode/Decode + `VALID_CONTACT_FLAG_COMBINATIONS` 재사용 (touch와 공유, spec §3.1.1.1)
+  - [x] `PenFrame { frame_offset, contacts: Vec<PenContact> }` — 중복 선택 (touch와 semantic/타입 차이로 제네릭화보다 가독성 우선)
+  - [x] `PenEventPdu { encode_time, frames }` — `EVENTID_PEN = 0x0008`
+  - [x] 가변 정수 재사용 (2/4/8-byte unsigned + 2/4-byte signed 코덱 공유), DoS cap: `MAX_FRAMES_PER_EVENT` 공유 + `MAX_PEN_CONTACTS_PER_FRAME = 4` 별도 (multipen "up to four" 제약)
+  - [x] `RdpeiDvcClient::send_pen_event(encode_time, frames)` API
+  - [x] 버전 게이트: `pen_input_allowed = negotiated >= V200` 체크
+  - [x] V300 multipen 활성 = 3-way AND (negotiated ≥ V300 + 서버 `SC_READY_MULTIPEN_INJECTION_SUPPORTED` + 클라 `CS_READY_FLAGS_ENABLE_MULTIPEN_INJECTION`), 미충족 시 outgoing flag 자동 제거
 
 - [x] **Step 3 — Verification** (120 tests ✅, clean workspace)
   - [x] `@impl-verifier` — 33/35 PASS (2 테스트 커버리지 갭만, 구현은 스펙 정확)
