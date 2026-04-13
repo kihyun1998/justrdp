@@ -130,6 +130,10 @@ impl DvcProcessor for RdpegtClient {
     }
 
     fn start(&mut self, channel_id: u32) -> DvcResult<Vec<DvcMessage>> {
+        // DRDYNVC may re-create this channel (server closes and re-opens);
+        // drop any stale mapping state from the previous lifetime so the
+        // new channel starts from a clean geometry map.
+        self.geometries.clear();
         self.channel_id = channel_id;
         self.open = true;
         Ok(Vec::new())
@@ -141,10 +145,11 @@ impl DvcProcessor for RdpegtClient {
                 "RDPEGT process() called before start()",
             )));
         }
-        debug_assert_eq!(
-            channel_id, self.channel_id,
-            "RdpegtClient: channel_id mismatch in process()"
-        );
+        if channel_id != self.channel_id {
+            return Err(DvcError::Protocol(String::from(
+                "RDPEGT: channel_id mismatch in process()",
+            )));
+        }
         let mut cur = ReadCursor::new(payload);
         let pdu = MappedGeometryPacket::decode(&mut cur).map_err(DvcError::Decode)?;
         if cur.remaining() != 0 {
@@ -298,6 +303,29 @@ mod tests {
         bytes.push(0xAB);
         let err = c.process(1, &bytes);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn restart_flushes_stale_geometry() {
+        let mut c = RdpegtClient::new();
+        c.start(1).unwrap();
+        let u = GeometryUpdate::new_single(7, 0, IRect::new(0, 0, 10, 10));
+        c.process(1, &encode_pdu(&MappedGeometryPacket::Update(u)))
+            .unwrap();
+        assert_eq!(c.active_mappings(), 1);
+        // Re-start without an intervening close(): stale mapping must be gone.
+        c.start(2).unwrap();
+        assert_eq!(c.active_mappings(), 0);
+        assert!(c.lookup(7).is_none());
+    }
+
+    #[test]
+    fn channel_id_mismatch_is_error() {
+        let mut c = RdpegtClient::new();
+        c.start(1).unwrap();
+        let u = GeometryUpdate::new_single(1, 0, IRect::new(0, 0, 10, 10));
+        let bytes = encode_pdu(&MappedGeometryPacket::Update(u));
+        assert!(c.process(999, &bytes).is_err());
     }
 
     #[test]

@@ -60,7 +60,7 @@ pub const MAX_ACTIVE_MAPPINGS: usize = 1024;
 pub const MAX_CBGEOMETRYBUFFER: u32 = 65_536;
 
 /// Maximum `cbGeometryData` accepted (header + buffer).
-pub const MAX_CBGEOMETRYDATA: u32 = 72 + MAX_CBGEOMETRYBUFFER;
+pub const MAX_CBGEOMETRYDATA: u32 = UPDATE_FIXED_SIZE + MAX_CBGEOMETRYBUFFER;
 
 // ── IRect ──
 
@@ -236,7 +236,11 @@ impl Encode for MappedGeometryPacket {
                 // RGNDATAHEADER
                 dst.write_u32_le(RGNDATAHEADER_SIZE, CTX)?;
                 dst.write_u32_le(RDH_RECTANGLES, CTX)?;
-                dst.write_u32_le(u.rects.len() as u32, CTX)?;
+                // rects.len() fits in u32 because cb_geometry_buffer() above
+                // already verified it via u32::try_from; reuse that count
+                // instead of a fresh truncating cast.
+                let rect_count = (cb_buffer - RGNDATAHEADER_SIZE) / (IRect::WIRE_SIZE as u32);
+                dst.write_u32_le(rect_count, CTX)?;
                 dst.write_u32_le(u.rgn_size, CTX)?;
                 u.region_bound.encode(dst, CTX)?;
                 for r in &u.rects {
@@ -244,7 +248,7 @@ impl Encode for MappedGeometryPacket {
                 }
             }
             Self::Clear(c) => {
-                dst.write_u32_le(24, CTX)?;
+                dst.write_u32_le(CLEAR_PACKET_SIZE, CTX)?;
                 dst.write_u32_le(MAPPED_GEOMETRY_VERSION, CTX)?;
                 dst.write_u64_le(c.mapping_id, CTX)?;
                 dst.write_u32_le(GEOMETRY_CLEAR, CTX)?;
