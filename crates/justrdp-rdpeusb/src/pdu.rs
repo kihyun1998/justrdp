@@ -438,8 +438,8 @@ pub(crate) fn decode_utf16_multisz(
         .ok_or_else(|| DecodeError::invalid_value(context, "cch*2 overflow"))?;
     let bytes = src.read_slice(byte_len, context)?;
     let mut raw = Vec::with_capacity(cch as usize);
-    for i in 0..(cch as usize) {
-        raw.push(u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]));
+    for pair in bytes.chunks_exact(2) {
+        raw.push(u16::from_le_bytes([pair[0], pair[1]]));
     }
     Ok(Utf16Multisz { raw })
 }
@@ -894,14 +894,9 @@ impl<'de> Decode<'de> for UsbDeviceCapabilities {
             device_is_high_speed,
             no_ack_isoch_write_jitter_buffer_size_in_ms,
         };
-        value.validate().map_err(|m| {
-            DecodeError::invalid_value("UsbDeviceCapabilities", match m {
-                "CbSize != 28" => "CbSize",
-                "HcdCapabilities != 0" => "HcdCapabilities",
-                "NoAckIsochWriteJitterBufferSizeInMs out of range" => "NoAckIsoch",
-                _ => "validation",
-            })
-        })?;
+        value
+            .validate()
+            .map_err(|m| DecodeError::invalid_value("UsbDeviceCapabilities", m))?;
         Ok(value)
     }
 }
@@ -1230,6 +1225,13 @@ impl<'de> Decode<'de> for RegisterRequestCallback {
             ));
         }
         let num_request_completion = src.read_u32_le("REGISTER::NumRequestCompletion")?;
+        // §2.2.6.2: NumRequestCompletion MUST be 0 or 1.
+        if num_request_completion > 1 {
+            return Err(DecodeError::invalid_value(
+                "RegisterRequestCallback",
+                "NumRequestCompletion",
+            ));
+        }
         let request_completion = if num_request_completion == 0 {
             None
         } else {

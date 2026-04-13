@@ -449,7 +449,7 @@ impl UrbdrcClient {
             u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
 
         match function_id {
-            FN_CANCEL_REQUEST => self.handle_cancel_request(payload),
+            FN_CANCEL_REQUEST => self.handle_cancel_request(interface_id, payload),
             FN_REGISTER_REQUEST_CALLBACK => self.handle_register_callback(interface_id, payload),
             FN_IO_CONTROL => self.handle_io_control(interface_id, payload, false),
             FN_INTERNAL_IO_CONTROL => self.handle_io_control(interface_id, payload, true),
@@ -461,13 +461,28 @@ impl UrbdrcClient {
         }
     }
 
-    fn handle_cancel_request(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+    fn handle_cancel_request(
+        &mut self,
+        interface_id: u32,
+        payload: &[u8],
+    ) -> DvcResult<Vec<DvcMessage>> {
         let mut src = ReadCursor::new(payload);
         let req = match CancelRequest::decode(&mut src) {
             Ok(v) => v,
             Err(_) => return Ok(Vec::new()),
         };
-        self.handler.handle_cancel(req.request_id);
+        // §3.3.5.3.1: the client SHOULD verify the RequestId is outstanding
+        // before forwarding to the host. A hostile server that sends CANCEL
+        // for a non-existent or already-completed request must not reach the
+        // UrbHandler — silently drop instead.
+        let known = self
+            .devices
+            .get(&interface_id)
+            .map(|d| d.in_flight.contains_key(&req.request_id))
+            .unwrap_or(false);
+        if known {
+            self.handler.handle_cancel(req.request_id);
+        }
         Ok(Vec::new())
     }
 
@@ -481,16 +496,17 @@ impl UrbdrcClient {
             Ok(v) => v,
             Err(_) => return Ok(Vec::new()),
         };
-        let dev = self
-            .devices
-            .entry(interface_id)
-            .or_insert_with(|| DeviceState {
-                usb_device: interface_id,
-                request_completion: None,
-                in_flight: BTreeMap::new(),
-                closed: false,
-            });
-        dev.request_completion = req.request_completion;
+        // Refuse to create a phantom DeviceState for an interface_id the
+        // client never announced via build_add_device. A hostile server
+        // could otherwise pollute the device table with arbitrary IDs and
+        // then drive IO_CONTROL / TRANSFER_IN against them. Silently drop
+        // unknown IDs per §3.1.5 out-of-sequence rule.
+        match self.devices.get_mut(&interface_id) {
+            Some(dev) => {
+                dev.request_completion = req.request_completion;
+            }
+            None => return Ok(Vec::new()),
+        }
         Ok(Vec::new())
     }
 
@@ -507,15 +523,14 @@ impl UrbdrcClient {
         is_transfer_in: bool,
     ) -> Result<(), DvcError> {
         let cap = self.config.max_in_flight_requests_per_device;
+        // Callers always reach this after `device_completion_iid` returned
+        // Some, so the device entry must already exist. Refuse to implicitly
+        // create a phantom DeviceState — that would let an earlier logic bug
+        // recover silently instead of surfacing as a protocol close.
         let dev = self
             .devices
-            .entry(device)
-            .or_insert_with(|| DeviceState {
-                usb_device: device,
-                request_completion: None,
-                in_flight: BTreeMap::new(),
-                closed: false,
-            });
+            .get_mut(&device)
+            .ok_or_else(|| DvcError::Protocol("unknown device in record_in_flight".to_string()))?;
         if dev.in_flight.len() >= cap {
             return Err(DvcError::Protocol(format!(
                 "device {} exceeded in-flight cap",
@@ -1105,6 +1120,16 @@ mod tests {
         let mut c = UrbdrcClient::new(Box::new(MockUrbHandler::default()));
         c.control_state = ControlState::Ready;
         let dev = 0x0000_1000;
+        // Pre-register the device (as build_add_device would).
+        c.devices.insert(
+            dev,
+            DeviceState {
+                usb_device: dev,
+                request_completion: None,
+                in_flight: BTreeMap::new(),
+                closed: false,
+            },
+        );
         // REGISTER first.
         let reg = RegisterRequestCallback::new(dev, 1, 0x0000_2000);
         let mut buf = alloc::vec![0u8; reg.size()];
@@ -1136,6 +1161,15 @@ mod tests {
         let mut c = UrbdrcClient::new(Box::new(MockUrbHandler::default()));
         c.control_state = ControlState::Ready;
         let dev = 0x0000_1000;
+        c.devices.insert(
+            dev,
+            DeviceState {
+                usb_device: dev,
+                request_completion: None,
+                in_flight: BTreeMap::new(),
+                closed: false,
+            },
+        );
         let reg = RegisterRequestCallback::new(dev, 1, 0x0000_2000);
         let mut buf = alloc::vec![0u8; reg.size()];
         let mut cur = WriteCursor::new(&mut buf);

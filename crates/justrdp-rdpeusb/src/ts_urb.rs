@@ -538,35 +538,38 @@ macro_rules! fixed_urb {
         }
         impl $name {
             pub fn decode_body(header: TsUrbHeader, src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
-                $( let $field = <$ty as ReadField>::read(src, stringify!($name), stringify!($field))?; )*
+                $( let $field = <$ty as ReadField>::read(src, stringify!($name))?; )*
                 Ok(Self { header, $( $field ),* })
             }
         }
     };
 }
 
-// Helper trait for reading primitive fields in the macro.
+// Helper trait for reading primitive fields in the macro. `ctx` carries
+// the enclosing struct name from `stringify!($name)` so decode errors
+// cite the variant (`"TsUrbBulkOrInterruptTransfer"`) instead of the
+// generic cursor type (`"ts_urb::u32"`).
 trait ReadField: Sized {
-    fn read(src: &mut ReadCursor<'_>, ctx: &'static str, field: &'static str) -> DecodeResult<Self>;
+    fn read(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<Self>;
 }
 impl ReadField for u8 {
-    fn read(src: &mut ReadCursor<'_>, _c: &'static str, _f: &'static str) -> DecodeResult<Self> {
-        src.read_u8("ts_urb::u8")
+    fn read(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<Self> {
+        src.read_u8(ctx)
     }
 }
 impl ReadField for u16 {
-    fn read(src: &mut ReadCursor<'_>, _c: &'static str, _f: &'static str) -> DecodeResult<Self> {
-        src.read_u16_le("ts_urb::u16")
+    fn read(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<Self> {
+        src.read_u16_le(ctx)
     }
 }
 impl ReadField for u32 {
-    fn read(src: &mut ReadCursor<'_>, _c: &'static str, _f: &'static str) -> DecodeResult<Self> {
-        src.read_u32_le("ts_urb::u32")
+    fn read(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<Self> {
+        src.read_u32_le(ctx)
     }
 }
 impl ReadField for [u8; 8] {
-    fn read(src: &mut ReadCursor<'_>, _c: &'static str, _f: &'static str) -> DecodeResult<Self> {
-        let s = src.read_slice(8, "ts_urb::[u8;8]")?;
+    fn read(src: &mut ReadCursor<'_>, ctx: &'static str) -> DecodeResult<Self> {
+        let s = src.read_slice(8, ctx)?;
         Ok([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
     }
 }

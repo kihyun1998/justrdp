@@ -5,13 +5,13 @@
 
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_dvc::DvcProcessor;
-use justrdp_rdpeusb::client::{MockUrbHandler, UrbdrcClient};
+use justrdp_rdpeusb::client::{MockUrbHandler, UrbdrcClient, UsbDeviceDescriptor};
 use justrdp_rdpeusb::pdu::{
     hresult_is_success, AddVirtualChannel, ChannelCreated, IoControl, IoControlCompletion, Mask,
     RegisterRequestCallback, RetractDevice, RimExchangeCapabilityRequest,
     RimExchangeCapabilityResponse, SharedMsgHeader, TransferInRequest, UrbCompletionNoData,
-    FN_IO_CONTROL, FN_RETRACT_DEVICE, FN_TRANSFER_IN_REQUEST, HRESULT_S_OK,
-    USB_RETRACT_REASON_BLOCKED_BY_POLICY,
+    UsbDeviceCapabilities, FN_IO_CONTROL, FN_RETRACT_DEVICE, FN_TRANSFER_IN_REQUEST,
+    HRESULT_S_OK, USB_RETRACT_REASON_BLOCKED_BY_POLICY,
 };
 use justrdp_rdpeusb::ts_urb::{
     TsUrb, TsUrbBulkOrInterruptTransfer, TsUrbHeader, URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER,
@@ -59,10 +59,36 @@ fn full_flow_capability_then_channel_created_then_io_control_then_transfer_in_th
     let mut src = ReadCursor::new(&msg.data);
     let _ = AddVirtualChannel::decode(&mut src).unwrap();
 
-    // ── 4. REGISTER_REQUEST_CALLBACK on the per-device DVC ──
+    // ── 4. ADD_DEVICE (register the device instance client-side) ──
     // We reuse the same client instance as the per-device processor for
     // test simplicity. Choose a UsbDevice interface ID.
     let dev_iid = 0x0000_1000;
+    let descriptor = UsbDeviceDescriptor {
+        usb_device_interface_id: dev_iid,
+        device_instance_id: "USB\\VID_1234&PID_5678".encode_utf16().collect(),
+        hardware_ids: {
+            let mut v: Vec<u16> = "USB\\VID_1234".encode_utf16().collect();
+            v.push(0);
+            v.push(0);
+            v
+        },
+        compatibility_ids: Vec::new(),
+        container_id: "{11112222-3333-4444-5555-666677778888}"
+            .encode_utf16()
+            .collect(),
+        capabilities: UsbDeviceCapabilities {
+            cb_size: 28,
+            usb_bus_interface_version: 2,
+            usbdi_version: 0x500,
+            supported_usb_version: 0x0200,
+            hcd_capabilities: 0,
+            device_is_high_speed: 1,
+            no_ack_isoch_write_jitter_buffer_size_in_ms: 0,
+        },
+    };
+    let _add_device_msg = client.build_add_device(&descriptor).unwrap();
+
+    // ── 5. REGISTER_REQUEST_CALLBACK on the per-device DVC ──
     let register = RegisterRequestCallback::new(dev_iid, 10, 0x0000_2000);
     let buf = encode(&register);
     let out = client.process(0, &buf).unwrap();
