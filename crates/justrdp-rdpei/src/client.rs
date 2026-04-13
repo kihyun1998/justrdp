@@ -17,10 +17,11 @@ use justrdp_core::{AsAny, Encode, WriteCursor};
 use justrdp_dvc::{DvcError, DvcMessage, DvcProcessor, DvcResult};
 
 use crate::pdu::{
-    CsReadyPdu, DismissHoveringContactPdu, EVENTID_CS_READY, EVENTID_DISMISS_HOVERING_TOUCH_CONTACT,
-    EVENTID_RESUME_INPUT, EVENTID_SC_READY, EVENTID_SUSPEND_INPUT, EVENTID_TOUCH, RdpeiHeader,
-    RDPINPUT_PROTOCOL_V100, RDPINPUT_PROTOCOL_V200, ResumeInputPdu, ScReadyPdu, SuspendInputPdu,
-    TouchEventPdu, TouchFrame,
+    CsReadyFlags, CsReadyPdu, DismissHoveringContactPdu, EVENTID_CS_READY,
+    EVENTID_DISMISS_HOVERING_TOUCH_CONTACT, EVENTID_PEN, EVENTID_RESUME_INPUT, EVENTID_SC_READY,
+    EVENTID_SUSPEND_INPUT, EVENTID_TOUCH, MAX_PEN_CONTACTS_PER_FRAME, PenEventPdu, PenFrame,
+    RDPINPUT_PROTOCOL_V100, RDPINPUT_PROTOCOL_V200, RDPINPUT_PROTOCOL_V300, RdpeiHeader,
+    ResumeInputPdu, ScReadyFlags, ScReadyPdu, SuspendInputPdu, TouchEventPdu, TouchFrame,
 };
 
 /// DVC channel name for Touch Input.
@@ -98,6 +99,13 @@ pub struct RdpeiDvcClient {
     server_features: Option<u32>,
     /// Server-controlled ADM: MS-RDPEI 3.3.1.1.
     input_suspended: bool,
+    /// Pen Input Allowed ADM (MS-RDPEI 3.3.1.2): `true` when the negotiated
+    /// protocol version supports pen (V200+).
+    pen_input_allowed: bool,
+    /// Multipen injection active: negotiated V300 + server advertised
+    /// `SC_READY_MULTIPEN_INJECTION_SUPPORTED` + client requested
+    /// `CS_READY_FLAGS_ENABLE_MULTIPEN_INJECTION`.
+    multipen_active: bool,
     /// Client-initiated outbound messages queued between `process()` calls.
     outbound: Vec<DvcMessage>,
 }
@@ -116,6 +124,8 @@ impl RdpeiDvcClient {
             negotiated_version: None,
             server_features: None,
             input_suspended: false,
+            pen_input_allowed: false,
+            multipen_active: false,
             outbound: Vec::new(),
         }
     }
@@ -141,6 +151,19 @@ impl RdpeiDvcClient {
         self.server_features
     }
 
+    /// Whether pen input is allowed on the negotiated channel. Set to
+    /// `true` after SC_READY when negotiated version >= V200. MS-RDPEI 3.3.1.2
+    pub fn pen_input_allowed(&self) -> bool {
+        self.pen_input_allowed
+    }
+
+    /// Whether multipen injection is active. Requires all three:
+    /// negotiated V300, server `SC_READY_MULTIPEN_INJECTION_SUPPORTED`,
+    /// and client `CS_READY_FLAGS_ENABLE_MULTIPEN_INJECTION`.
+    pub fn multipen_active(&self) -> bool {
+        self.multipen_active
+    }
+
     /// Queue a TOUCH_EVENT_PDU to send to the server.
     ///
     /// Returns an error when the channel is not yet ready or when input
@@ -163,6 +186,61 @@ impl RdpeiDvcClient {
         };
         self.enqueue_pdu(&pdu)
             .map_err(|e| format!("failed to encode TouchEventPdu: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Queue an RDPINPUT_PEN_EVENT_PDU to send to the server.
+    ///
+    /// Requires the negotiated version to be V200 or higher (checked via
+    /// `pen_input_allowed`). Rejected while input transmission is
+    /// suspended. Validates `deviceId` against the multipen state: if
+    /// multipen is not active, all contacts MUST have `device_id = 0`;
+    /// if multipen is active, `device_id` must be ≤ 3 and each frame
+    /// must not exceed `MAX_PEN_CONTACTS_PER_FRAME`.
+    pub fn send_pen_event(
+        &mut self,
+        encode_time: u32,
+        frames: Vec<PenFrame>,
+    ) -> Result<(), String> {
+        if !self.is_ready() {
+            return Err(String::from("RDPEI channel is not ready"));
+        }
+        if !self.pen_input_allowed {
+            return Err(String::from(
+                "pen input not allowed (negotiated version < V200)",
+            ));
+        }
+        if self.input_suspended {
+            return Err(String::from("input transmission is suspended"));
+        }
+        for frame in &frames {
+            if frame.contacts.len() > MAX_PEN_CONTACTS_PER_FRAME as usize {
+                return Err(String::from("pen frame exceeds MAX_PEN_CONTACTS_PER_FRAME"));
+            }
+            if !self.multipen_active {
+                // Single-pen mode: only device_id = 0 permitted.
+                if frame.contacts.iter().any(|c| c.device_id != 0) {
+                    return Err(String::from(
+                        "device_id must be 0 when multipen is not active",
+                    ));
+                }
+                if frame.contacts.len() > 1 {
+                    return Err(String::from(
+                        "single-pen mode permits at most 1 contact per frame",
+                    ));
+                }
+            } else if frame.contacts.iter().any(|c| c.device_id > 3) {
+                return Err(String::from(
+                    "device_id must be <= 3 when multipen is active",
+                ));
+            }
+        }
+        let pdu = PenEventPdu {
+            encode_time,
+            frames,
+        };
+        self.enqueue_pdu(&pdu)
+            .map_err(|e| format!("failed to encode PenEventPdu: {e:?}"))?;
         Ok(())
     }
 
@@ -210,12 +288,31 @@ impl RdpeiDvcClient {
         self.negotiated_version = Some(negotiated);
         self.server_features = sc_ready.supported_features;
 
+        // Pen Input Allowed ADM: set when negotiated >= V200 (MS-RDPEI 3.3.1.2).
+        self.pen_input_allowed = negotiated >= RDPINPUT_PROTOCOL_V200;
+
         // Strip DISABLE_TIMESTAMP_INJECTION when negotiating V100 (MS-RDPEI
         // 2.2.3.2 SHOULD NOT be sent to V100 servers).
         let mut flags = self.config.cs_ready_flags;
         if negotiated == RDPINPUT_PROTOCOL_V100 {
-            flags &= !crate::pdu::CsReadyFlags::DISABLE_TIMESTAMP_INJECTION;
+            flags &= !CsReadyFlags::DISABLE_TIMESTAMP_INJECTION;
         }
+
+        // Multipen injection requires all three: negotiated V300, server
+        // advertises SC_READY_MULTIPEN_INJECTION_SUPPORTED, and client
+        // requests CS_READY_FLAGS_ENABLE_MULTIPEN_INJECTION. Strip the
+        // client request flag if the preconditions are not met
+        // (SHOULD NOT send without server advertisement).
+        let client_wants_multipen = flags & CsReadyFlags::ENABLE_MULTIPEN_INJECTION != 0;
+        let server_advertises = sc_ready
+            .supported_features
+            .is_some_and(|f| f & ScReadyFlags::MULTIPEN_INJECTION_SUPPORTED != 0);
+        let multipen_ok =
+            negotiated >= RDPINPUT_PROTOCOL_V300 && server_advertises && client_wants_multipen;
+        if !multipen_ok {
+            flags &= !CsReadyFlags::ENABLE_MULTIPEN_INJECTION;
+        }
+        self.multipen_active = multipen_ok;
 
         let cs_ready = CsReadyPdu {
             flags,
@@ -285,7 +382,10 @@ impl DvcProcessor for RdpeiDvcClient {
                 self.input_suspended = false;
                 Ok(Vec::new())
             }
-            EVENTID_CS_READY | EVENTID_TOUCH | EVENTID_DISMISS_HOVERING_TOUCH_CONTACT => {
+            EVENTID_CS_READY
+            | EVENTID_TOUCH
+            | EVENTID_DISMISS_HOVERING_TOUCH_CONTACT
+            | EVENTID_PEN => {
                 // Client-sourced event IDs never arrive from the server.
                 // MS-RDPEI 3.1.5.1: ignore unexpected PDUs.
                 Ok(Vec::new())
@@ -302,6 +402,8 @@ impl DvcProcessor for RdpeiDvcClient {
         self.negotiated_version = None;
         self.server_features = None;
         self.input_suspended = false;
+        self.pen_input_allowed = false;
+        self.multipen_active = false;
         self.outbound.clear();
     }
 }
@@ -323,8 +425,8 @@ fn encode_pdu<E: Encode>(pdu: &E) -> DvcResult<DvcMessage> {
 mod tests {
     use super::*;
     use crate::pdu::{
-        ContactFlags, CsReadyFlags, RDPINPUT_PROTOCOL_V101, RDPINPUT_PROTOCOL_V300,
-        ScReadyFlags, TouchContact, TouchFrame,
+        ContactFlags, CsReadyFlags, PenContact, PenFlags, RDPINPUT_PROTOCOL_V101,
+        RDPINPUT_PROTOCOL_V300, ScReadyFlags, TouchContact, TouchFrame,
     };
 
     fn encode<E: Encode>(pdu: &E) -> Vec<u8> {
@@ -614,6 +716,204 @@ mod tests {
     }
 
     // ── Trait-object dispatch (DvcProcessor) ──
+
+    // ── Pen extension (§9.5) ──
+
+    fn single_pen_frame(device_id: u8) -> PenFrame {
+        PenFrame {
+            frame_offset: 0,
+            contacts: alloc::vec![PenContact {
+                device_id,
+                x: 100,
+                y: 200,
+                contact_flags: ContactFlags::DOWN
+                    | ContactFlags::INRANGE
+                    | ContactFlags::INCONTACT,
+                pen_flags: Some(PenFlags::BARREL_PRESSED),
+                pressure: Some(512),
+                rotation: Some(90),
+                tilt_x: Some(10),
+                tilt_y: Some(-5),
+            }],
+        }
+    }
+
+    #[test]
+    fn pen_input_allowed_gated_on_v200() {
+        // V100 → pen not allowed.
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(crate::pdu::RDPINPUT_PROTOCOL_V100, None))
+            .unwrap();
+        assert!(!c.pen_input_allowed());
+        assert!(c.send_pen_event(0, alloc::vec![single_pen_frame(0)]).is_err());
+
+        // V101 → still touch-only (< V200).
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V101, None)).unwrap();
+        assert!(!c.pen_input_allowed());
+
+        // V200 → allowed.
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        assert!(c.pen_input_allowed());
+        assert!(!c.multipen_active());
+    }
+
+    #[test]
+    fn multipen_requires_all_three_conditions() {
+        // 1. V300 + server advertises + client requests → active.
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            client_max_version: RDPINPUT_PROTOCOL_V300,
+            cs_ready_flags: CsReadyFlags::ENABLE_MULTIPEN_INJECTION,
+            ..Default::default()
+        });
+        c.process(
+            1,
+            &sc_ready(
+                RDPINPUT_PROTOCOL_V300,
+                Some(ScReadyFlags::MULTIPEN_INJECTION_SUPPORTED),
+            ),
+        )
+        .unwrap();
+        assert!(c.multipen_active());
+        c.take_pending_messages();
+
+        // 2. Server didn't advertise → inactive; flag stripped from CS_READY.
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            client_max_version: RDPINPUT_PROTOCOL_V300,
+            cs_ready_flags: CsReadyFlags::ENABLE_MULTIPEN_INJECTION,
+            ..Default::default()
+        });
+        let msgs = c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V300, None)).unwrap();
+        assert!(!c.multipen_active());
+        let cs = CsReadyPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(cs.flags & CsReadyFlags::ENABLE_MULTIPEN_INJECTION, 0);
+
+        // 3. Client didn't request → inactive.
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            client_max_version: RDPINPUT_PROTOCOL_V300,
+            cs_ready_flags: 0,
+            ..Default::default()
+        });
+        c.process(
+            1,
+            &sc_ready(
+                RDPINPUT_PROTOCOL_V300,
+                Some(ScReadyFlags::MULTIPEN_INJECTION_SUPPORTED),
+            ),
+        )
+        .unwrap();
+        assert!(!c.multipen_active());
+
+        // 4. Negotiated < V300 (server V200) → inactive even with client request.
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            client_max_version: RDPINPUT_PROTOCOL_V300,
+            cs_ready_flags: CsReadyFlags::ENABLE_MULTIPEN_INJECTION,
+            ..Default::default()
+        });
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        assert!(!c.multipen_active());
+    }
+
+    #[test]
+    fn send_pen_event_requires_ready() {
+        let mut c = RdpeiDvcClient::new();
+        assert!(c.send_pen_event(0, alloc::vec![single_pen_frame(0)]).is_err());
+    }
+
+    #[test]
+    fn send_pen_event_blocked_while_suspended() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.process(1, &suspend()).unwrap();
+        assert!(c.send_pen_event(0, alloc::vec![single_pen_frame(0)]).is_err());
+    }
+
+    #[test]
+    fn send_pen_event_single_pen_rejects_nonzero_device_id() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        // device_id = 1 invalid in single-pen mode.
+        assert!(c.send_pen_event(0, alloc::vec![single_pen_frame(1)]).is_err());
+    }
+
+    #[test]
+    fn send_pen_event_single_pen_rejects_multi_contact() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        let frame = PenFrame {
+            frame_offset: 0,
+            contacts: alloc::vec![single_pen_frame(0).contacts[0].clone(); 2],
+        };
+        assert!(c.send_pen_event(0, alloc::vec![frame]).is_err());
+    }
+
+    #[test]
+    fn send_pen_event_multipen_accepts_device_ids_0_to_3() {
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            client_max_version: RDPINPUT_PROTOCOL_V300,
+            cs_ready_flags: CsReadyFlags::ENABLE_MULTIPEN_INJECTION,
+            ..Default::default()
+        });
+        c.process(
+            1,
+            &sc_ready(
+                RDPINPUT_PROTOCOL_V300,
+                Some(ScReadyFlags::MULTIPEN_INJECTION_SUPPORTED),
+            ),
+        )
+        .unwrap();
+        assert!(c.multipen_active());
+        let frame = PenFrame {
+            frame_offset: 0,
+            contacts: (0..4).map(|i| single_pen_frame(i).contacts[0].clone()).collect(),
+        };
+        assert!(c.send_pen_event(0, alloc::vec![frame]).is_ok());
+    }
+
+    #[test]
+    fn send_pen_event_multipen_rejects_device_id_gt_3() {
+        let mut c = RdpeiDvcClient::with_config(RdpeiClientConfig {
+            client_max_version: RDPINPUT_PROTOCOL_V300,
+            cs_ready_flags: CsReadyFlags::ENABLE_MULTIPEN_INJECTION,
+            ..Default::default()
+        });
+        c.process(
+            1,
+            &sc_ready(
+                RDPINPUT_PROTOCOL_V300,
+                Some(ScReadyFlags::MULTIPEN_INJECTION_SUPPORTED),
+            ),
+        )
+        .unwrap();
+        assert!(c.send_pen_event(0, alloc::vec![single_pen_frame(4)]).is_err());
+    }
+
+    #[test]
+    fn send_pen_event_queues_encoded_pdu() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        c.send_pen_event(999, alloc::vec![single_pen_frame(0)])
+            .unwrap();
+        let msgs = c.take_pending_messages();
+        assert_eq!(msgs.len(), 1);
+        let decoded = crate::pdu::PenEventPdu::decode_from(&msgs[0].data).unwrap();
+        assert_eq!(decoded.encode_time, 999);
+        assert_eq!(decoded.frames.len(), 1);
+        assert_eq!(decoded.frames[0].contacts.len(), 1);
+    }
+
+    #[test]
+    fn inbound_pen_event_ignored() {
+        let mut c = RdpeiDvcClient::new();
+        c.process(1, &sc_ready(RDPINPUT_PROTOCOL_V200, None)).unwrap();
+        // Hand-craft a minimal PEN_EVENT_PDU as if the server sent it.
+        let inbound_pen = encode(&crate::pdu::PenEventPdu {
+            encode_time: 0,
+            frames: alloc::vec![],
+        });
+        assert!(c.process(1, &inbound_pen).unwrap().is_empty());
+    }
 
     #[test]
     fn dvc_processor_trait_object_full_flow() {

@@ -32,6 +32,8 @@ pub const EVENTID_SUSPEND_INPUT: u16 = 0x0004;
 pub const EVENTID_RESUME_INPUT: u16 = 0x0005;
 /// Client → server: RDPINPUT_DISMISS_HOVERING_TOUCH_CONTACT_PDU. MS-RDPEI 2.2.3.6
 pub const EVENTID_DISMISS_HOVERING_TOUCH_CONTACT: u16 = 0x0006;
+/// Client → server: RDPINPUT_PEN_EVENT_PDU. MS-RDPEI 2.2.3.7
+pub const EVENTID_PEN: u16 = 0x0008;
 
 // ── Protocol versions (MS-RDPEI 2.2.3.1 / 2.2.3.2) ──
 
@@ -949,6 +951,391 @@ impl Encode for TouchEventPdu {
 
     fn name(&self) -> &'static str {
         "TouchEventPdu"
+    }
+
+    fn size(&self) -> usize {
+        HEADER_SIZE + self.body_size()
+    }
+}
+
+// =============================================================================
+// RDPINPUT_PEN_CONTACT / PEN_FRAME / PEN_EVENT_PDU (MS-RDPEI 2.2.3.7*)
+// =============================================================================
+
+/// `fieldsPresent` bit flags for `PenContact`. MS-RDPEI 2.2.3.7.1.1
+pub struct PenFieldsPresent;
+
+impl PenFieldsPresent {
+    pub const PENFLAGS: u16 = 0x0001;
+    pub const PRESSURE: u16 = 0x0002;
+    pub const ROTATION: u16 = 0x0004;
+    pub const TILTX: u16 = 0x0008;
+    pub const TILTY: u16 = 0x0010;
+}
+
+/// `penFlags` bit flags. MS-RDPEI 2.2.3.7.1.1
+pub struct PenFlags;
+
+impl PenFlags {
+    pub const BARREL_PRESSED: u32 = 0x0000_0001;
+    pub const ERASER_PRESSED: u32 = 0x0000_0002;
+    pub const INVERTED: u32 = 0x0000_0004;
+    /// Mask of all spec-defined bits; other bits in a decoded value should
+    /// be preserved for forward compatibility.
+    pub const ALL: u32 = Self::BARREL_PRESSED | Self::ERASER_PRESSED | Self::INVERTED;
+}
+
+/// `pressure` maximum for pen (shares range with touch). MS-RDPEI 2.2.3.7.1.1
+pub const PEN_PRESSURE_MAX: u32 = 1024;
+/// `rotation` maximum. MS-RDPEI 2.2.3.7.1.1
+pub const PEN_ROTATION_MAX: u16 = 359;
+/// `tiltX`/`tiltY` range. MS-RDPEI 2.2.3.7.1.1
+pub const PEN_TILT_MIN: i16 = -90;
+pub const PEN_TILT_MAX: i16 = 90;
+
+/// Policy cap on simultaneous pen contacts per frame.
+///
+/// V200/V300 single-pen mode allows 1; V300 multipen allows 4 (§2.2.3.1
+/// "up to four pen devices"). We cap at 4 regardless; the client-side
+/// validation enforces the stricter single-pen rule based on negotiation
+/// state.
+pub const MAX_PEN_CONTACTS_PER_FRAME: u16 = 4;
+
+/// A single pen contact within a `PenFrame`. MS-RDPEI 2.2.3.7.1.1
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PenContact {
+    /// Pen device identifier. MUST be 0 unless multipen injection is
+    /// active; validation is performed at the `RdpeiDvcClient` API layer,
+    /// not here, because the PDU layer does not know the negotiation state.
+    pub device_id: u8,
+    /// X position (virtual-desktop pixels).
+    pub x: i32,
+    /// Y position.
+    pub y: i32,
+    /// Contact state bits — must be one of `VALID_CONTACT_FLAG_COMBINATIONS`
+    /// (shared with touch, MS-RDPEI 2.2.3.7.1.1 → §3.1.1.1).
+    pub contact_flags: u32,
+    /// Pen button state (`PenFlags::*`). Any OR combination permitted —
+    /// no enumerated valid-combo table in the spec.
+    pub pen_flags: Option<u32>,
+    /// Pressure (0..=1024).
+    pub pressure: Option<u32>,
+    /// Rotation in degrees (0..=359). **2-byte unsigned** on the wire,
+    /// unlike touch `orientation` which is 4-byte.
+    pub rotation: Option<u16>,
+    /// Tilt X (−90..=+90).
+    pub tilt_x: Option<i16>,
+    /// Tilt Y (−90..=+90).
+    pub tilt_y: Option<i16>,
+}
+
+impl PenContact {
+    fn fields_present_mask(&self) -> u16 {
+        let mut m = 0u16;
+        if self.pen_flags.is_some() {
+            m |= PenFieldsPresent::PENFLAGS;
+        }
+        if self.pressure.is_some() {
+            m |= PenFieldsPresent::PRESSURE;
+        }
+        if self.rotation.is_some() {
+            m |= PenFieldsPresent::ROTATION;
+        }
+        if self.tilt_x.is_some() {
+            m |= PenFieldsPresent::TILTX;
+        }
+        if self.tilt_y.is_some() {
+            m |= PenFieldsPresent::TILTY;
+        }
+        m
+    }
+
+    fn validate(&self) -> Result<(), EncodeError> {
+        if !VALID_CONTACT_FLAG_COMBINATIONS.contains(&self.contact_flags) {
+            return Err(EncodeError::invalid_value(
+                "PenContact",
+                "contactFlags not a valid combination",
+            ));
+        }
+        if let Some(p) = self.pressure
+            && p > PEN_PRESSURE_MAX
+        {
+            return Err(EncodeError::invalid_value("PenContact", "pressure > 1024"));
+        }
+        if let Some(r) = self.rotation
+            && r > PEN_ROTATION_MAX
+        {
+            return Err(EncodeError::invalid_value("PenContact", "rotation > 359"));
+        }
+        if let Some(tx) = self.tilt_x
+            && !(PEN_TILT_MIN..=PEN_TILT_MAX).contains(&tx)
+        {
+            return Err(EncodeError::invalid_value("PenContact", "tiltX out of range"));
+        }
+        if let Some(ty) = self.tilt_y
+            && !(PEN_TILT_MIN..=PEN_TILT_MAX).contains(&ty)
+        {
+            return Err(EncodeError::invalid_value("PenContact", "tiltY out of range"));
+        }
+        Ok(())
+    }
+}
+
+impl Encode for PenContact {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        self.validate()?;
+        dst.write_u8(self.device_id, "PenContact::DeviceId")?;
+        encode_two_byte_unsigned(
+            dst,
+            self.fields_present_mask(),
+            "PenContact::FieldsPresent",
+        )?;
+        encode_four_byte_signed(dst, self.x, "PenContact::X")?;
+        encode_four_byte_signed(dst, self.y, "PenContact::Y")?;
+        encode_four_byte_unsigned(dst, self.contact_flags, "PenContact::ContactFlags")?;
+        if let Some(f) = self.pen_flags {
+            encode_four_byte_unsigned(dst, f, "PenContact::PenFlags")?;
+        }
+        if let Some(p) = self.pressure {
+            encode_four_byte_unsigned(dst, p, "PenContact::Pressure")?;
+        }
+        if let Some(r) = self.rotation {
+            encode_two_byte_unsigned(dst, r, "PenContact::Rotation")?;
+        }
+        if let Some(tx) = self.tilt_x {
+            encode_two_byte_signed(dst, tx, "PenContact::TiltX")?;
+        }
+        if let Some(ty) = self.tilt_y {
+            encode_two_byte_signed(dst, ty, "PenContact::TiltY")?;
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "PenContact"
+    }
+
+    fn size(&self) -> usize {
+        let mut n = 1; // deviceId
+        n += two_byte_unsigned_size(self.fields_present_mask());
+        n += four_byte_signed_size(self.x);
+        n += four_byte_signed_size(self.y);
+        n += four_byte_unsigned_size(self.contact_flags);
+        if let Some(f) = self.pen_flags {
+            n += four_byte_unsigned_size(f);
+        }
+        if let Some(p) = self.pressure {
+            n += four_byte_unsigned_size(p);
+        }
+        if let Some(r) = self.rotation {
+            n += two_byte_unsigned_size(r);
+        }
+        if let Some(tx) = self.tilt_x {
+            n += two_byte_signed_size(tx);
+        }
+        if let Some(ty) = self.tilt_y {
+            n += two_byte_signed_size(ty);
+        }
+        n
+    }
+}
+
+impl<'de> Decode<'de> for PenContact {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let device_id = src.read_u8("PenContact::DeviceId")?;
+        let fields_present = decode_two_byte_unsigned(src, "PenContact::FieldsPresent")?;
+        let x = decode_four_byte_signed(src, "PenContact::X")?;
+        let y = decode_four_byte_signed(src, "PenContact::Y")?;
+        let contact_flags = decode_four_byte_unsigned(src, "PenContact::ContactFlags")?;
+        if !VALID_CONTACT_FLAG_COMBINATIONS.contains(&contact_flags) {
+            return Err(DecodeError::invalid_value(
+                "PenContact",
+                "contactFlags not a valid combination",
+            ));
+        }
+        let pen_flags = if fields_present & PenFieldsPresent::PENFLAGS != 0 {
+            Some(decode_four_byte_unsigned(src, "PenContact::PenFlags")?)
+        } else {
+            None
+        };
+        let pressure = if fields_present & PenFieldsPresent::PRESSURE != 0 {
+            let p = decode_four_byte_unsigned(src, "PenContact::Pressure")?;
+            if p > PEN_PRESSURE_MAX {
+                return Err(DecodeError::invalid_value("PenContact", "pressure > 1024"));
+            }
+            Some(p)
+        } else {
+            None
+        };
+        let rotation = if fields_present & PenFieldsPresent::ROTATION != 0 {
+            let r = decode_two_byte_unsigned(src, "PenContact::Rotation")?;
+            if r > PEN_ROTATION_MAX {
+                return Err(DecodeError::invalid_value("PenContact", "rotation > 359"));
+            }
+            Some(r)
+        } else {
+            None
+        };
+        let tilt_x = if fields_present & PenFieldsPresent::TILTX != 0 {
+            let t = decode_two_byte_signed(src, "PenContact::TiltX")?;
+            if !(PEN_TILT_MIN..=PEN_TILT_MAX).contains(&t) {
+                return Err(DecodeError::invalid_value("PenContact", "tiltX out of range"));
+            }
+            Some(t)
+        } else {
+            None
+        };
+        let tilt_y = if fields_present & PenFieldsPresent::TILTY != 0 {
+            let t = decode_two_byte_signed(src, "PenContact::TiltY")?;
+            if !(PEN_TILT_MIN..=PEN_TILT_MAX).contains(&t) {
+                return Err(DecodeError::invalid_value("PenContact", "tiltY out of range"));
+            }
+            Some(t)
+        } else {
+            None
+        };
+        Ok(Self {
+            device_id,
+            x,
+            y,
+            contact_flags,
+            pen_flags,
+            pressure,
+            rotation,
+            tilt_x,
+            tilt_y,
+        })
+    }
+}
+
+/// A single pen frame within a `PenEventPdu`. MS-RDPEI 2.2.3.7.1
+///
+/// Structurally identical to `TouchFrame` except the contact element type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PenFrame {
+    pub frame_offset: u64,
+    pub contacts: Vec<PenContact>,
+}
+
+impl Encode for PenFrame {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        let count = u16::try_from(self.contacts.len())
+            .map_err(|_| EncodeError::invalid_value("PenFrame", "contactCount exceeds u16"))?;
+        encode_two_byte_unsigned(dst, count, "PenFrame::ContactCount")?;
+        encode_eight_byte_unsigned(dst, self.frame_offset, "PenFrame::FrameOffset")?;
+        for c in &self.contacts {
+            c.encode(dst)?;
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "PenFrame"
+    }
+
+    fn size(&self) -> usize {
+        let count = u16::try_from(self.contacts.len()).unwrap_or(u16::MAX);
+        let mut n = two_byte_unsigned_size(count);
+        n += eight_byte_unsigned_size(self.frame_offset);
+        for c in &self.contacts {
+            n += c.size();
+        }
+        n
+    }
+}
+
+impl<'de> Decode<'de> for PenFrame {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let count = decode_two_byte_unsigned(src, "PenFrame::ContactCount")?;
+        if count > MAX_PEN_CONTACTS_PER_FRAME {
+            return Err(DecodeError::invalid_value(
+                "PenFrame",
+                "contactCount exceeds MAX_PEN_CONTACTS_PER_FRAME",
+            ));
+        }
+        let frame_offset = decode_eight_byte_unsigned(src, "PenFrame::FrameOffset")?;
+        let mut contacts = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            contacts.push(PenContact::decode(src)?);
+        }
+        Ok(Self {
+            frame_offset,
+            contacts,
+        })
+    }
+}
+
+/// RDPINPUT_PEN_EVENT_PDU (client → server). MS-RDPEI 2.2.3.7
+///
+/// Structurally identical to `TouchEventPdu` except the frame element
+/// type and the `event_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PenEventPdu {
+    pub encode_time: u32,
+    pub frames: Vec<PenFrame>,
+}
+
+impl PenEventPdu {
+    fn body_size(&self) -> usize {
+        let frame_count = u16::try_from(self.frames.len()).unwrap_or(u16::MAX);
+        let mut n = four_byte_unsigned_size(self.encode_time);
+        n += two_byte_unsigned_size(frame_count);
+        for f in &self.frames {
+            n += f.size();
+        }
+        n
+    }
+
+    pub fn decode_from(payload: &[u8]) -> DecodeResult<Self> {
+        let mut src = ReadCursor::new(payload);
+        let header = RdpeiHeader::decode(&mut src)?;
+        if header.event_id != EVENTID_PEN {
+            return Err(DecodeError::unexpected_value(
+                "PenEventPdu",
+                "EventId",
+                "expected EVENTID_PEN (0x0008)",
+            ));
+        }
+        let encode_time = decode_four_byte_unsigned(&mut src, "PenEventPdu::EncodeTime")?;
+        let frame_count = decode_two_byte_unsigned(&mut src, "PenEventPdu::FrameCount")?;
+        if frame_count > MAX_FRAMES_PER_EVENT {
+            return Err(DecodeError::invalid_value(
+                "PenEventPdu",
+                "frameCount exceeds MAX_FRAMES_PER_EVENT",
+            ));
+        }
+        let mut frames = Vec::with_capacity(frame_count as usize);
+        for _ in 0..frame_count {
+            frames.push(PenFrame::decode(&mut src)?);
+        }
+        Ok(Self {
+            encode_time,
+            frames,
+        })
+    }
+}
+
+impl Encode for PenEventPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        let frame_count = u16::try_from(self.frames.len())
+            .map_err(|_| EncodeError::invalid_value("PenEventPdu", "frameCount exceeds u16"))?;
+        let pdu_length = u32::try_from(self.size())
+            .map_err(|_| EncodeError::invalid_value("PenEventPdu", "pdu_length exceeds u32"))?;
+        RdpeiHeader {
+            event_id: EVENTID_PEN,
+            pdu_length,
+        }
+        .encode(dst)?;
+        encode_four_byte_unsigned(dst, self.encode_time, "PenEventPdu::EncodeTime")?;
+        encode_two_byte_unsigned(dst, frame_count, "PenEventPdu::FrameCount")?;
+        for f in &self.frames {
+            f.encode(dst)?;
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "PenEventPdu"
     }
 
     fn size(&self) -> usize {
@@ -2098,6 +2485,276 @@ mod tests {
         let mut src = ReadCursor::new(&bytes);
         let decoded = TouchFrame::decode(&mut src).unwrap();
         assert_eq!(decoded.contacts.len(), MAX_CONTACTS_PER_FRAME as usize);
+    }
+
+    // ── Pen extension (§9.5) ──
+
+    fn minimal_pen() -> PenContact {
+        PenContact {
+            device_id: 0,
+            x: 0,
+            y: 0,
+            contact_flags: ContactFlags::DOWN | ContactFlags::INRANGE | ContactFlags::INCONTACT,
+            pen_flags: None,
+            pressure: None,
+            rotation: None,
+            tilt_x: None,
+            tilt_y: None,
+        }
+    }
+
+    #[test]
+    fn pen_contact_minimal_wire_bytes() {
+        // Spec-derived minimal: device_id=0, fieldsPresent=0, x=0, y=0,
+        // contactFlags=0x19 → [0x00, 0x00, 0x00, 0x00, 0x19] (5 bytes).
+        let c = minimal_pen();
+        let bytes = encode_to_vec(&c);
+        assert_eq!(bytes, vec![0x00, 0x00, 0x00, 0x00, 0x19]);
+        let mut src = ReadCursor::new(&bytes);
+        assert_eq!(PenContact::decode(&mut src).unwrap(), c);
+    }
+
+    #[test]
+    fn pen_contact_all_optional_fields_roundtrip() {
+        let c = PenContact {
+            device_id: 0,
+            x: 500,
+            y: 300,
+            contact_flags: ContactFlags::DOWN | ContactFlags::INRANGE | ContactFlags::INCONTACT,
+            pen_flags: Some(PenFlags::BARREL_PRESSED),
+            pressure: Some(512),
+            rotation: Some(180),
+            tilt_x: Some(45),
+            tilt_y: Some(-30),
+        };
+        let bytes = encode_to_vec(&c);
+        let mut src = ReadCursor::new(&bytes);
+        assert_eq!(PenContact::decode(&mut src).unwrap(), c);
+    }
+
+    #[test]
+    fn pen_contact_each_optional_field_alone() {
+        let base = minimal_pen();
+        let variants = [
+            PenContact {
+                pen_flags: Some(PenFlags::INVERTED),
+                ..base.clone()
+            },
+            PenContact {
+                pressure: Some(1024),
+                ..base.clone()
+            },
+            PenContact {
+                rotation: Some(359),
+                ..base.clone()
+            },
+            PenContact {
+                tilt_x: Some(-90),
+                ..base.clone()
+            },
+            PenContact {
+                tilt_y: Some(90),
+                ..base.clone()
+            },
+        ];
+        for c in variants {
+            let bytes = encode_to_vec(&c);
+            let mut src = ReadCursor::new(&bytes);
+            assert_eq!(PenContact::decode(&mut src).unwrap(), c);
+        }
+    }
+
+    #[test]
+    fn pen_contact_pressure_bounds() {
+        // 1024 accept, 1025 reject on encode; same on decode via the
+        // decoder's own bounds check.
+        for p in [0u32, 1, 512, 1024] {
+            let c = PenContact {
+                pressure: Some(p),
+                ..minimal_pen()
+            };
+            encode_to_vec(&c);
+        }
+        let c = PenContact {
+            pressure: Some(1025),
+            ..minimal_pen()
+        };
+        let mut buf = vec![0u8; 32];
+        assert!(c.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn pen_contact_rotation_bounds() {
+        for r in [0u16, 1, 90, 359] {
+            let c = PenContact {
+                rotation: Some(r),
+                ..minimal_pen()
+            };
+            encode_to_vec(&c);
+        }
+        let c = PenContact {
+            rotation: Some(360),
+            ..minimal_pen()
+        };
+        let mut buf = vec![0u8; 32];
+        assert!(c.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn pen_contact_tilt_bounds() {
+        for t in [-90i16, -1, 0, 1, 90] {
+            let c = PenContact {
+                tilt_x: Some(t),
+                tilt_y: Some(t),
+                ..minimal_pen()
+            };
+            encode_to_vec(&c);
+        }
+        for bad in [-91i16, 91] {
+            let c = PenContact {
+                tilt_x: Some(bad),
+                ..minimal_pen()
+            };
+            let mut buf = vec![0u8; 32];
+            assert!(c.encode(&mut WriteCursor::new(&mut buf)).is_err());
+            let c = PenContact {
+                tilt_y: Some(bad),
+                ..minimal_pen()
+            };
+            let mut buf = vec![0u8; 32];
+            assert!(c.encode(&mut WriteCursor::new(&mut buf)).is_err());
+        }
+    }
+
+    #[test]
+    fn pen_contact_all_8_valid_contact_flags() {
+        for flags in VALID_CONTACT_FLAG_COMBINATIONS {
+            let c = PenContact {
+                contact_flags: flags,
+                ..minimal_pen()
+            };
+            let bytes = encode_to_vec(&c);
+            let mut src = ReadCursor::new(&bytes);
+            assert_eq!(
+                PenContact::decode(&mut src).unwrap().contact_flags,
+                flags
+            );
+        }
+    }
+
+    #[test]
+    fn pen_contact_invalid_contact_flags_rejected() {
+        let c = PenContact {
+            contact_flags: ContactFlags::DOWN, // incomplete
+            ..minimal_pen()
+        };
+        let mut buf = vec![0u8; 32];
+        assert!(c.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn pen_flags_any_combination_accepted() {
+        // Unlike contactFlags, penFlags has no enumerated valid-combo table.
+        for f in 0u32..=PenFlags::ALL {
+            let c = PenContact {
+                pen_flags: Some(f),
+                ..minimal_pen()
+            };
+            let bytes = encode_to_vec(&c);
+            let mut src = ReadCursor::new(&bytes);
+            assert_eq!(PenContact::decode(&mut src).unwrap().pen_flags, Some(f));
+        }
+    }
+
+    #[test]
+    fn pen_event_pdu_minimal_wire_bytes() {
+        let pdu = PenEventPdu {
+            encode_time: 0,
+            frames: vec![PenFrame {
+                frame_offset: 0,
+                contacts: vec![minimal_pen()],
+            }],
+        };
+        let bytes = encode_to_vec(&pdu);
+        // eventId=0x08, pduLength=15, encodeTime=0, frameCount=1,
+        // contactCount=1, frameOffset=0, minimal pen (5 bytes)
+        assert_eq!(
+            bytes,
+            vec![
+                0x08, 0x00, 0x0F, 0x00, 0x00, 0x00, // header
+                0x00, // encodeTime
+                0x01, // frameCount
+                0x01, // contactCount
+                0x00, // frameOffset
+                0x00, 0x00, 0x00, 0x00, 0x19 // minimal pen
+            ]
+        );
+        let decoded = PenEventPdu::decode_from(&bytes).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[test]
+    fn pen_event_pdu_multi_frame_roundtrip() {
+        let pdu = PenEventPdu {
+            encode_time: 12345,
+            frames: vec![
+                PenFrame {
+                    frame_offset: 0,
+                    contacts: vec![PenContact {
+                        device_id: 0,
+                        x: 100,
+                        y: 200,
+                        contact_flags: ContactFlags::DOWN
+                            | ContactFlags::INRANGE
+                            | ContactFlags::INCONTACT,
+                        pen_flags: None,
+                        pressure: Some(800),
+                        rotation: None,
+                        tilt_x: None,
+                        tilt_y: None,
+                    }],
+                },
+                PenFrame {
+                    frame_offset: 16_000,
+                    contacts: vec![PenContact {
+                        device_id: 0,
+                        x: 101,
+                        y: 201,
+                        contact_flags: ContactFlags::UPDATE
+                            | ContactFlags::INRANGE
+                            | ContactFlags::INCONTACT,
+                        pen_flags: Some(PenFlags::BARREL_PRESSED),
+                        pressure: Some(810),
+                        rotation: Some(45),
+                        tilt_x: Some(10),
+                        tilt_y: Some(-5),
+                    }],
+                },
+            ],
+        };
+        let bytes = encode_to_vec(&pdu);
+        assert_eq!(PenEventPdu::decode_from(&bytes).unwrap(), pdu);
+    }
+
+    #[test]
+    fn pen_event_pdu_wrong_event_id_rejected() {
+        let mut bytes = encode_to_vec(&PenEventPdu {
+            encode_time: 0,
+            frames: vec![],
+        });
+        bytes[0] = 0x03; // TOUCH event id
+        assert!(PenEventPdu::decode_from(&bytes).is_err());
+    }
+
+    #[test]
+    fn pen_frame_rejects_contact_count_over_cap() {
+        // Hand-craft a frame body with contactCount = MAX + 1.
+        let mut buf = vec![0u8; 16];
+        let mut dst = WriteCursor::new(&mut buf);
+        encode_two_byte_unsigned(&mut dst, MAX_PEN_CONTACTS_PER_FRAME + 1, "t").unwrap();
+        encode_eight_byte_unsigned(&mut dst, 0, "t").unwrap();
+        let mut src = ReadCursor::new(&buf);
+        assert!(PenFrame::decode(&mut src).is_err());
     }
 
     #[test]

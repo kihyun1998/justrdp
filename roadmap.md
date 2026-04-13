@@ -1581,7 +1581,7 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
   - V200 vs V300 feature 분기 (multipen injection)
   - 최대 펜 contact 수 / 최대 프레임 수 (스펙 vs 정책)
 
-- [ ] **Step 2 — Implementation** (`crates/justrdp-rdpei/src/pdu.rs` + `client.rs`)
+- [x] **Step 2 — Implementation** (`crates/justrdp-rdpei/src/pdu.rs` + `client.rs`, 108 tests ✅)
   - [ ] `PenContact { pen_contact_id, x, y, pen_flags, pressure, rotation, tilt_x, tilt_y }` + Encode/Decode + 유효 flag 조합 validation
   - [ ] `PenFrame { frame_offset, contacts: Vec<PenContact> }` (재사용 가능한 경우 `TouchFrame` 과 제네릭화 검토, 단순 중복이 나으면 중복)
   - [ ] `PenEventPdu { encode_time, frames }` — eventId=0x0008
