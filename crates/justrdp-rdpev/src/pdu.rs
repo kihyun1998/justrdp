@@ -5,4 +5,6 @@
 //! ships the header; the rest land in subsequent steps.
 
 pub mod capabilities;
+pub mod guid;
 pub mod header;
+pub mod presentation;

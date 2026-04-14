@@ -72,3 +72,12 @@ pub use pdu::capabilities::{
     ExchangeCapabilitiesReq, ExchangeCapabilitiesRsp, TsmmCapabilities, MAX_CAPABILITIES,
     MAX_CAPABILITY_DATA_BYTES,
 };
+
+#[cfg(feature = "alloc")]
+pub use pdu::guid::{Guid, GUID_SIZE};
+
+#[cfg(feature = "alloc")]
+pub use pdu::presentation::{
+    OnNewPresentation, SetChannelParams, SetTopologyReq, SetTopologyRsp, ShutdownPresentationReq,
+    ShutdownPresentationRsp,
+};

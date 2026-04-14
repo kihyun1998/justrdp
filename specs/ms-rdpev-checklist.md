@@ -894,7 +894,7 @@ bb ca f3 17
 89 96 9f d2
 00 00 00 00  -> StreamId = 0x00000000
 ```
-Total wire: 28 bytes (12 header + 16 GUID + 4 StreamId)
+Total wire: 32 bytes (12 header + 16 GUID + 4 StreamId)
 
 #### 11.2 EXCHANGE_CAPABILITIES_REQ (§4 — Channel Setup Sequence)
 ```
