@@ -7,8 +7,10 @@
 pub mod capabilities;
 pub mod control;
 pub mod format;
+pub mod geometry;
 pub mod guid;
 pub mod header;
+pub mod misc;
 pub mod presentation;
 pub mod sample;
 pub mod stream;

@@ -86,7 +86,18 @@ pub use pdu::format::{
 };
 
 #[cfg(feature = "alloc")]
+pub use pdu::geometry::{
+    GeometryInfo, SetSourceVideoRect, SetVideoWindow, TsRect, UpdateGeometryInfo,
+    GEOMETRY_INFO_SIZE_NO_PAD, GEOMETRY_INFO_SIZE_WITH_PAD, MAX_VISIBLE_RECTS,
+};
+
+#[cfg(feature = "alloc")]
 pub use pdu::guid::{Guid, GUID_SIZE};
+
+#[cfg(feature = "alloc")]
+pub use pdu::misc::{
+    ClientEventNotification, OnChannelVolume, OnStreamVolume, SetAllocator, MAX_EVENT_BLOB_BYTES,
+};
 
 #[cfg(feature = "alloc")]
 pub use pdu::presentation::{
