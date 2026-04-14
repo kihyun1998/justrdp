@@ -74,6 +74,12 @@ pub use pdu::capabilities::{
 };
 
 #[cfg(feature = "alloc")]
+pub use pdu::control::{
+    NotifyPreroll, OnEndOfStream, OnFlush, OnPlaybackPaused, OnPlaybackRateChanged,
+    OnPlaybackRestarted, OnPlaybackStarted, OnPlaybackStopped,
+};
+
+#[cfg(feature = "alloc")]
 pub use pdu::format::{
     CheckFormatSupportReq, CheckFormatSupportRsp, TsAmMediaType, MAX_FORMAT_BYTES,
     TS_AM_MEDIA_TYPE_FIXED_SIZE,

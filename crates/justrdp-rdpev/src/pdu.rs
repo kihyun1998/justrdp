@@ -5,6 +5,7 @@
 //! ships the header; the rest land in subsequent steps.
 
 pub mod capabilities;
+pub mod control;
 pub mod format;
 pub mod guid;
 pub mod header;
