@@ -7,9 +7,11 @@
 //!
 //! 1. **PNP Device Info** (`"PNPDR"`) — the control channel that negotiates
 //!    version, waits for authentication, then announces and removes client
-//!    PnP devices. Implemented in this step (§9.14a).
+//!    PnP devices (§9.14a). Entry point: [`PnpInfoClient`].
 //! 2. **PNP Device I/O** (`"FileRedirectorChannel"`, multi-instance) — the
-//!    per-file I/O sub-protocol. Deferred to §9.14b.
+//!    per-file I/O sub-protocol carrying CreateFile / Read / Write /
+//!    IoControl / IoCancel and custom events (§9.14b). Entry point:
+//!    [`FileRedirectorChannelClient`].
 //!
 //! Each `PNPDR` message shares a fixed 8-byte [`PnpInfoHeader`] with a `Size`
 //! field (total PDU size including the header, little-endian) and a
@@ -41,15 +43,25 @@ pub mod pdu;
 #[cfg(feature = "alloc")]
 pub mod client;
 
+#[cfg(feature = "alloc")]
+pub mod file_redirector;
+
 pub use constants::{
-    packet_id, MAX_DEVICES, MAX_DEVICE_DESCRIPTION_BYTES, MAX_HARDWARE_ID_BYTES,
-    MAX_INTERFACE_BYTES, PNPDR_CHANNEL_NAME, PNP_CAP_DYNAMIC_DEVICE_ADDITION, PNP_INFO_HEADER_SIZE,
+    function_id, io_version, packet_id, packet_type, CLIENT_IO_HEADER_SIZE,
+    FILE_REDIRECTOR_CHANNEL_NAME, MAX_CUSTOM_EVENT_BYTES, MAX_DEVICES,
+    MAX_DEVICE_DESCRIPTION_BYTES, MAX_HARDWARE_ID_BYTES, MAX_INTERFACE_BYTES,
+    MAX_IOCONTROL_BYTES, MAX_OUTSTANDING_REQUESTS, MAX_READ_BYTES, MAX_REQUEST_ID, MAX_WRITE_BYTES,
+    PNPDR_CHANNEL_NAME, PNP_CAP_DYNAMIC_DEVICE_ADDITION, PNP_INFO_HEADER_SIZE,
+    SERVER_IO_HEADER_SIZE,
 };
 
 #[cfg(feature = "alloc")]
 pub use pdu::{
-    AuthenticatedClientMsg, ClientDeviceAdditionMsg, ClientDeviceRemovalMsg, ClientVersionMsg,
-    PnpDeviceDescription, PnpInfoHeader, ServerVersionMsg, VersionMsg,
+    AuthenticatedClientMsg, ClientCapabilitiesReply, ClientDeviceAdditionMsg,
+    ClientDeviceCustomEvent, ClientDeviceRemovalMsg, ClientIoHeader, ClientVersionMsg,
+    CreateFileReply, CreateFileRequest, IoControlReply, IoControlRequest, PnpDeviceDescription,
+    PnpInfoHeader, ReadReply, ReadRequest, ServerCapabilitiesRequest, ServerIoHeader,
+    ServerVersionMsg, SpecificIoCancelRequest, VersionMsg, WriteReply, WriteRequest,
 };
 
 #[cfg(feature = "alloc")]
@@ -57,8 +69,20 @@ pub use client::{
     DeviceEntry, NullCallback, PnpInfoCallback, PnpInfoClient, PnpInfoError, PnpInfoState,
 };
 
+#[cfg(feature = "alloc")]
+pub use file_redirector::{
+    ChannelInstance, FileRedirectorChannelClient, FileRedirectorError, FileRedirectorState,
+    IoCallback, IoRequestKind, NullIoCallback, E_NOTIMPL,
+};
+
 #[cfg(all(test, feature = "alloc"))]
 mod client_tests;
 
 #[cfg(all(test, feature = "alloc"))]
 mod pdu_tests;
+
+#[cfg(all(test, feature = "alloc"))]
+mod pdu_io_tests;
+
+#[cfg(all(test, feature = "alloc"))]
+mod file_redirector_tests;

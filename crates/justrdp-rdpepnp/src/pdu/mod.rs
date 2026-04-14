@@ -8,6 +8,8 @@
 //! elements each have their own encode/decode routine.
 
 mod header;
+pub mod io;
+pub mod io_header;
 
 use alloc::vec::Vec;
 
@@ -19,6 +21,16 @@ use crate::constants::{
 };
 
 pub use header::PnpInfoHeader;
+pub use io::{
+    ClientCapabilitiesReply, ClientDeviceCustomEvent, CreateFileReply, CreateFileRequest,
+    IoControlReply, IoControlRequest, ReadReply, ReadRequest, ServerCapabilitiesRequest,
+    SpecificIoCancelRequest, WriteReply, WriteRequest, CLIENT_CAPS_REPLY_SIZE,
+    CREATE_FILE_REPLY_SIZE, CREATE_FILE_REQUEST_SIZE, CUSTOM_EVENT_MIN_SIZE,
+    IOCONTROL_REPLY_MIN_SIZE, IOCONTROL_REQUEST_MIN_SIZE, READ_REPLY_MIN_SIZE, READ_REQUEST_SIZE,
+    SERVER_CAPS_REQUEST_SIZE, SPECIFIC_IOCANCEL_REQUEST_SIZE, WRITE_REPLY_SIZE,
+    WRITE_REQUEST_MIN_SIZE,
+};
+pub use io_header::{ClientIoHeader, ServerIoHeader};
 
 // ── Fixed sizes (bytes, post-header unless otherwise noted) ──
 

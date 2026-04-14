@@ -1876,10 +1876,17 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [x] Balanced-callback invariant (replace-in-place 예외 제외)
 - [x] Unknown PacketId forward-compat (silent drop)
 
-**9.14b — FileRedirectorChannel I/O 서브프로토콜 (미구현)**
-- [ ] `SERVER_IO_HEADER` / `CLIENT_IO_HEADER`, CreateFile/Read/Write/IoControl/IoCancel
-- [ ] Custom Event (version 0x0006 협상)
-- [ ] per-channel FSM + outstanding request 추적
+**9.14b — FileRedirectorChannel I/O 서브프로토콜 ✅ (crate: justrdp-rdpepnp)**
+- [x] `SERVER_IO_HEADER` (8B, u24 RequestId) / `CLIENT_IO_HEADER` (4B)
+- [x] ServerCapabilitiesRequest / ClientCapabilitiesReply (§2.2.2.2)
+- [x] CreateFile / Read / Write / IoControl Request+Reply (§2.2.2.3.1–8)
+- [x] SpecificIoCancelRequest (§2.2.2.3.9, no reply)
+- [x] ClientDeviceCustomEvent (§2.2.2.3.10, gated on negotiated v0x0006)
+- [x] Per-channel FSM (WaitCapabilities → WaitCreateFile → Active → Closed)
+      with outstanding request table (MAX=256, duplicate-id → close)
+- [x] Multi-instance DvcProcessor keyed by channel_id
+- [x] Per-field DoS caps (64 KiB) mirroring PNPDR convention
+- [x] IoCallback trait for host-side I/O service + reply truncation to cb_out
 
 ### 9.15 License Persistence (MS-RDPELE)
 
