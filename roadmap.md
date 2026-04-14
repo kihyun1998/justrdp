@@ -1831,28 +1831,29 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [x] DoS caps: MAX_LOGICAL_SURFACES=4096, MAX_REDIR_SURFACES=4096
 - [x] 50/50 tests passing
 
-### 9.13 Multiparty Virtual Channel (MS-RDPEMC)
+### 9.13 Multiparty Virtual Channel (MS-RDPEMC) ✅
 
 > **requires**: `justrdp-svc` (static SVC "encomsp"), 7.1 세션
-> **검증**: Shadow 세션 integration test
+> **검증**: 50/50 tests (25 PDU + 25 FSM), impl-verifier 14/14 PASS
 > **참고**: MS-RDPEMC는 DRDYNVC가 아닌 static virtual channel "encomsp"를
 > 사용합니다 (MS-RDPBCGR §3.1.5.2).
 
-**Step 9.13a — PDU 레이어 (`justrdp-rdpemc` crate):**
+**Step 9.13a — PDU 레이어 (`justrdp-rdpemc` crate):** ✅
 
-- [ ] 13개 PDU struct Encode/Decode (MS-RDPEMC §2.2)
-- [ ] ORDER_HDR + UNICODE_STRING 공통 타입
-- [ ] `decode_all()` 연속 PDU 루프 파서
-- [ ] 11개 파생 테스트 벡터 + per-PDU 라운드트립
+- [x] 13개 PDU struct Encode/Decode (MS-RDPEMC §2.2)
+- [x] ORDER_HDR + UNICODE_STRING 공통 타입 (cchString ≤ 1024)
+- [x] `decode_all()` 연속 PDU 루프 파서 + 미지 타입 forward-compat skip
+- [x] 11개 파생 테스트 벡터 + per-PDU 라운드트립
 
-**Step 9.13b — FSM + SvcProcessor:**
+**Step 9.13b — FSM + SvcProcessor:** ✅
 
-- [ ] 다자 RDP 세션 (여러 클라이언트가 하나의 세션 공유)
-- [ ] Shadow 세션 (관리자가 사용자 세션 모니터링/제어)
-- [ ] View-only / Interactive 모드
-- [ ] 제어 권한 요청/승인 시퀀스
-- [ ] `EncomspClient` `SvcProcessor` 구현 + callback trait
-- [ ] app/window/participant 상태 테이블 + DoS caps
+- [x] 다자 RDP 세션 (여러 클라이언트가 하나의 세션 공유)
+- [x] Shadow 세션 (관리자가 사용자 세션 모니터링/제어)
+- [x] View-only / Interactive 모드 (MAY_VIEW/MAY_INTERACT 플래그)
+- [x] 제어 권한 요청/승인 시퀀스 (`build_control_request` + response)
+- [x] `EncomspClient<C>` `SvcProcessor` 구현 + `EncomspCallback` trait
+- [x] app/window/participant 상태 테이블 + DoS caps (512/1024/512)
+- [x] app 삭제 cascade → window, filter state change 전체 플러시
 
 ### 9.14 Plug and Play Device Redirection (MS-RDPEPNP)
 
