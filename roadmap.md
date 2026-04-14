@@ -1809,7 +1809,7 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [x] Step 3: `RdpegtClient` DVC processor, `GeometryEntry` map, `GeometryLookup` trait for RDPEVOR
 - [x] Step 4: impl-verifier 0 FAIL (after fixes), code-reviewer + security-scanner clean (23/23 tests, DoS caps, MAX_ACTIVE_MAPPINGS boundary test, trailing-byte rejection, pre-start guard)
 
-### 9.12 Desktop Composition (MS-RDPEDC)
+### 9.12 Desktop Composition (MS-RDPEDC) ✅
 
 > **requires**: CAPSETTYPE_COMPDESK (`justrdp-pdu` 기존 구현), MS-RDPEGDI Alternate Secondary Order transport
 > **검증**: PDU roundtrip + 스펙 §4 hex test vectors
@@ -1817,12 +1817,19 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 >   Desktop Composition Virtual Channel Extension v8.0. MS-RDPCR2 (Composited
 >   Remoting V2, 136-message DWM scene-graph protocol) is tracked separately below.
 
-- [ ] 6개 PDU 전부 구현 (TOGGLE / LSURFACE / SURFOBJ / REDIRSURF_ASSOC / COMPREF_PENDING / SWITCH_SURFOBJ / FLUSH_COMPOSEONCE)
-- [ ] `TS_ALTSEC_COMPDESK_FIRST = 0x0C` Alternate Secondary Order header (0x32 byte)
-- [ ] Composition mode FSM (COMPOSITION_OFF ↔ COMPOSITION_ON, DWM desk enter/leave sub-modes)
-- [ ] 논리 서피스 테이블 + 리다이렉션 서피스 테이블 (BTreeMap, no_std)
-- [ ] CAPSETTYPE_COMPDESK capability set과 연동 (이미 `justrdp-pdu/src/rdp/capabilities.rs`)
-- [ ] 스펙 §4.2.1, §4.3.2 hex test vectors 정확 매칭
+- Step 0: spec-checker → `specs/ms-rdpedc-checklist.md` (7 PDUs, trivial sizing)
+- Step 1: crate + constants + 7 PDU Encode/Decode + 25 unit tests (spec §4.2.1, §4.3.2 hex vectors pass)
+- Step 2: `RdpedcClient` processor + FSM + surface tables + `CompDeskCallback` + 22 tests
+- Step 3: impl-verifier → 2 HIGH + 1 MEDIUM + 3 LOW fixed (duplicate CompositionOn, unknown-op skip, COMPDESK_SUPPORTED const, regression tests)
+- [x] 7개 PDU 전부 구현 (TOGGLE / LSURFACE / SURFOBJ / REDIRSURF_ASSOC / COMPREF_PENDING / SWITCH_SURFOBJ / FLUSH_COMPOSEONCE)
+- [x] `TS_ALTSEC_COMPDESK_FIRST = 0x0C` Alternate Secondary Order header (0x32 byte)
+- [x] Composition mode FSM (COMPOSITION_OFF ↔ COMPOSITION_ON, DWM desk enter/leave sub-modes)
+- [x] 논리 서피스 테이블 + 리다이렉션 서피스 테이블 (BTreeMap, no_std)
+- [x] CAPSETTYPE_COMPDESK capability set과 연동 (`justrdp-pdu/src/rdp/capabilities.rs` + `COMPDESK_SUPPORTED/NOT_SUPPORTED` const)
+- [x] 스펙 §4.2.1, §4.3.2 hex test vectors 정확 매칭
+- [x] Forward-compat: unknown operation byte skip via `size` field
+- [x] DoS caps: MAX_LOGICAL_SURFACES=4096, MAX_REDIR_SURFACES=4096
+- [x] 50/50 tests passing
 
 ### 9.13 Multiparty Virtual Channel (MS-RDPEMC)
 
