@@ -97,8 +97,8 @@ impl From<EncomspError> for SvcError {
         match e {
             EncomspError::Decode(d) => SvcError::Decode(d),
             EncomspError::Encode(e) => SvcError::Encode(e),
-            EncomspError::TableFull { which, cap: _ } => {
-                SvcError::Protocol(alloc::format!("encomsp table full: {which}"))
+            EncomspError::TableFull { which, cap } => {
+                SvcError::Protocol(alloc::format!("encomsp table full: {which} (cap={cap})"))
             }
             EncomspError::Protocol(msg) => {
                 SvcError::Protocol(alloc::format!("encomsp protocol: {msg}"))
@@ -138,6 +138,12 @@ impl From<justrdp_core::EncodeError> for EncomspError {
 ///   `OD_PARTICIPANT_CREATED` for the same `participant_id` fires
 ///   [`EncomspCallback::on_participant_permissions_updated`], NOT
 ///   another `on_participant_created`.
+/// * Applications and windows do NOT have a dedicated update callback:
+///   a duplicate `OD_APP_CREATED` / `OD_WND_CREATED` (same id, new
+///   payload) replaces the stored record in place and fires
+///   `on_app_created` / `on_window_created` a second time. Callers
+///   that materialise UI state per id MUST treat a second fire as an
+///   update to the existing record, not as a new entity.
 pub trait EncomspCallback {
     fn on_filter_state_changed(&mut self, _enabled: bool) {}
 
@@ -603,15 +609,14 @@ impl<C: EncomspCallback> EncomspClient<C> {
             // flags; preserve the stored friendly_name unless the new
             // PDU carries a non-empty one (spec allows both).
             entry.group_id = group_id;
-            let new_flags = pdu_flags;
-            let changed = entry.flags != new_flags;
-            entry.flags = new_flags;
+            let changed = entry.flags != pdu_flags;
+            entry.flags = pdu_flags;
             if !friendly_name.is_empty() {
                 entry.friendly_name = friendly_name;
             }
             if changed {
                 self.callback
-                    .on_participant_permissions_updated(participant_id, new_flags);
+                    .on_participant_permissions_updated(participant_id, pdu_flags);
             }
         }
         Ok(())
