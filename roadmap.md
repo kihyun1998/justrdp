@@ -1768,19 +1768,31 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [x] Step 4: Integration test (tests/flow.rs) — enumerator↔device 프로세서 side-by-side end-to-end: v2 negotiation → announce → activate → stream list → media type list → current → start → sample (queue drain + empty→SampleErrorResponse) → property list/get/set/get → stop → deactivate → close → remove → close. Plus announce/remove idempotency, v1 negotiation gating property API, host-level ItemNotFound propagation (4 tests)
 - [x] Step 5: impl-verifier (83/86 PASS) + code-reviewer + security-scanner; applied fixes: trailing-bytes → `ErrorResponse(InvalidMessage)` instead of channel tear-down, `start()` re-create calls `stop_streams()` before `deactivate()` for contract-compliant host teardown, `pixel_aspect_ratio_denominator == 0` rejected symmetrically with `frame_rate_denominator`, no-op `DvcError::Encode` identity re-wrap dropped, `encode_to_vec` upgraded from `debug_assert` to `assert` for release-build coverage, `SampleRequest` early-exit `SampleErrorResponse(OutOfMemory)` for oversize host returns, UTF-16 cap exact-boundary + odd-byte orphan tests, `start()` re-create teardown-order regression test, C→S rejection broadened to 0x01/0x02/0x12/0x13
 
-### 9.10 Video Redirection (MS-RDPEV)
+### 9.10 Video Redirection (MS-RDPEV) ✅
 
-> **requires**: 7.3 DVC 프레임워크
-> **검증**: PDU roundtrip
+> **requires**: 7.3 DVC ✅
+> **검증**: PDU roundtrip + 통합 테스트 + 2-pass 검증
+> **크레이트**: `justrdp-rdpev` ✅
 
 **DVC 이름**: `TSMF` (TS Multimedia Framework)
 
-- [ ] TSMF Interface: Exchange Capabilities
-- [ ] 미디어 타입 협상 (오디오/비디오 코덱)
-- [ ] 서버 측 미디어 플레이어 → 클라이언트 측 로컬 재생
-- [ ] Play/Pause/Stop/Seek 제어
-- [ ] 스트림 타이밍 동기화 (presentation timestamp)
-- [ ] 레거시 비디오 리다이렉션 (RDPEVOR 이전 방식)
+- [x] Step 0: Spec Analysis → `specs/ms-rdpev-checklist.md`
+- [x] Step 1: Crate Skeleton (no_std, forbid unsafe)
+- [x] Step 2A-2H: PDU 레이어 — 24 wire types, 9 modules, 112 unit tests
+  - 2A: SHARED_MSG_HEADER (12B 요청 / 8B 응답, InterfaceId+Mask+MessageId+FunctionId)
+  - 2B: TSMM_CAPABILITIES + ExchangeCapabilities Req/Rsp
+  - 2C: Presentation lifecycle (SetChannelParams, OnNewPresentation, SetTopology Req/Rsp, ShutdownPresentation Req/Rsp) + Guid
+  - 2D: TS_AM_MEDIA_TYPE + CheckFormatSupport Req/Rsp (numMediaType invariant)
+  - 2E: AddStream + RemoveStream
+  - 2F: TS_MM_DATA_SAMPLE + OnSample + PlaybackAck (Client Notifications interface)
+  - 2G: NotifyPreroll + OnFlush + OnEndOfStream + OnPlayback{Started,Paused,Stopped,Restarted,RateChanged}
+  - 2H: SetVideoWindow + UpdateGeometryInfo + SetSourceVideoRect + OnStreamVolume + OnChannelVolume + SetAllocator + ClientEventNotification
+- [x] Step 3: `RdpevClient` DvcProcessor + `TsmfMediaSink` host trait + presentation/stream FSM + 22 PDU 핸들러 + ON_SAMPLE→PlaybackAck 1:1 핫패스
+- [x] Step 4: 통합 테스트 (`tests/flow.rs`) — 8 시나리오 (full lifecycle, multi-presentation, pipelined CHECK_FORMAT, etc.)
+- [x] Step 5: 2-pass 검증 (impl-verifier + code-reviewer + security-scanner)
+  - 1차: P0 (ON_SAMPLE Ready guard) + 4 P1 (HRESULT pairing, stream_id, NotifyPreroll routing, f32 validation) + 3 P2 fix
+  - 2차: W1 (Ready→Setup demotion 방지) + W2 (OnPlaybackRateChanged NaN/Inf reject) + 테스트 cleanup
+  - 최종: 169 tests passing (161 unit + 8 integration), 0 P0/P1 outstanding
 
 ### 9.11 Geometry Tracking (MS-RDPEGT) ✅
 
