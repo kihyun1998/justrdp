@@ -397,13 +397,20 @@ impl RdpecamDeviceClient {
 }
 
 /// Decodes exactly `P` from `payload`. Both a parse failure and
-/// trailing-byte garbage surface as `DvcError::Decode`, which
-/// `process()` catches and translates into
-/// `ErrorResponse(InvalidMessage)` per MS-RDPECAM §8. Keeping every
-/// wire-format defect in a single error variant is what lets the
-/// caller replace the usual `?` with a uniform catch-arm without
-/// accidentally letting a `DvcError::Protocol` (channel tear-down)
-/// escape for a bug the spec only intends to trigger an error reply.
+/// trailing-byte garbage surface as `DvcError::Decode`.
+///
+/// Every `on_*` handler in this module calls `decode_exact(..)?`,
+/// so a decode failure propagates straight out of the handler back
+/// to [`RdpecamDeviceClient::process`], which is the single catch
+/// site: it turns `Err(DvcError::Decode(_))` into the spec-mandated
+/// `ErrorResponse(InvalidMessage)` per MS-RDPECAM §8. Any other
+/// `DvcError` variant (encode failure, protocol violation) bubbles
+/// up to the DVC framework and tears the channel down.
+///
+/// Keeping every wire-format defect in a single error variant is
+/// what lets `process()` handle the whole class with one match arm
+/// without accidentally letting a `DvcError::Protocol` escape for a
+/// bug the spec only wants answered with an error reply.
 fn decode_exact<P>(payload: &[u8]) -> DvcResult<P>
 where
     for<'a> P: Decode<'a>,
@@ -997,6 +1004,107 @@ mod tests {
         // Activate must still succeed.
         let ok = exchange(&mut c, ActivateDeviceRequest::new(VERSION_2));
         assert_eq!(first_two(&ok), (VERSION_2, 0x01));
+    }
+
+    /// Minimal `CameraDevice` that returns a `MAX_SAMPLE_BYTES + 1`
+    /// byte buffer from `capture_sample`, used to exercise the
+    /// processor's OOM early-exit guard in `on_sample_request`
+    /// without having to thread an oversize mode through the full
+    /// `MockCameraDevice` builder surface.
+    struct OversizeSampleDevice {
+        streams: Vec<StreamDescription>,
+        media_types: Vec<MediaTypeDescription>,
+        is_active: bool,
+        is_streaming: bool,
+    }
+
+    impl OversizeSampleDevice {
+        fn new() -> Self {
+            Self {
+                streams: alloc::vec![base_stream()],
+                media_types: alloc::vec![base_media_type()],
+                is_active: false,
+                is_streaming: false,
+            }
+        }
+    }
+
+    impl CameraDevice for OversizeSampleDevice {
+        fn activate(&mut self) -> Result<(), crate::camera::CamError> {
+            self.is_active = true;
+            Ok(())
+        }
+        fn deactivate(&mut self) -> Result<(), crate::camera::CamError> {
+            self.is_streaming = false;
+            self.is_active = false;
+            Ok(())
+        }
+        fn stream_list(&self) -> &[StreamDescription] {
+            &self.streams
+        }
+        fn media_type_list(
+            &self,
+            _: u8,
+        ) -> Result<&[MediaTypeDescription], crate::camera::CamError> {
+            Ok(&self.media_types)
+        }
+        fn current_media_type(
+            &self,
+            _: u8,
+        ) -> Result<MediaTypeDescription, crate::camera::CamError> {
+            Ok(base_media_type())
+        }
+        fn start_streams(
+            &mut self,
+            _: &[StartStreamInfo],
+        ) -> Result<(), crate::camera::CamError> {
+            self.is_streaming = true;
+            Ok(())
+        }
+        fn stop_streams(&mut self) -> Result<(), crate::camera::CamError> {
+            self.is_streaming = false;
+            Ok(())
+        }
+        fn capture_sample(&mut self, _: u8) -> Result<Vec<u8>, crate::camera::CamError> {
+            // Return one byte over the cap so the processor's early
+            // exit fires without the encoder ever seeing the buffer.
+            Ok(alloc::vec![0u8; crate::pdu::capture::MAX_SAMPLE_BYTES + 1])
+        }
+    }
+
+    #[test]
+    fn sample_request_oversize_host_return_becomes_out_of_memory() {
+        // Exercises the defence-in-depth guard at `on_sample_request`
+        // that rejects host samples larger than `MAX_SAMPLE_BYTES`
+        // as `SampleErrorResponse(OutOfMemory)` before they reach
+        // `encode_to_vec`. Without this test the guard would be
+        // dead-code from a coverage standpoint and a future refactor
+        // could delete it without noticing.
+        let mut c = RdpecamDeviceClient::new(
+            String::from("oversize"),
+            VERSION_2,
+            Box::new(OversizeSampleDevice::new()),
+        );
+        c.start(1).unwrap();
+        exchange(&mut c, ActivateDeviceRequest::new(VERSION_2));
+        exchange(
+            &mut c,
+            StartStreamsRequest {
+                version: VERSION_2,
+                infos: alloc::vec![StartStreamInfo {
+                    stream_index: 0,
+                    media_type: base_media_type(),
+                }],
+            },
+        );
+        let resp = exchange(&mut c, SampleRequest::new(VERSION_2, 0));
+        // SampleErrorResponse with OutOfMemory (0x07).
+        assert_eq!(first_two(&resp), (VERSION_2, 0x13));
+        assert_eq!(resp[2], 0); // stream_index
+        assert_eq!(
+            u32::from_le_bytes([resp[3], resp[4], resp[5], resp[6]]),
+            ErrorCode::OutOfMemory.to_u32()
+        );
     }
 
     #[test]

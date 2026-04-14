@@ -260,8 +260,16 @@ impl CameraDevice for MockCameraDevice {
         if !self.is_active {
             return Err(CamError::NotInitialized);
         }
+        // Strict ordering contract: a well-behaved client MUST call
+        // `stop_streams` before `deactivate`, so a mock that rejects
+        // the reverse order turns the "teardown order" processor
+        // tests into real regressions rather than silent no-ops.
+        // Without this guard the ordering test could pass even if
+        // the processor swapped the two calls (see Step 5 review).
+        if self.is_streaming {
+            return Err(CamError::InvalidRequest);
+        }
         self.is_active = false;
-        self.is_streaming = false;
         self.deactivate_calls += 1;
         Ok(())
     }
