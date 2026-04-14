@@ -1833,13 +1833,26 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 ### 9.13 Multiparty Virtual Channel (MS-RDPEMC)
 
-> **requires**: 7.3 DVC 프레임워크, 7.1 세션
+> **requires**: `justrdp-svc` (static SVC "encomsp"), 7.1 세션
 > **검증**: Shadow 세션 integration test
+> **참고**: MS-RDPEMC는 DRDYNVC가 아닌 static virtual channel "encomsp"를
+> 사용합니다 (MS-RDPBCGR §3.1.5.2).
+
+**Step 9.13a — PDU 레이어 (`justrdp-rdpemc` crate):**
+
+- [ ] 13개 PDU struct Encode/Decode (MS-RDPEMC §2.2)
+- [ ] ORDER_HDR + UNICODE_STRING 공통 타입
+- [ ] `decode_all()` 연속 PDU 루프 파서
+- [ ] 11개 파생 테스트 벡터 + per-PDU 라운드트립
+
+**Step 9.13b — FSM + SvcProcessor:**
 
 - [ ] 다자 RDP 세션 (여러 클라이언트가 하나의 세션 공유)
 - [ ] Shadow 세션 (관리자가 사용자 세션 모니터링/제어)
 - [ ] View-only / Interactive 모드
 - [ ] 제어 권한 요청/승인 시퀀스
+- [ ] `EncomspClient` `SvcProcessor` 구현 + callback trait
+- [ ] app/window/participant 상태 테이블 + DoS caps
 
 ### 9.14 Plug and Play Device Redirection (MS-RDPEPNP)
 

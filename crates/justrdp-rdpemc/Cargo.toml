@@ -1,0 +1,19 @@
+[package]
+name = "justrdp-rdpemc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Multiparty Virtual Channel Extension (MS-RDPEMC) for JustRDP"
+keywords = ["rdp", "encomsp", "multiparty", "shadow", "rdpemc"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc"]
+std = ["alloc", "justrdp-core/std"]
+
+[dependencies]
+justrdp-core.workspace = true
