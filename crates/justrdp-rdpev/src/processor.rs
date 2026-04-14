@@ -55,11 +55,22 @@ use justrdp_core::{AsAny, Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_dvc::{DvcError, DvcMessage, DvcProcessor, DvcResult};
 
 use crate::constants::{unpack_interface_id, FunctionId, InterfaceValue, Mask, S_OK};
-use crate::media::{CheckFormatResult, TsmfMediaSink};
+use crate::media::{result_to_hresult, CheckFormatResult, TsmfMediaSink};
 use crate::pdu::capabilities::{ExchangeCapabilitiesReq, ExchangeCapabilitiesRsp};
+use crate::pdu::control::{
+    NotifyPreroll, OnEndOfStream, OnFlush, OnPlaybackPaused, OnPlaybackRateChanged,
+    OnPlaybackRestarted, OnPlaybackStarted, OnPlaybackStopped,
+};
 use crate::pdu::format::{CheckFormatSupportReq, CheckFormatSupportRsp, TsAmMediaType};
+use crate::pdu::geometry::{SetSourceVideoRect, SetVideoWindow, UpdateGeometryInfo};
 use crate::pdu::guid::{Guid, GUID_SIZE};
-use crate::pdu::presentation::{OnNewPresentation, SetChannelParams};
+use crate::pdu::misc::{ClientEventNotification, OnChannelVolume, OnStreamVolume, SetAllocator};
+use crate::pdu::presentation::{
+    OnNewPresentation, SetChannelParams, SetTopologyReq, SetTopologyRsp, ShutdownPresentationReq,
+    ShutdownPresentationRsp,
+};
+use crate::pdu::sample::{OnSample, PlaybackAck};
+use crate::pdu::stream::{AddStream, RemoveStream};
 use crate::CHANNEL_NAME;
 
 // ── DoS caps ────────────────────────────────────────────────────────
@@ -79,12 +90,16 @@ enum ChannelState {
     Closed,
 }
 
-// PresentationState/StreamState/StreamContext fields are written in
-// Step 3a (`Created`) and read by every subsequent transition that
-// Step 3b will add (Setup → Ready → Terminated, Added → Streaming →
-// Stopped). The dead_code allow keeps the public skeleton compiling
-// cleanly until 3b lands.
-#[allow(dead_code)]
+/// Per-presentation lifecycle.
+///
+/// `Created` is the state right after `ON_NEW_PRESENTATION` and
+/// before the first `ADD_STREAM`. `Setup` is reached on the first
+/// `ADD_STREAM` and stays there as more streams are added. `Ready`
+/// is reached when the server's `SET_TOPOLOGY_REQ` has been answered
+/// with `topology_ready = 1`; this is the only state in which
+/// `ON_SAMPLE` is expected. `Terminated` is set briefly while a
+/// `SHUTDOWN_PRESENTATION_REQ` is being processed before the
+/// presentation is removed from the map entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PresentationState {
     Created,
@@ -93,27 +108,31 @@ pub(crate) enum PresentationState {
     Terminated,
 }
 
-#[allow(dead_code)]
+/// Per-stream lifecycle. Reaches `Streaming` on the first `ON_SAMPLE`
+/// the stream sees; `Stopped` is currently a placeholder for future
+/// fine-grained flow control (the wire protocol only has whole-
+/// presentation playback states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamState {
     Added,
     Streaming,
+    #[allow(dead_code)]
     Stopped,
 }
 
 // ── Per-presentation context ────────────────────────────────────────
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct StreamContext {
+    #[allow(dead_code)]
     pub media_type: TsAmMediaType,
     pub state: StreamState,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct PresentationContext {
     pub state: PresentationState,
+    #[allow(dead_code)]
     pub platform_cookie: u32,
     pub streams: BTreeMap<u32, StreamContext>,
 }
@@ -293,27 +312,83 @@ impl RdpevClient {
         // ("ignore unknown") so that a future spec extension does not
         // tear the channel down.
         match (interface_value, fid) {
-            // ── Step 3a handlers ──
+            // ── Capability + bind ──
             (InterfaceValue::ServerData, FunctionId::ExchangeCapabilitiesReq) => {
                 self.handle_exchange_capabilities_req(payload)
             }
             (InterfaceValue::ServerData, FunctionId::SetChannelParams) => {
                 self.handle_set_channel_params(payload)
             }
+            // ── Presentation lifecycle ──
             (InterfaceValue::ServerData, FunctionId::OnNewPresentation) => {
                 self.handle_on_new_presentation(payload)
             }
             (InterfaceValue::ServerData, FunctionId::CheckFormatSupportReq) => {
                 self.handle_check_format_support_req(payload)
             }
-            // ── Step 3b handlers (deliberately unimplemented for now) ──
-            (InterfaceValue::ServerData, _) => {
-                // Step 3b will fill these in. For now: ignore so the
-                // skeleton compiles cleanly and the partial-coverage
-                // tests can exercise the four implemented paths.
-                Ok(Vec::new())
+            (InterfaceValue::ServerData, FunctionId::AddStream) => {
+                self.handle_add_stream(payload)
             }
-            // Unknown interface -- ignore.
+            (InterfaceValue::ServerData, FunctionId::SetTopologyReq) => {
+                self.handle_set_topology_req(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::RemoveStream) => {
+                self.handle_remove_stream(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::ShutdownPresentationReq) => {
+                self.handle_shutdown_presentation_req(payload)
+            }
+            // ── Hot path ──
+            (InterfaceValue::ServerData, FunctionId::OnSample) => self.handle_on_sample(payload),
+            // ── Playback control ──
+            (InterfaceValue::ServerData, FunctionId::NotifyPreroll) => {
+                self.handle_notify_preroll(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::OnFlush) => self.handle_on_flush(payload),
+            (InterfaceValue::ServerData, FunctionId::OnEndOfStream) => {
+                self.handle_on_end_of_stream(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::OnPlaybackStarted) => {
+                self.handle_on_playback_started(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::OnPlaybackPaused) => {
+                self.handle_on_playback_paused(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::OnPlaybackStopped) => {
+                self.handle_on_playback_stopped(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::OnPlaybackRestarted) => {
+                self.handle_on_playback_restarted(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::OnPlaybackRateChanged) => {
+                self.handle_on_playback_rate_changed(payload)
+            }
+            // ── Volume / geometry / window / allocator ──
+            (InterfaceValue::ServerData, FunctionId::OnStreamVolume) => {
+                self.handle_on_stream_volume(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::OnChannelVolume) => {
+                self.handle_on_channel_volume(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::SetVideoWindow) => {
+                self.handle_set_video_window(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::UpdateGeometryInfo) => {
+                self.handle_update_geometry_info(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::SetSourceVideoRect) => {
+                self.handle_set_source_video_rect(payload)
+            }
+            (InterfaceValue::ServerData, FunctionId::SetAllocator) => {
+                self.handle_set_allocator(payload)
+            }
+            // Unknown FunctionId on a known interface — ignore per spec §9.
+            (InterfaceValue::ServerData, _) => Ok(Vec::new()),
+            // Client Notifications interface PDUs are client→server only;
+            // a server that sends one is buggy. Ignore rather than tear
+            // down the channel.
+            (InterfaceValue::ClientNotifications, _) => Ok(Vec::new()),
+            // Unknown interface — ignore.
             _ => Ok(Vec::new()),
         }
     }
@@ -412,6 +487,307 @@ impl RdpevClient {
             result: S_OK,
         };
         Ok(alloc::vec![Self::encode_pdu(&rsp)?])
+    }
+
+    // ── Step 3b handlers: presentation lifecycle ──
+
+    fn handle_add_stream(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ADD_STREAM")?;
+        let mut r = ReadCursor::new(payload);
+        let req = AddStream::decode(&mut r)?;
+        let pres = match self.presentations.get_mut(&req.presentation_id.0) {
+            Some(p) => p,
+            None => {
+                // Unknown presentation: hand the call to the sink
+                // anyway (so a host that maintains its own routing
+                // can still see the stream) and drop. We do not tear
+                // the channel down because the spec is liberal here.
+                let _ = self
+                    .sink
+                    .add_stream(req.presentation_id, req.stream_id, &req.media_type);
+                return Ok(Vec::new());
+            }
+        };
+        if pres.streams.len() >= MAX_STREAMS_PER_PRESENTATION
+            && !pres.streams.contains_key(&req.stream_id)
+        {
+            return Err(DvcError::Protocol(format!(
+                "MS-RDPEV: ADD_STREAM exceeds MAX_STREAMS_PER_PRESENTATION ({MAX_STREAMS_PER_PRESENTATION})"
+            )));
+        }
+        match self
+            .sink
+            .add_stream(req.presentation_id, req.stream_id, &req.media_type)
+        {
+            Ok(()) => {
+                pres.streams.insert(
+                    req.stream_id,
+                    StreamContext {
+                        media_type: req.media_type.clone(),
+                        state: StreamState::Added,
+                    },
+                );
+                pres.state = PresentationState::Setup;
+            }
+            Err(_) => {
+                // Sink refused; do not insert. No wire response.
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn handle_set_topology_req(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("SET_TOPOLOGY_REQ")?;
+        let mut r = ReadCursor::new(payload);
+        let req = SetTopologyReq::decode(&mut r)?;
+        let ready = self.sink.set_topology(req.presentation_id);
+        if let Some(pres) = self.presentations.get_mut(&req.presentation_id.0) {
+            if ready {
+                pres.state = PresentationState::Ready;
+            }
+        }
+        let rsp = SetTopologyRsp {
+            message_id: req.message_id,
+            topology_ready: if ready { 1 } else { 0 },
+            // Spec §2.2.5.2.6: Result = S_OK on success; for failure
+            // the topology_ready flag does the heavy lifting and the
+            // server treats E_FAIL identically. We pick S_OK so a
+            // confused server still gets a parseable HRESULT.
+            result: S_OK,
+        };
+        Ok(alloc::vec![Self::encode_pdu(&rsp)?])
+    }
+
+    fn handle_remove_stream(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("REMOVE_STREAM")?;
+        let mut r = ReadCursor::new(payload);
+        let req = RemoveStream::decode(&mut r)?;
+        if let Some(pres) = self.presentations.get_mut(&req.presentation_id.0) {
+            pres.streams.remove(&req.stream_id);
+        }
+        self.sink.remove_stream(req.presentation_id, req.stream_id);
+        Ok(Vec::new())
+    }
+
+    fn handle_shutdown_presentation_req(
+        &mut self,
+        payload: &[u8],
+    ) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("SHUTDOWN_PRESENTATION_REQ")?;
+        let mut r = ReadCursor::new(payload);
+        let req = ShutdownPresentationReq::decode(&mut r)?;
+        // Mark Terminated briefly so observers see the transition,
+        // then drop the entire context. The sink call must happen
+        // BEFORE the map removal so the sink can still observe the
+        // streams via its own bookkeeping if it wants to.
+        if let Some(pres) = self.presentations.get_mut(&req.presentation_id.0) {
+            pres.state = PresentationState::Terminated;
+        }
+        let result = self.sink.shutdown_presentation(req.presentation_id);
+        self.presentations.remove(&req.presentation_id.0);
+        let rsp = ShutdownPresentationRsp {
+            message_id: req.message_id,
+            result: result_to_hresult(result),
+        };
+        Ok(alloc::vec![Self::encode_pdu(&rsp)?])
+    }
+
+    // ── Step 3b handlers: ON_SAMPLE hot path ──
+
+    fn handle_on_sample(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_SAMPLE")?;
+        let mut r = ReadCursor::new(payload);
+        let req = OnSample::decode(&mut r)?;
+
+        // Update internal stream state if the stream is known. We do
+        // NOT bail out on unknown streams: spec §3.3.5.3.3 requires a
+        // PLAYBACK_ACK for every ON_SAMPLE the client received, full
+        // stop. The sink's handler is responsible for absorbing the
+        // sample (or discarding it if unknown).
+        if let Some(pres) = self.presentations.get_mut(&req.presentation_id.0) {
+            if let Some(stream) = pres.streams.get_mut(&req.stream_id) {
+                stream.state = StreamState::Streaming;
+            }
+        }
+        // Capture echo fields BEFORE handing the sample to the sink
+        // so we don't have to clone the whole payload.
+        let echo_throttle = req.sample.throttle_duration;
+        let echo_cb_data = req.sample.p_data.len() as u64;
+
+        self.sink
+            .on_sample(req.presentation_id, req.stream_id, &req.sample);
+
+        let ack = PlaybackAck {
+            message_id: self.next_msg_id(),
+            stream_id: req.stream_id,
+            data_duration: echo_throttle,
+            cb_data: echo_cb_data,
+        };
+        Ok(alloc::vec![Self::encode_pdu(&ack)?])
+    }
+
+    // ── Step 3b handlers: playback control (fire-and-forget) ──
+
+    fn handle_notify_preroll(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("NOTIFY_PREROLL")?;
+        // NOTIFY_PREROLL is a buffering hint that the spec calls
+        // RECOMMENDED rather than MUST; the sink trait deliberately
+        // has no dedicated method for it. We still decode the PDU to
+        // validate its structure (so a malformed prefix tears the
+        // channel down rather than going unnoticed) but we do not
+        // route it to the sink.
+        let _ = NotifyPreroll::decode(&mut ReadCursor::new(payload))?;
+        Ok(Vec::new())
+    }
+
+    fn handle_on_flush(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_FLUSH")?;
+        let req = OnFlush::decode(&mut ReadCursor::new(payload))?;
+        self.sink.on_flush(req.presentation_id, req.stream_id);
+        Ok(Vec::new())
+    }
+
+    fn handle_on_end_of_stream(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_END_OF_STREAM")?;
+        let req = OnEndOfStream::decode(&mut ReadCursor::new(payload))?;
+        self.sink
+            .on_end_of_stream(req.presentation_id, req.stream_id);
+        Ok(Vec::new())
+    }
+
+    fn handle_on_playback_started(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_PLAYBACK_STARTED")?;
+        let req = OnPlaybackStarted::decode(&mut ReadCursor::new(payload))?;
+        self.sink.on_playback_started(
+            req.presentation_id,
+            req.playback_start_offset,
+            req.is_seek != 0,
+        );
+        Ok(Vec::new())
+    }
+
+    fn handle_on_playback_paused(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_PLAYBACK_PAUSED")?;
+        let req = OnPlaybackPaused::decode(&mut ReadCursor::new(payload))?;
+        self.sink.on_playback_paused(req.presentation_id);
+        Ok(Vec::new())
+    }
+
+    fn handle_on_playback_stopped(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_PLAYBACK_STOPPED")?;
+        let req = OnPlaybackStopped::decode(&mut ReadCursor::new(payload))?;
+        self.sink.on_playback_stopped(req.presentation_id);
+        Ok(Vec::new())
+    }
+
+    fn handle_on_playback_restarted(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_PLAYBACK_RESTARTED")?;
+        let req = OnPlaybackRestarted::decode(&mut ReadCursor::new(payload))?;
+        self.sink.on_playback_restarted(req.presentation_id);
+        Ok(Vec::new())
+    }
+
+    fn handle_on_playback_rate_changed(
+        &mut self,
+        payload: &[u8],
+    ) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_PLAYBACK_RATE_CHANGED")?;
+        let req = OnPlaybackRateChanged::decode(&mut ReadCursor::new(payload))?;
+        self.sink
+            .on_playback_rate_changed(req.presentation_id, req.new_rate);
+        Ok(Vec::new())
+    }
+
+    // ── Step 3b handlers: volume + geometry + window + allocator ──
+
+    fn handle_on_stream_volume(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_STREAM_VOLUME")?;
+        let req = OnStreamVolume::decode(&mut ReadCursor::new(payload))?;
+        self.sink
+            .on_stream_volume(req.presentation_id, req.new_volume, req.b_muted != 0);
+        Ok(Vec::new())
+    }
+
+    fn handle_on_channel_volume(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("ON_CHANNEL_VOLUME")?;
+        let req = OnChannelVolume::decode(&mut ReadCursor::new(payload))?;
+        self.sink.on_channel_volume(
+            req.presentation_id,
+            req.channel_volume,
+            req.changed_channel,
+        );
+        Ok(Vec::new())
+    }
+
+    fn handle_set_video_window(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("SET_VIDEO_WINDOW")?;
+        let req = SetVideoWindow::decode(&mut ReadCursor::new(payload))?;
+        self.sink.set_video_window(
+            req.presentation_id,
+            req.video_window_id,
+            req.hwnd_parent,
+        );
+        Ok(Vec::new())
+    }
+
+    fn handle_update_geometry_info(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("UPDATE_GEOMETRY_INFO")?;
+        let req = UpdateGeometryInfo::decode(&mut ReadCursor::new(payload))?;
+        self.sink
+            .update_geometry(req.presentation_id, &req.geometry, &req.visible_rects);
+        Ok(Vec::new())
+    }
+
+    fn handle_set_source_video_rect(
+        &mut self,
+        payload: &[u8],
+    ) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("SET_SOURCE_VIDEO_RECT")?;
+        let req = SetSourceVideoRect::decode(&mut ReadCursor::new(payload))?;
+        self.sink.set_source_video_rect(
+            req.presentation_id,
+            req.left,
+            req.top,
+            req.right,
+            req.bottom,
+        );
+        Ok(Vec::new())
+    }
+
+    fn handle_set_allocator(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        self.ensure_open("SET_ALLOCATOR")?;
+        let req = SetAllocator::decode(&mut ReadCursor::new(payload))?;
+        self.sink.set_allocator(
+            req.presentation_id,
+            req.stream_id,
+            req.c_buffers,
+            req.cb_buffer,
+            req.cb_align,
+            req.cb_prefix,
+        );
+        Ok(Vec::new())
+    }
+
+    // ── Step 3b: outbound ClientEventNotification helper ──
+
+    /// Emits a `CLIENT_EVENT_NOTIFICATION` PDU on the Client
+    /// Notifications interface. The host calls this to push
+    /// application-defined events back to the server. Returns the
+    /// encoded `DvcMessage` so the embedder can hand it to the DVC
+    /// framework's send queue.
+    pub fn client_event(
+        &mut self,
+        stream_id: u32,
+        event_id: u32,
+        blob: Vec<u8>,
+    ) -> DvcResult<DvcMessage> {
+        let pdu = ClientEventNotification {
+            message_id: self.next_msg_id(),
+            stream_id,
+            event_id,
+            p_blob: blob,
+        };
+        Self::encode_pdu(&pdu)
     }
 }
 
@@ -752,6 +1128,579 @@ mod tests {
         let mut r = ReadCursor::new(&rsp_bytes);
         let rsp = CheckFormatSupportRsp::decode(&mut r).unwrap();
         assert_eq!(rsp.format_supported, 0);
+    }
+
+    // ── Step 3b: presentation lifecycle ──
+
+    fn create_presentation(c: &mut RdpevClient, g: Guid) {
+        let req = OnNewPresentation {
+            message_id: 0,
+            presentation_id: g,
+            platform_cookie: platform_cookie::MF,
+        };
+        c.process(CHAN_ID, &encode(&req)).unwrap();
+    }
+
+    fn add_stream(c: &mut RdpevClient, g: Guid, stream_id: u32) {
+        let req = AddStream {
+            message_id: 0,
+            presentation_id: g,
+            stream_id,
+            media_type: dummy_media_type(),
+        };
+        c.process(CHAN_ID, &encode(&req)).unwrap();
+    }
+
+    fn sink_of(c: &RdpevClient) -> &MockTsmfMediaSink {
+        c.sink
+            .as_any()
+            .downcast_ref::<MockTsmfMediaSink>()
+            .unwrap()
+    }
+
+    #[test]
+    fn add_stream_inserts_stream_and_transitions_to_setup() {
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 7);
+        let pres = c.presentations.get(&G1.0).unwrap();
+        assert_eq!(pres.state, PresentationState::Setup);
+        assert!(pres.streams.contains_key(&7));
+        assert_eq!(pres.streams[&7].state, StreamState::Added);
+        assert_eq!(sink_of(&c).add_stream_calls, 1);
+    }
+
+    #[test]
+    fn add_stream_for_unknown_presentation_still_calls_sink_but_no_insert() {
+        let mut c = fresh_client();
+        // Skip create_presentation deliberately.
+        add_stream(&mut c, G1, 1);
+        assert_eq!(c.presentation_count(), 0);
+        // Sink was still called per the liberal-receiver policy.
+        assert_eq!(sink_of(&c).add_stream_calls, 1);
+    }
+
+    #[test]
+    fn add_stream_skips_insert_when_sink_refuses() {
+        let sink = Box::new(
+            MockTsmfMediaSink::new().fail_add_stream_with(TsmfError::OperationNotSupported),
+        );
+        let mut c = RdpevClient::new(sink);
+        c.start(CHAN_ID).unwrap();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 1);
+        let pres = c.presentations.get(&G1.0).unwrap();
+        assert!(pres.streams.is_empty());
+        // Presentation stays in Created (no successful ADD_STREAM yet).
+        assert_eq!(pres.state, PresentationState::Created);
+    }
+
+    #[test]
+    fn add_stream_enforces_max_streams_per_presentation_cap() {
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        for sid in 0..MAX_STREAMS_PER_PRESENTATION as u32 {
+            add_stream(&mut c, G1, sid);
+        }
+        // One more — must be rejected.
+        let req = AddStream {
+            message_id: 0,
+            presentation_id: G1,
+            stream_id: 999,
+            media_type: dummy_media_type(),
+        };
+        assert!(matches!(
+            c.process(CHAN_ID, &encode(&req)),
+            Err(DvcError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn set_topology_req_emits_rsp_with_ready_flag_and_transitions_to_ready() {
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 0);
+        let req = SetTopologyReq {
+            message_id: 17,
+            presentation_id: G1,
+        };
+        let mut out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        assert_eq!(out.len(), 1);
+        let rsp = SetTopologyRsp::decode(&mut ReadCursor::new(&out.remove(0).data)).unwrap();
+        assert_eq!(rsp.message_id, 17);
+        assert_eq!(rsp.topology_ready, 1);
+        assert_eq!(rsp.result, S_OK);
+        let pres = c.presentations.get(&G1.0).unwrap();
+        assert_eq!(pres.state, PresentationState::Ready);
+    }
+
+    #[test]
+    fn set_topology_req_returns_not_ready_when_sink_refuses() {
+        let sink = Box::new(MockTsmfMediaSink::new().with_topology_ready(false));
+        let mut c = RdpevClient::new(sink);
+        c.start(CHAN_ID).unwrap();
+        create_presentation(&mut c, G1);
+        let req = SetTopologyReq {
+            message_id: 0,
+            presentation_id: G1,
+        };
+        let mut out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        let rsp = SetTopologyRsp::decode(&mut ReadCursor::new(&out.remove(0).data)).unwrap();
+        assert_eq!(rsp.topology_ready, 0);
+        // State stays in Created (not promoted to Ready).
+        assert_eq!(
+            c.presentations.get(&G1.0).unwrap().state,
+            PresentationState::Created
+        );
+    }
+
+    // ── ON_SAMPLE → PLAYBACK_ACK hot path ──
+
+    fn dummy_sample(throttle: u64, p_data: Vec<u8>) -> crate::pdu::sample::TsMmDataSample {
+        crate::pdu::sample::TsMmDataSample {
+            sample_start_time: 100,
+            sample_end_time: 200,
+            throttle_duration: throttle,
+            sample_flags: 0,
+            sample_extensions: 0,
+            p_data,
+        }
+    }
+
+    #[test]
+    fn on_sample_emits_playback_ack_with_echoed_fields() {
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 1);
+
+        let req = OnSample {
+            message_id: 0,
+            presentation_id: G1,
+            stream_id: 1,
+            sample: dummy_sample(0xCAFE, alloc::vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00]),
+        };
+        let mut out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        assert_eq!(out.len(), 1);
+        let ack = PlaybackAck::decode(&mut ReadCursor::new(&out.remove(0).data)).unwrap();
+        assert_eq!(ack.stream_id, 1);
+        assert_eq!(ack.data_duration, 0xCAFE);
+        assert_eq!(ack.cb_data, 5);
+
+        // Stream state promoted to Streaming.
+        assert_eq!(
+            c.presentations.get(&G1.0).unwrap().streams[&1].state,
+            StreamState::Streaming
+        );
+        let s = sink_of(&c);
+        assert_eq!(s.on_sample_calls, 1);
+        let (gid, sid, payload) = s.last_sample.as_ref().unwrap();
+        assert_eq!(*gid, G1);
+        assert_eq!(*sid, 1);
+        assert_eq!(payload, &alloc::vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00]);
+    }
+
+    #[test]
+    fn on_sample_for_unknown_presentation_still_emits_ack() {
+        // 1:1 ack rule applies regardless of whether the client knew
+        // the stream. The host is responsible for absorbing samples
+        // it does not recognise.
+        let mut c = fresh_client();
+        let req = OnSample {
+            message_id: 0,
+            presentation_id: G1, // never created
+            stream_id: 1,
+            sample: dummy_sample(7, alloc::vec![]),
+        };
+        let mut out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        assert_eq!(out.len(), 1);
+        let ack = PlaybackAck::decode(&mut ReadCursor::new(&out.remove(0).data)).unwrap();
+        assert_eq!(ack.stream_id, 1);
+        assert_eq!(ack.data_duration, 7);
+        assert_eq!(ack.cb_data, 0);
+        // Sink still saw it.
+        assert_eq!(sink_of(&c).on_sample_calls, 1);
+    }
+
+    #[test]
+    fn playback_ack_message_ids_are_monotonic_across_samples() {
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 0);
+        let mut last_id = None;
+        for _ in 0..3 {
+            let req = OnSample {
+                message_id: 0,
+                presentation_id: G1,
+                stream_id: 0,
+                sample: dummy_sample(0, alloc::vec![]),
+            };
+            let mut out = c.process(CHAN_ID, &encode(&req)).unwrap();
+            let ack = PlaybackAck::decode(&mut ReadCursor::new(&out.remove(0).data)).unwrap();
+            if let Some(prev) = last_id {
+                assert!(ack.message_id > prev, "expected monotonic ids");
+            }
+            last_id = Some(ack.message_id);
+        }
+    }
+
+    // ── REMOVE_STREAM + SHUTDOWN_PRESENTATION_REQ ──
+
+    #[test]
+    fn remove_stream_drops_stream_and_calls_sink() {
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 0);
+        add_stream(&mut c, G1, 1);
+        let req = RemoveStream {
+            message_id: 0,
+            presentation_id: G1,
+            stream_id: 0,
+        };
+        let out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        assert!(out.is_empty());
+        let pres = c.presentations.get(&G1.0).unwrap();
+        assert!(!pres.streams.contains_key(&0));
+        assert!(pres.streams.contains_key(&1));
+        assert_eq!(sink_of(&c).remove_stream_calls, 1);
+    }
+
+    #[test]
+    fn shutdown_presentation_req_removes_presentation_and_emits_rsp() {
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 0);
+        let req = ShutdownPresentationReq {
+            message_id: 55,
+            presentation_id: G1,
+        };
+        let mut out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        assert_eq!(out.len(), 1);
+        let rsp = ShutdownPresentationRsp::decode(&mut ReadCursor::new(&out.remove(0).data))
+            .unwrap();
+        assert_eq!(rsp.message_id, 55);
+        assert_eq!(rsp.result, S_OK);
+        assert_eq!(c.presentation_count(), 0);
+        assert_eq!(sink_of(&c).shutdown_presentation_calls, 1);
+    }
+
+    #[test]
+    fn shutdown_presentation_returns_sink_error_as_hresult() {
+        let sink = Box::new(
+            MockTsmfMediaSink::new().fail_shutdown_with(TsmfError::OperationNotSupported),
+        );
+        let mut c = RdpevClient::new(sink);
+        c.start(CHAN_ID).unwrap();
+        create_presentation(&mut c, G1);
+        let req = ShutdownPresentationReq {
+            message_id: 0,
+            presentation_id: G1,
+        };
+        let mut out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        let rsp = ShutdownPresentationRsp::decode(&mut ReadCursor::new(&out.remove(0).data))
+            .unwrap();
+        // E_NOTIMPL = 0x80004001
+        assert_eq!(rsp.result, 0x8000_4001);
+        // The presentation is removed even on sink failure.
+        assert_eq!(c.presentation_count(), 0);
+    }
+
+    // ── Playback control fire-and-forget ──
+
+    #[test]
+    fn control_pdus_dispatch_to_correct_sink_methods() {
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 0);
+
+        // OnFlush
+        c.process(
+            CHAN_ID,
+            &encode(&OnFlush {
+                message_id: 0,
+                presentation_id: G1,
+                stream_id: 0,
+            }),
+        )
+        .unwrap();
+        // OnEndOfStream
+        c.process(
+            CHAN_ID,
+            &encode(&OnEndOfStream {
+                message_id: 0,
+                presentation_id: G1,
+                stream_id: 0,
+            }),
+        )
+        .unwrap();
+        // OnPlaybackStarted
+        c.process(
+            CHAN_ID,
+            &encode(&OnPlaybackStarted {
+                message_id: 0,
+                presentation_id: G1,
+                playback_start_offset: 10_000,
+                is_seek: 1,
+            }),
+        )
+        .unwrap();
+        // OnPlaybackPaused / Stopped / Restarted
+        c.process(
+            CHAN_ID,
+            &encode(&OnPlaybackPaused {
+                message_id: 0,
+                presentation_id: G1,
+            }),
+        )
+        .unwrap();
+        c.process(
+            CHAN_ID,
+            &encode(&OnPlaybackStopped {
+                message_id: 0,
+                presentation_id: G1,
+            }),
+        )
+        .unwrap();
+        c.process(
+            CHAN_ID,
+            &encode(&OnPlaybackRestarted {
+                message_id: 0,
+                presentation_id: G1,
+            }),
+        )
+        .unwrap();
+        c.process(
+            CHAN_ID,
+            &encode(&OnPlaybackRateChanged {
+                message_id: 0,
+                presentation_id: G1,
+                new_rate: 1.5,
+            }),
+        )
+        .unwrap();
+        // NotifyPreroll — decoded but not routed to sink.
+        c.process(
+            CHAN_ID,
+            &encode(&NotifyPreroll {
+                message_id: 0,
+                presentation_id: G1,
+                stream_id: 0,
+            }),
+        )
+        .unwrap();
+
+        let s = sink_of(&c);
+        assert_eq!(s.on_flush_calls, 1);
+        assert_eq!(s.on_end_of_stream_calls, 1);
+        assert_eq!(s.on_playback_started_calls, 1);
+        assert_eq!(s.on_playback_paused_calls, 1);
+        assert_eq!(s.on_playback_stopped_calls, 1);
+        assert_eq!(s.on_playback_restarted_calls, 1);
+        assert_eq!(s.on_playback_rate_changed_calls, 1);
+    }
+
+    #[test]
+    fn volume_geometry_window_allocator_dispatch() {
+        use crate::pdu::geometry::{GeometryInfo, TsRect};
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 0);
+
+        c.process(
+            CHAN_ID,
+            &encode(&OnStreamVolume {
+                message_id: 0,
+                presentation_id: G1,
+                new_volume: 100,
+                b_muted: 0,
+            }),
+        )
+        .unwrap();
+        c.process(
+            CHAN_ID,
+            &encode(&OnChannelVolume {
+                message_id: 0,
+                presentation_id: G1,
+                channel_volume: 50,
+                changed_channel: 1,
+            }),
+        )
+        .unwrap();
+        c.process(
+            CHAN_ID,
+            &encode(&SetVideoWindow {
+                message_id: 0,
+                presentation_id: G1,
+                video_window_id: 0xAA,
+                hwnd_parent: 0xBB,
+            }),
+        )
+        .unwrap();
+        c.process(
+            CHAN_ID,
+            &encode(&UpdateGeometryInfo {
+                message_id: 0,
+                presentation_id: G1,
+                geometry: GeometryInfo {
+                    video_window_id: 0,
+                    video_window_state: 0,
+                    width: 1920,
+                    height: 1080,
+                    left: 0,
+                    top: 0,
+                    reserved: 0,
+                    client_left: 0,
+                    client_top: 0,
+                    padding: None,
+                },
+                visible_rects: alloc::vec![TsRect {
+                    top: 0,
+                    left: 0,
+                    bottom: 1080,
+                    right: 1920,
+                }],
+            }),
+        )
+        .unwrap();
+        c.process(
+            CHAN_ID,
+            &encode(&SetSourceVideoRect {
+                message_id: 0,
+                presentation_id: G1,
+                left: 0.0,
+                top: 0.0,
+                right: 1.0,
+                bottom: 1.0,
+            }),
+        )
+        .unwrap();
+        c.process(
+            CHAN_ID,
+            &encode(&SetAllocator {
+                message_id: 0,
+                presentation_id: G1,
+                stream_id: 0,
+                c_buffers: 4,
+                cb_buffer: 4096,
+                cb_align: 16,
+                cb_prefix: 0,
+            }),
+        )
+        .unwrap();
+
+        let s = sink_of(&c);
+        assert_eq!(s.on_stream_volume_calls, 1);
+        assert_eq!(s.on_channel_volume_calls, 1);
+        assert_eq!(s.set_video_window_calls, 1);
+        assert_eq!(s.update_geometry_calls, 1);
+        assert_eq!(s.set_source_video_rect_calls, 1);
+        assert_eq!(s.set_allocator_calls, 1);
+    }
+
+    // ── Outbound ClientEventNotification helper ──
+
+    #[test]
+    fn client_event_helper_emits_valid_notification() {
+        let mut c = fresh_client();
+        let msg = c
+            .client_event(7, 0xCAFE, alloc::vec![0xDE, 0xAD])
+            .unwrap();
+        let decoded =
+            ClientEventNotification::decode(&mut ReadCursor::new(&msg.data)).unwrap();
+        assert_eq!(decoded.stream_id, 7);
+        assert_eq!(decoded.event_id, 0xCAFE);
+        assert_eq!(decoded.p_blob, alloc::vec![0xDE, 0xAD]);
+    }
+
+    // ── Full happy-path end-to-end ──
+
+    #[test]
+    fn full_presentation_lifecycle_round_trip() {
+        let mut c = fresh_client();
+        // 1. Bind
+        c.process(
+            CHAN_ID,
+            &encode(&SetChannelParams {
+                message_id: 0,
+                presentation_id: G1,
+                stream_id: 0,
+            }),
+        )
+        .unwrap();
+        // 2. Capabilities
+        let caps_out = c
+            .process(
+                CHAN_ID,
+                &encode(&ExchangeCapabilitiesReq::new(
+                    0,
+                    alloc::vec![TsmmCapabilities::u32_payload(capability_type::VERSION, 2)],
+                )),
+            )
+            .unwrap();
+        assert_eq!(caps_out.len(), 1);
+        // 3. ON_NEW_PRESENTATION
+        create_presentation(&mut c, G1);
+        // 4. CHECK_FORMAT_SUPPORT
+        let fmt_out = c
+            .process(
+                CHAN_ID,
+                &encode(&CheckFormatSupportReq {
+                    message_id: 0,
+                    platform_cookie: platform_cookie::MF,
+                    no_rollover_flags: 0,
+                    media_type: dummy_media_type(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(fmt_out.len(), 1);
+        // 5. ADD_STREAM
+        add_stream(&mut c, G1, 0);
+        // 6. SET_TOPOLOGY
+        let topo_out = c
+            .process(
+                CHAN_ID,
+                &encode(&SetTopologyReq {
+                    message_id: 0,
+                    presentation_id: G1,
+                }),
+            )
+            .unwrap();
+        assert_eq!(topo_out.len(), 1);
+        assert_eq!(
+            c.presentations.get(&G1.0).unwrap().state,
+            PresentationState::Ready
+        );
+        // 7. ON_SAMPLE → PLAYBACK_ACK
+        let sample_out = c
+            .process(
+                CHAN_ID,
+                &encode(&OnSample {
+                    message_id: 0,
+                    presentation_id: G1,
+                    stream_id: 0,
+                    sample: dummy_sample(42, alloc::vec![1, 2, 3]),
+                }),
+            )
+            .unwrap();
+        assert_eq!(sample_out.len(), 1);
+        // 8. SHUTDOWN
+        c.process(
+            CHAN_ID,
+            &encode(&ShutdownPresentationReq {
+                message_id: 0,
+                presentation_id: G1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(c.presentation_count(), 0);
+
+        let s = sink_of(&c);
+        assert_eq!(s.exchange_capabilities_calls, 1);
+        assert_eq!(s.on_new_presentation_calls, 1);
+        assert_eq!(s.check_format_support_calls, 1);
+        assert_eq!(s.add_stream_calls, 1);
+        assert_eq!(s.set_topology_calls, 1);
+        assert_eq!(s.on_sample_calls, 1);
+        assert_eq!(s.shutdown_presentation_calls, 1);
     }
 
     // ── Dispatch ──
