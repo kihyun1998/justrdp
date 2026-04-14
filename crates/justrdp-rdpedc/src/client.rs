@@ -30,6 +30,7 @@
 //! down the session.
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use justrdp_core::ReadCursor;
 
@@ -298,9 +299,25 @@ impl RdpedcClient {
                 CompositionMode::On { dwm_desk: false }
             }
             (_, EventType::CompositionOff) => {
-                // Leaving composition mode: drop all surface state.
-                self.logical_surfaces.clear();
-                self.redir_surfaces.clear();
+                // Leaving composition mode: drop all surface state
+                // and fire the matching destroy/disassoc callbacks.
+                // Going through the destroy_*_internal helpers honours
+                // the balanced-callback contract documented on
+                // CompDeskCallback (every associated → matched by
+                // exactly one disassociated, every created matched by
+                // destroyed). A prior bulk `BTreeMap::clear()` would
+                // have left hosts that reference-count proxies with
+                // leaked references on every mode cycle.
+                let lsurface_ids: Vec<u64> =
+                    self.logical_surfaces.keys().copied().collect();
+                for id in lsurface_ids {
+                    self.destroy_logical_surface_internal(id, cb);
+                }
+                let cache_ids: Vec<u32> =
+                    self.redir_surfaces.keys().copied().collect();
+                for id in cache_ids {
+                    self.destroy_redir_surface_internal(id, cb);
+                }
                 self.current_draw_target = None;
                 CompositionMode::Off
             }
@@ -353,7 +370,7 @@ impl RdpedcClient {
         // need to clear. We can't mutate the map and fire callbacks in
         // the same loop without running into the `&mut self` /
         // `&mut C` borrow conflict, and a collection avoids it.
-        let mut detached: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        let mut detached: Vec<u32> = Vec::new();
         for (&cache_id, entry) in self.redir_surfaces.iter_mut() {
             if entry.assoc_lsurface == Some(h_lsurface) {
                 entry.assoc_lsurface = None;
@@ -388,18 +405,10 @@ impl RdpedcClient {
         cb: &mut C,
     ) -> Result<(), RdpedcError> {
         if pdu.create {
-            // Create-over-existing: run the full destroy path first so
-            // the stale entry is cleanly torn down (destroy callback
-            // fires, redir assoc_lsurface references are cleared)
-            // before the fresh entry replaces it. Without this step a
-            // malicious or buggy server could cycle the same
-            // `h_lsurface` and suppress destroy notifications
-            // indefinitely while accumulating stale redir associations.
-            //
-            // The cap check is intentionally skipped on the replace
-            // path: `destroy` drops the old entry, so the table goes
-            // N → N-1 → N across the two operations and the cap
-            // invariant (`len <= MAX_LOGICAL_SURFACES`) still holds.
+            // Create-over-existing: tear down first. See
+            // `destroy_logical_surface_internal` for rationale. Cap
+            // check skipped on the replace branch because the net
+            // size delta is zero.
             if self.logical_surfaces.contains_key(&pdu.h_lsurface) {
                 self.destroy_logical_surface_internal(pdu.h_lsurface, cb);
             } else if self.logical_surfaces.len() >= MAX_LOGICAL_SURFACES {
@@ -424,9 +433,9 @@ impl RdpedcClient {
         cb: &mut C,
     ) -> Result<(), RdpedcError> {
         if pdu.create {
-            // Create-over-existing: same tear-down-first semantics as
-            // the logical-surface path. Cap check skipped on replace
-            // for the same reason — net size delta is zero.
+            // Create-over-existing: tear down first. See
+            // `destroy_redir_surface_internal`. Cap check skipped on
+            // replace (zero net size delta).
             if self.redir_surfaces.contains_key(&pdu.cache_id) {
                 self.destroy_redir_surface_internal(pdu.cache_id, cb);
             } else if self.redir_surfaces.len() >= MAX_REDIR_SURFACES {
@@ -728,10 +737,46 @@ mod tests {
         );
         assert_eq!(c.logical_len(), 1);
         assert_eq!(c.redir_len(), 1);
+        cb.events.clear();
         apply(&mut c, toggle(EventType::CompositionOff), &mut cb);
         assert_eq!(c.logical_len(), 0);
         assert_eq!(c.redir_len(), 0);
         assert_eq!(c.current_draw_target(), None);
+        // Security M1 regression: CompositionOff MUST fire the full
+        // balanced teardown sequence, not silently drop the maps.
+        assert_eq!(
+            cb.events,
+            vec![
+                Event::LDestroyed(1),
+                Event::RDestroyed(1),
+                Event::Mode(CompositionMode::Off),
+            ]
+        );
+    }
+
+    #[test]
+    fn composition_off_fires_disassoc_before_destroy() {
+        // Security M1 regression: when CompositionOff arrives while a
+        // redirection surface is still associated to a logical
+        // surface, the disassoc callback MUST fire first, then the
+        // logical destroy, then the redir destroy, then the mode
+        // change. Any other order leaks references in a host that
+        // ref-counts proxies via callback pairs.
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        apply(&mut c, toggle(EventType::CompositionOn), &mut cb);
+        setup_associated_pair(&mut c, &mut cb);
+        cb.events.clear();
+        apply(&mut c, toggle(EventType::CompositionOff), &mut cb);
+        assert_eq!(
+            cb.events,
+            vec![
+                Event::Disassoc(2),
+                Event::LDestroyed(1),
+                Event::RDestroyed(2),
+                Event::Mode(CompositionMode::Off),
+            ]
+        );
     }
 
     // ── Logical surface table ────────────────────────────────────────
