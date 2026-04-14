@@ -4,4 +4,5 @@
 //! presentation, format, stream, sample, control, etc.). Step 2A only
 //! ships the header; the rest land in subsequent steps.
 
+pub mod capabilities;
 pub mod header;

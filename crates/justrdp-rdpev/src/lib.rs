@@ -66,3 +66,9 @@ pub use constants::{
 
 #[cfg(feature = "alloc")]
 pub use pdu::header::{decode_request_header, decode_response_header, SharedMsgHeader};
+
+#[cfg(feature = "alloc")]
+pub use pdu::capabilities::{
+    ExchangeCapabilitiesReq, ExchangeCapabilitiesRsp, TsmmCapabilities, MAX_CAPABILITIES,
+    MAX_CAPABILITY_DATA_BYTES,
+};
