@@ -89,4 +89,9 @@ pub use pdu::presentation::{
 };
 
 #[cfg(feature = "alloc")]
+pub use pdu::sample::{
+    OnSample, PlaybackAck, TsMmDataSample, MAX_SAMPLE_BYTES, TS_MM_DATA_SAMPLE_FIXED_SIZE,
+};
+
+#[cfg(feature = "alloc")]
 pub use pdu::stream::{AddStream, RemoveStream};
