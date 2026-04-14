@@ -13,7 +13,7 @@ use justrdp_core::{
     Decode, DecodeError, DecodeResult, Encode, EncodeError, EncodeResult, ReadCursor, WriteCursor,
 };
 
-use crate::constants::{operation as op, ALT_SEC_HEADER_BYTE};
+use crate::constants::{operation as op, ALT_SEC_HEADER_BYTE, CACHE_ID_DESTROY_BIT};
 
 /// Wire size of the common 4-byte header that prefixes every MS-RDPEDC PDU.
 pub const COMMON_HEADER_SIZE: usize = 4;
@@ -58,6 +58,16 @@ fn expect_body_size(
 ) -> DecodeResult<()> {
     if got != expected {
         return Err(DecodeError::invalid_value(ctx, "size"));
+    }
+    Ok(())
+}
+
+/// Reject any `cache_id` with bit 31 set. Centralised because three
+/// PDUs (`SurfObj`, `SwitchSurfObj`, `FlushComposeOnce`) share the
+/// same invariant.
+fn check_cache_id_no_bit31(cache_id: u32, ctx: &'static str) -> EncodeResult<()> {
+    if cache_id & CACHE_ID_DESTROY_BIT != 0 {
+        return Err(EncodeError::invalid_value(ctx, "cache_id bit 31"));
     }
     Ok(())
 }
@@ -274,14 +284,12 @@ impl Encode for SurfObjCreateDestroy {
         Self::WIRE_SIZE
     }
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        if self.cache_id & crate::constants::CACHE_ID_DESTROY_BIT != 0 {
-            return Err(EncodeError::invalid_value(self.name(), "cache_id bit 31"));
-        }
+        check_cache_id_no_bit31(self.cache_id, self.name())?;
         write_common_header(dst, op::SURFOBJ_CREATE_DESTROY, Self::BODY_SIZE, self.name())?;
         let wire_id = if self.create {
             self.cache_id
         } else {
-            self.cache_id | crate::constants::CACHE_ID_DESTROY_BIT
+            self.cache_id | CACHE_ID_DESTROY_BIT
         };
         dst.write_u32_le(wire_id, self.name())?;
         dst.write_u8(self.surface_bpp, self.name())?;
@@ -450,9 +458,7 @@ impl Encode for SwitchSurfObj {
         Self::WIRE_SIZE
     }
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        if self.cache_id & crate::constants::CACHE_ID_DESTROY_BIT != 0 {
-            return Err(EncodeError::invalid_value(self.name(), "cache_id bit 31"));
-        }
+        check_cache_id_no_bit31(self.cache_id, self.name())?;
         write_common_header(dst, op::SURFOBJSWITCH, Self::BODY_SIZE, self.name())?;
         dst.write_u32_le(self.cache_id, self.name())?;
         Ok(())
@@ -501,9 +507,7 @@ impl Encode for FlushComposeOnce {
         Self::WIRE_SIZE
     }
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        if self.cache_id & crate::constants::CACHE_ID_DESTROY_BIT != 0 {
-            return Err(EncodeError::invalid_value(self.name(), "cache_id bit 31"));
-        }
+        check_cache_id_no_bit31(self.cache_id, self.name())?;
         write_common_header(dst, op::FLUSHCOMPOSEONCE, Self::BODY_SIZE, self.name())?;
         dst.write_u32_le(self.cache_id, self.name())?;
         dst.write_u64_le(self.h_lsurface, self.name())?;
@@ -544,13 +548,13 @@ pub enum CompDeskPdu {
 }
 
 /// Peek the 2-byte `header + operation` prefix of an MS-RDPEDC order
-/// and dispatch to the matching PDU decoder. Does NOT consume bytes
-/// beyond the single decoded PDU.
+/// and dispatch to the matching PDU decoder. On success, advances
+/// `src` by exactly the wire size of the decoded PDU.
 ///
 /// Returns `Err` if the header byte is wrong or the operation code
 /// is unknown. Forward-compatibility with future op codes is NOT
-/// handled here — the processor layer (Step 2) is responsible for
-/// skipping unknown orders using `size + 4` bytes.
+/// handled here — [`crate::client::RdpedcClient::process_order`] is
+/// responsible for skipping unknown orders using `size + 4` bytes.
 pub fn decode_any<'de>(src: &mut ReadCursor<'de>) -> DecodeResult<CompDeskPdu> {
     const CTX: &str = "MS-RDPEDC::decode_any";
     // Peek the operation byte without consuming. We know we need at

@@ -3,6 +3,16 @@
 //! Values come directly from the spec; the source section is noted
 //! next to each constant.
 
+// The `process_order` forward-compat skip reads a u16 body_size and
+// adds it to COMMON_HEADER_SIZE = 4. On any target where `usize` is at
+// least 2 bytes wide the sum (max 65539) cannot overflow. All supported
+// Rust targets have 32-bit or 64-bit `usize`, so this is a belt-and-
+// braces guard for any hypothetical exotic target.
+const _: () = assert!(
+    core::mem::size_of::<usize>() >= 4,
+    "justrdp-rdpedc requires a target with usize >= 32 bits"
+);
+
 // ── Desktop Composition Capability Set (MS-RDPBCGR §2.2.7.2.8) ───────
 
 /// `CompDeskSupportLevel` value meaning composition services are not
@@ -53,17 +63,9 @@ pub mod operation {
     pub const FLUSHCOMPOSEONCE: u8 = 0x07;
 }
 
-// ── TS_COMPDESK_TOGGLE eventType values (§2.2.1.1) ───────────────────
-
-pub mod event_type {
-    //! Values for `TS_COMPDESK_TOGGLE.eventType`.
-    pub const REDIRMODE_COMPOSITION_OFF: u8 = 0x00;
-    pub const REDIRMODE_RESERVED_00: u8 = 0x01;
-    pub const REDIRMODE_RESERVED_01: u8 = 0x02;
-    pub const REDIRMODE_COMPOSITION_ON: u8 = 0x03;
-    pub const REDIRMODE_DWM_DESK_ENTER: u8 = 0x04;
-    pub const REDIRMODE_DWM_DESK_LEAVE: u8 = 0x05;
-}
+// The eventType values from MS-RDPEDC §2.2.1.1 are encoded directly
+// as variants of [`crate::pdu::EventType`]; a parallel `const` module
+// would be dead code since the typed enum is the canonical API.
 
 // ── TS_COMPDESK_LSURFACE.flags bit values (§2.2.2.1) ─────────────────
 

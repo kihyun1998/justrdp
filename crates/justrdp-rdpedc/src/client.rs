@@ -51,8 +51,18 @@ pub const MAX_REDIR_SURFACES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RdpedcError {
-    /// The byte stream could not be parsed as a valid MS-RDPEDC order.
-    Decode,
+    /// The buffer ended before a full PDU could be read. Typically a
+    /// framing issue in the outer caller (e.g. the Update PDU was
+    /// fragmented) rather than a server protocol violation.
+    UnexpectedEof,
+    /// The first byte of the order was not [`ALT_SEC_HEADER_BYTE`]
+    /// (`0x32`); the caller passed a non-MS-RDPEDC order.
+    InvalidHeader,
+    /// A known-op PDU body failed to decode — wrong size, invalid
+    /// field, or reserved value. Contains the operation code of the
+    /// offending PDU so post-mortem diagnostics can attribute the
+    /// failure to a specific message type.
+    DecodeBody { operation: u8 },
     /// A surface table would exceed its per-client cap.
     TooManySurfaces,
 }
@@ -99,12 +109,40 @@ pub struct RedirSurface {
 /// Host-side hook for drawing-layer side effects.
 ///
 /// Every method has a default no-op implementation so hosts can opt
-/// into only the events they care about. The client invokes these
-/// callbacks **after** its own state has been updated, so it's safe
-/// for a callback to query the client back via its getters.
+/// into only the events they care about.
+///
+/// ## Invocation contract
+///
+/// - Callbacks fire **after** the client's internal state has been
+///   updated, so a callback may query the client back via its getters
+///   (`mode`, `logical_surface`, `redir_surface`, ...) and see the
+///   post-event state.
+/// - All surface-naming callbacks only fire when the surface is known
+///   to the client — either just created, or already in the table.
+///   A PDU that names an unknown surface is silently dropped and does
+///   not reach the callback layer. This means callback implementations
+///   can assume every id they receive was valid at the moment of the
+///   call.
+/// - Ordering for create-over-existing: if a server sends
+///   `LSURFACE create` or `SURFOBJ create` for a key that is already
+///   in the table, the existing entry is first destroyed (its
+///   destroy callback fires, redirection-surface `assoc_lsurface`
+///   references are cleared) and then the fresh entry is inserted
+///   (its create callback fires). Callback consumers therefore never
+///   observe a silent replacement.
 pub trait CompDeskCallback {
     fn on_mode_changed(&mut self, _mode: CompositionMode) {}
     fn on_logical_surface_created(&mut self, _h_lsurface: u64, _entry: &LogicalSurface) {}
+    /// Called after a logical surface has been removed from the table.
+    ///
+    /// **Important**: the destroyed entry may have had
+    /// `compref_pending = true` at the time of destruction. Per
+    /// MS-RDPEDC §3.2.5.2.4, the host drawing layer MUST NOT release
+    /// its proxy for the surface until the compositor releases its
+    /// own reference. A host callback that unconditionally releases
+    /// resources on destroy will violate that rule. The host MUST
+    /// track `compref_pending` separately if it cares about proxy
+    /// lifetime — this callback fires regardless.
     fn on_logical_surface_destroyed(&mut self, _h_lsurface: u64) {}
     fn on_redir_surface_created(&mut self, _cache_id: u32, _entry: &RedirSurface) {}
     fn on_redir_surface_destroyed(&mut self, _cache_id: u32) {}
@@ -112,9 +150,11 @@ pub trait CompDeskCallback {
     fn on_redir_surface_disassociated(&mut self, _cache_id: u32) {}
     fn on_compref_pending(&mut self, _h_lsurface: u64) {}
     /// Drawing is being retargeted at `cache_id` until the next
-    /// `SWITCH_SURFOBJ` or `FLUSH_COMPOSEONCE`.
+    /// `SWITCH_SURFOBJ` or `FLUSH_COMPOSEONCE`. Only fires when
+    /// `cache_id` names a live redirection surface.
     fn on_switch_draw_target(&mut self, _cache_id: u32) {}
     /// A compose-once draw cycle for `cache_id` / `h_lsurface` is done.
+    /// Only fires when `cache_id` names a live redirection surface.
     fn on_flush_compose_once(&mut self, _cache_id: u32, _h_lsurface: u64) {}
 }
 
@@ -130,8 +170,8 @@ impl CompDeskCallback for NullCallback {}
 #[derive(Debug)]
 pub struct RdpedcClient {
     mode: CompositionMode,
-    logical: BTreeMap<u64, LogicalSurface>,
-    redir: BTreeMap<u32, RedirSurface>,
+    logical_surfaces: BTreeMap<u64, LogicalSurface>,
+    redir_surfaces: BTreeMap<u32, RedirSurface>,
     /// `cache_id` most recently handed to a `SWITCH_SURFOBJ`, or
     /// `None` if no retargeting is active.
     current_draw_target: Option<u32>,
@@ -147,8 +187,8 @@ impl RdpedcClient {
     pub fn new() -> Self {
         Self {
             mode: CompositionMode::Off,
-            logical: BTreeMap::new(),
-            redir: BTreeMap::new(),
+            logical_surfaces: BTreeMap::new(),
+            redir_surfaces: BTreeMap::new(),
             current_draw_target: None,
         }
     }
@@ -158,11 +198,11 @@ impl RdpedcClient {
     }
 
     pub fn logical_surface(&self, h_lsurface: u64) -> Option<&LogicalSurface> {
-        self.logical.get(&h_lsurface)
+        self.logical_surfaces.get(&h_lsurface)
     }
 
     pub fn redir_surface(&self, cache_id: u32) -> Option<&RedirSurface> {
-        self.redir.get(&cache_id)
+        self.redir_surfaces.get(&cache_id)
     }
 
     pub fn current_draw_target(&self) -> Option<u32> {
@@ -170,11 +210,11 @@ impl RdpedcClient {
     }
 
     pub fn logical_len(&self) -> usize {
-        self.logical.len()
+        self.logical_surfaces.len()
     }
 
     pub fn redir_len(&self) -> usize {
-        self.redir.len()
+        self.redir_surfaces.len()
     }
 
     /// Parse and apply a single MS-RDPEDC order from `bytes`.
@@ -195,23 +235,24 @@ impl RdpedcClient {
         cb: &mut C,
     ) -> Result<usize, RdpedcError> {
         if bytes.len() < COMMON_HEADER_SIZE {
-            return Err(RdpedcError::Decode);
+            return Err(RdpedcError::UnexpectedEof);
         }
         if bytes[0] != ALT_SEC_HEADER_BYTE {
-            return Err(RdpedcError::Decode);
+            return Err(RdpedcError::InvalidHeader);
         }
         let operation = bytes[1];
         let body_size = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
         let total = COMMON_HEADER_SIZE + body_size;
         if bytes.len() < total {
-            return Err(RdpedcError::Decode);
+            return Err(RdpedcError::UnexpectedEof);
         }
         // Skip unknown op codes per checklist §12 forward-compat rule.
         if !(0x01..=0x07).contains(&operation) {
             return Ok(total);
         }
         let mut cur = ReadCursor::new(&bytes[..total]);
-        let pdu = decode_any(&mut cur).map_err(|_| RdpedcError::Decode)?;
+        let pdu =
+            decode_any(&mut cur).map_err(|_| RdpedcError::DecodeBody { operation })?;
         self.apply(pdu, cb)?;
         Ok(total)
     }
@@ -252,8 +293,8 @@ impl RdpedcClient {
             }
             (_, EventType::CompositionOff) => {
                 // Leaving composition mode: drop all surface state.
-                self.logical.clear();
-                self.redir.clear();
+                self.logical_surfaces.clear();
+                self.redir_surfaces.clear();
                 self.current_draw_target = None;
                 CompositionMode::Off
             }
@@ -275,15 +316,61 @@ impl RdpedcClient {
         Ok(())
     }
 
+    /// Remove a logical surface, detach any redirection surfaces that
+    /// referenced it, and fire the destroy callback. Factored out so
+    /// the "create over existing" branch in [`Self::apply_lsurface`]
+    /// can reuse the exact same cleanup as an explicit destroy —
+    /// otherwise a server sending two creates with the same
+    /// `h_lsurface` would silently drop the old entry without firing
+    /// `on_logical_surface_destroyed` and without detaching dangling
+    /// `assoc_lsurface` references on redirection surfaces.
+    fn destroy_logical_surface_internal<C: CompDeskCallback>(
+        &mut self,
+        h_lsurface: u64,
+        cb: &mut C,
+    ) {
+        if self.logical_surfaces.remove(&h_lsurface).is_some() {
+            for entry in self.redir_surfaces.values_mut() {
+                if entry.assoc_lsurface == Some(h_lsurface) {
+                    entry.assoc_lsurface = None;
+                }
+            }
+            cb.on_logical_surface_destroyed(h_lsurface);
+        }
+    }
+
+    /// Remove a redirection surface, clear it from `current_draw_target`
+    /// if active, and fire the destroy callback. See
+    /// [`Self::destroy_logical_surface_internal`] for rationale.
+    fn destroy_redir_surface_internal<C: CompDeskCallback>(
+        &mut self,
+        cache_id: u32,
+        cb: &mut C,
+    ) {
+        if self.redir_surfaces.remove(&cache_id).is_some() {
+            if self.current_draw_target == Some(cache_id) {
+                self.current_draw_target = None;
+            }
+            cb.on_redir_surface_destroyed(cache_id);
+        }
+    }
+
     fn apply_lsurface<C: CompDeskCallback>(
         &mut self,
         pdu: LSurfaceCreateDestroy,
         cb: &mut C,
     ) -> Result<(), RdpedcError> {
         if pdu.create {
-            if self.logical.len() >= MAX_LOGICAL_SURFACES
-                && !self.logical.contains_key(&pdu.h_lsurface)
-            {
+            // Create-over-existing: run the full destroy path first so
+            // the stale entry is cleanly torn down (destroy callback
+            // fires, redir assoc_lsurface references are cleared)
+            // before the fresh entry replaces it. Without this step a
+            // malicious or buggy server could cycle the same
+            // `h_lsurface` and suppress destroy notifications
+            // indefinitely while accumulating stale redir associations.
+            if self.logical_surfaces.contains_key(&pdu.h_lsurface) {
+                self.destroy_logical_surface_internal(pdu.h_lsurface, cb);
+            } else if self.logical_surfaces.len() >= MAX_LOGICAL_SURFACES {
                 return Err(RdpedcError::TooManySurfaces);
             }
             let entry = LogicalSurface {
@@ -291,18 +378,10 @@ impl RdpedcClient {
                 hwnd: pdu.hwnd,
                 compref_pending: false,
             };
-            self.logical.insert(pdu.h_lsurface, entry);
+            self.logical_surfaces.insert(pdu.h_lsurface, entry);
             cb.on_logical_surface_created(pdu.h_lsurface, &entry);
-        } else if self.logical.remove(&pdu.h_lsurface).is_some() {
-            // Also detach any redirection surfaces that were pointing
-            // at this logical surface, so the redir table never carries
-            // dangling references.
-            for entry in self.redir.values_mut() {
-                if entry.assoc_lsurface == Some(pdu.h_lsurface) {
-                    entry.assoc_lsurface = None;
-                }
-            }
-            cb.on_logical_surface_destroyed(pdu.h_lsurface);
+        } else {
+            self.destroy_logical_surface_internal(pdu.h_lsurface, cb);
         }
         Ok(())
     }
@@ -313,7 +392,11 @@ impl RdpedcClient {
         cb: &mut C,
     ) -> Result<(), RdpedcError> {
         if pdu.create {
-            if self.redir.len() >= MAX_REDIR_SURFACES && !self.redir.contains_key(&pdu.cache_id) {
+            // Create-over-existing: same tear-down-first semantics as
+            // the logical-surface path.
+            if self.redir_surfaces.contains_key(&pdu.cache_id) {
+                self.destroy_redir_surface_internal(pdu.cache_id, cb);
+            } else if self.redir_surfaces.len() >= MAX_REDIR_SURFACES {
                 return Err(RdpedcError::TooManySurfaces);
             }
             let entry = RedirSurface {
@@ -323,13 +406,10 @@ impl RdpedcClient {
                 cy: pdu.cy,
                 assoc_lsurface: None,
             };
-            self.redir.insert(pdu.cache_id, entry);
+            self.redir_surfaces.insert(pdu.cache_id, entry);
             cb.on_redir_surface_created(pdu.cache_id, &entry);
-        } else if self.redir.remove(&pdu.cache_id).is_some() {
-            if self.current_draw_target == Some(pdu.cache_id) {
-                self.current_draw_target = None;
-            }
-            cb.on_redir_surface_destroyed(pdu.cache_id);
+        } else {
+            self.destroy_redir_surface_internal(pdu.cache_id, cb);
         }
         Ok(())
     }
@@ -344,12 +424,12 @@ impl RdpedcClient {
         // whose `h_surf` matches. Unknown surfaces are silently ignored
         // per the checklist.
         let mut matched: Option<u32> = None;
-        for (&cache_id, entry) in self.redir.iter_mut() {
+        for (&cache_id, entry) in self.redir_surfaces.iter_mut() {
             if entry.h_surf == pdu.h_surf {
                 if pdu.associate {
                     // Only honor the association when the target
                     // logical surface exists; otherwise ignore.
-                    if self.logical.contains_key(&pdu.h_lsurface) {
+                    if self.logical_surfaces.contains_key(&pdu.h_lsurface) {
                         entry.assoc_lsurface = Some(pdu.h_lsurface);
                         matched = Some(cache_id);
                     }
@@ -375,7 +455,7 @@ impl RdpedcClient {
         pdu: LSurfaceCompRefPending,
         cb: &mut C,
     ) -> Result<(), RdpedcError> {
-        if let Some(entry) = self.logical.get_mut(&pdu.h_lsurface) {
+        if let Some(entry) = self.logical_surfaces.get_mut(&pdu.h_lsurface) {
             entry.compref_pending = true;
             cb.on_compref_pending(pdu.h_lsurface);
         }
@@ -389,7 +469,7 @@ impl RdpedcClient {
     ) -> Result<(), RdpedcError> {
         // `SwitchSurfObj::decode` already rejects bit 31, so the id
         // is always a clean 31-bit value here.
-        if self.redir.contains_key(&pdu.cache_id) {
+        if self.redir_surfaces.contains_key(&pdu.cache_id) {
             self.current_draw_target = Some(pdu.cache_id);
             cb.on_switch_draw_target(pdu.cache_id);
         }
@@ -403,6 +483,20 @@ impl RdpedcClient {
         pdu: FlushComposeOnce,
         cb: &mut C,
     ) -> Result<(), RdpedcError> {
+        // Only act on known redirection surfaces. A server sending a
+        // FLUSH for a phantom `cache_id` would otherwise hand
+        // attacker-controlled ids to the host callback — mirror the
+        // guard in `apply_switch` so the callback contract is uniform.
+        //
+        // Note: the spec (§3.2.5.3.2) says FLUSH_COMPOSEONCE SHOULD
+        // only arrive for logical surfaces with the
+        // `TS_COMPDESK_HLSURF_COMPOSEONCE` flag set. We intentionally
+        // do NOT validate that flag here — the spec itself only says
+        // SHOULD and gives no enforcement requirement, and the host
+        // callback may still want to see the event for telemetry.
+        if !self.redir_surfaces.contains_key(&pdu.cache_id) {
+            return Ok(());
+        }
         // `flush` ends the currently active draw target; the next
         // drawing batch needs its own SWITCH to retarget.
         if self.current_draw_target == Some(pdu.cache_id) {
@@ -415,12 +509,9 @@ impl RdpedcClient {
 
 // ── Order stream walker ──────────────────────────────────────────────
 
-/// Iterator-style helper: parse the next MS-RDPEDC order from a byte
-/// slice that may contain a mix of alternate-secondary orders, and
-/// return `(consumed_bytes, result)`. Returns `None` if the slice is
-/// empty or doesn't start with an MS-RDPEDC header byte (so the caller
-/// can hand the slice to another order-type parser).
-pub fn peek_is_rdpedc_order(bytes: &[u8]) -> bool {
+/// `true` if the first byte of `bytes` is [`ALT_SEC_HEADER_BYTE`].
+/// Implementation detail of [`process_batch`].
+pub(crate) fn peek_is_rdpedc_order(bytes: &[u8]) -> bool {
     bytes.first().copied() == Some(ALT_SEC_HEADER_BYTE)
 }
 
@@ -435,7 +526,7 @@ pub fn process_batch<C: CompDeskCallback>(
     let mut offset = 0;
     while offset < bytes.len() && peek_is_rdpedc_order(&bytes[offset..]) {
         if bytes.len() - offset < COMMON_HEADER_SIZE {
-            return Err(RdpedcError::Decode);
+            return Err(RdpedcError::UnexpectedEof);
         }
         let consumed = client.process_order(&bytes[offset..], cb)?;
         offset += consumed;
@@ -1117,5 +1208,206 @@ mod tests {
         let consumed = process_batch(&mut c, &bytes, &mut cb).unwrap();
         assert_eq!(consumed, 5);
         assert_eq!(c.mode(), CompositionMode::On { dwm_desk: false });
+    }
+
+    // ── Regression tests for cross-agent review findings ─────────────
+
+    #[test]
+    fn lsurface_create_over_existing_fires_destroy_and_clears_assoc() {
+        // Security H1 regression: a server sending `create` for an
+        // existing hLSurface should see the old entry torn down
+        // cleanly (destroy callback + redir assoc_lsurface cleared)
+        // before the fresh entry replaces it.
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        // Create logical 1, redir 2 associated to logical 1.
+        apply(
+            &mut c,
+            CompDeskPdu::LSurface(LSurfaceCreateDestroy {
+                create: true,
+                flags: LSurfaceFlags::COMPOSEONCE,
+                h_lsurface: 1,
+                hwnd: 0x10,
+            }),
+            &mut cb,
+        );
+        apply(
+            &mut c,
+            CompDeskPdu::SurfObj(SurfObjCreateDestroy {
+                create: true,
+                cache_id: 2,
+                surface_bpp: 32,
+                h_surf: 0xABCD,
+                cx: 0,
+                cy: 0,
+            }),
+            &mut cb,
+        );
+        apply(
+            &mut c,
+            CompDeskPdu::RedirSurfAssoc(RedirSurfAssocLSurface {
+                associate: true,
+                h_lsurface: 1,
+                h_surf: 0xABCD,
+            }),
+            &mut cb,
+        );
+        cb.events.clear();
+        // Now send a second create for logical 1 with a different hwnd.
+        apply(
+            &mut c,
+            CompDeskPdu::LSurface(LSurfaceCreateDestroy {
+                create: true,
+                flags: LSurfaceFlags::REDIRECTION,
+                h_lsurface: 1,
+                hwnd: 0x99,
+            }),
+            &mut cb,
+        );
+        // Callbacks must be in order: destroyed old, created new.
+        assert_eq!(
+            cb.events,
+            vec![Event::LDestroyed(1), Event::LCreated(1)]
+        );
+        // The redir entry's assoc_lsurface must have been cleared.
+        assert_eq!(c.redir_surface(2).unwrap().assoc_lsurface, None);
+        // The fresh entry carries the new hwnd and has compref_pending
+        // reset to false.
+        let entry = c.logical_surface(1).unwrap();
+        assert_eq!(entry.hwnd, 0x99);
+        assert!(!entry.compref_pending);
+    }
+
+    #[test]
+    fn surfobj_create_over_existing_fires_destroy_and_clears_draw_target() {
+        // Security H1 regression for the redir-surface path.
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        apply(
+            &mut c,
+            CompDeskPdu::SurfObj(SurfObjCreateDestroy {
+                create: true,
+                cache_id: 5,
+                surface_bpp: 32,
+                h_surf: 0x111,
+                cx: 0,
+                cy: 0,
+            }),
+            &mut cb,
+        );
+        apply(
+            &mut c,
+            CompDeskPdu::Switch(SwitchSurfObj { cache_id: 5 }),
+            &mut cb,
+        );
+        assert_eq!(c.current_draw_target(), Some(5));
+        cb.events.clear();
+        // Second create for cache_id 5 — must tear down first.
+        apply(
+            &mut c,
+            CompDeskPdu::SurfObj(SurfObjCreateDestroy {
+                create: true,
+                cache_id: 5,
+                surface_bpp: 16,
+                h_surf: 0x222,
+                cx: 10,
+                cy: 10,
+            }),
+            &mut cb,
+        );
+        assert_eq!(
+            cb.events,
+            vec![Event::RDestroyed(5), Event::RCreated(5)]
+        );
+        assert_eq!(c.current_draw_target(), None);
+        let entry = c.redir_surface(5).unwrap();
+        assert_eq!(entry.surface_bpp, 16);
+        assert_eq!(entry.h_surf, 0x222);
+    }
+
+    #[test]
+    fn flush_on_unknown_cache_id_does_not_fire_callback() {
+        // Security W1 regression: apply_flush must match apply_switch's
+        // "surface must be known" contract so phantom attacker-
+        // controlled ids never reach the callback layer.
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        apply(
+            &mut c,
+            CompDeskPdu::Flush(FlushComposeOnce {
+                cache_id: 0xDEAD,
+                h_lsurface: 0xBEEF,
+            }),
+            &mut cb,
+        );
+        assert!(cb.events.is_empty());
+    }
+
+    #[test]
+    fn destroy_logical_while_compref_pending_still_fires_destroy() {
+        // Verifier MEDIUM: document-and-test that destroy fires even
+        // when compref_pending is true. The trait doc warns callers to
+        // check compref_pending separately; this test pins the wire
+        // behaviour so it can't regress.
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        apply(
+            &mut c,
+            CompDeskPdu::LSurface(LSurfaceCreateDestroy {
+                create: true,
+                flags: LSurfaceFlags::REDIRECTION,
+                h_lsurface: 77,
+                hwnd: 0,
+            }),
+            &mut cb,
+        );
+        apply(
+            &mut c,
+            CompDeskPdu::CompRefPending(LSurfaceCompRefPending { h_lsurface: 77 }),
+            &mut cb,
+        );
+        assert!(c.logical_surface(77).unwrap().compref_pending);
+        cb.events.clear();
+        apply(
+            &mut c,
+            CompDeskPdu::LSurface(LSurfaceCreateDestroy {
+                create: false,
+                flags: LSurfaceFlags::default(),
+                h_lsurface: 77,
+                hwnd: 0,
+            }),
+            &mut cb,
+        );
+        // Destroy fires even though compref_pending was true. It is the
+        // host's responsibility to defer proxy release until the
+        // compositor releases its own reference.
+        assert_eq!(cb.events, vec![Event::LDestroyed(77)]);
+        assert!(c.logical_surface(77).is_none());
+    }
+
+    #[test]
+    fn decode_body_error_carries_operation_code() {
+        // Code-reviewer W4 regression: the error variant preserves the
+        // offending operation code for post-mortem diagnostics.
+        // TS_COMPDESK_TOGGLE with an illegal eventType byte.
+        let bytes = [0x32, 0x01, 0x01, 0x00, 0xFF];
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        let err = c.process_order(&bytes, &mut cb).unwrap_err();
+        assert_eq!(err, RdpedcError::DecodeBody { operation: 0x01 });
+    }
+
+    #[test]
+    fn process_order_distinguishes_eof_from_invalid_header() {
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        assert_eq!(
+            c.process_order(&[0x32, 0x01], &mut cb).unwrap_err(),
+            RdpedcError::UnexpectedEof
+        );
+        assert_eq!(
+            c.process_order(&[0x00, 0x00, 0x00, 0x00], &mut cb).unwrap_err(),
+            RdpedcError::InvalidHeader
+        );
     }
 }
