@@ -1857,13 +1857,29 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 ### 9.14 Plug and Play Device Redirection (MS-RDPEPNP)
 
-> **requires**: 7.3 DVC 프레임워크
-> **검증**: PDU roundtrip
+> **requires**: 7.3 DVC 프레임워크 ✅
+> **검증**: PDU roundtrip + FSM + 멀티 에이전트 검증
+> **참고**: MS-RDPEPNP는 두 개의 독립 DVC 서브프로토콜로 구성:
+> `"PNPDR"` (제어/상태) + `"FileRedirectorChannel"` (per-file I/O).
+> 9.14a = PNPDR만, 9.14b = FileRedirectorChannel.
 
-- [ ] PnP 디바이스 열거 (클라이언트 → 서버)
-- [ ] 디바이스 추가/제거 알림
-- [ ] 디바이스 드라이버 매칭 (서버 측)
-- [ ] 디바이스 인스턴스 리다이렉션
+**9.14a — PNPDR 제어 채널 ✅ (crate: justrdp-rdpepnp)**
+- [x] `PNP_INFO_HEADER` (8B, Size/PacketId u32 LE, Size inclusive)
+- [x] Server/Client Version Message (shared `VersionMsg`, PacketId=0x65, 20B)
+- [x] Authenticated Client Message (PacketId=0x67, 8B header only)
+- [x] Client Device Addition Message (PacketId=0x66) + `PNP_DEVICE_DESCRIPTION`
+      (optional ContainerId/DeviceCaps 조합 4가지 모두 지원)
+- [x] Client Device Removal Message (PacketId=0x68, spec §4 wire trace #2 일치)
+- [x] `PnpInfoClient` DvcProcessor + 3-state FSM (WaitServerVersion → WaitAuthenticated → Active)
+- [x] 디바이스 테이블 + DoS caps (MAX_DEVICES=256, HW/Compat=1024B, Desc=512B, Iface=256B)
+- [x] 인바운드 디코드 경로에도 per-field cap 강제 (allocation DoS 방어)
+- [x] Balanced-callback invariant (replace-in-place 예외 제외)
+- [x] Unknown PacketId forward-compat (silent drop)
+
+**9.14b — FileRedirectorChannel I/O 서브프로토콜 (미구현)**
+- [ ] `SERVER_IO_HEADER` / `CLIENT_IO_HEADER`, CreateFile/Read/Write/IoControl/IoCancel
+- [ ] Custom Event (version 0x0006 협상)
+- [ ] per-channel FSM + outstanding request 추적
 
 ### 9.15 License Persistence (MS-RDPELE)
 

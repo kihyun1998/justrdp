@@ -523,6 +523,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-rdpepnp"
+version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+ "justrdp-dvc",
+]
+
+[[package]]
 name = "justrdp-rdpeusb"
 version = "0.1.0"
 dependencies = [
