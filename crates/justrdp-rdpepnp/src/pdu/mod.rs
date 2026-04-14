@@ -14,8 +14,8 @@ use alloc::vec::Vec;
 use justrdp_core::{Decode, DecodeError, DecodeResult, Encode, EncodeError, EncodeResult, ReadCursor, WriteCursor};
 
 use crate::constants::{
-    packet_id, MAX_DEVICES, MAX_DEVICE_DESCRIPTION_BYTES, MAX_HARDWARE_ID_BYTES,
-    MAX_INTERFACE_BYTES, PNP_INFO_HEADER_SIZE,
+    packet_id, CONTAINER_ID_BLOCK_SIZE, DEVICE_CAPS_BLOCK_SIZE, MAX_COMPAT_ID_BYTES, MAX_DEVICES,
+    MAX_DEVICE_DESCRIPTION_BYTES, MAX_HARDWARE_ID_BYTES, MAX_INTERFACE_BYTES, PNP_INFO_HEADER_SIZE,
 };
 
 pub use header::PnpInfoHeader;
@@ -207,10 +207,10 @@ impl PnpDeviceDescription {
             + self.compatibility_id.len()
             + self.device_description.len();
         if self.container_id.is_some() {
-            n += 4 + 16;
+            n += CONTAINER_ID_BLOCK_SIZE;
         }
         if self.device_caps.is_some() {
-            n += 4 + 4;
+            n += DEVICE_CAPS_BLOCK_SIZE;
         }
         n
     }
@@ -295,7 +295,7 @@ impl PnpDeviceDescription {
         let hardware_id = read_vec(src, cb_hw)?;
 
         let cb_compat = src.read_u32_le(DD_CTX)? as usize;
-        if cb_compat > MAX_HARDWARE_ID_BYTES {
+        if cb_compat > MAX_COMPAT_ID_BYTES {
             return Err(DecodeError::invalid_value(DD_CTX, "cbCompatIdLength cap"));
         }
         let compatibility_id = read_vec(src, cb_compat)?;
@@ -326,7 +326,11 @@ impl PnpDeviceDescription {
         let mut container_id = None;
         let mut device_caps = None;
 
-        if remaining_body >= 4 + 16 {
+        // Optional tail (§2.2.1.3.1.1): ContainerId MUST precede DeviceCaps
+        // when both are present. Each block carries a sentinel `cb*` length
+        // (CB_CONTAINER_ID=0x10, CB_DEVICE_CAPS=0x04) that we verify to
+        // reject truncated or malformed tails.
+        if remaining_body >= CONTAINER_ID_BLOCK_SIZE {
             let cb_container = src.read_u32_le(DD_CTX)?;
             if cb_container != crate::constants::CB_CONTAINER_ID {
                 return Err(DecodeError::invalid_value(DD_CTX, "cbContainerId"));
@@ -334,15 +338,15 @@ impl PnpDeviceDescription {
             let mut buf = [0u8; 16];
             buf.copy_from_slice(src.read_slice(16, DD_CTX)?);
             container_id = Some(buf);
-            remaining_body -= 4 + 16;
+            remaining_body -= CONTAINER_ID_BLOCK_SIZE;
         }
-        if remaining_body >= 4 + 4 {
+        if remaining_body >= DEVICE_CAPS_BLOCK_SIZE {
             let cb_caps = src.read_u32_le(DD_CTX)?;
             if cb_caps != crate::constants::CB_DEVICE_CAPS {
                 return Err(DecodeError::invalid_value(DD_CTX, "cbDeviceCaps"));
             }
             device_caps = Some(src.read_u32_le(DD_CTX)?);
-            remaining_body -= 4 + 4;
+            remaining_body -= DEVICE_CAPS_BLOCK_SIZE;
         }
         if remaining_body != 0 {
             return Err(DecodeError::invalid_value(DD_CTX, "DataSize mismatch"));

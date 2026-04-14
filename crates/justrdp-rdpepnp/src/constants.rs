@@ -81,13 +81,30 @@ pub const MAX_DEVICES: usize = 256;
 /// per GUID this caps at 16 interface GUIDs per device.
 pub const MAX_INTERFACE_BYTES: usize = 256;
 
-/// Maximum accepted length of `HardwareId` / `CompatibilityID` byte
-/// arrays. A Windows hardware-ID multisz rarely exceeds a few hundred
-/// bytes in practice.
+/// Maximum accepted length of `HardwareId` (bytes). A Windows hardware-ID
+/// multisz rarely exceeds a few hundred bytes in practice.
 pub const MAX_HARDWARE_ID_BYTES: usize = 1024;
+
+/// Maximum accepted length of `CompatibilityID` (bytes). Kept equal to
+/// [`MAX_HARDWARE_ID_BYTES`] because the two fields share a multisz
+/// encoding and similar expected sizes, but exposed as its own constant
+/// so that future tightening of one bound does not silently affect the
+/// other.
+pub const MAX_COMPAT_ID_BYTES: usize = MAX_HARDWARE_ID_BYTES;
 
 /// Maximum accepted length of `DeviceDescription` (UTF-16LE, 2 bytes/char).
 pub const MAX_DEVICE_DESCRIPTION_BYTES: usize = 512;
+
+// ── Optional tail block sizes (MS-RDPEPNP §2.2.1.3.1.1) ──
+
+/// Size in bytes of the optional `cbContainerId + ContainerId` block
+/// inside `PNP_DEVICE_DESCRIPTION`. Present iff the encoded `DataSize`
+/// leaves at least this many bytes after the mandatory fields.
+pub const CONTAINER_ID_BLOCK_SIZE: usize = 4 + 16;
+
+/// Size in bytes of the optional `cbDeviceCaps + DeviceCaps` block
+/// inside `PNP_DEVICE_DESCRIPTION`.
+pub const DEVICE_CAPS_BLOCK_SIZE: usize = 4 + 4;
 
 /// Windows implementation version constants (MS-RDPEPNP Appendix A §<2>–§<5>).
 ///
