@@ -1,0 +1,19 @@
+[package]
+name = "justrdp-rdpedc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Desktop Composition Virtual Channel Extension (MS-RDPEDC) for JustRDP"
+keywords = ["rdp", "compdesk", "dwm", "rdpedc"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc"]
+std = ["alloc", "justrdp-core/std"]
+
+[dependencies]
+justrdp-core.workspace = true

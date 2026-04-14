@@ -1809,15 +1809,20 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [x] Step 3: `RdpegtClient` DVC processor, `GeometryEntry` map, `GeometryLookup` trait for RDPEVOR
 - [x] Step 4: impl-verifier 0 FAIL (after fixes), code-reviewer + security-scanner clean (23/23 tests, DoS caps, MAX_ACTIVE_MAPPINGS boundary test, trailing-byte rejection, pre-start guard)
 
-### 9.12 Desktop Composition (MS-RDPECR2)
+### 9.12 Desktop Composition (MS-RDPEDC)
 
-> **requires**: 7.3 DVC 프레임워크
-> **검증**: PDU roundtrip
+> **requires**: CAPSETTYPE_COMPDESK (`justrdp-pdu` 기존 구현), MS-RDPEGDI Alternate Secondary Order transport
+> **검증**: PDU roundtrip + 스펙 §4 hex test vectors
+> **Note**: Roadmap alias "MS-RDPECR2" was a typo; the actual spec is [MS-RDPEDC]
+>   Desktop Composition Virtual Channel Extension v8.0. MS-RDPCR2 (Composited
+>   Remoting V2, 136-message DWM scene-graph protocol) is tracked separately below.
 
-- [ ] Composited Remoting V2 프로토콜
-- [ ] 데스크톱 컴포지션 리다이렉션 (DWM 통합)
-- [ ] CAPSETTYPE_COMPDESK capability set과 연동
-- [ ] 서버측 DWM 컴포지션 활성화/비활성화 제어
+- [ ] 6개 PDU 전부 구현 (TOGGLE / LSURFACE / SURFOBJ / REDIRSURF_ASSOC / COMPREF_PENDING / SWITCH_SURFOBJ / FLUSH_COMPOSEONCE)
+- [ ] `TS_ALTSEC_COMPDESK_FIRST = 0x0C` Alternate Secondary Order header (0x32 byte)
+- [ ] Composition mode FSM (COMPOSITION_OFF ↔ COMPOSITION_ON, DWM desk enter/leave sub-modes)
+- [ ] 논리 서피스 테이블 + 리다이렉션 서피스 테이블 (BTreeMap, no_std)
+- [ ] CAPSETTYPE_COMPDESK capability set과 연동 (이미 `justrdp-pdu/src/rdp/capabilities.rs`)
+- [ ] 스펙 §4.2.1, §4.3.2 hex test vectors 정확 매칭
 
 ### 9.13 Multiparty Virtual Channel (MS-RDPEMC)
 
@@ -2119,7 +2124,7 @@ pub trait RdpServerSoundHandler: Send { /* ... */ }
 | MS-RDPECAM  | Camera Device Redirection                | 6     | Low          |
 | MS-RDPEPC   | Printer Cache Extension                  | 6     | Low          |
 | MS-RDPEPNP  | Plug and Play Device Redirection         | 6     | Low          |
-| MS-RDPECR2  | Composited Remoting V2                   | 6     | Low          |
+| MS-RDPCR2   | Composited Remoting V2 (DWM scene graph) | —     | Deferred     |
 | MS-RDPEV    | Video Redirection Virtual Channel (TSMF) | 6     | Low          |
 | MS-RDPEMC   | Multiparty Virtual Channel Extension     | 6     | Low          |
 | MS-RDPEECO  | Extensible Output Channel Extension      | 6     | Low          |
