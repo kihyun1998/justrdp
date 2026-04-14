@@ -48,7 +48,13 @@ extern crate alloc;
 pub mod constants;
 
 #[cfg(feature = "alloc")]
+pub mod media;
+
+#[cfg(feature = "alloc")]
 pub mod pdu;
+
+#[cfg(feature = "alloc")]
+pub mod processor;
 
 /// DVC channel name for MS-RDPEV TSMF traffic. ANSI, null-terminated on
 /// the wire (the trailing NUL is added by the DRDYNVC layer when it
@@ -112,3 +118,11 @@ pub use pdu::sample::{
 
 #[cfg(feature = "alloc")]
 pub use pdu::stream::{AddStream, RemoveStream};
+
+#[cfg(feature = "alloc")]
+pub use media::{
+    result_to_hresult, CheckFormatResult, MockTsmfMediaSink, TsmfError, TsmfMediaSink,
+};
+
+#[cfg(feature = "alloc")]
+pub use processor::{RdpevClient, MAX_PRESENTATIONS, MAX_STREAMS_PER_PRESENTATION};
