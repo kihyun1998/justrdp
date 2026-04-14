@@ -249,11 +249,17 @@ pub struct UpdateGeometryInfo {
 
 impl UpdateGeometryInfo {
     fn payload_size(&self) -> usize {
+        // Clamp the rect count to MAX_VISIBLE_RECTS in case a caller
+        // builds an oversized struct without going through encode()
+        // first. The encode path itself rejects oversize lists, but
+        // size() must never overflow or under-count its buffer
+        // allocation. Caller-side clamp is simpler than checked_mul.
+        let clamped_rects = self.visible_rects.len().min(MAX_VISIBLE_RECTS);
         GUID_SIZE
             + 4 // numGeometryInfo
             + self.geometry.wire_size()
             + 4 // cbVisibleRect
-            + self.visible_rects.len() * TsRect::WIRE_SIZE
+            + clamped_rects * TsRect::WIRE_SIZE
     }
 }
 
@@ -390,6 +396,17 @@ impl<'de> Decode<'de> for SetSourceVideoRect {
         let top = f32::from_bits(src.read_u32_le(CTX)?);
         let right = f32::from_bits(src.read_u32_le(CTX)?);
         let bottom = f32::from_bits(src.read_u32_le(CTX)?);
+        // Spec §2.2.5.2.12: coordinates are normalized [0.0, 1.0].
+        // NaN / Inf / out-of-range values would propagate to the
+        // host's video renderer as garbage crop parameters, so we
+        // refuse them at the decode boundary. We accept exactly the
+        // closed unit interval; finite-but-out-of-range values from
+        // a malicious server are rejected.
+        for (v, name) in [(left, "Left"), (top, "Top"), (right, "Right"), (bottom, "Bottom")] {
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                return Err(DecodeError::invalid_value(CTX, name));
+            }
+        }
         Ok(Self {
             message_id: header.message_id,
             presentation_id,
@@ -706,6 +723,52 @@ mod tests {
             function_id::SET_SOURCE_VIDEO_RECT,
             function_id::REMOVE_STREAM
         );
+    }
+
+    #[test]
+    fn set_source_video_rect_decode_rejects_nan_coordinate() {
+        // Build a valid PDU prefix, then poison the Top f32 with a NaN.
+        let mut bytes: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x40, // PROXY
+            0x00, 0x00, 0x00, 0x00, // MessageId
+            0x16, 0x01, 0x00, 0x00, // SET_SOURCE_VIDEO_RECT
+        ];
+        bytes.extend_from_slice(G.as_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes()); // Left = 0.0
+        bytes.extend_from_slice(&f32::NAN.to_le_bytes()); // Top = NaN
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes()); // Right = 1.0
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes()); // Bottom = 1.0
+        let mut r = ReadCursor::new(&bytes);
+        assert!(SetSourceVideoRect::decode(&mut r).is_err());
+    }
+
+    #[test]
+    fn set_source_video_rect_decode_rejects_infinite_coordinate() {
+        let mut bytes: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x16, 0x01, 0x00, 0x00,
+        ];
+        bytes.extend_from_slice(G.as_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&f32::INFINITY.to_le_bytes());
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        let mut r = ReadCursor::new(&bytes);
+        assert!(SetSourceVideoRect::decode(&mut r).is_err());
+    }
+
+    #[test]
+    fn set_source_video_rect_decode_rejects_out_of_range_coordinate() {
+        let mut bytes: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x16, 0x01, 0x00, 0x00,
+        ];
+        bytes.extend_from_slice(G.as_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+        // 1.5 is finite but outside [0, 1].
+        bytes.extend_from_slice(&1.5_f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        let mut r = ReadCursor::new(&bytes);
+        assert!(SetSourceVideoRect::decode(&mut r).is_err());
     }
 
     #[test]

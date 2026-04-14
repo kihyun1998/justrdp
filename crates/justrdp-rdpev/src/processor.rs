@@ -243,11 +243,25 @@ impl RdpevClient {
     }
 
     /// Encodes a PDU into a `DvcMessage` in one shot.
+    ///
+    /// Surfaces a `size()`/`encode()` mismatch as a `DvcError::Protocol`
+    /// rather than `debug_assert!` so a regression in either direction
+    /// is caught in release builds too. (Encode-side mismatches would
+    /// otherwise produce a truncated PDU that the server might still
+    /// accept by happy accident.)
     pub(crate) fn encode_pdu<E: Encode>(pdu: &E) -> DvcResult<DvcMessage> {
-        let mut buf = alloc::vec![0u8; pdu.size()];
+        let claimed = pdu.size();
+        let mut buf = alloc::vec![0u8; claimed];
         let mut cur = WriteCursor::new(&mut buf);
         pdu.encode(&mut cur)?;
-        debug_assert_eq!(cur.pos(), pdu.size(), "size() mismatch in {}", pdu.name());
+        if cur.pos() != claimed {
+            return Err(DvcError::Protocol(format!(
+                "MS-RDPEV: encode() wrote {} bytes but size() promised {} for {}",
+                cur.pos(),
+                claimed,
+                pdu.name(),
+            )));
+        }
         Ok(DvcMessage::new(buf))
     }
 
@@ -419,6 +433,16 @@ impl RdpevClient {
                 "MS-RDPEV: SET_CHANNEL_PARAMS received after channel was already bound",
             )));
         }
+        // Spec §2.2.5.1: StreamId MUST be 0 for the control channel
+        // bind. A non-zero value would mean the server is binding the
+        // channel to a specific stream, which is not how TSMF works
+        // -- streams are created later via ADD_STREAM.
+        if req.stream_id != 0 {
+            return Err(DvcError::Protocol(format!(
+                "MS-RDPEV: SET_CHANNEL_PARAMS StreamId must be 0, got {}",
+                req.stream_id
+            )));
+        }
         self.bind = Some(ChannelBind {
             presentation_id: req.presentation_id,
             stream_id: req.stream_id,
@@ -549,11 +573,15 @@ impl RdpevClient {
         let rsp = SetTopologyRsp {
             message_id: req.message_id,
             topology_ready: if ready { 1 } else { 0 },
-            // Spec §2.2.5.2.6: Result = S_OK on success; for failure
-            // the topology_ready flag does the heavy lifting and the
-            // server treats E_FAIL identically. We pick S_OK so a
-            // confused server still gets a parseable HRESULT.
-            result: S_OK,
+            // Spec §2.2.5.2.6: Result MUST reflect the outcome.
+            // S_OK with topology_ready=0 sends contradictory signals
+            // and a strict server may not handle the combination.
+            // Pair them: ready=1 → S_OK, ready=0 → E_FAIL.
+            result: if ready {
+                S_OK
+            } else {
+                crate::constants::E_FAIL
+            },
         };
         Ok(alloc::vec![Self::encode_pdu(&rsp)?])
     }
@@ -599,11 +627,36 @@ impl RdpevClient {
         let mut r = ReadCursor::new(payload);
         let req = OnSample::decode(&mut r)?;
 
+        // Per-presentation state guard. The spec sequence (§7) is
+        // ON_NEW_PRESENTATION → CHECK_FORMAT_SUPPORT → ADD_STREAM →
+        // SET_TOPOLOGY_REQ/RSP, with ON_SAMPLE only valid afterwards
+        // in `Ready`. A server that fires an ON_SAMPLE before topology
+        // readiness is in protocol violation; we drop the sample
+        // (do NOT call the sink, do NOT ack) rather than letting the
+        // sink see a frame for a stream that hasn't been negotiated
+        // yet. The 1:1 ack rule (§3.3.5.3.3) applies to correctly-
+        // sequenced traffic only -- otherwise a malicious server could
+        // force the client to allocate full-size sample payloads
+        // (16 MiB each) for an unbounded number of "samples" before
+        // any presentation has been established.
+        //
+        // For unknown presentations we still call the sink (liberal
+        // receiver, matches ADD_STREAM behaviour) and emit the ack;
+        // this preserves the case where the client's bookkeeping is
+        // out of sync but the stream genuinely exists upstream.
+        let known_but_not_ready = self
+            .presentations
+            .get(&req.presentation_id.0)
+            .map(|p| p.state != PresentationState::Ready)
+            .unwrap_or(false);
+        if known_but_not_ready {
+            return Ok(Vec::new());
+        }
+
         // Update internal stream state if the stream is known. We do
-        // NOT bail out on unknown streams: spec §3.3.5.3.3 requires a
-        // PLAYBACK_ACK for every ON_SAMPLE the client received, full
-        // stop. The sink's handler is responsible for absorbing the
-        // sample (or discarding it if unknown).
+        // NOT bail out on unknown streams once the presentation passed
+        // the state gate above: spec §3.3.5.3.3 requires a PLAYBACK_ACK
+        // for every ON_SAMPLE the client received in valid sequence.
         if let Some(pres) = self.presentations.get_mut(&req.presentation_id.0) {
             if let Some(stream) = pres.streams.get_mut(&req.stream_id) {
                 stream.state = StreamState::Streaming;
@@ -630,13 +683,12 @@ impl RdpevClient {
 
     fn handle_notify_preroll(&mut self, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
         self.ensure_open("NOTIFY_PREROLL")?;
-        // NOTIFY_PREROLL is a buffering hint that the spec calls
-        // RECOMMENDED rather than MUST; the sink trait deliberately
-        // has no dedicated method for it. We still decode the PDU to
-        // validate its structure (so a malformed prefix tears the
-        // channel down rather than going unnoticed) but we do not
-        // route it to the sink.
-        let _ = NotifyPreroll::decode(&mut ReadCursor::new(payload))?;
+        // Spec §3.3.5.3.2: client SHOULD begin pre-roll buffering on
+        // receipt. We forward the hint to the sink so adaptive hosts
+        // can react; non-buffering hosts can leave the default no-op.
+        let req = NotifyPreroll::decode(&mut ReadCursor::new(payload))?;
+        self.sink
+            .notify_preroll(req.presentation_id, req.stream_id);
         Ok(Vec::new())
     }
 
@@ -1151,6 +1203,17 @@ mod tests {
         c.process(CHAN_ID, &encode(&req)).unwrap();
     }
 
+    /// Drives the presentation through SET_TOPOLOGY_REQ so subsequent
+    /// `ON_SAMPLE` PDUs pass the new `PresentationState::Ready` guard
+    /// added in the Step 5 review fixes.
+    fn set_topology(c: &mut RdpevClient, g: Guid) {
+        let req = SetTopologyReq {
+            message_id: 0,
+            presentation_id: g,
+        };
+        c.process(CHAN_ID, &encode(&req)).unwrap();
+    }
+
     fn sink_of(c: &RdpevClient) -> &MockTsmfMediaSink {
         c.sink
             .as_any()
@@ -1272,6 +1335,7 @@ mod tests {
         let mut c = fresh_client();
         create_presentation(&mut c, G1);
         add_stream(&mut c, G1, 1);
+        set_topology(&mut c, G1);
 
         let req = OnSample {
             message_id: 0,
@@ -1326,6 +1390,7 @@ mod tests {
         let mut c = fresh_client();
         create_presentation(&mut c, G1);
         add_stream(&mut c, G1, 0);
+        set_topology(&mut c, G1);
         let mut last_id = None;
         for _ in 0..3 {
             let req = OnSample {
@@ -1341,6 +1406,117 @@ mod tests {
             }
             last_id = Some(ack.message_id);
         }
+    }
+
+    // ── Step 5 fix: ON_SAMPLE state guard ──
+
+    #[test]
+    fn on_sample_dropped_silently_when_presentation_not_ready() {
+        // Presentation exists but SET_TOPOLOGY_REQ has not been
+        // answered, so state is Setup (not Ready). The processor
+        // must drop the sample without acking and without calling
+        // the sink — see the fix for the §9.10 Step 5 P0.
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 0);
+        // State is Setup, not Ready.
+        let req = OnSample {
+            message_id: 0,
+            presentation_id: G1,
+            stream_id: 0,
+            sample: dummy_sample(99, alloc::vec![1, 2, 3, 4]),
+        };
+        let out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        assert!(out.is_empty(), "no PlaybackAck on protocol violation");
+        assert_eq!(sink_of(&c).on_sample_calls, 0);
+    }
+
+    #[test]
+    fn on_sample_dropped_silently_after_presentation_terminated() {
+        // SHUTDOWN_PRESENTATION removes the presentation entirely, so
+        // a later ON_SAMPLE for the same id falls into the
+        // "unknown presentation" branch (which still acks per the
+        // liberal-receiver policy). This test asserts that contract.
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 0);
+        set_topology(&mut c, G1);
+        c.process(
+            CHAN_ID,
+            &encode(&ShutdownPresentationReq {
+                message_id: 0,
+                presentation_id: G1,
+            }),
+        )
+        .unwrap();
+        // Late sample arrives — presentation is now unknown, so the
+        // liberal-receiver branch acks it.
+        let req = OnSample {
+            message_id: 0,
+            presentation_id: G1,
+            stream_id: 0,
+            sample: dummy_sample(0, alloc::vec![]),
+        };
+        let out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        assert_eq!(out.len(), 1, "unknown-presentation branch acks");
+    }
+
+    // ── Step 5 fix: SET_CHANNEL_PARAMS StreamId == 0 ──
+
+    #[test]
+    fn set_channel_params_rejects_nonzero_stream_id() {
+        let mut c = fresh_client();
+        let req = SetChannelParams {
+            message_id: 0,
+            presentation_id: G1,
+            stream_id: 7, // illegal per spec §2.2.5.1
+        };
+        assert!(matches!(
+            c.process(CHAN_ID, &encode(&req)),
+            Err(DvcError::Protocol(_))
+        ));
+    }
+
+    // ── Step 5 fix: SetTopologyRsp HRESULT pairing ──
+
+    #[test]
+    fn set_topology_rsp_returns_e_fail_when_not_ready() {
+        let sink = Box::new(MockTsmfMediaSink::new().with_topology_ready(false));
+        let mut c = RdpevClient::new(sink);
+        c.start(CHAN_ID).unwrap();
+        create_presentation(&mut c, G1);
+        let mut out = c
+            .process(
+                CHAN_ID,
+                &encode(&SetTopologyReq {
+                    message_id: 0,
+                    presentation_id: G1,
+                }),
+            )
+            .unwrap();
+        let rsp =
+            SetTopologyRsp::decode(&mut ReadCursor::new(&out.remove(0).data)).unwrap();
+        assert_eq!(rsp.topology_ready, 0);
+        // E_FAIL = 0x80004005
+        assert_eq!(rsp.result, 0x8000_4005);
+    }
+
+    // ── Step 5 fix: NOTIFY_PREROLL → sink.notify_preroll ──
+
+    #[test]
+    fn notify_preroll_dispatches_to_sink() {
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        c.process(
+            CHAN_ID,
+            &encode(&NotifyPreroll {
+                message_id: 0,
+                presentation_id: G1,
+                stream_id: 3,
+            }),
+        )
+        .unwrap();
+        assert_eq!(sink_of(&c).notify_preroll_calls, 1);
     }
 
     // ── REMOVE_STREAM + SHUTDOWN_PRESENTATION_REQ ──

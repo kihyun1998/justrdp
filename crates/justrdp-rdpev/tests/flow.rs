@@ -296,6 +296,17 @@ fn two_concurrent_presentations_isolate_their_streams() {
             media_type: dummy_media_type(),
         },
     );
+    // Promote both presentations to Ready (Step 5 fix: ON_SAMPLE
+    // requires Ready state).
+    for &g in &[PRES_A, PRES_B] {
+        run(
+            &mut c,
+            &SetTopologyReq {
+                message_id: 0,
+                presentation_id: g,
+            },
+        );
+    }
 
     // Sample for A — ack carries stream_id 0.
     let mut out = run(

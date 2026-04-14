@@ -128,6 +128,19 @@ impl CheckFormatResult {
 /// instance and called synchronously from the DVC thread. Methods
 /// MUST NOT panic; long-running work belongs to the host's own
 /// queues, not this trait.
+///
+/// **Send bound**: the trait requires `Send` because the DVC framework
+/// may move the processor (and therefore the boxed sink) between
+/// threads. Implementations holding `Rc<T>`, `Cell<T>`, or other
+/// non-`Send` types will not compile -- use `Arc<T>` and interior
+/// mutability via `Mutex<T>` instead.
+///
+/// **Hot path: `on_sample`** receives `&TsMmDataSample` rather than an
+/// owned value precisely because production sinks should not clone
+/// the `pData` blob (which can be up to [`crate::MAX_SAMPLE_BYTES`]).
+/// The included [`MockTsmfMediaSink`] DOES clone the payload for
+/// assertion purposes -- that is a test-only convenience and MUST
+/// NOT be copied into a production implementation.
 pub trait TsmfMediaSink: AsAny + Send {
     // ── Mandatory ─────────────────────────────────────────────────
 
@@ -191,6 +204,14 @@ pub trait TsmfMediaSink: AsAny + Send {
     fn shutdown_presentation(&mut self, presentation_id: Guid) -> Result<(), TsmfError>;
 
     // ── Optional (default no-op) ──────────────────────────────────
+
+    /// Server signals that the client SHOULD begin pre-roll
+    /// buffering for a stream (MS-RDPEV §3.3.5.3.2). Hosts that
+    /// implement adaptive buffering should hold rendered frames in
+    /// memory until the first `on_playback_started` to absorb
+    /// network jitter; hosts that do not buffer can leave the
+    /// default no-op.
+    fn notify_preroll(&mut self, _presentation_id: Guid, _stream_id: u32) {}
 
     fn on_flush(&mut self, _presentation_id: Guid, _stream_id: u32) {}
 
@@ -296,6 +317,7 @@ pub struct MockTsmfMediaSink {
     pub shutdown_presentation_calls: u32,
 
     // Optional method counters:
+    pub notify_preroll_calls: u32,
     pub on_flush_calls: u32,
     pub on_end_of_stream_calls: u32,
     pub on_playback_started_calls: u32,
@@ -430,6 +452,9 @@ impl TsmfMediaSink for MockTsmfMediaSink {
         }
     }
 
+    fn notify_preroll(&mut self, _presentation_id: Guid, _stream_id: u32) {
+        self.notify_preroll_calls += 1;
+    }
     fn on_flush(&mut self, _presentation_id: Guid, _stream_id: u32) {
         self.on_flush_calls += 1;
     }

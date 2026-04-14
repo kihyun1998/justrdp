@@ -392,7 +392,7 @@ Payload after 8-byte response header:
 | 24 | variable | TS_MM_DATA_SAMPLE (as bytes) | `pSample` |
 
 - [ ] `FunctionId=0x00000103`
-- [ ] `numSample` is the byte count of the serialized `TS_MM_DATA_SAMPLE`; MUST equal `28 + cbData`
+- [ ] `numSample` is the byte count of the serialized `TS_MM_DATA_SAMPLE`; MUST equal `36 + cbData` (matches the 36-byte fixed header in §5.2)
 
 #### 4.20 ON_FLUSH (§2.2.5.3.4) — 20 bytes payload — S→C
 
