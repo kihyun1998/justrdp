@@ -270,6 +270,15 @@ impl<'de> Decode<'de> for OnPlaybackRateChanged {
         }
         let presentation_id = decode_guid(src, CTX)?;
         let new_rate = f32::from_bits(src.read_u32_le(CTX)?);
+        // Reject non-finite rates (NaN, ±Inf). Spec §2.2.5.4.5 does
+        // not impose a closed-interval bound -- negative rates are
+        // legal (rewind), and rates above 1.0 are legal (fast
+        // forward) -- but a NaN propagated to the host's frame
+        // scheduler will silently poison every timestamp that gets
+        // multiplied or divided by it. Reject at the wire boundary.
+        if !new_rate.is_finite() {
+            return Err(DecodeError::invalid_value(CTX, "NewRate"));
+        }
         Ok(Self {
             message_id: header.message_id,
             presentation_id,
@@ -466,9 +475,12 @@ mod tests {
     }
 
     #[test]
-    fn on_playback_rate_changed_extreme_values() {
-        // Half speed, 2x, and a NaN to verify bit-for-bit transport.
-        for &rate in &[0.5_f32, 2.0_f32, -1.0_f32, f32::INFINITY, 1.5_f32] {
+    fn on_playback_rate_changed_finite_rates_round_trip() {
+        // Spec §2.2.5.4.5 has no closed bound; negative (rewind),
+        // fractional, and above-unity rates are all legal as long as
+        // they are finite. Verify bit-for-bit transport for the
+        // legal subset.
+        for &rate in &[0.5_f32, 2.0_f32, -1.0_f32, 1.5_f32, 0.0_f32, -0.0_f32] {
             let pdu = OnPlaybackRateChanged {
                 message_id: 0,
                 presentation_id: G,
@@ -482,18 +494,31 @@ mod tests {
     }
 
     #[test]
-    fn on_playback_rate_changed_nan_round_trips_bit_for_bit() {
-        // f32::NAN with a custom payload -- the decoder must not coerce
-        // it to a canonical NaN.
-        let nan_with_payload = f32::from_bits(0x7fc12345);
+    fn on_playback_rate_changed_decode_rejects_nan() {
+        // f32::NAN with a custom payload would otherwise propagate to
+        // the host's frame scheduler and poison every downstream
+        // timestamp. The Step 5 second-pass fix rejects it at decode.
         let pdu = OnPlaybackRateChanged {
             message_id: 0,
             presentation_id: G,
-            new_rate: nan_with_payload,
+            new_rate: f32::from_bits(0x7fc12345),
         };
         let bytes = encode_to_vec(&pdu);
         let mut r = ReadCursor::new(&bytes);
-        let decoded = OnPlaybackRateChanged::decode(&mut r).unwrap();
-        assert_eq!(decoded.new_rate.to_bits(), 0x7fc12345);
+        assert!(OnPlaybackRateChanged::decode(&mut r).is_err());
+    }
+
+    #[test]
+    fn on_playback_rate_changed_decode_rejects_infinity() {
+        for &rate in &[f32::INFINITY, f32::NEG_INFINITY] {
+            let pdu = OnPlaybackRateChanged {
+                message_id: 0,
+                presentation_id: G,
+                new_rate: rate,
+            };
+            let bytes = encode_to_vec(&pdu);
+            let mut r = ReadCursor::new(&bytes);
+            assert!(OnPlaybackRateChanged::decode(&mut r).is_err());
+        }
     }
 }

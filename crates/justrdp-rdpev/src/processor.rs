@@ -551,7 +551,15 @@ impl RdpevClient {
                         state: StreamState::Added,
                     },
                 );
-                pres.state = PresentationState::Setup;
+                // Promote Created → Setup on the first ADD_STREAM,
+                // but DO NOT regress Ready (or Terminated) back to
+                // Setup. A malicious server that fires ADD_STREAM
+                // mid-playback would otherwise demote the state
+                // machine and bypass the ON_SAMPLE state guard,
+                // causing a playback denial.
+                if pres.state == PresentationState::Created {
+                    pres.state = PresentationState::Setup;
+                }
             }
             Err(_) => {
                 // Sink refused; do not insert. No wire response.
@@ -1259,6 +1267,40 @@ mod tests {
     }
 
     #[test]
+    fn add_stream_does_not_demote_ready_presentation() {
+        // Step 5 second-pass fix: a malicious server that fires
+        // ADD_STREAM after SET_TOPOLOGY would otherwise regress the
+        // presentation Ready → Setup, causing the next ON_SAMPLE to
+        // fall through the new state guard and be silently dropped.
+        // The fix preserves Ready (and Terminated).
+        let mut c = fresh_client();
+        create_presentation(&mut c, G1);
+        add_stream(&mut c, G1, 0);
+        set_topology(&mut c, G1);
+        assert_eq!(
+            c.presentations.get(&G1.0).unwrap().state,
+            PresentationState::Ready
+        );
+        // Server fires another ADD_STREAM (mid-playback).
+        add_stream(&mut c, G1, 1);
+        // Presentation must still be Ready, not Setup.
+        assert_eq!(
+            c.presentations.get(&G1.0).unwrap().state,
+            PresentationState::Ready,
+            "ADD_STREAM must not demote a Ready presentation"
+        );
+        // And ON_SAMPLE must still pass the guard.
+        let req = OnSample {
+            message_id: 0,
+            presentation_id: G1,
+            stream_id: 0,
+            sample: dummy_sample(0, alloc::vec![]),
+        };
+        let out = c.process(CHAN_ID, &encode(&req)).unwrap();
+        assert_eq!(out.len(), 1, "playback must still ack post-demotion attempt");
+    }
+
+    #[test]
     fn add_stream_enforces_max_streams_per_presentation_cap() {
         let mut c = fresh_client();
         create_presentation(&mut c, G1);
@@ -1432,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn on_sample_dropped_silently_after_presentation_terminated() {
+    fn on_sample_after_shutdown_falls_to_liberal_receiver_and_acks() {
         // SHUTDOWN_PRESENTATION removes the presentation entirely, so
         // a later ON_SAMPLE for the same id falls into the
         // "unknown presentation" branch (which still acks per the
@@ -1653,7 +1695,8 @@ mod tests {
             }),
         )
         .unwrap();
-        // NotifyPreroll — decoded but not routed to sink.
+        // NotifyPreroll — routed to sink.notify_preroll() since the
+        // Step 5 first-pass review fix.
         c.process(
             CHAN_ID,
             &encode(&NotifyPreroll {
@@ -1672,6 +1715,7 @@ mod tests {
         assert_eq!(s.on_playback_stopped_calls, 1);
         assert_eq!(s.on_playback_restarted_calls, 1);
         assert_eq!(s.on_playback_rate_changed_calls, 1);
+        assert_eq!(s.notify_preroll_calls, 1);
     }
 
     #[test]
