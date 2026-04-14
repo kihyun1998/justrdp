@@ -9,8 +9,9 @@ use justrdp_core::{
 use super::header::{OrderHeader, UnicodeString};
 use crate::constants::odtype;
 
-/// Fixed portion of [`OdParticipantCreated`] in bytes.
-pub const PARTICIPANT_CREATED_FIXED_SIZE: u16 = 16;
+/// Fixed portion of [`OdParticipantCreated`] in bytes (header, IDs,
+/// flags — everything before the trailing [`UnicodeString`]).
+pub const PARTICIPANT_CREATED_FIXED_SIZE: u16 = 14;
 /// Total wire size of [`OdParticipantRemoved`] in bytes.
 pub const PARTICIPANT_REMOVED_SIZE: u16 = 16;
 /// Total wire size of [`OdParticipantCtrlChange`] in bytes.

@@ -519,6 +519,7 @@ name = "justrdp-rdpemc"
 version = "0.1.0"
 dependencies = [
  "justrdp-core",
+ "justrdp-svc",
 ]
 
 [[package]]

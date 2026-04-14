@@ -212,7 +212,7 @@ fn participant_created_self_identity_roundtrip() {
         friendly_name: UnicodeString::empty(),
     };
     let bytes = encode_one(&pdu);
-    assert_eq!(bytes.len(), 18); // fixed 16 + cchString 2 + 0
+    assert_eq!(bytes.len(), 16); // hdr4 + pid4 + gid4 + flags2 + cchString2 + 0
     let back: OdParticipantCreated = decode_one(&bytes);
     assert_eq!(back, pdu);
     assert_eq!(back.flags & flags::IS_PARTICIPANT, flags::IS_PARTICIPANT);

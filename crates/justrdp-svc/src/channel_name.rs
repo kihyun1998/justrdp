@@ -96,6 +96,8 @@ pub const RDPDR: ChannelName = ChannelName::new(b"rdpdr");
 pub const DRDYNVC: ChannelName = ChannelName::new(b"drdynvc");
 /// Remote Programs (RAIL) channel.
 pub const RAIL: ChannelName = ChannelName::new(b"rail");
+/// Multiparty Virtual Channel Extension channel (MS-RDPEMC §2.1).
+pub const ENCOMSP: ChannelName = ChannelName::new(b"encomsp");
 
 #[cfg(test)]
 mod tests {

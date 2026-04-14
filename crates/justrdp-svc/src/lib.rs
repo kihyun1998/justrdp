@@ -40,7 +40,7 @@ mod dechunk;
 mod chunk;
 
 #[cfg(feature = "alloc")]
-pub use channel_name::{ChannelName, CLIPRDR, DRDYNVC, RAIL, RDPDR, RDPSND};
+pub use channel_name::{ChannelName, CLIPRDR, DRDYNVC, ENCOMSP, RAIL, RDPDR, RDPSND};
 #[cfg(feature = "alloc")]
 pub use channel_set::StaticChannelSet;
 

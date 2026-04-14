@@ -12,8 +12,9 @@ categories = ["no-std", "network-programming"]
 
 [features]
 default = ["alloc"]
-alloc = ["justrdp-core/alloc"]
+alloc = ["justrdp-core/alloc", "dep:justrdp-svc"]
 std = ["alloc", "justrdp-core/std"]
 
 [dependencies]
 justrdp-core.workspace = true
+justrdp-svc = { workspace = true, optional = true }

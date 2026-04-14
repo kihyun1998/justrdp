@@ -27,7 +27,7 @@
 //! | 0x0005 | `OD_WND_CREATED`                    | SM→P | 16 + 2·cchStr   | §2.2.3.4  |
 //! | 0x0006 | `OD_WND_SHOW`                       | P→SM | 8               | §2.2.3.6  |
 //! | 0x0007 | `OD_PARTICIPANT_REMOVED`            | SM→P | 16              | §2.2.4.2  |
-//! | 0x0008 | `OD_PARTICIPANT_CREATED`            | SM→P | 18 + 2·cchStr   | §2.2.4.1  |
+//! | 0x0008 | `OD_PARTICIPANT_CREATED`            | SM→P | 16 + 2·cchStr   | §2.2.4.1  |
 //! | 0x0009 | `OD_PARTICIPANT_CTRL_CHANGE`        | P→SM | 10              | §2.2.4.3  |
 //! | 0x000A | `OD_GRAPHICS_STREAM_PAUSED`         | SM→P | 4               | §2.2.5.1  |
 //! | 0x000B | `OD_GRAPHICS_STREAM_RESUMED`        | SM→P | 4               | §2.2.5.2  |
@@ -45,11 +45,21 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "alloc")]
+pub mod client;
 pub mod constants;
 pub mod pdu;
 
+#[cfg(all(test, feature = "alloc"))]
+mod client_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "alloc")]
+pub use client::{
+    AppEntry, EncomspCallback, EncomspClient, EncomspError, NullCallback, ParticipantEntry,
+    WindowEntry, MAX_APPLICATIONS, MAX_PARTICIPANTS, MAX_WINDOWS,
+};
 
 pub use constants::{
     flags, odtype, participant_disconnect_reason, ENCOMSP_CHANNEL_NAME, MAX_UNICODE_STRING_CCH,

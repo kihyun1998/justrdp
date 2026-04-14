@@ -106,7 +106,7 @@ Direction: SM = Sharing Manager (host/server), P = Participant (client/viewer).
 | 5  | OD_WND_CREATED                      | 0x0005 | SM→P  | 16+  | Name          |
 | 6  | OD_WND_SHOW                         | 0x0006 | P→SM  | 8    | No            |
 | 7  | OD_PARTICIPANT_REMOVED              | 0x0007 | SM→P  | 16   | No            |
-| 8  | OD_PARTICIPANT_CREATED              | 0x0008 | SM→P  | 18+  | FriendlyName  |
+| 8  | OD_PARTICIPANT_CREATED              | 0x0008 | SM→P  | 16+  | FriendlyName  |
 | 9  | OD_PARTICIPANT_CTRL_CHANGE          | 0x0009 | P→SM  | 10   | No            |
 | 10 | OD_GRAPHICS_STREAM_PAUSED           | 0x000A | SM→P  | 4    | No            |
 | 11 | OD_GRAPHICS_STREAM_RESUMED          | 0x000B | SM→P  | 4    | No            |
@@ -166,9 +166,9 @@ Total: 13 PDU types (vs 7 for MS-RDPEDC).
 - [ ] Windows NEVER sends this (Appendix A <5>); must parse if received
 - [ ] SPEC GAP: no WndId binding — rectangle is advisory only
 
-### 6.8 OD_PARTICIPANT_CREATED (§2.2.4.1) — SM→P, 18 + cchString*2 bytes
+### 6.8 OD_PARTICIPANT_CREATED (§2.2.4.1) — SM→P, 16 + cchString*2 bytes
 
-- [ ] HDR.Type=0x0008, HDR.Length=0x0012 + cchString*2
+- [ ] HDR.Type=0x0008, HDR.Length=0x0010 + cchString*2
 - [ ] ParticipantId: u32 LE, offset 4
 - [ ] GroupId: u32 LE, offset 8; Windows always 0 (Appendix A <6>)
 - [ ] Flags: u16 LE, offset 12

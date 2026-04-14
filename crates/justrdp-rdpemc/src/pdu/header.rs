@@ -91,6 +91,11 @@ impl UnicodeString {
         Some(Self { raw_utf16: units })
     }
 
+    /// `true` when the string carries zero UTF-16 code units.
+    pub fn is_empty(&self) -> bool {
+        self.raw_utf16.is_empty()
+    }
+
     /// Number of UTF-16 code units (the `cchString` wire field).
     pub fn cch(&self) -> u16 {
         // from_utf16 enforces ≤ 1024 and empty is 0; direct callers of
