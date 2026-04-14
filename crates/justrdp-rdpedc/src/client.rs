@@ -209,11 +209,17 @@ impl RdpedcClient {
         self.current_draw_target
     }
 
-    pub fn logical_len(&self) -> usize {
+    // Test-only accounting helpers. The public surface does not
+    // expose internal table sizes because call-site semantics are
+    // better served by `logical_surface(id).is_some()` membership
+    // checks.
+    #[cfg(test)]
+    pub(crate) fn logical_len(&self) -> usize {
         self.logical_surfaces.len()
     }
 
-    pub fn redir_len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn redir_len(&self) -> usize {
         self.redir_surfaces.len()
     }
 
@@ -283,7 +289,7 @@ impl RdpedcClient {
         let prev = self.mode;
         let next = match (prev, pdu.event_type) {
             // Reserved / ignored values: spec says SHOULD be ignored.
-            (_, EventType::Reserved00) | (_, EventType::Reserved01) => return Ok(()),
+            (_, EventType::Reserved1) | (_, EventType::Reserved2) => return Ok(()),
             // Duplicate CompositionOn while already On is silently
             // ignored per spec §2.2.1 — without this narrowing, a
             // redundant CompositionOn would clobber `dwm_desk: true`.
@@ -324,19 +330,40 @@ impl RdpedcClient {
     /// `h_lsurface` would silently drop the old entry without firing
     /// `on_logical_surface_destroyed` and without detaching dangling
     /// `assoc_lsurface` references on redirection surfaces.
+    ///
+    /// Callback ordering: every redirection surface whose
+    /// `assoc_lsurface` is cleared by this function fires its own
+    /// `on_redir_surface_disassociated` callback **before** the
+    /// logical surface's `on_logical_surface_destroyed` fires. This
+    /// keeps the associate/disassociate callback pairs balanced from
+    /// the host's perspective: every `on_redir_surface_associated`
+    /// call is eventually matched by exactly one disassociated call,
+    /// regardless of whether the disassociation happened via an
+    /// explicit `REDIRSURF_ASSOC` PDU or via the logical surface
+    /// being destroyed out from under it.
     fn destroy_logical_surface_internal<C: CompDeskCallback>(
         &mut self,
         h_lsurface: u64,
         cb: &mut C,
     ) {
-        if self.logical_surfaces.remove(&h_lsurface).is_some() {
-            for entry in self.redir_surfaces.values_mut() {
-                if entry.assoc_lsurface == Some(h_lsurface) {
-                    entry.assoc_lsurface = None;
-                }
-            }
-            cb.on_logical_surface_destroyed(h_lsurface);
+        if self.logical_surfaces.remove(&h_lsurface).is_none() {
+            return;
         }
+        // First pass: collect the cache_ids whose assoc_lsurface we
+        // need to clear. We can't mutate the map and fire callbacks in
+        // the same loop without running into the `&mut self` /
+        // `&mut C` borrow conflict, and a collection avoids it.
+        let mut detached: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        for (&cache_id, entry) in self.redir_surfaces.iter_mut() {
+            if entry.assoc_lsurface == Some(h_lsurface) {
+                entry.assoc_lsurface = None;
+                detached.push(cache_id);
+            }
+        }
+        for cache_id in detached {
+            cb.on_redir_surface_disassociated(cache_id);
+        }
+        cb.on_logical_surface_destroyed(h_lsurface);
     }
 
     /// Remove a redirection surface, clear it from `current_draw_target`
@@ -368,6 +395,11 @@ impl RdpedcClient {
             // malicious or buggy server could cycle the same
             // `h_lsurface` and suppress destroy notifications
             // indefinitely while accumulating stale redir associations.
+            //
+            // The cap check is intentionally skipped on the replace
+            // path: `destroy` drops the old entry, so the table goes
+            // N → N-1 → N across the two operations and the cap
+            // invariant (`len <= MAX_LOGICAL_SURFACES`) still holds.
             if self.logical_surfaces.contains_key(&pdu.h_lsurface) {
                 self.destroy_logical_surface_internal(pdu.h_lsurface, cb);
             } else if self.logical_surfaces.len() >= MAX_LOGICAL_SURFACES {
@@ -393,7 +425,8 @@ impl RdpedcClient {
     ) -> Result<(), RdpedcError> {
         if pdu.create {
             // Create-over-existing: same tear-down-first semantics as
-            // the logical-surface path.
+            // the logical-surface path. Cap check skipped on replace
+            // for the same reason — net size delta is zero.
             if self.redir_surfaces.contains_key(&pdu.cache_id) {
                 self.destroy_redir_surface_internal(pdu.cache_id, cb);
             } else if self.redir_surfaces.len() >= MAX_REDIR_SURFACES {
@@ -483,18 +516,24 @@ impl RdpedcClient {
         pdu: FlushComposeOnce,
         cb: &mut C,
     ) -> Result<(), RdpedcError> {
-        // Only act on known redirection surfaces. A server sending a
-        // FLUSH for a phantom `cache_id` would otherwise hand
-        // attacker-controlled ids to the host callback — mirror the
-        // guard in `apply_switch` so the callback contract is uniform.
+        // Only act on known redirection surfaces AND known logical
+        // surfaces. A server sending a FLUSH for a phantom `cache_id`
+        // or a fabricated `h_lsurface` would otherwise hand attacker-
+        // controlled ids to the host callback — mirror the guard in
+        // `apply_switch` so the callback contract is uniform and both
+        // u32/u64 arguments are guaranteed to name live table
+        // entries.
         //
         // Note: the spec (§3.2.5.3.2) says FLUSH_COMPOSEONCE SHOULD
         // only arrive for logical surfaces with the
         // `TS_COMPDESK_HLSURF_COMPOSEONCE` flag set. We intentionally
-        // do NOT validate that flag here — the spec itself only says
-        // SHOULD and gives no enforcement requirement, and the host
-        // callback may still want to see the event for telemetry.
-        if !self.redir_surfaces.contains_key(&pdu.cache_id) {
+        // do NOT validate that flag here — the spec only says SHOULD
+        // and gives no enforcement requirement, so log-and-forward is
+        // appropriate for the flag check while still validating
+        // identity.
+        if !self.redir_surfaces.contains_key(&pdu.cache_id)
+            || !self.logical_surfaces.contains_key(&pdu.h_lsurface)
+        {
             return Ok(());
         }
         // `flush` ends the currently active draw target; the next
@@ -654,8 +693,8 @@ mod tests {
         let mut cb = RecCallback::default();
         apply(&mut c, toggle(EventType::CompositionOn), &mut cb);
         cb.events.clear();
-        apply(&mut c, toggle(EventType::Reserved00), &mut cb);
-        apply(&mut c, toggle(EventType::Reserved01), &mut cb);
+        apply(&mut c, toggle(EventType::Reserved1), &mut cb);
+        apply(&mut c, toggle(EventType::Reserved2), &mut cb);
         assert!(cb.events.is_empty());
         assert_eq!(c.mode(), CompositionMode::On { dwm_desk: false });
     }
@@ -1048,6 +1087,18 @@ mod tests {
     fn flush_clears_current_draw_target_when_matching() {
         let mut c = RdpedcClient::new();
         let mut cb = RecCallback::default();
+        // apply_flush now requires BOTH cache_id and h_lsurface to
+        // name live table entries, so set up the logical surface too.
+        apply(
+            &mut c,
+            CompDeskPdu::LSurface(LSurfaceCreateDestroy {
+                create: true,
+                flags: LSurfaceFlags::COMPOSEONCE,
+                h_lsurface: 1,
+                hwnd: 0,
+            }),
+            &mut cb,
+        );
         apply(
             &mut c,
             CompDeskPdu::SurfObj(SurfObjCreateDestroy {
@@ -1075,6 +1126,36 @@ mod tests {
         );
         assert_eq!(c.current_draw_target(), None);
         assert!(cb.events.contains(&Event::Flush(7, 1)));
+    }
+
+    #[test]
+    fn flush_with_unknown_h_lsurface_does_not_fire_callback() {
+        // Security M1 regression: even when `cache_id` is live, a
+        // bogus `h_lsurface` must not reach the callback.
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        apply(
+            &mut c,
+            CompDeskPdu::SurfObj(SurfObjCreateDestroy {
+                create: true,
+                cache_id: 7,
+                surface_bpp: 32,
+                h_surf: 0,
+                cx: 0,
+                cy: 0,
+            }),
+            &mut cb,
+        );
+        cb.events.clear();
+        apply(
+            &mut c,
+            CompDeskPdu::Flush(FlushComposeOnce {
+                cache_id: 7,
+                h_lsurface: 0xDEAD_BEEF,
+            }),
+            &mut cb,
+        );
+        assert!(cb.events.is_empty());
     }
 
     #[test]
@@ -1212,15 +1293,96 @@ mod tests {
 
     // ── Regression tests for cross-agent review findings ─────────────
 
+    /// Build a client with logical surface 1, redir surface 2, and
+    /// an active association from 2 → 1. Used by several regression
+    /// tests that need the "populated" precondition.
+    fn setup_associated_pair(c: &mut RdpedcClient, cb: &mut RecCallback) {
+        apply(
+            c,
+            CompDeskPdu::LSurface(LSurfaceCreateDestroy {
+                create: true,
+                flags: LSurfaceFlags::COMPOSEONCE,
+                h_lsurface: 1,
+                hwnd: 0x10,
+            }),
+            cb,
+        );
+        apply(
+            c,
+            CompDeskPdu::SurfObj(SurfObjCreateDestroy {
+                create: true,
+                cache_id: 2,
+                surface_bpp: 32,
+                h_surf: 0xABCD,
+                cx: 0,
+                cy: 0,
+            }),
+            cb,
+        );
+        apply(
+            c,
+            CompDeskPdu::RedirSurfAssoc(RedirSurfAssocLSurface {
+                associate: true,
+                h_lsurface: 1,
+                h_surf: 0xABCD,
+            }),
+            cb,
+        );
+    }
+
     #[test]
-    fn lsurface_create_over_existing_fires_destroy_and_clears_assoc() {
-        // Security H1 regression: a server sending `create` for an
-        // existing hLSurface should see the old entry torn down
-        // cleanly (destroy callback + redir assoc_lsurface cleared)
-        // before the fresh entry replaces it.
+    fn lsurface_create_over_existing_fires_destroy_then_create() {
+        // Security H1 regression: callback order is destroy-then-create
+        // rather than a silent replace.
         let mut c = RdpedcClient::new();
         let mut cb = RecCallback::default();
-        // Create logical 1, redir 2 associated to logical 1.
+        setup_associated_pair(&mut c, &mut cb);
+        cb.events.clear();
+        apply(
+            &mut c,
+            CompDeskPdu::LSurface(LSurfaceCreateDestroy {
+                create: true,
+                flags: LSurfaceFlags::REDIRECTION,
+                h_lsurface: 1,
+                hwnd: 0x99,
+            }),
+            &mut cb,
+        );
+        assert_eq!(
+            cb.events,
+            vec![Event::Disassoc(2), Event::LDestroyed(1), Event::LCreated(1)]
+        );
+        assert_eq!(c.logical_surface(1).unwrap().hwnd, 0x99);
+    }
+
+    #[test]
+    fn lsurface_create_over_existing_clears_redir_assoc() {
+        // Security H1 regression (separate concern): the redir
+        // surface's `assoc_lsurface` pointer is cleared.
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        setup_associated_pair(&mut c, &mut cb);
+        apply(
+            &mut c,
+            CompDeskPdu::LSurface(LSurfaceCreateDestroy {
+                create: true,
+                flags: LSurfaceFlags::REDIRECTION,
+                h_lsurface: 1,
+                hwnd: 0x99,
+            }),
+            &mut cb,
+        );
+        assert_eq!(c.redir_surface(2).unwrap().assoc_lsurface, None);
+    }
+
+    #[test]
+    fn lsurface_create_over_existing_resets_compref_pending() {
+        // The fresh entry after a replace MUST have compref_pending
+        // reset to false, even if the old entry had it set. This
+        // assertion is only load-bearing because we set the flag on
+        // the old entry via a CompRefPending PDU before replacing.
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
         apply(
             &mut c,
             CompDeskPdu::LSurface(LSurfaceCreateDestroy {
@@ -1233,27 +1395,10 @@ mod tests {
         );
         apply(
             &mut c,
-            CompDeskPdu::SurfObj(SurfObjCreateDestroy {
-                create: true,
-                cache_id: 2,
-                surface_bpp: 32,
-                h_surf: 0xABCD,
-                cx: 0,
-                cy: 0,
-            }),
+            CompDeskPdu::CompRefPending(LSurfaceCompRefPending { h_lsurface: 1 }),
             &mut cb,
         );
-        apply(
-            &mut c,
-            CompDeskPdu::RedirSurfAssoc(RedirSurfAssocLSurface {
-                associate: true,
-                h_lsurface: 1,
-                h_surf: 0xABCD,
-            }),
-            &mut cb,
-        );
-        cb.events.clear();
-        // Now send a second create for logical 1 with a different hwnd.
+        assert!(c.logical_surface(1).unwrap().compref_pending);
         apply(
             &mut c,
             CompDeskPdu::LSurface(LSurfaceCreateDestroy {
@@ -1264,18 +1409,35 @@ mod tests {
             }),
             &mut cb,
         );
-        // Callbacks must be in order: destroyed old, created new.
+        assert!(!c.logical_surface(1).unwrap().compref_pending);
+    }
+
+    #[test]
+    fn explicit_lsurface_destroy_fires_disassoc_before_destroy() {
+        // Security M2 regression: balanced assoc/disassoc callbacks.
+        // Every `on_redir_surface_associated` must be matched by
+        // exactly one `on_redir_surface_disassociated`, including when
+        // the disassociation is indirect via the logical surface
+        // being torn down.
+        let mut c = RdpedcClient::new();
+        let mut cb = RecCallback::default();
+        setup_associated_pair(&mut c, &mut cb);
+        cb.events.clear();
+        apply(
+            &mut c,
+            CompDeskPdu::LSurface(LSurfaceCreateDestroy {
+                create: false,
+                flags: LSurfaceFlags::default(),
+                h_lsurface: 1,
+                hwnd: 0,
+            }),
+            &mut cb,
+        );
+        // Order: disassoc(2) first, then destroyed(1).
         assert_eq!(
             cb.events,
-            vec![Event::LDestroyed(1), Event::LCreated(1)]
+            vec![Event::Disassoc(2), Event::LDestroyed(1)]
         );
-        // The redir entry's assoc_lsurface must have been cleared.
-        assert_eq!(c.redir_surface(2).unwrap().assoc_lsurface, None);
-        // The fresh entry carries the new hwnd and has compref_pending
-        // reset to false.
-        let entry = c.logical_surface(1).unwrap();
-        assert_eq!(entry.hwnd, 0x99);
-        assert!(!entry.compref_pending);
     }
 
     #[test]

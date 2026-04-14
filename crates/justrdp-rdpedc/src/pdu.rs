@@ -75,12 +75,17 @@ fn check_cache_id_no_bit31(cache_id: u32, ctx: &'static str) -> EncodeResult<()>
 // ── TS_COMPDESK_TOGGLE (§2.2.1.1) ────────────────────────────────────
 
 /// `TS_COMPDESK_TOGGLE.eventType` values, spec §2.2.1.1.
+///
+/// The `Reserved1` / `Reserved2` variants correspond to the spec's
+/// two reserved values `0x01` and `0x02`; their suffixes match the
+/// wire value, not an ordinal index. Per spec, a client that receives
+/// either value SHOULD silently ignore the toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EventType {
     CompositionOff = 0x00,
-    Reserved00 = 0x01,
-    Reserved01 = 0x02,
+    Reserved1 = 0x01,
+    Reserved2 = 0x02,
     CompositionOn = 0x03,
     DwmDeskEnter = 0x04,
     DwmDeskLeave = 0x05,
@@ -90,8 +95,8 @@ impl EventType {
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0x00 => Self::CompositionOff,
-            0x01 => Self::Reserved00,
-            0x02 => Self::Reserved01,
+            0x01 => Self::Reserved1,
+            0x02 => Self::Reserved2,
             0x03 => Self::CompositionOn,
             0x04 => Self::DwmDeskEnter,
             0x05 => Self::DwmDeskLeave,
@@ -523,7 +528,13 @@ impl<'de> Decode<'de> for FlushComposeOnce {
             return Err(DecodeError::invalid_value(CTX, "operation"));
         }
         expect_body_size(hdr.body_size, Self::BODY_SIZE, CTX)?;
-        // Spec: bit 31 MUST be ignored, so we mask instead of erroring.
+        // Spec §2.2.3.2: bit 31 of cacheId "MUST be 0 and MUST be
+        // ignored by the client" — so we MASK instead of rejecting.
+        // This is deliberately different from the sibling PDU
+        // `SwitchSurfObj` (spec §2.2.3.1) which says "MUST be 0" with
+        // no "ignored" clause and therefore REJECTS bit 31 on decode.
+        // Do NOT "fix" this to match SwitchSurfObj — it would break
+        // spec compliance for FLUSH.
         let cache_id = src.read_u32_le(CTX)? & crate::constants::CACHE_ID_ID_MASK;
         let h_lsurface = src.read_u64_le(CTX)?;
         Ok(Self {
@@ -552,9 +563,17 @@ pub enum CompDeskPdu {
 /// `src` by exactly the wire size of the decoded PDU.
 ///
 /// Returns `Err` if the header byte is wrong or the operation code
-/// is unknown. Forward-compatibility with future op codes is NOT
-/// handled here — [`crate::client::RdpedcClient::process_order`] is
-/// responsible for skipping unknown orders using `size + 4` bytes.
+/// is outside the `0x01..=0x07` range currently defined by the spec.
+/// For an unknown op code the error is an opaque
+/// `DecodeError::invalid_value` with context `"unknown operation"` —
+/// the raw operation byte is NOT preserved in the error itself.
+/// Forward-compatibility with future op codes is NOT handled here:
+/// [`crate::client::RdpedcClient::process_order`] is the correct
+/// entry point for that path, as it reads the `size` field and
+/// skips `size + 4` bytes for unknown ops.
+///
+/// Prefer `RdpedcClient::process_order` for wire bytes you do not
+/// already know to be a known op code.
 pub fn decode_any<'de>(src: &mut ReadCursor<'de>) -> DecodeResult<CompDeskPdu> {
     const CTX: &str = "MS-RDPEDC::decode_any";
     // Peek the operation byte without consuming. We know we need at
@@ -607,8 +626,8 @@ mod tests {
     fn toggle_roundtrip_all_event_types() {
         for &ev in &[
             EventType::CompositionOff,
-            EventType::Reserved00,
-            EventType::Reserved01,
+            EventType::Reserved1,
+            EventType::Reserved2,
             EventType::CompositionOn,
             EventType::DwmDeskEnter,
             EventType::DwmDeskLeave,
