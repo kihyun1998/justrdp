@@ -21,14 +21,23 @@ pub mod property;
 /// `pdu.size()`. Used by the DVC processors to turn a constructed PDU
 /// into the payload of a [`justrdp_dvc::DvcMessage`].
 ///
-/// This function treats a mismatch between `size()` and the number of
-/// bytes actually written as a programming bug: `debug_assert_eq!` fires
-/// in debug builds, and release builds still return a correct buffer
-/// because the write cursor borrows `buf` exclusively.
+/// A mismatch between `size()` and the number of bytes actually
+/// written is a programming bug that corrupts every buffer produced
+/// for this PDU kind, so the check runs in release builds too
+/// (`assert_eq!`). Debug-only assertion would silently return a
+/// buffer with trailing zero bytes on release, which is harder to
+/// catch and far more damaging at runtime than a clean panic.
 pub(crate) fn encode_to_vec<E: Encode>(pdu: &E) -> EncodeResult<Vec<u8>> {
     let mut buf = vec![0u8; pdu.size()];
     let mut cur = WriteCursor::new(&mut buf);
     pdu.encode(&mut cur)?;
-    debug_assert_eq!(cur.pos(), pdu.size());
+    assert_eq!(
+        cur.pos(),
+        pdu.size(),
+        "encode() wrote {} bytes but size() promised {} for {}",
+        cur.pos(),
+        pdu.size(),
+        pdu.name()
+    );
     Ok(buf)
 }

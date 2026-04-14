@@ -584,7 +584,7 @@ ACTIVE or STREAMING
 65 00 72 00 61 00 20 00 31 00 00 00
 52 44 43 61 6d 65 72 61 5f 44 65 76 69 63 65 5f 30 00
 ```
-- `DeviceName = "Mock Camera 1"` (UTF-16 LE, 14 chars × 2 + 2 null = 30 bytes)
+- `DeviceName = "Mock Camera 1"` (UTF-16 LE, 13 chars × 2 + 2 null = 28 bytes)
 - `VirtualChannelName = "RDCamera_Device_0"` (ANSI, 17 chars + 1 null = 18 bytes)
 
 #### 9.4 StreamListResponse (§4.4.4) — 12 bytes

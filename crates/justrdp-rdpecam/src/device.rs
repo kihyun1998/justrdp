@@ -37,7 +37,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use justrdp_core::{AsAny, Encode, EncodeError};
+use justrdp_core::{AsAny, Encode};
 use justrdp_dvc::{DvcError, DvcMessage, DvcProcessor, DvcResult};
 
 use crate::camera::CameraDevice;
@@ -295,11 +295,26 @@ impl RdpecamDeviceClient {
             ));
         }
         match self.device.capture_sample(req.stream_index) {
-            Ok(sample) => Self::one(&SampleResponse {
-                version: self.negotiated_version,
-                stream_index: req.stream_index,
-                sample,
-            }),
+            Ok(sample) => {
+                // Defence in depth: the `SampleResponse` encoder
+                // enforces MAX_SAMPLE_BYTES, but we check here too
+                // so a misbehaving host cannot slip a 10 MiB buffer
+                // through to `encode_to_vec` where the failure would
+                // surface as a channel-level `DvcError::Encode`
+                // instead of the spec-mandated `SampleErrorResponse`.
+                if sample.len() > crate::pdu::capture::MAX_SAMPLE_BYTES {
+                    return Self::one(&SampleErrorResponse::new(
+                        self.negotiated_version,
+                        req.stream_index,
+                        ErrorCode::OutOfMemory,
+                    ));
+                }
+                Self::one(&SampleResponse {
+                    version: self.negotiated_version,
+                    stream_index: req.stream_index,
+                    sample,
+                })
+            }
             Err(e) => Self::one(&SampleErrorResponse::new(
                 self.negotiated_version,
                 req.stream_index,
@@ -381,12 +396,14 @@ impl RdpecamDeviceClient {
     }
 }
 
-/// Decodes exactly `P` from `payload`, converting both decode errors and
-/// trailing-byte garbage into `ErrorResponse(InvalidMessage)` at the
-/// caller. Returns the wire-format error as a `DvcError::Decode` that
-/// the caller translates via `?`-and-catch pattern OR propagates
-/// directly; we use the latter so the processor's helper code stays
-/// terse.
+/// Decodes exactly `P` from `payload`. Both a parse failure and
+/// trailing-byte garbage surface as `DvcError::Decode`, which
+/// `process()` catches and translates into
+/// `ErrorResponse(InvalidMessage)` per MS-RDPECAM §8. Keeping every
+/// wire-format defect in a single error variant is what lets the
+/// caller replace the usual `?` with a uniform catch-arm without
+/// accidentally letting a `DvcError::Protocol` (channel tear-down)
+/// escape for a bug the spec only intends to trigger an error reply.
 fn decode_exact<P>(payload: &[u8]) -> DvcResult<P>
 where
     for<'a> P: Decode<'a>,
@@ -394,8 +411,9 @@ where
     let mut cur = ReadCursor::new(payload);
     let pdu = P::decode(&mut cur).map_err(DvcError::Decode)?;
     if cur.remaining() != 0 {
-        return Err(DvcError::Protocol(String::from(
-            "RDPECAM device: trailing bytes after PDU",
+        return Err(DvcError::Decode(justrdp_core::DecodeError::invalid_value(
+            "CAM::device",
+            "trailing bytes after PDU",
         )));
     }
     Ok(pdu)
@@ -417,11 +435,16 @@ impl DvcProcessor for RdpecamDeviceClient {
 
     fn start(&mut self, channel_id: u32) -> DvcResult<Vec<DvcMessage>> {
         // If DRDYNVC re-creates this channel after an earlier close,
-        // make absolutely sure we do not carry over a streaming flag
-        // from the prior lifetime. Deactivating here is best-effort;
-        // the host trait may or may not support re-deactivation, so
-        // we ignore the result and always reset local state.
-        if matches!(self.state, DeviceState::Activated { .. }) {
+        // we MUST tear the host state down in the same order the
+        // per-message handlers do -- stop_streams before deactivate --
+        // otherwise a host that enforces the ordering contract would
+        // leak a streaming handle every time the DVC bounces. Both
+        // teardown calls are best-effort because the trait cannot
+        // report errors from within `start()`.
+        if self.is_streaming() {
+            let _ = self.device.stop_streams();
+        }
+        if self.is_activated() {
             let _ = self.device.deactivate();
         }
         self.channel_id = channel_id;
@@ -440,14 +463,14 @@ impl DvcProcessor for RdpecamDeviceClient {
                 "RDPECAM device: channel_id mismatch",
             )));
         }
-        // A wire-format error during PDU decode is converted into an
-        // ErrorResponse at `dispatch`, so the only things propagating as
-        // `DvcError` are outright protocol violations (trailing bytes,
-        // encode failures).
+        // Every wire-format defect (malformed field, wrong size,
+        // trailing bytes) arrives here as `DvcError::Decode` and is
+        // answered with `ErrorResponse(InvalidMessage)`. Any other
+        // error is a genuine protocol / encoding failure and bubbles
+        // up so the DVC framework can tear the channel down.
         match self.dispatch(payload) {
             Ok(msgs) => Ok(msgs),
             Err(DvcError::Decode(_)) => self.err_response(ErrorCode::InvalidMessage),
-            Err(DvcError::Encode(e)) => Err(DvcError::Encode(EncodeError::from(e))),
             Err(other) => Err(other),
         }
     }
@@ -926,16 +949,102 @@ mod tests {
 
     #[test]
     fn server_sending_client_only_message_returns_invalid_message() {
-        // SuccessResponse is a C→S message -- server should never send it.
+        // Every MessageId that is C→S-only on the device channel
+        // MUST produce `ErrorResponse(InvalidMessage)` when arriving
+        // from the server. Covers SuccessResponse (0x01),
+        // ErrorResponse (0x02), SampleResponse (0x12), and
+        // SampleErrorResponse (0x13) to lock in the contract for the
+        // whole set, not just the canonical 0x01 case.
+        for id in [0x01u8, 0x02, 0x12, 0x13] {
+            let mut c = build_client(VERSION_2);
+            c.start(1).unwrap();
+            let mut out = c.process(1, &[VERSION_2, id]).unwrap();
+            let resp = out.remove(0).data;
+            assert_eq!(
+                first_two(&resp),
+                (VERSION_2, 0x02),
+                "message id 0x{:02x} should be rejected",
+                id
+            );
+            assert_eq!(
+                u32::from_le_bytes([resp[2], resp[3], resp[4], resp[5]]),
+                ErrorCode::InvalidMessage.to_u32()
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_after_valid_pdu_return_invalid_message() {
+        // A wire-format defect that `Decode` itself does not surface
+        // (the PDU parsed, there were just extra trailing bytes)
+        // MUST still be answered with `ErrorResponse(InvalidMessage)`
+        // rather than escaping as a channel-level `DvcError::Protocol`
+        // that tears the DVC down. Regression guard for the Step 5
+        // review fix of `decode_exact`.
         let mut c = build_client(VERSION_2);
         c.start(1).unwrap();
-        let mut out = c.process(1, &[VERSION_2, 0x01]).unwrap();
+        // Encode a valid ActivateDeviceRequest and append one byte.
+        let mut bytes = encode_to_vec(&ActivateDeviceRequest::new(VERSION_2)).unwrap();
+        bytes.push(0xFF);
+        let mut out = c.process(1, &bytes).unwrap();
         let resp = out.remove(0).data;
         assert_eq!(first_two(&resp), (VERSION_2, 0x02));
         assert_eq!(
             u32::from_le_bytes([resp[2], resp[3], resp[4], resp[5]]),
             ErrorCode::InvalidMessage.to_u32()
         );
+        // And the processor is still healthy: a subsequent well-formed
+        // Activate must still succeed.
+        let ok = exchange(&mut c, ActivateDeviceRequest::new(VERSION_2));
+        assert_eq!(first_two(&ok), (VERSION_2, 0x01));
+    }
+
+    #[test]
+    fn start_recreate_during_streaming_tears_down_in_order() {
+        // Simulates DRDYNVC re-creating the per-device channel while
+        // the host is mid-stream. The processor MUST call
+        // `stop_streams` before `deactivate`, never the other way
+        // round, so a host that enforces the ordering does not leak a
+        // streaming handle. After the second `start()` the processor
+        // must be back in `Initialised` and a fresh Activate must
+        // work against the same (re-armed) mock.
+        let mut c = build_client(VERSION_2);
+        c.start(1).unwrap();
+        exchange(&mut c, ActivateDeviceRequest::new(VERSION_2));
+        exchange(
+            &mut c,
+            StartStreamsRequest {
+                version: VERSION_2,
+                infos: alloc::vec![StartStreamInfo {
+                    stream_index: 0,
+                    media_type: base_media_type(),
+                }],
+            },
+        );
+        assert!(c.is_streaming());
+        // Server tears down and re-creates (same channel id so the
+        // in-process `exchange` helper keeps working). Internally
+        // this MUST call stop_streams then deactivate on the host
+        // trait before resetting local state.
+        c.start(1).unwrap();
+        assert!(c.is_open());
+        assert!(!c.is_activated());
+        assert!(!c.is_streaming());
+        // The mock accepts a fresh activate/start cycle only if the
+        // prior teardown left it consistent (not half-streaming).
+        let ok = exchange(&mut c, ActivateDeviceRequest::new(VERSION_2));
+        assert_eq!(first_two(&ok), (VERSION_2, 0x01));
+        let ok = exchange(
+            &mut c,
+            StartStreamsRequest {
+                version: VERSION_2,
+                infos: alloc::vec![StartStreamInfo {
+                    stream_index: 0,
+                    media_type: base_media_type(),
+                }],
+            },
+        );
+        assert_eq!(first_two(&ok), (VERSION_2, 0x01));
     }
 
     #[test]

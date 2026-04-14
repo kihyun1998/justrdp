@@ -445,13 +445,47 @@ mod tests {
 
     #[test]
     fn device_added_rejects_device_name_over_cap() {
-        // decode path: construct wire bytes with MAX_DEVICE_NAME_UTF16+1 code units
+        // decode path: construct wire bytes with MAX_DEVICE_NAME_UTF16+1
+        // code units. The cap check in `read_utf16_null_terminated`
+        // fires on the (cap+1)-th iteration -- the loop accepts 256
+        // units and errors on the 257th -- so this payload must be
+        // rejected before the null terminator is reached.
         let mut bytes: Vec<u8> = alloc::vec![0x02, 0x05];
         for _ in 0..=MAX_DEVICE_NAME_UTF16 {
             bytes.extend_from_slice(&0x0041u16.to_le_bytes());
         }
         bytes.extend_from_slice(&[0x00, 0x00]);
         bytes.extend_from_slice(b"\0");
+        let mut r = ReadCursor::new(&bytes);
+        assert!(DeviceAddedNotification::decode(&mut r).is_err());
+    }
+
+    #[test]
+    fn device_added_accepts_device_name_at_exact_cap() {
+        // Companion to the over-cap test: MAX_DEVICE_NAME_UTF16 code
+        // units followed by a null terminator must decode cleanly.
+        // Catches off-by-one regressions in the cap boundary that a
+        // single "reject > cap" test cannot.
+        let mut bytes: Vec<u8> = alloc::vec![0x02, 0x05];
+        for _ in 0..MAX_DEVICE_NAME_UTF16 {
+            bytes.extend_from_slice(&0x0041u16.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0x00, 0x00]);
+        bytes.extend_from_slice(b"X\0");
+        let mut r = ReadCursor::new(&bytes);
+        let pdu = DeviceAddedNotification::decode(&mut r).unwrap();
+        assert_eq!(pdu.device_name.len(), MAX_DEVICE_NAME_UTF16);
+    }
+
+    #[test]
+    fn device_added_rejects_utf16_odd_byte_orphan() {
+        // Spec §6: "odd-length remaining bytes → malformed". One
+        // complete UTF-16 code unit followed by a single orphan byte
+        // with no null terminator leaves `read_u16_le` needing two
+        // bytes but only having one -- must surface as a decode error.
+        let mut bytes: Vec<u8> = alloc::vec![0x02, 0x05];
+        bytes.extend_from_slice(&0x0041u16.to_le_bytes()); // 'A'
+        bytes.push(0x42); // orphan half of the next code unit
         let mut r = ReadCursor::new(&bytes);
         assert!(DeviceAddedNotification::decode(&mut r).is_err());
     }

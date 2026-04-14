@@ -168,7 +168,7 @@ impl PropertyValue {
     }
 }
 
-// ── PropertyDescription (§2.2.3.17.1) — 18 bytes ──
+// ── PropertyDescription (§2.2.3.17.1) — 19 bytes ──
 
 /// Full description of one property advertised in a
 /// [`PropertyListResponse`]. All value fields are **signed** 32-bit LE.

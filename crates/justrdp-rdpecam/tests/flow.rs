@@ -18,13 +18,15 @@ use justrdp_dvc::DvcProcessor;
 use justrdp_rdpecam::{
     camera_control_property_id, frame_source_types, media_type_flags, property_capabilities,
     video_proc_amp_property_id, ActivateDeviceRequest, CurrentMediaTypeRequest,
-    DeactivateDeviceRequest, ErrorCode, MediaFormat, MediaTypeDescription, MediaTypeListRequest,
+    CurrentMediaTypeResponse, DeactivateDeviceRequest, DeviceAddedNotification,
+    DeviceRemovedNotification, ErrorCode, MediaFormat, MediaTypeDescription, MediaTypeListRequest,
     MediaTypeListResponse, MockCameraDevice, PropertyDescription, PropertyListRequest,
     PropertyListResponse, PropertyMode, PropertySet, PropertyValue, PropertyValueRequest,
     PropertyValueResponse, RdpecamDeviceClient, RdpecamEnumeratorClient, SampleRequest,
-    SetPropertyValueRequest, StartStreamInfo, StartStreamsRequest, StopStreamsRequest,
-    StreamDescription, StreamListRequest, StreamListResponse, SuccessResponse, VERSION_1,
-    VERSION_2, STREAM_CATEGORY_CAPTURE,
+    SampleResponse, SelectVersionRequest, SelectVersionResponse, SetPropertyValueRequest,
+    StartStreamInfo, StartStreamsRequest, StopStreamsRequest, StreamDescription,
+    StreamListRequest, StreamListResponse, SuccessResponse, STREAM_CATEGORY_CAPTURE, VERSION_1,
+    VERSION_2,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -385,9 +387,3 @@ fn unknown_property_id_returns_item_not_found() {
     );
 }
 
-// Imports used inside the tests above but declared down here so the
-// top-of-file use-list stays focused on the public crate surface.
-use justrdp_rdpecam::{
-    CurrentMediaTypeResponse, DeviceAddedNotification, DeviceRemovedNotification,
-    SampleResponse, SelectVersionRequest, SelectVersionResponse,
-};

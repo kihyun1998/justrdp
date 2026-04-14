@@ -193,6 +193,12 @@ impl MediaTypeDescription {
         if self.frame_rate_denominator == 0 {
             return Err(EncodeError::invalid_value(ctx, "frame_rate_denominator == 0"));
         }
+        if self.pixel_aspect_ratio_denominator == 0 {
+            return Err(EncodeError::invalid_value(
+                ctx,
+                "pixel_aspect_ratio_denominator == 0",
+            ));
+        }
         dst.write_u8(self.format.to_u8(), ctx)?;
         dst.write_u32_le(self.width, ctx)?;
         dst.write_u32_le(self.height, ctx)?;
@@ -218,6 +224,17 @@ impl MediaTypeDescription {
         }
         let pixel_aspect_ratio_numerator = src.read_u32_le(ctx)?;
         let pixel_aspect_ratio_denominator = src.read_u32_le(ctx)?;
+        // Mirror the frame-rate guard above: a zero denominator would
+        // make every downstream consumer that computes the effective
+        // pixel aspect ratio panic on debug builds or wrap silently in
+        // release, turning a server-controlled byte into a remotely
+        // triggerable client defect.
+        if pixel_aspect_ratio_denominator == 0 {
+            return Err(DecodeError::invalid_value(
+                ctx,
+                "pixel_aspect_ratio_denominator == 0",
+            ));
+        }
         let flags = src.read_u8(ctx)?;
         Ok(Self {
             format,
@@ -724,6 +741,38 @@ mod tests {
         let mut buf: Vec<u8> = alloc::vec![0u8; MediaTypeDescription::WIRE_SIZE];
         let mut w = WriteCursor::new(&mut buf);
         assert!(bad.encode_inner(&mut w, "test").is_err());
+    }
+
+    #[test]
+    fn media_type_description_encode_rejects_zero_pixel_aspect_ratio_denominator() {
+        let bad = MediaTypeDescription {
+            format: MediaFormat::Yuy2,
+            width: 640,
+            height: 480,
+            frame_rate_numerator: 30,
+            frame_rate_denominator: 1,
+            pixel_aspect_ratio_numerator: 1,
+            pixel_aspect_ratio_denominator: 0,
+            flags: 0,
+        };
+        let mut buf: Vec<u8> = alloc::vec![0u8; MediaTypeDescription::WIRE_SIZE];
+        let mut w = WriteCursor::new(&mut buf);
+        assert!(bad.encode_inner(&mut w, "test").is_err());
+    }
+
+    #[test]
+    fn media_type_description_decode_rejects_zero_pixel_aspect_ratio_denominator() {
+        let mut buf: Vec<u8> = alloc::vec![0u8; MediaTypeDescription::WIRE_SIZE];
+        buf[0] = MediaFormat::H264_RAW;
+        buf[1..5].copy_from_slice(&640u32.to_le_bytes());
+        buf[5..9].copy_from_slice(&480u32.to_le_bytes());
+        buf[9..13].copy_from_slice(&30u32.to_le_bytes());
+        buf[13..17].copy_from_slice(&1u32.to_le_bytes());
+        buf[17..21].copy_from_slice(&1u32.to_le_bytes());
+        buf[21..25].copy_from_slice(&0u32.to_le_bytes()); // zero PAR denom
+        buf[25] = 0;
+        let mut r = ReadCursor::new(&buf);
+        assert!(MediaTypeDescription::decode_inner(&mut r, "test").is_err());
     }
 
     #[test]

@@ -107,6 +107,14 @@ pub trait CameraDevice: Send {
     /// Captures one sample from the given stream. Returns the raw codec
     /// payload to be wrapped in a `SampleResponse`. Empty vectors are
     /// allowed (zero-length sample).
+    ///
+    /// Implementations MUST NOT return more than
+    /// [`crate::pdu::capture::MAX_SAMPLE_BYTES`] (4 MiB). The processor
+    /// defensively truncates oversize responses to
+    /// `SampleErrorResponse(OutOfMemory)`, but allocating the buffer
+    /// on the host side in the first place still risks memory
+    /// pressure on the embedder -- fail fast in the host if the
+    /// frame would exceed the limit.
     fn capture_sample(&mut self, stream_index: u8) -> Result<Vec<u8>, CamError>;
 
     // ── v2 Property API ──
