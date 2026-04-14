@@ -9,3 +9,4 @@ pub mod format;
 pub mod guid;
 pub mod header;
 pub mod presentation;
+pub mod stream;

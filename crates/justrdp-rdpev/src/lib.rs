@@ -87,3 +87,6 @@ pub use pdu::presentation::{
     OnNewPresentation, SetChannelParams, SetTopologyReq, SetTopologyRsp, ShutdownPresentationReq,
     ShutdownPresentationRsp,
 };
+
+#[cfg(feature = "alloc")]
+pub use pdu::stream::{AddStream, RemoveStream};
