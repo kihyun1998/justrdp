@@ -12,11 +12,19 @@ use super::asn1::*;
 use justrdp_core::DecodeResult;
 
 /// PA-PK-AS-REQ ::= SEQUENCE {
-///     signedAuthPack [0] IMPLICIT OCTET STRING  -- CMS SignedData(AuthPack)
+///     signedAuthPack          [0] IMPLICIT OCTET STRING,
+///                             -- CMS type ContentInfo (RFC 5652)
+///                             -- carrying SignedData(AuthPack)
+///     trustedCertifiers       [1] SEQUENCE OF ... OPTIONAL,  -- unused
+///     kdcPkId                 [2] IMPLICIT OCTET STRING OPTIONAL  -- unused
 /// }
+///
+/// RFC 4556 §3.2.1. `trustedCertifiers` and `kdcPkId` are optional
+/// and deliberately not emitted — JustRDP is a pure client that
+/// does not steer KDC trust anchors or identify target KDC keys.
 #[derive(Debug, Clone)]
 pub struct PaPkAsReq {
-    /// CMS SignedData containing the signed AuthPack.
+    /// CMS ContentInfo (SignedData) wrapping the signed AuthPack.
     pub signed_auth_pack: Vec<u8>,
 }
 
@@ -24,9 +32,21 @@ impl PaPkAsReq {
     /// Encode as DER.
     pub fn encode(&self) -> Vec<u8> {
         build_sequence(|w| {
-            // [0] IMPLICIT OCTET STRING
-            let t0 = build_context_tag(0, |w| w.write_octet_string(&self.signed_auth_pack));
-            w.write_raw(&t0);
+            // signedAuthPack `[0] IMPLICIT OCTET STRING`.
+            //
+            // DER IMPLICIT tagging of a primitive type (OCTET STRING
+            // is tag 0x04, primitive) replaces the tag octet with
+            // the context-specific tag *in its primitive form*. The
+            // resulting bytes are `80 <len> <content>`, NOT
+            // `A0 <len> 04 <inner-len> <content>` — the latter is
+            // the EXPLICIT form and is what an earlier revision of
+            // this function emitted. Windows AD KDCs strictly
+            // validate this against RFC 4556 §3.2.1 and would
+            // reject the doubly-wrapped form.
+            //
+            // See ITU-T X.690 §8.14.3 for the IMPLICIT tagging rule.
+            const CLASS_CONTEXT_PRIMITIVE_0: u8 = 0x80;
+            w.write_tlv(CLASS_CONTEXT_PRIMITIVE_0, &self.signed_auth_pack);
         })
     }
 }
@@ -125,13 +145,26 @@ impl AuthPack {
 ///     algorithm AlgorithmIdentifier { dhpublicnumber, DomainParameters },
 ///     subjectPublicKey BIT STRING (INTEGER)
 /// }
+///
+/// DomainParameters ::= SEQUENCE {
+///     p INTEGER,  -- odd prime, p = jq + 1
+///     g INTEGER,  -- generator, g
+///     q INTEGER,  -- factor of p-1 (subgroup order)
+///     j INTEGER OPTIONAL,  -- subgroup factor
+///     validationParms ValidationParms OPTIONAL
+/// }
 /// ```
-pub fn build_dh_spki(p: &[u8], g: &[u8], public_value: &[u8]) -> Vec<u8> {
+///
+/// `q` is REQUIRED by RFC 4556 §3.2.3.1 when using a well-known MODP
+/// group, and Windows AD KDCs reject `DomainParameters` that omit it.
+/// For Oakley Group 14 (RFC 3526) callers can derive `q = (p - 1) / 2`
+/// via `OakleyGroup14::order()` in `justrdp-core`.
+pub fn build_dh_spki(p: &[u8], g: &[u8], q: &[u8], public_value: &[u8]) -> Vec<u8> {
     // AlgorithmIdentifier: SEQUENCE { OID dhpublicnumber, DomainParameters }
-    // DomainParameters ::= SEQUENCE { p INTEGER, g INTEGER, q INTEGER OPTIONAL }
     let domain_params = build_sequence(|w| {
         w.write_integer_bytes(p);
         w.write_integer_bytes(g);
+        w.write_integer_bytes(q);
     });
 
     let algo_id = build_sequence(|w| {
@@ -279,8 +312,9 @@ mod tests {
     fn dh_spki_encode() {
         let p = vec![0x00, 0xFF]; // small prime for testing
         let g = vec![0x02];
+        let q = vec![0x7F]; // (p-1)/2 for the toy p
         let pub_val = vec![0x00, 0x42];
-        let spki = build_dh_spki(&p, &g, &pub_val);
+        let spki = build_dh_spki(&p, &g, &q, &pub_val);
         assert_eq!(spki[0], TAG_SEQUENCE);
     }
 

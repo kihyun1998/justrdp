@@ -359,10 +359,14 @@ impl KerberosSequence {
             .map_err(|_| ConnectorError::general("DH private key too short (min 32 bytes)"))?;
         let p = OakleyGroup14::prime();
         let g = OakleyGroup14::generator();
+        // q = (p-1)/2 for Oakley Group 14 safe-prime. Required by
+        // RFC 4556 §3.2.3.1 in the DomainParameters SEQUENCE.
+        let q = OakleyGroup14::order();
 
         let pub_bytes = kp.public_key.to_be_bytes();
         let p_bytes = p.to_be_bytes();
         let g_bytes = g.to_be_bytes();
+        let q_bytes = q.to_be_bytes();
 
         // Build the req body first (needed for paChecksum)
         let req_body = KdcReqBody {
@@ -382,7 +386,7 @@ impl KerberosSequence {
         let pa_checksum = sha1.finalize().to_vec();
 
         // Build AuthPack
-        let dh_spki = build_dh_spki(&p_bytes, &g_bytes, &pub_bytes);
+        let dh_spki = build_dh_spki(&p_bytes, &g_bytes, &q_bytes, &pub_bytes);
 
         let auth_pack = AuthPack {
             pk_authenticator: PkAuthenticator {
@@ -397,24 +401,43 @@ impl KerberosSequence {
 
         let auth_pack_der = auth_pack.encode();
 
+        // RFC 4556 §3.2.1 + RFC 5652 §5.3: the SignerInfo MUST carry
+        // a signedAttributes SET containing id-contentType and
+        // id-messageDigest, and the signature MUST be computed over
+        // the DER-encoded signedAttributes (re-tagged as SET 0x31
+        // per RFC 5652 §5.4), not directly over the eContent.
+        let message_digest = {
+            let mut h = Sha256::new();
+            h.update(&auth_pack_der);
+            h.finalize().to_vec()
+        };
+        let signed_attrs_inner =
+            cms::build_signed_attrs_inner(OID_PKINIT_AUTH_DATA, &message_digest);
+        let signed_attrs_to_sign = cms::build_signed_attrs_for_signing(&signed_attrs_inner);
+        let signed_attrs_in_signer_info =
+            cms::build_signed_attrs_for_signer_info(&signed_attrs_inner);
+
         // Two source modes for the certificate and signature:
         //   - smartcard_provider: host hashes, card signs, chain comes
         //     from the provider (end-entity + intermediates).
         //   - raw key: legacy path, in-memory RsaPrivateKey signs and
         //     a single client_cert_der is used.
+        // Both paths now sign `signed_attrs_to_sign` instead of the
+        // raw AuthPack DER so the CMS SignerInfo signature is
+        // RFC 4556 / RFC 5652 compliant.
         let (cert_chain, signature) = if let Some(provider) = config.smartcard_provider.as_ref() {
-            // Host-side SHA-256 of AuthPack DER, then delegate to card.
-            // Matches PIV (NIST SP 800-73-4 §3.3.2) and PKCS#11
-            // CKM_RSA_PKCS pre-hashed mode. RFC 4556 §3.2.1 + spec memo
-            // specs/pkinit-smartcard-notes.md.
             let end_entity = provider.get_certificate();
             if end_entity.is_empty() {
                 return Err(ConnectorError::general(
                     "smartcard provider returned an empty certificate",
                 ));
             }
+            // Host-side SHA-256 of the signedAttrs bytes, then
+            // delegate the RSA operation to the card. Matches PIV
+            // (NIST SP 800-73-4 §3.3.2) and PKCS#11 CKM_RSA_PKCS
+            // pre-hashed mode.
             let mut hasher = Sha256::new();
-            hasher.update(&auth_pack_der);
+            hasher.update(&signed_attrs_to_sign);
             let digest = hasher.finalize();
             let sig = provider.sign_digest(&digest).map_err(|e| {
                 ConnectorError::general_owned(alloc::format!(
@@ -426,7 +449,7 @@ impl KerberosSequence {
             (chain, sig)
         } else {
             // Legacy raw-key path.
-            let sig = rsa_sign_sha256(&config.private_key, &auth_pack_der)
+            let sig = rsa_sign_sha256(&config.private_key, &signed_attrs_to_sign)
                 .map_err(|_| ConnectorError::general("RSA key too small for PKCS#1 v1.5 signing"))?;
             let chain: Vec<Vec<u8>> = vec![config.client_cert_der.clone()];
             (chain, sig)
@@ -440,8 +463,13 @@ impl KerberosSequence {
                 ))
             })?;
 
-        // Build CMS SignerInfo.
-        let signer_info = cms::build_signer_info(&issuer_der, &serial_der, &signature);
+        // Build CMS SignerInfo with signedAttributes present.
+        let signer_info = cms::build_signer_info(
+            &issuer_der,
+            &serial_der,
+            Some(&signed_attrs_in_signer_info),
+            &signature,
+        );
 
         // Build CMS SignedData with the full chain (root excluded — the
         // smartcard provider is responsible for that, and the legacy

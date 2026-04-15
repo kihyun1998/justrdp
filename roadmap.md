@@ -1721,27 +1721,26 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
         type 16, PA-PAC-REQUEST type 128, CMS signed-data OID,
         id-pkinit-authData OID, dhpublicnumber OID, cname / realm /
         ctime 문자열을 전부 바이트 단위 검증
-  - [x] `@impl-verifier` 로 RFC 4556 1:1 대조 — 4개 스펙 편차 발견:
-        - **Finding A (fixed)**: `AuthPack.clientDHNonce` 태그
-          `[2]` → `[3]` 수정 (RFC 4556 §3.2.1 의 `supportedCMSTypes`
-          가 `[2]` 를 차지). `crates/justrdp-pdu/src/kerberos/pkinit.rs`
-        - **Finding B (open)**: `PaPkAsReq::encode` 가
+  - [x] `@impl-verifier` 로 RFC 4556 1:1 대조 — 4개 스펙 편차 발견,
+        전부 수정:
+        - **Finding A (fixed, `796967a`)**: `AuthPack.clientDHNonce`
+          태그 `[2]` → `[3]` (RFC 4556 §3.2.1 의 `supportedCMSTypes`
+          가 `[2]` 를 차지)
+        - **Finding B (fixed, `<next>`)**: `PaPkAsReq::encode` 가
           `signedAuthPack` 을 EXPLICIT `[0]` OCTET STRING 으로
-          인코딩 (`A0 <len> 04 <inner> <data>`). 스펙은 IMPLICIT
-          (`80 <len> <data>`). Windows AD KDC 엄격 모드에서
-          rejection 위험. `crates/justrdp-pdu/src/kerberos/pkinit.rs:28`
-        - **Finding C (open)**: `cms::build_signer_info` 가
-          `signedAttributes` SET 를 완전히 생략. RFC 4556 §3.2.1 은
-          `id-contentType` + `id-messageDigest` 를 필수로 요구하며,
-          서명도 이 SET 위에 계산되어야 함. 서명 파이프라인 동반
-          수정 필요. `crates/justrdp-pdu/src/cms.rs:110-143`
-        - **Finding D (open)**: `build_dh_spki` 의 `DomainParameters`
-          가 `q` 를 생략 (`p`, `g` 만). Oakley Group 14 (2048-bit
-          safe prime) 의 `q = (p-1)/2` 를 추가해야 AD KDC 호환.
-          `crates/justrdp-pdu/src/kerberos/pkinit.rs:119-125`
-  - [ ] **Follow-up: PKINIT interop hardening** (Findings B / C / D) —
-        Appendix G.2 로 분리 고려. 현재 `MockSmartcardProvider` 테스트
-        는 통과하지만 실제 Windows AD KDC 대상 검증이 미완
+          인코딩하던 것 (`A0 <len> 04 <inner> <data>`) 을 IMPLICIT
+          (`80 <len> <data>`) 로 수정 (ITU-T X.690 §8.14.3)
+        - **Finding C (fixed, `<next>`)**: `cms::build_signer_info`
+          에 `signedAttributes` 경로 추가. `build_signed_attrs_inner`
+          /`_for_signing`/`_for_signer_info` 3-단 헬퍼로 RFC 5652
+          §5.4 "separate encoding for signature computation" 규칙
+          구현. `id-contentType` + `id-messageDigest` 두 attribute
+          포함. `build_as_req_pkinit` 의 서명 파이프라인도 재구성 —
+          이제 `auth_pack_der` 대신 `SET` 재태깅된 signedAttrs 를
+          서명
+        - **Finding D (fixed, `<next>`)**: `build_dh_spki` 의
+          `DomainParameters` SEQUENCE 에 `q` 추가. `OakleyGroup14::order()`
+          헬퍼 신설 (`justrdp-core::dh`) 로 `q = (p-1)/2` 계산
 
 **Phase 2 — Native PC/SC backend (실 하드웨어 검증 TODO)**
 

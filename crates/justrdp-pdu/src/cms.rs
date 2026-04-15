@@ -104,12 +104,22 @@ pub fn build_signed_data(
 ///     digestAlgorithm        DigestAlgorithmIdentifier,
 ///     signedAttrs            [0] IMPLICIT SET OF Attribute OPTIONAL,
 ///     signatureAlgorithm     SignatureAlgorithmIdentifier,
-///     signature              OCTET STRING
+///     signature              OCTET STRING,
+///     unsignedAttrs          [1] IMPLICIT SET OF Attribute OPTIONAL
 /// }
 /// ```
+///
+/// `signed_attrs` must be the full `[0] IMPLICIT SET OF Attribute`
+/// TLV bytes (tag `0xA0`) — typically produced by
+/// [`build_signed_attrs_for_signer_info`]. RFC 4556 §3.2.1 requires
+/// PKINIT SignerInfos to include `signedAttributes` with at minimum
+/// `id-contentType` and `id-messageDigest`. Pass `None` only for
+/// legacy test fixtures; real PKINIT exchanges must supply the
+/// attributes.
 pub fn build_signer_info(
     issuer_der: &[u8],
     serial_number_der: &[u8],
+    signed_attrs: Option<&[u8]>,
     signature: &[u8],
 ) -> Vec<u8> {
     build_sequence(|w| {
@@ -130,6 +140,11 @@ pub fn build_signer_info(
         });
         w.write_raw(&digest_algo);
 
+        // signedAttributes [0] IMPLICIT SET OF Attribute OPTIONAL
+        if let Some(attrs) = signed_attrs {
+            w.write_raw(attrs);
+        }
+
         // signatureAlgorithm: SHA-256 with RSA
         let sig_algo = build_sequence(|w| {
             w.write_oid(OID_SHA256_WITH_RSA);
@@ -140,6 +155,79 @@ pub fn build_signer_info(
         // signature OCTET STRING
         w.write_octet_string(signature);
     })
+}
+
+// ── Signed attributes (RFC 5652 §5.3 + RFC 4556 §3.2.1) ──
+
+/// OID `id-contentType` (1.2.840.113549.1.9.3).
+pub const OID_CONTENT_TYPE: &[u8] =
+    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x03];
+
+/// OID `id-messageDigest` (1.2.840.113549.1.9.4).
+pub const OID_MESSAGE_DIGEST: &[u8] =
+    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
+
+/// Build the *inner* bytes of the `signedAttributes` SET — just the
+/// two Attribute SEQUENCEs concatenated, without any outer SET tag.
+/// Callers wrap the result twice:
+///
+/// * [`build_signed_attrs_for_signing`] prepends the SET tag
+///   (`0x31`) so the result can be hashed and signed per RFC 5652
+///   §5.4 ("separate encoding of the signedAttrs field is performed
+///   for signature computation ... an EXPLICIT SET OF tag is used").
+/// * [`build_signed_attrs_for_signer_info`] prepends the `[0]
+///   IMPLICIT` context tag (`0xA0`) so the result can be embedded
+///   in a `SignerInfo`.
+///
+/// The produced attributes are the two RFC 4556 §3.2.1 requires:
+/// `id-contentType` carrying the eContent type OID, and
+/// `id-messageDigest` carrying the SHA-256 digest of the eContent
+/// octets.
+///
+/// DER canonical ordering of the SET OF is satisfied by the order
+/// these two attributes are emitted in: the `contentType` SEQUENCE
+/// starts with the same `0x30` tag as `messageDigest` but has a
+/// smaller length (its value is a ~11-byte OID vs a 34-byte OCTET
+/// STRING-wrapped 32-byte digest), so byte-wise comparison places
+/// `contentType` first.
+pub fn build_signed_attrs_inner(
+    content_type_oid: &[u8],
+    message_digest: &[u8],
+) -> Vec<u8> {
+    let attr_content_type = build_sequence(|w| {
+        w.write_oid(OID_CONTENT_TYPE);
+        let val_set = build_set(|w| {
+            w.write_oid(content_type_oid);
+        });
+        w.write_raw(&val_set);
+    });
+
+    let attr_message_digest = build_sequence(|w| {
+        w.write_oid(OID_MESSAGE_DIGEST);
+        let val_set = build_set(|w| {
+            w.write_octet_string(message_digest);
+        });
+        w.write_raw(&val_set);
+    });
+
+    let mut out = Vec::with_capacity(attr_content_type.len() + attr_message_digest.len());
+    out.extend_from_slice(&attr_content_type);
+    out.extend_from_slice(&attr_message_digest);
+    out
+}
+
+/// Wrap [`build_signed_attrs_inner`] output with an explicit `SET`
+/// tag (`0x31`) — the form that MUST be fed to the signing function
+/// per RFC 5652 §5.4.
+pub fn build_signed_attrs_for_signing(inner: &[u8]) -> Vec<u8> {
+    build_set(|w| w.write_raw(inner))
+}
+
+/// Wrap [`build_signed_attrs_inner`] output with the `[0] IMPLICIT
+/// SET` context tag (`0xA0`) — the form that goes inside a
+/// `SignerInfo`'s `signedAttributes` field.
+pub fn build_signed_attrs_for_signer_info(inner: &[u8]) -> Vec<u8> {
+    build_implicit_context_tag(0, inner)
 }
 
 /// Decode a CMS ContentInfo to extract the SignedData content.
@@ -311,7 +399,8 @@ mod tests {
             w.into_inner()
         };
 
-        let signer_info = build_signer_info(&fake_issuer, &fake_serial, &fake_signature);
+        let signer_info =
+            build_signer_info(&fake_issuer, &fake_serial, None, &fake_signature);
 
         let signed_data = build_signed_data(
             OID_PKINIT_AUTH_DATA,
@@ -326,12 +415,42 @@ mod tests {
     }
 
     #[test]
-    fn signer_info_builds() {
+    fn signer_info_builds_without_signed_attrs() {
         let issuer = vec![0x30, 0x00]; // empty SEQUENCE
         let serial = vec![0x02, 0x01, 0x01]; // INTEGER 1
         let sig = vec![0x42; 64];
 
-        let si = build_signer_info(&issuer, &serial, &sig);
+        let si = build_signer_info(&issuer, &serial, None, &sig);
         assert_eq!(si[0], TAG_SEQUENCE);
+    }
+
+    #[test]
+    fn signer_info_builds_with_signed_attrs() {
+        let issuer = vec![0x30, 0x00];
+        let serial = vec![0x02, 0x01, 0x01];
+        let sig = vec![0x42; 64];
+
+        // Build a realistic signedAttrs structure over a 32-byte
+        // SHA-256 digest and an arbitrary eContent type OID.
+        let inner = build_signed_attrs_inner(OID_PKINIT_AUTH_DATA, &[0x11u8; 32]);
+        let attrs_in_si = build_signed_attrs_for_signer_info(&inner);
+
+        let si = build_signer_info(&issuer, &serial, Some(&attrs_in_si), &sig);
+
+        // The SignerInfo must now contain the 0xA0 IMPLICIT [0] SET
+        // OF Attribute tag somewhere — the inner bytes start with
+        // 0xA0 and we asserted earlier that this is the wrapper.
+        assert_eq!(si[0], TAG_SEQUENCE);
+        assert!(
+            si.windows(inner.len()).any(|w| w == inner.as_slice()),
+            "signedAttrs inner bytes must be embedded in the SignerInfo",
+        );
+
+        // And the for-signing form (tag 0x31) and the for-signer-info
+        // form (tag 0xA0) must differ only in their leading tag byte.
+        let for_signing = build_signed_attrs_for_signing(&inner);
+        assert_eq!(attrs_in_si[0], 0xA0);
+        assert_eq!(for_signing[0], 0x31);
+        assert_eq!(&attrs_in_si[1..], &for_signing[1..]);
     }
 }
