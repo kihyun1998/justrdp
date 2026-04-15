@@ -251,15 +251,41 @@ impl RdpClient {
 
         // Outputs of one successful (non-redirected) handshake. Filled in
         // by the loop body once the connector reaches Connected without
-        // server_redirection.
-        let (mut transport, server_public_key, last_arc_cookie, result_for_session): (
+        // server_redirection. `timeout_handle` is a `try_clone()` of the
+        // raw TcpStream used purely as a setsockopt target so the
+        // handshake read/write timeouts can be cleared before the
+        // session pump starts reading frames indefinitely.
+        let (
+            mut transport,
+            server_public_key,
+            last_arc_cookie,
+            result_for_session,
+            timeout_handle,
+        ): (
             Transport,
             Option<Vec<u8>>,
             Option<ArcCookie>,
             ResultForSession,
+            TcpStream,
         ) = loop {
-            debug!(addr = %current_addr, attempt = redirect_depth + 1, "rdp.connect.tcp");
-            let tcp = TcpStream::connect(current_addr)?;
+            debug!(
+                addr = %current_addr,
+                attempt = redirect_depth + 1,
+                timeout_ms = current_config.connect_timeout.as_millis() as u64,
+                "rdp.connect.tcp",
+            );
+            let tcp = TcpStream::connect_timeout(&current_addr, current_config.connect_timeout)?;
+            // Bound every subsequent handshake read/write by the same
+            // timeout so a stalled server can't hang the connect path.
+            // Setting the timeouts on the raw TcpStream leaks through
+            // to the TLS wrapper because setsockopt affects the
+            // underlying socket, not the Rust handle. The timeouts
+            // are cleared via `timeout_handle` below once the session
+            // pump starts — see the `None` resets right before the
+            // `Ok(Self { ... })` return at the bottom of this fn.
+            tcp.set_read_timeout(Some(current_config.connect_timeout))?;
+            tcp.set_write_timeout(Some(current_config.connect_timeout))?;
+            let timeout_handle = tcp.try_clone()?;
             // Clone the config so we can rebuild ClientConnector on the
             // next iteration if a redirect is detected.
             let mut connector = ClientConnector::new(current_config.clone());
@@ -446,8 +472,25 @@ impl RdpClient {
                     channel_ids: result.channel_ids.clone(),
                     redirect_depth,
                 },
+                timeout_handle,
             );
         };
+
+        // Hand the session loop an unbounded socket so steady-state
+        // reads can block forever. `set_read_timeout(None)` clears
+        // SO_RCVTIMEO on the underlying socket; any error here just
+        // leaves the handshake timeout in place, which is strictly
+        // tighter than unbounded (no hang risk), so it is swallowed.
+        #[allow(unused_variables)]
+        {
+            if let Err(e) = timeout_handle.set_read_timeout(None) {
+                debug!(error = %e, "rdp.connect clear read_timeout failed (non-fatal)");
+            }
+            if let Err(e) = timeout_handle.set_write_timeout(None) {
+                debug!(error = %e, "rdp.connect clear write_timeout failed (non-fatal)");
+            }
+        }
+        drop(timeout_handle);
 
         // From here on, the loop has exited with a usable transport
         // pointing at the (post-redirect) target. The remaining setup

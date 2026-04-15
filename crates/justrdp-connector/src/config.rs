@@ -4,6 +4,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use justrdp_pdu::gcc::client::ChannelDef;
 use justrdp_pdu::rdp::client_info::PerformanceFlags;
@@ -503,6 +504,17 @@ pub struct Config {
     ///
     /// When empty (default), single-monitor mode is used with `desktop_size`.
     pub monitors: Vec<MonitorConfig>,
+    /// Wall-clock budget for the connect phase: TCP connect, TLS
+    /// handshake, CredSSP / NLA, BasicSettingsExchange, and connection
+    /// finalization. The blocking runtime applies this as both the
+    /// `TcpStream::connect_timeout` budget and the read/write timeout
+    /// used during every handshake PDU exchange. Once the connector
+    /// transitions into the active session pump the timeout is
+    /// cleared so steady-state reads can block indefinitely waiting
+    /// for the next frame.
+    ///
+    /// Default: 30 seconds.
+    pub connect_timeout: Duration,
 }
 
 impl core::fmt::Debug for Config {
@@ -558,6 +570,7 @@ impl Config {
                 redirection_password_blob: None,
                 redirection_guid: None,
                 monitors: Vec::new(),
+                connect_timeout: Duration::from_secs(30),
             },
         }
     }
@@ -756,6 +769,18 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the wall-clock budget for the connect phase (TCP + TLS +
+    /// CredSSP + BasicSettings + Finalization). The runtime applies
+    /// this as `TcpStream::connect_timeout` and as the read/write
+    /// timeout for every handshake PDU; it is cleared once the
+    /// session pump begins so steady-state reads can block forever.
+    ///
+    /// Default: 30 seconds.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
+        self
+    }
+
     /// Apply settings from a parsed `.rdp` file.
     ///
     /// Maps the fields Windows `mstsc.exe` stores in `.rdp` files onto the
@@ -776,5 +801,35 @@ impl ConfigBuilder {
     /// Build the configuration.
     pub fn build(self) -> Config {
         self.config
+    }
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_timeout_default_is_30s() {
+        let config = Config::builder("u", "p").build();
+        assert_eq!(config.connect_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn connect_timeout_builder_sets_value() {
+        let config = Config::builder("u", "p")
+            .connect_timeout(Duration::from_secs(5))
+            .build();
+        assert_eq!(config.connect_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn connect_timeout_accepts_zero() {
+        // Zero means "non-blocking / immediate failure" per
+        // std::net::TcpStream::connect_timeout documentation; the
+        // builder must not reject it.
+        let config = Config::builder("u", "p")
+            .connect_timeout(Duration::ZERO)
+            .build();
+        assert_eq!(config.connect_timeout, Duration::ZERO);
     }
 }

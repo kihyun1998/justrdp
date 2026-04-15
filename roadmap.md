@@ -801,7 +801,11 @@ pub enum RdpEvent {
   - [x] `EnhancedSecurityUpgrade` → `Transport::Swapping` → TLS 업그레이드 → `Transport::Tls`
   - [x] `EarlyUserAuthResult` 4바이트/TsRequest fallback 분기 (HYBRID_EX)
   - [x] `ServerCertVerifier` 콜백 주입 (rustls + native-tls 양쪽)
-  - [ ] TCP / TLS 핸드셰이크 타임아웃 — 후속 (현재는 OS 기본값)
+  - [x] TCP / TLS 핸드셰이크 타임아웃 — `Config::connect_timeout`
+        (기본 30s). `TcpStream::connect_timeout` + `set_read_timeout` +
+        `set_write_timeout` 를 raw TcpStream에 설정하고, 세션 펌프
+        진입 직전에 `try_clone()` 핸들로 `None` 해제 (세션 reads는
+        무한 대기 유지)
 - [x] **ActiveStage 펌프** (M4, 커밋 `03ed1da` + `a829d72`)
   - [x] Fast-path/slow-path 자동 분기 (`TpktHint`가 첫 바이트 보고 dispatch)
   - [x] `BulkDecompressor` 상태 세션 수명 동안 유지 (`ActiveStage` 내부에 슬로우/패스트패스 별도 컨텍스트)
