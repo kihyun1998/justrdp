@@ -21,6 +21,32 @@ pub mod pdu;
 pub mod client;
 
 #[cfg(feature = "alloc")]
+pub mod http;
+
+#[cfg(feature = "alloc")]
+pub mod auth;
+
+#[cfg(feature = "std")]
+pub mod transport;
+
+#[cfg(feature = "std")]
+pub use transport::{ConnectError, GatewayConnection};
+
+#[cfg(feature = "alloc")]
+pub use auth::{
+    base64_decode, base64_encode, build_authorization_header, parse_www_authenticate, AuthScheme,
+    NtlmAuthState, NtlmClient, NtlmCredentials, NtlmError, NtlmRandom,
+};
+
+#[cfg(feature = "alloc")]
+pub use http::{
+    encode_chunk, encode_final_chunk, format_guid_braces, ChunkError, ChunkedDecoder,
+    PreambleSkipper, RdgHttpRequest, RdgMethod, DEFAULT_URL_PATH, HEADER_RDG_CONNECTION_ID,
+    HEADER_RDG_CORRELATION_ID, HEADER_RDG_USER_ID, METHOD_RDG_IN_DATA, METHOD_RDG_OUT_DATA,
+    OUT_CHANNEL_PREAMBLE_SIZE,
+};
+
+#[cfg(feature = "alloc")]
 pub use client::{
     decode_data, find_packet_size, GatewayClient, GatewayClientConfig, GatewayClientState,
     GatewayError, GatewayResult, Written,

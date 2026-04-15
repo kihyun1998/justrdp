@@ -407,6 +407,7 @@ name = "justrdp-gateway"
 version = "0.1.0"
 dependencies = [
  "justrdp-core",
+ "justrdp-pdu",
 ]
 
 [[package]]

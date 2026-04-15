@@ -11,9 +11,10 @@ keywords = ["rdp", "gateway", "tsgu"]
 categories = ["no-std", "network-programming"]
 
 [features]
-default = ["alloc"]
-alloc = ["justrdp-core/alloc"]
-std = ["alloc", "justrdp-core/std"]
+default = ["std"]
+alloc = ["justrdp-core/alloc", "justrdp-pdu/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-pdu/std"]
 
 [dependencies]
 justrdp-core.workspace = true
+justrdp-pdu.workspace = true
