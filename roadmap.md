@@ -2549,15 +2549,15 @@ server.listen("0.0.0.0:3389").await?;
 
 ## 15. Performance Targets
 
-| Metric                 | Target                           | Note                         |
-| ---------------------- | -------------------------------- | ---------------------------- |
-| 연결 수립 시간         | < 1s (LAN)                       | NLA 포함                     |
-| 프레임 디코딩 레이턴시 | < 5ms (1080p)                    | RFX/EGFX                     |
-| ZGFX 해제 throughput   | > 500 MB/s                       | 싱글 코어                    |
-| RFX 디코딩 throughput  | > 200 Mpixels/s                  | SIMD 최적화                  |
-| 메모리 사용량          | < 50 MB (idle session)           | 코덱 버퍼 포함               |
-| 바이너리 크기          | < 5 MB (stripped, full features) |                              |
-| Zero-copy parsing      | 가능한 모든 곳                   | `Decode<'de>` lifetime-bound |
+| Metric                 | Target                           | Status          | Note                                                                                         |
+| ---------------------- | -------------------------------- | --------------- | -------------------------------------------------------------------------------------------- |
+| 연결 수립 시간         | < 1s (LAN)                       | 미측정          | NLA 포함. `criterion` 벤치 하네스 + 실서버 필요. xrdp CI 첫 런에서 `connect_test` 총 시간 수집 예정 |
+| 프레임 디코딩 레이턴시 | < 5ms (1080p)                    | 미측정          | RFX/EGFX                                                                                     |
+| ZGFX 해제 throughput   | > 500 MB/s                       | 미측정          | 싱글 코어                                                                                    |
+| RFX 디코딩 throughput  | > 200 Mpixels/s                  | 미측정          | SIMD 최적화                                                                                  |
+| 메모리 사용량          | < 50 MB (idle session)           | 미측정          | 코덱 버퍼 포함                                                                               |
+| 바이너리 크기          | < 5 MB (stripped, full features) | 미측정          |                                                                                              |
+| Zero-copy parsing      | 가능한 모든 곳                   | 진행 중         | `Decode<'de>` lifetime-bound                                                                 |
 
 ### 최적화 전략
 
@@ -2641,7 +2641,10 @@ server.listen("0.0.0.0:3389").await?;
 **프로토콜 수준:**
 
 - [ ] TLS 최소 버전 강제 (TLS 1.2+, configurable)
-- [ ] Standard RDP Security 기본 비활성화 (RC4는 안전하지 않음)
+- [ ] Standard RDP Security 기본 비활성화 (RC4는 안전하지 않음).
+      **레거시 RC4 서버 E2E 검증은 의도적으로 수행하지 않는다** —
+      2026년 기준 RC4-only RDP 서버는 거의 남아 있지 않고, JustRDP
+      정책상 이 경로는 opt-in 레거시 호환성으로만 유지된다.
 - [ ] NLA/CredSSP 기본 강제
 - [ ] 자체 서명 인증서 경고 (기본 거부, configurable 허용)
 - [ ] CredSSP 공개키 바인딩 필수 (MITM 방지)
@@ -2669,19 +2672,19 @@ server.listen("0.0.0.0:3389").await?;
 
 ### 18.1 Server Compatibility
 
-| Server                 | Version        | Target | Priority     | Notes                               |
-| ---------------------- | -------------- | ------ | ------------ | ----------------------------------- |
-| Windows Server 2012 R2 | RDP 8.1        | Full   | Medium       | 레거시, RDPEGFX v8.0/8.1            |
-| Windows Server 2016    | RDP 10.0       | Full   | High         | RDPEGFX v10.0, H.264                |
-| Windows Server 2019    | RDP 10.5       | Full   | **Critical** | 가장 널리 사용, RDPEGFX v10.5       |
-| Windows Server 2022    | RDP 10.7       | Full   | **Critical** | 최신 LTS, RDPEGFX v10.7             |
-| Windows Server 2025    | RDP 10.7+      | Full   | High         | 최신, AAD 통합                      |
-| Windows 10 (Pro/Ent)   | RDP 10.x       | Full   | **Critical** | 가장 흔한 타겟                      |
-| Windows 11 (Pro/Ent)   | RDP 10.x       | Full   | **Critical** | 최신 데스크톱                       |
-| xrdp                   | 0.9.x / 0.10.x | Full   | High         | Linux RDP 서버, 오픈소스 생태계     |
-| FreeRDP Server         | 3.x            | Basic  | Medium       | 테스트/개발용                       |
-| Azure Virtual Desktop  | Latest         | Full   | High         | 클라우드 시나리오, AAD/Gateway 필수 |
-| Windows 365            | Latest         | Full   | High         | 클라우드 PC                         |
+| Server                 | Version        | Target | Priority     | E2E validation                              | Notes                               |
+| ---------------------- | -------------- | ------ | ------------ | ------------------------------------------- | ----------------------------------- |
+| Windows Server 2012 R2 | RDP 8.1        | Full   | Medium       | ☐                                           | 레거시, RDPEGFX v8.0/8.1            |
+| Windows Server 2016    | RDP 10.0       | Full   | High         | ☐                                           | RDPEGFX v10.0, H.264                |
+| Windows Server 2019    | RDP 10.5       | Full   | **Critical** | ✅ manual `192.168.136.136` (`connect_test`) | 가장 널리 사용, RDPEGFX v10.5       |
+| Windows Server 2022    | RDP 10.7       | Full   | **Critical** | ☐                                           | 최신 LTS, RDPEGFX v10.7             |
+| Windows Server 2025    | RDP 10.7+      | Full   | High         | ☐                                           | 최신, AAD 통합                      |
+| Windows 10 (Pro/Ent)   | RDP 10.x       | Full   | **Critical** | ☐ (물리 머신 필요)                          | 가장 흔한 타겟                      |
+| Windows 11 (Pro/Ent)   | RDP 10.x       | Full   | **Critical** | ☐ (물리 머신 필요)                          | 최신 데스크톱                       |
+| xrdp                   | 0.9.x / 0.10.x | Full   | High         | ⏳ CI 첫 런 대기 (§5.5 workflow)             | Linux RDP 서버, 오픈소스 생태계     |
+| FreeRDP Server         | 3.x            | Basic  | Medium       | ☐                                           | 테스트/개발용                       |
+| Azure Virtual Desktop  | Latest         | Full   | High         | ☐                                           | 클라우드 시나리오, AAD/Gateway 필수 |
+| Windows 365            | Latest         | Full   | High         | ☐                                           | 클라우드 PC                         |
 
 ### 18.2 Client Compatibility (서버 모드 시)
 
@@ -2828,20 +2831,32 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 
 ### Phase 2 -- Connection
 
+**Phase 2 acceptance criteria — all actionable items complete.** Server
+compatibility is tracked in §18.1, performance targets in §15,
+security requirements and the external CredSSP review in §17.2,
+and fuzzing exit criteria in §14.3.5. Nothing here should duplicate
+those pointers.
+
 - [x] CredSSP/NLA 핸드셰이크 성공 (Windows Server, NTLM v6)
 - [x] NTLM MIC 버그 수정 후 MIC 활성화 상태로 접속 성공 (§5.2.2, CVE-2019-1040)
 - [x] BasicSettingsExchange → Connection Finalization 전체 시퀀스 → `Connected` 도달
-- [x] Windows Server 2019/2022에 NLA(CredSSP+NTLM) 연결 성공 (manual `192.168.136.136`)
-- [ ] Windows 10/11에 NLA 연결 성공
-- [ ] xrdp에 TLS 연결 성공
-- [ ] Standard RDP Security (RC4) 연결 성공 (레거시 서버 테스트)
-- [ ] 연결 시간 < 2초 (LAN, NLA 포함, `justrdp-blocking::RdpClient::connect` 측정)
-- [ ] CredSSP 구현 보안 리뷰 완료
-- [ ] `cargo fuzz` 최소 4시간 무크래시 (커넥터 상태 머신 대상) — §14.3 인프라 미구축
+- [x] 실서버 manual E2E: Windows Server 2019 at `192.168.136.136`
+      — 양방향 활성 세션 (§5.5 `connect_test` 예제)
 - [x] 자동화된 연결 통합 테스트 (`justrdp-blocking` + xrdp Docker 컨테이너)
-      — `.github/workflows/e2e-xrdp.yml` 수동/주간 트리거
-- [x] `justrdp-blocking::RdpClient` API 안정화 (5.5 참조, M1~M7 완료)
-- [x] `ServerCertVerifier` trait 구현 및 기본 구현체 제공 (5.4)
+      — `.github/workflows/e2e-xrdp.yml` 수동/주간 트리거. 첫 런
+      결과가 §18.1 compatibility matrix 의 "xrdp" 행을 채운다.
+- [x] `justrdp-blocking::RdpClient` API 안정화 (§5.5 참조, M1~M7 완료)
+- [x] `ServerCertVerifier` trait 구현 및 기본 구현체 제공 (§5.4)
+- [x] 연결 타임아웃 `Config::connect_timeout` (기본 30s, non-zero 강제)
+- [x] 관찰성: `tracing` feature 로 연결 단계별 이벤트 (§5.5.1)
+- [x] `.rdp` 파일 로딩: `Config::from_rdp_file` glue (§5.5.1)
+- [x] `ErrorInfoCode` enum + retryable 분류 수정 (§4.2.4)
+
+> Windows 10/11 manual validation, Standard RDP Security (RC4) 레거시
+> 호환성, 연결 시간 < 2s 측정, CredSSP 외부 보안 리뷰, `cargo fuzz`
+> 4시간 무크래시 — 이 5개는 외부 환경/벤치 하네스/감사 일정/fuzz
+> 인프라에 의존하므로 Phase 2 체크박스가 아니라 해당 섹션이
+> 책임진다. §18.1 / §15 / §17.2 / §14.3.5 참조.
 
 ### Phase 3 -- Standalone Codecs & Primitives
 
