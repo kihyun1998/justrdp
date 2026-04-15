@@ -563,7 +563,10 @@ pub enum ClientConnectorState {
   ```
 - [x] `ConnectionResult` -- 연결 결과 (채널 ID 매핑, 서버 capabilities, 세션 정보)
 - [x] `ChannelConnectionSequence` -- 채널 Join 반복 상태 머신
-- [x] `LicenseExchangeSequence` -- 라이센스 교환 (Valid Client 단축 경로 포함)
+- [x] `LicenseExchangeSequence` -- **단축 경로만**: `STATUS_VALID_CLIENT`
+      수신 시 통과, `LicenseRequest`/`PlatformChallenge` 수신 시
+      `ERR_NO_LICENSE_SERVER` 로 거절. MS-RDPELE §2.2.2.3 이후의 풀
+      RSA/RC4 교환은 §5.6 (deferred) 참조
 - [x] `ConnectionActivationSequence` -- Demand Active / Confirm Active 교환
 
 ### 5.2 Authentication
@@ -812,9 +815,8 @@ pub enum RdpEvent {
   - [x] Routing Token/Cookie를 새 `Config.routing_token`에 주입 (X.224 routingToken field)
   - [x] `RdpEvent::Redirected { target }` 방출 (handshake 루프 탈출 후 one-shot event)
   - [x] 리다이렉션 루프 방지 (MAX_REDIRECTS = 5)
-- [ ] **License persistence** (9.15 미착수)
-  - [ ] `FileLicenseStore` 구현 (`~/.justrdp/licenses/{server}_{hwid}.bin`)
-  - [ ] `Config::license_store()` 빌더 메서드
+- [ ] **License persistence** — §5.6 에서 MS-RDPELE 풀 교환과 함께 처리
+      (단독 구현 불가: 저장할 blob을 만드는 경로 자체가 미구현)
 - [ ] **`.rdp` 파일 로딩** (`justrdp-rdpfile` 통합 미착수)
   - [ ] `Config::from_rdp_file(path)` 편의 생성자
 - [ ] **관찰성** (미착수)
@@ -829,6 +831,72 @@ pub enum RdpEvent {
   - [x] Windows RDS E2E (manual, `192.168.136.136`) — connect_test 예제로 양방향 활성 세션 검증 (GraphicsUpdate + PointerBitmap + 입력 송신)
   - [x] Auto-reconnect: `test_drop_transport()` → `Reconnecting` → `Reconnected` → 정상 재개 (420ms)
   - [x] Session redirection: connector-level wire-format injection test 2개 (WaitSynchronize + WaitFontMap 양쪽에서 LB cookie / TARGET_NET_ADDRESS 검증)
+
+---
+
+### 5.6 MS-RDPELE Full Licensing & Persistence (deferred)
+
+> **status**: 보류. 현재 JustRDP는 §5.1 `LicenseExchangeSequence`에서
+> `LicenseErrorMessage::STATUS_VALID_CLIENT` 단축 경로와, 서버가
+> `LicenseRequest`/`PlatformChallenge`를 보낼 때 `ERR_NO_LICENSE_SERVER /
+> ST_TOTAL_ABORT`로 거절하는 두 모드만 지원한다. 현대 NLA/TLS 배포는
+> 서버가 단일 `STATUS_VALID_CLIENT`로 licensing을 건너뛰므로 이 단축
+> 경로만으로 충분하다 ― MS-RDPELE §2.2.2.3 이후의 전체 교환은 거의
+> 쓰이지 않는다.
+>
+> 그럼에도 per-device CAL + 레거시 서버 환경을 지원하려면 다음 두 축을
+> 함께 진행해야 한다. 어느 한쪽만 착수하는 것은 의미가 없어(저장할
+> blob이 생성되지 않음 / 로드된 blob을 보낼 경로가 없음) 원래 Phase 6에
+> 있던 "License Persistence" 단독 항목은 삭제하고 여기로 통합한다.
+
+**축 1 — MS-RDPELE 전체 교환 구현 (`justrdp-pdu` + `justrdp-connector`):**
+
+- [ ] `ClientNewLicenseRequest` (§2.2.2.2) 인코더
+  - [ ] `PreferredKeyExchangeAlg` (`KEY_EXCHANGE_ALG_RSA = 0x00000001`)
+  - [ ] `PlatformId`
+  - [ ] `ClientRandom` (32 bytes)
+  - [ ] `EncryptedPreMasterSecret` (RSA PKCS#1 v1.5, `justrdp-core::rsa`)
+  - [ ] `ClientUserName` / `ClientMachineName` BLOBs
+- [ ] `ClientPlatformChallengeResponse` (§2.2.2.5) 인코더
+  - [ ] MAC salt 키 파생 (§5.1.3)
+  - [ ] RC4 세션 키 파생
+  - [ ] `EncryptedPlatformChallengeResponse` + `EncryptedHWID` + MAC
+- [ ] `ClientLicenseInfo` (§2.2.2.3) 인코더 — 저장된 라이선스 재제시 경로
+- [ ] `PlatformChallenge` (§2.2.2.4) / `NewLicense` (§2.2.2.6) /
+      `UpgradeLicense` (§2.2.2.7) 구조체 디코더 (현재는 `LicenseGenericPdu`
+      블롭으로만 파싱)
+- [ ] `step_licensing_exchange()` FSM 재작성
+  - [ ] 현재의 "거절" 경로를 feature-flag 뒤로 이동
+  - [ ] `LicenseRequest → ClientNewLicenseRequest/ClientLicenseInfo →
+        PlatformChallenge → ClientPlatformChallengeResponse →
+        NewLicense/UpgradeLicense` 풀 라운드트립
+  - [ ] `ClientHardwareId` 20바이트 산정 (Config 빌더로 고정 or
+        hostname+salt 해시 기본값)
+
+**축 2 — 영속화 레이어:**
+
+- [ ] `LicenseStore` trait (`justrdp-connector`)
+  ```rust
+  pub trait LicenseStore: Send + Sync {
+      fn load(&self, server_hostname: &str, hwid: &[u8; 20]) -> Option<Vec<u8>>;
+      fn save(&self, server_hostname: &str, hwid: &[u8; 20], license_blob: &[u8]);
+  }
+  ```
+- [ ] `NoopLicenseStore` 기본값
+- [ ] `ConfigBuilder::license_store()` / `server_hostname()` 빌더 메서드
+- [ ] 축 1의 FSM에서 진입 시 `store.load()` → `ClientLicenseInfo` 경로,
+      `NewLicense`/`UpgradeLicense` 수신 시 `store.save()`
+- [ ] `FileLicenseStore` (`justrdp-blocking` §5.5) — `~/.justrdp/licenses/{server_hash}_{hwid_hex}.bin`
+  - [ ] `server_hostname` 의 path traversal 방지를 위한 해시/인코딩
+  - [ ] 디렉터리 권한 (Unix 0700 / Windows ACL)
+  - [ ] 손상 파일 감지 + 재발급 폴백
+
+**검증:**
+
+- [ ] 풀 교환 wire 트레이스 (MS-RDPELE §4) 바이트 단위 일치
+- [ ] RSA/RC4/MAC 테스트 벡터
+- [ ] 라이선스 발급 → 저장 → 재연결 시 로드 → `STATUS_VALID_CLIENT` 수신
+      end-to-end 통합 테스트
 
 ---
 
@@ -1888,33 +1956,6 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [x] Per-field DoS caps (64 KiB) mirroring PNPDR convention
 - [x] IoCallback trait for host-side I/O service + reply truncation to cb_out
 
-### 9.15 License Persistence (MS-RDPELE)
-
-> **requires**: 2.5 Licensing, 5.5 `justrdp-blocking` (파일 구현체)
-> **검증**: 라이선스 발급 → 저장 → 재연결 시 로드 → licensing 스킵
-
-**Connector 레이어 (`justrdp-connector`):**
-
-- [ ] `LicenseStore` trait
-  ```rust
-  pub trait LicenseStore: Send + Sync {
-      fn load(&self, server_hostname: &str, hwid: &[u8; 20]) -> Option<Vec<u8>>;
-      fn save(&self, server_hostname: &str, hwid: &[u8; 20], license_blob: &[u8]);
-  }
-  ```
-- [ ] `NoopLicenseStore` (기본값, 저장 없음)
-- [ ] `ConfigBuilder::license_store()` 빌더 메서드
-- [ ] Licensing 상태 머신에서 `load()` → `ClientLicenseInfo` 재사용 경로
-- [ ] 신규 라이선스 발급 성공 시 `save()` 호출
-
-**런타임 레이어 (`justrdp-blocking` §5.5에서 구현):**
-
-- [ ] `FileLicenseStore` — `~/.justrdp/licenses/{server}_{hwid_hex}.bin`
-- [ ] 경로 생성/권한 설정
-- [ ] 손상된 파일 감지 및 재발급 폴백
-
----
-
 ## 10. Phase 7 -- Transport Extensions
 
 > **목표**: WAN 환경에서의 성능 최적화, 방화벽/프록시 통과.
@@ -2215,7 +2256,7 @@ fn main() -> anyhow::Result<()> {
         .enable_audio(true)
         .reconnect_policy(ReconnectPolicy::default()) // 9.2
         .follow_redirects(true)                       // 9.3
-        .license_store(FileLicenseStore::default())   // 9.15
+        .license_store(FileLicenseStore::default())   // §5.6 deferred
         .build()?;
 
     let mut client = RdpClient::connect(config)?;
