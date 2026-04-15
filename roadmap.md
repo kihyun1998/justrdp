@@ -27,7 +27,13 @@
 18. [Compatibility Matrix](#18-compatibility-matrix)
 19. [Crate Dependency Graph](#19-crate-dependency-graph)
 20. [Definition of Done (per Phase)](#20-definition-of-done-per-phase)
-21. [Error & Disconnect Code Reference](#21-error--disconnect-code-reference)
+
+Appendices:
+- [Appendix B: Error & Disconnect Code Reference](#appendix-b-error--disconnect-code-reference)
+- [Appendix C: Glossary](#appendix-c-glossary)
+- [Appendix D: Microsoft Documentation URLs](#appendix-d-microsoft-documentation-urls)
+- [Appendix E: Milestone Summary](#appendix-e-milestone-summary)
+- [Appendix F: Competitive Comparison](#appendix-f-competitive-comparison)
 
 ---
 
@@ -148,7 +154,8 @@ Network Layer
 | `justrdp-bulk`           | 벌크 압축/해제                     | `Mppc8k`, `Mppc64k`, `Ncrush`, `Xcrush`, `BulkCompressor`, `BulkDecompressor`                              |
 | `justrdp-svc`            | Static Virtual Channel 프레임워크  | `SvcProcessor`, `StaticChannelSet`, `ChannelPduHeader`, `SvcMessage`                                       |
 | `justrdp-dvc`            | Dynamic Virtual Channel 프레임워크 | `DvcProcessor`, `DrdynvcClient`, `DrdynvcServer`, `DynamicChannelId`                                       |
-| `justrdp-connector`      | 연결 상태 머신                     | `ClientConnector`, `ClientConnectorState`, `Sequence`, `Config`, `CredsspSequence`                         |
+| `justrdp-connector`      | 연결 상태 머신 (클라이언트)        | `ClientConnector`, `ClientConnectorState`, `Sequence`, `Config`, `CredsspSequence`                         |
+| `justrdp-acceptor`       | 연결 상태 머신 (서버, Phase 8)     | `ServerAcceptor`, `ServerAcceptorState`, `AcceptorConfig`                                                  |
 | `justrdp-session`        | 활성 세션 처리                     | `ActiveStage`, `ActiveStageOutput`, `FastPathProcessor`, `X224Processor`                                   |
 | `justrdp-input`          | 입력 이벤트 관리                   | `InputDatabase`, `Operation`, `Scancode`, `FastPathInputEvent`                                             |
 | `justrdp-cliprdr`        | 클립보드 채널                      | `Cliprdr<Role>`, `CliprdrBackend`, `FormatList`, `FormatDataRequest`                                       |
@@ -388,7 +395,12 @@ pub trait PduHint: Send + Sync {
 - [x] `RefreshRectPdu`
 - [x] `ShutdownRequestPdu` / `ShutdownDeniedPdu`
 - [x] `SaveSessionInfoPdu` -- Logon / AutoReconnect
-- [x] `SetErrorInfoPdu` -- 300+ disconnect reason 코드
+- [x] `SetErrorInfoPdu` -- 300+ disconnect reason 코드 (Appendix B 참조)
+  - [ ] `ErrorInfoCode` enum — 모든 에러 코드를 symbolic enum으로 매핑 (현재는 raw `u32` + 상수)
+  - [ ] 에러 코드 → 사용자 친화적 메시지 변환 함수
+  - [x] `is_error_info_retryable(code) -> bool` — 재연결 가능 여부 판단 (`justrdp-pdu::rdp::finalization`)
+  - [ ] 에러 코드 → 로그 심각도(severity) 매핑
+  - [ ] 서버 모드: 적절한 에러 코드 전송 (연결 거부, 라이센스 문제 등)
 - [x] `SetKeyboardIndicatorsPdu`
 - [x] `SetKeyboardImeStatusPdu`
 - [x] `MonitorLayoutPdu`
@@ -815,13 +827,6 @@ pub enum RdpEvent {
   - [x] Routing Token/Cookie를 새 `Config.routing_token`에 주입 (X.224 routingToken field)
   - [x] `RdpEvent::Redirected { target }` 방출 (handshake 루프 탈출 후 one-shot event)
   - [x] 리다이렉션 루프 방지 (MAX_REDIRECTS = 5)
-- [ ] **License persistence** — §5.6 에서 MS-RDPELE 풀 교환과 함께 처리
-      (단독 구현 불가: 저장할 blob을 만드는 경로 자체가 미구현)
-- [ ] **`.rdp` 파일 로딩** (`justrdp-rdpfile` 통합 미착수)
-  - [ ] `Config::from_rdp_file(path)` 편의 생성자
-- [ ] **관찰성** (미착수)
-  - [ ] `tracing` crate 지원 (feature flag)
-  - [ ] 연결 단계별 span
 - [x] **에러 처리** (M1~M6 누적)
   - [x] `ConnectError` enum (`Tcp` / `Tls` / `Connector` / `UnexpectedEof` / `FrameTooLarge` / `ChannelSetup` / `Unimplemented`)
   - [x] `RuntimeError` enum (`Io` / `Session` / `FrameTooLarge` / `Disconnected` / `Unimplemented`)
@@ -831,6 +836,19 @@ pub enum RdpEvent {
   - [x] Windows RDS E2E (manual, `192.168.136.136`) — connect_test 예제로 양방향 활성 세션 검증 (GraphicsUpdate + PointerBitmap + 입력 송신)
   - [x] Auto-reconnect: `test_drop_transport()` → `Reconnecting` → `Reconnected` → 정상 재개 (420ms)
   - [x] Session redirection: connector-level wire-format injection test 2개 (WaitSynchronize + WaitFontMap 양쪽에서 LB cookie / TARGET_NET_ADDRESS 검증)
+
+#### 5.5.1 Non-blocking follow-ups
+
+> M1~M7은 완료된 상태이며 `Connected` / active session 목표를 달성.
+> 아래 항목들은 M1~M7의 blocker가 아니고 생태계 편의성 개선용.
+
+- [ ] **`.rdp` 파일 로딩** (`justrdp-rdpfile` 통합)
+  - [ ] `Config::from_rdp_file(path)` 편의 생성자
+- [ ] **관찰성**
+  - [ ] `tracing` crate 지원 (feature flag)
+  - [ ] 연결 단계별 span
+- [ ] **License persistence** — §5.6 에서 MS-RDPELE 풀 교환과 함께 처리
+      (단독 구현 불가: 저장할 blob을 만드는 경로 자체가 미구현)
 
 ---
 
@@ -1486,7 +1504,7 @@ pub trait GfxHandler: Send {
 - [x] `next_event()` 자동 reconnect 진입 (Disconnected/Io → try_reconnect)
 - [x] 재연결 전제 조건 (`can_reconnect()`): policy.max_attempts > 0 AND last_arc_cookie.is_some() AND svc_set.is_empty()
 - [x] SVC processor와 reconnect 상호 배제 (MVP: stateful processors는 자동 재연결 시 부활 불가)
-- [x] `is_error_info_retryable(code)` → 재연결 가능 여부 판단 (§21.6 분류): user intent / policy denial → 비재시도; transient (timeout, OOM, protocol error) → 재시도; licensing / broker → 비재시도
+- [x] `is_error_info_retryable(code)` → 재연결 가능 여부 판단 (Appendix B 에러 코드 분류 기반): user intent / policy denial → 비재시도; transient (timeout, OOM, protocol error) → 재시도; licensing / broker → 비재시도
 
 ### 9.3 Session Redirection ✅
 
@@ -2212,10 +2230,7 @@ pub trait RdpServerSoundHandler: Send { /* ... */ }
 | MS-RDPCR2   | Composited Remoting V2 (DWM scene graph) | —     | Deferred     |
 | MS-RDPEV    | Video Redirection Virtual Channel (TSMF) | 6     | Low          |
 | MS-RDPEMC   | Multiparty Virtual Channel Extension     | 6     | Low          |
-| MS-RDPEECO  | Extensible Output Channel Extension      | 6     | Low          |
-| MS-RDPEXPS  | Extended Presentation Session            | 6     | Low          |
 | MS-RDPEDC   | Desktop Composition Virtual Channel      | 6     | Low          |
-| MS-RDPEAR   | Audio Redirection (newer)                | 6     | Low          |
 | MS-TSGU     | Terminal Services Gateway                | 7     | High         |
 | MS-RDPEUDP  | UDP Transport Extension                  | 7     | Medium       |
 | MS-RDPEMT   | Multitransport Extension                 | 7     | Medium       |
@@ -2496,11 +2511,12 @@ server.listen("0.0.0.0:3389").await?;
 
 **코드 수준:**
 
-- [ ] `#![forbid(unsafe_code)]` -- Core tier 전체 (예외 시 `// SAFETY:` 주석 필수)
-- [ ] `zeroize` -- 자격증명, 세션 키, 비밀번호 메모리 즉시 소거
-- [ ] 정수 오버플로 -- `checked_add()`, `checked_mul()` 사용 (PDU 길이 계산)
-- [ ] 최대 PDU 크기 -- 상수로 정의, 초과 시 즉시 거부 (예: `MAX_PDU_SIZE = 16 MB`)
-- [ ] 최대 채널 수 -- SVC 31개, DVC 무한이지만 configurable limit 설정
+- [x] `#![forbid(unsafe_code)]` -- Core tier 전체 (core/pdu/connector 등 각 파일 상단 확인)
+- [x] `zeroize` -- RSA 개인 키(`justrdp-core::rsa`), CredSSP 자격/세션 키/nonce,
+      Kerberos 키, PKINIT smartcard provider, DH/bignum 등에 적용
+- [ ] 정수 오버플로 -- `checked_add()`, `checked_mul()` 사용 (PDU 길이 계산) — 부분 적용, 전체 감사 필요
+- [x] 최대 PDU 크기 -- TPKT/Fast-Path 레벨에서 거부
+- [x] 최대 채널 수 -- SVC 31개, DVC 구현별 configurable cap (예: `MAX_CHANNELS`)
 - [ ] 압축 폭탄 방지 -- 해제 출력 최대 크기 제한 (compression ratio limit)
 - [ ] 타임아웃 -- 모든 상태 머신에 전환 타임아웃 (configurable)
 
@@ -2684,77 +2700,85 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 ### Phase 1 -- Foundation
 
 - [x] `justrdp-core`: `Encode`/`Decode` trait 구현 및 100% 단위 테스트
-- [ ] `justrdp-pdu`: 모든 TPKT/X.224/MCS/GCC PDU roundtrip 테스트 통과
-- [ ] `justrdp-pdu`: 30종 Capability Set 인코딩/디코딩 통과
-- [ ] `justrdp-pdu`: Fast-Path 입출력 PDU roundtrip 테스트 통과
-- [ ] `cargo fuzz` 최소 1시간 무크래시 (PDU 디코더 대상)
-- [ ] `#![no_std]` 빌드 성공 (core, pdu)
+- [x] `justrdp-pdu`: 모든 TPKT/X.224/MCS/GCC PDU roundtrip 테스트 통과
+- [x] `justrdp-pdu`: 30종 Capability Set 인코딩/디코딩 통과
+- [x] `justrdp-pdu`: Fast-Path 입출력 PDU roundtrip 테스트 통과
+- [ ] `cargo fuzz` 최소 1시간 무크래시 (PDU 디코더 대상) — 인프라 미구축
+- [x] `#![no_std]` 빌드 성공 (core, pdu)
 - [ ] CI: Linux/Windows/macOS, x86_64/aarch64 빌드 통과
-- [ ] 문서: 모든 public API에 `///` doc comment
+- [x] 문서: 모든 public API에 `///` doc comment
 
 ### Phase 2 -- Connection
 
 - [x] CredSSP/NLA 핸드셰이크 성공 (Windows Server, NTLM v6)
-- [ ] NTLM MIC 버그 수정 후 MIC 활성화 상태로 접속 성공
-- [ ] BasicSettingsExchange → Connection Finalization 전체 시퀀스 → `Connected` 도달
-- [ ] Windows Server 2019/2022에 NLA(CredSSP+NTLM) 연결 성공
+- [x] NTLM MIC 버그 수정 후 MIC 활성화 상태로 접속 성공 (§5.2.2, CVE-2019-1040)
+- [x] BasicSettingsExchange → Connection Finalization 전체 시퀀스 → `Connected` 도달
+- [x] Windows Server 2019/2022에 NLA(CredSSP+NTLM) 연결 성공 (manual `192.168.136.136`)
 - [ ] Windows 10/11에 NLA 연결 성공
 - [ ] xrdp에 TLS 연결 성공
 - [ ] Standard RDP Security (RC4) 연결 성공 (레거시 서버 테스트)
 - [ ] 연결 시간 < 2초 (LAN, NLA 포함, `justrdp-blocking::RdpClient::connect` 측정)
 - [ ] CredSSP 구현 보안 리뷰 완료
-- [ ] `cargo fuzz` 최소 4시간 무크래시 (커넥터 상태 머신 대상)
+- [ ] `cargo fuzz` 최소 4시간 무크래시 (커넥터 상태 머신 대상) — 인프라 미구축
 - [ ] 자동화된 연결 통합 테스트 (`justrdp-blocking` + xrdp Docker 컨테이너)
-- [ ] `justrdp-blocking::RdpClient` API 안정화 (5.5 참조)
-- [ ] `ServerCertVerifier` trait 구현 및 기본 구현체 제공 (5.4)
+- [x] `justrdp-blocking::RdpClient` API 안정화 (5.5 참조, M1~M7 완료)
+- [x] `ServerCertVerifier` trait 구현 및 기본 구현체 제공 (5.4)
 
-### Phase 3 -- Graphics
+### Phase 3 -- Standalone Codecs & Primitives
 
-- [ ] Windows Server에서 그래픽 수신 및 RGBA 프레임 버퍼 생성 성공
-- [ ] RLE, Planar, RFX 코덱 디코딩 정확성 검증 (참조 이미지 비교)
-- [ ] EGFX 파이프라인 (v8.0 ~ v10.x) 동작 확인
-- [ ] ZGFX 압축/해제 throughput > 300 MB/s
-- [ ] `ActiveStage` 프레임 처리 레이턴시 < 10ms (1080p)
-- [ ] 포인터/커서 렌더링 정확성
-- [ ] `cargo fuzz` 최소 8시간 무크래시 (코덱 디코더 대상)
+- [x] RLE / Planar / NSCodec / ClearCodec / RFX 디코더 정확성 검증 (참조 이미지 비교)
+- [x] ZGFX 압축/해제 정확성
+- [ ] ZGFX 압축/해제 throughput > 300 MB/s (벤치 미측정)
+- [x] 포인터/커서 렌더링 정확성
+- [ ] `cargo fuzz` 최소 8시간 무크래시 (코덱 디코더 대상) — 인프라 미구축
 - [ ] 코덱 벤치마크 기준선 설정 (`criterion`)
+- [x] `justrdp-input` 입력 이벤트 관리 (scancode/unicode/mouse/sync)
+- [x] `.rdp` 파일 파서 (`justrdp-rdpfile`)
 
-### Phase 4 -- Channels
+### Phase 4 -- Session Core & Channel Frameworks
 
-- [ ] 클립보드: 텍스트/이미지/파일 양방향 복사 동작 확인 (Windows ↔ 클라이언트)
-- [ ] 드라이브: 로컬 디렉터리를 원격 세션에서 탐색/읽기/쓰기 가능
-- [ ] 오디오 출력: 원격 세션 오디오가 로컬에서 재생됨 (PCM 기본)
-- [ ] 오디오 입력: 로컬 마이크가 원격 세션에서 인식됨
-- [ ] 디스플레이 리사이즈: 클라이언트 창 크기 변경 시 원격 해상도 자동 조정
-- [ ] RemoteApp: 단일 앱 실행 및 윈도우 관리 동작 확인
-- [ ] 모든 채널의 초기화/종료 시퀀스 정상 동작
+- [x] `ActiveStage` 프레임 처리 (GraphicsUpdate + Pointer + ChannelData 라우팅)
+- [x] Fast-path/slow-path 자동 분기 (`TpktHint`)
+- [x] EGFX 파이프라인 (v8.0 ~ v10.x) 동작 확인 (Windows RDS manual)
+- [x] SVC 프레임워크 (`SvcProcessor`, `StaticChannelSet`)
+- [x] DVC 프레임워크 (`DvcProcessor`, `DrdynvcClient`)
+- [ ] `ActiveStage` 프레임 처리 레이턴시 < 10ms (1080p) — 벤치 미측정
+
+### Phase 5 -- Channel Implementations
+
+- [x] 클립보드(CLIPRDR): PDU 레이어 + 네이티브 백엔드 (Windows/Linux/macOS)
+- [x] 드라이브(RDPDR): FileSystem 리다이렉션
+- [x] 오디오 출력(RDPSND): PCM + 네이티브 백엔드
+- [x] 오디오 입력(RDPEAI): 네이티브 마이크 백엔드
+- [x] 디스플레이 제어(RDPEDISP): 해상도 자동 조정
+- [x] RemoteApp(RAIL): 단일 앱 실행 + 윈도우 관리
+- [x] EGFX(RDPEGFX): 서버 GFX 수신 파이프라인
+- [x] 모든 채널의 초기화/종료 시퀀스 정상 동작
+- [ ] Windows ↔ 클라이언트 E2E: 클립보드 텍스트/이미지/파일 양방향 복사 (manual만 검증)
 - [ ] 채널 보안 리뷰 완료 (RDPDR 파일 접근 범위, CLIPRDR 데이터 유출 방지)
 
-### Phase 5 -- Advanced
+### Phase 6 -- Advanced Features & Integration
 
-- [ ] 멀티모니터: 2개 이상 모니터에서 올바른 좌표/렌더링
-- [ ] 자동 재연결: `justrdp-blocking` 기반, 네트워크 끊김 후 3초 이내 세션 복구
-- [ ] 세션 리다이렉션: `justrdp-blocking` 기반, 로드밸런서 환경에서 올바른 리다이렉트 (mock broker 테스트)
-- [ ] 라이선스 영구화: 첫 연결 시 라이선스 발급, 재연결 시 licensing 스킵 검증
-- [ ] 각 추가 기능(USB, touch, pen)의 기본 동작 확인
+- [x] 멀티모니터: 2개 이상 모니터에서 올바른 좌표/렌더링
+- [x] 자동 재연결: 네트워크 끊김 후 세션 복구 (§9.2, `test_drop_transport` 420ms 검증)
+- [x] 세션 리다이렉션: LB cookie/TARGET_NET_ADDRESS 파싱 + 자동 재연결 (§9.3)
+- [x] Touch/Pen/USB/Smartcard/Camera/Video/Geometry/DesktopComposition/Multiparty/PnP 확장 채널 (§9.4~§9.14)
+- [ ] 각 추가 기능의 실서버 E2E (Windows RDS 양방향 검증은 §9.4, §9.8, §9.14 일부만 manual 완료)
 
-### Phase 6 -- Transport
+### Phase 7 -- Transport Extensions
 
 - [ ] UDP reliable: TCP 대비 레이턴시 개선 측정 가능
 - [ ] UDP lossy: 오디오/비디오 스트림 정상 전송
 - [ ] RD Gateway: HTTP/WebSocket 전송을 통한 연결 성공
 - [ ] Multitransport: TCP+UDP 동시 전송, DVC 라우팅 정상
 
-### Phase 7 -- Server
+### Phase 8 -- Server-Side & Ecosystem
 
 - [ ] mstsc.exe (Windows 내장 클라이언트)에서 JustRDP 서버 연결 성공
 - [ ] FreeRDP(xfreerdp)에서 JustRDP 서버 연결 성공
 - [ ] 서버 → 클라이언트 그래픽 전송 (RFX 인코딩)
 - [ ] 클라이언트 → 서버 입력 수신 및 처리
 - [ ] 멀티세션 동시 접속
-
-### Phase 8 -- Ecosystem
-
 - [ ] WASM 빌드 및 브라우저에서 RDP 연결 성공
 - [ ] C FFI: 외부 C 프로그램에서 JustRDP 호출 성공
 - [ ] Python 바인딩: `pip install justrdp` 후 스크립팅 사용 가능
@@ -2762,11 +2786,12 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 
 ---
 
-## 21. Error & Disconnect Code Reference
+## Appendix B: Error & Disconnect Code Reference
 
 > `SetErrorInfoPdu`로 전송되는 disconnect reason 코드. 디버깅과 사용자 메시지에 필수.
+> 레퍼런스 부록. 구현 항목은 §4.2.4 RDP Core PDUs 참조.
 
-### 21.1 Protocol-Independent Codes
+### B.1 Protocol-Independent Codes
 
 | Code   | Name                                      | Description           |
 | ------ | ----------------------------------------- | --------------------- |
@@ -2782,7 +2807,7 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 | 0x000A | ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER  | 사용자 요청 종료      |
 | 0x000B | ERRINFO_LOGOFF_BY_USER                    | 사용자 로그오프       |
 
-### 21.2 Protocol Error Codes
+### B.2 Protocol Error Codes
 
 | Code   | Name                                        | Description              |
 | ------ | ------------------------------------------- | ------------------------ |
@@ -2799,7 +2824,7 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 | 0x1007 | ERRINFO_ENCRYPT_NEW_KEYS_FAILED             | 새 키 생성 실패          |
 | 0x1008 | ERRINFO_DECRYPT_NEW_KEYS_FAILED             | 새 키 생성 실패          |
 
-### 21.3 Licensing Error Codes
+### B.3 Licensing Error Codes
 
 | Code   | Name                                  | Description                 |
 | ------ | ------------------------------------- | --------------------------- |
@@ -2814,7 +2839,7 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 | 0x1014 | ERRINFO_LICENSE_CANT_UPGRADE_LICENSE  | 라이센스 업그레이드 불가    |
 | 0x1015 | ERRINFO_LICENSE_NO_REMOTE_CONNECTIONS | 원격 연결 라이센스 없음     |
 
-### 21.4 Connection Broker / Redirection Codes
+### B.4 Connection Broker / Redirection Codes
 
 | Code   | Name                                         | Description                |
 | ------ | -------------------------------------------- | -------------------------- |
@@ -2831,7 +2856,7 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 | 0x040B | ERRINFO_CB_HELPER_FAILED                     | 헬퍼 실패                  |
 | 0x040C | ERRINFO_CB_DESTINATION_NOT_IN_POOL           | 대상이 풀에 없음           |
 
-### 21.5 Security Negotiation Failure Codes
+### B.5 Security Negotiation Failure Codes
 
 | Code   | Name                        | Description            |
 | ------ | --------------------------- | ---------------------- |
@@ -2841,14 +2866,6 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 | 0x0004 | INCONSISTENT_FLAGS          | 비일관적 플래그        |
 | 0x0005 | HYBRID_REQUIRED_BY_SERVER   | 서버가 NLA 필수        |
 | 0x0006 | SSL_WITH_USER_AUTH_REQUIRED | TLS + 사용자 인증 필수 |
-
-### 21.6 구현 항목
-
-- [ ] `DisconnectReason` enum -- 모든 에러 코드 매핑 (`justrdp-pdu`)
-- [ ] 에러 코드 → 사용자 친화적 메시지 변환 함수 (`justrdp-pdu`)
-- [ ] 에러 코드 → 재연결 가능 여부 판단 함수 (`justrdp-pdu::DisconnectReason::is_retryable()`, `justrdp-blocking`의 `ReconnectPolicy`가 소비)
-- [ ] 에러 코드 → 로그 심각도(severity) 매핑
-- [ ] 서버 모드: 적절한 에러 코드 전송 (연결 거부, 라이센스 문제 등)
 
 ---
 
@@ -2917,19 +2934,23 @@ Phase 2 ▸ Connection         justrdp-connector, justrdp-tls, justrdp-blocking
                              CredSSP, NTLM, Kerberos, SPNEGO, Standard RDP Security
                              Remote Credential Guard, Restricted Admin, Azure AD
                              Synchronous runtime (TCP/TLS pump, RdpClient API)
-Phase 3 ▸ Graphics           justrdp-graphics, justrdp-egfx, justrdp-session, justrdp-input
+Phase 3 ▸ Standalone Codecs  justrdp-graphics, justrdp-bulk, justrdp-input, justrdp-rdpfile
                              RLE, Planar, RFX, NSCodec, ClearCodec, H.264, ZGFX
-Phase 4 ▸ Channels           justrdp-svc, justrdp-dvc
-                             cliprdr, rdpdr, rdpsnd, rdpeai, displaycontrol, rail
-Phase 5 ▸ Advanced           Multi-monitor, auto-reconnect, session redirection
-                             License persistence (MS-RDPELE store)
-                             USB, touch, pen, camera, video (RDPEVOR/RDPEV)
-                             Desktop composition, multiparty, PnP, geometry
-Phase 6 ▸ Transport          justrdp-rdpeudp, justrdp-rdpemt, justrdp-gateway (MS-TSGU)
+                             Input events, .rdp file parsing
+Phase 4 ▸ Session Core       justrdp-session, justrdp-svc, justrdp-dvc, justrdp-egfx
+                             ActiveStage, fast/slow-path dispatch, SVC/DVC frameworks
+Phase 5 ▸ Channels           cliprdr, rdpdr, rdpsnd, rdpeai, displaycontrol, rail, egfx
+                             Native backends (Windows/Linux/macOS)
+Phase 6 ▸ Advanced           Multi-monitor, auto-reconnect, session redirection
+                             USB, touch, pen, camera, smartcard
+                             Video (RDPEVOR/RDPEV), geometry, desktop composition
+                             Multiparty, PnP device redirection
+                             (MS-RDPELE full exchange + license persistence: §5.6 deferred)
+Phase 7 ▸ Transport          justrdp-rdpeudp, justrdp-rdpemt, justrdp-gateway (MS-TSGU)
                              UDP reliable/lossy, DTLS, multitransport, WebSocket
-Phase 7 ▸ Server             justrdp-acceptor, justrdp-server
+Phase 8 ▸ Server+Ecosystem   justrdp-acceptor, justrdp-server
                              Server-side GFX encoding, multi-session, shadow
-Phase 8 ▸ Ecosystem          justrdp-web (WASM), justrdp-ffi (C/Python)
+                             justrdp-web (WASM), justrdp-ffi (C/Python)
                              justrdp-client (GUI), justrdp-gateway, justrdp-proxy
 ```
 
