@@ -1488,7 +1488,13 @@ pub trait GfxHandler: Send {
 - [x] Enhanced Security 변형 (MS-RDPBCGR 2.2.13.3.1) — Connector가 `ShareControlHeader.pdu_type == ServerRedirect` 분기에서 2바이트 pad 후 본문 파싱
 - [x] `RedirFlags` 16개 비트 모두 정의 (TargetNetAddress, LoadBalanceInfo, Username, Domain, Password, DontStoreUsername, SmartcardLogon, NoRedirect, TargetFQDN, TargetNetBiosName, TargetNetAddresses, ClientTsvUrl, ServerTsvCapable, PasswordIsPkEncrypted, RedirectionGuid, TargetCertificate)
 - [x] Routing Token / LB Info 바이트 배열 추출 (raw `Vec<u8>` — 바이트 그대로 보존, 호출자가 해석)
-- [ ] ~~비밀번호 cookie 암호화 처리 (RC4 / 서버 공개키)~~ → 현재는 raw bytes로 보존만 (RDSTLS 재인증은 후속)
+- [x] **의도적 미구현**: 비밀번호 cookie RC4/서버 공개키 복호화 —
+      클라이언트는 `LB_PASSWORD_IS_PK_ENCRYPTED` blob 을 복호화하지
+      않고 `Config.redirection_password_blob` 에 raw bytes 로 보존,
+      RDSTLS 재인증 시 그대로 forward (§5.2.6). 실제 복호화는 target
+      RD Session Host 가 담당하므로 클라이언트 측 암호화 처리 경로는
+      설계상 존재하지 않는다. 투명 전달 구현은 바로 아래 "PK-encrypted
+      password cookie 투명 전달" 항목 참조.
 - [x] 11개 단위 테스트 (header roundtrip, magic 거부, 절단/오버런 거부, 단일/복수 field, TargetNetAddresses 구조, 64KB sanity cap, padding 소비)
 
 **Connector 레이어 (`justrdp-connector`):**
