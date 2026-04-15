@@ -277,25 +277,23 @@ impl RdpClient {
             let tcp = TcpStream::connect_timeout(&current_addr, current_config.connect_timeout)?;
             // Bound every subsequent handshake read/write by the same
             // timeout so a stalled server can't hang the connect path.
-            // Setting the timeouts on the raw TcpStream leaks through
-            // to the TLS wrapper because setsockopt affects the
-            // underlying socket, not the Rust handle. The timeouts
-            // are cleared via `timeout_handle` below once the session
-            // pump starts — see the `None` resets right before the
-            // `Ok(Self { ... })` return at the bottom of this fn.
+            // The next two `setsockopt` calls and the paired
+            // `set_read_timeout(None)` / `set_write_timeout(None)`
+            // resets at the bottom of this function share one
+            // underlying socket with `transport` (the timeouts leak
+            // through the TLS wrapper because setsockopt affects
+            // the OS socket, not the Rust handle). This is safe
+            // only because `Transport` is deliberately `!Send` —
+            // see the comment on the enum definition — so no second
+            // thread ever holds the TLS-wrapped stream while we are
+            // mutating the socket options through `timeout_handle`.
+            // When M7 lifts the `!Send` restriction this whole
+            // clear-on-handoff pattern MUST be re-examined; the
+            // simplest fix will be to thread the handshake timeout
+            // through a typed state object instead of sharing a
+            // raw socket handle across thread boundaries.
             tcp.set_read_timeout(Some(current_config.connect_timeout))?;
             tcp.set_write_timeout(Some(current_config.connect_timeout))?;
-            // Safety note: calling setsockopt on `timeout_handle`
-            // while the "primary" TcpStream is being read from a
-            // different thread would race. This is safe today only
-            // because `Transport` is deliberately `!Send` (see the
-            // comment on the enum definition), so no second thread
-            // ever holds the TLS-wrapped stream. When M7 lifts the
-            // `!Send` restriction this clear-on-handoff pattern
-            // MUST be re-examined; the simplest fix will be to
-            // pass the handshake timeout down through a typed
-            // state object and never share a socket handle across
-            // thread boundaries.
             let timeout_handle = tcp.try_clone()?;
             // Clone the config so we can rebuild ClientConnector on the
             // next iteration if a redirect is detected.
@@ -492,14 +490,16 @@ impl RdpClient {
         // SO_RCVTIMEO on the underlying socket; any error here just
         // leaves the handshake timeout in place, which is strictly
         // tighter than unbounded (no hang risk), so it is swallowed.
-        #[allow(unused_variables)]
-        {
-            if let Err(e) = timeout_handle.set_read_timeout(None) {
-                debug!(error = %e, "rdp.connect clear read_timeout failed (non-fatal)");
-            }
-            if let Err(e) = timeout_handle.set_write_timeout(None) {
-                debug!(error = %e, "rdp.connect clear write_timeout failed (non-fatal)");
-            }
+        // The `_e` prefix keeps the binding alive for the `debug!`
+        // macro while silencing the unused-variable lint that fires
+        // when the tracing feature is off (debug! expands to an
+        // empty statement). Scope it per-binding instead of a block
+        // allow so a future real bug isn't masked.
+        if let Err(_e) = timeout_handle.set_read_timeout(None) {
+            debug!(error = %_e, "rdp.connect clear read_timeout failed (non-fatal)");
+        }
+        if let Err(_e) = timeout_handle.set_write_timeout(None) {
+            debug!(error = %_e, "rdp.connect clear write_timeout failed (non-fatal)");
         }
         drop(timeout_handle);
 

@@ -516,7 +516,13 @@ impl ErrorInfoCode {
             Self::LicenseNoRemoteConnections => "server not licensed for remote connections",
 
             Self::CbDestinationNotFound => "broker: destination endpoint not found",
-            Self::CbLoadingDestination => "broker: destination endpoint is loading",
+            // MS-RDPBCGR §2.2.5.1.1 has a name/prose conflict for
+            // this code: the constant name says LOADING but the
+            // reference prose says "the target endpoint ... is
+            // disconnecting from the Connection Broker". Prefer the
+            // prose wording because anyone consulting MS docs will
+            // match against that text, not the symbol name.
+            Self::CbLoadingDestination => "broker: target disconnecting from broker",
             Self::CbRedirectingToDestination => "broker: redirect to destination failed",
             Self::CbSessionOnlineVmWake => "broker: VM wake failure",
             Self::CbSessionOnlineVmBoot => "broker: VM boot failure",

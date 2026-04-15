@@ -513,11 +513,10 @@ pub struct Config {
     /// cleared so steady-state reads can block indefinitely waiting
     /// for the next frame.
     ///
-    /// **Must be non-zero.** `Duration::ZERO` is rejected by
-    /// `std::net::TcpStream::connect_timeout` at runtime with
-    /// `InvalidInput`, so the builder refuses it up front rather
-    /// than letting the error surface deep inside the connect
-    /// sequence where the cause is hard to trace.
+    /// Must be non-zero; [`ConfigBuilder::connect_timeout`] enforces
+    /// this at construction time. Direct struct construction skips
+    /// the check — the runtime will then surface
+    /// `std::io::ErrorKind::InvalidInput` on the first connect call.
     ///
     /// Default: 30 seconds.
     pub connect_timeout: Duration,
