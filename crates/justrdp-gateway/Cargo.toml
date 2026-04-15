@@ -1,0 +1,19 @@
+[package]
+name = "justrdp-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Remote Desktop Gateway (MS-TSGU) transport for JustRDP"
+keywords = ["rdp", "gateway", "tsgu"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc"]
+std = ["alloc", "justrdp-core/std"]
+
+[dependencies]
+justrdp-core.workspace = true
