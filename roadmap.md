@@ -395,12 +395,22 @@ pub trait PduHint: Send + Sync {
 - [x] `RefreshRectPdu`
 - [x] `ShutdownRequestPdu` / `ShutdownDeniedPdu`
 - [x] `SaveSessionInfoPdu` -- Logon / AutoReconnect
-- [x] `SetErrorInfoPdu` -- 300+ disconnect reason 코드 (Appendix B 참조)
-  - [ ] `ErrorInfoCode` enum — 모든 에러 코드를 symbolic enum으로 매핑 (현재는 raw `u32` + 상수)
-  - [ ] 에러 코드 → 사용자 친화적 메시지 변환 함수
-  - [x] `is_error_info_retryable(code) -> bool` — 재연결 가능 여부 판단 (`justrdp-pdu::rdp::finalization`)
-  - [ ] 에러 코드 → 로그 심각도(severity) 매핑
+- [x] `SetErrorInfoPdu` -- ~100 disconnect reason 코드 (Appendix B 참조)
+  - [x] `ErrorInfoCode` enum (`justrdp-pdu::rdp::error_info`) — 42개
+        top-level variant (Protocol-Independent 20 + Licensing 11 +
+        Connection Broker 11) + `RdpProtocol(u32)` 랩핑 + `Unknown(u32)`
+  - [x] `ErrorInfoCode::description()` — 모든 variant용 static 영문
+        메시지
+  - [x] `ErrorInfoCode::category()` → `ErrorInfoCategory` (5-way)
+  - [x] `ErrorInfoCode::severity()` → `ErrorInfoSeverity`
+        (Info/Warning/Error/Fatal, `Ord` 구현)
+  - [x] `ErrorInfoCode::is_retryable()` + `SetErrorInfoPdu::code()`
+  - [x] **latent bug 수정**: 기존 `is_error_info_retryable(u32)`가
+        존재하지 않는 범위(`0x100C..=0x1015` 등)를 licensing으로
+        체크해서 실제 라이선스 코드(`0x100..=0x10A`)를 모두 retryable로
+        잘못 분류하던 문제 — 이제 enum에 위임
   - [ ] 서버 모드: 적절한 에러 코드 전송 (연결 거부, 라이센스 문제 등)
+        — Phase 8 서버 사이드와 함께 처리
 - [x] `SetKeyboardIndicatorsPdu`
 - [x] `SetKeyboardImeStatusPdu`
 - [x] `MonitorLayoutPdu`
@@ -2795,73 +2805,74 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 
 ## Appendix B: Error & Disconnect Code Reference
 
-> `SetErrorInfoPdu`로 전송되는 disconnect reason 코드. 디버깅과 사용자 메시지에 필수.
-> 레퍼런스 부록. 구현 항목은 §4.2.4 RDP Core PDUs 참조.
+> `SetErrorInfoPdu`로 전송되는 disconnect reason 코드. MS-RDPBCGR §2.2.5.1.1
+> 기준으로 전사. 구현은 `justrdp-pdu::rdp::error_info::ErrorInfoCode` 및
+> §4.2.4 RDP Core PDUs 참조.
 
-### B.1 Protocol-Independent Codes
+### B.1 Protocol-Independent Codes (`ErrorInfoCategory::ProtocolIndependent`)
 
-| Code   | Name                                      | Description           |
-| ------ | ----------------------------------------- | --------------------- |
-| 0x0000 | ERRINFO_RPC_INITIATED_DISCONNECT          | 관리자가 세션 종료    |
-| 0x0001 | ERRINFO_RPC_INITIATED_LOGOFF              | 관리자가 로그오프     |
-| 0x0002 | ERRINFO_IDLE_TIMEOUT                      | 유휴 타임아웃         |
-| 0x0003 | ERRINFO_LOGON_TIMEOUT                     | 로그온 타임아웃       |
-| 0x0004 | ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION  | 다른 연결에 의해 끊김 |
-| 0x0005 | ERRINFO_OUT_OF_MEMORY                     | 서버 메모리 부족      |
-| 0x0006 | ERRINFO_SERVER_DENIED_CONNECTION          | 서버가 연결 거부      |
-| 0x0007 | ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES    | 권한 부족             |
-| 0x0009 | ERRINFO_SERVER_FRESH_CREDENTIALS_REQUIRED | 새 자격증명 필요      |
-| 0x000A | ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER  | 사용자 요청 종료      |
-| 0x000B | ERRINFO_LOGOFF_BY_USER                    | 사용자 로그오프       |
+| Code       | Name                                          | Description                     |
+| ---------- | --------------------------------------------- | ------------------------------- |
+| 0x00000000 | ERRINFO_NONE                                  | 에러 없음 (무시)                |
+| 0x00000001 | ERRINFO_RPC_INITIATED_DISCONNECT              | 다른 세션의 관리자가 끊음       |
+| 0x00000002 | ERRINFO_RPC_INITIATED_LOGOFF                  | 강제 로그오프                   |
+| 0x00000003 | ERRINFO_IDLE_TIMEOUT                          | 유휴 타임아웃                   |
+| 0x00000004 | ERRINFO_LOGON_TIMEOUT                         | 로그온 세션 타임아웃            |
+| 0x00000005 | ERRINFO_DISCONNECTED_BY_OTHERCONNECTION       | 다른 연결에 의해 밀려남         |
+| 0x00000006 | ERRINFO_OUT_OF_MEMORY                         | 서버 메모리 부족                |
+| 0x00000007 | ERRINFO_SERVER_DENIED_CONNECTION              | 서버가 연결 거부                |
+| 0x00000009 | ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES        | 접근 권한 부족                  |
+| 0x0000000A | ERRINFO_SERVER_FRESH_CREDENTIALS_REQUIRED     | 저장된 자격증명 거부, 재입력    |
+| 0x0000000B | ERRINFO_RPC_INITIATED_DISCONNECT_BYUSER       | 해당 세션의 관리자가 끊음       |
+| 0x0000000C | ERRINFO_LOGOFF_BY_USER                        | 사용자 로그오프                 |
+| 0x0000000F | ERRINFO_CLOSE_STACK_ON_DRIVER_NOT_READY       | 디스플레이 드라이버 미준비      |
+| 0x00000010 | ERRINFO_SERVER_DWM_CRASH                      | 원격 DWM 프로세스 비정상 종료   |
+| 0x00000011 | ERRINFO_CLOSE_STACK_ON_DRIVER_FAILURE         | 드라이버 초기화 실패            |
+| 0x00000012 | ERRINFO_CLOSE_STACK_ON_DRIVER_IFACE_FAILURE   | 드라이버 인터페이스 실패        |
+| 0x00000017 | ERRINFO_SERVER_WINLOGON_CRASH                 | 원격 Winlogon 비정상 종료       |
+| 0x00000018 | ERRINFO_SERVER_CSRSS_CRASH                    | 원격 CSRSS 비정상 종료          |
+| 0x00000019 | ERRINFO_SERVER_SHUTDOWN                       | 서버 셧다운 중                  |
+| 0x0000001A | ERRINFO_SERVER_REBOOT                         | 서버 재부팅 중                  |
 
-### B.2 Protocol Error Codes
+### B.2 Licensing Codes (`ErrorInfoCategory::Licensing`)
 
-| Code   | Name                                        | Description              |
-| ------ | ------------------------------------------- | ------------------------ |
-| 0x0100 | ERRINFO_CLOSE_STACK_ON_DRIVER_NOT_READY     | 드라이버 미준비          |
-| 0x0104 | ERRINFO_SERVER_DWM_CRASH                    | 서버 DWM 충돌            |
-| 0x010C | ERRINFO_CLOSE_STACK_ON_DRIVER_FAILURE       | 드라이버 실패            |
-| 0x010D | ERRINFO_CLOSE_STACK_ON_DRIVER_IFACE_FAILURE | 드라이버 인터페이스 실패 |
-| 0x1000 | ERRINFO_ENCRYPTION_FAILURE                  | 암호화 실패              |
-| 0x1001 | ERRINFO_DECRYPTION_FAILURE                  | 복호화 실패              |
-| 0x1002 | ERRINFO_ENCRYPT_UPDATE_FAILURE              | 암호화 업데이트 실패     |
-| 0x1003 | ERRINFO_DECRYPT_UPDATE_FAILURE              | 복호화 업데이트 실패     |
-| 0x1005 | ERRINFO_ENCRYPT_NO_ENCRYPT_KEY              | 암호화 키 없음           |
-| 0x1006 | ERRINFO_DECRYPT_NO_DECRYPT_KEY              | 복호화 키 없음           |
-| 0x1007 | ERRINFO_ENCRYPT_NEW_KEYS_FAILED             | 새 키 생성 실패          |
-| 0x1008 | ERRINFO_DECRYPT_NEW_KEYS_FAILED             | 새 키 생성 실패          |
+| Code       | Name                                        | Description                       |
+| ---------- | ------------------------------------------- | --------------------------------- |
+| 0x00000100 | ERRINFO_LICENSE_INTERNAL                    | 라이선스 컴포넌트 내부 오류       |
+| 0x00000101 | ERRINFO_LICENSE_NO_LICENSE_SERVER           | 라이선스 서버 없음                |
+| 0x00000102 | ERRINFO_LICENSE_NO_LICENSE                  | CAL 없음                          |
+| 0x00000103 | ERRINFO_LICENSE_BAD_CLIENT_MSG              | 잘못된 클라이언트 라이선스 메시지 |
+| 0x00000104 | ERRINFO_LICENSE_HWID_DOESNT_MATCH_LICENSE   | 저장 라이선스 변조 (HWID 불일치)  |
+| 0x00000105 | ERRINFO_LICENSE_BAD_CLIENT_LICENSE          | 저장 라이선스 포맷 오류           |
+| 0x00000106 | ERRINFO_LICENSE_CANT_FINISH_PROTOCOL        | 라이선스 프로토콜 중단            |
+| 0x00000107 | ERRINFO_LICENSE_CLIENT_ENDED_PROTOCOL       | 클라이언트가 프로토콜 조기 종료   |
+| 0x00000108 | ERRINFO_LICENSE_BAD_CLIENT_ENCRYPTION       | 라이선스 메시지 암호화 오류       |
+| 0x00000109 | ERRINFO_LICENSE_CANT_UPGRADE_LICENSE        | 라이선스 업그레이드 불가          |
+| 0x0000010A | ERRINFO_LICENSE_NO_REMOTE_CONNECTIONS       | 원격 연결 허용 안됨               |
 
-### B.3 Licensing Error Codes
+### B.3 Connection Broker Codes (`ErrorInfoCategory::ConnectionBroker`)
 
-| Code   | Name                                  | Description                 |
-| ------ | ------------------------------------- | --------------------------- |
-| 0x100C | ERRINFO_LICENSE_NO_LICENSE_SERVER     | 라이센스 서버 없음          |
-| 0x100D | ERRINFO_LICENSE_NO_LICENSE            | 라이센스 없음               |
-| 0x100E | ERRINFO_LICENSE_BAD_CLIENT_MSG        | 잘못된 클라이언트 메시지    |
-| 0x100F | ERRINFO_LICENSE_HWID_DOESNT_MATCH     | 하드웨어 ID 불일치          |
-| 0x1010 | ERRINFO_LICENSE_BAD_CLIENT_LICENSE    | 잘못된 클라이언트 라이센스  |
-| 0x1011 | ERRINFO_LICENSE_CANT_FINISH_PROTOCOL  | 라이센스 프로토콜 완료 불가 |
-| 0x1012 | ERRINFO_LICENSE_CLIENT_ENDED_PROTOCOL | 클라이언트가 프로토콜 종료  |
-| 0x1013 | ERRINFO_LICENSE_BAD_CLIENT_ENCRYPTION | 잘못된 암호화               |
-| 0x1014 | ERRINFO_LICENSE_CANT_UPGRADE_LICENSE  | 라이센스 업그레이드 불가    |
-| 0x1015 | ERRINFO_LICENSE_NO_REMOTE_CONNECTIONS | 원격 연결 라이센스 없음     |
+| Code       | Name                                          | Description               |
+| ---------- | --------------------------------------------- | ------------------------- |
+| 0x00000400 | ERRINFO_CB_DESTINATION_NOT_FOUND              | 대상 endpoint 없음        |
+| 0x00000402 | ERRINFO_CB_LOADING_DESTINATION                | 대상이 브로커에서 분리 중 |
+| 0x00000404 | ERRINFO_CB_REDIRECTING_TO_DESTINATION         | 리다이렉트 중 오류        |
+| 0x00000405 | ERRINFO_CB_SESSION_ONLINE_VM_WAKE             | 대상 VM 깨우기 실패       |
+| 0x00000406 | ERRINFO_CB_SESSION_ONLINE_VM_BOOT             | 대상 VM 부팅 실패         |
+| 0x00000407 | ERRINFO_CB_SESSION_ONLINE_VM_NO_DNS           | 대상 VM IP 미확인         |
+| 0x00000408 | ERRINFO_CB_DESTINATION_POOL_NOT_FREE          | 풀에 가용 endpoint 없음   |
+| 0x00000409 | ERRINFO_CB_CONNECTION_CANCELLED               | 연결 처리 취소            |
+| 0x00000410 | ERRINFO_CB_CONNECTION_ERROR_INVALID_SETTINGS  | routingToken 검증 실패    |
+| 0x00000411 | ERRINFO_CB_SESSION_ONLINE_VM_BOOT_TIMEOUT     | 대상 VM 부팅 타임아웃     |
+| 0x00000412 | ERRINFO_CB_SESSION_ONLINE_VM_SESSMON_FAILED   | VM 세션 모니터링 실패     |
 
-### B.4 Connection Broker / Redirection Codes
+### B.4 RDP Internal Protocol Errors (`ErrorInfoCategory::RdpProtocol`)
 
-| Code   | Name                                         | Description                |
-| ------ | -------------------------------------------- | -------------------------- |
-| 0x0400 | ERRINFO_CB_DESTINATION_NOT_FOUND             | 대상 서버 없음             |
-| 0x0401 | ERRINFO_CB_LOADING_DESTINATION               | 대상 서버 로딩 중          |
-| 0x0402 | ERRINFO_CB_REDIRECTING_TO_DESTINATION        | 대상으로 리다이렉트 중     |
-| 0x0404 | ERRINFO_CB_CONNECTION_CANCELLED              | 연결 취소됨                |
-| 0x0405 | ERRINFO_CB_CONNECTION_ERROR_INVALID_SETTINGS | 잘못된 설정                |
-| 0x0406 | ERRINFO_CB_SESSION_ONLINE_VM_WAKE            | VM 깨우기 중               |
-| 0x0407 | ERRINFO_CB_SESSION_ONLINE_VM_BOOT            | VM 부팅 중                 |
-| 0x0408 | ERRINFO_CB_SESSION_ONLINE_VM_NO_DNS          | VM DNS 없음                |
-| 0x0409 | ERRINFO_CB_DESTINATION_POOL_NOT_FREE         | 풀에 사용 가능한 대상 없음 |
-| 0x040A | ERRINFO_CB_CONNECTION_CANCELLED_ADMIN        | 관리자가 연결 취소         |
-| 0x040B | ERRINFO_CB_HELPER_FAILED                     | 헬퍼 실패                  |
-| 0x040C | ERRINFO_CB_DESTINATION_NOT_IN_POOL           | 대상이 풀에 없음           |
+> 0x000010C9..=0x00001195 범위의 ~80개 내부 프로토콜 오류 (UnknownPduType,
+> SequenceError, Capability/Bitmap/Mouse/Input 파싱 실패, Security header
+> 부족, Decrypt 실패 등). 진단용으로만 의미가 있어 열거하지 않고
+> `ErrorInfoCode::RdpProtocol(u32)` 한 variant로 랩핑한다. 전체 목록은
+> MS-RDPBCGR §2.2.5.1.1 참조.
 
 ### B.5 Security Negotiation Failure Codes
 

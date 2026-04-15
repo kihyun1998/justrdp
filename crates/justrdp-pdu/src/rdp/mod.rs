@@ -5,6 +5,7 @@
 pub mod capabilities;
 pub mod client_info;
 pub mod drawing_orders;
+pub mod error_info;
 pub mod fast_path;
 pub mod finalization;
 pub mod headers;

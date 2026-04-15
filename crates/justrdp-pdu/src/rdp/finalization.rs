@@ -385,13 +385,33 @@ pub struct SetErrorInfoPdu {
     pub error_info: u32,
 }
 
-/// Common error codes (MS-RDPBCGR 2.2.5.1.1, Set Error Info PDU).
+impl SetErrorInfoPdu {
+    /// Classified representation of [`Self::error_info`]. See
+    /// [`crate::rdp::error_info`] for categories, severities, and
+    /// retryability.
+    pub const fn code(&self) -> crate::rdp::error_info::ErrorInfoCode {
+        crate::rdp::error_info::ErrorInfoCode::from_u32(self.error_info)
+    }
+}
+
+// ── Commonly-referenced ERRINFO constants (MS-RDPBCGR 2.2.5.1.1) ──
+//
+// These are the subset of values that appear in existing pattern
+// matches throughout the crate tree. The full symbolic enumeration
+// lives in `crate::rdp::error_info::ErrorInfoCode`.
+
 pub const ERRINFO_NONE: u32 = 0x0000_0000;
 pub const ERRINFO_RPC_INITIATED_DISCONNECT: u32 = 0x0000_0001;
 pub const ERRINFO_RPC_INITIATED_LOGOFF: u32 = 0x0000_0002;
 pub const ERRINFO_IDLE_TIMEOUT: u32 = 0x0000_0003;
 pub const ERRINFO_LOGON_TIMEOUT: u32 = 0x0000_0004;
-pub const ERRINFO_DISCONNECTED_BY_OTHER: u32 = 0x0000_0005;
+/// Spec-correct spelling of the `DISCONNECTED_BY_OTHERCONNECTION`
+/// constant. Retained alongside the legacy `ERRINFO_DISCONNECTED_BY_OTHER`
+/// alias so existing call sites keep compiling.
+pub const ERRINFO_DISCONNECTED_BY_OTHERCONNECTION: u32 = 0x0000_0005;
+/// Legacy alias for [`ERRINFO_DISCONNECTED_BY_OTHERCONNECTION`]. New
+/// code should prefer the spec-correct name.
+pub const ERRINFO_DISCONNECTED_BY_OTHER: u32 = ERRINFO_DISCONNECTED_BY_OTHERCONNECTION;
 pub const ERRINFO_OUT_OF_MEMORY: u32 = 0x0000_0006;
 pub const ERRINFO_SERVER_DENIED_CONNECTION: u32 = 0x0000_0007;
 pub const ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES: u32 = 0x0000_0009;
@@ -409,45 +429,14 @@ pub const ERRINFO_LOGOFF_BY_USER: u32 = 0x0000_000C;
 /// credential refresh required) where a plain reconnect would just
 /// hit the same wall.
 ///
-/// See roadmap §21.6 for the full code table.
-///
-/// Used by `justrdp-blocking::RdpClient::next_event` to gate the
-/// auto-reconnect path when the server initiates a clean termination
-/// via SetErrorInfo + DisconnectProviderUltimatum.
+/// Thin wrapper around
+/// [`ErrorInfoCode::is_retryable`](crate::rdp::error_info::ErrorInfoCode::is_retryable)
+/// — kept for back-compat with the existing
+/// `justrdp-blocking::RdpClient::next_event` call site, which gates
+/// the auto-reconnect path on this value. Prefer the enum API for new
+/// code.
 pub const fn is_error_info_retryable(code: u32) -> bool {
-    match code {
-        // No error — this isn't a real disconnect reason.
-        ERRINFO_NONE => true,
-
-        // Administrator / user initiated — user intent is to leave.
-        ERRINFO_RPC_INITIATED_DISCONNECT
-        | ERRINFO_RPC_INITIATED_LOGOFF
-        | ERRINFO_DISCONNECTED_BY_OTHER
-        | ERRINFO_SERVER_DENIED_CONNECTION
-        | ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES
-        | ERRINFO_SERVER_FRESH_CREDENTIALS_REQUIRED
-        | ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER
-        | ERRINFO_LOGOFF_BY_USER => false,
-
-        // Transient server-side failures — reconnect often succeeds.
-        ERRINFO_IDLE_TIMEOUT | ERRINFO_LOGON_TIMEOUT | ERRINFO_OUT_OF_MEMORY => true,
-
-        // Licensing errors (0x100C..=0x1015) — persistent and usually
-        // won't clear on retry without operator intervention.
-        0x0000_100C..=0x0000_1015 => false,
-
-        // Protocol / encryption failures (0x1000..=0x100B) — usually
-        // transient bugs or MITM artifacts; let reconnect try once.
-        0x0000_1000..=0x0000_100B => true,
-
-        // Connection Broker / redirection codes (0x0400..=0x040F) are
-        // informational: the client should be doing a redirect, not a
-        // retry. Mark as non-retryable so we don't loop.
-        0x0000_0400..=0x0000_040F => false,
-
-        // Unknown / future codes — assume transient and retry once.
-        _ => true,
-    }
+    crate::rdp::error_info::ErrorInfoCode::from_u32(code).is_retryable()
 }
 
 impl Encode for SetErrorInfoPdu {
@@ -1284,28 +1273,39 @@ mod tests {
 
     #[test]
     fn is_error_info_retryable_classifies_license_errors_as_final() {
-        // 0x100C..=0x1015 range (licensing)
-        assert!(!is_error_info_retryable(0x100C));
-        assert!(!is_error_info_retryable(0x100D));
-        assert!(!is_error_info_retryable(0x1010));
-        assert!(!is_error_info_retryable(0x1015));
+        // MS-RDPBCGR 2.2.5.1.1 licensing range: 0x0100..=0x010A.
+        // An earlier revision of this function used 0x100C..=0x1015
+        // which does not correspond to any real spec value — those
+        // codes were never rejected, so a license failure would flip
+        // the runtime into an infinite reconnect loop.
+        assert!(!is_error_info_retryable(0x0100)); // LICENSE_INTERNAL
+        assert!(!is_error_info_retryable(0x0101)); // NO_LICENSE_SERVER
+        assert!(!is_error_info_retryable(0x0104)); // HWID_DOESNT_MATCH
+        assert!(!is_error_info_retryable(0x010A)); // NO_REMOTE_CONNECTIONS
     }
 
     #[test]
-    fn is_error_info_retryable_classifies_protocol_errors_as_retryable() {
-        // 0x1000..=0x100B (encryption / decryption failures) are transient.
-        assert!(is_error_info_retryable(0x1000));
-        assert!(is_error_info_retryable(0x1005));
-        assert!(is_error_info_retryable(0x100B));
+    fn is_error_info_retryable_classifies_rdp_protocol_errors_as_retryable() {
+        // Internal RDP protocol errors live in 0x10C9..=0x1195
+        // (malformed PDU, sequence errors, security failures, etc.).
+        // Transient by default — let the runtime reconnect once.
+        assert!(is_error_info_retryable(0x10C9)); // UNKNOWNPDUTYPE2
+        assert!(is_error_info_retryable(0x10EC)); // VIRTUALCHANNELDECOMPRESSIONERR
+        assert!(is_error_info_retryable(0x1192)); // DECRYPTFAILED
+        assert!(is_error_info_retryable(0x1195)); // DECRYPTFAILED2
     }
 
     #[test]
     fn is_error_info_retryable_classifies_connection_broker_as_final() {
-        // 0x0400..=0x040F (Connection Broker / redirection codes)
-        // should trigger a redirect path, not a plain retry loop.
-        assert!(!is_error_info_retryable(0x0400));
-        assert!(!is_error_info_retryable(0x0408));
-        assert!(!is_error_info_retryable(0x040F));
+        // MS-RDPBCGR 2.2.5.1.1 Connection Broker range (sparse
+        // 0x0400..=0x0412). Earlier code checked 0x0400..=0x040F and
+        // therefore missed the three codes at 0x0410, 0x0411, 0x0412
+        // (invalid routing token + VM boot/sessmon failures).
+        assert!(!is_error_info_retryable(0x0400)); // DESTINATION_NOT_FOUND
+        assert!(!is_error_info_retryable(0x0408)); // DESTINATION_POOL_NOT_FREE
+        assert!(!is_error_info_retryable(0x0409)); // CONNECTION_CANCELLED
+        assert!(!is_error_info_retryable(0x0410)); // INVALID_SETTINGS
+        assert!(!is_error_info_retryable(0x0412)); // VM_SESSMON_FAILED
     }
 
     #[test]
