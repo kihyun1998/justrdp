@@ -43,6 +43,7 @@ use crate::credssp::run_credssp_sequence;
 use crate::error::{ConnectError, RuntimeError};
 use crate::event::RdpEvent;
 use crate::reconnect::ReconnectPolicy;
+use crate::telemetry::{blk_warn, debug, error, info};
 use crate::transport::{read_pdu, write_all};
 
 /// Transport abstraction shared across the pre-TLS and post-TLS phases.
@@ -231,6 +232,12 @@ impl RdpClient {
                     "no socket addresses resolved from `server` argument",
                 ))
             })?;
+        info!(
+            addr = %initial_addr,
+            server_name,
+            processors = processors.len(),
+            "rdp.connect start",
+        );
 
         // 9.3 Session Redirection: the handshake may need to be re-run
         // against a different target if the broker sends a redirection
@@ -251,6 +258,7 @@ impl RdpClient {
             Option<ArcCookie>,
             ResultForSession,
         ) = loop {
+            debug!(addr = %current_addr, attempt = redirect_depth + 1, "rdp.connect.tcp");
             let tcp = TcpStream::connect(current_addr)?;
             // Clone the config so we can rebuild ClientConnector on the
             // next iteration if a redirect is detected.
@@ -265,12 +273,14 @@ impl RdpClient {
                         | ClientConnectorState::Connected { .. }
                 )
             })?;
+            debug!("rdp.connect.phase=x224_nego");
 
             // Phase 2: TLS upgrade if needed.
             let server_public_key = if matches!(
                 connector.state(),
                 ClientConnectorState::EnhancedSecurityUpgrade
             ) {
+                debug!("rdp.connect.phase=tls_upgrade");
                 let tcp = match std::mem::replace(&mut transport, Transport::Swapping) {
                     Transport::Tcp(s) => s,
                     _ => {
@@ -281,8 +291,13 @@ impl RdpClient {
                 };
                 let upgraded = upgrader.upgrade(tcp, &current_name)?;
                 transport = Transport::Tls(Box::new(upgraded.stream));
+                debug!(
+                    pubkey_len = upgraded.server_public_key.len(),
+                    "rdp.connect.tls_upgrade ok",
+                );
                 Some(upgraded.server_public_key)
             } else {
+                debug!("rdp.connect.tls_upgrade skipped (standard rdp security)");
                 None
             };
 
@@ -297,6 +312,7 @@ impl RdpClient {
                     | ClientConnectorState::CredsspPubKeyAuth
                     | ClientConnectorState::CredsspCredentials
             ) {
+                debug!("rdp.connect.phase=credssp");
                 let server_pub_key = server_public_key
                     .as_ref()
                     .cloned()
@@ -316,6 +332,7 @@ impl RdpClient {
             }
 
             // Phase 4: BasicSettings → ... → Finalization → Connected.
+            debug!("rdp.connect.phase=basic_settings_to_finalization");
             drive_until_state_change(&mut connector, &mut transport, |s| s.is_connected())?;
 
             let result = connector.result().ok_or_else(|| {
@@ -323,6 +340,13 @@ impl RdpClient {
                     "connector reached Connected but result() returned None",
                 )
             })?;
+            debug!(
+                channels = result.channel_ids.len(),
+                selected_protocol = ?result.selected_protocol,
+                has_redirection = result.server_redirection.is_some(),
+                has_arc_cookie = result.server_arc_cookie.is_some(),
+                "rdp.connect.phase=connected",
+            );
 
             // 9.3 redirect dispatch: if the connector captured a Server
             // Redirection PDU, the current transport is unusable — drop
@@ -331,7 +355,13 @@ impl RdpClient {
             // values needed to construct RdpClient.
             if let Some(redir) = result.server_redirection.clone() {
                 redirect_depth += 1;
+                info!(
+                    depth = redirect_depth,
+                    redir_flags = format!("0x{:08X}", redir.redir_flags),
+                    "rdp.connect.redirect",
+                );
                 if redirect_depth > MAX_REDIRECTS {
+                    error!(max = MAX_REDIRECTS, "rdp.connect.redirect exhausted");
                     return Err(ConnectError::Tcp(io::Error::new(
                         io::ErrorKind::Other,
                         format!("too many redirects ({MAX_REDIRECTS} max) — aborting"),
@@ -401,6 +431,11 @@ impl RdpClient {
                 channel_ids: result.channel_ids.clone(),
             };
             let server_arc_cookie = result.server_arc_cookie.clone();
+            info!(
+                addr = %current_addr,
+                redirects = redirect_depth,
+                "rdp.connect handshake complete",
+            );
             break (
                 transport,
                 server_public_key,
@@ -774,6 +809,12 @@ impl RdpClient {
     ///   is mutually exclusive with channel registration in this MVP
     fn try_reconnect(&mut self) {
         if !self.can_reconnect() {
+            blk_warn!(
+                max_attempts = self.reconnect_policy.max_attempts,
+                has_arc = self.last_arc_cookie.is_some(),
+                svc_empty = self.svc_set.is_empty(),
+                "rdp.reconnect skipped (policy or state forbids it)",
+            );
             self.pending_events.push_back(RdpEvent::Disconnected(
                 GracefulDisconnectReason::ServerDisconnect(
                     justrdp_pdu::mcs::DisconnectReason::DomainDisconnected,
@@ -789,16 +830,19 @@ impl RdpClient {
         self.session.take();
 
         let max_attempts = self.reconnect_policy.max_attempts;
+        info!(max_attempts, "rdp.reconnect begin");
         for attempt in 1..=max_attempts {
             let delay = self.reconnect_policy.delay_for_attempt(attempt);
             if delay > std::time::Duration::ZERO {
                 std::thread::sleep(delay);
             }
+            debug!(attempt, ?delay, "rdp.reconnect attempt");
             self.pending_events
                 .push_back(RdpEvent::Reconnecting { attempt });
 
             match self.do_one_reconnect() {
                 Ok(()) => {
+                    info!(attempt, "rdp.reconnect ok");
                     self.pending_events.push_back(RdpEvent::Reconnected);
                     return;
                 }
@@ -806,11 +850,13 @@ impl RdpClient {
                     // Try again on the next iteration. Errors are
                     // intentionally swallowed here; if all attempts fail
                     // the loop falls through to the disconnect path.
+                    debug!(attempt, "rdp.reconnect attempt failed");
                 }
             }
         }
 
         // All attempts exhausted.
+        error!(max_attempts, "rdp.reconnect exhausted");
         self.pending_events.push_back(RdpEvent::Disconnected(
             GracefulDisconnectReason::ServerDisconnect(
                 justrdp_pdu::mcs::DisconnectReason::DomainDisconnected,

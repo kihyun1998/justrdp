@@ -41,6 +41,7 @@ mod error;
 mod event;
 mod reconnect;
 pub mod rdpfile;
+mod telemetry;
 mod transport;
 
 pub use client::RdpClient;

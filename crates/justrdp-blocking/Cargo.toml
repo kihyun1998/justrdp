@@ -14,6 +14,10 @@ categories = ["network-programming"]
 default = ["rustls"]
 rustls = ["justrdp-tls/rustls-backend"]
 native-tls = ["justrdp-tls/native-tls-backend"]
+# Emit `tracing` spans and events for connect / reconnect / redirect
+# flow. Off by default so minimal-dep users do not pay for a
+# subscriber framework they are not going to wire up.
+tracing = ["dep:tracing"]
 
 [dependencies]
 justrdp-core = { workspace = true, features = ["alloc", "std"] }
@@ -24,4 +28,5 @@ justrdp-svc.workspace = true
 justrdp-input.workspace = true
 justrdp-tls.workspace = true
 justrdp-rdpfile = { workspace = true, features = ["alloc"] }
+tracing = { version = "0.1", optional = true }
 getrandom = "0.2"

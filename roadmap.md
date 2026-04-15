@@ -861,9 +861,16 @@ pub enum RdpEvent {
   - [x] `justrdp_blocking::rdpfile::rdp_file_config(path, user, pass)` —
         one-shot path→`RdpFileConfig { address, hostname, port, config }`
   - [x] 21 unit test (16 connector + 5 blocking)
-- [ ] **관찰성**
-  - [ ] `tracing` crate 지원 (feature flag)
-  - [ ] 연결 단계별 span
+- [x] **관찰성**
+  - [x] `tracing` crate 지원 (`justrdp-blocking` feature `tracing`,
+        기본 off — 의존 없는 빌드 보장)
+  - [x] 연결 단계별 이벤트: `rdp.connect.{start, tcp, phase=x224_nego,
+        phase=tls_upgrade, phase=credssp, phase=basic_settings_to_finalization,
+        phase=connected, redirect, handshake complete}`
+  - [x] 재연결 이벤트: `rdp.reconnect.{begin, attempt, ok, skipped,
+        exhausted}`
+  - [x] 내부 `src/telemetry.rs` shim — feature off 시 매크로가
+        no-op으로 확장되어 런타임 오버헤드 0
 - [ ] **License persistence** — §5.6 에서 MS-RDPELE 풀 교환과 함께 처리
       (단독 구현 불가: 저장할 blob을 만드는 경로 자체가 미구현)
 
