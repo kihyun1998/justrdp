@@ -2437,10 +2437,94 @@ server.listen("0.0.0.0:3389").await?;
 
 ### 14.3 Fuzzing
 
-- **PDU 퍼징**: `cargo-fuzz` + `libfuzzer`로 모든 `Decode` 구현 퍼징
-- **코덱 퍼징**: RFX, RLE, ZGFX, NSCodec 디코더 퍼징
-- **상태 머신 퍼징**: 임의 바이트 시퀀스로 커넥터/세션 상태 머신 퍼징
-- **목표**: 패닉, OOM, 무한 루프 없음
+> **status**: 인프라 미구축. DoD Phase 1/2/3의 "cargo fuzz 최소 N시간
+> 무크래시" 항목들이 이 플랜에 의존한다. 현재는 `justrdp-fuzzing`
+> crate가 §3 Crate Structure 표에만 존재하고 실제 디렉터리/Cargo.toml
+> 은 없는 상태 — 본 섹션이 그 공백을 채우는 작업 플랜이다.
+
+#### 14.3.1 인프라 부트스트랩
+
+- [ ] `crates/justrdp-fuzzing/` 디렉터리 + `Cargo.toml` 생성
+  - [ ] `[package] publish = false`, 워크스페이스 등록
+  - [ ] `libfuzzer-sys` dep, `[[bin]]` 섹션들로 타겟 나열
+  - [ ] `cargo fuzz` (`cargo-fuzz` 도구)와 호환되는 레이아웃
+- [ ] `fuzz/` 디렉터리와 `fuzz.toml` (타겟 목록, corpus 경로, 디폴트 플래그)
+- [ ] 모든 타겟 공통 유틸: `init_from_slice`, 최대 입력 크기 상한,
+      `#![no_main]` 보일러플레이트 공통화
+- [ ] 로컬 실행 스크립트 `scripts/fuzz.sh` — nightly 툴체인 탐지,
+      타겟 이름 → `cargo +nightly fuzz run <target>` 매핑
+- [ ] README: `rustup toolchain install nightly`,
+      `cargo install cargo-fuzz`, 로컬 run/corpus-minimize 예시
+
+#### 14.3.2 타겟 목록 (우선순위)
+
+> 우선순위 기준: (1) 외부 바이트가 직접 들어오는 표면 (2) 디코더
+> 복잡도 (3) 과거 보안 이슈 빈도. 상단일수록 먼저 시작한다.
+
+**Tier 1 — PDU 디코더 (Phase 1 DoD 대상)**
+
+- [ ] `fuzz_tpkt_header` — TPKT 4B 헤더 + X.224
+- [ ] `fuzz_mcs_connect_initial` — GCC user data 블록 포함
+- [ ] `fuzz_mcs_channel_join` / `mcs_send_data`
+- [ ] `fuzz_capability_sets` — 30종 capability set dispatch
+- [ ] `fuzz_fastpath_input` / `fuzz_fastpath_output` — 빠른 경로 이벤트
+- [ ] `fuzz_share_data_pdu` — Control / Synchronize / FontList / PersistentKey
+- [ ] `fuzz_client_info_pdu` — Info packet + Extended info + ARC 쿠키
+- [ ] `fuzz_license_preamble` — licensing PDU family
+
+**Tier 2 — 커넥터/시퀀스 (Phase 2 DoD 대상)**
+
+- [ ] `fuzz_credssp_ts_request` — BER/DER 파서 표면
+- [ ] `fuzz_ntlm_message` — Negotiate / Challenge / Authenticate + AV pairs
+- [ ] `fuzz_x224_negotiation` — CR/CC + RDP_NEG_REQ/RSP
+- [ ] `fuzz_server_redirection_pdu` — UTF-16LE 주소, LB cookie,
+      PK-encrypted password blob (§9.3 관련)
+
+**Tier 3 — 코덱 (Phase 3 DoD 대상)**
+
+- [ ] `fuzz_rfx_decoder` — 전체 RFX 프레임 (header → tile → RLGR)
+- [ ] `fuzz_rle_decoder` — Interleaved RLE bitmap
+- [ ] `fuzz_nscodec_decoder`
+- [ ] `fuzz_clearcodec_decoder`
+- [ ] `fuzz_zgfx_decompressor` — RDP8 bulk 압축 해제
+- [ ] `fuzz_mppc_decompressor` — MS-RDPBCGR bulk
+- [ ] `fuzz_ncrush_decompressor` / `fuzz_xcrush_decompressor`
+
+**Tier 4 — 가상 채널 / 확장**
+
+- [ ] `fuzz_dvc_pdu` — DRDYNVC create/close/data 프레임
+- [ ] `fuzz_rdpegfx_pdu` — GFX pipeline PDU
+- [ ] `fuzz_cliprdr_pdu` — 클립보드 포맷 데이터
+- [ ] `fuzz_rdpdr_iorequest` — 파일 시스템 IRP
+
+#### 14.3.3 Corpus 전략
+
+- [ ] 각 타겟별 `corpus/<target>/` 디렉터리, 초기 시드로 단위 테스트의
+      encode() 출력 바이트 사용 (기존 roundtrip 벡터 재활용)
+- [ ] Wire trace 샘플이 존재하는 PDU(§4 Wire Traces, RDPEPNP, RDPEMC 등)는
+      스펙 예시 바이트를 corpus에 추가
+- [ ] `cargo fuzz tmin` 으로 크래시 재현 corpus 축소 워크플로 문서화
+- [ ] `.gitignore`에 `fuzz/corpus/` 제외, `fuzz/seeds/`만 커밋 (대용량
+      회피 + 시드 재현성 동시 확보)
+
+#### 14.3.4 CI 통합
+
+- [ ] `.github/workflows/fuzz-smoke.yml` — 모든 타겟 60초 스모크
+      (매 PR, 크래시만 체크)
+- [ ] `.github/workflows/fuzz-nightly.yml` — 핵심 타겟 1시간 (매일 cron)
+- [ ] OSS-Fuzz 등록 검토 (장기) — 24/7 퍼징 서비스 무료 제공, 보안
+      프로젝트 요건 충족 여부 확인 필요
+- [ ] 크래시 발견 시 failing input 을 테스트 케이스로 승격하는 워크플로
+      (regression test 로 보존)
+
+#### 14.3.5 Exit criteria (DoD에서 참조)
+
+- **Phase 1 DoD**: Tier 1 전 타겟 최소 1시간 무크래시
+- **Phase 2 DoD**: Tier 1 + Tier 2 최소 4시간 무크래시
+- **Phase 3 DoD**: Tier 1 + Tier 3 최소 8시간 무크래시
+
+**공통 목표**: 패닉, 메모리 무한 증가, 무한 루프, 정수 오버플로우,
+ unchecked slice indexing 없음.
 
 ### 14.4 Benchmarks
 
@@ -2733,7 +2817,7 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 - [x] `justrdp-pdu`: 모든 TPKT/X.224/MCS/GCC PDU roundtrip 테스트 통과
 - [x] `justrdp-pdu`: 30종 Capability Set 인코딩/디코딩 통과
 - [x] `justrdp-pdu`: Fast-Path 입출력 PDU roundtrip 테스트 통과
-- [ ] `cargo fuzz` 최소 1시간 무크래시 (PDU 디코더 대상) — 인프라 미구축
+- [ ] `cargo fuzz` 최소 1시간 무크래시 (PDU 디코더 대상) — §14.3 인프라 미구축
 - [x] `#![no_std]` 빌드 성공 (core, pdu)
 - [ ] CI: Linux/Windows/macOS, x86_64/aarch64 빌드 통과
 - [x] 문서: 모든 public API에 `///` doc comment
@@ -2749,7 +2833,7 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 - [ ] Standard RDP Security (RC4) 연결 성공 (레거시 서버 테스트)
 - [ ] 연결 시간 < 2초 (LAN, NLA 포함, `justrdp-blocking::RdpClient::connect` 측정)
 - [ ] CredSSP 구현 보안 리뷰 완료
-- [ ] `cargo fuzz` 최소 4시간 무크래시 (커넥터 상태 머신 대상) — 인프라 미구축
+- [ ] `cargo fuzz` 최소 4시간 무크래시 (커넥터 상태 머신 대상) — §14.3 인프라 미구축
 - [x] 자동화된 연결 통합 테스트 (`justrdp-blocking` + xrdp Docker 컨테이너)
       — `.github/workflows/e2e-xrdp.yml` 수동/주간 트리거
 - [x] `justrdp-blocking::RdpClient` API 안정화 (5.5 참조, M1~M7 완료)
@@ -2761,7 +2845,7 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 - [x] ZGFX 압축/해제 정확성
 - [ ] ZGFX 압축/해제 throughput > 300 MB/s (벤치 미측정)
 - [x] 포인터/커서 렌더링 정확성
-- [ ] `cargo fuzz` 최소 8시간 무크래시 (코덱 디코더 대상) — 인프라 미구축
+- [ ] `cargo fuzz` 최소 8시간 무크래시 (코덱 디코더 대상) — §14.3 인프라 미구축
 - [ ] 코덱 벤치마크 기준선 설정 (`criterion`)
 - [x] `justrdp-input` 입력 이벤트 관리 (scancode/unicode/mouse/sync)
 - [x] `.rdp` 파일 파서 (`justrdp-rdpfile`)
