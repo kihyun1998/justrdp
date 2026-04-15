@@ -1,0 +1,116 @@
+name: E2E — xrdp
+
+# Stands up a disposable xrdp container and drives the full
+# JustRDP connect sequence against it via the `connect_test`
+# example in `justrdp-blocking`. Runs on demand (manual trigger)
+# and weekly so the CI signal does not block day-to-day PRs but
+# still catches regressions in the connect / TLS / CredSSP /
+# finalization path.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_events:
+        description: "Events to observe before declaring success"
+        required: false
+        default: "30"
+  schedule:
+    # Sunday 03:17 UTC. Off-peak so a flaky runner does not
+    # collide with merge traffic.
+    - cron: "17 3 * * 0"
+
+# Prevent two runs from stomping on each other's containers /
+# port bindings on the same runner.
+concurrency:
+  group: e2e-xrdp-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  xrdp-roundtrip:
+    name: connect_test → xrdp (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-e2e-xrdp-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-xrdp-
+
+      - name: Build connect_test example
+        # Build before starting the container so container startup
+        # time overlaps with nothing — if compilation fails we fail
+        # fast without the extra xrdp setup cost.
+        run: cargo build -p justrdp-blocking --example connect_test
+
+      - name: Build xrdp docker image
+        run: docker build -t justrdp-xrdp -f tests/xrdp/Dockerfile tests/xrdp
+
+      - name: Start xrdp container
+        run: |
+          docker run --rm -d \
+              -p 3389:3389 \
+              --name justrdp-xrdp \
+              justrdp-xrdp
+
+      - name: Wait for xrdp healthcheck
+        run: |
+          # Poll the Docker healthcheck for up to 60 s. The
+          # Dockerfile's HEALTHCHECK greps `ss -ltn` for :3389, so a
+          # `healthy` state means xrdp is actively listening.
+          for i in $(seq 1 60); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' justrdp-xrdp 2>/dev/null || echo unknown)
+            echo "xrdp health: $status (attempt $i)"
+            if [ "$status" = "healthy" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "xrdp failed to become healthy within 60 s"
+          docker logs justrdp-xrdp || true
+          exit 1
+
+      - name: Run connect_test against xrdp
+        id: roundtrip
+        run: |
+          set +e
+          cargo run -p justrdp-blocking --example connect_test -- \
+              --host 127.0.0.1 \
+              --port 3389 \
+              --user testuser \
+              --password testpass \
+              --domain '' \
+              --max-events "${{ github.event.inputs.max_events || '30' }}"
+          rc=$?
+          echo "connect_test exit code: $rc"
+          # Accept 0 (clean). Any other code is a regression — the
+          # example documents 1 as connect failure and 2 as runtime
+          # error, both of which we want to surface.
+          exit $rc
+
+      - name: Dump xrdp logs on failure
+        if: failure()
+        run: docker logs justrdp-xrdp || true
+
+      - name: Stop xrdp container
+        # Always run so a crashed container still gets cleaned up
+        # on self-hosted runners with persistent state.
+        if: always()
+        run: docker stop justrdp-xrdp || true

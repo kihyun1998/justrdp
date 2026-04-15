@@ -841,8 +841,14 @@ pub enum RdpEvent {
   - [x] `ConnectError` enum (`Tcp` / `Tls` / `Connector` / `UnexpectedEof` / `FrameTooLarge` / `ChannelSetup` / `Unimplemented`)
   - [x] `RuntimeError` enum (`Io` / `Session` / `FrameTooLarge` / `Disconnected` / `Unimplemented`)
   - [x] `is_error_info_retryable(code)` 분류 (user intent / policy / transient / license / broker 5-way)
-- [ ] **Integration tests** (일부 잔여)
-  - [ ] xrdp Docker 컨테이너 E2E (CI)
+- [x] **Integration tests**
+  - [x] xrdp Docker 컨테이너 E2E (`tests/xrdp/Dockerfile` +
+        `.github/workflows/e2e-xrdp.yml`) — manual/weekly workflow가
+        Ubuntu 22.04 + xrdp + xorgxrdp + xfce4 컨테이너를 빌드/기동하고
+        `connect_test` 예제로 `testuser:testpass@localhost:3389` 에
+        연결, 종료 코드로 회귀 판정. 알려진 finalization 버그(Windows RDS
+        WaitSynchronize 드랍)는 xrdp 대상에서 재현 여부가 아직 미확인
+        이라 현재는 on-demand/주간 스케줄
   - [x] Windows RDS E2E (manual, `192.168.136.136`) — connect_test 예제로 양방향 활성 세션 검증 (GraphicsUpdate + PointerBitmap + 입력 송신)
   - [x] Auto-reconnect: `test_drop_transport()` → `Reconnecting` → `Reconnected` → 정상 재개 (420ms)
   - [x] Session redirection: connector-level wire-format injection test 2개 (WaitSynchronize + WaitFontMap 양쪽에서 LB cookie / TARGET_NET_ADDRESS 검증)
@@ -2744,7 +2750,8 @@ Level 8: justrdp-server, justrdp-client, justrdp-web, justrdp-ffi  (parallel)
 - [ ] 연결 시간 < 2초 (LAN, NLA 포함, `justrdp-blocking::RdpClient::connect` 측정)
 - [ ] CredSSP 구현 보안 리뷰 완료
 - [ ] `cargo fuzz` 최소 4시간 무크래시 (커넥터 상태 머신 대상) — 인프라 미구축
-- [ ] 자동화된 연결 통합 테스트 (`justrdp-blocking` + xrdp Docker 컨테이너)
+- [x] 자동화된 연결 통합 테스트 (`justrdp-blocking` + xrdp Docker 컨테이너)
+      — `.github/workflows/e2e-xrdp.yml` 수동/주간 트리거
 - [x] `justrdp-blocking::RdpClient` API 안정화 (5.5 참조, M1~M7 완료)
 - [x] `ServerCertVerifier` trait 구현 및 기본 구현체 제공 (5.4)
 
