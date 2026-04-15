@@ -23,4 +23,5 @@ justrdp-session.workspace = true
 justrdp-svc.workspace = true
 justrdp-input.workspace = true
 justrdp-tls.workspace = true
+justrdp-rdpfile = { workspace = true, features = ["alloc"] }
 getrandom = "0.2"

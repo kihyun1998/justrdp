@@ -565,7 +565,7 @@ impl Config {
 
 /// Builder for [`Config`].
 pub struct ConfigBuilder {
-    config: Config,
+    pub(crate) config: Config,
 }
 
 impl ConfigBuilder {
@@ -754,6 +754,23 @@ impl ConfigBuilder {
     pub fn redirection_guid(mut self, guid: Vec<u8>) -> Self {
         self.config.redirection_guid = Some(guid);
         self
+    }
+
+    /// Apply settings from a parsed `.rdp` file.
+    ///
+    /// Maps the fields Windows `mstsc.exe` stores in `.rdp` files onto the
+    /// connector [`Config`]. Credentials are **not** touched — `.rdp` files
+    /// cannot carry passwords, and the username/password supplied to
+    /// [`Config::builder`] takes precedence. Pass the file's `username`
+    /// through the builder explicitly if you want it to override.
+    ///
+    /// Unmapped fields (Gateway, RemoteApp, smart-sizing, etc.) are
+    /// silently ignored — the caller can still set those manually via
+    /// dedicated builder methods. See [`rdpfile`](crate::rdpfile) for the
+    /// complete mapping table and helpers to extract the server address.
+    #[cfg(feature = "alloc")]
+    pub fn apply_rdp_file(self, file: &justrdp_rdpfile::RdpFile) -> Self {
+        crate::rdpfile::apply_to_builder(self, file)
     }
 
     /// Build the configuration.

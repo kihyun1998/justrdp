@@ -16,6 +16,8 @@ mod connector;
 pub mod credssp;
 mod encode_helpers;
 mod error;
+#[cfg(feature = "alloc")]
+pub mod rdpfile;
 mod result;
 mod sequence;
 mod state;

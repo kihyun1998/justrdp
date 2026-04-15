@@ -842,8 +842,15 @@ pub enum RdpEvent {
 > M1~M7은 완료된 상태이며 `Connected` / active session 목표를 달성.
 > 아래 항목들은 M1~M7의 blocker가 아니고 생태계 편의성 개선용.
 
-- [ ] **`.rdp` 파일 로딩** (`justrdp-rdpfile` 통합)
-  - [ ] `Config::from_rdp_file(path)` 편의 생성자
+- [x] **`.rdp` 파일 로딩** (`justrdp-rdpfile` 통합)
+  - [x] `ConfigBuilder::apply_rdp_file(&RdpFile)` — no_std 매핑
+        (domain, desktop size, color depth, compression, CredSSP bit,
+        PerformanceFlags 7개)
+  - [x] `justrdp_connector::rdpfile::server_address(&RdpFile)` —
+        IPv4/IPv6(bracketed)/hostname + `server port` fallback → default 3389
+  - [x] `justrdp_blocking::rdpfile::rdp_file_config(path, user, pass)` —
+        one-shot path→`RdpFileConfig { address, hostname, port, config }`
+  - [x] 21 unit test (16 connector + 5 blocking)
 - [ ] **관찰성**
   - [ ] `tracing` crate 지원 (feature flag)
   - [ ] 연결 단계별 span

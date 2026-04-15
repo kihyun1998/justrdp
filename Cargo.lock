@@ -316,6 +316,7 @@ dependencies = [
  "justrdp-core",
  "justrdp-input",
  "justrdp-pdu",
+ "justrdp-rdpfile",
  "justrdp-session",
  "justrdp-svc",
  "justrdp-tls",
@@ -356,6 +357,7 @@ dependencies = [
  "justrdp-core",
  "justrdp-pdu",
  "justrdp-pkinit-card",
+ "justrdp-rdpfile",
 ]
 
 [[package]]

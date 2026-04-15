@@ -40,9 +40,14 @@ mod credssp;
 mod error;
 mod event;
 mod reconnect;
+pub mod rdpfile;
 mod transport;
 
 pub use client::RdpClient;
 pub use error::{ConnectError, RuntimeError};
 pub use event::RdpEvent;
+pub use rdpfile::{
+    load_rdp_file, rdp_file_config, rdp_file_config_from_parsed, ParsedRdpFile, RdpFileConfig,
+    RdpFileError, RdpFileParseError,
+};
 pub use reconnect::ReconnectPolicy;
