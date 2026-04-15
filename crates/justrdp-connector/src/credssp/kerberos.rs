@@ -1248,6 +1248,155 @@ mod tests {
     }
 
     #[test]
+    fn pkinit_smartcard_as_req_structure_matches_rfc4556() {
+        // Structural verification of the full PA-PK-AS-REQ chain:
+        //
+        //   AS-REQ                (RFC 4120 5.4.1, APPLICATION 10)
+        //    └── padata SEQUENCE
+        //         ├── PA-PK-AS-REQ (RFC 4556 3.2.1, type 16)
+        //         │    └── CMS ContentInfo
+        //         │         ├── contentType = OID signed-data
+        //         │         │   (1.2.840.113549.1.7.2)
+        //         │         └── content = SignedData
+        //         │              └── encapContentInfo
+        //         │                   ├── contentType =
+        //         │                   │   OID_PKINIT_AUTH_DATA
+        //         │                   │   (1.3.6.1.5.2.3.1)
+        //         │                   └── content = AuthPack DER
+        //         └── PA-PAC-REQUEST     (include-pac = true)
+        //
+        // Walking the entire ASN.1 by hand is fragile, so this test
+        // byte-pattern-searches for known-fixed OID sequences and
+        // raw ASCII field values that MUST appear when the encoder
+        // produces a correctly-structured PA-PK-AS-REQ. Every
+        // assertion cites the RFC clause it backs so future changes
+        // have a spec reference to argue against.
+        use justrdp_pkinit_card::MockSmartcardProvider;
+
+        // Fixed random inputs so the test is deterministic.
+        let random = KerberosRandom {
+            nonce: 0x5678_1234,
+            tgs_nonce: 100,
+            confounder_as: [0; 16],
+            confounder_tgs_auth: [0; 16],
+            confounder_ap_auth: [0; 16],
+            subkey: vec![0x42; 32],
+            seq_number: 1,
+            timestamp_usec: 0,
+            client_dh_nonce: [0xAAu8; 32],
+        };
+
+        let config = PkinitConfig::from_provider(
+            Box::new(MockSmartcardProvider::new()),
+            vec![0x42; 32],
+        );
+        let mut seq =
+            KerberosSequence::new_pkinit("alice", "REALM.COM", "server", random, config);
+        let as_req = seq
+            .build_as_req_pkinit(b"20260326120000Z", 0x0001_E240) // usec=123456
+            .expect("build_as_req_pkinit");
+
+        // ── Layer 1: RFC 4120 §5.4.1 AS-REQ wrapper ──
+
+        // [APPLICATION 10] = class 01 | P/C 1 | tag 10 = 0110 1010 = 0x6a
+        assert_eq!(as_req[0], 0x6a, "AS-REQ [APPLICATION 10] outer tag");
+
+        // ── Layer 2: RFC 4556 §3.2.1 PA-PK-AS-REQ marker ──
+
+        // PA_PK_AS_REQ = 16 appears as an INTEGER inside a PA-DATA
+        // SEQUENCE. BER encoding of 16 as a 1-byte INTEGER is
+        // `02 01 10`. The padata-type is tagged [1], so the actual
+        // bytes in the stream are `a1 03 02 01 10`.
+        let pa_type_marker: &[u8] = &[0xa1, 0x03, 0x02, 0x01, 0x10];
+        assert!(
+            find_subslice(&as_req, pa_type_marker).is_some(),
+            "PA-PK-AS-REQ type-16 marker must be present (RFC 4556 §3.2.1)",
+        );
+
+        // PA_PAC_REQUEST = 128 as the second PA-DATA (encoded as the
+        // 2-byte INTEGER `02 02 00 80` inside an [1] tag).
+        let pa_pac_request_marker: &[u8] = &[0xa1, 0x04, 0x02, 0x02, 0x00, 0x80];
+        assert!(
+            find_subslice(&as_req, pa_pac_request_marker).is_some(),
+            "PA-PAC-REQUEST type-128 marker must be present (RFC 4120 §5.2.7.7)",
+        );
+
+        // ── Layer 3: CMS OIDs inside the PA-PK-AS-REQ signedAuthPack ──
+
+        // PKCS #7 signed-data OID: 1.2.840.113549.1.7.2 encoded as
+        // an OID = `06 09 2a 86 48 86 f7 0d 01 07 02`. This is the
+        // contentType of the outer ContentInfo — its presence proves
+        // the signedAuthPack is actually a CMS SignedData.
+        let oid_signed_data: &[u8] =
+            &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
+        assert!(
+            find_subslice(&as_req, oid_signed_data).is_some(),
+            "CMS ContentInfo must advertise signed-data OID (RFC 5652 §5.1)",
+        );
+
+        // PKINIT auth data OID: 1.3.6.1.5.2.3.1 encoded as
+        // `06 07 2b 06 01 05 02 03 01`. This is the encapContentInfo
+        // contentType inside the SignedData — its presence proves
+        // the signed content is specifically the PKINIT AuthPack,
+        // not some other signed object (RFC 4556 §3.2.1).
+        let oid_pkinit_auth_data: &[u8] =
+            &[0x06, 0x07, 0x2b, 0x06, 0x01, 0x05, 0x02, 0x03, 0x01];
+        assert!(
+            find_subslice(&as_req, oid_pkinit_auth_data).is_some(),
+            "SignedData encapContentInfo must use id-pkinit-authData (RFC 4556 §3.2.1)",
+        );
+
+        // DH public number OID: 1.2.840.10046.2.1 encoded as
+        // `06 07 2a 86 48 ce 3e 02 01`. Proves the AuthPack carries
+        // a clientPublicValue SubjectPublicKeyInfo with DH parameters,
+        // not RSA.
+        let oid_dh_public_number: &[u8] =
+            &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3e, 0x02, 0x01];
+        assert!(
+            find_subslice(&as_req, oid_dh_public_number).is_some(),
+            "AuthPack.clientPublicValue must use dhpublicnumber OID (RFC 4556 §3.2.3.1)",
+        );
+
+        // ── Layer 4: free-form client identity must round-trip ──
+        //
+        // KDC-REQ-BODY carries cname = "alice" and realm = "REALM.COM"
+        // as GeneralString fields. Both values must appear verbatim
+        // somewhere in the encoded output — any transformation that
+        // drops or mangles them is a regression the existing "outer
+        // tag is 0x6a" assertion would not catch.
+        assert!(
+            find_subslice(&as_req, b"alice").is_some(),
+            "cname='alice' must appear in KDC-REQ-BODY (RFC 4120 §5.4.1)",
+        );
+        assert!(
+            find_subslice(&as_req, b"REALM.COM").is_some(),
+            "realm='REALM.COM' must appear in KDC-REQ-BODY",
+        );
+        assert!(
+            find_subslice(&as_req, b"20260326120000Z").is_some(),
+            "pkAuthenticator.ctime must appear verbatim (RFC 4556 §3.2.1)",
+        );
+
+        // Side effect: DH private key stashed for later shared-secret
+        // computation. Without this the subsequent AS-REP processing
+        // cannot derive the reply key (RFC 4556 §3.2.3.1).
+        assert!(
+            seq.dh_private_key.is_some(),
+            "build_as_req_pkinit must retain the DH private key for AS-REP processing",
+        );
+    }
+
+    /// Locate a byte subslice. Uses a naive O(n*m) search which is
+    /// fine for the handful of short patterns we look up in a few-KB
+    /// encoded AS-REQ.
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return None;
+        }
+        (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+    }
+
+    #[test]
     fn pkinit_smartcard_provider_with_intermediates_includes_chain() {
         use justrdp_pdu::cms;
         use justrdp_pkinit_card::{MockSmartcardProvider, SmartcardProvider};

@@ -71,16 +71,24 @@ impl PkAuthenticator {
 }
 
 /// AuthPack ::= SEQUENCE {
-///     pkAuthenticator   [0] PKAuthenticator,
-///     clientPublicValue [1] SubjectPublicKeyInfo OPTIONAL,
-///     clientDHNonce     [2] OCTET STRING OPTIONAL
+///     pkAuthenticator         [0] PKAuthenticator,
+///     clientPublicValue       [1] SubjectPublicKeyInfo OPTIONAL,
+///     supportedCMSTypes       [2] SEQUENCE OF AlgorithmIdentifier OPTIONAL,
+///     clientDHNonce           [3] DHNonce OPTIONAL
 /// }
+///
+/// RFC 4556 §3.2.1. JustRDP does not advertise preferred CMS
+/// algorithm identifiers, so `supportedCMSTypes` at `[2]` is always
+/// omitted. `clientDHNonce` lives at `[3]` per the spec even when
+/// `[2]` is absent — an earlier revision of this code mis-tagged it
+/// as `[2]`, which would cause Windows KDCs to decode the nonce as
+/// `supportedCMSTypes` and fail. Fixed by adding a `[3]` tag.
 #[derive(Debug, Clone)]
 pub struct AuthPack {
     pub pk_authenticator: PkAuthenticator,
     /// DER-encoded SubjectPublicKeyInfo for DH.
     pub client_public_value: Option<Vec<u8>>,
-    /// Client DH nonce for key derivation (RFC 4556 3.2.3.1).
+    /// Client DH nonce for key derivation (RFC 4556 §3.2.3.1).
     pub client_dh_nonce: Option<Vec<u8>>,
 }
 
@@ -99,10 +107,12 @@ impl AuthPack {
                 w.write_raw(&t1);
             }
 
-            // [2] clientDHNonce OPTIONAL
+            // [2] supportedCMSTypes — not used, always absent.
+
+            // [3] clientDHNonce OPTIONAL (RFC 4556 §3.2.1)
             if let Some(ref nonce) = self.client_dh_nonce {
-                let t2 = build_context_tag(2, |w| w.write_octet_string(nonce));
-                w.write_raw(&t2);
+                let t3 = build_context_tag(3, |w| w.write_octet_string(nonce));
+                w.write_raw(&t3);
             }
         })
     }

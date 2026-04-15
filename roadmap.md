@@ -1710,10 +1710,34 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
         (backward compat)
   - [x] `justrdp-core::rsa::rsa_sign_sha256_digest` helper 추가
         (hash 단계 분리)
-- [ ] **Step 4** — Phase 1 검증
-  - [ ] Mock provider 기반 AS-REQ 생성 unit test (PA-PK-AS-REQ
-        구조 검증)
-  - [ ] `@impl-verifier` 로 RFC 4556 1:1 대조
+- [x] **Step 4** — Phase 1 검증 (commit `<next>`)
+  - [x] Mock provider 기반 AS-REQ 생성 unit test —
+        `pkinit_smartcard_as_req_structure_matches_rfc4556`
+        (`credssp/kerberos.rs`). AS-REQ APPLICATION tag, PA-PK-AS-REQ
+        type 16, PA-PAC-REQUEST type 128, CMS signed-data OID,
+        id-pkinit-authData OID, dhpublicnumber OID, cname / realm /
+        ctime 문자열을 전부 바이트 단위 검증
+  - [x] `@impl-verifier` 로 RFC 4556 1:1 대조 — 4개 스펙 편차 발견:
+        - **Finding A (fixed)**: `AuthPack.clientDHNonce` 태그
+          `[2]` → `[3]` 수정 (RFC 4556 §3.2.1 의 `supportedCMSTypes`
+          가 `[2]` 를 차지). `crates/justrdp-pdu/src/kerberos/pkinit.rs`
+        - **Finding B (open)**: `PaPkAsReq::encode` 가
+          `signedAuthPack` 을 EXPLICIT `[0]` OCTET STRING 으로
+          인코딩 (`A0 <len> 04 <inner> <data>`). 스펙은 IMPLICIT
+          (`80 <len> <data>`). Windows AD KDC 엄격 모드에서
+          rejection 위험. `crates/justrdp-pdu/src/kerberos/pkinit.rs:28`
+        - **Finding C (open)**: `cms::build_signer_info` 가
+          `signedAttributes` SET 를 완전히 생략. RFC 4556 §3.2.1 은
+          `id-contentType` + `id-messageDigest` 를 필수로 요구하며,
+          서명도 이 SET 위에 계산되어야 함. 서명 파이프라인 동반
+          수정 필요. `crates/justrdp-pdu/src/cms.rs:110-143`
+        - **Finding D (open)**: `build_dh_spki` 의 `DomainParameters`
+          가 `q` 를 생략 (`p`, `g` 만). Oakley Group 14 (2048-bit
+          safe prime) 의 `q = (p-1)/2` 를 추가해야 AD KDC 호환.
+          `crates/justrdp-pdu/src/kerberos/pkinit.rs:119-125`
+  - [ ] **Follow-up: PKINIT interop hardening** (Findings B / C / D) —
+        Appendix G.2 로 분리 고려. 현재 `MockSmartcardProvider` 테스트
+        는 통과하지만 실제 Windows AD KDC 대상 검증이 미완
 
 **Phase 2 — Native PC/SC backend (실 하드웨어 검증 TODO)**
 
