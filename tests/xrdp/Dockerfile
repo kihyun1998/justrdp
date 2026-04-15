@@ -45,13 +45,21 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Test account. Password is baked in because this image only runs
-# inside ephemeral CI containers with no inbound network exposure
-# outside the runner — never publish this image.
+# Test account. The password is injected at build time via
+# `--build-arg XRDP_TEST_PASSWORD=...` so neither the Dockerfile
+# nor the built image layer contains a literal credential when the
+# CI workflow passes it in from a repository secret. A weak default
+# is provided purely so a contributor running the image locally
+# without setting the build-arg does not get a useradd failure;
+# local developers who care about credential hygiene should set
+# their own.
+#
+# No sudo is granted — the E2E test only needs RDP access, and
+# passwordless sudo would turn any xrdp-side RCE into an immediate
+# root on the container host's user namespace.
+ARG XRDP_TEST_PASSWORD=changeme
 RUN useradd -m -s /bin/bash testuser && \
-    echo 'testuser:testpass' | chpasswd && \
-    adduser testuser sudo && \
-    echo 'testuser ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+    echo "testuser:${XRDP_TEST_PASSWORD}" | chpasswd
 
 # xrdp ships with a self-signed TLS key pair that requires being a
 # member of the `ssl-cert` group to read. Add xrdp to that group so

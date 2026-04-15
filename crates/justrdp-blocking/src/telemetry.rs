@@ -1,17 +1,23 @@
 //! Thin shim over `tracing` macros so the rest of the crate can call
-//! [`info!`], [`debug!`], [`warn!`], [`error!`], and [`trace!`] without
-//! sprinkling `#[cfg(feature = "tracing")]` at every call site.
+//! [`info!`], [`debug!`], [`blk_warn!`], [`error!`], and [`trace!`]
+//! without sprinkling `#[cfg(feature = "tracing")]` at every call site.
 //!
 //! When the `tracing` feature is off the macros expand to nothing, so
-//! release builds without observability pay zero cost. When the feature
-//! is on they delegate to the real `tracing` crate macros.
+//! release builds without observability pay zero cost. When the
+//! feature is on they delegate to the real `tracing` crate macros.
 //!
-//! The macros live at crate root via `#[macro_use] mod telemetry;` in
-//! `lib.rs`, so sibling modules call them by name (`info!`,
-//! `blk_warn!`, etc.) without any `use` line. `warn` is aliased to
-//! `blk_warn` because a bare `warn` identifier collides with the
-//! built-in `#[warn(...)]` lint attribute when re-exported through
-//! `pub(crate) use`.
+//! The macros are defined at module scope in this file and re-exported
+//! via `pub(crate) use { ... }` so sibling modules pull them in with a
+//! normal `use crate::telemetry::{info, debug, blk_warn, ...};` line —
+//! this avoids the `#[macro_use]` mechanism, which historically
+//! required defining macros with `#[macro_export]` and polluted the
+//! crate-root namespace.
+//!
+//! `warn` is aliased to `blk_warn` because a bare `warn` identifier
+//! collides with the built-in `#[warn(...)]` lint attribute when
+//! re-exported through `pub(crate) use`; the other four macro names
+//! (`info`, `debug`, `error`, `trace`) have no such conflict and are
+//! re-exported unchanged.
 
 #![allow(unused_imports, unused_macros)]
 

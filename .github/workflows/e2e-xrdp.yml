@@ -61,7 +61,19 @@ jobs:
         run: cargo build -p justrdp-blocking --example connect_test
 
       - name: Build xrdp docker image
-        run: docker build -t justrdp-xrdp -f tests/xrdp/Dockerfile tests/xrdp
+        # The test password is injected as a Docker build arg from a
+        # repository secret. If the secret is not configured (fresh
+        # fork), the Dockerfile ARG default keeps the build working
+        # for local experiments but CI runs should always supply a
+        # real value.
+        env:
+          XRDP_TEST_PASSWORD: ${{ secrets.XRDP_TEST_PASSWORD || 'changeme' }}
+        run: |
+          docker build \
+              --build-arg XRDP_TEST_PASSWORD="${XRDP_TEST_PASSWORD}" \
+              -t justrdp-xrdp \
+              -f tests/xrdp/Dockerfile \
+              tests/xrdp
 
       - name: Start xrdp container
         run: |
@@ -89,15 +101,22 @@ jobs:
 
       - name: Run connect_test against xrdp
         id: roundtrip
+        # Pass the password via env so GitHub's secret masker
+        # redacts it in any log line that prints the arg. Passing
+        # it on the command line would leak in `ps aux` and would
+        # appear in the workflow log verbatim.
+        env:
+          XRDP_TEST_PASSWORD: ${{ secrets.XRDP_TEST_PASSWORD || 'changeme' }}
+          MAX_EVENTS: ${{ github.event.inputs.max_events || '30' }}
         run: |
           set +e
           cargo run -p justrdp-blocking --example connect_test -- \
               --host 127.0.0.1 \
               --port 3389 \
               --user testuser \
-              --password testpass \
+              --password "${XRDP_TEST_PASSWORD}" \
               --domain '' \
-              --max-events "${{ github.event.inputs.max_events || '30' }}"
+              --max-events "${MAX_EVENTS}"
           rc=$?
           echo "connect_test exit code: $rc"
           # Accept 0 (clean). Any other code is a regression — the

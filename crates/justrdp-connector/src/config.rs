@@ -513,6 +513,12 @@ pub struct Config {
     /// cleared so steady-state reads can block indefinitely waiting
     /// for the next frame.
     ///
+    /// **Must be non-zero.** `Duration::ZERO` is rejected by
+    /// `std::net::TcpStream::connect_timeout` at runtime with
+    /// `InvalidInput`, so the builder refuses it up front rather
+    /// than letting the error surface deep inside the connect
+    /// sequence where the cause is hard to trace.
+    ///
     /// Default: 30 seconds.
     pub connect_timeout: Duration,
 }
@@ -775,8 +781,19 @@ impl ConfigBuilder {
     /// timeout for every handshake PDU; it is cleared once the
     /// session pump begins so steady-state reads can block forever.
     ///
+    /// # Panics
+    ///
+    /// Panics if `timeout` is `Duration::ZERO`. Zero is rejected by
+    /// `std::net::TcpStream::connect_timeout` with `InvalidInput`;
+    /// catching it here turns a confusing runtime error into an
+    /// obvious configuration bug at the call site.
+    ///
     /// Default: 30 seconds.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "connect_timeout must be non-zero (std::net::TcpStream::connect_timeout rejects zero)",
+        );
         self.config.connect_timeout = timeout;
         self
     }
@@ -823,13 +840,12 @@ mod tests {
     }
 
     #[test]
-    fn connect_timeout_accepts_zero() {
-        // Zero means "non-blocking / immediate failure" per
-        // std::net::TcpStream::connect_timeout documentation; the
-        // builder must not reject it.
-        let config = Config::builder("u", "p")
-            .connect_timeout(Duration::ZERO)
-            .build();
-        assert_eq!(config.connect_timeout, Duration::ZERO);
+    #[should_panic(expected = "connect_timeout must be non-zero")]
+    fn connect_timeout_rejects_zero() {
+        // `std::net::TcpStream::connect_timeout(&addr, ZERO)` returns
+        // InvalidInput at runtime; reject up front so the cause is
+        // obvious from the stack trace rather than surfacing as a
+        // generic ConnectError::Tcp deep inside the handshake.
+        let _ = Config::builder("u", "p").connect_timeout(Duration::ZERO);
     }
 }

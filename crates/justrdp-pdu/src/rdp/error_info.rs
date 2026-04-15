@@ -516,7 +516,7 @@ impl ErrorInfoCode {
             Self::LicenseNoRemoteConnections => "server not licensed for remote connections",
 
             Self::CbDestinationNotFound => "broker: destination endpoint not found",
-            Self::CbLoadingDestination => "broker: destination is disconnecting",
+            Self::CbLoadingDestination => "broker: destination endpoint is loading",
             Self::CbRedirectingToDestination => "broker: redirect to destination failed",
             Self::CbSessionOnlineVmWake => "broker: VM wake failure",
             Self::CbSessionOnlineVmBoot => "broker: VM boot failure",

@@ -285,6 +285,17 @@ impl RdpClient {
             // `Ok(Self { ... })` return at the bottom of this fn.
             tcp.set_read_timeout(Some(current_config.connect_timeout))?;
             tcp.set_write_timeout(Some(current_config.connect_timeout))?;
+            // Safety note: calling setsockopt on `timeout_handle`
+            // while the "primary" TcpStream is being read from a
+            // different thread would race. This is safe today only
+            // because `Transport` is deliberately `!Send` (see the
+            // comment on the enum definition), so no second thread
+            // ever holds the TLS-wrapped stream. When M7 lifts the
+            // `!Send` restriction this clear-on-handoff pattern
+            // MUST be re-examined; the simplest fix will be to
+            // pass the handshake timeout down through a typed
+            // state object and never share a socket handle across
+            // thread boundaries.
             let timeout_handle = tcp.try_clone()?;
             // Clone the config so we can rebuild ClientConnector on the
             // next iteration if a redirect is detected.

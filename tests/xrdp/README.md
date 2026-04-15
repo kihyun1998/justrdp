@@ -16,17 +16,24 @@ a real Linux RDP server.
 | host     | `localhost` (when mapped with `-p 3389:3389`) |
 | port     | `3389`     |
 | user     | `testuser` |
-| password | `testpass` |
+| password | set via `--build-arg XRDP_TEST_PASSWORD=...` at build time; defaults to `changeme` if unset |
 | domain   | _(empty)_  |
 
-**Never publish the built image.** The password is baked in and only
-safe inside ephemeral CI containers.
+The password is **not** baked into the Dockerfile. CI pulls it from
+the `XRDP_TEST_PASSWORD` GitHub Actions secret; local runs can set
+their own. The built image still contains the password in
+`/etc/shadow` (via `chpasswd`), so **never publish the image
+regardless of which password you chose**.
 
 ## Local run
 
 ```bash
-# Build
-docker build -t justrdp-xrdp -f tests/xrdp/Dockerfile tests/xrdp
+# Build (pick your own password; default is `changeme`)
+docker build \
+    --build-arg XRDP_TEST_PASSWORD=hunter2 \
+    -t justrdp-xrdp \
+    -f tests/xrdp/Dockerfile \
+    tests/xrdp
 
 # Start
 docker run --rm -d -p 3389:3389 --name justrdp-xrdp justrdp-xrdp
@@ -41,7 +48,7 @@ cargo run -p justrdp-blocking --example connect_test -- \
     --host localhost \
     --port 3389 \
     --user testuser \
-    --password testpass \
+    --password hunter2 \
     --domain '' \
     --max-events 30
 
