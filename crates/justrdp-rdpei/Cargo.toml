@@ -18,3 +18,9 @@ std = ["alloc", "justrdp-core/std", "justrdp-dvc/std"]
 [dependencies]
 justrdp-core.workspace = true
 justrdp-dvc.workspace = true
+
+[dev-dependencies]
+# SvcProcessor trait lives in justrdp-svc; integration tests that
+# treat DrdynvcClient as an SVC processor need it in scope to
+# reach its `process()` method through the trait.
+justrdp-svc.workspace = true

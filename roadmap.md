@@ -1608,7 +1608,10 @@ pub trait GfxHandler: Send {
   - [x] Suspend/Resume: `SUSPEND_INPUT` 수신 시 `send_touch_event` 차단 (ADM `InputTransmissionSuspended`)
   - [x] 재연결 시나리오: 두 번째 SC_READY 수신 시 CS_READY 재송신 + suspend flag 리셋
   - [x] 클라 발신 event ID (CS_READY/TOUCH/DISMISS_HOVERING)가 inbound로 도착 시 무시 (§3.1.5.1)
-  - [ ] `Connector`/세션 레이어 등록 경로 — Step 4에서 통합 테스트와 함께
+  - [x] `Connector`/세션 레이어 등록 경로 — `crates/justrdp-rdpei/tests/drdynvc_integration.rs`
+        3개 통합 테스트로 `DrdynvcClient → RdpeiDvcClient` 라우팅 검증
+        (caps → create → SC_READY → CS_READY 왕복, 잘못된 채널 이름
+        거절, `Box<dyn SvcProcessor>` vtable 경유)
 
 - [x] **Step 4 — 검증** (77 tests ✅, clean workspace build)
   - [x] `@impl-verifier` 로 스펙 1:1 대조 → 3개 실질 이슈 수정 (TouchFrame::size 절단, ContactRect 미재노출, 무의미한 assertion)
