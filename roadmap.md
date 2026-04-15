@@ -1513,7 +1513,11 @@ pub trait GfxHandler: Send {
 - [x] `RdpEvent::Redirected { target }` 방출 (성공 핸드셰이크 후 한 번)
 - [x] 리다이렉션 루프 방지 — `MAX_REDIRECTS = 5`, 초과 시 `ConnectError::Tcp(Other)` 반환
 - [x] 7개 단위 테스트 (utf16 디코딩, IPv4 default port, 명시 port, target_net_address path, target_net_addresses fallback, 빈 PDU None 반환, 절단 거부)
-- [ ] 실서버 통합 테스트 — mock broker (TcpListener + 가짜 RDP handshake) 필요. 진짜 Connection Broker 환경 또는 synthetic wire-frame 주입
+- [x] 실서버 통합 테스트 — `crates/justrdp-blocking/tests/mock_redirect.rs`
+      5개 테스트 (direct target, broker→target redirect, max depth,
+      no target address, PK-encrypted password). `TcpListener` 2개로
+      broker + target 시뮬레이션, `NoopTlsUpgrader` 로 TLS 스킵.
+      세부 Phase 1~4는 아래 §9.3.5 참조
 
 **`justrdp-blocking` 잔여 후속 작업 (CHECKLIST.md에서 이관):**
 
