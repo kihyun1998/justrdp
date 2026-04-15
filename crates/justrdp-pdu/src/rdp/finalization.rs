@@ -386,11 +386,28 @@ pub struct SetErrorInfoPdu {
 }
 
 impl SetErrorInfoPdu {
+    /// Construct a PDU carrying the given symbolic error code.
+    ///
+    /// Prefer this over the raw `SetErrorInfoPdu { error_info: ... }`
+    /// literal when emitting the PDU from the server side or from a
+    /// test that needs to simulate a specific disconnect reason. The
+    /// round-trip `Self::new(c).code() == c` holds for every named
+    /// variant and for `RdpProtocol(_)` / `Unknown(_)`.
+    pub const fn new(code: crate::rdp::error_info::ErrorInfoCode) -> Self {
+        Self { error_info: code.as_u32() }
+    }
+
     /// Classified representation of [`Self::error_info`]. See
     /// [`crate::rdp::error_info`] for categories, severities, and
     /// retryability.
     pub const fn code(&self) -> crate::rdp::error_info::ErrorInfoCode {
         crate::rdp::error_info::ErrorInfoCode::from_u32(self.error_info)
+    }
+}
+
+impl From<crate::rdp::error_info::ErrorInfoCode> for SetErrorInfoPdu {
+    fn from(code: crate::rdp::error_info::ErrorInfoCode) -> Self {
+        Self::new(code)
     }
 }
 
@@ -1244,6 +1261,46 @@ mod tests {
         pdu.encode(&mut cursor).unwrap();
         let mut cursor = ReadCursor::new(&buf);
         assert_eq!(SetErrorInfoPdu::decode(&mut cursor).unwrap(), pdu);
+    }
+
+    #[test]
+    fn set_error_info_new_from_code_roundtrips_through_wire() {
+        // Every named code must survive ErrorInfoCode → PDU → encode
+        // → decode → PDU → code without loss. This is the server
+        // emission path: a future `justrdp-acceptor` builds a PDU
+        // from the enum, writes it to the wire, and a client reads
+        // it back through the same type.
+        use crate::rdp::error_info::ErrorInfoCode;
+
+        for code in [
+            ErrorInfoCode::None,
+            ErrorInfoCode::IdleTimeout,
+            ErrorInfoCode::ServerDeniedConnection,
+            ErrorInfoCode::LicenseNoLicenseServer,
+            ErrorInfoCode::CbDestinationNotFound,
+            ErrorInfoCode::RdpProtocol(0x10EC),
+            ErrorInfoCode::Unknown(0xDEAD_BEEF),
+        ] {
+            let pdu = SetErrorInfoPdu::new(code);
+            assert_eq!(pdu.error_info, code.as_u32());
+            assert_eq!(pdu.code(), code);
+
+            let mut buf = [0u8; 4];
+            let mut cursor = WriteCursor::new(&mut buf);
+            pdu.encode(&mut cursor).unwrap();
+            let mut cursor = ReadCursor::new(&buf);
+            let decoded = SetErrorInfoPdu::decode(&mut cursor).unwrap();
+            assert_eq!(decoded, pdu);
+            assert_eq!(decoded.code(), code);
+        }
+    }
+
+    #[test]
+    fn set_error_info_from_trait_matches_new() {
+        use crate::rdp::error_info::ErrorInfoCode;
+        let pdu1 = SetErrorInfoPdu::new(ErrorInfoCode::ServerShutdown);
+        let pdu2: SetErrorInfoPdu = ErrorInfoCode::ServerShutdown.into();
+        assert_eq!(pdu1, pdu2);
     }
 
     #[test]

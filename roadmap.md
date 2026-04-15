@@ -410,8 +410,9 @@ pub trait PduHint: Send + Sync {
         존재하지 않는 범위(`0x100C..=0x1015` 등)를 licensing으로
         체크해서 실제 라이선스 코드(`0x100..=0x10A`)를 모두 retryable로
         잘못 분류하던 문제 — 이제 enum에 위임
-  - [ ] 서버 모드: 적절한 에러 코드 전송 (연결 거부, 라이센스 문제 등)
-        — Phase 8 서버 사이드와 함께 처리
+  - [x] 서버 모드 emission API: `SetErrorInfoPdu::new(ErrorInfoCode)`
+        + `From<ErrorInfoCode>`. 서버 상태머신(§11.1/11.2)이 착수되면
+        이 생성자를 그대로 사용해 Share Data Header 에 감싸 전송
 - [x] `SetKeyboardIndicatorsPdu`
 - [x] `SetKeyboardImeStatusPdu`
 - [x] `MonitorLayoutPdu`
