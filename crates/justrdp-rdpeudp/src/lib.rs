@@ -31,6 +31,9 @@ pub mod v2;
 pub mod dtls;
 
 #[cfg(feature = "alloc")]
+pub mod dtls_handshake;
+
+#[cfg(feature = "alloc")]
 pub mod fec;
 
 #[cfg(feature = "alloc")]

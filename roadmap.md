@@ -2080,7 +2080,7 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
   - [x] FEC (Forward Error Correction) — XOR encode/decode, 단일 손실 복구, 가변 길이 지원
   - [x] 순서 보장 — reorder buffer, out-of-order → in-order flush
   - [x] TLS over UDP (DTLS) — DTLS 1.0/1.2 레코드 레이어, TLS 1.2 PRF, AES-128-CBC-SHA256 record protection (encrypt/decrypt/MAC), key derivation (master_secret + key_block), verify_data 생성
-  - [ ] DTLS 핸드셰이크 상태 머신 (ClientHello → HelloVerifyRequest → ServerHello → Certificate → ClientKeyExchange → ChangeCipherSpec → Finished)
+  - [x] DTLS 핸드셰이크 상태 머신 — ClientHello (cookie 재전송), HelloVerifyRequest, ServerHello (cipher 검증), Certificate (DER→SPKI→RSA PubKey 추출), ClientKeyExchange (PKCS#1v1.5 RSA), ChangeCipherSpec + epoch 전환, Finished (verify_data 생성/검증)
 - [x] Lossy 모드:
   - [x] FEC only (재전송 없음) — FEC recovery 동작 확인
   - [x] DTLS record protection — Reliable 모드와 동일한 dtls.rs 모듈 공유
