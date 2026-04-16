@@ -2079,10 +2079,11 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
   - [x] 혼잡 제어 (congestion window) — slow-start / congestion avoidance / loss halving (Reno)
   - [x] FEC (Forward Error Correction) — XOR encode/decode, 단일 손실 복구, 가변 길이 지원
   - [x] 순서 보장 — reorder buffer, out-of-order → in-order flush
-  - [ ] TLS over UDP (DTLS — justrdp-tls 확장 필요, 통합 포인트 문서화됨)
+  - [x] TLS over UDP (DTLS) — DTLS 1.0/1.2 레코드 레이어, TLS 1.2 PRF, AES-128-CBC-SHA256 record protection (encrypt/decrypt/MAC), key derivation (master_secret + key_block), verify_data 생성
+  - [ ] DTLS 핸드셰이크 상태 머신 (ClientHello → HelloVerifyRequest → ServerHello → Certificate → ClientKeyExchange → ChangeCipherSpec → Finished)
 - [x] Lossy 모드:
   - [x] FEC only (재전송 없음) — FEC recovery 동작 확인
-  - [ ] DTLS (위와 동일)
+  - [x] DTLS record protection — Reliable 모드와 동일한 dtls.rs 모듈 공유
 - [x] ACK/NACK 처리 — ACK vector gap 감지, acknowledge_up_to 송신 버퍼 정리, detect_loss_from_ack_vector
 - [x] MTU 협상 — 4-value min, 경계값 (1132/1232) 테스트
 - [x] 프로토콜 버전 1/2/3 지원 — SYNEX 협상, v3 cookieHash, min 선택, 미사용 시 None
