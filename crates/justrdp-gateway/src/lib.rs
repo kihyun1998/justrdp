@@ -26,11 +26,20 @@ pub mod http;
 #[cfg(feature = "alloc")]
 pub mod auth;
 
+#[cfg(feature = "alloc")]
+pub mod ws;
+
 #[cfg(feature = "std")]
 pub mod transport;
 
 #[cfg(feature = "std")]
+pub mod ws_transport;
+
+#[cfg(feature = "std")]
 pub use transport::{ConnectError, GatewayConnection};
+
+#[cfg(feature = "std")]
+pub use ws_transport::{MaskSource, WsConnectError, WsGatewayConnection};
 
 #[cfg(feature = "alloc")]
 pub use auth::{

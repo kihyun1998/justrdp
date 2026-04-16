@@ -1994,13 +1994,18 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 **HTTP Transport (신규, 권장):**
 
-- [ ] Handshake Request/Response
-- [ ] Tunnel Create/Response
-- [ ] Tunnel Auth/Response
-- [ ] Channel Create/Response
-- [ ] Data PDU 전송/수신
-- [ ] Keepalive
-- [ ] Close Channel
+- [x] Handshake Request/Response
+- [x] Tunnel Create/Response
+- [x] Tunnel Auth/Response
+- [x] Channel Create/Response
+- [x] Data PDU 전송/수신
+- [x] Keepalive
+- [x] Close Channel
+- [x] HTTP/1.1 RDG_IN_DATA/RDG_OUT_DATA 프레이밍 + chunked + 100-byte preamble
+- [x] NTLMv2 HTTP 401 재시도 루프 (justrdp-gateway::auth)
+- [x] `GatewayConnection<R, W>` std Read/Write adapter
+- [x] Mock gateway end-to-end integration test (401 retry + handshake + data)
+- [x] `justrdp-blocking::connect_via_gateway_with_upgrader` — 실소켓/TLS를 붙인 high-level API
 
 **RPC-over-HTTP (레거시):**
 
@@ -2018,9 +2023,12 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 **WebSocket Transport:**
 
-- [ ] WebSocket 업그레이드
-- [ ] 바이너리 프레임 전송
-- [ ] 게이트웨이 인증
+- [x] WebSocket 업그레이드 (RFC 6455 §4.1 + Sec-WebSocket-Accept 검증)
+- [x] 바이너리 프레임 전송 (masking, 7/16/64 length variants, 비최소 인코딩 거부)
+- [x] Ping/Pong 자동 응답, Close 핸드쉐이크, 단편화/재조립
+- [x] `WsGatewayConnection<S>` std Read/Write adapter
+- [x] 게이트웨이 인증 (justrdp-gateway::auth NTLM 재사용 — `SSPI_NTLM` scheme)
+- [x] `justrdp-blocking::connect_via_gateway_ws_with_upgrader` — 실소켓/TLS + 401 retry + 101 Accept 검증
 
 **공통:**
 
@@ -2034,7 +2042,33 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 > **requires**: Phase 2 (Connected), justrdp-tls (DTLS)
 > **검증**: UDP 핸드셰이크 integration test
 
-**구현 항목:**
+**PDU layer (v1 — `justrdp-rdpeudp` crate):**
+
+- [x] `RdpUdpFecHeader` (§2.2.2.1) + 모든 `RDPUDP_FLAG_*` 상수
+- [x] `SynDataPayload` (§2.2.2.5) + MTU [1132, 1232] 범위 검증
+- [x] `AckVectorHeader` (§2.2.2.7) + DWORD 정렬 패딩 + `AckVectorElement` 2-bit state / 6-bit run length 인코딩
+- [x] `AckOfAcksHeader` (§2.2.2.6)
+- [x] `SourcePayloadHeader` (§2.2.2.4)
+- [x] `FecPayloadHeader` (§2.2.2.2)
+- [x] `CorrelationIdPayload` (§2.2.2.8) + byte-value 제약 (no 0x00/0xF4 first, no 0x0D)
+- [x] `SynDataExPayload` (§2.2.2.9) + version 1/2/3 + 선택적 `cookieHash`
+- [x] `PayloadPrefix` (§2.2.2.3)
+- [x] SYN 제로 패딩 헬퍼 (§3.1.5.1.1 step 6)
+- [x] 스펙 §2.2 FEC Packet 예제 디코드 테스트
+
+**PDU layer (v2 — MS-RDPEUDP2 §2.2, version 3 이상 활성화):**
+
+- [x] `RdpEudp2Header` — 12-bit flags + 4-bit LogWindowSize 패킹, 상호 배타 flag 검증 (ACK ⊥ ACKVEC, at least one flag)
+- [x] `AckPayload` (§2.2.1.2.1) — 24-bit receivedTS + packed numDelayedAcks/delayAckTimeScale + delayAckTimeAdditions
+- [x] `OverheadSizePayload` (§2.2.1.2.2)
+- [x] `DelayAckInfoPayload` (§2.2.1.2.3)
+- [x] `AckOfAcksPayload` (§2.2.1.2.4)
+- [x] `DataHeaderPayload` (§2.2.1.2.5)
+- [x] `DataBodyPayload` (§2.2.1.2.7) — implicit length consuming UDP datagram tail
+- [x] `AckVecPayload` (§2.2.1.2.6) — 선택적 24-bit timestamp + `CodedAckVecElement` (State Map + Run-Length 인코딩 모드)
+- [x] `RdpEudp2Packet` top-level composite — canonical 페이로드 순서 (§2.2.1) 강제
+
+**State machine / transport:**
 
 - [ ] 3-way 핸드셰이크 (SYN → SYN+ACK → ACK)
 - [ ] `RdpeudpSocket` -- UDP 소켓 추상화

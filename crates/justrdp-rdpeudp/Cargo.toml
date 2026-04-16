@@ -1,0 +1,19 @@
+[package]
+name = "justrdp-rdpeudp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MS-RDPEUDP / MS-RDPEUDP2 UDP Transport PDU definitions for JustRDP"
+keywords = ["rdp", "udp", "rdpeudp"]
+categories = ["no-std", "encoding"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc"]
+std = ["alloc", "justrdp-core/std"]
+
+[dependencies]
+justrdp-core.workspace = true

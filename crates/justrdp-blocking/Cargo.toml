@@ -28,5 +28,6 @@ justrdp-svc.workspace = true
 justrdp-input.workspace = true
 justrdp-tls.workspace = true
 justrdp-rdpfile = { workspace = true, features = ["alloc"] }
+justrdp-gateway.workspace = true
 tracing = { version = "0.1", optional = true }
 getrandom = "0.2"

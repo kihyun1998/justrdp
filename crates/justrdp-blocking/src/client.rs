@@ -61,6 +61,12 @@ pub(crate) enum Transport {
     /// boxed through `justrdp_tls::ReadWrite`, and blocking clients are
     /// single-threaded. Cross-thread ownership is an M7+ concern.
     Tls(Box<dyn ReadWrite>),
+    /// Boxed pre-TLS byte pipe that is not a concrete `TcpStream`.
+    /// Used by the MS-TSGU gateway path where the "raw socket" is
+    /// actually the already-authenticated GatewayConnection carrying
+    /// RDP bytes inside the outer gateway TLS tunnel. Eligible for
+    /// the same TLS upgrade swap as `Tcp`.
+    Boxed(Box<dyn ReadWrite>),
     /// Placeholder used while the transport is swapped during upgrade.
     Swapping,
 }
@@ -70,6 +76,7 @@ impl Read for Transport {
         match self {
             Self::Tcp(s) => s.read(buf),
             Self::Tls(s) => s.read(buf),
+            Self::Boxed(s) => s.read(buf),
             Self::Swapping => Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "transport is being swapped",
@@ -83,6 +90,7 @@ impl Write for Transport {
         match self {
             Self::Tcp(s) => s.write(buf),
             Self::Tls(s) => s.write(buf),
+            Self::Boxed(s) => s.write(buf),
             Self::Swapping => Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "transport is being swapped",
@@ -94,6 +102,7 @@ impl Write for Transport {
         match self {
             Self::Tcp(s) => s.flush(),
             Self::Tls(s) => s.flush(),
+            Self::Boxed(s) => s.flush(),
             Self::Swapping => Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "transport is being swapped",
@@ -316,15 +325,15 @@ impl RdpClient {
                 ClientConnectorState::EnhancedSecurityUpgrade
             ) {
                 debug!("rdp.connect.phase=tls_upgrade");
-                let tcp = match std::mem::replace(&mut transport, Transport::Swapping) {
-                    Transport::Tcp(s) => s,
+                let upgraded = match std::mem::replace(&mut transport, Transport::Swapping) {
+                    Transport::Tcp(s) => upgrader.upgrade(s, &current_name)?,
+                    Transport::Boxed(s) => upgrader.upgrade(s, &current_name)?,
                     _ => {
                         return Err(ConnectError::Unimplemented(
                             "unexpected transport variant before TLS upgrade",
                         ));
                     }
                 };
-                let upgraded = upgrader.upgrade(tcp, &current_name)?;
                 transport = Transport::Tls(Box::new(upgraded.stream));
                 debug!(
                     pubkey_len = upgraded.server_public_key.len(),
@@ -566,6 +575,243 @@ impl RdpClient {
             last_server_addr,
             last_server_name,
             last_config,
+            last_arc_cookie,
+            input_db: InputDatabase::new(),
+        })
+    }
+
+    /// Perform the full RDP connection sequence through a Remote
+    /// Desktop Gateway (MS-TSGU HTTP Transport).
+    ///
+    /// `gateway_cfg` describes the gateway endpoint, credentials, and
+    /// target RDP server. `server_name` is the SNI hostname for the
+    /// **inner** TLS handshake against the RDP server (usually the
+    /// target machine's name, not the gateway's). `upgrader` is reused
+    /// for both the outer gateway TLS and the inner RDP TLS — pass a
+    /// custom [`ServerCertVerifier`] via the upgrader constructor if
+    /// you need to distinguish the two trust policies.
+    ///
+    /// Redirects (9.3 Session Redirection) are not followed when
+    /// tunnelling through a gateway: if the RDP server emits one, the
+    /// connect fails with `ConnectError::Unimplemented`. Auto-reconnect
+    /// (M7) is similarly disabled — the `last_server_addr` captured on
+    /// the client is a synthetic placeholder because the target is no
+    /// longer reachable directly by TCP.
+    pub fn connect_via_gateway_with_upgrader<U>(
+        gateway_cfg: &crate::gateway::GatewayConfig,
+        server_name: &str,
+        config: Config,
+        upgrader: U,
+        processors: Vec<Box<dyn SvcProcessor>>,
+    ) -> Result<Self, ConnectError>
+    where
+        U: TlsUpgrader,
+        U::Stream: 'static,
+    {
+        info!(
+            gateway = %gateway_cfg.gateway_addr,
+            target = %gateway_cfg.target_host,
+            server_name,
+            processors = processors.len(),
+            "rdp.connect_via_gateway start",
+        );
+        let tunnel = crate::gateway::establish_gateway_tunnel(gateway_cfg, &upgrader)?;
+        debug!("rdp.connect_via_gateway tunnel established");
+        Self::run_handshake_over_tunnel(
+            tunnel,
+            gateway_cfg.target_port,
+            server_name,
+            config,
+            upgrader,
+            processors,
+        )
+    }
+
+    /// Perform the full RDP connection sequence through a Remote
+    /// Desktop Gateway using the **WebSocket Transport** variant
+    /// (MS-TSGU §2.2.3.1.2, RFC 6455).
+    ///
+    /// Single TCP/TLS connection to the gateway, HTTP/1.1 `Upgrade:
+    /// websocket` handshake (with the same NTLM 401 retry loop as the
+    /// HTTP Transport path), and WebSocket binary frames carrying the
+    /// MS-TSGU PDUs. Semantics are otherwise identical to
+    /// [`connect_via_gateway_with_upgrader`]: no redirects, no
+    /// auto-reconnect, one-shot connect.
+    pub fn connect_via_gateway_ws_with_upgrader<U>(
+        gateway_cfg: &crate::gateway::GatewayConfig,
+        server_name: &str,
+        config: Config,
+        upgrader: U,
+        processors: Vec<Box<dyn SvcProcessor>>,
+    ) -> Result<Self, ConnectError>
+    where
+        U: TlsUpgrader,
+        U::Stream: 'static,
+    {
+        info!(
+            gateway = %gateway_cfg.gateway_addr,
+            target = %gateway_cfg.target_host,
+            server_name,
+            processors = processors.len(),
+            "rdp.connect_via_gateway_ws start",
+        );
+        let tunnel = crate::gateway::establish_gateway_tunnel_ws(gateway_cfg, &upgrader)?;
+        debug!("rdp.connect_via_gateway_ws tunnel established");
+        Self::run_handshake_over_tunnel(
+            tunnel,
+            gateway_cfg.target_port,
+            server_name,
+            config,
+            upgrader,
+            processors,
+        )
+    }
+
+    /// Shared inner body for both gateway entry points: runs phases
+    /// 1–4 of the RDP handshake over an already-authenticated
+    /// gateway tunnel, then constructs the `RdpClient`.
+    fn run_handshake_over_tunnel<U>(
+        tunnel: Box<dyn ReadWrite>,
+        target_port: u16,
+        server_name: &str,
+        config: Config,
+        upgrader: U,
+        processors: Vec<Box<dyn SvcProcessor>>,
+    ) -> Result<Self, ConnectError>
+    where
+        U: TlsUpgrader,
+        U::Stream: 'static,
+    {
+        let mut connector = ClientConnector::new(config.clone());
+        let mut transport = Transport::Boxed(tunnel);
+
+        // Phase 1: X.224 + basic negotiation up to EnhancedSecurityUpgrade.
+        drive_until_state_change(&mut connector, &mut transport, |s| {
+            matches!(
+                s,
+                ClientConnectorState::EnhancedSecurityUpgrade
+                    | ClientConnectorState::Connected { .. }
+            )
+        })?;
+
+        // Phase 2: inner TLS upgrade. This wraps the outer gateway
+        // stream in a second TLS layer — the RDP server's own cert.
+        let server_public_key = if matches!(
+            connector.state(),
+            ClientConnectorState::EnhancedSecurityUpgrade
+        ) {
+            debug!("rdp.connect_via_gateway phase=inner_tls_upgrade");
+            let upgraded = match std::mem::replace(&mut transport, Transport::Swapping) {
+                Transport::Boxed(s) => upgrader.upgrade(s, server_name)?,
+                _ => {
+                    return Err(ConnectError::Unimplemented(
+                        "gateway path: unexpected transport variant before inner TLS upgrade",
+                    ));
+                }
+            };
+            transport = Transport::Tls(Box::new(upgraded.stream));
+            Some(upgraded.server_public_key)
+        } else {
+            None
+        };
+
+        drive_until_state_change(&mut connector, &mut transport, |s| {
+            !matches!(s, ClientConnectorState::EnhancedSecurityUpgrade)
+        })?;
+
+        // Phase 3: CredSSP if the server asks for it.
+        if matches!(
+            connector.state(),
+            ClientConnectorState::CredsspNegoTokens
+                | ClientConnectorState::CredsspPubKeyAuth
+                | ClientConnectorState::CredsspCredentials
+        ) {
+            debug!("rdp.connect_via_gateway phase=credssp");
+            let server_pub_key =
+                server_public_key
+                    .as_ref()
+                    .cloned()
+                    .ok_or(ConnectError::Unimplemented(
+                        "gateway path: CredSSP requires inner TLS upgrade to capture server_public_key",
+                    ))?;
+            run_credssp_sequence(&connector, &mut transport, server_pub_key)?;
+            drive_until_state_change(&mut connector, &mut transport, |s| {
+                !matches!(
+                    s,
+                    ClientConnectorState::CredsspNegoTokens
+                        | ClientConnectorState::CredsspPubKeyAuth
+                        | ClientConnectorState::CredsspCredentials
+                        | ClientConnectorState::CredsspEarlyUserAuth
+                )
+            })?;
+        }
+
+        // Phase 4: BasicSettings → Finalization → Connected.
+        drive_until_state_change(&mut connector, &mut transport, |s| s.is_connected())?;
+
+        let result = connector.result().ok_or_else(|| {
+            ConnectError::Unimplemented(
+                "connector reached Connected but result() returned None",
+            )
+        })?;
+
+        if result.server_redirection.is_some() {
+            return Err(ConnectError::Unimplemented(
+                "gateway path: server redirection is not supported in this release",
+            ));
+        }
+
+        let user_channel_id = result.user_channel_id;
+        let channel_ids = result.channel_ids.clone();
+        let session_config = SessionConfig {
+            io_channel_id: result.io_channel_id,
+            user_channel_id,
+            share_id: result.share_id,
+            channel_ids: channel_ids.clone(),
+        };
+        let last_arc_cookie = result.server_arc_cookie.clone();
+        let session = Box::new(ActiveStage::new(session_config));
+
+        let mut svc_set = SvcChannelSet::new();
+        for processor in processors {
+            svc_set
+                .insert(processor)
+                .map_err(|e| ConnectError::ChannelSetup(format!("{e:?}")))?;
+        }
+        svc_set.assign_ids(&channel_ids);
+        let start_results = svc_set
+            .start_all(user_channel_id)
+            .map_err(|e| ConnectError::ChannelSetup(format!("{e:?}")))?;
+        for (_chan_id, frames) in start_results {
+            for frame in frames {
+                transport.write_all(&frame).map_err(ConnectError::Tcp)?;
+            }
+        }
+        transport.flush().map_err(ConnectError::Tcp)?;
+
+        // The target address is unreachable directly; record a
+        // placeholder so the field is populated but auto-reconnect
+        // (which dials last_server_addr) will fail early.
+        let placeholder_addr =
+            SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, target_port));
+
+        info!(
+            "rdp.connect_via_gateway handshake complete",
+        );
+
+        Ok(Self {
+            transport: Some(transport),
+            session: Some(session),
+            reconnect_policy: ReconnectPolicy::disabled(),
+            scratch: Vec::new(),
+            pending_events: VecDeque::new(),
+            disconnected: false,
+            svc_set,
+            user_channel_id,
+            server_public_key,
+            last_server_addr: placeholder_addr,
+            last_server_name: server_name.to_string(),
+            last_config: config,
             last_arc_cookie,
             input_db: InputDatabase::new(),
         })

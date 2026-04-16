@@ -39,6 +39,7 @@ mod client;
 mod credssp;
 mod error;
 mod event;
+pub mod gateway;
 mod reconnect;
 pub mod rdpfile;
 mod telemetry;
