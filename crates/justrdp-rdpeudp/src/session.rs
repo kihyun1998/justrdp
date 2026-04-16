@@ -139,6 +139,25 @@ impl From<justrdp_core::EncodeError> for RdpeudpError {
 }
 
 // =============================================================================
+// Reliable-mode constants
+// =============================================================================
+
+/// Initial RTO before any RTT sample (500ms per MS-RDPEUDP v1, 300ms
+/// per v2). We use the v1 default; the caller may override after
+/// version negotiation.
+pub const INITIAL_RTO_US: u64 = 500_000;
+
+/// RFC 6298 §2.1: α = 1/8 for SRTT computation.
+const SRTT_ALPHA_SHIFT: u32 = 3;
+/// RFC 6298 §2.1: β = 1/4 for RTTVAR computation.
+const RTTVAR_BETA_SHIFT: u32 = 2;
+
+/// Initial congestion window (packets).
+pub const INITIAL_CWND: u32 = 2;
+/// Initial slow-start threshold (packets).
+pub const INITIAL_SSTHRESH: u32 = 64;
+
+// =============================================================================
 // Result of a receive() call
 // =============================================================================
 
@@ -201,36 +220,62 @@ pub struct RdpeudpSession {
     /// AckOfAcks — we only need to report ACK vector entries for
     /// sequence numbers > this value.
     ack_of_acks_base: u32,
+
+    // ── Reorder buffer (reliable mode) ──
+
+    /// Received payloads keyed by their source SN, waiting to be
+    /// delivered in order. `None` entries represent gaps.
+    reorder_buf: Vec<Option<Vec<u8>>>,
+    /// The next SN the application expects to read (in-order
+    /// delivery frontier).
+    next_deliver_sn: u32,
+    /// Payloads that have been reordered and are ready for the
+    /// application to consume via [`take_ordered_data`].
+    ordered_output: Vec<Vec<u8>>,
+
+    // ── RTT / RTO estimation ──
+
+    /// Smoothed round-trip time in microseconds (SRTT). 0 = not yet
+    /// estimated.
+    srtt_us: u64,
+    /// RTT variance in microseconds (RTTVAR).
+    rttvar_us: u64,
+    /// Retransmission timeout in microseconds.
+    rto_us: u64,
+
+    // ── Congestion window ──
+
+    /// Congestion window size in packets.
+    cwnd: u32,
+    /// Slow-start threshold in packets.
+    ssthresh: u32,
+    /// Number of packets acknowledged since the last cwnd increase.
+    ack_count_since_increase: u32,
+
+    // ── Send buffer for retransmission ──
+
+    /// Unacknowledged sent packets: `(sn, payload)`. Drained as ACKs
+    /// arrive. Used by the caller to decide what to retransmit.
+    send_buf: Vec<(u32, Vec<u8>)>,
 }
 
 impl RdpeudpSession {
     /// Create a **client-side** session in `Idle`.
     pub fn new(config: RdpeudpConfig) -> Self {
-        let isn = config.initial_sequence_number;
-        Self {
-            config,
-            state: RdpeudpState::Idle,
-            is_server: false,
-            remote_initial_sn: None,
-            negotiated_mtu: None,
-            negotiated_version: None,
-            negotiated_lossy: false,
-            next_send_coded_sn: isn.wrapping_add(1),
-            next_send_source_sn: isn.wrapping_add(1),
-            highest_received_sn: 0,
-            recv_bitmap: Vec::new(),
-            recv_base: 0,
-            ack_of_acks_base: 0,
-        }
+        Self::build(config, RdpeudpState::Idle, false)
     }
 
     /// Create a **server-side** session in `Listening`.
     pub fn new_server(config: RdpeudpConfig) -> Self {
+        Self::build(config, RdpeudpState::Listening, true)
+    }
+
+    fn build(config: RdpeudpConfig, state: RdpeudpState, is_server: bool) -> Self {
         let isn = config.initial_sequence_number;
         Self {
             config,
-            state: RdpeudpState::Listening,
-            is_server: true,
+            state,
+            is_server,
             remote_initial_sn: None,
             negotiated_mtu: None,
             negotiated_version: None,
@@ -241,6 +286,16 @@ impl RdpeudpSession {
             recv_bitmap: Vec::new(),
             recv_base: 0,
             ack_of_acks_base: 0,
+            reorder_buf: Vec::new(),
+            next_deliver_sn: 0,
+            ordered_output: Vec::new(),
+            srtt_us: 0,
+            rttvar_us: 0,
+            rto_us: INITIAL_RTO_US,
+            cwnd: INITIAL_CWND,
+            ssthresh: INITIAL_SSTHRESH,
+            ack_count_since_increase: 0,
+            send_buf: Vec::new(),
         }
     }
 
@@ -391,6 +446,7 @@ impl RdpeudpSession {
                 if let Some(remote_isn) = self.remote_initial_sn {
                     self.highest_received_sn = remote_isn;
                     self.recv_base = remote_isn.wrapping_add(1);
+                    self.next_deliver_sn = remote_isn.wrapping_add(1);
                 }
                 self.state = RdpeudpState::Connected;
                 Ok(ReceiveAction::Nothing)
@@ -456,6 +512,7 @@ impl RdpeudpSession {
         let remote_isn = syn_data.sn_initial_sequence_number;
         self.highest_received_sn = remote_isn;
         self.recv_base = remote_isn.wrapping_add(1);
+        self.next_deliver_sn = remote_isn.wrapping_add(1);
 
         // Build the handshake ACK datagram.
         self.build_handshake_ack(remote_isn, output)?;
@@ -638,12 +695,10 @@ impl RdpeudpSession {
             let payload = cur.remaining();
             let data = cur.read_slice(payload, "SourcePayload")?;
             self.record_received(src_hdr.sn_source_start);
-            // Update highest_received_sn.
             if sn_after(src_hdr.sn_source_start, self.highest_received_sn) {
                 self.highest_received_sn = src_hdr.sn_source_start;
             }
-            // TODO: deliver `data` to caller via a buffer or callback.
-            let _ = data;
+            self.reorder_insert(src_hdr.sn_source_start, data.to_vec());
         }
         Ok(ReceiveAction::Nothing)
     }
@@ -705,6 +760,7 @@ impl RdpeudpSession {
         let sn_source = self.next_send_source_sn;
         self.next_send_coded_sn = sn_coded.wrapping_add(1);
         self.next_send_source_sn = sn_source.wrapping_add(1);
+        self.record_sent(sn_source, payload.to_vec());
 
         let header = RdpUdpFecHeader {
             sn_source_ack: self.highest_received_sn,
@@ -789,6 +845,171 @@ impl RdpeudpSession {
     /// Return the highest received source SN (snSourceAck value).
     pub fn highest_received_sn(&self) -> u32 {
         self.highest_received_sn
+    }
+
+    // ─────────────── Reorder buffer ───────────────
+
+    /// After calling [`receive`], take any payloads that can now be
+    /// delivered **in order** to the application. Returns them in
+    /// sequence-number order. Empty if no new contiguous payloads
+    /// are available.
+    pub fn take_ordered_data(&mut self) -> Vec<Vec<u8>> {
+        core::mem::take(&mut self.ordered_output)
+    }
+
+    /// Internal: insert a received payload into the reorder buffer
+    /// and flush any newly-contiguous payloads to `ordered_output`.
+    fn reorder_insert(&mut self, sn: u32, payload: Vec<u8>) {
+        if sn_before(sn, self.next_deliver_sn) {
+            return; // duplicate / old
+        }
+        let idx = sn.wrapping_sub(self.next_deliver_sn) as usize;
+        if idx >= self.reorder_buf.len() {
+            self.reorder_buf.resize(idx + 1, None);
+        }
+        if self.reorder_buf[idx].is_none() {
+            self.reorder_buf[idx] = Some(payload);
+        }
+        // Flush the contiguous prefix.
+        while let Some(Some(_)) = self.reorder_buf.first() {
+            let data = self.reorder_buf.remove(0).unwrap();
+            self.ordered_output.push(data);
+            self.next_deliver_sn = self.next_deliver_sn.wrapping_add(1);
+        }
+    }
+
+    // ─────────────── RTT / RTO ───────────────
+
+    /// Feed an RTT sample (in microseconds) to update SRTT, RTTVAR,
+    /// and RTO per RFC 6298 §2.
+    pub fn update_rtt(&mut self, rtt_us: u64) {
+        if self.srtt_us == 0 {
+            // First sample.
+            self.srtt_us = rtt_us;
+            self.rttvar_us = rtt_us / 2;
+        } else {
+            let diff = if rtt_us > self.srtt_us {
+                rtt_us - self.srtt_us
+            } else {
+                self.srtt_us - rtt_us
+            };
+            self.rttvar_us = (self.rttvar_us * ((1 << RTTVAR_BETA_SHIFT) - 1)
+                + diff)
+                >> RTTVAR_BETA_SHIFT;
+            self.srtt_us = (self.srtt_us * ((1 << SRTT_ALPHA_SHIFT) - 1)
+                + rtt_us)
+                >> SRTT_ALPHA_SHIFT;
+        }
+        // RTO = SRTT + max(G, 4*RTTVAR). We use G = 1ms = 1000µs.
+        let k_rttvar = self.rttvar_us.saturating_mul(4);
+        self.rto_us = self.srtt_us + core::cmp::max(1000, k_rttvar);
+        // RFC 6298 §2.4: minimum RTO of 1s is recommended, but
+        // MS-RDPEUDP uses 500ms for v1 / 300ms for v2. We enforce
+        // a 200ms floor.
+        self.rto_us = core::cmp::max(self.rto_us, 200_000);
+    }
+
+    /// Return the current retransmission timeout in microseconds.
+    pub fn rto_us(&self) -> u64 {
+        self.rto_us
+    }
+
+    /// Return the smoothed RTT in microseconds, or 0 if no samples
+    /// have been collected.
+    pub fn srtt_us(&self) -> u64 {
+        self.srtt_us
+    }
+
+    /// Double the RTO (called on retransmission timeout per
+    /// RFC 6298 §5.5 "back off the timer").
+    pub fn backoff_rto(&mut self) {
+        self.rto_us = self.rto_us.saturating_mul(2);
+        // Cap at 60 seconds.
+        self.rto_us = core::cmp::min(self.rto_us, 60_000_000);
+    }
+
+    // ─────────────── Congestion window ───────────────
+
+    /// Return the current congestion window (packets).
+    pub fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+
+    /// Return the current slow-start threshold (packets).
+    pub fn ssthresh(&self) -> u32 {
+        self.ssthresh
+    }
+
+    /// Notify the session that `n` packets were acknowledged. Updates
+    /// cwnd using slow-start (cwnd < ssthresh) or congestion
+    /// avoidance (cwnd >= ssthresh).
+    pub fn on_acks_received(&mut self, n: u32) {
+        for _ in 0..n {
+            if self.cwnd < self.ssthresh {
+                // Slow start: cwnd += 1 per ACK.
+                self.cwnd = self.cwnd.saturating_add(1);
+            } else {
+                // Congestion avoidance: cwnd += 1 per cwnd ACKs.
+                self.ack_count_since_increase += 1;
+                if self.ack_count_since_increase >= self.cwnd {
+                    self.cwnd = self.cwnd.saturating_add(1);
+                    self.ack_count_since_increase = 0;
+                }
+            }
+        }
+    }
+
+    /// Notify the session of a loss event (e.g. triple duplicate ACK
+    /// or RTO expiry). Halves cwnd and sets ssthresh per Reno.
+    pub fn on_loss(&mut self) {
+        self.ssthresh = core::cmp::max(self.cwnd / 2, 2);
+        self.cwnd = self.ssthresh;
+        self.ack_count_since_increase = 0;
+    }
+
+    /// Return `true` if the send window allows sending more packets.
+    /// The caller should check this before calling
+    /// [`build_data_packet`].
+    pub fn can_send(&self) -> bool {
+        (self.send_buf.len() as u32) < self.cwnd
+    }
+
+    // ─────────────── Send buffer ───────────────
+
+    /// Record that a packet was sent (for retransmission tracking).
+    /// Called automatically by [`build_data_packet`].
+    fn record_sent(&mut self, sn: u32, payload: Vec<u8>) {
+        self.send_buf.push((sn, payload));
+    }
+
+    /// Process ACK feedback: remove acknowledged packets from the
+    /// send buffer. Returns the number of newly acknowledged packets.
+    pub fn acknowledge_up_to(&mut self, acked_sn: u32) -> u32 {
+        let before = self.send_buf.len();
+        self.send_buf
+            .retain(|(sn, _)| sn_after(*sn, acked_sn));
+        let after = self.send_buf.len();
+        (before - after) as u32
+    }
+
+    /// Return the list of unacknowledged (sn, payload) pairs that
+    /// may need retransmission. Does not remove them — the caller
+    /// decides whether to retransmit.
+    pub fn unacked_packets(&self) -> &[(u32, Vec<u8>)] {
+        &self.send_buf
+    }
+
+    /// Detect loss from an ACK vector: any gap (NOT_YET_RECEIVED
+    /// element) in the ACK vector is a NACK. Returns the estimated
+    /// number of lost packets.
+    pub fn detect_loss_from_ack_vector(&self, ack_elements: &[AckVectorElement]) -> u32 {
+        let mut losses = 0u32;
+        for el in ack_elements {
+            if el.state == VectorElementState::DatagramNotYetReceived {
+                losses += el.run_length as u32;
+            }
+        }
+        losses
     }
 }
 

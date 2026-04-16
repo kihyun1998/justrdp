@@ -28,6 +28,9 @@ pub mod v1;
 pub mod v2;
 
 #[cfg(feature = "alloc")]
+pub mod fec;
+
+#[cfg(feature = "alloc")]
 pub mod session;
 
 #[cfg(feature = "std")]

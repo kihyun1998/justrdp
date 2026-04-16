@@ -17,3 +17,6 @@ std = ["alloc", "justrdp-core/std"]
 
 [dependencies]
 justrdp-core.workspace = true
+
+[dev-dependencies]
+justrdp-core = { workspace = true, features = ["alloc"] }

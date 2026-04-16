@@ -2073,19 +2073,19 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [x] Sans-io `RdpeudpSession` 3-way 핸드셰이크 (SYN → SYN+ACK → ACK), MTU/version/lossy 협상, client+server
 - [x] `RdpeudpSession` 데이터 경로 — 시퀀스 넘버 추적, Source Packet 빌드, ACK vector 수집/RLE 생성, AckOfAcks 처리, wrapping SN 비교
 - [x] `RdpeudpSocket` — std UdpSocket 바인딩, SYN 재전송 (exp backoff), blocking send_data/recv_data, loopback echo 테스트
-- [ ] Reliable 모드:
-  - [ ] 시퀀스 번호 관리
-  - [ ] 재전송 타이머 (RTO)
-  - [ ] 혼잡 제어 (congestion window)
-  - [ ] FEC (Forward Error Correction)
-  - [ ] 순서 보장
-  - [ ] TLS over UDP
-- [ ] Lossy 모드:
-  - [ ] FEC only (재전송 없음)
-  - [ ] DTLS
-- [ ] ACK/NACK 처리
-- [ ] MTU 협상
-- [ ] 프로토콜 버전 1/2/3 지원
+- [x] Reliable 모드:
+  - [x] 시퀀스 번호 관리 (wrapping u32, 중복 감지, 순서 비교)
+  - [x] 재전송 타이머 (RTO) — RFC 6298 SRTT/RTTVAR + 지수 백오프 + 200ms/60s floor/cap
+  - [x] 혼잡 제어 (congestion window) — slow-start / congestion avoidance / loss halving (Reno)
+  - [x] FEC (Forward Error Correction) — XOR encode/decode, 단일 손실 복구, 가변 길이 지원
+  - [x] 순서 보장 — reorder buffer, out-of-order → in-order flush
+  - [ ] TLS over UDP (DTLS — justrdp-tls 확장 필요, 통합 포인트 문서화됨)
+- [x] Lossy 모드:
+  - [x] FEC only (재전송 없음) — FEC recovery 동작 확인
+  - [ ] DTLS (위와 동일)
+- [x] ACK/NACK 처리 — ACK vector gap 감지, acknowledge_up_to 송신 버퍼 정리, detect_loss_from_ack_vector
+- [x] MTU 협상 — 4-value min, 경계값 (1132/1232) 테스트
+- [x] 프로토콜 버전 1/2/3 지원 — SYNEX 협상, v3 cookieHash, min 선택, 미사용 시 None
 
 ### 10.3 Multitransport (MS-RDPEMT)
 
