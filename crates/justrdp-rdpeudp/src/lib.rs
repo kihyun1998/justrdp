@@ -28,4 +28,10 @@ pub mod v1;
 pub mod v2;
 
 #[cfg(feature = "alloc")]
+pub mod session;
+
+#[cfg(feature = "alloc")]
 pub use v1::*;
+
+#[cfg(feature = "alloc")]
+pub use session::{RdpeudpConfig, RdpeudpError, RdpeudpSession, RdpeudpState, ReceiveAction};

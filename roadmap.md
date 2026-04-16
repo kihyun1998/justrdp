@@ -2070,7 +2070,8 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 **State machine / transport:**
 
-- [ ] 3-way 핸드셰이크 (SYN → SYN+ACK → ACK)
+- [x] Sans-io `RdpeudpSession` 3-way 핸드셰이크 (SYN → SYN+ACK → ACK), MTU/version/lossy 협상, client+server
+- [x] `RdpeudpSession` 데이터 경로 — 시퀀스 넘버 추적, Source Packet 빌드, ACK vector 수집/RLE 생성, AckOfAcks 처리, wrapping SN 비교
 - [ ] `RdpeudpSocket` -- UDP 소켓 추상화
 - [ ] Reliable 모드:
   - [ ] 시퀀스 번호 관리
