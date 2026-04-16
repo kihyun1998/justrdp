@@ -30,8 +30,14 @@ pub mod v2;
 #[cfg(feature = "alloc")]
 pub mod session;
 
+#[cfg(feature = "std")]
+pub mod socket;
+
 #[cfg(feature = "alloc")]
 pub use v1::*;
 
 #[cfg(feature = "alloc")]
 pub use session::{RdpeudpConfig, RdpeudpError, RdpeudpSession, RdpeudpState, ReceiveAction};
+
+#[cfg(feature = "std")]
+pub use socket::{RdpeudpSocket, SocketError};
