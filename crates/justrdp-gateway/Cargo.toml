@@ -19,3 +19,8 @@ std = ["alloc", "justrdp-core/std", "justrdp-pdu/std", "justrdp-rpch/std"]
 justrdp-core.workspace = true
 justrdp-pdu.workspace = true
 justrdp-rpch.workspace = true
+
+[dev-dependencies]
+# Used only to cross-validate our inlined minimal TSRequest DER
+# encoder against the canonical one in justrdp-connector::credssp.
+justrdp-connector.workspace = true
