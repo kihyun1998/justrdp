@@ -35,12 +35,23 @@
 //! - `TSG_PACKET_REAUTH`: reauthentication flow. Out of scope until
 //!   CredSSP re-auth is wired in.
 
+pub mod bind;
 pub mod client;
 pub mod errors;
 pub mod methods;
+pub mod paa;
 pub mod types;
 
-pub use client::{TsProxyClient, TsProxyClientError};
+#[cfg(feature = "std")]
+pub mod channel;
+
+pub use bind::{build_tsproxy_bind_pdu, validate_tsproxy_bind_ack, BindAckError,
+    DEFAULT_MAX_RECV_FRAG, DEFAULT_MAX_XMIT_FRAG, TSPROXY_CONTEXT_ID};
+pub use client::{TsProxyClient, TsProxyClientError, TsProxyState};
+pub use paa::PaaCookie;
+
+#[cfg(feature = "std")]
+pub use channel::{ChannelError, ChannelOptions, RpchGatewayChannel};
 pub use errors::{
     E_PROXY_ALREADYDISCONNECTED, E_PROXY_CAPABILITYMISMATCH,
     E_PROXY_COOKIE_AUTHENTICATION_ACCESS_DENIED, E_PROXY_COOKIE_BADPACKET, E_PROXY_INTERNALERROR,
