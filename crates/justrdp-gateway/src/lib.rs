@@ -29,6 +29,9 @@ pub mod auth;
 #[cfg(feature = "alloc")]
 pub mod ws;
 
+#[cfg(feature = "alloc")]
+pub mod rpch;
+
 #[cfg(feature = "std")]
 pub mod transport;
 
