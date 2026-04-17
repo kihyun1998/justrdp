@@ -628,6 +628,57 @@ impl RdpClient {
     }
 
     /// Perform the full RDP connection sequence through a Remote
+    /// Desktop Gateway using the legacy **RPC-over-HTTP v2**
+    /// transport (MS-RPCH + MS-TSGU's TsProxy RPC interface).
+    ///
+    /// This path is intended for Windows Server 2008 R2 / 2012
+    /// gateways that predate the HTTP Transport / WebSocket
+    /// Transport used by
+    /// [`connect_via_gateway_with_upgrader`] and
+    /// [`connect_via_gateway_ws_with_upgrader`]. It opens two TCP
+    /// connections (IN and OUT), drives HTTP NTLM 401 retry on
+    /// each, runs the CONN/A/B/C RPC-over-HTTP handshake, then
+    /// drives TsProxyCreateTunnel → AuthorizeTunnel → CreateChannel
+    /// → SetupReceivePipe. All RDP bytes subsequently flow through
+    /// TsProxySendToServer (outbound) and the SetupReceivePipe
+    /// RPC pipe (inbound).
+    ///
+    /// The single supported authentication path is the same NTLM
+    /// HTTP 401 retry used by the other two transports; RPC-level
+    /// auth is anonymous (MS-TSGU §3.2.1). Tunnel-level
+    /// authentication is optional and carried by
+    /// [`RpchGatewayConfig::paa_cookie`][crate::gateway::RpchGatewayConfig::paa_cookie].
+    pub fn connect_via_gateway_rpch_with_upgrader<U>(
+        gateway_cfg: &crate::gateway::RpchGatewayConfig,
+        server_name: &str,
+        config: Config,
+        upgrader: U,
+        processors: Vec<Box<dyn SvcProcessor>>,
+    ) -> Result<Self, ConnectError>
+    where
+        U: TlsUpgrader,
+        U::Stream: 'static,
+    {
+        info!(
+            gateway = %gateway_cfg.gateway_addr,
+            target = %gateway_cfg.target_host,
+            server_name,
+            processors = processors.len(),
+            "rdp.connect_via_gateway_rpch start",
+        );
+        let tunnel = crate::gateway::establish_gateway_tunnel_rpch(gateway_cfg, &upgrader)?;
+        debug!("rdp.connect_via_gateway_rpch tunnel established");
+        Self::run_handshake_over_tunnel(
+            tunnel,
+            gateway_cfg.target_port,
+            server_name,
+            config,
+            upgrader,
+            processors,
+        )
+    }
+
+    /// Perform the full RDP connection sequence through a Remote
     /// Desktop Gateway using the **WebSocket Transport** variant
     /// (MS-TSGU §2.2.3.1.2, RFC 6455).
     ///

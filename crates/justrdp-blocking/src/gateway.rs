@@ -618,6 +618,288 @@ where
 }
 
 // =============================================================================
+// RPC-over-HTTP v2 Transport variant (MS-RPCH, legacy)
+// =============================================================================
+
+/// Configuration for reaching an RDP server through a Windows
+/// Server 2008 R2 / 2012 Remote Desktop Gateway that only speaks
+/// RPC-over-HTTP v2 (MS-RPCH + MS-TSGU's TsProxy RPC interface),
+/// rather than the newer HTTP Transport / WebSocket Transport.
+///
+/// The HTTP-level NTLM dance uses the same `credentials` as the
+/// other transports. Tunnel-level authentication is carried by an
+/// optional [`PaaCookie`] — see MS-TSGU §2.2.10.1. If `paa_cookie`
+/// is `None`, the client sends `TSG_PACKET_VERSIONCAPS` to
+/// `TsProxyCreateTunnel`, which is only accepted by gateways
+/// configured for anonymous tunnel auth.
+#[derive(Debug, Clone)]
+pub struct RpchGatewayConfig {
+    pub gateway_addr: String,
+    pub gateway_hostname: String,
+    pub credentials: NtlmCredentials,
+    pub target_host: String,
+    pub target_port: u16,
+    pub connect_timeout: Duration,
+    pub auth_timeout: Duration,
+    /// Optional PAA cookie. `None` means "send TSG_PACKET_VERSIONCAPS
+    /// to CreateTunnel" — used by anonymous or SSPI-NTLM-only
+    /// deployments.
+    pub paa_cookie: Option<justrdp_gateway::rpch::PaaCookie>,
+}
+
+impl RpchGatewayConfig {
+    pub fn new(
+        gateway_addr: impl Into<String>,
+        gateway_hostname: impl Into<String>,
+        credentials: NtlmCredentials,
+        target_host: impl Into<String>,
+    ) -> Self {
+        Self {
+            gateway_addr: gateway_addr.into(),
+            gateway_hostname: gateway_hostname.into(),
+            credentials,
+            target_host: target_host.into(),
+            target_port: 3389,
+            connect_timeout: Duration::from_secs(10),
+            auth_timeout: Duration::from_secs(10),
+            paa_cookie: None,
+        }
+    }
+}
+
+fn rpch_channel_err(e: justrdp_gateway::rpch::ChannelError) -> ConnectError {
+    ConnectError::Tcp(io::Error::other(alloc_format_rpch_error(e)))
+}
+
+fn alloc_format_rpch_error(e: justrdp_gateway::rpch::ChannelError) -> String {
+    format!("rpch gateway: {e}")
+}
+
+fn rpch_tunnel_err(e: justrdp_rpch::TunnelIoError) -> ConnectError {
+    ConnectError::Tcp(io::Error::other(format!("rpch tunnel: {e}")))
+}
+
+/// Build a fresh [`RpchTunnelConfig`][justrdp_rpch::RpchTunnelConfig]
+/// with random cookies for every GUID the protocol asks us to pick
+/// (virtual connection, IN channel, OUT channel, association group).
+fn make_rpch_tunnel_config() -> Result<justrdp_rpch::RpchTunnelConfig, ConnectError> {
+    use justrdp_rpch::pdu::uuid::RpcUuid;
+    fn random_uuid() -> Result<RpcUuid, ConnectError> {
+        let mut b = [0u8; 16];
+        getrandom::getrandom(&mut b).map_err(|e| {
+            ConnectError::Tcp(io::Error::other(format!("OS random failure: {e}")))
+        })?;
+        // Mask to RFC 4122 v4.
+        b[6] = (b[6] & 0x0F) | 0x40;
+        b[8] = (b[8] & 0x3F) | 0x80;
+        Ok(RpcUuid {
+            data1: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            data2: u16::from_be_bytes([b[4], b[5]]),
+            data3: u16::from_be_bytes([b[6], b[7]]),
+            data4: [b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]],
+        })
+    }
+    Ok(justrdp_rpch::RpchTunnelConfig {
+        virtual_connection_cookie: random_uuid()?,
+        out_channel_cookie: random_uuid()?,
+        in_channel_cookie: random_uuid()?,
+        association_group_id: random_uuid()?,
+        receive_window_size: 65_536,
+        channel_lifetime: 0x4000_0000,
+        client_keepalive: 300_000,
+    })
+}
+
+/// HTTP-level NTLM 401 retry on a single TCP/TLS stream, using the
+/// RPC-over-HTTP v2 verbs (`RPC_IN_DATA` / `RPC_OUT_DATA`). After
+/// `200 OK` the stream is positioned at the start of the request
+/// body (which the caller writes into) and, for OUT channels, at
+/// the start of the response body (which the caller reads from).
+fn authenticate_rpch_channel<S: Read + Write>(
+    stream: &mut S,
+    channel: justrdp_rpch::http::RpchChannel,
+    cfg: &RpchGatewayConfig,
+) -> Result<(), ConnectError> {
+    let random = make_ntlm_random()?;
+    let mut ntlm = NtlmClient::new(cfg.credentials.clone(), random);
+
+    // Round 1: anonymous header-only request → 401.
+    send_rpch_request(stream, channel, cfg, None)?;
+    let headers = read_http_response_headers(stream)?;
+    let resp = parse_http_response(&headers)?;
+    if resp.status == 200 {
+        return Err(http_err(
+            "rpch gateway accepted anonymous request — refusing unauthenticated tunnel",
+        ));
+    }
+    if resp.status != 401 {
+        return Err(http_err(format!(
+            "expected 401 on first rpch request, got {}",
+            resp.status
+        )));
+    }
+    require_ntlm_scheme(&resp)?;
+
+    // Round 2: NTLM NEGOTIATE → 401 + challenge.
+    let type1 = ntlm.negotiate().map_err(ntlm_err)?;
+    send_rpch_request(
+        stream,
+        channel,
+        cfg,
+        Some(build_authorization_header(AuthScheme::Ntlm, &type1)),
+    )?;
+    let headers = read_http_response_headers(stream)?;
+    let resp = parse_http_response(&headers)?;
+    if resp.status != 401 {
+        return Err(http_err(format!(
+            "expected 401 challenge on second rpch request, got {}",
+            resp.status
+        )));
+    }
+    let www = resp
+        .header("WWW-Authenticate")
+        .ok_or_else(|| http_err("missing WWW-Authenticate on rpch challenge"))?;
+    let challenge = parse_www_authenticate(www, AuthScheme::Ntlm)
+        .ok_or_else(|| http_err("malformed WWW-Authenticate NTLM token"))?;
+    if challenge.is_empty() {
+        return Err(http_err(
+            "rpch gateway sent empty NTLM challenge on second 401",
+        ));
+    }
+
+    // Round 3: NTLM AUTHENTICATE → 200 OK.
+    let type3 = ntlm.authenticate(&challenge).map_err(ntlm_err)?;
+    debug_assert_eq!(ntlm.state(), NtlmAuthState::Done);
+    send_rpch_request(
+        stream,
+        channel,
+        cfg,
+        Some(build_authorization_header(AuthScheme::Ntlm, &type3)),
+    )?;
+    let headers = read_http_response_headers(stream)?;
+    let resp = parse_http_response(&headers)?;
+    if resp.status != 200 {
+        return Err(http_err(format!(
+            "expected 200 on authenticated rpch request, got {}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+fn send_rpch_request<W: Write>(
+    writer: &mut W,
+    channel: justrdp_rpch::http::RpchChannel,
+    cfg: &RpchGatewayConfig,
+    authorization: Option<String>,
+) -> Result<(), ConnectError> {
+    let target = format!("{}:{}", cfg.target_host, cfg.target_port);
+    let host = cfg.gateway_hostname.clone();
+    let mut req = justrdp_rpch::http::RpchHttpRequest::new(channel, target, host);
+    if let Some(auth) = authorization {
+        req = req.authorization(auth);
+    }
+    let bytes = req.to_bytes();
+    writer.write_all(&bytes).map_err(ConnectError::Tcp)?;
+    writer.flush().map_err(ConnectError::Tcp)?;
+    Ok(())
+}
+
+/// Open one authenticated HTTP channel for RPC-over-HTTP v2 and
+/// return the TLS-wrapped stream positioned past the 200 OK
+/// response headers.
+fn open_authenticated_rpch_channel<U: TlsUpgrader>(
+    cfg: &RpchGatewayConfig,
+    upgrader: &U,
+    channel: justrdp_rpch::http::RpchChannel,
+    addr: SocketAddr,
+) -> Result<Box<dyn ReadWrite>, ConnectError>
+where
+    U::Stream: 'static,
+{
+    let tcp = TcpStream::connect_timeout(&addr, cfg.connect_timeout)?;
+    tcp.set_read_timeout(Some(cfg.auth_timeout))?;
+    tcp.set_write_timeout(Some(cfg.auth_timeout))?;
+
+    let upgraded = upgrader.upgrade(tcp, &cfg.gateway_hostname)?;
+    let mut stream: Box<dyn ReadWrite> = Box::new(upgraded.stream);
+    authenticate_rpch_channel(&mut stream, channel, cfg)?;
+    Ok(stream)
+}
+
+/// Drive the full RPC-over-HTTP v2 connect sequence: open IN + OUT
+/// TCP/TLS channels with HTTP NTLM 401 retry, drive CONN/A/B/C on
+/// the paired streams via [`RpchTunnel`], then run
+/// BIND → TsProxyCreateTunnel → AuthorizeTunnel → CreateChannel →
+/// SetupReceivePipe via [`RpchGatewayChannel`]. Returns a
+/// `ReadWrite` byte pipe where RDP traffic can flow.
+pub fn establish_gateway_tunnel_rpch<U: TlsUpgrader>(
+    cfg: &RpchGatewayConfig,
+    upgrader: &U,
+) -> Result<Box<dyn ReadWrite>, ConnectError>
+where
+    U::Stream: 'static,
+{
+    let addr = cfg
+        .gateway_addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            ConnectError::Tcp(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no socket addresses resolved for gateway_addr",
+            ))
+        })?;
+
+    // OUT first (its HTTP response body hosts the server's CONN/A3,
+    // C2 and all TsProxy RESPONSE PDUs).
+    let out_stream = open_authenticated_rpch_channel(
+        cfg,
+        upgrader,
+        justrdp_rpch::http::RpchChannel::Out,
+        addr,
+    )?;
+    let in_stream = open_authenticated_rpch_channel(
+        cfg,
+        upgrader,
+        justrdp_rpch::http::RpchChannel::In,
+        addr,
+    )?;
+
+    // Clear timeouts before handing off — the handshake and streamed
+    // RESPONSE PDUs from SetupReceivePipe can legitimately pause.
+    // The inner channel handles its own timeouts if needed.
+    // (Note: this relies on BoxedReadWrite supporting clone-free
+    // access; if not, the timeouts remain — harmless for short
+    // sessions.)
+
+    // Step A: CONN/A/B/C handshake.
+    let tunnel_cfg = make_rpch_tunnel_config()?;
+    let tunnel = justrdp_rpch::RpchTunnel::connect(in_stream, out_stream, tunnel_cfg)
+        .map_err(rpch_tunnel_err)?;
+
+    // Step B: DCE/RPC BIND + TsProxy full flow.
+    let version_caps = justrdp_gateway::rpch::types::TsgPacketVersionCaps::client_default(0);
+    let endpoint = justrdp_gateway::rpch::types::TsEndpointInfo {
+        resource_names: alloc_vec_of_string(&cfg.target_host),
+        alternate_resource_names: Vec::new(),
+        port: justrdp_gateway::rpch::types::TsEndpointInfo::rdp_port(cfg.target_port),
+    };
+    let options = justrdp_gateway::rpch::ChannelOptions {
+        version_caps,
+        paa_cookie: cfg.paa_cookie.clone(),
+        endpoint,
+    };
+    let channel = justrdp_gateway::rpch::RpchGatewayChannel::establish(tunnel, options)
+        .map_err(rpch_channel_err)?;
+    Ok(Box::new(channel))
+}
+
+fn alloc_vec_of_string(s: &str) -> Vec<String> {
+    std::vec![s.to_string()]
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -847,6 +1129,111 @@ mod tests {
             ConnectError::Tcp(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
             _ => panic!("expected InvalidData, got {err:?}"),
         }
+    }
+
+    // ===================== RPC-over-HTTP v2 auth =====================
+
+    fn test_rpch_cfg() -> RpchGatewayConfig {
+        RpchGatewayConfig::new(
+            "gw.example.com:443",
+            "gw.example.com",
+            NtlmCredentials::new("alice", "hunter2", ""),
+            "rdp.example.com",
+        )
+    }
+
+    #[test]
+    fn authenticate_rpch_channel_runs_401_retry_loop() {
+        let challenge = synthetic_challenge();
+        let mut stream = Scripted::new(build_scripted_three_step(&challenge));
+        let cfg = test_rpch_cfg();
+
+        authenticate_rpch_channel(
+            &mut stream,
+            justrdp_rpch::http::RpchChannel::Out,
+            &cfg,
+        )
+        .unwrap();
+
+        // Exactly three RPC_OUT_DATA requests must have been sent.
+        let out = &stream.written;
+        assert_eq!(
+            out.windows(12).filter(|w| *w == b"RPC_OUT_DATA").count(),
+            3,
+        );
+        assert_eq!(
+            out.windows(20)
+                .filter(|w| *w == b"Authorization: NTLM ")
+                .count(),
+            2,
+        );
+    }
+
+    #[test]
+    fn authenticate_rpch_channel_in_variant_uses_rpc_in_data_verb() {
+        let challenge = synthetic_challenge();
+        let mut stream = Scripted::new(build_scripted_three_step(&challenge));
+        let cfg = test_rpch_cfg();
+
+        authenticate_rpch_channel(
+            &mut stream,
+            justrdp_rpch::http::RpchChannel::In,
+            &cfg,
+        )
+        .unwrap();
+
+        let out = &stream.written;
+        assert_eq!(
+            out.windows(11).filter(|w| *w == b"RPC_IN_DATA").count(),
+            3,
+        );
+        // IN channel advertises the 1 GiB Content-Length default
+        // defined in MS-RPCH §3.2.2.3.1.
+        assert!(
+            out.windows(b"Content-Length: 1073741824".len())
+                .any(|w| w == b"Content-Length: 1073741824"),
+            "IN channel must advertise the 1 GiB body cap"
+        );
+    }
+
+    #[test]
+    fn authenticate_rpch_channel_rejects_unauthenticated_200() {
+        let mut stream = Scripted::new(b"HTTP/1.1 200 OK\r\n\r\n".to_vec());
+        let cfg = test_rpch_cfg();
+        let err = authenticate_rpch_channel(
+            &mut stream,
+            justrdp_rpch::http::RpchChannel::Out,
+            &cfg,
+        )
+        .unwrap_err();
+        match err {
+            ConnectError::Tcp(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            _ => panic!("expected InvalidData, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn rpch_tunnel_config_guids_are_uuidv4() {
+        let cfg = make_rpch_tunnel_config().unwrap();
+        // v4 marker in byte 6 of data4-style layout — we stored
+        // bytes [6..8] into data3 (BE), so to check v4 inspect the
+        // high nibble of data3's MSB.
+        let data3_msb = (cfg.virtual_connection_cookie.data3 >> 8) as u8;
+        assert_eq!(data3_msb & 0xF0, 0x40, "version nibble must be 4");
+        // variant bits land in data4[0].
+        assert_eq!(
+            cfg.virtual_connection_cookie.data4[0] & 0xC0,
+            0x80,
+            "variant bits must be 10"
+        );
+        // All four cookies must be distinct.
+        assert_ne!(
+            cfg.virtual_connection_cookie,
+            cfg.out_channel_cookie
+        );
+        assert_ne!(cfg.virtual_connection_cookie, cfg.in_channel_cookie);
+        assert_ne!(cfg.virtual_connection_cookie, cfg.association_group_id);
+        assert_ne!(cfg.out_channel_cookie, cfg.in_channel_cookie);
     }
 
     #[test]

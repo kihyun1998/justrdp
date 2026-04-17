@@ -29,5 +29,6 @@ justrdp-input.workspace = true
 justrdp-tls.workspace = true
 justrdp-rdpfile = { workspace = true, features = ["alloc"] }
 justrdp-gateway.workspace = true
+justrdp-rpch = { workspace = true, features = ["std"] }
 tracing = { version = "0.1", optional = true }
 getrandom = "0.2"
