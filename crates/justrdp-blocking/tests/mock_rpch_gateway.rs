@@ -72,7 +72,7 @@ struct NoopUpgrader;
 
 impl TlsUpgrader for NoopUpgrader {
     type Stream = Passthrough<Box<dyn ReadWrite>>;
-    fn upgrade<S: Read + Write + 'static>(
+    fn upgrade<S: Read + Write + Send + 'static>(
         &self,
         stream: S,
         _server_name: &str,

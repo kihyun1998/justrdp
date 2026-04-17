@@ -78,7 +78,7 @@ impl Default for RustlsUpgrader {
 impl TlsUpgrader for RustlsUpgrader {
     type Stream = StreamOwned<ClientConnection, Box<dyn ReadWrite>>;
 
-    fn upgrade<S: Read + Write + 'static>(
+    fn upgrade<S: Read + Write + Send + 'static>(
         &self,
         stream: S,
         server_name: &str,

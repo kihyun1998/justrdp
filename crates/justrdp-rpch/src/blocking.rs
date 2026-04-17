@@ -21,9 +21,18 @@
 extern crate std;
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use std::vec::Vec;
 
-use crate::pdu::COMMON_HEADER_SIZE;
+use justrdp_core::WriteCursor;
+
+use crate::pdu::{
+    common::{PFC_FIRST_FRAG, PFC_LAST_FRAG},
+    COMMON_HEADER_SIZE,
+};
 use crate::tunnel::{
     peek_frag_length, HandshakeStage, OutboundAction, RpchTunnelConfig, RpchTunnelError,
     RpchTunnelState,
@@ -81,9 +90,16 @@ impl From<RpchTunnelError> for TunnelIoError {
 
 /// Blocking adapter that owns the two channel streams and the
 /// tunnel state machine.
+///
+/// The IN stream is wrapped in `Arc<Mutex<_>>` so a background
+/// keepalive thread (see [`spawn_keepalive_thread`]) can write
+/// Ping RTS PDUs without racing against [`send_pdu`] calls on the
+/// main thread. `Arc<Mutex<_>>` is intentionally required even
+/// without keepalive — the contention is a single-writer bottleneck
+/// in practice and the type stays the same across both call sites.
 #[derive(Debug)]
 pub struct RpchTunnel<I: Read + Write, O: Read + Write> {
-    inbound: I,
+    inbound: Arc<Mutex<I>>,
     outbound: O,
     state: RpchTunnelState,
     /// Small scratch buffer reused across `recv_pdu` calls.
@@ -137,7 +153,7 @@ impl<I: Read + Write, O: Read + Write> RpchTunnel<I, O> {
         }
 
         Ok(Self {
-            inbound,
+            inbound: Arc::new(Mutex::new(inbound)),
             outbound,
             state,
             scratch,
@@ -146,9 +162,26 @@ impl<I: Read + Write, O: Read + Write> RpchTunnel<I, O> {
 
     /// Write one complete DCE/RPC PDU to the IN channel body.
     pub fn send_pdu(&mut self, pdu: &[u8]) -> Result<(), TunnelIoError> {
-        self.inbound.write_all(pdu)?;
-        self.inbound.flush()?;
+        let mut g = self.inbound.lock().expect("rpch inbound mutex poisoned");
+        g.write_all(pdu)?;
+        g.flush()?;
         Ok(())
+    }
+
+    /// Write a keepalive Ping RTS PDU on the IN channel. A ping is
+    /// `PTYPE=0x14` with `RTS_FLAG_PING` set, `NumberOfCommands=1`
+    /// with an `Empty` command — the minimal payload the gateway
+    /// accepts as "client still alive" (MS-RPCH §3.2.1.5.5).
+    pub fn send_ping(&mut self) -> Result<(), TunnelIoError> {
+        let bytes = build_keepalive_ping_pdu();
+        self.send_pdu(&bytes)
+    }
+
+    /// Clone the `Arc<Mutex<I>>` that guards the IN stream. Intended
+    /// for [`spawn_keepalive_thread`] and similar out-of-band
+    /// writers.
+    pub fn inbound_handle(&self) -> Arc<Mutex<I>> {
+        self.inbound.clone()
     }
 
     /// Read one complete DCE/RPC data PDU off the OUT channel body.
@@ -167,8 +200,10 @@ impl<I: Read + Write, O: Read + Write> RpchTunnel<I, O> {
                     // Maybe the client is now obliged to emit an ack
                     // to keep the server's send window open.
                     if let Some(ack) = self.state.flow_ack_if_due() {
-                        self.inbound.write_all(&ack)?;
-                        self.inbound.flush()?;
+                        let mut g =
+                            self.inbound.lock().expect("rpch inbound mutex poisoned");
+                        g.write_all(&ack)?;
+                        g.flush()?;
                     }
                     return Ok(Some(data));
                 }
@@ -184,6 +219,102 @@ impl<I: Read + Write, O: Read + Write> RpchTunnel<I, O> {
     /// Borrow the underlying state machine (for metrics / testing).
     pub fn state(&self) -> &RpchTunnelState {
         &self.state
+    }
+}
+
+// =============================================================================
+// Keepalive
+// =============================================================================
+
+/// Build the 24-byte serialized form of a keepalive Ping RTS PDU.
+/// Used by both [`RpchTunnel::send_ping`] and
+/// [`spawn_keepalive_thread`].
+fn build_keepalive_ping_pdu() -> Vec<u8> {
+    use crate::pdu::{RtsCommand, RtsPdu, RTS_FLAG_PING};
+    let pdu = RtsPdu {
+        pfc_flags: PFC_FIRST_FRAG | PFC_LAST_FRAG,
+        flags: RTS_FLAG_PING,
+        commands: std::vec![RtsCommand::Empty],
+    };
+    let mut buf = std::vec![0u8; pdu.size()];
+    let mut w = WriteCursor::new(&mut buf);
+    pdu.encode(&mut w).expect("ping PDU fits");
+    buf
+}
+
+/// Live handle returned by [`spawn_keepalive_thread`]. Dropping it
+/// signals the worker to exit and joins the thread.
+#[derive(Debug)]
+pub struct KeepaliveHandle {
+    stop: Arc<AtomicBool>,
+    joiner: Option<JoinHandle<()>>,
+}
+
+impl KeepaliveHandle {
+    /// Ask the keepalive worker to stop and block until it does.
+    /// Idempotent — calling more than once is a no-op.
+    pub fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(j) = self.joiner.take() {
+            let _ = j.join();
+        }
+    }
+
+    /// Has the worker been asked to stop?
+    pub fn is_stopping(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for KeepaliveHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Spawn a background thread that writes a keepalive Ping RTS PDU
+/// to `inbound` every `interval`. Returns a handle whose `Drop`
+/// signals the thread to exit.
+///
+/// The thread never panics on transient write errors — a network
+/// blip should not tear the tunnel down through this path — it
+/// just swallows them and retries on the next tick. When the
+/// stream really is dead, the main thread's next `send_pdu` will
+/// surface the failure.
+pub fn spawn_keepalive_thread<W>(inbound: Arc<Mutex<W>>, interval: Duration) -> KeepaliveHandle
+where
+    W: Write + Send + 'static,
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_cloned = stop.clone();
+    let ping_bytes = build_keepalive_ping_pdu();
+
+    let joiner = thread::spawn(move || {
+        // Use coarse-grained sleeps so shutdown is observed within
+        // ~100 ms of the Drop signal, irrespective of `interval`.
+        let tick = Duration::from_millis(100);
+        let mut last_fire = Instant::now();
+        while !stop_cloned.load(Ordering::SeqCst) {
+            thread::sleep(tick.min(interval));
+            if last_fire.elapsed() >= interval {
+                let mut g = match inbound.lock() {
+                    Ok(g) => g,
+                    Err(_) => break, // poisoned — stop cleanly
+                };
+                if let Err(_e) = g.write_all(&ping_bytes).and_then(|_| g.flush()) {
+                    // Transport is in trouble; drop the lock and
+                    // let the main thread's next send_pdu report.
+                    break;
+                }
+                drop(g);
+                last_fire = Instant::now();
+            }
+        }
+    });
+
+    KeepaliveHandle {
+        stop,
+        joiner: Some(joiner),
     }
 }
 
@@ -353,7 +484,10 @@ mod tests {
         let tunnel = RpchTunnel::connect(inbound, outbound, test_config()).unwrap();
         // First byte of IN write buffer should be an RTS PDU
         // (CONN/B1) with ptype=0x14.
-        assert_eq!(tunnel.inbound.write_buf[2], crate::pdu::RTS_PTYPE);
+        {
+            let g = tunnel.inbound.lock().unwrap();
+            assert_eq!(g.write_buf[2], crate::pdu::RTS_PTYPE);
+        }
         // First byte of OUT write buffer should be an RTS PDU
         // (CONN/A1) with ptype=0x14.
         assert_eq!(tunnel.outbound.write_buf[2], crate::pdu::RTS_PTYPE);
@@ -449,8 +583,85 @@ mod tests {
 
         // Last bytes written to IN stream should be exactly req_bytes,
         // appended after the CONN/B1 written during connect().
-        let written = &tunnel.inbound.write_buf;
-        assert!(written.ends_with(&req_bytes));
+        {
+            let g = tunnel.inbound.lock().unwrap();
+            assert!(g.write_buf.ends_with(&req_bytes));
+        }
+    }
+
+    // ---- keepalive ----------------------------------------------------
+
+    #[test]
+    fn build_keepalive_ping_pdu_has_ping_flag() {
+        let bytes = build_keepalive_ping_pdu();
+        // Common header PTYPE is at offset 2.
+        assert_eq!(bytes[2], crate::pdu::RTS_PTYPE);
+        // flags lives at offset 16..18 in an RTS PDU.
+        let flags = u16::from_le_bytes([bytes[16], bytes[17]]);
+        assert_eq!(flags & crate::pdu::RTS_FLAG_PING, crate::pdu::RTS_FLAG_PING);
+        // NumberOfCommands = 1 (one Empty command).
+        let n = u16::from_le_bytes([bytes[18], bytes[19]]);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn send_ping_appends_ping_pdu_to_inbound() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&synthetic_a3());
+        out.extend_from_slice(&synthetic_c2());
+        let inbound = FakeChannel::new(Vec::new());
+        let outbound = FakeChannel::new(out);
+        let mut tunnel = RpchTunnel::connect(inbound, outbound, test_config()).unwrap();
+
+        let len_before = tunnel.inbound.lock().unwrap().write_buf.len();
+        tunnel.send_ping().unwrap();
+        let after = tunnel.inbound.lock().unwrap().write_buf.clone();
+        assert!(after.len() > len_before);
+        // Last PDU emitted should be a Ping RTS.
+        let ping_start = len_before;
+        assert_eq!(after[ping_start + 2], crate::pdu::RTS_PTYPE);
+        let flags =
+            u16::from_le_bytes([after[ping_start + 16], after[ping_start + 17]]);
+        assert_eq!(flags & crate::pdu::RTS_FLAG_PING, crate::pdu::RTS_FLAG_PING);
+    }
+
+    #[test]
+    fn spawn_keepalive_thread_fires_pings_and_stops_on_drop() {
+        use std::time::{Duration, Instant};
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&synthetic_a3());
+        out.extend_from_slice(&synthetic_c2());
+        let inbound = FakeChannel::new(Vec::new());
+        let outbound = FakeChannel::new(out);
+        let tunnel = RpchTunnel::connect(inbound, outbound, test_config()).unwrap();
+
+        let len_after_conn_b1 = tunnel.inbound.lock().unwrap().write_buf.len();
+        let handle = tunnel.inbound_handle();
+        // Fire every 50 ms; worker sleeps 100 ms max between ticks.
+        let keepalive = spawn_keepalive_thread(handle, Duration::from_millis(50));
+
+        // Wait for at least three pings (~ 150 ms + jitter).
+        let deadline = Instant::now() + Duration::from_millis(2_000);
+        loop {
+            let extra = tunnel.inbound.lock().unwrap().write_buf.len() - len_after_conn_b1;
+            // One Ping PDU is 24 bytes (16 header + 4 RTS head + 4 Empty cmd).
+            if extra >= 24 * 3 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("keepalive worker produced fewer pings than expected; extra = {extra}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Drop the handle — worker must exit within ~250 ms.
+        let stop = Instant::now();
+        drop(keepalive);
+        assert!(
+            stop.elapsed() < Duration::from_millis(500),
+            "keepalive thread took too long to stop"
+        );
     }
 
     #[test]
@@ -482,12 +693,12 @@ mod tests {
         let inbound = FakeChannel::new(Vec::new());
         let outbound = FakeChannel::new(out);
         let mut tunnel = RpchTunnel::connect(inbound, outbound, small_cfg).unwrap();
-        let len_before = tunnel.inbound.write_buf.len();
+        let len_before = tunnel.inbound.lock().unwrap().write_buf.len();
         let _got = tunnel.recv_pdu().unwrap().unwrap();
         // After recv, IN stream must have received an additional
         // FlowControlAck RTS PDU beyond the initial CONN/B1.
         assert!(
-            tunnel.inbound.write_buf.len() > len_before,
+            tunnel.inbound.lock().unwrap().write_buf.len() > len_before,
             "expected flow-control ack appended to IN stream"
         );
     }

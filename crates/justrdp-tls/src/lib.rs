@@ -71,8 +71,10 @@ pub struct TlsUpgradeResult<S> {
 /// Implementations handle the TLS handshake and extract the server's
 /// public key for use in CredSSP authentication.
 pub trait TlsUpgrader {
-    /// The type of the TLS-wrapped stream.
-    type Stream: Read + Write;
+    /// The type of the TLS-wrapped stream. `Send` is required so
+    /// callers can hand the stream (or a clone of its guard) off to
+    /// a background thread — see `justrdp-rpch::blocking::spawn_keepalive_thread`.
+    type Stream: Read + Write + Send;
 
     /// Perform TLS handshake and upgrade the given stream.
     ///
@@ -82,7 +84,7 @@ pub trait TlsUpgrader {
     ///
     /// RDP servers commonly use self-signed certificates, so implementations
     /// may provide an option to skip certificate verification.
-    fn upgrade<S: Read + Write + 'static>(
+    fn upgrade<S: Read + Write + Send + 'static>(
         &self,
         stream: S,
         server_name: &str,
@@ -90,8 +92,14 @@ pub trait TlsUpgrader {
 }
 
 /// Trait alias combining [`Read`] and [`Write`], used to box transport streams.
-pub trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
+///
+/// `Send` is required so that adapters (for example the RPC-over-HTTP v2
+/// keepalive worker in `justrdp-rpch::blocking::spawn_keepalive_thread`)
+/// can move an `Arc<Mutex<Box<dyn ReadWrite>>>` into a worker thread. All
+/// concrete backends we ship — `std::net::TcpStream`, `rustls::StreamOwned`,
+/// `native_tls::TlsStream` — are already `Send`.
+pub trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send> ReadWrite for T {}
 
 // Re-export backend types
 #[cfg(feature = "rustls-backend")]

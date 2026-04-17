@@ -875,8 +875,14 @@ where
 
     // Step A: CONN/A/B/C handshake.
     let tunnel_cfg = make_rpch_tunnel_config()?;
+    let keepalive_ms = tunnel_cfg.client_keepalive;
     let tunnel = justrdp_rpch::RpchTunnel::connect(in_stream, out_stream, tunnel_cfg)
         .map_err(rpch_tunnel_err)?;
+
+    // Grab a second reference to the IN stream before handing the
+    // tunnel over to `RpchGatewayChannel::establish` so the
+    // keepalive worker has somewhere to write its Ping RTS PDUs.
+    let keepalive_inbound = tunnel.inbound_handle();
 
     // Step B: DCE/RPC BIND + TsProxy full flow.
     let version_caps = justrdp_gateway::rpch::types::TsgPacketVersionCaps::client_default(0);
@@ -892,7 +898,56 @@ where
     };
     let channel = justrdp_gateway::rpch::RpchGatewayChannel::establish(tunnel, options)
         .map_err(rpch_channel_err)?;
-    Ok(Box::new(channel))
+
+    // Step C: spawn the keepalive worker. A `0` interval is the
+    // MS-RPCH §2.2.3.5.5 "disabled" sentinel.
+    let keepalive = if keepalive_ms > 0 {
+        Some(justrdp_rpch::blocking::spawn_keepalive_thread(
+            keepalive_inbound,
+            Duration::from_millis(keepalive_ms as u64),
+        ))
+    } else {
+        None
+    };
+
+    Ok(Box::new(KeepaliveRpchTunnel { channel, _keepalive: keepalive }))
+}
+
+/// Bundles an `RpchGatewayChannel` with the background keepalive
+/// worker that pings the IN channel every `ClientKeepalive` ms.
+/// Dropping this struct shuts the worker down (via
+/// `KeepaliveHandle::Drop`) before the underlying streams are
+/// closed, so the worker never writes to a half-closed socket.
+struct KeepaliveRpchTunnel<I, O>
+where
+    I: Read + Write + Send + 'static,
+    O: Read + Write + Send + 'static,
+{
+    channel: justrdp_gateway::rpch::RpchGatewayChannel<I, O>,
+    _keepalive: Option<justrdp_rpch::blocking::KeepaliveHandle>,
+}
+
+impl<I, O> Read for KeepaliveRpchTunnel<I, O>
+where
+    I: Read + Write + Send + 'static,
+    O: Read + Write + Send + 'static,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.channel.read(buf)
+    }
+}
+
+impl<I, O> Write for KeepaliveRpchTunnel<I, O>
+where
+    I: Read + Write + Send + 'static,
+    O: Read + Write + Send + 'static,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.channel.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.channel.flush()
+    }
 }
 
 fn alloc_vec_of_string(s: &str) -> Vec<String> {
