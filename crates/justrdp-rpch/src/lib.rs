@@ -29,4 +29,7 @@ extern crate alloc;
 pub mod ndr;
 
 #[cfg(feature = "alloc")]
+pub mod pdu;
+
+#[cfg(feature = "alloc")]
 pub use ndr::{NdrDecoder, NdrEncoder, NdrError, NdrResult};
