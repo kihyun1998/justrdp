@@ -31,6 +31,7 @@ pub mod auth;
 pub mod bind;
 pub mod body;
 pub mod common;
+pub mod reassembly;
 pub mod rts;
 pub mod uuid;
 
@@ -53,6 +54,9 @@ pub use common::{
     CommonHeader, COMMON_HEADER_SIZE, DREP_DEFAULT, PFC_CONC_MPX, PFC_DID_NOT_EXECUTE,
     PFC_FIRST_FRAG, PFC_LAST_FRAG, PFC_MAYBE, PFC_OBJECT_UUID, PFC_PENDING_CANCEL,
     RPC_VERS, RPC_VERS_MINOR,
+};
+pub use reassembly::{
+    ReassembledPdu, ReassemblyBuffer, ReassemblyError, DEFAULT_REASSEMBLY_CAP,
 };
 pub use rts::{
     conn_a1, conn_b1, RtsCommand, RtsPdu, RTS_FLAG_ECHO, RTS_FLAG_EOF, RTS_FLAG_IN_CHANNEL,
