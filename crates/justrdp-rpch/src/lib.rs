@@ -26,10 +26,31 @@
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
+pub mod http;
+
+#[cfg(feature = "alloc")]
 pub mod ndr;
 
 #[cfg(feature = "alloc")]
 pub mod pdu;
 
 #[cfg(feature = "alloc")]
+pub mod tunnel;
+
+#[cfg(feature = "std")]
+pub mod blocking;
+
+#[cfg(feature = "alloc")]
 pub use ndr::{NdrDecoder, NdrEncoder, NdrError, NdrResult};
+
+#[cfg(feature = "alloc")]
+pub use http::{HttpError, HttpResponse, RpchChannel, RpchHttpRequest};
+
+#[cfg(feature = "alloc")]
+pub use tunnel::{
+    HandshakeStage, OutboundAction, RpchTunnelConfig, RpchTunnelError, RpchTunnelState,
+    peek_frag_length,
+};
+
+#[cfg(feature = "std")]
+pub use blocking::{RpchTunnel, TunnelIoError};

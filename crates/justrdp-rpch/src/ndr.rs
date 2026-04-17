@@ -138,8 +138,7 @@ impl fmt::Display for NdrError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for NdrError {}
+impl core::error::Error for NdrError {}
 
 /// Result alias used by both the encoder and decoder.
 pub type NdrResult<T> = Result<T, NdrError>;
