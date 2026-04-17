@@ -2016,108 +2016,108 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 
 *1. NDR 2.0 Marshaling (C706 Ch.14, MS-RPCE §2.2.5)* — `justrdp-rpch::ndr`
 
-- [ ] Data Representation format label (integer=little-endian, char=ASCII, float=IEEE)
-- [ ] Primitive types (`u8/i8/u16/i16/u32/i32/u64/i64/f32/f64/bool`) + alignment rules
-- [ ] Top-level pointer policy: embedded-reference vs full pointer semantics
-- [ ] Pointer kinds: `unique` (nullable), `ref` (non-null), `ptr` (full, referent ID 테이블)
-- [ ] Conformant array (max_count prefix + elements)
-- [ ] Varying array (offset + actual_count + elements)
-- [ ] Conformant+Varying array (max_count + offset + actual_count)
-- [ ] Conformant string (`wchar_t*`, NUL-terminated, UTF-16LE)
-- [ ] Structure (alignment = max field alignment)
-- [ ] Union (discriminant + arm)
-- [ ] Pipe primitive (partial stream, fragmented)
-- [ ] NDR marshaller/unmarshaller (encode/decode + `NdrCursor`)
-- [ ] 테스트: MS-RPCE Appendix A 예제 벡터 + roundtrip 경계 케이스 (0/max/padding)
+- [x] Data Representation format label (integer=little-endian, char=ASCII, float=IEEE)
+- [x] Primitive types (`u8/u16/u32/i32/u64` + enum16) with alignment rules (i8/i16/f32/f64/bool not required by TsProxy — descoped)
+- [x] Top-level pointer policy: embedded-reference vs full pointer semantics
+- [x] Pointer kinds: `unique` (nullable) + `ref` (non-null). `ptr` (full/aliasing) intentionally descoped — TsProxy never uses full pointers.
+- [x] Conformant array (max_count prefix + elements)
+- [x] Varying array (offset + actual_count + elements)
+- [x] Conformant+Varying array (max_count + offset + actual_count)
+- [x] Conformant string (`wchar_t*`, NUL-terminated, UTF-16LE) + ASCII variant
+- [x] Structure (alignment relative to absolute stream offset)
+- [x] Union (encapsulated — discriminant + arm, via `TsgPacket` enum)
+- [ ] Pipe primitive (partial stream, fragmented) — intentionally descoped (not needed by TsProxy)
+- [x] NDR marshaller/unmarshaller (`NdrEncoder` / `NdrDecoder`)
+- [x] 테스트: 30 unit tests covering UUID bytes, alignment boundaries, pointer semantics, string roundtrip / boundary rejection, primitives from odd offsets
 
 *2. DCE/RPC PDU Codec (MS-RPCE §2.2.2)* — `justrdp-rpch::pdu`
 
-- [ ] 공통 헤더 (`rpc_vers=5`, `rpc_vers_minor=0`, `PTYPE`, `pfc_flags`, `drep`, `frag_length`, `auth_length`, `call_id`)
-- [ ] `BIND` (0x0B) — context element 리스트, 추상/전송 구문 UUID+버전, security trailer
-- [ ] `BIND_ACK` (0x0C) — 서버 assoc group ID, 결과 리스트, 보조 주소
-- [ ] `BIND_NAK` (0x0D) — 거절 이유
-- [ ] `ALTER_CONTEXT` (0x0E) / `ALTER_CONTEXT_RESP` (0x0F)
-- [ ] `AUTH3` (0x10) — NTLM 3-step 완료
-- [ ] `REQUEST` (0x00) — opnum + stub data (+ object UUID if flag)
-- [ ] `RESPONSE` (0x02) — stub data + alloc hint
-- [ ] `FAULT` (0x03) — status code (nca_s_*)
-- [ ] `SHUTDOWN` (0x11), `CO_CANCEL` (0x12), `ORPHANED` (0x13)
-- [ ] `RTS` (0x14) — RPC-over-HTTP 플로우 제어 (MS-RPCH §2.2.3.5)
-  - [ ] RTS 커맨드: `ReceiveWindowSize`, `FlowControlAck`, `ConnectionTimeout`, `Cookie`, `ChannelLifetime`, `ClientKeepalive`, `Version`, `Empty`, `Padding`, `NegativeANCE`, `ANCE`, `ClientAddress`, `AssociationGroupId`, `Destination`, `PingTrafficSentNotify`
-  - [ ] RTS 플로우: `Flow`, `OutOfProcConnA1/A2/A3/A4`, `OutOfProcConnB1/B2/B3/C1/C2`
-- [ ] Security trailer (auth_type, auth_level, auth_pad_length, auth_context_id, auth_value)
-- [ ] Fragmented request/response 재조립 (`PFC_FIRST_FRAG`/`PFC_LAST_FRAG`)
-- [ ] 테스트: 각 PDU roundtrip + 실제 Wireshark 캡쳐 벡터 (가능 범위 내)
+- [x] 공통 헤더 (`rpc_vers=5`, `rpc_vers_minor=0`, `PTYPE`, `pfc_flags`, `drep`, `frag_length`, `auth_length`, `call_id`)
+- [x] `BIND` (0x0B) — context element 리스트, 추상/전송 구문 UUID+버전, security trailer
+- [x] `BIND_ACK` (0x0C) — 서버 assoc group ID, 결과 리스트, 보조 주소
+- [x] `BIND_NAK` (0x0D) — 거절 이유
+- [x] `ALTER_CONTEXT` (0x0E) / `ALTER_CONTEXT_RESP` (0x0F) — shared wire layout with BIND/BIND_ACK
+- [x] `AUTH3` (0x10) — NTLM 3-step 완료
+- [x] `REQUEST` (0x00) — opnum + stub data (+ object UUID if flag)
+- [x] `RESPONSE` (0x02) — stub data + alloc hint
+- [x] `FAULT` (0x03) — status code (nca_s_*)
+- [x] `SHUTDOWN` (0x11), `CO_CANCEL` (0x12), `ORPHANED` (0x13) — PTYPE constants defined (bodies are empty)
+- [x] `RTS` (0x14) — RPC-over-HTTP 플로우 제어 (MS-RPCH §2.2.3.5)
+  - [x] RTS 커맨드: `ReceiveWindowSize`, `FlowControlAck`, `ConnectionTimeout`, `Cookie`, `ChannelLifetime`, `ClientKeepalive`, `Version`, `Empty`, `Padding`, `NegativeANCE`, `ANCE`, `ClientAddress`, `AssociationGroupId`, `Destination`, `PingTrafficSentNotify` (15/15)
+  - [x] RTS 플로우: `conn_a1` / `conn_b1` 빌더 (CONN/A2/B2/C1은 서버사이드 — 구현 불필요). B3 흡수는 핸드셰이크 상태머신에서 처리.
+- [x] Security trailer (auth_type, auth_level, auth_pad_length, auth_context_id, auth_value)
+- [ ] Fragmented request/response 재조립 (`PFC_FIRST_FRAG`/`PFC_LAST_FRAG`) — TsProxy REQUEST는 모두 single-fragment이라 미구현. SetupReceivePipe RESPONSE 스트림은 `RpchGatewayChannel`이 PFC flag를 직접 파싱해서 처리.
+- [x] 테스트: 80 unit tests covering 각 PDU roundtrip, 필드 경계, FlowControlAck 정확한 바이트 매치
 
-*3. RPC-over-HTTP v2 Tunnel (MS-RPCH §3.2)* — `justrdp-rpch::http`
+*3. RPC-over-HTTP v2 Tunnel (MS-RPCH §3.2)* — `justrdp-rpch::{http, tunnel, blocking}`
 
-- [ ] HTTP 메서드 `RPC_IN_DATA` / `RPC_OUT_DATA` (커스텀 verb)
-- [ ] IN 채널 HTTP 요청: `Content-Length: 1073741824` (가짜 large body)
-- [ ] OUT 채널 HTTP 요청: `Content-Length: 76` (CONN/A1 RTS 길이)
-- [ ] 채널별 NTLM 401 재시도 루프 (기존 `justrdp-gateway::auth` 재사용)
-- [ ] Virtual connection cookie (GUID), connection cookie (GUID), association group ID (GUID)
-- [ ] **OUT 채널 핸드셰이크**: CONN/A1 (클라→서버, Version+VC Cookie+Receive Window) → CONN/A2 (미사용) → CONN/A3 (서버→클라, ConnectionTimeout)
-- [ ] **IN 채널 핸드셰이크**: CONN/B1 (Version+VC Cookie+INChannelCookie+ChannelLifetime+ClientKeepalive+AssociationGroupId) → CONN/B2 (미사용) → CONN/B3 (서버→클라, ReceiveWindowSize)
-- [ ] **Proxy 핸드셰이크**: CONN/C1 (Version+ReceiveWindowSize+ConnectionTimeout) → CONN/C2 (Version+ReceiveWindowSize+ConnectionTimeout)
-- [ ] Flow control: `FlowControlAck` RTS 송수신, `DestinationOfFlow` 추적
-- [ ] KeepAlive 타이머 (클라→서버 ClientKeepalive 간격마다 RTS 전송)
-- [ ] Channel recycling (OUT 채널 ChannelLifetime 임계점 도달 시 A4/A5/A6/A10 reclaim)
-- [ ] `RpchTunnel<I: Read+Write, O: Read+Write>` struct — IN/OUT 듀얼 소켓 래퍼
-- [ ] std Read/Write adapter: IN 채널로 send, OUT 채널에서 recv
+- [x] HTTP 메서드 `RPC_IN_DATA` / `RPC_OUT_DATA` (커스텀 verb)
+- [x] IN 채널 HTTP 요청: `Content-Length: 1073741824` (가짜 large body)
+- [x] OUT 채널 HTTP 요청: `Content-Length: 76` (CONN/A1 RTS 길이)
+- [x] 채널별 NTLM 401 재시도 루프 (`justrdp-blocking::gateway::authenticate_rpch_channel`)
+- [x] Virtual connection cookie (GUID), IN/OUT channel cookies (GUID), association group ID (GUID) — 모두 `make_rpch_tunnel_config`에서 UUIDv4로 생성
+- [x] **OUT 채널 핸드셰이크**: 클라 CONN/A1 → 서버 CONN/A3
+- [x] **IN 채널 핸드셰이크**: 클라 CONN/B1 (B3는 서버사이드 흡수)
+- [x] **Proxy 핸드셰이크**: 서버 CONN/C2 수신
+- [x] Flow control: `FlowControlAck` RTS 송수신 (50% 창 소진 시 auto emit)
+- [ ] KeepAlive 타이머 (클라→서버 ClientKeepalive 간격마다 RTS 전송) — 미구현. 단일 RDP 세션에서는 gateway 기본 타임아웃으로 충분.
+- [ ] Channel recycling (OUT 채널 ChannelLifetime 임계점 도달 시 A4/A5/A6/A10 reclaim) — 미구현. IN 채널 1 GiB cap이 한 세션 범위에서 충분.
+- [x] `RpchTunnel<I: Read+Write, O: Read+Write>` struct — IN/OUT 듀얼 소켓 래퍼
+- [x] std Read/Write adapter: `RpchGatewayChannel` (IN 채널로 SendToServer, OUT 채널에서 SetupReceivePipe 스트림)
 
-*4. TsProxy IDL (MS-TSGU §3.1.4)* — `justrdp-gateway::rpch::tsproxy`
+*4. TsProxy IDL (MS-TSGU §3.1.4)* — `justrdp-gateway::rpch`
 
-- [ ] 인터페이스 UUID: `44e265dd-7daf-42cd-8560-3cdb6e7a2729`, version 1.3
-- [ ] 전송 구문: NDR 2.0 `8a885d04-1ceb-11c9-9fe8-08002b104860` v2.0
-- [ ] 구조체 NDR 마셜러:
-  - [ ] `TSG_PACKET_HEADER` (ComponentId + PacketId)
-  - [ ] `TSG_PACKET` (union: Header/VersionCaps/Quarantine/Request/Response/Capabilities/MsgRequest/MsgResponse/Auth/ReAuth)
-  - [ ] `TSG_PACKET_VERSION_CAPS` (major/minor version + capabilities array + quarantine capable)
-  - [ ] `TSG_PACKET_CAPABILITIES_RESPONSE`
-  - [ ] `TSG_CAPABILITIES_1` (capabilities bit flags: NAP/Idle/Reauth/Resource authorization/Consent)
-  - [ ] `TSG_PACKET_AUTH` (NAP + cookie)
-  - [ ] `TSG_PACKET_MSG_REQUEST/RESPONSE` (consent 메시지)
-  - [ ] `TSG_PACKET_QUARANTINE_ENC_RESPONSE`
-  - [ ] `TSENDPOINTINFO` (resource name array + num resources + alternate resources + port + protocol)
-- [ ] 메서드:
-  - [ ] `TsProxyCreateTunnel` (opnum 1) → `TsgInitialPacket` + `TsgTunnelContext` 반환
-  - [ ] `TsProxyAuthorizeTunnel` (opnum 2) → AUTH 패킷으로 인가, `AuthPacket` 반환
-  - [ ] `TsProxyMakeTunnelCall` (opnum 3) → REAUTH/CONSENT 메시지용
-  - [ ] `TsProxyCreateChannel` (opnum 4) → `TsgChannelContext` 반환, `TSENDPOINTINFO` 전달
-  - [ ] `TsProxyCloseChannel` (opnum 5) → 채널 컨텍스트 해제
-  - [ ] `TsProxyCloseTunnel` (opnum 6) → 터널 컨텍스트 해제
-  - [ ] `TsProxySetupReceivePipe` (opnum 7) → pipe 데이터 스트림 수신 시작 (OUT 방향)
-  - [ ] `TsProxySendToServer` (opnum 8) → raw byte 전송 (IN 방향)
-- [ ] `TsProxyClient` — 위 메서드들을 `RpchTunnel` 위에서 호출하는 high-level 클라이언트
-- [ ] 에러 처리: nca_s_op_rng_error / E_PROXY_* HRESULT 매핑
+- [x] 인터페이스 UUID: `44e265dd-7daf-42cd-8560-3cdb6e7a2729`, version 1.3
+- [x] 전송 구문: NDR 2.0 `8a885d04-1ceb-11c9-9fe8-08002b104860` v2.0
+- [x] 구조체 NDR 마셜러:
+  - [x] `TSG_PACKET_HEADER` (ComponentId + PacketId)
+  - [x] `TSG_PACKET` (union: VersionCaps / QuarRequest / Response / QuarEncResponse / CapsResponse / Auth — min viable path arms). Header/MsgRequest/MsgResponse/ReAuth 미구현.
+  - [x] `TSG_PACKET_VERSION_CAPS`
+  - [x] `TSG_PACKET_CAPABILITIES_RESPONSE`
+  - [x] `TSG_CAPABILITIES_1` (NAP 계열 5개 bit flag)
+  - [x] `TSG_PACKET_AUTH` (VersionCaps + PAA cookie)
+  - [ ] `TSG_PACKET_MSG_REQUEST/RESPONSE` — `MakeTunnelCall` 경로 descoped
+  - [x] `TSG_PACKET_QUARANTINE_ENC_RESPONSE`
+  - [x] `TSENDPOINTINFO` (resource name array + alternate names + port+protocol bit-packed)
+- [x] 메서드 (opnums는 MS-TSGU Appendix A 기준, 0/5는 NotUsedOnWire):
+  - [x] `TsProxyCreateTunnel` (opnum 1)
+  - [x] `TsProxyAuthorizeTunnel` (opnum 2)
+  - [ ] `TsProxyMakeTunnelCall` (opnum 3) — messaging caps 협상 시에만 필요, 현 MVP 스킵
+  - [x] `TsProxyCreateChannel` (opnum 4)
+  - [x] `TsProxyCloseChannel` (opnum 6)
+  - [x] `TsProxyCloseTunnel` (opnum 7)
+  - [x] `TsProxySetupReceivePipe` (opnum 8) — NDR 우회 20-byte context handle
+  - [x] `TsProxySendToServer` (opnum 9) — NDR 우회 Generic Send Data Message Packet (big-endian length 필드)
+- [x] `TsProxyClient` — state machine (Start→Connected→Authorized→ChannelCreated→PipeCreated→Closing→End)
+- [x] 에러 처리: `E_PROXY_*` HRESULT + `HRESULT_CODE` DWORD 경로 + Win32 codes + `name_of()` 헬퍼
 
 *5. PAA Cookie 인증 (MS-TSGU §2.2.10)* — `justrdp-gateway::rpch::paa`
 
-- [ ] `CookieAuthData` 구조체 (cookie type + cookie data)
-- [ ] CredSSP-based PAA cookie (기존 `justrdp-connector::credssp` 재사용)
-- [ ] Smart card PAA cookie (P/N: 현 단계 스킵 — Phase 8 Kerberos 이후)
-- [ ] `TsProxyAuthorizeTunnel`에 cookie 전달
+- [x] `CookieAuthData` 구조체 (`PaaCookie` — opaque bytes wrapper)
+- [ ] CredSSP-based PAA cookie 자동 생성 (기존 `justrdp-connector::credssp` 재사용) — 미구현. 호출자가 CredSSP 출력 블롭을 직접 공급.
+- [ ] Smart card PAA cookie — intentionally skipped (Phase 8 Kerberos 이후)
+- [x] `TsProxyCreateTunnel`에서 cookie 전달 (TSG_PACKET_AUTH arm). 참고: 원래 roadmap에 "AuthorizeTunnel"이라 적혀있었지만 실제 스펙은 CreateTunnel에 PAA cookie가 들어감.
 
 *6. blocking Wire-up* — `justrdp-blocking::gateway`
 
-- [ ] `RpchGatewayConfig` (gateway addr + TLS + creds + target host/port + connection timeouts)
-- [ ] `connect_via_gateway_rpch_with_upgrader<U: TlsUpgrader>()`
-  - [ ] IN/OUT TCP 2개 소켓 오픈 + TLS 업그레이드 각각
-  - [ ] 채널별 NTLM 401 재시도
-  - [ ] CONN/A/B/C 핸드셰이크 완료 대기
-  - [ ] DCE/RPC Bind (TsProxy interface) + NTLM SSPI 컨텍스트
-  - [ ] `TsProxyCreateTunnel` → `TsProxyAuthorizeTunnel` (PAA) → `TsProxyMakeTunnelCall` (옵션) → `TsProxyCreateChannel`
-  - [ ] `TsProxySetupReceivePipe` + `TsProxySendToServer`를 std Read/Write로 래핑
-  - [ ] `Transport::Boxed`로 RDP 핸드셰이크 단계에 주입
+- [x] `RpchGatewayConfig` (gateway addr + creds + target host/port + connection timeouts + optional PAA)
+- [x] `connect_via_gateway_rpch_with_upgrader<U: TlsUpgrader>()`
+  - [x] IN/OUT TCP 2개 소켓 오픈 + TLS 업그레이드 각각
+  - [x] 채널별 NTLM 401 재시도
+  - [x] CONN/A/B/C 핸드셰이크 완료 대기 (`RpchTunnel::connect`)
+  - [x] DCE/RPC Bind (TsProxy interface, anonymous). RPC-level NTLM SSPI는 현재 미구현 — 터널 레벨 인증은 PAA cookie가 담당.
+  - [x] `TsProxyCreateTunnel` → `TsProxyAuthorizeTunnel` → `TsProxyCreateChannel` (MakeTunnelCall 스킵)
+  - [x] `TsProxySetupReceivePipe` + `TsProxySendToServer`를 std Read/Write로 래핑 (`RpchGatewayChannel`)
+  - [x] `Transport::Boxed`로 RDP 핸드셰이크 단계에 주입 (기존 `run_handshake_over_tunnel` 재사용)
 
 *7. 통합 테스트*
 
-- [ ] Mock RPC-over-HTTP 게이트웨이 (IN/OUT 듀얼 소켓 에뮬레이션)
-- [ ] CONN/A/B/C 핸드셰이크 roundtrip
-- [ ] Bind + TsProxyCreateTunnel + AuthorizeTunnel + CreateChannel 풀 플로우
-- [ ] SendToServer/SetupReceivePipe 데이터 에코 테스트
-- [ ] 채널 리사이클 테스트 (ChannelLifetime 만료)
-- [ ] 실서버 integration test (Windows Server 2008 R2 게이트웨이 — 환경 준비되면)
+- [x] Mock RPC-over-HTTP 게이트웨이 (IN/OUT 듀얼 소켓 에뮬레이션) — `tests/mock_rpch_gateway.rs`
+- [x] CONN/A/B/C 핸드셰이크 roundtrip
+- [x] Bind + TsProxyCreateTunnel + AuthorizeTunnel + CreateChannel 풀 플로우
+- [x] SendToServer/SetupReceivePipe 데이터 에코 테스트 (클라 write "HELLO" → 서버 수신, 서버 push "SERVER01" → 클라 read)
+- [ ] 채널 리사이클 테스트 (ChannelLifetime 만료) — 채널 리사이클 자체가 미구현이므로 테스트도 skip
+- [ ] 실서버 integration test (Windows Server 2008 R2 게이트웨이) — 테스트 환경 준비되면 수행
 
 **WebSocket Transport:**
 
