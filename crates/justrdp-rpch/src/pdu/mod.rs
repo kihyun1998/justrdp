@@ -59,8 +59,8 @@ pub use reassembly::{
     ReassembledPdu, ReassemblyBuffer, ReassemblyError, DEFAULT_REASSEMBLY_CAP,
 };
 pub use rts::{
-    conn_a1, conn_b1, RtsCommand, RtsPdu, RTS_FLAG_ECHO, RTS_FLAG_EOF, RTS_FLAG_IN_CHANNEL,
-    RTS_FLAG_NONE, RTS_FLAG_OTHER_CMD, RTS_FLAG_OUT_CHANNEL, RTS_FLAG_PING,
+    conn_a1, conn_b1, recycle_conn_b3, RtsCommand, RtsPdu, RTS_FLAG_ECHO, RTS_FLAG_EOF,
+    RTS_FLAG_IN_CHANNEL, RTS_FLAG_NONE, RTS_FLAG_OTHER_CMD, RTS_FLAG_OUT_CHANNEL, RTS_FLAG_PING,
     RTS_FLAG_RECYCLE_CHANNEL, RTS_PTYPE,
 };
 pub use uuid::RpcUuid;

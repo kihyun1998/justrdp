@@ -21,7 +21,7 @@
 extern crate std;
 
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -104,6 +104,14 @@ pub struct RpchTunnel<I: Read + Write, O: Read + Write> {
     state: RpchTunnelState,
     /// Small scratch buffer reused across `recv_pdu` calls.
     scratch: Vec<u8>,
+    /// Cumulative bytes sent via [`send_pdu`] on the current IN
+    /// stream, used by [`needs_recycle`] to detect when the
+    /// `Content-Length` ceiling on that stream is approaching.
+    /// Reset on [`recycle_in_channel`].
+    bytes_sent: Arc<AtomicU64>,
+    /// When `Some`, [`needs_recycle`] returns `true` after the
+    /// counter crosses this many bytes. `None` disables recycling.
+    recycle_threshold: Option<u64>,
 }
 
 impl<I: Read + Write, O: Read + Write> RpchTunnel<I, O> {
@@ -157,7 +165,38 @@ impl<I: Read + Write, O: Read + Write> RpchTunnel<I, O> {
             outbound,
             state,
             scratch,
+            bytes_sent: Arc::new(AtomicU64::new(0)),
+            recycle_threshold: None,
         })
+    }
+
+    /// Configure the IN channel recycling threshold. Once the
+    /// tunnel has written more than `bytes` to the current IN
+    /// stream via [`send_pdu`], [`needs_recycle`] starts returning
+    /// `true` and callers are expected to follow up with
+    /// [`recycle_in_channel`].
+    ///
+    /// A common choice is `channel_lifetime * 3 / 4` — three-
+    /// quarters of the IN stream's Content-Length cap leaves
+    /// comfortable headroom for the handshake traffic of the
+    /// recycling exchange itself.
+    pub fn set_recycle_threshold(&mut self, bytes: u64) {
+        self.recycle_threshold = Some(bytes);
+    }
+
+    /// Cumulative bytes written to the current IN stream.
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(Ordering::SeqCst)
+    }
+
+    /// Returns `true` once the counter has crossed the recycle
+    /// threshold set by [`set_recycle_threshold`]. Always `false`
+    /// when no threshold is configured.
+    pub fn needs_recycle(&self) -> bool {
+        match self.recycle_threshold {
+            None => false,
+            Some(t) => self.bytes_sent() >= t,
+        }
     }
 
     /// Write one complete DCE/RPC PDU to the IN channel body.
@@ -165,6 +204,55 @@ impl<I: Read + Write, O: Read + Write> RpchTunnel<I, O> {
         let mut g = self.inbound.lock().expect("rpch inbound mutex poisoned");
         g.write_all(pdu)?;
         g.flush()?;
+        drop(g);
+        self.bytes_sent
+            .fetch_add(pdu.len() as u64, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Replace the IN stream with a fresh one after the caller has
+    /// negotiated a new `RPC_IN_DATA` channel (new TCP + TLS +
+    /// NTLM 401). MS-RPCH §3.2.2.3.3: the client emits an
+    /// `OutOfProcConnB3` (aka [`recycle_conn_b3`]) on the new IN
+    /// stream **before** switching so the server can migrate the
+    /// virtual connection, then closes the old stream.
+    ///
+    /// Returns `Err` with the new stream on failure so the caller
+    /// can decide whether to retry or bail out.
+    pub fn recycle_in_channel(
+        &mut self,
+        mut new_inbound: I,
+        new_in_channel_cookie: crate::pdu::uuid::RpcUuid,
+    ) -> Result<(), TunnelIoError> {
+        // Emit the recycle-B3 handshake on the new stream.
+        let cfg = self.state.config_snapshot();
+        let recycle = crate::pdu::recycle_conn_b3(
+            cfg.virtual_connection_cookie,
+            new_in_channel_cookie,
+            cfg.in_channel_cookie,
+            cfg.channel_lifetime,
+            cfg.client_keepalive,
+            cfg.association_group_id,
+        );
+        let mut buf = Vec::with_capacity(recycle.size());
+        buf.resize(recycle.size(), 0);
+        let mut w = WriteCursor::new(&mut buf);
+        recycle
+            .encode(&mut w)
+            .expect("recycle B3 fits in its computed buffer");
+        new_inbound.write_all(&buf)?;
+        new_inbound.flush()?;
+
+        // Swap the stream. The old stream is dropped here; in
+        // practice the caller has already closed the old HTTP
+        // connection at the TLS layer, so this is just a final GC.
+        let mut guard = self.inbound.lock().expect("rpch inbound mutex poisoned");
+        *guard = new_inbound;
+        drop(guard);
+        // Record that the new stream's INChannelCookie is in use
+        // and start the byte counter over.
+        self.state.set_in_channel_cookie(new_in_channel_cookie);
+        self.bytes_sent.store(0, Ordering::SeqCst);
         Ok(())
     }
 
@@ -662,6 +750,111 @@ mod tests {
             stop.elapsed() < Duration::from_millis(500),
             "keepalive thread took too long to stop"
         );
+    }
+
+    // ---- channel recycling --------------------------------------------
+
+    #[test]
+    fn bytes_sent_starts_at_zero_after_connect() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&synthetic_a3());
+        out.extend_from_slice(&synthetic_c2());
+        let inbound = FakeChannel::new(Vec::new());
+        let outbound = FakeChannel::new(out);
+        let tunnel = RpchTunnel::connect(inbound, outbound, test_config()).unwrap();
+        assert_eq!(tunnel.bytes_sent(), 0);
+        assert!(!tunnel.needs_recycle(), "no threshold set → never recycles");
+    }
+
+    #[test]
+    fn send_pdu_increments_bytes_sent_counter() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&synthetic_a3());
+        out.extend_from_slice(&synthetic_c2());
+        let inbound = FakeChannel::new(Vec::new());
+        let outbound = FakeChannel::new(out);
+        let mut tunnel = RpchTunnel::connect(inbound, outbound, test_config()).unwrap();
+
+        let payload = [0xAAu8; 32];
+        tunnel.send_pdu(&payload).unwrap();
+        assert_eq!(tunnel.bytes_sent(), 32);
+        tunnel.send_pdu(&payload).unwrap();
+        assert_eq!(tunnel.bytes_sent(), 64);
+    }
+
+    #[test]
+    fn needs_recycle_fires_once_threshold_crossed() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&synthetic_a3());
+        out.extend_from_slice(&synthetic_c2());
+        let inbound = FakeChannel::new(Vec::new());
+        let outbound = FakeChannel::new(out);
+        let mut tunnel = RpchTunnel::connect(inbound, outbound, test_config()).unwrap();
+
+        tunnel.set_recycle_threshold(100);
+        assert!(!tunnel.needs_recycle());
+        tunnel.send_pdu(&[0xAAu8; 50]).unwrap();
+        assert!(!tunnel.needs_recycle());
+        tunnel.send_pdu(&[0xBBu8; 60]).unwrap();
+        assert!(tunnel.needs_recycle(), "crossed 100 bytes");
+    }
+
+    #[test]
+    fn recycle_in_channel_swaps_stream_and_resets_counter() {
+        use crate::pdu::uuid::RpcUuid;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&synthetic_a3());
+        out.extend_from_slice(&synthetic_c2());
+        let inbound = FakeChannel::new(Vec::new());
+        let outbound = FakeChannel::new(out);
+        let mut tunnel = RpchTunnel::connect(inbound, outbound, test_config()).unwrap();
+
+        // Push some data through the original IN stream.
+        tunnel.send_pdu(&[0u8; 200]).unwrap();
+        assert_eq!(tunnel.bytes_sent(), 200);
+        let original_len = tunnel.inbound.lock().unwrap().write_buf.len();
+        assert!(original_len >= 200);
+
+        // Swap in a fresh stream.
+        let new_inbound = FakeChannel::new(Vec::new());
+        let new_cookie = RpcUuid::parse("55555555-5555-5555-5555-555555555555").unwrap();
+        tunnel.recycle_in_channel(new_inbound, new_cookie).unwrap();
+
+        // Counter reset, and the new stream already holds the
+        // recycle-B3 PDU the recycle code emitted.
+        assert_eq!(tunnel.bytes_sent(), 0);
+        let new_in_buf = tunnel.inbound.lock().unwrap().write_buf.clone();
+        // First PDU on the new stream must be an RTS (PTYPE=0x14)
+        // with both RECYCLE_CHANNEL and IN_CHANNEL flags.
+        assert_eq!(new_in_buf[2], crate::pdu::RTS_PTYPE);
+        let flags = u16::from_le_bytes([new_in_buf[16], new_in_buf[17]]);
+        assert_eq!(
+            flags & (crate::pdu::RTS_FLAG_RECYCLE_CHANNEL | crate::pdu::RTS_FLAG_IN_CHANNEL),
+            crate::pdu::RTS_FLAG_RECYCLE_CHANNEL | crate::pdu::RTS_FLAG_IN_CHANNEL
+        );
+    }
+
+    #[test]
+    fn post_recycle_send_pdu_goes_to_new_stream() {
+        use crate::pdu::uuid::RpcUuid;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&synthetic_a3());
+        out.extend_from_slice(&synthetic_c2());
+        let inbound = FakeChannel::new(Vec::new());
+        let outbound = FakeChannel::new(out);
+        let mut tunnel = RpchTunnel::connect(inbound, outbound, test_config()).unwrap();
+
+        let new_inbound = FakeChannel::new(Vec::new());
+        let new_cookie = RpcUuid::parse("66666666-6666-6666-6666-666666666666").unwrap();
+        tunnel.recycle_in_channel(new_inbound, new_cookie).unwrap();
+
+        let before_send = tunnel.inbound.lock().unwrap().write_buf.len();
+        tunnel.send_pdu(&[0xAB; 16]).unwrap();
+        let after_send = tunnel.inbound.lock().unwrap().write_buf.len();
+        assert_eq!(after_send - before_send, 16);
+        assert_eq!(tunnel.bytes_sent(), 16, "post-recycle counter is fresh");
     }
 
     #[test]

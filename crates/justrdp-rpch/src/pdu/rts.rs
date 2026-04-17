@@ -411,6 +411,37 @@ pub fn conn_b1(
     }
 }
 
+/// Build the client → server IN-channel recycling PDU the client
+/// sends on the **new** IN channel as the first PDU after HTTP
+/// 200 OK, to migrate the virtual connection from the old
+/// IN channel (MS-RPCH §3.2.2.3.3 "OutOfProcConnB3").
+///
+/// Carries both `RTS_FLAG_RECYCLE_CHANNEL` and `RTS_FLAG_IN_CHANNEL`
+/// and names the old INChannelCookie so the server can match the
+/// recycle up with the existing virtual connection.
+pub fn recycle_conn_b3(
+    virtual_connection_cookie: RpcUuid,
+    new_in_channel_cookie: RpcUuid,
+    old_in_channel_cookie: RpcUuid,
+    channel_lifetime: u32,
+    client_keepalive: u32,
+    association_group_id: RpcUuid,
+) -> RtsPdu {
+    RtsPdu {
+        pfc_flags: PFC_FIRST_FRAG | PFC_LAST_FRAG,
+        flags: RTS_FLAG_RECYCLE_CHANNEL | RTS_FLAG_IN_CHANNEL,
+        commands: Vec::from([
+            RtsCommand::Version(1),
+            RtsCommand::Cookie(virtual_connection_cookie),
+            RtsCommand::Cookie(new_in_channel_cookie),
+            RtsCommand::Cookie(old_in_channel_cookie),
+            RtsCommand::ChannelLifetime(channel_lifetime),
+            RtsCommand::ClientKeepalive(client_keepalive),
+            RtsCommand::AssociationGroupId(association_group_id),
+        ]),
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================

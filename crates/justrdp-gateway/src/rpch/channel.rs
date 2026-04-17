@@ -298,6 +298,33 @@ where
         &self.client
     }
 
+    /// Configure the byte threshold at which the tunnel signals
+    /// that its IN stream needs to be replaced (MS-RPCH §3.2.2.3.3).
+    /// A common choice is 75% of `channel_lifetime`.
+    pub fn set_recycle_threshold(&mut self, bytes: u64) {
+        self.tunnel.set_recycle_threshold(bytes);
+    }
+
+    /// Whether the configured recycle threshold has been crossed
+    /// on the current IN stream.
+    pub fn needs_in_channel_recycle(&self) -> bool {
+        self.tunnel.needs_recycle()
+    }
+
+    /// Swap the IN stream for a fresh one the caller has already
+    /// negotiated (new TCP + TLS + NTLM + HTTP 200). Emits the
+    /// required `OutOfProcConnB3` RTS handshake on the new stream
+    /// before switching — see [`justrdp_rpch::RpchTunnel::recycle_in_channel`].
+    pub fn recycle_in_channel(
+        &mut self,
+        new_inbound: I,
+        new_in_channel_cookie: justrdp_rpch::pdu::uuid::RpcUuid,
+    ) -> Result<(), ChannelError> {
+        self.tunnel
+            .recycle_in_channel(new_inbound, new_in_channel_cookie)
+            .map_err(io_error_from_tunnel)
+    }
+
     /// Read PDUs from the OUT channel until either a RESPONSE
     /// carrying the SendToServer call_id arrives (returning it as
     /// `Ok(Some(dword))`) or, if `send_call_id` is `None`, until a

@@ -319,6 +319,27 @@ impl RpchTunnelState {
     pub fn receive_window_size(&self) -> u32 {
         self.cfg.receive_window_size
     }
+
+    /// Keepalive interval in milliseconds, from the configured
+    /// `client_keepalive` field.
+    pub fn client_keepalive_ms(&self) -> u32 {
+        self.cfg.client_keepalive
+    }
+
+    /// Clone the configured [`RpchTunnelConfig`] — used by the
+    /// blocking adapter's channel-recycle path to read the current
+    /// cookie set without granting mutable access to the state.
+    pub fn config_snapshot(&self) -> RpchTunnelConfig {
+        self.cfg.clone()
+    }
+
+    /// Update the IN channel cookie after the blocking adapter
+    /// successfully recycled the underlying IN stream. The new
+    /// cookie becomes the one advertised in any future
+    /// `recycle_conn_b3` PDU we emit.
+    pub fn set_in_channel_cookie(&mut self, cookie: crate::pdu::uuid::RpcUuid) {
+        self.cfg.in_channel_cookie = cookie;
+    }
 }
 
 // =============================================================================
