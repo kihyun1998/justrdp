@@ -1,0 +1,22 @@
+[package]
+name = "justrdp-rpch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MS-RPCE / MS-RPCH / NDR 2.0 marshaling for JustRDP's RD Gateway RPC-over-HTTP legacy transport"
+keywords = ["rdp", "rpc", "ndr", "dcerpc", "rpch"]
+categories = ["no-std", "encoding"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc"]
+std = ["alloc", "justrdp-core/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+
+[dev-dependencies]
+justrdp-core = { workspace = true, features = ["alloc"] }

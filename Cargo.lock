@@ -602,6 +602,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-rpch"
+version = "0.1.0"
+dependencies = [
+ "justrdp-core",
+]
+
+[[package]]
 name = "justrdp-session"
 version = "0.1.0"
 dependencies = [
