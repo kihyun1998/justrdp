@@ -408,6 +408,7 @@ dependencies = [
 name = "justrdp-gateway"
 version = "0.1.0"
 dependencies = [
+ "justrdp-connector",
  "justrdp-core",
  "justrdp-pdu",
  "justrdp-rpch",
