@@ -318,6 +318,7 @@ dependencies = [
  "justrdp-input",
  "justrdp-pdu",
  "justrdp-rdpfile",
+ "justrdp-rpch",
  "justrdp-session",
  "justrdp-svc",
  "justrdp-tls",
@@ -409,6 +410,7 @@ version = "0.1.0"
 dependencies = [
  "justrdp-core",
  "justrdp-pdu",
+ "justrdp-rpch",
 ]
 
 [[package]]

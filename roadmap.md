@@ -2007,7 +2007,7 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [x] Mock gateway end-to-end integration test (401 retry + handshake + data)
 - [x] `justrdp-blocking::connect_via_gateway_with_upgrader` — 실소켓/TLS를 붙인 high-level API
 
-**RPC-over-HTTP (레거시):**
+**RPC-over-HTTP (레거시):** ✅ 전체 구현 완료 (C1-C6)
 
 > **적용 범위**: Windows Server 2008 R2 / 2012 게이트웨이 (HTTP/WebSocket Transport 미지원 환경)
 > **의존성 스택**: NDR20 → DCE/RPC → RPC-over-HTTP v2 → TsProxy IDL → PAA → blocking wire-up
