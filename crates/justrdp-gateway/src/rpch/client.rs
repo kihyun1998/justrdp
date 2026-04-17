@@ -36,14 +36,15 @@ use justrdp_rpch::pdu::{
 
 use super::methods::{
     build_authorize_tunnel_stub, build_close_channel_stub, build_close_tunnel_stub,
-    build_create_channel_stub, build_create_tunnel_stub, build_send_to_server_message,
-    build_setup_receive_pipe_message, parse_authorize_tunnel_response,
-    parse_close_channel_response, parse_close_tunnel_response, parse_create_channel_response,
-    parse_create_tunnel_response, AuthorizeTunnelResponse, CreateChannelResponse,
-    CreateTunnelResponse, SendToServerError, OPNUM_TS_PROXY_AUTHORIZE_TUNNEL,
-    OPNUM_TS_PROXY_CLOSE_CHANNEL, OPNUM_TS_PROXY_CLOSE_TUNNEL, OPNUM_TS_PROXY_CREATE_CHANNEL,
-    OPNUM_TS_PROXY_CREATE_TUNNEL, OPNUM_TS_PROXY_SEND_TO_SERVER,
-    OPNUM_TS_PROXY_SETUP_RECEIVE_PIPE,
+    build_create_channel_stub, build_create_tunnel_stub, build_make_tunnel_call_stub,
+    build_send_to_server_message, build_setup_receive_pipe_message,
+    parse_authorize_tunnel_response, parse_close_channel_response, parse_close_tunnel_response,
+    parse_create_channel_response, parse_create_tunnel_response, parse_make_tunnel_call_response,
+    AuthorizeTunnelResponse, CreateChannelResponse, CreateTunnelResponse, MakeTunnelCallResponse,
+    SendToServerError, OPNUM_TS_PROXY_AUTHORIZE_TUNNEL, OPNUM_TS_PROXY_CLOSE_CHANNEL,
+    OPNUM_TS_PROXY_CLOSE_TUNNEL, OPNUM_TS_PROXY_CREATE_CHANNEL, OPNUM_TS_PROXY_CREATE_TUNNEL,
+    OPNUM_TS_PROXY_MAKE_TUNNEL_CALL, OPNUM_TS_PROXY_SEND_TO_SERVER,
+    OPNUM_TS_PROXY_SETUP_RECEIVE_PIPE, TSG_TUNNEL_CALL_ASYNC_MSG_REQUEST,
 };
 use super::types::{ContextHandle, TsEndpointInfo, TsgPacket};
 
@@ -311,6 +312,62 @@ impl TsProxyClient {
             });
         }
         self.state = TsProxyState::Authorized;
+        Ok(resp)
+    }
+
+    // ---- TsProxyMakeTunnelCall (opnum 3) -------------------------------
+
+    /// Build a `TsProxyMakeTunnelCall` REQUEST PDU. Legal from any
+    /// state where the tunnel handle is held (typically used from
+    /// `Authorized` onwards as a long-poll while channel / data
+    /// traffic proceeds in parallel). The caller supplies both the
+    /// `procId` — one of
+    /// [`TSG_TUNNEL_CALL_ASYNC_MSG_REQUEST`][super::methods::TSG_TUNNEL_CALL_ASYNC_MSG_REQUEST]
+    /// or
+    /// [`TSG_TUNNEL_CANCEL_ASYNC_MSG_REQUEST`][super::methods::TSG_TUNNEL_CANCEL_ASYNC_MSG_REQUEST]
+    /// — and the `TSG_PACKET` payload (usually `TsgPacket::MsgRequest`).
+    pub fn build_make_tunnel_call(
+        &mut self,
+        proc_id: u32,
+        packet: &TsgPacket,
+    ) -> Result<Vec<u8>, TsProxyClientError> {
+        let handle = self
+            .tunnel_context
+            .ok_or(TsProxyClientError::WrongState {
+                wanted: TsProxyState::Connected,
+                actual: self.state,
+            })?;
+        let stub = build_make_tunnel_call_stub(&handle, proc_id, packet);
+        Ok(self.wrap_request(OPNUM_TS_PROXY_MAKE_TUNNEL_CALL, stub))
+    }
+
+    /// Convenience wrapper: build a long-poll `TsProxyMakeTunnelCall`
+    /// asking the server for one pending async message.
+    pub fn build_make_tunnel_call_async_msg_request(
+        &mut self,
+    ) -> Result<Vec<u8>, TsProxyClientError> {
+        let pkt = TsgPacket::MsgRequest(super::types::TsgPacketMsgRequest {
+            max_messages_per_batch: 1,
+        });
+        self.build_make_tunnel_call(TSG_TUNNEL_CALL_ASYNC_MSG_REQUEST, &pkt)
+    }
+
+    /// Consume the RESPONSE PDU for `TsProxyMakeTunnelCall`.
+    /// Non-success HRESULTs surface as `ServerError`. Does not
+    /// change the tunnel state — the method is a long-poll and
+    /// may be invoked repeatedly.
+    pub fn on_make_tunnel_call_response(
+        &mut self,
+        pdu_bytes: &[u8],
+    ) -> Result<MakeTunnelCallResponse, TsProxyClientError> {
+        let stub = self.unwrap_response(pdu_bytes)?;
+        let resp = parse_make_tunnel_call_response(&stub)?;
+        if resp.return_value != super::errors::ERROR_SUCCESS {
+            return Err(TsProxyClientError::ServerError {
+                method: "TsProxyMakeTunnelCall",
+                hresult: resp.return_value,
+            });
+        }
         Ok(resp)
     }
 
@@ -697,6 +754,80 @@ mod tests {
         c.on_close_tunnel_response(&wrap_response_pdu(e.into_bytes(), 7))
             .unwrap();
         assert_eq!(c.state(), TsProxyState::End);
+    }
+
+    #[test]
+    fn make_tunnel_call_requires_tunnel_context() {
+        let mut c = TsProxyClient::new();
+        // State=Start → no tunnel handle yet → must error.
+        let err = c.build_make_tunnel_call_async_msg_request().unwrap_err();
+        assert!(matches!(err, TsProxyClientError::WrongState { .. }));
+    }
+
+    #[test]
+    fn make_tunnel_call_uses_opnum_3() {
+        let mut c = TsProxyClient::new();
+        // Drive through CreateTunnel to get into Connected state.
+        let pkt = TsgPacket::VersionCaps(TsgPacketVersionCaps::client_default(0));
+        let _ = c.build_create_tunnel(&pkt).unwrap();
+        let stub = build_response_stub_create_tunnel(sample_handle(), 1);
+        c.on_create_tunnel_response(&wrap_response_pdu(stub, 1))
+            .unwrap();
+
+        let pdu = c.build_make_tunnel_call_async_msg_request().unwrap();
+        // opnum at offset 22..24 of the REQUEST PDU.
+        let opnum = u16::from_le_bytes([pdu[22], pdu[23]]);
+        assert_eq!(opnum, super::super::methods::OPNUM_TS_PROXY_MAKE_TUNNEL_CALL);
+    }
+
+    #[test]
+    fn make_tunnel_call_response_parses_string_message() {
+        use crate::rpch::types::{
+            TsgAsyncMessage, TsgPacketMsgResponse, TsgPacketStringMessage,
+            TSG_ASYNC_MESSAGE_SERVICE_MESSAGE,
+        };
+
+        let mut c = TsProxyClient::new();
+        // Skip state validation by forging the tunnel handle.
+        let pkt = TsgPacket::VersionCaps(TsgPacketVersionCaps::client_default(0));
+        let _ = c.build_create_tunnel(&pkt).unwrap();
+        c.on_create_tunnel_response(&wrap_response_pdu(
+            build_response_stub_create_tunnel(sample_handle(), 1),
+            1,
+        ))
+        .unwrap();
+
+        // Synthesize a MakeTunnelCall RESPONSE stub carrying a
+        // service message.
+        let msg_response = TsgPacketMsgResponse {
+            msg_id: 42,
+            msg_type: TSG_ASYNC_MESSAGE_SERVICE_MESSAGE,
+            is_msg_present: 1,
+            message: Some(TsgAsyncMessage::Service(TsgPacketStringMessage {
+                is_display_mandatory: 1,
+                is_consent_mandatory: 0,
+                msg_buffer: Some(vec![0x0048, 0x0069]), // "Hi"
+            })),
+        };
+        let mut e = NdrEncoder::new();
+        let _ = e.write_unique_pointer(true);
+        TsgPacket::MessagePacket(msg_response.clone()).encode_ndr(&mut e);
+        e.write_u32(ERROR_SUCCESS);
+        let stub = e.into_bytes();
+
+        let resp = c
+            .on_make_tunnel_call_response(&wrap_response_pdu(stub, 2))
+            .unwrap();
+        assert_eq!(resp.return_value, ERROR_SUCCESS);
+        let msg = resp.as_msg_response().expect("expected MessagePacket arm");
+        assert_eq!(msg.msg_id, 42);
+        assert_eq!(msg.is_msg_present, 1);
+        match &msg.message {
+            Some(TsgAsyncMessage::Service(s)) => {
+                assert_eq!(s.msg_buffer.as_deref(), Some(&[0x0048u16, 0x0069][..]));
+            }
+            other => panic!("expected Service message, got {other:?}"),
+        }
     }
 
     #[test]

@@ -157,6 +157,70 @@ pub fn parse_authorize_tunnel_response(stub: &[u8]) -> NdrResult<AuthorizeTunnel
 }
 
 // =============================================================================
+// TsProxyMakeTunnelCall (opnum 3)
+// =============================================================================
+
+/// `procId` values for `TsProxyMakeTunnelCall` (MS-TSGU §3.1.4.3).
+pub const TSG_TUNNEL_CALL_ASYNC_MSG_REQUEST: u32 = 0x0000_0001;
+pub const TSG_TUNNEL_CANCEL_ASYNC_MSG_REQUEST: u32 = 0x0000_0002;
+
+/// Build the stub_data for `TsProxyMakeTunnelCall` asking the
+/// server for any pending consent / service / reauth messages.
+///
+/// `max_messages_per_batch` caps how many messages the server may
+/// bundle in a single response. Windows clients use 1.
+pub fn build_make_tunnel_call_stub(
+    tunnel_context: &ContextHandle,
+    proc_id: u32,
+    tsg_packet: &TsgPacket,
+) -> Vec<u8> {
+    let mut e = NdrEncoder::new();
+    tunnel_context.encode_ndr(&mut e);
+    e.write_u32(proc_id);
+    tsg_packet.encode_ndr(&mut e);
+    e.into_bytes()
+}
+
+/// Fields returned by `TsProxyMakeTunnelCall`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MakeTunnelCallResponse {
+    /// Should be a `TsgPacket::MessagePacket` variant carrying a
+    /// [`TsgPacketMsgResponse`][super::types::TsgPacketMsgResponse].
+    pub tsg_packet_response: TsgPacket,
+    pub return_value: u32,
+}
+
+impl MakeTunnelCallResponse {
+    /// Borrow the inner `TsgPacketMsgResponse` if the server
+    /// returned the expected union arm.
+    pub fn as_msg_response(
+        &self,
+    ) -> Option<&super::types::TsgPacketMsgResponse> {
+        if let TsgPacket::MessagePacket(r) = &self.tsg_packet_response {
+            Some(r)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn parse_make_tunnel_call_response(stub: &[u8]) -> NdrResult<MakeTunnelCallResponse> {
+    let mut d = NdrDecoder::new(stub);
+    let inner_ptr = d.read_unique_pointer("MakeTunnelCallResponse.inner")?;
+    if inner_ptr.is_none() {
+        return Err(NdrError::InvalidData {
+            context: "MakeTunnelCallResponse: NULL TSG_PACKET in [out, ref]*",
+        });
+    }
+    let tsg_packet_response = TsgPacket::decode_ndr(&mut d)?;
+    let return_value = d.read_u32("MakeTunnelCallResponse.return_value")?;
+    Ok(MakeTunnelCallResponse {
+        tsg_packet_response,
+        return_value,
+    })
+}
+
+// =============================================================================
 // TsProxyCreateChannel (opnum 4)
 // =============================================================================
 

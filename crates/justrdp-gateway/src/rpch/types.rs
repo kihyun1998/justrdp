@@ -646,13 +646,290 @@ impl TsgPacketAuth {
 }
 
 // =============================================================================
+// TSG_PACKET_MSG_REQUEST (§2.2.9.2.6)
+// =============================================================================
+
+/// Sent by the client in `TsProxyMakeTunnelCall` when asking the
+/// gateway for any pending async messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TsgPacketMsgRequest {
+    /// Upper bound on how many messages the server may bundle in
+    /// the corresponding response; `1` is the conservative choice
+    /// and what every Windows client ships.
+    pub max_messages_per_batch: u32,
+}
+
+impl TsgPacketMsgRequest {
+    pub fn encode_ndr(&self, e: &mut NdrEncoder) {
+        e.write_u32(self.max_messages_per_batch);
+    }
+
+    pub fn decode_ndr(d: &mut NdrDecoder<'_>) -> NdrResult<Self> {
+        Ok(Self {
+            max_messages_per_batch: d.read_u32("TsgPacketMsgRequest.max_messages_per_batch")?,
+        })
+    }
+}
+
+// =============================================================================
+// TSG_ASYNC_MESSAGE_* + TSG_PACKET_STRING_MESSAGE + REAUTH_MESSAGE
+// (§2.2.9.2.7 body)
+// =============================================================================
+
+/// `msgType` discriminants for the async message union inside
+/// `TsgPacketMsgResponse`.
+pub const TSG_ASYNC_MESSAGE_CONSENT_MESSAGE: u32 = 0x0000_0001;
+pub const TSG_ASYNC_MESSAGE_SERVICE_MESSAGE: u32 = 0x0000_0002;
+pub const TSG_ASYNC_MESSAGE_REAUTH: u32 = 0x0000_0003;
+
+/// `TSG_PACKET_STRING_MESSAGE` — carries consent / service
+/// message text. `msgBuffer` is a `[unique, size_is(msgBytes)]
+/// wchar_t*`, NOT a `[string]`: it is a raw `u16` array of exactly
+/// `msgBytes` elements with no NUL terminator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsgPacketStringMessage {
+    /// `0` = free to ignore, non-zero = client MUST render the text.
+    pub is_display_mandatory: i32,
+    /// `0` = just informational, non-zero = client MUST require
+    /// explicit user consent before proceeding.
+    pub is_consent_mandatory: i32,
+    /// Raw UTF-16LE code units. None = `[unique]` pointer is NULL.
+    pub msg_buffer: Option<alloc::vec::Vec<u16>>,
+}
+
+impl TsgPacketStringMessage {
+    pub fn encode_ndr(&self, e: &mut NdrEncoder) {
+        e.write_i32(self.is_display_mandatory);
+        e.write_i32(self.is_consent_mandatory);
+        let count = self.msg_buffer.as_ref().map(|v| v.len() as u32).unwrap_or(0);
+        e.write_u32(count);
+        let present = self.msg_buffer.is_some();
+        let _ = e.write_unique_pointer(present);
+        if let Some(units) = &self.msg_buffer {
+            // Conformant array of u16 — max_count prefix + elements.
+            e.write_u32(units.len() as u32);
+            for u in units {
+                e.write_u16(*u);
+            }
+        }
+    }
+
+    pub fn decode_ndr(d: &mut NdrDecoder<'_>) -> NdrResult<Self> {
+        let is_display_mandatory = d.read_i32("TsgPacketStringMessage.is_display_mandatory")?;
+        let is_consent_mandatory = d.read_i32("TsgPacketStringMessage.is_consent_mandatory")?;
+        let msg_bytes = d.read_u32("TsgPacketStringMessage.msg_bytes")?;
+        let ptr = d.read_unique_pointer("TsgPacketStringMessage.msg_buffer")?;
+        let msg_buffer = if ptr.is_some() {
+            let max_count = d.read_u32("TsgPacketStringMessage.msg_buffer.max_count")?;
+            if max_count != msg_bytes {
+                return Err(NdrError::InvalidData {
+                    context: "TsgPacketStringMessage: msg_buffer max_count mismatch",
+                });
+            }
+            let mut out = alloc::vec::Vec::with_capacity(msg_bytes as usize);
+            for _ in 0..msg_bytes {
+                out.push(d.read_u16("TsgPacketStringMessage.msg_buffer.element")?);
+            }
+            Some(out)
+        } else {
+            None
+        };
+        Ok(Self {
+            is_display_mandatory,
+            is_consent_mandatory,
+            msg_buffer,
+        })
+    }
+}
+
+/// `TSG_PACKET_REAUTH_MESSAGE` — the server is asking the client
+/// to reauthenticate; `tunnel_context` is an opaque 64-bit
+/// reauthentication identifier that the client must echo back in
+/// the follow-up `TsProxyCreateTunnel(REAUTH)` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TsgPacketReauthMessage {
+    pub tunnel_context: u64,
+}
+
+impl TsgPacketReauthMessage {
+    pub fn encode_ndr(&self, e: &mut NdrEncoder) {
+        e.write_u64(self.tunnel_context);
+    }
+
+    pub fn decode_ndr(d: &mut NdrDecoder<'_>) -> NdrResult<Self> {
+        Ok(Self {
+            tunnel_context: d.read_u64("TsgPacketReauthMessage.tunnel_context")?,
+        })
+    }
+}
+
+/// Arm of the inner `[switch_is(msgType)]` union in
+/// [`TsgPacketMsgResponse`]. Only populated when
+/// `is_msg_present != 0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TsgAsyncMessage {
+    Consent(TsgPacketStringMessage),
+    Service(TsgPacketStringMessage),
+    Reauth(TsgPacketReauthMessage),
+}
+
+impl TsgAsyncMessage {
+    pub fn msg_type(&self) -> u32 {
+        match self {
+            Self::Consent(_) => TSG_ASYNC_MESSAGE_CONSENT_MESSAGE,
+            Self::Service(_) => TSG_ASYNC_MESSAGE_SERVICE_MESSAGE,
+            Self::Reauth(_) => TSG_ASYNC_MESSAGE_REAUTH,
+        }
+    }
+}
+
+// =============================================================================
+// TSG_PACKET_MSG_RESPONSE (§2.2.9.2.7)
+// =============================================================================
+
+/// The `TsProxyMakeTunnelCall` response body. When
+/// `is_msg_present == 0`, `message` is `None` — this is the normal
+/// long-poll return shape when the server had nothing to say before
+/// the call timed out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsgPacketMsgResponse {
+    pub msg_id: u32,
+    /// Always set; echoes the arm selected by `message` when
+    /// present, otherwise whatever the server fills in.
+    pub msg_type: u32,
+    /// Signed `long` on the wire. `0` = no message returned; any
+    /// non-zero value = a message is present and must be rendered.
+    pub is_msg_present: i32,
+    pub message: Option<TsgAsyncMessage>,
+}
+
+impl TsgPacketMsgResponse {
+    pub fn encode_ndr(&self, e: &mut NdrEncoder) {
+        e.write_u32(self.msg_id);
+        e.write_u32(self.msg_type);
+        e.write_i32(self.is_msg_present);
+        // Encapsulated union: the switch value (`msg_type`) was
+        // already written above. The arm itself is encoded as a
+        // `[unique]` pointer slot + deferred body per MS-TSGU's
+        // IDL pointer_default(unique).
+        let present = self.message.is_some();
+        let _ = e.write_unique_pointer(present);
+        if let Some(m) = &self.message {
+            match m {
+                TsgAsyncMessage::Consent(s) | TsgAsyncMessage::Service(s) => s.encode_ndr(e),
+                TsgAsyncMessage::Reauth(r) => r.encode_ndr(e),
+            }
+        }
+    }
+
+    pub fn decode_ndr(d: &mut NdrDecoder<'_>) -> NdrResult<Self> {
+        let msg_id = d.read_u32("TsgPacketMsgResponse.msg_id")?;
+        let msg_type = d.read_u32("TsgPacketMsgResponse.msg_type")?;
+        let is_msg_present = d.read_i32("TsgPacketMsgResponse.is_msg_present")?;
+        let ptr = d.read_unique_pointer("TsgPacketMsgResponse.message")?;
+        let message = if ptr.is_some() {
+            Some(match msg_type {
+                TSG_ASYNC_MESSAGE_CONSENT_MESSAGE => {
+                    TsgAsyncMessage::Consent(TsgPacketStringMessage::decode_ndr(d)?)
+                }
+                TSG_ASYNC_MESSAGE_SERVICE_MESSAGE => {
+                    TsgAsyncMessage::Service(TsgPacketStringMessage::decode_ndr(d)?)
+                }
+                TSG_ASYNC_MESSAGE_REAUTH => {
+                    TsgAsyncMessage::Reauth(TsgPacketReauthMessage::decode_ndr(d)?)
+                }
+                _ => {
+                    return Err(NdrError::InvalidData {
+                        context: "TsgPacketMsgResponse: unknown msg_type",
+                    });
+                }
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            msg_id,
+            msg_type,
+            is_msg_present,
+            message,
+        })
+    }
+}
+
+// =============================================================================
+// TSG_PACKET_REAUTH (§2.2.9.2.8)
+// =============================================================================
+
+/// Client → server reauthentication packet sent via
+/// `TsProxyCreateTunnel(packet_id = TSG_PACKET_TYPE_REAUTH)`. The
+/// `tunnel_context` field echoes the 64-bit token from a prior
+/// `TsgPacketReauthMessage` so the server can match this reauth up
+/// with the original tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsgPacketReauth {
+    pub tunnel_context: u64,
+    pub initial_packet: TsgReauthInitialPacket,
+}
+
+/// Inner union of [`TsgPacketReauth`], selected by the `packet_id`
+/// field inside the struct. Windows clients use `Auth` when
+/// reauthenticating with a fresh PAA cookie and `VersionCaps` for
+/// the SSPI-only case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TsgReauthInitialPacket {
+    VersionCaps(TsgPacketVersionCaps),
+    Auth(TsgPacketAuth),
+}
+
+impl TsgReauthInitialPacket {
+    pub fn packet_id(&self) -> u32 {
+        match self {
+            Self::VersionCaps(_) => TSG_PACKET_TYPE_VERSIONCAPS,
+            Self::Auth(_) => TSG_PACKET_TYPE_AUTH,
+        }
+    }
+}
+
+impl TsgPacketReauth {
+    pub fn encode_ndr(&self, e: &mut NdrEncoder) {
+        e.write_u64(self.tunnel_context);
+        e.write_u32(self.initial_packet.packet_id());
+        // [unique] pointer to the arm body.
+        let _ = e.write_unique_pointer(true);
+        match &self.initial_packet {
+            TsgReauthInitialPacket::VersionCaps(vc) => vc.encode_ndr(e),
+            TsgReauthInitialPacket::Auth(a) => a.encode_ndr(e),
+        }
+    }
+
+    pub fn decode_ndr(d: &mut NdrDecoder<'_>) -> NdrResult<Self> {
+        let tunnel_context = d.read_u64("TsgPacketReauth.tunnel_context")?;
+        let packet_id = d.read_u32("TsgPacketReauth.packet_id")?;
+        let _ptr = d.read_unique_pointer("TsgPacketReauth.initial_packet")?;
+        let initial_packet = match packet_id {
+            TSG_PACKET_TYPE_VERSIONCAPS => {
+                TsgReauthInitialPacket::VersionCaps(TsgPacketVersionCaps::decode_ndr(d)?)
+            }
+            TSG_PACKET_TYPE_AUTH => TsgReauthInitialPacket::Auth(TsgPacketAuth::decode_ndr(d)?),
+            _ => {
+                return Err(NdrError::InvalidData {
+                    context: "TsgPacketReauth: unknown packet_id",
+                });
+            }
+        };
+        Ok(Self {
+            tunnel_context,
+            initial_packet,
+        })
+    }
+}
+
+// =============================================================================
 // TSG_PACKET outer envelope (§2.2.9)
 // =============================================================================
 
-/// The `TSG_PACKET` union — discriminated by `packetId`. We only
-/// model the arms used by the minimum-viable tunnel flow. The rest
-/// of the message/reauth arms are represented as opaque raw bytes
-/// (future work).
+/// The `TSG_PACKET` union — discriminated by `packetId`. Covers
+/// every arm needed by TsProxy's 8 on-wire methods.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TsgPacket {
     VersionCaps(TsgPacketVersionCaps),
@@ -661,6 +938,13 @@ pub enum TsgPacket {
     QuarEncResponse(TsgPacketQuarEncResponse),
     CapsResponse(TsgPacketCapsResponse),
     Auth(TsgPacketAuth),
+    /// `TsProxyMakeTunnelCall` REQUEST payload.
+    MsgRequest(TsgPacketMsgRequest),
+    /// `TsProxyMakeTunnelCall` RESPONSE payload.
+    MessagePacket(TsgPacketMsgResponse),
+    /// Reauthentication bundle carried by
+    /// `TsProxyCreateTunnel(packet_id = REAUTH)`.
+    Reauth(TsgPacketReauth),
 }
 
 impl TsgPacket {
@@ -672,6 +956,9 @@ impl TsgPacket {
             Self::QuarEncResponse(_) => TSG_PACKET_TYPE_QUARENC_RESPONSE,
             Self::CapsResponse(_) => TSG_PACKET_TYPE_CAPS_RESPONSE,
             Self::Auth(_) => TSG_PACKET_TYPE_AUTH,
+            Self::MsgRequest(_) => TSG_PACKET_TYPE_MSGREQUEST_PACKET,
+            Self::MessagePacket(_) => TSG_PACKET_TYPE_MESSAGE_PACKET,
+            Self::Reauth(_) => TSG_PACKET_TYPE_REAUTH,
         }
     }
 
@@ -689,6 +976,9 @@ impl TsgPacket {
             Self::QuarEncResponse(x) => x.encode_ndr(e),
             Self::CapsResponse(x) => x.encode_ndr(e),
             Self::Auth(x) => x.encode_ndr(e),
+            Self::MsgRequest(x) => x.encode_ndr(e),
+            Self::MessagePacket(x) => x.encode_ndr(e),
+            Self::Reauth(x) => x.encode_ndr(e),
         }
     }
 
@@ -702,6 +992,13 @@ impl TsgPacket {
             TSG_PACKET_TYPE_QUARENC_RESPONSE => {
                 Ok(Self::QuarEncResponse(TsgPacketQuarEncResponse::decode_ndr(d)?))
             }
+            TSG_PACKET_TYPE_MSGREQUEST_PACKET => {
+                Ok(Self::MsgRequest(TsgPacketMsgRequest::decode_ndr(d)?))
+            }
+            TSG_PACKET_TYPE_MESSAGE_PACKET => {
+                Ok(Self::MessagePacket(TsgPacketMsgResponse::decode_ndr(d)?))
+            }
+            TSG_PACKET_TYPE_REAUTH => Ok(Self::Reauth(TsgPacketReauth::decode_ndr(d)?)),
             TSG_PACKET_TYPE_CAPS_RESPONSE => Ok(Self::CapsResponse(TsgPacketCapsResponse::decode_ndr(d)?)),
             TSG_PACKET_TYPE_AUTH => Ok(Self::Auth(TsgPacketAuth::decode_ndr(d)?)),
             _ => Err(NdrError::InvalidData {
@@ -1086,5 +1383,198 @@ mod tests {
         assert_eq!(TSG_PACKET_TYPE_QUARENC_RESPONSE, 0x4552);
         assert_eq!(TSG_PACKET_TYPE_CAPS_RESPONSE, 0x4350);
         assert_eq!(TSG_PACKET_TYPE_AUTH, 0x4054);
+    }
+
+    // ---- messaging types ------------------------------------------
+
+    #[test]
+    fn msg_request_roundtrip() {
+        let r = TsgPacketMsgRequest {
+            max_messages_per_batch: 1,
+        };
+        let got = roundtrip(
+            &r,
+            TsgPacketMsgRequest::encode_ndr,
+            TsgPacketMsgRequest::decode_ndr,
+        );
+        assert_eq!(got, r);
+    }
+
+    #[test]
+    fn string_message_roundtrip_with_buffer() {
+        let s = TsgPacketStringMessage {
+            is_display_mandatory: 1,
+            is_consent_mandatory: 0,
+            msg_buffer: Some(vec![0x0048, 0x0069, 0x0021]), // "Hi!"
+        };
+        let got = roundtrip(
+            &s,
+            TsgPacketStringMessage::encode_ndr,
+            TsgPacketStringMessage::decode_ndr,
+        );
+        assert_eq!(got, s);
+    }
+
+    #[test]
+    fn string_message_roundtrip_null_buffer() {
+        let s = TsgPacketStringMessage {
+            is_display_mandatory: 0,
+            is_consent_mandatory: 0,
+            msg_buffer: None,
+        };
+        let got = roundtrip(
+            &s,
+            TsgPacketStringMessage::encode_ndr,
+            TsgPacketStringMessage::decode_ndr,
+        );
+        assert_eq!(got, s);
+    }
+
+    #[test]
+    fn reauth_message_roundtrip() {
+        let m = TsgPacketReauthMessage {
+            tunnel_context: 0x0123_4567_89AB_CDEF,
+        };
+        let got = roundtrip(
+            &m,
+            TsgPacketReauthMessage::encode_ndr,
+            TsgPacketReauthMessage::decode_ndr,
+        );
+        assert_eq!(got, m);
+    }
+
+    #[test]
+    fn msg_response_roundtrip_consent_message() {
+        let r = TsgPacketMsgResponse {
+            msg_id: 1,
+            msg_type: TSG_ASYNC_MESSAGE_CONSENT_MESSAGE,
+            is_msg_present: 1,
+            message: Some(TsgAsyncMessage::Consent(TsgPacketStringMessage {
+                is_display_mandatory: 1,
+                is_consent_mandatory: 1,
+                msg_buffer: Some(vec![0x0054, 0x006F, 0x0053]), // "ToS"
+            })),
+        };
+        let got = roundtrip(
+            &r,
+            TsgPacketMsgResponse::encode_ndr,
+            TsgPacketMsgResponse::decode_ndr,
+        );
+        assert_eq!(got, r);
+    }
+
+    #[test]
+    fn msg_response_roundtrip_reauth_message() {
+        let r = TsgPacketMsgResponse {
+            msg_id: 2,
+            msg_type: TSG_ASYNC_MESSAGE_REAUTH,
+            is_msg_present: 1,
+            message: Some(TsgAsyncMessage::Reauth(TsgPacketReauthMessage {
+                tunnel_context: 0xDEAD_BEEF_CAFE_F00D,
+            })),
+        };
+        let got = roundtrip(
+            &r,
+            TsgPacketMsgResponse::encode_ndr,
+            TsgPacketMsgResponse::decode_ndr,
+        );
+        assert_eq!(got, r);
+    }
+
+    #[test]
+    fn msg_response_roundtrip_long_poll_empty() {
+        // Long-poll return with nothing to say.
+        let r = TsgPacketMsgResponse {
+            msg_id: 0,
+            msg_type: 0,
+            is_msg_present: 0,
+            message: None,
+        };
+        let got = roundtrip(
+            &r,
+            TsgPacketMsgResponse::encode_ndr,
+            TsgPacketMsgResponse::decode_ndr,
+        );
+        assert_eq!(got, r);
+    }
+
+    #[test]
+    fn reauth_packet_roundtrip_with_auth_arm() {
+        let r = TsgPacketReauth {
+            tunnel_context: 0xAAAA_BBBB_CCCC_DDDD,
+            initial_packet: TsgReauthInitialPacket::Auth(TsgPacketAuth {
+                version_caps: TsgPacketVersionCaps::client_default(TSG_NAP_CAPABILITY_QUAR_SOH),
+                cookie: vec![0xF0; 32],
+            }),
+        };
+        let got = roundtrip(
+            &r,
+            TsgPacketReauth::encode_ndr,
+            TsgPacketReauth::decode_ndr,
+        );
+        assert_eq!(got, r);
+    }
+
+    #[test]
+    fn reauth_packet_roundtrip_with_version_caps_arm() {
+        let r = TsgPacketReauth {
+            tunnel_context: 0x1111_2222_3333_4444,
+            initial_packet: TsgReauthInitialPacket::VersionCaps(
+                TsgPacketVersionCaps::client_default(TSG_MESSAGING_CAP_REAUTH),
+            ),
+        };
+        let got = roundtrip(
+            &r,
+            TsgPacketReauth::encode_ndr,
+            TsgPacketReauth::decode_ndr,
+        );
+        assert_eq!(got, r);
+    }
+
+    #[test]
+    fn tsg_packet_envelope_covers_all_nine_arms() {
+        let arms: Vec<TsgPacket> = vec![
+            TsgPacket::VersionCaps(TsgPacketVersionCaps::client_default(0)),
+            TsgPacket::QuarRequest(TsgPacketQuarRequest {
+                flags: 0,
+                machine_name: None,
+                data: None,
+            }),
+            TsgPacket::Response(TsgPacketResponse {
+                flags: 0,
+                response_data: vec![],
+                redirection_flags: TsgRedirectionFlags::default(),
+            }),
+            TsgPacket::QuarEncResponse(TsgPacketQuarEncResponse {
+                flags: 0,
+                cert_chain: None,
+                nonce: RpcUuid::NIL,
+                version_caps: None,
+            }),
+            TsgPacket::Auth(TsgPacketAuth {
+                version_caps: TsgPacketVersionCaps::client_default(0),
+                cookie: vec![],
+            }),
+            TsgPacket::MsgRequest(TsgPacketMsgRequest {
+                max_messages_per_batch: 1,
+            }),
+            TsgPacket::MessagePacket(TsgPacketMsgResponse {
+                msg_id: 0,
+                msg_type: 0,
+                is_msg_present: 0,
+                message: None,
+            }),
+            TsgPacket::Reauth(TsgPacketReauth {
+                tunnel_context: 0xDEAD,
+                initial_packet: TsgReauthInitialPacket::VersionCaps(
+                    TsgPacketVersionCaps::client_default(0),
+                ),
+            }),
+        ];
+        for arm in arms {
+            let got = roundtrip(&arm, TsgPacket::encode_ndr, TsgPacket::decode_ndr);
+            assert_eq!(got.packet_id(), arm.packet_id(), "{arm:?}");
+            assert_eq!(got, arm);
+        }
     }
 }
