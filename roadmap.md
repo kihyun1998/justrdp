@@ -1778,6 +1778,29 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
   - [x] 워크스페이스 clean 빌드 + 전체 테스트 통과
         (rsa 9 / pkinit-card 30 / connector pkinit 6)
 
+**Phase 3 — Smart card PAA cookie for RD Gateway (§10.1 follow-up)**
+
+Uses the `SmartcardProvider` trait built in Phase 1 to construct
+a PAA cookie for Windows RD Gateways configured with smart-card
+authentication RAP (Resource Authorization Policy). MS-TSGU
+§2.2.10.1 `CookieAuthData` accepts either an NTLM/CredSSP blob
+(already implemented in §10.1 C11) or a smart-card-derived
+credential blob verified against the user's X.509 cert.
+
+- [ ] `PaaCookie::from_smartcard_provider(provider, gateway_spn)`
+      constructor in `justrdp-gateway::rpch::paa`
+- [ ] Wire format research: confirm whether the smart-card PAA
+      cookie is (a) a CMS `SignedData` blob signed with the card's
+      key, (b) a CredSSP `TSRequest` with a PKINIT-derived
+      credential, or (c) a Kerberos AP-REQ wrapped as `auth_info`.
+      MS-TSGU §2.2.10 does not specify — needs wire capture from
+      a real smart-card PAA deployment or further spec-checker
+      investigation.
+- [ ] Unit test against mock `SmartcardProvider` (no hardware)
+- [ ] Integration test deferred — requires a live Windows RD
+      Gateway configured with smart-card RAP, plus a physical
+      card or PC/SC virtual card adapter.
+
 ### 9.7 USB Redirection (MS-RDPEUSB)
 
 > **requires**: 7.3 DVC 프레임워크 (RDPDR 불필요 — URBDRC DVC 직접 사용)
@@ -2098,8 +2121,8 @@ MS-RDPEI V200+ 에서 **동일 채널 `Microsoft::Windows::RDS::Input`** 에
 - [x] CredSSP-formatted PAA cookie 생성 — `PaaCookie::from_ntlm_authenticate_as_credssp(bytes)` wraps NTLM AUTHENTICATE in a TSRequest DER per MS-CSSP §2.2.1. 인라인 minimal encoder가 `justrdp-connector::credssp::TsRequest::encode()`와 바이트 일치 (§10.1 C11).
 - [x] `from_ntlm_authenticate(bytes)` — 2008 R2 RAP-NTLM 경로용 bare pass-through
 - [x] `from_credssp_ts_request(der)` — 호출자가 풀 CredSSP 드라이브한 결과 주입용 pass-through
-- [ ] Smart card PAA cookie — intentionally skipped (Phase 8 Kerberos 이후)
 - [x] `TsProxyCreateTunnel`에서 cookie 전달 (TSG_PACKET_AUTH arm). 참고: 원래 roadmap에 "AuthorizeTunnel"이라 적혀있었지만 실제 스펙은 CreateTunnel에 PAA cookie가 들어감.
+- Smart card-based PAA cookie는 §9.6 Phase 3에서 다룸 (PKINIT/SmartcardProvider 인프라 위에 얹음)
 
 *6. blocking Wire-up* — `justrdp-blocking::gateway`
 
