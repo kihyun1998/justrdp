@@ -76,6 +76,20 @@ impl ClientRequestInfo {
 /// session driver needs (negotiated caps, credentials, channel IDs) --
 /// callers who dispose of the `ServerAcceptor` after the handshake
 /// cannot call accessors on it.
+///
+/// **Credential hygiene.** The `client_info` field embeds the parsed
+/// `ClientInfoPdu`, which carries the user's plaintext password.
+/// `ClientInfoPdu::Drop` zeroes the password on drop, but:
+/// - **`Clone`** allocates a second heap buffer with the plaintext
+///   password. Both copies zero independently when dropped, but they
+///   coexist between the clone and the first drop. Prefer moving the
+///   `AcceptanceResult` rather than cloning it.
+/// - **`Debug`** prints the raw struct fields; redact the password
+///   before logging (or call
+///   [`take_client_info`](Self::take_client_info) to extract the PDU
+///   through a move so subsequent `Debug`/`Clone` sees `None`).
+/// - The credential can be extracted (and removed from the result)
+///   via [`take_client_info`](Self::take_client_info).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptanceResult {
     /// Security protocol the server selected in `RDP_NEG_RSP`.
@@ -104,6 +118,17 @@ pub struct AcceptanceResult {
 }
 
 impl AcceptanceResult {
+    /// Move the Client Info PDU out of the result, leaving `None`.
+    ///
+    /// Use this to isolate credential handling: the extracted PDU can be
+    /// passed to a dedicated credential-validation routine and dropped
+    /// (zero-on-drop) as soon as the validation completes, while the
+    /// rest of the `AcceptanceResult` can be cloned / logged / shipped
+    /// across threads without carrying a live password.
+    pub fn take_client_info(&mut self) -> Option<ClientInfoPdu> {
+        self.client_info.take()
+    }
+
     #[allow(dead_code)] // Used by tests and later commits.
     pub(crate) fn new(client_request: ClientRequestInfo) -> Self {
         Self {

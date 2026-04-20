@@ -112,7 +112,7 @@ impl DrdynvcServer {
     /// MS-RDPEDYC §3.2.5.1.1: server sends this first, advertising its
     /// highest supported version. For v2/v3 the four `priority_charges`
     /// values are inlined per §2.2.1.1.2.
-    pub fn initialize_capabilities(&self) -> Vec<u8> {
+    pub fn initialize_capabilities(&self) -> DvcResult<Vec<u8>> {
         let charges = if self.advertised_version >= crate::pdu::CAPS_VERSION_2 {
             // Default priority charges: equal weight across all four
             // priority classes. Real servers tune these for traffic
@@ -122,7 +122,11 @@ impl DrdynvcServer {
         } else {
             None
         };
-        encode_caps_request(self.advertised_version, charges)
+        // `encode_caps_request` returns an error only on (version,
+        // charges) mismatches. Our self.advertised_version and our
+        // own matching `charges` selection above can never misalign,
+        // so the `?` here is a safety-net for future refactors.
+        Ok(encode_caps_request(self.advertised_version, charges)?)
     }
 
     /// Process a Capabilities Response from the client. The client
@@ -229,8 +233,11 @@ impl DrdynvcServer {
             Ok(true)
         } else {
             // Negative status: drop the channel from our tracking table
-            // so future data PDUs for this ID are rejected and the
-            // channel ID can be reused if the caller wants.
+            // so future data PDUs for this ID are rejected. The channel
+            // ID is **retired, not reusable**: `last_channel_id` is
+            // never decremented, so a subsequent `open_channel` with
+            // the same ID would hit the monotonicity guard. Callers
+            // must use the next monotonically higher ID for any retry.
             self.channels.remove(&channel_id);
             Ok(false)
         }
@@ -372,7 +379,7 @@ mod tests {
     #[test]
     fn capability_negotiation_round_trip() {
         let server = DrdynvcServer::new();
-        let req = server.initialize_capabilities();
+        let req = server.initialize_capabilities().unwrap();
         // Wire shape: header(0x50) + pad(0) + version(0x0003 LE) + 8 bytes of charges = 12 bytes.
         assert_eq!(req.len(), 12);
         assert_eq!(req[0], 0x50); // CMD_CAPS << 4
@@ -380,9 +387,44 @@ mod tests {
     }
 
     #[test]
+    fn initialize_capabilities_v1_emits_4_byte_request() {
+        let server = DrdynvcServer::with_version(1);
+        let req = server.initialize_capabilities().unwrap();
+        assert_eq!(req.len(), 4);
+        assert_eq!(req[0], 0x50);
+        assert_eq!(&req[2..4], &[0x01, 0x00]);
+    }
+
+    #[test]
+    fn encode_caps_request_rejects_v2_without_charges() {
+        use crate::pdu::encode_caps_request;
+        assert!(encode_caps_request(2, None).is_err());
+    }
+
+    #[test]
+    fn encode_caps_request_rejects_v1_with_charges() {
+        use crate::pdu::encode_caps_request;
+        assert!(encode_caps_request(1, Some([0, 0, 0, 0])).is_err());
+    }
+
+    #[test]
+    fn decode_caps_response_rejects_nonzero_sp_or_cb_id() {
+        use crate::pdu::decode_caps_response;
+        // Header byte 0x51 = CMD_CAPS(5) << 4 | cb_id=1 -- spec violation.
+        let bad = [0x51, 0x00, 0x01, 0x00];
+        assert!(decode_caps_response(&bad).is_err());
+        // Header byte 0x54 = CMD_CAPS(5) << 4 | sp=1<<2 -- spec violation.
+        let bad = [0x54, 0x00, 0x01, 0x00];
+        assert!(decode_caps_response(&bad).is_err());
+        // Header byte 0x50 = valid.
+        let ok = [0x50, 0x00, 0x01, 0x00];
+        assert_eq!(decode_caps_response(&ok).unwrap(), 1);
+    }
+
+    #[test]
     fn process_caps_response_records_negotiated_version_v1() {
         let mut server = DrdynvcServer::new();
-        let _ = server.initialize_capabilities();
+        let _ = server.initialize_capabilities().unwrap();
         // Client picks v1 -- 4-byte wire shape (header + pad + version).
         let resp = encode_caps_response(1);
         assert_eq!(resp.len(), 4);
@@ -440,6 +482,24 @@ mod tests {
         let mut server = DrdynvcServer::new();
         let err = server.open_channel(0, "x", 0).unwrap_err();
         assert!(matches!(err, DvcError::Protocol(_)));
+    }
+
+    #[test]
+    fn channel_id_is_retired_after_negative_create_response() {
+        // Regression for the doc-comment contradiction: after the
+        // client rejects a CreateRequest, the channel ID must be
+        // retired (not reusable) because `last_channel_id` is never
+        // decremented. A caller attempting to reuse the same ID must
+        // hit the monotonicity guard.
+        let mut server = DrdynvcServer::new();
+        let _ = server.open_channel(8, "snd", 1).unwrap();
+        let reject = encode_create_response(8, -1); // negative status
+        assert!(!server.process_create_response(&reject).unwrap());
+        // Same ID rejected by the monotonicity guard:
+        let err = server.open_channel(8, "snd", 1).unwrap_err();
+        assert!(matches!(err, DvcError::Protocol(msg) if msg.contains("monotonicity")));
+        // A higher ID still works.
+        let _ = server.open_channel(9, "snd", 1).unwrap();
     }
 
     #[test]

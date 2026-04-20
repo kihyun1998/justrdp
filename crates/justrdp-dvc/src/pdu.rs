@@ -459,25 +459,42 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
 /// Encode a DYNVC_CAPS_REQ (server → client, MS-RDPEDYC §2.2.1.1).
 ///
 /// `version` ∈ {1, 2, 3}. For v2/v3, `priority_charges` is the
-/// MS-RDPEDYC §2.2.1.1.2 array of four `PriorityCharge` u16 values.
-/// `None` is allowed only when `version == 1`.
-pub fn encode_caps_request(version: u16, priority_charges: Option<[u16; 4]>) -> Vec<u8> {
+/// MS-RDPEDYC §2.2.1.1.2 array of four `PriorityCharge` u16 values;
+/// passing `None` for v2/v3 returns an error (the spec defines defaults
+/// but the API requires the caller to commit to a policy explicitly).
+/// For v1, `priority_charges` MUST be `None` (the field is absent on
+/// the wire); supplying `Some` for v1 is also an error.
+pub fn encode_caps_request(
+    version: u16,
+    priority_charges: Option<[u16; 4]>,
+) -> EncodeResult<Vec<u8>> {
     let with_charges = version >= CAPS_VERSION_2;
+    match (with_charges, priority_charges) {
+        (true, None) => {
+            return Err(justrdp_core::EncodeError::other(
+                "encode_caps_request",
+                "v2/v3 Capabilities Request requires priority_charges (got None)",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(justrdp_core::EncodeError::other(
+                "encode_caps_request",
+                "v1 Capabilities Request must not carry priority_charges (got Some)",
+            ));
+        }
+        _ => {}
+    }
     let size = if with_charges { 12 } else { 4 };
     let mut buf = alloc::vec![0u8; size];
     buf[0] = encode_header(CMD_CAPS, 0, 0);
     buf[1] = 0x00; // pad
     buf[2..4].copy_from_slice(&version.to_le_bytes());
-    if with_charges {
-        // The spec assigns default values when the server omits this
-        // array; here we require the caller to supply them rather than
-        // baking a policy into a low-level encoder.
-        let charges = priority_charges.expect("v2/v3 caps require priority charges");
+    if let Some(charges) = priority_charges {
         for (i, c) in charges.iter().enumerate() {
             buf[4 + i * 2..6 + i * 2].copy_from_slice(&c.to_le_bytes());
         }
     }
-    buf
+    Ok(buf)
 }
 
 /// Encode a DYNVC_CREATE_REQ (server → client, MS-RDPEDYC §2.2.2.1).
@@ -514,12 +531,22 @@ pub fn encode_create_request(channel_id: u32, channel_name: &str, priority: u8) 
 pub fn decode_caps_response(bytes: &[u8]) -> DecodeResult<u16> {
     let mut cursor = ReadCursor::new(bytes);
     let header = cursor.read_u8("DVC::header")?;
-    let (cmd, _sp, _cb_id) = decode_header(header);
+    let (cmd, sp, cb_id) = decode_header(header);
     if cmd != CMD_CAPS {
         return Err(DecodeError::unexpected_value(
             "DVC::capsResponse",
             "cmd",
             "expected CMD_CAPS (0x05)",
+        ));
+    }
+    // MS-RDPEDYC §2.2.1.2: Sp and cbId sub-fields MUST both be 0 (the
+    // header byte MUST be exactly 0x50). Reject non-zero values to
+    // avoid silently tolerating malformed or fuzzed input.
+    if sp != 0 || cb_id != 0 {
+        return Err(DecodeError::unexpected_value(
+            "DVC::capsResponse",
+            "header",
+            "Sp and cbId must both be 0 (header must be 0x50)",
         ));
     }
     let _pad = cursor.read_u8("DVC::capsPad")?;

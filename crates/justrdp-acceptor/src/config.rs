@@ -168,16 +168,12 @@ impl AcceptorConfigBuilder {
     ///
     /// Use [`build_allow_downgrade`](Self::build_allow_downgrade) if
     /// you explicitly want to accept this risk (legacy interop).
-    pub fn build(self) -> Result<AcceptorConfig, &'static str> {
+    pub fn build(self) -> Result<AcceptorConfig, crate::error::AcceptorConfigError> {
         use justrdp_pdu::x224::SecurityProtocol;
         let has_enhanced =
             self.inner.supported_protocols.bits() & !SecurityProtocol::RDP.bits() != 0;
         if has_enhanced && !self.inner.require_enhanced_security {
-            return Err(
-                "AcceptorConfig allows PROTOCOL_RDP downgrade: supported_protocols \
-                 advertises enhanced security but require_enhanced_security is false. \
-                 Call build_allow_downgrade() if this is intentional.",
-            );
+            return Err(crate::error::AcceptorConfigError::DowngradeRisk);
         }
         Ok(self.inner)
     }
@@ -213,7 +209,9 @@ mod tests {
             .require_enhanced_security(false)
             .build()
             .unwrap_err();
-        assert!(err.contains("downgrade"));
+        assert_eq!(err, crate::error::AcceptorConfigError::DowngradeRisk);
+        // Display formatter should mention "downgrade" for log grepping.
+        assert!(alloc::format!("{err}").contains("downgrade"));
     }
 
     #[test]

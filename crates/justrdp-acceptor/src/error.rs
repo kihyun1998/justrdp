@@ -101,3 +101,35 @@ impl fmt::Display for AcceptorError {
 
 /// Acceptor result type.
 pub type AcceptorResult<T> = Result<T, AcceptorError>;
+
+/// Errors returned by `AcceptorConfigBuilder::build()`.
+///
+/// Kept separate from `AcceptorError` because config-validation errors
+/// happen at startup (before any wire activity) and the caller typically
+/// wants to react differently (log the misconfiguration and exit, rather
+/// than tear down an active connection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptorConfigError {
+    /// `supported_protocols` advertises enhanced security bits
+    /// (SSL/HYBRID/HYBRID_EX/RDSTLS/AAD) while
+    /// `require_enhanced_security` is `false`. A man-in-the-middle can
+    /// strip all `requestedProtocols` bits from the client's CR and
+    /// force Standard RDP Security, which the server accepts because
+    /// it's in the allowed set. Call
+    /// `AcceptorConfigBuilder::build_allow_downgrade()` to opt into
+    /// this behaviour explicitly (legacy interop only).
+    DowngradeRisk,
+}
+
+impl fmt::Display for AcceptorConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DowngradeRisk => write!(
+                f,
+                "AcceptorConfig allows PROTOCOL_RDP downgrade: supported_protocols \
+                 advertises enhanced security but require_enhanced_security is false; \
+                 call build_allow_downgrade() if this is intentional"
+            ),
+        }
+    }
+}

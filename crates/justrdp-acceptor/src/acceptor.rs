@@ -159,6 +159,16 @@ enum FinalizationPhase {
 /// mismatches with `ERRINFO_CONFIRMACTIVEWRONGORIGINATOR (0x10D5)`.
 const CONFIRM_ACTIVE_ORIGINATOR_ID: u16 = 0x03EA;
 
+/// Maximum number of PersistentKeyList PDUs the acceptor will accept
+/// between the server's GrantedControl and the client's FontList
+/// during finalization.
+///
+/// MS-RDPBCGR §2.2.1.17 does not impose a hard count limit, but in
+/// practice real clients (mstsc, FreeRDP) send at most a few. 64 is a
+/// conservative server-side cap that prevents a post-auth client from
+/// looping in `WaitClientFontList` indefinitely (DoS).
+const MAX_PERSISTENT_KEY_LIST_PDUS: u8 = 64;
+
 // ── TS_SECURITY_HEADER constants (MS-RDPBCGR §2.2.8.1.1.2.1) ──
 
 /// Security header flag: payload is a Client Info PDU.
@@ -1529,13 +1539,10 @@ impl ServerAcceptor {
             ShareDataPduType::PersistentKeyList => {
                 // Optional client-side cache hint. No response required.
                 // Stay in this sub-phase to wait for the FontList that
-                // follows. MS-RDPBCGR §2.2.1.17 describes
-                // PersistentKeyList as possibly spanning multiple PDUs
-                // (PERSIST_FIRST_PDU / PERSIST_LAST_PDU flags), but
-                // Windows servers in practice see at most a handful.
-                // Cap at 64 to prevent a client from looping here
-                // indefinitely (DoS).
-                const MAX_PERSISTENT_KEY_LIST_PDUS: u8 = 64;
+                // follows. PERSIST_FIRST_PDU / PERSIST_LAST_PDU flags
+                // allow legitimate clients to split the list across
+                // multiple PDUs; the module-level
+                // `MAX_PERSISTENT_KEY_LIST_PDUS` cap prevents DoS.
                 if self.persistent_key_list_count >= MAX_PERSISTENT_KEY_LIST_PDUS {
                     return Err(AcceptorError::general(
                         "exceeded maximum PersistentKeyList PDUs during finalization",

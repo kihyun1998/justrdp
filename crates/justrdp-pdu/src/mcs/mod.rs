@@ -89,6 +89,14 @@ impl DomainParameters {
     /// (`max_channel_ids = 34`, `max_user_ids = 3`, `max_mcs_pdu_size
     /// = 65528`) match what mstsc observes during a real RDP session
     /// and sit inside the defaults we advertise for min/max.
+    ///
+    /// **Intentional deviation:** `max_token_ids = 0` is strictly below
+    /// `min_default().max_token_ids = 1`, which is a formal T.125 §8.2
+    /// violation (the confirmed value must be >= the client's minimum).
+    /// Every shipping implementation (Windows RDS, FreeRDP, rdesktop)
+    /// sends `max_token_ids = 0` regardless of the client's declared
+    /// minimum, and every client accepts it. We keep the widely-
+    /// interoperable value over spec literalism.
     pub fn server_default() -> Self {
         Self {
             max_channel_ids: 34,
