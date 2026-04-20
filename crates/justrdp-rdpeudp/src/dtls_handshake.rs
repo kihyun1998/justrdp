@@ -73,8 +73,14 @@ pub enum DtlsError {
     UnexpectedMessage(u8),
     /// Cipher suite mismatch.
     CipherMismatch,
+    /// Server advertised a DTLS version the client did not offer, or
+    /// attempted to downgrade below the client's minimum.
+    VersionMismatch,
     /// Certificate parsing failed.
     BadCertificate,
+    /// Server's RSA modulus is too small for the pre-master secret
+    /// plus PKCS#1 v1.5 Type 2 padding (RFC 8017 §7.2.1).
+    KeyTooSmall,
     /// Server Finished verify_data mismatch.
     VerifyDataMismatch,
     /// Encode/decode failure.
@@ -123,6 +129,10 @@ pub struct DtlsClientHandshake {
 
     // ── Cookie from HelloVerifyRequest ──
     cookie: Vec<u8>,
+
+    /// Set when the server's ChangeCipherSpec record is observed.
+    /// Required by RFC 5246 §7.1 before accepting the server Finished.
+    received_server_ccs: bool,
 }
 
 impl DtlsClientHandshake {
@@ -149,6 +159,7 @@ impl DtlsClientHandshake {
             keys: None,
             server_public_key: None,
             cookie: Vec::new(),
+            received_server_ccs: false,
         }
     }
 
@@ -193,15 +204,14 @@ impl DtlsClientHandshake {
         }
 
         let body = self.encode_client_hello_body();
-        let msg_seq = if self.state == DtlsState::GotHelloVerifyRequest {
-            // RFC 6347 §4.2.1: message_seq resets to 0 after HVR.
-            self.client_msg_seq = 0;
-            0
-        } else {
-            let s = self.client_msg_seq;
-            self.client_msg_seq += 1;
-            s
-        };
+        // RFC 6347 §4.2.2: each transmitted handshake message
+        // increments `message_seq` by one. The retried ClientHello
+        // following a HelloVerifyRequest is a NEW message (not a
+        // retransmission of the first ClientHello) and therefore
+        // uses `message_seq = 1`, not 0. See the example flow in
+        // §4.2.2 ("ClientHello (seq=1) with cookie").
+        let msg_seq = self.client_msg_seq;
+        self.client_msg_seq += 1;
 
         let mut hs_data = Vec::new();
         let hdr = HandshakeHeader::unfragmented(
@@ -318,7 +328,17 @@ impl DtlsClientHandshake {
         if body.len() < 38 {
             return Err(DtlsError::Protocol("ServerHello too short"));
         }
-        self.version = [body[0], body[1]];
+        // RFC 5246 §E.1 / RFC 7457: reject any ServerHello version
+        // not in the set the client offered. The client offers
+        // DTLS 1.0 on the wire (pre_master_secret embeds DTLS 1.0,
+        // our client_version byte is DTLS 1.0) so we accept DTLS 1.0
+        // or DTLS 1.2; anything else is an attempted downgrade or
+        // mis-negotiation.
+        let server_version = [body[0], body[1]];
+        if server_version != DTLS_1_0 && server_version != DTLS_1_2 {
+            return Err(DtlsError::VersionMismatch);
+        }
+        self.version = server_version;
         self.server_random.copy_from_slice(&body[2..34]);
         let session_id_len = body[34] as usize;
         let after_sid = 35 + session_id_len;
@@ -405,7 +425,7 @@ impl DtlsClientHandshake {
             server_key,
             &self.pre_master_secret,
             rng,
-        );
+        )?;
         let mut cke_body = Vec::new();
         cke_body.extend_from_slice(&(encrypted_pms.len() as u16).to_be_bytes());
         cke_body.extend_from_slice(&encrypted_pms);
@@ -467,7 +487,15 @@ impl DtlsClientHandshake {
         self.transcript_bytes.extend_from_slice(&fin_data);
 
         // Encrypt the Finished message.
-        let keys = self.keys.as_ref().unwrap();
+        //
+        // `self.keys` was populated a few lines above from the
+        // derived key block, so this branch is unreachable — but we
+        // surface it as a structured error rather than panicking if
+        // a future refactor ever violates the invariant.
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or(DtlsError::InvalidState("keys not derived"))?;
         let mut iv = [0u8; 16];
         rng.fill(&mut iv);
         let encrypted = encrypt_record(
@@ -500,8 +528,15 @@ impl DtlsClientHandshake {
         &mut self,
         _record: &DtlsRecord,
     ) -> Result<Vec<DtlsRecord>, DtlsError> {
-        // Just note that the server's epoch incremented; next record
-        // will be encrypted. No output needed.
+        // RFC 5246 §7.1: a ChangeCipherSpec MUST precede the server
+        // Finished. Record it here so `handle_server_finished` can
+        // reject a Finished that arrives without a preceding CCS.
+        // We accept CCS only once the client flight has been sent —
+        // receiving one earlier is a protocol violation.
+        if self.state != DtlsState::WaitServerFinished {
+            return Err(DtlsError::InvalidState("CCS in wrong state"));
+        }
+        self.received_server_ccs = true;
         Ok(vec![])
     }
 
@@ -512,6 +547,12 @@ impl DtlsClientHandshake {
         if self.state != DtlsState::WaitServerFinished {
             return Err(DtlsError::InvalidState("Finished in wrong state"));
         }
+        if !self.received_server_ccs {
+            // RFC 5246 §7.1: a server Finished without a preceding
+            // ChangeCipherSpec MUST be rejected.
+            self.state = DtlsState::Failed;
+            return Err(DtlsError::Protocol("Finished without CCS"));
+        }
         if body.len() < FINISHED_VERIFY_DATA_SIZE {
             return Err(DtlsError::Protocol("Finished too short"));
         }
@@ -521,7 +562,11 @@ impl DtlsClientHandshake {
             b"server finished",
             &transcript_hash,
         );
-        if body[..FINISHED_VERIFY_DATA_SIZE] != expected[..] {
+        // Constant-time compare closes the verify_data timing oracle
+        // (RFC 5246 §7.4.9 requires the verify_data be the only
+        // authenticator of the handshake; a timing leak here would
+        // let an on-path attacker forge the server Finished).
+        if !ct_eq(&body[..FINISHED_VERIFY_DATA_SIZE], &expected[..]) {
             self.state = DtlsState::Failed;
             return Err(DtlsError::VerifyDataMismatch);
         }
@@ -549,14 +594,23 @@ impl DtlsClientHandshake {
 // =============================================================================
 
 /// RSA PKCS#1 v1.5 Type 2 (encryption) padding and public-key
-/// encryption. Returns the ciphertext as big-endian bytes.
+/// encryption. Returns the ciphertext as big-endian bytes, padded to
+/// `k = ceil(bit_len / 8)`.
+///
+/// RFC 8017 §7.2.1 requires `mLen ≤ k - 11`. We enforce this as a
+/// hard check — in release builds a server advertising an undersized
+/// RSA modulus would previously wrap the arithmetic and produce a
+/// multi-gigabyte PS buffer. Returns `DtlsError::KeyTooSmall` on
+/// violation.
 fn rsa_pkcs1_v15_encrypt<R: DtlsRandom>(
     key: &RsaPublicKey,
     message: &[u8],
     rng: &mut R,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, DtlsError> {
     let k = key.n.bit_len().div_ceil(8);
-    debug_assert!(message.len() + 11 <= k);
+    if message.len() + 11 > k {
+        return Err(DtlsError::KeyTooSmall);
+    }
 
     // EM = 0x00 || 0x02 || PS || 0x00 || message
     let ps_len = k - message.len() - 3;
@@ -581,7 +635,7 @@ fn rsa_pkcs1_v15_encrypt<R: DtlsRandom>(
     // RSA: c = em^e mod n (big-endian).
     let m = BigUint::from_be_bytes(&em);
     let c = m.mod_exp(&key.e, &key.n);
-    c.to_be_bytes_padded(k)
+    Ok(c.to_be_bytes_padded(k))
 }
 
 // =============================================================================
@@ -602,10 +656,17 @@ mod justrdp_tls_free {
         let (_, _cert_end) = super::der_read_seq(cert_der, &mut pos)?;
         // TBSCertificate SEQUENCE
         let (_, tbs_end) = super::der_read_seq(cert_der, &mut pos)?;
-        // version [0] EXPLICIT (optional)
+        // version [0] EXPLICIT Version DEFAULT v1 (optional).
+        //
+        // `der_skip_tlv` consumes the ENTIRE `[0] EXPLICIT { INTEGER }`
+        // TLV in one step — the INTEGER lives inside the `[0]` value
+        // and is not a sibling field. A previous revision skipped
+        // twice here, which silently consumed `serialNumber` and
+        // shifted every subsequent field by one, corrupting SPKI
+        // extraction for any v2/v3 X.509 certificate (which is every
+        // real-world TLS server cert).
         if pos < tbs_end && cert_der[pos] == 0xA0 {
             super::der_skip_tlv(cert_der, &mut pos)?;
-            super::der_skip_tlv(cert_der, &mut pos)?; // inner INTEGER
         }
         // serialNumber
         super::der_skip_tlv(cert_der, &mut pos)?;
@@ -772,6 +833,76 @@ mod tests {
     }
 
     #[test]
+    fn retried_client_hello_uses_message_seq_one() {
+        // RFC 6347 §4.2.2 example: CH1=0, HVR=0, CH2=1. A previous
+        // revision reset `client_msg_seq` to 0 on retry, which
+        // caused CKE/Finished seqs to be off-by-one and was rejected
+        // by strict peers.
+        let mut rng = FixedRng(0);
+        let mut hs = DtlsClientHandshake::new(&mut rng);
+        hs.build_client_hello().unwrap();
+
+        let cookie = b"cookie";
+        let mut hvr_body = Vec::new();
+        hvr_body.extend_from_slice(&DTLS_1_0);
+        hvr_body.push(cookie.len() as u8);
+        hvr_body.extend_from_slice(cookie);
+        let mut frag = Vec::new();
+        HandshakeHeader::unfragmented(
+            HT_HELLO_VERIFY_REQUEST,
+            hvr_body.len() as u32,
+            0,
+        )
+        .encode(&mut frag);
+        frag.extend_from_slice(&hvr_body);
+        let hvr = DtlsRecord {
+            content_type: CONTENT_TYPE_HANDSHAKE,
+            version: DTLS_1_0,
+            epoch: 0,
+            sequence_number: 0,
+            fragment: frag,
+        };
+
+        let retries = hs.receive(&hvr).unwrap();
+        assert_eq!(retries.len(), 1);
+        let retry_hdr = HandshakeHeader::decode(&retries[0].fragment).unwrap();
+        assert_eq!(
+            retry_hdr.message_seq, 1,
+            "retried ClientHello MUST use message_seq=1 per RFC 6347 §4.2.2"
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_unsupported_version() {
+        let mut rng = FixedRng(0);
+        let mut hs = DtlsClientHandshake::new(&mut rng);
+        hs.build_client_hello().unwrap();
+
+        // Forge a ServerHello with SSLv3 version (0x0300) — neither
+        // DTLS 1.0 nor DTLS 1.2. Client must reject.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x00]); // bogus version
+        body.extend_from_slice(&[0u8; 32]); // server_random
+        body.push(0); // session_id len
+        body.extend_from_slice(&TLS_RSA_WITH_AES_128_CBC_SHA256);
+        body.push(0); // compression = null
+
+        let mut frag = Vec::new();
+        HandshakeHeader::unfragmented(HT_SERVER_HELLO, body.len() as u32, 0)
+            .encode(&mut frag);
+        frag.extend_from_slice(&body);
+        let sh = DtlsRecord {
+            content_type: CONTENT_TYPE_HANDSHAKE,
+            version: DTLS_1_0,
+            epoch: 0,
+            sequence_number: 0,
+            fragment: frag,
+        };
+        let err = hs.receive(&sh).unwrap_err();
+        assert!(matches!(err, DtlsError::VersionMismatch));
+    }
+
+    #[test]
     fn hello_verify_request_triggers_cookie_retry() {
         let mut rng = FixedRng(0);
         let mut hs = DtlsClientHandshake::new(&mut rng);
@@ -823,8 +954,55 @@ mod tests {
         };
         let mut rng = FixedRng(0x42);
         let pms = [0xAA; PRE_MASTER_SECRET_SIZE];
-        let ct = rsa_pkcs1_v15_encrypt(&key, &pms, &mut rng);
+        let ct = rsa_pkcs1_v15_encrypt(&key, &pms, &mut rng).unwrap();
         assert_eq!(ct.len(), 128, "ciphertext must equal modulus size");
+    }
+
+    #[test]
+    fn rsa_pkcs1_v15_encrypt_rejects_undersized_modulus() {
+        // 256-bit modulus is too small to fit a 48-byte PMS plus
+        // 11 bytes of PKCS#1 v1.5 framing (32 < 59).
+        let key = RsaPublicKey {
+            n: BigUint::from_be_bytes(&[0xFF; 32]),
+            e: BigUint::from_be_bytes(&[0x01, 0x00, 0x01]),
+        };
+        let mut rng = FixedRng(0);
+        let pms = [0xAA; PRE_MASTER_SECRET_SIZE];
+        let err = rsa_pkcs1_v15_encrypt(&key, &pms, &mut rng).unwrap_err();
+        assert!(matches!(err, DtlsError::KeyTooSmall));
+    }
+
+    #[test]
+    fn rsa_pkcs1_v15_encrypt_pkcs1_structure() {
+        // Encrypt against n = (very small prime-like) 7-byte modulus
+        // just to recover the EM bytes from (c mod n) for inspection
+        // is not trivial; instead, exercise the EM construction
+        // indirectly by requiring: for a 1024-bit modulus and empty
+        // exponent (e = 1) the ciphertext equals EM padded to k. EM
+        // layout per RFC 8017 §7.2.1: 0x00 || 0x02 || PS (nonzero)
+        // || 0x00 || message.
+        let one_modulus = {
+            let mut buf = [0u8; 128];
+            buf[0] = 0x80; // 1024-bit high bit set, very large number
+            buf
+        };
+        let key = RsaPublicKey {
+            n: BigUint::from_be_bytes(&one_modulus),
+            e: BigUint::from_be_bytes(&[0x01]), // e = 1 → c = m
+        };
+        let mut rng = FixedRng(0x01);
+        let msg = [0xAAu8; 48];
+        let ct = rsa_pkcs1_v15_encrypt(&key, &msg, &mut rng).unwrap();
+        assert_eq!(ct.len(), 128);
+        // First two bytes must be 0x00, 0x02.
+        assert_eq!(ct[0], 0x00);
+        assert_eq!(ct[1], 0x02);
+        // Message is at the tail (last 48 bytes).
+        assert_eq!(&ct[80..128], &msg[..]);
+        // Separator byte 0x00 between PS and message.
+        assert_eq!(ct[79], 0x00);
+        // All PS bytes must be nonzero.
+        assert!(ct[2..79].iter().all(|&b| b != 0));
     }
 
     #[test]

@@ -233,13 +233,25 @@ fn cwnd_congestion_avoidance_growth() {
 }
 
 #[test]
-fn cwnd_on_loss_halves_and_sets_ssthresh() {
+fn cwnd_on_fast_retransmit_halves_and_sets_ssthresh() {
     let (mut c, _s) = drive_to_connected(100, 200);
     c.on_acks_received(20); // grow cwnd to 22
     let before = c.cwnd();
-    c.on_loss();
+    c.on_fast_retransmit();
     assert_eq!(c.ssthresh(), core::cmp::max(before / 2, 2));
+    // Fast-retransmit: cwnd collapses to ssthresh (RFC 5681 §3.2).
     assert_eq!(c.cwnd(), c.ssthresh());
+}
+
+#[test]
+fn cwnd_on_rto_timeout_restarts_slow_start() {
+    let (mut c, _s) = drive_to_connected(100, 200);
+    c.on_acks_received(20); // grow cwnd
+    let before = c.cwnd();
+    c.on_rto_timeout();
+    // RFC 5681 §3.1: RTO collapses cwnd to 1 SMSS and halves ssthresh.
+    assert_eq!(c.ssthresh(), core::cmp::max(before / 2, 2));
+    assert_eq!(c.cwnd(), 1);
 }
 
 #[test]
@@ -554,4 +566,126 @@ fn dtls_integration_point_documented() {
     // Future: c.start_dtls_handshake(...) → drives DTLS ClientHello
     // over the same session, producing datagrams to send.
     // For now, this is a documentation-only test.
+}
+
+// =============================================================================
+// 11. Hardening — v3 cookie validation, OOM window cap, lossy suppression
+// =============================================================================
+
+#[test]
+fn server_accepts_matching_v3_cookie() {
+    let mut ccfg = client_cfg(100);
+    ccfg.protocol_version = RDPUDP_PROTOCOL_VERSION_3;
+    ccfg.cookie_hash = Some([0xC0; 32]);
+    let mut scfg = server_cfg(200);
+    scfg.protocol_version = RDPUDP_PROTOCOL_VERSION_3;
+    scfg.cookie_hash = Some([0xC0; 32]);
+
+    let (c, s) = drive_to_connected_custom(ccfg, scfg);
+    assert!(c.is_connected());
+    assert!(s.is_connected());
+}
+
+#[test]
+fn server_rejects_mismatched_v3_cookie() {
+    let mut ccfg = client_cfg(100);
+    ccfg.protocol_version = RDPUDP_PROTOCOL_VERSION_3;
+    ccfg.cookie_hash = Some([0xC0; 32]);
+    let mut scfg = server_cfg(200);
+    scfg.protocol_version = RDPUDP_PROTOCOL_VERSION_3;
+    scfg.cookie_hash = Some([0xDE; 32]);
+
+    let mut c = RdpeudpSession::new(ccfg);
+    let mut s = RdpeudpSession::new_server(scfg);
+    let mut syn = Vec::new();
+    c.build_syn(&mut syn).unwrap();
+    let mut syn_ack = Vec::new();
+    let err = s.receive(&syn, &mut syn_ack).unwrap_err();
+    // Server must reject BEFORE sending any SYN+ACK.
+    assert!(syn_ack.is_empty());
+    assert!(format!("{:?}", err).contains("cookieHash"));
+}
+
+#[test]
+fn server_rejects_missing_v3_cookie() {
+    // Client advertises v3 but omits cookie (e.g. misconfigured or
+    // downgrade attempt). With the fixed server decode path, the
+    // SYNEX parse succeeds with cookie_hash=None and the server's
+    // expected-cookie check then fails.
+    let mut ccfg = client_cfg(100);
+    ccfg.protocol_version = RDPUDP_PROTOCOL_VERSION_3;
+    ccfg.cookie_hash = None;
+    let mut scfg = server_cfg(200);
+    scfg.protocol_version = RDPUDP_PROTOCOL_VERSION_3;
+    scfg.cookie_hash = Some([0xC0; 32]);
+
+    let mut c = RdpeudpSession::new(ccfg);
+    let mut s = RdpeudpSession::new_server(scfg);
+    let mut syn = Vec::new();
+    c.build_syn(&mut syn).unwrap();
+    let mut syn_ack = Vec::new();
+    assert!(s.receive(&syn, &mut syn_ack).is_err());
+}
+
+#[test]
+fn reorder_buffer_drops_out_of_window_sn() {
+    let (c, mut s) = drive_to_connected(100, 200);
+    // Craft a datagram with SN very far ahead: next_deliver + 1_000_000.
+    // The window cap should drop it silently; no ordered data appears.
+    let mut out = Vec::new();
+    let far_sn = c.next_send_sn().wrapping_add(1_000_000);
+
+    use justrdp_core::{Encode, WriteCursor};
+    let header = RdpUdpFecHeader {
+        sn_source_ack: c.highest_received_sn(),
+        u_receive_window_size: 64,
+        u_flags: RDPUDP_FLAG_DATA | RDPUDP_FLAG_ACK,
+    };
+    let ack_vec = AckVectorHeader::new(vec![AckVectorElement::new(
+        VectorElementState::DatagramReceived,
+        1,
+    )]);
+    let src_hdr = SourcePayloadHeader {
+        sn_coded: far_sn,
+        sn_source_start: far_sn,
+    };
+    let payload = b"far";
+    let size = header.size() + ack_vec.size() + src_hdr.size() + payload.len();
+    out.resize(size, 0);
+    let mut cur = WriteCursor::new(&mut out);
+    header.encode(&mut cur).unwrap();
+    ack_vec.encode(&mut cur).unwrap();
+    src_hdr.encode(&mut cur).unwrap();
+    cur.write_slice(payload, "payload").unwrap();
+
+    s.receive(&out, &mut Vec::new()).unwrap();
+    // Out-of-window packet is dropped, so nothing becomes deliverable.
+    assert!(s.take_ordered_data().is_empty());
+}
+
+#[test]
+fn lossy_mode_does_not_retain_send_buf() {
+    let mut ccfg = client_cfg(100);
+    ccfg.lossy = true;
+    let mut scfg = server_cfg(200);
+    scfg.lossy = true;
+    let (mut c, _s) = drive_to_connected_custom(ccfg, scfg);
+    assert!(c.negotiated_lossy());
+
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        c.build_data_packet(b"x", &mut out).unwrap();
+    }
+    // Lossy mode: packets are NOT retained for retransmission.
+    assert_eq!(c.unacked_packets().len(), 0);
+}
+
+#[test]
+fn reliable_mode_retains_send_buf() {
+    let (mut c, _s) = drive_to_connected(100, 200);
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        c.build_data_packet(b"x", &mut out).unwrap();
+    }
+    assert_eq!(c.unacked_packets().len(), 3);
 }

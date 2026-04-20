@@ -525,15 +525,25 @@ pub const SYN_DATA_EX_PAYLOAD_WITH_COOKIE_SIZE: usize = 36;
 
 impl Encode for SynDataExPayload {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        dst.write_u16_le(self.u_syn_ex_flags, "uSynExFlags")?;
-        dst.write_u16_le(self.u_udp_ver, "uUdpVer")?;
-        if let Some(hash) = &self.cookie_hash {
+        if self.cookie_hash.is_some() {
+            // §2.2.2.9: cookieHash is only meaningful when the
+            // version info is actually valid AND the version is v3.
             if self.u_udp_ver != RDPUDP_PROTOCOL_VERSION_3 {
                 return Err(EncodeError::invalid_value(
                     "RDPUDP_SYNDATAEX_PAYLOAD",
                     "cookieHash present but uUdpVer != PROTOCOL_VERSION_3",
                 ));
             }
+            if self.u_syn_ex_flags & RDPUDP_VERSION_INFO_VALID == 0 {
+                return Err(EncodeError::invalid_value(
+                    "RDPUDP_SYNDATAEX_PAYLOAD",
+                    "cookieHash present but RDPUDP_VERSION_INFO_VALID clear",
+                ));
+            }
+        }
+        dst.write_u16_le(self.u_syn_ex_flags, "uSynExFlags")?;
+        dst.write_u16_le(self.u_udp_ver, "uUdpVer")?;
+        if let Some(hash) = &self.cookie_hash {
             dst.write_slice(hash, "cookieHash")?;
         }
         Ok(())
@@ -564,6 +574,36 @@ impl SynDataExPayload {
         let u_syn_ex_flags = src.read_u16_le("uSynExFlags")?;
         let u_udp_ver = src.read_u16_le("uUdpVer")?;
         let cookie_hash = if expect_cookie_hash {
+            let slice = src.read_slice(32, "cookieHash")?;
+            let mut h = [0u8; 32];
+            h.copy_from_slice(slice);
+            Some(h)
+        } else {
+            None
+        };
+        Ok(Self {
+            u_syn_ex_flags,
+            u_udp_ver,
+            cookie_hash,
+        })
+    }
+
+    /// Decode a client→server SYN SYNDATAEX payload, auto-detecting
+    /// the optional `cookieHash` from the version field.
+    ///
+    /// Per §2.2.2.9 the hash is present iff
+    /// `uUdpVer == RDPUDP_PROTOCOL_VERSION_3` AND the
+    /// `RDPUDP_VERSION_INFO_VALID` flag is set. The server uses this
+    /// entry point because the SYN+ACK (server→client) never carries
+    /// a cookie — asymmetry the PDU alone cannot infer.
+    pub fn decode_client_syn<'de>(
+        src: &mut ReadCursor<'de>,
+    ) -> DecodeResult<Self> {
+        let u_syn_ex_flags = src.read_u16_le("uSynExFlags")?;
+        let u_udp_ver = src.read_u16_le("uUdpVer")?;
+        let has_cookie = u_udp_ver == RDPUDP_PROTOCOL_VERSION_3
+            && (u_syn_ex_flags & RDPUDP_VERSION_INFO_VALID) != 0;
+        let cookie_hash = if has_cookie {
             let slice = src.read_slice(32, "cookieHash")?;
             let mut h = [0u8; 32];
             h.copy_from_slice(slice);

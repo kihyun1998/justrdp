@@ -29,6 +29,7 @@
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use justrdp_core::{
@@ -157,6 +158,13 @@ pub const INITIAL_CWND: u32 = 2;
 /// Initial slow-start threshold (packets).
 pub const INITIAL_SSTHRESH: u32 = 64;
 
+/// Multiplier applied to the negotiated `receive_window_size` to
+/// bound the reorder / recv bitmap memory. Anything beyond this many
+/// packets ahead of the delivery frontier is treated as a peer
+/// protocol violation and dropped (defense against a single-datagram
+/// allocation DoS where a peer advertises SN = base + 2³¹).
+pub const MAX_REORDER_WINDOW_FACTOR: u32 = 4;
+
 // =============================================================================
 // Result of a receive() call
 // =============================================================================
@@ -224,8 +232,10 @@ pub struct RdpeudpSession {
     // ── Reorder buffer (reliable mode) ──
 
     /// Received payloads keyed by their source SN, waiting to be
-    /// delivered in order. `None` entries represent gaps.
-    reorder_buf: Vec<Option<Vec<u8>>>,
+    /// delivered in order. `None` entries represent gaps. Backed by
+    /// a `VecDeque` so the ordered prefix flush runs in O(1) per
+    /// packet instead of O(n) per `remove(0)`.
+    reorder_buf: VecDeque<Option<Vec<u8>>>,
     /// The next SN the application expects to read (in-order
     /// delivery frontier).
     next_deliver_sn: u32,
@@ -286,7 +296,7 @@ impl RdpeudpSession {
             recv_bitmap: Vec::new(),
             recv_base: 0,
             ack_of_acks_base: 0,
-            reorder_buf: Vec::new(),
+            reorder_buf: VecDeque::new(),
             next_deliver_sn: 0,
             ordered_output: Vec::new(),
             srtt_us: 0,
@@ -537,12 +547,29 @@ impl RdpeudpSession {
             let _corr = CorrelationIdPayload::decode(cur)?;
         }
 
-        // Parse optional SYNEX.
+        // Parse optional SYNEX. For v3 clients this consumes the
+        // 32-byte `cookieHash` too (§2.2.2.9). Leaving those bytes
+        // unread would desync the cursor for any payload we add in
+        // the future.
         let mut client_version: Option<u16> = None;
         if flags & RDPUDP_FLAG_SYNEX != 0 {
-            let synex = SynDataExPayload::decode_with_cookie(cur, false)?;
+            let synex = SynDataExPayload::decode_client_syn(cur)?;
             if synex.u_syn_ex_flags & RDPUDP_VERSION_INFO_VALID != 0 {
                 client_version = Some(synex.u_udp_ver);
+            }
+            // If the server was configured with an expected cookie
+            // hash, validate it in constant time. A mismatched
+            // cookie is a session-fixation / replay indicator and
+            // MUST abort the handshake before we emit SYN+ACK.
+            if let Some(expected) = self.config.cookie_hash {
+                match synex.cookie_hash {
+                    Some(got) if ct_eq_cookie(&got, &expected) => {}
+                    _ => {
+                        return Err(RdpeudpError::Protocol(
+                            "v3 cookieHash missing or does not match expected value",
+                        ));
+                    }
+                }
             }
         }
 
@@ -704,6 +731,9 @@ impl RdpeudpSession {
     }
 
     /// Record that we received a packet with the given source SN.
+    ///
+    /// Ignores SNs beyond `receive_window_size × MAX_REORDER_WINDOW_FACTOR`
+    /// — same allocation-DoS guard as [`reorder_insert`].
     fn record_received(&mut self, sn: u32) {
         if self.recv_bitmap.is_empty() {
             // First data packet: initialize the bitmap.
@@ -716,6 +746,11 @@ impl RdpeudpSession {
             return;
         }
         let offset = sn.wrapping_sub(self.recv_base) as usize;
+        let max_window = (self.config.receive_window_size as usize)
+            .saturating_mul(MAX_REORDER_WINDOW_FACTOR as usize);
+        if offset >= max_window {
+            return; // out of window — drop silently (peer is misbehaving)
+        }
         if offset >= self.recv_bitmap.len() {
             // Extend the bitmap up to this SN.
             self.recv_bitmap.resize(offset + 1, false);
@@ -859,21 +894,34 @@ impl RdpeudpSession {
 
     /// Internal: insert a received payload into the reorder buffer
     /// and flush any newly-contiguous payloads to `ordered_output`.
+    ///
+    /// Drops the payload if its SN lies beyond
+    /// `next_deliver_sn + receive_window_size × MAX_REORDER_WINDOW_FACTOR`
+    /// — a single crafted datagram with `sn = next_deliver_sn + 2³¹`
+    /// would otherwise try to resize the buffer to ~2 billion
+    /// entries (≈48 GiB of `Option<Vec<u8>>`) and OOM the host.
     fn reorder_insert(&mut self, sn: u32, payload: Vec<u8>) {
         if sn_before(sn, self.next_deliver_sn) {
             return; // duplicate / old
         }
         let idx = sn.wrapping_sub(self.next_deliver_sn) as usize;
+        let max_window = (self.config.receive_window_size as usize)
+            .saturating_mul(MAX_REORDER_WINDOW_FACTOR as usize);
+        if idx >= max_window {
+            return; // out of window — drop
+        }
         if idx >= self.reorder_buf.len() {
             self.reorder_buf.resize(idx + 1, None);
         }
         if self.reorder_buf[idx].is_none() {
             self.reorder_buf[idx] = Some(payload);
         }
-        // Flush the contiguous prefix.
-        while let Some(Some(_)) = self.reorder_buf.first() {
-            let data = self.reorder_buf.remove(0).unwrap();
-            self.ordered_output.push(data);
+        // Flush the contiguous prefix. `VecDeque::pop_front` is O(1)
+        // per packet; the previous `Vec::remove(0)` was O(n²) over
+        // a burst.
+        while matches!(self.reorder_buf.front(), Some(Some(_))) {
+            let slot = self.reorder_buf.pop_front().unwrap();
+            self.ordered_output.push(slot.unwrap());
             self.next_deliver_sn = self.next_deliver_sn.wrapping_add(1);
         }
     }
@@ -959,11 +1007,24 @@ impl RdpeudpSession {
         }
     }
 
-    /// Notify the session of a loss event (e.g. triple duplicate ACK
-    /// or RTO expiry). Halves cwnd and sets ssthresh per Reno.
-    pub fn on_loss(&mut self) {
+    /// Notify the session that a **fast-retransmit** loss event
+    /// occurred (triple duplicate ACK / ACK-vector gap). RFC 5681
+    /// §3.2 keeps `cwnd = ssthresh = max(cwnd/2, 2)` so delivery
+    /// resumes in congestion avoidance, not slow-start.
+    pub fn on_fast_retransmit(&mut self) {
         self.ssthresh = core::cmp::max(self.cwnd / 2, 2);
         self.cwnd = self.ssthresh;
+        self.ack_count_since_increase = 0;
+    }
+
+    /// Notify the session that the retransmission timer expired.
+    /// RFC 5681 §3.1 requires restarting slow-start with
+    /// `cwnd = 1 SMSS` and halving ssthresh — this is strictly more
+    /// conservative than the fast-retransmit response and is used
+    /// when no ACK feedback was received at all.
+    pub fn on_rto_timeout(&mut self) {
+        self.ssthresh = core::cmp::max(self.cwnd / 2, 2);
+        self.cwnd = 1;
         self.ack_count_since_increase = 0;
     }
 
@@ -978,7 +1039,15 @@ impl RdpeudpSession {
 
     /// Record that a packet was sent (for retransmission tracking).
     /// Called automatically by [`build_data_packet`].
+    ///
+    /// No-op in lossy mode: MS-RDPEUDP §3.1.1 states a lossy session
+    /// provides no retransmission guarantees, so retaining packets
+    /// for replay would be wasted memory (and incorrect if the caller
+    /// used [`unacked_packets`] to rebuild a retransmit queue).
     fn record_sent(&mut self, sn: u32, payload: Vec<u8>) {
+        if self.negotiated_lossy {
+            return;
+        }
         self.send_buf.push((sn, payload));
     }
 
@@ -1026,6 +1095,17 @@ fn sn_after(a: u32, b: u32) -> bool {
 /// Return `true` if `a` is strictly "before" `b`.
 fn sn_before(a: u32, b: u32) -> bool {
     sn_after(b, a)
+}
+
+/// Constant-time 32-byte cookie hash compare. Closes a timing oracle
+/// that would otherwise let an attacker recover the expected cookie
+/// one byte at a time across repeated SYN attempts.
+fn ct_eq_cookie(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 // =============================================================================
