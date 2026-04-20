@@ -40,7 +40,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use justrdp_core::{DecodeError, ReadCursor, WriteCursor};
+use justrdp_core::{DecodeError, DecodeErrorKind, ReadCursor, WriteCursor};
 use justrdp_rpch::pdu::{
     BindAckPdu, BindPdu, ContextElement, SyntaxId, BIND_PTYPE, PFC_FIRST_FRAG, PFC_LAST_FRAG,
     RESULT_ACCEPTANCE,
@@ -103,8 +103,13 @@ pub fn build_tsproxy_bind_pdu(call_id: u32) -> Vec<u8> {
 /// Reason a BIND_ACK was rejected or malformed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindAckError {
-    /// The PDU bytes failed to decode as a BIND_ACK.
-    Decode(&'static str),
+    /// The PDU bytes failed to decode as a BIND_ACK. The first field
+    /// is a short descriptor (`"PDU shorter than common header"` for
+    /// our own guards, or the `context` field of the underlying
+    /// [`DecodeError`] for failures surfaced through `From`). The
+    /// second field carries the [`DecodeErrorKind`] when a
+    /// `DecodeError` was converted — otherwise `None`.
+    Decode(&'static str, Option<DecodeErrorKind>),
     /// Decoded fine but not a BIND_ACK (unexpected `ptype`).
     NotBindAck { got_ptype: u8 },
     /// BIND_ACK contained no result entries — the server did not
@@ -117,7 +122,10 @@ pub enum BindAckError {
 impl core::fmt::Display for BindAckError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Decode(ctx) => write!(f, "BIND_ACK decode failed: {ctx}"),
+            Self::Decode(ctx, Some(kind)) => {
+                write!(f, "BIND_ACK decode failed in {ctx}: {kind:?}")
+            }
+            Self::Decode(ctx, None) => write!(f, "BIND_ACK decode failed: {ctx}"),
             Self::NotBindAck { got_ptype } => {
                 write!(f, "not a BIND_ACK (ptype={got_ptype:#04x})")
             }
@@ -133,8 +141,8 @@ impl core::fmt::Display for BindAckError {
 impl core::error::Error for BindAckError {}
 
 impl From<DecodeError> for BindAckError {
-    fn from(_: DecodeError) -> Self {
-        Self::Decode("DecodeError")
+    fn from(e: DecodeError) -> Self {
+        Self::Decode(e.context, Some(e.kind))
     }
 }
 
@@ -143,7 +151,7 @@ impl From<DecodeError> for BindAckError {
 /// success.
 pub fn validate_tsproxy_bind_ack(pdu_bytes: &[u8]) -> Result<u32, BindAckError> {
     if pdu_bytes.len() < 16 {
-        return Err(BindAckError::Decode("PDU shorter than common header"));
+        return Err(BindAckError::Decode("PDU shorter than common header", None));
     }
     let mut c = ReadCursor::new(pdu_bytes);
     let pdu = BindAckPdu::decode(&mut c)?;
@@ -275,7 +283,7 @@ mod tests {
         // decoding as BindAckPdu fails and we surface `Decode`.
         let bytes = build_tsproxy_bind_pdu(1);
         let err = validate_tsproxy_bind_ack(&bytes).unwrap_err();
-        assert!(matches!(err, BindAckError::Decode(_)));
+        assert!(matches!(err, BindAckError::Decode(..)));
     }
 
     #[test]

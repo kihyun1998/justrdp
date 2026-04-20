@@ -421,18 +421,20 @@ fn make_sec_websocket_key() -> Result<String, ConnectError> {
 /// Build a getrandom-backed [`MaskSource`] for the WebSocket frame
 /// codec. Called per connection; the closure itself draws a fresh
 /// key on each frame.
+///
+/// If the OS RNG is unavailable mid-session the closure panics rather
+/// than falling back to a predictable sentinel. A repeated or
+/// guessable mask lets an on-path attacker recover plaintext from
+/// correlated frames (RFC 6455 §10.3); silently demoting the
+/// WebSocket to cleartext-equivalent would be worse than tearing the
+/// session down. `getrandom` failure post-boot implies a fundamentally
+/// broken environment (no `/dev/urandom`, empty CNG entropy pool)
+/// where continuing is unsafe.
 fn make_mask_source() -> MaskSource {
     std::boxed::Box::new(|| {
         let mut m = [0u8; 4];
-        // If OS entropy is unavailable mid-session, fall back to a
-        // deterministic sentinel so encoding continues — masking is
-        // a denial-of-cache-poisoning measure, not a confidentiality
-        // control, and a predictable mask on one frame is less bad
-        // than dropping the session. Still log loudly if it ever
-        // happens.
-        if getrandom::getrandom(&mut m).is_err() {
-            m = [0xA5, 0x5A, 0xA5, 0x5A];
-        }
+        getrandom::getrandom(&mut m)
+            .expect("OS RNG unavailable — cannot safely mask WebSocket frames");
         m
     })
 }

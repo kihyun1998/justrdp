@@ -31,9 +31,8 @@ use justrdp_core::WriteBuf;
 
 use crate::client::{find_packet_size, GatewayClient, GatewayError};
 use crate::http::{encode_chunk, encode_final_chunk, ChunkError, ChunkedDecoder, PreambleSkipper};
-use crate::pdu::{DataPdu, PACKET_HEADER_SIZE};
-
-use justrdp_core::{Decode, ReadCursor};
+#[cfg(test)]
+use crate::pdu::PACKET_HEADER_SIZE;
 
 // =============================================================================
 // Error
@@ -53,6 +52,9 @@ pub enum ConnectError {
     /// The OUT channel closed before the handshake completed, or
     /// before an expected Data PDU payload was fully received.
     UnexpectedEof,
+    /// The server announced a `packet_length` that exceeds
+    /// [`crate::pdu::MAX_PACKET_SIZE`].
+    PacketTooLarge(crate::client::PacketTooLarge),
 }
 
 impl core::fmt::Display for ConnectError {
@@ -62,6 +64,7 @@ impl core::fmt::Display for ConnectError {
             Self::Gateway(e) => write!(f, "gateway protocol: {e:?}"),
             Self::Chunk(e) => write!(f, "gateway chunked encoding: {e:?}"),
             Self::UnexpectedEof => write!(f, "gateway transport: unexpected EOF"),
+            Self::PacketTooLarge(e) => write!(f, "{e}"),
         }
     }
 }
@@ -70,6 +73,7 @@ impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::PacketTooLarge(e) => Some(e),
             _ => None,
         }
     }
@@ -90,6 +94,12 @@ impl From<GatewayError> for ConnectError {
 impl From<ChunkError> for ConnectError {
     fn from(e: ChunkError) -> Self {
         Self::Chunk(e)
+    }
+}
+
+impl From<crate::client::PacketTooLarge> for ConnectError {
+    fn from(e: crate::client::PacketTooLarge) -> Self {
+        Self::PacketTooLarge(e)
     }
 }
 
@@ -224,7 +234,7 @@ fn read_next_pdu<R: Read>(
     scratch: &mut [u8],
 ) -> Result<Vec<u8>, ConnectError> {
     loop {
-        if let Some(size) = find_packet_size(&state.decoded) {
+        if let Some(size) = find_packet_size(&state.decoded)? {
             if state.decoded.len() >= size {
                 let pdu = state.decoded.drain(..size).collect::<Vec<u8>>();
                 return Ok(pdu);
@@ -254,7 +264,7 @@ impl<R: Read, W: Write> Read for GatewayConnection<R, W> {
         // Otherwise pull in enough bytes to decode the next Data PDU
         // and stash its payload in `pending`.
         loop {
-            if let Some(size) = find_packet_size(&self.decoded) {
+            if let Some(size) = find_packet_size(&self.decoded).map_err(io_other)? {
                 if self.decoded.len() >= size {
                     let pdu_bytes: Vec<u8> = self.decoded.drain(..size).collect();
                     let data = parse_data_pdu(&pdu_bytes).map_err(io_other)?;
@@ -320,20 +330,13 @@ impl<R: Read, W: Write> GatewayConnection<R, W> {
 }
 
 // =============================================================================
-// Internal parse helpers
+// Internal parse helpers (shared with ws_transport via transport_util)
 // =============================================================================
 
-fn parse_data_pdu(bytes: &[u8]) -> Result<Vec<u8>, GatewayError> {
-    if bytes.len() < PACKET_HEADER_SIZE {
-        return Err(GatewayError::InvalidState("data pdu: short header"));
-    }
-    let mut cur = ReadCursor::new(bytes);
-    let pdu = DataPdu::decode(&mut cur).map_err(GatewayError::Decode)?;
-    Ok(pdu.data)
-}
+use crate::transport_util::{io_other, parse_data_pdu as parse_data_pdu_shared};
 
-fn io_other<E: core::fmt::Debug>(e: E) -> io::Error {
-    io::Error::other(alloc::format!("{e:?}"))
+fn parse_data_pdu(bytes: &[u8]) -> Result<Vec<u8>, GatewayError> {
+    parse_data_pdu_shared(bytes, "data pdu: short header")
 }
 
 // =============================================================================
@@ -353,7 +356,7 @@ mod tests {
         HTTP_TUNNEL_RESPONSE_FIELD_CAPS, HTTP_TUNNEL_RESPONSE_FIELD_TUNNEL_ID, STATUS_SUCCESS,
     };
 
-    use justrdp_core::{Encode, WriteCursor};
+    use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
     use std::io::Cursor;
 
     fn encode_pdu<T: Encode>(pdu: &T) -> Vec<u8> {
@@ -449,7 +452,7 @@ mod tests {
         let mut offset = 0;
         let mut pdus = 0;
         while offset + PACKET_HEADER_SIZE <= body.len() {
-            let size = find_packet_size(&body[offset..]).unwrap();
+            let size = find_packet_size(&body[offset..]).unwrap().unwrap();
             assert!(offset + size <= body.len(), "body truncated mid-PDU");
             offset += size;
             pdus += 1;

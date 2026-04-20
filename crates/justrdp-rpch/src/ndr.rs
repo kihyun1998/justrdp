@@ -547,7 +547,8 @@ impl<'a> NdrDecoder<'a> {
     /// Decode a conformant-varying UTF-16LE string **including** its
     /// NUL terminator, returning a heap [`String`]. Errors if the
     /// string is empty (MS-RPCE strings must contain at least the
-    /// NUL), if `offset != 0`, or if the data contains unpaired
+    /// NUL), if `offset != 0`, if `actual_count` exceeds
+    /// [`MAX_NDR_STRING_UNITS`], or if the data contains unpaired
     /// surrogates.
     pub fn read_conformant_varying_wstring(&mut self) -> NdrResult<String> {
         let (_max, offset, actual) = self.read_conformant_varying_header()?;
@@ -559,6 +560,11 @@ impl<'a> NdrDecoder<'a> {
         if actual == 0 {
             return Err(NdrError::InvalidData {
                 context: "wstring: zero actual_count (missing NUL terminator)",
+            });
+        }
+        if actual as usize > MAX_NDR_STRING_UNITS {
+            return Err(NdrError::InvalidData {
+                context: "wstring: actual_count exceeds MAX_NDR_STRING_UNITS",
             });
         }
         let mut units = Vec::with_capacity(actual as usize);
@@ -591,6 +597,11 @@ impl<'a> NdrDecoder<'a> {
                 context: "cstring: zero actual_count (missing NUL terminator)",
             });
         }
+        if actual as usize > MAX_NDR_STRING_UNITS {
+            return Err(NdrError::InvalidData {
+                context: "cstring: actual_count exceeds MAX_NDR_STRING_UNITS",
+            });
+        }
         let bytes = self.read_bytes(actual as usize, "cstring data")?;
         if *bytes.last().unwrap() != 0 {
             return Err(NdrError::InvalidData {
@@ -602,6 +613,18 @@ impl<'a> NdrDecoder<'a> {
         Ok(out)
     }
 }
+
+/// Upper bound on a single NDR conformant-varying string's
+/// `actual_count`, applied to both wstring (UTF-16 code units) and
+/// cstring (ASCII bytes) decoders. Without this cap an attacker-chosen
+/// `actual_count = u32::MAX` would force a 4 GiB `Vec::with_capacity`
+/// and trigger OOM before the cursor-level bounds check ever runs.
+///
+/// 32 Ki code units is 4× larger than the longest field TsProxy
+/// exchanges in practice (resource names, hostnames). The cursor still
+/// enforces that the requested bytes actually fit in the input stream,
+/// so this cap only bounds the pre-allocation cost.
+pub const MAX_NDR_STRING_UNITS: usize = 32 * 1024;
 
 // =============================================================================
 // Tests
@@ -813,6 +836,46 @@ mod tests {
             d.read_conformant_varying_wstring().unwrap_err(),
             NdrError::InvalidData { .. }
         ));
+    }
+
+    #[test]
+    fn wstring_rejects_actual_count_over_string_cap() {
+        // actual_count = MAX_NDR_STRING_UNITS + 1 would trigger a
+        // multi-MiB Vec::with_capacity without the cap. max_count is
+        // set to the same value to pass the invariant check; the
+        // stream itself is short (no data bytes), which means without
+        // the cap we would first allocate, then error on the cursor
+        // bounds check.
+        let over = (MAX_NDR_STRING_UNITS + 1) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&over.to_le_bytes()); // max_count
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // offset
+        bytes.extend_from_slice(&over.to_le_bytes()); // actual_count
+        let mut d = NdrDecoder::new(&bytes);
+        let err = d.read_conformant_varying_wstring().unwrap_err();
+        match err {
+            NdrError::InvalidData { context } => {
+                assert!(context.contains("exceeds MAX_NDR_STRING_UNITS"));
+            }
+            _ => panic!("expected InvalidData, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn cstring_rejects_actual_count_over_string_cap() {
+        let over = (MAX_NDR_STRING_UNITS + 1) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&over.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&over.to_le_bytes());
+        let mut d = NdrDecoder::new(&bytes);
+        let err = d.read_conformant_varying_cstring().unwrap_err();
+        match err {
+            NdrError::InvalidData { context } => {
+                assert!(context.contains("exceeds MAX_NDR_STRING_UNITS"));
+            }
+            _ => panic!("expected InvalidData, got {err:?}"),
+        }
     }
 
     #[test]

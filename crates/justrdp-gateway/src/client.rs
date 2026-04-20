@@ -40,7 +40,7 @@ use crate::pdu::{
     HTTP_CAPABILITY_IDLE_TIMEOUT, HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN,
     HTTP_CAPABILITY_MESSAGING_SERVICE_MSG, HTTP_CAPABILITY_REAUTH,
     HTTP_CAPABILITY_TYPE_QUAR_SOH, HTTP_CAPABILITY_UDP_TRANSPORT, HTTP_EXTENDED_AUTH_NONE,
-    HTTP_EXTENDED_AUTH_PAA, PACKET_HEADER_SIZE, STATUS_SUCCESS,
+    HTTP_EXTENDED_AUTH_PAA, MAX_PACKET_SIZE, PACKET_HEADER_SIZE, STATUS_SUCCESS,
 };
 
 // =============================================================================
@@ -191,6 +191,33 @@ pub enum GatewayError {
     Decode(DecodeError),
 }
 
+impl core::fmt::Display for GatewayError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidState(ctx) => write!(f, "gateway: invalid state ({ctx})"),
+            Self::UnexpectedPdu { expected, got } => write!(
+                f,
+                "gateway: unexpected PDU (expected {expected}, got packetType {got:#06x})"
+            ),
+            Self::ServerStatus { stage, code } => write!(
+                f,
+                "gateway: server returned non-success status at {stage} (HRESULT {code:#010x})"
+            ),
+            Self::CapabilityMismatch => {
+                write!(f, "gateway: required HTTP_TUNNEL_PACKET capabilities not granted")
+            }
+            Self::Encode(e) => write!(f, "gateway: encode: {e}"),
+            Self::Decode(e) => write!(f, "gateway: decode: {e}"),
+        }
+    }
+}
+
+impl core::error::Error for GatewayError {
+    // EncodeError / DecodeError from justrdp-core do not implement
+    // core::error::Error, so we expose no `source`. Their Display
+    // output is still embedded in our own Display above.
+}
+
 impl From<EncodeError> for GatewayError {
     fn from(e: EncodeError) -> Self {
         Self::Encode(e)
@@ -218,20 +245,53 @@ pub enum Written {
 // PDU framing helper
 // =============================================================================
 
-/// Return the total byte size of the MS-TSGU PDU at the start of `bytes`,
-/// or `None` if fewer than 8 bytes are available.
+/// Error returned when [`find_packet_size`] refuses a packet that
+/// exceeds [`MAX_PACKET_SIZE`]. Signals an unrecoverable protocol
+/// violation — the caller should tear the channel down rather than
+/// continuing to buffer attacker-chosen bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketTooLarge {
+    /// The `packet_length` value the peer advertised.
+    pub declared: u32,
+}
+
+impl core::fmt::Display for PacketTooLarge {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "gateway packet_length {} exceeds {} byte cap",
+            self.declared, MAX_PACKET_SIZE
+        )
+    }
+}
+
+impl core::error::Error for PacketTooLarge {}
+
+/// Return the total byte size of the MS-TSGU PDU at the start of
+/// `bytes`, or `Ok(None)` if fewer than 8 bytes are available so far.
 ///
-/// Reads the `packet_length` field of `HTTP_PACKET_HEADER` (§2.2.10.9)
-/// and returns it. The caller must buffer incoming bytes from the OUT
-/// channel until this function returns `Some(n)`, at which point the
-/// first `n` bytes form a complete PDU ready to pass to
+/// Reads the `packet_length` field of `HTTP_PACKET_HEADER`
+/// (§2.2.10.9). The caller must buffer incoming bytes from the OUT
+/// channel until this function returns `Ok(Some(n))`, at which point
+/// the first `n` bytes form a complete PDU ready to pass to
 /// [`GatewayClient::step`].
-pub fn find_packet_size(bytes: &[u8]) -> Option<usize> {
+///
+/// Returns `Err(PacketTooLarge)` when the peer advertises a length
+/// over [`MAX_PACKET_SIZE`]. Without this cap, a malicious or
+/// compromised gateway could set `packet_length = 0xFFFF_FFFF` and
+/// force the caller to buffer ~4 GiB before discovering the truncation
+/// — a trivial remote OOM.
+pub fn find_packet_size(bytes: &[u8]) -> Result<Option<usize>, PacketTooLarge> {
     if bytes.len() < PACKET_HEADER_SIZE {
-        return None;
+        return Ok(None);
     }
     let packet_length = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    Some(packet_length as usize)
+    if packet_length as usize > MAX_PACKET_SIZE {
+        return Err(PacketTooLarge {
+            declared: packet_length,
+        });
+    }
+    Ok(Some(packet_length as usize))
 }
 
 // =============================================================================
@@ -801,13 +861,23 @@ mod tests {
 
     #[test]
     fn find_packet_size_handles_partial_header() {
-        assert_eq!(find_packet_size(&[]), None);
-        assert_eq!(find_packet_size(&[0; 7]), None);
+        assert_eq!(find_packet_size(&[]), Ok(None));
+        assert_eq!(find_packet_size(&[0; 7]), Ok(None));
         // 8-byte header claiming a 12-byte packet
         assert_eq!(
             find_packet_size(&[0x10, 0, 0, 0, 0x0C, 0, 0, 0]),
-            Some(12)
+            Ok(Some(12))
         );
+    }
+
+    #[test]
+    fn find_packet_size_rejects_oversize_length_field() {
+        // An attacker-controlled gateway announces a 2 GiB packet.
+        // Without the cap the caller would buffer 2 GiB before
+        // finding out the stream is malformed.
+        let oversize = [0x10, 0, 0, 0, 0x00, 0x00, 0x00, 0x80];
+        let err = find_packet_size(&oversize).unwrap_err();
+        assert_eq!(err.declared, 0x8000_0000);
     }
 
     // ---------- Helpers ----------

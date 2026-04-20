@@ -178,12 +178,24 @@ impl WsUpgradeRequest {
 fn header(out: &mut Vec<u8>, name: &str, value: &str) {
     push(out, name);
     push(out, ": ");
-    push(out, value);
+    push_header_value(out, value);
     push(out, "\r\n");
 }
 
 fn push(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
+}
+
+/// Append an HTTP header value byte-by-byte, dropping any CR (`\r`)
+/// or LF (`\n`) per RFC 9110 §5.5. Prevents header injection via
+/// attacker-controlled fields (Host override, sub-protocol, auth
+/// header).
+fn push_header_value(out: &mut Vec<u8>, value: &str) {
+    for &b in value.as_bytes() {
+        if b != b'\r' && b != b'\n' {
+            out.push(b);
+        }
+    }
 }
 
 // =============================================================================

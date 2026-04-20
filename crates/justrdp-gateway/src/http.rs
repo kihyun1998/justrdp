@@ -188,12 +188,27 @@ impl RdgHttpRequest {
 fn header(out: &mut Vec<u8>, name: &str, value: &str) {
     push_str(out, name);
     push_str(out, ": ");
-    push_str(out, value);
+    push_header_value(out, value);
     push_str(out, "\r\n");
 }
 
 fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
+}
+
+/// Append an HTTP header value byte-by-byte, dropping any CR (`\r`)
+/// or LF (`\n`). RFC 9110 §5.5 forbids these in field values; if an
+/// attacker-controlled field (`RDG-User-Id`, `Authorization`, the
+/// user-agent override) smuggled them in, the result would be an
+/// extra header or — with `Content-Length` — request smuggling.
+/// Silently stripping matches how browsers and curl treat the same
+/// input and avoids a fallible `header()` signature.
+fn push_header_value(out: &mut Vec<u8>, value: &str) {
+    for &b in value.as_bytes() {
+        if b != b'\r' && b != b'\n' {
+            out.push(b);
+        }
+    }
 }
 
 // =============================================================================
@@ -530,6 +545,25 @@ mod tests {
             "\r\nRDG-Correlation-Id: {bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb}\r\n"
         ));
         assert!(text.contains("\r\nRDG-User-Id: alice\r\n"));
+    }
+
+    #[test]
+    fn header_values_strip_crlf_to_prevent_injection() {
+        // Hostile `user_id` attempts to smuggle an extra header; the
+        // request builder must drop the CR/LF and emit the remaining
+        // text on a single header line. A naive splice would have
+        // produced `\r\nX-Injected: yes\r\n` as a standalone header.
+        let mut req = RdgHttpRequest::new(RdgMethod::InData, "h", [0; 16]);
+        req.user_id = Some("alice\r\nX-Injected: yes".to_string());
+        req.authorization = Some("NTLM token\nX-Evil: 1".to_string());
+        let text = String::from_utf8(req.to_bytes()).unwrap();
+        // The smuggled name must NOT appear as a standalone header.
+        assert!(!text.contains("\r\nX-Injected:"));
+        assert!(!text.contains("\r\nX-Evil:"));
+        // Sanitised values survive minus the CR/LF — concatenated
+        // into the legitimate header value.
+        assert!(text.contains("\r\nRDG-User-Id: aliceX-Injected: yes\r\n"));
+        assert!(text.contains("\r\nAuthorization: NTLM tokenX-Evil: 1\r\n"));
     }
 
     // ---------- encode_chunk / encode_final_chunk ----------

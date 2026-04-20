@@ -93,6 +93,9 @@ pub enum TsProxyClientError {
     Ndr(justrdp_rpch::ndr::NdrError),
     /// DCE/RPC PDU decode failed.
     RpcPdu(justrdp_core::DecodeError),
+    /// Encoding a REQUEST PDU failed. This indicates an internal
+    /// sizing bug — `size()` disagreed with `encode()`.
+    RpcEncode(justrdp_core::EncodeError),
     /// The response PDU carried a different PTYPE than expected.
     UnexpectedPtype {
         got: u8,
@@ -100,6 +103,12 @@ pub enum TsProxyClientError {
     },
     /// SendToServer payload could not be framed.
     SendToServer(SendToServerError),
+    /// Internal invariant violation — the state machine reached a
+    /// state that would logically imply a handle/context was set
+    /// but the stored `Option` was `None`. Programmer error rather
+    /// than a protocol condition, but surfaced via `Result` instead
+    /// of `panic!` so misuse never crashes the host process.
+    Invariant(&'static str),
 }
 
 impl core::fmt::Display for TsProxyClientError {
@@ -116,15 +125,23 @@ impl core::fmt::Display for TsProxyClientError {
             ),
             Self::Ndr(e) => write!(f, "TsProxy NDR: {e}"),
             Self::RpcPdu(e) => write!(f, "TsProxy DCE/RPC PDU: {e}"),
+            Self::RpcEncode(e) => write!(f, "TsProxy DCE/RPC PDU encode: {e}"),
             Self::UnexpectedPtype { got, wanted } => {
                 write!(f, "TsProxy: unexpected PDU type {got:#04x} (wanted {wanted:#04x})")
             }
             Self::SendToServer(e) => write!(f, "TsProxy: {e}"),
+            Self::Invariant(what) => write!(f, "TsProxy invariant violated: {what}"),
         }
     }
 }
 
 impl core::error::Error for TsProxyClientError {}
+
+impl From<justrdp_core::EncodeError> for TsProxyClientError {
+    fn from(e: justrdp_core::EncodeError) -> Self {
+        Self::RpcEncode(e)
+    }
+}
 
 impl From<justrdp_rpch::ndr::NdrError> for TsProxyClientError {
     fn from(e: justrdp_rpch::ndr::NdrError) -> Self {
@@ -220,7 +237,11 @@ impl TsProxyClient {
     }
 
     /// Wrap a stub buffer in a REQUEST PDU with the given `opnum`.
-    fn wrap_request(&mut self, opnum: u16, stub_data: Vec<u8>) -> Vec<u8> {
+    fn wrap_request(
+        &mut self,
+        opnum: u16,
+        stub_data: Vec<u8>,
+    ) -> Result<Vec<u8>, TsProxyClientError> {
         let req = RequestPdu {
             pfc_flags: PFC_FIRST_FRAG | PFC_LAST_FRAG,
             call_id: self.allocate_call_id(),
@@ -233,8 +254,8 @@ impl TsProxyClient {
         };
         let mut buf = alloc::vec![0u8; req.size()];
         let mut w = WriteCursor::new(&mut buf);
-        req.encode(&mut w).expect("request fits in computed buffer");
-        buf
+        req.encode(&mut w)?;
+        Ok(buf)
     }
 
     fn unwrap_response(&self, pdu_bytes: &[u8]) -> Result<Vec<u8>, TsProxyClientError> {
@@ -266,7 +287,7 @@ impl TsProxyClient {
     ) -> Result<Vec<u8>, TsProxyClientError> {
         self.expect_state(TsProxyState::Start)?;
         let stub = build_create_tunnel_stub(packet);
-        Ok(self.wrap_request(OPNUM_TS_PROXY_CREATE_TUNNEL, stub))
+        self.wrap_request(OPNUM_TS_PROXY_CREATE_TUNNEL, stub)
     }
 
     /// Consume the RESPONSE PDU for `TsProxyCreateTunnel`.
@@ -294,9 +315,11 @@ impl TsProxyClient {
         packet: &TsgPacket,
     ) -> Result<Vec<u8>, TsProxyClientError> {
         self.expect_state(TsProxyState::Connected)?;
-        let h = self.tunnel_context.expect("tunnel_context set in Connected");
+        let h = self.tunnel_context.ok_or(TsProxyClientError::Invariant(
+            "tunnel_context missing despite Connected state",
+        ))?;
         let stub = build_authorize_tunnel_stub(&h, packet);
-        Ok(self.wrap_request(OPNUM_TS_PROXY_AUTHORIZE_TUNNEL, stub))
+        self.wrap_request(OPNUM_TS_PROXY_AUTHORIZE_TUNNEL, stub)
     }
 
     pub fn on_authorize_tunnel_response(
@@ -338,7 +361,7 @@ impl TsProxyClient {
                 actual: self.state,
             })?;
         let stub = build_make_tunnel_call_stub(&handle, proc_id, packet);
-        Ok(self.wrap_request(OPNUM_TS_PROXY_MAKE_TUNNEL_CALL, stub))
+        self.wrap_request(OPNUM_TS_PROXY_MAKE_TUNNEL_CALL, stub)
     }
 
     /// Convenience wrapper: build a long-poll `TsProxyMakeTunnelCall`
@@ -378,9 +401,11 @@ impl TsProxyClient {
         endpoint: &TsEndpointInfo,
     ) -> Result<Vec<u8>, TsProxyClientError> {
         self.expect_state(TsProxyState::Authorized)?;
-        let h = self.tunnel_context.expect("tunnel_context set in Authorized");
+        let h = self.tunnel_context.ok_or(TsProxyClientError::Invariant(
+            "tunnel_context missing despite Authorized state",
+        ))?;
         let stub = build_create_channel_stub(&h, endpoint);
-        Ok(self.wrap_request(OPNUM_TS_PROXY_CREATE_CHANNEL, stub))
+        self.wrap_request(OPNUM_TS_PROXY_CREATE_CHANNEL, stub)
     }
 
     pub fn on_create_channel_response(
@@ -409,11 +434,11 @@ impl TsProxyClient {
     /// typically `ERROR_GRACEFUL_DISCONNECT`).
     pub fn build_setup_receive_pipe(&mut self) -> Result<Vec<u8>, TsProxyClientError> {
         self.expect_state(TsProxyState::ChannelCreated)?;
-        let h = self
-            .channel_context
-            .expect("channel_context set in ChannelCreated");
+        let h = self.channel_context.ok_or(TsProxyClientError::Invariant(
+            "channel_context missing despite ChannelCreated state",
+        ))?;
         let stub = build_setup_receive_pipe_message(&h);
-        let pdu = self.wrap_request(OPNUM_TS_PROXY_SETUP_RECEIVE_PIPE, stub);
+        let pdu = self.wrap_request(OPNUM_TS_PROXY_SETUP_RECEIVE_PIPE, stub)?;
         self.state = TsProxyState::PipeCreated;
         Ok(pdu)
     }
@@ -427,9 +452,11 @@ impl TsProxyClient {
         buffers: &[&[u8]],
     ) -> Result<Vec<u8>, TsProxyClientError> {
         self.expect_state(TsProxyState::PipeCreated)?;
-        let h = self.channel_context.expect("channel_context set");
+        let h = self.channel_context.ok_or(TsProxyClientError::Invariant(
+            "channel_context missing despite PipeCreated state",
+        ))?;
         let stub = build_send_to_server_message(&h, buffers)?;
-        Ok(self.wrap_request(OPNUM_TS_PROXY_SEND_TO_SERVER, stub))
+        self.wrap_request(OPNUM_TS_PROXY_SEND_TO_SERVER, stub)
     }
 
     // ---- TsProxyCloseChannel (opnum 6) ---------------------------------
@@ -447,10 +474,12 @@ impl TsProxyClient {
                 });
             }
         }
-        let h = self.channel_context.expect("channel_context set");
+        let h = self.channel_context.ok_or(TsProxyClientError::Invariant(
+            "channel_context missing in ChannelCreated/PipeCreated state",
+        ))?;
         let stub = build_close_channel_stub(&h);
         self.state = TsProxyState::Closing;
-        Ok(self.wrap_request(OPNUM_TS_PROXY_CLOSE_CHANNEL, stub))
+        self.wrap_request(OPNUM_TS_PROXY_CLOSE_CHANNEL, stub)
     }
 
     pub fn on_close_channel_response(
@@ -487,7 +516,7 @@ impl TsProxyClient {
             })?;
         let stub = build_close_tunnel_stub(&h);
         self.state = TsProxyState::Closing;
-        Ok(self.wrap_request(OPNUM_TS_PROXY_CLOSE_TUNNEL, stub))
+        self.wrap_request(OPNUM_TS_PROXY_CLOSE_TUNNEL, stub)
     }
 
     /// Consume the RESPONSE PDU for `TsProxyCloseTunnel`.

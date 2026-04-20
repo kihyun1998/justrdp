@@ -20,6 +20,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::fmt;
 
 /// The PAA cookie shape actually placed inside the `cookie` field
 /// of [`TsgPacketAuth`][crate::rpch::types::TsgPacketAuth].
@@ -30,7 +31,11 @@ use alloc::vec::Vec;
 /// Represented as a newtype mostly so that code that hands the
 /// bytes around picks up type-level hints about what the blob
 /// actually is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The inner bytes carry NTLM-derived or CredSSP-wrapped credential
+/// material, so `Debug` is masked and `Drop` zeroes the backing
+/// capacity before the allocator reclaims it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PaaCookie {
     /// Opaque authentication material — typically a CredSSP
     /// `TSRequest` output blob that wraps an SPNEGO/NTLM token.
@@ -38,6 +43,24 @@ pub struct PaaCookie {
     /// internal representation (e.g. a borrowed slice) without
     /// breaking callers.
     bytes: Vec<u8>,
+}
+
+impl fmt::Debug for PaaCookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PaaCookie")
+            .field("bytes", &format_args!("<{} bytes redacted>", self.bytes.len()))
+            .finish()
+    }
+}
+
+impl Drop for PaaCookie {
+    fn drop(&mut self) {
+        let cap = self.bytes.capacity();
+        self.bytes.resize(cap, 0);
+        self.bytes.fill(0);
+        core::hint::black_box(&self.bytes);
+        self.bytes.clear();
+    }
 }
 
 impl PaaCookie {
@@ -54,8 +77,12 @@ impl PaaCookie {
     }
 
     /// Consume and return the raw bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    ///
+    /// `Drop`'s zeroization is skipped for the returned `Vec` — the
+    /// caller takes ownership of the sensitive buffer. `Drop` still
+    /// runs on the (now-empty) wrapper to make the transfer explicit.
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        core::mem::take(&mut self.bytes)
     }
 
     /// Length of the cookie in bytes — equals the `cookieLen` DWORD

@@ -33,6 +33,9 @@ pub mod ws;
 pub mod rpch;
 
 #[cfg(feature = "std")]
+mod transport_util;
+
+#[cfg(feature = "std")]
 pub mod transport;
 
 #[cfg(feature = "std")]

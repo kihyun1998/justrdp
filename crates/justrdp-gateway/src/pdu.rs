@@ -56,6 +56,14 @@ pub const PKT_TYPE_CLOSE_CHANNEL_RESPONSE: u16 = 0x0011;
 /// Wire size of `HTTP_PACKET_HEADER` in bytes. §2.2.10.9
 pub const PACKET_HEADER_SIZE: usize = 8;
 
+/// Upper bound on a single MS-TSGU HTTP Transport PDU, enforced by
+/// [`crate::client::find_packet_size`] so an attacker cannot drive the
+/// caller's buffer to 4 GiB by setting `packet_length = 0xFFFF_FFFF`.
+/// MS-TSGU data PDUs in practice carry RDP fragments well under 64 KiB;
+/// 1 MiB leaves generous headroom for future use while still fitting
+/// comfortably in memory.
+pub const MAX_PACKET_SIZE: usize = 1 * 1024 * 1024;
+
 /// `HTTP_PACKET_HEADER` — 8-byte common header that prefixes every
 /// MS-TSGU HTTP Transport PDU. §2.2.10.9
 ///

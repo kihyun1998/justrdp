@@ -25,10 +25,9 @@ extern crate std;
 use std::io::{self, Read, Write};
 use std::vec::Vec;
 
-use justrdp_core::{Decode, ReadCursor, WriteBuf};
+use justrdp_core::WriteBuf;
 
 use crate::client::{find_packet_size, GatewayClient, GatewayError};
-use crate::pdu::{DataPdu, PACKET_HEADER_SIZE};
 use crate::ws::{
     encode_close_payload, encode_frame, WsError, WsFrame, WsFrameDecoder, WS_CLOSE_NORMAL,
     WS_OPCODE_BINARY, WS_OPCODE_CLOSE, WS_OPCODE_PONG,
@@ -49,6 +48,9 @@ pub enum WsConnectError {
     UnexpectedEof,
     /// Server initiated the WebSocket close handshake.
     ServerClosed { code: Option<u16> },
+    /// The server announced a `packet_length` exceeding
+    /// [`crate::pdu::MAX_PACKET_SIZE`].
+    PacketTooLarge(crate::client::PacketTooLarge),
 }
 
 impl core::fmt::Display for WsConnectError {
@@ -61,6 +63,7 @@ impl core::fmt::Display for WsConnectError {
             Self::ServerClosed { code } => {
                 write!(f, "ws transport: server closed (code {code:?})")
             }
+            Self::PacketTooLarge(e) => write!(f, "{e}"),
         }
     }
 }
@@ -69,6 +72,7 @@ impl std::error::Error for WsConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::PacketTooLarge(e) => Some(e),
             _ => None,
         }
     }
@@ -87,6 +91,11 @@ impl From<GatewayError> for WsConnectError {
 impl From<WsError> for WsConnectError {
     fn from(e: WsError) -> Self {
         Self::Ws(e)
+    }
+}
+impl From<crate::client::PacketTooLarge> for WsConnectError {
+    fn from(e: crate::client::PacketTooLarge) -> Self {
+        Self::PacketTooLarge(e)
     }
 }
 
@@ -215,7 +224,7 @@ impl<S: Read + Write> Read for WsGatewayConnection<S> {
             return Ok(0);
         }
         loop {
-            if let Some(size) = find_packet_size(&self.decoded) {
+            if let Some(size) = find_packet_size(&self.decoded).map_err(io_other)? {
                 if self.decoded.len() >= size {
                     let pdu_bytes: Vec<u8> = self.decoded.drain(..size).collect();
                     let data = parse_data_pdu(&pdu_bytes).map_err(io_other)?;
@@ -254,21 +263,25 @@ impl<S: Read + Write> Read for WsGatewayConnection<S> {
                         .map_err(io_other)?;
                     }
                     WsFrame::Pong(_) => { /* discard */ }
-                    WsFrame::Close { code, .. } => {
-                        // Echo a Close frame and tear down.
+                    WsFrame::Close { .. } => {
+                        // RFC 6455 §5.5.1: on receiving a Close, echo
+                        // one and treat the connection as closed. Mark
+                        // `self.closed = true` up front so we do not
+                        // try to send a second echo if the echo itself
+                        // fails (and so any future writes short-circuit).
+                        self.closed = true;
                         let payload = encode_close_payload(Some(WS_CLOSE_NORMAL), "");
-                        let _ = send_control_frame(
+                        send_control_frame(
                             &mut self.stream,
                             WS_OPCODE_CLOSE,
                             &payload,
                             &mut self.mask_source,
-                        );
-                        self.closed = true;
+                        )
+                        .map_err(io_other)?;
                         if self.decoded.is_empty() && self.pending_cursor >= self.pending.len() {
                             return Ok(0);
                         }
                         // Serve any already-decoded data before the Close.
-                        let _ = code;
                         break;
                     }
                 }
@@ -350,7 +363,7 @@ fn read_next_pdu<S: Read + Write>(
     mask_source: &mut MaskSource,
 ) -> Result<Vec<u8>, WsConnectError> {
     loop {
-        if let Some(size) = find_packet_size(decoded) {
+        if let Some(size) = find_packet_size(decoded)? {
             if decoded.len() >= size {
                 let pdu = decoded.drain(..size).collect::<Vec<u8>>();
                 return Ok(pdu);
@@ -376,17 +389,10 @@ fn read_next_pdu<S: Read + Write>(
     }
 }
 
-fn parse_data_pdu(bytes: &[u8]) -> Result<Vec<u8>, GatewayError> {
-    if bytes.len() < PACKET_HEADER_SIZE {
-        return Err(GatewayError::InvalidState("ws data pdu: short header"));
-    }
-    let mut cur = ReadCursor::new(bytes);
-    let pdu = DataPdu::decode(&mut cur).map_err(GatewayError::Decode)?;
-    Ok(pdu.data)
-}
+use crate::transport_util::{io_other, parse_data_pdu as parse_data_pdu_shared};
 
-fn io_other<E: core::fmt::Debug>(e: E) -> io::Error {
-    io::Error::other(alloc::format!("{e:?}"))
+fn parse_data_pdu(bytes: &[u8]) -> Result<Vec<u8>, GatewayError> {
+    parse_data_pdu_shared(bytes, "ws data pdu: short header")
 }
 
 // =============================================================================
@@ -406,7 +412,7 @@ mod tests {
     };
     use crate::ws::{encode_frame, WS_OPCODE_BINARY, WS_OPCODE_PING};
 
-    use justrdp_core::{Encode, WriteCursor};
+    use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
     use std::collections::VecDeque;
     use std::io::Result as IoResult;
 

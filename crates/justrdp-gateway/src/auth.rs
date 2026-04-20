@@ -17,8 +17,9 @@
 
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt;
 
 use justrdp_core::encode_vec;
 use justrdp_pdu::ntlm::compute::{
@@ -38,12 +39,21 @@ use justrdp_pdu::ntlm::messages::{
 /// `domain` may be empty; if so the client falls back to the server's
 /// `MsvAvNbDomainName` from target_info per MS-NLMP 3.1.5.1.2.
 /// `workstation` is optional and typically blank for HTTP clients.
-#[derive(Debug, Clone)]
+///
+/// Fields are crate-private so the password cannot be read or
+/// reassigned from outside; callers construct an instance via
+/// [`Self::new`] and optionally [`Self::with_workstation`]. Values are
+/// stored as owned UTF-8 byte vectors (not `String`) so `Drop` can
+/// zero the backing capacity without needing `unsafe` — matching the
+/// pattern used by `justrdp-connector::credssp::CredsspSequence`.
+/// `Debug` is masked so the password never reaches log output, panic
+/// traces, or test failure printouts.
+#[derive(Clone)]
 pub struct NtlmCredentials {
-    pub username: String,
-    pub password: String,
-    pub domain: String,
-    pub workstation: String,
+    pub(crate) username: Vec<u8>,
+    pub(crate) password: Vec<u8>,
+    pub(crate) domain: Vec<u8>,
+    pub(crate) workstation: Vec<u8>,
 }
 
 impl NtlmCredentials {
@@ -53,11 +63,60 @@ impl NtlmCredentials {
         domain: impl Into<String>,
     ) -> Self {
         Self {
-            username: username.into(),
-            password: password.into(),
-            domain: domain.into(),
-            workstation: String::new(),
+            username: username.into().into_bytes(),
+            password: password.into().into_bytes(),
+            domain: domain.into().into_bytes(),
+            workstation: Vec::new(),
         }
+    }
+
+    /// Return a copy with `workstation` populated. RD Gateway clients
+    /// typically leave this blank.
+    #[must_use]
+    pub fn with_workstation(mut self, workstation: impl Into<String>) -> Self {
+        self.workstation = workstation.into().into_bytes();
+        self
+    }
+
+    pub fn username(&self) -> &str {
+        // Values are always constructed from `String`, so the bytes
+        // are guaranteed valid UTF-8.
+        core::str::from_utf8(&self.username).unwrap_or("")
+    }
+
+    pub fn domain(&self) -> &str {
+        core::str::from_utf8(&self.domain).unwrap_or("")
+    }
+
+    pub fn workstation(&self) -> &str {
+        core::str::from_utf8(&self.workstation).unwrap_or("")
+    }
+
+    pub(crate) fn password_str(&self) -> &str {
+        core::str::from_utf8(&self.password).unwrap_or("")
+    }
+}
+
+impl fmt::Debug for NtlmCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NtlmCredentials")
+            .field("username", &self.username())
+            .field("password", &"<redacted>")
+            .field("domain", &self.domain())
+            .field("workstation", &self.workstation())
+            .finish()
+    }
+}
+
+impl Drop for NtlmCredentials {
+    fn drop(&mut self) {
+        // Overwrite the backing capacity (not just the length) with
+        // zeros before the allocator reclaims it. `black_box` prevents
+        // the optimizer from eliding the writes.
+        zero_vec(&mut self.username);
+        zero_vec(&mut self.password);
+        zero_vec(&mut self.domain);
+        zero_vec(&mut self.workstation);
     }
 }
 
@@ -67,13 +126,37 @@ impl NtlmCredentials {
 /// The gateway crate does not pull in an RNG — callers are expected to
 /// obtain entropy from their host environment (e.g. `getrandom` on
 /// std).
-#[derive(Debug, Clone, Copy)]
+///
+/// `Debug` is implemented manually so the session key does not leak to
+/// log output or panic traces.
+#[derive(Clone, Copy)]
 pub struct NtlmRandom {
     /// 8-byte NTLMv2 client challenge.
     pub client_challenge: [u8; 8],
     /// 16-byte key encrypted and sent to the server via the
     /// `EncryptedRandomSessionKey` field of the Authenticate message.
     pub exported_session_key: [u8; 16],
+}
+
+impl fmt::Debug for NtlmRandom {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NtlmRandom")
+            .field("client_challenge", &"<redacted>")
+            .field("exported_session_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Overwrite a `Vec<u8>`'s full backing capacity with zero bytes, then
+/// clear the length. `black_box` keeps the optimizer from eliding the
+/// writes before the buffer is reclaimed. Invoked only from `Drop` on
+/// sensitive structs — not on the hot path.
+fn zero_vec(v: &mut Vec<u8>) {
+    let cap = v.capacity();
+    v.resize(cap, 0);
+    v.fill(0);
+    core::hint::black_box(&v);
+    v.clear();
 }
 
 // =============================================================================
@@ -143,7 +226,7 @@ pub enum NtlmError {
 ///    [`parse_www_authenticate`].
 /// 3. [`Self::authenticate`] consumes the CHALLENGE and produces the
 ///    AUTHENTICATE bytes. Send them in the retry request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NtlmClient {
     creds: NtlmCredentials,
     random: NtlmRandom,
@@ -151,6 +234,27 @@ pub struct NtlmClient {
     /// Cached raw bytes of the NEGOTIATE message — needed as input to
     /// the MIC computation in step 3.
     negotiate_bytes: Vec<u8>,
+}
+
+impl fmt::Debug for NtlmClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NtlmClient")
+            .field("creds", &self.creds)
+            .field("random", &self.random)
+            .field("state", &self.state)
+            .field("negotiate_bytes", &format_args!("<{} bytes>", self.negotiate_bytes.len()))
+            .finish()
+    }
+}
+
+impl Drop for NtlmClient {
+    fn drop(&mut self) {
+        // `creds` zeroes itself on drop; only the cached NEGOTIATE
+        // bytes need explicit clearing here. The bytes contain no
+        // secrets per se but pinning them down keeps the session-scoped
+        // material contained.
+        zero_vec(&mut self.negotiate_bytes);
+    }
 }
 
 impl NtlmClient {
@@ -202,22 +306,27 @@ impl NtlmClient {
                 String::new()
             }
         } else {
-            self.creds.domain.clone()
+            self.creds.domain().to_string()
         };
 
         // Prefer the server-supplied MsvAvTimestamp over a local clock.
         let has_timestamp = av_pairs.iter().any(|p| p.id == AvId::MsvAvTimestamp as u16);
         let time = AvPair::find(&av_pairs, AvId::MsvAvTimestamp)
             .and_then(|ts| {
-                if ts.value.len() == 8 {
-                    Some(u64::from_le_bytes(ts.value[..8].try_into().unwrap()))
-                } else {
-                    None
-                }
+                // `MsvAvTimestamp` is defined as an 8-byte FILETIME
+                // (MS-NLMP §2.2.2.1). A server that sends any other
+                // length is malformed; drop the pair rather than
+                // unwrapping or reading a truncated value.
+                let arr: [u8; 8] = ts.value.as_slice().try_into().ok()?;
+                Some(u64::from_le_bytes(arr))
             })
             .unwrap_or(0);
 
-        let response_key = ntowfv2(&self.creds.password, &self.creds.username, &effective_domain);
+        let response_key = ntowfv2(
+            self.creds.password_str(),
+            self.creds.username(),
+            &effective_domain,
+        );
         let modified_target_info = modify_target_info(&challenge.target_info);
 
         let (nt_response, lm_response, session_base_key) = compute_response(
@@ -243,8 +352,8 @@ impl NtlmClient {
             lm_response,
             nt_response,
             domain_name: to_utf16le(&effective_domain),
-            user_name: to_utf16le(&self.creds.username),
-            workstation: to_utf16le(&self.creds.workstation),
+            user_name: to_utf16le(self.creds.username()),
+            workstation: to_utf16le(self.creds.workstation()),
             encrypted_random_session_key,
             version: NtlmVersion::windows_10(),
             mic: [0u8; 16],
