@@ -338,6 +338,8 @@ pub enum NegotiationFailureCode {
     HybridRequiredByServer = 0x0000_0005,
     /// Server requires TLS with user authentication.
     SslWithUserAuthRequired = 0x0000_0006,
+    /// Server requires Entra ID (Azure AD) authentication (MS-RDPBCGR 2.2.1.2.2).
+    EntraAuthRequiredByServer = 0x0000_0007,
 }
 
 impl NegotiationFailureCode {
@@ -350,6 +352,7 @@ impl NegotiationFailureCode {
             0x04 => Ok(Self::InconsistentFlags),
             0x05 => Ok(Self::HybridRequiredByServer),
             0x06 => Ok(Self::SslWithUserAuthRequired),
+            0x07 => Ok(Self::EntraAuthRequiredByServer),
             _ => Err(DecodeError::unexpected_value(
                 "NegotiationFailureCode",
                 "code",
@@ -1237,6 +1240,7 @@ mod tests {
         let codes = [
             SslRequiredByServer, SslNotAllowedByServer, SslCertNotOnServer,
             InconsistentFlags, HybridRequiredByServer, SslWithUserAuthRequired,
+            EntraAuthRequiredByServer,
         ];
         for code in codes {
             let fail = NegotiationFailure { code };

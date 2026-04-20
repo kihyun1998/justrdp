@@ -1,0 +1,102 @@
+#![forbid(unsafe_code)]
+
+//! Acceptance result types.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use justrdp_pdu::x224::{NegotiationRequestFlags, NegotiationResponseFlags, SecurityProtocol};
+
+/// Number of bytes written to the output buffer by a `step()` call.
+#[derive(Debug, Clone, Copy)]
+pub struct Written {
+    /// Bytes written to the output `WriteBuf`.
+    pub size: usize,
+}
+
+impl Written {
+    /// No bytes were written (e.g., for receive-only states).
+    pub fn nothing() -> Self {
+        Self { size: 0 }
+    }
+
+    /// A specific number of bytes were written.
+    pub fn new(size: usize) -> Self {
+        Self { size }
+    }
+}
+
+/// Information captured from the client's X.224 Connection Request.
+///
+/// Stored on the acceptor while it advances through the connection sequence
+/// so that later phases (e.g., MCS Connect Response, Demand Active) can
+/// honour client-requested behaviour. Also available to the caller via
+/// `ServerAcceptor::client_request()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientRequestInfo {
+    /// Cookie from `Cookie: mstshash=...\r\n`, if present.
+    pub cookie: Option<String>,
+    /// Routing token from `Cookie: msts=...\r\n`, if present.
+    pub routing_token: Option<Vec<u8>>,
+    /// Bitmask of `requestedProtocols` from `RDP_NEG_REQ`. Defaults to
+    /// `PROTOCOL_RDP` (0) when no `RDP_NEG_REQ` is present in the CR
+    /// (legacy RDP 4.x/5.0 client).
+    pub requested_protocols: SecurityProtocol,
+    /// Flags from `RDP_NEG_REQ`. Defaults to empty.
+    pub request_flags: NegotiationRequestFlags,
+    /// Whether `RDP_NEG_REQ` was present in the CR. When `false` the server
+    /// MUST send a Connection Confirm with no `rdpNegData` (legacy path).
+    pub had_negotiation_request: bool,
+}
+
+impl ClientRequestInfo {
+    #[allow(dead_code)] // Used by tests and later commits.
+    pub(crate) fn legacy() -> Self {
+        Self {
+            cookie: None,
+            routing_token: None,
+            requested_protocols: SecurityProtocol::RDP,
+            request_flags: NegotiationRequestFlags::NONE,
+            had_negotiation_request: false,
+        }
+    }
+}
+
+/// Result of a successful RDP server connection acceptance.
+///
+/// Filled in incrementally by later phases (MCS, capabilities, etc.). Phase 1
+/// only populates `selected_protocol` and `server_nego_flags`; the remaining
+/// fields are left at their default values until the corresponding phase
+/// runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceResult {
+    /// Security protocol the server selected in `RDP_NEG_RSP`.
+    pub selected_protocol: SecurityProtocol,
+    /// Flags the server placed in `RDP_NEG_RSP`.
+    pub server_nego_flags: NegotiationResponseFlags,
+    /// Information captured from the client's CR.
+    pub client_request: ClientRequestInfo,
+    /// MCS I/O channel ID assigned by the server (filled in Phase 4).
+    pub io_channel_id: u16,
+    /// MCS user channel ID assigned to the joined user (filled in Phase 5).
+    pub user_channel_id: u16,
+    /// Share ID assigned by the server (filled in Phase 11).
+    pub share_id: u32,
+    /// Channel name to MCS channel ID mapping (filled in Phase 4).
+    pub channel_ids: Vec<(String, u16)>,
+}
+
+impl AcceptanceResult {
+    #[allow(dead_code)] // Used by tests and later commits.
+    pub(crate) fn new(client_request: ClientRequestInfo) -> Self {
+        Self {
+            selected_protocol: SecurityProtocol::RDP,
+            server_nego_flags: NegotiationResponseFlags::NONE,
+            client_request,
+            io_channel_id: 0,
+            user_channel_id: 0,
+            share_id: 0,
+            channel_ids: Vec::new(),
+        }
+    }
+}
