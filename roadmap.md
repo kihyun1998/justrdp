@@ -2288,7 +2288,10 @@ pub enum ServerAcceptorState {
 
 ### 11.2 `justrdp-server` -- Extensible Server Skeleton
 
-> **requires**: 11.1 Acceptor, Phase 3 코덱 (RFX 인코딩), 8.6 EGFX
+> 원래 한 덩어리로 계획돼 있던 `justrdp-server`를 세 서브 섹션으로 분리.
+> 11.2a는 최소 동작 서버, 11.2b는 GFX 인코딩 파이프라인, 11.2c는
+> 서버 방향 채널 핸들러. 11.2a 완료 시점에 "bitmap + input + disconnect"
+> 수준의 서버가 돌아가며, 11.2b/c는 수요에 따라 독립적으로 진행 가능.
 
 ```rust
 pub trait RdpServerDisplayHandler: Send {
@@ -2307,16 +2310,80 @@ pub trait RdpServerClipboardHandler: Send { /* ... */ }
 pub trait RdpServerSoundHandler: Send { /* ... */ }
 ```
 
-**구현 항목:**
+#### 11.2a -- Core Server Skeleton (v1)
 
-- [ ] `RdpServer` -- 메인 서버 struct
-- [ ] Display handler 통합 (RFX 인코딩, EGFX 전송)
-- [ ] Input handler 통합
-- [ ] Clipboard handler 통합
-- [ ] Sound handler 통합
-- [ ] 멀티세션 지원
-- [ ] 세션 관리 (disconnect, reconnect)
-- [ ] 서버 사이드 GFX 인코딩 파이프라인
+> **requires**: 11.1 Acceptor, 8.6 EGFX(프로토콜만, 인코딩 루프 제외)
+
+목표: acceptor를 감싸서 **정상 세션이 굴러가는 최소 구성**. 디스플레이는
+uncompressed bitmap fast-path, 입력/종료/SVC opaque forward까지. RFX/EGFX
+인코딩 파이프라인과 채널별 핸들러는 11.2b/c에서 분리 진행.
+
+- [ ] `justrdp-server` crate + `RdpServerConfig` + error 타입
+- [ ] Connection driver -- `ServerAcceptor` 펌프 → `Accepted` 진입
+- [ ] `RdpServerDisplayHandler` / `RdpServerInputHandler` trait +
+      `DisplayUpdate` enum (Bitmap / Pointer / Palette / Reset)
+- [ ] `ServerActiveStage` -- **서버 방향** fast-path input 디코드,
+      slow-path control PDU 처리 (ShutdownRequest / SuppressOutput /
+      RefreshRect / PersistentKeyList 후속 / ClientControl(ACTIVELY))
+- [ ] Fast-path `FASTPATH_UPDATETYPE_BITMAP` 인코더 (uncompressed RGB)
+- [ ] Fast-path pointer update 인코더 (Position / Default / Hidden /
+      New / Cached / Color)
+- [ ] Input dispatch -- Scancode / Unicode / Mouse / MouseX / Sync /
+      QoE 이벤트 → trait 호출
+- [ ] SVC data opaque forward hook (채널 크레이트 장착 포인트)
+- [ ] 종료 경로 -- `SetErrorInfoPdu` 송출 + MCS
+      `DisconnectProviderUltimatum` + `ServerTerminate` output
+- [ ] `justrdp-blocking` 클라와 loopback 통합 테스트
+
+#### 11.2b -- Server-Side GFX Encoding Pipeline
+
+> **requires**: 11.2a, Phase 3 RFX 인코더, 8.6 EGFX, 4.4 ZGFX
+
+목표: 실서버 수준의 코덱 경로. tile encoder를 frame 레벨로 래핑하고
+EGFX/DVC 송신 루프를 깔아서 **mstsc 인터롭**에 도달.
+
+- [ ] `SurfaceCommand` 기반 슬로우/패스트 패스 송신 (2.2.9.1.2.1.10)
+- [ ] RFX 서버 인코딩 루프 -- `TS_RFX_FRAME_BEGIN`/`TS_RFX_REGION`/
+      `TS_RFX_TILESET`/`TS_RFX_FRAME_END` 프레이밍, quant/tile
+      파티셔닝, context 관리
+- [ ] Progressive RFX 품질 스케줄링 hook
+- [ ] EGFX (DVC) 서버 인코딩 루프 -- `CreateSurface` /
+      `MapSurfaceToOutput` / `ResetGraphics` / `WireToSurface1-2` /
+      `StartFrame` / `EndFrame` + `FrameAcknowledge` 왕복
+- [ ] ZGFX 압축 프레이밍 (`DYNVC_DATA_FIRST_COMPRESSED` /
+      `DYNVC_DATA_COMPRESSED`)
+- [ ] Deactivation-Reactivation 서버측 재드라이브 (디스플레이 크기
+      변경 등) -- Deactivate All → 재 Demand Active
+- [ ] `DisplayHandler`에 `get_surface_update()` /
+      `get_egfx_frame()` 확장 seam
+- [ ] mstsc 실서버 인터롭 스모크 테스트
+
+#### 11.2c -- Server-Direction Channel Handlers
+
+> **requires**: 11.2a
+
+목표: 기존 채널 크레이트들(client-oriented)의 서버 방향 확장 +
+`RdpServer`에서 `*Handler` trait으로 노출. 채널당 독립 커밋 묶음,
+필요한 것부터 (cliprdr 우선 권장).
+
+- [ ] `justrdp-cliprdr` 서버 방향 -- Monitor Ready, Format List emit,
+      Format Data Request/Response 서버 측
+- [ ] `RdpServerClipboardHandler` trait + skeleton 통합
+- [ ] `justrdp-rdpsnd` 서버 방향 -- Audio Format PDU, WaveInfo/Wave2
+      PDU, Server Audio Formats and Version PDU
+- [ ] `RdpServerSoundHandler` trait + skeleton 통합
+- [ ] (선택) `justrdp-rdpdr` 서버 방향 -- Announce, Server I/O Request
+      emit
+- [ ] (선택) `RdpServerFilesystemHandler` trait
+
+#### 연기 / 제외
+
+- **멀티세션**: 런타임 관심사 (프로토콜 아님). `RdpServer`는
+  per-connection, caller가 tokio/`std::net`으로 스폰.
+  `examples/` 예제만 추가.
+- **Auto-reconnect cookie 서버 emit**: 9.x 별도 작업.
+- **Shadow / multi-party**: 별도 섹션 (MS-RDPEMC).
+- **Session redirection emit (서버 → 클라 리다이렉트)**: 11.2d 후보.
 
 ### 11.3 `justrdp-web` -- WASM Bindings
 
