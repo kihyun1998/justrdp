@@ -38,6 +38,24 @@ pub struct AcceptorConfig {
     /// `RDP_NEG_RSP.flags`. Indicates server-side support for the
     /// MS-RDPEGFX Graphics Pipeline.
     pub gfx_supported: bool,
+
+    // ── Phase 4: MCS Connect Response ──────────────────────────────────
+
+    /// Server RDP version reported in `SC_CORE.version` (MS-RDPBCGR
+    /// §2.2.1.4.2). Default: RDP 10.7 = `0x000A_0007`.
+    pub server_rdp_version: u32,
+    /// Optional `earlyCapabilityFlags` for `SC_CORE` (MS-RDPBCGR
+    /// §2.2.1.4.2). `None` -> field omitted on the wire.
+    pub server_early_capability_flags: Option<u32>,
+    /// Whether to allocate an MCS message channel (and emit
+    /// `SC_MCS_MSGCHANNEL`) when the client included `CS_MCS_MSGCHANNEL`
+    /// in its CR. The channel itself is used by Auto-Detect /
+    /// Multitransport Bootstrapping.
+    pub support_message_channel: bool,
+    /// Whether to advertise `SC_MULTITRANSPORT` in the Connect Response.
+    /// `None` -> block omitted; `Some(flags)` -> block sent with the
+    /// given `flags` (e.g. `SOFTSYNC | TUNNEL_UDP_FECR`).
+    pub multitransport_flags: Option<u32>,
 }
 
 impl Default for AcceptorConfig {
@@ -52,6 +70,13 @@ impl Default for AcceptorConfig {
             redirected_auth_supported: false,
             extended_client_data_supported: true,
             gfx_supported: false,
+            // RDP 10.7 (0x000A_0007) -- matches what Windows Server 2019+
+            // advertises and is high enough to enable Surface Commands /
+            // EGFX without forcing the extra optional `SC_CORE` fields.
+            server_rdp_version: 0x000A_0007,
+            server_early_capability_flags: None,
+            support_message_channel: false,
+            multitransport_flags: None,
         }
     }
 }
@@ -108,6 +133,26 @@ impl AcceptorConfigBuilder {
 
     pub fn gfx_supported(mut self, supported: bool) -> Self {
         self.inner.gfx_supported = supported;
+        self
+    }
+
+    pub fn server_rdp_version(mut self, version: u32) -> Self {
+        self.inner.server_rdp_version = version;
+        self
+    }
+
+    pub fn server_early_capability_flags(mut self, flags: Option<u32>) -> Self {
+        self.inner.server_early_capability_flags = flags;
+        self
+    }
+
+    pub fn support_message_channel(mut self, supported: bool) -> Self {
+        self.inner.support_message_channel = supported;
+        self
+    }
+
+    pub fn multitransport_flags(mut self, flags: Option<u32>) -> Self {
+        self.inner.multitransport_flags = flags;
         self
     }
 

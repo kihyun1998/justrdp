@@ -2,18 +2,25 @@
 
 //! Server acceptor state machine implementation.
 
-use justrdp_core::{Decode, PduHint, ReadCursor, WriteBuf};
+use alloc::vec::Vec;
 
-use justrdp_pdu::tpkt::{TpktHeader, TpktHint};
+use justrdp_core::{Decode, Encode, PduHint, ReadCursor, WriteBuf, WriteCursor};
+
+use justrdp_pdu::mcs::{ConnectInitial, ConnectResponse, ConnectResponseResult, DomainParameters};
+use justrdp_pdu::tpkt::{TpktHeader, TpktHint, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{
-    ConnectionConfirm, ConnectionRequest, ConnectionRequestData, NegotiationFailure,
+    ConnectionConfirm, ConnectionRequest, ConnectionRequestData, DataTransfer, NegotiationFailure,
     NegotiationFailureCode, NegotiationRequestFlags, NegotiationResponse,
-    NegotiationResponseFlags, SecurityProtocol,
+    NegotiationResponseFlags, SecurityProtocol, DATA_TRANSFER_HEADER_SIZE,
 };
 
 use crate::config::AcceptorConfig;
 use crate::encode_helpers::encode_connection_confirm;
 use crate::error::{AcceptorError, AcceptorErrorKind, AcceptorResult};
+use crate::mcs::{
+    allocate_channel_ids, build_server_data_blocks, decode_connect_initial_gcc,
+    wrap_server_gcc, ChannelAllocation, ClientGccData, ServerGccInputs,
+};
 use crate::result::{AcceptanceResult, ClientRequestInfo, Written};
 use crate::sequence::Sequence;
 use crate::state::ServerAcceptorState;
@@ -43,6 +50,16 @@ pub struct ServerAcceptor {
     // ── Negotiated values (filled across phases) ──
     selected_protocol: SecurityProtocol,
     server_nego_flags: NegotiationResponseFlags,
+
+    // ── Phase 4: MCS state ──
+    /// Captured client GCC data from the MCS Connect Initial.
+    client_gcc: Option<ClientGccData>,
+    /// Channel allocation produced from the client's CS_NET request.
+    channel_alloc: Option<ChannelAllocation>,
+    /// Pre-built MCS Connect Response wire bytes (TPKT + X.224 DT + BER
+    /// ConnectResponse). Computed in `WaitMcsConnectInitial`, drained in
+    /// `SendMcsConnectResponse`.
+    pending_connect_response: Option<Vec<u8>>,
 }
 
 impl ServerAcceptor {
@@ -56,7 +73,22 @@ impl ServerAcceptor {
             pending_is_failure: false,
             selected_protocol: SecurityProtocol::RDP,
             server_nego_flags: NegotiationResponseFlags::NONE,
+            client_gcc: None,
+            channel_alloc: None,
+            pending_connect_response: None,
         }
+    }
+
+    /// Captured client GCC data from the MCS Connect Initial. Available
+    /// once the acceptor has advanced past `WaitMcsConnectInitial`.
+    pub fn client_gcc(&self) -> Option<&ClientGccData> {
+        self.client_gcc.as_ref()
+    }
+
+    /// MCS channel allocation. Available once the acceptor has advanced
+    /// past `WaitMcsConnectInitial`.
+    pub fn channel_allocation(&self) -> Option<&ChannelAllocation> {
+        self.channel_alloc.as_ref()
     }
 
     /// Returns the active configuration.
@@ -415,6 +447,106 @@ impl ServerAcceptor {
         Ok(Written::nothing())
     }
 
+    // ── Phase 4: MCS Connect Initial / Connect Response ────────────────
+
+    fn step_wait_mcs_connect_initial(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let mut cursor = ReadCursor::new(input);
+        let _tpkt = TpktHeader::decode(&mut cursor)?;
+        let _dt = DataTransfer::decode(&mut cursor)?;
+        let connect_initial = ConnectInitial::decode(&mut cursor)?;
+
+        // Parse client GCC data blocks. The CR/CC happened in plaintext;
+        // by here we either reached MCS via TLS+(maybe)CredSSP or via
+        // Standard RDP Security. Either way the GCC payload is the same
+        // shape on the wire.
+        let client_gcc = decode_connect_initial_gcc(&connect_initial.user_data)?;
+
+        // Allocate channel IDs from the client's CS_NET request.
+        let client_channels: &[_] = client_gcc
+            .network
+            .as_ref()
+            .map(|n| n.channels.as_slice())
+            .unwrap_or(&[]);
+        let enable_message_channel = self.config.support_message_channel
+            && client_gcc.message_channel.is_some();
+        let alloc = allocate_channel_ids(client_channels, enable_message_channel)?;
+
+        // Build server data blocks. For TLS / CredSSP / RDSTLS / AAD the
+        // SC_SECURITY block is always "none" (encryption_method=0,
+        // encryption_level=0). Standard RDP Security would carry the
+        // server random + certificate here; that path requires Commit 1's
+        // scaffolding plus a key-derivation step that lives outside the
+        // acceptor in justrdp-pdu.
+        let multitransport_flags = self
+            .config
+            .multitransport_flags
+            .filter(|_| client_gcc.multitransport.is_some());
+        // MS-RDPBCGR §2.2.1.4.2: SC_CORE.clientRequestedProtocols MUST
+        // echo the client's original RDP_NEG_REQ.requestedProtocols
+        // verbatim so the client can detect a MITM downgrade attack
+        // (a MITM that rewrites RDP_NEG_RSP.selectedProtocol can't also
+        // forge the SC_CORE echo, because that channel is inside the
+        // post-TLS / post-CredSSP stream). Sending the server-chosen
+        // protocol instead of the client's request defeats the check.
+        let client_requested_protocols = self
+            .client_request
+            .as_ref()
+            .map(|r| r.requested_protocols.bits())
+            .unwrap_or(0);
+        let inputs = ServerGccInputs {
+            server_version: self.config.server_rdp_version,
+            client_requested_protocols,
+            early_capability_flags: self.config.server_early_capability_flags,
+            encryption_method: 0,
+            encryption_level: 0,
+            server_random: None,
+            server_certificate: None,
+            channels: &alloc,
+            multitransport_flags,
+        };
+        let server_blocks = build_server_data_blocks(&inputs)?;
+        let gcc_resp = wrap_server_gcc(server_blocks)?;
+
+        // Build the MCS Connect Response. `called_connect_id` mirrors the
+        // T.125 convention used by Windows servers (always 0).
+        let connect_response = ConnectResponse {
+            result: ConnectResponseResult::RtSuccessful,
+            called_connect_id: 0,
+            domain_parameters: DomainParameters::client_default(),
+            user_data: gcc_resp,
+        };
+
+        // Wrap in TPKT + X.224 DT.
+        let inner_size = DATA_TRANSFER_HEADER_SIZE + connect_response.size();
+        let total_size = TPKT_HEADER_SIZE + inner_size;
+        let mut buf = alloc::vec![0u8; total_size];
+        {
+            let mut cursor = WriteCursor::new(&mut buf);
+            TpktHeader::try_for_payload(inner_size)?.encode(&mut cursor)?;
+            DataTransfer.encode(&mut cursor)?;
+            connect_response.encode(&mut cursor)?;
+        }
+
+        self.client_gcc = Some(client_gcc);
+        self.channel_alloc = Some(alloc);
+        self.pending_connect_response = Some(buf);
+        self.state = ServerAcceptorState::SendMcsConnectResponse;
+        Ok(Written::nothing())
+    }
+
+    fn step_send_mcs_connect_response(
+        &mut self,
+        output: &mut WriteBuf,
+    ) -> AcceptorResult<Written> {
+        let bytes = self.pending_connect_response.take().ok_or_else(|| {
+            AcceptorError::general("no pending MCS Connect Response (state machine corrupt)")
+        })?;
+        output.resize(bytes.len());
+        output.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+        self.state = ServerAcceptorState::ChannelConnection;
+        Ok(Written::new(bytes.len()))
+    }
+
     // ── Phase 3: CredSSP Accept (external) ──────────────────────────────
 
     /// Caller has finished the server-side CredSSP exchange (NEGOTIATE /
@@ -483,6 +615,10 @@ impl ServerAcceptor {
         let mut result = AcceptanceResult::new(info);
         result.selected_protocol = self.selected_protocol;
         result.server_nego_flags = self.server_nego_flags;
+        if let Some(alloc) = &self.channel_alloc {
+            result.io_channel_id = alloc.io_channel_id;
+            result.channel_ids = alloc.static_channels.clone();
+        }
         result
     }
 }
@@ -531,10 +667,14 @@ impl Sequence for ServerAcceptor {
             ServerAcceptorState::SendConnectionConfirm => self.step_send_connection_confirm(output),
             ServerAcceptorState::TlsAccept => self.step_tls_accept(),
             ServerAcceptorState::CredsspAccept => self.step_credssp_accept(),
+            ServerAcceptorState::WaitMcsConnectInitial => {
+                self.step_wait_mcs_connect_initial(input)
+            }
+            ServerAcceptorState::SendMcsConnectResponse => {
+                self.step_send_mcs_connect_response(output)
+            }
             // Later commits will fill these in.
-            ServerAcceptorState::WaitMcsConnectInitial
-            | ServerAcceptorState::SendMcsConnectResponse
-            | ServerAcceptorState::ChannelConnection
+            ServerAcceptorState::ChannelConnection
             | ServerAcceptorState::WaitClientInfo
             | ServerAcceptorState::SendLicense
             | ServerAcceptorState::SendDemandActive
@@ -1114,6 +1254,212 @@ mod tests {
         let err = acc.notify_tls_failed().unwrap_err();
         assert!(matches!(err.kind, AcceptorErrorKind::InvalidState));
         assert_eq!(acc.state(), &ServerAcceptorState::CredsspAccept);
+    }
+
+    /// Build a TPKT-wrapped MCS Connect Initial with the given GCC client
+    /// data blocks.
+    fn build_mcs_connect_initial_bytes(client_blocks: &[u8]) -> alloc::vec::Vec<u8> {
+        use justrdp_pdu::gcc::ConferenceCreateRequest;
+        use justrdp_pdu::mcs::{ConnectInitial, DomainParameters};
+        use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
+        use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
+
+        let gcc = ConferenceCreateRequest::new(client_blocks.to_vec());
+        let gcc_encoded = justrdp_core::encode_vec(&gcc).unwrap();
+
+        let ci = ConnectInitial {
+            calling_domain_selector: alloc::vec![1],
+            called_domain_selector: alloc::vec![1],
+            upward_flag: true,
+            target_parameters: DomainParameters::client_default(),
+            minimum_parameters: DomainParameters::min_default(),
+            maximum_parameters: DomainParameters::max_default(),
+            user_data: gcc_encoded,
+        };
+        let inner_size = DATA_TRANSFER_HEADER_SIZE + ci.size();
+        let total = TPKT_HEADER_SIZE + inner_size;
+        let mut buf = alloc::vec![0u8; total];
+        let mut cursor = justrdp_core::WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(inner_size).unwrap().encode(&mut cursor).unwrap();
+        DataTransfer.encode(&mut cursor).unwrap();
+        ci.encode(&mut cursor).unwrap();
+        buf
+    }
+
+    /// Build the minimal client GCC user data: CS_CORE + CS_SECURITY +
+    /// optional CS_NET.
+    fn build_client_gcc_blocks(channels: &[&str]) -> alloc::vec::Vec<u8> {
+        use justrdp_pdu::gcc::client::{
+            ChannelDef, ClientCoreData, ClientNetworkData, ClientSecurityData,
+        };
+        let core = ClientCoreData::new(1024, 768);
+        let security = ClientSecurityData::new();
+        let mut total = core.size() + security.size();
+        let net = if !channels.is_empty() {
+            let chans: alloc::vec::Vec<ChannelDef> = channels
+                .iter()
+                .map(|n| ChannelDef::new(n, 0))
+                .collect();
+            let n = ClientNetworkData { channels: chans };
+            total += n.size();
+            Some(n)
+        } else {
+            None
+        };
+        let mut buf = alloc::vec![0u8; total];
+        let mut cursor = justrdp_core::WriteCursor::new(&mut buf);
+        core.encode(&mut cursor).unwrap();
+        security.encode(&mut cursor).unwrap();
+        if let Some(n) = net {
+            n.encode(&mut cursor).unwrap();
+        }
+        buf
+    }
+
+    /// Drive the acceptor through Phase 1, 2, 3 to reach
+    /// WaitMcsConnectInitial. Uses an `SSL | HYBRID` negotiation so the
+    /// transcript also exercises TLS+CredSSP no-op transitions and lets
+    /// callers verify the server echoes the *client's original*
+    /// `requestedProtocols` (not the server-chosen `HYBRID`).
+    fn drive_to_wait_mcs() -> ServerAcceptor {
+        let mut acc = drive_through_cc(
+            SecurityProtocol::SSL.union(SecurityProtocol::HYBRID),
+        );
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap(); // TlsAccept -> CredsspAccept
+        acc.step(&[], &mut out).unwrap(); // CredsspAccept -> WaitMcsConnectInitial
+        acc
+    }
+
+    #[test]
+    fn mcs_connect_initial_decode_and_response_round_trip() {
+        let mut acc = drive_to_wait_mcs();
+        let client_blocks = build_client_gcc_blocks(&["rdpdr", "rdpsnd"]);
+        let ci_bytes = build_mcs_connect_initial_bytes(&client_blocks);
+
+        let mut out = WriteBuf::new();
+        // WaitMcsConnectInitial
+        acc.step(&ci_bytes, &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::SendMcsConnectResponse);
+        assert!(out.is_empty());
+        let alloc = acc.channel_allocation().unwrap();
+        assert_eq!(alloc.io_channel_id, crate::mcs::IO_CHANNEL_ID);
+        assert_eq!(alloc.static_channels.len(), 2);
+        assert_eq!(alloc.static_channels[0].0, "rdpdr");
+        assert_eq!(alloc.static_channels[1].0, "rdpsnd");
+
+        // SendMcsConnectResponse
+        let written = acc.step(&[], &mut out).unwrap();
+        assert!(written.size > 0);
+        assert_eq!(acc.state(), &ServerAcceptorState::ChannelConnection);
+
+        // Verify the produced bytes round-trip through the client decoder.
+        let mut cursor = ReadCursor::new(&out.as_slice()[..written.size]);
+        let _tpkt = TpktHeader::decode(&mut cursor).unwrap();
+        let _dt = DataTransfer::decode(&mut cursor).unwrap();
+        let cresp = ConnectResponse::decode(&mut cursor).unwrap();
+        assert_eq!(cresp.result, ConnectResponseResult::RtSuccessful);
+        // Decode the GCC payload to verify channel IDs match the allocation.
+        use justrdp_pdu::gcc::ConferenceCreateResponse;
+        let mut gcc_cursor = ReadCursor::new(&cresp.user_data);
+        let gcc = ConferenceCreateResponse::decode(&mut gcc_cursor).unwrap();
+        // Walk the server data blocks looking for SC_NET.
+        let mut block_cursor = ReadCursor::new(&gcc.user_data);
+        // Skip SC_CORE (header + version + 2 optional u32s = 16 bytes).
+        let core = justrdp_pdu::gcc::server::ServerCoreData::decode(&mut block_cursor).unwrap();
+        // Spec §2.2.1.4.2: must echo the client's original
+        // requestedProtocols (SSL | HYBRID = 0x3), not the
+        // server-selected protocol (HYBRID = 0x2). This catches MITM
+        // downgrade attempts.
+        assert_eq!(
+            core.client_requested_protocols,
+            Some(SecurityProtocol::SSL.union(SecurityProtocol::HYBRID).bits())
+        );
+        // SC_SECURITY
+        let _sec = justrdp_pdu::gcc::server::ServerSecurityData::decode(&mut block_cursor).unwrap();
+        // SC_NET
+        let net =
+            justrdp_pdu::gcc::server::ServerNetworkData::decode(&mut block_cursor).unwrap();
+        assert_eq!(net.mcs_channel_id, crate::mcs::IO_CHANNEL_ID);
+        assert_eq!(
+            net.channel_ids,
+            alloc::vec![crate::mcs::IO_CHANNEL_ID + 1, crate::mcs::IO_CHANNEL_ID + 2]
+        );
+    }
+
+    #[test]
+    fn mcs_connect_initial_with_message_channel() {
+        // Client requests message channel via CS_MCS_MSGCHANNEL.
+        use justrdp_pdu::gcc::client::{
+            ClientCoreData, ClientMessageChannelData, ClientSecurityData,
+        };
+        let core = ClientCoreData::new(800, 600);
+        let security = ClientSecurityData::new();
+        let msg = ClientMessageChannelData { flags: 0 };
+        let mut buf = alloc::vec![0u8; core.size() + security.size() + msg.size()];
+        let mut cursor = justrdp_core::WriteCursor::new(&mut buf);
+        core.encode(&mut cursor).unwrap();
+        security.encode(&mut cursor).unwrap();
+        msg.encode(&mut cursor).unwrap();
+        let ci_bytes = build_mcs_connect_initial_bytes(&buf);
+
+        // Server config that supports the message channel.
+        let cfg = AcceptorConfig::builder()
+            .support_message_channel(true)
+            .build();
+        let mut acc = ServerAcceptor::new(cfg);
+        let mut out = WriteBuf::new();
+        // Drive through CC + TLS + CredSSP.
+        let nego = NegotiationRequest::new(SecurityProtocol::HYBRID);
+        let cr = ConnectionRequest::new(Some(nego));
+        let cr_bytes = build_cr_bytes(&cr);
+        acc.step(&cr_bytes, &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        // WaitMcsConnectInitial
+        acc.step(&ci_bytes, &mut out).unwrap();
+        let alloc = acc.channel_allocation().unwrap();
+        assert_eq!(alloc.message_channel_id, Some(crate::mcs::IO_CHANNEL_ID + 1));
+
+        // Verify SC_MCS_MSGCHANNEL is in the response.
+        let written = acc.step(&[], &mut out).unwrap();
+        let mut c = ReadCursor::new(&out.as_slice()[..written.size]);
+        let _ = TpktHeader::decode(&mut c).unwrap();
+        let _ = DataTransfer::decode(&mut c).unwrap();
+        let cresp = ConnectResponse::decode(&mut c).unwrap();
+        use justrdp_pdu::gcc::ConferenceCreateResponse;
+        let mut gc = ReadCursor::new(&cresp.user_data);
+        let gcc = ConferenceCreateResponse::decode(&mut gc).unwrap();
+        let mut bc = ReadCursor::new(&gcc.user_data);
+        let _core = justrdp_pdu::gcc::server::ServerCoreData::decode(&mut bc).unwrap();
+        let _sec = justrdp_pdu::gcc::server::ServerSecurityData::decode(&mut bc).unwrap();
+        let _net = justrdp_pdu::gcc::server::ServerNetworkData::decode(&mut bc).unwrap();
+        let msg_block =
+            justrdp_pdu::gcc::server::ServerMessageChannelData::decode(&mut bc).unwrap();
+        assert_eq!(msg_block.mcs_message_channel_id, crate::mcs::IO_CHANNEL_ID + 1);
+    }
+
+    #[test]
+    fn mcs_connect_initial_no_static_channels_allocates_io_only() {
+        let mut acc = drive_to_wait_mcs();
+        let client_blocks = build_client_gcc_blocks(&[]);
+        let ci_bytes = build_mcs_connect_initial_bytes(&client_blocks);
+        let mut out = WriteBuf::new();
+        acc.step(&ci_bytes, &mut out).unwrap();
+        let alloc = acc.channel_allocation().unwrap();
+        assert!(alloc.static_channels.is_empty());
+        assert_eq!(alloc.io_channel_id, crate::mcs::IO_CHANNEL_ID);
+    }
+
+    #[test]
+    fn mcs_connect_initial_rejects_missing_core() {
+        let mut acc = drive_to_wait_mcs();
+        // Empty client data blocks (no CS_CORE).
+        let ci_bytes = build_mcs_connect_initial_bytes(&[]);
+        let mut out = WriteBuf::new();
+        let err = acc.step(&ci_bytes, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("CS_CORE"));
     }
 
     #[test]
