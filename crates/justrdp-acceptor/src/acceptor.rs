@@ -11,7 +11,15 @@ use justrdp_pdu::mcs::{
     ConnectResponse, ConnectResponseResult, DomainParameters, ErectDomainRequest,
     SendDataIndication, SendDataRequest,
 };
+use justrdp_pdu::rdp::capabilities::{
+    BitmapCapability, CapabilitySet, ConfirmActivePdu, DemandActivePdu, GeneralCapability,
+    InputCapability, LargePointerCapability, MultifragmentUpdateCapability, OrderCapability,
+    PointerCapability, ShareCapability, SurfaceCommandsCapability, VirtualChannelCapability,
+};
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
+use justrdp_pdu::rdp::headers::{
+    ShareControlHeader, ShareControlPduType, SHARE_CONTROL_HEADER_SIZE,
+};
 use justrdp_pdu::rdp::licensing::LicenseErrorMessage;
 use justrdp_pdu::tpkt::{TpktHeader, TpktHint, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{
@@ -90,7 +98,22 @@ pub struct ServerAcceptor {
     /// exchange. Available once the acceptor has advanced past
     /// `WaitClientInfo`.
     client_info: Option<ClientInfoPdu>,
+
+    // ── Phase 11: Capabilities Exchange ──
+    /// Server-assigned share ID (sent in DemandActive, echoed by
+    /// ConfirmActive). Default `0x0001_03EA` matches what Windows RDS
+    /// emits and is what mstsc / FreeRDP expect to round-trip.
+    share_id: u32,
+    /// Capability sets the client returned in ConfirmActivePdu.
+    /// Available once the acceptor has advanced past
+    /// `WaitConfirmActive`.
+    client_capabilities: Vec<CapabilitySet>,
 }
+
+/// Spec-mandated `originatorID` value the client MUST place in
+/// ConfirmActivePdu (MS-RDPBCGR §2.2.1.13.2.1). Windows RDS rejects
+/// mismatches with `ERRINFO_CONFIRMACTIVEWRONGORIGINATOR (0x10D5)`.
+const CONFIRM_ACTIVE_ORIGINATOR_ID: u16 = 0x03EA;
 
 // ── TS_SECURITY_HEADER constants (MS-RDPBCGR §2.2.8.1.1.2.1) ──
 
@@ -139,7 +162,21 @@ impl ServerAcceptor {
             channel_join_index: 0,
             pending_join_requested: None,
             client_info: None,
+            share_id: 0x0001_03EA,
+            client_capabilities: Vec::new(),
         }
+    }
+
+    /// Server-assigned share ID. Available once the acceptor has
+    /// advanced past `SendDemandActive`.
+    pub fn share_id(&self) -> u32 {
+        self.share_id
+    }
+
+    /// Capability sets the client returned in ConfirmActive. Available
+    /// once the acceptor has advanced past `WaitConfirmActive`.
+    pub fn client_capabilities(&self) -> &[CapabilitySet] {
+        &self.client_capabilities
     }
 
     /// Decoded `ClientInfoPdu` captured during the secure-settings
@@ -914,6 +951,258 @@ impl ServerAcceptor {
         Ok(Written::new(total))
     }
 
+    // ── Phase 11: Capabilities Exchange ────────────────────────────────
+
+    /// Build the server's capability sets advertised in DemandActive.
+    ///
+    /// Includes the spec-mandatory caps (General, Bitmap, Order, Pointer,
+    /// Input, VirtualChannel, Share) plus a handful that are essentially
+    /// universal (LargePointer, MultifragmentUpdate, SurfaceCommands)
+    /// and that the connector advertises on the client side. The
+    /// `desktop_width/height` come from the client's CS_CORE so server
+    /// echoes the negotiated resolution.
+    fn build_server_capabilities(&self) -> Vec<CapabilitySet> {
+        let (width, height, bpp) = self
+            .client_gcc
+            .as_ref()
+            .map(|g| {
+                let bpp = g
+                    .core
+                    .high_color_depth
+                    .map(|d| d as u16)
+                    .unwrap_or(g.core.color_depth as u16);
+                (g.core.desktop_width, g.core.desktop_height, bpp.max(8))
+            })
+            .unwrap_or((1024, 768, 16));
+
+        alloc::vec![
+            CapabilitySet::General(GeneralCapability {
+                os_major_type: 1, // OSMAJORTYPE_WINDOWS
+                os_minor_type: 3, // OSMINORTYPE_WINDOWS_NT
+                protocol_version: 0x0200,
+                pad2: 0,
+                general_compression_types: 0,
+                // FASTPATH_OUTPUT_SUPPORTED | LONG_CREDENTIALS_SUPPORTED |
+                // AUTORECONNECT_SUPPORTED | ENC_SALTED_CHECKSUM |
+                // NO_BITMAP_COMPRESSION_HDR
+                extra_flags: 0x041D,
+                update_capability_flag: 0,
+                remote_unshare_flag: 0,
+                general_compression_level: 0,
+                refresh_rect_support: 1,
+                suppress_output_support: 1,
+            }),
+            CapabilitySet::Bitmap(BitmapCapability {
+                preferred_bits_per_pixel: bpp,
+                receive1_bit_per_pixel: 1,
+                receive4_bits_per_pixel: 1,
+                receive8_bits_per_pixel: 1,
+                desktop_width: width,
+                desktop_height: height,
+                pad2a: 0,
+                desktop_resize_flag: 1,
+                bitmap_compression_flag: 1,
+                high_color_flags: 0,
+                // DRAW_ALLOW_DYNAMIC_COLOR_FIDELITY |
+                // DRAW_ALLOW_COLOR_SUBSAMPLING |
+                // DRAW_ALLOW_SKIP_ALPHA
+                drawing_flags: 0x08 | 0x10 | 0x20,
+                multiple_rectangle_support: 1,
+                pad2b: 0,
+            }),
+            CapabilitySet::Order(OrderCapability {
+                terminal_descriptor: [0u8; 16],
+                pad4: 0,
+                desktop_save_x_granularity: 1,
+                desktop_save_y_granularity: 20,
+                pad2a: 0,
+                maximum_order_level: 1,
+                number_fonts: 0,
+                // NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT |
+                // COLORINDEXSUPPORT
+                order_flags: 0x002A,
+                order_support: [0u8; 32],
+                text_flags: 0x06A1,
+                order_support_ex_flags: 0,
+                pad4b: 0,
+                desktop_save_size: 0x38400,
+                pad2b: 0,
+                pad2c: 0,
+                text_ansi_code_page: 0,
+                pad2d: 0,
+            }),
+            CapabilitySet::Pointer(PointerCapability {
+                color_pointer_flag: 1,
+                color_pointer_cache_size: 25,
+                pointer_cache_size: 25,
+            }),
+            CapabilitySet::Input(InputCapability {
+                // INPUT_FLAG_SCANCODES | INPUT_FLAG_MOUSEX |
+                // INPUT_FLAG_UNICODE | INPUT_FLAG_FASTPATH_INPUT2
+                input_flags: 0x0035,
+                pad2: 0,
+                keyboard_layout: self
+                    .client_gcc
+                    .as_ref()
+                    .map(|g| g.core.keyboard_layout)
+                    .unwrap_or(0x0409),
+                keyboard_type: self
+                    .client_gcc
+                    .as_ref()
+                    .map(|g| g.core.keyboard_type)
+                    .unwrap_or(4),
+                keyboard_sub_type: self
+                    .client_gcc
+                    .as_ref()
+                    .map(|g| g.core.keyboard_sub_type)
+                    .unwrap_or(0),
+                keyboard_function_key: self
+                    .client_gcc
+                    .as_ref()
+                    .map(|g| g.core.keyboard_function_key)
+                    .unwrap_or(12),
+                ime_file_name: [0u8; 64],
+            }),
+            CapabilitySet::VirtualChannel(VirtualChannelCapability {
+                flags: 0,
+                vc_chunk_size: Some(1600),
+            }),
+            CapabilitySet::Share(ShareCapability {
+                node_id: self.user_channel_id,
+                pad2: 0,
+            }),
+            CapabilitySet::MultifragmentUpdate(MultifragmentUpdateCapability {
+                max_request_size: 0x0003_8400,
+            }),
+            CapabilitySet::LargePointer(LargePointerCapability {
+                large_pointer_support_flags: 0x0001, // LARGE_POINTER_FLAG_96x96
+            }),
+            CapabilitySet::SurfaceCommands(SurfaceCommandsCapability {
+                cmd_flags: 0x0052,
+                reserved: 0,
+            }),
+        ]
+    }
+
+    fn step_send_demand_active(&mut self, output: &mut WriteBuf) -> AcceptorResult<Written> {
+        let alloc = self
+            .channel_alloc
+            .as_ref()
+            .ok_or_else(|| AcceptorError::general("SendDemandActive before MCS Connect"))?;
+        let io_channel_id = alloc.io_channel_id;
+
+        // Build the DemandActive PDU. `source_descriptor = "RDP\0\0"` is
+        // what every Windows / FreeRDP server sends.
+        let demand = DemandActivePdu {
+            share_id: self.share_id,
+            source_descriptor: alloc::vec![0x52, 0x44, 0x50, 0x00, 0x00],
+            capability_sets: self.build_server_capabilities(),
+            session_id: 0,
+        };
+        let demand_bytes = justrdp_core::encode_vec(&demand)?;
+
+        // Wrap in ShareControl(DemandActivePdu, pdu_source =
+        // server_user_channel = 0x03EA).
+        let total_length = SHARE_CONTROL_HEADER_SIZE + demand_bytes.len();
+        if total_length > u16::MAX as usize {
+            return Err(AcceptorError::general(
+                "DemandActivePdu too large to fit in u16 ShareControl length",
+            ));
+        }
+        let mut sc_payload = alloc::vec![0u8; total_length];
+        {
+            let mut cursor = WriteCursor::new(&mut sc_payload);
+            // ShareControl `pduSource` is the channel ID of the transmission
+            // source (MS-RDPBCGR §2.2.8.1.1.1.1). The server has no separate
+            // MCS user channel, so we mirror the client connector's pattern
+            // and use `user_channel_id` -- which is the same value the SDI
+            // wrapper below uses for `initiator`. Consistency across the
+            // two fields matters more than the spec's loose wording about
+            // "the source of the PDU"; diverging values would confuse
+            // clients that compare them. The constant 0x03EA is reserved
+            // for ConfirmActive's `originatorID` (a separate field) and
+            // would not be a correct value here.
+            ShareControlHeader {
+                total_length: total_length as u16,
+                pdu_type: ShareControlPduType::DemandActivePdu,
+                pdu_source: self.user_channel_id,
+            }
+            .encode(&mut cursor)?;
+            cursor.write_slice(&demand_bytes, "DemandActive::body")?;
+        }
+
+        // Wrap in MCS SendDataIndication on the I/O channel. No
+        // security header for TLS / NLA: the basic security header is
+        // reserved for the secure-settings exchange (SEC_INFO_PKT) and
+        // the licensing PDU (SEC_LICENSE_PKT).
+        let sdi = SendDataIndication {
+            initiator: self.user_channel_id,
+            channel_id: io_channel_id,
+            user_data: &sc_payload,
+        };
+        let inner_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let total = TPKT_HEADER_SIZE + inner_size;
+        output.resize(total);
+        {
+            let mut cursor = WriteCursor::new(output.as_mut_slice());
+            TpktHeader::try_for_payload(inner_size)?.encode(&mut cursor)?;
+            DataTransfer.encode(&mut cursor)?;
+            sdi.encode(&mut cursor)?;
+        }
+        self.state = ServerAcceptorState::WaitConfirmActive;
+        Ok(Written::new(total))
+    }
+
+    fn step_wait_confirm_active(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let mut cursor = ReadCursor::new(input);
+        let _tpkt = TpktHeader::decode(&mut cursor)?;
+        let _dt = DataTransfer::decode(&mut cursor)?;
+        let sdr = SendDataRequest::decode(&mut cursor)?;
+
+        let alloc = self
+            .channel_alloc
+            .as_ref()
+            .ok_or_else(|| AcceptorError::general("ConfirmActive before MCS Connect"))?;
+        if sdr.channel_id != alloc.io_channel_id {
+            return Err(AcceptorError::general(
+                "ConfirmActive must be sent on the I/O channel",
+            ));
+        }
+        if sdr.initiator != self.user_channel_id {
+            return Err(AcceptorError::general(
+                "ConfirmActive initiator does not match the assigned user channel",
+            ));
+        }
+
+        // ShareControl header dispatch.
+        let mut inner = ReadCursor::new(sdr.user_data);
+        let sc_hdr = ShareControlHeader::decode(&mut inner)?;
+        if sc_hdr.pdu_type != ShareControlPduType::ConfirmActivePdu {
+            return Err(AcceptorError::general(
+                "expected ConfirmActivePdu, got a different ShareControl PDU",
+            ));
+        }
+        let confirm = ConfirmActivePdu::decode(&mut inner)?;
+
+        // Spec validation (MS-RDPBCGR §2.2.1.13.2.1):
+        //  * shareId MUST equal the value the server sent in DemandActive
+        //  * originatorID MUST be the constant 0x03EA
+        if confirm.share_id != self.share_id {
+            return Err(AcceptorError::general(
+                "ConfirmActive shareId does not match the value sent in DemandActive",
+            ));
+        }
+        if confirm.originator_id != CONFIRM_ACTIVE_ORIGINATOR_ID {
+            return Err(AcceptorError::general(
+                "ConfirmActive originatorID is not the spec-mandated 0x03EA",
+            ));
+        }
+
+        self.client_capabilities = confirm.capability_sets;
+        self.state = ServerAcceptorState::ConnectionFinalization;
+        Ok(Written::nothing())
+    }
+
     // ── External-failure helpers ────────────────────────────────────────
 
     /// Caller signals that the external TLS handshake failed. The
@@ -1034,10 +1323,10 @@ impl Sequence for ServerAcceptor {
             }
             ServerAcceptorState::WaitClientInfo => self.step_wait_client_info(input),
             ServerAcceptorState::SendLicense => self.step_send_license(output),
+            ServerAcceptorState::SendDemandActive => self.step_send_demand_active(output),
+            ServerAcceptorState::WaitConfirmActive => self.step_wait_confirm_active(input),
             // Later commits will fill these in.
-            ServerAcceptorState::SendDemandActive
-            | ServerAcceptorState::WaitConfirmActive
-            | ServerAcceptorState::ConnectionFinalization => Err(AcceptorError::general(
+            ServerAcceptorState::ConnectionFinalization => Err(AcceptorError::general(
                 "state not yet implemented in this commit",
             )),
             ServerAcceptorState::Accepted { .. } | ServerAcceptorState::NegotiationFailed => {
@@ -2211,6 +2500,281 @@ mod tests {
         let mut out = WriteBuf::new();
         let err = acc.step(&buf, &mut out).unwrap_err();
         assert!(alloc::format!("{err}").contains("SEC_INFO_PKT"));
+    }
+
+    /// Drive an acceptor to SendDemandActive (post-license).
+    fn drive_to_send_demand_active() -> ServerAcceptor {
+        let mut acc = drive_to_wait_client_info();
+        let user_id = acc.user_channel_id();
+        let info = ClientInfoPdu::new("", "alice", "x");
+        let bytes = build_client_info_pdu_bytes(user_id, crate::mcs::IO_CHANNEL_ID, &info);
+        let mut out = WriteBuf::new();
+        acc.step(&bytes, &mut out).unwrap(); // -> SendLicense
+        acc.step(&[], &mut out).unwrap(); // -> SendDemandActive
+        assert_eq!(acc.state(), &ServerAcceptorState::SendDemandActive);
+        acc
+    }
+
+    /// Build a ConfirmActivePdu wrapped in ShareControl + MCS SDR + DT +
+    /// TPKT, addressed to `(initiator, io_channel_id)`.
+    fn build_confirm_active_bytes(
+        initiator: u16,
+        io_channel_id: u16,
+        share_id: u32,
+    ) -> alloc::vec::Vec<u8> {
+        use justrdp_pdu::rdp::capabilities::{ConfirmActivePdu, GeneralCapability};
+        let confirm = ConfirmActivePdu {
+            share_id,
+            originator_id: CONFIRM_ACTIVE_ORIGINATOR_ID,
+            source_descriptor: alloc::vec![0x4D, 0x53, 0x54, 0x53, 0x43, 0x00], // "MSTSC\0"
+            capability_sets: alloc::vec![CapabilitySet::General(GeneralCapability {
+                os_major_type: 1,
+                os_minor_type: 3,
+                protocol_version: 0x0200,
+                pad2: 0,
+                general_compression_types: 0,
+                extra_flags: 0x041D,
+                update_capability_flag: 0,
+                remote_unshare_flag: 0,
+                general_compression_level: 0,
+                refresh_rect_support: 1,
+                suppress_output_support: 1,
+            })],
+        };
+        let body = justrdp_core::encode_vec(&confirm).unwrap();
+        let total = SHARE_CONTROL_HEADER_SIZE + body.len();
+        let mut sc = alloc::vec![0u8; total];
+        {
+            let mut c = WriteCursor::new(&mut sc);
+            ShareControlHeader {
+                total_length: total as u16,
+                pdu_type: ShareControlPduType::ConfirmActivePdu,
+                pdu_source: initiator,
+            }
+            .encode(&mut c)
+            .unwrap();
+            c.write_slice(&body, "ConfirmActive::body").unwrap();
+        }
+        let sdr = SendDataRequest {
+            initiator,
+            channel_id: io_channel_id,
+            user_data: &sc,
+        };
+        let inner = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+        let total_pkt = TPKT_HEADER_SIZE + inner;
+        let mut buf = alloc::vec![0u8; total_pkt];
+        let mut c = WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(inner)
+            .unwrap()
+            .encode(&mut c)
+            .unwrap();
+        DataTransfer.encode(&mut c).unwrap();
+        sdr.encode(&mut c).unwrap();
+        buf
+    }
+
+    #[test]
+    fn demand_active_round_trip_with_confirm_active() {
+        let mut acc = drive_to_send_demand_active();
+        let mut out = WriteBuf::new();
+        let user_id = acc.user_channel_id();
+        let share_id = acc.share_id();
+
+        // Server emits DemandActive.
+        let written = acc.step(&[], &mut out).unwrap();
+        assert!(written.size > 0);
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitConfirmActive);
+
+        // Decode the wire bytes the acceptor produced and verify.
+        let mut c = ReadCursor::new(&out.as_slice()[..written.size]);
+        let _ = TpktHeader::decode(&mut c).unwrap();
+        let _ = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        assert_eq!(sdi.channel_id, crate::mcs::IO_CHANNEL_ID);
+        assert_eq!(sdi.initiator, user_id);
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let sc_hdr = ShareControlHeader::decode(&mut inner).unwrap();
+        assert_eq!(sc_hdr.pdu_type, ShareControlPduType::DemandActivePdu);
+        let demand = DemandActivePdu::decode(&mut inner).unwrap();
+        assert_eq!(demand.share_id, share_id);
+        assert_eq!(demand.source_descriptor, alloc::vec![0x52, 0x44, 0x50, 0x00, 0x00]);
+        assert!(!demand.capability_sets.is_empty());
+        assert_eq!(demand.session_id, 0);
+
+        // Verify ShareControl pdu_source matches the SDI initiator
+        // (consistency: both must be the user channel ID).
+        assert_eq!(sc_hdr.pdu_source, sdi.initiator);
+
+        // Verify all spec-mandatory capability sets are present.
+        // MS-RDPBCGR §1.3.1.1.10 / §2.2.7 lists General, Bitmap, Order,
+        // Pointer, Input, VirtualChannel, Share as mandatory.
+        let mut has_general = false;
+        let mut has_bitmap = false;
+        let mut has_order = false;
+        let mut has_pointer = false;
+        let mut has_input = false;
+        let mut has_vchannel = false;
+        let mut has_share = false;
+        for cap in &demand.capability_sets {
+            match cap {
+                CapabilitySet::General(_) => has_general = true,
+                CapabilitySet::Bitmap(_) => has_bitmap = true,
+                CapabilitySet::Order(_) => has_order = true,
+                CapabilitySet::Pointer(_) => has_pointer = true,
+                CapabilitySet::Input(_) => has_input = true,
+                CapabilitySet::VirtualChannel(_) => has_vchannel = true,
+                CapabilitySet::Share(_) => has_share = true,
+                _ => {}
+            }
+        }
+        assert!(has_general, "missing General capability");
+        assert!(has_bitmap, "missing Bitmap capability");
+        assert!(has_order, "missing Order capability");
+        assert!(has_pointer, "missing Pointer capability");
+        assert!(has_input, "missing Input capability");
+        assert!(has_vchannel, "missing VirtualChannel capability");
+        assert!(has_share, "missing Share capability");
+
+        // Client responds with ConfirmActive.
+        let confirm_bytes = build_confirm_active_bytes(user_id, crate::mcs::IO_CHANNEL_ID, share_id);
+        acc.step(&confirm_bytes, &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::ConnectionFinalization);
+        assert_eq!(acc.client_capabilities().len(), 1);
+    }
+
+    #[test]
+    fn confirm_active_rejects_wrong_originator_id() {
+        let mut acc = drive_to_send_demand_active();
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap(); // emit DemandActive
+        let user_id = acc.user_channel_id();
+        let share_id = acc.share_id();
+
+        // Build a ConfirmActive with a wrong originator_id.
+        use justrdp_pdu::rdp::capabilities::{ConfirmActivePdu, GeneralCapability};
+        let confirm = ConfirmActivePdu {
+            share_id,
+            originator_id: 0xDEAD, // WRONG (should be 0x03EA)
+            source_descriptor: alloc::vec![0x4D, 0x53, 0x54, 0x53, 0x43, 0x00],
+            capability_sets: alloc::vec![CapabilitySet::General(GeneralCapability {
+                os_major_type: 1,
+                os_minor_type: 3,
+                protocol_version: 0x0200,
+                pad2: 0,
+                general_compression_types: 0,
+                extra_flags: 0x041D,
+                update_capability_flag: 0,
+                remote_unshare_flag: 0,
+                general_compression_level: 0,
+                refresh_rect_support: 1,
+                suppress_output_support: 1,
+            })],
+        };
+        let body = justrdp_core::encode_vec(&confirm).unwrap();
+        let total = SHARE_CONTROL_HEADER_SIZE + body.len();
+        let mut sc = alloc::vec![0u8; total];
+        let mut cc = WriteCursor::new(&mut sc);
+        ShareControlHeader {
+            total_length: total as u16,
+            pdu_type: ShareControlPduType::ConfirmActivePdu,
+            pdu_source: user_id,
+        }
+        .encode(&mut cc)
+        .unwrap();
+        cc.write_slice(&body, "body").unwrap();
+        let sdr = SendDataRequest {
+            initiator: user_id,
+            channel_id: crate::mcs::IO_CHANNEL_ID,
+            user_data: &sc,
+        };
+        let inner = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+        let total_pkt = TPKT_HEADER_SIZE + inner;
+        let mut buf = alloc::vec![0u8; total_pkt];
+        let mut c = WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(inner).unwrap().encode(&mut c).unwrap();
+        DataTransfer.encode(&mut c).unwrap();
+        sdr.encode(&mut c).unwrap();
+
+        let err = acc.step(&buf, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("originatorID"));
+    }
+
+    #[test]
+    fn confirm_active_rejects_wrong_share_id() {
+        let mut acc = drive_to_send_demand_active();
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap();
+        let user_id = acc.user_channel_id();
+        // Use a deliberately wrong share_id.
+        let confirm_bytes =
+            build_confirm_active_bytes(user_id, crate::mcs::IO_CHANNEL_ID, 0xDEAD_BEEF);
+        let err = acc.step(&confirm_bytes, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("shareId"));
+    }
+
+    #[test]
+    fn confirm_active_rejects_wrong_initiator() {
+        let mut acc = drive_to_send_demand_active();
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap();
+        let share_id = acc.share_id();
+        // Initiator that isn't the assigned user channel.
+        let confirm_bytes =
+            build_confirm_active_bytes(0xBEEF, crate::mcs::IO_CHANNEL_ID, share_id);
+        let err = acc.step(&confirm_bytes, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("initiator"));
+    }
+
+    #[test]
+    fn confirm_active_rejects_wrong_channel() {
+        let mut acc = drive_to_send_demand_active();
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap();
+        let user_id = acc.user_channel_id();
+        let share_id = acc.share_id();
+        // Address ConfirmActive to a non-I/O channel.
+        let confirm_bytes = build_confirm_active_bytes(user_id, 0xBEEF, share_id);
+        let err = acc.step(&confirm_bytes, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("I/O channel"));
+    }
+
+    #[test]
+    fn confirm_active_rejects_wrong_share_control_pdu_type() {
+        let mut acc = drive_to_send_demand_active();
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap();
+        let user_id = acc.user_channel_id();
+
+        // Build a ShareControl frame with pdu_type = Data (0x07) where
+        // ConfirmActivePdu (0x03) is expected. Body can be empty -- the
+        // type check fires before any body decode.
+        let total = SHARE_CONTROL_HEADER_SIZE;
+        let mut sc = alloc::vec![0u8; total];
+        ShareControlHeader {
+            total_length: total as u16,
+            pdu_type: ShareControlPduType::Data,
+            pdu_source: user_id,
+        }
+        .encode(&mut WriteCursor::new(&mut sc))
+        .unwrap();
+        let sdr = SendDataRequest {
+            initiator: user_id,
+            channel_id: crate::mcs::IO_CHANNEL_ID,
+            user_data: &sc,
+        };
+        let inner = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+        let total_pkt = TPKT_HEADER_SIZE + inner;
+        let mut buf = alloc::vec![0u8; total_pkt];
+        let mut c = WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(inner)
+            .unwrap()
+            .encode(&mut c)
+            .unwrap();
+        DataTransfer.encode(&mut c).unwrap();
+        sdr.encode(&mut c).unwrap();
+
+        let err = acc.step(&buf, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("ConfirmActivePdu"));
     }
 
     #[test]
