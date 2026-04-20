@@ -6,7 +6,7 @@
 //! managing DVC capability negotiation, channel create/close, and data dispatch.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -17,7 +17,10 @@ use justrdp_svc::{
     ChannelName, CompressionCondition, SvcMessage, SvcProcessor, SvcResult, DRDYNVC,
 };
 
-use crate::pdu::{self, DvcPdu, CAPS_VERSION_3, CREATION_STATUS_OK};
+use crate::pdu::{
+    self, DvcPdu, SoftSyncChannelList, CAPS_VERSION_3, CREATION_STATUS_OK,
+    SOFT_SYNC_CHANNEL_LIST_PRESENT, SOFT_SYNC_TCP_FLUSHED,
+};
 use crate::reassembly::DvcReassembler;
 use crate::{DvcError, DvcProcessor, DvcResult};
 
@@ -48,6 +51,28 @@ pub struct DrdynvcClient {
     decompressors: BTreeMap<u32, ZgfxDecompressor>,
     /// Negotiated version (0 = not yet negotiated).
     negotiated_version: u16,
+
+    // ── Multitransport / Soft-Sync routing (MS-RDPEDYC §3.1.5.3) ──
+    //
+    // Populated lazily by `notify_tunnels_ready` and the `SoftSyncRequest`
+    // handler. Empty when multitransport is not in use, which is the
+    // default while the connector still rejects `Initiate Multitransport
+    // Request` with E_ABORT (Commit D).
+
+    /// Tunnel types the caller has signalled as ready for use (e.g.
+    /// after the RDPEMT `RDP_TUNNEL_CREATERESPONSE` has been received
+    /// successfully). Indexed by `TUNNELTYPE_*` u32 value.
+    available_tunnels: BTreeSet<u32>,
+    /// Inbound routing decided at SoftSyncRequest time:
+    /// `channel_id → tunnel_type` for DVCs the **server** will write
+    /// over a multitransport tunnel. Channels not present here arrive
+    /// over the DRDYNVC SVC.
+    channel_to_tunnel: BTreeMap<u32, u32>,
+    /// Tunnel types the **client** is currently writing DVC data over,
+    /// snapshotted at SoftSyncResponse send time. A channel's outbound
+    /// route is determined by looking up its `channel_to_tunnel` entry
+    /// and confirming that tunnel type is in this set.
+    outbound_tunnels: BTreeSet<u32>,
 }
 
 impl DrdynvcClient {
@@ -59,6 +84,9 @@ impl DrdynvcClient {
             reassemblers: BTreeMap::new(),
             decompressors: BTreeMap::new(),
             negotiated_version: 0,
+            available_tunnels: BTreeSet::new(),
+            channel_to_tunnel: BTreeMap::new(),
+            outbound_tunnels: BTreeSet::new(),
         }
     }
 
@@ -71,6 +99,115 @@ impl DrdynvcClient {
     /// Get the negotiated DVC version (0 if not yet negotiated).
     pub fn negotiated_version(&self) -> u16 {
         self.negotiated_version
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Multitransport / Soft-Sync routing (MS-RDPEDYC §3.1.5.3)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Notify the DRDYNVC manager that one or more multitransport tunnels
+    /// (`TUNNELTYPE_UDPFECR` / `TUNNELTYPE_UDPFECL`) are connected and
+    /// ready for DVC routing. Must be called *before* the server sends
+    /// `DYNVC_SOFT_SYNC_REQUEST`; otherwise the request will be answered
+    /// silently (no Response → spec-compliant SVC fallback per §3.2.5.3.1).
+    ///
+    /// Idempotent: subsequent calls add to the available set.
+    pub fn notify_tunnels_ready(&mut self, tunnel_types: &[u32]) {
+        for &t in tunnel_types {
+            self.available_tunnels.insert(t);
+        }
+    }
+
+    /// Look up the multitransport tunnel that the **server** uses to
+    /// deliver inbound data for `channel_id`. `None` means the channel
+    /// is still routed over the DRDYNVC SVC.
+    pub fn inbound_tunnel_for(&self, channel_id: u32) -> Option<u32> {
+        self.channel_to_tunnel.get(&channel_id).copied()
+    }
+
+    /// Look up the multitransport tunnel that the **client** must use
+    /// to write outbound data for `channel_id`. Returns `None` for
+    /// channels not Soft-Synced or for tunnels the client opted out of
+    /// in its `SoftSyncResponse` (i.e. `outbound_tunnels` does not
+    /// contain that tunnel type).
+    pub fn outbound_tunnel_for(&self, channel_id: u32) -> Option<u32> {
+        let tunnel = *self.channel_to_tunnel.get(&channel_id)?;
+        if self.outbound_tunnels.contains(&tunnel) {
+            Some(tunnel)
+        } else {
+            None
+        }
+    }
+
+    /// Process a Soft-Sync Request (§2.2.5.1) and, if any of the
+    /// requested tunnels are available, populate the inbound routing
+    /// table and emit a Soft-Sync Response (§2.2.5.2) to be sent over
+    /// the DRDYNVC SVC. Returns `Ok(vec![])` when no tunnels match
+    /// (per §3.2.5.3.1, the absence of a Response keeps DVC traffic
+    /// on the SVC, which is exactly what JustRDP wants in that case).
+    ///
+    /// Errors:
+    /// - `DvcError::Protocol` if the same `channel_id` appears in more
+    ///   than one channel list (MS-RDPEDYC §2.2.5.1.1: MUST NOT).
+    fn handle_soft_sync_request(
+        &mut self,
+        flags: u16,
+        channel_lists: Vec<SoftSyncChannelList>,
+    ) -> DvcResult<Vec<SvcMessage>> {
+        // Defensive: even though decode validates SOFT_SYNC_TCP_FLUSHED,
+        // re-assert here so we never act on a malformed request that
+        // somehow slipped through (e.g. via a future direct constructor).
+        if flags & SOFT_SYNC_TCP_FLUSHED == 0 {
+            return Err(DvcError::Protocol(String::from(
+                "DYNVC_SOFT_SYNC_REQUEST without SOFT_SYNC_TCP_FLUSHED",
+            )));
+        }
+        let _ = SOFT_SYNC_CHANNEL_LIST_PRESENT; // silence unused import; flag is a doc anchor
+
+        // §2.2.5.1.1 MUST NOT: a channel_id may appear in at most one
+        // SoftSyncChannelList. The decoder doesn't enforce this; do it
+        // here before mutating any state.
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        for list in &channel_lists {
+            for &id in &list.dvc_ids {
+                if !seen.insert(id) {
+                    return Err(DvcError::Protocol(alloc::format!(
+                        "DYNVC_SOFT_SYNC_REQUEST: channel {} appears in multiple lists",
+                        id,
+                    )));
+                }
+            }
+        }
+
+        // Compute the intersection between what the server wants to use
+        // and what the caller has signalled as ready. Channels assigned
+        // to unsupported tunnels stay on the SVC.
+        let mut activated_tunnels: BTreeSet<u32> = BTreeSet::new();
+        for list in &channel_lists {
+            if !self.available_tunnels.contains(&list.tunnel_type) {
+                continue;
+            }
+            activated_tunnels.insert(list.tunnel_type);
+            for &id in &list.dvc_ids {
+                self.channel_to_tunnel.insert(id, list.tunnel_type);
+            }
+        }
+
+        if activated_tunnels.is_empty() {
+            // Spec-permitted no-op: not sending a Response keeps all DVC
+            // traffic on the SVC (MS-RDPEDYC §3.2.5.3.1 "If the client
+            // does not send a Soft-Sync Response PDU, then all DVC data
+            // MUST be sent over the DRDYNVC SVC").
+            return Ok(vec![]);
+        }
+
+        // Snapshot outbound routing for `outbound_tunnel_for` lookups
+        // and build the Response PDU.
+        self.outbound_tunnels = activated_tunnels.clone();
+        let tunnels_to_switch: Vec<u32> = activated_tunnels.into_iter().collect();
+        let response = pdu::encode_soft_sync_response(&tunnels_to_switch)
+            .map_err(DvcError::Encode)?;
+        Ok(vec![SvcMessage::new(response)])
     }
 
     /// Process a parsed DVC PDU and produce response SVC messages.
@@ -176,13 +313,8 @@ impl DrdynvcClient {
                     Ok(vec![])
                 }
             }
-            DvcPdu::SoftSyncRequest { .. } => {
-                // The PDU is decoded so the client doesn't drop the connection,
-                // but multitransport-aware routing isn't wired up yet — without
-                // a Soft-Sync Response, MS-RDPEDYC §3.2.5.3.1 mandates that all
-                // DVC data continues over the DRDYNVC SVC, which is exactly the
-                // current behavior. Routing migration lands with §10.3 Commit E.
-                Ok(vec![])
+            DvcPdu::SoftSyncRequest { flags, channel_lists } => {
+                self.handle_soft_sync_request(flags, channel_lists)
             }
             DvcPdu::SoftSyncResponse { .. } => {
                 // Server-bound PDU; receiving it on the client side is a
@@ -566,9 +698,10 @@ mod tests {
     }
 
     #[test]
-    fn soft_sync_request_no_op_response() {
-        // Soft-Sync routing isn't wired up yet; the client must accept the
-        // PDU and stay silent (per §3.2.5.3.1, no Response = stay on SVC).
+    fn soft_sync_request_no_op_when_no_tunnels_ready() {
+        // No tunnel marked ready → declining the Soft-Sync is the
+        // spec-permitted default (MS-RDPEDYC §3.2.5.3.1: absence of
+        // Response keeps DVC traffic on the SVC).
         let mut client = DrdynvcClient::new();
         let req = pdu::encode_soft_sync_request(
             pdu::SOFT_SYNC_TCP_FLUSHED | pdu::SOFT_SYNC_CHANNEL_LIST_PRESENT,
@@ -579,7 +712,141 @@ mod tests {
         )
         .unwrap();
         let responses = client.process(&req).expect("Soft-Sync Request must decode");
-        assert!(responses.is_empty(), "no Response is sent yet (Commit E will wire routing)");
+        assert!(responses.is_empty(), "no tunnels ready → no Response");
+        // Routing tables remain empty.
+        assert!(client.inbound_tunnel_for(3).is_none());
+        assert!(client.outbound_tunnel_for(3).is_none());
+    }
+
+    #[test]
+    fn soft_sync_request_with_ready_tunnel_emits_response() {
+        let mut client = DrdynvcClient::new();
+        client.notify_tunnels_ready(&[pdu::TUNNELTYPE_UDPFECR]);
+        let req = pdu::encode_soft_sync_request(
+            pdu::SOFT_SYNC_TCP_FLUSHED | pdu::SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &[pdu::SoftSyncChannelList {
+                tunnel_type: pdu::TUNNELTYPE_UDPFECR,
+                dvc_ids: vec![3, 7],
+            }],
+        )
+        .unwrap();
+        let responses = client.process(&req).expect("Soft-Sync Request must decode");
+        assert_eq!(responses.len(), 1, "exactly one Response emitted");
+
+        // Decode the Response to verify TunnelsToSwitch.
+        let mut src = ReadCursor::new(&responses[0].data);
+        let pdu = pdu::decode_dvc_pdu(&mut src).expect("Response decodes");
+        match pdu {
+            DvcPdu::SoftSyncResponse { tunnels_to_switch } => {
+                assert_eq!(tunnels_to_switch, vec![pdu::TUNNELTYPE_UDPFECR]);
+            }
+            other => panic!("expected SoftSyncResponse, got {other:?}"),
+        }
+
+        // Routing tables populated: both inbound (server → client) and
+        // outbound (client → server) for the listed channels.
+        assert_eq!(client.inbound_tunnel_for(3), Some(pdu::TUNNELTYPE_UDPFECR));
+        assert_eq!(client.inbound_tunnel_for(7), Some(pdu::TUNNELTYPE_UDPFECR));
+        assert_eq!(client.outbound_tunnel_for(3), Some(pdu::TUNNELTYPE_UDPFECR));
+        assert_eq!(client.outbound_tunnel_for(7), Some(pdu::TUNNELTYPE_UDPFECR));
+        // Unrelated channel stays on the SVC.
+        assert!(client.inbound_tunnel_for(99).is_none());
+        assert!(client.outbound_tunnel_for(99).is_none());
+    }
+
+    #[test]
+    fn soft_sync_request_partial_tunnel_availability() {
+        // Server requests both UDPFECR and UDPFECL, but only UDPFECR
+        // is ready. UDPFECL channels stay on the SVC; UDPFECR channels
+        // get routed; Response advertises only UDPFECR.
+        let mut client = DrdynvcClient::new();
+        client.notify_tunnels_ready(&[pdu::TUNNELTYPE_UDPFECR]);
+        let req = pdu::encode_soft_sync_request(
+            pdu::SOFT_SYNC_TCP_FLUSHED | pdu::SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &[
+                pdu::SoftSyncChannelList {
+                    tunnel_type: pdu::TUNNELTYPE_UDPFECR,
+                    dvc_ids: vec![3],
+                },
+                pdu::SoftSyncChannelList {
+                    tunnel_type: pdu::TUNNELTYPE_UDPFECL,
+                    dvc_ids: vec![7],
+                },
+            ],
+        )
+        .unwrap();
+        let responses = client.process(&req).expect("Soft-Sync Request must decode");
+        assert_eq!(responses.len(), 1);
+
+        let mut src = ReadCursor::new(&responses[0].data);
+        match pdu::decode_dvc_pdu(&mut src).unwrap() {
+            DvcPdu::SoftSyncResponse { tunnels_to_switch } => {
+                assert_eq!(tunnels_to_switch, vec![pdu::TUNNELTYPE_UDPFECR]);
+            }
+            other => panic!("expected SoftSyncResponse, got {other:?}"),
+        }
+
+        assert_eq!(client.inbound_tunnel_for(3), Some(pdu::TUNNELTYPE_UDPFECR));
+        // Channel 7 was assigned to UDPFECL (not ready) → unrouted.
+        assert!(client.inbound_tunnel_for(7).is_none());
+    }
+
+    #[test]
+    fn soft_sync_request_duplicate_channel_id_rejected() {
+        // Same channel_id appears under two different tunnel types —
+        // MS-RDPEDYC §2.2.5.1.1 MUST NOT.
+        let mut client = DrdynvcClient::new();
+        client.notify_tunnels_ready(&[pdu::TUNNELTYPE_UDPFECR, pdu::TUNNELTYPE_UDPFECL]);
+        let req = pdu::encode_soft_sync_request(
+            pdu::SOFT_SYNC_TCP_FLUSHED | pdu::SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &[
+                pdu::SoftSyncChannelList {
+                    tunnel_type: pdu::TUNNELTYPE_UDPFECR,
+                    dvc_ids: vec![3],
+                },
+                pdu::SoftSyncChannelList {
+                    tunnel_type: pdu::TUNNELTYPE_UDPFECL,
+                    dvc_ids: vec![3],
+                },
+            ],
+        )
+        .unwrap();
+        let err = client.process(&req).expect_err("must reject duplicate channel");
+        match err {
+            justrdp_svc::SvcError::Protocol(_) => {}
+            other => panic!("expected SvcError::Protocol, got {other:?}"),
+        }
+        // No partial state left behind.
+        assert!(client.inbound_tunnel_for(3).is_none());
+    }
+
+    #[test]
+    fn outbound_tunnel_for_returns_none_when_tunnel_not_in_response() {
+        // Edge: channel was inbound-routed via SoftSyncRequest, but the
+        // Response excluded its tunnel (e.g. tunnel disappeared). Future
+        // re-routing isn't covered, but `outbound_tunnel_for` must respect
+        // `outbound_tunnels` and not blindly mirror `channel_to_tunnel`.
+        let mut client = DrdynvcClient::new();
+        client.notify_tunnels_ready(&[pdu::TUNNELTYPE_UDPFECR]);
+        let req = pdu::encode_soft_sync_request(
+            pdu::SOFT_SYNC_TCP_FLUSHED | pdu::SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &[pdu::SoftSyncChannelList {
+                tunnel_type: pdu::TUNNELTYPE_UDPFECR,
+                dvc_ids: vec![3],
+            }],
+        )
+        .unwrap();
+        client.process(&req).unwrap();
+        // Sanity: outbound currently allowed.
+        assert_eq!(client.outbound_tunnel_for(3), Some(pdu::TUNNELTYPE_UDPFECR));
+        // Simulate "client decided to stop writing on UDPFECR" by clearing
+        // the outbound set directly. (No public API to mutate this — it
+        // only changes when a new SoftSyncResponse is constructed. Use
+        // an internal mutation here to stress the lookup logic.)
+        client.outbound_tunnels.clear();
+        assert!(client.outbound_tunnel_for(3).is_none());
+        // Inbound stays — server still uses the tunnel for that channel.
+        assert_eq!(client.inbound_tunnel_for(3), Some(pdu::TUNNELTYPE_UDPFECR));
     }
 
     #[test]

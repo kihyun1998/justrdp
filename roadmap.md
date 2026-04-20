@@ -2233,8 +2233,12 @@ credential blob verified against the user's X.509 cert.
 - [x] `TunnelCreateResponse` PDU (HRESULT) (§2.2.2.2)
 - [x] `TunnelData` PDU (HigherLayerData) (§2.2.2.3)
 - [x] `DYNVC_SOFT_SYNC_REQUEST` / `_RESPONSE` PDU encode/decode (MS-RDPEDYC §2.2.5)
-- [ ] DVC를 UDP 트랜스포트로 라우팅
-- [ ] 트랜스포트 간 DVC Soft-Sync 마이그레이션 (라우팅 활성화)
+- [x] DRDYNVC manager Soft-Sync 라우팅 테이블 (`channel_to_tunnel`, `available_tunnels`, `outbound_tunnels`)
+  - `notify_tunnels_ready()` API — caller가 UDP 셋업 완료 시점을 신호
+  - `inbound_tunnel_for(channel_id)` / `outbound_tunnel_for(channel_id)` 조회 API
+  - `SoftSyncRequest` arm — 중복 channel_id MUST NOT 검증, 가용 터널 교집합 계산, 조건부 Response 송신
+- [ ] Inbound 터널 데이터 주입 (`process_tunnel_data`) + outbound 라우팅 자동화 (`send_on_channel` API 확장)
+- [ ] End-to-end fake-tunnel integration test
 
 ---
 
