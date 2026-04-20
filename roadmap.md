@@ -2222,6 +2222,10 @@ credential blob verified against the user's X.509 cert.
 - [ ] `InitiateMultitransportRequest` 수신 (메인 TCP 연결 통해)
 - [ ] UDP 연결 수립
 - [ ] TLS/DTLS 핸드셰이크 (UDP 위)
+  - [x] DTLS 1.0/1.2 client handshake state machine (HVR cookie, ServerHello, Cert/SPKI capture, CKE/CCS/Finished, server CCS+Finished verify)
+  - [x] `DtlsSession` wrapper — auto-driven flight + post-handshake app-data encrypt/decrypt with replay rejection (MS-RDPEMT §5.1 SPKI pinning helper)
+  - [x] End-to-end loopback test against in-test minimal DTLS server (RSA-512 key, full HVR-cookie path)
+  - [ ] TLS over reliable-UDP variant (UDPFECR transport)
 - [x] `RDP_TUNNEL_HEADER` / `RDP_TUNNEL_SUBHEADER` PDU (§2.2.1)
 - [x] `TunnelCreateRequest` PDU (requestId + securityCookie) (§2.2.2.1)
 - [x] `TunnelCreateResponse` PDU (HRESULT) (§2.2.2.2)

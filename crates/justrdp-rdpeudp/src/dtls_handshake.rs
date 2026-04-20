@@ -290,10 +290,16 @@ impl DtlsClientHandshake {
         }
         let body = &record.fragment[body_start..body_end];
 
-        // Add the full handshake message to the transcript
-        // (header + body, for unfragmented messages).
-        self.transcript_bytes
-            .extend_from_slice(&record.fragment[..body_end]);
+        // Add the full handshake message to the transcript (header +
+        // body, for unfragmented messages) — but NOT for HT_FINISHED.
+        // RFC 5246 §7.4.9: verify_data is computed over the transcript
+        // *up to but not including* the message being verified, so the
+        // server's Finished must not be in the transcript when its
+        // expected verify_data is computed in `handle_server_finished`.
+        if hdr.msg_type != HT_FINISHED {
+            self.transcript_bytes
+                .extend_from_slice(&record.fragment[..body_end]);
+        }
 
         match hdr.msg_type {
             HT_HELLO_VERIFY_REQUEST => self.handle_hello_verify_request(body),
