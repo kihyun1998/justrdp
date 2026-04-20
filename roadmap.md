@@ -2222,8 +2222,10 @@ credential blob verified against the user's X.509 cert.
 - [ ] `InitiateMultitransportRequest` 수신 (메인 TCP 연결 통해)
 - [ ] UDP 연결 수립
 - [ ] TLS/DTLS 핸드셰이크 (UDP 위)
-- [ ] `TunnelCreateRequest` PDU (requestId + securityCookie)
-- [ ] `TunnelCreateResponse` PDU
+- [x] `RDP_TUNNEL_HEADER` / `RDP_TUNNEL_SUBHEADER` PDU (§2.2.1)
+- [x] `TunnelCreateRequest` PDU (requestId + securityCookie) (§2.2.2.1)
+- [x] `TunnelCreateResponse` PDU (HRESULT) (§2.2.2.2)
+- [x] `TunnelData` PDU (HigherLayerData) (§2.2.2.3)
 - [ ] DVC를 UDP 트랜스포트로 라우팅
 - [ ] 트랜스포트 간 DVC Soft-Sync 마이그레이션 (DYNVC_SOFT_SYNC_REQUEST/RESPONSE)
 

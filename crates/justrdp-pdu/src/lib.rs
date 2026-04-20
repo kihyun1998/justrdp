@@ -19,5 +19,7 @@ pub mod mcs;
 pub mod ntlm;
 pub mod pcb;
 pub mod rdp;
+#[cfg(feature = "alloc")]
+pub mod rdpemt;
 pub mod tpkt;
 pub mod x224;
