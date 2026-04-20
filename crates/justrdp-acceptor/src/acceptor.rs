@@ -6,7 +6,10 @@ use alloc::vec::Vec;
 
 use justrdp_core::{Decode, Encode, PduHint, ReadCursor, WriteBuf, WriteCursor};
 
-use justrdp_pdu::mcs::{ConnectInitial, ConnectResponse, ConnectResponseResult, DomainParameters};
+use justrdp_pdu::mcs::{
+    AttachUserConfirm, AttachUserRequest, ChannelJoinConfirm, ChannelJoinRequest, ConnectInitial,
+    ConnectResponse, ConnectResponseResult, DomainParameters, ErectDomainRequest,
+};
 use justrdp_pdu::tpkt::{TpktHeader, TpktHint, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{
     ConnectionConfirm, ConnectionRequest, ConnectionRequestData, DataTransfer, NegotiationFailure,
@@ -60,6 +63,42 @@ pub struct ServerAcceptor {
     /// ConnectResponse). Computed in `WaitMcsConnectInitial`, drained in
     /// `SendMcsConnectResponse`.
     pending_connect_response: Option<Vec<u8>>,
+
+    // ── Phase 5: Channel Connection state ──
+    /// Sub-phase within `ChannelConnection`. Tracks the
+    /// Erect Domain → Attach User → Channel Join handshake without
+    /// adding a separate `ServerAcceptorState` variant per step.
+    channel_phase: ChannelPhase,
+    /// MCS user channel ID assigned to the client. Filled when the
+    /// AttachUserRequest is received; sent back in AttachUserConfirm.
+    user_channel_id: u16,
+    /// Channels the client must join (in order):
+    ///   user channel, I/O channel, optional message channel, then
+    ///   each static virtual channel.
+    channels_to_join: Vec<u16>,
+    /// Index into `channels_to_join` for the next ChannelJoinConfirm.
+    channel_join_index: usize,
+    /// Channel ID captured from the most recent ChannelJoinRequest;
+    /// echoed back in the corresponding ChannelJoinConfirm.
+    pending_join_requested: Option<u16>,
+}
+
+/// Sub-phase within the `ChannelConnection` state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelPhase {
+    /// Waiting for the client's MCS Erect Domain Request (no response).
+    WaitErectDomainRequest,
+    /// Waiting for the client's MCS Attach User Request.
+    WaitAttachUserRequest,
+    /// Pending MCS Attach User Confirm to send back.
+    SendAttachUserConfirm,
+    /// Waiting for the next MCS Channel Join Request.
+    WaitChannelJoinRequest,
+    /// Pending MCS Channel Join Confirm to send back.
+    SendChannelJoinConfirm,
+    /// All channels joined; the next `step()` transitions out of
+    /// `ChannelConnection` into the next phase.
+    Done,
 }
 
 impl ServerAcceptor {
@@ -76,7 +115,18 @@ impl ServerAcceptor {
             client_gcc: None,
             channel_alloc: None,
             pending_connect_response: None,
+            channel_phase: ChannelPhase::WaitErectDomainRequest,
+            user_channel_id: 0,
+            channels_to_join: Vec::new(),
+            channel_join_index: 0,
+            pending_join_requested: None,
         }
+    }
+
+    /// MCS user channel ID assigned to the joined user. Available once
+    /// the acceptor has processed the AttachUserRequest.
+    pub fn user_channel_id(&self) -> u16 {
+        self.user_channel_id
     }
 
     /// Captured client GCC data from the MCS Connect Initial. Available
@@ -544,7 +594,187 @@ impl ServerAcceptor {
         output.resize(bytes.len());
         output.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
         self.state = ServerAcceptorState::ChannelConnection;
+        self.channel_phase = ChannelPhase::WaitErectDomainRequest;
         Ok(Written::new(bytes.len()))
+    }
+
+    // ── Phase 5: Channel Connection ────────────────────────────────────
+
+    /// Encode an MCS PER PDU wrapped in TPKT + X.224 DT and write it
+    /// into `output`.
+    fn write_slow_path(
+        &self,
+        pdu: &dyn Encode,
+        output: &mut WriteBuf,
+    ) -> AcceptorResult<usize> {
+        let inner = DATA_TRANSFER_HEADER_SIZE + pdu.size();
+        let total = TPKT_HEADER_SIZE + inner;
+        output.resize(total);
+        let mut cursor = WriteCursor::new(output.as_mut_slice());
+        TpktHeader::try_for_payload(inner)?.encode(&mut cursor)?;
+        DataTransfer.encode(&mut cursor)?;
+        pdu.encode(&mut cursor)?;
+        Ok(total)
+    }
+
+    /// Decode a TPKT + X.224 DT envelope and return a cursor positioned
+    /// at the start of the inner PER-encoded MCS PDU.
+    fn decode_slow_path<'a>(input: &'a [u8]) -> AcceptorResult<ReadCursor<'a>> {
+        let mut cursor = ReadCursor::new(input);
+        let _tpkt = TpktHeader::decode(&mut cursor)?;
+        let _dt = DataTransfer::decode(&mut cursor)?;
+        Ok(cursor)
+    }
+
+    /// Compute the user channel ID to assign in `AttachUserConfirm`.
+    ///
+    /// Convention (matches Windows / FreeRDP servers):
+    /// - I/O channel:  `0x03EB` (1003)
+    /// - Static VCs:   `0x03EC..` (one per `ClientNetworkData.channels`)
+    /// - Message ch.:  next free if `support_message_channel`
+    /// - User ch.:     next free, with a floor of `0x03EF` (1007) so
+    ///                 even pure-no-static-channel sessions get a user
+    ///                 ID in the conventional range.
+    fn next_user_channel_id(alloc: &ChannelAllocation) -> u16 {
+        let mut next = alloc.io_channel_id + 1 + alloc.static_channels.len() as u16;
+        if alloc.message_channel_id.is_some() {
+            next += 1;
+        }
+        next.max(0x03EF)
+    }
+
+    fn step_channel_connection(
+        &mut self,
+        input: &[u8],
+        output: &mut WriteBuf,
+    ) -> AcceptorResult<Written> {
+        match self.channel_phase {
+            ChannelPhase::WaitErectDomainRequest => self.step_wait_erect_domain(input),
+            ChannelPhase::WaitAttachUserRequest => self.step_wait_attach_user_request(input),
+            ChannelPhase::SendAttachUserConfirm => self.step_send_attach_user_confirm(output),
+            ChannelPhase::WaitChannelJoinRequest => self.step_wait_channel_join_request(input),
+            ChannelPhase::SendChannelJoinConfirm => self.step_send_channel_join_confirm(output),
+            ChannelPhase::Done => {
+                // All channels joined -- transition into the next phase
+                // (Standard RDP Security key exchange would land here in
+                // the legacy path; otherwise we go straight to the
+                // Secure Settings Exchange in a later commit). For now
+                // park in `WaitClientInfo` so future commits can pick
+                // up the thread.
+                self.state = ServerAcceptorState::WaitClientInfo;
+                Ok(Written::nothing())
+            }
+        }
+    }
+
+    fn step_wait_erect_domain(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let mut cursor = Self::decode_slow_path(input)?;
+        let _erect = ErectDomainRequest::decode(&mut cursor)?;
+        // Erect Domain has no response. Move straight to AttachUser.
+        self.channel_phase = ChannelPhase::WaitAttachUserRequest;
+        Ok(Written::nothing())
+    }
+
+    fn step_wait_attach_user_request(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let mut cursor = Self::decode_slow_path(input)?;
+        let _aur = AttachUserRequest::decode(&mut cursor)?;
+
+        let alloc = self
+            .channel_alloc
+            .as_ref()
+            .ok_or_else(|| AcceptorError::general("AttachUserRequest before MCS Connect"))?;
+        self.user_channel_id = Self::next_user_channel_id(alloc);
+
+        // Build the channel-join list in the order the client will join:
+        //   user channel, I/O channel, [message channel], then each
+        //   static virtual channel in original order. The client always
+        //   joins the user channel first to validate the assignment,
+        //   then the I/O channel, then everything else.
+        self.channels_to_join.clear();
+        self.channels_to_join.push(self.user_channel_id);
+        self.channels_to_join.push(alloc.io_channel_id);
+        if let Some(msg) = alloc.message_channel_id {
+            self.channels_to_join.push(msg);
+        }
+        for (_, id) in alloc.static_channels.iter() {
+            self.channels_to_join.push(*id);
+        }
+        self.channel_join_index = 0;
+
+        self.channel_phase = ChannelPhase::SendAttachUserConfirm;
+        Ok(Written::nothing())
+    }
+
+    fn step_send_attach_user_confirm(&mut self, output: &mut WriteBuf) -> AcceptorResult<Written> {
+        let confirm = AttachUserConfirm {
+            result: 0, // rt-successful
+            initiator: Some(self.user_channel_id),
+        };
+        let written = self.write_slow_path(&confirm, output)?;
+        self.channel_phase = ChannelPhase::WaitChannelJoinRequest;
+        Ok(Written::new(written))
+    }
+
+    fn step_wait_channel_join_request(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let mut cursor = Self::decode_slow_path(input)?;
+        let req = ChannelJoinRequest::decode(&mut cursor)?;
+
+        // MS-RDPBCGR §1.3.1.1.5 does not mandate a specific ordering for
+        // client-side Channel Join Requests, but real clients (mstsc,
+        // FreeRDP) always follow the order that the server returned in
+        // `ServerNetworkData` (user channel first, then I/O, then
+        // message, then statics). Enforcing strict order here gives us
+        // three things in one check:
+        //   1. Rejection of random unallocated channel IDs.
+        //   2. Rejection of duplicate joins (same ID sent twice would
+        //      pass a plain `contains()` check but would skip an
+        //      unjoined channel).
+        //   3. Bounds safety against post-Done join requests.
+        let expected = *self.channels_to_join.get(self.channel_join_index).ok_or_else(|| {
+            AcceptorError::general("ChannelJoinRequest received after all channels joined")
+        })?;
+        if req.channel_id != expected {
+            return Err(AcceptorError::general(
+                "ChannelJoinRequest channel_id does not match the next expected channel ID \
+                 (out-of-order, unallocated, or duplicate)",
+            ));
+        }
+        // Reject initiator ID that doesn't match the user channel we
+        // just assigned (anti-spoofing: any other client on this MCS
+        // connection should never appear during the join loop).
+        if req.initiator != self.user_channel_id {
+            return Err(AcceptorError::general(
+                "ChannelJoinRequest initiator does not match assigned user channel ID",
+            ));
+        }
+
+        // Stash the requested ID; the send step echoes it.
+        self.pending_join_requested = Some(req.channel_id);
+        self.channel_phase = ChannelPhase::SendChannelJoinConfirm;
+        Ok(Written::nothing())
+    }
+
+    fn step_send_channel_join_confirm(
+        &mut self,
+        output: &mut WriteBuf,
+    ) -> AcceptorResult<Written> {
+        let requested = self.pending_join_requested.take().ok_or_else(|| {
+            AcceptorError::general("no pending Channel Join Request")
+        })?;
+        let confirm = ChannelJoinConfirm {
+            result: 0, // rt-successful
+            initiator: self.user_channel_id,
+            requested,
+            channel_id: Some(requested),
+        };
+        let written = self.write_slow_path(&confirm, output)?;
+        self.channel_join_index += 1;
+        if self.channel_join_index >= self.channels_to_join.len() {
+            self.channel_phase = ChannelPhase::Done;
+        } else {
+            self.channel_phase = ChannelPhase::WaitChannelJoinRequest;
+        }
+        Ok(Written::new(written))
     }
 
     // ── Phase 3: CredSSP Accept (external) ──────────────────────────────
@@ -649,7 +879,14 @@ impl Sequence for ServerAcceptor {
             ServerAcceptorState::CredsspAccept => None,
             ServerAcceptorState::WaitMcsConnectInitial => Some(&TPKT_HINT),
             ServerAcceptorState::SendMcsConnectResponse => None,
-            ServerAcceptorState::ChannelConnection => Some(&TPKT_HINT),
+            ServerAcceptorState::ChannelConnection => match self.channel_phase {
+                ChannelPhase::WaitErectDomainRequest
+                | ChannelPhase::WaitAttachUserRequest
+                | ChannelPhase::WaitChannelJoinRequest => Some(&TPKT_HINT),
+                ChannelPhase::SendAttachUserConfirm
+                | ChannelPhase::SendChannelJoinConfirm
+                | ChannelPhase::Done => None,
+            },
             ServerAcceptorState::WaitClientInfo => Some(&TPKT_HINT),
             ServerAcceptorState::SendLicense => None,
             ServerAcceptorState::SendDemandActive => None,
@@ -673,9 +910,11 @@ impl Sequence for ServerAcceptor {
             ServerAcceptorState::SendMcsConnectResponse => {
                 self.step_send_mcs_connect_response(output)
             }
+            ServerAcceptorState::ChannelConnection => {
+                self.step_channel_connection(input, output)
+            }
             // Later commits will fill these in.
-            ServerAcceptorState::ChannelConnection
-            | ServerAcceptorState::WaitClientInfo
+            ServerAcceptorState::WaitClientInfo
             | ServerAcceptorState::SendLicense
             | ServerAcceptorState::SendDemandActive
             | ServerAcceptorState::WaitConfirmActive
@@ -1460,6 +1699,261 @@ mod tests {
         let mut out = WriteBuf::new();
         let err = acc.step(&ci_bytes, &mut out).unwrap_err();
         assert!(alloc::format!("{err}").contains("CS_CORE"));
+    }
+
+    /// Helper: encode an MCS PER PDU wrapped in TPKT + X.224 DT.
+    fn build_slow_path<P: justrdp_core::Encode>(pdu: &P) -> alloc::vec::Vec<u8> {
+        use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
+        use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
+        let inner = DATA_TRANSFER_HEADER_SIZE + pdu.size();
+        let total = TPKT_HEADER_SIZE + inner;
+        let mut buf = alloc::vec![0u8; total];
+        let mut cursor = justrdp_core::WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(inner)
+            .unwrap()
+            .encode(&mut cursor)
+            .unwrap();
+        DataTransfer.encode(&mut cursor).unwrap();
+        pdu.encode(&mut cursor).unwrap();
+        buf
+    }
+
+    /// Drive an acceptor through Phase 1-4 and into ChannelConnection
+    /// (WaitErectDomainRequest sub-phase) with the given list of static
+    /// channel names.
+    fn drive_to_channel_connection(channels: &[&str]) -> ServerAcceptor {
+        let mut acc = drive_to_wait_mcs();
+        let client_blocks = build_client_gcc_blocks(channels);
+        let ci_bytes = build_mcs_connect_initial_bytes(&client_blocks);
+        let mut out = WriteBuf::new();
+        acc.step(&ci_bytes, &mut out).unwrap(); // -> SendMcsConnectResponse
+        acc.step(&[], &mut out).unwrap(); // -> ChannelConnection
+        assert_eq!(acc.state(), &ServerAcceptorState::ChannelConnection);
+        acc
+    }
+
+    #[test]
+    fn channel_connection_full_handshake_no_static_channels() {
+        let mut acc = drive_to_channel_connection(&[]);
+        let mut out = WriteBuf::new();
+
+        // 1) Client sends Erect Domain Request (no response).
+        let edr = ErectDomainRequest {
+            sub_height: 0,
+            sub_interval: 0,
+        };
+        let edr_bytes = build_slow_path(&edr);
+        acc.step(&edr_bytes, &mut out).unwrap();
+        assert!(out.is_empty());
+
+        // 2) Client sends Attach User Request -> server responds with
+        //    Attach User Confirm.
+        let aur_bytes = build_slow_path(&AttachUserRequest);
+        acc.step(&aur_bytes, &mut out).unwrap();
+        let written = acc.step(&[], &mut out).unwrap();
+        assert!(written.size > 0);
+        // Decode the AttachUserConfirm we emitted.
+        let mut c = ReadCursor::new(&out.as_slice()[..written.size]);
+        let _ = TpktHeader::decode(&mut c).unwrap();
+        let _ = DataTransfer::decode(&mut c).unwrap();
+        let confirm = AttachUserConfirm::decode(&mut c).unwrap();
+        assert_eq!(confirm.result, 0);
+        let user_id = confirm.initiator.unwrap();
+        assert_eq!(user_id, acc.user_channel_id());
+        // No static channels + no message channel -> only [user, io] to join.
+        assert_eq!(acc.channels_to_join.len(), 2);
+
+        // 3) Channel join loop: user channel first.
+        for &chid in &[user_id, crate::mcs::IO_CHANNEL_ID] {
+            let req = ChannelJoinRequest {
+                initiator: user_id,
+                channel_id: chid,
+            };
+            let req_bytes = build_slow_path(&req);
+            acc.step(&req_bytes, &mut out).unwrap();
+            let written = acc.step(&[], &mut out).unwrap();
+            let mut c = ReadCursor::new(&out.as_slice()[..written.size]);
+            let _ = TpktHeader::decode(&mut c).unwrap();
+            let _ = DataTransfer::decode(&mut c).unwrap();
+            let confirm = ChannelJoinConfirm::decode(&mut c).unwrap();
+            assert_eq!(confirm.result, 0);
+            assert_eq!(confirm.initiator, user_id);
+            assert_eq!(confirm.requested, chid);
+            assert_eq!(confirm.channel_id, Some(chid));
+        }
+
+        // 4) After all joins, the next step transitions out of
+        //    ChannelConnection.
+        acc.step(&[], &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitClientInfo);
+    }
+
+    #[test]
+    fn channel_connection_with_static_channels_and_message_channel() {
+        // Client requests message channel + 2 static VCs.
+        use justrdp_pdu::gcc::client::{
+            ClientCoreData, ClientMessageChannelData, ClientNetworkData, ClientSecurityData,
+            ChannelDef,
+        };
+        let core = ClientCoreData::new(1024, 768);
+        let security = ClientSecurityData::new();
+        let net = ClientNetworkData {
+            channels: alloc::vec![ChannelDef::new("rdpdr", 0), ChannelDef::new("snd", 0)],
+        };
+        let msg = ClientMessageChannelData { flags: 0 };
+        let mut buf = alloc::vec![0u8; core.size() + security.size() + net.size() + msg.size()];
+        {
+            let mut c = justrdp_core::WriteCursor::new(&mut buf);
+            core.encode(&mut c).unwrap();
+            security.encode(&mut c).unwrap();
+            net.encode(&mut c).unwrap();
+            msg.encode(&mut c).unwrap();
+        }
+        let ci_bytes = build_mcs_connect_initial_bytes(&buf);
+        let cfg = AcceptorConfig::builder()
+            .support_message_channel(true)
+            .build();
+        let mut acc = ServerAcceptor::new(cfg);
+        let nego = NegotiationRequest::new(SecurityProtocol::HYBRID);
+        let cr = ConnectionRequest::new(Some(nego));
+        let cr_bytes = build_cr_bytes(&cr);
+        let mut out = WriteBuf::new();
+        acc.step(&cr_bytes, &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap(); // CC
+        acc.step(&[], &mut out).unwrap(); // TLS
+        acc.step(&[], &mut out).unwrap(); // CredSSP
+        acc.step(&ci_bytes, &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap(); // -> ChannelConnection
+
+        // Phase 5
+        acc.step(&build_slow_path(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }), &mut out).unwrap();
+        acc.step(&build_slow_path(&AttachUserRequest), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap(); // AttachUserConfirm
+        let user_id = acc.user_channel_id();
+
+        // user, io, message, static1, static2 = 5 channels
+        assert_eq!(acc.channels_to_join.len(), 5);
+
+        // Join all 5 channels in sequence.
+        let to_join = acc.channels_to_join.clone();
+        for chid in to_join {
+            let req = ChannelJoinRequest {
+                initiator: user_id,
+                channel_id: chid,
+            };
+            acc.step(&build_slow_path(&req), &mut out).unwrap();
+            acc.step(&[], &mut out).unwrap();
+        }
+        // Done -> next step transitions to WaitClientInfo.
+        acc.step(&[], &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitClientInfo);
+    }
+
+    #[test]
+    fn channel_join_rejects_unallocated_channel_id() {
+        let mut acc = drive_to_channel_connection(&[]);
+        let mut out = WriteBuf::new();
+        acc.step(&build_slow_path(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }), &mut out).unwrap();
+        acc.step(&build_slow_path(&AttachUserRequest), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        let user_id = acc.user_channel_id();
+        // Bogus channel ID that wasn't allocated.
+        let req = ChannelJoinRequest {
+            initiator: user_id,
+            channel_id: 0xBEEF,
+        };
+        let err = acc.step(&build_slow_path(&req), &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("unallocated"));
+    }
+
+    #[test]
+    fn channel_join_rejects_wrong_initiator() {
+        let mut acc = drive_to_channel_connection(&[]);
+        let mut out = WriteBuf::new();
+        acc.step(&build_slow_path(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }), &mut out).unwrap();
+        acc.step(&build_slow_path(&AttachUserRequest), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        let user_id = acc.user_channel_id();
+        // Spoofed initiator (not the allocated user channel).
+        let req = ChannelJoinRequest {
+            initiator: user_id.wrapping_add(7),
+            channel_id: user_id,
+        };
+        let err = acc.step(&build_slow_path(&req), &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("initiator"));
+    }
+
+    #[test]
+    fn channel_join_rejects_duplicate_join() {
+        // Regression: previously a client could send Join(user_id) twice;
+        // both would pass `contains()` and `channel_join_index` would
+        // advance past the I/O channel without ever joining it.
+        let mut acc = drive_to_channel_connection(&[]);
+        let mut out = WriteBuf::new();
+        acc.step(
+            &build_slow_path(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }),
+            &mut out,
+        )
+        .unwrap();
+        acc.step(&build_slow_path(&AttachUserRequest), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        let user_id = acc.user_channel_id();
+
+        // First join is fine.
+        let req = ChannelJoinRequest {
+            initiator: user_id,
+            channel_id: user_id,
+        };
+        acc.step(&build_slow_path(&req), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+
+        // Second join of the SAME channel is rejected as out-of-order
+        // (the next expected channel is the I/O channel, not user_id).
+        let dup = ChannelJoinRequest {
+            initiator: user_id,
+            channel_id: user_id,
+        };
+        let err = acc.step(&build_slow_path(&dup), &mut out).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(
+            msg.contains("out-of-order") || msg.contains("duplicate"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn channel_join_rejects_out_of_order() {
+        // channels_to_join is [user, io]. Sending join(io) first
+        // (skipping the user channel) must be rejected.
+        let mut acc = drive_to_channel_connection(&[]);
+        let mut out = WriteBuf::new();
+        acc.step(
+            &build_slow_path(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }),
+            &mut out,
+        )
+        .unwrap();
+        acc.step(&build_slow_path(&AttachUserRequest), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        let user_id = acc.user_channel_id();
+
+        let req = ChannelJoinRequest {
+            initiator: user_id,
+            channel_id: crate::mcs::IO_CHANNEL_ID,
+        };
+        let err = acc.step(&build_slow_path(&req), &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("out-of-order"));
+    }
+
+    #[test]
+    fn user_channel_id_starts_at_or_above_0x03ef() {
+        let mut acc = drive_to_channel_connection(&[]);
+        let mut out = WriteBuf::new();
+        acc.step(&build_slow_path(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }), &mut out).unwrap();
+        acc.step(&build_slow_path(&AttachUserRequest), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        // Even with no static channels and no message channel, the user
+        // channel ID must be >= 0x03EF (1007) per Windows convention.
+        assert!(acc.user_channel_id() >= 0x03EF);
     }
 
     #[test]
