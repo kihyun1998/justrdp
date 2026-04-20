@@ -9,7 +9,10 @@ use justrdp_core::{Decode, Encode, PduHint, ReadCursor, WriteBuf, WriteCursor};
 use justrdp_pdu::mcs::{
     AttachUserConfirm, AttachUserRequest, ChannelJoinConfirm, ChannelJoinRequest, ConnectInitial,
     ConnectResponse, ConnectResponseResult, DomainParameters, ErectDomainRequest,
+    SendDataIndication, SendDataRequest,
 };
+use justrdp_pdu::rdp::client_info::ClientInfoPdu;
+use justrdp_pdu::rdp::licensing::LicenseErrorMessage;
 use justrdp_pdu::tpkt::{TpktHeader, TpktHint, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{
     ConnectionConfirm, ConnectionRequest, ConnectionRequestData, DataTransfer, NegotiationFailure,
@@ -81,7 +84,22 @@ pub struct ServerAcceptor {
     /// Channel ID captured from the most recent ChannelJoinRequest;
     /// echoed back in the corresponding ChannelJoinConfirm.
     pending_join_requested: Option<u16>,
+
+    // ── Phase 7: Client Info ──
+    /// Decoded `ClientInfoPdu` captured from the secure-settings
+    /// exchange. Available once the acceptor has advanced past
+    /// `WaitClientInfo`.
+    client_info: Option<ClientInfoPdu>,
 }
+
+// ── TS_SECURITY_HEADER constants (MS-RDPBCGR §2.2.8.1.1.2.1) ──
+
+/// Security header flag: payload is a Client Info PDU.
+const SEC_INFO_PKT: u16 = 0x0040;
+/// Security header flag: payload is a Licensing PDU.
+const SEC_LICENSE_PKT: u16 = 0x0080;
+/// Basic security header size for TLS/NLA: flags(2) + flagsHi(2).
+const BASIC_SECURITY_HEADER_SIZE: usize = 4;
 
 /// Sub-phase within the `ChannelConnection` state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +138,17 @@ impl ServerAcceptor {
             channels_to_join: Vec::new(),
             channel_join_index: 0,
             pending_join_requested: None,
+            client_info: None,
         }
+    }
+
+    /// Decoded `ClientInfoPdu` captured during the secure-settings
+    /// exchange. Available once the acceptor has advanced past
+    /// `WaitClientInfo`. The `Drop` impl on `ClientInfoPdu` zeroes the
+    /// password field on drop, so the secret only lives as long as the
+    /// `ServerAcceptor` itself.
+    pub fn client_info(&self) -> Option<&ClientInfoPdu> {
+        self.client_info.as_ref()
     }
 
     /// MCS user channel ID assigned to the joined user. Available once
@@ -795,6 +823,97 @@ impl ServerAcceptor {
         Ok(Written::nothing())
     }
 
+    // ── Phase 7: Wait for Client Info PDU ──────────────────────────────
+
+    fn step_wait_client_info(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let mut cursor = ReadCursor::new(input);
+        let _tpkt = TpktHeader::decode(&mut cursor)?;
+        let _dt = DataTransfer::decode(&mut cursor)?;
+        let sdr = SendDataRequest::decode(&mut cursor)?;
+
+        // Validate the addressing.
+        let alloc = self
+            .channel_alloc
+            .as_ref()
+            .ok_or_else(|| AcceptorError::general("ClientInfoPdu before MCS Connect"))?;
+        if sdr.channel_id != alloc.io_channel_id {
+            return Err(AcceptorError::general(
+                "ClientInfoPdu must be sent on the I/O channel",
+            ));
+        }
+        if sdr.initiator != self.user_channel_id {
+            return Err(AcceptorError::general(
+                "ClientInfoPdu initiator does not match the assigned user channel",
+            ));
+        }
+
+        // TLS / NLA path: 4-byte basic security header. The flags MUST
+        // include `SEC_INFO_PKT (0x40)` per MS-RDPBCGR §2.2.1.11.
+        // Standard RDP Security adds an extra MAC and the body would be
+        // RC4-encrypted; that path is intentionally unsupported in this
+        // commit (the connector already documents this same boundary).
+        let mut sec = ReadCursor::new(sdr.user_data);
+        if sec.remaining() < BASIC_SECURITY_HEADER_SIZE {
+            return Err(AcceptorError::general(
+                "ClientInfoPdu user_data shorter than basic security header",
+            ));
+        }
+        let flags = sec.read_u16_le("ClientInfo::secFlags")?;
+        let _flags_hi = sec.read_u16_le("ClientInfo::secFlagsHi")?;
+        if flags & SEC_INFO_PKT == 0 {
+            return Err(AcceptorError::general(
+                "expected SEC_INFO_PKT flag on Client Info PDU",
+            ));
+        }
+
+        let info = ClientInfoPdu::decode(&mut sec)?;
+        self.client_info = Some(info);
+        self.state = ServerAcceptorState::SendLicense;
+        Ok(Written::nothing())
+    }
+
+    // ── Phase 9: Send License (Valid Client shortcut) ──────────────────
+
+    fn step_send_license(&mut self, output: &mut WriteBuf) -> AcceptorResult<Written> {
+        let alloc = self
+            .channel_alloc
+            .as_ref()
+            .ok_or_else(|| AcceptorError::general("SendLicense before MCS Connect"))?;
+        let io_channel_id = alloc.io_channel_id;
+
+        // Build the License Error Alert ("Valid Client" shortcut: tells
+        // the client there is no licensing exchange to do).
+        let license = LicenseErrorMessage::valid_client();
+        let license_bytes = justrdp_core::encode_vec(&license)?;
+
+        // Wrap with the basic security header (flags = SEC_LICENSE_PKT).
+        let mut inner = alloc::vec![0u8; BASIC_SECURITY_HEADER_SIZE + license_bytes.len()];
+        {
+            let mut cursor = WriteCursor::new(&mut inner);
+            cursor.write_u16_le(SEC_LICENSE_PKT, "License::secFlags")?;
+            cursor.write_u16_le(0, "License::secFlagsHi")?;
+            cursor.write_slice(&license_bytes, "License::body")?;
+        }
+
+        // Wrap in MCS SendDataIndication on the I/O channel.
+        let sdi = SendDataIndication {
+            initiator: self.user_channel_id,
+            channel_id: io_channel_id,
+            user_data: &inner,
+        };
+        let inner_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let total = TPKT_HEADER_SIZE + inner_size;
+        output.resize(total);
+        {
+            let mut cursor = WriteCursor::new(output.as_mut_slice());
+            TpktHeader::try_for_payload(inner_size)?.encode(&mut cursor)?;
+            DataTransfer.encode(&mut cursor)?;
+            sdi.encode(&mut cursor)?;
+        }
+        self.state = ServerAcceptorState::SendDemandActive;
+        Ok(Written::new(total))
+    }
+
     // ── External-failure helpers ────────────────────────────────────────
 
     /// Caller signals that the external TLS handshake failed. The
@@ -913,10 +1032,10 @@ impl Sequence for ServerAcceptor {
             ServerAcceptorState::ChannelConnection => {
                 self.step_channel_connection(input, output)
             }
+            ServerAcceptorState::WaitClientInfo => self.step_wait_client_info(input),
+            ServerAcceptorState::SendLicense => self.step_send_license(output),
             // Later commits will fill these in.
-            ServerAcceptorState::WaitClientInfo
-            | ServerAcceptorState::SendLicense
-            | ServerAcceptorState::SendDemandActive
+            ServerAcceptorState::SendDemandActive
             | ServerAcceptorState::WaitConfirmActive
             | ServerAcceptorState::ConnectionFinalization => Err(AcceptorError::general(
                 "state not yet implemented in this commit",
@@ -1942,6 +2061,156 @@ mod tests {
         };
         let err = acc.step(&build_slow_path(&req), &mut out).unwrap_err();
         assert!(alloc::format!("{err}").contains("out-of-order"));
+    }
+
+    /// Drive an acceptor all the way through Phase 5 so the next step
+    /// is WaitClientInfo.
+    fn drive_to_wait_client_info() -> ServerAcceptor {
+        let mut acc = drive_to_channel_connection(&[]);
+        let mut out = WriteBuf::new();
+        acc.step(
+            &build_slow_path(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }),
+            &mut out,
+        )
+        .unwrap();
+        acc.step(&build_slow_path(&AttachUserRequest), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap(); // AttachUserConfirm
+        let user_id = acc.user_channel_id();
+        for &chid in &[user_id, crate::mcs::IO_CHANNEL_ID] {
+            let req = ChannelJoinRequest {
+                initiator: user_id,
+                channel_id: chid,
+            };
+            acc.step(&build_slow_path(&req), &mut out).unwrap();
+            acc.step(&[], &mut out).unwrap();
+        }
+        acc.step(&[], &mut out).unwrap(); // -> WaitClientInfo
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitClientInfo);
+        acc
+    }
+
+    /// Build a TPKT + X.224 DT + MCS SDR + basic-security-header(SEC_INFO_PKT)
+    /// + ClientInfoPdu, addressed to `(initiator, io_channel_id)`.
+    fn build_client_info_pdu_bytes(
+        initiator: u16,
+        io_channel_id: u16,
+        info: &ClientInfoPdu,
+    ) -> alloc::vec::Vec<u8> {
+        use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
+        use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
+
+        let info_bytes = justrdp_core::encode_vec(info).unwrap();
+        let mut sec = alloc::vec![0u8; BASIC_SECURITY_HEADER_SIZE + info_bytes.len()];
+        {
+            let mut c = WriteCursor::new(&mut sec);
+            c.write_u16_le(SEC_INFO_PKT, "secFlags").unwrap();
+            c.write_u16_le(0, "secFlagsHi").unwrap();
+            c.write_slice(&info_bytes, "info").unwrap();
+        }
+        let sdr = SendDataRequest {
+            initiator,
+            channel_id: io_channel_id,
+            user_data: &sec,
+        };
+        let inner = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+        let total = TPKT_HEADER_SIZE + inner;
+        let mut buf = alloc::vec![0u8; total];
+        let mut c = WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(inner).unwrap().encode(&mut c).unwrap();
+        DataTransfer.encode(&mut c).unwrap();
+        sdr.encode(&mut c).unwrap();
+        buf
+    }
+
+    #[test]
+    fn client_info_decoded_and_license_sent() {
+        let mut acc = drive_to_wait_client_info();
+        let user_id = acc.user_channel_id();
+        let info = ClientInfoPdu::new("MYDOMAIN", "alice", "P@ssw0rd!");
+        let bytes = build_client_info_pdu_bytes(user_id, crate::mcs::IO_CHANNEL_ID, &info);
+
+        let mut out = WriteBuf::new();
+        acc.step(&bytes, &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::SendLicense);
+        let captured = acc.client_info().unwrap();
+        assert_eq!(captured.user_name, "alice");
+        assert_eq!(captured.domain, "MYDOMAIN");
+
+        let written = acc.step(&[], &mut out).unwrap();
+        assert!(written.size > 0);
+        assert_eq!(acc.state(), &ServerAcceptorState::SendDemandActive);
+
+        // Decode the wire bytes the acceptor produced. Walk
+        // TPKT -> X.224 DT -> MCS SDI -> security header -> license.
+        let mut c = ReadCursor::new(&out.as_slice()[..written.size]);
+        let _ = TpktHeader::decode(&mut c).unwrap();
+        let _ = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        assert_eq!(sdi.initiator, user_id);
+        assert_eq!(sdi.channel_id, crate::mcs::IO_CHANNEL_ID);
+        let mut sec = ReadCursor::new(sdi.user_data);
+        let flags = sec.read_u16_le("flags").unwrap();
+        let _flags_hi = sec.read_u16_le("flagsHi").unwrap();
+        assert_eq!(flags & SEC_LICENSE_PKT, SEC_LICENSE_PKT);
+        let lic = LicenseErrorMessage::decode(&mut sec).unwrap();
+        use justrdp_pdu::rdp::licensing::{LicenseErrorCode, LicenseStateTransition};
+        assert_eq!(lic.error_code, LicenseErrorCode::StatusValidClient);
+        assert_eq!(lic.state_transition, LicenseStateTransition::NoTransition);
+    }
+
+    #[test]
+    fn client_info_rejects_wrong_channel() {
+        let mut acc = drive_to_wait_client_info();
+        let user_id = acc.user_channel_id();
+        let info = ClientInfoPdu::new("", "bob", "x");
+        // Address to a bogus channel.
+        let bytes = build_client_info_pdu_bytes(user_id, 0xBEEF, &info);
+        let mut out = WriteBuf::new();
+        let err = acc.step(&bytes, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("I/O channel"));
+    }
+
+    #[test]
+    fn client_info_rejects_wrong_initiator() {
+        let mut acc = drive_to_wait_client_info();
+        let info = ClientInfoPdu::new("", "bob", "x");
+        // Spoofed initiator (not the assigned user channel).
+        let bytes = build_client_info_pdu_bytes(0xBEEF, crate::mcs::IO_CHANNEL_ID, &info);
+        let mut out = WriteBuf::new();
+        let err = acc.step(&bytes, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("initiator"));
+    }
+
+    #[test]
+    fn client_info_rejects_missing_sec_info_pkt_flag() {
+        let mut acc = drive_to_wait_client_info();
+        let user_id = acc.user_channel_id();
+        let info = ClientInfoPdu::new("", "carol", "x");
+        let info_bytes = justrdp_core::encode_vec(&info).unwrap();
+        // Build with flags = 0 (NO SEC_INFO_PKT).
+        let mut sec = alloc::vec![0u8; BASIC_SECURITY_HEADER_SIZE + info_bytes.len()];
+        {
+            let mut c = WriteCursor::new(&mut sec);
+            c.write_u16_le(0, "flags").unwrap();
+            c.write_u16_le(0, "flagsHi").unwrap();
+            c.write_slice(&info_bytes, "info").unwrap();
+        }
+        let sdr = SendDataRequest {
+            initiator: user_id,
+            channel_id: crate::mcs::IO_CHANNEL_ID,
+            user_data: &sec,
+        };
+        let inner = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+        let total = TPKT_HEADER_SIZE + inner;
+        let mut buf = alloc::vec![0u8; total];
+        let mut c = WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(inner).unwrap().encode(&mut c).unwrap();
+        DataTransfer.encode(&mut c).unwrap();
+        sdr.encode(&mut c).unwrap();
+
+        let mut out = WriteBuf::new();
+        let err = acc.step(&buf, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("SEC_INFO_PKT"));
     }
 
     #[test]
