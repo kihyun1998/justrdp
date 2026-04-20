@@ -71,6 +71,23 @@ impl From<justrdp_core::EncodeError> for DvcError {
 #[cfg(feature = "alloc")]
 pub type DvcResult<T> = Result<T, DvcError>;
 
+// ── DvcOutput ──
+
+/// Outbound side of a DVC operation: bytes that must be sent over a
+/// specific transport. Returned by route-aware DRDYNVC APIs
+/// ([`DrdynvcClient::route_outbound`], [`DrdynvcClient::process_tunnel_data`])
+/// so callers don't have to consult the routing table themselves.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DvcOutput {
+    /// Send via the DRDYNVC SVC over the main TCP connection.
+    Svc(justrdp_svc::SvcMessage),
+    /// Wrap as `RDP_TUNNEL_DATA` on the named multitransport tunnel
+    /// (`TUNNELTYPE_UDPFECR` / `TUNNELTYPE_UDPFECL`) and send via its
+    /// UDP/DTLS transport.
+    Tunnel { tunnel_type: u32, payload: Vec<u8> },
+}
+
 // ── DvcMessage ──
 
 /// A message to be sent on a dynamic virtual channel.

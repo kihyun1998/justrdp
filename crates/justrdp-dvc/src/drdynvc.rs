@@ -22,7 +22,7 @@ use crate::pdu::{
     SOFT_SYNC_CHANNEL_LIST_PRESENT, SOFT_SYNC_TCP_FLUSHED,
 };
 use crate::reassembly::DvcReassembler;
-use crate::{DvcError, DvcProcessor, DvcResult};
+use crate::{DvcError, DvcOutput, DvcProcessor, DvcResult};
 
 /// Maximum DVC version we support.
 const MAX_SUPPORTED_VERSION: u16 = CAPS_VERSION_3;
@@ -112,6 +112,13 @@ impl DrdynvcClient {
     /// silently (no Response → spec-compliant SVC fallback per §3.2.5.3.1).
     ///
     /// Idempotent: subsequent calls add to the available set.
+    ///
+    /// **Namespace caveat**: pass MS-RDPEDYC values
+    /// ([`TUNNELTYPE_UDPFECR`](crate::pdu::TUNNELTYPE_UDPFECR) = 0x01,
+    /// [`TUNNELTYPE_UDPFECL`](crate::pdu::TUNNELTYPE_UDPFECL) = 0x03),
+    /// **not** MS-RDPBCGR `TRANSPORTTYPE_*` values (where UDPFECL is
+    /// 0x04). UDPFECR happens to share value 0x01 in both namespaces;
+    /// UDPFECL silently fails to match if the wrong namespace is used.
     pub fn notify_tunnels_ready(&mut self, tunnel_types: &[u32]) {
         for &t in tunnel_types {
             self.available_tunnels.insert(t);
@@ -201,9 +208,13 @@ impl DrdynvcClient {
             return Ok(vec![]);
         }
 
-        // Snapshot outbound routing for `outbound_tunnel_for` lookups
-        // and build the Response PDU.
-        self.outbound_tunnels = activated_tunnels.clone();
+        // Accumulate (don't replace) outbound routing — a future second
+        // SoftSyncRequest must not silently drop channels assigned by an
+        // earlier request from the outbound set, since `channel_to_tunnel`
+        // also accumulates and the two views would otherwise diverge.
+        // The Response PDU itself only advertises the *newly activated*
+        // tunnels, which matches the spec's per-request semantics.
+        self.outbound_tunnels.extend(activated_tunnels.iter().copied());
         let tunnels_to_switch: Vec<u32> = activated_tunnels.into_iter().collect();
         let response = pdu::encode_soft_sync_response(&tunnels_to_switch)
             .map_err(DvcError::Encode)?;
@@ -379,20 +390,168 @@ impl DrdynvcClient {
         Ok(messages)
     }
 
-    /// Send data on an open DVC channel from the application side.
+    /// Send data on an open DVC channel via the DRDYNVC SVC and return
+    /// an `SvcMessage` ready for the `drdynvc` static channel.
     ///
-    /// Use this when a `DvcProcessor` produces a message outside of the normal
-    /// server-initiated flow (e.g., `DisplayControlClient::take_pending_message()`).
-    /// Returns an `SvcMessage` ready to be sent on the `drdynvc` static channel.
+    /// **Soft-Sync guard**: returns `Err` if the channel has been
+    /// soft-synced to a multitransport tunnel. Sending SVC bytes for
+    /// such a channel would silently bypass the routing the server
+    /// agreed to in `SoftSyncResponse` and split the wire ordering
+    /// across two transports. Use [`Self::route_outbound`] (which picks
+    /// the correct transport automatically) for the common path.
     ///
-    /// Returns `Err` if `channel_id` is not currently open.
+    /// Returns `Err` if `channel_id` is not currently open or if it
+    /// has an active outbound tunnel route.
     pub fn send_on_channel(&mut self, channel_id: u32, data: &[u8]) -> DvcResult<SvcMessage> {
         if !self.active_channels.contains_key(&channel_id) {
             return Err(DvcError::Protocol(String::from(
                 "send_on_channel: channel not open",
             )));
         }
+        if self.outbound_tunnel_for(channel_id).is_some() {
+            return Err(DvcError::Protocol(alloc::format!(
+                "send_on_channel: channel {channel_id} is soft-synced to a tunnel; \
+                 use route_outbound() to honor the negotiated route",
+            )));
+        }
         Ok(SvcMessage::new(pdu::encode_data(channel_id, data)))
+    }
+
+    /// Send data on an open DVC channel, picking SVC vs multitransport
+    /// tunnel based on the Soft-Sync routing table
+    /// ([`Self::outbound_tunnel_for`]). Returns the encoded DVC PDU
+    /// bytes wrapped in a [`DvcOutput`] tagged with the chosen route so
+    /// the caller knows which transport to write to without consulting
+    /// the routing table separately.
+    ///
+    /// Returns `Err` if `channel_id` is not currently open.
+    pub fn route_outbound(&self, channel_id: u32, data: &[u8]) -> DvcResult<DvcOutput> {
+        if !self.active_channels.contains_key(&channel_id) {
+            return Err(DvcError::Protocol(String::from(
+                "route_outbound: channel not open",
+            )));
+        }
+        let dvc_pdu = pdu::encode_data(channel_id, data);
+        Ok(match self.outbound_tunnel_for(channel_id) {
+            Some(tunnel_type) => DvcOutput::Tunnel { tunnel_type, payload: dvc_pdu },
+            None => DvcOutput::Svc(SvcMessage::new(dvc_pdu)),
+        })
+    }
+
+    /// Inject DVC PDU bytes that arrived on a multitransport tunnel
+    /// (`tunnel_type` = `TUNNELTYPE_UDPFECR` / `TUNNELTYPE_UDPFECL`).
+    /// `payload` is the `HigherLayerData` field of the wrapping
+    /// `RDP_TUNNEL_DATA` PDU (MS-RDPEMT §2.2.2.3); the wrapper is
+    /// caller-stripped because the connector already knows which tunnel
+    /// the datagram came from.
+    ///
+    /// Returns processor responses tagged with their outbound route —
+    /// typically `Tunnel { tunnel_type, .. }` mirroring the inbound
+    /// tunnel, but [`Self::outbound_tunnel_for`] may direct a response
+    /// elsewhere if the routing tables disagree.
+    ///
+    /// Errors:
+    /// - `DvcError::Protocol` if `tunnel_type` is not one the caller
+    ///   has marked as ready via [`Self::notify_tunnels_ready`] —
+    ///   accepting tunnel data on a transport we never advertised
+    ///   would be a server-side spec violation worth surfacing.
+    /// - PDU decode / processor errors propagate.
+    pub fn process_tunnel_data(
+        &mut self,
+        tunnel_type: u32,
+        payload: &[u8],
+    ) -> DvcResult<Vec<DvcOutput>> {
+        if !self.available_tunnels.contains(&tunnel_type) {
+            return Err(DvcError::Protocol(alloc::format!(
+                "process_tunnel_data: tunnel 0x{tunnel_type:08X} not marked ready",
+            )));
+        }
+        // MS-RDPEMT runs in DTLS message mode (one record = one
+        // application message) and the existing DVC `Data` decode
+        // greedily consumes the rest of the buffer, so each call must
+        // carry exactly one DVC PDU (typically one `RDP_TUNNEL_DATA`'s
+        // HigherLayerData).
+        let mut src = ReadCursor::new(payload);
+        let pdu = pdu::decode_dvc_pdu(&mut src)?;
+        self.process_tunnel_pdu(pdu)
+    }
+
+    /// Tunnel-side counterpart to `process_pdu`. Only data PDUs are
+    /// expected here — caps / create / close / soft-sync travel on the
+    /// SVC. Anything else is a protocol error.
+    fn process_tunnel_pdu(&mut self, pdu: DvcPdu) -> DvcResult<Vec<DvcOutput>> {
+        match pdu {
+            DvcPdu::DataFirst { channel_id, total_length, data } => {
+                self.handle_tunnel_fragment(channel_id, Some(total_length), &data)
+            }
+            DvcPdu::Data { channel_id, data } => {
+                self.handle_tunnel_fragment(channel_id, None, &data)
+            }
+            DvcPdu::DataFirstCompressed { channel_id, total_length, data } => {
+                let decompressed = self.decompress_chunk(channel_id, &data)?;
+                self.handle_tunnel_fragment(channel_id, Some(total_length), &decompressed)
+            }
+            DvcPdu::DataCompressed { channel_id, data } => {
+                let decompressed = self.decompress_chunk(channel_id, &data)?;
+                self.handle_tunnel_fragment(channel_id, None, &decompressed)
+            }
+            other => Err(DvcError::Protocol(alloc::format!(
+                "process_tunnel_data: control PDU on tunnel: {:?}",
+                other,
+            ))),
+        }
+    }
+
+    fn handle_tunnel_fragment(
+        &mut self,
+        channel_id: u32,
+        total_length: Option<u32>,
+        data: &[u8],
+    ) -> DvcResult<Vec<DvcOutput>> {
+        let reassembler = match self.reassemblers.get_mut(&channel_id) {
+            Some(r) => r,
+            // Unknown channel — silently drop (matches SVC-side
+            // behavior for unknown channels per §3.1.5.1.4).
+            None => return Ok(vec![]),
+        };
+        let complete = match total_length {
+            Some(len) => reassembler.data_first(len, data)?,
+            None => reassembler.data(data)?,
+        };
+        if let Some(payload) = complete {
+            self.dispatch_data_routed(channel_id, &payload)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Dispatch reassembled payload to the channel processor and tag
+    /// each response with the outbound route picked by the routing
+    /// table. Used by the tunnel ingestion path.
+    fn dispatch_data_routed(
+        &mut self,
+        channel_id: u32,
+        payload: &[u8],
+    ) -> DvcResult<Vec<DvcOutput>> {
+        let name = match self.active_channels.get(&channel_id) {
+            Some(n) => n.clone(),
+            None => return Ok(vec![]),
+        };
+        let proc = match self.processors.get_mut(&name) {
+            Some(p) => p,
+            None => return Ok(vec![]),
+        };
+        let responses = proc.process(channel_id, payload)?;
+        let route = self.outbound_tunnel_for(channel_id);
+        let mut out = Vec::with_capacity(responses.len());
+        for msg in responses {
+            let dvc_pdu = pdu::encode_data(channel_id, &msg.data);
+            out.push(match route {
+                Some(tunnel_type) => DvcOutput::Tunnel { tunnel_type, payload: dvc_pdu },
+                None => DvcOutput::Svc(SvcMessage::new(dvc_pdu)),
+            });
+        }
+        Ok(out)
     }
 
     /// Look up the channel ID for a registered processor by name.
@@ -858,6 +1017,237 @@ mod tests {
         match err {
             justrdp_svc::SvcError::Protocol(_) => {}
             other => panic!("expected SvcError::Protocol, got {other:?}"),
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Soft-Sync routing — outbound + inbound tunnel APIs (Commit E.2)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Drive a client through Caps + Create + SoftSyncRequest so that
+    /// channel 3 ("testdvc") is open and routed via UDPFECR. Returns
+    /// the configured client.
+    fn client_with_soft_synced_channel() -> DrdynvcClient {
+        let mut client = DrdynvcClient::new();
+        client.register(Box::new(EchoDvcProcessor));
+        client.notify_tunnels_ready(&[pdu::TUNNELTYPE_UDPFECR]);
+        // Caps v1 → CreateRequest channel_id=3 → SoftSync over UDPFECR.
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+        let create_req = [0x10, 0x03, 0x74, 0x65, 0x73, 0x74, 0x64, 0x76, 0x63, 0x00];
+        client.process(&create_req).unwrap();
+        let soft_sync_req = pdu::encode_soft_sync_request(
+            pdu::SOFT_SYNC_TCP_FLUSHED | pdu::SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &[pdu::SoftSyncChannelList {
+                tunnel_type: pdu::TUNNELTYPE_UDPFECR,
+                dvc_ids: vec![3],
+            }],
+        )
+        .unwrap();
+        let resp = client.process(&soft_sync_req).unwrap();
+        assert_eq!(resp.len(), 1, "SoftSyncResponse must be emitted");
+        client
+    }
+
+    #[test]
+    fn route_outbound_tunnel_for_soft_synced_channel() {
+        let client = client_with_soft_synced_channel();
+        let out = client.route_outbound(3, b"hello").unwrap();
+        match out {
+            DvcOutput::Tunnel { tunnel_type, payload } => {
+                assert_eq!(tunnel_type, pdu::TUNNELTYPE_UDPFECR);
+                // The payload is a DYNVC_DATA frame for channel 3 carrying "hello".
+                let mut src = ReadCursor::new(&payload);
+                match pdu::decode_dvc_pdu(&mut src).unwrap() {
+                    DvcPdu::Data { channel_id, data } => {
+                        assert_eq!(channel_id, 3);
+                        assert_eq!(data, b"hello");
+                    }
+                    other => panic!("expected DYNVC_DATA, got {other:?}"),
+                }
+            }
+            DvcOutput::Svc(_) => panic!("channel 3 must route via UDPFECR"),
+        }
+    }
+
+    #[test]
+    fn route_outbound_svc_for_unrouted_channel() {
+        // No Soft-Sync, just a regular open channel.
+        let mut client = DrdynvcClient::new();
+        client.register(Box::new(EchoDvcProcessor));
+        client.process(&[0x50, 0x00, 0x01, 0x00]).unwrap();
+        let create_req = [0x10, 0x03, 0x74, 0x65, 0x73, 0x74, 0x64, 0x76, 0x63, 0x00];
+        client.process(&create_req).unwrap();
+        let out = client.route_outbound(3, b"hello").unwrap();
+        match out {
+            DvcOutput::Svc(msg) => {
+                let mut src = ReadCursor::new(&msg.data);
+                match pdu::decode_dvc_pdu(&mut src).unwrap() {
+                    DvcPdu::Data { channel_id, data } => {
+                        assert_eq!(channel_id, 3);
+                        assert_eq!(data, b"hello");
+                    }
+                    other => panic!("expected DYNVC_DATA, got {other:?}"),
+                }
+            }
+            DvcOutput::Tunnel { .. } => panic!("non-soft-synced channel must use SVC"),
+        }
+    }
+
+    #[test]
+    fn route_outbound_unknown_channel_errors() {
+        let client = DrdynvcClient::new();
+        assert!(client.route_outbound(99, b"x").is_err());
+    }
+
+    #[test]
+    fn process_tunnel_data_dispatches_and_routes_response() {
+        // End-to-end: server sends DYNVC_DATA over the UDPFECR tunnel
+        // to soft-synced channel 3. Echo processor responds; response
+        // must be tagged for the same tunnel.
+        let mut client = client_with_soft_synced_channel();
+        let server_frame = pdu::encode_data(3, b"hello");
+        let outputs = client
+            .process_tunnel_data(pdu::TUNNELTYPE_UDPFECR, &server_frame)
+            .unwrap();
+        assert_eq!(outputs.len(), 1, "echo emits exactly one response");
+        match &outputs[0] {
+            DvcOutput::Tunnel { tunnel_type, payload } => {
+                assert_eq!(*tunnel_type, pdu::TUNNELTYPE_UDPFECR);
+                let mut src = ReadCursor::new(payload);
+                match pdu::decode_dvc_pdu(&mut src).unwrap() {
+                    DvcPdu::Data { channel_id, data } => {
+                        assert_eq!(channel_id, 3);
+                        assert_eq!(data, b"hello");
+                    }
+                    other => panic!("expected DYNVC_DATA, got {other:?}"),
+                }
+            }
+            DvcOutput::Svc(_) => panic!("response must follow inbound tunnel"),
+        }
+    }
+
+    #[test]
+    fn process_tunnel_data_rejects_unmarked_tunnel() {
+        // UDPFECR is the only one ready; UDPFECL data must error.
+        let mut client = client_with_soft_synced_channel();
+        let server_frame = pdu::encode_data(3, b"hi");
+        let err = client
+            .process_tunnel_data(pdu::TUNNELTYPE_UDPFECL, &server_frame)
+            .unwrap_err();
+        match err {
+            DvcError::Protocol(msg) => assert!(msg.contains("not marked ready")),
+            other => panic!("expected DvcError::Protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_tunnel_data_rejects_control_pdu() {
+        // CreateRequest, Caps, Close etc. MUST come over the SVC,
+        // never the tunnel. A server bug sending one over UDP should
+        // surface as a protocol error.
+        let mut client = client_with_soft_synced_channel();
+        // Build a DYNVC_CLOSE for channel 3.
+        let close_frame = pdu::encode_close(3);
+        let err = client
+            .process_tunnel_data(pdu::TUNNELTYPE_UDPFECR, &close_frame)
+            .unwrap_err();
+        assert!(matches!(err, DvcError::Protocol(_)));
+    }
+
+    #[test]
+    fn process_tunnel_data_unknown_channel_silently_dropped() {
+        // Inbound tunnel data for a channel we don't have open should
+        // be dropped without error (defensive — server timing race).
+        let mut client = client_with_soft_synced_channel();
+        let server_frame = pdu::encode_data(99, b"orphan");
+        let outputs = client
+            .process_tunnel_data(pdu::TUNNELTYPE_UDPFECR, &server_frame)
+            .unwrap();
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn second_soft_sync_request_accumulates_outbound_tunnels() {
+        // After a first SoftSyncRequest assigns channel 3 to UDPFECR,
+        // a second request adding channel 5 on UDPFECL must not erase
+        // channel 3's outbound route.
+        let mut client = DrdynvcClient::new();
+        client.notify_tunnels_ready(&[pdu::TUNNELTYPE_UDPFECR, pdu::TUNNELTYPE_UDPFECL]);
+
+        let req1 = pdu::encode_soft_sync_request(
+            pdu::SOFT_SYNC_TCP_FLUSHED | pdu::SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &[pdu::SoftSyncChannelList {
+                tunnel_type: pdu::TUNNELTYPE_UDPFECR,
+                dvc_ids: vec![3],
+            }],
+        )
+        .unwrap();
+        client.process(&req1).unwrap();
+        assert_eq!(client.outbound_tunnel_for(3), Some(pdu::TUNNELTYPE_UDPFECR));
+
+        let req2 = pdu::encode_soft_sync_request(
+            pdu::SOFT_SYNC_TCP_FLUSHED | pdu::SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &[pdu::SoftSyncChannelList {
+                tunnel_type: pdu::TUNNELTYPE_UDPFECL,
+                dvc_ids: vec![5],
+            }],
+        )
+        .unwrap();
+        client.process(&req2).unwrap();
+        // Both channels keep their tunnel routes.
+        assert_eq!(client.outbound_tunnel_for(3), Some(pdu::TUNNELTYPE_UDPFECR));
+        assert_eq!(client.outbound_tunnel_for(5), Some(pdu::TUNNELTYPE_UDPFECL));
+    }
+
+    #[test]
+    fn send_on_channel_rejects_soft_synced_channel() {
+        // Soft-Sync makes channel 3 tunnel-routed; the legacy SVC-only
+        // send_on_channel must refuse rather than silently mis-route.
+        let mut client = client_with_soft_synced_channel();
+        let err = client.send_on_channel(3, b"oops").unwrap_err();
+        match err {
+            DvcError::Protocol(msg) => assert!(msg.contains("soft-synced")),
+            other => panic!("expected DvcError::Protocol, got {other:?}"),
+        }
+        // route_outbound on the same channel still works.
+        assert!(matches!(
+            client.route_outbound(3, b"ok"),
+            Ok(DvcOutput::Tunnel { .. }),
+        ));
+    }
+
+    #[test]
+    fn process_tunnel_data_handles_fragmented_payload() {
+        // Server splits "hello world" across two RDP_TUNNEL_DATA PDUs
+        // on UDPFECR (DataFirst then Data continuation). Each arrives
+        // in its own `process_tunnel_data` call (DTLS message mode).
+        // The first yields no output (incomplete); the second carries
+        // the reassembled message and the echo response.
+        let mut client = client_with_soft_synced_channel();
+        let part1 = pdu::encode_data_first(3, b"hello world".len() as u32, b"hello ");
+        let part2 = pdu::encode_data(3, b"world");
+
+        let out1 = client
+            .process_tunnel_data(pdu::TUNNELTYPE_UDPFECR, &part1)
+            .unwrap();
+        assert!(out1.is_empty(), "first fragment: still incomplete");
+
+        let out2 = client
+            .process_tunnel_data(pdu::TUNNELTYPE_UDPFECR, &part2)
+            .unwrap();
+        assert_eq!(out2.len(), 1, "second fragment completes the message");
+        match &out2[0] {
+            DvcOutput::Tunnel { tunnel_type: _, payload } => {
+                let mut src = ReadCursor::new(payload);
+                match pdu::decode_dvc_pdu(&mut src).unwrap() {
+                    DvcPdu::Data { channel_id, data } => {
+                        assert_eq!(channel_id, 3);
+                        assert_eq!(data, b"hello world");
+                    }
+                    other => panic!("expected DYNVC_DATA, got {other:?}"),
+                }
+            }
+            other => panic!("expected Tunnel, got {other:?}"),
         }
     }
 }

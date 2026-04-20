@@ -2236,9 +2236,10 @@ credential blob verified against the user's X.509 cert.
 - [x] DRDYNVC manager Soft-Sync 라우팅 테이블 (`channel_to_tunnel`, `available_tunnels`, `outbound_tunnels`)
   - `notify_tunnels_ready()` API — caller가 UDP 셋업 완료 시점을 신호
   - `inbound_tunnel_for(channel_id)` / `outbound_tunnel_for(channel_id)` 조회 API
-  - `SoftSyncRequest` arm — 중복 channel_id MUST NOT 검증, 가용 터널 교집합 계산, 조건부 Response 송신
-- [ ] Inbound 터널 데이터 주입 (`process_tunnel_data`) + outbound 라우팅 자동화 (`send_on_channel` API 확장)
-- [ ] End-to-end fake-tunnel integration test
+  - `SoftSyncRequest` arm — 중복 channel_id MUST NOT 검증, 가용 터널 교집합 계산, 조건부 Response 송신, 두 번째 Request도 누적
+- [x] Inbound 터널 데이터 주입 (`process_tunnel_data`) — 응답을 `outbound_tunnel_for` 기반으로 라우트
+- [x] Outbound 라우팅 자동화 (`route_outbound` → `DvcOutput::Svc`/`Tunnel`) + `send_on_channel` Soft-Sync guard
+- [x] Fake-tunnel 통합 테스트 (handshake 활성화 → tunnel 데이터 inject → 에코 응답이 같은 터널로 라우트)
 
 ---
 
