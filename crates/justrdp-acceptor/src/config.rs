@@ -156,7 +156,37 @@ impl AcceptorConfigBuilder {
         self
     }
 
-    pub fn build(self) -> AcceptorConfig {
+    /// Validate and return the built config.
+    ///
+    /// Returns an error when the config would create a MITM-aided
+    /// downgrade window: `supported_protocols` advertises enhanced
+    /// security bits (SSL/HYBRID/HYBRID_EX/RDSTLS/AAD) but
+    /// `require_enhanced_security` is false. In that combination, a
+    /// man-in-the-middle can strip all `requestedProtocols` bits from
+    /// the client's CR to force `PROTOCOL_RDP` selection even though
+    /// the server actually supports TLS.
+    ///
+    /// Use [`build_allow_downgrade`](Self::build_allow_downgrade) if
+    /// you explicitly want to accept this risk (legacy interop).
+    pub fn build(self) -> Result<AcceptorConfig, &'static str> {
+        use justrdp_pdu::x224::SecurityProtocol;
+        let has_enhanced =
+            self.inner.supported_protocols.bits() & !SecurityProtocol::RDP.bits() != 0;
+        if has_enhanced && !self.inner.require_enhanced_security {
+            return Err(
+                "AcceptorConfig allows PROTOCOL_RDP downgrade: supported_protocols \
+                 advertises enhanced security but require_enhanced_security is false. \
+                 Call build_allow_downgrade() if this is intentional.",
+            );
+        }
+        Ok(self.inner)
+    }
+
+    /// Like [`build`](Self::build) but skips the downgrade-safety
+    /// invariant. Only use this when you need to accept legacy
+    /// Standard-RDP-Security clients while also serving TLS clients --
+    /// accept that MITM can force-downgrade to RC4 in that mode.
+    pub fn build_allow_downgrade(self) -> AcceptorConfig {
         self.inner
     }
 }
@@ -164,5 +194,59 @@ impl AcceptorConfigBuilder {
 impl Default for AcceptorConfigBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use justrdp_pdu::x224::SecurityProtocol;
+
+    #[test]
+    fn build_rejects_downgrade_combo() {
+        // Enhanced bits advertised + require_enhanced_security=false
+        // is the exact combination a MITM can exploit.
+        let err = AcceptorConfig::builder()
+            .supported_protocols(
+                SecurityProtocol::SSL.union(SecurityProtocol::HYBRID),
+            )
+            .require_enhanced_security(false)
+            .build()
+            .unwrap_err();
+        assert!(err.contains("downgrade"));
+    }
+
+    #[test]
+    fn build_accepts_rdp_only_with_enhanced_off() {
+        // Pure Standard-RDP-Security server is safe: there are no
+        // enhanced bits to downgrade from.
+        let cfg = AcceptorConfig::builder()
+            .supported_protocols(SecurityProtocol::RDP)
+            .require_enhanced_security(false)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.supported_protocols, SecurityProtocol::RDP);
+    }
+
+    #[test]
+    fn build_accepts_enhanced_with_require_on() {
+        let cfg = AcceptorConfig::builder()
+            .supported_protocols(SecurityProtocol::HYBRID)
+            .require_enhanced_security(true)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.supported_protocols, SecurityProtocol::HYBRID);
+    }
+
+    #[test]
+    fn build_allow_downgrade_bypasses_invariant() {
+        // Explicit opt-in for legacy interop.
+        let cfg = AcceptorConfig::builder()
+            .supported_protocols(
+                SecurityProtocol::SSL.union(SecurityProtocol::HYBRID),
+            )
+            .require_enhanced_security(false)
+            .build_allow_downgrade();
+        assert!(!cfg.require_enhanced_security);
     }
 }

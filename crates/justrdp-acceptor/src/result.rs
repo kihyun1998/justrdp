@@ -5,6 +5,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use justrdp_pdu::rdp::capabilities::CapabilitySet;
+use justrdp_pdu::rdp::client_info::ClientInfoPdu;
 use justrdp_pdu::x224::{NegotiationRequestFlags, NegotiationResponseFlags, SecurityProtocol};
 
 /// Number of bytes written to the output buffer by a `step()` call.
@@ -64,10 +66,16 @@ impl ClientRequestInfo {
 
 /// Result of a successful RDP server connection acceptance.
 ///
-/// Filled in incrementally by later phases (MCS, capabilities, etc.). Phase 1
-/// only populates `selected_protocol` and `server_nego_flags`; the remaining
-/// fields are left at their default values until the corresponding phase
-/// runs.
+/// Filled in incrementally by later phases (MCS, capabilities, etc.).
+/// Phase 1 only populates `selected_protocol` and `server_nego_flags`;
+/// the remaining fields are left at their default values until the
+/// corresponding phase runs.
+///
+/// The terminal `Accepted { result }` hands ownership of this struct to
+/// the caller, so it must carry *everything* the post-connection
+/// session driver needs (negotiated caps, credentials, channel IDs) --
+/// callers who dispose of the `ServerAcceptor` after the handshake
+/// cannot call accessors on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptanceResult {
     /// Security protocol the server selected in `RDP_NEG_RSP`.
@@ -80,10 +88,19 @@ pub struct AcceptanceResult {
     pub io_channel_id: u16,
     /// MCS user channel ID assigned to the joined user (filled in Phase 5).
     pub user_channel_id: u16,
+    /// MCS message channel ID, if one was allocated in Phase 4.
+    pub message_channel_id: Option<u16>,
     /// Share ID assigned by the server (filled in Phase 11).
     pub share_id: u32,
     /// Channel name to MCS channel ID mapping (filled in Phase 4).
     pub channel_ids: Vec<(String, u16)>,
+    /// Capability sets the client returned in ConfirmActive (filled
+    /// in Phase 11). Empty before the confirm arrives.
+    pub client_capabilities: Vec<CapabilitySet>,
+    /// Parsed Client Info PDU (filled in Phase 7). `None` if the
+    /// connection terminated before the secure-settings exchange.
+    /// The `ClientInfoPdu::Drop` impl zeroes the password on drop.
+    pub client_info: Option<ClientInfoPdu>,
 }
 
 impl AcceptanceResult {
@@ -95,8 +112,11 @@ impl AcceptanceResult {
             client_request,
             io_channel_id: 0,
             user_channel_id: 0,
+            message_channel_id: None,
             share_id: 0,
             channel_ids: Vec::new(),
+            client_capabilities: Vec::new(),
+            client_info: None,
         }
     }
 }

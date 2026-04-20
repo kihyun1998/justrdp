@@ -267,9 +267,26 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
             // Wire: Header + ChannelId + ChannelName (null-terminated)
             let channel_id = read_channel_id(src, cb_id)?;
             let remaining = src.peek_remaining();
+            // Cap the null-terminator scan distance to bound the
+            // per-PDU allocation that follows. MS-RDPEDYC 2.2.2.1 does
+            // not set an explicit maximum, but no real channel name
+            // exceeds 64 bytes (see MS-RDPBCGR §2.2.1.3.4 which caps
+            // static VC names at 7 ASCII chars). 256 is a generous
+            // ceiling that still prevents an attacker from forcing a
+            // multi-KB String allocation per CREATE attempt.
+            const MAX_CHANNEL_NAME_LEN: usize = 256;
+            let scan_limit = remaining.len().min(MAX_CHANNEL_NAME_LEN);
             // MS-RDPEDYC 2.2.2.1: channel name MUST be null-terminated.
-            let name_end = remaining.iter().position(|&b| b == 0)
-                .ok_or_else(|| DecodeError::unexpected_value("DVC", "channelName", "missing null terminator"))?;
+            let name_end = remaining[..scan_limit]
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or_else(|| {
+                    DecodeError::unexpected_value(
+                        "DVC",
+                        "channelName",
+                        "missing null terminator within 256 bytes",
+                    )
+                })?;
             let name_bytes = &remaining[..name_end];
             let channel_name = core::str::from_utf8(name_bytes)
                 .map_err(|_| DecodeError::unexpected_value("DVC", "channelName", "invalid UTF-8"))?;
@@ -438,6 +455,77 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
 }
 
 // ── Encoding functions ──
+
+/// Encode a DYNVC_CAPS_REQ (server → client, MS-RDPEDYC §2.2.1.1).
+///
+/// `version` ∈ {1, 2, 3}. For v2/v3, `priority_charges` is the
+/// MS-RDPEDYC §2.2.1.1.2 array of four `PriorityCharge` u16 values.
+/// `None` is allowed only when `version == 1`.
+pub fn encode_caps_request(version: u16, priority_charges: Option<[u16; 4]>) -> Vec<u8> {
+    let with_charges = version >= CAPS_VERSION_2;
+    let size = if with_charges { 12 } else { 4 };
+    let mut buf = alloc::vec![0u8; size];
+    buf[0] = encode_header(CMD_CAPS, 0, 0);
+    buf[1] = 0x00; // pad
+    buf[2..4].copy_from_slice(&version.to_le_bytes());
+    if with_charges {
+        // The spec assigns default values when the server omits this
+        // array; here we require the caller to supply them rather than
+        // baking a policy into a low-level encoder.
+        let charges = priority_charges.expect("v2/v3 caps require priority charges");
+        for (i, c) in charges.iter().enumerate() {
+            buf[4 + i * 2..6 + i * 2].copy_from_slice(&c.to_le_bytes());
+        }
+    }
+    buf
+}
+
+/// Encode a DYNVC_CREATE_REQ (server → client, MS-RDPEDYC §2.2.2.1).
+///
+/// Wire: `Header + ChannelId(varint) + ChannelName + 0x00`. The channel
+/// name is ANSI; this encoder accepts any `&str` and writes the raw
+/// bytes followed by a null terminator. `priority` (Sp) ∈ {0..3} maps
+/// to the channel priority class.
+pub fn encode_create_request(channel_id: u32, channel_name: &str, priority: u8) -> Vec<u8> {
+    let cb_id = cb_id_for(channel_id);
+    let name = channel_name.as_bytes();
+    let size = 1 + cb_id_size(cb_id) + name.len() + 1;
+    let mut buf = alloc::vec![0u8; size];
+    let mut cursor = WriteCursor::new(&mut buf);
+    cursor
+        .write_u8(encode_header(CMD_CREATE, priority & 0x03, cb_id), "DVC::header")
+        .expect("pre-sized buffer");
+    write_channel_id(&mut cursor, channel_id, cb_id).expect("pre-sized buffer");
+    cursor.write_slice(name, "DVC::channelName").expect("pre-sized buffer");
+    cursor.write_u8(0x00, "DVC::nullTerminator").expect("pre-sized buffer");
+    buf
+}
+
+/// Decode a DYNVC_CAPS_RSP (client → server, MS-RDPEDYC §2.2.1.2).
+///
+/// Unlike [`decode_dvc_pdu`], this reader does **not** consume the
+/// four priority-charge fields that v2/v3 Capabilities **Requests**
+/// carry: per §2.2.1.2, the client's Capabilities Response is always
+/// `Header(1) + Pad(1) + Version(2)` = 4 bytes regardless of version.
+/// A real client response deserializes correctly here; feeding the
+/// same bytes to `decode_dvc_pdu` would fail on v2/v3 because it
+/// would attempt to read 8 extra bytes of charges that the client
+/// never sends.
+pub fn decode_caps_response(bytes: &[u8]) -> DecodeResult<u16> {
+    let mut cursor = ReadCursor::new(bytes);
+    let header = cursor.read_u8("DVC::header")?;
+    let (cmd, _sp, _cb_id) = decode_header(header);
+    if cmd != CMD_CAPS {
+        return Err(DecodeError::unexpected_value(
+            "DVC::capsResponse",
+            "cmd",
+            "expected CMD_CAPS (0x05)",
+        ));
+    }
+    let _pad = cursor.read_u8("DVC::capsPad")?;
+    let version = cursor.read_u16_le("DVC::capsVersion")?;
+    Ok(version)
+}
 
 /// Encode a DYNVC_CAPS_RSP.
 pub fn encode_caps_response(version: u16) -> Vec<u8> {

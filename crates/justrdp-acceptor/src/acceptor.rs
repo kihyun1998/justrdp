@@ -97,6 +97,12 @@ pub struct ServerAcceptor {
     /// echoed back in the corresponding ChannelJoinConfirm.
     pending_join_requested: Option<u16>,
 
+    /// Number of PersistentKeyList PDUs received in the current
+    /// finalization phase. The spec allows at most one such PDU before
+    /// FontList; this counter caps the count to prevent a hostile
+    /// client from looping in `WaitClientFontList` forever (DoS).
+    persistent_key_list_count: u8,
+
     // ── Phase 7: Client Info ──
     /// Decoded `ClientInfoPdu` captured from the secure-settings
     /// exchange. Available once the acceptor has advanced past
@@ -199,6 +205,7 @@ impl ServerAcceptor {
             channels_to_join: Vec::new(),
             channel_join_index: 0,
             pending_join_requested: None,
+            persistent_key_list_count: 0,
             client_info: None,
             share_id: 0x0001_03EA,
             client_capabilities: Vec::new(),
@@ -663,10 +670,14 @@ impl ServerAcceptor {
 
         // Build the MCS Connect Response. `called_connect_id` mirrors the
         // T.125 convention used by Windows servers (always 0).
+        // `domain_parameters` MUST carry the *negotiated* result per
+        // T.125 §8.2 -- using `client_default()` (the client-facing
+        // struct) would advertise parameters outside the agreed
+        // [min, max] range that the client sent in ConnectInitial.
         let connect_response = ConnectResponse {
             result: ConnectResponseResult::RtSuccessful,
             called_connect_id: 0,
-            domain_parameters: DomainParameters::client_default(),
+            domain_parameters: DomainParameters::server_default(),
             user_data: gcc_resp,
         };
 
@@ -740,11 +751,27 @@ impl ServerAcceptor {
     ///                 even pure-no-static-channel sessions get a user
     ///                 ID in the conventional range.
     fn next_user_channel_id(alloc: &ChannelAllocation) -> u16 {
-        let mut next = alloc.io_channel_id + 1 + alloc.static_channels.len() as u16;
-        if alloc.message_channel_id.is_some() {
-            next += 1;
-        }
-        next.max(0x03EF)
+        // Compute the highest channel ID the allocator has already
+        // handed out, then pick the very next ID. Previous form
+        // assumed `io + 1 + n_static + (1 if msg)` but did not account
+        // for the fact that `message_channel_id` is always *after*
+        // the static block when present -- so that's the actual
+        // high-water mark whenever it exists. Computing it as
+        // `max(all allocated IDs) + 1` is collision-free by
+        // construction. The floor `0x03EF` (1007) matches the Windows
+        // RDS convention: user channel IDs live at >= 1007 even on
+        // sessions with zero static channels.
+        let max_static = alloc
+            .static_channels
+            .iter()
+            .map(|(_, id)| *id)
+            .max()
+            .unwrap_or(alloc.io_channel_id);
+        let max_allocated = alloc
+            .message_channel_id
+            .map(|id| id.max(max_static))
+            .unwrap_or(max_static);
+        max_allocated.saturating_add(1).max(0x03EF)
     }
 
     fn step_channel_connection(
@@ -1475,12 +1502,19 @@ impl ServerAcceptor {
         &mut self,
         output: &mut WriteBuf,
     ) -> AcceptorResult<Written> {
-        // MS-RDPBCGR §2.2.1.20.3: GrantedControl has grantId =
-        // user_channel_id, controlId = 0x03EA (server).
+        // MS-RDPBCGR §2.2.1.20.3: GrantedControl carries grantId =
+        // client user-channel ID and controlId = the server's
+        // `pduSource`, which must match what the client observed in
+        // DemandActive.pduSource. Our state machine uses
+        // `self.user_channel_id` for both DemandActive.pduSource and
+        // SDI.initiator (see `step_send_demand_active` for the
+        // consistency argument); emitting the constant 0x03EA here
+        // would diverge from the DemandActive transcript and trip
+        // mstsc's controlId validation.
         let ctrl = ControlPdu {
             action: ControlAction::GrantedControl,
             grant_id: self.user_channel_id,
-            control_id: CONFIRM_ACTIVE_ORIGINATOR_ID as u32,
+            control_id: self.user_channel_id as u32,
         };
         let body = justrdp_core::encode_vec(&ctrl)?;
         let written = self.write_share_data_pdu(ShareDataPduType::Control, &body, output)?;
@@ -1495,7 +1529,19 @@ impl ServerAcceptor {
             ShareDataPduType::PersistentKeyList => {
                 // Optional client-side cache hint. No response required.
                 // Stay in this sub-phase to wait for the FontList that
-                // follows.
+                // follows. MS-RDPBCGR §2.2.1.17 describes
+                // PersistentKeyList as possibly spanning multiple PDUs
+                // (PERSIST_FIRST_PDU / PERSIST_LAST_PDU flags), but
+                // Windows servers in practice see at most a handful.
+                // Cap at 64 to prevent a client from looping here
+                // indefinitely (DoS).
+                const MAX_PERSISTENT_KEY_LIST_PDUS: u8 = 64;
+                if self.persistent_key_list_count >= MAX_PERSISTENT_KEY_LIST_PDUS {
+                    return Err(AcceptorError::general(
+                        "exceeded maximum PersistentKeyList PDUs during finalization",
+                    ));
+                }
+                self.persistent_key_list_count += 1;
                 Ok(Written::nothing())
             }
             ShareDataPduType::FontList => {
@@ -1571,9 +1617,12 @@ impl ServerAcceptor {
         if let Some(alloc) = &self.channel_alloc {
             result.io_channel_id = alloc.io_channel_id;
             result.channel_ids = alloc.static_channels.clone();
+            result.message_channel_id = alloc.message_channel_id;
         }
         result.user_channel_id = self.user_channel_id;
         result.share_id = self.share_id;
+        result.client_capabilities = self.client_capabilities.clone();
+        result.client_info = self.client_info.clone();
         result
     }
 }
@@ -1793,7 +1842,7 @@ mod tests {
         let cfg = AcceptorConfig::builder()
             .require_enhanced_security(false)
             .supported_protocols(SecurityProtocol::RDP)
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         acc.step(&cr_bytes, &mut out).unwrap();
@@ -1821,7 +1870,7 @@ mod tests {
             .supported_protocols(
                 SecurityProtocol::HYBRID.union(SecurityProtocol::HYBRID_EX),
             )
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         acc.step(&cr_bytes, &mut out).unwrap();
@@ -1842,7 +1891,7 @@ mod tests {
 
         let cfg = AcceptorConfig::builder()
             .tls_certificate_available(false)
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         acc.step(&cr_bytes, &mut out).unwrap();
@@ -1862,7 +1911,7 @@ mod tests {
         let cfg = AcceptorConfig::builder()
             .require_enhanced_security(false)
             .supported_protocols(SecurityProtocol::RDP)
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         acc.step(&cr_bytes, &mut out).unwrap();
@@ -1887,7 +1936,7 @@ mod tests {
 
         let cfg = AcceptorConfig::builder()
             .restricted_admin_supported(true)
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         acc.step(&cr_bytes, &mut out).unwrap();
@@ -1932,7 +1981,7 @@ mod tests {
 
         let cfg = AcceptorConfig::builder()
             .supported_protocols(SecurityProtocol::AAD)
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         acc.step(&cr_bytes, &mut out).unwrap();
@@ -2011,7 +2060,7 @@ mod tests {
 
         let cfg = AcceptorConfig::builder()
             .redirected_auth_supported(true)
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         acc.step(&cr_bytes, &mut out).unwrap();
@@ -2053,7 +2102,7 @@ mod tests {
         let cr = ConnectionRequest::new(Some(nego));
         let cr_bytes = build_cr_bytes(&cr);
 
-        let cfg = AcceptorConfig::builder().gfx_supported(true).build();
+        let cfg = AcceptorConfig::builder().gfx_supported(true).build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         acc.step(&cr_bytes, &mut out).unwrap();
@@ -2080,7 +2129,7 @@ mod tests {
 
         let cfg = AcceptorConfig::builder()
             .supported_protocols(SecurityProtocol::SSL.union(SecurityProtocol::AAD))
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         acc.step(&cr_bytes, &mut out).unwrap();
@@ -2150,7 +2199,7 @@ mod tests {
         // client's SSL-only request is honoured as plain SSL.
         let cfg = AcceptorConfig::builder()
             .supported_protocols(SecurityProtocol::SSL)
-            .build();
+            .build().unwrap();
         let nego = NegotiationRequest::new(SecurityProtocol::SSL);
         let cr = ConnectionRequest::new(Some(nego));
         let cr_bytes = build_cr_bytes(&cr);
@@ -2379,7 +2428,7 @@ mod tests {
         // Server config that supports the message channel.
         let cfg = AcceptorConfig::builder()
             .support_message_channel(true)
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let mut out = WriteBuf::new();
         // Drive through CC + TLS + CredSSP.
@@ -2546,7 +2595,7 @@ mod tests {
         let ci_bytes = build_mcs_connect_initial_bytes(&buf);
         let cfg = AcceptorConfig::builder()
             .support_message_channel(true)
-            .build();
+            .build().unwrap();
         let mut acc = ServerAcceptor::new(cfg);
         let nego = NegotiationRequest::new(SecurityProtocol::HYBRID);
         let cr = ConnectionRequest::new(Some(nego));
@@ -3243,7 +3292,9 @@ mod tests {
         let granted = ControlPdu::decode(&mut ReadCursor::new(&server_body)).unwrap();
         assert_eq!(granted.action, ControlAction::GrantedControl);
         assert_eq!(granted.grant_id, user_id);
-        assert_eq!(granted.control_id, CONFIRM_ACTIVE_ORIGINATOR_ID as u32);
+        // controlId must equal the server's pduSource from DemandActive,
+        // which in our state machine is `user_channel_id`.
+        assert_eq!(granted.control_id, user_id as u32);
 
         // 4) Client FontList -> server FontMap
         let font_list = FontListPdu::default_request();
@@ -3338,6 +3389,50 @@ mod tests {
         );
         let err = acc.step(&bytes, &mut out).unwrap_err();
         assert!(alloc::format!("{err}").contains("Synchronize"));
+    }
+
+    #[test]
+    fn finalization_caps_persistent_key_list_spam() {
+        // DoS regression: a client that keeps sending
+        // PersistentKeyList PDUs must be kicked off after the cap, not
+        // allowed to stall the finalization phase forever.
+        let mut acc = drive_to_connection_finalization();
+        let user_id = acc.user_channel_id();
+        let share_id = acc.share_id();
+        let mut out = WriteBuf::new();
+
+        // Advance past Sync + Cooperate + RequestControl.
+        let sync = SynchronizePdu {
+            message_type: SYNCMSGTYPE_SYNC,
+            target_user: CONFIRM_ACTIVE_ORIGINATOR_ID,
+        };
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::Synchronize, &justrdp_core::encode_vec(&sync).unwrap(),
+        );
+        acc.step(&bytes, &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        for action in [ControlAction::Cooperate, ControlAction::RequestControl] {
+            let ctrl = ControlPdu { action, grant_id: 0, control_id: 0 };
+            let bytes = build_share_data_pdu_bytes(
+                user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+                ShareDataPduType::Control, &justrdp_core::encode_vec(&ctrl).unwrap(),
+            );
+            acc.step(&bytes, &mut out).unwrap();
+            acc.step(&[], &mut out).unwrap();
+        }
+
+        // Hammer with PersistentKeyList PDUs. The cap is 64.
+        let pkl_bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::PersistentKeyList, &alloc::vec![0u8; 24],
+        );
+        for _ in 0..64 {
+            acc.step(&pkl_bytes, &mut out).unwrap();
+        }
+        // The 65th PKL triggers the cap.
+        let err = acc.step(&pkl_bytes, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("PersistentKeyList"));
     }
 
     #[test]

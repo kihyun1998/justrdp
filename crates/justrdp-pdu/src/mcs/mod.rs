@@ -81,6 +81,27 @@ impl DomainParameters {
         }
     }
 
+    /// Negotiated parameters the server returns in `ConnectResponse`.
+    ///
+    /// Per T.125 §8.2, this field reflects the **agreed-upon** values
+    /// after parameter negotiation -- it must fall within the client's
+    /// `[minimum, maximum]` bounds. The Windows RDS-style values below
+    /// (`max_channel_ids = 34`, `max_user_ids = 3`, `max_mcs_pdu_size
+    /// = 65528`) match what mstsc observes during a real RDP session
+    /// and sit inside the defaults we advertise for min/max.
+    pub fn server_default() -> Self {
+        Self {
+            max_channel_ids: 34,
+            max_user_ids: 3,
+            max_token_ids: 0,
+            num_priorities: 1,
+            min_throughput: 0,
+            max_height: 1,
+            max_mcs_pdu_size: 65528,
+            protocol_version: 2,
+        }
+    }
+
     fn content_size(&self) -> usize {
         ber::sizeof_integer(self.max_channel_ids as i64)
             + ber::sizeof_integer(self.max_user_ids as i64)

@@ -2277,14 +2277,14 @@ pub enum ServerAcceptorState {
 
 **구현 항목:**
 
-- [ ] `ServerAcceptor` -- `Sequence` trait 구현
-- [ ] `ServerConfig` -- 서버 설정 (인증서, 암호화, 지원 채널, 코덱 등)
-- [ ] 클라이언트 Negotiate 수신 및 프로토콜 선택
-- [ ] TLS 서버 핸드셰이크
-- [ ] CredSSP 서버 측 (자격증명 수신)
-- [ ] 서버 측 Capability Set 생성
-- [ ] 채널 ID 할당
-- [ ] `DrdynvcServer` -- 서버 측 DVC 호스트 (Phase 4에서 이동)
+- [x] `ServerAcceptor` -- `Sequence` trait 구현
+- [x] `AcceptorConfig` -- 서버 설정 (지원 프로토콜/채널/멀티트랜스포트 플래그 등; 인증서/코덱은 caller 책임)
+- [x] 클라이언트 Negotiate 수신 및 프로토콜 선택 (MS-RDPBCGR §2.2.1.1)
+- [x] TLS 서버 핸드셰이크 (외부 위임 훅: `TlsAccept` 상태)
+- [x] CredSSP 서버 측 (외부 위임 훅: `CredsspAccept` 상태 -- 실제 SPNEGO/NTLM은 caller가 수행)
+- [x] 서버 측 Capability Set 생성 (General/Bitmap/Order/Pointer/Input/VirtualChannel/Share + LargePointer/MultifragmentUpdate/SurfaceCommands)
+- [x] 채널 ID 할당 (IO=0x03EB, 정적 VC 순차, 메시지 채널, 유저 채널 floor 0x03EF)
+- [x] `DrdynvcServer` -- 서버 측 DVC 호스트 (capability negotiation + create/close + data I/O + 모노토닉성 강제)
 
 ### 11.2 `justrdp-server` -- Extensible Server Skeleton
 

@@ -28,9 +28,13 @@ pub mod pdu;
 mod reassembly;
 #[cfg(feature = "alloc")]
 mod drdynvc;
+#[cfg(feature = "alloc")]
+mod drdynvc_server;
 
 #[cfg(feature = "alloc")]
 pub use drdynvc::DrdynvcClient;
+#[cfg(feature = "alloc")]
+pub use drdynvc_server::DrdynvcServer;
 
 #[cfg(feature = "alloc")]
 use alloc::string::String;
