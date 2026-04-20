@@ -94,7 +94,20 @@ impl ServerAcceptorState {
         }
     }
 
-    /// Whether this is a send state (acceptor produces output, no input needed).
+    /// Whether this state advances without consuming input from the wire.
+    ///
+    /// Returns `true` for two distinct kinds of state:
+    /// - True send states (`SendConnectionConfirm`, `SendMcsConnectResponse`,
+    ///   `SendLicense`, `SendDemandActive`) where `step()` produces output
+    ///   bytes the caller must flush.
+    /// - External-delegation states (`TlsAccept`, `CredsspAccept`) where
+    ///   `step()` is a no-op transition and produces zero bytes; the
+    ///   caller has already done all I/O outside the state machine.
+    ///
+    /// Both kinds are grouped together because the driver loop treats
+    /// them identically: pass `&[]` as input and call `step()`. To check
+    /// whether output is expected, inspect the `Written.size` returned
+    /// by `step()` rather than relying on this predicate.
     pub fn is_send_state(&self) -> bool {
         matches!(
             self,

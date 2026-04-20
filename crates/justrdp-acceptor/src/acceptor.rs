@@ -382,6 +382,95 @@ impl ServerAcceptor {
         NegotiationResponseFlags::from_bits(bits)
     }
 
+    // ── Phase 2: TLS Accept (external) ──────────────────────────────────
+
+    /// Caller has finished the TLS server handshake. Transition to the
+    /// next phase based on the previously selected security protocol.
+    ///
+    /// MS-RDPBCGR §5.4.5 — after Enhanced RDP Security has been
+    /// established the next PDU on the wire is either a CredSSP TsRequest
+    /// (HYBRID/HYBRID_EX) or directly the MCS Connect Initial
+    /// (SSL/RDSTLS/AAD).
+    fn step_tls_accept(&mut self) -> AcceptorResult<Written> {
+        if self.selected_protocol == SecurityProtocol::RDP {
+            // Defensive: Standard RDP Security must never reach this state
+            // -- `step_send_connection_confirm` already routes RDP
+            // straight to `WaitMcsConnectInitial`. Reaching here means a
+            // caller has manipulated the state machine.
+            return Err(AcceptorError::general(
+                "TlsAccept reached with PROTOCOL_RDP -- caller corrupted state",
+            ));
+        }
+        if self.selected_protocol.contains(SecurityProtocol::HYBRID)
+            || self.selected_protocol.contains(SecurityProtocol::HYBRID_EX)
+        {
+            self.state = ServerAcceptorState::CredsspAccept;
+        } else {
+            // Plain SSL, RDSTLS, or AAD -- the server jumps directly to
+            // MCS. RDSTLS / AAD-specific server-side exchanges (if any
+            // are added in later commits) should slot in before this
+            // transition.
+            self.state = ServerAcceptorState::WaitMcsConnectInitial;
+        }
+        Ok(Written::nothing())
+    }
+
+    // ── Phase 3: CredSSP Accept (external) ──────────────────────────────
+
+    /// Caller has finished the server-side CredSSP exchange (NEGOTIATE /
+    /// CHALLENGE / AUTHENTICATE / TSCredentials). For HYBRID_EX the
+    /// caller is also responsible for emitting the 4-byte
+    /// EarlyUserAuthResult (MS-RDPBCGR §5.4.2.2) on the TLS stream
+    /// **before** invoking `step()` -- this state machine does not
+    /// produce that byte sequence.
+    ///
+    /// MS-CSSP §3.1.5 leaves the actual SPNEGO/NTLM exchange to the
+    /// caller's `ServerCredsspSequence` (mirrors the way the client
+    /// `Connector` defers to `CredsspSequence`). The state machine just
+    /// records that auth completed and moves on.
+    fn step_credssp_accept(&mut self) -> AcceptorResult<Written> {
+        self.state = ServerAcceptorState::WaitMcsConnectInitial;
+        Ok(Written::nothing())
+    }
+
+    // ── External-failure helpers ────────────────────────────────────────
+
+    /// Caller signals that the external TLS handshake failed. The
+    /// acceptor transitions to `NegotiationFailed`; no Connection
+    /// Confirm is emitted (one was already sent and the failure is
+    /// purely TLS-layer). The caller must close the underlying TCP
+    /// connection.
+    pub fn notify_tls_failed(&mut self) -> AcceptorResult<()> {
+        match self.state {
+            ServerAcceptorState::TlsAccept => {
+                self.state = ServerAcceptorState::NegotiationFailed;
+                Ok(())
+            }
+            _ => Err(AcceptorError {
+                kind: AcceptorErrorKind::InvalidState,
+            }),
+        }
+    }
+
+    /// Caller signals that the external server-side CredSSP exchange
+    /// failed (auth rejected, pubKeyAuth verification failed, etc.).
+    /// The acceptor transitions to `NegotiationFailed`. The caller is
+    /// expected to have already emitted any spec-mandated error PDU
+    /// (e.g. TsRequest with `errorCode`, EarlyUserAuthResult =
+    /// `ACCESS_DENIED` for HYBRID_EX) on the TLS stream before invoking
+    /// this helper.
+    pub fn notify_credssp_failed(&mut self) -> AcceptorResult<()> {
+        match self.state {
+            ServerAcceptorState::CredsspAccept => {
+                self.state = ServerAcceptorState::NegotiationFailed;
+                Ok(())
+            }
+            _ => Err(AcceptorError {
+                kind: AcceptorErrorKind::InvalidState,
+            }),
+        }
+    }
+
     /// Build the final [`AcceptanceResult`]. Phase 1 stops before the full
     /// connection completes; this method exists for tests and for the
     /// completion path that later phases (Commits 4 / 6 / 7) will wire up.
@@ -440,10 +529,10 @@ impl Sequence for ServerAcceptor {
                 self.step_wait_connection_request(input)
             }
             ServerAcceptorState::SendConnectionConfirm => self.step_send_connection_confirm(output),
+            ServerAcceptorState::TlsAccept => self.step_tls_accept(),
+            ServerAcceptorState::CredsspAccept => self.step_credssp_accept(),
             // Later commits will fill these in.
-            ServerAcceptorState::TlsAccept
-            | ServerAcceptorState::CredsspAccept
-            | ServerAcceptorState::WaitMcsConnectInitial
+            ServerAcceptorState::WaitMcsConnectInitial
             | ServerAcceptorState::SendMcsConnectResponse
             | ServerAcceptorState::ChannelConnection
             | ServerAcceptorState::WaitClientInfo
@@ -906,6 +995,125 @@ mod tests {
         assert_eq!(out.len(), 19);
         assert_eq!(out.as_slice()[5], 0xd0); // X.224 CC code
         assert_eq!(out.as_slice()[11], 0x03); // RDP_NEG_FAILURE type
+    }
+
+    /// Drive the acceptor from `WaitConnectionRequest` through the CC
+    /// using a CR that requests `client_request_proto`. Returns the
+    /// acceptor in whatever state it lands in after `SendConnectionConfirm`.
+    fn drive_through_cc(client_request_proto: SecurityProtocol) -> ServerAcceptor {
+        let nego = NegotiationRequest::new(client_request_proto);
+        let cr = ConnectionRequest::new(Some(nego));
+        let cr_bytes = build_cr_bytes(&cr);
+        let mut acc = ServerAcceptor::new(AcceptorConfig::default());
+        let mut out = WriteBuf::new();
+        acc.step(&cr_bytes, &mut out).unwrap();
+        let _ = acc.step(&[], &mut out).unwrap();
+        acc
+    }
+
+    #[test]
+    fn tls_accept_with_hybrid_transitions_to_credssp_accept() {
+        let mut acc = drive_through_cc(SecurityProtocol::HYBRID);
+        assert_eq!(acc.state(), &ServerAcceptorState::TlsAccept);
+        let mut out = WriteBuf::new();
+        let written = acc.step(&[], &mut out).unwrap();
+        assert_eq!(written.size, 0);
+        assert_eq!(acc.state(), &ServerAcceptorState::CredsspAccept);
+    }
+
+    #[test]
+    fn tls_accept_with_hybrid_ex_transitions_to_credssp_accept() {
+        let mut acc =
+            drive_through_cc(SecurityProtocol::SSL.union(SecurityProtocol::HYBRID_EX));
+        assert_eq!(acc.state(), &ServerAcceptorState::TlsAccept);
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::CredsspAccept);
+    }
+
+    #[test]
+    fn tls_accept_with_ssl_skips_credssp() {
+        // Server config that does not advertise HYBRID/HYBRID_EX so the
+        // client's SSL-only request is honoured as plain SSL.
+        let cfg = AcceptorConfig::builder()
+            .supported_protocols(SecurityProtocol::SSL)
+            .build();
+        let nego = NegotiationRequest::new(SecurityProtocol::SSL);
+        let cr = ConnectionRequest::new(Some(nego));
+        let cr_bytes = build_cr_bytes(&cr);
+        let mut acc = ServerAcceptor::new(cfg);
+        let mut out = WriteBuf::new();
+        acc.step(&cr_bytes, &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::TlsAccept);
+        acc.step(&[], &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitMcsConnectInitial);
+    }
+
+    #[test]
+    fn credssp_accept_transitions_to_wait_mcs_connect_initial() {
+        let mut acc = drive_through_cc(SecurityProtocol::HYBRID);
+        let mut out = WriteBuf::new();
+        // TlsAccept -> CredsspAccept
+        acc.step(&[], &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::CredsspAccept);
+        // CredsspAccept -> WaitMcsConnectInitial
+        let written = acc.step(&[], &mut out).unwrap();
+        assert_eq!(written.size, 0);
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitMcsConnectInitial);
+    }
+
+    #[test]
+    fn notify_tls_failed_transitions_to_negotiation_failed() {
+        let mut acc = drive_through_cc(SecurityProtocol::HYBRID);
+        assert_eq!(acc.state(), &ServerAcceptorState::TlsAccept);
+        acc.notify_tls_failed().unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::NegotiationFailed);
+    }
+
+    #[test]
+    fn notify_credssp_failed_transitions_to_negotiation_failed() {
+        let mut acc = drive_through_cc(SecurityProtocol::HYBRID);
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap(); // -> CredsspAccept
+        acc.notify_credssp_failed().unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::NegotiationFailed);
+    }
+
+    #[test]
+    fn notify_tls_failed_in_wrong_state_errors() {
+        // Fresh acceptor in WaitConnectionRequest; calling notify_tls_failed
+        // is a programming error.
+        let mut acc = ServerAcceptor::new(AcceptorConfig::default());
+        let err = acc.notify_tls_failed().unwrap_err();
+        assert!(matches!(err.kind, AcceptorErrorKind::InvalidState));
+    }
+
+    #[test]
+    fn notify_credssp_failed_in_wrong_state_errors() {
+        let mut acc = ServerAcceptor::new(AcceptorConfig::default());
+        let err = acc.notify_credssp_failed().unwrap_err();
+        assert!(matches!(err.kind, AcceptorErrorKind::InvalidState));
+    }
+
+    #[test]
+    fn notify_credssp_failed_called_in_tls_accept_state_errors() {
+        // Cross-state guard: must not silently accept the wrong helper.
+        let mut acc = drive_through_cc(SecurityProtocol::HYBRID);
+        assert_eq!(acc.state(), &ServerAcceptorState::TlsAccept);
+        let err = acc.notify_credssp_failed().unwrap_err();
+        assert!(matches!(err.kind, AcceptorErrorKind::InvalidState));
+        assert_eq!(acc.state(), &ServerAcceptorState::TlsAccept);
+    }
+
+    #[test]
+    fn notify_tls_failed_called_in_credssp_accept_state_errors() {
+        let mut acc = drive_through_cc(SecurityProtocol::HYBRID);
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap(); // -> CredsspAccept
+        let err = acc.notify_tls_failed().unwrap_err();
+        assert!(matches!(err.kind, AcceptorErrorKind::InvalidState));
+        assert_eq!(acc.state(), &ServerAcceptorState::CredsspAccept);
     }
 
     #[test]
