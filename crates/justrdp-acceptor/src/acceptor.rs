@@ -17,8 +17,12 @@ use justrdp_pdu::rdp::capabilities::{
     PointerCapability, ShareCapability, SurfaceCommandsCapability, VirtualChannelCapability,
 };
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
+use justrdp_pdu::rdp::finalization::{
+    ControlAction, ControlPdu, FontListPdu, FontMapPdu, SynchronizePdu, SYNCMSGTYPE_SYNC,
+};
 use justrdp_pdu::rdp::headers::{
-    ShareControlHeader, ShareControlPduType, SHARE_CONTROL_HEADER_SIZE,
+    ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
+    SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE,
 };
 use justrdp_pdu::rdp::licensing::LicenseErrorMessage;
 use justrdp_pdu::tpkt::{TpktHeader, TpktHint, TPKT_HEADER_SIZE};
@@ -108,6 +112,40 @@ pub struct ServerAcceptor {
     /// Available once the acceptor has advanced past
     /// `WaitConfirmActive`.
     client_capabilities: Vec<CapabilitySet>,
+
+    // ── Phase 12: Connection Finalization ──
+    /// Sub-phase within `ConnectionFinalization`. Mirrors the way
+    /// `ChannelConnection` uses `ChannelPhase` to sequence the
+    /// alternating wait/send pattern without multiplying state-enum
+    /// variants.
+    finalization_phase: FinalizationPhase,
+}
+
+/// Sub-phase within the `ConnectionFinalization` state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizationPhase {
+    /// Waiting for the client's Synchronize PDU.
+    WaitClientSync,
+    /// Pending server Synchronize PDU to send back.
+    SendServerSync,
+    /// Waiting for the client's Control PDU (action = Cooperate).
+    WaitClientCooperate,
+    /// Pending server Control PDU (action = Cooperate) to send back.
+    SendServerCooperate,
+    /// Waiting for the client's Control PDU (action = RequestControl).
+    /// PersistentKeyList may also arrive between RequestControl and
+    /// FontList -- it's silently consumed when seen.
+    WaitClientRequestControl,
+    /// Pending server Control PDU (action = GrantedControl).
+    SendServerGrantedControl,
+    /// Waiting for the client's FontList PDU. Optional PersistentKeyList
+    /// PDUs are accepted (no response required).
+    WaitClientFontList,
+    /// Pending server FontMap PDU.
+    SendServerFontMap,
+    /// Finalization complete; the next `step()` transitions to
+    /// `Accepted`.
+    Done,
 }
 
 /// Spec-mandated `originatorID` value the client MUST place in
@@ -164,6 +202,7 @@ impl ServerAcceptor {
             client_info: None,
             share_id: 0x0001_03EA,
             client_capabilities: Vec::new(),
+            finalization_phase: FinalizationPhase::WaitClientSync,
         }
     }
 
@@ -1203,6 +1242,283 @@ impl ServerAcceptor {
         Ok(Written::nothing())
     }
 
+    // ── Phase 12: Connection Finalization ──────────────────────────────
+
+    /// Decode the outer envelope (TPKT + X.224 DT + MCS SDR) and return
+    /// the inner ShareControl bytes. Reused by all finalization
+    /// wait-states.
+    fn decode_finalization_envelope<'a>(
+        &self,
+        input: &'a [u8],
+    ) -> AcceptorResult<&'a [u8]> {
+        let mut cursor = ReadCursor::new(input);
+        let _tpkt = TpktHeader::decode(&mut cursor)?;
+        let _dt = DataTransfer::decode(&mut cursor)?;
+        let sdr = SendDataRequest::decode(&mut cursor)?;
+        let alloc = self
+            .channel_alloc
+            .as_ref()
+            .ok_or_else(|| AcceptorError::general("finalization PDU before MCS Connect"))?;
+        if sdr.channel_id != alloc.io_channel_id {
+            return Err(AcceptorError::general(
+                "finalization PDU must arrive on the I/O channel",
+            ));
+        }
+        if sdr.initiator != self.user_channel_id {
+            return Err(AcceptorError::general(
+                "finalization PDU initiator does not match the assigned user channel",
+            ));
+        }
+        // SAFETY: SDR.user_data is borrowed from `input`; the lifetime
+        // is propagated through the ReadCursor.
+        Ok(sdr.user_data)
+    }
+
+    /// Decode a ShareData PDU body from the SDR `user_data`. Returns
+    /// `(pdu_type2, body_bytes)`. Validates ShareControl pdu_type ==
+    /// Data and ShareData.share_id == self.share_id.
+    fn decode_share_data<'a>(
+        &self,
+        sdr_user_data: &'a [u8],
+    ) -> AcceptorResult<(ShareDataPduType, &'a [u8])> {
+        let mut cursor = ReadCursor::new(sdr_user_data);
+        let sc_hdr = ShareControlHeader::decode(&mut cursor)?;
+        if sc_hdr.pdu_type != ShareControlPduType::Data {
+            return Err(AcceptorError::general(
+                "expected ShareControl Data PDU during finalization",
+            ));
+        }
+        let sd_hdr = ShareDataHeader::decode(&mut cursor)?;
+        if sd_hdr.share_id != self.share_id {
+            return Err(AcceptorError::general(
+                "ShareData.shareId does not match the negotiated value",
+            ));
+        }
+        Ok((sd_hdr.pdu_type2, cursor.peek_remaining()))
+    }
+
+    /// Wrap an inner PDU body in ShareData + ShareControl + MCS SDI +
+    /// X.224 DT + TPKT. Used by all finalization send-states.
+    fn write_share_data_pdu(
+        &self,
+        pdu_type2: ShareDataPduType,
+        inner: &[u8],
+        output: &mut WriteBuf,
+    ) -> AcceptorResult<usize> {
+        let alloc = self
+            .channel_alloc
+            .as_ref()
+            .ok_or_else(|| AcceptorError::general("send finalization PDU before MCS Connect"))?;
+        let io_channel_id = alloc.io_channel_id;
+
+        let sd_total = SHARE_DATA_HEADER_SIZE + inner.len();
+        let sc_total = SHARE_CONTROL_HEADER_SIZE + sd_total;
+        if sc_total > u16::MAX as usize {
+            return Err(AcceptorError::general(
+                "finalization ShareControl payload exceeds u16",
+            ));
+        }
+        if inner.len() > u16::MAX as usize {
+            return Err(AcceptorError::general(
+                "finalization inner body exceeds u16 uncompressedLength",
+            ));
+        }
+
+        let mut sc_payload = alloc::vec![0u8; sc_total];
+        {
+            let mut cursor = WriteCursor::new(&mut sc_payload);
+            ShareControlHeader {
+                total_length: sc_total as u16,
+                pdu_type: ShareControlPduType::Data,
+                pdu_source: self.user_channel_id,
+            }
+            .encode(&mut cursor)?;
+            ShareDataHeader {
+                share_id: self.share_id,
+                stream_id: 1, // STREAM_LOW
+                // MS-RDPBCGR §2.2.8.1.1.1.2: uncompressedLength is the
+                // PDU data length **NOT including the ShareDataHeader
+                // itself**. The connector's `wrap_share_data` uses the
+                // same convention.
+                uncompressed_length: inner.len() as u16,
+                pdu_type2,
+                compressed_type: 0,
+                compressed_length: 0,
+            }
+            .encode(&mut cursor)?;
+            cursor.write_slice(inner, "finalization::body")?;
+        }
+
+        let sdi = SendDataIndication {
+            initiator: self.user_channel_id,
+            channel_id: io_channel_id,
+            user_data: &sc_payload,
+        };
+        let inner_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let total = TPKT_HEADER_SIZE + inner_size;
+        output.resize(total);
+        let mut cursor = WriteCursor::new(output.as_mut_slice());
+        TpktHeader::try_for_payload(inner_size)?.encode(&mut cursor)?;
+        DataTransfer.encode(&mut cursor)?;
+        sdi.encode(&mut cursor)?;
+        Ok(total)
+    }
+
+    fn step_connection_finalization(
+        &mut self,
+        input: &[u8],
+        output: &mut WriteBuf,
+    ) -> AcceptorResult<Written> {
+        match self.finalization_phase {
+            FinalizationPhase::WaitClientSync => self.fin_wait_client_sync(input),
+            FinalizationPhase::SendServerSync => self.fin_send_server_sync(output),
+            FinalizationPhase::WaitClientCooperate => self.fin_wait_client_cooperate(input),
+            FinalizationPhase::SendServerCooperate => self.fin_send_server_cooperate(output),
+            FinalizationPhase::WaitClientRequestControl => {
+                self.fin_wait_client_request_control(input)
+            }
+            FinalizationPhase::SendServerGrantedControl => {
+                self.fin_send_server_granted_control(output)
+            }
+            FinalizationPhase::WaitClientFontList => self.fin_wait_client_font_list(input),
+            FinalizationPhase::SendServerFontMap => self.fin_send_server_font_map(output),
+            FinalizationPhase::Done => {
+                let result = self.make_acceptance_result();
+                self.state = ServerAcceptorState::Accepted { result };
+                Ok(Written::nothing())
+            }
+        }
+    }
+
+    fn fin_wait_client_sync(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let user_data = self.decode_finalization_envelope(input)?;
+        let (pdu_type2, body) = self.decode_share_data(user_data)?;
+        if pdu_type2 != ShareDataPduType::Synchronize {
+            return Err(AcceptorError::general(
+                "expected Synchronize PDU as first finalization message",
+            ));
+        }
+        let sync = SynchronizePdu::decode(&mut ReadCursor::new(body))?;
+        // MS-RDPBCGR §2.2.1.14: messageType MUST be SYNCMSGTYPE_SYNC (1).
+        if sync.message_type != SYNCMSGTYPE_SYNC {
+            return Err(AcceptorError::general(
+                "client Synchronize messageType is not SYNCMSGTYPE_SYNC",
+            ));
+        }
+        self.finalization_phase = FinalizationPhase::SendServerSync;
+        Ok(Written::nothing())
+    }
+
+    fn fin_send_server_sync(&mut self, output: &mut WriteBuf) -> AcceptorResult<Written> {
+        // Per MS-RDPBCGR §2.2.1.19: server Synchronize targets the user
+        // channel ID assigned to the client.
+        let sync = SynchronizePdu {
+            message_type: SYNCMSGTYPE_SYNC,
+            target_user: self.user_channel_id,
+        };
+        let body = justrdp_core::encode_vec(&sync)?;
+        let written = self.write_share_data_pdu(ShareDataPduType::Synchronize, &body, output)?;
+        self.finalization_phase = FinalizationPhase::WaitClientCooperate;
+        Ok(Written::new(written))
+    }
+
+    fn fin_wait_client_cooperate(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let user_data = self.decode_finalization_envelope(input)?;
+        let (pdu_type2, body) = self.decode_share_data(user_data)?;
+        if pdu_type2 != ShareDataPduType::Control {
+            return Err(AcceptorError::general(
+                "expected Control PDU after Synchronize",
+            ));
+        }
+        let ctrl = ControlPdu::decode(&mut ReadCursor::new(body))?;
+        if ctrl.action != ControlAction::Cooperate {
+            return Err(AcceptorError::general(
+                "expected Control PDU with action=Cooperate",
+            ));
+        }
+        self.finalization_phase = FinalizationPhase::SendServerCooperate;
+        Ok(Written::nothing())
+    }
+
+    fn fin_send_server_cooperate(&mut self, output: &mut WriteBuf) -> AcceptorResult<Written> {
+        // MS-RDPBCGR §2.2.1.20.1: Cooperate has grantId=0, controlId=0.
+        let ctrl = ControlPdu {
+            action: ControlAction::Cooperate,
+            grant_id: 0,
+            control_id: 0,
+        };
+        let body = justrdp_core::encode_vec(&ctrl)?;
+        let written = self.write_share_data_pdu(ShareDataPduType::Control, &body, output)?;
+        self.finalization_phase = FinalizationPhase::WaitClientRequestControl;
+        Ok(Written::new(written))
+    }
+
+    fn fin_wait_client_request_control(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let user_data = self.decode_finalization_envelope(input)?;
+        let (pdu_type2, body) = self.decode_share_data(user_data)?;
+        if pdu_type2 != ShareDataPduType::Control {
+            return Err(AcceptorError::general(
+                "expected Control PDU (RequestControl) after server Cooperate",
+            ));
+        }
+        let ctrl = ControlPdu::decode(&mut ReadCursor::new(body))?;
+        if ctrl.action != ControlAction::RequestControl {
+            return Err(AcceptorError::general(
+                "expected Control PDU with action=RequestControl",
+            ));
+        }
+        self.finalization_phase = FinalizationPhase::SendServerGrantedControl;
+        Ok(Written::nothing())
+    }
+
+    fn fin_send_server_granted_control(
+        &mut self,
+        output: &mut WriteBuf,
+    ) -> AcceptorResult<Written> {
+        // MS-RDPBCGR §2.2.1.20.3: GrantedControl has grantId =
+        // user_channel_id, controlId = 0x03EA (server).
+        let ctrl = ControlPdu {
+            action: ControlAction::GrantedControl,
+            grant_id: self.user_channel_id,
+            control_id: CONFIRM_ACTIVE_ORIGINATOR_ID as u32,
+        };
+        let body = justrdp_core::encode_vec(&ctrl)?;
+        let written = self.write_share_data_pdu(ShareDataPduType::Control, &body, output)?;
+        self.finalization_phase = FinalizationPhase::WaitClientFontList;
+        Ok(Written::new(written))
+    }
+
+    fn fin_wait_client_font_list(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        let user_data = self.decode_finalization_envelope(input)?;
+        let (pdu_type2, body) = self.decode_share_data(user_data)?;
+        match pdu_type2 {
+            ShareDataPduType::PersistentKeyList => {
+                // Optional client-side cache hint. No response required.
+                // Stay in this sub-phase to wait for the FontList that
+                // follows.
+                Ok(Written::nothing())
+            }
+            ShareDataPduType::FontList => {
+                let _font_list = FontListPdu::decode(&mut ReadCursor::new(body))?;
+                self.finalization_phase = FinalizationPhase::SendServerFontMap;
+                Ok(Written::nothing())
+            }
+            _ => Err(AcceptorError::general(
+                "expected FontList or PersistentKeyList PDU during finalization",
+            )),
+        }
+    }
+
+    fn fin_send_server_font_map(&mut self, output: &mut WriteBuf) -> AcceptorResult<Written> {
+        // FontMap has the same structure as FontList per
+        // MS-RDPBCGR §2.2.1.22.
+        let font_map = FontMapPdu::default_request();
+        let body = justrdp_core::encode_vec(&font_map)?;
+        let written = self.write_share_data_pdu(ShareDataPduType::FontMap, &body, output)?;
+        self.finalization_phase = FinalizationPhase::Done;
+        Ok(Written::new(written))
+    }
+
     // ── External-failure helpers ────────────────────────────────────────
 
     /// Caller signals that the external TLS handshake failed. The
@@ -1244,7 +1560,6 @@ impl ServerAcceptor {
     /// Build the final [`AcceptanceResult`]. Phase 1 stops before the full
     /// connection completes; this method exists for tests and for the
     /// completion path that later phases (Commits 4 / 6 / 7) will wire up.
-    #[allow(dead_code)] // Wired up in later commits.
     pub(crate) fn make_acceptance_result(&self) -> AcceptanceResult {
         let info = self
             .client_request
@@ -1257,6 +1572,8 @@ impl ServerAcceptor {
             result.io_channel_id = alloc.io_channel_id;
             result.channel_ids = alloc.static_channels.clone();
         }
+        result.user_channel_id = self.user_channel_id;
+        result.share_id = self.share_id;
         result
     }
 }
@@ -1299,7 +1616,17 @@ impl Sequence for ServerAcceptor {
             ServerAcceptorState::SendLicense => None,
             ServerAcceptorState::SendDemandActive => None,
             ServerAcceptorState::WaitConfirmActive => Some(&TPKT_HINT),
-            ServerAcceptorState::ConnectionFinalization => Some(&TPKT_HINT),
+            ServerAcceptorState::ConnectionFinalization => match self.finalization_phase {
+                FinalizationPhase::WaitClientSync
+                | FinalizationPhase::WaitClientCooperate
+                | FinalizationPhase::WaitClientRequestControl
+                | FinalizationPhase::WaitClientFontList => Some(&TPKT_HINT),
+                FinalizationPhase::SendServerSync
+                | FinalizationPhase::SendServerCooperate
+                | FinalizationPhase::SendServerGrantedControl
+                | FinalizationPhase::SendServerFontMap
+                | FinalizationPhase::Done => None,
+            },
             ServerAcceptorState::Accepted { .. } | ServerAcceptorState::NegotiationFailed => None,
         }
     }
@@ -1325,10 +1652,9 @@ impl Sequence for ServerAcceptor {
             ServerAcceptorState::SendLicense => self.step_send_license(output),
             ServerAcceptorState::SendDemandActive => self.step_send_demand_active(output),
             ServerAcceptorState::WaitConfirmActive => self.step_wait_confirm_active(input),
-            // Later commits will fill these in.
-            ServerAcceptorState::ConnectionFinalization => Err(AcceptorError::general(
-                "state not yet implemented in this commit",
-            )),
+            ServerAcceptorState::ConnectionFinalization => {
+                self.step_connection_finalization(input, output)
+            }
             ServerAcceptorState::Accepted { .. } | ServerAcceptorState::NegotiationFailed => {
                 Err(AcceptorError {
                     kind: AcceptorErrorKind::InvalidState,
@@ -2775,6 +3101,261 @@ mod tests {
 
         let err = acc.step(&buf, &mut out).unwrap_err();
         assert!(alloc::format!("{err}").contains("ConfirmActivePdu"));
+    }
+
+    /// Drive an acceptor to ConnectionFinalization (post-ConfirmActive).
+    fn drive_to_connection_finalization() -> ServerAcceptor {
+        let mut acc = drive_to_send_demand_active();
+        let mut out = WriteBuf::new();
+        acc.step(&[], &mut out).unwrap(); // emit DemandActive
+        let user_id = acc.user_channel_id();
+        let share_id = acc.share_id();
+        let confirm_bytes = build_confirm_active_bytes(user_id, crate::mcs::IO_CHANNEL_ID, share_id);
+        acc.step(&confirm_bytes, &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::ConnectionFinalization);
+        acc
+    }
+
+    /// Wrap a ShareData PDU body in TPKT + X.224 DT + MCS SDR +
+    /// ShareControl(Data) + ShareData header. Used to feed the
+    /// finalization wait-states.
+    fn build_share_data_pdu_bytes(
+        initiator: u16,
+        io_channel_id: u16,
+        share_id: u32,
+        pdu_type2: ShareDataPduType,
+        body: &[u8],
+    ) -> alloc::vec::Vec<u8> {
+        let sd_total = SHARE_DATA_HEADER_SIZE + body.len();
+        let sc_total = SHARE_CONTROL_HEADER_SIZE + sd_total;
+        let mut sc = alloc::vec![0u8; sc_total];
+        {
+            let mut c = WriteCursor::new(&mut sc);
+            ShareControlHeader {
+                total_length: sc_total as u16,
+                pdu_type: ShareControlPduType::Data,
+                pdu_source: initiator,
+            }
+            .encode(&mut c)
+            .unwrap();
+            ShareDataHeader {
+                share_id,
+                stream_id: 1,
+                uncompressed_length: body.len() as u16,
+                pdu_type2,
+                compressed_type: 0,
+                compressed_length: 0,
+            }
+            .encode(&mut c)
+            .unwrap();
+            c.write_slice(body, "fin::body").unwrap();
+        }
+        let sdr = SendDataRequest {
+            initiator,
+            channel_id: io_channel_id,
+            user_data: &sc,
+        };
+        let inner = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+        let total_pkt = TPKT_HEADER_SIZE + inner;
+        let mut buf = alloc::vec![0u8; total_pkt];
+        let mut c = WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(inner)
+            .unwrap()
+            .encode(&mut c)
+            .unwrap();
+        DataTransfer.encode(&mut c).unwrap();
+        sdr.encode(&mut c).unwrap();
+        buf
+    }
+
+    /// Decode the next server PDU emitted by the acceptor and return
+    /// its `(pdu_type2, body)`.
+    fn decode_server_share_data(out: &WriteBuf, written: usize) -> (ShareDataPduType, alloc::vec::Vec<u8>) {
+        let mut c = ReadCursor::new(&out.as_slice()[..written]);
+        let _ = TpktHeader::decode(&mut c).unwrap();
+        let _ = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let _sc = ShareControlHeader::decode(&mut inner).unwrap();
+        let sd = ShareDataHeader::decode(&mut inner).unwrap();
+        let body = inner.peek_remaining().to_vec();
+        (sd.pdu_type2, body)
+    }
+
+    #[test]
+    fn finalization_full_handshake_reaches_accepted() {
+        let mut acc = drive_to_connection_finalization();
+        let user_id = acc.user_channel_id();
+        let share_id = acc.share_id();
+        let mut out = WriteBuf::new();
+
+        // 1) Client Sync -> server Sync
+        let sync = SynchronizePdu {
+            message_type: SYNCMSGTYPE_SYNC,
+            target_user: CONFIRM_ACTIVE_ORIGINATOR_ID,
+        };
+        let body = justrdp_core::encode_vec(&sync).unwrap();
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::Synchronize, &body,
+        );
+        acc.step(&bytes, &mut out).unwrap();
+        let written = acc.step(&[], &mut out).unwrap();
+        let (typ, server_body) = decode_server_share_data(&out, written.size);
+        assert_eq!(typ, ShareDataPduType::Synchronize);
+        let server_sync = SynchronizePdu::decode(&mut ReadCursor::new(&server_body)).unwrap();
+        assert_eq!(server_sync.target_user, user_id);
+        assert_eq!(server_sync.message_type, SYNCMSGTYPE_SYNC);
+
+        // 2) Client Cooperate -> server Cooperate
+        let coop = ControlPdu {
+            action: ControlAction::Cooperate,
+            grant_id: 0,
+            control_id: 0,
+        };
+        let body = justrdp_core::encode_vec(&coop).unwrap();
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::Control, &body,
+        );
+        acc.step(&bytes, &mut out).unwrap();
+        let written = acc.step(&[], &mut out).unwrap();
+        let (typ, server_body) = decode_server_share_data(&out, written.size);
+        assert_eq!(typ, ShareDataPduType::Control);
+        let server_ctrl = ControlPdu::decode(&mut ReadCursor::new(&server_body)).unwrap();
+        assert_eq!(server_ctrl.action, ControlAction::Cooperate);
+
+        // 3) Client RequestControl -> server GrantedControl
+        let req_ctrl = ControlPdu {
+            action: ControlAction::RequestControl,
+            grant_id: 0,
+            control_id: 0,
+        };
+        let body = justrdp_core::encode_vec(&req_ctrl).unwrap();
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::Control, &body,
+        );
+        acc.step(&bytes, &mut out).unwrap();
+        let written = acc.step(&[], &mut out).unwrap();
+        let (typ, server_body) = decode_server_share_data(&out, written.size);
+        assert_eq!(typ, ShareDataPduType::Control);
+        let granted = ControlPdu::decode(&mut ReadCursor::new(&server_body)).unwrap();
+        assert_eq!(granted.action, ControlAction::GrantedControl);
+        assert_eq!(granted.grant_id, user_id);
+        assert_eq!(granted.control_id, CONFIRM_ACTIVE_ORIGINATOR_ID as u32);
+
+        // 4) Client FontList -> server FontMap
+        let font_list = FontListPdu::default_request();
+        let body = justrdp_core::encode_vec(&font_list).unwrap();
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::FontList, &body,
+        );
+        acc.step(&bytes, &mut out).unwrap();
+        let written = acc.step(&[], &mut out).unwrap();
+        let (typ, _server_body) = decode_server_share_data(&out, written.size);
+        assert_eq!(typ, ShareDataPduType::FontMap);
+
+        // 5) One more step transitions to Accepted with the result.
+        acc.step(&[], &mut out).unwrap();
+        match acc.state() {
+            ServerAcceptorState::Accepted { result } => {
+                assert_eq!(result.selected_protocol, SecurityProtocol::HYBRID);
+                assert_eq!(result.io_channel_id, crate::mcs::IO_CHANNEL_ID);
+                assert_eq!(result.user_channel_id, user_id);
+                assert_eq!(result.share_id, share_id);
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn finalization_accepts_optional_persistent_key_list_before_font_list() {
+        let mut acc = drive_to_connection_finalization();
+        let user_id = acc.user_channel_id();
+        let share_id = acc.share_id();
+        let mut out = WriteBuf::new();
+
+        // Run the first three round-trips (sync / coop / req-control) so
+        // we land in WaitClientFontList.
+        let sync = SynchronizePdu {
+            message_type: SYNCMSGTYPE_SYNC,
+            target_user: CONFIRM_ACTIVE_ORIGINATOR_ID,
+        };
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::Synchronize, &justrdp_core::encode_vec(&sync).unwrap(),
+        );
+        acc.step(&bytes, &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        for action in [ControlAction::Cooperate, ControlAction::RequestControl] {
+            let ctrl = ControlPdu { action, grant_id: 0, control_id: 0 };
+            let bytes = build_share_data_pdu_bytes(
+                user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+                ShareDataPduType::Control, &justrdp_core::encode_vec(&ctrl).unwrap(),
+            );
+            acc.step(&bytes, &mut out).unwrap();
+            acc.step(&[], &mut out).unwrap();
+        }
+
+        // Send a PersistentKeyList (optional, no server response).
+        let pkl_body = alloc::vec![0u8; 24]; // minimum body: 5*u16 + 5*u16 + flags + pad
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::PersistentKeyList, &pkl_body,
+        );
+        let written = acc.step(&bytes, &mut out).unwrap();
+        assert_eq!(written.size, 0);
+        assert_eq!(acc.state(), &ServerAcceptorState::ConnectionFinalization);
+
+        // Then the FontList -> FontMap.
+        let font_list = FontListPdu::default_request();
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::FontList, &justrdp_core::encode_vec(&font_list).unwrap(),
+        );
+        acc.step(&bytes, &mut out).unwrap();
+        let written = acc.step(&[], &mut out).unwrap();
+        let (typ, _) = decode_server_share_data(&out, written.size);
+        assert_eq!(typ, ShareDataPduType::FontMap);
+
+        acc.step(&[], &mut out).unwrap();
+        assert!(matches!(acc.state(), ServerAcceptorState::Accepted { .. }));
+    }
+
+    #[test]
+    fn finalization_rejects_unexpected_pdu_type() {
+        let mut acc = drive_to_connection_finalization();
+        let user_id = acc.user_channel_id();
+        let share_id = acc.share_id();
+        let mut out = WriteBuf::new();
+
+        // Send an Input PDU instead of the expected Synchronize.
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, share_id,
+            ShareDataPduType::Input, &alloc::vec![0u8; 4],
+        );
+        let err = acc.step(&bytes, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("Synchronize"));
+    }
+
+    #[test]
+    fn finalization_rejects_wrong_share_id() {
+        let mut acc = drive_to_connection_finalization();
+        let user_id = acc.user_channel_id();
+        let mut out = WriteBuf::new();
+        let sync = SynchronizePdu {
+            message_type: SYNCMSGTYPE_SYNC,
+            target_user: CONFIRM_ACTIVE_ORIGINATOR_ID,
+        };
+        // Wrong share_id.
+        let bytes = build_share_data_pdu_bytes(
+            user_id, crate::mcs::IO_CHANNEL_ID, 0xDEAD_BEEF,
+            ShareDataPduType::Synchronize, &justrdp_core::encode_vec(&sync).unwrap(),
+        );
+        let err = acc.step(&bytes, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("shareId"));
     }
 
     #[test]
