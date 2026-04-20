@@ -487,13 +487,23 @@ mod tests {
         let mut w = WriteCursor::new(&mut buf);
         pdu.encode(&mut w).unwrap();
 
-        // Verify PFC_OBJECT_UUID got set in the encoded header.
+        // Verify PFC_OBJECT_UUID got set in the encoded header —
+        // `encode` forces the bit whenever `object` is `Some`, even
+        // if the caller cleared it from `pfc_flags`.
         assert_eq!(buf[3] & PFC_OBJECT_UUID, PFC_OBJECT_UUID);
 
         let mut r = ReadCursor::new(&buf);
         let got = RequestPdu::decode(&mut r).unwrap();
         assert_eq!(got.object, pdu.object);
         assert_eq!(got.stub_data, pdu.stub_data);
+        // `decode` strips the `PFC_OBJECT_UUID` bit from the returned
+        // `pfc_flags`: the bit's presence is already conveyed by
+        // `object.is_some()`, and keeping it would desync a
+        // `PartialEq` roundtrip if we re-encode and compare. The
+        // original `pdu.pfc_flags == 0x03` had the bit clear, so
+        // what we decode back should also have it clear.
+        assert_eq!(got.pfc_flags & PFC_OBJECT_UUID, 0);
+        assert_eq!(got.pfc_flags, pdu.pfc_flags & !PFC_OBJECT_UUID);
     }
 
     #[test]

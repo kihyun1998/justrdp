@@ -52,7 +52,7 @@ pub const TSG_PACKET_TYPE_HEADER: u32 = 0x0000_4844; // "HD"
 pub const TSG_PACKET_TYPE_VERSIONCAPS: u32 = 0x0000_5643; // "VC"
 pub const TSG_PACKET_TYPE_QUARCONFIGREQUEST: u32 = 0x0000_5143; // "QC"
 pub const TSG_PACKET_TYPE_QUARREQUEST: u32 = 0x0000_5152; // "QR"
-pub const TSG_PACKET_TYPE_RESPONSE: u32 = 0x0000_5052; // "RP"
+pub const TSG_PACKET_TYPE_RESPONSE: u32 = 0x0000_5052; // "PR" (big-endian byte order: 0x50='P', 0x52='R')
 pub const TSG_PACKET_TYPE_QUARENC_RESPONSE: u32 = 0x0000_4552; // "QE"
 pub const TSG_PACKET_TYPE_CAPS_RESPONSE: u32 = 0x0000_4350; // "CP"
 pub const TSG_PACKET_TYPE_MSGREQUEST_PACKET: u32 = 0x0000_4752; // "GR"
@@ -1378,11 +1378,18 @@ mod tests {
     fn discriminant_constants_match_spec() {
         assert_eq!(TSG_PACKET_TYPE_HEADER, 0x4844);
         assert_eq!(TSG_PACKET_TYPE_VERSIONCAPS, 0x5643);
+        assert_eq!(TSG_PACKET_TYPE_QUARCONFIGREQUEST, 0x5143);
         assert_eq!(TSG_PACKET_TYPE_QUARREQUEST, 0x5152);
         assert_eq!(TSG_PACKET_TYPE_RESPONSE, 0x5052);
         assert_eq!(TSG_PACKET_TYPE_QUARENC_RESPONSE, 0x4552);
         assert_eq!(TSG_PACKET_TYPE_CAPS_RESPONSE, 0x4350);
+        assert_eq!(TSG_PACKET_TYPE_MSGREQUEST_PACKET, 0x4752);
+        assert_eq!(TSG_PACKET_TYPE_MESSAGE_PACKET, 0x4750);
         assert_eq!(TSG_PACKET_TYPE_AUTH, 0x4054);
+        assert_eq!(TSG_PACKET_TYPE_REAUTH, 0x5250);
+        // RESPONSE (0x5052) and REAUTH (0x5250) are byte-swapped
+        // neighbours — verify they did not get transposed.
+        assert_ne!(TSG_PACKET_TYPE_RESPONSE, TSG_PACKET_TYPE_REAUTH);
     }
 
     // ---- messaging types ------------------------------------------

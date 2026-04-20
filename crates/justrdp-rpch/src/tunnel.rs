@@ -441,8 +441,14 @@ mod tests {
         assert_eq!(s.stage(), HandshakeStage::AwaitingConnA3);
     }
 
-    /// Build a synthetic CONN/A3 response (server-originated): an
-    /// RTS PDU with Version + ReceiveWindowSize, no special flags.
+    /// Build a synthetic CONN/A3 response (server-originated).
+    ///
+    /// **Note**: MS-RPCH §2.2.4.3 specifies the canonical CONN/A3
+    /// command list as `ConnectionTimeout, Version`. This helper
+    /// substitutes `Version, ReceiveWindowSize` because the state
+    /// machine does not inspect command content — it matches the
+    /// stage purely on PDU `ptype`/`flags`. Do not reuse this helper
+    /// as a fixture for parsers that care about command identity.
     fn conn_a3_bytes() -> Vec<u8> {
         let pdu = RtsPdu {
             pfc_flags: crate::pdu::PFC_FIRST_FRAG | crate::pdu::PFC_LAST_FRAG,

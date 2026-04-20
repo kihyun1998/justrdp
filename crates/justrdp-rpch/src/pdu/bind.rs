@@ -114,6 +114,16 @@ impl ContextElement {
                 justrdp_core::EncodeError::other("ContextElement", "too many transfer syntaxes"),
             );
         }
+        // C706 §12.6.4.3 declares `p_cont_elem_t.n_transfer_syn` as
+        // `unsigned short` (u16) plus 2 reserved bytes of padding,
+        // yielding the same 4-byte slot we emit here. Windows
+        // `RPCRT4` and every observed client implementation write
+        // the count into the low byte only and leave the other three
+        // bytes at zero, so `u8 + u8 + u16 reserved` is bytewise
+        // indistinguishable on the wire. We keep the u8 form for
+        // symmetry with existing Windows packet captures; the
+        // `n > u8::MAX` guard above preserves the MS-RPCE practical
+        // upper bound of 255 contexts.
         dst.write_u8(n as u8, "n_transfer_syn")?;
         dst.write_u8(0, "reserved")?;
         self.abstract_syntax.encode(dst)?;
@@ -125,6 +135,9 @@ impl ContextElement {
 
     pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         let context_id = src.read_u16_le("p_cont_id")?;
+        // See the matching comment on `encode` — we interpret
+        // C706's `unsigned short n_transfer_syn` as u8 + 0 pad byte
+        // to match Windows' wire layout.
         let n = src.read_u8("n_transfer_syn")? as usize;
         let _reserved = src.read_u8("reserved")?;
         let abstract_syntax = SyntaxId::decode(src)?;
