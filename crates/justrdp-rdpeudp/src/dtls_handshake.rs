@@ -639,16 +639,28 @@ fn rsa_pkcs1_v15_encrypt<R: DtlsRandom>(
     let mut em = Vec::with_capacity(k);
     em.push(0x00);
     em.push(0x02);
-    // PS: ps_len non-zero random bytes.
-    let mut ps = vec![0u8; ps_len];
-    rng.fill(&mut ps);
-    // Replace any zeros (PKCS#1 requires non-zero PS).
-    for b in &mut ps {
-        while *b == 0 {
-            let mut one = [0u8; 1];
-            rng.fill(&mut one);
-            *b = one[0];
+    // PS: ps_len non-zero random bytes. Use rejection sampling from a
+    // pre-filled pool rather than the natural per-byte retry loop —
+    // the latter's iteration count leaks RNG output distribution via
+    // timing. Pull ~4× the pool size to keep refills rare for any
+    // sane RNG, then refill if exhausted.
+    let mut ps = Vec::with_capacity(ps_len);
+    let mut pool_size = ps_len.saturating_mul(4).max(16);
+    while ps.len() < ps_len {
+        let mut pool = vec![0u8; pool_size];
+        rng.fill(&mut pool);
+        for b in pool.into_iter() {
+            if b != 0 {
+                ps.push(b);
+                if ps.len() == ps_len {
+                    break;
+                }
+            }
         }
+        // If we emptied the pool without filling PS, double the next
+        // refill to amortize against a degenerate RNG (defensive — for
+        // a uniform RNG the first pass always succeeds).
+        pool_size = pool_size.saturating_mul(2);
     }
     em.extend_from_slice(&ps);
     em.push(0x00);

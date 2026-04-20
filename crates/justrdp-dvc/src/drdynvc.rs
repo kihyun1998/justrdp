@@ -169,7 +169,14 @@ impl DrdynvcClient {
                 "DYNVC_SOFT_SYNC_REQUEST without SOFT_SYNC_TCP_FLUSHED",
             )));
         }
-        let _ = SOFT_SYNC_CHANNEL_LIST_PRESENT; // silence unused import; flag is a doc anchor
+        // §2.2.5.1: if the LIST_PRESENT bit is unset there must be no
+        // channel lists (the decoder enforces this by tying it to
+        // NumberOfTunnels==0; re-assert defensively here too).
+        if flags & SOFT_SYNC_CHANNEL_LIST_PRESENT == 0 && !channel_lists.is_empty() {
+            return Err(DvcError::Protocol(String::from(
+                "DYNVC_SOFT_SYNC_REQUEST: channel lists present without SOFT_SYNC_CHANNEL_LIST_PRESENT",
+            )));
+        }
 
         // §2.2.5.1.1 MUST NOT: a channel_id may appear in at most one
         // SoftSyncChannelList. The decoder doesn't enforce this; do it
@@ -402,6 +409,12 @@ impl DrdynvcClient {
     ///
     /// Returns `Err` if `channel_id` is not currently open or if it
     /// has an active outbound tunnel route.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use route_outbound() for routing-aware dispatch; this API \
+                rejects Soft-Synced channels and will be removed once all \
+                callers migrate"
+    )]
     pub fn send_on_channel(&mut self, channel_id: u32, data: &[u8]) -> DvcResult<SvcMessage> {
         if !self.active_channels.contains_key(&channel_id) {
             return Err(DvcError::Protocol(String::from(
@@ -473,6 +486,16 @@ impl DrdynvcClient {
         // HigherLayerData).
         let mut src = ReadCursor::new(payload);
         let pdu = pdu::decode_dvc_pdu(&mut src)?;
+        if src.remaining() > 0 {
+            // Decoder consumed a complete PDU but bytes remain — server
+            // either packed multiple PDUs (which our DTLS message-mode
+            // assumption forbids) or sent a corrupt frame. Surface as an
+            // error rather than silently drop.
+            return Err(DvcError::Protocol(alloc::format!(
+                "process_tunnel_data: {} trailing bytes after DVC PDU",
+                src.remaining(),
+            )));
+        }
         self.process_tunnel_pdu(pdu)
     }
 
@@ -810,6 +833,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercising the deprecated path until callers migrate
     fn send_on_channel_open_channel() {
         let mut client = DrdynvcClient::new();
         client.register(Box::new(EchoDvcProcessor));
@@ -834,6 +858,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn send_on_channel_closed_channel_returns_error() {
         let mut client = DrdynvcClient::new();
         assert!(client.send_on_channel(99, b"data").is_err());
@@ -1200,6 +1225,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn send_on_channel_rejects_soft_synced_channel() {
         // Soft-Sync makes channel 3 tunnel-routed; the legacy SVC-only
         // send_on_channel must refuse rather than silently mis-route.

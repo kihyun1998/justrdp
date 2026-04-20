@@ -367,11 +367,31 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
                 .ok_or_else(|| DecodeError::unexpected_value(
                     "DVC", "softSyncRequest::length", "too small for header fields",
                 ))?;
+            // DoS guard: each list is at minimum 6 bytes (TunnelType=4 +
+            // NumberOfDVCs=2). Reject up front if NumberOfTunnels couldn't
+            // physically fit even with empty channel lists — otherwise a
+            // server-supplied number_of_tunnels=65535 would cause
+            // `Vec::with_capacity(65535)` allocation before any byte is
+            // read.
+            if (number_of_tunnels as usize).saturating_mul(6) > lists_budget {
+                return Err(DecodeError::unexpected_value(
+                    "DVC", "softSyncRequest::numberOfTunnels",
+                    "exceeds Length budget (would over-allocate)",
+                ));
+            }
             let before_lists = src.remaining();
             let mut channel_lists = Vec::with_capacity(number_of_tunnels as usize);
             for _ in 0..number_of_tunnels {
                 let tunnel_type = src.read_u32_le("DVC::softSyncRequest::tunnelType")?;
                 let n_dvcs = src.read_u16_le("DVC::softSyncRequest::numberOfDVCs")?;
+                // DoS guard: each DVC ID is 4 bytes; refuse to allocate if
+                // the declared count couldn't fit in the remaining bytes.
+                if (n_dvcs as usize).saturating_mul(4) > src.remaining() {
+                    return Err(DecodeError::unexpected_value(
+                        "DVC", "softSyncRequest::numberOfDVCs",
+                        "exceeds remaining bytes (would over-allocate)",
+                    ));
+                }
                 let mut dvc_ids = Vec::with_capacity(n_dvcs as usize);
                 for _ in 0..n_dvcs {
                     dvc_ids.push(src.read_u32_le("DVC::softSyncRequest::dvcId")?);
@@ -397,6 +417,16 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
             let _pad = src.read_u8("DVC::softSyncResponse::pad")?;
             // RESPONSE uses u32 NumberOfTunnels (REQUEST uses u16) — §2.2.5.2.
             let number_of_tunnels = src.read_u32_le("DVC::softSyncResponse::numberOfTunnels")?;
+            // DoS guard: each entry is 4 bytes; reject if the declared
+            // count couldn't possibly fit in the remaining bytes — without
+            // this, `number_of_tunnels = u32::MAX` would request a 16 GB
+            // allocation before reading the first entry.
+            if (number_of_tunnels as usize).saturating_mul(4) > src.remaining() {
+                return Err(DecodeError::unexpected_value(
+                    "DVC", "softSyncResponse::numberOfTunnels",
+                    "exceeds remaining bytes (would over-allocate)",
+                ));
+            }
             let mut tunnels_to_switch = Vec::with_capacity(number_of_tunnels as usize);
             for _ in 0..number_of_tunnels {
                 tunnels_to_switch.push(src.read_u32_le("DVC::softSyncResponse::tunnelType")?);
@@ -802,6 +832,49 @@ mod tests {
         // Length = 3 (< 4, so Length - 4 underflows).
         let buf = [
             0x80, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn soft_sync_request_huge_number_of_tunnels_rejected() {
+        // DoS guard: NumberOfTunnels=0xFFFF would cause a 64K Vec
+        // allocation before any list bytes are read. The guard rejects
+        // before the alloc when number_of_tunnels * 6 > lists_budget.
+        let buf = [
+            0x80, 0x00,
+            0x08, 0x00, 0x00, 0x00, // Length = 8 (no room for any list)
+            0x03, 0x00,             // Flags = TCP_FLUSHED | LIST_PRESENT
+            0xFF, 0xFF,             // NumberOfTunnels = 65535 (would OOM)
+        ];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn soft_sync_request_huge_number_of_dvcs_rejected() {
+        // DoS guard: per-list NumberOfDVCs=0xFFFF would cause a 256K
+        // Vec allocation. Rejected when n_dvcs * 4 > src.remaining().
+        let buf = [
+            0x80, 0x00,
+            0x10, 0x00, 0x00, 0x00, // Length = 16
+            0x03, 0x00,             // Flags
+            0x01, 0x00,             // NumberOfTunnels = 1
+            0x01, 0x00, 0x00, 0x00, // TunnelType = UDPFECR
+            0xFF, 0xFF,             // NumberOfDVCs = 65535 (would OOM)
+        ];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn soft_sync_response_huge_number_of_tunnels_rejected() {
+        // DoS guard: u32 NumberOfTunnels=0xFFFFFFFF would request
+        // 16 GB of allocation. Rejected when count * 4 > remaining.
+        let buf = [
+            0x90, 0x00,
+            0xFF, 0xFF, 0xFF, 0xFF, // NumberOfTunnels = u32::MAX
         ];
         let mut src = ReadCursor::new(&buf);
         assert!(decode_dvc_pdu(&mut src).is_err());

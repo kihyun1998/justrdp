@@ -635,6 +635,17 @@ fn full_dtls_handshake_with_hello_verify_request() {
 
     let server_msg = b"server replies pong";
     let server_record = server.encrypt_app_data(server_msg);
+    // Regression guard against the "Item 6" false positive raised in an
+    // earlier review pass: server `Finished` consumed epoch-1 seqnum 0,
+    // so the server's first app data MUST start at seqnum 1, and the
+    // client's `last_recv_seq=Some(0)` MUST still accept it. If a future
+    // refactor split the seqnum counter or reset the server's
+    // `server_record_seq_e1` after Finished, this assertion fires before
+    // the decrypt would be silently rejected as replay.
+    assert_eq!(
+        server_record.sequence_number, 1,
+        "server first app-data must be epoch-1 seq=1 (Finished was seq=0)",
+    );
     let client_received = client.decrypt_app_data(&server_record).unwrap();
     assert_eq!(client_received, server_msg);
 
