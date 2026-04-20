@@ -185,7 +185,10 @@ impl ClientConnectorState {
                 // handled by channel_join_sending flag in next_pdu_hint()
                 | Self::SecurityCommencement
                 | Self::SecureSettingsExchange
-                | Self::MultitransportBootstrapping
+                // MultitransportBootstrapping was a send state when stubbed
+                // (it produced no output and transitioned immediately). The
+                // real implementation needs to wait for a server PDU on the
+                // MCS message channel, so it must NOT be in `is_send_state`.
                 | Self::CapabilitiesExchangeSendConfirmActive
                 | Self::ConnectionFinalizationSendSynchronize
                 | Self::ConnectionFinalizationSendCooperate

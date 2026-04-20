@@ -2219,8 +2219,10 @@ credential blob verified against the user's X.509 cert.
 
 **구현 항목:**
 
-- [ ] `InitiateMultitransportRequest` 수신 (메인 TCP 연결 통해)
-- [ ] UDP 연결 수립
+- [x] `InitiateMultitransportRequest` 수신 (메인 TCP 연결 통해, MCS message channel)
+  - connector `step_multitransport_bootstrapping` 실 구현 — message channel 미연결 시 즉시 통과, io 채널의 PDU(예: DemandActive)면 다음 phase 위임, message 채널의 multitransport request면 응답 송신
+  - 현재는 `E_ABORT` 응답 (Soft-Sync 미지원 — MS-RDPBCGR §1.3.1.1 / §2.2.15.2가 명시적으로 허용)
+- [ ] UDP 연결 수립 (justrdp-blocking 통합)
 - [ ] TLS/DTLS 핸드셰이크 (UDP 위)
   - [x] DTLS 1.0/1.2 client handshake state machine (HVR cookie, ServerHello, Cert/SPKI capture, CKE/CCS/Finished, server CCS+Finished verify)
   - [x] `DtlsSession` wrapper — auto-driven flight + post-handshake app-data encrypt/decrypt with replay rejection (MS-RDPEMT §5.1 SPKI pinning helper)

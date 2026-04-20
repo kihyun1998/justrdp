@@ -61,6 +61,25 @@ pub const SEC_LICENSE_PKT: u16 = 0x0080;
 pub const SEC_SECURE_CHECKSUM: u16 = 0x0800;
 /// Reset seqno (key update marker in server-to-client).
 pub const SEC_RESET_SEQNO: u16 = 0x0002;
+/// Server → Client: Initiate Multitransport Request payload follows.
+/// MS-RDPBCGR §2.2.8.1.1.2.1. Shares the bit value with `SEC_RESET_SEQNO`
+/// — disambiguated by direction and PDU context (multitransport bootstrap
+/// arrives on the message channel, not the io channel).
+pub const SEC_TRANSPORT_REQ: u16 = 0x0002;
+/// Client → Server: Initiate Multitransport Response payload follows.
+/// MS-RDPBCGR §2.2.8.1.1.2.1.
+pub const SEC_TRANSPORT_RSP: u16 = 0x0004;
+
+// ── HRESULTs used by the multitransport bootstrap response ──
+
+/// Successful tunnel acceptance. Per MS-RDPBCGR §1.3.1.1, the client
+/// MUST only send `S_OK` when the server advertised `SOFTSYNC_TCP_TO_UDP`
+/// in the Server Multitransport Channel Data (§2.2.1.4.6).
+pub const HRESULT_S_OK: u32 = 0x0000_0000;
+/// Generic abort — used by the client to decline multitransport (e.g.,
+/// when UDP setup fails or Soft-Sync is not supported). MS-RDPBCGR
+/// §2.2.15.2 + Windows ERREF.
+pub const HRESULT_E_ABORT: u32 = 0x8000_4004;
 
 // ── RSA Key Exchange ──
 

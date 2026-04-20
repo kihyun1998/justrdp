@@ -30,15 +30,17 @@ use justrdp_pdu::rdp::capabilities::{
 };
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
 use justrdp_pdu::rdp::finalization::{
-    ArcCsPrivatePacket, ControlAction, ControlPdu, FontListPdu, MonitorLayoutEntry,
-    MonitorLayoutPdu, SaveSessionInfoPdu, SetErrorInfoPdu, SynchronizePdu,
-    ERRINFO_NONE, TS_MONITOR_PRIMARY,
+    ArcCsPrivatePacket, ControlAction, ControlPdu, FontListPdu, InitiateMultitransportRequest,
+    MonitorLayoutEntry, MonitorLayoutPdu, MultitransportResponse, SaveSessionInfoPdu,
+    SetErrorInfoPdu, SynchronizePdu, ERRINFO_NONE, MULTITRANSPORT_RESPONSE_SIZE,
+    TS_MONITOR_PRIMARY,
 };
 use justrdp_pdu::rdp::redirection::ServerRedirectionPdu;
 use justrdp_pdu::rdp::server_certificate;
 use justrdp_pdu::rdp::standard_security::{
     self, FipsSecurityContext, RdpSecurityContext,
-    SEC_ENCRYPT, SEC_EXCHANGE_PKT,
+    SEC_ENCRYPT, SEC_EXCHANGE_PKT, SEC_TRANSPORT_REQ, SEC_TRANSPORT_RSP,
+    HRESULT_E_ABORT,
     ENCRYPTION_METHOD_FIPS, ENCRYPTION_LEVEL_NONE, ENCRYPTION_LEVEL_LOW,
 };
 use justrdp_pdu::rdp::headers::{
@@ -1125,6 +1127,20 @@ impl ClientConnector {
         extra_sec_flags: u16,
         output: &mut WriteBuf,
     ) -> ConnectorResult<usize> {
+        let channel_id = self.io_channel_id;
+        self.encrypt_and_send_mcs_on_channel(payload, extra_sec_flags, channel_id, output)
+    }
+
+    /// Same as [`Self::encrypt_and_send_mcs`] but routes the resulting
+    /// MCS Send Data Request to an arbitrary channel (e.g. the message
+    /// channel for `Initiate Multitransport Response`).
+    fn encrypt_and_send_mcs_on_channel(
+        &mut self,
+        payload: &[u8],
+        extra_sec_flags: u16,
+        channel_id: u16,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<usize> {
         match &mut self.security_mode {
             SecurityMode::Rc4(ctx) => {
                 let mut data = payload.to_vec();
@@ -1139,7 +1155,7 @@ impl ClientConnector {
                     cursor.write_slice(&mac, "SecurityHeader::mac")?;
                     cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
                 }
-                encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
+                encode_mcs_send_data(self.user_channel_id, channel_id, &inner, output)
             }
             SecurityMode::Fips(ctx) => {
                 let (ciphertext, mac, pad_len) = ctx.encrypt(payload);
@@ -1157,7 +1173,7 @@ impl ClientConnector {
                     cursor.write_slice(&mac, "FipsHeader::mac")?;
                     cursor.write_slice(&ciphertext, "FipsHeader::encryptedData")?;
                 }
-                encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
+                encode_mcs_send_data(self.user_channel_id, channel_id, &inner, output)
             }
             SecurityMode::None => {
                 if extra_sec_flags != 0 {
@@ -1170,9 +1186,9 @@ impl ClientConnector {
                         cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
                         cursor.write_slice(payload, "SecurityHeader::data")?;
                     }
-                    encode_mcs_send_data(self.user_channel_id, self.io_channel_id, &inner, output)
+                    encode_mcs_send_data(self.user_channel_id, channel_id, &inner, output)
                 } else {
-                    encode_mcs_send_data(self.user_channel_id, self.io_channel_id, payload, output)
+                    encode_mcs_send_data(self.user_channel_id, channel_id, payload, output)
                 }
             }
         }
@@ -1355,12 +1371,100 @@ impl ClientConnector {
         }
     }
 
-    /// Phase 10: Multitransport Bootstrapping.
-    /// MS-RDPBCGR 2.2.15.1: server may optionally initiate multitransport.
-    /// Currently a pass-through; transitions immediately to capabilities exchange.
-    fn step_multitransport_bootstrapping(&mut self) -> ConnectorResult<Written> {
-        self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
-        Ok(Written::nothing())
+    /// Phase 10: Multitransport Bootstrapping (MS-RDPBCGR §2.2.15.1).
+    ///
+    /// The server may send zero or more `Initiate Multitransport Request`
+    /// PDUs on the MCS message channel before `Demand Active`. Each request
+    /// asks the client to set up a UDP side-channel (reliable or lossy) for
+    /// later DVC Soft-Sync routing. JustRDP doesn't yet drive the UDP setup
+    /// from inside the connector — it's a sans-io component, and the UDP
+    /// transport lives in `justrdp-rdpeudp` / `justrdp-blocking`.
+    ///
+    /// Per MS-RDPBCGR §1.3.1.1, `S_OK` may only be sent when the server
+    /// advertised `SOFTSYNC_TCP_TO_UDP` (Server Multitransport Channel Data
+    /// flag, §2.2.1.4.6). Since the connector cannot yet complete the UDP
+    /// path, this step responds `E_ABORT` (0x80004004) to every request,
+    /// which the spec explicitly permits when the client does not honor
+    /// multitransport. The server keeps the main TCP session alive and
+    /// proceeds to send `Demand Active` regardless.
+    ///
+    /// Three input shapes are handled:
+    ///
+    /// 1. **No message channel was joined** (`mcs_message_channel_id` is
+    ///    `None` or `0`) — multitransport cannot occur on this session;
+    ///    short-circuit to capabilities exchange and re-feed `input` so
+    ///    nothing is lost (`Demand Active` may be in this very buffer).
+    /// 2. **PDU on the io channel** — almost certainly `Demand Active`;
+    ///    transition and re-process.
+    /// 3. **PDU on the message channel** — decode the multitransport
+    ///    request, send back `E_ABORT`, stay in this state for any
+    ///    additional requests (a server may issue one each for UDPFECR
+    ///    and UDPFECL).
+    fn step_multitransport_bootstrapping(
+        &mut self,
+        input: &[u8],
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written> {
+        // Case 1: no message channel joined → multitransport cannot occur.
+        // `next_pdu_hint` returns `None` in this case so the caller hands us
+        // an empty input; just transition to the next phase.
+        let msg_channel_id = match self.mcs_message_channel_id {
+            Some(id) if id != 0 => id,
+            _ => {
+                self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
+                return Ok(Written::nothing());
+            }
+        };
+
+        let mut cursor = ReadCursor::new(input);
+        let _tpkt = TpktHeader::decode(&mut cursor)?;
+        let _dt = DataTransfer::decode(&mut cursor)?;
+        let sdi = SendDataIndication::decode(&mut cursor)?;
+
+        // Case 2: PDU arrived on the io channel — likely Demand Active.
+        if sdi.channel_id == self.io_channel_id {
+            self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
+            return self.step_capabilities_wait_demand_active(input);
+        }
+
+        // PDUs on any other channel are ignored — the client only joined
+        // io_channel + msg_channel for this phase.
+        if sdi.channel_id != msg_channel_id {
+            return Ok(Written::nothing());
+        }
+
+        // Case 3: message channel — decode the multitransport request.
+        let (flags, decrypted) = self.decrypt_server_data(sdi.user_data)?;
+        if flags & SEC_TRANSPORT_REQ == 0 {
+            // Unexpected payload on the message channel; ignore and wait
+            // for the next PDU. (Servers don't normally send anything else
+            // here pre-DemandActive, but stay defensive.)
+            return Ok(Written::nothing());
+        }
+
+        let mut payload = ReadCursor::new(&decrypted);
+        let request = InitiateMultitransportRequest::decode(&mut payload)?;
+
+        // Build the response. JustRDP doesn't (yet) honor multitransport,
+        // so always return E_ABORT — spec-compliant per §2.2.15.2 + §1.3.1.1.
+        let response = MultitransportResponse {
+            request_id: request.request_id,
+            hr_response: HRESULT_E_ABORT,
+        };
+        let mut response_bytes = vec![0u8; MULTITRANSPORT_RESPONSE_SIZE];
+        {
+            let mut wc = WriteCursor::new(&mut response_bytes);
+            response.encode(&mut wc)?;
+        }
+        let size = self.encrypt_and_send_mcs_on_channel(
+            &response_bytes,
+            SEC_TRANSPORT_RSP,
+            msg_channel_id,
+            output,
+        )?;
+        // Stay in this state — additional requests (e.g. UDPFECL after
+        // UDPFECR) or DemandActive may follow.
+        Ok(Written::new(size))
     }
 
     fn step_capabilities_wait_demand_active(&mut self, input: &[u8]) -> ConnectorResult<Written> {
@@ -1858,6 +1962,19 @@ impl Sequence for ClientConnector {
         &self.state
     }
 
+    /// Hint for how the caller should obtain the next input slice.
+    ///
+    /// Contract:
+    /// - `is_send_state() == true`  → returns `None`. Caller invokes
+    ///   `step(&[], &mut output)` to drive the send.
+    /// - Wait state with hint        → caller reads enough bytes to
+    ///   satisfy the hint, then invokes `step(&buf, &mut output)`.
+    /// - **Wait state with `None`**  → currently only
+    ///   `MultitransportBootstrapping` when the MCS message channel was
+    ///   not joined. The phase is a no-op in that case; caller MUST
+    ///   invoke `step(&[], &mut output)` (do not block on a network
+    ///   read). Document this branch explicitly because it is the only
+    ///   place a non-send state asks for an empty input.
     fn next_pdu_hint(&self) -> Option<&dyn PduHint> {
         if self.state.is_send_state() || self.state.is_connected() {
             None
@@ -1882,6 +1999,18 @@ impl Sequence for ClientConnector {
                 None // send sub-phase
             } else {
                 Some(&TPKT_HINT) // wait sub-phase
+            }
+        } else if matches!(
+            self.state,
+            ClientConnectorState::MultitransportBootstrapping
+        ) {
+            // Multitransport bootstrap waits for server PDUs only when an
+            // MCS message channel was actually joined; otherwise the phase
+            // is a no-op and `step()` short-circuits without input.
+            if matches!(self.mcs_message_channel_id, Some(id) if id != 0) {
+                Some(&TPKT_HINT)
+            } else {
+                None
             }
         } else {
             Some(&TPKT_HINT)
@@ -1963,7 +2092,7 @@ impl Sequence for ClientConnector {
                 self.step_licensing_exchange(input, output)
             }
             ClientConnectorState::MultitransportBootstrapping => {
-                self.step_multitransport_bootstrapping()
+                self.step_multitransport_bootstrapping(input, output)
             }
             ClientConnectorState::CapabilitiesExchangeWaitDemandActive => {
                 self.step_capabilities_wait_demand_active(input)
@@ -2287,13 +2416,167 @@ mod tests {
 
     #[test]
     fn multitransport_bootstrapping_pass_through() {
+        // No MCS message channel was joined → phase is a no-op and the
+        // hint is None so the caller invokes us with empty input.
         let config = Config::builder("user", "pass").build();
         let mut connector = ClientConnector::new(config);
         let mut output = WriteBuf::new();
 
         connector.state = ClientConnectorState::MultitransportBootstrapping;
+        assert!(connector.next_pdu_hint().is_none());
         connector.step(&[], &mut output).unwrap();
         assert_eq!(*connector.state(), ClientConnectorState::CapabilitiesExchangeWaitDemandActive);
+    }
+
+    /// Build a server-to-client PDU shell carrying `payload` on `channel_id`.
+    /// TPKT + X.224 DT + MCS Send Data Indication. Used by the
+    /// multitransport tests below.
+    fn build_server_pdu(initiator: u16, channel_id: u16, payload: &[u8]) -> Vec<u8> {
+        use justrdp_pdu::mcs::SendDataIndication;
+        let sdi = SendDataIndication { initiator, channel_id, user_data: payload };
+        let mcs_size = 3 + sdi.size(); // X.224 DT header is 3 bytes
+        let total = TPKT_HEADER_SIZE + mcs_size;
+        let mut buf = vec![0u8; total];
+        let mut cursor = WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(mcs_size).unwrap().encode(&mut cursor).unwrap();
+        DataTransfer.encode(&mut cursor).unwrap();
+        sdi.encode(&mut cursor).unwrap();
+        buf
+    }
+
+    /// Build the server-side payload of an Initiate Multitransport Request:
+    /// basic security header (`SEC_TRANSPORT_REQ`) + 24-byte body.
+    fn build_initiate_multitransport_payload(
+        request_id: u32,
+        request_protocol: u16,
+        cookie: [u8; 16],
+    ) -> Vec<u8> {
+        let req = InitiateMultitransportRequest {
+            request_id,
+            request_protocol,
+            reserved: 0,
+            security_cookie: cookie,
+        };
+        let mut body = vec![0u8; req.size()];
+        let mut wc = WriteCursor::new(&mut body);
+        req.encode(&mut wc).unwrap();
+
+        let mut payload = Vec::with_capacity(BASIC_SECURITY_HEADER_SIZE + body.len());
+        payload.extend_from_slice(&SEC_TRANSPORT_REQ.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes()); // flagsHi
+        payload.extend_from_slice(&body);
+        payload
+    }
+
+    #[test]
+    fn multitransport_request_replied_with_e_abort() {
+        // Set up a connector in MultitransportBootstrapping with both io
+        // and message channels configured. SecurityMode is `None` (TLS/NLA)
+        // so we skip RC4/FIPS path and exercise the simpler decrypt branch.
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        connector.state = ClientConnectorState::MultitransportBootstrapping;
+        connector.user_channel_id = 1007;
+        connector.io_channel_id = 1003;
+        connector.mcs_message_channel_id = Some(1009);
+
+        // Server hint should now request a TPKT (we expect a server PDU).
+        assert!(connector.next_pdu_hint().is_some());
+
+        let cookie = [0xAB; 16];
+        let payload = build_initiate_multitransport_payload(0x0102_0304, 0x0001, cookie);
+        let input = build_server_pdu(0, 1009, &payload); // channel_id = msg channel
+
+        let mut output = WriteBuf::new();
+        let written = connector.step(&input, &mut output).unwrap();
+        assert!(written.size > 0, "client must send a Multitransport Response");
+        // Stay in this state — server may send another request (UDPFECL).
+        assert_eq!(
+            *connector.state(),
+            ClientConnectorState::MultitransportBootstrapping,
+        );
+
+        // Inspect the response: TPKT + X.224 + MCS SDR(channel=msg) +
+        // basic security header (SEC_TRANSPORT_RSP) + 8-byte response body.
+        // Look for the 8 known body bytes anywhere in the produced packet.
+        let buf = &output.as_mut_slice()[..written.size];
+        let mut expected_body = Vec::with_capacity(8);
+        expected_body.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        expected_body.extend_from_slice(&HRESULT_E_ABORT.to_le_bytes());
+        let found = buf.windows(expected_body.len()).any(|w| w == expected_body);
+        assert!(found, "response must contain requestId echo + E_ABORT HRESULT");
+
+        // SEC_TRANSPORT_RSP flag (0x0004) must be present somewhere as the
+        // basic security header — search for the byte pair (0x04, 0x00).
+        let flag_pair = [SEC_TRANSPORT_RSP as u8, 0u8];
+        let flag_found = buf.windows(2).any(|w| w == flag_pair);
+        assert!(flag_found, "SEC_TRANSPORT_RSP basic security flag missing");
+    }
+
+    #[test]
+    fn multitransport_demand_active_on_io_channel_skips_phase() {
+        // If a PDU arrives on the io channel during MultitransportBootstrapping
+        // (typical when the server omits multitransport), the connector must
+        // treat it as the start of CapabilitiesExchange and re-process.
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        connector.state = ClientConnectorState::MultitransportBootstrapping;
+        connector.user_channel_id = 1007;
+        connector.io_channel_id = 1003;
+        connector.mcs_message_channel_id = Some(1009);
+
+        // Build any non-multitransport PDU on the io channel — we don't
+        // care if Demand Active fully decodes downstream, only that the
+        // state transitions and the call is delegated.
+        let body = vec![0u8; 16];
+        let input = build_server_pdu(0, 1003, &body);
+
+        let mut output = WriteBuf::new();
+        // The downstream wait_demand_active step may error on the bogus
+        // payload; what we assert is that the state transitioned.
+        let _ = connector.step(&input, &mut output);
+        assert_eq!(
+            *connector.state(),
+            ClientConnectorState::CapabilitiesExchangeWaitDemandActive,
+        );
+    }
+
+    #[test]
+    fn multitransport_two_requests_each_get_e_abort() {
+        // UDPFECR and UDPFECL requests both arrive — verify each yields
+        // a separate response and we stay in the phase between them.
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        connector.state = ClientConnectorState::MultitransportBootstrapping;
+        connector.user_channel_id = 1007;
+        connector.io_channel_id = 1003;
+        connector.mcs_message_channel_id = Some(1009);
+
+        let mk = |req_id: u32, proto: u16| {
+            build_server_pdu(
+                0,
+                1009,
+                &build_initiate_multitransport_payload(req_id, proto, [0xCC; 16]),
+            )
+        };
+
+        let mut out1 = WriteBuf::new();
+        connector.step(&mk(1, 0x0001), &mut out1).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::MultitransportBootstrapping);
+        let buf1 = out1.as_mut_slice();
+        let mut want1 = Vec::with_capacity(8);
+        want1.extend_from_slice(&1u32.to_le_bytes());
+        want1.extend_from_slice(&HRESULT_E_ABORT.to_le_bytes());
+        assert!(buf1.windows(want1.len()).any(|w| w == want1));
+
+        let mut out2 = WriteBuf::new();
+        connector.step(&mk(2, 0x0002), &mut out2).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::MultitransportBootstrapping);
+        let buf2 = out2.as_mut_slice();
+        let mut want2 = Vec::with_capacity(8);
+        want2.extend_from_slice(&2u32.to_le_bytes());
+        want2.extend_from_slice(&HRESULT_E_ABORT.to_le_bytes());
+        assert!(buf2.windows(want2.len()).any(|w| w == want2));
     }
 
     #[test]
