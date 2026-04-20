@@ -2226,8 +2226,9 @@ credential blob verified against the user's X.509 cert.
 - [x] `TunnelCreateRequest` PDU (requestId + securityCookie) (§2.2.2.1)
 - [x] `TunnelCreateResponse` PDU (HRESULT) (§2.2.2.2)
 - [x] `TunnelData` PDU (HigherLayerData) (§2.2.2.3)
+- [x] `DYNVC_SOFT_SYNC_REQUEST` / `_RESPONSE` PDU encode/decode (MS-RDPEDYC §2.2.5)
 - [ ] DVC를 UDP 트랜스포트로 라우팅
-- [ ] 트랜스포트 간 DVC Soft-Sync 마이그레이션 (DYNVC_SOFT_SYNC_REQUEST/RESPONSE)
+- [ ] 트랜스포트 간 DVC Soft-Sync 마이그레이션 (라우팅 활성화)
 
 ---
 

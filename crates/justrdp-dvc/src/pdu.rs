@@ -17,11 +17,31 @@ pub const CMD_CLOSE: u8 = 0x04;
 pub const CMD_CAPS: u8 = 0x05;
 pub const CMD_DATA_FIRST_COMPRESSED: u8 = 0x06;
 pub const CMD_DATA_COMPRESSED: u8 = 0x07;
-// Soft-Sync commands (MS-RDPEDYC 2.2.4). Not yet implemented — decoded
-// as unsupported so the client returns an explicit error rather than
-// falling into the "unknown command" path.
-pub(crate) const CMD_SOFT_SYNC_REQUEST: u8 = 0x08;
-pub(crate) const CMD_SOFT_SYNC_RESPONSE: u8 = 0x09;
+/// `DYNVC_SOFT_SYNC_REQUEST` — Cmd field. MS-RDPEDYC §2.2.5.1
+pub const CMD_SOFT_SYNC_REQUEST: u8 = 0x08;
+/// `DYNVC_SOFT_SYNC_RESPONSE` — Cmd field. MS-RDPEDYC §2.2.5.2
+pub const CMD_SOFT_SYNC_RESPONSE: u8 = 0x09;
+
+// ── Soft-Sync flags (MS-RDPEDYC §2.2.5.1) ──
+
+/// Server has flushed all DVC data on the DRDYNVC SVC; subsequent data
+/// for the listed channels will be sent via multitransport tunnels.
+/// MUST be set in every Soft-Sync Request.
+pub const SOFT_SYNC_TCP_FLUSHED: u16 = 0x0001;
+/// Indicates that `SoftSyncChannelLists` is present and `NumberOfTunnels`
+/// may be non-zero.
+pub const SOFT_SYNC_CHANNEL_LIST_PRESENT: u16 = 0x0002;
+
+// ── Tunnel types (MS-RDPEDYC §2.2.5.1.1, §2.2.5.2) ──
+//
+// NOTE: these values differ from MS-RDPBCGR §2.2.15.1 `requestProtocol`
+// (TRANSPORTTYPE_UDPFECR=0x01, TRANSPORTTYPE_UDPFECL=0x04). RDPEDYC uses
+// 0x01 / 0x03 instead.
+
+/// RDP-UDP FEC reliable multitransport tunnel.
+pub const TUNNELTYPE_UDPFECR: u32 = 0x0000_0001;
+/// RDP-UDP FEC lossy multitransport tunnel. (Note: 0x03, *not* 0x02.)
+pub const TUNNELTYPE_UDPFECL: u32 = 0x0000_0003;
 
 // ── Version constants ──
 
@@ -132,6 +152,26 @@ pub fn write_length(dst: &mut WriteCursor<'_>, length: u32, len_id: u8) -> Encod
     write_varint(dst, length, len_id, "DVC::length")
 }
 
+// ── Soft-Sync supporting types (MS-RDPEDYC §2.2.5.1.1) ──
+
+/// `DYNVC_SOFT_SYNC_CHANNEL_LIST` — group of DVC channel IDs assigned to a
+/// single multitransport tunnel. Carried inside a Soft-Sync Request.
+/// MS-RDPEDYC §2.2.5.1.1
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftSyncChannelList {
+    /// `TUNNELTYPE_UDPFECR` (0x01) or `TUNNELTYPE_UDPFECL` (0x03).
+    pub tunnel_type: u32,
+    /// DVC channel IDs to route over `tunnel_type` after Soft-Sync.
+    pub dvc_ids: Vec<u32>,
+}
+
+impl SoftSyncChannelList {
+    fn encoded_size(&self) -> usize {
+        // TunnelType(4) + NumberOfDVCs(2) + ListOfDVCIds(4 * N)
+        4 + 2 + self.dvc_ids.len() * 4
+    }
+}
+
 // ── PDU types ──
 
 /// Parsed DVC PDU from server (server → client direction).
@@ -177,6 +217,23 @@ pub enum DvcPdu {
     },
     /// Close a dynamic virtual channel.
     Close { channel_id: u32 },
+    /// Server → Client: switch a set of DVCs from the DRDYNVC SVC to one or
+    /// more multitransport tunnels. MS-RDPEDYC §2.2.5.1
+    SoftSyncRequest {
+        /// `SOFT_SYNC_TCP_FLUSHED` and/or `SOFT_SYNC_CHANNEL_LIST_PRESENT`.
+        flags: u16,
+        /// One entry per target tunnel. Empty when
+        /// `SOFT_SYNC_CHANNEL_LIST_PRESENT` is unset.
+        channel_lists: Vec<SoftSyncChannelList>,
+    },
+    /// Client → Server: ack which tunnels the client will write DVC data to.
+    /// MS-RDPEDYC §2.2.5.2 — produced by `decode_dvc_pdu` when bytes arrive
+    /// for symmetry/testing; the `DrdynvcClient` rejects this on receive
+    /// since the server should never send it.
+    SoftSyncResponse {
+        /// `TUNNELTYPE_UDPFECR` / `TUNNELTYPE_UDPFECL` values.
+        tunnels_to_switch: Vec<u32>,
+    },
 }
 
 /// Decode a server→client DVC PDU from bytes.
@@ -267,9 +324,84 @@ pub fn decode_dvc_pdu(src: &mut ReadCursor<'_>) -> DecodeResult<DvcPdu> {
             src.skip(data.len(), "DVC::dataCompressedPayload")?;
             Ok(DvcPdu::DataCompressed { channel_id, data })
         }
-        // Soft-Sync (MS-RDPEDYC 2.2.4) — not yet supported.
-        CMD_SOFT_SYNC_REQUEST | CMD_SOFT_SYNC_RESPONSE => {
-            Err(DecodeError::unsupported("DVC", "Soft-Sync is not yet supported"))
+        CMD_SOFT_SYNC_REQUEST => {
+            // MS-RDPEDYC §2.2.5.1: Sp + cbId MUST be 0 (header byte == 0x80).
+            if sp != 0 || cb_id != 0 {
+                return Err(DecodeError::unexpected_value(
+                    "DVC", "softSyncRequest::header", "Sp/cbId must be 0",
+                ));
+            }
+            let _pad = src.read_u8("DVC::softSyncRequest::pad")?;
+            let length = src.read_u32_le("DVC::softSyncRequest::length")?;
+            // Length is self-inclusive; remaining must equal Length - 4.
+            let expected_remaining = (length as usize)
+                .checked_sub(4)
+                .ok_or_else(|| DecodeError::unexpected_value(
+                    "DVC", "softSyncRequest::length", "must be >= 4 (self-inclusive)",
+                ))?;
+            if src.remaining() < expected_remaining {
+                return Err(DecodeError::unexpected_value(
+                    "DVC", "softSyncRequest::length", "exceeds available bytes",
+                ));
+            }
+            let flags = src.read_u16_le("DVC::softSyncRequest::flags")?;
+            // SOFT_SYNC_TCP_FLUSHED MUST be set (§2.2.5.1).
+            if flags & SOFT_SYNC_TCP_FLUSHED == 0 {
+                return Err(DecodeError::unexpected_value(
+                    "DVC", "softSyncRequest::flags", "SOFT_SYNC_TCP_FLUSHED required",
+                ));
+            }
+            let number_of_tunnels = src.read_u16_le("DVC::softSyncRequest::numberOfTunnels")?;
+            // List-present flag and tunnel count must agree.
+            let list_present = flags & SOFT_SYNC_CHANNEL_LIST_PRESENT != 0;
+            if !list_present && number_of_tunnels != 0 {
+                return Err(DecodeError::unexpected_value(
+                    "DVC", "softSyncRequest", "CHANNEL_LIST_PRESENT unset but NumberOfTunnels > 0",
+                ));
+            }
+            // Bound channel-list reads to the Length-declared region. Without
+            // this, a server-sent Length that's smaller than the actual lists
+            // would cause us to over-read into the next SVC PDU.
+            let lists_budget = expected_remaining
+                .checked_sub(4) // Flags(2) + NumberOfTunnels(2) already consumed.
+                .ok_or_else(|| DecodeError::unexpected_value(
+                    "DVC", "softSyncRequest::length", "too small for header fields",
+                ))?;
+            let before_lists = src.remaining();
+            let mut channel_lists = Vec::with_capacity(number_of_tunnels as usize);
+            for _ in 0..number_of_tunnels {
+                let tunnel_type = src.read_u32_le("DVC::softSyncRequest::tunnelType")?;
+                let n_dvcs = src.read_u16_le("DVC::softSyncRequest::numberOfDVCs")?;
+                let mut dvc_ids = Vec::with_capacity(n_dvcs as usize);
+                for _ in 0..n_dvcs {
+                    dvc_ids.push(src.read_u32_le("DVC::softSyncRequest::dvcId")?);
+                }
+                channel_lists.push(SoftSyncChannelList { tunnel_type, dvc_ids });
+            }
+            let consumed = before_lists - src.remaining();
+            if consumed != lists_budget {
+                return Err(DecodeError::unexpected_value(
+                    "DVC", "softSyncRequest::length",
+                    "channel lists do not match Length-declared region",
+                ));
+            }
+            Ok(DvcPdu::SoftSyncRequest { flags, channel_lists })
+        }
+        CMD_SOFT_SYNC_RESPONSE => {
+            // MS-RDPEDYC §2.2.5.2: Sp + cbId MUST be 0 (header byte == 0x90).
+            if sp != 0 || cb_id != 0 {
+                return Err(DecodeError::unexpected_value(
+                    "DVC", "softSyncResponse::header", "Sp/cbId must be 0",
+                ));
+            }
+            let _pad = src.read_u8("DVC::softSyncResponse::pad")?;
+            // RESPONSE uses u32 NumberOfTunnels (REQUEST uses u16) — §2.2.5.2.
+            let number_of_tunnels = src.read_u32_le("DVC::softSyncResponse::numberOfTunnels")?;
+            let mut tunnels_to_switch = Vec::with_capacity(number_of_tunnels as usize);
+            for _ in 0..number_of_tunnels {
+                tunnels_to_switch.push(src.read_u32_le("DVC::softSyncResponse::tunnelType")?);
+            }
+            Ok(DvcPdu::SoftSyncResponse { tunnels_to_switch })
         }
         _ => Err(DecodeError::unexpected_value("DVC", "Cmd", "unknown DVC command")),
     }
@@ -324,6 +456,45 @@ pub fn encode_data_first(channel_id: u32, total_length: u32, data: &[u8]) -> Vec
     buf
 }
 
+/// Encode a `DYNVC_SOFT_SYNC_REQUEST` (server side; mostly useful for
+/// loopback tests). MS-RDPEDYC §2.2.5.1
+pub fn encode_soft_sync_request(flags: u16, channel_lists: &[SoftSyncChannelList]) -> Vec<u8> {
+    let lists_size: usize = channel_lists.iter().map(SoftSyncChannelList::encoded_size).sum();
+    // Length is self-inclusive: Length(4) + Flags(2) + NumberOfTunnels(2) + lists.
+    let length = (4 + 2 + 2 + lists_size) as u32;
+    let total = 1 + 1 + length as usize; // Cmd + Pad + Length-covered region.
+    let mut buf = alloc::vec![0u8; total];
+    let mut cursor = WriteCursor::new(&mut buf);
+    cursor.write_u8(encode_header(CMD_SOFT_SYNC_REQUEST, 0, 0), "DVC::header").expect("pre-sized buffer");
+    cursor.write_u8(0x00, "DVC::softSyncRequest::pad").expect("pre-sized buffer");
+    cursor.write_u32_le(length, "DVC::softSyncRequest::length").expect("pre-sized buffer");
+    cursor.write_u16_le(flags, "DVC::softSyncRequest::flags").expect("pre-sized buffer");
+    cursor.write_u16_le(channel_lists.len() as u16, "DVC::softSyncRequest::numberOfTunnels").expect("pre-sized buffer");
+    for list in channel_lists {
+        cursor.write_u32_le(list.tunnel_type, "DVC::softSyncRequest::tunnelType").expect("pre-sized buffer");
+        cursor.write_u16_le(list.dvc_ids.len() as u16, "DVC::softSyncRequest::numberOfDVCs").expect("pre-sized buffer");
+        for &id in &list.dvc_ids {
+            cursor.write_u32_le(id, "DVC::softSyncRequest::dvcId").expect("pre-sized buffer");
+        }
+    }
+    buf
+}
+
+/// Encode a `DYNVC_SOFT_SYNC_RESPONSE`. MS-RDPEDYC §2.2.5.2
+pub fn encode_soft_sync_response(tunnels_to_switch: &[u32]) -> Vec<u8> {
+    let total = 1 + 1 + 4 + tunnels_to_switch.len() * 4;
+    let mut buf = alloc::vec![0u8; total];
+    let mut cursor = WriteCursor::new(&mut buf);
+    cursor.write_u8(encode_header(CMD_SOFT_SYNC_RESPONSE, 0, 0), "DVC::header").expect("pre-sized buffer");
+    cursor.write_u8(0x00, "DVC::softSyncResponse::pad").expect("pre-sized buffer");
+    // RESPONSE NumberOfTunnels is u32 (REQUEST is u16) — §2.2.5.2.
+    cursor.write_u32_le(tunnels_to_switch.len() as u32, "DVC::softSyncResponse::numberOfTunnels").expect("pre-sized buffer");
+    for &t in tunnels_to_switch {
+        cursor.write_u32_le(t, "DVC::softSyncResponse::tunnelType").expect("pre-sized buffer");
+    }
+    buf
+}
+
 /// Encode a DYNVC_CLOSE.
 pub fn encode_close(channel_id: u32) -> Vec<u8> {
     let cb_id = cb_id_for(channel_id);
@@ -338,6 +509,7 @@ pub fn encode_close(channel_id: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn header_encode_decode_roundtrip() {
@@ -465,6 +637,216 @@ mod tests {
         let mut src = ReadCursor::new(&encoded);
         let pdu = decode_dvc_pdu(&mut src).unwrap();
         assert_eq!(pdu, DvcPdu::Close { channel_id: 0x12345 });
+    }
+
+    // ── Soft-Sync (MS-RDPEDYC §2.2.5) ──
+
+    #[test]
+    fn soft_sync_request_minimal_wire() {
+        // SOFT_SYNC_TCP_FLUSHED only, no channel lists.
+        let buf = encode_soft_sync_request(SOFT_SYNC_TCP_FLUSHED, &[]);
+        assert_eq!(
+            &buf,
+            &[
+                0x80,                   // Cmd=8, Sp=0, cbId=0
+                0x00,                   // Pad
+                0x08, 0x00, 0x00, 0x00, // Length=8 (self-inclusive)
+                0x01, 0x00,             // Flags = SOFT_SYNC_TCP_FLUSHED
+                0x00, 0x00,             // NumberOfTunnels=0
+            ],
+        );
+        let mut src = ReadCursor::new(&buf);
+        let pdu = decode_dvc_pdu(&mut src).unwrap();
+        assert_eq!(
+            pdu,
+            DvcPdu::SoftSyncRequest {
+                flags: SOFT_SYNC_TCP_FLUSHED,
+                channel_lists: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn soft_sync_request_with_channels_wire() {
+        let lists = vec![SoftSyncChannelList {
+            tunnel_type: TUNNELTYPE_UDPFECR,
+            dvc_ids: vec![3],
+        }];
+        let buf = encode_soft_sync_request(
+            SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &lists,
+        );
+        assert_eq!(
+            &buf,
+            &[
+                0x80,
+                0x00,
+                // Length = 4 + 2 + 2 + (4 + 2 + 4) = 18 = 0x12
+                0x12, 0x00, 0x00, 0x00,
+                0x03, 0x00,             // Flags = TCP_FLUSHED | CHANNEL_LIST_PRESENT
+                0x01, 0x00,             // NumberOfTunnels=1
+                0x01, 0x00, 0x00, 0x00, // TunnelType = UDPFECR
+                0x01, 0x00,             // NumberOfDVCs=1
+                0x03, 0x00, 0x00, 0x00, // ChannelId=3
+            ],
+        );
+        let mut src = ReadCursor::new(&buf);
+        let pdu = decode_dvc_pdu(&mut src).unwrap();
+        assert_eq!(
+            pdu,
+            DvcPdu::SoftSyncRequest {
+                flags: SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT,
+                channel_lists: lists,
+            },
+        );
+    }
+
+    #[test]
+    fn soft_sync_request_two_tunnels_roundtrip() {
+        let lists = vec![
+            SoftSyncChannelList { tunnel_type: TUNNELTYPE_UDPFECR, dvc_ids: vec![3, 7] },
+            SoftSyncChannelList { tunnel_type: TUNNELTYPE_UDPFECL, dvc_ids: vec![11] },
+        ];
+        let buf = encode_soft_sync_request(
+            SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &lists,
+        );
+        let mut src = ReadCursor::new(&buf);
+        let pdu = decode_dvc_pdu(&mut src).unwrap();
+        match pdu {
+            DvcPdu::SoftSyncRequest { flags, channel_lists } => {
+                assert_eq!(flags, SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT);
+                assert_eq!(channel_lists, lists);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn soft_sync_request_missing_tcp_flushed_rejected() {
+        // Hand-craft a request without SOFT_SYNC_TCP_FLUSHED set.
+        let buf = [
+            0x80, 0x00, 0x08, 0x00, 0x00, 0x00,
+            0x00, 0x00, // Flags = 0 (missing required bit)
+            0x00, 0x00,
+        ];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn soft_sync_request_inconsistent_list_present_rejected() {
+        // CHANNEL_LIST_PRESENT unset but NumberOfTunnels=1.
+        let buf = [
+            0x80, 0x00, 0x12, 0x00, 0x00, 0x00,
+            0x01, 0x00, // Flags = TCP_FLUSHED only
+            0x01, 0x00, // NumberOfTunnels = 1
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn soft_sync_request_bad_header_byte_rejected() {
+        // Sp=1 (non-zero) — byte0 should be 0x84 instead of 0x80.
+        let buf = [
+            0x84, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn soft_sync_request_length_too_small_rejected() {
+        // Length = 3 (< 4, so Length - 4 underflows).
+        let buf = [
+            0x80, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn soft_sync_request_length_exceeds_buffer_rejected() {
+        // Length=0xFFFFFFFF but only ~10 bytes remain → over-read guard fires.
+        let buf = [
+            0x80, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn soft_sync_request_length_smaller_than_lists_rejected() {
+        // Length claims 8 bytes (Length+Flags+NumberOfTunnels only), but a
+        // channel list follows on the wire — server lied about Length.
+        let buf = [
+            0x80, 0x00,
+            0x08, 0x00, 0x00, 0x00, // Length = 8 (no lists declared)
+            0x03, 0x00,             // Flags = TCP_FLUSHED | CHANNEL_LIST_PRESENT
+            0x01, 0x00,             // NumberOfTunnels = 1 (contradicts Length)
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // a list anyway
+        ];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn soft_sync_response_minimal_wire() {
+        let buf = encode_soft_sync_response(&[]);
+        assert_eq!(&buf, &[0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let mut src = ReadCursor::new(&buf);
+        let pdu = decode_dvc_pdu(&mut src).unwrap();
+        assert_eq!(pdu, DvcPdu::SoftSyncResponse { tunnels_to_switch: vec![] });
+    }
+
+    #[test]
+    fn soft_sync_response_single_tunnel_wire() {
+        let buf = encode_soft_sync_response(&[TUNNELTYPE_UDPFECR]);
+        assert_eq!(
+            &buf,
+            &[
+                0x90,
+                0x00,
+                0x01, 0x00, 0x00, 0x00, // NumberOfTunnels = 1 (u32)
+                0x01, 0x00, 0x00, 0x00, // UDPFECR
+            ],
+        );
+        let mut src = ReadCursor::new(&buf);
+        let pdu = decode_dvc_pdu(&mut src).unwrap();
+        assert_eq!(
+            pdu,
+            DvcPdu::SoftSyncResponse { tunnels_to_switch: vec![TUNNELTYPE_UDPFECR] },
+        );
+    }
+
+    #[test]
+    fn soft_sync_response_two_tunnels_roundtrip() {
+        let buf = encode_soft_sync_response(&[TUNNELTYPE_UDPFECR, TUNNELTYPE_UDPFECL]);
+        let mut src = ReadCursor::new(&buf);
+        let pdu = decode_dvc_pdu(&mut src).unwrap();
+        assert_eq!(
+            pdu,
+            DvcPdu::SoftSyncResponse {
+                tunnels_to_switch: vec![TUNNELTYPE_UDPFECR, TUNNELTYPE_UDPFECL],
+            },
+        );
+    }
+
+    #[test]
+    fn soft_sync_response_bad_header_byte_rejected() {
+        // cbId=1 — byte0 should be 0x91.
+        let buf = [0x91, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut src = ReadCursor::new(&buf);
+        assert!(decode_dvc_pdu(&mut src).is_err());
+    }
+
+    #[test]
+    fn tunneltype_constants_distinct_from_rdpbcgr() {
+        // RDPEDYC uses 1 / 3 (NOT 1 / 4 like RDPBCGR §2.2.15.1).
+        assert_eq!(TUNNELTYPE_UDPFECR, 0x01);
+        assert_eq!(TUNNELTYPE_UDPFECL, 0x03);
     }
 
     #[test]

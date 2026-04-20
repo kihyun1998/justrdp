@@ -176,6 +176,21 @@ impl DrdynvcClient {
                     Ok(vec![])
                 }
             }
+            DvcPdu::SoftSyncRequest { .. } => {
+                // The PDU is decoded so the client doesn't drop the connection,
+                // but multitransport-aware routing isn't wired up yet — without
+                // a Soft-Sync Response, MS-RDPEDYC §3.2.5.3.1 mandates that all
+                // DVC data continues over the DRDYNVC SVC, which is exactly the
+                // current behavior. Routing migration lands with §10.3 Commit E.
+                Ok(vec![])
+            }
+            DvcPdu::SoftSyncResponse { .. } => {
+                // Server-bound PDU; receiving it on the client side is a
+                // protocol violation.
+                Err(DvcError::Protocol(String::from(
+                    "unexpected DYNVC_SOFT_SYNC_RESPONSE on client",
+                )))
+            }
         }
     }
 
@@ -548,5 +563,33 @@ mod tests {
 
         assert_eq!(client.channel_id_by_name("testdvc"), Some(3));
         assert_eq!(client.channel_id_by_name("nonexistent"), None);
+    }
+
+    #[test]
+    fn soft_sync_request_no_op_response() {
+        // Soft-Sync routing isn't wired up yet; the client must accept the
+        // PDU and stay silent (per §3.2.5.3.1, no Response = stay on SVC).
+        let mut client = DrdynvcClient::new();
+        let req = pdu::encode_soft_sync_request(
+            pdu::SOFT_SYNC_TCP_FLUSHED | pdu::SOFT_SYNC_CHANNEL_LIST_PRESENT,
+            &[pdu::SoftSyncChannelList {
+                tunnel_type: pdu::TUNNELTYPE_UDPFECR,
+                dvc_ids: vec![3],
+            }],
+        );
+        let responses = client.process(&req).expect("Soft-Sync Request must decode");
+        assert!(responses.is_empty(), "no Response is sent yet (Commit E will wire routing)");
+    }
+
+    #[test]
+    fn soft_sync_response_from_server_rejected() {
+        // Server-bound PDU received by the client → protocol error.
+        let mut client = DrdynvcClient::new();
+        let resp = pdu::encode_soft_sync_response(&[pdu::TUNNELTYPE_UDPFECR]);
+        let err = client.process(&resp).expect_err("must reject client-only PDU");
+        match err {
+            justrdp_svc::SvcError::Protocol(_) => {}
+            other => panic!("expected SvcError::Protocol, got {other:?}"),
+        }
     }
 }
