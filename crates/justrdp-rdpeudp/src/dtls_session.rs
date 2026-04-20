@@ -14,14 +14,20 @@
 //! ```text
 //! Caller                     DtlsSession                  RdpeudpSession (UDP)
 //!   new(rng)        ─────►   build ClientHello   ─────►   send datagram(s)
-//!   recv datagram   ─────►   feed_record(rec)
+//!   recv datagram   ─────►   feed_record(rec)            // handshake/CCS records
 //!                            ├─► HVR     → re-ClientHello
 //!                            ├─► ServerHello/Cert/SHD
 //!                            └─► CCS+Finished (after CKE flight)
 //!   is_connected()  ─────►   true
-//!   encrypt_app_data       ─────►   APPLICATION_DATA record  ─────►   send datagram
-//!   feed_record(app)       ─────►   decrypt_app_data → plaintext
+//!   encrypt_app_data ─────►   APPLICATION_DATA record  ─────►   send datagram
+//!   recv datagram   ─────►   inspect record.content_type:
+//!                              APPLICATION_DATA → decrypt_app_data(rec)
+//!                              else             → feed_record(rng, rec)
 //! ```
+//!
+//! Application-data records are routed by the caller, *not* via
+//! `feed_record` — passing one returns [`DtlsError::UnexpectedMessage`]
+//! without mutating the session.
 
 extern crate alloc;
 
@@ -30,7 +36,7 @@ use alloc::vec::Vec;
 
 use crate::dtls::{
     ct_eq, decrypt_record, encrypt_record, DtlsRecord, KeyBlock, AES_BLOCK_SIZE,
-    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
+    CONTENT_TYPE_APPLICATION_DATA,
 };
 use crate::dtls_handshake::{
     DtlsClientHandshake, DtlsError, DtlsRandom, DtlsState,
@@ -121,9 +127,24 @@ impl DtlsSession {
         rng: &mut R,
         record: &DtlsRecord,
     ) -> Result<(), DtlsError> {
-        // Encrypted records arrive once the server enters epoch 1
-        // (server CCS or Finished, then any application data). Decrypt
-        // before letting the handshake or the app layer see them.
+        // The wire `content_type` byte is in plaintext on the record
+        // header even when the fragment is encrypted, so we can route
+        // application data away from the handshake path *before*
+        // decrypting and before consuming the seqnum slot. If we
+        // decrypted first and *then* rejected, `last_recv_seq` would
+        // be advanced past this record's number — `decrypt_app_data`
+        // would later refuse to re-process it as "replay/out-of-order"
+        // and the caller would have permanently lost the message.
+        if record.content_type == CONTENT_TYPE_APPLICATION_DATA {
+            return Err(DtlsError::UnexpectedMessage(
+                CONTENT_TYPE_APPLICATION_DATA,
+            ));
+        }
+
+        // Encrypted handshake/CCS records arrive once the server
+        // enters epoch 1 (server Finished is the only epoch-1
+        // handshake message in this flow). Decrypt before letting the
+        // handshake see them.
         let plaintext_record;
         let dispatched: &DtlsRecord = if record.epoch == 0 {
             record
@@ -135,7 +156,8 @@ impl DtlsSession {
                 "encrypted record before keys derived",
             ))?;
             // Anti-replay: enforce strictly increasing seqnum within
-            // epoch 1.
+            // epoch 1. Done before mutating state so a rejected record
+            // leaves the session intact.
             if let Some(prev) = self.last_recv_seq {
                 if record.sequence_number <= prev {
                     return Err(DtlsError::Protocol("DTLS replay/out-of-order"));
@@ -161,15 +183,6 @@ impl DtlsSession {
             };
             &plaintext_record
         };
-
-        // Application data after handshake completes is returned to
-        // the caller via decrypt_app_data — it doesn't go through the
-        // handshake's receive() path.
-        if dispatched.content_type == CONTENT_TYPE_APPLICATION_DATA {
-            return Err(DtlsError::InvalidState(
-                "application data must be consumed via decrypt_app_data",
-            ));
-        }
 
         let responses = self.handshake.receive(dispatched)?;
         for r in responses {
@@ -267,27 +280,10 @@ impl DtlsSession {
     }
 }
 
-// `CONTENT_TYPE_HANDSHAKE` and `CONTENT_TYPE_CHANGE_CIPHER_SPEC` are
-// re-exported so loopback tests in other crates don't have to dig into
-// the dtls module just to drive the wrapper.
-pub use crate::dtls::{
-    CONTENT_TYPE_APPLICATION_DATA as APPLICATION_DATA_CONTENT_TYPE,
-    CONTENT_TYPE_CHANGE_CIPHER_SPEC as CHANGE_CIPHER_SPEC_CONTENT_TYPE,
-    CONTENT_TYPE_HANDSHAKE as HANDSHAKE_CONTENT_TYPE,
-};
-
-// Keep the imports above honest for clippy / dead-code checks.
-#[allow(dead_code)]
-const _ASSERT: (u8, u8, u8) = (
-    CONTENT_TYPE_HANDSHAKE,
-    CONTENT_TYPE_CHANGE_CIPHER_SPEC,
-    CONTENT_TYPE_APPLICATION_DATA,
-);
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dtls::{KeyBlock, DTLS_1_2};
+    use crate::dtls::{KeyBlock, CONTENT_TYPE_HANDSHAKE, DTLS_1_2};
     use alloc::vec;
 
     /// A counter-based RNG for deterministic test vectors. NOT

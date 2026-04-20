@@ -397,11 +397,16 @@ pub struct TunnelData {
 }
 
 impl TunnelData {
-    /// Build a Data PDU. Returns `Err` if `data.len() > u16::MAX`, since the
-    /// `PayloadLength` field is only 16 bits.
-    pub fn new(higher_layer_data: Vec<u8>) -> Result<Self, &'static str> {
+    /// Build a Data PDU. Returns `EncodeError::invalid_value` if
+    /// `data.len() > u16::MAX`, since the `PayloadLength` field is only
+    /// 16 bits. Uses `EncodeError` (instead of a string) so callers can
+    /// `?`-propagate alongside other PDU errors.
+    pub fn new(higher_layer_data: Vec<u8>) -> EncodeResult<Self> {
         if higher_layer_data.len() > u16::MAX as usize {
-            return Err("TunnelData: higher_layer_data exceeds u16::MAX");
+            return Err(EncodeError::invalid_value(
+                "TunnelData",
+                "higher_layer_data exceeds u16::MAX",
+            ));
         }
         Ok(Self {
             header: TunnelHeader::new(

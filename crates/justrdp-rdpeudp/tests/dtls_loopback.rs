@@ -199,8 +199,10 @@ fn rsa_pkcs1_v15_decrypt(key: &RsaPrivateKey, ciphertext: &[u8]) -> Option<Vec<u
         }
     }
     let sep = sep?;
-    if sep < 11 {
-        return None; // PS too short (RFC 8017 §7.2.1)
+    // PS occupies em[2..sep], so PS length = sep - 2. RFC 8017 §7.2.2
+    // requires PS length >= 8, i.e. sep >= 10.
+    if sep < 10 {
+        return None;
     }
     Some(em[sep + 1..].to_vec())
 }

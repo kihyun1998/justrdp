@@ -576,7 +576,8 @@ mod tests {
                 tunnel_type: pdu::TUNNELTYPE_UDPFECR,
                 dvc_ids: vec![3],
             }],
-        );
+        )
+        .unwrap();
         let responses = client.process(&req).expect("Soft-Sync Request must decode");
         assert!(responses.is_empty(), "no Response is sent yet (Commit E will wire routing)");
     }
@@ -585,7 +586,7 @@ mod tests {
     fn soft_sync_response_from_server_rejected() {
         // Server-bound PDU received by the client → protocol error.
         let mut client = DrdynvcClient::new();
-        let resp = pdu::encode_soft_sync_response(&[pdu::TUNNELTYPE_UDPFECR]);
+        let resp = pdu::encode_soft_sync_response(&[pdu::TUNNELTYPE_UDPFECR]).unwrap();
         let err = client.process(&resp).expect_err("must reject client-only PDU");
         match err {
             justrdp_svc::SvcError::Protocol(_) => {}
