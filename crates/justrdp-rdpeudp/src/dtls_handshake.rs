@@ -126,6 +126,11 @@ pub struct DtlsClientHandshake {
     master_secret: [u8; MASTER_SECRET_SIZE],
     keys: Option<KeyBlock>,
     server_public_key: Option<RsaPublicKey>,
+    /// Raw SubjectPublicKeyInfo bytes from the leaf certificate. Captured
+    /// so callers can pin against the SPKI from the main RDP TLS channel
+    /// (MS-RDPEMT §5.1: the multitransport cert MUST match the main
+    /// connection cert).
+    server_spki: Option<Vec<u8>>,
 
     // ── Cookie from HelloVerifyRequest ──
     cookie: Vec<u8>,
@@ -158,6 +163,7 @@ impl DtlsClientHandshake {
             master_secret: [0; MASTER_SECRET_SIZE],
             keys: None,
             server_public_key: None,
+            server_spki: None,
             cookie: Vec::new(),
             received_server_ccs: false,
         }
@@ -175,6 +181,13 @@ impl DtlsClientHandshake {
     /// completes).
     pub fn keys(&self) -> Option<&KeyBlock> {
         self.keys.as_ref()
+    }
+
+    /// Return the server's SubjectPublicKeyInfo bytes (available after
+    /// `Certificate` is processed). MS-RDPEMT §5.1 callers SHOULD pin
+    /// this against the SPKI from the main RDP TLS channel.
+    pub fn server_spki(&self) -> Option<&[u8]> {
+        self.server_spki.as_deref()
     }
 
     /// Return the negotiated DTLS version bytes.
@@ -388,6 +401,9 @@ impl DtlsClientHandshake {
             .ok_or(DtlsError::BadCertificate)?;
         let pubkey = parse_rsa_spki(&spki).ok_or(DtlsError::BadCertificate)?;
         self.server_public_key = Some(pubkey);
+        // Capture raw SPKI bytes so the caller can pin against the
+        // main-channel TLS cert per MS-RDPEMT §5.1.
+        self.server_spki = Some(spki);
 
         self.state = DtlsState::WaitServerHelloDone;
         Ok(vec![])

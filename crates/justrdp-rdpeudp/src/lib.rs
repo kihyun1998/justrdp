@@ -34,6 +34,9 @@ pub mod dtls;
 pub mod dtls_handshake;
 
 #[cfg(feature = "alloc")]
+pub mod dtls_session;
+
+#[cfg(feature = "alloc")]
 pub mod fec;
 
 #[cfg(feature = "alloc")]
