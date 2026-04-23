@@ -27,6 +27,8 @@ pub mod pdu;
 mod backend;
 #[cfg(feature = "alloc")]
 mod processor;
+#[cfg(feature = "alloc")]
+mod server;
 
 #[cfg(feature = "alloc")]
 pub use backend::{
@@ -34,3 +36,5 @@ pub use backend::{
 };
 #[cfg(feature = "alloc")]
 pub use processor::CliprdrClient;
+#[cfg(feature = "alloc")]
+pub use server::{ClipboardServer, RdpServerClipboardHandler};
