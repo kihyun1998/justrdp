@@ -25,12 +25,14 @@
 //! across `CHANNEL_FLAG_FIRST` / `_LAST` chunks and surfaced as
 //! [`ActiveStageOutput::SvcData`].
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use justrdp_acceptor::AcceptanceResult;
 use justrdp_core::{Decode, ReadCursor};
 use justrdp_pdu::mcs::SendDataRequest;
+use justrdp_svc::{SvcError, SvcServerProcessor};
 use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathInputHeader};
 use justrdp_pdu::rdp::finalization::{
     ControlAction, ControlPdu, InputEventPdu, InputEventType, PersistentKeyListPdu, RefreshRectPdu,
@@ -113,6 +115,18 @@ fn slow_path_kbd_flags_to_fast_path(slow: u16) -> u16 {
 /// before the stage rejects further entries. Mirrors the DoS cap the
 /// acceptor enforces during finalization.
 const MAX_PERSISTENT_KEY_LIST_PDUS: u8 = 64;
+
+/// Translate an [`SvcError`] raised by an [`SvcServerProcessor`] into
+/// the server-crate error flavor. Decode / encode faults keep their
+/// typed identity; protocol violations become `ProtocolOwned` so the
+/// message survives.
+fn svc_error_to_server_error(e: SvcError) -> ServerError {
+    match e {
+        SvcError::Decode(d) => ServerError::from(d),
+        SvcError::Encode(e) => ServerError::from(e),
+        SvcError::Protocol(msg) => ServerError::protocol_owned(msg),
+    }
+}
 
 /// Hard cap on per-channel SVC reassembly buffer size. Without this,
 /// `ChannelPduHeader.length` (a wire-supplied `u32`) can drive a 4 GiB
@@ -260,6 +274,14 @@ pub struct ServerActiveStage {
     /// [`confirm_redemand_active_complete`](Self::confirm_redemand_active_complete)
     /// records the new `share_id`.
     pending_display_size: Option<(u16, u16)>,
+    /// Server-side SVC processors registered via
+    /// [`register_svc_processor`](Self::register_svc_processor). Inbound
+    /// SVC data on a channel with a registered processor is dispatched
+    /// to `.process()` and the returned messages are encoded as outbound
+    /// wire frames (emitted as [`ActiveStageOutput::SendBytes`]).
+    /// Channels without a registered processor fall through to the
+    /// [`ActiveStageOutput::SvcData`] opaque-forward path (§11.2a).
+    svc_processors: Vec<(u16, Box<dyn SvcServerProcessor>)>,
 }
 
 impl ServerActiveStage {
@@ -276,6 +298,7 @@ impl ServerActiveStage {
             svc_reassembly: Vec::new(),
             deactivation_state: DeactivationState::Active,
             pending_display_size: None,
+            svc_processors: Vec::new(),
         }
     }
 
@@ -514,9 +537,16 @@ impl ServerActiveStage {
                      ChannelPduHeader.length",
                 ));
             }
+            let payload = chunk.to_vec();
+            if let Some(frames) = self.dispatch_svc(channel_id, &payload)? {
+                return Ok(frames
+                    .into_iter()
+                    .map(ActiveStageOutput::SendBytes)
+                    .collect());
+            }
             return Ok(alloc::vec![ActiveStageOutput::SvcData {
                 channel_id,
-                payload: chunk.to_vec(),
+                payload,
             }]);
         }
 
@@ -597,12 +627,103 @@ impl ServerActiveStage {
             }
             let payload = core::mem::take(&mut entry.buffer);
             entry.expected_total = 0;
+            if let Some(frames) = self.dispatch_svc(channel_id, &payload)? {
+                return Ok(frames
+                    .into_iter()
+                    .map(ActiveStageOutput::SendBytes)
+                    .collect());
+            }
             return Ok(alloc::vec![ActiveStageOutput::SvcData {
                 channel_id,
                 payload,
             }]);
         }
         Ok(Vec::new())
+    }
+
+    /// Register a server-direction SVC processor for the channel named
+    /// by `processor.channel_name()`. The channel MUST be in the
+    /// negotiated list produced by the acceptor; otherwise this returns
+    /// `ServerError::protocol(_)`. Only one processor per channel may be
+    /// registered at a time (duplicates are also rejected).
+    ///
+    /// `start()` is invoked on the processor immediately and the
+    /// resulting `SvcMessage`s are encoded into outbound SVC wire frames
+    /// (TPKT + X.224 DT + MCS SDI + `ChannelPduHeader` + payload,
+    /// already chunked to `config.channel_chunk_length`). The caller
+    /// MUST flush these frames before the next client PDU arrives --
+    /// for CLIPRDR this is the Server Capabilities + Monitor Ready
+    /// burst required by MS-RDPECLIP 3.2.
+    ///
+    /// Once registered, inbound SVC data on this channel is dispatched
+    /// to the processor via `.process()` and its responses are emitted
+    /// as [`ActiveStageOutput::SendBytes`] chunks. Channels without a
+    /// registered processor continue to surface as
+    /// [`ActiveStageOutput::SvcData`] (§11.2a opaque-forward behaviour).
+    pub fn register_svc_processor(
+        &mut self,
+        mut processor: Box<dyn SvcServerProcessor>,
+    ) -> ServerResult<Vec<Vec<u8>>> {
+        let name = processor.channel_name();
+        let channel_id = self
+            .channel_ids
+            .iter()
+            .find(|(n, _)| n.as_str() == name.as_str())
+            .map(|(_, id)| *id)
+            .ok_or_else(|| {
+                ServerError::protocol_owned(alloc::format!(
+                    "SVC processor channel '{name}' is not in the negotiated VC list"
+                ))
+            })?;
+        if self.svc_processors.iter().any(|(id, _)| *id == channel_id) {
+            return Err(ServerError::protocol(
+                "duplicate SVC processor registration for the same channel",
+            ));
+        }
+
+        let messages = processor.start().map_err(svc_error_to_server_error)?;
+        self.svc_processors.push((channel_id, processor));
+
+        let mut frames = Vec::new();
+        for msg in &messages {
+            frames.extend(self.encode_svc_send(channel_id, &msg.data)?);
+        }
+        Ok(frames)
+    }
+
+    /// Whether a server-direction SVC processor is registered for
+    /// `channel_id`. Returns `false` for unknown channels.
+    pub fn has_svc_processor(&self, channel_id: u16) -> bool {
+        self.svc_processors
+            .iter()
+            .any(|(id, _)| *id == channel_id)
+    }
+
+    /// Hand a reassembled SVC payload to a registered processor, if any,
+    /// and encode the response as outbound SVC frames. `None` means no
+    /// processor is registered for this channel -- the caller falls
+    /// through to [`ActiveStageOutput::SvcData`].
+    fn dispatch_svc(
+        &mut self,
+        channel_id: u16,
+        payload: &[u8],
+    ) -> ServerResult<Option<Vec<Vec<u8>>>> {
+        let Some(idx) = self
+            .svc_processors
+            .iter()
+            .position(|(id, _)| *id == channel_id)
+        else {
+            return Ok(None);
+        };
+        let messages = {
+            let processor = &mut self.svc_processors[idx].1;
+            processor.process(payload).map_err(svc_error_to_server_error)?
+        };
+        let mut frames = Vec::new();
+        for msg in &messages {
+            frames.extend(self.encode_svc_send(channel_id, &msg.data)?);
+        }
+        Ok(Some(frames))
     }
 
     // Server-direction framing helpers (encode_svc_send,
@@ -1914,5 +2035,274 @@ mod tests {
         let (_sc, body) = strip_to_share_control(&bytes);
         let pdu = DeactivateAllPdu::decode(&mut ReadCursor::new(&body)).unwrap();
         assert_eq!(pdu.share_id, 0x1111_2222);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // SVC processor registry / dispatch tests (§11.2c-1 Commit 2)
+    // ──────────────────────────────────────────────────────────────
+
+    use justrdp_core::AsAny;
+    use justrdp_svc::{
+        ChannelName, CompressionCondition, SvcMessage, SvcProcessor, SvcResult,
+        SvcServerProcessor,
+    };
+
+    /// Stateless test processor that echoes `process()` input back and
+    /// emits a caller-provided fixed message from `start()`. Holds no
+    /// shared observation state — tests inspect behaviour via the
+    /// outbound frames instead.
+    struct EchoServerProcessor {
+        name: ChannelName,
+        start_msg: Vec<u8>,
+    }
+
+    impl core::fmt::Debug for EchoServerProcessor {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("EchoServerProcessor")
+                .field("name", &self.name)
+                .finish()
+        }
+    }
+
+    impl AsAny for EchoServerProcessor {
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
+        }
+    }
+
+    impl SvcProcessor for EchoServerProcessor {
+        fn channel_name(&self) -> ChannelName {
+            self.name
+        }
+        fn start(&mut self) -> SvcResult<Vec<SvcMessage>> {
+            if self.start_msg.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(alloc::vec![SvcMessage::new(self.start_msg.clone())])
+            }
+        }
+        fn process(&mut self, payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
+            Ok(alloc::vec![SvcMessage::new(payload.to_vec())])
+        }
+        fn compression_condition(&self) -> CompressionCondition {
+            CompressionCondition::Never
+        }
+    }
+
+    impl SvcServerProcessor for EchoServerProcessor {}
+
+    /// Decode a TPKT + X.224 + MCS + ChannelPduHeader outbound frame
+    /// into `(channel_id, flags, total_len, payload)` so tests can
+    /// assert on the wire.
+    fn decode_svc_frame(frame: &[u8]) -> (u16, u32, u32, Vec<u8>) {
+        let mut c = ReadCursor::new(frame);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let h = ChannelPduHeader::decode(&mut inner).unwrap();
+        (sdi.channel_id, h.flags, h.length, inner.peek_remaining().to_vec())
+    }
+
+    #[test]
+    fn register_svc_processor_unknown_channel_rejected() {
+        // fake_result() negotiates only "rdpsnd"; register a processor
+        // whose channel_name is "cliprdr" → protocol error.
+        let mut s = fake_stage();
+        let err = s
+            .register_svc_processor(Box::new(EchoServerProcessor {
+                name: ChannelName::new(b"cliprdr"),
+                start_msg: Vec::new(),
+            }))
+            .unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("not in the negotiated VC list"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn register_svc_processor_duplicate_rejected() {
+        let mut s = fake_stage();
+        s.register_svc_processor(Box::new(EchoServerProcessor {
+            name: ChannelName::new(b"rdpsnd"),
+            start_msg: Vec::new(),
+        }))
+        .unwrap();
+
+        let err = s
+            .register_svc_processor(Box::new(EchoServerProcessor {
+                name: ChannelName::new(b"rdpsnd"),
+                start_msg: Vec::new(),
+            }))
+            .unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("duplicate SVC processor"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn register_svc_processor_start_returns_encoded_frames() {
+        let mut s = fake_stage();
+        let frames = s
+            .register_svc_processor(Box::new(EchoServerProcessor {
+                name: ChannelName::new(b"rdpsnd"),
+                start_msg: b"INIT".to_vec(),
+            }))
+            .unwrap();
+        assert_eq!(frames.len(), 1, "single-chunk start message");
+        let (ch, flags, total, payload) = decode_svc_frame(&frames[0]);
+        assert_eq!(ch, 0x03EC);
+        assert_eq!(flags & (CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST),
+                   CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST);
+        assert_eq!(total as usize, 4);
+        assert_eq!(payload, b"INIT");
+        assert!(s.has_svc_processor(0x03EC));
+    }
+
+    #[test]
+    fn register_svc_processor_without_start_emit_returns_no_frames() {
+        let mut s = fake_stage();
+        let frames = s
+            .register_svc_processor(Box::new(EchoServerProcessor {
+                name: ChannelName::new(b"rdpsnd"),
+                start_msg: Vec::new(),
+            }))
+            .unwrap();
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn inbound_svc_dispatched_to_registered_processor_single_chunk() {
+        let mut s = fake_stage();
+        s.register_svc_processor(Box::new(EchoServerProcessor {
+            name: ChannelName::new(b"rdpsnd"),
+            start_msg: Vec::new(),
+        }))
+        .unwrap();
+
+        // Client sends "HELLO" on rdpsnd; echo processor must respond
+        // with the same bytes, surfaced as SendBytes (not SvcData).
+        let bytes = wrap_client_svc_chunk(
+            &s,
+            0x03EC,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST,
+            5,
+            b"HELLO",
+        );
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
+        assert_eq!(out.len(), 1, "one outbound frame expected");
+        match &out[0] {
+            ActiveStageOutput::SendBytes(frame) => {
+                let (ch, flags, total, payload) = decode_svc_frame(frame);
+                assert_eq!(ch, 0x03EC);
+                assert!(flags & CHANNEL_FLAG_FIRST != 0);
+                assert!(flags & CHANNEL_FLAG_LAST != 0);
+                assert_eq!(total as usize, 5);
+                assert_eq!(payload, b"HELLO");
+            }
+            other => panic!("expected SendBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_svc_multi_chunk_reassembles_then_dispatches() {
+        let mut s = fake_stage();
+        s.register_svc_processor(Box::new(EchoServerProcessor {
+            name: ChannelName::new(b"rdpsnd"),
+            start_msg: Vec::new(),
+        }))
+        .unwrap();
+
+        let full: Vec<u8> = (0..200u8).collect();
+        let f1 = wrap_client_svc_chunk(&s, 0x03EC, CHANNEL_FLAG_FIRST, 200, &full[..120]);
+        let f2 = wrap_client_svc_chunk(&s, 0x03EC, CHANNEL_FLAG_LAST, 200, &full[120..]);
+
+        // Intermediate chunks emit nothing (reassembly pending).
+        assert!(s.process(&f1, &mut NoopHandler).unwrap().is_empty());
+
+        // LAST chunk → echo processor sees 200 bytes → echoes back.
+        let out = s.process(&f2, &mut NoopHandler).unwrap();
+        // 200 bytes fits in one outbound chunk (default 1600).
+        let mut all = Vec::new();
+        for o in out {
+            match o {
+                ActiveStageOutput::SendBytes(frame) => {
+                    let (ch, _flags, _total, payload) = decode_svc_frame(&frame);
+                    assert_eq!(ch, 0x03EC);
+                    all.extend(payload);
+                }
+                other => panic!("expected SendBytes, got {other:?}"),
+            }
+        }
+        assert_eq!(all, full);
+    }
+
+    #[test]
+    fn inbound_svc_without_processor_falls_through_to_svc_data() {
+        // Regression: §11.2a opaque-forward behaviour MUST survive when
+        // no processor is registered for the channel.
+        let mut s = fake_stage();
+        let bytes = wrap_client_svc_chunk(
+            &s,
+            0x03EC,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST,
+            3,
+            b"RAW",
+        );
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
+        assert_eq!(
+            out,
+            vec![ActiveStageOutput::SvcData {
+                channel_id: 0x03EC,
+                payload: b"RAW".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_errors_propagate() {
+        // A processor that returns an Err from process() MUST surface
+        // as a ServerError rather than being silently swallowed.
+        struct FailingProcessor;
+        impl core::fmt::Debug for FailingProcessor {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("FailingProcessor")
+            }
+        }
+        impl AsAny for FailingProcessor {
+            fn as_any(&self) -> &dyn core::any::Any { self }
+            fn as_any_mut(&mut self) -> &mut dyn core::any::Any { self }
+        }
+        impl SvcProcessor for FailingProcessor {
+            fn channel_name(&self) -> ChannelName { ChannelName::new(b"rdpsnd") }
+            fn start(&mut self) -> SvcResult<Vec<SvcMessage>> { Ok(Vec::new()) }
+            fn process(&mut self, _payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
+                Err(SvcError::Protocol(alloc::string::String::from(
+                    "processor-side decode failure",
+                )))
+            }
+        }
+        impl SvcServerProcessor for FailingProcessor {}
+
+        let mut s = fake_stage();
+        s.register_svc_processor(Box::new(FailingProcessor)).unwrap();
+
+        let bytes = wrap_client_svc_chunk(
+            &s,
+            0x03EC,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST,
+            1,
+            b"x",
+        );
+        let err = s.process(&bytes, &mut NoopHandler).unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("processor-side decode failure"),
+            "got: {err}"
+        );
     }
 }

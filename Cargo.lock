@@ -626,6 +626,7 @@ dependencies = [
  "justrdp-acceptor",
  "justrdp-core",
  "justrdp-pdu",
+ "justrdp-svc",
 ]
 
 [[package]]
