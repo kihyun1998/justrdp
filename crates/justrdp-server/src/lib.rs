@@ -18,6 +18,7 @@ extern crate std;
 
 mod active;
 mod config;
+mod encoder;
 mod error;
 mod handler;
 mod server;
@@ -32,6 +33,7 @@ pub use handler::{
     RdpServerDisplayHandler, RdpServerInputHandler,
 };
 pub use active::{ActiveStageOutput, ServerActiveStage};
+pub use encoder::{encode_bitmap_update, MAX_FAST_PATH_PDU_LENGTH};
 pub use server::RdpServer;
 
 // Re-export the acceptor-side types the driver depends on so callers don't
