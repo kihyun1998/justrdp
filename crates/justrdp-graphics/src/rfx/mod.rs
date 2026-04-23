@@ -18,6 +18,7 @@ pub mod quant;
 pub mod rlgr;
 pub mod subband;
 pub mod tile;
+pub mod wire;
 
 use alloc::vec::Vec;
 use core::fmt;
