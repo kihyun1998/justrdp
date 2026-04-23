@@ -2343,25 +2343,117 @@ uncompressed bitmap fast-path, 입력/종료/SVC opaque forward까지. RFX/EGFX
 #### 11.2b -- Server-Side GFX Encoding Pipeline
 
 > **requires**: 11.2a, Phase 3 RFX 인코더, 8.6 EGFX, 4.4 ZGFX
+>
+> §11.2a 보다 범위가 커서 5개의 sub-section 으로 다시 분할. b-1 부터
+> 직선적으로 의존 (b-2 가 b-1 의 fast-path SurfaceCommands 인코더 위에
+> RFX 페이로드를 얹고, b-3 이 b-2 의 RFX 프레임을 EGFX `WireToSurface1`
+> 바디로 사용). b-5 (Deactivation-Reactivation) 만 b-1 에만 의존하므로
+> 독립 진행 가능.
+> mstsc 실서버 인터롭 스모크 테스트는 §11.2d 로 이관 (b 단독으로는
+> client/server 양측이 한 프로세스에서 돌아가는 환경이 없음).
 
-목표: 실서버 수준의 코덱 경로. tile encoder를 frame 레벨로 래핑하고
-EGFX/DVC 송신 루프를 깔아서 **mstsc 인터롭**에 도달.
+##### 11.2b-1 -- SurfaceCommand PDU & Fast-Path Frame
 
-- [ ] `SurfaceCommand` 기반 슬로우/패스트 패스 송신 (2.2.9.1.2.1.10)
-- [ ] RFX 서버 인코딩 루프 -- `TS_RFX_FRAME_BEGIN`/`TS_RFX_REGION`/
-      `TS_RFX_TILESET`/`TS_RFX_FRAME_END` 프레이밍, quant/tile
-      파티셔닝, context 관리
-- [ ] Progressive RFX 품질 스케줄링 hook
-- [ ] EGFX (DVC) 서버 인코딩 루프 -- `CreateSurface` /
-      `MapSurfaceToOutput` / `ResetGraphics` / `WireToSurface1-2` /
-      `StartFrame` / `EndFrame` + `FrameAcknowledge` 왕복
-- [ ] ZGFX 압축 프레이밍 (`DYNVC_DATA_FIRST_COMPRESSED` /
-      `DYNVC_DATA_COMPRESSED`)
-- [ ] Deactivation-Reactivation 서버측 재드라이브 (디스플레이 크기
-      변경 등) -- Deactivate All → 재 Demand Active
-- [ ] `DisplayHandler`에 `get_surface_update()` /
-      `get_egfx_frame()` 확장 seam
-- [ ] mstsc 실서버 인터롭 스모크 테스트
+> **requires**: 11.2a
+
+`FASTPATH_UPDATETYPE_SURFCMDS = 0x4` 위에 얹히는 Surface Command 송신
+경로. 코덱 페이로드는 b-2/b-3 에서 채우되, **컨테이너 PDU 와 fast-path
+인코더 + DisplayHandler seam 만 먼저 안착**.
+
+- [ ] `SetSurfaceBitsCommand` PDU (MS-RDPBCGR 2.2.9.2.1) -- destLeft/Top/
+      Right/Bottom + `TS_BITMAP_DATA_EX` 페이로드 컨테이너
+- [ ] `StreamSurfaceBitsCommand` PDU (MS-RDPBCGR 2.2.9.2.2)
+- [ ] `FrameMarkerCommand` PDU (MS-RDPBCGR 2.2.9.2.3) -- Begin/End
+      frameId
+- [ ] Fast-path `SurfaceCommands` 업데이트 인코더 (`encode_fast_path` +
+      fragmentation, 15-bit 길이 캡)
+- [ ] `DisplayUpdate::SurfaceBits { dest, bitmap_data_ex }` +
+      `DisplayUpdate::FrameMarker { begin, frame_id }` 추가
+- [ ] `RdpServerDisplayHandler::get_surface_update()` seam
+- [ ] PDU roundtrip + fast-path frame 인코더 단위 테스트
+
+##### 11.2b-2 -- RFX Wire-Level Framing & Server Encoder
+
+> **requires**: 11.2b-1, 6.3 RFX 코덱
+
+타일 인코더 (`RfxEncoder`) 위에 **MS-RDPRFX 2.2 메시지 스트림**을 깔고,
+서버 측 컨텍스트/채널/sync 핸드셰이크를 관리. RFX 비트스트림을
+`TS_BITMAP_DATA_EX.bitmapData` 로 실어 b-1 의 `SetSurfaceBitsCommand`
+페이로드로 전달.
+
+- [ ] `RfxBlockType` (`WBT_*`) + `RfxHeader` (blockType/blockLen)
+- [ ] `WBT_SYNC` (0xCCC0) -- magic + version
+- [ ] `WBT_CODEC_VERSIONS` (0xCCC1)
+- [ ] `WBT_CHANNELS` (0xCCC2) + `RfxChannel` (id/width/height)
+- [ ] `WBT_CONTEXT` (0xCCC3) -- ctxId/tileSize/properties (entropy/quant/
+      progressive flags)
+- [ ] `WBT_FRAME_BEGIN` (0xCCC4) / `WBT_FRAME_END` (0xCCC5)
+- [ ] `WBT_REGION` (0xCCC6) -- regionFlags + rect 배열
+- [ ] `WBT_TILESET` (0xCCC7) -- quants 테이블 + tile 배열 (tileIdx,
+      x/y, YLen/CbLen/CrLen, YData/CbData/CrData)
+- [ ] `RfxFrameEncoder` -- frame 단위 API (begin → region → tileset →
+      end), 서버 sync/codec_versions/channels/context handshake state,
+      quant/tile 파티셔닝
+- [ ] PDU roundtrip + frame 단위 인코드 테스트 (1 tile, 다중 tile,
+      다중 region)
+
+##### 11.2b-3 -- EGFX Server Encoding Loop
+
+> **requires**: 11.2b-2, 8.6 EGFX, 11.1 DVC 서버
+
+`GfxClient` 의 미러로 **`GfxServer`** 를 만들어 `DrdynvcServer` 에
+register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
+루프, `StartFrame/EndFrame ↔ FrameAcknowledge` 왕복 관리.
+
+- [ ] `GfxServer` -- `DvcProcessor` 구현 (server 방향)
+- [ ] Caps negotiation 서버측 -- `CapsAdvertise` 수신 → `CapsConfirm`
+      선택 (10.7 우선, fallback)
+- [ ] 서버 송신 API: `create_surface`, `delete_surface`,
+      `map_surface_to_output`, `reset_graphics`, `solid_fill`,
+      `surface_to_surface`, `cache_*`, `evict_cache_entry`
+- [ ] `wire_to_surface_1` (codec 디스패치: RFX/CLEARCODEC/PLANAR/
+      AVC420/AVC444/UNCOMPRESSED) + `wire_to_surface_2`
+- [ ] `start_frame` / `end_frame` 송신 + `FrameAcknowledge` 수신 추적
+      (`pending_frames` queue + `QUEUE_DEPTH_UNAVAILABLE` /
+      `SUSPEND_FRAME_ACKNOWLEDGEMENT` 인식)
+- [ ] `RdpServerDisplayHandler::get_egfx_frame()` seam
+- [ ] DVC integration test (loopback `DrdynvcServer ↔ DrdynvcClient` +
+      `GfxServer ↔ GfxClient` echo 한 프레임 RFX 인코드/디코드)
+
+##### 11.2b-4 -- Progressive RFX & ZGFX Compressed DVC Framing
+
+> **requires**: 11.2b-3
+
+송신 루프 위에 얹는 품질/대역 최적화. progressive 는 8.6 의
+`CodecQuant` 와 progressive flag 를 `WBT_TILESET` 에 흘려 단계적 품질
+향상. ZGFX-Lite 는 DVC 전송 시 `DYNVC_DATA_*COMPRESSED` 로 페이로드
+대체.
+
+- [ ] Progressive RFX 품질 스케줄링 hook -- `ProgressiveQualityScheduler`
+      trait + tile 별 quality level 결정 (sync/region/tileset 재사용
+      여부 판정)
+- [ ] EGFX 송신 시 ZGFX 압축 적용 -- `DvcProcessor::send` 단계에서
+      페이로드 → `ZgfxCompressor` → `DYNVC_DATA_FIRST_COMPRESSED` /
+      `DYNVC_DATA_COMPRESSED` 프레이밍
+- [ ] 압축률/사이즈 임계값 기반 fallback (압축 후 더 커지면 raw 전송)
+- [ ] 단위 테스트 (압축 결정/프레이밍 양방향)
+
+##### 11.2b-5 -- Deactivation-Reactivation Sequence
+
+> **requires**: 11.2b-1 (b-2/b-3 와 무관, 독립 진행 가능)
+
+해상도/모니터 변경 시 서버측 재드라이브. MS-RDPBCGR 1.3.1.3 시퀀스:
+서버 → `Deactivate All PDU` → 클라 ack → 서버 재 `Demand Active` →
+캡 재협상 → 활성 세션 복귀.
+
+- [ ] `DeactivateAllPdu` 송신 (MS-RDPBCGR 2.2.3.1)
+- [ ] `ServerActiveStage::request_deactivation_reactivation(new_size)`
+      API + 내부 상태 (`Active` → `WaitClientDeactivateAck` →
+      `RedemandActive` → `Active`)
+- [ ] 재 Demand Active 시 capability set 재생성 (해상도 변경 반영)
+- [ ] `RdpServerDisplayHandler::get_display_size()` 결과 변경 감지 hook
+      또는 명시적 API 둘 중 채택
+- [ ] 단위 테스트 (시퀀스 라운드트립, 변경된 해상도 반영)
 
 #### 11.2c -- Server-Direction Channel Handlers
 
