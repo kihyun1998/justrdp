@@ -26,16 +26,19 @@
 //!
 //! ## Sub-section coverage
 //!
-//! This file is staged across §11.2b-2 commits; this commit lands the
-//! handshake set (Sync / CodecVersions / Channels). Subsequent commits
-//! add Context, FrameBegin/FrameEnd/Region, TileSet/Tile, and the
-//! `RfxFrameEncoder` state machine on top.
+//! Staged across §11.2b-2 commits. So far: handshake set (Sync /
+//! CodecVersions / Channels) and the codec context (Context, including
+//! the [`RfxProperties`] bitfield helper shared with TileSet).
+//! Remaining commits add FrameBegin / FrameEnd / Region, TileSet /
+//! Tile, and the [`RfxFrameEncoder`] state machine.
 
 use alloc::vec::Vec;
 
 use justrdp_core::{
     Decode, DecodeError, DecodeResult, Encode, EncodeError, EncodeResult, ReadCursor, WriteCursor,
 };
+
+use super::rlgr::RlgrMode;
 
 // ── Block type constants (MS-RDPRFX 2.2.2.1.1) ──────────────────────
 
@@ -75,6 +78,33 @@ pub const CBT_REGION: u16 = 0xCAC1;
 
 /// `CBT_TILESET` — the `subtype` constant inside `WBT_EXTENSION`.
 pub const CBT_TILESET: u16 = 0xCAC2;
+
+// ── Properties bitfield constants (MS-RDPRFX 2.2.2.2.4 / 2.2.2.3.4) ─
+
+/// `flags = CODEC_MODE` -- image mode (every frame is independently
+/// decodable; handshake messages MUST precede each frame).
+/// MS-RDPRFX 2.2.2.2.4.
+pub const CODEC_MODE_IMAGE: u8 = 0x02;
+
+/// `cct = COL_CONV_ICT` -- the only color-conversion transform
+/// currently defined; MUST be written as 0x1. MS-RDPRFX 2.2.2.2.4.
+pub const COL_CONV_ICT: u8 = 0x1;
+
+/// `xft = CLW_XFORM_DWT_53_A` -- the only DWT variant currently
+/// defined; MUST be written as 0x1. MS-RDPRFX 2.2.2.2.4.
+pub const CLW_XFORM_DWT_53_A: u8 = 0x1;
+
+/// `et = CLW_ENTROPY_RLGR1` -- RLGR1 entropy coder.
+/// MS-RDPRFX 2.2.2.2.4.
+pub const CLW_ENTROPY_RLGR1: u8 = 0x01;
+
+/// `et = CLW_ENTROPY_RLGR3` -- RLGR3 entropy coder.
+/// MS-RDPRFX 2.2.2.2.4.
+pub const CLW_ENTROPY_RLGR3: u8 = 0x04;
+
+/// `qt = SCALAR_QUANTIZATION` -- the only quantization type currently
+/// defined; MUST be written as 0x1. MS-RDPRFX 2.2.2.2.4.
+pub const SCALAR_QUANTIZATION: u8 = 0x1;
 
 // ── Magic / version / fixed-value constants ─────────────────────────
 
@@ -131,6 +161,16 @@ pub const RFX_CODEC_VERSIONS_SIZE: usize = 10;
 /// Wire size of a single `TS_RFX_CHANNELT` entry inside `WBT_CHANNELS`
 /// (MS-RDPRFX 2.2.2.1.3).
 pub const RFX_CHANNELT_SIZE: usize = 5;
+
+/// Total wire size of a `TS_RFX_CONTEXT` block (MS-RDPRFX 2.2.2.2.4).
+pub const RFX_CONTEXT_SIZE: usize = 13;
+
+/// Fixed `ctxId` value -- MUST be 0 (MS-RDPRFX 2.2.2.2.4).
+pub const CTX_ID: u8 = 0x00;
+
+/// `tileSize` value inside `TS_RFX_CONTEXT` -- MUST be `0x0040`
+/// (64 pixels). MS-RDPRFX 2.2.2.2.4.
+pub const CT_TILE_64X64: u16 = 0x0040;
 
 // ── TS_RFX_BLOCKT ───────────────────────────────────────────────────
 
@@ -487,6 +527,208 @@ impl<'de> Decode<'de> for RfxChannels {
     }
 }
 
+// ── Properties bitfield helper ──────────────────────────────────────
+
+/// Variable parts of the `properties` bitfield shared by `TS_RFX_CONTEXT`
+/// (MS-RDPRFX 2.2.2.2.4) and `TS_RFX_TILESET` (MS-RDPRFX 2.2.2.3.4).
+///
+/// The two layouts are NOT identical -- TileSet inserts a `lt` (last
+/// tileset) bit at LSB, shifting every other field by one bit. Pack /
+/// unpack helpers per layout encapsulate this so callers never touch
+/// the bit positions directly.
+///
+/// Fixed fields (`cct`, `xft`, `qt`) only have one valid value each
+/// per the current spec and are written as that value during pack;
+/// unpack accepts any value (per spec "decoder SHOULD ignore" guidance)
+/// and discards them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RfxProperties {
+    /// `flags` (3 bits). Use [`CODEC_MODE_IMAGE`] for image-mode
+    /// streams (handshake every frame).
+    pub flags: u8,
+    /// Entropy coder selection. Drives the `et` (4 bits) field.
+    pub entropy: RlgrMode,
+}
+
+impl RfxProperties {
+    /// Image-mode default (`flags = CODEC_MODE_IMAGE`) with the supplied
+    /// entropy mode.
+    pub const fn image(entropy: RlgrMode) -> Self {
+        Self {
+            flags: CODEC_MODE_IMAGE,
+            entropy,
+        }
+    }
+
+    fn et_bits(self) -> u16 {
+        match self.entropy {
+            RlgrMode::Rlgr1 => CLW_ENTROPY_RLGR1 as u16,
+            RlgrMode::Rlgr3 => CLW_ENTROPY_RLGR3 as u16,
+        }
+    }
+
+    fn et_from_bits(raw: u16) -> DecodeResult<RlgrMode> {
+        match raw as u8 {
+            CLW_ENTROPY_RLGR1 => Ok(RlgrMode::Rlgr1),
+            CLW_ENTROPY_RLGR3 => Ok(RlgrMode::Rlgr3),
+            _ => Err(DecodeError::unexpected_value(
+                "RfxProperties",
+                "et",
+                "expected CLW_ENTROPY_RLGR1 (0x01) or CLW_ENTROPY_RLGR3 (0x04)",
+            )),
+        }
+    }
+
+    /// Pack into the `TS_RFX_CONTEXT.properties` u16 layout
+    /// (MS-RDPRFX 2.2.2.2.4):
+    /// `flags(3) | cct(2) | xft(4) | et(4) | qt(2) | r(1)`.
+    pub fn pack_context(self) -> u16 {
+        let flags = (self.flags as u16) & 0x07;
+        let cct = (COL_CONV_ICT as u16) & 0x03;
+        let xft = (CLW_XFORM_DWT_53_A as u16) & 0x0F;
+        let et = self.et_bits() & 0x0F;
+        let qt = (SCALAR_QUANTIZATION as u16) & 0x03;
+        flags | (cct << 3) | (xft << 5) | (et << 9) | (qt << 13)
+    }
+
+    /// Unpack a `TS_RFX_CONTEXT.properties` u16 into the variable
+    /// fields. Returns `Err` only when the `et` field has a value
+    /// other than `CLW_ENTROPY_RLGR1` (0x01) or `CLW_ENTROPY_RLGR3`
+    /// (0x04). Other fields (`cct`, `xft`, `qt`, `r`) are ignored
+    /// per spec ("decoder SHOULD ignore").
+    pub fn unpack_context(raw: u16) -> DecodeResult<Self> {
+        let flags = (raw & 0x07) as u8;
+        let et = (raw >> 9) & 0x0F;
+        Ok(Self {
+            flags,
+            entropy: Self::et_from_bits(et)?,
+        })
+    }
+
+    /// Pack into the `TS_RFX_TILESET.properties` u16 layout
+    /// (MS-RDPRFX 2.2.2.3.4):
+    /// `lt(1) | flags(3) | cct(2) | xft(4) | et(4) | qt(2)`.
+    /// `lt` is hard-coded to 1 (the only valid value -- there is always
+    /// exactly one TileSet per Region in the current spec).
+    pub fn pack_tileset(self) -> u16 {
+        let lt: u16 = 0x1;
+        let flags = (self.flags as u16) & 0x07;
+        let cct = (COL_CONV_ICT as u16) & 0x03;
+        let xft = (CLW_XFORM_DWT_53_A as u16) & 0x0F;
+        let et = self.et_bits() & 0x0F;
+        let qt = (SCALAR_QUANTIZATION as u16) & 0x03;
+        lt | (flags << 1) | (cct << 4) | (xft << 6) | (et << 10) | (qt << 14)
+    }
+
+    /// Unpack a `TS_RFX_TILESET.properties` u16. Same `et` validation
+    /// as [`unpack_context`](Self::unpack_context); other fields
+    /// (including `lt`) are ignored per spec.
+    pub fn unpack_tileset(raw: u16) -> DecodeResult<Self> {
+        let flags = ((raw >> 1) & 0x07) as u8;
+        let et = (raw >> 10) & 0x0F;
+        Ok(Self {
+            flags,
+            entropy: Self::et_from_bits(et)?,
+        })
+    }
+}
+
+// ── TS_RFX_CONTEXT ──────────────────────────────────────────────────
+
+/// `TS_RFX_CONTEXT` -- MS-RDPRFX 2.2.2.2.4.
+///
+/// Carries the codec context: tile size (always 64×64), entropy mode,
+/// and operational flags. Wrapped in [`RfxCodecChannelHeader`] with
+/// `channelId = CHANNEL_ID_CONTEXT` (0xFF) -- the special "all
+/// channels" id reserved for Context messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RfxContext {
+    pub properties: RfxProperties,
+}
+
+impl RfxContext {
+    /// Image-mode context with the given entropy coder.
+    pub const fn image(entropy: RlgrMode) -> Self {
+        Self {
+            properties: RfxProperties::image(entropy),
+        }
+    }
+}
+
+impl Encode for RfxContext {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        RfxCodecChannelHeader {
+            block_type: WBT_CONTEXT,
+            block_len: RFX_CONTEXT_SIZE as u32,
+            codec_id: CODEC_ID,
+            channel_id: CHANNEL_ID_CONTEXT,
+        }
+        .encode(dst)?;
+        dst.write_u8(CTX_ID, "RfxContext::ctxId")?;
+        dst.write_u16_le(CT_TILE_64X64, "RfxContext::tileSize")?;
+        dst.write_u16_le(self.properties.pack_context(), "RfxContext::properties")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RfxContext"
+    }
+
+    fn size(&self) -> usize {
+        RFX_CONTEXT_SIZE
+    }
+}
+
+impl<'de> Decode<'de> for RfxContext {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let hdr = RfxCodecChannelHeader::decode(src)?;
+        if hdr.block_type != WBT_CONTEXT {
+            return Err(DecodeError::unexpected_value(
+                "RfxContext",
+                "blockType",
+                "expected WBT_CONTEXT (0xCCC3)",
+            ));
+        }
+        if hdr.block_len as usize != RFX_CONTEXT_SIZE {
+            return Err(DecodeError::invalid_value("RfxContext", "blockLen"));
+        }
+        if hdr.codec_id != CODEC_ID {
+            return Err(DecodeError::unexpected_value(
+                "RfxContext",
+                "codecId",
+                "expected RFX CODEC_ID (0x01)",
+            ));
+        }
+        if hdr.channel_id != CHANNEL_ID_CONTEXT {
+            return Err(DecodeError::unexpected_value(
+                "RfxContext",
+                "channelId",
+                "expected CHANNEL_ID_CONTEXT (0xFF)",
+            ));
+        }
+        let ctx_id = src.read_u8("RfxContext::ctxId")?;
+        if ctx_id != CTX_ID {
+            return Err(DecodeError::unexpected_value(
+                "RfxContext",
+                "ctxId",
+                "expected 0x00",
+            ));
+        }
+        let tile_size = src.read_u16_le("RfxContext::tileSize")?;
+        if tile_size != CT_TILE_64X64 {
+            return Err(DecodeError::unexpected_value(
+                "RfxContext",
+                "tileSize",
+                "expected CT_TILE_64X64 (0x0040)",
+            ));
+        }
+        let raw = src.read_u16_le("RfxContext::properties")?;
+        Ok(Self {
+            properties: RfxProperties::unpack_context(raw)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,6 +1045,190 @@ mod tests {
         let c = RfxChannels { channels: entries };
         let mut buf = vec![0u8; c.size()];
         assert!(c.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn rfx_properties_pack_context_rlgr1_matches_spec_layout() {
+        // image-mode + RLGR1: flags=0x02, cct=0x1, xft=0x1, et=0x01, qt=0x1
+        // = 0x02 | (0x1<<3) | (0x1<<5) | (0x01<<9) | (0x1<<13)
+        // = 0x0002 | 0x0008 | 0x0020 | 0x0200 | 0x2000 = 0x222A
+        let p = RfxProperties::image(RlgrMode::Rlgr1);
+        assert_eq!(p.pack_context(), 0x222A);
+    }
+
+    #[test]
+    fn rfx_properties_pack_context_rlgr3_matches_spec_layout() {
+        // image-mode + RLGR3: flags=0x02, et=0x04 → 0x02 | 0x08 | 0x20 | (0x04<<9) | 0x2000
+        // (0x04 << 9) = 0x0800; total = 0x282A
+        let p = RfxProperties::image(RlgrMode::Rlgr3);
+        assert_eq!(p.pack_context(), 0x282A);
+    }
+
+    #[test]
+    fn rfx_properties_pack_tileset_rlgr3_matches_spec_layout() {
+        // tileset image-mode + RLGR3: lt=1, flags=0x02, cct=0x1, xft=0x1, et=0x04, qt=0x1
+        // = 0x1 | (0x02<<1) | (0x1<<4) | (0x1<<6) | (0x04<<10) | (0x1<<14)
+        // = 0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x1000 | 0x4000 = 0x5055
+        let p = RfxProperties::image(RlgrMode::Rlgr3);
+        assert_eq!(p.pack_tileset(), 0x5055);
+    }
+
+    #[test]
+    fn rfx_properties_pack_tileset_rlgr1_matches_spec_layout() {
+        // tileset image-mode + RLGR1: lt=1, flags=0x02, cct=0x1, xft=0x1, et=0x01, qt=0x1
+        // = 0x1 | 0x4 | 0x10 | 0x40 | (0x01<<10) | 0x4000
+        // = 0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x0400 | 0x4000 = 0x4455
+        let p = RfxProperties::image(RlgrMode::Rlgr1);
+        assert_eq!(p.pack_tileset(), 0x4455);
+    }
+
+    #[test]
+    fn rfx_properties_pack_tileset_lt_bit_always_set() {
+        for entropy in [RlgrMode::Rlgr1, RlgrMode::Rlgr3] {
+            for flags in 0..=0x07_u8 {
+                let p = RfxProperties { flags, entropy };
+                assert_eq!(
+                    p.pack_tileset() & 0x1,
+                    0x1,
+                    "lt bit must always be set",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rfx_properties_unpack_context_roundtrip_both_modes() {
+        for entropy in [RlgrMode::Rlgr1, RlgrMode::Rlgr3] {
+            let p = RfxProperties::image(entropy);
+            let raw = p.pack_context();
+            let d = RfxProperties::unpack_context(raw).unwrap();
+            assert_eq!(d, p);
+        }
+    }
+
+    #[test]
+    fn rfx_properties_unpack_tileset_roundtrip_both_modes() {
+        for entropy in [RlgrMode::Rlgr1, RlgrMode::Rlgr3] {
+            let p = RfxProperties::image(entropy);
+            let raw = p.pack_tileset();
+            let d = RfxProperties::unpack_tileset(raw).unwrap();
+            assert_eq!(d, p);
+        }
+    }
+
+    #[test]
+    fn rfx_properties_unpack_context_rejects_unknown_et() {
+        // Same Context layout but et = 0x07 (undefined).
+        let raw = (0x02_u16) | (0x1 << 3) | (0x1 << 5) | (0x07 << 9) | (0x1 << 13);
+        assert!(RfxProperties::unpack_context(raw).is_err());
+    }
+
+    #[test]
+    fn rfx_properties_unpack_tileset_rejects_unknown_et() {
+        let raw = 0x1_u16 | (0x02 << 1) | (0x1 << 4) | (0x1 << 6) | (0x07 << 10) | (0x1 << 14);
+        assert!(RfxProperties::unpack_tileset(raw).is_err());
+    }
+
+    #[test]
+    fn rfx_properties_unpack_context_ignores_reserved_and_must_fields() {
+        // Construct a Context properties word with cct=0x3, xft=0x5, qt=0x2,
+        // r=1 — all of which are spec-illegal — and verify the decoder
+        // still recovers the variable parts (flags, et) successfully.
+        let flags = 0x02_u16;
+        let et = CLW_ENTROPY_RLGR1 as u16;
+        let raw = flags | (0x3 << 3) | (0x5 << 5) | (et << 9) | (0x2 << 13) | (0x1 << 15);
+        let d = RfxProperties::unpack_context(raw).unwrap();
+        assert_eq!(d.flags, 0x02);
+        assert!(matches!(d.entropy, RlgrMode::Rlgr1));
+    }
+
+    #[test]
+    fn rfx_context_roundtrip_rlgr1() {
+        let c = RfxContext::image(RlgrMode::Rlgr1);
+        let d = roundtrip(&c);
+        assert_eq!(d, c);
+        assert_eq!(c.size(), RFX_CONTEXT_SIZE);
+    }
+
+    #[test]
+    fn rfx_context_roundtrip_rlgr3() {
+        let c = RfxContext::image(RlgrMode::Rlgr3);
+        let d = roundtrip(&c);
+        assert_eq!(d, c);
+    }
+
+    #[test]
+    fn rfx_context_byte_layout_uses_context_channel_id() {
+        let c = RfxContext::image(RlgrMode::Rlgr3);
+        let mut buf = vec![0u8; RFX_CONTEXT_SIZE];
+        c.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // codecId at byte 6, channelId at byte 7.
+        assert_eq!(buf[6], CODEC_ID);
+        assert_eq!(buf[7], CHANNEL_ID_CONTEXT);
+        // ctxId at byte 8.
+        assert_eq!(buf[8], 0x00);
+        // tileSize u16 LE at bytes 9..11.
+        assert_eq!(&buf[9..11], &[0x40, 0x00]);
+    }
+
+    #[test]
+    fn rfx_context_decode_rejects_wrong_block_type() {
+        let c = RfxContext::image(RlgrMode::Rlgr1);
+        let mut buf = vec![0u8; RFX_CONTEXT_SIZE];
+        c.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[0] = 0xC0; // WBT_SYNC instead of WBT_CONTEXT
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxContext::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_context_decode_rejects_wrong_codec_id() {
+        let c = RfxContext::image(RlgrMode::Rlgr1);
+        let mut buf = vec![0u8; RFX_CONTEXT_SIZE];
+        c.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[6] = 0x02; // codecId byte
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxContext::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_context_decode_rejects_wrong_channel_id() {
+        let c = RfxContext::image(RlgrMode::Rlgr1);
+        let mut buf = vec![0u8; RFX_CONTEXT_SIZE];
+        c.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[7] = CHANNEL_ID_DATA; // 0x00 instead of 0xFF
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxContext::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_context_decode_rejects_wrong_ctx_id() {
+        let c = RfxContext::image(RlgrMode::Rlgr1);
+        let mut buf = vec![0u8; RFX_CONTEXT_SIZE];
+        c.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[8] = 0x01;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxContext::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_context_decode_rejects_wrong_tile_size() {
+        let c = RfxContext::image(RlgrMode::Rlgr1);
+        let mut buf = vec![0u8; RFX_CONTEXT_SIZE];
+        c.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[9] = 0x80; // tileSize=0x0080 instead of 0x0040
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxContext::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_context_decode_rejects_wrong_block_len() {
+        let c = RfxContext::image(RlgrMode::Rlgr1);
+        let mut buf = vec![0u8; RFX_CONTEXT_SIZE];
+        c.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[2] = 0xFF;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxContext::decode(&mut src).is_err());
     }
 
     #[test]
