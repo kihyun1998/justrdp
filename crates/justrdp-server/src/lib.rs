@@ -16,6 +16,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+mod active;
 mod config;
 mod error;
 mod handler;
@@ -30,6 +31,7 @@ pub use handler::{
     BitmapUpdate, DisplayRect, DisplayUpdate, PointerColorUpdate, PointerNewUpdate,
     RdpServerDisplayHandler, RdpServerInputHandler,
 };
+pub use active::{ActiveStageOutput, ServerActiveStage};
 pub use server::RdpServer;
 
 // Re-export the acceptor-side types the driver depends on so callers don't

@@ -24,6 +24,6 @@ mod state;
 pub use acceptor::ServerAcceptor;
 pub use config::{AcceptorConfig, AcceptorConfigBuilder};
 pub use error::{AcceptorConfigError, AcceptorError, AcceptorErrorKind, AcceptorResult};
-pub use result::{AcceptanceResult, Written};
+pub use result::{AcceptanceResult, ClientRequestInfo, Written};
 pub use sequence::Sequence;
 pub use state::ServerAcceptorState;
