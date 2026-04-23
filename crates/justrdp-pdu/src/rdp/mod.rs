@@ -20,4 +20,5 @@ pub mod redirection;
 pub mod server_certificate;
 #[cfg(feature = "alloc")]
 pub mod standard_security;
+pub mod surface_commands;
 pub mod svc;
