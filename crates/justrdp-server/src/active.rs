@@ -29,12 +29,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use justrdp_acceptor::AcceptanceResult;
-use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
-use justrdp_pdu::mcs::{
-    DisconnectProviderUltimatum, DisconnectReason, SendDataIndication, SendDataRequest,
-};
-use justrdp_pdu::rdp::error_info::ErrorInfoCode;
-use justrdp_pdu::rdp::finalization::SetErrorInfoPdu;
+use justrdp_core::{Decode, ReadCursor};
+use justrdp_pdu::mcs::SendDataRequest;
 use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathInputHeader};
 use justrdp_pdu::rdp::finalization::{
     ControlAction, ControlPdu, InputEventPdu, InputEventType, PersistentKeyListPdu, RefreshRectPdu,
@@ -42,14 +38,12 @@ use justrdp_pdu::rdp::finalization::{
 };
 use justrdp_pdu::rdp::headers::{
     ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
-    SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE,
 };
 use justrdp_pdu::rdp::svc::{
     ChannelPduHeader, CHANNEL_FLAG_FIRST, CHANNEL_FLAG_LAST, CHANNEL_PACKET_COMPRESSED,
-    CHANNEL_PDU_HEADER_SIZE,
 };
-use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
-use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
+use justrdp_pdu::tpkt::TpktHeader;
+use justrdp_pdu::x224::DataTransfer;
 
 use crate::config::RdpServerConfig;
 use crate::error::{ServerError, ServerResult};
@@ -144,9 +138,8 @@ const MAX_SVC_REASSEMBLY_BYTES: u32 = 16 * 1024 * 1024;
 ///   real Windows clients never send `FASTPATH_INPUT_ACTION_X224`.
 const TPKT_VERSION: u8 = 0x03;
 
-/// Stream priority the server tags onto outbound `ShareDataHeader`.
-/// `STREAM_LOW = 1` matches what acceptor finalization emits.
-const STREAM_LOW: u8 = 1;
+// `STREAM_LOW = 1` lives in `encoder.rs` alongside the framing helpers;
+// the test module re-imports it from there.
 
 /// Outputs produced by [`ServerActiveStage::process`]. Each call may
 /// produce zero or more outputs (a single client PDU can trigger both a
@@ -456,146 +449,11 @@ impl ServerActiveStage {
         Ok(Vec::new())
     }
 
-    /// Encode an outbound SVC payload as one or more wire-ready frames
-    /// (TPKT + X.224 DT + MCS SDI + ChannelPduHeader + chunk).
-    ///
-    /// Splits `payload` into chunks of at most
-    /// `config.channel_chunk_length` bytes per
-    /// [`MAX_CHANNEL_CHUNK_LENGTH`] (MS-RDPBCGR §2.2.7.1.10). The
-    /// `ChannelPduHeader.length` field carries the **total uncompressed
-    /// message length** in every chunk; `flags` carries
-    /// `CHANNEL_FLAG_FIRST` on the first chunk, `CHANNEL_FLAG_LAST` on
-    /// the last, both on a single-chunk message.
-    ///
-    /// `channel_id` MUST be a negotiated SVC channel; otherwise the
-    /// helper returns `ServerError::protocol(_)`.
-    ///
-    /// [`MAX_CHANNEL_CHUNK_LENGTH`]: crate::MAX_CHANNEL_CHUNK_LENGTH
-    pub fn encode_svc_send(
-        &self,
-        channel_id: u16,
-        payload: &[u8],
-    ) -> ServerResult<Vec<Vec<u8>>> {
-        if !self.channel_ids.iter().any(|(_, id)| *id == channel_id) {
-            return Err(ServerError::protocol(
-                "encode_svc_send target channel is not in the negotiated VC list",
-            ));
-        }
-        let total = payload.len();
-        if total > u32::MAX as usize {
-            return Err(ServerError::protocol(
-                "SVC payload exceeds u32 ChannelPduHeader.length",
-            ));
-        }
-        let chunk_size = self.config.channel_chunk_length;
-
-        if total == 0 {
-            // Empty messages still need to declare presence with a
-            // FIRST|LAST chunk carrying zero data bytes.
-            return Ok(alloc::vec![self.frame_one_svc_chunk(
-                channel_id,
-                CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST,
-                0,
-                &[],
-            )?]);
-        }
-
-        let mut frames = Vec::with_capacity(total.div_ceil(chunk_size));
-        let mut offset = 0usize;
-        while offset < total {
-            let end = (offset + chunk_size).min(total);
-            let mut flags = 0u32;
-            if offset == 0 {
-                flags |= CHANNEL_FLAG_FIRST;
-            }
-            if end == total {
-                flags |= CHANNEL_FLAG_LAST;
-            }
-            frames.push(self.frame_one_svc_chunk(
-                channel_id,
-                flags,
-                total as u32,
-                &payload[offset..end],
-            )?);
-            offset = end;
-        }
-        Ok(frames)
-    }
-
-    /// Encode a clean-disconnect sequence: `SetErrorInfoPdu` (wrapped
-    /// in ShareData on the I/O channel) followed by a top-level MCS
-    /// `DisconnectProviderUltimatum` (TPKT + X.224 DT + 2-byte PER).
-    ///
-    /// Returns the two frames in order. The caller MUST flush both
-    /// before closing the underlying transport so the client can
-    /// surface a coherent disconnect reason rather than seeing only a
-    /// half-open TCP close.
-    ///
-    /// The MCS reason is fixed at `UserRequested` (3) for the
-    /// server-initiated path; the actual cause of the disconnect is
-    /// carried by the preceding `SetErrorInfoPdu`'s
-    /// [`ErrorInfoCode`].
-    pub fn encode_disconnect(&self, code: ErrorInfoCode) -> ServerResult<Vec<Vec<u8>>> {
-        let info = SetErrorInfoPdu::new(code);
-        let info_frame = self.encode_share_data(ShareDataPduType::SetErrorInfo, &info)?;
-        let ult_frame = self.encode_disconnect_ultimatum(DisconnectReason::UserRequested)?;
-        Ok(alloc::vec![info_frame, ult_frame])
-    }
-
-    /// Encode a stand-alone `DisconnectProviderUltimatum` frame
-    /// (TPKT + X.224 DT + 2-byte PER body). Use this when no
-    /// `SetErrorInfoPdu` is needed (e.g. fatal protocol error mid-handshake).
-    pub fn encode_disconnect_ultimatum(
-        &self,
-        reason: DisconnectReason,
-    ) -> ServerResult<Vec<u8>> {
-        let ult = DisconnectProviderUltimatum { reason };
-        let payload_size = DATA_TRANSFER_HEADER_SIZE + ult.size();
-        let total = TPKT_HEADER_SIZE + payload_size;
-        let mut buf = vec![0u8; total];
-        {
-            let mut c = WriteCursor::new(&mut buf);
-            TpktHeader::try_for_payload(payload_size)?.encode(&mut c)?;
-            DataTransfer.encode(&mut c)?;
-            ult.encode(&mut c)?;
-        }
-        Ok(buf)
-    }
-
-    fn frame_one_svc_chunk(
-        &self,
-        channel_id: u16,
-        flags: u32,
-        total_length: u32,
-        chunk: &[u8],
-    ) -> ServerResult<Vec<u8>> {
-        let header = ChannelPduHeader {
-            length: total_length,
-            flags,
-        };
-        let body_size = CHANNEL_PDU_HEADER_SIZE + chunk.len();
-        let mut body = vec![0u8; body_size];
-        {
-            let mut c = WriteCursor::new(&mut body);
-            header.encode(&mut c)?;
-            c.write_slice(chunk, "svc::chunkData")?;
-        }
-        let sdi = SendDataIndication {
-            initiator: self.user_channel_id,
-            channel_id,
-            user_data: &body,
-        };
-        let payload_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
-        let total = TPKT_HEADER_SIZE + payload_size;
-        let mut buf = vec![0u8; total];
-        {
-            let mut c = WriteCursor::new(&mut buf);
-            TpktHeader::try_for_payload(payload_size)?.encode(&mut c)?;
-            DataTransfer.encode(&mut c)?;
-            sdi.encode(&mut c)?;
-        }
-        Ok(buf)
-    }
+    // Server-direction framing helpers (encode_svc_send,
+    // encode_disconnect, encode_disconnect_ultimatum,
+    // encode_share_data, frame_one_svc_chunk) live in `encoder.rs` to
+    // keep this file focused on the inbound dispatch loop. They are
+    // exposed via `pub use` from lib.rs.
 
     fn process_io_channel(
         &mut self,
@@ -851,67 +709,6 @@ impl ServerActiveStage {
         Ok(Vec::new())
     }
 
-    /// Wrap an inner ShareData body in ShareData + ShareControl + MCS
-    /// SDI + X.224 DT + TPKT and return the wire bytes.
-    pub(crate) fn encode_share_data<E: Encode>(
-        &self,
-        pdu_type2: ShareDataPduType,
-        inner: &E,
-    ) -> ServerResult<Vec<u8>> {
-        let inner_size = inner.size();
-        if inner_size > u16::MAX as usize {
-            return Err(ServerError::protocol(
-                "ShareData inner body exceeds u16 uncompressedLength",
-            ));
-        }
-        let sd_total = SHARE_DATA_HEADER_SIZE + inner_size;
-        let sc_total = SHARE_CONTROL_HEADER_SIZE + sd_total;
-        if sc_total > u16::MAX as usize {
-            return Err(ServerError::protocol(
-                "ShareControl payload exceeds u16 totalLength",
-            ));
-        }
-
-        let mut sc_payload = vec![0u8; sc_total];
-        {
-            let mut cursor = WriteCursor::new(&mut sc_payload);
-            ShareControlHeader {
-                total_length: sc_total as u16,
-                pdu_type: ShareControlPduType::Data,
-                pdu_source: self.user_channel_id,
-            }
-            .encode(&mut cursor)?;
-            ShareDataHeader {
-                share_id: self.share_id,
-                stream_id: STREAM_LOW,
-                // MS-RDPBCGR §2.2.8.1.1.1.2: uncompressedLength excludes
-                // the ShareDataHeader itself -- matches the acceptor's
-                // finalization-side convention.
-                uncompressed_length: inner_size as u16,
-                pdu_type2,
-                compressed_type: 0,
-                compressed_length: 0,
-            }
-            .encode(&mut cursor)?;
-            inner.encode(&mut cursor)?;
-        }
-
-        let sdi = SendDataIndication {
-            initiator: self.user_channel_id,
-            channel_id: self.io_channel_id,
-            user_data: &sc_payload,
-        };
-        let payload_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
-        let total = TPKT_HEADER_SIZE + payload_size;
-        let mut buf = vec![0u8; total];
-        {
-            let mut cursor = WriteCursor::new(&mut buf);
-            TpktHeader::try_for_payload(payload_size)?.encode(&mut cursor)?;
-            DataTransfer.encode(&mut cursor)?;
-            sdi.encode(&mut cursor)?;
-        }
-        Ok(buf)
-    }
 }
 
 #[cfg(test)]
@@ -920,13 +717,29 @@ mod tests {
     use alloc::string::ToString;
     use core::cell::RefCell;
     use justrdp_acceptor::AcceptanceResult;
-    use justrdp_core::EncodeResult;
+    use justrdp_core::{Encode, EncodeResult, WriteCursor};
+    use justrdp_pdu::mcs::{
+        DisconnectProviderUltimatum, DisconnectReason, SendDataIndication,
+    };
+    use justrdp_pdu::rdp::error_info::ErrorInfoCode;
     use justrdp_pdu::rdp::fast_path::{
         FastPathInputHeader, FastPathMouseEvent, FastPathScancodeEvent, FastPathSyncEvent,
         FastPathUnicodeEvent, FASTPATH_INPUT_ACTION_FASTPATH,
     };
-    use justrdp_pdu::rdp::finalization::InclusiveRect;
-    use justrdp_pdu::x224::{NegotiationRequestFlags, NegotiationResponseFlags, SecurityProtocol};
+    use justrdp_pdu::rdp::finalization::{InclusiveRect, SetErrorInfoPdu};
+    use justrdp_pdu::rdp::headers::{SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE};
+    use justrdp_pdu::rdp::svc::CHANNEL_PDU_HEADER_SIZE;
+    use justrdp_pdu::tpkt::TPKT_HEADER_SIZE;
+    use justrdp_pdu::x224::{
+        DATA_TRANSFER_HEADER_SIZE, NegotiationRequestFlags, NegotiationResponseFlags,
+        SecurityProtocol,
+    };
+
+    /// Mirror of the production-side `STREAM_LOW` constant (now in
+    /// `encoder.rs`). Re-declared here so the test envelope builders
+    /// emit byte-for-byte identical headers without crossing the
+    /// module boundary.
+    const STREAM_LOW: u8 = 1;
 
     /// Minimal handler that drops every callback. Used by the
     /// control-PDU dispatch tests that don't care about input events.
