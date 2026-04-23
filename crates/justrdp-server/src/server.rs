@@ -112,6 +112,8 @@ impl RdpServer {
     /// Returns `Err(ServerError::unexpected("Accepted"))` when the handshake
     /// has not reached `Accepted`. The `Acceptor` is dropped on success;
     /// callers transition into the active-session stage at this point.
+    #[must_use = "the AcceptanceResult must be passed to ServerActiveStage::new \
+                  -- discarding it drops the negotiated session state"]
     pub fn take_acceptance_result(self) -> ServerResult<(AcceptanceResult, RdpServerConfig)> {
         let RdpServer { acceptor, config } = self;
         // `ServerAcceptor` does not expose a move-out helper for the inner

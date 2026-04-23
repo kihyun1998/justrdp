@@ -738,29 +738,29 @@ impl ServerActiveStage {
     fn dispatch_fast_path_event(
         &self,
         event: FastPathInputEvent,
-        h: &mut dyn RdpServerInputHandler,
+        input_handler: &mut dyn RdpServerInputHandler,
     ) {
         match event {
             FastPathInputEvent::Scancode(e) => {
-                h.on_keyboard_scancode(u16::from(e.event_flags), e.key_code);
+                input_handler.on_keyboard_scancode(u16::from(e.event_flags), e.key_code);
             }
             FastPathInputEvent::Unicode(e) => {
-                h.on_keyboard_unicode(u16::from(e.event_flags), e.unicode_code);
+                input_handler.on_keyboard_unicode(u16::from(e.event_flags), e.unicode_code);
             }
             FastPathInputEvent::Mouse(e) => {
-                h.on_mouse(e.pointer_flags, e.x_pos, e.y_pos);
+                input_handler.on_mouse(e.pointer_flags, e.x_pos, e.y_pos);
             }
             FastPathInputEvent::MouseX(e) => {
-                h.on_mouse_extended(e.pointer_flags, e.x_pos, e.y_pos);
+                input_handler.on_mouse_extended(e.pointer_flags, e.x_pos, e.y_pos);
             }
             FastPathInputEvent::RelativeMouse(e) => {
-                h.on_mouse_relative(u16::from(e.event_flags), e.x_delta, e.y_delta);
+                input_handler.on_mouse_relative(u16::from(e.event_flags), e.x_delta, e.y_delta);
             }
             FastPathInputEvent::Sync(e) => {
-                h.on_sync(e.event_flags);
+                input_handler.on_sync(e.event_flags);
             }
             FastPathInputEvent::QoeTimestamp(e) => {
-                h.on_qoe_timestamp(e.timestamp);
+                input_handler.on_qoe_timestamp(e.timestamp);
             }
         }
     }
@@ -1399,12 +1399,12 @@ mod tests {
     #[test]
     fn sdr_with_wrong_initiator_errors() {
         let mut s = fake_stage();
-        // Build a synthetic SDR with a bogus initiator.
+        // Build the ShareData envelope manually with a wrong initiator.
+        // We can't reuse `wrap_client_share_data` because it always uses
+        // `stage.user_channel_id`; mutating the SDR field after the
+        // helper-built envelope would mean re-decoding and re-encoding,
+        // which is more intrusive than just open-coding the construction.
         let pdu = ShutdownRequestPdu;
-        let inner_bytes = wrap_client_share_data(&s, ShareDataPduType::ShutdownRequest, &pdu);
-        // Patch the SDR initiator field by re-decoding and re-encoding
-        // would be intrusive; instead build the envelope manually with
-        // a wrong initiator.
         let inner_size = pdu.size();
         let sd_total = SHARE_DATA_HEADER_SIZE + inner_size;
         let sc_total = SHARE_CONTROL_HEADER_SIZE + sd_total;
@@ -1444,7 +1444,6 @@ mod tests {
             DataTransfer.encode(&mut c).unwrap();
             sdr.encode(&mut c).unwrap();
         }
-        let _ = inner_bytes; // silence unused-variable lint
         assert!(s.process(&buf, &mut NoopHandler).is_err());
     }
 
