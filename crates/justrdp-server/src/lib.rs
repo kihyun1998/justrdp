@@ -33,7 +33,10 @@ pub use handler::{
     RdpServerDisplayHandler, RdpServerInputHandler,
 };
 pub use active::{ActiveStageOutput, ServerActiveStage};
-pub use encoder::{encode_bitmap_update, MAX_FAST_PATH_PDU_LENGTH};
+pub use encoder::{
+    encode_bitmap_update, encode_pointer_cached, encode_pointer_color, encode_pointer_new,
+    encode_pointer_position, encode_pointer_update, MAX_FAST_PATH_PDU_LENGTH,
+};
 pub use server::RdpServer;
 
 // Re-export the acceptor-side types the driver depends on so callers don't

@@ -17,10 +17,14 @@ use justrdp_pdu::rdp::fast_path::{
     FastPathOutputHeader, FastPathOutputUpdate, FastPathUpdateType, Fragmentation,
     FASTPATH_OUTPUT_ACTION_FASTPATH,
 };
+use justrdp_pdu::rdp::pointer::{
+    TsCachedPointerAttribute, TsColorPointerAttribute, TsPoint16, TsPointerAttribute,
+    and_mask_row_stride, validate_color_pointer_dimensions, xor_mask_row_stride,
+};
 
 use crate::config::RdpServerConfig;
 use crate::error::{ServerError, ServerResult};
-use crate::handler::BitmapUpdate;
+use crate::handler::{BitmapUpdate, DisplayUpdate, PointerColorUpdate, PointerNewUpdate};
 
 /// Maximum total size of a single fast-path PDU. Set by the 15-bit
 /// length field defined in MS-RDPBCGR §2.2.9.1.2 (`encode_length` in
@@ -175,6 +179,149 @@ fn chunk_into_fast_path_frames(
         offset = end;
     }
     Ok(frames)
+}
+
+/// Encode a fast-path pointer update (any of the
+/// `Position`/`Hidden`/`Default`/`Color`/`New`/`Cached` variants of
+/// [`DisplayUpdate`]) into a single fast-path PDU.
+///
+/// Pointer updates always fit comfortably inside a single fast-path
+/// PDU -- the largest payload is a 96x96 [`PointerNewUpdate`] at 32 bpp
+/// (~37 KiB) which still sits well below the 15-bit length cap. The
+/// encoder therefore emits only `Fragmentation::Single` frames.
+///
+/// Non-pointer variants (`Bitmap`, `Palette`, `Reset`) MUST be routed
+/// to their own encoders; this function returns
+/// `ServerError::protocol(...)` for them.
+pub fn encode_pointer_update(update: &DisplayUpdate) -> ServerResult<Vec<u8>> {
+    match update {
+        DisplayUpdate::PointerPosition(p) => {
+            encode_pointer_position(p)
+        }
+        DisplayUpdate::PointerHidden => encode_pointer_empty(FastPathUpdateType::PointerHidden),
+        DisplayUpdate::PointerDefault => encode_pointer_empty(FastPathUpdateType::PointerDefault),
+        DisplayUpdate::PointerCached { cache_index } => {
+            encode_pointer_cached(*cache_index)
+        }
+        DisplayUpdate::PointerColor(c) => encode_pointer_color(c),
+        DisplayUpdate::PointerNew(n) => encode_pointer_new(n),
+        DisplayUpdate::Bitmap(_) | DisplayUpdate::Palette(_) | DisplayUpdate::Reset { .. } => {
+            Err(ServerError::protocol(
+                "encode_pointer_update called on a non-pointer DisplayUpdate variant",
+            ))
+        }
+    }
+}
+
+/// Encode a [`FASTPATH_UPDATETYPE_PTR_POSITION`] PDU
+/// (MS-RDPBCGR §2.2.9.1.2.1.5). Payload is a 4-byte `TS_POINT16`.
+pub fn encode_pointer_position(p: &TsPoint16) -> ServerResult<Vec<u8>> {
+    let mut payload = vec![0u8; p.size()];
+    {
+        let mut c = WriteCursor::new(&mut payload);
+        p.encode(&mut c)?;
+    }
+    encode_one_fast_path_pdu(FastPathUpdateType::PointerPosition, Fragmentation::Single, &payload)
+}
+
+/// Encode either [`FASTPATH_UPDATETYPE_PTR_NULL`] (MS-RDPBCGR
+/// §2.2.9.1.2.1.6) or [`FASTPATH_UPDATETYPE_PTR_DEFAULT`] (§2.2.9.1.2.1.7).
+/// Both have an empty payload.
+fn encode_pointer_empty(code: FastPathUpdateType) -> ServerResult<Vec<u8>> {
+    debug_assert!(matches!(
+        code,
+        FastPathUpdateType::PointerHidden | FastPathUpdateType::PointerDefault
+    ));
+    encode_one_fast_path_pdu(code, Fragmentation::Single, &[])
+}
+
+/// Encode a [`FASTPATH_UPDATETYPE_PTR_CACHED`] PDU
+/// (MS-RDPBCGR §2.2.9.1.2.1.11). Payload is a 2-byte `cacheIndex`.
+pub fn encode_pointer_cached(cache_index: u16) -> ServerResult<Vec<u8>> {
+    let attr = TsCachedPointerAttribute { cache_index };
+    let mut payload = vec![0u8; attr.size()];
+    {
+        let mut c = WriteCursor::new(&mut payload);
+        attr.encode(&mut c)?;
+    }
+    encode_one_fast_path_pdu(FastPathUpdateType::PointerCached, Fragmentation::Single, &payload)
+}
+
+/// Encode a [`FASTPATH_UPDATETYPE_PTR_COLOR`] PDU
+/// (MS-RDPBCGR §2.2.9.1.2.1.9). Validates the 32x32 limit and the
+/// 2-byte AND/XOR mask scan-line padding from §2.2.9.1.1.4.4.
+pub fn encode_pointer_color(c: &PointerColorUpdate) -> ServerResult<Vec<u8>> {
+    validate_color_pointer_dimensions(c.width, c.height).map_err(ServerError::from)?;
+    let expected_xor = xor_mask_row_stride(c.width, 24) * usize::from(c.height);
+    let expected_and = and_mask_row_stride(c.width) * usize::from(c.height);
+    if c.xor_mask_data.len() != expected_xor {
+        return Err(ServerError::protocol(
+            "PointerColorUpdate.xor_mask_data length does not match \
+             width * 24bpp / 8 padded to a 2-byte boundary * height",
+        ));
+    }
+    if c.and_mask_data.len() != expected_and {
+        return Err(ServerError::protocol(
+            "PointerColorUpdate.and_mask_data length does not match \
+             ceil(width / 8) padded to a 2-byte boundary * height",
+        ));
+    }
+    let attr = TsColorPointerAttribute {
+        cache_index: c.cache_index,
+        hot_spot: c.hot_spot,
+        width: c.width,
+        height: c.height,
+        xor_mask_data: c.xor_mask_data.clone(),
+        and_mask_data: c.and_mask_data.clone(),
+    };
+    let mut payload = vec![0u8; attr.size()];
+    {
+        let mut cur = WriteCursor::new(&mut payload);
+        attr.encode(&mut cur)?;
+    }
+    encode_one_fast_path_pdu(FastPathUpdateType::PointerColor, Fragmentation::Single, &payload)
+}
+
+/// Encode a [`FASTPATH_UPDATETYPE_PTR_NEW`] PDU
+/// (MS-RDPBCGR §2.2.9.1.2.1.10). Validates `xor_bpp ∈ {1,4,8,16,24,32}`
+/// and the per-bpp 2-byte XOR / AND mask scan-line padding.
+pub fn encode_pointer_new(p: &PointerNewUpdate) -> ServerResult<Vec<u8>> {
+    if !matches!(p.xor_bpp, 1 | 4 | 8 | 16 | 24 | 32) {
+        return Err(ServerError::protocol(
+            "PointerNewUpdate.xor_bpp must be one of 1/4/8/16/24/32",
+        ));
+    }
+    let expected_xor = xor_mask_row_stride(p.width, p.xor_bpp) * usize::from(p.height);
+    let expected_and = and_mask_row_stride(p.width) * usize::from(p.height);
+    if p.xor_mask_data.len() != expected_xor {
+        return Err(ServerError::protocol(
+            "PointerNewUpdate.xor_mask_data length does not match \
+             width * xor_bpp / 8 padded to a 2-byte boundary * height",
+        ));
+    }
+    if p.and_mask_data.len() != expected_and {
+        return Err(ServerError::protocol(
+            "PointerNewUpdate.and_mask_data length does not match \
+             ceil(width / 8) padded to a 2-byte boundary * height",
+        ));
+    }
+    let attr = TsPointerAttribute {
+        xor_bpp: p.xor_bpp,
+        color_ptr_attr: TsColorPointerAttribute {
+            cache_index: p.cache_index,
+            hot_spot: p.hot_spot,
+            width: p.width,
+            height: p.height,
+            xor_mask_data: p.xor_mask_data.clone(),
+            and_mask_data: p.and_mask_data.clone(),
+        },
+    };
+    let mut payload = vec![0u8; attr.size()];
+    {
+        let mut cur = WriteCursor::new(&mut payload);
+        attr.encode(&mut cur)?;
+    }
+    encode_one_fast_path_pdu(FastPathUpdateType::PointerNew, Fragmentation::Single, &payload)
 }
 
 /// Build a single fast-path PDU containing one `FastPathOutputUpdate`.
@@ -406,6 +553,166 @@ mod tests {
         let _ = FastPathOutputHeader::decode(&mut c).unwrap();
         let single = FastPathOutputUpdate::decode(&mut c).unwrap();
         assert_eq!(single.fragmentation, Fragmentation::Single);
+    }
+
+    fn decode_pointer_payload(frame: &[u8]) -> (FastPathUpdateType, Vec<u8>) {
+        let mut c = ReadCursor::new(frame);
+        let _hdr = FastPathOutputHeader::decode(&mut c).unwrap();
+        let upd = FastPathOutputUpdate::decode(&mut c).unwrap();
+        assert_eq!(upd.fragmentation, Fragmentation::Single);
+        (upd.update_code, upd.update_data)
+    }
+
+    #[test]
+    fn pointer_position_encodes_ts_point16() {
+        let p = TsPoint16 { x_pos: 0x1234, y_pos: 0x5678 };
+        let frame = encode_pointer_update(&DisplayUpdate::PointerPosition(p)).unwrap();
+        let (code, payload) = decode_pointer_payload(&frame);
+        assert_eq!(code, FastPathUpdateType::PointerPosition);
+        assert_eq!(payload, vec![0x34, 0x12, 0x78, 0x56]);
+    }
+
+    #[test]
+    fn pointer_hidden_emits_empty_payload() {
+        let frame = encode_pointer_update(&DisplayUpdate::PointerHidden).unwrap();
+        let (code, payload) = decode_pointer_payload(&frame);
+        assert_eq!(code, FastPathUpdateType::PointerHidden);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn pointer_default_emits_empty_payload() {
+        let frame = encode_pointer_update(&DisplayUpdate::PointerDefault).unwrap();
+        let (code, payload) = decode_pointer_payload(&frame);
+        assert_eq!(code, FastPathUpdateType::PointerDefault);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn pointer_cached_encodes_index_le() {
+        let frame =
+            encode_pointer_update(&DisplayUpdate::PointerCached { cache_index: 0x00AB })
+                .unwrap();
+        let (code, payload) = decode_pointer_payload(&frame);
+        assert_eq!(code, FastPathUpdateType::PointerCached);
+        assert_eq!(payload, vec![0xAB, 0x00]);
+    }
+
+    #[test]
+    fn pointer_color_roundtrip_through_encoded_payload() {
+        // 8x8 color cursor: AND mask = 2 bytes/row * 8 rows = 16; XOR
+        // 24bpp = 24 bytes/row * 8 rows = 192.
+        let c = PointerColorUpdate {
+            cache_index: 3,
+            hot_spot: TsPoint16 { x_pos: 4, y_pos: 4 },
+            width: 8,
+            height: 8,
+            xor_mask_data: vec![0xCC; 24 * 8],
+            and_mask_data: vec![0xAA; 2 * 8],
+        };
+        let frame = encode_pointer_update(&DisplayUpdate::PointerColor(c.clone())).unwrap();
+        let (code, payload) = decode_pointer_payload(&frame);
+        assert_eq!(code, FastPathUpdateType::PointerColor);
+        let mut rc = ReadCursor::new(&payload);
+        let attr = TsColorPointerAttribute::decode(&mut rc).unwrap();
+        assert_eq!(attr.cache_index, c.cache_index);
+        assert_eq!(attr.hot_spot, c.hot_spot);
+        assert_eq!(attr.width, c.width);
+        assert_eq!(attr.height, c.height);
+        assert_eq!(attr.xor_mask_data, c.xor_mask_data);
+        assert_eq!(attr.and_mask_data, c.and_mask_data);
+    }
+
+    #[test]
+    fn pointer_color_rejects_oversize() {
+        let c = PointerColorUpdate {
+            cache_index: 0,
+            hot_spot: TsPoint16::default(),
+            width: 33, // > 32 cap from MS-RDPBCGR §2.2.9.1.1.4.4
+            height: 8,
+            xor_mask_data: vec![0; xor_mask_row_stride(33, 24) * 8],
+            and_mask_data: vec![0; and_mask_row_stride(33) * 8],
+        };
+        assert!(encode_pointer_update(&DisplayUpdate::PointerColor(c)).is_err());
+    }
+
+    #[test]
+    fn pointer_color_rejects_wrong_xor_length() {
+        let c = PointerColorUpdate {
+            cache_index: 0,
+            hot_spot: TsPoint16::default(),
+            width: 8,
+            height: 8,
+            xor_mask_data: vec![0; 100], // wrong: should be 192
+            and_mask_data: vec![0; 16],
+        };
+        assert!(encode_pointer_update(&DisplayUpdate::PointerColor(c)).is_err());
+    }
+
+    #[test]
+    fn pointer_new_32bpp_roundtrip() {
+        // 16x16x32bpp: XOR = 64 bytes/row * 16 rows = 1024; AND = 2*16 = 32
+        let n = PointerNewUpdate {
+            xor_bpp: 32,
+            cache_index: 1,
+            hot_spot: TsPoint16 { x_pos: 8, y_pos: 8 },
+            width: 16,
+            height: 16,
+            xor_mask_data: vec![0x11; 64 * 16],
+            and_mask_data: vec![0x22; 2 * 16],
+        };
+        let frame = encode_pointer_update(&DisplayUpdate::PointerNew(n.clone())).unwrap();
+        let (code, payload) = decode_pointer_payload(&frame);
+        assert_eq!(code, FastPathUpdateType::PointerNew);
+        let mut rc = ReadCursor::new(&payload);
+        let attr = TsPointerAttribute::decode(&mut rc).unwrap();
+        assert_eq!(attr.xor_bpp, 32);
+        assert_eq!(attr.color_ptr_attr.width, 16);
+        assert_eq!(attr.color_ptr_attr.height, 16);
+        assert_eq!(attr.color_ptr_attr.xor_mask_data.len(), 1024);
+    }
+
+    #[test]
+    fn pointer_new_rejects_invalid_bpp() {
+        let n = PointerNewUpdate {
+            xor_bpp: 64,
+            cache_index: 0,
+            hot_spot: TsPoint16::default(),
+            width: 1,
+            height: 1,
+            xor_mask_data: vec![0; 8],
+            and_mask_data: vec![0; 2],
+        };
+        assert!(encode_pointer_update(&DisplayUpdate::PointerNew(n)).is_err());
+    }
+
+    #[test]
+    fn pointer_new_rejects_wrong_mask_length() {
+        let n = PointerNewUpdate {
+            xor_bpp: 1,
+            cache_index: 0,
+            hot_spot: TsPoint16::default(),
+            width: 32,
+            height: 32,
+            xor_mask_data: vec![0; 100], // wrong: needs 4*32 = 128
+            and_mask_data: vec![0; 4 * 32],
+        };
+        assert!(encode_pointer_update(&DisplayUpdate::PointerNew(n)).is_err());
+    }
+
+    #[test]
+    fn pointer_update_rejects_non_pointer_variant() {
+        let upd = DisplayUpdate::Reset { width: 800, height: 600 };
+        assert!(encode_pointer_update(&upd).is_err());
+        let bm = DisplayUpdate::Bitmap(BitmapUpdate {
+            dest_left: 0,
+            dest_top: 0,
+            width: 1,
+            height: 1,
+            bits_per_pixel: 32,
+            data: vec![0; 4],
+        });
+        assert!(encode_pointer_update(&bm).is_err());
     }
 
     #[test]
