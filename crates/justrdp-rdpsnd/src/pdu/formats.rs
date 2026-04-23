@@ -17,6 +17,44 @@ const FORMATS_BODY_FIXED_SIZE: usize = 20;
 /// Real servers advertise fewer than 100; cap to prevent DoS.
 const MAX_AUDIO_FORMATS: u16 = 256;
 
+/// Server sound capability flags -- MS-RDPEA 2.2.2.1 (`dwFlags` bitmask).
+///
+/// Symmetric to [`ClientSndFlags`]. The protocol reuses the same bit
+/// layout in both directions; separate newtypes document the role on
+/// each side and prevent accidentally swapping them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerSndCapsFlags(u32);
+
+impl ServerSndCapsFlags {
+    /// Server is prepared to stream audio. MUST be set when the
+    /// server actually supports RDPSND.
+    pub const ALIVE: Self = Self(0x0000_0001);
+    /// Server honours client volume-change PDUs.
+    pub const VOLUME: Self = Self(0x0000_0002);
+    /// Server honours client pitch-change PDUs (rarely used).
+    pub const PITCH: Self = Self(0x0000_0004);
+
+    /// Create from raw bits.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// Get raw bits.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Check if a flag is set.
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Combine two flag sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 /// Client sound capability flags -- MS-RDPEA 2.2.2.2
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientSndFlags(u32);
@@ -53,21 +91,41 @@ impl ClientSndFlags {
 /// Server Audio Formats and Version PDU -- MS-RDPEA 2.2.2.1
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerAudioFormatsPdu {
-    /// Initial block number counter.
+    /// `dwFlags` bitmask advertising server capabilities (ALIVE /
+    /// VOLUME / PITCH).
+    pub flags: ServerSndCapsFlags,
+    /// Initial volume (low word = left, high word = right; `0xFFFF_FFFF`
+    /// = full).
+    pub volume: u32,
+    /// Initial pitch multiplier (`0x0001_0000` = 1.0 in 16.16 fixed
+    /// point; `0` when pitch is unsupported).
+    pub pitch: u32,
+    /// `wDGramPort` -- UDP datagram port for out-of-band audio; `0`
+    /// means SVC-only transport.
+    pub dgram_port: u16,
+    /// Initial block number counter (`cLastBlockConfirmed`). Per spec,
+    /// servers typically emit `0xFF` in the first PDU to denote "no
+    /// blocks yet".
     pub last_block_confirmed: u8,
-    /// Server protocol version.
+    /// Server protocol version (MS-RDPEA 2.2.2.1 / 2.2.2.2).
     pub version: u16,
     /// Supported audio formats.
     pub formats: Vec<AudioFormat>,
 }
 
 impl ServerAudioFormatsPdu {
+    fn body_size(&self) -> usize {
+        FORMATS_BODY_FIXED_SIZE + self.formats.iter().map(|f| f.size()).sum::<usize>()
+    }
+
     /// Decode from cursor after the header has been read.
     pub fn decode_body(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
-        let _dw_flags = src.read_u32_le("ServerFormats::dwFlags")?;
-        let _dw_volume = src.read_u32_le("ServerFormats::dwVolume")?;
-        let _dw_pitch = src.read_u32_le("ServerFormats::dwPitch")?;
-        let _w_dgram_port = src.read_u16_le("ServerFormats::wDGramPort")?;
+        let flags = ServerSndCapsFlags::from_bits(
+            src.read_u32_le("ServerFormats::dwFlags")?,
+        );
+        let volume = src.read_u32_le("ServerFormats::dwVolume")?;
+        let pitch = src.read_u32_le("ServerFormats::dwPitch")?;
+        let dgram_port = src.read_u16_le("ServerFormats::wDGramPort")?;
         let num_formats = src.read_u16_le("ServerFormats::wNumberOfFormats")?;
         if num_formats > MAX_AUDIO_FORMATS {
             return Err(justrdp_core::DecodeError::invalid_value(
@@ -85,10 +143,51 @@ impl ServerAudioFormatsPdu {
         }
 
         Ok(Self {
+            flags,
+            volume,
+            pitch,
+            dgram_port,
             last_block_confirmed,
             version,
             formats,
         })
+    }
+}
+
+impl Encode for ServerAudioFormatsPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        let body_size = u16::try_from(self.body_size())
+            .map_err(|_| justrdp_core::EncodeError::invalid_value("ServerFormats", "body too large"))?;
+        let num_formats = u16::try_from(self.formats.len())
+            .map_err(|_| justrdp_core::EncodeError::invalid_value("ServerFormats", "too many formats"))?;
+        if num_formats > MAX_AUDIO_FORMATS {
+            return Err(justrdp_core::EncodeError::invalid_value(
+                "ServerFormats",
+                "wNumberOfFormats exceeds limit",
+            ));
+        }
+        let header = SndHeader::new(SndMsgType::Formats, body_size);
+        header.encode(dst)?;
+        dst.write_u32_le(self.flags.bits(), "ServerFormats::dwFlags")?;
+        dst.write_u32_le(self.volume, "ServerFormats::dwVolume")?;
+        dst.write_u32_le(self.pitch, "ServerFormats::dwPitch")?;
+        dst.write_u16_le(self.dgram_port, "ServerFormats::wDGramPort")?;
+        dst.write_u16_le(num_formats, "ServerFormats::wNumberOfFormats")?;
+        dst.write_u8(self.last_block_confirmed, "ServerFormats::cLastBlockConfirmed")?;
+        dst.write_u16_le(self.version, "ServerFormats::wVersion")?;
+        dst.write_u8(0, "ServerFormats::bPad")?;
+        for fmt in &self.formats {
+            fmt.encode(dst)?;
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "ServerAudioFormatsPdu"
+    }
+
+    fn size(&self) -> usize {
+        SND_HEADER_SIZE + self.body_size()
     }
 }
 
@@ -110,6 +209,39 @@ pub struct ClientAudioFormatsPdu {
 impl ClientAudioFormatsPdu {
     fn body_size(&self) -> usize {
         FORMATS_BODY_FIXED_SIZE + self.formats.iter().map(|f| f.size()).sum::<usize>()
+    }
+
+    /// Decode from cursor after the header has been read. Used by
+    /// server-side processors receiving the client's Audio Formats
+    /// reply (MS-RDPEA 2.2.2.2).
+    pub fn decode_body(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        let flags = ClientSndFlags::from_bits(src.read_u32_le("ClientFormats::dwFlags")?);
+        let volume = src.read_u32_le("ClientFormats::dwVolume")?;
+        let pitch = src.read_u32_le("ClientFormats::dwPitch")?;
+        let _dgram_port = src.read_u16_le("ClientFormats::wDGramPort")?;
+        let num_formats = src.read_u16_le("ClientFormats::wNumberOfFormats")?;
+        if num_formats > MAX_AUDIO_FORMATS {
+            return Err(justrdp_core::DecodeError::invalid_value(
+                "ClientFormats",
+                "wNumberOfFormats exceeds limit",
+            ));
+        }
+        let _last_block = src.read_u8("ClientFormats::cLastBlockConfirmed")?;
+        let version = src.read_u16_le("ClientFormats::wVersion")?;
+        let _pad = src.read_u8("ClientFormats::bPad")?;
+
+        let mut formats = Vec::with_capacity(num_formats as usize);
+        for _ in 0..num_formats {
+            formats.push(AudioFormat::decode(src)?);
+        }
+
+        Ok(Self {
+            flags,
+            volume,
+            pitch,
+            version,
+            formats,
+        })
     }
 }
 
@@ -203,6 +335,11 @@ mod tests {
         assert_eq!(pdu.last_block_confirmed, 255);
         assert_eq!(pdu.version, 5);
         assert_eq!(pdu.formats.len(), 5);
+        // Fields that were previously discarded now parsed.
+        assert_eq!(pdu.flags.bits(), 0x008B_FB08);
+        assert_eq!(pdu.volume, 0x0009_F1E0);
+        assert_eq!(pdu.pitch, 0x771F_2770);
+        assert_eq!(pdu.dgram_port, 0);
 
         // Format 0: PCM stereo 22050 Hz 16-bit
         assert_eq!(pdu.formats[0].format_tag, WaveFormatTag::PCM);
@@ -240,6 +377,54 @@ mod tests {
         ];
         let mut cursor = ReadCursor::new(&body);
         assert!(ServerAudioFormatsPdu::decode_body(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn server_formats_encode_roundtrip() {
+        let pdu = ServerAudioFormatsPdu {
+            flags: ServerSndCapsFlags::ALIVE.union(ServerSndCapsFlags::VOLUME),
+            volume: 0xFFFF_FFFF,
+            pitch: 0x0001_0000,
+            dgram_port: 0,
+            last_block_confirmed: 0xFF,
+            version: 6,
+            formats: alloc::vec![AudioFormat::pcm(2, 44100, 16)],
+        };
+
+        let mut buf = alloc::vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+
+        // BodySize = 20 (fixed) + 18 (one PCM format) = 38.
+        let mut cursor = ReadCursor::new(&buf);
+        let header = SndHeader::decode(&mut cursor).unwrap();
+        assert_eq!(header.msg_type, SndMsgType::Formats);
+        assert_eq!(header.body_size, 38);
+
+        let decoded = ServerAudioFormatsPdu::decode_body(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[test]
+    fn server_formats_encode_rejects_too_many_formats() {
+        // u16::MAX formats would overflow body_size in practice, but we
+        // cap at MAX_AUDIO_FORMATS regardless.
+        let mut formats = alloc::vec::Vec::with_capacity((MAX_AUDIO_FORMATS + 1) as usize);
+        for _ in 0..=MAX_AUDIO_FORMATS {
+            formats.push(AudioFormat::pcm(1, 8000, 8));
+        }
+        let pdu = ServerAudioFormatsPdu {
+            flags: ServerSndCapsFlags::ALIVE,
+            volume: 0,
+            pitch: 0,
+            dgram_port: 0,
+            last_block_confirmed: 0xFF,
+            version: 6,
+            formats,
+        };
+        let mut buf = alloc::vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        assert!(pdu.encode(&mut cursor).is_err());
     }
 
     #[test]

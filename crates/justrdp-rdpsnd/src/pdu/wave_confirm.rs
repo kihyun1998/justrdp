@@ -2,11 +2,7 @@
 
 //! Wave Confirm PDU -- MS-RDPEA 2.2.3.8
 
-use justrdp_core::WriteCursor;
-use justrdp_core::{Encode, EncodeResult};
-
-#[cfg(test)]
-use justrdp_core::{ReadCursor, DecodeResult};
+use justrdp_core::{DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor};
 
 use super::header::{SndHeader, SndMsgType, SND_HEADER_SIZE};
 
@@ -31,9 +27,10 @@ impl WaveConfirmPdu {
     }
 
     /// Decode from cursor after the header has been read.
-    /// WaveConfirmPdu is client→server only; decode is for tests.
-    #[cfg(test)]
-    pub(crate) fn decode_body(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+    ///
+    /// Used by server-side processors (client emits this PDU) to
+    /// correlate Wave / Wave2 PDUs with their completion timestamps.
+    pub fn decode_body(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         let timestamp = src.read_u16_le("WaveConfirmPdu::wTimeStamp")?;
         let confirmed_block_no = src.read_u8("WaveConfirmPdu::cConfirmedBlockNo")?;
         let _pad = src.read_u8("WaveConfirmPdu::bPad")?;

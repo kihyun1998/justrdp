@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! WaveInfo / Wave2 PDU -- MS-RDPEA 2.2.3.3, 2.2.3.9
+//! WaveInfo / Wave2 PDU -- MS-RDPEA 2.2.3.3, 2.2.3.10
 
 use alloc::vec::Vec;
 
@@ -28,7 +28,40 @@ pub struct WaveInfoPdu {
     pub total_audio_size: usize,
 }
 
+/// Fixed body size seen on the wire for a WaveInfo PDU (before the
+/// `BodySize` overloading that also encodes total audio size). Covers
+/// `wTimeStamp` (2) + `wFormatNo` (2) + `cBlockNo` (1) + `bPad` (3) +
+/// `Data[4]` (4) = 12 bytes.
+const WAVE_INFO_WIRE_BODY_SIZE: usize = 12;
+
 impl WaveInfoPdu {
+    /// Build a WaveInfo PDU from an audio chunk. The first 4 bytes of
+    /// `audio` populate `Data[]` (`initial_data`); the remaining bytes
+    /// are emitted by the caller as a Wave PDU via
+    /// [`encode_wave_pdu_body`].
+    ///
+    /// Returns `None` if `audio.len() < 4` -- the WaveInfo PDU requires
+    /// at least 4 bytes to fill the `Data[4]` field (MS-RDPEA 2.2.3.3).
+    pub fn from_chunk(
+        timestamp: u16,
+        format_no: u16,
+        block_no: u8,
+        audio: &[u8],
+    ) -> Option<Self> {
+        if audio.len() < 4 {
+            return None;
+        }
+        let mut initial_data = [0u8; 4];
+        initial_data.copy_from_slice(&audio[..4]);
+        Some(Self {
+            timestamp,
+            format_no,
+            block_no,
+            initial_data,
+            total_audio_size: audio.len(),
+        })
+    }
+
     /// Decode from cursor after the header has been read.
     ///
     /// MS-RDPEA 2.2.3.3: BodySize = 4 + total_audio_data_size,
@@ -79,6 +112,60 @@ impl WaveInfoPdu {
     }
 }
 
+impl Encode for WaveInfoPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        // MS-RDPEA 2.2.3.3: BodySize = 4 + total_audio_size, NOT the
+        // 12 wire bytes. The spec overloads this field so the client
+        // learns how many total audio bytes (across WaveInfo+Wave) are
+        // en route. `total_audio_size` MUST be >= 4 (the 4 bytes in
+        // `Data[]`); anything smaller is a struct-construction bug.
+        if self.total_audio_size < 4 {
+            return Err(justrdp_core::EncodeError::invalid_value(
+                "WaveInfoPdu",
+                "total_audio_size < 4",
+            ));
+        }
+        let body_size = u16::try_from(self.total_audio_size.saturating_add(4))
+            .map_err(|_| justrdp_core::EncodeError::invalid_value("WaveInfoPdu", "total_audio_size too large"))?;
+        let header = SndHeader::new(SndMsgType::Wave, body_size);
+        header.encode(dst)?;
+        dst.write_u16_le(self.timestamp, "WaveInfoPdu::wTimeStamp")?;
+        dst.write_u16_le(self.format_no, "WaveInfoPdu::wFormatNo")?;
+        dst.write_u8(self.block_no, "WaveInfoPdu::cBlockNo")?;
+        dst.write_slice(&[0u8; 3], "WaveInfoPdu::bPad")?;
+        dst.write_slice(&self.initial_data, "WaveInfoPdu::Data")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "WaveInfoPdu"
+    }
+
+    fn size(&self) -> usize {
+        SND_HEADER_SIZE + WAVE_INFO_WIRE_BODY_SIZE
+    }
+}
+
+/// Encode the raw Wave PDU that follows a WaveInfo PDU on the wire.
+///
+/// The Wave PDU has no `SNDPROLOG` header; it is 4 zero bytes of
+/// padding followed by the audio bytes that did not fit in the
+/// preceding WaveInfo's `Data[4]` field (MS-RDPEA 2.2.3.4). Callers
+/// typically pair this with [`WaveInfoPdu::from_chunk`] via:
+///
+/// ```text
+/// let info = WaveInfoPdu::from_chunk(ts, fmt, blk, &audio)?;
+/// let info_bytes = encode_to_vec(&info)?;
+/// let wave_bytes = encode_wave_pdu_body(&audio[4..]);
+/// // send info_bytes then wave_bytes on the SVC channel
+/// ```
+pub fn encode_wave_pdu_body(remaining_audio: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + remaining_audio.len());
+    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(remaining_audio);
+    out
+}
+
 /// Decode the Wave PDU that follows a WaveInfo PDU.
 ///
 /// The Wave PDU has no RDPSND header. It starts with 4 bytes padding
@@ -105,7 +192,7 @@ pub fn decode_wave_data(
     Ok(audio)
 }
 
-/// Wave2 PDU (Server → Client) -- MS-RDPEA 2.2.3.9
+/// Wave2 PDU (Server → Client) -- MS-RDPEA 2.2.3.10
 ///
 /// Modern alternative to WaveInfo+Wave pair. Contains all audio
 /// data in a single PDU.
@@ -271,6 +358,87 @@ mod tests {
         let mut cursor = ReadCursor::new(&wave_pdu);
         let audio = decode_wave_data(&mut cursor, &wave_info).unwrap();
         assert_eq!(audio, alloc::vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn wave_info_from_chunk_rejects_short_audio() {
+        // MS-RDPEA 2.2.3.3: Data[4] requires 4 bytes.
+        assert!(WaveInfoPdu::from_chunk(0, 0, 0, &[]).is_none());
+        assert!(WaveInfoPdu::from_chunk(0, 0, 0, &[1, 2, 3]).is_none());
+        assert!(WaveInfoPdu::from_chunk(0, 0, 0, &[1, 2, 3, 4]).is_some());
+    }
+
+    #[test]
+    fn wave_info_encode_minimum_audio_size() {
+        // 4-byte audio -> total_audio_size=4, remaining=0, body_size=8.
+        let pdu = WaveInfoPdu::from_chunk(100, 0, 1, &[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+        let mut buf = alloc::vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let header = SndHeader::decode(&mut cursor).unwrap();
+        assert_eq!(header.msg_type, SndMsgType::Wave);
+        assert_eq!(header.body_size, 8);
+
+        let decoded = WaveInfoPdu::decode_body(&mut cursor, header.body_size).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[test]
+    fn wave_info_encode_with_remaining_data() {
+        // 12-byte audio -> total_audio_size=12, body_size=16, remaining=8.
+        let audio: alloc::vec::Vec<u8> = (0..12u8).collect();
+        let pdu = WaveInfoPdu::from_chunk(100, 0, 1, &audio).unwrap();
+        let mut buf = alloc::vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+
+        let mut cursor = ReadCursor::new(&buf);
+        let header = SndHeader::decode(&mut cursor).unwrap();
+        assert_eq!(header.body_size, 16);
+        let decoded = WaveInfoPdu::decode_body(&mut cursor, header.body_size).unwrap();
+        assert_eq!(decoded.initial_data, [0, 1, 2, 3]);
+        assert_eq!(decoded.total_audio_size, 12);
+        assert_eq!(decoded.remaining_wave_size(), 8);
+    }
+
+    #[test]
+    fn encode_wave_pdu_body_prepends_four_zero_pad() {
+        // 0 remaining bytes -> just 4 zeros.
+        let bytes = encode_wave_pdu_body(&[]);
+        assert_eq!(bytes, alloc::vec![0, 0, 0, 0]);
+
+        // 8 remaining bytes -> 4 zeros + those bytes.
+        let bytes = encode_wave_pdu_body(&[0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        assert_eq!(
+            bytes,
+            alloc::vec![0, 0, 0, 0, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+        );
+    }
+
+    #[test]
+    fn wave_info_plus_wave_roundtrip_full_audio() {
+        // End-to-end: encode a 12-byte chunk, then decode WaveInfo and
+        // Wave back, reassemble, verify identity.
+        let audio: alloc::vec::Vec<u8> = (0x10..0x1Cu8).collect();
+        let info = WaveInfoPdu::from_chunk(42, 2, 7, &audio).unwrap();
+
+        let mut info_buf = alloc::vec![0u8; info.size()];
+        let mut c = WriteCursor::new(&mut info_buf);
+        info.encode(&mut c).unwrap();
+
+        let wave_buf = encode_wave_pdu_body(&audio[4..]);
+
+        // Decode WaveInfo.
+        let mut c = ReadCursor::new(&info_buf);
+        let header = SndHeader::decode(&mut c).unwrap();
+        let decoded_info = WaveInfoPdu::decode_body(&mut c, header.body_size).unwrap();
+
+        // Decode Wave (no header) and reassemble.
+        let mut c = ReadCursor::new(&wave_buf);
+        let full = decode_wave_data(&mut c, &decoded_info).unwrap();
+        assert_eq!(full, audio);
     }
 
     #[test]

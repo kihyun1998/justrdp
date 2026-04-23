@@ -25,6 +25,8 @@ mod engine;
 mod processor;
 #[cfg(feature = "alloc")]
 mod processor_dvc;
+#[cfg(feature = "alloc")]
+mod server;
 
 #[cfg(feature = "alloc")]
 pub use backend::RdpsndBackend;
@@ -34,3 +36,5 @@ pub use decoder::make_decoder;
 pub use processor::RdpsndClient;
 #[cfg(feature = "alloc")]
 pub use processor_dvc::{RdpsndDvcClient, RdpsndLossyDvcClient};
+#[cfg(feature = "alloc")]
+pub use server::{RdpServerSoundHandler, SoundServer};

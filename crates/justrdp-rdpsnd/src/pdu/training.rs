@@ -17,6 +17,18 @@ pub struct TrainingPdu {
 }
 
 impl TrainingPdu {
+    /// Create a new Training PDU. `pack_size == 0` means "header+body
+    /// only, 8 wire bytes". A non-zero value is the total PDU size;
+    /// the encoder emits `pack_size - SND_HEADER_SIZE - 4` bytes of
+    /// trailing zero padding so the server can measure round-trip at
+    /// a specific packet size (MS-RDPEA 2.2.3.1).
+    pub fn new(timestamp: u16, pack_size: u16) -> Self {
+        Self {
+            timestamp,
+            pack_size,
+        }
+    }
+
     /// Decode from cursor after the header has been read.
     ///
     /// `body_size` is from the header; any data beyond the fixed 4 bytes is ignored.
@@ -38,6 +50,51 @@ impl TrainingPdu {
             timestamp,
             pack_size,
         })
+    }
+
+    /// Total wire length of this PDU: `SND_HEADER_SIZE` + body_size.
+    /// When `pack_size == 0`, body_size = 4 (timestamp + pack_size).
+    /// When `pack_size > 0`, body_size = `pack_size - SND_HEADER_SIZE`,
+    /// including the trailing filler.
+    fn body_size(&self) -> u16 {
+        if self.pack_size == 0 {
+            4
+        } else {
+            self.pack_size.saturating_sub(SND_HEADER_SIZE as u16)
+        }
+    }
+}
+
+impl Encode for TrainingPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        let body_size = self.body_size();
+        if body_size < 4 {
+            return Err(justrdp_core::EncodeError::invalid_value(
+                "TrainingPdu",
+                "pack_size smaller than header+body minimum",
+            ));
+        }
+        let header = SndHeader::new(SndMsgType::Training, body_size);
+        header.encode(dst)?;
+        dst.write_u16_le(self.timestamp, "TrainingPdu::wTimeStamp")?;
+        dst.write_u16_le(self.pack_size, "TrainingPdu::wPackSize")?;
+        let filler = (body_size - 4) as usize;
+        if filler > 0 {
+            // Emit zeros -- the client ignores the filler, and MS-RDPEA
+            // does not prescribe specific byte values here.
+            for _ in 0..filler {
+                dst.write_u8(0, "TrainingPdu::filler")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "TrainingPdu"
+    }
+
+    fn size(&self) -> usize {
+        SND_HEADER_SIZE + self.body_size() as usize
     }
 }
 
@@ -132,5 +189,39 @@ mod tests {
         assert_eq!(training.pack_size, 8);
         // Cursor should be fully consumed after skipping extra data.
         assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn training_encode_no_pack_size() {
+        // pack_size = 0 → 8 wire bytes total: 4 header + 4 body.
+        let pdu = TrainingPdu::new(0x1234, 0);
+        let mut buf = alloc::vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        assert_eq!(buf.len(), 8);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let header = SndHeader::decode(&mut cursor).unwrap();
+        assert_eq!(header.msg_type, SndMsgType::Training);
+        assert_eq!(header.body_size, 4);
+        let decoded = TrainingPdu::decode_body(&mut cursor, header.body_size).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[test]
+    fn training_encode_with_pack_size() {
+        // pack_size = 16 → total 16 bytes; body_size = 12; 8 bytes filler.
+        let pdu = TrainingPdu::new(0x5678, 16);
+        let mut buf = alloc::vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        assert_eq!(buf.len(), 16);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let header = SndHeader::decode(&mut cursor).unwrap();
+        assert_eq!(header.body_size, 12);
+        let decoded = TrainingPdu::decode_body(&mut cursor, header.body_size).unwrap();
+        assert_eq!(decoded.timestamp, 0x5678);
+        assert_eq!(decoded.pack_size, 16);
     }
 }
