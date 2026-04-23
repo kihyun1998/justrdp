@@ -2333,9 +2333,12 @@ uncompressed bitmap fast-path, 입력/종료/SVC opaque forward까지. RFX/EGFX
 - [x] SVC data opaque forward hook (채널 크레이트 장착 포인트)
 - [x] 종료 경로 -- `SetErrorInfoPdu` 송출 + MCS
       `DisconnectProviderUltimatum` + `ServerTerminate` output
-- [ ] `justrdp-blocking` 클라와 loopback 통합 테스트
-      (wire-level smoke test in `active::tests::session_smoke_test_dispatches_in_order`;
-       full TCP-loopback dual-thread driver deferred to follow-up commit)
+- [-] `justrdp-blocking` 클라와 loopback 통합 테스트 -- **deferred to §11.2d**
+      (wire-level smoke test in `active::tests::session_smoke_test_dispatches_in_order`
+       covers ServerActiveStage in isolation; combined integration test
+       lands in §11.2d after 11.2b/c so the harness can also exercise
+       the GFX pipeline and channel handlers in one place rather than
+       being rewritten when those interfaces shift)
 
 #### 11.2b -- Server-Side GFX Encoding Pipeline
 
@@ -2378,6 +2381,42 @@ EGFX/DVC 송신 루프를 깔아서 **mstsc 인터롭**에 도달.
       emit
 - [ ] (선택) `RdpServerFilesystemHandler` trait
 
+#### 11.2d -- Integration Tests
+
+> **requires**: 11.2a, 11.2b, 11.2c
+>
+> 11.2a/b/c 의 인터페이스가 모두 안정화된 시점에 **한 번에** 통합 테스트
+> 인프라를 구축. 11.2a 만 통합 테스트를 작성하면 11.2b 의
+> `DisplayHandler::get_surface_update()` / `get_egfx_frame()` 확장과
+> 11.2c 의 `*Handler` trait 추가가 들어올 때마다 테스트 재작성이 필요해
+> churn 발생.
+
+목표: `ServerAcceptor` ↔ `ClientConnector` 양방향 풀 핸드셰이크 +
+active session PDU 교환을 단일 프로세스에서 deterministic 하게 검증.
+TLS 단계는 caller-delegated 훅이므로 `NoopTlsUpgrader` 어댑터로 우회
+(Standard RDP Security 풀 스택 검증은
+[Appendix G.2 (`§11.2a-stdsec`)](#g2-standard-rdp-security-server-side-stack-112a-stdsec)
+완료 후 본 섹션에 변형 추가).
+
+- [ ] **인프라**: 인메모리 duplex transport (`Vec<u8>` 양방향 큐) +
+      `NoopTlsUpgrader` 어댑터. `mock_redirect.rs` 의
+      기존 헬퍼 (`encode_pdu`, `wrap_tpkt_dt`, `build_server_data_frame`)
+      재사용.
+- [ ] **풀 핸드셰이크 테스트** (11.2a) -- X.224 Negotiate → MCS Connect
+      → Channel Join → Client Info → License → DemandActive →
+      ConfirmActive → Finalization → 양쪽 `Accepted`/`Connected` 도달.
+- [ ] **Active session 양방향** (11.2a) -- 서버가 fast-path bitmap 송신
+      → 클라이언트 디코드 검증; 클라이언트가 fast-path input 송신 →
+      서버 dispatch 검증; clean disconnect (`SetErrorInfoPdu` +
+      `DisconnectProviderUltimatum`) 양쪽 종료 검증.
+- [ ] **GFX 파이프라인 검증** (11.2b) -- RFX `TS_RFX_FRAME_BEGIN`/
+      `_END` 프레이밍, EGFX `WireToSurface` + `FrameAcknowledge`
+      왕복.
+- [ ] **채널 핸들러 검증** (11.2c) -- cliprdr `Format List` /
+      `Format Data Request` 왕복; rdpsnd `Audio Format` PDU.
+- [ ] **regression suite** -- 회귀 잡기 위한 known-good 시나리오 묶음
+      (CI 에서 항상 실행).
+
 #### 연기 / 제외
 
 - **멀티세션**: 런타임 관심사 (프로토콜 아님). `RdpServer`는
@@ -2385,7 +2424,11 @@ EGFX/DVC 송신 루프를 깔아서 **mstsc 인터롭**에 도달.
   `examples/` 예제만 추가.
 - **Auto-reconnect cookie 서버 emit**: 9.x 별도 작업.
 - **Shadow / multi-party**: 별도 섹션 (MS-RDPEMC).
-- **Session redirection emit (서버 → 클라 리다이렉트)**: 11.2d 후보.
+- **Session redirection emit (서버 → 클라 리다이렉트)**: 11.2e 후보.
+- **Standard RDP Security server-side stack** (PROTOCOL_RDP without
+  TLS, RC4 + MAC): §11.2a 의 의도된 stub. 풀 구현은 별도
+  sub-roadmap [**§11.2a-stdsec** (Appendix G.2)](#g2-standard-rdp-security-server-side-stack-112a-stdsec)
+  로 분리 -- 3 commit 추정.
 
 ### 11.3 `justrdp-web` -- WASM Bindings
 
@@ -3415,3 +3458,52 @@ Phase 8 ▸ Server+Ecosystem   justrdp-acceptor, justrdp-server
 - [ ] RSA/RC4/MAC 테스트 벡터
 - [ ] 라이선스 발급 → 저장 → 재연결 시 로드 → `STATUS_VALID_CLIENT` 수신
       end-to-end 통합 테스트
+
+---
+
+### G.2 Standard RDP Security Server-Side Stack (`§11.2a-stdsec`)
+
+> **Why deferred**: §11.2a 는 의도적으로 `ServerAcceptor` 의 `SC_SECURITY`
+> 블록을 항상 `encryption_method=0/level=0` (no encryption) 으로 emit
+> 하도록 stub 처리했음. 모든 모던 RDP 배포는 TLS/CredSSP 를 사용하므로
+> Standard RDP Security (PROTOCOL_RDP, RC4 + MAC) 는 legacy interop 외에는
+> 가치가 적음. `justrdp-pdu/src/rdp/standard_security.rs` 의 클라이언트
+> 측 RC4/MAC 코드는 이미 완성됐고 테스트 벡터도 있음 -- 빠진 건 acceptor
+> 측의 RSA 인증서 발급 + `SecurityExchange PDU` 디코드 + 송수신 path 의
+> wrap/unwrap 통합뿐.
+>
+> **Why it cannot be split**: RSA 인증서 → 클라이언트 랜덤 → 세션 키
+> 파생 → MAC/RC4 wrap 4단계가 한 핸드셰이크 안에서 모두 살아있어야
+> 검증 가능. 어느 한 단계만 떼서 commit 하면 회귀 잡을 길이 없음.
+>
+> **언제 진가가 살아나는가**: §11.2d 통합 테스트가 "TCP loopback +
+> Standard RDP Security 풀 핸드셰이크" 변형을 추가할 수 있게 됨 (현재
+> §11.2d 는 `NoopTlsUpgrader` 어댑터로 TLS 만 우회한 형태). 또한 `xrdp`
+> 같은 PROTOCOL_RDP-only 클라이언트와의 인터롭이 가능해짐.
+
+**작업 항목 (3 commit 추정):**
+
+- [ ] **S1 -- RSA 인증서 발급**: `ServerAcceptor` 에 `RdpSecurityContext`
+      필드 추가. `justrdp-pdu` 의 `ServerRsaPublicKey` / `ProprietaryCertificate`
+      구조를 사용해서 connection 별 RSA 키쌍 + 자체 서명 인증서 생성.
+      `MCS Connect Response` 의 `SC_SECURITY` 에 `serverRandom` (32B) +
+      `serverCertificate` 첨부.
+- [ ] **S2 -- SecurityExchange PDU 서버 디코드**: 클라이언트가 보내는
+      `Security Exchange PDU` (TPKT 위에서) 를 받아 `EncryptedClientRandom`
+      을 RSA 복호화 → `clientRandom` 회수. `derive_session_keys` 호출로
+      master / session / sign / encrypt / decrypt 키 파생. `RdpSecurityContext`
+      에 키 저장.
+- [ ] **S3 -- ActiveStage 송수신 wrap/unwrap**: `ServerActiveStage` 가 모든
+      slow-path 송신을 `encrypt_packet()` + MAC 으로 감싸도록, 모든
+      slow-path 수신을 `decrypt_packet()` + MAC 검증으로 풀도록 통합.
+      Fast-path 도 `FASTPATH_*_ENCRYPTED` 플래그 설정 시 동일 처리.
+      Key update (4096B 마다) 트리거.
+
+**검증:**
+
+- [ ] 클라이언트가 보낸 `EncryptedClientRandom` 을 서버가 풀어 동일한
+      `clientRandom` 추출 (round-trip wire 트레이스).
+- [ ] 양쪽 파생 세션 키가 byte-identical.
+- [ ] `ConfirmActive` PDU 가 서버 `decrypt_packet()` 통과.
+- [ ] §11.2d 에 "TCP loopback + Standard RDP Security" 변형 통합 테스트
+      추가 → 풀 wire-level 검증.
