@@ -2476,20 +2476,93 @@ register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
 #### 11.2c -- Server-Direction Channel Handlers
 
 > **requires**: 11.2a
+>
+> 채널 간 의존성이 없으므로 채널별 sub-section 으로 분할. 각 sub-section
+> 은 "서버 방향 PDU emit/decode + ServerProcessor → Handler trait +
+> RdpServer 통합" 구조의 2 commit. cliprdr/rdpsnd 만으로 데모 시나리오
+> 충족, rdpdr 은 (선택) 으로 후순위. SVC dispatch 통합은 11.2a 의
+> `svc_opaque_forward` hook 위에 채널별 ServerProcessor 를 register
+> 하는 식.
 
-목표: 기존 채널 크레이트들(client-oriented)의 서버 방향 확장 +
-`RdpServer`에서 `*Handler` trait으로 노출. 채널당 독립 커밋 묶음,
-필요한 것부터 (cliprdr 우선 권장).
+##### 11.2c-1 -- cliprdr 서버 방향
 
-- [ ] `justrdp-cliprdr` 서버 방향 -- Monitor Ready, Format List emit,
-      Format Data Request/Response 서버 측
-- [ ] `RdpServerClipboardHandler` trait + skeleton 통합
-- [ ] `justrdp-rdpsnd` 서버 방향 -- Audio Format PDU, WaveInfo/Wave2
-      PDU, Server Audio Formats and Version PDU
-- [ ] `RdpServerSoundHandler` trait + skeleton 통합
-- [ ] (선택) `justrdp-rdpdr` 서버 방향 -- Announce, Server I/O Request
-      emit
-- [ ] (선택) `RdpServerFilesystemHandler` trait
+> **requires**: 11.2a (SVC opaque forward hook), 8.4 cliprdr PDU
+
+목표: 기존 client-oriented `ClipboardProcessor` 의 미러로
+`ClipboardServer` 를 만들어 SVC 채널 위에서 서버 → 클라이언트 클립보드
+공유 시퀀스를 구동.
+
+- [ ] `ClipboardServer` -- `SvcProcessor` 구현 (server 방향)
+- [ ] Server Monitor Ready PDU emit (MS-RDPECLIP 2.2.2.1)
+- [ ] Capability exchange -- `Server Clipboard Capabilities PDU` emit,
+      `Client Clipboard Capabilities PDU` 수신 (general flags 협상)
+- [ ] `Format List PDU` 수신 + `Format List Response PDU` emit
+      (long format names 지원)
+- [ ] `Format Data Request PDU` emit / `Format Data Response PDU` 수신
+      (서버가 클라 클립보드에서 데이터를 가져오는 방향)
+- [ ] `Format Data Request PDU` 수신 / `Format Data Response PDU` emit
+      (클라가 서버 클립보드에서 데이터를 가져가는 방향)
+- [ ] `RdpServerClipboardHandler` trait -- `on_format_list`,
+      `on_format_data_request`, `on_format_data_response`,
+      `current_formats()`, `provide_format_data(format_id)`
+- [ ] `RdpServer` 통합 -- SVC dispatch 시 채널 이름으로 라우팅, 핸들러
+      미설정 시 11.2a opaque forward 로 fall-through
+- [ ] 단위 테스트 (PDU roundtrip, 시퀀스 상태 머신, 양방향 데이터 교환)
+
+##### 11.2c-2 -- rdpsnd 서버 방향
+
+> **requires**: 11.2a, 8.5 rdpsnd PDU
+
+목표: 기존 client-oriented `SoundProcessor` 의 미러로 `SoundServer` 를
+만들어 서버 → 클라이언트 오디오 송출 시퀀스를 구동. 데이터 흐름은
+주로 서버→클라 (오디오 스트리밍) 이라 emit 측이 무거움.
+
+- [ ] `SoundServer` -- `SvcProcessor` 구현 (server 방향)
+- [ ] `Server Audio Formats and Version PDU` (MS-RDPEA 2.2.2.1) emit --
+      지원 포맷 광고 + 버전 협상
+- [ ] `Client Audio Formats and Version PDU` 수신 -- 클라 측 지원 포맷
+      교집합 추출
+- [ ] `Quality Mode PDU` 수신
+- [ ] `WaveInfo PDU` (MS-RDPEA 2.2.3.3) + `Wave PDU` (2.2.3.4) emit --
+      PCM 포맷 오디오 청크 송출
+- [ ] `Wave2 PDU` (MS-RDPEA 2.2.3.10) emit -- 압축 포맷 + timestamp
+      포함 청크 송출
+- [ ] `Wave Confirm PDU` 수신 -- 송출 latency tracking
+- [ ] `Training PDU` emit / `Training Confirm PDU` 수신 (선택; latency
+      측정용)
+- [ ] `RdpServerSoundHandler` trait -- `next_audio_chunk()`,
+      `on_wave_confirm(timestamp, cBlockNo)`, `negotiated_format()`
+- [ ] `RdpServer` 통합 (cliprdr 와 동일한 SVC 라우팅 패턴)
+- [ ] 단위 테스트 (PDU roundtrip, 포맷 협상, WaveInfo/Wave 페어 인코드,
+      timestamp 추적)
+
+##### 11.2c-3 -- (선택) rdpdr 서버 방향
+
+> **requires**: 11.2a, 8.7 rdpdr PDU
+>
+> 데모 시나리오 후순위. IRP 다양성 (file system / printer / smart card /
+> serial / parallel) 으로 가장 무거운 서브섹션. cliprdr/rdpsnd 까지만
+> 구현하고 멈추는 것도 합리적.
+
+- [ ] `FilesystemServer` -- `SvcProcessor` 구현 (server 방향)
+- [ ] `Server Announce Request` (MS-RDPEFS 2.2.2.2) emit
+- [ ] `Client Announce Reply` / `Client Name Request` 수신
+- [ ] `Server Core Capability Request` emit / `Client Core Capability
+      Response` 수신
+- [ ] `Server Client ID Confirm` emit
+- [ ] `Client Device List Announce Request` 수신 -- 디바이스 목록
+      파싱 (DRIVE / PRINT / PORT / SMARTCARD)
+- [ ] `Server Device Announce Response` emit
+- [ ] `Device I/O Request` emit (CREATE/CLOSE/READ/WRITE/QUERY_INFO/
+      SET_INFO/DIRECTORY_CONTROL/LOCK_CONTROL/QUERY_VOLUME_INFO/
+      SET_VOLUME_INFO/DEVICE_CONTROL) -- 우선 CREATE/READ/WRITE/CLOSE
+      만 1차 범위
+- [ ] `Device I/O Completion` 수신 + completion ID 매칭
+- [ ] `RdpServerFilesystemHandler` trait -- `on_device_announce`,
+      `next_io_request()`, `on_io_completion(completion_id, status,
+      data)`
+- [ ] `RdpServer` 통합
+- [ ] 단위 테스트 (PDU roundtrip, 시퀀스 상태 머신, completion ID 매칭)
 
 #### 11.2d -- Integration Tests
 
