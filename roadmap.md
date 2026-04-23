@@ -2527,24 +2527,36 @@ register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
 만들어 서버 → 클라이언트 오디오 송출 시퀀스를 구동. 데이터 흐름은
 주로 서버→클라 (오디오 스트리밍) 이라 emit 측이 무거움.
 
-- [ ] `SoundServer` -- `SvcProcessor` 구현 (server 방향)
-- [ ] `Server Audio Formats and Version PDU` (MS-RDPEA 2.2.2.1) emit --
-      지원 포맷 광고 + 버전 협상
-- [ ] `Client Audio Formats and Version PDU` 수신 -- 클라 측 지원 포맷
-      교집합 추출
-- [ ] `Quality Mode PDU` 수신
-- [ ] `WaveInfo PDU` (MS-RDPEA 2.2.3.3) + `Wave PDU` (2.2.3.4) emit --
-      PCM 포맷 오디오 청크 송출
-- [ ] `Wave2 PDU` (MS-RDPEA 2.2.3.10) emit -- 압축 포맷 + timestamp
-      포함 청크 송출
-- [ ] `Wave Confirm PDU` 수신 -- 송출 latency tracking
-- [ ] `Training PDU` emit / `Training Confirm PDU` 수신 (선택; latency
-      측정용)
-- [ ] `RdpServerSoundHandler` trait -- `next_audio_chunk()`,
-      `on_wave_confirm(timestamp, cBlockNo)`, `negotiated_format()`
-- [ ] `RdpServer` 통합 (cliprdr 와 동일한 SVC 라우팅 패턴)
-- [ ] 단위 테스트 (PDU roundtrip, 포맷 협상, WaveInfo/Wave 페어 인코드,
-      timestamp 추적)
+- [x] `SoundServer` -- `SvcProcessor` / `SvcServerProcessor` 구현
+      (상태 머신 `NotStarted` → `WaitClientFormats` → `Streaming`)
+- [x] `Server Audio Formats and Version PDU` (MS-RDPEA 2.2.2.1) emit --
+      지원 포맷 광고 + 버전 협상 (`ServerAudioFormatsPdu::encode` 추가)
+- [x] `Client Audio Formats and Version PDU` 수신 -- 포맷 교집합
+      (byte-equal) + flags 비트와이즈 AND + version `min()` 협상
+- [x] `Quality Mode PDU` emit (`build_quality_mode`) / 수신
+      (`RdpServerSoundHandler::on_quality_mode`)
+- [x] `WaveInfo PDU` (MS-RDPEA 2.2.3.3) + `Wave PDU` (2.2.3.4) emit --
+      `emit_wave_chunk(format_index, audio, timestamp)` 가
+      `[WaveInfoPdu, RawWave]` 페어 반환 (BodySize = 4 + audio.len())
+- [x] `Wave2 PDU` (MS-RDPEA 2.2.3.10) emit -- `emit_wave2_chunk`
+      (audio timestamp + 단일 PDU)
+- [x] `Wave Confirm PDU` 수신 -- pending-confirm 링 (bounded at 256)
+      매칭 + u16 wrapping latency 계산
+- [x] `Training PDU` emit (`send_training`) / `Training Confirm PDU`
+      수신 (rtt 계산 + handler dispatch, pending 없으면 silently drop)
+- [x] `RdpServerSoundHandler` trait -- `on_client_formats`,
+      `on_quality_mode`, `on_wave_confirm(timestamp, block_no, latency_ms)`,
+      `on_training_confirm(timestamp, pack_size, rtt_ms)`, `on_close`
+      (`next_audio_chunk()` / `negotiated_format()` 는 명시 API
+      `emit_wave_chunk` / `negotiated_formats()` 로 대체)
+- [x] `RdpServer` 통합 -- §11.2c-1 의 generic
+      `ServerActiveStage::register_svc_processor` 위에 그대로 얹힘
+      (cliprdr 와 동일 패턴)
+- [x] 단위 테스트 (28건 server: PDU 시퀀스 + 포맷 협상 +
+      WaveInfo/Wave 페어 인코드 + latency wraparound +
+      blockNo 255→0 wrap + pending cap + Close reset + unknown msgType
+      drop; 9건 PDU: ServerAudioFormatsPdu/TrainingPdu encode roundtrip,
+      WaveInfoPdu encode, encode_wave_pdu_body)
 
 ##### 11.2c-3 -- (선택) rdpdr 서버 방향
 
