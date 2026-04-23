@@ -14,6 +14,7 @@
 
 pub mod color;
 pub mod dwt;
+pub mod frame_encoder;
 pub mod quant;
 pub mod rlgr;
 pub mod subband;

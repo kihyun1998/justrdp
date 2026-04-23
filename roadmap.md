@@ -2381,20 +2381,20 @@ uncompressed bitmap fast-path, 입력/종료/SVC opaque forward까지. RFX/EGFX
 `TS_BITMAP_DATA_EX.bitmapData` 로 실어 b-1 의 `SetSurfaceBitsCommand`
 페이로드로 전달.
 
-- [ ] `RfxBlockType` (`WBT_*`) + `RfxHeader` (blockType/blockLen)
-- [ ] `WBT_SYNC` (0xCCC0) -- magic + version
-- [ ] `WBT_CODEC_VERSIONS` (0xCCC1)
-- [ ] `WBT_CHANNELS` (0xCCC2) + `RfxChannel` (id/width/height)
-- [ ] `WBT_CONTEXT` (0xCCC3) -- ctxId/tileSize/properties (entropy/quant/
+- [x] `RfxBlockType` (`WBT_*`) + `RfxHeader` (blockType/blockLen)
+- [x] `WBT_SYNC` (0xCCC0) -- magic + version
+- [x] `WBT_CODEC_VERSIONS` (0xCCC1)
+- [x] `WBT_CHANNELS` (0xCCC2) + `RfxChannel` (id/width/height)
+- [x] `WBT_CONTEXT` (0xCCC3) -- ctxId/tileSize/properties (entropy/quant/
       progressive flags)
-- [ ] `WBT_FRAME_BEGIN` (0xCCC4) / `WBT_FRAME_END` (0xCCC5)
-- [ ] `WBT_REGION` (0xCCC6) -- regionFlags + rect 배열
-- [ ] `WBT_TILESET` (0xCCC7) -- quants 테이블 + tile 배열 (tileIdx,
+- [x] `WBT_FRAME_BEGIN` (0xCCC4) / `WBT_FRAME_END` (0xCCC5)
+- [x] `WBT_REGION` (0xCCC6) -- regionFlags + rect 배열
+- [x] `WBT_TILESET` (0xCCC7) -- quants 테이블 + tile 배열 (tileIdx,
       x/y, YLen/CbLen/CrLen, YData/CbData/CrData)
-- [ ] `RfxFrameEncoder` -- frame 단위 API (begin → region → tileset →
+- [x] `RfxFrameEncoder` -- frame 단위 API (begin → region → tileset →
       end), 서버 sync/codec_versions/channels/context handshake state,
       quant/tile 파티셔닝
-- [ ] PDU roundtrip + frame 단위 인코드 테스트 (1 tile, 다중 tile,
+- [x] PDU roundtrip + frame 단위 인코드 테스트 (1 tile, 다중 tile,
       다중 region)
 
 ##### 11.2b-3 -- EGFX Server Encoding Loop
