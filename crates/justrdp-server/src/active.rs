@@ -30,7 +30,11 @@ use alloc::vec::Vec;
 
 use justrdp_acceptor::AcceptanceResult;
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
-use justrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+use justrdp_pdu::mcs::{
+    DisconnectProviderUltimatum, DisconnectReason, SendDataIndication, SendDataRequest,
+};
+use justrdp_pdu::rdp::error_info::ErrorInfoCode;
+use justrdp_pdu::rdp::finalization::SetErrorInfoPdu;
 use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathInputHeader};
 use justrdp_pdu::rdp::finalization::{
     ControlAction, ControlPdu, InputEventPdu, InputEventType, PersistentKeyListPdu, RefreshRectPdu,
@@ -466,6 +470,46 @@ impl ServerActiveStage {
             offset = end;
         }
         Ok(frames)
+    }
+
+    /// Encode a clean-disconnect sequence: `SetErrorInfoPdu` (wrapped
+    /// in ShareData on the I/O channel) followed by a top-level MCS
+    /// `DisconnectProviderUltimatum` (TPKT + X.224 DT + 2-byte PER).
+    ///
+    /// Returns the two frames in order. The caller MUST flush both
+    /// before closing the underlying transport so the client can
+    /// surface a coherent disconnect reason rather than seeing only a
+    /// half-open TCP close.
+    ///
+    /// The MCS reason is fixed at `UserRequested` (3) for the
+    /// server-initiated path; the actual cause of the disconnect is
+    /// carried by the preceding `SetErrorInfoPdu`'s
+    /// [`ErrorInfoCode`].
+    pub fn encode_disconnect(&self, code: ErrorInfoCode) -> ServerResult<Vec<Vec<u8>>> {
+        let info = SetErrorInfoPdu::new(code);
+        let info_frame = self.encode_share_data(ShareDataPduType::SetErrorInfo, &info)?;
+        let ult_frame = self.encode_disconnect_ultimatum(DisconnectReason::UserRequested)?;
+        Ok(alloc::vec![info_frame, ult_frame])
+    }
+
+    /// Encode a stand-alone `DisconnectProviderUltimatum` frame
+    /// (TPKT + X.224 DT + 2-byte PER body). Use this when no
+    /// `SetErrorInfoPdu` is needed (e.g. fatal protocol error mid-handshake).
+    pub fn encode_disconnect_ultimatum(
+        &self,
+        reason: DisconnectReason,
+    ) -> ServerResult<Vec<u8>> {
+        let ult = DisconnectProviderUltimatum { reason };
+        let payload_size = DATA_TRANSFER_HEADER_SIZE + ult.size();
+        let total = TPKT_HEADER_SIZE + payload_size;
+        let mut buf = vec![0u8; total];
+        {
+            let mut c = WriteCursor::new(&mut buf);
+            TpktHeader::try_for_payload(payload_size)?.encode(&mut c)?;
+            DataTransfer.encode(&mut c)?;
+            ult.encode(&mut c)?;
+        }
+        Ok(buf)
     }
 
     fn frame_one_svc_chunk(
@@ -1527,6 +1571,110 @@ mod tests {
         let s = fake_stage();
         // 0x0FFF is not in the registered channel_ids of fake_result().
         assert!(s.encode_svc_send(0x0FFF, b"x").is_err());
+    }
+
+    #[test]
+    fn encode_disconnect_emits_setting_then_ultimatum() {
+        let s = fake_stage();
+        let frames = s
+            .encode_disconnect(ErrorInfoCode::RpcInitiatedDisconnect)
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+
+        // Frame 0: SetErrorInfoPdu wrapped in ShareData on I/O channel.
+        let mut c = ReadCursor::new(&frames[0]);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        assert_eq!(sdi.channel_id, s.io_channel_id);
+        assert_eq!(sdi.initiator, s.user_channel_id);
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let sc = ShareControlHeader::decode(&mut inner).unwrap();
+        assert_eq!(sc.pdu_type, ShareControlPduType::Data);
+        assert_eq!(sc.pdu_source, s.user_channel_id);
+        let sd = ShareDataHeader::decode(&mut inner).unwrap();
+        assert_eq!(sd.pdu_type2, ShareDataPduType::SetErrorInfo);
+        assert_eq!(sd.share_id, s.share_id);
+        let info = SetErrorInfoPdu::decode(&mut ReadCursor::new(inner.peek_remaining())).unwrap();
+        assert_eq!(info.code(), ErrorInfoCode::RpcInitiatedDisconnect);
+
+        // Frame 1: top-level DisconnectProviderUltimatum (no MCS SDI
+        // wrapping -- the PER body sits directly under X.224 DT).
+        let mut c = ReadCursor::new(&frames[1]);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let ult = DisconnectProviderUltimatum::decode(&mut c).unwrap();
+        assert_eq!(ult.reason, DisconnectReason::UserRequested);
+    }
+
+    #[test]
+    fn encode_disconnect_ultimatum_alone_decodes_back() {
+        let s = fake_stage();
+        let bytes = s
+            .encode_disconnect_ultimatum(DisconnectReason::ProviderInitiated)
+            .unwrap();
+        let mut c = ReadCursor::new(&bytes);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let ult = DisconnectProviderUltimatum::decode(&mut c).unwrap();
+        assert_eq!(ult.reason, DisconnectReason::ProviderInitiated);
+    }
+
+    /// Wire-roundtrip smoke: drive the full `process()` dispatch
+    /// against a known good fixture sequence (Suppress → Refresh →
+    /// Shutdown) and assert each step produces the expected output. A
+    /// proper TCP-loopback integration test against `justrdp-blocking`
+    /// is out of scope for §11.2a (would need a no-TLS handshake
+    /// shim and dual-thread driver) -- tracked as a §11.2a follow-up.
+    #[test]
+    fn session_smoke_test_dispatches_in_order() {
+        let mut s = fake_stage();
+        let mut h = NoopHandler;
+
+        // Step 1: client suppresses output.
+        let suppress_pdu = SuppressOutputPdu {
+            allow_display_updates: 0,
+            left: None,
+            top: None,
+            right: None,
+            bottom: None,
+        };
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::SuppressOutput, &suppress_pdu);
+        let out = s.process(&bytes, &mut h).unwrap();
+        assert!(matches!(
+            out.as_slice(),
+            [ActiveStageOutput::SuppressOutput { suppress: true, .. }]
+        ));
+        assert!(s.is_output_suppressed());
+
+        // Step 2: client refreshes a region.
+        let refresh = RefreshRectPdu {
+            areas: alloc::vec![InclusiveRect { left: 0, top: 0, right: 99, bottom: 99 }],
+        };
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::RefreshRect, &refresh);
+        let out = s.process(&bytes, &mut h).unwrap();
+        assert!(matches!(out.as_slice(), [ActiveStageOutput::RefreshRect(_)]));
+
+        // Step 3: client requests shutdown -- server replies denied + notifies.
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::ShutdownRequest, &ShutdownRequestPdu);
+        let out = s.process(&bytes, &mut h).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], ActiveStageOutput::SendBytes(_)));
+        assert!(matches!(out[1], ActiveStageOutput::ShutdownRequested));
+
+        // Step 4: server-initiated disconnect (LogoffByUser).
+        let frames = s.encode_disconnect(ErrorInfoCode::LogoffByUser).unwrap();
+        assert_eq!(frames.len(), 2);
+        // Decode frame 0 SetErrorInfoPdu code matches.
+        let mut c = ReadCursor::new(&frames[0]);
+        let _ = TpktHeader::decode(&mut c).unwrap();
+        let _ = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let _sc = ShareControlHeader::decode(&mut inner).unwrap();
+        let _sd = ShareDataHeader::decode(&mut inner).unwrap();
+        let info = SetErrorInfoPdu::decode(&mut ReadCursor::new(inner.peek_remaining())).unwrap();
+        assert_eq!(info.code(), ErrorInfoCode::LogoffByUser);
     }
 
     #[test]

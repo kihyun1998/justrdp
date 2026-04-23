@@ -33,6 +33,8 @@ pub use handler::{
     RdpServerDisplayHandler, RdpServerInputHandler,
 };
 pub use active::{ActiveStageOutput, ServerActiveStage};
+pub use justrdp_pdu::mcs::DisconnectReason;
+pub use justrdp_pdu::rdp::error_info::ErrorInfoCode;
 pub use encoder::{
     encode_bitmap_update, encode_pointer_cached, encode_pointer_color, encode_pointer_new,
     encode_pointer_position, encode_pointer_update, MAX_FAST_PATH_PDU_LENGTH,

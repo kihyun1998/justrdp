@@ -2318,22 +2318,24 @@ pub trait RdpServerSoundHandler: Send { /* ... */ }
 uncompressed bitmap fast-path, 입력/종료/SVC opaque forward까지. RFX/EGFX
 인코딩 파이프라인과 채널별 핸들러는 11.2b/c에서 분리 진행.
 
-- [ ] `justrdp-server` crate + `RdpServerConfig` + error 타입
-- [ ] Connection driver -- `ServerAcceptor` 펌프 → `Accepted` 진입
-- [ ] `RdpServerDisplayHandler` / `RdpServerInputHandler` trait +
+- [x] `justrdp-server` crate + `RdpServerConfig` + error 타입
+- [x] Connection driver -- `ServerAcceptor` 펌프 → `Accepted` 진입
+- [x] `RdpServerDisplayHandler` / `RdpServerInputHandler` trait +
       `DisplayUpdate` enum (Bitmap / Pointer / Palette / Reset)
-- [ ] `ServerActiveStage` -- **서버 방향** fast-path input 디코드,
+- [x] `ServerActiveStage` -- **서버 방향** fast-path input 디코드,
       slow-path control PDU 처리 (ShutdownRequest / SuppressOutput /
       RefreshRect / PersistentKeyList 후속 / ClientControl(ACTIVELY))
-- [ ] Fast-path `FASTPATH_UPDATETYPE_BITMAP` 인코더 (uncompressed RGB)
-- [ ] Fast-path pointer update 인코더 (Position / Default / Hidden /
+- [x] Fast-path `FASTPATH_UPDATETYPE_BITMAP` 인코더 (uncompressed RGB)
+- [x] Fast-path pointer update 인코더 (Position / Default / Hidden /
       New / Cached / Color)
-- [ ] Input dispatch -- Scancode / Unicode / Mouse / MouseX / Sync /
+- [x] Input dispatch -- Scancode / Unicode / Mouse / MouseX / Sync /
       QoE 이벤트 → trait 호출
-- [ ] SVC data opaque forward hook (채널 크레이트 장착 포인트)
-- [ ] 종료 경로 -- `SetErrorInfoPdu` 송출 + MCS
+- [x] SVC data opaque forward hook (채널 크레이트 장착 포인트)
+- [x] 종료 경로 -- `SetErrorInfoPdu` 송출 + MCS
       `DisconnectProviderUltimatum` + `ServerTerminate` output
 - [ ] `justrdp-blocking` 클라와 loopback 통합 테스트
+      (wire-level smoke test in `active::tests::session_smoke_test_dispatches_in_order`;
+       full TCP-loopback dual-thread driver deferred to follow-up commit)
 
 #### 11.2b -- Server-Side GFX Encoding Pipeline
 
