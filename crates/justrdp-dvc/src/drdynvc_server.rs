@@ -33,9 +33,10 @@ use justrdp_core::ReadCursor;
 
 use crate::pdu::{
     decode_caps_response, decode_dvc_pdu, encode_caps_request, encode_close,
-    encode_create_request, encode_data, encode_data_first, DvcPdu, CAPS_VERSION_3,
-    CREATION_STATUS_OK,
+    encode_create_request, encode_data, encode_data_compressed, encode_data_first,
+    encode_data_first_compressed, DvcPdu, CAPS_VERSION_3, CREATION_STATUS_OK,
 };
+use justrdp_bulk::zgfx::{ZgfxCompressor, ZgfxError};
 use crate::reassembly::DvcReassembler;
 use crate::{DvcError, DvcResult};
 
@@ -287,6 +288,96 @@ impl DrdynvcServer {
         Ok(encode_data_first(channel_id, total_length, first_chunk))
     }
 
+    /// Encode `compressed_payload` as a single DYNVC_DATA_COMPRESSED
+    /// PDU (MS-RDPEDYC §2.2.3.4).
+    ///
+    /// `compressed_payload` MUST already be the bulk-encoded
+    /// `RDP_SEGMENTED_DATA` form produced by
+    /// [`ZgfxCompressor::compress`]. The receiving DVC layer will run
+    /// it through [`ZgfxDecompressor`](justrdp_bulk::zgfx::ZgfxDecompressor)
+    /// before delivering to the channel processor.
+    ///
+    /// For an automatic compress-or-fallback wrapper that consults a
+    /// size threshold, see
+    /// [`send_data_with_compression_fallback`](Self::send_data_with_compression_fallback).
+    pub fn send_data_compressed(
+        &self,
+        channel_id: u32,
+        compressed_payload: &[u8],
+    ) -> DvcResult<Vec<u8>> {
+        if !self.is_channel_open(channel_id) {
+            return Err(DvcError::Protocol(alloc::format!(
+                "send_data_compressed: channel_id {channel_id} is not open"
+            )));
+        }
+        Ok(encode_data_compressed(channel_id, compressed_payload))
+    }
+
+    /// Encode `compressed_first_chunk` as a DYNVC_DATA_FIRST_COMPRESSED
+    /// PDU (MS-RDPEDYC §2.2.3.3). Follow up with
+    /// [`send_data_compressed`](Self::send_data_compressed) for the
+    /// remaining chunks; `total_length` is the byte total of the
+    /// reassembled (still-compressed) payload across every chunk.
+    pub fn send_data_first_compressed(
+        &self,
+        channel_id: u32,
+        total_length: u32,
+        compressed_first_chunk: &[u8],
+    ) -> DvcResult<Vec<u8>> {
+        if !self.is_channel_open(channel_id) {
+            return Err(DvcError::Protocol(alloc::format!(
+                "send_data_first_compressed: channel_id {channel_id} is not open"
+            )));
+        }
+        Ok(encode_data_first_compressed(
+            channel_id,
+            total_length,
+            compressed_first_chunk,
+        ))
+    }
+
+    /// Compress `payload` via `compressor` and emit either a
+    /// `DYNVC_DATA_COMPRESSED` (when the compressed form saves at
+    /// least `min_savings_bytes` over the raw form) or a plain
+    /// `DYNVC_DATA` otherwise.
+    ///
+    /// Use this when the application is willing to defer the
+    /// compress-or-skip decision to the framework. Pass
+    /// `min_savings_bytes = 0` to take any saving (including a
+    /// 1-byte win); pass a larger value to require the compressed
+    /// payload be meaningfully smaller before paying the
+    /// decompression cost on the receiver. The current
+    /// [`ZgfxCompressor`] is pass-through (no LZ77), so in practice
+    /// this helper always returns the uncompressed branch -- the seam
+    /// exists so applications can opt in cleanly once real
+    /// compression lands.
+    ///
+    /// Returns the encoded DVC PDU bytes. On compression error the
+    /// helper returns the underlying [`ZgfxError`] wrapped in
+    /// [`DvcError::Protocol`].
+    pub fn send_data_with_compression_fallback(
+        &self,
+        channel_id: u32,
+        payload: &[u8],
+        compressor: &mut ZgfxCompressor,
+        min_savings_bytes: usize,
+    ) -> DvcResult<Vec<u8>> {
+        if !self.is_channel_open(channel_id) {
+            return Err(DvcError::Protocol(alloc::format!(
+                "send_data_with_compression_fallback: channel_id {channel_id} is not open"
+            )));
+        }
+        let mut compressed = Vec::with_capacity(payload.len());
+        compressor
+            .compress(payload, &mut compressed)
+            .map_err(zgfx_error_to_dvc)?;
+        if payload.len() >= compressed.len().saturating_add(min_savings_bytes) {
+            Ok(encode_data_compressed(channel_id, &compressed))
+        } else {
+            Ok(encode_data(channel_id, payload))
+        }
+    }
+
     /// Process an inbound DVC PDU from the client. Reassembles
     /// fragments and returns `Some((channel_id, payload))` when a
     /// complete client message is available, or `None` when more
@@ -369,6 +460,12 @@ impl Default for DrdynvcServer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Translate a [`ZgfxError`] into a [`DvcError::Protocol`] variant
+/// with the underlying error preserved in the message string.
+fn zgfx_error_to_dvc(e: ZgfxError) -> DvcError {
+    DvcError::Protocol(alloc::format!("ZGFX compression failed: {e:?}"))
 }
 
 #[cfg(test)]
@@ -591,5 +688,158 @@ mod tests {
         let res = server.process_inbound(&encode_close(7)).unwrap();
         assert_eq!(res, None);
         assert!(!server.is_channel_open(7));
+    }
+
+    // ── Compressed DVC framing (§11.2b-4 Commit 2) ──────────────
+
+    use crate::pdu::{decode_dvc_pdu, DvcPdu};
+    use alloc::vec;
+    use justrdp_core::ReadCursor;
+
+    fn open_server_with_channel(channel_id: u32) -> DrdynvcServer {
+        let mut server = DrdynvcServer::new();
+        let _ = server.open_channel(channel_id, "graphics", 0).unwrap();
+        let _ = server
+            .process_create_response(&encode_create_response(channel_id, CREATION_STATUS_OK))
+            .unwrap();
+        assert!(server.is_channel_open(channel_id));
+        server
+    }
+
+    #[test]
+    fn send_data_compressed_emits_dynvc_data_compressed() {
+        let server = open_server_with_channel(7);
+        let payload = vec![0xCC; 64];
+        let bytes = server.send_data_compressed(7, &payload).unwrap();
+
+        // Decode and verify the cmd_id is CMD_DATA_COMPRESSED (0x07).
+        let mut cur = ReadCursor::new(&bytes);
+        match decode_dvc_pdu(&mut cur).unwrap() {
+            DvcPdu::DataCompressed { channel_id, data } => {
+                assert_eq!(channel_id, 7);
+                assert_eq!(data, payload);
+            }
+            other => panic!("expected DataCompressed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_data_compressed_rejects_unknown_channel() {
+        let server = DrdynvcServer::new();
+        assert!(server.send_data_compressed(99, &[0xAB]).is_err());
+    }
+
+    #[test]
+    fn send_data_first_compressed_emits_dynvc_data_first_compressed() {
+        let server = open_server_with_channel(7);
+        let chunk = vec![0xDD; 16];
+        let bytes = server
+            .send_data_first_compressed(7, 1024, &chunk)
+            .unwrap();
+        let mut cur = ReadCursor::new(&bytes);
+        match decode_dvc_pdu(&mut cur).unwrap() {
+            DvcPdu::DataFirstCompressed {
+                channel_id,
+                total_length,
+                data,
+            } => {
+                assert_eq!(channel_id, 7);
+                assert_eq!(total_length, 1024);
+                assert_eq!(data, chunk);
+            }
+            other => panic!("expected DataFirstCompressed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_data_first_compressed_rejects_unknown_channel() {
+        let server = DrdynvcServer::new();
+        assert!(server
+            .send_data_first_compressed(99, 100, &[0xAB])
+            .is_err());
+    }
+
+    #[test]
+    fn fallback_emits_uncompressed_when_no_savings() {
+        // Pass-through ZgfxCompressor adds 2 bytes of header overhead
+        // for a SINGLE segment, so for any sane payload the compressed
+        // form is strictly larger -> fallback fires (uncompressed).
+        let server = open_server_with_channel(7);
+        let mut compressor = ZgfxCompressor::new();
+        let payload = vec![0xEE; 128];
+        let bytes = server
+            .send_data_with_compression_fallback(7, &payload, &mut compressor, 0)
+            .unwrap();
+        let mut cur = ReadCursor::new(&bytes);
+        match decode_dvc_pdu(&mut cur).unwrap() {
+            DvcPdu::Data { channel_id, data } => {
+                assert_eq!(channel_id, 7);
+                assert_eq!(data, payload);
+            }
+            other => panic!("expected uncompressed Data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_threshold_blocks_marginal_savings() {
+        // Even if ZGFX did save N bytes, requiring `min_savings_bytes
+        // = N+1` still falls back. We can't easily produce a real
+        // saving with the pass-through compressor, but we can verify
+        // the threshold gating at the API level by setting an
+        // unreachable threshold and confirming the uncompressed
+        // branch fires.
+        let server = open_server_with_channel(7);
+        let mut compressor = ZgfxCompressor::new();
+        let payload = vec![0u8; 1024];
+        let bytes = server
+            .send_data_with_compression_fallback(
+                7,
+                &payload,
+                &mut compressor,
+                usize::MAX, // demand impossible savings
+            )
+            .unwrap();
+        let mut cur = ReadCursor::new(&bytes);
+        assert!(matches!(
+            decode_dvc_pdu(&mut cur).unwrap(),
+            DvcPdu::Data { .. },
+        ));
+    }
+
+    #[test]
+    fn fallback_rejects_unknown_channel_before_compressing() {
+        let server = DrdynvcServer::new();
+        let mut compressor = ZgfxCompressor::new();
+        assert!(server
+            .send_data_with_compression_fallback(99, &[0xAB], &mut compressor, 0)
+            .is_err());
+    }
+
+    #[test]
+    fn compressed_pdus_roundtrip_through_decode() {
+        // Encode → decode roundtrip for both compressed variants.
+        let server = open_server_with_channel(7);
+        let single_payload = vec![0x11; 32];
+        let single_bytes = server.send_data_compressed(7, &single_payload).unwrap();
+        let first_payload = vec![0x22; 64];
+        let first_bytes = server
+            .send_data_first_compressed(7, 200, &first_payload)
+            .unwrap();
+
+        let mut c1 = ReadCursor::new(&single_bytes);
+        match decode_dvc_pdu(&mut c1).unwrap() {
+            DvcPdu::DataCompressed { data, .. } => assert_eq!(data, single_payload),
+            _ => panic!(),
+        }
+        let mut c2 = ReadCursor::new(&first_bytes);
+        match decode_dvc_pdu(&mut c2).unwrap() {
+            DvcPdu::DataFirstCompressed {
+                total_length, data, ..
+            } => {
+                assert_eq!(total_length, 200);
+                assert_eq!(data, first_payload);
+            }
+            _ => panic!(),
+        }
     }
 }

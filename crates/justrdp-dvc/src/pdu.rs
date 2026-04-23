@@ -601,6 +601,56 @@ pub fn encode_data_first(channel_id: u32, total_length: u32, data: &[u8]) -> Vec
     buf
 }
 
+/// Encode a DYNVC_DATA_COMPRESSED (MS-RDPEDYC §2.2.3.4).
+///
+/// Wire layout is identical to [`encode_data`] but the command field
+/// is `CMD_DATA_COMPRESSED` (`0x07`). `data` is the bulk-encoded
+/// payload (`RDP_SEGMENTED_DATA` from
+/// [`justrdp_bulk::zgfx::ZgfxCompressor::compress`]); the receiver's
+/// DVC layer hands it to a ZGFX decompressor before delivering to the
+/// channel processor.
+pub fn encode_data_compressed(channel_id: u32, data: &[u8]) -> Vec<u8> {
+    let cb_id = cb_id_for(channel_id);
+    let size = 1 + cb_id_size(cb_id) + data.len();
+    let mut buf = alloc::vec![0u8; size];
+    let mut cursor = WriteCursor::new(&mut buf);
+    cursor
+        .write_u8(encode_header(CMD_DATA_COMPRESSED, 0, cb_id), "DVC::header")
+        .expect("pre-sized buffer");
+    write_channel_id(&mut cursor, channel_id, cb_id).expect("pre-sized buffer");
+    cursor
+        .write_slice(data, "DVC::dataCompressed")
+        .expect("pre-sized buffer");
+    buf
+}
+
+/// Encode a DYNVC_DATA_FIRST_COMPRESSED (MS-RDPEDYC §2.2.3.3). Same
+/// layout as [`encode_data_first`] with command `CMD_DATA_FIRST_COMPRESSED`
+/// (`0x06`); `data` is the bulk-encoded first chunk.
+pub fn encode_data_first_compressed(
+    channel_id: u32,
+    total_length: u32,
+    data: &[u8],
+) -> Vec<u8> {
+    let cb_id = cb_id_for(channel_id);
+    let len_id = len_id_for(total_length);
+    let size = 1 + cb_id_size(cb_id) + len_id_size(len_id) + data.len();
+    let mut buf = alloc::vec![0u8; size];
+    let mut cursor = WriteCursor::new(&mut buf);
+    cursor
+        .write_u8(
+            encode_header(CMD_DATA_FIRST_COMPRESSED, len_id, cb_id),
+            "DVC::header",
+        )
+        .expect("pre-sized buffer");
+    write_channel_id(&mut cursor, channel_id, cb_id).expect("pre-sized buffer");
+    write_length(&mut cursor, total_length, len_id).expect("pre-sized buffer");
+    cursor
+        .write_slice(data, "DVC::dataFirstCompressed")
+        .expect("pre-sized buffer");
+    buf
+}
+
 /// Encode a `DYNVC_SOFT_SYNC_REQUEST` (server side; mostly useful for
 /// loopback tests). MS-RDPEDYC §2.2.5.1
 ///

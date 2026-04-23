@@ -2433,14 +2433,19 @@ register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
 향상. ZGFX-Lite 는 DVC 전송 시 `DYNVC_DATA_*COMPRESSED` 로 페이로드
 대체.
 
-- [ ] Progressive RFX 품질 스케줄링 hook -- `ProgressiveQualityScheduler`
-      trait + tile 별 quality level 결정 (sync/region/tileset 재사용
-      여부 판정)
-- [ ] EGFX 송신 시 ZGFX 압축 적용 -- `DvcProcessor::send` 단계에서
-      페이로드 → `ZgfxCompressor` → `DYNVC_DATA_FIRST_COMPRESSED` /
-      `DYNVC_DATA_COMPRESSED` 프레이밍
-- [ ] 압축률/사이즈 임계값 기반 fallback (압축 후 더 커지면 raw 전송)
-- [ ] 단위 테스트 (압축 결정/프레이밍 양방향)
+- [x] Progressive RFX 품질 스케줄링 hook -- `ProgressiveQualityScheduler`
+      trait + tile 별 quality level 결정 (현재는 Skip/Full include 게이트;
+      multi-pass 단계적 화질은 enum 확장으로 추후)
+- [x] DVC 압축 프레이밍 -- `DrdynvcServer::send_data_compressed` /
+      `send_data_first_compressed` 가 `DYNVC_DATA_COMPRESSED` /
+      `DYNVC_DATA_FIRST_COMPRESSED` PDU emit
+- [x] 압축률/사이즈 임계값 기반 fallback --
+      `send_data_with_compression_fallback(payload, compressor,
+      min_savings_bytes)` -- 압축 후 절약이 임계값 미만이면 raw
+      `DYNVC_DATA` 로 fallback (현재 `ZgfxCompressor` 가 pass-through
+      라 항상 fallback; LZ77 도입 시 자동으로 동작 활성화)
+- [x] 단위 테스트 (스케줄러 skip/full/empty, 압축 PDU roundtrip,
+      fallback 결정 매트릭스, 미오픈 채널 거부)
 
 ##### 11.2b-5 -- Deactivation-Reactivation Sequence
 
