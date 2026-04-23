@@ -21,7 +21,7 @@ use justrdp_pdu::rdp::fast_path::{
     FastPathOutputHeader, FastPathOutputUpdate, FastPathUpdateType, Fragmentation,
     FASTPATH_OUTPUT_ACTION_FASTPATH,
 };
-use justrdp_pdu::rdp::finalization::SetErrorInfoPdu;
+use justrdp_pdu::rdp::finalization::{DeactivateAllPdu, SetErrorInfoPdu};
 use justrdp_pdu::rdp::headers::{
     ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
     SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE,
@@ -244,6 +244,61 @@ impl ServerActiveStage {
         let info_frame = self.encode_share_data(ShareDataPduType::SetErrorInfo, &info)?;
         let ult_frame = self.encode_disconnect_ultimatum(DisconnectReason::UserRequested)?;
         Ok(alloc::vec![info_frame, ult_frame])
+    }
+
+    /// Encode a `DeactivateAllPdu` (MS-RDPBCGR §2.2.3.1) wrapped in
+    /// ShareControl + MCS SDI + X.224 DT + TPKT.
+    ///
+    /// `DeactivateAllPdu` is itself a ShareControl PDU
+    /// (`pdu_type = DeactivateAllPdu` = `0x0006`) -- it does NOT live
+    /// inside a `ShareData` envelope, which is why the existing
+    /// [`encode_share_data`](Self::encode_share_data) helper cannot be
+    /// reused here.
+    ///
+    /// The body carries the current `share_id` (so the client knows
+    /// which share is being torn down) and a zero-length
+    /// `sourceDescriptor` field (we do not advertise a server name to
+    /// the client mid-session).
+    pub(crate) fn encode_deactivate_all(&self) -> ServerResult<Vec<u8>> {
+        let body = DeactivateAllPdu {
+            share_id: self.share_id(),
+            length_source_descriptor: 0,
+        };
+        let body_size = body.size();
+        let sc_total = SHARE_CONTROL_HEADER_SIZE + body_size;
+        if sc_total > u16::MAX as usize {
+            return Err(ServerError::protocol(
+                "ShareControl payload exceeds u16 totalLength",
+            ));
+        }
+
+        let mut sc_payload = vec![0u8; sc_total];
+        {
+            let mut cursor = WriteCursor::new(&mut sc_payload);
+            ShareControlHeader {
+                total_length: sc_total as u16,
+                pdu_type: ShareControlPduType::DeactivateAllPdu,
+                pdu_source: self.user_channel_id(),
+            }
+            .encode(&mut cursor)?;
+            body.encode(&mut cursor)?;
+        }
+
+        let sdi = SendDataIndication {
+            initiator: self.user_channel_id(),
+            channel_id: self.io_channel_id(),
+            user_data: &sc_payload,
+        };
+        let payload_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let total = TPKT_HEADER_SIZE + payload_size;
+        let mut buf = vec![0u8; total];
+        {
+            let mut cursor = WriteCursor::new(&mut buf);
+            TpktHeader::try_for_payload(payload_size)?.encode(&mut cursor)?;
+            DataTransfer.encode(&mut cursor)?;
+            sdi.encode(&mut cursor)?;
+        }
+        Ok(buf)
     }
 
     /// Encode a stand-alone `DisconnectProviderUltimatum` frame

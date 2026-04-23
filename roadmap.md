@@ -2455,14 +2455,23 @@ register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
 서버 → `Deactivate All PDU` → 클라 ack → 서버 재 `Demand Active` →
 캡 재협상 → 활성 세션 복귀.
 
-- [ ] `DeactivateAllPdu` 송신 (MS-RDPBCGR 2.2.3.1)
-- [ ] `ServerActiveStage::request_deactivation_reactivation(new_size)`
-      API + 내부 상태 (`Active` → `WaitClientDeactivateAck` →
-      `RedemandActive` → `Active`)
-- [ ] 재 Demand Active 시 capability set 재생성 (해상도 변경 반영)
-- [ ] `RdpServerDisplayHandler::get_display_size()` 결과 변경 감지 hook
-      또는 명시적 API 둘 중 채택
-- [ ] 단위 테스트 (시퀀스 라운드트립, 변경된 해상도 반영)
+- [x] `DeactivateAllPdu` 송신 (MS-RDPBCGR 2.2.3.1) -- `encode_deactivate_all`
+      helper (ShareControl + DeactivateAllPdu body)
+- [x] `ServerActiveStage::request_deactivation_reactivation(width, height)`
+      API + `DeactivationState { Active, WaitClientDeactivateAck }` 내부
+      상태. `confirm_redemand_active_complete(new_share_id)` 가 D/R
+      종료를 신호하고 새 share_id 적용
+- [-] **재 Demand Active 시 capability set 재생성** -- 부분: 새 size
+      는 `pending_display_size` 로 노출하지만 실제 re-DemandActive 흐름
+      (acceptor 의 finalization 재실행) 은 application-driven으로 남김.
+      현재 아키텍처에서는 active stage 가 acceptor 를 own 하지 않으므로
+      caller 가 active stage 폐기 + 새 RdpServer 핸드셰이크로 처리.
+      자동화는 §11.2d 통합 테스트에서 도입 예정
+- [x] 명시적 API 채택 -- `pending_display_size()` accessor +
+      `request_deactivation_reactivation(w, h)` 가 새 size 를 명시적
+      으로 받음. `get_display_size()` 자동 감지는 의도적 제외 (애매한
+      디바운싱 로직 회피)
+- [x] 단위 테스트 (시퀀스 라운드트립, 변경된 해상도 반영, error gating)
 
 #### 11.2c -- Server-Direction Channel Handlers
 

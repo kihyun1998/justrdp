@@ -182,6 +182,45 @@ pub enum ActiveStageOutput {
     },
 }
 
+/// Deactivation-Reactivation Sequence state (MS-RDPBCGR §1.3.1.3).
+///
+/// The server transitions through these states when the application
+/// requests a resolution / monitor change mid-session. The full
+/// sequence is:
+///
+/// 1. `Active` (steady state).
+/// 2. Application calls
+///    [`ServerActiveStage::request_deactivation_reactivation`] →
+///    server emits `DeactivateAllPdu` →
+///    state transitions to `WaitClientDeactivateAck`.
+/// 3. Per spec the client has no explicit acknowledgement PDU for
+///    DeactivateAll -- it simply stops sending PDUs that reference the
+///    old `share_id` and waits for a fresh `Demand Active`. The
+///    application is responsible for re-driving the connection
+///    finalization sequence (re-`Demand Active` with new caps,
+///    re-`Confirm Active`, finalization synch / control / font
+///    exchange) -- this typically means dropping the active stage and
+///    restarting from a fresh `RdpServer` handshake. While that
+///    happens the state stays `WaitClientDeactivateAck`.
+/// 4. Once the application has emitted the new `Demand Active` it
+///    calls [`ServerActiveStage::confirm_redemand_active_complete`]
+///    with the freshly negotiated `share_id` to transition back to
+///    `Active`. The new pending dimensions become the source of truth
+///    for [`pending_display_size`](ServerActiveStage::pending_display_size).
+///
+/// Display encoders SHOULD consult
+/// [`is_in_deactivation_reactivation`](ServerActiveStage::is_in_deactivation_reactivation)
+/// before emitting frames; sending PDUs that reference the old
+/// `share_id` after `DeactivateAll` is a protocol violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeactivationState {
+    /// Steady state -- normal session.
+    Active,
+    /// `DeactivateAllPdu` has been emitted; waiting for the
+    /// application to re-drive the Demand Active flow.
+    WaitClientDeactivateAck,
+}
+
 /// Per-channel reassembly state for inbound SVC data.
 #[derive(Debug, Default)]
 struct SvcReassembly {
@@ -212,6 +251,15 @@ pub struct ServerActiveStage {
     /// Per-channel inbound SVC reassembly state. Linear search is fine
     /// because the static-VC count is small (typically 1-3).
     svc_reassembly: Vec<(u16, SvcReassembly)>,
+    /// Current Deactivation-Reactivation lifecycle state.
+    deactivation_state: DeactivationState,
+    /// New `(width, height)` requested via
+    /// [`request_deactivation_reactivation`](Self::request_deactivation_reactivation).
+    /// `Some(_)` while a D/R sequence is in flight; cleared back to the
+    /// steady-state value once
+    /// [`confirm_redemand_active_complete`](Self::confirm_redemand_active_complete)
+    /// records the new `share_id`.
+    pending_display_size: Option<(u16, u16)>,
 }
 
 impl ServerActiveStage {
@@ -226,6 +274,8 @@ impl ServerActiveStage {
             suppress_output: false,
             persist_keys_count: 0,
             svc_reassembly: Vec::new(),
+            deactivation_state: DeactivationState::Active,
+            pending_display_size: None,
         }
     }
 
@@ -264,6 +314,112 @@ impl ServerActiveStage {
     /// Channel name → MCS channel ID list for the active session.
     pub fn channel_ids(&self) -> &[(alloc::string::String, u16)] {
         &self.channel_ids
+    }
+
+    /// Current Deactivation-Reactivation lifecycle state. Display
+    /// encoders SHOULD consult
+    /// [`is_in_deactivation_reactivation`](Self::is_in_deactivation_reactivation)
+    /// rather than matching on this directly.
+    pub fn deactivation_state(&self) -> DeactivationState {
+        self.deactivation_state
+    }
+
+    /// `true` while a Deactivation-Reactivation Sequence is in flight
+    /// (the server has emitted `DeactivateAllPdu` but the application
+    /// has not yet completed re-`Demand Active`). Display encoders MUST
+    /// suppress output during this window because the old `share_id`
+    /// is no longer valid.
+    pub fn is_in_deactivation_reactivation(&self) -> bool {
+        self.deactivation_state != DeactivationState::Active
+    }
+
+    /// New `(width, height)` pending after a
+    /// [`request_deactivation_reactivation`](Self::request_deactivation_reactivation)
+    /// call. Returns `None` in the steady state.
+    pub fn pending_display_size(&self) -> Option<(u16, u16)> {
+        self.pending_display_size
+    }
+
+    /// Begin a Deactivation-Reactivation Sequence (MS-RDPBCGR
+    /// §1.3.1.3) targeting the new desktop dimensions
+    /// `(width, height)`.
+    ///
+    /// Returns the wire bytes of a `DeactivateAllPdu` (already wrapped
+    /// in ShareControl + MCS SDI + X.224 DT + TPKT) ready to flush.
+    /// Transitions the lifecycle to
+    /// [`DeactivationState::WaitClientDeactivateAck`] and stores the
+    /// requested dimensions in
+    /// [`pending_display_size`](Self::pending_display_size).
+    ///
+    /// The application MUST then re-drive the connection finalization
+    /// flow (re-`Demand Active` with caps reflecting the new size,
+    /// re-`Confirm Active`, etc.) -- typically by dropping the active
+    /// stage and restarting from a fresh `RdpServer` handshake -- and
+    /// finally call
+    /// [`confirm_redemand_active_complete`](Self::confirm_redemand_active_complete)
+    /// to return to the `Active` state with the freshly negotiated
+    /// `share_id`.
+    ///
+    /// Calling this while a sequence is already in flight returns
+    /// `ServerError::protocol(_)`. `width` / `height` MUST both be
+    /// non-zero; zero dimensions are rejected.
+    pub fn request_deactivation_reactivation(
+        &mut self,
+        width: u16,
+        height: u16,
+    ) -> ServerResult<Vec<u8>> {
+        if self.deactivation_state != DeactivationState::Active {
+            return Err(ServerError::protocol(
+                "request_deactivation_reactivation called while a D/R sequence \
+                 is already in flight",
+            ));
+        }
+        if width == 0 || height == 0 {
+            return Err(ServerError::protocol(
+                "request_deactivation_reactivation: width and height MUST be non-zero",
+            ));
+        }
+        let bytes = self.encode_deactivate_all()?;
+        self.deactivation_state = DeactivationState::WaitClientDeactivateAck;
+        self.pending_display_size = Some((width, height));
+        Ok(bytes)
+    }
+
+    /// Signal that the application has completed the re-`Demand
+    /// Active` flow and the session is back in the steady state with
+    /// `new_share_id` (the value that flowed in the fresh
+    /// finalization sequence).
+    ///
+    /// Updates the stored `share_id` and clears the pending size and
+    /// suppress flag so subsequent display encoders pick up the new
+    /// session immediately. Returns `ServerError::protocol(_)` when
+    /// called outside of `WaitClientDeactivateAck`.
+    pub fn confirm_redemand_active_complete(
+        &mut self,
+        new_share_id: u32,
+    ) -> ServerResult<()> {
+        if self.deactivation_state != DeactivationState::WaitClientDeactivateAck {
+            return Err(ServerError::protocol(
+                "confirm_redemand_active_complete called outside of \
+                 WaitClientDeactivateAck",
+            ));
+        }
+        self.share_id = new_share_id;
+        self.deactivation_state = DeactivationState::Active;
+        // The pending size becomes the steady-state value; we keep it
+        // in `pending_display_size` until the application explicitly
+        // observes it (callers reading `pending_display_size()` after
+        // `confirm_redemand_active_complete()` see `None`).
+        self.pending_display_size = None;
+        // Output suppression is reset on every re-handshake to match
+        // the convention that a fresh share_id starts unsuppressed.
+        self.suppress_output = false;
+        // Reset PERSIST_BITMAP_KEYS counter and SVC reassembly state
+        // so a hostile client cannot accumulate state across D/R
+        // boundaries.
+        self.persist_keys_count = 0;
+        self.svc_reassembly.clear();
+        Ok(())
     }
 
     /// Process one complete client PDU.
@@ -1621,5 +1777,142 @@ mod tests {
         fn size(&self) -> usize {
             0
         }
+    }
+
+    // ── Deactivation-Reactivation (§11.2b-5) ─────────────────────
+
+    use justrdp_pdu::rdp::finalization::DeactivateAllPdu;
+
+    /// Strip TPKT + X.224 DT + MCS SDI from a server-emitted byte
+    /// stream and return the inner ShareControl payload.
+    fn strip_to_share_control(bytes: &[u8]) -> (ShareControlHeader, Vec<u8>) {
+        let mut c = ReadCursor::new(bytes);
+        let _ = TpktHeader::decode(&mut c).unwrap();
+        let _ = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let sc = ShareControlHeader::decode(&mut inner).unwrap();
+        (sc, inner.peek_remaining().to_vec())
+    }
+
+    #[test]
+    fn new_starts_in_active_state() {
+        let s = fake_stage();
+        assert_eq!(s.deactivation_state(), DeactivationState::Active);
+        assert!(!s.is_in_deactivation_reactivation());
+        assert_eq!(s.pending_display_size(), None);
+    }
+
+    #[test]
+    fn request_deactivation_reactivation_emits_deactivate_all_and_transitions() {
+        let mut s = fake_stage();
+        let original_share_id = s.share_id();
+        let bytes = s.request_deactivation_reactivation(2560, 1440).unwrap();
+
+        // Wire roundtrip: ShareControl pdu_type MUST be DeactivateAllPdu (0x0006).
+        let (sc, body) = strip_to_share_control(&bytes);
+        assert_eq!(sc.pdu_type, ShareControlPduType::DeactivateAllPdu);
+        assert_eq!(sc.pdu_source, s.user_channel_id());
+
+        let pdu = DeactivateAllPdu::decode(&mut ReadCursor::new(&body)).unwrap();
+        assert_eq!(pdu.share_id, original_share_id);
+        assert_eq!(pdu.length_source_descriptor, 0);
+
+        // State transitioned and pending size recorded.
+        assert_eq!(
+            s.deactivation_state(),
+            DeactivationState::WaitClientDeactivateAck,
+        );
+        assert!(s.is_in_deactivation_reactivation());
+        assert_eq!(s.pending_display_size(), Some((2560, 1440)));
+        // share_id is NOT yet replaced -- the new value comes from the
+        // re-handshake and lands via confirm_redemand_active_complete.
+        assert_eq!(s.share_id(), original_share_id);
+    }
+
+    #[test]
+    fn request_deactivation_reactivation_rejects_zero_dimensions() {
+        let mut s = fake_stage();
+        assert!(s.request_deactivation_reactivation(0, 1080).is_err());
+        assert!(s.request_deactivation_reactivation(1920, 0).is_err());
+        // State unchanged after the rejected calls.
+        assert_eq!(s.deactivation_state(), DeactivationState::Active);
+        assert_eq!(s.pending_display_size(), None);
+    }
+
+    #[test]
+    fn request_deactivation_reactivation_rejects_when_already_in_flight() {
+        let mut s = fake_stage();
+        let _ = s.request_deactivation_reactivation(800, 600).unwrap();
+        // A second call MUST fail without altering the state.
+        let err = s.request_deactivation_reactivation(1024, 768).unwrap_err();
+        let _ = err; // existence is enough; payload is the error message
+        assert_eq!(
+            s.deactivation_state(),
+            DeactivationState::WaitClientDeactivateAck,
+        );
+        assert_eq!(s.pending_display_size(), Some((800, 600)));
+    }
+
+    #[test]
+    fn confirm_redemand_active_complete_transitions_back_to_active() {
+        let mut s = fake_stage();
+        let _ = s.request_deactivation_reactivation(2560, 1440).unwrap();
+        s.confirm_redemand_active_complete(0xABCD_1234).unwrap();
+
+        assert_eq!(s.deactivation_state(), DeactivationState::Active);
+        assert!(!s.is_in_deactivation_reactivation());
+        assert_eq!(s.share_id(), 0xABCD_1234);
+        // Pending size cleared once the application has observed it
+        // and re-driven the handshake.
+        assert_eq!(s.pending_display_size(), None);
+        assert!(!s.is_output_suppressed());
+    }
+
+    #[test]
+    fn confirm_redemand_active_complete_rejects_outside_wait_state() {
+        let mut s = fake_stage();
+        assert!(s.confirm_redemand_active_complete(1).is_err());
+        // State unchanged.
+        assert_eq!(s.deactivation_state(), DeactivationState::Active);
+    }
+
+    #[test]
+    fn confirm_redemand_active_complete_resets_persist_keys_and_svc_reassembly() {
+        // Burn some cross-D-R state to verify the reset.
+        let mut s = fake_stage();
+        // Bypass the public API to forcibly seed persist_keys_count and
+        // svc_reassembly. (Test-only access via shared module.)
+        s.persist_keys_count = 7;
+        s.svc_reassembly.push((
+            0x03EC,
+            SvcReassembly {
+                expected_total: 100,
+                buffer: alloc::vec![0u8; 50],
+            },
+        ));
+        s.suppress_output = true;
+
+        let _ = s.request_deactivation_reactivation(800, 600).unwrap();
+        s.confirm_redemand_active_complete(0xCAFE_BABE).unwrap();
+
+        assert_eq!(s.persist_keys_count(), 0);
+        assert!(s.svc_reassembly.is_empty());
+        assert!(!s.is_output_suppressed());
+    }
+
+    #[test]
+    fn deactivate_all_pdu_share_id_matches_current_session() {
+        // Sanity-check the wire `share_id` field even after a successful
+        // Deactivation-Reactivation cycle: the next request reflects the
+        // freshly negotiated share_id.
+        let mut s = fake_stage();
+        let _ = s.request_deactivation_reactivation(800, 600).unwrap();
+        s.confirm_redemand_active_complete(0x1111_2222).unwrap();
+
+        let bytes = s.request_deactivation_reactivation(1024, 768).unwrap();
+        let (_sc, body) = strip_to_share_control(&bytes);
+        let pdu = DeactivateAllPdu::decode(&mut ReadCursor::new(&body)).unwrap();
+        assert_eq!(pdu.share_id, 0x1111_2222);
     }
 }
