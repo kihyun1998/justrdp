@@ -18,6 +18,7 @@ extern crate std;
 
 mod config;
 mod error;
+mod handler;
 mod server;
 
 pub use config::{
@@ -25,6 +26,10 @@ pub use config::{
     MAX_CHANNEL_CHUNK_LENGTH, RdpServerConfig, RdpServerConfigBuilder,
 };
 pub use error::{ServerConfigError, ServerError, ServerErrorKind, ServerResult};
+pub use handler::{
+    BitmapUpdate, DisplayRect, DisplayUpdate, PointerColorUpdate, PointerNewUpdate,
+    RdpServerDisplayHandler, RdpServerInputHandler,
+};
 pub use server::RdpServer;
 
 // Re-export the acceptor-side types the driver depends on so callers don't
