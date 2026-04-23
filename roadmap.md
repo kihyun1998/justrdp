@@ -2492,22 +2492,32 @@ register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
 `ClipboardServer` 를 만들어 SVC 채널 위에서 서버 → 클라이언트 클립보드
 공유 시퀀스를 구동.
 
-- [ ] `ClipboardServer` -- `SvcProcessor` 구현 (server 방향)
-- [ ] Server Monitor Ready PDU emit (MS-RDPECLIP 2.2.2.1)
-- [ ] Capability exchange -- `Server Clipboard Capabilities PDU` emit,
-      `Client Clipboard Capabilities PDU` 수신 (general flags 협상)
-- [ ] `Format List PDU` 수신 + `Format List Response PDU` emit
-      (long format names 지원)
-- [ ] `Format Data Request PDU` emit / `Format Data Response PDU` 수신
-      (서버가 클라 클립보드에서 데이터를 가져오는 방향)
-- [ ] `Format Data Request PDU` 수신 / `Format Data Response PDU` emit
+- [x] `ClipboardServer` -- `SvcProcessor` / `SvcServerProcessor` 구현
+      (server 방향, 상태 머신 `NotStarted` → `WaitingForInit` →
+      `Initialized`)
+- [x] Server Monitor Ready PDU emit (MS-RDPECLIP 2.2.2.2)
+- [x] Capability exchange -- `Server Clipboard Capabilities PDU` emit,
+      `Client Clipboard Capabilities PDU` 수신 (general flags 비트와이즈
+      AND 협상; 클라가 Caps 생략 시 `negotiated_flags = 0`)
+- [x] `Format List PDU` 수신 + `Format List Response PDU` emit
+      (long/short format names 양쪽; handler Err → `CB_RESPONSE_FAIL`
+      강등)
+- [x] `Format Data Request PDU` emit / `Format Data Response PDU` 수신
+      (`build_format_data_request(format_id)` 시 pending 저장, response
+      수신 시 correlation 하여 handler 에 format_id 전달)
+- [x] `Format Data Request PDU` 수신 / `Format Data Response PDU` emit
       (클라가 서버 클립보드에서 데이터를 가져가는 방향)
-- [ ] `RdpServerClipboardHandler` trait -- `on_format_list`,
+- [x] `RdpServerClipboardHandler` trait -- `on_format_list`,
       `on_format_data_request`, `on_format_data_response`,
-      `current_formats()`, `provide_format_data(format_id)`
-- [ ] `RdpServer` 통합 -- SVC dispatch 시 채널 이름으로 라우팅, 핸들러
-      미설정 시 11.2a opaque forward 로 fall-through
-- [ ] 단위 테스트 (PDU roundtrip, 시퀀스 상태 머신, 양방향 데이터 교환)
+      `on_file_contents_request/response`, `on_lock/on_unlock`
+      (`current_formats()` / `provide_format_data()` 는 명시 API
+      (`build_format_list` / `on_format_data_request`) 로 대체)
+- [x] `RdpServer` 통합 -- `ServerActiveStage::register_svc_processor`
+      로 채널 이름별 라우팅, 미등록 채널은 11.2a `ActiveStageOutput::SvcData`
+      로 fall-through
+- [x] 단위 테스트 (20건: PDU 라운드트립, 시퀀스 상태 머신, 양방향 데이터
+      교환, unknown msgType 드롭, MS-RDPECLIP 4.1.1 test vector +
+      8건: dispatch 라우팅 / 프레이밍 / fall-through / error 전파)
 
 ##### 11.2c-2 -- rdpsnd 서버 방향
 
