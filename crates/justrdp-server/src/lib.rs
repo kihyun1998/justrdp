@@ -18,9 +18,16 @@ extern crate std;
 
 mod config;
 mod error;
+mod server;
 
 pub use config::{
     DEFAULT_CHANNEL_CHUNK_LENGTH, DEFAULT_MAX_BITMAP_FRAGMENT_SIZE, MAX_BITMAP_FRAGMENT_SIZE_LIMIT,
     MAX_CHANNEL_CHUNK_LENGTH, RdpServerConfig, RdpServerConfigBuilder,
 };
 pub use error::{ServerConfigError, ServerError, ServerErrorKind, ServerResult};
+pub use server::RdpServer;
+
+// Re-export the acceptor-side types the driver depends on so callers don't
+// need to add `justrdp-acceptor` to their `Cargo.toml` just to drive the
+// state machine.
+pub use justrdp_acceptor::{AcceptanceResult, Sequence, ServerAcceptorState, Written};
