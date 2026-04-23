@@ -38,6 +38,7 @@ use justrdp_core::{
     Decode, DecodeError, DecodeResult, Encode, EncodeError, EncodeResult, ReadCursor, WriteCursor,
 };
 
+use super::quant::CodecQuant;
 use super::rlgr::RlgrMode;
 
 // ── Block type constants (MS-RDPRFX 2.2.2.1.1) ──────────────────────
@@ -191,6 +192,30 @@ pub const NUM_TILESETS_MUST: u16 = 0x0001;
 
 /// Wire size of a single `TS_RFX_RECT` entry (MS-RDPRFX 2.2.2.1.4).
 pub const RFX_RECT_SIZE: usize = 8;
+
+/// Wire size of a single `CodecQuant` entry inside `WBT_EXTENSION`
+/// (MS-RDPRFX 2.2.2.1.5).
+pub const RFX_CODEC_QUANT_SIZE: usize = 5;
+
+/// Fixed prefix (header + sub-fields up to and including
+/// `tilesDataSize`) of a `TS_RFX_TILESET` block. Adding `numQuant *
+/// RFX_CODEC_QUANT_SIZE` and `tilesDataSize` gives the total
+/// `blockLen`. MS-RDPRFX 2.2.2.3.4.
+pub const RFX_TILESET_FIXED_PREFIX_SIZE: usize = 22;
+
+/// Fixed prefix (header + indices + lengths) of a `CBT_TILE` block.
+/// Adding `YLen + CbLen + CrLen` gives the total `blockLen`.
+/// MS-RDPRFX 2.2.2.3.4.1.
+pub const RFX_TILE_FIXED_PREFIX_SIZE: usize = 19;
+
+/// `tileSize` u8 inside `TS_RFX_TILESET` -- MUST be 0x40 (64).
+/// Note: this differs from [`CT_TILE_64X64`] which is the u16 form
+/// inside `TS_RFX_CONTEXT`. MS-RDPRFX 2.2.2.3.4.
+pub const TILESET_TILE_SIZE: u8 = 0x40;
+
+/// `idx` value inside `TS_RFX_TILESET` -- MUST be 0x0000.
+/// MS-RDPRFX 2.2.2.3.4.
+pub const TILESET_IDX: u16 = 0x0000;
 
 // ── TS_RFX_BLOCKT ───────────────────────────────────────────────────
 
@@ -1057,6 +1082,340 @@ impl<'de> Decode<'de> for RfxRegion {
             ));
         }
         Ok(Self { rects })
+    }
+}
+
+// ── CBT_TILE (TS_RFX_TILE) ──────────────────────────────────────────
+
+/// `TS_RFX_TILE` -- MS-RDPRFX 2.2.2.3.4.1.
+///
+/// Per-tile inner block carried inside a `WBT_EXTENSION` (TileSet)
+/// payload. Uses the plain 6-byte [`RfxBlockHeader`] (no `codecId` /
+/// `channelId`) -- those identifiers live on the enclosing TileSet.
+///
+/// `quant_idx_*` index into the enclosing TileSet's `quant_vals`.
+/// `x_idx` / `y_idx` are tile positions in the 64-pixel grid (so the
+/// pixel origin is `(x_idx * 64, y_idx * 64)`). `*_data` lengths
+/// become the wire `YLen` / `CbLen` / `CrLen` u16 fields and are
+/// therefore each capped at 65_535 bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RfxTileWire {
+    pub quant_idx_y: u8,
+    pub quant_idx_cb: u8,
+    pub quant_idx_cr: u8,
+    pub x_idx: u16,
+    pub y_idx: u16,
+    pub y_data: Vec<u8>,
+    pub cb_data: Vec<u8>,
+    pub cr_data: Vec<u8>,
+}
+
+impl RfxTileWire {
+    fn block_len(&self) -> usize {
+        RFX_TILE_FIXED_PREFIX_SIZE + self.y_data.len() + self.cb_data.len() + self.cr_data.len()
+    }
+}
+
+impl Encode for RfxTileWire {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        if self.y_data.len() > u16::MAX as usize
+            || self.cb_data.len() > u16::MAX as usize
+            || self.cr_data.len() > u16::MAX as usize
+        {
+            return Err(EncodeError::other(
+                "RfxTileWire",
+                "component data length exceeds u16::MAX (65535)",
+            ));
+        }
+        let block_len = self.block_len();
+        if block_len > u32::MAX as usize {
+            return Err(EncodeError::other(
+                "RfxTileWire",
+                "blockLen exceeds u32::MAX",
+            ));
+        }
+        RfxBlockHeader {
+            block_type: CBT_TILE,
+            block_len: block_len as u32,
+        }
+        .encode(dst)?;
+        dst.write_u8(self.quant_idx_y, "RfxTileWire::quantIdxY")?;
+        dst.write_u8(self.quant_idx_cb, "RfxTileWire::quantIdxCb")?;
+        dst.write_u8(self.quant_idx_cr, "RfxTileWire::quantIdxCr")?;
+        dst.write_u16_le(self.x_idx, "RfxTileWire::xIdx")?;
+        dst.write_u16_le(self.y_idx, "RfxTileWire::yIdx")?;
+        dst.write_u16_le(self.y_data.len() as u16, "RfxTileWire::YLen")?;
+        dst.write_u16_le(self.cb_data.len() as u16, "RfxTileWire::CbLen")?;
+        dst.write_u16_le(self.cr_data.len() as u16, "RfxTileWire::CrLen")?;
+        dst.write_slice(&self.y_data, "RfxTileWire::YData")?;
+        dst.write_slice(&self.cb_data, "RfxTileWire::CbData")?;
+        dst.write_slice(&self.cr_data, "RfxTileWire::CrData")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RfxTileWire"
+    }
+
+    fn size(&self) -> usize {
+        self.block_len()
+    }
+}
+
+impl<'de> Decode<'de> for RfxTileWire {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let hdr = RfxBlockHeader::decode(src)?;
+        if hdr.block_type != CBT_TILE {
+            return Err(DecodeError::unexpected_value(
+                "RfxTileWire",
+                "blockType",
+                "expected CBT_TILE (0xCAC3)",
+            ));
+        }
+        let quant_idx_y = src.read_u8("RfxTileWire::quantIdxY")?;
+        let quant_idx_cb = src.read_u8("RfxTileWire::quantIdxCb")?;
+        let quant_idx_cr = src.read_u8("RfxTileWire::quantIdxCr")?;
+        let x_idx = src.read_u16_le("RfxTileWire::xIdx")?;
+        let y_idx = src.read_u16_le("RfxTileWire::yIdx")?;
+        let y_len = src.read_u16_le("RfxTileWire::YLen")? as usize;
+        let cb_len = src.read_u16_le("RfxTileWire::CbLen")? as usize;
+        let cr_len = src.read_u16_le("RfxTileWire::CrLen")? as usize;
+        let expected_len = RFX_TILE_FIXED_PREFIX_SIZE + y_len + cb_len + cr_len;
+        if hdr.block_len as usize != expected_len {
+            return Err(DecodeError::invalid_value(
+                "RfxTileWire",
+                "blockLen does not match Y/Cb/Cr lengths",
+            ));
+        }
+        let y_data = src.read_slice(y_len, "RfxTileWire::YData")?.to_vec();
+        let cb_data = src.read_slice(cb_len, "RfxTileWire::CbData")?.to_vec();
+        let cr_data = src.read_slice(cr_len, "RfxTileWire::CrData")?.to_vec();
+        Ok(Self {
+            quant_idx_y,
+            quant_idx_cb,
+            quant_idx_cr,
+            x_idx,
+            y_idx,
+            y_data,
+            cb_data,
+            cr_data,
+        })
+    }
+}
+
+// ── TS_RFX_TILESET (WBT_EXTENSION) ──────────────────────────────────
+
+/// `TS_RFX_TILESET` -- MS-RDPRFX 2.2.2.3.4.
+///
+/// The block type on the wire is `WBT_EXTENSION` (`0xCCC7`); the
+/// `subtype` field discriminates as `CBT_TILESET` (`0xCAC2`) so a
+/// future extension would use the same `WBT_EXTENSION` envelope with
+/// a different `subtype`.
+///
+/// `tileSize` field is `u8 = 0x40` -- this differs from
+/// `TS_RFX_CONTEXT.tileSize` which is `u16 = 0x0040`. Both encode the
+/// same value (64) but with different wire widths.
+///
+/// `properties.lt` (last-tileset) is hard-coded to 1: the spec
+/// currently defines exactly one TileSet per Region.
+///
+/// `tilesDataSize` is the byte total of the `tiles` field; the encoder
+/// computes it from `tiles.iter().map(|t| t.size()).sum()` and the
+/// decoder cross-checks against the actual tile bytes consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RfxTileSet {
+    pub properties: RfxProperties,
+    pub quant_vals: Vec<CodecQuant>,
+    pub tiles: Vec<RfxTileWire>,
+}
+
+impl RfxTileSet {
+    fn tiles_data_size(&self) -> usize {
+        self.tiles.iter().map(|t| t.block_len()).sum()
+    }
+
+    fn block_len(&self) -> usize {
+        RFX_TILESET_FIXED_PREFIX_SIZE
+            + self.quant_vals.len() * RFX_CODEC_QUANT_SIZE
+            + self.tiles_data_size()
+    }
+}
+
+impl Encode for RfxTileSet {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        if self.quant_vals.len() > u8::MAX as usize {
+            return Err(EncodeError::other(
+                "RfxTileSet",
+                "numQuant exceeds u8::MAX (255)",
+            ));
+        }
+        if self.tiles.len() > u16::MAX as usize {
+            return Err(EncodeError::other(
+                "RfxTileSet",
+                "numTiles exceeds u16::MAX (65535)",
+            ));
+        }
+        // Validate quant indices against the table size before we start
+        // serialising tile bytes: catching this here gives the caller a
+        // clear error rather than producing a wire-valid PDU that the
+        // decoder will silently accept (decoder cannot detect this --
+        // any u8 quant index is structurally valid).
+        let num_quant = self.quant_vals.len();
+        for (i, t) in self.tiles.iter().enumerate() {
+            for (idx, label) in [
+                (t.quant_idx_y, "Y"),
+                (t.quant_idx_cb, "Cb"),
+                (t.quant_idx_cr, "Cr"),
+            ] {
+                if (idx as usize) >= num_quant {
+                    let _ = (i, label); // names unused outside debug builds
+                    return Err(EncodeError::other(
+                        "RfxTileSet",
+                        "tile quantIdx out of range for TileSet quant_vals",
+                    ));
+                }
+            }
+        }
+        let tiles_data_size = self.tiles_data_size();
+        if tiles_data_size > u32::MAX as usize {
+            return Err(EncodeError::other(
+                "RfxTileSet",
+                "tilesDataSize exceeds u32::MAX",
+            ));
+        }
+        let block_len = self.block_len();
+        if block_len > u32::MAX as usize {
+            return Err(EncodeError::other(
+                "RfxTileSet",
+                "blockLen exceeds u32::MAX",
+            ));
+        }
+        RfxCodecChannelHeader {
+            block_type: WBT_EXTENSION,
+            block_len: block_len as u32,
+            codec_id: CODEC_ID,
+            channel_id: CHANNEL_ID_DATA,
+        }
+        .encode(dst)?;
+        dst.write_u16_le(CBT_TILESET, "RfxTileSet::subtype")?;
+        dst.write_u16_le(TILESET_IDX, "RfxTileSet::idx")?;
+        dst.write_u16_le(self.properties.pack_tileset(), "RfxTileSet::properties")?;
+        dst.write_u8(num_quant as u8, "RfxTileSet::numQuant")?;
+        dst.write_u8(TILESET_TILE_SIZE, "RfxTileSet::tileSize")?;
+        dst.write_u16_le(self.tiles.len() as u16, "RfxTileSet::numTiles")?;
+        dst.write_u32_le(tiles_data_size as u32, "RfxTileSet::tilesDataSize")?;
+        for q in &self.quant_vals {
+            let bytes = q.to_bytes();
+            dst.write_slice(&bytes, "RfxTileSet::quantVals[i]")?;
+        }
+        for t in &self.tiles {
+            t.encode(dst)?;
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RfxTileSet"
+    }
+
+    fn size(&self) -> usize {
+        self.block_len()
+    }
+}
+
+impl<'de> Decode<'de> for RfxTileSet {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let hdr = RfxCodecChannelHeader::decode(src)?;
+        if hdr.block_type != WBT_EXTENSION {
+            return Err(DecodeError::unexpected_value(
+                "RfxTileSet",
+                "blockType",
+                "expected WBT_EXTENSION (0xCCC7)",
+            ));
+        }
+        if hdr.codec_id != CODEC_ID {
+            return Err(DecodeError::unexpected_value(
+                "RfxTileSet",
+                "codecId",
+                "expected RFX CODEC_ID (0x01)",
+            ));
+        }
+        if hdr.channel_id != CHANNEL_ID_DATA {
+            return Err(DecodeError::unexpected_value(
+                "RfxTileSet",
+                "channelId",
+                "expected CHANNEL_ID_DATA (0x00)",
+            ));
+        }
+        let subtype = src.read_u16_le("RfxTileSet::subtype")?;
+        if subtype != CBT_TILESET {
+            return Err(DecodeError::unexpected_value(
+                "RfxTileSet",
+                "subtype",
+                "expected CBT_TILESET (0xCAC2)",
+            ));
+        }
+        // `idx` MUST be 0; we follow spec MUST and reject other values.
+        let idx = src.read_u16_le("RfxTileSet::idx")?;
+        if idx != TILESET_IDX {
+            return Err(DecodeError::unexpected_value(
+                "RfxTileSet",
+                "idx",
+                "expected 0x0000",
+            ));
+        }
+        let raw_props = src.read_u16_le("RfxTileSet::properties")?;
+        let properties = RfxProperties::unpack_tileset(raw_props)?;
+        let num_quant = src.read_u8("RfxTileSet::numQuant")?;
+        let tile_size = src.read_u8("RfxTileSet::tileSize")?;
+        if tile_size != TILESET_TILE_SIZE {
+            return Err(DecodeError::unexpected_value(
+                "RfxTileSet",
+                "tileSize",
+                "expected 0x40",
+            ));
+        }
+        let num_tiles = src.read_u16_le("RfxTileSet::numTiles")?;
+        let tiles_data_size = src.read_u32_le("RfxTileSet::tilesDataSize")? as usize;
+
+        let expected_len = RFX_TILESET_FIXED_PREFIX_SIZE
+            + (num_quant as usize) * RFX_CODEC_QUANT_SIZE
+            + tiles_data_size;
+        if hdr.block_len as usize != expected_len {
+            return Err(DecodeError::invalid_value(
+                "RfxTileSet",
+                "blockLen does not match numQuant + tilesDataSize",
+            ));
+        }
+
+        let mut quant_vals = Vec::with_capacity(num_quant as usize);
+        for _ in 0..num_quant {
+            let bytes = src.read_slice(RFX_CODEC_QUANT_SIZE, "RfxTileSet::quantVals[i]")?;
+            // `read_slice` returns a borrow; copy into a fixed array
+            // for `CodecQuant::from_bytes`.
+            let mut buf = [0u8; RFX_CODEC_QUANT_SIZE];
+            buf.copy_from_slice(bytes);
+            quant_vals.push(CodecQuant::from_bytes(&buf));
+        }
+
+        let tiles_start = src.pos();
+        let mut tiles = Vec::with_capacity(num_tiles as usize);
+        for _ in 0..num_tiles {
+            tiles.push(RfxTileWire::decode(src)?);
+        }
+        let tiles_consumed = src.pos() - tiles_start;
+        if tiles_consumed != tiles_data_size {
+            return Err(DecodeError::invalid_value(
+                "RfxTileSet",
+                "actual tile bytes consumed do not match tilesDataSize",
+            ));
+        }
+
+        Ok(Self {
+            properties,
+            quant_vals,
+            tiles,
+        })
     }
 }
 
@@ -1951,6 +2310,372 @@ mod tests {
         let mut src = ReadCursor::new(&buf);
         let d = RfxRegion::decode(&mut src).unwrap();
         assert_eq!(d.rects.len(), 0);
+    }
+
+    // ── TILE + TILESET tests ─────────────────────────────────────
+
+    fn sample_tile(quant_idx: u8, x_idx: u16, y_idx: u16, bytes_each: usize) -> RfxTileWire {
+        RfxTileWire {
+            quant_idx_y: quant_idx,
+            quant_idx_cb: quant_idx,
+            quant_idx_cr: quant_idx,
+            x_idx,
+            y_idx,
+            y_data: vec![0xAA; bytes_each],
+            cb_data: vec![0xBB; bytes_each],
+            cr_data: vec![0xCC; bytes_each],
+        }
+    }
+
+    fn sample_quant() -> CodecQuant {
+        CodecQuant::from_bytes(&[0x66, 0x66, 0x66, 0x66, 0x66])
+    }
+
+    #[test]
+    fn rfx_tile_wire_roundtrip_small() {
+        let t = sample_tile(0, 1, 2, 32);
+        let d = roundtrip(&t);
+        assert_eq!(d, t);
+        assert_eq!(t.size(), RFX_TILE_FIXED_PREFIX_SIZE + 32 * 3);
+    }
+
+    #[test]
+    fn rfx_tile_wire_roundtrip_zero_length_components() {
+        let t = RfxTileWire {
+            quant_idx_y: 0,
+            quant_idx_cb: 0,
+            quant_idx_cr: 0,
+            x_idx: 0,
+            y_idx: 0,
+            y_data: vec![],
+            cb_data: vec![],
+            cr_data: vec![],
+        };
+        let d = roundtrip(&t);
+        assert_eq!(d, t);
+        assert_eq!(t.size(), RFX_TILE_FIXED_PREFIX_SIZE);
+    }
+
+    #[test]
+    fn rfx_tile_wire_byte_layout() {
+        let t = RfxTileWire {
+            quant_idx_y: 0x11,
+            quant_idx_cb: 0x22,
+            quant_idx_cr: 0x33,
+            x_idx: 0x0102,
+            y_idx: 0x0304,
+            y_data: vec![0xAA; 2],
+            cb_data: vec![0xBB; 3],
+            cr_data: vec![0xCC; 1],
+        };
+        let mut buf = vec![0u8; t.size()];
+        t.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // header: blockType CBT_TILE = 0xCAC3
+        assert_eq!(&buf[..2], &[0xC3, 0xCA]);
+        // blockLen = 19 + 2 + 3 + 1 = 25 = 0x19
+        assert_eq!(&buf[2..6], &[0x19, 0x00, 0x00, 0x00]);
+        // quant indices
+        assert_eq!(&buf[6..9], &[0x11, 0x22, 0x33]);
+        // xIdx, yIdx LE
+        assert_eq!(&buf[9..11], &[0x02, 0x01]);
+        assert_eq!(&buf[11..13], &[0x04, 0x03]);
+        // YLen=2, CbLen=3, CrLen=1
+        assert_eq!(&buf[13..15], &[0x02, 0x00]);
+        assert_eq!(&buf[15..17], &[0x03, 0x00]);
+        assert_eq!(&buf[17..19], &[0x01, 0x00]);
+        // payload
+        assert_eq!(&buf[19..21], &[0xAA, 0xAA]);
+        assert_eq!(&buf[21..24], &[0xBB, 0xBB, 0xBB]);
+        assert_eq!(&buf[24..25], &[0xCC]);
+    }
+
+    #[test]
+    fn rfx_tile_wire_decode_rejects_blocklen_mismatch() {
+        let t = sample_tile(0, 0, 0, 16);
+        let mut buf = vec![0u8; t.size()];
+        t.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // blockLen at bytes 2..6 -- claim 0xFF.
+        buf[2] = 0xFF;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileWire::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_tile_wire_decode_rejects_wrong_block_type() {
+        let t = sample_tile(0, 0, 0, 16);
+        let mut buf = vec![0u8; t.size()];
+        t.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // CBT_REGION (0xCAC1) instead of CBT_TILE (0xCAC3) -- low byte differs.
+        buf[0] = 0xC1;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileWire::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_single_quant_single_tile_roundtrip() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![sample_quant()],
+            tiles: vec![sample_tile(0, 0, 0, 64)],
+        };
+        let d = roundtrip(&ts);
+        assert_eq!(d, ts);
+        // 22 + 1*5 + (19 + 64*3) = 22 + 5 + 211 = 238
+        assert_eq!(ts.size(), 22 + 5 + 19 + 64 * 3);
+    }
+
+    #[test]
+    fn rfx_tileset_multi_quant_multi_tile_roundtrip() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr1),
+            quant_vals: vec![sample_quant(), sample_quant(), sample_quant()],
+            tiles: vec![
+                sample_tile(0, 0, 0, 32),
+                sample_tile(1, 1, 0, 48),
+                sample_tile(2, 0, 1, 16),
+                sample_tile(2, 1, 1, 24),
+            ],
+        };
+        let d = roundtrip(&ts);
+        assert_eq!(d, ts);
+    }
+
+    #[test]
+    fn rfx_tileset_zero_tiles_roundtrip() {
+        // numTiles = 0, tilesDataSize = 0 -- wire-legal even if useless.
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![],
+            tiles: vec![],
+        };
+        let d = roundtrip(&ts);
+        assert_eq!(d, ts);
+        assert_eq!(ts.size(), 22);
+    }
+
+    #[test]
+    fn rfx_tileset_byte_layout_constants() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![],
+            tiles: vec![],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        ts.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // header: WBT_EXTENSION = 0xCCC7
+        assert_eq!(&buf[..2], &[0xC7, 0xCC]);
+        // blockLen = 22
+        assert_eq!(&buf[2..6], &[0x16, 0x00, 0x00, 0x00]);
+        assert_eq!(buf[6], CODEC_ID);
+        assert_eq!(buf[7], CHANNEL_ID_DATA);
+        // subtype CBT_TILESET = 0xCAC2
+        assert_eq!(&buf[8..10], &[0xC2, 0xCA]);
+        // idx = 0
+        assert_eq!(&buf[10..12], &[0x00, 0x00]);
+        // properties = pack_tileset(image, RLGR3) = 0x5055
+        assert_eq!(&buf[12..14], &[0x55, 0x50]);
+        // numQuant = 0
+        assert_eq!(buf[14], 0x00);
+        // tileSize = 0x40
+        assert_eq!(buf[15], TILESET_TILE_SIZE);
+        // numTiles = 0 LE
+        assert_eq!(&buf[16..18], &[0x00, 0x00]);
+        // tilesDataSize = 0 LE u32
+        assert_eq!(&buf[18..22], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn rfx_tileset_encode_rejects_quant_idx_out_of_range() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![sample_quant()],
+            tiles: vec![sample_tile(5, 0, 0, 16)], // idx 5 with only 1 quant entry
+        };
+        let mut buf = vec![0u8; ts.size()];
+        assert!(ts.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_decode_rejects_wrong_subtype() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![],
+            tiles: vec![],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        ts.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // subtype is at bytes 8..10; corrupt to 0xCAC1 (CBT_REGION).
+        buf[8] = 0xC1;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileSet::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_decode_rejects_wrong_idx() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![],
+            tiles: vec![],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        ts.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // idx at bytes 10..12; corrupt to 1.
+        buf[10] = 0x01;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileSet::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_decode_rejects_wrong_tile_size() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![],
+            tiles: vec![],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        ts.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // tileSize at byte 15; corrupt to 0x80.
+        buf[15] = 0x80;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileSet::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_decode_rejects_wrong_block_type() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![],
+            tiles: vec![],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        ts.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[0] = 0xC0; // -> WBT_SYNC
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileSet::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_decode_rejects_wrong_codec_id() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![],
+            tiles: vec![],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        ts.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[6] = 0x02;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileSet::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_decode_rejects_wrong_channel_id() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![],
+            tiles: vec![],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        ts.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[7] = CHANNEL_ID_CONTEXT;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileSet::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_decode_rejects_blocklen_mismatch() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![sample_quant()],
+            tiles: vec![sample_tile(0, 0, 0, 16)],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        ts.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[2] = 0xFF;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileSet::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_encode_at_max_num_quant() {
+        // 255 quant entries -- u8 upper boundary; tile uses index 254
+        // (highest valid).
+        let quant_vals = (0..255).map(|_| sample_quant()).collect::<Vec<_>>();
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals,
+            tiles: vec![RfxTileWire {
+                quant_idx_y: 254,
+                quant_idx_cb: 254,
+                quant_idx_cr: 254,
+                x_idx: 0,
+                y_idx: 0,
+                y_data: vec![],
+                cb_data: vec![],
+                cr_data: vec![],
+            }],
+        };
+        let d = roundtrip(&ts);
+        assert_eq!(d.quant_vals.len(), 255);
+        assert_eq!(d.tiles[0].quant_idx_y, 254);
+        // 22 + 255*5 + 19 = 22 + 1275 + 19 = 1316
+        assert_eq!(ts.size(), 22 + 255 * 5 + 19);
+    }
+
+    #[test]
+    fn rfx_tileset_encode_rejects_more_than_u8_max_quant_entries() {
+        let quant_vals = (0..256).map(|_| sample_quant()).collect::<Vec<_>>();
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals,
+            tiles: vec![],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        assert!(ts.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_encode_rejects_more_than_u16_max_tiles() {
+        // 65536 tiles -- exceeds u16 numTiles cap.
+        let tiles = (0..65_536_usize)
+            .map(|_| RfxTileWire {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx: 0,
+                y_idx: 0,
+                y_data: vec![],
+                cb_data: vec![],
+                cr_data: vec![],
+            })
+            .collect::<Vec<_>>();
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![sample_quant()],
+            tiles,
+        };
+        let mut buf = vec![0u8; ts.size()];
+        assert!(ts.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn rfx_tileset_decode_rejects_tiles_data_size_mismatch() {
+        let ts = RfxTileSet {
+            properties: RfxProperties::image(RlgrMode::Rlgr3),
+            quant_vals: vec![sample_quant()],
+            tiles: vec![sample_tile(0, 0, 0, 16)],
+        };
+        let mut buf = vec![0u8; ts.size()];
+        ts.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // tilesDataSize is at bytes 18..22; lower it by 1 -- decoder must
+        // detect blockLen vs computed size mismatch.
+        if buf[18] > 0 {
+            buf[18] -= 1;
+        } else {
+            buf[18] = 1;
+        }
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxTileSet::decode(&mut src).is_err());
     }
 
     #[test]
