@@ -212,6 +212,23 @@ pub trait RdpServerDisplayHandler {
         None
     }
 
+    /// Pull the next pre-built EGFX (RDPGFX) command stream for the
+    /// `Microsoft::Windows::RDS::Graphics` dynamic virtual channel.
+    ///
+    /// Each [`EgfxFrame`] carries one or more DVC payloads (typically
+    /// produced by `GfxServer::start_frame` / `wire_to_surface_1` /
+    /// `end_frame` calls in `justrdp-egfx`) that the active stage
+    /// forwards verbatim via `DrdynvcServer::send_data` on the GFX
+    /// channel. Returning `None` is the steady-state idle response.
+    ///
+    /// The seam exists so the GFX pipeline (§11.2b-3) can be wired in
+    /// without dragging `justrdp-dvc` / `justrdp-egfx` into
+    /// `justrdp-server`'s dependency graph -- the application owns the
+    /// `GfxServer` instance and feeds raw bytes through this hook.
+    fn get_egfx_frame(&mut self) -> Option<EgfxFrame> {
+        None
+    }
+
     /// Current desktop size as (`width`, `height`) in pixels. Used by
     /// the active stage during `Reset` and Deactivation-Reactivation
     /// (§11.2b). The dimensions MUST match the value sent in
@@ -237,6 +254,45 @@ pub trait RdpServerDisplayHandler {
     /// implementation drops the notification.
     fn on_refresh_rect(&mut self, areas: &[DisplayRect]) {
         let _ = areas;
+    }
+}
+
+/// Pre-built EGFX (RDPGFX) command stream returned from
+/// [`RdpServerDisplayHandler::get_egfx_frame`].
+///
+/// `messages` holds the DVC payloads for the
+/// `Microsoft::Windows::RDS::Graphics` channel exactly as they came out
+/// of `GfxServer` (typically `[0xE0, 0x04, RDPGFX_HEADER, body]` per
+/// payload, MS-RDPEGFX 2.2.5.1). Each entry maps to one
+/// `DrdynvcServer::send_data` call.
+///
+/// The struct is intentionally opaque from `justrdp-server`'s point of
+/// view -- this crate does not depend on `justrdp-dvc` /
+/// `justrdp-egfx` and treats the bytes as caller-owned blobs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgfxFrame {
+    pub messages: Vec<Vec<u8>>,
+}
+
+impl EgfxFrame {
+    /// Construct an empty frame.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct a frame from a list of pre-built DVC payloads.
+    pub fn with_messages(messages: Vec<Vec<u8>>) -> Self {
+        Self { messages }
+    }
+
+    /// Append one DVC payload.
+    pub fn push(&mut self, message: Vec<u8>) {
+        self.messages.push(message);
+    }
+
+    /// Whether the frame carries any payload.
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
     }
 }
 
@@ -377,6 +433,26 @@ mod tests {
                 tm_seconds: 0,
             }),
         });
+    }
+
+    #[test]
+    fn display_handler_default_get_egfx_frame_returns_none() {
+        let mut h = OneShotDisplay { update: None, size: (800, 600) };
+        assert!(h.get_egfx_frame().is_none());
+    }
+
+    #[test]
+    fn egfx_frame_construction_and_push() {
+        let mut f = EgfxFrame::new();
+        assert!(f.is_empty());
+        f.push(vec![0xE0, 0x04, 0xDE, 0xAD]);
+        f.push(vec![0xE0, 0x04, 0xBE, 0xEF]);
+        assert_eq!(f.messages.len(), 2);
+        assert_eq!(f.messages[0], vec![0xE0, 0x04, 0xDE, 0xAD]);
+        assert!(!f.is_empty());
+
+        let g = EgfxFrame::with_messages(vec![vec![1u8], vec![2u8, 3]]);
+        assert_eq!(g.messages.len(), 2);
     }
 
     #[test]

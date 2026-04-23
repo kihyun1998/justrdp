@@ -1797,6 +1797,247 @@ mod tests {
             .is_err());
     }
 
+    // ── GfxServer ↔ GfxClient loopback (Commit 5) ────────────────
+
+    use crate::client::{GfxClient, GfxHandler};
+    use crate::pdu::{
+        GfxRect16 as PduGfxRect16, RDPGFX_CAPS_FLAG_AVC_DISABLED, RDPGFX_CODECID_UNCOMPRESSED,
+    };
+    use alloc::boxed::Box;
+
+    /// Test handler that records every callback invocation so the
+    /// loopback test can assert on what the client decoded out of the
+    /// server-emitted byte stream.
+    #[derive(Default)]
+    struct LoopbackRecorder {
+        surfaces_created: Vec<u16>,
+        maps_to_output: Vec<u16>,
+        wire_to_surface_1_calls: u32,
+        frames_started: Vec<u32>,
+        frames_ended: Vec<u32>,
+    }
+
+    impl AsAny for LoopbackRecorder {
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
+        }
+    }
+
+    impl GfxHandler for LoopbackRecorder {
+        fn on_create_surface(&mut self, sid: u16, _w: u16, _h: u16, _pf: GfxPixelFormat) {
+            self.surfaces_created.push(sid);
+        }
+        fn on_delete_surface(&mut self, _sid: u16) {}
+        fn on_map_surface_to_output(&mut self, sid: u16, _x: u32, _y: u32) {
+            self.maps_to_output.push(sid);
+        }
+        fn on_reset_graphics(&mut self, _w: u32, _h: u32, _m: &[GfxMonitorDef]) {}
+        fn on_wire_to_surface_1(
+            &mut self,
+            _sid: u16,
+            _cid: u16,
+            _pf: GfxPixelFormat,
+            _r: PduGfxRect16,
+            _d: &[u8],
+        ) {
+            self.wire_to_surface_1_calls += 1;
+        }
+        fn on_wire_to_surface_2(
+            &mut self,
+            _sid: u16,
+            _cid: u16,
+            _ctx: u32,
+            _pf: GfxPixelFormat,
+            _d: &[u8],
+        ) {
+        }
+        fn on_start_frame(&mut self, frame_id: u32, _ts: u32) {
+            self.frames_started.push(frame_id);
+        }
+        fn on_end_frame(&mut self, frame_id: u32) -> Option<u32> {
+            self.frames_ended.push(frame_id);
+            // Acknowledge with a 0-byte queue depth -- per spec the
+            // numeric value here is the buffered byte count.
+            Some(0)
+        }
+    }
+
+    #[test]
+    fn loopback_caps_handshake_and_one_frame() {
+        // ── Handshake ───────────────────────────────────────────
+        let mut server = GfxServer::new();
+        assert!(server.start(1).unwrap().is_empty());
+
+        let mut client = GfxClient::with_handler(Box::new(LoopbackRecorder::default()));
+        let client_init = client.start(1).unwrap();
+        assert_eq!(client_init.len(), 1, "client emits CapsAdvertise");
+
+        // Server consumes the raw CapsAdvertise (no SINGLE wrap on the
+        // client→server direction per MS-RDPEGFX 2.2.5).
+        let server_resp = server.process(1, &client_init[0].data).unwrap();
+        assert_eq!(server_resp.len(), 1, "server emits one CapsConfirm");
+        assert_eq!(server.state(), ServerState::Active);
+
+        // Client consumes the SINGLE-wrapped CapsConfirm and goes Active.
+        let client_resp = client.process(1, &server_resp[0].data).unwrap();
+        assert!(
+            client_resp.is_empty(),
+            "client does not emit anything in response to CapsConfirm",
+        );
+
+        // ── Server emits a complete frame ───────────────────────
+        let create = server
+            .create_surface(1, 64, 64, GfxPixelFormat::XRGB_8888)
+            .unwrap();
+        let map = server.map_surface_to_output(1, 0, 0).unwrap();
+        let start = server.start_frame(0, 0).unwrap();
+        let bitmap = server
+            .wire_to_surface_1(
+                1,
+                RDPGFX_CODECID_UNCOMPRESSED,
+                GfxPixelFormat::XRGB_8888,
+                PduGfxRect16 { left: 0, top: 0, right: 64, bottom: 64 },
+                vec![0xFFu8; 64 * 64 * 4],
+            )
+            .unwrap();
+        let end = server.end_frame(0).unwrap();
+
+        assert_eq!(server.pending_frame_count(), 1);
+
+        // ── Forward each server payload through the client ─────
+        let mut client_replies = Vec::new();
+        for msg in [&create, &map, &start, &bitmap, &end] {
+            let replies = client.process(1, &msg.data).unwrap();
+            client_replies.extend(replies);
+        }
+
+        // Client emits exactly one FrameAck (after EndFrame).
+        assert_eq!(
+            client_replies.len(),
+            1,
+            "client must emit one FrameAck after EndFrame",
+        );
+
+        // ── Server consumes the FrameAck ────────────────────────
+        let ack_resp = server.process(1, &client_replies[0].data).unwrap();
+        assert!(ack_resp.is_empty());
+        assert_eq!(server.pending_frame_count(), 0, "ack drains pending queue");
+        assert_eq!(server.total_frame_acks_received(), 1);
+        assert!(!server.ack_suspended());
+
+        // ── Verify the client recorder saw all of it ────────────
+        let recorder = client
+            .as_any()
+            .downcast_ref::<GfxClient>()
+            .expect("client downcast")
+            .handler_for_test::<LoopbackRecorder>();
+        // Falling back to a direct field check via downcasting: the
+        // GfxClient does not expose its handler publicly, so reach
+        // into the handler via the recorder's recorded counters using
+        // the test's known shape. We use `client.as_any` to reach the
+        // recorder through the GfxClient debug accessor.
+        let _ = recorder; // see helper below
+    }
+
+    /// Convenience for the loopback test: pulls the client's handler
+    /// back out as a concrete `LoopbackRecorder` reference. `GfxClient`
+    /// stores `handler: Box<dyn GfxHandler>` and exposes it via `AsAny`
+    /// on the `GfxHandler` itself, so we route through that.
+    impl crate::GfxClient {
+        fn handler_for_test<T: AsAny + 'static>(&self) -> &T {
+            // The client doesn't expose a public handler accessor; this
+            // test-only helper reaches into the `Box<dyn GfxHandler>`
+            // via the `as_any` impl on `GfxHandler` (which extends
+            // `AsAny`). Implemented inside the egfx crate so no extra
+            // visibility is required.
+            self.handler_ref()
+                .as_any()
+                .downcast_ref::<T>()
+                .expect("handler downcast")
+        }
+    }
+
+    #[test]
+    fn loopback_handler_records_all_callbacks() {
+        // Same flow as above but actually inspects the recorder's
+        // recorded events.
+        let mut server = GfxServer::new();
+        server.start(1).unwrap();
+        let mut client = GfxClient::with_handler(Box::new(LoopbackRecorder::default()));
+        let init = client.start(1).unwrap();
+        let confirm = server.process(1, &init[0].data).unwrap();
+        client.process(1, &confirm[0].data).unwrap();
+
+        for msg in [
+            server
+                .create_surface(7, 32, 32, GfxPixelFormat::XRGB_8888)
+                .unwrap(),
+            server.map_surface_to_output(7, 100, 200).unwrap(),
+            server.start_frame(42, 0).unwrap(),
+            server
+                .wire_to_surface_1(
+                    7,
+                    RDPGFX_CODECID_UNCOMPRESSED,
+                    GfxPixelFormat::XRGB_8888,
+                    PduGfxRect16 { left: 0, top: 0, right: 32, bottom: 32 },
+                    vec![0u8; 32 * 32 * 4],
+                )
+                .unwrap(),
+            server.end_frame(42).unwrap(),
+        ] {
+            client.process(1, &msg.data).unwrap();
+        }
+
+        let recorder = client.handler_for_test::<LoopbackRecorder>();
+        assert_eq!(recorder.surfaces_created, vec![7]);
+        assert_eq!(recorder.maps_to_output, vec![7]);
+        assert_eq!(recorder.frames_started, vec![42]);
+        assert_eq!(recorder.frames_ended, vec![42]);
+        assert_eq!(recorder.wire_to_surface_1_calls, 1);
+    }
+
+    #[test]
+    fn loopback_negotiates_avc_disabled_flag_round_trip() {
+        // Client advertises VERSION10 with AVC_DISABLED; server's
+        // CapsConfirm must echo the flag, and a subsequent attempt to
+        // emit an AVC WireToSurface1 must be rejected on the server side.
+        use crate::pdu::RDPGFX_CODECID_AVC420;
+
+        let cap_sets = vec![GfxCapSet {
+            version: RDPGFX_CAPVERSION_10,
+            flags: RDPGFX_CAPS_FLAG_AVC_DISABLED,
+        }];
+        let mut server = GfxServer::new();
+        server.start(1).unwrap();
+        let mut client = GfxClient::new(
+            cap_sets.clone(),
+            Box::new(LoopbackRecorder::default()),
+        );
+        let init = client.start(1).unwrap();
+        let confirm = server.process(1, &init[0].data).unwrap();
+        client.process(1, &confirm[0].data).unwrap();
+
+        // Confirm the server's negotiated flag mirrors what the client sent.
+        assert_eq!(
+            server.negotiated().map(|c| c.flags),
+            Some(RDPGFX_CAPS_FLAG_AVC_DISABLED),
+        );
+
+        // AVC emit MUST be rejected.
+        assert!(server
+            .wire_to_surface_1(
+                1,
+                RDPGFX_CODECID_AVC420,
+                GfxPixelFormat::XRGB_8888,
+                PduGfxRect16 { left: 0, top: 0, right: 1, bottom: 1 },
+                vec![],
+            )
+            .is_err());
+    }
+
     // Single, separate version constants in the test scope — pull
     // unused warnings up here so the core test code stays focused.
     #[allow(unused_imports)]

@@ -29,7 +29,7 @@ pub use config::{
 };
 pub use error::{ServerConfigError, ServerError, ServerErrorKind, ServerResult};
 pub use handler::{
-    BitmapUpdate, DisplayRect, DisplayUpdate, PointerColorUpdate, PointerNewUpdate,
+    BitmapUpdate, DisplayRect, DisplayUpdate, EgfxFrame, PointerColorUpdate, PointerNewUpdate,
     RdpServerDisplayHandler, RdpServerInputHandler, SurfaceBitsUpdate,
 };
 pub use justrdp_pdu::rdp::surface_commands::CompressedBitmapHeaderEx;

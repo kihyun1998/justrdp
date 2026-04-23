@@ -267,6 +267,14 @@ impl GfxClient {
         self.negotiated_version
     }
 
+    /// Crate-internal accessor used by `GfxServer ↔ GfxClient` loopback
+    /// tests in `crate::server` to downcast the boxed handler without
+    /// adding a public API surface for application callers.
+    #[cfg(test)]
+    pub(crate) fn handler_ref(&self) -> &dyn GfxHandler {
+        &*self.handler
+    }
+
     /// Process the raw DVC payload (RDP_SEGMENTED_DATA).
     fn process_segmented_data(
         &mut self,

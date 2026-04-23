@@ -2405,20 +2405,24 @@ uncompressed bitmap fast-path, 입력/종료/SVC opaque forward까지. RFX/EGFX
 register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
 루프, `StartFrame/EndFrame ↔ FrameAcknowledge` 왕복 관리.
 
-- [ ] `GfxServer` -- `DvcProcessor` 구현 (server 방향)
-- [ ] Caps negotiation 서버측 -- `CapsAdvertise` 수신 → `CapsConfirm`
+- [x] `GfxServer` -- `DvcProcessor` 구현 (server 방향)
+- [x] Caps negotiation 서버측 -- `CapsAdvertise` 수신 → `CapsConfirm`
       선택 (10.7 우선, fallback)
-- [ ] 서버 송신 API: `create_surface`, `delete_surface`,
+- [x] 서버 송신 API: `create_surface`, `delete_surface`,
       `map_surface_to_output`, `reset_graphics`, `solid_fill`,
       `surface_to_surface`, `cache_*`, `evict_cache_entry`
-- [ ] `wire_to_surface_1` (codec 디스패치: RFX/CLEARCODEC/PLANAR/
-      AVC420/AVC444/UNCOMPRESSED) + `wire_to_surface_2`
-- [ ] `start_frame` / `end_frame` 송신 + `FrameAcknowledge` 수신 추적
+- [x] `wire_to_surface_1` (codec 디스패치: codec_id 는 caller 가 지정;
+      AVC 비활성 / thinclient 시 거부) + `wire_to_surface_2`
+- [x] `start_frame` / `end_frame` 송신 + `FrameAcknowledge` 수신 추적
       (`pending_frames` queue + `QUEUE_DEPTH_UNAVAILABLE` /
       `SUSPEND_FRAME_ACKNOWLEDGEMENT` 인식)
-- [ ] `RdpServerDisplayHandler::get_egfx_frame()` seam
-- [ ] DVC integration test (loopback `DrdynvcServer ↔ DrdynvcClient` +
-      `GfxServer ↔ GfxClient` echo 한 프레임 RFX 인코드/디코드)
+- [x] `RdpServerDisplayHandler::get_egfx_frame()` seam (opaque
+      `EgfxFrame { messages: Vec<Vec<u8>> }`; justrdp-server 가
+      justrdp-dvc/egfx 에 의존하지 않도록 분리)
+- [x] DVC integration test -- §11.2b-3 에서는 `GfxServer ↔ GfxClient`
+      직접 loopback (caps + 1 frame echo + AVC 거부); 전체
+      DrdynvcServer ↔ DrdynvcClient 까지 포함하는 통합 테스트는
+      §11.2d 통합 테스트 단계로 이관
 
 ##### 11.2b-4 -- Progressive RFX & ZGFX Compressed DVC Framing
 
