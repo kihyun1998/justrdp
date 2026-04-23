@@ -46,6 +46,61 @@ use super::wire::{
 /// 64×64 tiles aligned to the screen origin.
 pub const RFX_TILE_SIZE: u16 = 64;
 
+// ── Progressive quality scheduling ──────────────────────────────────
+
+/// Per-tile quality / inclusion decision returned by a
+/// [`ProgressiveQualityScheduler`].
+///
+/// In §11.2b-4 the scheduler is a pure include/exclude gate on top of
+/// the single-pass full-quality encoder -- the only currently-defined
+/// values are `Skip` (drop the tile from the emitted TileSet) and
+/// `Full` (encode at full quality). True multi-pass progressive RFX
+/// (gradual refinement of the same tile across frames) is left for a
+/// future expansion of this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileQuality {
+    /// Drop this tile -- it will not appear in the emitted
+    /// `WBT_TILESET`. Use this for delta frames where unchanged tiles
+    /// can be elided.
+    Skip,
+    /// Encode this tile at full quality (the only mode the current
+    /// encoder supports).
+    Full,
+}
+
+/// Caller-supplied policy that decides per-tile inclusion / quality
+/// for each frame.
+///
+/// Receives `frame_id` so schedulers can implement frame-cadence
+/// strategies (e.g. "send every tile every 30th frame, otherwise only
+/// dirty tiles").
+pub trait ProgressiveQualityScheduler {
+    /// Decide whether `(x_idx, y_idx)` should be included in the
+    /// frame keyed by `frame_id`, and at what quality.
+    fn quality_for_tile(
+        &mut self,
+        frame_id: u32,
+        x_idx: u16,
+        y_idx: u16,
+    ) -> TileQuality;
+}
+
+/// Scheduler that always returns [`TileQuality::Full`] -- the implicit
+/// default behavior of [`RfxFrameEncoder::encode_frame`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FullQualityScheduler;
+
+impl ProgressiveQualityScheduler for FullQualityScheduler {
+    fn quality_for_tile(
+        &mut self,
+        _frame_id: u32,
+        _x_idx: u16,
+        _y_idx: u16,
+    ) -> TileQuality {
+        TileQuality::Full
+    }
+}
+
 // ── Tile partitioning helper ────────────────────────────────────────
 
 /// Partition a `width × height` screen rectangle into the
@@ -176,8 +231,8 @@ impl RfxFrameEncoder {
         Ok(bytes)
     }
 
-    /// Encode one full frame. The output begins with the four
-    /// handshake blocks (image mode) and ends with `FrameEnd`.
+    /// Encode one full frame at full quality (every supplied tile is
+    /// included verbatim).
     ///
     /// `rects` are the destination rectangles; `numRects = 0` is wire-
     /// legal and the receiver synthesises a full-channel rect.
@@ -187,13 +242,51 @@ impl RfxFrameEncoder {
     ///
     /// The internal `frame_id` counter increments after every
     /// successful call (wrapping at `u32::MAX`).
+    ///
+    /// For per-tile inclusion decisions (delta frames, throttled
+    /// updates, etc.), use
+    /// [`encode_frame_with_scheduler`](Self::encode_frame_with_scheduler).
     pub fn encode_frame(
         &mut self,
         rects: &[RfxRect],
         quant_vals: Vec<CodecQuant>,
         tiles: Vec<RfxTileWire>,
     ) -> EncodeResult<Vec<u8>> {
+        self.encode_frame_with_scheduler(
+            rects,
+            quant_vals,
+            tiles,
+            &mut FullQualityScheduler,
+        )
+    }
+
+    /// Encode one frame, consulting `scheduler` to decide whether to
+    /// include each tile.
+    ///
+    /// Tiles for which the scheduler returns [`TileQuality::Skip`] are
+    /// dropped before the TileSet is built; the resulting `numTiles`
+    /// reflects only the kept tiles. The handshake blocks and frame
+    /// envelope (`FrameBegin` / `Region` / `FrameEnd`) are emitted
+    /// unconditionally so the receiver still sees a well-formed frame
+    /// even when every tile is skipped.
+    ///
+    /// `frame_id` (the value handed to the scheduler) is the same
+    /// monotonic counter used by [`encode_frame`](Self::encode_frame);
+    /// it advances after a successful call.
+    pub fn encode_frame_with_scheduler(
+        &mut self,
+        rects: &[RfxRect],
+        quant_vals: Vec<CodecQuant>,
+        tiles: Vec<RfxTileWire>,
+        scheduler: &mut dyn ProgressiveQualityScheduler,
+    ) -> EncodeResult<Vec<u8>> {
         let frame_id = self.next_frame_id;
+        let kept: Vec<RfxTileWire> = tiles
+            .into_iter()
+            .filter(|t| {
+                scheduler.quality_for_tile(frame_id, t.x_idx, t.y_idx) != TileQuality::Skip
+            })
+            .collect();
         let handshake = build_handshake(self.width, self.height, self.entropy)?;
 
         let frame_begin = RfxFrameBegin {
@@ -206,7 +299,7 @@ impl RfxFrameEncoder {
         let tileset = RfxTileSet {
             properties: RfxProperties::image(self.entropy),
             quant_vals,
-            tiles,
+            tiles: kept,
         };
         let frame_end = RfxFrameEnd;
 
@@ -522,6 +615,141 @@ mod tests {
         // Confirm the frame still starts with a Sync block.
         let mut c = ReadCursor::new(&bytes);
         assert!(RfxSync::decode(&mut c).is_ok());
+    }
+
+    // ── ProgressiveQualityScheduler ──────────────────────────────
+
+    /// Test scheduler that drops tiles whose `(x_idx, y_idx)` matches
+    /// any in `skip_tiles`.
+    struct SkipListScheduler {
+        skip_tiles: Vec<(u16, u16)>,
+        observed_frame_ids: Vec<u32>,
+    }
+
+    impl SkipListScheduler {
+        fn new(skip_tiles: Vec<(u16, u16)>) -> Self {
+            Self {
+                skip_tiles,
+                observed_frame_ids: Vec::new(),
+            }
+        }
+    }
+
+    impl ProgressiveQualityScheduler for SkipListScheduler {
+        fn quality_for_tile(
+            &mut self,
+            frame_id: u32,
+            x_idx: u16,
+            y_idx: u16,
+        ) -> TileQuality {
+            self.observed_frame_ids.push(frame_id);
+            if self.skip_tiles.contains(&(x_idx, y_idx)) {
+                TileQuality::Skip
+            } else {
+                TileQuality::Full
+            }
+        }
+    }
+
+    #[test]
+    fn full_quality_scheduler_keeps_every_tile() {
+        let mut e = RfxFrameEncoder::new(800, 600, RlgrMode::Rlgr3).unwrap();
+        let bytes = e
+            .encode_frame_with_scheduler(
+                &[],
+                vec![sample_quant()],
+                vec![sample_tile(0, 0), sample_tile(1, 0), sample_tile(0, 1)],
+                &mut FullQualityScheduler,
+            )
+            .unwrap();
+        let (.., tileset, _) = parse_frame(&bytes);
+        assert_eq!(tileset.tiles.len(), 3);
+    }
+
+    #[test]
+    fn scheduler_skip_drops_those_tiles_only() {
+        let mut e = RfxFrameEncoder::new(800, 600, RlgrMode::Rlgr3).unwrap();
+        let mut scheduler = SkipListScheduler::new(vec![(1, 0), (0, 1)]);
+        let bytes = e
+            .encode_frame_with_scheduler(
+                &[],
+                vec![sample_quant()],
+                vec![
+                    sample_tile(0, 0),
+                    sample_tile(1, 0), // skipped
+                    sample_tile(0, 1), // skipped
+                    sample_tile(1, 1),
+                ],
+                &mut scheduler,
+            )
+            .unwrap();
+        let (.., tileset, _) = parse_frame(&bytes);
+        assert_eq!(tileset.tiles.len(), 2);
+        let kept_indices: Vec<(u16, u16)> = tileset
+            .tiles
+            .iter()
+            .map(|t| (t.x_idx, t.y_idx))
+            .collect();
+        assert_eq!(kept_indices, vec![(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn scheduler_skip_all_emits_empty_tileset_but_full_envelope() {
+        let mut e = RfxFrameEncoder::new(800, 600, RlgrMode::Rlgr1).unwrap();
+        let mut scheduler = SkipListScheduler::new(vec![(0, 0), (1, 0)]);
+        let bytes = e
+            .encode_frame_with_scheduler(
+                &[],
+                vec![sample_quant()],
+                vec![sample_tile(0, 0), sample_tile(1, 0)],
+                &mut scheduler,
+            )
+            .unwrap();
+        let (fb, region, tileset, _fe) = parse_frame(&bytes);
+        // All four envelope blocks (handshake + frame begin/region/end)
+        // are still emitted even with zero tiles.
+        assert_eq!(fb.frame_idx, 0);
+        assert_eq!(region.rects.len(), 0);
+        assert_eq!(tileset.tiles.len(), 0);
+    }
+
+    #[test]
+    fn scheduler_receives_current_frame_id() {
+        let mut e = RfxFrameEncoder::new(800, 600, RlgrMode::Rlgr3).unwrap();
+        // Burn a frame to advance the counter.
+        e.encode_frame(&[], vec![], vec![]).unwrap();
+        assert_eq!(e.next_frame_id(), 1);
+        let mut scheduler = SkipListScheduler::new(vec![]);
+        e.encode_frame_with_scheduler(
+            &[],
+            vec![sample_quant()],
+            vec![sample_tile(0, 0), sample_tile(1, 0)],
+            &mut scheduler,
+        )
+        .unwrap();
+        // Both tile-quality calls saw frame_id == 1.
+        assert_eq!(scheduler.observed_frame_ids, vec![1, 1]);
+    }
+
+    #[test]
+    fn encode_frame_routes_through_full_quality_scheduler() {
+        // The `encode_frame` convenience MUST behave identically to
+        // `encode_frame_with_scheduler(.., FullQualityScheduler)`.
+        let mut e1 = RfxFrameEncoder::new(800, 600, RlgrMode::Rlgr3).unwrap();
+        let mut e2 = RfxFrameEncoder::new(800, 600, RlgrMode::Rlgr3).unwrap();
+        let tiles = vec![sample_tile(0, 0), sample_tile(1, 1)];
+        let a = e1
+            .encode_frame(&[], vec![sample_quant()], tiles.clone())
+            .unwrap();
+        let b = e2
+            .encode_frame_with_scheduler(
+                &[],
+                vec![sample_quant()],
+                tiles,
+                &mut FullQualityScheduler,
+            )
+            .unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
