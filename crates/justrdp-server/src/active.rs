@@ -7,8 +7,7 @@
 //! fast-path) and produces a stream of [`ActiveStageOutput`] events that
 //! the caller routes to display / input handlers and to the network.
 //!
-//! Scope of this commit (Commit 5 of §11.2a) is **slow-path control PDU
-//! dispatch only**:
+//! Scope after Commit 8:
 //!
 //! | `pduType2`              | Value | Behaviour                                         |
 //! |-------------------------|------:|---------------------------------------------------|
@@ -18,14 +17,12 @@
 //! | `Control(RequestCtrl)`  |  0x14 | emit `GrantedControl` reply (FreeRDP-style)       |
 //! | `Control(Detach)`       |  0x14 | emit [`ActiveStageOutput::ClientDetached`]        |
 //! | `Persistent Key List`   |  0x2B | silent consume with DoS-cap                       |
-//! | `Input` (slow-path)     |  0x1C | silent consume -- handled by Commit 8             |
+//! | `Input` (slow-path)     |  0x1C | dispatch each TS_INPUT_EVENT to input handler     |
 //! | other `pduType2`        |     ? | error                                             |
 //!
-//! Fast-path input PDUs and SVC channel data are accepted off the wire
-//! but currently dropped; they will be wired up in Commits 8 and 9
-//! respectively. The decode is permissive in this commit so the loopback
-//! integration test in Commit 10 can already exchange real Windows
-//! traffic without misclassifying frames.
+//! Fast-path input PDUs are decoded (header + each `FastPathInputEvent`)
+//! and dispatched to the input handler. SVC channel data is still
+//! silently dropped pending the SvcHandler trait in Commit 9.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -33,9 +30,10 @@ use alloc::vec::Vec;
 use justrdp_acceptor::AcceptanceResult;
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathInputHeader};
 use justrdp_pdu::rdp::finalization::{
-    ControlAction, ControlPdu, PersistentKeyListPdu, RefreshRectPdu, ShutdownDeniedPdu,
-    ShutdownRequestPdu, SuppressOutputPdu,
+    ControlAction, ControlPdu, InputEventPdu, InputEventType, PersistentKeyListPdu, RefreshRectPdu,
+    ShutdownDeniedPdu, ShutdownRequestPdu, SuppressOutputPdu,
 };
 use justrdp_pdu::rdp::headers::{
     ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
@@ -46,7 +44,66 @@ use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
 
 use crate::config::RdpServerConfig;
 use crate::error::{ServerError, ServerResult};
-use crate::handler::DisplayRect;
+use crate::handler::{DisplayRect, RdpServerInputHandler};
+
+// ── Slow-path keyboard flags (MS-RDPBCGR §2.2.8.1.1.3.1.1.1) ──
+
+const SLOW_PATH_KBDFLAGS_EXTENDED: u16 = 0x0100;
+const SLOW_PATH_KBDFLAGS_EXTENDED1: u16 = 0x0200;
+const SLOW_PATH_KBDFLAGS_RELEASE: u16 = 0x8000;
+
+// ── Fast-path keyboard flag bits (MS-RDPBCGR §2.2.8.1.2.2.1) ──
+//
+// Re-exported here as constants because the translation
+// `slow_path_kbd_flags_to_fast_path` needs them and the PDU crate does
+// not export them as named symbols (they live as inline literals in
+// the `event_flags & 0x1F` packing).
+
+const FASTPATH_INPUT_KBDFLAGS_RELEASE: u16 = 0x0001;
+const FASTPATH_INPUT_KBDFLAGS_EXTENDED: u16 = 0x0002;
+const FASTPATH_INPUT_KBDFLAGS_EXTENDED1: u16 = 0x0004;
+
+/// Wire size of a single slow-path TS_INPUT_EVENT record. All event
+/// types currently defined (Synchronize, ScanCode, Unicode, Mouse,
+/// ExtendedMouse) are 12 bytes total -- 6-byte header (`eventTime` u32
+/// + `messageType` u16) plus 6 bytes of event-specific data including
+/// any padding (MS-RDPBCGR §2.2.8.1.1.3.1.1).
+const SLOW_PATH_INPUT_EVENT_SIZE: usize = 12;
+
+/// Translate a slow-path TS_KEYBOARD_EVENT.keyboardFlags value
+/// (MS-RDPBCGR §2.2.8.1.1.3.1.1.1) to the fast-path
+/// `FASTPATH_INPUT_KBDFLAGS_*` bit layout (§2.2.8.1.2.2.1) so handlers
+/// see one representation regardless of input path. KBDFLAGS_DOWN is
+/// not represented in fast-path -- a key press is implied by the
+/// absence of `_RELEASE`.
+/// Map a raw `messageType` (u16) to the typed enum, falling back to
+/// `Err(())` for forward-compatibility values the server does not yet
+/// understand. The slow-path input dispatcher treats `Err(())` as
+/// "skip this event" rather than aborting the whole PDU.
+fn decode_slow_path_message_type(raw: u16) -> Result<InputEventType, ()> {
+    match raw {
+        0x0000 => Ok(InputEventType::Synchronize),
+        0x0004 => Ok(InputEventType::ScanCode),
+        0x0005 => Ok(InputEventType::Unicode),
+        0x8001 => Ok(InputEventType::Mouse),
+        0x8002 => Ok(InputEventType::ExtendedMouse),
+        _ => Err(()),
+    }
+}
+
+fn slow_path_kbd_flags_to_fast_path(slow: u16) -> u16 {
+    let mut out = 0u16;
+    if slow & SLOW_PATH_KBDFLAGS_RELEASE != 0 {
+        out |= FASTPATH_INPUT_KBDFLAGS_RELEASE;
+    }
+    if slow & SLOW_PATH_KBDFLAGS_EXTENDED != 0 {
+        out |= FASTPATH_INPUT_KBDFLAGS_EXTENDED;
+    }
+    if slow & SLOW_PATH_KBDFLAGS_EXTENDED1 != 0 {
+        out |= FASTPATH_INPUT_KBDFLAGS_EXTENDED1;
+    }
+    out
+}
 
 /// Maximum number of `PersistentKeyList` PDUs accepted in one session
 /// before the stage rejects further entries. Mirrors the DoS cap the
@@ -175,24 +232,34 @@ impl ServerActiveStage {
     /// `input` MUST be a complete TPKT frame or a complete fast-path
     /// frame -- the caller is responsible for having framed the bytes
     /// using the same `PduHint` machinery the acceptor uses.
-    pub fn process(&mut self, input: &[u8]) -> ServerResult<Vec<ActiveStageOutput>> {
+    ///
+    /// `input_handler` is invoked for each decoded input event (slow-
+    /// path or fast-path) before the function returns. Its callbacks
+    /// are infallible (per the trait contract) so they never abort
+    /// processing of a multi-event PDU mid-stream.
+    pub fn process(
+        &mut self,
+        input: &[u8],
+        input_handler: &mut dyn RdpServerInputHandler,
+    ) -> ServerResult<Vec<ActiveStageOutput>> {
         if input.is_empty() {
             return Err(ServerError::protocol("empty active-stage PDU"));
         }
         match input[0] {
-            TPKT_VERSION => self.process_slow_path(input),
+            TPKT_VERSION => self.process_slow_path(input, input_handler),
             // Fast-path action bits: 0x00 = FASTPATH_INPUT_ACTION_FASTPATH.
             // Anything else with the low two bits == 0 is also fast-path
             // (the upper 6 bits encode num_events / encryption flags).
-            // Commit 8 will decode these into trait calls; this commit
-            // silently drops them so the loopback test can ignore client
-            // input.
-            byte if (byte & 0x03) == 0x00 => Ok(Vec::new()),
+            byte if (byte & 0x03) == 0x00 => self.process_fast_path_input(input, input_handler),
             _ => Err(ServerError::protocol("unrecognised PDU framing byte")),
         }
     }
 
-    fn process_slow_path(&mut self, input: &[u8]) -> ServerResult<Vec<ActiveStageOutput>> {
+    fn process_slow_path(
+        &mut self,
+        input: &[u8],
+        input_handler: &mut dyn RdpServerInputHandler,
+    ) -> ServerResult<Vec<ActiveStageOutput>> {
         let mut cursor = ReadCursor::new(input);
         let _tpkt = TpktHeader::decode(&mut cursor)?;
         let _dt = DataTransfer::decode(&mut cursor)?;
@@ -205,7 +272,7 @@ impl ServerActiveStage {
         }
 
         if sdr.channel_id == self.io_channel_id {
-            self.process_io_channel(sdr.user_data)
+            self.process_io_channel(sdr.user_data, input_handler)
         } else if self.channel_ids.iter().any(|(_, id)| *id == sdr.channel_id) {
             // SVC data -- Commit 9 will dispatch to a registered handler.
             // Drop silently in this commit.
@@ -218,7 +285,11 @@ impl ServerActiveStage {
         }
     }
 
-    fn process_io_channel(&mut self, user_data: &[u8]) -> ServerResult<Vec<ActiveStageOutput>> {
+    fn process_io_channel(
+        &mut self,
+        user_data: &[u8],
+        input_handler: &mut dyn RdpServerInputHandler,
+    ) -> ServerResult<Vec<ActiveStageOutput>> {
         let mut cursor = ReadCursor::new(user_data);
         let sc_hdr = ShareControlHeader::decode(&mut cursor)?;
         if sc_hdr.pdu_type != ShareControlPduType::Data {
@@ -233,13 +304,14 @@ impl ServerActiveStage {
             ));
         }
         let body = cursor.peek_remaining();
-        self.dispatch_share_data(sd_hdr.pdu_type2, body)
+        self.dispatch_share_data(sd_hdr.pdu_type2, body, input_handler)
     }
 
     fn dispatch_share_data(
         &mut self,
         pdu_type2: ShareDataPduType,
         body: &[u8],
+        input_handler: &mut dyn RdpServerInputHandler,
     ) -> ServerResult<Vec<ActiveStageOutput>> {
         match pdu_type2 {
             ShareDataPduType::RefreshRect => self.handle_refresh_rect(body),
@@ -247,14 +319,137 @@ impl ServerActiveStage {
             ShareDataPduType::ShutdownRequest => self.handle_shutdown_request(body),
             ShareDataPduType::Control => self.handle_control(body),
             ShareDataPduType::PersistentKeyList => self.handle_persistent_key_list(body),
-            // Slow-path Input is theoretically possible (the spec does
-            // not forbid it post-finalization), but real Windows clients
-            // always use fast-path input. Drop silently for now -- the
-            // input dispatch lands in Commit 8.
-            ShareDataPduType::Input => Ok(Vec::new()),
+            ShareDataPduType::Input => self.handle_slow_path_input(body, input_handler),
             other => Err(ServerError::protocol_owned(alloc::format!(
                 "unexpected ShareData PDU type in active session: {other:?}"
             ))),
+        }
+    }
+
+    /// Decode a slow-path `TS_INPUT_PDU` (MS-RDPBCGR §2.2.8.1.1.3) and
+    /// dispatch each `TS_INPUT_EVENT` to the input handler. Real
+    /// Windows clients almost never use this path -- they prefer
+    /// fast-path -- but the spec permits it and the loopback test in
+    /// Commit 10 exercises it.
+    fn handle_slow_path_input(
+        &mut self,
+        body: &[u8],
+        input_handler: &mut dyn RdpServerInputHandler,
+    ) -> ServerResult<Vec<ActiveStageOutput>> {
+        let pdu = InputEventPdu::decode(&mut ReadCursor::new(body))?;
+        let expected_data_len = usize::from(pdu.num_events) * SLOW_PATH_INPUT_EVENT_SIZE;
+        if pdu.event_data.len() < expected_data_len {
+            return Err(ServerError::protocol(
+                "slow-path InputEventPdu.event_data shorter than num_events * 12 bytes",
+            ));
+        }
+        for event_idx in 0..pdu.num_events as usize {
+            let off = event_idx * SLOW_PATH_INPUT_EVENT_SIZE;
+            let chunk = &pdu.event_data[off..off + SLOW_PATH_INPUT_EVENT_SIZE];
+            let mut c = ReadCursor::new(chunk);
+            let _event_time = c.read_u32_le("TS_INPUT_EVENT::eventTime")?;
+            let raw_msg = c.read_u16_le("TS_INPUT_EVENT::messageType")?;
+            // Skip events with unrecognised messageType rather than
+            // erroring -- a forward-compatible client may emit a type
+            // we have not learned yet.
+            let Ok(msg) = decode_slow_path_message_type(raw_msg) else {
+                continue;
+            };
+            match msg {
+                InputEventType::Synchronize => {
+                    // toggleFlags is a u32 LE in the slow-path layout
+                    // but only the low byte carries meaningful state.
+                    let toggle = c.read_u32_le("TS_SYNCHRONIZE_EVENT::toggleFlags")?;
+                    input_handler.on_sync(toggle as u8);
+                }
+                InputEventType::ScanCode => {
+                    let kbd_flags = c.read_u16_le("TS_KEYBOARD_EVENT::keyboardFlags")?;
+                    let key_code = c.read_u16_le("TS_KEYBOARD_EVENT::keyCode")?;
+                    let _pad = c.read_u16_le("TS_KEYBOARD_EVENT::pad")?;
+                    let translated = slow_path_kbd_flags_to_fast_path(kbd_flags);
+                    input_handler.on_keyboard_scancode(translated, key_code as u8);
+                }
+                InputEventType::Unicode => {
+                    let kbd_flags = c.read_u16_le("TS_UNICODE_KEYBOARD_EVENT::keyboardFlags")?;
+                    let unicode = c.read_u16_le("TS_UNICODE_KEYBOARD_EVENT::unicodeCode")?;
+                    let _pad = c.read_u16_le("TS_UNICODE_KEYBOARD_EVENT::pad")?;
+                    let translated = slow_path_kbd_flags_to_fast_path(kbd_flags);
+                    input_handler.on_keyboard_unicode(translated, unicode);
+                }
+                InputEventType::Mouse => {
+                    let pf = c.read_u16_le("TS_POINTER_EVENT::pointerFlags")?;
+                    let x = c.read_u16_le("TS_POINTER_EVENT::xPos")?;
+                    let y = c.read_u16_le("TS_POINTER_EVENT::yPos")?;
+                    input_handler.on_mouse(pf, x, y);
+                }
+                InputEventType::ExtendedMouse => {
+                    let pf = c.read_u16_le("TS_POINTERX_EVENT::pointerFlags")?;
+                    let x = c.read_u16_le("TS_POINTERX_EVENT::xPos")?;
+                    let y = c.read_u16_le("TS_POINTERX_EVENT::yPos")?;
+                    input_handler.on_mouse_extended(pf, x, y);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Decode a fast-path input PDU (MS-RDPBCGR §2.2.8.1.2) and
+    /// dispatch each `FastPathInputEvent` to the input handler.
+    ///
+    /// The wire form has `num_events` (from the header) events
+    /// concatenated immediately after the length field; iteration
+    /// continues until either `num_events` events have been decoded or
+    /// the cursor is exhausted, whichever happens first.
+    fn process_fast_path_input(
+        &mut self,
+        input: &[u8],
+        input_handler: &mut dyn RdpServerInputHandler,
+    ) -> ServerResult<Vec<ActiveStageOutput>> {
+        let mut cursor = ReadCursor::new(input);
+        let header = FastPathInputHeader::decode(&mut cursor)?;
+        // The PDU may carry encryption flags we cannot honour without
+        // negotiated keys; fail loud rather than silently misinterpret.
+        if header.flags != 0 {
+            return Err(ServerError::protocol(
+                "encrypted fast-path input PDU received but no security context is active",
+            ));
+        }
+        let mut decoded = 0u8;
+        while decoded < header.num_events && cursor.remaining() > 0 {
+            let event = FastPathInputEvent::decode(&mut cursor)?;
+            self.dispatch_fast_path_event(event, input_handler);
+            decoded += 1;
+        }
+        Ok(Vec::new())
+    }
+
+    fn dispatch_fast_path_event(
+        &self,
+        event: FastPathInputEvent,
+        h: &mut dyn RdpServerInputHandler,
+    ) {
+        match event {
+            FastPathInputEvent::Scancode(e) => {
+                h.on_keyboard_scancode(u16::from(e.event_flags), e.key_code);
+            }
+            FastPathInputEvent::Unicode(e) => {
+                h.on_keyboard_unicode(u16::from(e.event_flags), e.unicode_code);
+            }
+            FastPathInputEvent::Mouse(e) => {
+                h.on_mouse(e.pointer_flags, e.x_pos, e.y_pos);
+            }
+            FastPathInputEvent::MouseX(e) => {
+                h.on_mouse_extended(e.pointer_flags, e.x_pos, e.y_pos);
+            }
+            FastPathInputEvent::RelativeMouse(e) => {
+                h.on_mouse_relative(u16::from(e.event_flags), e.x_delta, e.y_delta);
+            }
+            FastPathInputEvent::Sync(e) => {
+                h.on_sync(e.event_flags);
+            }
+            FastPathInputEvent::QoeTimestamp(e) => {
+                h.on_qoe_timestamp(e.timestamp);
+            }
         }
     }
 
@@ -411,10 +606,62 @@ impl ServerActiveStage {
 mod tests {
     use super::*;
     use alloc::string::ToString;
+    use core::cell::RefCell;
     use justrdp_acceptor::AcceptanceResult;
     use justrdp_core::EncodeResult;
+    use justrdp_pdu::rdp::fast_path::{
+        FastPathInputHeader, FastPathMouseEvent, FastPathScancodeEvent, FastPathSyncEvent,
+        FastPathUnicodeEvent, FASTPATH_INPUT_ACTION_FASTPATH,
+    };
     use justrdp_pdu::rdp::finalization::InclusiveRect;
     use justrdp_pdu::x224::{NegotiationRequestFlags, NegotiationResponseFlags, SecurityProtocol};
+
+    /// Minimal handler that drops every callback. Used by the
+    /// control-PDU dispatch tests that don't care about input events.
+    struct NoopHandler;
+    impl RdpServerInputHandler for NoopHandler {}
+
+    /// Recording handler -- captures every callback so the input
+    /// dispatch tests can assert on the exact sequence of events.
+    #[derive(Default)]
+    struct RecordingHandler {
+        events: RefCell<Vec<RecordedInput>>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum RecordedInput {
+        Scancode(u16, u8),
+        Unicode(u16, u16),
+        Mouse(u16, u16, u16),
+        MouseX(u16, u16, u16),
+        MouseRel(u16, i16, i16),
+        Sync(u8),
+        Qoe(u32),
+    }
+
+    impl RdpServerInputHandler for RecordingHandler {
+        fn on_keyboard_scancode(&mut self, flags: u16, key_code: u8) {
+            self.events.borrow_mut().push(RecordedInput::Scancode(flags, key_code));
+        }
+        fn on_keyboard_unicode(&mut self, flags: u16, unicode: u16) {
+            self.events.borrow_mut().push(RecordedInput::Unicode(flags, unicode));
+        }
+        fn on_mouse(&mut self, pf: u16, x: u16, y: u16) {
+            self.events.borrow_mut().push(RecordedInput::Mouse(pf, x, y));
+        }
+        fn on_mouse_extended(&mut self, pf: u16, x: u16, y: u16) {
+            self.events.borrow_mut().push(RecordedInput::MouseX(pf, x, y));
+        }
+        fn on_mouse_relative(&mut self, pf: u16, dx: i16, dy: i16) {
+            self.events.borrow_mut().push(RecordedInput::MouseRel(pf, dx, dy));
+        }
+        fn on_sync(&mut self, flags: u8) {
+            self.events.borrow_mut().push(RecordedInput::Sync(flags));
+        }
+        fn on_qoe_timestamp(&mut self, ts: u32) {
+            self.events.borrow_mut().push(RecordedInput::Qoe(ts));
+        }
+    }
 
     /// Build a minimally-populated AcceptanceResult so the active stage
     /// can be exercised without running the full handshake. All
@@ -499,26 +746,79 @@ mod tests {
     #[test]
     fn empty_input_errors() {
         let mut s = fake_stage();
-        assert!(s.process(&[]).is_err());
+        assert!(s.process(&[], &mut NoopHandler).is_err());
     }
 
     #[test]
     fn unrecognised_first_byte_errors() {
         let mut s = fake_stage();
         // 0x05 -> low bits 0b01, neither TPKT (0x03) nor fast-path (0x00)
-        let err = s.process(&[0x05, 0x00, 0x00, 0x00]).unwrap_err();
+        let err = s.process(&[0x05, 0x00, 0x00, 0x00], &mut NoopHandler).unwrap_err();
         let msg = alloc::format!("{err}");
         assert!(msg.contains("framing"), "got: {msg}");
     }
 
+    /// Build a fast-path input PDU carrying the supplied events. Used
+    /// by the input-dispatch tests below.
+    fn build_fast_path_input(events: Vec<FastPathInputEvent>) -> Vec<u8> {
+        let body_size: usize = events.iter().map(|e| e.size()).sum();
+        let provisional_total = 1 + 2 + body_size; // assume long-form length
+        let total = if provisional_total <= 0x7F { 2 + body_size } else { provisional_total };
+        let header = FastPathInputHeader {
+            action: FASTPATH_INPUT_ACTION_FASTPATH,
+            num_events: events.len() as u8,
+            flags: 0,
+            length: total as u16,
+        };
+        let mut buf = vec![0u8; header.size() + body_size];
+        let mut c = WriteCursor::new(&mut buf);
+        header.encode(&mut c).unwrap();
+        for e in events {
+            e.encode(&mut c).unwrap();
+        }
+        buf
+    }
+
     #[test]
-    fn fast_path_input_is_silently_consumed() {
-        // Commit 5 explicitly drops fast-path bytes; Commit 8 will
-        // replace this branch with proper input-event dispatch.
+    fn fast_path_scancode_dispatches_to_handler() {
         let mut s = fake_stage();
-        let bytes = [0x00u8, 0x05]; // action=0, length=5 (truncated, but parser doesn't reach it)
-        let out = s.process(&bytes).unwrap();
-        assert!(out.is_empty());
+        let mut h = RecordingHandler::default();
+        let pdu = build_fast_path_input(vec![FastPathInputEvent::Scancode(
+            FastPathScancodeEvent { event_flags: 0x01, key_code: 0x1E },
+        )]);
+        s.process(&pdu, &mut h).unwrap();
+        assert_eq!(
+            h.events.into_inner(),
+            vec![RecordedInput::Scancode(0x01, 0x1E)]
+        );
+    }
+
+    #[test]
+    fn fast_path_multi_event_pdu_dispatches_each_event() {
+        let mut s = fake_stage();
+        let mut h = RecordingHandler::default();
+        let pdu = build_fast_path_input(vec![
+            FastPathInputEvent::Mouse(FastPathMouseEvent {
+                event_flags: 0,
+                pointer_flags: 0x8000,
+                x_pos: 100,
+                y_pos: 200,
+            }),
+            FastPathInputEvent::Sync(FastPathSyncEvent { event_flags: 0x07 }),
+            FastPathInputEvent::Unicode(FastPathUnicodeEvent {
+                event_flags: 0,
+                unicode_code: 0x0041,
+            }),
+        ]);
+        s.process(&pdu, &mut h).unwrap();
+        assert_eq!(
+            h.events.into_inner(),
+            vec![
+                RecordedInput::Mouse(0x8000, 100, 200),
+                RecordedInput::Sync(0x07),
+                RecordedInput::Unicode(0, 0x0041),
+            ]
+        );
     }
 
     #[test]
@@ -531,7 +831,7 @@ mod tests {
             ],
         };
         let bytes = wrap_client_share_data(&s, ShareDataPduType::RefreshRect, &pdu);
-        let out = s.process(&bytes).unwrap();
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
         match out.as_slice() {
             [ActiveStageOutput::RefreshRect(areas)] => {
                 assert_eq!(areas.len(), 2);
@@ -559,7 +859,7 @@ mod tests {
             bottom: None,
         };
         let bytes = wrap_client_share_data(&s, ShareDataPduType::SuppressOutput, &pdu);
-        let out = s.process(&bytes).unwrap();
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
         match out.as_slice() {
             [ActiveStageOutput::SuppressOutput { suppress: true, area: None }] => {}
             other => panic!("expected SuppressOutput(true,None), got: {other:?}"),
@@ -580,7 +880,7 @@ mod tests {
             bottom: Some(599),
         };
         let bytes = wrap_client_share_data(&s, ShareDataPduType::SuppressOutput, &pdu);
-        let out = s.process(&bytes).unwrap();
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
         match out.as_slice() {
             [ActiveStageOutput::SuppressOutput {
                 suppress: false,
@@ -595,7 +895,7 @@ mod tests {
     fn shutdown_request_replies_denied_and_notifies() {
         let mut s = fake_stage();
         let bytes = wrap_client_share_data(&s, ShareDataPduType::ShutdownRequest, &ShutdownRequestPdu);
-        let out = s.process(&bytes).unwrap();
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
         assert_eq!(out.len(), 2);
         match &out[0] {
             ActiveStageOutput::SendBytes(b) => {
@@ -625,7 +925,7 @@ mod tests {
             control_id: 0,
         };
         let bytes = wrap_client_share_data(&s, ShareDataPduType::Control, &req);
-        let out = s.process(&bytes).unwrap();
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
         assert_eq!(out.len(), 1);
         match &out[0] {
             ActiveStageOutput::SendBytes(b) => {
@@ -656,7 +956,7 @@ mod tests {
             control_id: 0,
         };
         let bytes = wrap_client_share_data(&s, ShareDataPduType::Control, &req);
-        let out = s.process(&bytes).unwrap();
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
         assert!(matches!(out.as_slice(), [ActiveStageOutput::ClientDetached]));
     }
 
@@ -669,7 +969,7 @@ mod tests {
             control_id: 0,
         };
         let bytes = wrap_client_share_data(&s, ShareDataPduType::Control, &req);
-        assert!(s.process(&bytes).is_err());
+        assert!(s.process(&bytes, &mut NoopHandler).is_err());
     }
 
     #[test]
@@ -683,7 +983,7 @@ mod tests {
             keys: alloc::vec::Vec::new(),
         };
         let bytes = wrap_client_share_data(&s, ShareDataPduType::PersistentKeyList, &pdu);
-        let out = s.process(&bytes).unwrap();
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
         assert!(out.is_empty());
         assert_eq!(s.persist_keys_count(), 1);
     }
@@ -699,19 +999,80 @@ mod tests {
             keys: alloc::vec::Vec::new(),
         };
         let bytes = wrap_client_share_data(&s, ShareDataPduType::PersistentKeyList, &pdu);
-        assert!(s.process(&bytes).is_err());
+        assert!(s.process(&bytes, &mut NoopHandler).is_err());
     }
 
     #[test]
-    fn slow_path_input_dropped_silently() {
-        // Real Windows clients use fast-path; the slow-path branch
-        // exists for spec completeness. Commit 8 will route both into
-        // the InputHandler.
+    fn slow_path_input_scancode_dispatches_to_handler() {
         let mut s = fake_stage();
-        // Empty body suffices for the dispatch test.
-        let bytes = wrap_client_share_data(&s, ShareDataPduType::Input, &EmptyBody);
-        let out = s.process(&bytes).unwrap();
-        assert!(out.is_empty());
+        let mut h = RecordingHandler::default();
+        // Build TS_INPUT_PDU with one TS_KEYBOARD_EVENT (12 bytes total)
+        // KBDFLAGS_RELEASE = 0x8000 -> fast-path 0x01 after translation.
+        let mut event_data = vec![0u8; SLOW_PATH_INPUT_EVENT_SIZE];
+        let mut c = WriteCursor::new(&mut event_data);
+        c.write_u32_le(0x1234_5678, "eventTime").unwrap();
+        c.write_u16_le(0x0004, "messageType: ScanCode").unwrap();
+        c.write_u16_le(0x8000, "keyboardFlags: KBDFLAGS_RELEASE").unwrap();
+        c.write_u16_le(0x001E, "keyCode").unwrap();
+        c.write_u16_le(0x0000, "pad").unwrap();
+        let pdu = InputEventPdu {
+            num_events: 1,
+            event_data,
+        };
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::Input, &pdu);
+        s.process(&bytes, &mut h).unwrap();
+        // Slow-path KBDFLAGS_RELEASE (0x8000) must translate to
+        // fast-path FASTPATH_INPUT_KBDFLAGS_RELEASE (0x01).
+        assert_eq!(
+            h.events.into_inner(),
+            vec![RecordedInput::Scancode(0x01, 0x1E)]
+        );
+    }
+
+    #[test]
+    fn slow_path_input_unknown_message_type_skipped() {
+        let mut s = fake_stage();
+        let mut h = RecordingHandler::default();
+        // Two events: one valid mouse, one with unrecognised messageType.
+        let mut event_data = vec![0u8; SLOW_PATH_INPUT_EVENT_SIZE * 2];
+        {
+            let mut c = WriteCursor::new(&mut event_data);
+            // Event 1: unknown messageType 0xCAFE.
+            c.write_u32_le(0, "eventTime").unwrap();
+            c.write_u16_le(0xCAFE, "messageType: unknown").unwrap();
+            c.write_slice(&[0u8; 6], "padding").unwrap();
+            // Event 2: valid mouse.
+            c.write_u32_le(0, "eventTime").unwrap();
+            c.write_u16_le(0x8001, "messageType: Mouse").unwrap();
+            c.write_u16_le(0x0800, "pointerFlags: MOVE").unwrap();
+            c.write_u16_le(50, "xPos").unwrap();
+            c.write_u16_le(60, "yPos").unwrap();
+        }
+        let pdu = InputEventPdu {
+            num_events: 2,
+            event_data,
+        };
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::Input, &pdu);
+        s.process(&bytes, &mut h).unwrap();
+        // Only the second (valid) event reaches the handler.
+        assert_eq!(
+            h.events.into_inner(),
+            vec![RecordedInput::Mouse(0x0800, 50, 60)]
+        );
+    }
+
+    #[test]
+    fn fast_path_encrypted_pdu_rejected() {
+        // flags != 0 means the PDU expects a security context we don't
+        // have; the active stage MUST refuse rather than silently
+        // misinterpret the body.
+        let mut s = fake_stage();
+        let mut h = NoopHandler;
+        // FASTPATH_INPUT_ENCRYPTED is at bit 6 (value 0x40 in the byte
+        // when packed via (flags << 6)). Build the byte directly.
+        let header_byte = 0x00 | (0x01 << 6); // action=0, flags=ENCRYPTED
+        let bytes = [header_byte, 0x02];
+        assert!(s.process(&bytes, &mut h).is_err());
     }
 
     #[test]
@@ -720,7 +1081,7 @@ mod tests {
         // PlaySound (34 = 0x22) is server→client only; client emitting it
         // is malformed.
         let bytes = wrap_client_share_data(&s, ShareDataPduType::PlaySound, &EmptyBody);
-        assert!(s.process(&bytes).is_err());
+        assert!(s.process(&bytes, &mut NoopHandler).is_err());
     }
 
     #[test]
@@ -772,7 +1133,7 @@ mod tests {
             sdr.encode(&mut c).unwrap();
         }
         let _ = inner_bytes; // silence unused-variable lint
-        assert!(s.process(&buf).is_err());
+        assert!(s.process(&buf, &mut NoopHandler).is_err());
     }
 
     #[test]
@@ -796,7 +1157,7 @@ mod tests {
             DataTransfer.encode(&mut c).unwrap();
             sdr.encode(&mut c).unwrap();
         }
-        let out = s.process(&buf).unwrap();
+        let out = s.process(&buf, &mut NoopHandler).unwrap();
         assert!(out.is_empty());
     }
 
