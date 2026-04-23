@@ -30,6 +30,9 @@ use justrdp_pdu::rdp::pointer::{
     TsCachedPointerAttribute, TsColorPointerAttribute, TsPoint16, TsPointerAttribute,
     and_mask_row_stride, validate_color_pointer_dimensions, xor_mask_row_stride,
 };
+use justrdp_pdu::rdp::surface_commands::{
+    BitmapDataEx, FrameMarkerCmd, SetSurfaceBitsCmd,
+};
 use justrdp_pdu::rdp::svc::{
     ChannelPduHeader, CHANNEL_FLAG_FIRST, CHANNEL_FLAG_LAST, CHANNEL_PDU_HEADER_SIZE,
 };
@@ -39,7 +42,9 @@ use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
 use crate::active::ServerActiveStage;
 use crate::config::RdpServerConfig;
 use crate::error::{ServerError, ServerResult};
-use crate::handler::{BitmapUpdate, DisplayUpdate, PointerColorUpdate, PointerNewUpdate};
+use crate::handler::{
+    BitmapUpdate, DisplayUpdate, PointerColorUpdate, PointerNewUpdate, SurfaceBitsUpdate,
+};
 
 /// Stream priority on outbound `ShareDataHeader.streamId`.
 /// `STREAM_LOW = 1` matches what acceptor finalization emits.
@@ -415,6 +420,103 @@ fn chunk_into_fast_path_frames(
         offset = end;
     }
     Ok(frames)
+}
+
+/// Encode a surface-bits update as one or more fast-path
+/// `SurfaceCommands` PDU frames.
+///
+/// Builds a single `TS_SURFCMD_SET_SURF_BITS` (MS-RDPBCGR §2.2.9.2.1)
+/// from `update`, wraps it in a `TS_BITMAP_DATA_EX` (§2.2.9.2.1.1) and
+/// emits the bytes through `chunk_into_fast_path_frames` so that
+/// payloads exceeding `config.max_bitmap_fragment_size` are split with
+/// `Fragmentation::First`/`Next`/`Last` per §2.2.9.1.2.1.
+///
+/// `width`/`height` from `SurfaceBitsUpdate` are authoritative; the
+/// wire `destRight` / `destBottom` are written as `dest_left + width`
+/// / `dest_top + height` (exclusive bounds per spec Remarks).
+pub fn encode_surface_bits_update(
+    config: &RdpServerConfig,
+    update: &SurfaceBitsUpdate,
+) -> ServerResult<Vec<Vec<u8>>> {
+    if update.width == 0 || update.height == 0 {
+        return Err(ServerError::protocol(
+            "SurfaceBitsUpdate width/height must be non-zero",
+        ));
+    }
+    if update.bitmap_data.len() > u32::MAX as usize {
+        return Err(ServerError::protocol(
+            "SurfaceBitsUpdate.bitmap_data length exceeds u32::MAX",
+        ));
+    }
+
+    let dest_right = update
+        .dest_left
+        .checked_add(update.width)
+        .ok_or_else(|| {
+            ServerError::protocol("SurfaceBitsUpdate destLeft+width overflows u16")
+        })?;
+    let dest_bottom = update
+        .dest_top
+        .checked_add(update.height)
+        .ok_or_else(|| {
+            ServerError::protocol("SurfaceBitsUpdate destTop+height overflows u16")
+        })?;
+
+    let cmd = SetSurfaceBitsCmd {
+        dest_left: update.dest_left,
+        dest_top: update.dest_top,
+        dest_right,
+        dest_bottom,
+        bitmap_data: BitmapDataEx {
+            bpp: update.bpp,
+            codec_id: update.codec_id,
+            width: update.width,
+            height: update.height,
+            ex_header: update.ex_header,
+            bitmap_data: update.bitmap_data.clone(),
+        },
+    };
+
+    // Serialise the single TS_SURFCMD into the inner SURFCMDS payload
+    // bytes. The fast-path container is just a raw concatenation of
+    // TS_SURFCMD structures with no count prefix
+    // (MS-RDPBCGR §2.2.9.1.2.1.10).
+    let mut inner_payload = vec![0u8; cmd.size()];
+    {
+        let mut c = WriteCursor::new(&mut inner_payload);
+        cmd.encode(&mut c)?;
+    }
+
+    chunk_into_fast_path_frames(
+        FastPathUpdateType::SurfaceCommands,
+        &inner_payload,
+        config.max_bitmap_fragment_size,
+    )
+}
+
+/// Encode a single `TS_FRAME_MARKER` (MS-RDPBCGR §2.2.9.2.3) wrapped
+/// in a fast-path `SurfaceCommands` update PDU.
+///
+/// `begin == true` emits `SURFACECMD_FRAMEACTION_BEGIN`, `false` emits
+/// `_END`. The payload is always 8 bytes (`cmdType + frameAction +
+/// frameId`) plus the 3-byte fast-path overhead, so the result is
+/// always a single un-fragmented PDU regardless of `frame_id` value.
+pub fn encode_frame_marker(begin: bool, frame_id: u32) -> ServerResult<Vec<u8>> {
+    let cmd = if begin {
+        FrameMarkerCmd::begin(frame_id)
+    } else {
+        FrameMarkerCmd::end(frame_id)
+    };
+    let mut inner_payload = vec![0u8; cmd.size()];
+    {
+        let mut c = WriteCursor::new(&mut inner_payload);
+        cmd.encode(&mut c)?;
+    }
+    encode_one_fast_path_pdu(
+        FastPathUpdateType::SurfaceCommands,
+        Fragmentation::Single,
+        &inner_payload,
+    )
 }
 
 /// Encode a fast-path pointer update (any of the
@@ -995,5 +1097,241 @@ mod tests {
         assert_eq!(r.width, 7);
         assert_eq!(r.height, 4);
         assert_eq!(r.bitmap_data.len(), 32);
+    }
+
+    // ── SURFCMDS encoder tests ────────────────────────────────────
+
+    use justrdp_pdu::rdp::surface_commands::{
+        CompressedBitmapHeaderEx, FrameMarkerCmd, SetSurfaceBitsCmd, SurfaceCommand,
+        SURFACECMD_FRAMEACTION_BEGIN, SURFACECMD_FRAMEACTION_END,
+    };
+
+    /// Reassemble fast-path frames carrying SURFCMDS into the inner
+    /// payload bytes (a concatenated `TS_SURFCMD` stream).
+    fn reassemble_surfcmds(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for frame in frames {
+            let mut c = ReadCursor::new(frame);
+            let _hdr = FastPathOutputHeader::decode(&mut c).unwrap();
+            let upd = FastPathOutputUpdate::decode(&mut c).unwrap();
+            assert_eq!(upd.update_code, FastPathUpdateType::SurfaceCommands);
+            payload.extend_from_slice(&upd.update_data);
+        }
+        payload
+    }
+
+    fn sample_surface_bits(width: u16, height: u16, payload_len: usize) -> SurfaceBitsUpdate {
+        SurfaceBitsUpdate {
+            dest_left: 100,
+            dest_top: 200,
+            width,
+            height,
+            bpp: 32,
+            codec_id: 0,
+            bitmap_data: vec![0xCD; payload_len],
+            ex_header: None,
+        }
+    }
+
+    #[test]
+    fn frame_marker_begin_emits_single_pdu() {
+        let frame = encode_frame_marker(true, 0).unwrap();
+        let mut c = ReadCursor::new(&frame);
+        let hdr = FastPathOutputHeader::decode(&mut c).unwrap();
+        assert_eq!(hdr.length as usize, frame.len());
+        let upd = FastPathOutputUpdate::decode(&mut c).unwrap();
+        assert_eq!(upd.update_code, FastPathUpdateType::SurfaceCommands);
+        assert!(matches!(upd.fragmentation, Fragmentation::Single));
+        let mut payload_cur = ReadCursor::new(&upd.update_data);
+        let cmd = FrameMarkerCmd::decode(&mut payload_cur).unwrap();
+        assert_eq!(cmd.frame_action, SURFACECMD_FRAMEACTION_BEGIN);
+        assert_eq!(cmd.frame_id, 0);
+    }
+
+    #[test]
+    fn frame_marker_end_max_frame_id_roundtrip() {
+        let frame = encode_frame_marker(false, u32::MAX).unwrap();
+        let mut c = ReadCursor::new(&frame);
+        let _ = FastPathOutputHeader::decode(&mut c).unwrap();
+        let upd = FastPathOutputUpdate::decode(&mut c).unwrap();
+        let mut payload_cur = ReadCursor::new(&upd.update_data);
+        let cmd = FrameMarkerCmd::decode(&mut payload_cur).unwrap();
+        assert_eq!(cmd.frame_action, SURFACECMD_FRAMEACTION_END);
+        assert_eq!(cmd.frame_id, u32::MAX);
+    }
+
+    #[test]
+    fn frame_marker_via_dispatch_enum_decodes() {
+        let frame = encode_frame_marker(true, 7).unwrap();
+        let payload = reassemble_surfcmds(&[frame]);
+        let mut c = ReadCursor::new(&payload);
+        match SurfaceCommand::decode(&mut c).unwrap() {
+            SurfaceCommand::FrameMarker(m) => {
+                assert_eq!(m.frame_action, SURFACECMD_FRAMEACTION_BEGIN);
+                assert_eq!(m.frame_id, 7);
+            }
+            other => panic!("expected FrameMarker variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surface_bits_small_payload_single_frame() {
+        let cfg = config(16_364);
+        let upd = sample_surface_bits(8, 8, 256);
+        let frames = encode_surface_bits_update(&cfg, &upd).unwrap();
+        assert_eq!(frames.len(), 1);
+        let mut c = ReadCursor::new(&frames[0]);
+        let hdr = FastPathOutputHeader::decode(&mut c).unwrap();
+        assert_eq!(hdr.length as usize, frames[0].len());
+        let fp_upd = FastPathOutputUpdate::decode(&mut c).unwrap();
+        assert_eq!(fp_upd.update_code, FastPathUpdateType::SurfaceCommands);
+        assert!(matches!(fp_upd.fragmentation, Fragmentation::Single));
+        let payload = reassemble_surfcmds(&frames);
+        let mut p = ReadCursor::new(&payload);
+        let cmd = SetSurfaceBitsCmd::decode(&mut p).unwrap();
+        assert_eq!(cmd.dest_left, 100);
+        assert_eq!(cmd.dest_top, 200);
+        // destRight / destBottom are exclusive: dest_left + width.
+        assert_eq!(cmd.dest_right, 108);
+        assert_eq!(cmd.dest_bottom, 208);
+        assert_eq!(cmd.bitmap_data.width, 8);
+        assert_eq!(cmd.bitmap_data.height, 8);
+        assert_eq!(cmd.bitmap_data.bpp, 32);
+        assert_eq!(cmd.bitmap_data.codec_id, 0);
+        assert_eq!(cmd.bitmap_data.bitmap_data.len(), 256);
+        assert!(cmd.bitmap_data.ex_header.is_none());
+    }
+
+    #[test]
+    fn surface_bits_with_ex_header_roundtrip() {
+        let cfg = config(16_364);
+        let mut upd = sample_surface_bits(4, 4, 64);
+        upd.ex_header = Some(CompressedBitmapHeaderEx {
+            high_unique_id: 0xDEADBEEF,
+            low_unique_id: 0xCAFEBABE,
+            tm_milliseconds: 999,
+            tm_seconds: 8888,
+        });
+        let frames = encode_surface_bits_update(&cfg, &upd).unwrap();
+        let payload = reassemble_surfcmds(&frames);
+        let mut p = ReadCursor::new(&payload);
+        let cmd = SetSurfaceBitsCmd::decode(&mut p).unwrap();
+        let ex = cmd.bitmap_data.ex_header.expect("ex_header preserved");
+        assert_eq!(ex.high_unique_id, 0xDEADBEEF);
+        assert_eq!(ex.low_unique_id, 0xCAFEBABE);
+        assert_eq!(ex.tm_milliseconds, 999);
+        assert_eq!(ex.tm_seconds, 8888);
+    }
+
+    #[test]
+    fn surface_bits_zero_length_payload_accepted() {
+        let cfg = config(16_364);
+        let upd = sample_surface_bits(1, 1, 0);
+        let frames = encode_surface_bits_update(&cfg, &upd).unwrap();
+        let payload = reassemble_surfcmds(&frames);
+        let mut p = ReadCursor::new(&payload);
+        let cmd = SetSurfaceBitsCmd::decode(&mut p).unwrap();
+        assert!(cmd.bitmap_data.bitmap_data.is_empty());
+    }
+
+    #[test]
+    fn surface_bits_zero_dimensions_rejected() {
+        let cfg = config(16_364);
+        let mut upd = sample_surface_bits(8, 8, 256);
+        upd.width = 0;
+        assert!(encode_surface_bits_update(&cfg, &upd).is_err());
+        upd.width = 8;
+        upd.height = 0;
+        assert!(encode_surface_bits_update(&cfg, &upd).is_err());
+    }
+
+    #[test]
+    fn surface_bits_dest_overflow_rejected() {
+        let cfg = config(16_364);
+        let mut upd = sample_surface_bits(8, 8, 256);
+        upd.dest_left = u16::MAX;
+        upd.width = 2; // u16::MAX + 2 overflows
+        assert!(encode_surface_bits_update(&cfg, &upd).is_err());
+    }
+
+    #[test]
+    fn surface_bits_large_payload_fragments() {
+        // 1024-byte chunk limit forces splitting; payload comfortably
+        // exceeds it. Each fragment carries SURFCMDS bytes; reassembled
+        // bytes MUST decode as a single SetSurfaceBitsCmd identical to
+        // the input.
+        let cfg = config(1_024);
+        let upd = SurfaceBitsUpdate {
+            dest_left: 50,
+            dest_top: 60,
+            width: 32,
+            height: 32,
+            bpp: 32,
+            codec_id: 0,
+            bitmap_data: (0..4096).map(|i| (i & 0xFF) as u8).collect(),
+            ex_header: None,
+        };
+        let frames = encode_surface_bits_update(&cfg, &upd).unwrap();
+        assert!(
+            frames.len() > 1,
+            "expected fragmentation, got {} frames",
+            frames.len()
+        );
+        // Verify First / Next* / Last fragmentation tags.
+        let mut tags = Vec::new();
+        for f in &frames {
+            let mut c = ReadCursor::new(f);
+            let hdr = FastPathOutputHeader::decode(&mut c).unwrap();
+            assert_eq!(hdr.length as usize, f.len());
+            let fp = FastPathOutputUpdate::decode(&mut c).unwrap();
+            assert_eq!(fp.update_code, FastPathUpdateType::SurfaceCommands);
+            tags.push(fp.fragmentation);
+        }
+        assert!(matches!(tags.first(), Some(Fragmentation::First)));
+        assert!(matches!(tags.last(), Some(Fragmentation::Last)));
+        for tag in &tags[1..tags.len() - 1] {
+            assert!(matches!(tag, Fragmentation::Next));
+        }
+        // Reassemble and decode round-trips back to the input.
+        let payload = reassemble_surfcmds(&frames);
+        let mut p = ReadCursor::new(&payload);
+        let cmd = SetSurfaceBitsCmd::decode(&mut p).unwrap();
+        assert_eq!(cmd.bitmap_data.bitmap_data, upd.bitmap_data);
+        assert_eq!(cmd.bitmap_data.width, upd.width);
+        assert_eq!(cmd.bitmap_data.height, upd.height);
+    }
+
+    #[test]
+    fn surface_bits_chunk_limit_exact_boundary_single_frame() {
+        // Compute the exact inner SURFCMDS payload size for a small
+        // SetSurfaceBits and use that as the chunk limit so the payload
+        // fits in exactly one frame with Fragmentation::Single.
+        let upd = sample_surface_bits(2, 2, 16);
+        let inner_size = TS_SURFCMD_SURF_BITS_HEADER_SIZE_LOCAL
+            + TS_BITMAP_DATA_EX_FIXED_SIZE_LOCAL
+            + 16;
+        let cfg = config(inner_size);
+        let frames = encode_surface_bits_update(&cfg, &upd).unwrap();
+        assert_eq!(frames.len(), 1);
+        let mut c = ReadCursor::new(&frames[0]);
+        let _ = FastPathOutputHeader::decode(&mut c).unwrap();
+        let fp = FastPathOutputUpdate::decode(&mut c).unwrap();
+        assert!(matches!(fp.fragmentation, Fragmentation::Single));
+    }
+
+    // Local mirrors of the surface_commands constants used in the
+    // boundary test above; pulling them in as named consts keeps the
+    // arithmetic readable while documenting which spec sections feed it.
+    const TS_SURFCMD_SURF_BITS_HEADER_SIZE_LOCAL: usize = 10; // §2.2.9.2.1
+    const TS_BITMAP_DATA_EX_FIXED_SIZE_LOCAL: usize = 12; // §2.2.9.2.1.1
+
+    #[test]
+    fn frame_marker_size_matches_pdu_length_field() {
+        for begin in [true, false] {
+            let frame = encode_frame_marker(begin, 12345).unwrap();
+            let mut c = ReadCursor::new(&frame);
+            let hdr = FastPathOutputHeader::decode(&mut c).unwrap();
+            assert_eq!(hdr.length as usize, frame.len());
+        }
     }
 }

@@ -2360,17 +2360,17 @@ uncompressed bitmap fast-path, 입력/종료/SVC opaque forward까지. RFX/EGFX
 경로. 코덱 페이로드는 b-2/b-3 에서 채우되, **컨테이너 PDU 와 fast-path
 인코더 + DisplayHandler seam 만 먼저 안착**.
 
-- [ ] `SetSurfaceBitsCommand` PDU (MS-RDPBCGR 2.2.9.2.1) -- destLeft/Top/
+- [x] `SetSurfaceBitsCommand` PDU (MS-RDPBCGR 2.2.9.2.1) -- destLeft/Top/
       Right/Bottom + `TS_BITMAP_DATA_EX` 페이로드 컨테이너
-- [ ] `StreamSurfaceBitsCommand` PDU (MS-RDPBCGR 2.2.9.2.2)
-- [ ] `FrameMarkerCommand` PDU (MS-RDPBCGR 2.2.9.2.3) -- Begin/End
+- [x] `StreamSurfaceBitsCommand` PDU (MS-RDPBCGR 2.2.9.2.2)
+- [x] `FrameMarkerCommand` PDU (MS-RDPBCGR 2.2.9.2.3) -- Begin/End
       frameId
-- [ ] Fast-path `SurfaceCommands` 업데이트 인코더 (`encode_fast_path` +
+- [x] Fast-path `SurfaceCommands` 업데이트 인코더 (`encode_fast_path` +
       fragmentation, 15-bit 길이 캡)
-- [ ] `DisplayUpdate::SurfaceBits { dest, bitmap_data_ex }` +
+- [x] `DisplayUpdate::SurfaceBits(SurfaceBitsUpdate)` +
       `DisplayUpdate::FrameMarker { begin, frame_id }` 추가
-- [ ] `RdpServerDisplayHandler::get_surface_update()` seam
-- [ ] PDU roundtrip + fast-path frame 인코더 단위 테스트
+- [x] `RdpServerDisplayHandler::get_surface_update()` seam
+- [x] PDU roundtrip + fast-path frame 인코더 단위 테스트
 
 ##### 11.2b-2 -- RFX Wire-Level Framing & Server Encoder
 
