@@ -30,8 +30,9 @@ pub use config::{
 pub use error::{ServerConfigError, ServerError, ServerErrorKind, ServerResult};
 pub use handler::{
     BitmapUpdate, DisplayRect, DisplayUpdate, PointerColorUpdate, PointerNewUpdate,
-    RdpServerDisplayHandler, RdpServerInputHandler,
+    RdpServerDisplayHandler, RdpServerInputHandler, SurfaceBitsUpdate,
 };
+pub use justrdp_pdu::rdp::surface_commands::CompressedBitmapHeaderEx;
 pub use active::{ActiveStageOutput, ServerActiveStage};
 pub use justrdp_pdu::mcs::DisconnectReason;
 pub use justrdp_pdu::rdp::error_info::ErrorInfoCode;

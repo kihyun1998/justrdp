@@ -426,9 +426,9 @@ fn chunk_into_fast_path_frames(
 /// (~37 KiB) which still sits well below the 15-bit length cap. The
 /// encoder therefore emits only `Fragmentation::Single` frames.
 ///
-/// Non-pointer variants (`Bitmap`, `Palette`, `Reset`) MUST be routed
-/// to their own encoders; this function returns
-/// `ServerError::protocol(...)` for them.
+/// Non-pointer variants (`Bitmap`, `Palette`, `Reset`, `SurfaceBits`,
+/// `FrameMarker`) MUST be routed to their own encoders; this function
+/// returns `ServerError::protocol(...)` for them.
 pub fn encode_pointer_update(update: &DisplayUpdate) -> ServerResult<Vec<u8>> {
     match update {
         DisplayUpdate::PointerPosition(p) => {
@@ -441,11 +441,13 @@ pub fn encode_pointer_update(update: &DisplayUpdate) -> ServerResult<Vec<u8>> {
         }
         DisplayUpdate::PointerColor(c) => encode_pointer_color(c),
         DisplayUpdate::PointerNew(n) => encode_pointer_new(n),
-        DisplayUpdate::Bitmap(_) | DisplayUpdate::Palette(_) | DisplayUpdate::Reset { .. } => {
-            Err(ServerError::protocol(
-                "encode_pointer_update called on a non-pointer DisplayUpdate variant",
-            ))
-        }
+        DisplayUpdate::Bitmap(_)
+        | DisplayUpdate::Palette(_)
+        | DisplayUpdate::Reset { .. }
+        | DisplayUpdate::SurfaceBits(_)
+        | DisplayUpdate::FrameMarker { .. } => Err(ServerError::protocol(
+            "encode_pointer_update called on a non-pointer DisplayUpdate variant",
+        )),
     }
 }
 

@@ -13,6 +13,7 @@
 use alloc::vec::Vec;
 
 use justrdp_pdu::rdp::pointer::TsPoint16;
+use justrdp_pdu::rdp::surface_commands::CompressedBitmapHeaderEx;
 
 // ── Display update enum ──────────────────────────────────────────────
 
@@ -30,6 +31,8 @@ use justrdp_pdu::rdp::pointer::TsPoint16;
 /// | `PointerColor`     | `FASTPATH_UPDATETYPE_PTR_COLOR (0x9)`    | `TS_COLORPOINTERATTRIBUTE`                          |
 /// | `PointerNew`       | `FASTPATH_UPDATETYPE_PTR_NEW (0xB)`      | `TS_POINTERATTRIBUTE`                               |
 /// | `PointerCached`    | `FASTPATH_UPDATETYPE_PTR_CACHED (0xA)`   | `TS_CACHEDPOINTERATTRIBUTE.cacheIndex`              |
+/// | `SurfaceBits`      | `FASTPATH_UPDATETYPE_SURFCMDS (0x4)`     | `TS_SURFCMD_SET_SURF_BITS` + `TS_BITMAP_DATA_EX`   |
+/// | `FrameMarker`      | `FASTPATH_UPDATETYPE_SURFCMDS (0x4)`     | `TS_FRAME_MARKER` (begin/end + frameId)            |
 /// | `Reset`            | (Deactivation-Reactivation, §11.2b)      | new `(width, height)` -- triggers DAS in 11.2b     |
 ///
 /// The variants are kept lean so the application doesn't have to allocate
@@ -63,6 +66,19 @@ pub enum DisplayUpdate {
     /// are the only ones that emit this; 16/24/32-bpp sessions can leave
     /// the variant unused.
     Palette(Vec<u8>),
+    /// `TS_SURFCMD_SET_SURF_BITS` (MS-RDPBCGR §2.2.9.2.1) wrapped in a
+    /// fast-path `SurfaceCommands` update. The application supplies the
+    /// destination origin, codec id, decoded dimensions, and pre-encoded
+    /// payload bytes; the active stage builds the `TS_BITMAP_DATA_EX`
+    /// container and fragments the resulting fast-path PDU as needed.
+    /// `codec_id == 0` ⇒ uncompressed payload (no codec transform).
+    SurfaceBits(SurfaceBitsUpdate),
+    /// `TS_FRAME_MARKER` (MS-RDPBCGR §2.2.9.2.3) wrapped in a fast-path
+    /// `SurfaceCommands` update. `begin == true` emits
+    /// `SURFACECMD_FRAMEACTION_BEGIN`, `false` emits `_END`. Frame markers
+    /// always fit in a single un-fragmented fast-path PDU (8 bytes of
+    /// payload).
+    FrameMarker { begin: bool, frame_id: u32 },
     /// Display dimensions changed and the session needs a
     /// Deactivation-Reactivation Sequence. The active stage may emit
     /// `Deactivate All` and re-drive Demand Active in §11.2b; for the
@@ -111,6 +127,45 @@ pub struct PointerColorUpdate {
     pub and_mask_data: Vec<u8>,
 }
 
+/// Surface bits update payload (`TS_SURFCMD_SET_SURF_BITS` body).
+///
+/// The application supplies pre-encoded bytes (raw uncompressed pixels
+/// when `codec_id == 0`, or a codec-encoded bitstream from §11.2b-2/b-3
+/// otherwise). `width`/`height` are the **decoded** image dimensions
+/// and are authoritative on the wire (the active stage computes
+/// `destRight = dest_left + width` and `destBottom = dest_top + height`
+/// per MS-RDPBCGR §2.2.9.2.1 Remarks).
+///
+/// `ex_header` carries the optional `TS_COMPRESSED_BITMAP_HEADER_EX`
+/// (MS-RDPBCGR §2.2.9.2.1.1.1) used by clients that cache decoded
+/// frames. Most callers leave it `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceBitsUpdate {
+    /// Inclusive left bound of the destination rectangle (screen pixels).
+    pub dest_left: u16,
+    /// Inclusive top bound.
+    pub dest_top: u16,
+    /// Decoded image width in pixels (authoritative; determines wire
+    /// `destRight`).
+    pub width: u16,
+    /// Decoded image height in pixels (authoritative; determines wire
+    /// `destBottom`).
+    pub height: u16,
+    /// Bits per pixel of the **decoded** image.
+    pub bpp: u8,
+    /// Capability-negotiated codec id; `0x00` = uncompressed (no codec
+    /// transform), non-zero values reference codecs in
+    /// `BitmapCodecsCapability` (MS-RDPBCGR §2.2.7.2.10).
+    pub codec_id: u8,
+    /// Pre-encoded (or raw) payload bytes; length becomes the wire
+    /// `bitmapDataLength` u32 field.
+    pub bitmap_data: Vec<u8>,
+    /// Optional extended header. `Some(_)` causes
+    /// `EX_COMPRESSED_BITMAP_HEADER_PRESENT (0x01)` to be set in the
+    /// `TS_BITMAP_DATA_EX::flags` byte.
+    pub ex_header: Option<CompressedBitmapHeaderEx>,
+}
+
 /// New-style pointer cache entry (`TS_POINTERATTRIBUTE`,
 /// MS-RDPBCGR §2.2.9.1.1.4.5). `xor_bpp` may be 1, 4, 8, 16, 24, or 32;
 /// `width`/`height` are bounded by the negotiated `pointerCacheSize`
@@ -139,6 +194,23 @@ pub trait RdpServerDisplayHandler {
     /// `None` is the steady-state idle response and is fine to return
     /// every tick -- the active stage backs off transparently.
     fn get_display_update(&mut self) -> Option<DisplayUpdate>;
+
+    /// Pull the next surface-commands update (`SurfaceBits` /
+    /// `FrameMarker`) -- the SURFCMDS-channel counterpart to
+    /// [`get_display_update`](Self::get_display_update). The active
+    /// stage polls this hook after `get_display_update` returns `None`
+    /// each tick, so an application that doesn't use surface commands
+    /// can leave the default `None` implementation in place.
+    ///
+    /// Implementations MAY return any of the [`DisplayUpdate`] variants
+    /// from this hook -- the active stage routes by variant, not by
+    /// which method produced the update -- but in practice this seam
+    /// exists so that the GFX pipeline (§11.2b-2/b-3) can be wired up
+    /// independently of the basic bitmap path without churning
+    /// [`get_display_update`](Self::get_display_update)'s contract.
+    fn get_surface_update(&mut self) -> Option<DisplayUpdate> {
+        None
+    }
 
     /// Current desktop size as (`width`, `height`) in pixels. Used by
     /// the active stage during `Reset` and Deactivation-Reactivation
@@ -272,6 +344,85 @@ mod tests {
         let _ = DisplayUpdate::PointerCached { cache_index: 0 };
         let _ = DisplayUpdate::Reset { width: 1024, height: 768 };
         let _ = DisplayUpdate::Palette(vec![0u8; 768]);
+        let _ = DisplayUpdate::SurfaceBits(SurfaceBitsUpdate {
+            dest_left: 100,
+            dest_top: 200,
+            width: 64,
+            height: 64,
+            bpp: 32,
+            codec_id: 0,
+            bitmap_data: vec![0u8; 64 * 64 * 4],
+            ex_header: None,
+        });
+        let _ = DisplayUpdate::FrameMarker {
+            begin: true,
+            frame_id: 0xDEAD_BEEF,
+        };
+    }
+
+    #[test]
+    fn surface_bits_update_with_ex_header_constructible() {
+        let _ = DisplayUpdate::SurfaceBits(SurfaceBitsUpdate {
+            dest_left: 0,
+            dest_top: 0,
+            width: 1,
+            height: 1,
+            bpp: 32,
+            codec_id: 0x03,
+            bitmap_data: vec![0u8; 4],
+            ex_header: Some(CompressedBitmapHeaderEx {
+                high_unique_id: 0,
+                low_unique_id: 1,
+                tm_milliseconds: 0,
+                tm_seconds: 0,
+            }),
+        });
+    }
+
+    #[test]
+    fn display_handler_default_get_surface_update_returns_none() {
+        // A handler that does not opt in to surface commands MUST get
+        // the default `None` from the seam so the active stage can
+        // poll it unconditionally each tick.
+        let mut h = OneShotDisplay { update: None, size: (800, 600) };
+        assert!(h.get_surface_update().is_none());
+    }
+
+    /// Display handler that exposes only surface updates -- proves the
+    /// `get_surface_update` seam is independently overridable.
+    struct SurfaceOnlyDisplay {
+        next: Option<DisplayUpdate>,
+    }
+
+    impl RdpServerDisplayHandler for SurfaceOnlyDisplay {
+        fn get_display_update(&mut self) -> Option<DisplayUpdate> {
+            None
+        }
+        fn get_display_size(&self) -> (u16, u16) {
+            (1024, 768)
+        }
+        fn get_surface_update(&mut self) -> Option<DisplayUpdate> {
+            self.next.take()
+        }
+    }
+
+    #[test]
+    fn display_handler_get_surface_update_can_be_overridden() {
+        let mut h = SurfaceOnlyDisplay {
+            next: Some(DisplayUpdate::FrameMarker {
+                begin: true,
+                frame_id: 7,
+            }),
+        };
+        assert!(h.get_display_update().is_none());
+        match h.get_surface_update() {
+            Some(DisplayUpdate::FrameMarker { begin, frame_id }) => {
+                assert!(begin);
+                assert_eq!(frame_id, 7);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+        assert!(h.get_surface_update().is_none());
     }
 
     /// A handler that records callback invocations so tests in later
