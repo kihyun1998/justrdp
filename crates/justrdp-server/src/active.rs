@@ -21,8 +21,9 @@
 //! | other `pduType2`        |     ? | error                                             |
 //!
 //! Fast-path input PDUs are decoded (header + each `FastPathInputEvent`)
-//! and dispatched to the input handler. SVC channel data is still
-//! silently dropped pending the SvcHandler trait in Commit 9.
+//! and dispatched to the input handler. SVC channel data is reassembled
+//! across `CHANNEL_FLAG_FIRST` / `_LAST` chunks and surfaced as
+//! [`ActiveStageOutput::SvcData`].
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -38,6 +39,10 @@ use justrdp_pdu::rdp::finalization::{
 use justrdp_pdu::rdp::headers::{
     ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
     SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE,
+};
+use justrdp_pdu::rdp::svc::{
+    ChannelPduHeader, CHANNEL_FLAG_FIRST, CHANNEL_FLAG_LAST, CHANNEL_PACKET_COMPRESSED,
+    CHANNEL_PDU_HEADER_SIZE,
 };
 use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
@@ -155,6 +160,27 @@ pub enum ActiveStageOutput {
     /// The session is still alive but the client has released active
     /// control.
     ClientDetached,
+    /// Complete (potentially multi-chunk reassembled) SVC payload from
+    /// the client. The active stage performs the
+    /// `CHANNEL_FLAG_FIRST` / `CHANNEL_FLAG_LAST` reassembly and emits
+    /// the full message exactly once when the final chunk arrives.
+    SvcData {
+        /// MCS channel ID the data arrived on (matches one of the entries
+        /// in `ServerActiveStage::channel_ids()`).
+        channel_id: u16,
+        /// Reassembled payload (post-`ChannelPduHeader`).
+        payload: Vec<u8>,
+    },
+}
+
+/// Per-channel reassembly state for inbound SVC data.
+#[derive(Debug, Default)]
+struct SvcReassembly {
+    /// Total length declared in the FIRST chunk's `ChannelPduHeader.length`.
+    expected_total: u32,
+    /// Accumulated bytes; cleared when LAST is delivered or when a
+    /// fresh FIRST arrives.
+    buffer: Vec<u8>,
 }
 
 /// Server-side active session driver.
@@ -174,6 +200,9 @@ pub struct ServerActiveStage {
     /// PERSIST_BITMAP_KEYS PDUs received in the current session; capped
     /// to defend against a hostile client looping forever.
     persist_keys_count: u8,
+    /// Per-channel inbound SVC reassembly state. Linear search is fine
+    /// because the static-VC count is small (typically 1-3).
+    svc_reassembly: Vec<(u16, SvcReassembly)>,
 }
 
 impl ServerActiveStage {
@@ -187,6 +216,7 @@ impl ServerActiveStage {
             channel_ids: result.channel_ids,
             suppress_output: false,
             persist_keys_count: 0,
+            svc_reassembly: Vec::new(),
         }
     }
 
@@ -274,15 +304,203 @@ impl ServerActiveStage {
         if sdr.channel_id == self.io_channel_id {
             self.process_io_channel(sdr.user_data, input_handler)
         } else if self.channel_ids.iter().any(|(_, id)| *id == sdr.channel_id) {
-            // SVC data -- Commit 9 will dispatch to a registered handler.
-            // Drop silently in this commit.
-            let _ = sdr.channel_id;
-            Ok(Vec::new())
+            self.process_svc_inbound(sdr.channel_id, sdr.user_data)
         } else {
             Err(ServerError::protocol(
                 "SDR channel ID is neither the I/O channel nor any negotiated VC",
             ))
         }
+    }
+
+    /// Decode one chunk of inbound SVC traffic. The active stage owns
+    /// the per-channel reassembly buffer and emits a single
+    /// [`ActiveStageOutput::SvcData`] when the LAST chunk arrives.
+    fn process_svc_inbound(
+        &mut self,
+        channel_id: u16,
+        user_data: &[u8],
+    ) -> ServerResult<Vec<ActiveStageOutput>> {
+        let mut cursor = ReadCursor::new(user_data);
+        let header = ChannelPduHeader::decode(&mut cursor)?;
+        if header.flags & CHANNEL_PACKET_COMPRESSED != 0 {
+            return Err(ServerError::protocol(
+                "compressed SVC chunk received but bulk decompression \
+                 is not wired into the server skeleton",
+            ));
+        }
+        let chunk = cursor.peek_remaining();
+        let is_first = header.flags & CHANNEL_FLAG_FIRST != 0;
+        let is_last = header.flags & CHANNEL_FLAG_LAST != 0;
+
+        // Single-chunk fast path: FIRST and LAST set together. Skip the
+        // per-channel buffer entirely and emit straight away.
+        if is_first && is_last {
+            // Drop any stale partial buffer the client left behind.
+            self.svc_reassembly.retain(|(id, _)| *id != channel_id);
+            let total_len = header.length as usize;
+            if chunk.len() != total_len {
+                return Err(ServerError::protocol(
+                    "single-chunk SVC PDU body length disagrees with \
+                     ChannelPduHeader.length",
+                ));
+            }
+            return Ok(alloc::vec![ActiveStageOutput::SvcData {
+                channel_id,
+                payload: chunk.to_vec(),
+            }]);
+        }
+
+        // Multi-chunk path: locate or create the per-channel state.
+        let entry = if let Some(idx) = self
+            .svc_reassembly
+            .iter()
+            .position(|(id, _)| *id == channel_id)
+        {
+            &mut self.svc_reassembly[idx].1
+        } else {
+            self.svc_reassembly.push((channel_id, SvcReassembly::default()));
+            &mut self.svc_reassembly.last_mut().unwrap().1
+        };
+
+        if is_first {
+            entry.expected_total = header.length;
+            entry.buffer.clear();
+            entry.buffer.reserve(header.length as usize);
+        } else if entry.buffer.is_empty() {
+            return Err(ServerError::protocol(
+                "SVC continuation chunk received without a preceding \
+                 CHANNEL_FLAG_FIRST",
+            ));
+        } else if header.length != entry.expected_total {
+            return Err(ServerError::protocol(
+                "SVC continuation chunk reports a different total length \
+                 than the FIRST chunk",
+            ));
+        }
+
+        entry.buffer.extend_from_slice(chunk);
+        if entry.buffer.len() > entry.expected_total as usize {
+            return Err(ServerError::protocol(
+                "SVC reassembled buffer exceeds the FIRST chunk's declared total",
+            ));
+        }
+
+        if is_last {
+            if entry.buffer.len() != entry.expected_total as usize {
+                return Err(ServerError::protocol(
+                    "SVC LAST chunk arrived with reassembled length \
+                     different from the FIRST chunk's declared total",
+                ));
+            }
+            let payload = core::mem::take(&mut entry.buffer);
+            entry.expected_total = 0;
+            return Ok(alloc::vec![ActiveStageOutput::SvcData {
+                channel_id,
+                payload,
+            }]);
+        }
+        Ok(Vec::new())
+    }
+
+    /// Encode an outbound SVC payload as one or more wire-ready frames
+    /// (TPKT + X.224 DT + MCS SDI + ChannelPduHeader + chunk).
+    ///
+    /// Splits `payload` into chunks of at most
+    /// `config.channel_chunk_length` bytes per
+    /// [`MAX_CHANNEL_CHUNK_LENGTH`] (MS-RDPBCGR §2.2.7.1.10). The
+    /// `ChannelPduHeader.length` field carries the **total uncompressed
+    /// message length** in every chunk; `flags` carries
+    /// `CHANNEL_FLAG_FIRST` on the first chunk, `CHANNEL_FLAG_LAST` on
+    /// the last, both on a single-chunk message.
+    ///
+    /// `channel_id` MUST be a negotiated SVC channel; otherwise the
+    /// helper returns `ServerError::protocol(_)`.
+    ///
+    /// [`MAX_CHANNEL_CHUNK_LENGTH`]: crate::MAX_CHANNEL_CHUNK_LENGTH
+    pub fn encode_svc_send(
+        &self,
+        channel_id: u16,
+        payload: &[u8],
+    ) -> ServerResult<Vec<Vec<u8>>> {
+        if !self.channel_ids.iter().any(|(_, id)| *id == channel_id) {
+            return Err(ServerError::protocol(
+                "encode_svc_send target channel is not in the negotiated VC list",
+            ));
+        }
+        let total = payload.len();
+        if total > u32::MAX as usize {
+            return Err(ServerError::protocol(
+                "SVC payload exceeds u32 ChannelPduHeader.length",
+            ));
+        }
+        let chunk_size = self.config.channel_chunk_length;
+
+        if total == 0 {
+            // Empty messages still need to declare presence with a
+            // FIRST|LAST chunk carrying zero data bytes.
+            return Ok(alloc::vec![self.frame_one_svc_chunk(
+                channel_id,
+                CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST,
+                0,
+                &[],
+            )?]);
+        }
+
+        let mut frames = Vec::with_capacity(total.div_ceil(chunk_size));
+        let mut offset = 0usize;
+        while offset < total {
+            let end = (offset + chunk_size).min(total);
+            let mut flags = 0u32;
+            if offset == 0 {
+                flags |= CHANNEL_FLAG_FIRST;
+            }
+            if end == total {
+                flags |= CHANNEL_FLAG_LAST;
+            }
+            frames.push(self.frame_one_svc_chunk(
+                channel_id,
+                flags,
+                total as u32,
+                &payload[offset..end],
+            )?);
+            offset = end;
+        }
+        Ok(frames)
+    }
+
+    fn frame_one_svc_chunk(
+        &self,
+        channel_id: u16,
+        flags: u32,
+        total_length: u32,
+        chunk: &[u8],
+    ) -> ServerResult<Vec<u8>> {
+        let header = ChannelPduHeader {
+            length: total_length,
+            flags,
+        };
+        let body_size = CHANNEL_PDU_HEADER_SIZE + chunk.len();
+        let mut body = vec![0u8; body_size];
+        {
+            let mut c = WriteCursor::new(&mut body);
+            header.encode(&mut c)?;
+            c.write_slice(chunk, "svc::chunkData")?;
+        }
+        let sdi = SendDataIndication {
+            initiator: self.user_channel_id,
+            channel_id,
+            user_data: &body,
+        };
+        let payload_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let total = TPKT_HEADER_SIZE + payload_size;
+        let mut buf = vec![0u8; total];
+        {
+            let mut c = WriteCursor::new(&mut buf);
+            TpktHeader::try_for_payload(payload_size)?.encode(&mut c)?;
+            DataTransfer.encode(&mut c)?;
+            sdi.encode(&mut c)?;
+        }
+        Ok(buf)
     }
 
     fn process_io_channel(
@@ -1136,17 +1354,26 @@ mod tests {
         assert!(s.process(&buf, &mut NoopHandler).is_err());
     }
 
-    #[test]
-    fn svc_channel_data_dropped_silently() {
-        // Commit 9 will route VC payloads via the SvcHandler trait.
-        let mut s = fake_stage();
-        // Build a minimal SDR addressed to the rdpsnd VC (0x03EC) that
-        // our fake_result() registers.
-        let payload = b"hello";
+    /// Wrap a single SVC chunk (`ChannelPduHeader` + chunk bytes) in
+    /// the full TPKT/X.224/MCS/SDR envelope. Used by the inbound SVC
+    /// reassembly tests below.
+    fn wrap_client_svc_chunk(
+        stage: &ServerActiveStage,
+        channel_id: u16,
+        flags: u32,
+        total_length: u32,
+        chunk: &[u8],
+    ) -> Vec<u8> {
+        let mut body = vec![0u8; CHANNEL_PDU_HEADER_SIZE + chunk.len()];
+        {
+            let mut c = WriteCursor::new(&mut body);
+            ChannelPduHeader { length: total_length, flags }.encode(&mut c).unwrap();
+            c.write_slice(chunk, "chunk").unwrap();
+        }
         let sdr = SendDataRequest {
-            initiator: s.user_channel_id,
-            channel_id: 0x03EC,
-            user_data: payload,
+            initiator: stage.user_channel_id,
+            channel_id,
+            user_data: &body,
         };
         let payload_size = DATA_TRANSFER_HEADER_SIZE + sdr.size();
         let total = TPKT_HEADER_SIZE + payload_size;
@@ -1157,8 +1384,165 @@ mod tests {
             DataTransfer.encode(&mut c).unwrap();
             sdr.encode(&mut c).unwrap();
         }
-        let out = s.process(&buf, &mut NoopHandler).unwrap();
-        assert!(out.is_empty());
+        buf
+    }
+
+    #[test]
+    fn svc_single_chunk_emits_payload() {
+        let mut s = fake_stage();
+        let payload = b"hello, rdpsnd";
+        let bytes = wrap_client_svc_chunk(
+            &s,
+            0x03EC,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST,
+            payload.len() as u32,
+            payload,
+        );
+        let out = s.process(&bytes, &mut NoopHandler).unwrap();
+        assert_eq!(
+            out,
+            vec![ActiveStageOutput::SvcData {
+                channel_id: 0x03EC,
+                payload: payload.to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn svc_multi_chunk_reassembles() {
+        let mut s = fake_stage();
+        let full: Vec<u8> = (0..255u8).cycle().take(2000).collect();
+        // Three chunks: FIRST(800) + middle(800) + LAST(400)
+        let f1 = wrap_client_svc_chunk(&s, 0x03EC, CHANNEL_FLAG_FIRST, 2000, &full[..800]);
+        let f2 = wrap_client_svc_chunk(&s, 0x03EC, 0, 2000, &full[800..1600]);
+        let f3 = wrap_client_svc_chunk(&s, 0x03EC, CHANNEL_FLAG_LAST, 2000, &full[1600..2000]);
+        // Intermediate chunks emit nothing.
+        assert!(s.process(&f1, &mut NoopHandler).unwrap().is_empty());
+        assert!(s.process(&f2, &mut NoopHandler).unwrap().is_empty());
+        // LAST chunk emits the reassembled payload.
+        let out = s.process(&f3, &mut NoopHandler).unwrap();
+        assert_eq!(
+            out,
+            vec![ActiveStageOutput::SvcData {
+                channel_id: 0x03EC,
+                payload: full,
+            }]
+        );
+    }
+
+    #[test]
+    fn svc_continuation_without_first_errors() {
+        // A non-FIRST chunk arrives without any prior FIRST -- the
+        // active stage MUST refuse rather than silently emit garbage.
+        let mut s = fake_stage();
+        let bytes = wrap_client_svc_chunk(&s, 0x03EC, 0, 100, &[0xAB; 50]);
+        assert!(s.process(&bytes, &mut NoopHandler).is_err());
+    }
+
+    #[test]
+    fn svc_compressed_chunk_rejected() {
+        // CHANNEL_PACKET_COMPRESSED is in the high half of `flags` per
+        // §2.2.6.1.1; the server skeleton has no bulk-decompression
+        // support and MUST refuse rather than misinterpret the body.
+        let mut s = fake_stage();
+        let bytes = wrap_client_svc_chunk(
+            &s,
+            0x03EC,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST | CHANNEL_PACKET_COMPRESSED,
+            5,
+            b"hello",
+        );
+        assert!(s.process(&bytes, &mut NoopHandler).is_err());
+    }
+
+    #[test]
+    fn svc_total_length_mismatch_rejected_on_last() {
+        // FIRST declares total = 100 but LAST arrives with only 60
+        // bytes accumulated. The active stage MUST detect the truncation.
+        let mut s = fake_stage();
+        let f1 = wrap_client_svc_chunk(&s, 0x03EC, CHANNEL_FLAG_FIRST, 100, &[0; 30]);
+        let f2 = wrap_client_svc_chunk(&s, 0x03EC, CHANNEL_FLAG_LAST, 100, &[0; 30]);
+        assert!(s.process(&f1, &mut NoopHandler).unwrap().is_empty());
+        assert!(s.process(&f2, &mut NoopHandler).is_err());
+    }
+
+    #[test]
+    fn encode_svc_send_single_chunk() {
+        let s = fake_stage();
+        let payload = b"audio data";
+        let frames = s.encode_svc_send(0x03EC, payload).unwrap();
+        assert_eq!(frames.len(), 1);
+        // Decode the frame back and verify the chunk header carries
+        // FIRST | LAST and the same total length.
+        let mut c = ReadCursor::new(&frames[0]);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        assert_eq!(sdi.channel_id, 0x03EC);
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let header = ChannelPduHeader::decode(&mut inner).unwrap();
+        assert_eq!(header.length as usize, payload.len());
+        assert_eq!(header.flags, CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST);
+        assert_eq!(inner.peek_remaining(), payload);
+    }
+
+    #[test]
+    fn encode_svc_send_chunks_large_payload() {
+        // Build a stage whose chunk_length is small so we can force
+        // fragmentation without a 1600-byte payload. 64 is well above
+        // the 8-byte minimum and well below the channel chunk limit.
+        let cfg = RdpServerConfig::builder()
+            .channel_chunk_length(64)
+            .build()
+            .unwrap();
+        let s = ServerActiveStage::new(fake_result(), cfg);
+        let payload: Vec<u8> = (0..200u8).collect(); // 200 bytes
+        let frames = s.encode_svc_send(0x03EC, &payload).unwrap();
+        // 200 / 64 = 3 chunks (64 + 64 + 64 + 8) → ceil = 4
+        assert_eq!(frames.len(), 4);
+
+        // Inspect each frame's header: FIRST on first, LAST on last,
+        // neither on middles. `length` field is the same across all
+        // chunks (= total uncompressed message size).
+        let mut decoded_payload = Vec::new();
+        for (idx, frame) in frames.iter().enumerate() {
+            let mut c = ReadCursor::new(frame);
+            let _tpkt = TpktHeader::decode(&mut c).unwrap();
+            let _dt = DataTransfer::decode(&mut c).unwrap();
+            let sdi = SendDataIndication::decode(&mut c).unwrap();
+            let mut inner = ReadCursor::new(sdi.user_data);
+            let h = ChannelPduHeader::decode(&mut inner).unwrap();
+            assert_eq!(h.length as usize, payload.len(), "total length on chunk {idx}");
+            let want_first = idx == 0;
+            let want_last = idx == frames.len() - 1;
+            assert_eq!((h.flags & CHANNEL_FLAG_FIRST) != 0, want_first, "FIRST on {idx}");
+            assert_eq!((h.flags & CHANNEL_FLAG_LAST) != 0, want_last, "LAST on {idx}");
+            decoded_payload.extend_from_slice(inner.peek_remaining());
+        }
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn encode_svc_send_unknown_channel_errors() {
+        let s = fake_stage();
+        // 0x0FFF is not in the registered channel_ids of fake_result().
+        assert!(s.encode_svc_send(0x0FFF, b"x").is_err());
+    }
+
+    #[test]
+    fn encode_svc_send_empty_payload_emits_one_chunk() {
+        let s = fake_stage();
+        let frames = s.encode_svc_send(0x03EC, &[]).unwrap();
+        assert_eq!(frames.len(), 1);
+        let mut c = ReadCursor::new(&frames[0]);
+        let _ = TpktHeader::decode(&mut c).unwrap();
+        let _ = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let h = ChannelPduHeader::decode(&mut inner).unwrap();
+        assert_eq!(h.length, 0);
+        assert_eq!(h.flags, CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST);
+        assert_eq!(inner.peek_remaining(), &[] as &[u8]);
     }
 
     /// Empty PDU body used when only the dispatch table needs exercising.
