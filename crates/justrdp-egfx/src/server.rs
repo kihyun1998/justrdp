@@ -41,24 +41,28 @@ use justrdp_core::{AsAny, Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_dvc::{DvcError, DvcMessage, DvcProcessor, DvcResult};
 
 use crate::pdu::{
-    CacheImportReplyPdu, CacheToSurfacePdu, CapsAdvertisePdu, CapsConfirmPdu,
-    CreateSurfacePdu, DeleteEncodingContextPdu, DeleteSurfacePdu, EvictCacheEntryPdu,
-    GfxCapSet, GfxColor32, GfxMonitorDef, GfxPixelFormat, GfxPoint16, GfxRect16,
-    MapSurfaceToOutputPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
-    MapSurfaceToWindowPdu, RdpgfxHeader, ResetGraphicsPdu, SolidFillPdu, SurfaceToCachePdu,
-    SurfaceToSurfacePdu, WireToSurface1Pdu, WireToSurface2Pdu, MAX_CACHE_ENTRIES,
-    RDPGFX_CAPS_FLAG_AVC_DISABLED, RDPGFX_CAPS_FLAG_THINCLIENT, RDPGFX_CAPVERSION_10,
-    RDPGFX_CAPVERSION_101, RDPGFX_CAPVERSION_102, RDPGFX_CAPVERSION_103,
-    RDPGFX_CAPVERSION_104, RDPGFX_CAPVERSION_105, RDPGFX_CAPVERSION_106,
-    RDPGFX_CAPVERSION_107, RDPGFX_CAPVERSION_8, RDPGFX_CAPVERSION_81,
-    RDPGFX_CMDID_CACHEIMPORTREPLY, RDPGFX_CMDID_CACHETOSURFACE, RDPGFX_CMDID_CREATESURFACE,
-    RDPGFX_CMDID_DELETEENCODINGCONTEXT, RDPGFX_CMDID_DELETESURFACE,
-    RDPGFX_CMDID_EVICTCACHEENTRY, RDPGFX_CMDID_MAPSURFACETOOUTPUT,
-    RDPGFX_CMDID_MAPSURFACETOSCALEDOUTPUT, RDPGFX_CMDID_MAPSURFACETOSCALEDWINDOW,
-    RDPGFX_CMDID_MAPSURFACETOWINDOW, RDPGFX_CMDID_SOLIDFILL,
+    CacheImportOfferPdu, CacheImportReplyPdu, CacheToSurfacePdu, CapsAdvertisePdu,
+    CapsConfirmPdu, CreateSurfacePdu, DeleteEncodingContextPdu, DeleteSurfacePdu,
+    EndFramePdu, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxCapSet, GfxColor32,
+    GfxMonitorDef, GfxPixelFormat, GfxPoint16, GfxRect16, MapSurfaceToOutputPdu,
+    MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu,
+    QoeFrameAcknowledgePdu, RdpgfxHeader, ResetGraphicsPdu, SolidFillPdu, StartFramePdu,
+    SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface1Pdu, WireToSurface2Pdu,
+    MAX_CACHE_ENTRIES, RDPGFX_CAPS_FLAG_AVC_DISABLED, RDPGFX_CAPS_FLAG_THINCLIENT,
+    RDPGFX_CAPVERSION_10, RDPGFX_CAPVERSION_101, RDPGFX_CAPVERSION_102,
+    RDPGFX_CAPVERSION_103, RDPGFX_CAPVERSION_104, RDPGFX_CAPVERSION_105,
+    RDPGFX_CAPVERSION_106, RDPGFX_CAPVERSION_107, RDPGFX_CAPVERSION_8,
+    RDPGFX_CAPVERSION_81, RDPGFX_CMDID_CACHEIMPORTOFFER, RDPGFX_CMDID_CACHEIMPORTREPLY,
+    RDPGFX_CMDID_CACHETOSURFACE, RDPGFX_CMDID_CAPSADVERTISE, RDPGFX_CMDID_CREATESURFACE,
+    RDPGFX_CMDID_DELETEENCODINGCONTEXT, RDPGFX_CMDID_DELETESURFACE, RDPGFX_CMDID_ENDFRAME,
+    RDPGFX_CMDID_EVICTCACHEENTRY, RDPGFX_CMDID_FRAMEACKNOWLEDGE,
+    RDPGFX_CMDID_MAPSURFACETOOUTPUT, RDPGFX_CMDID_MAPSURFACETOSCALEDOUTPUT,
+    RDPGFX_CMDID_MAPSURFACETOSCALEDWINDOW, RDPGFX_CMDID_MAPSURFACETOWINDOW,
+    RDPGFX_CMDID_QOEFRAMEACKNOWLEDGE, RDPGFX_CMDID_SOLIDFILL, RDPGFX_CMDID_STARTFRAME,
     RDPGFX_CMDID_SURFACETOCACHE, RDPGFX_CMDID_SURFACETOSURFACE,
     RDPGFX_CMDID_WIRETOSURFACE_1, RDPGFX_CMDID_WIRETOSURFACE_2, RDPGFX_CODECID_AVC420,
     RDPGFX_CODECID_AVC444, RDPGFX_CODECID_AVC444V2, RDPGFX_CODECID_CAPROGRESSIVE,
+    SUSPEND_FRAME_ACKNOWLEDGEMENT,
 };
 
 /// DVC channel name (MS-RDPEGFX §2.2.5).
@@ -623,6 +627,69 @@ impl GfxServer {
         )?))
     }
 
+    /// `RDPGFX_START_FRAME_PDU` (MS-RDPEGFX 2.2.2.11). Marks the start
+    /// of a logical frame; pushes `frame_id` onto the in-flight queue.
+    /// `&mut self` because this updates [`pending_frames`] and the
+    /// `next_frame_id` counter (auto-incremented past the supplied id).
+    ///
+    /// `frame_id` SHOULD be monotonically increasing across a session
+    /// per spec; the encoder does not enforce monotonicity (callers may
+    /// reuse ids when wrapping at `u32::MAX`).
+    pub fn start_frame(&mut self, frame_id: u32, timestamp: u32) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        self.pending_frames.push_back(frame_id);
+        // Track the highest frame id seen so callers that delegate id
+        // assignment via `next_frame_id()` can pick up where this left
+        // off. `wrapping_add` because the spec allows wrapping.
+        self.next_frame_id = frame_id.wrapping_add(1);
+        let body = StartFramePdu {
+            timestamp,
+            frame_id,
+        };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_STARTFRAME,
+            &body,
+        )?))
+    }
+
+    /// `RDPGFX_END_FRAME_PDU` (MS-RDPEGFX 2.2.2.12). End-of-frame
+    /// marker. The supplied `frame_id` MUST match the most recently
+    /// started frame (strictly: it must be in the in-flight queue);
+    /// callers that interleave frames out of order are responsible for
+    /// passing the right id.
+    pub fn end_frame(&mut self, frame_id: u32) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        if !self.pending_frames.contains(&frame_id) {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: end_frame: frame_id not in in-flight queue",
+            )));
+        }
+        let body = EndFramePdu { frame_id };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_ENDFRAME,
+            &body,
+        )?))
+    }
+
+    /// Total number of `FrameAcknowledge` PDUs received so far.
+    /// Useful for back-pressure metrics; saturates at `u32::MAX`.
+    pub fn total_frame_acks_received(&self) -> u32 {
+        self.total_frames_acked
+    }
+
+    /// Dispatch a `FrameAcknowledge` to update in-flight tracking.
+    fn handle_frame_ack(&mut self, ack: &FrameAcknowledgePdu) {
+        // Per MS-RDPEGFX 2.2.2.13 the ack -- regardless of queueDepth --
+        // refers to a specific frameId; remove that id from the queue
+        // even when the client is also asking us to suspend further
+        // acks.
+        if let Some(pos) = self.pending_frames.iter().position(|&id| id == ack.frame_id) {
+            self.pending_frames.remove(pos);
+        }
+        self.ack_suspended = ack.queue_depth == SUSPEND_FRAME_ACKNOWLEDGEMENT;
+        self.total_frames_acked = self.total_frames_acked.saturating_add(1);
+    }
+
     fn avc_disabled(&self) -> bool {
         self.negotiated
             .as_ref()
@@ -738,14 +805,52 @@ impl DvcProcessor for GfxServer {
                 Ok(vec![Self::wrap_single(bytes)])
             }
             ServerState::Active => {
-                // Commit 1 only: the only legal client → server traffic
-                // in the Active state is FrameAcknowledge /
-                // QoEFrameAcknowledge (Commit 4 wires those). For now
-                // surface the unexpected payload as a protocol error so
-                // tests notice if anything else slips through.
-                Err(DvcError::Protocol(String::from(
-                    "GfxServer: inbound dispatch in Active state lands in §11.2b-3 Commit 4",
-                )))
+                // Peek the cmdId in the RDPGFX_HEADER without
+                // consuming it; each PDU's `decode` re-reads its own
+                // header. Per MS-RDPEGFX 3.3.5.1.5 the only legal
+                // client→server PDUs after handshake are
+                // FrameAcknowledge, QoEFrameAcknowledge, and (during
+                // initialization) CacheImportOffer.
+                if src.remaining() < RdpgfxHeader::WIRE_SIZE {
+                    return Err(DvcError::Protocol(String::from(
+                        "GfxServer: inbound payload shorter than RDPGFX_HEADER",
+                    )));
+                }
+                let head = src.peek_remaining();
+                let cmd_id = u16::from_le_bytes([head[0], head[1]]);
+                match cmd_id {
+                    RDPGFX_CMDID_FRAMEACKNOWLEDGE => {
+                        let ack = FrameAcknowledgePdu::decode(&mut src)
+                            .map_err(DvcError::Decode)?;
+                        self.handle_frame_ack(&ack);
+                        Ok(Vec::new())
+                    }
+                    RDPGFX_CMDID_QOEFRAMEACKNOWLEDGE => {
+                        // QoE acks carry only timing telemetry; consume
+                        // and discard. §11.2b-5 will route them
+                        // through a DisplayHandler callback for apps
+                        // that want to react to perceived latency.
+                        let _qoe = QoeFrameAcknowledgePdu::decode(&mut src)
+                            .map_err(DvcError::Decode)?;
+                        Ok(Vec::new())
+                    }
+                    RDPGFX_CMDID_CACHEIMPORTOFFER => {
+                        // §11.2b-3 default policy: accept-none.
+                        // Persistent caching is opt-in; §11.2b-5 will
+                        // wire a DisplayHandler seam so applications
+                        // can decide which entries to import.
+                        let _offer = CacheImportOfferPdu::decode(&mut src)
+                            .map_err(DvcError::Decode)?;
+                        let reply = self.cache_import_reply(Vec::new())?;
+                        Ok(vec![reply])
+                    }
+                    RDPGFX_CMDID_CAPSADVERTISE => Err(DvcError::Protocol(String::from(
+                        "GfxServer: duplicate CapsAdvertise after handshake",
+                    ))),
+                    other => Err(DvcError::Protocol(alloc::format!(
+                        "GfxServer: unexpected client→server cmdId {other:#06x}",
+                    ))),
+                }
             }
             ServerState::Closed => unreachable!("guarded above"),
         }
@@ -900,16 +1005,26 @@ mod tests {
     }
 
     #[test]
-    fn process_in_active_state_rejects_in_commit_1() {
-        // Commit 1: any inbound after Active is a protocol error
-        // (Commit 4 will accept FrameAcknowledge / QoEFrameAcknowledge).
+    fn process_in_active_state_rejects_unknown_cmd_id() {
+        // Active state accepts FrameAck / QoEFrameAck / CacheImportOffer;
+        // anything else is a protocol error.
         let mut s = GfxServer::new();
         s.start(1).unwrap();
         let advertise = make_advertise(&[RDPGFX_CAPVERSION_10]);
         s.process(1, &advertise).unwrap();
         assert_eq!(s.state(), ServerState::Active);
-        // Feed any non-empty payload -- expected to fail.
-        assert!(s.process(1, &[0u8; 8]).is_err());
+        // Build a fake header with an unsupported cmd_id (e.g. WireToSurface1
+        // is server→client only, so receiving it from the client is wrong).
+        let bogus_header = RdpgfxHeader {
+            cmd_id: RDPGFX_CMDID_WIRETOSURFACE_1,
+            flags: 0,
+            pdu_length: RdpgfxHeader::WIRE_SIZE as u32,
+        };
+        let mut buf = vec![0u8; RdpgfxHeader::WIRE_SIZE];
+        bogus_header
+            .encode(&mut WriteCursor::new(&mut buf))
+            .unwrap();
+        assert!(s.process(1, &buf).is_err());
     }
 
     #[test]
@@ -1459,6 +1574,209 @@ mod tests {
         assert!(s.cache_to_surface(0, 0, vec![]).is_err());
         assert!(s.evict_cache_entry(0).is_err());
         assert!(s.cache_import_reply(vec![]).is_err());
+    }
+
+    // ── Frame envelope + ack tracking (Commit 4) ─────────────────
+
+    use crate::pdu::{
+        QUEUE_DEPTH_UNAVAILABLE, RDPGFX_CMDID_ENDFRAME, RDPGFX_CMDID_STARTFRAME,
+    };
+
+    /// Encode a `FrameAcknowledgePdu` into raw bytes (client → server,
+    /// no SINGLE wrapper).
+    fn build_frame_ack(frame_id: u32, queue_depth: u32) -> Vec<u8> {
+        let pdu = FrameAcknowledgePdu {
+            queue_depth,
+            frame_id,
+            total_frames_decoded: frame_id.saturating_add(1),
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        pdu.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf
+    }
+
+    #[test]
+    fn start_frame_pushes_to_pending() {
+        let mut s = activated();
+        assert_eq!(s.pending_frame_count(), 0);
+        let msg = s.start_frame(7, 0).unwrap();
+        assert_eq!(s.pending_frame_count(), 1);
+        // Counter advances past the supplied frame_id.
+        assert_eq!(s.next_frame_id(), 8);
+        let cmd = unwrap_single(&msg);
+        let hdr = parse_command_header(cmd);
+        assert_eq!(hdr.cmd_id, RDPGFX_CMDID_STARTFRAME);
+        let body = StartFramePdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.frame_id, 7);
+    }
+
+    #[test]
+    fn end_frame_does_not_remove_until_ack() {
+        let mut s = activated();
+        s.start_frame(1, 0).unwrap();
+        s.end_frame(1).unwrap();
+        // Spec semantics: pending_frames is keyed on ack arrival, not
+        // on EndFrame. The frame is still in flight after EndFrame.
+        assert_eq!(s.pending_frame_count(), 1);
+    }
+
+    #[test]
+    fn end_frame_rejects_unknown_frame_id() {
+        let mut s = activated();
+        s.start_frame(1, 0).unwrap();
+        assert!(s.end_frame(999).is_err());
+    }
+
+    #[test]
+    fn end_frame_emits_correct_pdu() {
+        let mut s = activated();
+        s.start_frame(99, 0).unwrap();
+        let msg = s.end_frame(99).unwrap();
+        let cmd = unwrap_single(&msg);
+        assert_eq!(parse_command_header(cmd).cmd_id, RDPGFX_CMDID_ENDFRAME);
+        let body = EndFramePdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.frame_id, 99);
+    }
+
+    #[test]
+    fn frame_ack_removes_frame_from_pending() {
+        let mut s = activated();
+        s.start_frame(1, 0).unwrap();
+        s.end_frame(1).unwrap();
+        let ack = build_frame_ack(1, 0);
+        let resp = s.process(1, &ack).unwrap();
+        assert!(resp.is_empty());
+        assert_eq!(s.pending_frame_count(), 0);
+        assert!(!s.ack_suspended());
+        assert_eq!(s.total_frame_acks_received(), 1);
+    }
+
+    #[test]
+    fn frame_ack_with_queue_depth_unavailable_acks_normally() {
+        let mut s = activated();
+        s.start_frame(1, 0).unwrap();
+        let ack = build_frame_ack(1, QUEUE_DEPTH_UNAVAILABLE);
+        s.process(1, &ack).unwrap();
+        assert_eq!(s.pending_frame_count(), 0);
+        assert!(!s.ack_suspended());
+    }
+
+    #[test]
+    fn frame_ack_suspend_sets_flag_and_still_removes() {
+        let mut s = activated();
+        s.start_frame(1, 0).unwrap();
+        let ack = build_frame_ack(1, SUSPEND_FRAME_ACKNOWLEDGEMENT);
+        s.process(1, &ack).unwrap();
+        // Per spec the SUSPEND ack still references a specific frame.
+        assert_eq!(s.pending_frame_count(), 0);
+        assert!(s.ack_suspended());
+    }
+
+    #[test]
+    fn ack_for_unknown_frame_id_is_silently_tolerated() {
+        let mut s = activated();
+        s.start_frame(1, 0).unwrap();
+        let ack = build_frame_ack(999, 0);
+        let resp = s.process(1, &ack).unwrap();
+        assert!(resp.is_empty());
+        // Original frame still in flight, but ack count incremented.
+        assert_eq!(s.pending_frame_count(), 1);
+        assert_eq!(s.total_frame_acks_received(), 1);
+    }
+
+    #[test]
+    fn out_of_order_acks_remove_only_the_acked_frame() {
+        let mut s = activated();
+        s.start_frame(1, 0).unwrap();
+        s.start_frame(2, 0).unwrap();
+        s.start_frame(3, 0).unwrap();
+        assert_eq!(s.pending_frame_count(), 3);
+        // Ack frame 2 first.
+        s.process(1, &build_frame_ack(2, 0)).unwrap();
+        assert_eq!(s.pending_frame_count(), 2);
+        // Ack frame 1 next.
+        s.process(1, &build_frame_ack(1, 0)).unwrap();
+        assert_eq!(s.pending_frame_count(), 1);
+        // Ack frame 3 last.
+        s.process(1, &build_frame_ack(3, 0)).unwrap();
+        assert_eq!(s.pending_frame_count(), 0);
+    }
+
+    #[test]
+    fn qoe_ack_consumed_without_state_change() {
+        let mut s = activated();
+        s.start_frame(1, 0).unwrap();
+        let qoe = QoeFrameAcknowledgePdu {
+            frame_id: 1,
+            timestamp: 12_345,
+            time_diff_se: 16,
+            time_diff_edr: 8,
+        };
+        let mut buf = vec![0u8; qoe.size()];
+        qoe.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        let resp = s.process(1, &buf).unwrap();
+        assert!(resp.is_empty());
+        // QoE ack is informational only.
+        assert_eq!(s.pending_frame_count(), 1);
+        assert_eq!(s.total_frame_acks_received(), 0);
+    }
+
+    #[test]
+    fn cache_import_offer_emits_empty_reply() {
+        let mut s = activated();
+        // Empty offer is wire-legal and exercises the parse path.
+        let offer = CacheImportOfferPdu { cache_entries: vec![] };
+        let mut buf = vec![0u8; offer.size()];
+        offer.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        let resp = s.process(1, &buf).unwrap();
+        assert_eq!(resp.len(), 1);
+        let cmd = unwrap_single(&resp[0]);
+        assert_eq!(parse_command_header(cmd).cmd_id, RDPGFX_CMDID_CACHEIMPORTREPLY);
+        let reply = CacheImportReplyPdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        // §11.2b-3 default policy: accept-none.
+        assert!(reply.cache_slots.is_empty());
+    }
+
+    #[test]
+    fn duplicate_caps_advertise_in_active_errors() {
+        let mut s = activated();
+        let advertise = make_advertise(&[RDPGFX_CAPVERSION_10]);
+        assert!(s.process(1, &advertise).is_err());
+    }
+
+    #[test]
+    fn frame_envelope_gated_by_active_state() {
+        let mut s = GfxServer::new();
+        assert!(s.start_frame(1, 0).is_err());
+        assert!(s.end_frame(1).is_err());
+    }
+
+    #[test]
+    fn close_clears_pending_frames() {
+        let mut s = activated();
+        s.start_frame(1, 0).unwrap();
+        s.start_frame(2, 0).unwrap();
+        s.close(1);
+        assert_eq!(s.pending_frame_count(), 0);
+        assert_eq!(s.next_frame_id(), 0);
+        assert_eq!(s.total_frame_acks_received(), 0);
+        assert!(!s.ack_suspended());
+    }
+
+    #[test]
+    fn start_frame_id_wraps_at_u32_max() {
+        let mut s = activated();
+        s.start_frame(u32::MAX, 0).unwrap();
+        assert_eq!(s.next_frame_id(), 0);
     }
 
     #[test]
