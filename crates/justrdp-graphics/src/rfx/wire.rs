@@ -172,6 +172,26 @@ pub const CTX_ID: u8 = 0x00;
 /// (64 pixels). MS-RDPRFX 2.2.2.2.4.
 pub const CT_TILE_64X64: u16 = 0x0040;
 
+/// Total wire size of a `TS_RFX_FRAME_BEGIN` block
+/// (MS-RDPRFX 2.2.2.3.1).
+pub const RFX_FRAME_BEGIN_SIZE: usize = 14;
+
+/// Total wire size of a `TS_RFX_FRAME_END` block
+/// (MS-RDPRFX 2.2.2.3.2). Only the 8-byte `TS_RFX_CODEC_CHANNELT`
+/// header -- no body.
+pub const RFX_FRAME_END_SIZE: usize = 8;
+
+/// `regionFlags` value: bit 0 = `lrf` MUST be `1`; upper 7 bits
+/// reserved (write 0). MS-RDPRFX 2.2.2.3.3.
+pub const REGION_FLAGS_LRF: u8 = 0x01;
+
+/// `numTilesets` value inside `TS_RFX_REGION` -- MUST be `0x0001`.
+/// MS-RDPRFX 2.2.2.3.3.
+pub const NUM_TILESETS_MUST: u16 = 0x0001;
+
+/// Wire size of a single `TS_RFX_RECT` entry (MS-RDPRFX 2.2.2.1.4).
+pub const RFX_RECT_SIZE: usize = 8;
+
 // ── TS_RFX_BLOCKT ───────────────────────────────────────────────────
 
 /// `TS_RFX_BLOCKT` -- MS-RDPRFX 2.2.2.1.1.
@@ -729,6 +749,317 @@ impl<'de> Decode<'de> for RfxContext {
     }
 }
 
+// ── TS_RFX_FRAME_BEGIN ──────────────────────────────────────────────
+
+/// `TS_RFX_FRAME_BEGIN` -- MS-RDPRFX 2.2.2.3.1.
+///
+/// Marks the start of an encoded frame. `numRegions` is signed per the
+/// spec field type but is always positive in practice (typically 1; the
+/// current spec defines exactly one Region per frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RfxFrameBegin {
+    pub frame_idx: u32,
+    pub num_regions: i16,
+}
+
+impl Encode for RfxFrameBegin {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        RfxCodecChannelHeader {
+            block_type: WBT_FRAME_BEGIN,
+            block_len: RFX_FRAME_BEGIN_SIZE as u32,
+            codec_id: CODEC_ID,
+            channel_id: CHANNEL_ID_DATA,
+        }
+        .encode(dst)?;
+        dst.write_u32_le(self.frame_idx, "RfxFrameBegin::frameIdx")?;
+        dst.write_u16_le(self.num_regions as u16, "RfxFrameBegin::numRegions")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RfxFrameBegin"
+    }
+
+    fn size(&self) -> usize {
+        RFX_FRAME_BEGIN_SIZE
+    }
+}
+
+impl<'de> Decode<'de> for RfxFrameBegin {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let hdr = RfxCodecChannelHeader::decode(src)?;
+        if hdr.block_type != WBT_FRAME_BEGIN {
+            return Err(DecodeError::unexpected_value(
+                "RfxFrameBegin",
+                "blockType",
+                "expected WBT_FRAME_BEGIN (0xCCC4)",
+            ));
+        }
+        if hdr.block_len as usize != RFX_FRAME_BEGIN_SIZE {
+            return Err(DecodeError::invalid_value("RfxFrameBegin", "blockLen"));
+        }
+        if hdr.codec_id != CODEC_ID {
+            return Err(DecodeError::unexpected_value(
+                "RfxFrameBegin",
+                "codecId",
+                "expected RFX CODEC_ID (0x01)",
+            ));
+        }
+        if hdr.channel_id != CHANNEL_ID_DATA {
+            return Err(DecodeError::unexpected_value(
+                "RfxFrameBegin",
+                "channelId",
+                "expected CHANNEL_ID_DATA (0x00)",
+            ));
+        }
+        let frame_idx = src.read_u32_le("RfxFrameBegin::frameIdx")?;
+        let num_regions = src.read_u16_le("RfxFrameBegin::numRegions")? as i16;
+        Ok(Self {
+            frame_idx,
+            num_regions,
+        })
+    }
+}
+
+// ── TS_RFX_FRAME_END ────────────────────────────────────────────────
+
+/// `TS_RFX_FRAME_END` -- MS-RDPRFX 2.2.2.3.2.
+///
+/// End-of-frame marker. Carries no body; the 8-byte
+/// `TS_RFX_CODEC_CHANNELT` header is the entire block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RfxFrameEnd;
+
+impl Encode for RfxFrameEnd {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        RfxCodecChannelHeader {
+            block_type: WBT_FRAME_END,
+            block_len: RFX_FRAME_END_SIZE as u32,
+            codec_id: CODEC_ID,
+            channel_id: CHANNEL_ID_DATA,
+        }
+        .encode(dst)?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RfxFrameEnd"
+    }
+
+    fn size(&self) -> usize {
+        RFX_FRAME_END_SIZE
+    }
+}
+
+impl<'de> Decode<'de> for RfxFrameEnd {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let hdr = RfxCodecChannelHeader::decode(src)?;
+        if hdr.block_type != WBT_FRAME_END {
+            return Err(DecodeError::unexpected_value(
+                "RfxFrameEnd",
+                "blockType",
+                "expected WBT_FRAME_END (0xCCC5)",
+            ));
+        }
+        if hdr.block_len as usize != RFX_FRAME_END_SIZE {
+            return Err(DecodeError::invalid_value("RfxFrameEnd", "blockLen"));
+        }
+        if hdr.codec_id != CODEC_ID {
+            return Err(DecodeError::unexpected_value(
+                "RfxFrameEnd",
+                "codecId",
+                "expected RFX CODEC_ID (0x01)",
+            ));
+        }
+        if hdr.channel_id != CHANNEL_ID_DATA {
+            return Err(DecodeError::unexpected_value(
+                "RfxFrameEnd",
+                "channelId",
+                "expected CHANNEL_ID_DATA (0x00)",
+            ));
+        }
+        Ok(Self)
+    }
+}
+
+// ── TS_RFX_RECT ─────────────────────────────────────────────────────
+
+/// `TS_RFX_RECT` -- MS-RDPRFX 2.2.2.1.4.
+///
+/// Inclusive (x, y) origin + width/height in pixels. 8 bytes fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RfxRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl Encode for RfxRect {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_u16_le(self.x, "RfxRect::x")?;
+        dst.write_u16_le(self.y, "RfxRect::y")?;
+        dst.write_u16_le(self.width, "RfxRect::width")?;
+        dst.write_u16_le(self.height, "RfxRect::height")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RfxRect"
+    }
+
+    fn size(&self) -> usize {
+        RFX_RECT_SIZE
+    }
+}
+
+impl<'de> Decode<'de> for RfxRect {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        Ok(Self {
+            x: src.read_u16_le("RfxRect::x")?,
+            y: src.read_u16_le("RfxRect::y")?,
+            width: src.read_u16_le("RfxRect::width")?,
+            height: src.read_u16_le("RfxRect::height")?,
+        })
+    }
+}
+
+// ── TS_RFX_REGION ───────────────────────────────────────────────────
+
+/// `TS_RFX_REGION` -- MS-RDPRFX 2.2.2.3.3.
+///
+/// Lists destination rectangles for the upcoming TileSet.
+/// `regionType` is hard-coded to [`CBT_REGION`] and `numTilesets` to
+/// [`NUM_TILESETS_MUST`] (1) per spec.
+///
+/// `numRects = 0` is wire-legal: the spec says the receiver "MUST
+/// generate a rectangle whose top-left corner is `(0, 0)` and whose
+/// dimensions match the channel's width/height". The encoder allows
+/// it; the decoder accepts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RfxRegion {
+    pub rects: Vec<RfxRect>,
+}
+
+impl RfxRegion {
+    fn block_len(&self) -> usize {
+        // header(8) + regionFlags(1) + numRects(2) + rects + regionType(2) + numTilesets(2)
+        RFX_CODEC_CHANNEL_HEADER_SIZE + 1 + 2 + self.rects.len() * RFX_RECT_SIZE + 2 + 2
+    }
+}
+
+impl Encode for RfxRegion {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        if self.rects.len() > u16::MAX as usize {
+            return Err(EncodeError::other(
+                "RfxRegion",
+                "numRects exceeds u16::MAX (65535)",
+            ));
+        }
+        let block_len = self.block_len();
+        if block_len > u32::MAX as usize {
+            return Err(EncodeError::other(
+                "RfxRegion",
+                "blockLen exceeds u32::MAX",
+            ));
+        }
+        RfxCodecChannelHeader {
+            block_type: WBT_REGION,
+            block_len: block_len as u32,
+            codec_id: CODEC_ID,
+            channel_id: CHANNEL_ID_DATA,
+        }
+        .encode(dst)?;
+        dst.write_u8(REGION_FLAGS_LRF, "RfxRegion::regionFlags")?;
+        dst.write_u16_le(self.rects.len() as u16, "RfxRegion::numRects")?;
+        for r in &self.rects {
+            r.encode(dst)?;
+        }
+        dst.write_u16_le(CBT_REGION, "RfxRegion::regionType")?;
+        dst.write_u16_le(NUM_TILESETS_MUST, "RfxRegion::numTilesets")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RfxRegion"
+    }
+
+    fn size(&self) -> usize {
+        self.block_len()
+    }
+}
+
+impl<'de> Decode<'de> for RfxRegion {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let hdr = RfxCodecChannelHeader::decode(src)?;
+        if hdr.block_type != WBT_REGION {
+            return Err(DecodeError::unexpected_value(
+                "RfxRegion",
+                "blockType",
+                "expected WBT_REGION (0xCCC6)",
+            ));
+        }
+        if hdr.codec_id != CODEC_ID {
+            return Err(DecodeError::unexpected_value(
+                "RfxRegion",
+                "codecId",
+                "expected RFX CODEC_ID (0x01)",
+            ));
+        }
+        if hdr.channel_id != CHANNEL_ID_DATA {
+            return Err(DecodeError::unexpected_value(
+                "RfxRegion",
+                "channelId",
+                "expected CHANNEL_ID_DATA (0x00)",
+            ));
+        }
+        // regionFlags: spec mandates bit 0 = 1; reserved bits MUST be
+        // ignored on decode.
+        let region_flags = src.read_u8("RfxRegion::regionFlags")?;
+        if region_flags & REGION_FLAGS_LRF == 0 {
+            return Err(DecodeError::unexpected_value(
+                "RfxRegion",
+                "regionFlags",
+                "lrf bit (bit 0) MUST be set",
+            ));
+        }
+        let num_rects = src.read_u16_le("RfxRegion::numRects")?;
+        let expected_len = RFX_CODEC_CHANNEL_HEADER_SIZE
+            + 1
+            + 2
+            + (num_rects as usize) * RFX_RECT_SIZE
+            + 2
+            + 2;
+        if hdr.block_len as usize != expected_len {
+            return Err(DecodeError::invalid_value(
+                "RfxRegion",
+                "blockLen does not match numRects",
+            ));
+        }
+        let mut rects = Vec::with_capacity(num_rects as usize);
+        for _ in 0..num_rects {
+            rects.push(RfxRect::decode(src)?);
+        }
+        let region_type = src.read_u16_le("RfxRegion::regionType")?;
+        if region_type != CBT_REGION {
+            return Err(DecodeError::unexpected_value(
+                "RfxRegion",
+                "regionType",
+                "expected CBT_REGION (0xCAC1)",
+            ));
+        }
+        let num_tilesets = src.read_u16_le("RfxRegion::numTilesets")?;
+        if num_tilesets != NUM_TILESETS_MUST {
+            return Err(DecodeError::unexpected_value(
+                "RfxRegion",
+                "numTilesets",
+                "MUST be 0x0001",
+            ));
+        }
+        Ok(Self { rects })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1249,5 +1580,393 @@ mod tests {
         buf[5] = 0;
         let mut src = ReadCursor::new(&buf);
         assert!(RfxChannels::decode(&mut src).is_err());
+    }
+
+    // ── FRAME_BEGIN tests ────────────────────────────────────────
+
+    #[test]
+    fn rfx_frame_begin_roundtrip_zero() {
+        let f = RfxFrameBegin {
+            frame_idx: 0,
+            num_regions: 1,
+        };
+        let d = roundtrip(&f);
+        assert_eq!(d, f);
+        assert_eq!(f.size(), RFX_FRAME_BEGIN_SIZE);
+    }
+
+    #[test]
+    fn rfx_frame_begin_roundtrip_max_frame_idx() {
+        let f = RfxFrameBegin {
+            frame_idx: u32::MAX,
+            num_regions: 1,
+        };
+        let d = roundtrip(&f);
+        assert_eq!(d, f);
+    }
+
+    #[test]
+    fn rfx_frame_begin_byte_layout() {
+        let f = RfxFrameBegin {
+            frame_idx: 0x0102_0304,
+            num_regions: 1,
+        };
+        let mut buf = vec![0u8; RFX_FRAME_BEGIN_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // header bytes 0..2 = blockType WBT_FRAME_BEGIN (0xCCC4) LE.
+        assert_eq!(&buf[..2], &[0xC4, 0xCC]);
+        // bytes 2..6 = blockLen 14 LE.
+        assert_eq!(&buf[2..6], &[0x0E, 0x00, 0x00, 0x00]);
+        // codecId/channelId.
+        assert_eq!(buf[6], CODEC_ID);
+        assert_eq!(buf[7], CHANNEL_ID_DATA);
+        // frameIdx LE bytes 8..12.
+        assert_eq!(&buf[8..12], &[0x04, 0x03, 0x02, 0x01]);
+        // numRegions LE bytes 12..14.
+        assert_eq!(&buf[12..14], &[0x01, 0x00]);
+    }
+
+    #[test]
+    fn rfx_frame_begin_roundtrip_negative_num_regions() {
+        // numRegions is i16; verify the two's-complement cast roundtrips
+        // for i16::MIN (worst case for sign extension).
+        let f = RfxFrameBegin {
+            frame_idx: 0xCAFEBABE,
+            num_regions: i16::MIN,
+        };
+        let d = roundtrip(&f);
+        assert_eq!(d, f);
+    }
+
+    #[test]
+    fn rfx_frame_begin_decode_rejects_wrong_block_len() {
+        let f = RfxFrameBegin {
+            frame_idx: 0,
+            num_regions: 1,
+        };
+        let mut buf = vec![0u8; RFX_FRAME_BEGIN_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[2] = 0xFF;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxFrameBegin::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_frame_begin_decode_rejects_wrong_codec_id() {
+        let f = RfxFrameBegin {
+            frame_idx: 0,
+            num_regions: 1,
+        };
+        let mut buf = vec![0u8; RFX_FRAME_BEGIN_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[6] = 0x02;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxFrameBegin::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_frame_begin_decode_rejects_wrong_block_type() {
+        let f = RfxFrameBegin {
+            frame_idx: 1,
+            num_regions: 1,
+        };
+        let mut buf = vec![0u8; RFX_FRAME_BEGIN_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[0] = 0xC0; // -> WBT_SYNC
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxFrameBegin::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_frame_begin_decode_rejects_wrong_channel_id() {
+        let f = RfxFrameBegin {
+            frame_idx: 1,
+            num_regions: 1,
+        };
+        let mut buf = vec![0u8; RFX_FRAME_BEGIN_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[7] = CHANNEL_ID_CONTEXT;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxFrameBegin::decode(&mut src).is_err());
+    }
+
+    // ── FRAME_END tests ──────────────────────────────────────────
+
+    #[test]
+    fn rfx_frame_end_roundtrip() {
+        let f = RfxFrameEnd;
+        let d = roundtrip(&f);
+        assert_eq!(d, f);
+        assert_eq!(f.size(), RFX_FRAME_END_SIZE);
+    }
+
+    #[test]
+    fn rfx_frame_end_byte_layout() {
+        let f = RfxFrameEnd;
+        let mut buf = vec![0u8; RFX_FRAME_END_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        assert_eq!(&buf[..2], &[0xC5, 0xCC]); // WBT_FRAME_END (0xCCC5) LE
+        assert_eq!(&buf[2..6], &[0x08, 0x00, 0x00, 0x00]); // blockLen=8
+        assert_eq!(buf[6], CODEC_ID);
+        assert_eq!(buf[7], CHANNEL_ID_DATA);
+    }
+
+    #[test]
+    fn rfx_frame_end_decode_rejects_wrong_block_type() {
+        let f = RfxFrameEnd;
+        let mut buf = vec![0u8; RFX_FRAME_END_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[0] = 0xC0; // -> WBT_SYNC
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxFrameEnd::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_frame_end_decode_rejects_wrong_codec_id() {
+        let f = RfxFrameEnd;
+        let mut buf = vec![0u8; RFX_FRAME_END_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[6] = 0x02;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxFrameEnd::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_frame_end_decode_rejects_wrong_channel_id() {
+        let f = RfxFrameEnd;
+        let mut buf = vec![0u8; RFX_FRAME_END_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[7] = CHANNEL_ID_CONTEXT;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxFrameEnd::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_frame_end_decode_rejects_wrong_block_len() {
+        let f = RfxFrameEnd;
+        let mut buf = vec![0u8; RFX_FRAME_END_SIZE];
+        f.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[2] = 0xFF;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxFrameEnd::decode(&mut src).is_err());
+    }
+
+    // ── RECT + REGION tests ──────────────────────────────────────
+
+    #[test]
+    fn rfx_rect_roundtrip() {
+        let r = RfxRect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        };
+        let d = roundtrip(&r);
+        assert_eq!(d, r);
+        assert_eq!(r.size(), RFX_RECT_SIZE);
+    }
+
+    #[test]
+    fn rfx_rect_boundary_values_roundtrip() {
+        for r in [
+            RfxRect { x: 0, y: 0, width: 0, height: 0 },
+            RfxRect {
+                x: u16::MAX,
+                y: u16::MAX,
+                width: u16::MAX,
+                height: u16::MAX,
+            },
+            RfxRect { x: 0, y: u16::MAX, width: u16::MAX, height: 0 },
+        ] {
+            let d = roundtrip(&r);
+            assert_eq!(d, r);
+        }
+    }
+
+    #[test]
+    fn rfx_rect_byte_layout() {
+        let r = RfxRect {
+            x: 0x0102,
+            y: 0x0304,
+            width: 0x0506,
+            height: 0x0708,
+        };
+        let mut buf = [0u8; RFX_RECT_SIZE];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // x → y → width → height, all u16 LE.
+        assert_eq!(&buf, &[0x02, 0x01, 0x04, 0x03, 0x06, 0x05, 0x08, 0x07]);
+    }
+
+    #[test]
+    fn rfx_region_zero_rects_roundtrip() {
+        let r = RfxRegion { rects: vec![] };
+        let d = roundtrip(&r);
+        assert_eq!(d, r);
+        // header(8) + regionFlags(1) + numRects(2) + 0 + regionType(2) + numTilesets(2) = 15
+        assert_eq!(r.size(), 15);
+    }
+
+    #[test]
+    fn rfx_region_single_rect_roundtrip() {
+        let r = RfxRegion {
+            rects: vec![RfxRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }],
+        };
+        let d = roundtrip(&r);
+        assert_eq!(d, r);
+        assert_eq!(r.size(), 15 + 8);
+    }
+
+    #[test]
+    fn rfx_region_multi_rect_roundtrip() {
+        let rects = (0..5)
+            .map(|i| RfxRect {
+                x: i * 100,
+                y: i * 100,
+                width: 64,
+                height: 64,
+            })
+            .collect::<Vec<_>>();
+        let r = RfxRegion { rects };
+        let d = roundtrip(&r);
+        assert_eq!(d, r);
+        assert_eq!(r.size(), 15 + 5 * 8);
+    }
+
+    #[test]
+    fn rfx_region_byte_layout_constants() {
+        let r = RfxRegion {
+            rects: vec![RfxRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        };
+        let mut buf = vec![0u8; r.size()];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // header
+        assert_eq!(&buf[..2], &[0xC6, 0xCC]); // WBT_REGION
+        // blockLen = 23 = 15 + 8
+        assert_eq!(&buf[2..6], &[0x17, 0x00, 0x00, 0x00]);
+        assert_eq!(buf[6], CODEC_ID);
+        assert_eq!(buf[7], CHANNEL_ID_DATA);
+        // regionFlags
+        assert_eq!(buf[8], REGION_FLAGS_LRF);
+        // numRects=1
+        assert_eq!(&buf[9..11], &[0x01, 0x00]);
+        // skip 8B rect
+        // regionType = 0xCAC1 LE
+        assert_eq!(&buf[19..21], &[0xC1, 0xCA]);
+        // numTilesets = 0x0001 LE
+        assert_eq!(&buf[21..23], &[0x01, 0x00]);
+    }
+
+    #[test]
+    fn rfx_region_decode_rejects_wrong_block_type() {
+        let r = RfxRegion { rects: vec![] };
+        let mut buf = vec![0u8; r.size()];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[0] = 0xC0; // -> WBT_SYNC
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxRegion::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_region_decode_rejects_wrong_codec_id() {
+        let r = RfxRegion { rects: vec![] };
+        let mut buf = vec![0u8; r.size()];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[6] = 0x02;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxRegion::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_region_decode_rejects_wrong_channel_id() {
+        let r = RfxRegion { rects: vec![] };
+        let mut buf = vec![0u8; r.size()];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[7] = CHANNEL_ID_CONTEXT;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxRegion::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_region_decode_rejects_wrong_region_type() {
+        let r = RfxRegion {
+            rects: vec![RfxRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        };
+        let mut buf = vec![0u8; r.size()];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // regionType is at offset 19..21; write 0xCAC2 (CBT_TILESET) instead.
+        buf[19] = 0xC2;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxRegion::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_region_decode_rejects_wrong_num_tilesets() {
+        let r = RfxRegion {
+            rects: vec![RfxRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        };
+        let mut buf = vec![0u8; r.size()];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        // numTilesets at offset 21..23; corrupt to 0x0002.
+        buf[21] = 0x02;
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxRegion::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_region_decode_rejects_lrf_bit_unset() {
+        let r = RfxRegion { rects: vec![] };
+        let mut buf = vec![0u8; r.size()];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[8] = 0x00; // clear lrf
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxRegion::decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn rfx_region_decode_accepts_reserved_bits_in_region_flags() {
+        let r = RfxRegion { rects: vec![] };
+        let mut buf = vec![0u8; r.size()];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[8] = REGION_FLAGS_LRF | 0xFE; // set every reserved bit
+        let mut src = ReadCursor::new(&buf);
+        let d = RfxRegion::decode(&mut src).unwrap();
+        assert_eq!(d.rects.len(), 0);
+    }
+
+    #[test]
+    fn rfx_region_decode_rejects_blocklen_mismatch() {
+        let r = RfxRegion {
+            rects: vec![RfxRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        };
+        let mut buf = vec![0u8; r.size()];
+        r.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf[2] = 0xFF; // corrupt blockLen
+        let mut src = ReadCursor::new(&buf);
+        assert!(RfxRegion::decode(&mut src).is_err());
     }
 }
