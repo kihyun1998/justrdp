@@ -247,25 +247,55 @@ pub fn encode_pointer_cached(cache_index: u16) -> ServerResult<Vec<u8>> {
     encode_one_fast_path_pdu(FastPathUpdateType::PointerCached, Fragmentation::Single, &payload)
 }
 
+/// Validate that XOR / AND mask buffers have the exact byte count
+/// implied by `width × height` and the per-bpp stride formulas from
+/// MS-RDPBCGR §2.2.9.1.1.4.4 / §2.2.9.1.1.4.5. Used by both color and
+/// new-style pointer encoders so a single source of truth handles the
+/// stride padding rules. Returns a [`ServerError::protocol`] whose
+/// message includes the actual vs expected byte counts to make
+/// debugging mismatched masks straightforward.
+fn validate_pointer_mask_lengths(
+    ctx: &'static str,
+    width: u16,
+    height: u16,
+    xor_bpp: u16,
+    xor_mask_data: &[u8],
+    and_mask_data: &[u8],
+) -> ServerResult<()> {
+    let expected_xor = xor_mask_row_stride(width, xor_bpp) * usize::from(height);
+    let expected_and = and_mask_row_stride(width) * usize::from(height);
+    if xor_mask_data.len() != expected_xor {
+        return Err(ServerError::protocol_owned(alloc::format!(
+            "{ctx}: xor_mask_data length {got} does not match \
+             width * xor_bpp / 8 padded to 2-byte boundary * height \
+             (expected {expected_xor})",
+            got = xor_mask_data.len(),
+        )));
+    }
+    if and_mask_data.len() != expected_and {
+        return Err(ServerError::protocol_owned(alloc::format!(
+            "{ctx}: and_mask_data length {got} does not match \
+             ceil(width / 8) padded to 2-byte boundary * height \
+             (expected {expected_and})",
+            got = and_mask_data.len(),
+        )));
+    }
+    Ok(())
+}
+
 /// Encode a [`FASTPATH_UPDATETYPE_PTR_COLOR`] PDU
 /// (MS-RDPBCGR §2.2.9.1.2.1.9). Validates the 32x32 limit and the
 /// 2-byte AND/XOR mask scan-line padding from §2.2.9.1.1.4.4.
 pub fn encode_pointer_color(c: &PointerColorUpdate) -> ServerResult<Vec<u8>> {
     validate_color_pointer_dimensions(c.width, c.height).map_err(ServerError::from)?;
-    let expected_xor = xor_mask_row_stride(c.width, 24) * usize::from(c.height);
-    let expected_and = and_mask_row_stride(c.width) * usize::from(c.height);
-    if c.xor_mask_data.len() != expected_xor {
-        return Err(ServerError::protocol(
-            "PointerColorUpdate.xor_mask_data length does not match \
-             width * 24bpp / 8 padded to a 2-byte boundary * height",
-        ));
-    }
-    if c.and_mask_data.len() != expected_and {
-        return Err(ServerError::protocol(
-            "PointerColorUpdate.and_mask_data length does not match \
-             ceil(width / 8) padded to a 2-byte boundary * height",
-        ));
-    }
+    validate_pointer_mask_lengths(
+        "PointerColorUpdate",
+        c.width,
+        c.height,
+        24,
+        &c.xor_mask_data,
+        &c.and_mask_data,
+    )?;
     let attr = TsColorPointerAttribute {
         cache_index: c.cache_index,
         hot_spot: c.hot_spot,
@@ -291,20 +321,14 @@ pub fn encode_pointer_new(p: &PointerNewUpdate) -> ServerResult<Vec<u8>> {
             "PointerNewUpdate.xor_bpp must be one of 1/4/8/16/24/32",
         ));
     }
-    let expected_xor = xor_mask_row_stride(p.width, p.xor_bpp) * usize::from(p.height);
-    let expected_and = and_mask_row_stride(p.width) * usize::from(p.height);
-    if p.xor_mask_data.len() != expected_xor {
-        return Err(ServerError::protocol(
-            "PointerNewUpdate.xor_mask_data length does not match \
-             width * xor_bpp / 8 padded to a 2-byte boundary * height",
-        ));
-    }
-    if p.and_mask_data.len() != expected_and {
-        return Err(ServerError::protocol(
-            "PointerNewUpdate.and_mask_data length does not match \
-             ceil(width / 8) padded to a 2-byte boundary * height",
-        ));
-    }
+    validate_pointer_mask_lengths(
+        "PointerNewUpdate",
+        p.width,
+        p.height,
+        p.xor_bpp,
+        &p.xor_mask_data,
+        &p.and_mask_data,
+    )?;
     let attr = TsPointerAttribute {
         xor_bpp: p.xor_bpp,
         color_ptr_attr: TsColorPointerAttribute {

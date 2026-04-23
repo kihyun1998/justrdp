@@ -79,16 +79,11 @@ const FASTPATH_INPUT_KBDFLAGS_EXTENDED1: u16 = 0x0004;
 /// any padding (MS-RDPBCGR §2.2.8.1.1.3.1.1).
 const SLOW_PATH_INPUT_EVENT_SIZE: usize = 12;
 
-/// Translate a slow-path TS_KEYBOARD_EVENT.keyboardFlags value
-/// (MS-RDPBCGR §2.2.8.1.1.3.1.1.1) to the fast-path
-/// `FASTPATH_INPUT_KBDFLAGS_*` bit layout (§2.2.8.1.2.2.1) so handlers
-/// see one representation regardless of input path. KBDFLAGS_DOWN is
-/// not represented in fast-path -- a key press is implied by the
-/// absence of `_RELEASE`.
-/// Map a raw `messageType` (u16) to the typed enum, falling back to
-/// `Err(())` for forward-compatibility values the server does not yet
-/// understand. The slow-path input dispatcher treats `Err(())` as
-/// "skip this event" rather than aborting the whole PDU.
+/// Map a raw slow-path `messageType` (u16) to the typed enum
+/// (MS-RDPBCGR §2.2.8.1.1.3.1.1), falling back to `Err(())` for
+/// forward-compatibility values the server does not yet understand.
+/// The slow-path input dispatcher treats `Err(())` as "skip this
+/// event" rather than aborting the whole PDU.
 fn decode_slow_path_message_type(raw: u16) -> Result<InputEventType, ()> {
     match raw {
         0x0000 => Ok(InputEventType::Synchronize),
@@ -100,6 +95,12 @@ fn decode_slow_path_message_type(raw: u16) -> Result<InputEventType, ()> {
     }
 }
 
+/// Translate a slow-path `TS_KEYBOARD_EVENT.keyboardFlags` value
+/// (MS-RDPBCGR §2.2.8.1.1.3.1.1.1) to the fast-path
+/// `FASTPATH_INPUT_KBDFLAGS_*` bit layout (§2.2.8.1.2.2.1) so handlers
+/// see one representation regardless of input path. `KBDFLAGS_DOWN` is
+/// not represented in fast-path -- a key press is implied by the
+/// absence of `_RELEASE`.
 fn slow_path_kbd_flags_to_fast_path(slow: u16) -> u16 {
     let mut out = 0u16;
     if slow & SLOW_PATH_KBDFLAGS_RELEASE != 0 {
@@ -118,6 +119,17 @@ fn slow_path_kbd_flags_to_fast_path(slow: u16) -> u16 {
 /// before the stage rejects further entries. Mirrors the DoS cap the
 /// acceptor enforces during finalization.
 const MAX_PERSISTENT_KEY_LIST_PDUS: u8 = 64;
+
+/// Hard cap on per-channel SVC reassembly buffer size. Without this,
+/// `ChannelPduHeader.length` (a wire-supplied `u32`) can drive a 4 GiB
+/// `Vec::reserve` from a single FIRST chunk, OOM-killing the server
+/// before any data byte arrives. 16 MiB is comfortably above the
+/// largest message any of the standard SVC protocols (rdpsnd, cliprdr
+/// in non-file mode, rdpdr) actually emits; channel handlers that need
+/// to stream larger payloads (e.g. cliprdr file-transfer mode added in
+/// §11.2c) can either chunk at the application layer or expose a
+/// per-channel cap override on `RdpServerConfig`.
+const MAX_SVC_REASSEMBLY_BYTES: u32 = 16 * 1024 * 1024;
 
 /// First-byte sentinel that disambiguates the two top-level wire framings
 /// the active session will receive:
@@ -341,6 +353,11 @@ impl ServerActiveStage {
         if is_first && is_last {
             // Drop any stale partial buffer the client left behind.
             self.svc_reassembly.retain(|(id, _)| *id != channel_id);
+            if header.length > MAX_SVC_REASSEMBLY_BYTES {
+                return Err(ServerError::protocol(
+                    "single-chunk SVC PDU exceeds MAX_SVC_REASSEMBLY_BYTES",
+                ));
+            }
             let total_len = header.length as usize;
             if chunk.len() != total_len {
                 return Err(ServerError::protocol(
@@ -354,33 +371,66 @@ impl ServerActiveStage {
             }]);
         }
 
-        // Multi-chunk path: locate or create the per-channel state.
-        let entry = if let Some(idx) = self
+        // Multi-chunk path: only create per-channel state once a valid
+        // FIRST chunk arrives. A continuation arriving without an
+        // existing entry is an error; we deliberately do *not* push a
+        // default entry here so a hostile client cannot grow
+        // `svc_reassembly` by spamming lone NEXT chunks across distinct
+        // channel IDs.
+        let entry_idx = self
             .svc_reassembly
             .iter()
-            .position(|(id, _)| *id == channel_id)
-        {
-            &mut self.svc_reassembly[idx].1
-        } else {
-            self.svc_reassembly.push((channel_id, SvcReassembly::default()));
-            &mut self.svc_reassembly.last_mut().unwrap().1
-        };
+            .position(|(id, _)| *id == channel_id);
 
         if is_first {
+            // Cap the declared total before reserve() to prevent a
+            // single FIRST chunk from triggering a 4 GiB allocation.
+            if header.length > MAX_SVC_REASSEMBLY_BYTES {
+                return Err(ServerError::protocol(
+                    "SVC FIRST chunk total length exceeds MAX_SVC_REASSEMBLY_BYTES",
+                ));
+            }
+            let entry = match entry_idx {
+                Some(idx) => &mut self.svc_reassembly[idx].1,
+                None => {
+                    self.svc_reassembly.push((channel_id, SvcReassembly::default()));
+                    &mut self.svc_reassembly.last_mut().unwrap().1
+                }
+            };
             entry.expected_total = header.length;
             entry.buffer.clear();
             entry.buffer.reserve(header.length as usize);
-        } else if entry.buffer.is_empty() {
-            return Err(ServerError::protocol(
-                "SVC continuation chunk received without a preceding \
-                 CHANNEL_FLAG_FIRST",
-            ));
-        } else if header.length != entry.expected_total {
-            return Err(ServerError::protocol(
-                "SVC continuation chunk reports a different total length \
-                 than the FIRST chunk",
-            ));
+        } else {
+            // Continuation chunk: entry MUST already exist (created by
+            // a prior FIRST). If it does not, reject without allocating.
+            let Some(idx) = entry_idx else {
+                return Err(ServerError::protocol(
+                    "SVC continuation chunk received without a preceding \
+                     CHANNEL_FLAG_FIRST",
+                ));
+            };
+            let entry = &self.svc_reassembly[idx].1;
+            if entry.buffer.is_empty() {
+                return Err(ServerError::protocol(
+                    "SVC continuation chunk received without a preceding \
+                     CHANNEL_FLAG_FIRST",
+                ));
+            }
+            if header.length != entry.expected_total {
+                return Err(ServerError::protocol(
+                    "SVC continuation chunk reports a different total length \
+                     than the FIRST chunk",
+                ));
+            }
         }
+
+        // Re-borrow as &mut after the immutable validation borrow above.
+        let entry = &mut self
+            .svc_reassembly
+            .iter_mut()
+            .find(|(id, _)| *id == channel_id)
+            .expect("entry was located or created above")
+            .1;
 
         entry.buffer.extend_from_slice(chunk);
         if entry.buffer.len() > entry.expected_total as usize {
@@ -1497,6 +1547,60 @@ mod tests {
             b"hello",
         );
         assert!(s.process(&bytes, &mut NoopHandler).is_err());
+    }
+
+    #[test]
+    fn svc_first_chunk_with_oversized_total_rejected() {
+        // C-1 regression: a single FIRST chunk declaring length =
+        // 0xFFFF_FFFF MUST be refused before reaching `Vec::reserve`,
+        // otherwise the server would attempt a 4 GiB allocation per
+        // channel from one packet.
+        let mut s = fake_stage();
+        let bytes = wrap_client_svc_chunk(
+            &s,
+            0x03EC,
+            CHANNEL_FLAG_FIRST,
+            u32::MAX,
+            &[0; 10],
+        );
+        let err = s.process(&bytes, &mut NoopHandler).unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("MAX_SVC_REASSEMBLY_BYTES"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn svc_single_chunk_with_oversized_total_rejected() {
+        // C-1 regression for the FIRST | LAST single-chunk path.
+        let mut s = fake_stage();
+        let bytes = wrap_client_svc_chunk(
+            &s,
+            0x03EC,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST,
+            u32::MAX,
+            &[0; 10],
+        );
+        let err = s.process(&bytes, &mut NoopHandler).unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("MAX_SVC_REASSEMBLY_BYTES"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn svc_lone_continuation_does_not_create_state() {
+        // C-2 regression: a NEXT chunk arriving without any preceding
+        // FIRST MUST NOT add an empty entry to `svc_reassembly`. Send
+        // the same continuation 100 times across distinct channels (we
+        // only have one VC in fake_result, so use the same one) and
+        // assert the buffer count stays at zero.
+        let mut s = fake_stage();
+        for _ in 0..100 {
+            let bytes = wrap_client_svc_chunk(&s, 0x03EC, 0, 100, &[0; 50]);
+            assert!(s.process(&bytes, &mut NoopHandler).is_err());
+        }
+        assert!(s.svc_reassembly.is_empty());
     }
 
     #[test]

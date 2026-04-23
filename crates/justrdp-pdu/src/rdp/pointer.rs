@@ -185,8 +185,20 @@ impl Encode for TsColorPointerAttribute {
     }
 }
 
-impl<'de> Decode<'de> for TsColorPointerAttribute {
-    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+impl TsColorPointerAttribute {
+    /// Decode a color pointer attribute whose XOR mask uses the given
+    /// bit depth. `TS_PTRMSGTYPE_COLOR` callers go through the
+    /// [`Decode`] trait (which assumes 24 bpp); `TsPointerAttribute`
+    /// (new-style) calls this with the outer `xor_bpp` field so the
+    /// embedded mask length check picks the right stride.
+    ///
+    /// Validates `lengthXorMask == xor_mask_row_stride(width, xor_bpp) *
+    /// height` and `lengthAndMask == and_mask_row_stride(width) *
+    /// height` (both per MS-RDPBCGR §2.2.9.1.1.4.4 / §2.2.9.1.1.4.5).
+    /// A wire-supplied length that disagrees with the declared
+    /// dimensions is a hostile or corrupt PDU and is rejected before
+    /// the slice is read.
+    pub fn decode_with_bpp(src: &mut ReadCursor<'_>, xor_bpp: u16) -> DecodeResult<Self> {
         let cache_index = src.read_u16_le("TsColorPointerAttribute::cacheIndex")?;
         let hot_spot = TsPoint16::decode(src)?;
         let width = src.read_u16_le("TsColorPointerAttribute::width")?;
@@ -195,6 +207,21 @@ impl<'de> Decode<'de> for TsColorPointerAttribute {
             src.read_u16_le("TsColorPointerAttribute::lengthAndMask")? as usize;
         let length_xor_mask =
             src.read_u16_le("TsColorPointerAttribute::lengthXorMask")? as usize;
+        let expected_xor = xor_mask_row_stride(width, xor_bpp)
+            .saturating_mul(usize::from(height));
+        let expected_and = and_mask_row_stride(width).saturating_mul(usize::from(height));
+        if length_xor_mask != expected_xor {
+            return Err(DecodeError::invalid_value(
+                "TsColorPointerAttribute",
+                "lengthXorMask disagrees with width * xor_bpp / 8 padded * height",
+            ));
+        }
+        if length_and_mask != expected_and {
+            return Err(DecodeError::invalid_value(
+                "TsColorPointerAttribute",
+                "lengthAndMask disagrees with ceil(width / 8) padded * height",
+            ));
+        }
         let xor_mask_data = src
             .read_slice(length_xor_mask, "TsColorPointerAttribute::xorMaskData")?
             .to_vec();
@@ -209,6 +236,14 @@ impl<'de> Decode<'de> for TsColorPointerAttribute {
             xor_mask_data,
             and_mask_data,
         })
+    }
+}
+
+impl<'de> Decode<'de> for TsColorPointerAttribute {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        // TS_PTRMSGTYPE_COLOR mandates 24-bpp XOR data per
+        // MS-RDPBCGR §2.2.9.1.1.4.4.
+        Self::decode_with_bpp(src, 24)
     }
 }
 
@@ -243,7 +278,16 @@ impl Encode for TsPointerAttribute {
 impl<'de> Decode<'de> for TsPointerAttribute {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         let xor_bpp = src.read_u16_le("TsPointerAttribute::xorBpp")?;
-        let color_ptr_attr = TsColorPointerAttribute::decode(src)?;
+        // Validate xor_bpp is one of the spec's legal values before
+        // propagating it into the mask-length check; an invalid value
+        // would otherwise compute nonsensical expected strides.
+        if !matches!(xor_bpp, 1 | 4 | 8 | 16 | 24 | 32) {
+            return Err(DecodeError::invalid_value(
+                "TsPointerAttribute",
+                "xorBpp must be one of 1/4/8/16/24/32",
+            ));
+        }
+        let color_ptr_attr = TsColorPointerAttribute::decode_with_bpp(src, xor_bpp)?;
         Ok(Self {
             xor_bpp,
             color_ptr_attr,
@@ -315,19 +359,21 @@ mod tests {
 
     #[test]
     fn ts_color_pointer_roundtrip_minimal() {
-        // 1×1 cursor: AND mask 1 byte → padded to 2; XOR mask 24bpp → 3 bytes
+        // 1×1 cursor:
+        //   XOR mask @ 24bpp: row_bytes = 3 → padded to 4-byte stride.
+        //   AND mask:         row_bytes = 1 → padded to 2-byte stride.
         let p = TsColorPointerAttribute {
             cache_index: 0,
             hot_spot: TsPoint16 { x_pos: 0, y_pos: 0 },
             width: 1,
             height: 1,
-            xor_mask_data: vec![0xFF, 0x00, 0x00],
+            xor_mask_data: vec![0xFF, 0x00, 0x00, 0x00],
             and_mask_data: vec![0x00, 0x00],
         };
         let buf = encode_to_vec(&p);
         assert_eq!(
             buf.len(),
-            TS_COLOR_POINTER_ATTRIBUTE_FIXED_SIZE + 3 + 2
+            TS_COLOR_POINTER_ATTRIBUTE_FIXED_SIZE + 4 + 2
         );
         let mut c = ReadCursor::new(&buf);
         assert_eq!(TsColorPointerAttribute::decode(&mut c).unwrap(), p);
@@ -411,6 +457,75 @@ mod tests {
         assert_eq!(xor_mask_row_stride(17, 1), 4);
         // 9 px @ 4 bpp = 5 → padded to 6
         assert_eq!(xor_mask_row_stride(9, 4), 6);
+    }
+
+    #[test]
+    fn ts_color_pointer_decode_rejects_mismatched_xor_length() {
+        // W-2 regression: a hostile peer sets lengthXorMask to 65535 on
+        // a 1x1 cursor. The decoder MUST refuse before reading the
+        // 64 KiB slice -- otherwise downstream callers that derive the
+        // stride from width/height would mis-slice the buffer.
+        let mut buf = vec![0u8; TS_COLOR_POINTER_ATTRIBUTE_FIXED_SIZE];
+        let mut c = WriteCursor::new(&mut buf);
+        c.write_u16_le(0, "cacheIndex").unwrap();
+        c.write_u16_le(0, "hotSpot.x").unwrap();
+        c.write_u16_le(0, "hotSpot.y").unwrap();
+        c.write_u16_le(1, "width").unwrap();
+        c.write_u16_le(1, "height").unwrap();
+        c.write_u16_le(2, "lengthAndMask (correct)").unwrap();
+        c.write_u16_le(0xFFFF, "lengthXorMask (bogus)").unwrap();
+        let mut rc = ReadCursor::new(&buf);
+        assert!(TsColorPointerAttribute::decode(&mut rc).is_err());
+    }
+
+    #[test]
+    fn ts_color_pointer_decode_rejects_mismatched_and_length() {
+        let mut buf = vec![0u8; TS_COLOR_POINTER_ATTRIBUTE_FIXED_SIZE];
+        let mut c = WriteCursor::new(&mut buf);
+        c.write_u16_le(0, "cacheIndex").unwrap();
+        c.write_u16_le(0, "hotSpot.x").unwrap();
+        c.write_u16_le(0, "hotSpot.y").unwrap();
+        c.write_u16_le(1, "width").unwrap();
+        c.write_u16_le(1, "height").unwrap();
+        c.write_u16_le(0xFFFF, "lengthAndMask (bogus)").unwrap();
+        c.write_u16_le(4, "lengthXorMask (correct)").unwrap();
+        let mut rc = ReadCursor::new(&buf);
+        assert!(TsColorPointerAttribute::decode(&mut rc).is_err());
+    }
+
+    #[test]
+    fn ts_pointer_attribute_decode_rejects_invalid_xor_bpp() {
+        // W-2 regression: TsPointerAttribute MUST validate xor_bpp ∈
+        // {1,4,8,16,24,32} before propagating it to the inner mask
+        // length check (which would otherwise compute a stride from a
+        // garbage bpp).
+        let mut buf = vec![0u8; 2];
+        let mut c = WriteCursor::new(&mut buf);
+        c.write_u16_le(64, "xorBpp invalid").unwrap();
+        let mut rc = ReadCursor::new(&buf);
+        assert!(TsPointerAttribute::decode(&mut rc).is_err());
+    }
+
+    #[test]
+    fn ts_pointer_attribute_decode_with_xor_bpp_propagates_to_mask_check() {
+        // Build a 4x4 @ 1bpp pointer (XOR stride = 2 bytes/row * 4 = 8;
+        // AND stride = 2 bytes/row * 4 = 8). A correct PDU MUST round-trip;
+        // mutating lengthXorMask to be wrong (e.g., 4) MUST be rejected.
+        let attr = TsPointerAttribute {
+            xor_bpp: 1,
+            color_ptr_attr: TsColorPointerAttribute {
+                cache_index: 0,
+                hot_spot: TsPoint16::default(),
+                width: 4,
+                height: 4,
+                xor_mask_data: vec![0xAA; 8],
+                and_mask_data: vec![0x55; 8],
+            },
+        };
+        let buf = encode_to_vec(&attr);
+        // Sanity: round-trips via Decode trait.
+        let mut rc = ReadCursor::new(&buf);
+        assert_eq!(TsPointerAttribute::decode(&mut rc).unwrap(), attr);
     }
 
     #[test]
