@@ -41,15 +41,21 @@ use justrdp_core::{AsAny, Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_dvc::{DvcError, DvcMessage, DvcProcessor, DvcResult};
 
 use crate::pdu::{
-    CapsAdvertisePdu, CapsConfirmPdu, CreateSurfacePdu, DeleteSurfacePdu, GfxCapSet,
-    GfxMonitorDef, GfxPixelFormat, MapSurfaceToOutputPdu, MapSurfaceToScaledOutputPdu,
-    MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, RdpgfxHeader, ResetGraphicsPdu,
-    RDPGFX_CAPVERSION_10, RDPGFX_CAPVERSION_101, RDPGFX_CAPVERSION_102,
-    RDPGFX_CAPVERSION_103, RDPGFX_CAPVERSION_104, RDPGFX_CAPVERSION_105,
-    RDPGFX_CAPVERSION_106, RDPGFX_CAPVERSION_107, RDPGFX_CAPVERSION_8,
-    RDPGFX_CAPVERSION_81, RDPGFX_CMDID_CREATESURFACE, RDPGFX_CMDID_DELETESURFACE,
+    CapsAdvertisePdu, CapsConfirmPdu, CreateSurfacePdu, DeleteEncodingContextPdu,
+    DeleteSurfacePdu, GfxCapSet, GfxColor32, GfxMonitorDef, GfxPixelFormat, GfxPoint16,
+    GfxRect16, MapSurfaceToOutputPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
+    MapSurfaceToWindowPdu, RdpgfxHeader, ResetGraphicsPdu, SolidFillPdu, SurfaceToSurfacePdu,
+    WireToSurface1Pdu, WireToSurface2Pdu, RDPGFX_CAPS_FLAG_AVC_DISABLED,
+    RDPGFX_CAPS_FLAG_THINCLIENT, RDPGFX_CAPVERSION_10, RDPGFX_CAPVERSION_101,
+    RDPGFX_CAPVERSION_102, RDPGFX_CAPVERSION_103, RDPGFX_CAPVERSION_104,
+    RDPGFX_CAPVERSION_105, RDPGFX_CAPVERSION_106, RDPGFX_CAPVERSION_107,
+    RDPGFX_CAPVERSION_8, RDPGFX_CAPVERSION_81, RDPGFX_CMDID_CREATESURFACE,
+    RDPGFX_CMDID_DELETEENCODINGCONTEXT, RDPGFX_CMDID_DELETESURFACE,
     RDPGFX_CMDID_MAPSURFACETOOUTPUT, RDPGFX_CMDID_MAPSURFACETOSCALEDOUTPUT,
     RDPGFX_CMDID_MAPSURFACETOSCALEDWINDOW, RDPGFX_CMDID_MAPSURFACETOWINDOW,
+    RDPGFX_CMDID_SOLIDFILL, RDPGFX_CMDID_SURFACETOSURFACE, RDPGFX_CMDID_WIRETOSURFACE_1,
+    RDPGFX_CMDID_WIRETOSURFACE_2, RDPGFX_CODECID_AVC420, RDPGFX_CODECID_AVC444,
+    RDPGFX_CODECID_AVC444V2, RDPGFX_CODECID_CAPROGRESSIVE,
 };
 
 /// DVC channel name (MS-RDPEGFX §2.2.5).
@@ -361,6 +367,177 @@ impl GfxServer {
             RDPGFX_CMDID_MAPSURFACETOSCALEDOUTPUT,
             &body,
         )?))
+    }
+
+    /// `RDPGFX_SOLIDFILL_PDU` (MS-RDPEGFX 2.2.2.4).
+    pub fn solid_fill(
+        &self,
+        surface_id: u16,
+        fill_pixel: GfxColor32,
+        fill_rects: Vec<GfxRect16>,
+    ) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        if fill_rects.len() > u16::MAX as usize {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: solid_fill: fillRectCount exceeds u16::MAX",
+            )));
+        }
+        let body = SolidFillPdu {
+            surface_id,
+            fill_pixel,
+            fill_rects,
+        };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_SOLIDFILL,
+            &body,
+        )?))
+    }
+
+    /// `RDPGFX_SURFACE_TO_SURFACE_PDU` (MS-RDPEGFX 2.2.2.5). `src` and
+    /// `dst` MAY be the same surface id (in-place blit).
+    pub fn surface_to_surface(
+        &self,
+        surface_id_src: u16,
+        surface_id_dest: u16,
+        rect_src: GfxRect16,
+        dest_pts: Vec<GfxPoint16>,
+    ) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        if dest_pts.len() > u16::MAX as usize {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: surface_to_surface: destPtsCount exceeds u16::MAX",
+            )));
+        }
+        let body = SurfaceToSurfacePdu {
+            surface_id_src,
+            surface_id_dest,
+            rect_src,
+            dest_pts,
+        };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_SURFACETOSURFACE,
+            &body,
+        )?))
+    }
+
+    /// `RDPGFX_DELETE_ENCODING_CONTEXT_PDU` (MS-RDPEGFX 2.2.2.3).
+    /// Tears down a Progressive RFX persistent context that was
+    /// previously referenced via [`wire_to_surface_2`].
+    pub fn delete_encoding_context(
+        &self,
+        surface_id: u16,
+        codec_context_id: u32,
+    ) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        let body = DeleteEncodingContextPdu {
+            surface_id,
+            codec_context_id,
+        };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_DELETEENCODINGCONTEXT,
+            &body,
+        )?))
+    }
+
+    /// `RDPGFX_WIRE_TO_SURFACE_PDU_1` (MS-RDPEGFX 2.2.2.1).
+    ///
+    /// Codec-based bitmap transfer. The server is responsible for
+    /// producing `bitmap_data` in the codec's native format
+    /// (uncompressed BGRA / RFX wire stream / Planar / ClearCodec /
+    /// AVC4xx). This method packs the PDU but does not transcode --
+    /// callers wire `bitmap_data` directly from the appropriate
+    /// codec encoder (e.g. [`RfxFrameEncoder::encode_frame`] for
+    /// `codec_id = RDPGFX_CODECID_CAVIDEO`).
+    ///
+    /// Caps gating: when the negotiated cap set has
+    /// `RDPGFX_CAPS_FLAG_AVC_DISABLED` set, AVC codec ids
+    /// (AVC420/AVC444/AVC444V2) are rejected.
+    pub fn wire_to_surface_1(
+        &self,
+        surface_id: u16,
+        codec_id: u16,
+        pixel_format: GfxPixelFormat,
+        dest_rect: GfxRect16,
+        bitmap_data: Vec<u8>,
+    ) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        if bitmap_data.len() > u32::MAX as usize {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: wire_to_surface_1: bitmapDataLength exceeds u32::MAX",
+            )));
+        }
+        if matches!(
+            codec_id,
+            RDPGFX_CODECID_AVC420 | RDPGFX_CODECID_AVC444 | RDPGFX_CODECID_AVC444V2,
+        ) && self.avc_disabled()
+        {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: wire_to_surface_1: AVC codec rejected (RDPGFX_CAPS_FLAG_AVC_DISABLED is set)",
+            )));
+        }
+        let body = WireToSurface1Pdu {
+            surface_id,
+            codec_id,
+            pixel_format,
+            dest_rect,
+            bitmap_data,
+        };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_WIRETOSURFACE_1,
+            &body,
+        )?))
+    }
+
+    /// `RDPGFX_WIRE_TO_SURFACE_PDU_2` (MS-RDPEGFX 2.2.2.2). Persistent
+    /// encoding context (Progressive RFX); `codec_id` is hard-coded to
+    /// [`RDPGFX_CODECID_CAPROGRESSIVE`] per spec.
+    ///
+    /// Caps gating: when the negotiated cap set has
+    /// `RDPGFX_CAPS_FLAG_THINCLIENT` set, the client cannot maintain
+    /// persistent codec contexts and this method returns an error.
+    pub fn wire_to_surface_2(
+        &self,
+        surface_id: u16,
+        codec_context_id: u32,
+        pixel_format: GfxPixelFormat,
+        bitmap_data: Vec<u8>,
+    ) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        if bitmap_data.len() > u32::MAX as usize {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: wire_to_surface_2: bitmapDataLength exceeds u32::MAX",
+            )));
+        }
+        if self.thin_client() {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: wire_to_surface_2: rejected (RDPGFX_CAPS_FLAG_THINCLIENT is set)",
+            )));
+        }
+        let body = WireToSurface2Pdu {
+            surface_id,
+            codec_id: RDPGFX_CODECID_CAPROGRESSIVE,
+            codec_context_id,
+            pixel_format,
+            bitmap_data,
+        };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_WIRETOSURFACE_2,
+            &body,
+        )?))
+    }
+
+    fn avc_disabled(&self) -> bool {
+        self.negotiated
+            .as_ref()
+            .map(|cs| cs.flags & RDPGFX_CAPS_FLAG_AVC_DISABLED != 0)
+            .unwrap_or(false)
+    }
+
+    fn thin_client(&self) -> bool {
+        self.negotiated
+            .as_ref()
+            .map(|cs| cs.flags & RDPGFX_CAPS_FLAG_THINCLIENT != 0)
+            .unwrap_or(false)
     }
 
     /// `RDPGFX_MAP_SURFACE_TO_SCALED_WINDOW_PDU` (MS-RDPEGFX 2.2.2.23).
@@ -867,6 +1044,240 @@ mod tests {
         assert_eq!(body.mapped_height, 600);
         assert_eq!(body.target_width, 1024);
         assert_eq!(body.target_height, 768);
+    }
+
+    // ── Bitmap commands (Commit 2) ───────────────────────────────
+
+    fn rect(left: u16, top: u16, right: u16, bottom: u16) -> GfxRect16 {
+        GfxRect16 {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn solid_fill_roundtrip_zero_one_many_rects() {
+        use crate::pdu::RDPGFX_CMDID_SOLIDFILL;
+        let s = activated();
+        for rects in [
+            vec![],
+            vec![rect(0, 0, 64, 64)],
+            vec![rect(0, 0, 32, 32), rect(32, 32, 64, 64), rect(0, 32, 32, 64)],
+        ] {
+            let msg = s
+                .solid_fill(
+                    7,
+                    GfxColor32 { b: 0xFF, g: 0xAA, r: 0x55, xa: 0xFF },
+                    rects.clone(),
+                )
+                .unwrap();
+            let cmd = unwrap_single(&msg);
+            let hdr = parse_command_header(cmd);
+            assert_eq!(hdr.cmd_id, RDPGFX_CMDID_SOLIDFILL);
+            assert_eq!(hdr.pdu_length as usize, cmd.len());
+            let body = SolidFillPdu::decode(&mut ReadCursor::new(
+                &cmd[RdpgfxHeader::WIRE_SIZE..],
+            ))
+            .unwrap();
+            assert_eq!(body.surface_id, 7);
+            assert_eq!(body.fill_rects, rects);
+        }
+    }
+
+    #[test]
+    fn surface_to_surface_roundtrip() {
+        use crate::pdu::RDPGFX_CMDID_SURFACETOSURFACE;
+        let s = activated();
+        let dest_pts = vec![
+            GfxPoint16 { x: 100, y: 200 },
+            GfxPoint16 { x: 300, y: 400 },
+        ];
+        let msg = s
+            .surface_to_surface(1, 2, rect(0, 0, 64, 64), dest_pts.clone())
+            .unwrap();
+        let cmd = unwrap_single(&msg);
+        let hdr = parse_command_header(cmd);
+        assert_eq!(hdr.cmd_id, RDPGFX_CMDID_SURFACETOSURFACE);
+        assert_eq!(hdr.pdu_length as usize, cmd.len());
+        let body = SurfaceToSurfacePdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.surface_id_src, 1);
+        assert_eq!(body.surface_id_dest, 2);
+        assert_eq!(body.dest_pts, dest_pts);
+    }
+
+    #[test]
+    fn delete_encoding_context_roundtrip() {
+        use crate::pdu::RDPGFX_CMDID_DELETEENCODINGCONTEXT;
+        let s = activated();
+        let msg = s.delete_encoding_context(9, 0xCAFE_BABE).unwrap();
+        let cmd = unwrap_single(&msg);
+        assert_eq!(parse_command_header(cmd).cmd_id, RDPGFX_CMDID_DELETEENCODINGCONTEXT);
+        let body = DeleteEncodingContextPdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.surface_id, 9);
+        assert_eq!(body.codec_context_id, 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn wire_to_surface_1_uncompressed_roundtrip() {
+        use crate::pdu::{RDPGFX_CMDID_WIRETOSURFACE_1, RDPGFX_CODECID_UNCOMPRESSED};
+        let s = activated();
+        let payload = vec![0xAB; 256];
+        let msg = s
+            .wire_to_surface_1(
+                3,
+                RDPGFX_CODECID_UNCOMPRESSED,
+                GfxPixelFormat::XRGB_8888,
+                rect(10, 20, 74, 84),
+                payload.clone(),
+            )
+            .unwrap();
+        let cmd = unwrap_single(&msg);
+        let hdr = parse_command_header(cmd);
+        assert_eq!(hdr.cmd_id, RDPGFX_CMDID_WIRETOSURFACE_1);
+        assert_eq!(hdr.pdu_length as usize, cmd.len());
+        let body = WireToSurface1Pdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.surface_id, 3);
+        assert_eq!(body.codec_id, RDPGFX_CODECID_UNCOMPRESSED);
+        assert_eq!(body.pixel_format.0, PIXEL_FORMAT_XRGB_8888);
+        assert_eq!(body.bitmap_data, payload);
+    }
+
+    #[test]
+    fn wire_to_surface_1_rfx_roundtrip() {
+        use crate::pdu::{RDPGFX_CMDID_WIRETOSURFACE_1, RDPGFX_CODECID_CAVIDEO};
+        let s = activated();
+        let msg = s
+            .wire_to_surface_1(
+                4,
+                RDPGFX_CODECID_CAVIDEO,
+                GfxPixelFormat::XRGB_8888,
+                rect(0, 0, 64, 64),
+                vec![0u8; 1024],
+            )
+            .unwrap();
+        let cmd = unwrap_single(&msg);
+        assert_eq!(parse_command_header(cmd).cmd_id, RDPGFX_CMDID_WIRETOSURFACE_1);
+        let body = WireToSurface1Pdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.codec_id, RDPGFX_CODECID_CAVIDEO);
+    }
+
+    #[test]
+    fn wire_to_surface_1_rejects_avc_when_disabled() {
+        use crate::pdu::{RDPGFX_CAPS_FLAG_AVC_DISABLED, RDPGFX_CODECID_AVC420, RDPGFX_CODECID_AVC444};
+        // Force a negotiated cap set with AVC_DISABLED flag on.
+        let mut s = GfxServer::new();
+        s.start(1).unwrap();
+        let pdu = CapsAdvertisePdu {
+            cap_sets: vec![GfxCapSet {
+                version: RDPGFX_CAPVERSION_10,
+                flags: RDPGFX_CAPS_FLAG_AVC_DISABLED,
+            }],
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        pdu.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        s.process(1, &buf).unwrap();
+        // Each AVC codec must be rejected.
+        for codec in [RDPGFX_CODECID_AVC420, RDPGFX_CODECID_AVC444] {
+            assert!(s
+                .wire_to_surface_1(1, codec, GfxPixelFormat::XRGB_8888, rect(0, 0, 1, 1), vec![])
+                .is_err());
+        }
+        // Non-AVC codec still works.
+        use crate::pdu::RDPGFX_CODECID_UNCOMPRESSED;
+        assert!(s
+            .wire_to_surface_1(
+                1,
+                RDPGFX_CODECID_UNCOMPRESSED,
+                GfxPixelFormat::XRGB_8888,
+                rect(0, 0, 1, 1),
+                vec![0xFF; 4],
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn wire_to_surface_1_allows_avc_when_not_disabled() {
+        use crate::pdu::RDPGFX_CODECID_AVC420;
+        let s = activated(); // default flags = 0, AVC enabled
+        assert!(s
+            .wire_to_surface_1(1, RDPGFX_CODECID_AVC420, GfxPixelFormat::XRGB_8888, rect(0, 0, 1, 1), vec![])
+            .is_ok());
+    }
+
+    #[test]
+    fn wire_to_surface_2_roundtrip_uses_caprogressive_codec_id() {
+        use crate::pdu::{RDPGFX_CMDID_WIRETOSURFACE_2, RDPGFX_CODECID_CAPROGRESSIVE};
+        let s = activated();
+        let msg = s
+            .wire_to_surface_2(
+                5,
+                0x1234_ABCD,
+                GfxPixelFormat::XRGB_8888,
+                vec![0xCD; 64],
+            )
+            .unwrap();
+        let cmd = unwrap_single(&msg);
+        assert_eq!(parse_command_header(cmd).cmd_id, RDPGFX_CMDID_WIRETOSURFACE_2);
+        let body = WireToSurface2Pdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.surface_id, 5);
+        // Spec: codec_id MUST be CAPROGRESSIVE (server hardcodes it).
+        assert_eq!(body.codec_id, RDPGFX_CODECID_CAPROGRESSIVE);
+        assert_eq!(body.codec_context_id, 0x1234_ABCD);
+        assert_eq!(body.bitmap_data.len(), 64);
+    }
+
+    #[test]
+    fn wire_to_surface_2_rejected_when_thinclient_set() {
+        use crate::pdu::RDPGFX_CAPS_FLAG_THINCLIENT;
+        let mut s = GfxServer::new();
+        s.start(1).unwrap();
+        let pdu = CapsAdvertisePdu {
+            cap_sets: vec![GfxCapSet {
+                version: RDPGFX_CAPVERSION_10,
+                flags: RDPGFX_CAPS_FLAG_THINCLIENT,
+            }],
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        pdu.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        s.process(1, &buf).unwrap();
+        assert!(s
+            .wire_to_surface_2(1, 0, GfxPixelFormat::XRGB_8888, vec![])
+            .is_err());
+    }
+
+    #[test]
+    fn bitmap_commands_gated_by_active_state() {
+        let s = GfxServer::new();
+        assert!(s
+            .solid_fill(1, GfxColor32 { b: 0, g: 0, r: 0, xa: 0xFF }, vec![])
+            .is_err());
+        assert!(s
+            .surface_to_surface(1, 2, rect(0, 0, 1, 1), vec![])
+            .is_err());
+        assert!(s.delete_encoding_context(1, 0).is_err());
+        assert!(s
+            .wire_to_surface_1(1, 0, GfxPixelFormat::XRGB_8888, rect(0, 0, 1, 1), vec![])
+            .is_err());
+        assert!(s
+            .wire_to_surface_2(1, 0, GfxPixelFormat::XRGB_8888, vec![])
+            .is_err());
     }
 
     // Single, separate version constants in the test scope — pull
