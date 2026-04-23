@@ -1,0 +1,21 @@
+[package]
+name = "justrdp-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Extensible RDP server skeleton for JustRDP"
+keywords = ["rdp", "server"]
+categories = ["no-std", "network-programming"]
+
+[features]
+default = ["alloc"]
+alloc = ["justrdp-core/alloc", "justrdp-pdu/alloc", "justrdp-acceptor/alloc"]
+std = ["alloc", "justrdp-core/std", "justrdp-pdu/std", "justrdp-acceptor/std"]
+
+[dependencies]
+justrdp-core.workspace = true
+justrdp-pdu.workspace = true
+justrdp-acceptor.workspace = true

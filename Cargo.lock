@@ -620,6 +620,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-server"
+version = "0.1.0"
+dependencies = [
+ "justrdp-acceptor",
+ "justrdp-core",
+ "justrdp-pdu",
+]
+
+[[package]]
 name = "justrdp-session"
 version = "0.1.0"
 dependencies = [
