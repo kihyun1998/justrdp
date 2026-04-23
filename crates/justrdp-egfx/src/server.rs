@@ -41,21 +41,24 @@ use justrdp_core::{AsAny, Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_dvc::{DvcError, DvcMessage, DvcProcessor, DvcResult};
 
 use crate::pdu::{
-    CapsAdvertisePdu, CapsConfirmPdu, CreateSurfacePdu, DeleteEncodingContextPdu,
-    DeleteSurfacePdu, GfxCapSet, GfxColor32, GfxMonitorDef, GfxPixelFormat, GfxPoint16,
-    GfxRect16, MapSurfaceToOutputPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
-    MapSurfaceToWindowPdu, RdpgfxHeader, ResetGraphicsPdu, SolidFillPdu, SurfaceToSurfacePdu,
-    WireToSurface1Pdu, WireToSurface2Pdu, RDPGFX_CAPS_FLAG_AVC_DISABLED,
-    RDPGFX_CAPS_FLAG_THINCLIENT, RDPGFX_CAPVERSION_10, RDPGFX_CAPVERSION_101,
-    RDPGFX_CAPVERSION_102, RDPGFX_CAPVERSION_103, RDPGFX_CAPVERSION_104,
-    RDPGFX_CAPVERSION_105, RDPGFX_CAPVERSION_106, RDPGFX_CAPVERSION_107,
-    RDPGFX_CAPVERSION_8, RDPGFX_CAPVERSION_81, RDPGFX_CMDID_CREATESURFACE,
+    CacheImportReplyPdu, CacheToSurfacePdu, CapsAdvertisePdu, CapsConfirmPdu,
+    CreateSurfacePdu, DeleteEncodingContextPdu, DeleteSurfacePdu, EvictCacheEntryPdu,
+    GfxCapSet, GfxColor32, GfxMonitorDef, GfxPixelFormat, GfxPoint16, GfxRect16,
+    MapSurfaceToOutputPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
+    MapSurfaceToWindowPdu, RdpgfxHeader, ResetGraphicsPdu, SolidFillPdu, SurfaceToCachePdu,
+    SurfaceToSurfacePdu, WireToSurface1Pdu, WireToSurface2Pdu, MAX_CACHE_ENTRIES,
+    RDPGFX_CAPS_FLAG_AVC_DISABLED, RDPGFX_CAPS_FLAG_THINCLIENT, RDPGFX_CAPVERSION_10,
+    RDPGFX_CAPVERSION_101, RDPGFX_CAPVERSION_102, RDPGFX_CAPVERSION_103,
+    RDPGFX_CAPVERSION_104, RDPGFX_CAPVERSION_105, RDPGFX_CAPVERSION_106,
+    RDPGFX_CAPVERSION_107, RDPGFX_CAPVERSION_8, RDPGFX_CAPVERSION_81,
+    RDPGFX_CMDID_CACHEIMPORTREPLY, RDPGFX_CMDID_CACHETOSURFACE, RDPGFX_CMDID_CREATESURFACE,
     RDPGFX_CMDID_DELETEENCODINGCONTEXT, RDPGFX_CMDID_DELETESURFACE,
-    RDPGFX_CMDID_MAPSURFACETOOUTPUT, RDPGFX_CMDID_MAPSURFACETOSCALEDOUTPUT,
-    RDPGFX_CMDID_MAPSURFACETOSCALEDWINDOW, RDPGFX_CMDID_MAPSURFACETOWINDOW,
-    RDPGFX_CMDID_SOLIDFILL, RDPGFX_CMDID_SURFACETOSURFACE, RDPGFX_CMDID_WIRETOSURFACE_1,
-    RDPGFX_CMDID_WIRETOSURFACE_2, RDPGFX_CODECID_AVC420, RDPGFX_CODECID_AVC444,
-    RDPGFX_CODECID_AVC444V2, RDPGFX_CODECID_CAPROGRESSIVE,
+    RDPGFX_CMDID_EVICTCACHEENTRY, RDPGFX_CMDID_MAPSURFACETOOUTPUT,
+    RDPGFX_CMDID_MAPSURFACETOSCALEDOUTPUT, RDPGFX_CMDID_MAPSURFACETOSCALEDWINDOW,
+    RDPGFX_CMDID_MAPSURFACETOWINDOW, RDPGFX_CMDID_SOLIDFILL,
+    RDPGFX_CMDID_SURFACETOCACHE, RDPGFX_CMDID_SURFACETOSURFACE,
+    RDPGFX_CMDID_WIRETOSURFACE_1, RDPGFX_CMDID_WIRETOSURFACE_2, RDPGFX_CODECID_AVC420,
+    RDPGFX_CODECID_AVC444, RDPGFX_CODECID_AVC444V2, RDPGFX_CODECID_CAPROGRESSIVE,
 };
 
 /// DVC channel name (MS-RDPEGFX §2.2.5).
@@ -522,6 +525,100 @@ impl GfxServer {
         };
         Ok(Self::wrap_single(Self::encode_command(
             RDPGFX_CMDID_WIRETOSURFACE_2,
+            &body,
+        )?))
+    }
+
+    /// `RDPGFX_SURFACE_TO_CACHE_PDU` (MS-RDPEGFX 2.2.2.6). Snapshot a
+    /// surface region into a persistent cache slot identified by
+    /// `cache_key`. `cache_slot` MUST be in `0..MAX_CACHE_ENTRIES`
+    /// (5461) per spec.
+    pub fn surface_to_cache(
+        &self,
+        surface_id: u16,
+        cache_key: u64,
+        cache_slot: u16,
+        rect_src: GfxRect16,
+    ) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        if cache_slot >= MAX_CACHE_ENTRIES {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: surface_to_cache: cacheSlot exceeds MAX_CACHE_ENTRIES",
+            )));
+        }
+        let body = SurfaceToCachePdu {
+            surface_id,
+            cache_key,
+            cache_slot,
+            rect_src,
+        };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_SURFACETOCACHE,
+            &body,
+        )?))
+    }
+
+    /// `RDPGFX_CACHE_TO_SURFACE_PDU` (MS-RDPEGFX 2.2.2.7). Splat a
+    /// previously cached bitmap to one or more `dest_pts` on
+    /// `surface_id`.
+    pub fn cache_to_surface(
+        &self,
+        cache_slot: u16,
+        surface_id: u16,
+        dest_pts: Vec<GfxPoint16>,
+    ) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        if dest_pts.len() > u16::MAX as usize {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: cache_to_surface: destPtsCount exceeds u16::MAX",
+            )));
+        }
+        if cache_slot >= MAX_CACHE_ENTRIES {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: cache_to_surface: cacheSlot exceeds MAX_CACHE_ENTRIES",
+            )));
+        }
+        let body = CacheToSurfacePdu {
+            cache_slot,
+            surface_id,
+            dest_pts,
+        };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_CACHETOSURFACE,
+            &body,
+        )?))
+    }
+
+    /// `RDPGFX_EVICT_CACHE_ENTRY_PDU` (MS-RDPEGFX 2.2.2.8). Evict a
+    /// single cache slot.
+    pub fn evict_cache_entry(&self, cache_slot: u16) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        if cache_slot >= MAX_CACHE_ENTRIES {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: evict_cache_entry: cacheSlot exceeds MAX_CACHE_ENTRIES",
+            )));
+        }
+        let body = EvictCacheEntryPdu { cache_slot };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_EVICTCACHEENTRY,
+            &body,
+        )?))
+    }
+
+    /// `RDPGFX_CACHE_IMPORT_REPLY_PDU` (MS-RDPEGFX 2.2.2.17). Server's
+    /// response to a client `CacheImportOffer` listing the cache slots
+    /// the server accepted. Empty slot list (server rejected every
+    /// offered entry) is wire-legal.
+    pub fn cache_import_reply(&self, cache_slots: Vec<u16>) -> DvcResult<DvcMessage> {
+        self.ensure_active()?;
+        if cache_slots.len() > MAX_CACHE_ENTRIES as usize {
+            return Err(DvcError::Protocol(String::from(
+                "GfxServer: cache_import_reply: count exceeds MAX_CACHE_ENTRIES",
+            )));
+        }
+        let body = CacheImportReplyPdu { cache_slots };
+        Ok(Self::wrap_single(Self::encode_command(
+            RDPGFX_CMDID_CACHEIMPORTREPLY,
             &body,
         )?))
     }
@@ -1260,6 +1357,108 @@ mod tests {
         assert!(s
             .wire_to_surface_2(1, 0, GfxPixelFormat::XRGB_8888, vec![])
             .is_err());
+    }
+
+    // ── Cache commands (Commit 3) ────────────────────────────────
+
+    #[test]
+    fn surface_to_cache_roundtrip() {
+        use crate::pdu::RDPGFX_CMDID_SURFACETOCACHE;
+        let s = activated();
+        let msg = s
+            .surface_to_cache(3, 0xDEAD_BEEF_CAFE_BABE, 17, rect(0, 0, 64, 64))
+            .unwrap();
+        let cmd = unwrap_single(&msg);
+        let hdr = parse_command_header(cmd);
+        assert_eq!(hdr.cmd_id, RDPGFX_CMDID_SURFACETOCACHE);
+        assert_eq!(hdr.pdu_length as usize, cmd.len());
+        let body = SurfaceToCachePdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.surface_id, 3);
+        assert_eq!(body.cache_key, 0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(body.cache_slot, 17);
+    }
+
+    #[test]
+    fn cache_to_surface_roundtrip() {
+        use crate::pdu::RDPGFX_CMDID_CACHETOSURFACE;
+        let s = activated();
+        let dest_pts = vec![GfxPoint16 { x: 100, y: 200 }];
+        let msg = s.cache_to_surface(17, 3, dest_pts.clone()).unwrap();
+        let cmd = unwrap_single(&msg);
+        assert_eq!(parse_command_header(cmd).cmd_id, RDPGFX_CMDID_CACHETOSURFACE);
+        let body = CacheToSurfacePdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.cache_slot, 17);
+        assert_eq!(body.surface_id, 3);
+        assert_eq!(body.dest_pts, dest_pts);
+    }
+
+    #[test]
+    fn evict_cache_entry_roundtrip() {
+        use crate::pdu::RDPGFX_CMDID_EVICTCACHEENTRY;
+        let s = activated();
+        let msg = s.evict_cache_entry(42).unwrap();
+        let cmd = unwrap_single(&msg);
+        assert_eq!(parse_command_header(cmd).cmd_id, RDPGFX_CMDID_EVICTCACHEENTRY);
+        let body = EvictCacheEntryPdu::decode(&mut ReadCursor::new(
+            &cmd[RdpgfxHeader::WIRE_SIZE..],
+        ))
+        .unwrap();
+        assert_eq!(body.cache_slot, 42);
+    }
+
+    #[test]
+    fn cache_import_reply_roundtrip_zero_one_many_slots() {
+        use crate::pdu::RDPGFX_CMDID_CACHEIMPORTREPLY;
+        let s = activated();
+        for slots in [vec![], vec![1u16], vec![1u16, 2, 3, 4, 5]] {
+            let msg = s.cache_import_reply(slots.clone()).unwrap();
+            let cmd = unwrap_single(&msg);
+            assert_eq!(parse_command_header(cmd).cmd_id, RDPGFX_CMDID_CACHEIMPORTREPLY);
+            let body = CacheImportReplyPdu::decode(&mut ReadCursor::new(
+                &cmd[RdpgfxHeader::WIRE_SIZE..],
+            ))
+            .unwrap();
+            assert_eq!(body.cache_slots, slots);
+        }
+    }
+
+    #[test]
+    fn cache_methods_reject_slot_at_or_above_max_cache_entries() {
+        let s = activated();
+        // MAX_CACHE_ENTRIES = 5461; slot index MUST be < this value.
+        let bad_slot = MAX_CACHE_ENTRIES;
+        assert!(s
+            .surface_to_cache(0, 0, bad_slot, rect(0, 0, 1, 1))
+            .is_err());
+        assert!(s.cache_to_surface(bad_slot, 0, vec![]).is_err());
+        assert!(s.evict_cache_entry(bad_slot).is_err());
+        // Slot at MAX_CACHE_ENTRIES - 1 is the highest legal value.
+        assert!(s.evict_cache_entry(MAX_CACHE_ENTRIES - 1).is_ok());
+    }
+
+    #[test]
+    fn cache_import_reply_rejects_too_many_slots() {
+        let s = activated();
+        let too_many = vec![0u16; (MAX_CACHE_ENTRIES as usize) + 1];
+        assert!(s.cache_import_reply(too_many).is_err());
+        // At cap is fine.
+        let at_cap = vec![0u16; MAX_CACHE_ENTRIES as usize];
+        assert!(s.cache_import_reply(at_cap).is_ok());
+    }
+
+    #[test]
+    fn cache_commands_gated_by_active_state() {
+        let s = GfxServer::new();
+        assert!(s.surface_to_cache(0, 0, 0, rect(0, 0, 1, 1)).is_err());
+        assert!(s.cache_to_surface(0, 0, vec![]).is_err());
+        assert!(s.evict_cache_entry(0).is_err());
+        assert!(s.cache_import_reply(vec![]).is_err());
     }
 
     #[test]
