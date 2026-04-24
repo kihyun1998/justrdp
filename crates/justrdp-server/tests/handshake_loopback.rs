@@ -20,8 +20,8 @@ use justrdp_connector::{
 use justrdp_core::{Decode, Encode, ReadCursor, WriteBuf, WriteCursor};
 use justrdp_pdu::x224::SecurityProtocol;
 use justrdp_server::{
-    encode_bitmap_update, BitmapUpdate, DisplayRect, DisplayUpdate, RdpServerDisplayHandler,
-    RdpServerInputHandler, ServerActiveStage,
+    encode_bitmap_update, BitmapUpdate, DisplayRect, DisplayUpdate, EgfxFrame,
+    RdpServerDisplayHandler, RdpServerInputHandler, ServerActiveStage,
 };
 use justrdp_pdu::rdp::error_info::ErrorInfoCode;
 use justrdp_pdu::rdp::fast_path::{
@@ -766,4 +766,56 @@ fn channel_handlers_roundtrip_over_active_stage() {
         1,
         "SoundServer handler MUST receive on_client_formats exactly once"
     );
+}
+
+// ───────────────────────────────────────────────────────────────
+// GFX pipeline seam smoke test (§11.2d, 4th deliverable)
+// ───────────────────────────────────────────────────────────────
+//
+// The full GfxServer ↔ GfxClient round-trip (RFX / EGFX
+// `WireToSurface` / `FrameAcknowledge`) is covered by the loopback
+// test added in §11.2b-3 (commit a12f1b2). Here we only smoke-test the
+// `get_egfx_frame` seam so a future change to `RdpServerDisplayHandler`
+// cannot silently break the hook the server uses to drain EGFX frames.
+
+/// Display handler that surfaces a pre-built EGFX frame once.
+struct GfxFrameHandler {
+    frame: Option<EgfxFrame>,
+}
+
+impl RdpServerDisplayHandler for GfxFrameHandler {
+    fn get_display_update(&mut self) -> Option<DisplayUpdate> {
+        None
+    }
+    fn get_display_size(&self) -> (u16, u16) {
+        (1024, 768)
+    }
+    fn get_egfx_frame(&mut self) -> Option<EgfxFrame> {
+        self.frame.take()
+    }
+}
+
+#[test]
+fn egfx_frame_seam_surfaces_caller_owned_bytes() {
+    // Pretend two `DrdynvcServer::send_data` payloads came out of a
+    // `GfxServer` — we do not reproduce the GFX encoding here (that is
+    // §11.2b-3's turf). The seam's contract is that whatever the caller
+    // pushes through `EgfxFrame::with_messages` survives round-tripping
+    // through `RdpServerDisplayHandler::get_egfx_frame`.
+    let payload_a = vec![0xE0, 0x04, 0xAA, 0xBB, 0xCC];
+    let payload_b = vec![0xE0, 0x04, 0x11, 0x22, 0x33, 0x44];
+    let frame = EgfxFrame::with_messages(vec![payload_a.clone(), payload_b.clone()]);
+    let mut handler = GfxFrameHandler {
+        frame: Some(frame),
+    };
+
+    // First poll yields the frame with bytes intact.
+    let out = handler
+        .get_egfx_frame()
+        .expect("seam MUST surface the queued EGFX frame");
+    assert_eq!(out.messages.len(), 2);
+    assert_eq!(out.messages[0], payload_a);
+    assert_eq!(out.messages[1], payload_b);
+    // Second poll returns None (default idle response).
+    assert!(handler.get_egfx_frame().is_none());
 }
