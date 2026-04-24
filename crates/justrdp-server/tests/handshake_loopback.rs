@@ -697,6 +697,135 @@ fn standard_security_active_session_fast_path_input_decrypts() {
     );
 }
 
+/// End-to-end Standard-Security active-session loopback: drives the
+/// real handshake through a `ClientConnector` ↔ `ServerAcceptor` pair,
+/// transfers both cipher streams into an `ActiveStage` + client-side
+/// `RdpSecurityContext`, and exercises two bidirectional cases with
+/// encryption on every PDU:
+///
+/// 1. Server emits a bitmap (8x8 32bpp solid), wraps with
+///    `wrap_fast_path_outbound`, client decrypts + recovers the
+///    FastPathOutputUpdate and asserts `update_code == Bitmap`.
+/// 2. Client encrypts a fast-path scancode event, server's active
+///    stage RC4-decrypts via `process()` and dispatches to the
+///    input handler.
+///
+/// The key invariant under test: both cipher streams have been advanced
+/// symmetrically by the 6+6 encrypted slow-path PDUs that flow during
+/// the handshake, so the first active-session PDU encrypted at
+/// seqno=6 on one side MUST decrypt cleanly at seqno=6 on the other.
+/// Any drift in the §5.3.6 MAC seqno accounting between the acceptor's
+/// `wrap_security_payload`/`unwrap_security_payload` helpers and the
+/// connector's `encrypt_and_send_mcs`/`decrypt_server_data` would
+/// surface as a MAC-verify failure at the very first active PDU.
+#[test]
+fn standard_security_active_session_end_to_end_with_live_handshake() {
+    use justrdp_pdu::rdp::server_certificate::encode_proprietary_certificate;
+    use justrdp_pdu::rdp::standard_security::ENCRYPTION_METHOD_128BIT;
+
+    let (priv_key, pub_key) = synthetic_512bit_rsa();
+    let client_random: [u8; 32] = [0x3C; 32];
+    let server_random: [u8; 32] = [0xC3; 32];
+    let cert_blob = encode_proprietary_certificate(&pub_key);
+    let std_cfg = StandardSecurityConfig {
+        encryption_method: ENCRYPTION_METHOD_128BIT,
+        encryption_level: 2,
+        server_random,
+        private_key: priv_key,
+        public_key: pub_key,
+        server_cert_blob: Some(cert_blob),
+    };
+
+    let client_cfg = Config::builder("test-user", "test-pass")
+        .security_protocol(SecurityProtocol::RDP)
+        .client_random(client_random)
+        .build();
+    let acceptor_cfg = AcceptorConfig::builder()
+        .supported_protocols(SecurityProtocol::RDP)
+        .require_enhanced_security(false)
+        .standard_security(std_cfg)
+        .build()
+        .unwrap();
+
+    let client = ClientConnector::new(client_cfg);
+    let acceptor = ServerAcceptor::new(acceptor_cfg);
+    let (mut client, mut acceptor) = drive_full_handshake(client, acceptor);
+
+    // Handoff both cipher streams. Ordering matters: take_security_*
+    // borrows mut; the subsequent state/result reads don't need it.
+    let server_ctx = acceptor
+        .take_security_context()
+        .expect("Standard Security acceptor exposes cipher context");
+    let mut client_ctx = client
+        .take_rc4_security_context()
+        .expect("Standard Security connector exposes cipher context");
+    let result = match acceptor.state() {
+        ServerAcceptorState::Accepted { result } => result.clone(),
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+
+    let config = justrdp_server::RdpServerConfig::builder().build().unwrap();
+    let mut active =
+        ServerActiveStage::new(result, config.clone()).with_security_context(server_ctx);
+
+    // ── Direction 1: server emits an encrypted bitmap ──
+    let plaintext_frames = justrdp_server::encode_bitmap_update(
+        &config,
+        &solid_bitmap_update(0xFF_80_40_20),
+    )
+    .expect("encode_bitmap_update");
+    assert_eq!(
+        plaintext_frames.len(),
+        1,
+        "8x8 32bpp solid fits in one fast-path frame"
+    );
+    let encrypted_frame = active
+        .wrap_fast_path_outbound(&plaintext_frames[0])
+        .expect("wrap_fast_path_outbound on a live-handshake cipher stream");
+
+    // Client-side decrypt: strip FastPathOutputHeader, verify MAC,
+    // RC4-decrypt, then decode the update. Because the handshake has
+    // advanced `client_ctx.decrypt_count` to the same value as the
+    // server's `encrypt_count` for this direction, no seqno offset
+    // gymnastics are required.
+    use justrdp_pdu::rdp::fast_path::FastPathOutputHeader;
+    let mut hc = ReadCursor::new(&encrypted_frame);
+    let enc_hdr = FastPathOutputHeader::decode(&mut hc).unwrap();
+    let header_size = enc_hdr.size();
+    let body = &encrypted_frame[header_size..];
+    let mut mac = [0u8; 8];
+    mac.copy_from_slice(&body[..8]);
+    let mut ciphertext = body[8..].to_vec();
+    let ok = client_ctx.decrypt(&mut ciphertext, &mac);
+    assert!(
+        ok,
+        "client-side MAC verify MUST succeed on the first active-session PDU"
+    );
+    // The recovered plaintext matches the original update body byte-for-byte.
+    let mut plain_hc = ReadCursor::new(&plaintext_frames[0]);
+    let plain_hdr = FastPathOutputHeader::decode(&mut plain_hc).unwrap();
+    let plaintext_body = &plaintext_frames[0][plain_hdr.size()..];
+    assert_eq!(ciphertext.as_slice(), plaintext_body);
+    // And the recovered body decodes as a BITMAP update -- proves the
+    // encrypted frame carries the same payload, not stream-shifted
+    // garbage from a seqno mismatch.
+    let update = FastPathOutputUpdate::decode(&mut ReadCursor::new(&ciphertext)).unwrap();
+    assert_eq!(update.update_code, FastPathUpdateType::Bitmap);
+
+    // ── Direction 2: client encrypts a fast-path scancode ──
+    // Continues the same cipher streams (both contexts now have
+    // encrypt_count += 1 / decrypt_count += 1 from the direction-1
+    // exchange above). A MAC failure here would indicate the
+    // direction-reversed stream drifted, which is the case the §5.3.5
+    // server-side key swap was designed to prevent.
+    let mut input = RecordingInput::default();
+    let scancode_pdu = encrypted_fast_path_scancode_pdu(&mut client_ctx, 0x00, 0x1E);
+    active
+        .process(&scancode_pdu, &mut input)
+        .expect("server MUST decrypt + dispatch encrypted fast-path input");
+    assert_eq!(input.scancodes, vec![(0x0000, 0x1E)]);
+}
+
 /// Slow-path roundtrip: `wrap_slow_path_outbound` on one ActiveStage
 /// produces bytes that `unwrap_slow_path_inbound` on the paired stage
 /// decrypts byte-for-byte.

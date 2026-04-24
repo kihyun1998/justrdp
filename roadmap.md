@@ -3853,5 +3853,13 @@ Phase 8 ▸ Server+Ecosystem   justrdp-acceptor, justrdp-server
 - [x] 활성 세션 fast-path 출력 PDU 가 `FASTPATH_OUTPUT_ENCRYPTED` +
       MAC 으로 왕복 + tamper rejection (S3b 의
       `standard_security_active_session_fast_path_output_wrap_roundtrip`).
-- [ ] §11.2d 에 "TCP loopback + Standard RDP Security" 변형 통합 테스트
-      추가 → real-wire 검증 (mstsc 대상 interop, 선택적).
+- [x] §11.2d 에 "live handshake + Standard Security active session"
+      통합 테스트 추가 --
+      `standard_security_active_session_end_to_end_with_live_handshake`:
+      실제 `ClientConnector ↔ ServerAcceptor` 핸드셰이크로 양쪽 cipher
+      stream 을 6 PDU 만큼 advance 시킨 후, `take_rc4_security_context()`
+      / `take_security_context()` 로 양쪽 context 를 인계해서
+      encrypted 비트맵 emit + encrypted fast-path 입력 scancode 왕복
+      검증. §5.3.5 서버측 키 swap 이 틀렸으면 첫 active PDU 에서
+      MAC-verify 실패로 즉시 드러남. 실서버 mstsc 대상 wire interop
+      은 `justrdp-blocking` TCP loopback 통합 이후 선택적 추가.

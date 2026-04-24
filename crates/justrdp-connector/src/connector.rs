@@ -255,6 +255,36 @@ impl ClientConnector {
         self.selected_protocol
     }
 
+    /// Move the live Standard-RDP-Security RC4 cipher state out of the
+    /// connector, if one was negotiated (i.e. the session went through
+    /// the Security Exchange phase rather than TLS/CredSSP).
+    ///
+    /// Returns `None` for TLS/CredSSP/RDSTLS/AAD sessions (no cipher
+    /// context exists to hand off) and also `None` if the session
+    /// negotiated FIPS -- the resulting context is
+    /// [`FipsSecurityContext`](justrdp_pdu::rdp::standard_security::FipsSecurityContext),
+    /// not `RdpSecurityContext`, and FIPS is not yet wired through
+    /// post-handshake paths (§11.2a-stdsec S3b scope limit).
+    ///
+    /// After this call the connector's internal cipher state is
+    /// replaced with [`SecurityMode::None`], so any subsequent PDU
+    /// processing that expects Standard RDP Security will fail.
+    /// Callers are expected to invoke this exactly once, at the
+    /// handshake-to-active transition.
+    pub fn take_rc4_security_context(
+        &mut self,
+    ) -> Option<justrdp_pdu::rdp::standard_security::RdpSecurityContext> {
+        match core::mem::replace(&mut self.security_mode, SecurityMode::None) {
+            SecurityMode::Rc4(ctx) => Some(ctx),
+            other => {
+                // Put the non-matching variant back so we don't silently
+                // lose a FIPS context or break TLS/NLA sessions.
+                self.security_mode = other;
+                None
+            }
+        }
+    }
+
     /// Get a reference to the connector's [`Config`].
     ///
     /// Useful for I/O runtimes (e.g. `justrdp-blocking`) that need to read
