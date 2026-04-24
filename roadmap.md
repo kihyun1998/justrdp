@@ -3780,29 +3780,45 @@ Phase 8 ▸ Server+Ecosystem   justrdp-acceptor, justrdp-server
 > §11.2d 는 `NoopTlsUpgrader` 어댑터로 TLS 만 우회한 형태). 또한 `xrdp`
 > 같은 PROTOCOL_RDP-only 클라이언트와의 인터롭이 가능해짐.
 
-**작업 항목 (3 commit 추정):**
+**작업 항목 (5 commit 으로 조정됨 -- TSSK 상수 버그 발견으로
+`S1 prep` / `S2 prep` 커밋이 별도 선행 필요):**
 
-- [ ] **S1 -- RSA 인증서 발급**: `ServerAcceptor` 에 `RdpSecurityContext`
-      필드 추가. `justrdp-pdu` 의 `ServerRsaPublicKey` / `ProprietaryCertificate`
-      구조를 사용해서 connection 별 RSA 키쌍 + 자체 서명 인증서 생성.
-      `MCS Connect Response` 의 `SC_SECURITY` 에 `serverRandom` (32B) +
-      `serverCertificate` 첨부.
-- [ ] **S2 -- SecurityExchange PDU 서버 디코드**: 클라이언트가 보내는
-      `Security Exchange PDU` (TPKT 위에서) 를 받아 `EncryptedClientRandom`
-      을 RSA 복호화 → `clientRandom` 회수. `derive_session_keys` 호출로
-      master / session / sign / encrypt / decrypt 키 파생. `RdpSecurityContext`
-      에 키 저장.
+- [x] **S1 prep** -- `justrdp-pdu::rdp::server_certificate`:
+      `TERMINAL_SERVICES_EXPONENT` 버그 수정 (0x00010001 → 0xC0887B5B;
+      FreeRDP `tssk_exponent[]` 과 일치하는 값 확인),
+      `verify_proprietary_signature` 가 spec §5.3.3.1.1 대로 signed
+      region 전체 (12 + pk_blob_len bytes) 를 해싱하도록 수정 (기존엔
+      pk_blob 만 해싱 -- 실제 Windows 서버 proprietary 인증서 검증
+      불가능했던 기존 버그), `encode_proprietary_certificate` 서버측
+      헬퍼 신규 (TSSK 로 서명), 5건 단위 테스트 (emit+parse roundtrip,
+      tampered-bytes rejection, wire-field 스폿체크, TSSK 지수
+      regression anchor) ✅ commit 69b1eb4
+- [x] **S2 prep** -- `justrdp-core::rsa::rsa_private_decrypt_rdp`:
+      raw `m^d mod n` LE (`rsa_public_encrypt_rdp` 의 역연산).
+      Security Exchange 디코드용. 512-bit 키로 왕복 테스트 ✅
+      commit 4ee5f98
+- [ ] **S2 -- 수락 상태 머신 통합**: `AcceptorConfig::standard_security`
+      신규 필드 (`StandardSecurityConfig { encryption_method,
+      encryption_level, server_random, private_key, server_cert_blob }`),
+      `build_server_data_blocks` 가 조건부로 SC_SECURITY 를 실제 cert
+      + random 으로 채우도록 수정, `WaitSecurityExchange` 상태 추가
+      (ChannelJoinDone → WaitSecurityExchange → WaitClientInfo,
+      selected_protocol == RDP 일 때만), Security Exchange PDU
+      디코드 + `rsa_private_decrypt_rdp` + `derive_session_keys`,
+      파생 키를 acceptor 에 보관 (S3 에서 ActiveStage 로 이관)
 - [ ] **S3 -- ActiveStage 송수신 wrap/unwrap**: `ServerActiveStage` 가 모든
-      slow-path 송신을 `encrypt_packet()` + MAC 으로 감싸도록, 모든
-      slow-path 수신을 `decrypt_packet()` + MAC 검증으로 풀도록 통합.
+      slow-path 송신을 `RdpSecurityContext::encrypt` + MAC 으로 감싸도록,
+      모든 slow-path 수신을 `decrypt` + MAC 검증으로 풀도록 통합.
       Fast-path 도 `FASTPATH_*_ENCRYPTED` 플래그 설정 시 동일 처리.
-      Key update (4096B 마다) 트리거.
+      Key update (4096 packet 마다) + `SEC_RESET_SEQNO` 플래그 송신.
+      License PDU / DemandActive PDU 보안 헤더 추가. Acceptor 에서
+      저장한 `RdpSecurityContext` 를 `AcceptanceResult` 로 전달.
 
 **검증:**
 
 - [ ] 클라이언트가 보낸 `EncryptedClientRandom` 을 서버가 풀어 동일한
       `clientRandom` 추출 (round-trip wire 트레이스).
 - [ ] 양쪽 파생 세션 키가 byte-identical.
-- [ ] `ConfirmActive` PDU 가 서버 `decrypt_packet()` 통과.
+- [ ] `ConfirmActive` PDU 가 서버 `decrypt` 통과.
 - [ ] §11.2d 에 "TCP loopback + Standard RDP Security" 변형 통합 테스트
       추가 → 풀 wire-level 검증.
