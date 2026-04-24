@@ -3780,8 +3780,9 @@ Phase 8 ▸ Server+Ecosystem   justrdp-acceptor, justrdp-server
 > §11.2d 는 `NoopTlsUpgrader` 어댑터로 TLS 만 우회한 형태). 또한 `xrdp`
 > 같은 PROTOCOL_RDP-only 클라이언트와의 인터롭이 가능해짐.
 
-**작업 항목 (5 commit 으로 조정됨 -- TSSK 상수 버그 발견으로
-`S1 prep` / `S2 prep` 커밋이 별도 선행 필요):**
+**작업 항목 (6 commit 으로 분할 -- TSSK 상수 버그 발견으로
+`S1 prep` / `S2 prep` 커밋이 별도 선행 필요, S3 도 acceptor 부분(S3a)
+과 ActiveStage 부분(S3b) 으로 분할):**
 
 - [x] **S1 prep** -- `justrdp-pdu::rdp::server_certificate`:
       `TERMINAL_SERVICES_EXPONENT` 버그 수정 (0x00010001 → 0xC0887B5B;
@@ -3797,28 +3798,51 @@ Phase 8 ▸ Server+Ecosystem   justrdp-acceptor, justrdp-server
       raw `m^d mod n` LE (`rsa_public_encrypt_rdp` 의 역연산).
       Security Exchange 디코드용. 512-bit 키로 왕복 테스트 ✅
       commit 4ee5f98
-- [ ] **S2 -- 수락 상태 머신 통합**: `AcceptorConfig::standard_security`
+- [x] **S2 -- 수락 상태 머신 통합**: `AcceptorConfig::standard_security`
       신규 필드 (`StandardSecurityConfig { encryption_method,
-      encryption_level, server_random, private_key, server_cert_blob }`),
-      `build_server_data_blocks` 가 조건부로 SC_SECURITY 를 실제 cert
-      + random 으로 채우도록 수정, `WaitSecurityExchange` 상태 추가
-      (ChannelJoinDone → WaitSecurityExchange → WaitClientInfo,
-      selected_protocol == RDP 일 때만), Security Exchange PDU
+      encryption_level, server_random, private_key, public_key,
+      server_cert_blob }`), `build_server_data_blocks` 가 조건부로
+      SC_SECURITY 를 실제 cert + random 으로 채우도록 수정,
+      `WaitSecurityExchange` 상태 추가 (ChannelJoinDone →
+      WaitSecurityExchange → WaitClientInfo, selected_protocol == RDP
+      + standard_security Some 일 때만), Security Exchange PDU
       디코드 + `rsa_private_decrypt_rdp` + `derive_session_keys`,
-      파생 키를 acceptor 에 보관 (S3 에서 ActiveStage 로 이관)
-- [ ] **S3 -- ActiveStage 송수신 wrap/unwrap**: `ServerActiveStage` 가 모든
-      slow-path 송신을 `RdpSecurityContext::encrypt` + MAC 으로 감싸도록,
+      파생 키를 acceptor 에 보관 (S3a 에서 handshake 완료에 사용, S3b
+      에서 ActiveStage 로 이관). `AcceptorConfig`/`RdpServerConfig`
+      PartialEq/Eq derive 제거 (`RsaPrivateKey` 의 BigUint 가 Eq
+      아니므로). 9건 단위 테스트 (cert emit, null SC_SECURITY,
+      WaitSecurityExchange 전환, 실제 client random 복구 + 키 parity,
+      wrong-channel/missing-flag/wrong-length/FIPS 거부) ✅ commit 6fe4c37
+- [x] **S3a -- acceptor slow-path 암호화 wrap/unwrap**: `wrap_security_payload`
+      / `unwrap_security_payload` 헬퍼 신규, WaitClientInfo + SendLicense
+      + SendDemandActive + WaitConfirmActive + ConnectionFinalization
+      (8 sub-phase) 모두 적용. `derive_session_keys` 반환값은 client
+      시점이므로 서버에서 encrypt/decrypt 키 swap (`§5.3.5` 요구).
+      Security Exchange length 검사 완화 (`modulus_size` 또는
+      `modulus_size + 8` 모두 허용; mstsc 는 +8, JustRDP connector 는
+      +0). 통합 테스트 `standard_security_handshake_reaches_both_terminal_states`
+      -- connector↔acceptor 가 PROTOCOL_RDP + RC4 + MAC 으로 모든
+      encrypted PDU 왕복 + 양쪽 terminal 상태 도달 + client random
+      복구 + session key parity 확인 ✅ commit fd1ae6c
+- [ ] **S3b -- ActiveStage 송수신 wrap/unwrap**: `ServerActiveStage` 가
+      acceptor 에서 `take_security_context` 로 받은 `RdpSecurityContext`
+      을 보관, 모든 slow-path 송신을 `encrypt` + MAC 으로 감싸도록,
       모든 slow-path 수신을 `decrypt` + MAC 검증으로 풀도록 통합.
       Fast-path 도 `FASTPATH_*_ENCRYPTED` 플래그 설정 시 동일 처리.
-      Key update (4096 packet 마다) + `SEC_RESET_SEQNO` 플래그 송신.
-      License PDU / DemandActive PDU 보안 헤더 추가. Acceptor 에서
-      저장한 `RdpSecurityContext` 를 `AcceptanceResult` 로 전달.
+      Key update (4096 packet 마다, `RdpSecurityContext` 가 자동 처리)
+      + `SEC_RESET_SEQNO` 플래그 송신. 활성 세션 통합 테스트 변형
+      (standard security + bitmap emit + input dispatch).
 
 **검증:**
 
-- [ ] 클라이언트가 보낸 `EncryptedClientRandom` 을 서버가 풀어 동일한
-      `clientRandom` 추출 (round-trip wire 트레이스).
-- [ ] 양쪽 파생 세션 키가 byte-identical.
-- [ ] `ConfirmActive` PDU 가 서버 `decrypt` 통과.
+- [x] 클라이언트가 보낸 `EncryptedClientRandom` 을 서버가 풀어 동일한
+      `clientRandom` 추출 (handshake loopback 테스트로 확인).
+- [x] 양쪽 파생 세션 키가 byte-identical (handshake loopback 테스트의
+      `server_keys == expected` 검증).
+- [x] `ConfirmActive` PDU 가 서버 `decrypt` 통과 (handshake loopback
+      이 ConfirmActive 포함 모든 finalization PDU 를 encrypted 로
+      왕복).
+- [ ] 활성 세션 PDU (bitmap/input) 가 양방향 encrypted 로 왕복 (S3b
+      의 active loopback 테스트).
 - [ ] §11.2d 에 "TCP loopback + Standard RDP Security" 변형 통합 테스트
-      추가 → 풀 wire-level 검증.
+      추가 → 풀 wire-level 검증 (S3b 이후 선택적).
