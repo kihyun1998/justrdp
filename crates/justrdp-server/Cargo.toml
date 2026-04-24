@@ -20,3 +20,6 @@ justrdp-core.workspace = true
 justrdp-pdu.workspace = true
 justrdp-acceptor.workspace = true
 justrdp-svc.workspace = true
+
+[dev-dependencies]
+justrdp-connector.workspace = true
