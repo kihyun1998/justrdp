@@ -26,6 +26,7 @@ use justrdp_pdu::rdp::headers::{
     ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
     SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE,
 };
+use justrdp_pdu::rdp::redirection::ServerRedirectionPdu;
 use justrdp_pdu::rdp::pointer::{
     TsCachedPointerAttribute, TsColorPointerAttribute, TsPoint16, TsPointerAttribute,
     and_mask_row_stride, validate_color_pointer_dimensions, xor_mask_row_stride,
@@ -317,6 +318,90 @@ impl ServerActiveStage {
             TpktHeader::try_for_payload(payload_size)?.encode(&mut c)?;
             DataTransfer.encode(&mut c)?;
             ult.encode(&mut c)?;
+        }
+        Ok(buf)
+    }
+
+    /// Encode a Server Redirection PDU (MS-RDPBCGR §2.2.13.3.1
+    /// Enhanced Security form) ready to flush to the client.
+    ///
+    /// Wire layout:
+    ///
+    /// ```text
+    /// TPKT + X.224 DT + MCS SDI on io_channel_id + [
+    ///   ShareControlHeader (totalLength, pduType=0x000A RAW, pduSource),
+    ///   pad2Octets (u16 = 0x0000),
+    ///   RDP_SERVER_REDIRECTION_PACKET,
+    /// ]
+    /// ```
+    ///
+    /// The `pduType` field is written as `0x000A` (the raw
+    /// `ShareControlPduType::ServerRedirect` discriminant) -- NOT
+    /// `ShareControlPduType::to_u16()` which would OR in the `0x0010`
+    /// PDUVersion bit. Per MS-RDPBCGR §2.2.13.3.1 "the PDUVersion
+    /// subfield MUST be set to zero" for Server Redirection PDUs, and
+    /// both Appendix A test vectors confirm `0x0A 0x00` on the wire.
+    ///
+    /// The Standard Security form (MS-RDPBCGR §2.2.13.2.1), which
+    /// prefixes the body with a Non-FIPS security header and
+    /// RC4-encrypts the payload, is NOT emitted here. That path
+    /// requires the key-derivation work tracked under §11.2a-stdsec
+    /// (Appendix G.2). In the meantime the Enhanced Security wire
+    /// form above is what the existing `ClientConnector` decoder
+    /// expects in its finalization loop, so this helper is sufficient
+    /// for end-to-end loopback testing against that client.
+    pub(crate) fn encode_redirection(
+        &self,
+        pdu: &ServerRedirectionPdu,
+    ) -> ServerResult<Vec<u8>> {
+        let body_size = pdu.size();
+        // ShareControl header (6) + pad2Octets (2) + redirection body.
+        let sc_total = SHARE_CONTROL_HEADER_SIZE
+            .checked_add(2)
+            .and_then(|n| n.checked_add(body_size))
+            .ok_or_else(|| ServerError::protocol(
+                "ServerRedirection payload size overflow",
+            ))?;
+        if sc_total > u16::MAX as usize {
+            return Err(ServerError::protocol(
+                "ServerRedirection ShareControl totalLength exceeds u16",
+            ));
+        }
+
+        let mut sc_payload = vec![0u8; sc_total];
+        {
+            let mut c = WriteCursor::new(&mut sc_payload);
+            // ShareControlHeader is emitted manually because
+            // `ShareControlHeader::encode` goes through
+            // `ShareControlPduType::to_u16()` which always sets bit
+            // `0x0010` -- wrong for this PDU (spec mandates PDUVersion = 0).
+            c.write_u16_le(sc_total as u16, "ShareControlHeader::totalLength")?;
+            c.write_u16_le(
+                ShareControlPduType::ServerRedirect as u16,
+                "ShareControlHeader::pduType",
+            )?;
+            c.write_u16_le(
+                self.user_channel_id(),
+                "ShareControlHeader::pduSource",
+            )?;
+            // pad2Octets -- 2 bytes of alignment padding, receiver ignores.
+            c.write_u16_le(0, "ServerRedirection::pad2Octets")?;
+            pdu.encode(&mut c)?;
+        }
+
+        let sdi = SendDataIndication {
+            initiator: self.user_channel_id(),
+            channel_id: self.io_channel_id(),
+            user_data: &sc_payload,
+        };
+        let payload_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let total = TPKT_HEADER_SIZE + payload_size;
+        let mut buf = vec![0u8; total];
+        {
+            let mut c = WriteCursor::new(&mut buf);
+            TpktHeader::try_for_payload(payload_size)?.encode(&mut c)?;
+            DataTransfer.encode(&mut c)?;
+            sdi.encode(&mut c)?;
         }
         Ok(buf)
     }

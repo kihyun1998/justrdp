@@ -38,6 +38,7 @@ use justrdp_pdu::rdp::finalization::{
     ControlAction, ControlPdu, InputEventPdu, InputEventType, PersistentKeyListPdu, RefreshRectPdu,
     ShutdownDeniedPdu, ShutdownRequestPdu, SuppressOutputPdu,
 };
+use justrdp_pdu::rdp::redirection::ServerRedirectionPdu;
 use justrdp_pdu::rdp::headers::{
     ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
 };
@@ -282,6 +283,13 @@ pub struct ServerActiveStage {
     /// Channels without a registered processor fall through to the
     /// [`ActiveStageOutput::SvcData`] opaque-forward path (§11.2a).
     svc_processors: Vec<(u16, Box<dyn SvcServerProcessor>)>,
+    /// `true` once [`emit_redirection`](Self::emit_redirection) has
+    /// successfully produced a frame. Redirection is one-shot per
+    /// active stage -- subsequent attempts return
+    /// `ServerError::protocol(_)` so the caller does not accidentally
+    /// emit two redirection PDUs on the same session (which would
+    /// leave the client in a ambiguous reconnect state).
+    has_emitted_redirection: bool,
 }
 
 impl ServerActiveStage {
@@ -299,6 +307,7 @@ impl ServerActiveStage {
             deactivation_state: DeactivationState::Active,
             pending_display_size: None,
             svc_processors: Vec::new(),
+            has_emitted_redirection: false,
         }
     }
 
@@ -697,6 +706,59 @@ impl ServerActiveStage {
         self.svc_processors
             .iter()
             .any(|(id, _)| *id == channel_id)
+    }
+
+    /// Emit a Server Redirection PDU (MS-RDPBCGR §2.2.13.1). Instructs
+    /// the client to disconnect and reconnect to the target described
+    /// by `pdu` -- typically a different server in a load-balanced
+    /// deployment or a Connection Broker target.
+    ///
+    /// The returned `Vec<u8>` is a single ready-to-flush frame
+    /// (TPKT + X.224 DT + MCS SDI on the I/O channel + ShareControl +
+    /// pad2 + the redirection body). This matches the Enhanced
+    /// Security wire form (MS-RDPBCGR §2.2.13.3.1), which is what the
+    /// existing `ClientConnector` decoder recognizes in its
+    /// finalization loop. The Standard Security variant
+    /// (§2.2.13.2.1 -- RC4-encrypted) is deferred to §11.2a-stdsec.
+    ///
+    /// **One-shot**: calling `emit_redirection` a second time on the
+    /// same stage returns `ServerError::protocol(_)`. Display encoders
+    /// and SVC processor output SHOULD consult
+    /// [`has_emitted_redirection`](Self::has_emitted_redirection) and
+    /// stop producing updates once a redirection PDU is in flight --
+    /// the client will drop the TCP connection shortly after receiving
+    /// it.
+    ///
+    /// **State gating**: only valid in the `Active` deactivation state;
+    /// rejected while a Deactivation-Reactivation sequence is in
+    /// progress (the old `share_id` is invalid during that window, and
+    /// the spec does not define redirection-during-DR semantics).
+    pub fn emit_redirection(
+        &mut self,
+        pdu: &ServerRedirectionPdu,
+    ) -> ServerResult<Vec<u8>> {
+        if self.has_emitted_redirection {
+            return Err(ServerError::protocol(
+                "emit_redirection was already called on this ServerActiveStage",
+            ));
+        }
+        if self.deactivation_state != DeactivationState::Active {
+            return Err(ServerError::protocol(
+                "emit_redirection is not permitted while a \
+                 Deactivation-Reactivation Sequence is in flight",
+            ));
+        }
+        let bytes = self.encode_redirection(pdu)?;
+        self.has_emitted_redirection = true;
+        Ok(bytes)
+    }
+
+    /// Whether [`emit_redirection`](Self::emit_redirection) has already
+    /// produced a frame on this stage. After this returns `true`, no
+    /// further server-to-client PDUs should be sent -- the client will
+    /// drop the TCP connection shortly.
+    pub fn has_emitted_redirection(&self) -> bool {
+        self.has_emitted_redirection
     }
 
     /// Hand a reassembled SVC payload to a registered processor, if any,
@@ -2304,5 +2366,190 @@ mod tests {
             alloc::format!("{err}").contains("processor-side decode failure"),
             "got: {err}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Server Redirection emit tests (§11.2e Commit 1)
+    // ──────────────────────────────────────────────────────────────
+
+    use justrdp_pdu::rdp::headers::{ShareControlHeader, ShareControlPduType};
+    use justrdp_pdu::rdp::redirection::{
+        ServerRedirectionPdu, LB_LOAD_BALANCE_INFO, LB_NOREDIRECT, LB_TARGET_NET_ADDRESS,
+        SEC_REDIRECTION_PKT,
+    };
+
+    /// Peel TPKT + X.224 DT + MCS SDI + ShareControlHeader from a
+    /// redirection frame and return `(sdi_channel_id, header, pad2_bytes, body_bytes)`.
+    fn strip_redirection_frame(bytes: &[u8]) -> (u16, ShareControlHeader, u16, Vec<u8>) {
+        let mut c = ReadCursor::new(bytes);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let sc = ShareControlHeader::decode(&mut inner).unwrap();
+        let pad2 = inner.read_u16_le("pad2").unwrap();
+        let body = inner.peek_remaining().to_vec();
+        (sdi.channel_id, sc, pad2, body)
+    }
+
+    /// UTF-16LE encode `s` with a trailing `\0` word.
+    fn utf16le_nt(s: &str) -> Vec<u8> {
+        let mut out: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    #[test]
+    fn emit_redirection_produces_enhanced_security_frame() {
+        let mut s = fake_stage();
+        let pdu = ServerRedirectionPdu {
+            session_id: 0x1234,
+            redir_flags: LB_TARGET_NET_ADDRESS | LB_LOAD_BALANCE_INFO,
+            target_net_address: Some(utf16le_nt("10.0.0.5")),
+            load_balance_info: Some(b"Cookie: msts=1\r\n".to_vec()),
+            ..Default::default()
+        };
+        let expected_io = s.io_channel_id();
+        let expected_user = s.user_channel_id();
+        let frame = s.emit_redirection(&pdu).unwrap();
+        let (channel_id, sc, pad2, body) = strip_redirection_frame(&frame);
+
+        // SDI targets the I/O channel (not the user channel) -- a wrong
+        // channel_id would cause the client to silently ignore the PDU.
+        assert_eq!(channel_id, expected_io);
+
+        // ShareControlHeader sanity.
+        assert_eq!(sc.pdu_type, ShareControlPduType::ServerRedirect);
+        assert_eq!(sc.pdu_source, expected_user);
+        assert_eq!(pad2, 0);
+
+        // totalLength = ShareControlHeader(6) + pad2(2) + body.size().
+        assert_eq!(
+            sc.total_length as usize,
+            SHARE_CONTROL_HEADER_SIZE + 2 + body.len(),
+        );
+
+        // Decoding the body round-trips the PDU we emitted.
+        let decoded = ServerRedirectionPdu::decode(&mut ReadCursor::new(&body)).unwrap();
+        assert_eq!(decoded, pdu);
+
+        // has_emitted_redirection flipped.
+        assert!(s.has_emitted_redirection());
+    }
+
+    #[test]
+    fn emit_redirection_pdutype_bytes_are_0x0a_no_version_bits() {
+        // MS-RDPBCGR 2.2.13.3.1: the ShareControlHeader pduType for a
+        // Server Redirection PDU MUST have PDUVersion = 0. The wire
+        // bytes at the pduType offset must therefore be `0x0a 0x00`,
+        // not `0x1a 0x00` (which is what `to_u16()` would emit).
+        let mut s = fake_stage();
+        let pdu = ServerRedirectionPdu {
+            session_id: 0,
+            redir_flags: LB_NOREDIRECT,
+            ..Default::default()
+        };
+        let frame = s.emit_redirection(&pdu).unwrap();
+
+        // Walk to the pduType bytes inside the ShareControlHeader.
+        let mut c = ReadCursor::new(&frame);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        // ShareControlHeader = totalLength(2) + pduType(2) + pduSource(2).
+        // pduType starts at offset 2 of the user_data.
+        assert_eq!(
+            sdi.user_data[2], 0x0a,
+            "pduType low byte MUST be 0x0A (ServerRedirect)"
+        );
+        assert_eq!(
+            sdi.user_data[3], 0x00,
+            "pduType high byte MUST be 0x00 (PDUVersion = 0 per spec)"
+        );
+    }
+
+    #[test]
+    fn emit_redirection_one_shot() {
+        let mut s = fake_stage();
+        let pdu = ServerRedirectionPdu {
+            session_id: 0,
+            redir_flags: LB_NOREDIRECT,
+            ..Default::default()
+        };
+        assert!(!s.has_emitted_redirection());
+        s.emit_redirection(&pdu).unwrap();
+        assert!(s.has_emitted_redirection());
+
+        let err = s.emit_redirection(&pdu).unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("already called"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn emit_redirection_blocked_during_deactivation_reactivation() {
+        let mut s = fake_stage();
+        let _ = s.request_deactivation_reactivation(800, 600).unwrap();
+        assert!(s.is_in_deactivation_reactivation());
+
+        let pdu = ServerRedirectionPdu {
+            session_id: 0,
+            redir_flags: LB_NOREDIRECT,
+            ..Default::default()
+        };
+        let err = s.emit_redirection(&pdu).unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("Deactivation-Reactivation"),
+            "got: {err}"
+        );
+        assert!(
+            !s.has_emitted_redirection(),
+            "rejected emit MUST NOT flip the one-shot flag"
+        );
+    }
+
+    #[test]
+    fn emit_redirection_magic_and_length_fields() {
+        // Verify the RDP_SERVER_REDIRECTION_PACKET header on the wire:
+        // Flags = SEC_REDIRECTION_PKT (0x0400), Length = 20 (12 header +
+        // 8 pad) for a header-only packet.
+        let mut s = fake_stage();
+        let pdu = ServerRedirectionPdu {
+            session_id: 7,
+            redir_flags: LB_NOREDIRECT,
+            ..Default::default()
+        };
+        let frame = s.emit_redirection(&pdu).unwrap();
+        let (_ch, _sc, _pad2, body) = strip_redirection_frame(&frame);
+        assert_eq!(body.len(), 20, "12-byte header + 8-byte pad");
+        assert_eq!(&body[0..2], &SEC_REDIRECTION_PKT.to_le_bytes());
+        assert_eq!(&body[2..4], &20u16.to_le_bytes());
+        assert_eq!(&body[4..8], &7u32.to_le_bytes());
+        assert_eq!(&body[8..12], &LB_NOREDIRECT.to_le_bytes());
+        assert_eq!(&body[12..20], &[0u8; 8]);
+    }
+
+    #[test]
+    fn emit_redirection_target_net_addresses_bytes_roundtrip_via_decoder() {
+        use justrdp_pdu::rdp::redirection::{
+            TargetNetAddress, TargetNetAddresses, LB_TARGET_NET_ADDRESSES,
+        };
+        let mut s = fake_stage();
+        let pdu = ServerRedirectionPdu {
+            session_id: 0,
+            redir_flags: LB_TARGET_NET_ADDRESSES,
+            target_net_addresses: Some(TargetNetAddresses {
+                addresses: vec![
+                    TargetNetAddress { address: utf16le_nt("1.1.1.1") },
+                    TargetNetAddress { address: utf16le_nt("2.2.2.2") },
+                ],
+            }),
+            ..Default::default()
+        };
+        let frame = s.emit_redirection(&pdu).unwrap();
+        let (_ch, _sc, _pad2, body) = strip_redirection_frame(&frame);
+        let decoded = ServerRedirectionPdu::decode(&mut ReadCursor::new(&body)).unwrap();
+        assert_eq!(decoded, pdu);
     }
 }

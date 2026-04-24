@@ -22,7 +22,7 @@
 
 use alloc::vec::Vec;
 
-use justrdp_core::{Decode, DecodeError, DecodeResult, ReadCursor};
+use justrdp_core::{Decode, DecodeError, DecodeResult, Encode, EncodeError, EncodeResult, ReadCursor, WriteCursor};
 
 // ── Header constants ──
 
@@ -32,6 +32,11 @@ pub const SEC_REDIRECTION_PKT: u16 = 0x0400;
 
 /// Total size of the fixed header (Flags + Length + SessionID + RedirFlags).
 pub const REDIRECTION_HEADER_SIZE: usize = 12;
+
+/// Number of zero-padding bytes emitted at the end of the body. Both
+/// Microsoft Appendix A test vectors (Standard Security and Enhanced
+/// Security) use exactly 8 bytes; the spec permits "up to 8".
+pub const REDIRECTION_TRAILING_PAD: usize = 8;
 
 // ── RedirFlags bit definitions (MS-RDPBCGR 2.2.13.1) ──
 
@@ -101,6 +106,25 @@ impl<'de> Decode<'de> for TargetNetAddress {
     }
 }
 
+impl Encode for TargetNetAddress {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        let len = u32::try_from(self.address.len()).map_err(|_| {
+            EncodeError::invalid_value("TargetNetAddress", "addressLength > u32::MAX")
+        })?;
+        dst.write_u32_le(len, "TargetNetAddress::addressLength")?;
+        dst.write_slice(&self.address, "TargetNetAddress::address")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "TargetNetAddress"
+    }
+
+    fn size(&self) -> usize {
+        4 + self.address.len()
+    }
+}
+
 /// Collection of target network addresses (MS-RDPBCGR 2.2.13.1.1).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TargetNetAddresses {
@@ -122,6 +146,31 @@ impl<'de> Decode<'de> for TargetNetAddresses {
             addresses.push(TargetNetAddress::decode(src)?);
         }
         Ok(Self { addresses })
+    }
+}
+
+impl Encode for TargetNetAddresses {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        if self.addresses.len() > 256 {
+            return Err(EncodeError::invalid_value(
+                "TargetNetAddresses",
+                "addressCount exceeds 256 (decoder-enforced cap)",
+            ));
+        }
+        let count = self.addresses.len() as u32;
+        dst.write_u32_le(count, "TargetNetAddresses::addressCount")?;
+        for a in &self.addresses {
+            a.encode(dst)?;
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "TargetNetAddresses"
+    }
+
+    fn size(&self) -> usize {
+        4 + self.addresses.iter().map(|a| a.size()).sum::<usize>()
     }
 }
 
@@ -176,6 +225,24 @@ pub struct ServerRedirectionPdu {
 }
 
 impl ServerRedirectionPdu {
+    /// `redir_flags` bits that gate the presence of a data field.
+    /// Other bits (`LB_DONTSTOREUSERNAME`, `LB_SMARTCARD_LOGON`,
+    /// `LB_NOREDIRECT`, `LB_SERVER_TSV_CAPABLE`,
+    /// `LB_PASSWORD_IS_PK_ENCRYPTED`) are modifier bits that do not
+    /// have an associated optional field and are passed through
+    /// untouched during encode.
+    const DATA_FLAG_MASK: u32 = LB_TARGET_NET_ADDRESS
+        | LB_LOAD_BALANCE_INFO
+        | LB_USERNAME
+        | LB_DOMAIN
+        | LB_PASSWORD
+        | LB_TARGET_FQDN
+        | LB_TARGET_NETBIOS_NAME
+        | LB_TARGET_NET_ADDRESSES
+        | LB_CLIENT_TSV_URL
+        | LB_REDIRECTION_GUID
+        | LB_TARGET_CERTIFICATE;
+
     /// Returns `true` if `flag` is set in `redir_flags`.
     pub fn has_flag(&self, flag: u32) -> bool {
         self.redir_flags & flag != 0
@@ -186,6 +253,206 @@ impl ServerRedirectionPdu {
     pub fn is_no_redirect(&self) -> bool {
         self.has_flag(LB_NOREDIRECT)
     }
+
+    /// Derive the data-bit subset of `redir_flags` from which `Option`
+    /// fields are currently `Some`. Used by [`Encode`] to validate
+    /// that the caller kept `redir_flags` and the `Option` fields
+    /// consistent.
+    fn computed_data_flags(&self) -> u32 {
+        let mut f = 0u32;
+        if self.target_net_address.is_some() {
+            f |= LB_TARGET_NET_ADDRESS;
+        }
+        if self.load_balance_info.is_some() {
+            f |= LB_LOAD_BALANCE_INFO;
+        }
+        if self.username.is_some() {
+            f |= LB_USERNAME;
+        }
+        if self.domain.is_some() {
+            f |= LB_DOMAIN;
+        }
+        if self.password.is_some() {
+            f |= LB_PASSWORD;
+        }
+        if self.target_fqdn.is_some() {
+            f |= LB_TARGET_FQDN;
+        }
+        if self.target_netbios_name.is_some() {
+            f |= LB_TARGET_NETBIOS_NAME;
+        }
+        if self.target_net_addresses.is_some() {
+            f |= LB_TARGET_NET_ADDRESSES;
+        }
+        if self.tsv_url.is_some() {
+            f |= LB_CLIENT_TSV_URL;
+        }
+        if self.redirection_guid.is_some() {
+            f |= LB_REDIRECTION_GUID;
+        }
+        if self.target_certificate.is_some() {
+            f |= LB_TARGET_CERTIFICATE;
+        }
+        f
+    }
+
+    /// Byte count of all optional fields that are `Some` (including
+    /// the 4-byte length prefix for each).
+    fn optional_fields_size(&self) -> usize {
+        let mut size = 0;
+        if let Some(v) = &self.target_net_address {
+            size += 4 + v.len();
+        }
+        if let Some(v) = &self.load_balance_info {
+            size += 4 + v.len();
+        }
+        if let Some(v) = &self.username {
+            size += 4 + v.len();
+        }
+        if let Some(v) = &self.domain {
+            size += 4 + v.len();
+        }
+        if let Some(v) = &self.password {
+            size += 4 + v.len();
+        }
+        if let Some(v) = &self.target_fqdn {
+            size += 4 + v.len();
+        }
+        if let Some(v) = &self.target_netbios_name {
+            size += 4 + v.len();
+        }
+        if let Some(tna) = &self.target_net_addresses {
+            size += 4 + tna.size();
+        }
+        if let Some(v) = &self.tsv_url {
+            size += 4 + v.len();
+        }
+        if let Some(v) = &self.redirection_guid {
+            size += 4 + v.len();
+        }
+        if let Some(v) = &self.target_certificate {
+            size += 4 + v.len();
+        }
+        size
+    }
+}
+
+impl Encode for ServerRedirectionPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        // Enforce consistency between `redir_flags` data bits and the
+        // populated `Option` fields. Modifier bits (LB_NOREDIRECT,
+        // LB_SMARTCARD_LOGON, LB_DONTSTOREUSERNAME, LB_SERVER_TSV_CAPABLE,
+        // LB_PASSWORD_IS_PK_ENCRYPTED) are passed through without
+        // affecting the check.
+        let actual = self.redir_flags & Self::DATA_FLAG_MASK;
+        let expected = self.computed_data_flags();
+        if actual != expected {
+            return Err(EncodeError::invalid_value(
+                "ServerRedirectionPdu",
+                "redir_flags data bits disagree with populated Option fields",
+            ));
+        }
+
+        // LB_PASSWORD_IS_PK_ENCRYPTED is a modifier for LB_PASSWORD;
+        // set without the gating data flag it is wire-meaningless and
+        // a common caller bug worth catching early.
+        if self.redir_flags & LB_PASSWORD_IS_PK_ENCRYPTED != 0
+            && self.redir_flags & LB_PASSWORD == 0
+        {
+            return Err(EncodeError::invalid_value(
+                "ServerRedirectionPdu",
+                "LB_PASSWORD_IS_PK_ENCRYPTED set without LB_PASSWORD",
+            ));
+        }
+
+        let total = self.size();
+        let total_u16 = u16::try_from(total).map_err(|_| {
+            EncodeError::invalid_value("ServerRedirectionPdu", "length exceeds u16::MAX")
+        })?;
+
+        // Fixed header.
+        dst.write_u16_le(SEC_REDIRECTION_PKT, "ServerRedirectionPdu::flags")?;
+        dst.write_u16_le(total_u16, "ServerRedirectionPdu::length")?;
+        dst.write_u32_le(self.session_id, "ServerRedirectionPdu::sessionId")?;
+        dst.write_u32_le(self.redir_flags, "ServerRedirectionPdu::redirFlags")?;
+
+        // Optional fields appear in the order the decoder expects them
+        // (MS-RDPBCGR 2.2.13.1 plus the Appendix A annotated layout).
+        if let Some(v) = &self.target_net_address {
+            write_length_prefixed(dst, v, "targetNetAddress")?;
+        }
+        if let Some(v) = &self.load_balance_info {
+            write_length_prefixed(dst, v, "loadBalanceInfo")?;
+        }
+        if let Some(v) = &self.username {
+            write_length_prefixed(dst, v, "userName")?;
+        }
+        if let Some(v) = &self.domain {
+            write_length_prefixed(dst, v, "domain")?;
+        }
+        if let Some(v) = &self.password {
+            write_length_prefixed(dst, v, "password")?;
+        }
+        if let Some(v) = &self.target_fqdn {
+            write_length_prefixed(dst, v, "targetFQDN")?;
+        }
+        if let Some(v) = &self.target_netbios_name {
+            write_length_prefixed(dst, v, "targetNetBiosName")?;
+        }
+        // Structured TargetNetAddresses: outer u32 length prefix wraps
+        // the `addressCount` + `TARGET_NET_ADDRESS[]` body.
+        if let Some(tna) = &self.target_net_addresses {
+            let inner = u32::try_from(tna.size()).map_err(|_| {
+                EncodeError::invalid_value(
+                    "ServerRedirectionPdu",
+                    "targetNetAddressesLength exceeds u32::MAX",
+                )
+            })?;
+            dst.write_u32_le(inner, "ServerRedirectionPdu::targetNetAddressesLength")?;
+            tna.encode(dst)?;
+        }
+        if let Some(v) = &self.tsv_url {
+            write_length_prefixed(dst, v, "tsvUrl")?;
+        }
+        if let Some(v) = &self.redirection_guid {
+            write_length_prefixed(dst, v, "redirectionGuid")?;
+        }
+        if let Some(v) = &self.target_certificate {
+            write_length_prefixed(dst, v, "targetCertificate")?;
+        }
+
+        // Trailing pad: both Microsoft Appendix A examples use 8 bytes.
+        dst.write_slice(&[0u8; REDIRECTION_TRAILING_PAD], "ServerRedirectionPdu::pad")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "ServerRedirectionPdu"
+    }
+
+    fn size(&self) -> usize {
+        REDIRECTION_HEADER_SIZE + self.optional_fields_size() + REDIRECTION_TRAILING_PAD
+    }
+}
+
+/// Write a `u32 LE` length prefix followed by `value` bytes. The
+/// `_name_hint` is for human-debuggable error messages only; the actual
+/// WriteCursor context string is a static "ServerRedirectionPdu::field"
+/// prefix.
+fn write_length_prefixed(
+    dst: &mut WriteCursor<'_>,
+    value: &[u8],
+    _name_hint: &'static str,
+) -> EncodeResult<()> {
+    let len = u32::try_from(value.len()).map_err(|_| {
+        EncodeError::invalid_value(
+            "ServerRedirectionPdu",
+            "optional field length exceeds u32::MAX",
+        )
+    })?;
+    dst.write_u32_le(len, "ServerRedirectionPdu::fieldLength")?;
+    dst.write_slice(value, "ServerRedirectionPdu::fieldData")?;
+    Ok(())
 }
 
 impl<'de> Decode<'de> for ServerRedirectionPdu {
@@ -506,6 +773,200 @@ mod tests {
         body.resize(body.len() + 100, 0);
         let mut cursor = ReadCursor::new(&body);
         assert!(ServerRedirectionPdu::decode(&mut cursor).is_err());
+    }
+
+    fn encode_to_vec(pdu: &ServerRedirectionPdu) -> Vec<u8> {
+        let mut buf = vec![0u8; pdu.size()];
+        let mut c = WriteCursor::new(&mut buf);
+        pdu.encode(&mut c).unwrap();
+        buf
+    }
+
+    #[test]
+    fn encode_header_only_noredirect() {
+        // Minimal: only the informational LB_NOREDIRECT modifier bit
+        // (no data fields). Output = 12-byte header + 8-byte pad = 20B.
+        let pdu = ServerRedirectionPdu {
+            session_id: 0x0000_0001,
+            redir_flags: LB_NOREDIRECT,
+            ..Default::default()
+        };
+        let bytes = encode_to_vec(&pdu);
+        assert_eq!(bytes.len(), REDIRECTION_HEADER_SIZE + REDIRECTION_TRAILING_PAD);
+
+        // Spot-check wire layout: flags, length, sessionId, redirFlags.
+        assert_eq!(&bytes[0..2], &SEC_REDIRECTION_PKT.to_le_bytes());
+        assert_eq!(&bytes[2..4], &20u16.to_le_bytes());
+        assert_eq!(&bytes[4..8], &1u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &LB_NOREDIRECT.to_le_bytes());
+        assert_eq!(&bytes[12..20], &[0u8; 8]);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_all_optional_fields() {
+        let addr_utf16: Vec<u8> = "10.0.0.5\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let user_utf16: Vec<u8> = "alice\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let domain_utf16: Vec<u8> = "CORP\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let password = vec![0xDE, 0xAD, 0xBE, 0xEF]; // opaque PK-encrypted
+        let fqdn_utf16: Vec<u8> = "srv.example.com\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let netbios_utf16: Vec<u8> = "SRV\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let tsv = vec![0x01, 0x02, 0x03];
+        let guid_utf16: Vec<u8> = "base64guid\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let cert = vec![0x30, 0x82, 0x00, 0x10];
+        let a1: Vec<u8> = "1.1.1.1\0".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let a2: Vec<u8> = "2.2.2.2\0".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+
+        let pdu = ServerRedirectionPdu {
+            session_id: 42,
+            redir_flags: LB_TARGET_NET_ADDRESS
+                | LB_LOAD_BALANCE_INFO
+                | LB_USERNAME
+                | LB_DOMAIN
+                | LB_PASSWORD
+                | LB_PASSWORD_IS_PK_ENCRYPTED
+                | LB_TARGET_FQDN
+                | LB_TARGET_NETBIOS_NAME
+                | LB_TARGET_NET_ADDRESSES
+                | LB_CLIENT_TSV_URL
+                | LB_REDIRECTION_GUID
+                | LB_TARGET_CERTIFICATE,
+            target_net_address: Some(addr_utf16.clone()),
+            load_balance_info: Some(b"Cookie: msts=1\r\n".to_vec()),
+            username: Some(user_utf16.clone()),
+            domain: Some(domain_utf16.clone()),
+            password: Some(password.clone()),
+            target_fqdn: Some(fqdn_utf16.clone()),
+            target_netbios_name: Some(netbios_utf16.clone()),
+            target_net_addresses: Some(TargetNetAddresses {
+                addresses: vec![
+                    TargetNetAddress { address: a1.clone() },
+                    TargetNetAddress { address: a2.clone() },
+                ],
+            }),
+            tsv_url: Some(tsv.clone()),
+            redirection_guid: Some(guid_utf16.clone()),
+            target_certificate: Some(cert.clone()),
+        };
+        let bytes = encode_to_vec(&pdu);
+        let mut cursor = ReadCursor::new(&bytes);
+        let decoded = ServerRedirectionPdu::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, pdu);
+    }
+
+    #[test]
+    fn encode_rejects_redir_flags_mismatch() {
+        // Flag set but Option is None.
+        let pdu = ServerRedirectionPdu {
+            session_id: 1,
+            redir_flags: LB_TARGET_NET_ADDRESS,
+            target_net_address: None,
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        assert!(pdu.encode(&mut WriteCursor::new(&mut buf)).is_err());
+
+        // Option Some but flag NOT set.
+        let pdu = ServerRedirectionPdu {
+            session_id: 1,
+            redir_flags: 0,
+            target_net_address: Some(vec![0x58, 0x00, 0x00, 0x00]),
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        assert!(pdu.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn encode_rejects_pk_encrypted_without_password() {
+        let pdu = ServerRedirectionPdu {
+            session_id: 1,
+            redir_flags: LB_PASSWORD_IS_PK_ENCRYPTED,
+            password: None,
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        assert!(pdu.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn encode_passthrough_modifier_bits() {
+        // Modifier bits (NOREDIRECT, SMARTCARD_LOGON, SERVER_TSV_CAPABLE,
+        // DONTSTOREUSERNAME) are not tied to data fields -- the encoder
+        // must accept them without complaint.
+        let pdu = ServerRedirectionPdu {
+            session_id: 0,
+            redir_flags: LB_NOREDIRECT
+                | LB_SMARTCARD_LOGON
+                | LB_SERVER_TSV_CAPABLE
+                | LB_USERNAME
+                | LB_DONTSTOREUSERNAME,
+            username: Some(vec![0x55, 0x00, 0x00, 0x00]),
+            ..Default::default()
+        };
+        let bytes = encode_to_vec(&pdu);
+        let mut cursor = ReadCursor::new(&bytes);
+        let decoded = ServerRedirectionPdu::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.redir_flags, pdu.redir_flags);
+        assert!(decoded.has_flag(LB_DONTSTOREUSERNAME));
+        assert!(decoded.has_flag(LB_SERVER_TSV_CAPABLE));
+    }
+
+    #[test]
+    fn encode_rejects_u16_length_overflow() {
+        // A username blob of 70 KiB would push the total past u16::MAX
+        // (65 536). Verify the encoder rejects it rather than silently
+        // truncating the length field.
+        let pdu = ServerRedirectionPdu {
+            session_id: 0,
+            redir_flags: LB_USERNAME,
+            username: Some(vec![0u8; 70 * 1024]),
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        assert!(pdu.encode(&mut WriteCursor::new(&mut buf)).is_err());
+    }
+
+    #[test]
+    fn encode_target_net_addresses_inner_length_correct() {
+        // Outer TargetNetAddressesLength MUST equal 4 (addressCount) +
+        // sum(4 + addr.len()).
+        let a1: Vec<u8> = "1.1.1.1\0".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let a2: Vec<u8> = "2.2.2.2\0".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let expected_inner = 4 + (4 + a1.len()) + (4 + a2.len());
+
+        let pdu = ServerRedirectionPdu {
+            session_id: 0,
+            redir_flags: LB_TARGET_NET_ADDRESSES,
+            target_net_addresses: Some(TargetNetAddresses {
+                addresses: vec![
+                    TargetNetAddress { address: a1 },
+                    TargetNetAddress { address: a2 },
+                ],
+            }),
+            ..Default::default()
+        };
+        let bytes = encode_to_vec(&pdu);
+        // After the 12-byte header: outer u32 length prefix immediately.
+        let outer_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        assert_eq!(outer_len, expected_inner);
     }
 
     #[test]
