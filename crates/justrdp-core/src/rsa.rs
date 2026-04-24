@@ -191,6 +191,32 @@ pub fn rsa_public_encrypt_rdp(key: &RsaPublicKey, plaintext: &[u8]) -> Vec<u8> {
     c.to_le_bytes_padded(k)
 }
 
+/// Server-side inverse of [`rsa_public_encrypt_rdp`] -- decrypt a
+/// Security Exchange PDU's `encryptedClientRandom` using the server's
+/// RSA private key.
+///
+/// 1. Input is in little-endian byte order (typically
+///    `ciphertext.len() == key.key_size()` but any trailing zero
+///    padding is accepted as the spec allows the field to be zero-
+///    extended to the modulus size)
+/// 2. Compute m = c^d mod n
+/// 3. Output in little-endian, zero-padded to `key.key_size()`. The
+///    caller extracts `client_random = plaintext[0..32]` per
+///    MS-RDPBCGR §5.3.4.1 (the 32-byte client random is the low-order
+///    bytes; the remainder is zero padding the client added to fill
+///    the modulus).
+///
+/// This is raw textbook RSA -- no PKCS#1 padding is stripped because
+/// RDP's Security Exchange PDU does not use PKCS#1 formatting; the
+/// client simply pads the 32-byte random to modulus size with zero
+/// bytes and raises to `e` mod `n`.
+pub fn rsa_private_decrypt_rdp(key: &RsaPrivateKey, ciphertext: &[u8]) -> Vec<u8> {
+    let k = key.key_size();
+    let c = BigUint::from_le_bytes(ciphertext);
+    let m = c.mod_exp(&key.d, &key.n);
+    m.to_le_bytes_padded(k)
+}
+
 /// Verify an RSA PKCS#1 v1.5 (SHA-256) signature.
 ///
 /// 1. Compute s^e mod n to recover the padded message
@@ -373,6 +399,31 @@ mod tests {
         };
         let ct = rsa_public_encrypt_rdp(&pub_key, &[0x02]); // 2 in LE
         assert_eq!(ct[0], 0x08); // 8 in LE
+    }
+
+    #[test]
+    fn rsa_private_decrypt_rdp_roundtrip_via_public_encrypt() {
+        // End-to-end: client encrypts a 32-byte random with the server's
+        // public key; server decrypts with the private key and must
+        // recover the same 32-byte random in the low-order output bytes.
+        let priv_key = test_512bit_key();
+        let pub_key = priv_key.public_key();
+        let mut client_random = [0u8; 32];
+        for (i, b) in client_random.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(3).wrapping_add(0x11);
+        }
+
+        // Client pads to modulus size (64) with trailing zeros per §5.3.4.1.
+        let mut padded = [0u8; 64];
+        padded[..32].copy_from_slice(&client_random);
+        let encrypted = rsa_public_encrypt_rdp(&pub_key, &padded);
+        assert_eq!(encrypted.len(), 64);
+
+        let decrypted = rsa_private_decrypt_rdp(&priv_key, &encrypted);
+        assert_eq!(decrypted.len(), 64);
+        assert_eq!(&decrypted[..32], &client_random);
+        // Padding region is all zero.
+        assert!(decrypted[32..].iter().all(|&b| b == 0));
     }
 
     #[test]
