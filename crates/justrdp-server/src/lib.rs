@@ -17,6 +17,7 @@ extern crate alloc;
 extern crate std;
 
 mod active;
+mod arc_verify;
 mod config;
 mod encoder;
 mod error;
@@ -40,6 +41,9 @@ pub use justrdp_pdu::rdp::error_info::ErrorInfoCode;
 pub use justrdp_pdu::rdp::finalization::{
     ArcCsPrivatePacket, ArcScPrivatePacket, LogonErrorsInfo, LogonInfoExtended, LogonInfoV1,
     LogonInfoV2, SaveSessionInfoData, SaveSessionInfoPdu,
+};
+pub use arc_verify::{
+    verify_auto_reconnect_packet, ArcVerifyError, ENHANCED_SECURITY_CLIENT_RANDOM,
 };
 pub use random::RandomSource;
 pub use encoder::{
