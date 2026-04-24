@@ -33,7 +33,12 @@ pub const MAX_BITMAP_FRAGMENT_SIZE_LIMIT: usize = 32_767 - 16;
 /// (chunk sizing, bitmap fragmentation thresholds).
 ///
 /// [`RdpServer`]: crate::RdpServer
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Does not derive `PartialEq`/`Eq`: [`AcceptorConfig::standard_security`]
+/// can embed an [`RsaPrivateKey`](justrdp_core::rsa::RsaPrivateKey)
+/// whose `BigUint` limbs aren't comparable in this crate. Compare
+/// individual fields if an equality check is needed.
+#[derive(Debug, Clone)]
 pub struct RdpServerConfig {
     /// Configuration for the wrapped `ServerAcceptor` driving the
     /// X.224 / MCS / Capability Exchange / Finalization handshake.

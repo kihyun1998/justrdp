@@ -2,14 +2,74 @@
 
 //! Acceptor configuration.
 
+use alloc::vec::Vec;
+
+use justrdp_core::rsa::RsaPrivateKey;
+use justrdp_pdu::rdp::server_certificate::ServerRsaPublicKey;
 use justrdp_pdu::x224::SecurityProtocol;
+
+/// Standard RDP Security configuration (MS-RDPBCGR §5.3).
+///
+/// Populated by the caller when the server wants to accept
+/// `PROTOCOL_RDP` sessions end-to-end (RC4 + MAC). The acceptor uses
+/// this to:
+/// - Emit `ServerSecurityData.{encryption_method, encryption_level,
+///   server_random, server_certificate}` in the MCS Connect Response.
+/// - RSA-decrypt the client's `encryptedClientRandom` from the Security
+///   Exchange PDU (§2.2.1.10.1, §5.3.4.1).
+/// - Derive the session keys per §5.3.5.
+///
+/// `public_key` MUST be the public half of `private_key`; the acceptor
+/// does not cross-check them. Typical production use is to ship the TSSK
+/// test key (via [`justrdp_pdu::rdp::server_certificate::TERMINAL_SERVICES_MODULUS`]
+/// et al.) since Windows / mstsc / FreeRDP all trust it; it's the same
+/// key xrdp, FreeRDP, and IronRDP use for their proprietary cert path.
+///
+/// Does **not** derive `PartialEq`/`Eq` because [`RsaPrivateKey`]'s
+/// `BigUint` limbs aren't comparable in this crate. Callers that need
+/// equality on configuration should compare the other (unrelated) fields
+/// separately.
+#[derive(Debug, Clone)]
+pub struct StandardSecurityConfig {
+    /// Encryption method to advertise and use. Typically
+    /// `ENCRYPTION_METHOD_128BIT (0x02)`. FIPS and 40/56-bit are valid
+    /// on the wire but not covered by the §11.2a-stdsec S2 landing (FIPS
+    /// requires a separate `FipsSecurityContext`; low-bit RC4 works but
+    /// matches no Windows deployment worth testing against).
+    pub encryption_method: u32,
+    /// Encryption level to advertise (2 = client-compatible is what every
+    /// production server emits). MS-RDPBCGR §2.2.1.4.3.
+    pub encryption_level: u32,
+    /// 32-byte server random embedded in `ServerSecurityData` and mixed
+    /// into the session-key derivation. Caller is responsible for
+    /// generating this from a CSPRNG; the acceptor does not clone or
+    /// regenerate it across reconnects.
+    pub server_random: [u8; 32],
+    /// RSA private key used to decrypt `encryptedClientRandom`. MUST be
+    /// the private half of the `public_key` below (the acceptor does not
+    /// verify this).
+    pub private_key: RsaPrivateKey,
+    /// RSA public key embedded inside the proprietary server certificate
+    /// that the acceptor will emit in `ServerSecurityData.server_certificate`.
+    pub public_key: ServerRsaPublicKey,
+    /// Pre-rendered proprietary server certificate bytes that will be
+    /// copied verbatim into `ServerSecurityData.server_certificate`.
+    /// `None` -> the acceptor will build one via
+    /// [`encode_proprietary_certificate`] from `public_key` on demand.
+    /// Callers that need to serve a cached signed cert (e.g. to amortize
+    /// the signing cost, or to ship a canned one signed offline) pass
+    /// `Some(bytes)`.
+    ///
+    /// [`encode_proprietary_certificate`]: justrdp_pdu::rdp::server_certificate::encode_proprietary_certificate
+    pub server_cert_blob: Option<Vec<u8>>,
+}
 
 /// Configuration for `ServerAcceptor`.
 ///
 /// Phase 1 (X.224 Negotiate) needs only the security-protocol related
 /// fields; later phases (MCS, capabilities, licensing) will extend this
 /// struct.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AcceptorConfig {
     /// Bitmask of security protocols this server is willing to accept.
     /// Typical default: `SSL | HYBRID | HYBRID_EX`.
@@ -56,6 +116,24 @@ pub struct AcceptorConfig {
     /// `None` -> block omitted; `Some(flags)` -> block sent with the
     /// given `flags` (e.g. `SOFTSYNC | TUNNEL_UDP_FECR`).
     pub multitransport_flags: Option<u32>,
+
+    // ── Standard RDP Security (MS-RDPBCGR §5.3) ───────────────────────
+
+    /// Optional Standard RDP Security configuration. When `Some`, the
+    /// acceptor will emit a signed proprietary certificate + `serverRandom`
+    /// in the MCS Connect Response and handle the subsequent
+    /// `SecurityExchange` PDU by RSA-decrypting the client's random and
+    /// deriving session keys. When `None` (the default), `ServerSecurityData`
+    /// is emitted with `encryption_method = 0 / encryption_level = 0` and
+    /// the acceptor skips the Security Exchange phase entirely -- which is
+    /// the correct shape for TLS/CredSSP/RDSTLS/AAD sessions.
+    ///
+    /// Note: this field breaks `PartialEq`/`Eq` on [`AcceptorConfig`]
+    /// because [`RsaPrivateKey`](justrdp_core::rsa::RsaPrivateKey)'s big-int
+    /// limbs aren't comparable in this crate. Callers that previously
+    /// `assert_eq!`-ed two `AcceptorConfig`s should compare individual
+    /// fields instead.
+    pub standard_security: Option<StandardSecurityConfig>,
 }
 
 impl Default for AcceptorConfig {
@@ -77,6 +155,7 @@ impl Default for AcceptorConfig {
             server_early_capability_flags: None,
             support_message_channel: false,
             multitransport_flags: None,
+            standard_security: None,
         }
     }
 }
@@ -153,6 +232,20 @@ impl AcceptorConfigBuilder {
 
     pub fn multitransport_flags(mut self, flags: Option<u32>) -> Self {
         self.inner.multitransport_flags = flags;
+        self
+    }
+
+    /// Install Standard RDP Security credentials (RSA private key +
+    /// server random + encryption method). When set, the acceptor
+    /// handles the full legacy security exchange for `PROTOCOL_RDP`
+    /// sessions. Typically combined with
+    /// `supported_protocols(SecurityProtocol::RDP)` and
+    /// `require_enhanced_security(false)` (plus
+    /// [`build_allow_downgrade`](Self::build_allow_downgrade) if also
+    /// advertising enhanced bits) -- otherwise the field is inert
+    /// because the acceptor never selects `PROTOCOL_RDP`.
+    pub fn standard_security(mut self, cfg: StandardSecurityConfig) -> Self {
+        self.inner.standard_security = Some(cfg);
         self
     }
 

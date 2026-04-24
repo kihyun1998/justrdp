@@ -41,6 +41,17 @@ pub enum ServerAcceptorState {
     /// Run the Erect Domain / Attach User / Channel Join handshake.
     ChannelConnection,
 
+    // ── Phase 6: Standard RDP Security key exchange (PROTOCOL_RDP only) ──
+    /// Wait for the client's `Security Exchange` PDU carrying the
+    /// RSA-encrypted client random. Only reached when the session
+    /// negotiated Standard RDP Security **and** the acceptor was
+    /// configured with a [`StandardSecurityConfig`]. TLS/CredSSP/RDSTLS
+    /// paths skip this state and go from `ChannelConnection` straight
+    /// to `WaitClientInfo`.
+    ///
+    /// [`StandardSecurityConfig`]: crate::config::StandardSecurityConfig
+    WaitSecurityExchange,
+
     // ── Phase 7: Secure Settings Exchange ──
     /// Wait for the Client Info PDU.
     WaitClientInfo,
@@ -84,6 +95,7 @@ impl ServerAcceptorState {
             Self::WaitMcsConnectInitial => "WaitMcsConnectInitial",
             Self::SendMcsConnectResponse => "SendMcsConnectResponse",
             Self::ChannelConnection => "ChannelConnection",
+            Self::WaitSecurityExchange => "WaitSecurityExchange",
             Self::WaitClientInfo => "WaitClientInfo",
             Self::SendLicense => "SendLicense",
             Self::SendDemandActive => "SendDemandActive",
@@ -152,6 +164,7 @@ mod tests {
             ServerAcceptorState::WaitMcsConnectInitial,
             ServerAcceptorState::SendMcsConnectResponse,
             ServerAcceptorState::ChannelConnection,
+            ServerAcceptorState::WaitSecurityExchange,
             ServerAcceptorState::WaitClientInfo,
             ServerAcceptorState::SendLicense,
             ServerAcceptorState::SendDemandActive,
@@ -175,6 +188,7 @@ mod tests {
 
         assert!(!ServerAcceptorState::WaitConnectionRequest.is_send_state());
         assert!(!ServerAcceptorState::WaitMcsConnectInitial.is_send_state());
+        assert!(!ServerAcceptorState::WaitSecurityExchange.is_send_state());
         assert!(!ServerAcceptorState::WaitClientInfo.is_send_state());
         assert!(!ServerAcceptorState::WaitConfirmActive.is_send_state());
         assert!(!ServerAcceptorState::ChannelConnection.is_send_state());

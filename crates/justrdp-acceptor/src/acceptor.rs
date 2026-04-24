@@ -4,6 +4,7 @@
 
 use alloc::vec::Vec;
 
+use justrdp_core::rsa::rsa_private_decrypt_rdp;
 use justrdp_core::{Decode, Encode, PduHint, ReadCursor, WriteBuf, WriteCursor};
 
 use justrdp_pdu::mcs::{
@@ -25,6 +26,11 @@ use justrdp_pdu::rdp::headers::{
     SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE,
 };
 use justrdp_pdu::rdp::licensing::LicenseErrorMessage;
+use justrdp_pdu::rdp::server_certificate::encode_proprietary_certificate;
+use justrdp_pdu::rdp::standard_security::{
+    derive_session_keys, RdpSecurityContext, SessionKeys, ENCRYPTION_METHOD_128BIT,
+    ENCRYPTION_METHOD_40BIT, ENCRYPTION_METHOD_56BIT, SEC_EXCHANGE_PKT,
+};
 use justrdp_pdu::tpkt::{TpktHeader, TpktHint, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{
     ConnectionConfirm, ConnectionRequest, ConnectionRequestData, DataTransfer, NegotiationFailure,
@@ -125,6 +131,25 @@ pub struct ServerAcceptor {
     /// alternating wait/send pattern without multiplying state-enum
     /// variants.
     finalization_phase: FinalizationPhase,
+
+    // ── Standard RDP Security (MS-RDPBCGR §5.3) ─────────────────────────
+    /// Client random recovered by RSA-decrypting `encryptedClientRandom`
+    /// in the Security Exchange PDU (§2.2.1.10.1, §5.3.4.1). Populated
+    /// only when the session negotiated Standard RDP Security AND the
+    /// acceptor was configured with a [`StandardSecurityConfig`].
+    ///
+    /// [`StandardSecurityConfig`]: crate::config::StandardSecurityConfig
+    client_random: Option<[u8; 32]>,
+    /// Derived session keys (mac + encrypt + decrypt). Owned by the
+    /// acceptor until S3 hands it off to `ServerActiveStage` via
+    /// [`take_security_context`](Self::take_security_context). Separate
+    /// from `security_context` so callers can inspect the keys for a
+    /// loopback test without tearing down the active cipher state.
+    session_keys: Option<SessionKeys>,
+    /// RC4 security context. Built in `step_wait_security_exchange` and
+    /// moved out via `take_security_context` when transitioning into an
+    /// active session (S3).
+    security_context: Option<RdpSecurityContext>,
 }
 
 /// Sub-phase within the `ConnectionFinalization` state.
@@ -220,7 +245,40 @@ impl ServerAcceptor {
             share_id: 0x0001_03EA,
             client_capabilities: Vec::new(),
             finalization_phase: FinalizationPhase::WaitClientSync,
+            client_random: None,
+            session_keys: None,
+            security_context: None,
         }
+    }
+
+    /// Client random recovered from the Security Exchange PDU. Only
+    /// populated for Standard RDP Security sessions. Exposed for
+    /// diagnostics and loopback testing; production code should normally
+    /// reach for `take_security_context` to drive the session cipher.
+    pub fn client_random(&self) -> Option<&[u8; 32]> {
+        self.client_random.as_ref()
+    }
+
+    /// Derived session keys. Populated after `WaitSecurityExchange`
+    /// succeeds. Useful for parity testing against a connector-produced
+    /// `SessionKeys` to prove both sides derive byte-identical material.
+    ///
+    /// Returning a reference (not a move) lets the caller inspect keys
+    /// without disturbing the live [`RdpSecurityContext`] state.
+    pub fn session_keys(&self) -> Option<&SessionKeys> {
+        self.session_keys.as_ref()
+    }
+
+    /// Move the built `RdpSecurityContext` out of the acceptor.
+    ///
+    /// Callers (typically `ServerActiveStage` in §11.2a-stdsec S3) use
+    /// this to take ownership of the live RC4 state + MAC keys for the
+    /// remainder of the session. After this call
+    /// [`session_keys`](Self::session_keys) still returns the derived
+    /// key material for inspection, but the cipher stream is no longer
+    /// available through the acceptor.
+    pub fn take_security_context(&mut self) -> Option<RdpSecurityContext> {
+        self.security_context.take()
     }
 
     /// Server-assigned share ID. Available once the acceptor has
@@ -643,11 +701,11 @@ impl ServerAcceptor {
         let alloc = allocate_channel_ids(client_channels, enable_message_channel)?;
 
         // Build server data blocks. For TLS / CredSSP / RDSTLS / AAD the
-        // SC_SECURITY block is always "none" (encryption_method=0,
-        // encryption_level=0). Standard RDP Security would carry the
-        // server random + certificate here; that path requires Commit 1's
-        // scaffolding plus a key-derivation step that lives outside the
-        // acceptor in justrdp-pdu.
+        // SC_SECURITY block is "none" (encryption_method=0,
+        // encryption_level=0). Standard RDP Security (PROTOCOL_RDP) with
+        // a configured `StandardSecurityConfig` fills in a real signed
+        // cert + server random so the client can RSA-encrypt its
+        // contribution to the session keys.
         let multitransport_flags = self
             .config
             .multitransport_flags
@@ -664,14 +722,45 @@ impl ServerAcceptor {
             .as_ref()
             .map(|r| r.requested_protocols.bits())
             .unwrap_or(0);
+        // `enable_standard_security` guards every later Standard-Security
+        // code path inside this function so that a caller who left a
+        // `StandardSecurityConfig` attached to an `AcceptorConfig` used
+        // for a TLS session doesn't accidentally send a proprietary
+        // cert + random across a TLS channel (which would be a
+        // spec-compliant but obviously wrong wire transcript).
+        let enable_standard_security = self.config.standard_security.is_some()
+            && self.selected_protocol == SecurityProtocol::RDP;
+        let std_cert_bytes: Option<alloc::vec::Vec<u8>> = if enable_standard_security {
+            let cfg = self.config.standard_security.as_ref().unwrap();
+            let bytes = cfg
+                .server_cert_blob
+                .clone()
+                .unwrap_or_else(|| encode_proprietary_certificate(&cfg.public_key));
+            Some(bytes)
+        } else {
+            None
+        };
+        let (sc_encryption_method, sc_encryption_level, sc_server_random, sc_server_cert) =
+            if enable_standard_security {
+                let cfg = self.config.standard_security.as_ref().unwrap();
+                let cert_slice: &[u8] = std_cert_bytes.as_deref().unwrap_or(&[]);
+                (
+                    cfg.encryption_method,
+                    cfg.encryption_level,
+                    Some(&cfg.server_random[..]),
+                    Some(cert_slice),
+                )
+            } else {
+                (0u32, 0u32, None, None)
+            };
         let inputs = ServerGccInputs {
             server_version: self.config.server_rdp_version,
             client_requested_protocols,
             early_capability_flags: self.config.server_early_capability_flags,
-            encryption_method: 0,
-            encryption_level: 0,
-            server_random: None,
-            server_certificate: None,
+            encryption_method: sc_encryption_method,
+            encryption_level: sc_encryption_level,
+            server_random: sc_server_random,
+            server_certificate: sc_server_cert,
             channels: &alloc,
             multitransport_flags,
         };
@@ -796,13 +885,21 @@ impl ServerAcceptor {
             ChannelPhase::WaitChannelJoinRequest => self.step_wait_channel_join_request(input),
             ChannelPhase::SendChannelJoinConfirm => self.step_send_channel_join_confirm(output),
             ChannelPhase::Done => {
-                // All channels joined -- transition into the next phase
-                // (Standard RDP Security key exchange would land here in
-                // the legacy path; otherwise we go straight to the
-                // Secure Settings Exchange in a later commit). For now
-                // park in `WaitClientInfo` so future commits can pick
-                // up the thread.
-                self.state = ServerAcceptorState::WaitClientInfo;
+                // All channels joined -- pick the next phase based on
+                // whether the session negotiated Standard RDP Security.
+                //   * PROTOCOL_RDP + StandardSecurityConfig: the client
+                //     will send a `SecurityExchange` PDU next.
+                //   * Everything else (TLS/CredSSP/RDSTLS/AAD, or
+                //     PROTOCOL_RDP without a key configured): skip the
+                //     exchange and go straight to the secure-settings
+                //     PDU.
+                self.state = if self.selected_protocol == SecurityProtocol::RDP
+                    && self.config.standard_security.is_some()
+                {
+                    ServerAcceptorState::WaitSecurityExchange
+                } else {
+                    ServerAcceptorState::WaitClientInfo
+                };
                 Ok(Written::nothing())
             }
         }
@@ -916,6 +1013,148 @@ impl ServerAcceptor {
             self.channel_phase = ChannelPhase::WaitChannelJoinRequest;
         }
         Ok(Written::new(written))
+    }
+
+    // ── Phase 6: Standard RDP Security key exchange ─────────────────────
+
+    /// Decode the client's `Security Exchange` PDU (MS-RDPBCGR §2.2.1.10.1),
+    /// RSA-decrypt `encryptedClientRandom`, and derive the RC4 session
+    /// keys per §5.3.5.
+    ///
+    /// Only reached when the acceptor selected `PROTOCOL_RDP` and the
+    /// caller supplied a [`StandardSecurityConfig`](crate::StandardSecurityConfig).
+    ///
+    /// Wire shape of the Security Exchange PDU:
+    /// ```text
+    /// TPKT | X.224 DT | MCS SDR |
+    ///   basicSecurityHeader (flags = SEC_EXCHANGE_PKT, flagsHi = 0) |
+    ///   length (u32 LE) |
+    ///   encryptedClientRandom (modulus_bytes + 8 bytes of OAEP-style
+    ///                          null padding the spec calls out in
+    ///                          §5.3.4.1)
+    /// ```
+    ///
+    /// MS-RDPBCGR §5.3.4.1 mandates the 8 trailing zero bytes on the
+    /// encrypted-random field regardless of modulus size, so `length`
+    /// is `modulus_bytes + 8`. The acceptor silently strips that pad:
+    /// the raw RSA input is `encryptedClientRandom[..modulus_bytes]`.
+    fn step_wait_security_exchange(&mut self, input: &[u8]) -> AcceptorResult<Written> {
+        // Outer envelope: TPKT -> X.224 DT -> MCS SDR.
+        let mut cursor = ReadCursor::new(input);
+        let _tpkt = TpktHeader::decode(&mut cursor)?;
+        let _dt = DataTransfer::decode(&mut cursor)?;
+        let sdr = SendDataRequest::decode(&mut cursor)?;
+
+        let alloc = self
+            .channel_alloc
+            .as_ref()
+            .ok_or_else(|| AcceptorError::general("SecurityExchange before MCS Connect"))?;
+        if sdr.channel_id != alloc.io_channel_id {
+            return Err(AcceptorError::general(
+                "SecurityExchange must be sent on the I/O channel",
+            ));
+        }
+        if sdr.initiator != self.user_channel_id {
+            return Err(AcceptorError::general(
+                "SecurityExchange initiator does not match the assigned user channel",
+            ));
+        }
+
+        // Inner security envelope: flags(2) | flagsHi(2) | length(4) |
+        //                          encryptedClientRandom(length)
+        let mut sec = ReadCursor::new(sdr.user_data);
+        if sec.remaining() < BASIC_SECURITY_HEADER_SIZE + 4 {
+            return Err(AcceptorError::general(
+                "SecurityExchange user_data shorter than basic header + length field",
+            ));
+        }
+        let flags = sec.read_u16_le("SecExchange::secFlags")?;
+        let _flags_hi = sec.read_u16_le("SecExchange::secFlagsHi")?;
+        // MS-RDPBCGR §2.2.1.10.1: secFlags MUST include SEC_EXCHANGE_PKT.
+        // Other bits (SEC_IGNORE_SEQNO etc.) are meaningless here; reject
+        // only if the exchange marker is missing.
+        if flags & SEC_EXCHANGE_PKT == 0 {
+            return Err(AcceptorError::general(
+                "expected SEC_EXCHANGE_PKT flag on Security Exchange PDU",
+            ));
+        }
+        let length = sec.read_u32_le("SecExchange::length")? as usize;
+        if length != sec.remaining() {
+            return Err(AcceptorError::general(
+                "SecurityExchange length does not match trailing encryptedClientRandom bytes",
+            ));
+        }
+
+        // Retrieve the pre-configured private key + expected modulus size.
+        let std_cfg = self.config.standard_security.as_ref().ok_or_else(|| {
+            AcceptorError::general(
+                "WaitSecurityExchange reached without StandardSecurityConfig installed",
+            )
+        })?;
+        let modulus_bytes = std_cfg.public_key.modulus_len_bytes();
+        // §5.3.4.1: encryptedClientRandom = modulus_bytes payload + 8-byte
+        // trailing null pad. Reject length mismatches up-front so we don't
+        // silently RSA-decrypt the wrong slice.
+        if length != modulus_bytes + 8 {
+            return Err(AcceptorError::general(
+                "SecurityExchange length != modulus_size + 8 (spec-required null pad)",
+            ));
+        }
+        let encrypted = sec
+            .read_slice(modulus_bytes, "SecExchange::encryptedClientRandom")?;
+        // Consume and ignore the 8-byte null pad. MS-RDPBCGR §5.3.4.1
+        // requires it to be zero but real clients sometimes leak stack
+        // garbage here; accepting any bytes matches mstsc / FreeRDP
+        // server behaviour and never affects the derived keys.
+        let _trailing_pad = sec
+            .read_slice(8, "SecExchange::nullPad")?;
+
+        // Raw textbook RSA decrypt in LE. `rsa_private_decrypt_rdp`
+        // returns `modulus_bytes` bytes; the 32-byte client random is
+        // at the low end of that LE buffer (spec §5.3.4.1 says the
+        // client zero-pads up to modulus size).
+        let decrypted = rsa_private_decrypt_rdp(&std_cfg.private_key, encrypted);
+        if decrypted.len() < 32 {
+            return Err(AcceptorError::general(
+                "RSA decrypt produced fewer than 32 bytes -- impossible modulus length",
+            ));
+        }
+        let mut client_random = [0u8; 32];
+        client_random.copy_from_slice(&decrypted[..32]);
+
+        // Derive RC4 session keys. FIPS uses a completely different key
+        // derivation (`derive_fips_session_keys` + 3DES-CBC) and the
+        // `RdpSecurityContext` returned here is RC4-only, so we reject
+        // FIPS at the acceptor boundary. Callers that really need FIPS
+        // should run a separate build that plumbs `FipsSecurityContext`
+        // end-to-end.
+        if std_cfg.encryption_method != ENCRYPTION_METHOD_40BIT
+            && std_cfg.encryption_method != ENCRYPTION_METHOD_56BIT
+            && std_cfg.encryption_method != ENCRYPTION_METHOD_128BIT
+        {
+            return Err(AcceptorError::general(
+                "StandardSecurityConfig.encryption_method must be 40/56/128-bit RC4 \
+                 (FIPS is not supported on the acceptor key-exchange path)",
+            ));
+        }
+        let keys = derive_session_keys(
+            &client_random,
+            &std_cfg.server_random,
+            std_cfg.encryption_method,
+        )
+        .map_err(AcceptorError::general)?;
+
+        // SEC_SECURE_CHECKSUM (salted MAC) applies from RDP 5.2+.
+        // Mirror the connector's threshold (`server_rdp_version >=
+        // 0x00080004` = RDP 5.2) to keep wire behavior symmetric.
+        let use_salted_mac = self.config.server_rdp_version >= 0x00080004;
+        let ctx = RdpSecurityContext::new(keys.clone(), use_salted_mac);
+
+        self.client_random = Some(client_random);
+        self.session_keys = Some(keys);
+        self.security_context = Some(ctx);
+        self.state = ServerAcceptorState::WaitClientInfo;
+        Ok(Written::nothing())
     }
 
     // ── Phase 3: CredSSP Accept (external) ──────────────────────────────
@@ -1668,6 +1907,7 @@ impl Sequence for ServerAcceptor {
                 | ChannelPhase::SendChannelJoinConfirm
                 | ChannelPhase::Done => None,
             },
+            ServerAcceptorState::WaitSecurityExchange => Some(&TPKT_HINT),
             ServerAcceptorState::WaitClientInfo => Some(&TPKT_HINT),
             ServerAcceptorState::SendLicense => None,
             ServerAcceptorState::SendDemandActive => None,
@@ -1704,6 +1944,7 @@ impl Sequence for ServerAcceptor {
             ServerAcceptorState::ChannelConnection => {
                 self.step_channel_connection(input, output)
             }
+            ServerAcceptorState::WaitSecurityExchange => self.step_wait_security_exchange(input),
             ServerAcceptorState::WaitClientInfo => self.step_wait_client_info(input),
             ServerAcceptorState::SendLicense => self.step_send_license(output),
             ServerAcceptorState::SendDemandActive => self.step_send_demand_active(output),
@@ -3487,5 +3728,485 @@ mod tests {
         assert!(result
             .server_nego_flags
             .contains(NegotiationResponseFlags::EXTENDED_CLIENT_DATA));
+    }
+
+    // ── §11.2a-stdsec S2: Standard RDP Security key-exchange path ──
+
+    /// Same 512-bit synthetic RSA key as `justrdp-core::rsa` tests. Using
+    /// a *test* key (not the real TSSK) keeps the exponent at 65537 so
+    /// the bignum ladder stays fast; the TSSK 32-bit exponent would
+    /// work here too but the tests don't care about the signature path.
+    fn test_512bit_rsa() -> (justrdp_core::rsa::RsaPrivateKey, justrdp_pdu::rdp::server_certificate::ServerRsaPublicKey) {
+        use justrdp_core::bignum::BigUint;
+        use justrdp_core::rsa::RsaPrivateKey;
+        use justrdp_pdu::rdp::server_certificate::ServerRsaPublicKey;
+        let n_bytes = [
+            0x9A, 0xD2, 0x93, 0x02, 0xA1, 0xC2, 0x45, 0x47,
+            0x32, 0x6C, 0x6A, 0x4E, 0x0B, 0x25, 0xA5, 0x8B,
+            0xFE, 0x2C, 0xA4, 0x03, 0xF3, 0x21, 0x59, 0x76,
+            0x30, 0xBB, 0x58, 0xBD, 0xC3, 0x4D, 0xB1, 0xF0,
+            0x86, 0xC1, 0x79, 0xCD, 0xF8, 0xCF, 0xB6, 0x36,
+            0x79, 0x0D, 0xA2, 0x84, 0xB8, 0xE2, 0xE5, 0xB3,
+            0xF0, 0x6B, 0xD4, 0x15, 0xEB, 0xCD, 0xAA, 0x2C,
+            0xD7, 0xD6, 0x9A, 0x40, 0x67, 0x6A, 0xF1, 0xA7,
+        ];
+        let e_bytes = [0x01, 0x00, 0x01];
+        let d_bytes = [
+            0x80, 0x03, 0xAF, 0x74, 0xD4, 0xA5, 0x9A, 0xBC,
+            0xE4, 0xEF, 0x89, 0xF2, 0x9F, 0xFA, 0xEF, 0xE8,
+            0x52, 0x31, 0x3D, 0x28, 0xDA, 0xE6, 0xEF, 0x5E,
+            0xEF, 0xAA, 0x69, 0x14, 0xF7, 0x21, 0x0E, 0x08,
+            0x25, 0x2F, 0xB2, 0x8D, 0x9A, 0x5B, 0x7E, 0xAA,
+            0x12, 0xB4, 0x76, 0xB8, 0x68, 0x84, 0x0D, 0x78,
+            0x30, 0x8A, 0x93, 0xCD, 0x69, 0x65, 0x8C, 0x63,
+            0x67, 0x9A, 0x43, 0x36, 0xDD, 0xAB, 0x3F, 0x69,
+        ];
+        // Mirror the modulus back out in LE for `ServerRsaPublicKey`.
+        let mut modulus_le = n_bytes.to_vec();
+        modulus_le.reverse();
+        let priv_key = RsaPrivateKey {
+            n: BigUint::from_be_bytes(&n_bytes),
+            d: BigUint::from_be_bytes(&d_bytes),
+            e: BigUint::from_be_bytes(&e_bytes),
+        };
+        let pub_key = ServerRsaPublicKey {
+            exponent: 0x0001_0001,
+            modulus: modulus_le,
+            bit_len: 512,
+        };
+        (priv_key, pub_key)
+    }
+
+    fn standard_security_cfg(server_random_byte: u8) -> crate::config::StandardSecurityConfig {
+        let (priv_key, pub_key) = test_512bit_rsa();
+        crate::config::StandardSecurityConfig {
+            encryption_method:
+                justrdp_pdu::rdp::standard_security::ENCRYPTION_METHOD_128BIT,
+            encryption_level: 2, // client-compatible
+            server_random: [server_random_byte; 32],
+            private_key: priv_key,
+            public_key: pub_key,
+            server_cert_blob: None,
+        }
+    }
+
+    /// Drive a fresh acceptor with `PROTOCOL_RDP` (Standard RDP Security)
+    /// through Phase 1-5 all the way to `WaitSecurityExchange`.
+    fn drive_to_wait_security_exchange(
+        std_cfg: crate::config::StandardSecurityConfig,
+    ) -> ServerAcceptor {
+        // Standard-RDP-Security-only server: Supports PROTOCOL_RDP,
+        // `require_enhanced_security=false` disables the MITM-downgrade
+        // guard since there are no enhanced bits to downgrade from.
+        let cfg = AcceptorConfig::builder()
+            .supported_protocols(SecurityProtocol::RDP)
+            .require_enhanced_security(false)
+            .standard_security(std_cfg)
+            .build()
+            .unwrap();
+        let mut acc = ServerAcceptor::new(cfg);
+        let mut out = WriteBuf::new();
+
+        // Phase 1+2: CR -> CC (PROTOCOL_RDP skips TLS/CredSSP).
+        let nego = NegotiationRequest::new(SecurityProtocol::RDP);
+        let cr = ConnectionRequest::new(Some(nego));
+        acc.step(&build_cr_bytes(&cr), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitMcsConnectInitial);
+
+        // Phase 4: MCS Connect Initial + Response.
+        let client_blocks = build_client_gcc_blocks(&[]);
+        let ci_bytes = build_mcs_connect_initial_bytes(&client_blocks);
+        acc.step(&ci_bytes, &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::ChannelConnection);
+
+        // Phase 5: Erect Domain / AttachUser / Channel Joins.
+        acc.step(
+            &build_slow_path(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }),
+            &mut out,
+        )
+        .unwrap();
+        acc.step(&build_slow_path(&AttachUserRequest), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        let user_id = acc.user_channel_id();
+        for &chid in &[user_id, crate::mcs::IO_CHANNEL_ID] {
+            let req = ChannelJoinRequest {
+                initiator: user_id,
+                channel_id: chid,
+            };
+            acc.step(&build_slow_path(&req), &mut out).unwrap();
+            acc.step(&[], &mut out).unwrap();
+        }
+        // One more step to drain ChannelPhase::Done into the next state.
+        acc.step(&[], &mut out).unwrap();
+        acc
+    }
+
+    /// Build the same Security Exchange PDU the client connector produces:
+    /// TPKT | DT | SDR | secFlags=SEC_EXCHANGE_PKT | secFlagsHi=0 |
+    /// length(=modulus_size+8) | RSA(encrypt(client_random || zero_pad_32))
+    /// | zero_pad_8.
+    fn build_security_exchange_pdu(
+        user_channel_id: u16,
+        io_channel_id: u16,
+        pub_key: &justrdp_pdu::rdp::server_certificate::ServerRsaPublicKey,
+        client_random: &[u8; 32],
+    ) -> alloc::vec::Vec<u8> {
+        use justrdp_core::bignum::BigUint;
+        use justrdp_core::rsa::{rsa_public_encrypt_rdp, RsaPublicKey};
+        use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
+        use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
+
+        let modulus_size = pub_key.modulus_len_bytes();
+        let rsa_pub = RsaPublicKey {
+            n: BigUint::from_le_bytes(&pub_key.modulus),
+            e: BigUint::from_u32(pub_key.exponent),
+        };
+        // §5.3.4.1: plaintext is the 32-byte client random padded up to
+        // modulus size with trailing zero bytes.
+        let mut padded = alloc::vec![0u8; modulus_size];
+        padded[..32].copy_from_slice(client_random);
+        let encrypted = rsa_public_encrypt_rdp(&rsa_pub, &padded);
+        assert_eq!(encrypted.len(), modulus_size);
+
+        // Build the security-exchange inner bytes.
+        let length_field = (modulus_size + 8) as u32;
+        let inner_len = BASIC_SECURITY_HEADER_SIZE + 4 + length_field as usize;
+        let mut inner = alloc::vec![0u8; inner_len];
+        {
+            let mut c = WriteCursor::new(&mut inner);
+            c.write_u16_le(SEC_EXCHANGE_PKT, "SecExchange::flags").unwrap();
+            c.write_u16_le(0, "SecExchange::flagsHi").unwrap();
+            c.write_u32_le(length_field, "SecExchange::length").unwrap();
+            c.write_slice(&encrypted, "SecExchange::ciphertext").unwrap();
+            c.write_slice(&[0u8; 8], "SecExchange::trailingNullPad").unwrap();
+        }
+
+        // Wrap in SDR + X.224 DT + TPKT.
+        let sdr = SendDataRequest {
+            initiator: user_channel_id,
+            channel_id: io_channel_id,
+            user_data: &inner,
+        };
+        let inner_size = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+        let total = TPKT_HEADER_SIZE + inner_size;
+        let mut buf = alloc::vec![0u8; total];
+        let mut cursor = WriteCursor::new(&mut buf);
+        TpktHeader::try_for_payload(inner_size)
+            .unwrap()
+            .encode(&mut cursor)
+            .unwrap();
+        DataTransfer.encode(&mut cursor).unwrap();
+        sdr.encode(&mut cursor).unwrap();
+        buf
+    }
+
+    #[test]
+    fn sc_security_echoes_standard_security_config() {
+        // When `StandardSecurityConfig` is attached AND the negotiated
+        // protocol is PROTOCOL_RDP, the MCS Connect Response MUST carry
+        // the configured encryption_method/level + server_random + a
+        // proprietary certificate blob. This is the wire-visible
+        // promise that the server is ready to do RC4 key exchange.
+        use justrdp_pdu::gcc::server::ServerSecurityData;
+        use justrdp_pdu::gcc::ConferenceCreateResponse;
+
+        let std_cfg = standard_security_cfg(0xAB);
+        let srv_random = std_cfg.server_random;
+        let acc_cfg = AcceptorConfig::builder()
+            .supported_protocols(SecurityProtocol::RDP)
+            .require_enhanced_security(false)
+            .standard_security(std_cfg)
+            .build()
+            .unwrap();
+        let mut acc = ServerAcceptor::new(acc_cfg);
+        let mut out = WriteBuf::new();
+
+        let nego = NegotiationRequest::new(SecurityProtocol::RDP);
+        let cr = ConnectionRequest::new(Some(nego));
+        acc.step(&build_cr_bytes(&cr), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        let ci_bytes = build_mcs_connect_initial_bytes(&build_client_gcc_blocks(&[]));
+        acc.step(&ci_bytes, &mut out).unwrap();
+        let written = acc.step(&[], &mut out).unwrap(); // SendMcsConnectResponse
+
+        let mut cursor = ReadCursor::new(&out.as_slice()[..written.size]);
+        let _tpkt = TpktHeader::decode(&mut cursor).unwrap();
+        let _dt = DataTransfer::decode(&mut cursor).unwrap();
+        let cresp = ConnectResponse::decode(&mut cursor).unwrap();
+        let mut gcc_cursor = ReadCursor::new(&cresp.user_data);
+        let gcc = ConferenceCreateResponse::decode(&mut gcc_cursor).unwrap();
+        let mut bc = ReadCursor::new(&gcc.user_data);
+        // Skip SC_CORE.
+        let _core = justrdp_pdu::gcc::server::ServerCoreData::decode(&mut bc).unwrap();
+        let sec = ServerSecurityData::decode(&mut bc).unwrap();
+        assert_eq!(
+            sec.encryption_method,
+            justrdp_pdu::rdp::standard_security::ENCRYPTION_METHOD_128BIT
+        );
+        assert_eq!(sec.encryption_level, 2);
+        assert_eq!(sec.server_random.as_deref().unwrap(), &srv_random[..]);
+        // Cert blob must parse back through the existing parser so we
+        // know the acceptor emitted a well-formed proprietary cert and
+        // not some mangled bytes.
+        let cert_bytes = sec.server_certificate.unwrap();
+        let parsed =
+            justrdp_pdu::rdp::server_certificate::parse_server_certificate(&cert_bytes).unwrap();
+        assert_eq!(parsed.public_key.exponent, 0x0001_0001);
+        assert_eq!(parsed.public_key.bit_len, 512);
+    }
+
+    #[test]
+    fn sc_security_stays_null_without_standard_security_config() {
+        // Fire-breathing regression: an AcceptorConfig with no
+        // `standard_security` MUST continue to emit the null-encryption
+        // SC_SECURITY block even when the selected protocol is RDP
+        // (e.g. a pure TLS deployment that happens to accept legacy
+        // clients as a fallback). Prevents accidental secret leakage
+        // or confused wire shape when the caller forgets to wire up
+        // the key.
+        use justrdp_pdu::gcc::ConferenceCreateResponse;
+        let cfg = AcceptorConfig::builder()
+            .supported_protocols(SecurityProtocol::RDP)
+            .require_enhanced_security(false)
+            .build()
+            .unwrap();
+        let mut acc = ServerAcceptor::new(cfg);
+        let mut out = WriteBuf::new();
+        let nego = NegotiationRequest::new(SecurityProtocol::RDP);
+        let cr = ConnectionRequest::new(Some(nego));
+        acc.step(&build_cr_bytes(&cr), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        let ci = build_mcs_connect_initial_bytes(&build_client_gcc_blocks(&[]));
+        acc.step(&ci, &mut out).unwrap();
+        let written = acc.step(&[], &mut out).unwrap();
+        let mut cursor = ReadCursor::new(&out.as_slice()[..written.size]);
+        let _tpkt = TpktHeader::decode(&mut cursor).unwrap();
+        let _dt = DataTransfer::decode(&mut cursor).unwrap();
+        let cresp = ConnectResponse::decode(&mut cursor).unwrap();
+        let mut gcc_cursor = ReadCursor::new(&cresp.user_data);
+        let gcc = ConferenceCreateResponse::decode(&mut gcc_cursor).unwrap();
+        let mut bc = ReadCursor::new(&gcc.user_data);
+        let _core = justrdp_pdu::gcc::server::ServerCoreData::decode(&mut bc).unwrap();
+        let sec = justrdp_pdu::gcc::server::ServerSecurityData::decode(&mut bc).unwrap();
+        assert_eq!(sec.encryption_method, 0);
+        assert_eq!(sec.encryption_level, 0);
+        assert!(sec.server_random.is_none());
+        assert!(sec.server_certificate.is_none());
+    }
+
+    #[test]
+    fn channel_connection_done_branches_to_wait_security_exchange() {
+        // The state after ChannelPhase::Done is WaitSecurityExchange
+        // ONLY when Standard RDP Security is configured + selected.
+        let std_cfg = standard_security_cfg(0x11);
+        let acc = drive_to_wait_security_exchange(std_cfg);
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitSecurityExchange);
+        // And the TPKT hint is installed so the caller's read loop
+        // frames the inbound Security Exchange PDU correctly.
+        assert!(acc.next_pdu_hint().is_some());
+    }
+
+    #[test]
+    fn channel_connection_done_without_std_cfg_skips_to_wait_client_info() {
+        // Mirror of the above but with no StandardSecurityConfig -- the
+        // acceptor must skip the security-exchange phase as it does on
+        // the TLS/NLA paths.
+        let cfg = AcceptorConfig::builder()
+            .supported_protocols(SecurityProtocol::RDP)
+            .require_enhanced_security(false)
+            .build()
+            .unwrap();
+        let mut acc = ServerAcceptor::new(cfg);
+        let mut out = WriteBuf::new();
+        let nego = NegotiationRequest::new(SecurityProtocol::RDP);
+        let cr = ConnectionRequest::new(Some(nego));
+        acc.step(&build_cr_bytes(&cr), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        let ci = build_mcs_connect_initial_bytes(&build_client_gcc_blocks(&[]));
+        acc.step(&ci, &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        acc.step(
+            &build_slow_path(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }),
+            &mut out,
+        )
+        .unwrap();
+        acc.step(&build_slow_path(&AttachUserRequest), &mut out).unwrap();
+        acc.step(&[], &mut out).unwrap();
+        let user_id = acc.user_channel_id();
+        for &chid in &[user_id, crate::mcs::IO_CHANNEL_ID] {
+            let req = ChannelJoinRequest {
+                initiator: user_id,
+                channel_id: chid,
+            };
+            acc.step(&build_slow_path(&req), &mut out).unwrap();
+            acc.step(&[], &mut out).unwrap();
+        }
+        acc.step(&[], &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitClientInfo);
+    }
+
+    #[test]
+    fn security_exchange_recovers_client_random_and_derives_keys() {
+        // End-to-end key exchange: the fixed client random arrives
+        // wrapped in a valid Security Exchange PDU, the acceptor
+        // RSA-decrypts it, derives session keys, and both sides'
+        // derivations agree byte-for-byte.
+        let std_cfg = standard_security_cfg(0x5A);
+        let server_random = std_cfg.server_random;
+        let (_, pub_key) = test_512bit_rsa();
+        let mut acc = drive_to_wait_security_exchange(std_cfg);
+
+        let client_random: [u8; 32] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB,
+            0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+            0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+        ];
+        let user_id = acc.user_channel_id();
+        let pdu = build_security_exchange_pdu(
+            user_id,
+            crate::mcs::IO_CHANNEL_ID,
+            &pub_key,
+            &client_random,
+        );
+
+        let mut out = WriteBuf::new();
+        acc.step(&pdu, &mut out).unwrap();
+        assert_eq!(acc.state(), &ServerAcceptorState::WaitClientInfo);
+
+        // Recovered client random bytewise matches what was encrypted.
+        assert_eq!(acc.client_random().unwrap(), &client_random);
+
+        // Keys derived on the server match what the client would derive
+        // from the same (client_random, server_random, method) tuple --
+        // this is the invariant that makes RC4 symmetric in the first
+        // place.
+        let ref_keys = justrdp_pdu::rdp::standard_security::derive_session_keys(
+            &client_random,
+            &server_random,
+            justrdp_pdu::rdp::standard_security::ENCRYPTION_METHOD_128BIT,
+        )
+        .unwrap();
+        let got = acc.session_keys().unwrap();
+        assert_eq!(got.mac_key, ref_keys.mac_key);
+        assert_eq!(got.encrypt_key, ref_keys.encrypt_key);
+        assert_eq!(got.decrypt_key, ref_keys.decrypt_key);
+        assert_eq!(got.key_len, 16);
+
+        // Security context is available for handoff (S3) but not yet
+        // consumed.
+        assert!(acc.take_security_context().is_some());
+        // Second take is empty: ownership semantics (S3 must not
+        // accidentally pull the context twice).
+        assert!(acc.take_security_context().is_none());
+    }
+
+    #[test]
+    fn security_exchange_rejects_wrong_channel() {
+        // A Security Exchange addressed to a non-I/O channel is a
+        // spec violation (§5.3.4) and a spoof vector for a malicious
+        // client that joined an SVC. MUST be rejected.
+        let std_cfg = standard_security_cfg(0x22);
+        let (_, pub_key) = test_512bit_rsa();
+        let mut acc = drive_to_wait_security_exchange(std_cfg);
+        let client_random = [0x77u8; 32];
+        let user_id = acc.user_channel_id();
+        // Send on user_channel_id (which is joined but not the I/O channel).
+        let pdu = build_security_exchange_pdu(
+            user_id,
+            user_id, // wrong channel
+            &pub_key,
+            &client_random,
+        );
+        let mut out = WriteBuf::new();
+        let err = acc.step(&pdu, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("I/O channel"));
+    }
+
+    #[test]
+    fn security_exchange_rejects_missing_sec_exchange_pkt_flag() {
+        // Dropping SEC_EXCHANGE_PKT (flags=0) must not be confused with
+        // a benign client-info-ish PDU -- the acceptor hasn't reached
+        // SEC_INFO_PKT handling yet, so accepting this would silently
+        // let RAW bytes bypass RSA decryption.
+        let std_cfg = standard_security_cfg(0x33);
+        let (_, pub_key) = test_512bit_rsa();
+        let mut acc = drive_to_wait_security_exchange(std_cfg);
+        let client_random = [0x11u8; 32];
+        let mut pdu = build_security_exchange_pdu(
+            acc.user_channel_id(),
+            crate::mcs::IO_CHANNEL_ID,
+            &pub_key,
+            &client_random,
+        );
+        // Locate the flags field inside the SDR user_data and zero it.
+        // The SDR envelope is variable-length PER so we search for the
+        // SEC_EXCHANGE_PKT (0x0001) u16 LE marker and stomp it.
+        let marker = [0x01u8, 0x00, 0x00, 0x00]; // flags=0x0001 flagsHi=0x0000
+        let pos = pdu.windows(4).position(|w| w == marker).unwrap();
+        pdu[pos] = 0x00; // flags low byte
+        let mut out = WriteBuf::new();
+        let err = acc.step(&pdu, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("SEC_EXCHANGE_PKT"));
+    }
+
+    #[test]
+    fn security_exchange_rejects_wrong_length_field() {
+        // If the client sends `length != modulus_size + 8`, the server
+        // MUST refuse rather than RSA-decrypting a short/long slice.
+        let std_cfg = standard_security_cfg(0x44);
+        let (_, pub_key) = test_512bit_rsa();
+        let mut acc = drive_to_wait_security_exchange(std_cfg);
+        let client_random = [0x22u8; 32];
+        let pdu_ok = build_security_exchange_pdu(
+            acc.user_channel_id(),
+            crate::mcs::IO_CHANNEL_ID,
+            &pub_key,
+            &client_random,
+        );
+        // Find the length u32 (= modulus_size + 8 = 72) and tamper it
+        // to 68 so the ciphertext no longer fits an RSA block.
+        let good_len_bytes = 72u32.to_le_bytes();
+        let pos = pdu_ok.windows(4).position(|w| w == good_len_bytes).unwrap();
+        let mut pdu = pdu_ok.clone();
+        pdu[pos..pos + 4].copy_from_slice(&68u32.to_le_bytes());
+        let mut out = WriteBuf::new();
+        let err = acc.step(&pdu, &mut out).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(
+            msg.contains("length") || msg.contains("pad"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn security_exchange_rejects_fips_encryption_method() {
+        // Acceptor path is RC4-only: FIPS requires a whole different
+        // key-derivation function + 3DES context that this landing does
+        // not wire through. Silently accepting the FIPS method bit and
+        // deriving RC4 keys would produce a ciphertext stream the client
+        // can't decrypt.
+        let (priv_key, pub_key) = test_512bit_rsa();
+        let std_cfg = crate::config::StandardSecurityConfig {
+            encryption_method:
+                justrdp_pdu::rdp::standard_security::ENCRYPTION_METHOD_FIPS,
+            encryption_level: 4,
+            server_random: [0x66u8; 32],
+            private_key: priv_key,
+            public_key: pub_key.clone(),
+            server_cert_blob: None,
+        };
+        let mut acc = drive_to_wait_security_exchange(std_cfg);
+        let client_random = [0x99u8; 32];
+        let pdu = build_security_exchange_pdu(
+            acc.user_channel_id(),
+            crate::mcs::IO_CHANNEL_ID,
+            &pub_key,
+            &client_random,
+        );
+        let mut out = WriteBuf::new();
+        let err = acc.step(&pdu, &mut out).unwrap_err();
+        assert!(alloc::format!("{err}").contains("FIPS"));
     }
 }

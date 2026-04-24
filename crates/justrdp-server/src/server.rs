@@ -182,13 +182,18 @@ mod tests {
 
     #[test]
     fn config_round_trips_through_constructor() {
+        // `RdpServerConfig` no longer implements `PartialEq` because it
+        // may embed an RSA private key via StandardSecurityConfig, so
+        // we compare the visible scalar fields field-by-field instead.
         let cfg = RdpServerConfig::builder()
             .max_bitmap_fragment_size(1024)
             .channel_chunk_length(512)
             .build()
             .unwrap();
         let s = RdpServer::new(cfg.clone());
-        assert_eq!(s.config(), &cfg);
+        let got = s.config();
+        assert_eq!(got.max_bitmap_fragment_size, 1024);
+        assert_eq!(got.channel_chunk_length, 512);
     }
 
     #[test]
