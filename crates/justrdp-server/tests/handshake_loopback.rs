@@ -29,6 +29,9 @@ use justrdp_pdu::rdp::fast_path::{
     FastPathScancodeEvent, FastPathUpdateType, FASTPATH_INPUT_ACTION_FASTPATH,
 };
 use justrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+use justrdp_pdu::rdp::redirection::{
+    ServerRedirectionPdu, LB_LOAD_BALANCE_INFO, LB_TARGET_NET_ADDRESS,
+};
 use justrdp_pdu::rdp::svc::{
     ChannelPduHeader, CHANNEL_FLAG_FIRST, CHANNEL_FLAG_LAST, CHANNEL_OPTION_INITIALIZED,
     CHANNEL_PDU_HEADER_SIZE,
@@ -793,6 +796,122 @@ impl RdpServerDisplayHandler for GfxFrameHandler {
     fn get_egfx_frame(&mut self) -> Option<EgfxFrame> {
         self.frame.take()
     }
+}
+
+// ───────────────────────────────────────────────────────────────
+// Server Redirection loopback (§11.2e Commit 2)
+// ───────────────────────────────────────────────────────────────
+
+/// UTF-16LE encode `s` with a trailing `\0` word. Local helper so this
+/// test's setup does not depend on a common utility we are not ready
+/// to lift into the public API yet.
+fn utf16le_null_terminated(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+/// End-to-end loopback test for §11.2e: the server emits a Server
+/// Redirection PDU just as the handshake is about to terminate, and
+/// the real `ClientConnector` decodes it into
+/// `ConnectionResult.server_redirection`.
+///
+/// Injection strategy: drive the handshake normally until the
+/// `ServerAcceptor` transitions to `Accepted` (which means it has
+/// just emitted its final Font Map PDU into the server-to-client
+/// buffer). At that instant the client is still in
+/// `ConnectionFinalizationWaitFontMap` -- the exact state where the
+/// finalization PDU decoder recognises `ShareControlPduType::ServerRedirect`.
+/// We discard the pending Font Map bytes, replace them with the
+/// redirection frame produced by `ServerActiveStage::emit_redirection`,
+/// and continue driving. The client parses the redirection and
+/// transitions directly to `Connected` with the PDU carried in
+/// `ConnectionResult.server_redirection`.
+#[test]
+fn server_emit_redirection_during_finalization_reaches_connected() {
+    let mut client = ClientConnector::new(rdp_only_client_config());
+    let mut acceptor = ServerAcceptor::new(rdp_only_acceptor_config());
+    let mut c2s: Vec<u8> = Vec::new();
+    let mut s2c: Vec<u8> = Vec::new();
+    let mut client_out = WriteBuf::new();
+    let mut server_out = WriteBuf::new();
+
+    let redirection_pdu = ServerRedirectionPdu {
+        session_id: 0xCAFE_BABE,
+        redir_flags: LB_TARGET_NET_ADDRESS | LB_LOAD_BALANCE_INFO,
+        target_net_address: Some(utf16le_null_terminated("10.9.8.7")),
+        load_balance_info: Some(b"Cookie: msts=redirected\r\n".to_vec()),
+        ..Default::default()
+    };
+
+    let mut injected = false;
+    for i in 0..DRIVE_ITERATIONS_CAP {
+        if client.state().is_connected() {
+            break;
+        }
+
+        // Trigger the injection on the first iteration after the
+        // acceptor reaches Accepted. By construction, `step_acceptor`
+        // of the prior iteration placed the final Font Map into
+        // `s2c`; we overwrite it before the client gets a chance to
+        // read those bytes.
+        if !injected && acceptor.state().is_accepted() {
+            let result = match acceptor.state() {
+                ServerAcceptorState::Accepted { result } => result.clone(),
+                _ => unreachable!(),
+            };
+            let config = justrdp_server::RdpServerConfig::builder()
+                .build()
+                .expect("default RdpServerConfig");
+            let mut active = ServerActiveStage::new(result, config);
+            let frame = active
+                .emit_redirection(&redirection_pdu)
+                .expect("emit_redirection should succeed on a fresh Active stage");
+            s2c.clear();
+            s2c.extend_from_slice(&frame);
+            injected = true;
+            continue;
+        }
+
+        let mut any = false;
+        loop {
+            match step_client(&mut client, &mut s2c, &mut client_out, &mut c2s) {
+                StepOutcome::Progressed => any = true,
+                StepOutcome::WaitingForInput | StepOutcome::Terminal => break,
+            }
+        }
+        loop {
+            match step_acceptor(&mut acceptor, &mut c2s, &mut server_out, &mut s2c) {
+                StepOutcome::Progressed => any = true,
+                StepOutcome::WaitingForInput | StepOutcome::Terminal => break,
+            }
+        }
+        if !any {
+            panic!(
+                "handshake deadlocked at iteration {i} before injection: \
+                 client_state={:?} acceptor_state={:?}",
+                client.state(),
+                acceptor.state()
+            );
+        }
+    }
+
+    assert!(injected, "redirection was never injected into the handshake");
+    assert!(
+        client.state().is_connected(),
+        "client MUST reach Connected after receiving the redirection PDU, got {:?}",
+        client.state()
+    );
+
+    let result = client.result().expect("Connected implies ConnectionResult");
+    let got = result
+        .server_redirection
+        .as_ref()
+        .expect("ConnectionResult.server_redirection MUST be populated");
+    assert_eq!(got.session_id, 0xCAFE_BABE);
+    assert!(got.has_flag(LB_TARGET_NET_ADDRESS));
+    assert!(got.has_flag(LB_LOAD_BALANCE_INFO));
+    assert_eq!(got, &redirection_pdu);
 }
 
 #[test]
