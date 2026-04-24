@@ -21,6 +21,7 @@ mod config;
 mod encoder;
 mod error;
 mod handler;
+mod random;
 mod server;
 
 pub use config::{
@@ -36,6 +37,11 @@ pub use justrdp_pdu::rdp::surface_commands::CompressedBitmapHeaderEx;
 pub use active::{ActiveStageOutput, DeactivationState, ServerActiveStage};
 pub use justrdp_pdu::mcs::DisconnectReason;
 pub use justrdp_pdu::rdp::error_info::ErrorInfoCode;
+pub use justrdp_pdu::rdp::finalization::{
+    ArcCsPrivatePacket, ArcScPrivatePacket, LogonErrorsInfo, LogonInfoExtended, LogonInfoV1,
+    LogonInfoV2, SaveSessionInfoData, SaveSessionInfoPdu,
+};
+pub use random::RandomSource;
 pub use encoder::{
     encode_bitmap_update, encode_frame_marker, encode_pointer_cached, encode_pointer_color,
     encode_pointer_new, encode_pointer_position, encode_pointer_update,

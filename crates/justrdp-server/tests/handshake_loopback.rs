@@ -914,6 +914,117 @@ fn server_emit_redirection_during_finalization_reaches_connected() {
     assert_eq!(got, &redirection_pdu);
 }
 
+// ───────────────────────────────────────────────────────────────
+// Auto-Reconnect Cookie loopback (§11.2f Commit 1)
+// ───────────────────────────────────────────────────────────────
+
+/// End-to-end loopback test for §11.2f: the server emits a
+/// `Save Session Info PDU` (infoType = `INFOTYPE_LOGON_EXTENDED_INFO`)
+/// carrying an `ArcScPrivatePacket`, and the real `ClientConnector`
+/// surfaces it in `ConnectionResult.server_arc_cookie`.
+///
+/// Injection strategy: drive the handshake normally until the
+/// `ServerAcceptor` transitions to `Accepted`. At that instant the
+/// server has just queued the Font Map PDU in `s2c`; the client is
+/// still in `ConnectionFinalizationWaitFontMap`. We splice a
+/// Save Session Info frame **before** those pending FontMap bytes.
+/// The client connector's finalization loop decodes the cookie via
+/// `try_store_monitor_layout` (which also handles
+/// `ShareDataPduType::SaveSessionInfo`) before the FontMap advances
+/// it to `Connected`.
+#[test]
+fn server_emit_auto_reconnect_cookie_reaches_client_connection_result() {
+    use justrdp_server::RandomSource;
+
+    struct FixedRng(u8);
+    impl RandomSource for FixedRng {
+        fn fill_random(&mut self, buf: &mut [u8]) {
+            buf.fill(self.0);
+        }
+    }
+
+    let mut client = ClientConnector::new(rdp_only_client_config());
+    let mut acceptor = ServerAcceptor::new(rdp_only_acceptor_config());
+    let mut c2s: Vec<u8> = Vec::new();
+    let mut s2c: Vec<u8> = Vec::new();
+    let mut client_out = WriteBuf::new();
+    let mut server_out = WriteBuf::new();
+
+    let expected_logon_id: u32 = 0xDEAD_BEEF;
+    let expected_bits = [0xA5u8; 16];
+
+    let mut injected = false;
+    for i in 0..DRIVE_ITERATIONS_CAP {
+        if client.state().is_connected() {
+            break;
+        }
+
+        if !injected && acceptor.state().is_accepted() {
+            let result = match acceptor.state() {
+                ServerAcceptorState::Accepted { result } => result.clone(),
+                _ => unreachable!(),
+            };
+            let config = justrdp_server::RdpServerConfig::builder()
+                .build()
+                .expect("default RdpServerConfig");
+            let mut active = ServerActiveStage::new(result, config);
+            let mut rng = FixedRng(0xA5);
+            let (cookie_frame, cookie) = active
+                .emit_auto_reconnect_cookie(expected_logon_id, &mut rng)
+                .expect("emit_auto_reconnect_cookie on fresh Active stage");
+            assert_eq!(cookie.logon_id, expected_logon_id);
+            assert_eq!(cookie.arc_random_bits, expected_bits);
+
+            // Splice the cookie frame BEFORE the pending FontMap bytes.
+            // The client consumes SaveSessionInfo first (captures ARC),
+            // then FontMap drives the transition to Connected.
+            let mut spliced = Vec::with_capacity(cookie_frame.len() + s2c.len());
+            spliced.extend_from_slice(&cookie_frame);
+            spliced.extend_from_slice(&s2c);
+            s2c = spliced;
+            injected = true;
+            continue;
+        }
+
+        let mut any = false;
+        loop {
+            match step_client(&mut client, &mut s2c, &mut client_out, &mut c2s) {
+                StepOutcome::Progressed => any = true,
+                StepOutcome::WaitingForInput | StepOutcome::Terminal => break,
+            }
+        }
+        loop {
+            match step_acceptor(&mut acceptor, &mut c2s, &mut server_out, &mut s2c) {
+                StepOutcome::Progressed => any = true,
+                StepOutcome::WaitingForInput | StepOutcome::Terminal => break,
+            }
+        }
+        if !any {
+            panic!(
+                "handshake deadlocked at iteration {i} before injection: \
+                 client_state={:?} acceptor_state={:?}",
+                client.state(),
+                acceptor.state()
+            );
+        }
+    }
+
+    assert!(injected, "cookie was never injected into the handshake");
+    assert!(
+        client.state().is_connected(),
+        "client MUST reach Connected after consuming cookie + FontMap, got {:?}",
+        client.state()
+    );
+
+    let result = client.result().expect("Connected implies ConnectionResult");
+    let got = result
+        .server_arc_cookie
+        .as_ref()
+        .expect("ConnectionResult.server_arc_cookie MUST be populated");
+    assert_eq!(got.logon_id, expected_logon_id);
+    assert_eq!(got.arc_random_bits, expected_bits);
+}
+
 #[test]
 fn egfx_frame_seam_surfaces_caller_owned_bytes() {
     // Pretend two `DrdynvcServer::send_data` payloads came out of a

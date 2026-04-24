@@ -35,7 +35,8 @@ use justrdp_pdu::mcs::SendDataRequest;
 use justrdp_svc::{SvcError, SvcServerProcessor};
 use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathInputHeader};
 use justrdp_pdu::rdp::finalization::{
-    ControlAction, ControlPdu, InputEventPdu, InputEventType, PersistentKeyListPdu, RefreshRectPdu,
+    ArcScPrivatePacket, ControlAction, ControlPdu, InputEventPdu, InputEventType, LogonInfoExtended,
+    PersistentKeyListPdu, RefreshRectPdu, SaveSessionInfoData, SaveSessionInfoPdu,
     ShutdownDeniedPdu, ShutdownRequestPdu, SuppressOutputPdu,
 };
 use justrdp_pdu::rdp::redirection::ServerRedirectionPdu;
@@ -51,6 +52,7 @@ use justrdp_pdu::x224::DataTransfer;
 use crate::config::RdpServerConfig;
 use crate::error::{ServerError, ServerResult};
 use crate::handler::{DisplayRect, RdpServerInputHandler};
+use crate::random::RandomSource;
 
 // ── Slow-path keyboard flags (MS-RDPBCGR §2.2.8.1.1.3.1.1.1) ──
 
@@ -290,6 +292,12 @@ pub struct ServerActiveStage {
     /// emit two redirection PDUs on the same session (which would
     /// leave the client in a ambiguous reconnect state).
     has_emitted_redirection: bool,
+    /// Most recent Auto-Reconnect Cookie issued for this session via
+    /// [`emit_auto_reconnect_cookie`](Self::emit_auto_reconnect_cookie).
+    /// Overwritten on each re-issue -- the server only retains the
+    /// current cookie per MS-RDPBCGR §5.5 (previously issued cookies
+    /// for this session are invalidated when a new one is emitted).
+    current_arc_cookie: Option<ArcScPrivatePacket>,
 }
 
 impl ServerActiveStage {
@@ -308,6 +316,7 @@ impl ServerActiveStage {
             pending_display_size: None,
             svc_processors: Vec::new(),
             has_emitted_redirection: false,
+            current_arc_cookie: None,
         }
     }
 
@@ -759,6 +768,123 @@ impl ServerActiveStage {
     /// drop the TCP connection shortly.
     pub fn has_emitted_redirection(&self) -> bool {
         self.has_emitted_redirection
+    }
+
+    /// Encode a `Save Session Info` PDU (MS-RDPBCGR §2.2.10.1) with
+    /// the supplied [`SaveSessionInfoData`] variant and return a single
+    /// wire-ready frame (TPKT + X.224 DT + MCS SDI on the I/O channel +
+    /// ShareControl + ShareData + body).
+    ///
+    /// The four infoType variants map 1:1 onto the enum:
+    ///
+    /// | `SaveSessionInfoData` variant | `infoType`                    |
+    /// |-------------------------------|-------------------------------|
+    /// | `LogonV1(_)`                  | `INFOTYPE_LOGON`              |
+    /// | `LogonV2(_)`                  | `INFOTYPE_LOGON_LONG`         |
+    /// | `PlainNotify`                 | `INFOTYPE_LOGON_PLAINNOTIFY`  |
+    /// | `Extended(_)`                 | `INFOTYPE_LOGON_EXTENDED_INFO`|
+    ///
+    /// This is the generic wrapper; for the Auto-Reconnect Cookie
+    /// convenience flow use
+    /// [`emit_auto_reconnect_cookie`](Self::emit_auto_reconnect_cookie).
+    ///
+    /// **Security envelope**: the frame is emitted in Enhanced Security
+    /// form (no Non-FIPS `securityHeader`). The Standard RDP Security
+    /// variant (RC4-encrypted) is deferred to `§11.2a-stdsec`.
+    pub fn emit_save_session_info(
+        &self,
+        data: SaveSessionInfoData,
+    ) -> ServerResult<Vec<u8>> {
+        let pdu = SaveSessionInfoPdu { info_data: data };
+        self.encode_share_data(ShareDataPduType::SaveSessionInfo, &pdu)
+    }
+
+    /// Generate a fresh Auto-Reconnect Cookie using the supplied
+    /// [`RandomSource`], emit it in a `Save Session Info` PDU
+    /// (infoType = `INFOTYPE_LOGON_EXTENDED_INFO`, carrying an
+    /// `ARC_SC_PRIVATE_PACKET` per MS-RDPBCGR §2.2.4.2), and return
+    /// `(frame_bytes, cookie)` to the caller.
+    ///
+    /// The returned [`ArcScPrivatePacket`] is the exact material the
+    /// client will echo back (HMAC-keyed) in a
+    /// `ClientAutoReconnectPacket` on the next reconnection attempt
+    /// (MS-RDPBCGR §5.5). Callers that run cross-process
+    /// verification (e.g. behind a load balancer) SHOULD persist this
+    /// value alongside the session's `logon_id`; same-process callers
+    /// can retrieve it via
+    /// [`current_auto_reconnect_cookie`](Self::current_auto_reconnect_cookie).
+    ///
+    /// **Re-emit semantics** (§5.5): calling this method a second
+    /// time generates a *new* 16-byte random value and replaces the
+    /// stored cookie -- the previous cookie is invalidated from the
+    /// server's perspective. This matches the Windows RDS behaviour
+    /// of refreshing the cookie at hourly intervals or on session
+    /// reset.
+    ///
+    /// # Guards
+    ///
+    /// - **After redirection**: once
+    ///   [`emit_redirection`](Self::emit_redirection) has fired, the
+    ///   client will tear down the connection shortly and any ARC
+    ///   cookie for this session is moot. Returns
+    ///   `ServerError::protocol(_)`.
+    /// - **During Deactivation-Reactivation**: the cookie wire
+    ///   format does not include the `share_id`, but emitting a
+    ///   Save Session Info PDU mid-D/R would ride on a stale
+    ///   ShareControl envelope (the old `share_id` is invalid for
+    ///   the duration of the D/R window). Rejected for the same
+    ///   reason `emit_redirection` is rejected in that state.
+    ///
+    /// # Security
+    ///
+    /// The 16-byte `ArcRandomBits` is the HMAC-MD5 key used to
+    /// authenticate the next reconnection attempt. Callers MUST
+    /// provide a cryptographically secure RNG; a predictable source
+    /// allows offline forgery of `ClientAutoReconnectPacket`.
+    pub fn emit_auto_reconnect_cookie(
+        &mut self,
+        logon_id: u32,
+        rng: &mut dyn RandomSource,
+    ) -> ServerResult<(Vec<u8>, ArcScPrivatePacket)> {
+        if self.has_emitted_redirection {
+            return Err(ServerError::protocol(
+                "emit_auto_reconnect_cookie is not permitted after \
+                 emit_redirection (the session is ending)",
+            ));
+        }
+        if self.deactivation_state != DeactivationState::Active {
+            return Err(ServerError::protocol(
+                "emit_auto_reconnect_cookie is not permitted while a \
+                 Deactivation-Reactivation Sequence is in flight",
+            ));
+        }
+
+        let mut arc_random_bits = [0u8; 16];
+        rng.fill_random(&mut arc_random_bits);
+        let cookie = ArcScPrivatePacket {
+            logon_id,
+            arc_random_bits,
+        };
+
+        let ext = LogonInfoExtended {
+            auto_reconnect_cookie: Some(cookie),
+            logon_errors: None,
+        };
+        let frame = self.emit_save_session_info(SaveSessionInfoData::Extended(ext))?;
+
+        self.current_arc_cookie = Some(cookie);
+        Ok((frame, cookie))
+    }
+
+    /// Most recent Auto-Reconnect Cookie issued on this stage, or
+    /// `None` if [`emit_auto_reconnect_cookie`](Self::emit_auto_reconnect_cookie)
+    /// has not been called.
+    ///
+    /// Only the most-recent cookie is retained; earlier cookies for
+    /// this session are invalidated per MS-RDPBCGR §5.5 when a new
+    /// one is emitted.
+    pub fn current_auto_reconnect_cookie(&self) -> Option<&ArcScPrivatePacket> {
+        self.current_arc_cookie.as_ref()
     }
 
     /// Hand a reassembled SVC payload to a registered processor, if any,
@@ -2528,6 +2654,195 @@ mod tests {
         assert_eq!(&body[4..8], &7u32.to_le_bytes());
         assert_eq!(&body[8..12], &LB_NOREDIRECT.to_le_bytes());
         assert_eq!(&body[12..20], &[0u8; 8]);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Save Session Info / Auto-Reconnect Cookie emit tests (§11.2f)
+    // ──────────────────────────────────────────────────────────────
+
+    use justrdp_pdu::rdp::finalization::{
+        ArcScPrivatePacket as PduArcScPrivatePacket, SaveSessionInfoData as PduSaveSessionInfoData,
+        SaveSessionInfoPdu as PduSaveSessionInfoPdu,
+    };
+    use justrdp_pdu::rdp::headers::ShareDataHeader;
+
+    /// RandomSource test double that returns a pre-seeded byte pattern,
+    /// cycling through it if more bytes are requested than the seed
+    /// holds. Lets tests assert the RNG output flows into the cookie.
+    struct FakeRng {
+        seed: Vec<u8>,
+        cursor: usize,
+    }
+
+    impl FakeRng {
+        fn new(seed: &[u8]) -> Self {
+            Self {
+                seed: seed.to_vec(),
+                cursor: 0,
+            }
+        }
+    }
+
+    impl RandomSource for FakeRng {
+        fn fill_random(&mut self, buf: &mut [u8]) {
+            for b in buf.iter_mut() {
+                *b = self.seed[self.cursor % self.seed.len()];
+                self.cursor += 1;
+            }
+        }
+    }
+
+    /// Peel a Save Session Info frame back to the `SaveSessionInfoPdu`.
+    /// Returns `(sdi_channel_id, share_control_header, share_data_header, save_session_info_pdu)`.
+    fn strip_save_session_info_frame(
+        bytes: &[u8],
+    ) -> (u16, ShareControlHeader, ShareDataHeader, PduSaveSessionInfoPdu) {
+        let mut c = ReadCursor::new(bytes);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let sc = ShareControlHeader::decode(&mut inner).unwrap();
+        let sd = ShareDataHeader::decode(&mut inner).unwrap();
+        let pdu = PduSaveSessionInfoPdu::decode(&mut inner).unwrap();
+        (sdi.channel_id, sc, sd, pdu)
+    }
+
+    #[test]
+    fn emit_save_session_info_plain_notify_roundtrips() {
+        let s = fake_stage();
+        let frame = s
+            .emit_save_session_info(PduSaveSessionInfoData::PlainNotify)
+            .unwrap();
+        let (channel_id, sc, sd, pdu) = strip_save_session_info_frame(&frame);
+
+        assert_eq!(channel_id, s.io_channel_id());
+        assert_eq!(sc.pdu_type, ShareControlPduType::Data);
+        assert_eq!(sc.pdu_source, s.user_channel_id());
+        assert_eq!(sd.share_id, s.share_id());
+        assert_eq!(sd.pdu_type2, ShareDataPduType::SaveSessionInfo);
+        assert_eq!(sd.stream_id, STREAM_LOW);
+        assert_eq!(pdu.info_data, PduSaveSessionInfoData::PlainNotify);
+    }
+
+    #[test]
+    fn emit_auto_reconnect_cookie_produces_extended_save_session_info() {
+        // RNG-supplied bytes MUST land verbatim in the ArcScPrivatePacket
+        // on the wire, and the logon_id MUST round-trip through the
+        // ShareData envelope unchanged.
+        let mut s = fake_stage();
+        let mut rng = FakeRng::new(&[
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ]);
+        let logon_id = 0x0000_0042;
+
+        let (frame, returned_cookie) = s.emit_auto_reconnect_cookie(logon_id, &mut rng).unwrap();
+
+        assert_eq!(returned_cookie.logon_id, logon_id);
+        assert_eq!(
+            returned_cookie.arc_random_bits,
+            [
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+                0xFF, 0x00,
+            ]
+        );
+
+        let (channel_id, sc, sd, pdu) = strip_save_session_info_frame(&frame);
+        assert_eq!(channel_id, s.io_channel_id());
+        assert_eq!(sc.pdu_type, ShareControlPduType::Data);
+        assert_eq!(sd.pdu_type2, ShareDataPduType::SaveSessionInfo);
+
+        // The connector-facing path is arc_random(); assert that is what
+        // the client will see after decoding.
+        let (out_logon, out_bits) = pdu
+            .info_data
+            .arc_random()
+            .expect("Extended variant with ARC cookie MUST surface arc_random()");
+        assert_eq!(out_logon, logon_id);
+        assert_eq!(out_bits, returned_cookie.arc_random_bits);
+    }
+
+    #[test]
+    fn emit_auto_reconnect_cookie_updates_current_cookie_on_reissue() {
+        // §5.5: a new cookie replaces the old one. The stage's stored
+        // value MUST track the most recent emit.
+        let mut s = fake_stage();
+        let mut rng_a = FakeRng::new(&[0xA5; 1]);
+        let mut rng_b = FakeRng::new(&[0x5A; 1]);
+
+        assert!(s.current_auto_reconnect_cookie().is_none());
+
+        let (_, first) = s.emit_auto_reconnect_cookie(1, &mut rng_a).unwrap();
+        assert_eq!(s.current_auto_reconnect_cookie(), Some(&first));
+
+        let (_, second) = s.emit_auto_reconnect_cookie(1, &mut rng_b).unwrap();
+        assert_eq!(s.current_auto_reconnect_cookie(), Some(&second));
+        assert_ne!(first.arc_random_bits, second.arc_random_bits);
+    }
+
+    #[test]
+    fn emit_auto_reconnect_cookie_blocked_after_redirection() {
+        let mut s = fake_stage();
+        let redirect = ServerRedirectionPdu {
+            session_id: 0,
+            redir_flags: LB_NOREDIRECT,
+            ..Default::default()
+        };
+        s.emit_redirection(&redirect).unwrap();
+
+        let mut rng = FakeRng::new(&[0u8; 1]);
+        let err = s.emit_auto_reconnect_cookie(7, &mut rng).unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("after emit_redirection"),
+            "got: {err}"
+        );
+        assert!(
+            s.current_auto_reconnect_cookie().is_none(),
+            "rejected emit MUST NOT stash a cookie"
+        );
+    }
+
+    #[test]
+    fn emit_auto_reconnect_cookie_blocked_during_deactivation_reactivation() {
+        let mut s = fake_stage();
+        let _ = s.request_deactivation_reactivation(800, 600).unwrap();
+        assert!(s.is_in_deactivation_reactivation());
+
+        let mut rng = FakeRng::new(&[0u8; 1]);
+        let err = s.emit_auto_reconnect_cookie(7, &mut rng).unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("Deactivation-Reactivation"),
+            "got: {err}"
+        );
+        assert!(s.current_auto_reconnect_cookie().is_none());
+    }
+
+    #[test]
+    fn emit_auto_reconnect_cookie_logon_id_roundtrips_on_wire() {
+        // Edge cases: logon_id = 0 and logon_id = u32::MAX must survive
+        // encode → decode without truncation or byte-swap bugs.
+        for logon_id in [0u32, 1, u32::MAX] {
+            let mut s = fake_stage();
+            let mut rng = FakeRng::new(&[0u8; 1]);
+            let (frame, _) = s.emit_auto_reconnect_cookie(logon_id, &mut rng).unwrap();
+            let (_, _, _, pdu) = strip_save_session_info_frame(&frame);
+            let (out_logon, _) = pdu.info_data.arc_random().unwrap();
+            assert_eq!(out_logon, logon_id);
+        }
+    }
+
+    #[test]
+    fn cookie_struct_roundtrips_through_pdu_crate_and_back() {
+        // Sanity check that the re-exported ArcScPrivatePacket from the
+        // server crate is the same type callers pull from justrdp-pdu:
+        // the integration test relies on this identity.
+        let mut s = fake_stage();
+        let mut rng = FakeRng::new(&[0x5Au8; 1]);
+        let (_, c) = s.emit_auto_reconnect_cookie(42, &mut rng).unwrap();
+        let as_pdu: PduArcScPrivatePacket = c;
+        assert_eq!(as_pdu.logon_id, 42);
+        assert_eq!(as_pdu.arc_random_bits, [0x5A; 16]);
     }
 
     #[test]
