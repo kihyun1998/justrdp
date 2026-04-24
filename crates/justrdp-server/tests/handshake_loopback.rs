@@ -13,6 +13,7 @@
 
 use justrdp_acceptor::{
     AcceptorConfig, Sequence as AcceptorSequence, ServerAcceptor, ServerAcceptorState,
+    StandardSecurityConfig,
 };
 use justrdp_connector::{
     ClientConnector, ClientConnectorState, Config, Sequence as ConnectorSequence,
@@ -370,6 +371,158 @@ fn protocol_rdp_handshake_reaches_both_terminal_states() {
                 result.share_id, client_result.share_id,
                 "share_id MUST match on both sides"
             );
+            assert_eq!(result.selected_protocol, SecurityProtocol::RDP);
+        }
+        other => panic!("unexpected acceptor state: {other:?}"),
+    }
+}
+
+/// Same 512-bit synthetic RSA key used by the `justrdp-core::rsa` and
+/// `justrdp-acceptor` tests. We recreate it inline so we don't need to
+/// expose internal test helpers across crate boundaries.
+fn synthetic_512bit_rsa() -> (
+    justrdp_core::rsa::RsaPrivateKey,
+    justrdp_pdu::rdp::server_certificate::ServerRsaPublicKey,
+) {
+    use justrdp_core::bignum::BigUint;
+    use justrdp_core::rsa::RsaPrivateKey;
+    use justrdp_pdu::rdp::server_certificate::ServerRsaPublicKey;
+    let n_bytes = [
+        0x9A, 0xD2, 0x93, 0x02, 0xA1, 0xC2, 0x45, 0x47, 0x32, 0x6C, 0x6A, 0x4E, 0x0B, 0x25, 0xA5,
+        0x8B, 0xFE, 0x2C, 0xA4, 0x03, 0xF3, 0x21, 0x59, 0x76, 0x30, 0xBB, 0x58, 0xBD, 0xC3, 0x4D,
+        0xB1, 0xF0, 0x86, 0xC1, 0x79, 0xCD, 0xF8, 0xCF, 0xB6, 0x36, 0x79, 0x0D, 0xA2, 0x84, 0xB8,
+        0xE2, 0xE5, 0xB3, 0xF0, 0x6B, 0xD4, 0x15, 0xEB, 0xCD, 0xAA, 0x2C, 0xD7, 0xD6, 0x9A, 0x40,
+        0x67, 0x6A, 0xF1, 0xA7,
+    ];
+    let e_bytes = [0x01, 0x00, 0x01];
+    let d_bytes = [
+        0x80, 0x03, 0xAF, 0x74, 0xD4, 0xA5, 0x9A, 0xBC, 0xE4, 0xEF, 0x89, 0xF2, 0x9F, 0xFA, 0xEF,
+        0xE8, 0x52, 0x31, 0x3D, 0x28, 0xDA, 0xE6, 0xEF, 0x5E, 0xEF, 0xAA, 0x69, 0x14, 0xF7, 0x21,
+        0x0E, 0x08, 0x25, 0x2F, 0xB2, 0x8D, 0x9A, 0x5B, 0x7E, 0xAA, 0x12, 0xB4, 0x76, 0xB8, 0x68,
+        0x84, 0x0D, 0x78, 0x30, 0x8A, 0x93, 0xCD, 0x69, 0x65, 0x8C, 0x63, 0x67, 0x9A, 0x43, 0x36,
+        0xDD, 0xAB, 0x3F, 0x69,
+    ];
+    let mut modulus_le = n_bytes.to_vec();
+    modulus_le.reverse();
+    let priv_key = RsaPrivateKey {
+        n: BigUint::from_be_bytes(&n_bytes),
+        d: BigUint::from_be_bytes(&d_bytes),
+        e: BigUint::from_be_bytes(&e_bytes),
+    };
+    let pub_key = ServerRsaPublicKey {
+        exponent: 0x0001_0001,
+        modulus: modulus_le,
+        bit_len: 512,
+    };
+    (priv_key, pub_key)
+}
+
+/// End-to-end §11.2a-stdsec S3a validation: a ClientConnector and a
+/// ServerAcceptor both configured for Standard RDP Security (RC4 +
+/// MAC) drive themselves to terminal states using the same drive loop
+/// as the plain PROTOCOL_RDP test. This exercises every acceptor
+/// phase's new `wrap_security_payload` / `unwrap_security_payload`
+/// plumbing in a single wire transcript:
+///
+/// - MCS Connect Response carries a signed proprietary server cert
+///   + serverRandom in SC_SECURITY.
+/// - Security Exchange PDU delivers an RSA-encrypted clientRandom
+///   which the server RSA-decrypts + derives session keys from.
+/// - Client Info PDU arrives with SEC_ENCRYPT + MAC (decrypted by
+///   `step_wait_client_info`).
+/// - License PDU (SEC_LICENSE_PKT | SEC_ENCRYPT), DemandActive
+///   (SEC_ENCRYPT), ConfirmActive (decrypted), and all 8 finalization
+///   sub-phases round-trip through the RC4 stream in both directions.
+///
+/// A regression here is a high-stakes bug: any mismatch in session-key
+/// derivation or MAC ordering would stop the handshake somewhere past
+/// the Security Exchange with one side failing to decrypt; the deadlock
+/// check in `drive_full_handshake` would fire with a diagnostic state.
+#[test]
+fn standard_security_handshake_reaches_both_terminal_states() {
+    use justrdp_pdu::rdp::server_certificate::encode_proprietary_certificate;
+    use justrdp_pdu::rdp::standard_security::{derive_session_keys, ENCRYPTION_METHOD_128BIT};
+
+    let (priv_key, pub_key) = synthetic_512bit_rsa();
+    // Deterministic randoms so a regression reproduces bit-for-bit.
+    let client_random: [u8; 32] = [
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD,
+        0xEF, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+        0x11, 0x00,
+    ];
+    let server_random: [u8; 32] = [
+        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE,
+        0xAF, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD,
+        0xBE, 0xBF,
+    ];
+
+    // Pre-render the cert once so the test double-checks
+    // `encode_proprietary_certificate` is stable across the handshake
+    // (the acceptor's internal build call would otherwise re-sign it).
+    let cert_blob = encode_proprietary_certificate(&pub_key);
+    let std_cfg = StandardSecurityConfig {
+        encryption_method: ENCRYPTION_METHOD_128BIT,
+        encryption_level: 2, // client-compatible
+        server_random,
+        private_key: priv_key,
+        public_key: pub_key,
+        server_cert_blob: Some(cert_blob),
+    };
+
+    let client_cfg = Config::builder("test-user", "test-pass")
+        .security_protocol(SecurityProtocol::RDP)
+        .client_random(client_random)
+        .build();
+    let acceptor_cfg = AcceptorConfig::builder()
+        .supported_protocols(SecurityProtocol::RDP)
+        .require_enhanced_security(false)
+        .standard_security(std_cfg)
+        .build()
+        .expect("PROTOCOL_RDP + StandardSecurityConfig is a valid combination");
+
+    let client = ClientConnector::new(client_cfg);
+    let acceptor = ServerAcceptor::new(acceptor_cfg);
+    let (client, acceptor) = drive_full_handshake(client, acceptor);
+
+    // Both peers terminal:
+    assert!(
+        client.state().is_connected(),
+        "client did not reach Connected: {:?}",
+        client.state()
+    );
+    assert!(
+        acceptor.state().is_accepted(),
+        "acceptor did not reach Accepted: {:?}",
+        acceptor.state()
+    );
+
+    // The recovered client random must match what we configured; this
+    // proves the RSA-decrypt + LE-byte handling round-tripped bytewise.
+    assert_eq!(acceptor.client_random().unwrap(), &client_random);
+
+    // Session keys on both sides are a function of
+    // (clientRandom, serverRandom, encryption_method). Independently
+    // re-derive and compare byte-for-byte. If this fails, the server's
+    // RC4 stream and the client's would diverge exactly at the first
+    // encrypted PDU -- which is why the drive loop deadlock would
+    // precede the assertion.
+    let expected = derive_session_keys(&client_random, &server_random, ENCRYPTION_METHOD_128BIT)
+        .expect("128-bit RC4 key derivation always succeeds");
+    let server_keys = acceptor.session_keys().unwrap();
+    assert_eq!(server_keys.mac_key, expected.mac_key);
+    assert_eq!(server_keys.encrypt_key, expected.encrypt_key);
+    assert_eq!(server_keys.decrypt_key, expected.decrypt_key);
+    assert_eq!(server_keys.key_len, 16);
+
+    // Spot-check negotiated identifiers match on both sides (same as
+    // the plain PROTOCOL_RDP test), i.e. encryption didn't corrupt any
+    // late-handshake field.
+    let client_result = client.result().expect("Connected implies ConnectionResult");
+    match acceptor.state() {
+        ServerAcceptorState::Accepted { result } => {
+            assert_eq!(result.io_channel_id, client_result.io_channel_id);
+            assert_eq!(result.user_channel_id, client_result.user_channel_id);
+            assert_eq!(result.share_id, client_result.share_id);
             assert_eq!(result.selected_protocol, SecurityProtocol::RDP);
         }
         other => panic!("unexpected acceptor state: {other:?}"),

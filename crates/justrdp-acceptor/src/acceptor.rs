@@ -29,7 +29,7 @@ use justrdp_pdu::rdp::licensing::LicenseErrorMessage;
 use justrdp_pdu::rdp::server_certificate::encode_proprietary_certificate;
 use justrdp_pdu::rdp::standard_security::{
     derive_session_keys, RdpSecurityContext, SessionKeys, ENCRYPTION_METHOD_128BIT,
-    ENCRYPTION_METHOD_40BIT, ENCRYPTION_METHOD_56BIT, SEC_EXCHANGE_PKT,
+    ENCRYPTION_METHOD_40BIT, ENCRYPTION_METHOD_56BIT, SEC_ENCRYPT, SEC_EXCHANGE_PKT,
 };
 use justrdp_pdu::tpkt::{TpktHeader, TpktHint, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{
@@ -1092,22 +1092,24 @@ impl ServerAcceptor {
             )
         })?;
         let modulus_bytes = std_cfg.public_key.modulus_len_bytes();
-        // §5.3.4.1: encryptedClientRandom = modulus_bytes payload + 8-byte
-        // trailing null pad. Reject length mismatches up-front so we don't
-        // silently RSA-decrypt the wrong slice.
-        if length != modulus_bytes + 8 {
+        // MS-RDPBCGR §2.2.1.10.1.1: `length` equals the RSA modulus size
+        // + an optional trailing null-pad. Real mstsc emits the 8-byte
+        // pad (matches `keylen = modulus_size + 8` in the server cert);
+        // JustRDP's own connector elides it (`length = modulus_size`,
+        // no trailing bytes). Accept both shapes -- anything past the
+        // modulus-sized ciphertext is consumed and ignored as pad.
+        if length < modulus_bytes {
             return Err(AcceptorError::general(
-                "SecurityExchange length != modulus_size + 8 (spec-required null pad)",
+                "SecurityExchange length < modulus_size (ciphertext underflow)",
             ));
         }
+        let pad_len = length - modulus_bytes;
         let encrypted = sec
             .read_slice(modulus_bytes, "SecExchange::encryptedClientRandom")?;
-        // Consume and ignore the 8-byte null pad. MS-RDPBCGR §5.3.4.1
-        // requires it to be zero but real clients sometimes leak stack
-        // garbage here; accepting any bytes matches mstsc / FreeRDP
-        // server behaviour and never affects the derived keys.
-        let _trailing_pad = sec
-            .read_slice(8, "SecExchange::nullPad")?;
+        if pad_len > 0 {
+            let _trailing_pad = sec
+                .read_slice(pad_len, "SecExchange::nullPad")?;
+        }
 
         // Raw textbook RSA decrypt in LE. `rsa_private_decrypt_rdp`
         // returns `modulus_bytes` bytes; the 32-byte client random is
@@ -1137,18 +1139,41 @@ impl ServerAcceptor {
                  (FIPS is not supported on the acceptor key-exchange path)",
             ));
         }
-        let keys = derive_session_keys(
+        let client_keys = derive_session_keys(
             &client_random,
             &std_cfg.server_random,
             std_cfg.encryption_method,
         )
         .map_err(AcceptorError::general)?;
 
+        // `derive_session_keys` labels fields from the client's
+        // perspective (encrypt_key = client→server direction). The
+        // server uses the opposite-direction keys, so encrypt/decrypt
+        // need to be swapped before building the server's
+        // `RdpSecurityContext`. Mirrors the swap pattern in the
+        // `standard_security::encrypt_decrypt_roundtrip` unit test --
+        // forgetting it produces instant MAC-verify failure at the
+        // first encrypted PDU (the symptom the handshake loopback test
+        // was designed to catch).
+        let server_keys = SessionKeys {
+            encrypt_key: client_keys.decrypt_key,
+            decrypt_key: client_keys.encrypt_key,
+            encrypt_update_key: client_keys.decrypt_update_key,
+            decrypt_update_key: client_keys.encrypt_update_key,
+            ..client_keys.clone()
+        };
+
         // SEC_SECURE_CHECKSUM (salted MAC) applies from RDP 5.2+.
         // Mirror the connector's threshold (`server_rdp_version >=
         // 0x00080004` = RDP 5.2) to keep wire behavior symmetric.
         let use_salted_mac = self.config.server_rdp_version >= 0x00080004;
-        let ctx = RdpSecurityContext::new(keys.clone(), use_salted_mac);
+        let ctx = RdpSecurityContext::new(server_keys.clone(), use_salted_mac);
+
+        // Stash the CLIENT-perspective keys (the natural output of
+        // derive_session_keys) so `session_keys()` parity tests can
+        // compare directly against the client's derivation without
+        // mirror-swapping.
+        let keys = client_keys;
 
         self.client_random = Some(client_random);
         self.session_keys = Some(keys);
@@ -1175,6 +1200,117 @@ impl ServerAcceptor {
         Ok(Written::nothing())
     }
 
+    // ── Security layer wrap / unwrap (Standard RDP Security path) ──
+
+    /// Prepend the basic security header (and, when a security context
+    /// is live, the 8-byte MAC + RC4-encrypt the body in place) to
+    /// `payload`. The returned `Vec<u8>` goes into the outgoing MCS
+    /// SDI's `user_data` field.
+    ///
+    /// Three paths:
+    /// - **Standard RDP Security** (`security_context.is_some()`):
+    ///   `[SEC_ENCRYPT | extra_flags (2) | flagsHi=0 (2) | MAC (8) |
+    ///   RC4(payload)]`. MS-RDPBCGR §5.3.6.
+    /// - **TLS/NLA with a required sec-header bit** (`extra_flags != 0`):
+    ///   bare `[extra_flags (2) | 0 (2) | payload]`. Used for Client
+    ///   Info (`SEC_INFO_PKT`) and License (`SEC_LICENSE_PKT`) which
+    ///   keep the 4-byte basic header on every path.
+    /// - **TLS/NLA without a sec-header bit** (`extra_flags == 0`):
+    ///   payload verbatim. Used for DemandActive / Finalization PDUs
+    ///   which are sent without any security header on TLS/NLA.
+    ///
+    /// `security_context` is borrowed mutably because [`RdpSecurityContext::encrypt`]
+    /// advances the RC4 stream state and the salted-MAC sequence number.
+    fn wrap_security_payload(
+        &mut self,
+        payload: &[u8],
+        extra_flags: u16,
+    ) -> AcceptorResult<alloc::vec::Vec<u8>> {
+        if let Some(ctx) = self.security_context.as_mut() {
+            let mut data = payload.to_vec();
+            let mac = ctx.encrypt(&mut data);
+            let total = BASIC_SECURITY_HEADER_SIZE + 8 + data.len();
+            let mut out = alloc::vec![0u8; total];
+            let mut cursor = WriteCursor::new(&mut out);
+            cursor.write_u16_le(SEC_ENCRYPT | extra_flags, "SecurityHeader::flags")?;
+            cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+            cursor.write_slice(&mac, "SecurityHeader::mac")?;
+            cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
+            Ok(out)
+        } else if extra_flags != 0 {
+            let total = BASIC_SECURITY_HEADER_SIZE + payload.len();
+            let mut out = alloc::vec![0u8; total];
+            let mut cursor = WriteCursor::new(&mut out);
+            cursor.write_u16_le(extra_flags, "SecurityHeader::flags")?;
+            cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+            cursor.write_slice(payload, "SecurityHeader::data")?;
+            Ok(out)
+        } else {
+            Ok(payload.to_vec())
+        }
+    }
+
+    /// Inverse of [`wrap_security_payload`]: strip the basic security
+    /// header (and, when encrypted, verify the MAC + decrypt the body)
+    /// from an inbound SDR's `user_data`. Returns `(flags, plaintext)`
+    /// so the caller can inspect flag bits (`SEC_INFO_PKT`, etc.)
+    /// before decoding the inner PDU.
+    ///
+    /// `expect_header` = **true** for phases where TLS/NLA also carries
+    /// a basic security header (Client Info on any path); **false** for
+    /// phases where TLS/NLA has no security layer at all (ConfirmActive,
+    /// Finalization) and only Standard RDP Security should strip one.
+    ///
+    /// Rejects `security_context.is_some() && SEC_ENCRYPT not set`: on
+    /// a negotiated-encryption session the client MUST set `SEC_ENCRYPT`
+    /// on every post-exchange PDU, and accepting plaintext here would
+    /// let a MITM strip RC4 and feed unverified PDUs to later phases.
+    fn unwrap_security_payload(
+        &mut self,
+        user_data: &[u8],
+        expect_header: bool,
+    ) -> AcceptorResult<(u16, alloc::vec::Vec<u8>)> {
+        if let Some(ctx) = self.security_context.as_mut() {
+            let mut sec = ReadCursor::new(user_data);
+            if sec.remaining() < BASIC_SECURITY_HEADER_SIZE + 8 {
+                return Err(AcceptorError::general(
+                    "encrypted slow-path user_data shorter than sec header + MAC",
+                ));
+            }
+            let flags = sec.read_u16_le("SecurityHeader::flags")?;
+            let _flags_hi = sec.read_u16_le("SecurityHeader::flagsHi")?;
+            if flags & SEC_ENCRYPT == 0 {
+                return Err(AcceptorError::general(
+                    "Standard RDP Security: SEC_ENCRYPT flag missing on encrypted session",
+                ));
+            }
+            let mac_bytes = sec.read_slice(8, "SecurityHeader::mac")?;
+            let mut mac = [0u8; 8];
+            mac.copy_from_slice(mac_bytes);
+            let remaining = sec.remaining();
+            let encrypted = sec.read_slice(remaining, "SecurityHeader::encryptedData")?;
+            let mut data = encrypted.to_vec();
+            if !ctx.decrypt(&mut data, &mac) {
+                return Err(AcceptorError::general(
+                    "Standard RDP Security: MAC verification failed on slow-path PDU",
+                ));
+            }
+            Ok((flags, data))
+        } else if expect_header {
+            let mut sec = ReadCursor::new(user_data);
+            if sec.remaining() < BASIC_SECURITY_HEADER_SIZE {
+                return Err(AcceptorError::general(
+                    "slow-path user_data shorter than basic security header",
+                ));
+            }
+            let flags = sec.read_u16_le("SecurityHeader::flags")?;
+            let _flags_hi = sec.read_u16_le("SecurityHeader::flagsHi")?;
+            Ok((flags, sec.peek_remaining().to_vec()))
+        } else {
+            Ok((0u16, user_data.to_vec()))
+        }
+    }
+
     // ── Phase 7: Wait for Client Info PDU ──────────────────────────────
 
     fn step_wait_client_info(&mut self, input: &[u8]) -> AcceptorResult<Written> {
@@ -1199,26 +1335,16 @@ impl ServerAcceptor {
             ));
         }
 
-        // TLS / NLA path: 4-byte basic security header. The flags MUST
-        // include `SEC_INFO_PKT (0x40)` per MS-RDPBCGR §2.2.1.11.
-        // Standard RDP Security adds an extra MAC and the body would be
-        // RC4-encrypted; that path is intentionally unsupported in this
-        // commit (the connector already documents this same boundary).
-        let mut sec = ReadCursor::new(sdr.user_data);
-        if sec.remaining() < BASIC_SECURITY_HEADER_SIZE {
-            return Err(AcceptorError::general(
-                "ClientInfoPdu user_data shorter than basic security header",
-            ));
-        }
-        let flags = sec.read_u16_le("ClientInfo::secFlags")?;
-        let _flags_hi = sec.read_u16_le("ClientInfo::secFlagsHi")?;
+        // Basic security header on all paths. MS-RDPBCGR §2.2.1.11 requires
+        // `SEC_INFO_PKT`; Standard RDP Security also requires `SEC_ENCRYPT`
+        // and carries a MAC + RC4-encrypted ClientInfoPdu body.
+        let (flags, body) = self.unwrap_security_payload(sdr.user_data, true)?;
         if flags & SEC_INFO_PKT == 0 {
             return Err(AcceptorError::general(
                 "expected SEC_INFO_PKT flag on Client Info PDU",
             ));
         }
-
-        let info = ClientInfoPdu::decode(&mut sec)?;
+        let info = ClientInfoPdu::decode(&mut ReadCursor::new(&body))?;
         self.client_info = Some(info);
         self.state = ServerAcceptorState::SendLicense;
         Ok(Written::nothing())
@@ -1227,25 +1353,20 @@ impl ServerAcceptor {
     // ── Phase 9: Send License (Valid Client shortcut) ──────────────────
 
     fn step_send_license(&mut self, output: &mut WriteBuf) -> AcceptorResult<Written> {
-        let alloc = self
+        let io_channel_id = self
             .channel_alloc
             .as_ref()
-            .ok_or_else(|| AcceptorError::general("SendLicense before MCS Connect"))?;
-        let io_channel_id = alloc.io_channel_id;
+            .ok_or_else(|| AcceptorError::general("SendLicense before MCS Connect"))?
+            .io_channel_id;
 
         // Build the License Error Alert ("Valid Client" shortcut: tells
         // the client there is no licensing exchange to do).
         let license = LicenseErrorMessage::valid_client();
         let license_bytes = justrdp_core::encode_vec(&license)?;
 
-        // Wrap with the basic security header (flags = SEC_LICENSE_PKT).
-        let mut inner = alloc::vec![0u8; BASIC_SECURITY_HEADER_SIZE + license_bytes.len()];
-        {
-            let mut cursor = WriteCursor::new(&mut inner);
-            cursor.write_u16_le(SEC_LICENSE_PKT, "License::secFlags")?;
-            cursor.write_u16_le(0, "License::secFlagsHi")?;
-            cursor.write_slice(&license_bytes, "License::body")?;
-        }
+        // Wrap with the basic security header (+ MAC / RC4-encrypt when
+        // Standard RDP Security is active).
+        let inner = self.wrap_security_payload(&license_bytes, SEC_LICENSE_PKT)?;
 
         // Wrap in MCS SendDataIndication on the I/O channel.
         let sdi = SendDataIndication {
@@ -1446,14 +1567,14 @@ impl ServerAcceptor {
             cursor.write_slice(&demand_bytes, "DemandActive::body")?;
         }
 
-        // Wrap in MCS SendDataIndication on the I/O channel. No
-        // security header for TLS / NLA: the basic security header is
-        // reserved for the secure-settings exchange (SEC_INFO_PKT) and
-        // the licensing PDU (SEC_LICENSE_PKT).
+        // Wrap in MCS SendDataIndication on the I/O channel. TLS/NLA
+        // sends the ShareControl bytes verbatim; Standard RDP Security
+        // adds a SEC_ENCRYPT header + MAC around the whole ShareControl.
+        let wrapped = self.wrap_security_payload(&sc_payload, 0)?;
         let sdi = SendDataIndication {
             initiator: self.user_channel_id,
             channel_id: io_channel_id,
-            user_data: &sc_payload,
+            user_data: &wrapped,
         };
         let inner_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
         let total = TPKT_HEADER_SIZE + inner_size;
@@ -1489,8 +1610,12 @@ impl ServerAcceptor {
             ));
         }
 
-        // ShareControl header dispatch.
-        let mut inner = ReadCursor::new(sdr.user_data);
+        // Strip the Standard-RDP-Security wrapper (if any) before
+        // ShareControl dispatch. TLS/NLA has no security header on
+        // ConfirmActive; Standard RDP Security wraps the whole
+        // ShareControl PDU in SEC_ENCRYPT + MAC.
+        let (_flags, body) = self.unwrap_security_payload(sdr.user_data, false)?;
+        let mut inner = ReadCursor::new(&body);
         let sc_hdr = ShareControlHeader::decode(&mut inner)?;
         if sc_hdr.pdu_type != ShareControlPduType::ConfirmActivePdu {
             return Err(AcceptorError::general(
@@ -1521,12 +1646,18 @@ impl ServerAcceptor {
     // ── Phase 12: Connection Finalization ──────────────────────────────
 
     /// Decode the outer envelope (TPKT + X.224 DT + MCS SDR) and return
-    /// the inner ShareControl bytes. Reused by all finalization
-    /// wait-states.
-    fn decode_finalization_envelope<'a>(
-        &self,
-        input: &'a [u8],
-    ) -> AcceptorResult<&'a [u8]> {
+    /// the decrypted inner ShareControl bytes. Reused by all
+    /// finalization wait-states.
+    ///
+    /// Returns an owned `Vec<u8>` because Standard RDP Security produces
+    /// plaintext from an in-place RC4 stream decrypt: the resulting
+    /// bytes don't alias any slice of `input`. TLS/NLA simply copies
+    /// `sdr.user_data` verbatim (negligible; finalization PDUs are
+    /// small).
+    fn decode_finalization_envelope(
+        &mut self,
+        input: &[u8],
+    ) -> AcceptorResult<alloc::vec::Vec<u8>> {
         let mut cursor = ReadCursor::new(input);
         let _tpkt = TpktHeader::decode(&mut cursor)?;
         let _dt = DataTransfer::decode(&mut cursor)?;
@@ -1545,9 +1676,8 @@ impl ServerAcceptor {
                 "finalization PDU initiator does not match the assigned user channel",
             ));
         }
-        // SAFETY: SDR.user_data is borrowed from `input`; the lifetime
-        // is propagated through the ReadCursor.
-        Ok(sdr.user_data)
+        let (_flags, body) = self.unwrap_security_payload(sdr.user_data, false)?;
+        Ok(body)
     }
 
     /// Decode a ShareData PDU body from the SDR `user_data`. Returns
@@ -1575,17 +1705,21 @@ impl ServerAcceptor {
 
     /// Wrap an inner PDU body in ShareData + ShareControl + MCS SDI +
     /// X.224 DT + TPKT. Used by all finalization send-states.
+    ///
+    /// On Standard RDP Security the SDI `user_data` is additionally
+    /// wrapped with a `SEC_ENCRYPT` header + MAC around the whole
+    /// ShareControl payload via [`wrap_security_payload`].
     fn write_share_data_pdu(
-        &self,
+        &mut self,
         pdu_type2: ShareDataPduType,
         inner: &[u8],
         output: &mut WriteBuf,
     ) -> AcceptorResult<usize> {
-        let alloc = self
+        let io_channel_id = self
             .channel_alloc
             .as_ref()
-            .ok_or_else(|| AcceptorError::general("send finalization PDU before MCS Connect"))?;
-        let io_channel_id = alloc.io_channel_id;
+            .ok_or_else(|| AcceptorError::general("send finalization PDU before MCS Connect"))?
+            .io_channel_id;
 
         let sd_total = SHARE_DATA_HEADER_SIZE + inner.len();
         let sc_total = SHARE_CONTROL_HEADER_SIZE + sd_total;
@@ -1625,10 +1759,11 @@ impl ServerAcceptor {
             cursor.write_slice(inner, "finalization::body")?;
         }
 
+        let wrapped = self.wrap_security_payload(&sc_payload, 0)?;
         let sdi = SendDataIndication {
             initiator: self.user_channel_id,
             channel_id: io_channel_id,
-            user_data: &sc_payload,
+            user_data: &wrapped,
         };
         let inner_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
         let total = TPKT_HEADER_SIZE + inner_size;
@@ -1668,7 +1803,7 @@ impl ServerAcceptor {
 
     fn fin_wait_client_sync(&mut self, input: &[u8]) -> AcceptorResult<Written> {
         let user_data = self.decode_finalization_envelope(input)?;
-        let (pdu_type2, body) = self.decode_share_data(user_data)?;
+        let (pdu_type2, body) = self.decode_share_data(&user_data)?;
         if pdu_type2 != ShareDataPduType::Synchronize {
             return Err(AcceptorError::general(
                 "expected Synchronize PDU as first finalization message",
@@ -1700,7 +1835,7 @@ impl ServerAcceptor {
 
     fn fin_wait_client_cooperate(&mut self, input: &[u8]) -> AcceptorResult<Written> {
         let user_data = self.decode_finalization_envelope(input)?;
-        let (pdu_type2, body) = self.decode_share_data(user_data)?;
+        let (pdu_type2, body) = self.decode_share_data(&user_data)?;
         if pdu_type2 != ShareDataPduType::Control {
             return Err(AcceptorError::general(
                 "expected Control PDU after Synchronize",
@@ -1731,7 +1866,7 @@ impl ServerAcceptor {
 
     fn fin_wait_client_request_control(&mut self, input: &[u8]) -> AcceptorResult<Written> {
         let user_data = self.decode_finalization_envelope(input)?;
-        let (pdu_type2, body) = self.decode_share_data(user_data)?;
+        let (pdu_type2, body) = self.decode_share_data(&user_data)?;
         if pdu_type2 != ShareDataPduType::Control {
             return Err(AcceptorError::general(
                 "expected Control PDU (RequestControl) after server Cooperate",
@@ -1773,7 +1908,7 @@ impl ServerAcceptor {
 
     fn fin_wait_client_font_list(&mut self, input: &[u8]) -> AcceptorResult<Written> {
         let user_data = self.decode_finalization_envelope(input)?;
-        let (pdu_type2, body) = self.decode_share_data(user_data)?;
+        let (pdu_type2, body) = self.decode_share_data(&user_data)?;
         match pdu_type2 {
             ShareDataPduType::PersistentKeyList => {
                 // Optional client-side cache hint. No response required.
@@ -4152,9 +4287,14 @@ mod tests {
     }
 
     #[test]
-    fn security_exchange_rejects_wrong_length_field() {
-        // If the client sends `length != modulus_size + 8`, the server
-        // MUST refuse rather than RSA-decrypting a short/long slice.
+    fn security_exchange_rejects_length_below_modulus_size() {
+        // The acceptor tolerates `length ∈ [modulus_size, modulus_size+8]`
+        // to interop with mstsc (which emits +8 null pad) and our own
+        // connector (which elides the pad). But `length < modulus_size`
+        // is a protocol error: there aren't enough bytes to form a full
+        // RSA block, and silently accepting this would either underread
+        // (buffer-underflow CVE bait) or decrypt a short ciphertext to
+        // arbitrary plaintext.
         let std_cfg = standard_security_cfg(0x44);
         let (_, pub_key) = test_512bit_rsa();
         let mut acc = drive_to_wait_security_exchange(std_cfg);
@@ -4165,19 +4305,60 @@ mod tests {
             &pub_key,
             &client_random,
         );
-        // Find the length u32 (= modulus_size + 8 = 72) and tamper it
-        // to 68 so the ciphertext no longer fits an RSA block.
+        // Tamper the length field from 72 (modulus_size + 8) to 32
+        // (which is less than the 64-byte modulus, so the read can't
+        // even extract a full RSA block).
         let good_len_bytes = 72u32.to_le_bytes();
         let pos = pdu_ok.windows(4).position(|w| w == good_len_bytes).unwrap();
         let mut pdu = pdu_ok.clone();
-        pdu[pos..pos + 4].copy_from_slice(&68u32.to_le_bytes());
+        pdu[pos..pos + 4].copy_from_slice(&32u32.to_le_bytes());
+        // Also truncate the actual bytes so `length != remaining`
+        // doesn't fire first. We keep the first 32 bytes of ciphertext.
+        pdu.truncate(pos + 4 + 32);
+        // Repair the TPKT total-length field so the outer envelope still
+        // parses. TPKT length is a big-endian u16 at offset 2.
+        let new_total = pdu.len() as u16;
+        pdu[2..4].copy_from_slice(&new_total.to_be_bytes());
+        // And the SDR's DataTransfer is fixed-size so no repair needed
+        // there; MCS SDR's user_data length is PER-encoded, which means
+        // we'd need to re-encode. For simplicity, build a fresh PDU with
+        // a shorter `length` directly instead of tampering.
+        let _ = pdu; // drop tamper attempt
+
+        // Rebuild: flags+flagsHi+length(=32)+32bytes -- all wrapped in
+        // a fresh outer envelope so the PER length math stays consistent.
+        use justrdp_core::WriteCursor as WC;
+        use justrdp_pdu::mcs::SendDataRequest;
+        use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
+        use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
+        let mut inner = alloc::vec![0u8; BASIC_SECURITY_HEADER_SIZE + 4 + 32];
+        {
+            let mut c = WC::new(&mut inner);
+            c.write_u16_le(SEC_EXCHANGE_PKT, "flags").unwrap();
+            c.write_u16_le(0, "flagsHi").unwrap();
+            c.write_u32_le(32, "length").unwrap();
+            c.write_slice(&[0u8; 32], "truncatedCiphertext").unwrap();
+        }
+        let sdr = SendDataRequest {
+            initiator: acc.user_channel_id(),
+            channel_id: crate::mcs::IO_CHANNEL_ID,
+            user_data: &inner,
+        };
+        let inner_size = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+        let total = TPKT_HEADER_SIZE + inner_size;
+        let mut pdu = alloc::vec![0u8; total];
+        {
+            let mut c = WC::new(&mut pdu);
+            TpktHeader::try_for_payload(inner_size)
+                .unwrap()
+                .encode(&mut c)
+                .unwrap();
+            DataTransfer.encode(&mut c).unwrap();
+            sdr.encode(&mut c).unwrap();
+        }
         let mut out = WriteBuf::new();
         let err = acc.step(&pdu, &mut out).unwrap_err();
-        let msg = alloc::format!("{err}");
-        assert!(
-            msg.contains("length") || msg.contains("pad"),
-            "unexpected error: {msg}"
-        );
+        assert!(alloc::format!("{err}").contains("underflow"));
     }
 
     #[test]
