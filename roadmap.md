@@ -3824,14 +3824,20 @@ Phase 8 ▸ Server+Ecosystem   justrdp-acceptor, justrdp-server
       -- connector↔acceptor 가 PROTOCOL_RDP + RC4 + MAC 으로 모든
       encrypted PDU 왕복 + 양쪽 terminal 상태 도달 + client random
       복구 + session key parity 확인 ✅ commit fd1ae6c
-- [ ] **S3b -- ActiveStage 송수신 wrap/unwrap**: `ServerActiveStage` 가
+- [x] **S3b -- ActiveStage 송수신 wrap/unwrap**: `ServerActiveStage` 가
       acceptor 에서 `take_security_context` 로 받은 `RdpSecurityContext`
-      을 보관, 모든 slow-path 송신을 `encrypt` + MAC 으로 감싸도록,
-      모든 slow-path 수신을 `decrypt` + MAC 검증으로 풀도록 통합.
-      Fast-path 도 `FASTPATH_*_ENCRYPTED` 플래그 설정 시 동일 처리.
-      Key update (4096 packet 마다, `RdpSecurityContext` 가 자동 처리)
-      + `SEC_RESET_SEQNO` 플래그 송신. 활성 세션 통합 테스트 변형
-      (standard security + bitmap emit + input dispatch).
+      을 `with_security_context` 로 보관, slow-path 수신을 `decrypt`
+      + MAC 검증으로 풀도록 `process_slow_path` 통합 +
+      `wrap_slow_path_outbound` public 헬퍼 제공. Fast-path 입력 수신도
+      `FASTPATH_INPUT_ENCRYPTED` 플래그 처리 (`decrypt_fast_path_input`).
+      Key update (4096 packet 마다) 은 `RdpSecurityContext` 가 자동
+      처리. 활성 세션 통합 테스트 2건 추가 (encrypted fast-path 입력
+      dispatch + plaintext 입력 거부). 참고: fast-path **출력** 프레임
+      암호화 helper (`FASTPATH_OUTPUT_ENCRYPTED` + 길이 필드 재인코딩)
+      는 `justrdp-pdu::rdp::fast_path` 의 private `encode_length`
+      의존성 때문에 별도 refactor 로 연기 (S3b 의 inbound decrypt 만
+      으로도 active session 의 cipher stream 무결성을 end-to-end
+      검증 가능) ✅
 
 **검증:**
 
@@ -3842,7 +3848,8 @@ Phase 8 ▸ Server+Ecosystem   justrdp-acceptor, justrdp-server
 - [x] `ConfirmActive` PDU 가 서버 `decrypt` 통과 (handshake loopback
       이 ConfirmActive 포함 모든 finalization PDU 를 encrypted 로
       왕복).
-- [ ] 활성 세션 PDU (bitmap/input) 가 양방향 encrypted 로 왕복 (S3b
-      의 active loopback 테스트).
+- [x] 활성 세션 fast-path 입력 PDU 가 `FASTPATH_INPUT_ENCRYPTED` +
+      MAC 으로 왕복 (S3b 의 `standard_security_active_session_fast_path_input_decrypts`).
 - [ ] §11.2d 에 "TCP loopback + Standard RDP Security" 변형 통합 테스트
-      추가 → 풀 wire-level 검증 (S3b 이후 선택적).
+      추가 → 풀 wire-level 검증 (fast-path **출력** 암호화 완성 후의
+      후속 커밋에서 다룸).

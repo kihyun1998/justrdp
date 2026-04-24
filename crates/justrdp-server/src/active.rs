@@ -30,10 +30,19 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use justrdp_acceptor::AcceptanceResult;
-use justrdp_core::{Decode, ReadCursor};
+use justrdp_core::{Decode, ReadCursor, WriteCursor};
 use justrdp_pdu::mcs::SendDataRequest;
 use justrdp_svc::{SvcError, SvcServerProcessor};
-use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathInputHeader};
+use justrdp_pdu::rdp::fast_path::{
+    FastPathInputEvent, FastPathInputHeader, FASTPATH_INPUT_ENCRYPTED,
+};
+use justrdp_pdu::rdp::standard_security::{RdpSecurityContext, SEC_ENCRYPT};
+
+/// Basic security header size (MS-RDPBCGR §2.2.8.1.1.2.1): flags(2) +
+/// flagsHi(2) = 4 bytes. Wrapped here (rather than re-imported) to
+/// avoid crossing the `justrdp-pdu` crate boundary for a single
+/// constant.
+const BASIC_SECURITY_HEADER_SIZE: usize = 4;
 use justrdp_pdu::rdp::finalization::{
     ArcScPrivatePacket, ControlAction, ControlPdu, InputEventPdu, InputEventType, LogonInfoExtended,
     PersistentKeyListPdu, RefreshRectPdu, SaveSessionInfoData, SaveSessionInfoPdu,
@@ -298,6 +307,19 @@ pub struct ServerActiveStage {
     /// current cookie per MS-RDPBCGR §5.5 (previously issued cookies
     /// for this session are invalidated when a new one is emitted).
     current_arc_cookie: Option<ArcScPrivatePacket>,
+    /// Standard RDP Security cipher state handed off by the acceptor
+    /// (§11.2a-stdsec S3). `None` on TLS/NLA sessions (no post-handshake
+    /// encryption). `Some(_)` on `PROTOCOL_RDP` sessions, where every
+    /// inbound slow-path / fast-path PDU carries a `SEC_ENCRYPT` flag
+    /// + MAC and every outbound PDU must be encrypted + signed before
+    /// the wire.
+    ///
+    /// The RC4 stream + MAC sequence number advance per call so the
+    /// field is mutated on every `process()` and every outbound wrap;
+    /// the 4096-packet automatic key update in
+    /// [`RdpSecurityContext::encrypt`] / [`decrypt`] happens
+    /// transparently.
+    security_context: Option<RdpSecurityContext>,
 }
 
 impl ServerActiveStage {
@@ -317,7 +339,36 @@ impl ServerActiveStage {
             svc_processors: Vec::new(),
             has_emitted_redirection: false,
             current_arc_cookie: None,
+            security_context: None,
         }
+    }
+
+    /// Attach a [`RdpSecurityContext`] produced by the acceptor's
+    /// SecurityExchange phase (§11.2a-stdsec S3). After this call every
+    /// inbound PDU fed to [`process`](Self::process) is decrypted +
+    /// MAC-verified before dispatch, and
+    /// [`wrap_slow_path_outbound`](Self::wrap_slow_path_outbound) /
+    /// [`wrap_fast_path_outbound`](Self::wrap_fast_path_outbound)
+    /// become the required emit path for the caller.
+    ///
+    /// Takes `self` by move to keep the builder-style construction
+    /// pattern (`ServerActiveStage::new(...).with_security_context(ctx)`),
+    /// matches how `ServerAcceptor::take_security_context` transfers
+    /// ownership of the live cipher state, and makes it impossible to
+    /// keep a second reference to the context alive after handoff.
+    pub fn with_security_context(mut self, ctx: RdpSecurityContext) -> Self {
+        self.security_context = Some(ctx);
+        self
+    }
+
+    /// Whether the active stage is running in Standard RDP Security
+    /// mode (i.e. a `RdpSecurityContext` was attached via
+    /// [`with_security_context`](Self::with_security_context)).
+    ///
+    /// Useful for test doubles and for callers that share one config
+    /// between encrypted and non-encrypted sessions.
+    pub fn is_encrypted(&self) -> bool {
+        self.security_context.is_some()
     }
 
     /// Borrow the runtime config (chunk lengths, fragment sizes).
@@ -507,16 +558,171 @@ impl ServerActiveStage {
             ));
         }
 
-        if sdr.channel_id == self.io_channel_id {
-            self.process_io_channel(sdr.user_data, input_handler)
-        } else if self.channel_ids.iter().any(|(_, id)| *id == sdr.channel_id) {
-            self.process_svc_inbound(sdr.channel_id, sdr.user_data)
+        // Standard RDP Security: strip the basic security header +
+        // MAC + RC4-decrypt the body before dispatch. TLS/NLA passes
+        // through verbatim. The decrypt path borrows `self` mutably
+        // (RC4 state advances + key update at 4096 packets), so we
+        // resolve the channel-dispatch branch in two steps to avoid
+        // holding an immutable borrow of `sdr.user_data` while taking
+        // the mutable borrow for decryption.
+        let channel_id = sdr.channel_id;
+        let body = self.decrypt_slow_path_user_data(sdr.user_data)?;
+
+        if channel_id == self.io_channel_id {
+            self.process_io_channel(&body, input_handler)
+        } else if self.channel_ids.iter().any(|(_, id)| *id == channel_id) {
+            self.process_svc_inbound(channel_id, &body)
         } else {
             Err(ServerError::protocol(
                 "SDR channel ID is neither the I/O channel nor any negotiated VC",
             ))
         }
     }
+
+    /// Public counterpart to [`wrap_slow_path_outbound`]: strip the
+    /// basic security header (`+` MAC `+` RC4-decrypt) from an inbound
+    /// slow-path `user_data` when Standard RDP Security is active;
+    /// otherwise return `user_data.to_vec()`.
+    ///
+    /// Intended for callers that drive their own slow-path dispatch
+    /// outside the built-in [`process`](Self::process) flow (e.g.
+    /// custom RefreshRect handlers). The active stage's internal
+    /// slow-path pipeline calls this same method, so the
+    /// wrap→unwrap round trip is covered end-to-end.
+    ///
+    /// [`wrap_slow_path_outbound`]: Self::wrap_slow_path_outbound
+    pub fn unwrap_slow_path_inbound(&mut self, user_data: &[u8]) -> ServerResult<Vec<u8>> {
+        self.decrypt_slow_path_user_data(user_data)
+    }
+
+    /// Strip the basic security header (`+` MAC `+` RC4-decrypt) from
+    /// an inbound slow-path SDR's `user_data` when Standard RDP
+    /// Security is active; otherwise return `user_data.to_vec()`.
+    ///
+    /// A session negotiated at `ENCRYPTION_LEVEL_CLIENT_COMPATIBLE` or
+    /// higher MUST set `SEC_ENCRYPT` on every client-to-server PDU
+    /// post-SecurityExchange; the acceptor enforced this during the
+    /// handshake, and rejecting it here again keeps the active-stage
+    /// API as strict as the acceptor so a MITM can't strip encryption
+    /// mid-session.
+    fn decrypt_slow_path_user_data(&mut self, user_data: &[u8]) -> ServerResult<Vec<u8>> {
+        let Some(ctx) = self.security_context.as_mut() else {
+            return Ok(user_data.to_vec());
+        };
+        let mut sec = ReadCursor::new(user_data);
+        if sec.remaining() < BASIC_SECURITY_HEADER_SIZE + 8 {
+            return Err(ServerError::protocol(
+                "active slow-path user_data shorter than sec header + MAC",
+            ));
+        }
+        let flags = sec.read_u16_le("SecurityHeader::flags")?;
+        let _flags_hi = sec.read_u16_le("SecurityHeader::flagsHi")?;
+        if flags & SEC_ENCRYPT == 0 {
+            return Err(ServerError::protocol(
+                "Standard RDP Security: SEC_ENCRYPT missing on active slow-path PDU",
+            ));
+        }
+        let mac_bytes = sec.read_slice(8, "SecurityHeader::mac")?;
+        let mut mac = [0u8; 8];
+        mac.copy_from_slice(mac_bytes);
+        let remaining = sec.remaining();
+        let encrypted = sec.read_slice(remaining, "SecurityHeader::encryptedData")?;
+        let mut data = encrypted.to_vec();
+        if !ctx.decrypt(&mut data, &mac) {
+            return Err(ServerError::protocol(
+                "Standard RDP Security: MAC verify failed on active slow-path PDU",
+            ));
+        }
+        Ok(data)
+    }
+
+    /// Wrap an outbound slow-path payload (already shaped as
+    /// ShareControl / ShareData / License / DemandActive / ...) with
+    /// the basic security header (`+` MAC `+` RC4-encrypt) when
+    /// Standard RDP Security is active. On TLS/NLA the payload is
+    /// returned verbatim.
+    ///
+    /// Intended to be called by the caller *immediately before*
+    /// building the MCS SDI envelope. The returned `Vec<u8>` becomes
+    /// the SDI's `user_data`.
+    ///
+    /// `extra_flags` is OR-ed into the emitted security flags
+    /// (e.g. pass `0x0080` for the `SEC_LICENSE_PKT` bit on a
+    /// license-redelivery in a re-activation sequence). The common
+    /// post-handshake case is `0`, which emits just `SEC_ENCRYPT`.
+    pub fn wrap_slow_path_outbound(
+        &mut self,
+        payload: &[u8],
+        extra_flags: u16,
+    ) -> ServerResult<Vec<u8>> {
+        let Some(ctx) = self.security_context.as_mut() else {
+            return Ok(payload.to_vec());
+        };
+        let mut data = payload.to_vec();
+        let mac = ctx.encrypt(&mut data);
+        let total = BASIC_SECURITY_HEADER_SIZE + 8 + data.len();
+        let mut out = alloc::vec![0u8; total];
+        let mut cursor = WriteCursor::new(&mut out);
+        cursor.write_u16_le(SEC_ENCRYPT | extra_flags, "SecurityHeader::flags")?;
+        cursor.write_u16_le(0, "SecurityHeader::flagsHi")?;
+        cursor.write_slice(&mac, "SecurityHeader::mac")?;
+        cursor.write_slice(&data, "SecurityHeader::encryptedData")?;
+        Ok(out)
+    }
+
+    /// Strip and decrypt the inline 8-byte MAC from a fast-path **input**
+    /// PDU that carries the `FASTPATH_INPUT_ENCRYPTED` flag. Returns
+    /// the decrypted body (the concatenated event stream) ready for
+    /// `FastPathInputEvent::decode`.
+    ///
+    /// Wire shape per MS-RDPBCGR §2.2.8.1.2 when encrypted:
+    /// `byte0(flags+numEvents) | length(1-2) | [numEventsExt(1)] |
+    /// MAC(8) | RC4(event body)`.
+    ///
+    /// Returns an error if encryption is negotiated but the header
+    /// did not set the flag, or vice versa.
+    fn decrypt_fast_path_input(
+        &mut self,
+        header: &FastPathInputHeader,
+        body: &[u8],
+    ) -> ServerResult<Vec<u8>> {
+        let is_encrypted = (header.flags & FASTPATH_INPUT_ENCRYPTED) != 0;
+        match (self.security_context.as_mut(), is_encrypted) {
+            (Some(ctx), true) => {
+                if body.len() < 8 {
+                    return Err(ServerError::protocol(
+                        "encrypted fast-path input PDU shorter than 8-byte MAC",
+                    ));
+                }
+                let mut mac = [0u8; 8];
+                mac.copy_from_slice(&body[..8]);
+                let mut data = body[8..].to_vec();
+                if !ctx.decrypt(&mut data, &mac) {
+                    return Err(ServerError::protocol(
+                        "Standard RDP Security: MAC verify failed on fast-path input PDU",
+                    ));
+                }
+                Ok(data)
+            }
+            (Some(_), false) => Err(ServerError::protocol(
+                "Standard RDP Security: fast-path input PDU missing FASTPATH_INPUT_ENCRYPTED",
+            )),
+            (None, true) => Err(ServerError::protocol(
+                "encrypted fast-path input PDU received but no security context is active",
+            )),
+            (None, false) => Ok(body.to_vec()),
+        }
+    }
+
+    // Note: outbound fast-path frame encryption is not yet exposed as
+    // a helper on `ServerActiveStage`. The wire shape (re-encoded
+    // length field, byte-0 flag bits, 8-byte MAC prefix before the
+    // encrypted body) requires hooking into the private `encode_length`
+    // machinery inside `justrdp-pdu::rdp::fast_path`, which is a
+    // separate refactor. For loopback-test purposes, the fast-path
+    // *input* direction (client→server) exercises the decrypt helper
+    // above, which is the end of the cipher stream that was broken
+    // (and is now proven correct) by the active-session loopback test.
 
     /// Decode one chunk of inbound SVC traffic. The active stage owns
     /// the per-channel reassembly buffer and emits a single
@@ -1042,16 +1248,19 @@ impl ServerActiveStage {
     ) -> ServerResult<Vec<ActiveStageOutput>> {
         let mut cursor = ReadCursor::new(input);
         let header = FastPathInputHeader::decode(&mut cursor)?;
-        // The PDU may carry encryption flags we cannot honour without
-        // negotiated keys; fail loud rather than silently misinterpret.
-        if header.flags != 0 {
-            return Err(ServerError::protocol(
-                "encrypted fast-path input PDU received but no security context is active",
-            ));
-        }
+        // Remaining bytes after the header are either:
+        //   * plain event stream (TLS/NLA; header.flags == 0), or
+        //   * [MAC(8) | RC4(event stream)] when Standard RDP Security
+        //     is active and `FASTPATH_INPUT_ENCRYPTED` is set.
+        // `decrypt_fast_path_input` handles both cases consistently
+        // and rejects mismatches (e.g. flag set but no context, or
+        // context active but flag missing).
+        let tail = cursor.peek_remaining();
+        let plaintext = self.decrypt_fast_path_input(&header, tail)?;
+        let mut body_cursor = ReadCursor::new(&plaintext);
         let mut decoded = 0u8;
-        while decoded < header.num_events && cursor.remaining() > 0 {
-            let event = FastPathInputEvent::decode(&mut cursor)?;
+        while decoded < header.num_events && body_cursor.remaining() > 0 {
+            let event = FastPathInputEvent::decode(&mut body_cursor)?;
             self.dispatch_fast_path_event(event, input_handler);
             decoded += 1;
         }

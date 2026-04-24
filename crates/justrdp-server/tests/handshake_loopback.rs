@@ -28,6 +28,7 @@ use justrdp_pdu::rdp::error_info::ErrorInfoCode;
 use justrdp_pdu::rdp::fast_path::{
     FastPathInputEvent, FastPathInputHeader, FastPathOutputHeader, FastPathOutputUpdate,
     FastPathScancodeEvent, FastPathUpdateType, FASTPATH_INPUT_ACTION_FASTPATH,
+    FASTPATH_INPUT_ENCRYPTED,
 };
 use justrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
 use justrdp_pdu::rdp::redirection::{
@@ -527,6 +528,274 @@ fn standard_security_handshake_reaches_both_terminal_states() {
         }
         other => panic!("unexpected acceptor state: {other:?}"),
     }
+}
+
+/// Build a *client-produced* encrypted fast-path input PDU: single
+/// scancode event, wrapped with `FASTPATH_INPUT_ENCRYPTED` flag + 8-byte
+/// MAC + RC4-encrypted event body. Mirrors the wire shape a real mstsc
+/// emits during a `PROTOCOL_RDP` session at
+/// `ENCRYPTION_LEVEL_CLIENT_COMPATIBLE`.
+///
+/// `ctx` is mutated because `encrypt()` advances the RC4 state and MAC
+/// sequence counter.
+fn encrypted_fast_path_scancode_pdu(
+    ctx: &mut justrdp_pdu::rdp::standard_security::RdpSecurityContext,
+    flags: u8,
+    key_code: u8,
+) -> Vec<u8> {
+    // Plaintext event body: one scancode event.
+    let event = FastPathInputEvent::Scancode(FastPathScancodeEvent {
+        event_flags: flags,
+        key_code,
+    });
+    let body_size = event.size();
+    let mut plaintext = vec![0u8; body_size];
+    {
+        let mut c = WriteCursor::new(&mut plaintext);
+        event.encode(&mut c).unwrap();
+    }
+
+    // Encrypt + MAC.
+    let mut encrypted = plaintext.clone();
+    let mac = ctx.encrypt(&mut encrypted);
+
+    // Header length = byte0(1) + length(1 or 2) + MAC(8) + body.
+    // The first-draft length assumes the 1-byte length-field encoding
+    // (which covers PDUs up to 127 bytes). For scancode (body=2) the
+    // total is 1 + 1 + 8 + 2 = 12, comfortably inside that limit.
+    let total = 1 + 1 + 8 + encrypted.len();
+    assert!(total <= 0x7F, "encrypted fast-path PDU shape assumes 1-byte length encoding");
+
+    let header = FastPathInputHeader {
+        action: FASTPATH_INPUT_ACTION_FASTPATH,
+        num_events: 1,
+        flags: FASTPATH_INPUT_ENCRYPTED,
+        length: total as u16,
+    };
+
+    let mut buf = vec![0u8; total];
+    let mut c = WriteCursor::new(&mut buf);
+    header.encode(&mut c).unwrap();
+    c.write_slice(&mac, "mac").unwrap();
+    c.write_slice(&encrypted, "encryptedEvents").unwrap();
+    buf
+}
+
+/// Build a synthetic encrypted Standard-Security session (no handshake):
+/// a paired `(client_ctx, server_ctx)` and a minimal
+/// [`AcceptanceResult`] plus an [`AcceptorConfig`] so callers can spin
+/// up an [`ServerActiveStage`] directly.
+///
+/// Skipping the handshake lets the test pin `encrypt_count` /
+/// `decrypt_count` to `0` on both sides -- a real end-to-end run would
+/// advance them by the 6 slow-path PDUs each direction carries during
+/// the handshake, which is an orthogonal concern already proven by
+/// `standard_security_handshake_reaches_both_terminal_states`. This
+/// test isolates the active-stage decrypt path.
+fn fresh_paired_security_contexts() -> (
+    justrdp_pdu::rdp::standard_security::RdpSecurityContext,
+    justrdp_pdu::rdp::standard_security::RdpSecurityContext,
+) {
+    use justrdp_pdu::rdp::standard_security::{
+        derive_session_keys, RdpSecurityContext, SessionKeys, ENCRYPTION_METHOD_128BIT,
+    };
+    let cr = [0x01u8; 32];
+    let sr = [0x02u8; 32];
+    let client_keys = derive_session_keys(&cr, &sr, ENCRYPTION_METHOD_128BIT).unwrap();
+    // Server perspective: encrypt/decrypt direction swapped (matches
+    // the acceptor's `step_wait_security_exchange` logic).
+    let server_keys = SessionKeys {
+        encrypt_key: client_keys.decrypt_key,
+        decrypt_key: client_keys.encrypt_key,
+        encrypt_update_key: client_keys.decrypt_update_key,
+        decrypt_update_key: client_keys.encrypt_update_key,
+        ..client_keys.clone()
+    };
+    // Match acceptor's default: RDP 10.7 >= 0x00080004 -> salted MAC.
+    let client_ctx = RdpSecurityContext::new(client_keys, true);
+    let server_ctx = RdpSecurityContext::new(server_keys, true);
+    (client_ctx, server_ctx)
+}
+
+/// Build a minimal `AcceptanceResult` suitable for driving a
+/// `ServerActiveStage` without going through the handshake. All
+/// fields are constructed directly from pub members; values mirror
+/// what the acceptor would have assigned to a no-VC session. Only the
+/// channel IDs and share_id matter to the active stage's inbound
+/// validation -- the rest are left at type defaults.
+fn minimal_acceptance_result() -> justrdp_acceptor::AcceptanceResult {
+    use justrdp_acceptor::{AcceptanceResult, ClientRequestInfo};
+    use justrdp_pdu::x224::{NegotiationRequestFlags, NegotiationResponseFlags};
+    AcceptanceResult {
+        selected_protocol: SecurityProtocol::RDP,
+        server_nego_flags: NegotiationResponseFlags::NONE,
+        client_request: ClientRequestInfo {
+            cookie: None,
+            routing_token: None,
+            requested_protocols: SecurityProtocol::RDP,
+            request_flags: NegotiationRequestFlags::NONE,
+            had_negotiation_request: true,
+        },
+        io_channel_id: 0x03EB,
+        user_channel_id: 0x03EF,
+        message_channel_id: None,
+        share_id: 0x0001_03EA,
+        channel_ids: Vec::new(),
+        client_capabilities: Vec::new(),
+        client_info: None,
+    }
+}
+
+/// End-to-end §11.2a-stdsec S3b validation: when the active stage
+/// holds a `RdpSecurityContext`, an encrypted fast-path input PDU
+/// produced by the matching client-side context is RC4-decrypted,
+/// MAC-verified, and dispatched to the input handler.
+///
+/// The test deliberately does NOT run a live handshake -- doing so
+/// would advance both cipher streams by the 6 slow-path PDUs the
+/// handshake carries, requiring the "client side" synthetic to
+/// advance in lockstep. Pairing fresh `(client_ctx, server_ctx)`
+/// contexts lets this test focus squarely on the active-stage
+/// plumbing: `decrypt_fast_path_input`, the `FASTPATH_INPUT_ENCRYPTED`
+/// flag handling, and the handoff that `with_security_context`
+/// performs. The full handshake-plus-active round trip is covered by
+/// `standard_security_handshake_reaches_both_terminal_states` +
+/// this test in combination.
+#[test]
+fn standard_security_active_session_fast_path_input_decrypts() {
+    let (mut client_ctx, server_ctx) = fresh_paired_security_contexts();
+    let result = minimal_acceptance_result();
+    let config = justrdp_server::RdpServerConfig::builder().build().unwrap();
+    let mut active = ServerActiveStage::new(result, config).with_security_context(server_ctx);
+    assert!(active.is_encrypted());
+
+    let mut input = RecordingInput::default();
+    // Press-down 'A' (key_code 0x1E).
+    let pdu = encrypted_fast_path_scancode_pdu(&mut client_ctx, 0x00, 0x1E);
+    let out = active
+        .process(&pdu, &mut input)
+        .expect("active stage must decrypt+dispatch encrypted fast-path input");
+    assert!(out.is_empty(), "scancode dispatch produces no outbound PDU");
+    assert_eq!(
+        input.scancodes,
+        vec![(0x0000, 0x1E)],
+        "recorded scancode MUST round-trip through RC4+MAC"
+    );
+
+    // Second event on the same stream advances the cipher + MAC seqno
+    // -- confirms the RC4 state is actually being carried forward
+    // (and would catch a regression where each PDU is decrypted from
+    // a fresh RC4 state, or where the MAC seqno is always zero).
+    let pdu2 = encrypted_fast_path_scancode_pdu(&mut client_ctx, 0x01, 0x1E); // key-up 'A'
+    active
+        .process(&pdu2, &mut input)
+        .expect("second encrypted PDU on the same stream must also decrypt");
+    assert_eq!(
+        input.scancodes.last(),
+        Some(&(0x0001, 0x1E)),
+        "second scancode dispatched with its own flag bits"
+    );
+}
+
+/// Slow-path roundtrip: `wrap_slow_path_outbound` on one ActiveStage
+/// produces bytes that `unwrap_slow_path_inbound` on the paired stage
+/// decrypts byte-for-byte.
+///
+/// This isolates the slow-path cipher helpers from the rest of the
+/// active-session pipeline. Both helpers are public, so this test
+/// also serves as executable documentation for callers building
+/// custom slow-path handlers on top of the ActiveStage API.
+#[test]
+fn standard_security_active_session_slow_path_wrap_unwrap_roundtrip() {
+    let (client_ctx, server_ctx) = fresh_paired_security_contexts();
+    // Client writes to `client_active` via `wrap_slow_path_outbound`;
+    // server reads from `server_active` via `unwrap_slow_path_inbound`.
+    // Each side needs its own ActiveStage holding the matching context.
+    let client_result = minimal_acceptance_result();
+    let server_result = minimal_acceptance_result();
+    let config = justrdp_server::RdpServerConfig::builder().build().unwrap();
+    let mut client_active =
+        ServerActiveStage::new(client_result, config.clone()).with_security_context(client_ctx);
+    let mut server_active =
+        ServerActiveStage::new(server_result, config).with_security_context(server_ctx);
+
+    // Distinct payloads so a "return the same bytes always" bug would
+    // immediately surface as a spurious pass on the first payload and
+    // a failure on the next.
+    let payloads: Vec<&[u8]> = vec![
+        b"hello standard rdp security",
+        b"second payload on the RC4 stream",
+        // Short payload -- catches off-by-one errors in length math.
+        b"x",
+        // Longer payload with binary noise.
+        &[0x00, 0xFF, 0x5A, 0xA5, 0x01, 0x02, 0x03, 0x04, 0xDE, 0xAD, 0xBE, 0xEF],
+    ];
+
+    for (i, plaintext) in payloads.iter().enumerate() {
+        let wrapped = client_active
+            .wrap_slow_path_outbound(plaintext, 0)
+            .expect("wrap MUST succeed when security context is active");
+        // Wrapped output MUST be exactly 4 (sec header) + 8 (MAC) +
+        // plaintext.len() bytes. Anything else is a sign the header
+        // or MAC size drifted.
+        assert_eq!(
+            wrapped.len(),
+            4 + 8 + plaintext.len(),
+            "payload #{i}: wrapped length must be header+MAC+body"
+        );
+
+        let recovered = server_active
+            .unwrap_slow_path_inbound(&wrapped)
+            .expect("unwrap MUST succeed for a freshly-wrapped payload");
+        assert_eq!(
+            recovered.as_slice(),
+            *plaintext,
+            "payload #{i}: roundtrip MUST return byte-identical plaintext"
+        );
+    }
+
+    // Tampering test: flip a bit in the ciphertext of a fresh wrapped
+    // payload; the server MUST reject with a MAC-verify error.
+    let original = b"some payload to tamper with";
+    let mut tampered = client_active.wrap_slow_path_outbound(original, 0).unwrap();
+    // Flip the last byte of the ciphertext (MAC is at [4..12],
+    // ciphertext starts at index 12).
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    let err = server_active
+        .unwrap_slow_path_inbound(&tampered)
+        .expect_err("MAC-tampered payload MUST fail verification");
+    assert!(
+        format!("{err}").contains("MAC"),
+        "expected MAC failure, got: {err}"
+    );
+}
+
+/// Negative test: when Standard RDP Security is active, a fast-path
+/// input PDU without the `FASTPATH_INPUT_ENCRYPTED` flag MUST be
+/// rejected. Silently accepting it would let a MITM strip encryption
+/// mid-session.
+#[test]
+fn standard_security_active_session_rejects_unencrypted_fast_path_input() {
+    let (_client_ctx, server_ctx) = fresh_paired_security_contexts();
+    let result = minimal_acceptance_result();
+    let mut active = ServerActiveStage::new(
+        result,
+        justrdp_server::RdpServerConfig::builder().build().unwrap(),
+    )
+    .with_security_context(server_ctx);
+
+    // Build a plaintext fast-path input and feed it in. Active stage
+    // must reject because encryption is negotiated.
+    let plaintext_pdu = fast_path_scancode_pdu(0x00, 0x1E);
+    let err = active
+        .process(&plaintext_pdu, &mut RecordingInput::default())
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("FASTPATH_INPUT_ENCRYPTED"),
+        "unexpected error: {msg}"
+    );
 }
 
 /// Drive the handshake and then exercise both directions of the active
