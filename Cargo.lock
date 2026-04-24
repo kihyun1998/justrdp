@@ -624,9 +624,11 @@ name = "justrdp-server"
 version = "0.1.0"
 dependencies = [
  "justrdp-acceptor",
+ "justrdp-cliprdr",
  "justrdp-connector",
  "justrdp-core",
  "justrdp-pdu",
+ "justrdp-rdpsnd",
  "justrdp-svc",
 ]
 

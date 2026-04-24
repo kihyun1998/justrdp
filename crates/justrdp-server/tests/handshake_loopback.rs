@@ -28,6 +28,13 @@ use justrdp_pdu::rdp::fast_path::{
     FastPathInputEvent, FastPathInputHeader, FastPathOutputHeader, FastPathOutputUpdate,
     FastPathScancodeEvent, FastPathUpdateType, FASTPATH_INPUT_ACTION_FASTPATH,
 };
+use justrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+use justrdp_pdu::rdp::svc::{
+    ChannelPduHeader, CHANNEL_FLAG_FIRST, CHANNEL_FLAG_LAST, CHANNEL_OPTION_INITIALIZED,
+    CHANNEL_PDU_HEADER_SIZE,
+};
+use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
+use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
 
 /// Upper bound on the number of drive iterations before declaring the
 /// handshake deadlocked. Empirically the PROTOCOL_RDP path completes in
@@ -42,6 +49,17 @@ const DRIVE_ITERATIONS_CAP: usize = 4096;
 fn rdp_only_client_config() -> Config {
     Config::builder("test-user", "test-pass")
         .security_protocol(SecurityProtocol::RDP)
+        .build()
+}
+
+/// Same as [`rdp_only_client_config`] but with `cliprdr` / `rdpsnd`
+/// registered as static virtual channels so the server side can
+/// exercise its channel-handler dispatch on those IDs.
+fn rdp_client_config_with_channels() -> Config {
+    Config::builder("test-user", "test-pass")
+        .security_protocol(SecurityProtocol::RDP)
+        .channel("cliprdr", CHANNEL_OPTION_INITIALIZED)
+        .channel("rdpsnd", CHANNEL_OPTION_INITIALIZED)
         .build()
 }
 
@@ -487,4 +505,265 @@ fn active_session_bitmap_emit_input_dispatch_and_clean_disconnect() {
     };
     rec.on_suppress_output(true, None);
     assert_eq!(rec.suppress_calls, vec![(true, None)]);
+}
+
+// ───────────────────────────────────────────────────────────────
+// Channel-handler validation (§11.2d, 3rd deliverable)
+// ───────────────────────────────────────────────────────────────
+
+/// Wrap a single SVC chunk in the client-side framing
+/// `TPKT + X.224 DT + MCS SendDataRequest + ChannelPduHeader` so
+/// `ServerActiveStage::process` can decode it.
+fn wrap_client_svc(
+    user_channel_id: u16,
+    channel_id: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut body = vec![0u8; CHANNEL_PDU_HEADER_SIZE + payload.len()];
+    {
+        let mut c = WriteCursor::new(&mut body);
+        ChannelPduHeader {
+            length: payload.len() as u32,
+            flags: CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST,
+        }
+        .encode(&mut c)
+        .unwrap();
+        c.write_slice(payload, "chunk").unwrap();
+    }
+    let sdr = SendDataRequest {
+        initiator: user_channel_id,
+        channel_id,
+        user_data: &body,
+    };
+    let payload_size = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+    let total = TPKT_HEADER_SIZE + payload_size;
+    let mut buf = vec![0u8; total];
+    let mut c = WriteCursor::new(&mut buf);
+    TpktHeader::try_for_payload(payload_size).unwrap().encode(&mut c).unwrap();
+    DataTransfer.encode(&mut c).unwrap();
+    sdr.encode(&mut c).unwrap();
+    buf
+}
+
+/// Decode a server-direction frame produced by
+/// `encode_svc_send` / the SVC dispatch path. Returns
+/// `(channel_id, svc_payload)`.
+fn unwrap_server_svc(frame: &[u8]) -> (u16, Vec<u8>) {
+    let mut c = ReadCursor::new(frame);
+    let _tpkt = TpktHeader::decode(&mut c).unwrap();
+    let _dt = DataTransfer::decode(&mut c).unwrap();
+    let sdi = SendDataIndication::decode(&mut c).unwrap();
+    let mut inner = ReadCursor::new(sdi.user_data);
+    let _hdr = ChannelPduHeader::decode(&mut inner).unwrap();
+    (sdi.channel_id, inner.peek_remaining().to_vec())
+}
+
+/// Channel-handler seam validation: drive a handshake that negotiates
+/// `cliprdr` and `rdpsnd` as static channels, register the servers
+/// against the active stage, and verify:
+///
+/// 1. `register_svc_processor` emits the expected init burst for each
+///    channel (cliprdr: Caps + MonitorReady; rdpsnd: Server Audio
+///    Formats).
+/// 2. A client-direction CLIPRDR Format List PDU elicits a Format
+///    List Response PDU from the server, encoded as an SVC frame.
+/// 3. A client-direction RDPSND Client Audio Formats PDU advances the
+///    server past format negotiation (recorded by the handler).
+#[test]
+fn channel_handlers_roundtrip_over_active_stage() {
+    use justrdp_cliprdr::pdu::{
+        ClipboardHeader, ClipboardMsgFlags, ClipboardMsgType, FormatListPdu, LongFormatName,
+    };
+    use justrdp_cliprdr::{
+        ClipboardResult, ClipboardServer, FormatDataResponse, FormatListResponse,
+        RdpServerClipboardHandler,
+    };
+    use justrdp_rdpsnd::pdu::{
+        AudioFormat, ClientAudioFormatsPdu, ClientSndFlags, SndHeader, SndMsgType,
+    };
+    use justrdp_rdpsnd::{RdpServerSoundHandler, SoundServer};
+
+    // Drive a handshake that registers cliprdr + rdpsnd on the client.
+    let client = ClientConnector::new(rdp_client_config_with_channels());
+    let acceptor = ServerAcceptor::new(rdp_only_acceptor_config());
+    let (client, acceptor) = drive_full_handshake(client, acceptor);
+
+    // Cross-check both sides agree on the channel IDs.
+    let result = match acceptor.state() {
+        ServerAcceptorState::Accepted { result } => result.clone(),
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    let client_result = client.result().expect("Connected implies result");
+    let cliprdr_id = result
+        .channel_ids
+        .iter()
+        .find(|(n, _)| n == "cliprdr")
+        .map(|(_, id)| *id)
+        .expect("cliprdr channel negotiated");
+    let rdpsnd_id = result
+        .channel_ids
+        .iter()
+        .find(|(n, _)| n == "rdpsnd")
+        .map(|(_, id)| *id)
+        .expect("rdpsnd channel negotiated");
+    assert_eq!(
+        client_result.channel_ids, result.channel_ids,
+        "both sides see the same channel_id list"
+    );
+    let user_channel_id = result.user_channel_id;
+
+    let config = justrdp_server::RdpServerConfig::builder()
+        .build()
+        .expect("default RdpServerConfig");
+    let mut active = ServerActiveStage::new(result, config);
+
+    // ── Register ClipboardServer (server-direction cliprdr) ──
+    struct AcceptingClipHandler;
+    impl RdpServerClipboardHandler for AcceptingClipHandler {
+        fn on_format_list(
+            &mut self,
+            _formats: &[LongFormatName],
+        ) -> ClipboardResult<FormatListResponse> {
+            Ok(FormatListResponse::Ok)
+        }
+        fn on_format_data_request(
+            &mut self,
+            _format_id: u32,
+        ) -> ClipboardResult<FormatDataResponse> {
+            Ok(FormatDataResponse::Fail)
+        }
+        fn on_format_data_response(
+            &mut self,
+            _data: &[u8],
+            _is_success: bool,
+            _format_id: Option<u32>,
+        ) {
+        }
+    }
+    let clip_frames = active
+        .register_svc_processor(Box::new(ClipboardServer::new(Box::new(
+            AcceptingClipHandler,
+        ))))
+        .expect("register cliprdr server");
+    assert_eq!(
+        clip_frames.len(),
+        2,
+        "cliprdr init burst emits 2 frames (Caps + MonitorReady)"
+    );
+    {
+        let (ch0, payload0) = unwrap_server_svc(&clip_frames[0]);
+        let (ch1, payload1) = unwrap_server_svc(&clip_frames[1]);
+        assert_eq!(ch0, cliprdr_id);
+        assert_eq!(ch1, cliprdr_id);
+        let h0 = ClipboardHeader::decode(&mut ReadCursor::new(&payload0)).unwrap();
+        let h1 = ClipboardHeader::decode(&mut ReadCursor::new(&payload1)).unwrap();
+        assert_eq!(h0.msg_type, ClipboardMsgType::ClipCaps);
+        assert_eq!(h1.msg_type, ClipboardMsgType::MonitorReady);
+    }
+
+    // ── Register SoundServer (server-direction rdpsnd) ──
+    use std::sync::{Arc, Mutex};
+    #[derive(Default)]
+    struct SoundHandlerState {
+        client_formats_calls: u32,
+    }
+    struct RecordingSoundHandler {
+        state: Arc<Mutex<SoundHandlerState>>,
+    }
+    impl RdpServerSoundHandler for RecordingSoundHandler {
+        fn on_client_formats(
+            &mut self,
+            _formats: &[AudioFormat],
+            _flags: ClientSndFlags,
+            _version: u16,
+        ) {
+            self.state.lock().unwrap().client_formats_calls += 1;
+        }
+    }
+    let sound_state = Arc::new(Mutex::new(SoundHandlerState::default()));
+    let sound_server = SoundServer::new(
+        Box::new(RecordingSoundHandler {
+            state: sound_state.clone(),
+        }),
+        vec![AudioFormat::pcm(2, 44100, 16)],
+    );
+    let snd_frames = active
+        .register_svc_processor(Box::new(sound_server))
+        .expect("register rdpsnd server");
+    assert_eq!(snd_frames.len(), 1, "rdpsnd emits ServerAudioFormats");
+    {
+        let (ch, payload) = unwrap_server_svc(&snd_frames[0]);
+        assert_eq!(ch, rdpsnd_id);
+        let h = SndHeader::decode(&mut ReadCursor::new(&payload)).unwrap();
+        assert_eq!(h.msg_type, SndMsgType::Formats);
+    }
+
+    // ── CLIPRDR roundtrip: client FormatList → server FormatListResponse ──
+    let client_clip_caps_body = {
+        // Minimal Client Capabilities PDU: needed so the server can
+        // negotiate `USE_LONG_FORMAT_NAMES` before the Format List parses
+        // in long form.
+        use justrdp_cliprdr::pdu::{
+            ClipboardCapsPdu, GeneralCapabilityFlags, GeneralCapabilitySet, CB_CAPS_VERSION_2,
+        };
+        let caps = ClipboardCapsPdu::new(GeneralCapabilitySet::new(
+            CB_CAPS_VERSION_2,
+            GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
+        ));
+        let mut buf = vec![0u8; caps.size()];
+        caps.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf
+    };
+    let caps_bytes = wrap_client_svc(user_channel_id, cliprdr_id, &client_clip_caps_body);
+    let mut drop_input = RecordingInput::default();
+    let caps_out = active.process(&caps_bytes, &mut drop_input).unwrap();
+    assert!(
+        caps_out.is_empty(),
+        "Caps PDU produces no response (state change only)"
+    );
+
+    // Now send the Format List (long variant, one entry: CF_UNICODETEXT).
+    let format_list_body = {
+        let pdu = FormatListPdu::Long(vec![LongFormatName::new(0x000D, String::new())]);
+        let mut buf = vec![0u8; pdu.full_size()];
+        pdu.encode_full(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf
+    };
+    let fl_bytes = wrap_client_svc(user_channel_id, cliprdr_id, &format_list_body);
+    let fl_out = active.process(&fl_bytes, &mut drop_input).unwrap();
+    assert_eq!(fl_out.len(), 1, "exactly one FormatListResponse frame");
+    let out_bytes = match &fl_out[0] {
+        justrdp_server::ActiveStageOutput::SendBytes(b) => b.clone(),
+        other => panic!("expected SendBytes, got {other:?}"),
+    };
+    let (ch, payload) = unwrap_server_svc(&out_bytes);
+    assert_eq!(ch, cliprdr_id);
+    let resp_header = ClipboardHeader::decode(&mut ReadCursor::new(&payload)).unwrap();
+    assert_eq!(resp_header.msg_type, ClipboardMsgType::FormatListResponse);
+    assert!(resp_header.msg_flags.contains(ClipboardMsgFlags::CB_RESPONSE_OK));
+
+    // ── RDPSND handshake: client sends Client Audio Formats ──
+    let client_snd_body = {
+        let pdu = ClientAudioFormatsPdu {
+            flags: ClientSndFlags::ALIVE,
+            volume: 0,
+            pitch: 0,
+            version: 6,
+            formats: vec![AudioFormat::pcm(2, 44100, 16)],
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        pdu.encode(&mut WriteCursor::new(&mut buf)).unwrap();
+        buf
+    };
+    let snd_bytes = wrap_client_svc(user_channel_id, rdpsnd_id, &client_snd_body);
+    let snd_out = active.process(&snd_bytes, &mut drop_input).unwrap();
+    assert!(
+        snd_out.is_empty(),
+        "ClientAudioFormats produces no direct response"
+    );
+    assert_eq!(
+        sound_state.lock().unwrap().client_formats_calls,
+        1,
+        "SoundServer handler MUST receive on_client_formats exactly once"
+    );
 }

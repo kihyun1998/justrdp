@@ -23,3 +23,5 @@ justrdp-svc.workspace = true
 
 [dev-dependencies]
 justrdp-connector.workspace = true
+justrdp-cliprdr.workspace = true
+justrdp-rdpsnd.workspace = true
