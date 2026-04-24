@@ -30,11 +30,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use justrdp_acceptor::AcceptanceResult;
-use justrdp_core::{Decode, ReadCursor, WriteCursor};
+use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_pdu::mcs::SendDataRequest;
 use justrdp_svc::{SvcError, SvcServerProcessor};
 use justrdp_pdu::rdp::fast_path::{
-    FastPathInputEvent, FastPathInputHeader, FASTPATH_INPUT_ENCRYPTED,
+    FastPathInputEvent, FastPathInputHeader, FastPathOutputHeader, FASTPATH_INPUT_ENCRYPTED,
+    FASTPATH_OUTPUT_ACTION_FASTPATH, FASTPATH_OUTPUT_ENCRYPTED, FASTPATH_OUTPUT_SECURE_CHECKSUM,
 };
 use justrdp_pdu::rdp::standard_security::{RdpSecurityContext, SEC_ENCRYPT};
 
@@ -714,15 +715,88 @@ impl ServerActiveStage {
         }
     }
 
-    // Note: outbound fast-path frame encryption is not yet exposed as
-    // a helper on `ServerActiveStage`. The wire shape (re-encoded
-    // length field, byte-0 flag bits, 8-byte MAC prefix before the
-    // encrypted body) requires hooking into the private `encode_length`
-    // machinery inside `justrdp-pdu::rdp::fast_path`, which is a
-    // separate refactor. For loopback-test purposes, the fast-path
-    // *input* direction (client→server) exercises the decrypt helper
-    // above, which is the end of the cipher stream that was broken
-    // (and is now proven correct) by the active-session loopback test.
+    /// Wrap an already-built fast-path **output** frame (as produced
+    /// by e.g. [`encode_bitmap_update`](crate::encode_bitmap_update))
+    /// with the `FASTPATH_OUTPUT_ENCRYPTED` flag `+` MAC `+` RC4
+    /// encryption when Standard RDP Security is active. On TLS/NLA
+    /// the frame is returned unchanged.
+    ///
+    /// Expected input shape (from the free encoders):
+    /// `byte0(action|flags=0) | length(1-2B) | updateBody`.
+    /// Output shape:
+    /// `byte0(action|FASTPATH_OUTPUT_ENCRYPTED[|FASTPATH_OUTPUT_SECURE_CHECKSUM]) |
+    /// length(1-2B, recomputed) | MAC(8) | RC4(updateBody)`.
+    ///
+    /// The length field may grow from 1 to 2 bytes if adding the
+    /// 8-byte MAC pushes the total past `0x7F`; this helper handles
+    /// that transition by iterating once on the candidate header size.
+    ///
+    /// `SEC_SECURE_CHECKSUM` is emitted whenever the session was
+    /// negotiated with the salted-MAC algorithm (RDP 5.2+); the
+    /// `RdpSecurityContext` already knows this from its construction
+    /// flag, but it's not directly exposed. We conservatively emit the
+    /// salted-checksum bit unconditionally for Standard-Security
+    /// sessions: the connector/client accepts either value and computes
+    /// the MAC using its own configured salting mode. Tightening this
+    /// to match the context flag is a follow-up once
+    /// `RdpSecurityContext::use_salted_mac()` is exposed.
+    pub fn wrap_fast_path_outbound(&mut self, frame: &[u8]) -> ServerResult<Vec<u8>> {
+        let Some(ctx) = self.security_context.as_mut() else {
+            return Ok(frame.to_vec());
+        };
+        if frame.is_empty() {
+            return Err(ServerError::protocol(
+                "fast-path output frame is empty; nothing to encrypt",
+            ));
+        }
+        // Decode the existing header to figure out where the body starts.
+        let mut src = ReadCursor::new(frame);
+        let hdr = FastPathOutputHeader::decode(&mut src).map_err(ServerError::from)?;
+        let header_in_size = hdr.size();
+        if (hdr.length as usize) != frame.len() {
+            return Err(ServerError::protocol(
+                "fast-path output frame length field disagrees with slice length",
+            ));
+        }
+        let body = &frame[header_in_size..];
+
+        // Encrypt the body + compute MAC over the plaintext.
+        let mut encrypted = body.to_vec();
+        let mac = ctx.encrypt(&mut encrypted);
+
+        // Recompute the total length with MAC included. The length
+        // field is self-describing, so if the total crosses 0x7F the
+        // field grows from 1 to 2 bytes and the total grows by one
+        // more. Walking from an initial 1-byte-field guess and
+        // widening once covers every case (the field can only grow).
+        let candidate_body = 8 + encrypted.len();
+        let mut total = 1 + 1 + candidate_body; // assume 1-byte length
+        if total > 0x7F {
+            total = 1 + 2 + candidate_body; // promote to 2-byte length
+        }
+        let total_u16: u16 = total
+            .try_into()
+            .map_err(|_| ServerError::protocol("fast-path output frame exceeds u16 length"))?;
+
+        // Emit a fresh header with the encryption flag + salted
+        // checksum bit set. Per §2.2.9.1.2 bits 6-7 of byte0 carry
+        // the flags; `FastPathOutputHeader::encode` handles this.
+        let out_hdr = FastPathOutputHeader {
+            action: FASTPATH_OUTPUT_ACTION_FASTPATH,
+            flags: FASTPATH_OUTPUT_ENCRYPTED | FASTPATH_OUTPUT_SECURE_CHECKSUM,
+            length: total_u16,
+        };
+        let mut out = alloc::vec![0u8; total];
+        let mut dst = WriteCursor::new(&mut out);
+        out_hdr.encode(&mut dst).map_err(ServerError::from)?;
+        dst.write_slice(&mac, "FastPathOutput::mac")?;
+        dst.write_slice(&encrypted, "FastPathOutput::encryptedBody")?;
+        // Ignore action bits from the caller's header (always
+        // FASTPATH_OUTPUT_ACTION_FASTPATH = 0 for output); ignoring
+        // matches the constant above and keeps the wire shape stable.
+        let _ = hdr.action;
+        Ok(out)
+    }
 
     /// Decode one chunk of inbound SVC traffic. The active stage owns
     /// the per-channel reassembly buffer and emits a single
