@@ -34,9 +34,15 @@ async function connect() {
       $('domain').value || null,
     );
     log(`connected: ${JSON.stringify(summary)}`, 'ok');
+    if (client.hasClipboard) {
+      log('cliprdr negotiated — clipboard sync active', 'ok');
+    } else {
+      log('cliprdr not negotiated — clipboard sync disabled');
+    }
     $('status').textContent = 'connected';
     $('disconnectBtn').disabled = false;
     attachInputListeners();
+    attachClipboardListeners();
     pollLoop();
   } catch (e) {
     log(`connect failed: ${e?.message ?? e}`, 'err');
@@ -54,6 +60,10 @@ async function pollLoop() {
         // Throttle log spam — only print once per 60-frame burst.
         if (Math.random() < 0.02) log(`drew ${blits} rect(s)`);
       }
+      // pollEvents drained any incoming clipboard PDU into the
+      // ClipboardChannel cache; check for new remote text and push
+      // it into the browser's clipboard.
+      await syncClipboardFromRdp();
     } catch (e) {
       log(`poll error: ${e?.message ?? e}`, 'err');
       break;
@@ -64,6 +74,7 @@ async function pollLoop() {
   $('connectBtn').disabled = false;
   $('status').textContent = 'idle';
   detachInputListeners();
+  detachClipboardListeners();
   client = null;
 }
 
@@ -165,6 +176,66 @@ function detachInputListeners() {
   canvas.removeEventListener('contextmenu', onContextMenu);
   canvas.removeEventListener('keydown', onKeyDown);
   canvas.removeEventListener('keyup', onKeyUp);
+}
+
+// ── Clipboard sync ──────────────────────────────────────────────────
+
+/// When the RDP server pushes new clipboard text, mirror it into the
+/// browser via navigator.clipboard.writeText. Skipped silently if
+/// the browser denies the permission (the user can copy manually).
+async function syncClipboardFromRdp() {
+  if (!client?.hasClipboard) return;
+  const text = client.pollRemoteClipboardText();
+  if (typeof text !== 'string') return;
+  try {
+    await navigator.clipboard.writeText(text);
+    log(`rdp → browser: ${text.length} chars`);
+  } catch (e) {
+    /* permission denied / not focused — silent */
+  }
+}
+
+/// When the user copies in the browser (Ctrl+C or paste-ready content
+/// on the canvas focus), push the text into the RDP clipboard.
+async function syncClipboardToRdp() {
+  if (!client?.hasClipboard) return;
+  let text;
+  try {
+    text = await navigator.clipboard.readText();
+  } catch (e) {
+    return; // permission denied
+  }
+  if (!text) return;
+  try {
+    await client.setLocalClipboardText(text);
+    log(`browser → rdp: ${text.length} chars`);
+  } catch (e) {
+    log(`clipboard push failed: ${e?.message ?? e}`, 'err');
+  }
+}
+
+const onCanvasFocus = () => {
+  // Best effort: when the canvas takes focus, push the browser
+  // clipboard to RDP so the user can paste right away.
+  syncClipboardToRdp();
+};
+
+const onCopyShortcut = (e) => {
+  // Detect Ctrl/Cmd+C inside the canvas — push browser clipboard.
+  if (!(e.ctrlKey || e.metaKey)) return;
+  if (e.code !== 'KeyC') return;
+  // Defer one tick so the browser populates the clipboard first.
+  setTimeout(() => { syncClipboardToRdp().catch(() => {}); }, 50);
+};
+
+function attachClipboardListeners() {
+  canvas.addEventListener('focus', onCanvasFocus);
+  canvas.addEventListener('keydown', onCopyShortcut);
+}
+
+function detachClipboardListeners() {
+  canvas.removeEventListener('focus', onCanvasFocus);
+  canvas.removeEventListener('keydown', onCopyShortcut);
 }
 
 (async function bootstrap() {

@@ -34,7 +34,9 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 use crate::canvas::CanvasFrameSink;
+use crate::clipboard::ClipboardChannel;
 use crate::driver::WebClient;
+use crate::transport::WebTransport;
 use crate::input::{
     mouse_button_event, mouse_move_event, mouse_wheel_event, scancode_event, MouseButton,
 };
@@ -116,6 +118,9 @@ struct JsClientInner {
     /// connector's `EnhancedSecurityUpgrade` is treated as already
     /// done. Mirrors `WebClient::with_external_tls(true)`.
     external_tls: bool,
+    /// Clipboard channel router. Auto-attached on `connect()` if the
+    /// negotiated channels include `cliprdr`.
+    clipboard: Option<ClipboardChannel>,
 }
 
 /// Stateful RDP-over-WebSocket client. Hold one per `<canvas>`.
@@ -219,9 +224,14 @@ impl JsClient {
 
         let summary = serialize_summary(&result);
         let session = ActiveSession::new(transport, &result);
+        // Auto-attach the clipboard channel when the server negotiated
+        // it. `from_connection` errors with ChannelNotNegotiated if
+        // not — we silently leave clipboard disabled in that case.
+        let clipboard = ClipboardChannel::from_connection(&result).ok();
         let mut g = self.inner.borrow_mut();
         g.session = Some(session);
         g.last_summary = Some(summary.clone());
+        g.clipboard = clipboard;
         Ok(summary)
     }
 
@@ -262,14 +272,23 @@ impl JsClient {
 
         let mut blits: u32 = 0;
         let mut terminated = false;
+        // Collect clipboard channel response frames in order; we send
+        // them after the per-event loop so the borrow tracking stays
+        // simple (no awaits while holding any RefCell guard).
+        let mut clipboard_responses: Vec<Vec<u8>> = Vec::new();
         for event in &events {
             if let Some(sink) = sink_opt.as_mut() {
-                // The renderer lives in self.inner; borrow_mut briefly
-                // here is safe because we already dropped the earlier
-                // borrow before the await.
                 let mut g = self.inner.borrow_mut();
                 if let Ok(true) = g.renderer.render(event, sink) {
                     blits += 1;
+                }
+            }
+            if let crate::SessionEvent::Channel { channel_id, data } = event {
+                let mut g = self.inner.borrow_mut();
+                if let Some(cl) = g.clipboard.as_mut() {
+                    if let Ok(frames) = cl.process_channel_data(*channel_id, data) {
+                        clipboard_responses.extend(frames);
+                    }
                 }
             }
             if matches!(event, crate::SessionEvent::Terminated(_)) {
@@ -277,14 +296,117 @@ impl JsClient {
             }
         }
 
+        // Drain any clipboard response frames back to the server. Each
+        // frame is a complete TPKT-framed slow-path PDU.
+        for frame in &clipboard_responses {
+            session
+                .transport()
+                .send(frame)
+                .await
+                .map_err(|e| js_error(format!("clipboard send: {e}")))?;
+        }
+
         let mut g = self.inner.borrow_mut();
         if !terminated {
             g.session = Some(session);
+        } else {
+            // Tear down clipboard with the session — it's tied to a
+            // specific cliprdr channel id from this connection.
+            g.clipboard = None;
         }
         // Sink survives the session — embedders may attach a new session
         // on the same canvas without re-binding it.
         g.sink = sink_opt;
         Ok(blits)
+    }
+
+    // ── Clipboard (S5b) ────────────────────────────────────────────
+
+    /// Whether the current session negotiated the `cliprdr` channel.
+    /// `false` for sessions where the server didn't include it (no
+    /// clipboard sync available).
+    #[wasm_bindgen(getter, js_name = hasClipboard)]
+    pub fn has_clipboard(&self) -> bool {
+        self.inner.borrow().clipboard.is_some()
+    }
+
+    /// Push a string to the RDP clipboard as `CF_UNICODETEXT`. The
+    /// renderer encodes it as UTF-16LE with a NUL terminator and
+    /// announces a one-format format list to the server. The server
+    /// will follow up with a format-data-request, which `pollEvents`
+    /// auto-handles via the bundled backend.
+    #[wasm_bindgen(js_name = setLocalClipboardText)]
+    pub async fn set_local_clipboard_text(&self, text: String) -> Result<(), JsValue> {
+        // Build CF_UNICODETEXT bytes: UTF-16LE codepoints + 0x0000 terminator.
+        let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0u8, 0u8]);
+
+        // set_local_format_data needs &mut clipboard; take/put-back to
+        // avoid holding a RefCell borrow across the awaited send.
+        let mut clipboard = self
+            .inner
+            .borrow_mut()
+            .clipboard
+            .take()
+            .ok_or_else(|| js_error("clipboard channel not available"))?;
+        let frames = match clipboard.set_local_format_data(13 /* CF_UNICODETEXT */, bytes, "") {
+            Ok(f) => f,
+            Err(e) => {
+                self.inner.borrow_mut().clipboard = Some(clipboard);
+                return Err(js_error(format!("set local clipboard: {e}")));
+            }
+        };
+        // Take session for the send loop.
+        let mut session = match self.inner.borrow_mut().session.take() {
+            Some(s) => s,
+            None => {
+                self.inner.borrow_mut().clipboard = Some(clipboard);
+                return Err(js_error("not connected"));
+            }
+        };
+        let mut send_err = None;
+        for frame in &frames {
+            if let Err(e) = session.transport().send(frame).await {
+                send_err = Some(format!("clipboard send: {e}"));
+                break;
+            }
+        }
+        let mut g = self.inner.borrow_mut();
+        g.session = Some(session);
+        g.clipboard = Some(clipboard);
+        if let Some(msg) = send_err {
+            return Err(js_error(msg));
+        }
+        Ok(())
+    }
+
+    /// Drain the most-recently-received `CF_UNICODETEXT` clipboard
+    /// data from the server, decoded as a UTF-16LE string. Returns
+    /// `null` if the server hasn't pushed text since the last poll.
+    #[wasm_bindgen(js_name = pollRemoteClipboardText)]
+    pub fn poll_remote_clipboard_text(&self) -> JsValue {
+        let bytes = match self.inner.borrow_mut().clipboard.as_mut() {
+            Some(cl) => cl.take_remote_format_data(13),
+            None => None,
+        };
+        let Some(bytes) = bytes else {
+            return JsValue::NULL;
+        };
+        // Decode UTF-16LE, drop trailing NUL.
+        let mut units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|w| u16::from_le_bytes([w[0], w[1]]))
+            .collect();
+        if units.last() == Some(&0) {
+            units.pop();
+        }
+        match String::from_utf16(&units) {
+            Ok(s) => JsValue::from_str(&s),
+            Err(_) => JsValue::NULL,
+        }
     }
 
     // ── Input forwarding (S4) ──────────────────────────────────────
