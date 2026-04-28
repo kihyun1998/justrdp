@@ -247,6 +247,74 @@ impl ServerActiveStage {
         Ok(alloc::vec![info_frame, ult_frame])
     }
 
+    /// Encode a fresh `DemandActivePdu` for a Deactivation-Reactivation
+    /// re-emit (MS-RDPBCGR §1.3.1.3). The body uses the *current*
+    /// `self.share_id` (which `request_deactivation_reactivation` has
+    /// already bumped to the new value before calling this) and a
+    /// capability set rebuilt from `gcc_snapshot` with the supplied
+    /// new `(width, height)`.
+    ///
+    /// Wraps the body in ShareControl + MCS SDI + X.224 DT + TPKT --
+    /// the same envelope the acceptor's first DemandActive uses.
+    pub(crate) fn encode_demand_active_redemand(
+        &mut self,
+        width: u16,
+        height: u16,
+    ) -> ServerResult<Vec<u8>> {
+        use justrdp_acceptor::build_demand_active_capabilities;
+        use justrdp_pdu::rdp::capabilities::DemandActivePdu;
+
+        let caps = build_demand_active_capabilities(
+            &self.gcc_snapshot,
+            self.user_channel_id(),
+            Some((width, height)),
+        );
+        let demand = DemandActivePdu {
+            share_id: self.share_id(),
+            // "RDP\0\0" -- mirrors the acceptor's source descriptor.
+            source_descriptor: alloc::vec![0x52, 0x44, 0x50, 0x00, 0x00],
+            capability_sets: caps,
+            session_id: 0,
+        };
+        let demand_bytes = justrdp_core::encode_vec(&demand)?;
+
+        let sc_total = SHARE_CONTROL_HEADER_SIZE + demand_bytes.len();
+        if sc_total > u16::MAX as usize {
+            return Err(ServerError::protocol(
+                "DemandActivePdu redemand exceeds u16 ShareControl totalLength",
+            ));
+        }
+        let mut sc_payload = vec![0u8; sc_total];
+        {
+            let mut cursor = WriteCursor::new(&mut sc_payload);
+            ShareControlHeader {
+                total_length: sc_total as u16,
+                pdu_type: ShareControlPduType::DemandActivePdu,
+                pdu_source: self.user_channel_id(),
+            }
+            .encode(&mut cursor)?;
+            cursor.write_slice(&demand_bytes, "DemandActive::body")?;
+        }
+
+        // Standard RDP Security: encrypt + sign before SDI wrap.
+        let wrapped = self.wrap_slow_path_outbound(&sc_payload, 0)?;
+        let sdi = SendDataIndication {
+            initiator: self.user_channel_id(),
+            channel_id: self.io_channel_id(),
+            user_data: &wrapped,
+        };
+        let payload_size = DATA_TRANSFER_HEADER_SIZE + sdi.size();
+        let total = TPKT_HEADER_SIZE + payload_size;
+        let mut buf = vec![0u8; total];
+        {
+            let mut cursor = WriteCursor::new(&mut buf);
+            TpktHeader::try_for_payload(payload_size)?.encode(&mut cursor)?;
+            DataTransfer.encode(&mut cursor)?;
+            sdi.encode(&mut cursor)?;
+        }
+        Ok(buf)
+    }
+
     /// Encode a `DeactivateAllPdu` (MS-RDPBCGR §2.2.3.1) wrapped in
     /// ShareControl + MCS SDI + X.224 DT + TPKT.
     ///

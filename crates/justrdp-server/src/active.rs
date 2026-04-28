@@ -29,9 +29,14 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use justrdp_acceptor::AcceptanceResult;
+use justrdp_acceptor::{
+    build_demand_active_capabilities, AcceptanceResult, GccCoreSnapshot,
+};
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_pdu::mcs::SendDataRequest;
+use justrdp_pdu::rdp::capabilities::{
+    CapabilitySet, ConfirmActivePdu, DemandActivePdu,
+};
 use justrdp_svc::{SvcError, SvcServerProcessor};
 use justrdp_pdu::rdp::fast_path::{
     FastPathInputEvent, FastPathInputHeader, FastPathOutputHeader, FASTPATH_INPUT_ENCRYPTED,
@@ -45,9 +50,10 @@ use justrdp_pdu::rdp::standard_security::{RdpSecurityContext, SEC_ENCRYPT};
 /// constant.
 const BASIC_SECURITY_HEADER_SIZE: usize = 4;
 use justrdp_pdu::rdp::finalization::{
-    ArcScPrivatePacket, ControlAction, ControlPdu, InputEventPdu, InputEventType, LogonInfoExtended,
-    PersistentKeyListPdu, RefreshRectPdu, SaveSessionInfoData, SaveSessionInfoPdu,
-    ShutdownDeniedPdu, ShutdownRequestPdu, SuppressOutputPdu,
+    ArcScPrivatePacket, ControlAction, ControlPdu, FontListPdu, FontMapPdu, InputEventPdu,
+    InputEventType, LogonInfoExtended, PersistentKeyListPdu, RefreshRectPdu, SaveSessionInfoData,
+    SaveSessionInfoPdu, ShutdownDeniedPdu, ShutdownRequestPdu, SuppressOutputPdu, SynchronizePdu,
+    SYNCMSGTYPE_SYNC,
 };
 use justrdp_pdu::rdp::redirection::ServerRedirectionPdu;
 use justrdp_pdu::rdp::headers::{
@@ -213,39 +219,58 @@ pub enum ActiveStageOutput {
 ///
 /// The server transitions through these states when the application
 /// requests a resolution / monitor change mid-session. The full
-/// sequence is:
+/// automated sequence is:
 ///
 /// 1. `Active` (steady state).
 /// 2. Application calls
 ///    [`ServerActiveStage::request_deactivation_reactivation`] →
-///    server emits `DeactivateAllPdu` →
-///    state transitions to `WaitClientDeactivateAck`.
-/// 3. Per spec the client has no explicit acknowledgement PDU for
-///    DeactivateAll -- it simply stops sending PDUs that reference the
-///    old `share_id` and waits for a fresh `Demand Active`. The
-///    application is responsible for re-driving the connection
-///    finalization sequence (re-`Demand Active` with new caps,
-///    re-`Confirm Active`, finalization synch / control / font
-///    exchange) -- this typically means dropping the active stage and
-///    restarting from a fresh `RdpServer` handshake. While that
-///    happens the state stays `WaitClientDeactivateAck`.
-/// 4. Once the application has emitted the new `Demand Active` it
-///    calls [`ServerActiveStage::confirm_redemand_active_complete`]
-///    with the freshly negotiated `share_id` to transition back to
-///    `Active`. The new pending dimensions become the source of truth
-///    for [`pending_display_size`](ServerActiveStage::pending_display_size).
+///    server emits `DeactivateAllPdu` *and* a fresh `DemandActivePdu`
+///    (with capability sets reflecting the new desktop size and a
+///    new `share_id` = previous + 1) in a single concatenated frame
+///    burst → state transitions to `WaitConfirmActive`.
+/// 3. Client echoes a fresh `ConfirmActivePdu` matching the new
+///    `share_id`. `process()` decodes it and transitions to
+///    `WaitClientSynchronize`.
+/// 4. The four-step finalization sequence runs again on the new
+///    `share_id`: `WaitClientSynchronize → WaitClientCooperate →
+///    WaitClientRequestControl → WaitClientFontList`. For each
+///    incoming client PDU the server emits the matching response
+///    (Synchronize, Control(Cooperate), Control(GrantedControl),
+///    FontMap) and advances to the next sub-phase.
+/// 5. After FontMap is emitted the state returns to `Active` and
+///    the new `share_id` is the steady-state value.
 ///
 /// Display encoders SHOULD consult
 /// [`is_in_deactivation_reactivation`](ServerActiveStage::is_in_deactivation_reactivation)
-/// before emitting frames; sending PDUs that reference the old
-/// `share_id` after `DeactivateAll` is a protocol violation.
+/// before emitting frames; sending PDUs that reference the new
+/// `share_id` before the cycle completes (or the old one after the
+/// cycle starts) is a protocol violation.
+///
+/// **Manual override**: the legacy
+/// [`confirm_redemand_active_complete`](ServerActiveStage::confirm_redemand_active_complete)
+/// hook is still available for callers that want to drive the
+/// finalization sequence externally; calling it from any non-`Active`
+/// state forces an immediate transition back to `Active` with the
+/// supplied `share_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeactivationState {
     /// Steady state -- normal session.
     Active,
-    /// `DeactivateAllPdu` has been emitted; waiting for the
-    /// application to re-drive the Demand Active flow.
-    WaitClientDeactivateAck,
+    /// `DeactivateAllPdu` + new `DemandActivePdu` have been emitted;
+    /// awaiting the client's `ConfirmActivePdu`.
+    WaitConfirmActive,
+    /// `ConfirmActive` received; awaiting the client's first
+    /// finalization PDU (`SynchronizePdu`).
+    WaitClientSynchronize,
+    /// `Synchronize` received; awaiting the client's
+    /// `Control(Cooperate)`.
+    WaitClientCooperate,
+    /// `Control(Cooperate)` received; awaiting the client's
+    /// `Control(RequestControl)`.
+    WaitClientRequestControl,
+    /// `Control(RequestControl)` received; awaiting the client's
+    /// `FontList`.
+    WaitClientFontList,
 }
 
 /// Per-channel reassembly state for inbound SVC data.
@@ -282,11 +307,21 @@ pub struct ServerActiveStage {
     deactivation_state: DeactivationState,
     /// New `(width, height)` requested via
     /// [`request_deactivation_reactivation`](Self::request_deactivation_reactivation).
-    /// `Some(_)` while a D/R sequence is in flight; cleared back to the
-    /// steady-state value once
+    /// `Some(_)` while a D/R sequence is in flight; cleared once the
+    /// automated finalization completes (or
     /// [`confirm_redemand_active_complete`](Self::confirm_redemand_active_complete)
-    /// records the new `share_id`.
+    /// is called as a manual override).
     pending_display_size: Option<(u16, u16)>,
+    /// Snapshot of the client's GCC `ClientCoreData` carried over from
+    /// the acceptor. Lets `request_deactivation_reactivation` rebuild
+    /// the server's capability set with a new desktop size while
+    /// preserving keyboard layout / color depth / etc.
+    pub(crate) gcc_snapshot: GccCoreSnapshot,
+    /// Capability sets the client returned in the *first* ConfirmActive
+    /// (carried through `AcceptanceResult::client_capabilities`).
+    /// Updated when a fresh ConfirmActive arrives during D/R so display
+    /// encoders see the post-D/R cap negotiation result.
+    client_capabilities: Vec<CapabilitySet>,
     /// Server-side SVC processors registered via
     /// [`register_svc_processor`](Self::register_svc_processor). Inbound
     /// SVC data on a channel with a registered processor is dispatched
@@ -337,6 +372,8 @@ impl ServerActiveStage {
             svc_reassembly: Vec::new(),
             deactivation_state: DeactivationState::Active,
             pending_display_size: None,
+            gcc_snapshot: result.gcc_core,
+            client_capabilities: result.client_capabilities,
             svc_processors: Vec::new(),
             has_emitted_redirection: false,
             current_arc_cookie: None,
@@ -433,25 +470,42 @@ impl ServerActiveStage {
         self.pending_display_size
     }
 
+    /// Capability sets the client returned in its most recent
+    /// `ConfirmActivePdu`. Equal to `result.client_capabilities` after
+    /// the initial handshake; updated whenever a fresh ConfirmActive
+    /// arrives during a Deactivation-Reactivation cycle.
+    pub fn client_capabilities(&self) -> &[CapabilitySet] {
+        &self.client_capabilities
+    }
+
+
     /// Begin a Deactivation-Reactivation Sequence (MS-RDPBCGR
     /// §1.3.1.3) targeting the new desktop dimensions
     /// `(width, height)`.
     ///
-    /// Returns the wire bytes of a `DeactivateAllPdu` (already wrapped
-    /// in ShareControl + MCS SDI + X.224 DT + TPKT) ready to flush.
-    /// Transitions the lifecycle to
-    /// [`DeactivationState::WaitClientDeactivateAck`] and stores the
-    /// requested dimensions in
-    /// [`pending_display_size`](Self::pending_display_size).
+    /// Returns a single concatenated wire buffer carrying *both*:
+    /// 1. `DeactivateAllPdu` (ShareControl + MCS SDI + X.224 DT +
+    ///    TPKT), with the *current* `share_id` so the client knows
+    ///    which session is being torn down.
+    /// 2. A fresh `DemandActivePdu` (likewise wrapped) carrying a
+    ///    capability set rebuilt from `gcc_snapshot` with the new
+    ///    `(width, height)` and a new `share_id` = `previous + 1`.
     ///
-    /// The application MUST then re-drive the connection finalization
-    /// flow (re-`Demand Active` with caps reflecting the new size,
-    /// re-`Confirm Active`, etc.) -- typically by dropping the active
-    /// stage and restarting from a fresh `RdpServer` handshake -- and
-    /// finally call
+    /// After flushing, [`process()`](Self::process) automatically
+    /// drives the rest of the cycle: it expects, in order, a
+    /// `ConfirmActivePdu` and the four-step finalization
+    /// (`Synchronize`, `Control(Cooperate)`, `Control(RequestControl)`,
+    /// `FontList`), emitting the matching server reply
+    /// (`Synchronize`, `Control(Cooperate)`, `Control(GrantedControl)`,
+    /// `FontMap`) for each. The state returns to `Active` once
+    /// FontMap is emitted; the new `share_id` becomes the steady-state
+    /// value.
+    ///
+    /// **Manual override**: callers that want to drive the sequence
+    /// externally (e.g. for protocol-level tests) can call
     /// [`confirm_redemand_active_complete`](Self::confirm_redemand_active_complete)
-    /// to return to the `Active` state with the freshly negotiated
-    /// `share_id`.
+    /// from any non-`Active` state to force an immediate transition
+    /// back to `Active` with a caller-supplied `share_id`.
     ///
     /// Calling this while a sequence is already in flight returns
     /// `ServerError::protocol(_)`. `width` / `height` MUST both be
@@ -472,29 +526,49 @@ impl ServerActiveStage {
                 "request_deactivation_reactivation: width and height MUST be non-zero",
             ));
         }
-        let bytes = self.encode_deactivate_all()?;
-        self.deactivation_state = DeactivationState::WaitClientDeactivateAck;
+
+        // Burst (1): DeactivateAll on the *current* share_id.
+        let mut buf = self.encode_deactivate_all()?;
+
+        // Bump the share_id deterministically (matches Windows'
+        // observed behaviour of monotonic increments). The new value
+        // takes effect immediately so the DemandActive emit and
+        // subsequent finalization PDUs all reference it.
+        self.share_id = self.share_id.wrapping_add(1);
+
+        // Burst (2): fresh DemandActive with the new size + share_id.
+        let new_demand = self.encode_demand_active_redemand(width, height)?;
+        buf.extend_from_slice(&new_demand);
+
+        self.deactivation_state = DeactivationState::WaitConfirmActive;
         self.pending_display_size = Some((width, height));
-        Ok(bytes)
+        // Stale client_capabilities are wiped; they get rewritten when
+        // the fresh ConfirmActive lands.
+        self.client_capabilities.clear();
+        Ok(buf)
     }
 
-    /// Signal that the application has completed the re-`Demand
-    /// Active` flow and the session is back in the steady state with
-    /// `new_share_id` (the value that flowed in the fresh
-    /// finalization sequence).
+    /// Manual override: skip the automated D/R finalization and
+    /// transition immediately back to `Active` with `new_share_id`.
     ///
-    /// Updates the stored `share_id` and clears the pending size and
-    /// suppress flag so subsequent display encoders pick up the new
-    /// session immediately. Returns `ServerError::protocol(_)` when
-    /// called outside of `WaitClientDeactivateAck`.
+    /// Originally the only way to close a D/R cycle (the application
+    /// had to drive the re-handshake externally), now retained as an
+    /// escape hatch for tests / specialised servers that bypass the
+    /// automated flow. Accepts a call from *any* non-`Active`
+    /// deactivation state and forces the transition; returns
+    /// `ServerError::protocol(_)` only when called from the steady
+    /// `Active` state.
+    ///
+    /// Resets `suppress_output`, the PERSIST_BITMAP_KEYS counter, and
+    /// the inbound SVC reassembly state so a fresh share_id starts
+    /// from a clean slate.
     pub fn confirm_redemand_active_complete(
         &mut self,
         new_share_id: u32,
     ) -> ServerResult<()> {
-        if self.deactivation_state != DeactivationState::WaitClientDeactivateAck {
+        if self.deactivation_state == DeactivationState::Active {
             return Err(ServerError::protocol(
-                "confirm_redemand_active_complete called outside of \
-                 WaitClientDeactivateAck",
+                "confirm_redemand_active_complete called while not in a D/R sequence",
             ));
         }
         self.share_id = new_share_id;
@@ -1207,6 +1281,22 @@ impl ServerActiveStage {
     ) -> ServerResult<Vec<ActiveStageOutput>> {
         let mut cursor = ReadCursor::new(user_data);
         let sc_hdr = ShareControlHeader::decode(&mut cursor)?;
+
+        // Deactivation-Reactivation: while a D/R cycle is in flight the
+        // first PDU must be the client's fresh ConfirmActive
+        // (ShareControl PDU type 0x0003), and subsequent PDUs go
+        // through the dedicated finalization sub-state machine. The
+        // legacy steady-state `Data` dispatch only runs once the
+        // cycle completes.
+        if self.deactivation_state == DeactivationState::WaitConfirmActive {
+            if sc_hdr.pdu_type != ShareControlPduType::ConfirmActivePdu {
+                return Err(ServerError::protocol(
+                    "expected ConfirmActivePdu during Deactivation-Reactivation",
+                ));
+            }
+            return self.handle_redemand_confirm_active(cursor.peek_remaining());
+        }
+
         if sc_hdr.pdu_type != ShareControlPduType::Data {
             return Err(ServerError::protocol(
                 "active-session ShareControl PDU is not a Data PDU",
@@ -1219,7 +1309,133 @@ impl ServerActiveStage {
             ));
         }
         let body = cursor.peek_remaining();
+
+        // Continue D/R re-finalization sub-phases on Data PDUs.
+        if self.deactivation_state != DeactivationState::Active {
+            return self.dispatch_redemand_finalization(sd_hdr.pdu_type2, body);
+        }
+
         self.dispatch_share_data(sd_hdr.pdu_type2, body, input_handler)
+    }
+
+    /// Handle the fresh `ConfirmActivePdu` arriving in the
+    /// `WaitConfirmActive` substate of a Deactivation-Reactivation
+    /// cycle. Validates spec invariants
+    /// (MS-RDPBCGR §2.2.1.13.2.1: shareId matches the new server
+    /// share_id, originatorID == 0x03EA), captures the new client
+    /// capabilities, and advances to `WaitClientSynchronize`.
+    fn handle_redemand_confirm_active(
+        &mut self,
+        body: &[u8],
+    ) -> ServerResult<Vec<ActiveStageOutput>> {
+        const CONFIRM_ACTIVE_ORIGINATOR_ID: u16 = 0x03EA;
+        let confirm = ConfirmActivePdu::decode(&mut ReadCursor::new(body))?;
+        if confirm.share_id != self.share_id {
+            return Err(ServerError::protocol(
+                "redemand ConfirmActive shareId does not match the new server share_id",
+            ));
+        }
+        if confirm.originator_id != CONFIRM_ACTIVE_ORIGINATOR_ID {
+            return Err(ServerError::protocol(
+                "redemand ConfirmActive originatorID is not 0x03EA",
+            ));
+        }
+        self.client_capabilities = confirm.capability_sets;
+        self.deactivation_state = DeactivationState::WaitClientSynchronize;
+        Ok(Vec::new())
+    }
+
+    /// Drive one finalization sub-phase during a
+    /// Deactivation-Reactivation cycle. The expected `pdu_type2` is
+    /// determined by the current `deactivation_state`; mismatches are
+    /// surfaced as protocol errors. Each successful step emits the
+    /// matching server-side response (`Synchronize`,
+    /// `Control(Cooperate)`, `Control(GrantedControl)`, `FontMap`)
+    /// and advances the state, with the FontList → FontMap step
+    /// returning the cycle to `Active`.
+    fn dispatch_redemand_finalization(
+        &mut self,
+        pdu_type2: ShareDataPduType,
+        body: &[u8],
+    ) -> ServerResult<Vec<ActiveStageOutput>> {
+        match (self.deactivation_state, pdu_type2) {
+            (DeactivationState::WaitClientSynchronize, ShareDataPduType::Synchronize) => {
+                let sync = SynchronizePdu::decode(&mut ReadCursor::new(body))?;
+                if sync.message_type != SYNCMSGTYPE_SYNC {
+                    return Err(ServerError::protocol(
+                        "redemand client Synchronize messageType is not SYNCMSGTYPE_SYNC",
+                    ));
+                }
+                let server_sync = SynchronizePdu {
+                    message_type: SYNCMSGTYPE_SYNC,
+                    target_user: self.user_channel_id,
+                };
+                let frame =
+                    self.encode_share_data(ShareDataPduType::Synchronize, &server_sync)?;
+                self.deactivation_state = DeactivationState::WaitClientCooperate;
+                Ok(alloc::vec![ActiveStageOutput::SendBytes(frame)])
+            }
+            (DeactivationState::WaitClientCooperate, ShareDataPduType::Control) => {
+                let pdu = ControlPdu::decode(&mut ReadCursor::new(body))?;
+                if pdu.action != ControlAction::Cooperate {
+                    return Err(ServerError::protocol(
+                        "expected Control(Cooperate) during redemand finalization",
+                    ));
+                }
+                let cooperate = ControlPdu {
+                    action: ControlAction::Cooperate,
+                    grant_id: 0,
+                    control_id: 0,
+                };
+                let frame = self.encode_share_data(ShareDataPduType::Control, &cooperate)?;
+                self.deactivation_state = DeactivationState::WaitClientRequestControl;
+                Ok(alloc::vec![ActiveStageOutput::SendBytes(frame)])
+            }
+            (DeactivationState::WaitClientRequestControl, ShareDataPduType::Control) => {
+                let pdu = ControlPdu::decode(&mut ReadCursor::new(body))?;
+                if pdu.action != ControlAction::RequestControl {
+                    return Err(ServerError::protocol(
+                        "expected Control(RequestControl) during redemand finalization",
+                    ));
+                }
+                let granted = ControlPdu {
+                    action: ControlAction::GrantedControl,
+                    grant_id: self.user_channel_id,
+                    control_id: self.user_channel_id as u32,
+                };
+                let frame = self.encode_share_data(ShareDataPduType::Control, &granted)?;
+                self.deactivation_state = DeactivationState::WaitClientFontList;
+                Ok(alloc::vec![ActiveStageOutput::SendBytes(frame)])
+            }
+            (DeactivationState::WaitClientFontList, ShareDataPduType::FontList) => {
+                // Body is decoded for protocol-strictness only; no
+                // fields are retained.
+                let _ = FontListPdu::decode(&mut ReadCursor::new(body))?;
+                // FontMapPdu is a type alias for FontListPdu (same
+                // wire shape, distinguished by ShareData PduType2).
+                let font_map = FontMapPdu {
+                    number_fonts: 0,
+                    total_num_fonts: 0,
+                    list_flags: 0x0003, // FONTLIST_FIRST | FONTLIST_LAST
+                    entry_size: 4,
+                };
+                let frame = self.encode_share_data(ShareDataPduType::FontMap, &font_map)?;
+                // Cycle complete -- back to steady state. Reset the
+                // companion flags so post-D/R sessions behave like
+                // freshly-handshaken sessions.
+                self.deactivation_state = DeactivationState::Active;
+                self.pending_display_size = None;
+                self.suppress_output = false;
+                self.persist_keys_count = 0;
+                self.svc_reassembly.clear();
+                Ok(alloc::vec![ActiveStageOutput::SendBytes(frame)])
+            }
+            (state, _) => Err(ServerError::protocol_owned(alloc::format!(
+                "unexpected ShareData PDU {:?} during redemand finalization (state={:?})",
+                pdu_type2,
+                state
+            ))),
+        }
     }
 
     fn dispatch_share_data(
@@ -1595,6 +1811,45 @@ mod tests {
                 pdu_type2,
                 compressed_type: 0,
                 compressed_length: 0,
+            }
+            .encode(&mut c)
+            .unwrap();
+            inner.encode(&mut c).unwrap();
+        }
+        let sdr = SendDataRequest {
+            initiator: stage.user_channel_id,
+            channel_id: stage.io_channel_id,
+            user_data: &sc_payload,
+        };
+        let payload_size = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+        let total = TPKT_HEADER_SIZE + payload_size;
+        let mut buf = vec![0u8; total];
+        {
+            let mut c = WriteCursor::new(&mut buf);
+            TpktHeader::try_for_payload(payload_size).unwrap().encode(&mut c).unwrap();
+            DataTransfer.encode(&mut c).unwrap();
+            sdr.encode(&mut c).unwrap();
+        }
+        buf
+    }
+
+    /// Wrap a generic ShareControl PDU (e.g. ConfirmActive) in MCS SDR
+    /// + X.224 DT + TPKT. Mirror of `wrap_client_share_data` for PDUs
+    /// that don't carry a ShareData envelope.
+    fn wrap_client_share_control<E: Encode>(
+        stage: &ServerActiveStage,
+        pdu_type: ShareControlPduType,
+        inner: &E,
+    ) -> Vec<u8> {
+        let inner_size = inner.size();
+        let sc_total = SHARE_CONTROL_HEADER_SIZE + inner_size;
+        let mut sc_payload = vec![0u8; sc_total];
+        {
+            let mut c = WriteCursor::new(&mut sc_payload);
+            ShareControlHeader {
+                total_length: sc_total as u16,
+                pdu_type,
+                pdu_source: stage.user_channel_id,
             }
             .encode(&mut c)
             .unwrap();
@@ -2396,31 +2651,53 @@ mod tests {
         assert_eq!(s.pending_display_size(), None);
     }
 
+    /// Walk a concatenated D/R burst (DeactivateAllPdu + DemandActivePdu)
+    /// and return the two ShareControl payloads in order.
+    fn split_d_r_burst(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        // Each frame is [TPKT(4) + X.224 DT(3) + MCS SDI(...)]; the
+        // TPKT length lets us cleanly split the two frames.
+        let len0 = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+        let f0 = bytes[..len0].to_vec();
+        let f1 = bytes[len0..].to_vec();
+        (f0, f1)
+    }
+
     #[test]
-    fn request_deactivation_reactivation_emits_deactivate_all_and_transitions() {
+    fn request_deactivation_reactivation_emits_deactivate_all_and_demand_active() {
         let mut s = fake_stage();
         let original_share_id = s.share_id();
         let bytes = s.request_deactivation_reactivation(2560, 1440).unwrap();
 
-        // Wire roundtrip: ShareControl pdu_type MUST be DeactivateAllPdu (0x0006).
-        let (sc, body) = strip_to_share_control(&bytes);
-        assert_eq!(sc.pdu_type, ShareControlPduType::DeactivateAllPdu);
-        assert_eq!(sc.pdu_source, s.user_channel_id());
+        let (frame0, frame1) = split_d_r_burst(&bytes);
+        // Frame 0: DeactivateAllPdu carrying the *old* share_id.
+        let (sc0, body0) = strip_to_share_control(&frame0);
+        assert_eq!(sc0.pdu_type, ShareControlPduType::DeactivateAllPdu);
+        let deact = DeactivateAllPdu::decode(&mut ReadCursor::new(&body0)).unwrap();
+        assert_eq!(deact.share_id, original_share_id);
 
-        let pdu = DeactivateAllPdu::decode(&mut ReadCursor::new(&body)).unwrap();
-        assert_eq!(pdu.share_id, original_share_id);
-        assert_eq!(pdu.length_source_descriptor, 0);
+        // Frame 1: fresh DemandActive on the *new* share_id (= old + 1)
+        // with the new desktop dimensions reflected in the Bitmap cap.
+        let (sc1, body1) = strip_to_share_control(&frame1);
+        assert_eq!(sc1.pdu_type, ShareControlPduType::DemandActivePdu);
+        let new_demand =
+            DemandActivePdu::decode(&mut ReadCursor::new(&body1)).unwrap();
+        assert_eq!(new_demand.share_id, original_share_id.wrapping_add(1));
+        let bitmap_cap = new_demand
+            .capability_sets
+            .iter()
+            .find_map(|c| match c {
+                CapabilitySet::Bitmap(b) => Some(b.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(bitmap_cap.desktop_width, 2560);
+        assert_eq!(bitmap_cap.desktop_height, 1440);
 
-        // State transitioned and pending size recorded.
-        assert_eq!(
-            s.deactivation_state(),
-            DeactivationState::WaitClientDeactivateAck,
-        );
+        // State + accessors reflect the in-flight cycle.
+        assert_eq!(s.deactivation_state(), DeactivationState::WaitConfirmActive);
         assert!(s.is_in_deactivation_reactivation());
         assert_eq!(s.pending_display_size(), Some((2560, 1440)));
-        // share_id is NOT yet replaced -- the new value comes from the
-        // re-handshake and lands via confirm_redemand_active_complete.
-        assert_eq!(s.share_id(), original_share_id);
+        assert_eq!(s.share_id(), original_share_id.wrapping_add(1));
     }
 
     #[test]
@@ -2440,15 +2717,14 @@ mod tests {
         // A second call MUST fail without altering the state.
         let err = s.request_deactivation_reactivation(1024, 768).unwrap_err();
         let _ = err; // existence is enough; payload is the error message
-        assert_eq!(
-            s.deactivation_state(),
-            DeactivationState::WaitClientDeactivateAck,
-        );
+        assert_eq!(s.deactivation_state(), DeactivationState::WaitConfirmActive);
         assert_eq!(s.pending_display_size(), Some((800, 600)));
     }
 
     #[test]
     fn confirm_redemand_active_complete_transitions_back_to_active() {
+        // Manual override: skip the automated finalization and force a
+        // direct return to Active with a caller-supplied share_id.
         let mut s = fake_stage();
         let _ = s.request_deactivation_reactivation(2560, 1440).unwrap();
         s.confirm_redemand_active_complete(0xABCD_1234).unwrap();
@@ -2456,17 +2732,15 @@ mod tests {
         assert_eq!(s.deactivation_state(), DeactivationState::Active);
         assert!(!s.is_in_deactivation_reactivation());
         assert_eq!(s.share_id(), 0xABCD_1234);
-        // Pending size cleared once the application has observed it
-        // and re-driven the handshake.
         assert_eq!(s.pending_display_size(), None);
         assert!(!s.is_output_suppressed());
     }
 
     #[test]
-    fn confirm_redemand_active_complete_rejects_outside_wait_state() {
+    fn confirm_redemand_active_complete_rejects_in_active_state() {
+        // The manual override only makes sense from a non-Active state.
         let mut s = fake_stage();
         assert!(s.confirm_redemand_active_complete(1).is_err());
-        // State unchanged.
         assert_eq!(s.deactivation_state(), DeactivationState::Active);
     }
 
@@ -2474,8 +2748,6 @@ mod tests {
     fn confirm_redemand_active_complete_resets_persist_keys_and_svc_reassembly() {
         // Burn some cross-D-R state to verify the reset.
         let mut s = fake_stage();
-        // Bypass the public API to forcibly seed persist_keys_count and
-        // svc_reassembly. (Test-only access via shared module.)
         s.persist_keys_count = 7;
         s.svc_reassembly.push((
             0x03EC,
@@ -2496,17 +2768,153 @@ mod tests {
 
     #[test]
     fn deactivate_all_pdu_share_id_matches_current_session() {
-        // Sanity-check the wire `share_id` field even after a successful
-        // Deactivation-Reactivation cycle: the next request reflects the
-        // freshly negotiated share_id.
+        // After one D/R cycle (manual override) + a second cycle, the
+        // DeactivateAll wire share_id reflects the value the
+        // application supplied to the manual override.
         let mut s = fake_stage();
         let _ = s.request_deactivation_reactivation(800, 600).unwrap();
         s.confirm_redemand_active_complete(0x1111_2222).unwrap();
 
         let bytes = s.request_deactivation_reactivation(1024, 768).unwrap();
-        let (_sc, body) = strip_to_share_control(&bytes);
+        let (frame0, _frame1) = split_d_r_burst(&bytes);
+        let (_sc, body) = strip_to_share_control(&frame0);
         let pdu = DeactivateAllPdu::decode(&mut ReadCursor::new(&body)).unwrap();
         assert_eq!(pdu.share_id, 0x1111_2222);
+    }
+
+    #[test]
+    fn full_redemand_finalization_returns_to_active() {
+        // Drive the entire automated cycle end-to-end with synthesized
+        // client PDUs:
+        //   ConfirmActive → Synchronize → Cooperate → RequestControl →
+        //   FontList
+        // and verify the four server emits + final state transition.
+        let mut s = fake_stage();
+        let original_share_id = s.share_id();
+        let _burst = s.request_deactivation_reactivation(1280, 720).unwrap();
+        let new_share_id = original_share_id.wrapping_add(1);
+        let user_ch = s.user_channel_id();
+        assert_eq!(s.deactivation_state(), DeactivationState::WaitConfirmActive);
+
+        // Step 1: client ConfirmActive on the new share_id.
+        let confirm = ConfirmActivePdu {
+            share_id: new_share_id,
+            originator_id: 0x03EA,
+            source_descriptor: alloc::vec![0x4D, 0x53, 0x54, 0x53, 0x43, 0x00], // "MSTSC\0"
+            capability_sets: alloc::vec::Vec::new(),
+        };
+        let mut h = NoopHandler;
+        let bytes = wrap_client_share_control(
+            &s,
+            ShareControlPduType::ConfirmActivePdu,
+            &confirm,
+        );
+        let out = s.process(&bytes, &mut h).unwrap();
+        assert!(out.is_empty(), "ConfirmActive produces no immediate emit");
+        assert_eq!(
+            s.deactivation_state(),
+            DeactivationState::WaitClientSynchronize
+        );
+
+        // Step 2: client Synchronize → server emits Synchronize.
+        let sync = SynchronizePdu {
+            message_type: SYNCMSGTYPE_SYNC,
+            target_user: user_ch,
+        };
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::Synchronize, &sync);
+        let out = s.process(&bytes, &mut h).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], ActiveStageOutput::SendBytes(_)));
+        assert_eq!(
+            s.deactivation_state(),
+            DeactivationState::WaitClientCooperate
+        );
+
+        // Step 3: client Control(Cooperate) → server emits Cooperate.
+        let coop = ControlPdu {
+            action: ControlAction::Cooperate,
+            grant_id: 0,
+            control_id: 0,
+        };
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::Control, &coop);
+        let out = s.process(&bytes, &mut h).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            s.deactivation_state(),
+            DeactivationState::WaitClientRequestControl
+        );
+
+        // Step 4: client Control(RequestControl) → server emits GrantedControl.
+        let req = ControlPdu {
+            action: ControlAction::RequestControl,
+            grant_id: 0,
+            control_id: 0,
+        };
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::Control, &req);
+        let out = s.process(&bytes, &mut h).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            s.deactivation_state(),
+            DeactivationState::WaitClientFontList
+        );
+
+        // Step 5: client FontList → server emits FontMap → Active again.
+        let font_list = FontListPdu::default_request();
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::FontList, &font_list);
+        let out = s.process(&bytes, &mut h).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(s.deactivation_state(), DeactivationState::Active);
+        assert!(!s.is_in_deactivation_reactivation());
+        assert_eq!(s.share_id(), new_share_id, "new share_id is now steady state");
+        assert_eq!(s.pending_display_size(), None);
+    }
+
+    #[test]
+    fn redemand_confirm_active_rejects_wrong_share_id() {
+        let mut s = fake_stage();
+        let _ = s.request_deactivation_reactivation(1024, 768).unwrap();
+        let confirm = ConfirmActivePdu {
+            share_id: 0xDEAD_BEEF, // wrong: not new_share_id
+            originator_id: 0x03EA,
+            source_descriptor: alloc::vec![0u8; 6],
+            capability_sets: alloc::vec::Vec::new(),
+        };
+        let mut h = NoopHandler;
+        let bytes = wrap_client_share_control(
+            &s,
+            ShareControlPduType::ConfirmActivePdu,
+            &confirm,
+        );
+        assert!(s.process(&bytes, &mut h).is_err());
+    }
+
+    #[test]
+    fn redemand_finalization_rejects_unexpected_pdu_type() {
+        let mut s = fake_stage();
+        let _ = s.request_deactivation_reactivation(1024, 768).unwrap();
+        let new_share_id = s.share_id();
+        let confirm = ConfirmActivePdu {
+            share_id: new_share_id,
+            originator_id: 0x03EA,
+            source_descriptor: alloc::vec![0u8; 6],
+            capability_sets: alloc::vec::Vec::new(),
+        };
+        let mut h = NoopHandler;
+        let bytes = wrap_client_share_control(
+            &s,
+            ShareControlPduType::ConfirmActivePdu,
+            &confirm,
+        );
+        s.process(&bytes, &mut h).unwrap();
+        // Now we are in WaitClientSynchronize; the spec wants
+        // Synchronize but the client sends Control instead.
+        let coop = ControlPdu {
+            action: ControlAction::Cooperate,
+            grant_id: 0,
+            control_id: 0,
+        };
+        let bytes = wrap_client_share_data(&s, ShareDataPduType::Control, &coop);
+        assert!(s.process(&bytes, &mut h).is_err());
     }
 
     // ──────────────────────────────────────────────────────────────
