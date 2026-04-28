@@ -25,6 +25,7 @@ webrtc-data = []
 justrdp-core = { workspace = true, features = ["alloc"] }
 justrdp-connector = { workspace = true }
 justrdp-pdu.workspace = true
+justrdp-session = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

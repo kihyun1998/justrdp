@@ -23,6 +23,7 @@ use justrdp_connector::{
     ClientConnector, ClientConnectorState, ConnectionResult, ConnectorError, Sequence,
 };
 use justrdp_core::{PduHint, WriteBuf};
+use justrdp_session::SessionError;
 
 use crate::error::TransportError;
 use crate::transport::WebTransport;
@@ -33,15 +34,19 @@ use crate::transport::WebTransport;
 pub const MAX_HANDSHAKE_PDU_SIZE: usize = 16 * 1024 * 1024;
 
 /// Driver-level failure modes. Kept separate from [`TransportError`] /
-/// [`ConnectorError`] so callers can pattern-match on the *origin* of a
-/// failure (transport vs. connector vs. driver policy).
+/// [`ConnectorError`] / [`SessionError`] so callers can pattern-match on
+/// the *origin* of a failure (transport vs. connector vs. session vs.
+/// driver policy).
 #[derive(Debug)]
 pub enum DriverError {
     /// The underlying [`WebTransport`] failed.
     Transport(TransportError),
     /// The connector state machine rejected a PDU or hit a state error.
     Connector(ConnectorError),
-    /// A handshake PDU exceeded [`MAX_HANDSHAKE_PDU_SIZE`].
+    /// The active session processor rejected a frame (decode/protocol).
+    Session(SessionError),
+    /// A handshake or active-session PDU exceeded
+    /// [`MAX_HANDSHAKE_PDU_SIZE`].
     FrameTooLarge { size: usize },
     /// The connector reached `EnhancedSecurityUpgrade` but this driver
     /// doesn't support TLS in the current step (S2 boundary).
@@ -74,8 +79,9 @@ impl core::fmt::Display for DriverError {
         match self {
             Self::Transport(e) => write!(f, "transport: {e}"),
             Self::Connector(e) => write!(f, "connector: {e:?}"),
+            Self::Session(e) => write!(f, "session: {e}"),
             Self::FrameTooLarge { size } => {
-                write!(f, "handshake PDU too large: {size} bytes")
+                write!(f, "PDU too large: {size} bytes")
             }
             Self::TlsRequired => f.write_str("TLS upgrade required (NLA/SSL not yet supported in justrdp-web)"),
             Self::NlaRequired { state } => write!(f, "NLA/CredSSP not yet supported (state={state})"),
@@ -95,6 +101,12 @@ impl From<TransportError> for DriverError {
 impl From<ConnectorError> for DriverError {
     fn from(e: ConnectorError) -> Self {
         Self::Connector(e)
+    }
+}
+
+impl From<SessionError> for DriverError {
+    fn from(e: SessionError) -> Self {
+        Self::Session(e)
     }
 }
 
@@ -191,7 +203,7 @@ impl<T: WebTransport> WebClient<T> {
 /// Browser bridges may deliver one RDP PDU per WebSocket message, but the
 /// crate doesn't depend on that — we re-frame from the byte stream using
 /// the connector-supplied [`PduHint`] just like `justrdp-blocking` does.
-async fn recv_until_pdu<T: WebTransport>(
+pub(crate) async fn recv_until_pdu<T: WebTransport>(
     transport: &mut T,
     hint: &dyn PduHint,
     scratch: &mut Vec<u8>,

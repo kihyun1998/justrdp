@@ -713,6 +713,7 @@ dependencies = [
  "justrdp-connector",
  "justrdp-core",
  "justrdp-pdu",
+ "justrdp-session",
  "pollster",
  "wasm-bindgen",
  "wasm-bindgen-futures",
