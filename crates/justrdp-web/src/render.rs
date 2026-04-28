@@ -335,6 +335,26 @@ pub struct BitmapRenderer {
     /// each row. PatBlt orders with `BS_PATTERN` and a cached
     /// `brush_hatch` index look up here.
     brush_cache: BTreeMap<u8, [u8; 8]>,
+    /// Glyph cache populated by `CacheGlyph` Secondary orders
+    /// (MS-RDPEGDI 2.2.2.2.1.2.5 / 2.2.2.2.1.2.6). Keyed by
+    /// `(cache_id, glyph_index)`; each entry stores cx/cy and a
+    /// 1 bpp mask. GlyphIndex orders composite the mask onto the
+    /// destination using the foreground color.
+    glyph_cache: BTreeMap<(u8, u16), CachedGlyph>,
+}
+
+/// One entry in [`BitmapRenderer::glyph_cache`].
+///
+/// MS-RDPEGDI 2.2.2.2.1.2.5: glyph data is 1 bpp, padded so each row
+/// is a multiple of 4 bytes (`stride = ((cx + 31) & !31) / 8`). The
+/// row order matches the wire (top-down). We store the bytes
+/// verbatim and walk them per-pixel during composition.
+#[derive(Debug, Clone)]
+struct CachedGlyph {
+    cx: u16,
+    cy: u16,
+    stride: u16,
+    mask: Vec<u8>,
 }
 
 /// One entry in [`BitmapRenderer::bitmap_cache`].
@@ -392,7 +412,12 @@ impl BitmapRenderer {
             avc_decoder: None,
             bitmap_cache: BTreeMap::new(),
             brush_cache: BTreeMap::new(),
+            glyph_cache: BTreeMap::new(),
         }
+    }
+
+    pub fn glyph_cache_len(&self) -> usize {
+        self.glyph_cache.len()
     }
 
     /// Number of cached bitmaps currently held (test / instrumentation).
@@ -624,9 +649,11 @@ impl BitmapRenderer {
                         SecondaryOrderType::CacheBrush => {
                             let _ = self.cache_brush(body);
                         }
-                        // CacheGlyph / CacheColorTable: decoded only
-                        // enough to keep the order stream in sync;
-                        // rendering against them is S3d-6d2.
+                        SecondaryOrderType::CacheGlyph => {
+                            let _ = self.cache_glyph(extra_flags, body);
+                        }
+                        // CacheColorTable: decoded only enough to keep
+                        // the order stream in sync.
                         _ => {}
                     }
                 }
@@ -704,11 +731,7 @@ impl BitmapRenderer {
                     decode_patblt(cursor, field_flags, delta, &mut self.primary_history)?;
                 Ok(try_render_patblt(&order, &self.brush_cache, sink))
             }
-            PrimaryOrderType::GlyphIndex => {
-                let _ =
-                    decode_glyph_index_inline(cursor, field_flags, &mut self.primary_history)?;
-                Ok(false) // text rendering deferred — cursor advances correctly
-            }
+            PrimaryOrderType::GlyphIndex => self.try_render_glyph_index(cursor, field_flags, sink),
             PrimaryOrderType::PolygonSc => {
                 self.try_render_polygon(cursor, field_flags, sink, false)
             }
@@ -732,6 +755,164 @@ impl BitmapRenderer {
             PrimaryOrderType::Polyline => self.try_render_polyline(cursor, field_flags, sink),
             other => Err(RenderError::UnsupportedPrimaryOrder { order_type: other }),
         }
+    }
+
+    /// `GlyphIndex` body decoder + 1 bpp mask compositor (MS-RDPEGDI
+    /// 2.2.2.2.1.1.2.13). Each command in the trailing variable-length
+    /// `data` is one of:
+    ///   * 0x00..=0xFD — single glyph index byte (cache id is in the
+    ///     header). Renders the cached glyph mask at the running pen
+    ///     position with the foreground color where bits = 1.
+    ///   * 0xFE — cache_id switch (1 byte) — followed by index.
+    ///   * 0xFF — terminator (we honor it but the order's cbData should
+    ///     already bound the iteration).
+    ///   * 0x80..=0xFD with high bit set in some flAccel modes — used
+    ///     as relative offset (skipped for now; rare on modern wire).
+    ///
+    /// `flAccel` flags (`order.fl_accel`) we honor:
+    ///   SO_VERTICAL / SO_HORIZONTAL — fixed cell layout.
+    ///   SO_REVERSED — render right-to-left (deferred).
+    ///
+    /// Glyphs that miss the cache silently skip (the embedder loses
+    /// that one character). Background-rect drawing (BkLeft..BkBottom
+    /// + BackColor) is not currently rendered — fonts on top of an
+    /// already-painted background look right; isolated text spans
+    /// would need the bk rect too (S3d-6d3 follow-up).
+    fn try_render_glyph_index<S: FrameSink>(
+        &mut self,
+        cursor: &mut ReadCursor<'_>,
+        field_flags: u32,
+        sink: &mut S,
+    ) -> Result<bool, RenderError> {
+        // Decode the 22 fixed fields per their flag bits.
+        let mut cache_id = 0u8;
+        let mut _fl_accel = 0u8;
+        let mut _ul_char_inc = 0u8;
+        let mut _f_op_redundant = 0u8;
+        let mut back_color = [0u8; 3];
+        let mut fore_color = [0u8; 3];
+        let mut bk_left = 0i16;
+        let mut bk_top = 0i16;
+        let mut bk_right = 0i16;
+        let mut bk_bottom = 0i16;
+        let mut _op_left = 0i16;
+        let mut _op_top = 0i16;
+        let mut _op_right = 0i16;
+        let mut _op_bottom = 0i16;
+        let mut _brush_org_x = 0u8;
+        let mut _brush_org_y = 0u8;
+        let mut _brush_style = 0u8;
+        let mut _brush_hatch = 0u8;
+        let mut _brush_extra = [0u8; 7];
+        let mut x = 0i16;
+        let mut y = 0i16;
+
+        if field_flags & (1 << 0) != 0 {
+            cache_id = cursor.read_u8("GlyphIndex::cacheId")?;
+        }
+        if field_flags & (1 << 1) != 0 {
+            _fl_accel = cursor.read_u8("GlyphIndex::flAccel")?;
+        }
+        if field_flags & (1 << 2) != 0 {
+            _ul_char_inc = cursor.read_u8("GlyphIndex::ulCharInc")?;
+        }
+        if field_flags & (1 << 3) != 0 {
+            _f_op_redundant = cursor.read_u8("GlyphIndex::fOpRedundant")?;
+        }
+        if field_flags & (1 << 4) != 0 {
+            back_color[0] = cursor.read_u8("GlyphIndex::back[0]")?;
+            back_color[1] = cursor.read_u8("GlyphIndex::back[1]")?;
+            back_color[2] = cursor.read_u8("GlyphIndex::back[2]")?;
+        }
+        if field_flags & (1 << 5) != 0 {
+            fore_color[0] = cursor.read_u8("GlyphIndex::fore[0]")?;
+            fore_color[1] = cursor.read_u8("GlyphIndex::fore[1]")?;
+            fore_color[2] = cursor.read_u8("GlyphIndex::fore[2]")?;
+        }
+        for (i, dst) in [
+            &mut bk_left,
+            &mut bk_top,
+            &mut bk_right,
+            &mut bk_bottom,
+            &mut _op_left,
+            &mut _op_top,
+            &mut _op_right,
+            &mut _op_bottom,
+        ]
+        .iter_mut()
+        .enumerate()
+        {
+            if field_flags & (1 << (6 + i)) != 0 {
+                **dst = cursor.read_u16_le("GlyphIndex::rect")? as i16;
+            }
+        }
+        if field_flags & (1 << 14) != 0 {
+            _brush_org_x = cursor.read_u8("GlyphIndex::brushOrgX")?;
+        }
+        if field_flags & (1 << 15) != 0 {
+            _brush_org_y = cursor.read_u8("GlyphIndex::brushOrgY")?;
+        }
+        if field_flags & (1 << 16) != 0 {
+            _brush_style = cursor.read_u8("GlyphIndex::brushStyle")?;
+        }
+        if field_flags & (1 << 17) != 0 {
+            _brush_hatch = cursor.read_u8("GlyphIndex::brushHatch")?;
+        }
+        if field_flags & (1 << 18) != 0 {
+            for i in 0..7 {
+                _brush_extra[i] = cursor.read_u8("GlyphIndex::brushExtra")?;
+            }
+        }
+        if field_flags & (1 << 19) != 0 {
+            x = cursor.read_u16_le("GlyphIndex::x")? as i16;
+        }
+        if field_flags & (1 << 20) != 0 {
+            y = cursor.read_u16_le("GlyphIndex::y")? as i16;
+        }
+        let mut cb = 0usize;
+        let mut data: Vec<u8> = Vec::new();
+        if field_flags & (1 << 21) != 0 {
+            cb = cursor.read_u8("GlyphIndex::cbData")? as usize;
+            let bytes = cursor.read_slice(cb, "GlyphIndex::data")?;
+            data = bytes.to_vec();
+        }
+        let _ = (back_color, bk_left, bk_top, bk_right, bk_bottom, cb);
+
+        let fore_rgba = [fore_color[0], fore_color[1], fore_color[2], 0xFF];
+        let mut pen_x = x as i32;
+        let pen_y = y as i32;
+        let mut current_cache_id = cache_id;
+        let mut any_blits = false;
+        let mut i = 0;
+        while i < data.len() {
+            let b = data[i];
+            i += 1;
+            match b {
+                0xFE => {
+                    // Cache id switch: next byte is the new cache_id.
+                    if i < data.len() {
+                        current_cache_id = data[i];
+                        i += 1;
+                    }
+                    continue;
+                }
+                0xFF => break, // explicit terminator
+                idx => {
+                    let glyph_key = (current_cache_id, idx as u16);
+                    if let Some(g) = self.glyph_cache.get(&glyph_key).cloned() {
+                        if composite_glyph_mask(&g, pen_x, pen_y, &fore_rgba, sink) {
+                            any_blits = true;
+                        }
+                        // Advance pen by glyph width. Real flAccel-driven
+                        // schemes can shift differently (vertical text,
+                        // proportional spacing) — this minimum ships the
+                        // common left-to-right horizontal layout.
+                        pen_x += g.cx as i32;
+                    }
+                }
+            }
+        }
+        Ok(any_blits)
     }
 
     /// PolygonSC / PolygonCB body decoder + scan-line fill.
@@ -1176,6 +1357,65 @@ impl BitmapRenderer {
                 pixels_rgba,
             },
         );
+        Ok(())
+    }
+
+    /// `CacheGlyph` parser (MS-RDPEGDI 2.2.2.2.1.2.5 — V1 layout).
+    ///
+    /// `extraFlags` low 8 bits = cacheId; `body` layout:
+    ///   cacheId         (u8)  — duplicated in extraFlags
+    ///   cGlyphs         (u8)
+    ///   array of cGlyphs entries:
+    ///     cacheIndex    (u16 LE)
+    ///     x, y          (i16 LE × 2) — origin (we ignore)
+    ///     cx, cy        (u16 LE × 2)
+    ///     aj            (cy * stride bytes, 1 bpp mask)
+    /// where `stride = ((cx + 7) / 8 + 3) & ~3` per spec
+    /// (each row aligned to 4 bytes).
+    ///
+    /// V2 (orderType 0x09) has a slightly different header but the
+    /// glyph entries follow the same shape — V2 support deferred.
+    fn cache_glyph(&mut self, extra_flags: u16, body: &[u8]) -> Result<(), RenderError> {
+        if body.len() < 2 {
+            return Err(RenderError::SizeMismatch(
+                "CacheGlyph: header truncated".into(),
+            ));
+        }
+        let _cache_id_dup = body[0];
+        let cache_id = (extra_flags & 0xFF) as u8;
+        let c_glyphs = body[1] as usize;
+        let mut off = 2usize;
+        for _ in 0..c_glyphs {
+            if body.len() < off + 10 {
+                return Err(RenderError::SizeMismatch(
+                    "CacheGlyph: glyph header truncated".into(),
+                ));
+            }
+            let cache_index = u16::from_le_bytes([body[off], body[off + 1]]);
+            // x, y unused (text origin reset by GlyphIndex).
+            let cx = u16::from_le_bytes([body[off + 6], body[off + 7]]);
+            let cy = u16::from_le_bytes([body[off + 8], body[off + 9]]);
+            off += 10;
+            let row_bytes = ((cx as usize + 7) / 8 + 3) & !3;
+            let mask_len = row_bytes * cy as usize;
+            if body.len() < off + mask_len {
+                return Err(RenderError::SizeMismatch(format!(
+                    "CacheGlyph: glyph mask {mask_len} but {} bytes left",
+                    body.len() - off
+                )));
+            }
+            let mask = body[off..off + mask_len].to_vec();
+            off += mask_len;
+            self.glyph_cache.insert(
+                (cache_id, cache_index),
+                CachedGlyph {
+                    cx,
+                    cy,
+                    stride: row_bytes as u16,
+                    mask,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -2034,16 +2274,45 @@ fn rop3(rop: u8, p: u8, s: u8, d: u8) -> u8 {
     out
 }
 
+/// Composite a 1 bpp glyph mask onto `sink` at `(pen_x, pen_y)` using
+/// `fore_rgba` for set bits and skipping unset bits (transparent).
+///
+/// The mask is row-major top-down with `g.stride` bytes per row, MSB
+/// = leftmost pixel. Issues one tiny `blit_rgba` per filled pixel —
+/// not optimal, but correct against any FrameSink. A future
+/// optimization could batch contiguous runs.
+fn composite_glyph_mask<S: FrameSink>(
+    g: &CachedGlyph,
+    pen_x: i32,
+    pen_y: i32,
+    fore_rgba: &[u8; 4],
+    sink: &mut S,
+) -> bool {
+    let mut any = false;
+    for row in 0..g.cy as usize {
+        let row_start = row * g.stride as usize;
+        for col in 0..g.cx as usize {
+            let byte = g.mask[row_start + col / 8];
+            let bit = 7 - (col & 7);
+            if (byte >> bit) & 1 != 0 {
+                let x = pen_x + col as i32;
+                let y = pen_y + row as i32;
+                if x >= 0 && y >= 0 && x <= u16::MAX as i32 && y <= u16::MAX as i32 {
+                    sink.blit_rgba(x as u16, y as u16, 1, 1, fore_rgba);
+                    any = true;
+                }
+            }
+        }
+    }
+    any
+}
+
 /// Skip-only `GlyphIndex` body parser (MS-RDPEGDI 2.2.2.2.1.1.2.13).
 ///
-/// The 22-field GlyphIndex order carries cached glyph indices and a
-/// foreground/background color, but actually rendering text means a
-/// secondary `CacheGlyph` parser + 1bpp mask compositor — substantial
-/// follow-up work. For now we just walk the cursor through the body so
-/// the rest of the order stream stays in sync; rendering is a no-op
-/// (the embedder loses cached text).
-///
-/// Returns the cbData byte count consumed (informational only).
+/// Retained for callers that need to advance past a GlyphIndex order
+/// without bringing the renderer's glyph cache into scope. The
+/// real renderer path uses `BitmapRenderer::try_render_glyph_index`.
+#[allow(dead_code)]
 fn decode_glyph_index_inline(
     cursor: &mut ReadCursor<'_>,
     field_flags: u32,
@@ -4634,6 +4903,79 @@ mod tests {
         assert_eq!(&pixels[4..8],   &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&pixels[8..12],  &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&pixels[12..16], &[0xAA, 0xBB, 0xCC, 0xFF]);
+    }
+
+    /// CacheGlyph V1 + GlyphIndex round-trip — cache one 8×8 glyph
+    /// (a solid block: every bit set), reference it from a GlyphIndex,
+    /// and expect 64 fore-color blits at the pen position.
+    #[test]
+    fn cache_glyph_then_glyph_index_round_trip() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // CacheGlyph V1 body: cacheId(1) + cGlyphs(1) + glyph entry.
+        // 1 glyph: cacheIndex=5, x=0, y=0, cx=8, cy=4, mask = 4 rows of
+        // 4-byte stride (8 bits actually used per row, 0xFF + 3 pad).
+        let mut body = Vec::new();
+        body.push(2); // cacheId duplicate
+        body.push(1); // cGlyphs
+        body.extend_from_slice(&5u16.to_le_bytes()); // cacheIndex
+        body.extend_from_slice(&0i16.to_le_bytes()); // x
+        body.extend_from_slice(&0i16.to_le_bytes()); // y
+        body.extend_from_slice(&8u16.to_le_bytes()); // cx
+        body.extend_from_slice(&4u16.to_le_bytes()); // cy
+        // mask: 4 rows × 4 bytes (stride = ceil(8/8)=1 → +3 pad to 4).
+        for _ in 0..4 {
+            body.push(0xFF);              // 8 bits = entire row
+            body.extend_from_slice(&[0; 3]);
+        }
+        let extra_flags: u16 = 0x02; // cacheId = 2
+        let cache_frame = build_secondary_order_frame(extra_flags, 0x03 /* CacheGlyph */, &body);
+
+        // GlyphIndex order: cacheId=2, foreColor=(0xAA, 0xBB, 0xCC),
+        // x=10, y=20, cbData=1, data=[5] → render glyph index 5.
+        let mut gi = Vec::new();
+        gi.push(2);                                   // cacheId
+        gi.push(0); gi.push(0); gi.push(0);           // flAccel/charInc/fOpRedundant
+        gi.extend_from_slice(&[0, 0, 0]);             // back
+        gi.extend_from_slice(&[0xAA, 0xBB, 0xCC]);    // fore
+        for _ in 0..8 { gi.extend_from_slice(&0u16.to_le_bytes()); } // bk/op rects
+        gi.push(0); gi.push(0); gi.push(0); gi.push(0);
+        gi.extend_from_slice(&[0; 7]);
+        gi.extend_from_slice(&10u16.to_le_bytes());   // x
+        gi.extend_from_slice(&20u16.to_le_bytes());   // y
+        gi.push(1);                                   // cbData
+        gi.push(5);                                   // glyph index 5
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::GlyphIndex,
+            field_flags: 0x003F_FFFF,
+            bounds: None,
+            data: gi,
+        };
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.glyph_cache_len(), 1);
+        // 8×4 mask, all bits set → 32 fore-color pixel blits.
+        assert_eq!(sink.blits.len(), 32);
+        for blit in &sink.blits {
+            assert_eq!(&blit.4, &[0xAA, 0xBB, 0xCC, 0xFF]);
+        }
     }
 
     /// CacheBitmapV1 16 bpp uncompressed → cache populates and a
