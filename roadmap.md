@@ -2292,7 +2292,7 @@ pub enum ServerAcceptorState {
 > **11.2a** 최소 동작 서버 (bitmap + input + disconnect) ✅,
 > **11.2b** GFX 인코딩 파이프라인 (RFX / EGFX / ZGFX) ✅,
 > **11.2c** 서버 방향 채널 핸들러 (cliprdr ✅ / rdpsnd ✅ /
-> rdpdr 선택), **11.2d** 풀 핸드셰이크 + 활성 세션 통합 테스트 ✅,
+> rdpdr ✅), **11.2d** 풀 핸드셰이크 + 활성 세션 통합 테스트 ✅,
 > **11.2e** Session Redirection 서버 emit, **11.2f**
 > Auto-Reconnect Cookie 서버 emit. 11.2a 완료 시점부터 각 서브
 > 섹션은 수요에 따라 독립적으로 진행 가능.
@@ -2562,33 +2562,64 @@ register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
       drop; 9건 PDU: ServerAudioFormatsPdu/TrainingPdu encode roundtrip,
       WaveInfoPdu encode, encode_wave_pdu_body)
 
-##### 11.2c-3 -- (선택) rdpdr 서버 방향
+##### 11.2c-3 -- rdpdr 서버 방향
 
 > **requires**: 11.2a, 8.7 rdpdr PDU
 >
-> 데모 시나리오 후순위. IRP 다양성 (file system / printer / smart card /
-> serial / parallel) 으로 가장 무거운 서브섹션. cliprdr/rdpsnd 까지만
-> 구현하고 멈추는 것도 합리적.
+> 4 commit (S1 init / S2 capability / S3 device list + IRP /
+> S4 RdpServer 통합) 으로 분할 구현. 1차 범위는 file system 디바이스
+> 와 CREATE/CLOSE/READ/WRITE IRP -- printer / smart card / serial /
+> parallel / 추가 IRP 는 PDU 레이어가 이미 있으므로 server emit 헬퍼만
+> 늘리면 확장 가능.
 
-- [ ] `FilesystemServer` -- `SvcProcessor` 구현 (server 방향)
-- [ ] `Server Announce Request` (MS-RDPEFS 2.2.2.2) emit
-- [ ] `Client Announce Reply` / `Client Name Request` 수신
-- [ ] `Server Core Capability Request` emit / `Client Core Capability
-      Response` 수신
-- [ ] `Server Client ID Confirm` emit
-- [ ] `Client Device List Announce Request` 수신 -- 디바이스 목록
-      파싱 (DRIVE / PRINT / PORT / SMARTCARD)
-- [ ] `Server Device Announce Response` emit
-- [ ] `Device I/O Request` emit (CREATE/CLOSE/READ/WRITE/QUERY_INFO/
-      SET_INFO/DIRECTORY_CONTROL/LOCK_CONTROL/QUERY_VOLUME_INFO/
-      SET_VOLUME_INFO/DEVICE_CONTROL) -- 우선 CREATE/READ/WRITE/CLOSE
-      만 1차 범위
-- [ ] `Device I/O Completion` 수신 + completion ID 매칭
-- [ ] `RdpServerFilesystemHandler` trait -- `on_device_announce`,
-      `next_io_request()`, `on_io_completion(completion_id, status,
-      data)`
-- [ ] `RdpServer` 통합
-- [ ] 단위 테스트 (PDU roundtrip, 시퀀스 상태 머신, completion ID 매칭)
+- [x] `FilesystemServer` -- `SvcProcessor` / `SvcServerProcessor`
+      구현 (상태 머신 `NotStarted` → `WaitingForClientAnnounce` →
+      `WaitingForClientName` → `WaitingForClientCapability` →
+      `WaitingForDeviceList` → `Active`)
+- [x] `Server Announce Request` (MS-RDPEFS 2.2.2.2) emit -- `start()`
+- [x] `Client Announce Reply` (2.2.2.3) / `Client Name Request`
+      (2.2.2.4) 수신 -- `version_minor` 협상은 `min(server, client)`,
+      `client_id` 는 클라가 재작성 가능
+- [x] `Server Core Capability Request` (2.2.2.7) emit -- 기본
+      `ioCode1 = CREATE/CLOSE/READ/WRITE`, General V2 + Drive V2
+      cap; 재작성 가능 (`config.server_io_code1`) /
+      `Client Core Capability Response` (2.2.2.8) 수신 + 비트와이즈
+      AND intersection 협상
+- [x] `Server Client ID Confirm` (2.2.2.6) emit -- `ClientName` 직후
+      Capability Request 와 한 burst 로 송출
+- [x] `Client Device List Announce Request` (2.2.3.1) 수신 -- raw
+      `DeviceAnnounce` 의 type/id/dosName/deviceData 를
+      `AnnouncedDevice` 로 변환 + `announced_devices()` 에 누적
+      (DRIVE / PRINT / PORT / SMARTCARD 모두 동일 디스패치)
+- [x] `Server Device Announce Response` (2.2.2.1) emit -- 핸들러가
+      반환한 NTSTATUS 를 `result_code` 로; 다중 디바이스 시 디바이스
+      당 한 frame
+- [x] `Device I/O Request` emit (`build_create_request` /
+      `build_close_request` / `build_read_request` /
+      `build_write_request`) -- 1차 범위 CREATE/READ/WRITE/CLOSE 완료;
+      QUERY_INFO/SET_INFO/DIRECTORY_CONTROL/LOCK_CONTROL/
+      QUERY_VOLUME_INFO/SET_VOLUME_INFO/DEVICE_CONTROL 는 추후 확장
+      포인트로 남김 (`config.server_io_code1` 만 키우면 됨)
+- [x] `Device I/O Completion` (2.2.1.5) 수신 + completion ID 매칭 --
+      `inflight: BTreeMap<u32, MajorFunction>` 으로 추적,
+      `MAX_INFLIGHT=4096` soft cap, 알려진 id 만 `IoCompletion` enum
+      (Create/Close/Read/Write) 로 디코드 후 핸들러에 전달; 미지의
+      id 는 `SvcError::Protocol(_)`
+- [x] `RdpServerFilesystemHandler` trait -- `on_client_name` /
+      `on_client_capabilities(io_code1, caps)` /
+      `on_device_announce(&AnnouncedDevice) -> u32 (NTSTATUS)` /
+      `on_io_completion(device_id, completion_id, io_status,
+      IoCompletion)` (`next_io_request()` 패턴은 build_*_request
+      generic API 로 대체)
+- [x] `RdpServer` 통합 -- §11.2c-1 의 generic
+      `ServerActiveStage::register_svc_processor` 위에 그대로 얹힘
+      (cliprdr / rdpsnd 와 동일 패턴; `justrdp-server` 가 rdpdr 에
+      직접 의존하지 않음)
+- [x] 단위 테스트 (24건: 시퀀스 상태 머신 9 + capability 협상 6 +
+      디바이스 list/IRP/completion 9) + 통합 테스트 1건
+      (`handshake_loopback::rdpdr_server_full_handshake_over_active_stage`
+      -- 풀 핸드셰이크 → 채널 등록 → 4-step 시퀀스 → IRP wire shape
+      검증)
 
 #### 11.2d -- Integration Tests
 

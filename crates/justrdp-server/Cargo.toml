@@ -25,3 +25,4 @@ justrdp-svc.workspace = true
 justrdp-connector.workspace = true
 justrdp-cliprdr.workspace = true
 justrdp-rdpsnd.workspace = true
+justrdp-rdpdr.workspace = true

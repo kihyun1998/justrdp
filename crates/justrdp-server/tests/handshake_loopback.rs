@@ -68,6 +68,15 @@ fn rdp_client_config_with_channels() -> Config {
         .build()
 }
 
+/// Same as above but also registers `rdpdr` for the §11.2c-3 server
+/// integration test.
+fn rdp_client_config_with_rdpdr() -> Config {
+    Config::builder("test-user", "test-pass")
+        .security_protocol(SecurityProtocol::RDP)
+        .channel("rdpdr", CHANNEL_OPTION_INITIALIZED)
+        .build()
+}
+
 /// Build a PROTOCOL_RDP-only acceptor config. `require_enhanced_security`
 /// MUST be `false` here since the server is advertising only
 /// `PROTOCOL_RDP`; otherwise the builder rejects the combination as a
@@ -1422,6 +1431,372 @@ fn channel_handlers_roundtrip_over_active_stage() {
         "SoundServer handler MUST receive on_client_formats exactly once"
     );
 }
+
+// ───────────────────────────────────────────────────────────────
+// RDPDR server-direction handshake (§11.2c-3 S4)
+// ───────────────────────────────────────────────────────────────
+
+/// Drive the §11.2c-3 server through the full RDPDR initialization
+/// over a real `ServerActiveStage`:
+///
+/// 1. `register_svc_processor` returns the Server Announce burst.
+/// 2. Synthesizing a `ClientAnnounceReply` + `ClientName` from the
+///    "client" elicits the Capability Request + Client ID Confirm
+///    burst (2 frames).
+/// 3. A `ClientCapability` + `DeviceListAnnounce` pair drives the
+///    server to `Active` and produces a `DeviceReply` per device.
+/// 4. With the server `Active`, an outgoing `Create` IRP frame is
+///    well-formed against the existing client-side decoder.
+///
+/// This is the §11.2c-3 mirror of the cliprdr/rdpsnd test above; it
+/// closes out the roadmap bullet that wires the rdpdr server into
+/// `RdpServer` (`register_svc_processor` is generic, so the only
+/// integration point is the SVC channel name -> processor map and the
+/// negotiated channel id).
+#[test]
+fn rdpdr_server_full_handshake_over_active_stage() {
+    use justrdp_rdpdr::pdu::{
+        capability::{
+            CapabilityRequestPdu, CapabilitySet, ExtendedPdu, ExtraFlags1,
+            GeneralCapabilitySet, IoCode1, RDPDR_MAJOR_RDP_VERSION,
+        },
+        device::{DeviceAnnounce, DeviceAnnounceResponsePdu, DeviceListAnnouncePdu},
+        header::{Component, PacketId, SharedHeader},
+        init::{ClientAnnounceReply, ClientNameRequest, VersionPdu},
+        irp::{DeviceIoRequest, IrpRequest, MajorFunction, MinorFunction},
+    };
+    use justrdp_rdpdr::{
+        AnnouncedDevice, FilesystemServer, IoCompletion, RdpServerFilesystemHandler,
+    };
+
+    let client = ClientConnector::new(rdp_client_config_with_rdpdr());
+    let acceptor = ServerAcceptor::new(rdp_only_acceptor_config());
+    let (client, acceptor) = drive_full_handshake(client, acceptor);
+
+    let result = match acceptor.state() {
+        ServerAcceptorState::Accepted { result } => result.clone(),
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    let client_result = client.result().expect("Connected implies result");
+    let rdpdr_id = result
+        .channel_ids
+        .iter()
+        .find(|(n, _)| n == "rdpdr")
+        .map(|(_, id)| *id)
+        .expect("rdpdr channel negotiated");
+    assert_eq!(client_result.channel_ids, result.channel_ids);
+    let user_channel_id = result.user_channel_id;
+
+    let config = justrdp_server::RdpServerConfig::builder()
+        .build()
+        .expect("default RdpServerConfig");
+    let mut active = ServerActiveStage::new(result, config);
+
+    use std::sync::{Arc, Mutex};
+    #[derive(Default)]
+    struct FsState {
+        announces: Vec<AnnouncedDevice>,
+        completions: Vec<(u32, u32, u32, IoCompletion)>,
+    }
+    struct RecordingFsHandler {
+        state: Arc<Mutex<FsState>>,
+    }
+    impl RdpServerFilesystemHandler for RecordingFsHandler {
+        fn on_device_announce(&mut self, device: &AnnouncedDevice) -> u32 {
+            self.state.lock().unwrap().announces.push(device.clone());
+            0 // STATUS_SUCCESS
+        }
+        fn on_io_completion(
+            &mut self,
+            device_id: u32,
+            completion_id: u32,
+            io_status: u32,
+            completion: IoCompletion,
+        ) {
+            self.state.lock().unwrap().completions.push((
+                device_id,
+                completion_id,
+                io_status,
+                completion,
+            ));
+        }
+    }
+    let fs_state = Arc::new(Mutex::new(FsState::default()));
+    let fs_server = FilesystemServer::new(Box::new(RecordingFsHandler {
+        state: fs_state.clone(),
+    }));
+
+    // Hold a shared handle (via raw pointer through the registered Box
+    // is not viable). Instead: re-register-shaped APIs are not exposed,
+    // so we keep a sibling FilesystemServer for the IRP wire-shape
+    // inspection at the end of the test. The registered server still
+    // proves the handshake works end-to-end.
+    let init_frames = active
+        .register_svc_processor(Box::new(fs_server))
+        .expect("register rdpdr server");
+    assert_eq!(init_frames.len(), 1, "rdpdr emits Server Announce only");
+
+    let (ch, payload) = unwrap_server_svc(&init_frames[0]);
+    assert_eq!(ch, rdpdr_id);
+    let mut cursor = ReadCursor::new(&payload);
+    let h = SharedHeader::decode(&mut cursor).unwrap();
+    assert_eq!(h.component, Component::Core);
+    assert_eq!(h.packet_id, PacketId::ServerAnnounce);
+    let announce = VersionPdu::decode(&mut cursor).unwrap();
+    let server_client_id = announce.client_id;
+
+    // ── Synthesize ClientAnnounceReply + ClientName ──
+    let reply = ClientAnnounceReply {
+        version_major: 0x0001,
+        version_minor: 0x000C,
+        client_id: server_client_id,
+    };
+    let mut reply_buf =
+        vec![0u8; SharedHeader::new(Component::Core, PacketId::ClientIdConfirm).size() + reply.size()];
+    {
+        let mut wc = WriteCursor::new(&mut reply_buf);
+        SharedHeader::new(Component::Core, PacketId::ClientIdConfirm)
+            .encode(&mut wc)
+            .unwrap();
+        reply.encode(&mut wc).unwrap();
+    }
+    let mut drop_input = RecordingInput::default();
+    let r1 = active
+        .process(
+            &wrap_client_svc(user_channel_id, rdpdr_id, &reply_buf),
+            &mut drop_input,
+        )
+        .unwrap();
+    assert!(r1.is_empty(), "ClientAnnounceReply produces no immediate emit");
+
+    let name = ClientNameRequest {
+        unicode: true,
+        computer_name: String::from("LOOPBACK"),
+    };
+    let mut name_buf =
+        vec![0u8; SharedHeader::new(Component::Core, PacketId::ClientName).size() + name.size()];
+    {
+        let mut wc = WriteCursor::new(&mut name_buf);
+        SharedHeader::new(Component::Core, PacketId::ClientName)
+            .encode(&mut wc)
+            .unwrap();
+        name.encode(&mut wc).unwrap();
+    }
+    let r2 = active
+        .process(
+            &wrap_client_svc(user_channel_id, rdpdr_id, &name_buf),
+            &mut drop_input,
+        )
+        .unwrap();
+    assert_eq!(r2.len(), 2, "ClientName emits Capability + ClientId Confirm");
+    let frame0 = match &r2[0] {
+        justrdp_server::ActiveStageOutput::SendBytes(b) => b.clone(),
+        other => panic!("expected SendBytes, got {other:?}"),
+    };
+    let frame1 = match &r2[1] {
+        justrdp_server::ActiveStageOutput::SendBytes(b) => b.clone(),
+        other => panic!("expected SendBytes, got {other:?}"),
+    };
+    let (ch0, payload0) = unwrap_server_svc(&frame0);
+    let (ch1, payload1) = unwrap_server_svc(&frame1);
+    assert_eq!(ch0, rdpdr_id);
+    assert_eq!(ch1, rdpdr_id);
+    let h0 = SharedHeader::decode(&mut ReadCursor::new(&payload0)).unwrap();
+    let h1 = SharedHeader::decode(&mut ReadCursor::new(&payload1)).unwrap();
+    assert_eq!(h0.packet_id, PacketId::ServerCapability);
+    assert_eq!(h1.packet_id, PacketId::ClientIdConfirm);
+
+    // ── ClientCapability ──
+    let client_caps = CapabilityRequestPdu::new(vec![CapabilitySet::General(
+        GeneralCapabilitySet {
+            os_type: 0,
+            os_version: 0,
+            protocol_major_version: RDPDR_MAJOR_RDP_VERSION,
+            protocol_minor_version: 0x000C,
+            io_code1: IoCode1::RDPDR_IRP_MJ_CREATE
+                .union(IoCode1::RDPDR_IRP_MJ_CLOSE)
+                .union(IoCode1::RDPDR_IRP_MJ_READ)
+                .union(IoCode1::RDPDR_IRP_MJ_WRITE),
+            extended_pdu: ExtendedPdu::RDPDR_USER_LOGGEDON_PDU,
+            extra_flags1: ExtraFlags1::NONE,
+            special_type_device_cap: Some(0),
+        },
+    )]);
+    let mut caps_buf = vec![
+        0u8;
+        SharedHeader::new(Component::Core, PacketId::ClientCapability).size()
+            + client_caps.size()
+    ];
+    {
+        let mut wc = WriteCursor::new(&mut caps_buf);
+        SharedHeader::new(Component::Core, PacketId::ClientCapability)
+            .encode(&mut wc)
+            .unwrap();
+        client_caps.encode(&mut wc).unwrap();
+    }
+    let r3 = active
+        .process(
+            &wrap_client_svc(user_channel_id, rdpdr_id, &caps_buf),
+            &mut drop_input,
+        )
+        .unwrap();
+    assert!(r3.is_empty(), "ClientCapability has no direct response");
+
+    // ── DeviceListAnnounce: one drive ──
+    let dla = DeviceListAnnouncePdu {
+        devices: vec![DeviceAnnounce::filesystem(99, "C:", Some("Local Disk"))],
+    };
+    let mut dla_buf = vec![
+        0u8;
+        SharedHeader::new(Component::Core, PacketId::DeviceListAnnounce).size() + dla.size()
+    ];
+    {
+        let mut wc = WriteCursor::new(&mut dla_buf);
+        SharedHeader::new(Component::Core, PacketId::DeviceListAnnounce)
+            .encode(&mut wc)
+            .unwrap();
+        dla.encode(&mut wc).unwrap();
+    }
+    let r4 = active
+        .process(
+            &wrap_client_svc(user_channel_id, rdpdr_id, &dla_buf),
+            &mut drop_input,
+        )
+        .unwrap();
+    assert_eq!(r4.len(), 1, "one DeviceReply per announced device");
+    let dr_frame = match &r4[0] {
+        justrdp_server::ActiveStageOutput::SendBytes(b) => b.clone(),
+        other => panic!("expected SendBytes, got {other:?}"),
+    };
+    let (_ch, dr_payload) = unwrap_server_svc(&dr_frame);
+    let mut dr_cur = ReadCursor::new(&dr_payload);
+    let _ = SharedHeader::decode(&mut dr_cur).unwrap();
+    let dr_body = DeviceAnnounceResponsePdu::decode(&mut dr_cur).unwrap();
+    assert_eq!(dr_body.device_id, 99);
+    assert_eq!(dr_body.result_code, 0);
+
+    let s = fs_state.lock().unwrap();
+    assert_eq!(s.announces.len(), 1);
+    assert_eq!(s.announces[0].preferred_dos_name, "C:");
+    drop(s);
+
+    // ── IRP Create wire-shape proof using a sibling server ──
+    //
+    // The registered FilesystemServer is owned by the active stage and
+    // doesn't expose `build_create_request` from outside. Drive a
+    // fresh, deterministically-positioned sibling through the same
+    // handshake on a synthetic transport, then verify a Create IRP
+    // round-trips through the existing client-side decoder.
+    let mut sibling = FilesystemServer::new(Box::new(SilentFsHandler));
+    use justrdp_svc::SvcProcessor;
+    sibling.start().unwrap();
+    sibling
+        .process(&{
+            let mut buf =
+                vec![0u8; SharedHeader::new(Component::Core, PacketId::ClientIdConfirm).size() + 8];
+            let mut wc = WriteCursor::new(&mut buf);
+            SharedHeader::new(Component::Core, PacketId::ClientIdConfirm)
+                .encode(&mut wc)
+                .unwrap();
+            ClientAnnounceReply {
+                version_major: 0x0001,
+                version_minor: 0x000C,
+                client_id: 1,
+            }
+            .encode(&mut wc)
+            .unwrap();
+            buf
+        })
+        .unwrap();
+    sibling
+        .process(&{
+            let n = ClientNameRequest {
+                unicode: true,
+                computer_name: String::from("X"),
+            };
+            let mut buf =
+                vec![0u8; SharedHeader::new(Component::Core, PacketId::ClientName).size() + n.size()];
+            let mut wc = WriteCursor::new(&mut buf);
+            SharedHeader::new(Component::Core, PacketId::ClientName)
+                .encode(&mut wc)
+                .unwrap();
+            n.encode(&mut wc).unwrap();
+            buf
+        })
+        .unwrap();
+    sibling
+        .process(&{
+            let c = CapabilityRequestPdu::new(vec![CapabilitySet::General(
+                GeneralCapabilitySet {
+                    os_type: 0,
+                    os_version: 0,
+                    protocol_major_version: RDPDR_MAJOR_RDP_VERSION,
+                    protocol_minor_version: 0x000C,
+                    io_code1: IoCode1::RDPDR_IRP_MJ_CREATE,
+                    extended_pdu: ExtendedPdu::RDPDR_USER_LOGGEDON_PDU,
+                    extra_flags1: ExtraFlags1::NONE,
+                    special_type_device_cap: Some(0),
+                },
+            )]);
+            let mut buf = vec![
+                0u8;
+                SharedHeader::new(Component::Core, PacketId::ClientCapability).size() + c.size()
+            ];
+            let mut wc = WriteCursor::new(&mut buf);
+            SharedHeader::new(Component::Core, PacketId::ClientCapability)
+                .encode(&mut wc)
+                .unwrap();
+            c.encode(&mut wc).unwrap();
+            buf
+        })
+        .unwrap();
+    sibling
+        .process(&{
+            let dla = DeviceListAnnouncePdu {
+                devices: vec![DeviceAnnounce::filesystem(7, "C:", None)],
+            };
+            let mut buf = vec![
+                0u8;
+                SharedHeader::new(Component::Core, PacketId::DeviceListAnnounce).size() + dla.size()
+            ];
+            let mut wc = WriteCursor::new(&mut buf);
+            SharedHeader::new(Component::Core, PacketId::DeviceListAnnounce)
+                .encode(&mut wc)
+                .unwrap();
+            dla.encode(&mut wc).unwrap();
+            buf
+        })
+        .unwrap();
+    assert!(sibling.is_active());
+
+    let (irp_msg, cid) = sibling
+        .build_create_request(7, 0x8000_0001, 0, 0, 7, 1, 0x0000_0021, "\\test")
+        .unwrap();
+    assert_eq!(cid, 0);
+    let mut irp_cur = ReadCursor::new(&irp_msg.data);
+    let h = SharedHeader::decode(&mut irp_cur).unwrap();
+    assert_eq!(h.packet_id, PacketId::DeviceIoRequest);
+    let req = DeviceIoRequest::decode(&mut irp_cur).unwrap();
+    assert_eq!(req.major_function, MajorFunction::Create);
+    assert_eq!(req.minor_function, MinorFunction::None);
+    assert_eq!(req.device_id, 7);
+    assert_eq!(req.completion_id, 0);
+    let body =
+        IrpRequest::decode_body(req.major_function, req.minor_function, &mut irp_cur).unwrap();
+    match body {
+        IrpRequest::Create(c) => {
+            assert_eq!(c.path, "\\test");
+            assert_eq!(c.create_disposition, 1);
+            assert_eq!(c.create_options, 0x0000_0021);
+        }
+        _ => panic!("expected Create"),
+    }
+}
+
+/// Filesystem handler that does nothing -- used by the sibling server
+/// in the IRP wire-shape verification step.
+struct SilentFsHandler;
+impl justrdp_rdpdr::RdpServerFilesystemHandler for SilentFsHandler {}
 
 // ───────────────────────────────────────────────────────────────
 // GFX pipeline seam smoke test (§11.2d, 4th deliverable)

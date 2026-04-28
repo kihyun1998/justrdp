@@ -38,5 +38,6 @@ pub use backend::{CreateResponse, DeviceIoError, DeviceIoResult, FileHandle, Rdp
 pub use processor::RdpdrClient;
 #[cfg(feature = "alloc")]
 pub use server::{
-    AnnouncedDevice, FilesystemServer, FilesystemServerConfig, RdpServerFilesystemHandler,
+    AnnouncedDevice, FilesystemServer, FilesystemServerConfig, IoCompletion,
+    RdpServerFilesystemHandler,
 };
