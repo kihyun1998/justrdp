@@ -1,0 +1,41 @@
+[package]
+name = "justrdp-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Transport-agnostic web/WASM bindings for JustRDP. Embedders plug in their own transport (WebSocket, WebTransport, gateway, native IPC) via the WebTransport trait."
+keywords = ["rdp", "wasm", "websocket", "remote-desktop", "browser"]
+categories = ["network-programming", "wasm"]
+
+[features]
+default = ["websocket"]
+# Exposes the bundled `WebSocketTransport` (wasm32 + browser only). On
+# non-wasm targets the gate is a no-op because `web-sys`/`wasm-bindgen`
+# are declared only under `[target.'cfg(target_arch = "wasm32")']`.
+websocket = []
+# Reserved for future reference transports. Activating today is a no-op
+# but avoids a breaking-change feature add later.
+webtransport = []
+webrtc-data = []
+
+[dependencies]
+# Trait + error types are alloc-only; no other JustRDP crate is pulled in
+# at S1 to keep the surface minimal. S2 will introduce the connector wrap.
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "CloseEvent",
+    "Event",
+    "MessageEvent",
+    "WebSocket",
+] }
+
+[dev-dependencies]
+pollster = "0.3"
