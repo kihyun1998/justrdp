@@ -21,6 +21,7 @@
 
 extern crate alloc;
 
+mod audio;
 mod clipboard;
 mod driver;
 mod error;
@@ -38,6 +39,7 @@ mod websocket;
 #[cfg(target_arch = "wasm32")]
 mod js;
 
+pub use audio::{AudioChannel, AudioChannelError, AudioFrame, AudioState};
 pub use clipboard::{ClipboardChannel, ClipboardChannelError, ClipboardState};
 pub use driver::{
     CredsspDriver, DriverError, TlsUpgrade, WebClient, MAX_HANDSHAKE_PDU_SIZE,

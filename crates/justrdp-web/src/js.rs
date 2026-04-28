@@ -33,6 +33,7 @@ use justrdp_pdu::x224::SecurityProtocol;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
+use crate::audio::AudioChannel;
 use crate::canvas::CanvasFrameSink;
 use crate::clipboard::ClipboardChannel;
 use crate::driver::WebClient;
@@ -121,6 +122,9 @@ struct JsClientInner {
     /// Clipboard channel router. Auto-attached on `connect()` if the
     /// negotiated channels include `cliprdr`.
     clipboard: Option<ClipboardChannel>,
+    /// Audio (RDPSND) channel router. Auto-attached on `connect()` if
+    /// the negotiated channels include `rdpsnd`.
+    audio: Option<AudioChannel>,
 }
 
 /// Stateful RDP-over-WebSocket client. Hold one per `<canvas>`.
@@ -228,10 +232,12 @@ impl JsClient {
         // it. `from_connection` errors with ChannelNotNegotiated if
         // not — we silently leave clipboard disabled in that case.
         let clipboard = ClipboardChannel::from_connection(&result).ok();
+        let audio = AudioChannel::from_connection(&result).ok();
         let mut g = self.inner.borrow_mut();
         g.session = Some(session);
         g.last_summary = Some(summary.clone());
         g.clipboard = clipboard;
+        g.audio = audio;
         Ok(summary)
     }
 
@@ -290,6 +296,11 @@ impl JsClient {
                         clipboard_responses.extend(frames);
                     }
                 }
+                if let Some(au) = g.audio.as_mut() {
+                    if let Ok(frames) = au.process_channel_data(*channel_id, data) {
+                        clipboard_responses.extend(frames);
+                    }
+                }
             }
             if matches!(event, crate::SessionEvent::Terminated(_)) {
                 terminated = true;
@@ -310,9 +321,10 @@ impl JsClient {
         if !terminated {
             g.session = Some(session);
         } else {
-            // Tear down clipboard with the session — it's tied to a
-            // specific cliprdr channel id from this connection.
+            // Tear down channel routers with the session — both are
+            // tied to specific MCS channel ids from this connection.
             g.clipboard = None;
+            g.audio = None;
         }
         // Sink survives the session — embedders may attach a new session
         // on the same canvas without re-binding it.
@@ -381,6 +393,53 @@ impl JsClient {
             return Err(js_error(msg));
         }
         Ok(())
+    }
+
+    // ── Audio (S6) ────────────────────────────────────────────────
+
+    /// Whether the current session negotiated the `rdpsnd` channel.
+    /// `false` for sessions where the server didn't include it (no
+    /// audio playback available).
+    #[wasm_bindgen(getter, js_name = hasAudio)]
+    pub fn has_audio(&self) -> bool {
+        self.inner.borrow().audio.is_some()
+    }
+
+    /// Drain the next queued audio frame and return it as a JS object:
+    /// `{ sampleRate, channels, bitsPerSample, data: Uint8Array }`.
+    /// Returns `null` when no frame is buffered.
+    ///
+    /// `data` is little-endian PCM bytes — the demo page converts to
+    /// Float32 + feeds an `AudioBuffer` for playback.
+    #[wasm_bindgen(js_name = pollAudioFrame)]
+    pub fn poll_audio_frame(&self) -> JsValue {
+        let frame = match self.inner.borrow_mut().audio.as_mut() {
+            Some(au) => au.take_frame(),
+            None => None,
+        };
+        let Some(frame) = frame else {
+            return JsValue::NULL;
+        };
+        let obj = Object::new();
+        let _ = Reflect::set(
+            &obj,
+            &JsValue::from_str("sampleRate"),
+            &JsValue::from_f64(frame.sample_rate as f64),
+        );
+        let _ = Reflect::set(
+            &obj,
+            &JsValue::from_str("channels"),
+            &JsValue::from_f64(frame.channels as f64),
+        );
+        let _ = Reflect::set(
+            &obj,
+            &JsValue::from_str("bitsPerSample"),
+            &JsValue::from_f64(frame.bits_per_sample as f64),
+        );
+        let arr = js_sys::Uint8Array::new_with_length(frame.data.len() as u32);
+        arr.copy_from(&frame.data);
+        let _ = Reflect::set(&obj, &JsValue::from_str("data"), &arr);
+        obj.into()
     }
 
     /// Drain the most-recently-received `CF_UNICODETEXT` clipboard

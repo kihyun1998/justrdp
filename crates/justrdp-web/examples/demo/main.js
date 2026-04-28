@@ -39,6 +39,12 @@ async function connect() {
     } else {
       log('cliprdr not negotiated — clipboard sync disabled');
     }
+    if (client.hasAudio) {
+      log('rdpsnd negotiated — audio playback active', 'ok');
+      setupAudio();
+    } else {
+      log('rdpsnd not negotiated — audio playback disabled');
+    }
     $('status').textContent = 'connected';
     $('disconnectBtn').disabled = false;
     attachInputListeners();
@@ -60,10 +66,10 @@ async function pollLoop() {
         // Throttle log spam — only print once per 60-frame burst.
         if (Math.random() < 0.02) log(`drew ${blits} rect(s)`);
       }
-      // pollEvents drained any incoming clipboard PDU into the
-      // ClipboardChannel cache; check for new remote text and push
-      // it into the browser's clipboard.
+      // pollEvents drained any incoming clipboard / audio PDUs into
+      // their respective caches; flush both back out.
       await syncClipboardFromRdp();
+      drainAudioFrames();
     } catch (e) {
       log(`poll error: ${e?.message ?? e}`, 'err');
       break;
@@ -75,6 +81,7 @@ async function pollLoop() {
   $('status').textContent = 'idle';
   detachInputListeners();
   detachClipboardListeners();
+  teardownAudio();
   client = null;
 }
 
@@ -236,6 +243,70 @@ function attachClipboardListeners() {
 function detachClipboardListeners() {
   canvas.removeEventListener('focus', onCanvasFocus);
   canvas.removeEventListener('keydown', onCopyShortcut);
+}
+
+// ── Audio playback ──────────────────────────────────────────────────
+
+let audioCtx = null;
+/// Schedule each AudioBuffer back-to-back from this offset; advance as
+/// frames are queued so they play sequentially without gaps.
+let audioNextStart = 0;
+
+function setupAudio() {
+  if (audioCtx) return;
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioNextStart = audioCtx.currentTime;
+  } catch (e) {
+    log(`audio context init failed: ${e?.message ?? e}`, 'err');
+  }
+}
+
+function teardownAudio() {
+  if (audioCtx) {
+    try { audioCtx.close(); } catch {}
+    audioCtx = null;
+    audioNextStart = 0;
+  }
+}
+
+/// Convert a PCM16-LE byte buffer (interleaved channels) into an
+/// AudioBuffer and schedule it for immediate playback.
+function playPcm16Frame(frame) {
+  if (!audioCtx) return;
+  const samples = frame.data.length / 2 / frame.channels;
+  if (samples === 0) return;
+  const buf = audioCtx.createBuffer(frame.channels, samples, frame.sampleRate);
+  // PCM16LE → Float32 ([-1.0, 1.0]).
+  const view = new DataView(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
+  for (let ch = 0; ch < frame.channels; ch++) {
+    const out = buf.getChannelData(ch);
+    for (let i = 0; i < samples; i++) {
+      const sample = view.getInt16((i * frame.channels + ch) * 2, /*littleEndian*/ true);
+      out[i] = sample / 32768;
+    }
+  }
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  // Schedule at the running offset; if the queue ran dry, snap to
+  // currentTime so we don't try to start in the past.
+  const startAt = Math.max(audioNextStart, audioCtx.currentTime + 0.01);
+  src.start(startAt);
+  audioNextStart = startAt + buf.duration;
+}
+
+function drainAudioFrames() {
+  if (!client?.hasAudio || !audioCtx) return;
+  let drained = 0;
+  while (drained < 8) {
+    const frame = client.pollAudioFrame();
+    if (!frame) break;
+    if (frame.bitsPerSample === 16) {
+      playPcm16Frame(frame);
+    }
+    drained++;
+  }
 }
 
 (async function bootstrap() {

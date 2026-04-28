@@ -28,6 +28,7 @@ justrdp-pdu.workspace = true
 justrdp-session = { workspace = true, features = ["alloc"] }
 justrdp-graphics = { workspace = true, features = ["alloc"] }
 justrdp-cliprdr = { workspace = true, features = ["alloc"] }
+justrdp-rdpsnd = { workspace = true, features = ["alloc"] }
 justrdp-svc = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
