@@ -38,6 +38,12 @@ use justrdp_graphics::{BitsPerPixel, RleDecompressor, RleError};
 use justrdp_pdu::rdp::bitmap::{
     TsBitmapData, TsUpdateBitmapData, BITMAP_COMPRESSION,
 };
+use justrdp_pdu::rdp::drawing_orders::{
+    decode_dstblt, decode_lineto, decode_memblt, decode_opaque_rect, decode_patblt, decode_scrblt,
+    OpaqueRectOrder, PrimaryOrderHistory, PrimaryOrderType, ALT_SECONDARY_ORDER_HEADER_SIZE,
+    ORDER_TYPE_CHANGE, TS_BOUNDS, TS_DELTA_COORDINATES, TS_SECONDARY, TS_STANDARD,
+    TS_ZERO_BOUNDS_DELTAS, TS_ZERO_FIELD_BYTE_BIT0, TS_ZERO_FIELD_BYTE_BIT1,
+};
 use justrdp_pdu::rdp::fast_path::FastPathUpdateType;
 use justrdp_pdu::rdp::surface_commands::{BitmapDataEx, SurfaceCommand, SURFACECMD_FRAMEACTION_END};
 
@@ -68,6 +74,13 @@ pub enum RenderError {
     /// RemoteFX TileSet referenced a quant index outside the table the
     /// same TileSet declared.
     RfxQuantIndexOutOfRange { quant_idx: u8, num_quants: u8 },
+    /// A Drawing Order's `controlFlags` did not match any known class
+    /// (Primary / Secondary / Alternate Secondary).
+    UnknownOrderClass { control_flags: u8 },
+    /// A Primary order referenced a type the renderer can't advance the
+    /// cursor for. The order stream is unrecoverable from this point —
+    /// the caller should drop the rest of the batch.
+    UnsupportedPrimaryOrder { order_type: PrimaryOrderType },
 }
 
 impl core::fmt::Display for RenderError {
@@ -93,6 +106,14 @@ impl core::fmt::Display for RenderError {
             } => write!(
                 f,
                 "RFX tile quant_idx {quant_idx} ≥ TileSet num_quants {num_quants}"
+            ),
+            Self::UnknownOrderClass { control_flags } => write!(
+                f,
+                "drawing order controlFlags 0x{control_flags:02X} matches no known class"
+            ),
+            Self::UnsupportedPrimaryOrder { order_type } => write!(
+                f,
+                "primary drawing order {order_type:?} not yet supported by the order walker"
             ),
         }
     }
@@ -187,6 +208,16 @@ pub struct BitmapRenderer {
     /// RFX entropy mode last seen on a TS_RFX_CONTEXT block. Defaults
     /// to RLGR1; tests and unsigned-frame streams can override.
     rfx_entropy: RlgrMode,
+    /// Per-type Primary Drawing Order field history (delta encoding,
+    /// type-change suppression, zero-field byte optimization). MUST
+    /// persist across orders within a session to correctly reconstruct
+    /// fields that the server elides.
+    primary_history: PrimaryOrderHistory,
+    /// Last Primary order type seen — used when a controlFlags byte
+    /// does NOT carry the TS_TYPE_CHANGE bit (the server is reusing
+    /// the previous order type to save a byte). Initial value matches
+    /// MS-RDPEGDI 3.2.1.1 (PatBlt).
+    last_primary_type: PrimaryOrderType,
 }
 
 impl Default for BitmapRenderer {
@@ -196,12 +227,14 @@ impl Default for BitmapRenderer {
 }
 
 impl BitmapRenderer {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             palette: None,
             last_frame_id: None,
             rfx_codec_id: None,
             rfx_entropy: RlgrMode::Rlgr1,
+            primary_history: PrimaryOrderHistory::new(),
+            last_primary_type: PrimaryOrderType::PatBlt,
         }
     }
 
@@ -267,11 +300,149 @@ impl BitmapRenderer {
                 Ok(any)
             }
             FastPathUpdateType::SurfaceCommands => self.process_surface_commands(data, sink),
+            FastPathUpdateType::Orders => self.process_orders(data, sink),
             // Synchronize is plumbing — accept silently.
             FastPathUpdateType::Synchronize => Ok(false),
             other => Err(RenderError::Unsupported {
                 update_code: *other,
             }),
+        }
+    }
+
+    /// Walk a `FASTPATH_UPDATETYPE_ORDERS` payload (MS-RDPEGDI 2.2.2.2):
+    /// `numberOrders (u16 LE) + N drawing orders`.
+    ///
+    /// S3d-4 renders Primary OpaqueRect orders to the sink (single-color
+    /// filled rectangles — the most common GDI primitive). All other
+    /// Primary types and every Secondary / Alternate Secondary order
+    /// are decoded only enough to advance the cursor; the renderer
+    /// returns an `Unsupported*` error if it can't safely skip past one,
+    /// since silently dropping mid-stream desynchronises the
+    /// `PrimaryOrderHistory` for everything that follows.
+    fn process_orders<S: FrameSink>(
+        &mut self,
+        payload: &[u8],
+        sink: &mut S,
+    ) -> Result<bool, RenderError> {
+        let mut cursor = ReadCursor::new(payload);
+        let number_orders = cursor.read_u16_le("Orders::numberOrders")? as usize;
+        let mut any_blits = false;
+        for _ in 0..number_orders {
+            if cursor.remaining() == 0 {
+                break;
+            }
+            let control_flags = cursor.read_u8("DrawingOrder::controlFlags")?;
+            if control_flags & TS_STANDARD == 0 {
+                // TS_STANDARD clear → Alternate Secondary order. Length
+                // prefix follows (u16 LE, total = controlFlags + length
+                // + body), so we can always skip safely without parsing
+                // the body.
+                let order_length =
+                    cursor.read_u16_le("AltSecondaryOrder::orderLength")? as usize;
+                let body_size = order_length
+                    .checked_sub(ALT_SECONDARY_ORDER_HEADER_SIZE - 1)
+                    .ok_or_else(|| {
+                        RenderError::SizeMismatch(format!(
+                            "alt-secondary orderLength too small: {order_length}"
+                        ))
+                    })?;
+                cursor.read_slice(body_size, "AltSecondaryOrder::body")?;
+                continue;
+            }
+            if control_flags & TS_SECONDARY != 0 {
+                // Secondary: orderLength + extraFlags + orderType + body.
+                let order_length =
+                    cursor.read_u16_le("SecondaryOrder::orderLength")? as i32;
+                let _extra_flags = cursor.read_u16_le("SecondaryOrder::extraFlags")?;
+                let _order_type = cursor.read_u8("SecondaryOrder::orderType")?;
+                // Per MS-RDPEGDI: body length = orderLength + 7 - 3 = orderLength + 4
+                let body_len = (order_length + 4) as usize;
+                cursor.read_slice(body_len, "SecondaryOrder::body")?;
+                continue;
+            }
+            // Primary order.
+            if self.process_primary_order(control_flags, &mut cursor, sink)? {
+                any_blits = true;
+            }
+        }
+        Ok(any_blits)
+    }
+
+    /// Decode and (where renderable) blit one Primary drawing order.
+    ///
+    /// `control_flags` is the byte already read from the stream. The
+    /// cursor is positioned at `orderType` (when TS_TYPE_CHANGE is set)
+    /// or `fieldFlags` (otherwise).
+    fn process_primary_order<S: FrameSink>(
+        &mut self,
+        control_flags: u8,
+        cursor: &mut ReadCursor<'_>,
+        sink: &mut S,
+    ) -> Result<bool, RenderError> {
+        let order_type = if control_flags & ORDER_TYPE_CHANGE != 0 {
+            let raw = cursor.read_u8("PrimaryOrder::orderType")?;
+            let t = PrimaryOrderType::from_u8(raw)?;
+            self.last_primary_type = t;
+            t
+        } else {
+            self.last_primary_type
+        };
+
+        // Field flags: starts at the per-type max byte count, but each
+        // TS_ZERO_FIELD_BYTE bit drops a trailing-zero byte from the
+        // wire (MS-RDPEGDI 2.2.2.2.1.1.2).
+        let max_ff_bytes = primary_field_flags_byte_count(order_type);
+        let zero_count = ((control_flags & TS_ZERO_FIELD_BYTE_BIT0) != 0) as usize
+            + ((control_flags & TS_ZERO_FIELD_BYTE_BIT1) != 0) as usize;
+        let ff_bytes = max_ff_bytes.saturating_sub(zero_count);
+        let mut field_flags: u32 = 0;
+        for i in 0..ff_bytes {
+            let b = cursor.read_u8("PrimaryOrder::fieldFlags")?;
+            field_flags |= (b as u32) << (i * 8);
+        }
+
+        // Optional bounds: skipped for rendering (the server is just
+        // narrowing the clip rect — we treat the whole desktop as the
+        // clip for now). We still consume the wire bytes so the cursor
+        // stays in sync.
+        if control_flags & TS_BOUNDS != 0 && control_flags & TS_ZERO_BOUNDS_DELTAS == 0 {
+            // Bounds are encoded as a 1-byte present-flags bitmap +
+            // 0..4 fields, each i16 (or i8 delta). Decode via the
+            // typed BoundsRect decoder so the format stays canonical.
+            let _ = justrdp_pdu::rdp::drawing_orders::BoundsRect::decode(cursor)?;
+        }
+
+        let delta = control_flags & TS_DELTA_COORDINATES != 0;
+
+        // Each typed decoder advances the cursor by exactly the right
+        // amount, so unsupported types still stay in sync.
+        match order_type {
+            PrimaryOrderType::OpaqueRect => {
+                let r = decode_opaque_rect(cursor, field_flags, delta, &mut self.primary_history)?;
+                blit_opaque_rect(&r, sink);
+                Ok(true)
+            }
+            PrimaryOrderType::DstBlt => {
+                let _ = decode_dstblt(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(false)
+            }
+            PrimaryOrderType::PatBlt => {
+                let _ = decode_patblt(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(false)
+            }
+            PrimaryOrderType::ScrBlt => {
+                let _ = decode_scrblt(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(false)
+            }
+            PrimaryOrderType::MemBlt => {
+                let _ = decode_memblt(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(false)
+            }
+            PrimaryOrderType::LineTo => {
+                let _ = decode_lineto(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(false)
+            }
+            other => Err(RenderError::UnsupportedPrimaryOrder { order_type: other }),
         }
     }
 
@@ -587,6 +758,61 @@ fn decode_rfx_stream<S: FrameSink>(
         }
     }
     Ok(blits)
+}
+
+/// Field-flags byte count per Primary order type (MS-RDPEGDI 2.2.2.2.1.1.2).
+/// Mirrors the private helper in `justrdp_pdu::rdp::drawing_orders` —
+/// duplicated here because the decoder helpers don't take the byte count
+/// as input, they leave it to the caller.
+fn primary_field_flags_byte_count(order_type: PrimaryOrderType) -> usize {
+    match order_type {
+        PrimaryOrderType::DstBlt
+        | PrimaryOrderType::ScrBlt
+        | PrimaryOrderType::DrawNineGrid
+        | PrimaryOrderType::OpaqueRect
+        | PrimaryOrderType::SaveBitmap
+        | PrimaryOrderType::MultiDstBlt
+        | PrimaryOrderType::Polyline
+        | PrimaryOrderType::PolygonSc
+        | PrimaryOrderType::EllipseSc => 1,
+        PrimaryOrderType::PatBlt
+        | PrimaryOrderType::LineTo
+        | PrimaryOrderType::MemBlt
+        | PrimaryOrderType::MultiDrawNineGrid
+        | PrimaryOrderType::MultiPatBlt
+        | PrimaryOrderType::MultiScrBlt
+        | PrimaryOrderType::MultiOpaqueRect
+        | PrimaryOrderType::FastIndex
+        | PrimaryOrderType::PolygonCb
+        | PrimaryOrderType::FastGlyph
+        | PrimaryOrderType::EllipseCb => 2,
+        PrimaryOrderType::Mem3Blt | PrimaryOrderType::GlyphIndex => 3,
+    }
+}
+
+/// Render an OpaqueRect order: a rectangle filled with one solid color.
+///
+/// `width` / `height` are encoded as the rectangle's pixel dimensions
+/// directly per MS-RDPEGDI 2.2.2.2.1.1.2.5; we clamp negatives to zero
+/// rather than wrapping (the server never sends negative width but the
+/// renderer is defensive).
+fn blit_opaque_rect<S: FrameSink>(order: &OpaqueRectOrder, sink: &mut S) {
+    let w = order.width.max(0) as u16;
+    let h = order.height.max(0) as u16;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let pixels: Vec<u8> = core::iter::repeat([order.red, order.green, order.blue, 0xFF])
+        .take((w as usize) * (h as usize))
+        .flatten()
+        .collect();
+    sink.blit_rgba(
+        order.left.max(0) as u16,
+        order.top.max(0) as u16,
+        w,
+        h,
+        &pixels,
+    );
 }
 
 /// Decode every tile in a TileSet and blit it at its grid position.
@@ -1388,6 +1614,122 @@ mod tests {
         // The encoder snapshot should have updated the renderer's
         // entropy field via the embedded TS_RFX_CONTEXT block.
         assert_eq!(renderer.rfx_entropy, RlgrMode::Rlgr1);
+    }
+
+    // ── Drawing Orders (S3d-4) ─────────────────────────────────────
+
+    /// Build a fast-path Orders payload carrying one OpaqueRect that
+    /// fills `(x, y, w, h)` with `(r, g, b)`. Uses the canonical
+    /// `PrimaryOrder::encode` so the wire shape matches what a real
+    /// server would emit (TS_STANDARD | ORDER_TYPE_CHANGE controlFlags,
+    /// 1-byte fieldFlags=0x7F = all 7 fields present, no bounds).
+    fn build_orders_opaquerect(
+        x: i16, y: i16, w: i16, h: i16, r: u8, g: u8, b: u8,
+    ) -> Vec<u8> {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // OpaqueRect body: 4 coordinate bytes (1 byte each, default
+        // non-delta = i16 LE) + 3 color bytes. With all fields
+        // present the encoder writes them in field order: left, top,
+        // width, height, red, green, blue.
+        let mut body = Vec::with_capacity(4 * 2 + 3);
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.extend_from_slice(&w.to_le_bytes());
+        body.extend_from_slice(&h.to_le_bytes());
+        body.push(r);
+        body.push(g);
+        body.push(b);
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::OpaqueRect,
+            field_flags: 0x7F, // all 7 fields present
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        // numberOrders = 1 (u16 LE)
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        frame
+    }
+
+    #[test]
+    fn orders_opaque_rect_renders_solid_fill() {
+        let payload = build_orders_opaquerect(50, 60, 4, 2, 0xFE, 0xDC, 0xBA);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew, "OpaqueRect should produce one blit");
+        assert_eq!(sink.blits.len(), 1);
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!((*x, *y, *w, *h), (50, 60, 4, 2));
+        assert_eq!(pixels.len(), 4 * 2 * 4);
+        // Every RGBA pixel must equal the OpaqueRect color.
+        for px in pixels.chunks_exact(4) {
+            assert_eq!(px, &[0xFE, 0xDC, 0xBA, 0xFF]);
+        }
+    }
+
+    #[test]
+    fn orders_zero_count_is_a_noop() {
+        // numberOrders=0, no bodies follow.
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: vec![0u8, 0u8],
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(!drew);
+        assert!(sink.blits.is_empty());
+    }
+
+    #[test]
+    fn orders_unsupported_primary_type_surfaces_typed_error() {
+        // PrimaryOrder::encode for a SaveBitmap with no fields → just
+        // the header (control_flags + order_type + 1 byte fieldFlags=0).
+        // We don't render SaveBitmap, but the cursor advance still
+        // works, so this lands as UnsupportedPrimaryOrder.
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::SaveBitmap,
+            field_flags: 0,
+            bounds: None,
+            data: Vec::new(),
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(
+            matches!(err, RenderError::UnsupportedPrimaryOrder { order_type: PrimaryOrderType::SaveBitmap }),
+            "expected UnsupportedPrimaryOrder(SaveBitmap), got {err:?}"
+        );
     }
 
     /// Without `set_rfx_codec_id`, a Surface Bits cmd carrying RFX data
