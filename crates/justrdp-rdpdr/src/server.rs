@@ -33,8 +33,14 @@ use justrdp_svc::{
     RDPDR,
 };
 
+use crate::pdu::capability::{
+    CapabilityRequestPdu, CapabilitySet, ExtendedPdu, ExtraFlags1,
+    GENERAL_CAPABILITY_VERSION_02, GeneralCapabilitySet, IoCode1, RDPDR_MAJOR_RDP_VERSION,
+};
 use crate::pdu::header::{Component, PacketId, SharedHeader};
-use crate::pdu::init::{ClientAnnounceReply, ClientNameRequest, ServerAnnounceRequest};
+use crate::pdu::init::{
+    ClientAnnounceReply, ClientNameRequest, ServerAnnounceRequest, ServerClientIdConfirm,
+};
 
 /// Highest minor version this server speaks. The negotiated minor version
 /// is `min(server_announce.version_minor, client_announce_reply.version_minor)`
@@ -55,9 +61,14 @@ enum FilesystemServerState {
     /// the state machine ignores out-of-order PDUs rather than
     /// erroring (matching the cliprdr/rdpsnd server convention).
     WaitingForClientName,
-    /// Capability negotiation phase. S2 will land Server Capability
-    /// emit and Client Capability decode here.
+    /// Capability negotiation phase. The server has emitted Server
+    /// Core Capability Request + Server Client ID Confirm and is
+    /// awaiting the client's Client Core Capability Response.
     WaitingForClientCapability,
+    /// Capability response received; the server has finalized its
+    /// negotiated I/O code set and is awaiting the Device List Announce
+    /// PDU. S3 will move on from here.
+    WaitingForDeviceList,
 }
 
 /// A device the server intends to drive on behalf of the client side.
@@ -86,15 +97,26 @@ pub struct FilesystemServerConfig {
     pub initial_client_id: u32,
     /// Highest minor version this server is willing to speak.
     pub max_version_minor: u16,
+    /// Major IRPs the server intends to drive. Advertised in the Server
+    /// Core Capability Request `ioCode1` field (MS-RDPEFS 2.2.2.7.1).
+    /// Defaults to CREATE/CLOSE/READ/WRITE -- the §11.2c-3 first-cut
+    /// scope -- callers can widen it for QUERY_INFO / DIRECTORY_CONTROL
+    /// once the IRP encoders ship in S3+.
+    pub server_io_code1: IoCode1,
 }
 
 impl FilesystemServerConfig {
     /// Default config: clientId=1, max minor version=0x000C
-    /// (Windows Server 2012 / latest published spec level).
+    /// (Windows Server 2012 / latest published spec level), IRP set
+    /// CREATE / CLOSE / READ / WRITE.
     pub fn new() -> Self {
         Self {
             initial_client_id: 1,
             max_version_minor: VERSION_MINOR_DEFAULT,
+            server_io_code1: IoCode1::RDPDR_IRP_MJ_CREATE
+                .union(IoCode1::RDPDR_IRP_MJ_CLOSE)
+                .union(IoCode1::RDPDR_IRP_MJ_READ)
+                .union(IoCode1::RDPDR_IRP_MJ_WRITE),
         }
     }
 }
@@ -107,15 +129,30 @@ impl Default for FilesystemServerConfig {
 
 /// Application-side filesystem handler invoked by [`FilesystemServer`].
 ///
-/// S1 only exposes the Client Name notification -- capability,
-/// device-announce, and IO-completion callbacks land in S2/S3. The
-/// trait is `Send` so it can live across async boundaries.
+/// S1/S2 expose name + capability notifications; device-announce and
+/// IO-completion callbacks land in S3. The trait is `Send` so it can
+/// live across async boundaries.
 pub trait RdpServerFilesystemHandler: Send {
     /// Client identified itself with a Client Name Request PDU
     /// (MS-RDPEFS 2.2.2.4). `computer_name` is the decoded ASCII or
     /// UTF-16LE name; `unicode` mirrors the wire UnicodeFlag for
     /// callers that need to know which form was used.
     fn on_client_name(&mut self, _computer_name: &str, _unicode: bool) {}
+
+    /// Client Core Capability Response (MS-RDPEFS 2.2.2.8) arrived.
+    /// `negotiated_io_code1` is the bitwise AND of the server's
+    /// advertised set and the client's reported support -- only IRPs
+    /// in this intersection are guaranteed to round-trip.
+    /// `client_capability_sets` is the raw decoded list (General /
+    /// Printer / Drive / SmartCard / Port) so callers can inspect the
+    /// negotiated General version (V1 vs V2) and any present
+    /// special-type counts.
+    fn on_client_capabilities(
+        &mut self,
+        _negotiated_io_code1: IoCode1,
+        _client_capability_sets: &[CapabilitySet],
+    ) {
+    }
 }
 
 /// Server-side RDPDR SVC channel processor.
@@ -140,6 +177,11 @@ pub struct FilesystemServer {
     /// Most recent Client Name received from the client, retained for
     /// inspection / logging by application code.
     client_computer_name: Option<String>,
+    /// Intersection of the server-advertised IRP set and the client's
+    /// reported support, populated when the Client Core Capability
+    /// Response arrives. Defaults to `IoCode1::from_bits(0)` (no IRP
+    /// guaranteed) before the response lands.
+    negotiated_io_code1: IoCode1,
 }
 
 impl AsAny for FilesystemServer {
@@ -183,6 +225,7 @@ impl FilesystemServer {
             client_id,
             version_minor,
             client_computer_name: None,
+            negotiated_io_code1: IoCode1::from_bits(0),
         }
     }
 
@@ -205,6 +248,13 @@ impl FilesystemServer {
     /// [`RdpServerFilesystemHandler::on_client_name`].
     pub fn client_computer_name(&self) -> Option<&str> {
         self.client_computer_name.as_deref()
+    }
+
+    /// Bitwise intersection of `config.server_io_code1` and the client's
+    /// reported `ioCode1`. Equals `IoCode1::from_bits(0)` until the
+    /// Client Core Capability Response arrives.
+    pub fn negotiated_io_code1(&self) -> IoCode1 {
+        self.negotiated_io_code1
     }
 
     /// Encode `body` framed by the RDPDR shared header.
@@ -230,6 +280,47 @@ impl FilesystemServer {
             client_id: self.config.initial_client_id,
         };
         Self::encode_message(Component::Core, PacketId::ServerAnnounce, &body)
+    }
+
+    /// Build the Server Core Capability Request -- MS-RDPEFS 2.2.2.7.
+    /// Advertises `config.server_io_code1` and the standard extended-PDU
+    /// flags for device removal / display name / user-logged-on
+    /// notifications. Drive cap uses V2 so the client knows the server
+    /// understands the V2 wire form (the PDU only encodes the cap
+    /// header so this is informational).
+    fn build_capability_request(&self) -> SvcResult<SvcMessage> {
+        let general = GeneralCapabilitySet {
+            os_type: 0,
+            os_version: 0,
+            protocol_major_version: RDPDR_MAJOR_RDP_VERSION,
+            protocol_minor_version: self.version_minor,
+            io_code1: self.config.server_io_code1,
+            extended_pdu: ExtendedPdu::RDPDR_DEVICE_REMOVE_PDUS
+                .union(ExtendedPdu::RDPDR_CLIENT_DISPLAY_NAME_PDU)
+                .union(ExtendedPdu::RDPDR_USER_LOGGEDON_PDU),
+            extra_flags1: ExtraFlags1::NONE,
+            // V2 -- carries specialTypeDeviceCap (0 here; the server
+            // doesn't run a smartcard backend in this scope).
+            special_type_device_cap: Some(0),
+        };
+        let caps = CapabilityRequestPdu::new(alloc::vec![
+            CapabilitySet::General(general),
+            CapabilitySet::Drive {
+                version: GENERAL_CAPABILITY_VERSION_02,
+            },
+        ]);
+        Self::encode_message(Component::Core, PacketId::ServerCapability, &caps)
+    }
+
+    /// Build the Server Client ID Confirm -- MS-RDPEFS 2.2.2.6.
+    /// Emitted in the same burst as the Server Capability Request.
+    fn build_client_id_confirm(&self) -> SvcResult<SvcMessage> {
+        let body = ServerClientIdConfirm {
+            version_major: 0x0001,
+            version_minor: self.version_minor,
+            client_id: self.client_id,
+        };
+        Self::encode_message(Component::Core, PacketId::ClientIdConfirm, &body)
     }
 
     /// Dispatch a decoded RDPDR PDU. Out-of-state and unknown PDUs are
@@ -267,13 +358,48 @@ impl FilesystemServer {
                 self.handler.on_client_name(&name.computer_name, name.unicode);
                 self.client_computer_name = Some(name.computer_name);
                 self.state = FilesystemServerState::WaitingForClientCapability;
-                // S2 will emit Server Core Capability Request + Client ID
-                // Confirm here; for S1 we just settle into the wait state.
+                // MS-RDPEFS 1.3.1: server replies to Client Name with its
+                // Capability Request followed by Client ID Confirm. The
+                // two PDUs are emitted as a burst so the client can pair
+                // them up (RdpdrClient drives both transitions on this
+                // pair).
+                Ok(alloc::vec![
+                    self.build_capability_request()?,
+                    self.build_client_id_confirm()?,
+                ])
+            }
+
+            // Client Core Capability Response -- MS-RDPEFS 2.2.2.8 (same
+            // wire shape as the request: numCaps + cap-set list).
+            (Component::Core, PacketId::ClientCapability) => {
+                if self.state != FilesystemServerState::WaitingForClientCapability {
+                    return Ok(Vec::new());
+                }
+                let resp = CapabilityRequestPdu::decode(body)?;
+                // Negotiate the IRP intersection. The General set carries
+                // the client's ioCode1; absence of a General set means the
+                // client advertised nothing -- treat it as the empty set.
+                let client_io_code1 = resp
+                    .capabilities
+                    .iter()
+                    .find_map(|c| match c {
+                        CapabilitySet::General(g) => Some(g.io_code1),
+                        _ => None,
+                    })
+                    .unwrap_or(IoCode1::from_bits(0));
+                self.negotiated_io_code1 = IoCode1::from_bits(
+                    self.config.server_io_code1.bits() & client_io_code1.bits(),
+                );
+                self.handler.on_client_capabilities(
+                    self.negotiated_io_code1,
+                    &resp.capabilities,
+                );
+                self.state = FilesystemServerState::WaitingForDeviceList;
                 Ok(Vec::new())
             }
 
             _ => {
-                // Drop unexpected / S2+ PDUs silently. They will be wired
+                // Drop unexpected / S3+ PDUs silently. They will be wired
                 // into handle_pdu as later sub-stages land.
                 Ok(Vec::new())
             }
@@ -320,6 +446,7 @@ mod tests {
     #[derive(Default, Debug)]
     struct HandlerState {
         names: Vec<(String, bool)>,
+        cap_calls: Vec<(IoCode1, Vec<CapabilitySet>)>,
     }
 
     struct MockHandler {
@@ -340,6 +467,18 @@ mod tests {
                 .unwrap()
                 .names
                 .push((computer_name.into(), unicode));
+        }
+
+        fn on_client_capabilities(
+            &mut self,
+            negotiated_io_code1: IoCode1,
+            client_capability_sets: &[CapabilitySet],
+        ) {
+            self.state
+                .lock()
+                .unwrap()
+                .cap_calls
+                .push((negotiated_io_code1, client_capability_sets.to_vec()));
         }
     }
 
@@ -398,6 +537,7 @@ mod tests {
             FilesystemServerConfig {
                 initial_client_id: 7,
                 max_version_minor: 0x000C,
+                ..FilesystemServerConfig::new()
             },
         );
         server.start().unwrap();
@@ -425,6 +565,7 @@ mod tests {
             FilesystemServerConfig {
                 initial_client_id: 1,
                 max_version_minor: 0x000A,
+                ..FilesystemServerConfig::new()
             },
         );
         server.start().unwrap();
@@ -463,7 +604,8 @@ mod tests {
         let resp = server
             .process(&encode_with_header(PacketId::ClientName, &name))
             .unwrap();
-        assert!(resp.is_empty(), "S1 has no S2 emits yet");
+        // S2: ClientName triggers Server Capability + Client ID Confirm.
+        assert_eq!(resp.len(), 2);
 
         let s = state.lock().unwrap();
         assert_eq!(s.names.len(), 1);
@@ -492,9 +634,10 @@ mod tests {
             unicode: false,
             computer_name: String::from("OLDPC"),
         };
-        server
+        let resp = server
             .process(&encode_with_header(PacketId::ClientName, &name))
             .unwrap();
+        assert_eq!(resp.len(), 2, "S2 burst follows ClientName");
 
         let s = state.lock().unwrap();
         assert_eq!(s.names[0].0, "OLDPC");
@@ -565,5 +708,239 @@ mod tests {
             .unwrap();
         assert!(resp.is_empty());
         assert!(state.lock().unwrap().names.is_empty());
+    }
+
+    // ── S2 ── Server Capability burst + Client Capability response ──
+
+    fn drive_to_capability_phase(server: &mut FilesystemServer) -> Vec<SvcMessage> {
+        server.start().unwrap();
+        server
+            .process(&encode_with_header(
+                PacketId::ClientIdConfirm,
+                &ClientAnnounceReply {
+                    version_major: 0x0001,
+                    version_minor: 0x000C,
+                    client_id: 1,
+                },
+            ))
+            .unwrap();
+        server
+            .process(&encode_with_header(
+                PacketId::ClientName,
+                &ClientNameRequest {
+                    unicode: true,
+                    computer_name: String::from("PC"),
+                },
+            ))
+            .unwrap()
+    }
+
+    #[test]
+    fn client_name_emits_capability_request_then_clientid_confirm() {
+        let (mut server, _state) = new_server();
+        let burst = drive_to_capability_phase(&mut server);
+        assert_eq!(burst.len(), 2);
+
+        let h0 = decode_header(&burst[0]);
+        assert_eq!(h0.component, Component::Core);
+        assert_eq!(
+            h0.packet_id,
+            PacketId::ServerCapability,
+            "Capability Request emits first"
+        );
+
+        let h1 = decode_header(&burst[1]);
+        assert_eq!(h1.packet_id, PacketId::ClientIdConfirm);
+
+        // Capability Request body parses cleanly and carries the
+        // configured ioCode1 plus a Drive cap entry.
+        let mut cursor = ReadCursor::new(&burst[0].data);
+        let _ = SharedHeader::decode(&mut cursor).unwrap();
+        let caps = CapabilityRequestPdu::decode(&mut cursor).unwrap();
+        let general = caps.capabilities.iter().find_map(|c| match c {
+            CapabilitySet::General(g) => Some(g.clone()),
+            _ => None,
+        });
+        let general = general.expect("server emits a General cap set");
+        assert_eq!(
+            general.io_code1,
+            IoCode1::RDPDR_IRP_MJ_CREATE
+                .union(IoCode1::RDPDR_IRP_MJ_CLOSE)
+                .union(IoCode1::RDPDR_IRP_MJ_READ)
+                .union(IoCode1::RDPDR_IRP_MJ_WRITE)
+        );
+        assert!(caps
+            .capabilities
+            .iter()
+            .any(|c| matches!(c, CapabilitySet::Drive { .. })));
+    }
+
+    #[test]
+    fn capability_request_uses_negotiated_minor_version() {
+        // Negotiated minor (the min of server/client) must propagate
+        // into the General cap's protocolMinorVersion field.
+        let (handler, _state) = MockHandler::new();
+        let mut server = FilesystemServer::with_config(
+            Box::new(handler),
+            FilesystemServerConfig {
+                initial_client_id: 1,
+                max_version_minor: 0x000C,
+                ..FilesystemServerConfig::new()
+            },
+        );
+        server.start().unwrap();
+        server
+            .process(&encode_with_header(
+                PacketId::ClientIdConfirm,
+                &ClientAnnounceReply {
+                    version_major: 0x0001,
+                    version_minor: 0x000A, // forces negotiation down
+                    client_id: 1,
+                },
+            ))
+            .unwrap();
+        let burst = server
+            .process(&encode_with_header(
+                PacketId::ClientName,
+                &ClientNameRequest {
+                    unicode: true,
+                    computer_name: String::from("PC"),
+                },
+            ))
+            .unwrap();
+
+        let mut cursor = ReadCursor::new(&burst[0].data);
+        let _ = SharedHeader::decode(&mut cursor).unwrap();
+        let caps = CapabilityRequestPdu::decode(&mut cursor).unwrap();
+        let general = caps.capabilities.iter().find_map(|c| match c {
+            CapabilitySet::General(g) => Some(g.clone()),
+            _ => None,
+        });
+        assert_eq!(general.unwrap().protocol_minor_version, 0x000A);
+    }
+
+    #[test]
+    fn client_capability_response_negotiates_io_code_intersection() {
+        let (mut server, state) = new_server();
+        drive_to_capability_phase(&mut server);
+
+        // Client supports CREATE+READ+QUERY_INFO; server advertises
+        // CREATE+CLOSE+READ+WRITE -> intersection = CREATE+READ.
+        let client_caps = CapabilityRequestPdu::new(alloc::vec![
+            CapabilitySet::General(GeneralCapabilitySet {
+                os_type: 0,
+                os_version: 0,
+                protocol_major_version: RDPDR_MAJOR_RDP_VERSION,
+                protocol_minor_version: 0x000C,
+                io_code1: IoCode1::RDPDR_IRP_MJ_CREATE
+                    .union(IoCode1::RDPDR_IRP_MJ_READ)
+                    .union(IoCode1::RDPDR_IRP_MJ_QUERY_INFORMATION),
+                extended_pdu: ExtendedPdu::RDPDR_USER_LOGGEDON_PDU,
+                extra_flags1: ExtraFlags1::NONE,
+                special_type_device_cap: Some(0),
+            }),
+            CapabilitySet::Drive {
+                version: GENERAL_CAPABILITY_VERSION_02,
+            },
+        ]);
+        let resp = server
+            .process(&encode_with_header(PacketId::ClientCapability, &client_caps))
+            .unwrap();
+        assert!(resp.is_empty(), "S2 has no immediate emit on cap response");
+
+        let expected = IoCode1::RDPDR_IRP_MJ_CREATE.union(IoCode1::RDPDR_IRP_MJ_READ);
+        assert_eq!(server.negotiated_io_code1(), expected);
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.cap_calls.len(), 1);
+        assert_eq!(s.cap_calls[0].0, expected);
+        // Handler also receives the raw cap list -- contains General + Drive.
+        assert!(matches!(s.cap_calls[0].1[0], CapabilitySet::General(_)));
+        assert!(matches!(s.cap_calls[0].1[1], CapabilitySet::Drive { .. }));
+    }
+
+    #[test]
+    fn client_capability_response_without_general_set_zeroes_intersection() {
+        // MS-RDPEFS 2.2.2.8 mandates a General set, but a buggy client
+        // could omit it. Treat absence as the empty set rather than
+        // erroring -- matches the cliprdr 'no Caps PDU' degradation.
+        let (mut server, _state) = new_server();
+        drive_to_capability_phase(&mut server);
+
+        let client_caps = CapabilityRequestPdu::new(alloc::vec![CapabilitySet::Drive {
+            version: GENERAL_CAPABILITY_VERSION_02,
+        }]);
+        server
+            .process(&encode_with_header(PacketId::ClientCapability, &client_caps))
+            .unwrap();
+        assert_eq!(server.negotiated_io_code1(), IoCode1::from_bits(0));
+    }
+
+    #[test]
+    fn client_capability_pre_state_dropped() {
+        // ClientCapability before ClientName must be silently dropped.
+        let (mut server, state) = new_server();
+        server.start().unwrap();
+        server
+            .process(&encode_with_header(
+                PacketId::ClientIdConfirm,
+                &ClientAnnounceReply {
+                    version_major: 0x0001,
+                    version_minor: 0x000C,
+                    client_id: 1,
+                },
+            ))
+            .unwrap();
+        // Skip ClientName entirely -> still in WaitingForClientName.
+        let client_caps = CapabilityRequestPdu::new(alloc::vec![]);
+        let resp = server
+            .process(&encode_with_header(PacketId::ClientCapability, &client_caps))
+            .unwrap();
+        assert!(resp.is_empty());
+        assert!(state.lock().unwrap().cap_calls.is_empty());
+        assert_eq!(server.negotiated_io_code1(), IoCode1::from_bits(0));
+    }
+
+    #[test]
+    fn duplicate_client_capability_dropped() {
+        let (mut server, state) = new_server();
+        drive_to_capability_phase(&mut server);
+
+        let first = CapabilityRequestPdu::new(alloc::vec![CapabilitySet::General(
+            GeneralCapabilitySet {
+                os_type: 0,
+                os_version: 0,
+                protocol_major_version: RDPDR_MAJOR_RDP_VERSION,
+                protocol_minor_version: 0x000C,
+                io_code1: IoCode1::RDPDR_IRP_MJ_CREATE,
+                extended_pdu: ExtendedPdu::RDPDR_USER_LOGGEDON_PDU,
+                extra_flags1: ExtraFlags1::NONE,
+                special_type_device_cap: Some(0),
+            },
+        )]);
+        server
+            .process(&encode_with_header(PacketId::ClientCapability, &first))
+            .unwrap();
+
+        // Second response: server must NOT re-dispatch (state advanced).
+        let second = CapabilityRequestPdu::new(alloc::vec![CapabilitySet::General(
+            GeneralCapabilitySet {
+                os_type: 0,
+                os_version: 0,
+                protocol_major_version: RDPDR_MAJOR_RDP_VERSION,
+                protocol_minor_version: 0x000C,
+                io_code1: IoCode1::RDPDR_IRP_MJ_WRITE,
+                extended_pdu: ExtendedPdu::RDPDR_USER_LOGGEDON_PDU,
+                extra_flags1: ExtraFlags1::NONE,
+                special_type_device_cap: Some(0),
+            },
+        )]);
+        server
+            .process(&encode_with_header(PacketId::ClientCapability, &second))
+            .unwrap();
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.cap_calls.len(), 1, "second cap response is dropped");
+        assert_eq!(s.cap_calls[0].0, IoCode1::RDPDR_IRP_MJ_CREATE);
     }
 }
