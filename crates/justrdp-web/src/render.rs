@@ -681,6 +681,17 @@ impl BitmapRenderer {
                     decode_patblt(cursor, field_flags, delta, &mut self.primary_history)?;
                 Ok(try_render_patblt(&order, sink))
             }
+            PrimaryOrderType::GlyphIndex => {
+                let _ =
+                    decode_glyph_index_inline(cursor, field_flags, &mut self.primary_history)?;
+                Ok(false) // text rendering deferred — cursor advances correctly
+            }
+            PrimaryOrderType::PolygonSc => {
+                self.try_render_polygon(cursor, field_flags, sink, false)
+            }
+            PrimaryOrderType::PolygonCb => {
+                self.try_render_polygon(cursor, field_flags, sink, true)
+            }
             PrimaryOrderType::ScrBlt => {
                 let _ = decode_scrblt(cursor, field_flags, delta, &mut self.primary_history)?;
                 Ok(false)
@@ -698,6 +709,146 @@ impl BitmapRenderer {
             PrimaryOrderType::Polyline => self.try_render_polyline(cursor, field_flags, sink),
             other => Err(RenderError::UnsupportedPrimaryOrder { order_type: other }),
         }
+    }
+
+    /// PolygonSC / PolygonCB body decoder + scan-line fill.
+    ///
+    /// Field layout (7 fields for SC, 13 for CB):
+    ///   1. xStart (coord)
+    ///   2. yStart (coord)
+    ///   3. bRop2 (u8) — ignored
+    ///   4. fillMode (u8) — ALTERNATE = 1, WINDING = 2; treated identically
+    ///   5. brushColor (3 bytes BGR) — fill color
+    ///   6. nDeltaEntries (u8)
+    ///   7. CodedDeltaList (cbData u16 + per-vertex (dx, dy) signed pairs)
+    ///
+    /// CB (Polygon with brush) has 6 additional fields between (5) and
+    /// (6): backColor + brush_org + brush_style + brush_hatch + brush_extra.
+    /// We don't render the brush yet — fall back to a solid `brushColor`
+    /// fill so the silhouette is correct even if the textured pattern
+    /// is missing.
+    fn try_render_polygon<S: FrameSink>(
+        &mut self,
+        cursor: &mut ReadCursor<'_>,
+        field_flags: u32,
+        sink: &mut S,
+        is_cb: bool,
+    ) -> Result<bool, RenderError> {
+        // SC and CB share the first five fields; CB inserts 6 brush
+        // fields before nDeltaEntries / CodedDeltaList.
+        let mut bit = 0u32;
+        let mut next_flag = || {
+            let m = 1u32 << bit;
+            bit += 1;
+            m
+        };
+        let (xs_flag, ys_flag, _rop2_flag, fill_flag, brush_color_flag) = (
+            next_flag(),
+            next_flag(),
+            next_flag(),
+            next_flag(),
+            next_flag(),
+        );
+        let (back_color_flag, brush_org_x_flag, brush_org_y_flag, brush_style_flag, brush_hatch_flag, brush_extra_flag);
+        if is_cb {
+            back_color_flag = next_flag();
+            brush_org_x_flag = next_flag();
+            brush_org_y_flag = next_flag();
+            brush_style_flag = next_flag();
+            brush_hatch_flag = next_flag();
+            brush_extra_flag = next_flag();
+        } else {
+            back_color_flag = 0;
+            brush_org_x_flag = 0;
+            brush_org_y_flag = 0;
+            brush_style_flag = 0;
+            brush_hatch_flag = 0;
+            brush_extra_flag = 0;
+        }
+        let n_entries_flag = next_flag();
+        let coded_list_flag = next_flag();
+
+        let xs = if field_flags & xs_flag != 0 {
+            decode_coord_field_inline(cursor, false)?
+        } else {
+            0
+        };
+        let ys = if field_flags & ys_flag != 0 {
+            decode_coord_field_inline(cursor, false)?
+        } else {
+            0
+        };
+        if field_flags & _rop2_flag != 0 {
+            cursor.read_u8("Polygon::bRop2")?;
+        }
+        if field_flags & fill_flag != 0 {
+            cursor.read_u8("Polygon::fillMode")?;
+        }
+        let mut brush_color = [0u8; 3];
+        if field_flags & brush_color_flag != 0 {
+            brush_color[0] = cursor.read_u8("Polygon::brushColor[0]")?;
+            brush_color[1] = cursor.read_u8("Polygon::brushColor[1]")?;
+            brush_color[2] = cursor.read_u8("Polygon::brushColor[2]")?;
+        }
+        if is_cb {
+            // 3 bytes back_color, 1 byte org_x, 1 byte org_y, 1 byte
+            // brush_style, 1 byte brush_hatch, 7 bytes brush_extra —
+            // each gated by its own flag. We don't render the brush;
+            // just consume the bytes.
+            if field_flags & back_color_flag != 0 {
+                cursor.read_u8("Polygon::backColor[0]")?;
+                cursor.read_u8("Polygon::backColor[1]")?;
+                cursor.read_u8("Polygon::backColor[2]")?;
+            }
+            if field_flags & brush_org_x_flag != 0 {
+                cursor.read_u8("Polygon::brushOrgX")?;
+            }
+            if field_flags & brush_org_y_flag != 0 {
+                cursor.read_u8("Polygon::brushOrgY")?;
+            }
+            if field_flags & brush_style_flag != 0 {
+                cursor.read_u8("Polygon::brushStyle")?;
+            }
+            if field_flags & brush_hatch_flag != 0 {
+                cursor.read_u8("Polygon::brushHatch")?;
+            }
+            if field_flags & brush_extra_flag != 0 {
+                for _ in 0..7 {
+                    cursor.read_u8("Polygon::brushExtra")?;
+                }
+            }
+        }
+        let n_entries = if field_flags & n_entries_flag != 0 {
+            cursor.read_u8("Polygon::nDeltaEntries")? as usize
+        } else {
+            0
+        };
+
+        // Walk the deltas to recover absolute vertex positions.
+        let mut verts: Vec<(i32, i32)> = Vec::with_capacity(n_entries + 1);
+        verts.push((xs as i32, ys as i32));
+        if field_flags & coded_list_flag != 0 {
+            let cb = cursor.read_u16_le("Polygon::cbData")? as usize;
+            let bytes = cursor.read_slice(cb, "Polygon::codedDelta")?;
+            let mut bcur = bytes;
+            let mut x = xs as i32;
+            let mut y = ys as i32;
+            for _ in 0..n_entries {
+                let (dx, rest) = read_two_byte_signed(bcur)?;
+                let (dy, rest) = read_two_byte_signed(rest)?;
+                bcur = rest;
+                x += dx as i32;
+                y += dy as i32;
+                verts.push((x, y));
+            }
+        }
+
+        if verts.len() < 3 {
+            return Ok(false);
+        }
+        let fill_color_rgba = [brush_color[2], brush_color[1], brush_color[0], 0xFF];
+        scanline_fill_polygon(&verts, &fill_color_rgba, sink);
+        Ok(true)
     }
 
     /// Polyline body decoder + render (MS-RDPEGDI 2.2.2.2.1.1.2.18).
@@ -874,6 +1025,7 @@ impl BitmapRenderer {
         }
         let payload = &cur[..length as usize];
 
+        const PIXEL_BPP_24: u8 = 0x05;
         let pixels_rgba = match (compressed, bpp_code) {
             (false, PIXEL_BPP_32) => {
                 let expected = width as usize * height as usize * 4;
@@ -881,6 +1033,13 @@ impl BitmapRenderer {
                     return Ok(());
                 }
                 bgra_to_rgba(payload)
+            }
+            (false, PIXEL_BPP_24) => {
+                let expected = width as usize * height as usize * 3;
+                if payload.len() != expected {
+                    return Ok(());
+                }
+                bgr_top_down_to_rgba(payload, width, height)
             }
             (false, PIXEL_BPP_16) => {
                 let expected = width as usize * height as usize * 2;
@@ -898,9 +1057,14 @@ impl BitmapRenderer {
                     .decompress(payload, width, height, BitsPerPixel::Bpp16, &mut raw)?;
                 rgb565_top_down_to_rgba(&raw, width, height)
             }
-            // 8 / 24 / non-32 uncompressed and any other compressed
-            // bpp: skip silently. Tracked under S3d-6c2 follow-up
-            // (full bpp coverage) and S3d-6c3 (CacheBitmapV1 / V3).
+            (true, PIXEL_BPP_24) => {
+                let mut raw = Vec::new();
+                RleDecompressor::new()
+                    .decompress(payload, width, height, BitsPerPixel::Bpp24, &mut raw)?;
+                bgr_top_down_to_rgba(&raw, width, height)
+            }
+            // 8 bpp would need a Palette PDU; CacheBitmapV1 / V3 use
+            // different layouts. Tracked under S3d-6c5.
             _ => return Ok(()),
         };
         self.bitmap_cache.insert(
@@ -915,25 +1079,21 @@ impl BitmapRenderer {
     }
 
     /// MemBlt: blit a sub-region of a cached bitmap into the surface.
-    /// We support `SRCCOPY` (`bRop = 0xCC`) only — the common case for
-    /// straight bitmap copies. Other ROPs require destination read-back
-    /// (tracked as S3d-6h).
+    /// SRCCOPY (`0xCC`) is the fast path (no destination read-back).
+    /// Other ROPs run through the [`rop3`] evaluator using the cached
+    /// bitmap as `S`, the destination read via [`FrameSink::peek_rgba`]
+    /// as `D`, and `P = 0xFF` (no pattern for MemBlt). When `peek_rgba`
+    /// is unsupported the blit silently drops to avoid corrupting the
+    /// display.
     fn try_render_memblt<S: FrameSink>(
         &mut self,
         order: &MemBltOrder,
         sink: &mut S,
     ) -> bool {
-        const ROP3_SRCCOPY: u8 = 0xCC;
-        if order.rop != ROP3_SRCCOPY {
-            return false;
-        }
-        // Cache id: only the low 8 bits are used. (Spec uses 3 bits for
-        // V2 cache, 8 bits for V3, but the field is decoded into u16
-        // by `decode_memblt`.) Mask to fit our cache key.
         let cache_id = (order.cache_id & 0xFF) as u8;
         let entry = match self.bitmap_cache.get(&(cache_id, order.cache_index)) {
-            Some(e) => e,
-            None => return false, // cache miss → silent drop
+            Some(e) => e.clone(), // brief clone to release self-borrow before sink.blit
+            None => return false,
         };
         let w = order.width.max(0) as u16;
         let h = order.height.max(0) as u16;
@@ -942,25 +1102,46 @@ impl BitmapRenderer {
         }
         let src_x = order.src_left.max(0) as u16;
         let src_y = order.src_top.max(0) as u16;
-        // Clamp to the cached bitmap's extents.
         let copy_w = w.min(entry.width.saturating_sub(src_x));
         let copy_h = h.min(entry.height.saturating_sub(src_y));
         if copy_w == 0 || copy_h == 0 {
             return false;
         }
+        let dest_left = order.left.max(0) as u16;
+        let dest_top = order.top.max(0) as u16;
+
+        // Source pixels: crop the cached bitmap to (src_x, src_y, copy_w × copy_h).
         let row_stride = entry.width as usize * 4;
-        let mut out = Vec::with_capacity(copy_w as usize * copy_h as usize * 4);
+        let mut src = Vec::with_capacity(copy_w as usize * copy_h as usize * 4);
         for row in 0..copy_h as usize {
             let off = (src_y as usize + row) * row_stride + src_x as usize * 4;
-            out.extend_from_slice(&entry.pixels_rgba[off..off + copy_w as usize * 4]);
+            src.extend_from_slice(&entry.pixels_rgba[off..off + copy_w as usize * 4]);
         }
-        sink.blit_rgba(
-            order.left.max(0) as u16,
-            order.top.max(0) as u16,
-            copy_w,
-            copy_h,
-            &out,
-        );
+
+        const ROP3_SRCCOPY: u8 = 0xCC;
+        if order.rop == ROP3_SRCCOPY {
+            sink.blit_rgba(dest_left, dest_top, copy_w, copy_h, &src);
+            return true;
+        }
+
+        // RMW: pull existing destination, evaluate ROP3 per channel.
+        let mut dst = Vec::new();
+        if !sink.peek_rgba(dest_left, dest_top, copy_w, copy_h, &mut dst) {
+            return false;
+        }
+        if dst.len() != src.len() {
+            return false;
+        }
+        let mut out = Vec::with_capacity(src.len());
+        for (s_px, d_px) in src.chunks_exact(4).zip(dst.chunks_exact(4)) {
+            // P=0xFF (no pattern for MemBlt). Apply the ROP per RGB channel;
+            // alpha is held at 0xFF (RDP surfaces don't carry a real alpha).
+            out.push(rop3(order.rop, 0xFF, s_px[0], d_px[0]));
+            out.push(rop3(order.rop, 0xFF, s_px[1], d_px[1]));
+            out.push(rop3(order.rop, 0xFF, s_px[2], d_px[2]));
+            out.push(0xFF);
+        }
+        sink.blit_rgba(dest_left, dest_top, copy_w, copy_h, &out);
         true
     }
 
@@ -1559,6 +1740,165 @@ fn primary_field_flags_byte_count(order_type: PrimaryOrderType) -> usize {
     }
 }
 
+/// ROP3 (MS-RDPEGDI 2.2.2.2.1.1.1.7) general truth-table evaluator.
+///
+/// The `rop` byte's 8 bits define the output for each of 8 input
+/// combinations of (P, S, D) ∈ {0,1}³. The lookup index is
+/// `(P << 2) | (S << 1) | D`, so:
+///
+/// ```text
+///   bit 0 → output for (P=0, S=0, D=0)
+///   bit 7 → output for (P=1, S=1, D=1)
+/// ```
+///
+/// We evaluate per-bit across the 8 bits of each channel byte so the
+/// same code handles SRCCOPY (0xCC = `D := S`), SRCAND (0x88 = `D := S
+/// & D`), PATPAINT (0xFB = `D := (~S) | P | D`), DSTINVERT (0x55 =
+/// `D := ~D`), and the rest of the 256 codes uniformly.
+fn rop3(rop: u8, p: u8, s: u8, d: u8) -> u8 {
+    let mut out = 0u8;
+    for bit in 0..8 {
+        let mask = 1u8 << bit;
+        let pb = ((p & mask) != 0) as u8;
+        let sb = ((s & mask) != 0) as u8;
+        let db = ((d & mask) != 0) as u8;
+        let idx = (pb << 2) | (sb << 1) | db;
+        if rop & (1u8 << idx) != 0 {
+            out |= mask;
+        }
+    }
+    out
+}
+
+/// Skip-only `GlyphIndex` body parser (MS-RDPEGDI 2.2.2.2.1.1.2.13).
+///
+/// The 22-field GlyphIndex order carries cached glyph indices and a
+/// foreground/background color, but actually rendering text means a
+/// secondary `CacheGlyph` parser + 1bpp mask compositor — substantial
+/// follow-up work. For now we just walk the cursor through the body so
+/// the rest of the order stream stays in sync; rendering is a no-op
+/// (the embedder loses cached text).
+///
+/// Returns the cbData byte count consumed (informational only).
+fn decode_glyph_index_inline(
+    cursor: &mut ReadCursor<'_>,
+    field_flags: u32,
+    _history: &mut PrimaryOrderHistory,
+) -> Result<usize, RenderError> {
+    // Field 1..4: cacheId, flAccel, ulCharInc, fOpRedundant (u8 each).
+    for i in 0..4 {
+        if field_flags & (1u32 << i) != 0 {
+            cursor.read_u8("GlyphIndex::headerByte")?;
+        }
+    }
+    // Field 5..6: BackColor, ForeColor (3 bytes each).
+    for i in 4..6 {
+        if field_flags & (1u32 << i) != 0 {
+            cursor.read_u8("GlyphIndex::color[0]")?;
+            cursor.read_u8("GlyphIndex::color[1]")?;
+            cursor.read_u8("GlyphIndex::color[2]")?;
+        }
+    }
+    // Field 7..14: BkLeft/Top/Right/Bottom + OpLeft/Top/Right/Bottom (i16 each).
+    for i in 6..14 {
+        if field_flags & (1u32 << i) != 0 {
+            cursor.read_u16_le("GlyphIndex::rectField")?;
+        }
+    }
+    // Field 15..16: BrushOrgX, BrushOrgY (u8 each).
+    for i in 14..16 {
+        if field_flags & (1u32 << i) != 0 {
+            cursor.read_u8("GlyphIndex::brushOrg")?;
+        }
+    }
+    // Field 17..18: BrushStyle, BrushHatch (u8 each).
+    for i in 16..18 {
+        if field_flags & (1u32 << i) != 0 {
+            cursor.read_u8("GlyphIndex::brushSel")?;
+        }
+    }
+    // Field 19: BrushExtra (7 bytes).
+    if field_flags & (1u32 << 18) != 0 {
+        for _ in 0..7 {
+            cursor.read_u8("GlyphIndex::brushExtra")?;
+        }
+    }
+    // Field 20..21: x, y (u16 each — TS_GLYPH_INDEX uses unsigned).
+    for i in 19..21 {
+        if field_flags & (1u32 << i) != 0 {
+            cursor.read_u16_le("GlyphIndex::pos")?;
+        }
+    }
+    // Field 22: cbData (u8) + that many trailing bytes of glyph commands.
+    let mut consumed = 0usize;
+    if field_flags & (1u32 << 21) != 0 {
+        let cb = cursor.read_u8("GlyphIndex::cbData")? as usize;
+        cursor.read_slice(cb, "GlyphIndex::variableData")?;
+        consumed = cb;
+    }
+    Ok(consumed)
+}
+
+/// Scan-line polygon fill in `color_rgba`. Standard even-odd / non-
+/// zero algorithm: for each scanline that crosses any edge, gather
+/// x-intersections, sort, fill between each pair. Issues one tiny
+/// `blit_rgba` per filled span.
+fn scanline_fill_polygon<S: FrameSink>(
+    verts: &[(i32, i32)],
+    color_rgba: &[u8; 4],
+    sink: &mut S,
+) {
+    if verts.len() < 3 {
+        return;
+    }
+    let min_y = verts.iter().map(|v| v.1).min().unwrap();
+    let max_y = verts.iter().map(|v| v.1).max().unwrap();
+    let n = verts.len();
+    for y in min_y..=max_y {
+        let mut crossings: Vec<i32> = Vec::new();
+        for i in 0..n {
+            let (x0, y0) = verts[i];
+            let (x1, y1) = verts[(i + 1) % n];
+            // Half-open interval test: include the lower endpoint, exclude upper.
+            let (lo_y, hi_y, lo_x, hi_x) = if y0 < y1 {
+                (y0, y1, x0, x1)
+            } else if y0 > y1 {
+                (y1, y0, x1, x0)
+            } else {
+                continue; // horizontal edge — skip
+            };
+            if y < lo_y || y >= hi_y {
+                continue;
+            }
+            // Linear interpolation; integer-only for simplicity.
+            let t_num = y - lo_y;
+            let t_den = hi_y - lo_y;
+            let x = lo_x + (hi_x - lo_x) * t_num / t_den;
+            crossings.push(x);
+        }
+        crossings.sort_unstable();
+        for chunk in crossings.chunks(2) {
+            if chunk.len() < 2 {
+                break;
+            }
+            let xs = chunk[0].max(0);
+            let xe = chunk[1].min(u16::MAX as i32);
+            if xs >= xe {
+                continue;
+            }
+            if y < 0 || y > u16::MAX as i32 {
+                continue;
+            }
+            let span = (xe - xs) as u16;
+            let pixels: Vec<u8> = core::iter::repeat(*color_rgba)
+                .take(span as usize)
+                .flatten()
+                .collect();
+            sink.blit_rgba(xs as u16, y as u16, span, 1, &pixels);
+        }
+    }
+}
+
 /// `TWO_BYTE_SIGNED_ENCODING` (MS-RDPEGDI 2.2.2.2.1.1.1.4):
 ///   byte0.bit7  = sign (1 → negative)
 ///   byte0.bit6  = "long" flag (1 → 14-bit value across 2 bytes)
@@ -1663,6 +2003,23 @@ fn bgra_to_rgba(pixels: &[u8]) -> Vec<u8> {
     rgba
 }
 
+/// Top-down BGR (24 bpp) → top-down RGBA (alpha = 0xFF). Used by the
+/// CacheBitmapV2 24-bpp path (cache convention is top-down).
+fn bgr_top_down_to_rgba(src: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let stride = width as usize * 3;
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in 0..height as usize {
+        let row_bytes = &src[row * stride..(row + 1) * stride];
+        for px in row_bytes.chunks_exact(3) {
+            out.push(px[2]);
+            out.push(px[1]);
+            out.push(px[0]);
+            out.push(0xFF);
+        }
+    }
+    out
+}
+
 /// Top-down RGB565 (LE u16) → top-down RGBA (alpha = 0xFF). Mirrors
 /// [`flip_and_convert_rgb565`] but skips the row flip — used for
 /// CacheBitmapV2 entries which are stored top-down by spec.
@@ -1746,36 +2103,139 @@ const ROP3_PATCOPY: u8 = 0xF0;
 const ROP3_BLACKNESS: u8 = 0x00;
 const ROP3_WHITENESS: u8 = 0xFF;
 
-/// Render the renderable subset of PatBlt: `BS_SOLID` brush + `PATCOPY`
-/// ROP, which fills a rectangle with the foreground color. Returns
-/// `true` if a blit was issued, `false` for everything else (the
-/// embedder loses these draws — most are textured fills that need a
-/// brush cache; a follow-up commit can add `BS_PATTERN` support once
-/// the Secondary `CacheBrush` order is decoded).
+/// `BS_PATTERN` brush style (8×8 monochrome inline pattern carried in
+/// `brush_hatch` + `brush_extra`).
+const BS_PATTERN: u8 = 0x03;
+
+/// Render PatBlt covering both `BS_SOLID` and `BS_PATTERN` brush styles,
+/// for both PATCOPY (no read-back) and the read-modify-write ROPs
+/// (PATPAINT, PATINVERT, …) via [`rop3`] + [`FrameSink::peek_rgba`].
+///
+/// For an 8×8 monochrome `BS_PATTERN`, the pattern data lives inline in
+/// the PatBlt order itself (`brush_hatch` is the first byte = top row,
+/// `brush_extra` holds the remaining 7 rows). Each pattern bit picks
+/// foreground (1) or background (0) for that pixel position before the
+/// ROP3 mixes it with the existing destination.
 fn try_render_patblt<S: FrameSink>(order: &PatBltOrder, sink: &mut S) -> bool {
-    if order.brush_style != BS_SOLID || order.rop != ROP3_PATCOPY {
-        return false;
-    }
     let w = order.width.max(0) as u16;
     let h = order.height.max(0) as u16;
     if w == 0 || h == 0 {
         return false;
     }
-    let r = order.fore_color[0];
-    let g = order.fore_color[1];
-    let b = order.fore_color[2];
-    let pixels: Vec<u8> = core::iter::repeat([r, g, b, 0xFF])
-        .take((w as usize) * (h as usize))
-        .flatten()
-        .collect();
-    sink.blit_rgba(
-        order.left.max(0) as u16,
-        order.top.max(0) as u16,
-        w,
-        h,
-        &pixels,
-    );
+    let dest_left = order.left.max(0) as u16;
+    let dest_top = order.top.max(0) as u16;
+
+    // Build the pattern source pixels (P) for the rect. For BS_SOLID
+    // every pixel is fore_color; for BS_PATTERN we tile the 8×8
+    // monochrome pattern starting from the brush origin.
+    let pattern_pixels = match order.brush_style {
+        BS_SOLID => {
+            // Cheap-out: don't actually allocate the buffer; we pass
+            // fore_color directly into rop3 for each pixel.
+            None
+        }
+        BS_PATTERN => Some(build_patblt_pattern(order, w, h)),
+        _ => return false,
+    };
+
+    if order.rop == ROP3_PATCOPY {
+        // No destination read-back needed.
+        let mut out = Vec::with_capacity(w as usize * h as usize * 4);
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let bit_set = pattern_bit(order, &pattern_pixels, col, row);
+                let (r, g, b) = if bit_set || order.brush_style == BS_SOLID {
+                    (order.fore_color[0], order.fore_color[1], order.fore_color[2])
+                } else {
+                    (order.back_color[0], order.back_color[1], order.back_color[2])
+                };
+                out.push(r);
+                out.push(g);
+                out.push(b);
+                out.push(0xFF);
+            }
+        }
+        sink.blit_rgba(dest_left, dest_top, w, h, &out);
+        return true;
+    }
+
+    // RMW path: read destination, evaluate ROP3 per channel with
+    // P = (pattern bit ? fore : back), S = 0 (PatBlt has no source).
+    let mut dst = Vec::new();
+    if !sink.peek_rgba(dest_left, dest_top, w, h, &mut dst) {
+        return false;
+    }
+    let mut out = Vec::with_capacity(dst.len());
+    let mut idx = 0;
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            let bit_set = pattern_bit(order, &pattern_pixels, col, row);
+            let (pr, pg, pb) = if bit_set || order.brush_style == BS_SOLID {
+                (order.fore_color[0], order.fore_color[1], order.fore_color[2])
+            } else {
+                (order.back_color[0], order.back_color[1], order.back_color[2])
+            };
+            let dr = dst[idx];
+            let dg = dst[idx + 1];
+            let db = dst[idx + 2];
+            out.push(rop3(order.rop, pr, 0, dr));
+            out.push(rop3(order.rop, pg, 0, dg));
+            out.push(rop3(order.rop, pb, 0, db));
+            out.push(0xFF);
+            idx += 4;
+        }
+    }
+    sink.blit_rgba(dest_left, dest_top, w, h, &out);
     true
+}
+
+/// Build a per-pixel pattern bitmap (1 byte per pixel: 0 = back, 1 =
+/// fore) for `BS_PATTERN`. We materialize this so the rendering loop
+/// can avoid re-decoding the 8×8 pattern row index per pixel.
+fn build_patblt_pattern(order: &PatBltOrder, w: u16, h: u16) -> Vec<u8> {
+    let mut p = Vec::with_capacity(w as usize * h as usize);
+    let rows = [
+        order.brush_hatch,
+        order.brush_extra[0],
+        order.brush_extra[1],
+        order.brush_extra[2],
+        order.brush_extra[3],
+        order.brush_extra[4],
+        order.brush_extra[5],
+        order.brush_extra[6],
+    ];
+    let ox = (order.brush_org_x as i32).rem_euclid(8) as usize;
+    let oy = (order.brush_org_y as i32).rem_euclid(8) as usize;
+    for row in 0..h as usize {
+        let pat_row = rows[(row + oy) & 7];
+        for col in 0..w as usize {
+            // Top-most bit (0x80) corresponds to the leftmost column.
+            let bit = 7 - ((col + ox) & 7);
+            p.push((pat_row >> bit) & 1);
+        }
+    }
+    p
+}
+
+/// Look up the pattern bit for `(col, row)` inside the rect being
+/// painted. For `BS_SOLID` the pattern is unused (we always pick fore).
+fn pattern_bit(
+    order: &PatBltOrder,
+    materialized: &Option<Vec<u8>>,
+    col: usize,
+    row: usize,
+) -> bool {
+    match order.brush_style {
+        BS_SOLID => true,
+        BS_PATTERN => match materialized {
+            Some(p) => {
+                let w = order.width.max(0) as usize;
+                p[row * w + col] != 0
+            }
+            None => true,
+        },
+        _ => true,
+    }
 }
 
 /// DstBlt ROP that XORs every channel — needs destination read-back.
@@ -3711,6 +4171,173 @@ mod tests {
         let drew = renderer.render(&event, &mut sink).unwrap();
         assert!(!drew);
         assert!(sink.blits.is_empty());
+    }
+
+    /// Triangle (3 vertices) PolygonSC — verify scanline fill issues
+    /// at least one row of color blits in the brush color.
+    #[test]
+    fn polygon_sc_triangle_fills_with_brush_color() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // Triangle vertices: (10, 0), (0, 10), (20, 10).
+        // Encode as (xStart=10, yStart=0) + 2 deltas: (-10, 10), (20, 0).
+        let mut delta_list = Vec::new();
+        delta_list.push(0x80 | 10); // dx=-10 short
+        delta_list.push(0x0A);      // dy=+10 short
+        delta_list.push(0x14);      // dx=+20 short
+        delta_list.push(0x00);      // dy=0 short
+        let cb_data = delta_list.len() as u16;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&10i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.push(13);
+        body.push(1);
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        body.push(2);
+        body.extend_from_slice(&cb_data.to_le_bytes());
+        body.extend_from_slice(&delta_list);
+
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::PolygonSc,
+            field_flags: 0x7F,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew, "PolygonSC must produce ≥1 fill blit");
+        assert!(!sink.blits.is_empty());
+        for blit in &sink.blits {
+            for px in blit.4.chunks_exact(4) {
+                assert_eq!(px, &[0xCC, 0xBB, 0xAA, 0xFF]);
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_index_skeleton_advances_cursor_no_render() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        let mut body = Vec::new();
+        body.push(0); // cacheId
+        body.push(0); body.push(0); body.push(0);
+        body.extend_from_slice(&[0, 0, 0]); // BackColor
+        body.extend_from_slice(&[0, 0, 0]); // ForeColor
+        for _ in 0..8 {
+            body.extend_from_slice(&0u16.to_le_bytes());
+        }
+        body.push(0); body.push(0); body.push(0); body.push(0);
+        body.extend_from_slice(&[0; 7]);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.push(0); // cbData
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::GlyphIndex,
+            field_flags: 0x003F_FFFF,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(!drew);
+        assert!(sink.blits.is_empty());
+    }
+
+    #[test]
+    fn rop3_evaluator_truth_table() {
+        assert_eq!(rop3(0xCC, 0x00, 0xAB, 0x00), 0xAB);
+        assert_eq!(rop3(0xCC, 0xFF, 0x12, 0xFF), 0x12);
+        assert_eq!(rop3(0x66, 0x00, 0xF0, 0x0F), 0xFF);
+        assert_eq!(rop3(0xF0, 0x55, 0xAA, 0x12), 0x55);
+        assert_eq!(rop3(0x55, 0x00, 0x00, 0xC3), !0xC3);
+        assert_eq!(rop3(0x00, 0xFF, 0xFF, 0xFF), 0x00);
+        assert_eq!(rop3(0xFF, 0x00, 0x00, 0x00), 0xFF);
+    }
+
+    #[test]
+    fn patblt_pattern_patcopy_checkerboard() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        let pattern_rows: [u8; 8] = [0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55];
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&2i16.to_le_bytes());
+        body.extend_from_slice(&2i16.to_le_bytes());
+        body.push(0xF0);
+        body.extend_from_slice(&[0x11, 0x22, 0x33]);
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        body.push(0); body.push(0);
+        body.push(0x03); // BS_PATTERN
+        body.push(pattern_rows[0]);
+        body.extend_from_slice(&pattern_rows[1..]);
+
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::PatBlt,
+            field_flags: 0x0FFF,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        assert_eq!(sink.blits.len(), 1);
+        let pixels = &sink.blits[0].4;
+        // Row 0 (pattern 0xAA): bit7=1, bit6=0 → fore, back.
+        // Row 1 (pattern 0x55): bit7=0, bit6=1 → back, fore.
+        // Existing PatBlt convention treats fore_color[0..3] as R,G,B
+        // directly (matches `orders_patblt_solid_patcopy_renders_filled_rect`).
+        assert_eq!(&pixels[0..4],   &[0xAA, 0xBB, 0xCC, 0xFF]);
+        assert_eq!(&pixels[4..8],   &[0x11, 0x22, 0x33, 0xFF]);
+        assert_eq!(&pixels[8..12],  &[0x11, 0x22, 0x33, 0xFF]);
+        assert_eq!(&pixels[12..16], &[0xAA, 0xBB, 0xCC, 0xFF]);
     }
 
     /// MemBlt against an empty cache must silently skip — same shape
