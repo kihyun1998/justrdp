@@ -27,6 +27,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use justrdp_core::{Decode, ReadCursor};
+use justrdp_graphics::rfx::rlgr::RlgrMode;
+use justrdp_graphics::rfx::wire::{
+    RfxChannels, RfxCodecVersions, RfxContext, RfxFrameBegin, RfxFrameEnd, RfxRegion, RfxSync,
+    RfxTileSet, WBT_CHANNELS, WBT_CODEC_VERSIONS, WBT_CONTEXT, WBT_EXTENSION, WBT_FRAME_BEGIN,
+    WBT_FRAME_END, WBT_REGION, WBT_SYNC,
+};
+use justrdp_graphics::rfx::{RfxDecoder, RfxError, TILE_COEFFICIENTS, TILE_SIZE};
 use justrdp_graphics::{BitsPerPixel, RleDecompressor, RleError};
 use justrdp_pdu::rdp::bitmap::{
     TsBitmapData, TsUpdateBitmapData, BITMAP_COMPRESSION,
@@ -54,8 +61,13 @@ pub enum RenderError {
     /// has no table to convert the indices with.
     PaletteMissing,
     /// A Surface Command referenced a codec that isn't wired yet
-    /// (RemoteFX / NSCodec / ClearCodec / AVC444 are S3d-3+).
+    /// (NSCodec / ClearCodec / AVC444 are S3d-5).
     UnsupportedCodec { codec_id: u8 },
+    /// RemoteFX decoding failed (RLGR / DWT / size).
+    Rfx(RfxError),
+    /// RemoteFX TileSet referenced a quant index outside the table the
+    /// same TileSet declared.
+    RfxQuantIndexOutOfRange { quant_idx: u8, num_quants: u8 },
 }
 
 impl core::fmt::Display for RenderError {
@@ -74,7 +86,21 @@ impl core::fmt::Display for RenderError {
             Self::UnsupportedCodec { codec_id } => {
                 write!(f, "Surface Command codec 0x{codec_id:02X} not yet supported")
             }
+            Self::Rfx(e) => write!(f, "RFX: {e}"),
+            Self::RfxQuantIndexOutOfRange {
+                quant_idx,
+                num_quants,
+            } => write!(
+                f,
+                "RFX tile quant_idx {quant_idx} ≥ TileSet num_quants {num_quants}"
+            ),
         }
+    }
+}
+
+impl From<RfxError> for RenderError {
+    fn from(e: RfxError) -> Self {
+        Self::Rfx(e)
     }
 }
 
@@ -140,17 +166,27 @@ const PALETTE_ENTRY_COUNT: usize = 256;
 
 /// Stateful renderer.
 ///
-/// Holds protocol state that survives across update batches — currently
-/// the 8 bpp palette table and the latest Frame Marker id; later steps
-/// will add codec contexts (RFX tile cache, NSCodec quantization
-/// tables, …). Use one instance per session; reusing across sessions
-/// risks decoding new traffic against stale palette/codec state.
+/// Holds protocol state that survives across update batches — the 8 bpp
+/// palette table, the latest Frame Marker id, and (when registered) the
+/// RFX entropy mode picked up from `TS_RFX_CONTEXT`. Use one instance
+/// per session; reusing across sessions risks decoding new traffic
+/// against stale palette/codec state.
 #[derive(Debug, Clone)]
 pub struct BitmapRenderer {
     palette: Option<[(u8, u8, u8); PALETTE_ENTRY_COUNT]>,
     /// Most recent Frame Marker id seen (BEGIN or END). Embedders that
     /// want true v-sync can poll this between draws to coalesce updates.
     last_frame_id: Option<u32>,
+    /// codec_id assigned to RemoteFX in the current session. Servers
+    /// pick this dynamically during capability negotiation, so the
+    /// embedder must register it via [`Self::set_rfx_codec_id`] before
+    /// any Surface Command carrying RFX data arrives. Default `None`
+    /// makes any non-zero codec_id surface as
+    /// [`RenderError::UnsupportedCodec`].
+    rfx_codec_id: Option<u8>,
+    /// RFX entropy mode last seen on a TS_RFX_CONTEXT block. Defaults
+    /// to RLGR1; tests and unsigned-frame streams can override.
+    rfx_entropy: RlgrMode,
 }
 
 impl Default for BitmapRenderer {
@@ -164,7 +200,24 @@ impl BitmapRenderer {
         Self {
             palette: None,
             last_frame_id: None,
+            rfx_codec_id: None,
+            rfx_entropy: RlgrMode::Rlgr1,
         }
+    }
+
+    /// Tell the renderer which codec_id to interpret as RemoteFX. Must
+    /// be called before any Surface Command carrying RFX data — the
+    /// codec_id is server-assigned during capability negotiation, so
+    /// the embedder reads it out of [`ConnectionResult::server_capabilities`]
+    /// and forwards it here.
+    ///
+    /// [`ConnectionResult::server_capabilities`]: justrdp_connector::ConnectionResult
+    pub fn set_rfx_codec_id(&mut self, codec_id: u8) {
+        self.rfx_codec_id = Some(codec_id);
+    }
+
+    pub fn rfx_codec_id(&self) -> Option<u8> {
+        self.rfx_codec_id
     }
 
     /// Whether the server has sent a Palette update yet. 8 bpp bitmaps
@@ -243,12 +296,12 @@ impl BitmapRenderer {
             let cmd = SurfaceCommand::decode(&mut cursor)?;
             match cmd {
                 SurfaceCommand::SetSurfaceBits(c) => {
-                    if blit_surface_bits(c.dest_left, c.dest_top, &c.bitmap_data, sink)? {
+                    if self.dispatch_surface_bits(c.dest_left, c.dest_top, &c.bitmap_data, sink)? {
                         any_blits = true;
                     }
                 }
                 SurfaceCommand::StreamSurfaceBits(c) => {
-                    if blit_surface_bits(c.dest_left, c.dest_top, &c.bitmap_data, sink)? {
+                    if self.dispatch_surface_bits(c.dest_left, c.dest_top, &c.bitmap_data, sink)? {
                         any_blits = true;
                     }
                 }
@@ -261,6 +314,26 @@ impl BitmapRenderer {
             }
         }
         Ok(any_blits)
+    }
+
+    /// Per-codec dispatch for one Surface Bits command.
+    fn dispatch_surface_bits<S: FrameSink>(
+        &mut self,
+        dest_left: u16,
+        dest_top: u16,
+        data: &BitmapDataEx,
+        sink: &mut S,
+    ) -> Result<bool, RenderError> {
+        if data.codec_id == 0 {
+            return blit_raw_surface_bits(dest_left, dest_top, data, sink);
+        }
+        if Some(data.codec_id) == self.rfx_codec_id {
+            let blits = decode_rfx_stream(self, dest_left, dest_top, &data.bitmap_data, sink)?;
+            return Ok(blits > 0);
+        }
+        Err(RenderError::UnsupportedCodec {
+            codec_id: data.codec_id,
+        })
     }
 
     fn decode_bitmap_rects(&self, payload: &[u8]) -> Result<Vec<DecodedRect>, RenderError> {
@@ -405,26 +478,14 @@ fn bpp_byte_size(bpp: u16) -> Result<usize, RenderError> {
     }
 }
 
-/// Decode one Surface Bits command's payload and blit it.
-///
-/// Returns `Ok(true)` if a blit was issued, `Ok(false)` if the payload
-/// was empty (zero-byte body — legal but rare).
-///
-/// `codec_id == 0` is the only path wired today: raw, top-down 32 bpp
-/// BGRA pixels (MS-RDPBCGR 2.2.9.2.1.2.1.1). The byte order swap is
-/// done in-place into a fresh RGBA buffer; no row flip because Surface
-/// Commands deliver pixels top-down per spec.
-fn blit_surface_bits<S: FrameSink>(
+/// codec_id == 0 path: raw, top-down 32 bpp BGRA pixels
+/// (MS-RDPBCGR 2.2.9.2.1.2.1.1). BGRA → RGBA byte swap, no row flip.
+fn blit_raw_surface_bits<S: FrameSink>(
     dest_left: u16,
     dest_top: u16,
     data: &BitmapDataEx,
     sink: &mut S,
 ) -> Result<bool, RenderError> {
-    if data.codec_id != 0 {
-        return Err(RenderError::UnsupportedCodec {
-            codec_id: data.codec_id,
-        });
-    }
     if data.bpp != 32 {
         return Err(RenderError::UnsupportedBpp {
             bits_per_pixel: data.bpp as u16,
@@ -444,16 +505,145 @@ fn blit_surface_bits<S: FrameSink>(
         return Ok(false);
     }
 
-    // BGRA → RGBA, no row flip (top-down per spec).
     let mut rgba = Vec::with_capacity(expected);
     for px in data.bitmap_data.chunks_exact(4) {
-        rgba.push(px[2]); // R ← wire B
-        rgba.push(px[1]); // G
-        rgba.push(px[0]); // B ← wire R
-        rgba.push(px[3]); // A
+        rgba.push(px[2]);
+        rgba.push(px[1]);
+        rgba.push(px[0]);
+        rgba.push(px[3]);
     }
     sink.blit_rgba(dest_left, dest_top, data.width, data.height, &rgba);
     Ok(true)
+}
+
+/// Walk a TS_RFX_* block stream, updating `renderer.rfx_entropy` from
+/// the Context block(s) and decoding every TileSet's tiles. Tiles are
+/// blitted at `(dest_left + x_idx*64, dest_top + y_idx*64)`.
+///
+/// Image-mode streams (the common server pattern) carry the four
+/// handshake blocks (Sync, CodecVersions, Channels, Context) before
+/// every frame, so a single call here is sufficient. Video-mode
+/// streams carry them once per session — we accept those too because
+/// the loop just no-ops on missing blocks and the entropy field
+/// retains its last value.
+fn decode_rfx_stream<S: FrameSink>(
+    renderer: &mut BitmapRenderer,
+    dest_left: u16,
+    dest_top: u16,
+    payload: &[u8],
+    sink: &mut S,
+) -> Result<u32, RenderError> {
+    let mut cursor = ReadCursor::new(payload);
+    let mut blits: u32 = 0;
+    while cursor.remaining() > 0 {
+        // Peek the 2-byte block_type so each branch can re-read it
+        // through the typed decoder (which validates the value).
+        if cursor.remaining() < 2 {
+            return Err(RenderError::SizeMismatch(format!(
+                "RFX block stream truncated: {} bytes left",
+                cursor.remaining()
+            )));
+        }
+        let head = cursor.peek_remaining();
+        let block_type = u16::from_le_bytes([head[0], head[1]]);
+        match block_type {
+            WBT_SYNC => {
+                RfxSync::decode(&mut cursor)?;
+            }
+            WBT_CODEC_VERSIONS => {
+                RfxCodecVersions::decode(&mut cursor)?;
+            }
+            WBT_CHANNELS => {
+                RfxChannels::decode(&mut cursor)?;
+            }
+            WBT_CONTEXT => {
+                let ctx = RfxContext::decode(&mut cursor)?;
+                renderer.rfx_entropy = ctx.properties.entropy;
+            }
+            WBT_FRAME_BEGIN => {
+                RfxFrameBegin::decode(&mut cursor)?;
+            }
+            WBT_REGION => {
+                RfxRegion::decode(&mut cursor)?;
+            }
+            WBT_EXTENSION => {
+                let tileset = RfxTileSet::decode(&mut cursor)?;
+                blits = blits.saturating_add(blit_rfx_tileset(
+                    &tileset,
+                    renderer.rfx_entropy,
+                    dest_left,
+                    dest_top,
+                    sink,
+                )?);
+            }
+            WBT_FRAME_END => {
+                RfxFrameEnd::decode(&mut cursor)?;
+            }
+            other => {
+                return Err(RenderError::SizeMismatch(format!(
+                    "RFX: unknown block_type 0x{other:04X}"
+                )));
+            }
+        }
+    }
+    Ok(blits)
+}
+
+/// Decode every tile in a TileSet and blit it at its grid position.
+fn blit_rfx_tileset<S: FrameSink>(
+    tileset: &RfxTileSet,
+    entropy: RlgrMode,
+    dest_left: u16,
+    dest_top: u16,
+    sink: &mut S,
+) -> Result<u32, RenderError> {
+    let decoder = RfxDecoder::new(entropy);
+    let mut tile_bgra: Vec<u8> = Vec::with_capacity(TILE_COEFFICIENTS * 4);
+    let mut tile_rgba: Vec<u8> = Vec::with_capacity(TILE_COEFFICIENTS * 4);
+    let num_quants = tileset.quant_vals.len();
+    let mut blits: u32 = 0;
+
+    for tile in &tileset.tiles {
+        for (idx, _label) in [
+            (tile.quant_idx_y, "Y"),
+            (tile.quant_idx_cb, "Cb"),
+            (tile.quant_idx_cr, "Cr"),
+        ] {
+            if (idx as usize) >= num_quants {
+                return Err(RenderError::RfxQuantIndexOutOfRange {
+                    quant_idx: idx,
+                    num_quants: num_quants as u8,
+                });
+            }
+        }
+        let q_y = &tileset.quant_vals[tile.quant_idx_y as usize];
+        let q_cb = &tileset.quant_vals[tile.quant_idx_cb as usize];
+        let q_cr = &tileset.quant_vals[tile.quant_idx_cr as usize];
+        decoder.decode_tile(
+            &tile.y_data,
+            &tile.cb_data,
+            &tile.cr_data,
+            q_y,
+            q_cb,
+            q_cr,
+            &mut tile_bgra,
+        )?;
+        // BGRA → RGBA into a separate buffer so subsequent tiles can
+        // reuse `tile_bgra` without reallocating.
+        tile_rgba.clear();
+        tile_rgba.reserve(tile_bgra.len());
+        for px in tile_bgra.chunks_exact(4) {
+            tile_rgba.push(px[2]);
+            tile_rgba.push(px[1]);
+            tile_rgba.push(px[0]);
+            tile_rgba.push(px[3]);
+        }
+        let x = dest_left.saturating_add(tile.x_idx.saturating_mul(TILE_SIZE as u16));
+        let y = dest_top.saturating_add(tile.y_idx.saturating_mul(TILE_SIZE as u16));
+        sink.blit_rgba(x, y, TILE_SIZE as u16, TILE_SIZE as u16, &tile_rgba);
+        blits = blits.saturating_add(1);
+    }
+    Ok(blits)
 }
 
 /// Bottom-up 8 bpp indexed → top-down RGBA via the cached palette.
@@ -1091,6 +1281,136 @@ mod tests {
         // One flush from FrameMarker END (BitmapRenderer::process_surface_commands
         // does not flush after each blit; that's the embedder's per-frame hook).
         assert_eq!(sink.flushes, 1);
+    }
+
+    // ── RFX (S3d-3) ────────────────────────────────────────────────
+
+    /// Wrap an RFX frame stream in a SetSurfaceBitsCmd payload that uses
+    /// the renderer's registered RFX codec_id, then return the full
+    /// fast-path SurfCmds payload (one command, no FrameMarker).
+    fn build_set_surface_bits_rfx(
+        codec_id: u8,
+        dest_left: u16,
+        dest_top: u16,
+        rfx_bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::surface_commands::SetSurfaceBitsCmd;
+        // The Surface Bits header advertises the *post-decode* tile
+        // dimensions, but they are spec-marked as informational; the
+        // RFX stream itself authoritatively encodes geometry. We pin
+        // 64×64 here for the smallest legal one-tile frame.
+        let cmd = SetSurfaceBitsCmd {
+            dest_left,
+            dest_top,
+            dest_right: dest_left + 64,
+            dest_bottom: dest_top + 64,
+            bitmap_data: BitmapDataEx {
+                bpp: 32,
+                codec_id,
+                width: 64,
+                height: 64,
+                ex_header: None,
+                bitmap_data: rfx_bytes,
+            },
+        };
+        let mut buf = vec![0u8; cmd.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut buf);
+            cmd.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        buf.truncate(written);
+        buf
+    }
+
+    /// Encode one RFX frame using the server-side helper, decode it
+    /// through `BitmapRenderer`, and check that the round-trip produces
+    /// at least one 64×64 RGBA blit at the registered position.
+    #[test]
+    fn rfx_round_trip_one_tile_image_mode() {
+        use justrdp_graphics::rfx::frame_encoder::RfxFrameEncoder;
+        use justrdp_graphics::rfx::quant::CodecQuant;
+        use justrdp_graphics::rfx::wire::RfxTileWire;
+
+        // Build a single-tile frame. quant index 0 references the
+        // default quant table; the tile data can be empty bytes — the
+        // RLGR decoder produces all-zero coefficients which color-
+        // convert to a uniform mid-gray, which is good enough for a
+        // structural integration test.
+        let tile = RfxTileWire {
+            quant_idx_y: 0,
+            quant_idx_cb: 0,
+            quant_idx_cr: 0,
+            x_idx: 0,
+            y_idx: 0,
+            // Minimum legal RLGR component: a single zero byte. Decoder
+            // emits 4096 zeros, then DWT/dequant/colorconv on zeros
+            // → mid-gray BGRA tile.
+            y_data: vec![0; 1],
+            cb_data: vec![0; 1],
+            cr_data: vec![0; 1],
+        };
+        let mut encoder = RfxFrameEncoder::new(64, 64, RlgrMode::Rlgr1).unwrap();
+        // Default Microsoft quant table (MS-RDPRFX §2.2.2.1.5 sample). The
+        // exact values do not matter for the structural assertions below;
+        // they just need to round-trip the renderer's range checks.
+        let quant = CodecQuant::from_bytes(&[0x66, 0x66, 0x77, 0x88, 0x98]);
+        let rfx_bytes = encoder
+            .encode_frame(&[], vec![quant], vec![tile])
+            .unwrap();
+
+        let codec_id = 0x09; // arbitrary server-assigned id
+        let surfcmds_payload = build_set_surface_bits_rfx(codec_id, 100, 50, rfx_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: surfcmds_payload,
+        };
+
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_rfx_codec_id(codec_id);
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew, "RFX frame must produce at least one blit");
+        assert_eq!(sink.blits.len(), 1);
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!(
+            (*x, *y, *w, *h),
+            (100, 50, 64, 64),
+            "single-tile RFX blit must land at (dest_left, dest_top) and be 64×64"
+        );
+        assert_eq!(pixels.len(), 64 * 64 * 4);
+        // Sample alpha: every RGBA pixel from the BGRA→RGBA swap should
+        // have alpha = 0xFF since RFX outputs 0xFF in the alpha slot.
+        for px in pixels.chunks_exact(4) {
+            assert_eq!(px[3], 0xFF);
+        }
+        // The encoder snapshot should have updated the renderer's
+        // entropy field via the embedded TS_RFX_CONTEXT block.
+        assert_eq!(renderer.rfx_entropy, RlgrMode::Rlgr1);
+    }
+
+    /// Without `set_rfx_codec_id`, a Surface Bits cmd carrying RFX data
+    /// is still surfaced as `UnsupportedCodec` — protect against an
+    /// embedder forgetting to register the codec_id and silently
+    /// painting garbage.
+    #[test]
+    fn rfx_without_registration_surfaces_unsupported_codec() {
+        let codec_id = 0x09;
+        // Empty RFX payload — never reached because we drop on codec_id.
+        let surfcmds_payload = build_set_surface_bits_rfx(codec_id, 0, 0, vec![]);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: surfcmds_payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        // Note: no set_rfx_codec_id call.
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(
+            matches!(err, RenderError::UnsupportedCodec { codec_id: 0x09 }),
+            "expected UnsupportedCodec(0x09), got {err:?}"
+        );
     }
 
     #[test]
