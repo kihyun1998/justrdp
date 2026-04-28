@@ -1,0 +1,71 @@
+<!doctype html>
+<!--
+  justrdp-web demo page.
+
+  Build:
+    cd crates/justrdp-web
+    wasm-pack build --target web --out-dir examples/demo/pkg
+
+  Serve:
+    Any static file server at the repo root, e.g.
+      python3 -m http.server 8080
+    Then open
+      http://localhost:8080/crates/justrdp-web/examples/demo/
+
+  Bridge:
+    The demo opens a WebSocket to the URL you type. justrdp-web does NOT
+    speak the MS Web Client gateway protocol — it expects a transparent
+    TCP-over-WebSocket bridge (e.g. https://github.com/jpillora/chisel
+    "ws → tcp", or any wsproxy implementation) so the WebSocket bytes
+    are forwarded verbatim to the RDP server's TCP socket.
+
+    Standard RDP Security only in this S3c milestone — point the bridge
+    at an RDP server that allows it (Windows server with NLA disabled,
+    xrdp, FreeRDP-server, …). NLA / SSL upgrade lands in a later step.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>justrdp-web demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1rem; background: #1e1e1e; color: #ddd; }
+    fieldset { border: 1px solid #555; padding: 0.5rem 1rem; margin-bottom: 0.5rem; }
+    label { display: inline-block; width: 5rem; }
+    input[type=text], input[type=password] { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 4px; width: 24rem; }
+    button { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 14px; margin-right: 6px; cursor: pointer; }
+    button:disabled { color: #666; cursor: not-allowed; }
+    canvas { background: black; border: 1px solid #444; image-rendering: pixelated; }
+    #log { background: #161616; padding: 0.5rem; height: 8rem; overflow-y: auto; white-space: pre-wrap; font-family: monospace; font-size: 12px; }
+    .ok { color: #6f6; }
+    .err { color: #f66; }
+  </style>
+</head>
+<body>
+  <h2>justrdp-web — Standard Security demo</h2>
+
+  <fieldset>
+    <legend>Connection</legend>
+    <div><label for="url">WS URL</label><input id="url" type="text" value="ws://localhost:7000/" /></div>
+    <div><label for="user">User</label><input id="user" type="text" value="alice" /></div>
+    <div><label for="pw">Password</label><input id="pw" type="password" value="" /></div>
+    <div><label for="domain">Domain</label><input id="domain" type="text" value="" /></div>
+    <p>
+      <button id="connectBtn">Connect</button>
+      <button id="disconnectBtn" disabled>Disconnect</button>
+      <span id="status"></span>
+    </p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Display</legend>
+    <canvas id="screen" width="1024" height="768"></canvas>
+  </fieldset>
+
+  <fieldset>
+    <legend>Log</legend>
+    <div id="log"></div>
+  </fieldset>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

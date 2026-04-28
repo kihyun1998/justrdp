@@ -2,24 +2,41 @@
 
 //! `wasm-bindgen` JavaScript facade (wasm32 only).
 //!
-//! Thin shim that ties [`WebSocketTransport`] and [`WebClient`] together
-//! into a one-shot `connect()` Promise visible from JS. Native callers
-//! should prefer `WebClient::connect()` directly — this module exists
-//! only to give browser embedders an out-of-the-box entry point.
+//! Two entry points:
 //!
-//! S2 surface is intentionally minimal — Standard RDP Security only,
-//! no post-handshake plumbing. S3+ will add the active-session pump and
-//! a stateful `JsClient` handle.
+//! 1. [`justrdp_connect`] — one-shot Promise that runs the handshake and
+//!    drops the connection. Useful as a smoke test from JS.
+//! 2. [`JsClient`] — stateful handle. Holds the post-handshake
+//!    [`ActiveSession`] *and* a [`CanvasFrameSink`] across JS calls so
+//!    the embedder can `connect()` once, then run a `pollEvents()` loop
+//!    that streams pixels into a `<canvas>`.
+//!
+//! Cancellation: every async method takes ownership of the relevant
+//! components via `Option::take`, runs the future without holding a
+//! `RefCell` borrow across the await, then puts the components back.
+//! If a JS caller drops the returned Promise, the components are lost
+//! (subsequent calls error with `"not connected"`); that's the same
+//! footgun every wasm-bindgen async API has and matches the way browser
+//! Promise consumers interact with state in practice.
+//!
+//! [`ActiveSession`]: crate::ActiveSession
+//! [`CanvasFrameSink`]: crate::CanvasFrameSink
 
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::String;
+use core::cell::RefCell;
 
 use js_sys::{Object, Reflect};
 use justrdp_connector::Config;
 use justrdp_pdu::x224::SecurityProtocol;
 use wasm_bindgen::prelude::*;
+use web_sys::HtmlCanvasElement;
 
+use crate::canvas::CanvasFrameSink;
 use crate::driver::WebClient;
+use crate::render::render_event;
+use crate::session::ActiveSession;
 use crate::websocket::{WebSocketConfig, WebSocketTransport};
 
 /// One-shot Standard-Security connect.
@@ -71,6 +88,185 @@ pub async fn justrdp_connect(
 
 fn js_error(msg: impl Into<String>) -> JsValue {
     js_sys::Error::new(&msg.into()).into()
+}
+
+// ── Stateful JsClient handle ────────────────────────────────────────
+
+#[derive(Default)]
+struct JsClientInner {
+    /// Active session after a successful `connect()`. Taken out for the
+    /// duration of every async method that touches it, then put back.
+    session: Option<ActiveSession<WebSocketTransport>>,
+    /// Optional render target. None means events are decoded but not
+    /// blitted (handy for headless tests / "tail the channel" UIs).
+    sink: Option<CanvasFrameSink>,
+    /// Last successful `connect()` summary, mirrored so JS can read it
+    /// at any time without re-issuing the connect Promise.
+    last_summary: Option<JsValue>,
+}
+
+/// Stateful RDP-over-WebSocket client. Hold one per `<canvas>`.
+///
+/// Lifecycle: `new()` → `attachCanvas()` (optional) → `connect()` →
+/// `pollEvents()` loop → `disconnect()`.
+#[wasm_bindgen]
+pub struct JsClient {
+    inner: Rc<RefCell<JsClientInner>>,
+}
+
+#[wasm_bindgen]
+impl JsClient {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(JsClientInner::default())),
+        }
+    }
+
+    /// Bind a `<canvas>` element. Calling this *before* `connect()` is
+    /// the common path; calling after a successful connect also works
+    /// and replaces any previously attached canvas.
+    #[wasm_bindgen(js_name = attachCanvas)]
+    pub fn attach_canvas(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
+        let sink = CanvasFrameSink::from_canvas(&canvas)?;
+        self.inner.borrow_mut().sink = Some(sink);
+        Ok(())
+    }
+
+    /// Whether `connect()` has succeeded and `disconnect()` hasn't run.
+    #[wasm_bindgen(getter)]
+    pub fn connected(&self) -> bool {
+        self.inner.borrow().session.is_some()
+    }
+
+    /// Last successful connect summary (the same shape returned by
+    /// `connect()`), or `null` if no handshake has succeeded yet.
+    #[wasm_bindgen(getter, js_name = lastSummary)]
+    pub fn last_summary(&self) -> JsValue {
+        self.inner
+            .borrow()
+            .last_summary
+            .clone()
+            .unwrap_or(JsValue::NULL)
+    }
+
+    /// Open a WebSocket bridge to `url`, run the Standard-Security
+    /// handshake, and store the resulting session for `pollEvents()`.
+    /// Resolves with the same JS object as [`justrdp_connect`].
+    pub async fn connect(
+        &self,
+        url: String,
+        username: String,
+        password: String,
+        domain: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        // Bail if a session is already up — caller must explicitly
+        // disconnect before reconnecting (avoids accidentally leaking
+        // an old transport).
+        if self.inner.borrow().session.is_some() {
+            return Err(js_error("already connected"));
+        }
+
+        let transport = WebSocketTransport::connect(WebSocketConfig::new(url))
+            .await
+            .map_err(|e| js_error(format!("websocket: {e}")))?;
+
+        let mut client_random = [0u8; 32];
+        getrandom::getrandom(&mut client_random)
+            .map_err(|e| js_error(format!("crypto.getRandomValues: {e}")))?;
+
+        let mut builder =
+            Config::builder(&username, &password).security_protocol(SecurityProtocol::RDP);
+        if let Some(d) = domain.as_deref().filter(|s| !s.is_empty()) {
+            builder = builder.domain(d);
+        }
+        let mut config = builder.build();
+        config.client_random = Some(client_random);
+
+        let client = WebClient::new(transport);
+        let (result, transport) = client
+            .connect(config)
+            .await
+            .map_err(|e| js_error(format!("handshake: {e}")))?;
+
+        let summary = serialize_summary(&result);
+        let session = ActiveSession::new(transport, &result);
+        let mut g = self.inner.borrow_mut();
+        g.session = Some(session);
+        g.last_summary = Some(summary.clone());
+        Ok(summary)
+    }
+
+    /// Read one frame from the wire, route it through `ActiveStage`,
+    /// and (if a canvas is attached) render any `Graphics::Bitmap`
+    /// rectangles. Returns the number of rectangles drawn.
+    ///
+    /// On `Terminated` the session is automatically dropped — the
+    /// `connected` getter will flip to `false` and a subsequent call
+    /// returns `Err("not connected")`.
+    #[wasm_bindgen(js_name = pollEvents)]
+    pub async fn poll_events(&self) -> Result<u32, JsValue> {
+        // Take the session, run the future without a borrow held across
+        // the await, then put it back unless the session has terminated.
+        let mut session = self
+            .inner
+            .borrow_mut()
+            .session
+            .take()
+            .ok_or_else(|| js_error("not connected"))?;
+        let result = session.next_events().await;
+
+        // Take the sink for rendering. Done after the await so the
+        // borrow doesn't span the suspension.
+        let mut sink_opt = self.inner.borrow_mut().sink.take();
+
+        let events = match result {
+            Ok(events) => events,
+            Err(e) => {
+                // Restore both components so the caller can decide how
+                // to recover (e.g. retry on a transient transport hiccup).
+                let mut g = self.inner.borrow_mut();
+                g.session = Some(session);
+                g.sink = sink_opt;
+                return Err(js_error(format!("poll: {e}")));
+            }
+        };
+
+        let mut blits: u32 = 0;
+        let mut terminated = false;
+        for event in &events {
+            if let Some(sink) = sink_opt.as_mut() {
+                if let Ok(true) = render_event(event, sink) {
+                    blits += 1;
+                }
+            }
+            if matches!(event, crate::SessionEvent::Terminated(_)) {
+                terminated = true;
+            }
+        }
+
+        let mut g = self.inner.borrow_mut();
+        if !terminated {
+            g.session = Some(session);
+        }
+        // Sink survives the session — embedders may attach a new session
+        // on the same canvas without re-binding it.
+        g.sink = sink_opt;
+        Ok(blits)
+    }
+
+    /// Drop the active session (if any). Idempotent; calling on a
+    /// disconnected client is a no-op.
+    pub async fn disconnect(&self) -> Result<(), JsValue> {
+        let session_opt = self.inner.borrow_mut().session.take();
+        let Some(mut session) = session_opt else {
+            return Ok(());
+        };
+        // Best-effort: ignore errors — the embedder already saw the
+        // disconnect intent and can move on.
+        let _ = session.disconnect().await;
+        Ok(())
+    }
 }
 
 fn serialize_summary(result: &justrdp_connector::ConnectionResult) -> JsValue {
