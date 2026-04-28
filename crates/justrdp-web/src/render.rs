@@ -26,12 +26,13 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use justrdp_core::ReadCursor;
+use justrdp_core::{Decode, ReadCursor};
 use justrdp_graphics::{BitsPerPixel, RleDecompressor, RleError};
 use justrdp_pdu::rdp::bitmap::{
     TsBitmapData, TsUpdateBitmapData, BITMAP_COMPRESSION,
 };
 use justrdp_pdu::rdp::fast_path::FastPathUpdateType;
+use justrdp_pdu::rdp::surface_commands::{BitmapDataEx, SurfaceCommand, SURFACECMD_FRAMEACTION_END};
 
 use crate::session::SessionEvent;
 
@@ -52,6 +53,9 @@ pub enum RenderError {
     /// An 8 bpp Bitmap arrived before a Palette update — the renderer
     /// has no table to convert the indices with.
     PaletteMissing,
+    /// A Surface Command referenced a codec that isn't wired yet
+    /// (RemoteFX / NSCodec / ClearCodec / AVC444 are S3d-3+).
+    UnsupportedCodec { codec_id: u8 },
 }
 
 impl core::fmt::Display for RenderError {
@@ -67,6 +71,9 @@ impl core::fmt::Display for RenderError {
             Self::SizeMismatch(msg) => write!(f, "size mismatch: {msg}"),
             Self::Rle(e) => write!(f, "RLE decompress: {e}"),
             Self::PaletteMissing => f.write_str("8 bpp bitmap arrived before any Palette update"),
+            Self::UnsupportedCodec { codec_id } => {
+                write!(f, "Surface Command codec 0x{codec_id:02X} not yet supported")
+            }
         }
     }
 }
@@ -134,13 +141,16 @@ const PALETTE_ENTRY_COUNT: usize = 256;
 /// Stateful renderer.
 ///
 /// Holds protocol state that survives across update batches — currently
-/// the 8 bpp palette table; later steps will add codec contexts (RFX
-/// tile cache, NSCodec quantization tables, …). Use one instance per
-/// session; reusing across sessions risks decoding new traffic against
-/// stale palette/codec state.
+/// the 8 bpp palette table and the latest Frame Marker id; later steps
+/// will add codec contexts (RFX tile cache, NSCodec quantization
+/// tables, …). Use one instance per session; reusing across sessions
+/// risks decoding new traffic against stale palette/codec state.
 #[derive(Debug, Clone)]
 pub struct BitmapRenderer {
     palette: Option<[(u8, u8, u8); PALETTE_ENTRY_COUNT]>,
+    /// Most recent Frame Marker id seen (BEGIN or END). Embedders that
+    /// want true v-sync can poll this between draws to coalesce updates.
+    last_frame_id: Option<u32>,
 }
 
 impl Default for BitmapRenderer {
@@ -151,13 +161,22 @@ impl Default for BitmapRenderer {
 
 impl BitmapRenderer {
     pub const fn new() -> Self {
-        Self { palette: None }
+        Self {
+            palette: None,
+            last_frame_id: None,
+        }
     }
 
     /// Whether the server has sent a Palette update yet. 8 bpp bitmaps
     /// before the first palette will fail with [`RenderError::PaletteMissing`].
     pub fn has_palette(&self) -> bool {
         self.palette.is_some()
+    }
+
+    /// The most recent Frame Marker id observed (BEGIN or END), or
+    /// `None` if the server has not sent one this session.
+    pub fn last_frame_id(&self) -> Option<u32> {
+        self.last_frame_id
     }
 
     /// Apply one [`SessionEvent`] to a [`FrameSink`], updating internal
@@ -194,15 +213,54 @@ impl BitmapRenderer {
                 }
                 Ok(any)
             }
-            // Surface Commands and the Synchronize tick are accepted but
-            // not yet rendered (Surface Commands lands in S3d-2). They
-            // are *not* errors — the embedder generally just keeps
-            // pumping events.
-            FastPathUpdateType::Synchronize | FastPathUpdateType::SurfaceCommands => Ok(false),
+            FastPathUpdateType::SurfaceCommands => self.process_surface_commands(data, sink),
+            // Synchronize is plumbing — accept silently.
+            FastPathUpdateType::Synchronize => Ok(false),
             other => Err(RenderError::Unsupported {
                 update_code: *other,
             }),
         }
+    }
+
+    /// Walk a `FASTPATH_UPDATETYPE_SURFCMDS` payload, dispatching each
+    /// command (MS-RDPBCGR 2.2.9.1.2.1.10):
+    ///
+    /// * `SET_SURFACE_BITS` / `STREAM_SURFACE_BITS` with `codec_id == 0`
+    ///   → raw 32 bpp BGRA pixels (top-down per spec) → RGBA blit.
+    /// * Any non-zero `codec_id` → [`RenderError::UnsupportedCodec`]
+    ///   (RFX / NSCodec / ClearCodec / AVC land in S3d-3+).
+    /// * `FRAME_MARKER` → cache `frame_id`; on `END`, call
+    ///   [`FrameSink::flush`] so embedders that buffer per-frame can
+    ///   commit at the spec-defined boundary.
+    fn process_surface_commands<S: FrameSink>(
+        &mut self,
+        payload: &[u8],
+        sink: &mut S,
+    ) -> Result<bool, RenderError> {
+        let mut cursor = ReadCursor::new(payload);
+        let mut any_blits = false;
+        while cursor.remaining() > 0 {
+            let cmd = SurfaceCommand::decode(&mut cursor)?;
+            match cmd {
+                SurfaceCommand::SetSurfaceBits(c) => {
+                    if blit_surface_bits(c.dest_left, c.dest_top, &c.bitmap_data, sink)? {
+                        any_blits = true;
+                    }
+                }
+                SurfaceCommand::StreamSurfaceBits(c) => {
+                    if blit_surface_bits(c.dest_left, c.dest_top, &c.bitmap_data, sink)? {
+                        any_blits = true;
+                    }
+                }
+                SurfaceCommand::FrameMarker(m) => {
+                    self.last_frame_id = Some(m.frame_id);
+                    if m.frame_action == SURFACECMD_FRAMEACTION_END {
+                        sink.flush();
+                    }
+                }
+            }
+        }
+        Ok(any_blits)
     }
 
     fn decode_bitmap_rects(&self, payload: &[u8]) -> Result<Vec<DecodedRect>, RenderError> {
@@ -345,6 +403,57 @@ fn bpp_byte_size(bpp: u16) -> Result<usize, RenderError> {
             bits_per_pixel: other,
         }),
     }
+}
+
+/// Decode one Surface Bits command's payload and blit it.
+///
+/// Returns `Ok(true)` if a blit was issued, `Ok(false)` if the payload
+/// was empty (zero-byte body — legal but rare).
+///
+/// `codec_id == 0` is the only path wired today: raw, top-down 32 bpp
+/// BGRA pixels (MS-RDPBCGR 2.2.9.2.1.2.1.1). The byte order swap is
+/// done in-place into a fresh RGBA buffer; no row flip because Surface
+/// Commands deliver pixels top-down per spec.
+fn blit_surface_bits<S: FrameSink>(
+    dest_left: u16,
+    dest_top: u16,
+    data: &BitmapDataEx,
+    sink: &mut S,
+) -> Result<bool, RenderError> {
+    if data.codec_id != 0 {
+        return Err(RenderError::UnsupportedCodec {
+            codec_id: data.codec_id,
+        });
+    }
+    if data.bpp != 32 {
+        return Err(RenderError::UnsupportedBpp {
+            bits_per_pixel: data.bpp as u16,
+        });
+    }
+    let expected = data.width as usize * data.height as usize * 4;
+    if data.bitmap_data.len() != expected {
+        return Err(RenderError::SizeMismatch(format!(
+            "Surface raw bitmap: expected {} bytes for {}x{} @ 32bpp, got {}",
+            expected,
+            data.width,
+            data.height,
+            data.bitmap_data.len()
+        )));
+    }
+    if expected == 0 {
+        return Ok(false);
+    }
+
+    // BGRA → RGBA, no row flip (top-down per spec).
+    let mut rgba = Vec::with_capacity(expected);
+    for px in data.bitmap_data.chunks_exact(4) {
+        rgba.push(px[2]); // R ← wire B
+        rgba.push(px[1]); // G
+        rgba.push(px[0]); // B ← wire R
+        rgba.push(px[3]); // A
+    }
+    sink.blit_rgba(dest_left, dest_top, data.width, data.height, &rgba);
+    Ok(true)
 }
 
 /// Bottom-up 8 bpp indexed → top-down RGBA via the cached palette.
@@ -896,6 +1005,130 @@ mod tests {
         let err = renderer.render(&truncated, &mut sink).unwrap_err();
         assert!(matches!(err, RenderError::SizeMismatch(_)));
         assert!(!renderer.has_palette());
+    }
+
+    // ── Surface Commands ────────────────────────────────────────────
+
+    /// Build a fast-path SurfCmds payload carrying one
+    /// SetSurfaceBits with a raw (codec_id=0) 1×1 32 bpp BGRA pixel.
+    /// `(b, g, r, a)` is the pixel value placed on the wire.
+    fn build_surface_set_bits_raw(b: u8, g: u8, r: u8, a: u8) -> Vec<u8> {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::surface_commands::SetSurfaceBitsCmd;
+        let cmd = SetSurfaceBitsCmd {
+            dest_left: 100,
+            dest_top: 50,
+            dest_right: 101,
+            dest_bottom: 51,
+            bitmap_data: BitmapDataEx {
+                bpp: 32,
+                codec_id: 0,
+                width: 1,
+                height: 1,
+                ex_header: None,
+                bitmap_data: vec![b, g, r, a],
+            },
+        };
+        let mut buf = vec![0u8; cmd.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut buf);
+            cmd.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        buf.truncate(written);
+        buf
+    }
+
+    fn build_frame_marker(action: u16, frame_id: u32) -> Vec<u8> {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::surface_commands::FrameMarkerCmd;
+        let m = FrameMarkerCmd {
+            frame_action: action,
+            frame_id,
+        };
+        let mut buf = vec![0u8; m.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut buf);
+            m.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        buf.truncate(written);
+        buf
+    }
+
+    #[test]
+    fn surface_commands_set_surface_bits_raw_32bpp() {
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        // Pixel BGRA = (0x11, 0x22, 0x33, 0xFF) → RGBA (0x33, 0x22, 0x11, 0xFF).
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: build_surface_set_bits_raw(0x11, 0x22, 0x33, 0xFF),
+        };
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        assert_eq!(sink.blits.len(), 1);
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!((*x, *y, *w, *h), (100, 50, 1, 1));
+        assert_eq!(pixels, &vec![0x33, 0x22, 0x11, 0xFF]);
+    }
+
+    #[test]
+    fn surface_commands_frame_marker_end_flushes_sink() {
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        // BEGIN(7), SetSurfaceBits, END(7) — a typical Windows frame.
+        let mut payload = build_frame_marker(0x0000, 7);
+        payload.extend_from_slice(&build_surface_set_bits_raw(0xFF, 0xFF, 0xFF, 0xFF));
+        payload.extend_from_slice(&build_frame_marker(0x0001, 7));
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        assert_eq!(renderer.last_frame_id(), Some(7));
+        // One flush from FrameMarker END (BitmapRenderer::process_surface_commands
+        // does not flush after each blit; that's the embedder's per-frame hook).
+        assert_eq!(sink.flushes, 1);
+    }
+
+    #[test]
+    fn surface_commands_unsupported_codec_surfaces_typed_error() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::surface_commands::SetSurfaceBitsCmd;
+        let cmd = SetSurfaceBitsCmd {
+            dest_left: 0,
+            dest_top: 0,
+            dest_right: 1,
+            dest_bottom: 1,
+            bitmap_data: BitmapDataEx {
+                bpp: 32,
+                codec_id: 0x03, // RemoteFX, not yet wired
+                width: 1,
+                height: 1,
+                ex_header: None,
+                bitmap_data: vec![0; 1], // payload doesn't matter — codec_id is rejected first
+            },
+        };
+        let mut buf = vec![0u8; cmd.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut buf);
+            cmd.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        buf.truncate(written);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: buf,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(
+            matches!(err, RenderError::UnsupportedCodec { codec_id: 0x03 }),
+            "expected UnsupportedCodec(0x03), got {err:?}"
+        );
     }
 
     #[test]
