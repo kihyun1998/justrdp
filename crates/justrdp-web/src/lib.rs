@@ -24,8 +24,12 @@ extern crate alloc;
 
 mod driver;
 mod error;
+mod render;
 mod session;
 mod transport;
+
+#[cfg(target_arch = "wasm32")]
+mod canvas;
 
 #[cfg(all(feature = "websocket", target_arch = "wasm32"))]
 mod websocket;
@@ -35,8 +39,14 @@ mod js;
 
 pub use driver::{DriverError, WebClient, MAX_HANDSHAKE_PDU_SIZE};
 pub use error::{TransportError, TransportErrorKind};
+pub use render::{
+    decode_bitmap_update_fast_path, render_event, DecodedRect, FrameSink, RenderError,
+};
 pub use session::{ActiveSession, PointerEvent, SessionEvent};
 pub use transport::WebTransport;
+
+#[cfg(target_arch = "wasm32")]
+pub use canvas::CanvasFrameSink;
 
 #[cfg(all(feature = "websocket", target_arch = "wasm32"))]
 pub use websocket::{WebSocketConfig, WebSocketTransport};
