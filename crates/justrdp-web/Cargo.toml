@@ -22,8 +22,9 @@ webtransport = []
 webrtc-data = []
 
 [dependencies]
-# Trait + error types are alloc-only; no other JustRDP crate is pulled in
-# at S1 to keep the surface minimal. S2 will introduce the connector wrap.
+justrdp-core = { workspace = true, features = ["alloc"] }
+justrdp-connector = { workspace = true }
+justrdp-pdu.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -36,6 +37,10 @@ web-sys = { version = "0.3", features = [
     "MessageEvent",
     "WebSocket",
 ] }
+# `js` enables the browser-backed (`crypto.getRandomValues`) RNG impl,
+# so `Config::client_random` can be filled without hand-rolling
+# `web_sys::Crypto` calls in the facade.
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 pollster = "0.3"

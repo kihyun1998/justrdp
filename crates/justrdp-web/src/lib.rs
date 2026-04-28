@@ -22,12 +22,17 @@
 
 extern crate alloc;
 
+mod driver;
 mod error;
 mod transport;
 
 #[cfg(all(feature = "websocket", target_arch = "wasm32"))]
 mod websocket;
 
+#[cfg(target_arch = "wasm32")]
+mod js;
+
+pub use driver::{DriverError, WebClient, MAX_HANDSHAKE_PDU_SIZE};
 pub use error::{TransportError, TransportErrorKind};
 pub use transport::WebTransport;
 
