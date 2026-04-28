@@ -2164,6 +2164,81 @@ fn decode_glyph_index_inline(
     Ok(consumed)
 }
 
+/// Scan-line polygon fill with an 8×8 monochrome brush. Each pixel in
+/// the filled span samples the brush at its absolute position
+/// (modulo 8, plus the brush origin); `1` bits draw the foreground
+/// RGBA, `0` bits draw the background RGBA. Both colors are written
+/// verbatim — no ROP — so this matches PolygonCB with the implicit
+/// PATCOPY semantics that legacy traffic uses for plain textured
+/// fills.
+fn scanline_fill_polygon_brush<S: FrameSink>(
+    verts: &[(i32, i32)],
+    pattern_rows: [u8; 8],
+    brush_org_x: i8,
+    brush_org_y: i8,
+    fore_rgba: &[u8; 4],
+    back_rgba: &[u8; 4],
+    sink: &mut S,
+) {
+    if verts.len() < 3 {
+        return;
+    }
+    let min_y = verts.iter().map(|v| v.1).min().unwrap();
+    let max_y = verts.iter().map(|v| v.1).max().unwrap();
+    let n = verts.len();
+    let ox = (brush_org_x as i32).rem_euclid(8) as usize;
+    let oy = (brush_org_y as i32).rem_euclid(8) as usize;
+    for y in min_y..=max_y {
+        if y < 0 || y > u16::MAX as i32 {
+            continue;
+        }
+        let mut crossings: Vec<i32> = Vec::new();
+        for i in 0..n {
+            let (x0, y0) = verts[i];
+            let (x1, y1) = verts[(i + 1) % n];
+            let (lo_y, hi_y, lo_x, hi_x) = if y0 < y1 {
+                (y0, y1, x0, x1)
+            } else if y0 > y1 {
+                (y1, y0, x1, x0)
+            } else {
+                continue;
+            };
+            if y < lo_y || y >= hi_y {
+                continue;
+            }
+            let t_num = y - lo_y;
+            let t_den = hi_y - lo_y;
+            let x = lo_x + (hi_x - lo_x) * t_num / t_den;
+            crossings.push(x);
+        }
+        crossings.sort_unstable();
+        let pat_row = pattern_rows[(y as usize + oy) & 7];
+        for chunk in crossings.chunks(2) {
+            if chunk.len() < 2 {
+                break;
+            }
+            let xs = chunk[0].max(0);
+            let xe = chunk[1].min(u16::MAX as i32);
+            if xs >= xe {
+                continue;
+            }
+            // Build the span pixel-by-pixel from the pattern. We
+            // batch the whole span in one blit so a 1000-pixel-wide
+            // fill doesn't issue 1000 sink calls.
+            let span_w = (xe - xs) as usize;
+            let mut span = Vec::with_capacity(span_w * 4);
+            for col in 0..span_w {
+                let abs_x = xs as usize + col;
+                let bit = 7 - ((abs_x + ox) & 7);
+                let on = (pat_row >> bit) & 1 != 0;
+                let color = if on { fore_rgba } else { back_rgba };
+                span.extend_from_slice(color);
+            }
+            sink.blit_rgba(xs as u16, y as u16, span_w as u16, 1, &span);
+        }
+    }
+}
+
 /// Scan-line polygon fill in `color_rgba`. Standard even-odd / non-
 /// zero algorithm: for each scanline that crosses any edge, gather
 /// x-intersections, sort, fill between each pair. Issues one tiny
@@ -2424,11 +2499,19 @@ fn try_render_polygon_sc<S: FrameSink>(order: &PolygonScOrder, sink: &mut S) -> 
     true
 }
 
-/// PolygonCB: scan-line fill, currently solid `brush_color` only —
-/// the textured-pattern path lands in S3d-6g2-pattern.
+/// PolygonCB: textured scan-line fill driven by the brush.
+///
+/// Resolves the brush source the same way `try_render_patblt` does
+/// (BS_SOLID = brush_color, BS_HATCHED = predefined hatch, BS_PATTERN
+/// = inline 8 bytes, BS_PATTERN | 0x80 = CacheBrush index). For each
+/// span of the polygon's interior we sample the 8×8 monochrome
+/// pattern at every pixel — `1` bits get `brush_color` (foreground),
+/// `0` bits get `back_color` (background, RGB convention matching
+/// PatBlt). Solid brushes degrade to the same single-color path
+/// PolygonSC uses.
 fn try_render_polygon_cb<S: FrameSink>(
     order: &PolygonCbOrder,
-    _renderer_brush_cache: &BTreeMap<u8, [u8; 8]>,
+    renderer_brush_cache: &BTreeMap<u8, [u8; 8]>,
     sink: &mut S,
 ) -> bool {
     if order.deltas.is_empty() {
@@ -2446,13 +2529,56 @@ fn try_render_polygon_cb<S: FrameSink>(
     if verts.len() < 3 {
         return false;
     }
-    let fill_color_rgba = [
-        order.brush_color[2],
-        order.brush_color[1],
+
+    // Resolve the pattern source (`P`) once.
+    let cached_brush_bit = order.brush_style & 0x80 != 0;
+    let style_low = order.brush_style & 0x7F;
+    let pattern_rows: Option<[u8; 8]> = if cached_brush_bit {
+        renderer_brush_lookup(renderer_brush_cache, order.brush_hatch)
+    } else {
+        match style_low {
+            BS_SOLID => None,
+            BS_HATCHED => hatch_pattern(order.brush_hatch),
+            BS_PATTERN => Some([
+                order.brush_hatch,
+                order.brush_extra[0],
+                order.brush_extra[1],
+                order.brush_extra[2],
+                order.brush_extra[3],
+                order.brush_extra[4],
+                order.brush_extra[5],
+                order.brush_extra[6],
+            ]),
+            _ => None,
+        }
+    };
+
+    let fore_rgba = [
         order.brush_color[0],
+        order.brush_color[1],
+        order.brush_color[2],
         0xFF,
     ];
-    scanline_fill_polygon(&verts, &fill_color_rgba, sink);
+    let back_rgba = [
+        order.back_color[0],
+        order.back_color[1],
+        order.back_color[2],
+        0xFF,
+    ];
+    if pattern_rows.is_none() {
+        // Solid brush_color fill — identical to PolygonSC.
+        scanline_fill_polygon(&verts, &fore_rgba, sink);
+        return true;
+    }
+    scanline_fill_polygon_brush(
+        &verts,
+        pattern_rows.unwrap(),
+        order.brush_org_x,
+        order.brush_org_y,
+        &fore_rgba,
+        &back_rgba,
+        sink,
+    );
     true
 }
 
@@ -4723,6 +4849,83 @@ mod tests {
         assert_eq!(&pixels[4..8],   &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&pixels[8..12],  &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&pixels[12..16], &[0xAA, 0xBB, 0xCC, 0xFF]);
+    }
+
+    /// PolygonCB with an inline BS_PATTERN brush — the textured fill
+    /// must alternate fore/back per the 8×8 monochrome pattern.
+    /// Triangle (0, 0) → (3, 0) → (0, 3): single-row scanlines on
+    /// y=0..2 progressively shorter (3, 2, 1 pixels). Pattern row 0
+    /// = 0x80 (only leftmost column on) — y=0 should produce
+    /// fore, back, back along the 3-pixel span.
+    #[test]
+    fn polygon_cb_inline_pattern_textured_fill() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // Triangle (0,0) → (3,0) → (0,3) → close. Encode 3 deltas.
+        // dx=+3, dy=0    → 0x03, 0x00
+        // dx=-3, dy=+3   → 0x83, 0x03
+        // dx=0,  dy=-3   → 0x00, 0x83
+        let mut delta_list = Vec::new();
+        delta_list.extend_from_slice(&[0x03, 0x00, 0x83, 0x03, 0x00, 0x83]);
+        let cb_data = delta_list.len() as u16;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&0i16.to_le_bytes()); // xStart
+        body.extend_from_slice(&0i16.to_le_bytes()); // yStart
+        body.push(13);                                // bRop2
+        body.push(1);                                 // fillMode
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // brushColor (fore) BGR-on-wire-but-we-treat-RGB
+        body.extend_from_slice(&[0x11, 0x22, 0x33]); // backColor
+        body.push(0);                                 // brushOrgX
+        body.push(0);                                 // brushOrgY
+        body.push(BS_PATTERN);                        // brush_style = 0x03 inline
+        body.push(0x80);                              // brush_hatch = pattern row 0
+        body.extend_from_slice(&[0x80; 7]);           // brush_extra = rows 1..7 (all same)
+        body.push(3);                                 // nDeltaEntries
+        body.extend_from_slice(&cb_data.to_le_bytes());
+        body.extend_from_slice(&delta_list);
+
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::PolygonCb,
+            field_flags: 0x1FFF, // all 13 fields
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        // We expect at least one fill span. Each span is a single blit
+        // covering the full scanline, with per-pixel fore/back colors
+        // from the pattern.
+        assert!(!sink.blits.is_empty(), "PolygonCB should fill ≥1 span");
+        // Find a non-empty span and check that at least the first
+        // pixel matches "fore" (because pattern bit 7 is 1 for 0x80).
+        let mut saw_fore = false;
+        for (_x, _y, w, _h, pixels) in &sink.blits {
+            if *w == 0 || pixels.is_empty() {
+                continue;
+            }
+            // First pixel should be fore-color (RGB convention).
+            if &pixels[0..4] == &[0xAA, 0xBB, 0xCC, 0xFF] {
+                saw_fore = true;
+                break;
+            }
+        }
+        assert!(saw_fore, "expected at least one fore-color pixel");
     }
 
     /// CacheGlyph V1 + GlyphIndex round-trip — cache one 8×8 glyph
