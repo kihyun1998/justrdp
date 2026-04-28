@@ -38,7 +38,9 @@ mod websocket;
 #[cfg(target_arch = "wasm32")]
 mod js;
 
-pub use driver::{DriverError, TlsUpgrade, WebClient, MAX_HANDSHAKE_PDU_SIZE};
+pub use driver::{
+    CredsspDriver, DriverError, TlsUpgrade, WebClient, MAX_HANDSHAKE_PDU_SIZE,
+};
 pub use error::{TransportError, TransportErrorKind};
 pub use input::{
     mouse_button_event, mouse_move_event, mouse_wheel_event, scancode_event, MouseButton,

@@ -16,6 +16,7 @@
 //!   enabled in later steps).
 //! * No CredSSP/NLA/AAD/RDSTLS — same handling.
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -58,6 +59,9 @@ pub enum DriverError {
     /// the in-band TLS handshake. The string is the upgrader's own
     /// error rendered via `Display`.
     TlsUpgrade(String),
+    /// An embedder-supplied [`CredsspDriver`] returned an error during
+    /// the SPNEGO / NTLM / Kerberos exchange.
+    Credssp(String),
     /// The driver reached `Connected` but the connector did not produce a
     /// `ConnectionResult` — should be impossible; surfaces as a logic
     /// error rather than a panic.
@@ -91,6 +95,7 @@ impl core::fmt::Display for DriverError {
             Self::TlsRequired => f.write_str("TLS upgrade required (NLA/SSL not yet supported in justrdp-web)"),
             Self::NlaRequired { state } => write!(f, "NLA/CredSSP not yet supported (state={state})"),
             Self::TlsUpgrade(msg) => write!(f, "TLS upgrade: {msg}"),
+            Self::Credssp(msg) => write!(f, "CredSSP: {msg}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }
@@ -306,6 +311,142 @@ impl<T: WebTransport> WebClient<T> {
             .ok_or_else(|| DriverError::internal("Connected state without ConnectionResult"))?;
         Ok((result, new_transport))
     }
+
+    /// Drive the handshake through `Connected` with both an in-band
+    /// TLS upgrade and an embedder-driven CredSSP / NLA exchange.
+    ///
+    /// Five-phase pump:
+    ///   1. Pre-TLS — pump until `EnhancedSecurityUpgrade`.
+    ///   2. TLS — `tls_upgrade.upgrade(transport)`.
+    ///   3. Mid pump — advance through `EnhancedSecurityUpgrade` and
+    ///      pump until either `CredsspNegoTokens` (HYBRID / HYBRID_EX)
+    ///      or `Connected` (SSL-only — no CredSSP needed).
+    ///   4. CredSSP — `credssp.drive(connector, transport)`. The driver
+    ///      runs the SPNEGO + NTLM/Kerberos exchange and advances
+    ///      the connector through every CredSSP state.
+    ///   5. Post-CredSSP — pump until `Connected`.
+    ///
+    /// Use this method only with an SSL/HYBRID-class config; for
+    /// Standard Security use [`Self::connect`] (no TLS / CredSSP), and
+    /// for SSL-without-NLA use [`Self::connect_with_upgrade`] (TLS
+    /// only).
+    pub async fn connect_with_nla<U, C>(
+        mut self,
+        config: justrdp_connector::Config,
+        tls_upgrade: U,
+        credssp: C,
+    ) -> Result<(ConnectionResult, U::Output), DriverError>
+    where
+        U: TlsUpgrade<T>,
+        C: CredsspDriver<U::Output>,
+    {
+        let mut connector = ClientConnector::new(config);
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut output = WriteBuf::new();
+
+        // Phase 1: pre-TLS pump.
+        let stop = pump_until_terminal(
+            &mut self.transport,
+            &mut connector,
+            &mut scratch,
+            &mut output,
+            false,
+        )
+        .await?;
+        match stop {
+            PumpStop::Connected => {
+                return Err(DriverError::internal(
+                    "connect_with_nla: server selected Standard Security; \
+                     use connect() instead",
+                ));
+            }
+            PumpStop::NlaRequired { .. } => {
+                return Err(DriverError::internal(
+                    "connect_with_nla: reached CredSSP state before TLS upgrade",
+                ));
+            }
+            PumpStop::EnhancedSecurityUpgrade => {}
+        }
+
+        // Phase 2: TLS upgrade.
+        let mut new_transport = tls_upgrade
+            .upgrade(self.transport)
+            .await
+            .map_err(|e| DriverError::TlsUpgrade(e.to_string()))?;
+
+        // Step past EnhancedSecurityUpgrade (no-op transition).
+        output.clear();
+        let _written = connector.step(&[], &mut output)?;
+        if !output.is_empty() {
+            new_transport.send(output.as_slice()).await?;
+            output.clear();
+        }
+
+        // Phase 3: pump until either Connected (SSL-only) or
+        // CredsspNegoTokens (HYBRID).
+        let stop = pump_until_terminal(
+            &mut new_transport,
+            &mut connector,
+            &mut scratch,
+            &mut output,
+            true,
+        )
+        .await?;
+        match stop {
+            PumpStop::Connected => {
+                // SSL-only path took us all the way to Connected
+                // without entering CredSSP. CredSSP driver isn't
+                // needed; succeed.
+                let result = connector.result().cloned().ok_or_else(|| {
+                    DriverError::internal("Connected state without ConnectionResult")
+                })?;
+                return Ok((result, new_transport));
+            }
+            PumpStop::EnhancedSecurityUpgrade => {
+                return Err(DriverError::internal(
+                    "post-TLS pump returned to EnhancedSecurityUpgrade",
+                ));
+            }
+            PumpStop::NlaRequired { .. } => {}
+        }
+
+        // Phase 4: CredSSP exchange. The driver advances the
+        // connector through every CredSSP state.
+        credssp
+            .drive(&mut connector, &mut new_transport)
+            .await
+            .map_err(|e| DriverError::Credssp(e.to_string()))?;
+
+        // Phase 5: post-CredSSP pump to Connected.
+        let stop = pump_until_terminal(
+            &mut new_transport,
+            &mut connector,
+            &mut scratch,
+            &mut output,
+            true,
+        )
+        .await?;
+        match stop {
+            PumpStop::Connected => {}
+            PumpStop::EnhancedSecurityUpgrade => {
+                return Err(DriverError::internal(
+                    "post-CredSSP pump returned to EnhancedSecurityUpgrade",
+                ));
+            }
+            PumpStop::NlaRequired { state } => {
+                return Err(DriverError::internal(format!(
+                    "post-CredSSP pump still at NLA state ({state}); \
+                     CredsspDriver did not advance past CredSSP",
+                )));
+            }
+        }
+
+        let result = connector
+            .result()
+            .cloned()
+            .ok_or_else(|| DriverError::internal("Connected state without ConnectionResult"))?;
+        Ok((result, new_transport))
+    }
 }
 
 /// Outcome of one [`pump_until_terminal`] call.
@@ -405,6 +546,42 @@ pub trait TlsUpgrade<T: WebTransport> {
         self,
         transport: T,
     ) -> impl core::future::Future<Output = Result<Self::Output, Self::Error>>;
+}
+
+/// CredSSP / NLA driver contract.
+///
+/// `drive(connector, transport)` runs the full SPNEGO + NTLM/Kerberos
+/// authentication exchange that follows the TLS upgrade for HYBRID /
+/// HYBRID_EX security protocols (MS-CSSP, MS-RDPBCGR 1.3.1.1 phase 3).
+/// On entry, the connector is in `CredsspNegoTokens` (or any other
+/// CredSSP-class state). On successful return, the connector must
+/// have advanced past every CredSSP state — typically reaching
+/// `BasicSettingsExchangeSendInitial`.
+///
+/// Implementations are responsible for:
+/// 1. Building a `CredsspSequence` from
+///    `connector.credssp_credential_type()`.
+/// 2. Driving the per-state TsRequest exchange over `transport`
+///    (server cert, public key auth, encrypted credentials).
+/// 3. Calling `connector.step(&[], &mut output)` to advance through
+///    `CredsspNegoTokens → CredsspPubKeyAuth → CredsspCredentials
+///    → (HYBRID_EX: CredsspEarlyUserAuth) → BasicSettingsExchangeSendInitial`.
+///
+/// justrdp-web ships no CredSSP implementation — the protocol needs
+/// platform-specific NTLM/Kerberos integration (Windows SSPI,
+/// libkrb5, MIT GSS-API). Native callers wire one through this trait;
+/// browser callers typically can't run CredSSP at all and should
+/// either pre-authenticate at the bridge or use a non-NLA target.
+pub trait CredsspDriver<T: WebTransport> {
+    /// Driver-provided error type. The driver wraps it into
+    /// [`DriverError::Credssp`] via `to_string`.
+    type Error: core::fmt::Display;
+
+    fn drive(
+        self,
+        connector: &mut ClientConnector,
+        transport: &mut T,
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>>;
 }
 
 /// Accumulate bytes from the transport until exactly one PDU is buffered.
@@ -789,6 +966,105 @@ mod tests {
         assert!(client.external_tls());
         let client = client.with_external_tls(false);
         assert!(!client.external_tls());
+    }
+
+    /// `CredsspDriver` exists, but a real impl needs platform NTLM /
+    /// Kerberos plumbing. For tests we provide a fake that just calls
+    /// `connector.step([], &mut output)` until the connector advances
+    /// past every CredSSP state (which the existing connector
+    /// implementation does as a no-op state transition — useful for
+    /// pinning the *plumbing*).
+    struct FakeCredsspDriver;
+
+    impl<TT: WebTransport> CredsspDriver<TT> for FakeCredsspDriver {
+        type Error = &'static str;
+
+        async fn drive(
+            self,
+            connector: &mut ClientConnector,
+            transport: &mut TT,
+        ) -> Result<(), Self::Error> {
+            let mut output = WriteBuf::new();
+            // Step at most a few times so a buggy connector doesn't
+            // loop forever in a test.
+            for _ in 0..8 {
+                match connector.state() {
+                    ClientConnectorState::CredsspNegoTokens
+                    | ClientConnectorState::CredsspPubKeyAuth
+                    | ClientConnectorState::CredsspCredentials
+                    | ClientConnectorState::CredsspEarlyUserAuth => {
+                        output.clear();
+                        connector
+                            .step(&[], &mut output)
+                            .map_err(|_| "step failed")?;
+                        if !output.is_empty() {
+                            transport
+                                .send(output.as_slice())
+                                .await
+                                .map_err(|_| "send failed")?;
+                            output.clear();
+                        }
+                    }
+                    _ => return Ok(()),
+                }
+            }
+            Err("CredSSP state machine did not advance past phase 3")
+        }
+    }
+
+    /// `connect_with_nla` runs TLS upgrade + CredSSP plumbing. With a
+    /// HYBRID protocol the connector visits CredSSP states; the fake
+    /// driver advances past them so the post-CredSSP pump runs and
+    /// stalls on EOF.
+    #[test]
+    fn connect_with_nla_runs_tls_then_credssp_plumbing() {
+        use justrdp_pdu::x224::{ConnectionConfirm, NegotiationResponse, NegotiationResponseFlags};
+        use justrdp_core::{Encode, WriteCursor};
+
+        block_on(async {
+            // Server picks HYBRID — connector goes through TLS then
+            // CredSSP.
+            let cc = ConnectionConfirm::success(NegotiationResponse {
+                flags: NegotiationResponseFlags::NONE,
+                protocol: SecurityProtocol::HYBRID,
+            });
+            let inner_size = cc.size();
+            let total = 4 + inner_size;
+            let mut buf = vec![0u8; total];
+            buf[0] = 0x03;
+            buf[1] = 0x00;
+            buf[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+            let mut cursor = WriteCursor::new(&mut buf[4..]);
+            cc.encode(&mut cursor).unwrap();
+
+            let shared = Rc::new(RefCell::new(CaptureShared {
+                sent: Vec::new(),
+                recv: VecDeque::from([Ok(buf)]),
+                closed: false,
+            }));
+            let transport = CaptureTransport {
+                shared: Rc::clone(&shared),
+            };
+
+            let mut config = Config::builder("alice", "p4ss")
+                .security_protocol(SecurityProtocol::HYBRID)
+                .build();
+            config.client_random = Some([0x42; 32]);
+
+            let client = WebClient::new(transport);
+            let result = client
+                .connect_with_nla(config, FakeTlsUpgrade, FakeCredsspDriver)
+                .await;
+            // Post-CredSSP pump stalls on recv EOF — Transport error
+            // confirms we got past TLS upgrade AND the CredSSP plumbing.
+            let err = result.unwrap_err();
+            match err {
+                DriverError::Transport(e) => {
+                    assert_eq!(e.kind(), TransportErrorKind::ConnectionClosed);
+                }
+                other => panic!("expected Transport(ConnectionClosed), got {other:?}"),
+            }
+        });
     }
 
     /// Fake [`TlsUpgrade`] for tests — wraps the inner `CaptureTransport`
