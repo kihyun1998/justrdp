@@ -36,7 +36,10 @@ use justrdp_graphics::rfx::wire::{
 use justrdp_graphics::rfx::{RfxDecoder, RfxError, TILE_COEFFICIENTS, TILE_SIZE};
 use alloc::boxed::Box;
 
-use justrdp_graphics::avc::{yuv420_to_bgra, AvcDecoder, AvcError};
+use justrdp_graphics::avc::{
+    combine_avc444_planes, combine_avc444v2_planes, yuv420_to_bgra, yuv444_to_bgra, AvcDecoder,
+    AvcError, Yuv420Frame,
+};
 use justrdp_graphics::clearcodec::{ClearCodecDecoder, ClearCodecError};
 use justrdp_graphics::nscodec::{NsCodecDecompressor, NsCodecError};
 use justrdp_graphics::{BitsPerPixel, RleDecompressor, RleError};
@@ -102,10 +105,11 @@ pub enum RenderError {
     /// the decoder is buffering for B-frames). The blit is a no-op but
     /// surfaces here so the embedder can keep frame ids in sync.
     AvcFrameUnavailable,
-    /// AVC444 metablock-driven path (two sub-streams + region map per
-    /// MS-RDPEGFX 2.2.4.4) is not yet implemented in this crate. The
-    /// embedder can still receive AVC420 single-stream blits.
-    Avc444NotImplemented,
+    /// AVC444 wire stream advertised an `LC` code that requires a
+    /// previous-frame luma cache the renderer doesn't keep yet
+    /// (`LC = 1`, chroma-only refresh). Frames following an `LC = 0`
+    /// or `LC = 2` are decoded normally.
+    AvcLumaCacheRequired,
 }
 
 impl core::fmt::Display for RenderError {
@@ -147,9 +151,10 @@ impl core::fmt::Display for RenderError {
                 "AVC codec_id registered but no AvcDecoder was injected (set_avc_decoder)",
             ),
             Self::AvcFrameUnavailable => f.write_str("AVC decoder returned no frame this call"),
-            Self::Avc444NotImplemented => {
-                f.write_str("AVC444 metablock path not yet implemented; AVC420 only")
-            }
+            Self::AvcLumaCacheRequired => f.write_str(
+                "AVC444 frame uses LC=1 (chroma-only refresh) which needs a cached luma frame; \
+                 unsupported in justrdp-web — wait for the next LC=0 / LC=2 keyframe",
+            ),
         }
     }
 }
@@ -285,10 +290,11 @@ pub struct BitmapRenderer {
     clearcodec_decoder: Option<ClearCodecDecoder>,
     /// codec_id assigned to AVC420 (single-stream H.264).
     avc420_codec_id: Option<u8>,
-    /// codec_id assigned to AVC444 (dual-stream luma + chroma aux).
-    /// Decoding the metablock layout is left for a follow-up; this
-    /// field exists so registration is symmetric with avc420.
+    /// codec_id assigned to AVC444 (dual-stream luma + chroma aux,
+    /// MS-RDPEGFX 2.2.4.4.2 layout).
     avc444_codec_id: Option<u8>,
+    /// codec_id assigned to AVC444v2 (MS-RDPEGFX 2.2.4.4.3 layout).
+    avc444v2_codec_id: Option<u8>,
     /// Embedder-supplied H.264 decoder. `Box<dyn AvcDecoder>` because
     /// justrdp-web does NOT bundle an H.264 implementation — wasm32
     /// callers usually wrap the browser's MediaSource / VideoDecoder
@@ -314,6 +320,7 @@ impl core::fmt::Debug for BitmapRenderer {
             .field("clearcodec_codec_id", &self.clearcodec_codec_id)
             .field("avc420_codec_id", &self.avc420_codec_id)
             .field("avc444_codec_id", &self.avc444_codec_id)
+            .field("avc444v2_codec_id", &self.avc444v2_codec_id)
             .field("has_avc_decoder", &self.avc_decoder.is_some())
             .finish_non_exhaustive()
     }
@@ -333,6 +340,7 @@ impl BitmapRenderer {
             clearcodec_decoder: None,
             avc420_codec_id: None,
             avc444_codec_id: None,
+            avc444v2_codec_id: None,
             avc_decoder: None,
         }
     }
@@ -365,16 +373,26 @@ impl BitmapRenderer {
         self.avc420_codec_id
     }
 
-    /// Register the AVC444 server-assigned codec_id. Decoding the
-    /// MS-RDPEGFX 2.2.4.4 metablock + region map is not yet wired —
-    /// matching frames currently surface as
-    /// [`RenderError::Avc444NotImplemented`].
+    /// Register the AVC444 (v1 layout) server-assigned codec_id.
+    /// Wire format: MS-RDPEGFX 2.2.4.4.2.
     pub fn set_avc444_codec_id(&mut self, codec_id: u8) {
         self.avc444_codec_id = Some(codec_id);
     }
 
     pub fn avc444_codec_id(&self) -> Option<u8> {
         self.avc444_codec_id
+    }
+
+    /// Register the AVC444v2 server-assigned codec_id (modern Windows
+    /// default for high-color session graphics). Wire format:
+    /// MS-RDPEGFX 2.2.4.4.3 — same `LC` code as v1 but a different
+    /// chroma-aux layout consumed by [`combine_avc444v2_planes`].
+    pub fn set_avc444v2_codec_id(&mut self, codec_id: u8) {
+        self.avc444v2_codec_id = Some(codec_id);
+    }
+
+    pub fn avc444v2_codec_id(&self) -> Option<u8> {
+        self.avc444v2_codec_id
     }
 
     /// Register the NSCodec server-assigned codec_id. Subsequent
@@ -679,26 +697,33 @@ impl BitmapRenderer {
             return self.blit_avc420_surface_bits(dest_left, dest_top, data, sink);
         }
         if Some(data.codec_id) == self.avc444_codec_id {
-            // The embedder still needs a decoder injected before we can
-            // claim the codec_id is "supported"; surface that first so
-            // the failure mode is consistent with AVC420.
-            if self.avc_decoder.is_none() {
-                return Err(RenderError::AvcDecoderMissing);
-            }
-            return Err(RenderError::Avc444NotImplemented);
+            return self.blit_avc444_surface_bits(
+                dest_left,
+                dest_top,
+                data,
+                sink,
+                Avc444Layout::V1,
+            );
+        }
+        if Some(data.codec_id) == self.avc444v2_codec_id {
+            return self.blit_avc444_surface_bits(
+                dest_left,
+                dest_top,
+                data,
+                sink,
+                Avc444Layout::V2,
+            );
         }
         Err(RenderError::UnsupportedCodec {
             codec_id: data.codec_id,
         })
     }
 
-    /// AVC420 single-stream blit. Treats `bitmap_data` as a complete
-    /// H.264 Annex B access unit (one frame), feeds it to the injected
-    /// `AvcDecoder`, then converts YUV 4:2:0 → BGRA → RGBA → sink.
-    ///
-    /// `data.width` / `data.height` are the *display* (cropped) size;
-    /// the decoded H.264 frame may be larger (16-aligned). `yuv420_to_bgra`
-    /// only converts the area that fits.
+    /// AVC420 single-stream blit. The wire format is
+    /// `RDPGFX_AVC420_BITMAP_STREAM` (MS-RDPEGFX 2.2.4.4.1):
+    /// numRegionRects + region rects + quantQualityVals + Annex B.
+    /// We strip the metablock and feed the trailing Annex B to the
+    /// injected `AvcDecoder`.
     fn blit_avc420_surface_bits<S: FrameSink>(
         &mut self,
         dest_left: u16,
@@ -710,22 +735,82 @@ impl BitmapRenderer {
             .avc_decoder
             .as_mut()
             .ok_or(RenderError::AvcDecoderMissing)?;
-        let frame_opt = decoder.decode_frame(&data.bitmap_data)?;
+        let annex_b = strip_avc420_metablock(&data.bitmap_data)?;
+        let frame_opt = decoder.decode_frame(annex_b)?;
         let frame = frame_opt.ok_or(RenderError::AvcFrameUnavailable)?;
-        let pixel_count = data.width as usize * data.height as usize;
-        let mut bgra = alloc::vec![0u8; pixel_count * 4];
-        yuv420_to_bgra(&frame, &mut bgra, data.width as u32, data.height as u32)?;
-
-        // BGRA → RGBA (Surface Commands top-down, no row flip needed).
-        let mut rgba = Vec::with_capacity(bgra.len());
-        for px in bgra.chunks_exact(4) {
-            rgba.push(px[2]);
-            rgba.push(px[1]);
-            rgba.push(px[0]);
-            rgba.push(px[3]);
-        }
-        sink.blit_rgba(dest_left, dest_top, data.width, data.height, &rgba);
+        blit_yuv420_frame(&frame, dest_left, dest_top, data.width, data.height, sink)?;
         Ok(true)
+    }
+
+    /// AVC444 (v1 / v2) blit. Wire layout:
+    ///   `cbAvc420EncodedBitstream1` (u32 LE, high 4 bits = LC, low 28 = size)
+    ///   `avc420EncodedBitstream1` (size bytes, RDPGFX_AVC420_BITMAP_STREAM)
+    ///   `avc420EncodedBitstream2` (rest, optional, RDPGFX_AVC420_BITMAP_STREAM)
+    ///
+    /// LC code (MS-RDPEGFX 3.3.8.3):
+    ///   0 → main view only (effectively AVC420; bitstream2 absent)
+    ///   1 → chroma-only refresh — requires a cached previous luma; we
+    ///       surface this as `RenderError::AvcLumaCacheRequired` rather
+    ///       than rendering against a stale frame
+    ///   2 → both bitstreams present, combine into YUV 4:4:4
+    fn blit_avc444_surface_bits<S: FrameSink>(
+        &mut self,
+        dest_left: u16,
+        dest_top: u16,
+        data: &BitmapDataEx,
+        sink: &mut S,
+        layout: Avc444Layout,
+    ) -> Result<bool, RenderError> {
+        if self.avc_decoder.is_none() {
+            return Err(RenderError::AvcDecoderMissing);
+        }
+        let (lc, bitstream1, bitstream2) = parse_avc444_envelope(&data.bitmap_data)?;
+        match lc {
+            0 => {
+                // Main view alone — same as AVC420.
+                let decoder = self.avc_decoder.as_mut().unwrap();
+                let annex_b = strip_avc420_metablock(bitstream1)?;
+                let frame = decoder
+                    .decode_frame(annex_b)?
+                    .ok_or(RenderError::AvcFrameUnavailable)?;
+                blit_yuv420_frame(&frame, dest_left, dest_top, data.width, data.height, sink)?;
+                Ok(true)
+            }
+            2 => {
+                let decoder = self.avc_decoder.as_mut().unwrap();
+                let main_annex = strip_avc420_metablock(bitstream1)?;
+                let main = decoder
+                    .decode_frame(main_annex)?
+                    .ok_or(RenderError::AvcFrameUnavailable)?;
+                let aux_bytes =
+                    bitstream2.ok_or_else(|| RenderError::SizeMismatch(
+                        "AVC444 LC=2 missing bitstream2".into(),
+                    ))?;
+                let aux_annex = strip_avc420_metablock(aux_bytes)?;
+                let aux = decoder
+                    .decode_frame(aux_annex)?
+                    .ok_or(RenderError::AvcFrameUnavailable)?;
+                let yuv444 = match layout {
+                    Avc444Layout::V1 => combine_avc444_planes(&main, &aux)?,
+                    Avc444Layout::V2 => combine_avc444v2_planes(&main, &aux)?,
+                };
+                let pixel_count = data.width as usize * data.height as usize;
+                let mut bgra = alloc::vec![0u8; pixel_count * 4];
+                yuv444_to_bgra(&yuv444, &mut bgra, data.width as u32, data.height as u32)?;
+                sink.blit_rgba(
+                    dest_left,
+                    dest_top,
+                    data.width,
+                    data.height,
+                    &swap_bgra_to_rgba(&bgra),
+                );
+                Ok(true)
+            }
+            1 => Err(RenderError::AvcLumaCacheRequired),
+            other => Err(RenderError::SizeMismatch(format!(
+                "AVC444 envelope: unknown LC code {other}"
+            ))),
+        }
     }
 
     fn decode_bitmap_rects(&self, payload: &[u8]) -> Result<Vec<DecodedRect>, RenderError> {
@@ -906,6 +991,114 @@ fn blit_raw_surface_bits<S: FrameSink>(
     }
     sink.blit_rgba(dest_left, dest_top, data.width, data.height, &rgba);
     Ok(true)
+}
+
+/// AVC444 wire layout selector — picks `combine_avc444_planes` (v1) or
+/// `combine_avc444v2_planes` (v2) per the registered codec_id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Avc444Layout {
+    V1,
+    V2,
+}
+
+/// `RDPGFX_AVC420_BITMAP_STREAM` (MS-RDPEGFX 2.2.4.4.1):
+///   numRegionRects (u32 LE)
+///   regionRects[N]              — 8 bytes each (left/top/right/bottom u16 LE)
+///   quantQualityVals[N]         — 3 bytes each (qp + reserved + qualityVal)
+///   avc420EncodedBitstream      — Annex B byte stream (rest of the buffer)
+///
+/// Returns the trailing Annex B slice. We don't interpret the region or
+/// quant entries — they describe rectangles inside the destination
+/// surface that the H.264 decoder already covers.
+fn strip_avc420_metablock(data: &[u8]) -> Result<&[u8], RenderError> {
+    if data.len() < 4 {
+        return Err(RenderError::SizeMismatch(format!(
+            "AVC420 stream truncated: {} bytes, need at least 4",
+            data.len()
+        )));
+    }
+    let n = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let after_count = 4usize;
+    let after_rects = after_count
+        .checked_add(n.checked_mul(8).ok_or_else(|| {
+            RenderError::SizeMismatch("AVC420 numRegionRects overflow".into())
+        })?)
+        .ok_or_else(|| RenderError::SizeMismatch("AVC420 metablock overflow".into()))?;
+    let after_quant = after_rects
+        .checked_add(n.checked_mul(3).ok_or_else(|| {
+            RenderError::SizeMismatch("AVC420 quant table overflow".into())
+        })?)
+        .ok_or_else(|| RenderError::SizeMismatch("AVC420 metablock overflow".into()))?;
+    if data.len() < after_quant {
+        return Err(RenderError::SizeMismatch(format!(
+            "AVC420 stream short: need {after_quant} bytes for {n} regions, got {}",
+            data.len()
+        )));
+    }
+    Ok(&data[after_quant..])
+}
+
+/// `RDPGFX_AVC444_BITMAP_STREAM` envelope (MS-RDPEGFX 2.2.4.4.2 / .3):
+///   cbAvc420EncodedBitstream1 (u32 LE) — high 4 bits = LC, low 28 = size
+///   avc420EncodedBitstream1   (`size` bytes, RDPGFX_AVC420_BITMAP_STREAM)
+///   avc420EncodedBitstream2   (rest of the buffer, optional)
+fn parse_avc444_envelope(data: &[u8]) -> Result<(u8, &[u8], Option<&[u8]>), RenderError> {
+    if data.len() < 4 {
+        return Err(RenderError::SizeMismatch(format!(
+            "AVC444 envelope truncated: {} bytes, need at least 4",
+            data.len()
+        )));
+    }
+    let header = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    // High 4 bits of the u32 → LC code; spec defines values 0–2.
+    let lc = ((header >> 28) & 0x0F) as u8;
+    let size1 = (header & 0x0FFF_FFFF) as usize;
+    let body = &data[4..];
+    if body.len() < size1 {
+        return Err(RenderError::SizeMismatch(format!(
+            "AVC444 envelope: cbAvc420EncodedBitstream1 = {size1} but body has {} bytes",
+            body.len()
+        )));
+    }
+    let bitstream1 = &body[..size1];
+    let bitstream2 = if body.len() > size1 {
+        Some(&body[size1..])
+    } else {
+        None
+    };
+    Ok((lc, bitstream1, bitstream2))
+}
+
+/// Convert one decoded `Yuv420Frame` to top-down RGBA and blit at
+/// `(dest_left, dest_top)` with the *display* `width` / `height`. The
+/// coded dimensions of `frame` may exceed the display size (16-aligned
+/// macroblocks) — `yuv420_to_bgra` only writes the area that fits.
+fn blit_yuv420_frame<S: FrameSink>(
+    frame: &Yuv420Frame,
+    dest_left: u16,
+    dest_top: u16,
+    width: u16,
+    height: u16,
+    sink: &mut S,
+) -> Result<(), RenderError> {
+    let pixel_count = width as usize * height as usize;
+    let mut bgra = alloc::vec![0u8; pixel_count * 4];
+    yuv420_to_bgra(frame, &mut bgra, width as u32, height as u32)?;
+    sink.blit_rgba(dest_left, dest_top, width, height, &swap_bgra_to_rgba(&bgra));
+    Ok(())
+}
+
+/// In-place would alias the buffer in test code; allocate a fresh vec
+/// so callers can keep the source for further conversion.
+fn swap_bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(bgra.len());
+    for px in bgra.chunks_exact(4) {
+        rgba.push(px[2]);
+        rgba.push(px[1]);
+        rgba.push(px[0]);
+        rgba.push(px[3]);
+    }
+    rgba
 }
 
 /// NSCodec → BGRA → RGBA top-down blit. NSCodec output is always
@@ -1964,11 +2157,34 @@ mod tests {
         }
     }
 
+    /// Build a RDPGFX_AVC420_BITMAP_STREAM with zero region rects (the
+    /// trailing Annex B body is `annex_b`).
+    fn build_avc420_stream(annex_b: &[u8]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(4 + annex_b.len());
+        data.extend_from_slice(&0u32.to_le_bytes()); // numRegionRects = 0
+        data.extend_from_slice(annex_b);
+        data
+    }
+
+    /// Build a RDPGFX_AVC444_BITMAP_STREAM with the given LC code,
+    /// `bitstream1` (always present), and optional `bitstream2`.
+    fn build_avc444_envelope(lc: u8, bitstream1: &[u8], bitstream2: Option<&[u8]>) -> Vec<u8> {
+        assert!(lc <= 0x0F);
+        let header: u32 = ((lc as u32) << 28) | ((bitstream1.len() as u32) & 0x0FFF_FFFF);
+        let mut data = Vec::with_capacity(4 + bitstream1.len() + bitstream2.map_or(0, |b| b.len()));
+        data.extend_from_slice(&header.to_le_bytes());
+        data.extend_from_slice(bitstream1);
+        if let Some(b2) = bitstream2 {
+            data.extend_from_slice(b2);
+        }
+        data
+    }
+
     #[test]
     fn avc420_round_trip_with_injected_decoder() {
         let codec_id = 0x0E;
-        let payload =
-            build_set_surface_bits_codec(codec_id, 4, 8, 16, 16, alloc::vec![0u8; 64]);
+        let stream = build_avc420_stream(&[0u8; 64]);
+        let payload = build_set_surface_bits_codec(codec_id, 4, 8, 16, 16, stream);
         let event = SessionEvent::Graphics {
             update_code: FastPathUpdateType::SurfaceCommands,
             data: payload,
@@ -2000,7 +2216,8 @@ mod tests {
     #[test]
     fn avc420_without_decoder_surfaces_typed_missing_error() {
         let codec_id = 0x0E;
-        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, vec![0u8; 8]);
+        let stream = build_avc420_stream(&[0u8; 8]);
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, stream);
         let event = SessionEvent::Graphics {
             update_code: FastPathUpdateType::SurfaceCommands,
             data: payload,
@@ -2022,7 +2239,8 @@ mod tests {
     #[test]
     fn avc420_decoder_yielding_none_surfaces_frame_unavailable() {
         let codec_id = 0x0E;
-        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, vec![0u8; 8]);
+        let stream = build_avc420_stream(&[0u8; 8]);
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, stream);
         let event = SessionEvent::Graphics {
             update_code: FastPathUpdateType::SurfaceCommands,
             data: payload,
@@ -2038,13 +2256,61 @@ mod tests {
         );
     }
 
-    /// AVC444 path is registered + decoder is provided, but the wire
-    /// metablock parser is not yet wired. We must surface the typed
-    /// `Avc444NotImplemented` error rather than guessing at the layout.
+    /// AVC444 LC=0 (main view only) — falls back to the AVC420 path
+    /// internally. The renderer must accept it and produce one blit.
     #[test]
-    fn avc444_surfaces_typed_not_implemented() {
+    fn avc444_lc0_main_view_only_blits() {
         let codec_id = 0x0F;
-        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, vec![0u8; 8]);
+        let envelope = build_avc444_envelope(0, &build_avc420_stream(&[0u8; 32]), None);
+        let payload = build_set_surface_bits_codec(codec_id, 1, 2, 16, 16, envelope);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_avc444_codec_id(codec_id);
+        renderer.set_avc_decoder(alloc::boxed::Box::new(FakeAvcDecoder::yielding(16, 16, 0x40)));
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        assert_eq!(sink.blits.len(), 1);
+        assert_eq!((sink.blits[0].0, sink.blits[0].1), (1, 2));
+    }
+
+    /// AVC444 LC=2 (both substreams) — exercises both decode_frame
+    /// calls + combine_avc444_planes + yuv444_to_bgra. Two blits would
+    /// be wrong; we expect exactly one.
+    #[test]
+    fn avc444_lc2_combines_both_substreams_v1_layout() {
+        let codec_id = 0x0F;
+        let envelope = build_avc444_envelope(
+            2,
+            &build_avc420_stream(&[0u8; 16]), // main
+            Some(&build_avc420_stream(&[0u8; 16])), // aux
+        );
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, envelope);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_avc444_codec_id(codec_id);
+        renderer.set_avc_decoder(alloc::boxed::Box::new(FakeAvcDecoder::yielding(16, 16, 0x80)));
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        assert_eq!(sink.blits.len(), 1, "AVC444 LC=2 should fold into one blit");
+    }
+
+    /// AVC444 LC=1 (chroma-only refresh) requires a previous-frame
+    /// luma cache; we explicitly surface that as
+    /// `RenderError::AvcLumaCacheRequired` so the embedder can wait
+    /// for the next keyframe instead of painting against stale luma.
+    #[test]
+    fn avc444_lc1_surfaces_luma_cache_required() {
+        let codec_id = 0x0F;
+        let envelope = build_avc444_envelope(1, &build_avc420_stream(&[0u8; 8]), None);
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, envelope);
         let event = SessionEvent::Graphics {
             update_code: FastPathUpdateType::SurfaceCommands,
             data: payload,
@@ -2055,9 +2321,31 @@ mod tests {
         let mut sink = Capture::new();
         let err = renderer.render(&event, &mut sink).unwrap_err();
         assert!(
-            matches!(err, RenderError::Avc444NotImplemented),
-            "expected Avc444NotImplemented, got {err:?}"
+            matches!(err, RenderError::AvcLumaCacheRequired),
+            "expected AvcLumaCacheRequired, got {err:?}"
         );
+    }
+
+    /// AVC444v2 codec_id is wired separately — the same envelope works
+    /// because the LC code lives in the same place; only the chroma-aux
+    /// combination layout differs (v2 vs v1). We just need a smoke
+    /// test that the v2 dispatch is reachable.
+    #[test]
+    fn avc444v2_lc0_is_dispatchable() {
+        let codec_id = 0x10;
+        let envelope = build_avc444_envelope(0, &build_avc420_stream(&[0u8; 16]), None);
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, envelope);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_avc444v2_codec_id(codec_id);
+        renderer.set_avc_decoder(alloc::boxed::Box::new(FakeAvcDecoder::yielding(16, 16, 0x33)));
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        assert_eq!(sink.blits.len(), 1);
     }
 
     /// `clear_avc_decoder` must drop the injection so subsequent calls
@@ -2065,7 +2353,8 @@ mod tests {
     #[test]
     fn clear_avc_decoder_disarms_dispatch() {
         let codec_id = 0x0E;
-        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, vec![0u8; 8]);
+        let stream = build_avc420_stream(&[0u8; 8]);
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, stream);
         let mut renderer = BitmapRenderer::new();
         renderer.set_avc420_codec_id(codec_id);
         renderer.set_avc_decoder(alloc::boxed::Box::new(FakeAvcDecoder::yielding(16, 16, 0)));
