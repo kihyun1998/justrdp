@@ -34,6 +34,9 @@ use justrdp_graphics::rfx::wire::{
     WBT_FRAME_END, WBT_REGION, WBT_SYNC,
 };
 use justrdp_graphics::rfx::{RfxDecoder, RfxError, TILE_COEFFICIENTS, TILE_SIZE};
+use alloc::boxed::Box;
+
+use justrdp_graphics::avc::{yuv420_to_bgra, AvcDecoder, AvcError};
 use justrdp_graphics::clearcodec::{ClearCodecDecoder, ClearCodecError};
 use justrdp_graphics::nscodec::{NsCodecDecompressor, NsCodecError};
 use justrdp_graphics::{BitsPerPixel, RleDecompressor, RleError};
@@ -87,6 +90,22 @@ pub enum RenderError {
     NsCodec(NsCodecError),
     /// ClearCodec (MS-RDPEGFX 2.2.4) decode failed.
     ClearCodec(ClearCodecError),
+    /// AVC (H.264) decode or YUV→BGRA conversion failed. Emitted by the
+    /// injected [`AvcDecoder`] or by [`yuv420_to_bgra`] downstream.
+    Avc(AvcError),
+    /// `set_avc420_codec_id` (or 444 sibling) was registered but no
+    /// `AvcDecoder` was injected. The justrdp-web crate has no built-in
+    /// H.264 decoder — the embedder MUST provide one
+    /// (browser MediaSource on wasm32, openh264 / FFmpeg on native).
+    AvcDecoderMissing,
+    /// AVC frame returned no output (P-frame with no visible delta, or
+    /// the decoder is buffering for B-frames). The blit is a no-op but
+    /// surfaces here so the embedder can keep frame ids in sync.
+    AvcFrameUnavailable,
+    /// AVC444 metablock-driven path (two sub-streams + region map per
+    /// MS-RDPEGFX 2.2.4.4) is not yet implemented in this crate. The
+    /// embedder can still receive AVC420 single-stream blits.
+    Avc444NotImplemented,
 }
 
 impl core::fmt::Display for RenderError {
@@ -123,6 +142,14 @@ impl core::fmt::Display for RenderError {
             ),
             Self::NsCodec(e) => write!(f, "NSCodec: {e}"),
             Self::ClearCodec(e) => write!(f, "ClearCodec: {e}"),
+            Self::Avc(e) => write!(f, "AVC: {e}"),
+            Self::AvcDecoderMissing => f.write_str(
+                "AVC codec_id registered but no AvcDecoder was injected (set_avc_decoder)",
+            ),
+            Self::AvcFrameUnavailable => f.write_str("AVC decoder returned no frame this call"),
+            Self::Avc444NotImplemented => {
+                f.write_str("AVC444 metablock path not yet implemented; AVC420 only")
+            }
         }
     }
 }
@@ -136,6 +163,12 @@ impl From<NsCodecError> for RenderError {
 impl From<ClearCodecError> for RenderError {
     fn from(e: ClearCodecError) -> Self {
         Self::ClearCodec(e)
+    }
+}
+
+impl From<AvcError> for RenderError {
+    fn from(e: AvcError) -> Self {
+        Self::Avc(e)
     }
 }
 
@@ -250,6 +283,17 @@ pub struct BitmapRenderer {
     /// lazily on first use to avoid the allocation when the codec
     /// isn't registered.
     clearcodec_decoder: Option<ClearCodecDecoder>,
+    /// codec_id assigned to AVC420 (single-stream H.264).
+    avc420_codec_id: Option<u8>,
+    /// codec_id assigned to AVC444 (dual-stream luma + chroma aux).
+    /// Decoding the metablock layout is left for a follow-up; this
+    /// field exists so registration is symmetric with avc420.
+    avc444_codec_id: Option<u8>,
+    /// Embedder-supplied H.264 decoder. `Box<dyn AvcDecoder>` because
+    /// justrdp-web does NOT bundle an H.264 implementation — wasm32
+    /// callers usually wrap the browser's MediaSource / VideoDecoder
+    /// API; native callers wrap openh264 / FFmpeg / hardware backends.
+    avc_decoder: Option<Box<dyn AvcDecoder>>,
 }
 
 impl Default for BitmapRenderer {
@@ -268,6 +312,9 @@ impl core::fmt::Debug for BitmapRenderer {
             .field("last_primary_type", &self.last_primary_type)
             .field("nscodec_codec_id", &self.nscodec_codec_id)
             .field("clearcodec_codec_id", &self.clearcodec_codec_id)
+            .field("avc420_codec_id", &self.avc420_codec_id)
+            .field("avc444_codec_id", &self.avc444_codec_id)
+            .field("has_avc_decoder", &self.avc_decoder.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -284,7 +331,50 @@ impl BitmapRenderer {
             nscodec_codec_id: None,
             clearcodec_codec_id: None,
             clearcodec_decoder: None,
+            avc420_codec_id: None,
+            avc444_codec_id: None,
+            avc_decoder: None,
         }
+    }
+
+    /// Inject an embedder-supplied H.264 decoder. Required before any
+    /// AVC420 / AVC444 codec_id can render frames. Replaces any
+    /// previously-installed decoder (the old one is dropped).
+    pub fn set_avc_decoder(&mut self, decoder: Box<dyn AvcDecoder>) {
+        self.avc_decoder = Some(decoder);
+    }
+
+    /// Drop the injected AVC decoder. Subsequent AVC420 / AVC444
+    /// frames will surface as [`RenderError::AvcDecoderMissing`].
+    pub fn clear_avc_decoder(&mut self) {
+        self.avc_decoder = None;
+    }
+
+    pub fn has_avc_decoder(&self) -> bool {
+        self.avc_decoder.is_some()
+    }
+
+    /// Register the AVC420 server-assigned codec_id. The matching
+    /// Surface Bits cmd's `bitmap_data` is treated as a single H.264
+    /// Annex B access unit and fed to the injected decoder.
+    pub fn set_avc420_codec_id(&mut self, codec_id: u8) {
+        self.avc420_codec_id = Some(codec_id);
+    }
+
+    pub fn avc420_codec_id(&self) -> Option<u8> {
+        self.avc420_codec_id
+    }
+
+    /// Register the AVC444 server-assigned codec_id. Decoding the
+    /// MS-RDPEGFX 2.2.4.4 metablock + region map is not yet wired —
+    /// matching frames currently surface as
+    /// [`RenderError::Avc444NotImplemented`].
+    pub fn set_avc444_codec_id(&mut self, codec_id: u8) {
+        self.avc444_codec_id = Some(codec_id);
+    }
+
+    pub fn avc444_codec_id(&self) -> Option<u8> {
+        self.avc444_codec_id
     }
 
     /// Register the NSCodec server-assigned codec_id. Subsequent
@@ -585,9 +675,57 @@ impl BitmapRenderer {
             );
             return blit_clearcodec_surface_bits(decoder, dest_left, dest_top, data, sink);
         }
+        if Some(data.codec_id) == self.avc420_codec_id {
+            return self.blit_avc420_surface_bits(dest_left, dest_top, data, sink);
+        }
+        if Some(data.codec_id) == self.avc444_codec_id {
+            // The embedder still needs a decoder injected before we can
+            // claim the codec_id is "supported"; surface that first so
+            // the failure mode is consistent with AVC420.
+            if self.avc_decoder.is_none() {
+                return Err(RenderError::AvcDecoderMissing);
+            }
+            return Err(RenderError::Avc444NotImplemented);
+        }
         Err(RenderError::UnsupportedCodec {
             codec_id: data.codec_id,
         })
+    }
+
+    /// AVC420 single-stream blit. Treats `bitmap_data` as a complete
+    /// H.264 Annex B access unit (one frame), feeds it to the injected
+    /// `AvcDecoder`, then converts YUV 4:2:0 → BGRA → RGBA → sink.
+    ///
+    /// `data.width` / `data.height` are the *display* (cropped) size;
+    /// the decoded H.264 frame may be larger (16-aligned). `yuv420_to_bgra`
+    /// only converts the area that fits.
+    fn blit_avc420_surface_bits<S: FrameSink>(
+        &mut self,
+        dest_left: u16,
+        dest_top: u16,
+        data: &BitmapDataEx,
+        sink: &mut S,
+    ) -> Result<bool, RenderError> {
+        let decoder = self
+            .avc_decoder
+            .as_mut()
+            .ok_or(RenderError::AvcDecoderMissing)?;
+        let frame_opt = decoder.decode_frame(&data.bitmap_data)?;
+        let frame = frame_opt.ok_or(RenderError::AvcFrameUnavailable)?;
+        let pixel_count = data.width as usize * data.height as usize;
+        let mut bgra = alloc::vec![0u8; pixel_count * 4];
+        yuv420_to_bgra(&frame, &mut bgra, data.width as u32, data.height as u32)?;
+
+        // BGRA → RGBA (Surface Commands top-down, no row flip needed).
+        let mut rgba = Vec::with_capacity(bgra.len());
+        for px in bgra.chunks_exact(4) {
+            rgba.push(px[2]);
+            rgba.push(px[1]);
+            rgba.push(px[0]);
+            rgba.push(px[3]);
+        }
+        sink.blit_rgba(dest_left, dest_top, data.width, data.height, &rgba);
+        Ok(true)
     }
 
     fn decode_bitmap_rects(&self, payload: &[u8]) -> Result<Vec<DecodedRect>, RenderError> {
@@ -1778,6 +1916,169 @@ mod tests {
         let mut sink = Capture::new();
         let err = renderer.render(&event, &mut sink).unwrap_err();
         assert!(matches!(err, RenderError::UnsupportedCodec { codec_id: 0x0A }));
+    }
+
+    // ── AVC420 / AVC444 (S3d-5b) ───────────────────────────────────
+
+    /// Fake AvcDecoder for tests — returns a pre-built `Yuv420Frame`
+    /// for every call (or `Ok(None)` when configured to drop frames).
+    /// Keeps a hit counter so the test can verify dispatch happened.
+    struct FakeAvcDecoder {
+        frame: Option<justrdp_graphics::avc::Yuv420Frame>,
+        calls: u32,
+    }
+
+    impl FakeAvcDecoder {
+        fn yielding(width: u32, height: u32, fill: u8) -> Self {
+            // 16-aligned coded size (H.264 macroblock).
+            let coded_w = ((width + 15) / 16) * 16;
+            let coded_h = ((height + 15) / 16) * 16;
+            Self {
+                frame: Some(justrdp_graphics::avc::Yuv420Frame {
+                    y: alloc::vec![fill; (coded_w * coded_h) as usize],
+                    u: alloc::vec![128; ((coded_w / 2) * (coded_h / 2)) as usize],
+                    v: alloc::vec![128; ((coded_w / 2) * (coded_h / 2)) as usize],
+                    width: coded_w,
+                    height: coded_h,
+                }),
+                calls: 0,
+            }
+        }
+
+        fn empty() -> Self {
+            Self {
+                frame: None,
+                calls: 0,
+            }
+        }
+    }
+
+    impl justrdp_graphics::avc::AvcDecoder for FakeAvcDecoder {
+        fn decode_frame(
+            &mut self,
+            _annex_b: &[u8],
+        ) -> Result<Option<justrdp_graphics::avc::Yuv420Frame>, justrdp_graphics::avc::AvcError>
+        {
+            self.calls += 1;
+            Ok(self.frame.clone())
+        }
+    }
+
+    #[test]
+    fn avc420_round_trip_with_injected_decoder() {
+        let codec_id = 0x0E;
+        let payload =
+            build_set_surface_bits_codec(codec_id, 4, 8, 16, 16, alloc::vec![0u8; 64]);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_avc420_codec_id(codec_id);
+        // Y=255 (luma white), U=V=128 (no color) → BT.709 reverse maps to
+        // R=G=B=255 white. We just check the alpha pin and that a blit
+        // happened at the right rect.
+        renderer.set_avc_decoder(alloc::boxed::Box::new(FakeAvcDecoder::yielding(
+            16, 16, 255,
+        )));
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew, "AVC420 should produce one blit");
+        assert_eq!(sink.blits.len(), 1);
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!((*x, *y, *w, *h), (4, 8, 16, 16));
+        assert_eq!(pixels.len(), 16 * 16 * 4);
+        // Alpha pinned, rough sanity on white luma.
+        for px in pixels.chunks_exact(4) {
+            assert_eq!(px[3], 0xFF);
+        }
+    }
+
+    /// AVC420 codec_id registered but no decoder injected → typed
+    /// `AvcDecoderMissing` (not `UnsupportedCodec`), so the embedder
+    /// gets a clean signal to plumb a decoder.
+    #[test]
+    fn avc420_without_decoder_surfaces_typed_missing_error() {
+        let codec_id = 0x0E;
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, vec![0u8; 8]);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_avc420_codec_id(codec_id);
+        // No set_avc_decoder call.
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(
+            matches!(err, RenderError::AvcDecoderMissing),
+            "expected AvcDecoderMissing, got {err:?}"
+        );
+    }
+
+    /// Decoder buffering (Ok(None)) surfaces as `AvcFrameUnavailable`,
+    /// distinct from a hard decode error — embedders may choose to keep
+    /// pumping frames in that case.
+    #[test]
+    fn avc420_decoder_yielding_none_surfaces_frame_unavailable() {
+        let codec_id = 0x0E;
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, vec![0u8; 8]);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_avc420_codec_id(codec_id);
+        renderer.set_avc_decoder(alloc::boxed::Box::new(FakeAvcDecoder::empty()));
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(
+            matches!(err, RenderError::AvcFrameUnavailable),
+            "expected AvcFrameUnavailable, got {err:?}"
+        );
+    }
+
+    /// AVC444 path is registered + decoder is provided, but the wire
+    /// metablock parser is not yet wired. We must surface the typed
+    /// `Avc444NotImplemented` error rather than guessing at the layout.
+    #[test]
+    fn avc444_surfaces_typed_not_implemented() {
+        let codec_id = 0x0F;
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, vec![0u8; 8]);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_avc444_codec_id(codec_id);
+        renderer.set_avc_decoder(alloc::boxed::Box::new(FakeAvcDecoder::empty()));
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(
+            matches!(err, RenderError::Avc444NotImplemented),
+            "expected Avc444NotImplemented, got {err:?}"
+        );
+    }
+
+    /// `clear_avc_decoder` must drop the injection so subsequent calls
+    /// flip back to `AvcDecoderMissing`.
+    #[test]
+    fn clear_avc_decoder_disarms_dispatch() {
+        let codec_id = 0x0E;
+        let payload = build_set_surface_bits_codec(codec_id, 0, 0, 16, 16, vec![0u8; 8]);
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_avc420_codec_id(codec_id);
+        renderer.set_avc_decoder(alloc::boxed::Box::new(FakeAvcDecoder::yielding(16, 16, 0)));
+        assert!(renderer.has_avc_decoder());
+        renderer.clear_avc_decoder();
+        assert!(!renderer.has_avc_decoder());
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(matches!(err, RenderError::AvcDecoderMissing));
     }
 
     /// ClearCodec dispatch — same shape as NSCodec. Send a deliberately
