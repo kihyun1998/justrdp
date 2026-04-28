@@ -48,7 +48,7 @@ use justrdp_pdu::rdp::bitmap::{
 };
 use justrdp_pdu::rdp::drawing_orders::{
     decode_dstblt, decode_lineto, decode_memblt, decode_opaque_rect, decode_patblt, decode_scrblt,
-    OpaqueRectOrder, PatBltOrder, PrimaryOrderHistory, PrimaryOrderType,
+    DstBltOrder, LineToOrder, OpaqueRectOrder, PatBltOrder, PrimaryOrderHistory, PrimaryOrderType,
     ALT_SECONDARY_ORDER_HEADER_SIZE, ORDER_TYPE_CHANGE, TS_BOUNDS, TS_DELTA_COORDINATES,
     TS_SECONDARY, TS_STANDARD, TS_ZERO_BOUNDS_DELTAS, TS_ZERO_FIELD_BYTE_BIT0,
     TS_ZERO_FIELD_BYTE_BIT1,
@@ -606,8 +606,9 @@ impl BitmapRenderer {
                 Ok(true)
             }
             PrimaryOrderType::DstBlt => {
-                let _ = decode_dstblt(cursor, field_flags, delta, &mut self.primary_history)?;
-                Ok(false)
+                let order =
+                    decode_dstblt(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(try_render_dstblt(&order, sink))
             }
             PrimaryOrderType::PatBlt => {
                 let order =
@@ -623,8 +624,9 @@ impl BitmapRenderer {
                 Ok(false)
             }
             PrimaryOrderType::LineTo => {
-                let _ = decode_lineto(cursor, field_flags, delta, &mut self.primary_history)?;
-                Ok(false)
+                let order =
+                    decode_lineto(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(try_render_lineto(&order, sink))
             }
             other => Err(RenderError::UnsupportedPrimaryOrder { order_type: other }),
         }
@@ -1272,6 +1274,10 @@ const BS_SOLID: u8 = 0x00;
 /// PatBlt raster operation: PATCOPY (MS-RDPEGDI 2.2.2.2.1.1.1.7).
 const ROP3_PATCOPY: u8 = 0xF0;
 
+/// DstBlt ROPs we can render without reading the destination back.
+const ROP3_BLACKNESS: u8 = 0x00;
+const ROP3_WHITENESS: u8 = 0xFF;
+
 /// Render the renderable subset of PatBlt: `BS_SOLID` brush + `PATCOPY`
 /// ROP, which fills a rectangle with the foreground color. Returns
 /// `true` if a blit was issued, `false` for everything else (the
@@ -1301,6 +1307,92 @@ fn try_render_patblt<S: FrameSink>(order: &PatBltOrder, sink: &mut S) -> bool {
         h,
         &pixels,
     );
+    true
+}
+
+/// Render a DstBlt order, but only for ROPs that don't require reading
+/// the existing destination pixels back (`FrameSink` is write-only):
+///
+/// * `BLACKNESS` (0x00) → fill rect with `(0, 0, 0, 0xFF)`
+/// * `WHITENESS` (0xFF) → fill rect with `(0xFF, 0xFF, 0xFF, 0xFF)`
+///
+/// Other DstBlt ROPs (DSTINVERT, BLACKBORDER, …) require destination
+/// readback and are silently skipped (`Ok(false)` from the caller).
+fn try_render_dstblt<S: FrameSink>(order: &DstBltOrder, sink: &mut S) -> bool {
+    let w = order.width.max(0) as u16;
+    let h = order.height.max(0) as u16;
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let color = match order.rop {
+        ROP3_BLACKNESS => [0x00, 0x00, 0x00, 0xFF],
+        ROP3_WHITENESS => [0xFF, 0xFF, 0xFF, 0xFF],
+        _ => return false,
+    };
+    let pixels: Vec<u8> = core::iter::repeat(color)
+        .take((w as usize) * (h as usize))
+        .flatten()
+        .collect();
+    sink.blit_rgba(
+        order.left.max(0) as u16,
+        order.top.max(0) as u16,
+        w,
+        h,
+        &pixels,
+    );
+    true
+}
+
+/// Render a LineTo order as a single-pixel-wide Bresenham line in the
+/// pen color. `pen_width` and the dashed `pen_style` codes are ignored
+/// for now (the embedder loses dotted/dashed lines and ≥2px widths,
+/// which is acceptable for the legacy GDI traffic that still emits
+/// LineTo). `back_color` and `back_mode` (used for transparent vs
+/// opaque dashed lines) are ignored for the same reason.
+///
+/// Issues one tiny `blit_rgba` per pixel so the implementation stays
+/// trivially correct against any FrameSink. A future optimization can
+/// batch into a per-segment scratch buffer.
+fn try_render_lineto<S: FrameSink>(order: &LineToOrder, sink: &mut S) -> bool {
+    let pen_color = [
+        order.pen_color[0],
+        order.pen_color[1],
+        order.pen_color[2],
+        0xFF,
+    ];
+    let mut x0 = order.start_x as i32;
+    let mut y0 = order.start_y as i32;
+    let x1 = order.end_x as i32;
+    let y1 = order.end_y as i32;
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    // Hard-cap line length to defeat a malformed order with absurd
+    // endpoints. 16k pixels is wider than any reasonable RDP desktop.
+    let mut budget = 16_384i32;
+    loop {
+        if x0 >= 0 && y0 >= 0 && x0 <= u16::MAX as i32 && y0 <= u16::MAX as i32 {
+            sink.blit_rgba(x0 as u16, y0 as u16, 1, 1, &pen_color);
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+        budget -= 1;
+        if budget <= 0 {
+            break;
+        }
+    }
     true
 }
 
@@ -2658,6 +2750,146 @@ mod tests {
         assert_eq!((*x, *y, *w, *h), (20, 30, 5, 3));
         for px in pixels.chunks_exact(4) {
             assert_eq!(px, &[0xAB, 0xCD, 0xEF, 0xFF]);
+        }
+    }
+
+    #[test]
+    fn orders_dstblt_blackness_renders_black_rect() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // DstBlt has 5 fields: left, top, width, height, rop.
+        // field_flags = 0x1F (all five present).
+        let mut body = Vec::with_capacity(2 * 4 + 1);
+        body.extend_from_slice(&7i16.to_le_bytes());
+        body.extend_from_slice(&8i16.to_le_bytes());
+        body.extend_from_slice(&3i16.to_le_bytes());
+        body.extend_from_slice(&2i16.to_le_bytes());
+        body.push(0x00); // ROP3_BLACKNESS
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::DstBlt,
+            field_flags: 0x1F,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        assert_eq!(sink.blits.len(), 1);
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!((*x, *y, *w, *h), (7, 8, 3, 2));
+        for px in pixels.chunks_exact(4) {
+            assert_eq!(px, &[0x00, 0x00, 0x00, 0xFF]);
+        }
+    }
+
+    #[test]
+    fn orders_dstblt_dstinvert_silently_skipped() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        let mut body = Vec::with_capacity(2 * 4 + 1);
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.push(0x55); // DSTINVERT — needs destination readback, must skip
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::DstBlt,
+            field_flags: 0x1F,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(!drew, "DSTINVERT cannot be rendered without read-back");
+        assert!(sink.blits.is_empty());
+    }
+
+    /// LineTo: draw a horizontal 5-pixel line. We don't care which
+    /// exact pixels Bresenham picks for axis-aligned cases; just
+    /// confirm we got the right pen color and the count matches.
+    #[test]
+    fn orders_lineto_horizontal_emits_one_blit_per_pixel() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // LineTo has 10 fields. Body order:
+        //   back_mode (u16 LE)
+        //   start_x, start_y, end_x, end_y (i16 LE × 4)
+        //   back_color (3 bytes)
+        //   rop2 (u8)
+        //   pen_style (u8)
+        //   pen_width (u8)
+        //   pen_color (3 bytes)
+        let mut body = Vec::with_capacity(2 + 2 * 4 + 3 + 1 + 1 + 1 + 3);
+        body.extend_from_slice(&1u16.to_le_bytes()); // back_mode = OPAQUE
+        body.extend_from_slice(&10i16.to_le_bytes()); // start_x
+        body.extend_from_slice(&20i16.to_le_bytes()); // start_y
+        body.extend_from_slice(&14i16.to_le_bytes()); // end_x
+        body.extend_from_slice(&20i16.to_le_bytes()); // end_y
+        body.extend_from_slice(&[0, 0, 0]);            // back_color
+        body.push(13);                                 // rop2 = R2_COPYPEN
+        body.push(0);                                  // pen_style = solid
+        body.push(1);                                  // pen_width
+        body.extend_from_slice(&[0xFF, 0x00, 0x00]);   // pen_color = red
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::LineTo,
+            field_flags: 0x03FF, // all 10 fields
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        // (10..=14) inclusive on x, fixed y = 5 distinct pixels.
+        assert_eq!(sink.blits.len(), 5);
+        for blit in &sink.blits {
+            assert_eq!((blit.2, blit.3), (1, 1));
+            assert_eq!(blit.1, 20);
+            assert_eq!(&blit.4, &[0xFF, 0x00, 0x00, 0xFF]);
         }
     }
 
