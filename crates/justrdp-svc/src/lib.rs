@@ -37,12 +37,14 @@ mod channel_set;
 #[cfg(feature = "alloc")]
 mod dechunk;
 #[cfg(feature = "alloc")]
-mod chunk;
+pub mod chunk;
 
 #[cfg(feature = "alloc")]
 pub use channel_name::{ChannelName, CLIPRDR, DRDYNVC, ENCOMSP, RAIL, RDPDR, RDPSND};
 #[cfg(feature = "alloc")]
 pub use channel_set::StaticChannelSet;
+#[cfg(feature = "alloc")]
+pub use chunk::chunk_and_encode;
 
 #[cfg(feature = "alloc")]
 use alloc::string::String;

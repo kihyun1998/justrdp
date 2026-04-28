@@ -1,4 +1,3 @@
-#![no_std]
 #![forbid(unsafe_code)]
 #![doc = "Transport-agnostic web / WASM bindings for JustRDP."]
 #![doc = ""]
@@ -22,6 +21,7 @@
 
 extern crate alloc;
 
+mod clipboard;
 mod driver;
 mod error;
 mod input;
@@ -38,6 +38,7 @@ mod websocket;
 #[cfg(target_arch = "wasm32")]
 mod js;
 
+pub use clipboard::{ClipboardChannel, ClipboardChannelError, ClipboardState};
 pub use driver::{
     CredsspDriver, DriverError, TlsUpgrade, WebClient, MAX_HANDSHAKE_PDU_SIZE,
 };
