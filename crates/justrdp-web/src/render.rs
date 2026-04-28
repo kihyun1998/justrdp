@@ -692,11 +692,7 @@ impl BitmapRenderer {
                                 let _ = self.cache_glyph(extra_flags, body);
                             }
                             GlyphCacheRevision::V2 => {
-                                // V2 wire layout deferred to S3d-6d4.
-                                // Silently drop so the order stream
-                                // stays in sync; the matching
-                                // GlyphIndex orders will miss the
-                                // cache and skip per-glyph renders.
+                                let _ = self.cache_glyph_v2(extra_flags, body);
                             }
                         },
                         // CacheColorTable: decoded only enough to keep
@@ -1352,6 +1348,61 @@ impl BitmapRenderer {
                     cx,
                     cy,
                     stride: row_bytes as u16,
+                    mask,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// `CacheGlyph` Revision 2 parser (MS-RDPEGDI 2.2.2.2.1.2.6).
+    ///
+    /// `extraFlags` packs three subfields:
+    ///   bits 0..=3   : cacheId
+    ///   bits 4..=7   : flags (reserved by us — not read)
+    ///   bits 8..=15  : cGlyphs (count of trailing glyph entries)
+    ///
+    /// Each glyph entry is:
+    ///   cacheIndex  (TWO_BYTE_UNSIGNED — 1 or 2 bytes)
+    ///   x           (TWO_BYTE_UNSIGNED) — discarded; pen position
+    ///                 comes from GlyphIndex.x / y at render time
+    ///   y           (TWO_BYTE_UNSIGNED) — discarded
+    ///   cx          (TWO_BYTE_UNSIGNED)
+    ///   cy          (TWO_BYTE_UNSIGNED)
+    ///   aj          (1 bpp mask, `((cx + 7) / 8 + 3) & ~3` bytes per
+    ///                 row × cy rows — same alignment as V1)
+    ///
+    /// Stored in the same `glyph_cache` as V1 entries, so subsequent
+    /// `GlyphIndex` orders look up by `(cacheId, cacheIndex)` without
+    /// caring which revision filled the slot.
+    fn cache_glyph_v2(&mut self, extra_flags: u16, body: &[u8]) -> Result<(), RenderError> {
+        let cache_id = (extra_flags & 0x000F) as u8;
+        let c_glyphs = ((extra_flags >> 8) & 0x00FF) as usize;
+        let mut cur = body;
+        for _ in 0..c_glyphs {
+            let (cache_index, rest) = read_two_byte_unsigned(cur, "CacheGlyphV2::cacheIndex")?;
+            let (_x, rest) = read_two_byte_unsigned(rest, "CacheGlyphV2::x")?;
+            let (_y, rest) = read_two_byte_unsigned(rest, "CacheGlyphV2::y")?;
+            let (cx, rest) = read_two_byte_unsigned(rest, "CacheGlyphV2::cx")?;
+            let (cy, rest) = read_two_byte_unsigned(rest, "CacheGlyphV2::cy")?;
+            cur = rest;
+            // Same alignment / layout as V1: stride padded to 4 bytes.
+            let stride = ((cx as usize + 7) / 8 + 3) & !3;
+            let mask_len = stride * cy as usize;
+            if cur.len() < mask_len {
+                return Err(RenderError::SizeMismatch(format!(
+                    "CacheGlyphV2: glyph mask {mask_len} but {} bytes left",
+                    cur.len()
+                )));
+            }
+            let mask = cur[..mask_len].to_vec();
+            cur = &cur[mask_len..];
+            self.glyph_cache.insert(
+                (cache_id, cache_index),
+                CachedGlyph {
+                    cx,
+                    cy,
+                    stride: stride as u16,
                     mask,
                 },
             );
@@ -5309,31 +5360,105 @@ mod tests {
         }
     }
 
-    /// `set_glyph_cache_revision(V2)` makes the renderer drop V2
-    /// CacheGlyph orders silently — verifies the revision toggle and
-    /// the silent-skip path.
+    /// V2 CacheGlyph parses one glyph using compact TWO_BYTE_UNSIGNED
+    /// fields. cGlyphs lives in the high byte of extra_flags; the
+    /// trailing body has cacheIndex / x / y / cx / cy each as a 1-byte
+    /// short form (high bit clear) followed by the 1 bpp mask.
     #[test]
-    fn glyph_cache_v2_revision_drops_silently() {
-        let mut renderer = BitmapRenderer::new();
-        assert_eq!(renderer.glyph_cache_revision(), GlyphCacheRevision::V1);
-        renderer.set_glyph_cache_revision(GlyphCacheRevision::V2);
-        assert_eq!(renderer.glyph_cache_revision(), GlyphCacheRevision::V2);
+    fn cache_glyph_v2_parses_one_glyph_and_renders() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
 
-        // Same body as the V1 round-trip test — but with V2 revision
-        // set, the parser drops it without populating the cache.
-        let mut cg = Vec::new();
-        cg.push(0);
-        cg.push(1);
-        cg.extend_from_slice(&5u16.to_le_bytes());
-        cg.extend_from_slice(&0i16.to_le_bytes());
-        cg.extend_from_slice(&0i16.to_le_bytes());
-        cg.extend_from_slice(&8u16.to_le_bytes());
-        cg.extend_from_slice(&4u16.to_le_bytes());
+        // V2 body: cacheIndex=4, x=0, y=0, cx=4, cy=4 (all short form),
+        // mask = 4 rows × 4-byte stride, top half-row bits set.
+        let mut body = Vec::new();
+        body.push(4); // cacheIndex (TWO_BYTE_UNSIGNED short)
+        body.push(0); // x
+        body.push(0); // y
+        body.push(4); // cx
+        body.push(4); // cy
         for _ in 0..4 {
-            cg.push(0xFF);
-            cg.extend_from_slice(&[0; 3]);
+            body.push(0xF0); // top 4 columns set
+            body.extend_from_slice(&[0u8; 3]);
         }
-        let cache_frame = build_secondary_order_frame(0x02, 0x03, &cg);
+        // extra_flags: cacheId=2 (low nibble), flags=0, cGlyphs=1 (high byte).
+        let extra_flags: u16 = (1u16 << 8) | 0x02;
+        let cache_frame = build_secondary_order_frame(extra_flags, 0x03 /* CacheGlyph */, &body);
+
+        // GlyphIndex referencing the cached glyph at cacheId=2, index=4.
+        let mut gi = Vec::new();
+        gi.push(2); // cacheId
+        gi.push(0); gi.push(0); gi.push(0);
+        gi.extend_from_slice(&[0, 0, 0]);
+        gi.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        for _ in 0..8 { gi.extend_from_slice(&0u16.to_le_bytes()); }
+        gi.push(0); gi.push(0); gi.push(0); gi.push(0);
+        gi.extend_from_slice(&[0; 7]);
+        gi.extend_from_slice(&5u16.to_le_bytes());
+        gi.extend_from_slice(&8u16.to_le_bytes());
+        gi.push(1);
+        gi.push(4);
+
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::GlyphIndex,
+            field_flags: 0x003F_FFFF,
+            bounds: None,
+            data: gi,
+        };
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_glyph_cache_revision(GlyphCacheRevision::V2);
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.glyph_cache_len(), 1);
+        // 4×4 mask, top 4 columns (bits 7..=4) set per row → 16 fore
+        // pixels rendered.
+        assert_eq!(sink.blits.len(), 16);
+        for blit in &sink.blits {
+            assert_eq!(&blit.4, &[0xAA, 0xBB, 0xCC, 0xFF]);
+        }
+    }
+
+    /// V2 with cacheIndex / cx / cy in long form (high bit set in head
+    /// byte) — exercises the 2-byte path of TWO_BYTE_UNSIGNED.
+    #[test]
+    fn cache_glyph_v2_long_form_two_byte_fields() {
+        // cGlyphs=1; body fields all in long form.
+        // cacheIndex=0x100 (long: head=0x81, next=0x00).
+        // x=0, y=0, cx=0x80 (long: 0x80, 0x80? no — 0x80 is exactly the
+        // boundary. Long form for 0x80 is head=0x80, next=0x80? Let
+        // me use cx=0x100 which clearly needs long form.)
+        // cy=0x100 same.
+        // Mask: stride = ((0x100 + 7)/8 + 3) & ~3 = (32 + 3) & ~3 = 32.
+        // 256 rows × 32 bytes = 8192 bytes — way too big for a unit test.
+        //
+        // Instead: cacheIndex=0x100 (long), but cx=4 / cy=4 (short).
+        let mut body = Vec::new();
+        body.push(0x81); body.push(0x00); // cacheIndex = 0x100 long form
+        body.push(0); body.push(0);       // x, y short form
+        body.push(4); body.push(4);       // cx, cy short form
+        for _ in 0..4 {
+            body.push(0xFF);
+            body.extend_from_slice(&[0u8; 3]);
+        }
+        let extra_flags: u16 = (1u16 << 8) | 0x05; // cacheId=5
+        let cache_frame = build_secondary_order_frame(extra_flags, 0x03, &body);
         let mut frame = Vec::new();
         frame.extend_from_slice(&1u16.to_le_bytes());
         frame.extend_from_slice(&cache_frame);
@@ -5341,9 +5466,22 @@ mod tests {
             update_code: FastPathUpdateType::Orders,
             data: frame,
         };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_glyph_cache_revision(GlyphCacheRevision::V2);
         let mut sink = Capture::new();
         renderer.render(&event, &mut sink).unwrap();
-        assert_eq!(renderer.glyph_cache_len(), 0);
+        assert_eq!(renderer.glyph_cache_len(), 1);
+    }
+
+    /// Revision toggle round-trips through the getter / setter.
+    #[test]
+    fn glyph_cache_revision_setter_round_trips() {
+        let mut renderer = BitmapRenderer::new();
+        assert_eq!(renderer.glyph_cache_revision(), GlyphCacheRevision::V1);
+        renderer.set_glyph_cache_revision(GlyphCacheRevision::V2);
+        assert_eq!(renderer.glyph_cache_revision(), GlyphCacheRevision::V2);
+        renderer.set_glyph_cache_revision(GlyphCacheRevision::V1);
+        assert_eq!(renderer.glyph_cache_revision(), GlyphCacheRevision::V1);
     }
 
     /// V1 8 bpp + palette: send a Palette PDU to seed the renderer's
