@@ -40,7 +40,8 @@ mod js;
 pub use driver::{DriverError, WebClient, MAX_HANDSHAKE_PDU_SIZE};
 pub use error::{TransportError, TransportErrorKind};
 pub use render::{
-    decode_bitmap_update_fast_path, render_event, DecodedRect, FrameSink, RenderError,
+    decode_bitmap_update_fast_path, render_event, BitmapRenderer, DecodedRect, FrameSink,
+    RenderError,
 };
 pub use session::{ActiveSession, PointerEvent, SessionEvent};
 pub use transport::WebTransport;

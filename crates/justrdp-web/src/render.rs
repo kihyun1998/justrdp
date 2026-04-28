@@ -40,16 +40,18 @@ use crate::session::SessionEvent;
 pub enum RenderError {
     /// The wire payload could not be decoded.
     Decode(justrdp_core::DecodeError),
-    /// The fast-path update type isn't handled yet (S3b: only Bitmap).
+    /// The fast-path update type isn't handled yet.
     Unsupported { update_code: FastPathUpdateType },
-    /// The bitmap announced a color depth that this crate does not
-    /// convert yet — currently 8 bpp (needs a Palette update first).
+    /// The bitmap announced a color depth this crate does not convert.
     UnsupportedBpp { bits_per_pixel: u16 },
     /// `width * height * bpp` does not match `bitmap_data.len()` for the
-    /// uncompressed path.
+    /// uncompressed path, or a Palette PDU was malformed.
     SizeMismatch(String),
     /// RLE decompression failed.
     Rle(RleError),
+    /// An 8 bpp Bitmap arrived before a Palette update — the renderer
+    /// has no table to convert the indices with.
+    PaletteMissing,
 }
 
 impl core::fmt::Display for RenderError {
@@ -64,6 +66,7 @@ impl core::fmt::Display for RenderError {
             }
             Self::SizeMismatch(msg) => write!(f, "size mismatch: {msg}"),
             Self::Rle(e) => write!(f, "RLE decompress: {e}"),
+            Self::PaletteMissing => f.write_str("8 bpp bitmap arrived before any Palette update"),
         }
     }
 }
@@ -124,9 +127,137 @@ pub trait FrameSink {
     fn flush(&mut self) {}
 }
 
+/// Number of palette entries in a TS_UPDATE_PALETTE PDU (always 256 per
+/// MS-RDPBCGR 2.2.9.1.1.3.1.1.1).
+const PALETTE_ENTRY_COUNT: usize = 256;
+
+/// Stateful renderer.
+///
+/// Holds protocol state that survives across update batches — currently
+/// the 8 bpp palette table; later steps will add codec contexts (RFX
+/// tile cache, NSCodec quantization tables, …). Use one instance per
+/// session; reusing across sessions risks decoding new traffic against
+/// stale palette/codec state.
+#[derive(Debug, Clone)]
+pub struct BitmapRenderer {
+    palette: Option<[(u8, u8, u8); PALETTE_ENTRY_COUNT]>,
+}
+
+impl Default for BitmapRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BitmapRenderer {
+    pub const fn new() -> Self {
+        Self { palette: None }
+    }
+
+    /// Whether the server has sent a Palette update yet. 8 bpp bitmaps
+    /// before the first palette will fail with [`RenderError::PaletteMissing`].
+    pub fn has_palette(&self) -> bool {
+        self.palette.is_some()
+    }
+
+    /// Apply one [`SessionEvent`] to a [`FrameSink`], updating internal
+    /// state as needed. Returns `Ok(true)` if any pixels were drawn,
+    /// `Ok(false)` for plumbing-only events (palette/synchronize/etc.).
+    pub fn render<S: FrameSink>(
+        &mut self,
+        event: &SessionEvent,
+        sink: &mut S,
+    ) -> Result<bool, RenderError> {
+        let SessionEvent::Graphics { update_code, data } = event else {
+            return Ok(false);
+        };
+
+        match update_code {
+            FastPathUpdateType::Palette => {
+                self.update_palette(data)?;
+                Ok(false)
+            }
+            FastPathUpdateType::Bitmap => {
+                let rects = self.decode_bitmap_rects(data)?;
+                let any = !rects.is_empty();
+                for r in rects {
+                    sink.blit_rgba(
+                        r.dest_left,
+                        r.dest_top,
+                        r.width,
+                        r.height,
+                        &r.pixels_rgba,
+                    );
+                }
+                if any {
+                    sink.flush();
+                }
+                Ok(any)
+            }
+            // Surface Commands and the Synchronize tick are accepted but
+            // not yet rendered (Surface Commands lands in S3d-2). They
+            // are *not* errors — the embedder generally just keeps
+            // pumping events.
+            FastPathUpdateType::Synchronize | FastPathUpdateType::SurfaceCommands => Ok(false),
+            other => Err(RenderError::Unsupported {
+                update_code: *other,
+            }),
+        }
+    }
+
+    fn decode_bitmap_rects(&self, payload: &[u8]) -> Result<Vec<DecodedRect>, RenderError> {
+        let mut cursor = ReadCursor::new(payload);
+        let update = TsUpdateBitmapData::decode_fast_path(&mut cursor)?;
+        let mut out: Vec<DecodedRect> = Vec::with_capacity(update.rectangles.len());
+        for rect in &update.rectangles {
+            out.push(decode_rect(rect, self.palette.as_ref())?);
+        }
+        Ok(out)
+    }
+
+    /// Decode a fast-path Palette update body and cache the result.
+    ///
+    /// Wire layout (MS-RDPBCGR 2.2.9.1.2.1.1.1):
+    ///   pad2Octets   : u16 (skipped)
+    ///   numberColors : u32 LE (must be 256)
+    ///   paletteData  : 256 × 3 bytes (R, G, B per entry)
+    fn update_palette(&mut self, data: &[u8]) -> Result<(), RenderError> {
+        const HEADER_SIZE: usize = 2 + 4;
+        if data.len() < HEADER_SIZE {
+            return Err(RenderError::SizeMismatch(format!(
+                "palette PDU truncated: got {} bytes, need at least {}",
+                data.len(),
+                HEADER_SIZE
+            )));
+        }
+        let n = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
+        if n != PALETTE_ENTRY_COUNT {
+            return Err(RenderError::SizeMismatch(format!(
+                "palette numberColors = {n}, expected {PALETTE_ENTRY_COUNT}"
+            )));
+        }
+        let body_size = PALETTE_ENTRY_COUNT * 3;
+        if data.len() < HEADER_SIZE + body_size {
+            return Err(RenderError::SizeMismatch(format!(
+                "palette body short: got {} bytes, need {}",
+                data.len() - HEADER_SIZE,
+                body_size
+            )));
+        }
+        let mut pal = [(0u8, 0u8, 0u8); PALETTE_ENTRY_COUNT];
+        for (i, slot) in pal.iter_mut().enumerate() {
+            let off = HEADER_SIZE + i * 3;
+            *slot = (data[off], data[off + 1], data[off + 2]);
+        }
+        self.palette = Some(pal);
+        Ok(())
+    }
+}
+
 /// Decode the fast-path Bitmap Update payload (everything *after* the
-/// `updateCode` and `size` fields) into a flat list of top-down BGRA
-/// rectangles.
+/// `updateCode` and `size` fields) into a flat list of top-down RGBA
+/// rectangles. Stateless — for 8 bpp bitmaps you must use
+/// [`BitmapRenderer`] instead so a Palette update can be cached first.
 pub fn decode_bitmap_update_fast_path(
     payload: &[u8],
 ) -> Result<Vec<DecodedRect>, RenderError> {
@@ -134,12 +265,15 @@ pub fn decode_bitmap_update_fast_path(
     let update = TsUpdateBitmapData::decode_fast_path(&mut cursor)?;
     let mut out: Vec<DecodedRect> = Vec::with_capacity(update.rectangles.len());
     for rect in &update.rectangles {
-        out.push(decode_rect(rect)?);
+        out.push(decode_rect(rect, None)?);
     }
     Ok(out)
 }
 
-fn decode_rect(rect: &TsBitmapData) -> Result<DecodedRect, RenderError> {
+fn decode_rect(
+    rect: &TsBitmapData,
+    palette: Option<&[(u8, u8, u8); PALETTE_ENTRY_COUNT]>,
+) -> Result<DecodedRect, RenderError> {
     let compressed = rect.flags & BITMAP_COMPRESSION != 0;
 
     // Stage 1: get raw bottom-up pixels at the source bpp.
@@ -157,8 +291,6 @@ fn decode_rect(rect: &TsBitmapData) -> Result<DecodedRect, RenderError> {
         raw_pixels = out;
         raw_slice = &raw_pixels;
     } else {
-        // Uncompressed: validate size up front so a malformed
-        // bitmap_length doesn't panic the row walker.
         let bpp_bytes = bpp_byte_size(rect.bits_per_pixel)?;
         let stride = rect.width as usize * bpp_bytes;
         let expected = stride * rect.height as usize;
@@ -181,6 +313,10 @@ fn decode_rect(rect: &TsBitmapData) -> Result<DecodedRect, RenderError> {
         24 => flip_and_swap_24bpp(raw_slice, rect.width, rect.height),
         16 => flip_and_convert_rgb565(raw_slice, rect.width, rect.height),
         15 => flip_and_convert_rgb555(raw_slice, rect.width, rect.height),
+        8 => {
+            let pal = palette.ok_or(RenderError::PaletteMissing)?;
+            flip_and_apply_palette(raw_slice, rect.width, rect.height, pal)
+        }
         other => {
             return Err(RenderError::UnsupportedBpp {
                 bits_per_pixel: other,
@@ -201,6 +337,7 @@ fn decode_rect(rect: &TsBitmapData) -> Result<DecodedRect, RenderError> {
 /// rest are surfaced via `UnsupportedBpp` upstream.
 fn bpp_byte_size(bpp: u16) -> Result<usize, RenderError> {
     match bpp {
+        8 => Ok(1),
         15 | 16 => Ok(2),
         24 => Ok(3),
         32 => Ok(4),
@@ -208,6 +345,28 @@ fn bpp_byte_size(bpp: u16) -> Result<usize, RenderError> {
             bits_per_pixel: other,
         }),
     }
+}
+
+/// Bottom-up 8 bpp indexed → top-down RGBA via the cached palette.
+fn flip_and_apply_palette(
+    src: &[u8],
+    width: u16,
+    height: u16,
+    palette: &[(u8, u8, u8); PALETTE_ENTRY_COUNT],
+) -> Vec<u8> {
+    let stride = width as usize;
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in (0..height as usize).rev() {
+        let row_bytes = &src[row * stride..(row + 1) * stride];
+        for &idx in row_bytes {
+            let (r, g, b) = palette[idx as usize];
+            out.push(r);
+            out.push(g);
+            out.push(b);
+            out.push(0xFF);
+        }
+    }
+    out
 }
 
 /// Bottom-up BGRA → top-down RGBA.
@@ -441,19 +600,20 @@ mod tests {
         }
     }
 
-    /// 8 bpp is the only standard depth this renderer still rejects (it
-    /// requires a Palette update first). Confirm that's still the case
-    /// after S3c added 15/16/24/32 support.
+    /// The stateless `decode_bitmap_update_fast_path` cannot resolve 8
+    /// bpp pixels because it has no palette table. Confirm the typed
+    /// error so the embedder can route the caller to BitmapRenderer
+    /// instead.
     #[test]
-    fn rejects_palette_indexed_8bpp() {
+    fn stateless_decode_8bpp_reports_palette_missing() {
         let mut rect = uncompressed_32bpp_rect(1, 1, 0xCC);
         rect.bits_per_pixel = 8;
         rect.bitmap_data = vec![0]; // 1 px @ 8bpp = 1 byte
         let payload = build_payload(rect);
         let err = decode_bitmap_update_fast_path(&payload).unwrap_err();
         assert!(
-            matches!(err, RenderError::UnsupportedBpp { bits_per_pixel: 8 }),
-            "expected UnsupportedBpp(8), got {err:?}"
+            matches!(err, RenderError::PaletteMissing),
+            "expected PaletteMissing, got {err:?}"
         );
     }
 
@@ -598,5 +758,159 @@ mod tests {
             }),
             "expected Unsupported(Orders), got {err:?}"
         );
+    }
+
+    // ── BitmapRenderer / Palette / 8 bpp ────────────────────────────────
+
+    /// Build a fast-path Palette PDU (TS_FP_UPDATE_PALETTE) where every
+    /// entry is `(idx, idx, idx)` — a grayscale ramp — so a 8 bpp test
+    /// can map back from any chosen index trivially.
+    fn build_grayscale_palette_pdu() -> Vec<u8> {
+        let mut data = Vec::with_capacity(2 + 4 + PALETTE_ENTRY_COUNT * 3);
+        data.extend_from_slice(&[0, 0]); // pad2Octets
+        data.extend_from_slice(&(PALETTE_ENTRY_COUNT as u32).to_le_bytes());
+        for i in 0..PALETTE_ENTRY_COUNT {
+            data.push(i as u8);
+            data.push(i as u8);
+            data.push(i as u8);
+        }
+        data
+    }
+
+    fn palette_event() -> SessionEvent {
+        SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Palette,
+            data: build_grayscale_palette_pdu(),
+        }
+    }
+
+    /// 8 bpp uncompressed bitmap with a known per-row index pattern, plus
+    /// a separate row 0 (bottom on the wire) tagged with index 0xCC so
+    /// the row flip can be observed.
+    fn uncompressed_8bpp_rect(width: u16, height: u16) -> TsBitmapData {
+        let total = width as usize * height as usize;
+        let mut data = Vec::with_capacity(total);
+        // Bottom row (wire row 0) tagged with 0xCC; subsequent rows fill
+        // with their wire row index for easy assertions.
+        for row in 0..height as usize {
+            let value = if row == 0 { 0xCC } else { row as u8 };
+            for _ in 0..width as usize {
+                data.push(value);
+            }
+        }
+        TsBitmapData {
+            dest_left: 0,
+            dest_top: 0,
+            dest_right: width - 1,
+            dest_bottom: height - 1,
+            width,
+            height,
+            bits_per_pixel: 8,
+            flags: 0,
+            compr_hdr: None,
+            bitmap_data: data,
+        }
+    }
+
+    #[test]
+    fn renderer_caches_palette_and_decodes_8bpp_uncompressed() {
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+
+        // Palette first; no draws.
+        assert!(!renderer.has_palette());
+        let drew = renderer.render(&palette_event(), &mut sink).unwrap();
+        assert!(!drew);
+        assert!(renderer.has_palette());
+        assert!(sink.blits.is_empty());
+
+        // Now an 8 bpp 2×2 bitmap. Wire row 0 (bottom) = 0xCC, wire row
+        // 1 (top) = 0x01. Top-down output: row 0 from index 0x01, row 1
+        // from index 0xCC. Grayscale palette → R=G=B=index, A=0xFF.
+        let rect = uncompressed_8bpp_rect(2, 2);
+        let payload = build_payload(rect);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Bitmap,
+            data: payload,
+        };
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        assert_eq!(sink.blits.len(), 1);
+        let (_, _, _, _, pixels) = &sink.blits[0];
+        // First top-down pixel comes from index 0x01.
+        assert_eq!(&pixels[0..4], &[0x01, 0x01, 0x01, 0xFF]);
+        // Last top-down pixel comes from index 0xCC.
+        assert_eq!(&pixels[pixels.len() - 4..], &[0xCC, 0xCC, 0xCC, 0xFF]);
+    }
+
+    #[test]
+    fn renderer_8bpp_without_palette_errors_with_palette_missing() {
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let rect = uncompressed_8bpp_rect(1, 1);
+        let payload = build_payload(rect);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Bitmap,
+            data: payload,
+        };
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(matches!(err, RenderError::PaletteMissing));
+    }
+
+    /// Compressed 8 bpp via the WHITE special order (single-byte 0xFD).
+    /// At 8 bpp, "white" is `0xFF`. With the grayscale palette built in
+    /// `build_grayscale_palette_pdu`, palette[0xFF] = (0xFF, 0xFF, 0xFF).
+    #[test]
+    fn renderer_decodes_compressed_8bpp_via_palette() {
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&palette_event(), &mut sink).unwrap();
+
+        let mut rect = uncompressed_8bpp_rect(2, 1);
+        rect.flags = BITMAP_COMPRESSION | justrdp_pdu::rdp::bitmap::NO_BITMAP_COMPRESSION_HDR;
+        rect.compr_hdr = None;
+        rect.bitmap_data = vec![0xFD, 0xFD]; // two WHITE specials = 0xFF, 0xFF
+        let payload = build_payload(rect);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Bitmap,
+            data: payload,
+        };
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew);
+        assert_eq!(sink.blits.len(), 1);
+        let pixels = &sink.blits[0].4;
+        assert_eq!(
+            pixels,
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+    }
+
+    #[test]
+    fn renderer_rejects_truncated_palette() {
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let truncated = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Palette,
+            data: vec![0, 0, 0, 0], // missing numberColors high bytes + body
+        };
+        let err = renderer.render(&truncated, &mut sink).unwrap_err();
+        assert!(matches!(err, RenderError::SizeMismatch(_)));
+        assert!(!renderer.has_palette());
+    }
+
+    #[test]
+    fn renderer_rejects_palette_with_wrong_color_count() {
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let mut data = Vec::with_capacity(2 + 4 + 3);
+        data.extend_from_slice(&[0, 0]); // pad
+        data.extend_from_slice(&1u32.to_le_bytes()); // wrong count
+        data.extend_from_slice(&[0, 0, 0]); // 1 entry
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Palette,
+            data,
+        };
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(matches!(err, RenderError::SizeMismatch(_)));
     }
 }

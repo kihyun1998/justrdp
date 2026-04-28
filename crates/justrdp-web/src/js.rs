@@ -35,7 +35,7 @@ use web_sys::HtmlCanvasElement;
 
 use crate::canvas::CanvasFrameSink;
 use crate::driver::WebClient;
-use crate::render::render_event;
+use crate::render::BitmapRenderer;
 use crate::session::ActiveSession;
 use crate::websocket::{WebSocketConfig, WebSocketTransport};
 
@@ -100,6 +100,12 @@ struct JsClientInner {
     /// Optional render target. None means events are decoded but not
     /// blitted (handy for headless tests / "tail the channel" UIs).
     sink: Option<CanvasFrameSink>,
+    /// Stateful renderer — caches the 8 bpp palette across batches and
+    /// (in S3d-2+) will hold codec contexts. Surviving across
+    /// `disconnect()` / `connect()` is fine: a fresh handshake will
+    /// emit a Palette PDU before any 8 bpp Bitmap, and codec state in
+    /// later steps will be reset on session boundaries.
+    renderer: BitmapRenderer,
     /// Last successful `connect()` summary, mirrored so JS can read it
     /// at any time without re-issuing the connect Promise.
     last_summary: Option<JsValue>,
@@ -236,7 +242,11 @@ impl JsClient {
         let mut terminated = false;
         for event in &events {
             if let Some(sink) = sink_opt.as_mut() {
-                if let Ok(true) = render_event(event, sink) {
+                // The renderer lives in self.inner; borrow_mut briefly
+                // here is safe because we already dropped the earlier
+                // borrow before the await.
+                let mut g = self.inner.borrow_mut();
+                if let Ok(true) = g.renderer.render(event, sink) {
                     blits += 1;
                 }
             }
