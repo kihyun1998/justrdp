@@ -34,6 +34,8 @@ use justrdp_graphics::rfx::wire::{
     WBT_FRAME_END, WBT_REGION, WBT_SYNC,
 };
 use justrdp_graphics::rfx::{RfxDecoder, RfxError, TILE_COEFFICIENTS, TILE_SIZE};
+use justrdp_graphics::clearcodec::{ClearCodecDecoder, ClearCodecError};
+use justrdp_graphics::nscodec::{NsCodecDecompressor, NsCodecError};
 use justrdp_graphics::{BitsPerPixel, RleDecompressor, RleError};
 use justrdp_pdu::rdp::bitmap::{
     TsBitmapData, TsUpdateBitmapData, BITMAP_COMPRESSION,
@@ -81,6 +83,10 @@ pub enum RenderError {
     /// cursor for. The order stream is unrecoverable from this point —
     /// the caller should drop the rest of the batch.
     UnsupportedPrimaryOrder { order_type: PrimaryOrderType },
+    /// NSCodec (MS-RDPNSC) decompression failed.
+    NsCodec(NsCodecError),
+    /// ClearCodec (MS-RDPEGFX 2.2.4) decode failed.
+    ClearCodec(ClearCodecError),
 }
 
 impl core::fmt::Display for RenderError {
@@ -115,7 +121,21 @@ impl core::fmt::Display for RenderError {
                 f,
                 "primary drawing order {order_type:?} not yet supported by the order walker"
             ),
+            Self::NsCodec(e) => write!(f, "NSCodec: {e}"),
+            Self::ClearCodec(e) => write!(f, "ClearCodec: {e}"),
         }
+    }
+}
+
+impl From<NsCodecError> for RenderError {
+    fn from(e: NsCodecError) -> Self {
+        Self::NsCodec(e)
+    }
+}
+
+impl From<ClearCodecError> for RenderError {
+    fn from(e: ClearCodecError) -> Self {
+        Self::ClearCodec(e)
     }
 }
 
@@ -188,11 +208,14 @@ const PALETTE_ENTRY_COUNT: usize = 256;
 /// Stateful renderer.
 ///
 /// Holds protocol state that survives across update batches — the 8 bpp
-/// palette table, the latest Frame Marker id, and (when registered) the
-/// RFX entropy mode picked up from `TS_RFX_CONTEXT`. Use one instance
-/// per session; reusing across sessions risks decoding new traffic
-/// against stale palette/codec state.
-#[derive(Debug, Clone)]
+/// palette table, the latest Frame Marker id, the RFX entropy mode (when
+/// the codec is registered), and the ClearCodec glyph/VBar caches. Use
+/// one instance per session; reusing across sessions risks decoding new
+/// traffic against stale palette/codec state.
+///
+/// Not `Clone` (ClearCodecDecoder is not Clone) and not derived `Debug`
+/// (same reason); a manual Debug impl below prints just the loose
+/// metadata and elides the codec internals.
 pub struct BitmapRenderer {
     palette: Option<[(u8, u8, u8); PALETTE_ENTRY_COUNT]>,
     /// Most recent Frame Marker id seen (BEGIN or END). Embedders that
@@ -218,11 +241,34 @@ pub struct BitmapRenderer {
     /// the previous order type to save a byte). Initial value matches
     /// MS-RDPEGDI 3.2.1.1 (PatBlt).
     last_primary_type: PrimaryOrderType,
+    /// codec_id assigned to NSCodec (MS-RDPNSC). Same registration
+    /// dance as `rfx_codec_id` — the server picks dynamically.
+    nscodec_codec_id: Option<u8>,
+    /// codec_id assigned to ClearCodec (MS-RDPEGFX §2.2.4).
+    clearcodec_codec_id: Option<u8>,
+    /// ClearCodec carries glyph + VBar caches across calls; constructed
+    /// lazily on first use to avoid the allocation when the codec
+    /// isn't registered.
+    clearcodec_decoder: Option<ClearCodecDecoder>,
 }
 
 impl Default for BitmapRenderer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl core::fmt::Debug for BitmapRenderer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BitmapRenderer")
+            .field("has_palette", &self.palette.is_some())
+            .field("last_frame_id", &self.last_frame_id)
+            .field("rfx_codec_id", &self.rfx_codec_id)
+            .field("rfx_entropy", &self.rfx_entropy)
+            .field("last_primary_type", &self.last_primary_type)
+            .field("nscodec_codec_id", &self.nscodec_codec_id)
+            .field("clearcodec_codec_id", &self.clearcodec_codec_id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -235,7 +281,35 @@ impl BitmapRenderer {
             rfx_entropy: RlgrMode::Rlgr1,
             primary_history: PrimaryOrderHistory::new(),
             last_primary_type: PrimaryOrderType::PatBlt,
+            nscodec_codec_id: None,
+            clearcodec_codec_id: None,
+            clearcodec_decoder: None,
         }
+    }
+
+    /// Register the NSCodec server-assigned codec_id. Subsequent
+    /// Surface Bits commands with that id route through
+    /// [`NsCodecDecompressor`].
+    pub fn set_nscodec_codec_id(&mut self, codec_id: u8) {
+        self.nscodec_codec_id = Some(codec_id);
+    }
+
+    pub fn nscodec_codec_id(&self) -> Option<u8> {
+        self.nscodec_codec_id
+    }
+
+    /// Register the ClearCodec server-assigned codec_id. Allocates the
+    /// [`ClearCodecDecoder`] on first call so the per-session glyph /
+    /// VBar caches persist for the rest of the session.
+    pub fn set_clearcodec_codec_id(&mut self, codec_id: u8) {
+        self.clearcodec_codec_id = Some(codec_id);
+        if self.clearcodec_decoder.is_none() {
+            self.clearcodec_decoder = Some(ClearCodecDecoder::new());
+        }
+    }
+
+    pub fn clearcodec_codec_id(&self) -> Option<u8> {
+        self.clearcodec_codec_id
     }
 
     /// Tell the renderer which codec_id to interpret as RemoteFX. Must
@@ -502,6 +576,15 @@ impl BitmapRenderer {
             let blits = decode_rfx_stream(self, dest_left, dest_top, &data.bitmap_data, sink)?;
             return Ok(blits > 0);
         }
+        if Some(data.codec_id) == self.nscodec_codec_id {
+            return blit_nscodec_surface_bits(dest_left, dest_top, data, sink);
+        }
+        if Some(data.codec_id) == self.clearcodec_codec_id {
+            let decoder = self.clearcodec_decoder.as_mut().expect(
+                "set_clearcodec_codec_id allocates the decoder; this Option is always Some here",
+            );
+            return blit_clearcodec_surface_bits(decoder, dest_left, dest_top, data, sink);
+        }
         Err(RenderError::UnsupportedCodec {
             codec_id: data.codec_id,
         })
@@ -682,6 +765,66 @@ fn blit_raw_surface_bits<S: FrameSink>(
         rgba.push(px[1]);
         rgba.push(px[0]);
         rgba.push(px[3]);
+    }
+    sink.blit_rgba(dest_left, dest_top, data.width, data.height, &rgba);
+    Ok(true)
+}
+
+/// NSCodec → BGRA → RGBA top-down blit. NSCodec output is always
+/// 32 bpp, so we just do the byte-order swap and call the sink. Surface
+/// Commands deliver pixels top-down (no row flip needed).
+fn blit_nscodec_surface_bits<S: FrameSink>(
+    dest_left: u16,
+    dest_top: u16,
+    data: &BitmapDataEx,
+    sink: &mut S,
+) -> Result<bool, RenderError> {
+    if data.width == 0 || data.height == 0 {
+        return Ok(false);
+    }
+    let mut bgra = Vec::new();
+    NsCodecDecompressor::new()
+        .decompress(&data.bitmap_data, data.width, data.height, &mut bgra)?;
+    let mut rgba = Vec::with_capacity(bgra.len());
+    for px in bgra.chunks_exact(4) {
+        rgba.push(px[2]);
+        rgba.push(px[1]);
+        rgba.push(px[0]);
+        rgba.push(px[3]);
+    }
+    sink.blit_rgba(dest_left, dest_top, data.width, data.height, &rgba);
+    Ok(true)
+}
+
+/// ClearCodec → BGR (24 bpp) → RGBA (alpha = 0xFF). Pad to 32 bpp
+/// during the channel swap so the sink stays uniform.
+fn blit_clearcodec_surface_bits<S: FrameSink>(
+    decoder: &mut ClearCodecDecoder,
+    dest_left: u16,
+    dest_top: u16,
+    data: &BitmapDataEx,
+    sink: &mut S,
+) -> Result<bool, RenderError> {
+    if data.width == 0 || data.height == 0 {
+        return Ok(false);
+    }
+    let bgr = decoder.decode(&data.bitmap_data, data.width, data.height)?;
+    let pixel_count = data.width as usize * data.height as usize;
+    if bgr.len() != pixel_count * 3 {
+        return Err(RenderError::SizeMismatch(format!(
+            "ClearCodec: expected {} BGR bytes for {}x{}, got {}",
+            pixel_count * 3,
+            data.width,
+            data.height,
+            bgr.len()
+        )));
+    }
+    let mut rgba = Vec::with_capacity(pixel_count * 4);
+    for px in bgr.chunks_exact(3) {
+        rgba.push(px[2]);
+        rgba.push(px[1]);
+        rgba.push(px[0]);
+        rgba.push(0xFF);
     }
     sink.blit_rgba(dest_left, dest_top, data.width, data.height, &rgba);
     Ok(true)
@@ -1553,6 +1696,140 @@ mod tests {
     /// Encode one RFX frame using the server-side helper, decode it
     /// through `BitmapRenderer`, and check that the round-trip produces
     /// at least one 64×64 RGBA blit at the registered position.
+    // ── NSCodec / ClearCodec (S3d-5) ───────────────────────────────
+
+    /// Build a SetSurfaceBitsCmd payload that carries `body` under
+    /// `codec_id`. width / height match `body`'s dimensions.
+    fn build_set_surface_bits_codec(
+        codec_id: u8,
+        dest_left: u16,
+        dest_top: u16,
+        width: u16,
+        height: u16,
+        body: Vec<u8>,
+    ) -> Vec<u8> {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::surface_commands::SetSurfaceBitsCmd;
+        let cmd = SetSurfaceBitsCmd {
+            dest_left,
+            dest_top,
+            dest_right: dest_left + width,
+            dest_bottom: dest_top + height,
+            bitmap_data: BitmapDataEx {
+                bpp: 32,
+                codec_id,
+                width,
+                height,
+                ex_header: None,
+                bitmap_data: body,
+            },
+        };
+        let mut buf = vec![0u8; cmd.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut buf);
+            cmd.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        buf.truncate(written);
+        buf
+    }
+
+    /// NSCodec dispatch — when the codec_id is registered, the
+    /// renderer must route through `NsCodecDecompressor`. We verify
+    /// this with a deliberately-malformed body so the codec returns an
+    /// error: it must reach us as `RenderError::NsCodec(...)`, not as
+    /// `UnsupportedCodec`. Round-trip wire vectors are tested at the
+    /// `justrdp-graphics::nscodec` layer; here we only care that
+    /// dispatch + error mapping are correct.
+    #[test]
+    fn nscodec_dispatch_routes_through_codec() {
+        let codec_id = 0x0A;
+        // Truncated body: not enough bytes for a NSCodec stream header.
+        let payload =
+            build_set_surface_bits_codec(codec_id, 0, 0, 1, 1, vec![0u8; 4]);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_nscodec_codec_id(codec_id);
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(
+            matches!(err, RenderError::NsCodec(_)),
+            "expected NsCodec(_), got {err:?}"
+        );
+    }
+
+    /// Without registration NSCodec data still surfaces as
+    /// UnsupportedCodec — so the embedder doesn't accidentally paint
+    /// random bytes when the codec was never negotiated.
+    #[test]
+    fn nscodec_without_registration_stays_unsupported() {
+        let codec_id = 0x0A;
+        let payload =
+            build_set_surface_bits_codec(codec_id, 0, 0, 1, 1, vec![0u8; 32]);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        // No set_nscodec_codec_id call.
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(matches!(err, RenderError::UnsupportedCodec { codec_id: 0x0A }));
+    }
+
+    /// ClearCodec dispatch — same shape as NSCodec. Send a deliberately
+    /// truncated body (1 byte) and expect `RenderError::ClearCodec(...)`.
+    #[test]
+    fn clearcodec_dispatch_routes_through_codec() {
+        let codec_id = 0x0B;
+        let payload =
+            build_set_surface_bits_codec(codec_id, 0, 0, 2, 2, vec![0u8; 1]);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_clearcodec_codec_id(codec_id);
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(
+            matches!(err, RenderError::ClearCodec(_)),
+            "expected ClearCodec(_), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clearcodec_without_registration_stays_unsupported() {
+        let codec_id = 0x0B;
+        let payload =
+            build_set_surface_bits_codec(codec_id, 0, 0, 1, 1, vec![0u8; 16]);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let err = renderer.render(&event, &mut sink).unwrap_err();
+        assert!(matches!(err, RenderError::UnsupportedCodec { codec_id: 0x0B }));
+    }
+
+    /// Registering ClearCodec must allocate the decoder lazily and
+    /// allow Debug printing without exposing the cache internals.
+    #[test]
+    fn clearcodec_registration_allocates_decoder_and_debug_redacts_internals() {
+        let mut renderer = BitmapRenderer::new();
+        assert!(renderer.clearcodec_codec_id().is_none());
+        renderer.set_clearcodec_codec_id(0x0B);
+        assert_eq!(renderer.clearcodec_codec_id(), Some(0x0B));
+        // Debug must compile (manual impl) and not include "cache".
+        let s = alloc::format!("{renderer:?}");
+        assert!(s.contains("clearcodec_codec_id"));
+        assert!(!s.contains("glyph_storage"));
+    }
+
     #[test]
     fn rfx_round_trip_one_tile_image_mode() {
         use justrdp_graphics::rfx::frame_encoder::RfxFrameEncoder;
