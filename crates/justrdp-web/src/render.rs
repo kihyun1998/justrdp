@@ -22,6 +22,7 @@
 //! pixels ready to hand to a Canvas/WebGL/wgpu surface without an extra
 //! conversion stage.
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -48,10 +49,10 @@ use justrdp_pdu::rdp::bitmap::{
 };
 use justrdp_pdu::rdp::drawing_orders::{
     decode_dstblt, decode_lineto, decode_memblt, decode_opaque_rect, decode_patblt, decode_scrblt,
-    DstBltOrder, LineToOrder, OpaqueRectOrder, PatBltOrder, PrimaryOrderHistory, PrimaryOrderType,
-    ALT_SECONDARY_ORDER_HEADER_SIZE, ORDER_TYPE_CHANGE, TS_BOUNDS, TS_DELTA_COORDINATES,
-    TS_SECONDARY, TS_STANDARD, TS_ZERO_BOUNDS_DELTAS, TS_ZERO_FIELD_BYTE_BIT0,
-    TS_ZERO_FIELD_BYTE_BIT1,
+    DstBltOrder, LineToOrder, MemBltOrder, OpaqueRectOrder, PatBltOrder, PrimaryOrderHistory,
+    PrimaryOrderType, SecondaryOrderType, ALT_SECONDARY_ORDER_HEADER_SIZE, ORDER_TYPE_CHANGE,
+    TS_BOUNDS, TS_DELTA_COORDINATES, TS_SECONDARY, TS_STANDARD, TS_ZERO_BOUNDS_DELTAS,
+    TS_ZERO_FIELD_BYTE_BIT0, TS_ZERO_FIELD_BYTE_BIT1,
 };
 use justrdp_pdu::rdp::fast_path::FastPathUpdateType;
 use justrdp_pdu::rdp::surface_commands::{BitmapDataEx, SurfaceCommand, SURFACECMD_FRAMEACTION_END};
@@ -301,6 +302,23 @@ pub struct BitmapRenderer {
     /// callers usually wrap the browser's MediaSource / VideoDecoder
     /// API; native callers wrap openh264 / FFmpeg / hardware backends.
     avc_decoder: Option<Box<dyn AvcDecoder>>,
+    /// Bitmap cache populated by `CacheBitmapV2Uncompressed` Secondary
+    /// drawing orders (MS-RDPEGDI 2.2.2.2.1.2.3). Keyed by
+    /// `(cache_id, cache_index)`; `MemBlt` Primary orders look up
+    /// against this and blit the cached bitmap (or a sub-region).
+    bitmap_cache: BTreeMap<(u8, u16), CachedBitmap>,
+}
+
+/// One entry in [`BitmapRenderer::bitmap_cache`].
+///
+/// `pixels_rgba` is top-down 32-bpp RGBA, ready to feed straight to a
+/// `FrameSink::blit_rgba`. We convert at cache insert so MemBlt
+/// look-ups stay O(1) per byte (no per-blit channel swap).
+#[derive(Debug, Clone)]
+struct CachedBitmap {
+    width: u16,
+    height: u16,
+    pixels_rgba: Vec<u8>,
 }
 
 impl Default for BitmapRenderer {
@@ -323,6 +341,7 @@ impl core::fmt::Debug for BitmapRenderer {
             .field("avc444_codec_id", &self.avc444_codec_id)
             .field("avc444v2_codec_id", &self.avc444v2_codec_id)
             .field("has_avc_decoder", &self.avc_decoder.is_some())
+            .field("bitmap_cache_entries", &self.bitmap_cache.len())
             .finish_non_exhaustive()
     }
 }
@@ -343,7 +362,13 @@ impl BitmapRenderer {
             avc444_codec_id: None,
             avc444v2_codec_id: None,
             avc_decoder: None,
+            bitmap_cache: BTreeMap::new(),
         }
+    }
+
+    /// Number of cached bitmaps currently held (test / instrumentation).
+    pub fn bitmap_cache_len(&self) -> usize {
+        self.bitmap_cache.len()
     }
 
     /// Inject an embedder-supplied H.264 decoder. Required before any
@@ -536,11 +561,22 @@ impl BitmapRenderer {
                 // Secondary: orderLength + extraFlags + orderType + body.
                 let order_length =
                     cursor.read_u16_le("SecondaryOrder::orderLength")? as i32;
-                let _extra_flags = cursor.read_u16_le("SecondaryOrder::extraFlags")?;
-                let _order_type = cursor.read_u8("SecondaryOrder::orderType")?;
+                let extra_flags = cursor.read_u16_le("SecondaryOrder::extraFlags")?;
+                let order_type_raw = cursor.read_u8("SecondaryOrder::orderType")?;
                 // Per MS-RDPEGDI: body length = orderLength + 7 - 3 = orderLength + 4
                 let body_len = (order_length + 4) as usize;
-                cursor.read_slice(body_len, "SecondaryOrder::body")?;
+                let body = cursor.read_slice(body_len, "SecondaryOrder::body")?;
+                // Dispatch the subset we know how to render. Unknown /
+                // unsupported types fall through silently — the
+                // embedder loses caching for those but the stream
+                // stays in sync because we already advanced the cursor.
+                if let Ok(sec_type) = SecondaryOrderType::from_u8(order_type_raw) {
+                    if sec_type == SecondaryOrderType::CacheBitmapV2Uncompressed {
+                        let _ = self.cache_bitmap_v2_uncompressed(extra_flags, body);
+                        // Decode failures are non-fatal: the cache miss
+                        // simply causes future MemBlt look-ups to skip.
+                    }
+                }
                 continue;
             }
             // Primary order.
@@ -620,8 +656,9 @@ impl BitmapRenderer {
                 Ok(false)
             }
             PrimaryOrderType::MemBlt => {
-                let _ = decode_memblt(cursor, field_flags, delta, &mut self.primary_history)?;
-                Ok(false)
+                let order =
+                    decode_memblt(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(self.try_render_memblt(&order, sink))
             }
             PrimaryOrderType::LineTo => {
                 let order =
@@ -671,6 +708,135 @@ impl BitmapRenderer {
             }
         }
         Ok(any_blits)
+    }
+
+    /// `CacheBitmapV2Uncompressed` parser (MS-RDPEGDI 2.2.2.2.1.2.3).
+    ///
+    /// `extraFlags` holds the cache id, bpp code, and a flags byte; the
+    /// body starts (optionally) with key1/key2 (8 bytes when persistent
+    /// bit is set), then variable-length width / height / bitmapLength /
+    /// cacheIndex, then the raw bitmap pixels.
+    ///
+    /// We support only `bpp_code = 0x06` (32 bpp, BGRA top-down). Other
+    /// bpps are common enough on legacy traffic, but converting them
+    /// here means duplicating the per-bpp code path from the per-frame
+    /// Bitmap update handler — defer until we share a common decoder.
+    fn cache_bitmap_v2_uncompressed(
+        &mut self,
+        extra_flags: u16,
+        body: &[u8],
+    ) -> Result<(), RenderError> {
+        const CBR2_PERSISTENT_KEY_PRESENT: u16 = 0x0100;
+        const CBR2_HEIGHT_SAME_AS_WIDTH: u16 = 0x0200;
+        const PIXEL_BPP_32: u8 = 0x06;
+
+        let cache_id = (extra_flags & 0x07) as u8;
+        let bpp_code = ((extra_flags >> 3) & 0x1F) as u8;
+        if bpp_code != PIXEL_BPP_32 {
+            // Lower-bpp cache entries go un-stored; matching MemBlt
+            // look-ups will miss and silently drop their blits.
+            return Ok(());
+        }
+        let mut cur = body;
+        if extra_flags & CBR2_PERSISTENT_KEY_PRESENT != 0 {
+            if cur.len() < 8 {
+                return Err(RenderError::SizeMismatch(
+                    "CacheBitmapV2: persistent keys truncated".into(),
+                ));
+            }
+            cur = &cur[8..];
+        }
+        let (width, mut cur) = read_two_byte_unsigned(cur, "bitmapWidth")?;
+        let height = if extra_flags & CBR2_HEIGHT_SAME_AS_WIDTH != 0 {
+            width
+        } else {
+            let (h, rest) = read_two_byte_unsigned(cur, "bitmapHeight")?;
+            cur = rest;
+            h
+        };
+        let (length, cur) = read_four_byte_unsigned(cur, "bitmapLength")?;
+        let (cache_index, cur) = read_two_byte_unsigned(cur, "cacheIndex")?;
+        if (length as usize) > cur.len() {
+            return Err(RenderError::SizeMismatch(format!(
+                "CacheBitmapV2: bitmapLength {length} exceeds remaining {} bytes",
+                cur.len()
+            )));
+        }
+        let pixels = &cur[..length as usize];
+        let expected = width as usize * height as usize * 4;
+        if pixels.len() != expected {
+            // Mis-shaped wire — treat as a transient cache miss.
+            return Ok(());
+        }
+        // Wire is BGRA top-down (per MS-RDPEGDI cache convention,
+        // which differs from the bottom-up TS_BITMAP_DATA used in
+        // fast-path Bitmap updates). Just byte-swap to RGBA.
+        let mut rgba = Vec::with_capacity(expected);
+        for px in pixels.chunks_exact(4) {
+            rgba.push(px[2]);
+            rgba.push(px[1]);
+            rgba.push(px[0]);
+            rgba.push(px[3]);
+        }
+        self.bitmap_cache.insert(
+            (cache_id, cache_index),
+            CachedBitmap {
+                width,
+                height,
+                pixels_rgba: rgba,
+            },
+        );
+        Ok(())
+    }
+
+    /// MemBlt: blit a sub-region of a cached bitmap into the surface.
+    /// We support `SRCCOPY` (`bRop = 0xCC`) only — the common case for
+    /// straight bitmap copies. Other ROPs require destination read-back
+    /// (tracked as S3d-6h).
+    fn try_render_memblt<S: FrameSink>(
+        &mut self,
+        order: &MemBltOrder,
+        sink: &mut S,
+    ) -> bool {
+        const ROP3_SRCCOPY: u8 = 0xCC;
+        if order.rop != ROP3_SRCCOPY {
+            return false;
+        }
+        // Cache id: only the low 8 bits are used. (Spec uses 3 bits for
+        // V2 cache, 8 bits for V3, but the field is decoded into u16
+        // by `decode_memblt`.) Mask to fit our cache key.
+        let cache_id = (order.cache_id & 0xFF) as u8;
+        let entry = match self.bitmap_cache.get(&(cache_id, order.cache_index)) {
+            Some(e) => e,
+            None => return false, // cache miss → silent drop
+        };
+        let w = order.width.max(0) as u16;
+        let h = order.height.max(0) as u16;
+        if w == 0 || h == 0 {
+            return false;
+        }
+        let src_x = order.src_left.max(0) as u16;
+        let src_y = order.src_top.max(0) as u16;
+        // Clamp to the cached bitmap's extents.
+        let copy_w = w.min(entry.width.saturating_sub(src_x));
+        let copy_h = h.min(entry.height.saturating_sub(src_y));
+        if copy_w == 0 || copy_h == 0 {
+            return false;
+        }
+        let row_stride = entry.width as usize * 4;
+        let mut out = Vec::with_capacity(copy_w as usize * copy_h as usize * 4);
+        for row in 0..copy_h as usize {
+            let off = (src_y as usize + row) * row_stride + src_x as usize * 4;
+            out.extend_from_slice(&entry.pixels_rgba[off..off + copy_w as usize * 4]);
+        }
+        sink.blit_rgba(
+            order.left.max(0) as u16,
+            order.top.max(0) as u16,
+            copy_w,
+            copy_h,
+            &out,
+        );
+        true
     }
 
     /// Per-codec dispatch for one Surface Bits command.
@@ -1266,6 +1432,57 @@ fn primary_field_flags_byte_count(order_type: PrimaryOrderType) -> usize {
         | PrimaryOrderType::EllipseCb => 2,
         PrimaryOrderType::Mem3Blt | PrimaryOrderType::GlyphIndex => 3,
     }
+}
+
+/// `TWO_BYTE_UNSIGNED_ENCODING` (MS-RDPEGDI 2.2.2.2.1.1.1.2):
+/// * High bit clear → 7-bit value in single byte.
+/// * High bit set   → 15-bit value across 2 bytes (big-endian, MSB byte first).
+fn read_two_byte_unsigned<'a>(
+    data: &'a [u8],
+    field: &'static str,
+) -> Result<(u16, &'a [u8]), RenderError> {
+    if data.is_empty() {
+        return Err(RenderError::SizeMismatch(format!(
+            "{field}: TWO_BYTE_UNSIGNED truncated"
+        )));
+    }
+    if data[0] & 0x80 == 0 {
+        Ok((data[0] as u16, &data[1..]))
+    } else {
+        if data.len() < 2 {
+            return Err(RenderError::SizeMismatch(format!(
+                "{field}: TWO_BYTE_UNSIGNED long form truncated"
+            )));
+        }
+        let value = (((data[0] & 0x7F) as u16) << 8) | data[1] as u16;
+        Ok((value, &data[2..]))
+    }
+}
+
+/// `FOUR_BYTE_UNSIGNED_ENCODING` (MS-RDPEGDI 2.2.2.2.1.1.1.3):
+/// First byte's top 2 bits encode the byte count (00→1, 01→2, 10→3, 11→4);
+/// the remaining bits across all bytes form a big-endian unsigned integer.
+fn read_four_byte_unsigned<'a>(
+    data: &'a [u8],
+    field: &'static str,
+) -> Result<(u32, &'a [u8]), RenderError> {
+    if data.is_empty() {
+        return Err(RenderError::SizeMismatch(format!(
+            "{field}: FOUR_BYTE_UNSIGNED truncated"
+        )));
+    }
+    let n = ((data[0] >> 6) & 0x03) as usize + 1;
+    if data.len() < n {
+        return Err(RenderError::SizeMismatch(format!(
+            "{field}: FOUR_BYTE_UNSIGNED needs {n} bytes, have {}",
+            data.len()
+        )));
+    }
+    let mut value: u32 = (data[0] & 0x3F) as u32;
+    for &b in &data[1..n] {
+        value = (value << 8) | b as u32;
+    }
+    Ok((value, &data[n..]))
 }
 
 /// PatBlt brush styles (MS-RDPEGDI 2.2.2.2.1.1.1.8).
@@ -2891,6 +3108,157 @@ mod tests {
             assert_eq!(blit.1, 20);
             assert_eq!(&blit.4, &[0xFF, 0x00, 0x00, 0xFF]);
         }
+    }
+
+    /// Build a Secondary CacheBitmapV2Uncompressed order body.
+    /// `(width, height)` are encoded via TWO_BYTE_UNSIGNED, length via
+    /// FOUR_BYTE_UNSIGNED, cacheIndex via TWO_BYTE_UNSIGNED. Only the
+    /// short form is exercised here (values < 0x80).
+    fn build_cache_bitmap_v2_body(
+        width: u8,
+        height: u8,
+        cache_index: u8,
+        pixels_bgra: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(width);  // TWO_BYTE_UNSIGNED short
+        body.push(height); // TWO_BYTE_UNSIGNED short
+        // FOUR_BYTE_UNSIGNED short: top-2 bits = 0 → 1 byte, low 6 bits = value.
+        let length = pixels_bgra.len();
+        assert!(length < 0x40, "test helper covers ≤ 63-byte payloads");
+        body.push(length as u8);
+        body.push(cache_index);
+        body.extend_from_slice(pixels_bgra);
+        body
+    }
+
+    /// Wrap a Secondary order body as `SecondaryOrder::encode` would —
+    /// controlFlags(1) + orderLength(2) + extraFlags(2) + orderType(1) + body.
+    fn build_secondary_order_frame(extra_flags: u16, order_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.push(0x03); // TS_STANDARD | TS_SECONDARY
+        let order_length = (body.len() as i32 + 2 + 1 - 7) as u16;
+        frame.extend_from_slice(&order_length.to_le_bytes());
+        frame.extend_from_slice(&extra_flags.to_le_bytes());
+        frame.push(order_type);
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    /// Round-trip a CacheBitmapV2Uncompressed Secondary order through
+    /// the renderer + verify the cache populated. Then a MemBlt
+    /// Primary order looks it up + blits a sub-region.
+    #[test]
+    fn cache_bitmap_v2_then_memblt_round_trip() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+
+        // 4×2 BGRA bitmap. We tag a known-position pixel at (1, 0) so
+        // the MemBlt sub-region crop can be verified.
+        let mut pixels_bgra = Vec::with_capacity(4 * 2 * 4);
+        for row in 0..2 {
+            for col in 0..4 {
+                pixels_bgra.push(col as u8);             // B
+                pixels_bgra.push(row as u8);             // G
+                pixels_bgra.push(0xC0 + col as u8);      // R
+                pixels_bgra.push(0xFF);                  // A
+            }
+        }
+
+        // Build the Orders payload with two orders: secondary cache
+        // followed by primary MemBlt.
+        let extra_flags: u16 = (0x06 << 3) | 0x02; // bpp_code=32 (0x06), cache_id=2
+        let cache_body = build_cache_bitmap_v2_body(4, 2, 7, &pixels_bgra);
+        let cache_frame = build_secondary_order_frame(extra_flags, 0x04, &cache_body);
+
+        // MemBlt primary: cache_id=2, cache_index=7, blit (src 1,0, 3×2)
+        // to dest (10, 20) with SRCCOPY.
+        let mut memblt_body = Vec::with_capacity(2 + 4 * 2 + 1 + 2 * 2 + 2);
+        memblt_body.extend_from_slice(&2u16.to_le_bytes());   // cacheId
+        memblt_body.extend_from_slice(&10i16.to_le_bytes());  // left
+        memblt_body.extend_from_slice(&20i16.to_le_bytes());  // top
+        memblt_body.extend_from_slice(&3i16.to_le_bytes());   // width
+        memblt_body.extend_from_slice(&2i16.to_le_bytes());   // height
+        memblt_body.push(0xCC);                                // SRCCOPY
+        memblt_body.extend_from_slice(&1i16.to_le_bytes());   // src_left
+        memblt_body.extend_from_slice(&0i16.to_le_bytes());   // src_top
+        memblt_body.extend_from_slice(&7u16.to_le_bytes());   // cacheIndex
+        let memblt = PrimaryOrder {
+            order_type: PrimaryOrderType::MemBlt,
+            field_flags: 0x01FF, // all 9 fields
+            bounds: None,
+            data: memblt_body,
+        };
+        let mut memblt_bytes = vec![0u8; memblt.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut memblt_bytes);
+            memblt.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        memblt_bytes.truncate(written);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u16.to_le_bytes()); // numberOrders = 2
+        frame.extend_from_slice(&cache_frame);
+        frame.extend_from_slice(&memblt_bytes);
+
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.bitmap_cache_len(), 1);
+        assert_eq!(sink.blits.len(), 1);
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!((*x, *y, *w, *h), (10, 20, 3, 2));
+        // First top-down pixel of the blit is cache[(1, 0)] in BGRA →
+        // RGBA = (0xC0+1, 0, 1, 0xFF).
+        assert_eq!(&pixels[0..4], &[0xC1, 0x00, 0x01, 0xFF]);
+    }
+
+    /// MemBlt against an empty cache must silently skip — same shape
+    /// as other "render-only-when-possible" branches in the walker.
+    #[test]
+    fn memblt_cache_miss_skips_silently() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        let mut body = Vec::with_capacity(2 + 4 * 2 + 1 + 2 * 2 + 2);
+        body.extend_from_slice(&0u16.to_le_bytes()); // cacheId 0
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.push(0xCC);
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes()); // cacheIndex 0
+        let memblt = PrimaryOrder {
+            order_type: PrimaryOrderType::MemBlt,
+            field_flags: 0x01FF,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; memblt.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            memblt.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(!drew);
+        assert!(sink.blits.is_empty());
     }
 
     #[test]
