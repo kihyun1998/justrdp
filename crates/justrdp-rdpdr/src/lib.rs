@@ -29,8 +29,14 @@ pub mod scard;
 mod backend;
 #[cfg(feature = "alloc")]
 mod processor;
+#[cfg(feature = "alloc")]
+mod server;
 
 #[cfg(feature = "alloc")]
 pub use backend::{CreateResponse, DeviceIoError, DeviceIoResult, FileHandle, RdpdrBackend};
 #[cfg(feature = "alloc")]
 pub use processor::RdpdrClient;
+#[cfg(feature = "alloc")]
+pub use server::{
+    AnnouncedDevice, FilesystemServer, FilesystemServerConfig, RdpServerFilesystemHandler,
+};
