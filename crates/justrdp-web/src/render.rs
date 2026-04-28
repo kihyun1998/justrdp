@@ -236,6 +236,28 @@ pub trait FrameSink {
         pixels_rgba: &[u8],
     );
 
+    /// Optional read-back: copy a rectangle of currently-displayed RGBA
+    /// pixels into `out`. Default returns `false` — sinks that don't
+    /// keep a shadow buffer simply opt out, and primary orders that
+    /// require destination read-back (DstBlt DSTINVERT, MemBlt
+    /// non-SRCCOPY ROPs, future PatBlt pattern with merge ROPs) will
+    /// silently drop their blits instead of corrupting the display.
+    ///
+    /// Implementors that *do* hold a shadow buffer (`CanvasFrameSink`
+    /// reading via `getImageData`, native compositors, …) override
+    /// this to fill `out` with `width * height * 4` RGBA bytes and
+    /// return `true`.
+    fn peek_rgba(
+        &mut self,
+        _dest_left: u16,
+        _dest_top: u16,
+        _width: u16,
+        _height: u16,
+        _out: &mut Vec<u8>,
+    ) -> bool {
+        false
+    }
+
     /// Optional: end of an update batch — useful for sinks that buffer
     /// blits to amortize draw calls.
     fn flush(&mut self) {}
@@ -571,10 +593,18 @@ impl BitmapRenderer {
                 // embedder loses caching for those but the stream
                 // stays in sync because we already advanced the cursor.
                 if let Ok(sec_type) = SecondaryOrderType::from_u8(order_type_raw) {
-                    if sec_type == SecondaryOrderType::CacheBitmapV2Uncompressed {
-                        let _ = self.cache_bitmap_v2_uncompressed(extra_flags, body);
-                        // Decode failures are non-fatal: the cache miss
-                        // simply causes future MemBlt look-ups to skip.
+                    match sec_type {
+                        SecondaryOrderType::CacheBitmapV2Uncompressed => {
+                            let _ = self.cache_bitmap_v2(extra_flags, body, false);
+                        }
+                        SecondaryOrderType::CacheBitmapV2Compressed => {
+                            let _ = self.cache_bitmap_v2(extra_flags, body, true);
+                        }
+                        // CacheBitmapV1 / V3 / CacheGlyph / CacheBrush /
+                        // CacheColorTable: decoded only enough to keep
+                        // the order stream in sync; rendering against
+                        // them is tracked under S3d-6b/d.
+                        _ => {}
                     }
                 }
                 continue;
@@ -665,8 +695,88 @@ impl BitmapRenderer {
                     decode_lineto(cursor, field_flags, delta, &mut self.primary_history)?;
                 Ok(try_render_lineto(&order, sink))
             }
+            PrimaryOrderType::Polyline => self.try_render_polyline(cursor, field_flags, sink),
             other => Err(RenderError::UnsupportedPrimaryOrder { order_type: other }),
         }
+    }
+
+    /// Polyline body decoder + render (MS-RDPEGDI 2.2.2.2.1.1.2.18).
+    ///
+    /// Field layout (7 fields):
+    ///   1. xStart (i16, coord field — supports `delta` flag)
+    ///   2. yStart (i16, coord field)
+    ///   3. bRop2 (u8) — ignored (treat as R2_COPYPEN)
+    ///   4. BrushCacheEntry (u16) — ignored (no brush for line)
+    ///   5. PenColor (3 bytes BGR)
+    ///   6. NumDeltaEntries (u8)
+    ///   7. CodedDeltaList (variable) — `len(u16)` + per-point deltas
+    ///
+    /// Each delta point is encoded with `TWO_BYTE_SIGNED_ENCODING` for
+    /// dx then dy. We don't currently honor the per-entry zero-bit
+    /// optimization (rare in modern traffic) — every point reads two
+    /// signed deltas.
+    ///
+    /// Bresenham line per segment, 1-pixel wide, in pen color.
+    fn try_render_polyline<S: FrameSink>(
+        &mut self,
+        cursor: &mut ReadCursor<'_>,
+        field_flags: u32,
+        sink: &mut S,
+    ) -> Result<bool, RenderError> {
+        // We can't reuse the typed history fields without a public
+        // decode_polyline helper, but we can read the seven fields
+        // ourselves. PrimaryOrderHistory still tracks last_order_type
+        // and bounds; we don't currently feed coord deltas back into
+        // the per-type field array because nothing else reads them.
+        let mut x = if field_flags & 0x01 != 0 {
+            decode_coord_field_inline(cursor, false)?
+        } else {
+            0
+        };
+        let mut y = if field_flags & 0x02 != 0 {
+            decode_coord_field_inline(cursor, false)?
+        } else {
+            0
+        };
+        let _rop2 = if field_flags & 0x04 != 0 {
+            cursor.read_u8("Polyline::bRop2")?
+        } else {
+            0
+        };
+        let _brush_cache = if field_flags & 0x08 != 0 {
+            cursor.read_u16_le("Polyline::brushCacheEntry")?
+        } else {
+            0
+        };
+        let mut pen_color = [0u8; 3];
+        if field_flags & 0x10 != 0 {
+            pen_color[0] = cursor.read_u8("Polyline::penColor[0]")?;
+            pen_color[1] = cursor.read_u8("Polyline::penColor[1]")?;
+            pen_color[2] = cursor.read_u8("Polyline::penColor[2]")?;
+        }
+        let num_entries = if field_flags & 0x20 != 0 {
+            cursor.read_u8("Polyline::numDeltaEntries")? as usize
+        } else {
+            0
+        };
+        if field_flags & 0x40 != 0 {
+            // CodedDeltaList: leading u16 LE byte count.
+            let cb = cursor.read_u16_le("Polyline::cbData")? as usize;
+            let bytes = cursor.read_slice(cb, "Polyline::codedDelta")?;
+            let mut bcur = bytes;
+            let pen_color_rgba = [pen_color[2], pen_color[1], pen_color[0], 0xFF];
+            for _ in 0..num_entries {
+                let (dx, rest) = read_two_byte_signed(bcur)?;
+                let (dy, rest) = read_two_byte_signed(rest)?;
+                bcur = rest;
+                let nx = (x as i32) + (dx as i32);
+                let ny = (y as i32) + (dy as i32);
+                draw_bresenham_segment(x as i32, y as i32, nx, ny, &pen_color_rgba, sink);
+                x = nx as i16;
+                y = ny as i16;
+            }
+        }
+        Ok(true)
     }
 
     /// Walk a `FASTPATH_UPDATETYPE_SURFCMDS` payload, dispatching each
@@ -710,33 +820,33 @@ impl BitmapRenderer {
         Ok(any_blits)
     }
 
-    /// `CacheBitmapV2Uncompressed` parser (MS-RDPEGDI 2.2.2.2.1.2.3).
+    /// `CacheBitmapV2` parser (MS-RDPEGDI 2.2.2.2.1.2.3) — handles both
+    /// the uncompressed (`orderType = 0x04`) and compressed
+    /// (`orderType = 0x05`, RLE) variants behind one method.
     ///
     /// `extraFlags` holds the cache id, bpp code, and a flags byte; the
     /// body starts (optionally) with key1/key2 (8 bytes when persistent
     /// bit is set), then variable-length width / height / bitmapLength /
     /// cacheIndex, then the raw bitmap pixels.
     ///
-    /// We support only `bpp_code = 0x06` (32 bpp, BGRA top-down). Other
-    /// bpps are common enough on legacy traffic, but converting them
-    /// here means duplicating the per-bpp code path from the per-frame
-    /// Bitmap update handler — defer until we share a common decoder.
-    fn cache_bitmap_v2_uncompressed(
+    /// Supported per-bpp entries:
+    /// * `bpp_code = 0x06` (32 bpp, BGRA top-down) — uncompressed only;
+    ///   the compressed wire never advertises 32 bpp.
+    /// * `bpp_code = 0x04` (16 bpp, RGB565) — uncompressed or RLE.
+    /// Others silently drop (matching MemBlt look-ups will miss).
+    fn cache_bitmap_v2(
         &mut self,
         extra_flags: u16,
         body: &[u8],
+        compressed: bool,
     ) -> Result<(), RenderError> {
         const CBR2_PERSISTENT_KEY_PRESENT: u16 = 0x0100;
         const CBR2_HEIGHT_SAME_AS_WIDTH: u16 = 0x0200;
+        const PIXEL_BPP_16: u8 = 0x04;
         const PIXEL_BPP_32: u8 = 0x06;
 
         let cache_id = (extra_flags & 0x07) as u8;
         let bpp_code = ((extra_flags >> 3) & 0x1F) as u8;
-        if bpp_code != PIXEL_BPP_32 {
-            // Lower-bpp cache entries go un-stored; matching MemBlt
-            // look-ups will miss and silently drop their blits.
-            return Ok(());
-        }
         let mut cur = body;
         if extra_flags & CBR2_PERSISTENT_KEY_PRESENT != 0 {
             if cur.len() < 8 {
@@ -762,28 +872,43 @@ impl BitmapRenderer {
                 cur.len()
             )));
         }
-        let pixels = &cur[..length as usize];
-        let expected = width as usize * height as usize * 4;
-        if pixels.len() != expected {
-            // Mis-shaped wire — treat as a transient cache miss.
-            return Ok(());
-        }
-        // Wire is BGRA top-down (per MS-RDPEGDI cache convention,
-        // which differs from the bottom-up TS_BITMAP_DATA used in
-        // fast-path Bitmap updates). Just byte-swap to RGBA.
-        let mut rgba = Vec::with_capacity(expected);
-        for px in pixels.chunks_exact(4) {
-            rgba.push(px[2]);
-            rgba.push(px[1]);
-            rgba.push(px[0]);
-            rgba.push(px[3]);
-        }
+        let payload = &cur[..length as usize];
+
+        let pixels_rgba = match (compressed, bpp_code) {
+            (false, PIXEL_BPP_32) => {
+                let expected = width as usize * height as usize * 4;
+                if payload.len() != expected {
+                    return Ok(());
+                }
+                bgra_to_rgba(payload)
+            }
+            (false, PIXEL_BPP_16) => {
+                let expected = width as usize * height as usize * 2;
+                if payload.len() != expected {
+                    return Ok(());
+                }
+                // Cache entries are top-down per MS-RDPEGDI cache
+                // convention, the row flip is undesirable here; do the
+                // RGB565 expansion without a flip.
+                rgb565_top_down_to_rgba(payload, width, height)
+            }
+            (true, PIXEL_BPP_16) => {
+                let mut raw = Vec::new();
+                RleDecompressor::new()
+                    .decompress(payload, width, height, BitsPerPixel::Bpp16, &mut raw)?;
+                rgb565_top_down_to_rgba(&raw, width, height)
+            }
+            // 8 / 24 / non-32 uncompressed and any other compressed
+            // bpp: skip silently. Tracked under S3d-6c2 follow-up
+            // (full bpp coverage) and S3d-6c3 (CacheBitmapV1 / V3).
+            _ => return Ok(()),
+        };
         self.bitmap_cache.insert(
             (cache_id, cache_index),
             CachedBitmap {
                 width,
                 height,
-                pixels_rgba: rgba,
+                pixels_rgba,
             },
         );
         Ok(())
@@ -1434,6 +1559,132 @@ fn primary_field_flags_byte_count(order_type: PrimaryOrderType) -> usize {
     }
 }
 
+/// `TWO_BYTE_SIGNED_ENCODING` (MS-RDPEGDI 2.2.2.2.1.1.1.4):
+///   byte0.bit7  = sign (1 → negative)
+///   byte0.bit6  = "long" flag (1 → 14-bit value across 2 bytes)
+///   long form:  magnitude = ((byte0 & 0x3F) << 8) | byte1
+///   short form: magnitude = byte0 & 0x3F
+fn read_two_byte_signed(data: &[u8]) -> Result<(i16, &[u8]), RenderError> {
+    if data.is_empty() {
+        return Err(RenderError::SizeMismatch(
+            "TWO_BYTE_SIGNED truncated".into(),
+        ));
+    }
+    let head = data[0];
+    let neg = head & 0x80 != 0;
+    let long = head & 0x40 != 0;
+    let (mag, rest) = if long {
+        if data.len() < 2 {
+            return Err(RenderError::SizeMismatch(
+                "TWO_BYTE_SIGNED long form truncated".into(),
+            ));
+        }
+        ((((head & 0x3F) as u16) << 8) | data[1] as u16, &data[2..])
+    } else {
+        ((head & 0x3F) as u16, &data[1..])
+    };
+    let value = mag as i16;
+    Ok((if neg { -value } else { value }, rest))
+}
+
+/// Decode a single coordinate field inline. Pen polylines don't use
+/// the typed `decode_coord_field` helper because PrimaryOrderHistory's
+/// per-type field array doesn't include Polyline. Falls back to the
+/// MS-RDPEGDI 2.2.2.2.1.1.1.4 signed encoding for delta mode and
+/// plain i16 LE for absolute mode.
+fn decode_coord_field_inline(cursor: &mut ReadCursor<'_>, delta: bool) -> Result<i16, RenderError> {
+    if delta {
+        // Read raw bytes through the cursor to feed the signed encoder.
+        let head = cursor.read_u8("coord::head")?;
+        let long = head & 0x40 != 0;
+        let neg = head & 0x80 != 0;
+        let mag = if long {
+            let next = cursor.read_u8("coord::next")?;
+            (((head & 0x3F) as u16) << 8) | next as u16
+        } else {
+            (head & 0x3F) as u16
+        };
+        let value = mag as i16;
+        Ok(if neg { -value } else { value })
+    } else {
+        Ok(cursor.read_u16_le("coord::abs")? as i16)
+    }
+}
+
+/// Bresenham line raster between two points; one tiny `blit_rgba` per
+/// pixel so the implementation stays trivially correct against any
+/// FrameSink. Shared by [`try_render_lineto`] and the Polyline path.
+fn draw_bresenham_segment<S: FrameSink>(
+    mut x0: i32,
+    mut y0: i32,
+    x1: i32,
+    y1: i32,
+    color_rgba: &[u8; 4],
+    sink: &mut S,
+) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut budget = 16_384i32;
+    loop {
+        if x0 >= 0 && y0 >= 0 && x0 <= u16::MAX as i32 && y0 <= u16::MAX as i32 {
+            sink.blit_rgba(x0 as u16, y0 as u16, 1, 1, color_rgba);
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+        budget -= 1;
+        if budget <= 0 {
+            break;
+        }
+    }
+}
+
+/// BGRA → RGBA byte-order swap (no row flip).
+fn bgra_to_rgba(pixels: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(pixels.len());
+    for px in pixels.chunks_exact(4) {
+        rgba.push(px[2]);
+        rgba.push(px[1]);
+        rgba.push(px[0]);
+        rgba.push(px[3]);
+    }
+    rgba
+}
+
+/// Top-down RGB565 (LE u16) → top-down RGBA (alpha = 0xFF). Mirrors
+/// [`flip_and_convert_rgb565`] but skips the row flip — used for
+/// CacheBitmapV2 entries which are stored top-down by spec.
+fn rgb565_top_down_to_rgba(src: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let stride = width as usize * 2;
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in 0..height as usize {
+        let row_bytes = &src[row * stride..(row + 1) * stride];
+        for px in row_bytes.chunks_exact(2) {
+            let v = u16::from_le_bytes([px[0], px[1]]);
+            let r5 = ((v >> 11) & 0x1F) as u8;
+            let g6 = ((v >> 5) & 0x3F) as u8;
+            let b5 = (v & 0x1F) as u8;
+            out.push((r5 << 3) | (r5 >> 2));
+            out.push((g6 << 2) | (g6 >> 4));
+            out.push((b5 << 3) | (b5 >> 2));
+            out.push(0xFF);
+        }
+    }
+    out
+}
+
 /// `TWO_BYTE_UNSIGNED_ENCODING` (MS-RDPEGDI 2.2.2.2.1.1.1.2):
 /// * High bit clear → 7-bit value in single byte.
 /// * High bit set   → 15-bit value across 2 bytes (big-endian, MSB byte first).
@@ -1527,19 +1778,41 @@ fn try_render_patblt<S: FrameSink>(order: &PatBltOrder, sink: &mut S) -> bool {
     true
 }
 
-/// Render a DstBlt order, but only for ROPs that don't require reading
-/// the existing destination pixels back (`FrameSink` is write-only):
+/// DstBlt ROP that XORs every channel — needs destination read-back.
+const ROP3_DSTINVERT: u8 = 0x55;
+
+/// Render a DstBlt order. Three ROP groups:
 ///
-/// * `BLACKNESS` (0x00) → fill rect with `(0, 0, 0, 0xFF)`
-/// * `WHITENESS` (0xFF) → fill rect with `(0xFF, 0xFF, 0xFF, 0xFF)`
+/// * `BLACKNESS` (0x00) → fill rect with `(0, 0, 0, 0xFF)`.
+/// * `WHITENESS` (0xFF) → fill rect with `(0xFF, 0xFF, 0xFF, 0xFF)`.
+/// * `DSTINVERT` (0x55) → read existing pixels back, invert R/G/B,
+///   re-blit. Requires the sink to implement
+///   [`FrameSink::peek_rgba`]; sinks that don't (the trait default)
+///   silently drop the blit so the display doesn't decay.
 ///
-/// Other DstBlt ROPs (DSTINVERT, BLACKBORDER, …) require destination
-/// readback and are silently skipped (`Ok(false)` from the caller).
+/// Other ROPs (BLACKBORDER, etc.) are still skipped pending S3d-6h
+/// expansion of the read-modify-write ROP set.
 fn try_render_dstblt<S: FrameSink>(order: &DstBltOrder, sink: &mut S) -> bool {
     let w = order.width.max(0) as u16;
     let h = order.height.max(0) as u16;
     if w == 0 || h == 0 {
         return false;
+    }
+    let dest_left = order.left.max(0) as u16;
+    let dest_top = order.top.max(0) as u16;
+    if order.rop == ROP3_DSTINVERT {
+        let mut buf = Vec::new();
+        if !sink.peek_rgba(dest_left, dest_top, w, h, &mut buf) {
+            return false;
+        }
+        // Invert RGB channels in-place; alpha untouched.
+        for px in buf.chunks_exact_mut(4) {
+            px[0] = !px[0];
+            px[1] = !px[1];
+            px[2] = !px[2];
+        }
+        sink.blit_rgba(dest_left, dest_top, w, h, &buf);
+        return true;
     }
     let color = match order.rop {
         ROP3_BLACKNESS => [0x00, 0x00, 0x00, 0xFF],
@@ -1550,13 +1823,7 @@ fn try_render_dstblt<S: FrameSink>(order: &DstBltOrder, sink: &mut S) -> bool {
         .take((w as usize) * (h as usize))
         .flatten()
         .collect();
-    sink.blit_rgba(
-        order.left.max(0) as u16,
-        order.top.max(0) as u16,
-        w,
-        h,
-        &pixels,
-    );
+    sink.blit_rgba(dest_left, dest_top, w, h, &pixels);
     true
 }
 
@@ -1577,39 +1844,14 @@ fn try_render_lineto<S: FrameSink>(order: &LineToOrder, sink: &mut S) -> bool {
         order.pen_color[2],
         0xFF,
     ];
-    let mut x0 = order.start_x as i32;
-    let mut y0 = order.start_y as i32;
-    let x1 = order.end_x as i32;
-    let y1 = order.end_y as i32;
-    let dx = (x1 - x0).abs();
-    let dy = -(y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    // Hard-cap line length to defeat a malformed order with absurd
-    // endpoints. 16k pixels is wider than any reasonable RDP desktop.
-    let mut budget = 16_384i32;
-    loop {
-        if x0 >= 0 && y0 >= 0 && x0 <= u16::MAX as i32 && y0 <= u16::MAX as i32 {
-            sink.blit_rgba(x0 as u16, y0 as u16, 1, 1, &pen_color);
-        }
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
-        }
-        budget -= 1;
-        if budget <= 0 {
-            break;
-        }
-    }
+    draw_bresenham_segment(
+        order.start_x as i32,
+        order.start_y as i32,
+        order.end_x as i32,
+        order.end_y as i32,
+        &pen_color,
+        sink,
+    );
     true
 }
 
@@ -3216,6 +3458,259 @@ mod tests {
         // First top-down pixel of the blit is cache[(1, 0)] in BGRA →
         // RGBA = (0xC0+1, 0, 1, 0xFF).
         assert_eq!(&pixels[0..4], &[0xC1, 0x00, 0x01, 0xFF]);
+    }
+
+    /// CacheBitmapV2Compressed (orderType 0x05) at 16 bpp, RLE — feed
+    /// a tiny RLE program (two WHITE special bytes = 2 white pixels)
+    /// through the secondary handler, confirm the cache populates.
+    #[test]
+    fn cache_bitmap_v2_compressed_16bpp_rle_decodes() {
+        // RLE program: WHITE, WHITE → 2 px @ 16 bpp white = (0xFFFF, 0xFFFF).
+        let body_rle = [0xFD, 0xFD];
+        // CacheBitmapV2 body (short forms, non-persistent):
+        //   bitmapWidth = 2 (TWO_BYTE_UNSIGNED short)
+        //   bitmapHeight = 1 (short)
+        //   bitmapLength = 2 (FOUR_BYTE_UNSIGNED short — 1 byte with top
+        //     bits 00 → 1 byte total, low 6 bits = value)
+        //   cacheIndex = 5 (TWO_BYTE_UNSIGNED short)
+        let mut body = Vec::new();
+        body.push(2);          // width
+        body.push(1);          // height
+        body.push(2);          // length
+        body.push(5);          // cacheIndex
+        body.extend_from_slice(&body_rle);
+        let extra_flags: u16 = (0x04 << 3) | 0x01; // bpp=16 (0x04), cache_id=1
+        let cache_frame =
+            build_secondary_order_frame(extra_flags, 0x05 /* CacheBitmapV2Compressed */, &body);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes()); // numberOrders
+        frame.extend_from_slice(&cache_frame);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.bitmap_cache_len(), 1);
+    }
+
+    // ── S3d-6g: Polyline ───────────────────────────────────────────
+
+    /// FrameSink that just records blits *and* serves a synthetic
+    /// peek_rgba so the read-modify-write tests don't have to wire a
+    /// shadow buffer themselves.
+    #[derive(Default)]
+    struct PeekableCapture {
+        blits: Vec<(u16, u16, u16, u16, Vec<u8>)>,
+        /// Pixels the sink should pretend are already on screen, RGBA
+        /// indexed by `(x, y)` linearized as `y * stride + x`. `stride`
+        /// is the width set by `seed`.
+        seed_pixels: Vec<u8>,
+        seed_width: u16,
+        seed_height: u16,
+    }
+
+    impl PeekableCapture {
+        fn seed(&mut self, w: u16, h: u16, color: [u8; 4]) {
+            self.seed_width = w;
+            self.seed_height = h;
+            self.seed_pixels = core::iter::repeat(color)
+                .take(w as usize * h as usize)
+                .flatten()
+                .collect();
+        }
+    }
+
+    impl FrameSink for PeekableCapture {
+        fn blit_rgba(
+            &mut self,
+            x: u16,
+            y: u16,
+            w: u16,
+            h: u16,
+            pixels: &[u8],
+        ) {
+            self.blits.push((x, y, w, h, pixels.to_vec()));
+        }
+
+        fn peek_rgba(
+            &mut self,
+            x: u16,
+            y: u16,
+            w: u16,
+            h: u16,
+            out: &mut Vec<u8>,
+        ) -> bool {
+            if x as u32 + w as u32 > self.seed_width as u32
+                || y as u32 + h as u32 > self.seed_height as u32
+            {
+                return false;
+            }
+            out.clear();
+            let stride = self.seed_width as usize * 4;
+            for row in 0..h as usize {
+                let row_off = (y as usize + row) * stride + x as usize * 4;
+                out.extend_from_slice(&self.seed_pixels[row_off..row_off + w as usize * 4]);
+            }
+            true
+        }
+    }
+
+    /// Polyline: a 2-segment path with deltas (+5, 0) then (0, +5).
+    /// Counts pixels — Bresenham emits one blit per pixel.
+    #[test]
+    fn orders_polyline_two_segments_emits_pen_color_pixels() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // Polyline body fields (7):
+        //   xStart (i16 LE) = 10
+        //   yStart (i16 LE) = 20
+        //   bRop2 (u8) = 13
+        //   BrushCacheEntry (u16 LE) = 0
+        //   PenColor (3 bytes BGR) = (0x00, 0x80, 0xFF)
+        //   NumDeltaEntries (u8) = 2
+        //   CodedDeltaList: cbData(u16) + 2 deltas, each (dx, dy).
+        //     delta1: dx=+5, dy=0 → short form: 0x05, 0x00
+        //     delta2: dx=0, dy=+5 → short form: 0x00, 0x05
+        let mut delta_list = Vec::new();
+        delta_list.push(0x05); delta_list.push(0x00);
+        delta_list.push(0x00); delta_list.push(0x05);
+        let cb_data = delta_list.len() as u16;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&10i16.to_le_bytes());
+        body.extend_from_slice(&20i16.to_le_bytes());
+        body.push(13);                                // bRop2 = R2_COPYPEN
+        body.extend_from_slice(&0u16.to_le_bytes()); // brushCacheEntry
+        body.extend_from_slice(&[0x00, 0x80, 0xFF]); // penColor BGR
+        body.push(2);                                 // numDeltaEntries
+        body.extend_from_slice(&cb_data.to_le_bytes());
+        body.extend_from_slice(&delta_list);
+
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::Polyline,
+            field_flags: 0x7F, // all 7 fields
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        // Two segments: 5 px horizontal + 5 px vertical = 11 unique
+        // points if Bresenham hits each endpoint twice (once at end of
+        // segment N, once at start of N+1). Single-pixel-wide
+        // segments mean the count is segment_length+1 each minus one
+        // overlap = 6 + 5 = 11 pixels in this case (or 5 + 6 with
+        // shifted overlap accounting, depending on Bresenham nudges).
+        assert!(
+            sink.blits.len() >= 10,
+            "expected ≥10 line pixels, got {}",
+            sink.blits.len()
+        );
+        // Pen color BGR (0x00, 0x80, 0xFF) → RGBA (0xFF, 0x80, 0x00, 0xFF).
+        for blit in &sink.blits {
+            assert_eq!(&blit.4, &[0xFF, 0x80, 0x00, 0xFF]);
+        }
+    }
+
+    // ── S3d-6h: peek_rgba + DstBlt DSTINVERT ───────────────────────
+
+    #[test]
+    fn dstblt_dstinvert_inverts_seeded_pixels() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // DstBlt with DSTINVERT covering (0, 0, 1, 1).
+        let mut body = Vec::with_capacity(2 * 4 + 1);
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.push(0x55); // ROP3_DSTINVERT
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::DstBlt,
+            field_flags: 0x1F,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = PeekableCapture::default();
+        sink.seed(2, 2, [0x12, 0x34, 0x56, 0xFF]);
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew, "DSTINVERT must blit when peek_rgba succeeds");
+        assert_eq!(sink.blits.len(), 1);
+        assert_eq!(
+            sink.blits[0].4,
+            vec![!0x12, !0x34, !0x56, 0xFF],
+            "RGB inverted, alpha preserved"
+        );
+    }
+
+    /// Without `peek_rgba`, a DSTINVERT silently drops — protects
+    /// against painting against a non-seeded shadow buffer.
+    #[test]
+    fn dstblt_dstinvert_drops_when_peek_unsupported() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        let mut body = Vec::with_capacity(2 * 4 + 1);
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.push(0x55);
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::DstBlt,
+            field_flags: 0x1F,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new(); // default peek_rgba returns false
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(!drew);
+        assert!(sink.blits.is_empty());
     }
 
     /// MemBlt against an empty cache must silently skip — same shape
