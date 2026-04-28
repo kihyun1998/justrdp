@@ -329,6 +329,12 @@ pub struct BitmapRenderer {
     /// `(cache_id, cache_index)`; `MemBlt` Primary orders look up
     /// against this and blit the cached bitmap (or a sub-region).
     bitmap_cache: BTreeMap<(u8, u16), CachedBitmap>,
+    /// Brush cache populated by `CacheBrush` Secondary drawing orders
+    /// (MS-RDPEGDI 2.2.2.2.1.2.7). 8×8 monochrome brushes only at the
+    /// moment — the byte array is `[u8; 8]` rows, MSB-first within
+    /// each row. PatBlt orders with `BS_PATTERN` and a cached
+    /// `brush_hatch` index look up here.
+    brush_cache: BTreeMap<u8, [u8; 8]>,
 }
 
 /// One entry in [`BitmapRenderer::bitmap_cache`].
@@ -385,12 +391,18 @@ impl BitmapRenderer {
             avc444v2_codec_id: None,
             avc_decoder: None,
             bitmap_cache: BTreeMap::new(),
+            brush_cache: BTreeMap::new(),
         }
     }
 
     /// Number of cached bitmaps currently held (test / instrumentation).
     pub fn bitmap_cache_len(&self) -> usize {
         self.bitmap_cache.len()
+    }
+
+    /// Number of cached brushes currently held.
+    pub fn brush_cache_len(&self) -> usize {
+        self.brush_cache.len()
     }
 
     /// Inject an embedder-supplied H.264 decoder. Required before any
@@ -600,10 +612,13 @@ impl BitmapRenderer {
                         SecondaryOrderType::CacheBitmapV2Compressed => {
                             let _ = self.cache_bitmap_v2(extra_flags, body, true);
                         }
-                        // CacheBitmapV1 / V3 / CacheGlyph / CacheBrush /
+                        SecondaryOrderType::CacheBrush => {
+                            let _ = self.cache_brush(body);
+                        }
+                        // CacheBitmapV1 / V3 / CacheGlyph /
                         // CacheColorTable: decoded only enough to keep
                         // the order stream in sync; rendering against
-                        // them is tracked under S3d-6b/d.
+                        // them is tracked under S3d-6c5 / 6d2.
                         _ => {}
                     }
                 }
@@ -679,7 +694,7 @@ impl BitmapRenderer {
             PrimaryOrderType::PatBlt => {
                 let order =
                     decode_patblt(cursor, field_flags, delta, &mut self.primary_history)?;
-                Ok(try_render_patblt(&order, sink))
+                Ok(try_render_patblt(&order, &self.brush_cache, sink))
             }
             PrimaryOrderType::GlyphIndex => {
                 let _ =
@@ -969,6 +984,62 @@ impl BitmapRenderer {
             }
         }
         Ok(any_blits)
+    }
+
+    /// `CacheBrush` parser (MS-RDPEGDI 2.2.2.2.1.2.7).
+    ///
+    /// Body layout:
+    ///   cacheEntry      (u8)  — index in [0, BRUSH_CACHE_SIZE)
+    ///   iBitmapFormat   (u8)  — 1 = 1 bpp mono, 3 = 8 bpp, etc.
+    ///   cx              (u8)  — width (must be 8)
+    ///   cy              (u8)  — height (must be 8)
+    ///   style           (u8)  — reserved
+    ///   iBytes          (u8)  — count of brushData bytes
+    ///   brushData       (iBytes)
+    ///
+    /// We accept only 8×8 1 bpp monochrome (the most common shape used
+    /// by Windows for hatched / dithered fills). Higher color depths
+    /// silently drop — the next PatBlt that references the missing
+    /// entry will skip its blit rather than paint corrupted pixels.
+    fn cache_brush(&mut self, body: &[u8]) -> Result<(), RenderError> {
+        if body.len() < 6 {
+            return Err(RenderError::SizeMismatch(
+                "CacheBrush: header truncated".into(),
+            ));
+        }
+        let cache_entry = body[0];
+        let i_bitmap_format = body[1];
+        let cx = body[2];
+        let cy = body[3];
+        let _style = body[4];
+        let i_bytes = body[5] as usize;
+        if cx != 8 || cy != 8 {
+            return Ok(()); // non-8×8 brushes silently drop for now
+        }
+        if body.len() < 6 + i_bytes {
+            return Err(RenderError::SizeMismatch(format!(
+                "CacheBrush: iBytes={i_bytes} but only {} body bytes left",
+                body.len() - 6
+            )));
+        }
+        let brush_data = &body[6..6 + i_bytes];
+        if i_bitmap_format != 1 {
+            return Ok(()); // non-1bpp brushes deferred (S3d-6b3)
+        }
+        // 1 bpp 8×8 = 8 bytes, MSB-first row layout. The wire row
+        // order on a CacheBrush is *reversed* (bottom-to-top per spec
+        // remarks for Brush types — this is the same convention DIB
+        // brushes use). Reverse on store so the renderer always sees
+        // a top-down 8×8 mask.
+        if brush_data.len() < 8 {
+            return Ok(());
+        }
+        let mut rows = [0u8; 8];
+        for i in 0..8 {
+            rows[i] = brush_data[7 - i];
+        }
+        self.brush_cache.insert(cache_entry, rows);
+        Ok(())
     }
 
     /// `CacheBitmapV2` parser (MS-RDPEGDI 2.2.2.2.1.2.3) — handles both
@@ -2103,9 +2174,35 @@ const ROP3_PATCOPY: u8 = 0xF0;
 const ROP3_BLACKNESS: u8 = 0x00;
 const ROP3_WHITENESS: u8 = 0xFF;
 
+/// `BS_HATCHED` brush style (predefined 8×8 hatch pattern selected by
+/// `brush_hatch`).
+const BS_HATCHED: u8 = 0x02;
+
 /// `BS_PATTERN` brush style (8×8 monochrome inline pattern carried in
-/// `brush_hatch` + `brush_extra`).
+/// `brush_hatch` + `brush_extra`, OR cache index when the high bit of
+/// the brush_style byte is set).
 const BS_PATTERN: u8 = 0x03;
+
+/// Hatch index (MS-RDPEGDI 2.2.2.2.1.1.1.8 brushHatch).
+const HS_HORIZONTAL: u8 = 0;
+const HS_VERTICAL: u8 = 1;
+const HS_FDIAGONAL: u8 = 2;
+const HS_BDIAGONAL: u8 = 3;
+const HS_CROSS: u8 = 4;
+const HS_DIAGCROSS: u8 = 5;
+
+/// Six predefined 8×8 hatch patterns (rows 0..7, MSB = leftmost column).
+fn hatch_pattern(index: u8) -> Option<[u8; 8]> {
+    Some(match index {
+        HS_HORIZONTAL => [0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00],
+        HS_VERTICAL => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10],
+        HS_FDIAGONAL => [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01],
+        HS_BDIAGONAL => [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80],
+        HS_CROSS => [0x10, 0x10, 0x10, 0xFF, 0x10, 0x10, 0x10, 0x10],
+        HS_DIAGCROSS => [0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81],
+        _ => return None,
+    })
+}
 
 /// Render PatBlt covering both `BS_SOLID` and `BS_PATTERN` brush styles,
 /// for both PATCOPY (no read-back) and the read-modify-write ROPs
@@ -2116,7 +2213,11 @@ const BS_PATTERN: u8 = 0x03;
 /// `brush_extra` holds the remaining 7 rows). Each pattern bit picks
 /// foreground (1) or background (0) for that pixel position before the
 /// ROP3 mixes it with the existing destination.
-fn try_render_patblt<S: FrameSink>(order: &PatBltOrder, sink: &mut S) -> bool {
+fn try_render_patblt<S: FrameSink>(
+    order: &PatBltOrder,
+    renderer_brush_cache: &BTreeMap<u8, [u8; 8]>,
+    sink: &mut S,
+) -> bool {
     let w = order.width.max(0) as u16;
     let h = order.height.max(0) as u16;
     if w == 0 || h == 0 {
@@ -2125,26 +2226,44 @@ fn try_render_patblt<S: FrameSink>(order: &PatBltOrder, sink: &mut S) -> bool {
     let dest_left = order.left.max(0) as u16;
     let dest_top = order.top.max(0) as u16;
 
-    // Build the pattern source pixels (P) for the rect. For BS_SOLID
-    // every pixel is fore_color; for BS_PATTERN we tile the 8×8
-    // monochrome pattern starting from the brush origin.
-    let pattern_pixels = match order.brush_style {
-        BS_SOLID => {
-            // Cheap-out: don't actually allocate the buffer; we pass
-            // fore_color directly into rop3 for each pixel.
-            None
+    // Resolve the source pattern (`P`). The high bit of brush_style
+    // (0x80) marks "cached pattern" — the brush_hatch byte then is a
+    // CacheBrush index. Otherwise:
+    //   BS_SOLID    → no pattern, fore_color everywhere.
+    //   BS_HATCHED  → predefined hatch index in brush_hatch.
+    //   BS_PATTERN  → 8×8 inline pattern in brush_hatch + brush_extra.
+    let cached_brush_bit = order.brush_style & 0x80 != 0;
+    let style_low = order.brush_style & 0x7F;
+    let pattern_rows: Option<[u8; 8]> = if cached_brush_bit {
+        renderer_brush_lookup(renderer_brush_cache, order.brush_hatch)
+    } else {
+        match style_low {
+            BS_SOLID => None,
+            BS_HATCHED => hatch_pattern(order.brush_hatch),
+            BS_PATTERN => Some([
+                order.brush_hatch,
+                order.brush_extra[0],
+                order.brush_extra[1],
+                order.brush_extra[2],
+                order.brush_extra[3],
+                order.brush_extra[4],
+                order.brush_extra[5],
+                order.brush_extra[6],
+            ]),
+            _ => return false,
         }
-        BS_PATTERN => Some(build_patblt_pattern(order, w, h)),
-        _ => return false,
     };
+    let pattern_pixels: Option<Vec<u8>> = pattern_rows.map(|rows| {
+        materialize_pattern(rows, order.brush_org_x, order.brush_org_y, w, h)
+    });
 
     if order.rop == ROP3_PATCOPY {
         // No destination read-back needed.
         let mut out = Vec::with_capacity(w as usize * h as usize * 4);
         for row in 0..h as usize {
             for col in 0..w as usize {
-                let bit_set = pattern_bit(order, &pattern_pixels, col, row);
-                let (r, g, b) = if bit_set || order.brush_style == BS_SOLID {
+                let bit_set = patblt_bit_set(&pattern_pixels, col, row, w);
+                let (r, g, b) = if bit_set || pattern_pixels.is_none() {
                     (order.fore_color[0], order.fore_color[1], order.fore_color[2])
                 } else {
                     (order.back_color[0], order.back_color[1], order.back_color[2])
@@ -2169,8 +2288,8 @@ fn try_render_patblt<S: FrameSink>(order: &PatBltOrder, sink: &mut S) -> bool {
     let mut idx = 0;
     for row in 0..h as usize {
         for col in 0..w as usize {
-            let bit_set = pattern_bit(order, &pattern_pixels, col, row);
-            let (pr, pg, pb) = if bit_set || order.brush_style == BS_SOLID {
+            let bit_set = patblt_bit_set(&pattern_pixels, col, row, w);
+            let (pr, pg, pb) = if bit_set || pattern_pixels.is_none() {
                 (order.fore_color[0], order.fore_color[1], order.fore_color[2])
             } else {
                 (order.back_color[0], order.back_color[1], order.back_color[2])
@@ -2189,27 +2308,16 @@ fn try_render_patblt<S: FrameSink>(order: &PatBltOrder, sink: &mut S) -> bool {
     true
 }
 
-/// Build a per-pixel pattern bitmap (1 byte per pixel: 0 = back, 1 =
-/// fore) for `BS_PATTERN`. We materialize this so the rendering loop
-/// can avoid re-decoding the 8×8 pattern row index per pixel.
-fn build_patblt_pattern(order: &PatBltOrder, w: u16, h: u16) -> Vec<u8> {
+/// Materialize an 8×8 monochrome pattern (`rows` MSB-first per row,
+/// row 0 at top) tiled to fill `(w × h)` with the given brush origin
+/// offset, returning one byte per pixel: 0 = background, 1 = foreground.
+fn materialize_pattern(rows: [u8; 8], org_x: i8, org_y: i8, w: u16, h: u16) -> Vec<u8> {
     let mut p = Vec::with_capacity(w as usize * h as usize);
-    let rows = [
-        order.brush_hatch,
-        order.brush_extra[0],
-        order.brush_extra[1],
-        order.brush_extra[2],
-        order.brush_extra[3],
-        order.brush_extra[4],
-        order.brush_extra[5],
-        order.brush_extra[6],
-    ];
-    let ox = (order.brush_org_x as i32).rem_euclid(8) as usize;
-    let oy = (order.brush_org_y as i32).rem_euclid(8) as usize;
+    let ox = (org_x as i32).rem_euclid(8) as usize;
+    let oy = (org_y as i32).rem_euclid(8) as usize;
     for row in 0..h as usize {
         let pat_row = rows[(row + oy) & 7];
         for col in 0..w as usize {
-            // Top-most bit (0x80) corresponds to the leftmost column.
             let bit = 7 - ((col + ox) & 7);
             p.push((pat_row >> bit) & 1);
         }
@@ -2217,25 +2325,20 @@ fn build_patblt_pattern(order: &PatBltOrder, w: u16, h: u16) -> Vec<u8> {
     p
 }
 
-/// Look up the pattern bit for `(col, row)` inside the rect being
-/// painted. For `BS_SOLID` the pattern is unused (we always pick fore).
-fn pattern_bit(
-    order: &PatBltOrder,
-    materialized: &Option<Vec<u8>>,
-    col: usize,
-    row: usize,
-) -> bool {
-    match order.brush_style {
-        BS_SOLID => true,
-        BS_PATTERN => match materialized {
-            Some(p) => {
-                let w = order.width.max(0) as usize;
-                p[row * w + col] != 0
-            }
-            None => true,
-        },
-        _ => true,
+fn patblt_bit_set(pattern: &Option<Vec<u8>>, col: usize, row: usize, w: u16) -> bool {
+    match pattern {
+        Some(p) => p[row * w as usize + col] != 0,
+        None => true,
     }
+}
+
+/// Helper that takes a `&BTreeMap<u8, [u8; 8]>` reference even though
+/// the renderer's brush_cache is reached through `&self`. We don't
+/// thread the renderer down into `try_render_patblt` (which is a free
+/// function, not a method) because the call site already has the
+/// cache borrow available; this signature keeps the look-up local.
+fn renderer_brush_lookup(cache: &BTreeMap<u8, [u8; 8]>, index: u8) -> Option<[u8; 8]> {
+    cache.get(&index).copied()
 }
 
 /// DstBlt ROP that XORs every channel — needs destination read-back.
@@ -4338,6 +4441,126 @@ mod tests {
         assert_eq!(&pixels[4..8],   &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&pixels[8..12],  &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&pixels[12..16], &[0xAA, 0xBB, 0xCC, 0xFF]);
+    }
+
+    /// CacheBrush + PatBlt with cached pattern (high-bit-set
+    /// brush_style + brush_hatch=cache index) round-trip. Verifies the
+    /// brush cache populates and the PatBlt walker resolves through it.
+    #[test]
+    fn cache_brush_then_patblt_round_trip() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // CacheBrush body: cacheEntry=3, iBitmapFormat=1 (1bpp), cx=8,
+        // cy=8, style=0, iBytes=8, brushData = vertical-stripe pattern
+        // (0x55 = 01010101 every row). Wire is bottom-up so we send
+        // 8 identical 0x55 bytes and the parser stores them as-is.
+        let mut body = Vec::new();
+        body.push(3);          // cacheEntry
+        body.push(1);          // iBitmapFormat = 1bpp
+        body.push(8);          // cx
+        body.push(8);          // cy
+        body.push(0);          // style
+        body.push(8);          // iBytes
+        body.extend_from_slice(&[0x55; 8]);
+        let cache_frame = build_secondary_order_frame(0, 0x07 /* CacheBrush */, &body);
+
+        // PatBlt with brush_style = BS_PATTERN | 0x80 (cached), brush_hatch=3.
+        let mut pat_body = Vec::new();
+        pat_body.extend_from_slice(&0i16.to_le_bytes());
+        pat_body.extend_from_slice(&0i16.to_le_bytes());
+        pat_body.extend_from_slice(&2i16.to_le_bytes()); // 2-wide
+        pat_body.extend_from_slice(&1i16.to_le_bytes()); // 1-tall
+        pat_body.push(0xF0);                              // PATCOPY
+        pat_body.extend_from_slice(&[0x10, 0x20, 0x30]); // back BGR
+        pat_body.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // fore BGR
+        pat_body.push(0); pat_body.push(0);
+        pat_body.push(BS_PATTERN | 0x80);                 // cached pattern
+        pat_body.push(3);                                 // brush_hatch = cache index
+        pat_body.extend_from_slice(&[0; 7]);              // brush_extra
+        let patblt = PrimaryOrder {
+            order_type: PrimaryOrderType::PatBlt,
+            field_flags: 0x0FFF,
+            bounds: None,
+            data: pat_body,
+        };
+        let mut patblt_bytes = vec![0u8; patblt.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut patblt_bytes);
+            patblt.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        patblt_bytes.truncate(written);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u16.to_le_bytes()); // numberOrders = 2
+        frame.extend_from_slice(&cache_frame);
+        frame.extend_from_slice(&patblt_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.brush_cache_len(), 1);
+        // Pattern row reversed (wire bottom-up) → first stored row is
+        // 0x55 (column 0=0, column 1=1, …). Top-most bit = leftmost
+        // pixel. With pattern row = 0x55 = 01010101 and width=2, top
+        // pixel: bit7=0 → back, second pixel: bit6=1 → fore.
+        assert_eq!(sink.blits.len(), 1);
+        let pixels = &sink.blits[0].4;
+        assert_eq!(&pixels[0..4], &[0x10, 0x20, 0x30, 0xFF]); // back
+        assert_eq!(&pixels[4..8], &[0xAA, 0xBB, 0xCC, 0xFF]); // fore
+    }
+
+    /// BS_HATCHED with HS_HORIZONTAL: row 3 of an 8×8 hatch is all-on
+    /// (0xFF), other rows are all-off — render a 1×4 column from y=0..3
+    /// and verify only y=3 picks foreground.
+    #[test]
+    fn patblt_bs_hatched_horizontal() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        let mut body = Vec::new();
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.extend_from_slice(&4i16.to_le_bytes()); // 1×4
+        body.push(0xF0);                              // PATCOPY
+        body.extend_from_slice(&[0x10, 0x20, 0x30]); // back
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // fore
+        body.push(0); body.push(0);
+        body.push(BS_HATCHED);
+        body.push(0); // HS_HORIZONTAL
+        body.extend_from_slice(&[0; 7]);
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::PatBlt,
+            field_flags: 0x0FFF,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        let pixels = &sink.blits[0].4;
+        // Rows 0, 1, 2 = back; row 3 = fore.
+        assert_eq!(&pixels[0..4],   &[0x10, 0x20, 0x30, 0xFF]); // y=0
+        assert_eq!(&pixels[4..8],   &[0x10, 0x20, 0x30, 0xFF]); // y=1
+        assert_eq!(&pixels[8..12],  &[0x10, 0x20, 0x30, 0xFF]); // y=2
+        assert_eq!(&pixels[12..16], &[0xAA, 0xBB, 0xCC, 0xFF]); // y=3
     }
 
     /// MemBlt against an empty cache must silently skip — same shape
