@@ -652,6 +652,7 @@ fn minimal_acceptance_result() -> justrdp_acceptor::AcceptanceResult {
         channel_ids: Vec::new(),
         client_capabilities: Vec::new(),
         client_info: None,
+        gcc_core: justrdp_acceptor::GccCoreSnapshot::default_for_tests(),
     }
 }
 

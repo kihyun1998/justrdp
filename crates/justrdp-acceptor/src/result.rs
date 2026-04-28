@@ -9,6 +9,65 @@ use justrdp_pdu::rdp::capabilities::CapabilitySet;
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
 use justrdp_pdu::x224::{NegotiationRequestFlags, NegotiationResponseFlags, SecurityProtocol};
 
+/// Subset of the client's GCC `ClientCoreData` retained for use after
+/// the handshake completes. Specifically: the inputs to the server's
+/// DemandActive `CapabilitySet` builder, so a Deactivation-Reactivation
+/// cycle can re-emit a fresh DemandActive (with a new desktop size)
+/// without having to keep the entire `ClientGccData` around.
+///
+/// Fields are direct copies of `ClientCoreData` fields with their
+/// original semantics; see MS-RDPBCGR §2.2.1.3.2 for value ranges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GccCoreSnapshot {
+    /// Initial desktop width the client requested. Captured as the
+    /// fallback width for the *first* DemandActive; the D/R re-emit
+    /// path overrides this with the application-supplied size.
+    pub desktop_width: u16,
+    /// Initial desktop height the client requested.
+    pub desktop_height: u16,
+    /// Raw `colorDepth` field (legacy 8/16/24-bit selector).
+    pub color_depth_raw: u16,
+    /// Optional `highColorDepth` field present from RDP 5.1+.
+    /// Takes precedence over `color_depth_raw` when present.
+    pub high_color_depth_raw: Option<u16>,
+    /// IBM-style keyboard layout identifier (LCID).
+    pub keyboard_layout: u32,
+    /// Keyboard type code (1 = IBM PC/XT, 4 = IBM enhanced 101/102, ...).
+    pub keyboard_type: u32,
+    /// Keyboard subtype (OEM-specific).
+    pub keyboard_sub_type: u32,
+    /// Function-key count (12 for standard 101/102 keyboards).
+    pub keyboard_function_key: u32,
+}
+
+impl GccCoreSnapshot {
+    /// Effective bits-per-pixel selector used in the Bitmap Capability
+    /// Set. Prefers `high_color_depth_raw` when present; otherwise
+    /// falls back to `color_depth_raw` (clamped to ≥8 like the
+    /// legacy capability builder).
+    pub fn effective_bpp(&self) -> u16 {
+        let raw = self.high_color_depth_raw.unwrap_or(self.color_depth_raw);
+        raw.max(8)
+    }
+
+    /// Default snapshot used when the acceptor never received a GCC
+    /// block (e.g. `make_acceptance_result()` called from a unit test
+    /// before MCS Connect parsing completes). 1024x768 / 16bpp /
+    /// US-English keyboard.
+    pub fn default_for_tests() -> Self {
+        Self {
+            desktop_width: 1024,
+            desktop_height: 768,
+            color_depth_raw: 16,
+            high_color_depth_raw: None,
+            keyboard_layout: 0x0409,
+            keyboard_type: 4,
+            keyboard_sub_type: 0,
+            keyboard_function_key: 12,
+        }
+    }
+}
+
 /// Number of bytes written to the output buffer by a `step()` call.
 #[derive(Debug, Clone, Copy)]
 pub struct Written {
@@ -115,6 +174,14 @@ pub struct AcceptanceResult {
     /// connection terminated before the secure-settings exchange.
     /// The `ClientInfoPdu::Drop` impl zeroes the password on drop.
     pub client_info: Option<ClientInfoPdu>,
+    /// Subset of the client's GCC `ClientCoreData` retained for the
+    /// post-handshake driver. Used by `ServerActiveStage` to rebuild
+    /// the server's `CapabilitySet` list during a
+    /// Deactivation-Reactivation cycle without having to keep the
+    /// full GCC block around. Filled in Phase 4 (MCS Connect Initial
+    /// parse); falls back to [`GccCoreSnapshot::default_for_tests`]
+    /// on `AcceptanceResult::new` for direct test construction.
+    pub gcc_core: GccCoreSnapshot,
 }
 
 impl AcceptanceResult {
@@ -142,6 +209,7 @@ impl AcceptanceResult {
             channel_ids: Vec::new(),
             client_capabilities: Vec::new(),
             client_info: None,
+            gcc_core: GccCoreSnapshot::default_for_tests(),
         }
     }
 }

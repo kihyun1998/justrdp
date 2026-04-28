@@ -2337,12 +2337,12 @@ uncompressed bitmap fast-path, 입력/종료/SVC opaque forward까지. RFX/EGFX
 - [x] SVC data opaque forward hook (채널 크레이트 장착 포인트)
 - [x] 종료 경로 -- `SetErrorInfoPdu` 송출 + MCS
       `DisconnectProviderUltimatum` + `ServerTerminate` output
-- [-] `justrdp-blocking` 클라와 loopback 통합 테스트 -- **deferred to §11.2d**
-      (wire-level smoke test in `active::tests::session_smoke_test_dispatches_in_order`
-       covers ServerActiveStage in isolation; combined integration test
-       lands in §11.2d after 11.2b/c so the harness can also exercise
-       the GFX pipeline and channel handlers in one place rather than
-       being rewritten when those interfaces shift)
+- [x] `justrdp-blocking` 클라와 loopback 통합 테스트 -- §11.2d 에서
+      `protocol_rdp_handshake_reaches_both_terminal_states` +
+      `active_session_bitmap_emit_input_dispatch_and_clean_disconnect`
+      두 건으로 안착. wire-level isolation smoke 는
+      `active::tests::session_smoke_test_dispatches_in_order` 에서
+      유지
 
 #### 11.2b -- Server-Side GFX Encoding Pipeline
 
@@ -2483,10 +2483,9 @@ register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
 >
 > 채널 간 의존성이 없으므로 채널별 sub-section 으로 분할. 각 sub-section
 > 은 "서버 방향 PDU emit/decode + ServerProcessor → Handler trait +
-> RdpServer 통합" 구조의 2 commit. cliprdr/rdpsnd 만으로 데모 시나리오
-> 충족, rdpdr 은 (선택) 으로 후순위. SVC dispatch 통합은 11.2a 의
-> `svc_opaque_forward` hook 위에 채널별 ServerProcessor 를 register
-> 하는 식.
+> RdpServer 통합" 구조의 2 commit. cliprdr / rdpsnd / rdpdr 모두 완료.
+> SVC dispatch 통합은 11.2a 의 `svc_opaque_forward` hook 위에 채널별
+> ServerProcessor 를 register 하는 식.
 
 ##### 11.2c-1 -- cliprdr 서버 방향
 

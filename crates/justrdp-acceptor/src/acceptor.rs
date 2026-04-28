@@ -45,7 +45,7 @@ use crate::mcs::{
     allocate_channel_ids, build_server_data_blocks, decode_connect_initial_gcc,
     wrap_server_gcc, ChannelAllocation, ClientGccData, ServerGccInputs,
 };
-use crate::result::{AcceptanceResult, ClientRequestInfo, Written};
+use crate::result::{AcceptanceResult, ClientRequestInfo, GccCoreSnapshot, Written};
 use crate::sequence::Sequence;
 use crate::state::ServerAcceptorState;
 
@@ -1391,133 +1391,35 @@ impl ServerAcceptor {
 
     /// Build the server's capability sets advertised in DemandActive.
     ///
-    /// Includes the spec-mandatory caps (General, Bitmap, Order, Pointer,
-    /// Input, VirtualChannel, Share) plus a handful that are essentially
-    /// universal (LargePointer, MultifragmentUpdate, SurfaceCommands)
-    /// and that the connector advertises on the client side. The
-    /// `desktop_width/height` come from the client's CS_CORE so server
-    /// echoes the negotiated resolution.
+    /// Thin wrapper over [`build_demand_active_capabilities`] that
+    /// pulls the snapshot inputs from the captured `client_gcc` (or
+    /// the test default if MCS Connect parsing has not yet run).
+    /// Used for the *first* DemandActive emit; the
+    /// Deactivation-Reactivation re-emit path in `ServerActiveStage`
+    /// calls the free function directly with an overridden size.
     fn build_server_capabilities(&self) -> Vec<CapabilitySet> {
-        let (width, height, bpp) = self
-            .client_gcc
-            .as_ref()
-            .map(|g| {
-                let bpp = g
-                    .core
-                    .high_color_depth
-                    .map(|d| d as u16)
-                    .unwrap_or(g.core.color_depth as u16);
-                (g.core.desktop_width, g.core.desktop_height, bpp.max(8))
-            })
-            .unwrap_or((1024, 768, 16));
+        let snapshot = self.gcc_snapshot();
+        build_demand_active_capabilities(&snapshot, self.user_channel_id, None)
+    }
 
-        alloc::vec![
-            CapabilitySet::General(GeneralCapability {
-                os_major_type: 1, // OSMAJORTYPE_WINDOWS
-                os_minor_type: 3, // OSMINORTYPE_WINDOWS_NT
-                protocol_version: 0x0200,
-                pad2: 0,
-                general_compression_types: 0,
-                // FASTPATH_OUTPUT_SUPPORTED | LONG_CREDENTIALS_SUPPORTED |
-                // AUTORECONNECT_SUPPORTED | ENC_SALTED_CHECKSUM |
-                // NO_BITMAP_COMPRESSION_HDR
-                extra_flags: 0x041D,
-                update_capability_flag: 0,
-                remote_unshare_flag: 0,
-                general_compression_level: 0,
-                refresh_rect_support: 1,
-                suppress_output_support: 1,
-            }),
-            CapabilitySet::Bitmap(BitmapCapability {
-                preferred_bits_per_pixel: bpp,
-                receive1_bit_per_pixel: 1,
-                receive4_bits_per_pixel: 1,
-                receive8_bits_per_pixel: 1,
-                desktop_width: width,
-                desktop_height: height,
-                pad2a: 0,
-                desktop_resize_flag: 1,
-                bitmap_compression_flag: 1,
-                high_color_flags: 0,
-                // DRAW_ALLOW_DYNAMIC_COLOR_FIDELITY |
-                // DRAW_ALLOW_COLOR_SUBSAMPLING |
-                // DRAW_ALLOW_SKIP_ALPHA
-                drawing_flags: 0x08 | 0x10 | 0x20,
-                multiple_rectangle_support: 1,
-                pad2b: 0,
-            }),
-            CapabilitySet::Order(OrderCapability {
-                terminal_descriptor: [0u8; 16],
-                pad4: 0,
-                desktop_save_x_granularity: 1,
-                desktop_save_y_granularity: 20,
-                pad2a: 0,
-                maximum_order_level: 1,
-                number_fonts: 0,
-                // NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT |
-                // COLORINDEXSUPPORT
-                order_flags: 0x002A,
-                order_support: [0u8; 32],
-                text_flags: 0x06A1,
-                order_support_ex_flags: 0,
-                pad4b: 0,
-                desktop_save_size: 0x38400,
-                pad2b: 0,
-                pad2c: 0,
-                text_ansi_code_page: 0,
-                pad2d: 0,
-            }),
-            CapabilitySet::Pointer(PointerCapability {
-                color_pointer_flag: 1,
-                color_pointer_cache_size: 25,
-                pointer_cache_size: 25,
-            }),
-            CapabilitySet::Input(InputCapability {
-                // INPUT_FLAG_SCANCODES | INPUT_FLAG_MOUSEX |
-                // INPUT_FLAG_UNICODE | INPUT_FLAG_FASTPATH_INPUT2
-                input_flags: 0x0035,
-                pad2: 0,
-                keyboard_layout: self
-                    .client_gcc
-                    .as_ref()
-                    .map(|g| g.core.keyboard_layout)
-                    .unwrap_or(0x0409),
-                keyboard_type: self
-                    .client_gcc
-                    .as_ref()
-                    .map(|g| g.core.keyboard_type)
-                    .unwrap_or(4),
-                keyboard_sub_type: self
-                    .client_gcc
-                    .as_ref()
-                    .map(|g| g.core.keyboard_sub_type)
-                    .unwrap_or(0),
-                keyboard_function_key: self
-                    .client_gcc
-                    .as_ref()
-                    .map(|g| g.core.keyboard_function_key)
-                    .unwrap_or(12),
-                ime_file_name: [0u8; 64],
-            }),
-            CapabilitySet::VirtualChannel(VirtualChannelCapability {
-                flags: 0,
-                vc_chunk_size: Some(1600),
-            }),
-            CapabilitySet::Share(ShareCapability {
-                node_id: self.user_channel_id,
-                pad2: 0,
-            }),
-            CapabilitySet::MultifragmentUpdate(MultifragmentUpdateCapability {
-                max_request_size: 0x0003_8400,
-            }),
-            CapabilitySet::LargePointer(LargePointerCapability {
-                large_pointer_support_flags: 0x0001, // LARGE_POINTER_FLAG_96x96
-            }),
-            CapabilitySet::SurfaceCommands(SurfaceCommandsCapability {
-                cmd_flags: 0x0052,
-                reserved: 0,
-            }),
-        ]
+    /// Snapshot of the capability-builder inputs from
+    /// `self.client_gcc`. Falls back to
+    /// [`GccCoreSnapshot::default_for_tests`] if MCS Connect parsing
+    /// has not yet captured the GCC blocks.
+    fn gcc_snapshot(&self) -> GccCoreSnapshot {
+        self.client_gcc
+            .as_ref()
+            .map(|g| GccCoreSnapshot {
+                desktop_width: g.core.desktop_width,
+                desktop_height: g.core.desktop_height,
+                color_depth_raw: g.core.color_depth as u16,
+                high_color_depth_raw: g.core.high_color_depth.map(|d| d as u16),
+                keyboard_layout: g.core.keyboard_layout,
+                keyboard_type: g.core.keyboard_type,
+                keyboard_sub_type: g.core.keyboard_sub_type,
+                keyboard_function_key: g.core.keyboard_function_key,
+            })
+            .unwrap_or_else(GccCoreSnapshot::default_for_tests)
     }
 
     fn step_send_demand_active(&mut self, output: &mut WriteBuf) -> AcceptorResult<Written> {
@@ -2004,8 +1906,130 @@ impl ServerAcceptor {
         result.share_id = self.share_id;
         result.client_capabilities = self.client_capabilities.clone();
         result.client_info = self.client_info.clone();
+        result.gcc_core = self.gcc_snapshot();
         result
     }
+}
+
+/// Build the server's `CapabilitySet` list for a `Demand Active PDU`.
+///
+/// Free-function form so post-handshake drivers (notably
+/// `ServerActiveStage` in `justrdp-server`) can rebuild the capability
+/// list during a Deactivation-Reactivation cycle without keeping a
+/// reference to the acceptor that produced the original
+/// `AcceptanceResult`.
+///
+/// `snapshot` is the captured GCC `ClientCoreData` subset stored on
+/// `AcceptanceResult::gcc_core`. `user_channel_id` is the MCS user
+/// channel assigned to the client (the `Share` capability `nodeId`).
+/// `override_size`, when `Some`, replaces the snapshot's
+/// desktop_width/height in the Bitmap capability -- used by
+/// `request_deactivation_reactivation` to inject the new resolution.
+///
+/// Caps emitted: General, Bitmap, Order, Pointer, Input,
+/// VirtualChannel, Share, MultifragmentUpdate, LargePointer,
+/// SurfaceCommands. Wire-equivalent to what the acceptor's first
+/// DemandActive emitted (matching the existing test transcripts).
+pub fn build_demand_active_capabilities(
+    snapshot: &GccCoreSnapshot,
+    user_channel_id: u16,
+    override_size: Option<(u16, u16)>,
+) -> Vec<CapabilitySet> {
+    let (width, height) = override_size
+        .unwrap_or((snapshot.desktop_width, snapshot.desktop_height));
+    let bpp = snapshot.effective_bpp();
+
+    alloc::vec![
+        CapabilitySet::General(GeneralCapability {
+            os_major_type: 1, // OSMAJORTYPE_WINDOWS
+            os_minor_type: 3, // OSMINORTYPE_WINDOWS_NT
+            protocol_version: 0x0200,
+            pad2: 0,
+            general_compression_types: 0,
+            // FASTPATH_OUTPUT_SUPPORTED | LONG_CREDENTIALS_SUPPORTED |
+            // AUTORECONNECT_SUPPORTED | ENC_SALTED_CHECKSUM |
+            // NO_BITMAP_COMPRESSION_HDR
+            extra_flags: 0x041D,
+            update_capability_flag: 0,
+            remote_unshare_flag: 0,
+            general_compression_level: 0,
+            refresh_rect_support: 1,
+            suppress_output_support: 1,
+        }),
+        CapabilitySet::Bitmap(BitmapCapability {
+            preferred_bits_per_pixel: bpp,
+            receive1_bit_per_pixel: 1,
+            receive4_bits_per_pixel: 1,
+            receive8_bits_per_pixel: 1,
+            desktop_width: width,
+            desktop_height: height,
+            pad2a: 0,
+            desktop_resize_flag: 1,
+            bitmap_compression_flag: 1,
+            high_color_flags: 0,
+            // DRAW_ALLOW_DYNAMIC_COLOR_FIDELITY |
+            // DRAW_ALLOW_COLOR_SUBSAMPLING |
+            // DRAW_ALLOW_SKIP_ALPHA
+            drawing_flags: 0x08 | 0x10 | 0x20,
+            multiple_rectangle_support: 1,
+            pad2b: 0,
+        }),
+        CapabilitySet::Order(OrderCapability {
+            terminal_descriptor: [0u8; 16],
+            pad4: 0,
+            desktop_save_x_granularity: 1,
+            desktop_save_y_granularity: 20,
+            pad2a: 0,
+            maximum_order_level: 1,
+            number_fonts: 0,
+            // NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT |
+            // COLORINDEXSUPPORT
+            order_flags: 0x002A,
+            order_support: [0u8; 32],
+            text_flags: 0x06A1,
+            order_support_ex_flags: 0,
+            pad4b: 0,
+            desktop_save_size: 0x38400,
+            pad2b: 0,
+            pad2c: 0,
+            text_ansi_code_page: 0,
+            pad2d: 0,
+        }),
+        CapabilitySet::Pointer(PointerCapability {
+            color_pointer_flag: 1,
+            color_pointer_cache_size: 25,
+            pointer_cache_size: 25,
+        }),
+        CapabilitySet::Input(InputCapability {
+            // INPUT_FLAG_SCANCODES | INPUT_FLAG_MOUSEX |
+            // INPUT_FLAG_UNICODE | INPUT_FLAG_FASTPATH_INPUT2
+            input_flags: 0x0035,
+            pad2: 0,
+            keyboard_layout: snapshot.keyboard_layout,
+            keyboard_type: snapshot.keyboard_type,
+            keyboard_sub_type: snapshot.keyboard_sub_type,
+            keyboard_function_key: snapshot.keyboard_function_key,
+            ime_file_name: [0u8; 64],
+        }),
+        CapabilitySet::VirtualChannel(VirtualChannelCapability {
+            flags: 0,
+            vc_chunk_size: Some(1600),
+        }),
+        CapabilitySet::Share(ShareCapability {
+            node_id: user_channel_id,
+            pad2: 0,
+        }),
+        CapabilitySet::MultifragmentUpdate(MultifragmentUpdateCapability {
+            max_request_size: 0x0003_8400,
+        }),
+        CapabilitySet::LargePointer(LargePointerCapability {
+            large_pointer_support_flags: 0x0001, // LARGE_POINTER_FLAG_96x96
+        }),
+        CapabilitySet::SurfaceCommands(SurfaceCommandsCapability {
+            cmd_flags: 0x0052,
+            reserved: 0,
+        }),
+    ]
 }
 
 impl AcceptorConfig {

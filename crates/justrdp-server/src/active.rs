@@ -1558,6 +1558,7 @@ mod tests {
             channel_ids: alloc::vec![("rdpsnd".to_string(), 0x03EC)],
             client_capabilities: alloc::vec::Vec::new(),
             client_info: None,
+            gcc_core: justrdp_acceptor::GccCoreSnapshot::default_for_tests(),
         }
     }
 

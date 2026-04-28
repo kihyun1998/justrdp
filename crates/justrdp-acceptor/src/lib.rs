@@ -21,9 +21,9 @@ mod result;
 mod sequence;
 mod state;
 
-pub use acceptor::ServerAcceptor;
+pub use acceptor::{build_demand_active_capabilities, ServerAcceptor};
 pub use config::{AcceptorConfig, AcceptorConfigBuilder, StandardSecurityConfig};
 pub use error::{AcceptorConfigError, AcceptorError, AcceptorErrorKind, AcceptorResult};
-pub use result::{AcceptanceResult, ClientRequestInfo, Written};
+pub use result::{AcceptanceResult, ClientRequestInfo, GccCoreSnapshot, Written};
 pub use sequence::Sequence;
 pub use state::ServerAcceptorState;
