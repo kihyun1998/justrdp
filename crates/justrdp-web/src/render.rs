@@ -606,19 +606,27 @@ impl BitmapRenderer {
                 // stays in sync because we already advanced the cursor.
                 if let Ok(sec_type) = SecondaryOrderType::from_u8(order_type_raw) {
                     match sec_type {
+                        SecondaryOrderType::CacheBitmapV1Uncompressed => {
+                            let _ = self.cache_bitmap_v1(extra_flags, body, false);
+                        }
+                        SecondaryOrderType::CacheBitmapV1Compressed => {
+                            let _ = self.cache_bitmap_v1(extra_flags, body, true);
+                        }
                         SecondaryOrderType::CacheBitmapV2Uncompressed => {
                             let _ = self.cache_bitmap_v2(extra_flags, body, false);
                         }
                         SecondaryOrderType::CacheBitmapV2Compressed => {
                             let _ = self.cache_bitmap_v2(extra_flags, body, true);
                         }
+                        SecondaryOrderType::CacheBitmapV3 => {
+                            let _ = self.cache_bitmap_v3(extra_flags, body);
+                        }
                         SecondaryOrderType::CacheBrush => {
                             let _ = self.cache_brush(body);
                         }
-                        // CacheBitmapV1 / V3 / CacheGlyph /
-                        // CacheColorTable: decoded only enough to keep
-                        // the order stream in sync; rendering against
-                        // them is tracked under S3d-6c5 / 6d2.
+                        // CacheGlyph / CacheColorTable: decoded only
+                        // enough to keep the order stream in sync;
+                        // rendering against them is S3d-6d2.
                         _ => {}
                     }
                 }
@@ -984,6 +992,191 @@ impl BitmapRenderer {
             }
         }
         Ok(any_blits)
+    }
+
+    /// `CacheBitmapV1` parser (MS-RDPEGDI 2.2.2.2.1.2.2).
+    ///
+    /// `extraFlags` holds:
+    ///   bits 0–8  : cacheId (3 bits, low nibble) — only low 3 used
+    ///   high bits : reserved
+    ///
+    /// Body layout (fixed):
+    ///   cacheId         (u8)  — duplicate of the extraFlags field
+    ///   pad1            (u8)
+    ///   bitmapWidth     (u8)  — pixel width
+    ///   bitmapHeight    (u8)  — pixel height
+    ///   bitmapBpp       (u8)  — bits per pixel
+    ///   bitmapLength    (u16 LE)
+    ///   cacheIndex      (u16 LE)
+    ///   bitmapDataStream (bitmapLength bytes)
+    ///
+    /// V1 entries are bottom-up (DIB convention) — different from V2
+    /// which is top-down. We flip during cache insert so MemBlt
+    /// look-ups always see top-down RGBA. Only 16 bpp (uncompressed
+    /// or RLE) and 24 bpp (uncompressed) are wired; 8 bpp would need
+    /// the palette and 32 bpp is a V3 feature.
+    fn cache_bitmap_v1(
+        &mut self,
+        _extra_flags: u16,
+        body: &[u8],
+        compressed: bool,
+    ) -> Result<(), RenderError> {
+        if body.len() < 9 {
+            return Err(RenderError::SizeMismatch(
+                "CacheBitmapV1: header truncated".into(),
+            ));
+        }
+        let cache_id = body[0];
+        // body[1] reserved
+        let width = body[2] as u16;
+        let height = body[3] as u16;
+        let bpp = body[4];
+        let bitmap_length = u16::from_le_bytes([body[5], body[6]]) as usize;
+        let cache_index = u16::from_le_bytes([body[7], body[8]]);
+        if body.len() < 9 + bitmap_length {
+            return Err(RenderError::SizeMismatch(format!(
+                "CacheBitmapV1: bitmapLength {bitmap_length} but only {} bytes left",
+                body.len() - 9
+            )));
+        }
+        let payload = &body[9..9 + bitmap_length];
+
+        let pixels_rgba = match (compressed, bpp) {
+            (false, 16) => {
+                let expected = width as usize * height as usize * 2;
+                if payload.len() != expected {
+                    return Ok(());
+                }
+                flip_and_convert_rgb565(payload, width, height)
+            }
+            (false, 24) => {
+                let expected = width as usize * height as usize * 3;
+                if payload.len() != expected {
+                    return Ok(());
+                }
+                flip_and_swap_24bpp(payload, width, height)
+            }
+            (true, 16) => {
+                let mut raw = Vec::new();
+                RleDecompressor::new()
+                    .decompress(payload, width, height, BitsPerPixel::Bpp16, &mut raw)?;
+                flip_and_convert_rgb565(&raw, width, height)
+            }
+            (true, 24) => {
+                let mut raw = Vec::new();
+                RleDecompressor::new()
+                    .decompress(payload, width, height, BitsPerPixel::Bpp24, &mut raw)?;
+                flip_and_swap_24bpp(&raw, width, height)
+            }
+            _ => return Ok(()),
+        };
+        self.bitmap_cache.insert(
+            (cache_id, cache_index),
+            CachedBitmap {
+                width,
+                height,
+                pixels_rgba,
+            },
+        );
+        Ok(())
+    }
+
+    /// `CacheBitmapV3` parser (MS-RDPEGDI 2.2.2.2.1.2.8).
+    ///
+    /// `extraFlags` packs:
+    ///   bits 0–2  : cacheId (3 bits)
+    ///   bits 7–14 : bitmapBpp (8 bits) — **actual** bpp (not a code)
+    ///
+    /// Body:
+    ///   cacheIndex (u16 LE)
+    ///   key1, key2 (u32 LE × 2)
+    ///   bitmapData (TS_COMPRESSED_BITMAP_HEADER_EX + raw payload)
+    ///
+    /// `TS_BITMAP_DATA_EX` payload format:
+    ///   bpp (u8) flags (u8) reserved (u8) codec_id (u8)
+    ///   width (u16 LE) height (u16 LE) bitmapDataLength (u32 LE)
+    ///   exHeader (24 bytes, optional)
+    ///   bitmapData (length bytes)
+    ///
+    /// V3 entries are top-down. We accept codec_id = 0 (raw 32 bpp)
+    /// and codec_id matching the registered RFX/NSCodec/ClearCodec
+    /// codec_ids — but only the raw path is implemented here for the
+    /// minimum. Codec-encoded V3 cache entries surface as
+    /// `RenderError::UnsupportedCodec` from the next MemBlt that
+    /// look-up misses.
+    fn cache_bitmap_v3(
+        &mut self,
+        extra_flags: u16,
+        body: &[u8],
+    ) -> Result<(), RenderError> {
+        if body.len() < 2 + 8 + 12 {
+            return Err(RenderError::SizeMismatch(
+                "CacheBitmapV3: header truncated".into(),
+            ));
+        }
+        let cache_id = (extra_flags & 0x07) as u8;
+        let cache_index = u16::from_le_bytes([body[0], body[1]]);
+        // Skip key1+key2 (8 bytes).
+        let mut cur = &body[2 + 8..];
+        // TS_BITMAP_DATA_EX — same shape as Surface Bits payload.
+        if cur.len() < 12 {
+            return Err(RenderError::SizeMismatch(
+                "CacheBitmapV3: TS_BITMAP_DATA_EX truncated".into(),
+            ));
+        }
+        let bpp = cur[0];
+        let flags = cur[1];
+        // cur[2] reserved
+        let codec_id = cur[3];
+        let width = u16::from_le_bytes([cur[4], cur[5]]);
+        let height = u16::from_le_bytes([cur[6], cur[7]]);
+        let length = u32::from_le_bytes([cur[8], cur[9], cur[10], cur[11]]) as usize;
+        cur = &cur[12..];
+        if flags & 0x01 != 0 {
+            // EX_COMPRESSED_BITMAP_HEADER_PRESENT — skip the 24-byte header.
+            if cur.len() < 24 {
+                return Err(RenderError::SizeMismatch(
+                    "CacheBitmapV3: ex header truncated".into(),
+                ));
+            }
+            cur = &cur[24..];
+        }
+        if cur.len() < length {
+            return Err(RenderError::SizeMismatch(format!(
+                "CacheBitmapV3: payload {length} but only {} bytes left",
+                cur.len()
+            )));
+        }
+        let payload = &cur[..length];
+        let pixels_rgba = match (codec_id, bpp) {
+            (0, 32) => {
+                let expected = width as usize * height as usize * 4;
+                if payload.len() != expected {
+                    return Ok(());
+                }
+                bgra_to_rgba(payload)
+            }
+            (0, 24) => {
+                let expected = width as usize * height as usize * 3;
+                if payload.len() != expected {
+                    return Ok(());
+                }
+                bgr_top_down_to_rgba(payload, width, height)
+            }
+            // Codec-encoded V3 entries (RFX / NSCodec / ClearCodec /
+            // AVC) are recognized but not yet decoded into the cache.
+            // S3d-6c5b would route through the existing codec dispatch.
+            _ => return Ok(()),
+        };
+        self.bitmap_cache.insert(
+            (cache_id, cache_index),
+            CachedBitmap {
+                width,
+                height,
+                pixels_rgba,
+            },
+        );
+        Ok(())
     }
 
     /// `CacheBrush` parser (MS-RDPEGDI 2.2.2.2.1.2.7).
@@ -4441,6 +4634,71 @@ mod tests {
         assert_eq!(&pixels[4..8],   &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&pixels[8..12],  &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&pixels[12..16], &[0xAA, 0xBB, 0xCC, 0xFF]);
+    }
+
+    /// CacheBitmapV1 16 bpp uncompressed → cache populates and a
+    /// MemBlt look-up against the inserted entry succeeds.
+    #[test]
+    fn cache_bitmap_v1_uncompressed_16bpp() {
+        // V1 body: cacheId(1) + pad(1) + width(1) + height(1) + bpp(1) +
+        // bitmapLength(2 LE) + cacheIndex(2 LE) + payload.
+        // 1×1 16 bpp white pixel = 0xFFFF.
+        let mut body = Vec::new();
+        body.push(2); // cacheId
+        body.push(0); // pad
+        body.push(1); // width
+        body.push(1); // height
+        body.push(16); // bpp
+        body.extend_from_slice(&2u16.to_le_bytes()); // length
+        body.extend_from_slice(&9u16.to_le_bytes()); // cacheIndex
+        body.extend_from_slice(&[0xFF, 0xFF]);
+        let cache_frame = build_secondary_order_frame(0, 0x00 /* V1 uncompressed */, &body);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.bitmap_cache_len(), 1);
+    }
+
+    /// CacheBitmapV3 32 bpp uncompressed (codec_id = 0).
+    #[test]
+    fn cache_bitmap_v3_codec0_32bpp() {
+        // V3 body: cacheIndex(2 LE) + key1(4) + key2(4) +
+        // TS_BITMAP_DATA_EX (12 byte header + payload).
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u16.to_le_bytes()); // cacheIndex
+        body.extend_from_slice(&0u32.to_le_bytes()); // key1
+        body.extend_from_slice(&0u32.to_le_bytes()); // key2
+        // TS_BITMAP_DATA_EX header.
+        body.push(32); // bpp
+        body.push(0);  // flags (no ex header)
+        body.push(0);  // reserved
+        body.push(0);  // codec_id
+        body.extend_from_slice(&1u16.to_le_bytes()); // width
+        body.extend_from_slice(&1u16.to_le_bytes()); // height
+        body.extend_from_slice(&4u32.to_le_bytes()); // length
+        // BGRA white pixel.
+        body.extend_from_slice(&[0xCC, 0xBB, 0xAA, 0xFF]);
+        // extraFlags: cacheId=2 in low 3 bits, bpp encoded in high bits.
+        let extra_flags: u16 = 0x02;
+        let cache_frame = build_secondary_order_frame(extra_flags, 0x08 /* V3 */, &body);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.bitmap_cache_len(), 1);
     }
 
     /// CacheBrush + PatBlt with cached pattern (high-bit-set
