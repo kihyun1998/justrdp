@@ -712,6 +712,7 @@ dependencies = [
  "js-sys",
  "justrdp-connector",
  "justrdp-core",
+ "justrdp-graphics",
  "justrdp-pdu",
  "justrdp-session",
  "pollster",

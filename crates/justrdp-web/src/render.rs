@@ -2,14 +2,14 @@
 
 //! Rendering: [`FrameSink`] trait + bitmap fast-path dispatcher.
 //!
-//! S3b ships the rendering surface contract and a minimal decoder for
-//! uncompressed 32-bit fast-path bitmap updates — enough to put pixels on
-//! a Canvas/WebGL/native target end-to-end. Compressed bitmaps (RLE) and
-//! non-32-bit color depths are explicitly surfaced as
-//! [`RenderError::Unsupported`] / [`RenderError::CompressedNotSupported`]
-//! so embedders see a clean failure mode rather than silent corruption;
-//! S3c will plug in `justrdp-graphics::RleDecompressor` and the lower
-//! color depths.
+//! Supported bitmap inputs:
+//! * Uncompressed 32 bpp BGRA (S3b).
+//! * Uncompressed and **Interleaved RLE** compressed 24 bpp (BGR), 16 bpp
+//!   (RGB565), and 15 bpp (RGB555) — added in S3c via
+//!   [`justrdp_graphics::RleDecompressor`]. After decompression each bpp
+//!   variant is converted to top-down RGBA in a single pass.
+//! * 8 bpp (palette-indexed) and Planar/RemoteFX/NSCodec/AVC are still
+//!   surfaced as typed errors and left for later steps.
 //!
 //! # Wire → sink conversions, in one pass
 //!
@@ -27,6 +27,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use justrdp_core::ReadCursor;
+use justrdp_graphics::{BitsPerPixel, RleDecompressor, RleError};
 use justrdp_pdu::rdp::bitmap::{
     TsBitmapData, TsUpdateBitmapData, BITMAP_COMPRESSION,
 };
@@ -41,14 +42,14 @@ pub enum RenderError {
     Decode(justrdp_core::DecodeError),
     /// The fast-path update type isn't handled yet (S3b: only Bitmap).
     Unsupported { update_code: FastPathUpdateType },
-    /// `BITMAP_COMPRESSION` is set but the decoder doesn't run RLE yet
-    /// (S3c). The embedder can drop the rectangle and continue.
-    CompressedNotSupported,
-    /// The bitmap announced a color depth other than 32. Lower depths
-    /// (15/16/24) need an additional conversion stage that lands in S3c.
+    /// The bitmap announced a color depth that this crate does not
+    /// convert yet — currently 8 bpp (needs a Palette update first).
     UnsupportedBpp { bits_per_pixel: u16 },
-    /// `width * height * bpp` does not match `bitmap_data.len()`.
+    /// `width * height * bpp` does not match `bitmap_data.len()` for the
+    /// uncompressed path.
     SizeMismatch(String),
+    /// RLE decompression failed.
+    Rle(RleError),
 }
 
 impl core::fmt::Display for RenderError {
@@ -58,11 +59,11 @@ impl core::fmt::Display for RenderError {
             Self::Unsupported { update_code } => {
                 write!(f, "unsupported fast-path update type: {update_code:?}")
             }
-            Self::CompressedNotSupported => f.write_str("compressed bitmap (RLE) not yet supported"),
             Self::UnsupportedBpp { bits_per_pixel } => {
                 write!(f, "unsupported bits_per_pixel: {bits_per_pixel}")
             }
             Self::SizeMismatch(msg) => write!(f, "size mismatch: {msg}"),
+            Self::Rle(e) => write!(f, "RLE decompress: {e}"),
         }
     }
 }
@@ -72,6 +73,12 @@ impl core::error::Error for RenderError {}
 impl From<justrdp_core::DecodeError> for RenderError {
     fn from(e: justrdp_core::DecodeError) -> Self {
         Self::Decode(e)
+    }
+}
+
+impl From<RleError> for RenderError {
+    fn from(e: RleError) -> Self {
+        Self::Rle(e)
     }
 }
 
@@ -133,49 +140,150 @@ pub fn decode_bitmap_update_fast_path(
 }
 
 fn decode_rect(rect: &TsBitmapData) -> Result<DecodedRect, RenderError> {
-    if rect.flags & BITMAP_COMPRESSION != 0 {
-        return Err(RenderError::CompressedNotSupported);
-    }
-    if rect.bits_per_pixel != 32 {
-        return Err(RenderError::UnsupportedBpp {
-            bits_per_pixel: rect.bits_per_pixel,
-        });
-    }
-    let bpp_bytes = 4usize;
-    let stride = rect.width as usize * bpp_bytes;
-    let expected = stride * rect.height as usize;
-    if rect.bitmap_data.len() != expected {
-        return Err(RenderError::SizeMismatch(format!(
-            "expected {} bytes for {}x{} @ 32bpp, got {}",
-            expected,
-            rect.width,
-            rect.height,
-            rect.bitmap_data.len()
-        )));
+    let compressed = rect.flags & BITMAP_COMPRESSION != 0;
+
+    // Stage 1: get raw bottom-up pixels at the source bpp.
+    let raw_pixels: Vec<u8>;
+    let raw_slice: &[u8];
+    if compressed {
+        let bpp = BitsPerPixel::from_raw(rect.bits_per_pixel).ok_or(
+            RenderError::UnsupportedBpp {
+                bits_per_pixel: rect.bits_per_pixel,
+            },
+        )?;
+        let mut out = Vec::new();
+        RleDecompressor::new()
+            .decompress(&rect.bitmap_data, rect.width, rect.height, bpp, &mut out)?;
+        raw_pixels = out;
+        raw_slice = &raw_pixels;
+    } else {
+        // Uncompressed: validate size up front so a malformed
+        // bitmap_length doesn't panic the row walker.
+        let bpp_bytes = bpp_byte_size(rect.bits_per_pixel)?;
+        let stride = rect.width as usize * bpp_bytes;
+        let expected = stride * rect.height as usize;
+        if rect.bitmap_data.len() != expected {
+            return Err(RenderError::SizeMismatch(format!(
+                "expected {} bytes for {}x{} @ {}bpp, got {}",
+                expected,
+                rect.width,
+                rect.height,
+                rect.bits_per_pixel,
+                rect.bitmap_data.len()
+            )));
+        }
+        raw_slice = &rect.bitmap_data;
     }
 
-    // Single pass: walk wire rows from bottom to top, copying each pixel
-    // with B and R swapped (BGRA → RGBA). One memory read pass, one
-    // write pass — same cost as a plain copy + flip.
-    let mut top_down = Vec::with_capacity(expected);
-    for row in (0..rect.height as usize).rev() {
-        let row_start = row * stride;
-        let row_bytes = &rect.bitmap_data[row_start..row_start + stride];
-        for px in row_bytes.chunks_exact(4) {
-            top_down.push(px[2]); // R ← wire B-position
-            top_down.push(px[1]); // G
-            top_down.push(px[0]); // B ← wire R-position
-            top_down.push(px[3]); // A
+    // Stage 2: bottom-up source bpp → top-down RGBA, single pass.
+    let pixels_rgba = match rect.bits_per_pixel {
+        32 => flip_and_swap_32bpp(raw_slice, rect.width, rect.height),
+        24 => flip_and_swap_24bpp(raw_slice, rect.width, rect.height),
+        16 => flip_and_convert_rgb565(raw_slice, rect.width, rect.height),
+        15 => flip_and_convert_rgb555(raw_slice, rect.width, rect.height),
+        other => {
+            return Err(RenderError::UnsupportedBpp {
+                bits_per_pixel: other,
+            });
         }
-    }
+    };
 
     Ok(DecodedRect {
         dest_left: rect.dest_left,
         dest_top: rect.dest_top,
         width: rect.width,
         height: rect.height,
-        pixels_rgba: top_down,
+        pixels_rgba,
     })
+}
+
+/// Source-bpp byte width. Only the bpps we render here are accepted; the
+/// rest are surfaced via `UnsupportedBpp` upstream.
+fn bpp_byte_size(bpp: u16) -> Result<usize, RenderError> {
+    match bpp {
+        15 | 16 => Ok(2),
+        24 => Ok(3),
+        32 => Ok(4),
+        other => Err(RenderError::UnsupportedBpp {
+            bits_per_pixel: other,
+        }),
+    }
+}
+
+/// Bottom-up BGRA → top-down RGBA.
+fn flip_and_swap_32bpp(src: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let stride = width as usize * 4;
+    let mut out = Vec::with_capacity(stride * height as usize);
+    for row in (0..height as usize).rev() {
+        let row_bytes = &src[row * stride..(row + 1) * stride];
+        for px in row_bytes.chunks_exact(4) {
+            out.push(px[2]); // R ← wire B
+            out.push(px[1]); // G
+            out.push(px[0]); // B ← wire R
+            out.push(px[3]); // A
+        }
+    }
+    out
+}
+
+/// Bottom-up BGR → top-down RGBA (alpha = 0xFF).
+fn flip_and_swap_24bpp(src: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let stride = width as usize * 3;
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in (0..height as usize).rev() {
+        let row_bytes = &src[row * stride..(row + 1) * stride];
+        for px in row_bytes.chunks_exact(3) {
+            out.push(px[2]); // R ← wire B
+            out.push(px[1]); // G
+            out.push(px[0]); // B ← wire R
+            out.push(0xFF);
+        }
+    }
+    out
+}
+
+/// Bottom-up RGB565 (LE u16) → top-down RGBA (alpha = 0xFF).
+///
+/// Bit layout per spec: `RRRRR GGGGGG BBBBB` packed into a little-endian
+/// 16-bit word. Channel expansion uses bit replication so the brightest
+/// 5/6-bit value maps exactly to 0xFF.
+fn flip_and_convert_rgb565(src: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let stride = width as usize * 2;
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in (0..height as usize).rev() {
+        let row_bytes = &src[row * stride..(row + 1) * stride];
+        for px in row_bytes.chunks_exact(2) {
+            let v = u16::from_le_bytes([px[0], px[1]]);
+            let r5 = ((v >> 11) & 0x1F) as u8;
+            let g6 = ((v >> 5) & 0x3F) as u8;
+            let b5 = (v & 0x1F) as u8;
+            out.push((r5 << 3) | (r5 >> 2));
+            out.push((g6 << 2) | (g6 >> 4));
+            out.push((b5 << 3) | (b5 >> 2));
+            out.push(0xFF);
+        }
+    }
+    out
+}
+
+/// Bottom-up RGB555 (LE u16) → top-down RGBA (alpha = 0xFF).
+fn flip_and_convert_rgb555(src: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let stride = width as usize * 2;
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in (0..height as usize).rev() {
+        let row_bytes = &src[row * stride..(row + 1) * stride];
+        for px in row_bytes.chunks_exact(2) {
+            let v = u16::from_le_bytes([px[0], px[1]]);
+            let r5 = ((v >> 10) & 0x1F) as u8;
+            let g5 = ((v >> 5) & 0x1F) as u8;
+            let b5 = (v & 0x1F) as u8;
+            out.push((r5 << 3) | (r5 >> 2));
+            out.push((g5 << 3) | (g5 >> 2));
+            out.push((b5 << 3) | (b5 >> 2));
+            out.push(0xFF);
+        }
+    }
+    out
 }
 
 /// Apply one [`SessionEvent`] to a [`FrameSink`].
@@ -223,20 +331,16 @@ pub fn render_event<S: FrameSink>(
 mod tests {
     use super::*;
     use alloc::vec;
-    use justrdp_core::{Encode, WriteCursor};
-    use justrdp_pdu::rdp::bitmap::TsCdHeader;
+    use justrdp_core::WriteCursor;
 
     /// Build a fast-path bitmap-update payload with one rectangle.
     fn build_payload(rect: TsBitmapData) -> Vec<u8> {
         let upd = TsUpdateBitmapData {
             rectangles: vec![rect],
         };
-        let size = 2 + 14 + upd.rectangles[0].size() - 14; // computed below
-        let _ = size; // silence; we use upd.size() via Encode
-        // Use the type's own encode_fast_path for safety.
-        let mut buf = Vec::new();
-        // worst-case allocation
-        buf.resize(2 + 64 + upd.rectangles[0].bitmap_data.len() + 16, 0);
+        // Worst-case allocation: number_rectangles (u16) + per-rect fixed
+        // header (18 bytes) + comp-hdr (8 bytes) + variable bitmap_data.
+        let mut buf = vec![0u8; 2 + 32 + upd.rectangles[0].bitmap_data.len() + 16];
         let mut cursor = WriteCursor::new(&mut buf);
         upd.encode_fast_path(&mut cursor).unwrap();
         let written = cursor.pos();
@@ -337,40 +441,108 @@ mod tests {
         }
     }
 
+    /// 8 bpp is the only standard depth this renderer still rejects (it
+    /// requires a Palette update first). Confirm that's still the case
+    /// after S3c added 15/16/24/32 support.
     #[test]
-    fn rejects_compressed_bitmap_until_s3c() {
-        let mut rect = uncompressed_32bpp_rect(1, 1, 0x00);
-        rect.flags |= BITMAP_COMPRESSION;
-        // Compressed flag set with no comp-hdr-omitted flag → wire format
-        // requires a TsCdHeader before bitmap_data. We're not actually
-        // trying to decode this payload, just confirm the renderer
-        // refuses it cleanly. So fabricate the minimal valid wire shape
-        // and feed it through.
-        rect.compr_hdr = Some(TsCdHeader {
-            cb_comp_first_row_size: 0,
-            cb_comp_main_body_size: 0,
-            cb_scan_width: 0,
-            cb_uncompressed_size: 0,
-        });
-        rect.bitmap_data = vec![]; // empty body; the renderer rejects before parsing it
+    fn rejects_palette_indexed_8bpp() {
+        let mut rect = uncompressed_32bpp_rect(1, 1, 0xCC);
+        rect.bits_per_pixel = 8;
+        rect.bitmap_data = vec![0]; // 1 px @ 8bpp = 1 byte
         let payload = build_payload(rect);
         let err = decode_bitmap_update_fast_path(&payload).unwrap_err();
         assert!(
-            matches!(err, RenderError::CompressedNotSupported),
-            "expected CompressedNotSupported, got {err:?}"
+            matches!(err, RenderError::UnsupportedBpp { bits_per_pixel: 8 }),
+            "expected UnsupportedBpp(8), got {err:?}"
         );
     }
 
+    /// Uncompressed RGB565: a single pixel with all five red bits set,
+    /// no green, no blue. Round-trip the bit-replication expansion so a
+    /// regression in the bit-shift order would flip the channel.
     #[test]
-    fn rejects_non_32bpp() {
-        let mut rect = uncompressed_32bpp_rect(1, 1, 0xCC);
+    fn decodes_uncompressed_rgb565_with_bit_replication() {
+        // RGB565 wire word = 0xF800 (LE: 0x00, 0xF8) = R=0x1F, G=0, B=0
+        // Bit-replicated 5→8: r5=0x1F → (0x1F<<3) | (0x1F>>2) = 0xFF
+        let mut rect = uncompressed_32bpp_rect(1, 1, 0);
         rect.bits_per_pixel = 16;
-        rect.bitmap_data = vec![0; 2]; // 1 px @ 16bpp = 2 bytes
+        rect.bitmap_data = vec![0x00, 0xF8];
+        let payload = build_payload(rect);
+        let rects = decode_bitmap_update_fast_path(&payload).unwrap();
+        assert_eq!(rects.len(), 1);
+        assert_eq!(&rects[0].pixels_rgba, &[0xFF, 0x00, 0x00, 0xFF]);
+    }
+
+    /// Uncompressed RGB555 + alpha pin to 0xFF.
+    #[test]
+    fn decodes_uncompressed_rgb555() {
+        // RGB555 wire word = 0x7C00 (LE: 0x00, 0x7C) = R=0x1F, G=0, B=0
+        let mut rect = uncompressed_32bpp_rect(1, 1, 0);
+        rect.bits_per_pixel = 15;
+        rect.bitmap_data = vec![0x00, 0x7C];
+        let payload = build_payload(rect);
+        let rects = decode_bitmap_update_fast_path(&payload).unwrap();
+        assert_eq!(rects.len(), 1);
+        assert_eq!(&rects[0].pixels_rgba, &[0xFF, 0x00, 0x00, 0xFF]);
+    }
+
+    /// Uncompressed 24 bpp BGR — one pixel, channel-distinguishable.
+    #[test]
+    fn decodes_uncompressed_24bpp_swaps_b_and_r() {
+        let mut rect = uncompressed_32bpp_rect(1, 1, 0);
+        rect.bits_per_pixel = 24;
+        rect.bitmap_data = vec![0x11, 0x22, 0x33]; // wire BGR
+        let payload = build_payload(rect);
+        let rects = decode_bitmap_update_fast_path(&payload).unwrap();
+        assert_eq!(rects.len(), 1);
+        assert_eq!(&rects[0].pixels_rgba, &[0x33, 0x22, 0x11, 0xFF]);
+    }
+
+    /// Round-trip through `RleDecompressor`: encode a 2×1 16 bpp pattern
+    /// as a single FOREGROUND/BACKGROUND run via the SPECIAL_WHITE order
+    /// and verify the renderer threads it through the RLE branch and
+    /// out the RGB565 converter.
+    ///
+    /// The simplest RLE program that fills a row is the WHITE single-byte
+    /// special order (0xFD) which writes one *white* pixel. Two of them
+    /// fill a 2×1 row.
+    #[test]
+    fn decodes_compressed_rle_16bpp_via_white_special_orders() {
+        // RLE program: [WHITE, WHITE]. Each pushes one bpp16 white pixel
+        // (= 0xFFFF). bitmap_length is omitted: NO_BITMAP_COMPRESSION_HDR
+        // keeps the on-wire shape minimal so the test isn't tied to the
+        // 8-byte compression header layout.
+        let mut rect = uncompressed_32bpp_rect(2, 1, 0);
+        rect.bits_per_pixel = 16;
+        rect.flags = BITMAP_COMPRESSION | justrdp_pdu::rdp::bitmap::NO_BITMAP_COMPRESSION_HDR;
+        rect.compr_hdr = None;
+        rect.bitmap_data = vec![0xFD, 0xFD];
+        let payload = build_payload(rect);
+        let rects = decode_bitmap_update_fast_path(&payload).unwrap();
+        assert_eq!(rects.len(), 1);
+        // 0xFFFF in RGB565 → R=0x1F, G=0x3F, B=0x1F → (0xFF, 0xFF, 0xFF) RGBA.
+        assert_eq!(
+            &rects[0].pixels_rgba,
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+    }
+
+    /// Compressed bitmaps with malformed RLE streams must surface as
+    /// `RenderError::Rle(...)`, *not* as a panic or generic decode error.
+    #[test]
+    fn surfaces_rle_decompression_errors() {
+        let mut rect = uncompressed_32bpp_rect(2, 1, 0);
+        rect.bits_per_pixel = 16;
+        rect.flags = BITMAP_COMPRESSION | justrdp_pdu::rdp::bitmap::NO_BITMAP_COMPRESSION_HDR;
+        rect.compr_hdr = None;
+        // 0xFC is reserved and the decompressor flags it as
+        // UnknownOrderCode — perfect canary for the error path.
+        rect.bitmap_data = vec![0xFC];
         let payload = build_payload(rect);
         let err = decode_bitmap_update_fast_path(&payload).unwrap_err();
         assert!(
-            matches!(err, RenderError::UnsupportedBpp { bits_per_pixel: 16 }),
-            "expected UnsupportedBpp(16), got {err:?}"
+            matches!(err, RenderError::Rle(_)),
+            "expected RenderError::Rle, got {err:?}"
         );
     }
 
