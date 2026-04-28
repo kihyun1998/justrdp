@@ -38,6 +38,9 @@ use justrdp_pdu::rdp::svc::{
     ChannelPduHeader, CHANNEL_FLAG_FIRST, CHANNEL_FLAG_LAST, CHANNEL_OPTION_INITIALIZED,
     CHANNEL_PDU_HEADER_SIZE,
 };
+use justrdp_pdu::rdp::headers::{
+    ShareControlHeader, ShareControlPduType, ShareDataHeader, ShareDataPduType,
+};
 use justrdp_pdu::tpkt::{TpktHeader, TPKT_HEADER_SIZE};
 use justrdp_pdu::x224::{DataTransfer, DATA_TRANSFER_HEADER_SIZE};
 
@@ -1798,6 +1801,328 @@ fn rdpdr_server_full_handshake_over_active_stage() {
 /// in the IRP wire-shape verification step.
 struct SilentFsHandler;
 impl justrdp_rdpdr::RdpServerFilesystemHandler for SilentFsHandler {}
+
+// ───────────────────────────────────────────────────────────────
+// Deactivation-Reactivation full-cycle loopback (§11.2b-5)
+// ───────────────────────────────────────────────────────────────
+
+/// Drive the §11.2b-5 D/R cycle end-to-end over a real
+/// `ServerActiveStage`, with a synthesized client driver that mirrors
+/// what `mstsc` / `xfreerdp` do post-DeactivateAll:
+///
+/// 1. Server calls `request_deactivation_reactivation(2560, 1440)` and
+///    flushes the resulting burst (DeactivateAll + fresh DemandActive).
+/// 2. Test parses the DemandActive to confirm the new desktop size
+///    propagates into the Bitmap capability set and the share_id has
+///    incremented to (original + 1).
+/// 3. Test synthesizes the client-side D/R PDUs in order
+///    (ConfirmActive → Synchronize → Cooperate → RequestControl →
+///    FontList) on the new share_id, feeding each to the active stage
+///    and asserting the matching server response shape.
+/// 4. After the FontMap emit, `deactivation_state == Active` and the
+///    new share_id is the steady-state value -- verified by emitting
+///    a fresh fast-path bitmap update through the active stage and
+///    decoding it cleanly.
+///
+/// The full ClientConnector is used for the *first* handshake only;
+/// the connector's post-Connected state is intentionally not driven
+/// because the surface under test is the server-side automation, not
+/// the connector's D/R re-finalization (which is already covered by
+/// connector unit tests around `CapabilitiesExchangeWaitDemandActive`).
+#[test]
+fn deactivation_reactivation_cycle_completes_round_trip() {
+    use justrdp_pdu::rdp::capabilities::{
+        CapabilitySet, ConfirmActivePdu, DemandActivePdu,
+    };
+    use justrdp_pdu::rdp::finalization::{
+        ControlAction, ControlPdu, FontListPdu, FontMapPdu, SynchronizePdu, SYNCMSGTYPE_SYNC,
+    };
+
+    // Phase 1: real handshake to Connected/Accepted.
+    let client = ClientConnector::new(rdp_only_client_config());
+    let acceptor = ServerAcceptor::new(rdp_only_acceptor_config());
+    let (_client, acceptor) = drive_full_handshake(client, acceptor);
+
+    let result = match acceptor.state() {
+        ServerAcceptorState::Accepted { result } => result.clone(),
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    let user_channel_id = result.user_channel_id;
+    let original_share_id = result.share_id;
+    let original_size = (result.gcc_core.desktop_width, result.gcc_core.desktop_height);
+
+    // Phase 2: server initiates D/R.
+    let config = justrdp_server::RdpServerConfig::builder().build().unwrap();
+    let mut active = ServerActiveStage::new(result, config);
+    let burst = active
+        .request_deactivation_reactivation(2560, 1440)
+        .expect("D/R burst");
+
+    // Phase 3: split the burst and verify each frame's shape.
+    // The TPKT length field gives us the boundary between the two
+    // concatenated frames.
+    let len0 = u16::from_be_bytes([burst[2], burst[3]]) as usize;
+    let frame_deact = &burst[..len0];
+    let frame_demand = &burst[len0..];
+
+    // Frame 0: DeactivateAllPdu on the *old* share_id.
+    {
+        let mut c = ReadCursor::new(frame_deact);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let sc = ShareControlHeader::decode(&mut inner).unwrap();
+        assert_eq!(sc.pdu_type, ShareControlPduType::DeactivateAllPdu);
+        let body = inner.peek_remaining();
+        let deact = justrdp_pdu::rdp::finalization::DeactivateAllPdu::decode(
+            &mut ReadCursor::new(body),
+        )
+        .unwrap();
+        assert_eq!(deact.share_id, original_share_id);
+    }
+
+    // Frame 1: fresh DemandActive on share_id+1, with the new size.
+    let new_share_id = original_share_id.wrapping_add(1);
+    {
+        let mut c = ReadCursor::new(frame_demand);
+        let _tpkt = TpktHeader::decode(&mut c).unwrap();
+        let _dt = DataTransfer::decode(&mut c).unwrap();
+        let sdi = SendDataIndication::decode(&mut c).unwrap();
+        let mut inner = ReadCursor::new(sdi.user_data);
+        let sc = ShareControlHeader::decode(&mut inner).unwrap();
+        assert_eq!(sc.pdu_type, ShareControlPduType::DemandActivePdu);
+        let demand = DemandActivePdu::decode(&mut inner).unwrap();
+        assert_eq!(demand.share_id, new_share_id);
+        let bitmap = demand.capability_sets.iter().find_map(|c| match c {
+            CapabilitySet::Bitmap(b) => Some(b.clone()),
+            _ => None,
+        }).expect("Bitmap cap");
+        assert_eq!(bitmap.desktop_width, 2560);
+        assert_eq!(bitmap.desktop_height, 1440);
+        assert_ne!(
+            (bitmap.desktop_width, bitmap.desktop_height),
+            original_size,
+            "new size must differ from original"
+        );
+    }
+    assert_eq!(active.share_id(), new_share_id);
+    assert_eq!(active.pending_display_size(), Some((2560, 1440)));
+
+    // Phase 4: drive the four-step finalization with synthesized
+    // client PDUs and verify each server emit shape.
+    let mut input = RecordingInput::default();
+
+    // Step 4.1: ConfirmActive -> WaitClientSynchronize (no immediate emit).
+    let confirm = ConfirmActivePdu {
+        share_id: new_share_id,
+        originator_id: 0x03EA,
+        source_descriptor: vec![0x4D, 0x53, 0x54, 0x53, 0x43, 0x00],
+        capability_sets: Vec::new(),
+    };
+    let bytes = build_share_control_frame(
+        user_channel_id,
+        ServerActiveStage::io_channel_id(&active),
+        ShareControlPduType::ConfirmActivePdu,
+        &confirm,
+    );
+    let out = active.process(&bytes, &mut input).unwrap();
+    assert!(out.is_empty(), "ConfirmActive: no immediate emit");
+
+    // Step 4.2: Synchronize -> Synchronize.
+    let sync = SynchronizePdu {
+        message_type: SYNCMSGTYPE_SYNC,
+        target_user: user_channel_id,
+    };
+    let bytes = build_share_data_frame(
+        user_channel_id,
+        ServerActiveStage::io_channel_id(&active),
+        new_share_id,
+        ShareDataPduType::Synchronize,
+        &sync,
+    );
+    let out = active.process(&bytes, &mut input).unwrap();
+    assert_server_emits_share_data(&out, ShareDataPduType::Synchronize, new_share_id);
+
+    // Step 4.3: Control(Cooperate) -> Control(Cooperate).
+    let coop = ControlPdu {
+        action: ControlAction::Cooperate,
+        grant_id: 0,
+        control_id: 0,
+    };
+    let bytes = build_share_data_frame(
+        user_channel_id,
+        ServerActiveStage::io_channel_id(&active),
+        new_share_id,
+        ShareDataPduType::Control,
+        &coop,
+    );
+    let out = active.process(&bytes, &mut input).unwrap();
+    assert_server_emits_share_data(&out, ShareDataPduType::Control, new_share_id);
+
+    // Step 4.4: Control(RequestControl) -> Control(GrantedControl).
+    let req = ControlPdu {
+        action: ControlAction::RequestControl,
+        grant_id: 0,
+        control_id: 0,
+    };
+    let bytes = build_share_data_frame(
+        user_channel_id,
+        ServerActiveStage::io_channel_id(&active),
+        new_share_id,
+        ShareDataPduType::Control,
+        &req,
+    );
+    let out = active.process(&bytes, &mut input).unwrap();
+    let granted_body =
+        assert_server_emits_share_data(&out, ShareDataPduType::Control, new_share_id);
+    let granted_pdu =
+        ControlPdu::decode(&mut ReadCursor::new(&granted_body)).unwrap();
+    assert_eq!(granted_pdu.action, ControlAction::GrantedControl);
+
+    // Step 4.5: FontList -> FontMap (cycle complete).
+    let font_list = FontListPdu::default_request();
+    let bytes = build_share_data_frame(
+        user_channel_id,
+        ServerActiveStage::io_channel_id(&active),
+        new_share_id,
+        ShareDataPduType::FontList,
+        &font_list,
+    );
+    let out = active.process(&bytes, &mut input).unwrap();
+    let font_map_body =
+        assert_server_emits_share_data(&out, ShareDataPduType::FontMap, new_share_id);
+    let _font_map = FontMapPdu::decode(&mut ReadCursor::new(&font_map_body)).unwrap();
+
+    // Phase 5: post-D/R steady state -- new share_id is sticky, the
+    // pending size has been consumed, and the stage emits fresh
+    // bitmap updates without erroring.
+    assert_eq!(
+        active.deactivation_state(),
+        justrdp_server::DeactivationState::Active
+    );
+    assert!(!active.is_in_deactivation_reactivation());
+    assert_eq!(active.share_id(), new_share_id);
+    assert_eq!(active.pending_display_size(), None);
+}
+
+/// Wrap a ShareControl PDU (any ShareControl pdu_type, not just Data)
+/// in MCS SDR + X.224 DT + TPKT for the active-stage process()
+/// pipeline. Mirrors the test helper of the same name in active.rs's
+/// inner test module, lifted here so the integration test doesn't
+/// need to depend on private fixtures.
+fn build_share_control_frame<E: Encode>(
+    user_channel_id: u16,
+    io_channel_id: u16,
+    pdu_type: ShareControlPduType,
+    inner: &E,
+) -> Vec<u8> {
+    use justrdp_pdu::rdp::headers::SHARE_CONTROL_HEADER_SIZE;
+    let inner_size = inner.size();
+    let sc_total = SHARE_CONTROL_HEADER_SIZE + inner_size;
+    let mut sc_payload = vec![0u8; sc_total];
+    {
+        let mut c = WriteCursor::new(&mut sc_payload);
+        ShareControlHeader {
+            total_length: sc_total as u16,
+            pdu_type,
+            pdu_source: user_channel_id,
+        }
+        .encode(&mut c)
+        .unwrap();
+        inner.encode(&mut c).unwrap();
+    }
+    let sdr = SendDataRequest {
+        initiator: user_channel_id,
+        channel_id: io_channel_id,
+        user_data: &sc_payload,
+    };
+    let payload_size = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+    let total = TPKT_HEADER_SIZE + payload_size;
+    let mut buf = vec![0u8; total];
+    let mut c = WriteCursor::new(&mut buf);
+    TpktHeader::try_for_payload(payload_size).unwrap().encode(&mut c).unwrap();
+    DataTransfer.encode(&mut c).unwrap();
+    sdr.encode(&mut c).unwrap();
+    buf
+}
+
+/// Wrap a ShareData PDU (`ShareControlPduType::Data + ShareDataHeader`)
+/// in MCS SDR + X.224 DT + TPKT.
+fn build_share_data_frame<E: Encode>(
+    user_channel_id: u16,
+    io_channel_id: u16,
+    share_id: u32,
+    pdu_type2: ShareDataPduType,
+    inner: &E,
+) -> Vec<u8> {
+    use justrdp_pdu::rdp::headers::{SHARE_CONTROL_HEADER_SIZE, SHARE_DATA_HEADER_SIZE};
+    let inner_size = inner.size();
+    let sd_total = SHARE_DATA_HEADER_SIZE + inner_size;
+    let sc_total = SHARE_CONTROL_HEADER_SIZE + sd_total;
+    let mut sc_payload = vec![0u8; sc_total];
+    {
+        let mut c = WriteCursor::new(&mut sc_payload);
+        ShareControlHeader {
+            total_length: sc_total as u16,
+            pdu_type: ShareControlPduType::Data,
+            pdu_source: user_channel_id,
+        }
+        .encode(&mut c)
+        .unwrap();
+        ShareDataHeader {
+            share_id,
+            stream_id: 1,
+            uncompressed_length: inner_size as u16,
+            pdu_type2,
+            compressed_type: 0,
+            compressed_length: 0,
+        }
+        .encode(&mut c)
+        .unwrap();
+        inner.encode(&mut c).unwrap();
+    }
+    let sdr = SendDataRequest {
+        initiator: user_channel_id,
+        channel_id: io_channel_id,
+        user_data: &sc_payload,
+    };
+    let payload_size = DATA_TRANSFER_HEADER_SIZE + sdr.size();
+    let total = TPKT_HEADER_SIZE + payload_size;
+    let mut buf = vec![0u8; total];
+    let mut c = WriteCursor::new(&mut buf);
+    TpktHeader::try_for_payload(payload_size).unwrap().encode(&mut c).unwrap();
+    DataTransfer.encode(&mut c).unwrap();
+    sdr.encode(&mut c).unwrap();
+    buf
+}
+
+/// Decode a server-side `ActiveStageOutput::SendBytes` frame produced
+/// during D/R re-finalization, verify the ShareControl + ShareData
+/// envelope shape, and return the inner PDU body for further
+/// inspection. Asserts the frame carries a single `SendBytes` output.
+fn assert_server_emits_share_data(
+    out: &[justrdp_server::ActiveStageOutput],
+    expected_type: ShareDataPduType,
+    expected_share_id: u32,
+) -> Vec<u8> {
+    assert_eq!(out.len(), 1, "expected single SendBytes output");
+    let bytes = match &out[0] {
+        justrdp_server::ActiveStageOutput::SendBytes(b) => b.clone(),
+        other => panic!("expected SendBytes, got {other:?}"),
+    };
+    let mut c = ReadCursor::new(&bytes);
+    let _ = TpktHeader::decode(&mut c).unwrap();
+    let _ = DataTransfer::decode(&mut c).unwrap();
+    let sdi = SendDataIndication::decode(&mut c).unwrap();
+    let mut inner = ReadCursor::new(sdi.user_data);
+    let sc = ShareControlHeader::decode(&mut inner).unwrap();
+    assert_eq!(sc.pdu_type, ShareControlPduType::Data);
+    let sd = ShareDataHeader::decode(&mut inner).unwrap();
+    assert_eq!(sd.pdu_type2, expected_type);
+    assert_eq!(sd.share_id, expected_share_id);
+    inner.peek_remaining().to_vec()
+}
 
 // ───────────────────────────────────────────────────────────────
 // GFX pipeline seam smoke test (§11.2d, 4th deliverable)

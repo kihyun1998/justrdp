@@ -29,14 +29,12 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use justrdp_acceptor::{
-    build_demand_active_capabilities, AcceptanceResult, GccCoreSnapshot,
-};
+use justrdp_acceptor::{AcceptanceResult, GccCoreSnapshot};
 use justrdp_core::{Decode, Encode, ReadCursor, WriteCursor};
 use justrdp_pdu::mcs::SendDataRequest;
-use justrdp_pdu::rdp::capabilities::{
-    CapabilitySet, ConfirmActivePdu, DemandActivePdu,
-};
+use justrdp_pdu::rdp::capabilities::{CapabilitySet, ConfirmActivePdu};
+#[cfg(test)]
+use justrdp_pdu::rdp::capabilities::DemandActivePdu;
 use justrdp_svc::{SvcError, SvcServerProcessor};
 use justrdp_pdu::rdp::fast_path::{
     FastPathInputEvent, FastPathInputHeader, FastPathOutputHeader, FASTPATH_INPUT_ENCRYPTED,
