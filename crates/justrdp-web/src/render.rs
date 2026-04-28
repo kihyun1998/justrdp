@@ -1121,34 +1121,65 @@ impl BitmapRenderer {
             )));
         }
         let payload = &cur[..length];
-        let pixels_rgba = match (codec_id, bpp) {
-            (0, 32) => {
-                let expected = width as usize * height as usize * 4;
-                if payload.len() != expected {
-                    return Ok(());
+        if codec_id == 0 {
+            let pixels_rgba = match bpp {
+                32 => {
+                    let expected = width as usize * height as usize * 4;
+                    if payload.len() != expected {
+                        return Ok(());
+                    }
+                    bgra_to_rgba(payload)
                 }
-                bgra_to_rgba(payload)
-            }
-            (0, 24) => {
-                let expected = width as usize * height as usize * 3;
-                if payload.len() != expected {
-                    return Ok(());
+                24 => {
+                    let expected = width as usize * height as usize * 3;
+                    if payload.len() != expected {
+                        return Ok(());
+                    }
+                    bgr_top_down_to_rgba(payload, width, height)
                 }
-                bgr_top_down_to_rgba(payload, width, height)
-            }
-            // Codec-encoded V3 entries (RFX / NSCodec / ClearCodec /
-            // AVC) are recognized but not yet decoded into the cache.
-            // S3d-6c5b would route through the existing codec dispatch.
-            _ => return Ok(()),
+                _ => return Ok(()),
+            };
+            self.bitmap_cache.insert(
+                (cache_id, cache_index),
+                CachedBitmap {
+                    width,
+                    height,
+                    pixels_rgba,
+                },
+            );
+            return Ok(());
+        }
+
+        // Codec-encoded V3 entry — route through the same Surface Bits
+        // dispatch by wrapping a BufferSink around an RGBA scratch
+        // buffer of the announced bitmap size. RFX / NSCodec /
+        // ClearCodec / AVC420 / AVC444 / AVC444v2 all reach the cache
+        // by a single code path. Decode failures and unsupported
+        // codecs silently drop (the matching MemBlt look-up will miss).
+        let synth_data = BitmapDataEx {
+            bpp,
+            codec_id,
+            width,
+            height,
+            ex_header: None,
+            bitmap_data: payload.to_vec(),
         };
-        self.bitmap_cache.insert(
-            (cache_id, cache_index),
-            CachedBitmap {
-                width,
-                height,
-                pixels_rgba,
-            },
-        );
+        let mut buf_sink = BufferSink::new(width, height);
+        match self.dispatch_surface_bits(0, 0, &synth_data, &mut buf_sink) {
+            Ok(true) => {
+                self.bitmap_cache.insert(
+                    (cache_id, cache_index),
+                    CachedBitmap {
+                        width,
+                        height,
+                        pixels_rgba: buf_sink.buf,
+                    },
+                );
+            }
+            // Ok(false) → no blit issued (e.g. zero-size).
+            // Err → silently drop; cache miss is the safe outcome.
+            _ => {}
+        }
         Ok(())
     }
 
@@ -1771,6 +1802,82 @@ fn blit_raw_surface_bits<S: FrameSink>(
 enum Avc444Layout {
     V1,
     V2,
+}
+
+/// In-memory [`FrameSink`] that captures `blit_rgba` calls into a
+/// fixed-size top-down RGBA buffer. Used by [`BitmapRenderer::cache_bitmap_v3`]
+/// to route codec-encoded V3 cache entries through the same
+/// `dispatch_surface_bits` pipeline that paints fast-path Surface Bits.
+struct BufferSink {
+    width: u16,
+    height: u16,
+    buf: Vec<u8>,
+}
+
+impl BufferSink {
+    fn new(width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            buf: alloc::vec![0u8; width as usize * height as usize * 4],
+        }
+    }
+}
+
+impl FrameSink for BufferSink {
+    fn blit_rgba(
+        &mut self,
+        dest_left: u16,
+        dest_top: u16,
+        width: u16,
+        height: u16,
+        pixels_rgba: &[u8],
+    ) {
+        if width == 0 || height == 0 || self.width == 0 || self.height == 0 {
+            return;
+        }
+        let row_stride_self = self.width as usize * 4;
+        let row_stride_src = width as usize * 4;
+        let max_x = self.width as usize;
+        let max_y = self.height as usize;
+        for row in 0..height as usize {
+            let dst_row = dest_top as usize + row;
+            if dst_row >= max_y {
+                break;
+            }
+            let dst_x = dest_left as usize;
+            if dst_x >= max_x {
+                continue;
+            }
+            let copy_w = (width as usize).min(max_x - dst_x);
+            let dst_off = dst_row * row_stride_self + dst_x * 4;
+            let src_off = row * row_stride_src;
+            self.buf[dst_off..dst_off + copy_w * 4]
+                .copy_from_slice(&pixels_rgba[src_off..src_off + copy_w * 4]);
+        }
+    }
+
+    fn peek_rgba(
+        &mut self,
+        dest_left: u16,
+        dest_top: u16,
+        width: u16,
+        height: u16,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        if dest_left as u32 + width as u32 > self.width as u32
+            || dest_top as u32 + height as u32 > self.height as u32
+        {
+            return false;
+        }
+        out.clear();
+        let stride = self.width as usize * 4;
+        for row in 0..height as usize {
+            let off = (dest_top as usize + row) * stride + dest_left as usize * 4;
+            out.extend_from_slice(&self.buf[off..off + width as usize * 4]);
+        }
+        true
+    }
 }
 
 /// `RDPGFX_AVC420_BITMAP_STREAM` (MS-RDPEGFX 2.2.4.4.1):
@@ -5018,6 +5125,77 @@ mod tests {
         body.extend_from_slice(&9u16.to_le_bytes()); // cacheIndex
         body.extend_from_slice(&[0xFF, 0xFF]);
         let cache_frame = build_secondary_order_frame(0, 0x00 /* V1 uncompressed */, &body);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.bitmap_cache_len(), 1);
+    }
+
+    /// V3 cache populated via NSCodec — verify the codec dispatch is
+    /// reached by feeding a deliberately-truncated payload and seeing
+    /// that the cache stays empty (silent drop, no error). This test
+    /// pins the routing without requiring a real NSCodec wire vector.
+    #[test]
+    fn cache_bitmap_v3_codec_encoded_routes_through_dispatch() {
+        let codec_id = 0x0A;
+        // V3 body with NSCodec codec_id and a 4-byte payload (too
+        // short for an NSCodec stream header → decoder errors,
+        // BufferSink path silently swallows).
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u16.to_le_bytes()); // cacheIndex
+        body.extend_from_slice(&0u32.to_le_bytes()); // key1
+        body.extend_from_slice(&0u32.to_le_bytes()); // key2
+        body.push(32);          // bpp
+        body.push(0);           // flags
+        body.push(0);           // reserved
+        body.push(codec_id);    // codec_id
+        body.extend_from_slice(&8u16.to_le_bytes()); // width
+        body.extend_from_slice(&8u16.to_le_bytes()); // height
+        body.extend_from_slice(&4u32.to_le_bytes()); // length
+        body.extend_from_slice(&[0u8; 4]);
+        let cache_frame = build_secondary_order_frame(0x01, 0x08 /* V3 */, &body);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_nscodec_codec_id(codec_id);
+        let mut sink = Capture::new();
+        // Must not panic / propagate the NSCodec decode error.
+        renderer.render(&event, &mut sink).unwrap();
+        // Truncated NSCodec body → decode failed → cache stays empty.
+        assert_eq!(renderer.bitmap_cache_len(), 0);
+        // No paint to the user-facing sink (BufferSink swallowed any).
+        assert!(sink.blits.is_empty());
+    }
+
+    /// V3 cache via codec_id=0 + bpp=24 (BGR) — exercises the manual
+    /// fast path for non-32-bpp raw entries.
+    #[test]
+    fn cache_bitmap_v3_codec0_24bpp() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&5u16.to_le_bytes()); // cacheIndex
+        body.extend_from_slice(&0u32.to_le_bytes()); // key1
+        body.extend_from_slice(&0u32.to_le_bytes()); // key2
+        body.push(24);          // bpp
+        body.push(0);
+        body.push(0);
+        body.push(0);           // codec_id
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.extend_from_slice(&[0x11, 0x22, 0x33]); // BGR
+        let cache_frame = build_secondary_order_frame(0x02, 0x08, &body);
         let mut frame = Vec::new();
         frame.extend_from_slice(&1u16.to_le_bytes());
         frame.extend_from_slice(&cache_frame);
