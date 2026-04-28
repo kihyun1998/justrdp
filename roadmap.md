@@ -2462,20 +2462,40 @@ register. caps confirm 까지의 핸드셰이크와 `WireToSurface1/2` 송신
 - [x] `DeactivateAllPdu` 송신 (MS-RDPBCGR 2.2.3.1) -- `encode_deactivate_all`
       helper (ShareControl + DeactivateAllPdu body)
 - [x] `ServerActiveStage::request_deactivation_reactivation(width, height)`
-      API + `DeactivationState { Active, WaitClientDeactivateAck }` 내부
-      상태. `confirm_redemand_active_complete(new_share_id)` 가 D/R
-      종료를 신호하고 새 share_id 적용
-- [-] **재 Demand Active 시 capability set 재생성** -- 부분: 새 size
-      는 `pending_display_size` 로 노출하지만 실제 re-DemandActive 흐름
-      (acceptor 의 finalization 재실행) 은 application-driven으로 남김.
-      현재 아키텍처에서는 active stage 가 acceptor 를 own 하지 않으므로
-      caller 가 active stage 폐기 + 새 RdpServer 핸드셰이크로 처리.
-      자동화는 §11.2d 통합 테스트에서 도입 예정
+      API + 6-단계 내부 상태 머신 (`Active` →
+      `WaitConfirmActive` → `WaitClientSynchronize` →
+      `WaitClientCooperate` → `WaitClientRequestControl` →
+      `WaitClientFontList` → `Active`). `request_*` 호출 한 번이
+      `DeactivateAll` + 새 `DemandActive` 두 frame 을 한 burst 로
+      반환 (share_id += 1). `confirm_redemand_active_complete(
+      new_share_id)` 는 manual override 로 보존
+- [x] **재 Demand Active 시 capability set 재생성** 자동화 완료.
+      `justrdp-acceptor` 에 `build_demand_active_capabilities(snapshot,
+      user_channel_id, override_size)` public 자유 함수 추출 +
+      `AcceptanceResult::gcc_core: GccCoreSnapshot` 필드 (kb /
+      color_depth / 초기 size). `ServerActiveStage` 가 snapshot 을
+      보관해 새 size 로 cap 재생성 → `encode_demand_active_redemand`
+      가 ShareControl + MCS SDI + X.224 DT + TPKT 로 frame 화. 통합
+      테스트 (`deactivation_reactivation_cycle_completes_round_trip`)
+      에서 새 Bitmap.desktop_width/height 가 새 값 반영 확인
+- [x] **재 Confirm Active + finalization 자동 송수신**:
+      `process()` 가 D/R substate 별로 `ConfirmActivePdu` /
+      `SynchronizePdu` / `Control(Cooperate)` /
+      `Control(RequestControl)` / `FontListPdu` 를 디코드하고
+      `Synchronize` / `Cooperate` / `GrantedControl` / `FontMap` 응답
+      emit. spec invariant (ConfirmActive shareId 일치, originatorID =
+      0x03EA, Synchronize messageType = SYNCMSGTYPE_SYNC) 검증. 알 수
+      없는 PDU 타입은 protocol error
 - [x] 명시적 API 채택 -- `pending_display_size()` accessor +
       `request_deactivation_reactivation(w, h)` 가 새 size 를 명시적
       으로 받음. `get_display_size()` 자동 감지는 의도적 제외 (애매한
       디바운싱 로직 회피)
-- [x] 단위 테스트 (시퀀스 라운드트립, 변경된 해상도 반영, error gating)
+- [x] 단위 테스트 (3 신규 + 5 갱신: burst-shape decode + 풀 4-step
+      finalization 라운드트립 + ConfirmActive shareId 거부 +
+      substate PDU 타입 거부) + 통합 테스트 1건
+      (`handshake_loopback::deactivation_reactivation_cycle_completes_round_trip`
+      -- 풀 핸드셰이크 → server `request_deactivation_reactivation`
+      → 합성 client PDU 5단계 → 새 share_id 정상화 확인)
 
 #### 11.2c -- Server-Direction Channel Handlers
 
