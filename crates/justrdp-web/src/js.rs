@@ -35,6 +35,9 @@ use web_sys::HtmlCanvasElement;
 
 use crate::canvas::CanvasFrameSink;
 use crate::driver::WebClient;
+use crate::input::{
+    mouse_button_event, mouse_move_event, mouse_wheel_event, scancode_event, MouseButton,
+};
 use crate::render::BitmapRenderer;
 use crate::session::ActiveSession;
 use crate::websocket::{WebSocketConfig, WebSocketTransport};
@@ -263,6 +266,82 @@ impl JsClient {
         // on the same canvas without re-binding it.
         g.sink = sink_opt;
         Ok(blits)
+    }
+
+    // ── Input forwarding (S4) ──────────────────────────────────────
+
+    /// Send a key-down. `keyCode` is a PS/2 set-1 scancode; the JS
+    /// embedder is responsible for KeyboardEvent → scancode mapping
+    /// (the demo page ships a US-English subset).
+    #[wasm_bindgen(js_name = sendKeyDown)]
+    pub async fn send_key_down(&self, key_code: u8, extended: bool) -> Result<(), JsValue> {
+        self.send_one(scancode_event(key_code, true, extended)).await
+    }
+
+    /// Companion key-up.
+    #[wasm_bindgen(js_name = sendKeyUp)]
+    pub async fn send_key_up(&self, key_code: u8, extended: bool) -> Result<(), JsValue> {
+        self.send_one(scancode_event(key_code, false, extended)).await
+    }
+
+    /// Mouse move to absolute desktop pixel `(x, y)`.
+    #[wasm_bindgen(js_name = sendMouseMove)]
+    pub async fn send_mouse_move(&self, x: u16, y: u16) -> Result<(), JsValue> {
+        self.send_one(mouse_move_event(x, y)).await
+    }
+
+    /// Mouse button press / release at `(x, y)`. `button` is `0` for
+    /// left, `1` for right, `2` for middle (matching `MouseEvent.button`
+    /// in the DOM).
+    #[wasm_bindgen(js_name = sendMouseButton)]
+    pub async fn send_mouse_button(
+        &self,
+        x: u16,
+        y: u16,
+        button: u8,
+        pressed: bool,
+    ) -> Result<(), JsValue> {
+        let button = match button {
+            0 => MouseButton::Left,
+            1 => MouseButton::Right,
+            2 => MouseButton::Middle,
+            other => {
+                return Err(js_error(format!("unknown mouse button index {other}")));
+            }
+        };
+        self.send_one(mouse_button_event(x, y, button, pressed)).await
+    }
+
+    /// Mouse wheel rotation. `deltaY` is the vertical step, positive
+    /// for "wheel up". Pass `horizontal=true` to translate to a
+    /// horizontal-wheel event instead.
+    #[wasm_bindgen(js_name = sendMouseWheel)]
+    pub async fn send_mouse_wheel(
+        &self,
+        x: u16,
+        y: u16,
+        delta: i32,
+        horizontal: bool,
+    ) -> Result<(), JsValue> {
+        self.send_one(mouse_wheel_event(x, y, delta, horizontal)).await
+    }
+
+    /// Internal helper: take session, send one input event, put back.
+    async fn send_one(
+        &self,
+        event: justrdp_pdu::rdp::fast_path::FastPathInputEvent,
+    ) -> Result<(), JsValue> {
+        let mut session = self
+            .inner
+            .borrow_mut()
+            .session
+            .take()
+            .ok_or_else(|| js_error("not connected"))?;
+        let result = session.send_input(&[event]).await;
+        // Always put back so a transient error keeps the session usable.
+        self.inner.borrow_mut().session = Some(session);
+        result.map_err(|e| js_error(format!("send_input: {e}")))?;
+        Ok(())
     }
 
     /// Drop the active session (if any). Idempotent; calling on a

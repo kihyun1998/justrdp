@@ -24,6 +24,7 @@ extern crate alloc;
 
 mod driver;
 mod error;
+mod input;
 mod render;
 mod session;
 mod transport;
@@ -39,6 +40,10 @@ mod js;
 
 pub use driver::{DriverError, WebClient, MAX_HANDSHAKE_PDU_SIZE};
 pub use error::{TransportError, TransportErrorKind};
+pub use input::{
+    mouse_button_event, mouse_move_event, mouse_wheel_event, scancode_event, MouseButton,
+    KBDFLAGS_EXTENDED, KBDFLAGS_RELEASE,
+};
 pub use render::{
     decode_bitmap_update_fast_path, render_event, BitmapRenderer, DecodedRect, FrameSink,
     RenderError,
