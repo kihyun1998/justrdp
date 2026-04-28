@@ -1029,6 +1029,22 @@ impl BitmapRenderer {
                 }
                 flip_and_swap_24bpp(payload, width, height)
             }
+            (false, 8) => {
+                let expected = width as usize * height as usize;
+                if payload.len() != expected {
+                    return Ok(());
+                }
+                let pal = match self.palette.as_ref() {
+                    Some(p) => p,
+                    // No palette negotiated yet → silently drop. The
+                    // matching MemBlt will miss until a future
+                    // Palette PDU primes the table; subsequent
+                    // CacheBitmap orders for the same slot will then
+                    // populate correctly.
+                    None => return Ok(()),
+                };
+                flip_and_apply_palette(payload, width, height, pal)
+            }
             (true, 16) => {
                 let mut raw = Vec::new();
                 RleDecompressor::new()
@@ -1040,6 +1056,16 @@ impl BitmapRenderer {
                 RleDecompressor::new()
                     .decompress(payload, width, height, BitsPerPixel::Bpp24, &mut raw)?;
                 flip_and_swap_24bpp(&raw, width, height)
+            }
+            (true, 8) => {
+                let pal = match self.palette.as_ref() {
+                    Some(p) => p,
+                    None => return Ok(()),
+                };
+                let mut raw = Vec::new();
+                RleDecompressor::new()
+                    .decompress(payload, width, height, BitsPerPixel::Bpp8, &mut raw)?;
+                flip_and_apply_palette(&raw, width, height, pal)
             }
             _ => return Ok(()),
         };
@@ -5106,6 +5132,74 @@ mod tests {
         for blit in &sink.blits {
             assert_eq!(&blit.4, &[0xAA, 0xBB, 0xCC, 0xFF]);
         }
+    }
+
+    /// V1 8 bpp + palette: send a Palette PDU to seed the renderer's
+    /// 256-entry table, then a CacheBitmapV1 entry whose pixels are
+    /// palette indices. The cached bitmap should be the palette
+    /// look-up of those indices (with bottom-up→top-down flip applied
+    /// by `flip_and_apply_palette`).
+    #[test]
+    fn cache_bitmap_v1_8bpp_uses_seeded_palette() {
+        let palette_event = palette_event();
+        // V1 body: cacheId=4, pad, width=2, height=2, bpp=8, length=4,
+        // cacheIndex=11, payload = [0x10, 0x20, 0x30, 0x40] (palette
+        // indices). With grayscale palette palette[i]=(i,i,i), the
+        // 2×2 bitmap stores bottom-up rows [0x10, 0x20] / [0x30, 0x40].
+        // After flip_and_apply_palette: top-down RGBA rows
+        //   row 0 ← wire row 1 ← (0x30, 0x40) → (0x30,0x30,0x30,FF), (0x40…)
+        //   row 1 ← wire row 0 ← (0x10, 0x20) → (0x10…), (0x20…)
+        let mut body = Vec::new();
+        body.push(4); // cacheId
+        body.push(0); // pad
+        body.push(2); // width
+        body.push(2); // height
+        body.push(8); // bpp
+        body.extend_from_slice(&4u16.to_le_bytes()); // bitmapLength
+        body.extend_from_slice(&11u16.to_le_bytes()); // cacheIndex
+        body.extend_from_slice(&[0x10, 0x20, 0x30, 0x40]);
+        let cache_frame = build_secondary_order_frame(0, 0x00 /* V1 uncompressed */, &body);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        let cache_event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&palette_event, &mut sink).unwrap();
+        renderer.render(&cache_event, &mut sink).unwrap();
+        assert_eq!(renderer.bitmap_cache_len(), 1);
+    }
+
+    /// V1 8 bpp without a palette must silently skip — verifies the
+    /// "wait for Palette PDU" failure mode without erroring.
+    #[test]
+    fn cache_bitmap_v1_8bpp_without_palette_skips_silently() {
+        let mut body = Vec::new();
+        body.push(0);
+        body.push(0);
+        body.push(1);
+        body.push(1);
+        body.push(8);
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.push(0x42);
+        let cache_frame = build_secondary_order_frame(0, 0x00, &body);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        // No palette set; must not error.
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.bitmap_cache_len(), 0);
     }
 
     /// CacheBitmapV1 16 bpp uncompressed → cache populates and a
