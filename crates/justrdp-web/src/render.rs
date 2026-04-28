@@ -343,6 +343,30 @@ pub struct BitmapRenderer {
     /// 1 bpp mask. GlyphIndex orders composite the mask onto the
     /// destination using the foreground color.
     glyph_cache: BTreeMap<(u8, u16), CachedGlyph>,
+    /// Negotiated GLYPH_REVISION (general capability set). The V2
+    /// `CacheGlyph` body uses a different (compacted) wire layout
+    /// from V1, distinguished only by capability negotiation —
+    /// embedders read it out of [`ConnectionResult::server_capabilities`]
+    /// and forward via [`Self::set_glyph_cache_revision`].
+    /// Defaults to V1 (the wire shape we currently parse).
+    ///
+    /// [`ConnectionResult::server_capabilities`]: justrdp_connector::ConnectionResult
+    glyph_cache_revision: GlyphCacheRevision,
+}
+
+/// Glyph cache revision selector (MS-RDPBCGR 2.2.7.1.7 / MS-RDPEGDI
+/// 2.2.2.2.1.2.5 vs .6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GlyphCacheRevision {
+    /// `CacheGlyph` Revision 1 — fixed-width fields, top-down mask.
+    /// MS-RDPEGDI 2.2.2.2.1.2.5.
+    #[default]
+    V1,
+    /// `CacheGlyph` Revision 2 — compact variable-length encoding.
+    /// MS-RDPEGDI 2.2.2.2.1.2.6. Wire parser deferred to S3d-6d4;
+    /// V2 entries currently silently drop, leaving subsequent
+    /// GlyphIndex orders with cache misses (text shows as gaps).
+    V2,
 }
 
 /// One entry in [`BitmapRenderer::glyph_cache`].
@@ -415,11 +439,23 @@ impl BitmapRenderer {
             bitmap_cache: BTreeMap::new(),
             brush_cache: BTreeMap::new(),
             glyph_cache: BTreeMap::new(),
+            glyph_cache_revision: GlyphCacheRevision::V1,
         }
     }
 
     pub fn glyph_cache_len(&self) -> usize {
         self.glyph_cache.len()
+    }
+
+    /// Tell the renderer which `CacheGlyph` revision the server
+    /// negotiated. Default is V1; embedders call this once after the
+    /// capability exchange if the server picked V2.
+    pub fn set_glyph_cache_revision(&mut self, rev: GlyphCacheRevision) {
+        self.glyph_cache_revision = rev;
+    }
+
+    pub fn glyph_cache_revision(&self) -> GlyphCacheRevision {
+        self.glyph_cache_revision
     }
 
     /// Number of cached bitmaps currently held (test / instrumentation).
@@ -651,9 +687,18 @@ impl BitmapRenderer {
                         SecondaryOrderType::CacheBrush => {
                             let _ = self.cache_brush(body);
                         }
-                        SecondaryOrderType::CacheGlyph => {
-                            let _ = self.cache_glyph(extra_flags, body);
-                        }
+                        SecondaryOrderType::CacheGlyph => match self.glyph_cache_revision {
+                            GlyphCacheRevision::V1 => {
+                                let _ = self.cache_glyph(extra_flags, body);
+                            }
+                            GlyphCacheRevision::V2 => {
+                                // V2 wire layout deferred to S3d-6d4.
+                                // Silently drop so the order stream
+                                // stays in sync; the matching
+                                // GlyphIndex orders will miss the
+                                // cache and skip per-glyph renders.
+                            }
+                        },
                         // CacheColorTable: decoded only enough to keep
                         // the order stream in sync.
                         _ => {}
@@ -768,26 +813,21 @@ impl BitmapRenderer {
     }
 
     /// `GlyphIndex` body decoder + 1 bpp mask compositor (MS-RDPEGDI
-    /// 2.2.2.2.1.1.2.13). Each command in the trailing variable-length
-    /// `data` is one of:
-    ///   * 0x00..=0xFD — single glyph index byte (cache id is in the
-    ///     header). Renders the cached glyph mask at the running pen
-    ///     position with the foreground color where bits = 1.
-    ///   * 0xFE — cache_id switch (1 byte) — followed by index.
-    ///   * 0xFF — terminator (we honor it but the order's cbData should
-    ///     already bound the iteration).
-    ///   * 0x80..=0xFD with high bit set in some flAccel modes — used
-    ///     as relative offset (skipped for now; rare on modern wire).
+    /// 2.2.2.2.1.1.2.13).
     ///
-    /// `flAccel` flags (`order.fl_accel`) we honor:
-    ///   SO_VERTICAL / SO_HORIZONTAL — fixed cell layout.
-    ///   SO_REVERSED — render right-to-left (deferred).
-    ///
-    /// Glyphs that miss the cache silently skip (the embedder loses
-    /// that one character). Background-rect drawing (BkLeft..BkBottom
-    /// + BackColor) is not currently rendered — fonts on top of an
-    /// already-painted background look right; isolated text spans
-    /// would need the bk rect too (S3d-6d3 follow-up).
+    /// Pipeline:
+    ///   1. Decode the 22 fixed fields per their flag bits.
+    ///   2. Fill the `BkLeft..BkBottom` rectangle with `BackColor`
+    ///      so isolated text spans paint correctly on top of an
+    ///      already-rendered desktop. Skipped when bk rect is empty.
+    ///   3. Walk the trailing `data` byte stream; for each
+    ///      0x00..=0xFD entry composite the cached glyph mask at the
+    ///      running pen position. `0xFE` switches `cache_id` (next
+    ///      byte = new id), `0xFF` terminates.
+    ///   4. After each glyph, advance the pen per `flAccel`:
+    ///      * default / `SO_HORIZONTAL` → `pen_x += cx`
+    ///      * `SO_VERTICAL`            → `pen_y += cy`
+    ///      * `SO_REVERSED`            → reverse direction on whichever axis is active
     fn try_render_glyph_index<S: FrameSink>(
         &mut self,
         cursor: &mut ReadCursor<'_>,
@@ -886,38 +926,89 @@ impl BitmapRenderer {
             let bytes = cursor.read_slice(cb, "GlyphIndex::data")?;
             data = bytes.to_vec();
         }
-        let _ = (back_color, bk_left, bk_top, bk_right, bk_bottom, cb);
+        let _ = cb;
+
+        // Step 1: paint the background rect (when non-empty). Skips
+        // when both right ≤ left or bottom ≤ top — server signals
+        // "no background needed" by zeroing those fields.
+        let mut any_blits = false;
+        if bk_right > bk_left && bk_bottom > bk_top {
+            let w = (bk_right - bk_left).max(0) as u16;
+            let h = (bk_bottom - bk_top).max(0) as u16;
+            if w > 0 && h > 0 {
+                let bk_rgba = [back_color[0], back_color[1], back_color[2], 0xFF];
+                let pixels: Vec<u8> = core::iter::repeat(bk_rgba)
+                    .take(w as usize * h as usize)
+                    .flatten()
+                    .collect();
+                sink.blit_rgba(
+                    bk_left.max(0) as u16,
+                    bk_top.max(0) as u16,
+                    w,
+                    h,
+                    &pixels,
+                );
+                any_blits = true;
+            }
+        }
+
+        // Step 2: composite glyphs.
+        const SO_HORIZONTAL: u8 = 0x01;
+        const SO_VERTICAL: u8 = 0x02;
+        const SO_REVERSED: u8 = 0x04;
+        let vertical = _fl_accel & SO_VERTICAL != 0;
+        let horizontal = _fl_accel & SO_HORIZONTAL != 0;
+        let reversed = _fl_accel & SO_REVERSED != 0;
+        // Default behavior when neither vertical nor horizontal bit is
+        // set is horizontal (the common case).
+        let advance_axis_vertical = vertical && !horizontal;
 
         let fore_rgba = [fore_color[0], fore_color[1], fore_color[2], 0xFF];
         let mut pen_x = x as i32;
-        let pen_y = y as i32;
+        let mut pen_y = y as i32;
         let mut current_cache_id = cache_id;
-        let mut any_blits = false;
         let mut i = 0;
         while i < data.len() {
             let b = data[i];
             i += 1;
             match b {
                 0xFE => {
-                    // Cache id switch: next byte is the new cache_id.
                     if i < data.len() {
                         current_cache_id = data[i];
                         i += 1;
                     }
                     continue;
                 }
-                0xFF => break, // explicit terminator
+                0xFF => break,
                 idx => {
                     let glyph_key = (current_cache_id, idx as u16);
                     if let Some(g) = self.glyph_cache.get(&glyph_key).cloned() {
-                        if composite_glyph_mask(&g, pen_x, pen_y, &fore_rgba, sink) {
+                        // For SO_REVERSED, the pen sits at the *right
+                        // edge* of where the glyph paints (horizontal)
+                        // or the *bottom* (vertical), so we shift the
+                        // composite origin back by cx / cy first.
+                        let blit_x = if reversed && !advance_axis_vertical {
+                            pen_x - g.cx as i32
+                        } else {
+                            pen_x
+                        };
+                        let blit_y = if reversed && advance_axis_vertical {
+                            pen_y - g.cy as i32
+                        } else {
+                            pen_y
+                        };
+                        if composite_glyph_mask(&g, blit_x, blit_y, &fore_rgba, sink) {
                             any_blits = true;
                         }
-                        // Advance pen by glyph width. Real flAccel-driven
-                        // schemes can shift differently (vertical text,
-                        // proportional spacing) — this minimum ships the
-                        // common left-to-right horizontal layout.
-                        pen_x += g.cx as i32;
+                        // Advance pen along the active axis, signed by
+                        // the SO_REVERSED bit.
+                        let step_h = if reversed { -(g.cx as i32) } else { g.cx as i32 };
+                        let step_v = if reversed { -(g.cy as i32) } else { g.cy as i32 };
+                        if advance_axis_vertical {
+                            pen_y += step_v;
+                        } else {
+                            pen_x += step_h;
+                        }
                     }
                 }
             }
@@ -5132,6 +5223,127 @@ mod tests {
         for blit in &sink.blits {
             assert_eq!(&blit.4, &[0xAA, 0xBB, 0xCC, 0xFF]);
         }
+    }
+
+    /// GlyphIndex with a non-empty bk rect — the BackColor fill must
+    /// blit before the glyph composition. We confirm: (a) the first
+    /// blit covers the bk rect dimensions in BackColor, and
+    /// (b) subsequent blits paint glyph mask pixels in ForeColor.
+    #[test]
+    fn glyph_index_bk_rect_paints_before_glyphs() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+
+        // Cache one 4×4 all-bits-on glyph at (cacheId=0, glyphIndex=1).
+        // 1 bpp 4×4 means 4 rows × stride=ceil(4/8)+pad-to-4 = 4 bytes/row.
+        let mut cg = Vec::new();
+        cg.push(0); // cacheId duplicate
+        cg.push(1); // cGlyphs
+        cg.extend_from_slice(&1u16.to_le_bytes()); // cacheIndex
+        cg.extend_from_slice(&0i16.to_le_bytes()); // x
+        cg.extend_from_slice(&0i16.to_le_bytes()); // y
+        cg.extend_from_slice(&4u16.to_le_bytes()); // cx
+        cg.extend_from_slice(&4u16.to_le_bytes()); // cy
+        for _ in 0..4 {
+            cg.push(0xF0); // top 4 bits set, rest pad
+            cg.extend_from_slice(&[0u8; 3]);
+        }
+        let cache_frame = build_secondary_order_frame(0x00, 0x03, &cg);
+
+        // GlyphIndex: cacheId=0, fore=(0xAA,0xBB,0xCC), back=(0x10,0x20,0x30),
+        // bk rect (5..15, 8..18) → 10×10 fill, x=5, y=8, cbData=1, glyph=1.
+        let mut gi = Vec::new();
+        gi.push(0); gi.push(0); gi.push(0); gi.push(0);
+        gi.extend_from_slice(&[0x10, 0x20, 0x30]); // back
+        gi.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // fore
+        gi.extend_from_slice(&5u16.to_le_bytes()); gi.extend_from_slice(&8u16.to_le_bytes());
+        gi.extend_from_slice(&15u16.to_le_bytes()); gi.extend_from_slice(&18u16.to_le_bytes());
+        gi.extend_from_slice(&0u16.to_le_bytes()); gi.extend_from_slice(&0u16.to_le_bytes());
+        gi.extend_from_slice(&0u16.to_le_bytes()); gi.extend_from_slice(&0u16.to_le_bytes());
+        gi.push(0); gi.push(0); gi.push(0); gi.push(0);
+        gi.extend_from_slice(&[0; 7]);
+        gi.extend_from_slice(&5u16.to_le_bytes()); // x
+        gi.extend_from_slice(&8u16.to_le_bytes()); // y
+        gi.push(1);
+        gi.push(1);
+
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::GlyphIndex,
+            field_flags: 0x003F_FFFF,
+            bounds: None,
+            data: gi,
+        };
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        // First blit must be the 10×10 BackColor rect.
+        assert!(!sink.blits.is_empty());
+        let (x0, y0, w0, h0, p0) = &sink.blits[0];
+        assert_eq!((*x0, *y0, *w0, *h0), (5, 8, 10, 10));
+        for px in p0.chunks_exact(4) {
+            assert_eq!(px, &[0x10, 0x20, 0x30, 0xFF]);
+        }
+        // Subsequent blits = glyph mask pixels (top 4 bits per row of
+        // a 4×4 mask = 16 fore-color pixel blits).
+        let glyph_blits: Vec<&(u16, u16, u16, u16, Vec<u8>)> =
+            sink.blits.iter().skip(1).collect();
+        assert_eq!(glyph_blits.len(), 16);
+        for blit in glyph_blits {
+            assert_eq!(&blit.4, &[0xAA, 0xBB, 0xCC, 0xFF]);
+        }
+    }
+
+    /// `set_glyph_cache_revision(V2)` makes the renderer drop V2
+    /// CacheGlyph orders silently — verifies the revision toggle and
+    /// the silent-skip path.
+    #[test]
+    fn glyph_cache_v2_revision_drops_silently() {
+        let mut renderer = BitmapRenderer::new();
+        assert_eq!(renderer.glyph_cache_revision(), GlyphCacheRevision::V1);
+        renderer.set_glyph_cache_revision(GlyphCacheRevision::V2);
+        assert_eq!(renderer.glyph_cache_revision(), GlyphCacheRevision::V2);
+
+        // Same body as the V1 round-trip test — but with V2 revision
+        // set, the parser drops it without populating the cache.
+        let mut cg = Vec::new();
+        cg.push(0);
+        cg.push(1);
+        cg.extend_from_slice(&5u16.to_le_bytes());
+        cg.extend_from_slice(&0i16.to_le_bytes());
+        cg.extend_from_slice(&0i16.to_le_bytes());
+        cg.extend_from_slice(&8u16.to_le_bytes());
+        cg.extend_from_slice(&4u16.to_le_bytes());
+        for _ in 0..4 {
+            cg.push(0xFF);
+            cg.extend_from_slice(&[0; 3]);
+        }
+        let cache_frame = build_secondary_order_frame(0x02, 0x03, &cg);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(&cache_frame);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut sink = Capture::new();
+        renderer.render(&event, &mut sink).unwrap();
+        assert_eq!(renderer.glyph_cache_len(), 0);
     }
 
     /// V1 8 bpp + palette: send a Palette PDU to seed the renderer's

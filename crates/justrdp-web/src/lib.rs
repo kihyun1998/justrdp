@@ -46,7 +46,7 @@ pub use input::{
 };
 pub use render::{
     decode_bitmap_update_fast_path, render_event, BitmapRenderer, DecodedRect, FrameSink,
-    RenderError,
+    GlyphCacheRevision, RenderError,
 };
 pub use session::{ActiveSession, PointerEvent, SessionEvent};
 pub use transport::WebTransport;
