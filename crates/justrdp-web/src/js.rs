@@ -112,6 +112,10 @@ struct JsClientInner {
     /// Last successful `connect()` summary, mirrored so JS can read it
     /// at any time without re-issuing the connect Promise.
     last_summary: Option<JsValue>,
+    /// JS-side flag: the bridge handles TLS termination, so the
+    /// connector's `EnhancedSecurityUpgrade` is treated as already
+    /// done. Mirrors `WebClient::with_external_tls(true)`.
+    external_tls: bool,
 }
 
 /// Stateful RDP-over-WebSocket client. Hold one per `<canvas>`.
@@ -140,6 +144,20 @@ impl JsClient {
         let sink = CanvasFrameSink::from_canvas(&canvas)?;
         self.inner.borrow_mut().sink = Some(sink);
         Ok(())
+    }
+
+    /// Tell the client that the WebSocket bridge already terminates TLS
+    /// to the RDP server (typical wsproxy / chisel / TS Gateway setup
+    /// with a `wss://` URL). When set, the connector's SSL/HYBRID
+    /// `EnhancedSecurityUpgrade` is treated as done-by-bridge and the
+    /// handshake continues without an in-band TLS handshake. Default
+    /// is `false`.
+    ///
+    /// NLA / CredSSP still surfaces as `not connected → NLA required`
+    /// because justrdp-web does not implement CredSSP yet.
+    #[wasm_bindgen(js_name = setExternalTls)]
+    pub fn set_external_tls(&self, enabled: bool) {
+        self.inner.borrow_mut().external_tls = enabled;
     }
 
     /// Whether `connect()` has succeeded and `disconnect()` hasn't run.
@@ -192,7 +210,8 @@ impl JsClient {
         let mut config = builder.build();
         config.client_random = Some(client_random);
 
-        let client = WebClient::new(transport);
+        let external_tls = self.inner.borrow().external_tls;
+        let client = WebClient::new(transport).with_external_tls(external_tls);
         let (result, transport) = client
             .connect(config)
             .await

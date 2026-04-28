@@ -118,11 +118,44 @@ impl From<SessionError> for DriverError {
 /// gateway sidecars, native test rigs) can use this directly.
 pub struct WebClient<T: WebTransport> {
     transport: T,
+    /// When `true`, treat the connector's `EnhancedSecurityUpgrade`
+    /// state as already complete — the WebSocket bridge (wsproxy /
+    /// chisel / TS Gateway) is assumed to have terminated TLS to the
+    /// RDP server already, so the byte stream we're moving on the
+    /// `WebTransport` is already inside the post-TLS plaintext from
+    /// the connector's point of view. False (default) keeps the
+    /// behaviour from S2: we error with `TlsRequired` as soon as the
+    /// state is reached.
+    external_tls: bool,
 }
 
 impl<T: WebTransport> WebClient<T> {
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            external_tls: false,
+        }
+    }
+
+    /// Tell the driver that any `EnhancedSecurityUpgrade` (SSL/HYBRID)
+    /// the server requests has already been performed by the layer
+    /// underneath the [`WebTransport`] (typically a `wss://` proxy
+    /// terminating TLS to the RDP server). When set, the driver
+    /// silently advances the connector through the upgrade state and
+    /// keeps pumping bytes — no in-band TLS handshake.
+    ///
+    /// Leave `false` (the default) when the embedder is talking to a
+    /// raw TCP bridge that does not perform TLS itself; the connector
+    /// will error out with [`DriverError::TlsRequired`] so the embedder
+    /// can plumb its own TLS upgrader (justrdp-tls or platform native).
+    pub fn with_external_tls(mut self, enabled: bool) -> Self {
+        self.external_tls = enabled;
+        self
+    }
+
+    /// Whether `with_external_tls` was set.
+    pub fn external_tls(&self) -> bool {
+        self.external_tls
     }
 
     /// Reborrow the underlying transport without consuming the client.
@@ -156,7 +189,22 @@ impl<T: WebTransport> WebClient<T> {
             match connector.state() {
                 ClientConnectorState::Connected { .. } => break,
                 ClientConnectorState::EnhancedSecurityUpgrade => {
-                    return Err(DriverError::TlsRequired);
+                    if !self.external_tls {
+                        return Err(DriverError::TlsRequired);
+                    }
+                    // The bridge has already terminated TLS to the RDP
+                    // server. Drive the connector through the no-op
+                    // step that just advances state to whatever comes
+                    // after the upgrade (BasicSettingsExchange for SSL,
+                    // CredsspNegoTokens for HYBRID, etc.). The connector
+                    // emits zero bytes for this step.
+                    output.clear();
+                    let _written = connector.step(&[], &mut output)?;
+                    if !output.is_empty() {
+                        self.transport.send(output.as_slice()).await?;
+                        output.clear();
+                    }
+                    continue;
                 }
                 state @ (ClientConnectorState::CredsspNegoTokens
                 | ClientConnectorState::CredsspPubKeyAuth
@@ -502,5 +550,83 @@ mod tests {
             // The driver still emitted the X.224 CR before bailing.
             assert_eq!(shared.borrow().sent.len(), 1);
         });
+    }
+
+    /// `with_external_tls(true)` must let the driver advance through
+    /// `EnhancedSecurityUpgrade` silently. The connector's next state
+    /// after SSL upgrade is `BasicSettingsExchangeSendInitial` (a send
+    /// state); the driver immediately emits the MCS Connect Initial
+    /// PDU. With no further server response in the recv script, the
+    /// loop then waits for `BasicSettingsExchangeWaitResponse` and
+    /// hits the recv EOF — that's the signal we got past the upgrade.
+    #[test]
+    fn with_external_tls_advances_past_security_upgrade() {
+        use justrdp_pdu::x224::{ConnectionConfirm, NegotiationResponse, NegotiationResponseFlags};
+        use justrdp_core::{Encode, WriteCursor};
+
+        block_on(async {
+            let cc = ConnectionConfirm::success(NegotiationResponse {
+                flags: NegotiationResponseFlags::NONE,
+                protocol: SecurityProtocol::SSL,
+            });
+            let inner_size = cc.size();
+            let total = 4 + inner_size;
+            let mut buf = vec![0u8; total];
+            buf[0] = 0x03;
+            buf[1] = 0x00;
+            buf[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+            let mut cursor = WriteCursor::new(&mut buf[4..]);
+            cc.encode(&mut cursor).unwrap();
+
+            let shared = Rc::new(RefCell::new(CaptureShared {
+                sent: Vec::new(),
+                recv: VecDeque::from([Ok(buf)]),
+                closed: false,
+            }));
+            let transport = CaptureTransport {
+                shared: Rc::clone(&shared),
+            };
+
+            let mut config = Config::builder("alice", "p4ss")
+                .security_protocol(SecurityProtocol::SSL)
+                .build();
+            config.client_random = Some([0x42; 32]);
+
+            let client = WebClient::new(transport).with_external_tls(true);
+            let err = client.connect(config).await.unwrap_err();
+            // We got past the security upgrade: the driver issued
+            // X.224 CR, then advanced through the upgrade, then sent
+            // the MCS Connect Initial. So `sent` should now contain
+            // *two* frames before the recv EOF stalled the loop.
+            let sent_count = shared.borrow().sent.len();
+            assert!(
+                sent_count >= 2,
+                "expected at least 2 sends past the upgrade, got {sent_count} (err={err:?})"
+            );
+            // And the failure must be the EOF, not TlsRequired.
+            match err {
+                DriverError::Transport(t) => {
+                    assert_eq!(t.kind(), TransportErrorKind::ConnectionClosed);
+                }
+                other => panic!("expected Transport(ConnectionClosed), got {other:?}"),
+            }
+        });
+    }
+
+    /// `with_external_tls(false)` (the default) preserves the S2 behaviour:
+    /// `EnhancedSecurityUpgrade` aborts with `TlsRequired` and the driver
+    /// emits no further frames.
+    #[test]
+    fn without_external_tls_keeps_tls_required_default() {
+        // This is what the `driver_reports_tls_required_when_server_selects_ssl`
+        // test already covers; this is just a structural pin so the
+        // default field value (`external_tls = false`) doesn't drift.
+        let t = MockTransport::new();
+        let client = WebClient::new(t);
+        assert!(!client.external_tls());
+        let client = client.with_external_tls(true);
+        assert!(client.external_tls());
+        let client = client.with_external_tls(false);
+        assert!(!client.external_tls());
     }
 }

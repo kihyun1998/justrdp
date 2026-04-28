@@ -48,9 +48,10 @@ use justrdp_pdu::rdp::bitmap::{
 };
 use justrdp_pdu::rdp::drawing_orders::{
     decode_dstblt, decode_lineto, decode_memblt, decode_opaque_rect, decode_patblt, decode_scrblt,
-    OpaqueRectOrder, PrimaryOrderHistory, PrimaryOrderType, ALT_SECONDARY_ORDER_HEADER_SIZE,
-    ORDER_TYPE_CHANGE, TS_BOUNDS, TS_DELTA_COORDINATES, TS_SECONDARY, TS_STANDARD,
-    TS_ZERO_BOUNDS_DELTAS, TS_ZERO_FIELD_BYTE_BIT0, TS_ZERO_FIELD_BYTE_BIT1,
+    OpaqueRectOrder, PatBltOrder, PrimaryOrderHistory, PrimaryOrderType,
+    ALT_SECONDARY_ORDER_HEADER_SIZE, ORDER_TYPE_CHANGE, TS_BOUNDS, TS_DELTA_COORDINATES,
+    TS_SECONDARY, TS_STANDARD, TS_ZERO_BOUNDS_DELTAS, TS_ZERO_FIELD_BYTE_BIT0,
+    TS_ZERO_FIELD_BYTE_BIT1,
 };
 use justrdp_pdu::rdp::fast_path::FastPathUpdateType;
 use justrdp_pdu::rdp::surface_commands::{BitmapDataEx, SurfaceCommand, SURFACECMD_FRAMEACTION_END};
@@ -609,8 +610,9 @@ impl BitmapRenderer {
                 Ok(false)
             }
             PrimaryOrderType::PatBlt => {
-                let _ = decode_patblt(cursor, field_flags, delta, &mut self.primary_history)?;
-                Ok(false)
+                let order =
+                    decode_patblt(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(try_render_patblt(&order, sink))
             }
             PrimaryOrderType::ScrBlt => {
                 let _ = decode_scrblt(cursor, field_flags, delta, &mut self.primary_history)?;
@@ -1262,6 +1264,44 @@ fn primary_field_flags_byte_count(order_type: PrimaryOrderType) -> usize {
         | PrimaryOrderType::EllipseCb => 2,
         PrimaryOrderType::Mem3Blt | PrimaryOrderType::GlyphIndex => 3,
     }
+}
+
+/// PatBlt brush styles (MS-RDPEGDI 2.2.2.2.1.1.1.8).
+const BS_SOLID: u8 = 0x00;
+
+/// PatBlt raster operation: PATCOPY (MS-RDPEGDI 2.2.2.2.1.1.1.7).
+const ROP3_PATCOPY: u8 = 0xF0;
+
+/// Render the renderable subset of PatBlt: `BS_SOLID` brush + `PATCOPY`
+/// ROP, which fills a rectangle with the foreground color. Returns
+/// `true` if a blit was issued, `false` for everything else (the
+/// embedder loses these draws — most are textured fills that need a
+/// brush cache; a follow-up commit can add `BS_PATTERN` support once
+/// the Secondary `CacheBrush` order is decoded).
+fn try_render_patblt<S: FrameSink>(order: &PatBltOrder, sink: &mut S) -> bool {
+    if order.brush_style != BS_SOLID || order.rop != ROP3_PATCOPY {
+        return false;
+    }
+    let w = order.width.max(0) as u16;
+    let h = order.height.max(0) as u16;
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let r = order.fore_color[0];
+    let g = order.fore_color[1];
+    let b = order.fore_color[2];
+    let pixels: Vec<u8> = core::iter::repeat([r, g, b, 0xFF])
+        .take((w as usize) * (h as usize))
+        .flatten()
+        .collect();
+    sink.blit_rgba(
+        order.left.max(0) as u16,
+        order.top.max(0) as u16,
+        w,
+        h,
+        &pixels,
+    );
+    true
 }
 
 /// Render an OpaqueRect order: a rectangle filled with one solid color.
@@ -2560,6 +2600,65 @@ mod tests {
         let drew = renderer.render(&event, &mut sink).unwrap();
         assert!(!drew);
         assert!(sink.blits.is_empty());
+    }
+
+    /// PatBlt with BS_SOLID brush + PATCOPY ROP renders a solid-color
+    /// rectangle from the foreground color — the most common shape
+    /// Windows uses for window-frame fills. Build the wire form via
+    /// PrimaryOrder::encode so the field-flags byte width matches what
+    /// real servers emit.
+    #[test]
+    fn orders_patblt_solid_patcopy_renders_filled_rect() {
+        use justrdp_core::Encode;
+        use justrdp_pdu::rdp::drawing_orders::PrimaryOrder;
+        // PatBlt has 12 fields; we set them all (field_flags = 0x0FFF).
+        // Body: left/top/width/height (i16 LE × 4) + rop (u8) +
+        // back_color (3) + fore_color (3) + brush_org_x (i8) +
+        // brush_org_y (i8) + brush_style (u8) + brush_hatch (u8) +
+        // brush_extra (7 bytes).
+        let mut body = Vec::with_capacity(2 * 4 + 1 + 3 + 3 + 1 + 1 + 1 + 1 + 7);
+        body.extend_from_slice(&20i16.to_le_bytes());   // left
+        body.extend_from_slice(&30i16.to_le_bytes());   // top
+        body.extend_from_slice(&5i16.to_le_bytes());    // width
+        body.extend_from_slice(&3i16.to_le_bytes());    // height
+        body.push(0xF0);                                 // rop = PATCOPY
+        body.extend_from_slice(&[0x00, 0x00, 0x00]);    // back_color (unused with PATCOPY)
+        body.extend_from_slice(&[0xAB, 0xCD, 0xEF]);    // fore_color RGB
+        body.push(0);                                   // brush_org_x
+        body.push(0);                                   // brush_org_y
+        body.push(0x00);                                // brush_style = BS_SOLID
+        body.push(0);                                   // brush_hatch
+        body.extend_from_slice(&[0; 7]);                // brush_extra
+        let order = PrimaryOrder {
+            order_type: PrimaryOrderType::PatBlt,
+            field_flags: 0x0FFF,
+            bounds: None,
+            data: body,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        let mut order_bytes = vec![0u8; order.size()];
+        let written = {
+            let mut cursor = WriteCursor::new(&mut order_bytes);
+            order.encode(&mut cursor).unwrap();
+            cursor.pos()
+        };
+        order_bytes.truncate(written);
+        frame.extend_from_slice(&order_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::Orders,
+            data: frame,
+        };
+        let mut renderer = BitmapRenderer::new();
+        let mut sink = Capture::new();
+        let drew = renderer.render(&event, &mut sink).unwrap();
+        assert!(drew, "PatBlt BS_SOLID + PATCOPY should produce a blit");
+        assert_eq!(sink.blits.len(), 1);
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!((*x, *y, *w, *h), (20, 30, 5, 3));
+        for px in pixels.chunks_exact(4) {
+            assert_eq!(px, &[0xAB, 0xCD, 0xEF, 0xFF]);
+        }
     }
 
     #[test]

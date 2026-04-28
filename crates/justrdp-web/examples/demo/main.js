@@ -26,6 +26,7 @@ async function connect() {
   try {
     client = new JsClient();
     client.attachCanvas($('screen'));
+    client.setExternalTls($('extTls').checked);
     const summary = await client.connect(
       $('url').value,
       $('user').value,
