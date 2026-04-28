@@ -706,6 +706,307 @@ pub fn decode_lineto(
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Polyline / Polygon decoders (MS-RDPEGDI 2.2.2.2.1.1.2.18 / .19 / .20)
+// ════════════════════════════════════════════════════════════════════
+
+/// One vertex delta in a Polyline / Polygon `CodedDeltaList` —
+/// post-decode, absolute coordinates relative to the start point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaPoint {
+    pub dx: i16,
+    pub dy: i16,
+}
+
+/// Polyline order — MS-RDPEGDI 2.2.2.2.1.1.2.18 (7 fields).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PolylineOrder {
+    pub x_start: i16,
+    pub y_start: i16,
+    pub rop2: u8,
+    pub brush_cache_entry: u16,
+    pub pen_color: [u8; 3],
+    pub deltas: alloc::vec::Vec<DeltaPoint>,
+}
+
+/// Polygon SC order — MS-RDPEGDI 2.2.2.2.1.1.2.19 (7 fields).
+/// Solid-color filled polygon (no brush pattern).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PolygonScOrder {
+    pub x_start: i16,
+    pub y_start: i16,
+    pub rop2: u8,
+    pub fill_mode: u8,
+    pub brush_color: [u8; 3],
+    pub deltas: alloc::vec::Vec<DeltaPoint>,
+}
+
+/// Polygon CB order — MS-RDPEGDI 2.2.2.2.1.1.2.20 (13 fields).
+/// Brush-pattern filled polygon (CacheBrush index in `brush_hatch`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PolygonCbOrder {
+    pub x_start: i16,
+    pub y_start: i16,
+    pub rop2: u8,
+    pub fill_mode: u8,
+    pub brush_color: [u8; 3],
+    pub back_color: [u8; 3],
+    pub brush_org_x: i8,
+    pub brush_org_y: i8,
+    pub brush_style: u8,
+    pub brush_hatch: u8,
+    pub brush_extra: [u8; 7],
+    pub deltas: alloc::vec::Vec<DeltaPoint>,
+}
+
+/// `TWO_BYTE_SIGNED_ENCODING` (MS-RDPEGDI 2.2.2.2.1.1.1.4).
+fn read_signed_delta<'de>(src: &mut ReadCursor<'de>) -> DecodeResult<i16> {
+    let head = src.read_u8("TwoByteSigned::head")?;
+    let neg = head & 0x80 != 0;
+    let long = head & 0x40 != 0;
+    let mag = if long {
+        let next = src.read_u8("TwoByteSigned::next")?;
+        (((head & 0x3F) as u16) << 8) | next as u16
+    } else {
+        (head & 0x3F) as u16
+    };
+    let value = mag as i16;
+    Ok(if neg { -value } else { value })
+}
+
+/// Decode a `CodedDeltaList`: `cbData (u16 LE) + n_entries × (dx, dy)`
+/// signed pairs. The list is consumed from `src` and the resulting
+/// `Vec<DeltaPoint>` matches `n_entries`.
+pub fn decode_coded_delta_list(
+    src: &mut ReadCursor<'_>,
+    n_entries: usize,
+) -> DecodeResult<alloc::vec::Vec<DeltaPoint>> {
+    let cb = src.read_u16_le("CodedDeltaList::cbData")? as usize;
+    let bytes = src.read_slice(cb, "CodedDeltaList::data")?;
+    let mut sub = ReadCursor::new(bytes);
+    let mut deltas = alloc::vec::Vec::with_capacity(n_entries);
+    for _ in 0..n_entries {
+        let dx = read_signed_delta(&mut sub)?;
+        let dy = read_signed_delta(&mut sub)?;
+        deltas.push(DeltaPoint { dx, dy });
+    }
+    Ok(deltas)
+}
+
+/// Decode a `Polyline` order body (7 fields).
+pub fn decode_polyline(
+    src: &mut ReadCursor<'_>,
+    field_flags: u32,
+    delta: bool,
+    history: &mut PrimaryOrderHistory,
+) -> DecodeResult<PolylineOrder> {
+    let f = history.fields_mut(PrimaryOrderType::Polyline);
+    if field_flags & 0x01 != 0 {
+        f[0] = decode_coord_field(src, delta, f[0] as i16)? as i32;
+    }
+    if field_flags & 0x02 != 0 {
+        f[1] = decode_coord_field(src, delta, f[1] as i16)? as i32;
+    }
+    if field_flags & 0x04 != 0 {
+        f[2] = src.read_u8("Polyline::bRop2")? as i32;
+    }
+    if field_flags & 0x08 != 0 {
+        f[3] = src.read_u16_le("Polyline::brushCacheEntry")? as i32;
+    }
+    let mut pen_color = [0u8; 3];
+    if field_flags & 0x10 != 0 {
+        pen_color[0] = src.read_u8("Polyline::penColor[0]")?;
+        pen_color[1] = src.read_u8("Polyline::penColor[1]")?;
+        pen_color[2] = src.read_u8("Polyline::penColor[2]")?;
+        f[4] = ((pen_color[0] as i32) << 16)
+            | ((pen_color[1] as i32) << 8)
+            | (pen_color[2] as i32);
+    } else {
+        let stored = f[4];
+        pen_color = [
+            (stored >> 16) as u8,
+            (stored >> 8) as u8,
+            stored as u8,
+        ];
+    }
+    let n_entries = if field_flags & 0x20 != 0 {
+        let n = src.read_u8("Polyline::numDeltaEntries")? as i32;
+        f[5] = n;
+        n as usize
+    } else {
+        f[5] as usize
+    };
+    let deltas = if field_flags & 0x40 != 0 {
+        decode_coded_delta_list(src, n_entries)?
+    } else {
+        alloc::vec::Vec::new()
+    };
+    Ok(PolylineOrder {
+        x_start: f[0] as i16,
+        y_start: f[1] as i16,
+        rop2: f[2] as u8,
+        brush_cache_entry: f[3] as u16,
+        pen_color,
+        deltas,
+    })
+}
+
+/// Decode a `PolygonSC` order body (7 fields).
+pub fn decode_polygon_sc(
+    src: &mut ReadCursor<'_>,
+    field_flags: u32,
+    delta: bool,
+    history: &mut PrimaryOrderHistory,
+) -> DecodeResult<PolygonScOrder> {
+    let f = history.fields_mut(PrimaryOrderType::PolygonSc);
+    if field_flags & 0x01 != 0 {
+        f[0] = decode_coord_field(src, delta, f[0] as i16)? as i32;
+    }
+    if field_flags & 0x02 != 0 {
+        f[1] = decode_coord_field(src, delta, f[1] as i16)? as i32;
+    }
+    if field_flags & 0x04 != 0 {
+        f[2] = src.read_u8("PolygonSc::bRop2")? as i32;
+    }
+    if field_flags & 0x08 != 0 {
+        f[3] = src.read_u8("PolygonSc::fillMode")? as i32;
+    }
+    let mut brush_color = [0u8; 3];
+    if field_flags & 0x10 != 0 {
+        brush_color[0] = src.read_u8("PolygonSc::brushColor[0]")?;
+        brush_color[1] = src.read_u8("PolygonSc::brushColor[1]")?;
+        brush_color[2] = src.read_u8("PolygonSc::brushColor[2]")?;
+        f[4] = ((brush_color[0] as i32) << 16)
+            | ((brush_color[1] as i32) << 8)
+            | (brush_color[2] as i32);
+    } else {
+        let stored = f[4];
+        brush_color = [
+            (stored >> 16) as u8,
+            (stored >> 8) as u8,
+            stored as u8,
+        ];
+    }
+    let n_entries = if field_flags & 0x20 != 0 {
+        let n = src.read_u8("PolygonSc::numDeltaEntries")? as i32;
+        f[5] = n;
+        n as usize
+    } else {
+        f[5] as usize
+    };
+    let deltas = if field_flags & 0x40 != 0 {
+        decode_coded_delta_list(src, n_entries)?
+    } else {
+        alloc::vec::Vec::new()
+    };
+    Ok(PolygonScOrder {
+        x_start: f[0] as i16,
+        y_start: f[1] as i16,
+        rop2: f[2] as u8,
+        fill_mode: f[3] as u8,
+        brush_color,
+        deltas,
+    })
+}
+
+/// Decode a `PolygonCB` order body (13 fields).
+pub fn decode_polygon_cb(
+    src: &mut ReadCursor<'_>,
+    field_flags: u32,
+    delta: bool,
+    history: &mut PrimaryOrderHistory,
+) -> DecodeResult<PolygonCbOrder> {
+    let f = history.fields_mut(PrimaryOrderType::PolygonCb);
+    if field_flags & 0x0001 != 0 {
+        f[0] = decode_coord_field(src, delta, f[0] as i16)? as i32;
+    }
+    if field_flags & 0x0002 != 0 {
+        f[1] = decode_coord_field(src, delta, f[1] as i16)? as i32;
+    }
+    if field_flags & 0x0004 != 0 {
+        f[2] = src.read_u8("PolygonCb::bRop2")? as i32;
+    }
+    if field_flags & 0x0008 != 0 {
+        f[3] = src.read_u8("PolygonCb::fillMode")? as i32;
+    }
+    let mut brush_color = [0u8; 3];
+    if field_flags & 0x0010 != 0 {
+        brush_color[0] = src.read_u8("PolygonCb::brushColor[0]")?;
+        brush_color[1] = src.read_u8("PolygonCb::brushColor[1]")?;
+        brush_color[2] = src.read_u8("PolygonCb::brushColor[2]")?;
+        f[4] = ((brush_color[0] as i32) << 16)
+            | ((brush_color[1] as i32) << 8)
+            | (brush_color[2] as i32);
+    } else {
+        let stored = f[4];
+        brush_color = [
+            (stored >> 16) as u8,
+            (stored >> 8) as u8,
+            stored as u8,
+        ];
+    }
+    let mut back_color = [0u8; 3];
+    if field_flags & 0x0020 != 0 {
+        back_color[0] = src.read_u8("PolygonCb::backColor[0]")?;
+        back_color[1] = src.read_u8("PolygonCb::backColor[1]")?;
+        back_color[2] = src.read_u8("PolygonCb::backColor[2]")?;
+        f[5] = ((back_color[0] as i32) << 16)
+            | ((back_color[1] as i32) << 8)
+            | (back_color[2] as i32);
+    } else {
+        let stored = f[5];
+        back_color = [
+            (stored >> 16) as u8,
+            (stored >> 8) as u8,
+            stored as u8,
+        ];
+    }
+    if field_flags & 0x0040 != 0 {
+        f[6] = src.read_u8("PolygonCb::brushOrgX")? as i8 as i32;
+    }
+    if field_flags & 0x0080 != 0 {
+        f[7] = src.read_u8("PolygonCb::brushOrgY")? as i8 as i32;
+    }
+    if field_flags & 0x0100 != 0 {
+        f[8] = src.read_u8("PolygonCb::brushStyle")? as i32;
+    }
+    if field_flags & 0x0200 != 0 {
+        f[9] = src.read_u8("PolygonCb::brushHatch")? as i32;
+    }
+    let mut brush_extra = [0u8; 7];
+    if field_flags & 0x0400 != 0 {
+        for i in 0..7 {
+            brush_extra[i] = src.read_u8("PolygonCb::brushExtra")?;
+        }
+    }
+    let n_entries = if field_flags & 0x0800 != 0 {
+        let n = src.read_u8("PolygonCb::numDeltaEntries")? as i32;
+        f[10] = n;
+        n as usize
+    } else {
+        f[10] as usize
+    };
+    let deltas = if field_flags & 0x1000 != 0 {
+        decode_coded_delta_list(src, n_entries)?
+    } else {
+        alloc::vec::Vec::new()
+    };
+    Ok(PolygonCbOrder {
+        x_start: f[0] as i16,
+        y_start: f[1] as i16,
+        rop2: f[2] as u8,
+        fill_mode: f[3] as u8,
+        brush_color,
+        back_color,
+        brush_org_x: f[6] as i8,
+        brush_org_y: f[7] as i8,
+        brush_style: f[8] as u8,
+        brush_hatch: f[9] as u8,
+        brush_extra,
+        deltas,
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Secondary Drawing Orders (Cache Orders)
 // ════════════════════════════════════════════════════════════════════
 

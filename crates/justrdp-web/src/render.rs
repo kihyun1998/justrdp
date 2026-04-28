@@ -48,11 +48,13 @@ use justrdp_pdu::rdp::bitmap::{
     TsBitmapData, TsUpdateBitmapData, BITMAP_COMPRESSION,
 };
 use justrdp_pdu::rdp::drawing_orders::{
-    decode_dstblt, decode_lineto, decode_memblt, decode_opaque_rect, decode_patblt, decode_scrblt,
-    DstBltOrder, LineToOrder, MemBltOrder, OpaqueRectOrder, PatBltOrder, PrimaryOrderHistory,
-    PrimaryOrderType, SecondaryOrderType, ALT_SECONDARY_ORDER_HEADER_SIZE, ORDER_TYPE_CHANGE,
-    TS_BOUNDS, TS_DELTA_COORDINATES, TS_SECONDARY, TS_STANDARD, TS_ZERO_BOUNDS_DELTAS,
-    TS_ZERO_FIELD_BYTE_BIT0, TS_ZERO_FIELD_BYTE_BIT1,
+    decode_dstblt, decode_lineto, decode_memblt, decode_opaque_rect, decode_patblt,
+    decode_polygon_cb, decode_polygon_sc, decode_polyline, decode_scrblt, DstBltOrder,
+    LineToOrder, MemBltOrder, OpaqueRectOrder, PatBltOrder, PolygonCbOrder, PolygonScOrder,
+    PolylineOrder, PrimaryOrderHistory, PrimaryOrderType, SecondaryOrderType,
+    ALT_SECONDARY_ORDER_HEADER_SIZE, ORDER_TYPE_CHANGE, TS_BOUNDS, TS_DELTA_COORDINATES,
+    TS_SECONDARY, TS_STANDARD, TS_ZERO_BOUNDS_DELTAS, TS_ZERO_FIELD_BYTE_BIT0,
+    TS_ZERO_FIELD_BYTE_BIT1,
 };
 use justrdp_pdu::rdp::fast_path::FastPathUpdateType;
 use justrdp_pdu::rdp::surface_commands::{BitmapDataEx, SurfaceCommand, SURFACECMD_FRAMEACTION_END};
@@ -733,10 +735,14 @@ impl BitmapRenderer {
             }
             PrimaryOrderType::GlyphIndex => self.try_render_glyph_index(cursor, field_flags, sink),
             PrimaryOrderType::PolygonSc => {
-                self.try_render_polygon(cursor, field_flags, sink, false)
+                let order =
+                    decode_polygon_sc(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(try_render_polygon_sc(&order, sink))
             }
             PrimaryOrderType::PolygonCb => {
-                self.try_render_polygon(cursor, field_flags, sink, true)
+                let order =
+                    decode_polygon_cb(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(try_render_polygon_cb(&order, &self.brush_cache, sink))
             }
             PrimaryOrderType::ScrBlt => {
                 let _ = decode_scrblt(cursor, field_flags, delta, &mut self.primary_history)?;
@@ -752,7 +758,11 @@ impl BitmapRenderer {
                     decode_lineto(cursor, field_flags, delta, &mut self.primary_history)?;
                 Ok(try_render_lineto(&order, sink))
             }
-            PrimaryOrderType::Polyline => self.try_render_polyline(cursor, field_flags, sink),
+            PrimaryOrderType::Polyline => {
+                let order =
+                    decode_polyline(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(try_render_polyline(&order, sink))
+            }
             other => Err(RenderError::UnsupportedPrimaryOrder { order_type: other }),
         }
     }
@@ -915,224 +925,6 @@ impl BitmapRenderer {
         Ok(any_blits)
     }
 
-    /// PolygonSC / PolygonCB body decoder + scan-line fill.
-    ///
-    /// Field layout (7 fields for SC, 13 for CB):
-    ///   1. xStart (coord)
-    ///   2. yStart (coord)
-    ///   3. bRop2 (u8) — ignored
-    ///   4. fillMode (u8) — ALTERNATE = 1, WINDING = 2; treated identically
-    ///   5. brushColor (3 bytes BGR) — fill color
-    ///   6. nDeltaEntries (u8)
-    ///   7. CodedDeltaList (cbData u16 + per-vertex (dx, dy) signed pairs)
-    ///
-    /// CB (Polygon with brush) has 6 additional fields between (5) and
-    /// (6): backColor + brush_org + brush_style + brush_hatch + brush_extra.
-    /// We don't render the brush yet — fall back to a solid `brushColor`
-    /// fill so the silhouette is correct even if the textured pattern
-    /// is missing.
-    fn try_render_polygon<S: FrameSink>(
-        &mut self,
-        cursor: &mut ReadCursor<'_>,
-        field_flags: u32,
-        sink: &mut S,
-        is_cb: bool,
-    ) -> Result<bool, RenderError> {
-        // SC and CB share the first five fields; CB inserts 6 brush
-        // fields before nDeltaEntries / CodedDeltaList.
-        let mut bit = 0u32;
-        let mut next_flag = || {
-            let m = 1u32 << bit;
-            bit += 1;
-            m
-        };
-        let (xs_flag, ys_flag, _rop2_flag, fill_flag, brush_color_flag) = (
-            next_flag(),
-            next_flag(),
-            next_flag(),
-            next_flag(),
-            next_flag(),
-        );
-        let (back_color_flag, brush_org_x_flag, brush_org_y_flag, brush_style_flag, brush_hatch_flag, brush_extra_flag);
-        if is_cb {
-            back_color_flag = next_flag();
-            brush_org_x_flag = next_flag();
-            brush_org_y_flag = next_flag();
-            brush_style_flag = next_flag();
-            brush_hatch_flag = next_flag();
-            brush_extra_flag = next_flag();
-        } else {
-            back_color_flag = 0;
-            brush_org_x_flag = 0;
-            brush_org_y_flag = 0;
-            brush_style_flag = 0;
-            brush_hatch_flag = 0;
-            brush_extra_flag = 0;
-        }
-        let n_entries_flag = next_flag();
-        let coded_list_flag = next_flag();
-
-        let xs = if field_flags & xs_flag != 0 {
-            decode_coord_field_inline(cursor, false)?
-        } else {
-            0
-        };
-        let ys = if field_flags & ys_flag != 0 {
-            decode_coord_field_inline(cursor, false)?
-        } else {
-            0
-        };
-        if field_flags & _rop2_flag != 0 {
-            cursor.read_u8("Polygon::bRop2")?;
-        }
-        if field_flags & fill_flag != 0 {
-            cursor.read_u8("Polygon::fillMode")?;
-        }
-        let mut brush_color = [0u8; 3];
-        if field_flags & brush_color_flag != 0 {
-            brush_color[0] = cursor.read_u8("Polygon::brushColor[0]")?;
-            brush_color[1] = cursor.read_u8("Polygon::brushColor[1]")?;
-            brush_color[2] = cursor.read_u8("Polygon::brushColor[2]")?;
-        }
-        if is_cb {
-            // 3 bytes back_color, 1 byte org_x, 1 byte org_y, 1 byte
-            // brush_style, 1 byte brush_hatch, 7 bytes brush_extra —
-            // each gated by its own flag. We don't render the brush;
-            // just consume the bytes.
-            if field_flags & back_color_flag != 0 {
-                cursor.read_u8("Polygon::backColor[0]")?;
-                cursor.read_u8("Polygon::backColor[1]")?;
-                cursor.read_u8("Polygon::backColor[2]")?;
-            }
-            if field_flags & brush_org_x_flag != 0 {
-                cursor.read_u8("Polygon::brushOrgX")?;
-            }
-            if field_flags & brush_org_y_flag != 0 {
-                cursor.read_u8("Polygon::brushOrgY")?;
-            }
-            if field_flags & brush_style_flag != 0 {
-                cursor.read_u8("Polygon::brushStyle")?;
-            }
-            if field_flags & brush_hatch_flag != 0 {
-                cursor.read_u8("Polygon::brushHatch")?;
-            }
-            if field_flags & brush_extra_flag != 0 {
-                for _ in 0..7 {
-                    cursor.read_u8("Polygon::brushExtra")?;
-                }
-            }
-        }
-        let n_entries = if field_flags & n_entries_flag != 0 {
-            cursor.read_u8("Polygon::nDeltaEntries")? as usize
-        } else {
-            0
-        };
-
-        // Walk the deltas to recover absolute vertex positions.
-        let mut verts: Vec<(i32, i32)> = Vec::with_capacity(n_entries + 1);
-        verts.push((xs as i32, ys as i32));
-        if field_flags & coded_list_flag != 0 {
-            let cb = cursor.read_u16_le("Polygon::cbData")? as usize;
-            let bytes = cursor.read_slice(cb, "Polygon::codedDelta")?;
-            let mut bcur = bytes;
-            let mut x = xs as i32;
-            let mut y = ys as i32;
-            for _ in 0..n_entries {
-                let (dx, rest) = read_two_byte_signed(bcur)?;
-                let (dy, rest) = read_two_byte_signed(rest)?;
-                bcur = rest;
-                x += dx as i32;
-                y += dy as i32;
-                verts.push((x, y));
-            }
-        }
-
-        if verts.len() < 3 {
-            return Ok(false);
-        }
-        let fill_color_rgba = [brush_color[2], brush_color[1], brush_color[0], 0xFF];
-        scanline_fill_polygon(&verts, &fill_color_rgba, sink);
-        Ok(true)
-    }
-
-    /// Polyline body decoder + render (MS-RDPEGDI 2.2.2.2.1.1.2.18).
-    ///
-    /// Field layout (7 fields):
-    ///   1. xStart (i16, coord field — supports `delta` flag)
-    ///   2. yStart (i16, coord field)
-    ///   3. bRop2 (u8) — ignored (treat as R2_COPYPEN)
-    ///   4. BrushCacheEntry (u16) — ignored (no brush for line)
-    ///   5. PenColor (3 bytes BGR)
-    ///   6. NumDeltaEntries (u8)
-    ///   7. CodedDeltaList (variable) — `len(u16)` + per-point deltas
-    ///
-    /// Each delta point is encoded with `TWO_BYTE_SIGNED_ENCODING` for
-    /// dx then dy. We don't currently honor the per-entry zero-bit
-    /// optimization (rare in modern traffic) — every point reads two
-    /// signed deltas.
-    ///
-    /// Bresenham line per segment, 1-pixel wide, in pen color.
-    fn try_render_polyline<S: FrameSink>(
-        &mut self,
-        cursor: &mut ReadCursor<'_>,
-        field_flags: u32,
-        sink: &mut S,
-    ) -> Result<bool, RenderError> {
-        // We can't reuse the typed history fields without a public
-        // decode_polyline helper, but we can read the seven fields
-        // ourselves. PrimaryOrderHistory still tracks last_order_type
-        // and bounds; we don't currently feed coord deltas back into
-        // the per-type field array because nothing else reads them.
-        let mut x = if field_flags & 0x01 != 0 {
-            decode_coord_field_inline(cursor, false)?
-        } else {
-            0
-        };
-        let mut y = if field_flags & 0x02 != 0 {
-            decode_coord_field_inline(cursor, false)?
-        } else {
-            0
-        };
-        let _rop2 = if field_flags & 0x04 != 0 {
-            cursor.read_u8("Polyline::bRop2")?
-        } else {
-            0
-        };
-        let _brush_cache = if field_flags & 0x08 != 0 {
-            cursor.read_u16_le("Polyline::brushCacheEntry")?
-        } else {
-            0
-        };
-        let mut pen_color = [0u8; 3];
-        if field_flags & 0x10 != 0 {
-            pen_color[0] = cursor.read_u8("Polyline::penColor[0]")?;
-            pen_color[1] = cursor.read_u8("Polyline::penColor[1]")?;
-            pen_color[2] = cursor.read_u8("Polyline::penColor[2]")?;
-        }
-        let num_entries = if field_flags & 0x20 != 0 {
-            cursor.read_u8("Polyline::numDeltaEntries")? as usize
-        } else {
-            0
-        };
-        if field_flags & 0x40 != 0 {
-            // CodedDeltaList: leading u16 LE byte count.
-            let cb = cursor.read_u16_le("Polyline::cbData")? as usize;
-            let bytes = cursor.read_slice(cb, "Polyline::codedDelta")?;
-            let mut bcur = bytes;
-            let pen_color_rgba = [pen_color[2], pen_color[1], pen_color[0], 0xFF];
-            for _ in 0..num_entries {
-                let (dx, rest) = read_two_byte_signed(bcur)?;
-                let (dy, rest) = read_two_byte_signed(rest)?;
-                bcur = rest;
-                let nx = (x as i32) + (dx as i32);
-                let ny = (y as i32) + (dy as i32);
-                draw_bresenham_segment(x as i32, y as i32, nx, ny, &pen_color_rgba, sink);
-                x = nx as i16;
-                y = ny as i16;
-            }
-        }
-        Ok(true)
-    }
 
     /// Walk a `FASTPATH_UPDATETYPE_SURFCMDS` payload, dispatching each
     /// command (MS-RDPBCGR 2.2.9.1.2.1.10):
@@ -2432,57 +2224,6 @@ fn scanline_fill_polygon<S: FrameSink>(
     }
 }
 
-/// `TWO_BYTE_SIGNED_ENCODING` (MS-RDPEGDI 2.2.2.2.1.1.1.4):
-///   byte0.bit7  = sign (1 → negative)
-///   byte0.bit6  = "long" flag (1 → 14-bit value across 2 bytes)
-///   long form:  magnitude = ((byte0 & 0x3F) << 8) | byte1
-///   short form: magnitude = byte0 & 0x3F
-fn read_two_byte_signed(data: &[u8]) -> Result<(i16, &[u8]), RenderError> {
-    if data.is_empty() {
-        return Err(RenderError::SizeMismatch(
-            "TWO_BYTE_SIGNED truncated".into(),
-        ));
-    }
-    let head = data[0];
-    let neg = head & 0x80 != 0;
-    let long = head & 0x40 != 0;
-    let (mag, rest) = if long {
-        if data.len() < 2 {
-            return Err(RenderError::SizeMismatch(
-                "TWO_BYTE_SIGNED long form truncated".into(),
-            ));
-        }
-        ((((head & 0x3F) as u16) << 8) | data[1] as u16, &data[2..])
-    } else {
-        ((head & 0x3F) as u16, &data[1..])
-    };
-    let value = mag as i16;
-    Ok((if neg { -value } else { value }, rest))
-}
-
-/// Decode a single coordinate field inline. Pen polylines don't use
-/// the typed `decode_coord_field` helper because PrimaryOrderHistory's
-/// per-type field array doesn't include Polyline. Falls back to the
-/// MS-RDPEGDI 2.2.2.2.1.1.1.4 signed encoding for delta mode and
-/// plain i16 LE for absolute mode.
-fn decode_coord_field_inline(cursor: &mut ReadCursor<'_>, delta: bool) -> Result<i16, RenderError> {
-    if delta {
-        // Read raw bytes through the cursor to feed the signed encoder.
-        let head = cursor.read_u8("coord::head")?;
-        let long = head & 0x40 != 0;
-        let neg = head & 0x80 != 0;
-        let mag = if long {
-            let next = cursor.read_u8("coord::next")?;
-            (((head & 0x3F) as u16) << 8) | next as u16
-        } else {
-            (head & 0x3F) as u16
-        };
-        let value = mag as i16;
-        Ok(if neg { -value } else { value })
-    } else {
-        Ok(cursor.read_u16_le("coord::abs")? as i16)
-    }
-}
 
 /// Bresenham line raster between two points; one tiny `blit_rgba` per
 /// pixel so the implementation stays trivially correct against any
@@ -2635,6 +2376,85 @@ const ROP3_PATCOPY: u8 = 0xF0;
 /// DstBlt ROPs we can render without reading the destination back.
 const ROP3_BLACKNESS: u8 = 0x00;
 const ROP3_WHITENESS: u8 = 0xFF;
+
+/// Render a Polyline order via Bresenham segments in pen color.
+fn try_render_polyline<S: FrameSink>(order: &PolylineOrder, sink: &mut S) -> bool {
+    let pen_color_rgba = [
+        order.pen_color[2],
+        order.pen_color[1],
+        order.pen_color[0],
+        0xFF,
+    ];
+    let mut x = order.x_start as i32;
+    let mut y = order.y_start as i32;
+    for d in &order.deltas {
+        let nx = x + d.dx as i32;
+        let ny = y + d.dy as i32;
+        draw_bresenham_segment(x, y, nx, ny, &pen_color_rgba, sink);
+        x = nx;
+        y = ny;
+    }
+    true
+}
+
+/// PolygonSC: solid-color scan-line fill.
+fn try_render_polygon_sc<S: FrameSink>(order: &PolygonScOrder, sink: &mut S) -> bool {
+    if order.deltas.is_empty() {
+        return false;
+    }
+    let mut verts: Vec<(i32, i32)> = Vec::with_capacity(order.deltas.len() + 1);
+    verts.push((order.x_start as i32, order.y_start as i32));
+    let mut x = order.x_start as i32;
+    let mut y = order.y_start as i32;
+    for d in &order.deltas {
+        x += d.dx as i32;
+        y += d.dy as i32;
+        verts.push((x, y));
+    }
+    if verts.len() < 3 {
+        return false;
+    }
+    let fill_color_rgba = [
+        order.brush_color[2],
+        order.brush_color[1],
+        order.brush_color[0],
+        0xFF,
+    ];
+    scanline_fill_polygon(&verts, &fill_color_rgba, sink);
+    true
+}
+
+/// PolygonCB: scan-line fill, currently solid `brush_color` only —
+/// the textured-pattern path lands in S3d-6g2-pattern.
+fn try_render_polygon_cb<S: FrameSink>(
+    order: &PolygonCbOrder,
+    _renderer_brush_cache: &BTreeMap<u8, [u8; 8]>,
+    sink: &mut S,
+) -> bool {
+    if order.deltas.is_empty() {
+        return false;
+    }
+    let mut verts: Vec<(i32, i32)> = Vec::with_capacity(order.deltas.len() + 1);
+    verts.push((order.x_start as i32, order.y_start as i32));
+    let mut x = order.x_start as i32;
+    let mut y = order.y_start as i32;
+    for d in &order.deltas {
+        x += d.dx as i32;
+        y += d.dy as i32;
+        verts.push((x, y));
+    }
+    if verts.len() < 3 {
+        return false;
+    }
+    let fill_color_rgba = [
+        order.brush_color[2],
+        order.brush_color[1],
+        order.brush_color[0],
+        0xFF,
+    ];
+    scanline_fill_polygon(&verts, &fill_color_rgba, sink);
+    true
+}
 
 /// `BS_HATCHED` brush style (predefined 8×8 hatch pattern selected by
 /// `brush_hatch`).
