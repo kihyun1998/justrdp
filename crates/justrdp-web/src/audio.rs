@@ -8,22 +8,41 @@
 //! drain via `take_frame`; the demo page funnels each frame into a
 //! Web Audio `AudioContext`.
 //!
-//! Format negotiation: the bundled backend accepts only **PCM** (16-bit
-//! little-endian, mono or stereo, any sample rate). Other codecs
-//! (ADPCM / Opus / AAC) need a browser-side decoder or a server-side
-//! fall-back; the trait surface is the right place for those follow-ups
-//! (see S6b in the roadmap).
+//! Format negotiation: the bundled backend accepts **PCM** (16-bit
+//! little-endian, mono or stereo, any sample rate), **MS-ADPCM**
+//! (`WaveFormatTag::ADPCM`, 0x0002), and **IMA / DVI ADPCM**
+//! (`WaveFormatTag::DVI_ADPCM`, 0x0011). The backend keeps a per-format
+//! decoder cache (`justrdp_audio::AudioDecoder`) and converts every
+//! incoming wave PDU to interleaved PCM16-LE before pushing an
+//! [`AudioFrame`], so embedders see a single uniform on-the-wire shape
+//! regardless of the negotiated codec.
+//!
+//! Compressed codecs that need a browser-side decoder (Opus, AAC,
+//! G.711) are still rejected here — they will be wired up in a
+//! separate sub-step (S6b2 in the roadmap) via an embedder-injected
+//! decoder trait.
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 use std::sync::{Arc, Mutex};
 
+use justrdp_audio::AudioDecoder;
 use justrdp_connector::ConnectionResult;
 use justrdp_rdpsnd::pdu::{AudioFormat, VolumePdu, WaveFormatTag};
-use justrdp_rdpsnd::{RdpsndBackend, RdpsndClient};
+use justrdp_rdpsnd::{make_decoder, RdpsndBackend, RdpsndClient};
 use justrdp_svc::StaticChannelSet;
+
+/// Maximum sample rate the bundled decode buffer is sized for.
+const MAX_SAMPLE_RATE_HZ: usize = 48_000;
+/// Maximum channel count we accept.
+const MAX_CHANNELS: usize = 2;
+/// Decode buffer span — one wave PDU practically never exceeds a
+/// couple of seconds of audio, even for ADPCM blocks.
+const DECODE_BUFFER_SECS: usize = 2;
+/// Sample capacity of the reusable decode buffer.
+const MAX_DECODE_SAMPLES: usize = MAX_SAMPLE_RATE_HZ * MAX_CHANNELS * DECODE_BUFFER_SECS;
 
 /// One decoded audio chunk pulled off the wire.
 #[derive(Debug, Clone)]
@@ -34,7 +53,9 @@ pub struct AudioFrame {
     pub sample_rate: u32,
     /// Channel count (1 = mono, 2 = stereo).
     pub channels: u16,
-    /// Sample width in bits (currently always 16 — only PCM 16 is wired).
+    /// Sample width in bits — always `16` post-decode. Every supported
+    /// codec (PCM16, MS-ADPCM, IMA-ADPCM) lands as interleaved
+    /// little-endian PCM16 in [`Self::data`].
     pub bits_per_sample: u16,
     /// Raw little-endian PCM bytes. Length = `channels * bytes_per_sample
     /// * num_frames`. Embedders convert to floats and feed an
@@ -81,27 +102,77 @@ impl AudioState {
 
 struct SharedBackend {
     state: Arc<Mutex<AudioState>>,
+    /// Per-format decoder cache, keyed by the dense index in the
+    /// negotiated format list (the `format_no` the server sends in
+    /// Wave / Wave2 PDUs). Built up in `on_server_formats` so we don't
+    /// re-instantiate decoders per wave PDU.
+    decoders: BTreeMap<u16, Box<dyn AudioDecoder>>,
+    /// Reusable interleaved-i16 decode buffer. Shared across formats
+    /// because only one decode is ever in flight per `on_wave_data` call.
+    decode_buf: Vec<i16>,
 }
 
 impl SharedBackend {
-    /// PCM 16-bit only — single-channel and stereo at any sample rate.
-    /// Other codecs would need a browser-side decoder or transcoder.
+    fn new(state: Arc<Mutex<AudioState>>) -> Self {
+        Self {
+            state,
+            decoders: BTreeMap::new(),
+            decode_buf: alloc::vec![0i16; MAX_DECODE_SAMPLES],
+        }
+    }
+
+    /// First-pass acceptance check — quickly reject formats whose
+    /// codec we don't have a decoder for, or whose dimensions exceed
+    /// the bundled buffer sizing. The follow-up
+    /// [`make_decoder`] call is the authoritative gate (it validates
+    /// the codec-specific `extra_data` blob, e.g. MS-ADPCM coefficient
+    /// table); this filter just avoids round-tripping obviously bad
+    /// formats through the decoder factory.
     fn accept(format: &AudioFormat) -> bool {
-        format.format_tag == WaveFormatTag::PCM
-            && format.bits_per_sample == 16
-            && (format.n_channels == 1 || format.n_channels == 2)
+        if !(format.n_channels == 1 || format.n_channels == 2) {
+            return false;
+        }
+        if format.n_samples_per_sec == 0
+            || format.n_samples_per_sec as usize > MAX_SAMPLE_RATE_HZ
+        {
+            return false;
+        }
+        match format.format_tag {
+            WaveFormatTag::PCM => format.bits_per_sample == 16,
+            // Block-based ADPCM variants — `make_decoder` validates the
+            // extra_data layout, so all we check here is non-zero
+            // block alignment.
+            WaveFormatTag::ADPCM | WaveFormatTag::DVI_ADPCM => format.n_block_align > 0,
+            // Opus / AAC / G.711 — need a browser-side or
+            // embedder-injected decoder; tracked in roadmap §11.3 S6b2.
+            _ => false,
+        }
     }
 }
 
 impl RdpsndBackend for SharedBackend {
     fn on_server_formats(&mut self, server_formats: &[AudioFormat]) -> Vec<usize> {
+        // A new format list invalidates every cached decoder.
+        self.decoders.clear();
+
         let mut accepted_idx = Vec::new();
         let mut accepted_formats = Vec::new();
         for (i, fmt) in server_formats.iter().enumerate() {
-            if Self::accept(fmt) {
-                accepted_idx.push(i);
-                accepted_formats.push(fmt.clone());
+            if !Self::accept(fmt) {
+                continue;
             }
+            // make_decoder is the authoritative codec validator — if it
+            // rejects the format (e.g. malformed MS-ADPCM extra_data),
+            // skip the format entirely instead of advertising a codec
+            // we can't actually drive.
+            let decoder = match make_decoder(fmt) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let dense_idx = accepted_formats.len() as u16;
+            accepted_idx.push(i);
+            accepted_formats.push(fmt.clone());
+            self.decoders.insert(dense_idx, decoder);
         }
         if let Ok(mut g) = self.state.lock() {
             g.accepted_formats = accepted_formats;
@@ -110,20 +181,39 @@ impl RdpsndBackend for SharedBackend {
     }
 
     fn on_wave_data(&mut self, format_no: u16, data: &[u8], _audio_timestamp: Option<u32>) {
+        let Some(decoder) = self.decoders.get_mut(&format_no) else {
+            // Stale or out-of-range format_no — drop rather than push
+            // unknown bytes downstream.
+            return;
+        };
+
+        let sample_rate = decoder.sample_rate();
+        let channels = decoder.channels();
+        let n_samples = match decoder.decode(data, &mut self.decode_buf) {
+            Ok(n) => n.min(self.decode_buf.len()),
+            Err(_) => return,
+        };
+        if n_samples == 0 {
+            return;
+        }
+
+        // Re-pack the i16 samples as little-endian PCM16 bytes — the
+        // demo's Web Audio bridge consumes that layout directly via
+        // `DataView::getInt16(_, /*littleEndian*/ true)`.
+        let mut bytes = Vec::with_capacity(n_samples * 2);
+        for &s in &self.decode_buf[..n_samples] {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+
         if let Ok(mut g) = self.state.lock() {
-            // The format_no indexes our *accepted* list; pull dimensions
-            // out of it so the embedder doesn't have to re-derive them.
-            let Some(fmt) = g.accepted_formats.get(format_no as usize).cloned() else {
-                // Stale or out-of-range format_no — drop the chunk
-                // rather than dispatching unknown bytes.
-                return;
-            };
             g.pending_frames.push_back(AudioFrame {
                 format_no,
-                sample_rate: fmt.n_samples_per_sec,
-                channels: fmt.n_channels,
-                bits_per_sample: fmt.bits_per_sample,
-                data: data.to_vec(),
+                sample_rate,
+                channels,
+                // Always 16 post-decode — every supported codec lands
+                // as PCM16 after `AudioDecoder::decode`.
+                bits_per_sample: 16,
+                data: bytes,
             });
         }
     }
@@ -184,7 +274,7 @@ impl From<justrdp_svc::SvcError> for AudioChannelError {
 impl AudioChannel {
     /// Construct from a [`ConnectionResult`]. Looks up `rdpsnd` in the
     /// negotiated channel list and instantiates the inner
-    /// [`RdpsndClient`] with the bundled PCM-only backend.
+    /// [`RdpsndClient`] with the bundled PCM/ADPCM backend.
     pub fn from_connection(result: &ConnectionResult) -> Result<Self, AudioChannelError> {
         let rdpsnd_channel_id = result
             .channel_ids
@@ -194,9 +284,7 @@ impl AudioChannel {
             .ok_or(AudioChannelError::ChannelNotNegotiated)?;
 
         let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
-        let backend = Box::new(SharedBackend {
-            state: Arc::clone(&state),
-        });
+        let backend = Box::new(SharedBackend::new(Arc::clone(&state)));
         let rdpsnd = Box::new(RdpsndClient::new(backend));
 
         let mut channels = StaticChannelSet::new();
@@ -290,6 +378,143 @@ mod tests {
         let mut ch = AudioChannel::from_connection(&result).unwrap();
         let frames = ch.process_channel_data(2000, &[0u8; 16]).unwrap();
         assert!(frames.is_empty());
+    }
+
+    /// Build a minimal MS-ADPCM `AudioFormat` (mono, 22050 Hz) using the
+    /// reference coefficient table from MS-RDPEA samples.
+    fn make_msadpcm_format() -> AudioFormat {
+        let coefs: [(i16, i16); 7] = [
+            (256, 0),
+            (512, -256),
+            (0, 0),
+            (192, 64),
+            (240, 0),
+            (460, -208),
+            (392, -232),
+        ];
+        let mut extra = vec![0u8; 32];
+        // wSamplesPerBlock = 4 — keeps the block small for tests.
+        extra[0..2].copy_from_slice(&4u16.to_le_bytes());
+        // wNumCoef = 7
+        extra[2..4].copy_from_slice(&7u16.to_le_bytes());
+        for (i, (c1, c2)) in coefs.iter().enumerate() {
+            let off = 4 + i * 4;
+            extra[off..off + 2].copy_from_slice(&c1.to_le_bytes());
+            extra[off + 2..off + 4].copy_from_slice(&c2.to_le_bytes());
+        }
+        AudioFormat {
+            format_tag: WaveFormatTag::ADPCM,
+            n_channels: 1,
+            n_samples_per_sec: 22_050,
+            n_avg_bytes_per_sec: 22_311,
+            n_block_align: 256,
+            bits_per_sample: 4,
+            extra_data: extra,
+        }
+    }
+
+    /// Minimal valid MS-ADPCM block for `make_msadpcm_format()`: mono
+    /// with `samples_per_block = 4`, so we need a 7-byte header plus
+    /// exactly one byte of nibble data (2 nibbles → 2 trailing samples).
+    fn make_msadpcm_block() -> Vec<u8> {
+        let mut block = Vec::with_capacity(8);
+        block.push(0); // bPredictor index 0
+        block.extend_from_slice(&16i16.to_le_bytes()); // iDelta
+        block.extend_from_slice(&0i16.to_le_bytes()); // iSamp1
+        block.extend_from_slice(&0i16.to_le_bytes()); // iSamp2
+        block.push(0x00); // 2 nibbles, both 0 — predictable decode
+        block
+    }
+
+    fn make_dvi_format() -> AudioFormat {
+        AudioFormat {
+            format_tag: WaveFormatTag::DVI_ADPCM,
+            n_channels: 2,
+            n_samples_per_sec: 22_050,
+            n_avg_bytes_per_sec: 22_201,
+            n_block_align: 1024,
+            bits_per_sample: 4,
+            // wSamplesPerBlock = 1017 (per MS-ADPCM IMA layout for
+            // block_align=1024, stereo).
+            extra_data: vec![0xF9, 0x03],
+        }
+    }
+
+    #[test]
+    fn shared_backend_accepts_pcm_adpcm_dvi_rejects_opus() {
+        let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
+        let mut backend = SharedBackend::new(Arc::clone(&state));
+        let server = vec![
+            AudioFormat::pcm(2, 44_100, 16),
+            make_msadpcm_format(),
+            make_dvi_format(),
+            AudioFormat {
+                format_tag: WaveFormatTag::OPUS,
+                n_channels: 2,
+                n_samples_per_sec: 48_000,
+                n_avg_bytes_per_sec: 0,
+                n_block_align: 0,
+                bits_per_sample: 0,
+                extra_data: vec![],
+            },
+        ];
+        let accepted = backend.on_server_formats(&server);
+        // PCM, MS-ADPCM, DVI-ADPCM — Opus rejected.
+        assert_eq!(accepted, vec![0, 1, 2]);
+        let g = state.lock().unwrap();
+        assert_eq!(g.accepted_formats.len(), 3);
+    }
+
+    #[test]
+    fn shared_backend_pcm_passthrough_via_decoder() {
+        let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
+        let mut backend = SharedBackend::new(Arc::clone(&state));
+        backend.on_server_formats(&[AudioFormat::pcm(1, 44_100, 16)]);
+
+        // Two PCM16 LE samples: 0x0100, 0x0200.
+        let input = [0x00, 0x01, 0x00, 0x02];
+        backend.on_wave_data(0, &input, None);
+
+        let mut g = state.lock().unwrap();
+        let frame = g.pending_frames.pop_front().expect("frame queued");
+        assert_eq!(frame.format_no, 0);
+        assert_eq!(frame.channels, 1);
+        assert_eq!(frame.sample_rate, 44_100);
+        assert_eq!(frame.bits_per_sample, 16);
+        // PCM passthrough — output bytes match the input verbatim.
+        assert_eq!(frame.data, input.to_vec());
+    }
+
+    #[test]
+    fn shared_backend_msadpcm_decodes_to_pcm16() {
+        let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
+        let mut backend = SharedBackend::new(Arc::clone(&state));
+        backend.on_server_formats(&[make_msadpcm_format()]);
+
+        backend.on_wave_data(0, &make_msadpcm_block(), None);
+
+        let mut g = state.lock().unwrap();
+        let frame = g.pending_frames.pop_front().expect("frame queued");
+        // Post-decode shape — every supported codec lands as PCM16 mono
+        // / stereo at the original sample rate.
+        assert_eq!(frame.bits_per_sample, 16);
+        assert_eq!(frame.channels, 1);
+        assert_eq!(frame.sample_rate, 22_050);
+        // samples_per_block = 4 mono → 4 i16 samples → 8 bytes.
+        assert_eq!(frame.data.len(), 8);
+    }
+
+    #[test]
+    fn shared_backend_drops_wave_for_unknown_format_no() {
+        let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
+        let mut backend = SharedBackend::new(Arc::clone(&state));
+        backend.on_server_formats(&[AudioFormat::pcm(1, 44_100, 16)]);
+
+        // format_no=5 was never negotiated — decoder cache miss must
+        // be silent and must NOT push a malformed frame.
+        backend.on_wave_data(5, &[0u8; 16], None);
+
+        assert_eq!(state.lock().unwrap().pending_frame_count(), 0);
     }
 
     #[test]
