@@ -24,6 +24,7 @@ justrdp-connector = { workspace = true }
 justrdp-input.workspace = true
 justrdp-pdu.workspace = true
 justrdp-session = { workspace = true, features = ["alloc"] }
+justrdp-svc = { workspace = true, features = ["alloc"] }
 # `default-features = false` keeps no_std compatibility — we only call
 # the lightweight event macros (info!/debug!/trace!/warn!), not the
 # subscriber registration surface.

@@ -21,6 +21,8 @@
 //! [`TpktHint`]: justrdp_pdu::tpkt::TpktHint
 //! [`FrameSink`]: crate::FrameSink
 
+use alloc::boxed::Box;
+use alloc::format;
 use alloc::vec::Vec;
 
 use justrdp_connector::ConnectionResult;
@@ -34,6 +36,7 @@ use justrdp_session::{
     ActiveStage, ActiveStageOutput, DeactivationReactivation, GracefulDisconnectReason,
     SessionConfig,
 };
+use justrdp_svc::{StaticChannelSet as SvcChannelSet, SvcProcessor};
 
 use crate::driver::{recv_until_pdu, DriverError};
 use crate::input::{
@@ -113,6 +116,18 @@ pub struct ActiveSession<T: WebTransport> {
     /// (raw fast-path) — that path is still available for callers who
     /// already track input state themselves.
     input_db: InputDatabase,
+    /// Static virtual channel processors keyed by MCS channel id. Set
+    /// up via [`Self::with_processors`]; otherwise empty and inert.
+    /// `next_events` routes inbound `ChannelData` frames here first —
+    /// frames a registered processor claims are consumed silently
+    /// (with any processor-emitted response frames written back to the
+    /// transport) instead of surfacing as [`SessionEvent::Channel`].
+    svc_set: SvcChannelSet,
+    /// Cached `user_channel_id` for the SVC dispatch path. Mirrors
+    /// what `ActiveStage::config()` exposes; cached here so the channel
+    /// dispatch loop in `next_events` doesn't have to reach back into
+    /// the stage on every frame.
+    user_channel_id: u16,
 }
 
 impl<T: WebTransport> ActiveSession<T> {
@@ -135,7 +150,55 @@ impl<T: WebTransport> ActiveSession<T> {
             stage: ActiveStage::new(config),
             scratch: Vec::new(),
             input_db: InputDatabase::new(),
+            svc_set: SvcChannelSet::new(),
+            user_channel_id: result.user_channel_id,
         }
+    }
+
+    /// Build an active session with a pre-populated set of static
+    /// virtual channel processors (clipboard, drive, sound, drdynvc,
+    /// …). Mirrors `justrdp_blocking::RdpClient::connect_with_processors`.
+    ///
+    /// The processors must declare channel names that were advertised
+    /// in the connector's `Config::static_channels` — otherwise the
+    /// server never allocates an MCS id for them and they sit idle
+    /// (no error; matches blocking semantics).
+    ///
+    /// This call drives `start_all` on every processor with an
+    /// allocated id, encoding any initial frames they want to emit and
+    /// flushing them through `transport.send` before returning. Errors
+    /// at this stage surface as [`DriverError::Channel`] / [`DriverError::Transport`].
+    ///
+    /// To use Dynamic Virtual Channels, wrap your DvcProcessor instances
+    /// in a `DrdynvcClient` and box that as the `drdynvc` SVC processor —
+    /// same pattern as blocking.
+    pub async fn with_processors(
+        transport: T,
+        result: &ConnectionResult,
+        processors: Vec<Box<dyn SvcProcessor>>,
+    ) -> Result<Self, DriverError> {
+        let mut session = Self::new(transport, result);
+        for processor in processors {
+            session
+                .svc_set
+                .insert(processor)
+                .map_err(|e| DriverError::Channel(format!("{e:?}")))?;
+        }
+        session.svc_set.assign_ids(&result.channel_ids);
+
+        // Run start_all to collect any initial frames each processor
+        // wants to send. The frames are already MCS+TPKT wrapped so
+        // they go straight onto the wire.
+        let start_results = session
+            .svc_set
+            .start_all(result.user_channel_id)
+            .map_err(|e| DriverError::Channel(format!("{e:?}")))?;
+        for (_chan_id, frames) in start_results {
+            for frame in frames {
+                session.transport.send(&frame).await?;
+            }
+        }
+        Ok(session)
     }
 
     /// Reborrow the underlying transport.
@@ -204,7 +267,26 @@ impl<T: WebTransport> ActiveSession<T> {
                     events.push(SessionEvent::SaveSessionInfo(data));
                 }
                 ActiveStageOutput::ChannelData { channel_id, data } => {
-                    events.push(SessionEvent::Channel { channel_id, data });
+                    // Try to dispatch to a registered SVC processor
+                    // first. If a processor claims the channel id its
+                    // response frames are written back over the
+                    // transport and the raw event is suppressed (the
+                    // processor "owns" the channel). If no processor
+                    // matches, fall through to a passthrough event so
+                    // callers can still observe traffic on un-registered
+                    // channels — matches blocking's behavior in
+                    // `RdpClient::next_event`.
+                    if self.svc_set.get_by_channel_id(channel_id).is_some() {
+                        let frames = self
+                            .svc_set
+                            .process_incoming(channel_id, &data, self.user_channel_id)
+                            .map_err(|e| DriverError::Channel(format!("{e:?}")))?;
+                        for frame in frames {
+                            self.transport.send(&frame).await?;
+                        }
+                    } else {
+                        events.push(SessionEvent::Channel { channel_id, data });
+                    }
                 }
                 ActiveStageOutput::ServerMonitorLayout { monitors } => {
                     events.push(SessionEvent::MonitorLayout(monitors));
@@ -1058,6 +1140,151 @@ mod tests {
             // Cached lock-key state stays at the default — raw send does
             // not touch the InputDatabase.
             assert_eq!(session.lock_keys(), LockKeys::default());
+        });
+    }
+
+    // ── SVC processor wiring tests ──────────────────────────────────
+
+    use alloc::string::String as StdString;
+    use justrdp_svc::{ChannelName, CompressionCondition, SvcMessage, SvcResult};
+
+    /// Echo SVC processor — start() emits "hello"; process() records
+    /// the inbound payload and replies "reply". Mirrors blocking's
+    /// `RecordingProcessor`.
+    #[derive(Debug, Default)]
+    struct EchoProcessor;
+
+    impl justrdp_core::AsAny for EchoProcessor {
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
+        }
+    }
+
+    impl SvcProcessor for EchoProcessor {
+        fn channel_name(&self) -> ChannelName {
+            ChannelName::new(b"echo")
+        }
+        fn start(&mut self) -> SvcResult<Vec<SvcMessage>> {
+            Ok(vec![SvcMessage::new(b"hello".to_vec())])
+        }
+        fn process(&mut self, _payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
+            Ok(vec![SvcMessage::new(b"reply".to_vec())])
+        }
+        fn compression_condition(&self) -> CompressionCondition {
+            CompressionCondition::Never
+        }
+    }
+
+    /// `EmptyStartProcessor` — `start()` returns nothing. Used to
+    /// confirm that with_processors() doesn't emit spurious frames
+    /// for processors that have nothing to say at startup.
+    #[derive(Debug, Default)]
+    struct EmptyStartProcessor;
+
+    impl justrdp_core::AsAny for EmptyStartProcessor {
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
+        }
+    }
+
+    impl SvcProcessor for EmptyStartProcessor {
+        fn channel_name(&self) -> ChannelName {
+            ChannelName::new(b"silent")
+        }
+        fn start(&mut self) -> SvcResult<Vec<SvcMessage>> {
+            Ok(Vec::new())
+        }
+        fn process(&mut self, _payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
+            Ok(Vec::new())
+        }
+        fn compression_condition(&self) -> CompressionCondition {
+            CompressionCondition::Never
+        }
+    }
+
+    fn build_session_for_processors(
+        channel_ids: Vec<(StdString, u16)>,
+    ) -> (ConnectionResult, Rc<RefCell<SharedSink>>, SinkTransport) {
+        let shared = Rc::new(RefCell::new(SharedSink {
+            sent: Vec::new(),
+            recv: VecDeque::new(),
+        }));
+        let transport = SinkTransport { shared: Rc::clone(&shared) };
+        let mut result = fake_result();
+        result.channel_ids = channel_ids;
+        (result, shared, transport)
+    }
+
+    #[test]
+    fn with_processors_empty_list_succeeds_no_traffic() {
+        block_on(async {
+            let (result, shared, transport) = build_session_for_processors(vec![]);
+            let _session = ActiveSession::with_processors(transport, &result, vec![])
+                .await
+                .unwrap();
+            assert!(shared.borrow().sent.is_empty());
+        });
+    }
+
+    #[test]
+    fn with_processors_writes_start_frames_for_assigned_channels() {
+        // Echo processor's start() emits "hello"; the channel_ids list
+        // contains a matching "echo" entry so the SVC set assigns it
+        // an MCS id and the frames get encoded + flushed.
+        block_on(async {
+            let (result, shared, transport) =
+                build_session_for_processors(vec![(StdString::from("echo"), 1004)]);
+            let processors: Vec<Box<dyn SvcProcessor>> =
+                vec![Box::new(EchoProcessor::default())];
+            let _session = ActiveSession::with_processors(transport, &result, processors)
+                .await
+                .unwrap();
+            // start_all produced one MCS-wrapped frame for the echo
+            // channel — written through the transport.
+            assert_eq!(shared.borrow().sent.len(), 1);
+            // Sanity check: the frame is non-empty (the processor's
+            // `b"hello"` payload + MCS/TPKT framing).
+            assert!(!shared.borrow().sent[0].is_empty());
+        });
+    }
+
+    #[test]
+    fn with_processors_unassigned_channel_writes_nothing() {
+        // Channel name does not appear in result.channel_ids, so
+        // assign_ids leaves the entry without an MCS id and start_all
+        // skips it. EmptyStartProcessor returns no frames anyway, so
+        // the assertion is double-protected.
+        block_on(async {
+            let (result, shared, transport) =
+                build_session_for_processors(vec![(StdString::from("unrelated"), 1004)]);
+            let processors: Vec<Box<dyn SvcProcessor>> =
+                vec![Box::new(EmptyStartProcessor::default())];
+            let _session = ActiveSession::with_processors(transport, &result, processors)
+                .await
+                .unwrap();
+            assert!(shared.borrow().sent.is_empty());
+        });
+    }
+
+    #[test]
+    fn with_processors_processor_with_empty_start_writes_nothing() {
+        // Processor IS assigned a channel id, but start() returns no
+        // messages — start_all should produce no frames for that entry.
+        block_on(async {
+            let (result, shared, transport) =
+                build_session_for_processors(vec![(StdString::from("silent"), 1004)]);
+            let processors: Vec<Box<dyn SvcProcessor>> =
+                vec![Box::new(EmptyStartProcessor::default())];
+            let _session = ActiveSession::with_processors(transport, &result, processors)
+                .await
+                .unwrap();
+            assert!(shared.borrow().sent.is_empty());
         });
     }
 

@@ -67,6 +67,12 @@ pub enum DriverError {
     /// `ConnectionResult` — should be impossible; surfaces as a logic
     /// error rather than a panic.
     Internal(String),
+    /// An SVC channel processor (clipboard, drive redirection, sound,
+    /// drdynvc, etc.) returned an error during `start()` /
+    /// `process_incoming()` / channel-set setup. The string is the
+    /// processor's error rendered via `Debug` (mirrors blocking's
+    /// `ConnectError::ChannelSetup` body).
+    Channel(String),
 }
 
 impl DriverError {
@@ -98,6 +104,7 @@ impl core::fmt::Display for DriverError {
             Self::TlsUpgrade(msg) => write!(f, "TLS upgrade: {msg}"),
             Self::Credssp(msg) => write!(f, "CredSSP: {msg}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
+            Self::Channel(msg) => write!(f, "channel: {msg}"),
         }
     }
 }
