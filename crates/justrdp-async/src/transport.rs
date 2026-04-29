@@ -60,6 +60,7 @@ pub(crate) mod mock {
     /// Minimal in-memory transport for unit tests. Exposed inside the crate
     /// only — embedders are expected to write transport-specific fakes
     /// against the public trait, which keeps the test surface honest.
+    #[derive(Debug)]
     pub struct MockTransport {
         pub sent: Vec<Vec<u8>>,
         pub recv_queue: VecDeque<Result<Vec<u8>, TransportError>>,
