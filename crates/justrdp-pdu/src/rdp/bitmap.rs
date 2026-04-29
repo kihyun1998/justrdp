@@ -223,7 +223,15 @@ pub struct TsUpdateBitmapData {
 }
 
 impl TsUpdateBitmapData {
-    /// Encode the fast-path payload form (omits leading `updateType`).
+    /// Encode the fast-path payload form.
+    ///
+    /// MS-RDPBCGR 2.2.9.1.2.1.5 says the fast-path bitmap update PDU
+    /// is identical to the slow-path TS_UPDATE_BITMAP_DATA
+    /// (2.2.9.1.1.3.1.2.1) — i.e. it carries the 2-byte `updateType`
+    /// (`UPDATETYPE_BITMAP` = 0x0001) ahead of `numberRectangles`.
+    /// Real Windows servers (Server 2019 verified) emit it; FreeRDP
+    /// also reads it. The fast-path form and the slow-path form share
+    /// the same wire layout, so this method handles both.
     pub fn encode_fast_path(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         if self.rectangles.len() > u16::MAX as usize {
             return Err(EncodeError::other(
@@ -231,6 +239,7 @@ impl TsUpdateBitmapData {
                 "numberRectangles exceeds u16::MAX",
             ));
         }
+        dst.write_u16_le(UPDATETYPE_BITMAP, "TsUpdateBitmapData::updateType")?;
         dst.write_u16_le(
             self.rectangles.len() as u16,
             "TsUpdateBitmapData::numberRectangles",
@@ -241,13 +250,24 @@ impl TsUpdateBitmapData {
         Ok(())
     }
 
-    /// Wire size of the fast-path payload (no leading `updateType`).
+    /// Wire size of the fast-path payload (includes the 2-byte
+    /// `updateType` prefix and the 2-byte `numberRectangles` field).
     pub fn fast_path_size(&self) -> usize {
-        2 + self.rectangles.iter().map(|r| r.size()).sum::<usize>()
+        4 + self.rectangles.iter().map(|r| r.size()).sum::<usize>()
     }
 
-    /// Decode the fast-path payload form (no leading `updateType`).
+    /// Decode the fast-path payload form. See
+    /// [`Self::encode_fast_path`] for the wire layout — `updateType`
+    /// (must be `UPDATETYPE_BITMAP`) + `numberRectangles` + rectangles.
     pub fn decode_fast_path(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        let update_type = src.read_u16_le("TsUpdateBitmapData::updateType")?;
+        if update_type != UPDATETYPE_BITMAP {
+            return Err(DecodeError::unexpected_value(
+                "TsUpdateBitmapData",
+                "updateType",
+                "expected UPDATETYPE_BITMAP (0x0001)",
+            ));
+        }
         let count = src.read_u16_le("TsUpdateBitmapData::numberRectangles")?;
         if count > MAX_BITMAP_RECTANGLES_PER_UPDATE {
             return Err(DecodeError::invalid_value(
@@ -265,7 +285,9 @@ impl TsUpdateBitmapData {
 
 impl Encode for TsUpdateBitmapData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        dst.write_u16_le(UPDATETYPE_BITMAP, "TsUpdateBitmapData::updateType")?;
+        // Slow-path TS_UPDATE_BITMAP_DATA shares the wire layout with
+        // the fast-path form (MS-RDPBCGR 2.2.9.1.1.3.1.2.1 and
+        // 2.2.9.1.2.1.5 reference the same structure).
         self.encode_fast_path(dst)
     }
 
@@ -274,20 +296,12 @@ impl Encode for TsUpdateBitmapData {
     }
 
     fn size(&self) -> usize {
-        2 + self.fast_path_size()
+        self.fast_path_size()
     }
 }
 
 impl<'de> Decode<'de> for TsUpdateBitmapData {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
-        let update_type = src.read_u16_le("TsUpdateBitmapData::updateType")?;
-        if update_type != UPDATETYPE_BITMAP {
-            return Err(DecodeError::unexpected_value(
-                "TsUpdateBitmapData",
-                "updateType",
-                "expected UPDATETYPE_BITMAP (0x0001)",
-            ));
-        }
         Self::decode_fast_path(src)
     }
 }
