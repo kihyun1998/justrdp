@@ -105,6 +105,11 @@ tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
 # Lighter than the `image` crate (single-purpose decoder/encoder
 # rather than the full multi-format pipeline).
 png = "0.17"
+# `native_window_demo` only — winit drives the OS window and event
+# loop, softbuffer uploads our RGBA framebuffer to the surface
+# without a GPU dependency.
+winit = "0.30"
+softbuffer = "0.4"
 
 [[example]]
 name = "native_connect_demo"
@@ -112,4 +117,8 @@ required-features = ["native-nla"]
 
 [[example]]
 name = "native_render_demo"
+required-features = ["native-nla"]
+
+[[example]]
+name = "native_window_demo"
 required-features = ["native-nla"]
