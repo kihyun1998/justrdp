@@ -19,6 +19,7 @@ mod driver;
 mod error;
 mod input;
 mod session;
+mod telemetry;
 mod transport;
 
 pub use driver::{CredsspDriver, DriverError, TlsUpgrade, WebClient, MAX_HANDSHAKE_PDU_SIZE};

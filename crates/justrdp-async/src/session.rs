@@ -40,6 +40,7 @@ use crate::input::{
     build_mouse_button_event, build_mouse_move_event, build_mouse_wheel_event,
     build_scancode_event, build_sync_event, build_unicode_event,
 };
+use crate::telemetry::{debug, info, trace};
 use crate::transport::WebTransport;
 
 static TPKT_HINT: TpktHint = TpktHint;
@@ -254,6 +255,7 @@ impl<T: WebTransport> ActiveSession<T> {
         &mut self,
         events: &[FastPathInputEvent],
     ) -> Result<(), DriverError> {
+        trace!(count = events.len(), "session.send_input");
         let frame = self.stage.encode_input_events(events)?;
         self.transport.send(&frame).await?;
         Ok(())
@@ -284,6 +286,7 @@ impl<T: WebTransport> ActiveSession<T> {
     pub async fn send_unicode_char(&mut self, ch: char) -> Result<bool, DriverError> {
         let code = u32::from(ch);
         if code > u16::MAX as u32 {
+            debug!(code, "session.send_unicode_char skipped (non-bmp)");
             return Ok(false);
         }
         let code = code as u16;
@@ -492,6 +495,7 @@ impl<T: WebTransport> ActiveSession<T> {
     /// Send a graceful shutdown request (Shutdown Request Denied response
     /// from the server still surfaces as `Terminated(ShutdownDenied)`).
     pub async fn shutdown(&mut self) -> Result<(), DriverError> {
+        info!("session.shutdown");
         let frame = self.stage.encode_shutdown_request()?;
         self.transport.send(&frame).await?;
         Ok(())
@@ -500,6 +504,7 @@ impl<T: WebTransport> ActiveSession<T> {
     /// Send an MCS Disconnect Provider Ultimatum (immediate disconnect,
     /// no graceful handshake).
     pub async fn disconnect(&mut self) -> Result<(), DriverError> {
+        info!("session.disconnect");
         let frame = self.stage.encode_disconnect()?;
         self.transport.send(&frame).await?;
         Ok(())

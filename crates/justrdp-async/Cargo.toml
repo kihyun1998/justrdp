@@ -10,12 +10,24 @@ description = "Runtime-agnostic async RDP client core (WebTransport family + Web
 keywords = ["rdp", "async", "transport"]
 categories = ["network-programming", "asynchronous"]
 
+[features]
+default = []
+# Light tracing instrumentation around the WebClient handshake pump
+# and ActiveSession boundary events. With the feature off the macros
+# expand to nothing, so release builds without observability pay zero
+# cost. The embedder is responsible for wiring up a `tracing` subscriber.
+tracing = ["dep:tracing"]
+
 [dependencies]
 justrdp-core = { workspace = true, features = ["alloc"] }
 justrdp-connector = { workspace = true }
 justrdp-input.workspace = true
 justrdp-pdu.workspace = true
 justrdp-session = { workspace = true, features = ["alloc"] }
+# `default-features = false` keeps no_std compatibility — we only call
+# the lightweight event macros (info!/debug!/trace!/warn!), not the
+# subscriber registration surface.
+tracing = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
 pollster = "0.3"

@@ -806,6 +806,7 @@ dependencies = [
  "justrdp-pdu",
  "justrdp-session",
  "pollster",
+ "tracing",
 ]
 
 [[package]]

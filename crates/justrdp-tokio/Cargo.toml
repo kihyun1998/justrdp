@@ -14,8 +14,10 @@ categories = ["network-programming", "asynchronous"]
 default = []
 # Forward tracing instrumentation through the worker thread. Off by
 # default to keep the dependency footprint minimal for embedders that
-# do not run a tracing subscriber.
-tracing = ["dep:tracing", "justrdp-blocking/tracing"]
+# do not run a tracing subscriber. The optional `justrdp-async` cascade
+# is conditional — if a `native-*` feature pulls async in, the embedder
+# also gets WebClient/ActiveSession tracing for free.
+tracing = ["dep:tracing", "justrdp-blocking/tracing", "justrdp-async?/tracing"]
 # Exposes `NativeTcpTransport` — a `tokio::net::TcpStream` wrapper that
 # implements `WebTransport` (from `justrdp-async`) directly. Native
 # substrate for `WebClient<NativeTcpTransport>` once §5.6.4 lands.

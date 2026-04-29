@@ -20,6 +20,10 @@ websocket = []
 # but avoids a breaking-change feature add later.
 webtransport = []
 webrtc-data = []
+# Cascade tracing into justrdp-async (WebClient handshake + ActiveSession).
+# The embedder is responsible for wiring up a `tracing-wasm` (or other
+# wasm-friendly) subscriber.
+tracing = ["justrdp-async/tracing"]
 
 [dependencies]
 justrdp-async = { workspace = true }

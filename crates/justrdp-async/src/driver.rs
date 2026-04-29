@@ -27,6 +27,7 @@ use justrdp_core::{PduHint, WriteBuf};
 use justrdp_session::SessionError;
 
 use crate::error::TransportError;
+use crate::telemetry::{async_warn, debug, info, trace};
 use crate::transport::WebTransport;
 
 /// Hard cap on a single PDU during the handshake; matches `justrdp-blocking`.
@@ -190,6 +191,11 @@ impl<T: WebTransport> WebClient<T> {
         mut self,
         config: justrdp_connector::Config,
     ) -> Result<(ConnectionResult, T), DriverError> {
+        info!(
+            username = %config.credentials.username,
+            external_tls = self.external_tls,
+            "rdp.connect begin"
+        );
         let mut connector = ClientConnector::new(config);
         let mut scratch: Vec<u8> = Vec::new();
         let mut output = WriteBuf::new();
@@ -204,14 +210,25 @@ impl<T: WebTransport> WebClient<T> {
         .await?;
         match stop {
             PumpStop::Connected => {}
-            PumpStop::EnhancedSecurityUpgrade => return Err(DriverError::TlsRequired),
-            PumpStop::NlaRequired { state } => return Err(DriverError::NlaRequired { state }),
+            PumpStop::EnhancedSecurityUpgrade => {
+                async_warn!("rdp.connect tls_required (use connect_with_upgrade)");
+                return Err(DriverError::TlsRequired);
+            }
+            PumpStop::NlaRequired { state } => {
+                async_warn!(state, "rdp.connect nla_required (use connect_with_nla)");
+                return Err(DriverError::NlaRequired { state });
+            }
         }
 
         let result = connector
             .result()
             .cloned()
             .ok_or_else(|| DriverError::internal("Connected state without ConnectionResult"))?;
+        info!(
+            selected_protocol = ?result.selected_protocol,
+            io_channel_id = result.io_channel_id,
+            "rdp.connect ok"
+        );
         Ok((result, self.transport))
     }
 
@@ -241,12 +258,17 @@ impl<T: WebTransport> WebClient<T> {
     where
         U: TlsUpgrade<T>,
     {
+        info!(
+            username = %config.credentials.username,
+            "rdp.connect_with_upgrade begin"
+        );
         let mut connector = ClientConnector::new(config);
         let mut scratch: Vec<u8> = Vec::new();
         let mut output = WriteBuf::new();
 
         // Phase 1: pre-TLS pump. external_tls is forced false so we
         // actually surface the upgrade rather than skipping past it.
+        debug!("rdp.connect.phase=pre_tls");
         let stop = pump_until_terminal(
             &mut self.transport,
             &mut connector,
@@ -261,16 +283,21 @@ impl<T: WebTransport> WebClient<T> {
                 // caller asked for an upgrade, so return an internal
                 // error rather than silently producing a non-upgraded
                 // U::Output we don't have.
+                async_warn!("rdp.connect_with_upgrade server picked standard security");
                 return Err(DriverError::internal(
                     "connect_with_upgrade: server selected Standard Security; \
                      use connect() instead",
                 ));
             }
-            PumpStop::NlaRequired { state } => return Err(DriverError::NlaRequired { state }),
+            PumpStop::NlaRequired { state } => {
+                async_warn!(state, "rdp.connect_with_upgrade nla_required (use connect_with_nla)");
+                return Err(DriverError::NlaRequired { state });
+            }
             PumpStop::EnhancedSecurityUpgrade => {}
         }
 
         // Phase 2: hand the transport to the upgrader.
+        debug!("rdp.connect.phase=tls_upgrade");
         let mut new_transport = upgrade
             .upgrade(self.transport)
             .await
@@ -287,6 +314,7 @@ impl<T: WebTransport> WebClient<T> {
         }
 
         // Phase 3: post-TLS pump.
+        debug!("rdp.connect.phase=post_tls");
         let stop = pump_until_terminal(
             &mut new_transport,
             &mut connector,
@@ -302,13 +330,20 @@ impl<T: WebTransport> WebClient<T> {
                     "post-TLS pump returned to EnhancedSecurityUpgrade",
                 ));
             }
-            PumpStop::NlaRequired { state } => return Err(DriverError::NlaRequired { state }),
+            PumpStop::NlaRequired { state } => {
+                async_warn!(state, "rdp.connect_with_upgrade nla_required after tls (use connect_with_nla)");
+                return Err(DriverError::NlaRequired { state });
+            }
         }
 
         let result = connector
             .result()
             .cloned()
             .ok_or_else(|| DriverError::internal("Connected state without ConnectionResult"))?;
+        info!(
+            selected_protocol = ?result.selected_protocol,
+            "rdp.connect_with_upgrade ok"
+        );
         Ok((result, new_transport))
     }
 
@@ -340,11 +375,16 @@ impl<T: WebTransport> WebClient<T> {
         U: TlsUpgrade<T>,
         C: CredsspDriver<U::Output>,
     {
+        info!(
+            username = %config.credentials.username,
+            "rdp.connect_with_nla begin"
+        );
         let mut connector = ClientConnector::new(config);
         let mut scratch: Vec<u8> = Vec::new();
         let mut output = WriteBuf::new();
 
         // Phase 1: pre-TLS pump.
+        debug!("rdp.connect.phase=pre_tls");
         let stop = pump_until_terminal(
             &mut self.transport,
             &mut connector,
@@ -355,6 +395,7 @@ impl<T: WebTransport> WebClient<T> {
         .await?;
         match stop {
             PumpStop::Connected => {
+                async_warn!("rdp.connect_with_nla server picked standard security");
                 return Err(DriverError::internal(
                     "connect_with_nla: server selected Standard Security; \
                      use connect() instead",
@@ -369,6 +410,7 @@ impl<T: WebTransport> WebClient<T> {
         }
 
         // Phase 2: TLS upgrade.
+        debug!("rdp.connect.phase=tls_upgrade");
         let mut new_transport = tls_upgrade
             .upgrade(self.transport)
             .await
@@ -384,6 +426,7 @@ impl<T: WebTransport> WebClient<T> {
 
         // Phase 3: pump until either Connected (SSL-only) or
         // CredsspNegoTokens (HYBRID).
+        debug!("rdp.connect.phase=mid_pump");
         let stop = pump_until_terminal(
             &mut new_transport,
             &mut connector,
@@ -400,6 +443,10 @@ impl<T: WebTransport> WebClient<T> {
                 let result = connector.result().cloned().ok_or_else(|| {
                     DriverError::internal("Connected state without ConnectionResult")
                 })?;
+                info!(
+                    selected_protocol = ?result.selected_protocol,
+                    "rdp.connect_with_nla ok (ssl-only path, no credssp)"
+                );
                 return Ok((result, new_transport));
             }
             PumpStop::EnhancedSecurityUpgrade => {
@@ -412,12 +459,14 @@ impl<T: WebTransport> WebClient<T> {
 
         // Phase 4: CredSSP exchange. The driver advances the
         // connector through every CredSSP state.
+        debug!("rdp.connect.phase=credssp");
         credssp
             .drive(&mut connector, &mut new_transport)
             .await
             .map_err(|e| DriverError::Credssp(e.to_string()))?;
 
         // Phase 5: post-CredSSP pump to Connected.
+        debug!("rdp.connect.phase=post_credssp");
         let stop = pump_until_terminal(
             &mut new_transport,
             &mut connector,
@@ -445,6 +494,10 @@ impl<T: WebTransport> WebClient<T> {
             .result()
             .cloned()
             .ok_or_else(|| DriverError::internal("Connected state without ConnectionResult"))?;
+        info!(
+            selected_protocol = ?result.selected_protocol,
+            "rdp.connect_with_nla ok"
+        );
         Ok((result, new_transport))
     }
 }
@@ -470,6 +523,9 @@ async fn pump_until_terminal<T: WebTransport>(
     external_tls: bool,
 ) -> Result<PumpStop, DriverError> {
     loop {
+        // Per-iteration trace — disabled at compile time without the
+        // `tracing` feature. State::name() is cheap (returns &'static str).
+        trace!(state = connector.state().name(), "pump_until_terminal.iter");
         match connector.state() {
             ClientConnectorState::Connected { .. } => return Ok(PumpStop::Connected),
             ClientConnectorState::EnhancedSecurityUpgrade => {
