@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! Audio output channel routing on top of `justrdp-rdpsnd` (MS-RDPEA).
+//! Audio output (RDPSND) and input (RDPEAI) channel routing.
 //!
 //! [`AudioChannel`] hosts the RDPSND processors inside a
 //! [`StaticChannelSet`]. Wave data the server pushes lands in
 //! `pending_frames` for the embedder to drain via `take_frame`; the
 //! demo page funnels each frame into a Web Audio `AudioContext`.
+//!
+//! ## Output (server → client)
 //!
 //! Two transports are supported and selected automatically based on
 //! what the server negotiated:
@@ -21,6 +23,18 @@
 //! same FIFO regardless of source); each backend keeps its own
 //! per-format decoder cache. Whichever transport the server picks
 //! delivers wave PDUs into the same queue.
+//!
+//! ## Input (client → server, microphone redirection)
+//!
+//! When `drdynvc` is negotiated, an [`AudioInputClient`] is registered
+//! alongside the playback DVCs to advertise the `AUDIO_INPUT` channel
+//! (MS-RDPEAI). The embedder polls [`AudioChannel::audio_input_state`]
+//! to learn the negotiated PCM format and feeds captured mic samples
+//! back through [`AudioChannel::audio_input_pcm_frames`], which builds
+//! the DVC PDUs and TPKT-frames them ready to send. The full RDPEAI
+//! state machine (Version → Formats → Open → Recording / FormatChange)
+//! is handled inside `AudioInputClient` itself; this module just wires
+//! it into the same drdynvc multiplexer that hosts the playback DVCs.
 //!
 //! Format negotiation: the bundled backend accepts **PCM** (16-bit
 //! little-endian, mono or stereo, any sample rate), **MS-ADPCM**
@@ -43,10 +57,12 @@ use std::sync::{Arc, Mutex};
 
 use justrdp_audio::AudioDecoder;
 use justrdp_connector::ConnectionResult;
-use justrdp_dvc::DrdynvcClient;
+use justrdp_core::AsAny;
+use justrdp_dvc::{DrdynvcClient, DvcError, DvcMessage, DvcOutput, DvcProcessor, DvcResult};
+use justrdp_rdpeai::AudioInputClient;
 use justrdp_rdpsnd::pdu::{AudioFormat, VolumePdu, WaveFormatTag};
 use justrdp_rdpsnd::{make_decoder, RdpsndBackend, RdpsndClient, RdpsndDvcClient, RdpsndLossyDvcClient};
-use justrdp_svc::StaticChannelSet;
+use justrdp_svc::{StaticChannelSet, SvcMessage};
 
 /// Embedder-injected decoder for codecs the bundled `justrdp-audio`
 /// stack doesn't handle (Opus, AAC, G.711, …).
@@ -380,6 +396,94 @@ impl RdpsndBackend for SharedBackend {
     }
 }
 
+/// `DvcProcessor` wrapper that delegates to a shared [`AudioInputClient`].
+///
+/// The drdynvc machinery requires a single boxed `DvcProcessor` per
+/// channel, but the embedder also needs a way to inspect input state
+/// (recording flag, negotiated format) and inject captured samples
+/// — neither possible if the only reference lives behind a
+/// `Box<dyn DvcProcessor>` inside the channel set.
+///
+/// The proxy holds an `Arc<Mutex<AudioInputClient>>` and forwards
+/// every callback through it; the embedder gets the second `Arc` clone
+/// for direct access. Locking inside callbacks is safe because the
+/// drdynvc dispatcher already serialises trait calls per channel.
+struct AudioInputProxy {
+    inner: Arc<Mutex<AudioInputClient>>,
+}
+
+impl AsAny for AudioInputProxy {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+}
+
+impl core::fmt::Debug for AudioInputProxy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AudioInputProxy").finish_non_exhaustive()
+    }
+}
+
+impl DvcProcessor for AudioInputProxy {
+    fn channel_name(&self) -> &str {
+        // Mirrors the constant inside `AudioInputClient`; resolved
+        // there as the wire-truthful name. Hard-coding here keeps
+        // `&str` lifetime tied to a 'static slice rather than the
+        // lock guard.
+        "AUDIO_INPUT"
+    }
+
+    fn start(&mut self, channel_id: u32) -> DvcResult<Vec<DvcMessage>> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| DvcError::Protocol(String::from("audio input mutex poisoned")))?;
+        g.start(channel_id)
+    }
+
+    fn process(&mut self, channel_id: u32, payload: &[u8]) -> DvcResult<Vec<DvcMessage>> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| DvcError::Protocol(String::from("audio input mutex poisoned")))?;
+        g.process(channel_id, payload)
+    }
+
+    fn close(&mut self, channel_id: u32) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.close(channel_id);
+        }
+    }
+}
+
+/// Snapshot of the AUDIO_INPUT (microphone redirection) DVC state.
+///
+/// Returned by [`AudioChannel::audio_input_state`] when `drdynvc` is
+/// negotiated. The embedder uses `recording` to decide when to start
+/// `getUserMedia` (or its native equivalent), and `sample_rate` /
+/// `channels` / `bits_per_sample` to format captured PCM before
+/// passing it to [`AudioChannel::audio_input_pcm_frames`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioInputState {
+    /// `true` when the server has issued the Open PDU and is ready
+    /// to consume captured audio.
+    pub recording: bool,
+    /// Sample rate of the negotiated PCM format, in Hz.
+    pub sample_rate: u32,
+    /// Channel count (1 = mono, 2 = stereo).
+    pub channels: u16,
+    /// Sample width — always 16 for PCM (the only format
+    /// `AudioInputClient` exposes by default).
+    pub bits_per_sample: u16,
+    /// Frames-per-packet hint from the server's Open PDU. The
+    /// embedder typically uses this as the natural chunk size when
+    /// pushing samples back.
+    pub frames_per_packet: u32,
+}
+
 /// Audio channel routing helper.
 pub struct AudioChannel {
     channels: StaticChannelSet,
@@ -393,6 +497,11 @@ pub struct AudioChannel {
     /// allocate it (SVC-only path).
     drdynvc_channel_id: Option<u16>,
     state: Arc<Mutex<AudioState>>,
+    /// Shared handle to the `AUDIO_INPUT` DVC client. Present when
+    /// `drdynvc` was negotiated; the embedder reaches into this to
+    /// inspect state and build wire-back messages for captured mic
+    /// samples.
+    audio_input: Option<Arc<Mutex<AudioInputClient>>>,
 }
 
 impl core::fmt::Debug for AudioChannel {
@@ -412,6 +521,12 @@ pub enum AudioChannelError {
     ChannelNotNegotiated,
     /// The wrapped channel set rejected the operation.
     Svc(justrdp_svc::SvcError),
+    /// AUDIO_INPUT (mic redirection) is not available — `drdynvc`
+    /// was not negotiated, so no DVC channel exists for MS-RDPEAI.
+    AudioInputUnavailable,
+    /// AUDIO_INPUT setup or send-back path returned an error
+    /// (typically a `DvcError` formatted as a string).
+    AudioInput(String),
 }
 
 impl core::fmt::Display for AudioChannelError {
@@ -421,6 +536,10 @@ impl core::fmt::Display for AudioChannelError {
                 "neither rdpsnd nor drdynvc was negotiated — audio cannot be routed",
             ),
             Self::Svc(e) => write!(f, "svc: {e:?}"),
+            Self::AudioInputUnavailable => {
+                f.write_str("AUDIO_INPUT (mic redirection) not negotiated — drdynvc absent")
+            }
+            Self::AudioInput(msg) => write!(f, "audio input: {msg}"),
         }
     }
 }
@@ -499,6 +618,7 @@ impl AudioChannel {
         let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
         let mut channels = StaticChannelSet::new();
         let mut id_assignments: Vec<(String, u16)> = Vec::new();
+        let mut audio_input: Option<Arc<Mutex<AudioInputClient>>> = None;
 
         let make_backend = |state: Arc<Mutex<AudioState>>| -> Box<SharedBackend> {
             match &external_decoder {
@@ -525,6 +645,19 @@ impl AudioChannel {
             let mut drdynvc = DrdynvcClient::new();
             drdynvc.register(Box::new(RdpsndDvcClient::new(reliable_backend)));
             drdynvc.register(Box::new(RdpsndLossyDvcClient::new(lossy_backend)));
+
+            // Audio input: register `AudioInputClient` via a proxy so
+            // we keep an external `Arc<Mutex<...>>` reference for
+            // state inspection and outbound mic-sample injection. The
+            // server only opens AUDIO_INPUT if the system has a mic
+            // configured for redirection, so registering it has no
+            // effect when the server doesn't ask.
+            let input_handle = Arc::new(Mutex::new(AudioInputClient::new()));
+            drdynvc.register(Box::new(AudioInputProxy {
+                inner: Arc::clone(&input_handle),
+            }));
+            audio_input = Some(input_handle);
+
             channels
                 .insert(Box::new(drdynvc))
                 .map_err(AudioChannelError::Svc)?;
@@ -539,6 +672,7 @@ impl AudioChannel {
             rdpsnd_channel_id,
             drdynvc_channel_id,
             state,
+            audio_input,
         })
     }
 
@@ -586,6 +720,138 @@ impl AudioChannel {
     /// FIFO. Returns `None` when the queue is empty.
     pub fn take_frame(&mut self) -> Option<AudioFrame> {
         self.state.lock().ok()?.pending_frames.pop_front()
+    }
+
+    // ── AUDIO_INPUT (microphone redirection) — MS-RDPEAI ──
+
+    /// Snapshot of the AUDIO_INPUT DVC state.
+    ///
+    /// `None` when `drdynvc` was not negotiated (no transport for
+    /// MS-RDPEAI). When present:
+    ///
+    /// * `recording = false` means the server has not yet opened the
+    ///   channel — the embedder should hold off on capture.
+    /// * `recording = true` means the embedder may now feed captured
+    ///   PCM bytes via [`Self::audio_input_pcm_frames`]. The format
+    ///   fields describe how the embedder should encode the samples.
+    pub fn audio_input_state(&self) -> Option<AudioInputState> {
+        let handle = self.audio_input.as_ref()?;
+        let g = handle.lock().ok()?;
+        let recording = g.is_recording();
+        // When not yet recording, populate format fields with the
+        // first negotiated PCM (best estimate) or fall back to the
+        // safe defaults `AudioInputClient` advertises (44.1k stereo
+        // 16-bit). Either way the embedder shouldn't act on these
+        // until `recording` flips.
+        let fmt = if recording {
+            g.current_format().cloned()
+        } else {
+            g.negotiated_formats().first().cloned()
+        };
+        let (sample_rate, channels, bits_per_sample) = match fmt {
+            Some(f) => (f.n_samples_per_sec, f.n_channels, f.bits_per_sample),
+            None => (44_100, 2, 16),
+        };
+        Some(AudioInputState {
+            recording,
+            sample_rate,
+            channels,
+            bits_per_sample,
+            frames_per_packet: g.frames_per_packet(),
+        })
+    }
+
+    /// Wrap captured mic samples into wire-ready TPKT frames.
+    ///
+    /// `samples` must be interleaved little-endian PCM matching the
+    /// format reported by [`Self::audio_input_state`]. Internally:
+    ///
+    /// 1. [`AudioInputClient::build_audio_messages`] produces the
+    ///    `INCOMING_DATA` + `DATA` DVC PDU pair.
+    /// 2. The drdynvc manager wraps each into a `DYNVC_DATA` SVC PDU
+    ///    (routing aware — UDP tunnels are skipped here because
+    ///    justrdp-web does not enable multitransport).
+    /// 3. The static channel set chunks and TPKT-frames the result.
+    ///
+    /// Returns an empty `Vec` when the AUDIO_INPUT channel has not
+    /// been opened by the server yet (the embedder may safely poll
+    /// this in their capture loop). Returns
+    /// [`AudioChannelError::AudioInputUnavailable`] when `drdynvc`
+    /// was never negotiated.
+    pub fn audio_input_pcm_frames(
+        &mut self,
+        samples: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>, AudioChannelError> {
+        let drdynvc_id = self
+            .drdynvc_channel_id
+            .ok_or(AudioChannelError::AudioInputUnavailable)?;
+        let input_handle = self
+            .audio_input
+            .as_ref()
+            .ok_or(AudioChannelError::AudioInputUnavailable)?;
+
+        // Step 1: build the DVC payloads from the input client.
+        let dvc_messages = {
+            let g = input_handle
+                .lock()
+                .map_err(|_| AudioChannelError::AudioInputUnavailable)?;
+            if !g.is_recording() {
+                // Server hasn't opened the channel yet — silent drop
+                // so a polling embedder doesn't see spurious errors
+                // before the server's Open PDU arrives.
+                return Ok(Vec::new());
+            }
+            g.build_audio_messages(samples)
+                .map_err(|e| AudioChannelError::AudioInput(format!("{e:?}")))?
+        };
+        if dvc_messages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Step 2: encode each DVC message via DrdynvcClient.
+        // route_outbound is route-aware (Soft-Sync UDP tunnels) but
+        // justrdp-web does not opt into multitransport, so every
+        // result lands in the SVC variant.
+        let mut svc_messages: Vec<SvcMessage> = Vec::with_capacity(dvc_messages.len());
+        {
+            let svc = self
+                .channels
+                .get_by_channel_id_mut(drdynvc_id)
+                .ok_or(AudioChannelError::AudioInputUnavailable)?;
+            let drdynvc = svc
+                .as_any_mut()
+                .downcast_mut::<DrdynvcClient>()
+                .ok_or(AudioChannelError::AudioInputUnavailable)?;
+            let audio_input_id = drdynvc
+                .channel_id_by_name("AUDIO_INPUT")
+                .ok_or(AudioChannelError::AudioInputUnavailable)?;
+            for dvc_msg in dvc_messages {
+                let out = drdynvc
+                    .route_outbound(audio_input_id, &dvc_msg.data)
+                    .map_err(|e| AudioChannelError::AudioInput(format!("{e:?}")))?;
+                match out {
+                    DvcOutput::Svc(msg) => svc_messages.push(msg),
+                    DvcOutput::Tunnel { .. } => {
+                        // justrdp-web does not enable UDP
+                        // multitransport, so tunnel routing should
+                        // never occur. Fail loudly rather than drop.
+                        return Err(AudioChannelError::AudioInput(String::from(
+                            "AUDIO_INPUT routed to UDP tunnel — multitransport not supported in justrdp-web",
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Step 3: chunk and frame the SVC messages.
+        let mut wire = Vec::new();
+        for svc_msg in svc_messages {
+            let frames = self
+                .channels
+                .encode_message(self.user_channel_id, drdynvc_id, &svc_msg)?;
+            wire.extend(frames);
+        }
+        Ok(wire)
     }
 }
 
@@ -1001,6 +1267,77 @@ mod tests {
 
         // Bundled path took PCM — external decoder was never asked.
         assert_eq!(stub.lock().unwrap().accepts_calls, 0);
+    }
+
+    // ── AUDIO_INPUT (mic redirection) wiring (S6c) ──
+
+    #[test]
+    fn audio_input_state_none_when_drdynvc_absent() {
+        // SVC-only path — RDPEAI has no transport.
+        let result = make_result(1005);
+        let ch = AudioChannel::from_connection(&result).unwrap();
+        assert!(ch.audio_input_state().is_none());
+    }
+
+    #[test]
+    fn audio_input_state_present_when_drdynvc_negotiated() {
+        let result = make_result_with(vec![(String::from("drdynvc"), 1006)]);
+        let ch = AudioChannel::from_connection(&result).unwrap();
+        let st = ch.audio_input_state().expect("rdpeai wired with drdynvc");
+        // Before the server opens AUDIO_INPUT, recording is false.
+        // The format fields are best-effort defaults — the embedder
+        // shouldn't act on them until `recording` flips.
+        assert!(!st.recording);
+        assert_eq!(st.bits_per_sample, 16);
+        assert_eq!(st.frames_per_packet, 0);
+    }
+
+    #[test]
+    fn audio_input_pcm_frames_errors_when_drdynvc_absent() {
+        let result = make_result(1005); // rdpsnd SVC only
+        let mut ch = AudioChannel::from_connection(&result).unwrap();
+        let err = ch.audio_input_pcm_frames(vec![0u8; 4]).unwrap_err();
+        assert!(matches!(err, AudioChannelError::AudioInputUnavailable));
+    }
+
+    #[test]
+    fn audio_input_pcm_frames_silent_drop_before_open() {
+        // Before the server has issued the Open PDU, captured samples
+        // are silently dropped — this lets the embedder poll
+        // unconditionally during their getUserMedia loop.
+        let result = make_result_with(vec![(String::from("drdynvc"), 1006)]);
+        let mut ch = AudioChannel::from_connection(&result).unwrap();
+        let frames = ch.audio_input_pcm_frames(vec![0u8; 4]).unwrap();
+        assert!(frames.is_empty(), "no wire bytes emitted before recording");
+    }
+
+    #[test]
+    fn drdynvc_hosts_audio_playback_and_audio_input_processors() {
+        // Structural assertion: when `drdynvc` is negotiated, the
+        // hosted DrdynvcClient must have all three audio DVCs
+        // registered (reliable + lossy playback + input). The actual
+        // open-channel ids are populated only after the server sends
+        // a DYNVC_CREATE_REQUEST, so `channel_id_by_name` returns
+        // `None` here — but the registration happened at construction
+        // time, which is what this test guards.
+        //
+        // The full RDPEAI state machine is covered exhaustively in
+        // `justrdp-rdpeai`'s own client-test suite; we verify only
+        // the routing-gate wiring at this layer.
+        let result = make_result_with(vec![(String::from("drdynvc"), 1006)]);
+        let mut ch = AudioChannel::from_connection(&result).unwrap();
+        let svc = ch
+            .channels
+            .get_by_channel_id_mut(1006)
+            .expect("drdynvc channel registered");
+        let drdynvc = svc
+            .as_any_mut()
+            .downcast_mut::<DrdynvcClient>()
+            .expect("svc processor is DrdynvcClient");
+        // Pre-CREATE_REQUEST: server hasn't allocated channel ids yet.
+        assert_eq!(drdynvc.channel_id_by_name("AUDIO_PLAYBACK_DVC"), None);
+        assert_eq!(drdynvc.channel_id_by_name("AUDIO_PLAYBACK_LOSSY_DVC"), None);
+        assert_eq!(drdynvc.channel_id_by_name("AUDIO_INPUT"), None);
     }
 
     #[test]

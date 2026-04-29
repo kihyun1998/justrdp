@@ -717,6 +717,7 @@ dependencies = [
  "justrdp-dvc",
  "justrdp-graphics",
  "justrdp-pdu",
+ "justrdp-rdpeai",
  "justrdp-rdpsnd",
  "justrdp-session",
  "justrdp-svc",

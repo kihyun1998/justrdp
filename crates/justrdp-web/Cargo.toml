@@ -29,6 +29,7 @@ justrdp-session = { workspace = true, features = ["alloc"] }
 justrdp-graphics = { workspace = true, features = ["alloc"] }
 justrdp-cliprdr = { workspace = true, features = ["alloc"] }
 justrdp-rdpsnd = { workspace = true, features = ["alloc"] }
+justrdp-rdpeai = { workspace = true, features = ["alloc"] }
 justrdp-audio = { workspace = true, features = ["alloc"] }
 justrdp-svc = { workspace = true, features = ["alloc"] }
 justrdp-dvc = { workspace = true, features = ["alloc"] }
