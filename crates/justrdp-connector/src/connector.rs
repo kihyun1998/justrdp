@@ -1824,7 +1824,7 @@ impl ClientConnector {
         self.step_send_finalization_pdu(
             ShareDataPduType::FontList,
             &pdu,
-            ClientConnectorState::ConnectionFinalizationWaitSynchronize,
+            ClientConnectorState::ConnectionFinalizationWaitFontMap,
             output,
         )
     }
@@ -1889,43 +1889,29 @@ impl ClientConnector {
         Ok(FinalizationPduResult::DataPdu(sd_hdr.pdu_type2))
     }
 
-    fn step_finalization_wait_pdu(
-        &mut self,
-        input: &[u8],
-        expected_type: ShareDataPduType,
-        next_state: ClientConnectorState,
-    ) -> ConnectorResult<Written> {
-        let pdu_type = self.decode_finalization_pdu(input)?;
-
-        match pdu_type {
-            FinalizationPduResult::DataPdu(t) if t == expected_type => {
-                self.state = next_state;
-            }
-            FinalizationPduResult::Redirect(redir) => {
-                self.server_redirection = Some(redir);
-                self.transition_to_connected();
-            }
-            FinalizationPduResult::DeactivateAll => {
-                // Deactivation-Reactivation: go back to capabilities exchange
-                // MS-RDPBCGR 1.3.1.3 — caller should check deactivation_count() to flush caches
-                self.deactivation_count = self.deactivation_count.saturating_add(1);
-                self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
-            }
-            _ => {
-                // Informational, unexpected, or non-matching data PDU — stay in same state
-            }
-        }
-        Ok(Written::nothing())
-    }
-
-    /// Wait for Font Map PDU and transition to Connected.
-    fn step_finalization_wait_font_map(&mut self, input: &[u8]) -> ConnectorResult<Written> {
-        // Decode the incoming PDU using the shared finalization logic.
+    /// Process one finalization-phase server PDU.
+    ///
+    /// MS-RDPBCGR §2.2.1.22 designates the Server Font Map PDU as the
+    /// **last** PDU of the connection sequence — receiving it is the sole
+    /// trigger for `Connected`. The preceding three (Synchronize §2.2.1.19,
+    /// Control-Cooperate §2.2.1.20, Control-GrantedControl §2.2.1.21) carry
+    /// no information the connector consumes, and the spec imposes no
+    /// receive-order constraint on the client (§1.3.1.1 only orders the
+    /// server *send* side). They are silently consumed in any order; this
+    /// also collapses the historical Cooperate/GrantedControl ambiguity —
+    /// both share `pduType2 = Control` and would otherwise need
+    /// `ControlPdu::action` disambiguation in a strict-state chain.
+    ///
+    /// Interleaved informational PDUs (SaveSessionInfo, MonitorLayout,
+    /// SetErrorInfo with `ERRINFO_NONE`) are absorbed by
+    /// `decode_finalization_pdu`; `SetErrorInfo` with a non-zero code
+    /// surfaces as an error. `DeactivateAll` restarts the capabilities
+    /// phase; `ServerRedirect` short-circuits to `Connected`.
+    fn step_finalization_wait_pdu(&mut self, input: &[u8]) -> ConnectorResult<Written> {
         let pdu_type = self.decode_finalization_pdu(input)?;
 
         match pdu_type {
             FinalizationPduResult::DataPdu(t) if t == ShareDataPduType::FontMap => {
-                // Font Map received — connection complete
                 self.transition_to_connected();
             }
             FinalizationPduResult::Redirect(redir) => {
@@ -1933,11 +1919,13 @@ impl ClientConnector {
                 self.transition_to_connected();
             }
             FinalizationPduResult::DeactivateAll => {
+                // MS-RDPBCGR §1.3.1.3 — caller should check deactivation_count() to flush caches
                 self.deactivation_count = self.deactivation_count.saturating_add(1);
                 self.state = ClientConnectorState::CapabilitiesExchangeWaitDemandActive;
             }
             _ => {
-                // Informational, unexpected, or non-FontMap data PDU — stay in current state
+                // Synchronize / Cooperate / GrantedControl / informational —
+                // silently consume; only FontMap completes the sequence.
             }
         }
         Ok(Written::nothing())
@@ -2145,29 +2133,8 @@ impl Sequence for ClientConnector {
             ClientConnectorState::ConnectionFinalizationSendFontList => {
                 self.step_finalization_send_font_list(output)
             }
-            ClientConnectorState::ConnectionFinalizationWaitSynchronize => {
-                self.step_finalization_wait_pdu(
-                    input,
-                    ShareDataPduType::Synchronize,
-                    ClientConnectorState::ConnectionFinalizationWaitCooperate,
-                )
-            }
-            ClientConnectorState::ConnectionFinalizationWaitCooperate => {
-                self.step_finalization_wait_pdu(
-                    input,
-                    ShareDataPduType::Control,
-                    ClientConnectorState::ConnectionFinalizationWaitGrantedControl,
-                )
-            }
-            ClientConnectorState::ConnectionFinalizationWaitGrantedControl => {
-                self.step_finalization_wait_pdu(
-                    input,
-                    ShareDataPduType::Control,
-                    ClientConnectorState::ConnectionFinalizationWaitFontMap,
-                )
-            }
             ClientConnectorState::ConnectionFinalizationWaitFontMap => {
-                self.step_finalization_wait_font_map(input)
+                self.step_finalization_wait_pdu(input)
             }
             ClientConnectorState::Connected { .. } => {
                 Err(ConnectorError {
@@ -3130,22 +3097,61 @@ mod tests {
         frame
     }
 
+    /// Helpers for synthesising the four finalization-phase PDUs in the
+    /// regression tests below.
+    fn synchronize_frame(io_channel_id: u16, share_id: u32, target_user: u16) -> Vec<u8> {
+        use justrdp_pdu::rdp::finalization::SynchronizePdu;
+        let body = justrdp_core::encode_vec(&SynchronizePdu {
+            message_type: 1,
+            target_user,
+        })
+        .unwrap();
+        build_server_data_frame(io_channel_id, share_id, ShareDataPduType::Synchronize, &body)
+    }
+
+    fn cooperate_frame(io_channel_id: u16, share_id: u32) -> Vec<u8> {
+        use justrdp_pdu::rdp::finalization::{ControlAction, ControlPdu};
+        let body = justrdp_core::encode_vec(&ControlPdu {
+            action: ControlAction::Cooperate,
+            grant_id: 0,
+            control_id: 0,
+        })
+        .unwrap();
+        build_server_data_frame(io_channel_id, share_id, ShareDataPduType::Control, &body)
+    }
+
+    fn granted_control_frame(io_channel_id: u16, share_id: u32, user_channel_id: u16) -> Vec<u8> {
+        use justrdp_pdu::rdp::finalization::{ControlAction, ControlPdu};
+        let body = justrdp_core::encode_vec(&ControlPdu {
+            action: ControlAction::GrantedControl,
+            grant_id: user_channel_id,
+            control_id: 0x0000_03EA,
+        })
+        .unwrap();
+        build_server_data_frame(io_channel_id, share_id, ShareDataPduType::Control, &body)
+    }
+
+    fn font_map_frame(io_channel_id: u16, share_id: u32) -> Vec<u8> {
+        use justrdp_pdu::rdp::finalization::FontListPdu;
+        let body = justrdp_core::encode_vec(&FontListPdu::default_request()).unwrap();
+        build_server_data_frame(io_channel_id, share_id, ShareDataPduType::FontMap, &body)
+    }
+
     #[test]
     fn finalization_stores_monitor_layout_in_connection_result() {
-        use justrdp_pdu::rdp::finalization::{FontListPdu, MonitorLayoutPdu, SynchronizePdu, ControlPdu, ControlAction};
+        use justrdp_pdu::rdp::finalization::MonitorLayoutPdu;
 
         let config = Config::builder("user", "pass").build();
         let mut connector = ClientConnector::new(config);
 
-        // Set up connector in finalization wait state
-        connector.state = ClientConnectorState::ConnectionFinalizationWaitSynchronize;
+        connector.state = ClientConnectorState::ConnectionFinalizationWaitFontMap;
         connector.io_channel_id = 1003;
         connector.user_channel_id = 1007;
         connector.share_id = 0x00040006;
 
         let mut output = WriteBuf::new();
 
-        // Server sends MonitorLayoutPdu (arrives before Synchronize — stored, state unchanged)
+        // Informational MonitorLayoutPdu must be absorbed without leaving WaitFontMap.
         let monitor_pdu = MonitorLayoutPdu {
             monitors: vec![
                 MonitorLayoutEntry { left: 0, top: 0, right: 1919, bottom: 1079, flags: TS_MONITOR_PRIMARY },
@@ -3155,39 +3161,27 @@ mod tests {
         let monitor_body = justrdp_core::encode_vec(&monitor_pdu).unwrap();
         let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::MonitorLayoutPdu, &monitor_body);
         connector.step(&frame, &mut output).unwrap();
-        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitSynchronize);
-
-        // Server sends Synchronize → advance to WaitCooperate
-        let sync = SynchronizePdu { message_type: 1, target_user: 1003 };
-        let sync_body = justrdp_core::encode_vec(&sync).unwrap();
-        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::Synchronize, &sync_body);
-        connector.step(&frame, &mut output).unwrap();
-        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitCooperate);
-
-        // Server sends Control(Cooperate) → advance to WaitGrantedControl
-        let coop = ControlPdu { action: ControlAction::Cooperate, grant_id: 0, control_id: 0 };
-        let coop_body = justrdp_core::encode_vec(&coop).unwrap();
-        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::Control, &coop_body);
-        connector.step(&frame, &mut output).unwrap();
-        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitGrantedControl);
-
-        // Server sends Control(GrantedControl) → advance to WaitFontMap
-        let grant = ControlPdu { action: ControlAction::GrantedControl, grant_id: 1007, control_id: 1007 };
-        let grant_body = justrdp_core::encode_vec(&grant).unwrap();
-        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::Control, &grant_body);
-        connector.step(&frame, &mut output).unwrap();
         assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitFontMap);
 
-        // Server sends FontMap → transition to Connected (FontMapPdu = FontListPdu)
-        let font_map = FontListPdu::default_request();
-        let fm_body = justrdp_core::encode_vec(&font_map).unwrap();
-        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::FontMap, &fm_body);
+        // The remaining three pre-FontMap PDUs are silently consumed.
+        for frame in [
+            synchronize_frame(1003, 0x00040006, 1003),
+            cooperate_frame(1003, 0x00040006),
+            granted_control_frame(1003, 0x00040006, 1007),
+        ] {
+            connector.step(&frame, &mut output).unwrap();
+            assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitFontMap);
+        }
+
+        // FontMap is the only PDU that flips us to Connected.
+        let frame = font_map_frame(1003, 0x00040006);
         connector.step(&frame, &mut output).unwrap();
 
-        // Verify Connected state with monitor layout
         match connector.state() {
             ClientConnectorState::Connected { result } => {
-                let layout = result.server_monitor_layout.as_ref()
+                let layout = result
+                    .server_monitor_layout
+                    .as_ref()
                     .expect("server_monitor_layout should be populated");
                 assert_eq!(layout.len(), 2);
                 assert_eq!(layout[0].left, 0);
@@ -3198,6 +3192,154 @@ mod tests {
             }
             other => panic!("expected Connected, got {:?}", other),
         }
+    }
+
+    /// Reproduces the §5.3.1 P0 wedge: server delivers the four
+    /// finalization PDUs in a non-canonical order. The connector MUST
+    /// reach `Connected` regardless of arrival order — only FontMap is
+    /// normatively the last PDU (MS-RDPBCGR §2.2.1.22), and the receive
+    /// order of Synchronize / Cooperate / GrantedControl is unconstrained
+    /// on the client side. This is a regression test for the
+    /// pre-existing `step_finalization_wait_pdu` silent-drop wedge
+    /// referenced by `crates/justrdp-blocking/examples/connect_test.rs`.
+    #[test]
+    fn finalization_accepts_pdus_in_arbitrary_order() {
+        // All permutations of the three non-terminal PDUs followed by FontMap.
+        let permutations: &[[u8; 3]] = &[
+            [0, 1, 2], [0, 2, 1],
+            [1, 0, 2], [1, 2, 0],
+            [2, 0, 1], [2, 1, 0],
+        ];
+
+        for perm in permutations {
+            let config = Config::builder("user", "pass").build();
+            let mut connector = ClientConnector::new(config);
+            connector.state = ClientConnectorState::ConnectionFinalizationWaitFontMap;
+            connector.io_channel_id = 1003;
+            connector.user_channel_id = 1007;
+            connector.share_id = 0x00040006;
+
+            let frames = [
+                synchronize_frame(1003, 0x00040006, 1003),
+                cooperate_frame(1003, 0x00040006),
+                granted_control_frame(1003, 0x00040006, 1007),
+            ];
+
+            let mut output = WriteBuf::new();
+            for &idx in perm {
+                connector.step(&frames[idx as usize], &mut output).unwrap();
+                assert_eq!(
+                    *connector.state(),
+                    ClientConnectorState::ConnectionFinalizationWaitFontMap,
+                    "permutation {:?} stalled before FontMap",
+                    perm,
+                );
+            }
+            let fm = font_map_frame(1003, 0x00040006);
+            connector.step(&fm, &mut output).unwrap();
+            assert!(
+                matches!(connector.state(), ClientConnectorState::Connected { .. }),
+                "permutation {:?} did not reach Connected on FontMap",
+                perm,
+            );
+        }
+    }
+
+    /// FontMap arriving as the *first* finalization PDU also completes the
+    /// sequence. Some servers (especially fast loopback handshakes) have
+    /// been observed reordering FontMap ahead of the others; the connector
+    /// must not stall waiting for PDUs the server already considers
+    /// implicit.
+    #[test]
+    fn finalization_completes_when_font_map_arrives_first() {
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        connector.state = ClientConnectorState::ConnectionFinalizationWaitFontMap;
+        connector.io_channel_id = 1003;
+        connector.user_channel_id = 1007;
+        connector.share_id = 0x00040006;
+
+        let mut output = WriteBuf::new();
+        let fm = font_map_frame(1003, 0x00040006);
+        connector.step(&fm, &mut output).unwrap();
+
+        assert!(matches!(
+            connector.state(),
+            ClientConnectorState::Connected { .. }
+        ));
+    }
+
+    /// Real Windows servers interleave SaveSessionInfo / MonitorLayout /
+    /// SetErrorInfo (with `ERRINFO_NONE`) between the four finalization
+    /// PDUs. None of these may stall the wait; only FontMap completes
+    /// the phase, and a non-zero `SetErrorInfo` is the only fatal case.
+    #[test]
+    fn finalization_absorbs_interleaved_informational_pdus() {
+        use justrdp_pdu::rdp::finalization::{
+            SaveSessionInfoData, SaveSessionInfoPdu, SetErrorInfoPdu,
+        };
+
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        connector.state = ClientConnectorState::ConnectionFinalizationWaitFontMap;
+        connector.io_channel_id = 1003;
+        connector.user_channel_id = 1007;
+        connector.share_id = 0x00040006;
+
+        let mut output = WriteBuf::new();
+
+        // SetErrorInfo with ERRINFO_NONE → ignored.
+        let err_body = justrdp_core::encode_vec(&SetErrorInfoPdu { error_info: 0 }).unwrap();
+        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::SetErrorInfo, &err_body);
+        connector.step(&frame, &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitFontMap);
+
+        // SaveSessionInfo (logon plain-notify, 576 bytes of padding) → ignored.
+        let info_body = justrdp_core::encode_vec(&SaveSessionInfoPdu {
+            info_data: SaveSessionInfoData::PlainNotify,
+        })
+        .unwrap();
+        let frame = build_server_data_frame(
+            1003,
+            0x00040006,
+            ShareDataPduType::SaveSessionInfo,
+            &info_body,
+        );
+        connector.step(&frame, &mut output).unwrap();
+        assert_eq!(*connector.state(), ClientConnectorState::ConnectionFinalizationWaitFontMap);
+
+        // Now FontMap completes.
+        let fm = font_map_frame(1003, 0x00040006);
+        connector.step(&fm, &mut output).unwrap();
+        assert!(matches!(
+            connector.state(),
+            ClientConnectorState::Connected { .. }
+        ));
+    }
+
+    /// SetErrorInfo with a non-zero error code MUST surface as a
+    /// connector error — silently absorbing it would mask a fatal
+    /// server-side condition during finalization.
+    #[test]
+    fn finalization_propagates_fatal_set_error_info() {
+        use justrdp_pdu::rdp::finalization::SetErrorInfoPdu;
+
+        let config = Config::builder("user", "pass").build();
+        let mut connector = ClientConnector::new(config);
+        connector.state = ClientConnectorState::ConnectionFinalizationWaitFontMap;
+        connector.io_channel_id = 1003;
+        connector.user_channel_id = 1007;
+        connector.share_id = 0x00040006;
+
+        let body = justrdp_core::encode_vec(&SetErrorInfoPdu {
+            error_info: 0x0000_0001, // ERRINFO_RPC_INITIATED_DISCONNECT
+        })
+        .unwrap();
+        let frame = build_server_data_frame(1003, 0x00040006, ShareDataPduType::SetErrorInfo, &body);
+
+        let mut output = WriteBuf::new();
+        let result = connector.step(&frame, &mut output);
+        assert!(result.is_err(), "non-zero SetErrorInfo must error out");
     }
 
     /// Build a ServerRedirectionPdu wire body by hand. The PDU has no
@@ -3262,8 +3404,8 @@ mod tests {
         let config = Config::builder("user", "pass").build();
         let mut connector = ClientConnector::new(config);
 
-        // Set up connector mid-finalization (waiting for Synchronize).
-        connector.state = ClientConnectorState::ConnectionFinalizationWaitSynchronize;
+        // Set up connector mid-finalization (single unified wait state).
+        connector.state = ClientConnectorState::ConnectionFinalizationWaitFontMap;
         connector.io_channel_id = 1003;
         connector.user_channel_id = 1007;
         connector.share_id = 0x00040006;
@@ -3303,9 +3445,11 @@ mod tests {
 
     #[test]
     fn finalization_wait_font_map_handles_server_redirect() {
-        // Mirror of the WaitSynchronize test for the WaitFontMap branch.
-        // Both finalization wait functions must handle the redirect — a
-        // broker may send the redirect mid-finalization at either point.
+        // Companion to `finalization_wait_pdu_handles_server_redirect`:
+        // exercises the redirect path with `LB_TARGET_NET_ADDRESS` instead
+        // of `LB_LOAD_BALANCE_INFO`. A broker may issue the redirect at
+        // any point during finalization; both PDU shapes must short-
+        // circuit to `Connected`.
         use justrdp_pdu::rdp::redirection::{LB_TARGET_NET_ADDRESS, SEC_REDIRECTION_PKT};
 
         let config = Config::builder("user", "pass").build();

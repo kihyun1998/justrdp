@@ -553,9 +553,9 @@ pub enum ClientConnectorState {
     ConnectionFinalizationSendRequestControl,
     ConnectionFinalizationSendPersistentKeyList,
     ConnectionFinalizationSendFontList,
-    ConnectionFinalizationWaitSynchronize,
-    ConnectionFinalizationWaitCooperate,
-    ConnectionFinalizationWaitGrantedControl,
+    // Single unified wait state (FontMap is the last PDU per
+    // MS-RDPBCGR §2.2.1.22; preceding Sync/Cooperate/GrantedControl
+    // are silently consumed in any order — see §5.3.1).
     ConnectionFinalizationWaitFontMap,
 
     // Terminal
@@ -716,20 +716,24 @@ pub enum ClientConnectorState {
 - [x] integration test 디버그 hex dump 코드 정리
 - [x] PRNG `simple_random_seed()` → OS 랜덤(`getrandom`) 교체
 
-#### 5.3.1 Known Issues (P0 — 출시 전 fix 필수)
+#### 5.3.1 Known Issues (P0 — 출시 전 fix 완료 2026-04-29)
 
-- [ ] **`step_finalization_wait_pdu` batched/out-of-order PDU drop** —
-      `crates/justrdp-blocking/examples/connect_test.rs:36-42` 에 pre-existing
-      issue 로 기록됨. Windows Server 가 Synchronize 보다 Cooperate/
-      GrantedControl 을 먼저 보내거나 여러 PDU 를 단일 TPKT 로 batching
-      하면 36 바이트 받고 silent drop → ECONNRESET. M7 데모에서 재현,
-      `tests/integration/src/main.rs` 도 동일 실패. fix 전까지 실서버
-      활성 세션 유지 불가. 검증: connect_test.rs 가 disconnect 없이
-      30s 이상 frame stream 수신해야 PASS.
-- [ ] **batched PDU 입력 처리 회귀 테스트** — 위 fix 후 mock 으로
-      `Synchronize | Cooperate | GrantedControl | FontMap` 4개 PDU 를
-      단일 TPKT 페이로드로 주입하는 단위 테스트 + 임의 순서 재배열
-      케이스 4개. xrdp Docker E2E 에 finalization 분기 케이스 추가.
+- [x] **`step_finalization_wait_pdu` batched/out-of-order PDU drop** —
+      4개의 strict-ordered wait state(`WaitSynchronize`/`WaitCooperate`/
+      `WaitGrantedControl`/`WaitFontMap`) 를 단일 `WaitFontMap` 으로
+      축소. MS-RDPBCGR §1.3.1.1 은 server-send 순서만 normative 이고
+      client-receive 순서는 자유이며 §2.2.1.22 가 FontMap 을 "last
+      PDU" 로 규정하므로, FontMap 만 `Connected` 트리거이고 나머지
+      Synchronize/Cooperate/GrantedControl/Informational 은 silent
+      consume. Cooperate/GrantedControl 의 `pduType2 = Control` 모호성
+      도 자연스럽게 해소.
+- [x] **out-of-order finalization PDU 회귀 테스트** —
+      `finalization_accepts_pdus_in_arbitrary_order` (3-PDU 6개 순열
+      × FontMap 마지막), `finalization_completes_when_font_map_arrives_first`,
+      `finalization_absorbs_interleaved_informational_pdus`
+      (SetErrorInfo ERRINFO_NONE + SaveSessionInfo PlainNotify),
+      `finalization_propagates_fatal_set_error_info` (non-zero
+      ERRINFO 는 connector error 로 surface) 4개 테스트 추가.
 
 ### 5.4 `justrdp-tls` -- TLS Transport
 
@@ -874,7 +878,7 @@ pub enum RdpEvent {
         이라 현재는 on-demand/주간 스케줄
   - [x] Windows RDS E2E (manual, `192.168.136.136`) — connect_test 예제로 양방향 활성 세션 검증 (GraphicsUpdate + PointerBitmap + 입력 송신)
   - [x] Auto-reconnect: `test_drop_transport()` → `Reconnecting` → `Reconnected` → 정상 재개 (420ms)
-  - [x] Session redirection: connector-level wire-format injection test 2개 (WaitSynchronize + WaitFontMap 양쪽에서 LB cookie / TARGET_NET_ADDRESS 검증)
+  - [x] Session redirection: connector-level wire-format injection test 2개 (단일 `WaitFontMap` state에서 LB cookie / TARGET_NET_ADDRESS 양쪽 검증)
 
 #### 5.5.1 Non-blocking follow-ups
 

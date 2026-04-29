@@ -104,13 +104,14 @@ pub enum ClientConnectorState {
     ConnectionFinalizationSendPersistentKeyList,
     /// Send Font List PDU.
     ConnectionFinalizationSendFontList,
-    /// Wait for server Synchronize PDU.
-    ConnectionFinalizationWaitSynchronize,
-    /// Wait for server Control(Cooperate) PDU.
-    ConnectionFinalizationWaitCooperate,
-    /// Wait for server Control(GrantedControl) PDU.
-    ConnectionFinalizationWaitGrantedControl,
-    /// Wait for server Font Map PDU.
+    /// Wait for server finalization PDUs. Per MS-RDPBCGR §2.2.1.22 the
+    /// Server Font Map PDU is the **last** PDU of the connection sequence,
+    /// so it is the sole trigger for `Connected`. The preceding three PDUs
+    /// (Synchronize §2.2.1.19, Control-Cooperate §2.2.1.20, Control-
+    /// GrantedControl §2.2.1.21) are accepted in any order and silently
+    /// consumed — the spec does not constrain the client receive order, and
+    /// a strict per-PDU state chain wedges when servers interleave
+    /// SaveSessionInfo / MonitorLayout / out-of-order frames.
     ConnectionFinalizationWaitFontMap,
 
     // ── Terminal ──
@@ -157,9 +158,6 @@ impl ClientConnectorState {
             Self::ConnectionFinalizationSendRequestControl => "ConnectionFinalizationSendRequestControl",
             Self::ConnectionFinalizationSendPersistentKeyList => "ConnectionFinalizationSendPersistentKeyList",
             Self::ConnectionFinalizationSendFontList => "ConnectionFinalizationSendFontList",
-            Self::ConnectionFinalizationWaitSynchronize => "ConnectionFinalizationWaitSynchronize",
-            Self::ConnectionFinalizationWaitCooperate => "ConnectionFinalizationWaitCooperate",
-            Self::ConnectionFinalizationWaitGrantedControl => "ConnectionFinalizationWaitGrantedControl",
             Self::ConnectionFinalizationWaitFontMap => "ConnectionFinalizationWaitFontMap",
             Self::Connected { .. } => "Connected",
         }

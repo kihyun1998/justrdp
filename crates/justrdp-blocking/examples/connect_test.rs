@@ -22,24 +22,15 @@
 //!   2 — runtime error
 //!   3 — argument parsing failed
 //!
-//! # Validation status (manual run, 2026-04-10, target 192.168.136.136)
+//! # Validation status (manual run, target 192.168.136.136)
 //!
-//! Pumps successfully through TCP → X.224 → TLS → CredSSP/NLA →
+//! Pumps through the full sequence: TCP → X.224 → TLS → CredSSP/NLA →
 //! BasicSettingsExchange → ChannelConnection → CapabilitiesExchange →
-//! most of ConnectionFinalization (Confirm Active, Synchronize, Cooperate,
-//! RequestControl, PersistentKeyList, FontList sent), then dies in
-//! `ConnectionFinalizationWaitSynchronize` after receiving 36 bytes from
-//! the server: the connector's `step_finalization_wait_pdu` (connector.rs
-//! ~line 1721) silently drops the PDU when `pdu_type2 != expected_type`,
-//! and the loop tries to read another PDU which never arrives → ECONNRESET.
-//!
-//! The same failure mode reproduces with `tests/integration/src/main.rs`,
-//! which is hand-rolled against the connector directly. So this is a
-//! pre-existing connector finalization issue (likely a Windows server
-//! sending Cooperate/GrantedControl before Synchronize, or batching
-//! multiple PDUs into one TPKT frame), **not** a regression introduced
-//! by `justrdp-blocking`. Fixing it is out of scope for the M7 example
-//! task and tracked separately.
+//! ConnectionFinalization (single unified `ConnectionFinalizationWaitFontMap`
+//! state — Synchronize/Cooperate/GrantedControl are silently consumed in
+//! arrival order; only FontMap completes the phase per MS-RDPBCGR
+//! §2.2.1.22). Successful completion: live frame stream from the server
+//! after `Connected`.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
