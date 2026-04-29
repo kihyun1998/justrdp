@@ -117,6 +117,73 @@ enum DecoderSlot {
 /// actually picks.
 type ExternalDecoderHandle = Arc<Mutex<dyn ExternalAudioDecoder>>;
 
+/// Type alias for a shareable embedder-supplied [`RdpsndBackend`].
+///
+/// When the embedder owns the audio sink (CPAL / OpenSL / WASAPI),
+/// they hand ownership in via [`AudioChannel::from_connection_with_backend`].
+/// Internally we register a [`BackendProxy`] for each
+/// [`RdpsndClient`] (SVC + reliable DVC + lossy DVC) so all three
+/// transports route to the *same* backend instance — the server
+/// only ever picks one, but the embedder doesn't have to know which
+/// in advance.
+type ExternalBackendHandle = Arc<Mutex<dyn RdpsndBackend>>;
+
+/// Internal selector for which backend strategy [`AudioChannel::build`]
+/// uses when wiring up the per-`RdpsndClient` backends. Matches the
+/// public constructor surface 1:1 so adding a new mode is a single
+/// variant + matching constructor.
+enum BackendMode {
+    /// Bundled `SharedBackend` — pushes decoded PCM into the shared
+    /// `AudioState` FIFO so the embedder can drain via `take_frame`.
+    /// `external_decoder` is the optional `ExternalAudioDecoder`
+    /// adapter for codecs the bundled stack doesn't handle.
+    Bundled {
+        external_decoder: Option<ExternalDecoderHandle>,
+    },
+    /// Embedder-owned backend behind a `BackendProxy` — every
+    /// `RdpsndClient` instance gets a proxy that delegates to the
+    /// same `Arc<Mutex<dyn RdpsndBackend>>`.
+    External(ExternalBackendHandle),
+}
+
+/// `RdpsndBackend` proxy that delegates every callback to a shared
+/// embedder-owned backend. The lock is acquired per-call; the
+/// drdynvc / SVC pump never holds it across a `recv()`, so contention
+/// stays trivial in practice.
+struct BackendProxy {
+    inner: ExternalBackendHandle,
+}
+
+impl RdpsndBackend for BackendProxy {
+    fn on_server_formats(&mut self, server_formats: &[AudioFormat]) -> Vec<usize> {
+        // A poisoned mutex is treated as "accept nothing": it's
+        // better than panicking inside the rdpsnd state machine and
+        // tearing down the whole transport.
+        match self.inner.lock() {
+            Ok(mut g) => g.on_server_formats(server_formats),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn on_wave_data(&mut self, format_no: u16, data: &[u8], audio_timestamp: Option<u32>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.on_wave_data(format_no, data, audio_timestamp);
+        }
+    }
+
+    fn on_volume(&mut self, volume: &VolumePdu) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.on_volume(volume);
+        }
+    }
+
+    fn on_close(&mut self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.on_close();
+        }
+    }
+}
+
 /// Maximum sample rate the bundled decode buffer is sized for.
 const MAX_SAMPLE_RATE_HZ: usize = 48_000;
 /// Maximum channel count we accept.
@@ -568,7 +635,7 @@ impl AudioChannel {
     /// from whichever route the server actually uses land in the same
     /// FIFO.
     pub fn from_connection(result: &ConnectionResult) -> Result<Self, AudioChannelError> {
-        Self::build(result, None)
+        Self::build(result, BackendMode::Bundled { external_decoder: None })
     }
 
     /// Same as [`Self::from_connection`] but with an embedder-injected
@@ -593,12 +660,38 @@ impl AudioChannel {
         // happens here because the binding's annotated type is the
         // unsized handle.
         let handle: ExternalDecoderHandle = Arc::new(Mutex::new(external_decoder));
-        Self::build(result, Some(handle))
+        Self::build(result, BackendMode::Bundled { external_decoder: Some(handle) })
+    }
+
+    /// Construct with an embedder-owned [`RdpsndBackend`] in place of
+    /// the bundled FIFO-backed backend.
+    ///
+    /// Native embedders (CPAL / OpenSL / WASAPI) typically want
+    /// audio bytes pushed directly into their own audio device; the
+    /// bundled `AudioState` FIFO becomes pointless. With this
+    /// constructor the channel skips `SharedBackend` entirely and
+    /// installs a [`BackendProxy`] for every [`RdpsndClient`]
+    /// (SVC + reliable DVC + lossy DVC) that delegates to the shared
+    /// `Arc<Mutex<dyn RdpsndBackend>>`.
+    ///
+    /// [`AudioChannel::take_frame`] returns `None` and
+    /// [`AudioState::pending_frame_count`] stays zero in this mode —
+    /// state lives inside the embedder's backend.
+    pub fn from_connection_with_backend<B>(
+        result: &ConnectionResult,
+        backend: B,
+    ) -> Result<Self, AudioChannelError>
+    where
+        B: RdpsndBackend + 'static,
+    {
+        // Same unsizing-coercion trick as `from_connection_with_external_decoder`.
+        let handle: ExternalBackendHandle = Arc::new(Mutex::new(backend));
+        Self::build(result, BackendMode::External(handle))
     }
 
     fn build(
         result: &ConnectionResult,
-        external_decoder: Option<ExternalDecoderHandle>,
+        backend_mode: BackendMode,
     ) -> Result<Self, AudioChannelError> {
         let rdpsnd_channel_id = result
             .channel_ids
@@ -620,10 +713,22 @@ impl AudioChannel {
         let mut id_assignments: Vec<(String, u16)> = Vec::new();
         let mut audio_input: Option<Arc<Mutex<AudioInputClient>>> = None;
 
-        let make_backend = |state: Arc<Mutex<AudioState>>| -> Box<SharedBackend> {
-            match &external_decoder {
-                Some(ext) => Box::new(SharedBackend::with_external_decoder(state, Arc::clone(ext))),
-                None => Box::new(SharedBackend::new(state)),
+        // One factory used at every place an `RdpsndClient` (or DVC
+        // variant) is created. With the bundled mode, every call
+        // produces a fresh `SharedBackend` that pushes into the same
+        // `AudioState`. With the external mode, every call produces
+        // a `BackendProxy` over the same `Arc<Mutex<dyn RdpsndBackend>>`
+        // — so all three transports route to the embedder's single
+        // backend instance.
+        let make_backend = |state: Arc<Mutex<AudioState>>| -> Box<dyn RdpsndBackend> {
+            match &backend_mode {
+                BackendMode::Bundled { external_decoder } => match external_decoder {
+                    Some(ext) => Box::new(SharedBackend::with_external_decoder(state, Arc::clone(ext))),
+                    None => Box::new(SharedBackend::new(state)),
+                },
+                BackendMode::External(handle) => Box::new(BackendProxy {
+                    inner: Arc::clone(handle),
+                }),
             }
         };
 
@@ -636,10 +741,10 @@ impl AudioChannel {
 
         if let Some(id) = drdynvc_channel_id {
             // Reliable DVC and lossy DVC each take their own backend
-            // (each owns a separate decoder cache); both push decoded
-            // frames into the shared `AudioState`. In practice the
-            // server picks one, but registering both leaves the choice
-            // to the server.
+            // (bundled mode: separate decoder caches; external mode:
+            // each is a proxy to the same shared backend). In
+            // practice the server picks one transport, but
+            // registering both leaves the choice to the server.
             let reliable_backend = make_backend(Arc::clone(&state));
             let lossy_backend = make_backend(Arc::clone(&state));
             let mut drdynvc = DrdynvcClient::new();
@@ -1338,6 +1443,125 @@ mod tests {
         assert_eq!(drdynvc.channel_id_by_name("AUDIO_PLAYBACK_DVC"), None);
         assert_eq!(drdynvc.channel_id_by_name("AUDIO_PLAYBACK_LOSSY_DVC"), None);
         assert_eq!(drdynvc.channel_id_by_name("AUDIO_INPUT"), None);
+    }
+
+    // ── Embedder-injected RdpsndBackend (S7-4) ──
+
+    /// Test backend that records every callback. Native embedders
+    /// (CPAL / WASAPI / OpenSL) substitute their own audio sink for
+    /// `SharedBackend`; this stub stands in for one in the test.
+    struct CountingBackend {
+        formats_calls: Arc<Mutex<u32>>,
+        wave_calls: Arc<Mutex<u32>>,
+        volume_calls: Arc<Mutex<u32>>,
+        close_calls: Arc<Mutex<u32>>,
+    }
+
+    impl RdpsndBackend for CountingBackend {
+        fn on_server_formats(&mut self, _server_formats: &[AudioFormat]) -> Vec<usize> {
+            *self.formats_calls.lock().unwrap() += 1;
+            Vec::new()
+        }
+        fn on_wave_data(&mut self, _format_no: u16, _data: &[u8], _ts: Option<u32>) {
+            *self.wave_calls.lock().unwrap() += 1;
+        }
+        fn on_volume(&mut self, _volume: &VolumePdu) {
+            *self.volume_calls.lock().unwrap() += 1;
+        }
+        fn on_close(&mut self) {
+            *self.close_calls.lock().unwrap() += 1;
+        }
+    }
+
+    #[test]
+    fn from_connection_with_backend_skips_bundled_state_fifo() {
+        // With a custom backend, `state()` is still allocated (the
+        // embedder may want it for diagnostics) but the
+        // pending_frames FIFO stays empty regardless of how the wire
+        // would have been processed — the bundled SharedBackend is
+        // not in the chain.
+        let result = make_result_with(vec![(String::from("rdpsnd"), 1005)]);
+        let backend = CountingBackend {
+            formats_calls: Arc::new(Mutex::new(0)),
+            wave_calls: Arc::new(Mutex::new(0)),
+            volume_calls: Arc::new(Mutex::new(0)),
+            close_calls: Arc::new(Mutex::new(0)),
+        };
+        let ch = AudioChannel::from_connection_with_backend(&result, backend).unwrap();
+        assert_eq!(ch.rdpsnd_channel_id(), Some(1005));
+        // pending_frames is empty — that's the bundled-FIFO field
+        // which the custom backend bypasses.
+        assert_eq!(ch.state().lock().unwrap().pending_frame_count(), 0);
+    }
+
+    #[test]
+    fn backend_proxy_delegates_to_shared_handle() {
+        // Drive a `BackendProxy` directly to confirm the lock-and-
+        // delegate plumbing works for every callback. (The proxy is
+        // private; we exercise it through `from_connection_with_backend`
+        // which constructs one for each registered RdpsndClient.)
+        let formats_calls = Arc::new(Mutex::new(0u32));
+        let wave_calls = Arc::new(Mutex::new(0u32));
+        let volume_calls = Arc::new(Mutex::new(0u32));
+        let close_calls = Arc::new(Mutex::new(0u32));
+        let backend = CountingBackend {
+            formats_calls: Arc::clone(&formats_calls),
+            wave_calls: Arc::clone(&wave_calls),
+            volume_calls: Arc::clone(&volume_calls),
+            close_calls: Arc::clone(&close_calls),
+        };
+        let handle: ExternalBackendHandle = Arc::new(Mutex::new(backend));
+        let mut proxy = BackendProxy {
+            inner: Arc::clone(&handle),
+        };
+        proxy.on_server_formats(&[AudioFormat::pcm(2, 44_100, 16)]);
+        proxy.on_wave_data(0, &[0u8; 4], None);
+        proxy.on_volume(&VolumePdu { volume: 0 });
+        proxy.on_close();
+        assert_eq!(*formats_calls.lock().unwrap(), 1);
+        assert_eq!(*wave_calls.lock().unwrap(), 1);
+        assert_eq!(*volume_calls.lock().unwrap(), 1);
+        assert_eq!(*close_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn from_connection_with_backend_dvc_paths_share_one_backend() {
+        // SVC + reliable DVC + lossy DVC each get their own
+        // BackendProxy clone — but every proxy delegates to the same
+        // shared backend handle. Verify by counting that the embedder's
+        // backend instance is constructed once (not three times)
+        // when `drdynvc` is also negotiated.
+        struct Marker(Arc<Mutex<u32>>);
+        impl RdpsndBackend for Marker {
+            fn on_server_formats(&mut self, _: &[AudioFormat]) -> Vec<usize> {
+                Vec::new()
+            }
+            fn on_wave_data(&mut self, _: u16, _: &[u8], _: Option<u32>) {}
+            fn on_volume(&mut self, _: &VolumePdu) {}
+            fn on_close(&mut self) {}
+        }
+        impl Drop for Marker {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+
+        let drops = Arc::new(Mutex::new(0u32));
+        let result = make_result_with(vec![
+            (String::from("rdpsnd"), 1005),
+            (String::from("drdynvc"), 1006),
+        ]);
+        {
+            let backend = Marker(Arc::clone(&drops));
+            let _ch = AudioChannel::from_connection_with_backend(&result, backend).unwrap();
+            // While the channel is alive, the backend hasn't been
+            // dropped — even though it's referenced by 3 proxies
+            // (SVC + reliable DVC + lossy DVC).
+            assert_eq!(*drops.lock().unwrap(), 0);
+        }
+        // After the channel drops, all proxies drop their Arc clones;
+        // the underlying backend hits its single `Drop` exactly once.
+        assert_eq!(*drops.lock().unwrap(), 1);
     }
 
     #[test]

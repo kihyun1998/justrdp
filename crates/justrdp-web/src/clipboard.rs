@@ -146,6 +146,44 @@ impl ClipboardChannel {
     /// handshake driver. Looks up the `cliprdr` channel by name and
     /// instantiates the inner [`CliprdrClient`].
     pub fn from_connection(result: &ConnectionResult) -> Result<Self, ClipboardChannelError> {
+        let state: Arc<Mutex<ClipboardState>> = Arc::new(Mutex::new(ClipboardState::default()));
+        let backend: Box<dyn CliprdrBackend> = Box::new(SharedBackend {
+            state: Arc::clone(&state),
+        });
+        Self::build(result, backend, state)
+    }
+
+    /// Construct with an embedder-owned [`CliprdrBackend`] in place of
+    /// the bundled `SharedBackend`.
+    ///
+    /// Native embedders typically want clipboard formats routed
+    /// directly to the host clipboard (e.g. `arboard`,
+    /// `clipboard-win`, NSPasteboard) without going through the
+    /// bundled `ClipboardState` cache. This constructor skips
+    /// `SharedBackend` and hands the supplied backend straight to
+    /// [`CliprdrClient`].
+    ///
+    /// `set_local_format_data` and `take_remote_format_data` still
+    /// operate against the bundled `ClipboardState` (they're
+    /// state-cache convenience APIs); embedders using a custom
+    /// backend will typically not call them and instead drive
+    /// clipboard sync from inside their backend.
+    pub fn from_connection_with_backend<B>(
+        result: &ConnectionResult,
+        backend: B,
+    ) -> Result<Self, ClipboardChannelError>
+    where
+        B: CliprdrBackend + 'static,
+    {
+        let state: Arc<Mutex<ClipboardState>> = Arc::new(Mutex::new(ClipboardState::default()));
+        Self::build(result, Box::new(backend), state)
+    }
+
+    fn build(
+        result: &ConnectionResult,
+        backend: Box<dyn CliprdrBackend>,
+        state: Arc<Mutex<ClipboardState>>,
+    ) -> Result<Self, ClipboardChannelError> {
         let cliprdr_channel_id = result
             .channel_ids
             .iter()
@@ -153,12 +191,7 @@ impl ClipboardChannel {
             .map(|(_, id)| *id)
             .ok_or(ClipboardChannelError::ChannelNotNegotiated)?;
 
-        let state: Arc<Mutex<ClipboardState>> = Arc::new(Mutex::new(ClipboardState::default()));
-        let backend = Box::new(SharedBackend {
-            state: Arc::clone(&state),
-        });
         let cliprdr = Box::new(CliprdrClient::new(backend));
-
         let mut channels = StaticChannelSet::new();
         channels.insert(cliprdr).map_err(ClipboardChannelError::Svc)?;
         channels.assign_ids(&[(String::from("cliprdr"), cliprdr_channel_id)]);
@@ -302,6 +335,51 @@ mod tests {
         let mut ch = ClipboardChannel::from_connection(&result).unwrap();
         let frames = ch.process_channel_data(2000, &[0u8; 16]).unwrap();
         assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn from_connection_with_backend_routes_through_custom_backend() {
+        // Native embedders inject their own CliprdrBackend (arboard,
+        // clipboard-win, NSPasteboard) instead of going through the
+        // bundled `SharedBackend` cache. This verifies the
+        // alternate constructor wires the channel without panicking
+        // and exposes the same channel-id / state surface.
+        struct StubBackend {
+            calls: Arc<Mutex<u32>>,
+        }
+        impl CliprdrBackend for StubBackend {
+            fn on_format_list(
+                &mut self,
+                _formats: &[LongFormatName],
+            ) -> ClipboardResult<FormatListResponse> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(FormatListResponse::Ok)
+            }
+            fn on_format_data_request(&mut self, _format_id: u32) -> ClipboardResult<FormatDataResponse> {
+                Ok(FormatDataResponse::Fail)
+            }
+            fn on_format_data_response(
+                &mut self,
+                _data: &[u8],
+                _is_success: bool,
+                _format_id: Option<u32>,
+            ) {
+            }
+        }
+
+        let result = make_result(1004);
+        let calls = Arc::new(Mutex::new(0u32));
+        let backend = StubBackend {
+            calls: Arc::clone(&calls),
+        };
+        let ch = ClipboardChannel::from_connection_with_backend(&result, backend).unwrap();
+        assert_eq!(ch.channel_id(), 1004);
+        // The bundled `ClipboardState` is still allocated (state cache
+        // for `set_local_format_data` / `take_remote_format_data`),
+        // but the embedder's backend owns the actual on_* callback
+        // path. No callbacks have fired yet — `calls` stays zero
+        // until a real cliprdr PDU arrives.
+        assert_eq!(*calls.lock().unwrap(), 0);
     }
 
     #[test]
