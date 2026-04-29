@@ -15,6 +15,7 @@ members = [
     "crates/justrdp-dvc",
     "crates/justrdp-tls",
     "crates/justrdp-blocking",
+    "crates/justrdp-async",
     "crates/justrdp-tokio",
     "crates/justrdp-cliprdr",
     "crates/justrdp-rdpdr",
@@ -73,6 +74,7 @@ justrdp-session = { path = "crates/justrdp-session", version = "0.1.0" }
 justrdp-svc = { path = "crates/justrdp-svc", version = "0.1.0" }
 justrdp-tls = { path = "crates/justrdp-tls", version = "0.1.0" }
 justrdp-blocking = { path = "crates/justrdp-blocking", version = "0.1.0" }
+justrdp-async = { path = "crates/justrdp-async", version = "0.1.0" }
 justrdp-tokio = { path = "crates/justrdp-tokio", version = "0.1.0" }
 justrdp-cliprdr = { path = "crates/justrdp-cliprdr", version = "0.1.0" }
 justrdp-rdpdr = { path = "crates/justrdp-rdpdr", version = "0.1.0" }

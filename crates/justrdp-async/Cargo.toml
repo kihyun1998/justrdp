@@ -1,0 +1,18 @@
+[package]
+name = "justrdp-async"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Runtime-agnostic async RDP client core (WebTransport family + WebClient pump). Shared by justrdp-web (browser/wasm) and justrdp-tokio (native)."
+keywords = ["rdp", "async", "transport"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+# Skeleton only at this commit — driver/session/transport land in
+# follow-ups (§5.6.1 Phase 1 commits 2-4). Workspace deps will be
+# added together with the matching code moves.
+
+[dev-dependencies]

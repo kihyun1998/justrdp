@@ -1,0 +1,17 @@
+#![forbid(unsafe_code)]
+#![no_std]
+#![doc = "Runtime-agnostic async core for JustRDP."]
+#![doc = ""]
+#![doc = "This crate hosts the `WebTransport` byte-pipe trait, the"]
+#![doc = "`WebClient<T>` connection driver, the `ActiveSession<T>` post-handshake"]
+#![doc = "pump, and the `TlsUpgrade` / `CredsspDriver` adapter traits — i.e. the"]
+#![doc = "shared substrate that lets the same async client run unmodified on top"]
+#![doc = "of any byte transport (browser WebSocket, native TCP+TLS, RD Gateway,"]
+#![doc = "WebRTC DataChannel, …)."]
+#![doc = ""]
+#![doc = "At this commit the crate is an empty skeleton: the actual code is"]
+#![doc = "moved in from `justrdp-web` over the follow-up commits of §5.6.1"]
+#![doc = "Phase 1 in roadmap.md. Until that work lands, depend on `justrdp-web`"]
+#![doc = "directly for `WebTransport`/`WebClient`/`ActiveSession`."]
+
+extern crate alloc;

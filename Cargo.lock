@@ -797,6 +797,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-async"
+version = "0.1.0"
+
+[[package]]
 name = "justrdp-audio"
 version = "0.1.0"
 
