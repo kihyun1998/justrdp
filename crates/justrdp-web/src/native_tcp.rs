@@ -21,8 +21,7 @@ use alloc::vec::Vec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::error::TransportError;
-use crate::transport::WebTransport;
+use justrdp_async::{TransportError, WebTransport};
 
 /// Default per-`recv()` read buffer size. Sized so RemoteFX progressive
 /// frames (~64 KB tile-set headers) come back in one or two reads on a
@@ -156,7 +155,7 @@ impl WebTransport for NativeTcpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::TransportErrorKind;
+    use justrdp_async::TransportErrorKind;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 

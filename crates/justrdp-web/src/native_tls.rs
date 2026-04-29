@@ -45,10 +45,8 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio_rustls::TlsConnector;
 
-use crate::driver::TlsUpgrade;
-use crate::error::TransportError;
+use justrdp_async::{TlsUpgrade, TransportError, WebTransport};
 use crate::native_tcp::NativeTcpTransport;
-use crate::transport::WebTransport;
 
 /// Default per-`recv()` read buffer size — kept identical to
 /// [`NativeTcpTransport`] so post-TLS throughput patterns match.
@@ -280,7 +278,7 @@ impl ServerCertVerifier for NoVerify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::TransportErrorKind;
+    use justrdp_async::TransportErrorKind;
 
     #[test]
     fn dangerous_no_verify_accepts_dns_server_name() {

@@ -59,7 +59,7 @@ use justrdp_pdu::rdp::drawing_orders::{
 use justrdp_pdu::rdp::fast_path::FastPathUpdateType;
 use justrdp_pdu::rdp::surface_commands::{BitmapDataEx, SurfaceCommand, SURFACECMD_FRAMEACTION_END};
 
-use crate::session::SessionEvent;
+use justrdp_async::SessionEvent;
 
 /// Render-side failure modes.
 #[derive(Debug)]

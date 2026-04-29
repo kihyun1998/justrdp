@@ -11,8 +11,10 @@ keywords = ["rdp", "async", "transport"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-# Skeleton only at this commit — driver/session/transport land in
-# follow-ups (§5.6.1 Phase 1 commits 2-4). Workspace deps will be
-# added together with the matching code moves.
+justrdp-core = { workspace = true, features = ["alloc"] }
+justrdp-connector = { workspace = true }
+justrdp-pdu.workspace = true
+justrdp-session = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
+pollster = "0.3"

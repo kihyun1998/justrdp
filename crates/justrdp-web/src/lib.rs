@@ -23,12 +23,8 @@ extern crate alloc;
 
 mod audio;
 mod clipboard;
-mod driver;
-mod error;
 mod input;
 mod render;
-mod session;
-mod transport;
 
 #[cfg(target_arch = "wasm32")]
 mod canvas;
@@ -50,10 +46,13 @@ mod js;
 
 pub use audio::{AudioChannel, AudioChannelError, AudioFrame, AudioState};
 pub use clipboard::{ClipboardChannel, ClipboardChannelError, ClipboardState};
-pub use driver::{
-    CredsspDriver, DriverError, TlsUpgrade, WebClient, MAX_HANDSHAKE_PDU_SIZE,
+// `WebTransport` family + driver / session pump live in `justrdp-async`
+// since §5.6.1 Phase 1. Re-exported here so existing embedders keep
+// compiling against `justrdp_web::WebClient` etc.
+pub use justrdp_async::{
+    ActiveSession, CredsspDriver, DriverError, PointerEvent, SessionEvent, TlsUpgrade,
+    TransportError, TransportErrorKind, WebClient, WebTransport, MAX_HANDSHAKE_PDU_SIZE,
 };
-pub use error::{TransportError, TransportErrorKind};
 pub use input::{
     mouse_button_event, mouse_move_event, mouse_wheel_event, scancode_event, MouseButton,
     KBDFLAGS_EXTENDED, KBDFLAGS_RELEASE,
@@ -62,8 +61,6 @@ pub use render::{
     decode_bitmap_update_fast_path, render_event, BitmapRenderer, DecodedRect, FrameSink,
     GlyphCacheRevision, RenderError,
 };
-pub use session::{ActiveSession, PointerEvent, SessionEvent};
-pub use transport::WebTransport;
 
 #[cfg(target_arch = "wasm32")]
 pub use canvas::CanvasFrameSink;

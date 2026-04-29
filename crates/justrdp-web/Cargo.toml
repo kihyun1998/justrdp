@@ -40,6 +40,7 @@ webtransport = []
 webrtc-data = []
 
 [dependencies]
+justrdp-async = { workspace = true }
 justrdp-core = { workspace = true, features = ["alloc"] }
 justrdp-connector = { workspace = true }
 justrdp-pdu.workspace = true

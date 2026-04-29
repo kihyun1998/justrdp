@@ -2,16 +2,25 @@
 #![no_std]
 #![doc = "Runtime-agnostic async core for JustRDP."]
 #![doc = ""]
-#![doc = "This crate hosts the `WebTransport` byte-pipe trait, the"]
-#![doc = "`WebClient<T>` connection driver, the `ActiveSession<T>` post-handshake"]
-#![doc = "pump, and the `TlsUpgrade` / `CredsspDriver` adapter traits — i.e. the"]
-#![doc = "shared substrate that lets the same async client run unmodified on top"]
-#![doc = "of any byte transport (browser WebSocket, native TCP+TLS, RD Gateway,"]
-#![doc = "WebRTC DataChannel, …)."]
+#![doc = "Hosts the [`WebTransport`] byte-pipe trait, the [`WebClient`]"]
+#![doc = "connection driver, the [`ActiveSession`] post-handshake pump, and the"]
+#![doc = "[`TlsUpgrade`] / [`CredsspDriver`] adapter traits — the shared substrate"]
+#![doc = "that lets the same async client run unmodified on top of any byte"]
+#![doc = "transport (browser WebSocket, native TCP+TLS, RD Gateway, WebRTC"]
+#![doc = "DataChannel, …)."]
 #![doc = ""]
-#![doc = "At this commit the crate is an empty skeleton: the actual code is"]
-#![doc = "moved in from `justrdp-web` over the follow-up commits of §5.6.1"]
-#![doc = "Phase 1 in roadmap.md. Until that work lands, depend on `justrdp-web`"]
-#![doc = "directly for `WebTransport`/`WebClient`/`ActiveSession`."]
+#![doc = "Embedders normally consume one of the runtime-bound wrappers"]
+#![doc = "(`justrdp-web` for browser/wasm, `justrdp-tokio` for native) instead"]
+#![doc = "of depending on this crate directly."]
 
 extern crate alloc;
+
+mod driver;
+mod error;
+mod session;
+mod transport;
+
+pub use driver::{CredsspDriver, DriverError, TlsUpgrade, WebClient, MAX_HANDSHAKE_PDU_SIZE};
+pub use error::{TransportError, TransportErrorKind};
+pub use session::{ActiveSession, PointerEvent, SessionEvent};
+pub use transport::WebTransport;

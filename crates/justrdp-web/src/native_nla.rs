@@ -40,10 +40,8 @@ use alloc::vec::Vec;
 use justrdp_connector::{ClientConnector, CredsspRandom, CredsspSequence, CredsspState, Sequence};
 use justrdp_pdu::x224::SecurityProtocol;
 
-use crate::driver::CredsspDriver;
-use crate::error::TransportError;
+use justrdp_async::{CredsspDriver, TransportError, WebTransport};
 use crate::native_tls::NativeTlsTransport;
-use crate::transport::WebTransport;
 
 /// Async CredSSP / NLA driver bound to [`NativeTlsTransport`].
 ///

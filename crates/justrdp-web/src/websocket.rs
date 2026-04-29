@@ -25,8 +25,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 
-use crate::error::TransportError;
-use crate::transport::WebTransport;
+use justrdp_async::{TransportError, WebTransport};
 
 /// Configuration for opening a [`WebSocketTransport`].
 #[derive(Debug, Clone)]

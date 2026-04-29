@@ -36,13 +36,11 @@ use web_sys::HtmlCanvasElement;
 use crate::audio::AudioChannel;
 use crate::canvas::CanvasFrameSink;
 use crate::clipboard::ClipboardChannel;
-use crate::driver::WebClient;
-use crate::transport::WebTransport;
+use justrdp_async::{ActiveSession, WebClient, WebTransport};
 use crate::input::{
     mouse_button_event, mouse_move_event, mouse_wheel_event, scancode_event, MouseButton,
 };
 use crate::render::BitmapRenderer;
-use crate::session::ActiveSession;
 use crate::websocket::{WebSocketConfig, WebSocketTransport};
 
 /// One-shot Standard-Security connect.
