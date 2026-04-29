@@ -28,6 +28,7 @@ use std::io::BufWriter;
 use std::time::Duration;
 
 use justrdp_connector::Config;
+use justrdp_pdu::rdp::finalization::InclusiveRect;
 use justrdp_web::{
     render_event, ActiveSession, FrameSink, NativeCredsspDriver, NativeTcpTransport,
     NativeTlsUpgrade, SessionEvent, WebClient, WebTransport,
@@ -194,6 +195,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sink = PngFrameSink::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
     let mut session = ActiveSession::new(post_tls, &result);
 
+    // Force a fresh full-screen paint. RDP servers don't push bitmap
+    // updates for an idle desktop until something triggers a redraw —
+    // without this kick the framebuffer stays at its initial cleared
+    // state and the resulting PNG is blank. Inclusive coords are
+    // 0..(width-1) × 0..(height-1).
+    session
+        .send_refresh_rect(&[InclusiveRect {
+            left: 0,
+            top: 0,
+            right: DEFAULT_WIDTH - 1,
+            bottom: DEFAULT_HEIGHT - 1,
+        }])
+        .await?;
+    eprintln!("sent RefreshRect for full desktop");
+
     let mut frames_with_pixels: u32 = 0;
     let mut total_events: u32 = 0;
 
@@ -205,8 +221,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 total_events += events.len() as u32;
                 for ev in &events {
                     if matches!(ev, SessionEvent::Graphics { .. }) {
-                        if render_event(ev, &mut sink).unwrap_or(false) {
-                            frames_with_pixels += 1;
+                        match render_event(ev, &mut sink) {
+                            Ok(true) => frames_with_pixels += 1,
+                            Ok(false) => {}
+                            // Surface decoder errors so the user can tell
+                            // "no bitmaps came in" from "bitmaps came in
+                            // but our decoder rejected them".
+                            Err(e) => eprintln!("frame {i}: render_event err: {e:?}"),
                         }
                     }
                 }
