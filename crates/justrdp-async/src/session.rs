@@ -24,6 +24,9 @@
 use alloc::vec::Vec;
 
 use justrdp_connector::ConnectionResult;
+use justrdp_input::{
+    InputDatabase, LockKeys, MouseButton, Operation, Scancode, MAX_RELEASE_OPS,
+};
 use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathUpdateType};
 use justrdp_pdu::rdp::finalization::{InclusiveRect, MonitorLayoutEntry, SaveSessionInfoData};
 use justrdp_pdu::tpkt::TpktHint;
@@ -33,6 +36,10 @@ use justrdp_session::{
 };
 
 use crate::driver::{recv_until_pdu, DriverError};
+use crate::input::{
+    build_mouse_button_event, build_mouse_move_event, build_mouse_wheel_event,
+    build_scancode_event, build_sync_event,
+};
 use crate::transport::WebTransport;
 
 static TPKT_HINT: TpktHint = TpktHint;
@@ -99,6 +106,12 @@ pub struct ActiveSession<T: WebTransport> {
     /// transport is message-oriented; the buffer absorbs message
     /// boundaries that don't align with PDU boundaries.
     scratch: Vec<u8>,
+    /// Tracks keyboard / mouse state so the high-level input API can
+    /// suppress duplicate presses, replay every held key on focus loss,
+    /// and report the cached mouse position. Bypassed by [`Self::send_input`]
+    /// (raw fast-path) — that path is still available for callers who
+    /// already track input state themselves.
+    input_db: InputDatabase,
 }
 
 impl<T: WebTransport> ActiveSession<T> {
@@ -120,6 +133,7 @@ impl<T: WebTransport> ActiveSession<T> {
             transport,
             stage: ActiveStage::new(config),
             scratch: Vec::new(),
+            input_db: InputDatabase::new(),
         }
     }
 
@@ -232,6 +246,10 @@ impl<T: WebTransport> ActiveSession<T> {
     /// Encode and send a batch of fast-path input events (keyboard,
     /// mouse). The encoder lives in `justrdp-session`; we just frame and
     /// forward.
+    ///
+    /// Bypasses the [`InputDatabase`] — the caller is responsible for
+    /// any state tracking. Prefer [`Self::key_press`] / [`Self::move_mouse`]
+    /// / etc. for the dedup + replay-on-focus-loss surface.
     pub async fn send_input(
         &mut self,
         events: &[FastPathInputEvent],
@@ -239,6 +257,164 @@ impl<T: WebTransport> ActiveSession<T> {
         let frame = self.stage.encode_input_events(events)?;
         self.transport.send(&frame).await?;
         Ok(())
+    }
+
+    // ── State-tracked input API ──────────────────────────────────────
+    //
+    // These methods consult the internal `InputDatabase` and only fire a
+    // wire event when state actually changes (e.g. a second key-press for
+    // an already-held key produces nothing). They mirror the surface
+    // exposed by `justrdp_blocking::RdpClient`. Use [`Self::send_input`]
+    // for the raw, untracked path.
+
+    /// Record a key press and send the event. Returns `Ok(true)` if the
+    /// event was sent, `Ok(false)` if the key was already held
+    /// (duplicate suppressed, nothing on the wire).
+    pub async fn key_press(&mut self, scancode: Scancode) -> Result<bool, DriverError> {
+        if self.input_db.key_press(scancode).is_some() {
+            self.send_input(&[build_scancode_event(scancode, true)]).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Record a key release and send the event. Returns `Ok(true)` if the
+    /// event was sent, `Ok(false)` if the key was not held.
+    pub async fn key_release(&mut self, scancode: Scancode) -> Result<bool, DriverError> {
+        if self.input_db.key_release(scancode).is_some() {
+            self.send_input(&[build_scancode_event(scancode, false)]).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Record a mouse button press at `(x, y)` and send the event. Returns
+    /// `Ok(true)` if the event was sent, `Ok(false)` if the button was
+    /// already held or the button is `MouseButton::X1` / `X2` (which
+    /// require a `MouseX` fast-path event the encoder does not yet emit;
+    /// skipped before the database update so a paired `button_release`
+    /// also no-ops, keeping client/server state in lockstep).
+    pub async fn button_press(
+        &mut self,
+        button: MouseButton,
+        x: u16,
+        y: u16,
+    ) -> Result<bool, DriverError> {
+        let Some(event) = build_mouse_button_event(button, true, x, y) else {
+            return Ok(false);
+        };
+        if self.input_db.mouse_button_press(button).is_none() {
+            return Ok(false);
+        }
+        self.send_input(&[event]).await?;
+        Ok(true)
+    }
+
+    /// Record a mouse button release at `(x, y)` and send the event.
+    /// Same X1/X2 caveat as [`Self::button_press`].
+    pub async fn button_release(
+        &mut self,
+        button: MouseButton,
+        x: u16,
+        y: u16,
+    ) -> Result<bool, DriverError> {
+        let Some(event) = build_mouse_button_event(button, false, x, y) else {
+            return Ok(false);
+        };
+        if self.input_db.mouse_button_release(button).is_none() {
+            return Ok(false);
+        }
+        self.send_input(&[event]).await?;
+        Ok(true)
+    }
+
+    /// Record a mouse move and send the event. Returns `Ok(false)` if
+    /// the position is unchanged.
+    pub async fn move_mouse(&mut self, x: u16, y: u16) -> Result<bool, DriverError> {
+        if self.input_db.mouse_move(x, y).is_some() {
+            self.send_input(&[build_mouse_move_event(x, y)]).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Send a vertical mouse wheel rotation. `delta` follows the Windows
+    /// convention (±120 per notch); positive scrolls up. Magnitude is
+    /// clamped to 255 by the wire encoding. The wheel is stateless and
+    /// does not consult the `InputDatabase`.
+    pub async fn wheel_scroll(&mut self, delta: i16) -> Result<(), DriverError> {
+        let (x, y) = self.input_db.mouse_position();
+        self.send_input(&[build_mouse_wheel_event(delta, false, x, y)])
+            .await
+    }
+
+    /// Send a horizontal mouse wheel rotation. Positive scrolls right.
+    pub async fn horizontal_wheel_scroll(&mut self, delta: i16) -> Result<(), DriverError> {
+        let (x, y) = self.input_db.mouse_position();
+        self.send_input(&[build_mouse_wheel_event(delta, true, x, y)])
+            .await
+    }
+
+    /// Update lock-key state and send a synchronize event. Always emits
+    /// (per MS-RDPBCGR §2.2.8.1.1.3.1.1.5, synchronize is unconditional
+    /// on focus gain regardless of whether the state actually changed).
+    pub async fn synchronize(&mut self, lock_keys: LockKeys) -> Result<(), DriverError> {
+        let _ = self.input_db.synchronize_event(lock_keys);
+        self.send_input(&[build_sync_event(lock_keys)]).await
+    }
+
+    /// Release all held keys and mouse buttons (e.g. on focus loss),
+    /// sending the appropriate release events in one batched frame.
+    /// Returns the number of release events written to the wire (excludes
+    /// X1/X2 which require an unsupported `MouseX` event type — those
+    /// are dropped by [`build_mouse_button_event`] so the server never
+    /// sees them held in the first place, keeping state consistent).
+    pub async fn release_all_input(&mut self) -> Result<usize, DriverError> {
+        let mut ops = [Operation::KeyPressed(Scancode::new(0, false)); MAX_RELEASE_OPS];
+        let count = self.input_db.release_all(&mut ops);
+        let (mx, my) = self.input_db.mouse_position();
+        // Build all events first so a partial-send failure cannot leave
+        // the database cleared while the server still sees keys held.
+        let events: Vec<FastPathInputEvent> = ops[..count]
+            .iter()
+            .filter_map(|op| match *op {
+                Operation::KeyReleased(sc) => Some(build_scancode_event(sc, false)),
+                Operation::MouseButtonReleased(btn) => {
+                    build_mouse_button_event(btn, false, mx, my)
+                }
+                _ => unreachable!("InputDatabase::release_all only emits release ops"),
+            })
+            .collect();
+        let sent = events.len();
+        if sent > 0 {
+            self.send_input(&events).await?;
+        }
+        Ok(sent)
+    }
+
+    /// Whether a scancode is currently tracked as held by the database.
+    /// Reflects sent-events only (raw [`Self::send_input`] calls bypass
+    /// tracking).
+    pub fn is_key_pressed(&self, scancode: Scancode) -> bool {
+        self.input_db.is_key_pressed(scancode)
+    }
+
+    /// Whether a mouse button is currently tracked as held.
+    pub fn is_button_pressed(&self, button: MouseButton) -> bool {
+        self.input_db.is_mouse_button_pressed(button)
+    }
+
+    /// Last mouse position recorded by [`Self::move_mouse`].
+    pub fn mouse_position(&self) -> (u16, u16) {
+        self.input_db.mouse_position()
+    }
+
+    /// Last lock-key state recorded by [`Self::synchronize`].
+    pub fn lock_keys(&self) -> LockKeys {
+        self.input_db.lock_keys()
     }
 
     /// Send a Refresh Rect PDU asking the server to re-emit bitmap
@@ -553,5 +729,229 @@ mod tests {
         async fn close(&mut self) -> Result<(), crate::TransportError> {
             Ok(())
         }
+    }
+
+    // ── State-tracked input API tests ───────────────────────────────
+
+    /// Decode a fast-path input frame back into the list of events the
+    /// caller asked the session to send. Anchors the wire-level
+    /// invariants for input round-trip tests: every event we emit must
+    /// round-trip through the wire codec to the byte-identical event.
+    fn decode_input_events(frame: &[u8]) -> Vec<FastPathInputEvent> {
+        use justrdp_core::{Decode, ReadCursor};
+        use justrdp_pdu::rdp::fast_path::FastPathInputHeader;
+
+        let mut cursor = ReadCursor::new(frame);
+        let hdr = FastPathInputHeader::decode(&mut cursor).unwrap();
+        let mut events = Vec::with_capacity(hdr.num_events as usize);
+        for _ in 0..hdr.num_events {
+            events.push(FastPathInputEvent::decode(&mut cursor).unwrap());
+        }
+        events
+    }
+
+    fn build_session() -> (ActiveSession<SinkTransport>, Rc<RefCell<SharedSink>>) {
+        let shared = Rc::new(RefCell::new(SharedSink {
+            sent: Vec::new(),
+            recv: VecDeque::new(),
+        }));
+        let transport = SinkTransport { shared: Rc::clone(&shared) };
+        let result = fake_result();
+        (ActiveSession::new(transport, &result), shared)
+    }
+
+    #[test]
+    fn key_press_first_call_sends_event_and_marks_pressed() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            let sc = Scancode::new(0x1E, false); // 'A'
+            let sent = session.key_press(sc).await.unwrap();
+            assert!(sent);
+            assert!(session.is_key_pressed(sc));
+            let events = decode_input_events(&shared.borrow().sent[0]);
+            match &events[0] {
+                FastPathInputEvent::Scancode(s) => {
+                    assert_eq!(s.key_code, 0x1E);
+                    assert_eq!(s.event_flags, 0); // no release, no extended
+                }
+                other => panic!("expected Scancode, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn key_press_duplicate_suppressed_no_wire_traffic() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            let sc = Scancode::new(0x1E, false);
+            assert!(session.key_press(sc).await.unwrap());
+            assert!(!session.key_press(sc).await.unwrap()); // dup → false
+            assert_eq!(shared.borrow().sent.len(), 1, "dup must not write");
+        });
+    }
+
+    #[test]
+    fn key_release_without_press_suppressed() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            let sc = Scancode::new(0x1E, false);
+            assert!(!session.key_release(sc).await.unwrap());
+            assert!(shared.borrow().sent.is_empty());
+        });
+    }
+
+    #[test]
+    fn key_release_after_press_sends_release_event() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            let sc = Scancode::new(0x1D, true); // Right Ctrl (extended)
+            session.key_press(sc).await.unwrap();
+            assert!(session.is_key_pressed(sc));
+            assert!(session.key_release(sc).await.unwrap());
+            assert!(!session.is_key_pressed(sc));
+
+            let events = decode_input_events(&shared.borrow().sent[1]);
+            match &events[0] {
+                FastPathInputEvent::Scancode(s) => {
+                    assert_eq!(s.key_code, 0x1D);
+                    // KBDFLAGS_RELEASE | KBDFLAGS_EXTENDED
+                    assert_eq!(s.event_flags, 0x03);
+                }
+                other => panic!("expected Scancode, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn button_press_x1_x2_dropped_silently() {
+        // X1/X2 require a MouseX event the encoder doesn't emit. The
+        // state-tracked API skips both the wire send AND the database
+        // update, so a follow-up release also no-ops — the server never
+        // sees a press, never sees a release, and the database never
+        // claims X1/X2 is held.
+        block_on(async {
+            let (mut session, shared) = build_session();
+            assert!(!session.button_press(MouseButton::X1, 0, 0).await.unwrap());
+            assert!(!session.button_press(MouseButton::X2, 0, 0).await.unwrap());
+            assert!(!session.is_button_pressed(MouseButton::X1));
+            assert!(!session.is_button_pressed(MouseButton::X2));
+            assert!(!session.button_release(MouseButton::X1, 0, 0).await.unwrap());
+            assert!(shared.borrow().sent.is_empty());
+        });
+    }
+
+    #[test]
+    fn button_press_left_writes_button1_down() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            assert!(session
+                .button_press(MouseButton::Left, 100, 200)
+                .await
+                .unwrap());
+            assert!(session.is_button_pressed(MouseButton::Left));
+            let events = decode_input_events(&shared.borrow().sent[0]);
+            match &events[0] {
+                FastPathInputEvent::Mouse(m) => {
+                    // PTRFLAGS_BUTTON1 | PTRFLAGS_DOWN
+                    assert_eq!(m.pointer_flags, 0x9000);
+                    assert_eq!((m.x_pos, m.y_pos), (100, 200));
+                }
+                other => panic!("expected Mouse, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn move_mouse_same_position_suppressed() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            assert!(session.move_mouse(50, 60).await.unwrap());
+            assert!(!session.move_mouse(50, 60).await.unwrap()); // dup
+            assert_eq!(session.mouse_position(), (50, 60));
+            assert_eq!(shared.borrow().sent.len(), 1);
+        });
+    }
+
+    #[test]
+    fn synchronize_emits_unconditionally() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            let locks = LockKeys {
+                scroll_lock: false,
+                num_lock: true,
+                caps_lock: true,
+                kana_lock: false,
+            };
+            session.synchronize(locks).await.unwrap();
+            session.synchronize(locks).await.unwrap(); // same — must still emit
+            assert_eq!(shared.borrow().sent.len(), 2);
+            assert_eq!(session.lock_keys(), locks);
+
+            // Verify the wire-level Sync event has the expected flag byte
+            // (num | caps = 0x02 | 0x04 = 0x06).
+            let events = decode_input_events(&shared.borrow().sent[0]);
+            match &events[0] {
+                FastPathInputEvent::Sync(s) => {
+                    assert_eq!(s.event_flags, 0x06);
+                }
+                other => panic!("expected Sync, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn release_all_input_clears_held_state_and_batches() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            let sc_a = Scancode::new(0x1E, false);
+            let sc_ctrl = Scancode::new(0x1D, true);
+            session.key_press(sc_a).await.unwrap();
+            session.key_press(sc_ctrl).await.unwrap();
+            session
+                .button_press(MouseButton::Left, 10, 20)
+                .await
+                .unwrap();
+            // 3 frames so far (one per state-changing call).
+            assert_eq!(shared.borrow().sent.len(), 3);
+
+            let count = session.release_all_input().await.unwrap();
+            // 2 keys + 1 button = 3 events, batched in a single frame.
+            assert_eq!(count, 3);
+            assert_eq!(shared.borrow().sent.len(), 4);
+            assert!(!session.is_key_pressed(sc_a));
+            assert!(!session.is_key_pressed(sc_ctrl));
+            assert!(!session.is_button_pressed(MouseButton::Left));
+
+            let events = decode_input_events(&shared.borrow().sent[3]);
+            assert_eq!(events.len(), 3);
+        });
+    }
+
+    #[test]
+    fn release_all_input_with_no_state_writes_nothing() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            let count = session.release_all_input().await.unwrap();
+            assert_eq!(count, 0);
+            assert!(shared.borrow().sent.is_empty());
+        });
+    }
+
+    #[test]
+    fn wheel_scroll_uses_cached_mouse_position() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            session.move_mouse(123, 456).await.unwrap();
+            session.wheel_scroll(120).await.unwrap();
+            let events = decode_input_events(&shared.borrow().sent[1]);
+            match &events[0] {
+                FastPathInputEvent::Mouse(m) => {
+                    // PTRFLAGS_WHEEL (0x0200) | magnitude (120)
+                    assert_eq!(m.pointer_flags, 0x0200 | 120);
+                    assert_eq!((m.x_pos, m.y_pos), (123, 456));
+                }
+                other => panic!("expected Mouse, got {other:?}"),
+            }
+        });
     }
 }

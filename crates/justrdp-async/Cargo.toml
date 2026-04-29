@@ -13,6 +13,7 @@ categories = ["network-programming", "asynchronous"]
 [dependencies]
 justrdp-core = { workspace = true, features = ["alloc"] }
 justrdp-connector = { workspace = true }
+justrdp-input.workspace = true
 justrdp-pdu.workspace = true
 justrdp-session = { workspace = true, features = ["alloc"] }
 
