@@ -22,6 +22,11 @@ websocket = []
 # is a no-op because the `tokio` dep is declared under
 # `[target.'cfg(not(target_arch = "wasm32"))']`.
 native-tcp = ["dep:tokio"]
+# Exposes `NativeTlsUpgrade` / `NativeTlsTransport` — async TLS via
+# `tokio-rustls` for the same `WebClient::connect_with_upgrade` path the
+# WebSocket build uses. Implies `native-tcp` because the upgrader
+# consumes a `NativeTcpTransport`.
+native-tls = ["native-tcp", "dep:tokio-rustls"]
 # Reserved for future reference transports. Activating today is a no-op
 # but avoids a breaking-change feature add later.
 webtransport = []
@@ -45,6 +50,10 @@ justrdp-dvc = { workspace = true, features = ["alloc"] }
 # (and any future native-only transports) — wasm targets must never
 # see it.
 tokio = { version = "1", features = ["net", "io-util"], optional = true }
+# Async TLS handshake driver. Pulls in `rustls 0.23` matching the
+# version `justrdp-tls` already uses. Optional and behind
+# `native-tls`.
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
