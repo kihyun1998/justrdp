@@ -25,8 +25,15 @@ native-tcp = ["dep:tokio"]
 # Exposes `NativeTlsUpgrade` / `NativeTlsTransport` — async TLS via
 # `tokio-rustls` for the same `WebClient::connect_with_upgrade` path the
 # WebSocket build uses. Implies `native-tcp` because the upgrader
-# consumes a `NativeTcpTransport`.
-native-tls = ["native-tcp", "dep:tokio-rustls"]
+# consumes a `NativeTcpTransport`. `justrdp-tls` is pulled in for its
+# SPKI-extraction helper used by `NativeTlsTransport::server_public_key`.
+native-tls = ["native-tcp", "dep:tokio-rustls", "dep:justrdp-tls"]
+# Exposes `NativeCredsspDriver` — async CredSSP / NLA driver wired
+# against `NativeTlsTransport`. Implies `native-tls` because the
+# driver pulls the server SPKI from the post-TLS transport. The
+# embedder still owns the NTLM/Kerberos side; this slice covers the
+# wire-level CredSSP exchange.
+native-nla = ["native-tls"]
 # Reserved for future reference transports. Activating today is a no-op
 # but avoids a breaking-change feature add later.
 webtransport = []
@@ -44,6 +51,16 @@ justrdp-rdpeai = { workspace = true, features = ["alloc"] }
 justrdp-audio = { workspace = true, features = ["alloc"] }
 justrdp-svc = { workspace = true, features = ["alloc"] }
 justrdp-dvc = { workspace = true, features = ["alloc"] }
+# `extract_spki_from_cert_der` (and friends) are the only things we
+# need from `justrdp-tls` here. Declared directly (not inherited from
+# workspace) so we can set `default-features = false` — that disables
+# the `rustls-backend` and avoids pulling rustls a second time (we
+# already get it via `tokio-rustls`).
+justrdp-tls = { path = "../justrdp-tls", version = "0.1.0", optional = true, default-features = false }
+# `CredsspRandom` for the NLA driver. The wasm32 target adds the `js`
+# feature on top of this entry to wire `crypto.getRandomValues`; on
+# native it works out of the box.
+getrandom = "0.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Optional native runtime. Only pulled in by the `native-tcp` feature
@@ -72,7 +89,8 @@ web-sys = { version = "0.3", features = [
 ] }
 # `js` enables the browser-backed (`crypto.getRandomValues`) RNG impl,
 # so `Config::client_random` can be filled without hand-rolling
-# `web_sys::Crypto` calls in the facade.
+# `web_sys::Crypto` calls in the facade. Stacks on top of the
+# top-level `getrandom` entry above.
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]

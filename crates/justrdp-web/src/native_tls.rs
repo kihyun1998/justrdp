@@ -159,6 +159,20 @@ impl NativeTlsTransport {
         let new_size = if bytes == 0 { DEFAULT_RECV_BUF_BYTES } else { bytes };
         self.recv_buf = alloc::vec![0u8; new_size];
     }
+
+    /// Extract the DER-encoded `SubjectPublicKeyInfo` of the server's
+    /// leaf certificate. Used by [`crate::NativeCredsspDriver`] to
+    /// drive the `pubKeyAuth` step of MS-CSSP §3.1.5.
+    ///
+    /// Returns `None` only if the rustls connection somehow has no
+    /// peer certificate (vanishingly rare — a successful TLS handshake
+    /// always carries one for client-side connections).
+    pub fn server_public_key(&self) -> Option<Vec<u8>> {
+        let (_io, conn) = self.stream.get_ref();
+        let certs = conn.peer_certificates()?;
+        let leaf = certs.first()?;
+        justrdp_tls::extract_spki_from_cert_der(leaf.as_ref())
+    }
 }
 
 impl WebTransport for NativeTlsTransport {

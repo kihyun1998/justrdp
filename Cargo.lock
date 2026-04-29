@@ -727,6 +727,7 @@ dependencies = [
  "justrdp-rdpsnd",
  "justrdp-session",
  "justrdp-svc",
+ "justrdp-tls",
  "pollster",
  "tokio",
  "tokio-rustls",
