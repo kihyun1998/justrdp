@@ -1146,6 +1146,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-tokio"
+version = "0.1.0"
+dependencies = [
+ "justrdp-blocking",
+ "justrdp-connector",
+ "justrdp-input",
+ "justrdp-tls",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "justrdp-web"
 version = "0.1.0"
 dependencies = [

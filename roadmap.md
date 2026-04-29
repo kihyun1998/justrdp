@@ -917,7 +917,12 @@ pub enum RdpEvent {
 >          현재 phase 항목이 없어 임베더(Tauri/Iced/axum 게이트웨이/DVC bridge)
 >          가 직접 `spawn_blocking` 래퍼를 작성해야 함. 이 갭을 닫는다.
 
-#### 5.6.1 `justrdp-async` (trait layer, no_std + alloc)
+#### 5.6.1 `justrdp-async` (trait layer, no_std + alloc) — **deferred**
+
+> **상태 (2026-04-29):** §5.6.2 가 `spawn_blocking` 래퍼 모델로 동작하는
+> 동안엔 두 번째 async backend 가 없어 trait 추상화 자체가 premature
+> abstraction. 두 번째 backend(예: smol/embassy 또는 native tokio
+> port — §5.6.2 follow-up 참조) 가 RFC 단계에 들어갈 때 도입한다.
 
 - [ ] `AsyncRead` / `AsyncWrite` trait — `futures-io` / `tokio::io` 와
       호환되도록 모양만 정의 (실제 구현은 `-tokio` 등이 제공).
@@ -925,16 +930,30 @@ pub enum RdpEvent {
 - [ ] `AsyncTlsUpgrader` trait — `justrdp-tls::TlsUpgrader` 의 async 변형
 - [ ] `AsyncCredsspDriver` trait — Windows SSPI / libkrb5 async 어댑터 진입점
 
-#### 5.6.2 `justrdp-tokio` (tokio backend)
+#### 5.6.2 `justrdp-tokio` (tokio backend) — **v1 완료 2026-04-29**
 
-- [ ] `AsyncRdpClient` — `RdpClient` 와 같은 high-level API. 내부적으로
+- [x] `AsyncRdpClient` — `RdpClient` 와 같은 high-level API. 내부적으로
       `spawn_blocking` 으로 connector pump 를 OS thread 에 격리하고,
       `tokio::sync::mpsc` 로 `RdpEvent` push, `oneshot` 으로 send 응답
-- [ ] `tokio::net::TcpStream` 직결 + `tokio-rustls` TLS 어댑터
+      — `crates/justrdp-tokio/`. connect / connect_with_verifier /
+      next_event / send_keyboard / send_unicode / send_mouse_{move,
+      button,wheel} / send_synchronize / disconnect 제공.
+- [x] 통합 테스트: lifecycle 3종 (closed-port → ConnectError::Tcp,
+      immediate-close handshake → error, `AsyncRdpClient: Send` 컴파일
+      검증). §9.3.5 mock broker 시나리오는 RdpClient 의 sync surface 에
+      이미 통합 테스트가 있어 동일 시나리오를 wrapper 통과시켜 다시
+      재현하는 건 채널 plumbing 만 검증할 뿐이라 생략.
+
+**v2 follow-up (착수 시점 미정):**
+
+- [ ] `tokio::net::TcpStream` 직결 + `tokio-rustls` TLS 어댑터 — 현재는
+      `spawn_blocking` 으로 sync `RdpClient` 를 격리. native async port
+      는 ~5000 LoC 중복 + sync CredSSP/SSPI 의존성으로 인해 별도 phase.
 - [ ] cancel-safe shutdown — `disconnect()` 호출 시 pending blocking
-      step 도 안전하게 종료 (TcpStream half-close + thread join timeout)
+      step 도 즉시 종료 (TcpStream half-close + thread join timeout).
+      현재 v1 동작: 워커가 `next_event()` 안에서 read 블록 중이면
+      다음 server 프레임 도착 또는 transport drop 시점에 disconnect 처리.
 - [ ] tracing span 통합 — connector phase span 이 tokio task local 로 전파
-- [ ] 통합 테스트: 같은 mock broker 시나리오 (§9.3.5) 를 tokio 위에서 재현
 
 #### 5.6.3 임베더 가이드 (문서 항목)
 

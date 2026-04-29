@@ -1,0 +1,33 @@
+[package]
+name = "justrdp-tokio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tokio runtime adapter for justrdp-blocking::RdpClient (async wrapper)"
+keywords = ["rdp", "tokio", "async"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = []
+# Forward tracing instrumentation through the worker thread. Off by
+# default to keep the dependency footprint minimal for embedders that
+# do not run a tracing subscriber.
+tracing = ["dep:tracing", "justrdp-blocking/tracing"]
+# TLS backend selection — `rustls` is the workspace default for
+# justrdp-blocking, so callers who want `native-tls` should set
+# `default-features = false` on `justrdp-blocking` at the workspace
+# level. Wiring is documented in the README.
+
+[dependencies]
+justrdp-blocking = { workspace = true }
+justrdp-connector.workspace = true
+justrdp-input.workspace = true
+justrdp-tls.workspace = true
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }
