@@ -100,4 +100,8 @@ pollster = "0.3"
 # `rt` and `macros` are only needed by tests so they live here rather
 # than in the `native-tcp` feature gate (keeps the runtime weight off
 # native embedders that bring their own runtime).
-tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
+
+[[example]]
+name = "native_connect_demo"
+required-features = ["native-nla"]
