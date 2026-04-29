@@ -28,6 +28,13 @@ native-tcp = ["dep:justrdp-async"]
 # `justrdp-tls` is pulled in for its SPKI-extraction helper used by
 # `NativeTlsTransport::server_public_key`.
 native-tls = ["native-tcp", "dep:tokio-rustls"]
+# Exposes `NativeTlsOsUpgrade` / `NativeTlsOsTransport` — async TLS via
+# `tokio-native-tls`, which delegates to the OS TLS stack (SChannel on
+# Windows, Secure Transport on macOS, OpenSSL on Linux). Pick this over
+# `native-tls` (rustls) when the embedder needs the OS trust store,
+# corp-PKI smartcards, or FIPS-mode SChannel. Both backends can coexist
+# in a single binary; the embedder picks per-session.
+native-tls-os = ["native-tcp", "dep:tokio-native-tls"]
 # Exposes `NativeCredsspDriver` — async CredSSP / NLA driver wired
 # against `NativeTlsTransport`. Implies `native-tls` because the driver
 # pulls the server SPKI from the post-TLS transport. `getrandom` fills
@@ -64,6 +71,11 @@ tracing = { version = "0.1", optional = true }
 # §11.3 S7-5 test server — drop `tls12` and the handshake gets a TCP
 # RST mid-handshake.
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+# OS-native TLS stack (SChannel / Secure Transport / OpenSSL). Optional,
+# pulled in by `native-tls-os`. Reuses `justrdp-tls::extract_spki_from_cert_der`
+# for SPKI extraction — that helper is platform-agnostic since it parses
+# DER, so both backends share it.
+tokio-native-tls = { version = "0.3", optional = true }
 # `CredsspRandom` for the NLA driver. Native-only path so no `js`
 # feature needed.
 getrandom = { version = "0.2", optional = true }

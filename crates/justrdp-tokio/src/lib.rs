@@ -48,6 +48,9 @@ mod native_tcp;
 #[cfg(feature = "native-tls")]
 mod native_tls;
 
+#[cfg(feature = "native-tls-os")]
+mod native_tls_os;
+
 #[cfg(feature = "native-nla")]
 mod native_nla;
 
@@ -58,6 +61,9 @@ pub use native_tcp::NativeTcpTransport;
 
 #[cfg(feature = "native-tls")]
 pub use native_tls::{NativeTlsTransport, NativeTlsUpgrade};
+
+#[cfg(feature = "native-tls-os")]
+pub use native_tls_os::{NativeTlsOsTransport, NativeTlsOsUpgrade};
 
 #[cfg(feature = "native-nla")]
 pub use native_nla::NativeCredsspDriver;
