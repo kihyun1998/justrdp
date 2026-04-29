@@ -70,7 +70,12 @@ tokio = { version = "1", features = ["net", "io-util"], optional = true }
 # Async TLS handshake driver. Pulls in `rustls 0.23` matching the
 # version `justrdp-tls` already uses. Optional and behind
 # `native-tls`.
-tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+# `tls12` is critical: without it rustls advertises TLS 1.3 only and
+# legacy Windows RDP servers (Server 2016/2019 SChannel) reset the
+# connection on the ClientHello. Verified empirically against the
+# §11.3 S7-5 test server — drop `tls12` and the handshake gets a TCP
+# RST mid-handshake.
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
