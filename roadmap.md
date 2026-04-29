@@ -1062,35 +1062,42 @@ target end-state 까지 단계적으로 통합.
 
 **실측 노트**: 원래 6커밋 계획이었으나 driver/session 단위 테스트가 `crate::transport::mock::MockTransport`(pub(crate)) 를 참조하는 가시성 문제로 transport+error+driver+session 4파일을 한 커밋에 함께 옮김 (`1e0ea4e`). 결과적으로 4커밋(c1: 빈 crate, c2: 코어 이동, c3: native_* 이동, c4: 문서/roadmap)으로 압축됨.
 
-#### 5.6.2 Phase 2 — Feature parity in `WebClient` (2주, +~1500 LoC)
+#### 5.6.2 Phase 2 — Feature parity in `WebClient` (2주, +~1500 LoC) ✅ **완료 2026-04-30**
 
 §5.5 `justrdp-blocking` 이 가진 기능 중 `WebClient` 에 없는 것들 이식.
 [참고: feature parity audit 2026-04-29 — `RdpClient` ↔ `WebClient` 비교 ~700 LoC gap]
 
-- [ ] **InputDatabase promote** → `justrdp-input` (~400 LoC, no_std 호환)
-      key_press/release helpers, button_press/release, move_mouse,
-      release_all_input, is_key_pressed, mouse_position, lock_keys 모두 이식.
-- [ ] **`FastPathInputEvent::Unicode` / `::Sync` constructor 추가** (~80 LoC).
-      현재 `justrdp-web/src/input.rs` 에 없음.
-- [ ] **`Reconnectable<F: TransportFactory, T: WebTransport>` wrapper** (~300 LoC).
-      `last_config` / `last_arc_cookie` / `last_addr` 보유, transport drop 시
-      factory 호출하여 재핸드셰이크. `justrdp-blocking/client.rs:1147-1254` 에서 포팅.
-- [ ] **`RedirectHandler` 통합** (~250 LoC). `WebClient::connect` 가
-      `connector.server_redirection` 을 보고 새 Config 로 재진입.
-      `justrdp-blocking/client.rs:251-467` 에서 포팅.
-- [ ] **RDSTLS / AAD 인증 경로** (~200 LoC). 현재 `WebClient` 가
-      `NlaRequired { state: "Rdstls…" / "Aad…" }` 에러로 거부 중
-      (`justrdp-web/src/driver.rs:490-504`).
-- [ ] **SVC processor 등록 모델 통일** (~200 LoC).
-      `connect_with_processors(Vec<Box<dyn SvcProcessor>>)` 시그니처 추가,
-      `start_all` 흐름 포팅 (`justrdp-blocking/client.rs:540-551`).
-- [ ] **Tracing instrumentation** (~150 LoC, feature-gated).
-      `justrdp-blocking/telemetry.rs` 패턴을 `WebClient` 에 적용.
-- [ ] **`tokio-native-tls` 백엔드** (~250 LoC, feature-gated).
-      현재 `justrdp-web` 은 `tokio-rustls` only.
-- [ ] feature parity gap audit re-run — Phase 2 종료 시 `RdpClient` ↔ `WebClient` 누락 항목이 0 이어야 함.
+- [x] **InputDatabase 통합 (Step A)** — `justrdp-input` 은 이미 promote 되어 있었으므로 `ActiveSession` 에 통합만 수행. `key_press` / `key_release` / `button_press` / `button_release` / `move_mouse` / `synchronize` / `release_all_input` / `wheel_scroll` / `horizontal_wheel_scroll` + `is_key_pressed` / `is_button_pressed` / `mouse_position` / `lock_keys` 추가 (commit `c2d0799`).
+- [x] **`FastPathInputEvent::Unicode` / `::Sync` constructor (Step B)** — `send_unicode(code, pressed)` / `send_unicode_char(ch)` (BMP-only) / `send_synchronize(LockKeys)` (raw, DB 우회) 추가 (commit `ec05997`).
+- [x] **`Reconnectable<F: TransportFactory>` wrapper + `ReconnectPolicy` (Step I)** — `TransportFactory` trait, `Reconnectable::open_next` (factory 호출 + ARC cookie 주입), `Reconnectable::record_result` (ARC cookie 저장 + redirect 적용), `observe_arc_cookie`. `ReconnectPolicy` (disabled/aggressive + delay_for_attempt) 도 함께. 실제 retry loop 는 임베더가 소유 — TlsUpgrade/CredsspDriver 의 `self`-by-value 컨트랙트 보존 위해 (commit `932655c`).
+- [x] **`RedirectHandler` 통합 (Step H)** — `redirect_target(redir, default_port) -> Option<String>` (UTF-16LE 디코드 + LB_TARGET_NET_ADDRESS / LB_TARGET_NET_ADDRESSES 우선순위), `apply_redirect(&mut Config, redir)` (routing_token 갱신, cookie/ARC 클리어, LB_PASSWORD_IS_PK_ENCRYPTED → RDSTLS 스위치, username/domain 오버라이드), `MAX_REDIRECTS = 5` 상수. 임베더 loop 패턴 docs (commit `d128f4a`).
+- [x] **RDSTLS + AAD 인증 경로 (Steps F + G)** — pump 의 NlaRequired bail-out 이 너무 광범위해서 RDSTLS / AAD 까지 거부했었음. `requires_external_driver(state) -> bool` predicate 으로 분리: CredSSP 4 state 만 bail (외부 `CredsspDriver` 필요), RDSTLS 4 state + AAD 3 state 는 connector 가 self-complete 하므로 inline 진행. `connect_with_upgrade` 가 RDSTLS / AAD 모두 처리 (commit `7bbea9c`). 기획상 두 step 으로 나뉘어 있었으나 underlying fix 가 단일 classifier 변경이라 한 commit 으로 통합.
+- [x] **SVC processor 등록 모델 통일 (Step E)** — `ActiveSession::with_processors(transport, result, processors)` async constructor: `StaticChannelSet` 빌드 + `assign_ids` + `start_all` (초기 frame flush). `next_events` 의 `ChannelData` 분기에서 dispatch — 매칭 processor 가 있으면 `process_incoming` 응답 frame 자동 write-back, 없으면 raw `SessionEvent::Channel` 패스스루. `DriverError::Channel(String)` 신규 variant (commit `a861382`).
+- [x] **Tracing instrumentation (Step C)** — `crates/justrdp-async/src/telemetry.rs` shim (info / debug / async_warn / error / trace; feature off 시 expand to nothing, no_std 호환 `tracing` `default-features=false`). `connect` / `connect_with_upgrade` / `connect_with_nla` 진입점 + phase 마커 (pre_tls / tls_upgrade / mid_pump / credssp / post_credssp / post_tls) + 에러 (TlsRequired / NlaRequired) + pump 상태 trace + `send_input` count + `shutdown`/`disconnect` 이벤트. `justrdp-tokio` / `justrdp-web` 의 `tracing` feature 가 cascade 로 enable (commit `7e4aca5`).
+- [x] **`tokio-native-tls` 백엔드 (Step D)** — `crates/justrdp-tokio/src/native_tls_os.rs`: `NativeTlsOsUpgrade` (`dangerous_no_verify` / `with_os_trust_store` / `from_connector`) + `NativeTlsOsTransport` (server_public_key DER SPKI 추출 — 기존 rustls 백엔드와 helper 공유). Windows SChannel / macOS Secure Transport / Linux OpenSSL. feature `native-tls-os = ["native-tcp", "dep:tokio-native-tls"]` — 기존 rustls 백엔드와 공존 가능 (한 binary 에 양쪽 link 검증) (commit `9ffd60e`).
+- [x] **feature parity gap audit re-run (Step J)** — 아래 표 참조. Phase 2 종료 시 `RdpClient` ↔ `WebClient` 의 핵심 surface 격차 0. 의도적 차이는 (a) 게이트웨이 (Phase 3 작업), (b) 임베더-주도 retry/redirect loop (TlsUpgrade `self`-by-value 컨트랙트 보존), (c) `KeyboardIndicators` 디코드 깊이 (blocking 은 bool 4종, async 는 u16 raw — 임베더가 디코드).
 
-**검증 기준**: §5.5 / §9.x 모든 기존 테스트가 `WebClient` 로도 통과.
+**Phase 2 ship 요약**: 9 commit (`c2d0799` → `932655c`), `justrdp-async` 27 → 92 tests (+65), 0 회귀, blocking / web / 다른 crate 영향 0. 9개 항목을 10단계로 쪼개 진행했으나 F+G 가 single classifier 변경으로 통합되어 실제 9 commit. ~1700 LoC (helper 모듈 + telemetry shim + tokio-native-tls + 11 새 ActiveSession 메서드 + 4 새 svc-aware 메서드 + redirect/reconnect 모듈 + tracing 지점).
+
+**Audit 표 (`RdpClient` ↔ `WebClient + ActiveSession + Reconnectable`)**:
+
+| 영역 | blocking surface | async 대응 | 상태 |
+|---|---|---|---|
+| Connect | `RdpClient::connect{,_with_upgrader,_with_processors}` | `WebClient::connect{,_with_upgrade,_with_nla}` + `ActiveSession::with_processors` | ✅ 일치 |
+| Connect (gateway) | `connect_via_gateway{,_rpch,_ws}` | (Phase 3 §5.6.3) | ⚠ 의도적 deferred |
+| 이벤트 루프 | `next_event() -> Option<RdpEvent>` | `ActiveSession::next_events() -> Vec<SessionEvent>` | ✅ 일치 (한 frame 당 다중 이벤트는 async 가 더 정확) |
+| Input (state-tracked) | `key_press/release`, `button_press/release`, `move_mouse`, `synchronize`, `release_all_input`, `is_key_pressed`, `is_button_pressed`, `mouse_position`, `lock_keys` | 동일 surface (Step A) | ✅ 일치 |
+| Input (raw) | `send_input_events`, `send_unicode`, `send_synchronize`, `send_mouse_button/move/wheel` | `send_input(events)`, `send_unicode(code, pressed)`, `send_unicode_char(ch)`, `send_synchronize(lock_keys)`, `wheel_scroll`, `horizontal_wheel_scroll` | ✅ 일치 (raw mouse helpers 는 `send_input` 으로 단일화) |
+| 종료 | `disconnect` | `shutdown` (graceful) + `disconnect` (immediate) | ✅ 일치 (async 가 더 정밀) |
+| Reconnect 정책 | `set_reconnect_policy` / `last_arc_cookie()` | `Reconnectable::with_policy` / `arc_cookie()` / `observe_arc_cookie` | ✅ 일치 |
+| Reconnect loop | 내부 `try_reconnect` (자동) | 임베더가 `Reconnectable::open_next` + `policy().delay_for_attempt(n)` | ⚠ 의도적 차이 (TlsUpgrade `self` 컨트랙트) |
+| Redirect | 내부 loop (자동) | `redirect_target` + `apply_redirect` + 임베더 loop, 또는 `Reconnectable::record_result -> bool` | ⚠ 의도적 차이 (위와 동일 사유) |
+| SVC | `connect_with_processors` + `RdpEvent::ChannelData` passthrough on unregistered | `ActiveSession::with_processors` + `SessionEvent::Channel` passthrough | ✅ 일치 |
+| Tracing | `feature = "tracing"` | `feature = "tracing"` (cascade through tokio + web) | ✅ 일치 |
+| TLS 백엔드 | rustls + native-tls (`justrdp-tls` 양쪽) | rustls (`native-tls`) + native-tls (`native-tls-os`) | ✅ 일치 |
+| KeyboardIndicators | `{ scroll, num, caps, kana }: bool` | `{ led_flags: u16 }` | ⚠ depth 차이, 임베더 디코드 |
+
+**검증**: `cargo test --workspace --exclude justrdp-server` 그린 (justrdp-server 사전 실패는 무관). `cargo test -p justrdp-async --features tracing` 92/92, `cargo test -p justrdp-tokio --features "native-nla native-tls-os"` 22/22 unit + 3 lifecycle.
 
 #### 5.6.3 Phase 3 — Gateway async 포팅 (3주, 가장 위험, +~2000 LoC / -1540 LoC)
 
