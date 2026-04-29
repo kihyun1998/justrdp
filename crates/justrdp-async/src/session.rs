@@ -38,7 +38,7 @@ use justrdp_session::{
 use crate::driver::{recv_until_pdu, DriverError};
 use crate::input::{
     build_mouse_button_event, build_mouse_move_event, build_mouse_wheel_event,
-    build_scancode_event, build_sync_event,
+    build_scancode_event, build_sync_event, build_unicode_event,
 };
 use crate::transport::WebTransport;
 
@@ -257,6 +257,48 @@ impl<T: WebTransport> ActiveSession<T> {
         let frame = self.stage.encode_input_events(events)?;
         self.transport.send(&frame).await?;
         Ok(())
+    }
+
+    /// Send a single Unicode key event (MS-RDPBCGR §2.2.8.1.2.2.2).
+    ///
+    /// Stateless — the `InputDatabase` doesn't track Unicode key state,
+    /// so callers must emit press/release pairs themselves. `pressed=true`
+    /// emits a press; `false` emits a release. `unicode_code` is a UTF-16
+    /// code unit; pass each surrogate of a non-BMP code point separately
+    /// (the wire format is per-code-unit).
+    pub async fn send_unicode(
+        &mut self,
+        unicode_code: u16,
+        pressed: bool,
+    ) -> Result<(), DriverError> {
+        self.send_input(&[build_unicode_event(unicode_code, pressed)])
+            .await
+    }
+
+    /// Convenience wrapper around [`Self::send_unicode`] that takes a
+    /// Rust `char`. Returns `Ok(true)` if the character fit in a single
+    /// UTF-16 code unit and a press+release pair was emitted; `Ok(false)`
+    /// for non-BMP code points (which would need a UTF-16 surrogate pair
+    /// — callers that need those should drive [`Self::send_unicode`]
+    /// directly with each code unit).
+    pub async fn send_unicode_char(&mut self, ch: char) -> Result<bool, DriverError> {
+        let code = u32::from(ch);
+        if code > u16::MAX as u32 {
+            return Ok(false);
+        }
+        let code = code as u16;
+        self.send_unicode(code, true).await?;
+        self.send_unicode(code, false).await?;
+        Ok(true)
+    }
+
+    /// Raw fast-path Synchronize event (MS-RDPBCGR §2.2.8.1.2.2.5).
+    /// Bypasses the `InputDatabase` — see [`Self::synchronize`] for the
+    /// state-tracked variant. Useful when a higher layer already owns
+    /// lock-key state and wants to push it without touching the cached
+    /// value.
+    pub async fn send_synchronize(&mut self, lock_keys: LockKeys) -> Result<(), DriverError> {
+        self.send_input(&[build_sync_event(lock_keys)]).await
     }
 
     // ── State-tracked input API ──────────────────────────────────────
@@ -934,6 +976,83 @@ mod tests {
             let count = session.release_all_input().await.unwrap();
             assert_eq!(count, 0);
             assert!(shared.borrow().sent.is_empty());
+        });
+    }
+
+    #[test]
+    fn send_unicode_press_emits_unicode_event_no_release_flag() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            session.send_unicode(0x0041, true).await.unwrap(); // 'A' press
+            let events = decode_input_events(&shared.borrow().sent[0]);
+            match &events[0] {
+                FastPathInputEvent::Unicode(u) => {
+                    assert_eq!(u.unicode_code, 0x0041);
+                    assert_eq!(u.event_flags, 0); // no release flag
+                }
+                other => panic!("expected Unicode, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn send_unicode_release_sets_release_flag() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            session.send_unicode(0x0041, false).await.unwrap();
+            let events = decode_input_events(&shared.borrow().sent[0]);
+            match &events[0] {
+                FastPathInputEvent::Unicode(u) => assert_eq!(u.event_flags, 0x01),
+                other => panic!("expected Unicode, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn send_unicode_char_bmp_emits_press_release_pair() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            assert!(session.send_unicode_char('A').await.unwrap());
+            assert_eq!(shared.borrow().sent.len(), 2);
+
+            let press = decode_input_events(&shared.borrow().sent[0]);
+            let release = decode_input_events(&shared.borrow().sent[1]);
+            match (&press[0], &release[0]) {
+                (FastPathInputEvent::Unicode(p), FastPathInputEvent::Unicode(r)) => {
+                    assert_eq!(p.unicode_code, 0x0041);
+                    assert_eq!(p.event_flags, 0);
+                    assert_eq!(r.unicode_code, 0x0041);
+                    assert_eq!(r.event_flags, 0x01);
+                }
+                _ => panic!("expected Unicode press+release"),
+            }
+        });
+    }
+
+    #[test]
+    fn send_unicode_char_non_bmp_returns_false_and_writes_nothing() {
+        block_on(async {
+            let (mut session, shared) = build_session();
+            // U+1F600 GRINNING FACE — outside BMP, needs surrogate pair.
+            assert!(!session.send_unicode_char('\u{1F600}').await.unwrap());
+            assert!(shared.borrow().sent.is_empty());
+        });
+    }
+
+    #[test]
+    fn send_synchronize_raw_does_not_update_database() {
+        block_on(async {
+            let (mut session, _shared) = build_session();
+            let locks = LockKeys {
+                scroll_lock: true,
+                num_lock: false,
+                caps_lock: false,
+                kana_lock: false,
+            };
+            session.send_synchronize(locks).await.unwrap();
+            // Cached lock-key state stays at the default — raw send does
+            // not touch the InputDatabase.
+            assert_eq!(session.lock_keys(), LockKeys::default());
         });
     }
 

@@ -124,10 +124,8 @@ pub(crate) fn build_mouse_wheel_event(
 }
 
 /// Build a fast-path Unicode key press/release event. Stateless — the
-/// `InputDatabase` does not track unicode state; callers either go via
-/// [`ActiveSession::send_unicode`] (when added) or build the event
-/// directly.
-#[allow(dead_code)] // Wired in Step B (FastPathInputEvent::Unicode constructor)
+/// `InputDatabase` does not track unicode state, so this is invoked
+/// directly from [`ActiveSession::send_unicode`] without any dedup.
 pub(crate) fn build_unicode_event(unicode_code: u16, pressed: bool) -> FastPathInputEvent {
     let event_flags = if pressed { 0 } else { KBDFLAGS_RELEASE };
     FastPathInputEvent::Unicode(FastPathUnicodeEvent {
