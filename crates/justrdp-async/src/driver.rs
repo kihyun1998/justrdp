@@ -517,6 +517,28 @@ enum PumpStop {
     NlaRequired { state: &'static str },
 }
 
+/// Whether a connector state requires an external driver (i.e. the
+/// pump must bail out and let the caller drive the exchange before
+/// resuming).
+///
+/// Currently this is only the four CredSSP states (which need a
+/// [`CredsspDriver`] for SPNEGO + NTLM/Kerberos token round-trips).
+/// RDSTLS and Azure AD states *look* similar but the connector handles
+/// their wire encoding/decoding internally inside `step()` — so the
+/// pump can run them inline as long as the underlying transport is
+/// post-TLS (which they always are; the connector only enters those
+/// states from `step_enhanced_security_upgrade` after seeing a
+/// matching `selectedProtocol` flag).
+fn requires_external_driver(state: &ClientConnectorState) -> bool {
+    matches!(
+        state,
+        ClientConnectorState::CredsspNegoTokens
+            | ClientConnectorState::CredsspPubKeyAuth
+            | ClientConnectorState::CredsspCredentials
+            | ClientConnectorState::CredsspEarlyUserAuth
+    )
+}
+
 /// Drive the connector loop on `transport` until a terminal state
 /// (`Connected`, `EnhancedSecurityUpgrade`, or any NLA-class state)
 /// is reached. Shared between [`WebClient::connect`] (one phase) and
@@ -550,17 +572,7 @@ async fn pump_until_terminal<T: WebTransport>(
                 }
                 continue;
             }
-            state @ (ClientConnectorState::CredsspNegoTokens
-            | ClientConnectorState::CredsspPubKeyAuth
-            | ClientConnectorState::CredsspCredentials
-            | ClientConnectorState::CredsspEarlyUserAuth
-            | ClientConnectorState::AadWaitServerNonce
-            | ClientConnectorState::AadSendAuthRequest
-            | ClientConnectorState::AadWaitAuthResult
-            | ClientConnectorState::RdstlsSendCapabilities
-            | ClientConnectorState::RdstlsWaitCapabilities
-            | ClientConnectorState::RdstlsSendAuthRequest
-            | ClientConnectorState::RdstlsWaitAuthResponse) => {
+            state if requires_external_driver(state) => {
                 return Ok(PumpStop::NlaRequired {
                     state: state.name(),
                 });
@@ -1281,5 +1293,82 @@ mod tests {
                 "expected Transport or Internal error, got {err:?}"
             );
         });
+    }
+
+    // ── requires_external_driver() classification tests ─────────────
+    //
+    // The pump uses this predicate to decide whether to bail out
+    // (NlaRequired) or run the state inline. CredSSP needs the caller's
+    // CredsspDriver impl; RDSTLS / AAD are connector-internal and the
+    // pump should run them inline. These tests pin the boundary so a
+    // future state addition lands in exactly one bucket on purpose.
+
+    #[test]
+    fn requires_external_driver_credssp_states_bail_out() {
+        for state in [
+            ClientConnectorState::CredsspNegoTokens,
+            ClientConnectorState::CredsspPubKeyAuth,
+            ClientConnectorState::CredsspCredentials,
+            ClientConnectorState::CredsspEarlyUserAuth,
+        ] {
+            assert!(
+                requires_external_driver(&state),
+                "CredSSP state {state:?} must require an external driver"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_external_driver_rdstls_states_run_inline() {
+        // RDSTLS: connector handles wire encode/decode internally inside
+        // step(), so the pump can run all four states without an
+        // external driver hook. This pins the bug-fix that moved RDSTLS
+        // out of the NlaRequired bail-out arm.
+        for state in [
+            ClientConnectorState::RdstlsSendCapabilities,
+            ClientConnectorState::RdstlsWaitCapabilities,
+            ClientConnectorState::RdstlsSendAuthRequest,
+            ClientConnectorState::RdstlsWaitAuthResponse,
+        ] {
+            assert!(
+                !requires_external_driver(&state),
+                "RDSTLS state {state:?} must NOT require an external driver \
+                 (pump runs them inline)"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_external_driver_aad_states_run_inline() {
+        // Azure AD: same story — JSON-over-TLS exchange handled inside
+        // the connector. Pump runs them inline.
+        for state in [
+            ClientConnectorState::AadWaitServerNonce,
+            ClientConnectorState::AadSendAuthRequest,
+            ClientConnectorState::AadWaitAuthResult,
+        ] {
+            assert!(
+                !requires_external_driver(&state),
+                "AAD state {state:?} must NOT require an external driver \
+                 (pump runs them inline)"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_external_driver_pre_security_states_run_inline() {
+        // Sanity check on the negative side: handshake states before
+        // the security selection point obviously don't need an external
+        // driver — the pump just walks the wire format.
+        for state in [
+            ClientConnectorState::ConnectionInitiationSendRequest,
+            ClientConnectorState::EnhancedSecurityUpgrade,
+            ClientConnectorState::BasicSettingsExchangeSendInitial,
+        ] {
+            assert!(
+                !requires_external_driver(&state),
+                "{state:?} must NOT require an external driver"
+            );
+        }
     }
 }
