@@ -37,10 +37,30 @@
 //! [`RdpClient`]: justrdp_blocking::RdpClient
 //! [`RdpClient::next_event`]: justrdp_blocking::RdpClient::next_event
 
+extern crate alloc;
+
 mod client;
 mod pump;
 
+#[cfg(feature = "native-tcp")]
+mod native_tcp;
+
+#[cfg(feature = "native-tls")]
+mod native_tls;
+
+#[cfg(feature = "native-nla")]
+mod native_nla;
+
 pub use client::AsyncRdpClient;
+
+#[cfg(feature = "native-tcp")]
+pub use native_tcp::NativeTcpTransport;
+
+#[cfg(feature = "native-tls")]
+pub use native_tls::{NativeTlsTransport, NativeTlsUpgrade};
+
+#[cfg(feature = "native-nla")]
+pub use native_nla::NativeCredsspDriver;
 
 // Re-export the surface a tokio embedder needs so callers do not have
 // to depend on `justrdp-blocking` / `justrdp-input` directly.

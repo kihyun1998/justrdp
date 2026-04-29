@@ -16,24 +16,6 @@ default = ["websocket"]
 # non-wasm targets the gate is a no-op because `web-sys`/`wasm-bindgen`
 # are declared only under `[target.'cfg(target_arch = "wasm32")']`.
 websocket = []
-# Exposes `NativeTcpTransport` — a `tokio::net::TcpStream` wrapper that
-# implements `WebTransport` directly (no wsproxy). Native targets only;
-# the optional `tokio` dependency is pulled in here. On wasm32 the gate
-# is a no-op because the `tokio` dep is declared under
-# `[target.'cfg(not(target_arch = "wasm32"))']`.
-native-tcp = ["dep:tokio"]
-# Exposes `NativeTlsUpgrade` / `NativeTlsTransport` — async TLS via
-# `tokio-rustls` for the same `WebClient::connect_with_upgrade` path the
-# WebSocket build uses. Implies `native-tcp` because the upgrader
-# consumes a `NativeTcpTransport`. `justrdp-tls` is pulled in for its
-# SPKI-extraction helper used by `NativeTlsTransport::server_public_key`.
-native-tls = ["native-tcp", "dep:tokio-rustls", "dep:justrdp-tls"]
-# Exposes `NativeCredsspDriver` — async CredSSP / NLA driver wired
-# against `NativeTlsTransport`. Implies `native-tls` because the
-# driver pulls the server SPKI from the post-TLS transport. The
-# embedder still owns the NTLM/Kerberos side; this slice covers the
-# wire-level CredSSP exchange.
-native-nla = ["native-tls"]
 # Reserved for future reference transports. Activating today is a no-op
 # but avoids a breaking-change feature add later.
 webtransport = []
@@ -52,31 +34,6 @@ justrdp-rdpeai = { workspace = true, features = ["alloc"] }
 justrdp-audio = { workspace = true, features = ["alloc"] }
 justrdp-svc = { workspace = true, features = ["alloc"] }
 justrdp-dvc = { workspace = true, features = ["alloc"] }
-# `extract_spki_from_cert_der` (and friends) are the only things we
-# need from `justrdp-tls` here. Declared directly (not inherited from
-# workspace) so we can set `default-features = false` — that disables
-# the `rustls-backend` and avoids pulling rustls a second time (we
-# already get it via `tokio-rustls`).
-justrdp-tls = { path = "../justrdp-tls", version = "0.1.0", optional = true, default-features = false }
-# `CredsspRandom` for the NLA driver. The wasm32 target adds the `js`
-# feature on top of this entry to wire `crypto.getRandomValues`; on
-# native it works out of the box.
-getrandom = "0.2"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Optional native runtime. Only pulled in by the `native-tcp` feature
-# (and any future native-only transports) — wasm targets must never
-# see it.
-tokio = { version = "1", features = ["net", "io-util"], optional = true }
-# Async TLS handshake driver. Pulls in `rustls 0.23` matching the
-# version `justrdp-tls` already uses. Optional and behind
-# `native-tls`.
-# `tls12` is critical: without it rustls advertises TLS 1.3 only and
-# legacy Windows RDP servers (Server 2016/2019 SChannel) reset the
-# connection on the ClientHello. Verified empirically against the
-# §11.3 S7-5 test server — drop `tls12` and the handshake gets a TCP
-# RST mid-handshake.
-tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -94,37 +51,11 @@ web-sys = { version = "0.3", features = [
     "WebSocket",
 ] }
 # `js` enables the browser-backed (`crypto.getRandomValues`) RNG impl,
-# so `Config::client_random` can be filled without hand-rolling
-# `web_sys::Crypto` calls in the facade. Stacks on top of the
-# top-level `getrandom` entry above.
+# so `Config::client_random` can be filled inside the wasm facade
+# without hand-rolling `web_sys::Crypto` calls. Native consumers do
+# not pull `getrandom` through this crate any more; native CredSSP
+# RNG lives in `justrdp-tokio`.
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 pollster = "0.3"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-# `rt` and `macros` are only needed by tests so they live here rather
-# than in the `native-tcp` feature gate (keeps the runtime weight off
-# native embedders that bring their own runtime).
-tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
-# Used only by `native_render_demo` to dump the framebuffer to PNG.
-# Lighter than the `image` crate (single-purpose decoder/encoder
-# rather than the full multi-format pipeline).
-png = "0.17"
-# `native_window_demo` only — winit drives the OS window and event
-# loop, softbuffer uploads our RGBA framebuffer to the surface
-# without a GPU dependency.
-winit = "0.30"
-softbuffer = "0.4"
-
-[[example]]
-name = "native_connect_demo"
-required-features = ["native-nla"]
-
-[[example]]
-name = "native_render_demo"
-required-features = ["native-nla"]
-
-[[example]]
-name = "native_window_demo"
-required-features = ["native-nla"]

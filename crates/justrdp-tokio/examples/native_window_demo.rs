@@ -38,10 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use justrdp_connector::Config;
-use justrdp_web::{
-    render_event, ActiveSession, FrameSink, NativeCredsspDriver, NativeTcpTransport,
-    NativeTlsUpgrade, SessionEvent, WebClient,
-};
+use justrdp_async::{ActiveSession, SessionEvent, WebClient};
+use justrdp_tokio::{NativeCredsspDriver, NativeTcpTransport, NativeTlsUpgrade};
+use justrdp_web::{render_event, FrameSink};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;

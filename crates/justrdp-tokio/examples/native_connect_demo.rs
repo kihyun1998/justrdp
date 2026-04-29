@@ -29,10 +29,8 @@ use std::env;
 use std::time::Duration;
 
 use justrdp_connector::Config;
-use justrdp_web::{
-    ActiveSession, NativeCredsspDriver, NativeTcpTransport, NativeTlsUpgrade, WebClient,
-    WebTransport,
-};
+use justrdp_async::{ActiveSession, WebClient, WebTransport};
+use justrdp_tokio::{NativeCredsspDriver, NativeTcpTransport, NativeTlsUpgrade};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

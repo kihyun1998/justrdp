@@ -32,15 +32,6 @@ mod canvas;
 #[cfg(all(feature = "websocket", target_arch = "wasm32"))]
 mod websocket;
 
-#[cfg(all(feature = "native-tcp", not(target_arch = "wasm32")))]
-mod native_tcp;
-
-#[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
-mod native_tls;
-
-#[cfg(all(feature = "native-nla", not(target_arch = "wasm32")))]
-mod native_nla;
-
 #[cfg(target_arch = "wasm32")]
 mod js;
 
@@ -67,12 +58,3 @@ pub use canvas::CanvasFrameSink;
 
 #[cfg(all(feature = "websocket", target_arch = "wasm32"))]
 pub use websocket::{WebSocketConfig, WebSocketTransport};
-
-#[cfg(all(feature = "native-tcp", not(target_arch = "wasm32")))]
-pub use native_tcp::NativeTcpTransport;
-
-#[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
-pub use native_tls::{NativeTlsTransport, NativeTlsUpgrade};
-
-#[cfg(all(feature = "native-nla", not(target_arch = "wasm32")))]
-pub use native_nla::NativeCredsspDriver;

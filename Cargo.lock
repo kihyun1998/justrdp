@@ -1160,12 +1160,21 @@ dependencies = [
 name = "justrdp-tokio"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.2.17",
+ "justrdp-async",
  "justrdp-blocking",
  "justrdp-connector",
+ "justrdp-core",
  "justrdp-input",
+ "justrdp-pdu",
  "justrdp-tls",
+ "justrdp-web",
+ "png",
+ "softbuffer",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "winit",
 ]
 
 [[package]]
@@ -1186,16 +1195,10 @@ dependencies = [
  "justrdp-rdpsnd",
  "justrdp-session",
  "justrdp-svc",
- "justrdp-tls",
- "png",
  "pollster",
- "softbuffer",
- "tokio",
- "tokio-rustls",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "winit",
 ]
 
 [[package]]

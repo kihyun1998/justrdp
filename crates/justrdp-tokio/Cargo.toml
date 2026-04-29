@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Tokio runtime adapter for justrdp-blocking::RdpClient (async wrapper)"
+description = "Tokio runtime adapter for justrdp-blocking::RdpClient (async wrapper) + native WebTransport / TLS / CredSSP adapters"
 keywords = ["rdp", "tokio", "async"]
 categories = ["network-programming", "asynchronous"]
 
@@ -16,6 +16,21 @@ default = []
 # default to keep the dependency footprint minimal for embedders that
 # do not run a tracing subscriber.
 tracing = ["dep:tracing", "justrdp-blocking/tracing"]
+# Exposes `NativeTcpTransport` — a `tokio::net::TcpStream` wrapper that
+# implements `WebTransport` (from `justrdp-async`) directly. Native
+# substrate for `WebClient<NativeTcpTransport>` once §5.6.4 lands.
+native-tcp = ["dep:justrdp-async"]
+# Exposes `NativeTlsUpgrade` / `NativeTlsTransport` — async TLS via
+# `tokio-rustls` for the `WebClient::connect_with_upgrade` path. Implies
+# `native-tcp` because the upgrader consumes a `NativeTcpTransport`.
+# `justrdp-tls` is pulled in for its SPKI-extraction helper used by
+# `NativeTlsTransport::server_public_key`.
+native-tls = ["native-tcp", "dep:tokio-rustls"]
+# Exposes `NativeCredsspDriver` — async CredSSP / NLA driver wired
+# against `NativeTlsTransport`. Implies `native-tls` because the driver
+# pulls the server SPKI from the post-TLS transport. `getrandom` fills
+# the per-session CredSSP random.
+native-nla = ["native-tls", "dep:getrandom"]
 # TLS backend selection — `rustls` is the workspace default for
 # justrdp-blocking, so callers who want `native-tls` should set
 # `default-features = false` on `justrdp-blocking` at the workspace
@@ -26,8 +41,51 @@ justrdp-blocking = { workspace = true }
 justrdp-connector.workspace = true
 justrdp-input.workspace = true
 justrdp-tls.workspace = true
-tokio = { version = "1", features = ["rt", "sync", "macros"] }
+# Used by the native CredSSP driver (`justrdp_core::WriteBuf`) and the
+# moved native_* modules (`justrdp_pdu::x224::SecurityProtocol`). Both
+# only get linked once one of the native-* features is on, but we keep
+# them as plain deps rather than gating them — the cost is negligible
+# and v2 (§5.6.4) will need them unconditionally.
+justrdp-core = { workspace = true, features = ["alloc"] }
+justrdp-pdu.workspace = true
+# Optional — only pulled in by the native-* features. Wasm builds do
+# not compile this crate, so a `cfg(not(target_arch="wasm32"))`
+# guard isn't necessary here.
+justrdp-async = { workspace = true, optional = true }
+tokio = { version = "1", features = ["rt", "sync", "macros", "net", "io-util"] }
 tracing = { version = "0.1", optional = true }
+# Async TLS handshake driver. Pulls in `rustls 0.23` matching the
+# version `justrdp-tls` already uses. Optional and behind `native-tls`.
+# `tls12` is critical: without it rustls advertises TLS 1.3 only and
+# legacy Windows RDP servers (Server 2016/2019 SChannel) reset the
+# connection on the ClientHello. Verified empirically against the
+# §11.3 S7-5 test server — drop `tls12` and the handshake gets a TCP
+# RST mid-handshake.
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+# `CredsspRandom` for the NLA driver. Native-only path so no `js`
+# feature needed.
+getrandom = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }
+# `native_render_demo` only — dumps the framebuffer to PNG.
+png = "0.17"
+# `native_window_demo` only — winit drives the OS window and event
+# loop, softbuffer uploads our RGBA framebuffer to the surface
+# without a GPU dependency.
+winit = "0.30"
+softbuffer = "0.4"
+# Examples reuse the rendering surface from `justrdp-web`.
+justrdp-web = { workspace = true }
+
+[[example]]
+name = "native_connect_demo"
+required-features = ["native-nla"]
+
+[[example]]
+name = "native_render_demo"
+required-features = ["native-nla"]
+
+[[example]]
+name = "native_window_demo"
+required-features = ["native-nla"]

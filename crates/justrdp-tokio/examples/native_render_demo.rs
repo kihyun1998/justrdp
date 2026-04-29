@@ -29,10 +29,9 @@ use std::time::Duration;
 
 use justrdp_connector::Config;
 use justrdp_pdu::rdp::finalization::InclusiveRect;
-use justrdp_web::{
-    render_event, ActiveSession, FrameSink, NativeCredsspDriver, NativeTcpTransport,
-    NativeTlsUpgrade, SessionEvent, WebClient, WebTransport,
-};
+use justrdp_async::{ActiveSession, SessionEvent, WebClient, WebTransport};
+use justrdp_tokio::{NativeCredsspDriver, NativeTcpTransport, NativeTlsUpgrade};
+use justrdp_web::{render_event, FrameSink};
 
 const DEFAULT_WIDTH: u16 = 1024;
 const DEFAULT_HEIGHT: u16 = 768;
