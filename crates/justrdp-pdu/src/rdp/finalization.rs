@@ -826,10 +826,13 @@ fn decode_logon_v2(src: &mut ReadCursor<'_>) -> DecodeResult<LogonInfoV2> {
     if version != LOGON_INFO_V2_VERSION {
         return Err(DecodeError::unexpected_value("LogonInfoV2", "version", "must be 0x0001"));
     }
-    let size = src.read_u32_le("LogonV2::size")?;
-    if size != LOGON_INFO_V2_FIXED_SIZE {
-        return Err(DecodeError::unexpected_value("LogonInfoV2", "size", "must be 576"));
-    }
+    // MS-RDPBCGR 2.2.10.1.1.2 specifies Size = 576 (the fixed-length
+    // portion), but real Windows servers (verified against Server 2019
+    // SChannel) emit other values here. The 558-byte Pad that follows
+    // is wire-fixed regardless, so we accept whatever the server sends
+    // and stay in sync via the fixed pad. Matches FreeRDP / IronRDP
+    // leniency.
+    let _size = src.read_u32_le("LogonV2::size")?;
     let session_id = src.read_u32_le("LogonV2::sessionId")?;
     let cb_domain = src.read_u32_le("LogonV2::cbDomain")? as usize;
     let cb_user = src.read_u32_le("LogonV2::cbUserName")? as usize;
@@ -2052,6 +2055,38 @@ mod tests {
         cursor.write_u16_le(0x0002, "ver").unwrap(); // BAD version
         let mut cursor = ReadCursor::new(&buf);
         assert!(SaveSessionInfoPdu::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn logon_v2_accepts_nonstandard_size_field() {
+        // MS-RDPBCGR 2.2.10.1.1.2 specifies Size=576, but real Windows
+        // servers (Server 2019 SChannel observed) emit other values.
+        // The decoder must accept any Size value; the 558-byte Pad
+        // that follows is wire-fixed.
+        let domain = b"DOM\0".to_vec();
+        let user = b"u\0\0".to_vec();
+        let pdu = SaveSessionInfoPdu {
+            info_data: SaveSessionInfoData::LogonV2(LogonInfoV2 {
+                session_id: 1,
+                domain: domain.clone(),
+                user_name: user.clone(),
+            }),
+        };
+        let mut buf = vec![0u8; pdu.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        pdu.encode(&mut cursor).unwrap();
+        // Patch Size field: infoType(4) + Version(2) = offset 6.
+        buf[6..10].copy_from_slice(&64u32.to_le_bytes()); // wrong-on-purpose
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = SaveSessionInfoPdu::decode(&mut cursor).unwrap();
+        match decoded.info_data {
+            SaveSessionInfoData::LogonV2(v2) => {
+                assert_eq!(v2.session_id, 1);
+                assert_eq!(v2.domain, domain);
+                assert_eq!(v2.user_name, user);
+            }
+            other => panic!("expected LogonV2, got {other:?}"),
+        }
     }
 
     #[test]
