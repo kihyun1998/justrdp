@@ -340,6 +340,39 @@ impl ActiveStage {
         )
     }
 
+    /// Build a Refresh Rect PDU frame (MS-RDPBCGR 2.2.11.2). Tells the
+    /// server to re-emit the listed inclusive rectangles. Useful after
+    /// a window restore / first-paint to force the server to send a
+    /// fresh bitmap update.
+    pub fn encode_refresh_rect(
+        &self,
+        areas: &[justrdp_pdu::rdp::finalization::InclusiveRect],
+    ) -> SessionResult<Vec<u8>> {
+        x224_proc::encode_refresh_rect(
+            self.config.user_channel_id,
+            self.config.io_channel_id,
+            self.config.share_id,
+            areas,
+        )
+    }
+
+    /// Build a Suppress Output PDU frame (MS-RDPBCGR 2.2.11.3). Pass
+    /// `allow=false` to pause display updates (e.g. window minimize),
+    /// `allow=true` with the visible viewport rect to resume.
+    pub fn encode_suppress_output(
+        &self,
+        allow: bool,
+        rect: Option<justrdp_pdu::rdp::finalization::InclusiveRect>,
+    ) -> SessionResult<Vec<u8>> {
+        x224_proc::encode_suppress_output(
+            self.config.user_channel_id,
+            self.config.io_channel_id,
+            self.config.share_id,
+            allow,
+            rect,
+        )
+    }
+
     /// Build an MCS DisconnectProviderUltimatum frame (for immediate disconnect).
     pub fn encode_disconnect(&self) -> SessionResult<Vec<u8>> {
         let dpu = DisconnectProviderUltimatum {

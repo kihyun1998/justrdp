@@ -16,8 +16,8 @@ use justrdp_pdu::mcs::{
 };
 use justrdp_pdu::rdp::fast_path::FastPathUpdateType;
 use justrdp_pdu::rdp::finalization::{
-    DeactivateAllPdu, MonitorLayoutPdu, PlaySoundPdu, SaveSessionInfoPdu, SetErrorInfoPdu,
-    SuppressOutputPdu, ERRINFO_NONE,
+    DeactivateAllPdu, InclusiveRect, MonitorLayoutPdu, PlaySoundPdu, RefreshRectPdu,
+    SaveSessionInfoPdu, SetErrorInfoPdu, SuppressOutputPdu, ERRINFO_NONE,
 };
 use justrdp_pdu::rdp::headers::{
     SetKeyboardImeStatusPdu, SetKeyboardIndicatorsPdu, ShareControlHeader, ShareControlPduType,
@@ -385,6 +385,79 @@ pub(crate) fn encode_shutdown_request(
     encode_mcs_send_data(user_channel_id, io_channel_id, &share_control)
 }
 
+/// Encode a Refresh Rect PDU (MS-RDPBCGR 2.2.11.2).
+///
+/// `areas` lists inclusive rectangles the server should re-emit. The
+/// `numberOfAreas` field is u8 (caps at 255 entries); empty `areas` is
+/// allowed but most servers ignore it.
+pub(crate) fn encode_refresh_rect(
+    user_channel_id: u16,
+    io_channel_id: u16,
+    share_id: u32,
+    areas: &[InclusiveRect],
+) -> SessionResult<Vec<u8>> {
+    if areas.len() > u8::MAX as usize {
+        return Err(SessionError::Protocol(alloc::string::String::from(
+            "RefreshRect: numberOfAreas exceeds u8 (max 255)",
+        )));
+    }
+    let pdu = RefreshRectPdu { areas: areas.to_vec() };
+    let mut inner = vec![0u8; pdu.size()];
+    pdu.encode(&mut WriteCursor::new(&mut inner))?;
+
+    let share_data = wrap_share_data(share_id, ShareDataPduType::RefreshRect, &inner)?;
+    let share_control = wrap_share_control(
+        ShareControlPduType::Data,
+        user_channel_id,
+        &share_data,
+    )?;
+    encode_mcs_send_data(user_channel_id, io_channel_id, &share_control)
+}
+
+/// Encode a Suppress Output PDU (MS-RDPBCGR 2.2.11.3).
+///
+/// `allow = false` (SUPPRESS_DISPLAY_UPDATES, 0x00) tells the server to
+/// stop sending display updates and the rect argument is ignored on the
+/// wire. `allow = true` (ALLOW_DISPLAY_UPDATES, 0x01) requires a viewport
+/// rect; pass `None` to default to a zero-rect (some servers tolerate
+/// it, but a real client should always pass the visible area).
+pub(crate) fn encode_suppress_output(
+    user_channel_id: u16,
+    io_channel_id: u16,
+    share_id: u32,
+    allow: bool,
+    rect: Option<InclusiveRect>,
+) -> SessionResult<Vec<u8>> {
+    let pdu = if allow {
+        let r = rect.unwrap_or(InclusiveRect { left: 0, top: 0, right: 0, bottom: 0 });
+        SuppressOutputPdu {
+            allow_display_updates: 1,
+            left: Some(r.left),
+            top: Some(r.top),
+            right: Some(r.right),
+            bottom: Some(r.bottom),
+        }
+    } else {
+        SuppressOutputPdu {
+            allow_display_updates: 0,
+            left: None,
+            top: None,
+            right: None,
+            bottom: None,
+        }
+    };
+    let mut inner = vec![0u8; pdu.size()];
+    pdu.encode(&mut WriteCursor::new(&mut inner))?;
+
+    let share_data = wrap_share_data(share_id, ShareDataPduType::SuppressOutput, &inner)?;
+    let share_control = wrap_share_control(
+        ShareControlPduType::Data,
+        user_channel_id,
+        &share_data,
+    )?;
+    encode_mcs_send_data(user_channel_id, io_channel_id, &share_control)
+}
+
 /// Build a ShareControlHeader + inner payload as bytes.
 fn wrap_share_control(
     pdu_type: ShareControlPduType,
@@ -684,6 +757,73 @@ mod tests {
         // Should be a SendDataRequest
         let choice = src.peek_remaining()[0] >> 2;
         assert_eq!(choice, DomainMcsPduType::SendDataRequest as u8);
+    }
+
+    /// Strip TPKT + X.224 DT + MCS SendDataRequest + ShareControl +
+    /// ShareData and return (ShareDataPduType, body).
+    fn unwrap_client_data_pdu(frame: &[u8]) -> (ShareDataPduType, Vec<u8>) {
+        let mut src = ReadCursor::new(frame);
+        let _tpkt = TpktHeader::decode(&mut src).unwrap();
+        let _dt = DataTransfer::decode(&mut src).unwrap();
+        let sdr = SendDataRequest::decode(&mut src).unwrap();
+        let mut inner = ReadCursor::new(sdr.user_data);
+        let _sch = ShareControlHeader::decode(&mut inner).unwrap();
+        let sdh = ShareDataHeader::decode(&mut inner).unwrap();
+        (sdh.pdu_type2, inner.peek_remaining().to_vec())
+    }
+
+    #[test]
+    fn encode_refresh_rect_wraps_areas_correctly() {
+        let areas = alloc::vec![
+            InclusiveRect { left: 0, top: 0, right: 1023, bottom: 767 },
+            InclusiveRect { left: 100, top: 100, right: 200, bottom: 200 },
+        ];
+        let frame = encode_refresh_rect(1007, 1003, 0x0001_03ea, &areas).unwrap();
+        let (ty, body) = unwrap_client_data_pdu(&frame);
+        assert_eq!(ty, ShareDataPduType::RefreshRect);
+        let pdu = RefreshRectPdu::decode(&mut ReadCursor::new(&body)).unwrap();
+        assert_eq!(pdu.areas, areas);
+    }
+
+    #[test]
+    fn encode_refresh_rect_rejects_too_many_areas() {
+        let areas: alloc::vec::Vec<InclusiveRect> = (0..256u16)
+            .map(|i| InclusiveRect { left: i, top: 0, right: i + 1, bottom: 1 })
+            .collect();
+        assert!(encode_refresh_rect(1007, 1003, 1, &areas).is_err());
+    }
+
+    #[test]
+    fn encode_suppress_output_allow_carries_rect() {
+        let frame = encode_suppress_output(
+            1007,
+            1003,
+            0x0001_03ea,
+            true,
+            Some(InclusiveRect { left: 0, top: 0, right: 1023, bottom: 767 }),
+        )
+        .unwrap();
+        let (ty, body) = unwrap_client_data_pdu(&frame);
+        assert_eq!(ty, ShareDataPduType::SuppressOutput);
+        let pdu = SuppressOutputPdu::decode(&mut ReadCursor::new(&body)).unwrap();
+        assert_eq!(pdu.allow_display_updates, 1);
+        assert_eq!(pdu.left, Some(0));
+        assert_eq!(pdu.top, Some(0));
+        assert_eq!(pdu.right, Some(1023));
+        assert_eq!(pdu.bottom, Some(767));
+    }
+
+    #[test]
+    fn encode_suppress_output_suppress_omits_rect_on_wire() {
+        let frame = encode_suppress_output(1007, 1003, 0x0001_03ea, false, None).unwrap();
+        let (ty, body) = unwrap_client_data_pdu(&frame);
+        assert_eq!(ty, ShareDataPduType::SuppressOutput);
+        // Body must be exactly 4 bytes (allow=0 + 3 pad), no rect on wire.
+        assert_eq!(body.len(), 4);
+        assert_eq!(body[0], 0); // SUPPRESS_DISPLAY_UPDATES
+        let pdu = SuppressOutputPdu::decode(&mut ReadCursor::new(&body)).unwrap();
+        assert_eq!(pdu.allow_display_updates, 0);
+        assert_eq!(pdu.left, None);
     }
 
     #[test]

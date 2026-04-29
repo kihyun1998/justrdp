@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 use justrdp_connector::ConnectionResult;
 use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathUpdateType};
-use justrdp_pdu::rdp::finalization::{MonitorLayoutEntry, SaveSessionInfoData};
+use justrdp_pdu::rdp::finalization::{InclusiveRect, MonitorLayoutEntry, SaveSessionInfoData};
 use justrdp_pdu::tpkt::TpktHint;
 use justrdp_session::{
     ActiveStage, ActiveStageOutput, DeactivationReactivation, GracefulDisconnectReason,
@@ -241,6 +241,36 @@ impl<T: WebTransport> ActiveSession<T> {
         Ok(())
     }
 
+    /// Send a Refresh Rect PDU asking the server to re-emit bitmap
+    /// updates for the listed inclusive rectangles. Useful right after
+    /// connect (or after a window restore) to force the first paint —
+    /// servers don't push bitmap updates for an idle desktop until
+    /// something triggers a redraw.
+    pub async fn send_refresh_rect(
+        &mut self,
+        areas: &[InclusiveRect],
+    ) -> Result<(), DriverError> {
+        let frame = self.stage.encode_refresh_rect(areas)?;
+        self.transport.send(&frame).await?;
+        Ok(())
+    }
+
+    /// Send a Suppress Output PDU. `allow=false` tells the server to
+    /// pause display updates (e.g. while the local window is minimised);
+    /// `allow=true` resumes them, with `rect` passing the visible
+    /// viewport. A typical client emits `(true, Some(viewport))` after
+    /// restore, often paired with a `send_refresh_rect` to force a
+    /// fresh full-screen paint.
+    pub async fn send_suppress_output(
+        &mut self,
+        allow: bool,
+        rect: Option<InclusiveRect>,
+    ) -> Result<(), DriverError> {
+        let frame = self.stage.encode_suppress_output(allow, rect)?;
+        self.transport.send(&frame).await?;
+        Ok(())
+    }
+
     /// Send a graceful shutdown request (Shutdown Request Denied response
     /// from the server still surfaces as `Terminated(ShutdownDenied)`).
     pub async fn shutdown(&mut self) -> Result<(), DriverError> {
@@ -408,6 +438,92 @@ mod tests {
             }
             // No reply frame for synchronize.
             assert!(shared.borrow().sent.is_empty());
+        });
+    }
+
+    /// Confirm `send_refresh_rect` produces a slow-path frame with
+    /// `ShareDataPduType::RefreshRect` and the rectangle list intact.
+    #[test]
+    fn send_refresh_rect_produces_correct_wire_frame() {
+        use justrdp_core::{Decode, ReadCursor};
+        use justrdp_pdu::mcs::SendDataRequest;
+        use justrdp_pdu::rdp::finalization::RefreshRectPdu;
+        use justrdp_pdu::rdp::headers::{
+            ShareControlHeader, ShareDataHeader, ShareDataPduType,
+        };
+        use justrdp_pdu::tpkt::TpktHeader;
+        use justrdp_pdu::x224::DataTransfer;
+
+        block_on(async {
+            let shared = Rc::new(RefCell::new(SharedSink {
+                sent: Vec::new(),
+                recv: VecDeque::new(),
+            }));
+            let transport = SinkTransport { shared: Rc::clone(&shared) };
+            let result = fake_result();
+            let mut session = ActiveSession::new(transport, &result);
+
+            let areas = alloc::vec![
+                InclusiveRect { left: 0, top: 0, right: 1023, bottom: 767 },
+            ];
+            session.send_refresh_rect(&areas).await.unwrap();
+
+            let sent = &shared.borrow().sent;
+            assert_eq!(sent.len(), 1, "exactly one frame written to transport");
+            let frame = &sent[0];
+
+            let mut src = ReadCursor::new(frame);
+            let _tpkt = TpktHeader::decode(&mut src).unwrap();
+            let _dt = DataTransfer::decode(&mut src).unwrap();
+            let sdr = SendDataRequest::decode(&mut src).unwrap();
+            let mut inner = ReadCursor::new(sdr.user_data);
+            let _sch = ShareControlHeader::decode(&mut inner).unwrap();
+            let sdh = ShareDataHeader::decode(&mut inner).unwrap();
+            assert_eq!(sdh.pdu_type2, ShareDataPduType::RefreshRect);
+            let pdu = RefreshRectPdu::decode(&mut inner).unwrap();
+            assert_eq!(pdu.areas, areas);
+        });
+    }
+
+    /// Confirm `send_suppress_output(false, None)` writes a 4-byte body
+    /// (no rect on wire) tagged `ShareDataPduType::SuppressOutput`.
+    #[test]
+    fn send_suppress_output_suppress_omits_rect() {
+        use justrdp_core::{Decode, ReadCursor};
+        use justrdp_pdu::mcs::SendDataRequest;
+        use justrdp_pdu::rdp::finalization::SuppressOutputPdu;
+        use justrdp_pdu::rdp::headers::{
+            ShareControlHeader, ShareDataHeader, ShareDataPduType,
+        };
+        use justrdp_pdu::tpkt::TpktHeader;
+        use justrdp_pdu::x224::DataTransfer;
+
+        block_on(async {
+            let shared = Rc::new(RefCell::new(SharedSink {
+                sent: Vec::new(),
+                recv: VecDeque::new(),
+            }));
+            let transport = SinkTransport { shared: Rc::clone(&shared) };
+            let result = fake_result();
+            let mut session = ActiveSession::new(transport, &result);
+
+            session.send_suppress_output(false, None).await.unwrap();
+
+            let sent = &shared.borrow().sent;
+            assert_eq!(sent.len(), 1);
+            let frame = &sent[0];
+
+            let mut src = ReadCursor::new(frame);
+            let _tpkt = TpktHeader::decode(&mut src).unwrap();
+            let _dt = DataTransfer::decode(&mut src).unwrap();
+            let sdr = SendDataRequest::decode(&mut src).unwrap();
+            let mut inner = ReadCursor::new(sdr.user_data);
+            let _sch = ShareControlHeader::decode(&mut inner).unwrap();
+            let sdh = ShareDataHeader::decode(&mut inner).unwrap();
+            assert_eq!(sdh.pdu_type2, ShareDataPduType::SuppressOutput);
+            let pdu = SuppressOutputPdu::decode(&mut inner).unwrap();
+            assert_eq!(pdu.allow_display_updates, 0);
+            assert_eq!(pdu.left, None);
         });
     }
 
