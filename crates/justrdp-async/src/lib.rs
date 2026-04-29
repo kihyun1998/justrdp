@@ -18,11 +18,13 @@ extern crate alloc;
 mod driver;
 mod error;
 mod input;
+mod redirect;
 mod session;
 mod telemetry;
 mod transport;
 
 pub use driver::{CredsspDriver, DriverError, TlsUpgrade, WebClient, MAX_HANDSHAKE_PDU_SIZE};
 pub use error::{TransportError, TransportErrorKind};
+pub use redirect::{apply_redirect, redirect_target, MAX_REDIRECTS};
 pub use session::{ActiveSession, PointerEvent, SessionEvent};
 pub use transport::WebTransport;
