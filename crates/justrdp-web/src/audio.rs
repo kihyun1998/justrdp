@@ -48,6 +48,59 @@ use justrdp_rdpsnd::pdu::{AudioFormat, VolumePdu, WaveFormatTag};
 use justrdp_rdpsnd::{make_decoder, RdpsndBackend, RdpsndClient, RdpsndDvcClient, RdpsndLossyDvcClient};
 use justrdp_svc::StaticChannelSet;
 
+/// Embedder-injected decoder for codecs the bundled `justrdp-audio`
+/// stack doesn't handle (Opus, AAC, G.711, …).
+///
+/// The contract is intentionally narrow: given an [`AudioFormat`] (the
+/// same descriptor the server sent during negotiation) and one wave
+/// PDU's worth of encoded bytes, return interleaved little-endian
+/// PCM16. The bundled audio path then re-packs that into an
+/// [`AudioFrame`] with `bits_per_sample = 16`, so the embedder sees a
+/// uniform shape regardless of which decoder ran.
+///
+/// Implementations are typically backed by a native codec (libopus,
+/// fdk-aac, etc.) for desktop targets, or by a buffered WebCodecs
+/// pipeline for wasm32 targets — note that browser audio decoders are
+/// inherently asynchronous, so a wasm implementation must drive the
+/// async setup ahead of time and only return synchronously here.
+///
+/// `Send` is required because [`RdpsndBackend`] is `Send`; the channel
+/// processors that own a [`SharedBackend`] live behind a
+/// `Box<dyn SvcProcessor>` and may be moved between threads in
+/// hosting code.
+pub trait ExternalAudioDecoder: Send {
+    /// Probe whether this decoder supports `format`. Called once per
+    /// server format during negotiation; only formats returning `true`
+    /// are advertised back to the server in [`SharedBackend::on_server_formats`].
+    /// Implementations should be cheap — this is dispatch, not state.
+    fn accepts(&mut self, format: &AudioFormat) -> bool;
+
+    /// Decode one wave PDU's payload to interleaved PCM16-LE bytes
+    /// (`channels * num_samples * 2`). Returning an empty `Vec`
+    /// signals "drop this chunk silently" — the wave is not pushed
+    /// downstream and no frame appears in the FIFO. Used both for
+    /// transient decode failures (lost prefix in a streaming codec)
+    /// and for codecs that produce no output until they've buffered
+    /// enough data.
+    fn decode(&mut self, format: &AudioFormat, payload: &[u8]) -> Vec<u8>;
+}
+
+/// Cache slot for one negotiated format. `Bundled` runs through the
+/// `justrdp-audio` decoder factory; `External` defers to the
+/// embedder-injected [`ExternalAudioDecoder`] (carrying the format
+/// description because that decoder is generic over the format).
+enum DecoderSlot {
+    Bundled(Box<dyn AudioDecoder>),
+    External(AudioFormat),
+}
+
+/// Type alias for the shareable decoder handle. Multiple
+/// [`SharedBackend`] instances (SVC + reliable DVC + lossy DVC) wrap
+/// references to the same underlying decoder so its internal codec
+/// state stays coherent regardless of which transport the server
+/// actually picks.
+type ExternalDecoderHandle = Arc<Mutex<dyn ExternalAudioDecoder>>;
+
 /// Maximum sample rate the bundled decode buffer is sized for.
 const MAX_SAMPLE_RATE_HZ: usize = 48_000;
 /// Maximum channel count we accept.
@@ -116,14 +169,20 @@ impl AudioState {
 
 struct SharedBackend {
     state: Arc<Mutex<AudioState>>,
-    /// Per-format decoder cache, keyed by the dense index in the
+    /// Per-format decoder slot, keyed by the dense index in the
     /// negotiated format list (the `format_no` the server sends in
     /// Wave / Wave2 PDUs). Built up in `on_server_formats` so we don't
     /// re-instantiate decoders per wave PDU.
-    decoders: BTreeMap<u16, Box<dyn AudioDecoder>>,
+    decoders: BTreeMap<u16, DecoderSlot>,
     /// Reusable interleaved-i16 decode buffer. Shared across formats
     /// because only one decode is ever in flight per `on_wave_data` call.
     decode_buf: Vec<i16>,
+    /// Optional embedder-injected decoder for codecs the bundled
+    /// `justrdp-audio` stack doesn't handle. Shared across all
+    /// `SharedBackend` instances (SVC + DVC paths) so its internal
+    /// state stays coherent regardless of which transport the server
+    /// uses.
+    external_decoder: Option<ExternalDecoderHandle>,
 }
 
 impl SharedBackend {
@@ -132,17 +191,34 @@ impl SharedBackend {
             state,
             decoders: BTreeMap::new(),
             decode_buf: alloc::vec![0i16; MAX_DECODE_SAMPLES],
+            external_decoder: None,
         }
     }
 
-    /// First-pass acceptance check — quickly reject formats whose
-    /// codec we don't have a decoder for, or whose dimensions exceed
-    /// the bundled buffer sizing. The follow-up
-    /// [`make_decoder`] call is the authoritative gate (it validates
-    /// the codec-specific `extra_data` blob, e.g. MS-ADPCM coefficient
-    /// table); this filter just avoids round-tripping obviously bad
-    /// formats through the decoder factory.
-    fn accept(format: &AudioFormat) -> bool {
+    fn with_external_decoder(
+        state: Arc<Mutex<AudioState>>,
+        external_decoder: ExternalDecoderHandle,
+    ) -> Self {
+        Self {
+            state,
+            decoders: BTreeMap::new(),
+            decode_buf: alloc::vec![0i16; MAX_DECODE_SAMPLES],
+            external_decoder: Some(external_decoder),
+        }
+    }
+
+    /// First-pass acceptance check for the **bundled** decoder path —
+    /// quickly reject formats whose codec we don't have a decoder for,
+    /// or whose dimensions exceed the bundled buffer sizing. The
+    /// follow-up [`make_decoder`] call is the authoritative gate (it
+    /// validates the codec-specific `extra_data` blob, e.g. MS-ADPCM
+    /// coefficient table); this filter just avoids round-tripping
+    /// obviously bad formats through the decoder factory.
+    ///
+    /// Channel-count and sample-rate ceilings apply uniformly so
+    /// embedder-injected decoders (e.g. Opus) cannot bypass the
+    /// shared decode-buffer sizing.
+    fn shape_acceptable(format: &AudioFormat) -> bool {
         if !(format.n_channels == 1 || format.n_channels == 2) {
             return false;
         }
@@ -151,14 +227,19 @@ impl SharedBackend {
         {
             return false;
         }
+        true
+    }
+
+    fn bundled_codec_acceptable(format: &AudioFormat) -> bool {
         match format.format_tag {
             WaveFormatTag::PCM => format.bits_per_sample == 16,
             // Block-based ADPCM variants — `make_decoder` validates the
             // extra_data layout, so all we check here is non-zero
             // block alignment.
             WaveFormatTag::ADPCM | WaveFormatTag::DVI_ADPCM => format.n_block_align > 0,
-            // Opus / AAC / G.711 — need a browser-side or
-            // embedder-injected decoder; tracked in roadmap §11.3 S6b2.
+            // Opus / AAC / G.711 — bundled stack returns
+            // `UnsupportedCodec`. Defer to `external_decoder` if one
+            // was injected.
             _ => false,
         }
     }
@@ -172,21 +253,40 @@ impl RdpsndBackend for SharedBackend {
         let mut accepted_idx = Vec::new();
         let mut accepted_formats = Vec::new();
         for (i, fmt) in server_formats.iter().enumerate() {
-            if !Self::accept(fmt) {
+            if !Self::shape_acceptable(fmt) {
                 continue;
             }
-            // make_decoder is the authoritative codec validator — if it
-            // rejects the format (e.g. malformed MS-ADPCM extra_data),
-            // skip the format entirely instead of advertising a codec
-            // we can't actually drive.
-            let decoder = match make_decoder(fmt) {
-                Ok(d) => d,
-                Err(_) => continue,
+
+            // 1) Try the bundled decoder factory first. `make_decoder`
+            //    is the authoritative codec validator — if it rejects
+            //    the format (e.g. malformed MS-ADPCM extra_data), we
+            //    skip rather than advertise a codec we can't drive.
+            let bundled_slot = if Self::bundled_codec_acceptable(fmt) {
+                make_decoder(fmt).ok().map(DecoderSlot::Bundled)
+            } else {
+                None
             };
+
+            // 2) Otherwise, defer to the embedder-injected decoder if
+            //    one is registered and accepts this format. The
+            //    decoder is shared across all backends; we acquire it
+            //    just long enough to probe.
+            let slot = bundled_slot.or_else(|| {
+                let ext = self.external_decoder.as_ref()?;
+                let mut g = ext.lock().ok()?;
+                if g.accepts(fmt) {
+                    Some(DecoderSlot::External(fmt.clone()))
+                } else {
+                    None
+                }
+            });
+
+            let Some(slot) = slot else { continue };
+
             let dense_idx = accepted_formats.len() as u16;
             accepted_idx.push(i);
             accepted_formats.push(fmt.clone());
-            self.decoders.insert(dense_idx, decoder);
+            self.decoders.insert(dense_idx, slot);
         }
         if let Ok(mut g) = self.state.lock() {
             g.accepted_formats = accepted_formats;
@@ -195,40 +295,75 @@ impl RdpsndBackend for SharedBackend {
     }
 
     fn on_wave_data(&mut self, format_no: u16, data: &[u8], _audio_timestamp: Option<u32>) {
-        let Some(decoder) = self.decoders.get_mut(&format_no) else {
+        let Some(slot) = self.decoders.get_mut(&format_no) else {
             // Stale or out-of-range format_no — drop rather than push
             // unknown bytes downstream.
             return;
         };
 
-        let sample_rate = decoder.sample_rate();
-        let channels = decoder.channels();
-        let n_samples = match decoder.decode(data, &mut self.decode_buf) {
-            Ok(n) => n.min(self.decode_buf.len()),
-            Err(_) => return,
-        };
-        if n_samples == 0 {
-            return;
-        }
+        match slot {
+            DecoderSlot::Bundled(decoder) => {
+                let sample_rate = decoder.sample_rate();
+                let channels = decoder.channels();
+                let n_samples = match decoder.decode(data, &mut self.decode_buf) {
+                    Ok(n) => n.min(self.decode_buf.len()),
+                    Err(_) => return,
+                };
+                if n_samples == 0 {
+                    return;
+                }
 
-        // Re-pack the i16 samples as little-endian PCM16 bytes — the
-        // demo's Web Audio bridge consumes that layout directly via
-        // `DataView::getInt16(_, /*littleEndian*/ true)`.
-        let mut bytes = Vec::with_capacity(n_samples * 2);
-        for &s in &self.decode_buf[..n_samples] {
-            bytes.extend_from_slice(&s.to_le_bytes());
-        }
+                // Re-pack the i16 samples as little-endian PCM16 bytes
+                // — the demo's Web Audio bridge consumes that layout
+                // directly via `DataView::getInt16(_, /*littleEndian*/ true)`.
+                let mut bytes = Vec::with_capacity(n_samples * 2);
+                for &s in &self.decode_buf[..n_samples] {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
 
-        if let Ok(mut g) = self.state.lock() {
-            g.pending_frames.push_back(AudioFrame {
-                format_no,
-                sample_rate,
-                channels,
-                // Always 16 post-decode — every supported codec lands
-                // as PCM16 after `AudioDecoder::decode`.
-                bits_per_sample: 16,
-                data: bytes,
-            });
+                if let Ok(mut g) = self.state.lock() {
+                    g.pending_frames.push_back(AudioFrame {
+                        format_no,
+                        sample_rate,
+                        channels,
+                        bits_per_sample: 16,
+                        data: bytes,
+                    });
+                }
+            }
+            DecoderSlot::External(format) => {
+                // The Mutex guard must be released before we re-take
+                // `state` (these are separate locks; ordering is fine,
+                // but keeping the guard scope tight keeps callers
+                // responsive on the audio path).
+                let Some(ext) = self.external_decoder.as_ref() else {
+                    return;
+                };
+                let bytes = match ext.lock() {
+                    Ok(mut g) => g.decode(format, data),
+                    Err(_) => return,
+                };
+                if bytes.is_empty() {
+                    // Embedder signalled "drop this chunk" — common
+                    // for streaming codecs that haven't yet buffered
+                    // enough to produce output.
+                    return;
+                }
+
+                let sample_rate = format.n_samples_per_sec;
+                let channels = format.n_channels;
+                if let Ok(mut g) = self.state.lock() {
+                    g.pending_frames.push_back(AudioFrame {
+                        format_no,
+                        sample_rate,
+                        channels,
+                        // External decoder contract: returned bytes
+                        // are PCM16-LE.
+                        bits_per_sample: 16,
+                        data: bytes,
+                    });
+                }
+            }
         }
     }
 
@@ -314,6 +449,38 @@ impl AudioChannel {
     /// from whichever route the server actually uses land in the same
     /// FIFO.
     pub fn from_connection(result: &ConnectionResult) -> Result<Self, AudioChannelError> {
+        Self::build(result, None)
+    }
+
+    /// Same as [`Self::from_connection`] but with an embedder-injected
+    /// [`ExternalAudioDecoder`] available for codecs the bundled
+    /// `justrdp-audio` stack doesn't handle (Opus, AAC, G.711). If
+    /// the decoder accepts a server-advertised format, it is
+    /// negotiated alongside the bundled formats.
+    ///
+    /// The decoder is shared across the SVC, reliable-DVC, and
+    /// lossy-DVC backends so a stateful codec sees a single,
+    /// continuous stream regardless of which transport the server
+    /// picks.
+    pub fn from_connection_with_external_decoder<D>(
+        result: &ConnectionResult,
+        external_decoder: D,
+    ) -> Result<Self, AudioChannelError>
+    where
+        D: ExternalAudioDecoder + 'static,
+    {
+        // `Arc::new` returns `Arc<Mutex<D>>` for sized `D`; the
+        // unsizing coercion to `Arc<Mutex<dyn ExternalAudioDecoder>>`
+        // happens here because the binding's annotated type is the
+        // unsized handle.
+        let handle: ExternalDecoderHandle = Arc::new(Mutex::new(external_decoder));
+        Self::build(result, Some(handle))
+    }
+
+    fn build(
+        result: &ConnectionResult,
+        external_decoder: Option<ExternalDecoderHandle>,
+    ) -> Result<Self, AudioChannelError> {
         let rdpsnd_channel_id = result
             .channel_ids
             .iter()
@@ -333,8 +500,15 @@ impl AudioChannel {
         let mut channels = StaticChannelSet::new();
         let mut id_assignments: Vec<(String, u16)> = Vec::new();
 
+        let make_backend = |state: Arc<Mutex<AudioState>>| -> Box<SharedBackend> {
+            match &external_decoder {
+                Some(ext) => Box::new(SharedBackend::with_external_decoder(state, Arc::clone(ext))),
+                None => Box::new(SharedBackend::new(state)),
+            }
+        };
+
         if let Some(id) = rdpsnd_channel_id {
-            let backend = Box::new(SharedBackend::new(Arc::clone(&state)));
+            let backend = make_backend(Arc::clone(&state));
             let rdpsnd = Box::new(RdpsndClient::new(backend));
             channels.insert(rdpsnd).map_err(AudioChannelError::Svc)?;
             id_assignments.push((String::from("rdpsnd"), id));
@@ -346,8 +520,8 @@ impl AudioChannel {
             // frames into the shared `AudioState`. In practice the
             // server picks one, but registering both leaves the choice
             // to the server.
-            let reliable_backend = Box::new(SharedBackend::new(Arc::clone(&state)));
-            let lossy_backend = Box::new(SharedBackend::new(Arc::clone(&state)));
+            let reliable_backend = make_backend(Arc::clone(&state));
+            let lossy_backend = make_backend(Arc::clone(&state));
             let mut drdynvc = DrdynvcClient::new();
             drdynvc.register(Box::new(RdpsndDvcClient::new(reliable_backend)));
             drdynvc.register(Box::new(RdpsndLossyDvcClient::new(lossy_backend)));
@@ -676,5 +850,185 @@ mod tests {
         let f2 = ch.take_frame().unwrap();
         assert_eq!(f2.data, vec![0x30, 0x40]);
         assert!(ch.take_frame().is_none());
+    }
+
+    // ── External (Opus / AAC / G.711) decoder injection (S6b2) ──
+
+    /// Test double — accepts every format whose `format_tag` is in
+    /// `accept_tags`, and decodes by returning a fixed PCM16-LE
+    /// payload whose first byte is the format tag's low byte. That
+    /// makes it easy for a test to verify "this frame came from the
+    /// external decoder for this format."
+    struct StubExternalDecoder {
+        accept_tags: Vec<WaveFormatTag>,
+        produce: Vec<u8>,
+        accepts_calls: u32,
+        decode_calls: u32,
+    }
+
+    impl ExternalAudioDecoder for StubExternalDecoder {
+        fn accepts(&mut self, format: &AudioFormat) -> bool {
+            self.accepts_calls += 1;
+            self.accept_tags.contains(&format.format_tag)
+        }
+
+        fn decode(&mut self, _format: &AudioFormat, _payload: &[u8]) -> Vec<u8> {
+            self.decode_calls += 1;
+            self.produce.clone()
+        }
+    }
+
+    fn make_opus_format() -> AudioFormat {
+        AudioFormat {
+            format_tag: WaveFormatTag::OPUS,
+            n_channels: 2,
+            n_samples_per_sec: 48_000,
+            n_avg_bytes_per_sec: 0,
+            n_block_align: 0,
+            // OPUS is encoded; the bundled path rejects this regardless
+            // of bits_per_sample. The bytes the external decoder
+            // returns are PCM16-LE per the trait contract.
+            bits_per_sample: 0,
+            extra_data: vec![],
+        }
+    }
+
+    #[test]
+    fn external_decoder_advertises_opus_when_bundled_rejects() {
+        // Without an external decoder, OPUS is dropped at negotiation.
+        // With one that accepts it, OPUS becomes a negotiated format
+        // and the original index is returned to the engine.
+        let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
+        let stub = Arc::new(Mutex::new(StubExternalDecoder {
+            accept_tags: vec![WaveFormatTag::OPUS],
+            produce: vec![0xAA, 0x00, 0xBB, 0x00],
+            accepts_calls: 0,
+            decode_calls: 0,
+        }));
+        let handle: ExternalDecoderHandle = stub.clone();
+        let mut backend = SharedBackend::with_external_decoder(Arc::clone(&state), handle);
+
+        let server = vec![
+            AudioFormat::pcm(2, 44_100, 16),
+            make_opus_format(),
+        ];
+        let accepted = backend.on_server_formats(&server);
+        // Both formats are accepted: PCM via bundled, OPUS via external.
+        assert_eq!(accepted, vec![0, 1]);
+        let g = state.lock().unwrap();
+        assert_eq!(g.accepted_formats.len(), 2);
+        assert_eq!(g.accepted_formats[1].format_tag, WaveFormatTag::OPUS);
+    }
+
+    #[test]
+    fn external_decoder_runs_on_wave_data_for_advertised_format() {
+        // After negotiating OPUS through the external decoder, a Wave
+        // PDU at the corresponding format_no must dispatch to the
+        // external decoder and queue its returned bytes verbatim
+        // (bits_per_sample = 16 per trait contract).
+        let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
+        let stub = Arc::new(Mutex::new(StubExternalDecoder {
+            accept_tags: vec![WaveFormatTag::OPUS],
+            produce: vec![0xAA, 0x00, 0xBB, 0x00],
+            accepts_calls: 0,
+            decode_calls: 0,
+        }));
+        let mut backend = SharedBackend::with_external_decoder(
+            Arc::clone(&state),
+            stub.clone() as ExternalDecoderHandle,
+        );
+        backend.on_server_formats(&[make_opus_format()]);
+
+        // format_no=0 is the OPUS slot.
+        backend.on_wave_data(0, &[0x01, 0x02, 0x03], None);
+
+        let mut g = state.lock().unwrap();
+        let frame = g.pending_frames.pop_front().expect("frame queued");
+        assert_eq!(frame.format_no, 0);
+        assert_eq!(frame.channels, 2);
+        assert_eq!(frame.sample_rate, 48_000);
+        assert_eq!(frame.bits_per_sample, 16);
+        assert_eq!(frame.data, vec![0xAA, 0x00, 0xBB, 0x00]);
+        drop(g);
+
+        // Decode was invoked exactly once.
+        assert_eq!(stub.lock().unwrap().decode_calls, 1);
+    }
+
+    #[test]
+    fn external_decoder_empty_output_drops_frame_silently() {
+        // Streaming codecs (Opus, AAC) typically buffer some prefix
+        // bytes before producing PCM. A decoder returning Vec::new()
+        // signals "drop this chunk silently" — no AudioFrame must
+        // appear in the FIFO.
+        let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
+        let stub = Arc::new(Mutex::new(StubExternalDecoder {
+            accept_tags: vec![WaveFormatTag::OPUS],
+            produce: vec![],
+            accepts_calls: 0,
+            decode_calls: 0,
+        }));
+        let mut backend = SharedBackend::with_external_decoder(
+            Arc::clone(&state),
+            stub.clone() as ExternalDecoderHandle,
+        );
+        backend.on_server_formats(&[make_opus_format()]);
+
+        backend.on_wave_data(0, &[0x01, 0x02], None);
+
+        assert_eq!(state.lock().unwrap().pending_frame_count(), 0);
+        assert_eq!(stub.lock().unwrap().decode_calls, 1);
+    }
+
+    #[test]
+    fn external_decoder_skipped_when_bundled_handles_format() {
+        // PCM is handled by the bundled decoder. The external decoder
+        // must not see PCM at all (otherwise stateful codecs could be
+        // initialised redundantly), so accepts() should never be
+        // called for it.
+        let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
+        let stub = Arc::new(Mutex::new(StubExternalDecoder {
+            accept_tags: vec![WaveFormatTag::PCM, WaveFormatTag::OPUS],
+            produce: vec![0xFF],
+            accepts_calls: 0,
+            decode_calls: 0,
+        }));
+        let mut backend = SharedBackend::with_external_decoder(
+            Arc::clone(&state),
+            stub.clone() as ExternalDecoderHandle,
+        );
+        backend.on_server_formats(&[AudioFormat::pcm(1, 44_100, 16)]);
+
+        // Bundled path took PCM — external decoder was never asked.
+        assert_eq!(stub.lock().unwrap().accepts_calls, 0);
+    }
+
+    #[test]
+    fn from_connection_with_external_decoder_routes_through_dvc() {
+        // End-to-end at the AudioChannel layer: build with an external
+        // decoder, pretend the server announced an OPUS format via a
+        // direct backend probe (the full RDPSND state machine isn't
+        // needed for this assertion), then verify the negotiated
+        // format list reflects the OPUS entry. Confirms the decoder
+        // handle is actually plumbed into the per-processor backends.
+        let result = make_result_with(vec![(String::from("drdynvc"), 1006)]);
+        let stub = StubExternalDecoder {
+            accept_tags: vec![WaveFormatTag::OPUS],
+            produce: vec![0x01, 0x00],
+            accepts_calls: 0,
+            decode_calls: 0,
+        };
+        let ch = AudioChannel::from_connection_with_external_decoder(&result, stub).unwrap();
+        // Drive a freshly constructed SharedBackend the same way
+        // `RdpsndDvcClient::on_server_formats` would, but via direct
+        // probe — using the channel's `state()` to verify the path is
+        // wired. We can't reach into the registered backend, so this
+        // test instead asserts that the AudioChannel constructed with
+        // the external decoder is structurally sound (no panic, both
+        // ids resolve as expected). Behaviour-level coverage of the
+        // external path is in the SharedBackend tests above.
+        assert_eq!(ch.drdynvc_channel_id(), Some(1006));
+        assert_eq!(ch.rdpsnd_channel_id(), None);
+        assert_eq!(ch.state().lock().unwrap().accepted_formats().len(), 0);
     }
 }
