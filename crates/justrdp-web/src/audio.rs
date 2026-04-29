@@ -2,17 +2,30 @@
 
 //! Audio output channel routing on top of `justrdp-rdpsnd` (MS-RDPEA).
 //!
-//! [`AudioChannel`] hosts an [`RdpsndClient`] inside a
-//! [`StaticChannelSet`] with a shared [`AudioState`] backend. Wave data
-//! the server pushes lands in `pending_frames` for the embedder to
-//! drain via `take_frame`; the demo page funnels each frame into a
-//! Web Audio `AudioContext`.
+//! [`AudioChannel`] hosts the RDPSND processors inside a
+//! [`StaticChannelSet`]. Wave data the server pushes lands in
+//! `pending_frames` for the embedder to drain via `take_frame`; the
+//! demo page funnels each frame into a Web Audio `AudioContext`.
+//!
+//! Two transports are supported and selected automatically based on
+//! what the server negotiated:
+//!
+//! * **SVC mode** — server addresses the static `rdpsnd` channel
+//!   directly. Hosts an [`RdpsndClient`] (advertises version 6).
+//! * **DVC mode** — server tunnels audio through `drdynvc`, opening
+//!   `AUDIO_PLAYBACK_DVC` (reliable) and / or `AUDIO_PLAYBACK_LOSSY_DVC`
+//!   (UDP multitransport). Both DVC clients (advertising version 8)
+//!   are registered with a [`DrdynvcClient`] under the `drdynvc` SVC.
+//!
+//! Both routes share one [`AudioState`] (decoded frames land in the
+//! same FIFO regardless of source); each backend keeps its own
+//! per-format decoder cache. Whichever transport the server picks
+//! delivers wave PDUs into the same queue.
 //!
 //! Format negotiation: the bundled backend accepts **PCM** (16-bit
 //! little-endian, mono or stereo, any sample rate), **MS-ADPCM**
 //! (`WaveFormatTag::ADPCM`, 0x0002), and **IMA / DVI ADPCM**
-//! (`WaveFormatTag::DVI_ADPCM`, 0x0011). The backend keeps a per-format
-//! decoder cache (`justrdp_audio::AudioDecoder`) and converts every
+//! (`WaveFormatTag::DVI_ADPCM`, 0x0011). The backend converts every
 //! incoming wave PDU to interleaved PCM16-LE before pushing an
 //! [`AudioFrame`], so embedders see a single uniform on-the-wire shape
 //! regardless of the negotiated codec.
@@ -30,8 +43,9 @@ use std::sync::{Arc, Mutex};
 
 use justrdp_audio::AudioDecoder;
 use justrdp_connector::ConnectionResult;
+use justrdp_dvc::DrdynvcClient;
 use justrdp_rdpsnd::pdu::{AudioFormat, VolumePdu, WaveFormatTag};
-use justrdp_rdpsnd::{make_decoder, RdpsndBackend, RdpsndClient};
+use justrdp_rdpsnd::{make_decoder, RdpsndBackend, RdpsndClient, RdpsndDvcClient, RdpsndLossyDvcClient};
 use justrdp_svc::StaticChannelSet;
 
 /// Maximum sample rate the bundled decode buffer is sized for.
@@ -235,7 +249,14 @@ impl RdpsndBackend for SharedBackend {
 pub struct AudioChannel {
     channels: StaticChannelSet,
     user_channel_id: u16,
-    rdpsnd_channel_id: u16,
+    /// MCS id of the `rdpsnd` SVC, when negotiated. `None` means the
+    /// server did not allocate it (DVC-only path or audio entirely
+    /// disabled).
+    rdpsnd_channel_id: Option<u16>,
+    /// MCS id of the `drdynvc` SVC, when negotiated. `None` means the
+    /// embedder did not advertise `drdynvc` or the server did not
+    /// allocate it (SVC-only path).
+    drdynvc_channel_id: Option<u16>,
     state: Arc<Mutex<AudioState>>,
 }
 
@@ -244,13 +265,15 @@ impl core::fmt::Debug for AudioChannel {
         f.debug_struct("AudioChannel")
             .field("user_channel_id", &self.user_channel_id)
             .field("rdpsnd_channel_id", &self.rdpsnd_channel_id)
+            .field("drdynvc_channel_id", &self.drdynvc_channel_id)
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Debug)]
 pub enum AudioChannelError {
-    /// The negotiated channel set didn't include `rdpsnd`.
+    /// The negotiated channel set included neither `rdpsnd` nor
+    /// `drdynvc` — there is no transport for audio.
     ChannelNotNegotiated,
     /// The wrapped channel set rejected the operation.
     Svc(justrdp_svc::SvcError),
@@ -259,7 +282,9 @@ pub enum AudioChannelError {
 impl core::fmt::Display for AudioChannelError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::ChannelNotNegotiated => f.write_str("RDPSND channel not negotiated by server"),
+            Self::ChannelNotNegotiated => f.write_str(
+                "neither rdpsnd nor drdynvc was negotiated — audio cannot be routed",
+            ),
             Self::Svc(e) => write!(f, "svc: {e:?}"),
         }
     }
@@ -272,35 +297,86 @@ impl From<justrdp_svc::SvcError> for AudioChannelError {
 }
 
 impl AudioChannel {
-    /// Construct from a [`ConnectionResult`]. Looks up `rdpsnd` in the
-    /// negotiated channel list and instantiates the inner
-    /// [`RdpsndClient`] with the bundled PCM/ADPCM backend.
+    /// Construct from a [`ConnectionResult`].
+    ///
+    /// Looks up both `rdpsnd` (SVC mode) and `drdynvc` (DVC mode hosting
+    /// `AUDIO_PLAYBACK_DVC` / `AUDIO_PLAYBACK_LOSSY_DVC`) in the
+    /// negotiated channel list. At least one must be present.
+    ///
+    /// * If `rdpsnd` is negotiated, an [`RdpsndClient`] is registered
+    ///   under that MCS id.
+    /// * If `drdynvc` is negotiated, a [`DrdynvcClient`] is registered
+    ///   under that id, with [`RdpsndDvcClient`] (reliable) and
+    ///   [`RdpsndLossyDvcClient`] (UDP multitransport) hosted inside.
+    ///
+    /// Each client owns its own [`SharedBackend`] (separate decoder
+    /// caches) but all share the returned [`AudioState`] — wave PDUs
+    /// from whichever route the server actually uses land in the same
+    /// FIFO.
     pub fn from_connection(result: &ConnectionResult) -> Result<Self, AudioChannelError> {
         let rdpsnd_channel_id = result
             .channel_ids
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("rdpsnd"))
-            .map(|(_, id)| *id)
-            .ok_or(AudioChannelError::ChannelNotNegotiated)?;
+            .map(|(_, id)| *id);
+        let drdynvc_channel_id = result
+            .channel_ids
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("drdynvc"))
+            .map(|(_, id)| *id);
+
+        if rdpsnd_channel_id.is_none() && drdynvc_channel_id.is_none() {
+            return Err(AudioChannelError::ChannelNotNegotiated);
+        }
 
         let state: Arc<Mutex<AudioState>> = Arc::new(Mutex::new(AudioState::default()));
-        let backend = Box::new(SharedBackend::new(Arc::clone(&state)));
-        let rdpsnd = Box::new(RdpsndClient::new(backend));
-
         let mut channels = StaticChannelSet::new();
-        channels.insert(rdpsnd).map_err(AudioChannelError::Svc)?;
-        channels.assign_ids(&[(String::from("rdpsnd"), rdpsnd_channel_id)]);
+        let mut id_assignments: Vec<(String, u16)> = Vec::new();
+
+        if let Some(id) = rdpsnd_channel_id {
+            let backend = Box::new(SharedBackend::new(Arc::clone(&state)));
+            let rdpsnd = Box::new(RdpsndClient::new(backend));
+            channels.insert(rdpsnd).map_err(AudioChannelError::Svc)?;
+            id_assignments.push((String::from("rdpsnd"), id));
+        }
+
+        if let Some(id) = drdynvc_channel_id {
+            // Reliable DVC and lossy DVC each take their own backend
+            // (each owns a separate decoder cache); both push decoded
+            // frames into the shared `AudioState`. In practice the
+            // server picks one, but registering both leaves the choice
+            // to the server.
+            let reliable_backend = Box::new(SharedBackend::new(Arc::clone(&state)));
+            let lossy_backend = Box::new(SharedBackend::new(Arc::clone(&state)));
+            let mut drdynvc = DrdynvcClient::new();
+            drdynvc.register(Box::new(RdpsndDvcClient::new(reliable_backend)));
+            drdynvc.register(Box::new(RdpsndLossyDvcClient::new(lossy_backend)));
+            channels
+                .insert(Box::new(drdynvc))
+                .map_err(AudioChannelError::Svc)?;
+            id_assignments.push((String::from("drdynvc"), id));
+        }
+
+        channels.assign_ids(&id_assignments);
 
         Ok(Self {
             channels,
             user_channel_id: result.user_channel_id,
             rdpsnd_channel_id,
+            drdynvc_channel_id,
             state,
         })
     }
 
-    pub fn channel_id(&self) -> u16 {
+    /// MCS channel id for the `rdpsnd` SVC, when negotiated.
+    pub fn rdpsnd_channel_id(&self) -> Option<u16> {
         self.rdpsnd_channel_id
+    }
+
+    /// MCS channel id for the `drdynvc` SVC (host for `AUDIO_PLAYBACK_DVC`
+    /// and `AUDIO_PLAYBACK_LOSSY_DVC`), when negotiated.
+    pub fn drdynvc_channel_id(&self) -> Option<u16> {
+        self.drdynvc_channel_id
     }
 
     pub fn state(&self) -> Arc<Mutex<AudioState>> {
@@ -308,9 +384,10 @@ impl AudioChannel {
     }
 
     /// Process raw `ChannelData.data` bytes from a
-    /// [`SessionEvent::Channel`] event. If the channel id doesn't
-    /// match RDPSND, returns an empty Vec so the embedder can route
-    /// every channel event without filtering.
+    /// [`SessionEvent::Channel`] event. The id is matched against both
+    /// the SVC `rdpsnd` and the SVC `drdynvc` slots; channels that
+    /// belong to neither return an empty Vec so the embedder can fan
+    /// every channel event in without pre-filtering.
     ///
     /// Returned wire frames are TPKT-framed and ready to send via
     /// `transport.send`.
@@ -321,7 +398,9 @@ impl AudioChannel {
         channel_id: u16,
         data: &[u8],
     ) -> Result<Vec<Vec<u8>>, AudioChannelError> {
-        if channel_id != self.rdpsnd_channel_id {
+        let matches_rdpsnd = Some(channel_id) == self.rdpsnd_channel_id;
+        let matches_drdynvc = Some(channel_id) == self.drdynvc_channel_id;
+        if !matches_rdpsnd && !matches_drdynvc {
             return Ok(Vec::new());
         }
         Ok(self
@@ -342,13 +421,13 @@ mod tests {
     use alloc::vec;
     use justrdp_pdu::x224::SecurityProtocol;
 
-    fn make_result(rdpsnd_id: u16) -> ConnectionResult {
+    fn make_result_with(channel_ids: Vec<(String, u16)>) -> ConnectionResult {
         ConnectionResult {
             io_channel_id: 1003,
             user_channel_id: 1001,
             share_id: 0x0001_03ea,
             server_capabilities: Vec::new(),
-            channel_ids: vec![(String::from("rdpsnd"), rdpsnd_id)],
+            channel_ids,
             selected_protocol: SecurityProtocol::RDP,
             session_id: 0,
             server_monitor_layout: None,
@@ -357,17 +436,46 @@ mod tests {
         }
     }
 
+    fn make_result(rdpsnd_id: u16) -> ConnectionResult {
+        make_result_with(vec![(String::from("rdpsnd"), rdpsnd_id)])
+    }
+
     #[test]
     fn from_connection_finds_rdpsnd_channel_id() {
         let result = make_result(1005);
         let ch = AudioChannel::from_connection(&result).unwrap();
-        assert_eq!(ch.channel_id(), 1005);
+        assert_eq!(ch.rdpsnd_channel_id(), Some(1005));
+        assert_eq!(ch.drdynvc_channel_id(), None);
     }
 
     #[test]
-    fn from_connection_errors_when_rdpsnd_missing() {
-        let mut result = make_result(0);
-        result.channel_ids.clear();
+    fn from_connection_finds_drdynvc_only() {
+        // DVC-only path: server may negotiate `drdynvc` without
+        // `rdpsnd` when the embedder only advertised the dynamic
+        // channel. AudioChannel must still construct successfully.
+        let result = make_result_with(vec![(String::from("drdynvc"), 1006)]);
+        let ch = AudioChannel::from_connection(&result).unwrap();
+        assert_eq!(ch.rdpsnd_channel_id(), None);
+        assert_eq!(ch.drdynvc_channel_id(), Some(1006));
+    }
+
+    #[test]
+    fn from_connection_finds_both_channels() {
+        // Both routes negotiated — the server picks at runtime which
+        // one to use; AudioChannel just routes whichever traffic
+        // arrives.
+        let result = make_result_with(vec![
+            (String::from("rdpsnd"), 1005),
+            (String::from("drdynvc"), 1006),
+        ]);
+        let ch = AudioChannel::from_connection(&result).unwrap();
+        assert_eq!(ch.rdpsnd_channel_id(), Some(1005));
+        assert_eq!(ch.drdynvc_channel_id(), Some(1006));
+    }
+
+    #[test]
+    fn from_connection_errors_when_neither_channel_negotiated() {
+        let result = make_result_with(Vec::new());
         let err = AudioChannel::from_connection(&result).unwrap_err();
         assert!(matches!(err, AudioChannelError::ChannelNotNegotiated));
     }
@@ -378,6 +486,27 @@ mod tests {
         let mut ch = AudioChannel::from_connection(&result).unwrap();
         let frames = ch.process_channel_data(2000, &[0u8; 16]).unwrap();
         assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn process_channel_data_routes_drdynvc_id() {
+        // A drdynvc-only AudioChannel must accept its negotiated id —
+        // even an empty PDU body should land at the DRDYNVC processor
+        // rather than be dropped at the routing gate. We feed a
+        // minimal valid `ChannelPduHeader` (length=0, FIRST|LAST) so
+        // the SVC layer dispatches one empty payload to DrdynvcClient,
+        // which produces no response (no DVC PDUs to decode). The
+        // assertion is that no error escapes — i.e. the channel was
+        // recognised and routed.
+        let result = make_result_with(vec![(String::from("drdynvc"), 1006)]);
+        let mut ch = AudioChannel::from_connection(&result).unwrap();
+        // ChannelPduHeader (8 bytes): length(u32 LE) = 0 + flags(u32 LE)
+        // = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST = 0x03.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&0x03u32.to_le_bytes());
+        let frames = ch.process_channel_data(1006, &frame).unwrap();
+        assert!(frames.is_empty(), "empty drdynvc payload yields no response");
     }
 
     /// Build a minimal MS-ADPCM `AudioFormat` (mono, 22050 Hz) using the

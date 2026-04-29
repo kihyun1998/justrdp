@@ -31,6 +31,7 @@ justrdp-cliprdr = { workspace = true, features = ["alloc"] }
 justrdp-rdpsnd = { workspace = true, features = ["alloc"] }
 justrdp-audio = { workspace = true, features = ["alloc"] }
 justrdp-svc = { workspace = true, features = ["alloc"] }
+justrdp-dvc = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

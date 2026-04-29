@@ -714,6 +714,7 @@ dependencies = [
  "justrdp-cliprdr",
  "justrdp-connector",
  "justrdp-core",
+ "justrdp-dvc",
  "justrdp-graphics",
  "justrdp-pdu",
  "justrdp-rdpsnd",
