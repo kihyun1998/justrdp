@@ -36,6 +36,9 @@ mod canvas;
 #[cfg(all(feature = "websocket", target_arch = "wasm32"))]
 mod websocket;
 
+#[cfg(all(feature = "native-tcp", not(target_arch = "wasm32")))]
+mod native_tcp;
+
 #[cfg(target_arch = "wasm32")]
 mod js;
 
@@ -61,3 +64,6 @@ pub use canvas::CanvasFrameSink;
 
 #[cfg(all(feature = "websocket", target_arch = "wasm32"))]
 pub use websocket::{WebSocketConfig, WebSocketTransport};
+
+#[cfg(all(feature = "native-tcp", not(target_arch = "wasm32")))]
+pub use native_tcp::NativeTcpTransport;

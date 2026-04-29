@@ -16,6 +16,12 @@ default = ["websocket"]
 # non-wasm targets the gate is a no-op because `web-sys`/`wasm-bindgen`
 # are declared only under `[target.'cfg(target_arch = "wasm32")']`.
 websocket = []
+# Exposes `NativeTcpTransport` — a `tokio::net::TcpStream` wrapper that
+# implements `WebTransport` directly (no wsproxy). Native targets only;
+# the optional `tokio` dependency is pulled in here. On wasm32 the gate
+# is a no-op because the `tokio` dep is declared under
+# `[target.'cfg(not(target_arch = "wasm32"))']`.
+native-tcp = ["dep:tokio"]
 # Reserved for future reference transports. Activating today is a no-op
 # but avoids a breaking-change feature add later.
 webtransport = []
@@ -33,6 +39,12 @@ justrdp-rdpeai = { workspace = true, features = ["alloc"] }
 justrdp-audio = { workspace = true, features = ["alloc"] }
 justrdp-svc = { workspace = true, features = ["alloc"] }
 justrdp-dvc = { workspace = true, features = ["alloc"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Optional native runtime. Only pulled in by the `native-tcp` feature
+# (and any future native-only transports) — wasm targets must never
+# see it.
+tokio = { version = "1", features = ["net", "io-util"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -56,3 +68,9 @@ getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 pollster = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# `rt` and `macros` are only needed by tests so they live here rather
+# than in the `native-tcp` feature gate (keeps the runtime weight off
+# native embedders that bring their own runtime).
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
