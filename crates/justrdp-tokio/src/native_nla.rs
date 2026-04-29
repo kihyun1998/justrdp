@@ -3,14 +3,15 @@
 //! Native CredSSP / NLA driver.
 //!
 //! Adapts `justrdp-blocking`'s synchronous `run_credssp_sequence` to
-//! the async [`CredsspDriver`] contract used by
-//! [`crate::WebClient::connect_with_nla`]. The state machine is
+//! the async [`justrdp_async::CredsspDriver`] contract used by
+//! [`justrdp_async::WebClient::connect_with_nla`]. The state machine is
 //! identical to the blocking version — only the I/O is async.
 //!
 //! ## Wire-up
 //!
 //! ```ignore
-//! use justrdp_web::{NativeTcpTransport, NativeTlsUpgrade, NativeCredsspDriver, WebClient};
+//! use justrdp_async::WebClient;
+//! use justrdp_tokio::{NativeTcpTransport, NativeTlsUpgrade, NativeCredsspDriver};
 //!
 //! let transport = NativeTcpTransport::connect(("rdp.example.com", 3389)).await?;
 //! let tls = NativeTlsUpgrade::dangerous_no_verify("rdp.example.com")?;
@@ -22,7 +23,7 @@
 //!
 //! `NativeCredsspDriver` is `CredsspDriver<NativeTlsTransport>` only —
 //! it pulls the server SPKI directly from the post-TLS stream via
-//! [`crate::NativeTlsTransport::server_public_key`], so it's not generic
+//! [`NativeTlsTransport::server_public_key`], so it's not generic
 //! over arbitrary `WebTransport`s. Embedders using a custom transport
 //! can implement [`CredsspDriver`] themselves.
 //!

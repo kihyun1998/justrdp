@@ -4,15 +4,16 @@
 //! [`WebTransport`].
 //!
 //! Lets desktop embedders run the same `WebClient` / `ActiveSession`
-//! pump that the wasm32 build uses, but talking directly to an RDP
-//! server's port 3389 (no `wsproxy` shim, no WebSocket framing). The
-//! transport returns whatever bytes are currently available from the
-//! socket; the connector layer's `recv_until_pdu` reassembler in
-//! [`crate::driver`] re-frames TPKT / fast-path PDUs across multiple
-//! `recv()` calls — same as the blocking client does.
+//! pump that the wasm32 build uses (both live in `justrdp-async`),
+//! but talking directly to an RDP server's port 3389 (no `wsproxy`
+//! shim, no WebSocket framing). The transport returns whatever bytes
+//! are currently available from the socket; the connector layer's
+//! `recv_until_pdu` reassembler inside `justrdp_async` re-frames
+//! TPKT / fast-path PDUs across multiple `recv()` calls — same as
+//! the blocking client does.
 //!
-//! `wasm32` builds skip this module entirely (the `tokio` dep is
-//! declared only for `cfg(not(target_arch = "wasm32"))`).
+//! `wasm32` builds skip this crate entirely (`justrdp-tokio` is not
+//! compiled for wasm targets).
 
 use alloc::format;
 use alloc::vec;
@@ -35,8 +36,9 @@ const DEFAULT_RECV_BUF_BYTES: usize = 16 * 1024;
 /// [`Self::from_stream`] (caller-owned `TcpStream`, useful for tests
 /// and for callers who set socket options or perform the connect via
 /// their own runtime). Then hand the value to
-/// [`crate::WebClient::connect`] / [`crate::WebClient::connect_with_upgrade`]
-/// /etc. — the trait is the integration point, not this struct.
+/// [`justrdp_async::WebClient::connect`] /
+/// [`justrdp_async::WebClient::connect_with_upgrade`] /etc. — the
+/// trait is the integration point, not this struct.
 pub struct NativeTcpTransport {
     stream: TcpStream,
     /// Reusable read buffer. `tokio::AsyncReadExt::read` fills as

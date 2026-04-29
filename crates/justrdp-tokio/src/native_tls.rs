@@ -2,11 +2,13 @@
 
 //! Native TLS upgrade via `tokio-rustls`.
 //!
-//! Plugs into [`crate::WebClient::connect_with_upgrade`] for desktop
-//! embedders that want async TLS without bringing their own TLS stack:
+//! Plugs into [`justrdp_async::WebClient::connect_with_upgrade`] for
+//! desktop embedders that want async TLS without bringing their own
+//! TLS stack:
 //!
 //! ```ignore
-//! use justrdp_web::{NativeTcpTransport, NativeTlsUpgrade, WebClient};
+//! use justrdp_async::WebClient;
+//! use justrdp_tokio::{NativeTcpTransport, NativeTlsUpgrade};
 //!
 //! let transport = NativeTcpTransport::connect(("rdp.example.com", 3389)).await?;
 //! let upgrader = NativeTlsUpgrade::dangerous_no_verify("rdp.example.com")?;
@@ -84,7 +86,7 @@ impl NativeTlsUpgrade {
     ///
     /// **Note**: `webpki-roots` is not pulled in by this crate; this
     /// constructor is a stub that returns
-    /// [`TransportErrorKind::Other`](crate::TransportErrorKind::Other) until
+    /// [`TransportErrorKind::Other`](justrdp_async::TransportErrorKind::Other) until
     /// an embedder needs it. Callers wanting strict roots today should
     /// build their own `ClientConfig` and use [`Self::from_connector`].
     /// (Tracking: roadmap §11.3 S7-2 follow-up — adds the optional
