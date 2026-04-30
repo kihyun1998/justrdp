@@ -36,6 +36,7 @@
 //! families. G7-G9 add RPC-over-HTTP.
 
 mod config;
+pub(crate) mod connect;
 pub(crate) mod error;
 pub(crate) mod http_auth;
 pub(crate) mod http_io;
@@ -46,6 +47,7 @@ pub(crate) mod random;
 pub(crate) mod web_rw;
 
 pub use config::GatewayConfig;
+pub use connect::connect_via_gateway;
 pub use http_transport::TsguHttpTransport;
 pub use inner_tls::{WebTransportTlsTransport, WebTransportTlsUpgrade};
 pub use web_rw::WebTransportRw;
