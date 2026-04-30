@@ -1201,12 +1201,41 @@ CredSSP — 가 필요). Default features 가 비어 있어서 v2 를 쓰려면 
 verifier_bridge.rs; 일부는 줄어듦: spawn_blocking + JoinError plumbing 제거).
 실제 의미 있는 변화는 LoC 가 아니라 **disconnect latency** 와 **Send/Sync** 보장.
 
-#### 5.6.5 Phase 5 — `justrdp-blocking` 슬림화 (1주, 옵션, -4500 LoC 또는 net 0)
+#### 5.6.5 Phase 5 — `justrdp-blocking` 정책 (옵션 (a) 채택, 2026-04-30)
 
-두 옵션 중 선택:
+두 옵션 중 **(a) 그대로 두기** 채택:
 
-- **(a) 그대로 두기** — 5300 LoC 그대로 유지. sync embedder 를 위한 독립 surface. `justrdp-async` 와 평행 존재. 유지보수 비용 분산.
-- **(b) 재작성** — `WebClient<T>` 위에 sync 블로킹 transport 어댑터로 wrap, ~500 LoC 로 축소. 단일 펌프 구현체 원칙 달성. 단 외부 사용자 API 호환성 유지를 위해 `RdpClient` surface 그대로 보존 필요.
+- **(a) 그대로 두기** ✅ — 5300 LoC 그대로 유지. sync embedder 를 위한
+  독립 surface. `justrdp-async` 와 평행 존재.
+- **(b) 재작성** — 보류 (ROI 작음, 위험 있음).
+
+**채택 이유**:
+
+본 프로젝트의 주 사용처는 **Tauri 기반 RDP 클라이언트** 로, async-only 환경.
+`justrdp-blocking` 은 사실상 dead path 가 되므로:
+
+1. **(b) 의 슬림화 ROI 가 작음** — 안 쓸 코드를 슬림화하는 데 1주 + nested
+   tokio runtime panic / drop deadlock / per-instance Runtime 자원 비용 등
+   기술적 함정 디버깅 시간 추가 발생.
+2. **(a) 의 비용은 받아들임** — 새 RDP 기능은 async 측에 우선 wiring;
+   sync 측 drift 는 의도된 비용. bug 도 async 측만 fix; sync 측은 frozen.
+3. **API stability** — 외부에 `RdpClient` 사용자가 있을 가능성 — semver
+   bump 회피.
+
+**동결 정책 (2026-04-30 부)**:
+
+- `justrdp-blocking` 은 frozen — 새 RDP feature wiring 안 들어감.
+- 보안 패치 / sans-io core change 가 surface 깨면만 fix.
+- `RdpEvent` / `RuntimeError` / `ConnectError` enum 은 v2 boundary
+  translation (`justrdp-tokio::translate`) 의 stable target 으로 유지.
+- 미래에 sync 사용자가 명확해지면 §5.6.5 옵션 (b) 또는 옵션 (c)
+  workspace 에서 제외 재고려.
+
+**연관 cleanup 항목** (이 결정에 따라 함께 처리):
+
+- §5.6.3 의 "blocking gateway.rs 1540 LoC 제거" — frozen 정책 안에서 그대로
+  유지. async 측 `gateway::connect_via_gateway*` 가 이미 있으므로 새
+  사용처는 async 측만 사용.
 
 > 옵션 (a) 가 default. 옵션 (b) 는 `justrdp-blocking` 이 외부 의존
 > 적은 것이 확인되거나 architectural cleanliness 우선순위가 높을 때.
