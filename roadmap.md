@@ -1103,21 +1103,58 @@ target end-state 까지 단계적으로 통합.
 
 `crates/justrdp-blocking/src/gateway.rs` 의 1540 LoC blocking sync 게이트웨이 구현 → async tokio 로 재작성.
 
-- [ ] **`GatewayAdapter<T: WebTransport>` trait** — gateway 가 `WebTransport`
-      산출. `WebClient::connect_via_gateway(gateway, config)` 진입점.
-- [ ] **HTTP outer-tunnel 변형** (`TsguHttpTransport`)
-  - `hyper` 1.x 또는 `reqwest` async 클라이언트
-  - NTLM 양방향 challenge-response 를 async 콜백으로 (~400 LoC)
-- [ ] **RPC-over-HTTP 변형** (`TsguRpchTransport`)
-  - `h2` crate 기반 HTTP/2 양방향 채널
-  - chunked OUT/IN channel + RTS PDU 프레이밍
-- [ ] **WebSocket 변형** (`TsguWsTransport`)
-  - `tokio-tungstenite` + 게이트웨이 인증 헤더
-- [ ] **NLA inside gateway**: 게이트웨이 TLS 안에서 다시 RDP TLS + CredSSP — 양 transport 스택 nesting. `WebClient::connect_with_nla` 가 `T: WebTransport` 추상 위에서 이미 동작하므로 transport nesting 만 정확히 구현.
-- [ ] `crates/justrdp-blocking/src/gateway.rs` 제거. `justrdp-blocking` 은 옵션으로 `justrdp-async + justrdp-tokio` 의존하도록 변경 (또는 §5.6.5 옵션 b).
-- [ ] **검증**: 실제 RD Gateway (Windows Server 2019 RD Gateway role) 환경에서 connect_test 성공. redirect 동반 시나리오도 통과.
+**HTTP + WebSocket 1차 진척 (G1-G7 완료, 2026-04-30)**:
 
-**위험**: Phase 3 가 §5.6 전체에서 가장 unknown. RPCH 의 HTTP/2 양방향 채널 + NTLM 양방향 협상이 async 환경에서 까다로움. 실제 RD Gateway 테스트 환경 사전 확보 필요.
+- [x] **HTTP outer-tunnel 변형** (`TsguHttpTransport`) — G1-G3, G5
+  - 외부 dep 추가 없음 (`hyper` / `reqwest` 도입 안 함). 손수
+    HTTP/1.1 파서 (`http_io`) + NTLM 401 retry (`http_auth`) 가
+    blocking 의 `authenticate_http_channel` 와 byte 단위 동일.
+  - `gateway::connect_via_gateway` 진입점이 외부 + 내부 TLS + MS-TSGU
+    펌프 + RDP 핸드셰이크 + ActiveSession 까지 한 호출.
+- [x] **WebSocket 변형** (`TsguWsTransport`) — G6-G7
+  - 외부 dep 추가 없음 (`tokio-tungstenite` 도입 안 함).
+    `justrdp-gateway::ws` (alloc-only) 의 `WsFrameDecoder` /
+    `encode_frame` 재사용. RFC 6455 §5.3 마스킹은 `getrandom` 으로
+    fresh per-frame.
+  - `gateway::connect_via_gateway_ws` 진입점.
+- [x] **inner TLS over `WebTransport`** — G4 (`WebTransportRw` +
+      `WebTransportTlsUpgrade`). nested TLS 의 핵심 unblocker; 게이트웨이
+      터널 외에 다른 generic transport (WebRTC DataChannel 등) 위에서도
+      재사용 가능.
+- [x] **검증** (단위): `cargo test -p justrdp-tokio --features "gateway
+      native-nla native-tls-os"` → 83/83 unit + 3/3 lifecycle. workspace
+      그린, 회귀 0. 7 commit (`5ac694a` … `9c4a16c`), ~3000 LoC 추가.
+
+**아직 미진행**:
+
+- [ ] **`GatewayAdapter<T: WebTransport>` trait** — 현재 두 `Tsgu*Transport`
+      모두 `impl WebTransport`; 별도 adapter trait 은 불필요로 판명.
+      이 항목은 §5.6.3 가 마무리될 때 제거 후보 (현 surface 가 이미
+      WebTransport 그대로).
+- [ ] **RPC-over-HTTP 변형** (`TsguRpchTransport`) — G8-G10 (별도 미니
+      phase). MS-RPCH HTTP/1.1 `RPC_OUT_DATA` / `RPC_IN_DATA` chunked
+      양방향 채널 + CONN/A/B/C RTS handshake + TsProxy RPC. 가장 위험,
+      실제 RD Gateway 환경 (Server 2008 R2 / 2012) 확보 후 진행.
+- [ ] **NLA inside gateway**: `WebClient::connect_with_nla` 가
+      `WebTransportTlsTransport<...>` 위에서 이미 동작 가능 (SPKI 추출
+      지원); 편의 wrapper `connect_via_gateway_nla` 만 후속 commit 으로
+      추가하면 끝.
+- [ ] `crates/justrdp-blocking/src/gateway.rs` 제거. `justrdp-blocking`
+      은 옵션으로 `justrdp-async + justrdp-tokio` 의존하도록 변경
+      (또는 §5.6.5 옵션 b).
+- [ ] **검증** (통합): 실제 RD Gateway (Windows Server 2019 RD Gateway
+      role) 환경에서 connect_test 성공. redirect 동반 시나리오도 통과.
+
+**위험 / 결정 포인트**:
+
+* RPCH HTTP/2 양방향 채널 + NTLM 양방향 협상이 async 환경에서 까다로움.
+  실제 RD Gateway 테스트 환경 사전 확보 필요. **현재 G1-G7 까지가 실무
+  RD Gateway 사용처의 99% 를 커버 (HTTP+WebSocket variant)** — RPCH 는
+  Windows Server 2008 R2 / 2012 에서만 사용되는 legacy path.
+* 의도적 deferred (이 phase 의 §5.6.6-style cleanup 후보):
+  - redirect / reconnect 자동화 — embedder loop 가 매 retry 마다 fresh
+    터널을 만드는 것이 자연스러우므로 §5.6.2 와 같은 구조 유지.
+  - `connect_via_gateway_nla` — 빌딩 블록은 모두 노출됨, wrapper 만 추가.
 
 #### 5.6.4 Phase 4 — `AsyncRdpClient` v2 (3일, -200 LoC + 400 LoC)
 
