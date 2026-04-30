@@ -1090,8 +1090,8 @@ target end-state 까지 단계적으로 통합.
 | Input (raw) | `send_input_events`, `send_unicode`, `send_synchronize`, `send_mouse_button/move/wheel` | `send_input(events)`, `send_unicode(code, pressed)`, `send_unicode_char(ch)`, `send_synchronize(lock_keys)`, `wheel_scroll`, `horizontal_wheel_scroll` | ✅ 일치 (raw mouse helpers 는 `send_input` 으로 단일화) |
 | 종료 | `disconnect` | `shutdown` (graceful) + `disconnect` (immediate) | ✅ 일치 (async 가 더 정밀) |
 | Reconnect 정책 | `set_reconnect_policy` / `last_arc_cookie()` | `Reconnectable::with_policy` / `arc_cookie()` / `observe_arc_cookie` | ✅ 일치 |
-| Reconnect loop | 내부 `try_reconnect` (자동) | 임베더가 `Reconnectable::open_next` + `policy().delay_for_attempt(n)` | ⚠ 의도적 차이 (TlsUpgrade `self` 컨트랙트) — 표준 코드 샘플 §5.6.6 §13.4 |
-| Redirect | 내부 loop (자동) | `redirect_target` + `apply_redirect` + 임베더 loop, 또는 `Reconnectable::record_result -> bool` | ⚠ 의도적 차이 (위와 동일 사유) — 표준 코드 샘플 §5.6.6 §13.4 |
+| Reconnect loop | 내부 `try_reconnect` (자동) | 임베더가 `Reconnectable::open_next` + `policy().delay_for_attempt(n)` | ⚠ 의도적 차이 (TlsUpgrade `self` 컨트랙트) — 표준 코드 §13.4.4 ✅ |
+| Redirect | 내부 loop (자동) | `redirect_target` + `apply_redirect` + 임베더 loop, 또는 `Reconnectable::record_result -> bool` | ⚠ 의도적 차이 (위와 동일 사유) — 표준 코드 §13.4.3 ✅ |
 | SVC | `connect_with_processors` + `RdpEvent::ChannelData` passthrough on unregistered | `ActiveSession::with_processors` + `SessionEvent::Channel` passthrough | ✅ 일치 |
 | Tracing | `feature = "tracing"` | `feature = "tracing"` (cascade through tokio + web) | ✅ 일치 |
 | TLS 백엔드 | rustls + native-tls (`justrdp-tls` 양쪽) | rustls (`native-tls`) + native-tls (`native-tls-os`) | ✅ 일치 |
@@ -1240,32 +1240,39 @@ verifier_bridge.rs; 일부는 줄어듦: spawn_blocking + JoinError plumbing 제
 > 옵션 (a) 가 default. 옵션 (b) 는 `justrdp-blocking` 이 외부 의존
 > 적은 것이 확인되거나 architectural cleanliness 우선순위가 높을 때.
 
-#### 5.6.6 Phase 6 — Tests + 문서 + 마이그레이션 (1주)
+#### 5.6.6 Phase 6 — Tests + 문서 + 마이그레이션 (코드 항목 완료 2026-04-30)
 
-- [ ] xrdp Docker E2E 를 양쪽 (tokio native + wasm) 에서 재현
-- [ ] mock broker E2E (§9.3.5) 양쪽 통과 — redirect 시나리오
-- [ ] 게이트웨이 integration test 추가 (Phase 3 산출물 검증)
-- [ ] §13.4 (신설) 임베더 가이드 — Tauri/Iced/eframe 같은 native UI
-      runtime 에서 `AsyncRdpClient` 를 mpsc/EventBus 로 묶어 frame/event 를
-      webview/surface 로 push 하는 표준 패턴 코드 샘플. 단일 모니터 + 단일
-      윈도우 기준 minimal viable embed. **반드시 포함**: §5.6.2 Phase 2 가
-      라이브러리 내부 자동화 대신 임베더 소유로 둔 두 루프의 표준 코드:
-      (a) connect-time redirect loop (`Reconnectable::open_next` →
-      `WebClient::connect_with_upgrade(fresh_upgrader())` →
-      `record_result()` → loop, `MAX_REDIRECTS=5`),
-      (b) post-handshake reconnect loop (`ActiveSession::next_events()` 가
-      `DriverError::Transport(_)` 반환 시 `policy().delay_for_attempt(n)`
-      만큼 sleep → `open_next` 로 재핸드셰이크 → 새 `ActiveSession`).
-      두 패턴 다 fresh upgrader 매 attempt 마다 build 하는 모범 코드 포함
-      (TlsUpgrade `self`-by-value 컨트랙트 회피 안내).
-- [ ] §13.5 (신설) `justrdp-blocking` 사용자의 `justrdp-tokio` v2 마이그레이션 가이드
-- [ ] §13.6 (신설) Custom transport 작성 가이드 (WebRTC DataChannel, QUIC 등을 `WebTransport` 로 노출하는 패턴)
-- [ ] **API cleanup — `SessionEvent::KeyboardIndicators` 깊이 일치화**:
-      현재 `{ led_flags: u16 }` raw 인코딩. blocking 의 `RdpEvent::KeyboardIndicators`
-      는 `{ scroll, num, caps, kana }: bool` 4-bool. `justrdp-input::LockKeys::from_flags(u16)`
-      재사용해서 `SessionEvent::KeyboardIndicators(LockKeys)` 로 변경 (1줄 디코드).
-      Phase 2 의 의도적 차이 3종 중 하나 — Phase 6 cleanup 으로 흡수.
-      변경 후 audit 표 (§5.6.2) 의 ⚠ 항목 1개 해소.
+**완료** (이 commit 시리즈로):
+
+- [x] §13.4 임베더 가이드 — Tauri 패턴 + 멀티탭 (MSTSC 스타일) +
+      redirect / reconnect 두 표준 루프 + v2 보장 사항 정리. 단일
+      윈도우 minimal viable embed 부터 multi-session 까지 5
+      sub-section.
+- [x] §13.5 `justrdp-tokio` v2 마이그레이션 가이드 — 외부 API 가
+      byte-for-byte 동일하므로 사실상 "Cargo feature 한 줄 추가"
+      만 필요. 행동 변화 (disconnect 응답성, Send/Sync, 자원 비용)
+      와 변경 (cancel-safety, error coarsening) 각각 정리. lower-level
+      API (`WebClient` / `ActiveSession` / `Reconnectable`) 직접 사용
+      안내.
+- [x] §13.6 Custom transport 가이드 — `WebTransport` trait 형태 +
+      구현 체크리스트 (framing, cancel safety, sticky close, EOF) +
+      reference implementations 표 + WebRTC DataChannel sketch. 게이트
+      웨이 어댑터가 generic `T: WebTransport` 위에 stack 가능 함을
+      명시.
+- [x] **API cleanup — `SessionEvent::KeyboardIndicators(LockKeys)`**:
+      raw u16 → LockKeys 직반환. async core 가 `LockKeys::from_flags`
+      디코드 owning. translate.rs 의 boundary 디코드 제거. §5.6.2
+      audit 표의 ⚠ 항목 1개 해소.
+
+**미진행** (환경 의존, 별도 트랙):
+
+- [ ] xrdp Docker E2E 를 양쪽 (tokio native + wasm) 에서 재현 — 실 RDP
+      서버 환경 + Docker compose 필요.
+- [ ] mock broker E2E (§9.3.5) 양쪽 통과 — redirect 시나리오. mock
+      broker 인프라 자체가 §9.3.5 의 work item.
+- [ ] 게이트웨이 integration test 추가 (Phase 3 산출물 검증) — 실
+      RD Gateway (Server 2019 RD Gateway role, 또는 Server 2008 R2
+      / 2012 for RPCH) 환경 필요.
 
 #### 5.6 — 총합 / 일정 / 위험
 
@@ -4061,6 +4068,200 @@ exponential backoff. `disabled()` 는 단발성. `delay_for_attempt(n)`
 - 클립보드 / 오디오 등 SVC channel 은 `ActiveSession::with_processors`
   로 구성 (현재 `AsyncRdpClient` 에는 채널 processor 주입 surface 가
   없음 — §5.6.x 추가 항목).
+
+### 13.5 v1 → v2 마이그레이션 가이드 (`AsyncRdpClient`)
+
+> **상태**: §5.6.4 Phase 4 가 들어왔으므로 사용 가능. 이 절은 v1
+> `AsyncRdpClient` (spawn_blocking 기반, justrdp-blocking wrapper) 를
+> 쓰던 사용자가 v2 (pure async, WebClient + ActiveSession 기반) 로
+> 옮길 때 무엇이 바뀌는지의 정리.
+
+**핵심**: **외부 API 는 byte-for-byte 동일**. 코드 변경 없음. 단
+**Cargo feature 한 줄** 추가만 필요:
+
+```toml
+# Cargo.toml
+[dependencies]
+-justrdp-tokio = "0.1"
++justrdp-tokio = { version = "0.1", features = ["native-nla"] }
+```
+
+이유: v2 의 `AsyncRdpClient` 는 `native-nla` feature 뒤에 있습니다 (full
+async stack — TCP + TLS + CredSSP — 가 필요). v1 은 unconditional 이
+었지만, v2 는 deps 에 비례한 gating 으로 정리되었습니다. feature 를
+명시 안 하면 compile error: `unresolved import 'justrdp_tokio::AsyncRdpClient'`.
+
+#### 13.5.1 행동 변화 (외부에서 관찰 가능한 차이)
+
+다음은 v2 가 **개선** 한 부분 — 사용자 코드 변경 없이 자동으로 받음:
+
+- **Disconnect 응답성**: v1 에선 `disconnect()` 가 워커의 다음
+  `next_event` 깨어남까지 대기 (idle 세션이면 TCP keepalive 까지).
+  v2 는 `tokio::select!` 로 in-flight `next_events()` 를 cancel 시키고
+  즉시 `session.shutdown()` 실행 — scheduling tick 단위.
+- **Send + Sync 보장**: `&AsyncRdpClient: Send`. `Arc<AsyncRdpClient>`
+  를 여러 tokio task 가 공유 dispatch 가능. v1 도 cmd_tx 가 Sync 라
+  비슷한 패턴이 동작했지만 v2 는 명시적으로 contract.
+- **자원 비용**: v1 은 세션마다 OS thread 1 개 (`spawn_blocking`).
+  v2 는 reactor task 1 개. 100 동시 세션이면 v1 = 100 thread, v2 =
+  ~N reactor threads (CPU 수).
+
+다음은 v2 가 **변경** 한 부분 — 의미 미묘한 영향 가능, 검증 권고:
+
+- **Cancel-safety on `next_event`**: v1 은 sync 워커 루프 안에서
+  next_event 가 진행 중이면 drop 해도 별 차이 없었음. v2 는 cancel-safe
+  by contract — `select!` 안에서 drop 해도 안전. 이걸 의존하지 않는
+  코드라면 영향 0.
+- **에러 surface**: 일부 transport 에러가 `RuntimeError::Disconnected`
+  로 collapse 됨 (v1 의 `Io(io::Error)` 보다 coarse). 디버깅 시
+  `tracing` feature 켜고 underlying `DriverError` 를 보세요.
+
+#### 13.5.2 새로 사용할 수 있게 된 API
+
+v2 가 도입되면서 **lower-level surface 도 직접 사용 가능** 해졌습니다.
+필요하면 이쪽으로 내려갈 수 있어요:
+
+- `WebClient<NativeTcpTransport>` — connect 만 직접 제어 (custom
+  CredsspDriver 같은 시나리오).
+- `ActiveSession<T>` — connect 후 pump 만 직접 제어 (mpsc 외에
+  tokio::sync::watch 같은 다른 구조 위에서 쓰고 싶을 때).
+- `Reconnectable<F>` — auto-reconnect 정책 직접 제어.
+- `gateway::connect_via_gateway*` — RD Gateway 변형 직접 사용.
+
+`AsyncRdpClient` 는 이들의 "최소한의 wiring 만 한 편의 API" 입니다.
+복잡한 사용처는 직접 layer 를 build.
+
+### 13.6 Custom Transport 가이드 (`WebTransport` 구현)
+
+> **상태**: §5.6 Phase 1-3 이 들어왔으므로 사용 가능. `WebTransport`
+> trait 자체는 `justrdp-async::WebTransport` (no_std + alloc) 에 정의.
+
+JustRDP 의 모든 async I/O 는 `WebTransport` trait 위에서 동작합니다.
+TCP / TLS / WebSocket 외의 transport (예: WebRTC DataChannel, QUIC
+stream, named pipe) 위에서도 RDP 를 돌리고 싶다면 이 trait 만 구현
+하면 됩니다.
+
+#### 13.6.1 trait 형태
+
+```rust
+pub trait WebTransport {
+    /// Send one transport-level message. MUST send the entire
+    /// `bytes` slice as a single frame.
+    fn send(
+        &mut self,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+
+    /// Receive the next inbound message. Returns the complete
+    /// payload of one transport-level frame. EOF (graceful peer
+    /// close) is reported as `TransportErrorKind::ConnectionClosed`.
+    fn recv(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<u8>, TransportError>> + Send;
+
+    /// Initiate orderly close.
+    fn close(
+        &mut self,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+}
+```
+
+> **wasm 변종**: `cfg(target_family = "wasm")` 에서는 `+ Send` 바운드
+> 가 빠집니다 (`js_sys` / `web-sys` future 가 일반적으로 `!Send`
+> 이므로). non-wasm 타겟에서는 `+ Send` 강제.
+
+#### 13.6.2 구현 체크리스트
+
+새 transport `MyTransport` 를 만들 때 만족해야 할 contract:
+
+1. **Framing 보존**: `send(bytes)` 는 `bytes` 를 단일 프레임으로
+   보내야 함. partial send 또는 frame splitting 은 protocol bug.
+   `recv()` 는 한 프레임의 완전 payload 를 반환 — 두 프레임을
+   concatenate 하면 안 됨.
+2. **Cancel safety**: `recv()` future 를 drop 했다 다시 호출해도
+   queue 된 메시지를 잃지 말 것. `send()` 도 마찬가지 — drop 후
+   `Err` 반환 OR 다음 `send()` 가 atomically 성공.
+3. **Sticky close**: 한 번 close 되면 subsequent `send` / `recv` 는
+   `TransportErrorKind::ConnectionClosed` 로 실패. 실수로
+   half-closed 소켓을 다시 건드리지 않게 sticky flag 사용.
+4. **EOF semantics**: peer 가 graceful close 하면 다음 `recv()` 가
+   `TransportError::closed(...)` 반환. unexpected mid-PDU close
+   도 마찬가지지만 connector 측이 protocol error 로 surface 함.
+
+#### 13.6.3 reference implementations
+
+이미 출하된 4 종 — 패턴 참조용:
+
+| 구현 | 위치 | 형태 |
+|---|---|---|
+| `NativeTcpTransport` | `justrdp-tokio` | `tokio::net::TcpStream` |
+| `NativeTlsTransport` | `justrdp-tokio` | `tokio_rustls::TlsStream<TcpStream>` |
+| `NativeTlsOsTransport` | `justrdp-tokio` | `tokio_native_tls::TlsStream<TcpStream>` (OS) |
+| `WebSocketTransport` | `justrdp-web` | browser `WebSocket` (wasm) |
+| `TsguHttpTransport` | `justrdp-tokio::gateway` | MS-TSGU HTTP variant — generic over `T: WebTransport` |
+| `TsguWsTransport` | `justrdp-tokio::gateway` | MS-TSGU WebSocket variant — 동상 |
+| `TsguRpchTransport` | `justrdp-tokio::gateway` | MS-TSGU RPC-over-HTTP variant |
+
+마지막 세 개는 **다른 `WebTransport` 위에 stack 하는 패턴** — 본인의
+custom transport 위에 게이트웨이 어댑터를 그대로 얹을 수 있다는
+의미. 예: WebRTC DataChannel → TsguHttpTransport → 게이트웨이를 통한
+RDP. 코드 변경 0.
+
+#### 13.6.4 sketch — WebRTC DataChannel transport 예시
+
+```rust
+pub struct WebRtcDataChannelTransport {
+    chan: webrtc::data_channel::RTCDataChannel,
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    closed: bool,
+}
+
+impl WebRtcDataChannelTransport {
+    pub async fn new(chan: RTCDataChannel) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        // RTC 의 on_message 콜백을 mpsc 에 push.
+        let tx_clone = tx.clone();
+        chan.on_message(Box::new(move |msg| {
+            let tx = tx_clone.clone();
+            Box::pin(async move {
+                let _ = tx.send(msg.data.to_vec()).await;
+            })
+        }));
+        Self { chan, rx, closed: false }
+    }
+}
+
+impl WebTransport for WebRtcDataChannelTransport {
+    async fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::closed("data channel closed"));
+        }
+        self.chan.send(&bytes.into())
+            .await
+            .map_err(|e| TransportError::io(format!("data channel send: {e}")))?;
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
+        if self.closed {
+            return Err(TransportError::closed("data channel closed"));
+        }
+        self.rx.recv().await
+            .ok_or_else(|| TransportError::closed("data channel peer closed"))
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        if self.closed { return Ok(()); }
+        self.closed = true;
+        let _ = self.chan.close().await;
+        Ok(())
+    }
+}
+```
+
+이 transport 위에서 그대로 `WebClient::connect_with_upgrade(...)` 호출
+가능. 게이트웨이를 통하려면 `TsguHttpTransport::connect(client, in_chan,
+out_chan, leftover)` 에 두 `WebRtcDataChannelTransport` 를 전달.
 
 ---
 
