@@ -78,8 +78,11 @@ pub enum SessionEvent {
     SaveSessionInfo(SaveSessionInfoData),
     /// Server reported a new monitor layout (mid-session).
     MonitorLayout(Vec<MonitorLayoutEntry>),
-    /// Server toggled keyboard indicator LEDs.
-    KeyboardIndicators { led_flags: u16 },
+    /// Server toggled keyboard indicator LEDs (Caps / Num / Scroll
+    /// / Kana). The raw `led_flags: u16` from MS-RDPBCGR
+    /// §2.2.8.2.2.1 is decoded via [`LockKeys::from_flags`] before
+    /// being surfaced — embedders see the four bools directly.
+    KeyboardIndicators(LockKeys),
     /// Server toggled IME state.
     KeyboardImeStatus { ime_state: u32, ime_conv_mode: u32 },
     /// Server asked the client to play a beep.
@@ -292,7 +295,12 @@ impl<T: WebTransport> ActiveSession<T> {
                     events.push(SessionEvent::MonitorLayout(monitors));
                 }
                 ActiveStageOutput::KeyboardIndicators { led_flags } => {
-                    events.push(SessionEvent::KeyboardIndicators { led_flags });
+                    // Decode the raw u16 flags into the 4-bool
+                    // shape now (was previously deferred to the
+                    // embedder boundary — §5.6.6 cleanup).
+                    events.push(SessionEvent::KeyboardIndicators(
+                        LockKeys::from_flags(led_flags),
+                    ));
                 }
                 ActiveStageOutput::KeyboardImeStatus {
                     ime_state,

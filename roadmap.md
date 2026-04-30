@@ -1095,7 +1095,7 @@ target end-state 까지 단계적으로 통합.
 | SVC | `connect_with_processors` + `RdpEvent::ChannelData` passthrough on unregistered | `ActiveSession::with_processors` + `SessionEvent::Channel` passthrough | ✅ 일치 |
 | Tracing | `feature = "tracing"` | `feature = "tracing"` (cascade through tokio + web) | ✅ 일치 |
 | TLS 백엔드 | rustls + native-tls (`justrdp-tls` 양쪽) | rustls (`native-tls`) + native-tls (`native-tls-os`) | ✅ 일치 |
-| KeyboardIndicators | `{ scroll, num, caps, kana }: bool` | `{ led_flags: u16 }` | ⚠ depth 차이, 임베더 디코드 (§5.6.6 cleanup 으로 흡수 예정 — `LockKeys` 직반환) |
+| KeyboardIndicators | `{ scroll, num, caps, kana }: bool` | `SessionEvent::KeyboardIndicators(LockKeys)` | ✅ 일치 (§5.6.6 cleanup 완료 — async core 가 `LockKeys::from_flags` 디코드 owning) |
 
 **검증**: `cargo test --workspace --exclude justrdp-server` 그린 (justrdp-server 사전 실패는 무관). `cargo test -p justrdp-async --features tracing` 92/92, `cargo test -p justrdp-tokio --features "native-nla native-tls-os"` 22/22 unit + 3 lifecycle.
 

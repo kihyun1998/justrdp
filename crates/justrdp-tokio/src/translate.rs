@@ -18,7 +18,6 @@
 
 use justrdp_async::{DriverError, PointerEvent, SessionEvent};
 use justrdp_blocking::{RdpEvent, RuntimeError};
-use justrdp_input::LockKeys;
 
 /// Translate one [`SessionEvent`] from the async core into zero or
 /// more [`RdpEvent`]s. The return type is `Vec` (not `Option`)
@@ -60,12 +59,12 @@ pub(crate) fn session_event_to_rdp_events(ev: SessionEvent) -> alloc::vec::Vec<R
         SessionEvent::MonitorLayout(monitors) => {
             vec![RdpEvent::ServerMonitorLayout { monitors }]
         }
-        SessionEvent::KeyboardIndicators { led_flags } => {
-            // v1 carries four bools; async carries the raw u16.
-            // `LockKeys::from_flags` does the bit-decode that v1
-            // does internally (and that §5.6.6 cleanup notes for
-            // promotion into the async core).
-            let lk = LockKeys::from_flags(led_flags);
+        SessionEvent::KeyboardIndicators(lk) => {
+            // §5.6.6 cleanup: bit-decode now happens inside async
+            // core (`session::SessionEvent::KeyboardIndicators`
+            // already carries `LockKeys`), so the boundary just
+            // re-shapes from struct field-access to v1's
+            // four-bool struct variant.
             vec![RdpEvent::KeyboardIndicators {
                 scroll: lk.scroll_lock,
                 num: lk.num_lock,
@@ -151,28 +150,22 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_indicators_decodes_led_flags_via_lock_keys() {
-        // Pick LED flags that trigger CAPS + NUM (bit positions
-        // checked via LockKeys constructor — this is intentionally
-        // a smoke-test against the bit layout, not an exhaustive
-        // truth table).
-        let ev = SessionEvent::KeyboardIndicators {
-            led_flags: 0b0000_0011,
-        };
+    fn keyboard_indicators_passes_lock_keys_through_unchanged() {
+        use justrdp_input::LockKeys;
+        // Post-§5.6.6: async core carries `LockKeys` directly.
+        // translate.rs only re-shapes — it doesn't decode anything.
+        // The test pins down "v1 four-bool surface stays correct"
+        // using the actual flag bits per MS-RDPBCGR §2.2.8.2.2.1.
+        let lk = LockKeys::from_flags(0b0000_0011); // SCROLL + NUM
+        let ev = SessionEvent::KeyboardIndicators(lk);
         let out = session_event_to_rdp_events(ev);
         assert_eq!(out.len(), 1);
         match &out[0] {
-            RdpEvent::KeyboardIndicators {
-                scroll,
-                num,
-                caps,
-                kana,
-            } => {
-                // Whatever LockKeys::from_flags(0b11) decodes to is
-                // what the embedder gets — the assertion is that
-                // we did the decode (i.e. didn't pass led_flags
-                // through verbatim) AND produced four bools.
-                let _ = (*scroll, *num, *caps, *kana);
+            RdpEvent::KeyboardIndicators { scroll, num, caps, kana } => {
+                assert!(*scroll);
+                assert!(*num);
+                assert!(!*caps);
+                assert!(!*kana);
             }
             other => panic!("expected KeyboardIndicators, got {other:?}"),
         }
