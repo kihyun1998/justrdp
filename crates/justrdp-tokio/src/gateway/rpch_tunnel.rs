@@ -241,7 +241,7 @@ mod tests {
     use super::*;
     use alloc::collections::VecDeque;
     use alloc::vec;
-    use justrdp_core::{Encode, WriteCursor};
+    use justrdp_core::WriteCursor;
     use justrdp_rpch::pdu::uuid::RpcUuid;
     use justrdp_rpch::pdu::{
         PFC_FIRST_FRAG, PFC_LAST_FRAG, RTS_FLAG_NONE, RTS_FLAG_OTHER_CMD,
