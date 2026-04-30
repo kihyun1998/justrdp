@@ -1090,12 +1090,12 @@ target end-state 까지 단계적으로 통합.
 | Input (raw) | `send_input_events`, `send_unicode`, `send_synchronize`, `send_mouse_button/move/wheel` | `send_input(events)`, `send_unicode(code, pressed)`, `send_unicode_char(ch)`, `send_synchronize(lock_keys)`, `wheel_scroll`, `horizontal_wheel_scroll` | ✅ 일치 (raw mouse helpers 는 `send_input` 으로 단일화) |
 | 종료 | `disconnect` | `shutdown` (graceful) + `disconnect` (immediate) | ✅ 일치 (async 가 더 정밀) |
 | Reconnect 정책 | `set_reconnect_policy` / `last_arc_cookie()` | `Reconnectable::with_policy` / `arc_cookie()` / `observe_arc_cookie` | ✅ 일치 |
-| Reconnect loop | 내부 `try_reconnect` (자동) | 임베더가 `Reconnectable::open_next` + `policy().delay_for_attempt(n)` | ⚠ 의도적 차이 (TlsUpgrade `self` 컨트랙트) |
-| Redirect | 내부 loop (자동) | `redirect_target` + `apply_redirect` + 임베더 loop, 또는 `Reconnectable::record_result -> bool` | ⚠ 의도적 차이 (위와 동일 사유) |
+| Reconnect loop | 내부 `try_reconnect` (자동) | 임베더가 `Reconnectable::open_next` + `policy().delay_for_attempt(n)` | ⚠ 의도적 차이 (TlsUpgrade `self` 컨트랙트) — 표준 코드 샘플 §5.6.6 §13.4 |
+| Redirect | 내부 loop (자동) | `redirect_target` + `apply_redirect` + 임베더 loop, 또는 `Reconnectable::record_result -> bool` | ⚠ 의도적 차이 (위와 동일 사유) — 표준 코드 샘플 §5.6.6 §13.4 |
 | SVC | `connect_with_processors` + `RdpEvent::ChannelData` passthrough on unregistered | `ActiveSession::with_processors` + `SessionEvent::Channel` passthrough | ✅ 일치 |
 | Tracing | `feature = "tracing"` | `feature = "tracing"` (cascade through tokio + web) | ✅ 일치 |
 | TLS 백엔드 | rustls + native-tls (`justrdp-tls` 양쪽) | rustls (`native-tls`) + native-tls (`native-tls-os`) | ✅ 일치 |
-| KeyboardIndicators | `{ scroll, num, caps, kana }: bool` | `{ led_flags: u16 }` | ⚠ depth 차이, 임베더 디코드 |
+| KeyboardIndicators | `{ scroll, num, caps, kana }: bool` | `{ led_flags: u16 }` | ⚠ depth 차이, 임베더 디코드 (§5.6.6 cleanup 으로 흡수 예정 — `LockKeys` 직반환) |
 
 **검증**: `cargo test --workspace --exclude justrdp-server` 그린 (justrdp-server 사전 실패는 무관). `cargo test -p justrdp-async --features tracing` 92/92, `cargo test -p justrdp-tokio --features "native-nla native-tls-os"` 22/22 unit + 3 lifecycle.
 
@@ -1147,9 +1147,24 @@ target end-state 까지 단계적으로 통합.
 - [ ] §13.4 (신설) 임베더 가이드 — Tauri/Iced/eframe 같은 native UI
       runtime 에서 `AsyncRdpClient` 를 mpsc/EventBus 로 묶어 frame/event 를
       webview/surface 로 push 하는 표준 패턴 코드 샘플. 단일 모니터 + 단일
-      윈도우 기준 minimal viable embed.
+      윈도우 기준 minimal viable embed. **반드시 포함**: §5.6.2 Phase 2 가
+      라이브러리 내부 자동화 대신 임베더 소유로 둔 두 루프의 표준 코드:
+      (a) connect-time redirect loop (`Reconnectable::open_next` →
+      `WebClient::connect_with_upgrade(fresh_upgrader())` →
+      `record_result()` → loop, `MAX_REDIRECTS=5`),
+      (b) post-handshake reconnect loop (`ActiveSession::next_events()` 가
+      `DriverError::Transport(_)` 반환 시 `policy().delay_for_attempt(n)`
+      만큼 sleep → `open_next` 로 재핸드셰이크 → 새 `ActiveSession`).
+      두 패턴 다 fresh upgrader 매 attempt 마다 build 하는 모범 코드 포함
+      (TlsUpgrade `self`-by-value 컨트랙트 회피 안내).
 - [ ] §13.5 (신설) `justrdp-blocking` 사용자의 `justrdp-tokio` v2 마이그레이션 가이드
 - [ ] §13.6 (신설) Custom transport 작성 가이드 (WebRTC DataChannel, QUIC 등을 `WebTransport` 로 노출하는 패턴)
+- [ ] **API cleanup — `SessionEvent::KeyboardIndicators` 깊이 일치화**:
+      현재 `{ led_flags: u16 }` raw 인코딩. blocking 의 `RdpEvent::KeyboardIndicators`
+      는 `{ scroll, num, caps, kana }: bool` 4-bool. `justrdp-input::LockKeys::from_flags(u16)`
+      재사용해서 `SessionEvent::KeyboardIndicators(LockKeys)` 로 변경 (1줄 디코드).
+      Phase 2 의 의도적 차이 3종 중 하나 — Phase 6 cleanup 으로 흡수.
+      변경 후 audit 표 (§5.6.2) 의 ⚠ 항목 1개 해소.
 
 #### 5.6 — 총합 / 일정 / 위험
 
