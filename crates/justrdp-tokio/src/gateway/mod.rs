@@ -49,7 +49,7 @@ pub(crate) mod ws_auth;
 pub(crate) mod ws_transport;
 
 pub use config::GatewayConfig;
-pub use connect::connect_via_gateway;
+pub use connect::{connect_via_gateway, connect_via_gateway_ws};
 pub use http_transport::TsguHttpTransport;
 pub use inner_tls::{WebTransportTlsTransport, WebTransportTlsUpgrade};
 pub use web_rw::WebTransportRw;

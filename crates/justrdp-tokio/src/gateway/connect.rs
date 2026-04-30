@@ -53,6 +53,8 @@ use super::http_auth::authenticate_http_channel;
 use super::http_transport::TsguHttpTransport;
 use super::outer_tls::connect_outer_tls;
 use super::random::make_connection_id;
+use super::ws_auth::authenticate_ws_channel;
+use super::ws_transport::TsguWsTransport;
 use crate::native_tcp::NativeTcpTransport;
 
 /// Establish an RDP session through a Remote Desktop Gateway,
@@ -167,6 +169,79 @@ where
     Ok((result, session))
 }
 
+/// WebSocket-Transport (MS-TSGU §2.2.3.1.2) variant of
+/// [`connect_via_gateway`].
+///
+/// Same shape and contract as the HTTP variant; differences:
+///
+/// * One TCP/TLS connection instead of two.
+/// * `make_outer` is called **once**, not twice.
+/// * The outer handshake terminates with a WebSocket
+///   `101 Switching Protocols` instead of `200 OK`, and subsequent
+///   bytes are RFC 6455 binary frames instead of HTTP chunked
+///   bodies.
+///
+/// Same intentional gaps (no NLA helper, no auto redirect /
+/// reconnect) — see [`connect_via_gateway`] for rationale.
+pub async fn connect_via_gateway_ws<MakeOuter, Outer, Inner>(
+    gateway_cfg: &GatewayConfig,
+    rdp_config: justrdp_connector::Config,
+    mut make_outer: MakeOuter,
+    inner_upgrader: Inner,
+    processors: Vec<Box<dyn SvcProcessor>>,
+) -> Result<(ConnectionResult, ActiveSession<Inner::Output>), DriverError>
+where
+    MakeOuter: FnMut() -> Outer,
+    Outer: TlsUpgrade<NativeTcpTransport, Error = TransportError>,
+    Outer::Output: WebTransport + Send + 'static,
+    Inner: TlsUpgrade<TsguWsTransport<Outer::Output>>,
+    Inner::Output: WebTransport + Send + 'static,
+{
+    let connection_id = match gateway_cfg.connection_id {
+        Some(id) => id,
+        None => make_connection_id().map_err(DriverError::Transport)?,
+    };
+
+    // 1. One TCP+outer-TLS to the gateway.
+    let mut chan = connect_outer_tls(gateway_cfg, make_outer())
+        .await
+        .map_err(DriverError::Transport)?;
+
+    // 2. HTTP/1.1 Upgrade with NTLM 401 retry → 101 Switching
+    //    Protocols.
+    let leftover = authenticate_ws_channel(&mut chan, gateway_cfg, connection_id)
+        .await
+        .map_err(DriverError::Transport)?;
+
+    // 3. MS-TSGU tunnel over WebSocket binary frames.
+    let gw_client = GatewayClient::new(GatewayClientConfig {
+        target_host: gateway_cfg.target_host.clone(),
+        target_port: gateway_cfg.target_port,
+        client_name: gateway_cfg.gateway_hostname.clone(),
+        client_caps: GatewayClientConfig::default_caps(),
+        paa_cookie: None,
+    });
+    let tunnel = TsguWsTransport::connect(gw_client, chan, leftover)
+        .await
+        .map_err(DriverError::Transport)?;
+
+    // 4. Inner RDP handshake on top.
+    let client = WebClient::new(tunnel);
+    let (result, post_tls) = client
+        .connect_with_upgrade(rdp_config, inner_upgrader)
+        .await?;
+
+    if result.server_redirection.is_some() {
+        return Err(DriverError::Internal(format!(
+            "gateway-ws path: server redirection is not supported \
+             (the target address in a redirect is unreachable through the same tunnel)"
+        )));
+    }
+
+    let session = ActiveSession::with_processors(post_tls, &result, processors).await?;
+    Ok((result, session))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +300,44 @@ mod tests {
         .unwrap();
 
         let result = connect_via_gateway(
+            &gw_cfg,
+            rdp_cfg,
+            || FailingUpgrade,
+            inner,
+            Vec::new(),
+        )
+        .await;
+
+        match result {
+            Err(DriverError::Transport(t)) => {
+                assert_eq!(t.kind(), TransportErrorKind::Protocol);
+            }
+            Err(other) => panic!("expected Transport(Protocol), got {other:?}"),
+            Ok(_) => panic!("expected error from FailingUpgrade, got Ok"),
+        }
+    }
+
+    /// Same shape as the HTTP-variant smoke test above — the WS
+    /// entry point must surface the outer upgrader's error as
+    /// `DriverError::Transport`. The handshake never gets far enough
+    /// to need the inner upgrader, so we don't need a real one.
+    #[tokio::test]
+    async fn ws_outer_upgrade_failure_surfaces_as_driver_transport_error() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let gw_cfg = cfg(&format!("{addr}"));
+        let rdp_cfg = justrdp_connector::Config::builder("alice", "p4ss").build();
+
+        let inner = super::super::inner_tls::WebTransportTlsUpgrade::dangerous_no_verify(
+            "rdp.example.com",
+        )
+        .unwrap();
+
+        let result = connect_via_gateway_ws(
             &gw_cfg,
             rdp_cfg,
             || FailingUpgrade,
