@@ -1103,7 +1103,7 @@ target end-state 까지 단계적으로 통합.
 
 `crates/justrdp-blocking/src/gateway.rs` 의 1540 LoC blocking sync 게이트웨이 구현 → async tokio 로 재작성.
 
-**HTTP + WebSocket 1차 진척 (G1-G7 완료, 2026-04-30)**:
+**HTTP + WebSocket + RPC-over-HTTP 변형 모두 완료 (G1-G11, 2026-04-30)**:
 
 - [x] **HTTP outer-tunnel 변형** (`TsguHttpTransport`) — G1-G3, G5
   - 외부 dep 추가 없음 (`hyper` / `reqwest` 도입 안 함). 손수
@@ -1117,44 +1117,60 @@ target end-state 까지 단계적으로 통합.
     `encode_frame` 재사용. RFC 6455 §5.3 마스킹은 `getrandom` 으로
     fresh per-frame.
   - `gateway::connect_via_gateway_ws` 진입점.
+- [x] **RPC-over-HTTP 변형** (`TsguRpchTransport`) — G8-G11
+  - 외부 dep 추가 없음. `justrdp-rpch::tunnel` (sans-io 상태 머신) +
+    `justrdp-gateway::rpch::client` (TsProxyClient) 모두 alloc-only 라
+    재사용. async 측은 I/O 만 담당.
+  - 두 어댑터 layer: `TsguRpchTunnel<TIn, TOut>` (CONN/A/B/C +
+    send_pdu / recv_pdu) → `TsguRpchTransport<TIn, TOut>` (BIND +
+    TsProxy 4-step + WebTransport).
+  - **멀티플렉스 핵심**: `pump_until(send_call_id)` 가 OUT 채널의
+    pipe RESPONSE (RDP bytes) 와 SendToServer RESPONSE (send 의 ack)
+    를 call_id 기준으로 분기. send 가 ack 기다리는 동안 끼어든 pipe
+    데이터는 `rx_buffer` 에 보관, 다음 recv 가 가져감.
+  - `gateway::connect_via_gateway_rpch` 진입점. 두 outer TLS + 두
+    NTLM auth + tunnel + transport + RDP 핸드셰이크 + ActiveSession.
+  - 의도적 deferred: keepalive task (tokio::spawn 으로 별도 commit),
+    channel recycling (1 GiB IN content-length 가 단일 RDP 세션에 충분),
+    `MakeTunnelCall` (consent / 서비스 메시지 long-poll, 서버가
+    `TSG_MESSAGING_CAP_*` 협상한 경우만 필요).
 - [x] **inner TLS over `WebTransport`** — G4 (`WebTransportRw` +
       `WebTransportTlsUpgrade`). nested TLS 의 핵심 unblocker; 게이트웨이
       터널 외에 다른 generic transport (WebRTC DataChannel 등) 위에서도
       재사용 가능.
 - [x] **검증** (단위): `cargo test -p justrdp-tokio --features "gateway
-      native-nla native-tls-os"` → 83/83 unit + 3/3 lifecycle. workspace
-      그린, 회귀 0. 7 commit (`5ac694a` … `9c4a16c`), ~3000 LoC 추가.
+      native-nla native-tls-os"` → 105/105 unit + 3/3 lifecycle. workspace
+      그린, 회귀 0. 11 commit (`5ac694a` … TBD G11), ~5000 LoC 추가.
 
 **아직 미진행**:
 
-- [ ] **`GatewayAdapter<T: WebTransport>` trait** — 현재 두 `Tsgu*Transport`
+- [ ] **`GatewayAdapter<T: WebTransport>` trait** — 현재 세 `Tsgu*Transport`
       모두 `impl WebTransport`; 별도 adapter trait 은 불필요로 판명.
-      이 항목은 §5.6.3 가 마무리될 때 제거 후보 (현 surface 가 이미
-      WebTransport 그대로).
-- [ ] **RPC-over-HTTP 변형** (`TsguRpchTransport`) — G8-G10 (별도 미니
-      phase). MS-RPCH HTTP/1.1 `RPC_OUT_DATA` / `RPC_IN_DATA` chunked
-      양방향 채널 + CONN/A/B/C RTS handshake + TsProxy RPC. 가장 위험,
-      실제 RD Gateway 환경 (Server 2008 R2 / 2012) 확보 후 진행.
+      이 항목은 §5.6.3 wrap-up 시 항목에서 제거.
 - [ ] **NLA inside gateway**: `WebClient::connect_with_nla` 가
       `WebTransportTlsTransport<...>` 위에서 이미 동작 가능 (SPKI 추출
-      지원); 편의 wrapper `connect_via_gateway_nla` 만 후속 commit 으로
-      추가하면 끝.
+      지원); 편의 wrapper `connect_via_gateway_nla` (그리고 _ws / _rpch
+      변형) 만 후속 commit 으로 추가하면 끝.
+- [ ] **RPCH keepalive task**: `tokio::spawn` 으로 주기적 Ping RTS PDU
+      송신. blocking 의 `spawn_keepalive_thread` 에 대응. 단 1 GiB IN
+      content-length 만으로도 일반 RDP 세션은 timeout 안 나서 기능적
+      gap 은 작음.
 - [ ] `crates/justrdp-blocking/src/gateway.rs` 제거. `justrdp-blocking`
       은 옵션으로 `justrdp-async + justrdp-tokio` 의존하도록 변경
       (또는 §5.6.5 옵션 b).
 - [ ] **검증** (통합): 실제 RD Gateway (Windows Server 2019 RD Gateway
       role) 환경에서 connect_test 성공. redirect 동반 시나리오도 통과.
 
-**위험 / 결정 포인트**:
+**위험 / 결정 포인트** (해소됨):
 
-* RPCH HTTP/2 양방향 채널 + NTLM 양방향 협상이 async 환경에서 까다로움.
-  실제 RD Gateway 테스트 환경 사전 확보 필요. **현재 G1-G7 까지가 실무
-  RD Gateway 사용처의 99% 를 커버 (HTTP+WebSocket variant)** — RPCH 는
-  Windows Server 2008 R2 / 2012 에서만 사용되는 legacy path.
+* ~~RPCH HTTP/2 양방향 채널 + NTLM 양방향 협상이 async 환경에서 까다로움~~
+  — sans-io state machine 재사용 + scripted-mock 기반 테스트로 해결.
+  실 게이트웨이 환경 통합 검증은 별도 task 로 남음.
 * 의도적 deferred (이 phase 의 §5.6.6-style cleanup 후보):
   - redirect / reconnect 자동화 — embedder loop 가 매 retry 마다 fresh
     터널을 만드는 것이 자연스러우므로 §5.6.2 와 같은 구조 유지.
-  - `connect_via_gateway_nla` — 빌딩 블록은 모두 노출됨, wrapper 만 추가.
+  - `connect_via_gateway_nla` 류 wrapper — 빌딩 블록 모두 노출됨.
+  - RPCH keepalive task — 단일 RDP 세션은 채널 lifetime 안에 끝남.
 
 #### 5.6.4 Phase 4 — `AsyncRdpClient` v2 (3일, -200 LoC + 400 LoC)
 

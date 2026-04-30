@@ -48,11 +48,14 @@ use justrdp_connector::ConnectionResult;
 use justrdp_gateway::{GatewayClient, GatewayClientConfig, RdgMethod};
 use justrdp_svc::SvcProcessor;
 
-use super::config::GatewayConfig;
+use super::config::{GatewayConfig, RpchGatewayConfig};
 use super::http_auth::authenticate_http_channel;
 use super::http_transport::TsguHttpTransport;
 use super::outer_tls::connect_outer_tls;
 use super::random::make_connection_id;
+use super::rpch_auth::authenticate_rpch_channel;
+use super::rpch_transport::{RpchChannelOptions, TsguRpchTransport};
+use super::rpch_tunnel::TsguRpchTunnel;
 use super::ws_auth::authenticate_ws_channel;
 use super::ws_transport::TsguWsTransport;
 use crate::native_tcp::NativeTcpTransport;
@@ -242,6 +245,107 @@ where
     Ok((result, session))
 }
 
+/// RPC-over-HTTP v2 (legacy MS-RPCH) variant of
+/// [`connect_via_gateway`].
+///
+/// Used by Windows Server 2008 R2 / 2012 RD Gateway deployments that
+/// predate the HTTP Transport / WebSocket Transport. Two TCP / TLS
+/// connections (`RPC_IN_DATA` / `RPC_OUT_DATA`), CONN/A/B/C virtual
+/// connection bring-up, then DCE/RPC BIND + the TsProxy 4-step
+/// (CreateTunnel → AuthorizeTunnel → CreateChannel →
+/// SetupReceivePipe). After that the server streams RDP bytes back
+/// through pipe RESPONSE PDUs, while client writes are wrapped as
+/// `TsProxySendToServer` calls — the `TsguRpchTransport` adapter
+/// hides all of this behind the same [`WebTransport`] surface
+/// `WebClient` consumes.
+///
+/// `make_outer` is called twice (IN channel, OUT channel) — same
+/// fresh-upgrader-per-call pattern as the HTTP variant. The PAA
+/// cookie, target host, and timeouts come from
+/// [`RpchGatewayConfig`]. The TsProxy `version_caps` defaults to
+/// `TsgPacketVersionCaps::client_default(0)` (no NAP capability
+/// advertised) — embedders that need NAP should fork this entry
+/// point, build their own [`RpchChannelOptions`], and call
+/// [`TsguRpchTransport::connect`] directly.
+///
+/// Same intentional gaps as the other variants: no NLA helper, no
+/// auto redirect / reconnect (each retry would need a fresh
+/// authenticated channel pair, which is the embedder's loop).
+pub async fn connect_via_gateway_rpch<MakeOuter, Outer, Inner>(
+    gateway_cfg: &RpchGatewayConfig,
+    rdp_config: justrdp_connector::Config,
+    mut make_outer: MakeOuter,
+    inner_upgrader: Inner,
+    processors: Vec<Box<dyn SvcProcessor>>,
+) -> Result<(ConnectionResult, ActiveSession<Inner::Output>), DriverError>
+where
+    MakeOuter: FnMut() -> Outer,
+    Outer: TlsUpgrade<NativeTcpTransport, Error = TransportError>,
+    Outer::Output: WebTransport + Send + 'static,
+    Inner: TlsUpgrade<TsguRpchTransport<Outer::Output, Outer::Output>>,
+    Inner::Output: WebTransport + Send + 'static,
+{
+    use justrdp_gateway::rpch::{TsEndpointInfo, TsgPacketVersionCaps};
+    use justrdp_rpch::http::RpchChannel;
+    use super::random::make_rpch_tunnel_config;
+
+    // 1. Random UUIDs for the RPCH virtual connection.
+    let tunnel_cfg = make_rpch_tunnel_config().map_err(DriverError::Transport)?;
+
+    // 2. OUT channel: TCP+TLS + NTLM 401. OUT first per §3.2.1.5
+    //    so the server's CONN/A3 is observable before IN starts.
+    let mut out_chan = super::outer_tls::connect_outer_tls_rpch(gateway_cfg, make_outer())
+        .await
+        .map_err(DriverError::Transport)?;
+    let out_leftover = authenticate_rpch_channel(&mut out_chan, RpchChannel::Out, gateway_cfg)
+        .await
+        .map_err(DriverError::Transport)?;
+
+    // 3. IN channel.
+    let mut in_chan = super::outer_tls::connect_outer_tls_rpch(gateway_cfg, make_outer())
+        .await
+        .map_err(DriverError::Transport)?;
+    let _in_leftover = authenticate_rpch_channel(&mut in_chan, RpchChannel::In, gateway_cfg)
+        .await
+        .map_err(DriverError::Transport)?;
+
+    // 4. CONN/A/B/C virtual connection.
+    let tunnel = TsguRpchTunnel::connect(in_chan, out_chan, tunnel_cfg, out_leftover)
+        .await
+        .map_err(DriverError::Transport)?;
+
+    // 5. BIND + TsProxy 4-step + SetupReceivePipe.
+    let endpoint = TsEndpointInfo {
+        resource_names: alloc::vec![gateway_cfg.target_host.clone()],
+        alternate_resource_names: Vec::new(),
+        port: TsEndpointInfo::rdp_port(gateway_cfg.target_port),
+    };
+    let options = RpchChannelOptions {
+        version_caps: TsgPacketVersionCaps::client_default(0),
+        paa_cookie: gateway_cfg.paa_cookie.clone(),
+        endpoint,
+    };
+    let transport = TsguRpchTransport::connect(tunnel, options)
+        .await
+        .map_err(DriverError::Transport)?;
+
+    // 6. Inner RDP handshake on top of the TsProxy byte pipe.
+    let client = WebClient::new(transport);
+    let (result, post_tls) = client
+        .connect_with_upgrade(rdp_config, inner_upgrader)
+        .await?;
+
+    if result.server_redirection.is_some() {
+        return Err(DriverError::Internal(format!(
+            "gateway-rpch path: server redirection is not supported \
+             (the target address in a redirect is unreachable through the same tunnel)"
+        )));
+    }
+
+    let session = ActiveSession::with_processors(post_tls, &result, processors).await?;
+    Ok((result, session))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +404,56 @@ mod tests {
         .unwrap();
 
         let result = connect_via_gateway(
+            &gw_cfg,
+            rdp_cfg,
+            || FailingUpgrade,
+            inner,
+            Vec::new(),
+        )
+        .await;
+
+        match result {
+            Err(DriverError::Transport(t)) => {
+                assert_eq!(t.kind(), TransportErrorKind::Protocol);
+            }
+            Err(other) => panic!("expected Transport(Protocol), got {other:?}"),
+            Ok(_) => panic!("expected error from FailingUpgrade, got Ok"),
+        }
+    }
+
+    fn rpch_cfg(addr: &str) -> RpchGatewayConfig {
+        let mut c = RpchGatewayConfig::new(
+            addr,
+            "gw.example.com",
+            NtlmCredentials::new("alice", "hunter2", ""),
+            "rdp.example.com",
+        );
+        c.connect_timeout = core::time::Duration::from_millis(200);
+        c.auth_timeout = core::time::Duration::from_millis(200);
+        c
+    }
+
+    /// Same outer-failure smoke test for the RPCH variant. The
+    /// failure path returns `Err` after the first `make_outer()`
+    /// call, before any IN/OUT channel auth or RPCH handshake.
+    #[tokio::test]
+    async fn rpch_outer_upgrade_failure_surfaces_as_driver_transport_error() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _accept = tokio::spawn(async move {
+            for _ in 0..2 {
+                let _ = listener.accept().await;
+            }
+        });
+
+        let gw_cfg = rpch_cfg(&format!("{addr}"));
+        let rdp_cfg = justrdp_connector::Config::builder("alice", "p4ss").build();
+        let inner = super::super::inner_tls::WebTransportTlsUpgrade::dangerous_no_verify(
+            "rdp.example.com",
+        )
+        .unwrap();
+
+        let result = connect_via_gateway_rpch(
             &gw_cfg,
             rdp_cfg,
             || FailingUpgrade,

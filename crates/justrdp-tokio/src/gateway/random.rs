@@ -17,6 +17,8 @@ use alloc::format;
 
 use justrdp_async::TransportError;
 use justrdp_gateway::NtlmRandom;
+use justrdp_rpch::pdu::uuid::RpcUuid;
+use justrdp_rpch::tunnel::RpchTunnelConfig;
 
 /// Build a fresh [`NtlmRandom`] from the OS RNG.
 ///
@@ -54,6 +56,42 @@ pub(crate) fn make_connection_id() -> Result<[u8; 16], TransportError> {
     Ok(id)
 }
 
+/// Generate a fresh random RFC 4122 v4 UUID (the same masking the
+/// rest of this module uses for `RDG-Connection-Id`). RPC-over-HTTP
+/// session setup needs four of these — virtual connection cookie,
+/// IN/OUT channel cookies, association group ID — and they MUST all
+/// be distinct and unpredictable per session.
+fn make_random_uuid() -> Result<RpcUuid, TransportError> {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b)
+        .map_err(|e| TransportError::io(format!("OS random failure: {e}")))?;
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+    Ok(RpcUuid {
+        data1: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+        data2: u16::from_be_bytes([b[4], b[5]]),
+        data3: u16::from_be_bytes([b[6], b[7]]),
+        data4: [b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]],
+    })
+}
+
+/// Build a fresh [`RpchTunnelConfig`] with the four random UUIDs the
+/// MS-RPCH §3.2.1.5 handshake demands. Defaults match what Windows
+/// RPCRT4 sends (verified via Wireshark by the blocking
+/// `make_rpch_tunnel_config` author).
+#[allow(dead_code)]
+pub(crate) fn make_rpch_tunnel_config() -> Result<RpchTunnelConfig, TransportError> {
+    Ok(RpchTunnelConfig {
+        virtual_connection_cookie: make_random_uuid()?,
+        out_channel_cookie: make_random_uuid()?,
+        in_channel_cookie: make_random_uuid()?,
+        association_group_id: make_random_uuid()?,
+        receive_window_size: 65_536,
+        channel_lifetime: 0x4000_0000,
+        client_keepalive: 300_000,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +115,27 @@ mod tests {
         assert_eq!(id[6] & 0xF0, 0x40);
         // RFC 4122 variant — top two bits of byte 8 are 0b10.
         assert_eq!(id[8] & 0xC0, 0x80);
+    }
+
+    #[test]
+    fn make_rpch_tunnel_config_returns_distinct_uuids() {
+        let cfg = make_rpch_tunnel_config().unwrap();
+        // The four UUIDs must all be distinct — collisions would
+        // confuse the MS-RPCH handshake.
+        let uuids = [
+            cfg.virtual_connection_cookie,
+            cfg.out_channel_cookie,
+            cfg.in_channel_cookie,
+            cfg.association_group_id,
+        ];
+        for i in 0..uuids.len() {
+            for j in (i + 1)..uuids.len() {
+                assert_ne!(uuids[i], uuids[j], "uuid collision at {i}/{j}");
+            }
+        }
+        // Sanity: defaults match Windows RPCRT4's observed values.
+        assert_eq!(cfg.receive_window_size, 65_536);
+        assert_eq!(cfg.channel_lifetime, 0x4000_0000);
+        assert_eq!(cfg.client_keepalive, 300_000);
     }
 }

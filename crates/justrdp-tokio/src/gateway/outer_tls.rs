@@ -22,12 +22,13 @@
 //! time. The gateway code never inspects which backend is in use.
 
 use alloc::format;
+use core::time::Duration;
 
 use justrdp_async::{TlsUpgrade, TransportError, WebTransport};
 use tokio::net::ToSocketAddrs;
 use tokio::time;
 
-use crate::gateway::GatewayConfig;
+use crate::gateway::config::{GatewayConfig, RpchGatewayConfig};
 use crate::native_tcp::NativeTcpTransport;
 
 /// Open a TCP connection to the gateway and run the outer TLS
@@ -78,21 +79,58 @@ where
     U: TlsUpgrade<NativeTcpTransport, Error = TransportError>,
     U::Output: WebTransport,
 {
-    let tcp = time::timeout(cfg.connect_timeout, NativeTcpTransport::connect(addr))
+    connect_outer_tls_with_timeouts(addr, cfg.connect_timeout, cfg.auth_timeout, upgrader).await
+}
+
+/// RPCH-config flavour. Identical body but parameterised on
+/// [`RpchGatewayConfig`] (which lacks `connection_id` but otherwise
+/// shares timeout fields).
+#[allow(dead_code)]
+pub(crate) async fn connect_outer_tls_rpch<U>(
+    cfg: &RpchGatewayConfig,
+    upgrader: U,
+) -> Result<U::Output, TransportError>
+where
+    U: TlsUpgrade<NativeTcpTransport, Error = TransportError>,
+    U::Output: WebTransport,
+{
+    connect_outer_tls_with_timeouts(
+        cfg.gateway_addr.as_str(),
+        cfg.connect_timeout,
+        cfg.auth_timeout,
+        upgrader,
+    )
+    .await
+}
+
+/// Shared body — TCP connect bounded by `connect_timeout`, TLS
+/// handshake bounded by `auth_timeout`. Both wrappers above are thin
+/// adapters around this so each gateway-config flavour gets a typed
+/// entry point without duplicating the timeout plumbing.
+async fn connect_outer_tls_with_timeouts<A, U>(
+    addr: A,
+    connect_timeout: Duration,
+    auth_timeout: Duration,
+    upgrader: U,
+) -> Result<U::Output, TransportError>
+where
+    A: ToSocketAddrs,
+    U: TlsUpgrade<NativeTcpTransport, Error = TransportError>,
+    U::Output: WebTransport,
+{
+    let tcp = time::timeout(connect_timeout, NativeTcpTransport::connect(addr))
         .await
         .map_err(|_| {
             TransportError::io(format!(
-                "gateway: tcp connect timed out after {:?}",
-                cfg.connect_timeout
+                "gateway: tcp connect timed out after {connect_timeout:?}",
             ))
         })??;
 
-    let tls = time::timeout(cfg.auth_timeout, upgrader.upgrade(tcp))
+    let tls = time::timeout(auth_timeout, upgrader.upgrade(tcp))
         .await
         .map_err(|_| {
             TransportError::io(format!(
-                "gateway: tls handshake timed out after {:?}",
-                cfg.auth_timeout
+                "gateway: tls handshake timed out after {auth_timeout:?}",
             ))
         })??;
 

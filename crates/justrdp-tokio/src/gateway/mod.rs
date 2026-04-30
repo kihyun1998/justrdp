@@ -52,7 +52,7 @@ pub(crate) mod ws_auth;
 pub(crate) mod ws_transport;
 
 pub use config::{GatewayConfig, RpchGatewayConfig};
-pub use connect::{connect_via_gateway, connect_via_gateway_ws};
+pub use connect::{connect_via_gateway, connect_via_gateway_rpch, connect_via_gateway_ws};
 pub use http_transport::TsguHttpTransport;
 pub use inner_tls::{WebTransportTlsTransport, WebTransportTlsUpgrade};
 pub use rpch_transport::{RpchChannelOptions, TsguRpchTransport};
