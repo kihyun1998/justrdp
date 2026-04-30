@@ -47,7 +47,13 @@ native-nla = ["native-tls", "dep:getrandom"]
 # upgrader is built on `tokio-rustls`, which the same feature pulls
 # in. The gateway crate is consumed in `alloc`-only mode (no std I/O);
 # all runtime plumbing lives here. Roadmap §5.6.3 (Phase 3).
-gateway = ["native-tls", "dep:justrdp-gateway", "dep:justrdp-svc", "dep:getrandom"]
+gateway = [
+    "native-tls",
+    "dep:justrdp-gateway",
+    "dep:justrdp-rpch",
+    "dep:justrdp-svc",
+    "dep:getrandom",
+]
 # TLS backend selection — `rustls` is the workspace default for
 # justrdp-blocking, so callers who want `native-tls` should set
 # `default-features = false` on `justrdp-blocking` at the workspace
@@ -96,6 +102,9 @@ getrandom = { version = "0.2", optional = true }
 # are `alloc`-only, which is exactly what the async side wants — no
 # std I/O bleeds in (that lives in `justrdp-blocking`'s `gateway.rs`).
 justrdp-gateway = { workspace = true, optional = true }
+# MS-RPCE / MS-RPCH / NDR 2.0 — used by the RPC-over-HTTP gateway
+# variant (`gateway` feature). Default `alloc` keeps no_std I/O out.
+justrdp-rpch = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }

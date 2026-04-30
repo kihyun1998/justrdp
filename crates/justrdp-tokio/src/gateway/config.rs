@@ -105,4 +105,70 @@ mod tests {
         assert_eq!(cfg.connect_timeout, Duration::from_secs(30));
         assert_eq!(cfg.connection_id, Some([0x42; 16]));
     }
+
+    #[test]
+    fn rpch_new_sets_default_target_port_and_timeouts() {
+        let cfg = RpchGatewayConfig::new(
+            "gw.example.com:443",
+            "gw.example.com",
+            NtlmCredentials::new("user", "pass", ""),
+            "rdp.example.com",
+        );
+        assert_eq!(cfg.target_port, 3389);
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.auth_timeout, Duration::from_secs(10));
+        assert!(cfg.paa_cookie.is_none());
+    }
+}
+
+/// Configuration for the legacy **RPC-over-HTTP v2** gateway variant
+/// (MS-TSGU §3.4 + MS-RPCH).
+///
+/// Used by Windows Server 2008 R2 / 2012 RD Gateway deployments that
+/// predate the HTTP Transport / WebSocket Transport. Two TCP / TLS
+/// connections (`RPC_IN_DATA` / `RPC_OUT_DATA`), each authenticated
+/// via NTLM HTTP-401 retry exactly like the HTTP variant, then
+/// CONN/A/B/C → BIND → TsProxy 4-step.
+///
+/// Mirrors `justrdp_blocking::gateway::RpchGatewayConfig` field-for-
+/// field. Differs from [`GatewayConfig`] only in:
+///
+/// * No `connection_id` field — the RPC-over-HTTP virtual connection
+///   has its own GUID set generated inside the tunnel handshake.
+/// * Extra `paa_cookie` field — opaque pre-authentication blob the
+///   gateway hands the client out-of-band (browser SSO etc.). `None`
+///   means "send `TSG_PACKET_VERSIONCAPS`" (anonymous tunnel auth).
+#[derive(Debug, Clone)]
+pub struct RpchGatewayConfig {
+    pub gateway_addr: String,
+    pub gateway_hostname: String,
+    pub credentials: NtlmCredentials,
+    pub target_host: String,
+    pub target_port: u16,
+    pub connect_timeout: Duration,
+    pub auth_timeout: Duration,
+    /// Optional PAA (pre-authentication) cookie. `None` means
+    /// "send `TSG_PACKET_VERSIONCAPS` to CreateTunnel" — used by
+    /// anonymous or SSPI-NTLM-only deployments.
+    pub paa_cookie: Option<justrdp_gateway::rpch::PaaCookie>,
+}
+
+impl RpchGatewayConfig {
+    pub fn new(
+        gateway_addr: impl Into<String>,
+        gateway_hostname: impl Into<String>,
+        credentials: NtlmCredentials,
+        target_host: impl Into<String>,
+    ) -> Self {
+        Self {
+            gateway_addr: gateway_addr.into(),
+            gateway_hostname: gateway_hostname.into(),
+            credentials,
+            target_host: target_host.into(),
+            target_port: 3389,
+            connect_timeout: Duration::from_secs(10),
+            auth_timeout: Duration::from_secs(10),
+            paa_cookie: None,
+        }
+    }
 }
