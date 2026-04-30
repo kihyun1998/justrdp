@@ -40,8 +40,12 @@ pub(crate) mod error;
 pub(crate) mod http_auth;
 pub(crate) mod http_io;
 pub(crate) mod http_transport;
+pub(crate) mod inner_tls;
 pub(crate) mod outer_tls;
 pub(crate) mod random;
+pub(crate) mod web_rw;
 
 pub use config::GatewayConfig;
 pub use http_transport::TsguHttpTransport;
+pub use inner_tls::{WebTransportTlsTransport, WebTransportTlsUpgrade};
+pub use web_rw::WebTransportRw;

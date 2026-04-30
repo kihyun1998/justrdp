@@ -28,12 +28,26 @@ use crate::error::TransportError;
 /// before it resolves must either succeed atomically or surface an error
 /// on the next call. Reference implementations that buffer internally
 /// (such as `WebSocketTransport`) satisfy this naturally.
+///
+/// ### Future Send-ness
+///
+/// On non-wasm targets the returned futures are bound `+ Send` so the
+/// trait can be used inside multi-threaded tokio runtimes (and in
+/// adapters like `justrdp-tokio::gateway::WebTransportRw` that need
+/// to box the futures behind `Send`-bounded trait objects). On wasm
+/// targets the bound is dropped — `js_sys` / `web-sys` futures are
+/// typically `!Send` and a `+ Send` requirement would lock out every
+/// browser-side impl.
+#[cfg(not(target_family = "wasm"))]
 pub trait WebTransport {
     /// Send one transport-level message.
     ///
     /// Implementations MUST send the entire `bytes` slice as a single
     /// frame; partial sends or splits across frames are a protocol bug.
-    fn send(&mut self, bytes: &[u8]) -> impl core::future::Future<Output = Result<(), TransportError>>;
+    fn send(
+        &mut self,
+        bytes: &[u8],
+    ) -> impl core::future::Future<Output = Result<(), TransportError>> + Send;
 
     /// Receive the next inbound message.
     ///
@@ -42,13 +56,31 @@ pub trait WebTransport {
     /// [`TransportErrorKind::ConnectionClosed`].
     ///
     /// [`TransportErrorKind::ConnectionClosed`]: crate::TransportErrorKind::ConnectionClosed
-    fn recv(&mut self) -> impl core::future::Future<Output = Result<Vec<u8>, TransportError>>;
+    fn recv(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, TransportError>> + Send;
 
     /// Initiate orderly close.
     ///
     /// Implementations should signal end-of-stream to the peer (WebSocket
     /// Close frame, HTTP/2 RST_STREAM, etc.) and ensure subsequent
     /// `send()` calls fail with `ConnectionClosed`.
+    fn close(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), TransportError>> + Send;
+}
+
+/// Wasm-side trait variant — same shape, no `Send` bound on the
+/// returned futures. See the doc comment on the non-wasm trait above.
+#[cfg(target_family = "wasm")]
+pub trait WebTransport {
+    fn send(
+        &mut self,
+        bytes: &[u8],
+    ) -> impl core::future::Future<Output = Result<(), TransportError>>;
+
+    fn recv(&mut self) -> impl core::future::Future<Output = Result<Vec<u8>, TransportError>>;
+
     fn close(&mut self) -> impl core::future::Future<Output = Result<(), TransportError>>;
 }
 

@@ -205,7 +205,7 @@ fn parse_data_pdu(bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
     Ok(pdu.data)
 }
 
-impl<T: WebTransport> WebTransport for TsguHttpTransport<T> {
+impl<T: WebTransport + Send> WebTransport for TsguHttpTransport<T> {
     async fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
         if self.closed {
             return Err(TransportError::closed("tsgu-http: already closed"));

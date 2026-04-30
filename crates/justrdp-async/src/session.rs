@@ -594,13 +594,16 @@ impl<T: WebTransport> ActiveSession<T> {
 }
 
 #[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::mock::MockTransport;
     use alloc::collections::VecDeque;
-    use alloc::rc::Rc;
+    use alloc::sync::Arc;
     use alloc::vec;
-    use core::cell::RefCell;
+    use std::sync::Mutex;
 
     use justrdp_connector::ConnectionResult;
     use justrdp_pdu::x224::SecurityProtocol;
@@ -717,12 +720,12 @@ mod tests {
             //   size        = 0x0000 (LE u16, no payload)
             // total = 5 bytes.
             let frame = vec![0x00, 0x05, 0x03, 0x00, 0x00];
-            let shared = Rc::new(RefCell::new(SharedSink {
+            let shared = Arc::new(Mutex::new(SharedSink {
                 sent: Vec::new(),
                 recv: VecDeque::from([Ok(frame)]),
             }));
             let transport = SinkTransport {
-                shared: Rc::clone(&shared),
+                shared: Arc::clone(&shared),
             };
             let result = fake_result();
             let mut session = ActiveSession::new(transport, &result);
@@ -742,7 +745,7 @@ mod tests {
                 other => panic!("expected Graphics(Synchronize), got {other:?}"),
             }
             // No reply frame for synchronize.
-            assert!(shared.borrow().sent.is_empty());
+            assert!(shared.lock().unwrap().sent.is_empty());
         });
     }
 
@@ -760,11 +763,11 @@ mod tests {
         use justrdp_pdu::x224::DataTransfer;
 
         block_on(async {
-            let shared = Rc::new(RefCell::new(SharedSink {
+            let shared = Arc::new(Mutex::new(SharedSink {
                 sent: Vec::new(),
                 recv: VecDeque::new(),
             }));
-            let transport = SinkTransport { shared: Rc::clone(&shared) };
+            let transport = SinkTransport { shared: Arc::clone(&shared) };
             let result = fake_result();
             let mut session = ActiveSession::new(transport, &result);
 
@@ -773,7 +776,7 @@ mod tests {
             ];
             session.send_refresh_rect(&areas).await.unwrap();
 
-            let sent = &shared.borrow().sent;
+            let sent = &shared.lock().unwrap().sent;
             assert_eq!(sent.len(), 1, "exactly one frame written to transport");
             let frame = &sent[0];
 
@@ -804,17 +807,17 @@ mod tests {
         use justrdp_pdu::x224::DataTransfer;
 
         block_on(async {
-            let shared = Rc::new(RefCell::new(SharedSink {
+            let shared = Arc::new(Mutex::new(SharedSink {
                 sent: Vec::new(),
                 recv: VecDeque::new(),
             }));
-            let transport = SinkTransport { shared: Rc::clone(&shared) };
+            let transport = SinkTransport { shared: Arc::clone(&shared) };
             let result = fake_result();
             let mut session = ActiveSession::new(transport, &result);
 
             session.send_suppress_output(false, None).await.unwrap();
 
-            let sent = &shared.borrow().sent;
+            let sent = &shared.lock().unwrap().sent;
             assert_eq!(sent.len(), 1);
             let frame = &sent[0];
 
@@ -836,7 +839,7 @@ mod tests {
 
     #[derive(Debug)]
     struct SinkTransport {
-        shared: Rc<RefCell<SharedSink>>,
+        shared: Arc<Mutex<SharedSink>>,
     }
     #[derive(Debug)]
     struct SharedSink {
@@ -846,11 +849,11 @@ mod tests {
 
     impl WebTransport for SinkTransport {
         async fn send(&mut self, bytes: &[u8]) -> Result<(), crate::TransportError> {
-            self.shared.borrow_mut().sent.push(bytes.to_vec());
+            self.shared.lock().unwrap().sent.push(bytes.to_vec());
             Ok(())
         }
         async fn recv(&mut self) -> Result<Vec<u8>, crate::TransportError> {
-            match self.shared.borrow_mut().recv.pop_front() {
+            match self.shared.lock().unwrap().recv.pop_front() {
                 Some(r) => r,
                 None => Err(crate::TransportError::closed("empty")),
             }
@@ -879,12 +882,12 @@ mod tests {
         events
     }
 
-    fn build_session() -> (ActiveSession<SinkTransport>, Rc<RefCell<SharedSink>>) {
-        let shared = Rc::new(RefCell::new(SharedSink {
+    fn build_session() -> (ActiveSession<SinkTransport>, Arc<Mutex<SharedSink>>) {
+        let shared = Arc::new(Mutex::new(SharedSink {
             sent: Vec::new(),
             recv: VecDeque::new(),
         }));
-        let transport = SinkTransport { shared: Rc::clone(&shared) };
+        let transport = SinkTransport { shared: Arc::clone(&shared) };
         let result = fake_result();
         (ActiveSession::new(transport, &result), shared)
     }
@@ -897,7 +900,7 @@ mod tests {
             let sent = session.key_press(sc).await.unwrap();
             assert!(sent);
             assert!(session.is_key_pressed(sc));
-            let events = decode_input_events(&shared.borrow().sent[0]);
+            let events = decode_input_events(&shared.lock().unwrap().sent[0]);
             match &events[0] {
                 FastPathInputEvent::Scancode(s) => {
                     assert_eq!(s.key_code, 0x1E);
@@ -915,7 +918,7 @@ mod tests {
             let sc = Scancode::new(0x1E, false);
             assert!(session.key_press(sc).await.unwrap());
             assert!(!session.key_press(sc).await.unwrap()); // dup → false
-            assert_eq!(shared.borrow().sent.len(), 1, "dup must not write");
+            assert_eq!(shared.lock().unwrap().sent.len(), 1, "dup must not write");
         });
     }
 
@@ -925,7 +928,7 @@ mod tests {
             let (mut session, shared) = build_session();
             let sc = Scancode::new(0x1E, false);
             assert!(!session.key_release(sc).await.unwrap());
-            assert!(shared.borrow().sent.is_empty());
+            assert!(shared.lock().unwrap().sent.is_empty());
         });
     }
 
@@ -939,7 +942,7 @@ mod tests {
             assert!(session.key_release(sc).await.unwrap());
             assert!(!session.is_key_pressed(sc));
 
-            let events = decode_input_events(&shared.borrow().sent[1]);
+            let events = decode_input_events(&shared.lock().unwrap().sent[1]);
             match &events[0] {
                 FastPathInputEvent::Scancode(s) => {
                     assert_eq!(s.key_code, 0x1D);
@@ -965,7 +968,7 @@ mod tests {
             assert!(!session.is_button_pressed(MouseButton::X1));
             assert!(!session.is_button_pressed(MouseButton::X2));
             assert!(!session.button_release(MouseButton::X1, 0, 0).await.unwrap());
-            assert!(shared.borrow().sent.is_empty());
+            assert!(shared.lock().unwrap().sent.is_empty());
         });
     }
 
@@ -978,7 +981,7 @@ mod tests {
                 .await
                 .unwrap());
             assert!(session.is_button_pressed(MouseButton::Left));
-            let events = decode_input_events(&shared.borrow().sent[0]);
+            let events = decode_input_events(&shared.lock().unwrap().sent[0]);
             match &events[0] {
                 FastPathInputEvent::Mouse(m) => {
                     // PTRFLAGS_BUTTON1 | PTRFLAGS_DOWN
@@ -997,7 +1000,7 @@ mod tests {
             assert!(session.move_mouse(50, 60).await.unwrap());
             assert!(!session.move_mouse(50, 60).await.unwrap()); // dup
             assert_eq!(session.mouse_position(), (50, 60));
-            assert_eq!(shared.borrow().sent.len(), 1);
+            assert_eq!(shared.lock().unwrap().sent.len(), 1);
         });
     }
 
@@ -1013,12 +1016,12 @@ mod tests {
             };
             session.synchronize(locks).await.unwrap();
             session.synchronize(locks).await.unwrap(); // same — must still emit
-            assert_eq!(shared.borrow().sent.len(), 2);
+            assert_eq!(shared.lock().unwrap().sent.len(), 2);
             assert_eq!(session.lock_keys(), locks);
 
             // Verify the wire-level Sync event has the expected flag byte
             // (num | caps = 0x02 | 0x04 = 0x06).
-            let events = decode_input_events(&shared.borrow().sent[0]);
+            let events = decode_input_events(&shared.lock().unwrap().sent[0]);
             match &events[0] {
                 FastPathInputEvent::Sync(s) => {
                     assert_eq!(s.event_flags, 0x06);
@@ -1041,17 +1044,17 @@ mod tests {
                 .await
                 .unwrap();
             // 3 frames so far (one per state-changing call).
-            assert_eq!(shared.borrow().sent.len(), 3);
+            assert_eq!(shared.lock().unwrap().sent.len(), 3);
 
             let count = session.release_all_input().await.unwrap();
             // 2 keys + 1 button = 3 events, batched in a single frame.
             assert_eq!(count, 3);
-            assert_eq!(shared.borrow().sent.len(), 4);
+            assert_eq!(shared.lock().unwrap().sent.len(), 4);
             assert!(!session.is_key_pressed(sc_a));
             assert!(!session.is_key_pressed(sc_ctrl));
             assert!(!session.is_button_pressed(MouseButton::Left));
 
-            let events = decode_input_events(&shared.borrow().sent[3]);
+            let events = decode_input_events(&shared.lock().unwrap().sent[3]);
             assert_eq!(events.len(), 3);
         });
     }
@@ -1062,7 +1065,7 @@ mod tests {
             let (mut session, shared) = build_session();
             let count = session.release_all_input().await.unwrap();
             assert_eq!(count, 0);
-            assert!(shared.borrow().sent.is_empty());
+            assert!(shared.lock().unwrap().sent.is_empty());
         });
     }
 
@@ -1071,7 +1074,7 @@ mod tests {
         block_on(async {
             let (mut session, shared) = build_session();
             session.send_unicode(0x0041, true).await.unwrap(); // 'A' press
-            let events = decode_input_events(&shared.borrow().sent[0]);
+            let events = decode_input_events(&shared.lock().unwrap().sent[0]);
             match &events[0] {
                 FastPathInputEvent::Unicode(u) => {
                     assert_eq!(u.unicode_code, 0x0041);
@@ -1087,7 +1090,7 @@ mod tests {
         block_on(async {
             let (mut session, shared) = build_session();
             session.send_unicode(0x0041, false).await.unwrap();
-            let events = decode_input_events(&shared.borrow().sent[0]);
+            let events = decode_input_events(&shared.lock().unwrap().sent[0]);
             match &events[0] {
                 FastPathInputEvent::Unicode(u) => assert_eq!(u.event_flags, 0x01),
                 other => panic!("expected Unicode, got {other:?}"),
@@ -1100,10 +1103,10 @@ mod tests {
         block_on(async {
             let (mut session, shared) = build_session();
             assert!(session.send_unicode_char('A').await.unwrap());
-            assert_eq!(shared.borrow().sent.len(), 2);
+            assert_eq!(shared.lock().unwrap().sent.len(), 2);
 
-            let press = decode_input_events(&shared.borrow().sent[0]);
-            let release = decode_input_events(&shared.borrow().sent[1]);
+            let press = decode_input_events(&shared.lock().unwrap().sent[0]);
+            let release = decode_input_events(&shared.lock().unwrap().sent[1]);
             match (&press[0], &release[0]) {
                 (FastPathInputEvent::Unicode(p), FastPathInputEvent::Unicode(r)) => {
                     assert_eq!(p.unicode_code, 0x0041);
@@ -1122,7 +1125,7 @@ mod tests {
             let (mut session, shared) = build_session();
             // U+1F600 GRINNING FACE — outside BMP, needs surrogate pair.
             assert!(!session.send_unicode_char('\u{1F600}').await.unwrap());
-            assert!(shared.borrow().sent.is_empty());
+            assert!(shared.lock().unwrap().sent.is_empty());
         });
     }
 
@@ -1210,12 +1213,12 @@ mod tests {
 
     fn build_session_for_processors(
         channel_ids: Vec<(StdString, u16)>,
-    ) -> (ConnectionResult, Rc<RefCell<SharedSink>>, SinkTransport) {
-        let shared = Rc::new(RefCell::new(SharedSink {
+    ) -> (ConnectionResult, Arc<Mutex<SharedSink>>, SinkTransport) {
+        let shared = Arc::new(Mutex::new(SharedSink {
             sent: Vec::new(),
             recv: VecDeque::new(),
         }));
-        let transport = SinkTransport { shared: Rc::clone(&shared) };
+        let transport = SinkTransport { shared: Arc::clone(&shared) };
         let mut result = fake_result();
         result.channel_ids = channel_ids;
         (result, shared, transport)
@@ -1228,7 +1231,7 @@ mod tests {
             let _session = ActiveSession::with_processors(transport, &result, vec![])
                 .await
                 .unwrap();
-            assert!(shared.borrow().sent.is_empty());
+            assert!(shared.lock().unwrap().sent.is_empty());
         });
     }
 
@@ -1247,10 +1250,10 @@ mod tests {
                 .unwrap();
             // start_all produced one MCS-wrapped frame for the echo
             // channel — written through the transport.
-            assert_eq!(shared.borrow().sent.len(), 1);
+            assert_eq!(shared.lock().unwrap().sent.len(), 1);
             // Sanity check: the frame is non-empty (the processor's
             // `b"hello"` payload + MCS/TPKT framing).
-            assert!(!shared.borrow().sent[0].is_empty());
+            assert!(!shared.lock().unwrap().sent[0].is_empty());
         });
     }
 
@@ -1268,7 +1271,7 @@ mod tests {
             let _session = ActiveSession::with_processors(transport, &result, processors)
                 .await
                 .unwrap();
-            assert!(shared.borrow().sent.is_empty());
+            assert!(shared.lock().unwrap().sent.is_empty());
         });
     }
 
@@ -1284,7 +1287,7 @@ mod tests {
             let _session = ActiveSession::with_processors(transport, &result, processors)
                 .await
                 .unwrap();
-            assert!(shared.borrow().sent.is_empty());
+            assert!(shared.lock().unwrap().sent.is_empty());
         });
     }
 
@@ -1294,7 +1297,7 @@ mod tests {
             let (mut session, shared) = build_session();
             session.move_mouse(123, 456).await.unwrap();
             session.wheel_scroll(120).await.unwrap();
-            let events = decode_input_events(&shared.borrow().sent[1]);
+            let events = decode_input_events(&shared.lock().unwrap().sent[1]);
             match &events[0] {
                 FastPathInputEvent::Mouse(m) => {
                     // PTRFLAGS_WHEEL (0x0200) | magnitude (120)

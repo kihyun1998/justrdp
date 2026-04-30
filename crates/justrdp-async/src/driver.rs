@@ -700,6 +700,9 @@ pub(crate) async fn recv_until_pdu<T: WebTransport>(
 }
 
 #[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::mock::MockTransport;
@@ -813,17 +816,21 @@ mod tests {
     // ── Driver-level integration with a real ClientConnector ────────────
 
     use alloc::collections::VecDeque;
-    use alloc::rc::Rc;
-    use core::cell::RefCell;
+    use alloc::sync::Arc;
+    use std::sync::Mutex;
     use justrdp_connector::Config;
     use justrdp_pdu::x224::SecurityProtocol;
 
     /// Test transport that exposes both the sent-bytes log and the
     /// recv-script via shared state, so a test can inspect what the
     /// driver wrote to the wire after a future resolves.
+    ///
+    /// `Arc<Mutex<...>>` (not `Rc<RefCell<...>>`) so the
+    /// `WebTransport` future is `Send` — see the trait's doc comment
+    /// on conditional Send-ness for non-wasm targets.
     #[derive(Debug)]
     struct CaptureTransport {
-        shared: Rc<RefCell<CaptureShared>>,
+        shared: Arc<Mutex<CaptureShared>>,
     }
 
     #[derive(Debug)]
@@ -835,7 +842,7 @@ mod tests {
 
     impl WebTransport for CaptureTransport {
         async fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-            let mut s = self.shared.borrow_mut();
+            let mut s = self.shared.lock().unwrap();
             if s.closed {
                 return Err(TransportError::closed("transport closed"));
             }
@@ -844,7 +851,7 @@ mod tests {
         }
 
         async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
-            let mut s = self.shared.borrow_mut();
+            let mut s = self.shared.lock().unwrap();
             match s.recv.pop_front() {
                 Some(r) => r,
                 None => Err(TransportError::closed("recv script exhausted")),
@@ -852,7 +859,7 @@ mod tests {
         }
 
         async fn close(&mut self) -> Result<(), TransportError> {
-            self.shared.borrow_mut().closed = true;
+            self.shared.lock().unwrap().closed = true;
             Ok(())
         }
     }
@@ -874,13 +881,13 @@ mod tests {
     #[test]
     fn driver_emits_x224_cr_then_propagates_recv_eof() {
         block_on(async {
-            let shared = Rc::new(RefCell::new(CaptureShared {
+            let shared = Arc::new(Mutex::new(CaptureShared {
                 sent: Vec::new(),
                 recv: VecDeque::new(),
                 closed: false,
             }));
             let transport = CaptureTransport {
-                shared: Rc::clone(&shared),
+                shared: Arc::clone(&shared),
             };
 
             let client = WebClient::new(transport);
@@ -891,7 +898,7 @@ mod tests {
 
             // Exactly one frame should have been sent before the driver
             // started waiting for the (never-arriving) ConnectionConfirm.
-            let sent = shared.borrow().sent.clone();
+            let sent = shared.lock().unwrap().sent.clone();
             assert_eq!(sent.len(), 1, "expected one send before EOF, got {sent:?}");
             let cr = &sent[0];
             // TPKT version byte = 3, reserved = 0 (MS-RDPBCGR / RFC 1006).
@@ -940,13 +947,13 @@ mod tests {
             let mut cursor = WriteCursor::new(&mut buf[4..]);
             cc.encode(&mut cursor).unwrap();
 
-            let shared = Rc::new(RefCell::new(CaptureShared {
+            let shared = Arc::new(Mutex::new(CaptureShared {
                 sent: Vec::new(),
                 recv: VecDeque::from([Ok(buf)]),
                 closed: false,
             }));
             let transport = CaptureTransport {
-                shared: Rc::clone(&shared),
+                shared: Arc::clone(&shared),
             };
 
             let mut config = Config::builder("alice", "p4ss")
@@ -961,7 +968,7 @@ mod tests {
                 "expected TlsRequired, got {err:?}"
             );
             // The driver still emitted the X.224 CR before bailing.
-            assert_eq!(shared.borrow().sent.len(), 1);
+            assert_eq!(shared.lock().unwrap().sent.len(), 1);
         });
     }
 
@@ -991,13 +998,13 @@ mod tests {
             let mut cursor = WriteCursor::new(&mut buf[4..]);
             cc.encode(&mut cursor).unwrap();
 
-            let shared = Rc::new(RefCell::new(CaptureShared {
+            let shared = Arc::new(Mutex::new(CaptureShared {
                 sent: Vec::new(),
                 recv: VecDeque::from([Ok(buf)]),
                 closed: false,
             }));
             let transport = CaptureTransport {
-                shared: Rc::clone(&shared),
+                shared: Arc::clone(&shared),
             };
 
             let mut config = Config::builder("alice", "p4ss")
@@ -1011,7 +1018,7 @@ mod tests {
             // X.224 CR, then advanced through the upgrade, then sent
             // the MCS Connect Initial. So `sent` should now contain
             // *two* frames before the recv EOF stalled the loop.
-            let sent_count = shared.borrow().sent.len();
+            let sent_count = shared.lock().unwrap().sent.len();
             assert!(
                 sent_count >= 2,
                 "expected at least 2 sends past the upgrade, got {sent_count} (err={err:?})"
@@ -1112,13 +1119,13 @@ mod tests {
             let mut cursor = WriteCursor::new(&mut buf[4..]);
             cc.encode(&mut cursor).unwrap();
 
-            let shared = Rc::new(RefCell::new(CaptureShared {
+            let shared = Arc::new(Mutex::new(CaptureShared {
                 sent: Vec::new(),
                 recv: VecDeque::from([Ok(buf)]),
                 closed: false,
             }));
             let transport = CaptureTransport {
-                shared: Rc::clone(&shared),
+                shared: Arc::clone(&shared),
             };
 
             let mut config = Config::builder("alice", "p4ss")
@@ -1204,13 +1211,13 @@ mod tests {
             let mut cursor = WriteCursor::new(&mut buf[4..]);
             cc.encode(&mut cursor).unwrap();
 
-            let shared = Rc::new(RefCell::new(CaptureShared {
+            let shared = Arc::new(Mutex::new(CaptureShared {
                 sent: Vec::new(),
                 recv: VecDeque::from([Ok(buf)]),
                 closed: false,
             }));
             let transport = CaptureTransport {
-                shared: Rc::clone(&shared),
+                shared: Arc::clone(&shared),
             };
 
             let mut config = Config::builder("alice", "p4ss")
@@ -1237,7 +1244,7 @@ mod tests {
             // The exact count past 2 depends on how many send states
             // the connector traverses before next_pdu_hint returns
             // Some — pinning the lower bound is enough.
-            assert!(shared.borrow().sent.len() >= 2);
+            assert!(shared.lock().unwrap().sent.len() >= 2);
         });
     }
 
@@ -1264,13 +1271,13 @@ mod tests {
             let mut cursor = WriteCursor::new(&mut buf[4..]);
             cc.encode(&mut cursor).unwrap();
 
-            let shared = Rc::new(RefCell::new(CaptureShared {
+            let shared = Arc::new(Mutex::new(CaptureShared {
                 sent: Vec::new(),
                 recv: VecDeque::from([Ok(buf)]),
                 closed: false,
             }));
             let transport = CaptureTransport {
-                shared: Rc::clone(&shared),
+                shared: Arc::clone(&shared),
             };
 
             let mut config = Config::builder("alice", "p4ss")

@@ -41,12 +41,13 @@ native-tls-os = ["native-tcp", "dep:tokio-native-tls"]
 # the per-session CredSSP random.
 native-nla = ["native-tls", "dep:getrandom"]
 # Exposes the MS-TSGU (Remote Desktop Gateway) async transport family
-# — `gateway::GatewayConfig`, `WebClient::connect_via_gateway*`. Implies
-# `native-tcp` because the gateway tunnels through `NativeTcpTransport`
-# under any user-supplied `TlsUpgrade` (rustls or OS native-tls). The
-# gateway crate is consumed in `alloc`-only mode (no std I/O); all
-# runtime plumbing lives here. Roadmap §5.6.3 (Phase 3).
-gateway = ["native-tcp", "dep:justrdp-gateway", "dep:getrandom"]
+# — `gateway::GatewayConfig`, `WebClient::connect_via_gateway*`,
+# `WebTransportTlsUpgrade` (nested rustls over a generic
+# `WebTransport`). Implies `native-tls` because the inner-TLS
+# upgrader is built on `tokio-rustls`, which the same feature pulls
+# in. The gateway crate is consumed in `alloc`-only mode (no std I/O);
+# all runtime plumbing lives here. Roadmap §5.6.3 (Phase 3).
+gateway = ["native-tls", "dep:justrdp-gateway", "dep:getrandom"]
 # TLS backend selection — `rustls` is the workspace default for
 # justrdp-blocking, so callers who want `native-tls` should set
 # `default-features = false` on `justrdp-blocking` at the workspace
