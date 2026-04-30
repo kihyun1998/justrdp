@@ -1168,6 +1168,7 @@ dependencies = [
  "justrdp-blocking",
  "justrdp-connector",
  "justrdp-core",
+ "justrdp-gateway",
  "justrdp-input",
  "justrdp-pdu",
  "justrdp-tls",

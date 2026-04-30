@@ -54,6 +54,9 @@ mod native_tls_os;
 #[cfg(feature = "native-nla")]
 mod native_nla;
 
+#[cfg(feature = "gateway")]
+pub mod gateway;
+
 pub use client::AsyncRdpClient;
 
 #[cfg(feature = "native-tcp")]

@@ -40,6 +40,13 @@ native-tls-os = ["native-tcp", "dep:tokio-native-tls"]
 # pulls the server SPKI from the post-TLS transport. `getrandom` fills
 # the per-session CredSSP random.
 native-nla = ["native-tls", "dep:getrandom"]
+# Exposes the MS-TSGU (Remote Desktop Gateway) async transport family
+# — `gateway::GatewayConfig`, `WebClient::connect_via_gateway*`. Implies
+# `native-tcp` because the gateway tunnels through `NativeTcpTransport`
+# under any user-supplied `TlsUpgrade` (rustls or OS native-tls). The
+# gateway crate is consumed in `alloc`-only mode (no std I/O); all
+# runtime plumbing lives here. Roadmap §5.6.3 (Phase 3).
+gateway = ["native-tcp", "dep:justrdp-gateway", "dep:getrandom"]
 # TLS backend selection — `rustls` is the workspace default for
 # justrdp-blocking, so callers who want `native-tls` should set
 # `default-features = false` on `justrdp-blocking` at the workspace
@@ -61,7 +68,7 @@ justrdp-pdu.workspace = true
 # not compile this crate, so a `cfg(not(target_arch="wasm32"))`
 # guard isn't necessary here.
 justrdp-async = { workspace = true, optional = true }
-tokio = { version = "1", features = ["rt", "sync", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "net", "io-util", "time"] }
 tracing = { version = "0.1", optional = true }
 # Async TLS handshake driver. Pulls in `rustls 0.23` matching the
 # version `justrdp-tls` already uses. Optional and behind `native-tls`.
@@ -77,8 +84,13 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
 # DER, so both backends share it.
 tokio-native-tls = { version = "0.3", optional = true }
 # `CredsspRandom` for the NLA driver. Native-only path so no `js`
-# feature needed.
+# feature needed. Also used by the `gateway` feature for NTLMSSP
+# nonces and RDG connection-id GUIDs.
 getrandom = { version = "0.2", optional = true }
+# MS-TSGU PDU / state-machine pieces. The crate's default features
+# are `alloc`-only, which is exactly what the async side wants — no
+# std I/O bleeds in (that lives in `justrdp-blocking`'s `gateway.rs`).
+justrdp-gateway = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }

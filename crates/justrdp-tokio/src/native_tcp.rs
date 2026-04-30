@@ -39,6 +39,7 @@ const DEFAULT_RECV_BUF_BYTES: usize = 16 * 1024;
 /// [`justrdp_async::WebClient::connect`] /
 /// [`justrdp_async::WebClient::connect_with_upgrade`] /etc. — the
 /// trait is the integration point, not this struct.
+#[derive(Debug)]
 pub struct NativeTcpTransport {
     stream: TcpStream,
     /// Reusable read buffer. `tokio::AsyncReadExt::read` fills as
