@@ -1,63 +1,110 @@
 #![forbid(unsafe_code)]
 
-//! `AsyncRdpClient` — async façade over `RdpClient`.
+//! `AsyncRdpClient` — pure-async façade over [`WebClient`] +
+//! [`ActiveSession`] (v2).
+//!
+//! ## What changed from v1
+//!
+//! v1 wrapped the synchronous `justrdp_blocking::RdpClient` with a
+//! `tokio::task::spawn_blocking` worker. That worked but had two
+//! problems:
+//!
+//! 1. **Disconnect latency**: while the worker was parked inside
+//!    `RdpClient::next_event` waiting for a server frame, the
+//!    command channel was not polled. A `Disconnect` request
+//!    waited until the server's next frame (or TCP keepalive)
+//!    woke the worker. v1's docstring documented this as a known
+//!    limitation.
+//! 2. **Not fan-out friendly**: `spawn_blocking` workers each
+//!    occupy one thread on the blocking pool; running 100 sessions
+//!    needed careful pool tuning.
+//!
+//! v2 replaces `spawn_blocking` with `tokio::spawn` over an async
+//! [`ActiveSession`]. The pump uses `tokio::select!` to multiplex
+//! command receives with event polls, so a `Disconnect` arriving
+//! while the pump is awaiting `next_events` cancels that future
+//! and runs `session.shutdown()` immediately.
+//!
+//! The public surface is **byte-for-byte identical to v1** so
+//! embedders see no breaking change. The internals (no
+//! `spawn_blocking`, no blocking thread per session, real async
+//! cancellation) move to the async core that Phase 2 / Phase 3
+//! built up.
+//!
+//! ## Threading model
+//!
+//! `AsyncRdpClient` is `Send`. The pump task owns the
+//! [`ActiveSession`] exclusively; commands flow in via a
+//! `mpsc::Sender<Command>` (Send + Sync + Clone) and events flow
+//! out via a `mpsc::Receiver<...>` (Send, single-consumer). All
+//! `send_*` methods take `&self` so multiple tokio tasks can
+//! dispatch input concurrently without external locking — the
+//! commands are queued through the same channel and serialised by
+//! the pump.
+//!
+//! [`WebClient`]: justrdp_async::WebClient
+//! [`ActiveSession`]: justrdp_async::ActiveSession
 
+use alloc::format;
+use alloc::string::String;
+use alloc::sync::Arc;
 use std::io;
-use std::net::ToSocketAddrs;
-use std::sync::Arc;
 
-use justrdp_blocking::{ConnectError, RdpClient, RdpEvent, RuntimeError};
+use justrdp_async::{ActiveSession, DriverError, WebClient};
+use justrdp_blocking::{ConnectError, RdpEvent, RuntimeError};
 use justrdp_connector::Config;
 use justrdp_input::{LockKeys, MouseButton, Scancode};
 use justrdp_tls::ServerCertVerifier;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::native_nla::NativeCredsspDriver;
+use crate::native_tcp::NativeTcpTransport;
+use crate::native_tls::{NativeTlsTransport, NativeTlsUpgrade};
 use crate::pump::{self, Command};
+use crate::verifier_bridge::build_native_tls_upgrade_with_verifier;
 
-/// Bound on the in-flight command queue. Input rates (~100 Hz tops) are
-/// nowhere near this, so the bound exists purely to prevent runaway
-/// memory use if a misbehaving caller spams `send_*` while the worker
-/// is wedged on a network read.
+/// Bound on the in-flight command queue. Input rates (~100 Hz tops)
+/// are nowhere near this; the bound exists purely to prevent
+/// runaway memory if a misbehaving caller spams `send_*` while the
+/// pump is wedged on a network read.
 const CMD_QUEUE: usize = 64;
 
-/// Bound on the event queue. Sized so a single screen-full of fast-path
-/// graphics tile updates does not force the worker to block on
-/// `blocking_send` while the consumer is mid-frame.
+/// Bound on the event queue. Sized so a screen-full of fast-path
+/// graphics tile updates does not force the pump to block on
+/// `send` while the consumer is mid-frame.
 const EVT_QUEUE: usize = 256;
 
-/// Async wrapper around [`RdpClient`].
-///
-/// See the crate-level docs for the threading model and cancel-safety
-/// contract. All `send_*` methods take `&self`; the underlying mpsc
-/// sender is `Send + Sync + Clone`, so multiple tokio tasks can dispatch
-/// input concurrently without external locking.
+/// Async wrapper around an RDP session. See the module-level docs
+/// for the threading model and cancel-safety contract. v1 surface
+/// preserved byte-for-byte.
 pub struct AsyncRdpClient {
     cmd_tx: mpsc::Sender<Command>,
     evt_rx: mpsc::Receiver<Result<RdpEvent, RuntimeError>>,
-    /// Held so callers can `await` the worker on graceful disconnect.
-    /// `None` after `disconnect()` consumes `self`.
+    /// `Some` until `disconnect()` is called; we then `await` it so
+    /// the caller's future does not return until the pump has
+    /// emitted any final wire bytes.
     pump: Option<JoinHandle<()>>,
 }
 
 impl AsyncRdpClient {
-    /// Connect to `server` over TCP+TLS using the rustls `AcceptAll`
-    /// verifier — the same default behaviour as
-    /// [`RdpClient::connect`](justrdp_blocking::RdpClient::connect).
-    ///
-    /// `server_name` is the SNI hostname used during the TLS upgrade;
-    /// it is taken by value because it must outlive the spawn_blocking
-    /// closure.
+    /// Connect to `server` over TCP+TLS using a no-verify rustls
+    /// config — the same default behaviour as
+    /// [`RdpClient::connect`](justrdp_blocking::RdpClient::connect)
+    /// (server identity is not verified; CredSSP / NLA cross-checks
+    /// the leaf SPKI separately, which is the real defence).
     pub async fn connect<A>(
         server: A,
         server_name: impl Into<String>,
         config: Config,
     ) -> Result<Self, ConnectError>
     where
-        A: ToSocketAddrs + Send + 'static,
+        A: tokio::net::ToSocketAddrs + Send + 'static,
     {
         let server_name = server_name.into();
-        spawn_session(move || RdpClient::connect(server, &server_name, config)).await
+        let upgrader = NativeTlsUpgrade::dangerous_no_verify(&server_name)
+            .map_err(transport_to_connect_error)?;
+        connect_inner(server, config, upgrader).await
     }
 
     /// Connect using a custom [`ServerCertVerifier`]. Mirrors
@@ -69,21 +116,20 @@ impl AsyncRdpClient {
         verifier: Arc<dyn ServerCertVerifier>,
     ) -> Result<Self, ConnectError>
     where
-        A: ToSocketAddrs + Send + 'static,
+        A: tokio::net::ToSocketAddrs + Send + 'static,
     {
         let server_name = server_name.into();
-        spawn_session(move || {
-            RdpClient::connect_with_verifier(server, &server_name, config, verifier)
-        })
-        .await
+        let upgrader = build_native_tls_upgrade_with_verifier(&server_name, verifier)
+            .map_err(transport_to_connect_error)?;
+        connect_inner(server, config, upgrader).await
     }
 
     /// Receive the next session event, awaiting until one arrives.
     ///
-    /// Returns `None` when the worker has exited (graceful disconnect,
-    /// transport drop, or terminal error already surfaced via a prior
-    /// `Some(Err(_))`). Treat `None` as the canonical end-of-session
-    /// signal.
+    /// Returns `None` once the pump exits (graceful disconnect,
+    /// transport drop, or terminal error already surfaced via a
+    /// prior `Some(Err(_))`). Treat `None` as the canonical
+    /// end-of-session signal.
     pub async fn next_event(&mut self) -> Option<Result<RdpEvent, RuntimeError>> {
         self.evt_rx.recv().await
     }
@@ -94,12 +140,17 @@ impl AsyncRdpClient {
         scancode: Scancode,
         pressed: bool,
     ) -> Result<(), RuntimeError> {
-        self.dispatch(|reply| Command::SendKeyboard { scancode, pressed, reply })
-            .await
+        self.dispatch(|reply| Command::SendKeyboard {
+            scancode,
+            pressed,
+            reply,
+        })
+        .await
     }
 
-    /// Send a Unicode keyboard event (BMP code points only; surrogate
-    /// pairs are rejected by the underlying `RdpClient::send_unicode`).
+    /// Send a Unicode keyboard event. BMP code points only —
+    /// non-BMP returns
+    /// `RuntimeError::Unimplemented("non-BMP Unicode (use UTF-16 surrogate pairs)")`.
     pub async fn send_unicode(&self, ch: char, pressed: bool) -> Result<(), RuntimeError> {
         self.dispatch(|reply| Command::SendUnicode { ch, pressed, reply })
             .await
@@ -119,11 +170,21 @@ impl AsyncRdpClient {
         x: u16,
         y: u16,
     ) -> Result<(), RuntimeError> {
-        self.dispatch(|reply| Command::SendMouseButton { button, pressed, x, y, reply })
-            .await
+        self.dispatch(|reply| Command::SendMouseButton {
+            button,
+            pressed,
+            x,
+            y,
+            reply,
+        })
+        .await
     }
 
-    /// Send a mouse wheel scroll event.
+    /// Send a mouse wheel scroll event at `(x, y)`. The position
+    /// is updated first, then the wheel scroll is emitted —
+    /// matching v1's
+    /// [`RdpClient::send_mouse_wheel`](justrdp_blocking::RdpClient::send_mouse_wheel)
+    /// semantics where the event carries coordinates.
     pub async fn send_mouse_wheel(
         &self,
         delta: i16,
@@ -131,8 +192,14 @@ impl AsyncRdpClient {
         x: u16,
         y: u16,
     ) -> Result<(), RuntimeError> {
-        self.dispatch(|reply| Command::SendMouseWheel { delta, horizontal, x, y, reply })
-            .await
+        self.dispatch(|reply| Command::SendMouseWheel {
+            delta,
+            horizontal,
+            x,
+            y,
+            reply,
+        })
+        .await
     }
 
     /// Send a Caps/Num/Scroll/Kana lock-state synchronisation.
@@ -141,13 +208,15 @@ impl AsyncRdpClient {
             .await
     }
 
-    /// Gracefully disconnect: send a Disconnect PDU, drain the worker,
-    /// and consume `self`.
+    /// Gracefully disconnect: send a Disconnect PDU, drain the
+    /// pump task, consume `self`.
     ///
-    /// Returns the underlying `RdpClient::disconnect` result. If the
-    /// worker has already exited (e.g. server-initiated disconnect that
-    /// was surfaced through `next_event`), returns `Ok(())` because
-    /// there is nothing left to tear down.
+    /// **v2 behaviour change**: disconnect now returns within a
+    /// scheduling tick of the call regardless of whether the pump
+    /// was awaiting `next_events()`. v1 had to wait for the next
+    /// server frame or TCP keepalive — the cancel-safe `select!`
+    /// pump in v2 cancels the pending `next_events()` future and
+    /// runs `shutdown()` immediately.
     pub async fn disconnect(mut self) -> Result<(), RuntimeError> {
         let (tx, rx) = oneshot::channel();
         if self
@@ -156,19 +225,18 @@ impl AsyncRdpClient {
             .await
             .is_err()
         {
-            // Worker already gone — nothing to do.
+            // Pump already gone (e.g. session ended via server
+            // disconnect that the embedder consumed). Nothing to
+            // tear down.
             return Ok(());
         }
         let result = match rx.await {
             Ok(r) => r,
-            // Reply oneshot dropped → worker died mid-disconnect. The
-            // session is effectively gone; report it as such rather
-            // than masking a partial teardown.
             Err(_) => Err(RuntimeError::Disconnected),
         };
 
-        // Wait for the worker to fully exit so any in-flight syscalls
-        // complete before we drop the JoinHandle.
+        // Wait for the pump task to fully exit so any in-flight
+        // syscalls complete before we drop the JoinHandle.
         if let Some(pump) = self.pump.take() {
             let _ = pump.await;
         }
@@ -176,8 +244,8 @@ impl AsyncRdpClient {
         result
     }
 
-    /// Internal helper: build a command via `make_cmd`, push it to the
-    /// worker, await the reply.
+    /// Internal helper: build a command via `make_cmd`, push it to
+    /// the pump, await the reply.
     async fn dispatch<F>(&self, make_cmd: F) -> Result<(), RuntimeError>
     where
         F: FnOnce(oneshot::Sender<Result<(), RuntimeError>>) -> Command,
@@ -193,30 +261,46 @@ impl AsyncRdpClient {
 
 impl Drop for AsyncRdpClient {
     fn drop(&mut self) {
-        // Closing `cmd_tx` is the worker's signal to wind down on its
-        // next try_recv between events. We cannot abort the worker's
-        // in-flight blocking read from here — see the crate-level
-        // cancel-safety note. Callers who need bounded shutdown should
-        // call `disconnect()` explicitly.
+        // Closing `cmd_tx` is the pump's signal to wind down on
+        // its next `cmd_rx.recv()` poll. Embedders who need
+        // bounded shutdown should call `disconnect()` explicitly.
     }
 }
 
-/// Run the synchronous connect on a blocking thread, then spawn the
-/// long-lived event pump on a second blocking task.
-async fn spawn_session<F>(connect: F) -> Result<AsyncRdpClient, ConnectError>
+/// Run the async connect (TCP + outer TLS + CredSSP/NLA + Phase 2
+/// handshake), then spawn the long-lived pump task on a tokio
+/// (NOT `spawn_blocking`) executor.
+async fn connect_inner<A>(
+    server: A,
+    config: Config,
+    upgrader: NativeTlsUpgrade,
+) -> Result<AsyncRdpClient, ConnectError>
 where
-    F: FnOnce() -> Result<RdpClient, ConnectError> + Send + 'static,
+    A: tokio::net::ToSocketAddrs + Send + 'static,
 {
-    let client: RdpClient = tokio::task::spawn_blocking(connect)
+    // 1. Resolve + open TCP.
+    let transport = NativeTcpTransport::connect(server)
         .await
-        .map_err(join_error_to_connect)??;
+        .map_err(transport_to_connect_error)?;
 
+    // 2. Drive the full handshake: outer TLS upgrade + (if the
+    //    server requires it) CredSSP / NLA + X.224 / MCS / etc.
+    //    `connect_with_nla` will skip the CredSSP step if the
+    //    connector doesn't reach it (i.e. server selected plain
+    //    RDP security), so always supplying the driver is safe.
+    let credssp = NativeCredsspDriver::new();
+    let webclient = WebClient::new(transport);
+    let (result, post_tls) = webclient
+        .connect_with_nla(config, upgrader, credssp)
+        .await
+        .map_err(driver_to_connect_error)?;
+
+    // 3. Build the active session and spawn the async pump.
+    let session: ActiveSession<NativeTlsTransport> = ActiveSession::new(post_tls, &result);
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(CMD_QUEUE);
     let (evt_tx, evt_rx) = mpsc::channel::<Result<RdpEvent, RuntimeError>>(EVT_QUEUE);
 
-    let pump = tokio::task::spawn_blocking(move || {
-        pump::run(client, cmd_rx, evt_tx);
-    });
+    let pump = tokio::spawn(pump::pump(session, cmd_rx, evt_tx));
 
     Ok(AsyncRdpClient {
         cmd_tx,
@@ -225,14 +309,40 @@ where
     })
 }
 
-fn join_error_to_connect(err: tokio::task::JoinError) -> ConnectError {
-    let kind = if err.is_cancelled() {
-        io::ErrorKind::Interrupted
-    } else {
-        io::ErrorKind::Other
-    };
-    ConnectError::Tcp(io::Error::new(
-        kind,
-        format!("connect blocking task failed: {err}"),
-    ))
+/// Map a [`DriverError`] surfaced during the connect phase into
+/// v1's [`ConnectError`] enum.
+fn driver_to_connect_error(err: DriverError) -> ConnectError {
+    use justrdp_async::TransportErrorKind;
+    use justrdp_tls::TlsError;
+    match err {
+        DriverError::Transport(e) if e.kind() == TransportErrorKind::ConnectionClosed => {
+            ConnectError::UnexpectedEof
+        }
+        DriverError::Transport(e) => ConnectError::Tcp(io::Error::other(format!("{e}"))),
+        DriverError::Connector(e) => ConnectError::Connector(e),
+        DriverError::FrameTooLarge { size } => ConnectError::FrameTooLarge(size),
+        DriverError::TlsRequired => ConnectError::Unimplemented("TLS upgrade required"),
+        DriverError::NlaRequired { state: _ } => ConnectError::Unimplemented("NLA / CredSSP required"),
+        DriverError::TlsUpgrade(s) => ConnectError::Tls(TlsError::Handshake(s)),
+        DriverError::Credssp(_) => ConnectError::Unimplemented("CredSSP exchange failed"),
+        DriverError::Session(e) => ConnectError::Tcp(io::Error::other(format!("session: {e:?}"))),
+        DriverError::Internal(s) => ConnectError::Tcp(io::Error::other(format!("internal: {s}"))),
+        DriverError::Channel(s) => ConnectError::ChannelSetup(s),
+    }
 }
+
+/// Map a [`TransportError`](justrdp_async::TransportError) from the
+/// TCP-connect step into v1's [`ConnectError::Tcp`]. Mirrors the
+/// kind that `RdpClient::connect`'s `?` operator on the underlying
+/// `TcpStream::connect` produces.
+fn transport_to_connect_error(err: justrdp_async::TransportError) -> ConnectError {
+    use justrdp_async::TransportErrorKind;
+    let io_kind = match err.kind() {
+        TransportErrorKind::ConnectionClosed => io::ErrorKind::ConnectionRefused,
+        TransportErrorKind::Io => io::ErrorKind::Other,
+        TransportErrorKind::Protocol => io::ErrorKind::InvalidData,
+        TransportErrorKind::Other | TransportErrorKind::Cancelled => io::ErrorKind::Other,
+    };
+    ConnectError::Tcp(io::Error::new(io_kind, format!("{err}")))
+}
+

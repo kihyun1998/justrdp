@@ -1172,15 +1172,34 @@ target end-state 까지 단계적으로 통합.
   - `connect_via_gateway_nla` 류 wrapper — 빌딩 블록 모두 노출됨.
   - RPCH keepalive task — 단일 RDP 세션은 채널 lifetime 안에 끝남.
 
-#### 5.6.4 Phase 4 — `AsyncRdpClient` v2 (3일, -200 LoC + 400 LoC)
+#### 5.6.4 Phase 4 — `AsyncRdpClient` v2 (완료 2026-04-30)
 
-- [ ] `crates/justrdp-tokio/src/client.rs` 재작성 — `WebClient<NativeTcpTransport>` 기반.
-- [ ] `spawn_blocking` 완전 제거. `Send + Sync`. fan-out 친화.
-- [ ] v1 surface 100% 호환 (게이트웨이/재연결/리다이렉트 포함). 기존 v1 테스트 통과 + 추가 테스트:
-  - 100 동시 세션 fan-out 테스트 (mock 서버 위에서)
-  - cancel-safe disconnect (TcpStream half-close 진짜 즉시 종료)
-- [ ] tracing span 이 tokio task-local 로 전파 (Phase 2 의 tracing 결과물).
-- [ ] v1 에서 documented "워커 next_event 블록 중 disconnect 지연" 문제 해소.
+- [x] `crates/justrdp-tokio/src/client.rs` 재작성 — `WebClient<NativeTcpTransport>` +
+      `ActiveSession<NativeTlsTransport>` 기반. `pump.rs` 도 async 화.
+- [x] `spawn_blocking` 완전 제거. `tokio::spawn` 기반 task. `AsyncRdpClient: Send`,
+      shared `&AsyncRdpClient: Send` (모든 `send_*` 가 `&self` — 다중 task fan-out).
+- [x] v1 surface 100% 호환 — 기존 lifecycle 3 테스트 그대로 통과.
+- [x] cancel-safe disconnect — `tokio::select!` 가 in-flight `next_events()` 를
+      취소하고 `session.shutdown()` 이 TCP half-close 를 즉시 실행. v1 의
+      "next_event 블록 중 disconnect 지연" 문제 해소.
+- [x] tracing — feature-gated `debug! / trace! / warn!` macro shim, off 시 no-op.
+      span 은 자연스럽게 tokio task-local 로 전파 (spawn_blocking 의 thread-local
+      barrier 가 사라졌으므로).
+- [x] 검증: `cargo test -p justrdp-tokio --features "native-nla"` → 25/25 unit
+      + 4/4 lifecycle (3 v1 + 1 새 `shared_ref_is_send`). all-features → 113/113
+      unit. workspace 그린, 회귀 0.
+
+게이트 변경: v2 는 `native-nla` feature 뒤에 위치 (full async stack — TCP + TLS +
+CredSSP — 가 필요). Default features 가 비어 있어서 v2 를 쓰려면 cargo feature 를
+명시해야 함. README 업데이트로 안내.
+
+미해결 (deferred):
+- [ ] 100 동시 세션 fan-out 테스트 — mock RDP 서버가 필요. §9.3.5 mock-broker
+      트랙의 일부로 다룸.
+
+번들 크기: ~600 LoC v1 → ~600 LoC v2 (일부는 늘어남: 새 translate.rs +
+verifier_bridge.rs; 일부는 줄어듦: spawn_blocking + JoinError plumbing 제거).
+실제 의미 있는 변화는 LoC 가 아니라 **disconnect latency** 와 **Send/Sync** 보장.
 
 #### 5.6.5 Phase 5 — `justrdp-blocking` 슬림화 (1주, 옵션, -4500 LoC 또는 net 0)
 

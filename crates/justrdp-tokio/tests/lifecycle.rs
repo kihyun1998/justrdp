@@ -1,17 +1,22 @@
-//! Lifecycle tests for `AsyncRdpClient`.
+//! Lifecycle tests for `AsyncRdpClient` v2.
 //!
 //! These tests do not require a live RDP server. They cover:
 //! 1. The connect path correctly maps a refused TCP connection to
-//!    `ConnectError::Tcp` (the spawn_blocking task returns the error
-//!    rather than panicking).
+//!    `ConnectError::Tcp` (no panic, no JoinError-derived noise).
 //! 2. Type-level requirements: `AsyncRdpClient: Send` and the wrapper
 //!    re-exports compile against an outside consumer.
 //!
+//! Gated on `native-nla` because v2's full async stack (TCP + TLS +
+//! CredSSP) lives behind that feature. Builds without `native-nla`
+//! skip these tests.
+//!
 //! End-to-end tests that drive a complete handshake are deferred to
 //! `justrdp-blocking`'s mock-broker test (§9.3.5 in roadmap.md), which
-//! exercises the underlying `RdpClient` directly. Re-running the same
+//! exercises the underlying handshake directly. Re-running the same
 //! scenario through the tokio wrapper would only re-test channel
 //! plumbing that is already covered here.
+
+#![cfg(feature = "native-nla")]
 
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
@@ -61,6 +66,22 @@ async fn connect_to_closed_port_returns_tcp_error() {
 fn async_rdp_client_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<AsyncRdpClient>();
+}
+
+/// `&AsyncRdpClient` (shared reference) MUST be `Send` so embedders
+/// can `Arc::new(client)` and dispatch `send_*` concurrently from
+/// multiple tokio tasks. v2 makes this explicit by having all
+/// `send_*` methods take `&self`; the underlying `mpsc::Sender` is
+/// `Send + Sync + Clone` so the pump serialises commands without
+/// needing external locking. Compile-time check.
+#[test]
+fn shared_ref_is_send() {
+    fn assert_ref_send<T: ?Sized>()
+    where
+        for<'a> &'a T: Send,
+    {
+    }
+    assert_ref_send::<AsyncRdpClient>();
 }
 
 /// The wrapper accepts a closed TCP connection (handshake fails inside

@@ -108,6 +108,11 @@ justrdp-rpch = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }
+# Used by translate.rs unit tests to construct
+# `GracefulDisconnectReason` values (a transitive type that the
+# main code path only forwards, so the runtime crate doesn't pull
+# it in).
+justrdp-session = { workspace = true, features = ["alloc"] }
 # `native_render_demo` only — dumps the framebuffer to PNG.
 png = "0.17"
 # `native_window_demo` only — winit drives the OS window and event
