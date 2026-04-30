@@ -3791,66 +3791,276 @@ let server = RdpServer::new(config, MyDisplay::new(), MyInput);
 server.listen("0.0.0.0:3389").await?;
 ```
 
-### 13.4 Tauri / Native Embedder API (`justrdp-tauri` + `justrdp-tokio`)
+### 13.4 Tauri / Native Embedder API (`justrdp-tokio` v2)
 
-> **주의**: 미구현 — §5.6 `justrdp-async` / `justrdp-tokio` 와
-> §11.3 S7 `NativeTcpTransport`, §11.5a `justrdp-tauri` 가 모두
-> 들어와야 사용 가능. 아래는 도착 후 보장하는 API 모양.
+> **상태**: §5.6 Phase 1-4 가 들어왔으므로 사용 가능. 아래 코드 샘플은
+> 현재 출하 surface (v2 `AsyncRdpClient`, `WebClient`, `ActiveSession`,
+> `Reconnectable`, `apply_redirect`) 를 그대로 호출.
+
+본 절은 "Tauri 같은 native UI runtime 에서 RDP 세션을 어떻게 묶는가"
+의 표준 패턴을 보여줍니다. **단일 윈도우 단일 모니터 minimal viable
+embed** 로 시작해서, 멀티탭 (MSTSC 스타일) → redirect loop → reconnect
+loop 까지 확장합니다.
+
+#### 13.4.1 단일 세션 — minimal viable embed
 
 ```rust
-// Tauri command — frontend 가 invoke("connect", ...) 로 호출
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tauri::Manager;
+
+use justrdp_tokio::{AsyncRdpClient, Config, RdpEvent};
+
+/// Tauri-side session handle. frontend 는 이 ID 만 들고 다님.
+#[derive(serde::Serialize, Clone)]
+pub struct SessionId(pub u64);
+
+/// 앱이 들고 다니는 active 세션 맵.
+#[derive(Default)]
+pub struct AppState {
+    sessions: Mutex<std::collections::HashMap<u64, Arc<AsyncRdpClient>>>,
+    next_id: Mutex<u64>,
+}
+
 #[tauri::command]
-async fn connect(
+async fn rdp_connect(
     window: tauri::Window,
+    state: tauri::State<'_, Arc<AppState>>,
     host: String, port: u16,
     user: String, pass: String, domain: Option<String>,
-) -> Result<SessionHandle, String> {
-    let config = Config::builder()
-        .server((host, port))
-        .credentials(Credentials::password(&user, &pass, domain.as_deref()))
-        .build()
-        .map_err(|e| e.to_string())?;
+) -> Result<SessionId, String> {
+    // 1. Build connector config.
+    let mut config = Config::builder(&user, &pass).build();
+    if let Some(d) = domain { config = config_with_domain(config, d); }
+    // (Config builder 의 정확한 API 는 justrdp-connector::Config 참조)
 
-    // tokio 기반 비동기 클라이언트
-    let mut client = AsyncRdpClient::connect(config).await?;
+    // 2. Connect — TLS + CredSSP + handshake.
+    let mut client = AsyncRdpClient::connect(
+        format!("{host}:{port}"),
+        host.clone(),
+        config,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
-    // 백그라운드 펌프: frame/clipboard/audio event 를 webview 로 push
+    // 3. Allocate session id, store handle, spawn pump.
+    let id = {
+        let mut n = state.next_id.lock().await;
+        *n += 1;
+        *n
+    };
+    let arc_client = Arc::new(client);
+    state.sessions.lock().await.insert(id, arc_client.clone());
+
+    // 4. Background pump: forward events to webview.
+    //    `next_event` is `&mut self`, so we keep a single pump per
+    //    session and dispatch input via the `&self` send_* methods.
+    //    Take ownership of the pump's `next_event` half by removing
+    //    from the map briefly — or split via interior mutability.
     let win = window.clone();
+    let pump_state = state.inner().clone();
     tokio::spawn(async move {
-        while let Some(event) = client.next_event().await {
+        let mut owned = match Arc::try_unwrap(arc_client) {
+            Ok(c) => c,
+            Err(_) => return, // shouldn't happen — we just inserted
+        };
+        while let Some(event) = owned.next_event().await {
             match event {
-                RdpEvent::GraphicsUpdate { region, bitmap } => {
-                    win.emit("rdp:frame", FramePayload { region, bitmap }).ok();
+                Ok(RdpEvent::GraphicsUpdate { update_code, data }) => {
+                    win.emit("rdp:frame", (id, update_code as u8, data)).ok();
                 }
-                RdpEvent::ClipboardData { format, data } => {
-                    win.emit("rdp:clipboard", (format, data)).ok();
+                Ok(RdpEvent::PointerPosition { x, y }) => {
+                    win.emit("rdp:cursor", (id, x, y)).ok();
                 }
-                RdpEvent::AudioFrame(f) => { win.emit("rdp:audio", f).ok(); }
-                RdpEvent::Disconnected(r) => {
-                    win.emit("rdp:disconnected", r.to_string()).ok();
+                Ok(RdpEvent::Disconnected(reason)) => {
+                    win.emit("rdp:disconnected", (id, format!("{reason:?}"))).ok();
                     break;
                 }
-                _ => {}
+                Ok(_) => { /* ignore other events for now */ }
+                Err(e) => {
+                    win.emit("rdp:error", (id, e.to_string())).ok();
+                    break;
+                }
             }
         }
+        // Cleanup: drop the session from the map.
+        pump_state.sessions.lock().await.remove(&id);
     });
 
-    Ok(SessionHandle::register(client))
+    Ok(SessionId(id))
+}
+
+#[tauri::command]
+async fn rdp_send_mouse_move(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: u64, x: u16, y: u16,
+) -> Result<(), String> {
+    let map = state.sessions.lock().await;
+    let client = map.get(&id).ok_or("unknown session")?;
+    client.send_mouse_move(x, y).await.map_err(|e| e.to_string())
 }
 ```
 
-**보장 사항** (구현 시 만족해야 하는 API 계약):
-- `AsyncRdpClient::connect` 는 `spawn_blocking` 위에서 connector
-  step 을 실행하므로 tokio runtime 을 막지 않음
-- `next_event()` 는 cancel-safe — `select!` 안에서 drop 해도 다음 호출
-  시 손실 없이 이어짐
-- `disconnect()` 는 pending TLS write 를 graceful 하게 종료, OS thread
-  join timeout 5s
-- frame `bitmap` 은 RGBA top-down 정규화된 `Vec<u8>` (§11.3 `FrameSink`
-  계약과 동일) — Tauri webview canvas 가 그대로 put_image_data 가능
-- 클립보드/오디오 backend 는 §11.3 S7 의 `BackendDriver` trait 으로
-  주입, native 환경에서는 `justrdp-cliprdr-native` /
-  `justrdp-rdpsnd-native` 가 default
+> **위 코드의 `Arc::try_unwrap` 부분은 v2 의 분리 패턴**: `next_event`
+> 는 `&mut self` 라서 단일 owner 가 필요하지만, `send_*` 는 `&self`
+> 로 충분합니다. 실무에서는 `Arc<AsyncRdpClient>` 를 그대로 두고
+> `next_event` 만 별도 task 가 owned 형태로 실행 — 위처럼 `try_unwrap`
+> 으로 ownership 을 옮기거나, 별도 `Mutex<Option<JoinHandle>>` 패턴
+> 사용. 자세한 패턴은 §13.4.2 참조.
+
+#### 13.4.2 멀티 세션 — MSTSC 스타일 탭
+
+```rust
+/// Per-session bundle: a sender handle (cloneable) + a pump task.
+pub struct SessionBundle {
+    /// Cloned by every Tauri command that wants to dispatch input.
+    pub sender: Arc<AsyncRdpClient>,
+    /// Aborted when the user closes the tab.
+    pub pump: tokio::task::JoinHandle<()>,
+}
+
+/// Tab 닫기 — 펌프 abort 후 disconnect 송신.
+async fn close_tab(state: &AppState, id: u64) -> Result<(), String> {
+    let bundle = state.sessions.lock().await.remove(&id);
+    if let Some(b) = bundle {
+        b.pump.abort();
+        // Try graceful disconnect — `Arc::try_unwrap` succeeds only
+        // if no other clones exist (i.e. all dispatching commands
+        // dropped). If it fails, the session lingers until reference
+        // count reaches zero.
+        if let Ok(client) = Arc::try_unwrap(b.sender) {
+            let _ = client.disconnect().await;
+        }
+    }
+    Ok(())
+}
+```
+
+**핵심 패턴**: 한 윈도우당 하나의 `AppState` (HashMap<id, SessionBundle>).
+탭마다 독립 세션. frontend 는 SessionId 만 들고 다니며 모든 command
+는 ID 로 dispatch.
+
+#### 13.4.3 표준 redirect loop — embedder 소유
+
+§5.6.2 Phase 2 가 라이브러리 자동화 대신 임베더 소유로 둔 첫 루프.
+**Reconnectable + apply_redirect + MAX_REDIRECTS** 를 어떻게 합치는지:
+
+```rust
+use justrdp_async::{
+    apply_redirect, redirect_target, MAX_REDIRECTS,
+    Reconnectable, ReconnectPolicy, TransportFactory, WebClient,
+};
+use justrdp_connector::Config;
+
+/// 매 attempt 마다 fresh outer-TLS upgrader 를 build 하는 factory.
+/// (TlsUpgrade 가 `self`-by-value 라서 재사용 불가 — Phase 2 의
+/// 문서화된 컨트랙트 회피.)
+async fn connect_with_redirect_loop(
+    initial_config: Config,
+    target_host: String,
+    target_port: u16,
+) -> Result<AsyncRdpClient, Box<dyn std::error::Error>> {
+    let mut config = initial_config;
+    let mut current_host = target_host;
+    let mut current_port = target_port;
+
+    for attempt in 0..MAX_REDIRECTS {
+        let client = AsyncRdpClient::connect(
+            format!("{current_host}:{current_port}"),
+            current_host.clone(),
+            config.clone(),
+        )
+        .await?;
+
+        // 핸드셰이크 결과의 server_redirection 검사 — v2 의
+        // AsyncRdpClient 는 이걸 직접 노출하지 않으므로, 대신
+        // 구체적으로는 connect 에서 redirect 가 발견되면
+        // ConnectError 로 surface 됨. 더 fine-grained 한 redirect
+        // 핸들링이 필요하면 WebClient 를 직접 써서 ConnectionResult
+        // 의 server_redirection 을 검사 (justrdp-async 직접 호출
+        // 패턴 — §13.4.4 참조).
+
+        return Ok(client);
+    }
+    Err("exceeded MAX_REDIRECTS".into())
+}
+```
+
+> **권고**: redirect 가 일반적인 환경 (broker / RDS farm) 에서는
+> `AsyncRdpClient` 대신 `WebClient<NativeTcpTransport>` 를 직접 써서
+> `ConnectionResult::server_redirection` 을 inspect 하세요. AsyncRdpClient
+> 는 단일 세션 단순 사용처에 최적화. WebClient 직접 사용 패턴은 §13.4.4.
+
+#### 13.4.4 표준 reconnect loop — embedder 소유
+
+§5.6.2 Phase 2 가 자동화 대신 임베더 소유로 둔 두 번째 루프. 핸드셰이크
+이후 (`ActiveSession` 단계) transport 가 끊어졌을 때:
+
+```rust
+use justrdp_async::{
+    ActiveSession, DriverError, ReconnectPolicy, TransportError,
+    Reconnectable,
+};
+use std::time::Duration;
+
+/// next_events 가 Transport 에러 반환 → policy.delay_for_attempt 만큼
+/// sleep → fresh tunnel 로 재핸드셰이크 → 새 ActiveSession.
+async fn run_with_auto_reconnect<MakeConnect, F>(
+    mut make_connect: MakeConnect,
+    policy: ReconnectPolicy,
+) where
+    MakeConnect: FnMut() -> F,
+    F: std::future::Future<Output = Result<AsyncRdpClient, Box<dyn std::error::Error>>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        let mut client = match make_connect().await {
+            Ok(c) => c,
+            Err(_) => {
+                let delay = policy.delay_for_attempt(attempt);
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+        };
+        attempt = 0; // reset on successful connect
+
+        // 정상 펌프
+        while let Some(event) = client.next_event().await {
+            match event {
+                Ok(_) => { /* dispatch */ }
+                Err(_) => break, // transport / session error → reconnect
+            }
+        }
+
+        // 연결 소실 — 재시도 with backoff
+        let delay = policy.delay_for_attempt(attempt);
+        attempt += 1;
+        tokio::time::sleep(delay).await;
+    }
+}
+```
+
+`ReconnectPolicy::aggressive()` 는 [200 ms, 500 ms, 1 s, 2 s, …] 의
+exponential backoff. `disabled()` 는 단발성. `delay_for_attempt(n)`
+는 capped 된 backoff 값을 돌려줍니다 (max 30 s 등).
+
+#### 13.4.5 보장 사항 — 현재 출하 surface 의 API 계약
+
+- `AsyncRdpClient::connect` 는 `tokio::spawn` 기반 (NOT
+  `spawn_blocking`). reactor thread 차단 없음.
+- `next_event()` 는 cancel-safe — `select!` 안에서 drop 해도 데이터
+  손실 없음 (Phase 2 cancel-safety 컨트랙트).
+- `disconnect()` 는 `tokio::select!` 가 in-flight `next_events` 를
+  취소하고 `session.shutdown()` 이 즉시 실행. v1 의 "next 프레임 또는
+  TCP keepalive 까지 대기" 문제 해소.
+- `send_*` 메서드는 모두 `&self` — `Arc<AsyncRdpClient>` 를 여러 task
+  가 공유 dispatch 가능.
+- frame `data: Vec<u8>` 은 fast-path graphics update 의 raw payload —
+  decode 는 embedder 가 `justrdp-graphics` / `justrdp-egfx` 로 처리.
+- 클립보드 / 오디오 등 SVC channel 은 `ActiveSession::with_processors`
+  로 구성 (현재 `AsyncRdpClient` 에는 채널 processor 주입 surface 가
+  없음 — §5.6.x 추가 항목).
 
 ---
 
