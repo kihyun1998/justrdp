@@ -39,7 +39,9 @@ mod config;
 pub(crate) mod error;
 pub(crate) mod http_auth;
 pub(crate) mod http_io;
+pub(crate) mod http_transport;
 pub(crate) mod outer_tls;
 pub(crate) mod random;
 
 pub use config::GatewayConfig;
+pub use http_transport::TsguHttpTransport;

@@ -13,7 +13,7 @@ use alloc::format;
 use alloc::string::String;
 
 use justrdp_async::TransportError;
-use justrdp_gateway::{ConnectError as GwConnectError, NtlmError};
+use justrdp_gateway::{GatewayError, NtlmError};
 
 // `dead_code` is silenced on the helpers below — they're scaffolding
 // the upcoming HTTP / WebSocket / RPCH adapters (G2-G9) will consume.
@@ -29,11 +29,14 @@ pub(crate) fn ntlm_err(e: NtlmError) -> TransportError {
     TransportError::protocol(format!("ntlm: {e:?}"))
 }
 
-/// Wrap a [`GwConnectError`] (MS-TSGU PDU encode/decode or state-machine
-/// rejection) into a transport-level `Protocol` error.
+/// Wrap a [`GatewayError`] (MS-TSGU state-machine PDU encode / decode
+/// or invalid-transition error) into a transport-level `Protocol`
+/// error. The state machine itself lives in `justrdp_gateway::client`
+/// and is reused verbatim from blocking; only the I/O around it is
+/// async.
 #[allow(dead_code)]
-pub(crate) fn gw_err(e: GwConnectError) -> TransportError {
-    TransportError::protocol(format!("gateway: {e}"))
+pub(crate) fn gw_err(e: GatewayError) -> TransportError {
+    TransportError::protocol(format!("gateway: {e:?}"))
 }
 
 /// Build a `Protocol`-class error for HTTP/1.1 surface failures
@@ -67,6 +70,6 @@ mod tests {
 
     #[test]
     fn gw_err_has_protocol_kind() {
-        let _f: fn(GwConnectError) -> TransportError = gw_err;
+        let _f: fn(GatewayError) -> TransportError = gw_err;
     }
 }
