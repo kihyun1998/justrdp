@@ -1172,6 +1172,7 @@ dependencies = [
  "justrdp-input",
  "justrdp-pdu",
  "justrdp-rpch",
+ "justrdp-session",
  "justrdp-svc",
  "justrdp-tls",
  "justrdp-web",
