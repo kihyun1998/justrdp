@@ -45,9 +45,12 @@ pub(crate) mod inner_tls;
 pub(crate) mod outer_tls;
 pub(crate) mod random;
 pub(crate) mod web_rw;
+pub(crate) mod ws_auth;
+pub(crate) mod ws_transport;
 
 pub use config::GatewayConfig;
 pub use connect::connect_via_gateway;
 pub use http_transport::TsguHttpTransport;
 pub use inner_tls::{WebTransportTlsTransport, WebTransportTlsUpgrade};
 pub use web_rw::WebTransportRw;
+pub use ws_transport::TsguWsTransport;
