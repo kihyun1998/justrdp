@@ -336,10 +336,16 @@ pub trait FilesystemSurface {
         range: LockRange,
     ) -> NativeFilesystemResult<()>;
 
-    /// Block until a change is detected in the directory referenced by
-    /// `handle`, returning the changed entry name (or `"."` when the
-    /// platform reports a directory-level event without naming the entry).
-    /// Implementations should apply a finite timeout and return `"."` when
-    /// the timeout elapses without a change.
-    fn watch(&self, handle: &Self::Handle) -> NativeFilesystemResult<String>;
+    /// Block until a change is detected in the directory at `path`,
+    /// returning the changed entry name (or `"."` when the platform reports
+    /// a directory-level event without naming the entry).  Implementations
+    /// should apply a finite timeout and return `"."` when the timeout
+    /// elapses without a change.
+    ///
+    /// Path-based (rather than handle-based) because all three current OS
+    /// APIs — `inotify_add_watch` (Linux), `kqueue` + `EVFILT_VNODE` (macOS),
+    /// and `FindFirstChangeNotificationW` (Windows) — accept a path.  The
+    /// wrapper performs the is-directory check on the open handle before
+    /// calling this method.
+    fn watch(&self, path: &Path) -> NativeFilesystemResult<String>;
 }

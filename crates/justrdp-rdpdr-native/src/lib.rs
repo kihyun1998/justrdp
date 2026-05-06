@@ -11,9 +11,11 @@ mod dir_info;
 mod fs_info;
 mod handle_map;
 mod path;
+mod std_fs;
 pub mod surface;
 mod volume_info;
 
+pub use std_fs::StdFilesystem;
 pub use surface::{
     DiskSpace, FileTimes, FilesystemSurface, LockMode, LockRange, NativeDirEntry,
     NativeFilesystemError, NativeFilesystemResult, NativeMetadata, OpenAccess, OpenDisposition,
@@ -708,7 +710,7 @@ fn encode_notify_info(filename: &str, action: u32) -> Vec<u8> {
 /// Block until a change is detected in the given directory.
 /// Returns the name of the first changed file/entry, or "." if unknown.
 #[cfg(target_os = "macos")]
-fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
+pub(crate) fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
     use std::os::unix::io::AsRawFd;
 
     let dir_file = fs::File::open(dir)?;
@@ -770,7 +772,7 @@ fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
+pub(crate) fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -864,7 +866,7 @@ fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
 }
 
 #[cfg(windows)]
-fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
+pub(crate) fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
     use std::os::windows::ffi::OsStrExt;
 
     let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
@@ -904,7 +906,7 @@ fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn wait_for_directory_change(_dir: &std::path::Path) -> std::io::Result<String> {
+pub(crate) fn wait_for_directory_change(_dir: &std::path::Path) -> std::io::Result<String> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "directory change notification not supported on this platform",
@@ -926,7 +928,7 @@ fn path_to_cstring(path: &std::path::Path) -> std::io::Result<std::ffi::CString>
 /// Uses platform-specific APIs to avoid TOCTOU race between an existence
 /// check and the rename operation.
 #[cfg(target_os = "linux")]
-fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     let from_c = path_to_cstring(from)?;
     let to_c = path_to_cstring(to)?;
 
@@ -950,7 +952,7 @@ fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Re
 }
 
 #[cfg(target_os = "macos")]
-fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     let from_c = path_to_cstring(from)?;
     let to_c = path_to_cstring(to)?;
 
@@ -974,7 +976,7 @@ fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Re
 }
 
 #[cfg(windows)]
-fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
@@ -998,7 +1000,7 @@ fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Re
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn rename_exclusive(_from: &std::path::Path, _to: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn rename_exclusive(_from: &std::path::Path, _to: &std::path::Path) -> std::io::Result<()> {
     // No atomic rename-exclusive available on this platform.
     // Return Unsupported rather than silently degrading to a racy check+rename.
     Err(std::io::Error::new(
@@ -1014,7 +1016,7 @@ fn rename_exclusive(_from: &std::path::Path, _to: &std::path::Path) -> std::io::
 /// Timestamps with value 0 or -1 are skipped (meaning "don't change").
 /// Uses `futimens` on the open fd to avoid rename-race issues with path-based APIs.
 #[cfg(unix)]
-fn set_file_times(file: &std::fs::File, info: &fs_info::BasicInfoSet) {
+pub(crate) fn set_file_times(file: &std::fs::File, info: &fs_info::BasicInfoSet) {
     use std::os::unix::io::AsRawFd;
 
     let access_time = filetime_to_timespec(info.last_access_time);
@@ -1060,7 +1062,7 @@ fn filetime_to_timespec(filetime: i64) -> libc::timespec {
 }
 
 #[cfg(windows)]
-fn set_file_times(file: &std::fs::File, info: &fs_info::BasicInfoSet) {
+pub(crate) fn set_file_times(file: &std::fs::File, info: &fs_info::BasicInfoSet) {
     use std::os::windows::io::AsRawHandle;
 
     let creation = filetime_or_null(info.creation_time);
@@ -1092,14 +1094,14 @@ fn filetime_or_null(ft: i64) -> Option<windows_sys::Win32::Foundation::FILETIME>
 }
 
 #[cfg(not(any(unix, windows)))]
-fn set_file_times(_file: &std::fs::File, _info: &fs_info::BasicInfoSet) {
+pub(crate) fn set_file_times(_file: &std::fs::File, _info: &fs_info::BasicInfoSet) {
     // No platform API available — accept silently.
 }
 
 // ── File locking ──────────────────────────────────────────────────────────
 
 #[cfg(unix)]
-fn lock_file(
+pub(crate) fn lock_file(
     file: &std::fs::File,
     offset: u64,
     length: u64,
@@ -1133,7 +1135,7 @@ fn lock_file(
 }
 
 #[cfg(unix)]
-fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Result<()> {
+pub(crate) fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
     let flock = libc::flock {
@@ -1154,7 +1156,7 @@ fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Resul
 }
 
 #[cfg(windows)]
-fn lock_file(
+pub(crate) fn lock_file(
     file: &std::fs::File,
     offset: u64,
     length: u64,
@@ -1195,7 +1197,7 @@ fn lock_file(
 }
 
 #[cfg(windows)]
-fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Result<()> {
+pub(crate) fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
 
     let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -1221,7 +1223,7 @@ fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Resul
 }
 
 #[cfg(not(any(unix, windows)))]
-fn lock_file(
+pub(crate) fn lock_file(
     _file: &std::fs::File,
     _offset: u64,
     _length: u64,
@@ -1235,7 +1237,7 @@ fn lock_file(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn unlock_file(_file: &std::fs::File, _offset: u64, _length: u64) -> std::io::Result<()> {
+pub(crate) fn unlock_file(_file: &std::fs::File, _offset: u64, _length: u64) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "file locking not supported on this platform",
@@ -1512,7 +1514,7 @@ mod tests {
     // ── Rename ─────────────────────────────────────────────────────────
 
     #[test]
-    fn rename_exclusive_fails_if_destination_exists() {
+    pub(crate) fn rename_exclusive_fails_if_destination_exists() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("src.txt"), b"data").unwrap();
         fs::write(dir.path().join("dst.txt"), b"existing").unwrap();
