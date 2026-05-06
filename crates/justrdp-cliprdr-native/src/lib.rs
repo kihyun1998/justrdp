@@ -23,6 +23,12 @@
 //! ```
 
 mod common;
+pub mod surface;
+
+pub use surface::{
+    NativeClipboardError, NativeClipboardFiles, NativeClipboardResult,
+    NativeClipboardSurface, NativeFileMeta,
+};
 
 #[cfg(target_os = "windows")]
 mod windows;
