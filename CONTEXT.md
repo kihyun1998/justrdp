@@ -321,12 +321,12 @@ A *role*, not a single trait — the platform-facing seam inside each
 `*-native` crate. Examples:
 `justrdp-rdpsnd-native::NativeAudioOutput`,
 `justrdp-rdpeai-native::AudioCaptureBackend`,
-`justrdp-cliprdr-native::NativeClipboardSurface` (planned).
-A Native surface speaks only platform-level vocabulary (raw bytes, format
-IDs, file handles); the surrounding `-native` wrapper handles all
-RDP-protocol-specific encoding. Dual to **Embedder**: an Embedder is the
-*RDP-library-consuming* role; a Native surface is the *OS-binding* role
-inside a channel implementation.
+`justrdp-cliprdr-native::NativeClipboardSurface`.
+A Native surface speaks only platform-level vocabulary (UTF-8 strings,
+DIB byte arrays, file handles); the surrounding `-native` wrapper handles
+all RDP-protocol-specific encoding. Dual to **Embedder**: an Embedder is
+the *RDP-library-consuming* role; a Native surface is the *OS-binding*
+role inside a channel implementation. _See_: ADR-0006.
 
 ---
 
