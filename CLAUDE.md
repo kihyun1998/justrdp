@@ -108,3 +108,9 @@ Canonical names used as-is (`needs-triage`, `needs-info`, `ready-for-agent`, `re
 ### Domain docs
 
 Single-context — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+**Language policy**: `CONTEXT.md` and every file under `docs/adr/` MUST be written
+in English. This is the only project artifact with that constraint — `roadmap.md`,
+this `CLAUDE.md`, code comments, and commit messages may stay in Korean. Rationale:
+domain docs are the cross-readable reference (open-source contributors, future
+tooling, indexing) and need to stay accessible without translation.
