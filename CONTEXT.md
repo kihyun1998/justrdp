@@ -316,6 +316,18 @@ A *role*, not a concrete trait — a Tauri / native-UI / WASM host that *carries
 around* the RDP library. §13.4 defines the standard pattern; `justrdp-tauri/`
 is the reference implementation.
 
+**Native surface**:
+A *role*, not a single trait — the platform-facing seam inside each
+`*-native` crate. Examples:
+`justrdp-rdpsnd-native::NativeAudioOutput`,
+`justrdp-rdpeai-native::AudioCaptureBackend`,
+`justrdp-cliprdr-native::NativeClipboardSurface` (planned).
+A Native surface speaks only platform-level vocabulary (raw bytes, format
+IDs, file handles); the surrounding `-native` wrapper handles all
+RDP-protocol-specific encoding. Dual to **Embedder**: an Embedder is the
+*RDP-library-consuming* role; a Native surface is the *OS-binding* role
+inside a channel implementation.
+
 ---
 
 ## Relationships
@@ -338,6 +350,11 @@ is the reference implementation.
 - **Surface Bits Command** supersedes **Bitmap Update** when the **RDPEGFX**
   capability is negotiated; the **Drawing Order** path is independent and
   slower.
+- Each `*-native` crate exposes one **Native surface** trait that its
+  platform modules implement; the surrounding wrapper struct converts the
+  channel's protocol vocabulary (e.g. `LongFormatName`,
+  `FileContentsRequestPdu`) into and out of the Native surface's
+  platform-level vocabulary.
 
 ---
 
