@@ -37,7 +37,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::client::danger::{
@@ -48,11 +47,9 @@ use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme}
 use tokio_rustls::TlsConnector;
 
 use justrdp_async::{TlsUpgrade, TransportError, WebTransport};
-use crate::native_tcp::NativeTcpTransport;
 
-/// Default per-`recv()` read buffer size — kept identical to
-/// [`NativeTcpTransport`] so post-TLS throughput patterns match.
-const DEFAULT_RECV_BUF_BYTES: usize = 16 * 1024;
+use crate::io_pipe::AsyncIoTransport;
+use crate::native_tcp::NativeTcpTransport;
 
 /// Async TLS upgrade.
 pub struct NativeTlsUpgrade {
@@ -137,9 +134,15 @@ impl TlsUpgrade<NativeTcpTransport> for NativeTlsUpgrade {
 /// Post-TLS transport — wraps `tokio_rustls::client::TlsStream<TcpStream>`
 /// the same way [`NativeTcpTransport`] wraps the raw socket.
 pub struct NativeTlsTransport {
-    stream: TlsStream<TcpStream>,
-    recv_buf: Vec<u8>,
-    closed: bool,
+    inner: AsyncIoTransport<TlsStream<TcpStream>>,
+}
+
+impl core::fmt::Debug for NativeTlsTransport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NativeTlsTransport")
+            .field("inner", &self.inner)
+            .finish()
+    }
 }
 
 impl NativeTlsTransport {
@@ -148,16 +151,13 @@ impl NativeTlsTransport {
     /// hand off the resulting stream as a `WebTransport`.
     pub fn from_stream(stream: TlsStream<TcpStream>) -> Self {
         Self {
-            stream,
-            recv_buf: alloc::vec![0u8; DEFAULT_RECV_BUF_BYTES],
-            closed: false,
+            inner: AsyncIoTransport::new(stream, "native-tls"),
         }
     }
 
     /// Override the per-`recv()` read buffer. Zero means default.
     pub fn set_recv_buf_size(&mut self, bytes: usize) {
-        let new_size = if bytes == 0 { DEFAULT_RECV_BUF_BYTES } else { bytes };
-        self.recv_buf = alloc::vec![0u8; new_size];
+        self.inner.set_recv_buf_size(bytes);
     }
 
     /// Extract the DER-encoded `SubjectPublicKeyInfo` of the server's
@@ -168,7 +168,7 @@ impl NativeTlsTransport {
     /// peer certificate (vanishingly rare — a successful TLS handshake
     /// always carries one for client-side connections).
     pub fn server_public_key(&self) -> Option<Vec<u8>> {
-        let (_io, conn) = self.stream.get_ref();
+        let (_io, conn) = self.inner.stream().get_ref();
         let certs = conn.peer_certificates()?;
         let leaf = certs.first()?;
         justrdp_tls::extract_spki_from_cert_der(leaf.as_ref())
@@ -177,45 +177,15 @@ impl NativeTlsTransport {
 
 impl WebTransport for NativeTlsTransport {
     async fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        if self.closed {
-            return Err(TransportError::closed("native-tls: already closed"));
-        }
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        self.stream
-            .write_all(bytes)
-            .await
-            .map_err(|e| TransportError::io(format!("tls send: {e}")))?;
-        Ok(())
+        self.inner.send(bytes).await
     }
 
     async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
-        if self.closed {
-            return Err(TransportError::closed("native-tls: already closed"));
-        }
-        let n = self
-            .stream
-            .read(&mut self.recv_buf)
-            .await
-            .map_err(|e| TransportError::io(format!("tls recv: {e}")))?;
-        if n == 0 {
-            self.closed = true;
-            return Err(TransportError::closed("native-tls: peer closed"));
-        }
-        Ok(self.recv_buf[..n].to_vec())
+        self.inner.recv().await
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        if self.closed {
-            return Ok(());
-        }
-        self.closed = true;
-        // Best-effort TLS close-notify + TCP shutdown.
-        if let Err(e) = self.stream.shutdown().await {
-            return Err(TransportError::io(format!("tls shutdown: {e}")));
-        }
-        Ok(())
+        self.inner.close().await
     }
 }
 

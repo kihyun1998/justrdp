@@ -16,19 +16,13 @@
 //! compiled for wasm targets).
 
 use alloc::format;
-use alloc::vec;
 use alloc::vec::Vec;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use justrdp_async::{TransportError, WebTransport};
 
-/// Default per-`recv()` read buffer size. Sized so RemoteFX progressive
-/// frames (~64 KB tile-set headers) come back in one or two reads on a
-/// healthy socket without making the per-call alloc dominate. The
-/// connector reassembles arbitrary chunking so this is pure tuning.
-const DEFAULT_RECV_BUF_BYTES: usize = 16 * 1024;
+use crate::io_pipe::AsyncIoTransport;
 
 /// Native TCP transport for desktop targets.
 ///
@@ -41,16 +35,7 @@ const DEFAULT_RECV_BUF_BYTES: usize = 16 * 1024;
 /// trait is the integration point, not this struct.
 #[derive(Debug)]
 pub struct NativeTcpTransport {
-    stream: TcpStream,
-    /// Reusable read buffer. `tokio::AsyncReadExt::read` fills as
-    /// much of this as is available, so we slice off the prefix
-    /// for the returned `Vec`. Re-allocating per call would dominate
-    /// the busy receive path.
-    recv_buf: Vec<u8>,
-    /// Sticky once peer EOF is observed or `close()` has been called.
-    /// Subsequent `send` / `recv` calls fail with `ConnectionClosed`
-    /// without re-touching the socket.
-    closed: bool,
+    inner: AsyncIoTransport<TcpStream>,
 }
 
 impl NativeTcpTransport {
@@ -64,7 +49,7 @@ impl NativeTcpTransport {
     {
         let stream = TcpStream::connect(addr)
             .await
-            .map_err(|e| TransportError::io(format!("tcp connect: {e}")))?;
+            .map_err(|e| TransportError::io(format!("native-tcp connect: {e}")))?;
         Ok(Self::from_stream(stream))
     }
 
@@ -74,9 +59,7 @@ impl NativeTcpTransport {
     /// connector.
     pub fn from_stream(stream: TcpStream) -> Self {
         Self {
-            stream,
-            recv_buf: vec![0u8; DEFAULT_RECV_BUF_BYTES],
-            closed: false,
+            inner: AsyncIoTransport::new(stream, "native-tcp"),
         }
     }
 
@@ -84,8 +67,7 @@ impl NativeTcpTransport {
     /// reduce syscall count for high-throughput RFX / AVC traffic but
     /// pin more memory per transport. Zero is treated as the default.
     pub fn set_recv_buf_size(&mut self, bytes: usize) {
-        let new_size = if bytes == 0 { DEFAULT_RECV_BUF_BYTES } else { bytes };
-        self.recv_buf = vec![0u8; new_size];
+        self.inner.set_recv_buf_size(bytes);
     }
 
     /// Take back the underlying `TcpStream`. Useful when the caller
@@ -93,65 +75,22 @@ impl NativeTcpTransport {
     /// native-tls stack rather than using `connect_with_upgrade`. The
     /// transport is left in a closed state; subsequent calls return
     /// `ConnectionClosed`.
-    pub fn into_stream(mut self) -> TcpStream {
-        self.closed = true;
-        self.stream
+    pub fn into_stream(self) -> TcpStream {
+        self.inner.into_stream()
     }
 }
 
 impl WebTransport for NativeTcpTransport {
     async fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        if self.closed {
-            return Err(TransportError::closed("native-tcp: already closed"));
-        }
-        // `write_all` retries short writes internally — callers see
-        // either "all bytes flushed to the kernel" or an error.
-        // Empty payloads are a no-op rather than a syscall (matches
-        // the contract that the upper layers only send non-empty
-        // PDUs).
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        self.stream
-            .write_all(bytes)
-            .await
-            .map_err(|e| TransportError::io(format!("tcp send: {e}")))?;
-        Ok(())
+        self.inner.send(bytes).await
     }
 
     async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
-        if self.closed {
-            return Err(TransportError::closed("native-tcp: already closed"));
-        }
-        let n = self
-            .stream
-            .read(&mut self.recv_buf)
-            .await
-            .map_err(|e| TransportError::io(format!("tcp recv: {e}")))?;
-        if n == 0 {
-            // Peer half-closed the socket. Stick the closed flag so
-            // the next call short-circuits without a redundant
-            // syscall. The driver layer maps this to a clean session
-            // termination.
-            self.closed = true;
-            return Err(TransportError::closed("native-tcp: peer closed"));
-        }
-        Ok(self.recv_buf[..n].to_vec())
+        self.inner.recv().await
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        if self.closed {
-            return Ok(());
-        }
-        self.closed = true;
-        // `shutdown()` is best-effort here — RDP servers often see
-        // disconnect via TPKT-level signals before TCP FIN, so a
-        // failed shutdown isn't an error from the embedder's
-        // perspective. Surface only catastrophic failures.
-        if let Err(e) = self.stream.shutdown().await {
-            return Err(TransportError::io(format!("tcp shutdown: {e}")));
-        }
-        Ok(())
+        self.inner.close().await
     }
 }
 
@@ -183,7 +122,9 @@ mod tests {
         client.send(b"abcdef").await.unwrap();
         let mut buf = [0u8; 6];
         // The server side reads the exact bytes back.
-        let n = server.read_exact(&mut buf).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read_exact(&mut server, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(n, 6);
         assert_eq!(&buf, b"abcdef");
     }
@@ -207,7 +148,7 @@ mod tests {
             let chunk = client.recv().await.unwrap();
             total.extend_from_slice(&chunk);
         }
-        assert_eq!(total, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(total, alloc::vec![0xAA, 0xBB, 0xCC, 0xDD]);
     }
 
     #[tokio::test]
@@ -248,7 +189,9 @@ mod tests {
         // syscalls were issued for an empty write).
         client.send(b"after").await.unwrap();
         let mut buf = [0u8; 5];
-        server.read_exact(&mut buf).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(&buf, b"after");
     }
 

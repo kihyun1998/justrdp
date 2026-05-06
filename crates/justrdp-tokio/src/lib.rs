@@ -43,6 +43,9 @@
 
 extern crate alloc;
 
+#[cfg(any(feature = "native-tcp", feature = "native-tls", feature = "native-tls-os"))]
+mod io_pipe;
+
 #[cfg(feature = "native-tcp")]
 mod native_tcp;
 

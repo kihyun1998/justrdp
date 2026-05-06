@@ -43,18 +43,14 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_native_tls::native_tls;
 use tokio_native_tls::{TlsConnector, TlsStream};
 
 use justrdp_async::{TlsUpgrade, TransportError, WebTransport};
-use crate::native_tcp::NativeTcpTransport;
 
-/// Default per-`recv()` read buffer size — matches [`NativeTcpTransport`]
-/// and [`crate::native_tls::NativeTlsTransport`] for consistent
-/// post-TLS throughput patterns.
-const DEFAULT_RECV_BUF_BYTES: usize = 16 * 1024;
+use crate::io_pipe::AsyncIoTransport;
+use crate::native_tcp::NativeTcpTransport;
 
 /// Async TLS upgrade backed by `tokio-native-tls` (OS TLS stack).
 pub struct NativeTlsOsUpgrade {
@@ -133,9 +129,15 @@ impl TlsUpgrade<NativeTcpTransport> for NativeTlsOsUpgrade {
 /// Post-TLS transport — wraps `tokio_native_tls::TlsStream<TcpStream>`
 /// the same way [`NativeTcpTransport`] wraps the raw socket.
 pub struct NativeTlsOsTransport {
-    stream: TlsStream<TcpStream>,
-    recv_buf: Vec<u8>,
-    closed: bool,
+    inner: AsyncIoTransport<TlsStream<TcpStream>>,
+}
+
+impl core::fmt::Debug for NativeTlsOsTransport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NativeTlsOsTransport")
+            .field("inner", &self.inner)
+            .finish()
+    }
 }
 
 impl NativeTlsOsTransport {
@@ -144,17 +146,14 @@ impl NativeTlsOsTransport {
     /// [`WebTransport`].
     pub fn from_stream(stream: TlsStream<TcpStream>) -> Self {
         Self {
-            stream,
-            recv_buf: alloc::vec![0u8; DEFAULT_RECV_BUF_BYTES],
-            closed: false,
+            inner: AsyncIoTransport::new(stream, "native-tls-os"),
         }
     }
 
     /// Override the per-`recv()` read buffer. Zero falls back to the
     /// default (16 KiB).
     pub fn set_recv_buf_size(&mut self, bytes: usize) {
-        let new_size = if bytes == 0 { DEFAULT_RECV_BUF_BYTES } else { bytes };
-        self.recv_buf = alloc::vec![0u8; new_size];
+        self.inner.set_recv_buf_size(bytes);
     }
 
     /// Extract the DER-encoded `SubjectPublicKeyInfo` of the server's
@@ -169,7 +168,8 @@ impl NativeTlsOsTransport {
     /// resumed-session edge cases.
     pub fn server_public_key(&self) -> Option<Vec<u8>> {
         let cert = self
-            .stream
+            .inner
+            .stream()
             .get_ref()
             .peer_certificate()
             .ok()
@@ -181,44 +181,15 @@ impl NativeTlsOsTransport {
 
 impl WebTransport for NativeTlsOsTransport {
     async fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        if self.closed {
-            return Err(TransportError::closed("native-tls-os: already closed"));
-        }
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        self.stream
-            .write_all(bytes)
-            .await
-            .map_err(|e| TransportError::io(format!("tls send: {e}")))?;
-        Ok(())
+        self.inner.send(bytes).await
     }
 
     async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
-        if self.closed {
-            return Err(TransportError::closed("native-tls-os: already closed"));
-        }
-        let n = self
-            .stream
-            .read(&mut self.recv_buf)
-            .await
-            .map_err(|e| TransportError::io(format!("tls recv: {e}")))?;
-        if n == 0 {
-            self.closed = true;
-            return Err(TransportError::closed("native-tls-os: peer closed"));
-        }
-        Ok(self.recv_buf[..n].to_vec())
+        self.inner.recv().await
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        if self.closed {
-            return Ok(());
-        }
-        self.closed = true;
-        if let Err(e) = self.stream.shutdown().await {
-            return Err(TransportError::io(format!("tls shutdown: {e}")));
-        }
-        Ok(())
+        self.inner.close().await
     }
 }
 
