@@ -32,10 +32,7 @@ use justrdp_input::{
 use justrdp_pdu::rdp::fast_path::{FastPathInputEvent, FastPathUpdateType};
 use justrdp_pdu::rdp::finalization::{InclusiveRect, MonitorLayoutEntry, SaveSessionInfoData};
 use justrdp_pdu::tpkt::TpktHint;
-use justrdp_session::{
-    ActiveStage, ActiveStageOutput, DeactivationReactivation, GracefulDisconnectReason,
-    SessionConfig,
-};
+use justrdp_session::{ActiveStage, GracefulDisconnectReason, SessionConfig};
 use justrdp_svc::{StaticChannelSet as SvcChannelSet, SvcProcessor};
 
 use crate::driver::{recv_until_pdu, DriverError};
@@ -226,112 +223,18 @@ impl<T: WebTransport> ActiveSession<T> {
         self.scratch.drain(..n);
 
         let outputs = self.stage.process(&frame)?;
-        let mut events: Vec<SessionEvent> = Vec::with_capacity(outputs.len());
-        for output in outputs {
-            match output {
-                ActiveStageOutput::ResponseFrame(bytes) => {
-                    self.transport.send(&bytes).await?;
-                }
-                ActiveStageOutput::GraphicsUpdate { update_code, data } => {
-                    events.push(SessionEvent::Graphics { update_code, data });
-                }
-                ActiveStageOutput::PointerDefault => {
-                    events.push(SessionEvent::Pointer(PointerEvent::Default));
-                }
-                ActiveStageOutput::PointerHidden => {
-                    events.push(SessionEvent::Pointer(PointerEvent::Hidden));
-                }
-                ActiveStageOutput::PointerPosition { x, y } => {
-                    events.push(SessionEvent::Pointer(PointerEvent::Position { x, y }));
-                }
-                ActiveStageOutput::PointerBitmap { pointer_type, data } => {
-                    events.push(SessionEvent::Pointer(PointerEvent::Bitmap {
-                        pointer_type,
-                        data,
-                    }));
-                }
-                ActiveStageOutput::DeactivateAll(DeactivationReactivation { share_id }) => {
-                    events.push(SessionEvent::Reactivation { share_id });
-                }
-                ActiveStageOutput::ServerReactivation { .. } => {
-                    // ServerReactivation does not carry the new share_id
-                    // (it is read from the embedded DemandActive body);
-                    // we surface the *current* (pre-reactivation) id so
-                    // the embedder can correlate before/after by tracking
-                    // changes across calls.
-                    events.push(SessionEvent::Reactivation {
-                        share_id: self.stage.config().share_id,
-                    });
-                }
-                ActiveStageOutput::Terminate(reason) => {
-                    events.push(SessionEvent::Terminated(reason));
-                }
-                ActiveStageOutput::SaveSessionInfo { data } => {
-                    events.push(SessionEvent::SaveSessionInfo(data));
-                }
-                ActiveStageOutput::ChannelData { channel_id, data } => {
-                    // Try to dispatch to a registered SVC processor
-                    // first. If a processor claims the channel id its
-                    // response frames are written back over the
-                    // transport and the raw event is suppressed (the
-                    // processor "owns" the channel). If no processor
-                    // matches, fall through to a passthrough event so
-                    // callers can still observe traffic on un-registered
-                    // channels — matches blocking's behavior in
-                    // `RdpClient::next_event`.
-                    if self.svc_set.get_by_channel_id(channel_id).is_some() {
-                        let frames = self
-                            .svc_set
-                            .process_incoming(channel_id, &data, self.user_channel_id)
-                            .map_err(|e| DriverError::Channel(format!("{e:?}")))?;
-                        for frame in frames {
-                            self.transport.send(&frame).await?;
-                        }
-                    } else {
-                        events.push(SessionEvent::Channel { channel_id, data });
-                    }
-                }
-                ActiveStageOutput::ServerMonitorLayout { monitors } => {
-                    events.push(SessionEvent::MonitorLayout(monitors));
-                }
-                ActiveStageOutput::KeyboardIndicators { led_flags } => {
-                    // Decode the raw u16 flags into the 4-bool
-                    // shape now (was previously deferred to the
-                    // embedder boundary — §5.6.6 cleanup).
-                    events.push(SessionEvent::KeyboardIndicators(
-                        LockKeys::from_flags(led_flags),
-                    ));
-                }
-                ActiveStageOutput::KeyboardImeStatus {
-                    ime_state,
-                    ime_conv_mode,
-                } => {
-                    events.push(SessionEvent::KeyboardImeStatus {
-                        ime_state,
-                        ime_conv_mode,
-                    });
-                }
-                ActiveStageOutput::PlaySound {
-                    duration_ms,
-                    frequency_hz,
-                } => {
-                    events.push(SessionEvent::PlaySound {
-                        duration_ms,
-                        frequency_hz,
-                    });
-                }
-                ActiveStageOutput::SuppressOutput {
-                    allow_display_updates,
-                    rect,
-                } => {
-                    events.push(SessionEvent::SuppressOutput {
-                        allow_display_updates,
-                        rect,
-                    });
-                }
-            }
+        let translation = crate::translate::translate_outputs(
+            outputs,
+            &mut self.svc_set,
+            self.user_channel_id,
+            self.stage.config().share_id,
+        )?;
+
+        for response_frame in translation.response_frames {
+            self.transport.send(&response_frame).await?;
         }
-        Ok(events)
+
+        Ok(translation.events)
     }
 
     /// Encode and send a batch of fast-path input events (keyboard,

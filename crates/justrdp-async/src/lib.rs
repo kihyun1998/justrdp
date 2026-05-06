@@ -22,6 +22,7 @@ mod reconnect;
 mod redirect;
 mod session;
 mod telemetry;
+mod translate;
 mod transport;
 
 pub use driver::{CredsspDriver, DriverError, TlsUpgrade, WebClient, MAX_HANDSHAKE_PDU_SIZE};
