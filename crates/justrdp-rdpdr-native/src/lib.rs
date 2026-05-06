@@ -1259,4 +1259,750 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.ntstatus, justrdp_rdpdr::pdu::irp::STATUS_NOT_SUPPORTED);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // MockFilesystem-backed protocol unit tests
+    //
+    // These tests exercise the wrapper's protocol logic — NTSTATUS mapping,
+    // delete-on-close orchestration, FILE_RENAME_INFORMATION boundary
+    // handling, dir cursor edge cases — without performing real disk I/O.
+    // The deepening payoff: failure modes that are awkward to reproduce
+    // against `std::fs` (DiskFull on a write that succeeded, lock conflict
+    // without spawning a competing process) become trivial.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use justrdp_rdpdr::pdu::irp::{
+        FILE_BOTH_DIRECTORY_INFORMATION, FILE_CREATE, FILE_OPEN,
+    };
+
+    /// In-memory [`FilesystemSurface`] for protocol-only unit tests.
+    /// `Mutex` (rather than `RefCell`) because `FilesystemSurface: Send`.
+    #[derive(Default, Debug)]
+    struct MockFilesystem {
+        state: Mutex<MockState>,
+    }
+
+    #[derive(Default, Debug)]
+    struct MockState {
+        next_handle_id: u32,
+        files: HashMap<PathBuf, MockFile>,
+        open_handles: HashMap<u32, MockOpenHandle>,
+        force_disk_full: bool,
+        force_lock_conflict: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockFile {
+        data: Vec<u8>,
+        is_dir: bool,
+    }
+
+    #[derive(Debug)]
+    struct MockOpenHandle {
+        path: PathBuf,
+    }
+
+    impl MockFilesystem {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn add_file(&self, path: impl Into<PathBuf>, data: Vec<u8>) {
+            let mut state = self.state.lock().unwrap();
+            state.files.insert(
+                path.into(),
+                MockFile { data, is_dir: false },
+            );
+        }
+
+        fn add_dir(&self, path: impl Into<PathBuf>) {
+            let mut state = self.state.lock().unwrap();
+            state.files.insert(
+                path.into(),
+                MockFile { data: vec![], is_dir: true },
+            );
+        }
+
+        fn force_disk_full(&self) {
+            self.state.lock().unwrap().force_disk_full = true;
+        }
+
+        fn force_lock_conflict(&self) {
+            self.state.lock().unwrap().force_lock_conflict = true;
+        }
+
+        fn file_exists(&self, path: &Path) -> bool {
+            self.state.lock().unwrap().files.contains_key(path)
+        }
+    }
+
+    impl FilesystemSurface for MockFilesystem {
+        type Handle = u32;
+
+        fn open(
+            &mut self,
+            path: &Path,
+            opts: OpenOptions,
+        ) -> NativeFilesystemResult<Opened<u32>> {
+            let mut state = self.state.lock().unwrap();
+            let exists = state.files.contains_key(path);
+
+            let (outcome, is_dir) = match opts.disposition {
+                OpenDisposition::Open => {
+                    if !exists {
+                        return Err(NativeFilesystemError::NotFound);
+                    }
+                    let f = state.files.get(path).unwrap();
+                    (OpenOutcome::Opened, f.is_dir)
+                }
+                OpenDisposition::Create => {
+                    if exists {
+                        return Err(NativeFilesystemError::AlreadyExists);
+                    }
+                    let is_dir = matches!(opts.kind, OpenKind::Directory);
+                    state
+                        .files
+                        .insert(path.to_path_buf(), MockFile { data: vec![], is_dir });
+                    (OpenOutcome::Created, is_dir)
+                }
+                OpenDisposition::OpenIf => {
+                    if exists {
+                        let f = state.files.get(path).unwrap();
+                        (OpenOutcome::Opened, f.is_dir)
+                    } else {
+                        let is_dir = matches!(opts.kind, OpenKind::Directory);
+                        state
+                            .files
+                            .insert(path.to_path_buf(), MockFile { data: vec![], is_dir });
+                        (OpenOutcome::Created, is_dir)
+                    }
+                }
+                OpenDisposition::Overwrite => {
+                    if !exists {
+                        return Err(NativeFilesystemError::NotFound);
+                    }
+                    let is_dir = state.files.get(path).unwrap().is_dir;
+                    if !is_dir {
+                        state.files.get_mut(path).unwrap().data.clear();
+                    }
+                    (OpenOutcome::Overwritten, is_dir)
+                }
+                OpenDisposition::OverwriteIf => {
+                    let outcome = if exists {
+                        let is_dir = state.files.get(path).unwrap().is_dir;
+                        if !is_dir {
+                            state.files.get_mut(path).unwrap().data.clear();
+                        }
+                        OpenOutcome::Overwritten
+                    } else {
+                        let is_dir = matches!(opts.kind, OpenKind::Directory);
+                        state
+                            .files
+                            .insert(path.to_path_buf(), MockFile { data: vec![], is_dir });
+                        OpenOutcome::Created
+                    };
+                    let is_dir = state.files.get(path).unwrap().is_dir;
+                    (outcome, is_dir)
+                }
+                OpenDisposition::Supersede => {
+                    let outcome = if exists {
+                        OpenOutcome::Superseded
+                    } else {
+                        OpenOutcome::Created
+                    };
+                    let is_dir = matches!(opts.kind, OpenKind::Directory);
+                    state
+                        .files
+                        .insert(path.to_path_buf(), MockFile { data: vec![], is_dir });
+                    (outcome, is_dir)
+                }
+            };
+
+            if matches!(opts.kind, OpenKind::FileStrict) && is_dir {
+                return Err(NativeFilesystemError::OsApi(
+                    "FILE_NON_DIRECTORY_FILE set but target is a directory".to_string(),
+                ));
+            }
+
+            state.next_handle_id += 1;
+            let id = state.next_handle_id;
+            state
+                .open_handles
+                .insert(id, MockOpenHandle { path: path.to_path_buf() });
+            Ok(Opened {
+                handle: id,
+                outcome,
+                is_dir,
+            })
+        }
+
+        fn rename(
+            &mut self,
+            from: &Path,
+            to: &Path,
+            replace: bool,
+        ) -> NativeFilesystemResult<()> {
+            let mut state = self.state.lock().unwrap();
+            if !state.files.contains_key(from) {
+                return Err(NativeFilesystemError::NotFound);
+            }
+            if state.files.contains_key(to) && !replace {
+                return Err(NativeFilesystemError::AlreadyExists);
+            }
+            let f = state.files.remove(from).unwrap();
+            state.files.insert(to.to_path_buf(), f);
+            Ok(())
+        }
+
+        fn remove_file(&mut self, path: &Path) -> NativeFilesystemResult<()> {
+            let mut state = self.state.lock().unwrap();
+            state
+                .files
+                .remove(path)
+                .ok_or(NativeFilesystemError::NotFound)?;
+            Ok(())
+        }
+
+        fn remove_dir(&mut self, path: &Path) -> NativeFilesystemResult<()> {
+            self.remove_file(path)
+        }
+
+        fn read_dir(&self, path: &Path) -> NativeFilesystemResult<Vec<NativeDirEntry>> {
+            let state = self.state.lock().unwrap();
+            let entries = state
+                .files
+                .iter()
+                .filter_map(|(p, f)| {
+                    if p.parent() == Some(path) {
+                        let name = p.file_name()?.to_string_lossy().into_owned();
+                        Some(NativeDirEntry {
+                            name,
+                            metadata: NativeMetadata {
+                                is_dir: f.is_dir,
+                                is_readonly: false,
+                                size: f.data.len() as u64,
+                                created: None,
+                                accessed: None,
+                                modified: None,
+                            },
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Ok(entries)
+        }
+
+        fn disk_space(&self, _path: &Path) -> NativeFilesystemResult<DiskSpace> {
+            Ok(DiskSpace {
+                total_bytes: 1_000_000_000,
+                free_bytes: 500_000_000,
+                available_bytes: 500_000_000,
+                bytes_per_sector: 512,
+                sectors_per_cluster: 8,
+            })
+        }
+
+        fn close(&mut self, handle: Self::Handle) -> NativeFilesystemResult<()> {
+            self.state.lock().unwrap().open_handles.remove(&handle);
+            Ok(())
+        }
+
+        fn read(
+            &mut self,
+            handle: &mut Self::Handle,
+            offset: u64,
+            len: usize,
+        ) -> NativeFilesystemResult<Vec<u8>> {
+            let state = self.state.lock().unwrap();
+            let h = state
+                .open_handles
+                .get(handle)
+                .ok_or(NativeFilesystemError::InvalidInput)?;
+            let f = state
+                .files
+                .get(&h.path)
+                .ok_or(NativeFilesystemError::NotFound)?;
+            let start = (offset as usize).min(f.data.len());
+            let end = (start + len).min(f.data.len());
+            Ok(f.data[start..end].to_vec())
+        }
+
+        fn write(
+            &mut self,
+            handle: &mut Self::Handle,
+            offset: u64,
+            data: &[u8],
+        ) -> NativeFilesystemResult<u32> {
+            let mut state = self.state.lock().unwrap();
+            let path = state
+                .open_handles
+                .get(handle)
+                .ok_or(NativeFilesystemError::InvalidInput)?
+                .path
+                .clone();
+            let f = state
+                .files
+                .get_mut(&path)
+                .ok_or(NativeFilesystemError::NotFound)?;
+            let start = offset as usize;
+            let end = start + data.len();
+            if f.data.len() < end {
+                f.data.resize(end, 0);
+            }
+            f.data[start..end].copy_from_slice(data);
+            Ok(data.len() as u32)
+        }
+
+        fn set_len(
+            &mut self,
+            handle: &mut Self::Handle,
+            len: u64,
+        ) -> NativeFilesystemResult<()> {
+            let mut state = self.state.lock().unwrap();
+            if state.force_disk_full {
+                return Err(NativeFilesystemError::DiskFull);
+            }
+            let path = state
+                .open_handles
+                .get(handle)
+                .ok_or(NativeFilesystemError::InvalidInput)?
+                .path
+                .clone();
+            let f = state
+                .files
+                .get_mut(&path)
+                .ok_or(NativeFilesystemError::NotFound)?;
+            f.data.resize(len as usize, 0);
+            Ok(())
+        }
+
+        fn metadata(&self, handle: &Self::Handle) -> NativeFilesystemResult<NativeMetadata> {
+            let state = self.state.lock().unwrap();
+            let h = state
+                .open_handles
+                .get(handle)
+                .ok_or(NativeFilesystemError::InvalidInput)?;
+            let f = state
+                .files
+                .get(&h.path)
+                .ok_or(NativeFilesystemError::NotFound)?;
+            Ok(NativeMetadata {
+                is_dir: f.is_dir,
+                is_readonly: false,
+                size: f.data.len() as u64,
+                created: None,
+                accessed: None,
+                modified: None,
+            })
+        }
+
+        fn set_times(
+            &mut self,
+            _handle: &mut Self::Handle,
+            _times: FileTimes,
+        ) -> NativeFilesystemResult<()> {
+            Ok(())
+        }
+
+        fn lock(
+            &mut self,
+            _handle: &mut Self::Handle,
+            _range: LockRange,
+            _mode: LockMode,
+        ) -> NativeFilesystemResult<()> {
+            if self.state.lock().unwrap().force_lock_conflict {
+                Err(NativeFilesystemError::Locked)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unlock(
+            &mut self,
+            _handle: &mut Self::Handle,
+            _range: LockRange,
+        ) -> NativeFilesystemResult<()> {
+            Ok(())
+        }
+
+        fn watch(&self, _path: &Path) -> NativeFilesystemResult<String> {
+            Err(NativeFilesystemError::Unsupported)
+        }
+    }
+
+    /// Build a backend wired to a fresh `MockFilesystem`, with a real
+    /// tempdir as `root_path` (needed to satisfy `with_surface`'s
+    /// `is_dir()` assertion).
+    fn make_mock_backend(
+        dir: &tempfile::TempDir,
+    ) -> NativeFilesystemBackend<MockFilesystem> {
+        NativeFilesystemBackend::with_surface(MockFilesystem::new(), dir.path(), 1, "C:")
+    }
+
+    // Build a FILE_RENAME_INFORMATION buffer with raw fields.
+    fn build_rename_buffer(
+        replace: bool,
+        root_directory: u32,
+        file_name_length: u32,
+        file_name: &[u8],
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.push(if replace { 0x01 } else { 0x00 });
+        data.extend_from_slice(&[0, 0, 0]); // Reserved
+        data.extend_from_slice(&root_directory.to_le_bytes());
+        data.extend_from_slice(&file_name_length.to_le_bytes());
+        data.extend_from_slice(file_name);
+        data
+    }
+
+    // ── NTSTATUS mapping for surface-emitted errors ────────────────────
+
+    #[test]
+    fn disk_full_on_truncate_returns_status_disk_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        let target_path = dir.path().join("file.bin");
+        backend.surface().add_file(&target_path, b"hello".to_vec());
+        backend.surface_mut().force_disk_full();
+
+        let resp = backend
+            .create(1, "\\file.bin", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        let mut data = [0u8; 8];
+        data[..8].copy_from_slice(&100i64.to_le_bytes());
+        let err = backend
+            .set_information(1, resp.file_id, FILE_END_OF_FILE_INFORMATION, &data)
+            .unwrap_err();
+
+        assert_eq!(err.ntstatus, STATUS_DISK_FULL);
+    }
+
+    #[test]
+    fn lock_conflict_returns_status_file_lock_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        let target_path = dir.path().join("file.bin");
+        backend.surface().add_file(&target_path, b"data".to_vec());
+        backend.surface_mut().force_lock_conflict();
+
+        let resp = backend
+            .create(1, "\\file.bin", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        let err = backend
+            .lock_control(
+                1,
+                resp.file_id,
+                SL_EXCLUSIVE_LOCK | SL_FAIL_IMMEDIATELY,
+                &[(0, 100)],
+            )
+            .unwrap_err();
+
+        assert_eq!(err.ntstatus, STATUS_FILE_LOCK_CONFLICT);
+    }
+
+    #[test]
+    fn open_missing_returns_status_no_such_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+
+        let err = backend
+            .create(1, "\\absent.txt", GENERIC_READ, FILE_OPEN, 0, 0)
+            .unwrap_err();
+
+        assert_eq!(
+            err.ntstatus,
+            justrdp_rdpdr::pdu::irp::STATUS_NO_SUCH_FILE
+        );
+    }
+
+    #[test]
+    fn create_when_exists_returns_object_name_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("dup.txt"), b"".to_vec());
+
+        let err = backend
+            .create(1, "\\dup.txt", GENERIC_WRITE, FILE_CREATE, 0, 0)
+            .unwrap_err();
+
+        assert_eq!(err.ntstatus, STATUS_OBJECT_NAME_COLLISION);
+    }
+
+    // ── FILE_RENAME_INFORMATION boundary parsing ───────────────────────
+
+    #[test]
+    fn rename_with_oversized_filename_length_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("src.txt"), b"".to_vec());
+
+        let resp = backend
+            .create(1, "\\src.txt", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        // FileNameLength = 33 KB exceeds the 32 KB cap in `parse_rename`.
+        let oversized: Vec<u8> = vec![0u8; 33 * 1024];
+        let buf = build_rename_buffer(true, 0, 33 * 1024, &oversized);
+        let err = backend
+            .set_information(1, resp.file_id, FILE_RENAME_INFORMATION, &buf)
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn rename_with_odd_filename_length_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("src.txt"), b"".to_vec());
+
+        let resp = backend
+            .create(1, "\\src.txt", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        // FileNameLength = 5 — odd, can't be UTF-16LE.
+        let bytes = vec![b'a', 0, b'b', 0, b'c'];
+        let buf = build_rename_buffer(true, 0, 5, &bytes);
+        let err = backend
+            .set_information(1, resp.file_id, FILE_RENAME_INFORMATION, &buf)
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn rename_with_nonzero_root_directory_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("src.txt"), b"".to_vec());
+
+        let resp = backend
+            .create(1, "\\src.txt", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        // RootDirectory = 1 (must be 0 per MS-FSCC 2.4.34).
+        let buf = build_rename_buffer(true, 1, 0, &[]);
+        let err = backend
+            .set_information(1, resp.file_id, FILE_RENAME_INFORMATION, &buf)
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn rename_with_short_buffer_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("src.txt"), b"".to_vec());
+
+        let resp = backend
+            .create(1, "\\src.txt", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        // Only 8 bytes — below the 12-byte minimum header.
+        let err = backend
+            .set_information(1, resp.file_id, FILE_RENAME_INFORMATION, &[0u8; 8])
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_INVALID_PARAMETER);
+    }
+
+    // ── FILE_DISPOSITION_INFORMATION boundary parsing ──────────────────
+
+    #[test]
+    fn disposition_with_invalid_byte_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("f.txt"), b"".to_vec());
+
+        let resp = backend
+            .create(1, "\\f.txt", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        // 0x02 is neither true nor false per parse_disposition.
+        let err = backend
+            .set_information(1, resp.file_id, FILE_DISPOSITION_INFORMATION, &[0x02])
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_INVALID_PARAMETER);
+    }
+
+    // ── FILE_END_OF_FILE_INFORMATION boundary parsing ──────────────────
+
+    #[test]
+    fn set_end_of_file_negative_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("f.txt"), b"".to_vec());
+
+        let resp = backend
+            .create(1, "\\f.txt", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        let data = (-1i64).to_le_bytes();
+        let err = backend
+            .set_information(1, resp.file_id, FILE_END_OF_FILE_INFORMATION, &data)
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_INVALID_PARAMETER);
+    }
+
+    // ── delete-on-close orchestration ──────────────────────────────────
+
+    #[test]
+    fn delete_on_close_removes_file_via_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        let path = dir.path().join("doomed.txt");
+        backend.surface().add_file(&path, b"bye".to_vec());
+
+        let resp = backend
+            .create(1, "\\doomed.txt", GENERIC_WRITE, FILE_OPEN, FILE_DELETE_ON_CLOSE, 0)
+            .unwrap();
+
+        backend.close(1, resp.file_id).unwrap();
+
+        // The mock's HashMap should no longer contain the file — proving
+        // the wrapper actually invoked `surface.remove_file` (not just
+        // dropped the handle).
+        assert!(!backend.surface().file_exists(&path));
+    }
+
+    // ── Directory cursor edge cases ────────────────────────────────────
+
+    #[test]
+    fn empty_directory_returns_no_more_files_after_dot_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend.surface().add_dir(dir.path().join("emptydir"));
+
+        let resp = backend
+            .create(1, "\\emptydir", GENERIC_READ, FILE_OPEN, FILE_DIRECTORY_FILE, 0)
+            .unwrap();
+
+        // Initial query — synthetic "."
+        backend
+            .query_directory(
+                1,
+                resp.file_id,
+                FILE_BOTH_DIRECTORY_INFORMATION,
+                true,
+                Some("\\*"),
+            )
+            .expect("initial query for '.' should succeed");
+
+        // Continuation — synthetic ".."
+        backend
+            .query_directory(
+                1,
+                resp.file_id,
+                FILE_BOTH_DIRECTORY_INFORMATION,
+                false,
+                None,
+            )
+            .expect("continuation for '..' should succeed");
+
+        // Third call — empty dir, no real children.
+        let err = backend
+            .query_directory(
+                1,
+                resp.file_id,
+                FILE_BOTH_DIRECTORY_INFORMATION,
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_NO_MORE_FILES);
+    }
+
+    #[test]
+    fn query_directory_on_file_handle_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("regular.txt"), b"".to_vec());
+
+        let resp = backend
+            .create(1, "\\regular.txt", GENERIC_READ, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        let err = backend
+            .query_directory(
+                1,
+                resp.file_id,
+                FILE_BOTH_DIRECTORY_INFORMATION,
+                true,
+                Some("\\*"),
+            )
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_NOT_A_DIRECTORY);
+    }
+
+    // ── apply_basic_info: 0/-1 timestamps are no-ops ───────────────────
+
+    #[test]
+    fn apply_basic_info_with_sentinel_timestamps_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("t.txt"), b"".to_vec());
+
+        let resp = backend
+            .create(1, "\\t.txt", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        // FILE_BASIC_INFORMATION: all timestamps 0 ("don't change"),
+        // attributes 0.  Wrapper must convert 0 → None and call
+        // surface.set_times without complaint.
+        let mut buf = Vec::with_capacity(40);
+        buf.extend_from_slice(&0i64.to_le_bytes()); // creation
+        buf.extend_from_slice(&0i64.to_le_bytes()); // access
+        buf.extend_from_slice(&(-1i64).to_le_bytes()); // write — the other sentinel
+        buf.extend_from_slice(&0i64.to_le_bytes()); // change
+        buf.extend_from_slice(&0u32.to_le_bytes()); // attributes
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+        backend
+            .set_information(1, resp.file_id, FILE_BASIC_INFORMATION, &buf)
+            .expect("sentinel timestamps must not be rejected");
+    }
+
+    // ── set_information with too-short basic-info buffer ───────────────
+
+    #[test]
+    fn apply_basic_info_with_short_buffer_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = make_mock_backend(&dir);
+        backend
+            .surface()
+            .add_file(dir.path().join("t.txt"), b"".to_vec());
+
+        let resp = backend
+            .create(1, "\\t.txt", GENERIC_WRITE, FILE_OPEN, 0, 0)
+            .unwrap();
+
+        // 39-byte buffer is one byte short of the 40-byte FILE_BASIC_INFORMATION.
+        let err = backend
+            .set_information(1, resp.file_id, FILE_BASIC_INFORMATION, &[0u8; 39])
+            .unwrap_err();
+        assert_eq!(err.ntstatus, STATUS_INVALID_PARAMETER);
+    }
 }
