@@ -1477,6 +1477,10 @@ impl ClientConnector {
 
         // Build the response. JustRDP doesn't (yet) honor multitransport,
         // so always return E_ABORT — spec-compliant per §2.2.15.2 + §1.3.1.1.
+        // Decision recorded in docs/adr/0008-multitransport-rejected-via-e-abort.md
+        // (lists the building blocks that exist independently and why connector-level
+        // integration is deferred to a single multi-commit PR rather than scaffolded
+        // here piecewise).
         let response = MultitransportResponse {
             request_id: request.request_id,
             hr_response: HRESULT_E_ABORT,
