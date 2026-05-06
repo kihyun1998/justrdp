@@ -11,8 +11,6 @@ use std::fmt;
 pub enum NativeClipboardError {
     /// OS clipboard is currently locked by another process.
     Locked,
-    /// The requested format ID is not currently held by the OS clipboard.
-    FormatNotAvailable(u32),
     /// An OS-level API call failed; the message is platform-specific.
     OsApi(String),
     /// Bytes from the OS could not be re-encoded into RDP-canonical form.
@@ -23,7 +21,6 @@ impl fmt::Display for NativeClipboardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Locked => f.write_str("OS clipboard is locked"),
-            Self::FormatNotAvailable(id) => write!(f, "format id {id:#x} not available"),
             Self::OsApi(msg) => write!(f, "OS clipboard API: {msg}"),
             Self::Encoding(msg) => write!(f, "encoding: {msg}"),
         }
@@ -37,47 +34,37 @@ pub type NativeClipboardResult<T> = Result<T, NativeClipboardError>;
 /// The platform-facing clipboard surface.
 ///
 /// Implementors are platform-specific adapters (Windows / X11 / Wayland /
-/// macOS). They speak only platform-level vocabulary: format IDs and
-/// RDP-canonical byte payloads. The surrounding `NativeClipboard` wrapper
-/// is the sole consumer; it converts between MS-RDPECLIP protocol types
-/// (`LongFormatName`, `FormatListResponse`, `FileContentsRequestPdu`) and
-/// this surface.
+/// macOS). They speak only platform-level vocabulary — UTF-8 text,
+/// device-independent-bitmap byte arrays — and never see MS-RDPECLIP types
+/// (`LongFormatName`, `FormatListResponse`, `FileContentsRequestPdu`). The
+/// surrounding `NativeClipboard` wrapper is the sole consumer; it owns all
+/// RDP-protocol encoding and format-ID dispatch.
 ///
-/// # Byte encoding
+/// # Available formats
 ///
-/// `read_all` returns bytes already in **RDP-canonical encoding** for the
-/// given `format_id`:
+/// Implementors expose two content kinds:
 ///
-/// - `CF_TEXT`: null-terminated ANSI / Latin-1
-/// - `CF_UNICODETEXT`: null-terminated UTF-16LE
-/// - `CF_DIB`: a BITMAPINFOHEADER + optional color table + pixel data,
-///   *without* the 14-byte BITMAPFILEHEADER
-/// - other formats: bytes exactly as the protocol expects them
+/// - **Text** as UTF-8 `String`s. The wrapper maps these to RDP `CF_TEXT`
+///   or `CF_UNICODETEXT` as the protocol negotiation requires.
+/// - **Image** as DIB bytes (BITMAPINFOHEADER + optional color table +
+///   pixel data, *without* the 14-byte BITMAPFILEHEADER). The wrapper maps
+///   these to RDP `CF_DIB`.
 ///
-/// `write_formats` accepts bytes in the same shape.
-///
-/// # Snapshot semantics
-///
-/// `NativeClipboard` calls `read_all` at most once per RDP format-list
-/// cycle and caches the result. Implementors may treat `read_all` as an
-/// expensive operation (e.g. a single `OpenClipboard` / `CloseClipboard`
-/// pair on Windows).
+/// `read_*` returns `Ok(None)` when the OS clipboard does not currently
+/// carry that content kind. Reserve `Err(_)` for genuine OS-level failures.
 pub trait NativeClipboardSurface: Send {
-    /// Return the format IDs currently available on the OS clipboard.
-    fn list_formats(&mut self) -> NativeClipboardResult<Vec<u32>>;
+    /// Read text from the OS clipboard, if available.
+    fn read_text(&mut self) -> NativeClipboardResult<Option<String>>;
 
-    /// Read every available format from the OS clipboard.
-    ///
-    /// The returned pairs are in no particular order. The caller treats
-    /// the result as a snapshot for the current format-list cycle.
-    fn read_all(&mut self) -> NativeClipboardResult<Vec<(u32, Vec<u8>)>>;
+    /// Write text to the OS clipboard, replacing any existing content.
+    fn write_text(&mut self, text: &str) -> NativeClipboardResult<()>;
 
-    /// Write all the given formats to the OS clipboard, replacing any
+    /// Read an image from the OS clipboard as DIB bytes, if available.
+    fn read_image(&mut self) -> NativeClipboardResult<Option<Vec<u8>>>;
+
+    /// Write an image (as DIB bytes) to the OS clipboard, replacing any
     /// existing content.
-    fn write_formats(
-        &mut self,
-        entries: &[(u32, Vec<u8>)],
-    ) -> NativeClipboardResult<()>;
+    fn write_image(&mut self, dib: &[u8]) -> NativeClipboardResult<()>;
 }
 
 /// File metadata as the **Native surface** sees it.
@@ -99,10 +86,14 @@ pub struct NativeFileMeta {
 /// Optional supertrait for clipboard surfaces that can transfer files.
 ///
 /// Implement this when the host OS clipboard exposes a file-list payload
-/// (Windows `CFSTR_FILECONTENTS`, macOS file URL pasteboard items). X11
-/// and Wayland generally cannot expose byte-range streaming and should not
-/// implement this trait — `NativeClipboard` will then reject file-contents
-/// requests by default.
+/// (Windows `CFSTR_FILECONTENTS`, macOS file URL pasteboard items). X11 and
+/// Wayland generally cannot expose byte-range streaming and should not
+/// implement this trait.
+///
+/// **No wrapper currently delegates to this trait** — `NativeClipboard`
+/// rejects file-contents requests by default. A future
+/// `NativeClipboardWithFiles` wrapper variant will land alongside the first
+/// concrete file-capable implementation.
 pub trait NativeClipboardFiles: NativeClipboardSurface {
     /// Number of files available for byte-range streaming.
     fn file_count(&mut self) -> NativeClipboardResult<u32>;

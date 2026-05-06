@@ -1,119 +1,78 @@
-//! Wayland clipboard backend for RDP clipboard redirection.
+//! Wayland clipboard adapter using `wl-clipboard-rs`.
 //!
-//! Uses the `wl-clipboard-rs` crate to interact with the Wayland clipboard.
-//! Supports text (CF_TEXT, CF_UNICODETEXT) and image (CF_DIB via BMP) formats.
+//! Provides [`WaylandClipboard`] — a [`NativeClipboardSurface`] over the
+//! Wayland clipboard. Each read/write spawns a short-lived interaction with
+//! the compositor (Wayland has no persistent clipboard handle).
 
 use std::io::Read;
 
-use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, LongFormatName};
-use justrdp_cliprdr::{ClipboardError, ClipboardResult, FormatDataResponse, FormatListResponse};
+use justrdp_cliprdr::ClipboardError;
 
-use crate::common::{
-    self, bmp_to_dib, dib_to_bmp, looks_like_dib, rdp_bytes_to_utf8, utf8_to_rdp,
-    MAX_CLIPBOARD_BYTES,
-};
+use crate::common::{bmp_to_dib, dib_to_bmp, MAX_CLIPBOARD_BYTES};
+use crate::surface::{NativeClipboardError, NativeClipboardResult, NativeClipboardSurface};
 
-/// Wayland clipboard backend.
-///
-/// Unlike X11, Wayland clipboard access is per-invocation — there is no
-/// persistent clipboard handle. Each read/write spawns a short-lived
-/// interaction with the compositor.
+/// Wayland clipboard surface.
 pub struct WaylandClipboard;
 
 impl WaylandClipboard {
-    /// Create a new Wayland clipboard backend.
     pub fn new() -> Result<Self, ClipboardError> {
         Ok(Self)
     }
+}
 
-    /// Accept the format list if it contains any supported format.
-    pub fn on_format_list(
-        &mut self,
-        formats: &[LongFormatName],
-    ) -> ClipboardResult<FormatListResponse> {
-        common::accept_supported_format_list(formats)
+impl NativeClipboardSurface for WaylandClipboard {
+    fn read_text(&mut self) -> NativeClipboardResult<Option<String>> {
+        use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
+
+        let (pipe, _mime) =
+            match get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text) {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            };
+
+        let mut text = String::with_capacity(4096);
+        pipe.take(MAX_CLIPBOARD_BYTES as u64)
+            .read_to_string(&mut text)
+            .map_err(|e| NativeClipboardError::Encoding(format!("Wayland text read: {e}")))?;
+        Ok(Some(text))
     }
 
-    /// Read from the Wayland clipboard and encode for the requested format.
-    pub fn on_format_data_request(
-        &mut self,
-        format_id: u32,
-    ) -> ClipboardResult<FormatDataResponse> {
-        if common::is_text_format(format_id) {
-            use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
-
-            let (pipe, _mime) =
-                get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text)
-                    .map_err(|_| ClipboardError::Failed)?;
-
-            let mut text = String::with_capacity(4096);
-            pipe.take(MAX_CLIPBOARD_BYTES as u64)
-                .read_to_string(&mut text)
-                .map_err(|_| ClipboardError::Failed)?;
-
-            let data = utf8_to_rdp(&text, format_id).ok_or(ClipboardError::Failed)?;
-            return Ok(FormatDataResponse::Ok(data));
-        }
-
-        if common::is_image_format(format_id) {
-            use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
-
-            let (mut pipe, _mime) = get_contents(
-                ClipboardType::Regular,
-                Seat::Unspecified,
-                MimeType::Specific("image/bmp"),
-            )
-            .map_err(|_| ClipboardError::Failed)?;
-
-            let mut bmp_bytes = Vec::with_capacity(4096);
-            pipe.take(MAX_CLIPBOARD_BYTES as u64)
-                .read_to_end(&mut bmp_bytes)
-                .map_err(|_| ClipboardError::Failed)?;
-
-            let dib = bmp_to_dib(&bmp_bytes).ok_or(ClipboardError::Failed)?;
-            return Ok(FormatDataResponse::Ok(dib));
-        }
-
-        Ok(FormatDataResponse::Fail)
-    }
-
-    /// Decode server data and copy to the Wayland clipboard.
-    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool, format_id: Option<u32>) {
-        if !is_success {
-            return;
-        }
-
+    fn write_text(&mut self, text: &str) -> NativeClipboardResult<()> {
         use wl_clipboard_rs::copy::{MimeType, Options, Source};
 
-        // Use the negotiated format_id when available; fall back to content heuristic.
-        if format_id == Some(common::CF_DIB) || (format_id.is_none() && looks_like_dib(data)) {
-            if let Some(bmp) = dib_to_bmp(data) {
-                let opts = Options::new();
-                let _ = opts.copy(
-                    Source::Bytes(bmp.into()),
-                    MimeType::Specific("image/bmp"),
-                );
-                return;
-            }
-        }
-
-        // Fall back to text
-        if let Some(text) = rdp_bytes_to_utf8(data) {
-            let opts = Options::new();
-            let _ = opts.copy(Source::Bytes(text.into_bytes().into()), MimeType::Text);
-        }
+        let opts = Options::new();
+        opts.copy(Source::Bytes(text.as_bytes().to_vec().into()), MimeType::Text)
+            .map_err(|e| NativeClipboardError::OsApi(format!("Wayland copy text: {e}")))
     }
 
-    pub fn on_file_contents_request(
-        &mut self,
-        _request: &FileContentsRequestPdu,
-    ) -> ClipboardResult<FileContentsResponsePdu> {
-        Err(ClipboardError::Other("file transfer not supported".into()))
+    fn read_image(&mut self) -> NativeClipboardResult<Option<Vec<u8>>> {
+        use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
+
+        let (mut pipe, _mime) = match get_contents(
+            ClipboardType::Regular,
+            Seat::Unspecified,
+            MimeType::Specific("image/bmp"),
+        ) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+
+        let mut bmp_bytes = Vec::with_capacity(4096);
+        pipe.take(MAX_CLIPBOARD_BYTES as u64)
+            .read_to_end(&mut bmp_bytes)
+            .map_err(|e| NativeClipboardError::OsApi(format!("Wayland image read: {e}")))?;
+
+        Ok(bmp_to_dib(&bmp_bytes))
     }
 
-    pub fn on_file_contents_response(&mut self, _response: &FileContentsResponsePdu) {}
+    fn write_image(&mut self, dib: &[u8]) -> NativeClipboardResult<()> {
+        use wl_clipboard_rs::copy::{MimeType, Options, Source};
 
-    pub fn on_lock(&mut self, _lock_id: u32) {}
-
-    pub fn on_unlock(&mut self, _lock_id: u32) {}
+        let bmp = dib_to_bmp(dib).ok_or_else(|| {
+            NativeClipboardError::Encoding("dib_to_bmp conversion failed".to_string())
+        })?;
+        let opts = Options::new();
+        opts.copy(Source::Bytes(bmp.into()), MimeType::Specific("image/bmp"))
+            .map_err(|e| NativeClipboardError::OsApi(format!("Wayland copy image: {e}")))
+    }
 }

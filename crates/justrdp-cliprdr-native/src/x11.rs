@@ -1,120 +1,88 @@
-//! X11 clipboard backend for RDP clipboard redirection.
+//! X11 clipboard adapter using the `x11-clipboard` crate.
 //!
-//! Uses the `x11-clipboard` crate to interact with the X11 CLIPBOARD selection.
-//! Supports text (CF_TEXT, CF_UNICODETEXT) and image (CF_DIB via BMP) formats.
+//! Provides [`X11Clipboard`] — a [`NativeClipboardSurface`] over the X11
+//! CLIPBOARD selection. Image transfers go through the `image/bmp` MIME atom
+//! and are DIB↔BMP-converted at this layer.
 
-use justrdp_cliprdr::pdu::{FileContentsRequestPdu, FileContentsResponsePdu, LongFormatName};
-use justrdp_cliprdr::{ClipboardError, ClipboardResult, FormatDataResponse, FormatListResponse};
+use justrdp_cliprdr::ClipboardError;
 use x11_clipboard::Clipboard as X11Clip;
 
-use crate::common::{self, bmp_to_dib, dib_to_bmp, looks_like_dib, rdp_bytes_to_utf8, utf8_to_rdp};
+use crate::common::{bmp_to_dib, dib_to_bmp};
+use crate::surface::{NativeClipboardError, NativeClipboardResult, NativeClipboardSurface};
 
 /// X11 clipboard timeout for selection reads.
 const X11_CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// X11 clipboard backend.
-///
-/// Wraps the X11 CLIPBOARD selection for reading and writing text and image
-/// data during RDP clipboard redirection.
+/// X11 clipboard surface.
 pub struct X11Clipboard {
     clip: X11Clip,
 }
 
 impl X11Clipboard {
-    /// Create a new X11 clipboard backend.
-    ///
-    /// Opens a connection to the X11 display. Fails if no X11 display is available.
+    /// Create a new X11 clipboard surface. Fails if no X11 display is
+    /// available.
     pub fn new() -> Result<Self, ClipboardError> {
         let clip = X11Clip::new().map_err(|_| ClipboardError::Failed)?;
         Ok(Self { clip })
     }
-
-    /// Accept the format list if it contains any supported format.
-    pub fn on_format_list(
-        &mut self,
-        formats: &[LongFormatName],
-    ) -> ClipboardResult<FormatListResponse> {
-        common::accept_supported_format_list(formats)
-    }
-
-    /// Read from the X11 CLIPBOARD selection and encode for the requested format.
-    pub fn on_format_data_request(
-        &mut self,
-        format_id: u32,
-    ) -> ClipboardResult<FormatDataResponse> {
-        if common::is_text_format(format_id) {
-            let atoms = &self.clip.getter.atoms;
-            let text_bytes = self
-                .clip
-                .load(
-                    atoms.clipboard,
-                    atoms.utf8_string,
-                    atoms.property,
-                    X11_CLIPBOARD_TIMEOUT,
-                )
-                .map_err(|_| ClipboardError::Failed)?;
-
-            let text = String::from_utf8(text_bytes).map_err(|_| ClipboardError::Failed)?;
-            let data = utf8_to_rdp(&text, format_id).ok_or(ClipboardError::Failed)?;
-            return Ok(FormatDataResponse::Ok(data));
-        }
-
-        if common::is_image_format(format_id) {
-            let bmp_atom = intern_bmp_atom(&self.clip.getter.connection)
-                .ok_or(ClipboardError::Failed)?;
-
-            let atoms = &self.clip.getter.atoms;
-            let bmp_bytes = self
-                .clip
-                .load(atoms.clipboard, bmp_atom, atoms.property, X11_CLIPBOARD_TIMEOUT)
-                .map_err(|_| ClipboardError::Failed)?;
-
-            let dib = bmp_to_dib(&bmp_bytes).ok_or(ClipboardError::Failed)?;
-            return Ok(FormatDataResponse::Ok(dib));
-        }
-
-        Ok(FormatDataResponse::Fail)
-    }
-
-    /// Decode server data and write to the X11 CLIPBOARD selection.
-    pub fn on_format_data_response(&mut self, data: &[u8], is_success: bool, format_id: Option<u32>) {
-        if !is_success {
-            return;
-        }
-
-        // Use the negotiated format_id when available; fall back to content heuristic.
-        if format_id == Some(common::CF_DIB) || (format_id.is_none() && looks_like_dib(data)) {
-            if let Some(bmp) = dib_to_bmp(data) {
-                if let Some(atom) = intern_bmp_atom(&self.clip.setter.connection) {
-                    let atoms = &self.clip.setter.atoms;
-                    let _ = self.clip.store(atoms.clipboard, atom, &bmp);
-                    return;
-                }
-            }
-        }
-
-        // Fall back to text
-        if let Some(text) = rdp_bytes_to_utf8(data) {
-            let atoms = &self.clip.setter.atoms;
-            let _ = self.clip.store(atoms.clipboard, atoms.utf8_string, text.as_bytes());
-        }
-    }
-
-    pub fn on_file_contents_request(
-        &mut self,
-        _request: &FileContentsRequestPdu,
-    ) -> ClipboardResult<FileContentsResponsePdu> {
-        Err(ClipboardError::Other("file transfer not supported".into()))
-    }
-
-    pub fn on_file_contents_response(&mut self, _response: &FileContentsResponsePdu) {}
-
-    pub fn on_lock(&mut self, _lock_id: u32) {}
-
-    pub fn on_unlock(&mut self, _lock_id: u32) {}
 }
 
-/// Intern the `image/bmp` MIME atom, returning `None` on failure.
+impl NativeClipboardSurface for X11Clipboard {
+    fn read_text(&mut self) -> NativeClipboardResult<Option<String>> {
+        let atoms = &self.clip.getter.atoms;
+        let bytes = match self.clip.load(
+            atoms.clipboard,
+            atoms.utf8_string,
+            atoms.property,
+            X11_CLIPBOARD_TIMEOUT,
+        ) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        match String::from_utf8(bytes) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) => Err(NativeClipboardError::Encoding(format!("X11 utf8: {e}"))),
+        }
+    }
+
+    fn write_text(&mut self, text: &str) -> NativeClipboardResult<()> {
+        let atoms = &self.clip.setter.atoms;
+        self.clip
+            .store(atoms.clipboard, atoms.utf8_string, text.as_bytes())
+            .map_err(|e| NativeClipboardError::OsApi(format!("X11 store: {e}")))
+    }
+
+    fn read_image(&mut self) -> NativeClipboardResult<Option<Vec<u8>>> {
+        let bmp_atom = match intern_bmp_atom(&self.clip.getter.connection) {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+
+        let atoms = &self.clip.getter.atoms;
+        let bmp_bytes = match self
+            .clip
+            .load(atoms.clipboard, bmp_atom, atoms.property, X11_CLIPBOARD_TIMEOUT)
+        {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+
+        Ok(bmp_to_dib(&bmp_bytes))
+    }
+
+    fn write_image(&mut self, dib: &[u8]) -> NativeClipboardResult<()> {
+        let bmp = dib_to_bmp(dib).ok_or_else(|| {
+            NativeClipboardError::Encoding("dib_to_bmp conversion failed".to_string())
+        })?;
+        let atom = intern_bmp_atom(&self.clip.setter.connection)
+            .ok_or_else(|| NativeClipboardError::OsApi("intern image/bmp atom failed".to_string()))?;
+        let atoms = &self.clip.setter.atoms;
+        self.clip
+            .store(atoms.clipboard, atom, bmp)
+            .map_err(|e| NativeClipboardError::OsApi(format!("X11 store image: {e}")))
+    }
+}
+
 fn intern_bmp_atom(conn: &x11_clipboard::xcb::Connection) -> Option<x11_clipboard::xcb::x::Atom> {
     use x11_clipboard::xcb::Xid;
     let cookie = conn.send_request(&x11_clipboard::xcb::x::InternAtom {
