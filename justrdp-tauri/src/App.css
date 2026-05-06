@@ -95,6 +95,64 @@ button {
   margin-right: 5px;
 }
 
+.subtitle {
+  color: #6b7280;
+  font-size: 0.9em;
+  margin-top: -0.5em;
+}
+
+.connect-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+  max-width: 360px;
+  margin: 1em auto;
+  text-align: left;
+}
+
+.connect-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2em;
+  font-size: 0.85em;
+  color: #555;
+}
+
+.connect-form input {
+  margin-top: 0.2em;
+}
+
+.connect-form button {
+  margin-top: 0.4em;
+}
+
+.session-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4em;
+  margin: 1em 0;
+}
+
+.session-panel .row {
+  gap: 0.6em;
+  margin-top: 0.6em;
+}
+
+.rdp-canvas {
+  border: 1px solid #ccc;
+  background: #1e1e1e;
+  margin: 0.6em 0;
+  max-width: 100%;
+  height: auto;
+}
+
+.status {
+  font-family: monospace;
+  color: #6b7280;
+  margin-top: 1em;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;

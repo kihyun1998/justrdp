@@ -43,6 +43,7 @@ members = [
     "crates/justrdp-rdpsnd-native",
     "crates/justrdp-rdpeai-native",
     "crates/justrdp-web",
+    "justrdp-tauri/src-tauri",
     "tests/integration",
 ]
 resolver = "3"
