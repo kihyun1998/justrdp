@@ -11,7 +11,14 @@ mod dir_info;
 mod fs_info;
 mod handle_map;
 mod path;
+pub mod surface;
 mod volume_info;
+
+pub use surface::{
+    DiskSpace, FileTimes, FilesystemSurface, LockMode, LockRange, NativeDirEntry,
+    NativeFilesystemError, NativeFilesystemResult, NativeMetadata, OpenAccess, OpenDisposition,
+    OpenKind, OpenOptions, OpenOutcome, Opened,
+};
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -36,7 +43,7 @@ use crate::handle_map::{DirEntry, DirState, HandleMap};
 use crate::path::rdp_to_local;
 use crate::volume_info::{
     encode_attribute_info, encode_device_info, encode_full_size_info, encode_size_info,
-    encode_volume_info, DiskSpace,
+    encode_volume_info,
 };
 
 // ── NTSTATUS codes not already in justrdp-rdpdr ────────────────────────────
