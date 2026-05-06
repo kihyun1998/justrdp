@@ -21,11 +21,18 @@
 //!     .await?;
 //! ```
 //!
-//! `NativeCredsspDriver` is `CredsspDriver<NativeTlsTransport>` only —
-//! it pulls the server SPKI directly from the post-TLS stream via
-//! [`NativeTlsTransport::server_public_key`], so it's not generic
-//! over arbitrary `WebTransport`s. Embedders using a custom transport
-//! can implement [`CredsspDriver`] themselves.
+//! `NativeCredsspDriver` is generic over any post-TLS transport that
+//! exposes its leaf-cert SPKI: `T: WebTransport + TlsServerSpki`.
+//! Both [`NativeTlsTransport`] (rustls) and [`NativeTlsOsTransport`]
+//! (native-tls / SChannel / Secure Transport / OpenSSL) implement
+//! the bound, so the same driver instance works with either TLS
+//! backend. The gateway inner-TLS transport
+//! ([`super::gateway::WebTransportTlsTransport`]) also implements it,
+//! enabling NLA over an MS-TSGU tunnel.
+//!
+//! Embedders with a custom TLS transport implement
+//! [`TlsServerSpki`](justrdp_async::TlsServerSpki) on it and the
+//! same driver works.
 //!
 //! ## What this driver does NOT do
 //!
@@ -33,7 +40,9 @@
 //! `justrdp-connector::CredsspSequence` ships the NTLM stack. Kerberos
 //! against a real KDC requires platform integration (Windows SSPI /
 //! libkrb5 / MIT GSS-API) which is intentionally out of scope here —
-//! that lives in a separate driver implementation.
+//! that lives in a separate driver implementation. See
+//! [ADR-0007](../../docs/adr/0007-credssp-mechanism-not-trait.md)
+//! for why `CredsspSequence` is NTLM-locked.
 
 use alloc::format;
 use alloc::vec::Vec;
@@ -41,15 +50,18 @@ use alloc::vec::Vec;
 use justrdp_connector::{ClientConnector, CredsspRandom, CredsspSequence, CredsspState, Sequence};
 use justrdp_pdu::x224::SecurityProtocol;
 
-use justrdp_async::{CredsspDriver, TransportError, WebTransport};
-use crate::native_tls::NativeTlsTransport;
+use justrdp_async::{CredsspDriver, TlsServerSpki, TransportError, WebTransport};
 
-/// Async CredSSP / NLA driver bound to [`NativeTlsTransport`].
+/// Async CredSSP / NLA driver, generic over any post-TLS transport
+/// that exposes its leaf-cert SPKI.
 ///
 /// The driver is intentionally minimal — it pulls credentials and the
 /// HYBRID/HYBRID_EX selection from the connector's `Config`, fills
 /// the per-session randomness via OS RNG, and shuttles bytes between
-/// `CredsspSequence` and the post-TLS transport.
+/// `CredsspSequence` and the post-TLS transport. The same driver
+/// instance works against `NativeTlsTransport`, `NativeTlsOsTransport`,
+/// or any custom embedder transport that implements
+/// [`TlsServerSpki`].
 #[derive(Debug, Default)]
 pub struct NativeCredsspDriver;
 
@@ -59,13 +71,16 @@ impl NativeCredsspDriver {
     }
 }
 
-impl CredsspDriver<NativeTlsTransport> for NativeCredsspDriver {
+impl<T> CredsspDriver<T> for NativeCredsspDriver
+where
+    T: WebTransport + TlsServerSpki + Send,
+{
     type Error = TransportError;
 
     async fn drive(
         self,
         connector: &mut ClientConnector,
-        transport: &mut NativeTlsTransport,
+        transport: &mut T,
     ) -> Result<(), TransportError> {
         // 1. Extract the server's leaf SPKI from the rustls handshake
         //    we just completed. CredSSP's `pubKeyAuth` step binds the
@@ -170,8 +185,8 @@ impl CredsspDriver<NativeTlsTransport> for NativeCredsspDriver {
 /// We re-frame here because the transport may deliver bytes in
 /// arbitrary chunks (TCP) or one-frame-per-message (WebSocket); the
 /// helper handles both.
-async fn read_asn1_sequence(
-    transport: &mut NativeTlsTransport,
+async fn read_asn1_sequence<T: WebTransport + Send>(
+    transport: &mut T,
     scratch: &mut Vec<u8>,
 ) -> Result<usize, TransportError> {
     scratch.clear();
@@ -219,8 +234,8 @@ async fn read_asn1_sequence(
 ///
 /// We peek the first byte to decide which framing applies. `0x30`
 /// (SEQUENCE tag) → fallback path; anything else → raw 4-byte status.
-async fn handle_early_user_auth(
-    transport: &mut NativeTlsTransport,
+async fn handle_early_user_auth<T: WebTransport + Send>(
+    transport: &mut T,
     credssp: &mut CredsspSequence,
     scratch: &mut Vec<u8>,
 ) -> Result<(), TransportError> {
@@ -265,8 +280,8 @@ async fn handle_early_user_auth(
 /// Drain `transport` into `scratch` until it holds at least
 /// `target` bytes. Each `recv()` returns whatever is currently
 /// available; we accumulate until the caller's framing is satisfied.
-async fn fill_until(
-    transport: &mut NativeTlsTransport,
+async fn fill_until<T: WebTransport + Send>(
+    transport: &mut T,
     scratch: &mut Vec<u8>,
     target: usize,
 ) -> Result<(), TransportError> {
@@ -305,6 +320,9 @@ fn fill_random(buf: &mut [u8]) -> Result<(), TransportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::VecDeque;
+    use alloc::sync::Arc;
+    use std::sync::Mutex;
 
     #[test]
     fn driver_constructs_default() {
@@ -332,5 +350,133 @@ mod tests {
         assert_eq!(r.client_challenge.len(), 8);
         assert_eq!(r.exported_session_key.len(), 16);
         assert!(r.client_nonce.iter().any(|&b| b != 0));
+    }
+
+    /// A stub transport that satisfies both `WebTransport` and
+    /// `TlsServerSpki`. Used to pin the generic bound on
+    /// `NativeCredsspDriver` — the type-level checks below must
+    /// compile, which proves the driver works against ANY transport
+    /// implementing both traits, not just the rustls or native-tls
+    /// concrete types.
+    #[derive(Debug)]
+    struct StubTlsTransport {
+        spki: Option<Vec<u8>>,
+        recv: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    impl WebTransport for StubTlsTransport {
+        async fn send(&mut self, _bytes: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.recv
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| TransportError::closed("stub: drained"))
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    impl TlsServerSpki for StubTlsTransport {
+        fn server_public_key(&self) -> Option<Vec<u8>> {
+            self.spki.clone()
+        }
+    }
+
+    /// Type-level check: `NativeCredsspDriver` is `CredsspDriver<T>`
+    /// for any `T: WebTransport + TlsServerSpki`. Without the trait
+    /// extraction this would fail to compile against `StubTlsTransport`
+    /// (the previous `impl CredsspDriver<NativeTlsTransport>` was a
+    /// concrete-type bound).
+    #[test]
+    fn driver_satisfies_credssp_for_stub_tls_transport() {
+        fn assert_credssp_driver<D, T>()
+        where
+            D: CredsspDriver<T>,
+            T: WebTransport + TlsServerSpki,
+        {
+        }
+        assert_credssp_driver::<NativeCredsspDriver, StubTlsTransport>();
+    }
+
+    /// `read_asn1_sequence` is now generic over `T: WebTransport +
+    /// Send` so it composes with any TLS transport. Drive it against
+    /// a stub transport that emits a hand-rolled SEQUENCE in two
+    /// chunks — the helper must reframe across the chunk boundary.
+    #[tokio::test]
+    async fn read_asn1_sequence_assembles_sequence_across_chunks() {
+        // SEQUENCE tag 0x30, short-form length 0x05, body 5 bytes.
+        let recv = Arc::new(Mutex::new(VecDeque::from([
+            vec![0x30, 0x05, 0xAA, 0xBB],
+            vec![0xCC, 0xDD, 0xEE],
+        ])));
+        let mut transport = StubTlsTransport {
+            spki: None,
+            recv: Arc::clone(&recv),
+        };
+        let mut scratch: Vec<u8> = Vec::new();
+        let n = read_asn1_sequence(&mut transport, &mut scratch).await.unwrap();
+        assert_eq!(n, 7, "tag + len + 5 body bytes");
+        assert_eq!(&scratch[..n], &[0x30, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+    }
+
+    /// Long-form length: tag 0x30, len-of-len 0x82 → 2-byte length
+    /// 0x0100 (256 body bytes). Confirms `read_asn1_sequence` parses
+    /// the long form correctly when running over a generic transport.
+    #[tokio::test]
+    async fn read_asn1_sequence_parses_long_form_length() {
+        let mut frame = Vec::with_capacity(4 + 256);
+        frame.push(0x30); // SEQUENCE tag
+        frame.push(0x82); // long-form, 2 length octets
+        frame.push(0x01);
+        frame.push(0x00); // body length = 256
+        frame.extend_from_slice(&[0xAB; 256]);
+
+        let recv = Arc::new(Mutex::new(VecDeque::from([frame.clone()])));
+        let mut transport = StubTlsTransport {
+            spki: None,
+            recv: Arc::clone(&recv),
+        };
+        let mut scratch: Vec<u8> = Vec::new();
+        let n = read_asn1_sequence(&mut transport, &mut scratch).await.unwrap();
+        assert_eq!(n, 4 + 256);
+        assert_eq!(scratch[..n], frame[..]);
+    }
+
+    /// Non-SEQUENCE tag must surface as a Protocol error rather than
+    /// silently advancing — the helper guards against bridges sending
+    /// stray bytes.
+    #[tokio::test]
+    async fn read_asn1_sequence_rejects_non_sequence_tag() {
+        let recv = Arc::new(Mutex::new(VecDeque::from([vec![0x99, 0x05]])));
+        let mut transport = StubTlsTransport {
+            spki: None,
+            recv: Arc::clone(&recv),
+        };
+        let mut scratch: Vec<u8> = Vec::new();
+        let err = read_asn1_sequence(&mut transport, &mut scratch)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), justrdp_async::TransportErrorKind::Protocol);
+    }
+
+    /// Empty mid-frame surfaces as ConnectionClosed, matching what the
+    /// outer driver loop expects. Confirms `fill_until` propagates
+    /// the closed kind from a generic transport.
+    #[tokio::test]
+    async fn fill_until_treats_empty_chunk_as_closed() {
+        let recv = Arc::new(Mutex::new(VecDeque::from([vec![]])));
+        let mut transport = StubTlsTransport {
+            spki: None,
+            recv: Arc::clone(&recv),
+        };
+        let mut scratch: Vec<u8> = Vec::new();
+        let err = fill_until(&mut transport, &mut scratch, 4).await.unwrap_err();
+        assert_eq!(err.kind(), justrdp_async::TransportErrorKind::ConnectionClosed);
     }
 }

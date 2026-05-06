@@ -30,4 +30,4 @@ pub use error::{TransportError, TransportErrorKind};
 pub use reconnect::{Reconnectable, ReconnectPolicy, TransportFactory};
 pub use redirect::{apply_redirect, redirect_target, MAX_REDIRECTS};
 pub use session::{ActiveSession, PointerEvent, SessionEvent};
-pub use transport::WebTransport;
+pub use transport::{TlsServerSpki, WebTransport};

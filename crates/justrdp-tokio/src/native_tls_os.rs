@@ -47,7 +47,7 @@ use tokio::net::TcpStream;
 use tokio_native_tls::native_tls;
 use tokio_native_tls::{TlsConnector, TlsStream};
 
-use justrdp_async::{TlsUpgrade, TransportError, WebTransport};
+use justrdp_async::{TlsServerSpki, TlsUpgrade, TransportError, WebTransport};
 
 use crate::io_pipe::AsyncIoTransport;
 use crate::native_tcp::NativeTcpTransport;
@@ -190,6 +190,15 @@ impl WebTransport for NativeTlsOsTransport {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         self.inner.close().await
+    }
+}
+
+impl TlsServerSpki for NativeTlsOsTransport {
+    fn server_public_key(&self) -> Option<Vec<u8>> {
+        // Delegate to the inherent method so external callers using
+        // `transport.server_public_key()` keep compiling without the
+        // trait imported (Rust resolves inherent methods first).
+        Self::server_public_key(self)
     }
 }
 

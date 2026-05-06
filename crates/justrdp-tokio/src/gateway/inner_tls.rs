@@ -29,7 +29,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use justrdp_async::{TlsUpgrade, TransportError, WebTransport};
+use justrdp_async::{TlsServerSpki, TlsUpgrade, TransportError, WebTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::client::danger::{
@@ -212,6 +212,15 @@ impl<X: WebTransport + Send + 'static> WebTransport for WebTransportTlsTransport
             return Err(TransportError::io(format!("inner tls shutdown: {e}")));
         }
         Ok(())
+    }
+}
+
+impl<X: WebTransport + Send + 'static> TlsServerSpki for WebTransportTlsTransport<X> {
+    fn server_public_key(&self) -> Option<Vec<u8>> {
+        // Delegate to the inherent method so external callers using
+        // `transport.server_public_key()` keep compiling without the
+        // trait imported (Rust resolves inherent methods first).
+        Self::server_public_key(self)
     }
 }
 

@@ -70,6 +70,29 @@ pub trait WebTransport {
     ) -> impl core::future::Future<Output = Result<(), TransportError>> + Send;
 }
 
+/// A post-TLS [`WebTransport`] that exposes the leaf-cert SPKI of
+/// the TLS peer it's connected to.
+///
+/// CredSSP / NLA's pubKeyAuth step (MS-CSSP §3.1.5) cross-checks the
+/// NTLM session key against the DER-encoded `SubjectPublicKeyInfo`
+/// of the TLS server certificate. Implementing this trait alongside
+/// [`WebTransport`] lets a [`CredsspDriver`] bind to *any* TLS
+/// transport (rustls direct, native-tls direct, gateway inner-TLS,
+/// custom embedder TLS) without committing to a single concrete
+/// type.
+///
+/// Pure-TCP transports (e.g. `NativeTcpTransport` before TLS upgrade)
+/// do NOT implement this trait — there is no leaf cert to inspect.
+///
+/// [`CredsspDriver`]: crate::CredsspDriver
+pub trait TlsServerSpki {
+    /// DER-encoded `SubjectPublicKeyInfo` of the TLS peer's leaf
+    /// certificate. Returns `None` only if the connection has no
+    /// peer certificate available, which is vanishingly rare for
+    /// client-side TLS to a real RDP server.
+    fn server_public_key(&self) -> Option<Vec<u8>>;
+}
+
 /// Wasm-side trait variant — same shape, no `Send` bound on the
 /// returned futures. See the doc comment on the non-wasm trait above.
 #[cfg(target_family = "wasm")]
