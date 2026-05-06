@@ -8,18 +8,17 @@
 //!
 //! See MS-FSCC 2.4 for wire format details.
 
-use std::fs::Metadata;
-
 use justrdp_rdpdr::pdu::irp::{
     FILE_BOTH_DIRECTORY_INFORMATION, FILE_DIRECTORY_INFORMATION, FILE_FULL_DIRECTORY_INFORMATION,
     FILE_NAMES_INFORMATION,
 };
 
 use crate::fs_info::{
-    align_allocation, metadata_to_attributes_with_name, system_time_to_filetime,
+    align_allocation, metadata_to_attributes_with_name, option_time_to_filetime,
     ALLOCATION_UNIT_BYTES,
 };
 use crate::path::encode_utf16le;
+use crate::surface::NativeMetadata;
 
 // ── Alignment ──────────────────────────────────────────────────────────────
 
@@ -52,7 +51,7 @@ const NAMES_INFO_HEADER: usize = 12;
 pub fn encode_dir_entry(
     fs_information_class: u32,
     name: &str,
-    metadata: &Metadata,
+    metadata: &NativeMetadata,
 ) -> Option<Vec<u8>> {
     match fs_information_class {
         FILE_DIRECTORY_INFORMATION => Some(encode_file_directory_info(name, metadata)),
@@ -70,7 +69,7 @@ pub fn encode_dir_entry(
 #[cfg(test)]
 pub fn encode_dir_entries(
     fs_information_class: u32,
-    entries: &[(String, Metadata)],
+    entries: &[(String, NativeMetadata)],
 ) -> Option<Vec<u8>> {
     if entries.is_empty() {
         return None;
@@ -128,7 +127,7 @@ pub fn encode_dir_entries(
 fn write_common_dir_header(
     buf: &mut Vec<u8>,
     name: &str,
-    metadata: &Metadata,
+    metadata: &NativeMetadata,
     file_name_length: u32,
 ) {
     let (creation, last_access, last_write, change) = extract_times(metadata);
@@ -161,7 +160,7 @@ fn write_common_dir_header(
 /// Encode FILE_DIRECTORY_INFORMATION (class 1).
 ///
 /// Header: 64 bytes (common 60 + FileNameLength 4) + FileName.
-fn encode_file_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
+fn encode_file_directory_info(name: &str, metadata: &NativeMetadata) -> Vec<u8> {
     let file_name_bytes = encode_utf16le(name);
     let mut buf = Vec::with_capacity(DIR_INFO_HEADER + file_name_bytes.len());
     write_common_dir_header(&mut buf, name, metadata, file_name_bytes.len() as u32);
@@ -173,7 +172,7 @@ fn encode_file_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
 ///
 /// Same as class 1 with an additional EaSize (u32) field.
 /// Header: 68 bytes + FileName.
-fn encode_file_full_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
+fn encode_file_full_directory_info(name: &str, metadata: &NativeMetadata) -> Vec<u8> {
     let file_name_bytes = encode_utf16le(name);
     let mut buf = Vec::with_capacity(FULL_DIR_INFO_HEADER + file_name_bytes.len());
     write_common_dir_header(&mut buf, name, metadata, file_name_bytes.len() as u32);
@@ -188,7 +187,7 @@ fn encode_file_full_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
 /// Same as class 2 with additional ShortNameLength (u8), Reserved (u8),
 /// and ShortName (24 bytes) after EaSize.
 /// Header: 94 bytes + FileName.
-fn encode_file_both_directory_info(name: &str, metadata: &Metadata) -> Vec<u8> {
+fn encode_file_both_directory_info(name: &str, metadata: &NativeMetadata) -> Vec<u8> {
     let file_name_bytes = encode_utf16le(name);
     let mut buf = Vec::with_capacity(BOTH_DIR_INFO_HEADER + file_name_bytes.len());
     write_common_dir_header(&mut buf, name, metadata, file_name_bytes.len() as u32);
@@ -235,42 +234,34 @@ fn encode_file_names_info(name: &str) -> Vec<u8> {
 
 /// Extract all four time fields from metadata, converting to Windows FILETIME (i64).
 ///
-/// Falls back to 0 if a time field is not available (e.g., on some platforms).
-fn extract_times(metadata: &Metadata) -> (i64, i64, i64, i64) {
-    let creation = metadata
-        .created()
-        .map(system_time_to_filetime)
-        .unwrap_or(0);
-    let last_access = metadata
-        .accessed()
-        .map(system_time_to_filetime)
-        .unwrap_or(0);
-    let last_write = metadata
-        .modified()
-        .map(system_time_to_filetime)
-        .unwrap_or(0);
-    // ChangeTime = LastWriteTime (no separate change time in std::fs::Metadata)
+/// Falls back to 0 if a time field is not available.  ChangeTime is reported
+/// equal to LastWriteTime since the platform-neutral [`NativeMetadata`] does
+/// not carry a separate ctime/change-time value.
+fn extract_times(metadata: &NativeMetadata) -> (i64, i64, i64, i64) {
+    let creation = option_time_to_filetime(metadata.created);
+    let last_access = option_time_to_filetime(metadata.accessed);
+    let last_write = option_time_to_filetime(metadata.modified);
     let change = last_write;
 
     (creation, last_access, last_write, change)
 }
 
 /// Get the file size. Directories report 0.
-fn file_size(metadata: &Metadata) -> i64 {
-    if metadata.is_dir() {
+fn file_size(metadata: &NativeMetadata) -> i64 {
+    if metadata.is_dir {
         0
     } else {
-        metadata.len() as i64
+        metadata.size as i64
     }
 }
 
 /// Compute the allocation size (rounded up to [`ALLOCATION_UNIT_BYTES`] blocks).
 /// Directories report 0.
-fn compute_allocation_size(metadata: &Metadata) -> i64 {
-    if metadata.is_dir() {
+fn compute_allocation_size(metadata: &NativeMetadata) -> i64 {
+    if metadata.is_dir {
         0
     } else {
-        align_allocation(metadata.len(), ALLOCATION_UNIT_BYTES)
+        align_allocation(metadata.size, ALLOCATION_UNIT_BYTES)
     }
 }
 
@@ -304,7 +295,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.path().join("test.txt");
         fs::write(&p, b"hello").unwrap();
-        let meta = fs::metadata(&p).unwrap();
+        let meta = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         let entry = encode_dir_entry(FILE_DIRECTORY_INFORMATION, "test.txt", &meta).unwrap();
         let name_bytes = encode_utf16le("test.txt");
@@ -316,7 +307,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.path().join("a.txt");
         fs::write(&p, b"").unwrap();
-        let meta = fs::metadata(&p).unwrap();
+        let meta = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         let entry = encode_dir_entry(FILE_DIRECTORY_INFORMATION, "a.txt", &meta).unwrap();
         let next_offset = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
@@ -330,7 +321,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.path().join("test.txt");
         fs::write(&p, b"hello").unwrap();
-        let meta = fs::metadata(&p).unwrap();
+        let meta = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         let entry =
             encode_dir_entry(FILE_FULL_DIRECTORY_INFORMATION, "test.txt", &meta).unwrap();
@@ -345,7 +336,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.path().join("test.txt");
         fs::write(&p, b"hello").unwrap();
-        let meta = fs::metadata(&p).unwrap();
+        let meta = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         let entry =
             encode_dir_entry(FILE_BOTH_DIRECTORY_INFORMATION, "test.txt", &meta).unwrap();
@@ -358,7 +349,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.path().join("test.txt");
         fs::write(&p, b"hello").unwrap();
-        let meta = fs::metadata(&p).unwrap();
+        let meta = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         let entry =
             encode_dir_entry(FILE_BOTH_DIRECTORY_INFORMATION, "test.txt", &meta).unwrap();
@@ -377,7 +368,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.path().join("x");
         fs::write(&p, b"").unwrap();
-        let meta = fs::metadata(&p).unwrap();
+        let meta = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         let entry = encode_dir_entry(FILE_NAMES_INFORMATION, "x", &meta).unwrap();
         let name_bytes = encode_utf16le("x");
@@ -391,7 +382,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.path().join("abc.txt");
         fs::write(&p, b"").unwrap();
-        let meta = fs::metadata(&p).unwrap();
+        let meta = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         let entry = encode_dir_entry(FILE_NAMES_INFORMATION, "abc.txt", &meta).unwrap();
         // FileNameLength at offset 8
@@ -406,7 +397,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.path().join("x");
         fs::write(&p, b"").unwrap();
-        let meta = fs::metadata(&p).unwrap();
+        let meta = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         assert!(encode_dir_entry(0xFF, "x", &meta).is_none());
     }
@@ -423,7 +414,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.path().join("file.txt");
         fs::write(&p, b"data").unwrap();
-        let meta = fs::metadata(&p).unwrap();
+        let meta = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         let entries = vec![("file.txt".to_string(), meta.clone())];
         let buf = encode_dir_entries(FILE_DIRECTORY_INFORMATION, &entries).unwrap();
@@ -444,11 +435,11 @@ mod tests {
         // Create two files with different name lengths.
         let p1 = dir.path().join("a.txt");
         fs::write(&p1, b"hello").unwrap();
-        let m1 = fs::metadata(&p1).unwrap();
+        let m1 = NativeMetadata::from_std(&fs::metadata(&p1).unwrap());
 
         let p2 = dir.path().join("bb.txt");
         fs::write(&p2, b"world!").unwrap();
-        let m2 = fs::metadata(&p2).unwrap();
+        let m2 = NativeMetadata::from_std(&fs::metadata(&p2).unwrap());
 
         let entries = vec![
             ("a.txt".to_string(), m1.clone()),
@@ -485,15 +476,15 @@ mod tests {
 
         let p1 = dir.path().join("x");
         fs::write(&p1, b"").unwrap();
-        let m1 = fs::metadata(&p1).unwrap();
+        let m1 = NativeMetadata::from_std(&fs::metadata(&p1).unwrap());
 
         let p2 = dir.path().join("yy");
         fs::write(&p2, b"ab").unwrap();
-        let m2 = fs::metadata(&p2).unwrap();
+        let m2 = NativeMetadata::from_std(&fs::metadata(&p2).unwrap());
 
         let p3 = dir.path().join("zzz");
         fs::write(&p3, b"abc").unwrap();
-        let m3 = fs::metadata(&p3).unwrap();
+        let m3 = NativeMetadata::from_std(&fs::metadata(&p3).unwrap());
 
         let entries = vec![
             ("x".to_string(), m1.clone()),
@@ -531,11 +522,11 @@ mod tests {
         // "x" -> 12 + 2 = 14 bytes (needs 2 bytes padding to reach 16)
         let p = dir.path().join("x");
         fs::write(&p, b"").unwrap();
-        let mx = fs::metadata(&p).unwrap();
+        let mx = NativeMetadata::from_std(&fs::metadata(&p).unwrap());
 
         let p2 = dir.path().join("y");
         fs::write(&p2, b"").unwrap();
-        let my = fs::metadata(&p2).unwrap();
+        let my = NativeMetadata::from_std(&fs::metadata(&p2).unwrap());
 
         let entries = vec![("x".to_string(), mx), ("y".to_string(), my)];
         let buf = encode_dir_entries(FILE_NAMES_INFORMATION, &entries).unwrap();

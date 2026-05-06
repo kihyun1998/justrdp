@@ -2,8 +2,12 @@
 //!
 //! Encodes metadata into raw little-endian byte buffers for `IRP_MJ_QUERY_INFORMATION`
 //! responses and decodes `IRP_MJ_SET_INFORMATION` request buffers.
+//!
+//! Encoders take [`NativeMetadata`] (the adapter-neutral metadata struct
+//! exposed by [`crate::FilesystemSurface`]).  Tests synthesize metadata
+//! either via `NativeMetadata::from_std(...)` from a real file, or by
+//! constructing the struct directly with no on-disk side effects.
 
-use std::fs::Metadata;
 #[cfg(test)]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,6 +16,8 @@ use justrdp_rdpdr::pdu::irp::{
     FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
     FILE_ATTRIBUTE_READONLY,
 };
+
+use crate::surface::NativeMetadata;
 
 // ── FILETIME ────────────────────────────────────────────────────────────────
 
@@ -66,27 +72,28 @@ pub fn filetime_to_system_time(filetime: i64) -> Option<SystemTime> {
 
 // ── File Attributes ─────────────────────────────────────────────────────────
 
-/// Map `std::fs::Metadata` to NT file attributes (MS-FSCC 2.6).
-pub fn metadata_to_attributes(metadata: &Metadata) -> u32 {
+/// Map [`NativeMetadata`] to NT file attributes (MS-FSCC 2.6).
+pub fn metadata_to_attributes(metadata: &NativeMetadata) -> u32 {
     metadata_to_attributes_inner(metadata, false)
 }
 
 /// Map metadata to attributes, considering the filename for hidden detection.
 ///
-/// On Unix, files starting with `.` are treated as hidden.
-pub fn metadata_to_attributes_with_name(metadata: &Metadata, name: &str) -> u32 {
+/// Files starting with `.` are treated as hidden — this is a Unix
+/// convention surfaced through RDP regardless of the host platform.
+pub fn metadata_to_attributes_with_name(metadata: &NativeMetadata, name: &str) -> u32 {
     let is_hidden = name.starts_with('.');
     metadata_to_attributes_inner(metadata, is_hidden)
 }
 
-fn metadata_to_attributes_inner(metadata: &Metadata, hidden: bool) -> u32 {
+fn metadata_to_attributes_inner(metadata: &NativeMetadata, hidden: bool) -> u32 {
     let mut attrs = 0u32;
 
-    if metadata.is_dir() {
+    if metadata.is_dir {
         attrs |= FILE_ATTRIBUTE_DIRECTORY;
     }
 
-    if is_readonly(metadata) {
+    if metadata.is_readonly {
         attrs |= FILE_ATTRIBUTE_READONLY;
     }
 
@@ -94,7 +101,7 @@ fn metadata_to_attributes_inner(metadata: &Metadata, hidden: bool) -> u32 {
         attrs |= FILE_ATTRIBUTE_HIDDEN;
     }
 
-    if metadata.is_dir() {
+    if metadata.is_dir {
         // Directories: just the directory flag + any other flags (readonly, hidden)
         attrs
     } else if attrs == 0 {
@@ -104,24 +111,6 @@ fn metadata_to_attributes_inner(metadata: &Metadata, hidden: bool) -> u32 {
         // Regular file with some attributes — add ARCHIVE
         attrs | FILE_ATTRIBUTE_ARCHIVE
     }
-}
-
-#[cfg(windows)]
-fn is_readonly(metadata: &Metadata) -> bool {
-    metadata.permissions().readonly()
-}
-
-#[cfg(unix)]
-fn is_readonly(metadata: &Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = metadata.permissions().mode();
-    // Check if owner write bit is not set
-    mode & 0o200 == 0
-}
-
-#[cfg(not(any(unix, windows)))]
-fn is_readonly(metadata: &Metadata) -> bool {
-    metadata.permissions().readonly()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -138,10 +127,11 @@ pub fn align_allocation(size: u64, block_size: u64) -> i64 {
     i64::try_from(aligned).unwrap_or(i64::MAX)
 }
 
-fn time_to_filetime_or_zero(time: std::io::Result<SystemTime>) -> i64 {
+/// Convert `Option<SystemTime>` to FILETIME, with `None` mapping to `0`.
+pub fn option_time_to_filetime(time: Option<SystemTime>) -> i64 {
     match time {
-        Ok(t) => system_time_to_filetime(t),
-        Err(_) => 0,
+        Some(t) => system_time_to_filetime(t),
+        None => 0,
     }
 }
 
@@ -150,12 +140,12 @@ fn time_to_filetime_or_zero(time: std::io::Result<SystemTime>) -> i64 {
 /// Encode FILE_BASIC_INFORMATION (class 4) — 40 bytes.
 ///
 /// MS-FSCC 2.4.7
-pub fn encode_basic_info(metadata: &Metadata) -> Vec<u8> {
+pub fn encode_basic_info(metadata: &NativeMetadata) -> Vec<u8> {
     let mut buf = Vec::with_capacity(40);
 
-    let creation_time = time_to_filetime_or_zero(metadata.created());
-    let last_access_time = time_to_filetime_or_zero(metadata.accessed());
-    let last_write_time = time_to_filetime_or_zero(metadata.modified());
+    let creation_time = option_time_to_filetime(metadata.created);
+    let last_access_time = option_time_to_filetime(metadata.accessed);
+    let last_write_time = option_time_to_filetime(metadata.modified);
     let change_time = last_write_time;
     let file_attributes = metadata_to_attributes(metadata);
 
@@ -172,11 +162,11 @@ pub fn encode_basic_info(metadata: &Metadata) -> Vec<u8> {
 /// Encode FILE_STANDARD_INFORMATION (class 5) — 24 bytes.
 ///
 /// MS-FSCC 2.4.41
-pub fn encode_standard_info(metadata: &Metadata) -> Vec<u8> {
+pub fn encode_standard_info(metadata: &NativeMetadata) -> Vec<u8> {
     let mut buf = Vec::with_capacity(24);
 
-    let is_dir = metadata.is_dir();
-    let file_size = if is_dir { 0 } else { metadata.len() };
+    let is_dir = metadata.is_dir;
+    let file_size = if is_dir { 0 } else { metadata.size };
     let allocation_size = align_allocation(file_size, ALLOCATION_UNIT_BYTES);
 
     buf.extend_from_slice(&allocation_size.to_le_bytes()); // AllocationSize
@@ -192,7 +182,7 @@ pub fn encode_standard_info(metadata: &Metadata) -> Vec<u8> {
 /// Encode FILE_ATTRIBUTE_TAG_INFORMATION (class 35) — 8 bytes.
 ///
 /// MS-FSCC 2.4.6
-pub fn encode_attribute_tag_info(metadata: &Metadata) -> Vec<u8> {
+pub fn encode_attribute_tag_info(metadata: &NativeMetadata) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8);
 
     let file_attributes = metadata_to_attributes(metadata);
@@ -377,7 +367,7 @@ mod tests {
     #[test]
     fn encode_basic_info_size() {
         let tmp = tempfile();
-        let metadata = fs::metadata(tmp.path()).unwrap();
+        let metadata = NativeMetadata::from_std(&fs::metadata(tmp.path()).unwrap());
         let buf = encode_basic_info(&metadata);
         assert_eq!(buf.len(), 40);
     }
@@ -385,7 +375,7 @@ mod tests {
     #[test]
     fn encode_standard_info_size() {
         let tmp = tempfile();
-        let metadata = fs::metadata(tmp.path()).unwrap();
+        let metadata = NativeMetadata::from_std(&fs::metadata(tmp.path()).unwrap());
         let buf = encode_standard_info(&metadata);
         assert_eq!(buf.len(), 24);
     }
@@ -395,7 +385,7 @@ mod tests {
         let tmp = tempfile();
         // Write some data so len > 0
         std::fs::write(tmp.path(), &[0u8; 5000]).unwrap();
-        let metadata = fs::metadata(tmp.path()).unwrap();
+        let metadata = NativeMetadata::from_std(&fs::metadata(tmp.path()).unwrap());
         let buf = encode_standard_info(&metadata);
         assert_eq!(buf.len(), 24);
 
@@ -411,7 +401,7 @@ mod tests {
     #[test]
     fn encode_standard_info_directory() {
         let dir = tempdir();
-        let metadata = fs::metadata(dir.path()).unwrap();
+        let metadata = NativeMetadata::from_std(&fs::metadata(dir.path()).unwrap());
         let buf = encode_standard_info(&metadata);
         assert_eq!(buf.len(), 24);
 
@@ -422,7 +412,7 @@ mod tests {
     #[test]
     fn encode_attribute_tag_info_size() {
         let tmp = tempfile();
-        let metadata = fs::metadata(tmp.path()).unwrap();
+        let metadata = NativeMetadata::from_std(&fs::metadata(tmp.path()).unwrap());
         let buf = encode_attribute_tag_info(&metadata);
         assert_eq!(buf.len(), 8);
 
@@ -434,7 +424,7 @@ mod tests {
     #[test]
     fn attributes_directory() {
         let dir = tempdir();
-        let metadata = fs::metadata(dir.path()).unwrap();
+        let metadata = NativeMetadata::from_std(&fs::metadata(dir.path()).unwrap());
         let attrs = metadata_to_attributes(&metadata);
         assert!(attrs & FILE_ATTRIBUTE_DIRECTORY != 0);
     }
@@ -442,7 +432,7 @@ mod tests {
     #[test]
     fn attributes_regular_file() {
         let tmp = tempfile();
-        let metadata = fs::metadata(tmp.path()).unwrap();
+        let metadata = NativeMetadata::from_std(&fs::metadata(tmp.path()).unwrap());
         let attrs = metadata_to_attributes(&metadata);
         // A regular writable file should have ARCHIVE (MS-FSCC 2.6)
         assert!(
@@ -455,7 +445,7 @@ mod tests {
     #[test]
     fn attributes_hidden_dotfile() {
         let tmp = tempfile();
-        let metadata = fs::metadata(tmp.path()).unwrap();
+        let metadata = NativeMetadata::from_std(&fs::metadata(tmp.path()).unwrap());
         let attrs = metadata_to_attributes_with_name(&metadata, ".hidden_file");
         assert!(attrs & FILE_ATTRIBUTE_HIDDEN != 0);
     }

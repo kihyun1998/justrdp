@@ -1,10 +1,11 @@
-//! Requires unsafe for libc and windows-sys FFI. All unsafe blocks are individually documented.
-#![allow(unsafe_code)]
-
 //! Native filesystem backend for Device Redirection (MS-RDPEFS).
 //!
-//! Provides [`NativeFilesystemBackend`] which implements [`RdpdrBackend`]
-//! using `std::fs` operations to serve a local directory as a redirected drive.
+//! [`NativeFilesystemBackend`] implements [`RdpdrBackend`] by translating
+//! the RDPEFS / FSCC wire protocol into operations against a pluggable
+//! [`FilesystemSurface`] adapter.  The default adapter is [`StdFilesystem`],
+//! which serves a local directory as a redirected drive via `std::fs`.
+//! Test code can substitute a mock surface (no real disk required) — see
+//! ADR-0006 for the deepening rationale.
 
 mod create;
 mod dir_info;
@@ -22,8 +23,6 @@ pub use surface::{
     OpenKind, OpenOptions, OpenOutcome, Opened,
 };
 
-use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use justrdp_rdpdr::pdu::device::DeviceAnnounce;
@@ -35,11 +34,14 @@ use justrdp_rdpdr::pdu::irp::{
 };
 use justrdp_rdpdr::{CreateResponse, DeviceIoError, DeviceIoResult, FileHandle, RdpdrBackend};
 
-use crate::create::open_file;
+use crate::create::{
+    FILE_CREATED, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPENED,
+    FILE_OVERWRITTEN, FILE_SUPERSEDED,
+};
 use crate::dir_info::encode_dir_entry;
 use crate::fs_info::{
     encode_attribute_tag_info, encode_basic_info, encode_standard_info, parse_basic_info_set,
-    parse_disposition, parse_end_of_file, parse_rename,
+    parse_disposition, parse_end_of_file, parse_rename, BasicInfoSet, FILETIME_UNIX_EPOCH_OFFSET,
 };
 use crate::handle_map::{DirEntry, DirState, HandleMap};
 use crate::path::rdp_to_local;
@@ -55,6 +57,7 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
 const STATUS_DISK_FULL: u32 = 0xC000_007F;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const STATUS_FILE_LOCK_CONFLICT: u32 = 0xC000_0054;
 
 // ── Lock operation flags (MS-RDPEFS, aligned with Windows SL_ constants) ──
 
@@ -74,10 +77,23 @@ const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 // FILE_ACTION constants (MS-FSCC 2.4.42)
 const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
 
+// DesiredAccess flags (MS-SMB2 2.2.13.1.1) — used by raw_to_opts
+const FILE_READ_DATA: u32 = 0x0000_0001;
+const FILE_WRITE_DATA: u32 = 0x0000_0002;
+const FILE_APPEND_DATA: u32 = 0x0000_0004;
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_ALL: u32 = 0x1000_0000;
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+
 // ── NativeFilesystemBackend ────────────────────────────────────────────────
 
 /// A native filesystem backend that shares a local directory as an RDP
 /// redirected drive.
+///
+/// Generic over a [`FilesystemSurface`] adapter `F`.  The default
+/// (`F = StdFilesystem`) is the production adapter; tests can construct
+/// the backend with a mock surface via [`NativeFilesystemBackend::with_surface`].
 ///
 /// # Example
 ///
@@ -88,18 +104,19 @@ const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
 /// let backend = NativeFilesystemBackend::new("/shared/folder", 1, "C:");
 /// let rdpdr = RdpdrClient::new(Box::new(backend));
 /// ```
-pub struct NativeFilesystemBackend {
+pub struct NativeFilesystemBackend<F: FilesystemSurface = StdFilesystem> {
+    surface: F,
     root_path: PathBuf,
     device_id: u32,
     dos_name: String,
     display_name: Option<String>,
-    handles: HandleMap,
+    handles: HandleMap<F::Handle>,
     volume_label: String,
     fs_name: String,
 }
 
-impl NativeFilesystemBackend {
-    /// Create a new native filesystem backend.
+impl NativeFilesystemBackend<StdFilesystem> {
+    /// Create a new native filesystem backend backed by [`StdFilesystem`].
     ///
     /// - `root_path`: Local directory to share. Must exist and be a directory.
     /// - `device_id`: Client-assigned unique device ID.
@@ -110,6 +127,20 @@ impl NativeFilesystemBackend {
     /// Panics if `dos_name` exceeds 7 characters or if `root_path` is not an
     /// existing directory.
     pub fn new(root_path: impl Into<PathBuf>, device_id: u32, dos_name: &str) -> Self {
+        Self::with_surface(StdFilesystem::new(), root_path, device_id, dos_name)
+    }
+}
+
+impl<F: FilesystemSurface> NativeFilesystemBackend<F> {
+    /// Create a backend with a custom [`FilesystemSurface`] adapter.  Used by
+    /// the tests in this crate to substitute a mock surface for the real
+    /// `std::fs`.
+    pub fn with_surface(
+        surface: F,
+        root_path: impl Into<PathBuf>,
+        device_id: u32,
+        dos_name: &str,
+    ) -> Self {
         assert!(
             dos_name.len() <= 7,
             "dos_name must be at most 7 characters, got {}",
@@ -122,6 +153,7 @@ impl NativeFilesystemBackend {
             root_path
         );
         Self {
+            surface,
             root_path,
             device_id,
             dos_name: dos_name.to_string(),
@@ -150,114 +182,80 @@ impl NativeFilesystemBackend {
         self
     }
 
+    /// Borrow the underlying surface — used by tests to inspect mock state.
+    pub fn surface(&self) -> &F {
+        &self.surface
+    }
+
+    /// Mutably borrow the underlying surface — used by tests to mutate mock
+    /// state between operations.
+    pub fn surface_mut(&mut self) -> &mut F {
+        &mut self.surface
+    }
+
     /// Resolve an RDP path to a local path, returning a DeviceIoError on failure.
     fn resolve_path(&self, rdp_path: &str) -> DeviceIoResult<PathBuf> {
         rdp_to_local(&self.root_path, rdp_path)
             .ok_or(DeviceIoError::new(STATUS_ACCESS_DENIED))
     }
 
-    /// Map an `std::io::Error` to a `DeviceIoError`.
-    fn map_io_error(err: &std::io::Error) -> DeviceIoError {
-        match err.kind() {
-            std::io::ErrorKind::NotFound => DeviceIoError::no_such_file(),
-            std::io::ErrorKind::PermissionDenied => DeviceIoError::access_denied(),
-            std::io::ErrorKind::AlreadyExists => DeviceIoError::new(STATUS_OBJECT_NAME_COLLISION),
-            _ => DeviceIoError::unsuccessful(),
-        }
-    }
-
-    /// Simple glob pattern matching for directory queries.
-    ///
-    /// Supports `*` (match any), `?` (match one), and `*.*` (match all with extension).
-    fn pattern_matches(pattern: &str, name: &str) -> bool {
-        let pattern = pattern.trim_start_matches('\\').trim_start_matches('/');
-
-        // "*" and "*.*" match everything
-        if pattern == "*" || pattern == "*.*" {
-            return true;
-        }
-
-        // Simple character-by-character matching with `*` and `?`
-        Self::glob_match(pattern.as_bytes(), name.as_bytes())
-    }
-
-    fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-        let mut pi = 0;
-        let mut ti = 0;
-        let mut star_pi: Option<usize> = None;
-        let mut star_ti = 0;
-
-        while ti < text.len() {
-            if pi < pattern.len()
-                && (pattern[pi].eq_ignore_ascii_case(&text[ti]) || pattern[pi] == b'?')
-            {
-                pi += 1;
-                ti += 1;
-            } else if pi < pattern.len() && pattern[pi] == b'*' {
-                star_pi = Some(pi);
-                star_ti = ti;
-                pi += 1;
-            } else if let Some(sp) = star_pi {
-                pi = sp + 1;
-                star_ti += 1;
-                ti = star_ti;
-            } else {
-                return false;
-            }
-        }
-
-        while pi < pattern.len() && pattern[pi] == b'*' {
-            pi += 1;
-        }
-
-        pi == pattern.len()
-    }
-
     /// Maximum directory entries to buffer (prevents memory exhaustion from
     /// adversarial directories, e.g., millions of files).
     const MAX_DIR_ENTRIES: usize = 100_000;
 
-    /// Read a directory and build enumeration state.
-    fn populate_dir_state(dir_path: &std::path::Path, path: Option<&str>) -> DirState {
+    /// Read a directory via the surface and build enumeration state.
+    ///
+    /// "." and ".." are synthesized at this layer with minimal directory
+    /// metadata (`is_dir: true`, zero size, no timestamps).  The
+    /// [`FilesystemSurface`] does not expose a path-based stat method —
+    /// real adapters' `read_dir` already excludes "." / ".." so the
+    /// wrapper is responsible for filling them in.  Synthetic metadata
+    /// is acceptable because the encoded `FILE_*_DIRECTORY_INFORMATION`
+    /// entry needs only the directory bit set; consumers do not validate
+    /// timestamps for these synthetic entries.
+    fn populate_dir_state(
+        surface: &F,
+        dir_path: &std::path::Path,
+        path: Option<&str>,
+    ) -> DirState {
         let pattern = path
             .map(|p| p.trim_start_matches('\\').trim_start_matches('/'))
             .unwrap_or("*");
 
         let mut entries = Vec::new();
 
-        // Add "." and ".." entries first
-        if Self::pattern_matches(pattern, ".") {
-            if let Ok(meta) = fs::metadata(dir_path) {
-                entries.push(DirEntry {
-                    name: ".".to_string(),
-                    metadata: meta,
-                });
-            }
+        let dot_metadata = NativeMetadata {
+            is_dir: true,
+            is_readonly: false,
+            size: 0,
+            created: None,
+            accessed: None,
+            modified: None,
+        };
+
+        if pattern_matches(pattern, ".") {
+            entries.push(DirEntry {
+                name: ".".to_string(),
+                metadata: dot_metadata.clone(),
+            });
         }
-        if Self::pattern_matches(pattern, "..") {
-            let parent_meta = dir_path
-                .parent()
-                .and_then(|p| fs::metadata(p).ok())
-                .or_else(|| fs::metadata(dir_path).ok());
-            if let Some(meta) = parent_meta {
-                entries.push(DirEntry {
-                    name: "..".to_string(),
-                    metadata: meta,
-                });
-            }
+        if pattern_matches(pattern, "..") {
+            entries.push(DirEntry {
+                name: "..".to_string(),
+                metadata: dot_metadata,
+            });
         }
 
-        // Read directory contents (capped at MAX_DIR_ENTRIES)
-        if let Ok(read_dir) = fs::read_dir(dir_path) {
-            for dir_entry in read_dir.flatten() {
+        if let Ok(read_dir) = surface.read_dir(dir_path) {
+            for native_entry in read_dir {
                 if entries.len() >= Self::MAX_DIR_ENTRIES {
                     break;
                 }
-                let name = dir_entry.file_name().to_string_lossy().to_string();
-                if Self::pattern_matches(pattern, &name) {
-                    if let Ok(meta) = dir_entry.metadata() {
-                        entries.push(DirEntry { name, metadata: meta });
-                    }
+                if pattern_matches(pattern, &native_entry.name) {
+                    entries.push(DirEntry {
+                        name: native_entry.name,
+                        metadata: native_entry.metadata,
+                    });
                 }
             }
         }
@@ -267,9 +265,17 @@ impl NativeFilesystemBackend {
             cursor: 0,
         }
     }
+
+    // Glob-pattern helpers exposed at the impl level so the existing tests
+    // can address them without specifying a concrete `F`.  These delegate to
+    // the free-function implementations.
+    #[cfg(test)]
+    fn pattern_matches(pattern: &str, name: &str) -> bool {
+        pattern_matches(pattern, name)
+    }
 }
 
-impl std::fmt::Debug for NativeFilesystemBackend {
+impl<F: FilesystemSurface> std::fmt::Debug for NativeFilesystemBackend<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeFilesystemBackend")
             .field("root_path", &self.root_path)
@@ -279,9 +285,172 @@ impl std::fmt::Debug for NativeFilesystemBackend {
     }
 }
 
+// ── Glob pattern matching (free functions) ──────────────────────────────────
+
+/// Simple glob pattern matching for directory queries.
+///
+/// Supports `*` (match any), `?` (match one), and `*.*` (match all with extension).
+fn pattern_matches(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.trim_start_matches('\\').trim_start_matches('/');
+
+    // "*" and "*.*" match everything
+    if pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+
+    glob_match(pattern.as_bytes(), name.as_bytes())
+}
+
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let mut pi = 0;
+    let mut ti = 0;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0;
+
+    while ti < text.len() {
+        if pi < pattern.len()
+            && (pattern[pi].eq_ignore_ascii_case(&text[ti]) || pattern[pi] == b'?')
+        {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
+}
+
+// ── Raw → typed translations ────────────────────────────────────────────────
+
+/// Translate the raw `IRP_MJ_CREATE` parameters into typed [`OpenOptions`]
+/// plus a separately-returned `delete_on_close` flag (which the wrapper
+/// owns; the surface does not see it).
+fn raw_to_opts(
+    desired_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+) -> DeviceIoResult<(OpenOptions, bool)> {
+    use justrdp_rdpdr::pdu::irp::{
+        FILE_CREATE, FILE_OPEN, FILE_OPEN_IF, FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE,
+    };
+
+    let need_write = desired_access
+        & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL)
+        != 0;
+    let need_read = desired_access
+        & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL | MAXIMUM_ALLOWED)
+        != 0
+        || !need_write; // default to read if no specific flags
+
+    let access = match (need_read, need_write) {
+        (true, true) => OpenAccess::ReadWrite,
+        (false, true) => OpenAccess::Write,
+        _ => OpenAccess::Read,
+    };
+
+    let disposition = match create_disposition {
+        FILE_OPEN => OpenDisposition::Open,
+        FILE_CREATE => OpenDisposition::Create,
+        FILE_OPEN_IF => OpenDisposition::OpenIf,
+        FILE_OVERWRITE => OpenDisposition::Overwrite,
+        FILE_OVERWRITE_IF => OpenDisposition::OverwriteIf,
+        FILE_SUPERSEDE => OpenDisposition::Supersede,
+        _ => return Err(DeviceIoError::new(STATUS_INVALID_PARAMETER)),
+    };
+
+    let kind = if create_options & FILE_DIRECTORY_FILE != 0 {
+        OpenKind::Directory
+    } else if create_options & FILE_NON_DIRECTORY_FILE != 0 {
+        OpenKind::FileStrict
+    } else {
+        OpenKind::File
+    };
+
+    let append = desired_access & FILE_APPEND_DATA != 0;
+    let delete_on_close = create_options & FILE_DELETE_ON_CLOSE != 0;
+
+    Ok((
+        OpenOptions {
+            access,
+            disposition,
+            kind,
+            append,
+        },
+        delete_on_close,
+    ))
+}
+
+fn outcome_to_information(outcome: OpenOutcome) -> u8 {
+    match outcome {
+        OpenOutcome::Created => FILE_CREATED,
+        OpenOutcome::Opened => FILE_OPENED,
+        OpenOutcome::Overwritten => FILE_OVERWRITTEN,
+        OpenOutcome::Superseded => FILE_SUPERSEDED,
+    }
+}
+
+/// Map a [`NativeFilesystemError`] to the RDPEFS [`DeviceIoError`] the
+/// caller expects.  Variant-by-variant translation keeps the wrapper
+/// independent of `std::io::ErrorKind`.
+fn map_native_fs_error(e: NativeFilesystemError) -> DeviceIoError {
+    match e {
+        NativeFilesystemError::NotFound => DeviceIoError::no_such_file(),
+        NativeFilesystemError::AccessDenied => DeviceIoError::access_denied(),
+        NativeFilesystemError::AlreadyExists => DeviceIoError::new(STATUS_OBJECT_NAME_COLLISION),
+        NativeFilesystemError::DiskFull => DeviceIoError::new(STATUS_DISK_FULL),
+        NativeFilesystemError::NotADirectory => DeviceIoError::new(STATUS_NOT_A_DIRECTORY),
+        NativeFilesystemError::Locked => DeviceIoError::new(STATUS_FILE_LOCK_CONFLICT),
+        NativeFilesystemError::Unsupported => DeviceIoError::not_supported(),
+        NativeFilesystemError::InvalidInput => DeviceIoError::new(STATUS_INVALID_PARAMETER),
+        NativeFilesystemError::OsApi(_) => DeviceIoError::unsuccessful(),
+    }
+}
+
+/// Convert a parsed `FILE_BASIC_INFORMATION` request into a typed
+/// [`FileTimes`] for the surface.  Slots with sentinel values `0`
+/// ("don't change") and `-1` ("don't update on subsequent ops") become
+/// `None`; positive values are converted to `SystemTime`.
+fn basic_info_to_file_times(info: &BasicInfoSet) -> FileTimes {
+    FileTimes {
+        creation: filetime_to_system_time(info.creation_time),
+        access: filetime_to_system_time(info.last_access_time),
+        write: filetime_to_system_time(info.last_write_time),
+    }
+}
+
+fn filetime_to_system_time(ft: i64) -> Option<std::time::SystemTime> {
+    if ft <= 0 {
+        return None; // 0 = "don't change", -1 = "don't update"; both → no-op
+    }
+    let relative = ft - FILETIME_UNIX_EPOCH_OFFSET;
+    if relative < 0 {
+        Some(std::time::UNIX_EPOCH) // Pre-1970 — clamp to epoch (best effort)
+    } else {
+        let secs = (relative / 10_000_000) as u64;
+        let nanos = ((relative % 10_000_000) * 100) as u32;
+        Some(
+            std::time::UNIX_EPOCH
+                + std::time::Duration::new(secs, nanos),
+        )
+    }
+}
+
 // ── RdpdrBackend implementation ────────────────────────────────────────────
 
-impl RdpdrBackend for NativeFilesystemBackend {
+impl<F: FilesystemSurface> RdpdrBackend for NativeFilesystemBackend<F> {
     fn device_list(&self) -> Vec<DeviceAnnounce> {
         vec![DeviceAnnounce::filesystem(
             self.device_id,
@@ -301,27 +470,27 @@ impl RdpdrBackend for NativeFilesystemBackend {
         desired_access: u32,
         create_disposition: u32,
         create_options: u32,
-        file_attributes: u32,
+        _file_attributes: u32,
     ) -> DeviceIoResult<CreateResponse> {
         let local_path = self.resolve_path(path)?;
+        let (opts, delete_on_close) =
+            raw_to_opts(desired_access, create_disposition, create_options)?;
 
-        let result = open_file(
-            &local_path,
-            desired_access,
-            create_disposition,
-            create_options,
-            file_attributes,
-        )
-        .map_err(|e| Self::map_io_error(&e))?;
+        let opened = self
+            .surface
+            .open(&local_path, opts)
+            .map_err(map_native_fs_error)?;
+
+        let information = outcome_to_information(opened.outcome);
 
         let file_id = self
             .handles
-            .insert(result.file, local_path, result.is_dir, result.delete_on_close)
+            .insert(opened.handle, local_path, opened.is_dir, delete_on_close)
             .ok_or(DeviceIoError::new(STATUS_INSUFFICIENT_RESOURCES))?;
 
         Ok(CreateResponse {
             file_id,
-            information: result.information,
+            information,
         })
     }
 
@@ -331,14 +500,19 @@ impl RdpdrBackend for NativeFilesystemBackend {
             .remove(&file_id)
             .ok_or(DeviceIoError::no_such_file())?;
 
-        // Handle delete-on-close: remove after handle is dropped, then report any error.
+        // Close the surface handle first so any platform locks are
+        // released before we attempt the deletion below.
+        self.surface
+            .close(entry.handle)
+            .map_err(map_native_fs_error)?;
+
         if entry.delete_on_close {
             let result = if entry.is_dir {
-                fs::remove_dir(&entry.path)
+                self.surface.remove_dir(&entry.path)
             } else {
-                fs::remove_file(&entry.path)
+                self.surface.remove_file(&entry.path)
             };
-            result.map_err(|e| Self::map_io_error(&e))?;
+            result.map_err(map_native_fs_error)?;
         }
 
         Ok(())
@@ -351,25 +525,15 @@ impl RdpdrBackend for NativeFilesystemBackend {
         length: u32,
         offset: u64,
     ) -> DeviceIoResult<Vec<u8>> {
+        let capped_length = length.min(MAX_READ_BYTES) as usize;
         let entry = self
             .handles
             .get_mut(&file_id)
             .ok_or(DeviceIoError::no_such_file())?;
 
-        entry
-            .file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| Self::map_io_error(&e))?;
-
-        let capped_length = length.min(MAX_READ_BYTES) as usize;
-        let mut buf = vec![0u8; capped_length];
-        let n = entry
-            .file
-            .read(&mut buf)
-            .map_err(|e| Self::map_io_error(&e))?;
-        buf.truncate(n);
-
-        Ok(buf)
+        self.surface
+            .read(&mut entry.handle, offset, capped_length)
+            .map_err(map_native_fs_error)
     }
 
     fn write(
@@ -379,28 +543,19 @@ impl RdpdrBackend for NativeFilesystemBackend {
         offset: u64,
         data: &[u8],
     ) -> DeviceIoResult<u32> {
-        let entry = self
-            .handles
-            .get_mut(&file_id)
-            .ok_or(DeviceIoError::no_such_file())?;
-
-        entry
-            .file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| Self::map_io_error(&e))?;
-
         let data = if data.len() > MAX_WRITE_BYTES {
             &data[..MAX_WRITE_BYTES]
         } else {
             data
         };
+        let entry = self
+            .handles
+            .get_mut(&file_id)
+            .ok_or(DeviceIoError::no_such_file())?;
 
-        entry
-            .file
-            .write_all(data)
-            .map_err(|e| Self::map_io_error(&e))?;
-
-        Ok(data.len() as u32)
+        self.surface
+            .write(&mut entry.handle, offset, data)
+            .map_err(map_native_fs_error)
     }
 
     fn device_control(
@@ -425,10 +580,10 @@ impl RdpdrBackend for NativeFilesystemBackend {
             .get(&file_id)
             .ok_or(DeviceIoError::no_such_file())?;
 
-        let metadata = entry
-            .file
-            .metadata()
-            .map_err(|e| Self::map_io_error(&e))?;
+        let metadata = self
+            .surface
+            .metadata(&entry.handle)
+            .map_err(map_native_fs_error)?;
 
         match fs_information_class {
             FILE_BASIC_INFORMATION => Ok(encode_basic_info(&metadata)),
@@ -463,8 +618,10 @@ impl RdpdrBackend for NativeFilesystemBackend {
             FILE_FS_VOLUME_INFORMATION => Ok(encode_volume_info(&self.volume_label)),
 
             FILE_FS_SIZE_INFORMATION => {
-                let disk = DiskSpace::query(&self.root_path)
-                    .ok_or(DeviceIoError::unsuccessful())?;
+                let disk = self
+                    .surface
+                    .disk_space(&self.root_path)
+                    .map_err(map_native_fs_error)?;
                 Ok(encode_size_info(&disk))
             }
 
@@ -473,8 +630,10 @@ impl RdpdrBackend for NativeFilesystemBackend {
             FILE_FS_ATTRIBUTE_INFORMATION => Ok(encode_attribute_info(&self.fs_name)),
 
             FILE_FS_FULL_SIZE_INFORMATION => {
-                let disk = DiskSpace::query(&self.root_path)
-                    .ok_or(DeviceIoError::unsuccessful())?;
+                let disk = self
+                    .surface
+                    .disk_space(&self.root_path)
+                    .map_err(map_native_fs_error)?;
                 Ok(encode_full_size_info(&disk))
             }
 
@@ -490,6 +649,28 @@ impl RdpdrBackend for NativeFilesystemBackend {
         initial_query: bool,
         path: Option<&str>,
     ) -> DeviceIoResult<Vec<u8>> {
+        // `initial_query` populates the cursor — done with `&self.surface`
+        // before we take a `&mut` on the entry, to avoid reborrow issues.
+        if initial_query {
+            let entry = self
+                .handles
+                .get(&file_id)
+                .ok_or(DeviceIoError::no_such_file())?;
+
+            if !entry.is_dir {
+                return Err(DeviceIoError::new(STATUS_NOT_A_DIRECTORY));
+            }
+
+            let dir_path = entry.path.clone();
+            let new_state = Self::populate_dir_state(&self.surface, &dir_path, path);
+
+            let entry = self
+                .handles
+                .get_mut(&file_id)
+                .ok_or(DeviceIoError::no_such_file())?;
+            entry.dir_state = Some(new_state);
+        }
+
         let entry = self
             .handles
             .get_mut(&file_id)
@@ -499,11 +680,6 @@ impl RdpdrBackend for NativeFilesystemBackend {
             return Err(DeviceIoError::new(STATUS_NOT_A_DIRECTORY));
         }
 
-        if initial_query {
-            entry.dir_state = Some(Self::populate_dir_state(&entry.path, path));
-        }
-
-        // Return the next entry from the enumeration
         let dir_state = entry
             .dir_state
             .as_mut()
@@ -516,7 +692,6 @@ impl RdpdrBackend for NativeFilesystemBackend {
         let dir_entry = &dir_state.entries[dir_state.cursor];
         dir_state.cursor += 1;
 
-        // Encode a single entry
         let buf = encode_dir_entry(fs_information_class, &dir_entry.name, &dir_entry.metadata)
             .ok_or(DeviceIoError::not_supported())?;
 
@@ -539,15 +714,15 @@ impl RdpdrBackend for NativeFilesystemBackend {
             return Err(DeviceIoError::new(STATUS_NOT_A_DIRECTORY));
         }
 
-        // NOTE: This call blocks the current thread for up to 30 seconds waiting
-        // for a filesystem change event. Callers must invoke this method from a
-        // dedicated blocking thread — not from an async executor or the main
-        // RDP processing loop.
-        let changed_name = wait_for_directory_change(&entry.path)
-            .map_err(|_| DeviceIoError::unsuccessful())?;
+        // NOTE: `surface.watch` blocks the current thread for up to its own
+        // configured timeout (30 s for [`StdFilesystem`]).  Callers must
+        // invoke this method from a dedicated blocking thread — not from an
+        // async executor or the main RDP processing loop.
+        let changed_name = self
+            .surface
+            .watch(&entry.path)
+            .map_err(map_native_fs_error)?;
 
-        // Encode a single FILE_NOTIFY_INFORMATION entry.
-        // FILE_ACTION_MODIFIED (0x03) is a safe default for all change types.
         Ok(encode_notify_info(&changed_name, FILE_ACTION_MODIFIED))
     }
 
@@ -558,23 +733,25 @@ impl RdpdrBackend for NativeFilesystemBackend {
         operation: u32,
         locks: &[(u64, u64)],
     ) -> DeviceIoResult<()> {
+        let is_unlock = operation & SL_LOCK_RELEASE != 0;
+        let mode = LockMode {
+            exclusive: operation & SL_EXCLUSIVE_LOCK != 0,
+            fail_immediately: operation & SL_FAIL_IMMEDIATELY != 0,
+        };
+
         let entry = self
             .handles
-            .get(&file_id)
+            .get_mut(&file_id)
             .ok_or(DeviceIoError::no_such_file())?;
 
-        let is_unlock = operation & SL_LOCK_RELEASE != 0;
-        let is_exclusive = operation & SL_EXCLUSIVE_LOCK != 0;
-        let fail_immediately = operation & SL_FAIL_IMMEDIATELY != 0;
-
         for &(offset, length) in locks {
-            if is_unlock {
-                unlock_file(&entry.file, offset, length)
-                    .map_err(|e| Self::map_io_error(&e))?;
+            let range = LockRange { offset, length };
+            let result = if is_unlock {
+                self.surface.unlock(&mut entry.handle, range)
             } else {
-                lock_file(&entry.file, offset, length, !is_exclusive, fail_immediately)
-                    .map_err(|e| Self::map_io_error(&e))?;
-            }
+                self.surface.lock(&mut entry.handle, range, mode)
+            };
+            result.map_err(map_native_fs_error)?;
         }
 
         Ok(())
@@ -583,37 +760,23 @@ impl RdpdrBackend for NativeFilesystemBackend {
 
 // ── set_information helpers ───────────────────────────────────────────────
 
-impl NativeFilesystemBackend {
-    /// `&self` suffices because `File::set_len` takes `&File` (interior mutability);
-    /// no handle map mutation is needed.
-    fn apply_end_of_file(&self, file_id: FileHandle, data: &[u8]) -> DeviceIoResult<()> {
+impl<F: FilesystemSurface> NativeFilesystemBackend<F> {
+    fn apply_end_of_file(&mut self, file_id: FileHandle, data: &[u8]) -> DeviceIoResult<()> {
         let new_size =
             parse_end_of_file(data).ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
 
         let entry = self
             .handles
-            .get(&file_id)
+            .get_mut(&file_id)
             .ok_or(DeviceIoError::no_such_file())?;
 
         if entry.is_dir {
             return Err(DeviceIoError::new(STATUS_INVALID_PARAMETER));
         }
 
-        entry.file.set_len(new_size).map_err(|e| {
-            // Check for platform-specific disk-full error codes.
-            #[cfg(unix)]
-            let is_disk_full = e.raw_os_error() == Some(libc::ENOSPC);
-            #[cfg(windows)]
-            let is_disk_full = e.raw_os_error() == Some(112); // ERROR_DISK_FULL
-            #[cfg(not(any(unix, windows)))]
-            let is_disk_full = false;
-
-            if is_disk_full {
-                DeviceIoError::new(STATUS_DISK_FULL)
-            } else {
-                Self::map_io_error(&e)
-            }
-        })
+        self.surface
+            .set_len(&mut entry.handle, new_size)
+            .map_err(map_native_fs_error)
     }
 
     fn apply_disposition(&mut self, file_id: FileHandle, data: &[u8]) -> DeviceIoResult<()> {
@@ -640,16 +803,12 @@ impl NativeFilesystemBackend {
 
         let new_path =
             rdp_to_local(&self.root_path, &new_name).ok_or(DeviceIoError::access_denied())?;
+        let old_path = entry.path.clone();
 
-        if replace_if_exists {
-            fs::rename(&entry.path, &new_path).map_err(|e| Self::map_io_error(&e))?;
-        } else {
-            // Atomic rename without replacement using platform-specific APIs
-            // to avoid TOCTOU race between exists() check and rename().
-            rename_exclusive(&entry.path, &new_path).map_err(|e| Self::map_io_error(&e))?;
-        }
+        self.surface
+            .rename(&old_path, &new_path, replace_if_exists)
+            .map_err(map_native_fs_error)?;
 
-        // Update the stored path
         let entry = self
             .handles
             .get_mut(&file_id)
@@ -659,26 +818,25 @@ impl NativeFilesystemBackend {
         Ok(())
     }
 
-    fn apply_basic_info(&self, file_id: FileHandle, data: &[u8]) -> DeviceIoResult<()> {
+    fn apply_basic_info(&mut self, file_id: FileHandle, data: &[u8]) -> DeviceIoResult<()> {
         let info =
             parse_basic_info_set(data).ok_or(DeviceIoError::new(STATUS_INVALID_PARAMETER))?;
+        let times = basic_info_to_file_times(&info);
 
         let entry = self
             .handles
-            .get(&file_id)
+            .get_mut(&file_id)
             .ok_or(DeviceIoError::no_such_file())?;
 
-        // Apply timestamps using platform-specific APIs.
-        // Value 0 means "don't change", value -1 means "don't update
-        // on subsequent ops" — both are treated as no-op here.
-        // Best-effort: timestamp setting failures are not fatal.
-        let _ = set_file_times(&entry.file, &info);
+        // Best-effort: timestamp setting failures are swallowed by the
+        // adapter (mirrors prior behavior — the trait method returns
+        // Result<()> for symmetry but [`StdFilesystem::set_times`] always
+        // returns `Ok`).
+        let _ = self.surface.set_times(&mut entry.handle, times);
 
         Ok(())
     }
 }
-
-// ── Platform-specific helpers ─────────────────────────────────────────────
 
 // ── FILE_NOTIFY_INFORMATION encoding ──────────────────────────────────────
 
@@ -705,550 +863,12 @@ fn encode_notify_info(filename: &str, action: u32) -> Vec<u8> {
     buf
 }
 
-// ── Directory change notification ─────────────────────────────────────────
-
-/// Block until a change is detected in the given directory.
-/// Returns the name of the first changed file/entry, or "." if unknown.
-#[cfg(target_os = "macos")]
-pub(crate) fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
-    use std::os::unix::io::AsRawFd;
-
-    let dir_file = fs::File::open(dir)?;
-    let fd = dir_file.as_raw_fd();
-
-    // SAFETY: Creating a kqueue file descriptor. Returns -1 on failure.
-    let kq = unsafe { libc::kqueue() };
-    if kq < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // Watch for NOTE_WRITE (files added/removed/renamed) on the directory fd.
-    let changelist = libc::kevent {
-        ident: fd as usize,
-        filter: libc::EVFILT_VNODE,
-        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
-        fflags: libc::NOTE_WRITE | libc::NOTE_ATTRIB | libc::NOTE_RENAME,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-
-    let mut eventlist: libc::kevent = unsafe { std::mem::zeroed() };
-
-    // Set a timeout of 30 seconds to prevent indefinite blocking.
-    let timeout = libc::timespec {
-        tv_sec: 30,
-        tv_nsec: 0,
-    };
-
-    // SAFETY: kq is a valid kqueue fd, changelist and eventlist are valid pointers.
-    let nev = unsafe {
-        libc::kevent(
-            kq,
-            &changelist,
-            1,
-            &mut eventlist,
-            1,
-            &timeout,
-        )
-    };
-
-    // SAFETY: Closing the kqueue fd.
-    unsafe {
-        libc::close(kq);
-    }
-
-    if nev < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    if nev == 0 {
-        // Timeout — return a generic change to unblock the caller.
-        return Ok(".".to_string());
-    }
-
-    // kqueue doesn't tell us WHICH file changed, just that the directory was modified.
-    // Return "." as a generic indicator.
-    Ok(".".to_string())
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(dir.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
-
-    // SAFETY: Creating an inotify instance.
-    let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
-    if inotify_fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let mask = libc::IN_CREATE
-        | libc::IN_DELETE
-        | libc::IN_MODIFY
-        | libc::IN_MOVED_FROM
-        | libc::IN_MOVED_TO
-        | libc::IN_ATTRIB;
-
-    // SAFETY: Adding a watch on a valid inotify fd with a valid C path.
-    let wd = unsafe { libc::inotify_add_watch(inotify_fd, c_path.as_ptr(), mask as u32) };
-    if wd < 0 {
-        unsafe { libc::close(inotify_fd); }
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // Set a read timeout using poll.
-    let mut pollfd = libc::pollfd {
-        fd: inotify_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-
-    // SAFETY: Polling a valid fd with a 30-second timeout.
-    let ret = unsafe { libc::poll(&mut pollfd, 1, 30_000) };
-
-    if ret <= 0 {
-        unsafe {
-            libc::inotify_rm_watch(inotify_fd, wd);
-            libc::close(inotify_fd);
-        }
-        if ret == 0 {
-            return Ok(".".to_string()); // Timeout
-        }
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // Read the event to get the filename.
-    let mut buf = [0u8; 4096];
-    // SAFETY: Reading from a valid inotify fd into a valid buffer.
-    let n = unsafe {
-        libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-    };
-
-    unsafe {
-        libc::inotify_rm_watch(inotify_fd, wd);
-        libc::close(inotify_fd);
-    }
-
-    if n < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // Parse the first inotify_event to extract the filename.
-    // NOTE: Only the first event is parsed. If the kernel batches multiple events
-    // into a single read() call (standard inotify behavior), subsequent events are
-    // ignored. This is acceptable because we only need one change name as a hint.
-    // Use read_unaligned because buf is a [u8] array with 1-byte alignment,
-    // but inotify_event has 4-byte aligned fields.
-    if n as usize >= std::mem::size_of::<libc::inotify_event>() {
-        let event = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const libc::inotify_event) };
-        if event.len > 0 {
-            let name_start = std::mem::size_of::<libc::inotify_event>();
-            let name_end = match name_start.checked_add(event.len as usize) {
-                Some(end) => end,
-                None => return Ok(".".to_string()),
-            };
-            if name_end <= n as usize {
-                let name_bytes = &buf[name_start..name_end];
-                // Trim trailing nulls
-                let name = std::str::from_utf8(
-                    &name_bytes[..name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len())]
-                )
-                .unwrap_or(".");
-                return Ok(name.to_string());
-            }
-        }
-    }
-
-    Ok(".".to_string())
-}
-
-#[cfg(windows)]
-pub(crate) fn wait_for_directory_change(dir: &std::path::Path) -> std::io::Result<String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-
-    // SAFETY: Calling FindFirstChangeNotificationW with a valid wide string path.
-    let handle = unsafe {
-        windows_sys::Win32::Storage::FileSystem::FindFirstChangeNotificationW(
-            wide.as_ptr(),
-            0, // don't watch subtree
-            windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE_FILE_NAME
-                | windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE_DIR_NAME
-                | windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE_SIZE
-                | windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE_LAST_WRITE,
-        )
-    };
-
-    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // Wait for the notification (30-second timeout).
-    // SAFETY: handle is valid.
-    let wait_result = unsafe {
-        windows_sys::Win32::System::Threading::WaitForSingleObject(handle, 30_000)
-    };
-
-    // SAFETY: Closing the notification handle.
-    unsafe {
-        windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification(handle);
-    }
-
-    match wait_result {
-        0 => Ok(".".to_string()), // WAIT_OBJECT_0 — change detected
-        0x102 => Ok(".".to_string()), // WAIT_TIMEOUT
-        _ => Err(std::io::Error::last_os_error()),
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-pub(crate) fn wait_for_directory_change(_dir: &std::path::Path) -> std::io::Result<String> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "directory change notification not supported on this platform",
-    ))
-}
-
-// ── Atomic rename (no-replace) ────────────────────────────────────────────
-
-/// Convert a `Path` to a `CString` for FFI calls on Unix.
-#[cfg(unix)]
-fn path_to_cstring(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
-    use std::os::unix::ffi::OsStrExt;
-    std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))
-}
-
-/// Rename a file/directory atomically, failing if the destination exists.
-///
-/// Uses platform-specific APIs to avoid TOCTOU race between an existence
-/// check and the rename operation.
-#[cfg(target_os = "linux")]
-pub(crate) fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    let from_c = path_to_cstring(from)?;
-    let to_c = path_to_cstring(to)?;
-
-    // SAFETY: Calling libc renameat2 with valid C strings and AT_FDCWD.
-    // RENAME_NOREPLACE (1) fails atomically if destination exists.
-    let ret = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from_c.as_ptr(),
-            libc::AT_FDCWD,
-            to_c.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    let from_c = path_to_cstring(from)?;
-    let to_c = path_to_cstring(to)?;
-
-    // SAFETY: Calling libc renameatx_np with valid C strings and AT_FDCWD.
-    // RENAME_EXCL (0x0004) fails atomically if destination exists.
-    let ret = unsafe {
-        libc::renameatx_np(
-            libc::AT_FDCWD,
-            from_c.as_ptr(),
-            libc::AT_FDCWD,
-            to_c.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn rename_exclusive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-
-    // SAFETY: Calling MoveFileExW with valid null-terminated wide strings.
-    // Flags = 0 means no MOVEFILE_REPLACE_EXISTING — fails if destination exists.
-    let ret = unsafe {
-        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-            from_wide.as_ptr(),
-            to_wide.as_ptr(),
-            0, // no replace
-        )
-    };
-
-    if ret != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(crate) fn rename_exclusive(_from: &std::path::Path, _to: &std::path::Path) -> std::io::Result<()> {
-    // No atomic rename-exclusive available on this platform.
-    // Return Unsupported rather than silently degrading to a racy check+rename.
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "atomic rename-exclusive not supported on this platform",
-    ))
-}
-
-// ── File timestamp setting ────────────────────────────────────────────────
-
-/// Set file timestamps from a FILE_BASIC_INFORMATION structure.
-///
-/// Timestamps with value 0 or -1 are skipped (meaning "don't change").
-/// Uses `futimens` on the open fd to avoid rename-race issues with path-based APIs.
-#[cfg(unix)]
-pub(crate) fn set_file_times(file: &std::fs::File, info: &fs_info::BasicInfoSet) {
-    use std::os::unix::io::AsRawFd;
-
-    let access_time = filetime_to_timespec(info.last_access_time);
-    let mod_time = filetime_to_timespec(info.last_write_time);
-
-    let times = [access_time, mod_time];
-
-    // SAFETY: fd is a valid open file descriptor, times is a valid [timespec; 2].
-    unsafe {
-        libc::futimens(file.as_raw_fd(), times.as_ptr());
-    }
-}
-
-#[cfg(unix)]
-fn filetime_to_timespec(filetime: i64) -> libc::timespec {
-    // 0 = don't change, -1 = don't update on subsequent ops
-    if filetime <= 0 {
-        return libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        };
-    }
-
-    let relative = filetime - fs_info::FILETIME_UNIX_EPOCH_OFFSET;
-
-    if relative < 0 {
-        // Before Unix epoch — set to epoch (best effort).
-        // We check `relative` instead of just `secs` to avoid negative tv_nsec
-        // from the modulo operation (POSIX requires tv_nsec >= 0).
-        return libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-    }
-
-    let secs = relative / 10_000_000;
-    let nsecs = (relative % 10_000_000) * 100;
-
-    libc::timespec {
-        tv_sec: secs as libc::time_t,
-        tv_nsec: nsecs as libc::c_long,
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn set_file_times(file: &std::fs::File, info: &fs_info::BasicInfoSet) {
-    use std::os::windows::io::AsRawHandle;
-
-    let creation = filetime_or_null(info.creation_time);
-    let access = filetime_or_null(info.last_access_time);
-    let write = filetime_or_null(info.last_write_time);
-
-    // SAFETY: file handle is valid, FILETIME pointers are valid or null.
-    // Using the open file handle directly avoids rename-race issues.
-    unsafe {
-        windows_sys::Win32::Storage::FileSystem::SetFileTime(
-            file.as_raw_handle() as _,
-            creation.as_ref().map_or(std::ptr::null(), |ft| ft),
-            access.as_ref().map_or(std::ptr::null(), |ft| ft),
-            write.as_ref().map_or(std::ptr::null(), |ft| ft),
-        );
-    }
-}
-
-#[cfg(windows)]
-fn filetime_or_null(ft: i64) -> Option<windows_sys::Win32::Foundation::FILETIME> {
-    if ft <= 0 {
-        None
-    } else {
-        Some(windows_sys::Win32::Foundation::FILETIME {
-            dwLowDateTime: ft as u32,
-            dwHighDateTime: (ft >> 32) as u32,
-        })
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn set_file_times(_file: &std::fs::File, _info: &fs_info::BasicInfoSet) {
-    // No platform API available — accept silently.
-}
-
-// ── File locking ──────────────────────────────────────────────────────────
-
-#[cfg(unix)]
-pub(crate) fn lock_file(
-    file: &std::fs::File,
-    offset: u64,
-    length: u64,
-    shared: bool,
-    fail_immediately: bool,
-) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    let lock_type = if shared { libc::F_RDLCK } else { libc::F_WRLCK };
-    let cmd = if fail_immediately {
-        libc::F_SETLK
-    } else {
-        libc::F_SETLKW
-    };
-
-    let flock = libc::flock {
-        l_type: lock_type as libc::c_short,
-        l_whence: libc::SEEK_SET as libc::c_short,
-        l_start: offset as libc::off_t,
-        l_len: length as libc::off_t,
-        l_pid: 0,
-    };
-
-    // SAFETY: file descriptor is valid, flock struct is properly initialized.
-    let ret = unsafe { libc::fcntl(file.as_raw_fd(), cmd, &flock) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
-pub(crate) fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    let flock = libc::flock {
-        l_type: libc::F_UNLCK as libc::c_short,
-        l_whence: libc::SEEK_SET as libc::c_short,
-        l_start: offset as libc::off_t,
-        l_len: length as libc::off_t,
-        l_pid: 0,
-    };
-
-    // SAFETY: file descriptor is valid, flock struct is properly initialized.
-    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &flock) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn lock_file(
-    file: &std::fs::File,
-    offset: u64,
-    length: u64,
-    shared: bool,
-    fail_immediately: bool,
-) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-
-    let mut flags = 0u32;
-    if !shared {
-        flags |= windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK;
-    }
-    if fail_immediately {
-        flags |= windows_sys::Win32::Storage::FileSystem::LOCKFILE_FAIL_IMMEDIATELY;
-    }
-
-    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
-    overlapped.Anonymous.Anonymous.Offset = offset as u32;
-    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-
-    // SAFETY: file handle is valid, OVERLAPPED is properly initialized.
-    let ret = unsafe {
-        windows_sys::Win32::Storage::FileSystem::LockFileEx(
-            file.as_raw_handle() as _,
-            flags,
-            0,
-            length as u32,
-            (length >> 32) as u32,
-            &mut overlapped,
-        )
-    };
-
-    if ret != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn unlock_file(file: &std::fs::File, offset: u64, length: u64) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-
-    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
-    overlapped.Anonymous.Anonymous.Offset = offset as u32;
-    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-
-    // SAFETY: file handle is valid, OVERLAPPED is properly initialized.
-    let ret = unsafe {
-        windows_sys::Win32::Storage::FileSystem::UnlockFileEx(
-            file.as_raw_handle() as _,
-            0,
-            length as u32,
-            (length >> 32) as u32,
-            &mut overlapped,
-        )
-    };
-
-    if ret != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn lock_file(
-    _file: &std::fs::File,
-    _offset: u64,
-    _length: u64,
-    _shared: bool,
-    _fail_immediately: bool,
-) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "file locking not supported on this platform",
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn unlock_file(_file: &std::fs::File, _offset: u64, _length: u64) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "file locking not supported on this platform",
-    ))
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn make_backend(dir: &tempfile::TempDir) -> NativeFilesystemBackend {
         NativeFilesystemBackend::new(dir.path(), 1, "C:")
@@ -1307,9 +927,7 @@ mod tests {
         let resp = backend
             .create(1, "\\data.bin", 0x4000_0000, 2, 0, 0)
             .unwrap();
-        backend
-            .write(1, resp.file_id, 0, b"Hello, RDP!")
-            .unwrap();
+        backend.write(1, resp.file_id, 0, b"Hello, RDP!").unwrap();
         backend.close(1, resp.file_id).unwrap();
 
         // Re-open and read
@@ -1498,23 +1116,23 @@ mod tests {
 
     #[test]
     fn glob_star_matches_all() {
-        assert!(NativeFilesystemBackend::pattern_matches("*", "anything"));
-        assert!(NativeFilesystemBackend::pattern_matches("*.*", "file.txt"));
-        assert!(NativeFilesystemBackend::pattern_matches("*.*", "noext"));
+        assert!(NativeFilesystemBackend::<StdFilesystem>::pattern_matches("*", "anything"));
+        assert!(NativeFilesystemBackend::<StdFilesystem>::pattern_matches("*.*", "file.txt"));
+        assert!(NativeFilesystemBackend::<StdFilesystem>::pattern_matches("*.*", "noext"));
     }
 
     #[test]
     fn glob_specific_pattern() {
-        assert!(NativeFilesystemBackend::pattern_matches("*.txt", "hello.txt"));
-        assert!(!NativeFilesystemBackend::pattern_matches("*.txt", "hello.doc"));
-        assert!(NativeFilesystemBackend::pattern_matches("test?", "test1"));
-        assert!(!NativeFilesystemBackend::pattern_matches("test?", "test12"));
+        assert!(NativeFilesystemBackend::<StdFilesystem>::pattern_matches("*.txt", "hello.txt"));
+        assert!(!NativeFilesystemBackend::<StdFilesystem>::pattern_matches("*.txt", "hello.doc"));
+        assert!(NativeFilesystemBackend::<StdFilesystem>::pattern_matches("test?", "test1"));
+        assert!(!NativeFilesystemBackend::<StdFilesystem>::pattern_matches("test?", "test12"));
     }
 
     // ── Rename ─────────────────────────────────────────────────────────
 
     #[test]
-    pub(crate) fn rename_exclusive_fails_if_destination_exists() {
+    fn rename_exclusive_fails_if_destination_exists() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("src.txt"), b"data").unwrap();
         fs::write(dir.path().join("dst.txt"), b"existing").unwrap();

@@ -43,6 +43,11 @@ pub struct OpenResult {
     pub file: File,
     pub is_dir: bool,
     pub information: u8,
+    /// Echoed back from the input `create_options` for caller convenience.
+    /// The wrapper independently extracts this from raw create_options via
+    /// `raw_to_opts` (see lib.rs); this field exists for the in-crate test
+    /// `create::tests::delete_on_close_flag`.
+    #[allow(dead_code)]
     pub delete_on_close: bool,
 }
 

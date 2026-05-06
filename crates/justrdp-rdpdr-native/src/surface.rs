@@ -114,11 +114,21 @@ pub enum OpenAccess {
 }
 
 /// What the open path is expected to refer to.
+///
+/// `File` is the lenient default — when a server sends neither
+/// `FILE_DIRECTORY_FILE` nor `FILE_NON_DIRECTORY_FILE` in `CreateOptions`
+/// (current Windows mstsc behavior for arbitrary path opens), the wrapper
+/// emits this variant and the surface opens whatever's there as a regular
+/// file.  `FileStrict` corresponds to `FILE_NON_DIRECTORY_FILE` and asks
+/// the surface to fail when the target turns out to be a directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenKind {
-    /// Regular file.
+    /// Regular file (lenient — neither MS-SMB2 directory bit set).
     File,
-    /// Directory.
+    /// Regular file (strict — `FILE_NON_DIRECTORY_FILE` was set; fail if
+    /// the target is a directory).
+    FileStrict,
+    /// Directory (`FILE_DIRECTORY_FILE` was set).
     Directory,
 }
 
@@ -180,6 +190,40 @@ pub struct NativeMetadata {
     pub modified: Option<SystemTime>,
 }
 
+impl NativeMetadata {
+    /// Build a `NativeMetadata` from a `std::fs::Metadata`.  Used by the
+    /// production [`crate::StdFilesystem`] adapter and by tests that want to
+    /// derive synthetic metadata from a real on-disk file before passing to
+    /// the encoders.
+    pub fn from_std(m: &std::fs::Metadata) -> Self {
+        Self {
+            is_dir: m.is_dir(),
+            is_readonly: is_readonly_std(m),
+            size: m.len(),
+            created: m.created().ok(),
+            accessed: m.accessed().ok(),
+            modified: m.modified().ok(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_readonly_std(m: &std::fs::Metadata) -> bool {
+    m.permissions().readonly()
+}
+
+#[cfg(unix)]
+fn is_readonly_std(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    // Owner-write bit clear → readonly.
+    m.permissions().mode() & 0o200 == 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_readonly_std(m: &std::fs::Metadata) -> bool {
+    m.permissions().readonly()
+}
+
 /// One entry returned by [`FilesystemSurface::read_dir`].
 ///
 /// `name` is the platform filename as a UTF-8 string (lossy-converted from
@@ -235,11 +279,15 @@ pub struct LockMode {
 /// All path arguments are already root-resolved and traversal-validated by
 /// the wrapper — adapters should treat them as trusted local filesystem
 /// paths and just execute.
-pub trait FilesystemSurface {
+pub trait FilesystemSurface: Send {
     /// Opaque per-handle resource the adapter associates with each open
     /// file or directory.  For the production adapter this is
     /// `std::fs::File`; for the mock adapter it is an in-memory token.
-    type Handle;
+    ///
+    /// Required to be `Send` because [`crate::NativeFilesystemBackend`]
+    /// implements `RdpdrBackend`, which itself requires `Send` so the
+    /// channel processor can move the backend across threads.
+    type Handle: Send;
 
     // ── Path-based operations ──────────────────────────────────────────
 

@@ -1,14 +1,15 @@
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::PathBuf;
 
 use justrdp_rdpdr::FileHandle;
 
+use crate::surface::NativeMetadata;
+
 /// Metadata for a single directory entry, captured during enumeration.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
-    pub metadata: std::fs::Metadata,
+    pub metadata: NativeMetadata,
 }
 
 /// Tracks directory enumeration state for a single open directory handle.
@@ -19,26 +20,30 @@ pub struct DirState {
 }
 
 /// A file or directory that is currently open via the native backend.
+///
+/// Generic over `H` — the handle type produced by the backing
+/// [`crate::FilesystemSurface`].  For [`crate::StdFilesystem`] this is
+/// `std::fs::File`; for test mocks it is the mock-specific token type.
 #[derive(Debug)]
-pub struct OpenEntry {
-    pub file: File,
+pub struct OpenEntry<H> {
+    pub handle: H,
     pub path: PathBuf,
     pub is_dir: bool,
     pub delete_on_close: bool,
     pub dir_state: Option<DirState>,
 }
 
-/// Maps RDP file handles (`FileHandle(u32)`) to native OS open entries.
+/// Maps RDP file handles (`FileHandle(u32)`) to native open entries.
 ///
 /// Handle 0 is reserved and never assigned (it is used as "no handle" in
 /// error responses). The first assigned handle is 1.
 #[derive(Debug)]
-pub struct HandleMap {
-    map: HashMap<u32, OpenEntry>,
+pub struct HandleMap<H> {
+    map: HashMap<u32, OpenEntry<H>>,
     next_id: u32,
 }
 
-impl HandleMap {
+impl<H> HandleMap<H> {
     /// Creates a new, empty handle map. The first handle assigned will be 1.
     pub fn new() -> Self {
         Self {
@@ -48,14 +53,14 @@ impl HandleMap {
     }
 
     /// Maximum number of concurrently open handles.
-    const MAX_OPEN_HANDLES: usize = 4096;
+    pub const MAX_OPEN_HANDLES: usize = 4096;
 
     /// Inserts a new open file/directory and returns the assigned `FileHandle`.
     ///
     /// Returns `None` if the maximum number of open handles has been reached.
     pub fn insert(
         &mut self,
-        file: File,
+        handle: H,
         path: PathBuf,
         is_dir: bool,
         delete_on_close: bool,
@@ -83,7 +88,7 @@ impl HandleMap {
         }
 
         let entry = OpenEntry {
-            file,
+            handle,
             path,
             is_dir,
             delete_on_close,
@@ -96,22 +101,22 @@ impl HandleMap {
     }
 
     /// Returns a reference to the entry for the given handle, if it exists.
-    pub fn get(&self, handle: &FileHandle) -> Option<&OpenEntry> {
+    pub fn get(&self, handle: &FileHandle) -> Option<&OpenEntry<H>> {
         self.map.get(&handle.0)
     }
 
     /// Returns a mutable reference to the entry for the given handle, if it exists.
-    pub fn get_mut(&mut self, handle: &FileHandle) -> Option<&mut OpenEntry> {
+    pub fn get_mut(&mut self, handle: &FileHandle) -> Option<&mut OpenEntry<H>> {
         self.map.get_mut(&handle.0)
     }
 
     /// Removes and returns the entry for the given handle, if it exists.
-    pub fn remove(&mut self, handle: &FileHandle) -> Option<OpenEntry> {
+    pub fn remove(&mut self, handle: &FileHandle) -> Option<OpenEntry<H>> {
         self.map.remove(&handle.0)
     }
 }
 
-impl Default for HandleMap {
+impl<H> Default for HandleMap<H> {
     fn default() -> Self {
         Self::new()
     }
@@ -120,6 +125,7 @@ impl Default for HandleMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_file() -> (File, PathBuf) {
@@ -134,7 +140,7 @@ mod tests {
 
     #[test]
     fn insert_returns_nonzero_handle() {
-        let mut map = HandleMap::new();
+        let mut map: HandleMap<File> = HandleMap::new();
         let (file, path) = temp_file();
         let handle = map.insert(file, path.clone(), false, false).unwrap();
         assert_ne!(handle.0, 0);
@@ -143,7 +149,7 @@ mod tests {
 
     #[test]
     fn get_returns_inserted_entry() {
-        let mut map = HandleMap::new();
+        let mut map: HandleMap<File> = HandleMap::new();
         let (file, path) = temp_file();
         let handle = map.insert(file, path.clone(), true, false).unwrap();
 
@@ -158,7 +164,7 @@ mod tests {
 
     #[test]
     fn get_mut_allows_modification() {
-        let mut map = HandleMap::new();
+        let mut map: HandleMap<File> = HandleMap::new();
         let (file, path) = temp_file();
         let handle = map.insert(file, path.clone(), false, false).unwrap();
 
@@ -173,7 +179,7 @@ mod tests {
 
     #[test]
     fn remove_returns_entry_and_clears() {
-        let mut map = HandleMap::new();
+        let mut map: HandleMap<File> = HandleMap::new();
         let (file, path) = temp_file();
         let handle = map.insert(file, path.clone(), false, false).unwrap();
 
@@ -188,13 +194,13 @@ mod tests {
 
     #[test]
     fn get_unknown_handle_returns_none() {
-        let map = HandleMap::new();
+        let map: HandleMap<File> = HandleMap::new();
         assert!(map.get(&FileHandle(42)).is_none());
     }
 
     #[test]
     fn handles_increment() {
-        let mut map = HandleMap::new();
+        let mut map: HandleMap<File> = HandleMap::new();
 
         let (f1, p1) = temp_file();
         let h1 = map.insert(f1, p1.clone(), false, false).unwrap();
@@ -210,7 +216,7 @@ mod tests {
 
     #[test]
     fn insert_with_delete_on_close() {
-        let mut map = HandleMap::new();
+        let mut map: HandleMap<File> = HandleMap::new();
         let (file, path) = temp_file();
         let handle = map.insert(file, path.clone(), false, true).unwrap();
 
@@ -222,9 +228,9 @@ mod tests {
 
     #[test]
     fn insert_rejects_when_full() {
-        let mut map = HandleMap::new();
+        let mut map: HandleMap<File> = HandleMap::new();
         // Fill to capacity
-        for _ in 0..HandleMap::MAX_OPEN_HANDLES {
+        for _ in 0..HandleMap::<File>::MAX_OPEN_HANDLES {
             let (file, path) = temp_file();
             assert!(map.insert(file, path, false, false).is_some());
         }
