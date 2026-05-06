@@ -3,7 +3,8 @@
 ## Status
 
 `accepted` (2026-05-06, established by the cliprdr-native refactor at
-commit `8b5fea1`).
+commit `8b5fea1`; confirmed by the rdpdr-native refactor across
+commits `c5b2f29`/`df1241b`/`60e8597`/`aebeef7`).
 
 ## Decision
 
@@ -46,20 +47,29 @@ clipboard / audio device required).
 
 ## Consequences
 
-- The `*-native` family now has a documented standard shape.
-  `rdpsnd-native` and `rdpeai-native` already follow it (with their own
-  within-crate seams `NativeAudioOutput` / `AudioCaptureBackend`);
-  `cliprdr-native` is now aligned via `NativeClipboardSurface`.
-- `rdpdr-native` is the next candidate for the same deepening — it
-  currently scatters `cfg!` directives across eight files instead of
-  exposing a within-crate platform seam.
+- The `*-native` family now has a documented standard shape, applied to
+  all four crates: `rdpsnd-native::NativeAudioOutput`,
+  `rdpeai-native::AudioCaptureBackend`,
+  `cliprdr-native::NativeClipboardSurface`, and
+  `rdpdr-native::FilesystemSurface`.
+- The pattern survives a *non-trivial* second adoption.  cliprdr-native
+  was the originating case (4 platforms × small surface); rdpdr-native
+  has 1 std-fs-backed platform but a *15-method* surface (open / read /
+  write / set_len / metadata / set_times / lock / unlock / read_dir /
+  rename / remove_file / remove_dir / disk_space / watch / close) plus
+  an associated `type Handle: Send`.  The pattern transferred without
+  reshape — confirming it generalizes beyond cliprdr's clipboard shape.
 - The naming asymmetry between Native-surface traits
-  (e.g. `NativeClipboardSurface`) and channel-protocol traits
-  (e.g. `RdpsndBackend`, `CliprdrBackend`) is intentional: they live at
-  different layers. Do not unify.
+  (e.g. `NativeClipboardSurface`, `FilesystemSurface`) and channel-protocol
+  traits (e.g. `RdpsndBackend`, `CliprdrBackend`, `RdpdrBackend`) is
+  intentional: they live at different layers. Do not unify.
 - The wrapper struct must be generic over the surface
   (`Wrapper<S: NativeSurface = PlatformDefault>`), with a default type
   parameter so existing call sites (`Wrapper::new()`) still compile
   without annotations.
+- When the surface trait owns per-handle resources (rdpdr-native's
+  `FilesystemSurface::Handle`), require `type Handle: Send` and
+  `trait NativeSurface: Send` together — supertrait alone is not enough
+  to satisfy `RdpdrBackend: Send` for the wrapper.
 - When a PR proposes "let's just have the platform implement the channel's
   protocol trait directly", point to this ADR.
