@@ -16,11 +16,22 @@ interface BlitPayload {
   rgba_b64: string;
 }
 
+interface PointerSpritePayload {
+  width: number;
+  height: number;
+  hotspot_x: number;
+  hotspot_y: number;
+  /// Top-down RGBA8, base64-encoded. Length is `width * height * 4`
+  /// bytes pre-base64.
+  rgba_b64: string;
+}
+
 type RdpEvent =
   | { kind: "frame"; blits: BlitPayload[] }
   | { kind: "pointer_position"; x: number; y: number }
   | { kind: "pointer_hidden" }
   | { kind: "pointer_default" }
+  | ({ kind: "pointer_sprite" } & PointerSpritePayload)
   | { kind: "disconnected"; reason: string }
   | { kind: "error"; message: string };
 
@@ -40,6 +51,23 @@ function drawBlit(ctx: CanvasRenderingContext2D, blit: BlitPayload) {
   for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
   const imageData = new ImageData(bytes, blit.w, blit.h);
   ctx.putImageData(imageData, blit.x, blit.y);
+}
+
+/// Convert a server-decoded cursor sprite into a CSS cursor value
+/// (`url(<data:image/png;base64,...>) <hsX> <hsY>, default`).
+/// Off-screen canvas keeps the main RDP framebuffer untouched.
+function spriteToCursorCss(sprite: PointerSpritePayload): string {
+  const off = document.createElement("canvas");
+  off.width = sprite.width;
+  off.height = sprite.height;
+  const ctx = off.getContext("2d");
+  if (!ctx) return "default";
+  const bin = atob(sprite.rgba_b64);
+  const bytes = new Uint8ClampedArray(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  ctx.putImageData(new ImageData(bytes, sprite.width, sprite.height), 0, 0);
+  const dataUri = off.toDataURL("image/png");
+  return `url(${dataUri}) ${sprite.hotspot_x} ${sprite.hotspot_y}, default`;
 }
 
 interface ConnectForm {
@@ -104,6 +132,13 @@ function App() {
         case "pointer_default":
           if (canvasRef.current) {
             canvasRef.current.style.cursor = "default";
+          }
+          break;
+        case "pointer_sprite":
+          // Slice β: server pushed a decoded color sprite. Convert
+          // RGBA → PNG data URI → CSS cursor URL (with hotspot).
+          if (canvasRef.current) {
+            canvasRef.current.style.cursor = spriteToCursorCss(payload);
           }
           break;
         case "disconnected":

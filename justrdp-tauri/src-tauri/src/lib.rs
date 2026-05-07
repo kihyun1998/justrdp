@@ -36,6 +36,8 @@ use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use serde::Serialize;
 use tauri::{Emitter, Manager, Window};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -87,6 +89,18 @@ enum FrontendEvent {
     /// cursor (after a previous hide / sprite). Frontend applies
     /// CSS `cursor: default`. (Slice α)
     PointerDefault,
+    /// Server pushed a fully-decoded cursor sprite. Frontend
+    /// off-screen-canvas + `toDataURL` + assigns
+    /// `canvas.style.cursor = url(...) hsX hsY, default`.
+    /// (Slice β / #10)
+    PointerSprite {
+        width: u16,
+        height: u16,
+        hotspot_x: u16,
+        hotspot_y: u16,
+        /// Top-down RGBA8 base64-encoded for IPC transport.
+        rgba_b64: String,
+    },
     Disconnected { reason: String },
     Error { message: String },
 }
@@ -200,6 +214,10 @@ async fn run_session(
     // the session; resetting it mid-session desynchronises the
     // server's elided fields and corrupts every subsequent order.
     let mut renderer = BitmapRenderer::new();
+    // Slice β (#10): per-session cursor sprite cache. Color pointer
+    // emits get decoded here and cached against the server-supplied
+    // index for future Cached-pointer lookups (Slice δ).
+    let mut cursor_cache = justrdp_cursor::CursorCache::new();
 
     loop {
         tokio::select! {
@@ -276,6 +294,38 @@ async fn run_session(
                     }
                     Some(Ok(RdpEvent::PointerDefault)) => {
                         let _ = window.emit("rdp:event", FrontendEvent::PointerDefault);
+                    }
+                    // Slice β (#10): decode Color pointer payloads.
+                    // pointer_type 0x06 LARGE / 0x07 CACHED / 0x08
+                    // POINTER (New) all silent-drop — Slices γ / δ
+                    // wire those decoders.
+                    Some(Ok(RdpEvent::PointerBitmap { pointer_type, data })) => {
+                        const TS_PTRMSGTYPE_COLOR: u16 = 0x0009;
+                        if pointer_type == TS_PTRMSGTYPE_COLOR {
+                            match justrdp_cursor::decode_color(&data) {
+                                Ok(cursor) => {
+                                    if let Some(idx) = justrdp_cursor::extract_cache_index(&data) {
+                                        cursor_cache.add(idx, cursor.clone());
+                                    }
+                                    let rgba_b64 = B64.encode(&cursor.rgba);
+                                    let _ = window.emit(
+                                        "rdp:event",
+                                        FrontendEvent::PointerSprite {
+                                            width: cursor.width,
+                                            height: cursor.height,
+                                            hotspot_x: cursor.hotspot_x,
+                                            hotspot_y: cursor.hotspot_y,
+                                            rgba_b64,
+                                        },
+                                    );
+                                }
+                                Err(_) => {
+                                    // Decoder rejection — silent
+                                    // drop, the canvas keeps the
+                                    // previous cursor.
+                                }
+                            }
+                        }
                     }
                     Some(Ok(RdpEvent::Disconnected(reason))) => {
                         let _ = window.emit(

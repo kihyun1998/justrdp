@@ -42,6 +42,7 @@ members = [
     "crates/justrdp-cliprdr-native",
     "crates/justrdp-rdpsnd-native",
     "crates/justrdp-rdpeai-native",
+    "crates/justrdp-cursor",
     "crates/justrdp-web",
     "justrdp-tauri/src-tauri",
     "tests/integration",
@@ -102,4 +103,5 @@ justrdp-rdpdr-native = { path = "crates/justrdp-rdpdr-native", version = "0.1.0"
 justrdp-cliprdr-native = { path = "crates/justrdp-cliprdr-native", version = "0.1.0" }
 justrdp-rdpsnd-native = { path = "crates/justrdp-rdpsnd-native", version = "0.1.0" }
 justrdp-rdpeai-native = { path = "crates/justrdp-rdpeai-native", version = "0.1.0" }
+justrdp-cursor = { path = "crates/justrdp-cursor", version = "0.1.0" }
 justrdp-web = { path = "crates/justrdp-web", version = "0.1.0" }

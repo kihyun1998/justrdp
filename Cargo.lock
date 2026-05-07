@@ -2157,6 +2157,10 @@ name = "justrdp-core"
 version = "0.1.0"
 
 [[package]]
+name = "justrdp-cursor"
+version = "0.1.0"
+
+[[package]]
 name = "justrdp-derive"
 version = "0.1.0"
 dependencies = [
@@ -2440,6 +2444,7 @@ dependencies = [
  "justrdp-cliprdr",
  "justrdp-cliprdr-native",
  "justrdp-core",
+ "justrdp-cursor",
  "justrdp-input",
  "justrdp-rdpsnd",
  "justrdp-rdpsnd-native",

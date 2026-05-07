@@ -141,10 +141,15 @@ pub enum ActiveStageOutput {
     /// Server sends a pointer position update.
     PointerPosition { x: u16, y: u16 },
     /// Server sends a pointer bitmap (color/new/large/cached).
+    /// Embedders that want a fully-decoded sprite call
+    /// `justrdp-cursor::decode_color` (and friends in Slices γ / δ)
+    /// on `data` plus `pointer_type`. Embedder-side decoding keeps
+    /// the cursor sprite cache out of the session crate (the cache
+    /// is UI state, not protocol state).
     PointerBitmap {
         /// Pointer update sub-type (slow-path messageType u16 or fast-path update code).
         pointer_type: u16,
-        /// Raw pointer data for decoding with `justrdp-graphics` pointer decoder.
+        /// Raw pointer data for embedder-side decoding via `justrdp-cursor`.
         data: Vec<u8>,
     },
     /// Server sent Deactivate All PDU -- caller must drive reactivation.
