@@ -122,11 +122,16 @@ function App() {
           setPointerPos([payload.x, payload.y]);
           break;
         case "pointer_hidden":
-          // Slice α: server hid its cursor — match on host. Sprite-
-          // bearing cursor changes (resize arrow, hand, I-beam) land
-          // in Slice β.
+          // Originally `cursor: none` per Slice α — but Windows
+          // sends Hidden during normal session bring-up before any
+          // sprite arrives, and Slice β only decodes Color pointer
+          // (0x09); New/Large/Cached are silent-dropped today, so
+          // the host cursor would stay invisible until Slice γ / δ
+          // wires the rest. Fall back to OS default until then —
+          // proper hide (password field) lands once all sprite
+          // types decode.
           if (canvasRef.current) {
-            canvasRef.current.style.cursor = "none";
+            canvasRef.current.style.cursor = "default";
           }
           break;
         case "pointer_default":

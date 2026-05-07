@@ -297,8 +297,10 @@ async fn run_session(
                     }
                     // Slice β (#10): decode Color pointer payloads.
                     // pointer_type 0x06 LARGE / 0x07 CACHED / 0x08
-                    // POINTER (New) all silent-drop — Slices γ / δ
-                    // wire those decoders.
+                    // POINTER (New) cannot be decoded yet (Slices
+                    // γ / δ); fall back to PointerDefault so the
+                    // host always shows an OS arrow rather than
+                    // stale state.
                     Some(Ok(RdpEvent::PointerBitmap { pointer_type, data })) => {
                         const TS_PTRMSGTYPE_COLOR: u16 = 0x0009;
                         if pointer_type == TS_PTRMSGTYPE_COLOR {
@@ -320,11 +322,21 @@ async fn run_session(
                                     );
                                 }
                                 Err(_) => {
-                                    // Decoder rejection — silent
-                                    // drop, the canvas keeps the
-                                    // previous cursor.
+                                    let _ = window.emit(
+                                        "rdp:event",
+                                        FrontendEvent::PointerDefault,
+                                    );
                                 }
                             }
+                        } else {
+                            // New / Large / Cached — Slice γ / δ
+                            // wires these. For now, fall back to
+                            // OS default so the user always sees
+                            // a cursor inside the canvas.
+                            let _ = window.emit(
+                                "rdp:event",
+                                FrontendEvent::PointerDefault,
+                            );
                         }
                     }
                     Some(Ok(RdpEvent::Disconnected(reason))) => {
