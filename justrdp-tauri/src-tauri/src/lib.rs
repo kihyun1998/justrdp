@@ -42,7 +42,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use justrdp_async::SessionEvent;
 use justrdp_tokio::{AsyncRdpClient, Config, RdpEvent};
-use justrdp_web::render_event;
+use justrdp_web::{render_event_stateful, BitmapRenderer};
 
 use crate::input::{InputAction, InputEvent};
 use crate::sink::{BlitRecord, TauriFrameSink};
@@ -187,6 +187,11 @@ async fn run_session(
     state: Arc<AppState>,
 ) {
     let mut sink = TauriFrameSink::new(DESKTOP_WIDTH, DESKTOP_HEIGHT);
+    // Session-scoped renderer state — Drawing Order delta-coding
+    // history, bitmap / brush / glyph caches. MUST live as long as
+    // the session; resetting it mid-session desynchronises the
+    // server's elided fields and corrupts every subsequent order.
+    let mut renderer = BitmapRenderer::new();
 
     loop {
         tokio::select! {
@@ -221,7 +226,7 @@ async fn run_session(
                         // translation in justrdp_tokio::translate
                         // (translate.rs:35).
                         let sev = SessionEvent::Graphics { update_code, data };
-                        match render_event(&sev, &mut sink) {
+                        match render_event_stateful(&sev, &mut sink, &mut renderer) {
                             Ok(true) => {
                                 let blits = sink.drain_blits();
                                 if !blits.is_empty() {

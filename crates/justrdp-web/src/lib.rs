@@ -49,8 +49,8 @@ pub use input::{
     KBDFLAGS_EXTENDED, KBDFLAGS_RELEASE,
 };
 pub use render::{
-    decode_bitmap_update_fast_path, render_event, BitmapRenderer, DecodedRect, FrameSink,
-    GlyphCacheRevision, RenderError,
+    decode_bitmap_update_fast_path, render_event, render_event_stateful, BitmapRenderer,
+    DecodedRect, FrameSink, GlyphCacheRevision, RenderError,
 };
 
 #[cfg(target_arch = "wasm32")]

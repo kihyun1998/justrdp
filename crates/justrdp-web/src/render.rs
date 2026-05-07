@@ -624,7 +624,7 @@ impl BitmapRenderer {
     /// returns an `Unsupported*` error if it can't safely skip past one,
     /// since silently dropping mid-stream desynchronises the
     /// `PrimaryOrderHistory` for everything that follows.
-    fn process_orders<S: FrameSink>(
+    pub fn process_orders<S: FrameSink>(
         &mut self,
         payload: &[u8],
         sink: &mut S,
@@ -3327,11 +3327,63 @@ fn flip_and_convert_rgb555(src: &[u8], width: u16, height: u16) -> Vec<u8> {
     out
 }
 
+/// Apply one [`SessionEvent`] to a [`FrameSink`] using a session-
+/// scoped [`BitmapRenderer`]. Unlike [`render_event`], this entry
+/// point dispatches `FastPathUpdateType::Orders` through the
+/// renderer's GDI Drawing Order pipeline (OpaqueRect / DstBlt /
+/// PatBlt / MemBlt + cache / LineTo / Polyline / DSTINVERT, etc.) —
+/// servers that emit Orders fast-path (most Windows installations)
+/// get small-update efficiency instead of falling back to
+/// full-screen Bitmap repaints.
+///
+/// `renderer` MUST be the same instance for the lifetime of one RDP
+/// session; the Drawing Order delta-coding history and bitmap /
+/// brush / glyph caches are kept inside it.
+pub fn render_event_stateful<S: FrameSink>(
+    event: &SessionEvent,
+    sink: &mut S,
+    renderer: &mut BitmapRenderer,
+) -> Result<bool, RenderError> {
+    let SessionEvent::Graphics { update_code, data } = event else {
+        return Ok(false);
+    };
+    match update_code {
+        FastPathUpdateType::Bitmap => {
+            let rects = decode_bitmap_update_fast_path(data)?;
+            let any = !rects.is_empty();
+            for r in rects {
+                sink.blit_rgba(
+                    r.dest_left,
+                    r.dest_top,
+                    r.width,
+                    r.height,
+                    &r.pixels_rgba,
+                );
+            }
+            if any {
+                sink.flush();
+            }
+            Ok(any)
+        }
+        FastPathUpdateType::Orders => renderer.process_orders(data, sink),
+        // Palette / Surface Bits / Pointer-* are silently dropped
+        // for now. Surface Bits would route through codec dispatch
+        // (RFX / NSCodec / AVC) once BitmapCodecs capability
+        // negotiation lands; pointer cursor sprites need a separate
+        // PointerSink trait. Both tracked as follow-ups.
+        _ => Ok(false),
+    }
+}
+
 /// Apply one [`SessionEvent`] to a [`FrameSink`].
 ///
 /// Returns `Ok(true)` if the event produced any output (Bitmap update),
 /// `Ok(false)` if the event was non-graphical or has no rectangles. Errors
 /// surface as-is so the embedder can decide whether to log+drop or abort.
+///
+/// Stateless — does not decode Drawing Orders. Embedders that want
+/// Drawing Order rendering should use [`render_event_stateful`] with
+/// a session-scoped [`BitmapRenderer`].
 pub fn render_event<S: FrameSink>(
     event: &SessionEvent,
     sink: &mut S,
@@ -3358,13 +3410,18 @@ pub fn render_event<S: FrameSink>(
             }
             Ok(any)
         }
-        // Synchronize / Surface / Orders / Pointer / etc. — silently
-        // accepted as "no pixels to draw"; the embedder doesn't need a
-        // separate "ignored" surface yet.
-        FastPathUpdateType::Synchronize | FastPathUpdateType::SurfaceCommands => Ok(false),
-        other => Err(RenderError::Unsupported {
-            update_code: *other,
-        }),
+        // Everything else — Synchronize, SurfaceCommands, Orders,
+        // Pointer, Palette, etc. — is silently accepted as "no
+        // pixels to draw" from this entry point's perspective.
+        // Drawing Orders specifically should be either decoded
+        // (TODO: GDI primary/secondary order decoder) or suppressed
+        // at the capability-negotiation layer (the connector
+        // currently false-advertises order support; see
+        // `justrdp-connector::connector` order_support array). Until
+        // a real decoder lands, surfacing an Unsupported error here
+        // would cripple any session against a Windows server that
+        // ever uses GDI fast-path output, which is most of them.
+        _ => Ok(false),
     }
 }
 
@@ -3627,19 +3684,36 @@ mod tests {
     }
 
     #[test]
-    fn render_event_surfaces_unsupported_update_type() {
-        let event = SessionEvent::Graphics {
-            update_code: FastPathUpdateType::Orders,
-            data: Vec::new(),
-        };
+    fn render_event_silently_drops_unsupported_update_types() {
+        // GDI Drawing Orders / Pointer / Palette etc. — anything the
+        // renderer doesn't decode — must NOT surface as an error,
+        // because Windows servers emit Orders fast-path in normal
+        // interactive sessions (mouse hover, cursor changes). The
+        // embedder gets Ok(false) and the canvas stays at whatever
+        // the last Bitmap update painted. Re-decode work is tracked
+        // separately (GDI primary/secondary order decoder).
         let mut sink = Capture::new();
-        let err = render_event(&event, &mut sink).unwrap_err();
-        assert!(
-            matches!(err, RenderError::Unsupported {
-                update_code: FastPathUpdateType::Orders
-            }),
-            "expected Unsupported(Orders), got {err:?}"
-        );
+        for code in [
+            FastPathUpdateType::Orders,
+            FastPathUpdateType::Palette,
+            FastPathUpdateType::PointerHidden,
+            FastPathUpdateType::PointerDefault,
+            FastPathUpdateType::PointerPosition,
+            FastPathUpdateType::PointerColor,
+            FastPathUpdateType::PointerCached,
+            FastPathUpdateType::PointerNew,
+            FastPathUpdateType::PointerLarge,
+        ] {
+            let event = SessionEvent::Graphics {
+                update_code: code,
+                data: Vec::new(),
+            };
+            let result = render_event(&event, &mut sink);
+            assert!(
+                matches!(result, Ok(false)),
+                "expected Ok(false) for {code:?}, got {result:?}"
+            );
+        }
     }
 
     // ── BitmapRenderer / Palette / 8 bpp ────────────────────────────────

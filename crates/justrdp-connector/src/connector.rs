@@ -2,6 +2,7 @@
 
 //! Client connection state machine implementation.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -1609,7 +1610,14 @@ impl ClientConnector {
                 number_fonts: 0,
                 order_flags: 0x002A, // NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT | COLORINDEXSUPPORT
                 order_support: {
-                    // Minimal order support matching FreeRDP defaults
+                    // Original FreeRDP-matching defaults restored —
+                    // an attempt to disable all bits made
+                    // Windows Server 2019 reject the connection at
+                    // finalization with a fatal error_info. Some
+                    // server configurations require at least the
+                    // baseline order set even when the client cannot
+                    // render them (silent drop in render_event is
+                    // safer than capability removal).
                     let mut os = [0u8; 32];
                     os[0] = 1;  // TS_NEG_DSTBLT_INDEX
                     os[1] = 1;  // TS_NEG_PATBLT_INDEX
@@ -1880,9 +1888,15 @@ impl ClientConnector {
         if sd_hdr.pdu_type2 == ShareDataPduType::SetErrorInfo {
             let pdu = SetErrorInfoPdu::decode(&mut inner)?;
             if pdu.error_info != ERRINFO_NONE {
-                return Err(ConnectorError::general(
-                    "server reported fatal error_info during finalization",
-                ));
+                // Surface the exact ERRINFO_* code so embedders can
+                // map it to the spec table (MS-RDPBCGR §2.2.5.1.1).
+                // Common codes: 0x000010CD = REJECTED_CONFIGURATION,
+                // 0x00000001 = RPC_INITIATED_DISCONNECT,
+                // 0x00000005 = LOGOFF_BY_USER, 0x00000004 = IDLE_TIMEOUT.
+                return Err(ConnectorError::general_owned(format!(
+                    "server reported fatal error_info during finalization (code 0x{:08X})",
+                    pdu.error_info
+                )));
             }
             return Ok(FinalizationPduResult::Informational);
         }
