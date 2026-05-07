@@ -108,6 +108,16 @@ function App() {
     };
   }, []);
 
+  async function tryConnect(): Promise<number> {
+    return invoke<number>("rdp_connect", {
+      host: form.host,
+      port: form.port,
+      user: form.user,
+      pass: form.pass,
+      domain: form.domain.trim() === "" ? null : form.domain,
+    });
+  }
+
   async function onConnect(e: React.FormEvent) {
     e.preventDefault();
     if (busy || sessionId !== null) return;
@@ -116,17 +126,42 @@ function App() {
     setFrameCount(0);
     setPointerPos(null);
     try {
-      const id = await invoke<number>("rdp_connect", {
-        host: form.host,
-        port: form.port,
-        user: form.user,
-        pass: form.pass,
-        domain: form.domain.trim() === "" ? null : form.domain,
-      });
+      // First attempt — succeeds when the server's SPKI is already
+      // in the trust store (returning user) or when the build was
+      // compiled with `dev-no-verify`.
+      const id = await tryConnect();
       setSessionId(id);
       setStatus("connected");
     } catch (err) {
-      setStatus(`connect failed: ${err}`);
+      // First attempt failed. The most likely cause in production
+      // builds is an unknown / mismatched SPKI — surface the
+      // fingerprint to the user and offer to trust it. If fetching
+      // the fingerprint also fails, give up and report the original
+      // connect error.
+      try {
+        setStatus("fetching server certificate…");
+        const spki: string = await invoke("rdp_fetch_cert_spki", {
+          host: form.host,
+          port: form.port,
+        });
+        const accepted = window.confirm(
+          `Server ${form.host}:${form.port}\n\n` +
+            `SPKI fingerprint (SHA-256):\n${spki}\n\n` +
+            `Trust this server and connect? Click OK only if you ` +
+            `recognise this fingerprint.`,
+        );
+        if (!accepted) {
+          setStatus("connection refused (untrusted certificate)");
+          return;
+        }
+        await invoke("rdp_trust_spki", { host: form.host, spkiHex: spki });
+        setStatus("trust persisted, reconnecting…");
+        const id = await tryConnect();
+        setSessionId(id);
+        setStatus("connected");
+      } catch (retryErr) {
+        setStatus(`connect failed: ${err} (retry: ${retryErr})`);
+      }
     } finally {
       setBusy(false);
     }

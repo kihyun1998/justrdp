@@ -28,9 +28,11 @@
 mod audio;
 mod input;
 mod sink;
+mod trust;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
@@ -43,6 +45,9 @@ use justrdp_web::render_event;
 
 use crate::input::{InputAction, InputEvent};
 use crate::sink::{BlitRecord, TauriFrameSink};
+use crate::trust::{
+    hex_decode_fingerprint, hex_encode_fingerprint, CaptureSpki, TrustStore, TrustStoreVerifier,
+};
 
 /// Default desktop size negotiated with the server. Pinned so the
 /// shadow framebuffer matches the canvas (`<canvas width=1024
@@ -80,13 +85,18 @@ enum FrontendEvent {
 struct AppState {
     sessions: Mutex<HashMap<u64, mpsc::Sender<SessionMsg>>>,
     next_id: AtomicU64,
+    /// TOFU certificate trust store. Wrapped in `std::sync::RwLock`
+    /// (not `tokio::sync::RwLock`) because the verifier callback is
+    /// sync and runs on the rustls handshake thread.
+    trust_store: Arc<StdRwLock<TrustStore>>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(trust_store: Arc<StdRwLock<TrustStore>>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
+            trust_store,
         }
     }
 }
@@ -118,6 +128,11 @@ async fn rdp_connect(
         processors.push(audio);
     }
 
+    // Slice E: TLS verifier choice is feature-gated. Production
+    // builds use the TOFU TrustStoreVerifier so an unknown / mismatched
+    // SPKI fails the handshake; dev builds with `dev-no-verify` keep
+    // the legacy dangerous_no_verify path for quick iteration.
+    #[cfg(feature = "dev-no-verify")]
     let client = AsyncRdpClient::connect_with_processors(
         format!("{host}:{port}"),
         host.clone(),
@@ -126,6 +141,21 @@ async fn rdp_connect(
     )
     .await
     .map_err(|e| format!("connect failed: {e}"))?;
+
+    #[cfg(not(feature = "dev-no-verify"))]
+    let client = {
+        let verifier: std::sync::Arc<dyn justrdp_tls::ServerCertVerifier> =
+            std::sync::Arc::new(TrustStoreVerifier::new(state.trust_store.clone()));
+        AsyncRdpClient::connect_with_verifier_and_processors(
+            format!("{host}:{port}"),
+            host.clone(),
+            config,
+            verifier,
+            processors,
+        )
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?
+    };
 
     let id = state.next_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (msg_tx, msg_rx) = mpsc::channel::<SessionMsg>(64);
@@ -304,6 +334,62 @@ async fn rdp_poll_remote_clipboard(
     Ok(None)
 }
 
+/// Probe `host:port` over TCP+TLS just enough to capture the
+/// server's leaf SPKI fingerprint, then abort the handshake. Used
+/// by the frontend's first-use trust prompt — it shows the user
+/// the hex fingerprint before the user calls `rdp_trust_spki`.
+///
+/// Implementation note: the capturing verifier returns `Reject`,
+/// which makes the rustls handshake fail with an "unknown issuer"-
+/// style error. That's fine — we collected the fingerprint *before*
+/// the verifier returned, so the Reject just acts as a fast-fail.
+#[tauri::command]
+async fn rdp_fetch_cert_spki(host: String, port: u16) -> Result<String, String> {
+    let capture = Arc::new(CaptureSpki::new());
+    let verifier: Arc<dyn justrdp_tls::ServerCertVerifier> = capture.clone();
+
+    // Dummy credentials — we never reach the RDP handshake. The TLS
+    // handshake itself is enough to receive the server cert.
+    let config = Config::builder("probe", "probe").build();
+
+    let _ = AsyncRdpClient::connect_with_verifier_and_processors(
+        format!("{host}:{port}"),
+        host.clone(),
+        config,
+        verifier,
+        Vec::new(),
+    )
+    .await;
+
+    // Whether the connect Result was Ok or Err, the verifier was
+    // invoked and the SPKI was captured. If the cert was somehow
+    // unparseable, surface that as a distinct error so the frontend
+    // doesn't show an empty hex string.
+    capture
+        .captured()
+        .map(|fp| hex_encode_fingerprint(&fp))
+        .ok_or_else(|| {
+            format!("could not extract SPKI from server cert at {host}:{port}")
+        })
+}
+
+/// Persist a SPKI fingerprint to the trust store. Called by the
+/// frontend after the user accepts the first-use trust prompt.
+#[tauri::command]
+async fn rdp_trust_spki(
+    state: tauri::State<'_, Arc<AppState>>,
+    host: String,
+    spki_hex: String,
+) -> Result<(), String> {
+    let fp = hex_decode_fingerprint(&spki_hex)
+        .ok_or_else(|| format!("invalid SPKI hex (expected 64 lowercase chars): {spki_hex}"))?;
+    let mut store = state
+        .trust_store
+        .write()
+        .map_err(|_| "trust store lock poisoned".to_string())?;
+    store.add(&host, fp).map_err(|e| format!("trust persist failed: {e}"))
+}
+
 #[tauri::command]
 async fn rdp_disconnect(
     state: tauri::State<'_, Arc<AppState>>,
@@ -328,12 +414,22 @@ async fn rdp_disconnect(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let state = Arc::new(AppState::new());
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .setup(move |app| {
-            app.manage(state.clone());
+        .setup(|app| {
+            // Resolve the platform-appropriate per-app config dir
+            // (`%APPDATA%\com.user.justrdp-tauri\` on Windows etc.)
+            // and open the trust store there. Failure to resolve
+            // falls back to the OS temp dir — better than refusing
+            // to launch.
+            let store_path = app
+                .path()
+                .app_config_dir()
+                .map(|d| d.join("trusted-spki.json"))
+                .unwrap_or_else(|_| std::env::temp_dir().join("justrdp-trusted-spki.json"));
+            let trust_store = Arc::new(StdRwLock::new(TrustStore::open(store_path)));
+            let state = Arc::new(AppState::new(trust_store));
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -342,6 +438,8 @@ pub fn run() {
             rdp_set_local_clipboard,
             rdp_poll_remote_clipboard,
             rdp_disconnect,
+            rdp_fetch_cert_spki,
+            rdp_trust_spki,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

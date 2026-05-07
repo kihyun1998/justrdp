@@ -12,6 +12,14 @@ repository.workspace = true
 name = "justrdp_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = []
+# Slice E (TOFU trust): enables the dangerous_no_verify TLS path.
+# Production builds MUST NOT pass this feature — Slice F's binary
+# audit greps the output for the dangerous symbol; with this gate
+# off, the symbol is not even compiled in.
+dev-no-verify = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -38,6 +46,19 @@ justrdp-web = { workspace = true }
 justrdp-svc = { workspace = true, features = ["alloc"] }
 justrdp-rdpsnd = { workspace = true, features = ["std"] }
 justrdp-rdpsnd-native = { workspace = true }
+# Slice E (TOFU trust): SHA-256 of SPKI + ServerCertVerifier trait.
+# `justrdp-core` for the sha256 helper, `justrdp-tls` for the
+# verifier trait + extract_spki_from_cert_der.
+justrdp-core = { workspace = true, features = ["alloc"] }
+justrdp-tls = { workspace = true }
 
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 base64 = "0.22"
+# Slice E (TOFU trust store): JSON serde for the persisted host →
+# SPKI map. `serde_json` is already pulled in via the existing
+# `serde_json` dep above; no extra runtime dep needed.
+
+[dev-dependencies]
+# Slice E: TrustStore unit tests need a scratch directory that is
+# cleaned up automatically.
+tempfile = "3"

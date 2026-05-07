@@ -2661,10 +2661,12 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "justrdp-async",
+ "justrdp-core",
  "justrdp-input",
  "justrdp-rdpsnd",
  "justrdp-rdpsnd-native",
  "justrdp-svc",
+ "justrdp-tls",
  "justrdp-tokio",
  "justrdp-web",
  "serde",
@@ -2672,6 +2674,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
  "tokio",
 ]
 

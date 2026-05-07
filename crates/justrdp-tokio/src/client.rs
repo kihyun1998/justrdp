@@ -157,6 +157,30 @@ impl AsyncRdpClient {
         connect_inner(server, config, upgrader, processors).await
     }
 
+    /// Combine a custom [`ServerCertVerifier`] *and* SVC processor
+    /// registration. The intersection of [`connect_with_verifier`]
+    /// and [`connect_with_processors`] — needed by embedders that
+    /// pin certificates *and* need clipboard / audio / file
+    /// redirect channels.
+    ///
+    /// [`connect_with_verifier`]: Self::connect_with_verifier
+    /// [`connect_with_processors`]: Self::connect_with_processors
+    pub async fn connect_with_verifier_and_processors<A>(
+        server: A,
+        server_name: impl Into<String>,
+        config: Config,
+        verifier: Arc<dyn ServerCertVerifier>,
+        processors: Vec<Box<dyn SvcProcessor>>,
+    ) -> Result<Self, ConnectError>
+    where
+        A: tokio::net::ToSocketAddrs + Send + 'static,
+    {
+        let server_name = server_name.into();
+        let upgrader = build_native_tls_upgrade_with_verifier(&server_name, verifier)
+            .map_err(transport_to_connect_error)?;
+        connect_inner(server, config, upgrader, processors).await
+    }
+
     /// Receive the next session event, awaiting until one arrives.
     ///
     /// Returns `None` once the pump exits (graceful disconnect,
