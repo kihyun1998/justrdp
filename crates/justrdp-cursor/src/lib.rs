@@ -132,9 +132,15 @@ pub enum CursorError {
         hotspot_x: u16,
         hotspot_y: u16,
     },
-    /// Pointer message type the decoder does not yet handle. Slices
-    /// γ / δ replace these.
-    Unsupported { msg_type: u16 },
+    /// `decode_new` saw a bit-depth other than 24 or 32 (the only
+    /// two we currently decode). Legacy 1/4/8/16 bpp variants are
+    /// rare on modern Windows servers and surface as Unsupported
+    /// rather than silently returning a wrong sprite.
+    UnsupportedBpp { xor_bpp: u16 },
+    /// Cached pointer message referenced a cache index the cache
+    /// has never seen — the embedder may choose to drop or trigger
+    /// a refresh.
+    CacheMiss { index: u16 },
 }
 
 /// Decode a `TS_PTRMSGTYPE_COLOR` (Color Pointer Update) payload —
@@ -256,6 +262,153 @@ pub fn decode_color(payload: &[u8]) -> Result<DecodedCursor, CursorError> {
         hotspot_y,
         rgba,
     })
+}
+
+/// Decode a `TS_PTRMSGTYPE_POINTER` (New Pointer Update) payload —
+/// MS-RDPBCGR §2.2.9.1.1.4.5. Same layout as Color but with a
+/// 2-byte `xorBpp` prefix; 24bpp shares the Color path, 32bpp
+/// reads BGRA (alpha respected when no AND mask is supplied).
+///
+/// Wire layout (little-endian):
+///
+/// ```text
+/// xorBpp          u16   // 1 / 4 / 8 / 16 / 24 / 32 — we accept 24, 32
+/// cacheIndex      u16
+/// hotSpot.x       u16
+/// hotSpot.y       u16
+/// width           u16
+/// height          u16
+/// lengthAndMask   u16
+/// lengthXorMask   u16
+/// xorMaskData     u8 * lengthXorMask   // bottom-up DIB
+/// andMaskData     u8 * lengthAndMask   // 1bpp packed, bottom-up
+/// ```
+pub fn decode_new(payload: &[u8]) -> Result<DecodedCursor, CursorError> {
+    const NEW_HEADER_LEN: usize = 16;
+    if payload.len() < NEW_HEADER_LEN {
+        return Err(CursorError::Truncated {
+            expected: NEW_HEADER_LEN,
+            got: payload.len(),
+        });
+    }
+    let xor_bpp = u16::from_le_bytes([payload[0], payload[1]]);
+    let _cache_index = u16::from_le_bytes([payload[2], payload[3]]);
+    let hotspot_x = u16::from_le_bytes([payload[4], payload[5]]);
+    let hotspot_y = u16::from_le_bytes([payload[6], payload[7]]);
+    let width = u16::from_le_bytes([payload[8], payload[9]]);
+    let height = u16::from_le_bytes([payload[10], payload[11]]);
+    let length_and = u16::from_le_bytes([payload[12], payload[13]]) as usize;
+    let length_xor = u16::from_le_bytes([payload[14], payload[15]]) as usize;
+
+    if width == 0 || height == 0 || hotspot_x >= width || hotspot_y >= height {
+        return Err(CursorError::BadDimensions {
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+        });
+    }
+
+    if xor_bpp != 24 && xor_bpp != 32 {
+        return Err(CursorError::UnsupportedBpp { xor_bpp });
+    }
+
+    let total = NEW_HEADER_LEN + length_xor + length_and;
+    if payload.len() < total {
+        return Err(CursorError::Truncated {
+            expected: total,
+            got: payload.len(),
+        });
+    }
+
+    let xor_data = &payload[NEW_HEADER_LEN..NEW_HEADER_LEN + length_xor];
+    let and_data = &payload[NEW_HEADER_LEN + length_xor..NEW_HEADER_LEN + length_xor + length_and];
+
+    let w = width as usize;
+    let h = height as usize;
+    let bytes_per_pixel = (xor_bpp / 8) as usize;
+    // 24bpp rows are 4-byte aligned (DIB convention); 32bpp already aligned.
+    let xor_row_stride = if xor_bpp == 24 {
+        (w * 3 + 3) & !3
+    } else {
+        w * 4
+    };
+    let and_row_unpadded = (w + 7) / 8;
+    let and_row_stride = (and_row_unpadded + 1) & !1;
+    let has_and = length_and > 0;
+
+    let mut rgba = alloc::vec![0u8; w * h * 4];
+    for src_y in 0..h {
+        let dst_y = h - 1 - src_y; // bottom-up DIB
+        let xor_off = src_y * xor_row_stride;
+        let and_off = src_y * and_row_stride;
+        for x in 0..w {
+            let pixel_off = xor_off + x * bytes_per_pixel;
+            let (b, g, r, a) = if xor_bpp == 24 {
+                (
+                    xor_data[pixel_off],
+                    xor_data[pixel_off + 1],
+                    xor_data[pixel_off + 2],
+                    0xFFu8,
+                )
+            } else {
+                (
+                    xor_data[pixel_off],
+                    xor_data[pixel_off + 1],
+                    xor_data[pixel_off + 2],
+                    xor_data[pixel_off + 3],
+                )
+            };
+            let and_bit = if has_and {
+                let and_byte = and_data[and_off + x / 8];
+                (and_byte >> (7 - (x % 8))) & 1
+            } else {
+                0 // no AND mask → use XOR alpha as-is
+            };
+
+            let dst = (dst_y * w + x) * 4;
+            if and_bit == 0 {
+                rgba[dst] = r;
+                rgba[dst + 1] = g;
+                rgba[dst + 2] = b;
+                rgba[dst + 3] = a;
+            } else {
+                rgba[dst] = 0;
+                rgba[dst + 1] = 0;
+                rgba[dst + 2] = 0;
+                rgba[dst + 3] = 0;
+            }
+        }
+    }
+
+    Ok(DecodedCursor {
+        width,
+        height,
+        hotspot_x,
+        hotspot_y,
+        rgba,
+    })
+}
+
+/// Decode a `TS_PTRMSGTYPE_CACHED` (Cached Pointer Update) payload
+/// — MS-RDPBCGR §2.2.9.1.1.4.6. Just a 2-byte cache index lookup;
+/// returns the previously-stored sprite verbatim, or `CacheMiss`
+/// when the cache has never seen this index.
+pub fn decode_cached(
+    payload: &[u8],
+    cache: &CursorCache,
+) -> Result<DecodedCursor, CursorError> {
+    if payload.len() < 2 {
+        return Err(CursorError::Truncated {
+            expected: 2,
+            got: payload.len(),
+        });
+    }
+    let idx = u16::from_le_bytes([payload[0], payload[1]]);
+    cache
+        .lookup(idx)
+        .cloned()
+        .ok_or(CursorError::CacheMiss { index: idx })
 }
 
 #[cfg(test)]
@@ -472,5 +625,83 @@ mod tests {
         cache.clear();
         assert!(cache.is_empty());
         assert!(cache.lookup(1).is_none());
+    }
+
+    /// New pointer (TS_PTRMSGTYPE_POINTER, Windows 11 default) at
+    /// 32 bpp BGRA carries alpha in-band. Without an AND mask the
+    /// alpha byte goes straight into RGBA.
+    #[test]
+    fn decode_new_32bpp_carries_alpha_in_band() {
+        let mut v = vec![];
+        v.extend_from_slice(&32u16.to_le_bytes()); // xorBpp = 32
+        v.extend_from_slice(&0u16.to_le_bytes()); // cacheIndex
+        v.extend_from_slice(&0u16.to_le_bytes()); // hotSpot.x
+        v.extend_from_slice(&0u16.to_le_bytes()); // hotSpot.y
+        v.extend_from_slice(&1u16.to_le_bytes()); // width
+        v.extend_from_slice(&1u16.to_le_bytes()); // height
+        v.extend_from_slice(&0u16.to_le_bytes()); // lengthAndMask = 0 (no AND mask)
+        v.extend_from_slice(&4u16.to_le_bytes()); // lengthXorMask
+        // BGRA: B=0x10, G=0x20, R=0x30, A=0x80 (half-alpha)
+        v.extend_from_slice(&[0x10, 0x20, 0x30, 0x80]);
+
+        let cursor = decode_new(&v).expect("decode ok");
+        assert_eq!(cursor.width, 1);
+        assert_eq!(cursor.height, 1);
+        // RGBA: R=0x30, G=0x20, B=0x10, A=0x80
+        assert_eq!(cursor.rgba, vec![0x30, 0x20, 0x10, 0x80]);
+    }
+
+    /// New pointer at 24 bpp behaves like Color pointer — uses AND
+    /// mask for transparency.
+    #[test]
+    fn decode_new_24bpp_uses_and_mask_like_color() {
+        let mut v = vec![];
+        v.extend_from_slice(&24u16.to_le_bytes()); // xorBpp = 24
+        v.extend_from_slice(&0u16.to_le_bytes()); // cacheIndex
+        v.extend_from_slice(&0u16.to_le_bytes()); // hotSpot.x
+        v.extend_from_slice(&0u16.to_le_bytes()); // hotSpot.y
+        v.extend_from_slice(&1u16.to_le_bytes()); // width
+        v.extend_from_slice(&1u16.to_le_bytes()); // height
+        v.extend_from_slice(&2u16.to_le_bytes()); // lengthAndMask
+        v.extend_from_slice(&4u16.to_le_bytes()); // lengthXorMask (3 + 1 pad)
+        // XOR: BGR red + 1 pad
+        v.extend_from_slice(&[0x00, 0x00, 0xFF, 0x00]);
+        // AND: 0-bit (opaque) + pad
+        v.extend_from_slice(&[0x00, 0x00]);
+
+        let cursor = decode_new(&v).expect("decode ok");
+        assert_eq!(cursor.rgba, vec![0xFF, 0x00, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn decode_new_rejects_unsupported_bpp() {
+        let mut v = vec![0u8; 16];
+        v[0..2].copy_from_slice(&8u16.to_le_bytes()); // xorBpp = 8 (legacy palette)
+        v[8..10].copy_from_slice(&1u16.to_le_bytes()); // width
+        v[10..12].copy_from_slice(&1u16.to_le_bytes()); // height
+        let err = decode_new(&v).unwrap_err();
+        assert!(matches!(err, CursorError::UnsupportedBpp { xor_bpp: 8 }));
+    }
+
+    /// Cached pointer hit returns the previously-cached sprite
+    /// verbatim.
+    #[test]
+    fn decode_cached_returns_stored_sprite_on_hit() {
+        let mut cache = CursorCache::new();
+        let sprite = fake_sprite(7);
+        cache.add(42, sprite.clone());
+        let payload = 42u16.to_le_bytes();
+        let result = decode_cached(&payload, &cache).expect("hit");
+        assert_eq!(result, sprite);
+    }
+
+    /// Cached pointer miss surfaces a typed error carrying the
+    /// requested index.
+    #[test]
+    fn decode_cached_surfaces_miss_with_index() {
+        let cache = CursorCache::new();
+        let payload = 99u16.to_le_bytes();
+        let err = decode_cached(&payload, &cache).unwrap_err();
+        assert!(matches!(err, CursorError::CacheMiss { index: 99 }));
     }
 }

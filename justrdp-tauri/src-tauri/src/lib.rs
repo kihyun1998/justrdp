@@ -295,49 +295,67 @@ async fn run_session(
                     Some(Ok(RdpEvent::PointerDefault)) => {
                         let _ = window.emit("rdp:event", FrontendEvent::PointerDefault);
                     }
-                    // Slice β (#10): decode Color pointer payloads.
-                    // pointer_type 0x06 LARGE / 0x07 CACHED / 0x08
-                    // POINTER (New) cannot be decoded yet (Slices
-                    // γ / δ); fall back to PointerDefault so the
-                    // host always shows an OS arrow rather than
-                    // stale state.
+                    // Slices β + γ + δ: decode Color (0x09) / New
+                    // POINTER (0x08, Windows 11 default) / Cached
+                    // (0x07) → emit sprite. New pointer covers
+                    // ~90% of Windows server traffic; Color is the
+                    // legacy XP-era fallback. Cached re-uses a
+                    // previously-decoded sprite (no IPC re-encode).
+                    // LARGE (0x06, HiDPI 96×96) is rare and stays
+                    // silent for now.
                     Some(Ok(RdpEvent::PointerBitmap { pointer_type, data })) => {
-                        const TS_PTRMSGTYPE_COLOR: u16 = 0x0009;
-                        if pointer_type == TS_PTRMSGTYPE_COLOR {
-                            match justrdp_cursor::decode_color(&data) {
-                                Ok(cursor) => {
-                                    if let Some(idx) = justrdp_cursor::extract_cache_index(&data) {
-                                        cursor_cache.add(idx, cursor.clone());
-                                    }
-                                    let rgba_b64 = B64.encode(&cursor.rgba);
-                                    let _ = window.emit(
-                                        "rdp:event",
-                                        FrontendEvent::PointerSprite {
-                                            width: cursor.width,
-                                            height: cursor.height,
-                                            hotspot_x: cursor.hotspot_x,
-                                            hotspot_y: cursor.hotspot_y,
-                                            rgba_b64,
-                                        },
-                                    );
-                                }
-                                Err(_) => {
-                                    let _ = window.emit(
-                                        "rdp:event",
-                                        FrontendEvent::PointerDefault,
-                                    );
+                        // Match BOTH slow-path messageType codes
+                        // (0x06/0x07/0x08/0x09) AND fast-path
+                        // FastPathUpdateType u8 codes (0xC/0xA/0xB/0x9).
+                        // Modern Windows servers send fast-path
+                        // almost exclusively, so missing the
+                        // fast-path arm leaves cursor stuck.
+                        const COLOR: &[u16] = &[0x0009]; // slow & fast share 0x9
+                        const POINTER_NEW: &[u16] = &[0x0008, 0x000B]; // slow=0x8, fast=0xB
+                        const CACHED: &[u16] = &[0x0007, 0x000A]; // slow=0x7, fast=0xA
+                        // LARGE: slow=0x6, fast=0xC — silent for now.
+
+                        let decoded = if COLOR.contains(&pointer_type) {
+                            let r = justrdp_cursor::decode_color(&data);
+                            if let Ok(ref c) = r {
+                                if let Some(idx) = justrdp_cursor::extract_cache_index(&data) {
+                                    cursor_cache.add(idx, c.clone());
                                 }
                             }
+                            r.ok()
+                        } else if POINTER_NEW.contains(&pointer_type) {
+                            // New Pointer puts cacheIndex at offset 2 (after xorBpp).
+                            let r = justrdp_cursor::decode_new(&data);
+                            if let Ok(ref c) = r {
+                                if data.len() >= 4 {
+                                    let idx = u16::from_le_bytes([data[2], data[3]]);
+                                    cursor_cache.add(idx, c.clone());
+                                }
+                            }
+                            r.ok()
+                        } else if CACHED.contains(&pointer_type) {
+                            justrdp_cursor::decode_cached(&data, &cursor_cache).ok()
                         } else {
-                            // New / Large / Cached — Slice γ / δ
-                            // wires these. For now, fall back to
-                            // OS default so the user always sees
-                            // a cursor inside the canvas.
+                            None // LARGE / unknown — silent drop
+                        };
+
+                        if let Some(cursor) = decoded {
+                            let rgba_b64 = B64.encode(&cursor.rgba);
                             let _ = window.emit(
                                 "rdp:event",
-                                FrontendEvent::PointerDefault,
+                                FrontendEvent::PointerSprite {
+                                    width: cursor.width,
+                                    height: cursor.height,
+                                    hotspot_x: cursor.hotspot_x,
+                                    hotspot_y: cursor.hotspot_y,
+                                    rgba_b64,
+                                },
                             );
                         }
+                        // Decoder rejection / unknown type → keep
+                        // last-painted cursor. Better than forcing
+                        // a default arrow that overwrites a valid
+                        // sprite from an earlier message.
                     }
                     Some(Ok(RdpEvent::Disconnected(reason))) => {
                         let _ = window.emit(
