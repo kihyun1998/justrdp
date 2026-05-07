@@ -1,9 +1,14 @@
 //! Tauri-side bridge for the JustRDP async client (v2).
 //!
-//! Slice A (this commit): connect / input / disconnect cycle.
-//!   `RdpEvent::GraphicsUpdate` is observed but only a frame counter
-//!   is forwarded to the frontend — actual decoding (BitmapRenderer
-//!   + FrameSink wiring) lives in Slice B.
+//! Slice B (this commit): GraphicsUpdate is decoded through
+//!   `justrdp_web::render_event` into a [`TauriFrameSink`], which
+//!   accumulates damaged rectangles and ships them to the frontend
+//!   as a single `Frame { blits }` IPC event. The frontend renders
+//!   each blit with `ctx.putImageData`.
+//!
+//! Slice A (prior commit): connect / input / disconnect cycle.
+//!   `RdpEvent::GraphicsUpdate` was observed but only a frame counter
+//!   was forwarded.
 //!
 //! ## Why a task-owned `AsyncRdpClient`
 //!
@@ -20,16 +25,31 @@
 //! accumulate because the task is the only consumer of both
 //! channels.
 
+mod audio;
+mod input;
+mod sink;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{Emitter, Manager, Window};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use justrdp_input::{MouseButton, Scancode};
+use justrdp_async::SessionEvent;
 use justrdp_tokio::{AsyncRdpClient, Config, RdpEvent};
+use justrdp_web::render_event;
+
+use crate::input::{InputAction, InputEvent};
+use crate::sink::{BlitRecord, TauriFrameSink};
+
+/// Default desktop size negotiated with the server. Pinned so the
+/// shadow framebuffer matches the canvas (`<canvas width=1024
+/// height=768>` in `App.tsx`). Resize support arrives in a later
+/// slice (display-control channel + dynamic canvas).
+const DESKTOP_WIDTH: u16 = 1024;
+const DESKTOP_HEIGHT: u16 = 768;
 
 /// In-flight messages from frontend commands to the per-session
 /// owner task. The task owns `AsyncRdpClient` and replies via the
@@ -44,27 +64,14 @@ enum SessionMsg {
     },
 }
 
-/// Frontend-shaped input event. One enum so we keep a single
-/// `send_input` Tauri command instead of four overlapping ones.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum InputEvent {
-    /// `code` is the 8-bit AT/PS-2 scancode; `extended` carries the
-    /// E0 prefix bit (arrow keys, right-side modifiers, etc.).
-    Key { code: u8, extended: bool, pressed: bool },
-    MouseMove { x: u16, y: u16 },
-    /// `button`: 0=Left 1=Right 2=Middle 3=X1 4=X2.
-    MouseButton { button: u8, pressed: bool, x: u16, y: u16 },
-    Wheel { delta: i16, horizontal: bool, x: u16, y: u16 },
-}
-
-/// Outbound `Window::emit("rdp:event", ...)` payload. Slice A keeps
-/// this minimal — Slice B will replace `Frame { count }` with
-/// `Frame { x, y, w, h, rgba_b64 }`.
+/// Outbound `Window::emit("rdp:event", ...)` payload. `Frame`
+/// carries one batch of damaged rectangles (one per BitmapData in
+/// the originating GraphicsUpdate); the frontend draws each with
+/// `putImageData` at `(x, y)`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum FrontendEvent {
-    Frame { count: u64 },
+    Frame { blits: Vec<BlitRecord> },
     PointerPosition { x: u16, y: u16 },
     Disconnected { reason: String },
     Error { message: String },
@@ -94,15 +101,31 @@ async fn rdp_connect(
     pass: String,
     domain: Option<String>,
 ) -> Result<u64, String> {
-    let mut builder = Config::builder(&user, &pass);
+    let mut builder =
+        Config::builder(&user, &pass).desktop_size(DESKTOP_WIDTH, DESKTOP_HEIGHT);
     if let Some(d) = domain {
         builder = builder.domain(&d);
     }
     let config = builder.build();
 
-    let client = AsyncRdpClient::connect(format!("{host}:{port}"), host.clone(), config)
-        .await
-        .map_err(|e| format!("connect failed: {e}"))?;
+    // Slice D2: register RDPSND audio processor on platforms that
+    // have a wired backend. `audio::new_platform_audio_processor`
+    // returns None on unsupported targets; in that case the session
+    // simply has no audio path (server-pushed PCM is silently dropped
+    // upstream of this module by the SVC dispatcher).
+    let mut processors = Vec::new();
+    if let Some(audio) = audio::new_platform_audio_processor() {
+        processors.push(audio);
+    }
+
+    let client = AsyncRdpClient::connect_with_processors(
+        format!("{host}:{port}"),
+        host.clone(),
+        config,
+        processors,
+    )
+    .await
+    .map_err(|e| format!("connect failed: {e}"))?;
 
     let id = state.next_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (msg_tx, msg_rx) = mpsc::channel::<SessionMsg>(64);
@@ -128,10 +151,7 @@ async fn run_session(
     window: Window,
     state: Arc<AppState>,
 ) {
-    let mut frame_count: u64 = 0;
-    // Emit a Frame event every Nth update so we don't spam the IPC
-    // bridge while we don't have actual pixels to ship yet.
-    const FRAME_REPORT_EVERY: u64 = 30;
+    let mut sink = TauriFrameSink::new(DESKTOP_WIDTH, DESKTOP_HEIGHT);
 
     loop {
         tokio::select! {
@@ -159,13 +179,38 @@ async fn run_session(
 
             evt = client.next_event() => {
                 match evt {
-                    Some(Ok(RdpEvent::GraphicsUpdate { .. })) => {
-                        frame_count += 1;
-                        if frame_count % FRAME_REPORT_EVERY == 0 {
-                            let _ = window.emit(
-                                "rdp:event",
-                                FrontendEvent::Frame { count: frame_count },
-                            );
+                    Some(Ok(RdpEvent::GraphicsUpdate { update_code, data })) => {
+                        // Reconstruct a SessionEvent::Graphics so
+                        // render_event can decode the bitmap update.
+                        // Fields are 1:1 with the v1-compat
+                        // translation in justrdp_tokio::translate
+                        // (translate.rs:35).
+                        let sev = SessionEvent::Graphics { update_code, data };
+                        match render_event(&sev, &mut sink) {
+                            Ok(true) => {
+                                let blits = sink.drain_blits();
+                                if !blits.is_empty() {
+                                    let _ = window.emit(
+                                        "rdp:event",
+                                        FrontendEvent::Frame { blits },
+                                    );
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                // Surface decoder errors instead of
+                                // silently dropping. Don't tear
+                                // down the session — codec gaps
+                                // (RFX without registered codec_id,
+                                // NSCodec, …) are recoverable; the
+                                // next refresh paints cleanly.
+                                let _ = window.emit(
+                                    "rdp:event",
+                                    FrontendEvent::Error {
+                                        message: format!("render: {e:?}"),
+                                    },
+                                );
+                            }
                         }
                     }
                     Some(Ok(RdpEvent::PointerPosition { x, y })) => {
@@ -207,25 +252,17 @@ async fn run_session(
 }
 
 async fn dispatch_input(client: &AsyncRdpClient, event: InputEvent) -> Result<(), String> {
-    let r = match event {
-        InputEvent::Key { code, extended, pressed } => {
-            client.send_keyboard(Scancode::new(code, extended), pressed).await
+    let action = input::translate(event).map_err(|e| format!("translate: {e:?}"))?;
+    let r = match action {
+        InputAction::Key { scancode, pressed } => client.send_keyboard(scancode, pressed).await,
+        InputAction::MouseMove { x, y } => client.send_mouse_move(x, y).await,
+        InputAction::MouseButton { button, pressed, x, y } => {
+            client.send_mouse_button(button, pressed, x, y).await
         }
-        InputEvent::MouseMove { x, y } => client.send_mouse_move(x, y).await,
-        InputEvent::MouseButton { button, pressed, x, y } => {
-            let btn = match button {
-                0 => MouseButton::Left,
-                1 => MouseButton::Right,
-                2 => MouseButton::Middle,
-                3 => MouseButton::X1,
-                4 => MouseButton::X2,
-                _ => return Err(format!("unknown mouse button {button}")),
-            };
-            client.send_mouse_button(btn, pressed, x, y).await
-        }
-        InputEvent::Wheel { delta, horizontal, x, y } => {
+        InputAction::Wheel { delta, horizontal, x, y } => {
             client.send_mouse_wheel(delta, horizontal, x, y).await
         }
+        InputAction::Unicode { ch, pressed } => client.send_unicode(ch, pressed).await,
     };
     r.map_err(|e| e.to_string())
 }

@@ -21,7 +21,10 @@ tracing = ["dep:tracing", "justrdp-blocking/tracing", "justrdp-async?/tracing"]
 # Exposes `NativeTcpTransport` — a `tokio::net::TcpStream` wrapper that
 # implements `WebTransport` (from `justrdp-async`) directly. Native
 # substrate for `WebClient<NativeTcpTransport>` once §5.6.4 lands.
-native-tcp = ["dep:justrdp-async"]
+# Pulls in `justrdp-svc` so `AsyncRdpClient::connect_with_processors`
+# (used by RDPSND/CLIPRDR/etc embedders) compiles unconditionally
+# under any native-* feature.
+native-tcp = ["dep:justrdp-async", "dep:justrdp-svc"]
 # Exposes `NativeTlsUpgrade` / `NativeTlsTransport` — async TLS via
 # `tokio-rustls` for the `WebClient::connect_with_upgrade` path. Implies
 # `native-tcp` because the upgrader consumes a `NativeTcpTransport`.

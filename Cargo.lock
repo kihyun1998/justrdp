@@ -2660,8 +2660,13 @@ name = "justrdp-tauri"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "justrdp-async",
  "justrdp-input",
+ "justrdp-rdpsnd",
+ "justrdp-rdpsnd-native",
+ "justrdp-svc",
  "justrdp-tokio",
+ "justrdp-web",
  "serde",
  "serde_json",
  "tauri",

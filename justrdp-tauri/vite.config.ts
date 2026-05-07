@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -28,5 +29,15 @@ export default defineConfig(async () => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+  },
+
+  // Vitest configuration. `keymap` is the only deep module that needs
+  // a JS test runner; it is a pure function with no DOM dependency,
+  // so `environment: 'node'` keeps the runner lightweight. Explicit
+  // imports (no `globals`) avoid polluting the type namespace.
+  test: {
+    globals: false,
+    environment: "node",
+    include: ["src/**/*.test.ts"],
   },
 }));

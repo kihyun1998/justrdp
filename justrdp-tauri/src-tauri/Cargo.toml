@@ -24,6 +24,20 @@ serde_json = "1"
 # JustRDP — pure-async client (v2) over native TCP/TLS/CredSSP.
 justrdp-tokio = { workspace = true, features = ["native-nla"] }
 justrdp-input = { workspace = true }
+# Slice B (frame push): SessionEvent::Graphics reconstruction +
+# BitmapRenderer + FrameSink trait. See src/sink.rs.
+justrdp-async = { workspace = true }
+# `websocket` feature is a no-op on non-wasm targets (gated behind
+# `cfg(target_arch = "wasm32")` in justrdp-web/Cargo.toml), so the
+# default feature set is fine here even though Tauri builds native.
+justrdp-web = { workspace = true }
+# Slice D2 (audio): SVC processor type + RDPSND client +
+# platform-specific audio output backend. See src/audio.rs. ADR-0006:
+# Tauri layer only touches NativeAudioOutput-shaped types; PDU-typed
+# RDPSND symbols live in the rdpsnd / rdpsnd-native crates.
+justrdp-svc = { workspace = true, features = ["alloc"] }
+justrdp-rdpsnd = { workspace = true, features = ["std"] }
+justrdp-rdpsnd-native = { workspace = true }
 
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 base64 = "0.22"

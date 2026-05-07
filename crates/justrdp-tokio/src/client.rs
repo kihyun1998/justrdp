@@ -48,9 +48,11 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use std::io;
 
 use justrdp_async::{ActiveSession, DriverError, WebClient};
+use justrdp_svc::SvcProcessor;
 use justrdp_blocking::{ConnectError, RdpEvent, RuntimeError};
 use justrdp_connector::Config;
 use justrdp_input::{LockKeys, MouseButton, Scancode};
@@ -104,7 +106,7 @@ impl AsyncRdpClient {
         let server_name = server_name.into();
         let upgrader = NativeTlsUpgrade::dangerous_no_verify(&server_name)
             .map_err(transport_to_connect_error)?;
-        connect_inner(server, config, upgrader).await
+        connect_inner(server, config, upgrader, Vec::new()).await
     }
 
     /// Connect using a custom [`ServerCertVerifier`]. Mirrors
@@ -121,7 +123,38 @@ impl AsyncRdpClient {
         let server_name = server_name.into();
         let upgrader = build_native_tls_upgrade_with_verifier(&server_name, verifier)
             .map_err(transport_to_connect_error)?;
-        connect_inner(server, config, upgrader).await
+        connect_inner(server, config, upgrader, Vec::new()).await
+    }
+
+    /// Connect with a no-verify TLS upgrader **and** register
+    /// [`SvcProcessor`]s on the resulting active session — RDPSND,
+    /// CLIPRDR, RDPDR, EGFX, etc. Same security posture as
+    /// [`connect`](Self::connect) (server identity not verified at
+    /// the TLS layer; CredSSP / NLA still cross-checks the leaf
+    /// SPKI). Mirrors [`RdpClient::connect_with_processors`](justrdp_blocking::RdpClient::connect_with_processors).
+    ///
+    /// Embedders constructing the per-session processor list inline:
+    ///
+    /// ```ignore
+    /// let processors: Vec<Box<dyn SvcProcessor>> = vec![
+    ///     Box::new(RdpsndClient::new(Box::new(audio_backend))),
+    ///     Box::new(cliprdr_client),
+    /// ];
+    /// AsyncRdpClient::connect_with_processors(addr, host, config, processors).await?
+    /// ```
+    pub async fn connect_with_processors<A>(
+        server: A,
+        server_name: impl Into<String>,
+        config: Config,
+        processors: Vec<Box<dyn SvcProcessor>>,
+    ) -> Result<Self, ConnectError>
+    where
+        A: tokio::net::ToSocketAddrs + Send + 'static,
+    {
+        let server_name = server_name.into();
+        let upgrader = NativeTlsUpgrade::dangerous_no_verify(&server_name)
+            .map_err(transport_to_connect_error)?;
+        connect_inner(server, config, upgrader, processors).await
     }
 
     /// Receive the next session event, awaiting until one arrives.
@@ -274,6 +307,7 @@ async fn connect_inner<A>(
     server: A,
     config: Config,
     upgrader: NativeTlsUpgrade,
+    processors: Vec<Box<dyn SvcProcessor>>,
 ) -> Result<AsyncRdpClient, ConnectError>
 where
     A: tokio::net::ToSocketAddrs + Send + 'static,
@@ -295,8 +329,13 @@ where
         .await
         .map_err(driver_to_connect_error)?;
 
-    // 3. Build the active session and spawn the async pump.
-    let session: ActiveSession<NativeTlsTransport> = ActiveSession::new(post_tls, &result);
+    // 3. Build the active session — `with_processors` accepts an
+    //    empty Vec, so the no-processor entry points reuse this
+    //    path without a separate ::new branch.
+    let session: ActiveSession<NativeTlsTransport> =
+        ActiveSession::with_processors(post_tls, &result, processors)
+            .await
+            .map_err(driver_to_connect_error)?;
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(CMD_QUEUE);
     let (evt_tx, evt_rx) = mpsc::channel::<Result<RdpEvent, RuntimeError>>(EVT_QUEUE);
 

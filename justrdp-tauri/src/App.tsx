@@ -1,15 +1,44 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { RdpCanvas } from "./RdpCanvas";
 import "./App.css";
 
 // Backend-shaped event payload. Mirror of `FrontendEvent` in
 // src-tauri/src/lib.rs — keep in sync.
+interface BlitPayload {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /// Top-down RGBA8, base64-encoded. Length is `w * h * 4` bytes
+  /// pre-base64.
+  rgba_b64: string;
+}
+
 type RdpEvent =
-  | { kind: "frame"; count: number }
+  | { kind: "frame"; blits: BlitPayload[] }
   | { kind: "pointer_position"; x: number; y: number }
   | { kind: "disconnected"; reason: string }
   | { kind: "error"; message: string };
+
+const CANVAS_WIDTH = 1024;
+const CANVAS_HEIGHT = 768;
+
+/// Decode a base64 RGBA payload into Uint8ClampedArray and blit it.
+/// `atob` is sync and runs on the main thread — fine for damaged
+/// rectangles in the typical few-KB to few-hundred-KB range. If the
+/// server pushes full-screen 32bpp at high frame rates we'd want a
+/// binary IPC channel (Tauri `Channel` API) instead, but that's a
+/// later optimisation.
+function drawBlit(ctx: CanvasRenderingContext2D, blit: BlitPayload) {
+  const bin = atob(blit.rgba_b64);
+  const len = bin.length;
+  const bytes = new Uint8ClampedArray(len);
+  for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+  const imageData = new ImageData(bytes, blit.w, blit.h);
+  ctx.putImageData(imageData, blit.x, blit.y);
+}
 
 interface ConnectForm {
   host: string;
@@ -34,6 +63,10 @@ function App() {
   const [frameCount, setFrameCount] = useState<number>(0);
   const [pointerPos, setPointerPos] = useState<[number, number] | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
+  // Canvas ref is owned by the parent so the listen callback can
+  // blit into it without re-renders. Lifted out of `RdpCanvas`
+  // because event handlers must not depend on child component state.
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // Listen for backend events. Empty deps → mount once. The cleanup
   // returned from useEffect calls `unlisten()` so React StrictMode's
@@ -43,9 +76,18 @@ function App() {
     listen<RdpEvent>("rdp:event", (event) => {
       const payload = event.payload;
       switch (payload.kind) {
-        case "frame":
-          setFrameCount(payload.count);
+        case "frame": {
+          const ctx = canvasRef.current?.getContext("2d");
+          if (ctx) {
+            for (const blit of payload.blits) {
+              drawBlit(ctx, blit);
+            }
+          }
+          // Counter is per-update (one IPC event per server-pushed
+          // GraphicsUpdate, regardless of how many rects it carried).
+          setFrameCount((n) => n + 1);
           break;
+        }
         case "pointer_position":
           setPointerPos([payload.x, payload.y]);
           break;
@@ -105,31 +147,14 @@ function App() {
     }
   }
 
-  // Slice A demo: send a hardcoded key (the letter 'a'). 8-bit
-  // scancode for 'A' on AT/PS-2 is 0x1E, no extended bit. Slice B
-  // (or a dedicated keymap track) wires up KeyboardEvent → scancode.
-  async function sendDemoKey() {
-    if (sessionId === null) return;
-    try {
-      await invoke("rdp_send_input", {
-        id: sessionId,
-        event: { kind: "key", code: 0x1e, extended: false, pressed: true },
-      });
-      await invoke("rdp_send_input", {
-        id: sessionId,
-        event: { kind: "key", code: 0x1e, extended: false, pressed: false },
-      });
-    } catch (err) {
-      setStatus(`send_input failed: ${err}`);
-    }
-  }
-
   return (
     <main className="container">
-      <h1>JustRDP — Tauri MVP (Slice A)</h1>
+      <h1>JustRDP — Tauri MVP (Slice C)</h1>
       <p className="subtitle">
-        connect / input / disconnect cycle. Frame decoding (BitmapRenderer)
-        arrives in Slice B.
+        connect / input / disconnect cycle + bitmap rendering +
+        full keyboard / mouse / wheel interactivity. Click the canvas
+        to focus it, then type or click as if it were the remote
+        desktop.
       </p>
 
       {sessionId === null ? (
@@ -145,8 +170,8 @@ function App() {
           frameCount={frameCount}
           pointerPos={pointerPos}
           onDisconnect={onDisconnect}
-          onSendDemoKey={sendDemoKey}
           busy={busy}
+          canvasRef={canvasRef}
         />
       )}
 
@@ -222,8 +247,8 @@ interface SessionPanelProps {
   frameCount: number;
   pointerPos: [number, number] | null;
   onDisconnect: () => void;
-  onSendDemoKey: () => void;
   busy: boolean;
+  canvasRef: React.RefObject<HTMLCanvasElement | null>;
 }
 
 function SessionPanel({
@@ -231,8 +256,8 @@ function SessionPanel({
   frameCount,
   pointerPos,
   onDisconnect,
-  onSendDemoKey,
   busy,
+  canvasRef,
 }: SessionPanelProps) {
   return (
     <div className="session-panel">
@@ -248,34 +273,18 @@ function SessionPanel({
           {pointerPos ? `${pointerPos[0]}, ${pointerPos[1]}` : "(none)"}
         </code>
       </p>
-      <RdpCanvasPlaceholder />
+      <RdpCanvas
+        sessionId={sessionId}
+        canvasRef={canvasRef}
+        width={CANVAS_WIDTH}
+        height={CANVAS_HEIGHT}
+      />
       <div className="row">
-        <button onClick={onSendDemoKey} disabled={busy}>
-          send demo key (a)
-        </button>
         <button onClick={onDisconnect} disabled={busy}>
           {busy ? "disconnecting…" : "disconnect"}
         </button>
       </div>
     </div>
-  );
-}
-
-/// Placeholder canvas. Slice A doesn't decode frames, so the canvas
-/// stays empty — but we already mount it with the same ref-only,
-/// memoized pattern that Slice B will use to blit RGBA. Mounting it
-/// now means Slice B is purely additive (paint into the existing
-/// canvas) instead of re-architecting the render path.
-function RdpCanvasPlaceholder() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  return (
-    <canvas
-      ref={canvasRef}
-      width={1024}
-      height={768}
-      className="rdp-canvas"
-      tabIndex={0}
-    />
   );
 }
 
