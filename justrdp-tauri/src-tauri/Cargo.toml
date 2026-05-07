@@ -46,6 +46,12 @@ justrdp-web = { workspace = true }
 justrdp-svc = { workspace = true, features = ["alloc"] }
 justrdp-rdpsnd = { workspace = true, features = ["std"] }
 justrdp-rdpsnd-native = { workspace = true }
+# Slice D1 (clipboard): SVC processor + native OS clipboard
+# adapter (Windows clipboard-win / macOS objc2 / Linux x11+wayland
+# behind features). Same ADR-0006 pattern as audio: this Tauri
+# layer touches the wrapper only, never CLIPRDR PDU types.
+justrdp-cliprdr = { workspace = true, features = ["std"] }
+justrdp-cliprdr-native = { workspace = true }
 # Slice E (TOFU trust): SHA-256 of SPKI + ServerCertVerifier trait.
 # `justrdp-core` for the sha256 helper, `justrdp-tls` for the
 # verifier trait + extract_spki_from_cert_der.

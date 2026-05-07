@@ -26,6 +26,7 @@
 //! channels.
 
 mod audio;
+mod clipboard;
 mod input;
 mod sink;
 mod trust;
@@ -118,14 +119,18 @@ async fn rdp_connect(
     }
     let config = builder.build();
 
-    // Slice D2: register RDPSND audio processor on platforms that
-    // have a wired backend. `audio::new_platform_audio_processor`
-    // returns None on unsupported targets; in that case the session
-    // simply has no audio path (server-pushed PCM is silently dropped
-    // upstream of this module by the SVC dispatcher).
+    // Slice D2 + D1: register RDPSND audio processor and CLIPRDR
+    // clipboard processor on platforms that have wired backends.
+    // Both `new_platform_*_processor` calls return None on
+    // unsupported targets; in that case the session has no audio /
+    // clipboard path (frames are silently dropped upstream by the
+    // SVC dispatcher).
     let mut processors = Vec::new();
     if let Some(audio) = audio::new_platform_audio_processor() {
         processors.push(audio);
+    }
+    if let Some(clip) = clipboard::new_platform_clipboard_processor() {
+        processors.push(clip);
     }
 
     // Slice E: TLS verifier choice is feature-gated. Production
@@ -314,25 +319,11 @@ async fn rdp_send_input(
     reply_rx.await.map_err(|_| "session task dropped reply".to_string())?
 }
 
-#[tauri::command]
-async fn rdp_set_local_clipboard(
-    _state: tauri::State<'_, Arc<AppState>>,
-    _id: u64,
-    _text: String,
-) -> Result<(), String> {
-    // Placeholder — clipboard channel wiring is out of scope for
-    // Slice A. Returns Ok so frontend can call without erroring.
-    Ok(())
-}
-
-#[tauri::command]
-async fn rdp_poll_remote_clipboard(
-    _state: tauri::State<'_, Arc<AppState>>,
-    _id: u64,
-) -> Result<Option<String>, String> {
-    // Placeholder — see rdp_set_local_clipboard.
-    Ok(None)
-}
+// Slice D1 deleted the `rdp_set_local_clipboard` and
+// `rdp_poll_remote_clipboard` placeholder commands — clipboard
+// sync now flows through the CLIPRDR SVC processor registered in
+// `rdp_connect`, which talks directly to the OS clipboard via
+// `NativeClipboard`. No frontend-driven polling is needed.
 
 /// Probe `host:port` over TCP+TLS just enough to capture the
 /// server's leaf SPKI fingerprint, then abort the handshake. Used
@@ -435,8 +426,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             rdp_connect,
             rdp_send_input,
-            rdp_set_local_clipboard,
-            rdp_poll_remote_clipboard,
             rdp_disconnect,
             rdp_fetch_cert_spki,
             rdp_trust_spki,

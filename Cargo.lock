@@ -2661,6 +2661,8 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "justrdp-async",
+ "justrdp-cliprdr",
+ "justrdp-cliprdr-native",
  "justrdp-core",
  "justrdp-input",
  "justrdp-rdpsnd",
