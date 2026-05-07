@@ -79,6 +79,14 @@ enum SessionMsg {
 enum FrontendEvent {
     Frame { blits: Vec<BlitRecord> },
     PointerPosition { x: u16, y: u16 },
+    /// Server asked the client to hide the cursor entirely
+    /// (full-screen video, certain password fields). Frontend
+    /// applies CSS `cursor: none`. (Slice α)
+    PointerHidden,
+    /// Server asked the client to restore the system default
+    /// cursor (after a previous hide / sprite). Frontend applies
+    /// CSS `cursor: default`. (Slice α)
+    PointerDefault,
     Disconnected { reason: String },
     Error { message: String },
 }
@@ -258,6 +266,16 @@ async fn run_session(
                             "rdp:event",
                             FrontendEvent::PointerPosition { x, y },
                         );
+                    }
+                    // Slice α: hide / restore tracer. Sprite-bearing
+                    // PointerBitmap stays in the catch-all arm below
+                    // until Slice β wires the decoder + cache + CSS
+                    // cursor URL flow.
+                    Some(Ok(RdpEvent::PointerHidden)) => {
+                        let _ = window.emit("rdp:event", FrontendEvent::PointerHidden);
+                    }
+                    Some(Ok(RdpEvent::PointerDefault)) => {
+                        let _ = window.emit("rdp:event", FrontendEvent::PointerDefault);
                     }
                     Some(Ok(RdpEvent::Disconnected(reason))) => {
                         let _ = window.emit(

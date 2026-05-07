@@ -19,6 +19,8 @@ interface BlitPayload {
 type RdpEvent =
   | { kind: "frame"; blits: BlitPayload[] }
   | { kind: "pointer_position"; x: number; y: number }
+  | { kind: "pointer_hidden" }
+  | { kind: "pointer_default" }
   | { kind: "disconnected"; reason: string }
   | { kind: "error"; message: string };
 
@@ -90,6 +92,19 @@ function App() {
         }
         case "pointer_position":
           setPointerPos([payload.x, payload.y]);
+          break;
+        case "pointer_hidden":
+          // Slice α: server hid its cursor — match on host. Sprite-
+          // bearing cursor changes (resize arrow, hand, I-beam) land
+          // in Slice β.
+          if (canvasRef.current) {
+            canvasRef.current.style.cursor = "none";
+          }
+          break;
+        case "pointer_default":
+          if (canvasRef.current) {
+            canvasRef.current.style.cursor = "default";
+          }
           break;
         case "disconnected":
           setStatus(`disconnected: ${payload.reason}`);

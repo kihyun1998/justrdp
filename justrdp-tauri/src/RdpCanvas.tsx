@@ -71,24 +71,58 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
       }
     };
 
-    const onMouseMove = (e: MouseEvent) => {
+    // Pointer events instead of mouse events so we can call
+    // setPointerCapture on pointerdown — that's what keeps the
+    // pointermove + pointerup events flowing to this canvas even
+    // when the cursor leaves the canvas's bounding box. Without
+    // capture, dragging a remote window's resize handle past the
+    // canvas edge silently drops the trailing pointermove + the
+    // pointerup, leaving the remote stuck mid-drag.
+    const onPointerMove = (e: PointerEvent) => {
       mouseX = clampX(e.clientX);
       mouseY = clampY(e.clientY);
       sendInput({ kind: "mouse_move", x: mouseX, y: mouseY });
     };
 
-    const onMouseDown = (e: MouseEvent) => {
+    const onPointerDown = (e: PointerEvent) => {
+      // Capture the pointer so further events flow to us even when
+      // the cursor exits the canvas. Released automatically on
+      // pointerup or pointercancel.
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch {
+        // Older browsers / unusual pointer types — fall back to
+        // un-captured behaviour rather than refusing the click.
+      }
       mouseX = clampX(e.clientX);
       mouseY = clampY(e.clientY);
       sendInput({ kind: "mouse_button", button: e.button, pressed: true, x: mouseX, y: mouseY });
       e.preventDefault();
     };
 
-    const onMouseUp = (e: MouseEvent) => {
+    const onPointerUp = (e: PointerEvent) => {
       mouseX = clampX(e.clientX);
       mouseY = clampY(e.clientY);
       sendInput({ kind: "mouse_button", button: e.button, pressed: false, x: mouseX, y: mouseY });
+      // setPointerCapture's release happens automatically on
+      // pointerup, but be explicit in case the runtime missed it.
+      if (canvas.hasPointerCapture(e.pointerId)) {
+        canvas.releasePointerCapture(e.pointerId);
+      }
       e.preventDefault();
+    };
+
+    const onPointerCancel = (e: PointerEvent) => {
+      // OS revoked capture (e.g. system gesture took over). Treat
+      // as button release so the remote does not see a stuck
+      // button.
+      sendInput({
+        kind: "mouse_button",
+        button: e.button,
+        pressed: false,
+        x: mouseX,
+        y: mouseY,
+      });
     };
 
     const onWheel = (e: WheelEvent) => {
@@ -124,9 +158,10 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
 
     canvas.addEventListener("keydown", onKeyDown);
     canvas.addEventListener("keyup", onKeyUp);
-    canvas.addEventListener("mousemove", onMouseMove);
-    canvas.addEventListener("mousedown", onMouseDown);
-    canvas.addEventListener("mouseup", onMouseUp);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointercancel", onPointerCancel);
     canvas.addEventListener("wheel", onWheel, { passive: false });
     canvas.addEventListener("blur", onBlur);
     canvas.addEventListener("contextmenu", onContextMenu);
@@ -134,9 +169,10 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
     return () => {
       canvas.removeEventListener("keydown", onKeyDown);
       canvas.removeEventListener("keyup", onKeyUp);
-      canvas.removeEventListener("mousemove", onMouseMove);
-      canvas.removeEventListener("mousedown", onMouseDown);
-      canvas.removeEventListener("mouseup", onMouseUp);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointerup", onPointerUp);
+      canvas.removeEventListener("pointercancel", onPointerCancel);
       canvas.removeEventListener("wheel", onWheel);
       canvas.removeEventListener("blur", onBlur);
       canvas.removeEventListener("contextmenu", onContextMenu);
