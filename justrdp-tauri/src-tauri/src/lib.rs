@@ -406,7 +406,6 @@ async fn rdp_disconnect(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // Resolve the platform-appropriate per-app config dir
             // (`%APPDATA%\com.user.justrdp-tauri\` on Windows etc.)
