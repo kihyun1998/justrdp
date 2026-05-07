@@ -51,7 +51,7 @@ use justrdp_pdu::rdp::drawing_orders::{
     decode_dstblt, decode_lineto, decode_memblt, decode_opaque_rect, decode_patblt,
     decode_polygon_cb, decode_polygon_sc, decode_polyline, decode_scrblt, DstBltOrder,
     LineToOrder, MemBltOrder, OpaqueRectOrder, PatBltOrder, PolygonCbOrder, PolygonScOrder,
-    PolylineOrder, PrimaryOrderHistory, PrimaryOrderType, SecondaryOrderType,
+    PolylineOrder, PrimaryOrderHistory, PrimaryOrderType, ScrBltOrder, SecondaryOrderType,
     ALT_SECONDARY_ORDER_HEADER_SIZE, ORDER_TYPE_CHANGE, TS_BOUNDS, TS_DELTA_COORDINATES,
     TS_SECONDARY, TS_STANDARD, TS_ZERO_BOUNDS_DELTAS, TS_ZERO_FIELD_BYTE_BIT0,
     TS_ZERO_FIELD_BYTE_BIT1,
@@ -786,8 +786,9 @@ impl BitmapRenderer {
                 Ok(try_render_polygon_cb(&order, &self.brush_cache, sink))
             }
             PrimaryOrderType::ScrBlt => {
-                let _ = decode_scrblt(cursor, field_flags, delta, &mut self.primary_history)?;
-                Ok(false)
+                let order =
+                    decode_scrblt(cursor, field_flags, delta, &mut self.primary_history)?;
+                Ok(try_render_scrblt(&order, sink))
             }
             PrimaryOrderType::MemBlt => {
                 let order =
@@ -2826,6 +2827,46 @@ fn try_render_polygon_sc<S: FrameSink>(order: &PolygonScOrder, sink: &mut S) -> 
 /// (BS_SOLID = brush_color, BS_HATCHED = predefined hatch, BS_PATTERN
 /// = inline 8 bytes, BS_PATTERN | 0x80 = CacheBrush index). For each
 /// span of the polygon's interior we sample the 8×8 monochrome
+/// SRCCOPY ScrBlt — copy a `(width, height)` rectangle from
+/// `(src_left, src_top)` to `(left, top)`. Used heavily by Windows
+/// when a window is dragged across the desktop or a region is
+/// scrolled: the server says "the pixels you already have at
+/// position A should now appear at position B". Without this, the
+/// destination is whatever stale Bitmap update last painted there
+/// — typically the desktop background showing through the gap.
+///
+/// Sinks without `peek_rgba` (no shadow buffer) return false here
+/// and the order silently no-ops, which is correct: there is no
+/// way to satisfy a copy without the source pixels.
+///
+/// Non-SRCCOPY ROPs are silently skipped for now — full ROP3
+/// evaluation across overlapping source / destination is a larger
+/// follow-up (the brush / pattern variants of the ROP3 evaluator
+/// already exist for MemBlt RMW, but ScrBlt has no pattern).
+fn try_render_scrblt<S: FrameSink>(order: &ScrBltOrder, sink: &mut S) -> bool {
+    if order.rop != 0xCC {
+        return false;
+    }
+    if order.width <= 0 || order.height <= 0 {
+        return false;
+    }
+    if order.left < 0 || order.top < 0 || order.src_left < 0 || order.src_top < 0 {
+        return false;
+    }
+
+    let w = order.width as u16;
+    let h = order.height as u16;
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(w as usize * h as usize * 4);
+    if !sink.peek_rgba(order.src_left as u16, order.src_top as u16, w, h, &mut buf) {
+        // Sink does not retain a shadow buffer — nothing we can do
+        // without the source pixels. Drag artefacts will persist
+        // until the server eventually pushes a Bitmap refresh.
+        return false;
+    }
+    sink.blit_rgba(order.left as u16, order.top as u16, w, h, &buf);
+    true
+}
+
 /// pattern at every pixel — `1` bits get `brush_color` (foreground),
 /// `0` bits get `back_color` (background, RGB convention matching
 /// PatBlt). Solid brushes degrade to the same single-color path
