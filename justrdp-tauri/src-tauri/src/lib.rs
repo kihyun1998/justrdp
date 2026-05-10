@@ -223,6 +223,13 @@ async fn run_session(
     if let Some(id) = client.rfx_codec_id() {
         renderer.set_rfx_codec_id(id);
     }
+    // PRD #14 Slice β (#16): NSCodec — RGB image codec, strong on
+    // continuous tones / gradients. ClearCodec is intentionally
+    // omitted: per MS-RDPEGFX §2.2.4 it is EGFX-only, not advertised
+    // through `BitmapCodecs`. Tracked as a follow-up EGFX SVC PRD.
+    if let Some(id) = client.nscodec_codec_id() {
+        renderer.set_nscodec_codec_id(id);
+    }
     // Slice β (#10): per-session cursor sprite cache. Color pointer
     // emits get decoded here and cached against the server-supplied
     // index for future Cached-pointer lookups (Slice δ).

@@ -5,7 +5,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use justrdp_pdu::rdp::capabilities::{CapabilitySet, CODEC_GUID_REMOTEFX};
+use justrdp_pdu::rdp::capabilities::{CapabilitySet, CODEC_GUID_NSCODEC, CODEC_GUID_REMOTEFX};
 use justrdp_pdu::rdp::finalization::MonitorLayoutEntry;
 use justrdp_pdu::rdp::redirection::ServerRedirectionPdu;
 use justrdp_pdu::x224::SecurityProtocol;
@@ -79,6 +79,11 @@ pub struct ConnectionResult {
     /// omitted the RFX entry — embedders should treat that as "RFX is
     /// not negotiated" and skip `BitmapRenderer::set_rfx_codec_id`.
     pub rfx_codec_id: Option<u8>,
+    /// Negotiated `codec_id` for NSCodec (MS-RDPNSC). Per
+    /// MS-RDPBCGR §2.2.7.2.10.1.1 this MUST be `0x01` when present
+    /// (the server cannot reassign NSCodec). `None` when not
+    /// negotiated.
+    pub nscodec_codec_id: Option<u8>,
 }
 
 impl ConnectionResult {
@@ -87,10 +92,20 @@ impl ConnectionResult {
     /// [`CODEC_GUID_REMOTEFX`]. Used at finalization time to populate
     /// [`Self::rfx_codec_id`].
     pub(crate) fn extract_rfx_codec_id(server_caps: &[CapabilitySet]) -> Option<u8> {
+        Self::extract_codec_id(server_caps, &CODEC_GUID_REMOTEFX)
+    }
+
+    /// Walk `server_capabilities` for the NSCodec entry's negotiated
+    /// `codec_id`. See [`Self::nscodec_codec_id`].
+    pub(crate) fn extract_nscodec_codec_id(server_caps: &[CapabilitySet]) -> Option<u8> {
+        Self::extract_codec_id(server_caps, &CODEC_GUID_NSCODEC)
+    }
+
+    fn extract_codec_id(server_caps: &[CapabilitySet], guid: &[u8; 16]) -> Option<u8> {
         for cap in server_caps {
             if let CapabilitySet::BitmapCodecs(bc) = cap {
                 for entry in &bc.codecs {
-                    if entry.guid == CODEC_GUID_REMOTEFX {
+                    if entry.guid == *guid {
                         return Some(entry.codec_id);
                     }
                 }

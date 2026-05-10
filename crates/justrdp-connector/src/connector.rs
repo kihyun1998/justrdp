@@ -27,7 +27,7 @@ use justrdp_pdu::rdp::capabilities::{
     FontCapability, GeneralCapability, GlyphCacheCapability, InputCapability,
     LargePointerCapability, MultifragmentUpdateCapability, OrderCapability, PointerCapability,
     ShareCapability, SoundCapability, SurfaceCommandsCapability, VirtualChannelCapability,
-    CODEC_GUID_REMOTEFX,
+    CODEC_GUID_NSCODEC, CODEC_GUID_REMOTEFX, NSCODEC_CODEC_ID,
 };
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
 use justrdp_pdu::rdp::finalization::{
@@ -1766,11 +1766,22 @@ impl ClientConnector {
                 reserved: 0,
             }),
             CapabilitySet::BitmapCodecs(BitmapCodecsCapability {
-                codecs: vec![BitmapCodecEntry {
-                    guid: CODEC_GUID_REMOTEFX,
-                    codec_id: RFX_DEFAULT_CODEC_ID,
-                    properties: RFX_CLIENT_CAPS_DEFAULT.to_vec(),
-                }],
+                codecs: vec![
+                    BitmapCodecEntry {
+                        guid: CODEC_GUID_REMOTEFX,
+                        codec_id: RFX_DEFAULT_CODEC_ID,
+                        properties: RFX_CLIENT_CAPS_DEFAULT.to_vec(),
+                    },
+                    // NSCodec — MS-RDPBCGR §2.2.7.2.10.1.1 + MS-RDPNSC §2.2.1.
+                    // codec_id MUST be 0x01 (normative). Properties =
+                    // TS_NSCODEC_CAPABILITYSET: fAllowDynamicFidelity=1,
+                    // fAllowSubsampling=1, colorLossLevel=2 (FreeRDP default).
+                    BitmapCodecEntry {
+                        guid: CODEC_GUID_NSCODEC,
+                        codec_id: NSCODEC_CODEC_ID,
+                        properties: vec![0x01, 0x01, 0x02],
+                    },
+                ],
             }),
         ]
     }
@@ -2009,6 +2020,7 @@ impl ClientConnector {
             .collect();
 
         let rfx_codec_id = ConnectionResult::extract_rfx_codec_id(&self.server_capabilities);
+        let nscodec_codec_id = ConnectionResult::extract_nscodec_codec_id(&self.server_capabilities);
 
         let result = ConnectionResult {
             io_channel_id: self.io_channel_id,
@@ -2022,6 +2034,7 @@ impl ClientConnector {
             server_arc_cookie: self.server_arc_cookie.take(),
             server_redirection: self.server_redirection.take(),
             rfx_codec_id,
+            nscodec_codec_id,
         };
 
         self.state = ClientConnectorState::Connected { result };
@@ -2318,6 +2331,47 @@ mod tests {
     }
 
     #[test]
+    fn confirm_active_advertises_nscodec_alongside_rfx() {
+        use justrdp_pdu::rdp::capabilities::{
+            CODEC_GUID_NSCODEC, NSCODEC_CODEC_ID,
+        };
+
+        let config = Config::builder("user", "pass").build();
+        let connector = ClientConnector::new(config);
+        let caps = connector.build_client_capabilities();
+
+        let bitmap_codecs = caps
+            .iter()
+            .find_map(|c| match c {
+                CapabilitySet::BitmapCodecs(bc) => Some(bc),
+                _ => None,
+            })
+            .expect("BitmapCodecs capability must exist");
+
+        let nscodec = bitmap_codecs
+            .codecs
+            .iter()
+            .find(|e| e.guid == CODEC_GUID_NSCODEC)
+            .expect("NSCodec entry must be advertised so the server can offer continuous-tone fast-path");
+
+        assert_eq!(
+            nscodec.codec_id, NSCODEC_CODEC_ID,
+            "NSCodec codec_id MUST be 0x01 per MS-RDPBCGR §2.2.7.2.10.1.1"
+        );
+        // TS_NSCODEC_CAPABILITYSET = 3 bytes (MS-RDPNSC §2.2.1):
+        // fAllowDynamicFidelity, fAllowSubsampling, colorLossLevel.
+        assert_eq!(
+            nscodec.properties.len(),
+            3,
+            "TS_NSCODEC_CAPABILITYSET is exactly 3 bytes per MS-RDPNSC §2.2.1"
+        );
+        assert!(
+            (1..=7).contains(&nscodec.properties[2]),
+            "colorLossLevel must be in valid range 1..=7"
+        );
+    }
+
+    #[test]
     fn config_builder_defaults() {
         let config = Config::builder("testuser", "testpass").build();
         assert_eq!(config.credentials.username, "testuser");
@@ -2520,9 +2574,37 @@ mod tests {
             server_arc_cookie: None,
             server_redirection: None,
             rfx_codec_id: Some(0x05),
+            nscodec_codec_id: None,
         };
 
         assert_eq!(result.rfx_codec_id, Some(0x05));
+    }
+
+    #[test]
+    fn connection_result_extracts_nscodec_codec_id_from_server_capabilities() {
+        use justrdp_pdu::rdp::capabilities::{
+            BitmapCodecEntry, BitmapCodecsCapability, CODEC_GUID_NSCODEC,
+            NSCODEC_CODEC_ID,
+        };
+
+        // Server echoes the NSCodec entry. Per spec the client-supplied
+        // codec_id (0x01) is normative — server MUST keep it as-is.
+        let server_caps = vec![CapabilitySet::BitmapCodecs(BitmapCodecsCapability {
+            codecs: vec![BitmapCodecEntry {
+                guid: CODEC_GUID_NSCODEC,
+                codec_id: NSCODEC_CODEC_ID,
+                properties: vec![0x01, 0x01, 0x02],
+            }],
+        })];
+
+        let extracted = ConnectionResult::extract_nscodec_codec_id(&server_caps);
+        assert_eq!(extracted, Some(NSCODEC_CODEC_ID));
+    }
+
+    #[test]
+    fn connection_result_nscodec_codec_id_is_none_when_server_omits_it() {
+        let extracted = ConnectionResult::extract_nscodec_codec_id(&[]);
+        assert!(extracted.is_none());
     }
 
     #[test]
@@ -2539,6 +2621,7 @@ mod tests {
             server_arc_cookie: None,
             server_redirection: None,
             rfx_codec_id: None,
+            nscodec_codec_id: None,
         };
 
         assert!(result.rfx_codec_id.is_none());
@@ -2561,6 +2644,7 @@ mod tests {
                 server_arc_cookie: None,
                 server_redirection: None,
                 rfx_codec_id: None,
+                nscodec_codec_id: None,
             },
         };
 

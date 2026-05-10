@@ -92,6 +92,9 @@ pub struct AsyncRdpClient {
     /// it on its `BitmapRenderer` post-handshake. `None` when the
     /// server did not echo a `BitmapCodecs` capability for RFX.
     rfx_codec_id: Option<u8>,
+    /// Negotiated `codec_id` for NSCodec (MS-RDPNSC). Per spec this
+    /// MUST be `0x01` when present; the server cannot reassign it.
+    nscodec_codec_id: Option<u8>,
 }
 
 impl AsyncRdpClient {
@@ -199,6 +202,13 @@ impl AsyncRdpClient {
     /// negotiate RFX for this session.
     pub fn rfx_codec_id(&self) -> Option<u8> {
         self.rfx_codec_id
+    }
+
+    /// Negotiated NSCodec codec id from the server's `BitmapCodecs`
+    /// reply (MS-RDPNSC). Per spec this is `Some(0x01)` when
+    /// negotiated. Pass to `BitmapRenderer::set_nscodec_codec_id`.
+    pub fn nscodec_codec_id(&self) -> Option<u8> {
+        self.nscodec_codec_id
     }
 
     pub async fn next_event(&mut self) -> Option<Result<RdpEvent, RuntimeError>> {
@@ -378,6 +388,7 @@ where
     let (evt_tx, evt_rx) = mpsc::channel::<Result<RdpEvent, RuntimeError>>(EVT_QUEUE);
 
     let rfx_codec_id = result.rfx_codec_id;
+    let nscodec_codec_id = result.nscodec_codec_id;
     let pump = tokio::spawn(pump::pump(session, cmd_rx, evt_tx));
 
     Ok(AsyncRdpClient {
@@ -385,6 +396,7 @@ where
         evt_rx,
         pump: Some(pump),
         rfx_codec_id,
+        nscodec_codec_id,
     })
 }
 

@@ -1066,6 +1066,22 @@ pub const CODEC_GUID_REMOTEFX: [u8; 16] = [
     0xAF, 0xB3, 0xB7, 0x3C, 0x9C, 0x6F, 0x78, 0x86,  // Data4
 ];
 
+/// `CODEC_GUID_NSCODEC` — NSCodec (RGB image codec), MS-RDPBCGR 2.2.7.2.10.1.1.
+///
+/// Source GUID:
+/// `{0xCA8D1BB9, 0x000F, 0x154F, {0x58, 0x9F, 0xAE, 0x2D, 0x1A, 0x87, 0xE2, 0xD6}}`.
+pub const CODEC_GUID_NSCODEC: [u8; 16] = [
+    0xB9, 0x1B, 0x8D, 0xCA,                          // Data1 LE
+    0x0F, 0x00,                                      // Data2 LE
+    0x4F, 0x15,                                      // Data3 LE
+    0x58, 0x9F, 0xAE, 0x2D, 0x1A, 0x87, 0xE2, 0xD6,  // Data4
+];
+
+/// NSCodec normative `codecID` — MS-RDPBCGR 2.2.7.2.10.1.1: when the
+/// client advertises NSCodec, `codecID` MUST be `0x01`. Other codecs
+/// let the client pick any non-zero value, but this one is fixed.
+pub const NSCODEC_CODEC_ID: u8 = 0x01;
+
 /// Single `TS_BITMAPCODEC` entry (MS-RDPBCGR 2.2.7.2.10.1).
 ///
 /// Wire layout: 16-byte `codecGUID` + 1-byte `codecID` + 2-byte
@@ -1914,6 +1930,47 @@ mod tests {
     #[test]
     fn bitmap_codecs_capability_roundtrip_empty() {
         let cap = CapabilitySet::BitmapCodecs(BitmapCodecsCapability { codecs: vec![] });
+        assert_eq!(roundtrip_capability(cap.clone()), cap);
+    }
+
+    #[test]
+    fn bitmap_codec_entry_nscodec_encodes_to_bit_exact_bytes() {
+        // NSCodec entry per MS-RDPBCGR §2.2.7.2.10.1.1 + MS-RDPNSC §2.2.1:
+        // 16-byte GUID + codec_id MUST be 0x01 + 2-byte propLen=3
+        // + properties = [fAllowDynamicFidelity=1, fAllowSubsampling=1, colorLossLevel=2]
+        let entry = BitmapCodecEntry {
+            guid: CODEC_GUID_NSCODEC,
+            codec_id: NSCODEC_CODEC_ID,
+            properties: vec![0x01, 0x01, 0x02],
+        };
+        let bytes = justrdp_core::encode_vec(&entry).unwrap();
+        let expected: &[u8] = &[
+            0xB9, 0x1B, 0x8D, 0xCA, 0x0F, 0x00, 0x4F, 0x15,
+            0x58, 0x9F, 0xAE, 0x2D, 0x1A, 0x87, 0xE2, 0xD6,
+            0x01,             // codec_id (NSCodec MUST = 0x01)
+            0x03, 0x00,       // propLen = 3 LE
+            0x01, 0x01, 0x02, // TS_NSCODEC_CAPABILITYSET
+        ];
+        assert_eq!(bytes, expected);
+        assert_eq!(entry.size(), expected.len());
+    }
+
+    #[test]
+    fn bitmap_codecs_capability_roundtrip_rfx_plus_nscodec() {
+        let cap = CapabilitySet::BitmapCodecs(BitmapCodecsCapability {
+            codecs: vec![
+                BitmapCodecEntry {
+                    guid: CODEC_GUID_REMOTEFX,
+                    codec_id: 0x03,
+                    properties: vec![],
+                },
+                BitmapCodecEntry {
+                    guid: CODEC_GUID_NSCODEC,
+                    codec_id: NSCODEC_CODEC_ID,
+                    properties: vec![0x01, 0x01, 0x02],
+                },
+            ],
+        });
         assert_eq!(roundtrip_capability(cap.clone()), cap);
     }
 

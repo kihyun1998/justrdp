@@ -288,6 +288,7 @@ mod tests {
             server_arc_cookie: arc,
             server_redirection: None,
             rfx_codec_id: None,
+            nscodec_codec_id: None,
         }
     }
 
