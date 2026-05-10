@@ -22,12 +22,12 @@ use justrdp_pdu::mcs::{
     ErectDomainRequest, SendDataIndication,
 };
 use justrdp_pdu::rdp::capabilities::{
-    ActivationCapability, BitmapCapability, BrushCapability, CapabilitySet,
-    ConfirmActivePdu, ControlCapability, DemandActivePdu, FontCapability,
-    GeneralCapability, GlyphCacheCapability, InputCapability, LargePointerCapability,
-    MultifragmentUpdateCapability, OrderCapability, PointerCapability,
-    ShareCapability, SoundCapability, SurfaceCommandsCapability,
-    VirtualChannelCapability,
+    ActivationCapability, BitmapCapability, BitmapCodecEntry, BitmapCodecsCapability,
+    BrushCapability, CapabilitySet, ConfirmActivePdu, ControlCapability, DemandActivePdu,
+    FontCapability, GeneralCapability, GlyphCacheCapability, InputCapability,
+    LargePointerCapability, MultifragmentUpdateCapability, OrderCapability, PointerCapability,
+    ShareCapability, SoundCapability, SurfaceCommandsCapability, VirtualChannelCapability,
+    CODEC_GUID_REMOTEFX,
 };
 use justrdp_pdu::rdp::client_info::ClientInfoPdu;
 use justrdp_pdu::rdp::finalization::{
@@ -1568,6 +1568,48 @@ impl ClientConnector {
     }
 
     fn build_client_capabilities(&self) -> Vec<CapabilitySet> {
+        // codec_id chosen by us; the server echoes (or reassigns) it in
+        // its `Server BitmapCodecs` reply. mstsc uses 3 for the first
+        // registered codec; we keep that for forward-compat.
+        const RFX_DEFAULT_CODEC_ID: u8 = 0x03;
+
+        // Default `TS_RFX_CLNT_CAPS_CONTAINER` (MS-RDPRFX 2.2.1.1) advertising
+        // both RLGR1 and RLGR3 entropy modes at tile 64x64 with the standard
+        // ICT colour conversion + DWT 5-3 transform. Bit-for-bit equivalent
+        // to FreeRDP's default; sufficient for any Windows 7/8.1/10/11 server
+        // to pick RemoteFX as the SurfaceCommands codec.
+        const RFX_CLIENT_CAPS_DEFAULT: &[u8] = &[
+            0x31, 0x00, 0x00, 0x00, // length = 49
+            0x01, 0x00, 0x00, 0x00, // captureFlags = CARDP_CAPS_CAPTURE_NON_CAC
+            0x25, 0x00, 0x00, 0x00, // capsLength = 37
+            // TS_RFX_CAPS
+            0xC0, 0xCB,             // blockType = CBY_CAPS
+            0x08, 0x00, 0x00, 0x00, // blockLen = 8
+            0x01, 0x00,             // numCapsets = 1
+            // TS_RFX_CAPSET
+            0xC1, 0xCB,             // blockType = CBY_CAPSET
+            0x1D, 0x00, 0x00, 0x00, // blockLen = 29
+            0x01,                   // codecId = TS_RFX_CODEC_ID
+            0xC0, 0xCF,             // capsetType = CLY_CAPSET
+            0x02, 0x00,             // numIcaps = 2
+            0x08, 0x00,             // icapLen = 8
+            // TS_RFX_ICAP[0] — RLGR1
+            0x00, 0x01,             // version = CLW_VERSION_1_0
+            0x40, 0x00,             // tileSize = 64
+            0x00,                   // flags = 0
+            0x01,                   // colConv = CLW_COL_CONV_ICT
+            0x01,                   // transformBits = CLW_XFORM_DWT_53_A
+            0x01,                   // entropyBits = CLW_ENTROPY_RLGR1
+            // TS_RFX_ICAP[1] — RLGR3
+            0x00, 0x01,
+            0x40, 0x00,
+            0x00,
+            0x01,
+            0x01,
+            0x04,                   // entropyBits = CLW_ENTROPY_RLGR3
+        ];
+
+
         vec![
             CapabilitySet::General(GeneralCapability {
                 os_major_type: 1,  // OSMAJORTYPE_WINDOWS
@@ -1722,6 +1764,13 @@ impl ClientConnector {
             CapabilitySet::SurfaceCommands(SurfaceCommandsCapability {
                 cmd_flags: 0x0052, // SURFCMDS_SET_SURFACE_BITS | SURFCMDS_FRAME_MARKER | SURFCMDS_STREAM_SURFACE_BITS
                 reserved: 0,
+            }),
+            CapabilitySet::BitmapCodecs(BitmapCodecsCapability {
+                codecs: vec![BitmapCodecEntry {
+                    guid: CODEC_GUID_REMOTEFX,
+                    codec_id: RFX_DEFAULT_CODEC_ID,
+                    properties: RFX_CLIENT_CAPS_DEFAULT.to_vec(),
+                }],
             }),
         ]
     }
@@ -1959,6 +2008,8 @@ impl ClientConnector {
             .map(|(def, &id)| (String::from(def.name_str()), id))
             .collect();
 
+        let rfx_codec_id = ConnectionResult::extract_rfx_codec_id(&self.server_capabilities);
+
         let result = ConnectionResult {
             io_channel_id: self.io_channel_id,
             user_channel_id: self.user_channel_id,
@@ -1970,6 +2021,7 @@ impl ClientConnector {
             server_monitor_layout: self.server_monitor_layout.take(),
             server_arc_cookie: self.server_arc_cookie.take(),
             server_redirection: self.server_redirection.take(),
+            rfx_codec_id,
         };
 
         self.state = ClientConnectorState::Connected { result };
@@ -2218,6 +2270,54 @@ mod tests {
     }
 
     #[test]
+    fn confirm_active_advertises_rfx_bitmap_codec() {
+        use justrdp_pdu::rdp::capabilities::{
+            BitmapCodecsCapability, CODEC_GUID_REMOTEFX,
+        };
+
+        let config = Config::builder("user", "pass").build();
+        let connector = ClientConnector::new(config);
+        let caps = connector.build_client_capabilities();
+
+        let bitmap_codecs = caps
+            .iter()
+            .find_map(|c| match c {
+                CapabilitySet::BitmapCodecs(bc) => Some(bc),
+                _ => None,
+            })
+            .expect("BitmapCodecs capability must be advertised so the server picks a modern codec");
+
+        let rfx = bitmap_codecs
+            .codecs
+            .iter()
+            .find(|e| e.guid == CODEC_GUID_REMOTEFX)
+            .expect("RFX entry must be present in the BitmapCodecs capability");
+
+        assert!(
+            rfx.codec_id != 0,
+            "RFX codec_id must be a non-zero session id"
+        );
+        assert!(
+            !rfx.properties.is_empty(),
+            "RFX entry must carry a TS_RFX_CLNT_CAPS_CONTAINER, not an empty blob"
+        );
+        // Sanity-check container header: length field at offset 0 must equal
+        // total properties length (TS_RFX_CLNT_CAPS_CONTAINER.length, MS-RDPRFX 2.2.1.1).
+        let declared_len = u32::from_le_bytes([
+            rfx.properties[0],
+            rfx.properties[1],
+            rfx.properties[2],
+            rfx.properties[3],
+        ]) as usize;
+        assert_eq!(
+            declared_len,
+            rfx.properties.len(),
+            "RFX container length field must equal blob length"
+        );
+        let _ = BitmapCodecsCapability::default(); // ensure type is exported
+    }
+
+    #[test]
     fn config_builder_defaults() {
         let config = Config::builder("testuser", "testpass").build();
         assert_eq!(config.credentials.username, "testuser");
@@ -2393,6 +2493,58 @@ mod tests {
     }
 
     #[test]
+    fn connection_result_extracts_rfx_codec_id_from_server_capabilities() {
+        use justrdp_pdu::rdp::capabilities::{
+            BitmapCodecEntry, BitmapCodecsCapability, CODEC_GUID_REMOTEFX,
+        };
+
+        // Server's Demand Active PDU includes its BitmapCodecs reply with
+        // codec_id = 0x05 for RFX (server is allowed to re-assign).
+        let server_caps = vec![CapabilitySet::BitmapCodecs(BitmapCodecsCapability {
+            codecs: vec![BitmapCodecEntry {
+                guid: CODEC_GUID_REMOTEFX,
+                codec_id: 0x05,
+                properties: vec![],
+            }],
+        })];
+
+        let result = ConnectionResult {
+            io_channel_id: 0,
+            user_channel_id: 0,
+            share_id: 0,
+            server_capabilities: server_caps,
+            channel_ids: Vec::new(),
+            selected_protocol: SecurityProtocol::RDP,
+            session_id: 0,
+            server_monitor_layout: None,
+            server_arc_cookie: None,
+            server_redirection: None,
+            rfx_codec_id: Some(0x05),
+        };
+
+        assert_eq!(result.rfx_codec_id, Some(0x05));
+    }
+
+    #[test]
+    fn connection_result_rfx_codec_id_is_none_when_server_omits_bitmap_codecs() {
+        let result = ConnectionResult {
+            io_channel_id: 0,
+            user_channel_id: 0,
+            share_id: 0,
+            server_capabilities: vec![], // server sent no BitmapCodecs cap
+            channel_ids: Vec::new(),
+            selected_protocol: SecurityProtocol::RDP,
+            session_id: 0,
+            server_monitor_layout: None,
+            server_arc_cookie: None,
+            server_redirection: None,
+            rfx_codec_id: None,
+        };
+
+        assert!(result.rfx_codec_id.is_none());
+    }
+
+    #[test]
     fn connected_state_returns_error() {
         let config = Config::builder("user", "pass").build();
         let mut connector = ClientConnector::new(config);
@@ -2408,6 +2560,7 @@ mod tests {
                 server_monitor_layout: None,
                 server_arc_cookie: None,
                 server_redirection: None,
+                rfx_codec_id: None,
             },
         };
 

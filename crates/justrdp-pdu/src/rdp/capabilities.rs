@@ -1052,27 +1052,111 @@ impl<'de> Decode<'de> for SurfaceCommandsCapability {
     }
 }
 
-/// Bitmap Codecs Capability Set (MS-RDPBCGR 2.2.7.2.14).
+// ── Bitmap Codecs Capability Set (MS-RDPBCGR 2.2.7.2.10) ──
+
+/// `CODEC_GUID_REMOTEFX` — RemoteFX codec (image mode), MS-RDPBCGR 2.2.7.2.10.1.1.
 ///
-/// The internal structure is variable-length and complex; stored as raw bytes for now.
+/// Encoded as a Microsoft GUID: Data1 LE (4) + Data2 LE (2) + Data3 LE (2)
+/// + Data4 byte array (8). Source GUID:
+/// `{0x76772F12, 0xBD72, 0x4463, {0xAF, 0xB3, 0xB7, 0x3C, 0x9C, 0x6F, 0x78, 0x86}}`.
+pub const CODEC_GUID_REMOTEFX: [u8; 16] = [
+    0x12, 0x2F, 0x77, 0x76,                          // Data1 LE
+    0x72, 0xBD,                                      // Data2 LE
+    0x63, 0x44,                                      // Data3 LE
+    0xAF, 0xB3, 0xB7, 0x3C, 0x9C, 0x6F, 0x78, 0x86,  // Data4
+];
+
+/// Single `TS_BITMAPCODEC` entry (MS-RDPBCGR 2.2.7.2.10.1).
+///
+/// Wire layout: 16-byte `codecGUID` + 1-byte `codecID` + 2-byte
+/// `codecPropertiesLength` + variable `codecProperties`. The properties
+/// blob is opaque at this layer — RFX uses `TS_RFX_CLNT_CAPS_CONTAINER`
+/// inside, NSCodec uses `TS_NSCODEC_CAPABILITYSET`, etc. Per-codec
+/// property structuring is deferred to follow-up slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitmapCodecEntry {
+    pub guid: [u8; 16],
+    pub codec_id: u8,
+    pub properties: Vec<u8>,
+}
+
+impl Encode for BitmapCodecEntry {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_slice(&self.guid, "BitmapCodec::codecGUID")?;
+        dst.write_u8(self.codec_id, "BitmapCodec::codecID")?;
+        if self.properties.len() > u16::MAX as usize {
+            return Err(justrdp_core::EncodeError::other(
+                "BitmapCodec",
+                "codecProperties exceed u16::MAX",
+            ));
+        }
+        dst.write_u16_le(self.properties.len() as u16, "BitmapCodec::codecPropertiesLength")?;
+        dst.write_slice(&self.properties, "BitmapCodec::codecProperties")?;
+        Ok(())
+    }
+    fn name(&self) -> &'static str { "BitmapCodecEntry" }
+    fn size(&self) -> usize { 16 + 1 + 2 + self.properties.len() }
+}
+
+impl<'de> Decode<'de> for BitmapCodecEntry {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        let guid_slice = src.read_slice(16, "BitmapCodec::codecGUID")?;
+        let mut guid = [0u8; 16];
+        guid.copy_from_slice(guid_slice);
+        let codec_id = src.read_u8("BitmapCodec::codecID")?;
+        let prop_len = src.read_u16_le("BitmapCodec::codecPropertiesLength")? as usize;
+        let properties = src.read_slice(prop_len, "BitmapCodec::codecProperties")?.into();
+        Ok(Self { guid, codec_id, properties })
+    }
+}
+
+/// Bitmap Codecs Capability Set (MS-RDPBCGR 2.2.7.2.10).
+///
+/// `TS_BITMAPCODECS_CAPABILITYSET`: `bitmapCodecCount` (1 byte) followed by
+/// that many `TS_BITMAPCODEC` entries. Replaces the previous opaque
+/// `Vec<u8>` shape so adding a codec does not require rewriting the parser.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BitmapCodecsCapability {
-    pub supported_bitmap_codecs: Vec<u8>,
+    pub codecs: Vec<BitmapCodecEntry>,
 }
 
 impl Encode for BitmapCodecsCapability {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        dst.write_slice(&self.supported_bitmap_codecs, "BitmapCodecs::data")?;
+        if self.codecs.len() > u8::MAX as usize {
+            return Err(justrdp_core::EncodeError::other(
+                "BitmapCodecs",
+                "bitmapCodecCount exceeds u8::MAX",
+            ));
+        }
+        dst.write_u8(self.codecs.len() as u8, "BitmapCodecs::bitmapCodecCount")?;
+        for entry in &self.codecs {
+            entry.encode(dst)?;
+        }
         Ok(())
     }
     fn name(&self) -> &'static str { "BitmapCodecsCapability" }
-    fn size(&self) -> usize { self.supported_bitmap_codecs.len() }
+    fn size(&self) -> usize {
+        1 + self.codecs.iter().map(|e| e.size()).sum::<usize>()
+    }
 }
 
 impl BitmapCodecsCapability {
     pub fn decode_with_len(src: &mut ReadCursor<'_>, body_len: usize) -> DecodeResult<Self> {
-        let data = src.read_slice(body_len, "BitmapCodecs::data")?;
-        Ok(Self { supported_bitmap_codecs: data.into() })
+        let start = src.pos();
+        let count = src.read_u8("BitmapCodecs::bitmapCodecCount")? as usize;
+        let mut codecs = Vec::with_capacity(count);
+        for _ in 0..count {
+            codecs.push(BitmapCodecEntry::decode(src)?);
+        }
+        let consumed = src.pos() - start;
+        if consumed != body_len {
+            return Err(DecodeError::unexpected_value(
+                "BitmapCodecsCapability",
+                "lengthCapability",
+                "bitmapCodecArray length does not match capability body length",
+            ));
+        }
+        Ok(Self { codecs })
     }
 }
 
@@ -1781,11 +1865,77 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_codecs_roundtrip() {
+    fn bitmap_codec_entry_rfx_encodes_to_bit_exact_bytes() {
+        // RFX entry with codec_id 0x03 and empty properties.
+        // Wire = 16-byte GUID + 1-byte codecID + 2-byte propLen=0
+        // = 19 bytes total.
+        let entry = BitmapCodecEntry {
+            guid: CODEC_GUID_REMOTEFX,
+            codec_id: 0x03,
+            properties: vec![],
+        };
+        let bytes = justrdp_core::encode_vec(&entry).unwrap();
+        let expected: &[u8] = &[
+            0x12, 0x2F, 0x77, 0x76, 0x72, 0xBD, 0x63, 0x44,
+            0xAF, 0xB3, 0xB7, 0x3C, 0x9C, 0x6F, 0x78, 0x86,
+            0x03,
+            0x00, 0x00,
+        ];
+        assert_eq!(bytes, expected);
+        assert_eq!(entry.size(), expected.len());
+    }
+
+    #[test]
+    fn bitmap_codec_entry_roundtrip_with_properties() {
+        let entry = BitmapCodecEntry {
+            guid: CODEC_GUID_REMOTEFX,
+            codec_id: 0x09,
+            properties: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+        };
+        let bytes = justrdp_core::encode_vec(&entry).unwrap();
+        let mut cur = ReadCursor::new(&bytes);
+        let decoded = BitmapCodecEntry::decode(&mut cur).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(entry.size(), bytes.len());
+    }
+
+    #[test]
+    fn bitmap_codecs_capability_roundtrip_one_rfx_entry() {
         let cap = CapabilitySet::BitmapCodecs(BitmapCodecsCapability {
-            supported_bitmap_codecs: vec![0x01, 0x00, 0x00],
+            codecs: vec![BitmapCodecEntry {
+                guid: CODEC_GUID_REMOTEFX,
+                codec_id: 0x03,
+                properties: vec![],
+            }],
         });
         assert_eq!(roundtrip_capability(cap.clone()), cap);
+    }
+
+    #[test]
+    fn bitmap_codecs_capability_roundtrip_empty() {
+        let cap = CapabilitySet::BitmapCodecs(BitmapCodecsCapability { codecs: vec![] });
+        assert_eq!(roundtrip_capability(cap.clone()), cap);
+    }
+
+    #[test]
+    fn bitmap_codecs_capability_size_matches_encoded_length() {
+        // CLAUDE.md PDU invariant: size() must equal encode() output bytes.
+        let cap = BitmapCodecsCapability {
+            codecs: vec![
+                BitmapCodecEntry {
+                    guid: CODEC_GUID_REMOTEFX,
+                    codec_id: 0x03,
+                    properties: vec![],
+                },
+                BitmapCodecEntry {
+                    guid: [0xFF; 16],
+                    codec_id: 0xAB,
+                    properties: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                },
+            ],
+        };
+        let bytes = justrdp_core::encode_vec(&cap).unwrap();
+        assert_eq!(cap.size(), bytes.len(), "size() must match encoded bytes");
     }
 
     #[test]

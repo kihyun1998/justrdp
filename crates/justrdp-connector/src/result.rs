@@ -5,7 +5,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use justrdp_pdu::rdp::capabilities::CapabilitySet;
+use justrdp_pdu::rdp::capabilities::{CapabilitySet, CODEC_GUID_REMOTEFX};
 use justrdp_pdu::rdp::finalization::MonitorLayoutEntry;
 use justrdp_pdu::rdp::redirection::ServerRedirectionPdu;
 use justrdp_pdu::x224::SecurityProtocol;
@@ -73,4 +73,29 @@ pub struct ConnectionResult {
     /// target instead of treating the session as live. `None` for normal
     /// connections.
     pub server_redirection: Option<ServerRedirectionPdu>,
+    /// Negotiated `codec_id` for RemoteFX (MS-RDPRFX), surfaced from the
+    /// server's `BitmapCodecs` reply in `Demand Active`. `None` when the
+    /// server did not echo a `BitmapCodecs` capability or the reply
+    /// omitted the RFX entry — embedders should treat that as "RFX is
+    /// not negotiated" and skip `BitmapRenderer::set_rfx_codec_id`.
+    pub rfx_codec_id: Option<u8>,
+}
+
+impl ConnectionResult {
+    /// Walk `server_capabilities` for a `BitmapCodecs` capability set and
+    /// return the negotiated `codec_id` for the entry whose GUID equals
+    /// [`CODEC_GUID_REMOTEFX`]. Used at finalization time to populate
+    /// [`Self::rfx_codec_id`].
+    pub(crate) fn extract_rfx_codec_id(server_caps: &[CapabilitySet]) -> Option<u8> {
+        for cap in server_caps {
+            if let CapabilitySet::BitmapCodecs(bc) = cap {
+                for entry in &bc.codecs {
+                    if entry.guid == CODEC_GUID_REMOTEFX {
+                        return Some(entry.codec_id);
+                    }
+                }
+            }
+        }
+        None
+    }
 }

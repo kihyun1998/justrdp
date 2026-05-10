@@ -87,6 +87,11 @@ pub struct AsyncRdpClient {
     /// the caller's future does not return until the pump has
     /// emitted any final wire bytes.
     pump: Option<JoinHandle<()>>,
+    /// Negotiated `codec_id` for RemoteFX, surfaced from
+    /// [`ConnectionResult::rfx_codec_id`] so the embedder can register
+    /// it on its `BitmapRenderer` post-handshake. `None` when the
+    /// server did not echo a `BitmapCodecs` capability for RFX.
+    rfx_codec_id: Option<u8>,
 }
 
 impl AsyncRdpClient {
@@ -187,6 +192,15 @@ impl AsyncRdpClient {
     /// transport drop, or terminal error already surfaced via a
     /// prior `Some(Err(_))`). Treat `None` as the canonical
     /// end-of-session signal.
+    /// Negotiated RemoteFX codec id from the server's `BitmapCodecs`
+    /// reply (MS-RDPRFX). Pass to `BitmapRenderer::set_rfx_codec_id`
+    /// before pumping events so SurfaceCommands carrying RFX data are
+    /// decoded instead of dropped. `None` when the server didn't
+    /// negotiate RFX for this session.
+    pub fn rfx_codec_id(&self) -> Option<u8> {
+        self.rfx_codec_id
+    }
+
     pub async fn next_event(&mut self) -> Option<Result<RdpEvent, RuntimeError>> {
         self.evt_rx.recv().await
     }
@@ -363,12 +377,14 @@ where
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(CMD_QUEUE);
     let (evt_tx, evt_rx) = mpsc::channel::<Result<RdpEvent, RuntimeError>>(EVT_QUEUE);
 
+    let rfx_codec_id = result.rfx_codec_id;
     let pump = tokio::spawn(pump::pump(session, cmd_rx, evt_tx));
 
     Ok(AsyncRdpClient {
         cmd_tx,
         evt_rx,
         pump: Some(pump),
+        rfx_codec_id,
     })
 }
 

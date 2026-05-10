@@ -3407,11 +3407,12 @@ pub fn render_event_stateful<S: FrameSink>(
             Ok(any)
         }
         FastPathUpdateType::Orders => renderer.process_orders(data, sink),
-        // Palette / Surface Bits / Pointer-* are silently dropped
-        // for now. Surface Bits would route through codec dispatch
-        // (RFX / NSCodec / AVC) once BitmapCodecs capability
-        // negotiation lands; pointer cursor sprites need a separate
-        // PointerSink trait. Both tracked as follow-ups.
+        FastPathUpdateType::SurfaceCommands => {
+            renderer.process_surface_commands(data, sink)
+        }
+        // Palette / Pointer-* still silent-dropped — pointer sprites
+        // route through the embedder's PointerSink (handled in the
+        // Tauri layer); palette is unused on 32-bit servers.
         _ => Ok(false),
     }
 }
@@ -4479,6 +4480,48 @@ mod tests {
         // The encoder snapshot should have updated the renderer's
         // entropy field via the embedded TS_RFX_CONTEXT block.
         assert_eq!(renderer.rfx_entropy, RlgrMode::Rlgr1);
+    }
+
+    /// Pin the integration boundary that PRD #14 Slice α wires up:
+    /// `render_event_stateful` (the embedder-facing entry) must forward
+    /// `SurfaceCommands` payloads into `BitmapRenderer.process_surface_commands`,
+    /// not silent-drop them. Without this, every server falls back to raw
+    /// Bitmap fast-path even when RFX is registered.
+    #[test]
+    fn render_event_stateful_forwards_surface_commands_to_renderer() {
+        use justrdp_graphics::rfx::frame_encoder::RfxFrameEncoder;
+        use justrdp_graphics::rfx::quant::CodecQuant;
+        use justrdp_graphics::rfx::wire::RfxTileWire;
+
+        let tile = RfxTileWire {
+            quant_idx_y: 0,
+            quant_idx_cb: 0,
+            quant_idx_cr: 0,
+            x_idx: 0,
+            y_idx: 0,
+            y_data: vec![0; 1],
+            cb_data: vec![0; 1],
+            cr_data: vec![0; 1],
+        };
+        let mut encoder = RfxFrameEncoder::new(64, 64, RlgrMode::Rlgr1).unwrap();
+        let quant = CodecQuant::from_bytes(&[0x66, 0x66, 0x77, 0x88, 0x98]);
+        let rfx_bytes = encoder.encode_frame(&[], vec![quant], vec![tile]).unwrap();
+
+        let codec_id = 0x03;
+        let payload = build_set_surface_bits_rfx(codec_id, 0, 0, rfx_bytes);
+        let event = SessionEvent::Graphics {
+            update_code: FastPathUpdateType::SurfaceCommands,
+            data: payload,
+        };
+
+        let mut renderer = BitmapRenderer::new();
+        renderer.set_rfx_codec_id(codec_id);
+        let mut sink = Capture::new();
+
+        let drew = render_event_stateful(&event, &mut sink, &mut renderer)
+            .expect("SurfaceCommands path must dispatch without error");
+        assert!(drew, "RFX SurfaceCommands frame must produce a blit");
+        assert_eq!(sink.blits.len(), 1, "exactly one tile blit expected");
     }
 
     // ── Drawing Orders (S3d-4) ─────────────────────────────────────

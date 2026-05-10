@@ -214,6 +214,15 @@ async fn run_session(
     // the session; resetting it mid-session desynchronises the
     // server's elided fields and corrupts every subsequent order.
     let mut renderer = BitmapRenderer::new();
+    // PRD #14 Slice α: register the negotiated RFX codec_id from the
+    // post-handshake `ConnectionResult` so SurfaceCommands carrying
+    // RFX-tagged payloads decode through `BitmapRenderer.process_surface_commands`
+    // instead of being dropped. `None` means the server didn't echo
+    // RFX in its `BitmapCodecs` reply — embedder skips registration
+    // and falls back to raw Bitmap fast-path automatically.
+    if let Some(id) = client.rfx_codec_id() {
+        renderer.set_rfx_codec_id(id);
+    }
     // Slice β (#10): per-session cursor sprite cache. Color pointer
     // emits get decoded here and cached against the server-supplied
     // index for future Cached-pointer lookups (Slice δ).

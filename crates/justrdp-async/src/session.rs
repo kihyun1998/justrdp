@@ -535,6 +535,7 @@ mod tests {
             server_monitor_layout: None,
             server_arc_cookie: None,
             server_redirection: None,
+            rfx_codec_id: None,
         }
     }
 
