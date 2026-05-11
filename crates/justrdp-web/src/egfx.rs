@@ -115,9 +115,30 @@ struct SurfaceState {
     output_origin: Option<(u32, u32)>,
     /// `width * height * 4` RGBA bytes, top-down.
     pixels_rgba: Vec<u8>,
-    /// Set on each composite into the surface; cleared after the next
-    /// `on_end_frame` blits the surface to the sink.
-    dirty: bool,
+    /// Bounding rect (left, top, right, bottom) of pixels written since
+    /// the last `on_end_frame` flush. `None` when nothing was painted
+    /// — `on_end_frame` skips the surface so fast-path Bitmap pixels
+    /// already on the canvas are not overwritten with a zero-fill EGFX
+    /// surface buffer (the bug that #28's full-surface blit caused).
+    dirty_rect: Option<(u16, u16, u16, u16)>,
+}
+
+impl SurfaceState {
+    /// Expand `dirty_rect` to enclose the new `rect`, clamped to the
+    /// surface dimensions.
+    fn mark_dirty(&mut self, left: u16, top: u16, right: u16, bottom: u16) {
+        let r = right.min(self.width);
+        let b = bottom.min(self.height);
+        if left >= r || top >= b {
+            return;
+        }
+        match self.dirty_rect {
+            None => self.dirty_rect = Some((left, top, r, b)),
+            Some((l0, t0, r0, b0)) => {
+                self.dirty_rect = Some((l0.min(left), t0.min(top), r0.max(r), b0.max(b)));
+            }
+        }
+    }
 }
 
 /// `GfxHandler` adapter that decodes EGFX commands into [`FrameSink`]
@@ -197,7 +218,7 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
                 height,
                 output_origin: None,
                 pixels_rgba,
-                dirty: false,
+                dirty_rect: None,
             },
         );
     }
@@ -328,22 +349,35 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
 
     fn on_end_frame(&mut self, _frame_id: u32) -> Option<u32> {
         for surface in self.surfaces.values_mut() {
-            if !surface.dirty {
+            let Some((dl, dt, dr, db)) = surface.dirty_rect.take() else {
                 continue;
-            }
+            };
             let Some((ox, oy)) = surface.output_origin else {
-                surface.dirty = false;
                 continue;
             };
-            // Output origin is u32 per the trait; FrameSink::blit_rgba
-            // takes u16 so out-of-range origins skip silently.
+            // Output origin is u32 per the trait; clip to u16 range
+            // since FrameSink::blit_rgba operates in desktop u16 coords.
             let (Ok(ox), Ok(oy)) = (u16::try_from(ox), u16::try_from(oy)) else {
-                surface.dirty = false;
                 continue;
             };
+            // Extract the dirty sub-rect from the surface's RGBA buffer
+            // — only those pixels go to the sink, so untouched regions
+            // (especially fast-path Bitmap pixels already on the canvas)
+            // are NOT overwritten with our zero-init surface buffer.
+            let rect_w = dr - dl;
+            let rect_h = db - dt;
+            let stride = usize::from(surface.width) * 4;
+            let mut tile = alloc::vec![0u8; usize::from(rect_w) * usize::from(rect_h) * 4];
+            for row in 0..rect_h {
+                let src_row = (usize::from(dt) + usize::from(row)) * stride
+                    + usize::from(dl) * 4;
+                let dst_row = usize::from(row) * usize::from(rect_w) * 4;
+                let row_bytes = usize::from(rect_w) * 4;
+                tile[dst_row..dst_row + row_bytes]
+                    .copy_from_slice(&surface.pixels_rgba[src_row..src_row + row_bytes]);
+            }
             self.sink
-                .blit_rgba(ox, oy, surface.width, surface.height, &surface.pixels_rgba);
-            surface.dirty = false;
+                .blit_rgba(ox + dl, oy + dt, rect_w, rect_h, &tile);
         }
         // Default: ack with queue depth 0 (no backpressure signal).
         Some(0)
@@ -388,7 +422,7 @@ fn composite_bgr_to_rgba(
             surface.pixels_rgba[dst_off + 3] = 0xFF;
         }
     }
-    surface.dirty = true;
+    surface.mark_dirty(dest_rect.left, dest_rect.top, dest_rect.right, dest_rect.bottom);
 }
 
 /// Composite raw BGRA pixel bytes into the surface's RGBA buffer at
@@ -429,7 +463,7 @@ fn composite_uncompressed_bgra_to_rgba(
             surface.pixels_rgba[dst_off + 3] = bitmap_data[src_off + 3];
         }
     }
-    surface.dirty = true;
+    surface.mark_dirty(dest_rect.left, dest_rect.top, dest_rect.right, dest_rect.bottom);
 }
 
 #[cfg(test)]
@@ -557,15 +591,16 @@ mod tests {
     }
 
     /// `dest_rect` selects the destination sub-region inside the surface.
-    /// Pixels outside the rect must remain the surface's prior content
-    /// (zero in this test); pixels inside must be the BGRA→RGBA-swapped
-    /// `bitmap_data`.
+    /// Only pixels inside the rect are dirty; `on_end_frame` blits ONLY
+    /// the dirty sub-rect (offset to its mapped origin) — never the
+    /// untouched surface area, which would otherwise overwrite fast-path
+    /// Bitmap pixels already on the canvas with our zero-init buffer.
     #[test]
-    fn wire_to_surface_1_composites_only_inside_dest_rect() {
+    fn wire_to_surface_1_blits_only_dirty_dest_rect_at_mapped_origin() {
         let mut renderer = GfxRenderer::new(CaptureSink::default());
 
         renderer.on_create_surface(1, 64, 64, GfxPixelFormat::ARGB_8888);
-        renderer.on_map_surface_to_output(1, 0, 0);
+        renderer.on_map_surface_to_output(1, 100, 200);
 
         // 32×32 region of pure red (BGRA: B=0, G=0, R=0xFF, A=0xFF).
         let red_bgra: Vec<u8> = vec![0x00, 0x00, 0xFF, 0xFF].repeat(32 * 32);
@@ -580,25 +615,13 @@ mod tests {
 
         let sink = renderer.sink();
         assert_eq!(sink.blits.len(), 1);
-        let pixels = &sink.blits[0].4;
-        assert_eq!(pixels.len(), 64 * 64 * 4);
-
-        // Pixel (0, 0) — outside the rect — must still be zero.
-        let p_corner = &pixels[0..4];
-        assert_eq!(p_corner, &[0, 0, 0, 0], "corner pixel must remain unwritten");
-
-        // Pixel (32, 32) — inside the rect — must be the swapped red.
-        let center_off = (32 * 64 + 32) * 4;
-        let p_center = &pixels[center_off..center_off + 4];
-        assert_eq!(
-            p_center,
-            &[0xFF, 0x00, 0x00, 0xFF],
-            "center pixel must be RGBA red after BGRA swap"
-        );
-
-        // Pixel (15, 15) — just outside top-left of rect — must remain zero.
-        let just_outside_off = (15 * 64 + 15) * 4;
-        assert_eq!(&pixels[just_outside_off..just_outside_off + 4], &[0, 0, 0, 0]);
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        // Blit lands at (mapped_origin + dest_rect.left, mapped_origin + dest_rect.top)
+        // and is exactly the dest_rect size — NOT the full 64×64 surface.
+        assert_eq!((*x, *y, *w, *h), (100 + 16, 200 + 16, 32, 32));
+        // 32 × 32 × 4 RGBA = 4096 bytes (every pixel = swapped red).
+        let expected: Vec<u8> = vec![0xFF, 0x00, 0x00, 0xFF].repeat(32 * 32);
+        assert_eq!(pixels, &expected);
     }
 
     use justrdp_graphics::avc::{AvcDecoder, AvcError, Yuv420Frame};
