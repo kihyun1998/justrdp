@@ -138,8 +138,26 @@ async fn rdp_connect(
     pass: String,
     domain: Option<String>,
 ) -> Result<u64, String> {
-    let mut builder =
-        Config::builder(&user, &pass).desktop_size(DESKTOP_WIDTH, DESKTOP_HEIGHT);
+    // CHANNEL_OPTION_INITIALIZED (0x80000000) + CHANNEL_OPTION_COMPRESS_RDP
+    // (0x00800000). Standard mstsc/FreeRDP flags for plain SVCs that
+    // support per-frame RDP compression.
+    const SVC_FLAGS: u32 = 0x8080_0000;
+
+    let mut builder = Config::builder(&user, &pass)
+        .desktop_size(DESKTOP_WIDTH, DESKTOP_HEIGHT)
+        // PRD #1 #2/#3/#5 silent-failure fix (discovered 2026-05-11 via
+        // [DIAG-egfx] log returning zero callbacks): SVC processors only
+        // get an MCS channel id when the channel name is also advertised
+        // in the connector's Config::static_channels. Otherwise the
+        // server allocates nothing and the processor sits idle (no
+        // error). Audio + clipboard advertised even when the platform
+        // backend is None — the processor list filters them out, but
+        // advertising costs nothing.
+        .channel("rdpsnd", SVC_FLAGS)
+        .channel("cliprdr", SVC_FLAGS)
+        // PRD #20 #29: drdynvc hosts EGFX (Microsoft::Windows::RDS::Graphics)
+        // dynamic channel — required for ClearCodec / AVC / surface bits.
+        .channel("drdynvc", SVC_FLAGS);
     if let Some(d) = domain {
         builder = builder.domain(&d);
     }
