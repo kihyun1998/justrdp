@@ -302,14 +302,28 @@ impl SvcProcessor for CliprdrClient {
     }
 
     fn start(&mut self) -> SvcResult<Vec<SvcMessage>> {
+        log::info!("[DIAG-clip] CliprdrClient.start (waiting for server caps)");
         // Client waits for server to send capabilities first.
         Ok(Vec::new())
     }
 
     fn process(&mut self, payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
+        log::info!("[DIAG-clip] CliprdrClient.process bytes={}", payload.len());
         let mut cursor = ReadCursor::new(payload);
         let header = ClipboardHeader::decode(&mut cursor)?;
-        self.handle_pdu(&header, &mut cursor)
+        log::info!(
+            "[DIAG-clip] CliprdrClient.process pdu_type={:?} flags={:?} len={}",
+            header.msg_type,
+            header.msg_flags,
+            header.data_len
+        );
+        let result = self.handle_pdu(&header, &mut cursor);
+        if let Err(e) = &result {
+            log::info!("[DIAG-clip] CliprdrClient.handle_pdu err={:?}", e);
+        } else if let Ok(msgs) = &result {
+            log::info!("[DIAG-clip] CliprdrClient.handle_pdu ok n_msgs={}", msgs.len());
+        }
+        result
     }
 
     fn compression_condition(&self) -> CompressionCondition {

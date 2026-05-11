@@ -170,10 +170,20 @@ async fn rdp_connect(
     // clipboard path (frames are silently dropped upstream by the
     // SVC dispatcher).
     let mut processors = Vec::new();
-    if let Some(audio) = audio::new_platform_audio_processor() {
+    let audio_processor = audio::new_platform_audio_processor();
+    log::info!(
+        "[DIAG-clip] audio backend registered = {}",
+        audio_processor.is_some()
+    );
+    if let Some(audio) = audio_processor {
         processors.push(audio);
     }
-    if let Some(clip) = clipboard::new_platform_clipboard_processor() {
+    let clipboard_processor = clipboard::new_platform_clipboard_processor();
+    log::info!(
+        "[DIAG-clip] clipboard backend registered = {}",
+        clipboard_processor.is_some()
+    );
+    if let Some(clip) = clipboard_processor {
         processors.push(clip);
     }
 

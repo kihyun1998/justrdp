@@ -2274,6 +2274,7 @@ version = "0.1.0"
 dependencies = [
  "justrdp-core",
  "justrdp-svc",
+ "log",
 ]
 
 [[package]]
