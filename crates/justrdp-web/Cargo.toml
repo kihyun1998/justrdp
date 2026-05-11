@@ -39,6 +39,7 @@ justrdp-audio = { workspace = true, features = ["alloc"] }
 justrdp-svc = { workspace = true, features = ["alloc"] }
 justrdp-dvc = { workspace = true, features = ["alloc"] }
 justrdp-egfx = { workspace = true, features = ["alloc"] }
+log = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

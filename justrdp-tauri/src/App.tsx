@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { info } from "@tauri-apps/plugin-log";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { RdpCanvas } from "./RdpCanvas";
 import "./App.css";
@@ -107,15 +108,28 @@ function App() {
       const payload = event.payload;
       switch (payload.kind) {
         case "frame": {
+          // [DIAG-perf]
+          const t0 = performance.now();
           const ctx = canvasRef.current?.getContext("2d");
           if (ctx) {
             for (const blit of payload.blits) {
               drawBlit(ctx, blit);
             }
           }
+          const t1 = performance.now();
           // Counter is per-update (one IPC event per server-pushed
           // GraphicsUpdate, regardless of how many rects it carried).
           setFrameCount((n) => n + 1);
+          // [DIAG-perf] log via tauri-plugin-log → same OS log file
+          // as Rust's log::info! lines. Fire-and-forget Promise (no
+          // await) so per-frame paint isn't blocked by IPC.
+          const totalBytes = payload.blits.reduce(
+            (s, b) => s + b.rgba_b64.length,
+            0,
+          );
+          info(
+            `[DIAG-perf] front.frame n=${payload.blits.length} b64_bytes=${totalBytes} paint_ms=${(t1 - t0).toFixed(2)}`,
+          ).catch(() => {});
           break;
         }
         case "pointer_position":

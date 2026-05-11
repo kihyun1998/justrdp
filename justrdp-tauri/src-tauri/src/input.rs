@@ -65,9 +65,12 @@ pub fn translate(event: InputEvent) -> Result<InputAction, InputError> {
         InputEvent::MouseMove { x, y } => Ok(InputAction::MouseMove { x, y }),
         InputEvent::MouseButton { button, pressed, x, y } => {
             let btn = match button {
+                // W3C PointerEvent.button order — see test for spec
+                // reference. Earlier revisions had 1↔2 swapped, which
+                // routed right-click → Middle on the wire.
                 0 => MouseButton::Left,
-                1 => MouseButton::Right,
-                2 => MouseButton::Middle,
+                1 => MouseButton::Middle,
+                2 => MouseButton::Right,
                 3 => MouseButton::X1,
                 4 => MouseButton::X2,
                 other => return Err(InputError::UnknownMouseButton(other)),
@@ -113,10 +116,14 @@ mod tests {
 
     #[test]
     fn translate_mouse_button_indices_zero_to_four_map_to_enum_variants() {
+        // W3C PointerEvent.button / MouseEvent.button order:
+        //   0 = main (Left), 1 = auxiliary (Middle), 2 = secondary (Right),
+        //   3 = X1 (back), 4 = X2 (forward). Reference:
+        //   https://www.w3.org/TR/uievents/#dom-mouseevent-button
         let cases = [
             (0u8, MouseButton::Left),
-            (1, MouseButton::Right),
-            (2, MouseButton::Middle),
+            (1, MouseButton::Middle),
+            (2, MouseButton::Right),
             (3, MouseButton::X1),
             (4, MouseButton::X2),
         ];

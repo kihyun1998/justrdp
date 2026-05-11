@@ -186,6 +186,9 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
         height: u16,
         _pixel_format: GfxPixelFormat,
     ) {
+        log::info!(
+            "[DIAG-egfx] on_create_surface id={surface_id} {width}x{height}"
+        );
         let pixels_rgba = alloc::vec![0u8; usize::from(width) * usize::from(height) * 4];
         self.surfaces.insert(
             surface_id,
@@ -209,6 +212,9 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
         output_origin_x: u32,
         output_origin_y: u32,
     ) {
+        log::info!(
+            "[DIAG-egfx] on_map_surface_to_output id={surface_id} origin=({output_origin_x},{output_origin_y})"
+        );
         if let Some(s) = self.surfaces.get_mut(&surface_id) {
             s.output_origin = Some((output_origin_x, output_origin_y));
         }
@@ -231,6 +237,14 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
         dest_rect: GfxRect16,
         bitmap_data: &[u8],
     ) {
+        log::info!(
+            "[DIAG-egfx] on_wire_to_surface_1 id={surface_id} codec=0x{codec_id:04x} bytes={n} rect=({l},{t},{r},{b})",
+            n = bitmap_data.len(),
+            l = dest_rect.left,
+            t = dest_rect.top,
+            r = dest_rect.right,
+            b = dest_rect.bottom,
+        );
         let Some(surface) = self.surfaces.get_mut(&surface_id) else {
             return; // unknown surface — drop
         };

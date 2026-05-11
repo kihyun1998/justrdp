@@ -299,14 +299,27 @@ async fn run_session(
             // refreshing. `Notify` is idempotent — multiple back-to-back
             // EGFX writes coalesce into one drain wake.
             _ = drain_notify.notified() => {
+                // [DIAG-perf] EGFX-side drain path
+                let t0 = std::time::Instant::now();
                 let blits = match frame_sink.lock() {
                     Ok(mut s) => s.drain_blits(),
                     Err(_) => continue,
                 };
+                let t1 = std::time::Instant::now();
+                let n = blits.len();
+                let bytes: usize = blits.iter().map(|b| b.rgba_b64.len()).sum();
                 if !blits.is_empty() {
                     let _ = window.emit(
                         "rdp:event",
                         FrontendEvent::Frame { blits },
+                    );
+                }
+                let t2 = std::time::Instant::now();
+                if n > 0 {
+                    log::info!(
+                        "[DIAG-perf] rust.egfx_drain n={n} b64_bytes={bytes} drain_us={d} emit_us={e}",
+                        d = (t1 - t0).as_micros(),
+                        e = (t2 - t1).as_micros(),
                     );
                 }
             }
@@ -339,19 +352,35 @@ async fn run_session(
                         // Fields are 1:1 with the v1-compat
                         // translation in justrdp_tokio::translate
                         // (translate.rs:35).
+                        // [DIAG-perf] fast-path render path
+                        let t0 = std::time::Instant::now();
+                        let data_len = data.len();
+                        let upd_dbg = format!("{update_code:?}");
                         let sev = SessionEvent::Graphics { update_code, data };
-                        match render_event_stateful(&sev, &mut sink, &mut renderer) {
+                        let render_result = render_event_stateful(&sev, &mut sink, &mut renderer);
+                        let t1 = std::time::Instant::now();
+                        match render_result {
                             Ok(true) => {
                                 let blits = match frame_sink.lock() {
                                     Ok(mut s) => s.drain_blits(),
                                     Err(_) => Vec::new(),
                                 };
+                                let t2 = std::time::Instant::now();
+                                let n = blits.len();
+                                let bytes: usize = blits.iter().map(|b| b.rgba_b64.len()).sum();
                                 if !blits.is_empty() {
                                     let _ = window.emit(
                                         "rdp:event",
                                         FrontendEvent::Frame { blits },
                                     );
                                 }
+                                let t3 = std::time::Instant::now();
+                                log::info!(
+                                    "[DIAG-perf] rust.fastpath kind={upd_dbg} wire_bytes={data_len} n={n} b64_bytes={bytes} render_us={r} drain_us={d} emit_us={e}",
+                                    r = (t1 - t0).as_micros(),
+                                    d = (t2 - t1).as_micros(),
+                                    e = (t3 - t2).as_micros(),
+                                );
                             }
                             Ok(false) => {}
                             Err(e) => {
@@ -599,7 +628,31 @@ async fn rdp_disconnect(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Identifier (e.g. `com.user.justrdp-tauri`) drives both the OS log
+    // dir namespacing and the log file name. Reading from the compiled
+    // tauri.conf.json keeps the two in sync without manual config.
+    let context: tauri::Context = tauri::generate_context!();
+    let log_file_name = context.config().identifier.clone();
+
     tauri::Builder::default()
+        // File-only logging (LogDir target). OS-standard locations:
+        //   Windows: %APPDATA%/<identifier>/logs/<file_name>.log
+        //   macOS:   ~/Library/Logs/<identifier>/<file_name>.log
+        //   Linux:   ~/.local/share/<identifier>/logs/<file_name>.log
+        // Rotation: 5MB, KeepAll. Local timezone (KST-aware).
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some(log_file_name),
+                    },
+                )])
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .max_file_size(5_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .setup(|app| {
             // Resolve the platform-appropriate per-app config dir
             // (`%APPDATA%\com.user.justrdp-tauri\` on Windows etc.)
@@ -623,6 +676,6 @@ pub fn run() {
             rdp_fetch_cert_spki,
             rdp_trust_spki,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }

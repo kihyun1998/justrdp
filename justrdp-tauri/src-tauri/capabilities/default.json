@@ -4,6 +4,7 @@
   "description": "Capability for the main window. Slice F: minimal allow-list — frontend only listens for backend events and invokes the explicitly registered Tauri commands. No filesystem, shell, exec, notification, or HTTP plugin permissions.",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "log:default"
   ]
 }
