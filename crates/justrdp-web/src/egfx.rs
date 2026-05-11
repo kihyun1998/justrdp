@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use justrdp_core::AsAny;
-use justrdp_egfx::{GfxColor32, GfxHandler, GfxMonitorDef, GfxPixelFormat, GfxRect16};
+use justrdp_egfx::{GfxColor32, GfxHandler, GfxMonitorDef, GfxPixelFormat, GfxPoint16, GfxRect16};
 use justrdp_graphics::avc::AvcDecoder;
 use justrdp_graphics::clearcodec::ClearCodecDecoder;
 
@@ -224,6 +224,7 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
     }
 
     fn on_delete_surface(&mut self, surface_id: u16) {
+        log::info!("[DIAG-egfx] on_delete_surface id={surface_id}");
         self.surfaces.remove(&surface_id);
     }
 
@@ -243,10 +244,11 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
 
     fn on_reset_graphics(
         &mut self,
-        _width: u32,
-        _height: u32,
+        width: u32,
+        height: u32,
         _monitors: &[GfxMonitorDef],
     ) {
+        log::info!("[DIAG-egfx] on_reset_graphics {width}x{height}");
         self.surfaces.clear();
     }
 
@@ -338,16 +340,142 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
 
     fn on_solid_fill(
         &mut self,
-        _surface_id: u16,
-        _fill_color: GfxColor32,
-        _rectangles: &[GfxRect16],
+        surface_id: u16,
+        fill_color: GfxColor32,
+        rectangles: &[GfxRect16],
     ) {
-        // Out of scope for #28.
+        log::info!(
+            "[DIAG-egfx] on_solid_fill id={surface_id} color=#{:02x}{:02x}{:02x} rects={}",
+            fill_color.r,
+            fill_color.g,
+            fill_color.b,
+            rectangles.len()
+        );
+        let Some(surface) = self.surfaces.get_mut(&surface_id) else {
+            return;
+        };
+        let stride = usize::from(surface.width) * 4;
+        for rect in rectangles {
+            let l = rect.left.min(surface.width);
+            let t = rect.top.min(surface.height);
+            let r = rect.right.min(surface.width);
+            let b = rect.bottom.min(surface.height);
+            if l >= r || t >= b {
+                continue;
+            }
+            for row in t..b {
+                let row_off = usize::from(row) * stride + usize::from(l) * 4;
+                let row_end = row_off + usize::from(r - l) * 4;
+                let buf = &mut surface.pixels_rgba[row_off..row_end];
+                for px in buf.chunks_exact_mut(4) {
+                    px[0] = fill_color.r;
+                    px[1] = fill_color.g;
+                    px[2] = fill_color.b;
+                    px[3] = 0xFF;
+                }
+            }
+            surface.mark_dirty(l, t, r, b);
+        }
     }
 
-    fn on_start_frame(&mut self, _frame_id: u32, _timestamp: u32) {}
+    fn on_surface_to_surface(
+        &mut self,
+        src_surface_id: u16,
+        dst_surface_id: u16,
+        src_rect: GfxRect16,
+        dest_points: &[GfxPoint16],
+    ) {
+        log::info!(
+            "[DIAG-egfx] on_surface_to_surface src={src_surface_id} dst={dst_surface_id} src_rect=({},{},{},{}) dst_n={}",
+            src_rect.left, src_rect.top, src_rect.right, src_rect.bottom, dest_points.len()
+        );
+        // Same-surface scroll is the common case (window content shift).
+        // Cross-surface is rare; not handled here.
+        if src_surface_id != dst_surface_id {
+            return;
+        }
+        let Some(surface) = self.surfaces.get_mut(&src_surface_id) else {
+            return;
+        };
+        let sw = usize::from(surface.width);
+        let stride = sw * 4;
+        let rect_w = src_rect.right.saturating_sub(src_rect.left);
+        let rect_h = src_rect.bottom.saturating_sub(src_rect.top);
+        if rect_w == 0 || rect_h == 0 {
+            return;
+        }
+        // Snapshot the source region so overlapping copies don't corrupt
+        // (rare but real on scroll-up patterns).
+        let mut src_copy = alloc::vec![0u8; usize::from(rect_w) * usize::from(rect_h) * 4];
+        for row in 0..rect_h {
+            let off = (usize::from(src_rect.top) + usize::from(row)) * stride
+                + usize::from(src_rect.left) * 4;
+            let dst_off = usize::from(row) * usize::from(rect_w) * 4;
+            let bytes = usize::from(rect_w) * 4;
+            src_copy[dst_off..dst_off + bytes]
+                .copy_from_slice(&surface.pixels_rgba[off..off + bytes]);
+        }
+        for dp in dest_points {
+            // GfxPoint16 fields are i16 — negative dest coords mean
+            // (partially) off-screen. Clip to 0; off-surface portions
+            // are simply not copied.
+            if dp.x < 0 || dp.y < 0 {
+                continue;
+            }
+            let dl = dp.x as u16;
+            let dt = dp.y as u16;
+            let dr = dl.saturating_add(rect_w).min(surface.width);
+            let db = dt.saturating_add(rect_h).min(surface.height);
+            if dl >= dr || dt >= db {
+                continue;
+            }
+            for row in 0..(db - dt) {
+                let dst_off = (usize::from(dt) + usize::from(row)) * stride
+                    + usize::from(dl) * 4;
+                let src_off = usize::from(row) * usize::from(rect_w) * 4;
+                let bytes = usize::from(dr - dl) * 4;
+                surface.pixels_rgba[dst_off..dst_off + bytes]
+                    .copy_from_slice(&src_copy[src_off..src_off + bytes]);
+            }
+            surface.mark_dirty(dl, dt, dr, db);
+        }
+    }
 
-    fn on_end_frame(&mut self, _frame_id: u32) -> Option<u32> {
+    fn on_surface_to_cache(
+        &mut self,
+        surface_id: u16,
+        cache_key: u64,
+        cache_slot: u16,
+        src_rect: GfxRect16,
+    ) {
+        log::info!(
+            "[DIAG-egfx] on_surface_to_cache id={surface_id} slot={cache_slot} key=0x{cache_key:016x} rect=({},{},{},{})",
+            src_rect.left, src_rect.top, src_rect.right, src_rect.bottom
+        );
+    }
+
+    fn on_cache_to_surface(
+        &mut self,
+        cache_slot: u16,
+        surface_id: u16,
+        dest_points: &[GfxPoint16],
+    ) {
+        log::info!(
+            "[DIAG-egfx] on_cache_to_surface slot={cache_slot} dst_id={surface_id} dst_n={}",
+            dest_points.len()
+        );
+    }
+
+    fn on_evict_cache_entry(&mut self, cache_slot: u16) {
+        log::info!("[DIAG-egfx] on_evict_cache_entry slot={cache_slot}");
+    }
+
+    fn on_start_frame(&mut self, frame_id: u32, _timestamp: u32) {
+        log::info!("[DIAG-egfx] on_start_frame fid={frame_id}");
+    }
+
+    fn on_end_frame(&mut self, frame_id: u32) -> Option<u32> {
+        log::info!("[DIAG-egfx] on_end_frame fid={frame_id}");
         for surface in self.surfaces.values_mut() {
             let Some((dl, dt, dr, db)) = surface.dirty_rect.take() else {
                 continue;
