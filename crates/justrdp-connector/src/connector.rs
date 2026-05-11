@@ -767,6 +767,21 @@ impl ClientConnector {
         core_data.client_name = self.config.client_name.clone();
         core_data.server_selected_protocol = Some(self.selected_protocol.bits());
 
+        // Advertise SUPPORT_DYNVC_GFX_PROTOCOL (MS-RDPBCGR 2.2.1.3.2).
+        // Server only initiates the `Microsoft::Windows::RDS::Graphics`
+        // dynamic channel (carrying ClearCodec / AVC420 / AVC444 / RFX
+        // surface bits) when this flag is set in earlyCapabilityFlags.
+        // mstsc / FreeRDP set it unconditionally on modern builds; we
+        // mirror that — embedders without the drdynvc SVC processor
+        // simply observe the channel sit idle (no protocol violation).
+        // Without this flag a fully-configured DRDYNVC + GfxClient
+        // pipeline negotiates the static channel but never sees a
+        // Create Request from the server.
+        let existing = core_data.early_capability_flags.unwrap_or(EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU);
+        core_data.early_capability_flags = Some(EarlyCapabilityFlags::from_bits(
+            existing.bits() | EarlyCapabilityFlags::SUPPORT_DYNVC_GFX_PROTOCOL.bits(),
+        ));
+
         let (monitor_data, monitor_ext_data) = self.build_monitor_blocks(&mut core_data)?;
 
         // Populate CS_CORE DPI fields from the primary monitor (MS-RDPBCGR 2.2.1.3.2).
