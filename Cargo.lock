@@ -2508,6 +2508,7 @@ dependencies = [
  "justrdp-connector",
  "justrdp-core",
  "justrdp-dvc",
+ "justrdp-egfx",
  "justrdp-graphics",
  "justrdp-pdu",
  "justrdp-rdpeai",
