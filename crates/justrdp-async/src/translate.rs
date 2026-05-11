@@ -114,6 +114,11 @@ pub(crate) fn translate_outputs(
                     let frames = svc_set
                         .process_incoming(channel_id, &data, user_channel_id)
                         .map_err(|e| DriverError::Channel(format!("{e:?}")))?;
+                    log::info!(
+                        "[DIAG-svc] process_incoming chan={channel_id} in_bytes={} out_frames={}",
+                        data.len(),
+                        frames.len()
+                    );
                     out.response_frames.extend(frames);
                 } else {
                     out.events.push(SessionEvent::Channel { channel_id, data });

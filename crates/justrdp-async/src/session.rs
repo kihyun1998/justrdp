@@ -230,6 +230,13 @@ impl<T: WebTransport> ActiveSession<T> {
             self.stage.config().share_id,
         )?;
 
+        let n_resp = translation.response_frames.len();
+        if n_resp > 0 {
+            let total: usize = translation.response_frames.iter().map(|f| f.len()).sum();
+            log::info!(
+                "[DIAG-svc] next_events sending {n_resp} response_frames total_bytes={total}"
+            );
+        }
         for response_frame in translation.response_frames {
             self.transport.send(&response_frame).await?;
         }

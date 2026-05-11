@@ -29,6 +29,7 @@ justrdp-svc = { workspace = true, features = ["alloc"] }
 # the lightweight event macros (info!/debug!/trace!/warn!), not the
 # subscriber registration surface.
 tracing = { version = "0.1", default-features = false, optional = true }
+log = { workspace = true }
 
 [dev-dependencies]
 pollster = "0.3"

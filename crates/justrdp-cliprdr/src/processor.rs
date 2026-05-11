@@ -132,9 +132,18 @@ impl CliprdrClient {
             messages.push(Self::encode_pdu(&temp)?);
         }
 
-        // Send an empty format list to complete initialization.
+        // Advertise CF_UNICODETEXT + CF_TEXT so the server starts
+        // sending its own clipboard updates (empirically: Microsoft
+        // RDP server treats an empty initial Format List as "host has
+        // no clipboard" and never sends server-side change
+        // notifications back). Actual data is fetched lazily from the
+        // host via on_format_data_request when the server asks.
         // MS-RDPECLIP 1.3.2.1: client MUST send Format List after caps.
-        let format_list = self.build_format_list_message(&[])?;
+        let initial_formats = [
+            LongFormatName::new(0x0000_000D, alloc::string::String::new()), // CF_UNICODETEXT
+            LongFormatName::new(0x0000_0001, alloc::string::String::new()), // CF_TEXT
+        ];
+        let format_list = self.build_format_list_message(&initial_formats)?;
         messages.push(format_list);
 
         Ok(messages)
@@ -163,6 +172,14 @@ impl CliprdrClient {
                     self.local_flags.bits() & remote_flags.bits(),
                 );
 
+                log::info!(
+                    "[DIAG-clip] cap negotiation local=0x{:08x} remote=0x{:08x} negotiated=0x{:08x} use_long_names={}",
+                    self.local_flags.bits(),
+                    remote_flags.bits(),
+                    self.negotiated_flags.bits(),
+                    self.use_long_format_names()
+                );
+
                 if self.state == CliprdrState::WaitingForServerCaps {
                     self.state = CliprdrState::WaitingForMonitorReady;
                 }
@@ -172,11 +189,12 @@ impl CliprdrClient {
             ClipboardMsgType::MonitorReady => {
                 if self.state == CliprdrState::WaitingForMonitorReady {
                     self.state = CliprdrState::Initialized;
+                    log::info!("[DIAG-clip] state=Initialized; sending init response (caps + format_list)");
                     // Send our caps, optional temp dir, and an empty format list
                     // to complete the initialization sequence per MS-RDPECLIP 1.3.2.1.
                     self.build_init_response()
                 } else {
-                    // Ignore duplicate MonitorReady to prevent capability re-negotiation.
+                    log::info!("[DIAG-clip] duplicate MonitorReady ignored (state={:?})", self.state);
                     Ok(Vec::new())
                 }
             }
@@ -322,6 +340,22 @@ impl SvcProcessor for CliprdrClient {
             log::info!("[DIAG-clip] CliprdrClient.handle_pdu err={:?}", e);
         } else if let Ok(msgs) = &result {
             log::info!("[DIAG-clip] CliprdrClient.handle_pdu ok n_msgs={}", msgs.len());
+            for (i, m) in msgs.iter().enumerate() {
+                // Hex-dump the first 64 bytes of each emitted PDU so a
+                // human can spot wire-format bugs by comparing against
+                // MS-RDPECLIP fixtures or a Wireshark capture of mstsc.
+                let bytes = &m.data;
+                let n = bytes.len().min(64);
+                let mut hex = alloc::string::String::with_capacity(n * 3);
+                for b in &bytes[..n] {
+                    use core::fmt::Write;
+                    let _ = write!(hex, "{:02x} ", b);
+                }
+                log::info!(
+                    "[DIAG-clip] emit[{i}] total_len={} first{n}={hex}",
+                    bytes.len()
+                );
+            }
         }
         result
     }
