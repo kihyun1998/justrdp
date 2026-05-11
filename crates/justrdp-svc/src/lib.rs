@@ -141,6 +141,16 @@ pub trait SvcProcessor: AsAny + Debug + Send {
     /// Returns response messages to send back.
     fn process(&mut self, payload: &[u8]) -> SvcResult<Vec<SvcMessage>>;
 
+    /// Drain any host-side asynchronous messages this channel has queued.
+    ///
+    /// Called by the session loop on wake-ups that are not driven by an
+    /// inbound server frame (e.g. an OS clipboard-change event reached
+    /// the channel out of band). The default returns no messages, which
+    /// fits any purely reactive channel.
+    fn poll(&mut self) -> SvcResult<Vec<SvcMessage>> {
+        Ok(Vec::new())
+    }
+
     /// Controls when compression should be applied to outgoing data.
     fn compression_condition(&self) -> CompressionCondition {
         CompressionCondition::WhenRdpDataIsCompressed

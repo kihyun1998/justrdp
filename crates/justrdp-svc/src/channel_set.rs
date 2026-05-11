@@ -145,6 +145,35 @@ impl StaticChannelSet {
         Ok(results)
     }
 
+    /// Drain host-side asynchronous messages from every assigned processor.
+    ///
+    /// Mirrors [`Self::start_all`] in shape: returns `(channel_id, frames)`
+    /// pairs already MCS-wrapped and ready for the transport. Suspended
+    /// channel sets emit nothing, matching `process_incoming`'s behaviour.
+    pub fn poll_all(&mut self, user_channel_id: u16) -> SvcResult<Vec<(u16, Vec<Vec<u8>>)>> {
+        if self.suspended {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::new();
+        for entry in &mut self.entries {
+            let Some(channel_id) = entry.mcs_channel_id else {
+                continue;
+            };
+            let messages = entry.processor.poll()?;
+            if !messages.is_empty() {
+                let frames = encode_messages(
+                    user_channel_id,
+                    channel_id,
+                    &messages,
+                    self.chunk_size,
+                    entry.show_protocol,
+                )?;
+                results.push((channel_id, frames));
+            }
+        }
+        Ok(results)
+    }
+
     /// Process incoming channel data from the session layer.
     ///
     /// `raw_data` is the MCS userData bytes (starting with ChannelPduHeader).
@@ -516,6 +545,94 @@ mod tests {
         // Don't assign any IDs.
         let results = set.start_all(1007).unwrap();
         assert!(results.is_empty());
+    }
+
+    /// Default `SvcProcessor::poll` returns no messages — locks down the
+    /// guarantee that adding `poll` to the trait does not synthesise spurious
+    /// frames on channels that have not opted in.
+    #[test]
+    fn poll_all_default_yields_nothing() {
+        let mut set = StaticChannelSet::new();
+        set.insert(Box::new(EchoProcessor {
+            name: ChannelName::new(b"echo"),
+        }))
+        .unwrap();
+        set.assign_ids(&[(String::from("echo"), 1004)]);
+
+        let results = set.poll_all(1007).unwrap();
+        assert!(results.is_empty(), "default poll() must yield no frames");
+    }
+
+    /// A processor that opts into the poll seam by returning one message per call.
+    #[derive(Debug)]
+    struct PollyProcessor {
+        name: ChannelName,
+        pending: Vec<Vec<u8>>,
+    }
+
+    impl justrdp_core::AsAny for PollyProcessor {
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
+        }
+    }
+
+    impl SvcProcessor for PollyProcessor {
+        fn channel_name(&self) -> ChannelName {
+            self.name
+        }
+        fn start(&mut self) -> SvcResult<Vec<SvcMessage>> {
+            Ok(Vec::new())
+        }
+        fn process(&mut self, _payload: &[u8]) -> SvcResult<Vec<SvcMessage>> {
+            Ok(Vec::new())
+        }
+        fn poll(&mut self) -> SvcResult<Vec<SvcMessage>> {
+            Ok(self.pending.drain(..).map(SvcMessage::new).collect())
+        }
+    }
+
+    #[test]
+    fn poll_all_drains_overridden_processor() {
+        let mut set = StaticChannelSet::new();
+        set.insert(Box::new(PollyProcessor {
+            name: ChannelName::new(b"polly"),
+            pending: vec![b"hello".to_vec()],
+        }))
+        .unwrap();
+        set.assign_ids(&[(String::from("polly"), 1004)]);
+
+        let results = set.poll_all(1007).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1004);
+        assert!(!results[0].1.is_empty());
+
+        // Second call drains nothing — pending is consumed.
+        let again = set.poll_all(1007).unwrap();
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn poll_all_skips_when_suspended() {
+        let mut set = StaticChannelSet::new();
+        set.insert(Box::new(PollyProcessor {
+            name: ChannelName::new(b"polly"),
+            pending: vec![b"hello".to_vec()],
+        }))
+        .unwrap();
+        set.assign_ids(&[(String::from("polly"), 1004)]);
+
+        // Force suspend
+        let raw = make_channel_data(0, CHANNEL_FLAG_SUSPEND, &[]);
+        set.process_incoming(1004, &raw, 1007).unwrap();
+
+        let results = set.poll_all(1007).unwrap();
+        assert!(
+            results.is_empty(),
+            "suspended channel set must not emit polled frames"
+        );
     }
 
     #[test]
