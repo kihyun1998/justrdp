@@ -125,6 +125,19 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
       info(`[DIAG-key] ime blur`).catch(() => {});
     };
 
+    // Hidden input would otherwise intercept native clipboard / undo
+    // operations and ingest into `input.value` — that ingestion ALSO
+    // overwrites the host OS clipboard (with the empty input value),
+    // breaking CLIPRDR host↔server sync. Keystrokes (Ctrl+C/V/X/Z) still
+    // dispatch to the server through the existing scancode path; the
+    // server uses its own clipboard which CLIPRDR keeps in sync with
+    // host. Suppress the native input behavior so CLIPRDR is the only
+    // clipboard pathway.
+    const onClipboardEvent = (e: Event) => {
+      e.preventDefault();
+      info(`[DIAG-key] suppressed ${e.type}`).catch(() => {});
+    };
+
     // Pointer events instead of mouse events so we can call
     // setPointerCapture on pointerdown — that's what keeps the
     // pointermove + pointerup events flowing to this canvas even
@@ -207,6 +220,9 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
     imeInput.addEventListener("focus", onFocus);
     imeInput.addEventListener("blur", onBlurDiag);
     imeInput.addEventListener("blur", onBlur);
+    imeInput.addEventListener("cut", onClipboardEvent);
+    imeInput.addEventListener("copy", onClipboardEvent);
+    imeInput.addEventListener("paste", onClipboardEvent);
 
     // Pointer / wheel / contextmenu stay on the canvas (the visible
     // surface) — pointer events are not focus-dependent.
@@ -226,6 +242,9 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
       imeInput.removeEventListener("focus", onFocus);
       imeInput.removeEventListener("blur", onBlurDiag);
       imeInput.removeEventListener("blur", onBlur);
+      imeInput.removeEventListener("cut", onClipboardEvent);
+      imeInput.removeEventListener("copy", onClipboardEvent);
+      imeInput.removeEventListener("paste", onClipboardEvent);
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointerup", onPointerUp);
