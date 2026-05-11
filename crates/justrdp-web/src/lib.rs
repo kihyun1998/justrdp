@@ -38,7 +38,7 @@ mod js;
 
 pub use audio::{AudioChannel, AudioChannelError, AudioFrame, AudioState};
 pub use clipboard::{ClipboardChannel, ClipboardChannelError, ClipboardState};
-pub use egfx::GfxRenderer;
+pub use egfx::{GfxRenderer, MutexFrameSink};
 // `WebTransport` family + driver / session pump live in `justrdp-async`
 // since §5.6.1 Phase 1. Re-exported here so existing embedders keep
 // compiling against `justrdp_web::WebClient` etc.

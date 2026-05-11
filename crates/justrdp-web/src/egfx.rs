@@ -20,6 +20,89 @@ use justrdp_graphics::avc::AvcDecoder;
 
 use crate::render::FrameSink;
 
+// `MutexFrameSink` requires `std::sync::Mutex`; behind the alloc + std
+// gate so wasm32 / no_std embedders can still depend on the rest of the
+// module. Tauri (the primary consumer) is std-only.
+extern crate std;
+use std::sync::{Arc, Mutex};
+
+/// `FrameSink` wrapper that locks an inner sink behind an `Arc<Mutex<...>>`.
+///
+/// Useful when two async tasks need to share one sink — for example, the
+/// JustRDP Tauri embedder runs the SVC processor pump (which dispatches
+/// EGFX surface bits through `GfxRenderer`) on a separate task from
+/// `run_session` (which dispatches fast-path Surface Commands through
+/// `BitmapRenderer`). Both write to the same canvas; `MutexFrameSink`
+/// gives both a `FrameSink` handle to the shared `TauriFrameSink`.
+///
+/// Locking pattern: each `FrameSink` method takes the mutex, calls
+/// through, releases. The mutex is uncontended in the common case
+/// (one task at a time during a frame batch).
+pub struct MutexFrameSink<S: FrameSink + Send + 'static> {
+    inner: Arc<Mutex<S>>,
+}
+
+impl<S: FrameSink + Send + 'static> MutexFrameSink<S> {
+    /// Wrap a shared sink. Clone the returned `Arc` to hand the same
+    /// inner sink to multiple tasks.
+    pub fn new(inner: Arc<Mutex<S>>) -> Self {
+        Self { inner }
+    }
+
+    /// Borrow the underlying `Arc<Mutex<S>>` so the embedder can reach
+    /// inner-sink-specific APIs (e.g. `TauriFrameSink::drain_blits`).
+    pub fn arc(&self) -> &Arc<Mutex<S>> {
+        &self.inner
+    }
+}
+
+impl<S: FrameSink + Send + 'static> Clone for MutexFrameSink<S> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner.clone() }
+    }
+}
+
+impl<S: FrameSink + Send + 'static> FrameSink for MutexFrameSink<S> {
+    fn resize(&mut self, width: u16, height: u16) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.resize(width, height);
+        }
+    }
+
+    fn blit_rgba(
+        &mut self,
+        dest_left: u16,
+        dest_top: u16,
+        width: u16,
+        height: u16,
+        pixels_rgba: &[u8],
+    ) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.blit_rgba(dest_left, dest_top, width, height, pixels_rgba);
+        }
+    }
+
+    fn peek_rgba(
+        &mut self,
+        dest_left: u16,
+        dest_top: u16,
+        width: u16,
+        height: u16,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        match self.inner.lock() {
+            Ok(mut s) => s.peek_rgba(dest_left, dest_top, width, height, out),
+            Err(_) => false,
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.flush();
+        }
+    }
+}
+
 /// Per-surface state held by [`GfxRenderer`]. Pixels are stored top-down
 /// RGBA (the format `FrameSink::blit_rgba` expects), regardless of the
 /// surface's wire pixel format — the wire format is normalised at write
@@ -294,6 +377,25 @@ mod tests {
         pixel.iter().copied().cycle().take(w * h * 4).collect()
     }
 
+    /// `MutexFrameSink` forwards every `blit_rgba` call to the inner
+    /// sink behind the shared `Arc<Mutex<...>>`. Two clones writing to
+    /// the same inner sink see merged blits — the contract that lets
+    /// the EGFX SVC pump and `run_session` share one canvas.
+    #[test]
+    fn mutex_frame_sink_forwards_blits_to_shared_inner() {
+        let inner = Arc::new(Mutex::new(CaptureSink::default()));
+        let mut a = MutexFrameSink::new(inner.clone());
+        let mut b = MutexFrameSink::new(inner.clone());
+
+        a.blit_rgba(1, 2, 3, 4, &[0xAA; 48]);
+        b.blit_rgba(10, 20, 30, 40, &[0xBB; 4800]);
+
+        let captured = inner.lock().unwrap();
+        assert_eq!(captured.blits.len(), 2, "both clones write to same sink");
+        assert_eq!(captured.blits[0].0, 1);
+        assert_eq!(captured.blits[1].0, 10);
+    }
+
     /// Tracer-bullet: full data flow through the adapter for the simplest
     /// possible codec (Uncompressed = 0x0000). Proves create_surface +
     /// map_surface_to_output + on_wire_to_surface_1 + on_end_frame
@@ -375,8 +477,6 @@ mod tests {
     }
 
     use justrdp_graphics::avc::{AvcDecoder, AvcError, Yuv420Frame};
-    extern crate std;
-    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct RecordedCalls {

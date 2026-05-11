@@ -26,6 +26,7 @@
 //! channels.
 
 mod audio;
+mod avc;
 mod clipboard;
 mod input;
 mod sink;
@@ -43,11 +44,14 @@ use tauri::{Emitter, Manager, Window};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use justrdp_async::SessionEvent;
+use justrdp_dvc::DrdynvcClient;
+use justrdp_egfx::GfxClient;
 use justrdp_tokio::{AsyncRdpClient, Config, RdpEvent};
-use justrdp_web::{render_event_stateful, BitmapRenderer};
+use justrdp_web::{render_event_stateful, BitmapRenderer, GfxRenderer, MutexFrameSink};
 
+use crate::avc::NoopAvcDecoder;
 use crate::input::{InputAction, InputEvent};
-use crate::sink::{BlitRecord, TauriFrameSink};
+use crate::sink::{BlitRecord, SharedSink, TauriFrameSink};
 use crate::trust::{
     hex_decode_fingerprint, hex_encode_fingerprint, CaptureSpki, TrustStore, TrustStoreVerifier,
 };
@@ -155,6 +159,37 @@ async fn rdp_connect(
         processors.push(clip);
     }
 
+    // PRD #20 / #29: shared canvas state. The EGFX SVC pump (DrdynvcClient
+    // → GfxClient → GfxRenderer below) and `run_session`'s fast-path
+    // renderer both blit into the same `TauriFrameSink`. `SharedSink`
+    // wraps it in `Arc<Mutex<...>>` for thread-safe access; `Notify`
+    // wakes `run_session` to drain pending blits whenever EGFX writes
+    // arrive (fast-path-only sessions still drain inline because each
+    // `next_event` already triggers a drain).
+    let frame_sink = Arc::new(std::sync::Mutex::new(TauriFrameSink::new(
+        DESKTOP_WIDTH,
+        DESKTOP_HEIGHT,
+    )));
+    let drain_notify = Arc::new(tokio::sync::Notify::new());
+
+    // EGFX adapter: GfxRenderer translates RDPGFX_WIRE_TO_SURFACE_PDU_1
+    // payloads into `FrameSink::blit_rgba` calls on `frame_sink`. The
+    // NoopAvcDecoder placeholder lets AVC420 / AVC444 payloads land
+    // somewhere without erroring; the real WebCodecs backend is #26.
+    let mut gfx_renderer = GfxRenderer::new(SharedSink::new(
+        frame_sink.clone(),
+        drain_notify.clone(),
+    ));
+    gfx_renderer.set_avc_decoder(Box::new(NoopAvcDecoder));
+
+    // DRDYNVC SVC processor: hosts the EGFX dynamic channel
+    // (`Microsoft::Windows::RDS::Graphics`). On `Create Request` from
+    // the server, GfxClient reaches `WaitingForCapsConfirm`; cap-confirm
+    // unlocks the surface-bits dispatch loop.
+    let mut drdynvc = DrdynvcClient::new();
+    drdynvc.register(Box::new(GfxClient::with_handler(Box::new(gfx_renderer))));
+    processors.push(Box::new(drdynvc));
+
     // Slice E: TLS verifier choice is feature-gated. Production
     // builds use the TOFU TrustStoreVerifier so an unknown / mismatched
     // SPKI fails the handshake; dev builds with `dev-no-verify` keep
@@ -189,8 +224,19 @@ async fn rdp_connect(
 
     let task_window = window.clone();
     let task_state = state.inner().clone();
+    let task_sink = frame_sink.clone();
+    let task_notify = drain_notify.clone();
     tokio::spawn(async move {
-        run_session(id, client, msg_rx, task_window, task_state).await;
+        run_session(
+            id,
+            client,
+            msg_rx,
+            task_window,
+            task_state,
+            task_sink,
+            task_notify,
+        )
+        .await;
     });
 
     state.sessions.lock().await.insert(id, msg_tx);
@@ -207,8 +253,14 @@ async fn run_session(
     mut msg_rx: mpsc::Receiver<SessionMsg>,
     window: Window,
     state: Arc<AppState>,
+    frame_sink: Arc<std::sync::Mutex<TauriFrameSink>>,
+    drain_notify: Arc<tokio::sync::Notify>,
 ) {
-    let mut sink = TauriFrameSink::new(DESKTOP_WIDTH, DESKTOP_HEIGHT);
+    // Fast-path render uses a `MutexFrameSink` view into the shared
+    // `frame_sink`. The EGFX SVC pump (registered in `rdp_connect`)
+    // writes into the same `Arc<Mutex<TauriFrameSink>>` via its own
+    // `SharedSink`, so both rendering paths land in one canvas.
+    let mut sink = MutexFrameSink::new(frame_sink.clone());
     // Session-scoped renderer state — Drawing Order delta-coding
     // history, bitmap / brush / glyph caches. MUST live as long as
     // the session; resetting it mid-session desynchronises the
@@ -238,6 +290,26 @@ async fn run_session(
     loop {
         tokio::select! {
             biased;
+
+            // PRD #20 / #29: drain blits emitted by the EGFX SVC pump
+            // (which writes into `frame_sink` from a separate task). On
+            // pure-EGFX sessions there are no fast-path events to
+            // trigger the inline drain in the `next_event` arm, so this
+            // notify-driven branch is the only thing keeping the canvas
+            // refreshing. `Notify` is idempotent — multiple back-to-back
+            // EGFX writes coalesce into one drain wake.
+            _ = drain_notify.notified() => {
+                let blits = match frame_sink.lock() {
+                    Ok(mut s) => s.drain_blits(),
+                    Err(_) => continue,
+                };
+                if !blits.is_empty() {
+                    let _ = window.emit(
+                        "rdp:event",
+                        FrontendEvent::Frame { blits },
+                    );
+                }
+            }
 
             msg = msg_rx.recv() => {
                 let Some(msg) = msg else { break };
@@ -270,7 +342,10 @@ async fn run_session(
                         let sev = SessionEvent::Graphics { update_code, data };
                         match render_event_stateful(&sev, &mut sink, &mut renderer) {
                             Ok(true) => {
-                                let blits = sink.drain_blits();
+                                let blits = match frame_sink.lock() {
+                                    Ok(mut s) => s.drain_blits(),
+                                    Err(_) => Vec::new(),
+                                };
                                 if !blits.is_empty() {
                                     let _ = window.emit(
                                         "rdp:event",

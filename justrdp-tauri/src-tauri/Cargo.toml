@@ -62,6 +62,13 @@ justrdp-cliprdr-native = { workspace = true }
 # verifier trait + extract_spki_from_cert_der.
 justrdp-core = { workspace = true, features = ["alloc"] }
 justrdp-tls = { workspace = true }
+# PRD #20 / issue #29: EGFX channel via DRDYNVC. justrdp-dvc carries
+# the DrdynvcClient SVC processor; justrdp-egfx provides GfxClient +
+# the GfxHandler trait that GfxRenderer (justrdp-web::egfx) implements.
+# justrdp-graphics for the AvcDecoder trait (NoopAvcDecoder placeholder).
+justrdp-dvc = { workspace = true, features = ["alloc"] }
+justrdp-egfx = { workspace = true, features = ["alloc"] }
+justrdp-graphics = { workspace = true, features = ["alloc"] }
 
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 base64 = "0.22"

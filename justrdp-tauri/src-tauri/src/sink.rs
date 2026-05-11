@@ -13,8 +13,11 @@
 //! `DSTINVERT` would silently drop their pixels (per the FrameSink
 //! trait docs).
 
+use std::sync::{Arc, Mutex};
+
 use justrdp_web::FrameSink;
 use serde::Serialize;
+use tokio::sync::Notify;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -150,5 +153,69 @@ impl FrameSink for TauriFrameSink {
             out.extend_from_slice(&self.pixels[off..off + w * 4]);
         }
         true
+    }
+}
+
+/// Shared `FrameSink` handle that both the EGFX SVC pump and
+/// `run_session` hold. The `Mutex` lets two async tasks write into the
+/// same `TauriFrameSink` (canvas pixels + pending blits); the `Notify`
+/// wakes `run_session` whenever blits accumulate so the IPC drain loop
+/// runs even when no fast-path event is incoming (pure-EGFX sessions).
+///
+/// PRD #20 / issue #29.
+#[derive(Clone)]
+pub struct SharedSink {
+    inner: Arc<Mutex<TauriFrameSink>>,
+    notify: Arc<Notify>,
+}
+
+impl SharedSink {
+    pub fn new(inner: Arc<Mutex<TauriFrameSink>>, notify: Arc<Notify>) -> Self {
+        Self { inner, notify }
+    }
+}
+
+impl FrameSink for SharedSink {
+    fn resize(&mut self, width: u16, height: u16) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.resize(width, height);
+        }
+    }
+
+    fn blit_rgba(
+        &mut self,
+        dest_left: u16,
+        dest_top: u16,
+        width: u16,
+        height: u16,
+        pixels_rgba: &[u8],
+    ) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.blit_rgba(dest_left, dest_top, width, height, pixels_rgba);
+        }
+        // Idempotent: notify_one stores at most one permit, so multiple
+        // back-to-back blits coalesce into a single drain wake.
+        self.notify.notify_one();
+    }
+
+    fn peek_rgba(
+        &mut self,
+        dest_left: u16,
+        dest_top: u16,
+        width: u16,
+        height: u16,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        match self.inner.lock() {
+            Ok(mut s) => s.peek_rgba(dest_left, dest_top, width, height, out),
+            Err(_) => false,
+        }
+    }
+
+    fn flush(&mut self) {
+        // No-op: TauriFrameSink::flush is itself a no-op (drains happen
+        // explicitly via drain_blits()), but we still notify so the
+        // EGFX pump's `on_end_frame` flush call wakes the drain loop.
+        self.notify.notify_one();
     }
 }
