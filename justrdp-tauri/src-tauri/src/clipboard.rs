@@ -22,28 +22,42 @@
 //! Linux feature wiring is a follow-up slice (same as audio's
 //! Linux PulseAudio gap).
 
+use std::sync::mpsc as stdmpsc;
+
 use justrdp_svc::SvcProcessor;
 
+/// Cross-thread wake signal driven by the platform clipboard listener
+/// thread (Win32 `WM_CLIPBOARDUPDATE` today; macOS / Linux follow-ups).
+/// Each `()` pushed by the listener tells the session loop to call
+/// `AsyncRdpClient::poll_outbound` and drain queued `FormatList` PDUs.
+///
+/// Using `std::sync::mpsc` (not `tokio::mpsc`) because the listener
+/// thread is a blocking thread, not an async task — the send-side
+/// must work without an async runtime. The Tauri session loop bridges
+/// it into tokio via `tokio::task::spawn_blocking`.
+pub type ClipboardWake = stdmpsc::Receiver<()>;
+
 /// Build an SVC processor that bridges the host OS clipboard and
-/// the remote one in both directions, if the current platform has
-/// a backend available. `None` on platforms without a wired
-/// surface so the embedder registers a clipboard-less session
-/// without conditional code at the call site.
+/// the remote one in both directions, plus the wake receiver that the
+/// session loop uses to know when to drain outbound. `None` on
+/// platforms without a wired surface so the embedder registers a
+/// clipboard-less session without conditional code at the call site.
 #[cfg(any(windows, target_os = "macos"))]
-pub fn new_platform_clipboard_processor() -> Option<Box<dyn SvcProcessor>> {
+pub fn new_platform_clipboard_processor() -> Option<(Box<dyn SvcProcessor>, ClipboardWake)> {
     use justrdp_cliprdr::CliprdrClient;
     use justrdp_cliprdr_native::NativeClipboard;
 
-    let clip = NativeClipboard::new().ok()?;
+    let (wake_tx, wake_rx) = stdmpsc::channel::<()>();
+    let clip = NativeClipboard::new_with_listener(wake_tx).ok()?;
     let client = CliprdrClient::new(Box::new(clip));
-    Some(Box::new(client))
+    Some((Box::new(client), wake_rx))
 }
 
 /// Linux without the `x11` or `wayland` feature on
 /// `justrdp-cliprdr-native`: no native surface, clipboard channel
 /// is omitted from the session. The session continues normally.
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn new_platform_clipboard_processor() -> Option<Box<dyn SvcProcessor>> {
+pub fn new_platform_clipboard_processor() -> Option<(Box<dyn SvcProcessor>, ClipboardWake)> {
     None
 }
 
@@ -52,16 +66,17 @@ mod tests {
     use super::*;
 
     /// Pin the platform-conditional contract: Windows / macOS yield
-    /// a backend; Linux without the feature yields None. Mirrors
+    /// a (backend, wake_rx) pair; Linux without the feature yields
+    /// None. Mirrors
     /// `audio::tests::returns_some_on_windows_and_none_elsewhere`.
     #[test]
     fn returns_some_on_windows_macos_and_none_elsewhere() {
-        let processor = new_platform_clipboard_processor();
+        let result = new_platform_clipboard_processor();
 
         #[cfg(any(windows, target_os = "macos"))]
-        assert!(processor.is_some(), "Windows/macOS build should yield a backend");
+        assert!(result.is_some(), "Windows/macOS build should yield a backend");
 
         #[cfg(not(any(windows, target_os = "macos")))]
-        let _ = processor;
+        let _ = result;
     }
 }

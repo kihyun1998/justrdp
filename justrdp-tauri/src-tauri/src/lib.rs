@@ -183,14 +183,15 @@ async fn rdp_connect(
     if let Some(audio) = audio_processor {
         processors.push(audio);
     }
-    let clipboard_processor = clipboard::new_platform_clipboard_processor();
+    let clipboard_pair = clipboard::new_platform_clipboard_processor();
     log::info!(
         "[DIAG-clip] clipboard backend registered = {}",
-        clipboard_processor.is_some()
+        clipboard_pair.is_some()
     );
-    if let Some(clip) = clipboard_processor {
+    let clipboard_wake = clipboard_pair.map(|(clip, wake)| {
         processors.push(clip);
-    }
+        wake
+    });
 
     // PRD #20 / #29: shared canvas state. The EGFX SVC pump (DrdynvcClient
     // → GfxClient → GfxRenderer below) and `run_session`'s fast-path
@@ -271,6 +272,7 @@ async fn rdp_connect(
     let task_sink = frame_sink.clone();
     let task_notify = drain_notify.clone();
     let task_channel = frame_channel.clone();
+    let task_clipboard_wake = clipboard_wake;
     tokio::spawn(async move {
         run_session(
             id,
@@ -281,6 +283,7 @@ async fn rdp_connect(
             task_sink,
             task_notify,
             task_channel,
+            task_clipboard_wake,
         )
         .await;
     });
@@ -302,7 +305,30 @@ async fn run_session(
     frame_sink: Arc<std::sync::Mutex<TauriFrameSink>>,
     drain_notify: Arc<tokio::sync::Notify>,
     frame_channel: Channel<InvokeResponseBody>,
+    clipboard_wake: Option<crate::clipboard::ClipboardWake>,
 ) {
+    // The Win32 clipboard listener uses std::sync::mpsc (it lives on a
+    // blocking thread with no async runtime). Bridge it into tokio by
+    // forwarding each `()` through a tokio mpsc so the session select!
+    // can await it. `spawn_blocking` keeps the std-side recv off the
+    // tokio worker thread; when the std sender is dropped (listener
+    // teardown), the forwarder exits and the tokio receiver closes,
+    // which gracefully removes the select arm.
+    let mut clipboard_wake_tokio: Option<tokio::sync::mpsc::Receiver<()>> =
+        match clipboard_wake {
+            Some(rx) => {
+                let (tx, rx_tokio) = tokio::sync::mpsc::channel::<()>(8);
+                tokio::task::spawn_blocking(move || {
+                    while rx.recv().is_ok() {
+                        if tx.blocking_send(()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                Some(rx_tokio)
+            }
+            None => None,
+        };
     // Fast-path render uses a `MutexFrameSink` view into the shared
     // `frame_sink`. The EGFX SVC pump (registered in `rdp_connect`)
     // writes into the same `Arc<Mutex<TauriFrameSink>>` via its own
@@ -335,8 +361,29 @@ async fn run_session(
     let mut cursor_cache = justrdp_cursor::CursorCache::new();
 
     loop {
+        // Future that yields `Some(())` on a clipboard wake and never
+        // resolves when the listener is absent — keeps the select arm
+        // dormant on platforms without a clipboard backend.
+        let clipboard_wake_fut = async {
+            match clipboard_wake_tokio.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending::<Option<()>>().await,
+            }
+        };
+
         tokio::select! {
             biased;
+
+            // CLIPRDR host→server outbound (#34): Win32 listener thread
+            // pushed a wake. Drain queued FormatList through the SVC
+            // poll_outbound seam. Errors are logged but non-fatal — a
+            // failed clipboard sync should not terminate the session.
+            Some(()) = clipboard_wake_fut => {
+                log::info!("[DIAG-clip] clipboard wake → poll_outbound");
+                if let Err(e) = client.poll_outbound().await {
+                    log::warn!("[DIAG-clip] poll_outbound err: {e:?}");
+                }
+            }
 
             // PRD #20 / #29: drain blits emitted by the EGFX SVC pump
             // (which writes into `frame_sink` from a separate task). On

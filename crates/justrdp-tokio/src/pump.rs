@@ -111,6 +111,13 @@ pub(crate) enum Command {
     Disconnect {
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    /// Drain host-side asynchronous outbound from every SVC processor.
+    /// Fired by the embedder when its wake source (CLIPRDR listener,
+    /// future RDPDR / RDPSND outbound) signals there is work to flush.
+    /// See `ActiveSession::poll_outbound` (justrdp-async).
+    PollOutbound {
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
 }
 
 /// Run the async pump until the session ends.
@@ -304,6 +311,10 @@ async fn handle_input(
         }
         Command::SendSynchronize { lock_keys, reply } => {
             let r = session.send_synchronize(lock_keys).await;
+            send_reply(reply, r)
+        }
+        Command::PollOutbound { reply } => {
+            let r = session.poll_outbound().await;
             send_reply(reply, r)
         }
         Command::Disconnect { .. } => {

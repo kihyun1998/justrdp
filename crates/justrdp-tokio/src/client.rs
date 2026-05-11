@@ -227,6 +227,17 @@ impl AsyncRdpClient {
         self.evt_rx.recv().await
     }
 
+    /// Tell the pump to drain host-side asynchronous outbound from every
+    /// registered SVC processor (CLIPRDR Win32 clipboard listener, future
+    /// RDPDR / RDPSND outbound, …). Returns `Ok(())` whether or not any
+    /// frames were emitted — an empty drain is the steady-state shape.
+    ///
+    /// Wired from the Tauri session loop into the `clipboard::wake_rx`
+    /// channel populated by the Win32 listener thread (slice 5/5 of #34).
+    pub async fn poll_outbound(&self) -> Result<(), RuntimeError> {
+        self.dispatch(|reply| Command::PollOutbound { reply }).await
+    }
+
     /// Send a raw scancode keyboard event.
     pub async fn send_keyboard(
         &self,

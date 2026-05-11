@@ -2284,9 +2284,11 @@ version = "0.1.0"
 dependencies = [
  "clipboard-win",
  "justrdp-cliprdr",
+ "log",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "windows-sys 0.59.0",
  "wl-clipboard-rs",
  "x11-clipboard",
 ]
