@@ -17,9 +17,17 @@ wayland = ["dep:wl-clipboard-rs"]
 
 [dependencies]
 justrdp-cliprdr = { workspace = true, features = ["std"] }
+log = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11-clipboard = { version = "0.9", optional = true }

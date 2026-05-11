@@ -65,6 +65,16 @@ pub trait NativeClipboardSurface: Send {
     /// Write an image (as DIB bytes) to the OS clipboard, replacing any
     /// existing content.
     fn write_image(&mut self, dib: &[u8]) -> NativeClipboardResult<()>;
+
+    /// Consume any "host clipboard changed since last call" signal the
+    /// platform listener has accumulated.
+    ///
+    /// Returns `true` if the OS clipboard has changed since the previous
+    /// call and the wrapper should announce a new `FormatList` to the
+    /// server. Default `false` for surfaces without a listener.
+    fn poll_change(&mut self) -> bool {
+        false
+    }
 }
 
 /// File metadata as the **Native surface** sees it.

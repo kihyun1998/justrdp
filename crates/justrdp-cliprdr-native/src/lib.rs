@@ -52,7 +52,7 @@ use justrdp_cliprdr::{
 
 use crate::common::{
     accept_supported_format_list, is_image_format, is_text_format, looks_like_dib,
-    rdp_bytes_to_utf8, utf8_to_rdp, CF_DIB,
+    rdp_bytes_to_utf8, utf8_to_rdp, CF_DIB, CF_TEXT, CF_UNICODETEXT,
 };
 
 // ── Default platform surface ───────────────────────────────────────────────
@@ -100,10 +100,43 @@ pub struct NativeClipboard<S: NativeClipboardSurface = PlatformClipboard> {
 }
 
 impl NativeClipboard<PlatformClipboard> {
-    /// Create with the platform's default clipboard surface.
+    /// Create with the platform's default clipboard surface (no listener).
+    ///
+    /// Suitable for embedders that only need server→host paste; host→server
+    /// outbound stays silent. Use [`NativeClipboard::new_with_listener`] to
+    /// enable bidirectional sync.
     pub fn new() -> Result<Self, ClipboardError> {
         let surface = PlatformClipboard::new()?;
         Ok(Self { surface })
+    }
+
+    /// Create with a host-clipboard-change listener wired to `wake_tx`.
+    ///
+    /// Each time the OS clipboard changes the platform surface raises an
+    /// internal "changed" flag and pushes `()` to `wake_tx`. The session
+    /// loop selects on that receiver to wake `SvcProcessor::poll` so the
+    /// queued `FormatList` can reach the server. Slice 3/5 of #34.
+    ///
+    /// Currently only the Windows surface implements an actual listener;
+    /// macOS / Linux constructors fall back to listener-less mode and
+    /// return without error.
+    #[cfg(target_os = "windows")]
+    pub fn new_with_listener(
+        wake_tx: std::sync::mpsc::Sender<()>,
+    ) -> Result<Self, ClipboardError> {
+        let surface = PlatformClipboard::new_with_listener(wake_tx)?;
+        Ok(Self { surface })
+    }
+
+    /// Listener-mode shim for non-Windows builds: falls back to a
+    /// listener-less surface so the same Tauri call site compiles on
+    /// every supported platform. macOS / Linux listeners land in a
+    /// follow-up slice.
+    #[cfg(not(target_os = "windows"))]
+    pub fn new_with_listener(
+        _wake_tx: std::sync::mpsc::Sender<()>,
+    ) -> Result<Self, ClipboardError> {
+        Self::new()
     }
 }
 
@@ -194,6 +227,19 @@ impl<S: NativeClipboardSurface> CliprdrBackend for NativeClipboard<S> {
         if let Some(text) = rdp_bytes_to_utf8(data) {
             let _ = self.surface.write_text(&text);
         }
+    }
+
+    fn take_pending_outbound(&mut self) -> Vec<LongFormatName> {
+        if !self.surface.poll_change() {
+            return Vec::new();
+        }
+        // Text-only outbound for this slice — image outbound enumeration of
+        // OS clipboard formats lands in a follow-up. Empty format_name is
+        // valid for both long-name and short-name (re-encoded) variants.
+        vec![
+            LongFormatName::new(CF_UNICODETEXT, String::new()),
+            LongFormatName::new(CF_TEXT, String::new()),
+        ]
     }
 
     // on_file_contents_request / response, on_lock / unlock use trait defaults
