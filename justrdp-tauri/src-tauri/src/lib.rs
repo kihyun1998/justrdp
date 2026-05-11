@@ -237,6 +237,17 @@ async fn rdp_connect(
         .map_err(|e| format!("connect failed: {e}"))?
     };
 
+    // [DIAG-egfx] which static channels actually got an MCS id from
+    // the server. If `drdynvc` is absent, the EGFX channel cannot
+    // possibly open — server rejected our advertise (likely a GPO /
+    // capset mismatch on Win Server 2019). If `drdynvc` is present
+    // but no `[DIAG-egfx] on_create_surface` lines follow, server
+    // accepted DRDYNVC but did not initiate `Microsoft::Windows::RDS::Graphics`.
+    log::info!(
+        "[DIAG-egfx] post-handshake channel_ids = {:?}",
+        client.channel_ids()
+    );
+
     let id = state.next_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (msg_tx, msg_rx) = mpsc::channel::<SessionMsg>(64);
 

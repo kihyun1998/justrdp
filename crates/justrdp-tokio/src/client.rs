@@ -95,6 +95,12 @@ pub struct AsyncRdpClient {
     /// Negotiated `codec_id` for NSCodec (MS-RDPNSC). Per spec this
     /// MUST be `0x01` when present; the server cannot reassign it.
     nscodec_codec_id: Option<u8>,
+    /// `(name, mcs_channel_id)` for every static virtual channel the
+    /// server allocated. Mirror of [`ConnectionResult::channel_ids`].
+    /// Useful for embedders to log which channels actually got an MCS
+    /// id (`drdynvc`, `rdpsnd`, `cliprdr`, …) — silent absence usually
+    /// means the channel name was not advertised in `Config`.
+    channel_ids: Vec<(String, u16)>,
 }
 
 impl AsyncRdpClient {
@@ -209,6 +215,12 @@ impl AsyncRdpClient {
     /// negotiated. Pass to `BitmapRenderer::set_nscodec_codec_id`.
     pub fn nscodec_codec_id(&self) -> Option<u8> {
         self.nscodec_codec_id
+    }
+
+    /// Static virtual channels allocated by the server for this
+    /// session. See [`Self::channel_ids`] field doc.
+    pub fn channel_ids(&self) -> &[(String, u16)] {
+        &self.channel_ids
     }
 
     pub async fn next_event(&mut self) -> Option<Result<RdpEvent, RuntimeError>> {
@@ -389,6 +401,7 @@ where
 
     let rfx_codec_id = result.rfx_codec_id;
     let nscodec_codec_id = result.nscodec_codec_id;
+    let channel_ids = result.channel_ids.clone();
     let pump = tokio::spawn(pump::pump(session, cmd_rx, evt_tx));
 
     Ok(AsyncRdpClient {
@@ -397,6 +410,7 @@ where
         pump: Some(pump),
         rfx_codec_id,
         nscodec_codec_id,
+        channel_ids,
     })
 }
 
