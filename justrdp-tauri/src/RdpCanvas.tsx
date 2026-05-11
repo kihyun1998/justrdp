@@ -1,5 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { info } from "@tauri-apps/plugin-log";
 import { keyEventToScancode } from "./keymap";
 
 interface RdpCanvasProps {
@@ -14,9 +15,16 @@ interface RdpCanvasProps {
 }
 
 /**
- * Interactive RDP surface. Owns the canvas DOM node's keyboard,
- * mouse, wheel, and blur listeners and forwards them to the backend
- * via the `rdp_send_input` Tauri command.
+ * Interactive RDP surface. Owns the canvas + a sibling hidden `<input>`
+ * for IME composition input.
+ *
+ * **Why the hidden input** — `<canvas>` is not an IME composition target
+ * per HTML spec, so OS-level IMEs (Korean / Japanese / Chinese / AltGr)
+ * swallow keydown without firing `compositionstart`. Apache Guacamole
+ * uses the same pattern. Pointer-down focuses the hidden input; ASCII
+ * keydowns dispatch via the existing scancode path; on `compositionend`
+ * the final text is decomposed into Unicode codepoints and dispatched
+ * through `InputEvent::Unicode`.
  *
  * Held-key tracking: every key currently in `keydown` state is kept
  * in a Set so a `blur` event can synthesise `keyup`s for all of them
@@ -24,9 +32,12 @@ interface RdpCanvasProps {
  * stay logically pressed on the remote and break the next session.
  */
 export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProps) {
+  const imeInputRef = useRef<HTMLInputElement>(null);
+
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const imeInput = imeInputRef.current;
+    if (!canvas || !imeInput) return;
 
     const heldKeys = new Set<string>();
     let mouseX = 0;
@@ -48,13 +59,23 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
-      // Suppress browser auto-repeat — the remote OS handles repeat
-      // itself. Without this the wire fills with redundant keydowns.
+      // [DIAG-key]
+      const sc = keyEventToScancode(e.code);
+      info(
+        `[DIAG-key] keydown code=${e.code} key=${e.key} isComposing=${e.isComposing} repeat=${e.repeat} sc=${sc ? "0x" + sc.code.toString(16) + (sc.extended ? "+ext" : "") : "null"}`,
+      ).catch(() => {});
+      // Suppress browser auto-repeat — the remote OS handles repeat.
       if (e.repeat) {
         e.preventDefault();
         return;
       }
-      const sc = keyEventToScancode(e.code);
+      // During IME composition, swallow scancode dispatch — the
+      // resulting text arrives via `compositionend` as Unicode chars.
+      // Chromium also surfaces in-composition keydowns with `keyCode==229`
+      // or `code=="Process"`; either marker means defer to composition.
+      if (e.isComposing || e.keyCode === 229 || e.code === "Process") {
+        return;
+      }
       if (sc) {
         e.preventDefault();
         heldKeys.add(e.code);
@@ -64,6 +85,9 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
 
     const onKeyUp = (e: KeyboardEvent) => {
       const sc = keyEventToScancode(e.code);
+      info(
+        `[DIAG-key] keyup code=${e.code} key=${e.key} sc=${sc ? "0x" + sc.code.toString(16) : "null"}`,
+      ).catch(() => {});
       if (sc) {
         e.preventDefault();
         heldKeys.delete(e.code);
@@ -71,13 +95,40 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
       }
     };
 
+    const onCompositionStart = (e: CompositionEvent) => {
+      info(`[DIAG-key] compositionstart data=${JSON.stringify(e.data)}`).catch(() => {});
+    };
+    const onCompositionUpdate = (e: CompositionEvent) => {
+      info(`[DIAG-key] compositionupdate data=${JSON.stringify(e.data)}`).catch(() => {});
+    };
+    const onCompositionEnd = (e: CompositionEvent) => {
+      const text = e.data || "";
+      info(
+        `[DIAG-key] compositionend data=${JSON.stringify(text)} chars=${[...text].length}`,
+      ).catch(() => {});
+      // Iterate Unicode code points (handles surrogate-pair emoji etc.;
+      // Rust side will reject supplementary plane with NonBmpUnicode but
+      // the iteration itself is correct).
+      for (const ch of text) {
+        const cp = ch.codePointAt(0);
+        if (cp === undefined) continue;
+        sendInput({ kind: "unicode", codepoint: cp, pressed: true });
+        sendInput({ kind: "unicode", codepoint: cp, pressed: false });
+      }
+      // Clear so subsequent compositions start from empty value.
+      imeInput.value = "";
+    };
+    const onFocus = () => {
+      info(`[DIAG-key] ime focus`).catch(() => {});
+    };
+    const onBlurDiag = () => {
+      info(`[DIAG-key] ime blur`).catch(() => {});
+    };
+
     // Pointer events instead of mouse events so we can call
     // setPointerCapture on pointerdown — that's what keeps the
     // pointermove + pointerup events flowing to this canvas even
-    // when the cursor leaves the canvas's bounding box. Without
-    // capture, dragging a remote window's resize handle past the
-    // canvas edge silently drops the trailing pointermove + the
-    // pointerup, leaving the remote stuck mid-drag.
+    // when the cursor leaves the canvas's bounding box.
     const onPointerMove = (e: PointerEvent) => {
       mouseX = clampX(e.clientX);
       mouseY = clampY(e.clientY);
@@ -85,9 +136,9 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
     };
 
     const onPointerDown = (e: PointerEvent) => {
-      // Capture the pointer so further events flow to us even when
-      // the cursor exits the canvas. Released automatically on
-      // pointerup or pointercancel.
+      // Focus the hidden IME input (NOT the canvas) so IME context is
+      // valid + keydown / composition events flow to our handlers.
+      imeInput.focus();
       try {
         canvas.setPointerCapture(e.pointerId);
       } catch {
@@ -104,8 +155,6 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
       mouseX = clampX(e.clientX);
       mouseY = clampY(e.clientY);
       sendInput({ kind: "mouse_button", button: e.button, pressed: false, x: mouseX, y: mouseY });
-      // setPointerCapture's release happens automatically on
-      // pointerup, but be explicit in case the runtime missed it.
       if (canvas.hasPointerCapture(e.pointerId)) {
         canvas.releasePointerCapture(e.pointerId);
       }
@@ -113,9 +162,6 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
     };
 
     const onPointerCancel = (e: PointerEvent) => {
-      // OS revoked capture (e.g. system gesture took over). Treat
-      // as button release so the remote does not see a stuck
-      // button.
       sendInput({
         kind: "mouse_button",
         button: e.button,
@@ -126,10 +172,6 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
     };
 
     const onWheel = (e: WheelEvent) => {
-      // Browsers report deltaY positive = "scroll content down",
-      // which on an RDP wire means "wheel rotated *toward* user".
-      // Negate so positive wheel delta = away (matches Windows
-      // WHEEL_DELTA convention).
       const horizontal = Math.abs(e.deltaX) > Math.abs(e.deltaY);
       const raw = horizontal ? e.deltaX : e.deltaY;
       const delta = Math.max(-32768, Math.min(32767, -Math.round(raw)));
@@ -138,8 +180,8 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
     };
 
     const onBlur = () => {
-      // Snapshot before the loop because each sendInput is async
-      // (fire-and-forget) but we mutate the set right here.
+      // Release every held physical key so a held Shift / Ctrl during
+      // an Alt-Tab away does not stay logically pressed on the remote.
       const held = Array.from(heldKeys);
       heldKeys.clear();
       for (const code of held) {
@@ -156,36 +198,75 @@ export function RdpCanvas({ sessionId, canvasRef, width, height }: RdpCanvasProp
       e.preventDefault();
     };
 
-    canvas.addEventListener("keydown", onKeyDown);
-    canvas.addEventListener("keyup", onKeyUp);
+    // Keyboard + composition listeners attach to the hidden IME input.
+    imeInput.addEventListener("keydown", onKeyDown);
+    imeInput.addEventListener("keyup", onKeyUp);
+    imeInput.addEventListener("compositionstart", onCompositionStart);
+    imeInput.addEventListener("compositionupdate", onCompositionUpdate);
+    imeInput.addEventListener("compositionend", onCompositionEnd);
+    imeInput.addEventListener("focus", onFocus);
+    imeInput.addEventListener("blur", onBlurDiag);
+    imeInput.addEventListener("blur", onBlur);
+
+    // Pointer / wheel / contextmenu stay on the canvas (the visible
+    // surface) — pointer events are not focus-dependent.
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointerup", onPointerUp);
     canvas.addEventListener("pointercancel", onPointerCancel);
     canvas.addEventListener("wheel", onWheel, { passive: false });
-    canvas.addEventListener("blur", onBlur);
     canvas.addEventListener("contextmenu", onContextMenu);
 
     return () => {
-      canvas.removeEventListener("keydown", onKeyDown);
-      canvas.removeEventListener("keyup", onKeyUp);
+      imeInput.removeEventListener("keydown", onKeyDown);
+      imeInput.removeEventListener("keyup", onKeyUp);
+      imeInput.removeEventListener("compositionstart", onCompositionStart);
+      imeInput.removeEventListener("compositionupdate", onCompositionUpdate);
+      imeInput.removeEventListener("compositionend", onCompositionEnd);
+      imeInput.removeEventListener("focus", onFocus);
+      imeInput.removeEventListener("blur", onBlurDiag);
+      imeInput.removeEventListener("blur", onBlur);
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointerup", onPointerUp);
       canvas.removeEventListener("pointercancel", onPointerCancel);
       canvas.removeEventListener("wheel", onWheel);
-      canvas.removeEventListener("blur", onBlur);
       canvas.removeEventListener("contextmenu", onContextMenu);
     };
   }, [sessionId, canvasRef, width, height]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      width={width}
-      height={height}
-      className="rdp-canvas"
-      tabIndex={0}
-    />
+    <div className="rdp-canvas-wrapper" style={{ position: "relative", width, height }}>
+      <canvas
+        ref={canvasRef}
+        width={width}
+        height={height}
+        className="rdp-canvas"
+      />
+      <input
+        ref={imeInputRef}
+        className="rdp-ime-input"
+        type="text"
+        autoComplete="off"
+        autoCorrect="off"
+        autoCapitalize="off"
+        spellCheck={false}
+        // `pointerEvents: none` lets clicks fall through to the canvas
+        // beneath; canvas's pointerdown handler explicitly focuses this
+        // input. `opacity: 0` + tiny size + transparent caret hide it.
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: 1,
+          height: 1,
+          opacity: 0,
+          border: 0,
+          outline: "none",
+          caretColor: "transparent",
+          pointerEvents: "none",
+        }}
+      />
+    </div>
   );
 }

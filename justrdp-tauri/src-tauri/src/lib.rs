@@ -539,7 +539,22 @@ async fn run_session(
 }
 
 async fn dispatch_input(client: &AsyncRdpClient, event: InputEvent) -> Result<(), String> {
-    let action = input::translate(event).map_err(|e| format!("translate: {e:?}"))?;
+    let action = match input::translate(event) {
+        Ok(a) => a,
+        Err(e) => {
+            log::info!("[DIAG-key] rust.translate_err {:?}", e);
+            return Err(format!("translate: {e:?}"));
+        }
+    };
+    // Mirror only key events into the diag log — other input types are
+    // already in the [DIAG-perf] perf log indirectly.
+    if let InputAction::Key { scancode, pressed } = &action {
+        log::info!(
+            "[DIAG-key] rust.dispatch Key sc=0x{:02x} pressed={}",
+            scancode.code,
+            pressed
+        );
+    }
     let r = match action {
         InputAction::Key { scancode, pressed } => client.send_keyboard(scancode, pressed).await,
         InputAction::MouseMove { x, y } => client.send_mouse_move(x, y).await,
@@ -551,6 +566,9 @@ async fn dispatch_input(client: &AsyncRdpClient, event: InputEvent) -> Result<()
         }
         InputAction::Unicode { ch, pressed } => client.send_unicode(ch, pressed).await,
     };
+    if let Err(e) = &r {
+        log::info!("[DIAG-key] rust.send_err {}", e);
+    }
     r.map_err(|e| e.to_string())
 }
 
