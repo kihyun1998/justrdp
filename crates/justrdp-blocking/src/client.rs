@@ -1519,6 +1519,58 @@ impl RdpClient {
         self.send_input_events(&[event])
     }
 
+    /// Drain host-side asynchronous outbound from every SVC processor and
+    /// push the resulting frames onto the transport.
+    ///
+    /// Companion of [`Self::next_event`] for the host→server direction.
+    /// The blocking client doesn't own a wake source — callers signalling
+    /// host-side events (the CLIPRDR Win32 listener, etc.) drive this
+    /// method directly when they observe their own wake channel.
+    ///
+    /// `Ok(())` is returned whether or not any frames were emitted; an
+    /// empty drain is the common steady-state shape.
+    ///
+    /// Used by the CLIPRDR host→server outbound path (#34, slice 4/5).
+    pub fn poll_outbound(&mut self) -> Result<(), RuntimeError> {
+        if self.disconnected {
+            return Err(RuntimeError::Disconnected);
+        }
+        let transport = self
+            .transport
+            .as_mut()
+            .ok_or(RuntimeError::Disconnected)?;
+        let polled = self
+            .svc_set
+            .poll_all(self.user_channel_id)
+            .map_err(|e| {
+                RuntimeError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("SVC poll_outbound failed: {e:?}"),
+                ))
+            })?;
+        let mut n_frames = 0usize;
+        let mut total_bytes = 0usize;
+        for (_chan_id, frames) in polled {
+            for frame in frames {
+                total_bytes += frame.len();
+                n_frames += 1;
+                transport.write_all(&frame).map_err(RuntimeError::Io)?;
+            }
+        }
+        if n_frames > 0 {
+            transport.flush().map_err(RuntimeError::Io)?;
+            info!(
+                n_frames,
+                total_bytes,
+                "[DIAG-svc] poll_outbound emitted frames"
+            );
+        }
+        // Touch the counters so the no-tracing build (where `info!` expands
+        // to nothing) doesn't warn about unused assignments.
+        let _ = (n_frames, total_bytes);
+        Ok(())
+    }
+
     /// Encode and write a batch of fast-path input events to the transport.
     ///
     /// Pre-condition: the session must be active. After a disconnect this

@@ -244,6 +244,39 @@ impl<T: WebTransport> ActiveSession<T> {
         Ok(translation.events)
     }
 
+    /// Drain host-side asynchronous outbound from every SVC processor and
+    /// push the resulting frames onto the transport.
+    ///
+    /// This is the host→server companion to [`Self::next_events`]. The
+    /// session does not own a wake source itself (the runtime is
+    /// agnostic — tokio mpsc, std mpsc, async-std channel, etc.); the
+    /// embedder selects on its own wake receiver and calls this whenever
+    /// a wake-up arrives. A wake with no pending outbound is a cheap
+    /// no-op — `poll_all` returns an empty list and no I/O happens.
+    ///
+    /// Used by the CLIPRDR host→server outbound path (#34, slice 4/5).
+    pub async fn poll_outbound(&mut self) -> Result<(), DriverError> {
+        let polled = self
+            .svc_set
+            .poll_all(self.user_channel_id)
+            .map_err(|e| DriverError::Channel(format!("{e:?}")))?;
+        let mut n_frames = 0usize;
+        let mut total_bytes = 0usize;
+        for (_chan_id, frames) in polled {
+            for frame in frames {
+                total_bytes += frame.len();
+                n_frames += 1;
+                self.transport.send(&frame).await?;
+            }
+        }
+        if n_frames > 0 {
+            log::info!(
+                "[DIAG-svc] poll_outbound emitted n_frames={n_frames} total_bytes={total_bytes}"
+            );
+        }
+        Ok(())
+    }
+
     /// Encode and send a batch of fast-path input events (keyboard,
     /// mouse). The encoder lives in `justrdp-session`; we just frame and
     /// forward.
