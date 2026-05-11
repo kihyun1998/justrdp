@@ -17,6 +17,7 @@ use core::any::Any;
 use justrdp_core::AsAny;
 use justrdp_egfx::{GfxColor32, GfxHandler, GfxMonitorDef, GfxPixelFormat, GfxRect16};
 use justrdp_graphics::avc::AvcDecoder;
+use justrdp_graphics::clearcodec::ClearCodecDecoder;
 
 use crate::render::FrameSink;
 
@@ -132,6 +133,11 @@ pub struct GfxRenderer<S: FrameSink + Send + 'static> {
     /// drops silently. The real WebCodecs-backed implementation is
     /// PRD #20 / #26.
     avc_decoder: Option<Box<dyn AvcDecoder>>,
+    /// Lazy-initialised ClearCodec decoder. Created on first 0x0008
+    /// dispatch so adapters that never see ClearCodec pay no cost.
+    /// Stateful (glyph cache + VBar caches per MS-RDPEGFX §2.2.4) —
+    /// the `&mut self` carries forward across calls.
+    clearcodec_decoder: Option<ClearCodecDecoder>,
 }
 
 impl<S: FrameSink + Send + 'static> GfxRenderer<S> {
@@ -141,6 +147,7 @@ impl<S: FrameSink + Send + 'static> GfxRenderer<S> {
             sink,
             surfaces: BTreeMap::new(),
             avc_decoder: None,
+            clearcodec_decoder: None,
         }
     }
 
@@ -235,6 +242,33 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
             0x0000 => {
                 composite_uncompressed_bgra_to_rgba(surface, dest_rect, bitmap_data);
             }
+            // ClearCodec — text + UI chrome codec, MS-RDPEGFX §2.2.4.
+            // Decoder returns BGR (3 bytes/pixel); convert to RGBA at
+            // composite time. Decoder is stateful (glyph + VBar caches
+            // across calls) so we lazy-init on first 0x0008 hit.
+            0x0008 => {
+                let rect_w = dest_rect.right.saturating_sub(dest_rect.left);
+                let rect_h = dest_rect.bottom.saturating_sub(dest_rect.top);
+                if rect_w == 0 || rect_h == 0 {
+                    return;
+                }
+                if self.clearcodec_decoder.is_none() {
+                    self.clearcodec_decoder = Some(ClearCodecDecoder::new());
+                }
+                let decoder = self
+                    .clearcodec_decoder
+                    .as_mut()
+                    .expect("just initialized above");
+                match decoder.decode(bitmap_data, rect_w, rect_h) {
+                    Ok(bgr) => {
+                        composite_bgr_to_rgba(surface, dest_rect, &bgr);
+                    }
+                    Err(_) => {
+                        // Decode failure — drop the chunk silently.
+                        // Production embedders may want to log here.
+                    }
+                }
+            }
             // AVC420 / AVC444 / AVC444V2 — feed the raw bitmap_data to
             // the registered AvcDecoder. The decoder is responsible for
             // unwrapping the EGFX AVC envelope (RDPGFX_AVC420_BITMAP_STREAM
@@ -300,6 +334,47 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
         // Default: ack with queue depth 0 (no backpressure signal).
         Some(0)
     }
+}
+
+/// Composite raw BGR pixel bytes (3 bytes/pixel, no alpha) into the
+/// surface's RGBA buffer at `dest_rect`. Per-pixel BGR→RGB swap with
+/// alpha forced to `0xFF`. Used by the ClearCodec dispatch arm — its
+/// decoder produces `width*height*3` bytes of BGR pixels.
+fn composite_bgr_to_rgba(
+    surface: &mut SurfaceState,
+    dest_rect: GfxRect16,
+    bgr: &[u8],
+) {
+    let rect_w = dest_rect.right.saturating_sub(dest_rect.left);
+    let rect_h = dest_rect.bottom.saturating_sub(dest_rect.top);
+    if rect_w == 0 || rect_h == 0 {
+        return;
+    }
+    let stride = usize::from(surface.width) * 4;
+    for row in 0..rect_h {
+        let src_row_off = usize::from(row) * usize::from(rect_w) * 3;
+        let dst_y = usize::from(dest_rect.top) + usize::from(row);
+        if dst_y >= usize::from(surface.height) {
+            break;
+        }
+        let dst_row_off = dst_y * stride + usize::from(dest_rect.left) * 4;
+        for col in 0..rect_w {
+            let src_off = src_row_off + usize::from(col) * 3;
+            let dst_off = dst_row_off + usize::from(col) * 4;
+            if src_off + 3 > bgr.len() {
+                break;
+            }
+            if dst_off + 4 > surface.pixels_rgba.len() {
+                break;
+            }
+            // BGR (3 bytes) → RGBA: B/G/R bytes swap into R/G/B + alpha 0xFF.
+            surface.pixels_rgba[dst_off] = bgr[src_off + 2];
+            surface.pixels_rgba[dst_off + 1] = bgr[src_off + 1];
+            surface.pixels_rgba[dst_off + 2] = bgr[src_off];
+            surface.pixels_rgba[dst_off + 3] = 0xFF;
+        }
+    }
+    surface.dirty = true;
 }
 
 /// Composite raw BGRA pixel bytes into the surface's RGBA buffer at
@@ -375,6 +450,42 @@ mod tests {
 
     fn full_surface_bgra(pixel: &[u8], w: usize, h: usize) -> Vec<u8> {
         pixel.iter().copied().cycle().take(w * h * 4).collect()
+    }
+
+    /// ClearCodec (codec_id 0x0008): a minimum-valid 14-byte all-zero
+    /// header decodes to a zero-pixel BGR buffer, which the adapter
+    /// must convert to RGBA with alpha 0xFF and blit at the mapped
+    /// surface origin. This pins the `BGR → RGBA + alpha=0xFF` byte
+    /// conversion at the dispatch boundary.
+    ///
+    /// 14 bytes = flags(1) + seq(1) + residual_count(4) + bands_count(4)
+    /// + subcodec_count(4); all zero so no per-component decoders run.
+    /// Per `justrdp_graphics::clearcodec` this returns `width*height*3`
+    /// bytes of zeros.
+    #[test]
+    fn clearcodec_zero_header_blits_zero_rgba_with_alpha_one() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        renderer.on_create_surface(8, 2, 2, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(8, 5, 5);
+
+        let zero_clearcodec = vec![0u8; 14];
+        renderer.on_wire_to_surface_1(
+            8,
+            0x0008, // RDPGFX_CODECID_CLEARCODEC
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 2, bottom: 2 },
+            &zero_clearcodec,
+        );
+        renderer.on_end_frame(1);
+
+        let sink = renderer.sink();
+        assert_eq!(sink.blits.len(), 1, "ClearCodec dispatch must produce one blit");
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!((*x, *y, *w, *h), (5, 5, 2, 2));
+        // 4 pixels × 4 bytes RGBA = 16 bytes. Each pixel: R=0, G=0, B=0, A=0xFF.
+        let expected: Vec<u8> = vec![0, 0, 0, 0xFF].repeat(4);
+        assert_eq!(pixels, &expected);
     }
 
     /// `MutexFrameSink` forwards every `blit_rgba` call to the inner
