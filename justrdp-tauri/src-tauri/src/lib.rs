@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::Serialize;
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{Emitter, Manager, Window};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -51,7 +52,7 @@ use justrdp_web::{render_event_stateful, BitmapRenderer, GfxRenderer, MutexFrame
 
 use crate::avc::NoopAvcDecoder;
 use crate::input::{InputAction, InputEvent};
-use crate::sink::{BlitRecord, SharedSink, TauriFrameSink};
+use crate::sink::{SharedSink, TauriFrameSink};
 use crate::trust::{
     hex_decode_fingerprint, hex_encode_fingerprint, CaptureSpki, TrustStore, TrustStoreVerifier,
 };
@@ -76,14 +77,13 @@ enum SessionMsg {
     },
 }
 
-/// Outbound `Window::emit("rdp:event", ...)` payload. `Frame`
-/// carries one batch of damaged rectangles (one per BitmapData in
-/// the originating GraphicsUpdate); the frontend draws each with
-/// `putImageData` at `(x, y)`.
+/// Outbound `Window::emit("rdp:event", ...)` payload for low-frequency
+/// events (cursor, disconnect, error). Graphics frames moved to a
+/// dedicated `tauri::ipc::Channel<Vec<u8>>` (PRD #31) — JSON encoding
+/// + base64 wrapping was the dominant per-frame cost.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum FrontendEvent {
-    Frame { blits: Vec<BlitRecord> },
     PointerPosition { x: u16, y: u16 },
     /// Server asked the client to hide the cursor entirely
     /// (full-screen video, certain password fields). Frontend
@@ -137,6 +137,11 @@ async fn rdp_connect(
     user: String,
     pass: String,
     domain: Option<String>,
+    // Frontend supplies a binary channel for graphics frames. Channel
+    // payloads are `pack_frame`-formatted RGBA blits — no JSON, no
+    // base64, ~50% smaller than the legacy `emit("rdp:event", Frame)`
+    // path and no per-frame encode/decode cost. PRD #31.
+    frame_channel: Channel<InvokeResponseBody>,
 ) -> Result<u64, String> {
     // CHANNEL_OPTION_INITIALIZED (0x80000000) + CHANNEL_OPTION_COMPRESS_RDP
     // (0x00800000). Standard mstsc/FreeRDP flags for plain SVCs that
@@ -265,6 +270,7 @@ async fn rdp_connect(
     let task_state = state.inner().clone();
     let task_sink = frame_sink.clone();
     let task_notify = drain_notify.clone();
+    let task_channel = frame_channel.clone();
     tokio::spawn(async move {
         run_session(
             id,
@@ -274,6 +280,7 @@ async fn rdp_connect(
             task_state,
             task_sink,
             task_notify,
+            task_channel,
         )
         .await;
     });
@@ -294,6 +301,7 @@ async fn run_session(
     state: Arc<AppState>,
     frame_sink: Arc<std::sync::Mutex<TauriFrameSink>>,
     drain_notify: Arc<tokio::sync::Notify>,
+    frame_channel: Channel<InvokeResponseBody>,
 ) {
     // Fast-path render uses a `MutexFrameSink` view into the shared
     // `frame_sink`. The EGFX SVC pump (registered in `rdp_connect`)
@@ -338,25 +346,21 @@ async fn run_session(
             // refreshing. `Notify` is idempotent — multiple back-to-back
             // EGFX writes coalesce into one drain wake.
             _ = drain_notify.notified() => {
-                // [DIAG-perf] EGFX-side drain path
+                // [DIAG-perf] EGFX-side drain path — binary IPC channel
                 let t0 = std::time::Instant::now();
-                let blits = match frame_sink.lock() {
-                    Ok(mut s) => s.drain_blits(),
+                let (has_pending, packed) = match frame_sink.lock() {
+                    Ok(mut s) => (s.has_pending(), s.drain_packed()),
                     Err(_) => continue,
                 };
                 let t1 = std::time::Instant::now();
-                let n = blits.len();
-                let bytes: usize = blits.iter().map(|b| b.rgba_b64.len()).sum();
-                if !blits.is_empty() {
-                    let _ = window.emit(
-                        "rdp:event",
-                        FrontendEvent::Frame { blits },
-                    );
+                let bytes_len = packed.len();
+                if has_pending {
+                    let _ = frame_channel.send(InvokeResponseBody::Raw(packed));
                 }
                 let t2 = std::time::Instant::now();
-                if n > 0 {
+                if has_pending {
                     log::info!(
-                        "[DIAG-perf] rust.egfx_drain n={n} b64_bytes={bytes} drain_us={d} emit_us={e}",
+                        "[DIAG-perf] rust.egfx_drain bytes={bytes_len} drain_us={d} send_us={e}",
                         d = (t1 - t0).as_micros(),
                         e = (t2 - t1).as_micros(),
                     );
@@ -400,22 +404,18 @@ async fn run_session(
                         let t1 = std::time::Instant::now();
                         match render_result {
                             Ok(true) => {
-                                let blits = match frame_sink.lock() {
-                                    Ok(mut s) => s.drain_blits(),
-                                    Err(_) => Vec::new(),
+                                let (has_pending, packed) = match frame_sink.lock() {
+                                    Ok(mut s) => (s.has_pending(), s.drain_packed()),
+                                    Err(_) => (false, Vec::new()),
                                 };
                                 let t2 = std::time::Instant::now();
-                                let n = blits.len();
-                                let bytes: usize = blits.iter().map(|b| b.rgba_b64.len()).sum();
-                                if !blits.is_empty() {
-                                    let _ = window.emit(
-                                        "rdp:event",
-                                        FrontendEvent::Frame { blits },
-                                    );
+                                let bytes_len = packed.len();
+                                if has_pending {
+                                    let _ = frame_channel.send(InvokeResponseBody::Raw(packed));
                                 }
                                 let t3 = std::time::Instant::now();
                                 log::info!(
-                                    "[DIAG-perf] rust.fastpath kind={upd_dbg} wire_bytes={data_len} n={n} b64_bytes={bytes} render_us={r} drain_us={d} emit_us={e}",
+                                    "[DIAG-perf] rust.fastpath kind={upd_dbg} wire_bytes={data_len} packed_bytes={bytes_len} render_us={r} drain_us={d} send_us={e}",
                                     r = (t1 - t0).as_micros(),
                                     d = (t2 - t1).as_micros(),
                                     e = (t3 - t2).as_micros(),

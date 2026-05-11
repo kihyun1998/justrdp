@@ -1,21 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { info } from "@tauri-apps/plugin-log";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { RdpCanvas } from "./RdpCanvas";
 import "./App.css";
 
 // Backend-shaped event payload. Mirror of `FrontendEvent` in
-// src-tauri/src/lib.rs — keep in sync.
-interface BlitPayload {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  /// Top-down RGBA8, base64-encoded. Length is `w * h * 4` bytes
-  /// pre-base64.
-  rgba_b64: string;
-}
+// src-tauri/src/lib.rs — keep in sync. (Graphics frames moved to a
+// dedicated binary `tauri::ipc::Channel` per PRD #31.)
 
 interface PointerSpritePayload {
   width: number;
@@ -28,7 +20,6 @@ interface PointerSpritePayload {
 }
 
 type RdpEvent =
-  | { kind: "frame"; blits: BlitPayload[] }
   | { kind: "pointer_position"; x: number; y: number }
   | { kind: "pointer_hidden" }
   | { kind: "pointer_default" }
@@ -39,19 +30,31 @@ type RdpEvent =
 const CANVAS_WIDTH = 1024;
 const CANVAS_HEIGHT = 768;
 
-/// Decode a base64 RGBA payload into Uint8ClampedArray and blit it.
-/// `atob` is sync and runs on the main thread — fine for damaged
-/// rectangles in the typical few-KB to few-hundred-KB range. If the
-/// server pushes full-screen 32bpp at high frame rates we'd want a
-/// binary IPC channel (Tauri `Channel` API) instead, but that's a
-/// later optimisation.
-function drawBlit(ctx: CanvasRenderingContext2D, blit: BlitPayload) {
-  const bin = atob(blit.rgba_b64);
-  const len = bin.length;
-  const bytes = new Uint8ClampedArray(len);
-  for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
-  const imageData = new ImageData(bytes, blit.w, blit.h);
-  ctx.putImageData(imageData, blit.x, blit.y);
+/// Parse a binary frame payload from the Rust `tauri::ipc::Channel`
+/// (PRD #31) and blit each rectangle. Layout matches Rust's
+/// `pack_frame`: `[u32 count] for each: [u16 x][u16 y][u16 w][u16 h]
+/// [u32 byte_len][byte_len bytes raw RGBA]`. All little-endian.
+///
+/// Avoids base64+JSON of the legacy path — for a 1024×768 full frame
+/// this drops the IPC payload from ~4 MB base64 to ~3 MB raw and skips
+/// the per-frame atob. Diagnostic measurement showed `emit_us` going
+/// from ~91 ms to a target < 16 ms in the same scenario.
+function paintFrame(ctx: CanvasRenderingContext2D, buf: ArrayBuffer): void {
+  const view = new DataView(buf);
+  const count = view.getUint32(0, true);
+  let off = 4;
+  for (let i = 0; i < count; i++) {
+    const x = view.getUint16(off, true);
+    const y = view.getUint16(off + 2, true);
+    const w = view.getUint16(off + 4, true);
+    const h = view.getUint16(off + 6, true);
+    const byteLen = view.getUint32(off + 8, true);
+    // ImageData expects Uint8ClampedArray. View into the underlying
+    // buffer — no copy.
+    const pixels = new Uint8ClampedArray(buf, off + 12, byteLen);
+    ctx.putImageData(new ImageData(pixels, w, h), x, y);
+    off += 12 + byteLen;
+  }
 }
 
 /// Convert a server-decoded cursor sprite into a CSS cursor value
@@ -101,37 +104,14 @@ function App() {
 
   // Listen for backend events. Empty deps → mount once. The cleanup
   // returned from useEffect calls `unlisten()` so React StrictMode's
-  // dev double-invoke doesn't leave a stale listener around.
+  // dev double-invoke doesn't leave a stale listener around. Graphics
+  // frames moved to a dedicated binary `Channel` (PRD #31) — only
+  // low-frequency cursor / disconnect / error events flow through here.
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     listen<RdpEvent>("rdp:event", (event) => {
       const payload = event.payload;
       switch (payload.kind) {
-        case "frame": {
-          // [DIAG-perf]
-          const t0 = performance.now();
-          const ctx = canvasRef.current?.getContext("2d");
-          if (ctx) {
-            for (const blit of payload.blits) {
-              drawBlit(ctx, blit);
-            }
-          }
-          const t1 = performance.now();
-          // Counter is per-update (one IPC event per server-pushed
-          // GraphicsUpdate, regardless of how many rects it carried).
-          setFrameCount((n) => n + 1);
-          // [DIAG-perf] log via tauri-plugin-log → same OS log file
-          // as Rust's log::info! lines. Fire-and-forget Promise (no
-          // await) so per-frame paint isn't blocked by IPC.
-          const totalBytes = payload.blits.reduce(
-            (s, b) => s + b.rgba_b64.length,
-            0,
-          );
-          info(
-            `[DIAG-perf] front.frame n=${payload.blits.length} b64_bytes=${totalBytes} paint_ms=${(t1 - t0).toFixed(2)}`,
-          ).catch(() => {});
-          break;
-        }
         case "pointer_position":
           setPointerPos([payload.x, payload.y]);
           break;
@@ -178,12 +158,25 @@ function App() {
   }, []);
 
   async function tryConnect(): Promise<number> {
+    // [DIAG-perf] paint each frame from the binary channel.
+    const frameChannel = new Channel<ArrayBuffer>();
+    frameChannel.onmessage = (buf) => {
+      const t0 = performance.now();
+      const ctx = canvasRef.current?.getContext("2d");
+      if (ctx) paintFrame(ctx, buf);
+      const t1 = performance.now();
+      setFrameCount((n) => n + 1);
+      info(
+        `[DIAG-perf] front.frame bytes=${buf.byteLength} paint_ms=${(t1 - t0).toFixed(2)}`,
+      ).catch(() => {});
+    };
     return invoke<number>("rdp_connect", {
       host: form.host,
       port: form.port,
       user: form.user,
       pass: form.pass,
       domain: form.domain.trim() === "" ? null : form.domain,
+      frameChannel,
     });
   }
 

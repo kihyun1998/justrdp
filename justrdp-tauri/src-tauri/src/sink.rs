@@ -16,25 +16,7 @@
 use std::sync::{Arc, Mutex};
 
 use justrdp_web::FrameSink;
-use serde::Serialize;
 use tokio::sync::Notify;
-
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
-
-/// One damaged rectangle, base64-encoded for JSON transport over the
-/// Tauri IPC bridge. Mirrored on the TS side as `BlitPayload` in
-/// `App.tsx`.
-#[derive(Debug, Clone, Serialize)]
-pub struct BlitRecord {
-    pub x: u16,
-    pub y: u16,
-    pub w: u16,
-    pub h: u16,
-    /// Top-down RGBA8 (`putImageData` layout). Length is `w * h * 4`
-    /// bytes pre-base64.
-    pub rgba_b64: String,
-}
 
 pub struct TauriFrameSink {
     width: u16,
@@ -42,7 +24,10 @@ pub struct TauriFrameSink {
     /// Top-down RGBA8 shadow framebuffer. Required so `peek_rgba`
     /// can serve read-back for non-SRCCOPY ROPs.
     pixels: Vec<u8>,
-    pending: Vec<BlitRecord>,
+    /// Pending damaged rectangles staged for the next IPC drain. Held
+    /// as raw RGBA — no base64, no JSON. `drain_packed` serialises the
+    /// list into a single binary frame for `tauri::ipc::Channel` send.
+    pending: Vec<RawBlit>,
 }
 
 impl TauriFrameSink {
@@ -61,10 +46,20 @@ impl TauriFrameSink {
         }
     }
 
-    /// Take all rectangles accumulated since the last drain. Returns
-    /// an empty `Vec` if nothing was blitted.
-    pub fn drain_blits(&mut self) -> Vec<BlitRecord> {
-        std::mem::take(&mut self.pending)
+    /// Drain all pending blits into a single binary IPC frame.
+    /// See [`pack_frame`] for the layout. Returns an empty 4-byte
+    /// frame (count = 0) when nothing was blitted — callers can elide
+    /// the send by checking `pending.is_empty()` before draining if
+    /// the no-op cost matters.
+    pub fn drain_packed(&mut self) -> Vec<u8> {
+        let blits = std::mem::take(&mut self.pending);
+        pack_frame(&blits)
+    }
+
+    /// Whether anything is queued — lets the caller skip an empty
+    /// drain + IPC send pair.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 }
 
@@ -107,10 +102,10 @@ impl FrameSink for TauriFrameSink {
             return;
         }
 
-        // Update shadow buffer row-by-row, simultaneously building a
-        // tightly-packed `clipped_rgba` for the IPC payload (so we
-        // don't re-encode the whole source rectangle when the server
-        // overflowed the surface).
+        // Update shadow buffer row-by-row, simultaneously building the
+        // tightly-packed RGBA for the IPC payload. Skipping per-row
+        // base64 (was ~5-10ms for full-screen) — bytes go straight into
+        // the binary channel.
         let mut clipped_rgba = Vec::with_capacity(copy_w * copy_h * 4);
         for row in 0..copy_h {
             let src_off = row * w * 4;
@@ -120,12 +115,12 @@ impl FrameSink for TauriFrameSink {
             clipped_rgba.extend_from_slice(src_slice);
         }
 
-        self.pending.push(BlitRecord {
+        self.pending.push(RawBlit {
             x: dest_left,
             y: dest_top,
             w: copy_w as u16,
             h: copy_h as u16,
-            rgba_b64: B64.encode(&clipped_rgba),
+            rgba: clipped_rgba,
         });
     }
 
