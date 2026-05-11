@@ -360,6 +360,40 @@ impl SvcProcessor for CliprdrClient {
         result
     }
 
+    fn poll(&mut self) -> SvcResult<Vec<SvcMessage>> {
+        // Pre-handshake: drop drained items silently — listener may fire
+        // before cap exchange completes (Win32 AddClipboardFormatListener
+        // is up the moment a message-only window is registered).
+        if self.state != CliprdrState::Initialized {
+            let _ = self.backend.take_pending_outbound();
+            return Ok(Vec::new());
+        }
+        let formats = self.backend.take_pending_outbound();
+        if formats.is_empty() {
+            return Ok(Vec::new());
+        }
+        log::info!(
+            "[DIAG-clip] CliprdrClient.poll outbound formats n={} ids={:?}",
+            formats.len(),
+            formats.iter().map(|f| f.format_id).collect::<Vec<_>>()
+        );
+        let msg = self.build_format_list_message(&formats)?;
+        // Mirror the inbound emit hex-dump path so the slice's [DIAG-clip]
+        // surface is symmetric for outbound traffic.
+        let bytes = &msg.data;
+        let n = bytes.len().min(64);
+        let mut hex = alloc::string::String::with_capacity(n * 3);
+        for b in &bytes[..n] {
+            use core::fmt::Write;
+            let _ = write!(hex, "{:02x} ", b);
+        }
+        log::info!(
+            "[DIAG-clip] poll emit total_len={} first{n}={hex}",
+            bytes.len()
+        );
+        Ok(alloc::vec![msg])
+    }
+
     fn compression_condition(&self) -> CompressionCondition {
         CompressionCondition::WhenRdpDataIsCompressed
     }
@@ -382,6 +416,7 @@ mod tests {
         format_list_called: bool,
         format_data_request_id: Option<u32>,
         format_data_response_data: Option<Vec<u8>>,
+        pending_outbound: Vec<LongFormatName>,
     }
 
     impl MockBackend {
@@ -390,6 +425,7 @@ mod tests {
                 format_list_called: false,
                 format_data_request_id: None,
                 format_data_response_data: None,
+                pending_outbound: Vec::new(),
             }
         }
     }
@@ -407,6 +443,10 @@ mod tests {
 
         fn on_format_data_response(&mut self, data: &[u8], _is_success: bool, _format_id: Option<u32>) {
             self.format_data_response_data = Some(data.to_vec());
+        }
+
+        fn take_pending_outbound(&mut self) -> Vec<LongFormatName> {
+            core::mem::take(&mut self.pending_outbound)
         }
 
         // on_file_contents_request, on_file_contents_response, on_lock, on_unlock
@@ -533,6 +573,50 @@ mod tests {
         let resp = format_list_response_bytes(ClipboardMsgFlags::CB_RESPONSE_OK);
         let msgs = client.process(&resp).unwrap();
         assert!(msgs.is_empty());
+    }
+
+    /// Before handshake completes, poll() must consume any queued items from
+    /// the backend but produce no PDU — the server would reject pre-Initialized
+    /// data PDUs anyway (MS-RDPECLIP 1.3.2.1). This locks down the safety gate
+    /// against a Win32 listener firing before cap negotiation finishes.
+    #[test]
+    fn poll_before_handshake_drains_silently() {
+        let mut backend = MockBackend::new();
+        backend.pending_outbound.push(LongFormatName::new(
+            0x0000_000D, // CF_UNICODETEXT
+            alloc::string::String::new(),
+        ));
+        let mut client = CliprdrClient::new(Box::new(backend));
+
+        let msgs = client.poll().unwrap();
+        assert!(msgs.is_empty(), "pre-handshake poll must not emit PDUs");
+    }
+
+    /// Happy path: after the cap+monitor-ready handshake, poll() drains the
+    /// backend's queued LongFormatName entries and emits exactly one
+    /// FormatList PDU. This is the seam that issue #34 unblocks.
+    #[test]
+    fn poll_after_handshake_emits_format_list() {
+        let mut backend = MockBackend::new();
+        backend.pending_outbound.push(LongFormatName::new(
+            0x0000_000D, // CF_UNICODETEXT
+            alloc::string::String::new(),
+        ));
+        backend.pending_outbound.push(LongFormatName::new(
+            0x0000_0001, // CF_TEXT
+            alloc::string::String::new(),
+        ));
+        let mut client = CliprdrClient::new(Box::new(backend));
+        complete_handshake(&mut client);
+
+        let msgs = client.poll().unwrap();
+        assert_eq!(msgs.len(), 1, "expected exactly one FormatList PDU");
+        // The PDU header lives at the start; msg_type byte 0 = 0x02 (FormatList).
+        assert_eq!(msgs[0].data[0], 0x02, "PDU type must be FormatList (0x02)");
+
+        // Second poll drains nothing — the queue is consumed.
+        let again = client.poll().unwrap();
+        assert!(again.is_empty(), "second poll must yield no messages");
     }
 
     #[test]

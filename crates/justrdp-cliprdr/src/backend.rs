@@ -82,4 +82,16 @@ pub trait CliprdrBackend: Send {
 
     /// Called when the remote side unlocks clipboard data.
     fn on_unlock(&mut self, _lock_id: u32) {}
+
+    /// Drain pending host-side clipboard-change announcements.
+    ///
+    /// The processor calls this from its `SvcProcessor::poll` whenever the
+    /// session loop signals a host-clipboard wake-up. Each returned
+    /// `LongFormatName` becomes one entry in an outbound `FormatList` PDU
+    /// (re-encoded as `ShortFormatName` if cap negotiation disabled long
+    /// names). Backends without a listener thread keep the default and
+    /// stay purely inbound.
+    fn take_pending_outbound(&mut self) -> Vec<LongFormatName> {
+        Vec::new()
+    }
 }
