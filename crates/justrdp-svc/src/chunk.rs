@@ -100,8 +100,11 @@ pub fn chunk_and_encode(
                 use core::fmt::Write as _;
                 let _ = write!(hex, "{:02x} ", b);
             }
-            log::info!(
-                "[DIAG-wire] cliprdr outbound chan={} initiator={} total_len={} chunk_flags=0x{:08x} frame_bytes={} first{n}={hex}",
+            // PRD #35 Module D: trace level so production logging is
+            // silent by default. Turn on per-module when diagnosing:
+            //   RUST_LOG=justrdp_svc::chunk=trace cargo run ...
+            log::trace!(
+                "[DIAG-wire] svc outbound chan={} initiator={} total_len={} chunk_flags=0x{:08x} frame_bytes={} first{n}={hex}",
                 channel_id,
                 initiator,
                 total_length,

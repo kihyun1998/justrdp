@@ -1,34 +1,57 @@
-//! CLI smoke for CLIPRDR — headless companion to the Tauri test app.
+//! CLI smoke for CLIPRDR — permanent headless diagnostic for PRD #35.
 //!
-//! Connects to a real RDP server with the CLIPRDR processor registered
-//! (with the platform's native clipboard listener), runs `next_event`
-//! for a bounded duration, and forwards every `[DIAG-clip]` log line
-//! to stderr through the global `log` facade.
+//! Headless companion to the Tauri test app. Connects to a real RDP
+//! server with the CLIPRDR processor registered (optionally with the
+//! Win32 clipboard listener), runs `next_event` for a bounded duration,
+//! and forwards every `[DIAG-clip]` / `[DIAG-svc]` log line to stderr
+//! through the global `log` facade. With `RUST_LOG=justrdp_svc::chunk=trace`
+//! it also emits `[DIAG-wire]` lines carrying the full MCS-wrapped
+//! outbound bytes for byte-level comparison against IronRDP / FreeRDP.
 //!
-//! The point of this binary is to compare **server-side response
-//! patterns** for two different capability advertisements:
+//! ## Why this binary is permanent
 //!
-//!   1. The current code: `0x3e` (long names + every file/lock cap we
-//!      don't actually implement). The Tauri-side log shows the server
-//!      goes silent after MonitorReady — no FormatListResponse, no
-//!      FormatDataRequest, no server-initiated FormatList.
+//! Reproducing CLIPRDR-class symptoms in the Tauri build requires the
+//! full GUI rebuild + manual clipboard interaction loop. This binary
+//! gives a ~10s iteration cycle for diagnosing or verifying any
+//! advertise/handler change — CLI only, no GUI, no operator clicks.
 //!
-//!   2. A narrowed advertisement: `0x02` (long names only). The
-//!      `feedback_no_partial_protocol_enable` memory predicts Microsoft
-//!      RDP silently degrades when a client over-advertises caps without
-//!      handlers; if that's right, switching to `0x02` should unblock
-//!      bidirectional traffic.
+//! ## Designed for the PRD #35 follow-up loop
 //!
-//! Run:
+//! When future work lands one of the missing CapabilitySet types
+//! flagged by `confirm_active_diff_from_mstsc_baseline_matches_documented_gaps`
+//! (BitmapCacheRev2, OffscreenCache, FrameAcknowledge), re-run this
+//! binary against the test server with `--cap 0x02 --seconds 30` and
+//! check whether the cliprdr server silence (no FormatListResponse, no
+//! server-initiated FormatList) is now broken — i.e. whether the new
+//! cap entry was the gap that contributed to issue #34.
+//!
+//! ## A/B knobs
+//!
+//! - `--cap` accepts hex (`0x02`) or decimal. Selects the CLIPRDR
+//!   `GeneralCapabilityFlags` set the client advertises. Use `0x02`
+//!   (USE_LONG_FORMAT_NAMES only, the post-PRD-#35-Module-C default)
+//!   to align with the production narrow-cap behaviour.
+//! - `--show-protocol` flips `CHANNEL_OPTION_SHOW_PROTOCOL` on the
+//!   cliprdr channel definition (FreeRDP-equivalent).
+//! - `--temp-dir <path>` inserts a Temporary Directory PDU between
+//!   caps and the format list.
+//! - `--no-listener` skips the Win32 clipboard listener thread — useful
+//!   for "did the server send *anything* spontaneously?" runs where
+//!   own-outbound traffic would muddy the picture.
+//!
+//! ## Run
 //!
 //! ```text
-//! cargo run -p justrdp-blocking --example cliprdr_cli --features tracing -- \
-//!     --host 192.168.136.136 --user rdptest --password 'qweQWEqwe!' --cap 0x02
+//! cargo run -p justrdp-blocking --example cliprdr_cli -- \
+//!     --host 192.168.136.136 --user rdptest --password 'qweQWEqwe@' --cap 0x02
 //! ```
 //!
-//! `--cap` accepts hex (`0x02`) or decimal (`2`). Defaults to the full
-//! `0x3e` advertisement that the Tauri build currently emits, so the
-//! out-of-the-box run reproduces the bug without code edits.
+//! For maximum signal, including `[DIAG-wire]` traces:
+//!
+//! ```text
+//! RUST_LOG=info,justrdp_svc::chunk=trace cargo run -p justrdp-blocking \
+//!     --example cliprdr_cli -- --host 192.168.136.136 ...
+//! ```
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
