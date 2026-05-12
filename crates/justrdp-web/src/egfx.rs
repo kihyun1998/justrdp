@@ -18,6 +18,7 @@ use justrdp_core::AsAny;
 use justrdp_egfx::{GfxColor32, GfxHandler, GfxMonitorDef, GfxPixelFormat, GfxPoint16, GfxRect16};
 use justrdp_graphics::avc::AvcDecoder;
 use justrdp_graphics::clearcodec::ClearCodecDecoder;
+use justrdp_graphics::planar::PlanarDecompressor;
 
 use crate::render::FrameSink;
 
@@ -477,6 +478,28 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
                     }
                 }
             }
+            // Planar (RDPGFX_CODECID_PLANAR) — RDP 6.0 Planar bitmap
+            // stream (MS-RDPEGFX 3.3.8 / MS-RDPEGDI 3.1.9). Decoder is
+            // stateless (`PlanarDecompressor::new()` is `const fn`) and
+            // shared with the fast-path Bitmap pipeline; we instantiate
+            // per call. Output is `rect_w * rect_h * 4` BGRA bytes which
+            // composite into the surface's top-down RGBA buffer at
+            // dest_rect with the same BGRA→RGBA byte-swap as the
+            // Uncompressed (0x0000) arm. PRD #35 Module B.
+            0x000A => {
+                let rect_w = dest_rect.right.saturating_sub(dest_rect.left);
+                let rect_h = dest_rect.bottom.saturating_sub(dest_rect.top);
+                if rect_w == 0 || rect_h == 0 {
+                    return;
+                }
+                let mut bgra = Vec::new();
+                if PlanarDecompressor::new()
+                    .decompress(bitmap_data, rect_w, rect_h, &mut bgra)
+                    .is_ok()
+                {
+                    composite_uncompressed_bgra_to_rgba(surface, dest_rect, &bgra);
+                }
+            }
             // AVC420 (RDPGFX_CODECID_AVC420) / AVC444 / AVC444V2 — parse
             // the EGFX envelope, then hand the inner H.264 Annex B
             // bytestream to the registered AvcDecoder. The envelope
@@ -506,12 +529,9 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
                     let _ = surface;
                 }
             }
-            // Other codecs (ClearCodec=0x0008, Planar=0x000A) tracked
-            // in follow-up cycles. Unknown codecs drop silently.
-            _ => {
-                // Production embedders should log here; tests assert no
-                // blit was emitted.
-            }
+            // Unknown codec_ids drop silently. Production embedders
+            // should log here; tests assert no blit was emitted.
+            _ => {}
         }
     }
 
@@ -1621,6 +1641,294 @@ mod tests {
         assert!(
             renderer.sink().blits.is_empty(),
             "writes to a deleted surface must produce no blits"
+        );
+    }
+
+    // ── PRD #35 Module B (#37) — Planar codec (0x000A) dispatch ──
+
+    /// Build a minimum-valid Planar payload (FormatHeader 0x20 = NA=1,
+    /// RLE=0, CLL=0, CS=0) for a `w * h` surface filled with the given
+    /// `(r, g, b)` colour. Output layout per MS-RDPEGDI §2.2.2.5.1:
+    /// header byte, R plane, G plane, B plane, pad byte.
+    fn build_planar_uncompressed_solid(w: u16, h: u16, r: u8, g: u8, b: u8) -> Vec<u8> {
+        let n = usize::from(w) * usize::from(h);
+        let mut out = Vec::with_capacity(1 + 3 * n + 1);
+        out.push(0x20);
+        out.extend(core::iter::repeat(r).take(n));
+        out.extend(core::iter::repeat(g).take(n));
+        out.extend(core::iter::repeat(b).take(n));
+        out.push(0x00);
+        out
+    }
+
+    /// PRD #35 Module B (#37 tracer bullet): codec_id 0x000A
+    /// (RDPGFX_CODECID_PLANAR) routes through PlanarDecompressor, the
+    /// BGRA result composites into the surface's top-down RGBA buffer at
+    /// dest_rect, and on_end_frame emits one blit at the mapped origin
+    /// carrying the colour after BGRA→RGBA swap. MS-RDPEGFX §3.3.8.
+    #[test]
+    fn planar_uncompressed_solid_color_blits_at_mapped_origin_with_rgba_swap() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        renderer.on_create_surface(1, 2, 2, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(1, 100, 200);
+
+        // 2×2 solid (R=0xAA, G=0xBB, B=0xCC, A implied 0xFF via NA=1).
+        let payload = build_planar_uncompressed_solid(2, 2, 0xAA, 0xBB, 0xCC);
+
+        renderer.on_wire_to_surface_1(
+            1,
+            0x000A, // RDPGFX_CODECID_PLANAR
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 2, bottom: 2 },
+            &payload,
+        );
+        renderer.on_end_frame(1);
+
+        let sink = renderer.sink();
+        assert_eq!(sink.blits.len(), 1, "Planar dispatch must produce exactly one blit");
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!(
+            (*x, *y, *w, *h),
+            (100, 200, 2, 2),
+            "blit must land at mapped_origin + dest_rect offset, sized to dest_rect"
+        );
+        // BGRA (decoder output) → RGBA (composite output) byte swap means
+        // each pixel becomes [R=0xAA, G=0xBB, B=0xCC, A=0xFF].
+        let expected: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xFF].repeat(4);
+        assert_eq!(pixels, &expected, "pixels must carry BGRA→RGBA-swapped Planar output");
+    }
+
+    /// PRD #35 Module B (#37 cycle 2): a truncated Planar payload (just
+    /// the FormatHeader byte with no plane data) must be dropped
+    /// silently — no blit, no panic, no surface dirtying. Matches the
+    /// "any PlanarError → drop" policy mirroring the ClearCodec and AVC
+    /// error arms.
+    #[test]
+    fn planar_truncated_payload_drops_silently() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        renderer.on_create_surface(2, 4, 4, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(2, 0, 0);
+
+        // Header only — no R/G/B plane bytes. Decoder will return
+        // PlanarError::TruncatedStream.
+        let payload = [0x20u8];
+        renderer.on_wire_to_surface_1(
+            2,
+            0x000A,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 4, bottom: 4 },
+            &payload,
+        );
+        renderer.on_end_frame(1);
+
+        assert!(
+            renderer.sink().blits.is_empty(),
+            "truncated Planar payload must produce no blit"
+        );
+    }
+
+    /// PRD #35 Module B (#37 cycle 3): a degenerate `dest_rect` with
+    /// zero width or height must short-circuit the dispatch arm before
+    /// invoking the decoder — the decoder's internal shape contract
+    /// expects positive dimensions and we honour that at the dispatch
+    /// boundary rather than relying on its error path.
+    #[test]
+    fn planar_zero_dest_rect_skips_decoder_entirely() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        renderer.on_create_surface(3, 16, 16, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(3, 50, 50);
+
+        // Valid-looking 1×1 Planar payload sent against a 0×0 dest_rect.
+        // Were the dispatch arm to feed it to the decoder with (0, 0)
+        // dimensions, the result would be implementation-defined; the
+        // arm must instead drop before decoder invocation.
+        let payload = build_planar_uncompressed_solid(1, 1, 0x11, 0x22, 0x33);
+        renderer.on_wire_to_surface_1(
+            3,
+            0x000A,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 4, top: 4, right: 4, bottom: 4 },
+            &payload,
+        );
+        renderer.on_end_frame(1);
+
+        assert!(
+            renderer.sink().blits.is_empty(),
+            "0×0 dest_rect must produce no blit"
+        );
+    }
+
+    /// PRD #35 Module B (#37 cycle 4): when `dest_rect` is a sub-region
+    /// of the surface (non-zero `left`/`top`), the blit at end_frame
+    /// must land at `mapped_origin + (dest_rect.left, dest_rect.top)`
+    /// with `dest_rect`-sized dimensions, NOT the full surface — same
+    /// dirty-rect contract as the Uncompressed arm. Without this, the
+    /// renderer would overwrite fast-path Bitmap pixels already on the
+    /// canvas with our zero-init surface buffer (the bug #28's
+    /// full-surface blit caused).
+    #[test]
+    fn planar_sub_region_dest_rect_blits_only_the_dirty_offset() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        renderer.on_create_surface(4, 16, 16, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(4, 100, 200);
+
+        // 4×4 region of red (RGBA: R=0xFF, G=0, B=0). Decoder produces
+        // 16 BGRA pixels, composite swaps to RGBA at dest_rect (4,4..8,8).
+        let payload = build_planar_uncompressed_solid(4, 4, 0xFF, 0x00, 0x00);
+        renderer.on_wire_to_surface_1(
+            4,
+            0x000A,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 4, top: 4, right: 8, bottom: 8 },
+            &payload,
+        );
+        renderer.on_end_frame(1);
+
+        let sink = renderer.sink();
+        assert_eq!(sink.blits.len(), 1, "exactly one blit expected");
+        let (x, y, w, h, pixels) = &sink.blits[0];
+        assert_eq!(
+            (*x, *y, *w, *h),
+            (100 + 4, 200 + 4, 4, 4),
+            "blit must land at mapped_origin + dest_rect offset, sized to dest_rect"
+        );
+        // 4×4 = 16 pixels, each RGBA = [FF, 00, 00, FF].
+        let expected: Vec<u8> = vec![0xFF, 0x00, 0x00, 0xFF].repeat(16);
+        assert_eq!(pixels, &expected);
+    }
+
+    /// PRD #35 Module B (#37 cycle 5): the dispatch arm must be agnostic
+    /// to the inner Planar mode — RLE-compressed payloads (header bit
+    /// `FORMAT_HEADER_RLE = 0x10`) decode through the same path. This
+    /// locks the contract that `PlanarDecompressor` owns all decode
+    /// mode handling; the dispatch arm only routes bytes and composites
+    /// the BGRA output.
+    #[test]
+    fn planar_rle_mode_payload_decodes_through_same_dispatch_arm() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        renderer.on_create_surface(5, 1, 1, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(5, 0, 0);
+
+        // RLE-mode 1×1 payload — header 0x30 (NA=1, RLE=1, CLL=0).
+        // Each plane: controlByte 0x10 (1 raw, 0 run) + 1 raw byte.
+        let payload: Vec<u8> = vec![
+            0x30, // header
+            0x10, 0x77, // R plane
+            0x10, 0x88, // G plane
+            0x10, 0x99, // B plane
+        ];
+
+        renderer.on_wire_to_surface_1(
+            5,
+            0x000A,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 1, bottom: 1 },
+            &payload,
+        );
+        renderer.on_end_frame(1);
+
+        let sink = renderer.sink();
+        assert_eq!(sink.blits.len(), 1, "RLE-mode Planar payload must decode + blit");
+        let (_, _, _, _, pixels) = &sink.blits[0];
+        assert_eq!(
+            pixels,
+            &vec![0x77, 0x88, 0x99, 0xFF],
+            "RLE-decoded BGRA→RGBA must yield [R=0x77, G=0x88, B=0x99, A=0xFF]"
+        );
+    }
+
+    /// PRD #35 Module B (#37 cycle 6): when the Planar FormatHeader has
+    /// NA=0 (alpha plane present), the decoded BGRA carries a real
+    /// alpha byte rather than the implicit 0xFF. The dispatch arm must
+    /// route through `composite_uncompressed_bgra_to_rgba`, which
+    /// copies `src[3]` to `dst[3]` (alpha-preserving), NOT through
+    /// `composite_bgr_to_rgba`, which forces alpha=0xFF. A careless
+    /// refactor that swaps the helper would silently break translucent
+    /// surfaces.
+    #[test]
+    fn planar_with_alpha_plane_preserves_alpha_through_composite() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        renderer.on_create_surface(6, 1, 1, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(6, 0, 0);
+
+        // NA=0 (alpha plane present), RLE=0, CLL=0 → header 0x00.
+        // Planes: A=0x80, R=0xFF, G=0x00, B=0x7F, Pad=0x00.
+        // Decoder BGRA output per pixel: [B=0x7F, G=0x00, R=0xFF, A=0x80].
+        // Composite RGBA output: [R=0xFF, G=0x00, B=0x7F, A=0x80].
+        let payload = [0x00, 0x80, 0xFF, 0x00, 0x7F, 0x00];
+
+        renderer.on_wire_to_surface_1(
+            6,
+            0x000A,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 1, bottom: 1 },
+            &payload,
+        );
+        renderer.on_end_frame(1);
+
+        let sink = renderer.sink();
+        assert_eq!(sink.blits.len(), 1);
+        let (_, _, _, _, pixels) = &sink.blits[0];
+        assert_eq!(
+            pixels,
+            &vec![0xFF, 0x00, 0x7F, 0x80],
+            "alpha plane must propagate to blit RGBA dst[3], not be overwritten with 0xFF"
+        );
+    }
+
+    /// PRD #35 Module B (#37 cycle 7): two successive Planar dispatches
+    /// to disjoint sub-rects on the same surface within one frame must
+    /// expand the surface's `dirty_rect` to enclose both regions. On
+    /// `on_end_frame` the renderer issues a single blit covering the
+    /// union, NOT two separate blits, and certainly NOT the full
+    /// surface. Mirrors the dirty-rect aggregation pattern locked for
+    /// `on_solid_fill` and other compositing arms.
+    #[test]
+    fn planar_two_disjoint_dispatches_aggregate_into_one_union_blit() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        renderer.on_create_surface(7, 32, 32, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(7, 0, 0);
+
+        // Top-left 2×2 region (rect (0,0,2,2)) — solid red.
+        let payload_a = build_planar_uncompressed_solid(2, 2, 0xFF, 0x00, 0x00);
+        renderer.on_wire_to_surface_1(
+            7,
+            0x000A,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 2, bottom: 2 },
+            &payload_a,
+        );
+
+        // Bottom-right 2×2 region (rect (10,10,12,12)) — solid green.
+        let payload_b = build_planar_uncompressed_solid(2, 2, 0x00, 0xFF, 0x00);
+        renderer.on_wire_to_surface_1(
+            7,
+            0x000A,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 10, top: 10, right: 12, bottom: 12 },
+            &payload_b,
+        );
+        renderer.on_end_frame(1);
+
+        let sink = renderer.sink();
+        assert_eq!(
+            sink.blits.len(),
+            1,
+            "two Planar dispatches within one frame must produce exactly one union blit"
+        );
+        let (x, y, w, h, _) = &sink.blits[0];
+        // Union of (0,0,2,2) and (10,10,12,12) is (0,0,12,12) — 12×12.
+        assert_eq!(
+            (*x, *y, *w, *h),
+            (0, 0, 12, 12),
+            "union blit must span the bounding box of both dest_rects"
         );
     }
 }
