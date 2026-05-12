@@ -215,7 +215,18 @@ impl ClientCoreData {
             serial_number: Some(0),
             high_color_depth: Some(HighColorDepth::Bpp16),
             supported_color_depths: Some(SupportedColorDepths::from_bits(0x000F)),
-            early_capability_flags: Some(EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU),
+            // PRD #35 Module A1: mstsc-equivalent baseline so the server
+            // recognises a full-feature client. Adding SUPPORT_MONITOR_LAYOUT_PDU
+            // is the connector's job (only when monitor data is present).
+            // SUPPORT_DYNVC_GFX_PROTOCOL stays off until Module B's EGFX
+            // renderer completes the five missing handlers.
+            early_capability_flags: Some(EarlyCapabilityFlags::from_bits(
+                EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU.bits()
+                    | EarlyCapabilityFlags::WANT_32BPP_SESSION.bits()
+                    | EarlyCapabilityFlags::SUPPORT_STATUSINFO_PDU.bits()
+                    | EarlyCapabilityFlags::SUPPORT_DYNAMIC_TIME_ZONE.bits()
+                    | EarlyCapabilityFlags::SUPPORT_NETCHAR_AUTODETECT.bits(),
+            )),
             client_dig_product_id: Some([0u8; 64]),
             connection_type: Some(0),
             pad1: Some(0),
@@ -755,6 +766,39 @@ impl<'de> Decode<'de> for ClientMultitransportChannelData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD #35 Module A1: `ClientCoreData::new` must seed
+    /// `early_capability_flags` with the mstsc-equivalent baseline so the
+    /// server treats us as a full-feature client. The previous default of
+    /// `SUPPORT_ERRINFO_PDU` alone (0x0001) is suspected to put Microsoft
+    /// servers into a partial-feature mode that silently disables channel
+    /// redirection after MonitorReady. The mstsc-equivalent baseline adds
+    /// WANT_32BPP_SESSION, SUPPORT_STATUSINFO_PDU, SUPPORT_DYNAMIC_TIME_ZONE,
+    /// SUPPORT_NETCHAR_AUTODETECT.
+    ///
+    /// `SUPPORT_MONITOR_LAYOUT_PDU` is OR-d in by the connector when monitor
+    /// data is present (multi-monitor path), so it is not in the baseline.
+    /// `SUPPORT_DYNVC_GFX_PROTOCOL` is intentionally still omitted until
+    /// PRD #35 Module B completes the EGFX renderer.
+    #[test]
+    fn client_core_data_default_advertises_mstsc_equivalent_early_caps() {
+        let core = ClientCoreData::new(800, 600);
+        let expected = EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU
+            .bits()
+            | EarlyCapabilityFlags::WANT_32BPP_SESSION.bits()
+            | EarlyCapabilityFlags::SUPPORT_STATUSINFO_PDU.bits()
+            | EarlyCapabilityFlags::SUPPORT_DYNAMIC_TIME_ZONE.bits()
+            | EarlyCapabilityFlags::SUPPORT_NETCHAR_AUTODETECT.bits();
+        let actual = core
+            .early_capability_flags
+            .expect("default must seed early_capability_flags");
+        assert_eq!(
+            actual.bits(),
+            expected,
+            "default must be mstsc-equivalent baseline (0x{expected:04x}), got 0x{:04x}",
+            actual.bits()
+        );
+    }
 
     #[test]
     fn client_core_data_roundtrip() {
