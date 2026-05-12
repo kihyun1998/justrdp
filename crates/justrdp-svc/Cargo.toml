@@ -18,3 +18,4 @@ std = ["alloc", "justrdp-core/std", "justrdp-pdu/std"]
 [dependencies]
 justrdp-core.workspace = true
 justrdp-pdu.workspace = true
+log = { workspace = true }

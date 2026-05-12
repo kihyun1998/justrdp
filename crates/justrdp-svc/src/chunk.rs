@@ -84,6 +84,31 @@ pub fn chunk_and_encode(
             flags,
             chunk_data,
         )?;
+        // [DIAG-wire] Outbound SVC frame, fully MCS-wrapped, exactly as it
+        // hits the transport. Limited to cliprdr (1005) so the noise of
+        // graphics traffic doesn't drown it. Includes the whole frame
+        // (TPKT + X.224 + MCS SendDataRequest + ChannelPDUHeader + payload)
+        // so wire-level byte comparison against mstsc/FreeRDP captures is
+        // possible. Will be removed after diagnosis (issue #34).
+        // Trail 2 — capture every SVC outbound, regardless of channel id,
+        // because the cliprdr MCS id varies per-session (mstsc, Tauri,
+        // and the CLI smoke binary all see different numbers).
+        {
+            let n = frame.len().min(128);
+            let mut hex = alloc::string::String::with_capacity(n * 3);
+            for b in &frame[..n] {
+                use core::fmt::Write as _;
+                let _ = write!(hex, "{:02x} ", b);
+            }
+            log::info!(
+                "[DIAG-wire] cliprdr outbound chan={} initiator={} total_len={} chunk_flags=0x{:08x} frame_bytes={} first{n}={hex}",
+                channel_id,
+                initiator,
+                total_length,
+                flags,
+                frame.len()
+            );
+        }
         frames.push(frame);
     }
 

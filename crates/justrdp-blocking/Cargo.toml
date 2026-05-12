@@ -32,3 +32,8 @@ justrdp-gateway = { workspace = true, features = ["std"] }
 justrdp-rpch = { workspace = true, features = ["std"] }
 tracing = { version = "0.1", optional = true }
 getrandom = "0.2"
+
+[dev-dependencies]
+justrdp-cliprdr = { workspace = true, features = ["alloc", "std"] }
+justrdp-cliprdr-native = { workspace = true }
+env_logger = "0.11"
