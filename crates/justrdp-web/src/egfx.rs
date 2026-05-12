@@ -21,6 +21,10 @@ use justrdp_graphics::clearcodec::ClearCodecDecoder;
 
 use crate::render::FrameSink;
 
+// `GfxCache` trait is consumed via `self.cache.insert/get/evict`; the
+// trait must be in scope wherever those methods are called.
+use cache::GfxCache as _;
+
 // `MutexFrameSink` requires `std::sync::Mutex`; behind the alloc + std
 // gate so wasm32 / no_std embedders can still depend on the rest of the
 // module. Tauri (the primary consumer) is std-only.
@@ -224,6 +228,10 @@ pub struct GfxRenderer<S: FrameSink + Send + 'static> {
     /// Stateful (glyph cache + VBar caches per MS-RDPEGFX §2.2.4) —
     /// the `&mut self` carries forward across calls.
     clearcodec_decoder: Option<ClearCodecDecoder>,
+    /// Bitmap cache slots backing MS-RDPEGFX 2.2.2.13 (SurfaceToCache),
+    /// 2.2.2.14 (CacheToSurface), 2.2.2.16 (EvictCacheEntry).
+    /// PRD #35 Module B (renderer cache wire-up).
+    cache: cache::InMemoryGfxCache,
 }
 
 impl<S: FrameSink + Send + 'static> GfxRenderer<S> {
@@ -234,6 +242,7 @@ impl<S: FrameSink + Send + 'static> GfxRenderer<S> {
             surfaces: BTreeMap::new(),
             avc_decoder: None,
             clearcodec_decoder: None,
+            cache: cache::InMemoryGfxCache::new(),
         }
     }
 
@@ -517,6 +526,34 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
             "[DIAG-egfx] on_surface_to_cache id={surface_id} slot={cache_slot} key=0x{cache_key:016x} rect=({},{},{},{})",
             src_rect.left, src_rect.top, src_rect.right, src_rect.bottom
         );
+        // PRD #35 Module B: extract the src_rect region of the surface's
+        // top-down RGBA buffer and stash it as a `CachedTile`. `cache_key`
+        // is a server-side hash we don't need to validate — the server
+        // owns lookup semantics.
+        let Some(surface) = self.surfaces.get(&surface_id) else {
+            return;
+        };
+        let l = src_rect.left.min(surface.width);
+        let t = src_rect.top.min(surface.height);
+        let r = src_rect.right.min(surface.width);
+        let b = src_rect.bottom.min(surface.height);
+        if l >= r || t >= b {
+            return;
+        }
+        let w = r - l;
+        let h = b - t;
+        let src_stride = usize::from(surface.width) * 4;
+        let tile_stride = usize::from(w) * 4;
+        let mut pixels_rgba = Vec::with_capacity(tile_stride * usize::from(h));
+        for row in t..b {
+            let row_off = usize::from(row) * src_stride + usize::from(l) * 4;
+            pixels_rgba.extend_from_slice(&surface.pixels_rgba[row_off..row_off + tile_stride]);
+        }
+        let _ = cache_key;
+        self.cache.insert(
+            cache_slot,
+            cache::CachedTile { width: w, height: h, pixels_rgba },
+        );
     }
 
     fn on_cache_to_surface(
@@ -529,10 +566,45 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
             "[DIAG-egfx] on_cache_to_surface slot={cache_slot} dst_id={surface_id} dst_n={}",
             dest_points.len()
         );
+        // PRD #35 Module B: look up the slot, then composite the tile
+        // onto the destination surface at each dest point (top-left
+        // origin). Out-of-bounds dest points are clipped against the
+        // surface dimensions — matches `on_solid_fill`'s edge handling.
+        let Some(tile) = self.cache.get(cache_slot).cloned() else {
+            return; // slot was empty or evicted; server side may retry
+        };
+        let Some(surface) = self.surfaces.get_mut(&surface_id) else {
+            return;
+        };
+        let dst_stride = usize::from(surface.width) * 4;
+        let tile_stride = usize::from(tile.width) * 4;
+        for point in dest_points {
+            // GfxPoint16 carries signed coords; negative values clip to
+            // the surface left/top edge per MS-RDPEGFX 2.2.2.14 dest
+            // semantics.
+            let l: u16 = if point.x <= 0 { 0 } else { (point.x as u16).min(surface.width) };
+            let t: u16 = if point.y <= 0 { 0 } else { (point.y as u16).min(surface.height) };
+            let r = l.saturating_add(tile.width).min(surface.width);
+            let b = t.saturating_add(tile.height).min(surface.height);
+            if l >= r || t >= b {
+                continue;
+            }
+            let copy_w = r - l;
+            for row in 0..(b - t) {
+                let dst_off = (usize::from(t) + usize::from(row)) * dst_stride + usize::from(l) * 4;
+                let src_off = usize::from(row) * tile_stride;
+                let dst_end = dst_off + usize::from(copy_w) * 4;
+                let src_end = src_off + usize::from(copy_w) * 4;
+                surface.pixels_rgba[dst_off..dst_end]
+                    .copy_from_slice(&tile.pixels_rgba[src_off..src_end]);
+            }
+            surface.mark_dirty(l, t, r, b);
+        }
     }
 
     fn on_evict_cache_entry(&mut self, cache_slot: u16) {
         log::info!("[DIAG-egfx] on_evict_cache_entry slot={cache_slot}");
+        self.cache.evict(cache_slot);
     }
 
     fn on_start_frame(&mut self, frame_id: u32, _timestamp: u32) {
@@ -691,6 +763,101 @@ mod tests {
 
     fn full_surface_bgra(pixel: &[u8], w: usize, h: usize) -> Vec<u8> {
         pixel.iter().copied().cycle().take(w * h * 4).collect()
+    }
+
+    /// PRD #35 Module B (renderer cache wire-up): end-to-end roundtrip.
+    /// Paint a known colour into a source surface, snapshot it to a cache
+    /// slot via `on_surface_to_cache`, then blit from that slot onto a
+    /// different destination surface via `on_cache_to_surface`. The
+    /// destination's frame must carry the source colour. Verifies the
+    /// public renderer contract (frame sink output), not the internal
+    /// cache field.
+    #[test]
+    fn cache_roundtrip_solid_fill_then_cache_to_other_surface() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        // Source: 4×4 at desktop origin (0,0), filled solid red.
+        renderer.on_create_surface(1, 4, 4, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(1, 0, 0);
+        renderer.on_solid_fill(
+            1,
+            GfxColor32 { r: 0xFF, g: 0x00, b: 0x00, xa: 0xFF },
+            &[GfxRect16 { left: 0, top: 0, right: 4, bottom: 4 }],
+        );
+        renderer.on_surface_to_cache(
+            1,
+            0xDEAD_BEEF,
+            7,
+            GfxRect16 { left: 0, top: 0, right: 4, bottom: 4 },
+        );
+
+        // Destination: 4×4 at desktop origin (10,0), initially empty.
+        renderer.on_create_surface(2, 4, 4, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(2, 10, 0);
+        renderer.on_cache_to_surface(7, 2, &[GfxPoint16 { x: 0, y: 0 }]);
+        renderer.on_end_frame(1);
+
+        let sink = renderer.sink();
+        let dest_blits: Vec<_> = sink
+            .blits
+            .iter()
+            .filter(|(l, _, _, _, _)| *l == 10)
+            .collect();
+        assert_eq!(
+            dest_blits.len(),
+            1,
+            "cache_to_surface must produce one blit at the destination's mapped origin"
+        );
+        let (_, _, _, _, pixels) = dest_blits[0];
+        assert_eq!(
+            &pixels[0..4],
+            &[0xFF, 0x00, 0x00, 0xFF],
+            "first pixel at destination must be the cached red (RGBA)"
+        );
+    }
+
+    /// PRD #35 Module B: after `EvictCacheEntry`, a subsequent
+    /// `CacheToSurface` for the same slot must produce no blit. The
+    /// server can issue evict before reusing a slot (and may even race
+    /// an in-flight cache lookup); the client honours the evict.
+    #[test]
+    fn cache_evict_then_cache_to_surface_is_silent() {
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+
+        renderer.on_create_surface(1, 4, 4, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(1, 0, 0);
+        renderer.on_solid_fill(
+            1,
+            GfxColor32 { r: 0x00, g: 0xFF, b: 0x00, xa: 0xFF },
+            &[GfxRect16 { left: 0, top: 0, right: 4, bottom: 4 }],
+        );
+        renderer.on_surface_to_cache(
+            1,
+            0xCAFE_BABE,
+            9,
+            GfxRect16 { left: 0, top: 0, right: 4, bottom: 4 },
+        );
+        renderer.on_evict_cache_entry(9);
+
+        // Destination surface at (20, 0). Without the evict, the cached
+        // green tile would land here; with the evict, the cache_to_surface
+        // is a silent no-op and the destination stays clean.
+        renderer.on_create_surface(2, 4, 4, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(2, 20, 0);
+        renderer.on_cache_to_surface(9, 2, &[GfxPoint16 { x: 0, y: 0 }]);
+        renderer.on_end_frame(1);
+
+        let sink = renderer.sink();
+        let dest_blits: Vec<_> = sink
+            .blits
+            .iter()
+            .filter(|(l, _, _, _, _)| *l == 20)
+            .collect();
+        assert!(
+            dest_blits.is_empty(),
+            "evicted slot must not produce a blit at the destination, got {} blits",
+            dest_blits.len()
+        );
     }
 
     /// PRD #35 Module B (cache slice): the cache module's core contract.
