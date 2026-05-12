@@ -132,29 +132,77 @@ fn unwrap_avc420_envelope(payload: &[u8]) -> Option<&[u8]> {
     Some(&payload[header_len..])
 }
 
-/// Strip the AVC444 outer envelope, then the inner AVC420 envelope, and
-/// return the Annex B bytes of stream1 (the main view).
+/// Inner Annex B bytes extracted from an `RDPGFX_AVC444_BITMAP_STREAM`,
+/// one slice per sub-stream. Either field is `None` when the LC field
+/// indicates the corresponding sub-stream is absent, or when truncation
+/// leaves no payload for it.
+#[derive(Debug, PartialEq, Eq)]
+struct Avc444Streams<'a> {
+    /// Main view (AVC420 luma+chroma, or luma-only when LC pairs with stream2).
+    stream1: Option<&'a [u8]>,
+    /// Auxiliary view (chroma update). Present when LC signals a paired
+    /// or chroma-only frame.
+    stream2: Option<&'a [u8]>,
+}
+
+/// Strip the AVC444 outer envelope and return the inner Annex B bytes
+/// of each present sub-stream.
 ///
-/// MS-RDPEGFX 2.2.4.5 `RDPGFX_AVC444_BITMAP_STREAM`:
+/// MS-RDPEGFX 2.2.4.5 `RDPGFX_AVC444_BITMAP_STREAM` (LC encoding per
+/// §4.4.5.1):
 ///   cbAvc420EncodedBitstream1 (u32 LE — high 30 bits = byte count of
-///     stream1, low 2 bits = LC frame type indicator)
+///     stream1, low 2 bits = LC frame type)
 ///   avc420EncodedBitstream1 (RDPGFX_AVC420_BITMAP_STREAM, length above)
-///   [avc420EncodedBitstream2] (RDPGFX_AVC420_BITMAP_STREAM, only when
-///     LC indicates a chroma-and-luma pair)
+///   [avc420EncodedBitstream2] (RDPGFX_AVC420_BITMAP_STREAM, depending on LC)
 ///
-/// This slice handles stream1 only; stream2 (auxiliary view) is a
-/// follow-up. Returns `None` on truncation or malformed length.
-fn unwrap_avc444_envelope(payload: &[u8]) -> Option<&[u8]> {
+/// LC handling:
+///   - `0b00` — stream1 only (full YUV420p frame)
+///   - `0b01` — stream1 (main view) + stream2 (auxiliary chroma)
+///   - `0b10` — stream2 only (chroma-only refresh on top of prior frame)
+///   - `0b11` — reserved; treated as malformed, returns `None`
+///
+/// Truncation: when stream2 is signalled but no payload remains after
+/// stream1, `stream2` is reported as `None` rather than an empty slice
+/// so the dispatch path does not invoke the decoder with a zero-length
+/// Annex B buffer.
+fn unwrap_avc444_envelope(payload: &[u8]) -> Option<Avc444Streams<'_>> {
     if payload.len() < 4 {
         return None;
     }
     let header = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let stream1_len = (header >> 2) as usize;
-    let end = 4usize.checked_add(stream1_len)?;
-    if payload.len() < end {
+    let lc = header & 0b11;
+
+    if lc == 0b11 {
         return None;
     }
-    unwrap_avc420_envelope(&payload[4..end])
+
+    let stream1_end = 4usize.checked_add(stream1_len)?;
+    if payload.len() < stream1_end {
+        return None;
+    }
+
+    let stream1 = match lc {
+        0b00 | 0b01 => unwrap_avc420_envelope(&payload[4..stream1_end]),
+        // LC=0b10 — chroma-only refresh; stream1 absent. The 30-bit length
+        // field still consumes stream1_end bytes but contains no main view.
+        0b10 => None,
+        _ => unreachable!(),
+    };
+
+    let stream2 = match lc {
+        0b01 | 0b10 => {
+            let stream2_bytes = &payload[stream1_end..];
+            if stream2_bytes.is_empty() {
+                None
+            } else {
+                unwrap_avc420_envelope(stream2_bytes)
+            }
+        }
+        _ => None,
+    };
+
+    Some(Avc444Streams { stream1, stream2 })
 }
 
 /// EGFX bitmap-cache slot store (PRD #35 Module B).
@@ -447,8 +495,13 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
             }
             0x000E | 0x000F => {
                 if let Some(decoder) = self.avc_decoder.as_mut() {
-                    if let Some(annex_b) = unwrap_avc444_envelope(bitmap_data) {
-                        let _ = decoder.decode_frame(annex_b);
+                    if let Some(streams) = unwrap_avc444_envelope(bitmap_data) {
+                        if let Some(s1) = streams.stream1 {
+                            let _ = decoder.decode_frame(s1);
+                        }
+                        if let Some(s2) = streams.stream2 {
+                            let _ = decoder.decode_frame(s2);
+                        }
                     }
                     let _ = surface;
                 }
@@ -798,6 +851,24 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
+    /// Build a minimal-but-valid AVC420 envelope wrapping `annex_b`:
+    /// one region rect covering 16×16 and one quant/quality pair. Used
+    /// across the AVC444 LC-variant tests so each test's intent isolates
+    /// to the LC bit and the surrounding `Avc444Streams` contract,
+    /// without re-stating the inner envelope shape every time.
+    fn wrap_avc420(annex_b: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.push(20);
+        out.push(80);
+        out.extend_from_slice(annex_b);
+        out
+    }
+
     /// Test-only sink that records every `blit_rgba` call as a tuple.
     #[derive(Default)]
     struct CaptureSink {
@@ -1139,12 +1210,302 @@ mod tests {
         );
     }
 
-    /// PRD #35 Module B: AVC444V2 (codec_id 0x000F) and AVC444 (0x000E)
-    /// wrap one or two AVC420 sub-streams. MS-RDPEGFX 2.2.4.5 layout:
-    /// `cbAvc420EncodedBitstream1(u32 with LC in low bits) +
-    /// avc420EncodedBitstream1(stream1) [+ avc420EncodedBitstream2]`.
-    /// Only the inner H.264 Annex B bytes of stream1 should reach the
-    /// decoder for this slice; stream2 (auxiliary view) is a follow-up.
+    /// PRD #35 Module B (#36 cycle 2): LC=`0b00` signals a single AVC420
+    /// frame in stream1 with no auxiliary chroma. Even when the envelope
+    /// has trailing bytes after the declared stream1 length, the parser
+    /// must NOT route them to the decoder — the LC field is authoritative,
+    /// not the payload length. This locks the parser's contract that
+    /// stream2 is gated on LC, not on residual bytes.
+    #[test]
+    fn avc444_lc00_routes_only_stream1_even_with_trailing_bytes() {
+        let calls = Arc::new(Mutex::new(RecordedCalls::default()));
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+        renderer.set_avc_decoder(alloc::boxed::Box::new(RecordingDecoder {
+            calls: calls.clone(),
+        }));
+
+        renderer.on_create_surface(8, 16, 16, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(8, 0, 0);
+
+        let annex_b: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
+        let stream1 = wrap_avc420(&annex_b);
+
+        // LC=0b00: stream1 only. Trailing junk bytes appended after the
+        // declared stream1 length — a careless parser might try to parse
+        // them as stream2.
+        let outer_len_lc = ((stream1.len() as u32) << 2) | 0b00;
+        let mut envelope: Vec<u8> = Vec::new();
+        envelope.extend_from_slice(&outer_len_lc.to_le_bytes());
+        envelope.extend_from_slice(&stream1);
+        envelope.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xFA, 0xCE]);
+
+        renderer.on_wire_to_surface_1(
+            8,
+            0x000E,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 16, bottom: 16 },
+            &envelope,
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.chunks.len(),
+            1,
+            "LC=0b00 must route only stream1 regardless of trailing bytes"
+        );
+        assert_eq!(recorded.chunks[0], annex_b);
+    }
+
+    /// PRD #35 Module B (#36 tracer bullet): under LC=`0b01` ("luma in
+    /// stream1, chroma in stream2") the AVC444 wire envelope carries TWO
+    /// concatenated AVC420 sub-streams. Each must be unwrapped down to
+    /// its inner Annex B bytes and handed to the registered `AvcDecoder`
+    /// via two sequential `decode_frame` calls — stream1 first, stream2
+    /// second. MS-RDPEGFX 2.2.4.5 §4.4.5.1 (LC encoding).
+    ///
+    /// This test was RED before the dual-stream parser shape change; it
+    /// is the contract that the new shape exists to satisfy.
+    #[test]
+    fn avc444_lc01_dispatches_both_inner_streams_to_decoder_in_order() {
+        let calls = Arc::new(Mutex::new(RecordedCalls::default()));
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+        renderer.set_avc_decoder(alloc::boxed::Box::new(RecordingDecoder {
+            calls: calls.clone(),
+        }));
+
+        renderer.on_create_surface(7, 16, 16, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(7, 0, 0);
+
+        let annex_b_main: Vec<u8> = vec![0x11, 0x22, 0x33, 0x44];
+        let annex_b_aux: Vec<u8> = vec![0x55, 0x66, 0x77, 0x88];
+
+        let stream1 = wrap_avc420(&annex_b_main);
+        let stream2 = wrap_avc420(&annex_b_aux);
+
+        // Outer AVC444 envelope: 30-bit cbAvc420EncodedBitstream1 length
+        // (stream1's byte count) + 2-bit LC=0b01 (luma+chroma split), then
+        // stream1 contiguously followed by stream2.
+        let outer_len_lc = ((stream1.len() as u32) << 2) | 0b01;
+        let mut envelope: Vec<u8> = Vec::new();
+        envelope.extend_from_slice(&outer_len_lc.to_le_bytes());
+        envelope.extend_from_slice(&stream1);
+        envelope.extend_from_slice(&stream2);
+
+        renderer.on_wire_to_surface_1(
+            7,
+            0x000E, // RDPGFX_CODECID_AVC444
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 16, bottom: 16 },
+            &envelope,
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.chunks.len(),
+            2,
+            "decoder must be called twice — once per AVC444 sub-stream when LC=0b01"
+        );
+        assert_eq!(
+            recorded.chunks[0], annex_b_main,
+            "first decoder call must carry stream1's inner Annex B (main view luma)"
+        );
+        assert_eq!(
+            recorded.chunks[1], annex_b_aux,
+            "second decoder call must carry stream2's inner Annex B (auxiliary chroma)"
+        );
+    }
+
+    /// PRD #35 Module B (#36 cycle 6): LC=`0b10` signals a chroma-only
+    /// refresh — stream1 (main view) is absent, only stream2 carries
+    /// chroma update bytes meant to compose against the prior frame's
+    /// luma reference inside the H.264 decoder. The parser routes the
+    /// post-header payload as stream2; the dispatch arm hands its inner
+    /// Annex B to `AvcDecoder::decode_frame` exactly once. Matches
+    /// IronRDP / FreeRDP behaviour. MS-RDPEGFX 2.2.4.5 §4.4.5.1.
+    #[test]
+    fn avc444_lc10_chroma_only_routes_stream2_to_decoder() {
+        let calls = Arc::new(Mutex::new(RecordedCalls::default()));
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+        renderer.set_avc_decoder(alloc::boxed::Box::new(RecordingDecoder {
+            calls: calls.clone(),
+        }));
+
+        renderer.on_create_surface(11, 16, 16, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(11, 0, 0);
+
+        let chroma_annex_b: Vec<u8> = vec![0xC0, 0xC1, 0xC2, 0xC3];
+        let stream2 = wrap_avc420(&chroma_annex_b);
+
+        // LC=0b10 with stream1_len=0 (no main view consumed). Stream2
+        // starts immediately after the 4-byte length-LC header.
+        let outer_len_lc = (0u32 << 2) | 0b10;
+        let mut envelope: Vec<u8> = Vec::new();
+        envelope.extend_from_slice(&outer_len_lc.to_le_bytes());
+        envelope.extend_from_slice(&stream2);
+
+        renderer.on_wire_to_surface_1(
+            11,
+            0x000E,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 16, bottom: 16 },
+            &envelope,
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.chunks.len(),
+            1,
+            "LC=0b10 (chroma-only refresh) must invoke decoder exactly once with stream2"
+        );
+        assert_eq!(
+            recorded.chunks[0], chroma_annex_b,
+            "decoder call must carry stream2's inner Annex B (chroma payload)"
+        );
+    }
+
+    /// PRD #35 Module B (#36 cycle 7 — impl-verifier follow-up): when
+    /// LC=`0b10` the 30-bit `cbAvc420EncodedBitstream1` field may still
+    /// carry a non-zero value that acts as a skip pointer to where
+    /// stream2 actually begins — IronRDP / FreeRDP servers exercise
+    /// this branch. The parser must honour the field as a `stream1_end`
+    /// offset and position stream2 at `4 + stream1_len`, regardless of
+    /// whatever bytes occupy the padding region.
+    #[test]
+    fn avc444_lc10_with_nonzero_stream1_len_skips_padding_and_routes_stream2() {
+        let calls = Arc::new(Mutex::new(RecordedCalls::default()));
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+        renderer.set_avc_decoder(alloc::boxed::Box::new(RecordingDecoder {
+            calls: calls.clone(),
+        }));
+
+        renderer.on_create_surface(12, 16, 16, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(12, 0, 0);
+
+        let chroma_annex_b: Vec<u8> = vec![0xD0, 0xD1, 0xD2];
+        let stream2 = wrap_avc420(&chroma_annex_b);
+
+        // Skip pointer: 16 bytes of padding between the 4-byte
+        // length-LC header and stream2's start.
+        let padding_len: u32 = 16;
+        let padding = alloc::vec![0xAA_u8; padding_len as usize];
+
+        // LC=0b10 with stream1_len = padding_len. Parser must treat the
+        // padding region as skipped main-view space and pick up stream2
+        // starting at byte `4 + padding_len`.
+        let outer_len_lc = (padding_len << 2) | 0b10;
+        let mut envelope: Vec<u8> = Vec::new();
+        envelope.extend_from_slice(&outer_len_lc.to_le_bytes());
+        envelope.extend_from_slice(&padding);
+        envelope.extend_from_slice(&stream2);
+
+        renderer.on_wire_to_surface_1(
+            12,
+            0x000E,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 16, bottom: 16 },
+            &envelope,
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.chunks.len(),
+            1,
+            "LC=0b10 with non-zero stream1_len must invoke decoder exactly once"
+        );
+        assert_eq!(
+            recorded.chunks[0], chroma_annex_b,
+            "decoder must receive stream2's inner Annex B — the padding region must be skipped, not parsed"
+        );
+    }
+
+    /// PRD #35 Module B (#36 cycle 5): an envelope whose 30-bit
+    /// stream1 length field claims more bytes than the payload actually
+    /// carries must be rejected as truncated. Without this guard, the
+    /// parser would slice out of bounds. MS-RDPEGFX 2.2.4.5 — payload
+    /// length safety contract.
+    #[test]
+    fn avc444_stream1_len_exceeding_payload_drops_envelope() {
+        let calls = Arc::new(Mutex::new(RecordedCalls::default()));
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+        renderer.set_avc_decoder(alloc::boxed::Box::new(RecordingDecoder {
+            calls: calls.clone(),
+        }));
+
+        renderer.on_create_surface(10, 16, 16, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(10, 0, 0);
+
+        // Header claims stream1_len = 0x00FF_FFFF (16 MB) and LC=0b00,
+        // but the payload is only the 4-byte header + 2 token bytes —
+        // far short of the declared length.
+        let outer_len_lc = (0x00FF_FFFFu32 << 2) | 0b00;
+        let mut envelope: Vec<u8> = Vec::new();
+        envelope.extend_from_slice(&outer_len_lc.to_le_bytes());
+        envelope.extend_from_slice(&[0x00, 0x01]);
+
+        renderer.on_wire_to_surface_1(
+            10,
+            0x000E,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 16, bottom: 16 },
+            &envelope,
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert!(
+            recorded.chunks.is_empty(),
+            "stream1_len exceeding payload must drop the envelope, got {} calls",
+            recorded.chunks.len()
+        );
+    }
+
+    /// PRD #35 Module B (#36 cycle 4): LC=`0b11` is reserved per
+    /// MS-RDPEGFX 2.2.4.5 §4.4.5.1. The parser must reject the envelope
+    /// outright (return `None`) and the renderer must NOT invoke the
+    /// decoder. A future spec revision that assigns meaning to `0b11`
+    /// should arrive with its own dispatch arm — meanwhile, treat as
+    /// malformed.
+    #[test]
+    fn avc444_lc11_reserved_drops_envelope_without_calling_decoder() {
+        let calls = Arc::new(Mutex::new(RecordedCalls::default()));
+        let mut renderer = GfxRenderer::new(CaptureSink::default());
+        renderer.set_avc_decoder(alloc::boxed::Box::new(RecordingDecoder {
+            calls: calls.clone(),
+        }));
+
+        renderer.on_create_surface(9, 16, 16, GfxPixelFormat::ARGB_8888);
+        renderer.on_map_surface_to_output(9, 0, 0);
+
+        // Build a structurally well-formed AVC420 inner envelope so the
+        // only thing rejecting the payload is the reserved LC field.
+        let annex_b: Vec<u8> = vec![0x42, 0x43, 0x44];
+        let inner = wrap_avc420(&annex_b);
+
+        let outer_len_lc = ((inner.len() as u32) << 2) | 0b11;
+        let mut envelope: Vec<u8> = Vec::new();
+        envelope.extend_from_slice(&outer_len_lc.to_le_bytes());
+        envelope.extend_from_slice(&inner);
+
+        renderer.on_wire_to_surface_1(
+            9,
+            0x000E,
+            GfxPixelFormat::ARGB_8888,
+            GfxRect16 { left: 0, top: 0, right: 16, bottom: 16 },
+            &envelope,
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert!(
+            recorded.chunks.is_empty(),
+            "LC=0b11 (reserved) must drop the envelope without decoder calls, got {} calls",
+            recorded.chunks.len()
+        );
+    }
+
+    /// PRD #35 Module B (#36 cycle 3): LC=`0b01` envelope where the
+    /// declared stream1 length consumes the entire payload after the
+    /// 4-byte length-LC header, leaving zero bytes for stream2. The
+    /// parser must report stream2 as `None` rather than passing an empty
+    /// slice to the decoder. MS-RDPEGFX 2.2.4.5 — truncation contract.
     #[test]
     fn avc444_unwraps_outer_then_inner_envelope_to_decoder() {
         let calls = Arc::new(Mutex::new(RecordedCalls::default()));
@@ -1157,17 +1518,7 @@ mod tests {
         renderer.on_map_surface_to_output(5, 0, 0);
 
         let annex_b: Vec<u8> = vec![0xCA, 0xFE, 0xBA, 0xBE];
-
-        // Inner AVC420 envelope (1 region rect + 1 QQ + annex_b).
-        let mut inner: Vec<u8> = Vec::new();
-        inner.extend_from_slice(&1u32.to_le_bytes());
-        inner.extend_from_slice(&0u16.to_le_bytes());
-        inner.extend_from_slice(&0u16.to_le_bytes());
-        inner.extend_from_slice(&16u16.to_le_bytes());
-        inner.extend_from_slice(&16u16.to_le_bytes());
-        inner.push(20);
-        inner.push(80);
-        inner.extend_from_slice(&annex_b);
+        let inner = wrap_avc420(&annex_b);
 
         // Outer AVC444 envelope: cbAvc420EncodedBitstream1 packs
         // 30-bit length + 2-bit LC (luma+chroma=1 → bit 0 set).
