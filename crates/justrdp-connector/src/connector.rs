@@ -1745,7 +1745,13 @@ impl ClientConnector {
             }),
             CapabilitySet::VirtualChannel(VirtualChannelCapability {
                 flags: 0,
-                vc_chunk_size: Some(1600),
+                // MS-RDPBCGR 2.2.7.1.10 VCChunkSize: "This field is only
+                // present in capability sets sent from server to client."
+                // Sending it client→server is a spec violation that some
+                // Microsoft servers respond to by silently disabling all
+                // channel redirection (cliprdr / rdpsnd / rdpdr). Suspected
+                // root cause of #34 (cliprdr server silence post-MonitorReady).
+                vc_chunk_size: None,
             }),
             CapabilitySet::Sound(SoundCapability {
                 sound_flags: 0x0001, // SOUND_BEEPS_FLAG
