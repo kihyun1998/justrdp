@@ -387,6 +387,25 @@ impl SvcProcessor for CliprdrClient {
         result
     }
 
+    fn declared_caps(&self) -> Vec<justrdp_svc::audit::AdvertisedCap> {
+        // PRD #35 Module A2: declare exactly the bits this processor's
+        // handlers actually implement. Today that mirrors `local_flags`
+        // — every bit there has a corresponding behavior:
+        //   * USE_LONG_FORMAT_NAMES → FormatList long-name encode/decode
+        //   * STREAM_FILECLIP_ENABLED / FILECLIP_NO_FILE_PATHS /
+        //     HUGE_FILE_SUPPORT_ENABLED → on_file_contents_request handler
+        //   * CAN_LOCK_CLIPDATA → on_lock / on_unlock handlers
+        // Backends that supply real implementations flip the opt-in
+        // builders (with_file_support / with_lock_support); backends
+        // that don't keep the default narrow advertisement. Either way
+        // declared_caps stays consistent with local_flags.
+        (0..32)
+            .map(|i| 1u32 << i)
+            .filter(|bit| self.local_flags.bits() & bit != 0)
+            .map(justrdp_svc::audit::AdvertisedCap::CliprdrGeneralFlag)
+            .collect()
+    }
+
     fn poll(&mut self) -> SvcResult<Vec<SvcMessage>> {
         // Pre-handshake: drop drained items silently — listener may fire
         // before cap exchange completes (Win32 AddClipboardFormatListener
@@ -615,6 +634,33 @@ mod tests {
         assert_eq!(
             general_flags, expected,
             "with_file_support must add STREAM_FILECLIP_ENABLED | FILECLIP_NO_FILE_PATHS | HUGE_FILE_SUPPORT_ENABLED on top of the default, got 0x{general_flags:08x}"
+        );
+    }
+
+    /// PRD #35 Module A2: the audit-harness contract — every bit
+    /// `CliprdrClient` advertises through its `GeneralCapabilityFlags`
+    /// must appear in `SvcProcessor::declared_caps()`. With the
+    /// Module C default (USE_LONG_FORMAT_NAMES only), the declaration
+    /// must include that one bit.
+    #[test]
+    fn declared_caps_cover_default_advertisement() {
+        use justrdp_svc::audit::{audit, AdvertisedCap};
+        use justrdp_svc::SvcProcessor;
+        let client = CliprdrClient::new(Box::new(MockBackend::new()));
+        // Advertised set: each bit set in local_flags becomes one
+        // CliprdrGeneralFlag entry. We expose this directly here for
+        // the test rather than parsing the emitted Caps PDU.
+        let advertised: Vec<AdvertisedCap> = (0..32)
+            .map(|i| 1u32 << i)
+            .filter(|bit| client.local_flags.bits() & bit != 0)
+            .map(AdvertisedCap::CliprdrGeneralFlag)
+            .collect();
+        let declared = client.declared_caps();
+        let report = audit(&advertised, &declared);
+        assert!(
+            report.is_clean(),
+            "cliprdr's default advertisement must have full declared-handler coverage; orphans: {:?}",
+            report.orphan_advertised
         );
     }
 

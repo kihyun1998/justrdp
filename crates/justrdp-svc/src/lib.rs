@@ -31,6 +31,8 @@
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
+pub mod audit;
+#[cfg(feature = "alloc")]
 mod channel_name;
 #[cfg(feature = "alloc")]
 mod channel_set;
@@ -140,6 +142,17 @@ pub trait SvcProcessor: AsAny + Debug + Send {
     ///
     /// Returns response messages to send back.
     fn process(&mut self, payload: &[u8]) -> SvcResult<Vec<SvcMessage>>;
+
+    /// Declare which capability bits this processor's handlers actually
+    /// implement. PRD #35 Module A2: the [`audit`] harness compares the
+    /// set of bits advertised on the wire against the union of every
+    /// registered processor's `declared_caps`. An advertised bit with
+    /// no declaration is a `feedback_no_partial_protocol_enable`
+    /// violation. Default is empty — reactive processors that carry no
+    /// capability semantics of their own opt out by doing nothing.
+    fn declared_caps(&self) -> Vec<crate::audit::AdvertisedCap> {
+        Vec::new()
+    }
 
     /// Drain any host-side asynchronous messages this channel has queued.
     ///
