@@ -108,6 +108,55 @@ impl<S: FrameSink + Send + 'static> FrameSink for MutexFrameSink<S> {
     }
 }
 
+/// Strip the AVC420 envelope and return the inner H.264 Annex B bytes.
+///
+/// MS-RDPEGFX 2.2.4.4 `RDPGFX_AVC420_BITMAP_STREAM`:
+///   numRegionRects (u32 LE)
+///   regionRects[numRegionRects] (each 8 bytes: 4 × u16 LE)
+///   quantQualityVals[numRegionRects] (each 2 bytes)
+///   avc420EncodedBitstream (remaining)
+///
+/// Returns `None` if the payload is truncated relative to the
+/// declared `numRegionRects`.
+fn unwrap_avc420_envelope(payload: &[u8]) -> Option<&[u8]> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let num_rects = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let rects_len = num_rects.checked_mul(8)?;
+    let qq_len = num_rects.checked_mul(2)?;
+    let header_len = 4usize.checked_add(rects_len)?.checked_add(qq_len)?;
+    if payload.len() < header_len {
+        return None;
+    }
+    Some(&payload[header_len..])
+}
+
+/// Strip the AVC444 outer envelope, then the inner AVC420 envelope, and
+/// return the Annex B bytes of stream1 (the main view).
+///
+/// MS-RDPEGFX 2.2.4.5 `RDPGFX_AVC444_BITMAP_STREAM`:
+///   cbAvc420EncodedBitstream1 (u32 LE — high 30 bits = byte count of
+///     stream1, low 2 bits = LC frame type indicator)
+///   avc420EncodedBitstream1 (RDPGFX_AVC420_BITMAP_STREAM, length above)
+///   [avc420EncodedBitstream2] (RDPGFX_AVC420_BITMAP_STREAM, only when
+///     LC indicates a chroma-and-luma pair)
+///
+/// This slice handles stream1 only; stream2 (auxiliary view) is a
+/// follow-up. Returns `None` on truncation or malformed length.
+fn unwrap_avc444_envelope(payload: &[u8]) -> Option<&[u8]> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let header = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let stream1_len = (header >> 2) as usize;
+    let end = 4usize.checked_add(stream1_len)?;
+    if payload.len() < end {
+        return None;
+    }
+    unwrap_avc420_envelope(&payload[4..end])
+}
+
 /// EGFX bitmap-cache slot store (PRD #35 Module B).
 ///
 /// MS-RDPEGFX 2.2.2.13 (SurfaceToCache), 2.2.2.14 (CacheToSurface), and
@@ -380,16 +429,28 @@ impl<S: FrameSink + Send + 'static> GfxHandler for GfxRenderer<S> {
                     }
                 }
             }
-            // AVC420 / AVC444 / AVC444V2 — feed the raw bitmap_data to
-            // the registered AvcDecoder. The decoder is responsible for
-            // unwrapping the EGFX AVC envelope (RDPGFX_AVC420_BITMAP_STREAM
-            // or _AVC444_) before invoking its H.264 backend; PRD #28's
-            // scope is the dispatch boundary, not envelope parsing.
-            // Without a registered decoder, AVC payloads drop silently.
-            0x000B | 0x000E | 0x000F => {
+            // AVC420 (RDPGFX_CODECID_AVC420) / AVC444 / AVC444V2 — parse
+            // the EGFX envelope, then hand the inner H.264 Annex B
+            // bytestream to the registered AvcDecoder. The envelope
+            // varies per codec id: AVC420 = RDPGFX_AVC420_BITMAP_STREAM
+            // (MS-RDPEGFX 2.2.4.4); AVC444/AVC444V2 = one or two
+            // RDPGFX_AVC420_BITMAP_STREAMs preceded by a packed length+LC
+            // header (MS-RDPEGFX 2.2.4.5 / 2.2.4.6). PRD #35 Module B.
+            // YUV→RGBA composite onto the surface is a follow-up cycle.
+            0x000B => {
                 if let Some(decoder) = self.avc_decoder.as_mut() {
-                    let _ = decoder.decode_frame(bitmap_data);
-                    let _ = surface; // YUV→RGBA composite is a follow-up cycle
+                    if let Some(annex_b) = unwrap_avc420_envelope(bitmap_data) {
+                        let _ = decoder.decode_frame(annex_b);
+                    }
+                    let _ = surface;
+                }
+            }
+            0x000E | 0x000F => {
+                if let Some(decoder) = self.avc_decoder.as_mut() {
+                    if let Some(annex_b) = unwrap_avc444_envelope(bitmap_data) {
+                        let _ = decoder.decode_frame(annex_b);
+                    }
+                    let _ = surface;
                 }
             }
             // Other codecs (ClearCodec=0x0008, Planar=0x000A) tracked
@@ -1030,11 +1091,16 @@ mod tests {
         }
     }
 
-    /// AVC420 (codec_id 0x000B) payloads must reach the registered
-    /// `AvcDecoder` byte-identical. Without a registered decoder, the
-    /// payload drops silently (verified separately in `unknown_codec_*`).
+    /// PRD #35 Module B: AVC420 payloads carry an envelope before the
+    /// H.264 bitstream. MS-RDPEGFX 2.2.4.4 RDPGFX_AVC420_BITMAP_STREAM
+    /// is `numRegionRects(u32) + regionRects[N×8] + quantQualityVals[N×2]
+    /// + avc420EncodedBitstream`. The renderer must parse the envelope
+    /// and pass only the inner Annex B bytes to the registered
+    /// `AvcDecoder`. Earlier behaviour passed the entire wire payload
+    /// verbatim, which the decoder would misinterpret as garbage NALU
+    /// prefix.
     #[test]
-    fn avc420_routes_to_registered_avc_decoder() {
+    fn avc420_unwraps_envelope_and_passes_inner_annex_b() {
         let calls = Arc::new(Mutex::new(RecordedCalls::default()));
         let mut renderer = GfxRenderer::new(CaptureSink::default());
         renderer.set_avc_decoder(alloc::boxed::Box::new(RecordingDecoder {
@@ -1044,24 +1110,43 @@ mod tests {
         renderer.on_create_surface(4, 16, 16, GfxPixelFormat::ARGB_8888);
         renderer.on_map_surface_to_output(4, 0, 0);
 
-        let nal = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42]; // arbitrary "Annex B" prefix
+        let annex_b: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42];
+        let mut envelope: Vec<u8> = Vec::new();
+        envelope.extend_from_slice(&1u32.to_le_bytes()); // numRegionRects = 1
+        // regionRect: left=0 top=0 right=16 bottom=16 (8 bytes)
+        envelope.extend_from_slice(&0u16.to_le_bytes());
+        envelope.extend_from_slice(&0u16.to_le_bytes());
+        envelope.extend_from_slice(&16u16.to_le_bytes());
+        envelope.extend_from_slice(&16u16.to_le_bytes());
+        // quantQualityVal: qpVal=30 qualityVal=100 (2 bytes)
+        envelope.push(30);
+        envelope.push(100);
+        envelope.extend_from_slice(&annex_b);
+
         renderer.on_wire_to_surface_1(
             4,
             0x000B, // RDPGFX_CODECID_AVC420
             GfxPixelFormat::ARGB_8888,
             GfxRect16 { left: 0, top: 0, right: 16, bottom: 16 },
-            &nal,
+            &envelope,
         );
 
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.chunks.len(), 1, "decoder must be called once");
-        assert_eq!(recorded.chunks[0], nal, "decoder must receive bytes verbatim");
+        assert_eq!(
+            recorded.chunks[0], annex_b,
+            "decoder must receive the inner Annex B stream, envelope stripped"
+        );
     }
 
-    /// AVC444 (codec_id 0x000E) shares the same decoder slot as AVC420
-    /// — both H.264 — so a registered decoder must be invoked for both.
+    /// PRD #35 Module B: AVC444V2 (codec_id 0x000F) and AVC444 (0x000E)
+    /// wrap one or two AVC420 sub-streams. MS-RDPEGFX 2.2.4.5 layout:
+    /// `cbAvc420EncodedBitstream1(u32 with LC in low bits) +
+    /// avc420EncodedBitstream1(stream1) [+ avc420EncodedBitstream2]`.
+    /// Only the inner H.264 Annex B bytes of stream1 should reach the
+    /// decoder for this slice; stream2 (auxiliary view) is a follow-up.
     #[test]
-    fn avc444_routes_to_same_avc_decoder() {
+    fn avc444_unwraps_outer_then_inner_envelope_to_decoder() {
         let calls = Arc::new(Mutex::new(RecordedCalls::default()));
         let mut renderer = GfxRenderer::new(CaptureSink::default());
         renderer.set_avc_decoder(alloc::boxed::Box::new(RecordingDecoder {
@@ -1071,18 +1156,40 @@ mod tests {
         renderer.on_create_surface(5, 16, 16, GfxPixelFormat::ARGB_8888);
         renderer.on_map_surface_to_output(5, 0, 0);
 
-        let nal = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        let annex_b: Vec<u8> = vec![0xCA, 0xFE, 0xBA, 0xBE];
+
+        // Inner AVC420 envelope (1 region rect + 1 QQ + annex_b).
+        let mut inner: Vec<u8> = Vec::new();
+        inner.extend_from_slice(&1u32.to_le_bytes());
+        inner.extend_from_slice(&0u16.to_le_bytes());
+        inner.extend_from_slice(&0u16.to_le_bytes());
+        inner.extend_from_slice(&16u16.to_le_bytes());
+        inner.extend_from_slice(&16u16.to_le_bytes());
+        inner.push(20);
+        inner.push(80);
+        inner.extend_from_slice(&annex_b);
+
+        // Outer AVC444 envelope: cbAvc420EncodedBitstream1 packs
+        // 30-bit length + 2-bit LC (luma+chroma=1 → bit 0 set).
+        let outer_len_lc = ((inner.len() as u32) << 2) | 0b01;
+        let mut envelope: Vec<u8> = Vec::new();
+        envelope.extend_from_slice(&outer_len_lc.to_le_bytes());
+        envelope.extend_from_slice(&inner);
+
         renderer.on_wire_to_surface_1(
             5,
             0x000E, // RDPGFX_CODECID_AVC444
             GfxPixelFormat::ARGB_8888,
             GfxRect16 { left: 0, top: 0, right: 16, bottom: 16 },
-            &nal,
+            &envelope,
         );
 
         let recorded = calls.lock().unwrap();
-        assert_eq!(recorded.chunks.len(), 1);
-        assert_eq!(recorded.chunks[0], nal);
+        assert_eq!(recorded.chunks.len(), 1, "decoder must be called once for stream1");
+        assert_eq!(
+            recorded.chunks[0], annex_b,
+            "decoder must receive inner Annex B, both envelopes stripped"
+        );
     }
 
     /// `on_reset_graphics` discards the entire surface map. After reset,
