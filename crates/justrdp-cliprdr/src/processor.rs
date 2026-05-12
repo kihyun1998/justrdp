@@ -75,11 +75,11 @@ impl CliprdrClient {
         Self {
             state: CliprdrState::WaitingForServerCaps,
             backend,
-            local_flags: GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
-                .union(GeneralCapabilityFlags::STREAM_FILECLIP_ENABLED)
-                .union(GeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS)
-                .union(GeneralCapabilityFlags::CAN_LOCK_CLIPDATA)
-                .union(GeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED),
+            // PRD #35 Module C: default advertises only USE_LONG_FORMAT_NAMES.
+            // File / lock support is opt-in via `with_file_support` /
+            // `with_lock_support` so capability bits stay paired with
+            // backend handlers (feedback_no_partial_protocol_enable).
+            local_flags: GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
             negotiated_flags: GeneralCapabilityFlags::NONE,
             temp_dir: None,
             pending_format_data_request: None,
@@ -95,6 +95,33 @@ impl CliprdrClient {
     /// Set the local capability flags.
     pub fn with_flags(mut self, flags: GeneralCapabilityFlags) -> Self {
         self.local_flags = flags;
+        self
+    }
+
+    /// Opt into file-clipboard advertisement (PRD #35 Module C).
+    ///
+    /// Adds `STREAM_FILECLIP_ENABLED`, `FILECLIP_NO_FILE_PATHS`, and
+    /// `HUGE_FILE_SUPPORT_ENABLED` on top of whatever was already set.
+    /// Backends without a real `on_file_contents_request` handler MUST
+    /// NOT call this — the default backend reject contract preserves
+    /// safety, but advertising bits without handlers is the
+    /// `feedback_no_partial_protocol_enable` anti-pattern.
+    pub fn with_file_support(mut self) -> Self {
+        self.local_flags = self.local_flags
+            .union(GeneralCapabilityFlags::STREAM_FILECLIP_ENABLED)
+            .union(GeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS)
+            .union(GeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED);
+        self
+    }
+
+    /// Opt into Lock / Unlock Clipboard Data advertisement (PRD #35 Module C).
+    ///
+    /// Adds `CAN_LOCK_CLIPDATA`. Backends that override `on_lock` and
+    /// `on_unlock` with real semantics (not the trait no-op defaults)
+    /// flip this on.
+    pub fn with_lock_support(mut self) -> Self {
+        self.local_flags = self.local_flags
+            .union(GeneralCapabilityFlags::CAN_LOCK_CLIPDATA);
         self
     }
 
@@ -491,6 +518,18 @@ mod tests {
         CliprdrClient::new(Box::new(MockBackend::new()))
     }
 
+    /// Extract the advertised `generalFlags` from an emitted Caps PDU.
+    ///
+    /// Centralises the offset arithmetic so the cap-hygiene tests don't
+    /// have to know the layout: ClipboardHeader(8) + cCapabilitiesSets(2)
+    /// + pad(2) + capType(2) + lengthCapability(2) + version(4) = 20
+    /// bytes before the four-byte `generalFlags` field. If the PDU
+    /// encoding ever shifts, only this helper changes.
+    fn caps_pdu_general_flags(caps_pdu: &[u8]) -> u32 {
+        assert!(caps_pdu.len() >= 24, "Caps PDU must include GeneralCapabilitySet");
+        u32::from_le_bytes([caps_pdu[20], caps_pdu[21], caps_pdu[22], caps_pdu[23]])
+    }
+
     /// Complete the handshake: send server Caps → MonitorReady.
     /// Returns the init response messages from MonitorReady.
     fn complete_handshake(client: &mut CliprdrClient) -> Vec<SvcMessage> {
@@ -532,6 +571,115 @@ mod tests {
 
         // Client local_flags includes STREAM_FILECLIP_ENABLED, but server doesn't
         assert!(!client.negotiated_flags.contains(GeneralCapabilityFlags::STREAM_FILECLIP_ENABLED));
+    }
+
+    /// PRD #35 Module C: the default `CliprdrClient::new()` must advertise
+    /// only `USE_LONG_FORMAT_NAMES`. The previous default (`0x3e`, including
+    /// `STREAM_FILECLIP_ENABLED`, `FILECLIP_NO_FILE_PATHS`, `CAN_LOCK_CLIPDATA`,
+    /// `HUGE_FILE_SUPPORT_ENABLED`) violated `feedback_no_partial_protocol_enable`:
+    /// every one of those bits was paired with a backend handler that defaults
+    /// to reject or no-op. Server-visible behaviour is what we lock here —
+    /// the bytes of the Caps PDU we put on the wire, not the internal field.
+    #[test]
+    fn default_new_advertises_only_long_format_names() {
+        let mut client = new_client();
+        let msgs = complete_handshake(&mut client);
+        // Init response: msgs[0] = Caps PDU, msgs[1] = FormatList PDU
+        let caps = &msgs[0].data;
+        // ClipboardHeader(8) + cCapabilitiesSets(2) + pad(2) + capType(2)
+        // + lengthCapability(2) + version(4) = 20 bytes before generalFlags.
+        // generalFlags is a u32 LE at offset 20..24.
+        assert!(caps.len() >= 24, "Caps PDU must include the GeneralCapabilitySet");
+        let general_flags = u32::from_le_bytes([caps[20], caps[21], caps[22], caps[23]]);
+        assert_eq!(
+            general_flags,
+            GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES.bits(),
+            "default advertisement must be USE_LONG_FORMAT_NAMES only (0x02), got 0x{general_flags:08x}"
+        );
+    }
+
+    /// PRD #35 Module C: opt-in file-clipboard support adds the three file
+    /// caps on top of the default. A backend that genuinely handles
+    /// `FileContentsRequest` (e.g. a future `NativeClipboardFiles` impl)
+    /// flips them on; the bits stay off otherwise.
+    #[test]
+    fn with_file_support_adds_file_caps_to_default() {
+        let mut client = CliprdrClient::new(Box::new(MockBackend::new())).with_file_support();
+        let msgs = complete_handshake(&mut client);
+        let general_flags = caps_pdu_general_flags(&msgs[0].data);
+        let expected = GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+            .union(GeneralCapabilityFlags::STREAM_FILECLIP_ENABLED)
+            .union(GeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS)
+            .union(GeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED)
+            .bits();
+        assert_eq!(
+            general_flags, expected,
+            "with_file_support must add STREAM_FILECLIP_ENABLED | FILECLIP_NO_FILE_PATHS | HUGE_FILE_SUPPORT_ENABLED on top of the default, got 0x{general_flags:08x}"
+        );
+    }
+
+    /// PRD #35 Module C: opt-in lock support adds `CAN_LOCK_CLIPDATA` only.
+    /// Backends that implement `on_lock` / `on_unlock` with real semantics
+    /// (not the trait defaults) flip this on.
+    #[test]
+    fn with_lock_support_adds_lock_cap_to_default() {
+        let mut client = CliprdrClient::new(Box::new(MockBackend::new())).with_lock_support();
+        let msgs = complete_handshake(&mut client);
+        let general_flags = caps_pdu_general_flags(&msgs[0].data);
+        let expected = GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+            .union(GeneralCapabilityFlags::CAN_LOCK_CLIPDATA)
+            .bits();
+        assert_eq!(
+            general_flags, expected,
+            "with_lock_support must add CAN_LOCK_CLIPDATA on top of the default, got 0x{general_flags:08x}"
+        );
+    }
+
+    /// PRD #35 Module C: opt-in builders compose. A backend that does
+    /// both file *and* lock implements both traits; calling the two
+    /// builders should yield the union of all four caps on top of the
+    /// long-format-name default. Locks the contract that builders are
+    /// accumulative (`|=`), not replacing (`=`).
+    #[test]
+    fn with_file_and_lock_support_compose_additively() {
+        let mut client = CliprdrClient::new(Box::new(MockBackend::new()))
+            .with_file_support()
+            .with_lock_support();
+        let msgs = complete_handshake(&mut client);
+        let general_flags = caps_pdu_general_flags(&msgs[0].data);
+        let expected = GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+            .union(GeneralCapabilityFlags::STREAM_FILECLIP_ENABLED)
+            .union(GeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS)
+            .union(GeneralCapabilityFlags::CAN_LOCK_CLIPDATA)
+            .union(GeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED)
+            .bits();
+        assert_eq!(
+            general_flags, expected,
+            "chained builders must compose additively (USE_LONG_FORMAT_NAMES + 3 file + 1 lock = 0x3e), got 0x{general_flags:08x}"
+        );
+    }
+
+    /// PRD #35 Module C: `with_flags` keeps its existing absolute-override
+    /// contract. Callers that have already constructed the precise flag
+    /// set (e.g. tests, advanced embedders driving custom protocols) must
+    /// be able to bypass the default + opt-in builders entirely. Even
+    /// when applied *after* `with_file_support()`, the explicit flags win.
+    #[test]
+    fn with_flags_overrides_prior_builders() {
+        // Build a client that has every opt-in cap on, then explicitly
+        // narrow with `with_flags`: the final advertised set must match
+        // the explicit flags exactly, not the accumulated builders.
+        let mut client = CliprdrClient::new(Box::new(MockBackend::new()))
+            .with_file_support()
+            .with_lock_support()
+            .with_flags(GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES);
+        let msgs = complete_handshake(&mut client);
+        let general_flags = caps_pdu_general_flags(&msgs[0].data);
+        assert_eq!(
+            general_flags,
+            GeneralCapabilityFlags::USE_LONG_FORMAT_NAMES.bits(),
+            "with_flags must be an absolute override regardless of prior builder calls, got 0x{general_flags:08x}"
+        );
     }
 
     #[test]
