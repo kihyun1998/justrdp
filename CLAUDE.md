@@ -4,6 +4,8 @@
 
 Pure Rust RDP library. `no_std` core, zero C dependencies. Uses `Encode`/`Decode` traits with `ReadCursor`/`WriteCursor` for all PDU serialization.
 
+**Scope of "zero C dependencies"**: applies to core library crates (`justrdp-core`, `justrdp-pdu`, `justrdp-graphics`, `justrdp-connector`, `justrdp-svc`, `justrdp-dvc`, `justrdp-egfx`, `justrdp-web`, etc.). Leaf binaries (`justrdp-tauri` and similar reference apps) may take narrow, well-scoped C-backed deps for codec / platform-UI needs that have no viable pure-Rust alternative — currently only `openh264` for H.264 decode (see [ADR-0009](docs/adr/0009-openh264-in-leaf-binary.md)). Every such exception requires an ADR.
+
 ## Crate Structure
 
 - `justrdp-core` — Encode/Decode traits, cursors, crypto primitives (RC4, AES, DES, RSA, SHA, MD5, HMAC)
