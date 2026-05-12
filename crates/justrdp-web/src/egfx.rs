@@ -104,6 +104,71 @@ impl<S: FrameSink + Send + 'static> FrameSink for MutexFrameSink<S> {
     }
 }
 
+/// EGFX bitmap-cache slot store (PRD #35 Module B).
+///
+/// MS-RDPEGFX 2.2.2.13 (SurfaceToCache), 2.2.2.14 (CacheToSurface), and
+/// 2.2.2.16 (EvictCacheEntry) describe a server-driven cache: the
+/// server tells us when to insert (with cache_slot + key), when to read
+/// (slot → blit at dest points), and when to evict. The client does
+/// *not* run its own eviction policy — server is authoritative.
+///
+/// `GfxCache` is intentionally a small trait so the renderer never
+/// touches raw storage. Implementations can be HashMap-backed, slab-
+/// backed, or memory-bounded without renderer code knowing.
+pub mod cache {
+    use alloc::collections::BTreeMap;
+    use alloc::vec::Vec;
+
+    /// A bitmap region stored in one cache slot. Pixels are top-down
+    /// RGBA, matching the format the rest of `GfxRenderer` keeps in
+    /// `SurfaceState::pixels_rgba`.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CachedTile {
+        pub width: u16,
+        pub height: u16,
+        pub pixels_rgba: Vec<u8>,
+    }
+
+    /// Server-driven bitmap cache backing.
+    pub trait GfxCache {
+        /// Store `tile` under `slot`. Replaces any prior entry at the
+        /// same slot (the server is responsible for issuing
+        /// EvictCacheEntry before reusing a slot when it cares about
+        /// the previous tile).
+        fn insert(&mut self, slot: u16, tile: CachedTile);
+        /// Look up the tile at `slot`, if any.
+        fn get(&self, slot: u16) -> Option<&CachedTile>;
+        /// Remove the tile at `slot`. No-op if the slot was empty.
+        fn evict(&mut self, slot: u16);
+    }
+
+    /// Default in-memory `GfxCache` impl — a `BTreeMap<u16, CachedTile>`.
+    #[derive(Default, Debug)]
+    pub struct InMemoryGfxCache {
+        slots: BTreeMap<u16, CachedTile>,
+    }
+
+    impl InMemoryGfxCache {
+        pub fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    impl GfxCache for InMemoryGfxCache {
+        fn insert(&mut self, slot: u16, tile: CachedTile) {
+            self.slots.insert(slot, tile);
+        }
+
+        fn get(&self, slot: u16) -> Option<&CachedTile> {
+            self.slots.get(&slot)
+        }
+
+        fn evict(&mut self, slot: u16) {
+            self.slots.remove(&slot);
+        }
+    }
+}
+
 /// Per-surface state held by [`GfxRenderer`]. Pixels are stored top-down
 /// RGBA (the format `FrameSink::blit_rgba` expects), regardless of the
 /// surface's wire pixel format — the wire format is normalised at write
@@ -626,6 +691,30 @@ mod tests {
 
     fn full_surface_bgra(pixel: &[u8], w: usize, h: usize) -> Vec<u8> {
         pixel.iter().copied().cycle().take(w * h * 4).collect()
+    }
+
+    /// PRD #35 Module B (cache slice): the cache module's core contract.
+    /// An inserted tile is retrievable bit-for-bit through the trait's
+    /// public interface; evicting a slot makes it unfindable. Tests
+    /// behaviour, not internal storage: the trait could be backed by a
+    /// HashMap, an LRU, a slab — none of that should be observable.
+    #[test]
+    fn gfx_cache_insert_get_evict_roundtrip() {
+        use super::cache::{CachedTile, GfxCache, InMemoryGfxCache};
+        let mut cache = InMemoryGfxCache::new();
+        let tile = CachedTile {
+            width: 4,
+            height: 4,
+            pixels_rgba: vec![0xAB; 4 * 4 * 4],
+        };
+        cache.insert(7, tile.clone());
+        let got = cache.get(7).expect("inserted slot must be retrievable");
+        assert_eq!(got.width, tile.width);
+        assert_eq!(got.height, tile.height);
+        assert_eq!(got.pixels_rgba, tile.pixels_rgba);
+
+        cache.evict(7);
+        assert!(cache.get(7).is_none(), "evicted slot must be gone");
     }
 
     /// ClearCodec (codec_id 0x0008): a minimum-valid 14-byte all-zero
