@@ -2305,6 +2305,120 @@ mod tests {
         assert!(connector.next_pdu_hint().is_some());
     }
 
+    /// PRD #35 Module A2 connector-level: lock the exact set of
+    /// CapabilitySet types `ConfirmActivePdu` advertises so that any
+    /// future addition or removal is an intentional, reviewed change.
+    /// Pairs with the channel-level audit in `justrdp-svc::audit`.
+    ///
+    /// The list is the *intended* advertisement, not a mstsc-equivalence
+    /// check — a follow-up cycle will diff this against the mstsc
+    /// reference (`BitmapCacheRev2`, `OffscreenCache`, `FrameAcknowledge`
+    /// are currently absent and suspected to contribute to issue #34's
+    /// cliprdr silence; that diff drives the next investigation step).
+    #[test]
+    fn confirm_active_cap_set_types_match_intended_enumeration() {
+        use justrdp_pdu::rdp::capabilities::CapabilitySetType;
+        let config = Config::builder("user", "pass").build();
+        let connector = ClientConnector::new(config);
+        let advertised: Vec<u16> = connector
+            .build_client_capabilities()
+            .iter()
+            .map(|c| c.cap_type())
+            .collect();
+        // EXPECTED — the exact ordered list we currently choose to
+        // advertise. Adding or removing an entry here must be a
+        // deliberate, reviewed change.
+        let expected: Vec<u16> = vec![
+            CapabilitySetType::General as u16,
+            CapabilitySetType::Bitmap as u16,
+            CapabilitySetType::Order as u16,
+            CapabilitySetType::Input as u16,
+            CapabilitySetType::Font as u16,
+            CapabilitySetType::Brush as u16,
+            CapabilitySetType::GlyphCache as u16,
+            CapabilitySetType::VirtualChannel as u16,
+            CapabilitySetType::Sound as u16,
+            CapabilitySetType::Control as u16,
+            CapabilitySetType::Activation as u16,
+            CapabilitySetType::Pointer as u16,
+            CapabilitySetType::Share as u16,
+            CapabilitySetType::MultifragmentUpdate as u16,
+            CapabilitySetType::LargePointer as u16,
+            CapabilitySetType::SurfaceCommands as u16,
+            CapabilitySetType::BitmapCodecs as u16,
+        ];
+        assert_eq!(
+            advertised, expected,
+            "ConfirmActivePdu cap set type advertisement deviated from the intended list; update either build_client_capabilities or this expected list deliberately"
+        );
+    }
+
+    /// PRD #35 Module A2 connector-level: enumerate the CapabilitySet
+    /// types `mstsc` advertises (FreeRDP `rdp_recv_get_active_header` +
+    /// MS-RDPBCGR 2.2.7 reference) and check exactly which entries our
+    /// `ConfirmActivePdu` omits. The diff is the suspected
+    /// `feedback_no_partial_protocol_enable` under-advertisement gap
+    /// that contributes to the cliprdr server-silence symptom in
+    /// issue #34.
+    ///
+    /// As each missing cap gains a real implementation (cache state for
+    /// `BitmapCacheRev2`, offscreen surface tracker for `OffscreenCache`,
+    /// frame ack pump for `FrameAcknowledge`), it moves out of
+    /// `expected_missing` and into the intended advertisement list (see
+    /// `confirm_active_cap_set_types_match_intended_enumeration`).
+    #[test]
+    fn confirm_active_diff_from_mstsc_baseline_matches_documented_gaps() {
+        use justrdp_pdu::rdp::capabilities::CapabilitySetType as T;
+        let config = Config::builder("user", "pass").build();
+        let connector = ClientConnector::new(config);
+        let advertised: Vec<u16> = connector
+            .build_client_capabilities()
+            .iter()
+            .map(|c| c.cap_type())
+            .collect();
+        // mstsc / FreeRDP baseline for a modern Windows client (no RAIL,
+        // no remote-program features — the typical user-facing setup).
+        let mstsc_baseline: Vec<u16> = vec![
+            T::General as u16,
+            T::Bitmap as u16,
+            T::Order as u16,
+            T::BitmapCacheRev2 as u16,
+            T::Control as u16,
+            T::Activation as u16,
+            T::Pointer as u16,
+            T::Share as u16,
+            T::Sound as u16,
+            T::Input as u16,
+            T::Font as u16,
+            T::Brush as u16,
+            T::GlyphCache as u16,
+            T::OffscreenCache as u16,
+            T::VirtualChannel as u16,
+            T::MultifragmentUpdate as u16,
+            T::LargePointer as u16,
+            T::SurfaceCommands as u16,
+            T::BitmapCodecs as u16,
+            T::FrameAcknowledge as u16,
+        ];
+        let missing: Vec<u16> = mstsc_baseline
+            .iter()
+            .filter(|cap| !advertised.contains(cap))
+            .copied()
+            .collect();
+        // Documented gaps — each is suspected as a contributor to the
+        // issue #34 cliprdr silence. Removing an entry from this list
+        // must be paired with adding a real handler + cap set entry.
+        let expected_missing: Vec<u16> = vec![
+            T::BitmapCacheRev2 as u16,
+            T::OffscreenCache as u16,
+            T::FrameAcknowledge as u16,
+        ];
+        assert_eq!(
+            missing, expected_missing,
+            "advertisement gap relative to mstsc must match the documented PRD #35 list; if a cap was implemented or removed, update this expectation"
+        );
+    }
+
     #[test]
     fn confirm_active_advertises_rfx_bitmap_codec() {
         use justrdp_pdu::rdp::capabilities::{
