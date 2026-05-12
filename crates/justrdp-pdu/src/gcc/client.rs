@@ -218,8 +218,9 @@ impl ClientCoreData {
             // PRD #35 Module A1: mstsc-equivalent baseline so the server
             // recognises a full-feature client. Adding SUPPORT_MONITOR_LAYOUT_PDU
             // is the connector's job (only when monitor data is present).
-            // SUPPORT_DYNVC_GFX_PROTOCOL stays off until Module B's EGFX
-            // renderer completes the five missing handlers.
+            // SUPPORT_DYNVC_GFX_PROTOCOL is OR-d in by the connector
+            // unconditionally (Module B #38, commits 879db46 + 1f3e041)
+            // since every required RDPGFX_* handler is now wired.
             early_capability_flags: Some(EarlyCapabilityFlags::from_bits(
                 EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU.bits()
                     | EarlyCapabilityFlags::WANT_32BPP_SESSION.bits()
@@ -778,8 +779,9 @@ mod tests {
     ///
     /// `SUPPORT_MONITOR_LAYOUT_PDU` is OR-d in by the connector when monitor
     /// data is present (multi-monitor path), so it is not in the baseline.
-    /// `SUPPORT_DYNVC_GFX_PROTOCOL` is intentionally still omitted until
-    /// PRD #35 Module B completes the EGFX renderer.
+    /// `SUPPORT_DYNVC_GFX_PROTOCOL` is similarly OR-d in by the connector
+    /// (unconditionally, PRD #35 Module B #38), so it is not in this
+    /// baseline either — the test below pins the *constructor* default.
     #[test]
     fn client_core_data_default_advertises_mstsc_equivalent_early_caps() {
         let core = ClientCoreData::new(800, 600);

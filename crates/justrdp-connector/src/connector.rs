@@ -767,22 +767,22 @@ impl ClientConnector {
         core_data.client_name = self.config.client_name.clone();
         core_data.server_selected_protocol = Some(self.selected_protocol.bits());
 
-        // SUPPORT_DYNVC_GFX_PROTOCOL flag intentionally NOT advertised
-        // until the EGFX renderer (justrdp-web::egfx::GfxRenderer) handles
-        // every required RDPGFX_* PDU. Currently missing: cache_to_surface,
-        // surface_to_cache, evict_cache_entry, AVC envelope, planar codec.
-        // When the flag is set, the server stops using the fast-path
-        // Bitmap update for many regions and switches to EGFX commands;
-        // any unhandled command silently drops, leaving the screen
-        // partially black (regression observed during PRD #20 / #32 dev
-        // session 2026-05-11). Re-enable the OR-in below once GfxRenderer
-        // is complete.
-        //
-        // let existing = core_data.early_capability_flags
-        //     .unwrap_or(EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU);
-        // core_data.early_capability_flags = Some(EarlyCapabilityFlags::from_bits(
-        //     existing.bits() | EarlyCapabilityFlags::SUPPORT_DYNVC_GFX_PROTOCOL.bits(),
-        // ));
+        // SUPPORT_DYNVC_GFX_PROTOCOL — advertised now that every required
+        // RDPGFX_* PDU has a handler in justrdp-web::egfx::GfxRenderer:
+        //   * cache_to_surface / surface_to_cache / evict_cache_entry
+        //     wired in commits c7628d6 + c48a7a7
+        //   * AVC envelope (stream1 + stream2 + LC dispatch) — slice α
+        //     (#36) commits a255b0a + 879db46
+        //   * Planar codec (0x000A) dispatch — slice β (#37) commit 1f3e041
+        // Once the bit is set, the server stops emitting fast-path Bitmap
+        // for many regions and switches to EGFX commands. Handlers above
+        // cover the full advertised surface — `feedback_no_partial_protocol_enable`
+        // satisfied. MS-RDPBCGR 2.2.1.3.3.
+        let existing = core_data.early_capability_flags
+            .unwrap_or(EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU);
+        core_data.early_capability_flags = Some(EarlyCapabilityFlags::from_bits(
+            existing.bits() | EarlyCapabilityFlags::SUPPORT_DYNVC_GFX_PROTOCOL.bits(),
+        ));
 
         let (monitor_data, monitor_ext_data) = self.build_monitor_blocks(&mut core_data)?;
 
@@ -3306,6 +3306,85 @@ mod tests {
         // Verify desktopWidth/desktopHeight = bounding rect of 2×1920×1080
         assert_eq!(core.desktop_width, 3840);
         assert_eq!(core.desktop_height, 1080);
+    }
+
+    /// PRD #35 Module B (#38 cycle 2): the SUPPORT_DYNVC_GFX_PROTOCOL
+    /// OR-in must NOT clobber bits already set on
+    /// `ClientCoreData::early_capability_flags` by the upstream
+    /// `ClientCoreData::new` mstsc baseline (Module A1, commit 6dc5cfd)
+    /// or by `build_monitor_blocks`'s SUPPORT_MONITOR_LAYOUT_PDU OR-in.
+    /// Use `existing.bits() | NEW.bits()` so all flags accumulate.
+    #[test]
+    fn gcc_dynvc_or_in_preserves_baseline_and_monitor_layout_bits() {
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .monitor(MonitorConfig::secondary(1920, 0, 1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+
+        let buf = step_gcc(&mut connector);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let _tpkt = TpktHeader::decode(&mut cursor).unwrap();
+        let _dt = DataTransfer::decode(&mut cursor).unwrap();
+        let ci = ConnectInitial::decode(&mut cursor).unwrap();
+        let gcc = ConferenceCreateRequest::decode(&mut ReadCursor::new(&ci.user_data)).unwrap();
+        let mut gcc_cursor = ReadCursor::new(&gcc.user_data);
+        let core = ClientCoreData::decode(&mut gcc_cursor).unwrap();
+
+        let flags = core.early_capability_flags.expect("earlyCapabilityFlags must be set");
+
+        // SUPPORT_ERRINFO_PDU is the most stable mstsc baseline bit —
+        // it must remain set even after the new OR-in. SUPPORT_MONITOR_LAYOUT_PDU
+        // is the bit that build_monitor_blocks OR-d earlier in the
+        // same emit cycle; the DYNVC OR-in must not strip it either.
+        assert!(
+            flags.contains(EarlyCapabilityFlags::SUPPORT_ERRINFO_PDU),
+            "SUPPORT_ERRINFO_PDU baseline bit must be preserved, got 0x{:04X}",
+            flags.bits()
+        );
+        assert!(
+            flags.contains(EarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU),
+            "SUPPORT_MONITOR_LAYOUT_PDU (from build_monitor_blocks) must be preserved, got 0x{:04X}",
+            flags.bits()
+        );
+        assert!(
+            flags.contains(EarlyCapabilityFlags::SUPPORT_DYNVC_GFX_PROTOCOL),
+            "SUPPORT_DYNVC_GFX_PROTOCOL must be set alongside baseline bits, got 0x{:04X}",
+            flags.bits()
+        );
+    }
+
+    /// PRD #35 Module B (#38 tracer): once the EGFX renderer handles
+    /// every required RDPGFX_* PDU (cache slices c7628d6/c48a7a7, AVC
+    /// envelope #36, Planar codec #37), the connector advertises
+    /// `SUPPORT_DYNVC_GFX_PROTOCOL` (0x0100) in the GCC CS_CORE
+    /// `earlyCapabilityFlags`. This is what makes the server treat us
+    /// as an EGFX-capable client and switch many regions from fast-path
+    /// Bitmap to EGFX commands. MS-RDPBCGR 2.2.1.3.3 — flag set.
+    #[test]
+    fn gcc_emits_support_dynvc_gfx_protocol_in_early_capability_flags() {
+        let config = Config::builder("user", "pass")
+            .monitor(MonitorConfig::primary(1920, 1080))
+            .build();
+        let mut connector = monitor_connector(config, NegotiationResponseFlags::EXTENDED_CLIENT_DATA);
+
+        let buf = step_gcc(&mut connector);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let _tpkt = TpktHeader::decode(&mut cursor).unwrap();
+        let _dt = DataTransfer::decode(&mut cursor).unwrap();
+        let ci = ConnectInitial::decode(&mut cursor).unwrap();
+        let gcc = ConferenceCreateRequest::decode(&mut ReadCursor::new(&ci.user_data)).unwrap();
+        let mut gcc_cursor = ReadCursor::new(&gcc.user_data);
+        let core = ClientCoreData::decode(&mut gcc_cursor).unwrap();
+
+        let flags = core.early_capability_flags.expect("earlyCapabilityFlags must be set");
+        assert!(
+            flags.contains(EarlyCapabilityFlags::SUPPORT_DYNVC_GFX_PROTOCOL),
+            "earlyCapabilityFlags must include SUPPORT_DYNVC_GFX_PROTOCOL (0x0100), got 0x{:04X}",
+            flags.bits()
+        );
     }
 
     #[test]

@@ -647,6 +647,20 @@ impl SvcProcessor for DrdynvcClient {
     fn compression_condition(&self) -> CompressionCondition {
         CompressionCondition::Never
     }
+
+    fn declared_caps(&self) -> Vec<justrdp_svc::audit::AdvertisedCap> {
+        // PRD #35 Module B (#38): `DrdynvcClient` is the SVC processor
+        // that registers the `Microsoft::Windows::RDS::Graphics` dynamic
+        // channel — i.e. the channel the
+        // `EarlyCapabilityFlags::SUPPORT_DYNVC_GFX_PROTOCOL` (0x0100)
+        // wire bit announces support for. The bit value is fixed by
+        // MS-RDPBCGR 2.2.1.3.3 and cannot drift; we hardcode it here
+        // rather than depending on `justrdp-pdu` for one u16 constant.
+        // The audit harness in `justrdp-svc::audit` cross-checks this
+        // declaration against the connector's advertised set so that
+        // `feedback_no_partial_protocol_enable` is enforced by tests.
+        vec![justrdp_svc::audit::AdvertisedCap::EarlyCapability(0x0100)]
+    }
 }
 
 #[cfg(test)]
@@ -1275,5 +1289,52 @@ mod tests {
             }
             other => panic!("expected Tunnel, got {other:?}"),
         }
+    }
+
+    /// PRD #35 Module B (#38 cycle 3): `DrdynvcClient` owns the
+    /// `Microsoft::Windows::RDS::Graphics` dynamic channel registration
+    /// (which is the only reason a server consults
+    /// `EarlyCapabilityFlags::SUPPORT_DYNVC_GFX_PROTOCOL = 0x0100`), so
+    /// its `SvcProcessor::declared_caps()` must declare that bit. The
+    /// audit harness in `justrdp-svc::audit` uses this declaration to
+    /// confirm `feedback_no_partial_protocol_enable` — every advertised
+    /// EarlyCapability bit has a registered handler. MS-RDPBCGR
+    /// 2.2.1.3.3 fixes the wire value at 0x0100.
+    #[test]
+    fn declared_caps_owns_support_dynvc_gfx_protocol_bit() {
+        use justrdp_svc::audit::AdvertisedCap;
+        use justrdp_svc::SvcProcessor;
+
+        let client = DrdynvcClient::new();
+        let declared = client.declared_caps();
+        assert!(
+            declared.contains(&AdvertisedCap::EarlyCapability(0x0100)),
+            "DrdynvcClient::declared_caps must include EarlyCapability(0x0100) = SUPPORT_DYNVC_GFX_PROTOCOL, got {declared:?}"
+        );
+    }
+
+    /// PRD #35 Module B (#38 cycle 4): the audit harness cross-axis
+    /// contract — if the connector advertises
+    /// `EarlyCapability(SUPPORT_DYNVC_GFX_PROTOCOL)` on the wire, the
+    /// processor that owns the corresponding dynamic-channel handlers
+    /// must declare it. With `DrdynvcClient` declaring 0x0100, the
+    /// audit returns a clean report. This locks the
+    /// `feedback_no_partial_protocol_enable` invariant for the EGFX
+    /// dynamic channel — a future regression that drops the
+    /// `declared_caps` override would surface here.
+    #[test]
+    fn audit_advertised_dynvc_gfx_bit_is_clean_with_drdynvc_client_declaration() {
+        use justrdp_svc::audit::{audit, AdvertisedCap};
+        use justrdp_svc::SvcProcessor;
+
+        let client = DrdynvcClient::new();
+        let advertised = [AdvertisedCap::EarlyCapability(0x0100)];
+        let report = audit(&advertised, &client.declared_caps());
+
+        assert!(
+            report.is_clean(),
+            "audit must be clean — DrdynvcClient owns SUPPORT_DYNVC_GFX_PROTOCOL. orphan_advertised = {:?}",
+            report.orphan_advertised
+        );
     }
 }
