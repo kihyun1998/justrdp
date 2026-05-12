@@ -2419,6 +2419,33 @@ mod tests {
         );
     }
 
+    /// PRD #35 Module A2: regression-lock the MS-RDPBCGR 2.2.7.1.10
+    /// compliance fix from commit 9106ff2. The `VCChunkSize` field is
+    /// "only present in capability sets sent from server to client";
+    /// emitting it client→server is a spec violation that some
+    /// Microsoft servers respond to by silently disabling all channel
+    /// redirection. Reverting that fix in the production builder
+    /// (setting vc_chunk_size back to Some) must be caught at test time.
+    #[test]
+    fn confirm_active_virtual_channel_omits_vc_chunk_size() {
+        use justrdp_pdu::rdp::capabilities::CapabilitySet;
+        let config = Config::builder("user", "pass").build();
+        let connector = ClientConnector::new(config);
+        let caps = connector.build_client_capabilities();
+        let vc = caps
+            .iter()
+            .find_map(|c| match c {
+                CapabilitySet::VirtualChannel(vc) => Some(vc),
+                _ => None,
+            })
+            .expect("VirtualChannel capability must be advertised");
+        assert!(
+            vc.vc_chunk_size.is_none(),
+            "client-side VirtualChannelCapability must omit VCChunkSize (MS-RDPBCGR 2.2.7.1.10), got {:?}",
+            vc.vc_chunk_size
+        );
+    }
+
     #[test]
     fn confirm_active_advertises_rfx_bitmap_codec() {
         use justrdp_pdu::rdp::capabilities::{
