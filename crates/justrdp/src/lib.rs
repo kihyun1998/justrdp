@@ -8,5 +8,6 @@
 //! ADR-0003 (phased codecs), and `docs/plan.md`.
 
 pub mod connect;
+pub mod tls;
 
 pub use connect::{Action, ConnectError, ConnectStateMachine, Event};
