@@ -100,6 +100,50 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
+/// The server endpoint to dial, preserving the host **exactly as the caller wrote it** — a DNS
+/// name or an IP literal. Resolution to socket addresses happens at dial time; the original form
+/// is kept because three consumers depend on it and must agree on the same name:
+///
+/// 1. **TLS SNI** — the rustls `ServerName` in the ClientHello (a DNS name when dialed by name).
+/// 2. **CredSSP SPN** — `TERMSRV/<host>`. NTLM ignores it, but Kerberos can only obtain a service
+///    ticket for the hostname form (#45).
+/// 3. **Certificate validation** — chain/SAN verification (#36) checks the certificate against
+///    the name the user intended to reach, not whatever it resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerAddr {
+    /// Hostname or IP literal, as dialed.
+    pub host: String,
+    /// TCP port (RDP default 3389).
+    pub port: u16,
+}
+
+impl ServerAddr {
+    /// A server endpoint from a host (DNS name or IP literal) and port.
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+        }
+    }
+
+    /// The CredSSP service principal name for this server: `TERMSRV/<host>`, with the host in
+    /// whatever form the caller dialed (hostname-based SPNs are what Kerberos requires — #45).
+    fn credssp_spn(&self) -> String {
+        format!("TERMSRV/{}", self.host)
+    }
+}
+
+/// Dial by raw socket address: the host becomes the IP literal, so SNI and the SPN carry the IP —
+/// the pre-[`ServerAddr`] behavior, kept for callers that genuinely only have an address.
+impl From<SocketAddr> for ServerAddr {
+    fn from(addr: SocketAddr) -> Self {
+        Self {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        }
+    }
+}
+
 /// Why the adapter-driven connect failed.
 #[derive(Debug)]
 pub enum ConnectFailure {
@@ -149,19 +193,34 @@ impl From<io::Error> for ConnectFailure {
     }
 }
 
-/// Connect to `addr`, run the X.224 security negotiation advertising `requested`, upgrade the socket
-/// to TLS, then authenticate with `credentials` via NLA (CredSSP / NTLM). `on_stage` is called with
-/// each connect stage label as it is entered, for progress UI / diagnostics.
+/// Connect to `server`, run the X.224 security negotiation advertising `requested`, upgrade the
+/// socket to TLS, then authenticate with `credentials` via NLA (CredSSP / NTLM). `on_stage` is
+/// called with each connect stage label as it is entered, for progress UI / diagnostics.
+///
+/// `server` is anything convertible to a [`ServerAddr`]: pass a hostname-based `ServerAddr` to
+/// carry the name through TLS SNI and the CredSSP SPN, or a plain `SocketAddr` for the IP-literal
+/// behavior.
 ///
 /// Returns the negotiated protocol and the authenticated TLS stream, ready for MCS. `credentials`
 /// is `skip`ped from the tracing span so the password is never recorded.
+pub async fn connect(
+    server: impl Into<ServerAddr>,
+    requested: SecurityProtocol,
+    credentials: Credentials,
+    on_stage: impl FnMut(&str),
+) -> Result<ConnectOutcome, ConnectFailure> {
+    connect_inner(server.into(), requested, credentials, on_stage).await
+}
+
+/// The monomorphic body of [`connect`], instrumented once the server identity is concrete.
 #[tracing::instrument(
+    name = "connect",
     skip(credentials, on_stage),
-    fields(host = %addr.ip(), port = addr.port()),
+    fields(host = %server.host, port = server.port),
     err,
 )]
-pub async fn connect(
-    addr: SocketAddr,
+async fn connect_inner(
+    server: ServerAddr,
     requested: SecurityProtocol,
     credentials: Credentials,
     mut on_stage: impl FnMut(&str),
@@ -180,10 +239,12 @@ pub async fn connect(
         while let Some(action) = queue.pop_front() {
             match action {
                 Action::Connect => {
+                    // (host, port) resolves DNS names and parses IP literals alike; the original
+                    // host string stays in `server` for SNI / SPN / validation.
                     let s = with_stage_timeout(
                         "tcp-connect",
                         TCP_CONNECT_TIMEOUT,
-                        TcpStream::connect(addr),
+                        TcpStream::connect((server.host.as_str(), server.port)),
                     )
                     .await?;
                     tracing::debug!("tcp socket connected");
@@ -201,7 +262,14 @@ pub async fn connect(
                     // peer certificate back to the machine, which extracts its subjectPublicKey.
                     let stream = tcp.take().expect("socket connected before TLS upgrade");
                     let connector = TlsConnector::from(Arc::new(client_config()));
-                    let server_name = ServerName::IpAddress(addr.ip().into());
+                    // SNI carries the host exactly as dialed: `ServerName` parses both DNS names
+                    // and IP literals, so a hostname reaches the server (and #36's validation)
+                    // instead of being flattened to whatever it resolved to.
+                    let server_name = ServerName::try_from(server.host.clone()).map_err(|e| {
+                        ConnectFailure::TlsHandshake {
+                            reason: format!("invalid server name {:?} for SNI: {e}", server.host),
+                        }
+                    })?;
                     tracing::debug!(?selected, "starting TLS handshake");
                     let established = match tokio::time::timeout(
                         STAGE_TIMEOUT,
@@ -244,7 +312,7 @@ pub async fn connect(
                         key_len = server_public_key.len(),
                         "starting CredSSP / NLA token exchange"
                     );
-                    run_credssp(stream, server_public_key, &credentials, addr).await?;
+                    run_credssp(stream, server_public_key, &credentials, &server).await?;
                     tracing::debug!("CredSSP exchange complete");
                     queue.extend(sm.process(Event::NlaComplete));
                     announce_stage(&mut sm, &mut announced, &mut on_stage);
@@ -334,13 +402,14 @@ async fn run_credssp(
     stream: &mut TlsStream<TcpStream>,
     server_public_key: Vec<u8>,
     credentials: &Credentials,
-    addr: SocketAddr,
+    server: &ServerAddr,
 ) -> Result<(), ConnectFailure> {
     let nla_err = |e: sspi::Error| ConnectFailure::Nla {
         reason: e.to_string(),
     };
-    // The CredSSP SPN identifies the target service; RDP uses `TERMSRV/<host>`.
-    let spn = format!("TERMSRV/{}", addr.ip());
+    // The CredSSP SPN identifies the target service; RDP uses `TERMSRV/<host>`, with the host as
+    // dialed (hostname when available — the form Kerberos will require, #45).
+    let spn = server.credssp_spn();
     let client_computer_name =
         std::env::var("COMPUTERNAME").unwrap_or_else(|_| "justrdp".to_string());
     let negotiate = NegotiateConfig::new(
@@ -728,6 +797,84 @@ mod tests {
         assert!(logs_contain("nla-credssp"), "nla-credssp stage not logged");
         // ...and byte counts are logged for the plaintext bytes written and read.
         assert!(logs_contain("bytes="), "byte counts not logged");
+    }
+
+    #[test]
+    fn server_addr_from_socket_addr_is_the_ip_literal() {
+        // The SocketAddr conversion is the legacy identity: host = IP literal, so SNI and SPN
+        // carry the IP — exactly the pre-ServerAddr behavior.
+        let sa: SocketAddr = "192.0.2.7:3389".parse().unwrap();
+        assert_eq!(ServerAddr::from(sa), ServerAddr::new("192.0.2.7", 3389));
+        assert_eq!(ServerAddr::from(sa).credssp_spn(), "TERMSRV/192.0.2.7");
+    }
+
+    #[test]
+    fn credssp_spn_uses_the_host_as_dialed() {
+        // Hostname in, hostname out: the SPN form Kerberos requires (#45).
+        let server = ServerAddr::new("vm.example.test", 3389);
+        assert_eq!(server.credssp_spn(), "TERMSRV/vm.example.test");
+    }
+
+    /// Like `mock_tls_server`, but also reports the SNI the client's ClientHello carried (or
+    /// `None` — rustls omits the SNI extension for IP-literal server names per RFC 6066).
+    async fn mock_tls_server_reporting_sni(
+        nego: [u8; 8],
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<Option<String>>) {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = ck.key_pair.serialize_der();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+        let (sni_tx, sni_rx) = tokio::sync::oneshot::channel();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 64];
+            let _ = sock.read(&mut scratch).await.unwrap();
+            sock.write_all(&confirm_frame(nego)).await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            let _ = sni_tx.send(tls.get_ref().1.server_name().map(str::to_owned));
+            let mut buf = [0u8; 1];
+            let _ = tls.read(&mut buf).await;
+        });
+        (addr, sni_rx)
+    }
+
+    #[tokio::test]
+    async fn connect_by_hostname_sends_dns_sni() {
+        // Dialing by name must put the *name* in the TLS ClientHello SNI — not the IP it resolved
+        // to. The mock observes the SNI from its accepted ServerConnection.
+        let (addr, sni_rx) =
+            mock_tls_server_reporting_sni([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+        let server = ServerAddr::new("localhost", addr.port());
+
+        let mut stages = Vec::new();
+        let _ = connect(server, requested(), test_credentials(), |s| {
+            stages.push(s.to_string())
+        })
+        .await;
+
+        // The handshake completed with a DNS-name SNI...
+        assert_eq!(sni_rx.await.unwrap().as_deref(), Some("localhost"));
+        // ...and the connect drove through TLS into NLA before the mock dropped the session,
+        // proving hostname dialing (DNS resolution included) works end-to-end.
+        assert!(
+            stages.contains(&"nla-credssp".to_string()),
+            "expected to reach nla-credssp, got {stages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_by_socket_addr_sends_no_dns_sni() {
+        // The IP path is unchanged: an IP-literal ServerName yields no SNI extension (RFC 6066
+        // forbids literal IPs there), which is what the server observes as `None`.
+        let (addr, sni_rx) =
+            mock_tls_server_reporting_sni([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+
+        let _ = connect(addr, requested(), test_credentials(), |_| {}).await;
+
+        assert_eq!(sni_rx.await.unwrap(), None);
     }
 
     /// Spawn a server that completes X.224 but then speaks garbage instead of TLS, so the handshake
