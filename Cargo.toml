@@ -20,3 +20,13 @@ tokio = { version = "1", default-features = false }
 # Structured observability (plan.md §11d): each Connect Stage is a tracing span; a no-op without a
 # subscriber, so it does not compromise sans-IO purity or portability.
 tracing = { version = "0.1", default-features = false }
+# TLS (slice-2, ADR-0002): rustls is a leaf, security-critical, non-RDP dependency used verbatim.
+# `ring` provider avoids the aws-lc-rs NASM build requirement on Windows.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# X.509 SubjectPublicKeyInfo extraction for CredSSP public-key binding — a leaf ASN.1/encoding lib,
+# not RDP protocol (ADR-0002). Lives in `justrdp` only; `justrdp-pdu` stays zero-dependency.
+x509-cert = "0.2"
+# Self-signed certificates for CI tests (dev-dependency only): the mock TLS server's cert and the
+# SPKI-extraction property test both generate a throwaway cert at test time.
+rcgen = "0.13"
