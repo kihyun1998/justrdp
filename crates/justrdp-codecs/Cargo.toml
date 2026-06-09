@@ -1,0 +1,17 @@
+[package]
+name = "justrdp-codecs"
+description = "RDP graphics codecs for justrdp (phased ownership — see ADR-0003)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Phase 1 (ADR-0003): bootstrap on `ironrdp-graphics`, kept behind this crate's own decode API
+# so it can be swapped for self-owned decoders later. Added in the codec slices, not in slice-1.
+# ironrdp-graphics = "0.8"
+
+[dev-dependencies]
+# The differential test oracle (ADR-0003): diff our decode output against ironrdp's on
+# identical bytes. Added alongside the first self-owned codec, not in slice-1.
+# ironrdp-graphics = "0.8"
