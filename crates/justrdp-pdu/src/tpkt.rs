@@ -1,6 +1,7 @@
 //! TPKT framing (RFC 1006). A 4-byte header `[version=3, reserved=0, length_be(u16)]` prefixes
 //! every slow-path RDP PDU; the length counts the header *plus* the payload.
 
+use crate::cursor::ReadCursor;
 use crate::error::DecodeError;
 
 /// TPKT version byte — always 3 for RDP (RFC 1006 / TPKT over TCP).
@@ -22,28 +23,20 @@ pub fn encode(payload: &[u8]) -> Vec<u8> {
 /// 4-byte header). The payload borrows `buf`; the whole frame occupies
 /// `HEADER_LEN + payload.len()` bytes, which the caller consumes.
 pub fn decode(buf: &[u8]) -> Result<&[u8], DecodeError> {
-    if buf.len() < HEADER_LEN {
-        return Err(DecodeError::NotEnoughBytes {
-            context: "tpkt header",
-            needed: HEADER_LEN,
-            got: buf.len(),
-        });
-    }
-    if buf[0] != VERSION {
+    let mut cur = ReadCursor::new(buf, "tpkt");
+    if cur.read_u8()? != VERSION {
         return Err(DecodeError::InvalidField {
             field: "tpkt.version",
             reason: "expected 3",
         });
     }
-    let total = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-    if buf.len() < total {
-        return Err(DecodeError::NotEnoughBytes {
-            context: "tpkt frame",
-            needed: total,
-            got: buf.len(),
-        });
-    }
-    Ok(&buf[HEADER_LEN..total])
+    cur.read_u8()?; // reserved
+    let total = cur.read_u16_be()? as usize;
+    let payload_len = total.checked_sub(HEADER_LEN).ok_or(DecodeError::InvalidField {
+        field: "tpkt.length",
+        reason: "shorter than the 4-byte header",
+    })?;
+    cur.read_slice(payload_len)
 }
 
 #[cfg(test)]
@@ -68,16 +61,11 @@ mod tests {
 
     #[test]
     fn decode_reports_not_enough_bytes_for_partial_frame() {
-        // The header declares a total length of 7, but only 5 bytes have arrived.
+        // The header declares a total length of 7, but only 5 bytes have arrived. The decoder
+        // must signal NotEnoughBytes (the sans-IO "wait for more" signal), not panic. The exact
+        // needed/got counts are an implementation detail of the cursor, so assert the variant.
         let partial = [0x03, 0x00, 0x00, 0x07, 0xAA];
         let err = decode(&partial).unwrap_err();
-        assert_eq!(
-            err,
-            DecodeError::NotEnoughBytes {
-                context: "tpkt frame",
-                needed: 7,
-                got: 5,
-            }
-        );
+        assert!(matches!(err, DecodeError::NotEnoughBytes { context: "tpkt", .. }));
     }
 }
