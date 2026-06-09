@@ -151,8 +151,12 @@ enum Stage {
     /// is part of NLA, not a stage of its own (CONTEXT.md lists seven stages).
     EarlyUserAuth { selected: SecurityProtocol },
     /// Terminal: the machine emitted [`Action::Authenticated`] or [`Action::FailWith`] and will
-    /// accept no further events (each yields [`ConnectError::UnexpectedEvent`]).
-    Done,
+    /// accept no further events (each yields [`ConnectError::UnexpectedEvent`]). Internal only —
+    /// `last` is the label of the stage where the connect ended, and [`Stage::label`] keeps
+    /// reporting it: CONTEXT.md's seven Connect Stages stay the complete observable set (no
+    /// eighth label leaks to the host's `on_stage`), and after a failure `stage()` still names
+    /// the stage that failed, preserving error attribution.
+    Done { last: &'static str },
 }
 
 impl Stage {
@@ -162,8 +166,13 @@ impl Stage {
             Stage::X224Negotiate => "x224-negotiate",
             Stage::TlsHandshake { .. } => "tls-handshake",
             Stage::NlaCredssp { .. } | Stage::EarlyUserAuth { .. } => "nla-credssp",
-            Stage::Done => "done",
+            Stage::Done { last } => last,
         }
+    }
+
+    /// The terminal state, remembering this stage's label as the last observable one.
+    fn done(self) -> Stage {
+        Stage::Done { last: self.label() }
     }
 }
 
@@ -251,7 +260,7 @@ impl ConnectStateMachine {
                     self.stage = Stage::EarlyUserAuth { selected };
                     vec![Action::AwaitEarlyUserAuth]
                 } else {
-                    self.stage = Stage::Done;
+                    self.stage = self.stage.done();
                     vec![Action::Authenticated { selected }]
                 }
             }
@@ -260,7 +269,7 @@ impl ConnectStateMachine {
                 // any other value — or a truncated buffer — is a malformed PDU.
                 match bytes.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) {
                     Some(AUTHZ_SUCCESS) => {
-                        self.stage = Stage::Done;
+                        self.stage = self.stage.done();
                         vec![Action::Authenticated { selected }]
                     }
                     Some(AUTHZ_ACCESS_DENIED) => self.fail(ConnectError::EarlyUserAuthDenied),
@@ -282,9 +291,10 @@ impl ConnectStateMachine {
     }
 
     /// Fail the connect: emit [`Action::FailWith`] and move to the terminal [`Stage::Done`], where
-    /// every further event is itself an [`ConnectError::UnexpectedEvent`].
+    /// every further event is itself an [`ConnectError::UnexpectedEvent`]. The label of the stage
+    /// that failed is kept, so `stage()` still attributes the error to it.
     fn fail(&mut self, e: ConnectError) -> Vec<Action> {
-        self.stage = Stage::Done;
+        self.stage = self.stage.done();
         vec![Action::FailWith(e)]
     }
 }
@@ -642,8 +652,10 @@ mod tests {
                 "nla-credssp",
                 &[EventKind::EarlyUserAuthResult],
             ),
-            (done_authenticated, "done", &[]),
-            (done_failed, "done", &[]),
+            // Terminal machines keep reporting the label of the stage where the connect ended —
+            // no eighth "done" label is ever observable (CONTEXT.md lists seven Connect Stages).
+            (done_authenticated, "nla-credssp", &[]),
+            (done_failed, "x224-negotiate", &[]),
         ];
 
         for (make, label, expected) in stages {
@@ -662,8 +674,19 @@ mod tests {
                     })],
                     "stage {label} fed {kind:?} must fail with UnexpectedEvent"
                 );
-                // The violation is terminal: the machine lands in `done`.
-                assert_eq!(sm.stage(), "done");
+                // The violation is terminal — but the label stays attributed to the stage where
+                // the connect ended, so on_stage observers never see a label change here...
+                assert_eq!(sm.stage(), label);
+                // ...and any further event (even the stage's formerly-expected one) fails typed.
+                let replay = sm.process(sample_event(kind));
+                assert_eq!(
+                    replay,
+                    vec![Action::FailWith(ConnectError::UnexpectedEvent {
+                        stage: label,
+                        event: kind,
+                    })],
+                    "terminal machine in {label} fed {kind:?} again must stay failed"
+                );
             }
         }
     }
@@ -687,24 +710,27 @@ mod tests {
 
     #[test]
     fn replay_after_authentication_is_unexpected() {
-        // The terminal stage accepts nothing: replaying the very event that authenticated must
-        // fail typed, not re-emit Authenticated.
+        // The terminal state accepts nothing: replaying the very event that authenticated must
+        // fail typed, not re-emit Authenticated. The reported stage stays the one where the
+        // connect ended (authentication completes inside nla-credssp).
         let mut sm = done_authenticated();
         let actions = sm.process(Event::NlaComplete);
         assert_eq!(
             actions,
             vec![Action::FailWith(ConnectError::UnexpectedEvent {
-                stage: "done",
+                stage: "nla-credssp",
                 event: EventKind::NlaComplete,
             })]
         );
     }
 
     #[test]
-    fn failure_transitions_to_done_stage() {
-        // FailWith is terminal: the stage label reflects it, so an adapter that keeps polling
-        // stage() after a failure sees `done`, not the stage that failed.
-        let sm = done_failed();
-        assert_eq!(sm.stage(), "done");
+    fn terminal_machine_keeps_the_last_canonical_stage_label() {
+        // Termination is internal: stage() keeps attributing to the stage where the connect
+        // ended — the failing stage after FailWith, the authenticating stage after Authenticated.
+        // No "done" (or any other non-glossary) label is ever observable, so a host's on_stage
+        // sees only CONTEXT.md's seven Connect Stage labels and error attribution survives.
+        assert_eq!(done_failed().stage(), "x224-negotiate");
+        assert_eq!(done_authenticated().stage(), "nla-credssp");
     }
 }
