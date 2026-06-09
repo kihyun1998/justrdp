@@ -14,8 +14,20 @@ pub enum Action {
     Connect,
     /// Write these bytes to the socket.
     WriteBytes(Vec<u8>),
-    /// The negotiated transport security protocol; the connect sequence may advance past X.224.
-    Proceed { selected: SecurityProtocol },
+    /// The X.224 negotiation selected `selected`; the adapter must now upgrade the socket to TLS
+    /// (rustls handshake) and hand the server's leaf certificate back via [`Event::TlsEstablished`].
+    /// The TLS records themselves never enter this machine (plan.md §3 — the handshake runs outside
+    /// the connect state machine).
+    StartTls { selected: SecurityProtocol },
+    /// The TLS upgrade is complete; the connect sequence may advance past `tls-handshake`. Carries
+    /// the server-selected protocol and the server's `subjectPublicKey` (DER `SubjectPublicKeyInfo`)
+    /// that CredSSP will bind to in the next slice.
+    Proceed {
+        /// The protocol the server chose in the X.224 Connection Confirm.
+        selected: SecurityProtocol,
+        /// The server's `subjectPublicKey` extracted from its TLS certificate (raw DER).
+        server_public_key: Vec<u8>,
+    },
     /// The connect attempt failed; surface this error and tear down.
     FailWith(ConnectError),
 }
@@ -27,6 +39,9 @@ pub enum Event<'a> {
     Connected,
     /// Bytes arrived from the socket.
     Received(&'a [u8]),
+    /// The TLS handshake the adapter ran (after [`Action::StartTls`]) completed; carries the
+    /// server's leaf certificate (DER) so the machine can extract its `subjectPublicKey`.
+    TlsEstablished(&'a [u8]),
 }
 
 /// Why a connect attempt failed.
@@ -38,6 +53,9 @@ pub enum ConnectError {
     UnsupportedProtocol(SecurityProtocol),
     /// A malformed PDU arrived from the server.
     Decode(justrdp_pdu::DecodeError),
+    /// The TLS upgrade failed: the server's certificate could not be parsed or its public key
+    /// extracted. (Handshake-level failures surface at the adapter boundary.)
+    TlsHandshake(crate::tls::TlsCertError),
 }
 
 /// The labeled connect sub-step the machine is in (CONTEXT.md "Connect Stage"). slice-1 stops at
@@ -48,6 +66,9 @@ enum Stage {
     TcpConnect,
     /// Socket is up; the X.224 security negotiation request has been sent, awaiting the confirm.
     X224Negotiate,
+    /// X.224 selected a TLS-based protocol; the adapter is running the rustls handshake, after which
+    /// it hands back the server certificate via [`Event::TlsEstablished`].
+    TlsHandshake,
 }
 
 impl Stage {
@@ -55,6 +76,7 @@ impl Stage {
         match self {
             Stage::TcpConnect => "tcp-connect",
             Stage::X224Negotiate => "x224-negotiate",
+            Stage::TlsHandshake => "tls-handshake",
         }
     }
 }
@@ -66,6 +88,9 @@ impl Stage {
 pub struct ConnectStateMachine {
     requested: SecurityProtocol,
     stage: Stage,
+    /// The protocol the server selected in the X.224 confirm, remembered across the TLS handshake so
+    /// it can be reported once the certificate arrives. `None` until the confirm is processed.
+    negotiated: Option<SecurityProtocol>,
 }
 
 impl ConnectStateMachine {
@@ -74,6 +99,7 @@ impl ConnectStateMachine {
         Self {
             requested,
             stage: Stage::TcpConnect,
+            negotiated: None,
         }
     }
 
@@ -100,7 +126,12 @@ impl ConnectStateMachine {
                 Ok(NegResponse::Selected(selected))
                     if selected.bits() != 0 && self.requested.contains(selected) =>
                 {
-                    vec![Action::Proceed { selected }]
+                    // The server picked a TLS-based protocol we advertised: remember it and ask the
+                    // adapter to upgrade the socket. The machine advances to `tls-handshake` and
+                    // waits for the resulting certificate.
+                    self.stage = Stage::TlsHandshake;
+                    self.negotiated = Some(selected);
+                    vec![Action::StartTls { selected }]
                 }
                 Ok(NegResponse::Selected(selected)) => {
                     vec![Action::FailWith(ConnectError::UnsupportedProtocol(selected))]
@@ -113,6 +144,18 @@ impl ConnectStateMachine {
                 // Any other malformed PDU is fatal.
                 Err(e) => vec![Action::FailWith(ConnectError::Decode(e))],
             },
+            Event::TlsEstablished(cert_der) => {
+                let selected = self
+                    .negotiated
+                    .expect("TlsEstablished only follows a StartTls in the tls-handshake stage");
+                match crate::tls::extract_subject_public_key(cert_der) {
+                    Ok(server_public_key) => vec![Action::Proceed {
+                        selected,
+                        server_public_key,
+                    }],
+                    Err(e) => vec![Action::FailWith(ConnectError::TlsHandshake(e))],
+                }
+            }
         }
     }
 }
@@ -190,15 +233,57 @@ mod tests {
     }
 
     #[test]
-    fn received_confirm_emits_proceed_with_selected_protocol() {
+    fn received_confirm_emits_start_tls_and_enters_tls_handshake_stage() {
         let mut sm = negotiating();
         let confirm = connection_confirm(SecurityProtocol::HYBRID);
         let actions = sm.process(Event::Received(&confirm));
+        // A valid confirm no longer ends the connect sequence: it hands off to the TLS upgrade. The
+        // machine asks the adapter to start the handshake and moves into the `tls-handshake` stage.
+        assert_eq!(
+            actions,
+            vec![Action::StartTls {
+                selected: SecurityProtocol::HYBRID
+            }]
+        );
+        assert_eq!(sm.stage(), "tls-handshake");
+    }
+
+    /// Drive a machine through the X.224 confirm into the `tls-handshake` stage, selecting `selected`.
+    fn awaiting_tls(selected: SecurityProtocol) -> ConnectStateMachine {
+        let mut sm = negotiating();
+        sm.process(Event::Received(&connection_confirm(selected)));
+        sm
+    }
+
+    #[test]
+    fn tls_established_emits_proceed_with_extracted_public_key() {
+        let mut sm = awaiting_tls(SecurityProtocol::HYBRID);
+        // The adapter ran the TLS handshake and hands back the server's leaf certificate. The
+        // machine extracts its subjectPublicKey and reports the completed upgrade.
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = key.cert.der();
+
+        let actions = sm.process(Event::TlsEstablished(cert_der.as_ref()));
+
         assert_eq!(
             actions,
             vec![Action::Proceed {
-                selected: SecurityProtocol::HYBRID
+                selected: SecurityProtocol::HYBRID,
+                server_public_key: key.key_pair.public_key_der(),
             }]
+        );
+    }
+
+    #[test]
+    fn tls_established_with_malformed_cert_fails_with_tls_handshake() {
+        let mut sm = awaiting_tls(SecurityProtocol::HYBRID);
+        // The handshake "completed" but the certificate the adapter handed back is not parseable.
+        let actions = sm.process(Event::TlsEstablished(&[0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(
+            actions,
+            vec![Action::FailWith(ConnectError::TlsHandshake(
+                crate::tls::TlsCertError::MalformedCertificate
+            ))]
         );
     }
 

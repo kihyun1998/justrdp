@@ -8,3 +8,12 @@ repository.workspace = true
 
 [dependencies]
 justrdp-pdu.workspace = true
+# X.509 SubjectPublicKeyInfo extraction (ADR-0002 leaf dependency). The sans-IO core parses the
+# server's TLS certificate into the `subjectPublicKey` DER that CredSSP binds to; the handshake
+# itself stays in the I/O adapter.
+x509-cert.workspace = true
+
+[dev-dependencies]
+# Generates a throwaway self-signed cert so the SPKI-extraction test can assert the extracted
+# SubjectPublicKeyInfo is byte-identical to the key pair's own DER.
+rcgen.workspace = true

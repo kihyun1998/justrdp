@@ -75,6 +75,20 @@ These supersede the matching open questions in §10.
    pure-Rust, patent-free, platform-invariant, so phased-c2 owns them directly. Mirrors how ironrdp
    (`H264Decoder` trait + optional `openh264` feature) and the prior justrdp (`AvcDecoder` trait)
    both shaped it. *(new — the trait seam plan.md §7/§11i/§23 already imply.)*
+9. **TLS boundary = the handshake runs in the adapter; the machine owns the `tls-handshake`
+   *stage* and the cert→`subjectPublicKey` extraction (slice-2).** rustls is itself a sans-IO
+   state machine, so shuttling its records through `ConnectStateMachine` would add nothing — the
+   handshake stays in `justrdp-tokio` (this refines §3's "TLS upgrade happens *outside* the
+   connector state machine"). But the machine is **not** bypassed: on a valid X.224 confirm it
+   emits `Action::StartTls`, advances into the `tls-handshake` stage, and after the adapter runs
+   the handshake it feeds the server's leaf certificate back via `Event::TlsEstablished`. The
+   machine then extracts the `subjectPublicKey` (DER `SubjectPublicKeyInfo`, via the leaf
+   `x509-cert` dep — ADR-0002) — a pure, CI-testable step — and emits `Action::Proceed {
+   selected, server_public_key }` for CredSSP to bind to next. This reconciles issue #2 ("a
+   `TlsUpgrade` state that accepts the cert and yields `subjectPublicKey`") with §3 ("handshake
+   outside the machine"): TLS *records* never enter the machine, but the TLS *stage* and the cert
+   it produces do. slice-2 accepts any cert (validate=false); chain/name validation + TOFU
+   pinning are later slices (§22). *(new — resolves the issue #2 ↔ §3 boundary conflict.)*
 
 ## 0. Traps already PROVEN on the real VM this session (do not re-discover)
 
