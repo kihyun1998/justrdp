@@ -401,14 +401,17 @@ async fn write_ts_request(
     Ok(())
 }
 
-/// Read one BER-framed `TsRequest` from the TLS stream. A TSRequest is a DER `SEQUENCE` (`0x30`)
-/// whose length prefix tells us exactly how many bytes to read, so we frame it precisely rather than
-/// guessing a buffer size (TLS records may split a single TSRequest across reads).
-async fn read_ts_request(stream: &mut TlsStream<TcpStream>) -> Result<TsRequest, ConnectFailure> {
+/// Read one BER-framed `TsRequest` from `reader`. A TSRequest is a DER `SEQUENCE` (`0x30`) whose
+/// length prefix tells us exactly how many bytes to read, so we frame it precisely rather than
+/// guessing a buffer size (TLS records may split a single TSRequest across reads). Generic over the
+/// reader so the framing — including the length cap — is unit-testable in memory.
+async fn read_ts_request<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<TsRequest, ConnectFailure> {
     let mut frame = Vec::with_capacity(64);
     // Tag + first length byte.
     let mut head = [0u8; 2];
-    stream.read_exact(&mut head).await?;
+    reader.read_exact(&mut head).await?;
     frame.extend_from_slice(&head);
     let content_len = if head[1] < 0x80 {
         // Short form: the length is the byte itself.
@@ -423,7 +426,7 @@ async fn read_ts_request(stream: &mut TlsStream<TcpStream>) -> Result<TsRequest,
             });
         }
         let mut len_bytes = vec![0u8; n];
-        stream.read_exact(&mut len_bytes).await?;
+        reader.read_exact(&mut len_bytes).await?;
         frame.extend_from_slice(&len_bytes);
         len_bytes.iter().fold(0usize, |acc, &b| (acc << 8) | b as usize)
     };
@@ -436,7 +439,7 @@ async fn read_ts_request(stream: &mut TlsStream<TcpStream>) -> Result<TsRequest,
         });
     }
     let mut content = vec![0u8; content_len];
-    stream.read_exact(&mut content).await?;
+    reader.read_exact(&mut content).await?;
     frame.extend_from_slice(&content);
     TsRequest::from_buffer(&frame).map_err(|e| ConnectFailure::Nla {
         reason: e.to_string(),
@@ -544,6 +547,84 @@ mod tests {
                 stage: "tls-handshake"
             })
         ));
+    }
+
+    /// The on-wire BER bytes of a TSRequest carrying `n` bytes of `nego_tokens` — the exact framing
+    /// `read_ts_request` must parse back (encoded by sspi, the same codec the real exchange uses).
+    fn encoded_ts_request(n: usize) -> Vec<u8> {
+        let ts = TsRequest {
+            nego_tokens: Some(vec![0xAB; n]),
+            ..TsRequest::default()
+        };
+        let mut buf = Vec::new();
+        ts.encode_ts_request(&mut buf).unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn read_ts_request_round_trips_a_short_form_frame() {
+        // A small TSRequest uses BER short-form length (< 0x80) — a single length byte.
+        let bytes = encoded_ts_request(10);
+        assert!(
+            bytes[1] < 0x80,
+            "expected short-form length for a small TSRequest, got {:#x}",
+            bytes[1]
+        );
+        let mut reader: &[u8] = &bytes;
+        let parsed = read_ts_request(&mut reader).await.unwrap();
+        assert_eq!(parsed.nego_tokens, Some(vec![0xAB; 10]));
+    }
+
+    #[tokio::test]
+    async fn read_ts_request_round_trips_a_long_form_frame() {
+        // A TSRequest over 127 bytes forces BER long-form length, exercising the multi-byte parse.
+        let bytes = encoded_ts_request(500);
+        assert!(
+            bytes[1] >= 0x80,
+            "expected long-form length for a large TSRequest, got {:#x}",
+            bytes[1]
+        );
+        let mut reader: &[u8] = &bytes;
+        let parsed = read_ts_request(&mut reader).await.unwrap();
+        assert_eq!(parsed.nego_tokens, Some(vec![0xAB; 500]));
+    }
+
+    #[tokio::test]
+    async fn read_ts_request_rejects_a_length_over_the_cap() {
+        // A hostile header claiming a 4-byte length of 0x00FF_FFFF (~16 MiB), far over the cap. The
+        // cap must trip BEFORE any content is read or allocated — we supply only the 6 header bytes,
+        // so reaching the content read would EOF instead of producing this clean rejection.
+        let header = [0x30, 0x84, 0x00, 0xFF, 0xFF, 0xFF];
+        let mut reader: &[u8] = &header;
+        match &read_ts_request(&mut reader).await.unwrap_err() {
+            ConnectFailure::Nla { reason } => {
+                assert!(reason.contains("exceeds"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected an over-cap Nla rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_ts_request_rejects_an_overwide_length_field() {
+        // 0x80 | 0x10 = 16 length bytes — wider than `usize`; refuse rather than overflow the fold.
+        let header = [0x30, 0x90];
+        let mut reader: &[u8] = &header;
+        match &read_ts_request(&mut reader).await.unwrap_err() {
+            ConnectFailure::Nla { reason } => {
+                assert!(reason.contains("refusing to parse"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected an over-wide length rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_ts_request_surfaces_truncation_as_io() {
+        // A valid header promising more content than is delivered: read_exact hits EOF mid-frame.
+        let mut bytes = encoded_ts_request(10);
+        bytes.truncate(bytes.len() - 5);
+        let mut reader: &[u8] = &bytes;
+        let err = read_ts_request(&mut reader).await.unwrap_err();
+        assert!(matches!(err, ConnectFailure::Io(_)), "expected an Io EOF error, got {err:?}");
     }
 
     /// A captured X.224 Connection Confirm carrying an 8-byte RDP negotiation structure.
