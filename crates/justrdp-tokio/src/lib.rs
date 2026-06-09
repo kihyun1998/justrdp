@@ -7,6 +7,7 @@
 //! extend the same loop through TLS, NLA, MCS, and activation.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -89,12 +90,12 @@ pub async fn connect(
         while let Some(action) = queue.pop_front() {
             match action {
                 Action::Connect => {
-                    let dial = tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr));
-                    let s = match dial.await {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => return Err(ConnectFailure::Io(e)),
-                        Err(_) => return Err(ConnectFailure::Timeout { stage: "tcp-connect" }),
-                    };
+                    let s = with_stage_timeout(
+                        "tcp-connect",
+                        TCP_CONNECT_TIMEOUT,
+                        TcpStream::connect(addr),
+                    )
+                    .await?;
                     tracing::debug!("tcp socket connected");
                     stream = Some(s);
                     queue.extend(sm.process(Event::Connected));
@@ -119,11 +120,7 @@ pub async fn connect(
 
         // The queue drained without a terminal action: the machine needs more bytes.
         let s = stream.as_mut().expect("socket connected before read");
-        let n = match tokio::time::timeout(X224_TIMEOUT, s.read(&mut readbuf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(ConnectFailure::Io(e)),
-            Err(_) => return Err(ConnectFailure::Timeout { stage: sm.stage() }),
-        };
+        let n = with_stage_timeout(sm.stage(), X224_TIMEOUT, s.read(&mut readbuf)).await?;
         if n == 0 {
             return Err(ConnectFailure::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -136,6 +133,21 @@ pub async fn connect(
     }
 }
 
+/// Await `fut` under the stage's timeout, mapping the outcome into a [`ConnectFailure`]: an I/O
+/// error becomes `Io`, and an elapsed timeout becomes `Timeout { stage }`. Every connect stage
+/// wraps its I/O through this single seam so the timeout/error policy lives in one place.
+async fn with_stage_timeout<T>(
+    stage: &'static str,
+    dur: Duration,
+    fut: impl Future<Output = io::Result<T>>,
+) -> Result<T, ConnectFailure> {
+    match tokio::time::timeout(dur, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(ConnectFailure::Io(e)),
+        Err(_) => Err(ConnectFailure::Timeout { stage }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +156,37 @@ mod tests {
 
     fn requested() -> SecurityProtocol {
         SecurityProtocol::SSL | SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX
+    }
+
+    #[tokio::test]
+    async fn with_stage_timeout_passes_through_ready_value() {
+        let out =
+            with_stage_timeout("test", Duration::from_secs(1), async { Ok::<u8, io::Error>(42) })
+                .await;
+        assert!(matches!(out, Ok(42)));
+    }
+
+    #[tokio::test]
+    async fn with_stage_timeout_maps_io_error_to_io() {
+        let out: Result<u8, ConnectFailure> =
+            with_stage_timeout("test", Duration::from_secs(1), async {
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
+            })
+            .await;
+        assert!(matches!(out, Err(ConnectFailure::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn with_stage_timeout_maps_elapsed_to_timeout_with_stage() {
+        // A future that never resolves must elapse and surface the stage name.
+        let never = std::future::pending::<io::Result<u8>>();
+        let out = with_stage_timeout("x224-negotiate", Duration::from_millis(10), never).await;
+        assert!(matches!(
+            out,
+            Err(ConnectFailure::Timeout {
+                stage: "x224-negotiate"
+            })
+        ));
     }
 
     /// A captured X.224 Connection Confirm carrying an 8-byte RDP negotiation structure.
