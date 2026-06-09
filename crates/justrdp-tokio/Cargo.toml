@@ -20,7 +20,8 @@ tokio-rustls = { workspace = true }
 sspi = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }
+# "sync" feeds the SNI observed by the mock TLS server back to the test (oneshot channel).
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros", "sync"] }
 # Captures tracing events in-test so we can assert on the emitted debug logs (criterion 14).
 tracing-test = "0.2"
 # The mock TLS server in the adapter tests presents a throwaway self-signed cert.
