@@ -27,6 +27,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # X.509 SubjectPublicKeyInfo extraction for CredSSP public-key binding — a leaf ASN.1/encoding lib,
 # not RDP protocol (ADR-0002). Lives in `justrdp` only; `justrdp-pdu` stays zero-dependency.
 x509-cert = "0.2"
+# NLA authentication (slice-3, ADR-0002 / plan.md decision 10): `sspi` owns CredSSP / SPNEGO / NTLM /
+# Kerberos verbatim — security-critical, non-RDP. Lives in the adapter (`justrdp-tokio`) only, the
+# same place `rustls` landed: it drives the `CredSspClient` token loop, so the sans-IO core never
+# sees a TSRequest.
+sspi = "0.21"
 # Self-signed certificates for CI tests (dev-dependency only): the mock TLS server's cert and the
 # SPKI-extraction property test both generate a throwaway cert at test time.
 rcgen = "0.13"
