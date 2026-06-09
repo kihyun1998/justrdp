@@ -47,6 +47,14 @@ pub enum Action {
 }
 
 /// An input handed to the machine by the host adapter.
+///
+/// Events are ordered: each one is valid only in the stage that requested it (e.g.
+/// [`Event::TlsEstablished`] answers [`Action::StartTls`], [`Event::NlaComplete`] answers
+/// [`Action::StartNla`]). Feeding an event the current stage does not expect is never undefined
+/// behavior and never panics — the machine fails the connect with
+/// [`ConnectError::UnexpectedEvent`], naming the stage and the offending event kind. This is the
+/// contract third-party adapters (blocking, wasm, …) are held to; `justrdp-tokio` upholds it by
+/// construction.
 #[derive(Debug, Clone, Copy)]
 pub enum Event<'a> {
     /// The TCP socket finished connecting.
@@ -65,6 +73,36 @@ pub enum Event<'a> {
     EarlyUserAuthResult(&'a [u8]),
 }
 
+impl Event<'_> {
+    /// The payload-free discriminant of this event, for [`ConnectError::UnexpectedEvent`].
+    pub fn kind(&self) -> EventKind {
+        match self {
+            Event::Connected => EventKind::Connected,
+            Event::Received(_) => EventKind::Received,
+            Event::TlsEstablished(_) => EventKind::TlsEstablished,
+            Event::NlaComplete => EventKind::NlaComplete,
+            Event::EarlyUserAuthResult(_) => EventKind::EarlyUserAuthResult,
+        }
+    }
+}
+
+/// The kind of an [`Event`], without its payload (which may borrow from the adapter's buffers).
+/// Carried by [`ConnectError::UnexpectedEvent`] to name the event that violated the ordering
+/// contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// [`Event::Connected`].
+    Connected,
+    /// [`Event::Received`].
+    Received,
+    /// [`Event::TlsEstablished`].
+    TlsEstablished,
+    /// [`Event::NlaComplete`].
+    NlaComplete,
+    /// [`Event::EarlyUserAuthResult`].
+    EarlyUserAuthResult,
+}
+
 /// Why a connect attempt failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectError {
@@ -80,10 +118,22 @@ pub enum ConnectError {
     /// HYBRID_EX only: the server's Early User Authorization Result PDU denied access
     /// (`AUTHZ_ACCESS_DENIED`) — user authorization failed, so the connection must be dropped.
     EarlyUserAuthDenied,
+    /// The adapter fed the machine an [`Event`] the current stage does not expect (the ordering
+    /// contract on [`Event`]). Carries the stage label and the offending event kind. This is an
+    /// adapter bug, not a server behavior — but it surfaces as a typed failure, never a panic.
+    UnexpectedEvent {
+        /// The connect-stage label the machine was in (as reported by
+        /// [`ConnectStateMachine::stage`]).
+        stage: &'static str,
+        /// The kind of event that arrived.
+        event: EventKind,
+    },
 }
 
 /// The labeled connect sub-step the machine is in (CONTEXT.md "Connect Stage"). slice-1 stops at
-/// `x224-negotiate`; later slices extend this set.
+/// `x224-negotiate`; later slices extend this set. Stages that follow the X.224 confirm carry the
+/// server-selected protocol, so a stage being reachable proves the data it needs exists — no
+/// `Option` to unwrap, no panic path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     /// Before the socket is up — the machine has asked the adapter to `Connect`.
@@ -92,10 +142,17 @@ enum Stage {
     X224Negotiate,
     /// X.224 selected a TLS-based protocol; the adapter is running the rustls handshake, after which
     /// it hands back the server certificate via [`Event::TlsEstablished`].
-    TlsHandshake,
+    TlsHandshake { selected: SecurityProtocol },
     /// TLS is up and the server's public key extracted; the adapter is running the CredSSP token
-    /// exchange (and, for HYBRID_EX, the Early User Authorization Result that follows it).
-    NlaCredssp,
+    /// exchange, completion signalled via [`Event::NlaComplete`].
+    NlaCredssp { selected: SecurityProtocol },
+    /// HYBRID_EX only: CredSSP finished and the adapter is reading the 4-byte Early User
+    /// Authorization Result PDU. Still the `nla-credssp` stage to observers — the early-auth read
+    /// is part of NLA, not a stage of its own (CONTEXT.md lists seven stages).
+    EarlyUserAuth { selected: SecurityProtocol },
+    /// Terminal: the machine emitted [`Action::Authenticated`] or [`Action::FailWith`] and will
+    /// accept no further events (each yields [`ConnectError::UnexpectedEvent`]).
+    Done,
 }
 
 impl Stage {
@@ -103,8 +160,9 @@ impl Stage {
         match self {
             Stage::TcpConnect => "tcp-connect",
             Stage::X224Negotiate => "x224-negotiate",
-            Stage::TlsHandshake => "tls-handshake",
-            Stage::NlaCredssp => "nla-credssp",
+            Stage::TlsHandshake { .. } => "tls-handshake",
+            Stage::NlaCredssp { .. } | Stage::EarlyUserAuth { .. } => "nla-credssp",
+            Stage::Done => "done",
         }
     }
 }
@@ -116,9 +174,6 @@ impl Stage {
 pub struct ConnectStateMachine {
     requested: SecurityProtocol,
     stage: Stage,
-    /// The protocol the server selected in the X.224 confirm, remembered across the TLS handshake so
-    /// it can be reported once the certificate arrives. `None` until the confirm is processed.
-    negotiated: Option<SecurityProtocol>,
 }
 
 impl ConnectStateMachine {
@@ -127,7 +182,6 @@ impl ConnectStateMachine {
         Self {
             requested,
             stage: Stage::TcpConnect,
-            negotiated: None,
         }
     }
 
@@ -142,86 +196,96 @@ impl ConnectStateMachine {
     }
 
     /// Advance the machine with an input event, returning the actions to perform.
+    ///
+    /// Dispatch is on the (stage, event) pair: each stage accepts exactly the event it asked the
+    /// adapter for, and every other combination fails the connect with
+    /// [`ConnectError::UnexpectedEvent`] — see the ordering contract on [`Event`].
     pub fn process(&mut self, event: Event) -> Vec<Action> {
-        match event {
-            Event::Connected => {
+        match (self.stage, event) {
+            (Stage::TcpConnect, Event::Connected) => {
                 self.stage = Stage::X224Negotiate;
                 let neg = NegRequest::new(self.requested).encode();
                 let tpdu = x224::encode_connection_request(&neg);
                 vec![Action::WriteBytes(tpkt::encode(&tpdu))]
             }
-            Event::Received(bytes) => match decode_confirm(bytes) {
+            (Stage::X224Negotiate, Event::Received(bytes)) => match decode_confirm(bytes) {
                 Ok(NegResponse::Selected(selected))
                     if selected.bits() != 0 && self.requested.contains(selected) =>
                 {
                     // The server picked a TLS-based protocol we advertised: remember it and ask the
                     // adapter to upgrade the socket. The machine advances to `tls-handshake` and
                     // waits for the resulting certificate.
-                    self.stage = Stage::TlsHandshake;
-                    self.negotiated = Some(selected);
+                    self.stage = Stage::TlsHandshake { selected };
                     vec![Action::StartTls { selected }]
                 }
                 Ok(NegResponse::Selected(selected)) => {
-                    vec![Action::FailWith(ConnectError::UnsupportedProtocol(selected))]
+                    self.fail(ConnectError::UnsupportedProtocol(selected))
                 }
                 Ok(NegResponse::Failure(code)) => {
-                    vec![Action::FailWith(ConnectError::NegotiationFailed(code))]
+                    self.fail(ConnectError::NegotiationFailed(code))
                 }
                 // A partial frame is not an error: wait for the adapter to deliver more bytes.
                 Err(justrdp_pdu::DecodeError::NotEnoughBytes { .. }) => Vec::new(),
                 // Any other malformed PDU is fatal.
-                Err(e) => vec![Action::FailWith(ConnectError::Decode(e))],
+                Err(e) => self.fail(ConnectError::Decode(e)),
             },
-            Event::TlsEstablished(cert_der) => {
-                let selected = self
-                    .negotiated
-                    .expect("TlsEstablished only follows a StartTls in the tls-handshake stage");
+            (Stage::TlsHandshake { selected }, Event::TlsEstablished(cert_der)) => {
                 match crate::tls::extract_subject_public_key(cert_der) {
                     Ok(server_public_key) => {
                         // TLS is up: hand off into NLA. The adapter runs the CredSSP token exchange
                         // (binding to this key); the machine advances to `nla-credssp` and waits for
                         // the adapter to report completion via `Event::NlaComplete`.
-                        self.stage = Stage::NlaCredssp;
+                        self.stage = Stage::NlaCredssp { selected };
                         vec![Action::StartNla {
                             selected,
                             server_public_key,
                         }]
                     }
-                    Err(e) => vec![Action::FailWith(ConnectError::TlsHandshake(e))],
+                    Err(e) => self.fail(ConnectError::TlsHandshake(e)),
                 }
             }
-            Event::EarlyUserAuthResult(bytes) => {
-                let selected = self.negotiated.expect(
-                    "EarlyUserAuthResult only follows AwaitEarlyUserAuth in the nla-credssp stage",
-                );
+            (Stage::NlaCredssp { selected }, Event::NlaComplete) => {
+                // HYBRID_EX appends a 4-byte Early User Authorization Result PDU after CredSSP; the
+                // machine must consume it before MCS. Plain HYBRID/SSL authenticate immediately.
+                if selected.contains(SecurityProtocol::HYBRID_EX) {
+                    self.stage = Stage::EarlyUserAuth { selected };
+                    vec![Action::AwaitEarlyUserAuth]
+                } else {
+                    self.stage = Stage::Done;
+                    vec![Action::Authenticated { selected }]
+                }
+            }
+            (Stage::EarlyUserAuth { selected }, Event::EarlyUserAuthResult(bytes)) => {
                 // 4 bytes little-endian (MS-RDPBCGR 2.2.10.2). Only AUTHZ_SUCCESS grants access;
                 // any other value — or a truncated buffer — is a malformed PDU.
                 match bytes.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) {
-                    Some(AUTHZ_SUCCESS) => vec![Action::Authenticated { selected }],
-                    Some(AUTHZ_ACCESS_DENIED) => {
-                        vec![Action::FailWith(ConnectError::EarlyUserAuthDenied)]
+                    Some(AUTHZ_SUCCESS) => {
+                        self.stage = Stage::Done;
+                        vec![Action::Authenticated { selected }]
                     }
-                    _ => vec![Action::FailWith(ConnectError::Decode(
+                    Some(AUTHZ_ACCESS_DENIED) => self.fail(ConnectError::EarlyUserAuthDenied),
+                    _ => self.fail(ConnectError::Decode(
                         justrdp_pdu::DecodeError::InvalidField {
                             field: "authorizationResult",
                             reason: "unrecognized or truncated Early User Authorization Result PDU",
                         },
-                    ))],
+                    )),
                 }
             }
-            Event::NlaComplete => {
-                let selected = self
-                    .negotiated
-                    .expect("NlaComplete only follows a StartNla in the nla-credssp stage");
-                // HYBRID_EX appends a 4-byte Early User Authorization Result PDU after CredSSP; the
-                // machine must consume it before MCS. Plain HYBRID/SSL authenticate immediately.
-                if selected.contains(SecurityProtocol::HYBRID_EX) {
-                    vec![Action::AwaitEarlyUserAuth]
-                } else {
-                    vec![Action::Authenticated { selected }]
-                }
-            }
+            // Every other (stage, event) combination violates the ordering contract on `Event`:
+            // an adapter bug, surfaced as a typed failure — never a panic, never silent.
+            (stage, event) => self.fail(ConnectError::UnexpectedEvent {
+                stage: stage.label(),
+                event: event.kind(),
+            }),
         }
+    }
+
+    /// Fail the connect: emit [`Action::FailWith`] and move to the terminal [`Stage::Done`], where
+    /// every further event is itself an [`ConnectError::UnexpectedEvent`].
+    fn fail(&mut self, e: ConnectError) -> Vec<Action> {
+        self.stage = Stage::Done;
+        vec![Action::FailWith(e)]
     }
 }
 
@@ -511,5 +575,136 @@ mod tests {
                 NegFailureCode::HYBRID_REQUIRED_BY_SERVER
             ))]
         );
+    }
+
+    /// All event kinds, for the stage × event mismatch matrix.
+    const ALL_EVENT_KINDS: [EventKind; 5] = [
+        EventKind::Connected,
+        EventKind::Received,
+        EventKind::TlsEstablished,
+        EventKind::NlaComplete,
+        EventKind::EarlyUserAuthResult,
+    ];
+
+    /// A representative event of `kind`. Payloads are minimal — for a mismatched (stage, event)
+    /// pair the machine must reject on the pairing alone, before looking at any payload.
+    fn sample_event(kind: EventKind) -> Event<'static> {
+        match kind {
+            EventKind::Connected => Event::Connected,
+            EventKind::Received => Event::Received(&[]),
+            EventKind::TlsEstablished => Event::TlsEstablished(&[]),
+            EventKind::NlaComplete => Event::NlaComplete,
+            EventKind::EarlyUserAuthResult => Event::EarlyUserAuthResult(&[0, 0, 0, 0]),
+        }
+    }
+
+    /// A machine driven to the terminal stage via the success path (Authenticated emitted).
+    fn done_authenticated() -> ConnectStateMachine {
+        let mut sm = awaiting_nla(SecurityProtocol::HYBRID);
+        sm.process(Event::NlaComplete);
+        sm
+    }
+
+    /// A machine driven to the terminal stage via the failure path (FailWith emitted).
+    fn done_failed() -> ConnectStateMachine {
+        let mut sm = negotiating();
+        sm.process(Event::Received(&connection_failure(
+            NegFailureCode::HYBRID_REQUIRED_BY_SERVER,
+        )));
+        sm
+    }
+
+    #[test]
+    fn stage_mismatched_events_fail_with_unexpected_event() {
+        // The full ordering-contract matrix: for every stage, every event the stage does not
+        // expect yields FailWith(UnexpectedEvent { stage, event }) — never a panic, never a
+        // silent misparse (e.g. Received after x224-negotiate used to be re-decoded as a confirm).
+        type Make = fn() -> ConnectStateMachine;
+        let stages: [(Make, &str, &[EventKind]); 7] = [
+            (
+                || ConnectStateMachine::new(requested()),
+                "tcp-connect",
+                &[EventKind::Connected],
+            ),
+            (negotiating, "x224-negotiate", &[EventKind::Received]),
+            (
+                || awaiting_tls(SecurityProtocol::HYBRID),
+                "tls-handshake",
+                &[EventKind::TlsEstablished],
+            ),
+            (
+                || awaiting_nla(SecurityProtocol::HYBRID),
+                "nla-credssp",
+                &[EventKind::NlaComplete],
+            ),
+            (
+                awaiting_early_user_auth,
+                "nla-credssp",
+                &[EventKind::EarlyUserAuthResult],
+            ),
+            (done_authenticated, "done", &[]),
+            (done_failed, "done", &[]),
+        ];
+
+        for (make, label, expected) in stages {
+            for kind in ALL_EVENT_KINDS {
+                if expected.contains(&kind) {
+                    continue;
+                }
+                let mut sm = make();
+                assert_eq!(sm.stage(), label, "stage constructor drove to the wrong stage");
+                let actions = sm.process(sample_event(kind));
+                assert_eq!(
+                    actions,
+                    vec![Action::FailWith(ConnectError::UnexpectedEvent {
+                        stage: label,
+                        event: kind,
+                    })],
+                    "stage {label} fed {kind:?} must fail with UnexpectedEvent"
+                );
+                // The violation is terminal: the machine lands in `done`.
+                assert_eq!(sm.stage(), "done");
+            }
+        }
+    }
+
+    #[test]
+    fn nla_complete_in_early_user_auth_substage_is_unexpected() {
+        // Regression pin for a latent pre-typed-error bug: a duplicate NlaComplete while awaiting
+        // the early-auth PDU used to re-emit AwaitEarlyUserAuth (double read). Both sub-states
+        // share the "nla-credssp" label, so the matrix above covers this pair too — this test
+        // documents the specific duplicate-event shape.
+        let mut sm = awaiting_early_user_auth();
+        let actions = sm.process(Event::NlaComplete);
+        assert_eq!(
+            actions,
+            vec![Action::FailWith(ConnectError::UnexpectedEvent {
+                stage: "nla-credssp",
+                event: EventKind::NlaComplete,
+            })]
+        );
+    }
+
+    #[test]
+    fn replay_after_authentication_is_unexpected() {
+        // The terminal stage accepts nothing: replaying the very event that authenticated must
+        // fail typed, not re-emit Authenticated.
+        let mut sm = done_authenticated();
+        let actions = sm.process(Event::NlaComplete);
+        assert_eq!(
+            actions,
+            vec![Action::FailWith(ConnectError::UnexpectedEvent {
+                stage: "done",
+                event: EventKind::NlaComplete,
+            })]
+        );
+    }
+
+    #[test]
+    fn failure_transitions_to_done_stage() {
+        // FailWith is terminal: the stage label reflects it, so an adapter that keeps polling
+        // stage() after a failure sees `done`, not the stage that failed.
+        let sm = done_failed();
+        assert_eq!(sm.stage(), "done");
     }
 }
