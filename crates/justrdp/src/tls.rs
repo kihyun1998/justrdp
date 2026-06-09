@@ -3,10 +3,13 @@
 //! connect machine would add nothing; see plan.md §3 and ADR-0002). What the core owns is the pure,
 //! RDP-relevant step: given the server's leaf certificate, extract the `subjectPublicKey` that
 //! CredSSP later binds to (`pubKeyAuth`, plan.md §0 — FreeRDP/IronRDP convention binds to the
-//! certificate's `SubjectPublicKeyInfo`, not the whole certificate).
+//! certificate's `subjectPublicKey`, the inner BIT STRING of the `SubjectPublicKeyInfo`, **not** the
+//! whole `SubjectPublicKeyInfo` and not the whole certificate). Binding to the full SPKI makes a
+//! Windows server reject the channel binding and abort the TLS session (proven on the real VM,
+//! slice-3): the server hashes only the inner key, so we must too.
 
 use x509_cert::Certificate;
-use x509_cert::der::{Decode, Encode};
+use x509_cert::der::Decode;
 
 /// Why extracting the server public key failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,15 +21,20 @@ pub enum TlsCertError {
 }
 
 /// Extract the server's `subjectPublicKey` from its leaf TLS certificate (`cert_der`), returning the
-/// DER-encoded `SubjectPublicKeyInfo` (algorithm identifier + the public key BIT STRING) — the exact
-/// bytes `openssl … | openssl rsa -pubin -outform DER` / OpenSSL's `i2d_PUBKEY` produce, and the
-/// value CredSSP's public-key binding consumes.
+/// inner public-key bytes — the contents of the `SubjectPublicKeyInfo`'s `subjectPublicKey` BIT
+/// STRING (for RSA, the DER `RSAPublicKey { modulus, exponent }`), **not** the enclosing
+/// `SubjectPublicKeyInfo` and **not** the certificate. This is the exact value CredSSP's `pubKeyAuth`
+/// binding hashes (FreeRDP / ironrdp `extract_tls_server_public_key` convention); a Windows server
+/// hashes the same inner key and aborts the TLS session if our binding disagrees.
 pub fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, TlsCertError> {
     let cert = Certificate::from_der(cert_der).map_err(|_| TlsCertError::MalformedCertificate)?;
     cert.tbs_certificate
         .subject_public_key_info
-        .to_der()
-        .map_err(|_| TlsCertError::PublicKeyEncoding)
+        .subject_public_key
+        .as_bytes()
+        .map(<[u8]>::to_vec)
+        // `None` only if the BIT STRING is not byte-aligned, which a valid public key never is.
+        .ok_or(TlsCertError::PublicKeyEncoding)
 }
 
 #[cfg(test)]
@@ -34,16 +42,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_subject_public_key_info_from_a_certificate() {
-        // A throwaway self-signed cert. The extracted SubjectPublicKeyInfo must be byte-identical to
-        // the key pair's own DER — that is what `i2d_PUBKEY` / `openssl rsa -pubin -outform DER`
-        // emit, and what CredSSP binds to.
+    fn extracts_the_inner_subject_public_key_not_the_whole_spki() {
+        // CredSSP's pubKeyAuth binds to the certificate's `subjectPublicKey` — the *inner* BIT STRING
+        // contents of the SubjectPublicKeyInfo, NOT the whole SPKI structure (FreeRDP / ironrdp
+        // convention). Binding to the full SPKI makes a Windows server reject the channel binding and
+        // abort the TLS session — proven on the real VM in slice-3.
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = key.cert.der();
-        let expected_spki = key.key_pair.public_key_der();
+        // `public_key_der()` is the *full* SubjectPublicKeyInfo; the inner key is a proper subset.
+        let full_spki = key.key_pair.public_key_der();
 
-        let spki = extract_subject_public_key(cert_der.as_ref()).unwrap();
-        assert_eq!(spki, expected_spki);
+        let inner = extract_subject_public_key(cert_der.as_ref()).unwrap();
+
+        assert!(
+            inner.len() < full_spki.len(),
+            "extracted the whole SPKI ({} bytes) instead of the inner subjectPublicKey",
+            inner.len()
+        );
+        assert!(
+            full_spki.windows(inner.len()).any(|w| w == inner.as_slice()),
+            "the inner subjectPublicKey must be contained verbatim within the full SPKI"
+        );
     }
 
     #[test]

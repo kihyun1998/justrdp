@@ -89,6 +89,30 @@ These supersede the matching open questions in §10.
    outside the machine"): TLS *records* never enter the machine, but the TLS *stage* and the cert
    it produces do. slice-2 accepts any cert (validate=false); chain/name validation + TOFU
    pinning are later slices (§22). *(new — resolves the issue #2 ↔ §3 boundary conflict.)*
+10. **NLA boundary = `sspi` owns CredSSP verbatim; the adapter drives the token loop; the machine
+    owns the `nla-credssp` *stage* + the HYBRID_EX Early User Authorization Result PDU (slice-3).**
+    The exact sibling of decision 9. `sspi::credssp::CredSspClient` *is* CredSSP — its
+    `new(public_key, credentials, cred_ssp_mode, client_mode, spn)` + `process(TsRequest) ->
+    Generator<…, ClientState>` already own TSRequest/TSCredentials BER, the multi-round SPNEGO/NTLM
+    loop, the `client_nonce`, the `pubKeyAuth = SHA256(magic‖nonce‖key)` binding, and channel
+    bindings. ADR-0002 says we use that **verbatim** ("every deviation is a potential authentication
+    bypass"), so **justrdp-pdu gets *no* TSRequest codec** and the core hand-rolls *none* of the
+    CredSSP crypto — MS-CSSP sits on `sspi`'s side of the boundary, exactly as TLS records sit on
+    rustls's. `CredSspClient::process` returns a `Generator` (sspi's async-over-sync seam for KDC
+    round-trips), so the loop is driven in `justrdp-tokio`, and **`sspi` lives in the adapter, not
+    the core** — the same place `rustls` landed in slice-2, refining ADR-0002's stated
+    `justrdp → sspi` graph edge to `justrdp-tokio → sspi`. The machine is **not** bypassed: after
+    `tls-handshake` it advances into `nla-credssp` and emits `Action::StartNla { selected,
+    server_public_key }` (the slice-2-extracted key threaded **internally** — *not* an `NlaConfig`
+    construction input, correcting issue #3's framing); the adapter constructs `CredSspClient` with
+    that key + the caller-supplied credentials, drives the token exchange over TLS, then signals
+    completion back. The one genuinely-RDP payload the machine owns is the **HYBRID_EX Early User
+    Authorization Result PDU** (MS-RDPBCGR, 4 bytes LE: 0=granted → proceed, 5=denied →
+    `ConnectError::EarlyUserAuthDenied`) — a pure, CI-testable decode, the NLA analog of slice-2's
+    cert→key extraction. Credentials are a `connect()` input held by the adapter and **never enter
+    the pure machine** (no secrets in the sans-IO core). *(new — resolves the issue #3 ↔ ADR-0002
+    CredSSP-ownership conflict; supersedes issue #3 AC#1 and its `NlaConfig.server_cert_public_key`
+    framing.)*
 
 ## 0. Traps already PROVEN on the real VM this session (do not re-discover)
 
@@ -118,7 +142,20 @@ These cost real time to find. Bake them into the design from day one.
   **DeactivateAll** → re-run capability exchange + activation → new desktop size. The session
   loop must drive this **cancel-aware** (teardown must not hang) and rebuild the framebuffer.
 - **CredSSP pubKeyAuth binds to the cert `subjectPublicKey`** (FreeRDP/IronRDP convention),
-  not the whole certificate.
+  not the whole certificate. **Proven on the real VM (slice-3): "subjectPublicKey" means the
+  *inner* BIT STRING contents** of the `SubjectPublicKeyInfo` (`subject_public_key.as_bytes()` —
+  for RSA, the DER `RSAPublicKey`), **not the full `SubjectPublicKeyInfo` DER** (what
+  `i2d_PUBKEY` / `openssl rsa -pubin -outform DER` / rcgen `public_key_der()` emit). Binding to the
+  full SPKI gets NTLM auth all the way through, then the server rejects the round-3 `pubKeyAuth` and
+  aborts the TLS session with a fatal `internal_error` alert. ironrdp's `extract_tls_server_public_key`
+  uses the inner key; so must we. A self-consistent CI test cannot catch this — only the real-VM
+  binding can.
+- **CredSSP tokens must be SPNEGO-wrapped (`ClientMode::Negotiate`), not bare NTLM.** Proven on the
+  real VM (slice-3): `ClientMode::Ntlm` sends raw NTLM messages and the Windows server aborts the
+  TLS session with `internal_error`. Use `ClientMode::Negotiate(NegotiateConfig::new(..))` with the
+  package list pinned to `ntlm` (`"ntlm,!kerberos,!pku2u"`) so SPNEGO wraps NTLM and no KDC
+  round-trip is attempted ("per spec we should always use the Negotiate security package in
+  CredSSP"). CredSSP/NLA works fine over **TLS 1.3** against this VM — no TLS-version pin needed.
 - **`write` is not cancel-safe** in an async session loop (ironrdp's `Framed::write_all`):
   interrupting a partial write and retrying duplicates bytes. `read_pdu` IS cancel-safe.
 
