@@ -77,7 +77,9 @@ These cost real time to find. Bake them into the design from day one.
   make `earlyCapabilityFlags` fully caller-controlled.
 - **The codec this server actually uses is RemoteFX *Progressive* (`WireToSurface2`)** — not
   H.264, not Uncompressed. Confirmed by live capture. β scope (Progressive, no external
-  decoder) is the right target; H.264/AVC needs an external decoder (openh264/ffmpeg).
+  decoder) is the right target; H.264/AVC needs a separate AVC decoder **backend — undecided**
+  (a C lib like openh264/ffmpeg, an OS-API Platform-FFI backend like WMF/VideoToolbox/VAAPI, or
+  skip it — RemoteFX/Progressive carry the desktop; don't hardcode openh264).
   **Correction verified in source (this sweep):** ironrdp-graphics 0.8 has a *near-complete*
   Progressive decoder — `TileState` (cross-pass coefficient/sign store, progressive.rs:687),
   `decode_first`/`decode_upgrade` (736/775), `reconstruct_to_rgba` (810, full inverse DWT +
@@ -239,7 +241,7 @@ advertise X, the server silently never offers Y. Capture every such coupling up 
 - [ ] **M(β)** — **RemoteFX Progressive decode**: TileSimple/First/Upgrade, DAS sign state, SRL, progressive quant, multi-pass coefficient accumulation, final DWT+colour. **ironrdp is NEAR decode-complete** (corrected, source-verified): `graphics/progressive.rs` ships both the low-level passes (`decode_first_pass`/`decode_upgrade_pass`) AND a high-level `TileState` (cross-pass store) + `decode_first`/`decode_upgrade` + `reconstruct_to_rgba` (full tile→RGBA) + a `SurfaceTiles` grid. *Our work = wire `WireToSurface2` payload → `SurfaceTiles`/`TileState` → `reconstruct_to_rgba` → `FrameUpdate`, plus surface bookkeeping.* ← the β work; this server uses it; smaller than first thought.
 - [ ] **O** — ClearCodec (EGFX lossless, mandatory *for EGFX* per spec): residual + vbar cache + subcodec (Raw/NSCodec/RLEX) + 4000-glyph cache. **Decode-complete in `graphics/clearcodec`** (BGRA, alpha=0xFF).
 - [ ] **O** — NSCodec (lossy subcodec): RLGR+AYCoCg, color-loss 0–7, chroma subsample. **ironrdp = PDU/caps only, no decoder.**
-- [ ] **O** — H.264 / AVC420 & AVC444: **NOT in ironrdp** — needs external decoder (openh264/ffmpeg). Patent/licensing implications. ironrdp-egfx wires AVC420→decoder *if* one is supplied.
+- [ ] **O** — H.264 / AVC420 & AVC444: **NOT in ironrdp** — needs a separate AVC decoder **backend (undecided)**: a vendored C lib (openh264/ffmpeg), an **OS-API Platform-FFI** backend (Windows Media Foundation / macOS VideoToolbox / Linux VAAPI — no C in our build tree, HW-accelerated), or **skip H.264** (optional in RDP; RemoteFX/Progressive cover the desktop). Decide at the H.264 slice, behind a pluggable decoder trait — **don't prescribe openh264**. Patent/licensing implications. ironrdp-egfx wires AVC420→a supplied decoder.
 - [ ] **O** — zgfx (RDP8 bulk compression for EGFX payloads): 2.5MB LZ77 history, segmented. **Decode-complete in `graphics/zgfx`.** History persists across frames.
 - [ ] **O** — MPPC / bulk compression (legacy fast-path payloads): 32KB history. *ironrdp ref: ironrdp-bulk.*
 - [ ] **M** — Pointer / cursor: color/large/monochrome shapes, XOR/AND masks, alpha, 32-entry cache, position/hide, inverted-pixel special case. **Decode-complete in `graphics/pointer.rs` + session compositing.**
@@ -415,7 +417,7 @@ The client's core RDP engine must be host-agnostic. Seams are closures/traits cr
 - [ ] **O — `"kerberos"`:** Link `sspi` with Kerberos enabled; requires KDC reachability. Default off (workgroup-sufficient).
 - [ ] **O — `"remote-fx"`:** Codec support (full + Progressive). Adds `ironrdp-graphics` dependency; default on.
 - [ ] **O — `"clearcodec"`:** Lossless codec (mandatory for EGFX per spec, so probably always-on if EGFX is on).
-- [ ] **O — `"h264"`:** H.264 AVC420/AVC444 via openh264. Adds binary openh264 dependency; default off (patent/licensing concerns).
+- [ ] **O — `"h264"`:** H.264 AVC420/AVC444 behind a **pluggable AVC decoder backend (undecided)** — a vendored C lib (openh264/ffmpeg), OS-API Platform-FFI (WMF/VideoToolbox/VAAPI), or none. Default off (patent/licensing); the backend is chosen at the H.264 slice, not prescribed here.
 - [ ] **O — `"gateway"`:** RDP Gateway / TS Gateway protocol (MS-TSGS) support for proxy scenarios. Default off.
 - [ ] **O — `"rdpdr"`:** Device/drive redirection (large, complex). Default off.
 - [ ] **O — `"clipboard"`:** CLIPRDR channel. Default off.
@@ -1642,7 +1644,7 @@ Here are the NOT/THINLY covered specifications to add:
 
 ### Layer 5 — Graphics & codecs (long tail)
 
-- [ ] **M — H.264 / AVC420 external decoder integration.** Receive WireToSurface2 with codec_id=AVC420 → pass to openh264 / ffmpeg / libx264 decoder → RGBA output. *ironrdp-egfx wires the PDU; no decoder included (patent/licensing). Spec-only for decoder integration.* EGFX-capable servers often use H.264; critical for modern perf.
+- [ ] **M — H.264 / AVC420 decoder-backend integration.** Receive the AVC WireToSurface PDU → pass to a **pluggable AVC decoder backend (undecided: C lib like openh264/ffmpeg, OS-API Platform-FFI like WMF/VideoToolbox/VAAPI, or skip)** → RGBA output. *ironrdp-egfx wires the PDU; no decoder included (patent/licensing). Backend chosen at the H.264 slice.* EGFX-capable servers often use H.264; matters for video-heavy perf.
 
 - [ ] **O — H.264 AVC444v2 (4:4:4 lossless).** Extension of AVC that preserves all channels (no chroma subsampling). *spec-only; requires H.264 decoder.* High-fidelity remote desktop (e.g., design / color-critical work).
 
