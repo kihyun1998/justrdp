@@ -17,14 +17,15 @@ A single attempt to establish an RDP session with a remote server. Begins with T
 A live RDP session after the [[Connect Stage]] completes activation. The Session owns the framebuffer, virtual channel processors, and the long-lived TCP stream. The session loop dispatches inbound graphics/input PDUs and emits [[Frame Update]]s, input responses, and other channel data to the host. Ends on disconnect or fatal error.
 
 ### Connect Stage
-A labeled sub-step within the [[Connection]] sequence. There are six stages, shared between diagnostic logging and the host's progress UI:
+A labeled sub-step within the [[Connection]] sequence. There are seven stages, shared between diagnostic logging and the host's progress UI:
 
 1. **tcp-connect** — TCP dial to the RDP server.
-2. **tls-handshake** — TLS upgrade (if SSL/HYBRID/RDSTLS negotiated).
-3. **nla-credssp** — NLA authentication via CredSSP, SPNEGO, and NTLM/Kerberos.
-4. **capability-exchange** — client/server advertise and negotiate feature flags and desktops size.
-5. **activation** — finalize the session (synchronize, grant control, exchange fonts).
-6. **session-active** — entered on successful activation; persists until disconnect.
+2. **x224-negotiate** — X.224 Connection Request/Confirm, selecting the transport security protocol (SSL / HYBRID / HYBRID_EX). The first protocol exchange after the socket opens, before any TLS upgrade.
+3. **tls-handshake** — TLS upgrade (if SSL/HYBRID/RDSTLS negotiated).
+4. **nla-credssp** — NLA authentication via CredSSP, SPNEGO, and NTLM/Kerberos.
+5. **capability-exchange** — client/server advertise and negotiate feature flags and desktops size.
+6. **activation** — finalize the session (synchronize, grant control, exchange fonts).
+7. **session-active** — entered on successful activation; persists until disconnect.
 
 Entered linearly; stage completion is observable by the host for both progress indication and error attribution.
 
