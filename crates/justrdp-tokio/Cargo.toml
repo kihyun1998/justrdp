@@ -10,6 +10,9 @@ repository.workspace = true
 justrdp.workspace = true
 justrdp-pdu.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
+tracing = { workspace = true, features = ["std", "attributes"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }
+# Captures tracing events in-test so we can assert on the emitted debug logs (criterion 14).
+tracing-test = "0.2"

@@ -67,6 +67,11 @@ impl From<io::Error> for ConnectFailure {
 /// is called with each connect stage label as it is entered, for progress UI / diagnostics.
 ///
 /// Returns the negotiated protocol and the live stream on success.
+#[tracing::instrument(
+    skip(on_stage),
+    fields(host = %addr.ip(), port = addr.port()),
+    err,
+)]
 pub async fn connect(
     addr: SocketAddr,
     requested: SecurityProtocol,
@@ -78,6 +83,7 @@ pub async fn connect(
     let mut readbuf = [0u8; 8192];
     let mut queue: VecDeque<Action> = sm.start().into();
     on_stage(sm.stage());
+    tracing::debug!(stage = sm.stage(), "entering connect stage");
 
     loop {
         while let Some(action) = queue.pop_front() {
@@ -89,15 +95,19 @@ pub async fn connect(
                         Ok(Err(e)) => return Err(ConnectFailure::Io(e)),
                         Err(_) => return Err(ConnectFailure::Timeout { stage: "tcp-connect" }),
                     };
+                    tracing::debug!("tcp socket connected");
                     stream = Some(s);
                     queue.extend(sm.process(Event::Connected));
                     on_stage(sm.stage());
+                    tracing::debug!(stage = sm.stage(), "entering connect stage");
                 }
                 Action::WriteBytes(bytes) => {
                     let s = stream.as_mut().expect("socket connected before write");
                     s.write_all(&bytes).await?;
+                    tracing::debug!(bytes = bytes.len(), "wrote frame to socket");
                 }
                 Action::Proceed { selected } => {
+                    tracing::debug!(?selected, "x224 negotiation complete");
                     return Ok(ConnectOutcome {
                         selected,
                         stream: stream.expect("socket connected before proceed"),
@@ -120,6 +130,7 @@ pub async fn connect(
                 "server closed connection during X.224 negotiation",
             )));
         }
+        tracing::debug!(bytes = n, stage = sm.stage(), "read from socket");
         inbox.extend_from_slice(&readbuf[..n]);
         queue.extend(sm.process(Event::Received(&inbox)));
     }
@@ -129,6 +140,7 @@ pub async fn connect(
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+    use tracing_test::traced_test;
 
     fn requested() -> SecurityProtocol {
         SecurityProtocol::SSL | SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX
@@ -153,6 +165,20 @@ mod tests {
             sock.write_all(&reply).await.unwrap();
         });
         addr
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn connect_logs_stage_transitions_and_byte_counts() {
+        // Server selects HYBRID (0x02).
+        let addr = mock_server(confirm_frame([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00])).await;
+        connect(addr, requested(), |_| {}).await.unwrap();
+
+        // Every connect stage is named in the debug logs (criterion 14: observable transitions)...
+        assert!(logs_contain("tcp-connect"), "tcp-connect stage not logged");
+        assert!(logs_contain("x224-negotiate"), "x224-negotiate stage not logged");
+        // ...and byte counts are logged for the bytes written and read.
+        assert!(logs_contain("bytes="), "byte counts not logged");
     }
 
     #[tokio::test]

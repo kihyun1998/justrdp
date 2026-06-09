@@ -17,3 +17,6 @@ justrdp-codecs = { path = "crates/justrdp-codecs" }
 # The only external dependency slice-1 introduces: the async runtime the I/O adapter drives the
 # sans-IO core with. rustls / sspi (ADR-0002) arrive in later slices.
 tokio = { version = "1", default-features = false }
+# Structured observability (plan.md §11d): each Connect Stage is a tracing span; a no-op without a
+# subscriber, so it does not compromise sans-IO purity or portability.
+tracing = { version = "0.1", default-features = false }
