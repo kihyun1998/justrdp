@@ -37,6 +37,11 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for each post-TCP connect stage (X.224 round trip, TLS handshake, …). Per plan.md §11e
 /// these share one bound, applied per stage rather than cumulatively.
 const STAGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Upper bound on a single CredSSP `TsRequest` we will buffer from the server. A real TSRequest is a
+/// few KB at most (NTLM / SPNEGO tokens; Kerberos PACs are larger but still modest); this caps a
+/// hostile or buggy server's BER length field so it cannot drive an unbounded allocation from the
+/// `nla-credssp` read before the bytes are even validated.
+const MAX_TS_REQUEST_LEN: usize = 64 * 1024;
 
 /// A successful connect through NLA: the server-selected transport security protocol and the live,
 /// authenticated TLS stream — positioned just after CredSSP (and the HYBRID_EX early-auth check),
@@ -353,8 +358,6 @@ async fn run_credssp(
     )
     .map_err(nla_err)?;
 
-    // The client speaks first: process an empty TsRequest to get the initial NTLM token, then
-    // ping-pong until `FinalMessage` (the TSCredentials delegation) is sent.
     // The client speaks first: process an empty TsRequest to get the initial token, then ping-pong
     // (Negotiate → Challenge → Authenticate → pubKeyAuth) until `FinalMessage` (the TSCredentials
     // delegation) is sent.
@@ -411,13 +414,27 @@ async fn read_ts_request(stream: &mut TlsStream<TcpStream>) -> Result<TsRequest,
         // Short form: the length is the byte itself.
         head[1] as usize
     } else {
-        // Long form: the low 7 bits give the number of big-endian length bytes that follow.
+        // Long form: the low 7 bits give the number of big-endian length bytes that follow. Reject a
+        // width that would overflow `usize` (no real TSRequest length needs more than 8 bytes).
         let n = (head[1] & 0x7f) as usize;
+        if n > std::mem::size_of::<usize>() {
+            return Err(ConnectFailure::Nla {
+                reason: format!("TSRequest BER length field uses {n} bytes; refusing to parse"),
+            });
+        }
         let mut len_bytes = vec![0u8; n];
         stream.read_exact(&mut len_bytes).await?;
         frame.extend_from_slice(&len_bytes);
         len_bytes.iter().fold(0usize, |acc, &b| (acc << 8) | b as usize)
     };
+    // Cap before allocating: a server-controlled length must not drive an unbounded allocation.
+    if content_len > MAX_TS_REQUEST_LEN {
+        return Err(ConnectFailure::Nla {
+            reason: format!(
+                "TSRequest length {content_len} exceeds the {MAX_TS_REQUEST_LEN}-byte cap"
+            ),
+        });
+    }
     let mut content = vec![0u8; content_len];
     stream.read_exact(&mut content).await?;
     frame.extend_from_slice(&content);
