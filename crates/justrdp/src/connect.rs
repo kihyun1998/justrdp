@@ -19,14 +19,28 @@ pub enum Action {
     /// The TLS records themselves never enter this machine (plan.md §3 — the handshake runs outside
     /// the connect state machine).
     StartTls { selected: SecurityProtocol },
-    /// The TLS upgrade is complete; the connect sequence may advance past `tls-handshake`. Carries
-    /// the server-selected protocol and the server's `subjectPublicKey` (DER `SubjectPublicKeyInfo`)
-    /// that CredSSP will bind to in the next slice.
-    Proceed {
+    /// The TLS upgrade is complete and the server's `subjectPublicKey` has been extracted; the
+    /// adapter must now run the CredSSP token exchange (NLA), binding `pubKeyAuth` to
+    /// `server_public_key`, and signal completion via [`Event::NlaComplete`]. The CredSSP records
+    /// (`TSRequest`s) never enter this machine — `sspi` owns CredSSP and the adapter drives the loop
+    /// (plan.md decision 10), exactly as the TLS handshake stays in the adapter.
+    StartNla {
         /// The protocol the server chose in the X.224 Connection Confirm.
         selected: SecurityProtocol,
-        /// The server's `subjectPublicKey` extracted from its TLS certificate (raw DER).
+        /// The server's `subjectPublicKey` (DER `SubjectPublicKeyInfo`) for CredSSP to bind to.
         server_public_key: Vec<u8>,
+    },
+    /// HYBRID_EX only: the CredSSP exchange finished and the server will now send the 4-byte Early
+    /// User Authorization Result PDU. The adapter must read it and deliver it via
+    /// [`Event::EarlyUserAuthResult`]. (Failing to consume it desyncs capability exchange —
+    /// plan.md §0.)
+    AwaitEarlyUserAuth,
+    /// Authentication succeeded (the CredSSP exchange, plus the HYBRID_EX Early User Authorization
+    /// check when applicable); the connect sequence has reached the end of what this slice
+    /// implements. Carries the negotiated protocol. MCS connect is the next slice.
+    Authenticated {
+        /// The protocol the server chose in the X.224 Connection Confirm.
+        selected: SecurityProtocol,
     },
     /// The connect attempt failed; surface this error and tear down.
     FailWith(ConnectError),
@@ -42,6 +56,13 @@ pub enum Event<'a> {
     /// The TLS handshake the adapter ran (after [`Action::StartTls`]) completed; carries the
     /// server's leaf certificate (DER) so the machine can extract its `subjectPublicKey`.
     TlsEstablished(&'a [u8]),
+    /// The CredSSP token exchange the adapter ran (after [`Action::StartNla`]) completed
+    /// successfully. For HYBRID_EX, the Early User Authorization Result PDU still follows on the
+    /// wire (delivered next via [`Event::EarlyUserAuthResult`]).
+    NlaComplete,
+    /// HYBRID_EX only: the 4-byte Early User Authorization Result PDU the adapter read (after
+    /// [`Action::AwaitEarlyUserAuth`]). Little-endian; the machine decodes grant/deny.
+    EarlyUserAuthResult(&'a [u8]),
 }
 
 /// Why a connect attempt failed.
@@ -56,6 +77,9 @@ pub enum ConnectError {
     /// The TLS upgrade failed: the server's certificate could not be parsed or its public key
     /// extracted. (Handshake-level failures surface at the adapter boundary.)
     TlsHandshake(crate::tls::TlsCertError),
+    /// HYBRID_EX only: the server's Early User Authorization Result PDU denied access
+    /// (`AUTHZ_ACCESS_DENIED`) — user authorization failed, so the connection must be dropped.
+    EarlyUserAuthDenied,
 }
 
 /// The labeled connect sub-step the machine is in (CONTEXT.md "Connect Stage"). slice-1 stops at
@@ -69,6 +93,9 @@ enum Stage {
     /// X.224 selected a TLS-based protocol; the adapter is running the rustls handshake, after which
     /// it hands back the server certificate via [`Event::TlsEstablished`].
     TlsHandshake,
+    /// TLS is up and the server's public key extracted; the adapter is running the CredSSP token
+    /// exchange (and, for HYBRID_EX, the Early User Authorization Result that follows it).
+    NlaCredssp,
 }
 
 impl Stage {
@@ -77,6 +104,7 @@ impl Stage {
             Stage::TcpConnect => "tcp-connect",
             Stage::X224Negotiate => "x224-negotiate",
             Stage::TlsHandshake => "tls-handshake",
+            Stage::NlaCredssp => "nla-credssp",
         }
     }
 }
@@ -149,16 +177,60 @@ impl ConnectStateMachine {
                     .negotiated
                     .expect("TlsEstablished only follows a StartTls in the tls-handshake stage");
                 match crate::tls::extract_subject_public_key(cert_der) {
-                    Ok(server_public_key) => vec![Action::Proceed {
-                        selected,
-                        server_public_key,
-                    }],
+                    Ok(server_public_key) => {
+                        // TLS is up: hand off into NLA. The adapter runs the CredSSP token exchange
+                        // (binding to this key); the machine advances to `nla-credssp` and waits for
+                        // the adapter to report completion via `Event::NlaComplete`.
+                        self.stage = Stage::NlaCredssp;
+                        vec![Action::StartNla {
+                            selected,
+                            server_public_key,
+                        }]
+                    }
                     Err(e) => vec![Action::FailWith(ConnectError::TlsHandshake(e))],
+                }
+            }
+            Event::EarlyUserAuthResult(bytes) => {
+                let selected = self.negotiated.expect(
+                    "EarlyUserAuthResult only follows AwaitEarlyUserAuth in the nla-credssp stage",
+                );
+                // 4 bytes little-endian (MS-RDPBCGR 2.2.10.2). Only AUTHZ_SUCCESS grants access;
+                // any other value — or a truncated buffer — is a malformed PDU.
+                match bytes.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) {
+                    Some(AUTHZ_SUCCESS) => vec![Action::Authenticated { selected }],
+                    Some(AUTHZ_ACCESS_DENIED) => {
+                        vec![Action::FailWith(ConnectError::EarlyUserAuthDenied)]
+                    }
+                    _ => vec![Action::FailWith(ConnectError::Decode(
+                        justrdp_pdu::DecodeError::InvalidField {
+                            field: "authorizationResult",
+                            reason: "unrecognized or truncated Early User Authorization Result PDU",
+                        },
+                    ))],
+                }
+            }
+            Event::NlaComplete => {
+                let selected = self
+                    .negotiated
+                    .expect("NlaComplete only follows a StartNla in the nla-credssp stage");
+                // HYBRID_EX appends a 4-byte Early User Authorization Result PDU after CredSSP; the
+                // machine must consume it before MCS. Plain HYBRID/SSL authenticate immediately.
+                if selected.contains(SecurityProtocol::HYBRID_EX) {
+                    vec![Action::AwaitEarlyUserAuth]
+                } else {
+                    vec![Action::Authenticated { selected }]
                 }
             }
         }
     }
 }
+
+/// `AUTHZ_SUCCESS` — the HYBRID_EX Early User Authorization Result PDU value that grants the user
+/// access (MS-RDPBCGR 2.2.10.2). Any other `authorizationResult` denies or is malformed.
+const AUTHZ_SUCCESS: u32 = 0x0000_0000;
+/// `AUTHZ_ACCESS_DENIED` — the Early User Authorization Result PDU value that denies access; the
+/// client must drop the connection (MS-RDPBCGR 2.2.10.2).
+const AUTHZ_ACCESS_DENIED: u32 = 0x0000_0005;
 
 /// Decode a server Connection Confirm frame into its RDP negotiation response, peeling TPKT →
 /// X.224 CC → `RDP_NEG_RSP`/`RDP_NEG_FAILURE`. Errors propagate so the caller can distinguish a
@@ -255,23 +327,112 @@ mod tests {
         sm
     }
 
+    /// Drive a machine through the TLS handshake into the `nla-credssp` stage (the adapter is now
+    /// running the CredSSP token exchange), selecting `selected`. The certificate is a throwaway
+    /// self-signed cert — only the stage transition matters here, not the extracted key.
+    fn awaiting_nla(selected: SecurityProtocol) -> ConnectStateMachine {
+        let mut sm = awaiting_tls(selected);
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        sm.process(Event::TlsEstablished(key.cert.der().as_ref()));
+        sm
+    }
+
     #[test]
-    fn tls_established_emits_proceed_with_extracted_public_key() {
+    fn tls_established_emits_start_nla_and_enters_nla_credssp_stage() {
         let mut sm = awaiting_tls(SecurityProtocol::HYBRID);
         // The adapter ran the TLS handshake and hands back the server's leaf certificate. The
-        // machine extracts its subjectPublicKey and reports the completed upgrade.
+        // machine extracts its subjectPublicKey and hands off into NLA: it asks the adapter to run
+        // the CredSSP token exchange (binding to that key) and advances to the `nla-credssp` stage.
+        // The handshake no longer terminates the connect sequence (slice-2 stopped here; slice-3
+        // continues — plan.md decision 10).
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = key.cert.der();
 
         let actions = sm.process(Event::TlsEstablished(cert_der.as_ref()));
 
+        // The machine threads through whatever the extractor produces (the inner subjectPublicKey —
+        // its exact form is tls.rs's contract, verified there); here we pin that StartNla carries it.
+        let expected_key = crate::tls::extract_subject_public_key(cert_der.as_ref()).unwrap();
         assert_eq!(
             actions,
-            vec![Action::Proceed {
+            vec![Action::StartNla {
                 selected: SecurityProtocol::HYBRID,
-                server_public_key: key.key_pair.public_key_der(),
+                server_public_key: expected_key,
             }]
         );
+        assert_eq!(sm.stage(), "nla-credssp");
+    }
+
+    #[test]
+    fn nla_complete_without_hybrid_ex_emits_authenticated() {
+        // On a plain HYBRID connection the CredSSP exchange is the end of authentication: when the
+        // adapter reports it finished, the machine is authenticated (no HYBRID_EX early-auth PDU
+        // follows). It reports the protocol the server selected.
+        let mut sm = awaiting_nla(SecurityProtocol::HYBRID);
+        let actions = sm.process(Event::NlaComplete);
+        assert_eq!(
+            actions,
+            vec![Action::Authenticated {
+                selected: SecurityProtocol::HYBRID
+            }]
+        );
+    }
+
+    /// Drive a HYBRID_EX machine to the point where it is waiting for the Early User Authorization
+    /// Result PDU (CredSSP done, `AwaitEarlyUserAuth` emitted).
+    fn awaiting_early_user_auth() -> ConnectStateMachine {
+        let mut sm = awaiting_nla(SecurityProtocol::HYBRID_EX);
+        sm.process(Event::NlaComplete);
+        sm
+    }
+
+    #[test]
+    fn early_user_auth_granted_emits_authenticated() {
+        let mut sm = awaiting_early_user_auth();
+        // AUTHZ_SUCCESS = 0x00000000, 4 bytes little-endian (MS-RDPBCGR 2.2.10.2).
+        let actions = sm.process(Event::EarlyUserAuthResult(&[0x00, 0x00, 0x00, 0x00]));
+        assert_eq!(
+            actions,
+            vec![Action::Authenticated {
+                selected: SecurityProtocol::HYBRID_EX
+            }]
+        );
+    }
+
+    #[test]
+    fn early_user_auth_denied_fails_with_early_user_auth_denied() {
+        let mut sm = awaiting_early_user_auth();
+        // AUTHZ_ACCESS_DENIED = 0x00000005: the server rejected the user. The client must drop the
+        // connection (MS-RDPBCGR — "login to the remote session will not be possible").
+        let actions = sm.process(Event::EarlyUserAuthResult(&[0x05, 0x00, 0x00, 0x00]));
+        assert_eq!(
+            actions,
+            vec![Action::FailWith(ConnectError::EarlyUserAuthDenied)]
+        );
+    }
+
+    #[test]
+    fn early_user_auth_unrecognized_code_fails_with_decode() {
+        let mut sm = awaiting_early_user_auth();
+        // Neither AUTHZ_SUCCESS (0) nor AUTHZ_ACCESS_DENIED (5): a malformed PDU, surfaced as a
+        // decode error rather than silently treated as success.
+        let actions = sm.process(Event::EarlyUserAuthResult(&[0x99, 0x00, 0x00, 0x00]));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::FailWith(ConnectError::Decode(_))]
+        ));
+    }
+
+    #[test]
+    fn nla_complete_with_hybrid_ex_awaits_early_user_auth() {
+        // HYBRID_EX adds a step: the server sends a 4-byte Early User Authorization Result PDU right
+        // after CredSSP, before MCS (plan.md §0 — unconsumed, capability exchange desyncs). So on
+        // NlaComplete the machine does not authenticate yet; it asks the adapter to read that PDU
+        // and stays in `nla-credssp`.
+        let mut sm = awaiting_nla(SecurityProtocol::HYBRID_EX);
+        let actions = sm.process(Event::NlaComplete);
+        assert_eq!(actions, vec![Action::AwaitEarlyUserAuth]);
+        assert_eq!(sm.stage(), "nla-credssp");
     }
 
     #[test]
