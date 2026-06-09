@@ -2,7 +2,7 @@
 # Crate split per ADR-0001 (sans-IO core) + plan.md decision 6 (pragmatic 3+1).
 [workspace]
 resolver = "2"
-members = ["crates/justrdp-pdu", "crates/justrdp", "crates/justrdp-codecs"]
+members = ["crates/justrdp-pdu", "crates/justrdp", "crates/justrdp-codecs", "crates/justrdp-tokio"]
 
 [workspace.package]
 edition = "2024"
@@ -12,4 +12,11 @@ repository = "https://github.com/kihyun1998/justrdp"
 
 [workspace.dependencies]
 justrdp-pdu = { path = "crates/justrdp-pdu" }
+justrdp = { path = "crates/justrdp" }
 justrdp-codecs = { path = "crates/justrdp-codecs" }
+# The only external dependency slice-1 introduces: the async runtime the I/O adapter drives the
+# sans-IO core with. rustls / sspi (ADR-0002) arrive in later slices.
+tokio = { version = "1", default-features = false }
+# Structured observability (plan.md §11d): each Connect Stage is a tracing span; a no-op without a
+# subscriber, so it does not compromise sans-IO purity or portability.
+tracing = { version = "0.1", default-features = false }

@@ -1,0 +1,18 @@
+[package]
+name = "justrdp-tokio"
+description = "Tokio I/O adapter that drives the sans-IO justrdp connect/session state machines."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+justrdp.workspace = true
+justrdp-pdu.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+tracing = { workspace = true, features = ["std", "attributes"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }
+# Captures tracing events in-test so we can assert on the emitted debug logs (criterion 14).
+tracing-test = "0.2"
