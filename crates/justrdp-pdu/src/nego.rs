@@ -119,15 +119,11 @@ impl NegResponse {
     /// Decode a negotiation response from the Connection Confirm variable part (the 8-byte
     /// `RDP_NEG_RSP` / `RDP_NEG_FAILURE`).
     pub fn decode(variable: &[u8]) -> Result<Self, crate::error::DecodeError> {
-        if variable.len() < 8 {
-            return Err(crate::error::DecodeError::NotEnoughBytes {
-                context: "rdp negotiation response",
-                needed: 8,
-                got: variable.len(),
-            });
-        }
-        let value = u32::from_le_bytes([variable[4], variable[5], variable[6], variable[7]]);
-        match variable[0] {
+        let mut cur = crate::cursor::ReadCursor::new(variable, "rdp negotiation response");
+        let ty = cur.read_u8()?;
+        cur.read_slice(3)?; // flags (1) + length (2) — fixed, unused
+        let value = cur.read_u32_le()?;
+        match ty {
             TYPE_RDP_NEG_RSP => Ok(NegResponse::Selected(SecurityProtocol::from_bits(value))),
             TYPE_RDP_NEG_FAILURE => Ok(NegResponse::Failure(NegFailureCode(value))),
             _ => Err(crate::error::DecodeError::InvalidField {

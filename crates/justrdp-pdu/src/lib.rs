@@ -7,6 +7,7 @@
 //! See `docs/plan.md` §2 (Layer 0 — wire) and §3 (Layer 1 — connection sequence), and ADR-0001
 //! (sans-IO state machine core).
 
+pub mod cursor;
 pub mod error;
 pub mod nego;
 pub mod tpkt;

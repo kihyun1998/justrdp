@@ -2,6 +2,7 @@
 //! TPDUs RDP uses during security negotiation. RDP carries its `RDP_NEG_REQ` / `RDP_NEG_RSP`
 //! structures in the TPDU *variable part*, so they are counted in the LI byte.
 
+use crate::cursor::ReadCursor;
 use crate::error::DecodeError;
 
 /// Connection Request TPDU code (client → server).
@@ -32,22 +33,22 @@ pub fn encode_connection_request(variable: &[u8]) -> Vec<u8> {
 /// Decode an X.224 Connection Confirm TPDU and return its variable part (e.g. the `RDP_NEG_RSP`
 /// bytes). The SRC-REF the server fills in is ignored — RDP does not use it.
 pub fn decode_connection_confirm(tpdu: &[u8]) -> Result<&[u8], DecodeError> {
-    if tpdu.len() < 1 + FIXED_PART_LEN {
-        return Err(DecodeError::NotEnoughBytes {
-            context: "x224 connection confirm",
-            needed: 1 + FIXED_PART_LEN,
-            got: tpdu.len(),
-        });
-    }
-    if tpdu[1] != CONNECTION_CONFIRM {
+    let mut cur = ReadCursor::new(tpdu, "x224 connection confirm");
+    let li = cur.read_u8()? as usize;
+    if cur.read_u8()? != CONNECTION_CONFIRM {
         return Err(DecodeError::InvalidField {
             field: "x224.code",
             reason: "expected Connection Confirm (0xD0)",
         });
     }
-    let li = tpdu[0] as usize;
-    let end = 1 + li;
-    Ok(&tpdu[1 + FIXED_PART_LEN..end])
+    // Skip the rest of the fixed part (DST-REF, SRC-REF, class) — the code byte is already read.
+    cur.read_slice(FIXED_PART_LEN - 1)?;
+    // LI counts the fixed part plus the variable part; the remainder is the variable part.
+    let variable_len = li.checked_sub(FIXED_PART_LEN).ok_or(DecodeError::InvalidField {
+        field: "x224.li",
+        reason: "shorter than the fixed TPDU header",
+    })?;
+    cur.read_slice(variable_len)
 }
 
 #[cfg(test)]
