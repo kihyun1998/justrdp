@@ -1,0 +1,15 @@
+[package]
+name = "justrdp-tokio"
+description = "Tokio I/O adapter that drives the sans-IO justrdp connect/session state machines."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+justrdp.workspace = true
+justrdp-pdu.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }
