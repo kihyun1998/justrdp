@@ -1,0 +1,9 @@
+[package]
+name = "justrdp-pdu"
+description = "RDP wire-format PDU encoding/decoding (sans-IO) for justrdp."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

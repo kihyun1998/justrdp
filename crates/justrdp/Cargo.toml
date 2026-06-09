@@ -1,0 +1,10 @@
+[package]
+name = "justrdp"
+description = "A from-scratch, sans-IO RDP client library."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+justrdp-pdu.workspace = true

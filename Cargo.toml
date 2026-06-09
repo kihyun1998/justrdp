@@ -1,6 +1,15 @@
-[package]
-name = "justrdp"
-version = "0.1.0"
-edition = "2024"
+# Virtual workspace for justrdp — a from-scratch, sans-IO RDP client library.
+# Crate split per ADR-0001 (sans-IO core) + plan.md decision 6 (pragmatic 3+1).
+[workspace]
+resolver = "2"
+members = ["crates/justrdp-pdu", "crates/justrdp", "crates/justrdp-codecs"]
 
-[dependencies]
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kihyun1998/justrdp"
+
+[workspace.dependencies]
+justrdp-pdu = { path = "crates/justrdp-pdu" }
+justrdp-codecs = { path = "crates/justrdp-codecs" }
