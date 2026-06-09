@@ -64,6 +64,17 @@ These supersede the matching open questions in §10.
    input, drdynvc + Display Control, then EGFX + RemoteFX/Progressive (the perf win), then the §O
    long tail. **"Complete" = the full plan.md M/O backlog**, dialled by how far down §O you go;
    f1 just sequences it safely. *(resolves §10 — MVP slice-1.)*
+8. **AVC/H.264 decode = a pluggable `AvcDecoder` trait, NOT an owned codec.** Unlike RemoteFX /
+   Progressive / ClearCodec / zgfx (owned outright via phased-c2, ADR-0003), H.264 is
+   patent-encumbered and its best backend is platform-dependent — so the core defines an
+   `AvcDecoder` trait (AVC bytes → RGBA) that the EGFX path calls, and the **backend is supplied,
+   not built-in**: a C lib (openh264/ffmpeg), an OS-API Platform-FFI backend (Windows Media
+   Foundation / macOS VideoToolbox / Linux VAAPI), or none — chosen at the H.264 slice, behind the
+   trait. justrdp ships **no** AVC decoder by default; absent one, AVC frames are skipped (the
+   server falls back to RemoteFX/Progressive). The other codecs are NOT traited — they're
+   pure-Rust, patent-free, platform-invariant, so phased-c2 owns them directly. Mirrors how ironrdp
+   (`H264Decoder` trait + optional `openh264` feature) and the prior justrdp (`AvcDecoder` trait)
+   both shaped it. *(new — the trait seam plan.md §7/§11i/§23 already imply.)*
 
 ## 0. Traps already PROVEN on the real VM this session (do not re-discover)
 
