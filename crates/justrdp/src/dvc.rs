@@ -1,8 +1,11 @@
 //! The drdynvc manager (MS-RDPEDYC 3.2) — the sans-IO state for the dynamic-virtual-channel
-//! transport riding the `drdynvc` static channel. It answers the server's Capabilities
-//! Request (version 1), accepts the Display Control channel ([MS-RDPEDISP]) and refuses every
-//! other Create Request, and reassembles fragmented channel data (DataFirst + Data). The
-//! session machine feeds it SVC payloads and wraps whatever it wants sent; this module never
+//! transport riding the `drdynvc` static channel. The manager owns the **transport**: it
+//! answers the server's Capabilities Request (version 1), matches Create Requests against the
+//! registered processors (refusing unknown channel names), and reassembles fragmented channel
+//! data (DataFirst + Data). Each channel is a [`DvcProcessor`] — the
+//! `channel_name`/`start`/`process`/`close` model (issue #8, conceptually after `ironrdp-dvc`,
+//! implemented here per ADR-0002) — which only ever sees complete messages. The session
+//! machine feeds the manager SVC payloads and wraps whatever it wants sent; this module never
 //! sees MCS framing.
 
 use justrdp_pdu::DecodeError;
@@ -26,6 +29,33 @@ const SVC_MESSAGE_CAP: usize = 64 << 10;
 /// bytes; the cap leaves room for future channels without allowing unbounded allocation.
 const DVC_MESSAGE_CAP: usize = 4 << 20;
 
+/// A dynamic-channel endpoint: one implementation per channel the client supports
+/// (Display Control today; EGFX and friends in their slices). The manager handles transport —
+/// processors receive only complete, reassembled messages.
+pub(crate) trait DvcProcessor {
+    /// The channel name the server's Create Request must match.
+    fn channel_name(&self) -> &'static str;
+    /// Called when the server created the channel (after the accepting Create Response is
+    /// queued). Returned outputs are processed like [`Self::process`]'s.
+    fn start(&mut self, channel_id: u32) -> Vec<ProcessorOutput>;
+    /// One complete (reassembled) channel message.
+    fn process(&mut self, message: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError>;
+    /// The channel closed (server Close PDU); drop per-channel state.
+    fn close(&mut self);
+}
+
+/// What a [`DvcProcessor`] wants done, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProcessorOutput {
+    /// A complete channel message to send (the manager fragments it into DVC data PDUs).
+    /// Display Control never speaks first, so no production processor constructs this yet —
+    /// the EGFX slice's caps-advertise will; the manager side is live and test-covered.
+    #[allow(dead_code)]
+    Send(Vec<u8>),
+    /// Display Control: the server's caps arrived — resize requests are valid now.
+    DisplayControlCaps(displaycontrol::Caps),
+}
+
 /// What the manager wants done after consuming one SVC payload, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DvcEvent {
@@ -36,26 +66,96 @@ pub(crate) enum DvcEvent {
     DisplayControlReady,
 }
 
-/// In-flight reassembly of one fragmented dynamic-channel message.
-#[derive(Debug)]
-struct Reassembly {
-    channel_id: u32,
-    total: usize,
-    buffer: Vec<u8>,
+/// The Display Control channel processor (MS-RDPEDISP): consumes the server's Caps PDU —
+/// the channel's only server→client message — and surfaces it; everything else on the
+/// channel is skipped as well-formed-but-unknown.
+#[derive(Debug, Default)]
+struct DisplayControlProcessor {
+    caps_seen: bool,
 }
 
-/// The drdynvc transport + Display Control state.
-#[derive(Debug, Default)]
+impl DvcProcessor for DisplayControlProcessor {
+    fn channel_name(&self) -> &'static str {
+        displaycontrol::CHANNEL_NAME
+    }
+
+    fn start(&mut self, _channel_id: u32) -> Vec<ProcessorOutput> {
+        Vec::new() // the server speaks first (its Caps PDU)
+    }
+
+    fn process(&mut self, message: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError> {
+        match DisplayControlPdu::decode(message)? {
+            DisplayControlPdu::Caps(caps) => {
+                tracing::debug!(
+                    target: "rdp_displaycontrol_caps",
+                    max_monitors = caps.max_num_monitors,
+                    area_a = caps.max_monitor_area_factor_a,
+                    area_b = caps.max_monitor_area_factor_b,
+                    "DISPLAYCONTROL_CAPS received"
+                );
+                let first = !self.caps_seen;
+                self.caps_seen = true;
+                Ok(if first {
+                    vec![ProcessorOutput::DisplayControlCaps(caps)]
+                } else {
+                    Vec::new()
+                })
+            }
+            DisplayControlPdu::Unknown { pdu_type } => {
+                tracing::debug!(
+                    target: "rdp_displaycontrol_caps",
+                    pdu_type,
+                    "unknown Display Control PDU skipped"
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.caps_seen = false;
+    }
+}
+
+/// One open dynamic channel: its server-assigned ID, the owning processor, and any
+/// fragmented message in flight (DataFirst total + accumulated bytes).
+#[derive(Debug)]
+struct OpenChannel {
+    channel_id: u32,
+    processor: usize,
+    reassembly: Option<(usize, Vec<u8>)>,
+}
+
+/// The drdynvc transport state plus the registered channel processors.
 pub(crate) struct Drdynvc {
+    processors: Vec<Box<dyn DvcProcessor + Send>>,
+    open: Vec<OpenChannel>,
     /// SVC chunk reassembly for the drdynvc channel itself.
     svc_buffer: Vec<u8>,
     svc_in_flight: bool,
-    /// The Display Control dynamic channel ID, once the server created it.
-    display_control: Option<u32>,
-    /// The server's Display Control caps, once received.
-    display_caps: Option<displaycontrol::Caps>,
-    /// One fragmented message in flight (only the accepted channel ever carries data).
-    reassembly: Option<Reassembly>,
+    /// The Display Control channel ID + server caps, recorded off the processor's output.
+    display_control: Option<(u32, displaycontrol::Caps)>,
+}
+
+impl core::fmt::Debug for Drdynvc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Drdynvc")
+            .field("open", &self.open)
+            .field("display_control", &self.display_control)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Drdynvc {
+    fn default() -> Self {
+        Self {
+            processors: vec![Box::new(DisplayControlProcessor::default())],
+            open: Vec::new(),
+            svc_buffer: Vec::new(),
+            svc_in_flight: false,
+            display_control: None,
+        }
+    }
 }
 
 impl Drdynvc {
@@ -63,7 +163,7 @@ impl Drdynvc {
     /// preconditions for a resize request (MS-RDPEDISP 1.3: the client must consume the Caps
     /// PDU before sending a Monitor Layout).
     pub(crate) fn display_control(&self) -> Option<(u32, displaycontrol::Caps)> {
-        Some((self.display_control?, self.display_caps?))
+        self.display_control
     }
 
     /// Consume one MCS-delivered SVC payload on the drdynvc channel.
@@ -109,38 +209,57 @@ impl Drdynvc {
     /// Handle one complete drdynvc PDU.
     fn on_dvc_pdu(&mut self, pdu: &[u8]) -> Result<Vec<DvcEvent>, DecodeError> {
         match DvcMessage::decode(pdu)? {
-            DvcMessage::CapabilitiesRequest { .. } => {
+            DvcMessage::CapabilitiesRequest { version } => {
+                tracing::debug!(
+                    target: "rdp_drdynvc",
+                    server_version = version,
+                    answered = dvc::CAPS_VERSION,
+                    "DYNVC capabilities request"
+                );
                 // The server's version is always ≥ ours; answer with what we implement.
                 Ok(vec![DvcEvent::Send(dvc::encode_capabilities_response(
                     dvc::CAPS_VERSION,
                 ))])
             }
             DvcMessage::CreateRequest { channel_id, name } => {
-                if name == displaycontrol::CHANNEL_NAME {
-                    self.display_control = Some(channel_id);
-                    self.display_caps = None; // fresh channel, fresh caps
-                    Ok(vec![DvcEvent::Send(dvc::encode_create_response(
-                        channel_id,
-                        CREATION_STATUS_OK,
-                    ))])
-                } else {
-                    // Channels justrdp does not implement yet are refused, which tells the
+                let Some(processor) = self
+                    .processors
+                    .iter()
+                    .position(|p| p.channel_name() == name)
+                else {
+                    tracing::debug!(target: "rdp_drdynvc", channel_id, name, "DYNVC create refused");
+                    // Channels with no registered processor are refused, which tells the
                     // server not to send data on them (EGFX and friends arrive as their own
-                    // slices and extend this dispatch).
-                    Ok(vec![DvcEvent::Send(dvc::encode_create_response(
+                    // slices, each registering a processor).
+                    return Ok(vec![DvcEvent::Send(dvc::encode_create_response(
                         channel_id,
                         CREATION_STATUS_REFUSED,
-                    ))])
-                }
+                    ))]);
+                };
+                tracing::debug!(target: "rdp_drdynvc", channel_id, name, "DYNVC create accepted");
+                self.open.retain(|c| c.channel_id != channel_id);
+                self.open.push(OpenChannel {
+                    channel_id,
+                    processor,
+                    reassembly: None,
+                });
+                let mut events = vec![DvcEvent::Send(dvc::encode_create_response(
+                    channel_id,
+                    CREATION_STATUS_OK,
+                ))];
+                let outputs = self.processors[processor].start(channel_id);
+                events.extend(self.apply_outputs(channel_id, outputs));
+                Ok(events)
             }
             DvcMessage::DataFirst {
                 channel_id,
                 total_length,
                 data,
             } => {
-                if Some(channel_id) != self.display_control {
+                let Some(open) = self.open.iter_mut().find(|c| c.channel_id == channel_id)
+                else {
                     return Ok(Vec::new()); // data on a refused channel: skipped
-                }
+                };
                 if total_length as usize > DVC_MESSAGE_CAP {
                     return Err(DecodeError::InvalidField {
                         field: "DYNVC_DATA_FIRST.Length",
@@ -149,67 +268,86 @@ impl Drdynvc {
                 }
                 if data.len() >= total_length as usize {
                     // Degenerate single-fragment DataFirst: complete immediately.
-                    self.reassembly = None;
-                    return self.on_channel_message(channel_id, &data[..total_length as usize]);
+                    open.reassembly = None;
+                    let message = data[..total_length as usize].to_vec();
+                    return self.dispatch(channel_id, &message);
                 }
-                self.reassembly = Some(Reassembly {
-                    channel_id,
-                    total: total_length as usize,
-                    buffer: data.to_vec(),
-                });
+                open.reassembly = Some((total_length as usize, data.to_vec()));
                 Ok(Vec::new())
             }
             DvcMessage::Data { channel_id, data } => {
-                if Some(channel_id) != self.display_control {
+                let Some(open) = self.open.iter_mut().find(|c| c.channel_id == channel_id)
+                else {
                     return Ok(Vec::new());
-                }
-                match self.reassembly.as_mut() {
-                    Some(r) if r.channel_id == channel_id => {
-                        r.buffer.extend_from_slice(data);
-                        if r.buffer.len() >= r.total {
-                            let r = self.reassembly.take().expect("checked above");
-                            return self.on_channel_message(channel_id, &r.buffer[..r.total]);
+                };
+                match open.reassembly.as_mut() {
+                    Some((total, buffer)) => {
+                        buffer.extend_from_slice(data);
+                        if buffer.len() >= *total {
+                            let total = *total;
+                            let buffer = open
+                                .reassembly
+                                .take()
+                                .map(|(_, b)| b)
+                                .unwrap_or_default();
+                            return self.dispatch(channel_id, &buffer[..total]);
                         }
                         Ok(Vec::new())
                     }
                     // No DataFirst in flight: the message fits one PDU.
-                    _ => self.on_channel_message(channel_id, data),
+                    None => {
+                        let message = data.to_vec();
+                        self.dispatch(channel_id, &message)
+                    }
                 }
             }
             DvcMessage::Close { channel_id } => {
-                if Some(channel_id) == self.display_control {
+                tracing::debug!(target: "rdp_drdynvc", channel_id, "DYNVC close");
+                if let Some(at) = self.open.iter().position(|c| c.channel_id == channel_id) {
+                    let open = self.open.remove(at);
+                    self.processors[open.processor].close();
+                }
+                if self.display_control.map(|(id, _)| id) == Some(channel_id) {
                     self.display_control = None;
-                    self.display_caps = None;
-                    self.reassembly = None;
                 }
                 Ok(Vec::new())
             }
             // Compressed / soft-sync / unknown commands: never negotiated, skipped
             // (well-formed-but-unknown never kills the session, plan.md §11c).
-            DvcMessage::Unsupported { .. } => Ok(Vec::new()),
+            DvcMessage::Unsupported { cmd } => {
+                tracing::debug!(target: "rdp_drdynvc", cmd, "unsupported DYNVC command skipped");
+                Ok(Vec::new())
+            }
         }
     }
 
-    /// Handle one complete message on an accepted dynamic channel (Display Control only).
-    fn on_channel_message(
-        &mut self,
-        _channel_id: u32,
-        message: &[u8],
-    ) -> Result<Vec<DvcEvent>, DecodeError> {
-        match DisplayControlPdu::decode(message)? {
-            DisplayControlPdu::Caps(caps) => {
-                let first = self.display_caps.is_none();
-                self.display_caps = Some(caps);
-                Ok(if first {
-                    vec![DvcEvent::DisplayControlReady]
-                } else {
-                    Vec::new()
-                })
+    /// Route one complete message to its channel's processor and apply the outputs.
+    fn dispatch(&mut self, channel_id: u32, message: &[u8]) -> Result<Vec<DvcEvent>, DecodeError> {
+        let Some(open) = self.open.iter().find(|c| c.channel_id == channel_id) else {
+            return Ok(Vec::new());
+        };
+        let outputs = self.processors[open.processor].process(message)?;
+        Ok(self.apply_outputs(channel_id, outputs))
+    }
+
+    /// Turn processor outputs into manager events (fragmenting sends, recording the
+    /// Display Control milestone).
+    fn apply_outputs(&mut self, channel_id: u32, outputs: Vec<ProcessorOutput>) -> Vec<DvcEvent> {
+        let mut events = Vec::new();
+        for output in outputs {
+            match output {
+                ProcessorOutput::Send(message) => {
+                    for pdu in dvc::encode_data(channel_id, &message) {
+                        events.push(DvcEvent::Send(pdu));
+                    }
+                }
+                ProcessorOutput::DisplayControlCaps(caps) => {
+                    self.display_control = Some((channel_id, caps));
+                    events.push(DvcEvent::DisplayControlReady);
+                }
             }
-            // The server never legitimately sends anything else on this channel
-            // (MS-RDPEDISP has no other server→client message); skip unknowns.
-            DisplayControlPdu::Unknown { .. } => Ok(Vec::new()),
         }
+        events
     }
 }
 
@@ -300,8 +438,7 @@ mod tests {
         let caps = display_caps_pdu(2, 1920, 1080);
         // Hand-fragment into DataFirst(8 bytes) + Data(rest) to exercise reassembly even
         // though a real caps PDU fits one fragment.
-        let mut first = vec![0x24, 7, caps.len() as u8]; // Cmd=2, Sp=1? — build manually:
-        first.clear();
+        let mut first = Vec::new();
         first.push((dvc::CMD_DATA_FIRST << 4) | 0); // cbId=0, Sp=0 (1-byte length)
         first.push(7);
         first.push(caps.len() as u8);
@@ -344,6 +481,61 @@ mod tests {
         assert!(manager.display_control().is_some());
         feed(&mut manager, &dvc::encode_close(7));
         assert!(manager.display_control().is_none());
+
+        // A re-created channel starts fresh: caps must arrive again before ready.
+        let events = feed(&mut manager, &create_request(8, displaycontrol::CHANNEL_NAME));
+        assert_eq!(events, vec![DvcEvent::Send(dvc::encode_create_response(8, 0))]);
+        assert!(manager.display_control().is_none());
+        for pdu in dvc::encode_data(8, &display_caps_pdu(1, 800, 600)) {
+            feed(&mut manager, &pdu);
+        }
+        assert_eq!(manager.display_control().unwrap().0, 8);
+    }
+
+    /// A stub processor that speaks first: `start` returns a message larger than one DVC
+    /// data PDU, exercising the manager's Send path (fragmentation included).
+    struct ChattyProcessor;
+
+    impl DvcProcessor for ChattyProcessor {
+        fn channel_name(&self) -> &'static str {
+            "justrdp::test::Chatty"
+        }
+        fn start(&mut self, _channel_id: u32) -> Vec<ProcessorOutput> {
+            vec![ProcessorOutput::Send(vec![0xAB; dvc::MAX_DATA_CHUNK + 1])]
+        }
+        fn process(&mut self, _message: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError> {
+            Ok(Vec::new())
+        }
+        fn close(&mut self) {}
+    }
+
+    #[test]
+    fn processor_start_messages_are_sent_and_fragmented() {
+        let mut manager = Drdynvc {
+            processors: vec![Box::new(ChattyProcessor)],
+            ..Drdynvc::default()
+        };
+        let events = feed(&mut manager, &create_request(5, "justrdp::test::Chatty"));
+        // Create Response + DataFirst + Data (the start message spans two fragments).
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0],
+            DvcEvent::Send(dvc::encode_create_response(5, 0))
+        );
+        let DvcEvent::Send(first) = &events[1] else {
+            panic!("expected a DataFirst send");
+        };
+        assert!(matches!(
+            DvcMessage::decode(first).unwrap(),
+            DvcMessage::DataFirst { channel_id: 5, .. }
+        ));
+        let DvcEvent::Send(rest) = &events[2] else {
+            panic!("expected a Data send");
+        };
+        assert!(matches!(
+            DvcMessage::decode(rest).unwrap(),
+            DvcMessage::Data { channel_id: 5, .. }
+        ));
     }
 
     #[test]

@@ -1082,6 +1082,7 @@ dependencies = [
  "justrdp-codecs",
  "justrdp-pdu",
  "rcgen",
+ "tracing",
  "x509-cert",
 ]
 

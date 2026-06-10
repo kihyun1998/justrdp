@@ -296,7 +296,7 @@ impl SessionStateMachine {
         let indication = mcs::SendDataIndication::decode(body).map_err(SessionError::Decode)?;
         if indication.channel_id != self.config.io_channel_id {
             if Some(indication.channel_id) == self.config.drdynvc_channel_id {
-                return self.on_drdynvc(indication.user_data, outputs);
+                return self.on_drdynvc(indication.channel_id, indication.user_data, outputs);
             }
             // Other static channel traffic (cliprdr, rdpsnd, …) — later slices' epics.
             return Ok(());
@@ -308,6 +308,7 @@ impl SessionStateMachine {
             share::PDU_TYPE_DEACTIVATE_ALL => {
                 // The server is resetting the session (most commonly a resize). Wait for the
                 // next Demand Active; graphics stop in the meantime.
+                tracing::debug!(target: "rdp_deactivate_all", "DeactivateAll received");
                 self.phase = Phase::Deactivated;
                 Ok(())
             }
@@ -354,6 +355,7 @@ impl SessionStateMachine {
             }
             share::PDU_TYPE2_FONT_MAP if self.phase == Phase::Reactivating => {
                 finalization::FontMap::decode(cur).map_err(SessionError::Decode)?;
+                tracing::debug!(target: "rdp_font_map", "Font Map received — reactivation complete");
                 self.phase = Phase::Active;
                 // Reactivation complete: re-emit the full screen so the host repaints
                 // (content restarts black; the server repaints everything next).
@@ -434,6 +436,12 @@ impl SessionStateMachine {
             .bitmap()
             .map(|b| (b.desktop_width, b.desktop_height))
             .unwrap_or(self.config.desktop_size);
+        tracing::debug!(
+            target: "rdp_demand_active",
+            width,
+            height,
+            "Demand Active received (reactivation)"
+        );
         if (width, height) != self.config.desktop_size {
             self.config.desktop_size = (width, height);
             self.framebuffer.resize(width, height);
@@ -556,6 +564,7 @@ impl SessionStateMachine {
     /// responses and the [`SessionOutput::DisplayControlReady`] milestone.
     fn on_drdynvc(
         &mut self,
+        mcs_channel_id: u16,
         payload: &[u8],
         outputs: &mut Vec<SessionOutput>,
     ) -> Result<(), SessionError> {
@@ -567,12 +576,9 @@ impl SessionStateMachine {
             match event {
                 DvcEvent::Send(pdu) => {
                     for chunk in svc::encode_chunks(&pdu) {
-                        outputs.push(SessionOutput::WriteBytes(self.wrap_channel(
-                            self.config
-                                .drdynvc_channel_id
-                                .expect("on_drdynvc is only reached when the channel id is set"),
-                            &chunk,
-                        )));
+                        outputs.push(SessionOutput::WriteBytes(
+                            self.wrap_channel(mcs_channel_id, &chunk),
+                        ));
                     }
                 }
                 DvcEvent::DisplayControlReady => {
@@ -608,6 +614,12 @@ impl SessionStateMachine {
                 reason: "requested area exceeds the server's Display Control caps",
             });
         }
+        tracing::debug!(
+            target: "rdp_displaycontrol_resize",
+            width,
+            height,
+            "Monitor Layout resize request encoded"
+        );
         let layout = displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor::primary(
             width, height,
         )]);
