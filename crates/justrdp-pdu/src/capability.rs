@@ -43,10 +43,17 @@ pub const GENERAL_NO_BITMAP_COMPRESSION_HDR: u16 = 0x0400;
 
 /// `inputFlags`: scancode input events (mandatory).
 pub const INPUT_FLAG_SCANCODES: u16 = 0x0001;
+/// `inputFlags`: extended mouse-button (MouseX) events.
+pub const INPUT_FLAG_MOUSEX: u16 = 0x0004;
 /// `inputFlags`: Unicode keyboard events.
 pub const INPUT_FLAG_UNICODE: u16 = 0x0010;
-/// `inputFlags`: fast-path input events.
+/// `inputFlags`: fast-path input events. Server-advertised (in Demand Active); the client
+/// sends fast-path input only when the server set this or [`INPUT_FLAG_FASTPATH_INPUT2`].
 pub const INPUT_FLAG_FASTPATH_INPUT: u16 = 0x0008;
+/// `inputFlags`: fast-path input v2 (CredSSP-era servers advertise this form).
+pub const INPUT_FLAG_FASTPATH_INPUT2: u16 = 0x0020;
+/// `inputFlags`: horizontal mouse wheel events (`TS_INPUT_FLAG_MOUSE_HWHEEL`).
+pub const INPUT_FLAG_MOUSE_HWHEEL: u16 = 0x0100;
 
 /// `orderFlags`: order negotiation supported (MUST be set).
 pub const ORDER_NEGOTIATE_SUPPORT: u16 = 0x0002;
@@ -598,8 +605,16 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
             color_pointer_cache_size: 20,
             pointer_cache_size: 20,
         }),
+        // MOUSEX and MOUSE_HWHEEL are advertised because the input encoder handles both
+        // (extended buttons; the horizontal wheel folds into pointerFlags exactly like the
+        // vertical one) — "advertise everything we can actually handle" (plan.md §1).
+        // FASTPATH_INPUT/2 are deliberately absent — those are *server* flags the client
+        // reads from Demand Active to pick its input transport.
         CapabilitySet::Input(InputCapabilitySet {
-            input_flags: INPUT_FLAG_SCANCODES | INPUT_FLAG_UNICODE,
+            input_flags: INPUT_FLAG_SCANCODES
+                | INPUT_FLAG_MOUSEX
+                | INPUT_FLAG_UNICODE
+                | INPUT_FLAG_MOUSE_HWHEEL,
             keyboard_layout: core.keyboard_layout,
             keyboard_type: core.keyboard_type,
             keyboard_subtype: core.keyboard_subtype,
@@ -683,6 +698,35 @@ mod tests {
                 assert_eq!(d.preferred_bits_per_pixel, 24);
             }
             _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn default_input_capset_advertises_every_handled_input_feature() {
+        // "Advertise everything we can actually handle" (plan.md §1, gate #7): the encoder
+        // supports scancodes, MouseX, Unicode, and the horizontal wheel — every one must be
+        // advertised, and the fast-path flags must NOT be (those are server-side).
+        let sets = default_client_capabilities(&sample_core());
+        let input = sets
+            .iter()
+            .find_map(|s| match s {
+                CapabilitySet::Input(i) => Some(i),
+                _ => None,
+            })
+            .expect("defaults include an Input capset");
+        for (flag, name) in [
+            (INPUT_FLAG_SCANCODES, "SCANCODES"),
+            (INPUT_FLAG_MOUSEX, "MOUSEX"),
+            (INPUT_FLAG_UNICODE, "UNICODE"),
+            (INPUT_FLAG_MOUSE_HWHEEL, "MOUSE_HWHEEL"),
+        ] {
+            assert!(input.input_flags & flag != 0, "{name} must be advertised");
+        }
+        for (flag, name) in [
+            (INPUT_FLAG_FASTPATH_INPUT, "FASTPATH_INPUT"),
+            (INPUT_FLAG_FASTPATH_INPUT2, "FASTPATH_INPUT2"),
+        ] {
+            assert!(input.input_flags & flag == 0, "{name} is a server flag");
         }
     }
 

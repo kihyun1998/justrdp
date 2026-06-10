@@ -42,6 +42,8 @@ pub const PDU_TYPE2_FONT_MAP: u8 = 0x28;
 pub const PDU_TYPE2_SAVE_SESSION_INFO: u8 = 0x26;
 /// `pduType2`: Set Error Info PDU (server → client, disconnect reasons).
 pub const PDU_TYPE2_SET_ERROR_INFO: u8 = 0x2F;
+/// `pduType2`: Input Event PDU (client → server, the slow-path input fallback).
+pub const PDU_TYPE2_INPUT: u8 = 0x1C;
 
 /// `streamId`: low-priority stream.
 pub const STREAM_LOW: u8 = 0x01;

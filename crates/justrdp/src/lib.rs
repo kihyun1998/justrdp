@@ -9,6 +9,7 @@
 
 pub mod connect;
 pub mod framebuffer;
+pub mod input;
 pub mod license_crypto;
 pub mod session;
 pub mod tls;
@@ -18,4 +19,6 @@ pub use connect::{
     Event, EventKind, LicenseConfig, LicenseEntropy, McsConnectResult, StaticChannel,
 };
 pub use framebuffer::{FrameUpdate, Framebuffer};
+pub use input::Scancode;
+pub use justrdp_pdu::input::InputEvent;
 pub use session::{SessionConfig, SessionError, SessionOutput, SessionStateMachine};
