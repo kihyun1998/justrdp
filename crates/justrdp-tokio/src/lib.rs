@@ -1335,9 +1335,9 @@ mod tests {
         let mut inbox = outcome.activation.leftover;
         let mut buf = [0u8; 16384];
 
-        // Capture compressed rectangles straight off the wire (single-fragment fast-path
-        // bitmap updates; fragmented ones are skipped — the capture is about real server
-        // bytes, and reassembly is the session machine's covered concern).
+        // Capture compressed rectangles straight off the wire, reassembling fragmented
+        // fast-path bitmap updates (large compressed bitmaps are exactly the ones servers
+        // fragment).
         let mut captured: Vec<justrdp_pdu::update::BitmapData> = Vec::new();
         let mut fragment: Vec<u8> = Vec::new();
         let mut total_rects = 0usize;
