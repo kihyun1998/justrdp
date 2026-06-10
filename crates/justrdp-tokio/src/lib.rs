@@ -285,13 +285,53 @@ pub async fn connect(
     credentials: Credentials,
     on_stage: impl FnMut(&str),
 ) -> Result<ConnectOutcome, ConnectFailure> {
-    connect_inner(server.into(), config, credentials, on_stage).await
+    connect_inner(
+        server.into(),
+        config,
+        credentials,
+        on_stage,
+        ConnectTimeouts::default(),
+    )
+    .await
+}
+
+/// The per-stage timeout policy for [`connect`]: how long the TCP dial may take, and how long
+/// each subsequent connect stage (an X.224 round trip, the TLS handshake, each NLA/MCS read)
+/// may sit idle before the connect fails with [`ConnectFailure::Timeout`] carrying the stage
+/// name. [`connect`] uses [`ConnectTimeouts::default`] (10 s dial / 15 s per stage, plan.md
+/// §11e); hosts with tighter UX budgets inject their own via [`connect_with_timeouts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectTimeouts {
+    /// Timeout for the TCP dial.
+    pub tcp_connect: Duration,
+    /// Timeout for each post-TCP connect stage, applied per stage rather than cumulatively.
+    pub stage: Duration,
+}
+
+impl Default for ConnectTimeouts {
+    fn default() -> Self {
+        Self {
+            tcp_connect: TCP_CONNECT_TIMEOUT,
+            stage: STAGE_TIMEOUT,
+        }
+    }
+}
+
+/// [`connect`] with the caller's [`ConnectTimeouts`] instead of the defaults.
+pub async fn connect_with_timeouts(
+    server: impl Into<ServerAddr>,
+    config: ConnectConfig,
+    credentials: Credentials,
+    on_stage: impl FnMut(&str),
+    timeouts: ConnectTimeouts,
+) -> Result<ConnectOutcome, ConnectFailure> {
+    connect_inner(server.into(), config, credentials, on_stage, timeouts).await
 }
 
 /// The monomorphic body of [`connect`], instrumented once the server identity is concrete.
 #[tracing::instrument(
     name = "connect",
-    skip(config, credentials, on_stage),
+    skip(config, credentials, on_stage, timeouts),
     fields(host = %server.host, port = server.port),
     err,
 )]
@@ -300,6 +340,7 @@ async fn connect_inner(
     config: ConnectConfig,
     credentials: Credentials,
     mut on_stage: impl FnMut(&str),
+    timeouts: ConnectTimeouts,
 ) -> Result<ConnectOutcome, ConnectFailure> {
     let mut sm = ConnectStateMachine::new(config);
     let mut transport = Transport::Absent;
@@ -319,7 +360,7 @@ async fn connect_inner(
                     // host string stays in `server` for SNI / SPN / validation.
                     let s = with_stage_timeout(
                         "tcp-connect",
-                        TCP_CONNECT_TIMEOUT,
+                        timeouts.tcp_connect,
                         TcpStream::connect((server.host.as_str(), server.port)),
                     )
                     .await?;
@@ -356,7 +397,7 @@ async fn connect_inner(
                     })?;
                     tracing::debug!(?selected, "starting TLS handshake");
                     let established = match tokio::time::timeout(
-                        STAGE_TIMEOUT,
+                        timeouts.stage,
                         connector.connect(server_name, stream),
                     )
                     .await
@@ -417,7 +458,7 @@ async fn connect_inner(
                         ))
                     })?;
                     let mut pdu = [0u8; 4];
-                    with_stage_timeout("nla-credssp", STAGE_TIMEOUT, stream.read_exact(&mut pdu))
+                    with_stage_timeout("nla-credssp", timeouts.stage, stream.read_exact(&mut pdu))
                         .await?;
                     tracing::debug!("read HYBRID_EX Early User Authorization Result PDU");
                     queue.extend(sm.process(Event::EarlyUserAuthResult(&pdu)));
@@ -471,7 +512,8 @@ async fn connect_inner(
         // The queue drained without a terminal action: the machine needs more bytes — from the
         // plaintext socket during X.224, from the TLS stream during the MCS exchange. The
         // machine reassembles TPKT frames itself, so raw chunks are fine.
-        let n = with_stage_timeout(sm.stage(), STAGE_TIMEOUT, transport.read(&mut readbuf)).await?;
+        let n =
+            with_stage_timeout(sm.stage(), timeouts.stage, transport.read(&mut readbuf)).await?;
         if n == 0 {
             return Err(ConnectFailure::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -842,12 +884,13 @@ async fn write_ts_request(
     Ok(())
 }
 
-/// Read one BER-framed `TsRequest` from `reader`. A TSRequest is a DER `SEQUENCE` (`0x30`) whose
-/// length prefix tells us exactly how many bytes to read, so we frame it precisely rather than
-/// guessing a buffer size (TLS records may split a single TSRequest across reads). Generic over the
-/// reader so the framing — including the length cap — is unit-testable in memory.
-async fn read_ts_request<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
+/// Read one BER-framed `TsRequest` from the TLS stream. A TSRequest is a DER `SEQUENCE` (`0x30`)
+/// whose length prefix tells us exactly how many bytes to read, so we frame it precisely rather
+/// than guessing a buffer size (TLS records may split a single TSRequest across reads). The
+/// framing — the length cap, the over-wide rejection, mid-frame reassembly — is pinned by the
+/// `connect`-level tests against a loopback TLS server replying with crafted TSRequest bytes.
+async fn read_ts_request(
+    reader: &mut TlsStream<TcpStream>,
 ) -> Result<TsRequest, ConnectFailure> {
     let mut frame = Vec::with_capacity(64);
     // Tag + first length byte.
@@ -1023,115 +1066,6 @@ mod tests {
                 hardware_id: [0x4A55_5354, 0x5244_5001, 0, 0], // "JUST","RDP\1" — arbitrary
             },
         }
-    }
-
-    #[tokio::test]
-    async fn with_stage_timeout_passes_through_ready_value() {
-        let out =
-            with_stage_timeout("test", Duration::from_secs(1), async { Ok::<u8, io::Error>(42) })
-                .await;
-        assert!(matches!(out, Ok(42)));
-    }
-
-    #[tokio::test]
-    async fn with_stage_timeout_maps_io_error_to_io() {
-        let out: Result<u8, ConnectFailure> =
-            with_stage_timeout("test", Duration::from_secs(1), async {
-                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
-            })
-            .await;
-        assert!(matches!(out, Err(ConnectFailure::Io(_))));
-    }
-
-    #[tokio::test]
-    async fn with_stage_timeout_maps_elapsed_to_timeout_with_stage() {
-        // A future that never resolves must elapse and surface the stage name.
-        let never = std::future::pending::<io::Result<u8>>();
-        let out = with_stage_timeout("tls-handshake", Duration::from_millis(10), never).await;
-        assert!(matches!(
-            out,
-            Err(ConnectFailure::Timeout {
-                stage: "tls-handshake"
-            })
-        ));
-    }
-
-    /// The on-wire BER bytes of a TSRequest carrying `n` bytes of `nego_tokens` — the exact framing
-    /// `read_ts_request` must parse back (encoded by sspi, the same codec the real exchange uses).
-    fn encoded_ts_request(n: usize) -> Vec<u8> {
-        let ts = TsRequest {
-            nego_tokens: Some(vec![0xAB; n]),
-            ..TsRequest::default()
-        };
-        let mut buf = Vec::new();
-        ts.encode_ts_request(&mut buf).unwrap();
-        buf
-    }
-
-    #[tokio::test]
-    async fn read_ts_request_round_trips_a_short_form_frame() {
-        // A small TSRequest uses BER short-form length (< 0x80) — a single length byte.
-        let bytes = encoded_ts_request(10);
-        assert!(
-            bytes[1] < 0x80,
-            "expected short-form length for a small TSRequest, got {:#x}",
-            bytes[1]
-        );
-        let mut reader: &[u8] = &bytes;
-        let parsed = read_ts_request(&mut reader).await.unwrap();
-        assert_eq!(parsed.nego_tokens, Some(vec![0xAB; 10]));
-    }
-
-    #[tokio::test]
-    async fn read_ts_request_round_trips_a_long_form_frame() {
-        // A TSRequest over 127 bytes forces BER long-form length, exercising the multi-byte parse.
-        let bytes = encoded_ts_request(500);
-        assert!(
-            bytes[1] >= 0x80,
-            "expected long-form length for a large TSRequest, got {:#x}",
-            bytes[1]
-        );
-        let mut reader: &[u8] = &bytes;
-        let parsed = read_ts_request(&mut reader).await.unwrap();
-        assert_eq!(parsed.nego_tokens, Some(vec![0xAB; 500]));
-    }
-
-    #[tokio::test]
-    async fn read_ts_request_rejects_a_length_over_the_cap() {
-        // A hostile header claiming a 4-byte length of 0x00FF_FFFF (~16 MiB), far over the cap. The
-        // cap must trip BEFORE any content is read or allocated — we supply only the 6 header bytes,
-        // so reaching the content read would EOF instead of producing this clean rejection.
-        let header = [0x30, 0x84, 0x00, 0xFF, 0xFF, 0xFF];
-        let mut reader: &[u8] = &header;
-        match &read_ts_request(&mut reader).await.unwrap_err() {
-            ConnectFailure::Nla { reason } => {
-                assert!(reason.contains("exceeds"), "unexpected reason: {reason}")
-            }
-            other => panic!("expected an over-cap Nla rejection, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn read_ts_request_rejects_an_overwide_length_field() {
-        // 0x80 | 0x10 = 16 length bytes — wider than `usize`; refuse rather than overflow the fold.
-        let header = [0x30, 0x90];
-        let mut reader: &[u8] = &header;
-        match &read_ts_request(&mut reader).await.unwrap_err() {
-            ConnectFailure::Nla { reason } => {
-                assert!(reason.contains("refusing to parse"), "unexpected reason: {reason}")
-            }
-            other => panic!("expected an over-wide length rejection, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn read_ts_request_surfaces_truncation_as_io() {
-        // A valid header promising more content than is delivered: read_exact hits EOF mid-frame.
-        let mut bytes = encoded_ts_request(10);
-        bytes.truncate(bytes.len() - 5);
-        let mut reader: &[u8] = &bytes;
-        let err = read_ts_request(&mut reader).await.unwrap_err();
-        assert!(matches!(err, ConnectFailure::Io(_)), "expected an Io EOF error, got {err:?}");
     }
 
     /// A captured X.224 Connection Confirm carrying an 8-byte RDP negotiation structure.
@@ -1358,6 +1292,208 @@ mod tests {
             ),
             "expected a protocol negotiation failure, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn connect_maps_a_refused_dial_to_io() {
+        // Reserve a loopback port, then release it: nobody listens, so the dial is refused and
+        // must surface as ConnectFailure::Io (not a timeout, not a panic).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = connect(addr, test_config(), test_credentials(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectFailure::Io(_)), "expected Io, got {err:?}");
+    }
+
+    /// Like `mock_tls_server`, but a CredSSP peer under our control: after the TLS handshake it
+    /// swallows the client's first TSRequest (the SPNEGO/NTLM NEGOTIATE) and answers with the
+    /// given raw bytes — each chunk flushed as its own TLS record, so a multi-chunk reply
+    /// reaches the client split mid-frame, exactly as real servers split large TSRequests.
+    /// This lets the tests drive the adapter's `nla-credssp` read path over the wire, through
+    /// public `connect`, with hostile, truncated, or fragmented framing. `hold_open` keeps the
+    /// connection alive after the reply (a failure must then come from the bytes, not an EOF);
+    /// `false` drops it immediately (an EOF mid-frame).
+    async fn mock_tls_server_replying_to_nla(reply: Vec<Vec<u8>>, hold_open: bool) -> SocketAddr {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = ck.key_pair.serialize_der();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 64];
+            let _ = sock.read(&mut scratch).await.unwrap(); // plaintext Connection Request
+            sock.write_all(&confirm_frame([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]))
+                .await
+                .unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            let mut nego = [0u8; 4096];
+            let _ = tls.read(&mut nego).await.unwrap(); // the client's first TSRequest
+            for chunk in reply {
+                tls.write_all(&chunk).await.unwrap();
+                tls.flush().await.unwrap(); // one TLS record per chunk
+            }
+            if hold_open {
+                let mut buf = [0u8; 1];
+                let _ = tls.read(&mut buf).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_an_oversized_ts_request_from_the_server() {
+        // A hostile header claiming a 4-byte BER length of 0x00FF_FFFF (~16 MiB), far over the
+        // cap. The connection stays open, so the only way connect can fail is the cap tripping
+        // before the content is read or allocated.
+        let addr =
+            mock_tls_server_replying_to_nla(vec![vec![0x30, 0x84, 0x00, 0xFF, 0xFF, 0xFF]], true)
+                .await;
+        let err = connect(addr, test_config(), test_credentials(), |_| {})
+            .await
+            .unwrap_err();
+        match &err {
+            ConnectFailure::Nla { reason } => {
+                assert!(reason.contains("exceeds"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected an over-cap Nla rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_an_overwide_ts_request_length() {
+        // 0x80 | 0x10 = 16 BER length bytes — wider than usize; the adapter must refuse to
+        // parse rather than overflow.
+        let addr = mock_tls_server_replying_to_nla(vec![vec![0x30, 0x90]], true).await;
+        let err = connect(addr, test_config(), test_credentials(), |_| {})
+            .await
+            .unwrap_err();
+        match &err {
+            ConnectFailure::Nla { reason } => {
+                assert!(reason.contains("refusing to parse"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected an over-wide length rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_surfaces_a_truncated_ts_request_as_io() {
+        // A valid header promising 10 content bytes, but the server sends 3 and drops the
+        // connection: the mid-frame EOF must surface as Io, not hang or panic.
+        let addr =
+            mock_tls_server_replying_to_nla(vec![vec![0x30, 0x0A, 0x01, 0x02, 0x03]], false).await;
+        let err = connect(addr, test_config(), test_credentials(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ConnectFailure::Io(_)),
+            "expected an Io EOF error, got {err:?}"
+        );
+    }
+
+    /// The on-wire bytes of a TSRequest carrying an NSTATUS `errorCode` — what a real server
+    /// sends when it rejects the authentication (e.g. STATUS_LOGON_FAILURE). The errorCode is
+    /// the **last** field of the DER sequence, so the client can only surface it after framing
+    /// and parsing the complete TSRequest.
+    fn ts_request_with_error_code(nego_token_len: usize, code: u32) -> Vec<u8> {
+        let ts = TsRequest {
+            nego_tokens: (nego_token_len > 0).then(|| vec![0xAB; nego_token_len]),
+            error_code: Some(sspi::credssp::NStatusCode(code)),
+            ..TsRequest::default()
+        };
+        let mut buf = Vec::new();
+        ts.encode_ts_request(&mut buf).unwrap();
+        buf
+    }
+
+    const STATUS_LOGON_FAILURE: u32 = 0xC000_006D;
+
+    #[tokio::test]
+    async fn connect_surfaces_a_server_reported_credssp_error() {
+        // A short-form (single length byte) TSRequest carrying STATUS_LOGON_FAILURE: the only
+        // way the client can report the server's error status is by having framed and parsed
+        // the TSRequest correctly — the positive proof of the short-form read path.
+        let reply = ts_request_with_error_code(0, STATUS_LOGON_FAILURE);
+        assert!(reply[1] < 0x80, "expected short-form BER, got {:#x}", reply[1]);
+        let addr = mock_tls_server_replying_to_nla(vec![reply], true).await;
+
+        let err = connect(addr, test_config(), test_credentials(), |_| {})
+            .await
+            .unwrap_err();
+        match &err {
+            ConnectFailure::Nla { reason } => assert!(
+                reason.contains("error status"),
+                "expected the server-reported CredSSP error, got: {reason}"
+            ),
+            other => panic!("expected an Nla failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_reassembles_a_split_long_form_ts_request() {
+        // A 400-byte nego token forces long-form BER, and the reply arrives split across three
+        // TLS records (servers really do split TSRequests — the reason the framing code reads
+        // by declared length instead of guessing). The errorCode sits at the END of the frame:
+        // surfacing it proves the client reassembled the whole long-form TSRequest.
+        let reply = ts_request_with_error_code(400, STATUS_LOGON_FAILURE);
+        assert!(reply[1] >= 0x80, "expected long-form BER, got {:#x}", reply[1]);
+        let third = reply.len() / 3;
+        let chunks = vec![
+            reply[..third].to_vec(),
+            reply[third..2 * third].to_vec(),
+            reply[2 * third..].to_vec(),
+        ];
+        let addr = mock_tls_server_replying_to_nla(chunks, true).await;
+
+        let err = connect(addr, test_config(), test_credentials(), |_| {})
+            .await
+            .unwrap_err();
+        match &err {
+            ConnectFailure::Nla { reason } => assert!(
+                reason.contains("error status"),
+                "expected the server-reported CredSSP error, got: {reason}"
+            ),
+            other => panic!("expected an Nla failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_times_out_with_the_stage_name_when_the_server_stalls() {
+        // A server that accepts the dial, swallows the Connection Request, and never replies:
+        // the x224-negotiate stage must elapse and surface *its* name — observed through the
+        // public connect API, with the stage timeout injected via ConnectTimeouts.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 64];
+            let _ = sock.read(&mut scratch).await; // swallow the Connection Request…
+            tokio::time::sleep(Duration::from_secs(60)).await; // …and stall, socket held open
+        });
+
+        let timeouts = ConnectTimeouts {
+            stage: Duration::from_millis(200),
+            ..ConnectTimeouts::default()
+        };
+        let err =
+            connect_with_timeouts(addr, test_config(), test_credentials(), |_| {}, timeouts)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConnectFailure::Timeout {
+                    stage: "x224-negotiate"
+                }
+            ),
+            "expected an x224-negotiate timeout, got {err:?}"
+        );
+        hold.abort();
     }
 
     /// Real-VM acceptance test (ADR-0001 real-VM harness). Ignored by default — run with
