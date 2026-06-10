@@ -18,7 +18,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use justrdp::{Action, ConnectConfig, ConnectError, ConnectStateMachine, Event, McsConnectResult};
+use justrdp::{
+    Action, ConnectConfig, ConnectError, ConnectStateMachine, Event, McsConnectResult,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -661,7 +663,8 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
     use tracing_test::traced_test;
 
-    use justrdp_pdu::gcc;
+    use justrdp::ClientInfoConfig;
+    use justrdp_pdu::{client_info, gcc};
     use justrdp_pdu::nego::SecurityProtocol;
 
     /// A full connect config for the tests: SSL|HYBRID|HYBRID_EX advertised, a modest GCC core,
@@ -703,6 +706,23 @@ mod tests {
                 gcc::ChannelDef::new("cliprdr", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
                 gcc::ChannelDef::new("drdynvc", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
             ],
+            client_info: ClientInfoConfig {
+                flags: client_info::ClientInfoFlags::MOUSE
+                    | client_info::ClientInfoFlags::AUTOLOGON
+                    | client_info::ClientInfoFlags::LOGON_NOTIFY
+                    | client_info::ClientInfoFlags::LOGON_ERRORS
+                    | client_info::ClientInfoFlags::MOUSE_HAS_WHEEL,
+                domain: String::new(),
+                username: "rdptest".to_string(),
+                alternate_shell: String::new(),
+                work_dir: String::new(),
+                address_family: client_info::ADDRESS_FAMILY_INET,
+                client_address: "192.168.136.1".to_string(),
+                client_dir: String::new(),
+                timezone: client_info::TimezoneInfo::utc(),
+                session_id: 0,
+                performance_flags: 0x7,
+            },
         }
     }
 
@@ -1086,5 +1106,40 @@ mod tests {
                 "expected to reach the {expected} stage, got {stages:?}"
             );
         }
+
+        // The slice-4b proof (#40): the Client Info PDU went out with the connect sequence, so
+        // the server now proceeds to licensing on its own — the next inbound PDU must be a
+        // SEC_LICENSE_PKT-flagged Send Data Indication. Without the Client Info PDU the server
+        // sends nothing and this read times out.
+        let mut stream = outcome.stream;
+        let mut inbox = Vec::new();
+        let mut buf = [0u8; 4096];
+        let frame_len = loop {
+            match justrdp_pdu::tpkt::frame_len(&inbox) {
+                Ok(n) if inbox.len() >= n => break n,
+                Ok(_) | Err(justrdp_pdu::DecodeError::NotEnoughBytes { .. }) => {
+                    let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf))
+                        .await
+                        .expect("server should start licensing after the Client Info PDU")
+                        .expect("read from the live stream");
+                    assert!(n > 0, "server closed instead of starting licensing");
+                    inbox.extend_from_slice(&buf[..n]);
+                }
+                Err(e) => panic!("malformed TPKT from server: {e}"),
+            }
+        };
+        let tpdu = justrdp_pdu::tpkt::decode(&inbox[..frame_len]).unwrap();
+        let mcs_body = justrdp_pdu::x224::decode_data(tpdu).unwrap();
+        let indication = justrdp_pdu::mcs::SendDataIndication::decode(mcs_body)
+            .expect("first post-connect PDU is channel data");
+        assert_eq!(indication.channel_id, outcome.mcs.io_channel_id);
+        let mut cur =
+            justrdp_pdu::cursor::ReadCursor::new(indication.user_data, "licensing security header");
+        let sec_flags = client_info::decode_basic_security_header(&mut cur).unwrap();
+        eprintln!("first inbound security flags: {sec_flags:#06x}");
+        assert!(
+            sec_flags & client_info::SEC_LICENSE_PKT != 0,
+            "expected SEC_LICENSE_PKT in the first inbound PDU, got flags {sec_flags:#06x}"
+        );
     }
 }
