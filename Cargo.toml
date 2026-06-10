@@ -32,6 +32,10 @@ x509-cert = "0.2"
 # same place `rustls` landed: it drives the `CredSspClient` token loop, so the sans-IO core never
 # sees a TSRequest.
 sspi = "0.21"
+# Cancellation plumbing for the adapter's session loop (slice-8): `CancellationToken` lets the
+# host cancel a resize / tear the session down without racing the select loop. Adapter-only,
+# like tokio itself.
+tokio-util = { version = "0.7", default-features = false }
 # Self-signed certificates for CI tests (dev-dependency only): the mock TLS server's cert and the
 # SPKI-extraction property test both generate a throwaway cert at test time.
 rcgen = "0.13"

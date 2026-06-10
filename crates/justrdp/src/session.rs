@@ -8,13 +8,16 @@
 //! the robustness policy (plan.md §11c: unknown-but-well-formed never kills the session,
 //! malformed input does).
 
+use crate::dvc::{Drdynvc, DvcEvent};
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::{planar, rle};
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::input::InputEvent;
-use justrdp_pdu::{fastpath, finalization, input, mcs, share, tpkt, update, x224};
+use justrdp_pdu::{
+    displaycontrol, dvc, fastpath, finalization, input, mcs, share, svc, tpkt, update, x224,
+};
 
 /// Everything the session machine needs from the completed connect sequence: channel
 /// addressing from [`crate::McsConnectResult`], the share state from
@@ -38,6 +41,11 @@ pub struct SessionConfig {
     /// fast-path when the server advertised `INPUT_FLAG_FASTPATH_INPUT`/`INPUT2`, the
     /// slow-path Input Event PDU otherwise.
     pub server_input_flags: u16,
+    /// The MCS channel ID the server granted for the `drdynvc` static channel
+    /// ([`crate::McsConnectResult::static_channels`], entry named `"drdynvc"`), or `None` if
+    /// the channel was not requested/granted — dynamic channels (Display Control resize,
+    /// EGFX, …) are then unavailable.
+    pub drdynvc_channel_id: Option<u16>,
 }
 
 /// One effect of feeding bytes to the machine, in order.
@@ -45,9 +53,43 @@ pub struct SessionConfig {
 pub enum SessionOutput {
     /// Fresh pixels for the host's frame sink.
     Frame(FrameUpdate),
-    /// Bytes the adapter must write to the socket (reactivation traffic).
+    /// Bytes the adapter must write to the socket (reactivation / drdynvc traffic).
     WriteBytes(Vec<u8>),
+    /// The Display Control channel is open and the server's caps arrived:
+    /// [`SessionStateMachine::request_resize`] is valid from now on.
+    DisplayControlReady,
 }
+
+/// Why a [`SessionStateMachine::request_resize`] call was refused (the session itself is
+/// unaffected — the host may retry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeError {
+    /// The drdynvc channel was not granted, the server has not created the Display Control
+    /// channel, or its caps have not arrived yet (wait for
+    /// [`SessionOutput::DisplayControlReady`]).
+    NotReady,
+    /// The dimensions are outside MS-RDPEDISP 2.2.2.2.1's 200–8192 range, or the area
+    /// exceeds what the server's caps allow.
+    InvalidDimensions {
+        /// Why the dimensions were rejected.
+        reason: &'static str,
+    },
+}
+
+impl core::fmt::Display for ResizeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ResizeError::NotReady => {
+                write!(f, "Display Control is not ready (no channel or caps yet)")
+            }
+            ResizeError::InvalidDimensions { reason } => {
+                write!(f, "invalid resize dimensions: {reason}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for ResizeError {}
 
 /// Why the session failed. Malformed server data is fatal (likely protocol desync,
 /// plan.md §11c); everything else never reaches this type.
@@ -101,6 +143,8 @@ pub struct SessionStateMachine {
     /// the update code in flight (fragments of one update are never interleaved with
     /// another's — MS-RDPBCGR 2.2.9.1.2.1).
     fragment: Option<(u8, Vec<u8>)>,
+    /// The drdynvc transport + Display Control state (slice-8).
+    drdynvc: Drdynvc,
 }
 
 impl SessionStateMachine {
@@ -116,6 +160,7 @@ impl SessionStateMachine {
             phase: Phase::Active,
             inbox: leftover,
             fragment: None,
+            drdynvc: Drdynvc::default(),
         }
     }
 
@@ -250,7 +295,10 @@ impl SessionStateMachine {
         let body = x224::decode_data(tpdu).map_err(SessionError::Decode)?;
         let indication = mcs::SendDataIndication::decode(body).map_err(SessionError::Decode)?;
         if indication.channel_id != self.config.io_channel_id {
-            // Static channel traffic (cliprdr/drdynvc …) — later slices' epics.
+            if Some(indication.channel_id) == self.config.drdynvc_channel_id {
+                return self.on_drdynvc(indication.user_data, outputs);
+            }
+            // Other static channel traffic (cliprdr, rdpsnd, …) — later slices' epics.
             return Ok(());
         }
         let mut cur = ReadCursor::new(indication.user_data, "session share pdu");
@@ -503,13 +551,87 @@ impl SessionStateMachine {
         }
     }
 
-    /// Wrap an I/O-channel payload into a complete outbound frame.
-    fn wrap_io(&self, payload: &[u8]) -> Vec<u8> {
+    /// Consume one MCS-delivered payload on the drdynvc static channel: SVC reassembly →
+    /// drdynvc dispatch (caps response, Display Control create, channel data) → outbound
+    /// responses and the [`SessionOutput::DisplayControlReady`] milestone.
+    fn on_drdynvc(
+        &mut self,
+        payload: &[u8],
+        outputs: &mut Vec<SessionOutput>,
+    ) -> Result<(), SessionError> {
+        let events = self
+            .drdynvc
+            .on_svc_payload(payload)
+            .map_err(SessionError::Decode)?;
+        for event in events {
+            match event {
+                DvcEvent::Send(pdu) => {
+                    for chunk in svc::encode_chunks(&pdu) {
+                        outputs.push(SessionOutput::WriteBytes(self.wrap_channel(
+                            self.config
+                                .drdynvc_channel_id
+                                .expect("on_drdynvc is only reached when the channel id is set"),
+                            &chunk,
+                        )));
+                    }
+                }
+                DvcEvent::DisplayControlReady => {
+                    outputs.push(SessionOutput::DisplayControlReady);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode a client-initiated resize as a Display Control Monitor Layout PDU
+    /// (MS-RDPEDISP 2.2.2.2): one primary monitor at the origin with the requested size. The
+    /// returned frames go to the socket verbatim; the server answers with
+    /// Deactivation–Reactivation (DeactivateAll → Demand Active carrying the new size), which
+    /// this machine already consumes — the framebuffer rebuilds and a full-screen
+    /// [`SessionOutput::Frame`] re-emit follows the reactivation Font Map.
+    ///
+    /// Valid only after [`SessionOutput::DisplayControlReady`]. An odd `width` is rounded
+    /// down to even (the spec forbids odd widths; mstsc does the same).
+    pub fn request_resize(&self, width: u16, height: u16) -> Result<Vec<Vec<u8>>, ResizeError> {
+        let drdynvc_id = self.config.drdynvc_channel_id.ok_or(ResizeError::NotReady)?;
+        let (channel_id, caps) = self.drdynvc.display_control().ok_or(ResizeError::NotReady)?;
+        let width = u32::from(width) & !1; // MS-RDPEDISP 2.2.2.2.1: width must be even
+        let height = u32::from(height);
+        let range = displaycontrol::MIN_MONITOR_DIMENSION..=displaycontrol::MAX_MONITOR_DIMENSION;
+        if !range.contains(&width) || !range.contains(&height) {
+            return Err(ResizeError::InvalidDimensions {
+                reason: "width/height must be within 200–8192 (MS-RDPEDISP 2.2.2.2.1)",
+            });
+        }
+        if u64::from(width) * u64::from(height) > caps.max_area() {
+            return Err(ResizeError::InvalidDimensions {
+                reason: "requested area exceeds the server's Display Control caps",
+            });
+        }
+        let layout = displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor::primary(
+            width, height,
+        )]);
+        let mut frames = Vec::new();
+        for pdu in dvc::encode_data(channel_id, &layout) {
+            for chunk in svc::encode_chunks(&pdu) {
+                frames.push(self.wrap_channel(drdynvc_id, &chunk));
+            }
+        }
+        Ok(frames)
+    }
+
+    /// Wrap a channel payload into a complete outbound frame on `channel_id`.
+    fn wrap_channel(&self, channel_id: u16, payload: &[u8]) -> Vec<u8> {
         tpkt::encode(&x224::encode_data(&mcs::encode_send_data_request(
             self.config.user_channel_id,
-            self.config.io_channel_id,
+            channel_id,
             payload,
         )))
+    }
+
+    /// Wrap an I/O-channel payload into a complete outbound frame.
+    fn wrap_io(&self, payload: &[u8]) -> Vec<u8> {
+        self.wrap_channel(self.config.io_channel_id, payload)
     }
 
     /// Wrap an I/O-channel payload into an outbound [`SessionOutput`].
@@ -524,6 +646,7 @@ mod tests {
 
     const IO: u16 = 1003;
     const USER: u16 = 1007;
+    const DRDYNVC: u16 = 1005;
     const SHARE: u32 = 0x0001_03EA;
 
     fn config() -> SessionConfig {
@@ -535,6 +658,7 @@ mod tests {
             capabilities: capability::default_client_capabilities(&test_core()),
             server_input_flags: capability::INPUT_FLAG_SCANCODES
                 | capability::INPUT_FLAG_FASTPATH_INPUT2,
+            drdynvc_channel_id: Some(DRDYNVC),
         }
     }
 
@@ -562,12 +686,12 @@ mod tests {
         }
     }
 
-    /// Frame a server→client I/O payload (SendDataIndication is encoded by hand: choice
-    /// 0x68, initiator 1002, the I/O channel, then a PER length).
-    fn server_io_frame(user_data: &[u8]) -> Vec<u8> {
+    /// Frame a server→client payload on `channel` (SendDataIndication is encoded by hand:
+    /// choice 0x68, initiator 1002, the channel, then a PER length).
+    fn server_channel_frame(channel: u16, user_data: &[u8]) -> Vec<u8> {
         let mut body = vec![0x68];
         body.extend_from_slice(&(1002u16 - 1001).to_be_bytes());
-        body.extend_from_slice(&IO.to_be_bytes());
+        body.extend_from_slice(&channel.to_be_bytes());
         body.push(0x70);
         if user_data.len() < 128 {
             body.push(user_data.len() as u8);
@@ -576,6 +700,49 @@ mod tests {
         }
         body.extend_from_slice(user_data);
         tpkt::encode(&x224::encode_data(&body))
+    }
+
+    /// Frame a server→client I/O payload.
+    fn server_io_frame(user_data: &[u8]) -> Vec<u8> {
+        server_channel_frame(IO, user_data)
+    }
+
+    /// Frame one complete drdynvc PDU as server→client SVC chunks on the drdynvc channel.
+    fn server_dvc_frames(pdu: &[u8]) -> Vec<Vec<u8>> {
+        svc::encode_chunks(pdu)
+            .iter()
+            .map(|chunk| server_channel_frame(DRDYNVC, chunk))
+            .collect()
+    }
+
+    /// Walk a fresh machine to the resize-ready state: drdynvc caps exchanged, Display
+    /// Control channel 7 created, server caps (1 monitor, `area_a × area_b`) consumed.
+    fn display_control_ready(sm: &mut SessionStateMachine, area_a: u32, area_b: u32) {
+        let caps_request = vec![0x50, 0x00, 0x01, 0x00];
+        for frame in server_dvc_frames(&caps_request) {
+            sm.process_bytes(&frame).unwrap();
+        }
+        let mut create = vec![0x10, 0x07];
+        create.extend_from_slice(displaycontrol::CHANNEL_NAME.as_bytes());
+        create.push(0);
+        for frame in server_dvc_frames(&create) {
+            sm.process_bytes(&frame).unwrap();
+        }
+        let mut caps = Vec::new();
+        caps.extend_from_slice(&displaycontrol::TYPE_CAPS.to_le_bytes());
+        caps.extend_from_slice(&20u32.to_le_bytes());
+        for v in [1u32, area_a, area_b] {
+            caps.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut ready = false;
+        for pdu in dvc::encode_data(7, &caps) {
+            for frame in server_dvc_frames(&pdu) {
+                for output in sm.process_bytes(&frame).unwrap() {
+                    ready |= output == SessionOutput::DisplayControlReady;
+                }
+            }
+        }
+        assert!(ready, "DisplayControlReady never surfaced");
     }
 
     fn server_data_pdu(pdu_type2: u8, body: &[u8]) -> Vec<u8> {
@@ -980,6 +1147,120 @@ mod tests {
         assert_eq!(fastpath::frame_len(&frames[0]).unwrap(), frames[0].len());
         assert_eq!(fastpath::frame_len(&frames[1]).unwrap(), frames[1].len());
         assert!(sm.encode_input(&[]).is_empty());
+    }
+
+    #[test]
+    fn drdynvc_caps_request_is_answered_on_the_drdynvc_channel() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let caps_request = vec![0x50, 0x00, 0x03, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut outputs = Vec::new();
+        for frame in server_dvc_frames(&caps_request) {
+            outputs.extend(sm.process_bytes(&frame).unwrap());
+        }
+        let [SessionOutput::WriteBytes(frame)] = outputs.as_slice() else {
+            panic!("expected one response frame, got {outputs:?}");
+        };
+        // The response embeds the SVC-chunked version-1 caps response and rides the
+        // drdynvc channel (big-endian MCS channelId).
+        let expected_chunk = &svc::encode_chunks(&dvc::encode_capabilities_response(1))[0];
+        assert!(frame.windows(expected_chunk.len()).any(|w| w == expected_chunk.as_slice()));
+        assert!(frame.windows(2).any(|w| w == DRDYNVC.to_be_bytes()));
+    }
+
+    #[test]
+    fn display_control_ready_enables_request_resize() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));
+        display_control_ready(&mut sm, 8192, 8192);
+
+        let frames = sm.request_resize(1280, 1024).unwrap();
+        assert_eq!(frames.len(), 1, "a 56-byte layout fits one SVC chunk");
+        let layout = displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor::primary(
+            1280, 1024,
+        )]);
+        let expected_chunk = &svc::encode_chunks(&dvc::encode_data(7, &layout)[0])[0];
+        assert!(
+            frames[0]
+                .windows(expected_chunk.len())
+                .any(|w| w == expected_chunk.as_slice()),
+            "resize frame does not embed the Monitor Layout DVC data"
+        );
+        assert_eq!(tpkt::frame_len(&frames[0]).unwrap(), frames[0].len());
+    }
+
+    #[test]
+    fn request_resize_rounds_odd_widths_down_and_validates_ranges() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        display_control_ready(&mut sm, 1920, 1080);
+
+        // Odd width 1281 → 1280 on the wire (MS-RDPEDISP forbids odd widths).
+        let frames = sm.request_resize(1281, 1024).unwrap();
+        let layout_even = displaycontrol::encode_monitor_layout(&[
+            displaycontrol::Monitor::primary(1280, 1024),
+        ]);
+        assert!(frames[0].windows(layout_even.len()).any(|w| w == layout_even));
+
+        // Out-of-range dimensions and caps-exceeding areas are typed errors.
+        assert!(matches!(
+            sm.request_resize(100, 768),
+            Err(ResizeError::InvalidDimensions { .. })
+        ));
+        assert!(matches!(
+            sm.request_resize(8192, 8192), // 64 MPx > 1920×1080 caps area
+            Err(ResizeError::InvalidDimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn refused_dynamic_channels_get_a_negative_creation_status() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut create = vec![0x10, 0x09];
+        create.extend_from_slice(b"Microsoft::Windows::RDS::Graphics\0");
+        let mut outputs = Vec::new();
+        for frame in server_dvc_frames(&create) {
+            outputs.extend(sm.process_bytes(&frame).unwrap());
+        }
+        let [SessionOutput::WriteBytes(frame)] = outputs.as_slice() else {
+            panic!("expected one refusal frame, got {outputs:?}");
+        };
+        let refusal = dvc::encode_create_response(9, 0x8000_4005);
+        let expected_chunk = &svc::encode_chunks(&refusal)[0];
+        assert!(frame.windows(expected_chunk.len()).any(|w| w == expected_chunk.as_slice()));
+        // And resize stays unavailable.
+        assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));
+    }
+
+    #[test]
+    fn resize_then_deactivate_reactivate_applies_the_new_size() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        display_control_ready(&mut sm, 8192, 8192);
+        sm.request_resize(8, 4).unwrap_err(); // below 200: validated
+        let _ = sm.request_resize(1280, 1024).unwrap();
+
+        // The server answers with the Deactivation–Reactivation cycle (already covered by
+        // deactivate_reactivate_resizes_and_reemits_full_screen); here we assert the
+        // drdynvc state survives it: Display Control stays ready afterwards.
+        let deactivate = server_io_frame(&share::encode_share_control(
+            share::PDU_TYPE_DEACTIVATE_ALL,
+            1002,
+            SHARE,
+            &[],
+        ));
+        assert!(sm.process_bytes(&deactivate).unwrap().is_empty());
+        assert!(sm.request_resize(1024, 768).is_ok(), "resize survives deactivation");
+    }
+
+    #[test]
+    fn without_a_drdynvc_channel_resize_is_not_ready_and_traffic_is_skipped() {
+        let mut cfg = config();
+        cfg.drdynvc_channel_id = None;
+        let mut sm = SessionStateMachine::new(cfg, Vec::new());
+        assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));
+        // What would have been drdynvc traffic is now unknown-static-channel noise: skipped.
+        let caps_request = vec![0x50, 0x00, 0x01, 0x00];
+        for frame in server_dvc_frames(&caps_request) {
+            assert!(sm.process_bytes(&frame).unwrap().is_empty());
+        }
     }
 
     #[test]
