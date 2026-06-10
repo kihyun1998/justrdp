@@ -1822,6 +1822,89 @@ mod tests {
         );
     }
 
+    /// Real-VM acceptance test for slice-9: the EGFX Graphics Pipeline. Connect with the
+    /// EGFX gate flag advertised (`test_config` sets `SUPPORT_DYN_VC_GFX_PROTOCOL` — the flag
+    /// ironrdp hardcoded away, the reason justrdp exists) plus the drdynvc channel. On this
+    /// VM that flag makes the server send **zero** slow-path bitmap data (verified in
+    /// slice-6), so every rendered pixel below necessarily travelled the EGFX path: caps
+    /// advertise/confirm → surface create/map → Progressive/Clear/Planar tile decode →
+    /// dirty-region frames. Asserts the desktop actually painted (coverage + color variety),
+    /// that the EGFX caps handshake was observed on the wire, and dumps a PPM for human
+    /// confirmation.
+    #[tokio::test]
+    #[traced_test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn egfx_graphics_pipeline_renders_the_desktop_against_real_vm() {
+        let _vm = VM_SESSION.lock().await;
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let config = test_config(); // EGFX flag ON + drdynvc channel
+        let session_capabilities = config.capabilities.clone();
+        let outcome = connect(addr, config, vm_credentials(), |_| {})
+            .await
+            .expect("connect should reach session-active");
+        let session_config = session_config_from(&outcome, session_capabilities);
+        assert!(
+            session_config.drdynvc_channel_id.is_some(),
+            "the VM should grant the drdynvc static channel"
+        );
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+        let mut stream = outcome.stream;
+
+        let mut frames = 0usize;
+        let mut covered: u64 = 0;
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_session(&mut stream, &mut machine, |frame| {
+                frames += 1;
+                covered += u64::from(frame.width) * u64::from(frame.height);
+            }),
+        )
+        .await;
+        if let Ok(result) = ended {
+            result.expect("session failed during the observation window");
+            panic!("server closed the session unexpectedly early");
+        }
+
+        let fb = machine.framebuffer();
+        let total = u64::from(fb.width()) * u64::from(fb.height());
+        eprintln!(
+            "EGFX frames={frames} covered={covered}px of {total}px ({}x{})",
+            fb.width(),
+            fb.height()
+        );
+        assert!(frames >= 1, "no EGFX FrameUpdate was emitted");
+        assert!(
+            covered >= total / 2,
+            "expected at least half the desktop painted via EGFX, got {covered} of {total}"
+        );
+
+        // The caps handshake must have been observed on the wire (not inferred).
+        assert!(logs_contain("rdp_egfx_caps"), "EGFX caps milestones never logged");
+        assert!(logs_contain("EGFX caps confirmed"), "server never confirmed EGFX caps");
+
+        // Monochrome output would mean the tile decode silently produced garbage.
+        let mut distinct = std::collections::HashSet::new();
+        for px in fb.pixels().chunks_exact(4) {
+            distinct.insert([px[0], px[1], px[2]]);
+            if distinct.len() > 16 {
+                break;
+            }
+        }
+        assert!(
+            distinct.len() > 16,
+            "framebuffer is near-monochrome ({} colors) — EGFX decode likely broken",
+            distinct.len()
+        );
+
+        let path = std::env::temp_dir().join("justrdp-slice9-egfx-frame.ppm");
+        let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+        for px in fb.pixels().chunks_exact(4) {
+            ppm.extend_from_slice(&px[..3]);
+        }
+        std::fs::write(&path, ppm).expect("write the visual dump");
+        eprintln!("visual dump for confirmation: {}", path.display());
+    }
+
     /// Real-VM acceptance test for slice-8: drdynvc + Display Control resize. Connect with
     /// the `drdynvc` static channel (EGFX gate flag deliberately **off**, so graphics stay on
     /// the proven bitmap path), wait for the server to negotiate drdynvc caps, create the
