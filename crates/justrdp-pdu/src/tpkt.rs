@@ -39,10 +39,49 @@ pub fn decode(buf: &[u8]) -> Result<&[u8], DecodeError> {
     cur.read_slice(payload_len)
 }
 
+/// Peek the total length (header included) of the TPKT frame at the front of `buf`, without
+/// consuming anything. Returns `NotEnoughBytes` while the 4-byte header is incomplete — the
+/// sans-IO "wait for more" signal a frame-assembly loop keys off.
+pub fn frame_len(buf: &[u8]) -> Result<usize, DecodeError> {
+    let mut cur = ReadCursor::new(buf, "tpkt");
+    if cur.read_u8()? != VERSION {
+        return Err(DecodeError::InvalidField {
+            field: "tpkt.version",
+            reason: "expected 3",
+        });
+    }
+    cur.read_u8()?; // reserved
+    let total = cur.read_u16_be()? as usize;
+    if total < HEADER_LEN {
+        return Err(DecodeError::InvalidField {
+            field: "tpkt.length",
+            reason: "shorter than the 4-byte header",
+        });
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::DecodeError;
+
+    #[test]
+    fn frame_len_peeks_total_length_without_needing_the_payload() {
+        // Only the header has arrived; the frame totals 19 bytes.
+        let header = [0x03, 0x00, 0x00, 0x13];
+        assert_eq!(frame_len(&header).unwrap(), 19);
+        // Fewer than 4 bytes: wait.
+        assert!(matches!(
+            frame_len(&header[..3]).unwrap_err(),
+            DecodeError::NotEnoughBytes { .. }
+        ));
+        // A non-TPKT first byte is malformed, not a partial frame.
+        assert!(matches!(
+            frame_len(&[0x16, 0x03, 0x01, 0x00]).unwrap_err(),
+            DecodeError::InvalidField { .. }
+        ));
+    }
 
     #[test]
     fn encode_wraps_payload_with_rfc1006_header() {

@@ -85,6 +85,19 @@ impl<'a> ReadCursor<'a> {
         Ok(v)
     }
 
+    /// Read a big-endian `u32`, advancing the cursor 4 bytes.
+    pub fn read_u32_be(&mut self) -> Result<u32, DecodeError> {
+        self.ensure(4)?;
+        let v = u32::from_be_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(v)
+    }
+
     /// Read the next `len` bytes as a borrowed slice, advancing the cursor.
     pub fn read_slice(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
         self.ensure(len)?;
