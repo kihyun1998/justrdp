@@ -8,10 +8,14 @@
 //! ADR-0003 (phased codecs), and `docs/plan.md`.
 
 pub mod connect;
+pub mod framebuffer;
 pub mod license_crypto;
+pub mod session;
 pub mod tls;
 
 pub use connect::{
     Action, ActivationResult, ClientInfoConfig, ConnectConfig, ConnectError, ConnectStateMachine,
     Event, EventKind, LicenseConfig, LicenseEntropy, McsConnectResult, StaticChannel,
 };
+pub use framebuffer::{FrameUpdate, Framebuffer};
+pub use session::{SessionConfig, SessionError, SessionOutput, SessionStateMachine};

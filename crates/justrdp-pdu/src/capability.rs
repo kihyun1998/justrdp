@@ -569,7 +569,13 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
         CapabilitySet::General(GeneralCapabilitySet {
             os_major_type: 1, // OSMAJORTYPE_WINDOWS
             os_minor_type: 3, // OSMINORTYPE_WINDOWS_NT
-            extra_flags: GENERAL_LONG_CREDENTIALS_SUPPORTED | GENERAL_NO_BITMAP_COMPRESSION_HDR,
+            // FASTPATH_OUTPUT is load-bearing: modern Windows servers send graphics almost
+            // exclusively as fast-path updates and paint *nothing* for a client that does
+            // not advertise it (verified against the test VM — only logon notifications
+            // arrive, zero bitmap data).
+            extra_flags: GENERAL_FASTPATH_OUTPUT_SUPPORTED
+                | GENERAL_LONG_CREDENTIALS_SUPPORTED
+                | GENERAL_NO_BITMAP_COMPRESSION_HDR,
             refresh_rect_support: 0,
             suppress_output_support: 0,
         }),
