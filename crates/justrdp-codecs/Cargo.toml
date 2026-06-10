@@ -6,11 +6,19 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["egfx-bootstrap"]
+# Phase 1 (ADR-0003): the EGFX decode path (zgfx, RemoteFX Progressive, ClearCodec — slice-9)
+# rides ironrdp-graphics behind this crate's own wrapper API. The feature is dropped per codec
+# as the self-owned rewrites land and pass the differential oracle.
+egfx-bootstrap = ["dep:ironrdp-graphics"]
+
 [dependencies]
 # Phase 1 (ADR-0003): bootstrap on `ironrdp-graphics`, kept behind this crate's own decode API
 # so it can be swapped for self-owned decoders later. The slow-path codecs (interleaved RLE,
 # RDP6 planar — slice-6) skipped phase 1: they are self-owned from the start, with
 # ironrdp-graphics as the differential oracle below.
+ironrdp-graphics = { version = "0.8", optional = true }
 
 [dev-dependencies]
 # The differential test oracle (ADR-0003): diff our decode output against ironrdp's on

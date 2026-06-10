@@ -584,6 +584,26 @@ impl SessionStateMachine {
                 DvcEvent::DisplayControlReady => {
                     outputs.push(SessionOutput::DisplayControlReady);
                 }
+                // EGFX pixels land in the same framebuffer the slow path writes — the
+                // framebuffer stays the single authoritative screen state either way.
+                DvcEvent::Frame(frame) => {
+                    if let Some(update) = self.framebuffer.blit(
+                        frame.x,
+                        frame.y,
+                        frame.width,
+                        frame.height,
+                        &frame.pixels,
+                        usize::from(frame.width),
+                    ) {
+                        outputs.push(SessionOutput::Frame(update));
+                    }
+                }
+                DvcEvent::OutputResized { width, height } => {
+                    if (width, height) != self.config.desktop_size {
+                        self.config.desktop_size = (width, height);
+                        self.framebuffer.resize(width, height);
+                    }
+                }
             }
         }
         Ok(())
@@ -1172,9 +1192,9 @@ mod tests {
         let [SessionOutput::WriteBytes(frame)] = outputs.as_slice() else {
             panic!("expected one response frame, got {outputs:?}");
         };
-        // The response embeds the SVC-chunked version-1 caps response and rides the
+        // The response embeds the SVC-chunked version-3 caps response and rides the
         // drdynvc channel (big-endian MCS channelId).
-        let expected_chunk = &svc::encode_chunks(&dvc::encode_capabilities_response(1))[0];
+        let expected_chunk = &svc::encode_chunks(&dvc::encode_capabilities_response(3))[0];
         assert!(frame.windows(expected_chunk.len()).any(|w| w == expected_chunk.as_slice()));
         assert!(frame.windows(2).any(|w| w == DRDYNVC.to_be_bytes()));
     }
@@ -1227,7 +1247,7 @@ mod tests {
     fn refused_dynamic_channels_get_a_negative_creation_status() {
         let mut sm = SessionStateMachine::new(config(), Vec::new());
         let mut create = vec![0x10, 0x09];
-        create.extend_from_slice(b"Microsoft::Windows::RDS::Graphics\0");
+        create.extend_from_slice(b"Microsoft::Windows::RDS::Geometry\0");
         let mut outputs = Vec::new();
         for frame in server_dvc_frames(&create) {
             outputs.extend(sm.process_bytes(&frame).unwrap());
