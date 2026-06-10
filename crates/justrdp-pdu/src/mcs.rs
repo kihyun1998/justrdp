@@ -30,6 +30,12 @@ const CHOICE_ATTACH_USER_REQUEST: u8 = 10;
 const CHOICE_ATTACH_USER_CONFIRM: u8 = 11;
 const CHOICE_CHANNEL_JOIN_REQUEST: u8 = 14;
 const CHOICE_CHANNEL_JOIN_CONFIRM: u8 = 15;
+const CHOICE_SEND_DATA_REQUEST: u8 = 25;
+const CHOICE_SEND_DATA_INDICATION: u8 = 26;
+
+/// The `dataPriority` (high) + `segmentation` (begin|end) byte every RDP client sends on a Send
+/// Data Request — a fixed protocol value.
+const SEND_DATA_PRIORITY_AND_SEGMENTATION: u8 = 0x70;
 
 /// T.125 DomainParameters. The three parameter sets in the Connect-Initial are fixed
 /// protocol-shaped values (every RDP client sends the same shapes); they carry no caller policy.
@@ -235,6 +241,57 @@ pub fn encode_channel_join_request(initiator_id: u16, channel_id: u16) -> Vec<u8
         .expect("initiator is a server-assigned UserId >= 1001");
     per::write_u16(&mut out, channel_id, 0).expect("base 0 cannot underflow");
     out
+}
+
+/// Encode a Send Data Request: `user_data` sent by `initiator_id` on `channel_id` (e.g. the
+/// Client Info PDU on the I/O channel). The PER length determinant caps `user_data` at 16383
+/// bytes — far above any connect-time payload; larger PDUs need MCS segmentation (a later
+/// slice, if ever needed).
+pub fn encode_send_data_request(
+    initiator_id: u16,
+    channel_id: u16,
+    user_data: &[u8],
+) -> Vec<u8> {
+    debug_assert!(user_data.len() <= 0x3FFF, "PER length determinant overflow");
+    let mut out = Vec::with_capacity(8 + user_data.len());
+    per::write_choice(&mut out, CHOICE_SEND_DATA_REQUEST << 2);
+    per::write_u16(&mut out, initiator_id, USER_CHANNEL_BASE)
+        .expect("initiator is a server-assigned UserId >= 1001");
+    per::write_u16(&mut out, channel_id, 0).expect("base 0 cannot underflow");
+    out.push(SEND_DATA_PRIORITY_AND_SEGMENTATION);
+    per::write_length(&mut out, user_data.len() as u16);
+    out.extend_from_slice(user_data);
+    out
+}
+
+/// A decoded Send Data Indication — server-to-client channel data (licensing PDUs, Share Data,
+/// static channel traffic). Borrows the user data from the input frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendDataIndication<'a> {
+    /// The sending user channel ID.
+    pub initiator_id: u16,
+    /// The MCS channel the data arrived on.
+    pub channel_id: u16,
+    /// The carried payload (e.g. a security header + licensing PDU).
+    pub user_data: &'a [u8],
+}
+
+impl<'a> SendDataIndication<'a> {
+    /// Decode from the MCS payload of an X.224 Data TPDU.
+    pub fn decode(body: &'a [u8]) -> Result<Self, DecodeError> {
+        let mut cur = ReadCursor::new(body, "send data indication");
+        read_domain_choice(&mut cur, CHOICE_SEND_DATA_INDICATION, "SendDataIndication")?;
+        let initiator_id = per::read_u16(&mut cur, USER_CHANNEL_BASE)?;
+        let channel_id = per::read_u16(&mut cur, 0)?;
+        cur.read_u8()?; // dataPriority + segmentation
+        let length = per::read_length(&mut cur)? as usize;
+        let user_data = cur.read_slice(length.min(cur.remaining()))?;
+        Ok(Self {
+            initiator_id,
+            channel_id,
+            user_data,
+        })
+    }
 }
 
 /// A decoded Channel Join Confirm.
