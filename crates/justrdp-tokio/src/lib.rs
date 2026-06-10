@@ -593,7 +593,11 @@ pub async fn run_session_with_input(
                 match events {
                     Some(events) => {
                         for frame in machine.encode_input(&events) {
-                            tracing::trace!(bytes = frame.len(), "input pdu");
+                            tracing::trace!(
+                                events = events.len(),
+                                bytes = frame.len(),
+                                "input pdu"
+                            );
                             stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
                         }
                     }
