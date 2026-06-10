@@ -863,9 +863,16 @@ impl ConnectStateMachine {
         match preamble.msg_type {
             license::MSG_ERROR_ALERT => {
                 let alert = license::LicenseError::decode(&mut cur).map_err(ConnectError::Decode)?;
-                if alert.error_code == license::STATUS_VALID_CLIENT {
-                    // The server accepted us as validly licensed: licensing is complete in a
-                    // single message (the path most real servers take).
+                // `dwStateTransition` pins the client's reaction (MS-RDPELE 2.2.2.7), not the
+                // error code alone: ST_NO_TRANSITION means the licensing exchange is over and
+                // the connect proceeds — true for the STATUS_VALID_CLIENT short-circuit (the
+                // path most real servers take) and equally for a grace-period server that
+                // reports an error code yet continues to Demand Active (FreeRDP-compatible).
+                // Everything else (ST_TOTAL_ABORT, or the RESET/RESEND transitions this slice
+                // does not negotiate) ends the connect with a typed failure.
+                if alert.error_code == license::STATUS_VALID_CLIENT
+                    || alert.state_transition == license::ST_NO_TRANSITION
+                {
                     self.stage = Stage::CapabilityExchange { selected };
                     Ok(Vec::new())
                 } else {
@@ -2078,13 +2085,18 @@ mod tests {
         out
     }
 
-    /// A License Error (ERROR_ALERT) message with the given code.
-    fn license_alert(error_code: u32) -> Vec<u8> {
+    /// A License Error (ERROR_ALERT) message with the given code and state transition.
+    fn license_alert_with(error_code: u32, state_transition: u32) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&error_code.to_le_bytes());
-        body.extend_from_slice(&license::ST_NO_TRANSITION.to_le_bytes());
+        body.extend_from_slice(&state_transition.to_le_bytes());
         body.extend_from_slice(&[0x04, 0x00, 0x00, 0x00]); // empty error-info blob
         license_message(license::MSG_ERROR_ALERT, &body)
+    }
+
+    /// A License Error (ERROR_ALERT) message ending the exchange (`ST_NO_TRANSITION`).
+    fn license_alert(error_code: u32) -> Vec<u8> {
+        license_alert_with(error_code, license::ST_NO_TRANSITION)
     }
 
     /// A proprietary (CERT_CHAIN_VERSION_1) server certificate around [`TEST_MODULUS`].
@@ -2297,14 +2309,36 @@ mod tests {
     }
 
     #[test]
-    fn licensing_error_other_than_valid_client_fails_typed() {
+    fn licensing_error_with_total_abort_fails_typed() {
         let mut sm = licensing();
-        // ERR_NO_LICENSE (0x02): the server refuses to license this client.
-        let actions = sm.process(Event::Received(&server_io_frame(&license_alert(0x02))));
+        // ERR_NO_LICENSE (0x02) + ST_TOTAL_ABORT: the server refuses and aborts the exchange
+        // (MS-RDPELE 2.2.2.7) — no license, no session.
+        let actions = sm.process(Event::Received(&server_io_frame(&license_alert_with(
+            0x02,
+            license::ST_TOTAL_ABORT,
+        ))));
         assert_eq!(
             actions,
             vec![Action::FailWith(ConnectError::LicensingFailed { error_code: 0x02 })]
         );
+    }
+
+    #[test]
+    fn licensing_error_with_no_transition_advances_like_a_grace_period_server() {
+        // A grace-period server reports an error code yet declares the exchange over
+        // (ST_NO_TRANSITION) and proceeds to Demand Active — the client must advance, not
+        // fail (the spec's "terminal License Error" clause; FreeRDP-compatible).
+        let mut sm = licensing();
+        let actions = sm.process(Event::Received(&server_io_frame(&license_alert_with(
+            0x02,
+            license::ST_NO_TRANSITION,
+        ))));
+        assert!(actions.is_empty(), "exchange-ending alert produces no output");
+
+        let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
+            1920, 1080,
+        ))));
+        assert_eq!(actions, expected_confirm_and_batch(1920, 1080));
     }
 
     #[test]
