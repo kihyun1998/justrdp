@@ -9,7 +9,10 @@ repository.workspace = true
 [dependencies]
 justrdp.workspace = true
 justrdp-pdu.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "time"] }
+# "sync" + "macros" are lib (not just dev) features since slice-7: `run_session` selects over
+# the socket and the host-input mpsc channel. Without them the lib only compiled via
+# dev-dependency feature unification (tests passed, standalone `cargo check` did not).
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
 # TLS upgrade (slice-2): the adapter owns the rustls handshake (the sans-IO core never sees TLS
 # records — plan.md §3). `rustls` re-exported via `tokio-rustls`.
