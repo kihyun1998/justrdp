@@ -8,10 +8,11 @@ repository.workspace = true
 
 [dependencies]
 # Phase 1 (ADR-0003): bootstrap on `ironrdp-graphics`, kept behind this crate's own decode API
-# so it can be swapped for self-owned decoders later. Added in the codec slices, not in slice-1.
-# ironrdp-graphics = "0.8"
+# so it can be swapped for self-owned decoders later. The slow-path codecs (interleaved RLE,
+# RDP6 planar — slice-6) skipped phase 1: they are self-owned from the start, with
+# ironrdp-graphics as the differential oracle below.
 
 [dev-dependencies]
 # The differential test oracle (ADR-0003): diff our decode output against ironrdp's on
-# identical bytes. Added alongside the first self-owned codec, not in slice-1.
-# ironrdp-graphics = "0.8"
+# identical bytes (and use its compressor to generate valid streams for the decoders).
+ironrdp-graphics = "0.8"

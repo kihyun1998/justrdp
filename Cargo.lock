@@ -1008,6 +1008,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd344ce9518ab83f6f7568ca4f1bc6dc8c55bd2da04cb5ee7b3e8740d5041734"
 
 [[package]]
+name = "ironrdp-graphics"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1a6960ef799bb9ab366ae9b56ec42a28449ceb29d380e1228774f359ad9f781"
+dependencies = [
+ "bit_field",
+ "bitflags 2.13.0",
+ "bitvec",
+ "byteorder",
+ "ironrdp-core",
+ "ironrdp-pdu",
+ "num-derive",
+ "num-traits",
+ "yuv",
+]
+
+[[package]]
 name = "ironrdp-pdu"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1062,6 +1079,7 @@ name = "justrdp"
 version = "0.1.0"
 dependencies = [
  "ironrdp-pdu",
+ "justrdp-codecs",
  "justrdp-pdu",
  "rcgen",
  "x509-cert",
@@ -1070,6 +1088,9 @@ dependencies = [
 [[package]]
 name = "justrdp-codecs"
 version = "0.1.0"
+dependencies = [
+ "ironrdp-graphics",
+]
 
 [[package]]
 name = "justrdp-pdu"
@@ -2880,6 +2901,15 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "synstructure",
+]
+
+[[package]]
+name = "yuv"
+version = "0.8.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89c90da4fb561f9750984de2c5e7f0ba01035d2eb29d69a7f375b1caef37fdf4"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

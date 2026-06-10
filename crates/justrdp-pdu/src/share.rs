@@ -26,6 +26,10 @@ const PROTOCOL_VERSION: u16 = 0x0010;
 /// Mask isolating the PDU type nibble from `pduType`.
 const PDU_TYPE_MASK: u16 = 0x000F;
 
+/// `pduType2`: Update PDU (graphics: bitmap, palette, synchronize).
+pub const PDU_TYPE2_UPDATE: u8 = 0x02;
+/// `pduType2`: Pointer Update PDU.
+pub const PDU_TYPE2_POINTER: u8 = 0x1B;
 /// `pduType2`: Synchronize PDU.
 pub const PDU_TYPE2_SYNCHRONIZE: u8 = 0x1F;
 /// `pduType2`: Control PDU.
