@@ -15,6 +15,7 @@ pub mod error;
 pub mod fastpath;
 pub mod finalization;
 pub mod gcc;
+pub mod input;
 pub mod license;
 pub mod mcs;
 pub mod nego;
