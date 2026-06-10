@@ -264,3 +264,120 @@ fn our_erect_domain_and_channel_join_requests_decode_in_ironrdp() {
         other => panic!("expected ChannelJoinRequest, got {other:?}"),
     }
 }
+
+#[test]
+fn our_client_info_pdu_decodes_identically_in_ironrdp() {
+    use justrdp_pdu::client_info as ci;
+
+    // Distinctive values in every caller-policy field so byte-offset slips surface as field
+    // mismatches in the oracle's parse.
+    let ours = ci::ClientInfo {
+        code_page: 0,
+        flags: ci::ClientInfoFlags::MOUSE
+            | ci::ClientInfoFlags::AUTOLOGON
+            | ci::ClientInfoFlags::LOGON_NOTIFY
+            | ci::ClientInfoFlags::LOGON_ERRORS
+            | ci::ClientInfoFlags::MOUSE_HAS_WHEEL,
+        domain: "WORKGROUP".to_string(),
+        username: "rdptest".to_string(),
+        password: String::new(),
+        alternate_shell: String::new(),
+        work_dir: String::new(),
+        extra: ci::ExtendedClientInfo {
+            address_family: ci::ADDRESS_FAMILY_INET,
+            address: "192.168.0.10".to_string(),
+            dir: "C:/justrdp".to_string(),
+            timezone: ci::TimezoneInfo {
+                bias: -540,
+                standard_name: "Korea Standard Time".to_string(),
+                standard_bias: 0,
+                daylight_name: "Korea Daylight Time".to_string(),
+                daylight_bias: -60,
+            },
+            session_id: 7,
+            performance_flags: 0x0000_0107,
+            reconnect_cookie: None,
+        },
+    };
+    let bytes = ours.encode();
+
+    let theirs: ironrdp_pdu::rdp::ClientInfoPdu =
+        ironrdp_decode(&bytes).expect("ironrdp decodes our Client Info PDU");
+
+    use ironrdp_pdu::rdp::client_info as iron_ci;
+    assert!(
+        theirs
+            .security_header
+            .flags
+            .contains(ironrdp_pdu::rdp::headers::BasicSecurityHeaderFlags::INFO_PKT)
+    );
+    let info = &theirs.client_info;
+    assert_eq!(info.credentials.username, "rdptest");
+    assert_eq!(info.credentials.domain.as_deref(), Some("WORKGROUP"));
+    assert_eq!(info.credentials.password, "");
+    assert!(info.flags.contains(
+        iron_ci::ClientInfoFlags::MOUSE
+            | iron_ci::ClientInfoFlags::AUTOLOGON
+            | iron_ci::ClientInfoFlags::UNICODE
+            | iron_ci::ClientInfoFlags::LOGON_NOTIFY
+            | iron_ci::ClientInfoFlags::LOGON_ERRORS
+            | iron_ci::ClientInfoFlags::MOUSE_HAS_WHEEL
+    ));
+    assert_eq!(info.extra_info.address_family, iron_ci::AddressFamily::INET);
+    assert_eq!(info.extra_info.address, "192.168.0.10");
+    assert_eq!(info.extra_info.dir, "C:/justrdp");
+    let tz = info.extra_info.optional_data.timezone().expect("timezone present");
+    assert_eq!(tz.bias, -540);
+    assert_eq!(tz.standard_name, "Korea Standard Time");
+    assert_eq!(tz.daylight_bias, -60);
+    assert_eq!(tz.standard_date.0, None, "zeroed SYSTEMTIME reads back as absent");
+    assert_eq!(info.extra_info.optional_data.session_id(), Some(7));
+    assert_eq!(
+        info.extra_info.optional_data.performance_flags(),
+        iron_ci::PerformanceFlags::from_bits(0x0000_0107)
+    );
+    assert_eq!(info.extra_info.optional_data.reconnect_cookie(), None);
+}
+
+#[test]
+fn our_send_data_request_decodes_in_ironrdp_with_the_client_info_payload() {
+    use justrdp_pdu::client_info as ci;
+
+    let info = ci::ClientInfo {
+        code_page: 0,
+        flags: ci::ClientInfoFlags::MOUSE,
+        domain: String::new(),
+        username: "u".to_string(),
+        password: String::new(),
+        alternate_shell: String::new(),
+        work_dir: String::new(),
+        extra: ci::ExtendedClientInfo {
+            address_family: ci::ADDRESS_FAMILY_INET,
+            address: String::new(),
+            dir: String::new(),
+            timezone: ci::TimezoneInfo::utc(),
+            session_id: 0,
+            performance_flags: 0,
+            reconnect_cookie: None,
+        },
+    };
+    let payload = info.encode();
+    let frame = justrdp_pdu::tpkt::encode(&justrdp_pdu::x224::encode_data(
+        &mcs::encode_send_data_request(1007, 1003, &payload),
+    ));
+
+    let parsed: X224<iron_mcs::McsMessage<'_>> =
+        ironrdp_decode(&frame).expect("ironrdp decodes our SendDataRequest");
+    match parsed.0 {
+        iron_mcs::McsMessage::SendDataRequest(req) => {
+            assert_eq!(req.initiator_id, 1007);
+            assert_eq!(req.channel_id, 1003);
+            assert_eq!(req.user_data.as_ref(), payload.as_slice());
+            // The carried payload itself parses as a Client Info PDU.
+            let inner: ironrdp_pdu::rdp::ClientInfoPdu =
+                ironrdp_decode(req.user_data.as_ref()).expect("payload is a Client Info PDU");
+            assert_eq!(inner.client_info.credentials.username, "u");
+        }
+        other => panic!("expected SendDataRequest, got {other:?}"),
+    }
+}

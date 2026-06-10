@@ -2,8 +2,11 @@
 //! consuming [`Event`]s (socket connected, bytes received) and emitting [`Action`]s (open the
 //! socket, write bytes, fail) — never touching the socket itself. Implemented so far:
 //! `tcp-connect` → `x224-negotiate` → `tls-handshake` → `nla-credssp` → the MCS/GCC half of
-//! `capability-exchange` (Connect-Initial/Response, Erect Domain, Attach User, Channel Join).
+//! `capability-exchange` (Connect-Initial/Response, Erect Domain, Attach User, Channel Join),
+//! closing with the Client Info PDU — the Secure Settings Exchange the server requires before
+//! it will start licensing (slice-5's entry point).
 
+use justrdp_pdu::client_info;
 use justrdp_pdu::gcc::{
     ClientGccBlocks, ClientNetworkData, ServerEarlyCapabilityFlags,
 };
@@ -26,6 +29,42 @@ pub struct ConnectConfig {
     /// Static virtual channels to request in the Client Network Data, in order. The server
     /// answers with one channel ID per entry.
     pub channels: Vec<gcc::ChannelDef>,
+    /// The Client Info PDU settings (Secure Settings Exchange, MS-RDPBCGR 2.2.1.11) — sent on
+    /// the I/O channel as soon as the channel join completes.
+    pub client_info: ClientInfoConfig,
+}
+
+/// Caller-supplied fields of the Client Info PDU. Every field reaches the wire verbatim.
+///
+/// There is deliberately **no password field**: the sans-IO machine never holds secrets
+/// (plan.md decision 10). Under NLA the session logs on with the CredSSP-delegated
+/// credentials, so the wire's password field is sent empty; a future autologon-over-plain-SSL
+/// feature would have to thread a password at the adapter boundary instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientInfoConfig {
+    /// `INFO_*` flags (e.g. AUTOLOGON, MOUSE, LOGON_NOTIFY) — caller policy. The PDU encoder
+    /// adds only `INFO_UNICODE`, which must match the UTF-16 strings it writes.
+    pub flags: client_info::ClientInfoFlags,
+    /// Logon domain (may be empty).
+    pub domain: String,
+    /// Logon user name (may be empty; under NLA the delegated identity wins).
+    pub username: String,
+    /// Program to run instead of the shell (usually empty).
+    pub alternate_shell: String,
+    /// Working directory for the alternate shell.
+    pub work_dir: String,
+    /// `clientAddressFamily` (see [`client_info::ADDRESS_FAMILY_INET`]).
+    pub address_family: u16,
+    /// The client's own address as text (informational).
+    pub client_address: String,
+    /// The client software directory (informational).
+    pub client_dir: String,
+    /// The client time zone.
+    pub timezone: client_info::TimezoneInfo,
+    /// `clientSessionId` (0 unless reconnecting).
+    pub session_id: u32,
+    /// `performanceFlags` (`PERF_*` bits).
+    pub performance_flags: u32,
 }
 
 /// A static virtual channel the server granted: the requested name paired with the MCS channel
@@ -606,22 +645,60 @@ impl ConnectStateMachine {
         }
     }
 
-    /// The MCS connect is complete: emit the terminal result.
+    /// The MCS connect is complete: send the Client Info PDU, then emit the terminal result.
+    ///
+    /// The Client Info write is the Secure Settings Exchange (MS-RDPBCGR 2.2.1.11) — the server
+    /// does not begin licensing until it arrives, so the connect machine owns the send rather
+    /// than leaving a silent gap for the host to discover. It happens at the tail of the
+    /// `capability-exchange` stage; per CONTEXT.md's seven-stage glossary no separate label
+    /// exists for it (it is a single fire-and-forget write with no response of its own — the
+    /// next inbound PDU is licensing, slice-5's entry point).
     fn finish(&mut self, selected: SecurityProtocol) -> Vec<Action> {
-        self.stage = self.stage.done();
-        vec![Action::McsConnected {
-            result: McsConnectResult {
-                selected,
-                user_channel_id: self.user_channel_id,
-                io_channel_id: self.io_channel_id,
-                static_channels: std::mem::take(&mut self.static_channels),
-                desktop_size: (
-                    self.config.core.desktop_width,
-                    self.config.core.desktop_height,
-                ),
-                channel_join_skipped: self.skip_channel_join,
+        let info = client_info::ClientInfo {
+            code_page: 0,
+            flags: self.config.client_info.flags,
+            domain: self.config.client_info.domain.clone(),
+            username: self.config.client_info.username.clone(),
+            // Never a secret here: NLA delegates the real credentials via CredSSP
+            // (plan.md decision 10 — no secrets in the sans-IO machine).
+            password: String::new(),
+            alternate_shell: self.config.client_info.alternate_shell.clone(),
+            work_dir: self.config.client_info.work_dir.clone(),
+            extra: client_info::ExtendedClientInfo {
+                address_family: self.config.client_info.address_family,
+                address: self.config.client_info.client_address.clone(),
+                dir: self.config.client_info.client_dir.clone(),
+                timezone: self.config.client_info.timezone.clone(),
+                session_id: self.config.client_info.session_id,
+                performance_flags: self.config.client_info.performance_flags,
+                // Empty until epic #25 replays a Save Session Info cookie.
+                reconnect_cookie: None,
             },
-        }]
+        };
+        let payload = info.encode();
+        let frame = tpkt::encode(&x224::encode_data(&mcs::encode_send_data_request(
+            self.user_channel_id,
+            self.io_channel_id,
+            &payload,
+        )));
+
+        self.stage = self.stage.done();
+        vec![
+            Action::WriteBytes(frame),
+            Action::McsConnected {
+                result: McsConnectResult {
+                    selected,
+                    user_channel_id: self.user_channel_id,
+                    io_channel_id: self.io_channel_id,
+                    static_channels: std::mem::take(&mut self.static_channels),
+                    desktop_size: (
+                        self.config.core.desktop_width,
+                        self.config.core.desktop_height,
+                    ),
+                    channel_join_skipped: self.skip_channel_join,
+                },
+            },
+        ]
     }
 
     /// Fail the connect: emit [`Action::FailWith`] and move to the terminal [`Stage::Done`],
@@ -705,6 +782,27 @@ mod tests {
                 ChannelDef::new("cliprdr", CHANNEL_OPTION_INITIALIZED).unwrap(),
                 ChannelDef::new("drdynvc", CHANNEL_OPTION_INITIALIZED).unwrap(),
             ],
+            client_info: ClientInfoConfig {
+                flags: client_info::ClientInfoFlags::MOUSE
+                    | client_info::ClientInfoFlags::AUTOLOGON
+                    | client_info::ClientInfoFlags::LOGON_NOTIFY,
+                domain: "WORKGROUP".to_string(),
+                username: "sm-user".to_string(),
+                alternate_shell: String::new(),
+                work_dir: String::new(),
+                address_family: client_info::ADDRESS_FAMILY_INET,
+                client_address: "10.0.0.2".to_string(),
+                client_dir: String::new(),
+                timezone: client_info::TimezoneInfo {
+                    bias: -540,
+                    standard_name: "Korea Standard Time".to_string(),
+                    standard_bias: 0,
+                    daylight_name: String::new(),
+                    daylight_bias: 0,
+                },
+                session_id: 0,
+                performance_flags: 0x7,
+            },
         }
     }
 
@@ -1087,9 +1185,15 @@ mod tests {
             batch.extend_from_slice(&iron_channel_join_confirm(1007, id, 0));
         }
         let actions = sm.process(Event::Received(&batch));
+        // The machine closes the exchange by sending the Client Info PDU (Secure Settings
+        // Exchange) before reporting completion — the server will not start licensing without
+        // it (#40). Its content is verified field-by-field in
+        // client_info_pdu_is_sent_on_the_io_channel_with_caller_fields.
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions[0], Action::WriteBytes(_)));
         assert_eq!(
-            actions,
-            vec![Action::McsConnected {
+            actions[1],
+            Action::McsConnected {
                 result: McsConnectResult {
                     selected: SecurityProtocol::HYBRID,
                     user_channel_id: 1007,
@@ -1101,7 +1205,7 @@ mod tests {
                     desktop_size: (1280, 800),
                     channel_join_skipped: false,
                 }
-            }]
+            }
         );
         assert_eq!(sm.stage(), "capability-exchange");
     }
@@ -1118,7 +1222,8 @@ mod tests {
         sm.process(Event::Received(&iron_connect_response(true, vec![1004, 1005])));
         let actions = sm.process(Event::Received(&iron_attach_user_confirm(1009)));
         match actions.as_slice() {
-            [Action::McsConnected { result }] => {
+            // Even on the skip path the Client Info PDU precedes completion.
+            [Action::WriteBytes(_), Action::McsConnected { result }] => {
                 assert!(result.channel_join_skipped);
                 assert_eq!(result.user_channel_id, 1009);
                 assert_eq!(result.io_channel_id, 1003);
@@ -1154,7 +1259,7 @@ mod tests {
         }
         let actions = sm.process(Event::Received(&batch));
         match actions.as_slice() {
-            [Action::McsConnected { result }] => {
+            [Action::WriteBytes(_), Action::McsConnected { result }] => {
                 assert_eq!(
                     result.static_channels,
                     vec![StaticChannel { name: "cliprdr".to_string(), id: 1004 }]
@@ -1209,6 +1314,51 @@ mod tests {
             actions.as_slice(),
             [Action::FailWith(ConnectError::Decode(_))]
         ));
+    }
+
+    #[test]
+    fn client_info_pdu_is_sent_on_the_io_channel_with_caller_fields() {
+        // The Secure Settings Exchange write that closes the MCS stage: a SendDataRequest from
+        // the user channel on the I/O channel, carrying SEC_INFO_PKT + the caller's Client Info
+        // fields — parsed back by ironrdp, the independent reference.
+        let mut sm = joining_channels();
+        let mut batch = Vec::new();
+        for id in [1007u16, 1003, 1004, 1005] {
+            batch.extend_from_slice(&iron_channel_join_confirm(1007, id, 0));
+        }
+        let actions = sm.process(Event::Received(&batch));
+        let Action::WriteBytes(frame) = &actions[0] else {
+            panic!("expected the Client Info write, got {actions:?}");
+        };
+
+        let parsed: IronX224<iron_mcs::McsMessage<'_>> = ironrdp_pdu::decode(frame).unwrap();
+        let iron_mcs::McsMessage::SendDataRequest(req) = parsed.0 else {
+            panic!("expected a SendDataRequest");
+        };
+        assert_eq!(req.initiator_id, 1007, "sent as the attached user");
+        assert_eq!(req.channel_id, 1003, "sent on the I/O channel");
+
+        let pdu: ironrdp_pdu::rdp::ClientInfoPdu =
+            ironrdp_pdu::decode(req.user_data.as_ref()).unwrap();
+        let info = &pdu.client_info;
+        assert_eq!(info.credentials.username, "sm-user");
+        assert_eq!(info.credentials.domain.as_deref(), Some("WORKGROUP"));
+        assert_eq!(
+            info.credentials.password, "",
+            "no secret enters the sans-IO machine (plan.md decision 10)"
+        );
+        let tz = info.extra_info.optional_data.timezone().expect("timezone present");
+        assert_eq!(tz.bias, -540);
+        assert_eq!(
+            info.extra_info.optional_data.performance_flags().map(|f| f.bits()),
+            Some(0x7)
+        );
+        assert_eq!(info.extra_info.optional_data.session_id(), Some(0));
+        assert_eq!(
+            info.extra_info.optional_data.reconnect_cookie(),
+            None,
+            "cbAutoReconnectCookie stays zero until epic #25"
+        );
     }
 
     #[test]
@@ -1280,7 +1430,10 @@ mod tests {
             batch.extend_from_slice(&iron_channel_join_confirm(1007, id, 0));
         }
         let actions = sm.process(Event::Received(&batch));
-        assert!(matches!(actions.as_slice(), [Action::McsConnected { .. }]));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::WriteBytes(_), Action::McsConnected { .. }]
+        ));
         sm
     }
 
