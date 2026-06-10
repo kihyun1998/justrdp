@@ -11,6 +11,6 @@ pub mod connect;
 pub mod tls;
 
 pub use connect::{
-    Action, ConnectConfig, ConnectError, ConnectStateMachine, Event, EventKind, McsConnectResult,
-    StaticChannel,
+    Action, ClientInfoConfig, ConnectConfig, ConnectError, ConnectStateMachine, Event, EventKind,
+    McsConnectResult, StaticChannel,
 };

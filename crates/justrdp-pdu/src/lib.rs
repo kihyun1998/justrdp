@@ -8,6 +8,7 @@
 //! (sans-IO state machine core).
 
 pub mod ber;
+pub mod client_info;
 pub mod cursor;
 pub mod error;
 pub mod gcc;
