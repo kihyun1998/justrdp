@@ -1372,6 +1372,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn connect_reaches_session_active_against_real_vm() {
+        let _vm = VM_SESSION.lock().await;
         let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
         let config = test_config();
         let requested = config.requested;
@@ -1499,6 +1500,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn captured_bitmap_rectangles_decode_identically_in_ironrdp() {
+        let _vm = VM_SESSION.lock().await;
         let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
         let credentials = Credentials {
             username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
@@ -1661,6 +1663,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn first_frames_render_the_desktop_against_real_vm() {
+        let _vm = VM_SESSION.lock().await;
         let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
         let config = legacy_graphics_config();
         let session_capabilities = config.capabilities.clone();
@@ -1732,6 +1735,12 @@ mod tests {
         std::fs::write(&path, ppm).expect("write the visual dump");
         eprintln!("visual dump for confirmation: {}", path.display());
     }
+
+    /// All real-VM tests log on to the same Windows session on the test VM; a concurrent
+    /// logon with the same account takes the session over and kicks the other test mid-run
+    /// (observed as a flake when the whole `--ignored` suite runs in parallel). Serialize
+    /// them on one process-wide lock.
+    static VM_SESSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Credentials from the environment for the real-VM tests.
     fn vm_credentials() -> Credentials {
@@ -1819,12 +1828,17 @@ mod tests {
     /// Display Control channel and send its caps (surfaced as `DisplayControlReady`), then
     /// request a resize to a different resolution. The server answers with the
     /// Deactivation–Reactivation cycle; the test passes when the full-screen re-emit arrives
-    /// at the new size and the framebuffer matches. The exchange milestones are printed so
-    /// the wire sequence (caps → create → caps PDU → resize → deactivate → reactivate) is
-    /// visible in the test log.
+    /// at the new size and the framebuffer matches.
+    ///
+    /// The PDU sequence (issue #8's logging criterion) is captured through the core's
+    /// tracing milestones — `rdp_drdynvc` (caps/create), `rdp_displaycontrol_caps`,
+    /// `rdp_displaycontrol_resize`, `rdp_deactivate_all`, `rdp_demand_active`,
+    /// `rdp_font_map` — asserted below and visible with `--nocapture`.
     #[tokio::test]
+    #[traced_test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn display_control_resize_against_real_vm() {
+        let _vm = VM_SESSION.lock().await;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1897,6 +1911,24 @@ mod tests {
             target,
             "framebuffer was not rebuilt at the negotiated size"
         );
+
+        // The wire sequence, as observed PDUs (issue #8: "log the sequence of PDU types
+        // exchanged") — each milestone must have actually been seen on the wire, not
+        // inferred from pixels.
+        for (target_name, what) in [
+            ("rdp_drdynvc", "DYNVC capabilities/create traffic"),
+            ("rdp_displaycontrol_caps", "DISPLAYCONTROL_CAPS"),
+            ("rdp_displaycontrol_resize", "Monitor Layout resize request"),
+            ("rdp_deactivate_all", "DeactivateAll"),
+            ("rdp_demand_active", "Demand Active"),
+            ("rdp_font_map", "Font Map (reactivation complete)"),
+        ] {
+            assert!(logs_contain(target_name), "{what} was never logged ({target_name})");
+        }
+        eprintln!(
+            "PDU sequence observed: DYNVC caps → create → EDISP caps → Monitor Layout → \
+             DeactivateAll → Demand Active → Font Map"
+        );
         eprintln!(
             "resize verified: {}x{} → {}x{}",
             initial_size.0,
@@ -1927,6 +1959,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn keyboard_and_mouse_input_drive_the_real_vm() {
+        let _vm = VM_SESSION.lock().await;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2106,6 +2139,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn slowpath_input_fallback_works_on_the_real_vm() {
+        let _vm = VM_SESSION.lock().await;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 

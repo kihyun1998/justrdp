@@ -28,7 +28,9 @@ sspi = { workspace = true }
 # "sync" feeds the SNI observed by the mock TLS server back to the test (oneshot channel).
 tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros", "sync"] }
 # Captures tracing events in-test so we can assert on the emitted debug logs (criterion 14).
-tracing-test = "0.2"
+# "no-env-filter" keeps events from the `justrdp` core crate (PDU-milestone targets like
+# rdp_deactivate_all) visible to the slice-8 wire-sequence assertions.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # The mock TLS server in the adapter tests presents a throwaway self-signed cert.
 rcgen = { workspace = true }
 # Differential oracle for the live-capture codec test (gate #6 fix note 3): bitmap rectangles

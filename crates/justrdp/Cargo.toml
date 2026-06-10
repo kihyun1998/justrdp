@@ -15,6 +15,10 @@ justrdp-codecs.workspace = true
 # inner `subjectPublicKey` BIT STRING (not the whole SubjectPublicKeyInfo) for CredSSP to bind
 # to; the handshake itself stays in the I/O adapter.
 x509-cert.workspace = true
+# Structured observability (plan.md §11d): PDU-milestone debug events (deactivate/demand-active/
+# drdynvc traffic) with named targets the test harness' tracing watchers assert on. A no-op
+# without a subscriber, so sans-IO purity and portability are unaffected.
+tracing = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 # Generates a throwaway self-signed cert so the key-extraction test can assert the extracted
