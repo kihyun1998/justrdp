@@ -51,9 +51,58 @@ pub fn decode_connection_confirm(tpdu: &[u8]) -> Result<&[u8], DecodeError> {
     cur.read_slice(variable_len)
 }
 
+/// Data TPDU code (class 0, with EOT).
+pub const DATA: u8 = 0xF0;
+/// The end-of-TSDU mark in the DT TPDU's number field.
+const EOT: u8 = 0x80;
+/// A class-0 Data TPDU header: LI=2, code 0xF0, EOT.
+const DATA_HEADER: [u8; 3] = [0x02, DATA, EOT];
+
+/// Encode an X.224 Data (DT) TPDU carrying `user_data` (e.g. an MCS PDU). Returns the raw TPDU
+/// bytes; the caller wraps them in TPKT.
+pub fn encode_data(user_data: &[u8]) -> Vec<u8> {
+    let mut tpdu = Vec::with_capacity(DATA_HEADER.len() + user_data.len());
+    tpdu.extend_from_slice(&DATA_HEADER);
+    tpdu.extend_from_slice(user_data);
+    tpdu
+}
+
+/// Decode an X.224 Data TPDU and return its user data (e.g. the MCS PDU bytes).
+pub fn decode_data(tpdu: &[u8]) -> Result<&[u8], DecodeError> {
+    let mut cur = ReadCursor::new(tpdu, "x224 data");
+    let li = cur.read_u8()?;
+    if li != 2 {
+        return Err(DecodeError::InvalidField {
+            field: "x224.li",
+            reason: "expected LI = 2 for a class-0 Data TPDU",
+        });
+    }
+    if cur.read_u8()? != DATA {
+        return Err(DecodeError::InvalidField {
+            field: "x224.code",
+            reason: "expected Data (0xF0)",
+        });
+    }
+    cur.read_u8()?; // TPDU-NR + EOT
+    cur.read_slice(cur.remaining())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_tpdu_round_trips_user_data() {
+        let tpdu = encode_data(&[0xAA, 0xBB]);
+        assert_eq!(tpdu, vec![0x02, 0xF0, 0x80, 0xAA, 0xBB]);
+        assert_eq!(decode_data(&tpdu).unwrap(), &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn decode_data_rejects_a_connection_confirm() {
+        let err = decode_data(&[0x06, 0xD0, 0x00, 0x00, 0x00, 0x00]).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidField { .. }));
+    }
 
     #[test]
     fn encode_connection_request_frames_variable_part() {

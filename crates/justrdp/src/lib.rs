@@ -10,4 +10,7 @@
 pub mod connect;
 pub mod tls;
 
-pub use connect::{Action, ConnectError, ConnectStateMachine, Event, EventKind};
+pub use connect::{
+    Action, ConnectConfig, ConnectError, ConnectStateMachine, Event, EventKind, McsConnectResult,
+    StaticChannel,
+};
