@@ -1061,6 +1061,7 @@ dependencies = [
 name = "justrdp"
 version = "0.1.0"
 dependencies = [
+ "ironrdp-pdu",
  "justrdp-pdu",
  "rcgen",
  "x509-cert",
