@@ -1298,6 +1298,153 @@ mod tests {
         assert!(frame_len > 0);
     }
 
+    /// Caller policy for a *legacy-graphics* (bitmap update) session: do NOT advertise
+    /// SUPPORT_DYN_VC_GFX_PROTOCOL (and skip drdynvc). A server seeing the EGFX gate flag
+    /// negotiates graphics over the dynamic channel and never falls back to bitmap updates
+    /// (verified against this VM: with the flag set it sends only drdynvc DVC requests and
+    /// zero bitmap data). Until the EGFX slice exists, the caller advertises what the client
+    /// can actually render — exactly the policy seam plan.md §0 demands stays caller-owned.
+    fn legacy_graphics_config() -> ConnectConfig {
+        let mut config = test_config();
+        config.core.early_capability_flags =
+            gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
+                | gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
+        config.channels =
+            vec![gcc::ChannelDef::new("cliprdr", gcc::CHANNEL_OPTION_INITIALIZED).unwrap()];
+        config
+    }
+
+    /// Real-VM differential test (gate #6 fix note 3): capture live bitmap rectangles from
+    /// the server and decode the identical bytes with both our codecs and ironrdp-graphics,
+    /// asserting byte-identical pixels. The VM delivers them as fast-path updates — the
+    /// `TS_BITMAP_DATA` payload inside is the same structure slow-path updates carry
+    /// (MS-RDPBCGR 2.2.9.1.1.3.1.2.2), as recorded in the gate verdict.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn captured_bitmap_rectangles_decode_identically_in_ironrdp() {
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let credentials = Credentials {
+            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
+            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
+            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
+        };
+        let outcome = connect(addr, legacy_graphics_config(), credentials, |_| {})
+            .await
+            .expect("connect should reach session-active");
+        let mut stream = outcome.stream;
+        let mut inbox = outcome.activation.leftover;
+        let mut buf = [0u8; 16384];
+
+        // Capture compressed rectangles straight off the wire (single-fragment fast-path
+        // bitmap updates; fragmented ones are skipped — the capture is about real server
+        // bytes, and reassembly is the session machine's covered concern).
+        let mut captured: Vec<justrdp_pdu::update::BitmapData> = Vec::new();
+        let mut fragment: Vec<u8> = Vec::new();
+        let mut total_rects = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        'capture: while captured.len() < 32 {
+            while let Some(&first) = inbox.first() {
+                let len = if justrdp_pdu::fastpath::is_fastpath(first) {
+                    justrdp_pdu::fastpath::frame_len(&inbox)
+                } else {
+                    justrdp_pdu::tpkt::frame_len(&inbox)
+                };
+                let len = match len {
+                    Ok(n) if inbox.len() >= n => n,
+                    _ => break,
+                };
+                let frame: Vec<u8> = inbox.drain(..len).collect();
+                if !justrdp_pdu::fastpath::is_fastpath(first) {
+                    continue;
+                }
+                for section in justrdp_pdu::fastpath::decode_updates(&frame).unwrap() {
+                    if section.code != justrdp_pdu::fastpath::FP_UPDATE_BITMAP {
+                        continue;
+                    }
+                    // Reassemble fragmented updates too — large (compressed) bitmaps are
+                    // exactly the ones servers fragment.
+                    let complete: Option<Vec<u8>> = match section.fragmentation {
+                        justrdp_pdu::fastpath::FP_FRAGMENT_SINGLE => Some(section.data.to_vec()),
+                        justrdp_pdu::fastpath::FP_FRAGMENT_FIRST => {
+                            fragment = section.data.to_vec();
+                            None
+                        }
+                        _ => {
+                            fragment.extend_from_slice(section.data);
+                            if section.fragmentation == justrdp_pdu::fastpath::FP_FRAGMENT_LAST {
+                                Some(std::mem::take(&mut fragment))
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    let Some(data) = complete else { continue };
+                    let mut cur = justrdp_pdu::cursor::ReadCursor::new(&data, "capture");
+                    cur.read_u16_le().unwrap(); // updateType
+                    let update = justrdp_pdu::update::BitmapUpdate::decode(&mut cur)
+                        .expect("captured bitmap update decodes");
+                    for rect in update.rectangles {
+                        total_rects += 1;
+                        if rect.compressed {
+                            captured.push(rect);
+                        }
+                    }
+                }
+            }
+            match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => inbox.extend_from_slice(&buf[..n]),
+                _ => break 'capture,
+            }
+        }
+        eprintln!(
+            "captured {} compressed rectangles from the live server ({total_rects} total)",
+            captured.len()
+        );
+        assert!(
+            captured.len() >= 4,
+            "expected the server to produce compressed bitmap rectangles to capture"
+        );
+
+        for (i, rect) in captured.iter().enumerate() {
+            let (w, h) = (usize::from(rect.width), usize::from(rect.height));
+            if rect.bits_per_pixel == 32 {
+                let ours = justrdp_codecs::planar::decompress(&rect.data, w, h)
+                    .unwrap_or_else(|e| panic!("rect {i}: ours failed: {e}"));
+                let mut theirs = Vec::new();
+                ironrdp_graphics::rdp6::BitmapStreamDecoder::default()
+                    .decode_bitmap_stream_to_rgb24(&rect.data, &mut theirs, w, h)
+                    .unwrap_or_else(|e| panic!("rect {i}: oracle failed: {e:?}"));
+                let ours_rgb: Vec<u8> = ours
+                    .chunks_exact(3)
+                    .flat_map(|bgr| [bgr[2], bgr[1], bgr[0]])
+                    .collect();
+                assert_eq!(ours_rgb, theirs, "rect {i} ({w}x{h} planar) diverged");
+            } else {
+                let ours =
+                    justrdp_codecs::rle::decompress(&rect.data, w, h, rect.bits_per_pixel)
+                        .unwrap_or_else(|e| panic!("rect {i}: ours failed: {e}"));
+                let mut theirs = Vec::new();
+                ironrdp_graphics::rle::decompress(
+                    &rect.data,
+                    &mut theirs,
+                    w,
+                    h,
+                    usize::from(rect.bits_per_pixel),
+                )
+                .unwrap_or_else(|e| panic!("rect {i}: oracle failed: {e:?}"));
+                assert_eq!(
+                    ours, theirs,
+                    "rect {i} ({w}x{h} @ {} bpp RLE) diverged",
+                    rect.bits_per_pixel
+                );
+            }
+        }
+        eprintln!(
+            "all {} captured rectangles byte-identical in both stacks",
+            captured.len()
+        );
+    }
+
     /// Real-VM acceptance test for slice-6: connect to session-active, run the session loop,
     /// and verify the first decoded frames actually render the desktop — at least one
     /// FrameUpdate arrives, most of the screen gets painted, and the framebuffer is visibly
@@ -1307,17 +1454,7 @@ mod tests {
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn first_frames_render_the_desktop_against_real_vm() {
         let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        // Caller policy for a *slow-path* graphics session: do NOT advertise
-        // SUPPORT_DYN_VC_GFX_PROTOCOL (and skip drdynvc). A server seeing the EGFX gate flag
-        // negotiates graphics over the dynamic channel and never paints slow-path (verified
-        // against this VM: with the flag set it sends only drdynvc DVC requests and zero
-        // bitmap updates). Until the EGFX slice exists, the caller advertises what the client
-        // can actually render — exactly the policy seam plan.md §0 demands stays caller-owned.
-        let mut config = test_config();
-        config.core.early_capability_flags =
-            gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
-                | gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
-        config.channels = vec![gcc::ChannelDef::new("cliprdr", gcc::CHANNEL_OPTION_INITIALIZED).unwrap()];
+        let config = legacy_graphics_config();
         let session_capabilities = config.capabilities.clone();
         let credentials = Credentials {
             username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),

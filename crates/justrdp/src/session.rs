@@ -164,6 +164,23 @@ impl SessionStateMachine {
                 fastpath::FP_FRAGMENT_NEXT | fastpath::FP_FRAGMENT_LAST => {
                     match self.fragment.as_mut() {
                         Some((code, buffer)) if *code == section.code => {
+                            // Cap reassembly so an endless NEXT stream cannot grow the
+                            // buffer unboundedly (the TSRequest-cap precedent). A real
+                            // update never exceeds one full desktop of RGBA pixels plus
+                            // headers by a wide margin.
+                            let cap = (usize::from(self.framebuffer.width())
+                                * usize::from(self.framebuffer.height())
+                                * 4)
+                            .max(1 << 20)
+                                + (64 << 10);
+                            if buffer.len() + section.data.len() > cap {
+                                return Err(SessionError::Decode(
+                                    justrdp_pdu::DecodeError::InvalidField {
+                                        field: "TS_FP_UPDATE.fragmentation",
+                                        reason: "fragmented update exceeds the reassembly cap",
+                                    },
+                                ));
+                            }
                             buffer.extend_from_slice(section.data);
                         }
                         // A continuation without a matching FIRST: protocol desync.
@@ -299,6 +316,19 @@ impl SessionStateMachine {
         &mut self,
         rect: &update::BitmapData,
     ) -> Result<Option<FrameUpdate>, SessionError> {
+        // Bound the wire-declared dimensions BEFORE the decoders allocate width × height
+        // buffers: a tiny malicious PDU declaring 65535×65535 would otherwise force a
+        // multi-gigabyte allocation (OOM abort, not a typed error — plan.md §11c; same
+        // class as the capped TSRequest read, gate #3). Legitimate rectangles never exceed
+        // the negotiated desktop plus the legacy 4-pixel alignment padding.
+        let max_w = self.framebuffer.width().saturating_add(3);
+        let max_h = self.framebuffer.height().saturating_add(3);
+        if rect.width > max_w || rect.height > max_h {
+            return Err(SessionError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                field: "TS_BITMAP_DATA",
+                reason: "bitmap rectangle exceeds the negotiated desktop size",
+            }));
+        }
         let width = usize::from(rect.width);
         let height = usize::from(rect.height);
         // All slow-path bitmap layouts are bottom-up; the conversion flips to top-down RGBA.
@@ -702,6 +732,62 @@ mod tests {
         };
         assert_eq!((frame.width, frame.height), (8, 4));
         assert_eq!(&frame.pixels[..4], &[3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn oversized_bitmap_dimensions_are_rejected_before_allocation() {
+        // A ~30-byte PDU declaring a 65535×65535 compressed bitmap must yield a typed
+        // error, not a multi-gigabyte allocation (gate #6 fix note 1).
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut body = Vec::new();
+        body.extend_from_slice(&update::UPDATETYPE_BITMAP.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        for v in [0u16, 0, 65534, 65534, 65535, 65535, 24] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(
+            &(update::BITMAP_COMPRESSION | update::NO_BITMAP_COMPRESSION_HDR).to_le_bytes(),
+        );
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.push(0x1F);
+        let err = sm
+            .process_bytes(&server_data_pdu(share::PDU_TYPE2_UPDATE, &body))
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionError::Decode(justrdp_pdu::DecodeError::InvalidField { .. })),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn fragment_reassembly_is_capped() {
+        // An endless FIRST + NEXT stream must hit the reassembly cap (typed error), not
+        // grow without bound (gate #6 fix note 1). Test desktop is 16×8 → cap ≈ 1 MiB.
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let chunk = vec![0u8; 16 << 10];
+        assert!(sm
+            .process_bytes(&fastpath::encode_pdu(&[(
+                fastpath::FP_UPDATE_BITMAP,
+                fastpath::FP_FRAGMENT_FIRST,
+                &chunk,
+            )]))
+            .unwrap()
+            .is_empty());
+        let mut result = Ok(Vec::new());
+        for _ in 0..80 {
+            result = sm.process_bytes(&fastpath::encode_pdu(&[(
+                fastpath::FP_UPDATE_BITMAP,
+                fastpath::FP_FRAGMENT_NEXT,
+                &chunk,
+            )]));
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(
+            matches!(result, Err(SessionError::Decode(_))),
+            "cap never tripped: {result:?}"
+        );
     }
 
     #[test]

@@ -1103,7 +1103,9 @@ dependencies = [
 name = "justrdp-tokio"
 version = "0.1.0"
 dependencies = [
+ "ironrdp-graphics",
  "justrdp",
+ "justrdp-codecs",
  "justrdp-pdu",
  "rcgen",
  "rustls",

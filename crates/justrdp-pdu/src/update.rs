@@ -72,6 +72,7 @@ impl BitmapUpdate {
             let mut length = cur.read_u16_le()? as usize;
 
             let compressed = flags & BITMAP_COMPRESSION != 0;
+            let mut main_body = None;
             if compressed && flags & NO_BITMAP_COMPRESSION_HDR == 0 {
                 // TS_CD_HEADER (8 bytes): all four fields restate what the bitmap header
                 // already says, so it is validated for size and dropped.
@@ -82,12 +83,19 @@ impl BitmapUpdate {
                     });
                 }
                 cur.read_u16_le()?; // cbCompFirstRowSize (MUST be 0)
-                let main_body = cur.read_u16_le()? as usize;
+                main_body = Some(cur.read_u16_le()? as usize);
                 cur.read_u16_le()?; // cbScanWidth
                 cur.read_u16_le()?; // cbUncompressedSize
-                length = main_body.min(length - 8);
+                length -= 8;
             }
-            let data = cur.read_slice(length)?.to_vec();
+            // Always consume the full bitmapLength from the cursor — a cbCompMainBodySize
+            // smaller than the remaining bytes means trailing padding, which must not bleed
+            // into the next rectangle's fields. The data itself is truncated to the body.
+            let raw = cur.read_slice(length)?;
+            let data = match main_body {
+                Some(body) => raw[..body.min(raw.len())].to_vec(),
+                None => raw.to_vec(),
+            };
             if width == 0 || height == 0 {
                 return Err(DecodeError::InvalidField {
                     field: "TS_BITMAP_DATA",
@@ -180,6 +188,28 @@ mod tests {
         let mut cur = ReadCursor::new(&body, "test");
         let update = BitmapUpdate::decode(&mut cur).unwrap();
         assert_eq!(update.rectangles[0].data, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn cd_header_trailing_padding_does_not_desync_the_next_rectangle() {
+        // Rect 1: bitmapLength 16 = 8 (CD header) + 5 body + 3 pad; mainBody says 5.
+        let mut payload = Vec::new();
+        for v in [0u16, 5, 8, 16] {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        payload.extend_from_slice(&[1, 2, 3, 4, 5]); // body
+        payload.extend_from_slice(&[0xEE; 3]); // trailing pad
+        let mut body = 2u16.to_le_bytes().to_vec();
+        body.extend_from_slice(&rect_bytes(BITMAP_COMPRESSION, &payload));
+        body.extend_from_slice(&rect_bytes(0, &[9, 9, 9]));
+        let mut cur = ReadCursor::new(&body, "test");
+        let update = BitmapUpdate::decode(&mut cur).unwrap();
+        assert_eq!(cur.remaining(), 0);
+        assert_eq!(update.rectangles.len(), 2);
+        // Body truncated to mainBody, padding consumed — the second rect parses intact.
+        assert_eq!(update.rectangles[0].data, vec![1, 2, 3, 4, 5]);
+        assert_eq!(update.rectangles[1].data, vec![9, 9, 9]);
+        assert_eq!(update.rectangles[1].bits_per_pixel, 16);
     }
 
     #[test]
