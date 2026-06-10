@@ -4,11 +4,12 @@
 //! bytes received, TLS established), and applies a per-stage timeout — surfacing the stage name on
 //! failure.
 //!
-//! slice-2 drives the first three connect stages (`tcp-connect` → `x224-negotiate` →
-//! `tls-handshake`). The TLS handshake itself runs here, not in the core: rustls is its own sans-IO
-//! state machine, so shuttling its records through the connect machine would add nothing (plan.md
-//! §3). The machine only sees the resulting server certificate, from which it extracts the
-//! `subjectPublicKey`. Later slices extend the same loop through NLA, MCS, and activation.
+//! The loop currently drives the connect sequence through `tcp-connect` → `x224-negotiate` →
+//! `tls-handshake` → `nla-credssp` → the MCS/GCC half of `capability-exchange` (Connect-Initial,
+//! channel join). The TLS handshake and the CredSSP token exchange run here, not in the core:
+//! rustls and `sspi` are their own state machines, so shuttling their records through the
+//! connect machine would add nothing (plan.md §3, decision 10). After [`Action::StartTls`] the
+//! machine's writes and reads transparently ride the TLS stream ([`Transport`]).
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -17,8 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use justrdp::{Action, ConnectError, ConnectStateMachine, Event};
-use justrdp_pdu::nego::SecurityProtocol;
+use justrdp::{Action, ConnectConfig, ConnectError, ConnectStateMachine, Event, McsConnectResult};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -43,15 +43,60 @@ const STAGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// `nla-credssp` read before the bytes are even validated.
 const MAX_TS_REQUEST_LEN: usize = 64 * 1024;
 
-/// A successful connect through NLA: the server-selected transport security protocol and the live,
-/// authenticated TLS stream — positioned just after CredSSP (and the HYBRID_EX early-auth check),
-/// ready for MCS connect in the next slice.
+/// A successful connect through MCS: the negotiated channel topology (user channel, I/O
+/// channel, granted static channels) and the live, authenticated TLS stream — positioned just
+/// after channel join, ready for the Client Info PDU (slice-4b) and licensing (slice-5).
 #[derive(Debug)]
 pub struct ConnectOutcome {
-    /// The protocol the server chose in the X.224 Connection Confirm.
-    pub selected: SecurityProtocol,
-    /// The TLS-upgraded, NLA-authenticated stream, ready for MCS.
+    /// The MCS/GCC results: selected protocol, user/IO channel IDs, static channels,
+    /// requested desktop size.
+    pub mcs: McsConnectResult,
+    /// The TLS-upgraded, NLA-authenticated stream with the MCS exchange completed.
     pub stream: TlsStream<TcpStream>,
+}
+
+/// The connect-time transport: plaintext TCP until the X.224 negotiation completes, the TLS
+/// stream after [`Action::StartTls`]. The machine's [`Action::WriteBytes`] and the read loop
+/// always target whichever is current, so the MCS exchange transparently rides TLS.
+enum Transport {
+    /// Between `Connect` and the TLS upgrade.
+    Tcp(TcpStream),
+    /// From the TLS upgrade onward.
+    Tls(Box<TlsStream<TcpStream>>),
+    /// Transient state while the TLS upgrade owns the socket, and after the terminal action
+    /// consumed the stream.
+    Absent,
+}
+
+impl Transport {
+    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Transport::Tcp(s) => s.write_all(bytes).await,
+            Transport::Tls(s) => s.write_all(bytes).await,
+            Transport::Absent => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "write before the socket is connected",
+            )),
+        }
+    }
+
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Transport::Tcp(s) => s.read(buf).await,
+            Transport::Tls(s) => s.read(buf).await,
+            Transport::Absent => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "read before the socket is connected",
+            )),
+        }
+    }
+
+    fn tls_mut(&mut self) -> Option<&mut TlsStream<TcpStream>> {
+        match self {
+            Transport::Tls(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 /// Credentials for NLA (CredSSP / NTLM). The adapter converts these into an `sspi` auth identity and
@@ -193,42 +238,45 @@ impl From<io::Error> for ConnectFailure {
     }
 }
 
-/// Connect to `server`, run the X.224 security negotiation advertising `requested`, upgrade the
-/// socket to TLS, then authenticate with `credentials` via NLA (CredSSP / NTLM). `on_stage` is
-/// called with each connect stage label as it is entered, for progress UI / diagnostics.
+/// Connect to `server` and drive the full connect sequence with `config`: X.224 security
+/// negotiation, TLS upgrade, NLA (CredSSP) authentication with `credentials`, then the MCS/GCC
+/// exchange and channel join. `on_stage` is called with each connect stage label as it is
+/// entered, for progress UI / diagnostics.
 ///
 /// `server` is anything convertible to a [`ServerAddr`]: pass a hostname-based `ServerAddr` to
-/// carry the name through TLS SNI and the CredSSP SPN, or a plain `SocketAddr` for the IP-literal
-/// behavior.
+/// carry the name through TLS SNI and the CredSSP SPN, or a plain `SocketAddr` for the
+/// IP-literal behavior.
 ///
-/// Returns the negotiated protocol and the authenticated TLS stream, ready for MCS. `credentials`
-/// is `skip`ped from the tracing span so the password is never recorded.
+/// `config` carries the caller's GCC settings — including all twelve `earlyCapabilityFlags`,
+/// which reach the wire verbatim (plan.md §0; nothing in justrdp hardcodes them).
+///
+/// Returns the MCS results (user channel, I/O channel, granted static channels) and the
+/// authenticated TLS stream, ready for the Client Info PDU. `credentials` is `skip`ped from the
+/// tracing span so the password is never recorded.
 pub async fn connect(
     server: impl Into<ServerAddr>,
-    requested: SecurityProtocol,
+    config: ConnectConfig,
     credentials: Credentials,
     on_stage: impl FnMut(&str),
 ) -> Result<ConnectOutcome, ConnectFailure> {
-    connect_inner(server.into(), requested, credentials, on_stage).await
+    connect_inner(server.into(), config, credentials, on_stage).await
 }
 
 /// The monomorphic body of [`connect`], instrumented once the server identity is concrete.
 #[tracing::instrument(
     name = "connect",
-    skip(credentials, on_stage),
+    skip(config, credentials, on_stage),
     fields(host = %server.host, port = server.port),
     err,
 )]
 async fn connect_inner(
     server: ServerAddr,
-    requested: SecurityProtocol,
+    config: ConnectConfig,
     credentials: Credentials,
     mut on_stage: impl FnMut(&str),
 ) -> Result<ConnectOutcome, ConnectFailure> {
-    let mut sm = ConnectStateMachine::new(requested);
-    let mut tcp: Option<TcpStream> = None;
-    let mut tls: Option<TlsStream<TcpStream>> = None;
-    let mut inbox: Vec<u8> = Vec::new();
+    let mut sm = ConnectStateMachine::new(config);
+    let mut transport = Transport::Absent;
     let mut readbuf = [0u8; 8192];
     let mut queue: VecDeque<Action> = sm.start().into();
     let mut announced = sm.stage();
@@ -248,19 +296,27 @@ async fn connect_inner(
                     )
                     .await?;
                     tracing::debug!("tcp socket connected");
-                    tcp = Some(s);
+                    transport = Transport::Tcp(s);
                     queue.extend(sm.process(Event::Connected));
                     announce_stage(&mut sm, &mut announced, &mut on_stage);
                 }
                 Action::WriteBytes(bytes) => {
-                    let s = tcp.as_mut().expect("socket connected before write");
-                    s.write_all(&bytes).await?;
+                    // Writes target whichever transport is current: plaintext TCP during X.224,
+                    // the TLS stream from the upgrade onward (MCS rides TLS).
+                    transport.write_all(&bytes).await?;
                     tracing::debug!(bytes = bytes.len(), "wrote frame to socket");
                 }
                 Action::StartTls { selected } => {
                     // The handshake runs here, never in the core machine. We hand only the resulting
                     // peer certificate back to the machine, which extracts its subjectPublicKey.
-                    let stream = tcp.take().expect("socket connected before TLS upgrade");
+                    let Transport::Tcp(stream) =
+                        std::mem::replace(&mut transport, Transport::Absent)
+                    else {
+                        return Err(ConnectFailure::Io(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "TLS upgrade requested without a connected plaintext socket",
+                        )));
+                    };
                     let connector = TlsConnector::from(Arc::new(client_config()));
                     // SNI carries the host exactly as dialed: `ServerName` parses both DNS names
                     // and IP literals, so a hostname reaches the server (and #36's validation)
@@ -296,7 +352,7 @@ async fn connect_inner(
                         .clone();
                     tracing::debug!("tls handshake complete; extracting server public key");
                     queue.extend(sm.process(Event::TlsEstablished(cert.as_ref())));
-                    tls = Some(established);
+                    transport = Transport::Tls(Box::new(established));
                     announce_stage(&mut sm, &mut announced, &mut on_stage);
                 }
                 Action::StartNla {
@@ -306,7 +362,12 @@ async fn connect_inner(
                     // CredSSP runs here, never in the core machine: `sspi` owns the token loop and
                     // we drive it over the TLS stream (plan.md decision 10). The core only sees the
                     // completion signal, plus — for HYBRID_EX — the early-auth result bytes.
-                    let stream = tls.as_mut().expect("tls established before NLA");
+                    let stream = transport.tls_mut().ok_or_else(|| {
+                        ConnectFailure::Io(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "NLA requested before the TLS upgrade",
+                        ))
+                    })?;
                     tracing::debug!(
                         ?selected,
                         key_len = server_public_key.len(),
@@ -321,7 +382,12 @@ async fn connect_inner(
                     // HYBRID_EX: the server sends a 4-byte Early User Authorization Result PDU right
                     // after CredSSP, before MCS. Read it (decrypted, off the TLS stream) and let the
                     // machine decode grant/deny.
-                    let stream = tls.as_mut().expect("tls established before early-user-auth");
+                    let stream = transport.tls_mut().ok_or_else(|| {
+                        ConnectFailure::Io(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "early-user-auth read before the TLS upgrade",
+                        ))
+                    })?;
                     let mut pdu = [0u8; 4];
                     with_stage_timeout("nla-credssp", STAGE_TIMEOUT, stream.read_exact(&mut pdu))
                         .await?;
@@ -329,31 +395,43 @@ async fn connect_inner(
                     queue.extend(sm.process(Event::EarlyUserAuthResult(&pdu)));
                     announce_stage(&mut sm, &mut announced, &mut on_stage);
                 }
-                Action::Authenticated { selected } => {
-                    tracing::debug!(?selected, "NLA complete; connection authenticated");
+                Action::McsConnected { result } => {
+                    tracing::debug!(
+                        user_channel = result.user_channel_id,
+                        io_channel = result.io_channel_id,
+                        static_channels = result.static_channels.len(),
+                        join_skipped = result.channel_join_skipped,
+                        "MCS connect complete"
+                    );
+                    let Transport::Tls(stream) =
+                        std::mem::replace(&mut transport, Transport::Absent)
+                    else {
+                        return Err(ConnectFailure::Io(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "MCS completed without a TLS stream",
+                        )));
+                    };
                     return Ok(ConnectOutcome {
-                        selected,
-                        stream: tls.expect("tls established before authenticated"),
+                        mcs: result,
+                        stream: *stream,
                     });
                 }
                 Action::FailWith(e) => return Err(ConnectFailure::Protocol(e)),
             }
         }
 
-        // The queue drained without a terminal action: the machine needs more bytes. This only
-        // happens during the plaintext X.224 phase; once TLS starts, the StartTls / StartNla arms
-        // drive their own reads and drain the queue without re-entering the plaintext read.
-        let s = tcp.as_mut().expect("socket connected before read");
-        let n = with_stage_timeout(sm.stage(), STAGE_TIMEOUT, s.read(&mut readbuf)).await?;
+        // The queue drained without a terminal action: the machine needs more bytes — from the
+        // plaintext socket during X.224, from the TLS stream during the MCS exchange. The
+        // machine reassembles TPKT frames itself, so raw chunks are fine.
+        let n = with_stage_timeout(sm.stage(), STAGE_TIMEOUT, transport.read(&mut readbuf)).await?;
         if n == 0 {
             return Err(ConnectFailure::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "server closed connection during X.224 negotiation",
+                format!("server closed the connection during {}", sm.stage()),
             )));
         }
         tracing::debug!(bytes = n, stage = sm.stage(), "read from socket");
-        inbox.extend_from_slice(&readbuf[..n]);
-        queue.extend(sm.process(Event::Received(&inbox)));
+        queue.extend(sm.process(Event::Received(&readbuf[..n])));
         announce_stage(&mut sm, &mut announced, &mut on_stage);
     }
 }
@@ -583,8 +661,49 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
     use tracing_test::traced_test;
 
-    fn requested() -> SecurityProtocol {
-        SecurityProtocol::SSL | SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX
+    use justrdp_pdu::gcc;
+    use justrdp_pdu::nego::SecurityProtocol;
+
+    /// A full connect config for the tests: SSL|HYBRID|HYBRID_EX advertised, a modest GCC core,
+    /// two static channels, and explicitly chosen early-capability flags (caller policy — set
+    /// here, in the host layer, exactly as the anti-hardcode rule demands).
+    fn test_config() -> ConnectConfig {
+        ConnectConfig {
+            requested: SecurityProtocol::SSL
+                | SecurityProtocol::HYBRID
+                | SecurityProtocol::HYBRID_EX,
+            core: gcc::ClientCoreData {
+                version: gcc::RDP_VERSION_10_12,
+                desktop_width: 1280,
+                desktop_height: 800,
+                keyboard_layout: 0x0409,
+                client_build: 1,
+                client_name: "justrdp".to_string(),
+                keyboard_type: gcc::KEYBOARD_TYPE_IBM_ENHANCED,
+                keyboard_subtype: 0,
+                keyboard_functional_keys_count: 12,
+                ime_file_name: String::new(),
+                post_beta2_color_depth: gcc::COLOR_DEPTH_8BPP,
+                client_product_id: 1,
+                serial_number: 0,
+                high_color_depth: gcc::HIGH_COLOR_DEPTH_24BPP,
+                supported_color_depths: gcc::SUPPORTED_COLOR_DEPTH_24BPP
+                    | gcc::SUPPORTED_COLOR_DEPTH_16BPP
+                    | gcc::SUPPORTED_COLOR_DEPTH_32BPP,
+                early_capability_flags: gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
+                    | gcc::ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL
+                    | gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN,
+                dig_product_id: String::new(),
+                connection_type: gcc::CONNECTION_TYPE_LAN,
+                // Overwritten by the machine with the negotiated protocol.
+                server_selected_protocol: SecurityProtocol::from_bits(0),
+            },
+            security: gcc::ClientSecurityData::default(),
+            channels: vec![
+                gcc::ChannelDef::new("cliprdr", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
+                gcc::ChannelDef::new("drdynvc", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
+            ],
+        }
     }
 
     #[tokio::test]
@@ -763,7 +882,7 @@ mod tests {
         let addr = mock_tls_server([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
 
         let mut stages = Vec::new();
-        let err = connect(addr, requested(), test_credentials(), |s| {
+        let err = connect(addr, test_config(), test_credentials(), |s| {
             stages.push(s.to_string())
         })
         .await
@@ -787,7 +906,7 @@ mod tests {
     async fn connect_logs_stage_transitions_through_nla() {
         let addr = mock_tls_server([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
         // Fails at the NLA boundary (no real NTLM peer); we only care about the logged transitions.
-        let _ = connect(addr, requested(), test_credentials(), |_| {}).await;
+        let _ = connect(addr, test_config(), test_credentials(), |_| {}).await;
 
         // Every connect stage through NLA is named in the debug logs (criterion 14: observable
         // transitions)...
@@ -850,7 +969,7 @@ mod tests {
         let server = ServerAddr::new("localhost", addr.port());
 
         let mut stages = Vec::new();
-        let _ = connect(server, requested(), test_credentials(), |s| {
+        let _ = connect(server, test_config(), test_credentials(), |s| {
             stages.push(s.to_string())
         })
         .await;
@@ -872,7 +991,7 @@ mod tests {
         let (addr, sni_rx) =
             mock_tls_server_reporting_sni([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
 
-        let _ = connect(addr, requested(), test_credentials(), |_| {}).await;
+        let _ = connect(addr, test_config(), test_credentials(), |_| {}).await;
 
         assert_eq!(sni_rx.await.unwrap(), None);
     }
@@ -896,7 +1015,7 @@ mod tests {
     #[tokio::test]
     async fn connect_surfaces_tls_handshake_failure() {
         let addr = mock_non_tls_server([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
-        let err = connect(addr, requested(), test_credentials(), |_| {})
+        let err = connect(addr, test_config(), test_credentials(), |_| {})
             .await
             .unwrap_err();
         assert!(
@@ -910,7 +1029,7 @@ mod tests {
         // Server refuses with RDP_NEG_FAILURE / HYBRID_REQUIRED_BY_SERVER (0x05) before any TLS.
         let addr = mock_non_tls_server([0x03, 0x00, 0x08, 0x00, 0x05, 0x00, 0x00, 0x00]).await;
 
-        let err = connect(addr, requested(), test_credentials(), |_| {})
+        let err = connect(addr, test_config(), test_credentials(), |_| {})
             .await
             .unwrap_err();
         assert!(
@@ -926,13 +1045,15 @@ mod tests {
     /// `cargo test -p justrdp-tokio -- --ignored` against the live RDP test VM, with the test
     /// account supplied via `JUSTRDP_TEST_USERNAME` / `JUSTRDP_TEST_PASSWORD` /
     /// `JUSTRDP_TEST_DOMAIN` (the latter optional) — so no credential is committed to the repo.
-    /// Verifies the full connect sequence through NLA: X.224 → TLS → CredSSP authentication (and the
-    /// HYBRID_EX early-auth check), ending in an authenticated stream ready for MCS.
+    /// Verifies the full connect sequence through MCS: X.224 → TLS → CredSSP authentication (and
+    /// the HYBRID_EX early-auth check) → MCS Connect + GCC exchange → channel join, ending with
+    /// the user channel ID and static channel list in hand (slice-4 acceptance).
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
-    async fn connect_authenticates_against_real_vm() {
+    async fn connect_completes_mcs_against_real_vm() {
         let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let req = requested();
+        let config = test_config();
+        let requested = config.requested;
         let credentials = Credentials {
             username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
             password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
@@ -940,19 +1061,30 @@ mod tests {
         };
 
         let mut stages = Vec::new();
-        let result = connect(addr, req, credentials, |s| stages.push(s.to_string())).await;
+        let result = connect(addr, config, credentials, |s| stages.push(s.to_string())).await;
         eprintln!("stages: {stages:?}");
-        let outcome = result.expect("connect through NLA should authenticate against the real VM");
+        let outcome = result.expect("connect through MCS should complete against the real VM");
+        eprintln!("mcs result: {:?}", outcome.mcs);
 
-        eprintln!("server selected protocol: {:?}", outcome.selected);
         // The server must select exactly one protocol from the set we advertised...
-        assert!(outcome.selected.bits() != 0);
-        assert!(req.contains(outcome.selected));
-        // ...and the connect sequence must have driven the full chain through NLA authentication.
+        assert!(outcome.mcs.selected.bits() != 0);
+        assert!(requested.contains(outcome.mcs.selected));
+        // ...the MCS exchange must yield a valid user channel (T.125 UserIds start at 1001)
+        // and the I/O channel...
+        assert!(outcome.mcs.user_channel_id >= 1001);
+        assert!(outcome.mcs.io_channel_id >= 1001);
+        // ...the requested static channels are answered (granted or refused, never dropped)...
+        assert!(outcome.mcs.static_channels.len() <= 2);
+        for ch in &outcome.mcs.static_channels {
+            assert!(ch.id >= 1001, "granted channel {} has id {}", ch.name, ch.id);
+        }
+        // ...and the connect sequence walked every stage through capability-exchange.
         assert_eq!(stages.first().map(String::as_str), Some("tcp-connect"));
-        assert!(
-            stages.contains(&"nla-credssp".to_string()),
-            "expected to reach the nla-credssp stage, got {stages:?}"
-        );
+        for expected in ["x224-negotiate", "tls-handshake", "nla-credssp", "capability-exchange"] {
+            assert!(
+                stages.contains(&expected.to_string()),
+                "expected to reach the {expected} stage, got {stages:?}"
+            );
+        }
     }
 }

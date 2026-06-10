@@ -17,3 +17,7 @@ x509-cert.workspace = true
 # Generates a throwaway self-signed cert so the SPKI-extraction test can assert the extracted
 # SubjectPublicKeyInfo is byte-identical to the key pair's own DER.
 rcgen.workspace = true
+# Differential oracle (ADR-0001): the MCS-stage machine tests build realistic *server* frames
+# (Connect-Response, AttachUserConfirm, ChannelJoinConfirm) with ironrdp's encoders and feed
+# them to our state machine — their encoder against our decoder, never our own bytes.
+ironrdp-pdu = "0.8.0"
