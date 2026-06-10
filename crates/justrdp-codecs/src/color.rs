@@ -73,9 +73,12 @@ pub fn bytes_per_pixel(bits_per_pixel: u16) -> Result<usize, ColorError> {
 ///
 /// `bottom_up` says the source scanlines run bottom-to-top — true for uncompressed and
 /// interleaved-RLE-decompressed slow-path bitmap data (the GDI legacy layout) — and makes
-/// this function flip them. The source stride is exactly `width × bytes-per-pixel` (slow-path
-/// bitmap data is padded to whole pixels per row by `width`/`height`, not to a byte
-/// alignment).
+/// this function flip them. The source stride is assumed to be exactly
+/// `width × bytes-per-pixel`. MS-RDPBCGR 2.2.9.1.1.3.1.2.2 pads each uncompressed row to a
+/// multiple of four *bytes*; real servers satisfy that by 4-aligning the `width` field itself
+/// (the up-to-3-pixel overhang), which makes the tight stride hold at every supported depth.
+/// A spec-legal but non-4-aligned width at 8/24 bpp would carry per-row pad bytes this
+/// function does not skip.
 pub fn to_rgba(
     src: &[u8],
     width: usize,

@@ -158,7 +158,9 @@ pub enum Action {
     StartNla {
         /// The protocol the server chose in the X.224 Connection Confirm.
         selected: SecurityProtocol,
-        /// The server's `subjectPublicKey` (DER `SubjectPublicKeyInfo`) for CredSSP to bind to.
+        /// The server's `subjectPublicKey` for CredSSP to bind to — the inner BIT STRING
+        /// contents of the `SubjectPublicKeyInfo` (for RSA, the DER `RSAPublicKey`), **not**
+        /// the whole SPKI (see `tls::extract_subject_public_key`).
         server_public_key: Vec<u8>,
     },
     /// HYBRID_EX only: the CredSSP exchange finished and the server will now send the 4-byte
