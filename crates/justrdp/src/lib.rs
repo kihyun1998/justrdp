@@ -9,6 +9,7 @@
 
 pub mod connect;
 mod dvc;
+mod egfx;
 pub mod framebuffer;
 pub mod input;
 pub mod license_crypto;

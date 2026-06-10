@@ -13,6 +13,7 @@ pub mod client_info;
 pub mod cursor;
 pub mod displaycontrol;
 pub mod dvc;
+pub mod egfx;
 pub mod error;
 pub mod fastpath;
 pub mod finalization;
