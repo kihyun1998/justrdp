@@ -20,7 +20,7 @@ use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::egfx::{Clear, Progressive, Zgfx};
 use justrdp_codecs::planar;
 use justrdp_pdu::DecodeError;
-use justrdp_pdu::egfx::{self, EgfxPdu, Point16, Rect16};
+use justrdp_pdu::egfx::{self, EgfxPdu, Rect16};
 
 /// Per-axis cap on surface dimensions. The spec ceiling is 32766 (MS-RDPEGFX 2.2.2.14); real
 /// surfaces track the desktop. The cap bounds a hostile CreateSurface before allocation.
@@ -57,6 +57,21 @@ impl Surface {
         usize::from(width) * usize::from(height) * 4
     }
 
+    /// Record a touched region, eagerly collapsing to one bounding box past
+    /// [`MAX_DIRTY_RECTS`] — a server that delays its End Frame (or floods SolidFill rects)
+    /// must not grow the list without bound (the allocation-cap discipline).
+    fn mark_dirty(&mut self, rect: DirtyRect) {
+        self.dirty.push(rect);
+        if self.dirty.len() > MAX_DIRTY_RECTS {
+            let left = self.dirty.iter().map(|r| r.0).min().unwrap_or(0);
+            let top = self.dirty.iter().map(|r| r.1).min().unwrap_or(0);
+            let right = self.dirty.iter().map(|r| r.0.saturating_add(r.2)).max().unwrap_or(0);
+            let bottom = self.dirty.iter().map(|r| r.1.saturating_add(r.3)).max().unwrap_or(0);
+            self.dirty.clear();
+            self.dirty.push((left, top, right - left, bottom - top));
+        }
+    }
+
     /// Copy `src` (RGBA, `src_stride_px` pixels per row, `copy_w × copy_h`) to `(x, y)`,
     /// clipping to the surface; negative destinations clip the source accordingly.
     fn blit(&mut self, x: i32, y: i32, copy_w: u16, copy_h: u16, src: &[u8], src_stride_px: usize) {
@@ -83,7 +98,7 @@ impl Surface {
             let dst_off = (dst_y + row) * stride + dst_x * 4;
             self.rgba[dst_off..dst_off + w * 4].copy_from_slice(src_row);
         }
-        self.dirty.push((dst_x as u16, dst_y as u16, w as u16, h as u16));
+        self.mark_dirty((dst_x as u16, dst_y as u16, w as u16, h as u16));
     }
 
     /// Extract a rectangle (clipped) as `(width, height, tight RGBA)`.
@@ -115,7 +130,7 @@ impl Surface {
                 px.copy_from_slice(&rgba);
             }
         }
-        self.dirty.push((x, y, w, h));
+        self.mark_dirty((x, y, w, h));
     }
 }
 
@@ -297,7 +312,7 @@ impl GraphicsProcessor {
                     surface.mapped = Some((origin_x, origin_y));
                     // Repaint the whole surface at its new position.
                     let (w, h) = (surface.width, surface.height);
-                    surface.dirty.push((0, 0, w, h));
+                    surface.mark_dirty((0, 0, w, h));
                 }
             }
             EgfxPdu::StartFrame { frame_id } => {
@@ -364,9 +379,11 @@ impl GraphicsProcessor {
                 ) else {
                     return Ok(());
                 };
-                let surface = self
-                    .surface_mut(surface_id)
-                    .expect("looked up above; surfaces unchanged since");
+                // Re-fetched rather than held across the decode (borrow split with the
+                // progressive decoder); a vanished surface is a skip, never a panic.
+                let Some(surface) = self.surface_mut(surface_id) else {
+                    return Ok(());
+                };
                 for tile in tiles {
                     surface.blit(
                         i32::from(tile.x_idx) * 64,
@@ -477,15 +494,7 @@ impl GraphicsProcessor {
                 surface.dirty.clear(); // off-screen scratch surface: nothing to show yet
                 continue;
             };
-            let mut rects = core::mem::take(&mut surface.dirty);
-            if rects.len() > MAX_DIRTY_RECTS {
-                // Collapse to the bounding box: one big frame beats hundreds of tiny ones.
-                let left = rects.iter().map(|r| r.0).min().unwrap_or(0);
-                let top = rects.iter().map(|r| r.1).min().unwrap_or(0);
-                let right = rects.iter().map(|r| r.0 + r.2).max().unwrap_or(0);
-                let bottom = rects.iter().map(|r| r.1 + r.3).max().unwrap_or(0);
-                rects = vec![(left, top, right - left, bottom - top)];
-            }
+            let rects = core::mem::take(&mut surface.dirty);
             for (x, y, w, h) in rects {
                 let (w, h, pixels) = {
                     let stride = usize::from(surface.width) * 4;
@@ -501,9 +510,11 @@ impl GraphicsProcessor {
                 if w == 0 || h == 0 {
                     continue;
                 }
-                let (Ok(out_x), Ok(out_y)) = (
-                    u16::try_from(ox + u32::from(x)),
-                    u16::try_from(oy + u32::from(y)),
+                // `ox`/`oy` are attacker-controlled u32s from MapSurfaceToOutput: the sum
+                // must neither overflow nor exceed the addressable output.
+                let (Some(out_x), Some(out_y)) = (
+                    ox.checked_add(u32::from(x)).and_then(|v| u16::try_from(v).ok()),
+                    oy.checked_add(u32::from(y)).and_then(|v| u16::try_from(v).ok()),
                 ) else {
                     continue; // mapped beyond the addressable output: nothing visible
                 };
@@ -562,9 +573,6 @@ impl DvcProcessor for GraphicsProcessor {
         *self = GraphicsProcessor::default();
     }
 }
-
-/// `Point16` is consumed via `i32` blit coordinates; keep the import obviously used.
-const _: fn(Point16) = |_| {};
 
 #[cfg(test)]
 mod tests {
@@ -833,5 +841,49 @@ mod tests {
     fn garbage_zgfx_is_a_typed_error() {
         let mut p = GraphicsProcessor::default();
         assert!(p.process(&[0x12, 0x34]).is_err());
+    }
+
+    #[test]
+    fn hostile_map_origin_does_not_overflow_or_emit() {
+        // A u32::MAX output origin must neither panic (debug overflow) nor produce frames —
+        // the surface is mapped beyond the addressable output.
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 4, 4);
+        assert!(map_surface(&mut p, 1, u32::MAX, u32::MAX).is_empty());
+        let outputs = feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [1, 1, 1, 0], [0, 0, 4, 4]),
+        );
+        assert!(outputs.is_empty(), "unaddressable mapping must drop frames, got {outputs:?}");
+    }
+
+    #[test]
+    fn dirty_rects_collapse_past_the_cap_without_unbounded_growth() {
+        // 100 tiny fills inside one never-ending frame: the dirty list must collapse to a
+        // bounding box instead of growing per rect, and the EndFrame flush stays small.
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 256, 2);
+        map_surface(&mut p, 1, 0, 0);
+        let mut start = vec![0u8; 8];
+        start[4..8].copy_from_slice(&1u32.to_le_bytes());
+        feed(&mut p, egfx::CMDID_START_FRAME, &start);
+        for i in 0..100u16 {
+            assert!(feed(
+                &mut p,
+                egfx::CMDID_SOLID_FILL,
+                &solid_fill_body(1, [9, 9, 9, 0], [i * 2, 0, i * 2 + 1, 1]),
+            )
+            .is_empty());
+        }
+        assert!(
+            p.surfaces[0].dirty.len() <= MAX_DIRTY_RECTS + 1,
+            "dirty list grew unbounded: {}",
+            p.surfaces[0].dirty.len()
+        );
+        let outputs = feed(&mut p, egfx::CMDID_END_FRAME, &1u32.to_le_bytes());
+        // A handful of frames (collapsed regions) plus the ack — not one per fill.
+        assert!(outputs.len() <= MAX_DIRTY_RECTS + 2, "got {} outputs", outputs.len());
+        assert!(matches!(outputs.last(), Some(Out::Send(_))), "ack must close the frame");
     }
 }
