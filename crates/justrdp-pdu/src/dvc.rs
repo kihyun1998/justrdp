@@ -28,9 +28,14 @@ pub const CMD_CAPABILITIES: u8 = 0x05;
 /// one 1600-byte SVC chunk.
 pub const MAX_DATA_CHUNK: usize = 1590;
 
-/// The capabilities version justrdp answers with: version 1 — no compressed data PDUs, no
-/// soft-sync, which none of the channels justrdp opens require.
-pub const CAPS_VERSION: u16 = 1;
+/// The capabilities version justrdp answers with: version 3 (capped at the server's offer).
+/// The server-side Graphics channel manager refuses to run over a version-1 transport
+/// (proven on the real VM: a V1 caps response gets the connection reset right after the EGFX
+/// caps advertise; V3 proceeds). The V3 features stay dormant in practice: compressed data
+/// PDUs are not used for EGFX (its payload is already zgfx-compressed end to end), and
+/// soft-sync only occurs when GCC multitransport is advertised, which justrdp does not send.
+/// Both arrive as `Unsupported` and are skipped if a server violates that.
+pub const CAPS_VERSION: u16 = 3;
 
 /// One decoded drdynvc message (the server→client direction plus the fields shared by both).
 #[derive(Debug, Clone, PartialEq, Eq)]

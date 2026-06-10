@@ -8,6 +8,8 @@
 //! machine feeds the manager SVC payloads and wraps whatever it wants sent; this module never
 //! sees MCS framing.
 
+use crate::egfx::GraphicsProcessor;
+use crate::framebuffer::FrameUpdate;
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::displaycontrol::{self, DisplayControlPdu};
 use justrdp_pdu::dvc::{self, DvcMessage};
@@ -48,12 +50,18 @@ pub(crate) trait DvcProcessor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProcessorOutput {
     /// A complete channel message to send (the manager fragments it into DVC data PDUs).
-    /// Display Control never speaks first, so no production processor constructs this yet —
-    /// the EGFX slice's caps-advertise will; the manager side is live and test-covered.
-    #[allow(dead_code)]
     Send(Vec<u8>),
     /// Display Control: the server's caps arrived — resize requests are valid now.
     DisplayControlCaps(displaycontrol::Caps),
+    /// EGFX: fresh pixels in output coordinates for the session framebuffer.
+    Frame(FrameUpdate),
+    /// EGFX: the server reset the output size (ResetGraphics).
+    OutputResized {
+        /// New output width in pixels.
+        width: u16,
+        /// New output height in pixels.
+        height: u16,
+    },
 }
 
 /// What the manager wants done after consuming one SVC payload, in order.
@@ -64,6 +72,15 @@ pub(crate) enum DvcEvent {
     /// The Display Control channel is open and the server's caps arrived: resize requests
     /// are valid from now on.
     DisplayControlReady,
+    /// EGFX pixels in output coordinates (the session machine blits its framebuffer).
+    Frame(FrameUpdate),
+    /// EGFX output resize (the session machine rebuilds its framebuffer).
+    OutputResized {
+        /// New output width in pixels.
+        width: u16,
+        /// New output height in pixels.
+        height: u16,
+    },
 }
 
 /// The Display Control channel processor (MS-RDPEDISP): consumes the server's Caps PDU —
@@ -149,7 +166,10 @@ impl core::fmt::Debug for Drdynvc {
 impl Default for Drdynvc {
     fn default() -> Self {
         Self {
-            processors: vec![Box::new(DisplayControlProcessor::default())],
+            processors: vec![
+                Box::new(DisplayControlProcessor::default()),
+                Box::new(GraphicsProcessor::default()),
+            ],
             open: Vec::new(),
             svc_buffer: Vec::new(),
             svc_in_flight: false,
@@ -210,15 +230,15 @@ impl Drdynvc {
     fn on_dvc_pdu(&mut self, pdu: &[u8]) -> Result<Vec<DvcEvent>, DecodeError> {
         match DvcMessage::decode(pdu)? {
             DvcMessage::CapabilitiesRequest { version } => {
+                let answered = version.min(dvc::CAPS_VERSION);
                 tracing::debug!(
                     target: "rdp_drdynvc",
                     server_version = version,
-                    answered = dvc::CAPS_VERSION,
+                    answered,
                     "DYNVC capabilities request"
                 );
-                // The server's version is always ≥ ours; answer with what we implement.
                 Ok(vec![DvcEvent::Send(dvc::encode_capabilities_response(
-                    dvc::CAPS_VERSION,
+                    answered,
                 ))])
             }
             DvcMessage::CreateRequest { channel_id, name } => {
@@ -345,6 +365,10 @@ impl Drdynvc {
                     self.display_control = Some((channel_id, caps));
                     events.push(DvcEvent::DisplayControlReady);
                 }
+                ProcessorOutput::Frame(frame) => events.push(DvcEvent::Frame(frame)),
+                ProcessorOutput::OutputResized { width, height } => {
+                    events.push(DvcEvent::OutputResized { width, height });
+                }
             }
         }
         events
@@ -389,12 +413,20 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_request_is_answered_with_version_1() {
+    fn capabilities_request_is_answered_with_min_of_server_and_ours() {
         let mut manager = Drdynvc::default();
+        // Server offers 3, we support 3 → answer 3.
         let events = feed(&mut manager, &caps_request());
         assert_eq!(
             events,
-            vec![DvcEvent::Send(dvc::encode_capabilities_response(1))]
+            vec![DvcEvent::Send(dvc::encode_capabilities_response(3))]
+        );
+        // Server offers 2 → answer is capped at the server's offer.
+        let mut manager = Drdynvc::default();
+        let events = feed(&mut manager, &[0x50, 0x00, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            events,
+            vec![DvcEvent::Send(dvc::encode_capabilities_response(2))]
         );
     }
 
@@ -422,7 +454,7 @@ mod tests {
     #[test]
     fn unknown_channels_are_refused() {
         let mut manager = Drdynvc::default();
-        let events = feed(&mut manager, &create_request(9, "Microsoft::Windows::RDS::Graphics"));
+        let events = feed(&mut manager, &create_request(9, "Microsoft::Windows::RDS::Geometry"));
         let [DvcEvent::Send(response)] = events.as_slice() else {
             panic!("expected one response, got {events:?}");
         };
