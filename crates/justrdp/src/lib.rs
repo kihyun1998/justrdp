@@ -8,9 +8,10 @@
 //! ADR-0003 (phased codecs), and `docs/plan.md`.
 
 pub mod connect;
+pub mod license_crypto;
 pub mod tls;
 
 pub use connect::{
-    Action, ClientInfoConfig, ConnectConfig, ConnectError, ConnectStateMachine, Event, EventKind,
-    McsConnectResult, StaticChannel,
+    Action, ActivationResult, ClientInfoConfig, ConnectConfig, ConnectError, ConnectStateMachine,
+    Event, EventKind, LicenseConfig, LicenseEntropy, McsConnectResult, StaticChannel,
 };

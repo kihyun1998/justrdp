@@ -8,13 +8,17 @@
 //! (sans-IO state machine core).
 
 pub mod ber;
+pub mod capability;
 pub mod client_info;
 pub mod cursor;
 pub mod error;
+pub mod finalization;
 pub mod gcc;
+pub mod license;
 pub mod mcs;
 pub mod nego;
 pub mod per;
+pub mod share;
 pub mod tpkt;
 pub mod x224;
 
