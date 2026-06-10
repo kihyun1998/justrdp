@@ -1192,7 +1192,7 @@ mod tests {
         let [SessionOutput::WriteBytes(frame)] = outputs.as_slice() else {
             panic!("expected one response frame, got {outputs:?}");
         };
-        // The response embeds the SVC-chunked version-1 caps response and rides the
+        // The response embeds the SVC-chunked version-3 caps response and rides the
         // drdynvc channel (big-endian MCS channelId).
         let expected_chunk = &svc::encode_chunks(&dvc::encode_capabilities_response(3))[0];
         assert!(frame.windows(expected_chunk.len()).any(|w| w == expected_chunk.as_slice()));
