@@ -12,7 +12,8 @@ use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::{planar, rle};
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
-use justrdp_pdu::{fastpath, finalization, mcs, share, tpkt, update, x224};
+use justrdp_pdu::input::InputEvent;
+use justrdp_pdu::{fastpath, finalization, input, mcs, share, tpkt, update, x224};
 
 /// Everything the session machine needs from the completed connect sequence: channel
 /// addressing from [`crate::McsConnectResult`], the share state from
@@ -31,6 +32,11 @@ pub struct SessionConfig {
     pub desktop_size: (u16, u16),
     /// The Confirm Active capability sets (caller-owned, verbatim — plan.md §0).
     pub capabilities: Vec<CapabilitySet>,
+    /// The server's `inputFlags` from its Demand Active Input capability set
+    /// ([`crate::ActivationResult::server_capabilities`]). Selects the input transport:
+    /// fast-path when the server advertised `INPUT_FLAG_FASTPATH_INPUT`/`INPUT2`, the
+    /// slow-path Input Event PDU otherwise.
+    pub server_input_flags: u16,
 }
 
 /// One effect of feeding bytes to the machine, in order.
@@ -429,15 +435,85 @@ impl SessionStateMachine {
         Ok(())
     }
 
+    /// Encode host input events into complete outbound wire frames (plan.md §6a). The
+    /// transport is chosen from what the server's Input capability set advertised: fast-path
+    /// input PDUs when `INPUT_FLAG_FASTPATH_INPUT`/`INPUT2` was set, the slow-path Input
+    /// Event PDU otherwise. Batches over a single PDU's event bound are split automatically
+    /// (the fast-path spill rule), and mouse coordinates are clamped to the current desktop —
+    /// a stale coordinate from a pre-resize host event must not land outside the new desktop.
+    ///
+    /// The adapter writes the returned frames to the socket in order. Pure function of the
+    /// machine's negotiated state: no I/O, no phase change (servers accept input during
+    /// reactivation; they simply ignore what no longer applies).
+    pub fn encode_input(&self, events: &[InputEvent]) -> Vec<Vec<u8>> {
+        if events.is_empty() {
+            return Vec::new();
+        }
+        let (max_x, max_y) = (
+            self.config.desktop_size.0.saturating_sub(1),
+            self.config.desktop_size.1.saturating_sub(1),
+        );
+        let events: Vec<InputEvent> = events
+            .iter()
+            .map(|event| match *event {
+                InputEvent::Mouse {
+                    flags,
+                    wheel_units,
+                    x,
+                    y,
+                } => InputEvent::Mouse {
+                    flags,
+                    wheel_units,
+                    x: x.min(max_x),
+                    y: y.min(max_y),
+                },
+                InputEvent::MouseX { flags, x, y } => InputEvent::MouseX {
+                    flags,
+                    x: x.min(max_x),
+                    y: y.min(max_y),
+                },
+                other => other,
+            })
+            .collect();
+
+        let fastpath_input = self.config.server_input_flags
+            & (capability::INPUT_FLAG_FASTPATH_INPUT | capability::INPUT_FLAG_FASTPATH_INPUT2)
+            != 0;
+        if fastpath_input {
+            // 255 events is the numEvents field bound; at ≤7 wire bytes per event a full
+            // chunk stays far below the 0x7FFF length-field ceiling.
+            events
+                .chunks(255)
+                .map(input::encode_fastpath_input)
+                .collect()
+        } else {
+            events
+                .chunks(255)
+                .map(|chunk| {
+                    self.wrap_io(&share::encode_share_data(
+                        self.config.user_channel_id,
+                        self.config.share_id,
+                        share::STREAM_HI,
+                        share::PDU_TYPE2_INPUT,
+                        &input::encode_slowpath_input_body(chunk),
+                    ))
+                })
+                .collect()
+        }
+    }
+
     /// Wrap an I/O-channel payload into a complete outbound frame.
-    fn send_io(&self, payload: &[u8]) -> SessionOutput {
-        SessionOutput::WriteBytes(tpkt::encode(&x224::encode_data(
-            &mcs::encode_send_data_request(
-                self.config.user_channel_id,
-                self.config.io_channel_id,
-                payload,
-            ),
+    fn wrap_io(&self, payload: &[u8]) -> Vec<u8> {
+        tpkt::encode(&x224::encode_data(&mcs::encode_send_data_request(
+            self.config.user_channel_id,
+            self.config.io_channel_id,
+            payload,
         )))
+    }
+
+    /// Wrap an I/O-channel payload into an outbound [`SessionOutput`].
+    fn send_io(&self, payload: &[u8]) -> SessionOutput {
+        SessionOutput::WriteBytes(self.wrap_io(payload))
     }
 }
 
@@ -456,6 +532,8 @@ mod tests {
             share_id: SHARE,
             desktop_size: (16, 8),
             capabilities: capability::default_client_capabilities(&test_core()),
+            server_input_flags: capability::INPUT_FLAG_SCANCODES
+                | capability::INPUT_FLAG_FASTPATH_INPUT2,
         }
     }
 
@@ -822,6 +900,85 @@ mod tests {
         body.extend_from_slice(&[0xAB, 0xCD]);
         let frame = tpkt::encode(&x224::encode_data(&body));
         assert!(sm.process_bytes(&frame).unwrap().is_empty());
+    }
+
+    #[test]
+    fn input_uses_fastpath_when_the_server_advertised_it() {
+        let sm = SessionStateMachine::new(config(), Vec::new());
+        let frames = sm.encode_input(&[InputEvent::ScanCode {
+            code: 0x1E,
+            release: false,
+            extended: false,
+            extended1: false,
+        }]);
+        assert_eq!(frames.len(), 1);
+        // A fast-path frame, not a TPKT frame.
+        assert!(fastpath::is_fastpath(frames[0][0]));
+        assert_eq!(frames[0], input::encode_fastpath_input(&[InputEvent::ScanCode {
+            code: 0x1E,
+            release: false,
+            extended: false,
+            extended1: false,
+        }]));
+    }
+
+    #[test]
+    fn input_falls_back_to_slowpath_without_the_server_flag() {
+        let mut cfg = config();
+        cfg.server_input_flags = capability::INPUT_FLAG_SCANCODES;
+        let sm = SessionStateMachine::new(cfg, Vec::new());
+        let event = InputEvent::Mouse {
+            flags: input::PTRFLAGS_MOVE,
+            wheel_units: 0,
+            x: 3,
+            y: 4,
+        };
+        let frames = sm.encode_input(&[event]);
+        assert_eq!(frames.len(), 1);
+        let frame = &frames[0];
+        // A TPKT frame wrapping MCS → Share Data PDU_TYPE2_INPUT with our event inside.
+        assert_eq!(frame[0], 0x03);
+        assert_eq!(justrdp_pdu::tpkt::frame_len(frame).unwrap(), frame.len());
+        let body = input::encode_slowpath_input_body(&[event]);
+        assert!(
+            frame.windows(body.len()).any(|w| w == body),
+            "slow-path frame does not embed the input body"
+        );
+    }
+
+    #[test]
+    fn input_mouse_coordinates_clamp_to_the_desktop() {
+        let sm = SessionStateMachine::new(config(), Vec::new()); // 16×8 desktop
+        let frames = sm.encode_input(&[InputEvent::Mouse {
+            flags: input::PTRFLAGS_MOVE,
+            wheel_units: 0,
+            x: 500,
+            y: 500,
+        }]);
+        // Fast-path: header(1) + len(1) + eventHeader(1) + flags(2) + x(2) + y(2).
+        let frame = &frames[0];
+        assert_eq!(u16::from_le_bytes([frame[5], frame[6]]), 15);
+        assert_eq!(u16::from_le_bytes([frame[7], frame[8]]), 7);
+    }
+
+    #[test]
+    fn input_batches_over_255_events_spill_into_multiple_pdus() {
+        let sm = SessionStateMachine::new(config(), Vec::new());
+        let events = vec![
+            InputEvent::ScanCode {
+                code: 0x1E,
+                release: false,
+                extended: false,
+                extended1: false,
+            };
+            300
+        ];
+        let frames = sm.encode_input(&events);
+        assert_eq!(frames.len(), 2);
+        // 255 + 45 events; both frames self-describe their length correctly.
+        assert_eq!(fastpath::frame_len(&frames[0]).unwrap(), frames[0].len());
+        assert_eq!(fastpath::frame_len(&frames[1]).unwrap(), frames[1].len());
+        assert!(sm.encode_input(&[]).is_empty());
     }
 
     #[test]

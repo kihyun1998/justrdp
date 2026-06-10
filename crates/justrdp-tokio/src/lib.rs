@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use justrdp::{
     Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, Event,
-    FrameUpdate, LicenseEntropy, McsConnectResult, SessionError, SessionOutput,
+    FrameUpdate, InputEvent, LicenseEntropy, McsConnectResult, SessionError, SessionOutput,
     SessionStateMachine,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -533,9 +533,31 @@ impl core::error::Error for SessionFailure {}
 pub async fn run_session(
     stream: &mut TlsStream<TcpStream>,
     machine: &mut SessionStateMachine,
+    on_frame: impl FnMut(&FrameUpdate),
+) -> Result<(), SessionFailure> {
+    // A pre-closed input channel: the input branch disables itself on the first (None) recv.
+    let (_, mut input) = tokio::sync::mpsc::channel(1);
+    run_session_with_input(stream, machine, on_frame, &mut input).await
+}
+
+/// [`run_session`] plus host input: batches of [`InputEvent`]s received on `input` are encoded
+/// by the machine ([`SessionStateMachine::encode_input`] — fast-path when the server advertised
+/// it, the slow-path Input Event PDU otherwise) and written to the socket, interleaved with the
+/// inbound graphics processing.
+///
+/// The host side holds the `mpsc::Sender`: a UI thread queues scancodes
+/// ([`justrdp::Scancode`]'s press/release events), mouse events, and toggle syncs (send one
+/// [`InputEvent::Sync`] with the OS lock state — [`keyboard_toggle_flags`] on Windows — right
+/// after the session starts, and again whenever a lock LED changes). Closing the channel
+/// disables the input branch; the session keeps running output-only.
+pub async fn run_session_with_input(
+    stream: &mut TlsStream<TcpStream>,
+    machine: &mut SessionStateMachine,
     mut on_frame: impl FnMut(&FrameUpdate),
+    input: &mut tokio::sync::mpsc::Receiver<Vec<InputEvent>>,
 ) -> Result<(), SessionFailure> {
     let mut readbuf = [0u8; 16 * 1024];
+    let mut input_open = true;
     // Drain bytes the connect sequence already buffered (ActivationResult::leftover, handed
     // to SessionStateMachine::new) before the first socket read.
     let mut pending = machine.process_bytes(&[]).map_err(SessionFailure::Protocol)?;
@@ -557,14 +579,62 @@ pub async fn run_session(
                 }
             }
         }
-        let n = stream.read(&mut readbuf).await.map_err(SessionFailure::Io)?;
-        if n == 0 {
-            return Ok(()); // orderly server close
+        tokio::select! {
+            received = stream.read(&mut readbuf) => {
+                let n = received.map_err(SessionFailure::Io)?;
+                if n == 0 {
+                    return Ok(()); // orderly server close
+                }
+                pending = machine
+                    .process_bytes(&readbuf[..n])
+                    .map_err(SessionFailure::Protocol)?;
+            }
+            events = input.recv(), if input_open => {
+                match events {
+                    Some(events) => {
+                        for frame in machine.encode_input(&events) {
+                            tracing::trace!(
+                                events = events.len(),
+                                bytes = frame.len(),
+                                "input pdu"
+                            );
+                            stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                        }
+                    }
+                    // Sender dropped: stop polling the channel, keep the session alive.
+                    None => input_open = false,
+                }
+            }
         }
-        pending = machine
-            .process_bytes(&readbuf[..n])
-            .map_err(SessionFailure::Protocol)?;
     }
+}
+
+/// The current keyboard lock state as [`InputEvent::Sync`] toggle flags, read from the OS
+/// (Windows: `GetKeyState`'s low-order toggle bit — no extra dependency, `user32` is always
+/// present). Send a sync event carrying these right after the session starts, and again on
+/// LED changes, so the server's modifier state matches the host's
+/// (MS-RDPBCGR 2.2.8.1.2.2.5).
+#[cfg(windows)]
+pub fn keyboard_toggle_flags() -> u8 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetKeyState(nVirtKey: i32) -> i16;
+    }
+    const VK_CAPITAL: i32 = 0x14;
+    const VK_NUMLOCK: i32 = 0x90;
+    const VK_SCROLL: i32 = 0x91;
+    let toggled = |vk| unsafe { GetKeyState(vk) } & 0x0001 != 0;
+    let mut flags = 0;
+    if toggled(VK_SCROLL) {
+        flags |= justrdp_pdu::input::SYNC_SCROLL_LOCK;
+    }
+    if toggled(VK_NUMLOCK) {
+        flags |= justrdp_pdu::input::SYNC_NUM_LOCK;
+    }
+    if toggled(VK_CAPITAL) {
+        flags |= justrdp_pdu::input::SYNC_CAPS_LOCK;
+    }
+    flags
 }
 
 /// Await `fut` under the stage's timeout, mapping the outcome into a [`ConnectFailure`]: an I/O
@@ -1445,6 +1515,31 @@ mod tests {
         );
     }
 
+    /// Assemble the [`justrdp::SessionConfig`] from a connect outcome — including the server's
+    /// Input capability flags, which pick the input transport (fast-path vs slow-path).
+    fn session_config_from(
+        outcome: &ConnectOutcome,
+        capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
+    ) -> justrdp::SessionConfig {
+        let server_input_flags = outcome
+            .activation
+            .server_capabilities
+            .iter()
+            .find_map(|set| match set {
+                justrdp_pdu::capability::CapabilitySet::Input(input) => Some(input.input_flags),
+                _ => None,
+            })
+            .unwrap_or(0);
+        justrdp::SessionConfig {
+            user_channel_id: outcome.mcs.user_channel_id,
+            io_channel_id: outcome.mcs.io_channel_id,
+            share_id: outcome.activation.share_id,
+            desktop_size: outcome.activation.desktop_size,
+            capabilities,
+            server_input_flags,
+        }
+    }
+
     /// Real-VM acceptance test for slice-6: connect to session-active, run the session loop,
     /// and verify the first decoded frames actually render the desktop — at least one
     /// FrameUpdate arrives, most of the screen gets painted, and the framebuffer is visibly
@@ -1466,13 +1561,7 @@ mod tests {
             .expect("connect should reach session-active");
 
         let mut machine = SessionStateMachine::new(
-            justrdp::SessionConfig {
-                user_channel_id: outcome.mcs.user_channel_id,
-                io_channel_id: outcome.mcs.io_channel_id,
-                share_id: outcome.activation.share_id,
-                desktop_size: outcome.activation.desktop_size,
-                capabilities: session_capabilities,
-            },
+            session_config_from(&outcome, session_capabilities),
             outcome.activation.leftover,
         );
         let mut stream = outcome.stream;
@@ -1530,4 +1619,284 @@ mod tests {
         std::fs::write(&path, ppm).expect("write the visual dump");
         eprintln!("visual dump for confirmation: {}", path.display());
     }
+
+    /// Credentials from the environment for the real-VM tests.
+    fn vm_credentials() -> Credentials {
+        Credentials {
+            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
+            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
+            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
+        }
+    }
+
+    /// Queue one press+release pair for the key a Windows VK maps to.
+    fn tap(vk: u16) -> Vec<InputEvent> {
+        let sc = justrdp::input::scancode_from_windows_vk(vk)
+            .unwrap_or_else(|| panic!("VK {vk:#04x} should map to a set-1 scancode"));
+        vec![sc.press(), sc.release()]
+    }
+
+    /// Real-VM acceptance test for slice-7: keyboard + mouse input over fast-path. Clicks
+    /// the Start button (mouse), types "notepad" into the Start search and Enter to launch
+    /// it, then types "aaa" (every keystroke through the VK→set-1 table) and scrolls the
+    /// wheel — verifying the server *visibly responds* at each step: graphics traffic spikes
+    /// after the input (a settled desktop paints nothing on its own) and the session survives
+    /// 30+ mixed events. A PPM dump (Notepad showing "aaa") is written for human confirmation.
+    ///
+    /// The launch goes through the Start menu rather than Win+R: this VM ignores the Windows
+    /// logo key (probed in isolation — every other key class works: plain scancodes, the
+    /// extended-flagged Apps/arrow keys, all mouse paths — so the policy sits server-side,
+    /// not in the encoding, which the ironrdp byte-differential pins down).
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn keyboard_and_mouse_input_drive_the_real_vm() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let config = legacy_graphics_config();
+        let session_capabilities = config.capabilities.clone();
+        let outcome = connect(addr, config, vm_credentials(), |_| {})
+            .await
+            .expect("connect should reach session-active");
+        let session_config = session_config_from(&outcome, session_capabilities);
+        assert!(
+            session_config.server_input_flags
+                & (justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT
+                    | justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT2)
+                != 0,
+            "this VM advertises fast-path input; flags={:#06x}",
+            session_config.server_input_flags
+        );
+        let desktop = session_config.desktop_size;
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+        let mut stream = outcome.stream;
+
+        let frames = Arc::new(AtomicUsize::new(0));
+        let frames_in_sink = frames.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+
+        let frames_in_driver = frames.clone();
+        let driver = tokio::spawn(async move {
+            let mut sent = 0usize;
+            let send = |events: Vec<InputEvent>, sent: &mut usize| {
+                *sent += events.len();
+                let tx = tx.clone();
+                async move { tx.send(events).await.expect("session loop alive") }
+            };
+            // Wait for the initial desktop paint to settle (no frames for 2 seconds), so
+            // every later frame delta is attributable to our input alone.
+            let mut last = frames_in_driver.load(Ordering::SeqCst);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let now = frames_in_driver.load(Ordering::SeqCst);
+                if now == last {
+                    break;
+                }
+                last = now;
+            }
+            // Toggle sync first, as a real client would (criterion: lock-state sync on
+            // session start, from the OS's live state).
+            send(
+                vec![InputEvent::Sync {
+                    toggle_flags: keyboard_toggle_flags(),
+                }],
+                &mut sent,
+            )
+            .await;
+            let idle_frames = frames_in_driver.load(Ordering::SeqCst);
+
+            // Mouse: click the Start button (bottom-left corner).
+            let click = |x: u16, y: u16| {
+                vec![
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    },
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_DOWN
+                            | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    },
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    },
+                ]
+            };
+            send(click(24, desktop.1.saturating_sub(20)), &mut sent).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let after_click = frames_in_driver.load(Ordering::SeqCst);
+
+            // Keyboard: type "notepad" into the Start search, Enter to launch it.
+            for vk in [0x4Eu16, 0x4F, 0x54, 0x45, 0x50, 0x41, 0x44] {
+                send(tap(vk), &mut sent).await; // N O T E P A D
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            send(tap(0x0D), &mut sent).await; // Enter
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            for _ in 0..3 {
+                send(tap(0x41), &mut sent).await; // A → "aaa" in Notepad
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            // Wheel scroll for good measure (vertical wheel, both directions).
+            let (cx, cy) = (desktop.0 / 2, desktop.1 / 2);
+            send(
+                vec![
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_WHEEL,
+                        wheel_units: -120,
+                        x: cx,
+                        y: cy,
+                    },
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_WHEEL,
+                        wheel_units: 120,
+                        x: cx,
+                        y: cy,
+                    },
+                ],
+                &mut sent,
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let after_typing = frames_in_driver.load(Ordering::SeqCst);
+            (sent, idle_frames, after_click, after_typing)
+            // tx drops here: the input branch disables, the session stays up.
+        });
+
+        // The timeout is the expected exit — a healthy session never ends on its own.
+        let ended = tokio::time::timeout(
+            Duration::from_secs(40),
+            run_session_with_input(
+                &mut stream,
+                &mut machine,
+                |_| {
+                    frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                },
+                &mut rx,
+            ),
+        )
+        .await;
+        if let Ok(result) = ended {
+            result.expect("session failed while input was in flight");
+            panic!("server closed the session during the input exchange");
+        }
+        let (sent, idle_frames, after_click, after_typing) =
+            driver.await.expect("input driver");
+
+        eprintln!(
+            "sent {sent} input events; frames: settled={idle_frames} → after click={after_click} \
+             → after typing={after_typing}"
+        );
+        // 10+ mixed events were sent and the session survived them (the timeout fired with
+        // no protocol error)…
+        assert!(sent >= 10, "expected to send 10+ events, sent {sent}");
+        // …the *mouse* visibly responded (the Start menu painted after the click)…
+        assert!(
+            after_click > idle_frames,
+            "no graphics followed the Start-button click ({idle_frames} → {after_click})"
+        );
+        // …and the *keyboard* visibly responded (search results / Notepad painted), where a
+        // settled desktop paints nothing on its own.
+        assert!(
+            after_typing > after_click,
+            "no graphics followed the typing ({after_click} → {after_typing})"
+        );
+
+        // Visual confirmation artifact: Notepad with "aaa" typed into it.
+        let fb = machine.framebuffer();
+        let path = std::env::temp_dir().join("justrdp-slice7-input.ppm");
+        let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+        for px in fb.pixels().chunks_exact(4) {
+            ppm.extend_from_slice(&px[..3]);
+        }
+        std::fs::write(&path, ppm).expect("write the visual dump");
+        eprintln!("visual dump for confirmation: {}", path.display());
+    }
+
+    /// Real-VM test for the slow-path input fallback: force `server_input_flags` to
+    /// scancodes-only so the machine wraps the same events in slow-path Input Event PDUs
+    /// (TS_INPUT_PDU_DATA over the share/MCS stack), and verify the live server accepts them —
+    /// graphics follow the input and the session survives.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn slowpath_input_fallback_works_on_the_real_vm() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let config = legacy_graphics_config();
+        let session_capabilities = config.capabilities.clone();
+        let outcome = connect(addr, config, vm_credentials(), |_| {})
+            .await
+            .expect("connect should reach session-active");
+        let mut session_config = session_config_from(&outcome, session_capabilities);
+        // The fallback seam under test: pretend the server never advertised fast-path input.
+        session_config.server_input_flags = justrdp_pdu::capability::INPUT_FLAG_SCANCODES;
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+        let mut stream = outcome.stream;
+
+        let frames = Arc::new(AtomicUsize::new(0));
+        let frames_in_sink = frames.clone();
+        let frames_in_driver = frames.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(16);
+        let driver = tokio::spawn(async move {
+            // Same settle-then-measure protocol as the fast-path test.
+            let mut last = frames_in_driver.load(Ordering::SeqCst);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let now = frames_in_driver.load(Ordering::SeqCst);
+                if now == last {
+                    break;
+                }
+                last = now;
+            }
+            tx.send(vec![InputEvent::Sync { toggle_flags: 0 }])
+                .await
+                .expect("session loop alive");
+            let idle_frames = frames_in_driver.load(Ordering::SeqCst);
+            // Apps key (context menu) then Escape: a visible open/close round trip carried
+            // entirely over slow-path Input Event PDUs.
+            let apps = justrdp::input::scancode_from_windows_vk(0x5D).unwrap();
+            tx.send(vec![apps.press(), apps.release()])
+                .await
+                .expect("session loop alive");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            tx.send(tap(0x1B)).await.expect("session loop alive"); // Escape closes it
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            (idle_frames, frames_in_driver.load(Ordering::SeqCst))
+        });
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(25),
+            run_session_with_input(
+                &mut stream,
+                &mut machine,
+                |_| {
+                    frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                },
+                &mut rx,
+            ),
+        )
+        .await;
+        if let Ok(result) = ended {
+            result.expect("session failed while slow-path input was in flight");
+            panic!("server closed the session during slow-path input");
+        }
+        let (idle_frames, after_frames) = driver.await.expect("input driver");
+        eprintln!("slow-path: frames before input {idle_frames}, after {after_frames}");
+        assert!(
+            after_frames > idle_frames,
+            "the server did not respond to slow-path input ({idle_frames} → {after_frames})"
+        );
+    }
 }
+
