@@ -13,6 +13,8 @@ justrdp-pdu.workspace = true
 # the socket and the host-input mpsc channel. Without them the lib only compiled via
 # dev-dependency feature unification (tests passed, standalone `cargo check` did not).
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros"] }
+# Cancel-aware session teardown (slice-8): the host signals stop via CancellationToken.
+tokio-util = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }
 # TLS upgrade (slice-2): the adapter owns the rustls handshake (the sans-IO core never sees TLS
 # records — plan.md §3). `rustls` re-exported via `tokio-rustls`.

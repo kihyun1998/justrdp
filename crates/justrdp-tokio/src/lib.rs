@@ -35,6 +35,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+// Re-exported so hosts cancel sessions without naming tokio-util themselves.
+pub use tokio_util::sync::CancellationToken;
 
 /// Timeout for the TCP dial.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -577,6 +579,11 @@ pub async fn run_session_with_input(
                 SessionOutput::WriteBytes(bytes) => {
                     stream.write_all(&bytes).await.map_err(SessionFailure::Io)?;
                 }
+                SessionOutput::DisplayControlReady => {
+                    // This entry point predates resize commands; hosts that want resize use
+                    // run_session_with_commands, which surfaces the event.
+                    tracing::debug!(target: "rdp_displaycontrol_caps", "display control ready");
+                }
             }
         }
         tokio::select! {
@@ -603,6 +610,106 @@ pub async fn run_session_with_input(
                     }
                     // Sender dropped: stop polling the channel, keep the session alive.
                     None => input_open = false,
+                }
+            }
+        }
+    }
+}
+
+/// A host→session instruction for [`run_session_with_commands`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCommand {
+    /// Encode and send a batch of input events (the [`run_session_with_input`] semantics).
+    Input(Vec<InputEvent>),
+    /// Request a client-initiated desktop resize via the Display Control channel
+    /// (MS-RDPEDISP). Valid once [`SessionEvent::DisplayControlReady`] has fired; a request
+    /// the machine refuses ([`justrdp::ResizeError`]) is logged and dropped — the session
+    /// keeps running and the host may retry. The server answers with
+    /// Deactivation–Reactivation; the new size shows up as a full-screen frame update.
+    Resize {
+        /// Requested desktop width (odd values are rounded down — the spec forbids them).
+        width: u16,
+        /// Requested desktop height.
+        height: u16,
+    },
+}
+
+/// A session milestone surfaced to the host by [`run_session_with_commands`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// The Display Control dynamic channel is open and the server's caps arrived:
+    /// [`SessionCommand::Resize`] is valid from now on.
+    DisplayControlReady,
+}
+
+/// [`run_session_with_input`] generalized to host *commands* (input + resize) and
+/// **cancel-aware teardown**: when `cancel` fires, the loop returns `Ok(())` promptly without
+/// waiting for server traffic, so a host abandoning a resize mid-cycle (or shutting down) can
+/// never deadlock on the session (issue #8's cancel-safety criterion). Dropping the returned
+/// future remains equally safe — the machine is pure and the socket is caller-owned.
+///
+/// `on_event` receives session milestones (currently [`SessionEvent::DisplayControlReady`]);
+/// `on_frame` keeps the synchronous frame-sink contract of [`run_session`].
+pub async fn run_session_with_commands(
+    stream: &mut TlsStream<TcpStream>,
+    machine: &mut SessionStateMachine,
+    mut on_frame: impl FnMut(&FrameUpdate),
+    mut on_event: impl FnMut(SessionEvent),
+    commands: &mut tokio::sync::mpsc::Receiver<SessionCommand>,
+    cancel: &CancellationToken,
+) -> Result<(), SessionFailure> {
+    let mut readbuf = [0u8; 16 * 1024];
+    let mut commands_open = true;
+    let mut pending = machine.process_bytes(&[]).map_err(SessionFailure::Protocol)?;
+    loop {
+        for output in pending.drain(..) {
+            match output {
+                SessionOutput::Frame(frame) => on_frame(&frame),
+                SessionOutput::WriteBytes(bytes) => {
+                    stream.write_all(&bytes).await.map_err(SessionFailure::Io)?;
+                }
+                SessionOutput::DisplayControlReady => {
+                    tracing::debug!(target: "rdp_displaycontrol_caps", "display control ready");
+                    on_event(SessionEvent::DisplayControlReady);
+                }
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::debug!("session cancelled by the host");
+                return Ok(());
+            }
+            received = stream.read(&mut readbuf) => {
+                let n = received.map_err(SessionFailure::Io)?;
+                if n == 0 {
+                    return Ok(()); // orderly server close
+                }
+                pending = machine
+                    .process_bytes(&readbuf[..n])
+                    .map_err(SessionFailure::Protocol)?;
+            }
+            command = commands.recv(), if commands_open => {
+                match command {
+                    Some(SessionCommand::Input(events)) => {
+                        for frame in machine.encode_input(&events) {
+                            stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                        }
+                    }
+                    Some(SessionCommand::Resize { width, height }) => {
+                        match machine.request_resize(width, height) {
+                            Ok(frames) => {
+                                tracing::info!(width, height, "resize requested");
+                                for frame in frames {
+                                    stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                                }
+                            }
+                            // Not fatal: the session is unaffected, the host may retry
+                            // (e.g. after DisplayControlReady fires).
+                            Err(e) => tracing::warn!(width, height, error = %e, "resize refused"),
+                        }
+                    }
+                    // Sender dropped: stop polling, keep the session alive.
+                    None => commands_open = false,
                 }
             }
         }
@@ -1537,6 +1644,12 @@ mod tests {
             desktop_size: outcome.activation.desktop_size,
             capabilities,
             server_input_flags,
+            drdynvc_channel_id: outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "drdynvc")
+                .map(|c| c.id),
         }
     }
 
@@ -1627,6 +1740,170 @@ mod tests {
             password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
             domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
         }
+    }
+
+    /// Cancel-safety (issue #8): cancelling the token ends `run_session_with_commands`
+    /// promptly and cleanly even while the server is silent and a refused resize command is
+    /// queued — no deadlock, no error. The mock completes a real TLS handshake and then holds
+    /// the connection open without sending a byte.
+    #[tokio::test]
+    async fn cancellation_ends_the_session_loop_promptly() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = ck.key_pair.serialize_der();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            let mut buf = [0u8; 256];
+            // Hold the session open, consuming whatever the client writes (the refused
+            // resize writes nothing, but input commands would land here).
+            loop {
+                match tls.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let connector = TlsConnector::from(Arc::new(client_config()));
+        let mut stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), sock)
+            .await
+            .unwrap();
+        let mut machine = SessionStateMachine::new(
+            justrdp::SessionConfig {
+                user_channel_id: 1007,
+                io_channel_id: 1003,
+                share_id: 0x0001_03EA,
+                desktop_size: (16, 8),
+                capabilities: Vec::new(),
+                server_input_flags: 0,
+                drdynvc_channel_id: None,
+            },
+            Vec::new(),
+        );
+
+        let (tx, mut commands) = tokio::sync::mpsc::channel(4);
+        // A resize before DisplayControlReady: refused (warn + drop), session keeps running.
+        tx.send(SessionCommand::Resize {
+            width: 1024,
+            height: 768,
+        })
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session_with_commands(&mut stream, &mut machine, |_| {}, |_| {}, &mut commands, &cancel),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "cancellation should end the loop cleanly, got {result:?}"
+        );
+    }
+
+    /// Real-VM acceptance test for slice-8: drdynvc + Display Control resize. Connect with
+    /// the `drdynvc` static channel (EGFX gate flag deliberately **off**, so graphics stay on
+    /// the proven bitmap path), wait for the server to negotiate drdynvc caps, create the
+    /// Display Control channel and send its caps (surfaced as `DisplayControlReady`), then
+    /// request a resize to a different resolution. The server answers with the
+    /// Deactivation–Reactivation cycle; the test passes when the full-screen re-emit arrives
+    /// at the new size and the framebuffer matches. The exchange milestones are printed so
+    /// the wire sequence (caps → create → caps PDU → resize → deactivate → reactivate) is
+    /// visible in the test log.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn display_control_resize_against_real_vm() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let mut config = legacy_graphics_config();
+        config
+            .channels
+            .push(gcc::ChannelDef::new("drdynvc", gcc::CHANNEL_OPTION_INITIALIZED).unwrap());
+        let session_capabilities = config.capabilities.clone();
+        let initial_size = (config.core.desktop_width, config.core.desktop_height);
+        let target = if initial_size == (1024, 768) {
+            (1280, 1024)
+        } else {
+            (1024, 768)
+        };
+
+        let outcome = connect(addr, config, vm_credentials(), |_| {})
+            .await
+            .expect("connect should reach session-active");
+        let session_config = session_config_from(&outcome, session_capabilities);
+        assert!(
+            session_config.drdynvc_channel_id.is_some(),
+            "the VM should grant the drdynvc static channel; granted: {:?}",
+            outcome.mcs.static_channels
+        );
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+        let mut stream = outcome.stream;
+
+        let (tx, mut commands) = tokio::sync::mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let ready_seen = Arc::new(AtomicBool::new(false));
+        let resized_seen = Arc::new(AtomicBool::new(false));
+
+        let ready_in_event = ready_seen.clone();
+        let on_event = move |event: SessionEvent| {
+            assert_eq!(event, SessionEvent::DisplayControlReady);
+            eprintln!("milestone: DisplayControlReady (drdynvc caps + create + EDISP caps done)");
+            ready_in_event.store(true, Ordering::SeqCst);
+            tx.try_send(SessionCommand::Resize {
+                width: target.0,
+                height: target.1,
+            })
+            .expect("queue the resize command");
+            eprintln!("milestone: Monitor Layout resize to {}x{} queued", target.0, target.1);
+        };
+        let resized_in_sink = resized_seen.clone();
+        let canceller = cancel.clone();
+        let on_frame = move |frame: &FrameUpdate| {
+            if (frame.width, frame.height) == target && (frame.x, frame.y) == (0, 0) {
+                // The post-reactivation full-screen re-emit at the new size.
+                eprintln!("milestone: reactivation complete, full frame at {}x{}", frame.width, frame.height);
+                resized_in_sink.store(true, Ordering::SeqCst);
+                canceller.cancel();
+            }
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_session_with_commands(&mut stream, &mut machine, on_frame, on_event, &mut commands, &cancel),
+        )
+        .await
+        .expect("resize cycle should complete well within the window");
+        result.expect("session failed during the resize cycle");
+
+        assert!(ready_seen.load(Ordering::SeqCst), "DisplayControlReady never fired");
+        assert!(resized_seen.load(Ordering::SeqCst), "no full-screen frame at the new size");
+        let fb = machine.framebuffer();
+        assert_eq!(
+            (fb.width(), fb.height()),
+            target,
+            "framebuffer was not rebuilt at the negotiated size"
+        );
+        eprintln!(
+            "resize verified: {}x{} → {}x{}",
+            initial_size.0,
+            initial_size.1,
+            fb.width(),
+            fb.height()
+        );
     }
 
     /// Queue one press+release pair for the key a Windows VK maps to.
