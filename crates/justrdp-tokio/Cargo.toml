@@ -26,3 +26,7 @@ tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"
 tracing-test = "0.2"
 # The mock TLS server in the adapter tests presents a throwaway self-signed cert.
 rcgen = { workspace = true }
+# Differential oracle for the live-capture codec test (gate #6 fix note 3): bitmap rectangles
+# captured from the real VM are decoded by both our codecs and ironrdp's (ADR-0003).
+ironrdp-graphics = "0.8"
+justrdp-codecs.workspace = true

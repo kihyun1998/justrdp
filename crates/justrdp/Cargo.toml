@@ -8,6 +8,9 @@ repository.workspace = true
 
 [dependencies]
 justrdp-pdu.workspace = true
+# The slow-path graphics codecs (slice-6): the session machine decodes bitmap rectangles
+# through this crate's pure decode API (ADR-0003).
+justrdp-codecs.workspace = true
 # X.509 SubjectPublicKeyInfo extraction (ADR-0002 leaf dependency). The sans-IO core parses the
 # server's TLS certificate into the `subjectPublicKey` DER that CredSSP binds to; the handshake
 # itself stays in the I/O adapter.
