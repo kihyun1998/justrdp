@@ -8,6 +8,7 @@
 //! ADR-0003 (phased codecs), and `docs/plan.md`.
 
 pub mod connect;
+mod dvc;
 pub mod framebuffer;
 pub mod input;
 pub mod license_crypto;
@@ -21,4 +22,4 @@ pub use connect::{
 pub use framebuffer::{FrameUpdate, Framebuffer};
 pub use input::Scancode;
 pub use justrdp_pdu::input::InputEvent;
-pub use session::{SessionConfig, SessionError, SessionOutput, SessionStateMachine};
+pub use session::{ResizeError, SessionConfig, SessionError, SessionOutput, SessionStateMachine};
