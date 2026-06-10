@@ -11,14 +11,14 @@ justrdp-pdu.workspace = true
 # The slow-path graphics codecs (slice-6): the session machine decodes bitmap rectangles
 # through this crate's pure decode API (ADR-0003).
 justrdp-codecs.workspace = true
-# X.509 SubjectPublicKeyInfo extraction (ADR-0002 leaf dependency). The sans-IO core parses the
-# server's TLS certificate into the `subjectPublicKey` DER that CredSSP binds to; the handshake
-# itself stays in the I/O adapter.
+# X.509 parsing (ADR-0002 leaf dependency). The sans-IO core extracts the server certificate's
+# inner `subjectPublicKey` BIT STRING (not the whole SubjectPublicKeyInfo) for CredSSP to bind
+# to; the handshake itself stays in the I/O adapter.
 x509-cert.workspace = true
 
 [dev-dependencies]
-# Generates a throwaway self-signed cert so the SPKI-extraction test can assert the extracted
-# SubjectPublicKeyInfo is byte-identical to the key pair's own DER.
+# Generates a throwaway self-signed cert so the key-extraction test can assert the extracted
+# bytes are the inner subjectPublicKey (a strict subset of the key pair's full SPKI DER).
 rcgen.workspace = true
 # Differential oracle (ADR-0001): the MCS-stage machine tests build realistic *server* frames
 # (Connect-Response, AttachUserConfirm, ChannelJoinConfirm) with ironrdp's encoders and feed
