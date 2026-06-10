@@ -82,8 +82,9 @@ These supersede the matching open questions in §10.
    connector state machine"). But the machine is **not** bypassed: on a valid X.224 confirm it
    emits `Action::StartTls`, advances into the `tls-handshake` stage, and after the adapter runs
    the handshake it feeds the server's leaf certificate back via `Event::TlsEstablished`. The
-   machine then extracts the `subjectPublicKey` (DER `SubjectPublicKeyInfo`, via the leaf
-   `x509-cert` dep — ADR-0002) — a pure, CI-testable step — and emits `Action::Proceed {
+   machine then extracts the `subjectPublicKey` (the inner BIT STRING of the
+   `SubjectPublicKeyInfo` — not the whole SPKI; via the leaf `x509-cert` dep — ADR-0002) — a
+   pure, CI-testable step — and emits `Action::Proceed {
    selected, server_public_key }` for CredSSP to bind to next. This reconciles issue #2 ("a
    `TlsUpgrade` state that accepts the cert and yields `subjectPublicKey`") with §3 ("handshake
    outside the machine"): TLS *records* never enter the machine, but the TLS *stage* and the cert

@@ -88,7 +88,7 @@ const TYPE_RDP_NEG_RSP: u8 = 0x02;
 const TYPE_RDP_NEG_FAILURE: u8 = 0x03;
 
 /// A reason the server refused every advertised protocol (`RDP_NEG_FAILURE.failureCode`,
-/// MS-RDPBCGR 2.2.1.1.1.1). Kept as a newtype so unknown codes survive a round-trip.
+/// MS-RDPBCGR 2.2.1.2.2). Kept as a newtype so unknown codes survive a round-trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NegFailureCode(pub u32);
 

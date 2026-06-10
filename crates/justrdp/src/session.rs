@@ -2,9 +2,10 @@
 //! `session-active`, this machine consumes raw socket bytes and produces [`SessionOutput`]s —
 //! decoded [`FrameUpdate`]s for the host's frame sink, and the occasional outbound frame
 //! (Deactivation–Reactivation re-runs capability exchange in-session, plan.md §0's resize
-//! trap). Slice-6 scope: slow-path graphics (bitmap + palette updates); orders, fast-path
-//! output, pointers, and input are later slices — their PDUs are decoded-and-skipped per the
-//! robustness policy (plan.md §11c: unknown-but-well-formed never kills the session,
+//! trap). Implemented so far: slow-path *and* fast-path output graphics (bitmap + palette
+//! updates, with fast-path fragment reassembly — slice-6) and outbound keyboard/mouse input
+//! (slice-7). Orders and pointers are later slices — their PDUs are decoded-and-skipped per
+//! the robustness policy (plan.md §11c: unknown-but-well-formed never kills the session,
 //! malformed input does).
 
 use crate::framebuffer::{FrameUpdate, Framebuffer};
