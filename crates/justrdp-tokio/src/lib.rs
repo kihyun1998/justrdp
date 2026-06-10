@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use justrdp::{
-    Action, ConnectConfig, ConnectError, ConnectStateMachine, Event, McsConnectResult,
+    Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, Event,
+    LicenseEntropy, McsConnectResult,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -45,16 +46,36 @@ const STAGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// `nla-credssp` read before the bytes are even validated.
 const MAX_TS_REQUEST_LEN: usize = 64 * 1024;
 
-/// A successful connect through MCS: the negotiated channel topology (user channel, I/O
-/// channel, granted static channels) and the live, authenticated TLS stream — positioned just
-/// after channel join, ready for the Client Info PDU (slice-4b) and licensing (slice-5).
+/// A successful connect, all the way to **session-active**: the MCS channel topology, the
+/// capability-exchange/activation results (negotiated desktop size, share ID, server
+/// capabilities), and the live, authenticated TLS stream — ready for the session loop.
 #[derive(Debug)]
 pub struct ConnectOutcome {
     /// The MCS/GCC results: selected protocol, user/IO channel IDs, static channels,
     /// requested desktop size.
     pub mcs: McsConnectResult,
-    /// The TLS-upgraded, NLA-authenticated stream with the MCS exchange completed.
+    /// The activation results: share ID, **negotiated** desktop size (allocate the framebuffer
+    /// from this one), the server's capability sets, and any bytes that followed the Font Map
+    /// in the same read (process them before reading the stream).
+    pub activation: ActivationResult,
+    /// The TLS-upgraded, NLA-authenticated stream, positioned just past the Font Map PDU.
     pub stream: TlsStream<TcpStream>,
+}
+
+/// Generate fresh per-connection licensing entropy ([`LicenseEntropy`]) from the process RNG
+/// (rustls' ring provider — the same RNG the TLS handshake trusts; no new dependency). The
+/// sans-IO core cannot produce randomness, so the adapter boundary owns this.
+pub fn generate_license_entropy() -> io::Result<LicenseEntropy> {
+    let rng = rustls::crypto::ring::default_provider().secure_random;
+    let mut client_random = [0u8; 32];
+    let mut premaster_secret = [0u8; 48];
+    rng.fill(&mut client_random)
+        .and_then(|()| rng.fill(&mut premaster_secret))
+        .map_err(|e| io::Error::other(format!("OS RNG failed generating license entropy: {e:?}")))?;
+    Ok(LicenseEntropy {
+        client_random,
+        premaster_secret,
+    })
 }
 
 /// The connect-time transport: plaintext TCP until the X.224 negotiation completes, the TLS
@@ -280,6 +301,8 @@ async fn connect_inner(
     let mut sm = ConnectStateMachine::new(config);
     let mut transport = Transport::Absent;
     let mut readbuf = [0u8; 8192];
+    // Filled at the McsConnected milestone; consumed when SessionActive terminates the loop.
+    let mut mcs: Option<McsConnectResult> = None;
     let mut queue: VecDeque<Action> = sm.start().into();
     let mut announced = sm.stage();
     on_stage(announced);
@@ -398,23 +421,43 @@ async fn connect_inner(
                     announce_stage(&mut sm, &mut announced, &mut on_stage);
                 }
                 Action::McsConnected { result } => {
+                    // A milestone, not the end: the machine continues through licensing,
+                    // capability exchange, and activation on the same stream.
                     tracing::debug!(
                         user_channel = result.user_channel_id,
                         io_channel = result.io_channel_id,
                         static_channels = result.static_channels.len(),
                         join_skipped = result.channel_join_skipped,
-                        "MCS connect complete"
+                        "MCS connect complete; continuing to licensing"
                     );
+                    mcs = Some(result);
+                }
+                Action::SessionActive { result } => {
+                    tracing::debug!(
+                        share_id = result.share_id,
+                        width = result.desktop_size.0,
+                        height = result.desktop_size.1,
+                        server_capsets = result.server_capabilities.len(),
+                        leftover = result.leftover.len(),
+                        "session active"
+                    );
+                    let Some(mcs) = mcs else {
+                        return Err(ConnectFailure::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "session-active reached without an MCS result",
+                        )));
+                    };
                     let Transport::Tls(stream) =
                         std::mem::replace(&mut transport, Transport::Absent)
                     else {
                         return Err(ConnectFailure::Io(io::Error::new(
                             io::ErrorKind::NotConnected,
-                            "MCS completed without a TLS stream",
+                            "session-active reached without a TLS stream",
                         )));
                     };
                     return Ok(ConnectOutcome {
-                        mcs: result,
+                        mcs,
+                        activation: result,
                         stream: *stream,
                     });
                 }
@@ -671,11 +714,7 @@ mod tests {
     /// two static channels, and explicitly chosen early-capability flags (caller policy — set
     /// here, in the host layer, exactly as the anti-hardcode rule demands).
     fn test_config() -> ConnectConfig {
-        ConnectConfig {
-            requested: SecurityProtocol::SSL
-                | SecurityProtocol::HYBRID
-                | SecurityProtocol::HYBRID_EX,
-            core: gcc::ClientCoreData {
+        let core = gcc::ClientCoreData {
                 version: gcc::RDP_VERSION_10_12,
                 desktop_width: 1280,
                 desktop_height: 800,
@@ -700,7 +739,13 @@ mod tests {
                 connection_type: gcc::CONNECTION_TYPE_LAN,
                 // Overwritten by the machine with the negotiated protocol.
                 server_selected_protocol: SecurityProtocol::from_bits(0),
-            },
+        };
+        ConnectConfig {
+            requested: SecurityProtocol::SSL
+                | SecurityProtocol::HYBRID
+                | SecurityProtocol::HYBRID_EX,
+            capabilities: justrdp_pdu::capability::default_client_capabilities(&core),
+            core,
             security: gcc::ClientSecurityData::default(),
             channels: vec![
                 gcc::ChannelDef::new("cliprdr", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
@@ -722,6 +767,11 @@ mod tests {
                 timezone: client_info::TimezoneInfo::utc(),
                 session_id: 0,
                 performance_flags: 0x7,
+            },
+            license: justrdp::LicenseConfig {
+                entropy: generate_license_entropy().expect("OS RNG"),
+                platform_id: justrdp_pdu::license::PLATFORM_ID_NT_POST_52_MICROSOFT,
+                hardware_id: [0x4A55_5354, 0x5244_5001, 0, 0], // "JUST","RDP\1" — arbitrary
             },
         }
     }
@@ -1065,15 +1115,18 @@ mod tests {
     /// `cargo test -p justrdp-tokio -- --ignored` against the live RDP test VM, with the test
     /// account supplied via `JUSTRDP_TEST_USERNAME` / `JUSTRDP_TEST_PASSWORD` /
     /// `JUSTRDP_TEST_DOMAIN` (the latter optional) — so no credential is committed to the repo.
-    /// Verifies the full connect sequence through MCS: X.224 → TLS → CredSSP authentication (and
-    /// the HYBRID_EX early-auth check) → MCS Connect + GCC exchange → channel join, ending with
-    /// the user channel ID and static channel list in hand (slice-4 acceptance).
+    /// Verifies the full connect sequence to **session-active**: X.224 → TLS → CredSSP (and the
+    /// HYBRID_EX early-auth check) → MCS/GCC + channel join → Client Info → licensing (this VM
+    /// short-circuits with `STATUS_VALID_CLIENT`) → Demand/Confirm Active → finalization →
+    /// Font Map, then proves the session is live by receiving the server's first post-active
+    /// PDU (slice-5 acceptance).
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
-    async fn connect_completes_mcs_against_real_vm() {
+    async fn connect_reaches_session_active_against_real_vm() {
         let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
         let config = test_config();
         let requested = config.requested;
+        let requested_size = (config.core.desktop_width, config.core.desktop_height);
         let credentials = Credentials {
             username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
             password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
@@ -1083,8 +1136,15 @@ mod tests {
         let mut stages = Vec::new();
         let result = connect(addr, config, credentials, |s| stages.push(s.to_string())).await;
         eprintln!("stages: {stages:?}");
-        let outcome = result.expect("connect through MCS should complete against the real VM");
+        let outcome = result.expect("connect should reach session-active against the real VM");
         eprintln!("mcs result: {:?}", outcome.mcs);
+        eprintln!(
+            "activation: share_id={:#010x} desktop={:?} server_capsets={} leftover={}",
+            outcome.activation.share_id,
+            outcome.activation.desktop_size,
+            outcome.activation.server_capabilities.len(),
+            outcome.activation.leftover.len(),
+        );
 
         // The server must select exactly one protocol from the set we advertised...
         assert!(outcome.mcs.selected.bits() != 0);
@@ -1098,48 +1158,71 @@ mod tests {
         for ch in &outcome.mcs.static_channels {
             assert!(ch.id >= 1001, "granted channel {} has id {}", ch.name, ch.id);
         }
-        // ...and the connect sequence walked every stage through capability-exchange.
+        // ...and the connect sequence walked every canonical stage, ending in session-active.
         assert_eq!(stages.first().map(String::as_str), Some("tcp-connect"));
-        for expected in ["x224-negotiate", "tls-handshake", "nla-credssp", "capability-exchange"] {
+        for expected in [
+            "x224-negotiate",
+            "tls-handshake",
+            "nla-credssp",
+            "capability-exchange",
+            "activation",
+        ] {
             assert!(
                 stages.contains(&expected.to_string()),
                 "expected to reach the {expected} stage, got {stages:?}"
             );
         }
+        assert_eq!(stages.last().map(String::as_str), Some("session-active"));
 
-        // The slice-4b proof (#40): the Client Info PDU went out with the connect sequence, so
-        // the server now proceeds to licensing on its own — the next inbound PDU must be a
-        // SEC_LICENSE_PKT-flagged Send Data Indication. Without the Client Info PDU the server
-        // sends nothing and this read times out.
+        // Capability exchange settled the desktop size: the VM honors the requested size
+        // (compare against the server's own Bitmap capability set as the source of truth).
+        let server_bitmap = outcome
+            .activation
+            .server_capabilities
+            .iter()
+            .find_map(|set| match set {
+                justrdp_pdu::capability::CapabilitySet::Bitmap(bitmap) => Some(bitmap),
+                _ => None,
+            })
+            .expect("the server's Demand Active carries a Bitmap capability set");
+        assert_eq!(
+            outcome.activation.desktop_size,
+            (server_bitmap.desktop_width, server_bitmap.desktop_height),
+            "ConnectionResult must record the server-negotiated size"
+        );
+        assert_eq!(
+            outcome.activation.desktop_size, requested_size,
+            "this VM honors the requested desktop size"
+        );
+        assert!(outcome.activation.share_id != 0);
+
+        // Session-active proof: the server starts streaming on its own (graphics / pointer /
+        // logon notifications). At least one complete inbound PDU must arrive — either already
+        // buffered in `leftover` or readable from the live stream.
         let mut stream = outcome.stream;
-        let mut inbox = Vec::new();
-        let mut buf = [0u8; 4096];
+        let mut inbox = outcome.activation.leftover;
+        let mut buf = [0u8; 8192];
         let frame_len = loop {
             match justrdp_pdu::tpkt::frame_len(&inbox) {
                 Ok(n) if inbox.len() >= n => break n,
                 Ok(_) | Err(justrdp_pdu::DecodeError::NotEnoughBytes { .. }) => {
                     let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf))
                         .await
-                        .expect("server should start licensing after the Client Info PDU")
+                        .expect("server should send a first PDU after session-active")
                         .expect("read from the live stream");
-                    assert!(n > 0, "server closed instead of starting licensing");
+                    assert!(n > 0, "server closed right after session-active");
                     inbox.extend_from_slice(&buf[..n]);
                 }
-                Err(e) => panic!("malformed TPKT from server: {e}"),
+                // Post-active traffic may be fast-path (no TPKT); any bytes at all prove the
+                // session is live.
+                Err(_) => break inbox.len(),
             }
         };
-        let tpdu = justrdp_pdu::tpkt::decode(&inbox[..frame_len]).unwrap();
-        let mcs_body = justrdp_pdu::x224::decode_data(tpdu).unwrap();
-        let indication = justrdp_pdu::mcs::SendDataIndication::decode(mcs_body)
-            .expect("first post-connect PDU is channel data");
-        assert_eq!(indication.channel_id, outcome.mcs.io_channel_id);
-        let mut cur =
-            justrdp_pdu::cursor::ReadCursor::new(indication.user_data, "licensing security header");
-        let sec_flags = client_info::decode_basic_security_header(&mut cur).unwrap();
-        eprintln!("first inbound security flags: {sec_flags:#06x}");
-        assert!(
-            sec_flags & client_info::SEC_LICENSE_PKT != 0,
-            "expected SEC_LICENSE_PKT in the first inbound PDU, got flags {sec_flags:#06x}"
+        eprintln!(
+            "first post-active pdu: {} bytes (of {} buffered)",
+            frame_len,
+            inbox.len()
         );
+        assert!(frame_len > 0);
     }
 }
