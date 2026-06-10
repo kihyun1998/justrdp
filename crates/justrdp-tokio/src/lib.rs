@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use justrdp::{
     Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, Event,
-    LicenseEntropy, McsConnectResult,
+    FrameUpdate, LicenseEntropy, McsConnectResult, SessionError, SessionOutput,
+    SessionStateMachine,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -492,6 +493,77 @@ fn announce_stage(
         *announced = sm.stage();
         on_stage(announced);
         tracing::debug!(stage = *announced, "entering connect stage");
+    }
+}
+
+/// Why a running session ended.
+#[derive(Debug)]
+pub enum SessionFailure {
+    /// Socket-level I/O failed.
+    Io(io::Error),
+    /// The server sent data the session machine rejects (malformed PDU / codec data).
+    Protocol(SessionError),
+}
+
+impl core::fmt::Display for SessionFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SessionFailure::Io(e) => write!(f, "session I/O failed: {e}"),
+            SessionFailure::Protocol(e) => write!(f, "session protocol failure: {e}"),
+        }
+    }
+}
+
+impl core::error::Error for SessionFailure {}
+
+/// Drive the sans-IO [`SessionStateMachine`] over the connected stream: read raw bytes, feed
+/// them to the machine, deliver every decoded [`FrameUpdate`] to `on_frame` **synchronously**,
+/// and write the machine's outbound frames (Deactivation–Reactivation traffic) back to the
+/// socket.
+///
+/// Build the machine from the connect results:
+/// [`SessionStateMachine::new`] with a `SessionConfig` assembled from
+/// [`ConnectOutcome::mcs`] / [`ConnectOutcome::activation`] (including
+/// `activation.leftover`), then pass [`ConnectOutcome::stream`].
+///
+/// Runs until the server closes the connection (`Ok(())`), an error occurs, or the future is
+/// dropped (the caller owns cancellation — timeouts, shutdown, etc.; per-stage timeout
+/// semantics are a connect-time concern). The machine is borrowed, so the caller keeps access
+/// to its framebuffer afterwards.
+pub async fn run_session(
+    stream: &mut TlsStream<TcpStream>,
+    machine: &mut SessionStateMachine,
+    mut on_frame: impl FnMut(&FrameUpdate),
+) -> Result<(), SessionFailure> {
+    let mut readbuf = [0u8; 16 * 1024];
+    // Drain bytes the connect sequence already buffered (ActivationResult::leftover, handed
+    // to SessionStateMachine::new) before the first socket read.
+    let mut pending = machine.process_bytes(&[]).map_err(SessionFailure::Protocol)?;
+    loop {
+        for output in pending.drain(..) {
+            match output {
+                SessionOutput::Frame(frame) => {
+                    tracing::trace!(
+                        x = frame.x,
+                        y = frame.y,
+                        width = frame.width,
+                        height = frame.height,
+                        "frame update"
+                    );
+                    on_frame(&frame);
+                }
+                SessionOutput::WriteBytes(bytes) => {
+                    stream.write_all(&bytes).await.map_err(SessionFailure::Io)?;
+                }
+            }
+        }
+        let n = stream.read(&mut readbuf).await.map_err(SessionFailure::Io)?;
+        if n == 0 {
+            return Ok(()); // orderly server close
+        }
+        pending = machine
+            .process_bytes(&readbuf[..n])
+            .map_err(SessionFailure::Protocol)?;
     }
 }
 
@@ -1224,5 +1296,101 @@ mod tests {
             inbox.len()
         );
         assert!(frame_len > 0);
+    }
+
+    /// Real-VM acceptance test for slice-6: connect to session-active, run the session loop,
+    /// and verify the first decoded frames actually render the desktop — at least one
+    /// FrameUpdate arrives, most of the screen gets painted, and the framebuffer is visibly
+    /// not monochrome (taskbar/wallpaper/icons produce many distinct colors). A PPM dump of
+    /// the framebuffer is written to the temp directory for human visual confirmation.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn first_frames_render_the_desktop_against_real_vm() {
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        // Caller policy for a *slow-path* graphics session: do NOT advertise
+        // SUPPORT_DYN_VC_GFX_PROTOCOL (and skip drdynvc). A server seeing the EGFX gate flag
+        // negotiates graphics over the dynamic channel and never paints slow-path (verified
+        // against this VM: with the flag set it sends only drdynvc DVC requests and zero
+        // bitmap updates). Until the EGFX slice exists, the caller advertises what the client
+        // can actually render — exactly the policy seam plan.md §0 demands stays caller-owned.
+        let mut config = test_config();
+        config.core.early_capability_flags =
+            gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
+                | gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
+        config.channels = vec![gcc::ChannelDef::new("cliprdr", gcc::CHANNEL_OPTION_INITIALIZED).unwrap()];
+        let session_capabilities = config.capabilities.clone();
+        let credentials = Credentials {
+            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
+            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
+            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
+        };
+        let outcome = connect(addr, config, credentials, |_| {})
+            .await
+            .expect("connect should reach session-active");
+
+        let mut machine = SessionStateMachine::new(
+            justrdp::SessionConfig {
+                user_channel_id: outcome.mcs.user_channel_id,
+                io_channel_id: outcome.mcs.io_channel_id,
+                share_id: outcome.activation.share_id,
+                desktop_size: outcome.activation.desktop_size,
+                capabilities: session_capabilities,
+            },
+            outcome.activation.leftover,
+        );
+        let mut stream = outcome.stream;
+
+        // Let the session run for a few seconds: the server paints the full desktop right
+        // after activation. The timeout is the expected exit (a session never ends itself).
+        let mut frames = 0usize;
+        let mut covered: u64 = 0;
+        let ended = tokio::time::timeout(
+            Duration::from_secs(8),
+            run_session(&mut stream, &mut machine, |frame| {
+                frames += 1;
+                covered += u64::from(frame.width) * u64::from(frame.height);
+            }),
+        )
+        .await;
+        if let Ok(result) = ended {
+            result.expect("session failed before the observation window closed");
+            panic!("server closed the session unexpectedly early");
+        }
+
+        let fb = machine.framebuffer();
+        let total = u64::from(fb.width()) * u64::from(fb.height());
+        eprintln!(
+            "frames={frames} covered={covered}px of {total}px ({}x{})",
+            fb.width(),
+            fb.height()
+        );
+        assert!(frames >= 1, "no FrameUpdate was emitted");
+        assert!(
+            covered >= total / 2,
+            "expected at least half the desktop painted, got {covered} of {total}"
+        );
+
+        // Monochrome output would mean the decode silently produced garbage.
+        let mut distinct = std::collections::HashSet::new();
+        for px in fb.pixels().chunks_exact(4) {
+            distinct.insert([px[0], px[1], px[2]]);
+            if distinct.len() > 16 {
+                break;
+            }
+        }
+        assert!(
+            distinct.len() > 16,
+            "framebuffer is near-monochrome ({} colors) — decode likely broken",
+            distinct.len()
+        );
+
+        // Visual confirmation artifact (open with any image viewer).
+        let path = std::env::temp_dir().join("justrdp-slice6-first-frame.ppm");
+        let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+        for px in fb.pixels().chunks_exact(4) {
+            ppm.extend_from_slice(&px[..3]);
+        }
+        std::fs::write(&path, ppm).expect("write the visual dump");
+        eprintln!("visual dump for confirmation: {}", path.display());
     }
 }

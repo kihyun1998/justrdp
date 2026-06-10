@@ -12,6 +12,7 @@ pub mod capability;
 pub mod client_info;
 pub mod cursor;
 pub mod error;
+pub mod fastpath;
 pub mod finalization;
 pub mod gcc;
 pub mod license;
@@ -20,6 +21,7 @@ pub mod nego;
 pub mod per;
 pub mod share;
 pub mod tpkt;
+pub mod update;
 pub mod x224;
 
 pub use error::DecodeError;
