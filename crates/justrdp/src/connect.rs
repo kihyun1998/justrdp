@@ -1,17 +1,19 @@
 //! The sans-IO connection state machine (ADR-0001). It drives the RDP connect sequence by
 //! consuming [`Event`]s (socket connected, bytes received) and emitting [`Action`]s (open the
-//! socket, write bytes, fail) — never touching the socket itself. Implemented so far:
-//! `tcp-connect` → `x224-negotiate` → `tls-handshake` → `nla-credssp` → the MCS/GCC half of
-//! `capability-exchange` (Connect-Initial/Response, Erect Domain, Attach User, Channel Join),
-//! closing with the Client Info PDU — the Secure Settings Exchange the server requires before
-//! it will start licensing (slice-5's entry point).
+//! socket, write bytes, fail) — never touching the socket itself. The full sequence:
+//! `tcp-connect` → `x224-negotiate` → `tls-handshake` → `nla-credssp` → `capability-exchange`
+//! (MCS/GCC, channel join, Client Info, licensing, Demand/Confirm Active) → `activation`
+//! (Synchronize / Control / Font List ↔ Font Map) → `session-active`.
 
+use crate::license_crypto;
+use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::client_info;
+use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::gcc::{
     ClientGccBlocks, ClientNetworkData, ServerEarlyCapabilityFlags,
 };
 use justrdp_pdu::nego::{NegFailureCode, NegRequest, NegResponse, SecurityProtocol};
-use justrdp_pdu::{gcc, mcs, tpkt, x224};
+use justrdp_pdu::{finalization, gcc, license, mcs, share, tpkt, x224};
 
 /// Everything the connect sequence needs from the caller, fixed at construction. The GCC fields
 /// — most critically `core.early_capability_flags`, the EGFX gate (plan.md §0) — reach the wire
@@ -32,6 +34,43 @@ pub struct ConnectConfig {
     /// The Client Info PDU settings (Secure Settings Exchange, MS-RDPBCGR 2.2.1.11) — sent on
     /// the I/O channel as soon as the channel join completes.
     pub client_info: ClientInfoConfig,
+    /// The capability sets to send in Confirm Active, **verbatim** — the same anti-hardcode
+    /// contract as `core.early_capability_flags` (plan.md §0). The machine touches exactly one
+    /// thing: the Bitmap set's desktop size is overwritten with the server-negotiated size from
+    /// Demand Active (a wire fact, like `serverSelectedProtocol`). Start from
+    /// [`capability::default_client_capabilities`] and edit as needed.
+    pub capabilities: Vec<CapabilitySet>,
+    /// Licensing parameters for the full MS-RDPELE negotiation (most servers short-circuit it
+    /// with `STATUS_VALID_CLIENT` and never consume these).
+    pub license: LicenseConfig,
+}
+
+/// Caller-supplied licensing parameters (MS-RDPELE). Reaches the wire verbatim.
+///
+/// Decision-10 note: the entropy below is **connection-scoped protocol nonce material**, not a
+/// user credential — it exists only to key the legacy licensing exchange, which itself rides
+/// inside the already-authenticated TLS session. User secrets still never enter this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LicenseConfig {
+    /// Fresh per-connection randomness for the licensing key exchange. Generate with a real
+    /// RNG at the adapter boundary (the sans-IO machine cannot produce randomness itself).
+    pub entropy: LicenseEntropy,
+    /// `PlatformId` for the New License Request (client OS / ISV identification, e.g.
+    /// [`license::PLATFORM_ID_NT_POST_52_MICROSOFT`]).
+    pub platform_id: u32,
+    /// `ClientHardwareId` for the Platform Challenge Response — four caller-chosen words
+    /// identifying this device to the license server (MS-RDPELE 2.2.2.5.1).
+    pub hardware_id: [u32; 4],
+}
+
+/// Per-connection randomness for licensing: the client random and the premaster secret the
+/// session keys derive from (MS-RDPELE 5.1.2–5.1.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LicenseEntropy {
+    /// `ClientRandom` (sent in the clear in the New License Request).
+    pub client_random: [u8; license::RANDOM_SIZE],
+    /// The premaster secret (sent RSA-encrypted to the server certificate's key).
+    pub premaster_secret: [u8; license::PREMASTER_SECRET_SIZE],
 }
 
 /// Caller-supplied fields of the Client Info PDU. Every field reaches the wire verbatim.
@@ -128,15 +167,39 @@ pub enum Action {
     /// plan.md §0.)
     AwaitEarlyUserAuth,
     /// The MCS connect sequence completed: GCC settings exchanged, user attached, channels
-    /// joined (or the join legitimately skipped). The connect sequence has reached the end of
-    /// what this slice implements; the Client Info PDU (slice-4b) and licensing (slice-5) are
-    /// next.
+    /// joined (or the join legitimately skipped). A **milestone, not the end**: the machine
+    /// continues through licensing, capability exchange, and activation — keep feeding it
+    /// [`Event::Received`] until [`Action::SessionActive`] or [`Action::FailWith`].
     McsConnected {
         /// The negotiated MCS/GCC results.
         result: McsConnectResult,
     },
+    /// Terminal: the Font Map PDU arrived — the session is active and ready for live I/O.
+    /// The connect machine is done; hand `result` (and the socket) to the session loop.
+    SessionActive {
+        /// The activation results the session loop starts from.
+        result: ActivationResult,
+    },
     /// The connect attempt failed; surface this error and tear down.
     FailWith(ConnectError),
+}
+
+/// What capability exchange + activation settled — everything the session loop needs beyond
+/// the earlier [`McsConnectResult`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationResult {
+    /// The server-assigned `shareID`, echoed in every Share Control PDU from here on.
+    pub share_id: u32,
+    /// The **negotiated** desktop size from the server's Bitmap capability set — allocate the
+    /// framebuffer from this, not from the size requested at GCC.
+    pub desktop_size: (u16, u16),
+    /// The server's capability sets from Demand Active, verbatim (the session loop reads
+    /// order/codec support from these).
+    pub server_capabilities: Vec<CapabilitySet>,
+    /// Socket bytes that arrived after the Font Map in the same read — already consumed from
+    /// the transport, so the session loop must process these **before** reading the socket
+    /// (servers start streaming graphics immediately).
+    pub leftover: Vec<u8>,
 }
 
 /// An input handed to the machine by the host adapter.
@@ -231,6 +294,15 @@ pub enum ConnectError {
         /// The T.125 `Result` value.
         result: u8,
     },
+    /// The server ended licensing with a License Error PDU whose code is not
+    /// `STATUS_VALID_CLIENT` — no license, no session (MS-RDPELE 2.2.2.7).
+    LicensingFailed {
+        /// The `dwErrorCode` the server reported.
+        error_code: u32,
+    },
+    /// A licensing message failed its MAC check — the decrypted content does not match the
+    /// server's integrity data (MS-RDPELE 5.1.6).
+    LicenseMacMismatch,
     /// The adapter fed the machine an [`Event`] the current stage does not expect (the ordering
     /// contract on [`Event`]). Carries the stage label and the offending event kind. This is an
     /// adapter bug, not a server behavior — but it surfaces as a typed failure, never a panic.
@@ -273,7 +345,18 @@ enum Stage {
     McsAttach { selected: SecurityProtocol },
     /// Channel Join Requests are on the wire, awaiting the remaining confirms.
     ChannelJoin { selected: SecurityProtocol },
-    /// Terminal: the machine emitted [`Action::McsConnected`] or [`Action::FailWith`] and will
+    /// The Client Info PDU is on the wire; awaiting the server's first licensing message
+    /// (MS-RDPELE). Still `capability-exchange` to observers: licensing is a gatekeeping
+    /// sub-step between the two halves of capability negotiation, and CONTEXT.md's seven
+    /// stages remain the complete observable set (the same ruling as Client Info, gate #40).
+    Licensing { selected: SecurityProtocol },
+    /// Licensing completed; awaiting the server's Demand Active (tolerating DeactivateAll
+    /// and stray data PDUs). Still `capability-exchange` — this is its second half.
+    CapabilityExchange { selected: SecurityProtocol },
+    /// Confirm Active + the finalization batch are on the wire; awaiting the server's
+    /// Synchronize / Control / **Font Map** — the session-active gate. Label: `activation`.
+    Finalization { selected: SecurityProtocol },
+    /// Terminal: the machine emitted [`Action::SessionActive`] or [`Action::FailWith`] and will
     /// accept no further events (each yields [`ConnectError::UnexpectedEvent`]). Internal only —
     /// `last` is the label of the stage where the connect ended, and [`Stage::label`] keeps
     /// reporting it: CONTEXT.md's seven Connect Stages stay the complete observable set (no
@@ -289,9 +372,12 @@ impl Stage {
             Stage::X224Negotiate => "x224-negotiate",
             Stage::TlsHandshake { .. } => "tls-handshake",
             Stage::NlaCredssp { .. } | Stage::EarlyUserAuth { .. } => "nla-credssp",
-            Stage::GccExchange { .. } | Stage::McsAttach { .. } | Stage::ChannelJoin { .. } => {
-                "capability-exchange"
-            }
+            Stage::GccExchange { .. }
+            | Stage::McsAttach { .. }
+            | Stage::ChannelJoin { .. }
+            | Stage::Licensing { .. }
+            | Stage::CapabilityExchange { .. } => "capability-exchange",
+            Stage::Finalization { .. } => "activation",
             Stage::Done { last } => last,
         }
     }
@@ -309,6 +395,9 @@ impl Stage {
                 | Stage::GccExchange { .. }
                 | Stage::McsAttach { .. }
                 | Stage::ChannelJoin { .. }
+                | Stage::Licensing { .. }
+                | Stage::CapabilityExchange { .. }
+                | Stage::Finalization { .. }
         )
     }
 }
@@ -329,6 +418,13 @@ pub struct ConnectStateMachine {
     static_channels: Vec<StaticChannel>,
     skip_channel_join: bool,
     pending_joins: Vec<u16>,
+    /// Licensing session keys, present only after a full negotiation ran (the
+    /// `STATUS_VALID_CLIENT` short-circuit never derives them).
+    license_keys: Option<license_crypto::LicenseKeys>,
+    /// Capability-exchange results (valid from Demand Active onward).
+    share_id: u32,
+    negotiated_size: (u16, u16),
+    server_capabilities: Vec<CapabilitySet>,
 }
 
 impl ConnectStateMachine {
@@ -344,6 +440,10 @@ impl ConnectStateMachine {
             static_channels: Vec::new(),
             skip_channel_join: false,
             pending_joins: Vec::new(),
+            license_keys: None,
+            share_id: 0,
+            negotiated_size: (0, 0),
+            server_capabilities: Vec::new(),
         }
     }
 
@@ -506,6 +606,35 @@ impl ConnectStateMachine {
                 Ok(confirm) => self.on_channel_join_confirm(selected, confirm),
                 Err(e) => self.fail(ConnectError::Decode(e)),
             },
+            // Post-MCS stages: every inbound frame is a Send Data Indication on the I/O
+            // channel; the per-stage step functions parse its payload.
+            Stage::Licensing { selected } => match decode_mcs_frame(frame)
+                .and_then(mcs::SendDataIndication::decode)
+            {
+                Ok(ind) => match self.license_step(selected, ind.user_data) {
+                    Ok(actions) => actions,
+                    Err(e) => self.fail(e),
+                },
+                Err(e) => self.fail(ConnectError::Decode(e)),
+            },
+            Stage::CapabilityExchange { selected } => match decode_mcs_frame(frame)
+                .and_then(mcs::SendDataIndication::decode)
+            {
+                Ok(ind) => match self.capability_step(selected, ind.user_data) {
+                    Ok(actions) => actions,
+                    Err(e) => self.fail(e),
+                },
+                Err(e) => self.fail(ConnectError::Decode(e)),
+            },
+            Stage::Finalization { selected } => match decode_mcs_frame(frame)
+                .and_then(mcs::SendDataIndication::decode)
+            {
+                Ok(ind) => match self.finalization_step(selected, ind.user_data) {
+                    Ok(actions) => actions,
+                    Err(e) => self.fail(e),
+                },
+                Err(e) => self.fail(ConnectError::Decode(e)),
+            },
             // drain_frames only runs in receiving stages; anything else is unreachable by
             // construction, but fail typed rather than panic if that invariant ever breaks.
             stage => self.fail(ConnectError::UnexpectedEvent {
@@ -645,14 +774,15 @@ impl ConnectStateMachine {
         }
     }
 
-    /// The MCS connect is complete: send the Client Info PDU, then emit the terminal result.
+    /// The MCS connect is complete: send the Client Info PDU, report the milestone, and enter
+    /// the licensing wait.
     ///
     /// The Client Info write is the Secure Settings Exchange (MS-RDPBCGR 2.2.1.11) — the server
     /// does not begin licensing until it arrives, so the connect machine owns the send rather
     /// than leaving a silent gap for the host to discover. It happens at the tail of the
     /// `capability-exchange` stage; per CONTEXT.md's seven-stage glossary no separate label
     /// exists for it (it is a single fire-and-forget write with no response of its own — the
-    /// next inbound PDU is licensing, slice-5's entry point).
+    /// next inbound PDU is licensing).
     fn finish(&mut self, selected: SecurityProtocol) -> Vec<Action> {
         let info = client_info::ClientInfo {
             code_page: 0,
@@ -682,7 +812,7 @@ impl ConnectStateMachine {
             &payload,
         )));
 
-        self.stage = self.stage.done();
+        self.stage = Stage::Licensing { selected };
         vec![
             Action::WriteBytes(frame),
             Action::McsConnected {
@@ -699,6 +829,321 @@ impl ConnectStateMachine {
                 },
             },
         ]
+    }
+
+    /// Wrap an I/O-channel payload (security header / share PDU and inward) into a complete
+    /// outbound frame: MCS Send Data Request → X.224 Data → TPKT.
+    fn send_io(&self, payload: &[u8]) -> Action {
+        Action::WriteBytes(tpkt::encode(&x224::encode_data(
+            &mcs::encode_send_data_request(self.user_channel_id, self.io_channel_id, payload),
+        )))
+    }
+
+    /// One licensing message arrived (MS-RDPELE 3.2.5). Advances to capability exchange on
+    /// `STATUS_VALID_CLIENT` (the common short-circuit) or a MAC-verified New/Upgrade License;
+    /// answers License Request / Platform Challenge on the full path; stays in `Licensing`
+    /// otherwise.
+    fn license_step(
+        &mut self,
+        selected: SecurityProtocol,
+        user_data: &[u8],
+    ) -> Result<Vec<Action>, ConnectError> {
+        let mut cur = ReadCursor::new(user_data, "licensing message");
+        let flags =
+            client_info::decode_basic_security_header(&mut cur).map_err(ConnectError::Decode)?;
+        if flags & client_info::SEC_LICENSE_PKT == 0 {
+            // Licensing is mandatory after Client Info (MS-RDPBCGR 1.3.1.1); anything else
+            // here means the sequence desynced.
+            return Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                field: "securityHeader.flags",
+                reason: "expected SEC_LICENSE_PKT while awaiting licensing",
+            }));
+        }
+        let preamble = license::LicensePreamble::decode(&mut cur).map_err(ConnectError::Decode)?;
+        match preamble.msg_type {
+            license::MSG_ERROR_ALERT => {
+                let alert = license::LicenseError::decode(&mut cur).map_err(ConnectError::Decode)?;
+                // `dwStateTransition` pins the client's reaction (MS-RDPELE 2.2.2.7), not the
+                // error code alone: ST_NO_TRANSITION means the licensing exchange is over and
+                // the connect proceeds — true for the STATUS_VALID_CLIENT short-circuit (the
+                // path most real servers take) and equally for a grace-period server that
+                // reports an error code yet continues to Demand Active (FreeRDP-compatible).
+                // Everything else (ST_TOTAL_ABORT, or the RESET/RESEND transitions this slice
+                // does not negotiate) ends the connect with a typed failure.
+                if alert.error_code == license::STATUS_VALID_CLIENT
+                    || alert.state_transition == license::ST_NO_TRANSITION
+                {
+                    self.stage = Stage::CapabilityExchange { selected };
+                    Ok(Vec::new())
+                } else {
+                    Err(ConnectError::LicensingFailed {
+                        error_code: alert.error_code,
+                    })
+                }
+            }
+            license::MSG_LICENSE_REQUEST => {
+                let request =
+                    license::ServerLicenseRequest::decode(&mut cur).map_err(ConnectError::Decode)?;
+                let key = self.server_license_key(request.certificate.as_ref())?;
+                let entropy = &self.config.license.entropy;
+                self.license_keys = Some(license_crypto::derive_license_keys(
+                    &entropy.premaster_secret,
+                    &entropy.client_random,
+                    &request.server_random,
+                ));
+                let encrypted_premaster = license_crypto::encrypt_premaster_secret(
+                    &entropy.premaster_secret,
+                    &key.modulus,
+                    key.exponent,
+                );
+                let msg = license::encode_new_license_request(
+                    self.config.license.platform_id,
+                    &entropy.client_random,
+                    &encrypted_premaster,
+                    &self.config.client_info.username,
+                    &self.config.core.client_name,
+                );
+                Ok(vec![self.send_io(&msg)])
+            }
+            license::MSG_PLATFORM_CHALLENGE => {
+                let challenge =
+                    license::PlatformChallenge::decode(&mut cur).map_err(ConnectError::Decode)?;
+                let keys = self.license_keys.as_ref().ok_or(ConnectError::Decode(
+                    justrdp_pdu::DecodeError::InvalidField {
+                        field: "PLATFORM_CHALLENGE",
+                        reason: "platform challenge before a license request derived keys",
+                    },
+                ))?;
+                let plain = license_crypto::rc4(&keys.license_key, &challenge.encrypted_challenge);
+                if license_crypto::mac_data(&keys.mac_salt, &plain) != challenge.mac {
+                    return Err(ConnectError::LicenseMacMismatch);
+                }
+                // PLATFORM_CHALLENGE_RESPONSE_DATA (MS-RDPELE 2.2.2.5.1): version 1.0, client
+                // type "other", detail level "detail", then the decrypted challenge echoed.
+                let mut response = Vec::with_capacity(8 + plain.len());
+                response.extend_from_slice(&0x0100u16.to_le_bytes());
+                response.extend_from_slice(&0xFF00u16.to_le_bytes());
+                response.extend_from_slice(&0x0003u16.to_le_bytes());
+                response.extend_from_slice(&(plain.len() as u16).to_le_bytes());
+                response.extend_from_slice(&plain);
+                // CLIENT_HARDWARE_ID (2.2.2.5.2): PlatformId + the caller's four words.
+                let mut hwid = Vec::with_capacity(20);
+                hwid.extend_from_slice(&self.config.license.platform_id.to_le_bytes());
+                for word in self.config.license.hardware_id {
+                    hwid.extend_from_slice(&word.to_le_bytes());
+                }
+                let mac =
+                    license_crypto::mac_data(&keys.mac_salt, &[&response[..], &hwid].concat());
+                let msg = license::encode_platform_challenge_response(
+                    &license_crypto::rc4(&keys.license_key, &response),
+                    &license_crypto::rc4(&keys.license_key, &hwid),
+                    &mac,
+                );
+                Ok(vec![self.send_io(&msg)])
+            }
+            license::MSG_NEW_LICENSE | license::MSG_UPGRADE_LICENSE => {
+                let new_license =
+                    license::NewLicense::decode(&mut cur).map_err(ConnectError::Decode)?;
+                let keys = self.license_keys.as_ref().ok_or(ConnectError::Decode(
+                    justrdp_pdu::DecodeError::InvalidField {
+                        field: "NEW_LICENSE",
+                        reason: "license grant before a license request derived keys",
+                    },
+                ))?;
+                let plain =
+                    license_crypto::rc4(&keys.license_key, &new_license.encrypted_license_info);
+                if license_crypto::mac_data(&keys.mac_salt, &plain) != new_license.mac {
+                    return Err(ConnectError::LicenseMacMismatch);
+                }
+                // Persistent license caching is optional (MS-RDPELE) and backlog (plan.md §3):
+                // the grant is integrity-verified and discarded.
+                self.stage = Stage::CapabilityExchange { selected };
+                Ok(Vec::new())
+            }
+            _ => Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                field: "preamble.bMsgType",
+                reason: "unknown licensing message type",
+            })),
+        }
+    }
+
+    /// Resolve the RSA key the premaster secret is encrypted to, from whichever certificate
+    /// format the server sent.
+    fn server_license_key(
+        &self,
+        certificate: Option<&license::ServerCertificate>,
+    ) -> Result<license::RsaPublicKey, ConnectError> {
+        match certificate {
+            // A server may omit the certificate when it expects a cached license (LICENSE_INFO);
+            // this client holds none (caching is backlog), so the exchange cannot proceed.
+            None => Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                field: "ServerCertificate",
+                reason: "server sent no licensing certificate and no license is cached",
+            })),
+            Some(license::ServerCertificate::Proprietary(key)) => Ok(key.clone()),
+            Some(license::ServerCertificate::X509Chain(chain)) => {
+                // The leaf (last) certificate carries the licensing key. `x509-cert` extracts
+                // the inner subjectPublicKey — the DER RSAPublicKey — exactly as the TLS
+                // binding path does (ADR-0002 leaf dependency).
+                let leaf = chain.last().expect("decode guarantees a non-empty chain");
+                let inner = crate::tls::extract_subject_public_key(leaf).map_err(|_| {
+                    ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                        field: "ServerCertificate.X509",
+                        reason: "licensing X.509 leaf certificate could not be parsed",
+                    })
+                })?;
+                license::RsaPublicKey::from_pkcs1_der(&inner).map_err(ConnectError::Decode)
+            }
+        }
+    }
+
+    /// One Share Control PDU arrived while awaiting Demand Active. DeactivateAll and stray
+    /// data PDUs are decoded and discarded (MS-RDPBCGR 3.2.5.3.13: the server may reset);
+    /// Demand Active triggers Confirm Active plus the pipelined finalization batch.
+    fn capability_step(
+        &mut self,
+        selected: SecurityProtocol,
+        user_data: &[u8],
+    ) -> Result<Vec<Action>, ConnectError> {
+        let mut cur = ReadCursor::new(user_data, "share control pdu");
+        let header = share::ShareControlHeader::decode(&mut cur).map_err(ConnectError::Decode)?;
+        match header.pdu_type {
+            // The server is resetting the session: discard and keep waiting for the next
+            // Demand Active.
+            share::PDU_TYPE_DEACTIVATE_ALL => Ok(Vec::new()),
+            // A data PDU before Demand Active (e.g. an early Set Error Info): skip, per the
+            // robustness policy (plan.md §11c — unknown-but-well-formed input never kills the
+            // connect; malformed input does).
+            share::PDU_TYPE_DATA => Ok(Vec::new()),
+            share::PDU_TYPE_DEMAND_ACTIVE => {
+                let demand =
+                    capability::DemandActive::decode(&mut cur).map_err(ConnectError::Decode)?;
+                self.share_id = header.share_id;
+                // The negotiated desktop size lives in the server's Bitmap set; a server that
+                // omits it accepts the client's requested size.
+                self.negotiated_size = demand
+                    .bitmap()
+                    .map(|b| (b.desktop_width, b.desktop_height))
+                    .unwrap_or((
+                        self.config.core.desktop_width,
+                        self.config.core.desktop_height,
+                    ));
+                self.server_capabilities = demand.capability_sets;
+
+                // Echo the negotiated size into our Bitmap set — the one wire fact the machine
+                // writes into the caller's capability list (like `serverSelectedProtocol`).
+                let mut caps = self.config.capabilities.clone();
+                for set in &mut caps {
+                    if let CapabilitySet::Bitmap(bitmap) = set {
+                        bitmap.desktop_width = self.negotiated_size.0;
+                        bitmap.desktop_height = self.negotiated_size.1;
+                    }
+                }
+                let confirm = share::encode_share_control(
+                    share::PDU_TYPE_CONFIRM_ACTIVE,
+                    self.user_channel_id,
+                    header.share_id,
+                    &capability::encode_confirm_active(header.pdu_source, b"justrdp\0", &caps),
+                );
+
+                // Pipeline the whole finalization batch with the confirm (MS-RDPBCGR
+                // 1.3.1.1 allows it; one round trip instead of four).
+                let batch = [
+                    (
+                        share::PDU_TYPE2_SYNCHRONIZE,
+                        finalization::Synchronize {
+                            target_user: header.pdu_source,
+                        }
+                        .encode(),
+                    ),
+                    (
+                        share::PDU_TYPE2_CONTROL,
+                        finalization::Control::new(finalization::CTRLACTION_COOPERATE).encode(),
+                    ),
+                    (
+                        share::PDU_TYPE2_CONTROL,
+                        finalization::Control::new(finalization::CTRLACTION_REQUEST_CONTROL)
+                            .encode(),
+                    ),
+                    (share::PDU_TYPE2_FONT_LIST, finalization::encode_font_list()),
+                ];
+                let mut actions = vec![self.send_io(&confirm)];
+                for (pdu_type2, body) in batch {
+                    actions.push(self.send_io(&share::encode_share_data(
+                        self.user_channel_id,
+                        header.share_id,
+                        share::STREAM_MED,
+                        pdu_type2,
+                        &body,
+                    )));
+                }
+                self.stage = Stage::Finalization { selected };
+                Ok(actions)
+            }
+            _ => Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                field: "ShareControlHeader.pduType",
+                reason: "unexpected share control pdu during capability exchange",
+            })),
+        }
+    }
+
+    /// One Share PDU arrived during finalization. The Font Map is the session-active gate;
+    /// the server's Synchronize / Control replies are decoded and noted; everything else is
+    /// skipped. A DeactivateAll (or a fresh Demand Active) re-runs capability exchange.
+    fn finalization_step(
+        &mut self,
+        selected: SecurityProtocol,
+        user_data: &[u8],
+    ) -> Result<Vec<Action>, ConnectError> {
+        let mut cur = ReadCursor::new(user_data, "finalization pdu");
+        let header = share::ShareControlHeader::decode(&mut cur).map_err(ConnectError::Decode)?;
+        match header.pdu_type {
+            share::PDU_TYPE_DATA => {
+                let data = share::ShareDataHeader::decode(&mut cur).map_err(ConnectError::Decode)?;
+                match data.pdu_type2 {
+                    share::PDU_TYPE2_FONT_MAP => {
+                        finalization::FontMap::decode(&mut cur).map_err(ConnectError::Decode)?;
+                        // Session-active: the terminal stage keeps the glossary label so the
+                        // host observes the `session-active` transition (CONTEXT.md stage 7).
+                        self.stage = Stage::Done {
+                            last: "session-active",
+                        };
+                        Ok(vec![Action::SessionActive {
+                            result: ActivationResult {
+                                share_id: self.share_id,
+                                desktop_size: self.negotiated_size,
+                                server_capabilities: std::mem::take(&mut self.server_capabilities),
+                                leftover: std::mem::take(&mut self.inbox),
+                            },
+                        }])
+                    }
+                    share::PDU_TYPE2_SYNCHRONIZE => {
+                        finalization::Synchronize::decode(&mut cur)
+                            .map_err(ConnectError::Decode)?;
+                        Ok(Vec::new())
+                    }
+                    share::PDU_TYPE2_CONTROL => {
+                        finalization::Control::decode(&mut cur).map_err(ConnectError::Decode)?;
+                        Ok(Vec::new())
+                    }
+                    // Anything else the server interleaves here (Save Session Info, Set Error
+                    // Info, keyboard indicators, …) is session-loop material: skipped now,
+                    // handled by the corresponding epics.
+                    _ => Ok(Vec::new()),
+                }
+            }
+            // The server reset mid-finalization: go back to waiting for Demand Active.
+            share::PDU_TYPE_DEACTIVATE_ALL => {
+                self.stage = Stage::CapabilityExchange { selected };
+                Ok(Vec::new())
+            }
+            // A fresh Demand Active without an explicit deactivate: re-run the exchange.
+            share::PDU_TYPE_DEMAND_ACTIVE => self.capability_step(selected, user_data),
+            _ => Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                field: "ShareControlHeader.pduType",
+                reason: "unexpected share control pdu during finalization",
+            })),
+        }
     }
 
     /// Fail the connect: emit [`Action::FailWith`] and move to the terminal [`Stage::Done`],
@@ -803,6 +1248,40 @@ mod tests {
                 session_id: 0,
                 performance_flags: 0x7,
             },
+            capabilities: capability::default_client_capabilities(&core_for_caps()),
+            license: LicenseConfig {
+                entropy: LicenseEntropy {
+                    client_random: [0x11; license::RANDOM_SIZE],
+                    premaster_secret: [0x22; license::PREMASTER_SECRET_SIZE],
+                },
+                platform_id: license::PLATFORM_ID_NT_POST_52_MICROSOFT,
+                hardware_id: [1, 2, 3, 4],
+            },
+        }
+    }
+
+    /// The same core data `config_with_flags` builds, for deriving default capabilities.
+    fn core_for_caps() -> justrdp_pdu::gcc::ClientCoreData {
+        justrdp_pdu::gcc::ClientCoreData {
+            version: RDP_VERSION_10_12,
+            desktop_width: 1280,
+            desktop_height: 800,
+            keyboard_layout: 0x0409,
+            client_build: 1,
+            client_name: "sm-test".to_string(),
+            keyboard_type: KEYBOARD_TYPE_IBM_ENHANCED,
+            keyboard_subtype: 0,
+            keyboard_functional_keys_count: 12,
+            ime_file_name: String::new(),
+            post_beta2_color_depth: COLOR_DEPTH_8BPP,
+            client_product_id: 1,
+            serial_number: 0,
+            high_color_depth: HIGH_COLOR_DEPTH_24BPP,
+            supported_color_depths: SUPPORTED_COLOR_DEPTH_24BPP | SUPPORTED_COLOR_DEPTH_32BPP,
+            early_capability_flags: ClientEarlyCapabilityFlags::empty(),
+            dig_product_id: String::new(),
+            connection_type: CONNECTION_TYPE_LAN,
+            server_selected_protocol: SecurityProtocol::from_bits(0),
         }
     }
 
@@ -1422,8 +1901,9 @@ mod tests {
         }
     }
 
-    /// A machine driven to the terminal stage via the success path (McsConnected emitted).
-    fn done_connected() -> ConnectStateMachine {
+    /// A machine driven through the MCS connect (McsConnected emitted) into the licensing
+    /// wait — no longer terminal since slice-5 continues to session-active.
+    fn licensing() -> ConnectStateMachine {
         let mut sm = joining_channels();
         let mut batch = Vec::new();
         for id in [1007u16, 1003, 1004, 1005] {
@@ -1452,7 +1932,7 @@ mod tests {
         // expect yields FailWith(UnexpectedEvent { stage, event }) — never a panic, never a
         // silent misparse.
         type Make = fn() -> ConnectStateMachine;
-        let stages: [(Make, &str, &[EventKind]); 10] = [
+        let stages: [(Make, &str, &[EventKind]); 12] = [
             (
                 || ConnectStateMachine::new(config()),
                 "tcp-connect",
@@ -1492,8 +1972,12 @@ mod tests {
                 &[EventKind::Received],
             ),
             (joining_channels, "capability-exchange", &[EventKind::Received]),
+            // Licensing and the Demand Active wait keep consuming socket bytes under the
+            // capability-exchange label; finalization does so under activation.
+            (licensing, "capability-exchange", &[EventKind::Received]),
+            (capability_waiting, "capability-exchange", &[EventKind::Received]),
+            (finalizing, "activation", &[EventKind::Received]),
             // Terminal machines keep reporting the label of the stage where the connect ended.
-            (done_connected, "capability-exchange", &[]),
             (done_failed, "x224-negotiate", &[]),
         ];
 
@@ -1547,14 +2031,14 @@ mod tests {
 
     #[test]
     fn replay_after_completion_is_unexpected() {
-        // The terminal state accepts nothing: replaying an event after McsConnected must fail
-        // typed, attributed to the stage where the connect ended (capability-exchange).
-        let mut sm = done_connected();
+        // The terminal state accepts nothing: replaying an event after SessionActive must
+        // fail typed, attributed to the stage where the connect ended (session-active).
+        let mut sm = session_active().0;
         let actions = sm.process(Event::NlaComplete);
         assert_eq!(
             actions,
             vec![Action::FailWith(ConnectError::UnexpectedEvent {
-                stage: "capability-exchange",
+                stage: "session-active",
                 event: EventKind::NlaComplete,
             })]
         );
@@ -1566,6 +2050,527 @@ mod tests {
         // ended. No non-glossary label is ever observable, so a host's on_stage sees only
         // CONTEXT.md's seven Connect Stage labels and error attribution survives.
         assert_eq!(done_failed().stage(), "x224-negotiate");
-        assert_eq!(done_connected().stage(), "capability-exchange");
+        assert_eq!(licensing().stage(), "capability-exchange");
+        assert_eq!(session_active().0.stage(), "session-active");
+    }
+
+    // ───────────────────────── slice-5: licensing → capability → activation ──────────────────
+
+    /// The server random every synthetic licensing exchange uses.
+    const SERVER_RANDOM: [u8; 32] = [0x5A; 32];
+    /// The 512-bit modulus of the synthetic proprietary licensing certificate (top bit set).
+    const TEST_MODULUS: [u8; 64] = [0xC3; 64];
+    /// The share ID the synthetic Demand Active assigns.
+    const SHARE_ID: u32 = 0x0001_03EA;
+
+    /// Wrap a server-side I/O channel payload as a complete inbound frame, with ironrdp's
+    /// Send Data Indication encoder (their encoder, our decoder).
+    fn server_io_frame(user_data: &[u8]) -> Vec<u8> {
+        iron_encode_vec(&IronX224(iron_mcs::SendDataIndication {
+            initiator_id: 1002,
+            channel_id: 1003,
+            user_data: std::borrow::Cow::Borrowed(user_data),
+        }))
+        .unwrap()
+    }
+
+    /// Security header + preamble + body, as the server frames licensing messages.
+    fn license_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        client_info::encode_basic_security_header(&mut out, client_info::SEC_LICENSE_PKT);
+        out.push(msg_type);
+        out.push(0x03); // version 3.0
+        out.extend_from_slice(&((4 + body.len()) as u16).to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A License Error (ERROR_ALERT) message with the given code and state transition.
+    fn license_alert_with(error_code: u32, state_transition: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&error_code.to_le_bytes());
+        body.extend_from_slice(&state_transition.to_le_bytes());
+        body.extend_from_slice(&[0x04, 0x00, 0x00, 0x00]); // empty error-info blob
+        license_message(license::MSG_ERROR_ALERT, &body)
+    }
+
+    /// A License Error (ERROR_ALERT) message ending the exchange (`ST_NO_TRANSITION`).
+    fn license_alert(error_code: u32) -> Vec<u8> {
+        license_alert_with(error_code, license::ST_NO_TRANSITION)
+    }
+
+    /// A proprietary (CERT_CHAIN_VERSION_1) server certificate around [`TEST_MODULUS`].
+    fn proprietary_cert() -> Vec<u8> {
+        let keylen = TEST_MODULUS.len() + 8;
+        let mut key = Vec::new();
+        key.extend_from_slice(&0x3141_5352u32.to_le_bytes()); // "RSA1"
+        key.extend_from_slice(&(keylen as u32).to_le_bytes());
+        key.extend_from_slice(&((TEST_MODULUS.len() * 8) as u32).to_le_bytes());
+        key.extend_from_slice(&((TEST_MODULUS.len() - 1) as u32).to_le_bytes());
+        key.extend_from_slice(&65537u32.to_le_bytes());
+        let mut le = TEST_MODULUS.to_vec();
+        le.reverse();
+        key.extend_from_slice(&le);
+        key.extend_from_slice(&[0u8; 8]);
+
+        let mut cert = Vec::new();
+        cert.extend_from_slice(&1u32.to_le_bytes());
+        cert.extend_from_slice(&1u32.to_le_bytes());
+        cert.extend_from_slice(&1u32.to_le_bytes());
+        cert.extend_from_slice(&0x0006u16.to_le_bytes());
+        cert.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        cert.extend_from_slice(&key);
+        cert
+    }
+
+    /// A Server License Request opening the full negotiation.
+    fn server_license_request() -> Vec<u8> {
+        let cert = proprietary_cert();
+        let mut body = Vec::new();
+        body.extend_from_slice(&SERVER_RANDOM);
+        body.extend_from_slice(&0x0006_0000u32.to_le_bytes()); // ProductInfo.dwVersion
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(b"M\0S\0");
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(b"A\0");
+        body.extend_from_slice(&0x000Du16.to_le_bytes()); // KeyExchangeList blob
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0x0003u16.to_le_bytes()); // certificate blob
+        body.extend_from_slice(&(cert.len() as u16).to_le_bytes());
+        body.extend_from_slice(&cert);
+        body.extend_from_slice(&0u32.to_le_bytes()); // ScopeCount 0
+        license_message(license::MSG_LICENSE_REQUEST, &body)
+    }
+
+    /// The keys both sides derive in the synthetic full negotiation (the test plays server).
+    fn test_license_keys() -> license_crypto::LicenseKeys {
+        license_crypto::derive_license_keys(&[0x22; 48], &[0x11; 32], &SERVER_RANDOM)
+    }
+
+    /// A synthetic Demand Active: General + Bitmap (carrying `width`×`height`) + Input.
+    fn server_demand_active(width: u16, height: u16) -> Vec<u8> {
+        let sets = vec![
+            CapabilitySet::General(capability::GeneralCapabilitySet {
+                os_major_type: 1,
+                os_minor_type: 3,
+                extra_flags: capability::GENERAL_FASTPATH_OUTPUT_SUPPORTED,
+                refresh_rect_support: 1,
+                suppress_output_support: 1,
+            }),
+            CapabilitySet::Bitmap(capability::BitmapCapabilitySet {
+                preferred_bits_per_pixel: 32,
+                desktop_width: width,
+                desktop_height: height,
+                desktop_resize_flag: 1,
+                drawing_flags: 0,
+            }),
+            CapabilitySet::Input(capability::InputCapabilitySet {
+                input_flags: capability::INPUT_FLAG_SCANCODES,
+                keyboard_layout: 0,
+                keyboard_type: 4,
+                keyboard_subtype: 0,
+                keyboard_function_key: 12,
+            }),
+        ];
+        let mut caps = Vec::new();
+        for set in &sets {
+            set.encode(&mut caps);
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&((caps.len() + 4) as u16).to_le_bytes());
+        body.extend_from_slice(b"RDP\0");
+        body.extend_from_slice(&(sets.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&caps);
+        body.extend_from_slice(&0u32.to_le_bytes()); // sessionId
+        share::encode_share_control(share::PDU_TYPE_DEMAND_ACTIVE, 1002, SHARE_ID, &body)
+    }
+
+    /// The five outbound frames the machine must emit in response to Demand Active:
+    /// Confirm Active (with the negotiated size echoed) + the pipelined finalization batch.
+    fn expected_confirm_and_batch(width: u16, height: u16) -> Vec<Action> {
+        let mut caps = config().capabilities;
+        for set in &mut caps {
+            if let CapabilitySet::Bitmap(bitmap) = set {
+                bitmap.desktop_width = width;
+                bitmap.desktop_height = height;
+            }
+        }
+        let confirm = share::encode_share_control(
+            share::PDU_TYPE_CONFIRM_ACTIVE,
+            1007,
+            SHARE_ID,
+            &capability::encode_confirm_active(1002, b"justrdp\0", &caps),
+        );
+        let mut expected = vec![Action::WriteBytes(frame_io(&confirm))];
+        let batch = [
+            (
+                share::PDU_TYPE2_SYNCHRONIZE,
+                finalization::Synchronize { target_user: 1002 }.encode(),
+            ),
+            (
+                share::PDU_TYPE2_CONTROL,
+                finalization::Control::new(finalization::CTRLACTION_COOPERATE).encode(),
+            ),
+            (
+                share::PDU_TYPE2_CONTROL,
+                finalization::Control::new(finalization::CTRLACTION_REQUEST_CONTROL).encode(),
+            ),
+            (share::PDU_TYPE2_FONT_LIST, finalization::encode_font_list()),
+        ];
+        for (pdu_type2, body) in batch {
+            expected.push(Action::WriteBytes(frame_io(&share::encode_share_data(
+                1007,
+                SHARE_ID,
+                share::STREAM_MED,
+                pdu_type2,
+                &body,
+            ))));
+        }
+        expected
+    }
+
+    /// Frame a client I/O payload the way the machine does (user 1007, I/O channel 1003).
+    fn frame_io(payload: &[u8]) -> Vec<u8> {
+        tpkt::encode(&x224::encode_data(&mcs::encode_send_data_request(
+            1007, 1003, payload,
+        )))
+    }
+
+    /// A server Share Data PDU on the synthetic share.
+    fn server_share_data(pdu_type2: u8, body: &[u8]) -> Vec<u8> {
+        share::encode_share_data(1002, SHARE_ID, share::STREAM_MED, pdu_type2, body)
+    }
+
+    /// Past licensing (short-circuit), awaiting Demand Active.
+    fn capability_waiting() -> ConnectStateMachine {
+        let mut sm = licensing();
+        let actions = sm.process(Event::Received(&server_io_frame(&license_alert(
+            license::STATUS_VALID_CLIENT,
+        ))));
+        assert!(actions.is_empty(), "the short-circuit produces no output");
+        sm
+    }
+
+    /// Past Demand Active: Confirm Active + finalization batch sent, awaiting Font Map.
+    fn finalizing() -> ConnectStateMachine {
+        let mut sm = capability_waiting();
+        let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
+            1920, 1080,
+        ))));
+        assert_eq!(actions, expected_confirm_and_batch(1920, 1080));
+        sm
+    }
+
+    /// Through the Font Map into session-active; returns the machine and the result.
+    fn session_active() -> (ConnectStateMachine, ActivationResult) {
+        let mut sm = finalizing();
+        // The server's own finalization replies, in the usual order.
+        for (pdu_type2, body) in [
+            (
+                share::PDU_TYPE2_SYNCHRONIZE,
+                finalization::Synchronize { target_user: 1007 }.encode(),
+            ),
+            (
+                share::PDU_TYPE2_CONTROL,
+                finalization::Control {
+                    action: finalization::CTRLACTION_COOPERATE,
+                    grant_id: 0,
+                    control_id: 0,
+                }
+                .encode(),
+            ),
+            (
+                share::PDU_TYPE2_CONTROL,
+                finalization::Control {
+                    action: finalization::CTRLACTION_GRANTED_CONTROL,
+                    grant_id: 1007,
+                    control_id: 1002,
+                }
+                .encode(),
+            ),
+        ] {
+            let actions =
+                sm.process(Event::Received(&server_io_frame(&server_share_data(
+                    pdu_type2, &body,
+                ))));
+            assert!(actions.is_empty(), "server finalization replies produce no output");
+        }
+        let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
+            share::PDU_TYPE2_FONT_MAP,
+            &[0, 0, 0, 0, 3, 0, 4, 0],
+        ))));
+        match actions.as_slice() {
+            [Action::SessionActive { result }] => (sm, result.clone()),
+            other => panic!("expected SessionActive after Font Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn licensing_error_with_total_abort_fails_typed() {
+        let mut sm = licensing();
+        // ERR_NO_LICENSE (0x02) + ST_TOTAL_ABORT: the server refuses and aborts the exchange
+        // (MS-RDPELE 2.2.2.7) — no license, no session.
+        let actions = sm.process(Event::Received(&server_io_frame(&license_alert_with(
+            0x02,
+            license::ST_TOTAL_ABORT,
+        ))));
+        assert_eq!(
+            actions,
+            vec![Action::FailWith(ConnectError::LicensingFailed { error_code: 0x02 })]
+        );
+    }
+
+    #[test]
+    fn licensing_error_with_no_transition_advances_like_a_grace_period_server() {
+        // A grace-period server reports an error code yet declares the exchange over
+        // (ST_NO_TRANSITION) and proceeds to Demand Active — the client must advance, not
+        // fail (the spec's "terminal License Error" clause; FreeRDP-compatible).
+        let mut sm = licensing();
+        let actions = sm.process(Event::Received(&server_io_frame(&license_alert_with(
+            0x02,
+            license::ST_NO_TRANSITION,
+        ))));
+        assert!(actions.is_empty(), "exchange-ending alert produces no output");
+
+        let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
+            1920, 1080,
+        ))));
+        assert_eq!(actions, expected_confirm_and_batch(1920, 1080));
+    }
+
+    #[test]
+    fn licensing_requires_the_license_security_flag() {
+        let mut sm = licensing();
+        // A well-formed share PDU where a licensing message must be: sequence desync.
+        let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
+            800, 600,
+        ))));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::FailWith(ConnectError::Decode(_))]
+            ),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn full_license_negotiation_answers_request_challenge_and_accepts_grant() {
+        let mut sm = licensing();
+
+        // 1. Server License Request → the machine answers with a New License Request built
+        //    from the caller's entropy and the certificate's RSA key — byte-exact.
+        let actions =
+            sm.process(Event::Received(&server_io_frame(&server_license_request())));
+        let encrypted_premaster =
+            license_crypto::encrypt_premaster_secret(&[0x22; 48], &TEST_MODULUS, 65537);
+        let expected = license::encode_new_license_request(
+            license::PLATFORM_ID_NT_POST_52_MICROSOFT,
+            &[0x11; 32],
+            &encrypted_premaster,
+            "sm-user",
+            "sm-test",
+        );
+        assert_eq!(actions, vec![Action::WriteBytes(frame_io(&expected))]);
+
+        // 2. Platform Challenge (RC4 + MAC under the derived keys) → byte-exact response.
+        let keys = test_license_keys();
+        let challenge_plain = b"TEST-CHALLENGE\0";
+        let mut challenge_body = Vec::new();
+        challenge_body.extend_from_slice(&0u32.to_le_bytes()); // ConnectFlags
+        let encrypted = license_crypto::rc4(&keys.license_key, challenge_plain);
+        challenge_body.extend_from_slice(&0x0009u16.to_le_bytes());
+        challenge_body.extend_from_slice(&(encrypted.len() as u16).to_le_bytes());
+        challenge_body.extend_from_slice(&encrypted);
+        challenge_body.extend_from_slice(&license_crypto::mac_data(
+            &keys.mac_salt,
+            challenge_plain,
+        ));
+        let actions = sm.process(Event::Received(&server_io_frame(&license_message(
+            license::MSG_PLATFORM_CHALLENGE,
+            &challenge_body,
+        ))));
+
+        let mut response = Vec::new();
+        response.extend_from_slice(&0x0100u16.to_le_bytes());
+        response.extend_from_slice(&0xFF00u16.to_le_bytes());
+        response.extend_from_slice(&0x0003u16.to_le_bytes());
+        response.extend_from_slice(&(challenge_plain.len() as u16).to_le_bytes());
+        response.extend_from_slice(challenge_plain);
+        let mut hwid = Vec::new();
+        hwid.extend_from_slice(&license::PLATFORM_ID_NT_POST_52_MICROSOFT.to_le_bytes());
+        for word in [1u32, 2, 3, 4] {
+            hwid.extend_from_slice(&word.to_le_bytes());
+        }
+        let expected = license::encode_platform_challenge_response(
+            &license_crypto::rc4(&keys.license_key, &response),
+            &license_crypto::rc4(&keys.license_key, &hwid),
+            &license_crypto::mac_data(&keys.mac_salt, &[&response[..], &hwid].concat()),
+        );
+        assert_eq!(actions, vec![Action::WriteBytes(frame_io(&expected))]);
+
+        // 3. New License (MAC-verified) ends the exchange; the machine is now waiting for
+        //    Demand Active and handles it normally.
+        let license_plain = b"LICENSE-BLOB";
+        let mut grant = Vec::new();
+        let encrypted = license_crypto::rc4(&keys.license_key, license_plain);
+        grant.extend_from_slice(&0x0009u16.to_le_bytes());
+        grant.extend_from_slice(&(encrypted.len() as u16).to_le_bytes());
+        grant.extend_from_slice(&encrypted);
+        grant.extend_from_slice(&license_crypto::mac_data(&keys.mac_salt, license_plain));
+        let actions = sm.process(Event::Received(&server_io_frame(&license_message(
+            license::MSG_NEW_LICENSE,
+            &grant,
+        ))));
+        assert!(actions.is_empty());
+
+        let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
+            1920, 1080,
+        ))));
+        assert_eq!(actions, expected_confirm_and_batch(1920, 1080));
+    }
+
+    #[test]
+    fn platform_challenge_with_a_bad_mac_fails_typed() {
+        let mut sm = licensing();
+        sm.process(Event::Received(&server_io_frame(&server_license_request())));
+
+        let keys = test_license_keys();
+        let mut challenge_body = Vec::new();
+        challenge_body.extend_from_slice(&0u32.to_le_bytes());
+        let encrypted = license_crypto::rc4(&keys.license_key, b"TEST-CHALLENGE\0");
+        challenge_body.extend_from_slice(&0x0009u16.to_le_bytes());
+        challenge_body.extend_from_slice(&(encrypted.len() as u16).to_le_bytes());
+        challenge_body.extend_from_slice(&encrypted);
+        challenge_body.extend_from_slice(&[0xAA; 16]); // wrong MAC
+        let actions = sm.process(Event::Received(&server_io_frame(&license_message(
+            license::MSG_PLATFORM_CHALLENGE,
+            &challenge_body,
+        ))));
+        assert_eq!(
+            actions,
+            vec![Action::FailWith(ConnectError::LicenseMacMismatch)]
+        );
+    }
+
+    #[test]
+    fn deactivate_all_before_demand_active_is_discarded() {
+        let mut sm = capability_waiting();
+        let deactivate =
+            share::encode_share_control(share::PDU_TYPE_DEACTIVATE_ALL, 1002, SHARE_ID, &[]);
+        let actions = sm.process(Event::Received(&server_io_frame(&deactivate)));
+        assert!(actions.is_empty(), "DeactivateAll is decoded and discarded");
+        assert_eq!(sm.stage(), "capability-exchange");
+
+        // The next Demand Active proceeds normally.
+        let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
+            1024, 768,
+        ))));
+        assert_eq!(actions, expected_confirm_and_batch(1024, 768));
+    }
+
+    #[test]
+    fn demand_active_enters_the_activation_stage() {
+        let sm = finalizing();
+        assert_eq!(sm.stage(), "activation");
+    }
+
+    #[test]
+    fn font_map_gates_session_active_with_negotiated_results() {
+        let (sm, result) = session_active();
+        assert_eq!(sm.stage(), "session-active");
+        assert_eq!(result.share_id, SHARE_ID);
+        // The negotiated size came from the server's Bitmap set, not the 1280×800 request.
+        assert_eq!(result.desktop_size, (1920, 1080));
+        assert_eq!(result.server_capabilities.len(), 3);
+        assert!(result.leftover.is_empty());
+    }
+
+    #[test]
+    fn bytes_after_the_font_map_are_returned_as_leftover() {
+        let mut sm = finalizing();
+        let mut chunk = server_io_frame(&server_share_data(
+            share::PDU_TYPE2_FONT_MAP,
+            &[0, 0, 0, 0, 3, 0, 4, 0],
+        ));
+        // The server's first graphics bytes ride in the same read.
+        let trailing = [0x03, 0x00, 0x00, 0x20, 0xDE, 0xAD];
+        chunk.extend_from_slice(&trailing);
+        let actions = sm.process(Event::Received(&chunk));
+        match actions.as_slice() {
+            [Action::SessionActive { result }] => assert_eq!(result.leftover, trailing),
+            other => panic!("expected SessionActive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_data_pdus_during_finalization_are_skipped() {
+        let mut sm = finalizing();
+        // Save Session Info (logon notification) interleaves here on real servers.
+        let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
+            share::PDU_TYPE2_SAVE_SESSION_INFO,
+            &[0u8; 12],
+        ))));
+        assert!(actions.is_empty());
+        assert_eq!(sm.stage(), "activation");
+    }
+
+    #[test]
+    fn deactivate_during_finalization_reruns_capability_exchange() {
+        let mut sm = finalizing();
+        let deactivate =
+            share::encode_share_control(share::PDU_TYPE_DEACTIVATE_ALL, 1002, SHARE_ID, &[]);
+        let actions = sm.process(Event::Received(&server_io_frame(&deactivate)));
+        assert!(actions.is_empty());
+        assert_eq!(sm.stage(), "capability-exchange");
+
+        let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
+            800, 600,
+        ))));
+        assert_eq!(actions, expected_confirm_and_batch(800, 600));
+    }
+
+    #[test]
+    fn malformed_demand_active_fails_typed_not_panics() {
+        let mut sm = capability_waiting();
+        // A Demand Active whose capability count points past the buffer.
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&8u16.to_le_bytes());
+        body.extend_from_slice(b"RDP\0");
+        body.extend_from_slice(&9u16.to_le_bytes()); // 9 capsets, none present
+        body.extend_from_slice(&0u16.to_le_bytes());
+        let frame = share::encode_share_control(
+            share::PDU_TYPE_DEMAND_ACTIVE,
+            1002,
+            SHARE_ID,
+            &body,
+        );
+        let actions = sm.process(Event::Received(&server_io_frame(&frame)));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::FailWith(ConnectError::Decode(_))]
+            ),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_license_message_fails_typed_not_panics() {
+        let mut sm = licensing();
+        // Truncated License Request: the server random is cut short.
+        let truncated = license_message(license::MSG_LICENSE_REQUEST, &[0x5A; 10]);
+        let actions = sm.process(Event::Received(&server_io_frame(&truncated)));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::FailWith(ConnectError::Decode(_))]
+            ),
+            "got {actions:?}"
+        );
     }
 }
