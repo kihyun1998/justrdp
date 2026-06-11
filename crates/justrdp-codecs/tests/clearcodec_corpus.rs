@@ -1,101 +1,159 @@
-//! Regression anchor over the real-VM ClearCodec corpus (issue #56).
+//! Replay + differential anchor over the real-VM ClearCodec corpus (issue #56).
 //!
-//! The `*.bin` fixtures are genuine `CODECID_CLEARCODEC` payloads captured from the test VM
-//! (see `tests/fixtures/clearcodec/README.md`). This test pins the **current bootstrap**
-//! (`ironrdp-graphics`) behaviour: the `ok`-tagged streams decode, and the three `err`-tagged
-//! signatures are rejected — the very streams a real server emits and mstsc renders, that the
-//! oracle wrongly refuses.
+//! `fixtures/clearcodec/replay.bin` is one full session's worth of genuine `CODECID_CLEARCODEC`
+//! payloads captured from the test VM, **in arrival order** (see the README). Order matters:
+//! ClearCodec is stateful (the V-bar and glyph caches span PDUs), so a cache-hit stream only
+//! resolves when the earlier streams that populated those entries are replayed first. Decoding a
+//! single captured payload in isolation would spuriously miss the cache — these tests replay the
+//! whole sequence through one decoder, the way the live session does.
 //!
-//! The decode outcome (ok vs err) is self-contained per payload — verified empirically that
-//! replaying the full capture through one stateful decoder yields the same classification as
-//! decoding each payload in isolation — so loading fixtures individually is faithful here.
+//! Two properties are asserted:
 //!
-//! When the phase-2 self-owned decoder lands (#56), the `err` assertions below flip to `ok`:
-//! that inversion is the signal the rewrite achieved its goal. Update this test then.
+//! 1. The self-owned decoder replays the entire capture without error — the live session does
+//!    too (0 rejections), whereas the bootstrap oracle rejects a large fraction.
+//! 2. Where the oracle *succeeds*, the self-owned output is byte-identical (ADR-0003 phase-2
+//!    acceptance); where the oracle *rejects* with one of its three defective validations, the
+//!    self-owned decoder produces pixels instead.
 
-use justrdp_codecs::egfx::Clear;
+use justrdp_codecs::clearcodec::ClearDecoder;
 
-struct Fixture {
-    file: String,
+/// One captured payload with the destination-rectangle dimensions it was decoded against.
+struct Entry {
     width: u16,
     height: u16,
-    oracle: String,
+    data: Vec<u8>,
 }
 
-fn fixtures_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clearcodec")
-}
+fn load_replay() -> Vec<Entry> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/clearcodec/replay.bin");
+    let buf = std::fs::read(path).expect("the ClearCodec replay corpus must be present");
 
-fn load_manifest() -> Vec<Fixture> {
-    let manifest = std::fs::read_to_string(fixtures_dir().join("manifest.tsv"))
-        .expect("the ClearCodec corpus manifest must be present");
-    manifest
-        .lines()
-        .skip(1) // header
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            let f: Vec<&str> = line.split('\t').collect();
-            Fixture {
-                file: f[0].to_string(),
-                width: f[1].parse().expect("width"),
-                height: f[2].parse().expect("height"),
-                oracle: f[4].to_string(),
-            }
-        })
-        .collect()
-}
-
-fn payload(file: &str) -> Vec<u8> {
-    std::fs::read(fixtures_dir().join(file)).expect("fixture payload must be present")
-}
-
-#[test]
-fn corpus_manifest_is_non_empty_and_covers_every_signature() {
-    let fixtures = load_manifest();
-    assert!(!fixtures.is_empty(), "corpus manifest is empty");
-    for tag in [
-        "ok",
-        "rlex_suite_exceeds_region",
-        "short_vbar_cache_miss",
-        "vbar_cache_miss_on_hit",
-    ] {
-        assert!(
-            fixtures.iter().any(|f| f.oracle == tag),
-            "corpus is missing a `{tag}` fixture"
-        );
+    let mut entries = Vec::new();
+    let count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let mut pos = 4usize;
+    for _ in 0..count {
+        let width = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
+        let height = u16::from_le_bytes(buf[pos + 2..pos + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        entries.push(Entry {
+            width,
+            height,
+            data: buf[pos..pos + len].to_vec(),
+        });
+        pos += len;
     }
+    entries
 }
 
 #[test]
-fn ok_tagged_streams_decode_to_full_bgra() {
-    for f in load_manifest().into_iter().filter(|f| f.oracle == "ok") {
-        let mut clear = Clear::new();
-        let out = clear
-            .decode_to_bgra(&payload(&f.file), f.width, f.height)
-            .unwrap_or_else(|e| panic!("`{}` (oracle=ok) should decode, got {e}", f.file));
+fn corpus_is_present_and_non_trivial() {
+    let entries = load_replay();
+    assert!(
+        entries.len() >= 8,
+        "replay corpus is suspiciously small ({} entries)",
+        entries.len()
+    );
+}
+
+/// The headline #56 result: the self-owned decoder replays the full captured session without a
+/// single rejection — reproducing, VM-free, what the live capture observed.
+///
+/// This is also the **no-holes** proof. A Clear-region hole arises only when a stream fails to
+/// decode and the core's warn-and-skip policy leaves the region un-painted; zero rejections
+/// across the whole capture means zero skips, hence no holes. (Per-pixel blackness cannot stand
+/// in for "hole" — a single-entry black palette is legitimate all-black content, e.g. entry 0.)
+/// The aggregate non-black tally guards the converse: that the decoder genuinely paints content
+/// rather than silently returning zeroed buffers.
+#[test]
+fn self_owned_replays_full_capture_without_error() {
+    let mut decoder = ClearDecoder::new();
+    let mut nonblack_total = 0usize;
+    for (i, e) in load_replay().iter().enumerate() {
+        let out = decoder
+            .decode(&e.data, e.width, e.height)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "entry {i} ({}x{}) failed to decode: {err}",
+                    e.width, e.height
+                )
+            });
         assert_eq!(
             out.len(),
-            usize::from(f.width) * usize::from(f.height) * 4,
-            "`{}` decoded to the wrong BGRA size",
-            f.file
+            usize::from(e.width) * usize::from(e.height) * 4,
+            "entry {i} decoded to the wrong BGRA size"
         );
+        nonblack_total += out
+            .chunks_exact(4)
+            .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+            .count();
     }
+    assert!(
+        nonblack_total > 1000,
+        "the whole capture decoded to (near-)black ({nonblack_total} non-black px) — the decoder \
+         is not painting real content"
+    );
 }
 
-/// The current bootstrap oracle rejects these genuine streams — this is the #56 defect, pinned.
-/// The phase-2 self-owned decoder must make them decode; when it does, move each tag into
-/// [`ok_tagged_streams_decode_to_full_bgra`] and delete it here.
+/// Differential acceptance: feed the ordered sequence to both the self-owned decoder and the
+/// `ironrdp-graphics` oracle, each stateful. Where the oracle succeeds, outputs must be
+/// byte-identical; where it rejects (its three defective validations), the self-owned decoder
+/// must succeed. Asserts the corpus actually exercises the oracle's defects (rejections > 0) and
+/// that all three rejection signatures appear, so the fix is genuinely covered.
 #[test]
-fn oracle_rejected_signatures_still_fail_under_the_bootstrap() {
-    for f in load_manifest().into_iter().filter(|f| f.oracle != "ok") {
-        let mut clear = Clear::new();
-        let result = clear.decode_to_bgra(&payload(&f.file), f.width, f.height);
-        assert!(
-            result.is_err(),
-            "`{}` (oracle={}) unexpectedly decoded — if #56's decoder now handles it, \
-             reclassify this fixture as `ok`",
-            f.file,
-            f.oracle
-        );
+fn self_owned_matches_oracle_where_oracle_succeeds() {
+    let entries = load_replay();
+
+    let mut mine = ClearDecoder::new();
+    let mut oracle = ironrdp_graphics::clearcodec::ClearCodecDecoder::new();
+
+    let mut oracle_rejections = 0usize;
+    let mut saw_short_vbar = false;
+    let mut saw_rlex = false;
+    let mut saw_vbar_index = false;
+
+    for (i, e) in entries.iter().enumerate() {
+        let ours = mine.decode(&e.data, e.width, e.height);
+        let theirs = oracle.decode(&e.data, e.width, e.height);
+
+        match theirs {
+            Ok(theirs) => {
+                let ours = ours.unwrap_or_else(|err| {
+                    panic!("entry {i}: self-owned failed where oracle succeeded: {err}")
+                });
+                assert_eq!(
+                    ours, theirs,
+                    "entry {i} ({}x{}): self-owned BGRA differs from the oracle on a stream both accept",
+                    e.width, e.height
+                );
+            }
+            Err(err) => {
+                oracle_rejections += 1;
+                let msg = err.to_string();
+                if msg.contains("shortVBarCacheMiss") {
+                    saw_short_vbar = true;
+                }
+                if msg.contains("rlex") {
+                    saw_rlex = true;
+                }
+                if msg.contains("vbarIndex") {
+                    saw_vbar_index = true;
+                }
+                assert!(
+                    ours.is_ok(),
+                    "entry {i}: oracle rejected ({msg}) and the self-owned decoder did too"
+                );
+            }
+        }
     }
+
+    assert!(
+        oracle_rejections > 0,
+        "corpus never triggered an oracle rejection — it does not exercise the #56 fix"
+    );
+    assert!(
+        saw_short_vbar && saw_rlex && saw_vbar_index,
+        "corpus is missing a signature (shortVBarCacheMiss={saw_short_vbar}, rlex={saw_rlex}, vbarIndex={saw_vbar_index})"
+    );
 }
