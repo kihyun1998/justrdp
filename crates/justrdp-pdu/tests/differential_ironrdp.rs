@@ -59,7 +59,11 @@ fn connection_confirm_selected_protocol_matches_ironrdp() {
 
     match (ours, theirs.0) {
         (NegResponse::Selected(ours_proto), IronConfirm::Response { protocol, .. }) => {
-            assert_eq!(ours_proto.bits(), protocol.bits(), "selected protocol differs");
+            assert_eq!(
+                ours_proto.bits(),
+                protocol.bits(),
+                "selected protocol differs"
+            );
         }
         (ours, theirs) => panic!("decode shape mismatch: justrdp={ours:?}, ironrdp={theirs:?}"),
     }
@@ -326,11 +330,18 @@ fn our_client_info_pdu_decodes_identically_in_ironrdp() {
     assert_eq!(info.extra_info.address_family, iron_ci::AddressFamily::INET);
     assert_eq!(info.extra_info.address, "192.168.0.10");
     assert_eq!(info.extra_info.dir, "C:/justrdp");
-    let tz = info.extra_info.optional_data.timezone().expect("timezone present");
+    let tz = info
+        .extra_info
+        .optional_data
+        .timezone()
+        .expect("timezone present");
     assert_eq!(tz.bias, -540);
     assert_eq!(tz.standard_name, "Korea Standard Time");
     assert_eq!(tz.daylight_bias, -60);
-    assert_eq!(tz.standard_date.0, None, "zeroed SYSTEMTIME reads back as absent");
+    assert_eq!(
+        tz.standard_date.0, None,
+        "zeroed SYSTEMTIME reads back as absent"
+    );
     assert_eq!(info.extra_info.optional_data.session_id(), Some(7));
     assert_eq!(
         info.extra_info.optional_data.performance_flags(),

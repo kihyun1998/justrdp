@@ -735,9 +735,7 @@ impl ConferenceCreateResponse {
             });
         }
         per::read_length(&mut cur)?; // gcc blocks length (the remainder)
-        let blocks = ServerGccBlocks::decode(
-            cur.read_slice(cur.remaining())?,
-        )?;
+        let blocks = ServerGccBlocks::decode(cur.read_slice(cur.remaining())?)?;
         Ok(Self { node_id, blocks })
     }
 }
@@ -800,7 +798,10 @@ mod tests {
         body.clear();
         core.encode_into(&mut body);
         assert_eq!(
-            ClientCoreData::decode(&body).unwrap().early_capability_flags.bits(),
+            ClientCoreData::decode(&body)
+                .unwrap()
+                .early_capability_flags
+                .bits(),
             0
         );
     }

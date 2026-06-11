@@ -413,8 +413,7 @@ fn decode_body(cmd_id: u16, body: &[u8]) -> Result<EgfxPdu<'_>, DecodeError> {
         }
         CMDID_SURFACE_TO_CACHE => {
             let surface_id = cur.read_u16_le()?;
-            let cache_key = u64::from(cur.read_u32_le()?)
-                | (u64::from(cur.read_u32_le()?) << 32);
+            let cache_key = u64::from(cur.read_u32_le()?) | (u64::from(cur.read_u32_le()?) << 32);
             let cache_slot = cur.read_u16_le()?;
             let src_rect = Rect16::decode(&mut cur)?;
             EgfxPdu::SurfaceToCache {

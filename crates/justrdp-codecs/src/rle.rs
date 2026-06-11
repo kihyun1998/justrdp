@@ -202,7 +202,9 @@ impl Decoder<'_> {
                         self.write_pixel(pixel);
                     }
                 }
-                REGULAR_FGBG_IMAGE | MEGA_FGBG_IMAGE | LITE_SET_FG_FGBG_IMAGE
+                REGULAR_FGBG_IMAGE
+                | MEGA_FGBG_IMAGE
+                | LITE_SET_FG_FGBG_IMAGE
                 | MEGA_SET_FGBG_IMAGE => {
                     if code == LITE_SET_FG_FGBG_IMAGE || code == MEGA_SET_FGBG_IMAGE {
                         fg = self.read_pixel()?;
@@ -247,7 +249,13 @@ impl Decoder<'_> {
     /// Write up to 8 pixels driven by `mask`: a set bit XORs the foreground pixel into the
     /// pixel above (foreground pixel itself on the first scanline), a clear bit copies the
     /// pixel above (black on the first scanline).
-    fn fg_bg_image(&mut self, mask: u8, fg: u32, bits: usize, first_line: bool) -> Result<(), RleError> {
+    fn fg_bg_image(
+        &mut self,
+        mask: u8,
+        fg: u32,
+        bits: usize,
+        first_line: bool,
+    ) -> Result<(), RleError> {
         self.ensure_out(bits)?;
         for bit in 0..bits {
             let set = mask & 1 << bit != 0;
@@ -416,10 +424,7 @@ mod tests {
         // Truncated: COLOR_RUN promises a pixel that is not there.
         assert_eq!(decompress(&[0x62], 2, 1, 8), Err(RleError::TruncatedInput));
         // Overflow: a run longer than the image.
-        assert_eq!(
-            decompress(&[0x1F], 4, 1, 8),
-            Err(RleError::OutputOverflow)
-        );
+        assert_eq!(decompress(&[0x1F], 4, 1, 8), Err(RleError::OutputOverflow));
         // Unknown order code.
         assert_eq!(
             decompress(&[0xFB], 4, 1, 8),

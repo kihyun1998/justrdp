@@ -247,11 +247,7 @@ pub fn encode_channel_join_request(initiator_id: u16, channel_id: u16) -> Vec<u8
 /// Client Info PDU on the I/O channel). The PER length determinant caps `user_data` at 16383
 /// bytes — far above any connect-time payload; larger PDUs need MCS segmentation (a later
 /// slice, if ever needed).
-pub fn encode_send_data_request(
-    initiator_id: u16,
-    channel_id: u16,
-    user_data: &[u8],
-) -> Vec<u8> {
+pub fn encode_send_data_request(initiator_id: u16, channel_id: u16, user_data: &[u8]) -> Vec<u8> {
     debug_assert!(user_data.len() <= 0x3FFF, "PER length determinant overflow");
     let mut out = Vec::with_capacity(8 + user_data.len());
     per::write_choice(&mut out, CHOICE_SEND_DATA_REQUEST << 2);

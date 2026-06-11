@@ -65,8 +65,18 @@ impl Surface {
         if self.dirty.len() > MAX_DIRTY_RECTS {
             let left = self.dirty.iter().map(|r| r.0).min().unwrap_or(0);
             let top = self.dirty.iter().map(|r| r.1).min().unwrap_or(0);
-            let right = self.dirty.iter().map(|r| r.0.saturating_add(r.2)).max().unwrap_or(0);
-            let bottom = self.dirty.iter().map(|r| r.1.saturating_add(r.3)).max().unwrap_or(0);
+            let right = self
+                .dirty
+                .iter()
+                .map(|r| r.0.saturating_add(r.2))
+                .max()
+                .unwrap_or(0);
+            let bottom = self
+                .dirty
+                .iter()
+                .map(|r| r.1.saturating_add(r.3))
+                .max()
+                .unwrap_or(0);
             self.dirty.clear();
             self.dirty.push((left, top, right - left, bottom - top));
         }
@@ -196,7 +206,10 @@ impl GraphicsProcessor {
         match codec_id {
             egfx::CODECID_UNCOMPRESSED => {
                 if data.len() < uw * uh * 4 {
-                    return Err(invalid("RDPGFX_WIRE_TO_SURFACE_PDU_1", "uncompressed data shorter than the destination rectangle"));
+                    return Err(invalid(
+                        "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                        "uncompressed data shorter than the destination rectangle",
+                    ));
                 }
                 // 32bpp BGRX/BGRA, top-down (EGFX surfaces are top-down, unlike the GDI
                 // legacy bottom-up of the slow path).
@@ -269,10 +282,12 @@ impl GraphicsProcessor {
             }
             EgfxPdu::ResetGraphics { width, height } => {
                 tracing::debug!(target: "rdp_egfx", width, height, "ResetGraphics");
-                let width = u16::try_from(width)
-                    .map_err(|_| invalid("RDPGFX_RESET_GRAPHICS_PDU", "output width exceeds u16"))?;
-                let height = u16::try_from(height)
-                    .map_err(|_| invalid("RDPGFX_RESET_GRAPHICS_PDU", "output height exceeds u16"))?;
+                let width = u16::try_from(width).map_err(|_| {
+                    invalid("RDPGFX_RESET_GRAPHICS_PDU", "output width exceeds u16")
+                })?;
+                let height = u16::try_from(height).map_err(|_| {
+                    invalid("RDPGFX_RESET_GRAPHICS_PDU", "output height exceeds u16")
+                })?;
                 outputs.push(ProcessorOutput::OutputResized { width, height });
             }
             EgfxPdu::CreateSurface {
@@ -281,12 +296,21 @@ impl GraphicsProcessor {
                 height,
                 pixel_format: _,
             } => {
-                if width == 0 || height == 0 || width > MAX_SURFACE_DIM || height > MAX_SURFACE_DIM {
-                    return Err(invalid("RDPGFX_CREATE_SURFACE_PDU", "surface dimensions out of bounds"));
+                if width == 0 || height == 0 || width > MAX_SURFACE_DIM || height > MAX_SURFACE_DIM
+                {
+                    return Err(invalid(
+                        "RDPGFX_CREATE_SURFACE_PDU",
+                        "surface dimensions out of bounds",
+                    ));
                 }
                 self.surfaces.retain(|s| s.id != surface_id);
-                if self.total_surface_bytes() + Surface::bytes(width, height) > MAX_TOTAL_SURFACE_BYTES {
-                    return Err(invalid("RDPGFX_CREATE_SURFACE_PDU", "total surface allocation exceeds the cap"));
+                if self.total_surface_bytes() + Surface::bytes(width, height)
+                    > MAX_TOTAL_SURFACE_BYTES
+                {
+                    return Err(invalid(
+                        "RDPGFX_CREATE_SURFACE_PDU",
+                        "total surface allocation exceeds the cap",
+                    ));
                 }
                 tracing::debug!(target: "rdp_egfx", surface_id, width, height, "CreateSurface");
                 self.surfaces.push(Surface {
@@ -339,9 +363,10 @@ impl GraphicsProcessor {
             } => {
                 if let Some(rgba) = self.decode_wts1(codec_id, dest_rect, data)? {
                     let (w, h) = (dest_rect.width(), dest_rect.height());
-                    let surface = self
-                        .surface_mut(surface_id)
-                        .ok_or(invalid("RDPGFX_WIRE_TO_SURFACE_PDU_1", "unknown destination surface"))?;
+                    let surface = self.surface_mut(surface_id).ok_or(invalid(
+                        "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                        "unknown destination surface",
+                    ))?;
                     surface.blit(
                         i32::from(dest_rect.left),
                         i32::from(dest_rect.top),
@@ -366,7 +391,10 @@ impl GraphicsProcessor {
                 let (sw, sh) = match self.surfaces.iter().find(|s| s.id == surface_id) {
                     Some(s) => (s.width, s.height),
                     None => {
-                        return Err(invalid("RDPGFX_WIRE_TO_SURFACE_PDU_2", "unknown destination surface"));
+                        return Err(invalid(
+                            "RDPGFX_WIRE_TO_SURFACE_PDU_2",
+                            "unknown destination surface",
+                        ));
                     }
                 };
                 // Warn-and-skip on failure, like the WTS1 codecs: a bootstrap-decoder
@@ -407,9 +435,10 @@ impl GraphicsProcessor {
                 rects,
             } => {
                 let rgba = [color_bgrx[2], color_bgrx[1], color_bgrx[0], 255];
-                let surface = self
-                    .surface_mut(surface_id)
-                    .ok_or(invalid("RDPGFX_SOLIDFILL_PDU", "unknown destination surface"))?;
+                let surface = self.surface_mut(surface_id).ok_or(invalid(
+                    "RDPGFX_SOLIDFILL_PDU",
+                    "unknown destination surface",
+                ))?;
                 for rect in rects {
                     surface.fill(rect, rgba);
                 }
@@ -424,13 +453,29 @@ impl GraphicsProcessor {
                     .surfaces
                     .iter()
                     .find(|s| s.id == src_surface_id)
-                    .ok_or(invalid("RDPGFX_SURFACE_TO_SURFACE_PDU", "unknown source surface"))?
-                    .extract(src_rect.left, src_rect.top, src_rect.width(), src_rect.height());
-                let dest = self
-                    .surface_mut(dest_surface_id)
-                    .ok_or(invalid("RDPGFX_SURFACE_TO_SURFACE_PDU", "unknown destination surface"))?;
+                    .ok_or(invalid(
+                        "RDPGFX_SURFACE_TO_SURFACE_PDU",
+                        "unknown source surface",
+                    ))?
+                    .extract(
+                        src_rect.left,
+                        src_rect.top,
+                        src_rect.width(),
+                        src_rect.height(),
+                    );
+                let dest = self.surface_mut(dest_surface_id).ok_or(invalid(
+                    "RDPGFX_SURFACE_TO_SURFACE_PDU",
+                    "unknown destination surface",
+                ))?;
                 for pt in dest_points {
-                    dest.blit(i32::from(pt.x), i32::from(pt.y), w, h, &pixels, usize::from(w));
+                    dest.blit(
+                        i32::from(pt.x),
+                        i32::from(pt.y),
+                        w,
+                        h,
+                        &pixels,
+                        usize::from(w),
+                    );
                 }
             }
             EgfxPdu::SurfaceToCache {
@@ -443,16 +488,34 @@ impl GraphicsProcessor {
                     .surfaces
                     .iter()
                     .find(|s| s.id == surface_id)
-                    .ok_or(invalid("RDPGFX_SURFACE_TO_CACHE_PDU", "unknown source surface"))?
-                    .extract(src_rect.left, src_rect.top, src_rect.width(), src_rect.height());
+                    .ok_or(invalid(
+                        "RDPGFX_SURFACE_TO_CACHE_PDU",
+                        "unknown source surface",
+                    ))?
+                    .extract(
+                        src_rect.left,
+                        src_rect.top,
+                        src_rect.width(),
+                        src_rect.height(),
+                    );
                 if let Some(old) = self.cache.remove(&cache_slot) {
                     self.cache_bytes -= old.rgba.len();
                 }
                 if self.cache_bytes + rgba.len() > MAX_CACHE_BYTES {
-                    return Err(invalid("RDPGFX_SURFACE_TO_CACHE_PDU", "bitmap cache exceeds the CAPVERSION_8 budget"));
+                    return Err(invalid(
+                        "RDPGFX_SURFACE_TO_CACHE_PDU",
+                        "bitmap cache exceeds the CAPVERSION_8 budget",
+                    ));
                 }
                 self.cache_bytes += rgba.len();
-                self.cache.insert(cache_slot, CachedBitmap { width: w, height: h, rgba });
+                self.cache.insert(
+                    cache_slot,
+                    CachedBitmap {
+                        width: w,
+                        height: h,
+                        rgba,
+                    },
+                );
             }
             EgfxPdu::CacheToSurface {
                 cache_slot,
@@ -465,11 +528,19 @@ impl GraphicsProcessor {
                     .ok_or(invalid("RDPGFX_CACHE_TO_SURFACE_PDU", "unknown cache slot"))?;
                 let (w, h) = (entry.width, entry.height);
                 let pixels = entry.rgba.clone();
-                let dest = self
-                    .surface_mut(surface_id)
-                    .ok_or(invalid("RDPGFX_CACHE_TO_SURFACE_PDU", "unknown destination surface"))?;
+                let dest = self.surface_mut(surface_id).ok_or(invalid(
+                    "RDPGFX_CACHE_TO_SURFACE_PDU",
+                    "unknown destination surface",
+                ))?;
                 for pt in dest_points {
-                    dest.blit(i32::from(pt.x), i32::from(pt.y), w, h, &pixels, usize::from(w));
+                    dest.blit(
+                        i32::from(pt.x),
+                        i32::from(pt.y),
+                        w,
+                        h,
+                        &pixels,
+                        usize::from(w),
+                    );
                 }
             }
             EgfxPdu::EvictCacheEntry { cache_slot } => {
@@ -513,8 +584,10 @@ impl GraphicsProcessor {
                 // `ox`/`oy` are attacker-controlled u32s from MapSurfaceToOutput: the sum
                 // must neither overflow nor exceed the addressable output.
                 let (Some(out_x), Some(out_y)) = (
-                    ox.checked_add(u32::from(x)).and_then(|v| u16::try_from(v).ok()),
-                    oy.checked_add(u32::from(y)).and_then(|v| u16::try_from(v).ok()),
+                    ox.checked_add(u32::from(x))
+                        .and_then(|v| u16::try_from(v).ok()),
+                    oy.checked_add(u32::from(y))
+                        .and_then(|v| u16::try_from(v).ok()),
                 ) else {
                     continue; // mapped beyond the addressable output: nothing visible
                 };
@@ -632,8 +705,16 @@ mod tests {
         };
         // Raw EGFX PDU — client→server traffic is NOT segment-wrapped (real-VM-proven).
         assert_eq!(&message[..2], &egfx::CMDID_CAPS_ADVERTISE.to_le_bytes());
-        assert!(message.windows(4).any(|w| w == egfx::CAPVERSION_8.to_le_bytes()));
-        assert!(message.windows(4).any(|w| w == egfx::CAPVERSION_10.to_le_bytes()));
+        assert!(
+            message
+                .windows(4)
+                .any(|w| w == egfx::CAPVERSION_8.to_le_bytes())
+        );
+        assert!(
+            message
+                .windows(4)
+                .any(|w| w == egfx::CAPVERSION_10.to_le_bytes())
+        );
         // Every 10.x capset carries AVC_DISABLED (no H.264 decoder).
         let v10_at = message
             .windows(4)
@@ -855,7 +936,10 @@ mod tests {
             egfx::CMDID_SOLID_FILL,
             &solid_fill_body(1, [1, 1, 1, 0], [0, 0, 4, 4]),
         );
-        assert!(outputs.is_empty(), "unaddressable mapping must drop frames, got {outputs:?}");
+        assert!(
+            outputs.is_empty(),
+            "unaddressable mapping must drop frames, got {outputs:?}"
+        );
     }
 
     #[test]
@@ -869,12 +953,14 @@ mod tests {
         start[4..8].copy_from_slice(&1u32.to_le_bytes());
         feed(&mut p, egfx::CMDID_START_FRAME, &start);
         for i in 0..100u16 {
-            assert!(feed(
-                &mut p,
-                egfx::CMDID_SOLID_FILL,
-                &solid_fill_body(1, [9, 9, 9, 0], [i * 2, 0, i * 2 + 1, 1]),
-            )
-            .is_empty());
+            assert!(
+                feed(
+                    &mut p,
+                    egfx::CMDID_SOLID_FILL,
+                    &solid_fill_body(1, [9, 9, 9, 0], [i * 2, 0, i * 2 + 1, 1]),
+                )
+                .is_empty()
+            );
         }
         assert!(
             p.surfaces[0].dirty.len() <= MAX_DIRTY_RECTS + 1,
@@ -883,7 +969,14 @@ mod tests {
         );
         let outputs = feed(&mut p, egfx::CMDID_END_FRAME, &1u32.to_le_bytes());
         // A handful of frames (collapsed regions) plus the ack — not one per fill.
-        assert!(outputs.len() <= MAX_DIRTY_RECTS + 2, "got {} outputs", outputs.len());
-        assert!(matches!(outputs.last(), Some(Out::Send(_))), "ack must close the frame");
+        assert!(
+            outputs.len() <= MAX_DIRTY_RECTS + 2,
+            "got {} outputs",
+            outputs.len()
+        );
+        assert!(
+            matches!(outputs.last(), Some(Out::Send(_))),
+            "ack must close the frame"
+        );
     }
 }

@@ -276,8 +276,7 @@ impl Drdynvc {
                 total_length,
                 data,
             } => {
-                let Some(open) = self.open.iter_mut().find(|c| c.channel_id == channel_id)
-                else {
+                let Some(open) = self.open.iter_mut().find(|c| c.channel_id == channel_id) else {
                     return Ok(Vec::new()); // data on a refused channel: skipped
                 };
                 if total_length as usize > DVC_MESSAGE_CAP {
@@ -296,8 +295,7 @@ impl Drdynvc {
                 Ok(Vec::new())
             }
             DvcMessage::Data { channel_id, data } => {
-                let Some(open) = self.open.iter_mut().find(|c| c.channel_id == channel_id)
-                else {
+                let Some(open) = self.open.iter_mut().find(|c| c.channel_id == channel_id) else {
                     return Ok(Vec::new());
                 };
                 match open.reassembly.as_mut() {
@@ -305,11 +303,7 @@ impl Drdynvc {
                         buffer.extend_from_slice(data);
                         if buffer.len() >= *total {
                             let total = *total;
-                            let buffer = open
-                                .reassembly
-                                .take()
-                                .map(|(_, b)| b)
-                                .unwrap_or_default();
+                            let buffer = open.reassembly.take().map(|(_, b)| b).unwrap_or_default();
                             return self.dispatch(channel_id, &buffer[..total]);
                         }
                         Ok(Vec::new())
@@ -423,7 +417,10 @@ mod tests {
         );
         // Server offers 2 → answer is capped at the server's offer.
         let mut manager = Drdynvc::default();
-        let events = feed(&mut manager, &[0x50, 0x00, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let events = feed(
+            &mut manager,
+            &[0x50, 0x00, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
         assert_eq!(
             events,
             vec![DvcEvent::Send(dvc::encode_capabilities_response(2))]
@@ -433,7 +430,10 @@ mod tests {
     #[test]
     fn display_control_create_is_accepted_and_caps_make_it_ready() {
         let mut manager = Drdynvc::default();
-        let events = feed(&mut manager, &create_request(7, displaycontrol::CHANNEL_NAME));
+        let events = feed(
+            &mut manager,
+            &create_request(7, displaycontrol::CHANNEL_NAME),
+        );
         assert_eq!(
             events,
             vec![DvcEvent::Send(dvc::encode_create_response(7, 0))]
@@ -454,11 +454,17 @@ mod tests {
     #[test]
     fn unknown_channels_are_refused() {
         let mut manager = Drdynvc::default();
-        let events = feed(&mut manager, &create_request(9, "Microsoft::Windows::RDS::Geometry"));
+        let events = feed(
+            &mut manager,
+            &create_request(9, "Microsoft::Windows::RDS::Geometry"),
+        );
         let [DvcEvent::Send(response)] = events.as_slice() else {
             panic!("expected one response, got {events:?}");
         };
-        assert_eq!(response, &dvc::encode_create_response(9, CREATION_STATUS_REFUSED));
+        assert_eq!(
+            response,
+            &dvc::encode_create_response(9, CREATION_STATUS_REFUSED)
+        );
         // Data on the refused channel is skipped without error.
         assert!(feed(&mut manager, &dvc::encode_data(9, &[1, 2, 3])[0]).is_empty());
     }
@@ -466,7 +472,10 @@ mod tests {
     #[test]
     fn fragmented_display_caps_reassemble_across_data_first_and_data() {
         let mut manager = Drdynvc::default();
-        feed(&mut manager, &create_request(7, displaycontrol::CHANNEL_NAME));
+        feed(
+            &mut manager,
+            &create_request(7, displaycontrol::CHANNEL_NAME),
+        );
         let caps = display_caps_pdu(2, 1920, 1080);
         // Hand-fragment into DataFirst(8 bytes) + Data(rest) to exercise reassembly even
         // though a real caps PDU fits one fragment.
@@ -506,7 +515,10 @@ mod tests {
     #[test]
     fn close_tears_down_display_control() {
         let mut manager = Drdynvc::default();
-        feed(&mut manager, &create_request(7, displaycontrol::CHANNEL_NAME));
+        feed(
+            &mut manager,
+            &create_request(7, displaycontrol::CHANNEL_NAME),
+        );
         for pdu in dvc::encode_data(7, &display_caps_pdu(1, 1024, 768)) {
             feed(&mut manager, &pdu);
         }
@@ -515,8 +527,14 @@ mod tests {
         assert!(manager.display_control().is_none());
 
         // A re-created channel starts fresh: caps must arrive again before ready.
-        let events = feed(&mut manager, &create_request(8, displaycontrol::CHANNEL_NAME));
-        assert_eq!(events, vec![DvcEvent::Send(dvc::encode_create_response(8, 0))]);
+        let events = feed(
+            &mut manager,
+            &create_request(8, displaycontrol::CHANNEL_NAME),
+        );
+        assert_eq!(
+            events,
+            vec![DvcEvent::Send(dvc::encode_create_response(8, 0))]
+        );
         assert!(manager.display_control().is_none());
         for pdu in dvc::encode_data(8, &display_caps_pdu(1, 800, 600)) {
             feed(&mut manager, &pdu);
@@ -550,10 +568,7 @@ mod tests {
         let events = feed(&mut manager, &create_request(5, "justrdp::test::Chatty"));
         // Create Response + DataFirst + Data (the start message spans two fragments).
         assert_eq!(events.len(), 3);
-        assert_eq!(
-            events[0],
-            DvcEvent::Send(dvc::encode_create_response(5, 0))
-        );
+        assert_eq!(events[0], DvcEvent::Send(dvc::encode_create_response(5, 0)));
         let DvcEvent::Send(first) = &events[1] else {
             panic!("expected a DataFirst send");
         };
@@ -597,7 +612,10 @@ mod tests {
 
         // DataFirst declaring more than the DVC cap on the accepted channel.
         let mut manager = Drdynvc::default();
-        feed(&mut manager, &create_request(7, displaycontrol::CHANNEL_NAME));
+        feed(
+            &mut manager,
+            &create_request(7, displaycontrol::CHANNEL_NAME),
+        );
         let mut pdu = Vec::new();
         pdu.push((dvc::CMD_DATA_FIRST << 4) | (2 << 2)); // cbId=0, Sp=2 (4-byte length)
         pdu.push(7);

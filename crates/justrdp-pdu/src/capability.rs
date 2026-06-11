@@ -473,14 +473,20 @@ impl CapabilitySet {
         let body = cur.read_slice(length - 4)?;
         let mut body_cur = ReadCursor::new(body, "capability set body");
         Ok(match set_type {
-            CAPSET_GENERAL => CapabilitySet::General(GeneralCapabilitySet::decode_body(&mut body_cur)?),
-            CAPSET_BITMAP => CapabilitySet::Bitmap(BitmapCapabilitySet::decode_body(&mut body_cur)?),
-            CAPSET_ORDER => CapabilitySet::Order(OrderCapabilitySet::decode_body(&mut body_cur)?),
-            CAPSET_POINTER => CapabilitySet::Pointer(PointerCapabilitySet::decode_body(&mut body_cur)?),
-            CAPSET_INPUT => CapabilitySet::Input(InputCapabilitySet::decode_body(&mut body_cur)?),
-            CAPSET_VIRTUAL_CHANNEL => {
-                CapabilitySet::VirtualChannel(VirtualChannelCapabilitySet::decode_body(&mut body_cur)?)
+            CAPSET_GENERAL => {
+                CapabilitySet::General(GeneralCapabilitySet::decode_body(&mut body_cur)?)
             }
+            CAPSET_BITMAP => {
+                CapabilitySet::Bitmap(BitmapCapabilitySet::decode_body(&mut body_cur)?)
+            }
+            CAPSET_ORDER => CapabilitySet::Order(OrderCapabilitySet::decode_body(&mut body_cur)?),
+            CAPSET_POINTER => {
+                CapabilitySet::Pointer(PointerCapabilitySet::decode_body(&mut body_cur)?)
+            }
+            CAPSET_INPUT => CapabilitySet::Input(InputCapabilitySet::decode_body(&mut body_cur)?),
+            CAPSET_VIRTUAL_CHANNEL => CapabilitySet::VirtualChannel(
+                VirtualChannelCapabilitySet::decode_body(&mut body_cur)?,
+            ),
             CAPSET_BITMAP_CODECS => {
                 CapabilitySet::BitmapCodecs(BitmapCodecsCapabilitySet::decode_body(&mut body_cur)?)
             }
@@ -636,8 +642,8 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
             data: vec![0; 8],
         },
         CapabilitySet::VirtualChannel(VirtualChannelCapabilitySet {
-            flags: 0,          // VCCAPS_NO_COMPR
-            chunk_size: 1600,  // CHANNEL_CHUNK_LENGTH
+            flags: 0,         // VCCAPS_NO_COMPR
+            chunk_size: 1600, // CHANNEL_CHUNK_LENGTH
         }),
         // Sound: SOUND_BEEPS_FLAG.
         CapabilitySet::Unknown {
@@ -785,10 +791,7 @@ mod tests {
         assert_eq!(demand.source_descriptor, b"RDP\0");
         assert_eq!(demand.capability_sets, sets);
         let bitmap = demand.bitmap().unwrap();
-        assert_eq!(
-            (bitmap.desktop_width, bitmap.desktop_height),
-            (1920, 1080)
-        );
+        assert_eq!((bitmap.desktop_width, bitmap.desktop_height), (1920, 1080));
     }
 
     #[test]

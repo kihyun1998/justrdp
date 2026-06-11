@@ -127,12 +127,11 @@ impl<'a> DvcMessage<'a> {
                 let channel_id = read_var(&mut cur, cb_id, "DYNVC_CREATE_REQ.ChannelId")?;
                 let rest = cur.read_slice(cur.remaining())?;
                 let name_bytes = rest.split(|&b| b == 0).next().unwrap_or(rest);
-                let name = core::str::from_utf8(name_bytes).map_err(|_| {
-                    DecodeError::InvalidField {
+                let name =
+                    core::str::from_utf8(name_bytes).map_err(|_| DecodeError::InvalidField {
                         field: "DYNVC_CREATE_REQ.ChannelName",
                         reason: "channel name is not valid UTF-8",
-                    }
-                })?;
+                    })?;
                 Ok(DvcMessage::CreateRequest { channel_id, name })
             }
             CMD_DATA_FIRST => {
@@ -244,7 +243,10 @@ mod tests {
 
     #[test]
     fn capabilities_response_wire_shape() {
-        assert_eq!(encode_capabilities_response(1), vec![0x50, 0x00, 0x01, 0x00]);
+        assert_eq!(
+            encode_capabilities_response(1),
+            vec![0x50, 0x00, 0x01, 0x00]
+        );
     }
 
     #[test]
@@ -264,7 +266,10 @@ mod tests {
         pdu.extend_from_slice(b"x\0");
         assert!(matches!(
             DvcMessage::decode(&pdu).unwrap(),
-            DvcMessage::CreateRequest { channel_id: 0x1234, name: "x" }
+            DvcMessage::CreateRequest {
+                channel_id: 0x1234,
+                name: "x"
+            }
         ));
     }
 
@@ -311,7 +316,11 @@ mod tests {
         assert_eq!(data.len(), MAX_DATA_CHUNK);
         let mut reassembled = data.to_vec();
         for pdu in &pdus[1..] {
-            let DvcMessage::Data { channel_id: 3, data } = DvcMessage::decode(pdu).unwrap() else {
+            let DvcMessage::Data {
+                channel_id: 3,
+                data,
+            } = DvcMessage::decode(pdu).unwrap()
+            else {
                 panic!("expected Data on channel 3");
             };
             assert!(data.len() <= MAX_DATA_CHUNK);

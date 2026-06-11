@@ -22,8 +22,10 @@ pub fn encode_connection_request(variable: &[u8]) -> Vec<u8> {
     tpdu.extend_from_slice(&[
         li,
         CONNECTION_REQUEST,
-        0x00, 0x00, // DST-REF
-        0x00, 0x00, // SRC-REF
+        0x00,
+        0x00, // DST-REF
+        0x00,
+        0x00, // SRC-REF
         0x00, // class 0 / options
     ]);
     tpdu.extend_from_slice(variable);
@@ -44,10 +46,12 @@ pub fn decode_connection_confirm(tpdu: &[u8]) -> Result<&[u8], DecodeError> {
     // Skip the rest of the fixed part (DST-REF, SRC-REF, class) — the code byte is already read.
     cur.read_slice(FIXED_PART_LEN - 1)?;
     // LI counts the fixed part plus the variable part; the remainder is the variable part.
-    let variable_len = li.checked_sub(FIXED_PART_LEN).ok_or(DecodeError::InvalidField {
-        field: "x224.li",
-        reason: "shorter than the fixed TPDU header",
-    })?;
+    let variable_len = li
+        .checked_sub(FIXED_PART_LEN)
+        .ok_or(DecodeError::InvalidField {
+            field: "x224.li",
+            reason: "shorter than the fixed TPDU header",
+        })?;
     cur.read_slice(variable_len)
 }
 

@@ -151,15 +151,14 @@ pub fn read_octet_string<'a>(
 
 /// Write an OCTET STRING with a SIZE lower bound of `min` (the determinant encodes
 /// `len - min`).
-pub fn write_octet_string(
-    out: &mut Vec<u8>,
-    octets: &[u8],
-    min: usize,
-) -> Result<(), DecodeError> {
-    let excess = octets.len().checked_sub(min).ok_or(DecodeError::InvalidField {
-        field: "per.octet_string",
-        reason: "octet string shorter than its SIZE lower bound",
-    })?;
+pub fn write_octet_string(out: &mut Vec<u8>, octets: &[u8], min: usize) -> Result<(), DecodeError> {
+    let excess = octets
+        .len()
+        .checked_sub(min)
+        .ok_or(DecodeError::InvalidField {
+            field: "per.octet_string",
+            reason: "octet string shorter than its SIZE lower bound",
+        })?;
     let excess = u16::try_from(excess).map_err(|_| DecodeError::InvalidField {
         field: "per.octet_string",
         reason: "octet string too long for a PER length determinant",
@@ -185,10 +184,13 @@ pub fn write_numeric_string(
     digits: &[u8],
     min: usize,
 ) -> Result<(), DecodeError> {
-    let excess = digits.len().checked_sub(min).ok_or(DecodeError::InvalidField {
-        field: "per.numeric_string",
-        reason: "numeric string shorter than its SIZE lower bound",
-    })?;
+    let excess = digits
+        .len()
+        .checked_sub(min)
+        .ok_or(DecodeError::InvalidField {
+            field: "per.numeric_string",
+            reason: "numeric string shorter than its SIZE lower bound",
+        })?;
     write_length(out, excess as u16);
     for pair in digits.chunks(2) {
         let hi = (pair[0].wrapping_sub(0x30)) % 10;

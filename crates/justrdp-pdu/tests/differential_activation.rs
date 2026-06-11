@@ -278,7 +278,13 @@ fn ironrdp_demand_active_decodes_to_the_same_capability_fields() {
         capability::GENERAL_FASTPATH_OUTPUT_SUPPORTED
             | capability::GENERAL_NO_BITMAP_COMPRESSION_HDR
     );
-    assert_eq!((general.refresh_rect_support, general.suppress_output_support), (1, 1));
+    assert_eq!(
+        (
+            general.refresh_rect_support,
+            general.suppress_output_support
+        ),
+        (1, 1)
+    );
 
     let bitmap = demand.bitmap().unwrap();
     assert_eq!(bitmap.preferred_bits_per_pixel, 32);

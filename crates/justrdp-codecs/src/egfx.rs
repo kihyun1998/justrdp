@@ -176,7 +176,10 @@ mod tests {
         use ironrdp_graphics::zgfx::{CompressionMode, compress_and_wrap_egfx};
         let mut compressor = ironrdp_graphics::zgfx::Compressor::new();
         let mut z = Zgfx::new();
-        for message in [&b"the quick brown fox jumps over the lazy dog"[..], &[7u8; 4096]] {
+        for message in [
+            &b"the quick brown fox jumps over the lazy dog"[..],
+            &[7u8; 4096],
+        ] {
             let wire =
                 compress_and_wrap_egfx(message, &mut compressor, CompressionMode::Always).unwrap();
             assert_eq!(z.decompress(&wire).unwrap(), message);

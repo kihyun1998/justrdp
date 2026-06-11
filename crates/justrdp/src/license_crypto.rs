@@ -265,11 +265,7 @@ impl BigUint {
     /// Little-endian bytes, minimal length (no high-order zeros) — matching
     /// `num_bigint::BigUint::to_bytes_le`, which the differential oracle uses.
     fn to_bytes_le(&self) -> Vec<u8> {
-        let mut out: Vec<u8> = self
-            .limbs
-            .iter()
-            .flat_map(|l| l.to_le_bytes())
-            .collect();
+        let mut out: Vec<u8> = self.limbs.iter().flat_map(|l| l.to_le_bytes()).collect();
         while out.last() == Some(&0) {
             out.pop();
         }
@@ -431,9 +427,14 @@ mod tests {
     #[test]
     fn sha1_known_vectors() {
         assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(hex(&sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(
-            hex(&sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex(&sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            hex(&sha1(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
         );
     }

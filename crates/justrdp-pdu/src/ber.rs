@@ -261,7 +261,16 @@ mod tests {
 
     #[test]
     fn integer_round_trips_across_its_width_thresholds() {
-        for value in [0u32, 0x7F, 0x80, 0x7FFF, 0x8000, 0x007F_FFFF, 0x0080_0000, u32::MAX] {
+        for value in [
+            0u32,
+            0x7F,
+            0x80,
+            0x7FFF,
+            0x8000,
+            0x007F_FFFF,
+            0x0080_0000,
+            u32::MAX,
+        ] {
             let mut out = Vec::new();
             write_integer(&mut out, value);
             let mut cur = ReadCursor::new(&out, "t");
@@ -276,7 +285,10 @@ mod tests {
         write_bool(&mut out, true);
         write_enumerated(&mut out, 0);
         write_octet_string(&mut out, &[0x01]);
-        assert_eq!(out, vec![0x01, 0x01, 0xFF, 0x0A, 0x01, 0x00, 0x04, 0x01, 0x01]);
+        assert_eq!(
+            out,
+            vec![0x01, 0x01, 0xFF, 0x0A, 0x01, 0x00, 0x04, 0x01, 0x01]
+        );
 
         let mut cur = ReadCursor::new(&out, "t");
         assert!(read_bool(&mut cur).unwrap());

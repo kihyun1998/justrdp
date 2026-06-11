@@ -50,7 +50,10 @@ impl core::fmt::Display for ColorError {
                 write!(f, "unsupported source depth: {bits_per_pixel} bpp")
             }
             ColorError::SourceTooShort { needed, got } => {
-                write!(f, "source pixel buffer too short: need {needed}, have {got}")
+                write!(
+                    f,
+                    "source pixel buffer too short: need {needed}, have {got}"
+                )
             }
         }
     }
@@ -99,7 +102,11 @@ pub fn to_rgba(
 
     let mut out = Vec::with_capacity(width * height * 4);
     for out_row in 0..height {
-        let src_row = if bottom_up { height - 1 - out_row } else { out_row };
+        let src_row = if bottom_up {
+            height - 1 - out_row
+        } else {
+            out_row
+        };
         let row = &src[src_row * row_bytes..(src_row + 1) * row_bytes];
         match bits_per_pixel {
             8 => {
@@ -186,7 +193,15 @@ mod tests {
         );
 
         // 15 bpp white: 0x7FFF must also reach 255 on every channel.
-        let out = to_rgba(&0x7FFFu16.to_le_bytes(), 1, 1, 15, &Palette::default(), false).unwrap();
+        let out = to_rgba(
+            &0x7FFFu16.to_le_bytes(),
+            1,
+            1,
+            15,
+            &Palette::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(out, [255, 255, 255, 255]);
     }
 

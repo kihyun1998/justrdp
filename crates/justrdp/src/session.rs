@@ -264,7 +264,8 @@ impl SessionStateMachine {
                 fastpath::FP_UPDATE_BITMAP => {
                     // The body is a TS_UPDATE_BITMAP_DATA, updateType field included.
                     cur.read_u16_le().map_err(SessionError::Decode)?;
-                    let bitmap = update::BitmapUpdate::decode(&mut cur).map_err(SessionError::Decode)?;
+                    let bitmap =
+                        update::BitmapUpdate::decode(&mut cur).map_err(SessionError::Decode)?;
                     for rect in &bitmap.rectangles {
                         if let Some(frame_update) = self.apply_bitmap(rect)? {
                             outputs.push(SessionOutput::Frame(frame_update));
@@ -273,7 +274,8 @@ impl SessionStateMachine {
                 }
                 fastpath::FP_UPDATE_PALETTE => {
                     cur.read_u16_le().map_err(SessionError::Decode)?;
-                    let palette = update::PaletteUpdate::decode(&mut cur).map_err(SessionError::Decode)?;
+                    let palette =
+                        update::PaletteUpdate::decode(&mut cur).map_err(SessionError::Decode)?;
                     self.palette = Palette {
                         entries: palette.entries,
                     };
@@ -381,10 +383,12 @@ impl SessionStateMachine {
         let max_w = self.framebuffer.width().saturating_add(3);
         let max_h = self.framebuffer.height().saturating_add(3);
         if rect.width > max_w || rect.height > max_h {
-            return Err(SessionError::Decode(justrdp_pdu::DecodeError::InvalidField {
-                field: "TS_BITMAP_DATA",
-                reason: "bitmap rectangle exceeds the negotiated desktop size",
-            }));
+            return Err(SessionError::Decode(
+                justrdp_pdu::DecodeError::InvalidField {
+                    field: "TS_BITMAP_DATA",
+                    reason: "bitmap rectangle exceeds the negotiated desktop size",
+                },
+            ));
         }
         let width = usize::from(rect.width);
         let height = usize::from(rect.height);
@@ -401,8 +405,8 @@ impl SessionStateMachine {
                     .map_err(SessionError::Color)?
             }
             (true, bpp) => {
-                let raw = rle::decompress(&rect.data, width, height, bpp)
-                    .map_err(SessionError::Rle)?;
+                let raw =
+                    rle::decompress(&rect.data, width, height, bpp).map_err(SessionError::Rle)?;
                 color::to_rgba(&raw, width, height, bpp, &self.palette, true)
                     .map_err(SessionError::Color)?
             }
@@ -619,8 +623,14 @@ impl SessionStateMachine {
     /// Valid only after [`SessionOutput::DisplayControlReady`]. An odd `width` is rounded
     /// down to even (the spec forbids odd widths; mstsc does the same).
     pub fn request_resize(&self, width: u16, height: u16) -> Result<Vec<Vec<u8>>, ResizeError> {
-        let drdynvc_id = self.config.drdynvc_channel_id.ok_or(ResizeError::NotReady)?;
-        let (channel_id, caps) = self.drdynvc.display_control().ok_or(ResizeError::NotReady)?;
+        let drdynvc_id = self
+            .config
+            .drdynvc_channel_id
+            .ok_or(ResizeError::NotReady)?;
+        let (channel_id, caps) = self
+            .drdynvc
+            .display_control()
+            .ok_or(ResizeError::NotReady)?;
         let width = u32::from(width) & !1; // MS-RDPEDISP 2.2.2.2.1: width must be even
         let height = u32::from(height);
         let range = displaycontrol::MIN_MONITOR_DIMENSION..=displaycontrol::MAX_MONITOR_DIMENSION;
@@ -778,7 +788,13 @@ mod tests {
     }
 
     fn server_data_pdu(pdu_type2: u8, body: &[u8]) -> Vec<u8> {
-        server_io_frame(&share::encode_share_data(1002, SHARE, share::STREAM_MED, pdu_type2, body))
+        server_io_frame(&share::encode_share_data(
+            1002,
+            SHARE,
+            share::STREAM_MED,
+            pdu_type2,
+            body,
+        ))
     }
 
     /// An uncompressed 24-bpp bitmap update: one rect at (x,y), w×h, all pixels `bgr`.
@@ -854,10 +870,11 @@ mod tests {
                 body.extend_from_slice(&[0, 0, 0]);
             }
         }
-        assert!(sm
-            .process_bytes(&server_data_pdu(share::PDU_TYPE2_UPDATE, &body))
-            .unwrap()
-            .is_empty());
+        assert!(
+            sm.process_bytes(&server_data_pdu(share::PDU_TYPE2_UPDATE, &body))
+                .unwrap()
+                .is_empty()
+        );
 
         // 8-bpp uncompressed bitmap of index 5.
         let mut body = Vec::new();
@@ -918,14 +935,22 @@ mod tests {
         let outputs = sm.process_bytes(&demand).unwrap();
         // Confirm Active + 4 finalization frames, all outbound writes.
         assert_eq!(outputs.len(), 5);
-        assert!(outputs.iter().all(|o| matches!(o, SessionOutput::WriteBytes(_))));
-        assert_eq!((sm.framebuffer().width(), sm.framebuffer().height()), (8, 4));
+        assert!(
+            outputs
+                .iter()
+                .all(|o| matches!(o, SessionOutput::WriteBytes(_)))
+        );
+        assert_eq!(
+            (sm.framebuffer().width(), sm.framebuffer().height()),
+            (8, 4)
+        );
 
         // Bitmaps are ignored until the Font Map closes reactivation…
-        assert!(sm
-            .process_bytes(&bitmap_update_frame(0, 0, 4, 2, [9, 9, 9]))
-            .unwrap()
-            .is_empty());
+        assert!(
+            sm.process_bytes(&bitmap_update_frame(0, 0, 4, 2, [9, 9, 9]))
+                .unwrap()
+                .is_empty()
+        );
 
         // …which re-emits the full (new-size) screen.
         let font_map = server_data_pdu(share::PDU_TYPE2_FONT_MAP, &[0, 0, 0, 0, 3, 0, 4, 0]);
@@ -990,14 +1015,15 @@ mod tests {
         assert!(outputs.is_empty());
         let tpkt_between = server_data_pdu(share::PDU_TYPE2_SAVE_SESSION_INFO, &[0; 4]);
         assert!(sm.process_bytes(&tpkt_between).unwrap().is_empty());
-        assert!(sm
-            .process_bytes(&fastpath::encode_pdu(&[(
+        assert!(
+            sm.process_bytes(&fastpath::encode_pdu(&[(
                 fastpath::FP_UPDATE_BITMAP,
                 fastpath::FP_FRAGMENT_NEXT,
                 b,
             )]))
             .unwrap()
-            .is_empty());
+            .is_empty()
+        );
         let outputs = sm
             .process_bytes(&fastpath::encode_pdu(&[(
                 fastpath::FP_UPDATE_BITMAP,
@@ -1032,7 +1058,10 @@ mod tests {
             .process_bytes(&server_data_pdu(share::PDU_TYPE2_UPDATE, &body))
             .unwrap_err();
         assert!(
-            matches!(err, SessionError::Decode(justrdp_pdu::DecodeError::InvalidField { .. })),
+            matches!(
+                err,
+                SessionError::Decode(justrdp_pdu::DecodeError::InvalidField { .. })
+            ),
             "got {err:?}"
         );
     }
@@ -1043,14 +1072,15 @@ mod tests {
         // grow without bound (gate #6 fix note 1). Test desktop is 16×8 → cap ≈ 1 MiB.
         let mut sm = SessionStateMachine::new(config(), Vec::new());
         let chunk = vec![0u8; 16 << 10];
-        assert!(sm
-            .process_bytes(&fastpath::encode_pdu(&[(
+        assert!(
+            sm.process_bytes(&fastpath::encode_pdu(&[(
                 fastpath::FP_UPDATE_BITMAP,
                 fastpath::FP_FRAGMENT_FIRST,
                 &chunk,
             )]))
             .unwrap()
-            .is_empty());
+            .is_empty()
+        );
         let mut result = Ok(Vec::new());
         for _ in 0..80 {
             result = sm.process_bytes(&fastpath::encode_pdu(&[(
@@ -1089,7 +1119,11 @@ mod tests {
             (share::PDU_TYPE2_POINTER, vec![0u8; 8]),
             (share::PDU_TYPE2_SAVE_SESSION_INFO, vec![0u8; 12]),
         ] {
-            assert!(sm.process_bytes(&server_data_pdu(t2, &body)).unwrap().is_empty());
+            assert!(
+                sm.process_bytes(&server_data_pdu(t2, &body))
+                    .unwrap()
+                    .is_empty()
+            );
         }
         // Traffic on a static channel (1004) is ignored for now.
         let mut body = vec![0x68];
@@ -1114,12 +1148,15 @@ mod tests {
         assert_eq!(frames.len(), 1);
         // A fast-path frame, not a TPKT frame.
         assert!(fastpath::is_fastpath(frames[0][0]));
-        assert_eq!(frames[0], input::encode_fastpath_input(&[InputEvent::ScanCode {
-            code: 0x1E,
-            release: false,
-            extended: false,
-            extended1: false,
-        }]));
+        assert_eq!(
+            frames[0],
+            input::encode_fastpath_input(&[InputEvent::ScanCode {
+                code: 0x1E,
+                release: false,
+                extended: false,
+                extended1: false,
+            }])
+        );
     }
 
     #[test]
@@ -1195,7 +1232,11 @@ mod tests {
         // The response embeds the SVC-chunked version-3 caps response and rides the
         // drdynvc channel (big-endian MCS channelId).
         let expected_chunk = &svc::encode_chunks(&dvc::encode_capabilities_response(3))[0];
-        assert!(frame.windows(expected_chunk.len()).any(|w| w == expected_chunk.as_slice()));
+        assert!(
+            frame
+                .windows(expected_chunk.len())
+                .any(|w| w == expected_chunk.as_slice())
+        );
         assert!(frame.windows(2).any(|w| w == DRDYNVC.to_be_bytes()));
     }
 
@@ -1207,9 +1248,8 @@ mod tests {
 
         let frames = sm.request_resize(1280, 1024).unwrap();
         assert_eq!(frames.len(), 1, "a 56-byte layout fits one SVC chunk");
-        let layout = displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor::primary(
-            1280, 1024,
-        )]);
+        let layout =
+            displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor::primary(1280, 1024)]);
         let expected_chunk = &svc::encode_chunks(&dvc::encode_data(7, &layout)[0])[0];
         assert!(
             frames[0]
@@ -1227,10 +1267,13 @@ mod tests {
 
         // Odd width 1281 → 1280 on the wire (MS-RDPEDISP forbids odd widths).
         let frames = sm.request_resize(1281, 1024).unwrap();
-        let layout_even = displaycontrol::encode_monitor_layout(&[
-            displaycontrol::Monitor::primary(1280, 1024),
-        ]);
-        assert!(frames[0].windows(layout_even.len()).any(|w| w == layout_even));
+        let layout_even =
+            displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor::primary(1280, 1024)]);
+        assert!(
+            frames[0]
+                .windows(layout_even.len())
+                .any(|w| w == layout_even)
+        );
 
         // Out-of-range dimensions and caps-exceeding areas are typed errors.
         assert!(matches!(
@@ -1257,7 +1300,11 @@ mod tests {
         };
         let refusal = dvc::encode_create_response(9, 0x8000_4005);
         let expected_chunk = &svc::encode_chunks(&refusal)[0];
-        assert!(frame.windows(expected_chunk.len()).any(|w| w == expected_chunk.as_slice()));
+        assert!(
+            frame
+                .windows(expected_chunk.len())
+                .any(|w| w == expected_chunk.as_slice())
+        );
         // And resize stays unavailable.
         assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));
     }
@@ -1279,7 +1326,10 @@ mod tests {
             &[],
         ));
         assert!(sm.process_bytes(&deactivate).unwrap().is_empty());
-        assert!(sm.request_resize(1024, 768).is_ok(), "resize survives deactivation");
+        assert!(
+            sm.request_resize(1024, 768).is_ok(),
+            "resize survives deactivation"
+        );
     }
 
     #[test]

@@ -173,9 +173,11 @@ fn fastpath_input_pdus_match_ironrdp_byte_for_byte() {
     // Each event alone in a PDU…
     for (i, (ours, theirs)) in pairs.iter().enumerate() {
         let our_pdu = input::encode_fastpath_input(std::slice::from_ref(ours));
-        let their_pdu =
-            iron_encode_vec(&FastPathInput::new(vec![*theirs]).unwrap()).unwrap();
-        assert_eq!(our_pdu, their_pdu, "event {i} diverged as a single-event PDU");
+        let their_pdu = iron_encode_vec(&FastPathInput::new(vec![*theirs]).unwrap()).unwrap();
+        assert_eq!(
+            our_pdu, their_pdu,
+            "event {i} diverged as a single-event PDU"
+        );
     }
 
     // …and the whole mix batched into one PDU (numEvents in the header).

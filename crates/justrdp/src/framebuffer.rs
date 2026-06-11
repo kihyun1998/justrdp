@@ -132,12 +132,18 @@ mod tests {
             src.extend_from_slice(&[255, 0, 0, 255, 255, 0, 0, 255, 9, 9, 9, 9]);
         }
         let update = fb.blit(1, 2, 2, 2, &src, 3).unwrap();
-        assert_eq!((update.x, update.y, update.width, update.height), (1, 2, 2, 2));
+        assert_eq!(
+            (update.x, update.y, update.width, update.height),
+            (1, 2, 2, 2)
+        );
         assert_eq!(&update.pixels[..4], &[255, 0, 0, 255]);
         // Framebuffer row 2, col 1 holds red; col 0 stays black.
         let stride = 4 * 4;
         assert_eq!(&fb.pixels()[2 * stride..2 * stride + 4], &[0, 0, 0, 255]);
-        assert_eq!(&fb.pixels()[2 * stride + 4..2 * stride + 8], &[255, 0, 0, 255]);
+        assert_eq!(
+            &fb.pixels()[2 * stride + 4..2 * stride + 8],
+            &[255, 0, 0, 255]
+        );
     }
 
     #[test]

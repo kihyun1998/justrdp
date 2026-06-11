@@ -123,7 +123,11 @@ mod tests {
         assert_eq!(c.read_u32_le().unwrap(), 0x0000_000B);
         assert!(matches!(
             c.read_u32_le().unwrap_err(),
-            DecodeError::NotEnoughBytes { needed: 4, got: 0, .. }
+            DecodeError::NotEnoughBytes {
+                needed: 4,
+                got: 0,
+                ..
+            }
         ));
     }
 
@@ -134,7 +138,11 @@ mod tests {
         assert_eq!(c.position(), 3);
         assert!(matches!(
             c.read_slice(2).unwrap_err(),
-            DecodeError::NotEnoughBytes { needed: 2, got: 1, .. }
+            DecodeError::NotEnoughBytes {
+                needed: 2,
+                got: 1,
+                ..
+            }
         ));
     }
 
@@ -147,7 +155,11 @@ mod tests {
         let empty = ReadCursor::new(&[], "t");
         assert!(matches!(
             empty.peek_u8().unwrap_err(),
-            DecodeError::NotEnoughBytes { needed: 1, got: 0, .. }
+            DecodeError::NotEnoughBytes {
+                needed: 1,
+                got: 0,
+                ..
+            }
         ));
     }
 
@@ -158,7 +170,11 @@ mod tests {
         assert_eq!(c.read_u16_be().unwrap(), 0x0304);
         assert!(matches!(
             c.read_u16_le().unwrap_err(),
-            DecodeError::NotEnoughBytes { needed: 2, got: 0, .. }
+            DecodeError::NotEnoughBytes {
+                needed: 2,
+                got: 0,
+                ..
+            }
         ));
     }
 

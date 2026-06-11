@@ -19,9 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use justrdp::{
-    Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, Event,
-    FrameUpdate, InputEvent, LicenseEntropy, McsConnectResult, SessionError, SessionOutput,
-    SessionStateMachine,
+    Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, Event, FrameUpdate,
+    InputEvent, LicenseEntropy, McsConnectResult, SessionError, SessionOutput, SessionStateMachine,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -74,7 +73,9 @@ pub fn generate_license_entropy() -> io::Result<LicenseEntropy> {
     let mut premaster_secret = [0u8; 48];
     rng.fill(&mut client_random)
         .and_then(|()| rng.fill(&mut premaster_secret))
-        .map_err(|e| io::Error::other(format!("OS RNG failed generating license entropy: {e:?}")))?;
+        .map_err(|e| {
+            io::Error::other(format!("OS RNG failed generating license entropy: {e:?}"))
+        })?;
     Ok(LicenseEntropy {
         client_random,
         premaster_secret,
@@ -148,7 +149,9 @@ impl Credentials {
         let username = match self.domain.as_deref() {
             Some(domain) => Username::new(&self.username, Some(domain)),
             // No explicit domain: accept a qualified name, else treat it as a bare account.
-            None => Username::parse(&self.username).or_else(|_| Username::new(&self.username, None)),
+            None => {
+                Username::parse(&self.username).or_else(|_| Username::new(&self.username, None))
+            }
         }
         .map_err(|e| ConnectFailure::Nla {
             reason: format!("invalid username: {e}"),
@@ -408,7 +411,11 @@ async fn connect_inner(
                                 reason: e.to_string(),
                             });
                         }
-                        Err(_) => return Err(ConnectFailure::Timeout { stage: "tls-handshake" }),
+                        Err(_) => {
+                            return Err(ConnectFailure::Timeout {
+                                stage: "tls-handshake",
+                            });
+                        }
                     };
                     let cert = established
                         .get_ref()
@@ -604,7 +611,9 @@ pub async fn run_session_with_input(
     let mut input_open = true;
     // Drain bytes the connect sequence already buffered (ActivationResult::leftover, handed
     // to SessionStateMachine::new) before the first socket read.
-    let mut pending = machine.process_bytes(&[]).map_err(SessionFailure::Protocol)?;
+    let mut pending = machine
+        .process_bytes(&[])
+        .map_err(SessionFailure::Protocol)?;
     loop {
         for output in pending.drain(..) {
             match output {
@@ -702,7 +711,9 @@ pub async fn run_session_with_commands(
 ) -> Result<(), SessionFailure> {
     let mut readbuf = [0u8; 16 * 1024];
     let mut commands_open = true;
-    let mut pending = machine.process_bytes(&[]).map_err(SessionFailure::Protocol)?;
+    let mut pending = machine
+        .process_bytes(&[])
+        .map_err(SessionFailure::Protocol)?;
     loop {
         for output in pending.drain(..) {
             match output {
@@ -851,9 +862,10 @@ async fn run_credssp(
             GeneratorState::Completed(result) => result.map_err(nla_err)?,
             GeneratorState::Suspended(_network_request) => {
                 return Err(ConnectFailure::Nla {
-                    reason: "server requires a KDC round-trip (Kerberos); only NTLM is supported in \
+                    reason:
+                        "server requires a KDC round-trip (Kerberos); only NTLM is supported in \
                              this slice"
-                        .to_string(),
+                            .to_string(),
                 });
             }
         };
@@ -889,9 +901,7 @@ async fn write_ts_request(
 /// than guessing a buffer size (TLS records may split a single TSRequest across reads). The
 /// framing — the length cap, the over-wide rejection, mid-frame reassembly — is pinned by the
 /// `connect`-level tests against a loopback TLS server replying with crafted TSRequest bytes.
-async fn read_ts_request(
-    reader: &mut TlsStream<TcpStream>,
-) -> Result<TsRequest, ConnectFailure> {
+async fn read_ts_request(reader: &mut TlsStream<TcpStream>) -> Result<TsRequest, ConnectFailure> {
     let mut frame = Vec::with_capacity(64);
     // Tag + first length byte.
     let mut head = [0u8; 2];
@@ -912,7 +922,9 @@ async fn read_ts_request(
         let mut len_bytes = vec![0u8; n];
         reader.read_exact(&mut len_bytes).await?;
         frame.extend_from_slice(&len_bytes);
-        len_bytes.iter().fold(0usize, |acc, &b| (acc << 8) | b as usize)
+        len_bytes
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | b as usize)
     };
     // Cap before allocating: a server-controlled length must not drive an unbounded allocation.
     if content_len > MAX_TS_REQUEST_LEN {
@@ -999,38 +1011,38 @@ mod tests {
     use tracing_test::traced_test;
 
     use justrdp::ClientInfoConfig;
-    use justrdp_pdu::{client_info, gcc};
     use justrdp_pdu::nego::SecurityProtocol;
+    use justrdp_pdu::{client_info, gcc};
 
     /// A full connect config for the tests: SSL|HYBRID|HYBRID_EX advertised, a modest GCC core,
     /// two static channels, and explicitly chosen early-capability flags (caller policy — set
     /// here, in the host layer, exactly as the anti-hardcode rule demands).
     fn test_config() -> ConnectConfig {
         let core = gcc::ClientCoreData {
-                version: gcc::RDP_VERSION_10_12,
-                desktop_width: 1280,
-                desktop_height: 800,
-                keyboard_layout: 0x0409,
-                client_build: 1,
-                client_name: "justrdp".to_string(),
-                keyboard_type: gcc::KEYBOARD_TYPE_IBM_ENHANCED,
-                keyboard_subtype: 0,
-                keyboard_functional_keys_count: 12,
-                ime_file_name: String::new(),
-                post_beta2_color_depth: gcc::COLOR_DEPTH_8BPP,
-                client_product_id: 1,
-                serial_number: 0,
-                high_color_depth: gcc::HIGH_COLOR_DEPTH_24BPP,
-                supported_color_depths: gcc::SUPPORTED_COLOR_DEPTH_24BPP
-                    | gcc::SUPPORTED_COLOR_DEPTH_16BPP
-                    | gcc::SUPPORTED_COLOR_DEPTH_32BPP,
-                early_capability_flags: gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
-                    | gcc::ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL
-                    | gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN,
-                dig_product_id: String::new(),
-                connection_type: gcc::CONNECTION_TYPE_LAN,
-                // Overwritten by the machine with the negotiated protocol.
-                server_selected_protocol: SecurityProtocol::from_bits(0),
+            version: gcc::RDP_VERSION_10_12,
+            desktop_width: 1280,
+            desktop_height: 800,
+            keyboard_layout: 0x0409,
+            client_build: 1,
+            client_name: "justrdp".to_string(),
+            keyboard_type: gcc::KEYBOARD_TYPE_IBM_ENHANCED,
+            keyboard_subtype: 0,
+            keyboard_functional_keys_count: 12,
+            ime_file_name: String::new(),
+            post_beta2_color_depth: gcc::COLOR_DEPTH_8BPP,
+            client_product_id: 1,
+            serial_number: 0,
+            high_color_depth: gcc::HIGH_COLOR_DEPTH_24BPP,
+            supported_color_depths: gcc::SUPPORTED_COLOR_DEPTH_24BPP
+                | gcc::SUPPORTED_COLOR_DEPTH_16BPP
+                | gcc::SUPPORTED_COLOR_DEPTH_32BPP,
+            early_capability_flags: gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
+                | gcc::ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL
+                | gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN,
+            dig_product_id: String::new(),
+            connection_type: gcc::CONNECTION_TYPE_LAN,
+            // Overwritten by the machine with the negotiated protocol.
+            server_selected_protocol: SecurityProtocol::from_bits(0),
         };
         ConnectConfig {
             requested: SecurityProtocol::SSL
@@ -1144,7 +1156,12 @@ mod tests {
         // TLS completed and the machine entered NLA before failing...
         assert_eq!(
             stages,
-            vec!["tcp-connect", "x224-negotiate", "tls-handshake", "nla-credssp"]
+            vec![
+                "tcp-connect",
+                "x224-negotiate",
+                "tls-handshake",
+                "nla-credssp"
+            ]
         );
         // ...and the failure is at the NLA boundary (the mock closed instead of returning a
         // TSRequest), not a TLS- or negotiation-level failure.
@@ -1164,8 +1181,14 @@ mod tests {
         // Every connect stage through NLA is named in the debug logs (criterion 14: observable
         // transitions)...
         assert!(logs_contain("tcp-connect"), "tcp-connect stage not logged");
-        assert!(logs_contain("x224-negotiate"), "x224-negotiate stage not logged");
-        assert!(logs_contain("tls-handshake"), "tls-handshake stage not logged");
+        assert!(
+            logs_contain("x224-negotiate"),
+            "x224-negotiate stage not logged"
+        );
+        assert!(
+            logs_contain("tls-handshake"),
+            "tls-handshake stage not logged"
+        );
         assert!(logs_contain("nla-credssp"), "nla-credssp stage not logged");
         // ...and byte counts are logged for the plaintext bytes written and read.
         assert!(logs_contain("bytes="), "byte counts not logged");
@@ -1305,7 +1328,10 @@ mod tests {
         let err = connect(addr, test_config(), test_credentials(), |_| {})
             .await
             .unwrap_err();
-        assert!(matches!(err, ConnectFailure::Io(_)), "expected Io, got {err:?}");
+        assert!(
+            matches!(err, ConnectFailure::Io(_)),
+            "expected Io, got {err:?}"
+        );
     }
 
     /// Like `mock_tls_server`, but a CredSSP peer under our control: after the TLS handshake it
@@ -1328,9 +1354,11 @@ mod tests {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut scratch = [0u8; 64];
             let _ = sock.read(&mut scratch).await.unwrap(); // plaintext Connection Request
-            sock.write_all(&confirm_frame([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]))
-                .await
-                .unwrap();
+            sock.write_all(&confirm_frame([
+                0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00,
+            ]))
+            .await
+            .unwrap();
             let mut tls = acceptor.accept(sock).await.unwrap();
             let mut nego = [0u8; 4096];
             let _ = tls.read(&mut nego).await.unwrap(); // the client's first TSRequest
@@ -1375,7 +1403,10 @@ mod tests {
             .unwrap_err();
         match &err {
             ConnectFailure::Nla { reason } => {
-                assert!(reason.contains("refusing to parse"), "unexpected reason: {reason}")
+                assert!(
+                    reason.contains("refusing to parse"),
+                    "unexpected reason: {reason}"
+                )
             }
             other => panic!("expected an over-wide length rejection, got {other:?}"),
         }
@@ -1419,7 +1450,11 @@ mod tests {
         // way the client can report the server's error status is by having framed and parsed
         // the TSRequest correctly — the positive proof of the short-form read path.
         let reply = ts_request_with_error_code(0, STATUS_LOGON_FAILURE);
-        assert!(reply[1] < 0x80, "expected short-form BER, got {:#x}", reply[1]);
+        assert!(
+            reply[1] < 0x80,
+            "expected short-form BER, got {:#x}",
+            reply[1]
+        );
         let addr = mock_tls_server_replying_to_nla(vec![reply], true).await;
 
         let err = connect(addr, test_config(), test_credentials(), |_| {})
@@ -1441,7 +1476,11 @@ mod tests {
         // by declared length instead of guessing). The errorCode sits at the END of the frame:
         // surfacing it proves the client reassembled the whole long-form TSRequest.
         let reply = ts_request_with_error_code(400, STATUS_LOGON_FAILURE);
-        assert!(reply[1] >= 0x80, "expected long-form BER, got {:#x}", reply[1]);
+        assert!(
+            reply[1] >= 0x80,
+            "expected long-form BER, got {:#x}",
+            reply[1]
+        );
         let third = reply.len() / 3;
         let chunks = vec![
             reply[..third].to_vec(),
@@ -1525,9 +1564,11 @@ mod tests {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut scratch = [0u8; 64];
             let _ = sock.read(&mut scratch).await.unwrap(); // plaintext Connection Request
-            sock.write_all(&confirm_frame([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]))
-                .await
-                .unwrap(); // select HYBRID: the client proceeds to TLS + NLA
+            sock.write_all(&confirm_frame([
+                0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00,
+            ]))
+            .await
+            .unwrap(); // select HYBRID: the client proceeds to TLS + NLA
             let mut tls = acceptor.accept(sock).await.unwrap();
 
             // Mirror the client's SPNEGO-wrapped-NTLM configuration on the acceptor side.
@@ -1629,10 +1670,9 @@ mod tests {
             stage: Duration::from_millis(200),
             ..ConnectTimeouts::default()
         };
-        let err =
-            connect_with_timeouts(addr, test_config(), test_credentials(), |_| {}, timeouts)
-                .await
-                .unwrap_err();
+        let err = connect_with_timeouts(addr, test_config(), test_credentials(), |_| {}, timeouts)
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1691,7 +1731,12 @@ mod tests {
         // ...the requested static channels are answered (granted or refused, never dropped)...
         assert!(outcome.mcs.static_channels.len() <= 2);
         for ch in &outcome.mcs.static_channels {
-            assert!(ch.id >= 1001, "granted channel {} has id {}", ch.name, ch.id);
+            assert!(
+                ch.id >= 1001,
+                "granted channel {} has id {}",
+                ch.name,
+                ch.id
+            );
         }
         // ...and the connect sequence walked every canonical stage, ending in session-active.
         assert_eq!(stages.first().map(String::as_str), Some("tcp-connect"));
@@ -1769,9 +1814,8 @@ mod tests {
     /// can actually render — exactly the policy seam plan.md §0 demands stays caller-owned.
     fn legacy_graphics_config() -> ConnectConfig {
         let mut config = test_config();
-        config.core.early_capability_flags =
-            gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
-                | gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
+        config.core.early_capability_flags = gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
+            | gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
         config.channels =
             vec![gcc::ChannelDef::new("cliprdr", gcc::CHANNEL_OPTION_INITIALIZED).unwrap()];
         config
@@ -1884,9 +1928,8 @@ mod tests {
                     .collect();
                 assert_eq!(ours_rgb, theirs, "rect {i} ({w}x{h} planar) diverged");
             } else {
-                let ours =
-                    justrdp_codecs::rle::decompress(&rect.data, w, h, rect.bits_per_pixel)
-                        .unwrap_or_else(|e| panic!("rect {i}: ours failed: {e}"));
+                let ours = justrdp_codecs::rle::decompress(&rect.data, w, h, rect.bits_per_pixel)
+                    .unwrap_or_else(|e| panic!("rect {i}: ours failed: {e}"));
                 let mut theirs = Vec::new();
                 ironrdp_graphics::rle::decompress(
                     &rect.data,
@@ -2098,7 +2141,14 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            run_session_with_commands(&mut stream, &mut machine, |_| {}, |_| {}, &mut commands, &cancel),
+            run_session_with_commands(
+                &mut stream,
+                &mut machine,
+                |_| {},
+                |_| {},
+                &mut commands,
+                &cancel,
+            ),
         )
         .await;
         assert!(
@@ -2164,8 +2214,14 @@ mod tests {
         );
 
         // The caps handshake must have been observed on the wire (not inferred).
-        assert!(logs_contain("rdp_egfx_caps"), "EGFX caps milestones never logged");
-        assert!(logs_contain("EGFX caps confirmed"), "server never confirmed EGFX caps");
+        assert!(
+            logs_contain("rdp_egfx_caps"),
+            "EGFX caps milestones never logged"
+        );
+        assert!(
+            logs_contain("EGFX caps confirmed"),
+            "server never confirmed EGFX caps"
+        );
 
         // Monochrome output would mean the tile decode silently produced garbage.
         let mut distinct = std::collections::HashSet::new();
@@ -2250,14 +2306,20 @@ mod tests {
                 height: target.1,
             })
             .expect("queue the resize command");
-            eprintln!("milestone: Monitor Layout resize to {}x{} queued", target.0, target.1);
+            eprintln!(
+                "milestone: Monitor Layout resize to {}x{} queued",
+                target.0, target.1
+            );
         };
         let resized_in_sink = resized_seen.clone();
         let canceller = cancel.clone();
         let on_frame = move |frame: &FrameUpdate| {
             if (frame.width, frame.height) == target && (frame.x, frame.y) == (0, 0) {
                 // The post-reactivation full-screen re-emit at the new size.
-                eprintln!("milestone: reactivation complete, full frame at {}x{}", frame.width, frame.height);
+                eprintln!(
+                    "milestone: reactivation complete, full frame at {}x{}",
+                    frame.width, frame.height
+                );
                 resized_in_sink.store(true, Ordering::SeqCst);
                 canceller.cancel();
             }
@@ -2265,14 +2327,27 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            run_session_with_commands(&mut stream, &mut machine, on_frame, on_event, &mut commands, &cancel),
+            run_session_with_commands(
+                &mut stream,
+                &mut machine,
+                on_frame,
+                on_event,
+                &mut commands,
+                &cancel,
+            ),
         )
         .await
         .expect("resize cycle should complete well within the window");
         result.expect("session failed during the resize cycle");
 
-        assert!(ready_seen.load(Ordering::SeqCst), "DisplayControlReady never fired");
-        assert!(resized_seen.load(Ordering::SeqCst), "no full-screen frame at the new size");
+        assert!(
+            ready_seen.load(Ordering::SeqCst),
+            "DisplayControlReady never fired"
+        );
+        assert!(
+            resized_seen.load(Ordering::SeqCst),
+            "no full-screen frame at the new size"
+        );
         let fb = machine.framebuffer();
         assert_eq!(
             (fb.width(), fb.height()),
@@ -2291,7 +2366,10 @@ mod tests {
             ("rdp_demand_active", "Demand Active"),
             ("rdp_font_map", "Font Map (reactivation complete)"),
         ] {
-            assert!(logs_contain(target_name), "{what} was never logged ({target_name})");
+            assert!(
+                logs_contain(target_name),
+                "{what} was never logged ({target_name})"
+            );
         }
         eprintln!(
             "PDU sequence observed: DYNVC caps → create → EDISP caps → Monitor Layout → \
@@ -2467,8 +2545,7 @@ mod tests {
             result.expect("session failed while input was in flight");
             panic!("server closed the session during the input exchange");
         }
-        let (sent, idle_frames, after_click, after_typing) =
-            driver.await.expect("input driver");
+        let (sent, idle_frames, after_click, after_typing) = driver.await.expect("input driver");
 
         eprintln!(
             "sent {sent} input events; frames: settled={idle_frames} → after click={after_click} \
@@ -2578,4 +2655,3 @@ mod tests {
         );
     }
 }
-

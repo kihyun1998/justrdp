@@ -90,7 +90,10 @@ fn key_derivation_matches_ironrdp() {
 
     let ours = license_crypto::derive_license_keys(&PREMASTER, &CLIENT_RANDOM, &SERVER_RANDOM);
     assert_eq!(ours.mac_salt.as_slice(), their_keys.mac_salt_key.as_slice());
-    assert_eq!(ours.license_key.as_slice(), their_keys.license_key.as_slice());
+    assert_eq!(
+        ours.license_key.as_slice(),
+        their_keys.license_key.as_slice()
+    );
 }
 
 #[test]
@@ -151,8 +154,7 @@ fn platform_challenge_response_verifies_under_ironrdp_keys() {
     client_info::encode_basic_security_header(&mut challenge_body, client_info::SEC_LICENSE_PKT);
     challenge_body.push(license::MSG_PLATFORM_CHALLENGE);
     challenge_body.push(0x03);
-    challenge_body
-        .extend_from_slice(&((4 + 4 + 4 + encrypted.len() + 16) as u16).to_le_bytes());
+    challenge_body.extend_from_slice(&((4 + 4 + 4 + encrypted.len() + 16) as u16).to_le_bytes());
     challenge_body.extend_from_slice(&0u32.to_le_bytes()); // ConnectFlags
     challenge_body.extend_from_slice(&0x0009u16.to_le_bytes());
     challenge_body.extend_from_slice(&(encrypted.len() as u16).to_le_bytes());

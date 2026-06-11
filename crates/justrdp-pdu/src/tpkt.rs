@@ -32,10 +32,12 @@ pub fn decode(buf: &[u8]) -> Result<&[u8], DecodeError> {
     }
     cur.read_u8()?; // reserved
     let total = cur.read_u16_be()? as usize;
-    let payload_len = total.checked_sub(HEADER_LEN).ok_or(DecodeError::InvalidField {
-        field: "tpkt.length",
-        reason: "shorter than the 4-byte header",
-    })?;
+    let payload_len = total
+        .checked_sub(HEADER_LEN)
+        .ok_or(DecodeError::InvalidField {
+            field: "tpkt.length",
+            reason: "shorter than the 4-byte header",
+        })?;
     cur.read_slice(payload_len)
 }
 
@@ -105,6 +107,12 @@ mod tests {
         // needed/got counts are an implementation detail of the cursor, so assert the variant.
         let partial = [0x03, 0x00, 0x00, 0x07, 0xAA];
         let err = decode(&partial).unwrap_err();
-        assert!(matches!(err, DecodeError::NotEnoughBytes { context: "tpkt", .. }));
+        assert!(matches!(
+            err,
+            DecodeError::NotEnoughBytes {
+                context: "tpkt",
+                ..
+            }
+        ));
     }
 }

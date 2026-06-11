@@ -61,7 +61,9 @@ mod tests {
             inner.len()
         );
         assert!(
-            full_spki.windows(inner.len()).any(|w| w == inner.as_slice()),
+            full_spki
+                .windows(inner.len())
+                .any(|w| w == inner.as_slice()),
             "the inner subjectPublicKey must be contained verbatim within the full SPKI"
         );
     }

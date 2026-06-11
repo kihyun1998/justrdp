@@ -9,9 +9,7 @@ use crate::license_crypto;
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::client_info;
 use justrdp_pdu::cursor::ReadCursor;
-use justrdp_pdu::gcc::{
-    ClientGccBlocks, ClientNetworkData, ServerEarlyCapabilityFlags,
-};
+use justrdp_pdu::gcc::{ClientGccBlocks, ClientNetworkData, ServerEarlyCapabilityFlags};
 use justrdp_pdu::nego::{NegFailureCode, NegRequest, NegResponse, SecurityProtocol};
 use justrdp_pdu::{finalization, gcc, license, mcs, share, tpkt, x224};
 
@@ -504,7 +502,10 @@ impl ConnectStateMachine {
             (Stage::EarlyUserAuth { selected }, Event::EarlyUserAuthResult(bytes)) => {
                 // 4 bytes little-endian (MS-RDPBCGR 2.2.10.2). Only AUTHZ_SUCCESS grants access;
                 // any other value — or a truncated buffer — is a malformed PDU.
-                match bytes.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) {
+                match bytes
+                    .get(..4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                {
                     Some(AUTHZ_SUCCESS) => self.start_mcs(selected),
                     Some(AUTHZ_ACCESS_DENIED) => self.fail(ConnectError::EarlyUserAuthDenied),
                     _ => self.fail(ConnectError::Decode(
@@ -585,58 +586,56 @@ impl ConnectStateMachine {
                 Ok(NegResponse::Selected(selected)) => {
                     self.fail(ConnectError::UnsupportedProtocol(selected))
                 }
-                Ok(NegResponse::Failure(code)) => {
-                    self.fail(ConnectError::NegotiationFailed(code))
+                Ok(NegResponse::Failure(code)) => self.fail(ConnectError::NegotiationFailed(code)),
+                Err(e) => self.fail(ConnectError::Decode(e)),
+            },
+            Stage::GccExchange { selected } => {
+                match decode_mcs_frame(frame).and_then(mcs::decode_connect_response) {
+                    Ok(response) => self.on_connect_response(selected, response),
+                    Err(e) => self.fail(ConnectError::Decode(e)),
                 }
-                Err(e) => self.fail(ConnectError::Decode(e)),
-            },
-            Stage::GccExchange { selected } => match decode_mcs_frame(frame)
-                .and_then(mcs::decode_connect_response)
-            {
-                Ok(response) => self.on_connect_response(selected, response),
-                Err(e) => self.fail(ConnectError::Decode(e)),
-            },
-            Stage::McsAttach { selected } => match decode_mcs_frame(frame)
-                .and_then(mcs::AttachUserConfirm::decode)
-            {
-                Ok(confirm) => self.on_attach_user_confirm(selected, confirm),
-                Err(e) => self.fail(ConnectError::Decode(e)),
-            },
-            Stage::ChannelJoin { selected } => match decode_mcs_frame(frame)
-                .and_then(mcs::ChannelJoinConfirm::decode)
-            {
-                Ok(confirm) => self.on_channel_join_confirm(selected, confirm),
-                Err(e) => self.fail(ConnectError::Decode(e)),
-            },
+            }
+            Stage::McsAttach { selected } => {
+                match decode_mcs_frame(frame).and_then(mcs::AttachUserConfirm::decode) {
+                    Ok(confirm) => self.on_attach_user_confirm(selected, confirm),
+                    Err(e) => self.fail(ConnectError::Decode(e)),
+                }
+            }
+            Stage::ChannelJoin { selected } => {
+                match decode_mcs_frame(frame).and_then(mcs::ChannelJoinConfirm::decode) {
+                    Ok(confirm) => self.on_channel_join_confirm(selected, confirm),
+                    Err(e) => self.fail(ConnectError::Decode(e)),
+                }
+            }
             // Post-MCS stages: every inbound frame is a Send Data Indication on the I/O
             // channel; the per-stage step functions parse its payload.
-            Stage::Licensing { selected } => match decode_mcs_frame(frame)
-                .and_then(mcs::SendDataIndication::decode)
-            {
-                Ok(ind) => match self.license_step(selected, ind.user_data) {
-                    Ok(actions) => actions,
-                    Err(e) => self.fail(e),
-                },
-                Err(e) => self.fail(ConnectError::Decode(e)),
-            },
-            Stage::CapabilityExchange { selected } => match decode_mcs_frame(frame)
-                .and_then(mcs::SendDataIndication::decode)
-            {
-                Ok(ind) => match self.capability_step(selected, ind.user_data) {
-                    Ok(actions) => actions,
-                    Err(e) => self.fail(e),
-                },
-                Err(e) => self.fail(ConnectError::Decode(e)),
-            },
-            Stage::Finalization { selected } => match decode_mcs_frame(frame)
-                .and_then(mcs::SendDataIndication::decode)
-            {
-                Ok(ind) => match self.finalization_step(selected, ind.user_data) {
-                    Ok(actions) => actions,
-                    Err(e) => self.fail(e),
-                },
-                Err(e) => self.fail(ConnectError::Decode(e)),
-            },
+            Stage::Licensing { selected } => {
+                match decode_mcs_frame(frame).and_then(mcs::SendDataIndication::decode) {
+                    Ok(ind) => match self.license_step(selected, ind.user_data) {
+                        Ok(actions) => actions,
+                        Err(e) => self.fail(e),
+                    },
+                    Err(e) => self.fail(ConnectError::Decode(e)),
+                }
+            }
+            Stage::CapabilityExchange { selected } => {
+                match decode_mcs_frame(frame).and_then(mcs::SendDataIndication::decode) {
+                    Ok(ind) => match self.capability_step(selected, ind.user_data) {
+                        Ok(actions) => actions,
+                        Err(e) => self.fail(e),
+                    },
+                    Err(e) => self.fail(ConnectError::Decode(e)),
+                }
+            }
+            Stage::Finalization { selected } => {
+                match decode_mcs_frame(frame).and_then(mcs::SendDataIndication::decode) {
+                    Ok(ind) => match self.finalization_step(selected, ind.user_data) {
+                        Ok(actions) => actions,
+                        Err(e) => self.fail(e),
+                    },
+                    Err(e) => self.fail(ConnectError::Decode(e)),
+                }
+            }
             // drain_frames only runs in receiving stages; anything else is unreachable by
             // construction, but fail typed rather than panic if that invariant ever breaks.
             stage => self.fail(ConnectError::UnexpectedEvent {
@@ -856,15 +855,18 @@ impl ConnectStateMachine {
         if flags & client_info::SEC_LICENSE_PKT == 0 {
             // Licensing is mandatory after Client Info (MS-RDPBCGR 1.3.1.1); anything else
             // here means the sequence desynced.
-            return Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
-                field: "securityHeader.flags",
-                reason: "expected SEC_LICENSE_PKT while awaiting licensing",
-            }));
+            return Err(ConnectError::Decode(
+                justrdp_pdu::DecodeError::InvalidField {
+                    field: "securityHeader.flags",
+                    reason: "expected SEC_LICENSE_PKT while awaiting licensing",
+                },
+            ));
         }
         let preamble = license::LicensePreamble::decode(&mut cur).map_err(ConnectError::Decode)?;
         match preamble.msg_type {
             license::MSG_ERROR_ALERT => {
-                let alert = license::LicenseError::decode(&mut cur).map_err(ConnectError::Decode)?;
+                let alert =
+                    license::LicenseError::decode(&mut cur).map_err(ConnectError::Decode)?;
                 // `dwStateTransition` pins the client's reaction (MS-RDPELE 2.2.2.7), not the
                 // error code alone: ST_NO_TRANSITION means the licensing exchange is over and
                 // the connect proceeds — true for the STATUS_VALID_CLIENT short-circuit (the
@@ -884,8 +886,8 @@ impl ConnectStateMachine {
                 }
             }
             license::MSG_LICENSE_REQUEST => {
-                let request =
-                    license::ServerLicenseRequest::decode(&mut cur).map_err(ConnectError::Decode)?;
+                let request = license::ServerLicenseRequest::decode(&mut cur)
+                    .map_err(ConnectError::Decode)?;
                 let key = self.server_license_key(request.certificate.as_ref())?;
                 let entropy = &self.config.license.entropy;
                 self.license_keys = Some(license_crypto::derive_license_keys(
@@ -962,10 +964,12 @@ impl ConnectStateMachine {
                 self.stage = Stage::CapabilityExchange { selected };
                 Ok(Vec::new())
             }
-            _ => Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
-                field: "preamble.bMsgType",
-                reason: "unknown licensing message type",
-            })),
+            _ => Err(ConnectError::Decode(
+                justrdp_pdu::DecodeError::InvalidField {
+                    field: "preamble.bMsgType",
+                    reason: "unknown licensing message type",
+                },
+            )),
         }
     }
 
@@ -978,10 +982,12 @@ impl ConnectStateMachine {
         match certificate {
             // A server may omit the certificate when it expects a cached license (LICENSE_INFO);
             // this client holds none (caching is backlog), so the exchange cannot proceed.
-            None => Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
-                field: "ServerCertificate",
-                reason: "server sent no licensing certificate and no license is cached",
-            })),
+            None => Err(ConnectError::Decode(
+                justrdp_pdu::DecodeError::InvalidField {
+                    field: "ServerCertificate",
+                    reason: "server sent no licensing certificate and no license is cached",
+                },
+            )),
             Some(license::ServerCertificate::Proprietary(key)) => Ok(key.clone()),
             Some(license::ServerCertificate::X509Chain(chain)) => {
                 // The leaf (last) certificate carries the licensing key. `x509-cert` extracts
@@ -1082,10 +1088,12 @@ impl ConnectStateMachine {
                 self.stage = Stage::Finalization { selected };
                 Ok(actions)
             }
-            _ => Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
-                field: "ShareControlHeader.pduType",
-                reason: "unexpected share control pdu during capability exchange",
-            })),
+            _ => Err(ConnectError::Decode(
+                justrdp_pdu::DecodeError::InvalidField {
+                    field: "ShareControlHeader.pduType",
+                    reason: "unexpected share control pdu during capability exchange",
+                },
+            )),
         }
     }
 
@@ -1101,7 +1109,8 @@ impl ConnectStateMachine {
         let header = share::ShareControlHeader::decode(&mut cur).map_err(ConnectError::Decode)?;
         match header.pdu_type {
             share::PDU_TYPE_DATA => {
-                let data = share::ShareDataHeader::decode(&mut cur).map_err(ConnectError::Decode)?;
+                let data =
+                    share::ShareDataHeader::decode(&mut cur).map_err(ConnectError::Decode)?;
                 match data.pdu_type2 {
                     share::PDU_TYPE2_FONT_MAP => {
                         finalization::FontMap::decode(&mut cur).map_err(ConnectError::Decode)?;
@@ -1141,10 +1150,12 @@ impl ConnectStateMachine {
             }
             // A fresh Demand Active without an explicit deactivate: re-run the exchange.
             share::PDU_TYPE_DEMAND_ACTIVE => self.capability_step(selected, user_data),
-            _ => Err(ConnectError::Decode(justrdp_pdu::DecodeError::InvalidField {
-                field: "ShareControlHeader.pduType",
-                reason: "unexpected share control pdu during finalization",
-            })),
+            _ => Err(ConnectError::Decode(
+                justrdp_pdu::DecodeError::InvalidField {
+                    field: "ShareControlHeader.pduType",
+                    reason: "unexpected share control pdu during finalization",
+                },
+            )),
         }
     }
 
@@ -1216,8 +1227,7 @@ mod tests {
                 client_product_id: 1,
                 serial_number: 0,
                 high_color_depth: HIGH_COLOR_DEPTH_24BPP,
-                supported_color_depths: SUPPORTED_COLOR_DEPTH_24BPP
-                    | SUPPORTED_COLOR_DEPTH_32BPP,
+                supported_color_depths: SUPPORTED_COLOR_DEPTH_24BPP | SUPPORTED_COLOR_DEPTH_32BPP,
                 early_capability_flags: flags,
                 dig_product_id: String::new(),
                 connection_type: CONNECTION_TYPE_LAN,
@@ -1314,8 +1324,10 @@ mod tests {
             actions,
             vec![Action::WriteBytes(vec![
                 0x03, 0x00, 0x00, 0x13, // TPKT: version, reserved, length = 19
-                0x0E, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00, // X.224 CR: LI=14, code, refs, class
-                0x01, 0x00, 0x08, 0x00, 0x0B, 0x00, 0x00, 0x00, // RDP_NEG_REQ: SSL|HYBRID|HYBRID_EX
+                0x0E, 0xE0, 0x00, 0x00, 0x00, 0x00,
+                0x00, // X.224 CR: LI=14, code, refs, class
+                0x01, 0x00, 0x08, 0x00, 0x0B, 0x00, 0x00,
+                0x00, // RDP_NEG_REQ: SSL|HYBRID|HYBRID_EX
             ])]
         );
         assert_eq!(sm.stage(), "x224-negotiate");
@@ -1501,7 +1513,9 @@ mod tests {
         let actions = sm.process(Event::Received(&confirm));
         assert_eq!(
             actions,
-            vec![Action::FailWith(ConnectError::UnsupportedProtocol(standard))]
+            vec![Action::FailWith(ConnectError::UnsupportedProtocol(
+                standard
+            ))]
         );
     }
 
@@ -1653,9 +1667,7 @@ mod tests {
         let actions = sm.process(Event::Received(&iron_attach_user_confirm(1007)));
         let expected_joins: Vec<Action> = [1007u16, 1003, 1004, 1005]
             .iter()
-            .map(|&id| {
-                Action::WriteBytes(frame_mcs(&mcs::encode_channel_join_request(1007, id)))
-            })
+            .map(|&id| Action::WriteBytes(frame_mcs(&mcs::encode_channel_join_request(1007, id))))
             .collect();
         assert_eq!(actions, expected_joins);
 
@@ -1680,8 +1692,14 @@ mod tests {
                     user_channel_id: 1007,
                     io_channel_id: 1003,
                     static_channels: vec![
-                        StaticChannel { name: "cliprdr".to_string(), id: 1004 },
-                        StaticChannel { name: "drdynvc".to_string(), id: 1005 },
+                        StaticChannel {
+                            name: "cliprdr".to_string(),
+                            id: 1004
+                        },
+                        StaticChannel {
+                            name: "drdynvc".to_string(),
+                            id: 1005
+                        },
                     ],
                     desktop_size: (1280, 800),
                     channel_join_skipped: false,
@@ -1700,7 +1718,10 @@ mod tests {
                 | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN,
         );
         let mut sm = awaiting_connect_response(cfg);
-        sm.process(Event::Received(&iron_connect_response(true, vec![1004, 1005])));
+        sm.process(Event::Received(&iron_connect_response(
+            true,
+            vec![1004, 1005],
+        )));
         let actions = sm.process(Event::Received(&iron_attach_user_confirm(1009)));
         match actions.as_slice() {
             // Even on the skip path the Client Info PDU precedes completion.
@@ -1720,7 +1741,10 @@ mod tests {
         // the machine must join normally — honoring the caller's flags, never its own policy.
         let cfg = config_with_flags(ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
         let mut sm = awaiting_connect_response(cfg);
-        sm.process(Event::Received(&iron_connect_response(true, vec![1004, 1005])));
+        sm.process(Event::Received(&iron_connect_response(
+            true,
+            vec![1004, 1005],
+        )));
         let actions = sm.process(Event::Received(&iron_attach_user_confirm(1009)));
         assert_eq!(actions.len(), 4, "must send all join requests");
         assert!(actions.iter().all(|a| matches!(a, Action::WriteBytes(_))));
@@ -1730,7 +1754,10 @@ mod tests {
     fn refused_channels_are_omitted_from_the_result_and_joins() {
         // The server refuses "drdynvc" (ID 0): it must not be joined nor reported as granted.
         let mut sm = awaiting_connect_response(config());
-        sm.process(Event::Received(&iron_connect_response(false, vec![1004, 0])));
+        sm.process(Event::Received(&iron_connect_response(
+            false,
+            vec![1004, 0],
+        )));
         let actions = sm.process(Event::Received(&iron_attach_user_confirm(1007)));
         assert_eq!(actions.len(), 3, "user + io + 1 granted static channel");
 
@@ -1743,7 +1770,10 @@ mod tests {
             [Action::WriteBytes(_), Action::McsConnected { result }] => {
                 assert_eq!(
                     result.static_channels,
-                    vec![StaticChannel { name: "cliprdr".to_string(), id: 1004 }]
+                    vec![StaticChannel {
+                        name: "cliprdr".to_string(),
+                        id: 1004
+                    }]
                 );
             }
             other => panic!("expected McsConnected, got {other:?}"),
@@ -1767,7 +1797,9 @@ mod tests {
         let actions = sm.process(Event::Received(&frame));
         assert_eq!(
             actions,
-            vec![Action::FailWith(ConnectError::McsConnectFailed { result: 14 })]
+            vec![Action::FailWith(ConnectError::McsConnectFailed {
+                result: 14
+            })]
         );
     }
 
@@ -1828,10 +1860,17 @@ mod tests {
             info.credentials.password, "",
             "no secret enters the sans-IO machine (plan.md decision 10)"
         );
-        let tz = info.extra_info.optional_data.timezone().expect("timezone present");
+        let tz = info
+            .extra_info
+            .optional_data
+            .timezone()
+            .expect("timezone present");
         assert_eq!(tz.bias, -540);
         assert_eq!(
-            info.extra_info.optional_data.performance_flags().map(|f| f.bits()),
+            info.extra_info
+                .optional_data
+                .performance_flags()
+                .map(|f| f.bits()),
             Some(0x7)
         );
         assert_eq!(info.extra_info.optional_data.session_id(), Some(0));
@@ -1973,11 +2012,19 @@ mod tests {
                 "capability-exchange",
                 &[EventKind::Received],
             ),
-            (joining_channels, "capability-exchange", &[EventKind::Received]),
+            (
+                joining_channels,
+                "capability-exchange",
+                &[EventKind::Received],
+            ),
             // Licensing and the Demand Active wait keep consuming socket bytes under the
             // capability-exchange label; finalization does so under activation.
             (licensing, "capability-exchange", &[EventKind::Received]),
-            (capability_waiting, "capability-exchange", &[EventKind::Received]),
+            (
+                capability_waiting,
+                "capability-exchange",
+                &[EventKind::Received],
+            ),
             (finalizing, "activation", &[EventKind::Received]),
             // Terminal machines keep reporting the label of the stage where the connect ended.
             (done_failed, "x224-negotiate", &[]),
@@ -1989,7 +2036,11 @@ mod tests {
                     continue;
                 }
                 let mut sm = make();
-                assert_eq!(sm.stage(), label, "stage constructor drove to the wrong stage");
+                assert_eq!(
+                    sm.stage(),
+                    label,
+                    "stage constructor drove to the wrong stage"
+                );
                 let actions = sm.process(sample_event(kind));
                 assert_eq!(
                     actions,
@@ -2294,11 +2345,13 @@ mod tests {
                 .encode(),
             ),
         ] {
-            let actions =
-                sm.process(Event::Received(&server_io_frame(&server_share_data(
-                    pdu_type2, &body,
-                ))));
-            assert!(actions.is_empty(), "server finalization replies produce no output");
+            let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
+                pdu_type2, &body,
+            ))));
+            assert!(
+                actions.is_empty(),
+                "server finalization replies produce no output"
+            );
         }
         let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
             share::PDU_TYPE2_FONT_MAP,
@@ -2321,7 +2374,9 @@ mod tests {
         ))));
         assert_eq!(
             actions,
-            vec![Action::FailWith(ConnectError::LicensingFailed { error_code: 0x02 })]
+            vec![Action::FailWith(ConnectError::LicensingFailed {
+                error_code: 0x02
+            })]
         );
     }
 
@@ -2335,7 +2390,10 @@ mod tests {
             0x02,
             license::ST_NO_TRANSITION,
         ))));
-        assert!(actions.is_empty(), "exchange-ending alert produces no output");
+        assert!(
+            actions.is_empty(),
+            "exchange-ending alert produces no output"
+        );
 
         let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
             1920, 1080,
@@ -2365,8 +2423,7 @@ mod tests {
 
         // 1. Server License Request → the machine answers with a New License Request built
         //    from the caller's entropy and the certificate's RSA key — byte-exact.
-        let actions =
-            sm.process(Event::Received(&server_io_frame(&server_license_request())));
+        let actions = sm.process(Event::Received(&server_io_frame(&server_license_request())));
         let encrypted_premaster =
             license_crypto::encrypt_premaster_secret(&[0x22; 48], &TEST_MODULUS, 65537);
         let expected = license::encode_new_license_request(
@@ -2387,10 +2444,8 @@ mod tests {
         challenge_body.extend_from_slice(&0x0009u16.to_le_bytes());
         challenge_body.extend_from_slice(&(encrypted.len() as u16).to_le_bytes());
         challenge_body.extend_from_slice(&encrypted);
-        challenge_body.extend_from_slice(&license_crypto::mac_data(
-            &keys.mac_salt,
-            challenge_plain,
-        ));
+        challenge_body
+            .extend_from_slice(&license_crypto::mac_data(&keys.mac_salt, challenge_plain));
         let actions = sm.process(Event::Received(&server_io_frame(&license_message(
             license::MSG_PLATFORM_CHALLENGE,
             &challenge_body,
@@ -2545,12 +2600,8 @@ mod tests {
         body.extend_from_slice(b"RDP\0");
         body.extend_from_slice(&9u16.to_le_bytes()); // 9 capsets, none present
         body.extend_from_slice(&0u16.to_le_bytes());
-        let frame = share::encode_share_control(
-            share::PDU_TYPE_DEMAND_ACTIVE,
-            1002,
-            SHARE_ID,
-            &body,
-        );
+        let frame =
+            share::encode_share_control(share::PDU_TYPE_DEMAND_ACTIVE, 1002, SHARE_ID, &body);
         let actions = sm.process(Event::Received(&server_io_frame(&frame)));
         assert!(
             matches!(

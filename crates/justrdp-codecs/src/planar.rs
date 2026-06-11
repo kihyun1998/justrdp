@@ -79,8 +79,18 @@ pub fn decompress(src: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Pl
             pos += decode_rle_plane(&body[pos.min(body.len())..], &mut alpha, width, height)?;
         }
         pos += decode_rle_plane(&body[pos.min(body.len())..], &mut plane0, width, height)?;
-        pos += decode_rle_plane(&body[pos.min(body.len())..], &mut plane1, chroma_w, chroma_h)?;
-        decode_rle_plane(&body[pos.min(body.len())..], &mut plane2, chroma_w, chroma_h)?;
+        pos += decode_rle_plane(
+            &body[pos.min(body.len())..],
+            &mut plane1,
+            chroma_w,
+            chroma_h,
+        )?;
+        decode_rle_plane(
+            &body[pos.min(body.len())..],
+            &mut plane2,
+            chroma_w,
+            chroma_h,
+        )?;
     } else {
         let alpha_size = if use_alpha { full_size } else { 0 };
         // Raw planes are stored back to back; a single pad byte may trail the stream.
@@ -208,7 +218,7 @@ mod tests {
             5, 6, // B plane
             0, // pad
         ];
-        let out = decompress(&src, 2, 1, ).unwrap();
+        let out = decompress(&src, 2, 1).unwrap();
         assert_eq!(out, [5, 3, 1, 6, 4, 2]); // BGR per pixel
     }
 

@@ -106,7 +106,10 @@ mod tests {
         assert_eq!(decoded[1].flags, 0);
         assert_eq!(decoded[2].flags, CHANNEL_FLAG_LAST);
         assert!(decoded.iter().all(|c| c.total_length == 4000));
-        let reassembled: Vec<u8> = decoded.iter().flat_map(|c| c.data.iter().copied()).collect();
+        let reassembled: Vec<u8> = decoded
+            .iter()
+            .flat_map(|c| c.data.iter().copied())
+            .collect();
         assert_eq!(reassembled, message);
     }
 

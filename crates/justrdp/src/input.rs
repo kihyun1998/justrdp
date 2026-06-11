@@ -87,8 +87,8 @@ pub fn pause_sequence() -> [InputEvent; 4] {
 /// layout-independent — a French host pressing the key labelled "A" reports VK/keycode "Q"'s
 /// position and the server applies its own layout).
 const LETTERS: [u8; 26] = [
-    0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
-    0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
+    0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19,
+    0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
 ];
 
 /// Set-1 scancodes for the top-row digits 0–9 (0 maps to `0x0B`, 1–9 to `0x02`–`0x0A`).
@@ -102,34 +102,34 @@ const DIGITS: [u8; 10] = [0x0B, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 
 /// position; pass the `VK_L*`/`VK_R*` forms when the host distinguishes sides.
 pub fn scancode_from_windows_vk(vk: u16) -> Option<Scancode> {
     Some(match vk {
-        0x08 => Scancode::plain(0x0E),       // VK_BACK
-        0x09 => Scancode::plain(0x0F),       // VK_TAB
-        0x0D => Scancode::plain(0x1C),       // VK_RETURN (numpad Enter: use ext(0x1C))
+        0x08 => Scancode::plain(0x0E),        // VK_BACK
+        0x09 => Scancode::plain(0x0F),        // VK_TAB
+        0x0D => Scancode::plain(0x1C),        // VK_RETURN (numpad Enter: use ext(0x1C))
         0x10 | 0xA0 => Scancode::plain(0x2A), // VK_SHIFT / VK_LSHIFT
-        0xA1 => Scancode::plain(0x36),       // VK_RSHIFT
+        0xA1 => Scancode::plain(0x36),        // VK_RSHIFT
         0x11 | 0xA2 => Scancode::plain(0x1D), // VK_CONTROL / VK_LCONTROL
-        0xA3 => Scancode::ext(0x1D),         // VK_RCONTROL
+        0xA3 => Scancode::ext(0x1D),          // VK_RCONTROL
         0x12 | 0xA4 => Scancode::plain(0x38), // VK_MENU / VK_LMENU
-        0xA5 => Scancode::ext(0x38),         // VK_RMENU (AltGr)
-        0x14 => Scancode::plain(0x3A),       // VK_CAPITAL
-        0x1B => Scancode::plain(0x01),       // VK_ESCAPE
-        0x20 => Scancode::plain(0x39),       // VK_SPACE
-        0x21 => Scancode::ext(0x49),         // VK_PRIOR (Page Up)
-        0x22 => Scancode::ext(0x51),         // VK_NEXT (Page Down)
-        0x23 => Scancode::ext(0x4F),         // VK_END
-        0x24 => Scancode::ext(0x47),         // VK_HOME
-        0x25 => Scancode::ext(0x4B),         // VK_LEFT
-        0x26 => Scancode::ext(0x48),         // VK_UP
-        0x27 => Scancode::ext(0x4D),         // VK_RIGHT
-        0x28 => Scancode::ext(0x50),         // VK_DOWN
-        0x2C => Scancode::ext(0x37),         // VK_SNAPSHOT (Print Screen)
-        0x2D => Scancode::ext(0x52),         // VK_INSERT
-        0x2E => Scancode::ext(0x53),         // VK_DELETE
+        0xA5 => Scancode::ext(0x38),          // VK_RMENU (AltGr)
+        0x14 => Scancode::plain(0x3A),        // VK_CAPITAL
+        0x1B => Scancode::plain(0x01),        // VK_ESCAPE
+        0x20 => Scancode::plain(0x39),        // VK_SPACE
+        0x21 => Scancode::ext(0x49),          // VK_PRIOR (Page Up)
+        0x22 => Scancode::ext(0x51),          // VK_NEXT (Page Down)
+        0x23 => Scancode::ext(0x4F),          // VK_END
+        0x24 => Scancode::ext(0x47),          // VK_HOME
+        0x25 => Scancode::ext(0x4B),          // VK_LEFT
+        0x26 => Scancode::ext(0x48),          // VK_UP
+        0x27 => Scancode::ext(0x4D),          // VK_RIGHT
+        0x28 => Scancode::ext(0x50),          // VK_DOWN
+        0x2C => Scancode::ext(0x37),          // VK_SNAPSHOT (Print Screen)
+        0x2D => Scancode::ext(0x52),          // VK_INSERT
+        0x2E => Scancode::ext(0x53),          // VK_DELETE
         0x30..=0x39 => Scancode::plain(DIGITS[usize::from(vk - 0x30)]),
         0x41..=0x5A => Scancode::plain(LETTERS[usize::from(vk - 0x41)]),
-        0x5B => Scancode::ext(0x5B),         // VK_LWIN
-        0x5C => Scancode::ext(0x5C),         // VK_RWIN
-        0x5D => Scancode::ext(0x5D),         // VK_APPS (menu key)
+        0x5B => Scancode::ext(0x5B), // VK_LWIN
+        0x5C => Scancode::ext(0x5C), // VK_RWIN
+        0x5D => Scancode::ext(0x5D), // VK_APPS (menu key)
         // Numpad digits (NumLock-on meanings; the positions are the non-extended nav codes).
         0x60 => Scancode::plain(0x52),
         0x61 => Scancode::plain(0x4F),
@@ -141,29 +141,29 @@ pub fn scancode_from_windows_vk(vk: u16) -> Option<Scancode> {
         0x67 => Scancode::plain(0x47),
         0x68 => Scancode::plain(0x48),
         0x69 => Scancode::plain(0x49),
-        0x6A => Scancode::plain(0x37),       // VK_MULTIPLY
-        0x6B => Scancode::plain(0x4E),       // VK_ADD
-        0x6D => Scancode::plain(0x4A),       // VK_SUBTRACT
-        0x6E => Scancode::plain(0x53),       // VK_DECIMAL
-        0x6F => Scancode::ext(0x35),         // VK_DIVIDE
+        0x6A => Scancode::plain(0x37), // VK_MULTIPLY
+        0x6B => Scancode::plain(0x4E), // VK_ADD
+        0x6D => Scancode::plain(0x4A), // VK_SUBTRACT
+        0x6E => Scancode::plain(0x53), // VK_DECIMAL
+        0x6F => Scancode::ext(0x35),   // VK_DIVIDE
         // F1–F12 (F13+ have no universal set-1 position).
         0x70..=0x79 => Scancode::plain(0x3B + (vk - 0x70) as u8),
-        0x7A => Scancode::plain(0x57),       // VK_F11
-        0x7B => Scancode::plain(0x58),       // VK_F12
-        0x90 => Scancode::plain(0x45),       // VK_NUMLOCK
-        0x91 => Scancode::plain(0x46),       // VK_SCROLL
-        0xBA => Scancode::plain(0x27),       // VK_OEM_1      ;:
-        0xBB => Scancode::plain(0x0D),       // VK_OEM_PLUS   =+
-        0xBC => Scancode::plain(0x33),       // VK_OEM_COMMA  ,<
-        0xBD => Scancode::plain(0x0C),       // VK_OEM_MINUS  -_
-        0xBE => Scancode::plain(0x34),       // VK_OEM_PERIOD .>
-        0xBF => Scancode::plain(0x35),       // VK_OEM_2      /?
-        0xC0 => Scancode::plain(0x29),       // VK_OEM_3      `~
-        0xDB => Scancode::plain(0x1A),       // VK_OEM_4      [{
-        0xDC => Scancode::plain(0x2B),       // VK_OEM_5      \|
-        0xDD => Scancode::plain(0x1B),       // VK_OEM_6      ]}
-        0xDE => Scancode::plain(0x28),       // VK_OEM_7      '"
-        0xE2 => Scancode::plain(0x56),       // VK_OEM_102 (ISO <> key)
+        0x7A => Scancode::plain(0x57), // VK_F11
+        0x7B => Scancode::plain(0x58), // VK_F12
+        0x90 => Scancode::plain(0x45), // VK_NUMLOCK
+        0x91 => Scancode::plain(0x46), // VK_SCROLL
+        0xBA => Scancode::plain(0x27), // VK_OEM_1      ;:
+        0xBB => Scancode::plain(0x0D), // VK_OEM_PLUS   =+
+        0xBC => Scancode::plain(0x33), // VK_OEM_COMMA  ,<
+        0xBD => Scancode::plain(0x0C), // VK_OEM_MINUS  -_
+        0xBE => Scancode::plain(0x34), // VK_OEM_PERIOD .>
+        0xBF => Scancode::plain(0x35), // VK_OEM_2      /?
+        0xC0 => Scancode::plain(0x29), // VK_OEM_3      `~
+        0xDB => Scancode::plain(0x1A), // VK_OEM_4      [{
+        0xDC => Scancode::plain(0x2B), // VK_OEM_5      \|
+        0xDD => Scancode::plain(0x1B), // VK_OEM_6      ]}
+        0xDE => Scancode::plain(0x28), // VK_OEM_7      '"
+        0xE2 => Scancode::plain(0x56), // VK_OEM_102 (ISO <> key)
         _ => return None,
     })
 }
@@ -360,7 +360,10 @@ mod tests {
     fn function_keys_are_not_extended() {
         assert_eq!(scancode_from_windows_vk(0x70), Some(Scancode::plain(0x3B))); // F1
         assert_eq!(scancode_from_windows_vk(0x7B), Some(Scancode::plain(0x58))); // F12
-        assert_eq!(scancode_from_macos_keycode(0x7A), Some(Scancode::plain(0x3B)));
+        assert_eq!(
+            scancode_from_macos_keycode(0x7A),
+            Some(Scancode::plain(0x3B))
+        );
         assert_eq!(scancode_from_linux_evdev(59), Some(Scancode::plain(0x3B)));
     }
 
