@@ -22,9 +22,7 @@ use justrdp::{
     Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, Event, FrameUpdate,
     InputEvent, LicenseEntropy, McsConnectResult, SessionError, SessionOutput, SessionStateMachine,
 };
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::pki_types::ServerName;
 use sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, TsRequest};
 use sspi::generator::GeneratorState;
 use sspi::negotiate::NegotiateConfig;
@@ -36,6 +34,10 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 // Re-exported so hosts cancel sessions without naming tokio-util themselves.
 pub use tokio_util::sync::CancellationToken;
+
+mod trust;
+use trust::client_config;
+pub use trust::{FilePinStore, MemoryPinStore, PinStore, TrustPolicy, pin_fingerprint};
 
 /// Timeout for the TCP dial.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -293,7 +295,7 @@ pub async fn connect(
         config,
         credentials,
         on_stage,
-        ConnectTimeouts::default(),
+        ConnectOptions::default(),
     )
     .await
 }
@@ -320,7 +322,8 @@ impl Default for ConnectTimeouts {
     }
 }
 
-/// [`connect`] with the caller's [`ConnectTimeouts`] instead of the defaults.
+/// [`connect`] with the caller's [`ConnectTimeouts`] instead of the defaults. The trust policy
+/// stays the default ([`TrustPolicy::Chain`]); use [`connect_with_options`] to choose both.
 pub async fn connect_with_timeouts(
     server: impl Into<ServerAddr>,
     config: ConnectConfig,
@@ -328,13 +331,44 @@ pub async fn connect_with_timeouts(
     on_stage: impl FnMut(&str),
     timeouts: ConnectTimeouts,
 ) -> Result<ConnectOutcome, ConnectFailure> {
-    connect_inner(server.into(), config, credentials, on_stage, timeouts).await
+    let options = ConnectOptions {
+        timeouts,
+        ..ConnectOptions::default()
+    };
+    connect_inner(server.into(), config, credentials, on_stage, options).await
+}
+
+/// The adapter-level knobs for [`connect`] that are not protocol configuration: the per-stage
+/// [`ConnectTimeouts`] and the server-certificate [`TrustPolicy`]. Protocol settings (GCC blocks,
+/// requested security protocols, channels) stay in the sans-IO core's `ConnectConfig`; these
+/// options exist only where the I/O actually happens.
+///
+/// `Default` is the safe configuration: default timeouts and **real certificate validation**
+/// ([`TrustPolicy::Chain`]).
+#[derive(Debug, Clone, Default)]
+pub struct ConnectOptions {
+    /// Per-stage timeout policy.
+    pub timeouts: ConnectTimeouts,
+    /// How to decide whether the server's TLS certificate is trusted.
+    pub trust: TrustPolicy,
+}
+
+/// [`connect`] with the caller's [`ConnectOptions`] (timeouts and trust policy) instead of the
+/// defaults.
+pub async fn connect_with_options(
+    server: impl Into<ServerAddr>,
+    config: ConnectConfig,
+    credentials: Credentials,
+    on_stage: impl FnMut(&str),
+    options: ConnectOptions,
+) -> Result<ConnectOutcome, ConnectFailure> {
+    connect_inner(server.into(), config, credentials, on_stage, options).await
 }
 
 /// The monomorphic body of [`connect`], instrumented once the server identity is concrete.
 #[tracing::instrument(
     name = "connect",
-    skip(config, credentials, on_stage, timeouts),
+    skip(config, credentials, on_stage, options),
     fields(host = %server.host, port = server.port),
     err,
 )]
@@ -343,8 +377,9 @@ async fn connect_inner(
     config: ConnectConfig,
     credentials: Credentials,
     mut on_stage: impl FnMut(&str),
-    timeouts: ConnectTimeouts,
+    options: ConnectOptions,
 ) -> Result<ConnectOutcome, ConnectFailure> {
+    let timeouts = options.timeouts;
     let mut sm = ConnectStateMachine::new(config);
     let mut transport = Transport::Absent;
     let mut readbuf = [0u8; 8192];
@@ -389,7 +424,14 @@ async fn connect_inner(
                             "TLS upgrade requested without a connected plaintext socket",
                         )));
                     };
-                    let connector = TlsConnector::from(Arc::new(client_config()));
+                    // The trust policy decides the verifier: Chain fails *here*, inside the
+                    // handshake, when the cert is untrusted — NLA is never reached.
+                    let tls_config = client_config(&options.trust, &server.host).map_err(|e| {
+                        ConnectFailure::TlsHandshake {
+                            reason: format!("building the TLS trust configuration: {e}"),
+                        }
+                    })?;
+                    let connector = TlsConnector::from(Arc::new(tls_config));
                     // SNI carries the host exactly as dialed: `ServerName` parses both DNS names
                     // and IP literals, so a hostname reaches the server (and #36's validation)
                     // instead of being flattened to whatever it resolved to.
@@ -942,70 +984,10 @@ async fn read_ts_request(reader: &mut TlsStream<TcpStream>) -> Result<TsRequest,
     })
 }
 
-/// A rustls client config that accepts any server certificate. slice-2's policy is `validate=false`:
-/// we extract the public key but do not yet verify the chain / name (CN/SAN, chain-of-trust, and
-/// TOFU pinning are follow-up slices, per plan.md §22). The `ring` crypto provider is selected
-/// explicitly so no process-default provider needs installing. Default protocol versions (TLS 1.2
-/// and 1.3) are kept — CredSSP/NLA over the same session was verified to work over TLS 1.3 against
-/// the real VM (slice-3), so no version pin is needed.
-fn client_config() -> rustls::ClientConfig {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .expect("ring provider supports the default TLS protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert { provider }))
-        .with_no_client_auth()
-}
-
-/// A `ServerCertVerifier` that accepts every certificate and signature. Used only for slice-2's
-/// extract-the-key-but-don't-validate policy; real validation arrives in a later slice.
-#[derive(Debug)]
-struct AcceptAnyServerCert {
-    provider: Arc<rustls::crypto::CryptoProvider>,
-}
-
-impl ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
     use tracing_test::traced_test;
@@ -1113,14 +1095,38 @@ mod tests {
         }
     }
 
+    /// [`connect`] with the explicit accept-any opt-in the mock-server tests need: the mocks
+    /// present a throwaway self-signed cert no trust store contains, so getting *past* the TLS
+    /// stage means deliberately choosing [`TrustPolicy::DangerAcceptAny`] (issue #36 — the
+    /// default policy would, correctly, refuse these servers; that refusal has its own test).
+    async fn connect_danger(
+        server: impl Into<ServerAddr>,
+        config: ConnectConfig,
+        credentials: Credentials,
+        on_stage: impl FnMut(&str),
+    ) -> Result<ConnectOutcome, ConnectFailure> {
+        let options = ConnectOptions {
+            trust: TrustPolicy::DangerAcceptAny,
+            ..ConnectOptions::default()
+        };
+        connect_with_options(server, config, credentials, on_stage, options).await
+    }
+
     /// Spawn a one-shot mock RDP server on loopback: it reads the client's plaintext Connection
     /// Request, replies with a Connection Confirm carrying `nego`, runs the TLS handshake with a
     /// throwaway self-signed cert, then reads one byte and drops the connection. It deliberately does
     /// **not** speak CredSSP, so the client reaches the `nla-credssp` stage and then fails there —
     /// which is exactly what lets these tests assert the TLS→NLA handoff without a real NTLM peer.
     async fn mock_tls_server(nego: [u8; 8]) -> SocketAddr {
+        mock_tls_server_returning_cert(nego).await.0
+    }
+
+    /// [`mock_tls_server`], but also returns the DER of the self-signed cert the mock presents —
+    /// the TOFU tests compute the expected `subjectPublicKey` pin from it.
+    async fn mock_tls_server_returning_cert(nego: [u8; 8]) -> (SocketAddr, Vec<u8>) {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
+        let cert_der = cert.as_ref().to_vec();
         let key = ck.signing_key.serialize_der();
         let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
 
@@ -1131,11 +1137,13 @@ mod tests {
             let mut scratch = [0u8; 64];
             let _ = sock.read(&mut scratch).await.unwrap(); // drain the plaintext Connection Request
             sock.write_all(&confirm_frame(nego)).await.unwrap(); // plaintext Connection Confirm
-            let mut tls = acceptor.accept(sock).await.unwrap(); // TLS handshake
+            let Ok(mut tls) = acceptor.accept(sock).await else {
+                return; // the client (correctly) refused the cert — nothing more to serve
+            };
             let mut buf = [0u8; 1];
             let _ = tls.read(&mut buf).await; // read one byte of the first TSRequest, then drop → close
         });
-        addr
+        (addr, cert_der)
     }
 
     #[tokio::test]
@@ -1147,7 +1155,7 @@ mod tests {
         let addr = mock_tls_server([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
 
         let mut stages = Vec::new();
-        let err = connect(addr, test_config(), test_credentials(), |s| {
+        let err = connect_danger(addr, test_config(), test_credentials(), |s| {
             stages.push(s.to_string())
         })
         .await
@@ -1176,7 +1184,7 @@ mod tests {
     async fn connect_logs_stage_transitions_through_nla() {
         let addr = mock_tls_server([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
         // Fails at the NLA boundary (no real NTLM peer); we only care about the logged transitions.
-        let _ = connect(addr, test_config(), test_credentials(), |_| {}).await;
+        let _ = connect_danger(addr, test_config(), test_credentials(), |_| {}).await;
 
         // Every connect stage through NLA is named in the debug logs (criterion 14: observable
         // transitions)...
@@ -1192,6 +1200,150 @@ mod tests {
         assert!(logs_contain("nla-credssp"), "nla-credssp stage not logged");
         // ...and byte counts are logged for the plaintext bytes written and read.
         assert!(logs_contain("bytes="), "byte counts not logged");
+    }
+
+    #[test]
+    fn the_default_trust_policy_is_chain_validation() {
+        // The "cannot silently ship" guard from #36: the default-constructed options must perform
+        // real chain validation. If the default ever regresses to accept-any, this is the tripwire.
+        assert!(matches!(TrustPolicy::default(), TrustPolicy::Chain));
+        assert!(matches!(
+            ConnectOptions::default().trust,
+            TrustPolicy::Chain
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_an_untrusted_certificate_by_default() {
+        // The mock presents a throwaway self-signed cert no trust store contains. The default
+        // policy must fail the handshake itself — the connect never reaches NLA, so the
+        // credentials are never exposed to an unauthenticated peer.
+        let addr = mock_tls_server([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+
+        let mut stages = Vec::new();
+        let err = connect(addr, test_config(), test_credentials(), |s| {
+            stages.push(s.to_string())
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ConnectFailure::TlsHandshake { .. }),
+            "expected a TLS trust failure, got {err:?}"
+        );
+        assert!(
+            !stages.contains(&"nla-credssp".to_string()),
+            "an untrusted certificate must never reach the NLA stage"
+        );
+    }
+
+    #[tokio::test]
+    async fn tofu_stores_the_pin_on_first_connect_and_proceeds() {
+        // First contact: the store has no pin for this host, so TOFU trusts the presented key,
+        // persists it, and lets the connect proceed (the mock then fails at NLA as always).
+        let (addr, cert_der) =
+            mock_tls_server_returning_cert([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+        let store = Arc::new(MemoryPinStore::default());
+        let options = ConnectOptions {
+            trust: TrustPolicy::Tofu(store.clone()),
+            ..ConnectOptions::default()
+        };
+
+        let mut stages = Vec::new();
+        let _ = connect_with_options(
+            addr,
+            test_config(),
+            test_credentials(),
+            |s| stages.push(s.to_string()),
+            options,
+        )
+        .await;
+
+        assert!(
+            stages.contains(&"nla-credssp".to_string()),
+            "first-use TOFU must let the connect proceed past TLS, got {stages:?}"
+        );
+        // The stored pin is exactly the cert's inner subjectPublicKey — the same material
+        // CredSSP binds to, extracted by the same function.
+        let expected = justrdp::tls::extract_subject_public_key(&cert_der).unwrap();
+        assert_eq!(store.lookup("127.0.0.1").unwrap(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn tofu_accepts_an_unchanged_key_on_reconnect() {
+        let (addr, cert_der) =
+            mock_tls_server_returning_cert([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+        let store = Arc::new(MemoryPinStore::default());
+        let pin = justrdp::tls::extract_subject_public_key(&cert_der).unwrap();
+        store.store("127.0.0.1", &pin).unwrap();
+        let options = ConnectOptions {
+            trust: TrustPolicy::Tofu(store),
+            ..ConnectOptions::default()
+        };
+
+        let mut stages = Vec::new();
+        let _ = connect_with_options(
+            addr,
+            test_config(),
+            test_credentials(),
+            |s| stages.push(s.to_string()),
+            options,
+        )
+        .await;
+
+        assert!(
+            stages.contains(&"nla-credssp".to_string()),
+            "an unchanged pinned key must connect, got {stages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tofu_rejects_a_changed_server_key() {
+        // The store already pins a *different* key for this host — the situation TOFU exists to
+        // catch (a MITM, or a silently reinstalled server). The handshake must fail with a typed
+        // error that names the host and both key fingerprints, and never reach NLA.
+        let (addr, cert_der) =
+            mock_tls_server_returning_cert([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+        let store = Arc::new(MemoryPinStore::default());
+        let pinned: &[u8] = b"not-the-key-the-server-presents";
+        store.store("127.0.0.1", pinned).unwrap();
+        let options = ConnectOptions {
+            trust: TrustPolicy::Tofu(store.clone()),
+            ..ConnectOptions::default()
+        };
+
+        let mut stages = Vec::new();
+        let err = connect_with_options(
+            addr,
+            test_config(),
+            test_credentials(),
+            |s| stages.push(s.to_string()),
+            options,
+        )
+        .await
+        .unwrap_err();
+
+        let ConnectFailure::TlsHandshake { reason } = &err else {
+            panic!("expected a TLS trust failure, got {err:?}");
+        };
+        // The error names the host and both SHA-256 fingerprints, so a host application can
+        // show the user exactly what changed.
+        let presented = justrdp::tls::extract_subject_public_key(&cert_der).unwrap();
+        assert!(reason.contains("127.0.0.1"), "no host in: {reason}");
+        assert!(
+            reason.contains(&pin_fingerprint(pinned)),
+            "no pinned fingerprint in: {reason}"
+        );
+        assert!(
+            reason.contains(&pin_fingerprint(&presented)),
+            "no presented fingerprint in: {reason}"
+        );
+        assert!(
+            !stages.contains(&"nla-credssp".to_string()),
+            "a changed key must never reach the NLA stage"
+        );
+        // And the pin is NOT silently overwritten — the stored key stays the old one.
+        assert_eq!(store.lookup("127.0.0.1").unwrap(), Some(pinned.to_vec()));
     }
 
     #[test]
@@ -1245,7 +1397,7 @@ mod tests {
         let server = ServerAddr::new("localhost", addr.port());
 
         let mut stages = Vec::new();
-        let _ = connect(server, test_config(), test_credentials(), |s| {
+        let _ = connect_danger(server, test_config(), test_credentials(), |s| {
             stages.push(s.to_string())
         })
         .await;
@@ -1267,7 +1419,7 @@ mod tests {
         let (addr, sni_rx) =
             mock_tls_server_reporting_sni([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
 
-        let _ = connect(addr, test_config(), test_credentials(), |_| {}).await;
+        let _ = connect_danger(addr, test_config(), test_credentials(), |_| {}).await;
 
         assert_eq!(sni_rx.await.unwrap(), None);
     }
@@ -1382,7 +1534,7 @@ mod tests {
         let addr =
             mock_tls_server_replying_to_nla(vec![vec![0x30, 0x84, 0x00, 0xFF, 0xFF, 0xFF]], true)
                 .await;
-        let err = connect(addr, test_config(), test_credentials(), |_| {})
+        let err = connect_danger(addr, test_config(), test_credentials(), |_| {})
             .await
             .unwrap_err();
         match &err {
@@ -1398,7 +1550,7 @@ mod tests {
         // 0x80 | 0x10 = 16 BER length bytes — wider than usize; the adapter must refuse to
         // parse rather than overflow.
         let addr = mock_tls_server_replying_to_nla(vec![vec![0x30, 0x90]], true).await;
-        let err = connect(addr, test_config(), test_credentials(), |_| {})
+        let err = connect_danger(addr, test_config(), test_credentials(), |_| {})
             .await
             .unwrap_err();
         match &err {
@@ -1418,7 +1570,7 @@ mod tests {
         // connection: the mid-frame EOF must surface as Io, not hang or panic.
         let addr =
             mock_tls_server_replying_to_nla(vec![vec![0x30, 0x0A, 0x01, 0x02, 0x03]], false).await;
-        let err = connect(addr, test_config(), test_credentials(), |_| {})
+        let err = connect_danger(addr, test_config(), test_credentials(), |_| {})
             .await
             .unwrap_err();
         assert!(
@@ -1457,7 +1609,7 @@ mod tests {
         );
         let addr = mock_tls_server_replying_to_nla(vec![reply], true).await;
 
-        let err = connect(addr, test_config(), test_credentials(), |_| {})
+        let err = connect_danger(addr, test_config(), test_credentials(), |_| {})
             .await
             .unwrap_err();
         match &err {
@@ -1489,7 +1641,7 @@ mod tests {
         ];
         let addr = mock_tls_server_replying_to_nla(chunks, true).await;
 
-        let err = connect(addr, test_config(), test_credentials(), |_| {})
+        let err = connect_danger(addr, test_config(), test_credentials(), |_| {})
             .await
             .unwrap_err();
         match &err {
@@ -1631,7 +1783,7 @@ mod tests {
         let (addr, finished_rx) = mock_credssp_server("test", "test").await;
 
         let mut stages = Vec::new();
-        let err = connect(addr, test_config(), test_credentials(), |s| {
+        let err = connect_danger(addr, test_config(), test_credentials(), |s| {
             stages.push(s.to_string())
         })
         .await
@@ -1709,7 +1861,10 @@ mod tests {
         };
 
         let mut stages = Vec::new();
-        let result = connect(addr, config, credentials, |s| stages.push(s.to_string())).await;
+        // The VM presents a self-signed cert: trusting it is an explicit, test-site decision
+        // (issue #36) — the default chain policy is not weakened to make the suite pass.
+        let result =
+            connect_danger(addr, config, credentials, |s| stages.push(s.to_string())).await;
         eprintln!("stages: {stages:?}");
         let outcome = result.expect("connect should reach session-active against the real VM");
         eprintln!("mcs result: {:?}", outcome.mcs);
@@ -1836,7 +1991,7 @@ mod tests {
             password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
             domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
         };
-        let outcome = connect(addr, legacy_graphics_config(), credentials, |_| {})
+        let outcome = connect_danger(addr, legacy_graphics_config(), credentials, |_| {})
             .await
             .expect("connect should reach session-active");
         let mut stream = outcome.stream;
@@ -2000,7 +2155,7 @@ mod tests {
             password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
             domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
         };
-        let outcome = connect(addr, config, credentials, |_| {})
+        let outcome = connect_danger(addr, config, credentials, |_| {})
             .await
             .expect("connect should reach session-active");
 
@@ -2106,7 +2261,11 @@ mod tests {
         });
 
         let sock = TcpStream::connect(addr).await.unwrap();
-        let connector = TlsConnector::from(Arc::new(client_config()));
+        // This raw session-loop test trusts the throwaway cert explicitly; trust policy is
+        // exercised by the connect-level tests.
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
         let mut stream = connector
             .connect(ServerName::try_from("localhost").unwrap(), sock)
             .await
@@ -2174,7 +2333,7 @@ mod tests {
         let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
         let config = test_config(); // EGFX flag ON + drdynvc channel
         let session_capabilities = config.capabilities.clone();
-        let outcome = connect(addr, config, vm_credentials(), |_| {})
+        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
             .await
             .expect("connect should reach session-active");
         let session_config = session_config_from(&outcome, session_capabilities);
@@ -2279,7 +2438,7 @@ mod tests {
             (1024, 768)
         };
 
-        let outcome = connect(addr, config, vm_credentials(), |_| {})
+        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
             .await
             .expect("connect should reach session-active");
         let session_config = session_config_from(&outcome, session_capabilities);
@@ -2412,7 +2571,7 @@ mod tests {
         let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
         let config = legacy_graphics_config();
         let session_capabilities = config.capabilities.clone();
-        let outcome = connect(addr, config, vm_credentials(), |_| {})
+        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
             .await
             .expect("connect should reach session-active");
         let session_config = session_config_from(&outcome, session_capabilities);
@@ -2591,7 +2750,7 @@ mod tests {
         let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
         let config = legacy_graphics_config();
         let session_capabilities = config.capabilities.clone();
-        let outcome = connect(addr, config, vm_credentials(), |_| {})
+        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
             .await
             .expect("connect should reach session-active");
         let mut session_config = session_config_from(&outcome, session_capabilities);
