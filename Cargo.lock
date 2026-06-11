@@ -2037,7 +2037,7 @@ dependencies = [
 [[package]]
 name = "sspi"
 version = "0.21.0"
-source = "git+https://github.com/kihyun1998/sspi-rs?rev=a432f9a#a432f9aaaf0fc3849227f77b6da56ce59bc9b74c"
+source = "git+https://github.com/kihyun1998/sspi-rs?rev=f8959ca#f8959ca980e2308b35917b2564d8e16d73504379"
 dependencies = [
  "async-dnssd",
  "async-recursion",
