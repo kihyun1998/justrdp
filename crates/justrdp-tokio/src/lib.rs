@@ -36,8 +36,8 @@ use tokio_rustls::client::TlsStream;
 pub use tokio_util::sync::CancellationToken;
 
 mod trust;
-pub use trust::TrustPolicy;
 use trust::client_config;
+pub use trust::{MemoryPinStore, PinStore, TrustPolicy, pin_fingerprint};
 
 /// Timeout for the TCP dial.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -426,7 +426,7 @@ async fn connect_inner(
                     };
                     // The trust policy decides the verifier: Chain fails *here*, inside the
                     // handshake, when the cert is untrusted — NLA is never reached.
-                    let tls_config = client_config(&options.trust).map_err(|e| {
+                    let tls_config = client_config(&options.trust, &server.host).map_err(|e| {
                         ConnectFailure::TlsHandshake {
                             reason: format!("building the TLS trust configuration: {e}"),
                         }
@@ -1118,8 +1118,15 @@ mod tests {
     /// **not** speak CredSSP, so the client reaches the `nla-credssp` stage and then fails there —
     /// which is exactly what lets these tests assert the TLS→NLA handoff without a real NTLM peer.
     async fn mock_tls_server(nego: [u8; 8]) -> SocketAddr {
+        mock_tls_server_returning_cert(nego).await.0
+    }
+
+    /// [`mock_tls_server`], but also returns the DER of the self-signed cert the mock presents —
+    /// the TOFU tests compute the expected `subjectPublicKey` pin from it.
+    async fn mock_tls_server_returning_cert(nego: [u8; 8]) -> (SocketAddr, Vec<u8>) {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
+        let cert_der = cert.as_ref().to_vec();
         let key = ck.signing_key.serialize_der();
         let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
 
@@ -1130,11 +1137,13 @@ mod tests {
             let mut scratch = [0u8; 64];
             let _ = sock.read(&mut scratch).await.unwrap(); // drain the plaintext Connection Request
             sock.write_all(&confirm_frame(nego)).await.unwrap(); // plaintext Connection Confirm
-            let mut tls = acceptor.accept(sock).await.unwrap(); // TLS handshake
+            let Ok(mut tls) = acceptor.accept(sock).await else {
+                return; // the client (correctly) refused the cert — nothing more to serve
+            };
             let mut buf = [0u8; 1];
             let _ = tls.read(&mut buf).await; // read one byte of the first TSRequest, then drop → close
         });
-        addr
+        (addr, cert_der)
     }
 
     #[tokio::test]
@@ -1226,6 +1235,115 @@ mod tests {
             !stages.contains(&"nla-credssp".to_string()),
             "an untrusted certificate must never reach the NLA stage"
         );
+    }
+
+    #[tokio::test]
+    async fn tofu_stores_the_pin_on_first_connect_and_proceeds() {
+        // First contact: the store has no pin for this host, so TOFU trusts the presented key,
+        // persists it, and lets the connect proceed (the mock then fails at NLA as always).
+        let (addr, cert_der) =
+            mock_tls_server_returning_cert([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+        let store = Arc::new(MemoryPinStore::default());
+        let options = ConnectOptions {
+            trust: TrustPolicy::Tofu(store.clone()),
+            ..ConnectOptions::default()
+        };
+
+        let mut stages = Vec::new();
+        let _ = connect_with_options(
+            addr,
+            test_config(),
+            test_credentials(),
+            |s| stages.push(s.to_string()),
+            options,
+        )
+        .await;
+
+        assert!(
+            stages.contains(&"nla-credssp".to_string()),
+            "first-use TOFU must let the connect proceed past TLS, got {stages:?}"
+        );
+        // The stored pin is exactly the cert's inner subjectPublicKey — the same material
+        // CredSSP binds to, extracted by the same function.
+        let expected = justrdp::tls::extract_subject_public_key(&cert_der).unwrap();
+        assert_eq!(store.lookup("127.0.0.1").unwrap(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn tofu_accepts_an_unchanged_key_on_reconnect() {
+        let (addr, cert_der) =
+            mock_tls_server_returning_cert([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+        let store = Arc::new(MemoryPinStore::default());
+        let pin = justrdp::tls::extract_subject_public_key(&cert_der).unwrap();
+        store.store("127.0.0.1", &pin).unwrap();
+        let options = ConnectOptions {
+            trust: TrustPolicy::Tofu(store),
+            ..ConnectOptions::default()
+        };
+
+        let mut stages = Vec::new();
+        let _ = connect_with_options(
+            addr,
+            test_config(),
+            test_credentials(),
+            |s| stages.push(s.to_string()),
+            options,
+        )
+        .await;
+
+        assert!(
+            stages.contains(&"nla-credssp".to_string()),
+            "an unchanged pinned key must connect, got {stages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tofu_rejects_a_changed_server_key() {
+        // The store already pins a *different* key for this host — the situation TOFU exists to
+        // catch (a MITM, or a silently reinstalled server). The handshake must fail with a typed
+        // error that names the host and both key fingerprints, and never reach NLA.
+        let (addr, cert_der) =
+            mock_tls_server_returning_cert([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+        let store = Arc::new(MemoryPinStore::default());
+        let pinned: &[u8] = b"not-the-key-the-server-presents";
+        store.store("127.0.0.1", pinned).unwrap();
+        let options = ConnectOptions {
+            trust: TrustPolicy::Tofu(store.clone()),
+            ..ConnectOptions::default()
+        };
+
+        let mut stages = Vec::new();
+        let err = connect_with_options(
+            addr,
+            test_config(),
+            test_credentials(),
+            |s| stages.push(s.to_string()),
+            options,
+        )
+        .await
+        .unwrap_err();
+
+        let ConnectFailure::TlsHandshake { reason } = &err else {
+            panic!("expected a TLS trust failure, got {err:?}");
+        };
+        // The error names the host and both SHA-256 fingerprints, so a host application can
+        // show the user exactly what changed.
+        let presented = justrdp::tls::extract_subject_public_key(&cert_der).unwrap();
+        assert!(reason.contains("127.0.0.1"), "no host in: {reason}");
+        assert!(
+            reason.contains(&pin_fingerprint(pinned)),
+            "no pinned fingerprint in: {reason}"
+        );
+        assert!(
+            reason.contains(&pin_fingerprint(&presented)),
+            "no presented fingerprint in: {reason}"
+        );
+        assert!(
+            !stages.contains(&"nla-credssp".to_string()),
+            "a changed key must never reach the NLA stage"
+        );
+        // And the pin is NOT silently overwritten — the stored key stays the old one.
+        assert_eq!(store.lookup("127.0.0.1").unwrap(), Some(pinned.to_vec()));
     }
 
     #[test]
@@ -2146,7 +2264,7 @@ mod tests {
         // This raw session-loop test trusts the throwaway cert explicitly; trust policy is
         // exercised by the connect-level tests.
         let connector = TlsConnector::from(Arc::new(
-            client_config(&TrustPolicy::DangerAcceptAny).unwrap(),
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
         ));
         let mut stream = connector
             .connect(ServerName::try_from("localhost").unwrap(), sock)
