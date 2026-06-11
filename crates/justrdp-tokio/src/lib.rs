@@ -1462,6 +1462,155 @@ mod tests {
         }
     }
 
+    /// The password store backing the mock CredSSP server: one account whose password sspi's
+    /// NTLM acceptor checks the client's AUTHENTICATE message against.
+    struct SingleUser {
+        username: String,
+        password: String,
+    }
+
+    impl sspi::credssp::CredentialsProxy for SingleUser {
+        type AuthenticationData = AuthIdentity;
+
+        fn auth_data_by_user(&mut self, username: &Username) -> io::Result<AuthIdentity> {
+            // Serve the account's password for whatever name the client claimed; a wrong
+            // password still fails the NTLM MIC check, so this does not weaken the test.
+            Ok(AuthIdentity {
+                username: username.clone(),
+                password: Secret::new(self.password.clone()),
+            })
+        }
+
+        fn auth_data(&mut self) -> io::Result<Vec<AuthIdentity>> {
+            let username = Username::parse(&self.username)
+                .or_else(|_| Username::new(&self.username, None))
+                .map_err(io::Error::other)?;
+            Ok(vec![AuthIdentity {
+                username,
+                password: Secret::new(self.password.clone()),
+            }])
+        }
+    }
+
+    /// A loopback RDP server that speaks the whole pre-MCS sequence for real: X.224 confirm
+    /// (HYBRID selected), TLS with a throwaway cert, then a complete CredSSP exchange driven by
+    /// sspi's `CredSspServer` — the genuine peer of the `CredSspClient` the adapter runs.
+    /// Requires the ADR-0004 fork-bridge (Devolutions/sspi-rs#688): the released 0.21.0 server
+    /// drops its final SPNEGO token and can never finish against a Negotiate-NTLM client.
+    /// The returned receiver yields the delegated account name once the server reaches
+    /// `Finished`, after which it drops the connection (the client is in `capability-exchange`
+    /// by then).
+    async fn mock_credssp_server(
+        username: &str,
+        password: &str,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use sspi::credssp::{CredSspServer, ServerMode, ServerState};
+
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.der().clone();
+        // The exact bytes the client binds pubKeyAuth to: the cert's inner subjectPublicKey,
+        // extracted by the same public helper the connect machine uses.
+        let public_key = justrdp::tls::extract_subject_public_key(cert.as_ref()).unwrap();
+        let key = ck.key_pair.serialize_der();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+
+        let proxy = SingleUser {
+            username: username.to_string(),
+            password: password.to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 64];
+            let _ = sock.read(&mut scratch).await.unwrap(); // plaintext Connection Request
+            sock.write_all(&confirm_frame([0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]))
+                .await
+                .unwrap(); // select HYBRID: the client proceeds to TLS + NLA
+            let mut tls = acceptor.accept(sock).await.unwrap();
+
+            // Mirror the client's SPNEGO-wrapped-NTLM configuration on the acceptor side.
+            let negotiate = NegotiateConfig::new(
+                Box::new(NtlmConfig::default()),
+                Some("ntlm,!kerberos,!pku2u".to_string()),
+                "mockserver".to_string(),
+            );
+            let mut server =
+                CredSspServer::new(public_key, proxy, ServerMode::Negotiate(negotiate)).unwrap();
+
+            let mut inbox: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                // One TSRequest per client write, and the client awaits our reply before the
+                // next — so accumulate until the buffer parses as a complete TSRequest.
+                let ts_request = loop {
+                    if !inbox.is_empty() {
+                        if let Ok(ts) = TsRequest::from_buffer(&inbox) {
+                            inbox.clear();
+                            break ts;
+                        }
+                    }
+                    let n = tls.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return; // client gave up mid-exchange — the test will fail on stages
+                    }
+                    inbox.extend_from_slice(&buf[..n]);
+                };
+                let state = match server.process(ts_request).start() {
+                    GeneratorState::Completed(result) => {
+                        result.expect("mock CredSSP server step failed")
+                    }
+                    GeneratorState::Suspended(_) => panic!("NTLM never needs a KDC round trip"),
+                };
+                match state {
+                    ServerState::ReplyNeeded(reply) => {
+                        let mut out = Vec::with_capacity(reply.buffer_len() as usize);
+                        reply.encode_ts_request(&mut out).unwrap();
+                        tls.write_all(&out).await.unwrap();
+                    }
+                    ServerState::Finished(identity) => {
+                        // The delegated TSCredentials arrived: CredSSP is complete. Report the
+                        // authenticated account and drop the connection — the client is already
+                        // past NLA, so it fails (cleanly) in capability-exchange.
+                        let _ = finished_tx.send(identity.username.account_name().to_string());
+                        return;
+                    }
+                }
+            }
+        });
+        (addr, finished_rx)
+    }
+
+    #[tokio::test]
+    async fn connect_completes_credssp_against_a_loopback_server() {
+        // The full NLA loop through public `connect`, in CI (previously real-VM-only):
+        // NEGOTIATE → CHALLENGE → AUTHENTICATE+mechListMIC → accept-completed+mechListMIC →
+        // pubKeyAuth → server pubKeyAuth → TSCredentials.
+        let (addr, finished_rx) = mock_credssp_server("test", "test").await;
+
+        let mut stages = Vec::new();
+        let err = connect(addr, test_config(), test_credentials(), |s| {
+            stages.push(s.to_string())
+        })
+        .await
+        .unwrap_err();
+
+        // NLA completed: the machine moved past nla-credssp into capability-exchange...
+        assert!(
+            stages.contains(&"capability-exchange".to_string()),
+            "expected the connect to clear NLA into capability-exchange, got {stages:?}"
+        );
+        // ...the failure is only the mock dropping the socket there...
+        assert!(
+            matches!(err, ConnectFailure::Io(_)),
+            "expected the post-NLA drop as Io, got {err:?}"
+        );
+        // ...and the server side really finished CredSSP with the delegated credentials.
+        let delegated = finished_rx.await.expect("the mock server reached Finished");
+        assert_eq!(delegated, "test");
+    }
+
     #[tokio::test]
     async fn connect_times_out_with_the_stage_name_when_the_server_stalls() {
         // A server that accepts the dial, swallows the Connection Request, and never replies:
