@@ -24,6 +24,13 @@ tracing = { version = "0.1", default-features = false }
 # `ring` provider avoids the aws-lc-rs NASM build requirement on Windows.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Server-certificate trust (issue #36, plan.md §22): chain/SAN validation against the **OS trust
+# store** — real RDP servers are overwhelmingly signed by enterprise CAs that live there, not in
+# Mozilla's webpki roots. Leaf, security-critical, non-RDP (ADR-0002); adapter-only like rustls.
+rustls-platform-verifier = { version = "0.7", default-features = false }
+# SHA-256 fingerprints for TOFU pin-mismatch errors (issue #36). Already in the dependency tree
+# as rustls' crypto provider; this only makes the digest API directly visible to the adapter.
+ring = "0.17"
 # X.509 SubjectPublicKeyInfo extraction for CredSSP public-key binding — a leaf ASN.1/encoding lib,
 # not RDP protocol (ADR-0002). Lives in `justrdp` only; `justrdp-pdu` stays zero-dependency.
 x509-cert = "0.2"

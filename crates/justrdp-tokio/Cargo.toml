@@ -20,6 +20,10 @@ tracing = { workspace = true, features = ["std", "attributes"] }
 # records — plan.md §3). `rustls` re-exported via `tokio-rustls`.
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+# Server-certificate trust (issue #36): the Chain policy verifies against the OS trust store;
+# TOFU mismatch errors carry SHA-256 pin fingerprints (ring is already rustls' provider here).
+rustls-platform-verifier = { workspace = true }
+ring = { workspace = true }
 # NLA authentication (slice-3, plan.md decision 10): the adapter drives `sspi::credssp::CredSspClient`
 # over the TLS stream; the sans-IO core never sees a TSRequest.
 sspi = { workspace = true }
