@@ -8,6 +8,7 @@
 //! ADR-0003 (phased codecs), and `docs/plan.md`.
 
 pub mod connect;
+pub mod cursor;
 mod dvc;
 mod egfx;
 pub mod framebuffer;
@@ -20,6 +21,7 @@ pub use connect::{
     Action, ActivationResult, ClientInfoConfig, ConnectConfig, ConnectError, ConnectStateMachine,
     Event, EventKind, LicenseConfig, LicenseEntropy, McsConnectResult, StaticChannel,
 };
+pub use cursor::{CursorEvent, CursorImage};
 pub use framebuffer::{FrameUpdate, Framebuffer};
 pub use input::Scancode;
 pub use justrdp_pdu::input::InputEvent;
