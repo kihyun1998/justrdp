@@ -1,6 +1,6 @@
 # 0002 — Dependency boundary: own RDP protocol, depend on crypto
 
-- Status: Accepted
+- Status: Accepted — the `sspi` half refined by [ADR-0004](0004-sspi-contribute-and-bridge.md) (2026-06-11)
 - Date: 2026-06-08
 
 ## Context
