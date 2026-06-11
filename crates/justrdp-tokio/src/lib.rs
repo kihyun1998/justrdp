@@ -2635,6 +2635,96 @@ mod tests {
         eprintln!("visual dump for confirmation: {}", path.display());
     }
 
+    /// Corpus-capture harness for #56 (the self-owned ClearCodec rewrite). Drives a real-VM
+    /// EGFX session with `JUSTRDP_CLEAR_CAPTURE_DIR` pointed at a dump directory; the ClearCodec
+    /// chokepoint in `justrdp-codecs` writes every `CODECID_CLEARCODEC` payload there (one
+    /// `clear-NNNN.bin` each) plus a `manifest.tsv` recording each stream's dimensions and
+    /// decode status (`ok` / `err:<msg>`).
+    ///
+    /// The payloads whose status carries the `rlex: suite exceeds region pixel count` or
+    /// `shortVBarCacheMiss` signatures are exactly the oracle-rejected corpus #56 needs: the
+    /// bootstrap oracle cannot arbitrate them, so they must be harvested from a real server, not
+    /// synthesised. This test only *proves capture works* and summarises what the VM emitted —
+    /// it does not assert a particular signature appears, because which regions a server
+    /// Clear-codes is non-deterministic. Curate the committed fixtures from the dump afterwards
+    /// (the manifest's `err:` rows point at the streams worth keeping).
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn capture_clearcodec_corpus_against_real_vm() {
+        let _vm = VM_SESSION.lock().await;
+
+        let dump = std::env::temp_dir().join("justrdp-clearcodec-corpus");
+        let _ = std::fs::remove_dir_all(&dump);
+        std::fs::create_dir_all(&dump).expect("create the capture dir");
+        // SAFETY: set before the session task spins up and removed after it ends; the VM_SESSION
+        // lock serialises real-VM tests and nothing else touches this var, so no concurrent
+        // reader/writer races the process environment.
+        unsafe {
+            std::env::set_var("JUSTRDP_CLEAR_CAPTURE_DIR", &dump);
+        }
+
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let config = test_config(); // EGFX flag ON + drdynvc channel
+        let session_capabilities = config.capabilities.clone();
+        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
+            .await
+            .expect("connect should reach session-active");
+        let session_config = session_config_from(&outcome, session_capabilities);
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+        let mut stream = outcome.stream;
+
+        // Run long enough to surface Clear-coded regions. The desktop's taskbar/tray was
+        // Clear-coded in slice-9; interacting with the desktop (opening windows) widens the
+        // Clear area, so a longer window captures a richer corpus.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_session(&mut stream, &mut machine, |_| {}, |_| {}),
+        )
+        .await;
+
+        // SAFETY: see the matching `set_var` above — same serialised, single-writer context.
+        unsafe {
+            std::env::remove_var("JUSTRDP_CLEAR_CAPTURE_DIR");
+        }
+
+        let manifest = std::fs::read_to_string(dump.join("manifest.tsv")).unwrap_or_default();
+        let rows: Vec<&str> = manifest.lines().collect();
+        let mut ok = 0usize;
+        let mut signatures: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for row in &rows {
+            let status = row.splitn(5, '\t').nth(4).unwrap_or("");
+            if status == "ok" {
+                ok += 1;
+            } else if let Some(msg) = status.strip_prefix("err:") {
+                // The oracle messages read `ClearCodec decode: [path @ file:line] invalid
+                // `field`: detail`; bucket by the part after the location bracket so the
+                // signature — not the crate path — is the key.
+                let sig = msg
+                    .rsplit_once("] ")
+                    .map(|(_, s)| s)
+                    .unwrap_or(msg)
+                    .trim()
+                    .to_string();
+                *signatures.entry(sig).or_default() += 1;
+            }
+        }
+        eprintln!(
+            "ClearCodec corpus: {} payloads captured ({ok} decoded ok, {} rejected) -> {}",
+            rows.len(),
+            rows.len() - ok,
+            dump.display()
+        );
+        for (sig, n) in &signatures {
+            eprintln!("  rejected x{n}: {sig}");
+        }
+        assert!(
+            !rows.is_empty(),
+            "no ClearCodec payloads captured — the VM may not have Clear-coded any region this \
+             run; interact with the desktop (open windows) to widen the Clear area and retry"
+        );
+    }
+
     /// Real-VM acceptance test for slice-8: drdynvc + Display Control resize. Connect with
     /// the `drdynvc` static channel (EGFX gate flag deliberately **off**, so graphics stay on
     /// the proven bitmap path), wait for the server to negotiate drdynvc caps, create the

@@ -137,15 +137,63 @@ impl Clear {
 
     /// Decode one ClearCodec bitmap stream into `width × height × 4` **BGRA** bytes
     /// (alpha forced to 0xFF — the wire format carries no alpha).
+    ///
+    /// When `JUSTRDP_CLEAR_CAPTURE_DIR` is set, the raw payload and its decode status are
+    /// dumped there first (see [`capture_clear_payload`]) — the corpus harness for the #56
+    /// self-owned rewrite, which needs the very streams this bootstrap oracle rejects.
     pub fn decode_to_bgra(
         &mut self,
         data: &[u8],
         width: u16,
         height: u16,
     ) -> Result<Vec<u8>, EgfxCodecError> {
-        self.inner
+        let result = self
+            .inner
             .decode(data, width, height)
-            .map_err(|e| EgfxCodecError::Clear(e.to_string()))
+            .map_err(|e| EgfxCodecError::Clear(e.to_string()));
+        // An *empty* value counts as unset — otherwise `Path::new("")` resolves to the
+        // process CWD and litters it with `clear-*.bin`.
+        if let Ok(dir) = std::env::var("JUSTRDP_CLEAR_CAPTURE_DIR")
+            && !dir.is_empty()
+        {
+            let status = match &result {
+                Ok(_) => String::from("ok"),
+                Err(e) => format!("err:{e}"),
+            };
+            capture_clear_payload(&dir, data, width, height, &status);
+        }
+        result
+    }
+}
+
+/// Test-only corpus capture, gated by the `JUSTRDP_CLEAR_CAPTURE_DIR` env var: append one
+/// ClearCodec payload (`clear-NNNN.bin`) plus a manifest row (`idx⇥w⇥h⇥len⇥status`) to that
+/// directory. It exists so a live real-VM session can harvest the fixture corpus for the #56
+/// self-owned ClearCodec rewrite — crucially the streams the bootstrap oracle *rejects*, which
+/// a differential test cannot arbitrate (the oracle is the thing that is wrong). Best-effort:
+/// any IO error is swallowed so capture never perturbs the live decode path.
+fn capture_clear_payload(dir: &str, data: &[u8], width: u16, height: u16, status: &str) {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let idx = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let dir = std::path::Path::new(dir);
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(format!("clear-{idx:04}.bin")), data);
+    if let Ok(mut manifest) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("manifest.tsv"))
+    {
+        let _ = writeln!(
+            manifest,
+            "{idx:04}\t{width}\t{height}\t{}\t{status}",
+            data.len()
+        );
     }
 }
 
