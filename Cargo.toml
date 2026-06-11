@@ -38,7 +38,7 @@ sspi = "0.21"
 tokio-util = { version = "0.7", default-features = false }
 # Self-signed certificates for CI tests (dev-dependency only): the mock TLS server's cert and the
 # SPKI-extraction property test both generate a throwaway cert at test time.
-rcgen = "0.13"
+rcgen = "0.14"
 
 # ADR-0004 fork-bridge (issue #61): sspi 0.21.0's CredSspServer cannot complete a Negotiate-NTLM
 # handshake with its own CredSspClient (Devolutions/sspi-rs#687) — which blocks our loopback
