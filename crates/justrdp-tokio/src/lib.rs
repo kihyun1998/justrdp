@@ -1109,7 +1109,7 @@ mod tests {
     async fn mock_tls_server(nego: [u8; 8]) -> SocketAddr {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
-        let key = ck.key_pair.serialize_der();
+        let key = ck.signing_key.serialize_der();
         let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1194,7 +1194,7 @@ mod tests {
     ) -> (SocketAddr, tokio::sync::oneshot::Receiver<Option<String>>) {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
-        let key = ck.key_pair.serialize_der();
+        let key = ck.signing_key.serialize_der();
         let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
         let (sni_tx, sni_rx) = tokio::sync::oneshot::channel();
 
@@ -1319,7 +1319,7 @@ mod tests {
     async fn mock_tls_server_replying_to_nla(reply: Vec<Vec<u8>>, hold_open: bool) -> SocketAddr {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
-        let key = ck.key_pair.serialize_der();
+        let key = ck.signing_key.serialize_der();
         let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1511,7 +1511,7 @@ mod tests {
         // The exact bytes the client binds pubKeyAuth to: the cert's inner subjectPublicKey,
         // extracted by the same public helper the connect machine uses.
         let public_key = justrdp::tls::extract_subject_public_key(cert.as_ref()).unwrap();
-        let key = ck.key_pair.serialize_der();
+        let key = ck.signing_key.serialize_der();
         let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
 
@@ -2044,7 +2044,7 @@ mod tests {
     async fn cancellation_ends_the_session_loop_promptly() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
-        let key = ck.key_pair.serialize_der();
+        let key = ck.signing_key.serialize_der();
         let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
