@@ -2781,6 +2781,126 @@ mod tests {
         vec![sc.press(), sc.release()]
     }
 
+    /// Real-VM acceptance (issue #42): logging off inside the session ends it with the
+    /// server's **typed** attribution (ERRINFO_LOGOFF_BY_USER → the UserLogoff bucket), not
+    /// an unexplained EOF. The logoff is driven the same way slice-7 launches Notepad —
+    /// click Start, type the command into the search, Enter — because this VM ignores the
+    /// Windows logo key (server-side policy, probed in slice-7), so Win+R is unavailable.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn logoff_inside_the_session_yields_the_typed_reason() {
+        let _vm = VM_SESSION.lock().await;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let config = test_config();
+        let session_capabilities = config.capabilities.clone();
+        let requested_size = (config.core.desktop_width, config.core.desktop_height);
+        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
+            .await
+            .expect("connect should reach session-active");
+        let mut machine = SessionStateMachine::new(
+            session_config_from(&outcome, session_capabilities),
+            outcome.activation.leftover,
+        );
+        let mut stream = outcome.stream;
+
+        let frames_in_sink = Arc::new(AtomicUsize::new(0));
+        let frames_in_driver = frames_in_sink.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(8);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(vec![InputEvent::Sync {
+                    toggle_flags: keyboard_toggle_flags(),
+                }])
+                .await;
+            // Wait until the desktop has painted AND settled.
+            let mut last = frames_in_driver.load(Ordering::SeqCst);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let now = frames_in_driver.load(Ordering::SeqCst);
+                if now == last && now > 0 {
+                    break;
+                }
+                last = now;
+            }
+            // Click the Start button (the slice-7-proven launch path), then type the
+            // command into the Start search and run it.
+            let (x, y) = (24u16, requested_size.1.saturating_sub(20));
+            let _ = tx
+                .send(vec![
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    },
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_DOWN
+                            | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    },
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    },
+                ])
+                .await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            for vk in [0x4Cu16, 0x4F, 0x47, 0x4F, 0x46, 0x46] {
+                let _ = tx.send(tap(vk)).await; // L O G O F F
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = tx.send(tap(0x0D)).await; // Enter
+            // Keep tx alive until the session ends so the input branch stays open.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_session_with_input(
+                &mut stream,
+                &mut machine,
+                |_| {
+                    frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                },
+                |_| {},
+                &mut rx,
+            ),
+        )
+        .await;
+        let reason = match ended {
+            Ok(result) => result.expect("the logoff close must classify, not fail"),
+            Err(_elapsed) => {
+                // Dump what the desktop looked like so the failure is diagnosable.
+                let fb = machine.framebuffer();
+                let path = std::env::temp_dir().join("justrdp-issue42-timeout.ppm");
+                let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+                for px in fb.pixels().chunks_exact(4) {
+                    ppm.extend_from_slice(&px[..3]);
+                }
+                std::fs::write(&path, ppm).expect("write the visual dump");
+                panic!(
+                    "the server did not close the session after the logoff; desktop dumped to {}",
+                    path.display()
+                );
+            }
+        };
+
+        eprintln!("logoff terminal value: {reason:?} → {:?}", reason.class());
+        assert!(
+            matches!(reason, justrdp::DisconnectReason::ServerDisconnected(_)),
+            "expected a server-attributed disconnect, got {reason:?}"
+        );
+        assert_eq!(reason.class(), justrdp::DisconnectClass::UserLogoff);
+    }
+
     /// Real-VM acceptance test for slice-7: keyboard + mouse input over fast-path. Clicks
     /// the Start button (mouse), types "notepad" into the Start search and Enter to launch
     /// it, then types "aaa" (every keystroke through the VK→set-1 table) and scrolls the
