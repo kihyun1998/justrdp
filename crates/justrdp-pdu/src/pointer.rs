@@ -304,8 +304,7 @@ mod tests {
     fn fastpath_ptr_null_and_default_map_to_system() {
         let mut cur = ReadCursor::new(&[], "test");
         assert_eq!(
-            PointerUpdate::decode_fastpath(crate::fastpath::FP_UPDATE_PTR_NULL, &mut cur)
-                .unwrap(),
+            PointerUpdate::decode_fastpath(crate::fastpath::FP_UPDATE_PTR_NULL, &mut cur).unwrap(),
             PointerUpdate::System {
                 pointer_type: SYSPTR_NULL
             }
