@@ -1,0 +1,9 @@
+# Watches crates.io weekly and opens bump PRs per dependency. Primary purpose: a new `sspi`
+# release is the tripwire for issue #61 — evaluate dropping the ADR-0004 [patch.crates-io]
+# fork-bridge (the bump PR must pass the real-VM suite per the ADR-0004 version-bump rule).
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
