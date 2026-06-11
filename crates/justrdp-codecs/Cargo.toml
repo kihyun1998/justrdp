@@ -8,9 +8,10 @@ repository.workspace = true
 
 [features]
 default = ["egfx-bootstrap"]
-# Phase 1 (ADR-0003): the EGFX decode path (zgfx, RemoteFX Progressive, ClearCodec — slice-9)
-# rides ironrdp-graphics behind this crate's own wrapper API. The feature is dropped per codec
-# as the self-owned rewrites land and pass the differential oracle.
+# Phase 1 (ADR-0003): the still-bootstrapped EGFX decoders (zgfx, RemoteFX Progressive) ride
+# ironrdp-graphics behind this crate's own wrapper API. The feature is dropped per codec as the
+# self-owned rewrites land and pass the differential oracle — ClearCodec already left (it is
+# self-owned in the ungated `clearcodec` module; the oracle remains only a dev-dependency).
 egfx-bootstrap = ["dep:ironrdp-graphics"]
 
 [dependencies]

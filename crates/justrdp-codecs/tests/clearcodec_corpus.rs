@@ -59,9 +59,17 @@ fn corpus_is_present_and_non_trivial() {
 
 /// The headline #56 result: the self-owned decoder replays the full captured session without a
 /// single rejection — reproducing, VM-free, what the live capture observed.
+///
+/// This is also the **no-holes** proof. A Clear-region hole arises only when a stream fails to
+/// decode and the core's warn-and-skip policy leaves the region un-painted; zero rejections
+/// across the whole capture means zero skips, hence no holes. (Per-pixel blackness cannot stand
+/// in for "hole" — a single-entry black palette is legitimate all-black content, e.g. entry 0.)
+/// The aggregate non-black tally guards the converse: that the decoder genuinely paints content
+/// rather than silently returning zeroed buffers.
 #[test]
 fn self_owned_replays_full_capture_without_error() {
     let mut decoder = ClearDecoder::new();
+    let mut nonblack_total = 0usize;
     for (i, e) in load_replay().iter().enumerate() {
         let out = decoder
             .decode(&e.data, e.width, e.height)
@@ -76,7 +84,16 @@ fn self_owned_replays_full_capture_without_error() {
             usize::from(e.width) * usize::from(e.height) * 4,
             "entry {i} decoded to the wrong BGRA size"
         );
+        nonblack_total += out
+            .chunks_exact(4)
+            .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+            .count();
     }
+    assert!(
+        nonblack_total > 1000,
+        "the whole capture decoded to (near-)black ({nonblack_total} non-black px) — the decoder \
+         is not painting real content"
+    );
 }
 
 /// Differential acceptance: feed the ordered sequence to both the self-owned decoder and the

@@ -2,13 +2,12 @@
 //! Progressive, backed by `ironrdp-graphics` behind this crate's own types so the core never
 //! names oracle types. Each will be replaced by a self-owned decoder verified against the same
 //! crate as a differential oracle, then the `egfx-bootstrap` feature gate drops the runtime
-//! dependency (ADR-0003 phases 2–3). ClearCodec already crossed that line: [`Clear`] now wraps
-//! the self-owned [`crate::clearcodec::ClearDecoder`].
+//! dependency (ADR-0003 phases 2–3). ClearCodec already crossed that line and moved out of this
+//! feature-gated module entirely — it now lives, self-owned and ungated, in
+//! [`crate::clearcodec`].
 
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::zgfx;
-
-use crate::clearcodec::ClearDecoder;
 
 /// Why an EGFX codec stage failed. Carries the bootstrap decoder's message — the typed
 /// distinctions that matter (which stage) are ours; the details are diagnostic.
@@ -18,8 +17,6 @@ pub enum EgfxCodecError {
     Zgfx(String),
     /// The RemoteFX Progressive block stream failed to decode.
     Progressive(String),
-    /// The ClearCodec bitmap stream failed to decode.
-    Clear(String),
 }
 
 impl core::fmt::Display for EgfxCodecError {
@@ -27,7 +24,6 @@ impl core::fmt::Display for EgfxCodecError {
         match self {
             EgfxCodecError::Zgfx(e) => write!(f, "zgfx decompression: {e}"),
             EgfxCodecError::Progressive(e) => write!(f, "RemoteFX Progressive decode: {e}"),
-            EgfxCodecError::Clear(e) => write!(f, "ClearCodec decode: {e}"),
         }
     }
 }
@@ -124,91 +120,6 @@ impl Default for Progressive {
     }
 }
 
-/// Stateful ClearCodec decoder — the V-bar / glyph caches persist across PDUs.
-///
-/// A thin wrapper over the self-owned [`crate::clearcodec::ClearDecoder`] (ADR-0003 phase 2);
-/// it keeps the `decode_to_bgra` API and the [`EgfxCodecError`] type the core consumes, and
-/// hosts the corpus-capture hook.
-pub struct Clear {
-    inner: ClearDecoder,
-}
-
-impl Clear {
-    /// A decoder with empty caches.
-    pub fn new() -> Self {
-        Self {
-            inner: ClearDecoder::new(),
-        }
-    }
-
-    /// Decode one ClearCodec bitmap stream into `width × height × 4` **BGRA** bytes
-    /// (alpha forced to 0xFF — the wire format carries no alpha).
-    ///
-    /// When `JUSTRDP_CLEAR_CAPTURE_DIR` is set, the raw payload and its decode status are
-    /// dumped there first (see [`capture_clear_payload`]) — the corpus harness for the #56
-    /// self-owned rewrite, which needs the very streams the bootstrap oracle rejects.
-    pub fn decode_to_bgra(
-        &mut self,
-        data: &[u8],
-        width: u16,
-        height: u16,
-    ) -> Result<Vec<u8>, EgfxCodecError> {
-        let result = self
-            .inner
-            .decode(data, width, height)
-            .map_err(|e| EgfxCodecError::Clear(e.to_string()));
-        // An *empty* value counts as unset — otherwise `Path::new("")` resolves to the
-        // process CWD and litters it with `clear-*.bin`.
-        if let Ok(dir) = std::env::var("JUSTRDP_CLEAR_CAPTURE_DIR")
-            && !dir.is_empty()
-        {
-            let status = match &result {
-                Ok(_) => String::from("ok"),
-                Err(e) => format!("err:{e}"),
-            };
-            capture_clear_payload(&dir, data, width, height, &status);
-        }
-        result
-    }
-}
-
-/// Test-only corpus capture, gated by the `JUSTRDP_CLEAR_CAPTURE_DIR` env var: append one
-/// ClearCodec payload (`clear-NNNN.bin`) plus a manifest row (`idx⇥w⇥h⇥len⇥status`) to that
-/// directory. It exists so a live real-VM session can harvest the fixture corpus for the #56
-/// self-owned ClearCodec rewrite — crucially the streams the bootstrap oracle *rejects*, which
-/// a differential test cannot arbitrate (the oracle is the thing that is wrong). Best-effort:
-/// any IO error is swallowed so capture never perturbs the live decode path.
-fn capture_clear_payload(dir: &str, data: &[u8], width: u16, height: u16, status: &str) {
-    use std::io::Write as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let idx = SEQ.fetch_add(1, Ordering::Relaxed);
-
-    let dir = std::path::Path::new(dir);
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let _ = std::fs::write(dir.join(format!("clear-{idx:04}.bin")), data);
-    if let Ok(mut manifest) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("manifest.tsv"))
-    {
-        let _ = writeln!(
-            manifest,
-            "{idx:04}\t{width}\t{height}\t{}\t{status}",
-            data.len()
-        );
-    }
-}
-
-impl Default for Clear {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,17 +158,6 @@ mod tests {
             z.decompress(&[0x00, 0x01]),
             Err(EgfxCodecError::Zgfx(_))
         ));
-    }
-
-    #[test]
-    fn clear_codec_round_trips_the_oracle_encoder() {
-        let mut encoder = ironrdp_graphics::clearcodec::ClearCodecEncoder::new();
-        // 4×2 solid color in BGRA.
-        let bgra: Vec<u8> = (0..8).flat_map(|_| [10u8, 20, 30, 255]).collect();
-        let stream = encoder.encode(&bgra, 4, 2);
-        let mut clear = Clear::new();
-        let decoded = clear.decode_to_bgra(&stream, 4, 2).unwrap();
-        assert_eq!(decoded, bgra);
     }
 
     #[test]

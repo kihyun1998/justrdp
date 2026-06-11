@@ -17,7 +17,8 @@
 use crate::dvc::{DvcProcessor, ProcessorOutput};
 use crate::framebuffer::FrameUpdate;
 use justrdp_codecs::color::{self, Palette};
-use justrdp_codecs::egfx::{Clear, Progressive, Zgfx};
+use justrdp_codecs::clearcodec::Clear;
+use justrdp_codecs::egfx::{Progressive, Zgfx};
 use justrdp_codecs::planar;
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::egfx::{self, EgfxPdu, Rect16};

@@ -182,6 +182,88 @@ struct GlyphEntry {
     pixels: Vec<u8>,
 }
 
+/// Stateful ClearCodec wrapper — the V-bar / glyph caches persist across PDUs.
+///
+/// This is the API the EGFX core consumes (`new` + `decode_to_bgra`). It is intentionally
+/// **ungated** — ClearCodec no longer rides the `egfx-bootstrap` feature, since its decoder
+/// ([`ClearDecoder`]) owns every layer and pulls in no `ironrdp-graphics`. The wrapper also
+/// hosts the corpus-capture hook.
+pub struct Clear {
+    inner: ClearDecoder,
+}
+
+impl Default for Clear {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clear {
+    /// A decoder with empty caches.
+    pub fn new() -> Self {
+        Self {
+            inner: ClearDecoder::new(),
+        }
+    }
+
+    /// Decode one ClearCodec bitmap stream into `width × height × 4` **BGRA** bytes
+    /// (alpha forced to 0xFF — the wire format carries no alpha).
+    ///
+    /// When `JUSTRDP_CLEAR_CAPTURE_DIR` is set, the raw payload and its decode status are
+    /// dumped there first (see [`capture_clear_payload`]) — the corpus harness for the #56
+    /// rewrite, which needs the very streams the bootstrap oracle rejects.
+    pub fn decode_to_bgra(
+        &mut self,
+        data: &[u8],
+        width: u16,
+        height: u16,
+    ) -> Result<Vec<u8>, ClearError> {
+        let result = self.inner.decode(data, width, height);
+        // An *empty* value counts as unset — otherwise `Path::new("")` resolves to the process
+        // CWD and litters it with `clear-*.bin`.
+        if let Ok(dir) = std::env::var("JUSTRDP_CLEAR_CAPTURE_DIR")
+            && !dir.is_empty()
+        {
+            let status = match &result {
+                Ok(_) => String::from("ok"),
+                Err(e) => format!("err:{e}"),
+            };
+            capture_clear_payload(&dir, data, width, height, &status);
+        }
+        result
+    }
+}
+
+/// Test-only corpus capture, gated by the `JUSTRDP_CLEAR_CAPTURE_DIR` env var: append one
+/// ClearCodec payload (`clear-NNNN.bin`) plus a manifest row (`idx⇥w⇥h⇥len⇥status`) to that
+/// directory. It exists so a live real-VM session can harvest the fixture corpus for the #56
+/// rewrite — crucially the streams the bootstrap oracle *rejects*, which a differential test
+/// cannot arbitrate. Best-effort: any IO error is swallowed so capture never perturbs decoding.
+fn capture_clear_payload(dir: &str, data: &[u8], width: u16, height: u16, status: &str) {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let idx = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let dir = std::path::Path::new(dir);
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(format!("clear-{idx:04}.bin")), data);
+    if let Ok(mut manifest) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("manifest.tsv"))
+    {
+        let _ = writeln!(
+            manifest,
+            "{idx:04}\t{width}\t{height}\t{}\t{status}",
+            data.len()
+        );
+    }
+}
+
 /// A ClearCodec decoder holding the V-bar and glyph caches that persist across frames.
 pub struct ClearDecoder {
     vbar_storage: Vec<Option<FullVBar>>,
@@ -760,11 +842,60 @@ fn bit_length(n: u32) -> u8 {
     if n == 0 {
         0
     } else {
-        u8::try_from(32 - n.leading_zeros()).expect("bit length of u32 fits in u8")
+        // `32 - leading_zeros()` is in `1..=32` for non-zero `n`, so the truncating cast is
+        // lossless — no panic path, per the crate's "malformed input is never a panic" rule.
+        (32 - n.leading_zeros()) as u8
     }
 }
 
 fn cast_usize(v: u32) -> usize {
-    // u32 always fits in usize on every target this crate builds for (32/64-bit).
-    usize::try_from(v).expect("u32 fits in usize")
+    // Lossless widening: `usize` is at least 32 bits on every target this crate builds for.
+    v as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Differential round-trip: encode with the `ironrdp-graphics` oracle's ClearCodec encoder,
+    /// decode with the self-owned decoder, and require the pixels back. Exercises the
+    /// residual-layer path the oracle's encoder emits.
+    #[test]
+    fn round_trips_the_oracle_encoder() {
+        let mut encoder = ironrdp_graphics::clearcodec::ClearCodecEncoder::new();
+        // 4×2 solid color in BGRA.
+        let bgra: Vec<u8> = (0..8).flat_map(|_| [10u8, 20, 30, 255]).collect();
+        let stream = encoder.encode(&bgra, 4, 2);
+        let decoded = Clear::new().decode_to_bgra(&stream, 4, 2).unwrap();
+        assert_eq!(decoded, bgra);
+    }
+
+    /// The corrected SHORT_VBAR_CACHE_MISS field layout: `shortVBarYOn` is the low byte and
+    /// `shortVBarYOff` is bits `[13:8]`. A header that the *oracle* would read as
+    /// `yOff < yOn` (and reject) must decode here.
+    #[test]
+    fn short_vbar_cache_miss_uses_low_byte_for_y_on() {
+        // yOn = 5 (low byte), yOff = 8 (bits[13:8]); top two bits clear → cache miss.
+        // pixel_count = yOff - yOn = 3.
+        let header: u16 = (8 << 8) | 5;
+        // One band: x 0..=0, y 0..=51 (band_height 52), black background, then this v-bar.
+        let mut bands = Vec::new();
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_start
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_end
+        bands.extend_from_slice(&0u16.to_le_bytes()); // y_start
+        bands.extend_from_slice(&51u16.to_le_bytes()); // y_end → height 52
+        bands.extend_from_slice(&[0, 0, 0]); // bkg BGR
+        bands.extend_from_slice(&header.to_le_bytes());
+        bands.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]); // 3 px
+
+        let mut stream = vec![0x00, 0x00]; // flags, seq
+        stream.extend_from_slice(&0u32.to_le_bytes()); // residualByteCount
+        stream.extend_from_slice(&u32::try_from(bands.len()).unwrap().to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // subcodecByteCount
+        stream.extend_from_slice(&bands);
+
+        let out = ClearDecoder::new().decode(&stream, 1, 52).unwrap();
+        // Row 5 (first pixel of the short v-bar) is blue 0xFF,0x00,0x00.
+        assert_eq!(&out[5 * 4..5 * 4 + 3], &[0xFF, 0x00, 0x00]);
+    }
 }
