@@ -321,9 +321,93 @@ impl ChannelJoinConfirm {
     }
 }
 
+/// T.125 `reason`: the domain itself disconnected.
+pub const RN_DOMAIN_DISCONNECTED: u8 = 0;
+/// T.125 `reason`: the provider (server) initiated the disconnect.
+pub const RN_PROVIDER_INITIATED: u8 = 1;
+/// T.125 `reason`: a token was purged.
+pub const RN_TOKEN_PURGED: u8 = 2;
+/// T.125 `reason`: the user requested the disconnect.
+pub const RN_USER_REQUESTED: u8 = 3;
+/// T.125 `reason`: a channel was purged.
+pub const RN_CHANNEL_PURGED: u8 = 4;
+
+const CHOICE_DISCONNECT_PROVIDER_ULTIMATUM: u8 = 8;
+
+/// A decoded MCS Disconnect Provider Ultimatum (T.125): the server's last MCS word before it
+/// closes the connection. The 3-bit PER ENUMERATED `reason` straddles the byte boundary —
+/// its top two bits ride the CHOICE byte's low bits, the last bit is the next byte's MSB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisconnectProviderUltimatum {
+    /// The `reason` (`RN_*`); values above 4 are out of the T.125 enumeration but preserved
+    /// rather than rejected (the disconnect itself is the signal that matters).
+    pub reason: u8,
+}
+
+impl DisconnectProviderUltimatum {
+    /// True if `body` (the MCS payload of an X.224 Data TPDU) opens with the
+    /// disconnect-provider-ultimatum CHOICE — the session loop's cheap pre-test before
+    /// trying [`SendDataIndication`].
+    pub fn matches(body: &[u8]) -> bool {
+        body.first()
+            .is_some_and(|b| b >> 2 == CHOICE_DISCONNECT_PROVIDER_ULTIMATUM)
+    }
+
+    /// Decode from the MCS payload of an X.224 Data TPDU.
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        let mut cur = ReadCursor::new(body, "disconnect provider ultimatum");
+        let b1 = cur.read_u8()?;
+        if b1 >> 2 != CHOICE_DISCONNECT_PROVIDER_ULTIMATUM {
+            return Err(DecodeError::InvalidField {
+                field: "DisconnectProviderUltimatum",
+                reason: "unexpected DomainMCSPDU choice",
+            });
+        }
+        let b2 = cur.read_u8()?;
+        Ok(Self {
+            reason: (b1 & 0x03) << 1 | b2 >> 7,
+        })
+    }
+}
+
+/// Encode a Disconnect Provider Ultimatum (client-initiated orderly close, and the test peer).
+pub fn encode_disconnect_provider_ultimatum(reason: u8) -> Vec<u8> {
+    vec![
+        CHOICE_DISCONNECT_PROVIDER_ULTIMATUM << 2 | reason >> 1 & 0x03,
+        (reason & 0x01) << 7,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnect_provider_ultimatum_round_trips() {
+        let frame = encode_disconnect_provider_ultimatum(RN_PROVIDER_INITIATED);
+        assert!(DisconnectProviderUltimatum::matches(&frame));
+        let dpum = DisconnectProviderUltimatum::decode(&frame).unwrap();
+        assert_eq!(dpum.reason, RN_PROVIDER_INITIATED);
+    }
+
+    #[test]
+    fn dpum_decodes_the_canonical_user_requested_bytes() {
+        // The textbook DPum frame: b1 = (8 << 2) | (3 >> 1) = 0x21, b2 = (3 & 1) << 7 = 0x80
+        // — choice 8 (disconnect-provider-ultimatum), reason rn-user-requested(3). The 3-bit
+        // PER ENUMERATED straddles the byte boundary; these two bytes pin the split.
+        let dpum = DisconnectProviderUltimatum::decode(&[0x21, 0x80]).unwrap();
+        assert_eq!(dpum.reason, RN_USER_REQUESTED);
+    }
+
+    #[test]
+    fn dpum_does_not_match_other_domain_pdus() {
+        // A Send Data Indication must not be mistaken for a disconnect.
+        let sdi = [CHOICE_SEND_DATA_INDICATION << 2, 0x00, 0x06, 0x03, 0xEB];
+        assert!(!DisconnectProviderUltimatum::matches(&sdi));
+        assert!(DisconnectProviderUltimatum::decode(&sdi).is_err());
+        // And a truncated DPum (one byte) is a typed error, not a panic.
+        assert!(DisconnectProviderUltimatum::decode(&[0x21]).is_err());
+    }
 
     #[test]
     fn erect_domain_request_matches_the_canonical_bytes() {

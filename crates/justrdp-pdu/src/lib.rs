@@ -14,6 +14,7 @@ pub mod cursor;
 pub mod displaycontrol;
 pub mod dvc;
 pub mod egfx;
+pub mod errinfo;
 pub mod error;
 pub mod fastpath;
 pub mod finalization;

@@ -9,6 +9,7 @@
 
 pub mod connect;
 pub mod cursor;
+pub mod disconnect;
 mod dvc;
 mod egfx;
 pub mod framebuffer;
@@ -22,6 +23,7 @@ pub use connect::{
     Event, EventKind, LicenseConfig, LicenseEntropy, McsConnectResult, StaticChannel,
 };
 pub use cursor::{CursorEvent, CursorImage};
+pub use disconnect::{DisconnectClass, DisconnectReason, ServerDisconnectCause};
 pub use framebuffer::{FrameUpdate, Framebuffer};
 pub use input::Scancode;
 pub use justrdp_pdu::input::InputEvent;

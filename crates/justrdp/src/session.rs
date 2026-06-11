@@ -9,6 +9,7 @@
 //! malformed input does).
 
 use crate::cursor::{CursorEvent, CursorImage};
+use crate::disconnect::{DisconnectReason, ServerDisconnectCause};
 use crate::dvc::{Drdynvc, DvcEvent};
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::color::{self, Palette};
@@ -165,6 +166,10 @@ pub struct SessionStateMachine {
     /// advertised — Color/New shapes store into it, Cached re-selects from it. It survives
     /// deactivation–reactivation (the cache belongs to the connection, not the share).
     cursor_cache: Vec<Option<CursorImage>>,
+    /// The server's latest Set Error Info attribution (issue #42); `ERRINFO_NONE` clears it.
+    error_info: Option<justrdp_pdu::errinfo::ErrorInfo>,
+    /// The reason from a received MCS Disconnect Provider Ultimatum (issue #42).
+    ultimatum_reason: Option<u8>,
     /// The drdynvc transport + Display Control state (slice-8).
     drdynvc: Drdynvc,
 }
@@ -199,7 +204,25 @@ impl SessionStateMachine {
             inbox: leftover,
             fragment: None,
             cursor_cache: vec![None; usize::from(cache_size)],
+            error_info: None,
+            ultimatum_reason: None,
             drdynvc: Drdynvc::default(),
+        }
+    }
+
+    /// Why the session ended, as far as the server said (issue #42). The adapter calls this
+    /// when the transport closes: a recorded Set Error Info code is the attribution (it
+    /// outranks the generic MCS ultimatum); with neither, the close is
+    /// [`DisconnectReason::UnexpectedDisconnect`].
+    pub fn disconnect_reason(&self) -> DisconnectReason {
+        if let Some(info) = self.error_info {
+            DisconnectReason::ServerDisconnected(ServerDisconnectCause::ErrorInfo(info))
+        } else if let Some(reason) = self.ultimatum_reason {
+            DisconnectReason::ServerDisconnected(ServerDisconnectCause::ProviderUltimatum {
+                reason,
+            })
+        } else {
+            DisconnectReason::UnexpectedDisconnect
         }
     }
 
@@ -426,6 +449,15 @@ impl SessionStateMachine {
     ) -> Result<(), SessionError> {
         let tpdu = tpkt::decode(frame).map_err(SessionError::Decode)?;
         let body = x224::decode_data(tpdu).map_err(SessionError::Decode)?;
+        if mcs::DisconnectProviderUltimatum::matches(body) {
+            // The server's last MCS word before closing the socket (issue #42): record the
+            // reason for the adapter to surface at EOF.
+            let dpum =
+                mcs::DisconnectProviderUltimatum::decode(body).map_err(SessionError::Decode)?;
+            tracing::info!(target: "rdp_dpum", reason = dpum.reason, "MCS Disconnect Provider Ultimatum");
+            self.ultimatum_reason = Some(dpum.reason);
+            return Ok(());
+        }
         let indication = mcs::SendDataIndication::decode(body).map_err(SessionError::Decode)?;
         if indication.channel_id != self.config.io_channel_id {
             if Some(indication.channel_id) == self.config.drdynvc_channel_id {
@@ -498,6 +530,24 @@ impl SessionStateMachine {
             share::PDU_TYPE2_POINTER if self.phase == Phase::Active => {
                 let update = PointerUpdate::decode_slowpath(cur).map_err(SessionError::Decode)?;
                 self.on_pointer(update, outputs)
+            }
+            share::PDU_TYPE2_SET_ERROR_INFO => {
+                // The server's attribution for the close that usually follows (issue #42).
+                // ERRINFO_NONE (0) clears rather than attributes.
+                let info = justrdp_pdu::errinfo::decode_set_error_info(cur)
+                    .map_err(SessionError::Decode)?;
+                if info.as_u32() == 0 {
+                    self.error_info = None;
+                } else {
+                    tracing::info!(
+                        target: "rdp_error_info",
+                        code = format_args!("{:#010x}", info.as_u32()),
+                        description = %info.description(),
+                        "server Set Error Info"
+                    );
+                    self.error_info = Some(info);
+                }
+                Ok(())
             }
             // Save Session Info, Set Error Info, server Synchronize/Control during
             // reactivation, … : decoded-and-skipped until their epics.
@@ -1085,6 +1135,97 @@ mod tests {
             sm.process_bytes(&fastpath_pointer_pdu(
                 fastpath::FP_UPDATE_CACHED_POINTER,
                 &0u16.to_le_bytes(),
+            )),
+            Err(SessionError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn a_set_error_info_pdu_becomes_the_disconnect_attribution() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        // Before anything arrives, a close is unattributable.
+        assert_eq!(
+            sm.disconnect_reason(),
+            DisconnectReason::UnexpectedDisconnect
+        );
+
+        // ERRINFO_LOGOFF_BY_USER (0x0000000C), then the socket closes (the close itself is
+        // the adapter's observation — the machine only records the attribution).
+        let outputs = sm
+            .process_bytes(&server_data_pdu(
+                share::PDU_TYPE2_SET_ERROR_INFO,
+                &0x0000_000Cu32.to_le_bytes(),
+            ))
+            .unwrap();
+        assert!(outputs.is_empty(), "attribution is silent, got {outputs:?}");
+        assert_eq!(
+            sm.disconnect_reason(),
+            DisconnectReason::ServerDisconnected(ServerDisconnectCause::ErrorInfo(
+                justrdp_pdu::errinfo::ErrorInfo::ProtocolIndependent(
+                    justrdp_pdu::errinfo::ProtocolIndependentCode::LogoffByUser
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn errinfo_none_does_not_attribute_the_disconnect() {
+        // ERRINFO_NONE (0): servers send it to clear state — not an attribution.
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        sm.process_bytes(&server_data_pdu(
+            share::PDU_TYPE2_SET_ERROR_INFO,
+            &0u32.to_le_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(
+            sm.disconnect_reason(),
+            DisconnectReason::UnexpectedDisconnect
+        );
+    }
+
+    #[test]
+    fn a_disconnect_provider_ultimatum_attributes_the_disconnect() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let frame = tpkt::encode(&x224::encode_data(
+            &mcs::encode_disconnect_provider_ultimatum(mcs::RN_PROVIDER_INITIATED),
+        ));
+        let outputs = sm.process_bytes(&frame).unwrap();
+        assert!(outputs.is_empty());
+        assert_eq!(
+            sm.disconnect_reason(),
+            DisconnectReason::ServerDisconnected(ServerDisconnectCause::ProviderUltimatum {
+                reason: mcs::RN_PROVIDER_INITIATED
+            })
+        );
+    }
+
+    #[test]
+    fn an_error_info_outranks_the_generic_ultimatum() {
+        // The usual server farewell is Error Info (specific) followed by a DPum (generic)
+        // followed by close: the specific attribution must win regardless of order.
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        sm.process_bytes(&server_data_pdu(
+            share::PDU_TYPE2_SET_ERROR_INFO,
+            &0x0000_000Cu32.to_le_bytes(),
+        ))
+        .unwrap();
+        sm.process_bytes(&tpkt::encode(&x224::encode_data(
+            &mcs::encode_disconnect_provider_ultimatum(mcs::RN_PROVIDER_INITIATED),
+        )))
+        .unwrap();
+        assert!(matches!(
+            sm.disconnect_reason(),
+            DisconnectReason::ServerDisconnected(ServerDisconnectCause::ErrorInfo(_))
+        ));
+    }
+
+    #[test]
+    fn a_truncated_error_info_body_is_a_typed_error() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        assert!(matches!(
+            sm.process_bytes(&server_data_pdu(
+                share::PDU_TYPE2_SET_ERROR_INFO,
+                &[0x0C, 0x00]
             )),
             Err(SessionError::Decode(_))
         ));
