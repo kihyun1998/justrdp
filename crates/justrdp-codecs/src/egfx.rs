@@ -1,12 +1,14 @@
-//! Phase-1 EGFX decoders (ADR-0003 bootstrap): zgfx bulk decompression, RemoteFX
-//! Progressive, and ClearCodec, backed by `ironrdp-graphics` behind this crate's own types so
-//! the core never names oracle types. Each will be replaced by a self-owned decoder verified
-//! against the same crate as a differential oracle, then the `egfx-bootstrap` feature gate
-//! drops the runtime dependency (ADR-0003 phases 2–3).
+//! Phase-1 EGFX decoders (ADR-0003 bootstrap): zgfx bulk decompression and RemoteFX
+//! Progressive, backed by `ironrdp-graphics` behind this crate's own types so the core never
+//! names oracle types. Each will be replaced by a self-owned decoder verified against the same
+//! crate as a differential oracle, then the `egfx-bootstrap` feature gate drops the runtime
+//! dependency (ADR-0003 phases 2–3). ClearCodec already crossed that line: [`Clear`] now wraps
+//! the self-owned [`crate::clearcodec::ClearDecoder`].
 
-use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::zgfx;
+
+use crate::clearcodec::ClearDecoder;
 
 /// Why an EGFX codec stage failed. Carries the bootstrap decoder's message — the typed
 /// distinctions that matter (which stage) are ours; the details are diagnostic.
@@ -123,15 +125,19 @@ impl Default for Progressive {
 }
 
 /// Stateful ClearCodec decoder — the V-bar / glyph caches persist across PDUs.
+///
+/// A thin wrapper over the self-owned [`crate::clearcodec::ClearDecoder`] (ADR-0003 phase 2);
+/// it keeps the `decode_to_bgra` API and the [`EgfxCodecError`] type the core consumes, and
+/// hosts the corpus-capture hook.
 pub struct Clear {
-    inner: ClearCodecDecoder,
+    inner: ClearDecoder,
 }
 
 impl Clear {
     /// A decoder with empty caches.
     pub fn new() -> Self {
         Self {
-            inner: ClearCodecDecoder::new(),
+            inner: ClearDecoder::new(),
         }
     }
 
@@ -140,7 +146,7 @@ impl Clear {
     ///
     /// When `JUSTRDP_CLEAR_CAPTURE_DIR` is set, the raw payload and its decode status are
     /// dumped there first (see [`capture_clear_payload`]) — the corpus harness for the #56
-    /// self-owned rewrite, which needs the very streams this bootstrap oracle rejects.
+    /// self-owned rewrite, which needs the very streams the bootstrap oracle rejects.
     pub fn decode_to_bgra(
         &mut self,
         data: &[u8],

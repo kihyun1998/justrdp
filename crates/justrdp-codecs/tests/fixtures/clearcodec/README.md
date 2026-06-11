@@ -1,48 +1,52 @@
 # ClearCodec corpus (issue #56)
 
-Real ClearCodec (`RDPGFX_CODECID_CLEARCODEC`) bitmap streams harvested from the live test
-VM (192.168.136.136, Windows Server 2022) by the `capture_clearcodec_corpus_against_real_vm`
-`#[ignore]` test in `justrdp-tokio`. Each `*.bin` is one post-zgfx `CODECID_CLEARCODEC`
-payload exactly as it reached `Clear::decode_to_bgra` on the wire.
+`replay.bin` is one full session's worth of genuine ClearCodec (`RDPGFX_CODECID_CLEARCODEC`)
+bitmap streams harvested from the live test VM (192.168.136.136, Windows Server 2022) by the
+`capture_clearcodec_corpus_against_real_vm` `#[ignore]` test in `justrdp-tokio`, **in arrival
+order**. Each payload is one post-zgfx `CODECID_CLEARCODEC` stream exactly as it reached
+`ClearDecoder::decode` on the wire, with the destination-rectangle dimensions it was decoded
+against.
 
-This corpus exists because ClearCodec is the ADR-0003 case where the **bootstrap oracle
-(`ironrdp-graphics`) is itself wrong**: it rejects genuine streams a real server emits and
-mstsc renders. A differential test cannot arbitrate streams the oracle refuses to decode, so
-the phase-2 self-owned decoder (#56) is validated against these captures instead.
+## Why a single ordered file (not per-stream fixtures)
 
-## `manifest.tsv`
+ClearCodec is **stateful**: the V-bar cache and glyph cache persist across PDUs. A cache-hit
+stream only resolves when the earlier streams that populated those cache entries are replayed
+first. Decoding a captured payload in isolation would spuriously miss the cache (this is exactly
+why one of the oracle's rejections, `vbarIndex` "V-bar cache miss on hit", is *transitive* — it
+disappears once the preceding bands decode and store their columns). So the corpus is the whole
+session in order, replayed through one decoder, the way the live session runs.
 
-Tab-separated, one row per fixture:
+## `replay.bin` format
 
-| column   | meaning                                                              |
-| -------- | ------------------------------------------------------------------- |
-| `file`   | the `*.bin` payload                                                  |
-| `width`  | destination rectangle width  (decode argument)                      |
-| `height` | destination rectangle height (decode argument)                      |
-| `len`    | payload byte length                                                 |
-| `oracle` | how `ironrdp-graphics` 0.8 classifies it (see tags below)           |
-| `detail` | the oracle's rejection message, for the `err` tags                  |
+Little-endian, no padding:
 
-## Oracle tags
+```
+u32   count
+count × {
+  u16  width        // destination rectangle width
+  u16  height       // destination rectangle height
+  u32  len          // payload byte length
+  u8   payload[len] // raw post-zgfx CODECID_CLEARCODEC stream
+}
+```
 
-- `ok` — the bootstrap oracle decodes it. The self-owned decoder must produce **byte-identical
-  RGBA** to the oracle for these (the normal differential path still applies where the oracle
-  is right).
-- `rlex_suite_exceeds_region` — oracle raises ``invalid `rlex`: suite exceeds region pixel
-  count`` (over-strict subcodec RLEX validation).
-- `short_vbar_cache_miss` — oracle raises ``invalid `shortVBarCacheMiss`: shortVBarYOff <
-  shortVBarYOn`` (wrong V-bar band validation).
-- `vbar_cache_miss_on_hit` — oracle raises ``invalid `vbarIndex`: V-bar cache miss on hit``
-  (a third limitation surfaced during capture, not noted in the original #56 write-up).
+## What the tests assert (`tests/clearcodec_corpus.rs`)
 
-The three `err` tags are exactly the streams #56 must decode successfully. Ground truth for
-their *pixels* is the full-desktop render in the slice-9 EGFX acceptance test (no Clear-region
-holes), since the oracle cannot supply a per-stream reference for streams it rejects.
+- The self-owned `ClearDecoder` replays the **entire** capture without error — matching the live
+  session, which had 0 rejections under the fixed decoder.
+- Where the bootstrap oracle (`ironrdp-graphics`) **succeeds**, the self-owned output is
+  **byte-identical** (ADR-0003 phase-2 acceptance).
+- Where the oracle **rejects** with one of its three defective validations
+  (`shortVBarCacheMiss`, `rlex` suite, `vbarIndex`), the self-owned decoder produces pixels. The
+  differential test asserts all three signatures appear in this corpus, so the #56 fix is
+  genuinely exercised.
+
+The oracle cannot supply a per-stream pixel reference for streams it rejects, so ground truth
+for those is the full-desktop render in the slice-9 EGFX real-VM acceptance test (no Clear-region
+holes).
 
 ## Provenance
 
 Captured 2026-06-11 from a normal interactive desktop session (taskbar/tray + open windows).
-Which regions a server Clear-codes is non-deterministic; re-running the capture harness yields
-a different mix. This curated subset (4 per `err` signature where available, 4 `ok`) is a
-representative slice of one capture run — the full run produced 71 payloads (19 ok, 52
-rejected).
+Which regions a server Clear-codes is non-deterministic; re-running the capture harness yields a
+different mix. This run produced 73 payloads.
