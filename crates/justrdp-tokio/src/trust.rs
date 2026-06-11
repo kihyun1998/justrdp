@@ -79,6 +79,97 @@ impl PinStore for MemoryPinStore {
     }
 }
 
+/// A minimal file-backed [`PinStore`] for tests and PoC hosts: one `host<TAB>hex-pin` line per
+/// host. Every lookup re-reads the file (external edits are seen immediately); every store
+/// rewrites it through a temp-file rename, so a crash never leaves a half-written pin file. A
+/// corrupt file is an **error**, not first-use — failing open would let an attacker re-pin by
+/// corrupting the store. Production hosts should implement [`PinStore`] over their own profile
+/// storage instead: this store does synchronous file I/O inside the TLS handshake and does no
+/// cross-process locking.
+#[derive(Debug)]
+pub struct FilePinStore {
+    path: std::path::PathBuf,
+    /// Serializes in-process read-modify-write cycles.
+    write_lock: Mutex<()>,
+}
+
+impl FilePinStore {
+    /// A pin store backed by the file at `path` (created on first store).
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            write_lock: Mutex::new(()),
+        }
+    }
+
+    fn read_all(&self) -> io::Result<HashMap<String, Vec<u8>>> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(e) => return Err(e),
+        };
+        let mut pins = HashMap::new();
+        for (idx, line) in text.lines().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let parsed = line
+                .split_once('\t')
+                .and_then(|(host, hex)| Some((host, hex_to_bytes(hex)?)));
+            let Some((host, pin)) = parsed else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("malformed pin file {:?} at line {}", self.path, idx + 1),
+                ));
+            };
+            pins.insert(host.to_string(), pin);
+        }
+        Ok(pins)
+    }
+}
+
+impl PinStore for FilePinStore {
+    fn lookup(&self, host: &str) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.read_all()?.remove(host))
+    }
+
+    fn store(&self, host: &str, pin: &[u8]) -> io::Result<()> {
+        let _guard = self.write_lock.lock().expect("pin store poisoned");
+        let mut pins = self.read_all()?;
+        pins.insert(host.to_string(), pin.to_vec());
+
+        let mut text = String::new();
+        for (host, pin) in &pins {
+            use std::fmt::Write as _;
+            let _ = writeln!(text, "{host}\t{}", bytes_to_hex(pin));
+        }
+        // Write-then-rename: the file is replaced atomically, never observed half-written.
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &self.path)
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
+}
+
 /// The SHA-256 fingerprint of a pin, lowercase hex — the form TOFU mismatch errors use, exposed
 /// so host applications can render their own "server key changed" warnings consistently.
 pub fn pin_fingerprint(pin: &[u8]) -> String {
@@ -207,6 +298,74 @@ impl ServerCertVerifier for TofuVerifier {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique temp path per test, pre-cleaned so reruns start fresh.
+    fn temp_pin_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("justrdp-pins-{}-{tag}.tsv", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn file_pin_store_round_trips_a_pin_across_instances() {
+        let path = temp_pin_path("roundtrip");
+        let store = FilePinStore::new(&path);
+        store.store("vm.example.test", &[0x01, 0x02, 0xFF]).unwrap();
+
+        // A brand-new instance reading the same file sees the pin — that is the persistence
+        // a process restart depends on.
+        let reopened = FilePinStore::new(&path);
+        assert_eq!(
+            reopened.lookup("vm.example.test").unwrap(),
+            Some(vec![0x01, 0x02, 0xFF])
+        );
+        assert_eq!(reopened.lookup("other.host").unwrap(), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_pin_store_keeps_hosts_independent() {
+        let path = temp_pin_path("independent");
+        let store = FilePinStore::new(&path);
+        store.store("a.example.test", b"key-a").unwrap();
+        store.store("b.example.test", b"key-b").unwrap();
+        // Storing for one host must not clobber another (the store rewrites the whole file).
+        store.store("a.example.test", b"key-a2").unwrap();
+
+        assert_eq!(
+            store.lookup("a.example.test").unwrap(),
+            Some(b"key-a2".to_vec())
+        );
+        assert_eq!(
+            store.lookup("b.example.test").unwrap(),
+            Some(b"key-b".to_vec())
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_pin_store_treats_a_missing_file_as_first_use() {
+        let path = temp_pin_path("missing");
+        let store = FilePinStore::new(&path);
+        assert_eq!(store.lookup("any.host").unwrap(), None);
+    }
+
+    #[test]
+    fn file_pin_store_surfaces_a_corrupt_file_as_an_error() {
+        // A corrupt pin file must fail closed (an error the verifier turns into a handshake
+        // failure), never silently behave like first-use — that would re-pin an attacker's key.
+        let path = temp_pin_path("corrupt");
+        std::fs::write(&path, "vm.example.test\tnot-hex!!\n").unwrap();
+        let store = FilePinStore::new(&path);
+        assert!(store.lookup("vm.example.test").is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }
 

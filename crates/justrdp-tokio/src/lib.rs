@@ -37,7 +37,7 @@ pub use tokio_util::sync::CancellationToken;
 
 mod trust;
 use trust::client_config;
-pub use trust::{MemoryPinStore, PinStore, TrustPolicy, pin_fingerprint};
+pub use trust::{FilePinStore, MemoryPinStore, PinStore, TrustPolicy, pin_fingerprint};
 
 /// Timeout for the TCP dial.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
