@@ -14,4 +14,5 @@ pub mod color;
 #[cfg(feature = "egfx-bootstrap")]
 pub mod egfx;
 pub mod planar;
+pub mod pointer;
 pub mod rle;
