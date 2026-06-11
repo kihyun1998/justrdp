@@ -47,10 +47,11 @@ mod tests {
         // contents of the SubjectPublicKeyInfo, NOT the whole SPKI structure (FreeRDP / ironrdp
         // convention). Binding to the full SPKI makes a Windows server reject the channel binding and
         // abort the TLS session — proven on the real VM in slice-3.
+        use rcgen::PublicKeyData as _;
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = key.cert.der();
-        // `public_key_der()` is the *full* SubjectPublicKeyInfo; the inner key is a proper subset.
-        let full_spki = key.key_pair.public_key_der();
+        // `subject_public_key_info()` is the *full* SPKI; the inner key is a proper subset.
+        let full_spki = key.signing_key.subject_public_key_info();
 
         let inner = extract_subject_public_key(cert_der.as_ref()).unwrap();
 
