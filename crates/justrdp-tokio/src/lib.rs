@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use justrdp::{
-    Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, CursorEvent, Event,
-    FrameUpdate, InputEvent, LicenseEntropy, McsConnectResult, SessionError, SessionOutput,
-    SessionStateMachine,
+    Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, CursorEvent,
+    DisconnectReason, Event, FrameUpdate, InputEvent, LicenseEntropy, McsConnectResult,
+    SessionError, SessionOutput, SessionStateMachine,
 };
 use rustls::pki_types::ServerName;
 use sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, TsRequest};
@@ -620,16 +620,17 @@ impl core::error::Error for SessionFailure {}
 /// [`ConnectOutcome::mcs`] / [`ConnectOutcome::activation`] (including
 /// `activation.leftover`), then pass [`ConnectOutcome::stream`].
 ///
-/// Runs until the server closes the connection (`Ok(())`), an error occurs, or the future is
-/// dropped (the caller owns cancellation — timeouts, shutdown, etc.; per-stage timeout
-/// semantics are a connect-time concern). The machine is borrowed, so the caller keeps access
-/// to its framebuffer afterwards.
+/// Runs until the transport ends, returning the typed [`DisconnectReason`] (issue #42): the
+/// server's Set Error Info / MCS ultimatum attribution when one arrived before the close,
+/// [`DisconnectReason::UnexpectedDisconnect`] otherwise. Protocol violations still surface as
+/// `Err`. The future may also simply be dropped (the caller owns cancellation); the machine is
+/// borrowed, so the caller keeps access to its framebuffer afterwards.
 pub async fn run_session(
     stream: &mut TlsStream<TcpStream>,
     machine: &mut SessionStateMachine,
     on_frame: impl FnMut(&FrameUpdate),
     on_cursor: impl FnMut(&CursorEvent),
-) -> Result<(), SessionFailure> {
+) -> Result<DisconnectReason, SessionFailure> {
     // A pre-closed input channel: the input branch disables itself on the first (None) recv.
     let (_, mut input) = tokio::sync::mpsc::channel(1);
     run_session_with_input(stream, machine, on_frame, on_cursor, &mut input).await
@@ -651,7 +652,7 @@ pub async fn run_session_with_input(
     mut on_frame: impl FnMut(&FrameUpdate),
     mut on_cursor: impl FnMut(&CursorEvent),
     input: &mut tokio::sync::mpsc::Receiver<Vec<InputEvent>>,
-) -> Result<(), SessionFailure> {
+) -> Result<DisconnectReason, SessionFailure> {
     let mut readbuf = [0u8; 16 * 1024];
     let mut input_open = true;
     // Drain bytes the connect sequence already buffered (ActivationResult::leftover, handed
@@ -688,13 +689,22 @@ pub async fn run_session_with_input(
         }
         tokio::select! {
             received = stream.read(&mut readbuf) => {
-                let n = received.map_err(SessionFailure::Io)?;
-                if n == 0 {
-                    return Ok(()); // orderly server close
+                match received {
+                    // Orderly server close: surface whatever the server attributed.
+                    Ok(0) => return Ok(machine.disconnect_reason()),
+                    Ok(n) => {
+                        pending = machine
+                            .process_bytes(&readbuf[..n])
+                            .map_err(SessionFailure::Protocol)?;
+                    }
+                    // A broken read (reset, missing close_notify, dead network) ends the
+                    // session the same way — with the recorded attribution if the server
+                    // got its farewell out first, UnexpectedDisconnect otherwise.
+                    Err(e) => {
+                        tracing::debug!(error = %e, "session read failed; classifying the disconnect");
+                        return Ok(machine.disconnect_reason());
+                    }
                 }
-                pending = machine
-                    .process_bytes(&readbuf[..n])
-                    .map_err(SessionFailure::Protocol)?;
             }
             events = input.recv(), if input_open => {
                 match events {
@@ -758,7 +768,7 @@ pub async fn run_session_with_commands(
     mut on_event: impl FnMut(SessionEvent),
     commands: &mut tokio::sync::mpsc::Receiver<SessionCommand>,
     cancel: &CancellationToken,
-) -> Result<(), SessionFailure> {
+) -> Result<DisconnectReason, SessionFailure> {
     let mut readbuf = [0u8; 16 * 1024];
     let mut commands_open = true;
     let mut pending = machine
@@ -781,16 +791,21 @@ pub async fn run_session_with_commands(
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::debug!("session cancelled by the host");
-                return Ok(());
+                return Ok(DisconnectReason::LocalClosed);
             }
             received = stream.read(&mut readbuf) => {
-                let n = received.map_err(SessionFailure::Io)?;
-                if n == 0 {
-                    return Ok(()); // orderly server close
+                match received {
+                    Ok(0) => return Ok(machine.disconnect_reason()), // orderly server close
+                    Ok(n) => {
+                        pending = machine
+                            .process_bytes(&readbuf[..n])
+                            .map_err(SessionFailure::Protocol)?;
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "session read failed; classifying the disconnect");
+                        return Ok(machine.disconnect_reason());
+                    }
                 }
-                pending = machine
-                    .process_bytes(&readbuf[..n])
-                    .map_err(SessionFailure::Protocol)?;
             }
             command = commands.recv(), if commands_open => {
                 match command {
@@ -2326,8 +2341,8 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Ok(Ok(()))),
-            "cancellation should end the loop cleanly, got {result:?}"
+            matches!(result, Ok(Ok(DisconnectReason::LocalClosed))),
+            "cancellation should end the loop cleanly as LocalClosed, got {result:?}"
         );
     }
 
@@ -2407,6 +2422,123 @@ mod tests {
         assert_eq!((image.width, image.height), (1, 1));
         assert_eq!((image.hotspot_x, image.hotspot_y), (3, 1));
         assert_eq!(image.rgba, [30, 20, 10, 255]); // BGRA wire → RGBA out
+    }
+
+    /// A bare mock session server: TLS handshake, then it writes `frames` to the client and
+    /// closes cleanly (close_notify). No X.224/CredSSP — the machine under test is the
+    /// *session* loop.
+    async fn mock_session_server(frames: Vec<Vec<u8>>) -> SocketAddr {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = ck.signing_key.serialize_der();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            for frame in frames {
+                tls.write_all(&frame).await.unwrap();
+            }
+            let _ = tls.shutdown().await;
+        });
+        addr
+    }
+
+    /// Connect a raw TLS client to `addr` and run `run_session` over it with a fresh
+    /// machine, returning the session's terminal value.
+    async fn session_terminal_value(
+        addr: SocketAddr,
+    ) -> Result<justrdp::DisconnectReason, SessionFailure> {
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
+        let mut stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), sock)
+            .await
+            .unwrap();
+        let mut machine = SessionStateMachine::new(
+            justrdp::SessionConfig {
+                user_channel_id: 1007,
+                io_channel_id: 1003,
+                share_id: 0x0001_03EA,
+                desktop_size: (16, 8),
+                capabilities: Vec::new(),
+                server_input_flags: 0,
+                drdynvc_channel_id: None,
+            },
+            Vec::new(),
+        );
+        run_session(&mut stream, &mut machine, |_| {}, |_| {}).await
+    }
+
+    /// A server→client MCS Send Data Indication frame on `channel` (initiator 1002), TPKT
+    /// framed — the transport every slow-path Share PDU rides.
+    fn server_io_frame(channel: u16, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 0x80, "test helper: short PER length only");
+        let mut body = vec![0x68]; // CHOICE sendDataIndication (26 << 2)
+        body.extend_from_slice(&(1002u16 - 1001).to_be_bytes());
+        body.extend_from_slice(&channel.to_be_bytes());
+        body.push(0x70); // dataPriority + segmentation
+        body.push(payload.len() as u8);
+        body.extend_from_slice(payload);
+        justrdp_pdu::tpkt::encode(&justrdp_pdu::x224::encode_data(&body))
+    }
+
+    #[tokio::test]
+    async fn an_error_info_before_close_attributes_the_disconnect() {
+        // ERRINFO_LOGOFF_BY_USER then an orderly close: the terminal value must carry the
+        // server's attribution — not UnexpectedDisconnect (the issue-42 ordering criterion).
+        let error_info = justrdp_pdu::share::encode_share_data(
+            1002,
+            0x0001_03EA,
+            justrdp_pdu::share::STREAM_MED,
+            justrdp_pdu::share::PDU_TYPE2_SET_ERROR_INFO,
+            &0x0000_000Cu32.to_le_bytes(),
+        );
+        let addr = mock_session_server(vec![server_io_frame(1003, &error_info)]).await;
+
+        let reason = session_terminal_value(addr).await.unwrap();
+
+        assert!(
+            matches!(
+                reason,
+                justrdp::DisconnectReason::ServerDisconnected(
+                    justrdp::ServerDisconnectCause::ErrorInfo(_)
+                )
+            ),
+            "expected the Error Info attribution, got {reason:?}"
+        );
+        assert_eq!(reason.class(), justrdp::DisconnectClass::UserLogoff);
+    }
+
+    #[tokio::test]
+    async fn a_provider_ultimatum_before_close_attributes_the_disconnect() {
+        let dpum = justrdp_pdu::tpkt::encode(&justrdp_pdu::x224::encode_data(
+            &justrdp_pdu::mcs::encode_disconnect_provider_ultimatum(
+                justrdp_pdu::mcs::RN_PROVIDER_INITIATED,
+            ),
+        ));
+        let addr = mock_session_server(vec![dpum]).await;
+
+        let reason = session_terminal_value(addr).await.unwrap();
+
+        assert_eq!(
+            reason,
+            justrdp::DisconnectReason::ServerDisconnected(
+                justrdp::ServerDisconnectCause::ProviderUltimatum {
+                    reason: justrdp_pdu::mcs::RN_PROVIDER_INITIATED
+                }
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_close_is_an_unexpected_disconnect() {
+        let addr = mock_session_server(Vec::new()).await;
+        let reason = session_terminal_value(addr).await.unwrap();
+        assert_eq!(reason, justrdp::DisconnectReason::UnexpectedDisconnect);
     }
 
     /// Real-VM acceptance test for slice-9: the EGFX Graphics Pipeline. Connect with the
