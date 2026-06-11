@@ -1183,6 +1183,7 @@ name = "justrdp-codecs"
 version = "0.1.0"
 dependencies = [
  "ironrdp-graphics",
+ "ironrdp-pdu",
 ]
 
 [[package]]

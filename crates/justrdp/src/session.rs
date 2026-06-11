@@ -8,15 +8,18 @@
 //! the robustness policy (plan.md §11c: unknown-but-well-formed never kills the session,
 //! malformed input does).
 
+use crate::cursor::{CursorEvent, CursorImage};
 use crate::dvc::{Drdynvc, DvcEvent};
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::color::{self, Palette};
-use justrdp_codecs::{planar, rle};
+use justrdp_codecs::{planar, pointer as pointer_codec, rle};
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::input::InputEvent;
+use justrdp_pdu::pointer::PointerUpdate;
 use justrdp_pdu::{
-    displaycontrol, dvc, fastpath, finalization, input, mcs, share, svc, tpkt, update, x224,
+    displaycontrol, dvc, fastpath, finalization, input, mcs, pointer, share, svc, tpkt, update,
+    x224,
 };
 
 /// Everything the session machine needs from the completed connect sequence: channel
@@ -53,6 +56,8 @@ pub struct SessionConfig {
 pub enum SessionOutput {
     /// Fresh pixels for the host's frame sink.
     Frame(FrameUpdate),
+    /// A cursor change for the host's cursor sink (issue #41).
+    Cursor(CursorEvent),
     /// Bytes the adapter must write to the socket (reactivation / drdynvc traffic).
     WriteBytes(Vec<u8>),
     /// The Display Control channel is open and the server's caps arrived:
@@ -103,6 +108,8 @@ pub enum SessionError {
     Planar(planar::PlanarError),
     /// Decoded pixels could not be converted (bad depth / short buffer).
     Color(color::ColorError),
+    /// A pointer shape failed to decode (bad mask sizes / unsupported depth).
+    Pointer(pointer_codec::PointerError),
 }
 
 impl core::fmt::Display for SessionError {
@@ -112,11 +119,22 @@ impl core::fmt::Display for SessionError {
             SessionError::Rle(e) => write!(f, "interleaved RLE: {e}"),
             SessionError::Planar(e) => write!(f, "RDP6 planar: {e}"),
             SessionError::Color(e) => write!(f, "pixel conversion: {e}"),
+            SessionError::Pointer(e) => write!(f, "pointer shape: {e}"),
         }
     }
 }
 
 impl core::error::Error for SessionError {}
+
+/// The event a decoded shape surfaces as: zero-sized shapes are the wire form of "no shape"
+/// (servers send them to blank the cursor), so they arrive as [`CursorEvent::Hidden`].
+fn cursor_event_for(image: CursorImage) -> CursorEvent {
+    if image.rgba.is_empty() {
+        CursorEvent::Hidden
+    } else {
+        CursorEvent::Set(image)
+    }
+}
 
 /// Where the machine stands in the (re)activation cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +161,10 @@ pub struct SessionStateMachine {
     /// the update code in flight (fragments of one update are never interleaved with
     /// another's — MS-RDPBCGR 2.2.9.1.2.1).
     fragment: Option<(u8, Vec<u8>)>,
+    /// The pointer cache (issue #41), sized from the Pointer capability set the caller
+    /// advertised — Color/New shapes store into it, Cached re-selects from it. It survives
+    /// deactivation–reactivation (the cache belongs to the connection, not the share).
+    cursor_cache: Vec<Option<CursorImage>>,
     /// The drdynvc transport + Display Control state (slice-8).
     drdynvc: Drdynvc,
 }
@@ -153,6 +175,22 @@ impl SessionStateMachine {
     /// belong to this machine; they are processed by the first [`Self::process_bytes`] call.
     pub fn new(config: SessionConfig, leftover: Vec<u8>) -> Self {
         let framebuffer = Framebuffer::new(config.desktop_size.0, config.desktop_size.1);
+        // The cache honors what the caller advertised in its Pointer capability set:
+        // `pointerCacheSize` when present (the cache New Pointer messages address), else
+        // `colorPointerCacheSize`; no Pointer set advertised means no cache (a conforming
+        // server then sends no shape messages at all).
+        let cache_size = config
+            .capabilities
+            .iter()
+            .find_map(|set| match set {
+                CapabilitySet::Pointer(p) => Some(if p.pointer_cache_size > 0 {
+                    p.pointer_cache_size
+                } else {
+                    p.color_pointer_cache_size
+                }),
+                _ => None,
+            })
+            .unwrap_or(0);
         Self {
             config,
             framebuffer,
@@ -160,6 +198,7 @@ impl SessionStateMachine {
             phase: Phase::Active,
             inbox: leftover,
             fragment: None,
+            cursor_cache: vec![None; usize::from(cache_size)],
             drdynvc: Drdynvc::default(),
         }
     }
@@ -280,10 +319,102 @@ impl SessionStateMachine {
                         entries: palette.entries,
                     };
                 }
-                // Synchronize, pointers, surface commands (EGFX slices), orders: skipped.
+                fastpath::FP_UPDATE_PTR_NULL
+                | fastpath::FP_UPDATE_PTR_DEFAULT
+                | fastpath::FP_UPDATE_PTR_POSITION
+                | fastpath::FP_UPDATE_COLOR_POINTER
+                | fastpath::FP_UPDATE_CACHED_POINTER
+                | fastpath::FP_UPDATE_NEW_POINTER => {
+                    let update = PointerUpdate::decode_fastpath(code, &mut cur)
+                        .map_err(SessionError::Decode)?;
+                    self.on_pointer(update, outputs)?;
+                }
+                // Synchronize, large pointers (capability never advertised), surface
+                // commands (EGFX slices), orders: skipped.
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Handle one decoded pointer update — both transports route here (issue #41).
+    fn on_pointer(
+        &mut self,
+        update: PointerUpdate,
+        outputs: &mut Vec<SessionOutput>,
+    ) -> Result<(), SessionError> {
+        match update {
+            PointerUpdate::System { pointer_type } => {
+                // SYSPTR_NULL hides; anything else (SYSPTR_DEFAULT being the only other
+                // conforming value) restores the host default.
+                let event = if pointer_type == pointer::SYSPTR_NULL {
+                    CursorEvent::Hidden
+                } else {
+                    CursorEvent::Default
+                };
+                outputs.push(SessionOutput::Cursor(event));
+            }
+            PointerUpdate::Position { x, y } => {
+                outputs.push(SessionOutput::Cursor(CursorEvent::Move { x, y }));
+            }
+            // The Color message is implicitly 24-bpp; New carries its own depth.
+            PointerUpdate::Color(attr) => self.set_cursor_shape(24, attr, outputs)?,
+            PointerUpdate::New { xor_bpp, color } => {
+                self.set_cursor_shape(xor_bpp, color, outputs)?;
+            }
+            PointerUpdate::Cached { cache_index } => {
+                let image = self
+                    .cursor_cache
+                    .get(usize::from(cache_index))
+                    .and_then(Option::as_ref)
+                    .ok_or(SessionError::Decode(
+                        justrdp_pdu::DecodeError::InvalidField {
+                            field: "TS_CACHEDPOINTERATTRIBUTE.cacheIndex",
+                            reason: "cache index beyond the advertised cache or an unfilled slot",
+                        },
+                    ))?;
+                outputs.push(SessionOutput::Cursor(cursor_event_for(image.clone())));
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode a Color/New shape, store it in its cache slot, and surface it.
+    fn set_cursor_shape(
+        &mut self,
+        xor_bpp: u16,
+        attr: pointer::ColorPointerAttribute,
+        outputs: &mut Vec<SessionOutput>,
+    ) -> Result<(), SessionError> {
+        // 8-bpp shapes resolve through the *session* palette — pointer messages carry none
+        // of their own.
+        let rgba = pointer_codec::decode_pointer(
+            attr.width,
+            attr.height,
+            xor_bpp,
+            &attr.xor_mask,
+            &attr.and_mask,
+            &self.palette,
+        )
+        .map_err(SessionError::Pointer)?;
+        let image = CursorImage {
+            width: attr.width,
+            height: attr.height,
+            hotspot_x: attr.hot_spot.0,
+            hotspot_y: attr.hot_spot.1,
+            rgba,
+        };
+        let slot = self
+            .cursor_cache
+            .get_mut(usize::from(attr.cache_index))
+            .ok_or(SessionError::Decode(
+                justrdp_pdu::DecodeError::InvalidField {
+                    field: "TS_COLORPOINTERATTRIBUTE.cacheIndex",
+                    reason: "cache index beyond the advertised pointer cache",
+                },
+            ))?;
+        *slot = Some(image.clone());
+        outputs.push(SessionOutput::Cursor(cursor_event_for(image)));
         Ok(())
     }
 
@@ -364,8 +495,12 @@ impl SessionStateMachine {
                 outputs.push(SessionOutput::Frame(self.framebuffer.full_frame()));
                 Ok(())
             }
-            // Pointer updates, Save Session Info, Set Error Info, server Synchronize/Control
-            // during reactivation, … : decoded-and-skipped until their epics.
+            share::PDU_TYPE2_POINTER if self.phase == Phase::Active => {
+                let update = PointerUpdate::decode_slowpath(cur).map_err(SessionError::Decode)?;
+                self.on_pointer(update, outputs)
+            }
+            // Save Session Info, Set Error Info, server Synchronize/Control during
+            // reactivation, … : decoded-and-skipped until their epics.
             _ => Ok(()),
         }
     }
@@ -811,6 +946,150 @@ mod tests {
         server_data_pdu(share::PDU_TYPE2_UPDATE, &body)
     }
 
+    /// A TS_FP_POINTERATTRIBUTE body: a 1×1 shape at `xor_bpp` 32 with one BGRA pixel,
+    /// AND mask all zeros (opaque).
+    fn new_pointer_body(cache_index: u16, bgra: [u8; 4], hot_spot: (u16, u16)) -> Vec<u8> {
+        let mut body = Vec::new();
+        for v in [
+            32u16, // xorBpp
+            cache_index,
+            hot_spot.0,
+            hot_spot.1,
+            1, // width
+            1, // height
+            2, // lengthAndMask (1 bit padded to 2 bytes)
+            4, // lengthXorMask
+        ] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&bgra);
+        body.extend_from_slice(&[0x00, 0x00]); // andMaskData
+        body
+    }
+
+    fn fastpath_pointer_pdu(code: u8, body: &[u8]) -> Vec<u8> {
+        fastpath::encode_pdu(&[(code, fastpath::FP_FRAGMENT_SINGLE, body)])
+    }
+
+    #[test]
+    fn fastpath_new_pointer_emits_set_cursor_and_caches_the_shape() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+
+        let body = new_pointer_body(3, [10, 20, 30, 200], (5, 4));
+        let outputs = sm
+            .process_bytes(&fastpath_pointer_pdu(
+                fastpath::FP_UPDATE_NEW_POINTER,
+                &body,
+            ))
+            .unwrap();
+        let [SessionOutput::Cursor(CursorEvent::Set(image))] = outputs.as_slice() else {
+            panic!("expected one SetCursor, got {outputs:?}");
+        };
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!((image.hotspot_x, image.hotspot_y), (5, 4));
+        // BGRA source → straight-alpha RGBA.
+        assert_eq!(image.rgba, [30, 20, 10, 200]);
+
+        // A Cached re-select of the same slot re-emits the stored shape.
+        let outputs = sm
+            .process_bytes(&fastpath_pointer_pdu(
+                fastpath::FP_UPDATE_CACHED_POINTER,
+                &3u16.to_le_bytes(),
+            ))
+            .unwrap();
+        let [SessionOutput::Cursor(CursorEvent::Set(cached))] = outputs.as_slice() else {
+            panic!("expected the cached SetCursor, got {outputs:?}");
+        };
+        assert_eq!(cached.rgba, [30, 20, 10, 200]);
+        assert_eq!((cached.hotspot_x, cached.hotspot_y), (5, 4));
+    }
+
+    #[test]
+    fn fastpath_hidden_and_default_pointers_emit_their_events() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+
+        let outputs = sm
+            .process_bytes(&fastpath_pointer_pdu(fastpath::FP_UPDATE_PTR_NULL, &[]))
+            .unwrap();
+        assert_eq!(outputs, vec![SessionOutput::Cursor(CursorEvent::Hidden)]);
+
+        let outputs = sm
+            .process_bytes(&fastpath_pointer_pdu(fastpath::FP_UPDATE_PTR_DEFAULT, &[]))
+            .unwrap();
+        assert_eq!(outputs, vec![SessionOutput::Cursor(CursorEvent::Default)]);
+    }
+
+    #[test]
+    fn slowpath_pointer_messages_ride_the_pointer_data_pdu() {
+        // The slow-path transport for the same updates: a TS_POINTER_PDU as a Share Data PDU
+        // body. Position is the message servers send most.
+        let mut body = justrdp_pdu::pointer::PTRMSGTYPE_POSITION
+            .to_le_bytes()
+            .to_vec();
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad2Octets
+        body.extend_from_slice(&7u16.to_le_bytes());
+        body.extend_from_slice(&6u16.to_le_bytes());
+
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let outputs = sm
+            .process_bytes(&server_data_pdu(share::PDU_TYPE2_POINTER, &body))
+            .unwrap();
+        assert_eq!(
+            outputs,
+            vec![SessionOutput::Cursor(CursorEvent::Move { x: 7, y: 6 })]
+        );
+    }
+
+    #[test]
+    fn slowpath_color_pointer_decodes_as_24bpp() {
+        // TS_PTRMSGTYPE_COLOR carries an implicit 24-bpp shape. 1×1: xor stride is 4 bytes
+        // (24 bits → 2-byte aligned), BGR + 1 pad byte.
+        let mut attr = Vec::new();
+        for v in [2u16, 0, 0, 1, 1, 2, 4] {
+            attr.extend_from_slice(&v.to_le_bytes());
+        }
+        attr.extend_from_slice(&[1, 2, 3, 0]); // xor: B=1 G=2 R=3 + stride pad
+        attr.extend_from_slice(&[0x00, 0x00]); // and
+        let mut body = justrdp_pdu::pointer::PTRMSGTYPE_COLOR
+            .to_le_bytes()
+            .to_vec();
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&attr);
+
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let outputs = sm
+            .process_bytes(&server_data_pdu(share::PDU_TYPE2_POINTER, &body))
+            .unwrap();
+        let [SessionOutput::Cursor(CursorEvent::Set(image))] = outputs.as_slice() else {
+            panic!("expected SetCursor, got {outputs:?}");
+        };
+        assert_eq!(image.rgba, [3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn cached_pointer_misuse_is_a_typed_error() {
+        // Index beyond the advertised cache size (default capset: 20 entries): protocol
+        // violation, fatal per plan.md §11c.
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        assert!(matches!(
+            sm.process_bytes(&fastpath_pointer_pdu(
+                fastpath::FP_UPDATE_CACHED_POINTER,
+                &20u16.to_le_bytes(),
+            )),
+            Err(SessionError::Decode(_))
+        ));
+
+        // A never-filled slot inside the bounds is the same desync.
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        assert!(matches!(
+            sm.process_bytes(&fastpath_pointer_pdu(
+                fastpath::FP_UPDATE_CACHED_POINTER,
+                &0u16.to_le_bytes(),
+            )),
+            Err(SessionError::Decode(_))
+        ));
+    }
+
     #[test]
     fn uncompressed_bitmap_yields_a_frame_update() {
         let mut sm = SessionStateMachine::new(config(), Vec::new());
@@ -1114,10 +1393,11 @@ mod tests {
     #[test]
     fn non_io_channels_and_unknown_pdus_are_skipped() {
         let mut sm = SessionStateMachine::new(config(), Vec::new());
-        // A pointer PDU and a save-session-info PDU produce nothing.
+        // Data PDUs without a handler produce nothing (pointer PDUs graduated to handled in
+        // issue #41 — save-session-info and set-error-info remain decode-and-skip).
         for (t2, body) in [
-            (share::PDU_TYPE2_POINTER, vec![0u8; 8]),
             (share::PDU_TYPE2_SAVE_SESSION_INFO, vec![0u8; 12]),
+            (share::PDU_TYPE2_SET_ERROR_INFO, vec![0u8; 4]),
         ] {
             assert!(
                 sm.process_bytes(&server_data_pdu(t2, &body))

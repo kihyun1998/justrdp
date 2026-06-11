@@ -20,6 +20,21 @@ pub const FP_UPDATE_PALETTE: u8 = 0x2;
 pub const FP_UPDATE_SYNCHRONIZE: u8 = 0x3;
 /// `updateCode`: surface commands (the EGFX-era path; later slices).
 pub const FP_UPDATE_SURFCMDS: u8 = 0x4;
+/// `updateCode`: hide the pointer (the fast-path form of SYSPTR_NULL).
+pub const FP_UPDATE_PTR_NULL: u8 = 0x5;
+/// `updateCode`: show the default pointer (the fast-path form of SYSPTR_DEFAULT).
+pub const FP_UPDATE_PTR_DEFAULT: u8 = 0x6;
+/// `updateCode`: server-set pointer position (`TS_FP_POINTERPOSATTRIBUTE`).
+pub const FP_UPDATE_PTR_POSITION: u8 = 0x8;
+/// `updateCode`: 24-bpp color pointer shape (`TS_FP_COLORPOINTERATTRIBUTE`).
+pub const FP_UPDATE_COLOR_POINTER: u8 = 0x9;
+/// `updateCode`: re-select a cached pointer (`TS_FP_CACHEDPOINTERATTRIBUTE`).
+pub const FP_UPDATE_CACHED_POINTER: u8 = 0xA;
+/// `updateCode`: variable-bpp pointer shape (`TS_FP_POINTERATTRIBUTE`).
+pub const FP_UPDATE_NEW_POINTER: u8 = 0xB;
+/// `updateCode`: large pointer shape (≤384×384; only sent if the client advertises the
+/// Large Pointer capability, which this client does not — decoded-and-skipped).
+pub const FP_UPDATE_LARGE_POINTER: u8 = 0xC;
 
 /// `fragmentation`: a complete update in one PDU.
 pub const FP_FRAGMENT_SINGLE: u8 = 0x0;

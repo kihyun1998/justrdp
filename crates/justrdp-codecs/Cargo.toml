@@ -24,3 +24,6 @@ ironrdp-graphics = { version = "0.8", optional = true }
 # The differential test oracle (ADR-0003): diff our decode output against ironrdp's on
 # identical bytes (and use its compressor to generate valid streams for the decoders).
 ironrdp-graphics = "0.8"
+# Constructs the pointer-attribute inputs the ironrdp-graphics pointer oracle consumes
+# (issue #41 differential tests only).
+ironrdp-pdu = "0.8"

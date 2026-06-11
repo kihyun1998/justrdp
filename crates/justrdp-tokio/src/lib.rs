@@ -19,8 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use justrdp::{
-    Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, Event, FrameUpdate,
-    InputEvent, LicenseEntropy, McsConnectResult, SessionError, SessionOutput, SessionStateMachine,
+    Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, CursorEvent, Event,
+    FrameUpdate, InputEvent, LicenseEntropy, McsConnectResult, SessionError, SessionOutput,
+    SessionStateMachine,
 };
 use rustls::pki_types::ServerName;
 use sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, TsRequest};
@@ -627,10 +628,11 @@ pub async fn run_session(
     stream: &mut TlsStream<TcpStream>,
     machine: &mut SessionStateMachine,
     on_frame: impl FnMut(&FrameUpdate),
+    on_cursor: impl FnMut(&CursorEvent),
 ) -> Result<(), SessionFailure> {
     // A pre-closed input channel: the input branch disables itself on the first (None) recv.
     let (_, mut input) = tokio::sync::mpsc::channel(1);
-    run_session_with_input(stream, machine, on_frame, &mut input).await
+    run_session_with_input(stream, machine, on_frame, on_cursor, &mut input).await
 }
 
 /// [`run_session`] plus host input: batches of [`InputEvent`]s received on `input` are encoded
@@ -647,6 +649,7 @@ pub async fn run_session_with_input(
     stream: &mut TlsStream<TcpStream>,
     machine: &mut SessionStateMachine,
     mut on_frame: impl FnMut(&FrameUpdate),
+    mut on_cursor: impl FnMut(&CursorEvent),
     input: &mut tokio::sync::mpsc::Receiver<Vec<InputEvent>>,
 ) -> Result<(), SessionFailure> {
     let mut readbuf = [0u8; 16 * 1024];
@@ -668,6 +671,10 @@ pub async fn run_session_with_input(
                         "frame update"
                     );
                     on_frame(&frame);
+                }
+                SessionOutput::Cursor(event) => {
+                    tracing::trace!(?event, "cursor event");
+                    on_cursor(&event);
                 }
                 SessionOutput::WriteBytes(bytes) => {
                     stream.write_all(&bytes).await.map_err(SessionFailure::Io)?;
@@ -742,11 +749,12 @@ pub enum SessionEvent {
 /// future remains equally safe — the machine is pure and the socket is caller-owned.
 ///
 /// `on_event` receives session milestones (currently [`SessionEvent::DisplayControlReady`]);
-/// `on_frame` keeps the synchronous frame-sink contract of [`run_session`].
+/// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
 pub async fn run_session_with_commands(
     stream: &mut TlsStream<TcpStream>,
     machine: &mut SessionStateMachine,
     mut on_frame: impl FnMut(&FrameUpdate),
+    mut on_cursor: impl FnMut(&CursorEvent),
     mut on_event: impl FnMut(SessionEvent),
     commands: &mut tokio::sync::mpsc::Receiver<SessionCommand>,
     cancel: &CancellationToken,
@@ -760,6 +768,7 @@ pub async fn run_session_with_commands(
         for output in pending.drain(..) {
             match output {
                 SessionOutput::Frame(frame) => on_frame(&frame),
+                SessionOutput::Cursor(event) => on_cursor(&event),
                 SessionOutput::WriteBytes(bytes) => {
                     stream.write_all(&bytes).await.map_err(SessionFailure::Io)?;
                 }
@@ -2171,10 +2180,15 @@ mod tests {
         let mut covered: u64 = 0;
         let ended = tokio::time::timeout(
             Duration::from_secs(8),
-            run_session(&mut stream, &mut machine, |frame| {
-                frames += 1;
-                covered += u64::from(frame.width) * u64::from(frame.height);
-            }),
+            run_session(
+                &mut stream,
+                &mut machine,
+                |frame| {
+                    frames += 1;
+                    covered += u64::from(frame.width) * u64::from(frame.height);
+                },
+                |_| {},
+            ),
         )
         .await;
         if let Ok(result) = ended {
@@ -2305,6 +2319,7 @@ mod tests {
                 &mut machine,
                 |_| {},
                 |_| {},
+                |_| {},
                 &mut commands,
                 &cancel,
             ),
@@ -2314,6 +2329,84 @@ mod tests {
             matches!(result, Ok(Ok(()))),
             "cancellation should end the loop cleanly, got {result:?}"
         );
+    }
+
+    /// Cursor events reach the host's synchronous cursor sink (issue #41), mirroring the
+    /// frame sink: a mock session server sends one fast-path New Pointer update (a 1×1
+    /// 32-bpp shape) and closes; the `on_cursor` callback must observe the decoded shape.
+    #[tokio::test]
+    async fn run_session_surfaces_cursor_events_to_the_host() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = ck.signing_key.serialize_der();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            // TS_FP_POINTERATTRIBUTE: xorBpp 32, cacheIndex 0, hotspot (3,1), 1×1,
+            // lengthAndMask 2, lengthXorMask 4, BGRA pixel, opaque AND mask.
+            let mut body = Vec::new();
+            for v in [32u16, 0, 3, 1, 1, 1, 2, 4] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body.extend_from_slice(&[10, 20, 30, 255]); // B G R A
+            body.extend_from_slice(&[0x00, 0x00]);
+            let pdu = justrdp_pdu::fastpath::encode_pdu(&[(
+                justrdp_pdu::fastpath::FP_UPDATE_NEW_POINTER,
+                justrdp_pdu::fastpath::FP_FRAGMENT_SINGLE,
+                &body,
+            )]);
+            tls.write_all(&pdu).await.unwrap();
+            // Orderly TLS close (close_notify) → run_session returns Ok after draining.
+            let _ = tls.shutdown().await;
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
+        let mut stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), sock)
+            .await
+            .unwrap();
+        let mut machine = SessionStateMachine::new(
+            justrdp::SessionConfig {
+                user_channel_id: 1007,
+                io_channel_id: 1003,
+                share_id: 0x0001_03EA,
+                desktop_size: (16, 8),
+                // The pointer cache is sized from this advertisement.
+                capabilities: vec![justrdp_pdu::capability::CapabilitySet::Pointer(
+                    justrdp_pdu::capability::PointerCapabilitySet {
+                        color_pointer_flag: 1,
+                        color_pointer_cache_size: 20,
+                        pointer_cache_size: 20,
+                    },
+                )],
+                server_input_flags: 0,
+                drdynvc_channel_id: None,
+            },
+            Vec::new(),
+        );
+
+        let mut cursors: Vec<justrdp::CursorEvent> = Vec::new();
+        run_session(
+            &mut stream,
+            &mut machine,
+            |_| {},
+            |c| cursors.push(c.clone()),
+        )
+        .await
+        .unwrap();
+
+        let [justrdp::CursorEvent::Set(image)] = cursors.as_slice() else {
+            panic!("expected one SetCursor event, got {cursors:?}");
+        };
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!((image.hotspot_x, image.hotspot_y), (3, 1));
+        assert_eq!(image.rgba, [30, 20, 10, 255]); // BGRA wire → RGBA out
     }
 
     /// Real-VM acceptance test for slice-9: the EGFX Graphics Pipeline. Connect with the
@@ -2348,10 +2441,15 @@ mod tests {
         let mut covered: u64 = 0;
         let ended = tokio::time::timeout(
             Duration::from_secs(10),
-            run_session(&mut stream, &mut machine, |frame| {
-                frames += 1;
-                covered += u64::from(frame.width) * u64::from(frame.height);
-            }),
+            run_session(
+                &mut stream,
+                &mut machine,
+                |frame| {
+                    frames += 1;
+                    covered += u64::from(frame.width) * u64::from(frame.height);
+                },
+                |_| {},
+            ),
         )
         .await;
         if let Ok(result) = ended {
@@ -2490,6 +2588,7 @@ mod tests {
                 &mut stream,
                 &mut machine,
                 on_frame,
+                |_| {},
                 on_event,
                 &mut commands,
                 &cancel,
@@ -2681,21 +2780,39 @@ mod tests {
                 &mut sent,
             )
             .await;
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            // Hover moves for the pointer slice (#41): over Notepad's edit area (an I-beam
+            // shape) and then over the desktop edge (an arrow) — each move makes the server
+            // push the pointer shape for what's under the cursor.
+            for (x, y) in [(cx, cy), (4, 4), (cx, cy)] {
+                send(
+                    vec![InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    }],
+                    &mut sent,
+                )
+                .await;
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
             let after_typing = frames_in_driver.load(Ordering::SeqCst);
             (sent, idle_frames, after_click, after_typing)
             // tx drops here: the input branch disables, the session stays up.
         });
 
         // The timeout is the expected exit — a healthy session never ends on its own.
+        let mut cursor_events: Vec<justrdp::CursorEvent> = Vec::new();
         let ended = tokio::time::timeout(
-            Duration::from_secs(40),
+            Duration::from_secs(45),
             run_session_with_input(
                 &mut stream,
                 &mut machine,
                 |_| {
                     frames_in_sink.fetch_add(1, Ordering::SeqCst);
                 },
+                |c| cursor_events.push(c.clone()),
                 &mut rx,
             ),
         )
@@ -2705,6 +2822,36 @@ mod tests {
             panic!("server closed the session during the input exchange");
         }
         let (sent, idle_frames, after_click, after_typing) = driver.await.expect("input driver");
+
+        // Pointer verification (#41): the hover moves above make the server push cursor
+        // shapes (arrow over the desktop, an I-beam over Notepad's edit area). Every decoded
+        // shape must be plausible: spec-capped dimensions, hotspot inside the shape, RGBA
+        // sized exactly width × height × 4.
+        let mut shapes = 0usize;
+        for event in &cursor_events {
+            if let justrdp::CursorEvent::Set(image) = event {
+                shapes += 1;
+                eprintln!(
+                    "cursor shape: {}x{} hotspot ({}, {})",
+                    image.width, image.height, image.hotspot_x, image.hotspot_y
+                );
+                assert!(image.width > 0 && image.width <= 96);
+                assert!(image.height > 0 && image.height <= 96);
+                assert!(image.hotspot_x < image.width && image.hotspot_y < image.height);
+                assert_eq!(
+                    image.rgba.len(),
+                    usize::from(image.width) * usize::from(image.height) * 4
+                );
+            }
+        }
+        eprintln!(
+            "cursor events: {} total, {shapes} SetCursor",
+            cursor_events.len()
+        );
+        assert!(
+            shapes >= 1,
+            "expected at least one decoded pointer shape from the VM, got {cursor_events:?}"
+        );
 
         eprintln!(
             "sent {sent} input events; frames: settled={idle_frames} → after click={after_click} \
@@ -2798,6 +2945,7 @@ mod tests {
                 |_| {
                     frames_in_sink.fetch_add(1, Ordering::SeqCst);
                 },
+                |_| {},
                 &mut rx,
             ),
         )
