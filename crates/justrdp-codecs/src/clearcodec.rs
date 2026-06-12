@@ -160,11 +160,11 @@ fn read_run_length(c: &mut Cursor<'_>, ctx: &'static str) -> Result<u32, ClearEr
 
 // --- Persistent cache state ---
 
+/// A cached short V-bar: only the covered pixels persist — the `yOn` offset is supplied by
+/// each cache-hit header, never by the cache (MS-RDPEGFX 2.2.4.1.1.2.1.1.2).
 #[derive(Clone)]
 struct ShortVBar {
-    y_on: u8,
-    pixel_count: u8,
-    /// BGR pixel data, `pixel_count * 3` bytes.
+    /// BGR pixel data, 3 bytes per covered row.
     pixels: Vec<u8>,
 }
 
@@ -471,11 +471,16 @@ impl ClearDecoder {
 
             let column_count = usize::from(x_end - x_start) + 1;
             for col in 0..column_count {
-                let vbar = self.decode_vbar(&mut c, band_height, bg_blue, bg_green, bg_red)?;
+                let slot = self.decode_vbar(&mut c, band_height, bg_blue, bg_green, bg_red)?;
                 let x = usize::from(x_start) + col;
                 if x >= w {
                     continue;
                 }
+                // The slot was just resolved/stored, so it is always populated; compositing
+                // straight from storage avoids the per-column clone (#86).
+                let Some(vbar) = self.vbar_storage.get(slot).and_then(|s| s.as_ref()) else {
+                    continue;
+                };
                 let rows = vbar.pixels.len() / 3;
                 for row in 0..rows {
                     let y = usize::from(y_start) + row;
@@ -493,7 +498,9 @@ impl ClearDecoder {
         Ok(())
     }
 
-    /// Decode one V-bar header and resolve it (through the cache) into a full column.
+    /// Decode one V-bar header and resolve it (through the cache) into a full column,
+    /// returning its `vbar_storage` slot — callers composite straight from storage, so the
+    /// hit/store paths run without per-column clones (#86).
     fn decode_vbar(
         &mut self,
         c: &mut Cursor<'_>,
@@ -501,7 +508,7 @@ impl ClearDecoder {
         bg_blue: u8,
         bg_green: u8,
         bg_red: u8,
-    ) -> Result<FullVBar, ClearError> {
+    ) -> Result<usize, ClearError> {
         c.ensure(2, "VBar")?;
         let header = c.u16_le();
 
@@ -510,7 +517,7 @@ impl ClearDecoder {
             let index = header & 0x7FFF;
             return self
                 .vbar_get(index)
-                .cloned()
+                .map(|_| usize::from(index))
                 .ok_or_else(|| invalid("vbarIndex", "V-bar cache miss on hit"));
         }
 
@@ -522,14 +529,9 @@ impl ClearDecoder {
             let cached = self
                 .short_vbar_get(index)
                 .ok_or_else(|| invalid("shortVbarIndex", "short V-bar cache miss on hit"))?;
-            let short = ShortVBar {
-                y_on,
-                pixel_count: cached.pixel_count,
-                pixels: cached.pixels.clone(),
-            };
-            let full = reconstruct_full_vbar(&short, band_height, bg_blue, bg_green, bg_red);
-            self.store_vbar(full.clone());
-            return Ok(full);
+            let full =
+                reconstruct_full_vbar(y_on, &cached.pixels, band_height, bg_blue, bg_green, bg_red);
+            return Ok(self.store_vbar(full));
         }
 
         // Both top bits clear: short V-bar cache miss with inline pixels.
@@ -557,15 +559,9 @@ impl ClearDecoder {
         c.ensure(pixel_byte_count, "ShortVBarCacheMiss")?;
         let pixels = c.slice(pixel_byte_count).to_vec();
 
-        let short = ShortVBar {
-            y_on,
-            pixel_count,
-            pixels,
-        };
-        self.store_short_vbar(short.clone());
-        let full = reconstruct_full_vbar(&short, band_height, bg_blue, bg_green, bg_red);
-        self.store_vbar(full.clone());
-        Ok(full)
+        let full = reconstruct_full_vbar(y_on, &pixels, band_height, bg_blue, bg_green, bg_red);
+        self.store_short_vbar(ShortVBar { pixels });
+        Ok(self.store_vbar(full))
     }
 
     /// Layer 3 — subcodec rectangles composited over the result.
@@ -628,10 +624,12 @@ impl ClearDecoder {
             .and_then(|s| s.as_ref())
     }
 
-    fn store_vbar(&mut self, vbar: FullVBar) {
+    /// Store a full V-bar at the cursor, returning the slot it landed in.
+    fn store_vbar(&mut self, vbar: FullVBar) -> usize {
         let idx = usize::from(self.vbar_cursor);
         self.vbar_storage[idx] = Some(vbar);
         self.vbar_cursor = (self.vbar_cursor + 1) % (VBAR_CACHE_SIZE as u16);
+        idx
     }
 
     fn store_short_vbar(&mut self, short: ShortVBar) {
@@ -653,10 +651,11 @@ impl ClearDecoder {
     }
 }
 
-/// Reconstruct a full column: background above `y_on`, the short V-bar's pixels, then background
-/// down to `band_height`.
+/// Reconstruct a full column: background above `y_on`, the short V-bar's pixels (BGR, 3 bytes
+/// per covered row), then background down to `band_height`.
 fn reconstruct_full_vbar(
-    short: &ShortVBar,
+    y_on: u8,
+    short_pixels: &[u8],
     band_height: u16,
     bg_blue: u8,
     bg_green: u8,
@@ -664,11 +663,11 @@ fn reconstruct_full_vbar(
 ) -> FullVBar {
     let height = usize::from(band_height);
     let mut pixels = Vec::with_capacity(height * 3);
-    for _ in 0..usize::from(short.y_on) {
+    for _ in 0..usize::from(y_on) {
         pixels.extend_from_slice(&[bg_blue, bg_green, bg_red]);
     }
-    pixels.extend_from_slice(&short.pixels);
-    let bottom_start = usize::from(short.y_on) + usize::from(short.pixel_count);
+    pixels.extend_from_slice(short_pixels);
+    let bottom_start = usize::from(y_on) + short_pixels.len() / 3;
     for _ in bottom_start..height {
         pixels.extend_from_slice(&[bg_blue, bg_green, bg_red]);
     }
