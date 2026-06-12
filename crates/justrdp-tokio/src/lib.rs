@@ -403,6 +403,11 @@ async fn connect_inner(
                         TcpStream::connect((server.host.as_str(), server.port)),
                     )
                     .await?;
+                    // Interactive sessions write many tiny frames (a fast-path input PDU is
+                    // ~10–20 bytes, one write_all each); Nagle would hold them behind the
+                    // server's delayed ACK for tens of ms. Disable it once here — the TLS
+                    // upgrade rides the same socket (#82).
+                    s.set_nodelay(true)?;
                     tracing::debug!("tcp socket connected");
                     transport = Transport::Tcp(s);
                     queue.extend(sm.process(Event::Connected));
