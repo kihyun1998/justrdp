@@ -945,6 +945,15 @@ mod tests {
     /// Walk a fresh machine to the resize-ready state: drdynvc caps exchanged, Display
     /// Control channel 7 created, server caps (1 monitor, `area_a × area_b`) consumed.
     fn display_control_ready(sm: &mut SessionStateMachine, area_a: u32, area_b: u32) {
+        display_control_ready_caps(sm, 1, area_a, area_b);
+    }
+
+    fn display_control_ready_caps(
+        sm: &mut SessionStateMachine,
+        max_num_monitors: u32,
+        area_a: u32,
+        area_b: u32,
+    ) {
         let caps_request = vec![0x50, 0x00, 0x01, 0x00];
         for frame in server_dvc_frames(&caps_request) {
             sm.process_bytes(&frame).unwrap();
@@ -958,7 +967,7 @@ mod tests {
         let mut caps = Vec::new();
         caps.extend_from_slice(&displaycontrol::TYPE_CAPS.to_le_bytes());
         caps.extend_from_slice(&20u32.to_le_bytes());
-        for v in [1u32, area_a, area_b] {
+        for v in [max_num_monitors, area_a, area_b] {
             caps.extend_from_slice(&v.to_le_bytes());
         }
         let mut ready = false;
@@ -1705,6 +1714,24 @@ mod tests {
             sm.request_resize(8192, 8192), // 64 MPx > 1920×1080 caps area
             Err(ResizeError::InvalidDimensions { .. })
         ));
+    }
+
+    #[test]
+    fn hostile_caps_area_does_not_overflow_request_resize() {
+        // A malicious server can advertise u32::MAX Display Control area factors;
+        // their product (u32³ > u64) must not overflow caps.max_area() into a
+        // debug-build panic when the client validates a resize. The product
+        // saturates, so an in-range resize still proceeds. Parallel of slice-9's
+        // hostile_map_origin_does_not_overflow_or_emit.
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        // All three caps factors maxed → the product is u32³ ≈ 2^96, which
+        // overflows u64 (monitors must also be large; the 2-arg helper pins it to
+        // 1, where MAX² still fits u64 and would not exercise the guard).
+        display_control_ready_caps(&mut sm, u32::MAX, u32::MAX, u32::MAX);
+        assert!(
+            sm.request_resize(1280, 1024).is_ok(),
+            "a saturated caps limit must not block a legitimately-bounded resize"
+        );
     }
 
     #[test]
