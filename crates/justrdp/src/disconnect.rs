@@ -43,7 +43,7 @@ pub enum DisconnectClass {
     PermissionDeny,
     /// The remote graphics stack failed — degradation / retry may help.
     GraphicsFail,
-    /// The user ended their own session — expected, nothing to repair.
+    /// The user ended or disconnected their own session — expected, nothing to repair.
     UserLogoff,
     /// No finer classification available.
     Unknown,
@@ -72,7 +72,13 @@ pub fn classify(info: ErrorInfo) -> DisconnectClass {
     use ProtocolIndependentCode as Pi;
     match info {
         ErrorInfo::ProtocolIndependent(code) => match code {
-            Pi::LogoffByUser | Pi::RpcInitiatedLogoff => DisconnectClass::UserLogoff,
+            // A logoff, or a disconnect the *user themselves* initiated (e.g. `tsdiscon` in
+            // their own session): their own choice, so the reaction is the same as a logoff —
+            // expected, nothing to repair. An *administrative* disconnect (RpcInitiatedDisconnect)
+            // is a different case and stays Unknown below.
+            Pi::LogoffByUser | Pi::RpcInitiatedLogoff | Pi::RpcInitiatedDisconnectByUser => {
+                DisconnectClass::UserLogoff
+            }
             Pi::IdleTimeout | Pi::LogonTimeout => DisconnectClass::Timeout,
             Pi::ServerFreshCredentialsRequired => DisconnectClass::AuthFail,
             Pi::ServerDeniedConnection | Pi::ServerInsufficientPrivileges => {
@@ -104,14 +110,16 @@ mod tests {
         // One representative per bucket, per the issue's acceptance list.
         for (code, class) in [
             (0x0000_000Cu32, DisconnectClass::UserLogoff), // LogoffByUser
-            (0x0000_0003, DisconnectClass::Timeout),       // IdleTimeout
-            (0x0000_0004, DisconnectClass::Timeout),       // LogonTimeout
-            (0x0000_000A, DisconnectClass::AuthFail),      // FreshCredentialsRequired
+            (0x0000_000B, DisconnectClass::UserLogoff), // RpcInitiatedDisconnectByUser (tsdiscon)
+            (0x0000_0001, DisconnectClass::Unknown), // RpcInitiatedDisconnect (admin) — deliberate
+            (0x0000_0003, DisconnectClass::Timeout), // IdleTimeout
+            (0x0000_0004, DisconnectClass::Timeout), // LogonTimeout
+            (0x0000_000A, DisconnectClass::AuthFail), // FreshCredentialsRequired
             (0x0000_0007, DisconnectClass::PermissionDeny), // ServerDeniedConnection
-            (0x0000_0010, DisconnectClass::GraphicsFail),  // ServerDwmCrash
-            (0x0000_0102, DisconnectClass::LicenseFail),   // NoLicense
-            (0x0000_10E7, DisconnectClass::Unknown),       // CapabilitySetTooSmall (RDP band)
-            (0xDEAD_BEEF, DisconnectClass::Unknown),       // uncatalogued
+            (0x0000_0010, DisconnectClass::GraphicsFail), // ServerDwmCrash
+            (0x0000_0102, DisconnectClass::LicenseFail), // NoLicense
+            (0x0000_10E7, DisconnectClass::Unknown), // CapabilitySetTooSmall (RDP band)
+            (0xDEAD_BEEF, DisconnectClass::Unknown), // uncatalogued
         ] {
             assert_eq!(
                 classify(ErrorInfo::from_u32(code)),
