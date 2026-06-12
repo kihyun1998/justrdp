@@ -2999,6 +2999,199 @@ mod tests {
         assert_eq!(reason.class(), justrdp::DisconnectClass::UserLogoff);
     }
 
+    /// Real-VM acceptance (issue #42 C7): a server-side **disconnect** (not logoff) — driven by
+    /// running `tsdiscon` inside the session — ends it with the server's *typed* attribution
+    /// (an MCS Disconnect Provider Ultimatum, or a Set Error Info PDU), i.e.
+    /// [`DisconnectReason::ServerDisconnected`], never an unexplained EOF. The exact class is
+    /// VM-policy-dependent (commonly `ProviderUltimatum`), so it is logged rather than pinned;
+    /// the invariant under test is *attributed vs unexpected*. `tsdiscon` is launched the same
+    /// way slice-7 launches Notepad — Start button, type the command, Enter — because this VM
+    /// ignores the Windows logo key (server-side policy probed in slice-7).
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn tsdiscon_inside_the_session_yields_a_typed_server_disconnect() {
+        let _vm = VM_SESSION.lock().await;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let config = test_config();
+        let session_capabilities = config.capabilities.clone();
+        let requested_size = (config.core.desktop_width, config.core.desktop_height);
+        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
+            .await
+            .expect("connect should reach session-active");
+        let mut machine = SessionStateMachine::new(
+            session_config_from(&outcome, session_capabilities),
+            outcome.activation.leftover,
+        );
+        let mut stream = outcome.stream;
+
+        let frames_in_sink = Arc::new(AtomicUsize::new(0));
+        let frames_in_driver = frames_in_sink.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(8);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(vec![InputEvent::Sync {
+                    toggle_flags: keyboard_toggle_flags(),
+                }])
+                .await;
+            // Wait until the desktop has painted AND settled.
+            let mut last = frames_in_driver.load(Ordering::SeqCst);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let now = frames_in_driver.load(Ordering::SeqCst);
+                if now == last && now > 0 {
+                    break;
+                }
+                last = now;
+            }
+            // Click the Start button, then type `tsdiscon` into the Start search and run it.
+            let (x, y) = (24u16, requested_size.1.saturating_sub(20));
+            let _ = tx
+                .send(vec![
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    },
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_DOWN
+                            | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    },
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    },
+                ])
+                .await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            // T S D I S C O N
+            for vk in [0x54u16, 0x53, 0x44, 0x49, 0x53, 0x43, 0x4F, 0x4E] {
+                let _ = tx.send(tap(vk)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = tx.send(tap(0x0D)).await; // Enter
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_session_with_input(
+                &mut stream,
+                &mut machine,
+                |_| {
+                    frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                },
+                |_| {},
+                &mut rx,
+            ),
+        )
+        .await;
+        let reason = ended
+            .expect("the server should disconnect within 60s of tsdiscon")
+            .expect("the disconnect must classify, not fail");
+
+        eprintln!("tsdiscon terminal value: {reason:?} → {:?}", reason.class());
+        assert!(
+            matches!(reason, justrdp::DisconnectReason::ServerDisconnected(_)),
+            "tsdiscon should be a server-attributed disconnect, got {reason:?}"
+        );
+    }
+
+    /// A controllable TCP forwarding proxy in front of the VM: it accepts one client connection,
+    /// pipes bytes both ways to `target`, and tears the whole thing down the instant the returned
+    /// kill-switch fires — simulating a pulled cable. TLS is end-to-end (client ↔ VM), so the
+    /// byte-level proxy is transparent to the handshake. Returns the local address to dial and
+    /// the kill-switch sender.
+    async fn kill_switch_proxy(
+        target: SocketAddr,
+    ) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut server = TcpStream::connect(target).await.unwrap();
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                // Kill-switch: returning drops both sockets, abruptly cutting the transport.
+                _ = kill_rx => {}
+            }
+        });
+        (local, kill_tx)
+    }
+
+    /// Real-VM acceptance (issue #42 C7): when the transport dies mid-session with no graceful
+    /// disconnect PDU, the session ends as the *untyped* [`DisconnectReason::UnexpectedDisconnect`]
+    /// — the complement of the attributed tsdiscon/logoff closes. The network loss is staged with
+    /// [`kill_switch_proxy`]: once the desktop has settled, the proxy is dropped, severing the
+    /// connection the way a pulled cable would.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_severed_transport_yields_unexpected_disconnect() {
+        let _vm = VM_SESSION.lock().await;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let vm: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let (proxy_addr, kill) = kill_switch_proxy(vm).await;
+
+        let config = test_config();
+        let session_capabilities = config.capabilities.clone();
+        let outcome = connect_danger(proxy_addr, config, vm_credentials(), |_| {})
+            .await
+            .expect("connect should reach session-active through the proxy");
+        let mut machine = SessionStateMachine::new(
+            session_config_from(&outcome, session_capabilities),
+            outcome.activation.leftover,
+        );
+        let mut stream = outcome.stream;
+
+        let frames = Arc::new(AtomicUsize::new(0));
+        let frames_watch = frames.clone();
+        tokio::spawn(async move {
+            // Wait until the desktop has painted AND settled, then cut the transport.
+            let mut last = frames_watch.load(Ordering::SeqCst);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let now = frames_watch.load(Ordering::SeqCst);
+                if now == last && now > 0 {
+                    break;
+                }
+                last = now;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = kill.send(()); // sever the network
+        });
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_session(
+                &mut stream,
+                &mut machine,
+                |_| {
+                    frames.fetch_add(1, Ordering::SeqCst);
+                },
+                |_| {},
+            ),
+        )
+        .await;
+        let reason = ended
+            .expect("the session must end within 60s of the transport being cut")
+            .expect("a severed transport is a clean terminal value, not a SessionFailure");
+
+        eprintln!("severed-transport terminal value: {reason:?}");
+        assert_eq!(reason, justrdp::DisconnectReason::UnexpectedDisconnect);
+    }
+
     /// Real-VM acceptance test for slice-7: keyboard + mouse input over fast-path. Clicks
     /// the Start button (mouse), types "notepad" into the Start search and Enter to launch
     /// it, then types "aaa" (every keystroke through the VK→set-1 table) and scrolls the
