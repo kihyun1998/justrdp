@@ -31,6 +31,12 @@ const SVC_MESSAGE_CAP: usize = 64 << 10;
 /// bytes; the cap leaves room for future channels without allowing unbounded allocation.
 const DVC_MESSAGE_CAP: usize = 4 << 20;
 
+/// Cap on simultaneously open dynamic channels, per registered processor. Conforming servers
+/// open one channel per processor (a Close frees its slot before any re-create); a server
+/// minting fresh channel ids for the same name must not grow the open list without bound
+/// (#86 — the allocation-cap discipline). At the cap a Create Request is refused, not fatal.
+const MAX_OPEN_CHANNELS_PER_PROCESSOR: usize = 4;
+
 /// A dynamic-channel endpoint: one implementation per channel the client supports
 /// (Display Control today; EGFX and friends in their slices). The manager handles transport —
 /// processors receive only complete, reassembled messages.
@@ -256,8 +262,20 @@ impl Drdynvc {
                         CREATION_STATUS_REFUSED,
                     ))]);
                 };
-                tracing::debug!(target: "rdp_drdynvc", channel_id, name, "DYNVC create accepted");
                 self.open.retain(|c| c.channel_id != channel_id);
+                if self.open.len() >= self.processors.len() * MAX_OPEN_CHANNELS_PER_PROCESSOR {
+                    tracing::warn!(
+                        target: "rdp_drdynvc",
+                        channel_id,
+                        name,
+                        "DYNVC create refused — open-channel cap reached"
+                    );
+                    return Ok(vec![DvcEvent::Send(dvc::encode_create_response(
+                        channel_id,
+                        CREATION_STATUS_REFUSED,
+                    ))]);
+                }
+                tracing::debug!(target: "rdp_drdynvc", channel_id, name, "DYNVC create accepted");
                 self.open.push(OpenChannel {
                     channel_id,
                     processor,
@@ -510,6 +528,44 @@ mod tests {
         assert!(manager.on_svc_payload(&chunk1).unwrap().is_empty());
         let events = manager.on_svc_payload(&chunk2).unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn creates_past_the_open_channel_cap_are_refused() {
+        let mut manager = Drdynvc::default();
+        let cap = manager.processors.len() * MAX_OPEN_CHANNELS_PER_PROCESSOR;
+        for id in 0..cap {
+            let events = feed(
+                &mut manager,
+                &create_request(id as u8, displaycontrol::CHANNEL_NAME),
+            );
+            assert_eq!(
+                events[0],
+                DvcEvent::Send(dvc::encode_create_response(id as u32, CREATION_STATUS_OK)),
+                "create #{id} under the cap must be accepted"
+            );
+        }
+        // One more fresh id is refused — the open list must not grow without bound (#86).
+        let events = feed(
+            &mut manager,
+            &create_request(200, displaycontrol::CHANNEL_NAME),
+        );
+        assert_eq!(
+            events,
+            vec![DvcEvent::Send(dvc::encode_create_response(
+                200,
+                CREATION_STATUS_REFUSED
+            ))]
+        );
+        // Re-creating an already-open id frees its slot first: still accepted at the cap.
+        let events = feed(
+            &mut manager,
+            &create_request(0, displaycontrol::CHANNEL_NAME),
+        );
+        assert_eq!(
+            events[0],
+            DvcEvent::Send(dvc::encode_create_response(0, CREATION_STATUS_OK))
+        );
     }
 
     #[test]
