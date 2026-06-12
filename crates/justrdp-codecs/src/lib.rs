@@ -8,8 +8,10 @@
 //! the start, oracle-tested against `ironrdp-graphics`. [`clearcodec`] is likewise self-owned
 //! (ADR-0003 phase 2): it corrects two oracle bit-level defects that reject genuine Server 2022
 //! streams. The remaining EGFX decoders ([`egfx`]: zgfx, RemoteFX Progressive — slice-9) are
-//! still phase-1 bootstrap wrappers behind the `egfx-bootstrap` feature; WireToSurface1 RemoteFX
-//! (CAVIDEO) and NSCodec arrive with their own phase-2 rewrites.
+//! still phase-1 bootstrap wrappers behind the `egfx-bootstrap` feature. [`rfx`] (WireToSurface1
+//! RemoteFX, issue #58) is self-owned and ungated like ClearCodec — it skipped phase 1 outright
+//! (the bootstrap crate has no assembled RemoteFX decoder), verified per ADR-0007 against the
+//! oracle's transform primitives; NSCodec arrives with its own phase-2 rewrite.
 
 pub mod clearcodec;
 pub mod color;
@@ -17,4 +19,5 @@ pub mod color;
 pub mod egfx;
 pub mod planar;
 pub mod pointer;
+pub mod rfx;
 pub mod rle;

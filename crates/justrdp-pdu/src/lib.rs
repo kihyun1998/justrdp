@@ -25,6 +25,7 @@ pub mod mcs;
 pub mod nego;
 pub mod per;
 pub mod pointer;
+pub mod rfx;
 pub mod share;
 pub mod svc;
 pub mod tpkt;
