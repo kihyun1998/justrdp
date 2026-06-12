@@ -42,10 +42,18 @@ pub struct Caps {
 
 impl Caps {
     /// The maximum total monitor area in pixels.
+    ///
+    /// The three factors are server-supplied `u32`s, so their product can reach
+    /// `u32`³ ≈ 2^96 — well past `u64`. A hostile server advertising large factors
+    /// must not overflow (a debug-build panic, or a silent release-build wrap) when
+    /// the client validates a resize against this limit, so the product **saturates**
+    /// at [`u64::MAX`]. Saturation is the right behaviour: an enormous advertised
+    /// limit means "effectively unbounded", and the real per-monitor dimension caps
+    /// (200–8192, MS-RDPEDISP 2.2.2.2.1) still gate the request.
     pub fn max_area(&self) -> u64 {
         u64::from(self.max_num_monitors)
-            * u64::from(self.max_monitor_area_factor_a)
-            * u64::from(self.max_monitor_area_factor_b)
+            .saturating_mul(u64::from(self.max_monitor_area_factor_a))
+            .saturating_mul(u64::from(self.max_monitor_area_factor_b))
     }
 }
 
@@ -170,6 +178,18 @@ mod tests {
         };
         assert_eq!(caps.max_num_monitors, 1);
         assert_eq!(caps.max_area(), 3840 * 2160);
+    }
+
+    #[test]
+    fn max_area_saturates_instead_of_overflowing() {
+        // u32³ ≈ 2^96 overflows u64; a hostile server's caps must saturate, not
+        // panic (debug) or wrap (release).
+        let caps = Caps {
+            max_num_monitors: u32::MAX,
+            max_monitor_area_factor_a: u32::MAX,
+            max_monitor_area_factor_b: u32::MAX,
+        };
+        assert_eq!(caps.max_area(), u64::MAX);
     }
 
     #[test]
