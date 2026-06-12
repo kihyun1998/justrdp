@@ -1,0 +1,42 @@
+name: CI
+
+# Minimal build gate: formatting, lints, and the (non-ignored) test suite.
+# The real-VM integration tests (192.168.136.136) are `#[ignore]` and never run
+# in CI — they need the throwaway Windows host, so they stay a maintainer step.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# One run per ref; a new push cancels an in-flight run on the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Use the runner's pre-installed rustup — no third-party toolchain action,
+      # matching the project's dependency discipline (ADR-0002).
+      - name: Rust toolchain (stable + rustfmt + clippy)
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace

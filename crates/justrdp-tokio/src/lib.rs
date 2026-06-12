@@ -1762,11 +1762,11 @@ mod tests {
                 // One TSRequest per client write, and the client awaits our reply before the
                 // next — so accumulate until the buffer parses as a complete TSRequest.
                 let ts_request = loop {
-                    if !inbox.is_empty() {
-                        if let Ok(ts) = TsRequest::from_buffer(&inbox) {
-                            inbox.clear();
-                            break ts;
-                        }
+                    if !inbox.is_empty()
+                        && let Ok(ts) = TsRequest::from_buffer(&inbox)
+                    {
+                        inbox.clear();
+                        break ts;
                     }
                     let n = tls.read(&mut buf).await.unwrap();
                     if n == 0 {

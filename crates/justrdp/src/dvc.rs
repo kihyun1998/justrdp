@@ -480,11 +480,11 @@ mod tests {
         // Hand-fragment into DataFirst(8 bytes) + Data(rest) to exercise reassembly even
         // though a real caps PDU fits one fragment.
         let mut first = Vec::new();
-        first.push((dvc::CMD_DATA_FIRST << 4) | 0); // cbId=0, Sp=0 (1-byte length)
+        first.push(dvc::CMD_DATA_FIRST << 4); // cbId=0, Sp=0 (1-byte length)
         first.push(7);
         first.push(caps.len() as u8);
         first.extend_from_slice(&caps[..8]);
-        let mut rest = vec![(dvc::CMD_DATA << 4) | 0, 7];
+        let mut rest = vec![dvc::CMD_DATA << 4, 7];
         rest.extend_from_slice(&caps[8..]);
 
         assert!(feed(&mut manager, &first).is_empty());
