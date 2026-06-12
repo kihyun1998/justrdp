@@ -10,9 +10,11 @@
 //! to CAPVERSION_8 — the RemoteFX/Progressive/Clear/Planar era — which structurally keeps the
 //! server away from AVC (H.264), for which no decoder exists yet.
 //!
-//! WireToSurface1 RemoteFX (`CODECID_CAVIDEO`) is logged-and-skipped: the bootstrap crate has
-//! no high-level decoder for the legacy TS_RFX container and real V8 servers prefer
-//! Progressive (issue #9's own hedge); it arrives with the phase-2 codec rewrites.
+//! WireToSurface1 RemoteFX (`CODECID_CAVIDEO`) decodes through the self-owned
+//! `justrdp-codecs::rfx` decoder (issue #58, ADR-0007) — it skipped the bootstrap phase
+//! outright (the bootstrap crate has no assembled TS_RFX decoder, and real V8 servers prefer
+//! Progressive, so the real VM cannot exercise it; the synthetic differential corpus is the
+//! verification ceiling).
 
 use crate::dvc::{DvcProcessor, ProcessorOutput};
 use crate::framebuffer::FrameUpdate;
@@ -20,6 +22,7 @@ use justrdp_codecs::clearcodec::Clear;
 use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::egfx::{Progressive, Zgfx};
 use justrdp_codecs::planar;
+use justrdp_codecs::rfx::RemoteFx;
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::egfx::{self, EgfxPdu, Rect16};
 
@@ -157,6 +160,7 @@ pub(crate) struct GraphicsProcessor {
     zgfx: Zgfx,
     progressive: Progressive,
     clear: Clear,
+    remotefx: RemoteFx,
     surfaces: Vec<Surface>,
     cache: std::collections::HashMap<u16, CachedBitmap>,
     cache_bytes: usize,
@@ -171,6 +175,7 @@ impl Default for GraphicsProcessor {
             zgfx: Zgfx::new(),
             progressive: Progressive::new(),
             clear: Clear::new(),
+            remotefx: RemoteFx::new(),
             surfaces: Vec::new(),
             cache: std::collections::HashMap::new(),
             cache_bytes: 0,
@@ -257,11 +262,16 @@ impl GraphicsProcessor {
                 };
                 Ok(Some(rgba))
             }
-            // RemoteFX non-progressive: phase-2 rewrite territory (no bootstrap API; the
-            // V8 test server prefers Progressive — issue #9's hedge). Skipped, not fatal.
+            // RemoteFX non-progressive: the self-owned TS_RFX decoder (issue #58). A
+            // headers-only payload legitimately paints nothing (`Ok(None)` from the codec);
+            // a malformed stream warn-and-skips like the sibling codecs.
             egfx::CODECID_CAVIDEO => {
-                tracing::warn!(target: "rdp_egfx", "WTS1 RemoteFX (CAVIDEO) not decoded yet — region skipped");
-                Ok(None)
+                let Ok(rgba) = self.remotefx.decode_to_rgba(data, w, h).map_err(|e| {
+                    tracing::warn!(target: "rdp_egfx", error = %e, "RemoteFX WTS1 decode failed — region skipped");
+                }) else {
+                    return Ok(None);
+                };
+                Ok(rgba)
             }
             other => {
                 tracing::debug!(target: "rdp_egfx", codec_id = other, "unsupported WTS1 codec skipped");
@@ -906,7 +916,8 @@ mod tests {
         let mut p = GraphicsProcessor::default();
         assert!(feed(&mut p, 0x0016, &[0; 8]).is_empty()); // QoE ack: unknown, skipped
         create_surface(&mut p, 1, 4, 4);
-        // CAVIDEO WTS1: logged + skipped, no error, no frame.
+        // Malformed CAVIDEO WTS1 (garbage, not a TS_RFX stream): warn-and-skip — no error,
+        // no frame, session survives (the sibling-codec failure contract).
         let mut body = Vec::new();
         body.extend_from_slice(&1u16.to_le_bytes());
         body.extend_from_slice(&egfx::CODECID_CAVIDEO.to_le_bytes());
@@ -917,6 +928,87 @@ mod tests {
         body.extend_from_slice(&4u32.to_le_bytes());
         body.extend_from_slice(&[0xAB; 4]);
         assert!(feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &body).is_empty());
+    }
+
+    /// Build a minimal valid TS_RFX payload: one full-tile region plus one tile whose three
+    /// components are the given RLGR bytes (entropy: RLGR1, quants: all-1 exponents).
+    fn cavideo_payload(component: &[u8]) -> Vec<u8> {
+        fn push_block(out: &mut Vec<u8>, ty: u16, channel_id: u8, body: &[u8]) {
+            out.extend_from_slice(&ty.to_le_bytes());
+            out.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
+            out.push(1);
+            out.push(channel_id);
+            out.extend_from_slice(body);
+        }
+        let mut data = Vec::new();
+        let mut region = vec![0x01u8];
+        region.extend_from_slice(&1u16.to_le_bytes());
+        for v in [0u16, 0, 64, 64] {
+            region.extend_from_slice(&v.to_le_bytes());
+        }
+        region.extend_from_slice(&0xCAC1u16.to_le_bytes());
+        region.extend_from_slice(&1u16.to_le_bytes());
+        push_block(&mut data, 0xCCC6, 0, &region);
+        let mut tile = Vec::new();
+        tile.extend_from_slice(&0xCAC3u16.to_le_bytes());
+        tile.extend_from_slice(&((6 + 13 + component.len() * 3) as u32).to_le_bytes());
+        tile.extend_from_slice(&[0, 0, 0]); // quant indices
+        tile.extend_from_slice(&0u16.to_le_bytes()); // xIdx
+        tile.extend_from_slice(&0u16.to_le_bytes()); // yIdx
+        for _ in 0..3 {
+            tile.extend_from_slice(&(component.len() as u16).to_le_bytes());
+        }
+        for _ in 0..3 {
+            tile.extend_from_slice(component);
+        }
+        let properties: u16 = 0x01 | (1 << 4) | (1 << 6) | (0x01 << 10) | (1 << 14);
+        let mut tileset = Vec::new();
+        tileset.extend_from_slice(&0xCAC2u16.to_le_bytes());
+        tileset.extend_from_slice(&0u16.to_le_bytes());
+        tileset.extend_from_slice(&properties.to_le_bytes());
+        tileset.push(1); // numQuant
+        tileset.push(64); // tileSize
+        tileset.extend_from_slice(&1u16.to_le_bytes()); // numTiles
+        tileset.extend_from_slice(&(tile.len() as u32).to_le_bytes());
+        tileset.extend_from_slice(&[0x11; 5]); // all-1 quant exponents (no shift)
+        tileset.extend_from_slice(&tile);
+        push_block(&mut data, 0xCCC7, 0, &tileset);
+        data
+    }
+
+    #[test]
+    fn wts1_remotefx_cavideo_decodes_to_a_frame() {
+        // An all-zero-coefficient tile reconstructs to Y = Cb = Cr = 0, which the RemoteFX
+        // inverse color transform maps to mid gray: (0 + 4096) · 2¹⁶ ≫ 21 = 128 per channel.
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        map_surface(&mut p, 1, 0, 0);
+        let payload = cavideo_payload(&[0x00; 8]);
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&egfx::CODECID_CAVIDEO.to_le_bytes());
+        body.push(egfx::PIXEL_FORMAT_XRGB_8888);
+        for v in [0u16, 0, 64, 64] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(&payload);
+        let outputs = feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &body);
+        let [Out::Frame(frame)] = outputs.as_slice() else {
+            panic!("expected one frame, got {outputs:?}");
+        };
+        assert_eq!(
+            (frame.x, frame.y, frame.width, frame.height),
+            (0, 0, 64, 64)
+        );
+        assert!(
+            frame
+                .pixels
+                .chunks_exact(4)
+                .all(|p| p == [128, 128, 128, 255]),
+            "zero spectrum must decode to mid gray, got {:?}…",
+            &frame.pixels[..8]
+        );
     }
 
     #[test]
