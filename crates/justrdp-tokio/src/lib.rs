@@ -863,6 +863,14 @@ pub fn keyboard_toggle_flags() -> u8 {
     flags
 }
 
+/// On platforms without a host LED query implemented, the lock state is unknown, so report no
+/// toggles set. The session still tracks Caps/Num/Scroll as the user presses them; only the
+/// initial host-matching sync is skipped. (A Linux X11/evdev reader can replace this stub.)
+#[cfg(not(windows))]
+pub fn keyboard_toggle_flags() -> u8 {
+    0
+}
+
 /// Await `fut` under the stage's timeout, mapping the outcome into a [`ConnectFailure`]: an I/O
 /// error becomes `Io`, and an elapsed timeout becomes `Timeout { stage }`. Every connect stage
 /// wraps its I/O through this single seam so the timeout/error policy lives in one place.
