@@ -41,6 +41,12 @@ const MAX_CACHE_BYTES: usize = 100 << 20;
 /// (bounds the per-frame output count without dropping content).
 const MAX_DIRTY_RECTS: usize = 64;
 
+/// Cap on live RemoteFX Progressive codec contexts across all surfaces (#83). Conforming
+/// servers use one context per surface (typically id 0); the decoder keeps per-context tile
+/// state sized to the whole surface, so an uncapped context map is an unbounded-allocation
+/// channel — the same class the surface and cache budgets close.
+const MAX_PROGRESSIVE_CONTEXTS: usize = 16;
+
 /// A dirty region in surface coordinates: `(x, y, width, height)`.
 type DirtyRect = (u16, u16, u16, u16);
 
@@ -54,6 +60,10 @@ struct Surface {
     /// Output-space position of the surface's (0,0), once MapSurfaceToOutput arrives.
     mapped: Option<(u32, u32)>,
     dirty: Vec<DirtyRect>,
+    /// Progressive codec contexts seen on this surface (WireToSurface2), freed with the
+    /// surface (#83) — DeleteEncodingContext is the only wire-level release and servers do
+    /// not reliably send it.
+    codec_contexts: Vec<u32>,
 }
 
 impl Surface {
@@ -195,6 +205,19 @@ impl GraphicsProcessor {
         self.surfaces.iter_mut().find(|s| s.id == id)
     }
 
+    /// Remove a surface and free the Progressive codec contexts it used (#83). The bootstrap
+    /// decoder keys contexts by id alone, so an id shared across surfaces loses its state
+    /// here — per spec context ids are surface-scoped, so a conforming server is unaffected
+    /// (the self-owned rewrite will key by (surface, context) and retire this caveat).
+    fn remove_surface(&mut self, surface_id: u16) {
+        while let Some(at) = self.surfaces.iter().position(|s| s.id == surface_id) {
+            let surface = self.surfaces.remove(at);
+            for ctx in surface.codec_contexts {
+                self.progressive.delete_context(ctx);
+            }
+        }
+    }
+
     fn total_surface_bytes(&self) -> usize {
         self.surfaces.iter().map(|s| s.rgba.len()).sum()
     }
@@ -299,6 +322,13 @@ impl GraphicsProcessor {
                 let height = u16::try_from(height).map_err(|_| {
                     invalid("RDPGFX_RESET_GRAPHICS_PDU", "output height exceeds u16")
                 })?;
+                // The reset invalidates the whole graphics state; drop every Progressive
+                // context with it (#83) — the server deletes/recreates surfaces around this
+                // PDU, and stale tile state would only mis-decode the next first pass.
+                self.progressive.reset();
+                for surface in &mut self.surfaces {
+                    surface.codec_contexts.clear();
+                }
                 outputs.push(ProcessorOutput::OutputResized { width, height });
             }
             EgfxPdu::CreateSurface {
@@ -314,7 +344,7 @@ impl GraphicsProcessor {
                         "surface dimensions out of bounds",
                     ));
                 }
-                self.surfaces.retain(|s| s.id != surface_id);
+                self.remove_surface(surface_id);
                 if self.total_surface_bytes() + Surface::bytes(width, height)
                     > MAX_TOTAL_SURFACE_BYTES
                 {
@@ -331,11 +361,12 @@ impl GraphicsProcessor {
                     rgba: vec![0; Surface::bytes(width, height)],
                     mapped: None,
                     dirty: Vec::new(),
+                    codec_contexts: Vec::new(),
                 });
             }
             EgfxPdu::DeleteSurface { surface_id } => {
                 tracing::debug!(target: "rdp_egfx", surface_id, "DeleteSurface");
-                self.surfaces.retain(|s| s.id != surface_id);
+                self.remove_surface(surface_id);
             }
             EgfxPdu::MapSurfaceToOutput {
                 surface_id,
@@ -408,6 +439,33 @@ impl GraphicsProcessor {
                         ));
                     }
                 };
+                // Enforce the live-context cap and record the surface→context association
+                // BEFORE the decoder allocates per-context state (#83). The decoder itself
+                // keeps an unbounded id-keyed map; this gate is what bounds it.
+                let known = self
+                    .surfaces
+                    .iter()
+                    .any(|s| s.codec_contexts.contains(&codec_context_id));
+                if !known {
+                    let mut live: Vec<u32> = self
+                        .surfaces
+                        .iter()
+                        .flat_map(|s| s.codec_contexts.iter().copied())
+                        .collect();
+                    live.sort_unstable();
+                    live.dedup();
+                    if live.len() >= MAX_PROGRESSIVE_CONTEXTS {
+                        return Err(invalid(
+                            "RDPGFX_WIRE_TO_SURFACE_PDU_2",
+                            "too many live Progressive codec contexts",
+                        ));
+                    }
+                }
+                if let Some(surface) = self.surface_mut(surface_id)
+                    && !surface.codec_contexts.contains(&codec_context_id)
+                {
+                    surface.codec_contexts.push(codec_context_id);
+                }
                 // Warn-and-skip on failure, like the WTS1 codecs: a bootstrap-decoder
                 // limitation must not kill the session (the tile state may desync until the
                 // next first-pass repaint, which servers send periodically).
@@ -435,10 +493,14 @@ impl GraphicsProcessor {
                 }
             }
             EgfxPdu::DeleteEncodingContext {
-                surface_id: _,
+                surface_id,
                 codec_context_id,
             } => {
                 self.progressive.delete_context(codec_context_id);
+                // Keep the surface→context accounting in step with the decoder (#83).
+                if let Some(surface) = self.surface_mut(surface_id) {
+                    surface.codec_contexts.retain(|&c| c != codec_context_id);
+                }
             }
             EgfxPdu::SolidFill {
                 surface_id,
@@ -760,6 +822,78 @@ mod tests {
                 height: 768,
             }]
         );
+    }
+
+    /// A WireToSurface2 body: progressive codec, the given context id, garbage payload —
+    /// the decode warn-and-skips, but the context id is recorded before it runs (#83).
+    fn wts2_body(surface_id: u16, ctx: u32, data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&surface_id.to_le_bytes());
+        body.extend_from_slice(&egfx::CODECID_CAPROGRESSIVE.to_le_bytes());
+        body.extend_from_slice(&ctx.to_le_bytes());
+        body.push(egfx::PIXEL_FORMAT_XRGB_8888);
+        body.extend_from_slice(data);
+        body
+    }
+
+    fn feed_wts2(p: &mut GraphicsProcessor, surface_id: u16, ctx: u32) -> Result<(), DecodeError> {
+        let message = egfx::wrap_uncompressed(&header(
+            egfx::CMDID_WIRE_TO_SURFACE_2,
+            &wts2_body(surface_id, ctx, &[0xFF; 8]),
+        ));
+        p.process(&message).map(|_| ())
+    }
+
+    fn fill_context_cap(p: &mut GraphicsProcessor, surface_id: u16) {
+        for ctx in 0..MAX_PROGRESSIVE_CONTEXTS as u32 {
+            feed_wts2(p, surface_id, ctx).expect("ids under the cap are accepted");
+        }
+    }
+
+    #[test]
+    fn progressive_contexts_are_capped_and_freed_with_their_surface() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        fill_context_cap(&mut p, 1);
+
+        // One more fresh id exceeds the cap: protocol error (allocation-bound discipline).
+        assert!(feed_wts2(&mut p, 1, 999).is_err());
+        // A known id stays decodable — no new context is created.
+        feed_wts2(&mut p, 1, 0).expect("a live context id is not the cap's business");
+
+        // Deleting the surface frees its contexts; a fresh id fits again.
+        feed(&mut p, egfx::CMDID_DELETE_SURFACE, &1u16.to_le_bytes());
+        create_surface(&mut p, 1, 64, 64);
+        feed_wts2(&mut p, 1, 999).expect("the budget was released with the surface");
+    }
+
+    #[test]
+    fn reset_graphics_drops_progressive_contexts() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        fill_context_cap(&mut p, 1);
+        assert!(feed_wts2(&mut p, 1, 999).is_err());
+
+        let mut body = vec![0u8; 332];
+        body[0..4].copy_from_slice(&1024u32.to_le_bytes());
+        body[4..8].copy_from_slice(&768u32.to_le_bytes());
+        feed(&mut p, egfx::CMDID_RESET_GRAPHICS, &body);
+
+        feed_wts2(&mut p, 1, 999).expect("ResetGraphics cleared every context");
+    }
+
+    #[test]
+    fn delete_encoding_context_releases_cap_budget() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        fill_context_cap(&mut p, 1);
+        assert!(feed_wts2(&mut p, 1, 999).is_err());
+
+        let mut body = 1u16.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        feed(&mut p, egfx::CMDID_DELETE_ENCODING_CONTEXT, &body);
+
+        feed_wts2(&mut p, 1, 999).expect("the freed context's slot is reusable");
     }
 
     #[test]
