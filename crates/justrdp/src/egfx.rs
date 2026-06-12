@@ -537,20 +537,25 @@ impl GraphicsProcessor {
                     .cache
                     .get(&cache_slot)
                     .ok_or(invalid("RDPGFX_CACHE_TO_SURFACE_PDU", "unknown cache slot"))?;
-                let (w, h) = (entry.width, entry.height);
-                let pixels = entry.rgba.clone();
-                let dest = self.surface_mut(surface_id).ok_or(invalid(
-                    "RDPGFX_CACHE_TO_SURFACE_PDU",
-                    "unknown destination surface",
-                ))?;
+                // Field-level borrows (`cache` immutably, `surfaces` mutably) are disjoint,
+                // so the cached pixels blit without a per-apply clone of the whole entry
+                // (#84) — the `surface_mut` helper would borrow all of `self` and force it.
+                let dest = self
+                    .surfaces
+                    .iter_mut()
+                    .find(|s| s.id == surface_id)
+                    .ok_or(invalid(
+                        "RDPGFX_CACHE_TO_SURFACE_PDU",
+                        "unknown destination surface",
+                    ))?;
                 for pt in dest_points {
                     dest.blit(
                         i32::from(pt.x),
                         i32::from(pt.y),
-                        w,
-                        h,
-                        &pixels,
-                        usize::from(w),
+                        entry.width,
+                        entry.height,
+                        &entry.rgba,
+                        usize::from(entry.width),
                     );
                 }
             }
