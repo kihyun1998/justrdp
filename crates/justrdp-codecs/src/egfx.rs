@@ -112,6 +112,11 @@ impl Progressive {
     pub fn delete_context(&mut self, codec_context_id: u32) {
         self.inner.delete_context(codec_context_id);
     }
+
+    /// Drop every codec context (ResetGraphics / channel teardown — #83).
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
 }
 
 impl Default for Progressive {
