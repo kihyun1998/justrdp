@@ -13,6 +13,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Default token gets read-only scope; grant write per-job only when needed.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -21,7 +25,7 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       # Use the runner's pre-installed rustup — no third-party toolchain action,
       # matching the project's dependency discipline (ADR-0002).
@@ -40,3 +44,13 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  # Supply-chain gate: just-shield verifies every action this repo ingests
+  # (SHA pinning, permissions, known-compromised versions) before merge.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: kihyun1998/just-shield@066f5f60ce9611e71b86043668a763f0e84fdab9 # v0.1.3
+        with:
+          strict: true
