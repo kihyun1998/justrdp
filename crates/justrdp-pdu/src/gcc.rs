@@ -246,6 +246,51 @@ fn read_utf16_fixed(cur: &mut ReadCursor<'_>, total: usize) -> Result<String, De
     Ok(String::from_utf16_lossy(&units[..end]))
 }
 
+impl Default for ClientCoreData {
+    /// A sensible host-facing starting point that **advertises every early-capability flag
+    /// justrdp can actually honour** — Set Error Info ([`ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU`]),
+    /// the EGFX gate ([`ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL`]), and channel-join
+    /// skip ([`ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN`]) — per the "advertise
+    /// everything we can handle" rule (plan.md §0, §5b).
+    ///
+    /// This is a **default, not a hardcode** (plan.md §0): every field, including
+    /// `early_capability_flags`, may be overridden — set, cleared, or extended — and the encoder
+    /// passes whatever bits remain through verbatim (see `early_capability_flags_pass_through_verbatim`).
+    /// A default-configured client therefore advertises `SUPPORT_ERR_INFO_PDU` and receives
+    /// attributable Set Error Info PDUs without the host opting in (issue #42 C4 / #71), while a
+    /// host that wants a leaner advertisement can still clear the flags.
+    ///
+    /// `server_selected_protocol` is left empty — the connect state machine fills it with the
+    /// negotiated value (it is protocol fact, not caller policy).
+    fn default() -> Self {
+        Self {
+            version: RDP_VERSION_10_12,
+            desktop_width: 1280,
+            desktop_height: 800,
+            keyboard_layout: 0x0409, // en-US
+            client_build: 18363,
+            client_name: "justrdp".to_string(),
+            keyboard_type: KEYBOARD_TYPE_IBM_ENHANCED,
+            keyboard_subtype: 0,
+            keyboard_functional_keys_count: 12,
+            ime_file_name: String::new(),
+            post_beta2_color_depth: COLOR_DEPTH_8BPP,
+            client_product_id: 1,
+            serial_number: 0,
+            high_color_depth: HIGH_COLOR_DEPTH_24BPP,
+            supported_color_depths: SUPPORTED_COLOR_DEPTH_24BPP
+                | SUPPORTED_COLOR_DEPTH_16BPP
+                | SUPPORTED_COLOR_DEPTH_32BPP,
+            early_capability_flags: ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
+                | ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL
+                | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN,
+            dig_product_id: String::new(),
+            connection_type: CONNECTION_TYPE_LAN,
+            server_selected_protocol: SecurityProtocol::from_bits(0),
+        }
+    }
+}
+
 impl ClientCoreData {
     /// Append the block body (without the user-data header) to `out`.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
@@ -803,6 +848,37 @@ mod tests {
                 .early_capability_flags
                 .bits(),
             0
+        );
+    }
+
+    #[test]
+    fn default_core_advertises_set_error_info_and_stays_overridable() {
+        // issue #42 C4 / #71: a default-configured client must advertise SUPPORT_ERR_INFO_PDU,
+        // so it receives attributable Set Error Info PDUs without the host opting in — and the
+        // flag must survive the encode (not be normalized away).
+        let core = ClientCoreData::default();
+        assert!(
+            core.early_capability_flags
+                .contains(ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU),
+            "the default must advertise the Set Error Info PDU support flag"
+        );
+        let mut body = Vec::new();
+        core.encode_into(&mut body);
+        assert!(
+            ClientCoreData::decode(&body)
+                .unwrap()
+                .early_capability_flags
+                .contains(ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU)
+        );
+
+        // It is a default, not a hardcode: the caller can still clear it (plan.md §0).
+        let leaner = ClientCoreData {
+            early_capability_flags: ClientEarlyCapabilityFlags::empty(),
+            ..ClientCoreData::default()
+        };
+        assert_eq!(
+            leaner.early_capability_flags,
+            ClientEarlyCapabilityFlags::empty()
         );
     }
 
