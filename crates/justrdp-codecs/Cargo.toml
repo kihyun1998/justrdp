@@ -15,6 +15,9 @@ default = ["egfx-bootstrap"]
 egfx-bootstrap = ["dep:ironrdp-graphics"]
 
 [dependencies]
+# The TS_RFX message-set parser (issue #58): the self-owned RemoteFX decoder consumes the
+# typed blocks; justrdp-pdu stays zero-dep (ADR-0002), this edge is workspace-internal.
+justrdp-pdu.workspace = true
 # Phase 1 (ADR-0003): bootstrap on `ironrdp-graphics`, kept behind this crate's own decode API
 # so it can be swapped for self-owned decoders later. The slow-path codecs (interleaved RLE,
 # RDP6 planar — slice-6) skipped phase 1: they are self-owned from the start, with

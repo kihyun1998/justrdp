@@ -149,6 +149,52 @@ pub fn to_rgba(
     Ok(out)
 }
 
+/// RemoteFX inverse color transform (ICT, MS-RDPRFX 3.1.8.1.3): per-pixel YCbCr → RGBA8888,
+/// alpha 255. Inputs are the planes exactly as the inverse DWT leaves them — pixel-domain
+/// fixed point, each sample ≈ `(channel − 128) · 32` — so the level shift folds in here
+/// (`+4096 = 128 · 32`) and the final shift drops both the ×32 and the coefficient scale.
+///
+/// The coefficients are the spec's constants in `f32`, and the per-pixel arithmetic mirrors
+/// the differential oracle's fixed-point form bit for bit (ADR-0007) — a "nicer" rounding
+/// here would be a permanent 1-LSB diff against every interoperable decoder. Accumulation is
+/// `i64` so hostile out-of-range samples saturate at the clamp instead of overflowing.
+pub fn rfx_ycbcr_to_rgba(y: &[i16], cb: &[i16], cr: &[i16], out: &mut [u8]) {
+    const PRECISION: i64 = 1 << 16;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "spec constants scaled to 16-bit fixed point; exact f32 product fits i64"
+    )]
+    const CR_R: i64 = (1.402_525_f32 * PRECISION as f32) as i64;
+    #[expect(clippy::cast_possible_truncation, reason = "as above")]
+    const CB_G: i64 = (0.343_730_f32 * PRECISION as f32) as i64;
+    #[expect(clippy::cast_possible_truncation, reason = "as above")]
+    const CR_G: i64 = (0.714_401_f32 * PRECISION as f32) as i64;
+    #[expect(clippy::cast_possible_truncation, reason = "as above")]
+    const CB_B: i64 = (1.769_905_f32 * PRECISION as f32) as i64;
+
+    debug_assert_eq!(y.len(), cb.len());
+    debug_assert_eq!(y.len(), cr.len());
+    debug_assert_eq!(out.len(), y.len() * 4);
+
+    // The clamp to 0..=255 makes the cast lossless, and clippy knows it.
+    fn clamp8(v: i64) -> u8 {
+        (v >> 21).clamp(0, 255) as u8
+    }
+
+    for (((&y, &cb), &cr), px) in y
+        .iter()
+        .zip(cb.iter())
+        .zip(cr.iter())
+        .zip(out.chunks_exact_mut(4))
+    {
+        let yy = (i64::from(y) + 4096) * PRECISION;
+        px[0] = clamp8(yy + CR_R * i64::from(cr));
+        px[1] = clamp8(yy - CR_G * i64::from(cr) - CB_G * i64::from(cb));
+        px[2] = clamp8(yy + CB_B * i64::from(cb));
+        px[3] = 255;
+    }
+}
+
 /// Widen a 5-bit channel to 8 bits, replicating the high bits into the low ones so full
 /// intensity maps to 255 (not 248).
 fn scale5(c: u8) -> u8 {
