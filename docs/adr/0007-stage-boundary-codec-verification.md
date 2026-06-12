@@ -1,6 +1,6 @@
 # 0007 — Stage-boundary differential verification for codecs without a high-level oracle
 
-- Status: Accepted — governs #58 (not yet implemented)
+- Status: Accepted (first implemented in PR #81 / issue #58; amended same day — see Consequences)
 - Date: 2026-06-12
 
 ## Context
@@ -44,7 +44,7 @@ The oracle crates remain **dev-dependencies only** (ADR-0003); nothing here adds
 - **ADR-0003's bit-exactness guarantee is preserved for oracle-less codecs.** The end-to-end byte-diff is replaced by (A)+(B), which together are strictly stronger at localizing the math bug ADR-0003 targets.
 - **This is the standing pattern for the RemoteFX family.** Progressive and NSCodec face the same "primitives but no high-level decoder" situation; they follow this ADR rather than re-deriving a strategy. The reusable pure-math stages a self-owned RemoteFX decoder factors out (entropy / dequant / inverse transform, plus YCbCr→RGB in the shared color seam) are the same units the composed reference and the future Progressive rewrite consume.
 - **Synthetic-only verification is an explicit ceiling for codecs the VM never emits.** Where no real-server bitstream can be captured (CAVIDEO today), the acceptance bar is the synthetic oracle and that limit is stated in the issue, not silently skipped. If such a server is later found, a real-VM smoke test is added then.
-- **The harness trusts the oracle's encoder to produce spec-valid streams.** Acceptable: the encoder is the same vetted crate family that supplies the decode primitives, and (A) independently checks the decode math regardless of how the bytes were produced.
+- **The harness trusts the oracle's encoder to produce spec-valid streams** — *amended 2026-06-12 (PR #81):* this premise failed on first contact. `ironrdp-graphics` 0.8's RLGR1 encoder adapts `kp` by `UP_GR` where MS-RDPRFX 3.1.8.1.7 (and FreeRDP's encoder *and* decoder, and the oracle's own decoder) use `UQ_GR`, so its RLGR1 streams desync every spec-correct decoder — including its own. The fallback that keeps point 3's *intent*: the forward transforms stay the oracle's, the entropy stage is a harness-local spec-correct RLGR encoder whose faithfulness is proven with the **oracle's decoder as the judge** (`harness_encoder_is_faithful_by_the_oracles_own_decoder`) — the input factory stays externally validated, not self-referential. A canary (`oracle_rlgr1_encoder_defect_still_present`) pins the upstream defect and fails loudly when an oracle upgrade fixes it, signalling the harness can be simplified back to the encoder-trusting form (the #56 pattern, mirrored to the encoder side).
 
 ## Alternatives considered
 
