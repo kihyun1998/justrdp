@@ -207,6 +207,28 @@ fn decode_rle_plane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property. `PlanarError`'s contract says
+        // "malformed input is always a typed error, never a panic"; this asserts that contract
+        // across the whole input space, not just the hand-picked vectors below. The planar `src`
+        // is the unbounded, attacker-controlled blob (header byte + plane data), so it is fully
+        // arbitrary; width/height are bounded because they arrive from fixed u16 `TS_BITMAP_DATA`
+        // header fields, never the stream. Reaching the end without unwinding IS the assertion —
+        // proptest fails (and shrinks to a minimal counterexample) on any panic / arithmetic
+        // overflow / OOB. This is not hypothetical: FreeRDP's RDP6 planar decoder took an OOB
+        // read here (CVE-2024-32458, `planar_skip_plane_rle`).
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decompress_never_panics_on_arbitrary_input(
+            width in 0usize..=64,
+            height in 0usize..=64,
+            src in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decompress(&src, width, height);
+        }
+    }
 
     #[test]
     fn raw_argb_planes_reassemble_to_bgr() {

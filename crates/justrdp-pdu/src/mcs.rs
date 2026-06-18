@@ -381,6 +381,23 @@ pub fn encode_disconnect_provider_ultimatum(reason: u8) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
+        // parser. `decode_connect_response` parses the BER-encoded MCS Connect-Response the server
+        // sends, including the nested GCC blocks, every length server-supplied — so the whole
+        // `body` is the unbounded, attacker-controlled input. Malformed bytes must surface as a
+        // typed `DecodeError`, never a panic / overflow / OOB. Reaching the end without unwinding
+        // IS the assertion; proptest shrinks any failure to a minimal counterexample.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_connect_response_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decode_connect_response(&body);
+        }
+    }
 
     #[test]
     fn disconnect_provider_ultimatum_round_trips() {

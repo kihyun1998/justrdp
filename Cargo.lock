@@ -1230,6 +1230,7 @@ name = "justrdp-pdu"
 version = "0.1.0"
 dependencies = [
  "ironrdp-pdu",
+ "proptest",
 ]
 
 [[package]]

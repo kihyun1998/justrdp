@@ -439,6 +439,26 @@ impl LicenseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
+        // parser. `ServerLicenseRequest::decode` is the deepest license parse: it walks the
+        // server's blobs and, through them, the embedded `ServerCertificate` and proprietary RSA
+        // modulus (a length-driven, OOB-prone path) — so the cursor's whole `data` is the
+        // unbounded, attacker-controlled input and this property covers those nested parsers too.
+        // Malformed bytes must surface as a typed `DecodeError`, never a panic / overflow / OOB.
+        // Reaching the end without unwinding IS the assertion; proptest shrinks any failure to a
+        // minimal counterexample.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn server_license_request_decode_never_panics_on_arbitrary_input(
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&data, "proptest license-request");
+            let _ = ServerLicenseRequest::decode(&mut cur);
+        }
+    }
 
     /// Build a proprietary certificate blob around a tiny RSA key (64-bit modulus).
     fn proprietary_cert(modulus_be: &[u8], exponent: u32) -> Vec<u8> {

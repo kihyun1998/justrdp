@@ -378,6 +378,8 @@ mod tests {
         // actually exercised (not just the UnsupportedBitsPerPixel early-out), with arbitrary
         // values mixed in. Reaching the end without unwinding IS the assertion — proptest fails
         // (and shrinks to a minimal counterexample) on any panic / arithmetic overflow / OOB.
+        // This is not hypothetical: FreeRDP's interleaved decoder took an OOB read here
+        // (CVE-2024-32460, `interleaved_decompress`).
         #![proptest_config(ProptestConfig::with_cases(2048))]
         #[test]
         fn decompress_never_panics_on_arbitrary_input(

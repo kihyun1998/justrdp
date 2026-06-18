@@ -10,3 +10,8 @@ repository.workspace = true
 
 [dev-dependencies]
 ironrdp-pdu = "0.8.0"
+# Property-based robustness tests for the server-controlled PDU parsers (ADR-0008, issue #97):
+# "decode never panics on arbitrary bytes". The differential oracle only checks correctness on
+# hand-written valid streams; proptest stresses the malformed/adversarial input space. Dev-only —
+# the crate itself stays zero-dependency (ADR-0002).
+proptest.workspace = true

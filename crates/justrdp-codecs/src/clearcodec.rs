@@ -855,6 +855,29 @@ fn cast_usize(v: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property. `ClearError`'s contract is the
+        // same as the other codecs': malformed input is always a typed error, never a panic. The
+        // ClearCodec `data` is the unbounded, attacker-controlled blob (flags + glyph/band/subcodec
+        // structure, cache indices), so it is fully arbitrary; width/height are bounded because they
+        // arrive from fixed u16 EGFX wire fields, never the stream. A fresh decoder per case keeps
+        // each run independent of cache state. Reaching the end without unwinding IS the assertion —
+        // proptest fails (and shrinks to a minimal counterexample) on any panic / arithmetic
+        // overflow / OOB — the class that produced repeated ClearCodec OOB CVEs in FreeRDP
+        // (CVE-2020-11040 in `clear_decompress_subcode_rlex`, and later `clear_decompress_bands_data`
+        // / `residual_data` / glyphData advisories through 3.21.0).
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_never_panics_on_arbitrary_input(
+            width in 0u16..=64,
+            height in 0u16..=64,
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ClearDecoder::new().decode(&data, width, height);
+        }
+    }
 
     /// Differential round-trip: encode with the `ironrdp-graphics` oracle's ClearCodec encoder,
     /// decode with the self-owned decoder, and require the pixels back. Exercises the

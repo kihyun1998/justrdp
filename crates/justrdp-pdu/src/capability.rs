@@ -656,6 +656,25 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
+        // parser. `DemandActive::decode` parses the server's TS_DEMAND_ACTIVE_PDU, walking an
+        // arbitrary list of capability sets (each set's length server-supplied), so the cursor's
+        // whole `data` is the unbounded, attacker-controlled input — this one property covers the
+        // per-set `CapabilitySet::decode` paths transitively. Malformed bytes must surface as a
+        // typed `DecodeError`, never a panic / overflow / OOB. Reaching the end without unwinding
+        // IS the assertion; proptest shrinks any failure to a minimal counterexample.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn demand_active_decode_never_panics_on_arbitrary_input(
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&data, "proptest demand-active");
+            let _ = DemandActive::decode(&mut cur);
+        }
+    }
 
     fn sample_core() -> crate::gcc::ClientCoreData {
         crate::gcc::ClientCoreData {

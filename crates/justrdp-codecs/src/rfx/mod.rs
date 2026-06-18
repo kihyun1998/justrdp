@@ -233,6 +233,28 @@ fn blit_tile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property. `RfxError`'s contract says
+        // malformed input is always a typed error, never a panic — and `decode_to_rgba` is the
+        // top-level WTS1 entry, so this one property covers the whole inverse pipeline (TS_RFX
+        // block parse → RLGR entropy → LL3 delta → dequant → inverse DWT → ICT) from raw bytes.
+        // `data` is the unbounded, attacker-controlled blob, so it is fully arbitrary; width/height
+        // are bounded because they arrive from fixed u16 destination-rect fields, never the stream.
+        // A fresh decoder per case keeps each run independent of the persisted video-mode verdict.
+        // Reaching the end without unwinding IS the assertion — proptest fails (and shrinks to a
+        // minimal counterexample) on any panic / arithmetic overflow / OOB.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_to_rgba_never_panics_on_arbitrary_input(
+            width in 0u16..=128,
+            height in 0u16..=128,
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = RemoteFx::new().decode_to_rgba(&data, width, height);
+        }
+    }
 
     /// Build a tiles-only frame (no context — the tileset carries everything a frame
     /// needs): one region of `rects` plus `tiles`, each tile's three components `comp`.

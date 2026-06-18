@@ -508,6 +508,23 @@ pub fn wrap_uncompressed(blob: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
+        // parser. `decode_all` walks an arbitrary number of RDPGFX_* PDU blocks out of one EGFX
+        // payload, every length/field server-supplied, so the whole `blob` is the unbounded,
+        // attacker-controlled input. Malformed bytes must surface as a typed `DecodeError`, never
+        // a panic / arithmetic overflow / OOB. Reaching the end without unwinding IS the assertion;
+        // proptest shrinks any failure to a minimal counterexample.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_all_never_panics_on_arbitrary_input(
+            blob in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decode_all(&blob);
+        }
+    }
 
     fn pdu(cmd_id: u16, body: &[u8]) -> Vec<u8> {
         let mut out = header(cmd_id, body.len());

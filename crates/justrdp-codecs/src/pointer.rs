@@ -163,6 +163,33 @@ fn xor_pixel(row: &[u8], col: usize, xor_bpp: u16, palette: &Palette) -> [u8; 4]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property. `PointerError`'s contract is
+        // the codecs' shared one: malformed input is always a typed error, never a panic. Both
+        // masks are the unbounded, attacker-controlled blobs (their lengths must match the
+        // stride × height the header implies, but nothing stops a server from lying), so they are
+        // fully arbitrary; width/height/xor_bpp are bounded because they arrive from fixed u16
+        // `TS_*POINTERATTRIBUTE` header fields. xor_bpp is biased toward the five real depths so
+        // the per-bpp pixel paths are actually exercised (not just the UnsupportedBpp early-out),
+        // with arbitrary values mixed in. The palette is the fixed session default — pointer
+        // shapes carry none of their own. Reaching the end without unwinding IS the assertion:
+        // proptest fails (and shrinks to a minimal counterexample) on any panic / OOB.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_pointer_never_panics_on_arbitrary_input(
+            width in 0u16..=64,
+            height in 0u16..=64,
+            xor_bpp in prop_oneof![
+                Just(1u16), Just(8), Just(16), Just(24), Just(32), any::<u16>(),
+            ],
+            xor_mask in proptest::collection::vec(any::<u8>(), 0..=512),
+            and_mask in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decode_pointer(width, height, xor_bpp, &xor_mask, &and_mask, &Palette::default());
+        }
+    }
 
     #[test]
     fn monochrome_cursor_decodes_all_four_mask_combinations() {

@@ -145,6 +145,23 @@ pub fn encode_pdu(updates: &[(u8, u8, &[u8])]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
+        // parser. `decode_updates` splits a fast-path output frame into its update PDUs, every
+        // length server-supplied, so the whole `frame` is the unbounded, attacker-controlled input.
+        // Malformed bytes must surface as a typed `DecodeError`, never a panic / overflow / OOB.
+        // Reaching the end without unwinding IS the assertion; proptest shrinks any failure to a
+        // minimal counterexample.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_updates_never_panics_on_arbitrary_input(
+            frame in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decode_updates(&frame);
+        }
+    }
 
     #[test]
     fn demux_distinguishes_tpkt_from_fastpath() {
