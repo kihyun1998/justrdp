@@ -36,7 +36,7 @@ A `fuzz/` workspace member with one libFuzzer target per highest-risk untrusted-
 - **Hangs.** `proptest` has no per-case timeout; an infinite loop hangs the test run rather than failing it. libFuzzer's timeout turns a hang into a reportable crash.
 - **Deeper paths.** Coverage feedback mutates toward unexplored branches, reaching states random generation rarely hits.
 
-The fuzz lane is tracked and built separately (issue #99); this ADR fixes the decision that fuzzing **belongs in CI, not local dev**, and why the two lanes are not redundant. Any CI action added for it honors the supply-chain gate ([ADR-0006](0006-ci-action-supply-chain-gate.md)): SHA-pinned, least-privilege.
+The fuzz lane is tracked and built separately (issue #99); this ADR fixes the decision that fuzzing **belongs in CI, not local dev**, and why the two lanes are not redundant. Any CI action added for it should be SHA-pinned and least-privilege.
 
 ### 3. The standing rule
 
