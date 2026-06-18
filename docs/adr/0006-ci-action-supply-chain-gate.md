@@ -48,7 +48,7 @@ supply-chain:
   runs-on: ubuntu-latest
   steps:
     - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-    - uses: kihyun1998/just-shield@83d4a4aa7779a567b499958832e6f16fbe8d04ee # v0.2.1
+    - uses: kihyun1998/just-shield@bfe605c359607bddb3fcbc04ee568e0ff4f60bf3 # v0.3.0
       with:
         strict: true
 ```
@@ -64,7 +64,7 @@ just-shield inspects every workflow in the repo and fails the build when an acti
 
 ### Trade-offs accepted
 
-- **just-shield is self-authored and young (v0.2.1).** Gating CI on the maintainer's own tooling is a dependency in its own right. Accepted because (a) it runs read-only — it inspects YAML and reports, it does not mutate the repo; (b) it is SHA-pinned like everything else; and (c) it is replaceable — the checks it performs (SHA-pinning, permissions, compromised-version lists) are also offered by drop-in tools such as `zizmor` and StepSecurity's Harden-Runner, so a stall in just-shield does not strand the project.
+- **just-shield is self-authored and young (v0.3.0).** Gating CI on the maintainer's own tooling is a dependency in its own right. Accepted because (a) it runs read-only — it inspects YAML and reports, it does not mutate the repo; (b) it is SHA-pinned like everything else; and (c) it is replaceable — the checks it performs (SHA-pinning, permissions, compromised-version lists) are also offered by drop-in tools such as `zizmor` and StepSecurity's Harden-Runner, so a stall in just-shield does not strand the project.
 - **SHA pins are less readable than tags.** Mitigated by the mandatory `# vX.Y.Z` trailing comment, which carries the human-meaningful version alongside the immutable reference.
 - **Updating an action becomes a deliberate SHA bump** rather than an automatic tag float. This is the point — visibility is the feature — and Dependabot automates the mechanical part.
 
