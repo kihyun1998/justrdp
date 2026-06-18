@@ -51,6 +51,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - uses: kihyun1998/just-shield@066f5f60ce9611e71b86043668a763f0e84fdab9 # v0.1.3
+      - uses: kihyun1998/just-shield@83d4a4aa7779a567b499958832e6f16fbe8d04ee # v0.2.1
         with:
           strict: true
