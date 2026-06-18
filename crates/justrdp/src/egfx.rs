@@ -164,6 +164,12 @@ pub(crate) struct GraphicsProcessor {
     surfaces: Vec<Surface>,
     cache: std::collections::HashMap<u16, CachedBitmap>,
     cache_bytes: usize,
+    /// The live Progressive codec context of each surface (surface_id → codec_context_id).
+    /// The bootstrap oracle keys contexts by id alone with no cap and frees them only on an
+    /// explicit DeleteEncodingContext; binding each context to its surface here — FreeRDP's
+    /// model — lets DeleteSurface/ResetGraphics free them and caps a live surface to one
+    /// context, closing the unbounded-growth leak (issue #83).
+    progressive_contexts: std::collections::BTreeMap<u16, u32>,
     confirmed_version: Option<u32>,
     frames_decoded: u32,
     in_frame: bool,
@@ -179,6 +185,7 @@ impl Default for GraphicsProcessor {
             surfaces: Vec::new(),
             cache: std::collections::HashMap::new(),
             cache_bytes: 0,
+            progressive_contexts: std::collections::BTreeMap::new(),
             confirmed_version: None,
             frames_decoded: 0,
             in_frame: false,
@@ -193,6 +200,16 @@ fn invalid(field: &'static str, reason: &'static str) -> DecodeError {
 impl GraphicsProcessor {
     fn surface_mut(&mut self, id: u16) -> Option<&mut Surface> {
         self.surfaces.iter_mut().find(|s| s.id == id)
+    }
+
+    /// Remove a surface and free the Progressive codec context bound to it (#83). Used by both
+    /// DeleteSurface and the CreateSurface replace path — a server that recreates a surface id
+    /// (resize/reconnect) must not strand the old surface's context in the id-keyed oracle.
+    fn remove_surface(&mut self, surface_id: u16) {
+        if let Some(ctx) = self.progressive_contexts.remove(&surface_id) {
+            self.progressive.delete_context(ctx);
+        }
+        self.surfaces.retain(|s| s.id != surface_id);
     }
 
     fn total_surface_bytes(&self) -> usize {
@@ -293,6 +310,11 @@ impl GraphicsProcessor {
             }
             EgfxPdu::ResetGraphics { width, height } => {
                 tracing::debug!(target: "rdp_egfx", width, height, "ResetGraphics");
+                // A reset invalidates all graphics state: drop every Progressive context so it
+                // cannot survive into the new layout (issue #83). Surfaces are left to the
+                // server's explicit Create/Delete, as before.
+                self.progressive.reset();
+                self.progressive_contexts.clear();
                 let width = u16::try_from(width).map_err(|_| {
                     invalid("RDPGFX_RESET_GRAPHICS_PDU", "output width exceeds u16")
                 })?;
@@ -314,7 +336,7 @@ impl GraphicsProcessor {
                         "surface dimensions out of bounds",
                     ));
                 }
-                self.surfaces.retain(|s| s.id != surface_id);
+                self.remove_surface(surface_id);
                 if self.total_surface_bytes() + Surface::bytes(width, height)
                     > MAX_TOTAL_SURFACE_BYTES
                 {
@@ -335,7 +357,10 @@ impl GraphicsProcessor {
             }
             EgfxPdu::DeleteSurface { surface_id } => {
                 tracing::debug!(target: "rdp_egfx", surface_id, "DeleteSurface");
-                self.surfaces.retain(|s| s.id != surface_id);
+                // Free the surface's Progressive context with it (issue #83): the oracle keys
+                // contexts by id, so without this the context outlives the surface and leaks
+                // across the delete/recreate cycles servers do on resize/reconnect.
+                self.remove_surface(surface_id);
             }
             EgfxPdu::MapSurfaceToOutput {
                 surface_id,
@@ -408,6 +433,21 @@ impl GraphicsProcessor {
                         ));
                     }
                 };
+                // One Progressive context per surface — FreeRDP keys by surfaceId, but the
+                // bootstrap oracle keys by codecContextId alone with no cap (issue #83). When a
+                // surface's stream moves to a new context id, free the old one so a single live
+                // surface cannot accumulate contexts without bound. Tracked on *reference* (not
+                // decode success) because the oracle creates the context lazily inside decode.
+                // Caveat: two surfaces sharing one id collide under id-only keying — the
+                // self-owned (surfaceId, contextId) decoder (ADR-0003 phase 2) retires both the
+                // caveat and this per-surface workaround.
+                if let Some(&prev) = self.progressive_contexts.get(&surface_id)
+                    && prev != codec_context_id
+                {
+                    self.progressive.delete_context(prev);
+                }
+                self.progressive_contexts
+                    .insert(surface_id, codec_context_id);
                 // Warn-and-skip on failure, like the WTS1 codecs: a bootstrap-decoder
                 // limitation must not kill the session (the tile state may desync until the
                 // next first-pass repaint, which servers send periodically).
@@ -439,6 +479,9 @@ impl GraphicsProcessor {
                 codec_context_id,
             } => {
                 self.progressive.delete_context(codec_context_id);
+                // Keep the per-surface tracking consistent with the explicit free.
+                self.progressive_contexts
+                    .retain(|_, &mut ctx| ctx != codec_context_id);
             }
             EgfxPdu::SolidFill {
                 surface_id,
@@ -1033,6 +1076,102 @@ mod tests {
             outputs.is_empty(),
             "unaddressable mapping must drop frames, got {outputs:?}"
         );
+    }
+
+    /// Feed one WireToSurface2 PDU (surface, codec, context id, raw codec data).
+    fn wts2(p: &mut GraphicsProcessor, surface_id: u16, codec_id: u16, ctx_id: u32, data: &[u8]) {
+        let mut body = Vec::new();
+        body.extend_from_slice(&surface_id.to_le_bytes());
+        body.extend_from_slice(&codec_id.to_le_bytes());
+        body.extend_from_slice(&ctx_id.to_le_bytes());
+        body.push(egfx::PIXEL_FORMAT_XRGB_8888);
+        body.extend_from_slice(data);
+        // Garbage Progressive payloads warn-and-skip (no frame), so no output is expected.
+        assert!(feed(p, egfx::CMDID_WIRE_TO_SURFACE_2, &body).is_empty());
+    }
+
+    fn delete_surface(p: &mut GraphicsProcessor, id: u16) {
+        feed(p, egfx::CMDID_DELETE_SURFACE, &id.to_le_bytes());
+    }
+
+    #[test]
+    fn delete_surface_frees_the_progressive_context() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        // The (surface, context) link is recorded on reference even though the garbage stream
+        // warn-skips on decode — that link is exactly what DeleteSurface must later free (#83).
+        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &[0xFF; 8]);
+        assert_eq!(p.progressive_contexts.get(&1), Some(&7));
+        assert_eq!(p.progressive.context_count(), 1);
+
+        delete_surface(&mut p, 1);
+        assert!(
+            p.progressive_contexts.is_empty(),
+            "DeleteSurface must drop the surface's context tracking"
+        );
+        assert_eq!(
+            p.progressive.context_count(),
+            0,
+            "DeleteSurface must free the oracle context — no leak across delete/recreate"
+        );
+    }
+
+    #[test]
+    fn reset_graphics_clears_contexts_but_keeps_surfaces() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        create_surface(&mut p, 2, 64, 64);
+        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &[0xFF; 8]);
+        wts2(&mut p, 2, egfx::CODECID_CAPROGRESSIVE, 8, &[0xFF; 8]);
+        assert_eq!(p.progressive.context_count(), 2);
+
+        let mut body = vec![0u8; 332];
+        body[0..4].copy_from_slice(&64u32.to_le_bytes());
+        body[4..8].copy_from_slice(&64u32.to_le_bytes());
+        feed(&mut p, egfx::CMDID_RESET_GRAPHICS, &body);
+
+        assert!(p.progressive_contexts.is_empty());
+        assert_eq!(p.progressive.context_count(), 0);
+        assert_eq!(
+            p.surfaces.len(),
+            2,
+            "ResetGraphics drops contexts, not surfaces"
+        );
+    }
+
+    #[test]
+    fn a_new_context_id_on_a_surface_evicts_the_previous() {
+        // The bootstrap oracle keys by context id, so a live surface that switches context id
+        // would otherwise accumulate contexts without bound (FreeRDP keys by surface and holds
+        // exactly one). Assert the collapse: one context per surface, the previous one freed.
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &[0xFF; 8]);
+        assert_eq!(p.progressive.context_count(), 1);
+
+        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 9, &[0xFF; 8]);
+        assert_eq!(p.progressive_contexts.get(&1), Some(&9));
+        assert_eq!(
+            p.progressive.context_count(),
+            1,
+            "switching context id must free the previous context, not accumulate it"
+        );
+    }
+
+    #[test]
+    fn recreating_a_surface_id_frees_the_old_context() {
+        // Servers recreate a surface id on resize/reconnect without a DeleteSurface; the old
+        // surface's Progressive context must be freed on the replace too, not stranded in the
+        // id-keyed oracle (#83).
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &[0xFF; 8]);
+        assert_eq!(p.progressive.context_count(), 1);
+
+        // CreateSurface with the same id replaces the surface — and frees its context.
+        create_surface(&mut p, 1, 128, 128);
+        assert!(p.progressive_contexts.is_empty());
+        assert_eq!(p.progressive.context_count(), 0);
     }
 
     #[test]
