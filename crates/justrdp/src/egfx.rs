@@ -158,6 +158,8 @@ struct CachedBitmap {
 /// The EGFX channel processor: transport codec state + the owned surface model.
 pub(crate) struct GraphicsProcessor {
     zgfx: Zgfx,
+    /// Reused zgfx output buffer — one allocation across messages (#86).
+    zgfx_blob: Vec<u8>,
     progressive: Progressive,
     clear: Clear,
     remotefx: RemoteFx,
@@ -179,6 +181,7 @@ impl Default for GraphicsProcessor {
     fn default() -> Self {
         Self {
             zgfx: Zgfx::new(),
+            zgfx_blob: Vec::new(),
             progressive: Progressive::new(),
             clear: Clear::new(),
             remotefx: RemoteFx::new(),
@@ -614,6 +617,19 @@ impl GraphicsProcessor {
         Ok(())
     }
 
+    /// Handle every EGFX PDU in one decompressed blob.
+    fn process_blob(&mut self, blob: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError> {
+        let mut outputs = Vec::new();
+        for pdu in egfx::decode_all(blob)? {
+            self.handle(pdu, &mut outputs)?;
+        }
+        if !self.in_frame {
+            // Draw ops outside a Start/End Frame bracket (spec-legal, rare): show them now.
+            self.flush_dirty(&mut outputs);
+        }
+        Ok(outputs)
+    }
+
     /// Emit the accumulated dirty regions of every output-mapped surface as frames.
     fn flush_dirty(&mut self, outputs: &mut Vec<ProcessorOutput>) {
         for surface in &mut self.surfaces {
@@ -686,19 +702,20 @@ impl DvcProcessor for GraphicsProcessor {
     }
 
     fn process(&mut self, message: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError> {
-        let blob = self.zgfx.decompress(message).map_err(|e| {
-            tracing::warn!(target: "rdp_egfx", error = %e, "zgfx decompression failed");
-            invalid("RDP_SEGMENTED_DATA", "zgfx decompression failed")
-        })?;
-        let mut outputs = Vec::new();
-        for pdu in egfx::decode_all(&blob)? {
-            self.handle(pdu, &mut outputs)?;
-        }
-        if !self.in_frame {
-            // Draw ops outside a Start/End Frame bracket (spec-legal, rare): show them now.
-            self.flush_dirty(&mut outputs);
-        }
-        Ok(outputs)
+        // The blob buffer is taken out of `self` (the PDU handlers need `&mut self` while
+        // the blob is borrowed) and put back after, so one allocation serves every message
+        // on the channel (#86).
+        let mut blob = core::mem::take(&mut self.zgfx_blob);
+        let result = self
+            .zgfx
+            .decompress_into(message, &mut blob)
+            .map_err(|e| {
+                tracing::warn!(target: "rdp_egfx", error = %e, "zgfx decompression failed");
+                invalid("RDP_SEGMENTED_DATA", "zgfx decompression failed")
+            })
+            .and_then(|()| self.process_blob(&blob));
+        self.zgfx_blob = blob;
+        result
     }
 
     fn close(&mut self) {

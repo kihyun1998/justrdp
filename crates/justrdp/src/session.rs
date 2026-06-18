@@ -236,29 +236,49 @@ impl SessionStateMachine {
     /// disambiguates (TPKT's version byte is `0x03`, a fast-path header has `action == 0`).
     pub fn process_bytes(&mut self, bytes: &[u8]) -> Result<Vec<SessionOutput>, SessionError> {
         self.inbox.extend_from_slice(bytes);
+        // Take the inbox so complete frames are processed as borrowed slices — one drain at
+        // the end instead of a per-frame allocate-and-shift (#86). The buffer must live
+        // outside `self` while the frame handlers (`&mut self`) run.
+        let mut inbox = core::mem::take(&mut self.inbox);
         let mut outputs = Vec::new();
-        while let Some(&first) = self.inbox.first() {
+        let mut consumed = 0;
+        let mut error = None;
+        while let Some(&first) = inbox.get(consumed) {
+            let rest = &inbox[consumed..];
             let result = if fastpath::is_fastpath(first) {
-                fastpath::frame_len(&self.inbox)
+                fastpath::frame_len(rest)
             } else {
-                tpkt::frame_len(&self.inbox)
+                tpkt::frame_len(rest)
             };
             let frame_len = match result {
                 Ok(n) => n,
                 Err(justrdp_pdu::DecodeError::NotEnoughBytes { .. }) => break,
-                Err(e) => return Err(SessionError::Decode(e)),
+                Err(e) => {
+                    error = Some(SessionError::Decode(e));
+                    break;
+                }
             };
-            if self.inbox.len() < frame_len {
+            if rest.len() < frame_len {
                 break;
             }
-            let frame: Vec<u8> = self.inbox.drain(..frame_len).collect();
-            if fastpath::is_fastpath(first) {
-                self.on_fastpath_pdu(&frame, &mut outputs)?;
+            let frame = &rest[..frame_len];
+            let handled = if fastpath::is_fastpath(first) {
+                self.on_fastpath_pdu(frame, &mut outputs)
             } else {
-                self.on_frame(&frame, &mut outputs)?;
+                self.on_frame(frame, &mut outputs)
+            };
+            if let Err(e) = handled {
+                error = Some(e);
+                break;
             }
+            consumed += frame_len;
         }
-        Ok(outputs)
+        inbox.drain(..consumed);
+        self.inbox = inbox;
+        match error {
+            Some(e) => Err(e),
+            None => Ok(outputs),
+        }
     }
 
     /// Handle one complete fast-path output PDU: reassemble fragmented updates, then route
@@ -1061,6 +1081,33 @@ mod tests {
         };
         assert_eq!(cached.rgba, [30, 20, 10, 200]);
         assert_eq!((cached.hotspot_x, cached.hotspot_y), (5, 4));
+    }
+
+    #[test]
+    fn frames_split_across_process_bytes_calls_reassemble() {
+        // The inbox contract (#86): a frame arriving in two chunks produces nothing on the
+        // first call and the full output on the second.
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let frame = bitmap_update_frame(0, 0, 4, 4, [9, 8, 7]);
+        let (a, b) = frame.split_at(5);
+        assert!(sm.process_bytes(a).unwrap().is_empty());
+        let outputs = sm.process_bytes(b).unwrap();
+        assert!(
+            matches!(outputs.as_slice(), [SessionOutput::Frame(_)]),
+            "expected the reassembled frame, got {outputs:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_frames_in_one_call_process_in_order() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut bytes = bitmap_update_frame(0, 0, 4, 4, [1, 2, 3]);
+        bytes.extend_from_slice(&bitmap_update_frame(4, 0, 4, 4, [4, 5, 6]));
+        let outputs = sm.process_bytes(&bytes).unwrap();
+        let [SessionOutput::Frame(first), SessionOutput::Frame(second)] = outputs.as_slice() else {
+            panic!("expected two frames, got {outputs:?}");
+        };
+        assert_eq!((first.x, second.x), (0, 4));
     }
 
     #[test]

@@ -45,13 +45,25 @@ impl Zgfx {
         }
     }
 
-    /// Decompress one RDP_SEGMENTED_DATA message (single or multipart) into the raw EGFX
-    /// PDU blob it carries.
+    /// Decompress one RDP_SEGMENTED_DATA message (single or multipart) into `output`, which
+    /// is cleared first. Callers reuse one buffer across messages, keeping the per-message
+    /// allocation off the hot path (#86).
+    pub fn decompress_into(
+        &mut self,
+        input: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<(), EgfxCodecError> {
+        output.clear();
+        self.inner
+            .decompress(input, output)
+            .map(|_| ())
+            .map_err(|e| EgfxCodecError::Zgfx(e.to_string()))
+    }
+
+    /// [`Self::decompress_into`] with a freshly allocated buffer per call.
     pub fn decompress(&mut self, input: &[u8]) -> Result<Vec<u8>, EgfxCodecError> {
         let mut output = Vec::new();
-        self.inner
-            .decompress(input, &mut output)
-            .map_err(|e| EgfxCodecError::Zgfx(e.to_string()))?;
+        self.decompress_into(input, &mut output)?;
         Ok(output)
     }
 }
@@ -174,6 +186,16 @@ mod tests {
                 compress_and_wrap_egfx(message, &mut compressor, CompressionMode::Always).unwrap();
             assert_eq!(z.decompress(&wire).unwrap(), message);
         }
+    }
+
+    #[test]
+    fn zgfx_decompress_into_clears_and_reuses_the_buffer() {
+        let mut z = Zgfx::new();
+        let mut buf = vec![0xAA; 7]; // stale content from a previous message
+        z.decompress_into(&[0xE0, 0x04, 1, 2], &mut buf).unwrap();
+        assert_eq!(buf, vec![1, 2]);
+        z.decompress_into(&[0xE0, 0x04, 3], &mut buf).unwrap();
+        assert_eq!(buf, vec![3]);
     }
 
     #[test]
