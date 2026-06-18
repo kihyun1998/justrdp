@@ -366,6 +366,17 @@ pub async fn connect_with_options(
     connect_inner(server.into(), config, credentials, on_stage, options).await
 }
 
+/// Apply the connect-time socket options to a freshly dialed session socket.
+///
+/// Disables Nagle (`TCP_NODELAY`): the session carries tiny interactive input PDUs (a fast-path
+/// input PDU is ~10-20 bytes), each written one `write_all` at a time. With Nagle on, such a small
+/// write can be held until the server's delayed ACK arrives (~40-200 ms), landing directly on
+/// perceived input latency. Interactive RDP clients (mstsc, FreeRDP) set `TCP_NODELAY` as standard
+/// practice. One call covers the whole connection — the TLS stream rides this same socket (#82).
+fn configure_session_socket(s: &TcpStream) -> io::Result<()> {
+    s.set_nodelay(true)
+}
+
 /// The monomorphic body of [`connect`], instrumented once the server identity is concrete.
 #[tracing::instrument(
     name = "connect",
@@ -403,6 +414,9 @@ async fn connect_inner(
                         TcpStream::connect((server.host.as_str(), server.port)),
                     )
                     .await?;
+                    // Disable Nagle before any frame rides this socket, so interactive input
+                    // writes are not held by Nagle + the server's delayed ACK (#82).
+                    configure_session_socket(&s)?;
                     tracing::debug!("tcp socket connected");
                     transport = Transport::Tcp(s);
                     queue.extend(sm.process(Event::Connected));
@@ -1176,6 +1190,30 @@ mod tests {
             let _ = tls.read(&mut buf).await; // read one byte of the first TSRequest, then drop → close
         });
         (addr, cert_der)
+    }
+
+    #[tokio::test]
+    async fn configure_session_socket_enables_tcp_nodelay() {
+        // The session socket carries tiny interactive input PDUs (~10-20 bytes). Nagle + the
+        // server's delayed ACK would hold such writes for ~40-200 ms, landing on input latency
+        // (issue #82). `configure_session_socket` is the connect-level seam that disables Nagle;
+        // assert the effect directly on a freshly dialed loopback socket.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s = TcpStream::connect(addr).await.unwrap();
+
+        // Precondition: tokio inherits the OS default, which is Nagle enabled (nodelay == false).
+        assert!(
+            !s.nodelay().unwrap(),
+            "precondition: a freshly dialed socket should have Nagle enabled (the bug #82 fixes)"
+        );
+
+        configure_session_socket(&s).unwrap();
+
+        assert!(
+            s.nodelay().unwrap(),
+            "configure_session_socket must set TCP_NODELAY on the session socket"
+        );
     }
 
     #[tokio::test]
