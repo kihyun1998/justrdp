@@ -366,6 +366,29 @@ fn decode_order(header: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property. `RleError`'s contract says
+        // "malformed input is always a typed error, never a panic"; this asserts that contract
+        // across the whole input space, not just the hand-picked vectors below. The compressed
+        // `src` is the unbounded, attacker-controlled blob, so it is fully arbitrary; width/height
+        // are bounded because they arrive from fixed u16 `TS_BITMAP_DATA` header fields, never the
+        // stream. bpp is biased toward the four real interleaved-RLE depths so decode paths are
+        // actually exercised (not just the UnsupportedBitsPerPixel early-out), with arbitrary
+        // values mixed in. Reaching the end without unwinding IS the assertion — proptest fails
+        // (and shrinks to a minimal counterexample) on any panic / arithmetic overflow / OOB.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decompress_never_panics_on_arbitrary_input(
+            bpp in prop_oneof![Just(8u16), Just(15u16), Just(16u16), Just(24u16), any::<u16>()],
+            width in 0usize..=64,
+            height in 0usize..=64,
+            src in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decompress(&src, width, height, bpp);
+        }
+    }
 
     #[test]
     fn color_run_and_bg_run_copy_above() {

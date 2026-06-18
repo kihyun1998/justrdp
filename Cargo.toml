@@ -46,6 +46,11 @@ tokio-util = { version = "0.7", default-features = false }
 # Self-signed certificates for CI tests (dev-dependency only): the mock TLS server's cert and the
 # SPKI-extraction property test both generate a throwaway cert at test time.
 rcgen = "0.14"
+# Robustness testing of the hand-rolled, untrusted-input parsers (ADR-0008, issue #97): property
+# tests assert "decode never panics on arbitrary bytes" and round-trip invariants across a wide
+# input space the hand-written differential-oracle vectors do not reach. Dev-dependency only; runs
+# on stable (unlike coverage-guided cargo-fuzz, which is a nightly CI-only lane — issue #99).
+proptest = "1"
 
 # ADR-0004 fork-bridge (issue #61): sspi 0.21.0's CredSspServer cannot complete a Negotiate-NTLM
 # handshake with its own CredSspClient (Devolutions/sspi-rs#687) — which blocks our loopback

@@ -31,3 +31,7 @@ ironrdp-graphics = "0.8"
 # Constructs the pointer-attribute inputs the ironrdp-graphics pointer oracle consumes
 # (issue #41 differential tests only).
 ironrdp-pdu = "0.8"
+# Property-based robustness tests for the untrusted-input codec decoders (ADR-0008, issue #97):
+# "decode never panics on arbitrary bytes". The differential oracle only checks correctness on
+# hand-written valid streams; proptest stresses the malformed/adversarial input space.
+proptest.workspace = true
