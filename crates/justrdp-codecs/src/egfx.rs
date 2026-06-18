@@ -8,6 +8,7 @@
 
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::zgfx;
+use std::collections::BTreeSet;
 
 /// Why an EGFX codec stage failed. Carries the bootstrap decoder's message — the typed
 /// distinctions that matter (which stage) are ours; the details are diagnostic.
@@ -76,6 +77,13 @@ pub struct ProgressiveTile {
 /// WireToSurface2 PDUs (first pass + upgrade passes refine the same coefficients).
 pub struct Progressive {
     inner: ProgressiveDecoder,
+    /// Codec-context ids this decoder has been asked to decode and not since freed — a
+    /// conservative superset of the oracle's live contexts. The bootstrap oracle keys contexts
+    /// by `codecContextId` alone, with **no cap** and no surface scoping, so the EGFX processor
+    /// must drive freeing explicitly (issue #83); this mirror lets it — and tests — observe the
+    /// live-context count. A parse error before the oracle creates its context leaves a harmless
+    /// phantom here that the next `delete_context`/`reset` clears.
+    contexts: BTreeSet<u32>,
 }
 
 impl Progressive {
@@ -83,6 +91,7 @@ impl Progressive {
     pub fn new() -> Self {
         Self {
             inner: ProgressiveDecoder::new(),
+            contexts: BTreeSet::new(),
         }
     }
 
@@ -94,6 +103,9 @@ impl Progressive {
         surface_height: u16,
         data: &[u8],
     ) -> Result<Vec<ProgressiveTile>, EgfxCodecError> {
+        // Track on reference: the oracle creates the context lazily inside `decode_bitmap`, so
+        // recording here (even when the decode later errors) keeps the count a safe superset.
+        self.contexts.insert(codec_context_id);
         let tiles = self
             .inner
             .decode_bitmap(codec_context_id, surface_width, surface_height, data)
@@ -108,9 +120,21 @@ impl Progressive {
             .collect())
     }
 
-    /// Free a codec context (`RDPGFX_CMDID_DELETEENCODINGCONTEXT`).
+    /// Free a codec context (`RDPGFX_CMDID_DELETEENCODINGCONTEXT`, or a per-surface eviction).
     pub fn delete_context(&mut self, codec_context_id: u32) {
+        self.contexts.remove(&codec_context_id);
         self.inner.delete_context(codec_context_id);
+    }
+
+    /// Drop every codec context (EGFX `ResetGraphics` / channel reset).
+    pub fn reset(&mut self) {
+        self.contexts.clear();
+        self.inner.reset();
+    }
+
+    /// The number of live codec contexts currently tracked.
+    pub fn context_count(&self) -> usize {
+        self.contexts.len()
     }
 }
 
@@ -123,6 +147,7 @@ impl Default for Progressive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn zgfx_unwraps_uncompressed_single_segments() {
@@ -167,5 +192,39 @@ mod tests {
             p.decode(1, 64, 64, &[0xFF; 16]),
             Err(EgfxCodecError::Progressive(_))
         ));
+    }
+
+    #[test]
+    fn delete_context_and_reset_track_the_live_count() {
+        // The count is the mirror the EGFX processor drives to avoid the unbounded-context
+        // leak (#83). Even garbage decodes are tracked (record-on-reference), so the lifecycle
+        // is observable without a valid Progressive stream.
+        let mut p = Progressive::new();
+        let _ = p.decode(7, 64, 64, &[0xFF; 16]);
+        let _ = p.decode(9, 64, 64, &[0xFF; 16]);
+        assert_eq!(p.context_count(), 2);
+        p.delete_context(7);
+        assert_eq!(p.context_count(), 1);
+        p.delete_context(123); // freeing an unknown id is a no-op, never underflows
+        assert_eq!(p.context_count(), 1);
+        p.reset();
+        assert_eq!(p.context_count(), 0);
+    }
+
+    proptest! {
+        // ADR-0008 / issue #97 — no-panic robustness for the Progressive decode path, the
+        // untrusted WireToSurface2 blob. Surface dims are bounded (they come from the fixed
+        // CreateSurface fields); the block stream is fully arbitrary.
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+        #[test]
+        fn progressive_decode_never_panics_on_arbitrary_input(
+            ctx in any::<u32>(),
+            w in 1u16..=256,
+            h in 1u16..=256,
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut p = Progressive::new();
+            let _ = p.decode(ctx, w, h, &data);
+        }
     }
 }
