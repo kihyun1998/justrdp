@@ -49,8 +49,9 @@ rcgen = "0.14"
 
 # ADR-0004 fork-bridge (issue #61): sspi 0.21.0's CredSspServer cannot complete a Negotiate-NTLM
 # handshake with its own CredSspClient (Devolutions/sspi-rs#687) — which blocks our loopback
-# full-CredSSP test. The fix is submitted upstream (Devolutions/sspi-rs#688); until it ships on
-# crates.io we ride the fork, pinned to the exact PR commit (the fork carries upstream-PR'd
-# commits ONLY). REMOVE this block and bump sspi when the fix is released (see issue #61).
+# full-CredSSP test. #687 is now fixed upstream by the maintainer's rework (Devolutions/sspi-rs#689,
+# merged) — our own #688 was closed in favor of it — but it has not yet shipped on crates.io. Until
+# it does we ride the fork at our CI branch tip (PR #691 head = upstream master incl. #689, plus our
+# CI/test gate). REMOVE this block and bump sspi when #689 is released on crates.io (see issue #61).
 [patch.crates-io]
-sspi = { git = "https://github.com/kihyun1998/sspi-rs", rev = "f8959ca" }
+sspi = { git = "https://github.com/kihyun1998/sspi-rs", rev = "96d055b52ce96090d78a150ddff4466e36c720ba" }
