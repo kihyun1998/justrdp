@@ -28,11 +28,13 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       # Use the runner's pre-installed rustup — no third-party toolchain action,
-      # matching the project's dependency discipline (ADR-0002).
-      - name: Rust toolchain (stable + rustfmt + clippy)
+      # matching the project's dependency discipline (ADR-0002). The Rust version
+      # is pinned in rust-toolchain.toml so a new release can't turn CI red on its
+      # own; bumping is a deliberate, reviewed change.
+      - name: Rust toolchain (pinned 1.96.0 + rustfmt + clippy)
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
+          rustup toolchain install 1.96.0 --no-self-update
+          rustup default 1.96.0
           rustup component add rustfmt clippy
           rustc --version && cargo --version
 
