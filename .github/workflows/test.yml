@@ -1,0 +1,38 @@
+# Build / format / lint / test gate for the workspace.
+#
+# Previously dropped (commit 2ca6c87) over a concern that SHA-pinning the workflow's actions would
+# be unmanageable to maintain. That concern is resolved: actions are pinned by `just-shield fix`
+# and kept current by the github-actions Dependabot ecosystem (ADR-0006), so the pins stay
+# immutable and up to date with no manual upkeep. Reinstated on that basis.
+#
+# Runs on the stable toolchain (no nightly needed) — the proptest robustness properties (ADR-0008)
+# ride in `cargo test --workspace` here; the nightly libFuzzer lane is separate (fuzz.yml).
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
