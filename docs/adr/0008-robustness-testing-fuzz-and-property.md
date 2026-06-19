@@ -1,6 +1,7 @@
 # 0008 — Robustness testing for untrusted-input parsers: property tests + fuzzing
 
 - Status: Accepted (issue #97; first property implemented for the RLE decoder — issue #98)
+- Amended: 2026-06-19 — #98 landed the no-panic property for **all** untrusted-input decoders (not just RLE), and #99 landed the `fuzz/` CI lane; the inline notes below are updated to the as-built state.
 - Date: 2026-06-18
 
 ## Context
@@ -36,7 +37,7 @@ A `fuzz/` workspace member with one libFuzzer target per highest-risk untrusted-
 - **Hangs.** `proptest` has no per-case timeout; an infinite loop hangs the test run rather than failing it. libFuzzer's timeout turns a hang into a reportable crash.
 - **Deeper paths.** Coverage feedback mutates toward unexplored branches, reaching states random generation rarely hits.
 
-The fuzz lane is tracked and built separately (issue #99); this ADR fixes the decision that fuzzing **belongs in CI, not local dev**, and why the two lanes are not redundant. Any CI action added for it should be SHA-pinned and least-privilege.
+This ADR fixes the decision that fuzzing **belongs in CI, not local dev**, and why the two lanes are not redundant. (Amended #99, landed: the `fuzz/` workspace member now carries one libFuzzer target per highest-risk decoder, run weekly on nightly Ubuntu. Its CI actions are SHA-pinned and least-privilege per [ADR-0006](0006-supply-chain-action-pinning.md), which formalizes the supply-chain requirement this sentence originally only gestured at.)
 
 ### 3. The standing rule
 
@@ -48,7 +49,7 @@ Adding a decoder for untrusted bytes obligates its no-panic property (and round-
 - **The stable lane is free to run.** Because the properties are ordinary `#[test]`s, they ship in the existing `cargo test --workspace` CI job with zero new infrastructure — the robustness net is on from the first property, before the heavier fuzz lane exists.
 - **`proptest`'s limits are explicit, and are exactly the fuzz lane's mandate.** Property tests catch panics/overflow/OOB and shrink, but not hangs and not coverage-directed depth. That gap is the *reason* fuzzing is deferred to CI rather than dropped — stated here so a future reader does not mistake "we have proptest" for "we have fuzzing."
 - **No runtime dependency added.** `proptest` is a dev-dependency; the fuzz crate is a non-published workspace member. The zero-runtime-dep boundary (ADR-0002) is untouched.
-- **First implementation: the RLE decoder.** `decompress_never_panics_on_arbitrary_input` (issue #98) is the tracer bullet establishing the pattern; remaining decoders (`planar`, `clearcodec`, `rfx/*`, `pointer`, and the server-controlled `justrdp-pdu` parsers) follow incrementally as they are touched, not in one sweep.
+- **Implemented across all decoders (issue #98, landed).** The RLE decoder's `decompress_never_panics_on_arbitrary_input` was the tracer bullet; the no-panic property now also covers `planar`, `clearcodec`, `rfx` and `pointer` in `justrdp-codecs`, and the server-controlled `justrdp-pdu` parsers (`egfx`, `fastpath`, `capability`, `license`, `mcs`). The `fuzz/` lane (issue #99) carries libFuzzer targets for the same entry points. The three codec properties whose class FreeRDP has a real OOB CVE for are grounded in it (`rle` → CVE-2024-32460, `planar` → CVE-2024-32458, `clearcodec` → CVE-2020-11040).
 
 ## Alternatives considered
 
