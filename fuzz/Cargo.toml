@@ -1,0 +1,94 @@
+# Coverage-guided cargo-fuzz / libFuzzer targets for the untrusted-input decoders (ADR-0008,
+# issue #99). This is the CI-only counterpart to the in-crate `proptest` no-panic properties:
+# libFuzzer's `-timeout` catches hangs (infinite loops) that proptest cannot, and coverage
+# guidance reaches deeper paths than random bytes. Requires the nightly toolchain and is
+# effectively Linux-only — it never runs on the maintainer's stable Windows MSVC host.
+#
+# Standalone workspace (the empty `[workspace]` below): cargo-fuzz convention, detaches this
+# crate from the parent justrdp workspace so its nightly/libFuzzer build never touches the
+# normal `cargo build`.
+[package]
+name = "justrdp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+# The decoders under test, by path — the same public entry points the no-panic proptests drive.
+justrdp-codecs = { path = "../crates/justrdp-codecs" }
+justrdp-pdu = { path = "../crates/justrdp-pdu" }
+
+[workspace]
+
+# Keep some debug info in the fuzz build so crash backtraces are legible.
+[profile.release]
+debug = 1
+
+# One libFuzzer binary per decoder. `test`/`doc`/`bench` are off — these are fuzz entry points,
+# not test or benchmark targets.
+[[bin]]
+name = "rle"
+path = "fuzz_targets/rle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "planar"
+path = "fuzz_targets/planar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clearcodec"
+path = "fuzz_targets/clearcodec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pointer"
+path = "fuzz_targets/pointer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rfx"
+path = "fuzz_targets/rfx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egfx"
+path = "fuzz_targets/egfx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fastpath"
+path = "fuzz_targets/fastpath.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capability"
+path = "fuzz_targets/capability.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "license"
+path = "fuzz_targets/license.rs"
+test = false
+doc = false
+bench = false

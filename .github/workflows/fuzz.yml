@@ -1,0 +1,75 @@
+# Coverage-guided fuzzing of the untrusted-input decoders (ADR-0008, issue #99).
+#
+# CI-only by necessity: libFuzzer needs the nightly toolchain and is effectively unsupported on
+# the maintainer's stable Windows MSVC host, so this lane lives on Ubuntu and never runs locally.
+# It is the counterpart to the in-crate `proptest` no-panic properties — libFuzzer's `-timeout`
+# catches hangs that proptest cannot, and coverage guidance reaches deeper paths.
+#
+# Non-blocking: this runs on a weekly schedule (and on demand), never as a per-PR merge gate.
+name: fuzz
+
+on:
+  schedule:
+    # Weekly, Sunday 04:17 UTC.
+    - cron: "17 4 * * 0"
+  workflow_dispatch:
+
+# Least privilege (just-shield R7): the fuzz job only reads the repo.
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      # One target's crash must not cancel the others — each is an independent safety net.
+      fail-fast: false
+      matrix:
+        target:
+          - rle
+          - planar
+          - clearcodec
+          - pointer
+          - rfx
+          - egfx
+          - fastpath
+          - capability
+          - license
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install nightly toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+
+      # Restore this target's corpus from the most recent run (prefix match); the run-id-keyed
+      # save below means each run writes a fresh immutable cache entry.
+      - name: Restore corpus
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      # -max_total_time bounds the run; -timeout=10 fails an input that runs >10s, which is how
+      # hangs (infinite loops) are caught — the gap proptest leaves open.
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=10
+
+      - name: Save corpus
+        if: ${{ always() && !cancelled() }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      # A crash leaves a reproducer under fuzz/artifacts/<target>/; upload it and let the job fail.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
