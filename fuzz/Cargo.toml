@@ -92,3 +92,10 @@ path = "fuzz_targets/license.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "nscodec"
+path = "fuzz_targets/nscodec.rs"
+test = false
+doc = false
+bench = false
