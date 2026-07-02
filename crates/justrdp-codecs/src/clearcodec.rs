@@ -481,7 +481,11 @@ impl ClearDecoder {
                 let Some(vbar) = self.vbar_storage.get(slot).and_then(|s| s.as_ref()) else {
                     continue;
                 };
-                let rows = vbar.pixels.len() / 3;
+                // Clamp to the current band: a full V-bar CACHE_HIT (0x8000) reuses a stored column
+                // verbatim, which may have been built for a taller band. FreeRDP `clear.c` clamps at
+                // composite with `if (count > nHeight) count = nHeight`, so a tall column never
+                // bleeds below a shorter band (#116).
+                let rows = (vbar.pixels.len() / 3).min(usize::from(band_height));
                 for row in 0..rows {
                     let y = usize::from(y_start) + row;
                     let dst = (y * w + x) * 4;
@@ -663,12 +667,17 @@ fn reconstruct_full_vbar(
 ) -> FullVBar {
     let height = usize::from(band_height);
     let mut pixels = Vec::with_capacity(height * 3);
-    for _ in 0..usize::from(y_on) {
+    // Every fill is clamped to `band_height`: a SHORT_VBAR_CACHE_HIT can reuse a taller band's
+    // short bar under a fresh `y_on`, so `y_on + short_pixels` may exceed the current band. FreeRDP
+    // `clear.c` vBarUpdate clamps each of the three fills with `if ((y + count) > vBarPixelCount)
+    // count = vBarPixelCount - y`; the assembled column is always exactly `band_height` rows (#116).
+    let top = usize::from(y_on).min(height);
+    for _ in 0..top {
         pixels.extend_from_slice(&[bg_blue, bg_green, bg_red]);
     }
-    pixels.extend_from_slice(short_pixels);
-    let bottom_start = usize::from(y_on) + short_pixels.len() / 3;
-    for _ in bottom_start..height {
+    let copy_rows = (short_pixels.len() / 3).min(height - top);
+    pixels.extend_from_slice(&short_pixels[..copy_rows * 3]);
+    for _ in (top + copy_rows)..height {
         pixels.extend_from_slice(&[bg_blue, bg_green, bg_red]);
     }
     FullVBar { pixels }
@@ -919,5 +928,120 @@ mod tests {
         let out = ClearDecoder::new().decode(&stream, 1, 52).unwrap();
         // Row 5 (first pixel of the short v-bar) is blue 0xFF,0x00,0x00.
         assert_eq!(&out[5 * 4..5 * 4 + 3], &[0xFF, 0x00, 0x00]);
+    }
+
+    /// #116 — a V-bar cache hit can carry a *taller* band's column into a *shorter* band. The
+    /// reconstruction must clamp the assembled column to the current band height (FreeRDP
+    /// `clear.c` vBarUpdate clamps every fill to `vBarPixelCount`); it must never be longer.
+    /// Expectation is hand-derived from the FreeRDP semantics — NOT the `ironrdp-graphics`
+    /// oracle, which shares the same un-clamped `reconstruct_full_vbar` (see #118).
+    #[test]
+    fn reconstruct_full_vbar_clamps_to_band_height() {
+        // 40 rows of short pixels, but the current band is only 10 tall, with y_on = 5.
+        let short: Vec<u8> = std::iter::repeat_n([0x11u8, 0x22, 0x33], 40)
+            .flatten()
+            .collect();
+        let full = reconstruct_full_vbar(5, &short, 10, 0, 0, 0);
+        // Exactly band_height rows — not the buggy 5 + 40 = 45.
+        assert_eq!(full.pixels.len(), 10 * 3);
+        // Rows 0..5 background, rows 5..10 the first 5 short pixels (the surplus is dropped).
+        assert_eq!(&full.pixels[0..5 * 3], &[0u8; 15]);
+        assert_eq!(
+            &full.pixels[5 * 3..10 * 3],
+            &[0x11, 0x22, 0x33].repeat(5)[..]
+        );
+    }
+
+    /// #116 — a full V-bar CACHE_HIT (0x8000) reuses a stored column verbatim; if that column was
+    /// built for a taller band it must not bleed below a shorter band. FreeRDP clamps at composite
+    /// (`clear.c`: `if (count > nHeight) count = nHeight`). Oracle-independent bitstream.
+    #[test]
+    fn full_vbar_cache_hit_does_not_bleed_below_a_shorter_band() {
+        let mut bands = Vec::new();
+        // Band 1: 1×20 (y 0..=19) — a SHORT_VBAR_CACHE_MISS stores a 20-row column at full slot 0.
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_start
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_end
+        bands.extend_from_slice(&0u16.to_le_bytes()); // y_start
+        bands.extend_from_slice(&19u16.to_le_bytes()); // y_end → height 20
+        bands.extend_from_slice(&[0, 0, 0]); // bkg BGR
+        let miss: u16 = 20 << 8; // yOn=0, yOff=20 → 20 short pixels
+        bands.extend_from_slice(&miss.to_le_bytes());
+        for _ in 0..20 {
+            bands.extend_from_slice(&[0x11, 0x22, 0x33]);
+        }
+        // Band 2: 1×5 (y 100..=104) — a full V-bar CACHE_HIT on slot 0 (the 20-row column).
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_start
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_end
+        bands.extend_from_slice(&100u16.to_le_bytes()); // y_start
+        bands.extend_from_slice(&104u16.to_le_bytes()); // y_end → height 5
+        bands.extend_from_slice(&[0, 0, 0]); // bkg BGR
+        bands.extend_from_slice(&0x8000u16.to_le_bytes()); // full V-bar cache hit, index 0
+
+        let out = ClearDecoder::new()
+            .decode(&build_stream(&bands), 1, 120)
+            .unwrap();
+        // Band 2 itself (row 100) shows the column.
+        assert_eq!(&out[100 * 4..100 * 4 + 3], &[0x11, 0x22, 0x33]);
+        // Rows below band 2 (105..120) must stay background — the tall column must not bleed down.
+        for y in 105..120 {
+            assert_eq!(
+                &out[y * 4..y * 4 + 3],
+                &[0, 0, 0],
+                "row {y} bled below the band"
+            );
+        }
+    }
+
+    /// #116 headline scenario, end to end — a SHORT_VBAR_CACHE_HIT (0x4000) reuses a taller band's
+    /// short bar under a fresh `yOn` in a shorter band. The reconstructed column must be clamped to
+    /// the shorter band. Oracle-independent bitstream.
+    #[test]
+    fn short_vbar_cache_hit_clamps_to_the_shorter_band() {
+        let mut bands = Vec::new();
+        // Band 1: 1×20 — SHORT_VBAR_CACHE_MISS stores a 10-row short bar at short slot 0.
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_start
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_end
+        bands.extend_from_slice(&0u16.to_le_bytes()); // y_start
+        bands.extend_from_slice(&19u16.to_le_bytes()); // y_end → height 20
+        bands.extend_from_slice(&[0, 0, 0]); // bkg BGR
+        let miss: u16 = 10 << 8; // yOn=0, yOff=10 → 10 short pixels
+        bands.extend_from_slice(&miss.to_le_bytes());
+        for _ in 0..10 {
+            bands.extend_from_slice(&[0x44, 0x55, 0x66]);
+        }
+        // Band 2: 1×5 (y 100..=104) — SHORT_VBAR_CACHE_HIT on slot 0, fresh yOn = 2.
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_start
+        bands.extend_from_slice(&0u16.to_le_bytes()); // x_end
+        bands.extend_from_slice(&100u16.to_le_bytes()); // y_start
+        bands.extend_from_slice(&104u16.to_le_bytes()); // y_end → height 5
+        bands.extend_from_slice(&[0, 0, 0]); // bkg BGR
+        bands.extend_from_slice(&0x4000u16.to_le_bytes()); // short V-bar cache hit, index 0
+        bands.push(2); // yOn
+
+        let out = ClearDecoder::new()
+            .decode(&build_stream(&bands), 1, 120)
+            .unwrap();
+        // Within band 2: rows 100..102 background, rows 102..105 the short bar (clamped from 10→3).
+        assert_eq!(&out[100 * 4..100 * 4 + 3], &[0, 0, 0]);
+        assert_eq!(&out[102 * 4..102 * 4 + 3], &[0x44, 0x55, 0x66]);
+        assert_eq!(&out[104 * 4..104 * 4 + 3], &[0x44, 0x55, 0x66]);
+        // Below band 2 must stay background — no bleed.
+        for y in 105..120 {
+            assert_eq!(
+                &out[y * 4..y * 4 + 3],
+                &[0, 0, 0],
+                "row {y} bled below the band"
+            );
+        }
+    }
+
+    /// Wrap a bands-layer payload in the ClearCodec bitmap-stream header (no residual/subcodec).
+    fn build_stream(bands: &[u8]) -> Vec<u8> {
+        let mut stream = vec![0x00, 0x00]; // flags, seq
+        stream.extend_from_slice(&0u32.to_le_bytes()); // residualByteCount
+        stream.extend_from_slice(&u32::try_from(bands.len()).unwrap().to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // subcodecByteCount
+        stream.extend_from_slice(bands);
+        stream
     }
 }
