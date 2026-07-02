@@ -90,8 +90,9 @@ impl RemoteFx {
 
         let mut out: Option<Vec<u8>> = None;
         // The clip region in force for the current frame: `None` until a TS_RFX_REGION
-        // arrives (clip to the full rectangle), then that region's rects (an empty list
-        // legitimately paints nothing).
+        // arrives (clip to the full rectangle), then that region's rects. A region with
+        // numRects==0 means the *whole surface*, not an empty clip ([MS-RDPRFX] 2.2.2.3.3),
+        // so it is materialized as a single (0,0,width,height) rect below.
         let mut region: Option<Vec<RfxRect>> = None;
         // One scratch pair reused across every tile and component.
         let mut component = vec![0i16; COMPONENT_LEN];
@@ -108,7 +109,20 @@ impl RemoteFx {
                     }
                 }
                 RfxMessage::FrameBegin { .. } => region = None,
-                RfxMessage::Region(rects) => region = Some(rects.clone()),
+                RfxMessage::Region(rects) => {
+                    // numRects==0 means the full surface, not an empty clip: materialize the
+                    // (0,0,width,height) rect FreeRDP fabricates ([MS-RDPRFX] 2.2.2.3.3).
+                    region = Some(if rects.is_empty() {
+                        vec![RfxRect {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height,
+                        }]
+                    } else {
+                        rects.clone()
+                    });
+                }
                 RfxMessage::TileSet(tileset) => {
                     if self.video_mode {
                         return Err(RfxError::VideoMode);
@@ -380,6 +394,33 @@ mod tests {
         // And the decoded zero-spectrum pixel differs from raw black (Y=0 maps to 128-ish
         // luma via the +4096 level shift), proving the pipeline actually ran.
         assert_ne!(inside, &[0u8, 0, 0, 255][..]);
+    }
+
+    #[test]
+    fn an_empty_region_paints_the_full_surface() {
+        // TS_RFX_REGION with numRects==0 means the whole surface, not an empty clip
+        // ([MS-RDPRFX] 2.2.2.3.3; FreeRDP rfx.c: numRects<1 => rect (0,0,width,height)).
+        // A single all-zero tile must therefore paint every pixel through the ICT — being
+        // masked out would reintroduce the black-region symptom the RemoteFX work removed.
+        let frame = stream(&[], &[(0, 0, vec![0x00; 8])]);
+        let mut decoder = RemoteFx::new();
+        let rgba = decoder
+            .decode_to_rgba(&frame, 64, 64)
+            .expect("valid stream")
+            .expect("a tileset paints");
+        assert_eq!(rgba.len(), 64 * 64 * 4);
+        // The decoded zero-spectrum value (not the opaque-black init) must appear — proving the
+        // tile painted rather than being clipped away by an empty region.
+        let decoded = &rgba[..4];
+        assert_ne!(
+            decoded,
+            &[0u8, 0, 0, 255][..],
+            "empty region painted nothing"
+        );
+        // A pixel deep inside the tile equals the decoded value — full-surface paint, not a
+        // partial/empty clip.
+        let deep = &rgba[(40 * 64 + 40) * 4..(40 * 64 + 40) * 4 + 4];
+        assert_eq!(deep, decoded, "empty region did not paint the full surface");
     }
 
     #[test]
