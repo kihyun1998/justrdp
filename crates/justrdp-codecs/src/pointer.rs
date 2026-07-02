@@ -258,6 +258,34 @@ mod tests {
     }
 
     #[test]
+    fn eight_bpp_multi_row_flips_bottom_up_and_honors_stride_padding() {
+        // 3×2 @8bpp. Odd width forces xor_stride = (3*8).div_ceil(16)*2 = 4 (3 index bytes + 1 pad
+        // byte per row), and two rows exercise the bottom-up flip (src_row = height-1-out_row) — the
+        // multi-row + odd-width coverage the single 1×1 vector above lacks (#124). Hand-computed:
+        // the differential oracle does not implement 8 bpp, so this stands on the spec, not a diff.
+        let mut palette = Palette::default();
+        palette.entries[1] = [10, 11, 12];
+        palette.entries[2] = [20, 21, 22];
+        palette.entries[3] = [30, 31, 32];
+        palette.entries[4] = [40, 41, 42];
+        palette.entries[5] = [50, 51, 52];
+        palette.entries[6] = [60, 61, 62];
+        // Bottom-up storage, each 4-byte row = 3 indices + 1 pad: stored row 0 = [1,2,3], row 1 = [4,5,6].
+        let xor_mask = [1, 2, 3, 0, 4, 5, 6, 0];
+
+        // Empty AND mask → fully opaque, so every pixel is its palette colour (no transparency/invert).
+        let rgba = decode_pointer(3, 2, 8, &xor_mask, &[], &palette).unwrap();
+
+        #[rustfmt::skip]
+        assert_eq!(rgba, [
+            // top row (out_row 0) = stored bottom row, indices 4,5,6 — proves the flip:
+            40, 41, 42, 255,  50, 51, 52, 255,  60, 61, 62, 255,
+            // bottom row (out_row 1) = stored top row, indices 1,2,3 (pad byte at [3]/[7] not read):
+            10, 11, 12, 255,  20, 21, 22, 255,  30, 31, 32, 255,
+        ]);
+    }
+
+    #[test]
     fn odd_widths_skip_the_stride_padding() {
         // 3×1 @24bpp: 9 data bytes padded to a 10-byte stride. The pad byte must not bleed
         // into the pixels. Pixels: red, green, blue (BGR source order).
