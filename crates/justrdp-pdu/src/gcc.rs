@@ -283,7 +283,10 @@ impl Default for ClientCoreData {
                 | SUPPORTED_COLOR_DEPTH_32BPP,
             early_capability_flags: ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
                 | ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL
-                | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN,
+                | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN
+                // Advertise the connectionType below: the server reads it only when this flag is
+                // set ([MS-RDPBCGR] 2.2.1.3.2), so without it the LAN hint is dead data (#123).
+                | ClientEarlyCapabilityFlags::VALID_CONNECTION_TYPE,
             dig_product_id: String::new(),
             connection_type: CONNECTION_TYPE_LAN,
             server_selected_protocol: SecurityProtocol::from_bits(0),
@@ -879,6 +882,21 @@ mod tests {
         assert_eq!(
             leaner.early_capability_flags,
             ClientEarlyCapabilityFlags::empty()
+        );
+    }
+
+    #[test]
+    fn default_connection_type_is_advertised_with_the_valid_flag() {
+        // #123: the server reads `connectionType` only when RNS_UD_CS_VALID_CONNECTION_TYPE is set
+        // ([MS-RDPBCGR] 2.2.1.3.2). The default advertises CONNECTION_TYPE_LAN, so it must also set
+        // that flag — otherwise the LAN hint is dead data the server ignores. IronRDP pairs them
+        // (connection.rs: VALID_CONNECTION_TYPE alongside ConnectionType::Lan).
+        let core = ClientCoreData::default();
+        assert_eq!(core.connection_type, CONNECTION_TYPE_LAN);
+        assert!(
+            core.early_capability_flags
+                .contains(ClientEarlyCapabilityFlags::VALID_CONNECTION_TYPE),
+            "a default advertising CONNECTION_TYPE_LAN must also set VALID_CONNECTION_TYPE"
         );
     }
 
