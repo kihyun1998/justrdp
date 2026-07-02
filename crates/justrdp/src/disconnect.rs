@@ -72,13 +72,12 @@ pub fn classify(info: ErrorInfo) -> DisconnectClass {
     use ProtocolIndependentCode as Pi;
     match info {
         ErrorInfo::ProtocolIndependent(code) => match code {
-            // A logoff, or a disconnect the *user themselves* initiated (e.g. `tsdiscon` in
-            // their own session): their own choice, so the reaction is the same as a logoff —
-            // expected, nothing to repair. An *administrative* disconnect (RpcInitiatedDisconnect)
-            // is a different case and stays Unknown below.
-            Pi::LogoffByUser | Pi::RpcInitiatedLogoff | Pi::RpcInitiatedDisconnectByUser => {
-                DisconnectClass::UserLogoff
-            }
+            // Ends originating in the *user's own session* (MS-RDPBCGR 2.2.5.1.1): a user logoff
+            // (LogoffByUser) or a disconnect from a tool in their session (RpcInitiatedDisconnectByUser,
+            // e.g. `tsdiscon`). Their own choice — expected, nothing to repair. The "another session"
+            // pair — RpcInitiatedDisconnect (0x01) and RpcInitiatedLogoff (0x02), both admin-initiated
+            // *from another session* — is a different case and stays Unknown below (#119).
+            Pi::LogoffByUser | Pi::RpcInitiatedDisconnectByUser => DisconnectClass::UserLogoff,
             Pi::IdleTimeout | Pi::LogonTimeout => DisconnectClass::Timeout,
             Pi::ServerFreshCredentialsRequired => DisconnectClass::AuthFail,
             Pi::ServerDeniedConnection | Pi::ServerInsufficientPrivileges => {
@@ -111,7 +110,8 @@ mod tests {
         for (code, class) in [
             (0x0000_000Cu32, DisconnectClass::UserLogoff), // LogoffByUser
             (0x0000_000B, DisconnectClass::UserLogoff), // RpcInitiatedDisconnectByUser (tsdiscon)
-            (0x0000_0001, DisconnectClass::Unknown), // RpcInitiatedDisconnect (admin) — deliberate
+            (0x0000_0001, DisconnectClass::Unknown), // RpcInitiatedDisconnect (admin, another session)
+            (0x0000_0002, DisconnectClass::Unknown), // RpcInitiatedLogoff (admin, another session) — spec-sibling of 0x01
             (0x0000_0003, DisconnectClass::Timeout), // IdleTimeout
             (0x0000_0004, DisconnectClass::Timeout), // LogonTimeout
             (0x0000_000A, DisconnectClass::AuthFail), // FreshCredentialsRequired
