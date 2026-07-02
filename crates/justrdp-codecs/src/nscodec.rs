@@ -112,6 +112,110 @@ pub fn parse_header(data: &[u8]) -> Result<(NscHeader, &[u8]), NscError> {
     ))
 }
 
+/// Split the concatenated plane data (from [`parse_header`]) into the four per-plane slices in wire
+/// order, by their byte counts. `parse_header` already guaranteed the total length; this is the
+/// bounds-checked partition the decode slices consume.
+pub fn split_planes<'a>(
+    planes: &'a [u8],
+    plane_byte_counts: &[u32; 4],
+) -> Result<[&'a [u8]; 4], NscError> {
+    let mut out: [&[u8]; 4] = [&[]; 4];
+    let mut off = 0usize;
+    for (i, &count) in plane_byte_counts.iter().enumerate() {
+        let end = usize::try_from(count)
+            .ok()
+            .and_then(|c| off.checked_add(c))
+            .ok_or(NscError::InvalidField {
+                field: "PlaneByteCount",
+                reason: "plane offset overflows usize",
+            })?;
+        out[i] = planes.get(off..end).ok_or(NscError::NotEnoughBytes {
+            ctx: "NSCodecPlanes",
+        })?;
+        off = end;
+    }
+    Ok(out)
+}
+
+/// Decode one plane into exactly `original_size` raw bytes. Three cases mirror FreeRDP
+/// `nsc_rle_decompress_data`: an empty (zero-length) plane fills `0xFF`; a plane shorter than its
+/// decoded size is RLE-compressed; otherwise it is stored raw and copied verbatim. `original_size`
+/// is caller-supplied geometry (width×height of the plane), not read from the untrusted stream.
+pub fn decode_plane(compressed: &[u8], original_size: usize) -> Result<Vec<u8>, NscError> {
+    if compressed.is_empty() {
+        Ok(vec![0xFF; original_size])
+    } else if compressed.len() < original_size {
+        nsc_rle_decode(compressed, original_size)
+    } else {
+        Ok(compressed[..original_size].to_vec())
+    }
+}
+
+/// The NSCodec plane RLE (FreeRDP `nsc_rle_decode`): decode `input` into exactly `original_size`
+/// bytes. A run is `value value marker` (`marker < 0xFF` → `marker + 2` repeats, else `0xFF` then a
+/// u32-LE count); a byte that does not repeat is a literal; the final four bytes are always stored
+/// raw. Every read is bounds-checked — `input` is untrusted.
+fn nsc_rle_decode(input: &[u8], original_size: usize) -> Result<Vec<u8>, NscError> {
+    let short = || NscError::NotEnoughBytes {
+        ctx: "NSCodecPlaneRle",
+    };
+    // Grow on demand; cap the pre-allocation so a large `original_size` alone can't force a huge one.
+    let mut out = Vec::with_capacity(original_size.min(1 << 16));
+    let mut left = original_size;
+    let mut pos = 0usize;
+
+    while left > 4 {
+        let value = *input.get(pos).ok_or_else(short)?;
+        pos += 1;
+
+        if left == 5 {
+            // The five-bytes-left boundary never starts a run — emit one literal, then the raw tail.
+            out.push(value);
+            left -= 1;
+            continue;
+        }
+
+        let next = *input.get(pos).ok_or_else(short)?;
+        if next != value {
+            // Literal: `next` is left in place to be the following iteration's `value`.
+            out.push(value);
+            left -= 1;
+            continue;
+        }
+
+        pos += 1; // consume the second `value`
+        let marker = *input.get(pos).ok_or_else(short)?;
+        let len = if marker < 0xFF {
+            pos += 1;
+            usize::from(marker) + 2
+        } else {
+            let bytes = input.get(pos + 1..pos + 5).ok_or_else(short)?;
+            pos += 5; // the 0xFF marker + the 4-byte count
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+        };
+        if len > left {
+            return Err(NscError::InvalidField {
+                field: "NSCodecPlaneRle",
+                reason: "run length exceeds the plane",
+            });
+        }
+        out.resize(out.len() + len, value);
+        left -= len;
+    }
+
+    // The loop only exits at `left <= 4`, and a run may not overshoot below four — so `left` is
+    // exactly 4 here, and the last four plane bytes are copied raw (FreeRDP's trailing `memcpy`).
+    if left != 4 {
+        return Err(NscError::InvalidField {
+            field: "NSCodecPlaneRle",
+            reason: "a run overshot the four-byte raw tail",
+        });
+    }
+    let tail = input.get(pos..pos + 4).ok_or_else(short)?;
+    out.extend_from_slice(tail);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +295,81 @@ mod tests {
         );
     }
 
+    // --- slice 2: RLE plane decode. Vectors are hand-encoded from the FreeRDP `nsc_rle_decode`
+    // scheme (`ironrdp-nscodec`'s `rle_encode` is private and only encodes whole bitmaps, so it is
+    // not a usable per-plane oracle — the full-pipeline round-trip lives in slice 4 / #140).
+
+    #[test]
+    fn rle_decodes_a_run_between_literals() {
+        // input: value 7 repeats (marker 3 → 3+2 = 5), then one literal (8), then the 4-byte tail.
+        let input = [7, 7, 3, 8, 9, 10, 11, 12];
+        let out = decode_plane(&input, 10).unwrap();
+        assert_eq!(out, [7, 7, 7, 7, 7, 8, 9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn rle_all_literals_round_trips_to_itself() {
+        // No repeats: the first byte is a literal, the five-left byte is a literal, then the tail.
+        let input = [1, 2, 3, 4, 5, 6];
+        assert_eq!(decode_plane(&input, 6).unwrap(), [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn rle_long_run_uses_the_four_byte_count() {
+        // marker 0xFF → the next u32-LE (266) is the run length; then the 4-byte tail.
+        let mut input = vec![5, 5, 0xFF];
+        input.extend_from_slice(&266u32.to_le_bytes());
+        input.extend_from_slice(&[100, 101, 102, 103]); // tail
+        let out = decode_plane(&input, 270).unwrap();
+        let mut want = vec![5u8; 266];
+        want.extend_from_slice(&[100, 101, 102, 103]);
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn empty_plane_fills_0xff() {
+        assert_eq!(decode_plane(&[], 5).unwrap(), [0xFF; 5]);
+    }
+
+    #[test]
+    fn plane_at_least_as_long_as_its_output_is_copied_raw() {
+        // compressed.len() (6) >= original_size (4): stored uncompressed, copied verbatim.
+        assert_eq!(decode_plane(&[1, 2, 3, 4, 5, 6], 4).unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rle_run_overshooting_the_tail_is_rejected() {
+        // marker 4 → len 6 consumes the whole plane, leaving 0 (< 4) — a malformed stream.
+        assert_eq!(
+            decode_plane(&[7, 7, 4], 6),
+            Err(NscError::InvalidField {
+                field: "NSCodecPlaneRle",
+                reason: "a run overshot the four-byte raw tail",
+            })
+        );
+    }
+
+    #[test]
+    fn rle_truncated_run_is_a_typed_error() {
+        // A run header with no marker byte.
+        assert_eq!(
+            decode_plane(&[7, 7], 10),
+            Err(NscError::NotEnoughBytes {
+                ctx: "NSCodecPlaneRle",
+            })
+        );
+    }
+
+    #[test]
+    fn split_planes_partitions_by_byte_counts() {
+        let planes: Vec<u8> = (0..7).collect();
+        let parts = split_planes(&planes, &[3, 2, 2, 0]).unwrap();
+        assert_eq!(parts[PLANE_LUMA], &[0, 1, 2]);
+        assert_eq!(parts[PLANE_ORANGE_CHROMA], &[3, 4]);
+        assert_eq!(parts[PLANE_GREEN_CHROMA], &[5, 6]);
+        assert!(parts[PLANE_ALPHA].is_empty());
+    }
+
     proptest! {
         // ADR-0008 / issue #97 — the no-panic robustness property. The whole buffer is the
         // unbounded, attacker-controlled blob; parsing must always be a typed error or Ok, never a
@@ -201,6 +380,16 @@ mod tests {
             data in proptest::collection::vec(any::<u8>(), 0..=256),
         ) {
             let _ = parse_header(&data);
+        }
+
+        // The RLE plane decode over arbitrary bytes: `original_size` is bounded (real geometry is a
+        // u16 field), so the fuzzer/proptest budget goes to the compressed `data`.
+        #[test]
+        fn decode_plane_never_panics_on_arbitrary_input(
+            original_size in 0usize..=4096,
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decode_plane(&data, original_size);
         }
     }
 }
