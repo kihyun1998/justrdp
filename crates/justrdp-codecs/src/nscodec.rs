@@ -298,6 +298,30 @@ pub fn reconstruct(
     Ok(out)
 }
 
+/// Decode a full NSCodec compressed-bitmap stream into `width`×`height` **BGRA** pixels — the public
+/// entry point wiring the header (#137) → per-plane RLE decode (#138) → colour reconstruction
+/// (#139). `width`/`height` are the region geometry supplied by the surface command / ClearCodec
+/// subcodec (#141), never read from the stream. NSCodec is stateless, so this is a free function.
+pub fn decode(data: &[u8], width: u16, height: u16) -> Result<Vec<u8>, NscError> {
+    let (w, h) = (usize::from(width), usize::from(height));
+    let (header, planes) = parse_header(data)?;
+    let sizes = plane_sizes(w, h, header.chroma_subsampled);
+    let slices = split_planes(planes, &header.plane_byte_counts)?;
+    let decoded = [
+        decode_plane(slices[0], sizes[0])?,
+        decode_plane(slices[1], sizes[1])?,
+        decode_plane(slices[2], sizes[2])?,
+        decode_plane(slices[3], sizes[3])?,
+    ];
+    reconstruct(
+        &decoded,
+        w,
+        h,
+        header.color_loss_level,
+        header.chroma_subsampled,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +546,60 @@ mod tests {
         );
     }
 
+    // --- slice 4: full-pipeline assembly. Vectors are hand-constructed whole streams (header +
+    // planes) with the expected BGRA computed from the slice-3 math. The `ironrdp-nscodec` encoder
+    // is deliberately NOT used as an oracle here: it stores planes bottom-up (FreeRDP `nsc_decode`
+    // reads top-down), never subsamples, and is lossy — so an encode→decode round-trip would be
+    // flipped, non-subsampled-only, and inexact. The real-server proof is corpus entry 30 in slice 5
+    // (#141). (ADR-0007 / #118: an unfaithful oracle is not used.)
+
+    /// Wrap plane bytes in a full NSCodec stream (20-byte header + concatenated planes).
+    fn stream(plane_counts: [u32; 4], color_loss: u8, chroma: u8, planes: &[u8]) -> Vec<u8> {
+        let mut s = header_bytes(plane_counts, color_loss, chroma);
+        s.extend_from_slice(planes);
+        s
+    }
+
+    #[test]
+    fn decode_assembles_a_non_subsampled_stream() {
+        // 2×1, raw planes (planeSize == originalSize), ColorLossLevel 1 — same pixels as the
+        // slice-3 non-subsampled vector, now driven end to end through the header + plane split.
+        let planes = [100, 50, 10, 0, 5, 0, 255, 128]; // Y, Co, Cg, A (2 raw bytes each)
+        let s = stream([2, 2, 2, 2], 1, 0, &planes);
+        assert_eq!(
+            decode(&s, 2, 1).unwrap(),
+            [85, 105, 105, 255, 50, 50, 50, 128]
+        );
+    }
+
+    #[test]
+    fn decode_assembles_a_subsampled_stream_with_padded_geometry() {
+        // 2×2 subsampled: plane sizes are the FreeRDP OrgByteCount [16, 4, 4, 4] (Y padded to
+        // tempWidth 8, chroma quarter-area). Same pixels as the slice-3 subsampled vector.
+        let mut planes = vec![10, 20, 0, 0, 0, 0, 0, 0, 30, 40, 0, 0, 0, 0, 0, 0]; // Y (16)
+        planes.extend_from_slice(&[5, 0, 0, 0]); // Co (4)
+        planes.extend_from_slice(&[2, 0, 0, 0]); // Cg (4)
+        planes.extend_from_slice(&[255, 254, 253, 252]); // A (4)
+        let s = stream([16, 4, 4, 4], 1, 1, &planes);
+        assert_eq!(
+            decode(&s, 2, 2).unwrap(),
+            [
+                3, 12, 13, 255, 13, 22, 23, 254, 23, 32, 33, 253, 33, 42, 43, 252
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_fills_an_empty_plane_with_0xff() {
+        // Alpha plane count 0 → 0xFF fill: the two pixels come back fully opaque.
+        let planes = [100, 50, 10, 0, 5, 0]; // Y, Co, Cg; no alpha bytes
+        let s = stream([2, 2, 2, 0], 1, 0, &planes);
+        assert_eq!(
+            decode(&s, 2, 1).unwrap(),
+            [85, 105, 105, 255, 50, 50, 50, 255]
+        );
+    }
+
     proptest! {
         // ADR-0008 / issue #97 — the no-panic robustness property. The whole buffer is the
         // unbounded, attacker-controlled blob; parsing must always be a typed error or Ok, never a
@@ -559,6 +637,17 @@ mod tests {
         ) {
             let planes = [p0, p1, p2, p3];
             let _ = reconstruct(&planes, width, height, color_loss, subsampled);
+        }
+
+        // Full-pipeline decode over an arbitrary stream: dims are bounded (real geometry is u16 from
+        // the surface command), so the budget goes to the attacker-controlled stream bytes.
+        #[test]
+        fn decode_never_panics_on_arbitrary_input(
+            width in 0u16..=48,
+            height in 0u16..=48,
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decode(&data, width, height);
         }
     }
 }
