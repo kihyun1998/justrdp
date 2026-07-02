@@ -51,7 +51,11 @@ const MAX_PALETTE_COUNT: u8 = 127;
 /// Per-axis tile dimension cap, mirroring the bootstrap decoder's OOM guard: rejects
 /// implausible tile shapes (e.g. 63961x771) regardless of total area before allocation.
 const MAX_DECODE_DIM: u16 = 8_192;
-/// Glyph cache stores tiles no larger than this many pixels.
+/// Glyph cache stores tiles no larger than this many pixels — a memory bound, not a spec limit
+/// (#127). The cache has [`GLYPH_CACHE_SIZE`] slots, so an unbounded per-entry size is a DoS
+/// surface; we cap it. A GLYPH_HIT for a larger, uncached tile degrades gracefully (cache-miss →
+/// typed error → the egfx layer warn-and-skips), never a panic. FreeRDP's `1024*1024` (`clear.c`)
+/// is a different thing — an anti-overflow sanity ceiling, not a cache-eligibility threshold.
 const MAX_GLYPH_PIXELS: usize = 1_024;
 
 /// Why a ClearCodec stream failed to decode. Malformed input is always a typed error, never a
@@ -306,6 +310,9 @@ impl ClearDecoder {
         let mut c = Cursor::new(data);
         c.ensure(2, "ClearCodecBitmapStream")?;
         let flags = c.u8();
+        // seqNumber is intentionally ignored (#127): FreeRDP validates its monotonicity and rejects
+        // a mismatch, but that is a server-sanity check — a client enforcing it would drop otherwise
+        // decodable frames on a benign sequence glitch. We are deliberately more lenient.
         let _seq_number = c.u8();
 
         let glyph_index = if flags & FLAG_GLYPH_INDEX != 0 {
@@ -520,6 +527,13 @@ impl ClearDecoder {
         c.ensure(2, "VBar")?;
         let header = c.u16_le();
 
+        // A cache hit on an unpopulated slot (below and in the short-V-bar path) is rejected as a
+        // typed error, where FreeRDP warns and fills a dummy zeroed column (#127). We are
+        // deliberately stricter: the #56 layout fix keeps the cache correctly populated for valid
+        // streams, so an unpopulated hit means a malformed stream — skipping the tile (via the
+        // egfx warn-and-skip) is cleaner than compositing dummy data. Corpus-verified: the real
+        // capture never triggers this reject.
+        //
         // Bit 15 set: full V-bar cache hit (read-only, no cursor advance).
         if header & 0x8000 != 0 {
             let index = header & 0x7FFF;
@@ -837,7 +851,12 @@ fn decode_rlex(data: &[u8]) -> Result<RlexData, ClearError> {
         let packed = c.u8();
         let stop_index = packed & stop_mask;
         let suite_depth = (packed >> stop_index_bits) & depth_mask;
-        let start_index = stop_index.saturating_sub(suite_depth);
+        // startIndex = stopIndex - suiteDepth must not underflow. FreeRDP computes it wrapping and
+        // rejects when startIndex >= paletteCount; we reject the underflow directly (#127) — same
+        // outcome, and it keeps these streams inside the differential oracle (both reject).
+        let start_index = stop_index
+            .checked_sub(suite_depth)
+            .ok_or_else(|| invalid("rlex", "suiteDepth exceeds stopIndex"))?;
         let run_length = read_run_length(&mut c, "RlexRun")?;
         segments.push(RlexSegment {
             start_index,
@@ -1122,6 +1141,19 @@ mod tests {
         for px in out.chunks_exact(4) {
             assert_eq!(px, &[10, 20, 30, 0xFF]);
         }
+    }
+
+    #[test]
+    fn rlex_suite_depth_exceeding_stop_index_is_rejected() {
+        // #127: a packed byte whose suiteDepth > stopIndex would underflow startIndex. FreeRDP
+        // rejects it (wrapping start >= paletteCount); we reject the underflow directly. packed
+        // 0x02 → stopIndex=0, suiteDepth=1 (palette_count=2 → 1 stop-index bit).
+        let bitmap = vec![2, 10, 20, 30, 40, 50, 60, 0x02, 0x00];
+        let mut out = vec![0u8; 4];
+        assert!(
+            decode_rlex_region(&bitmap, &mut out, 0, 0, 1, 1, 1).is_err(),
+            "suiteDepth exceeding stopIndex must be rejected"
+        );
     }
 
     #[test]
