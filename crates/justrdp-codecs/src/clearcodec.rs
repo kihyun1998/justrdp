@@ -609,8 +609,12 @@ impl ClearDecoder {
             match codec_id {
                 0x00 => decode_raw_region(bitmap, output, x_start, y_start, width, height, sw)?,
                 0x02 => decode_rlex_region(bitmap, output, x_start, y_start, width, height, sw)?,
-                // NSCodec (0x01) is not produced by EGFX servers in practice; left undecoded
-                // rather than rejected, matching the residual/band layers already drawn.
+                // NSCodec (0x01) is a valid subcodec FreeRDP decodes (clear.c:543) that we do not
+                // implement yet. Real Windows Server 2022 *does* send it (replay corpus entry 30,
+                // 48x78 — verified 2026-07-02), so failing the tile would drop a live frame: we
+                // skip this sub-region (it keeps the residual/band content already drawn) and
+                // continue. The decode gap is tracked in #132. (#121; the earlier "not produced by
+                // EGFX servers in practice" comment was wrong — the capture disproves it.)
                 0x01 => {}
                 _ => return Err(invalid("subCodecId", "unknown subcodec ID")),
             }
@@ -1118,5 +1122,31 @@ mod tests {
         for px in out.chunks_exact(4) {
             assert_eq!(px, &[10, 20, 30, 0xFF]);
         }
+    }
+
+    #[test]
+    fn nscodec_subcodec_is_skipped_not_rejected() {
+        // NSCodec (0x01) is a valid subcodec real WS2022 servers send (replay corpus entry 30) that
+        // we do not implement yet (#132). It must be skipped — the sub-region keeps prior content —
+        // so the frame still decodes; rejecting would drop a live frame (verified: a hard error
+        // breaks the corpus replay). This pins the interop-required tolerance (#121).
+        let subcodec: Vec<u8> = vec![
+            0, 0, // x_start
+            0, 0, // y_start
+            1, 0, // width = 1
+            1, 0, // height = 1
+            0, 0, 0, 0,    // bitmapByteCount = 0
+            0x01, // codecId = NSCodec
+        ];
+        let mut stream = vec![0x00, 0x00]; // flags, seq
+        stream.extend_from_slice(&0u32.to_le_bytes()); // residualByteCount
+        stream.extend_from_slice(&0u32.to_le_bytes()); // bandsByteCount
+        stream.extend_from_slice(&u32::try_from(subcodec.len()).unwrap().to_le_bytes());
+        stream.extend_from_slice(&subcodec);
+
+        assert!(
+            ClearDecoder::new().decode(&stream, 1, 1).is_ok(),
+            "an NSCodec subcodec must be skipped, not rejected (real servers send it)"
+        );
     }
 }
