@@ -1,6 +1,6 @@
 # 0007 — Stage-boundary differential verification for codecs without a high-level oracle
 
-- Status: Accepted (first implemented in PR #81 / issue #58; amended same day — see Consequences)
+- Status: Accepted (first implemented in PR #81 / issue #58; amended same day — see Consequences); assembly-layer independence added in the Amendment below (#118, 2026-07-02)
 - Date: 2026-06-12
 
 ## Context
@@ -53,3 +53,24 @@ The oracle crates remain **dev-dependencies only** (ADR-0003); nothing here adds
 - **Encode round-trip self-consistency** (`our_decode(synthetic_stream)` checked only for internal consistency). Rejected as a primary gate: with no independent decoder and a lossy codec, it asserts nothing about correctness against a reference. It survives only as the *input-generation* step feeding (A)/(B).
 - **Wait for a captured real-server corpus.** Rejected — the VM never sends CAVIDEO, so this blocks the codec indefinitely on an event that may never occur.
 - **Depend on `ironrdp-session`'s assembled RemoteFX decoder as the oracle.** Rejected — pulling in the session-level decoder is closer to vendoring the very assembly we are meant to own and prove independently (ADR-0003's "reference = copy = vendoring is explicitly avoided"); the primitive-level oracle keeps us honest about understanding the message set.
+
+## Amendment (2026-07-02, #118): a same-lineage oracle does not prove the *assembly* layer
+
+### Gap this closes
+
+ADR-0003 and the Context above treat "ironrdp exposes a high-level decoder" (ClearCodec, zgfx) as sufficient for the byte-identical differential. A retrospective audit showed that is true for **availability** but false for **independence**, and the gap is specific to the codec's *assembly* layer (compositing / region / cache reconstruction) as opposed to its transform *primitives*:
+
+1. **ClearCodec's high-level oracle shares our derivation.** `ironrdp-graphics`'s ClearCodec decoder is near line-for-line the same as ours (same V-bar reconstruction, same RLEX). A byte-identical diff cannot catch a bug both sides share by construction. **#116** is the demonstrated case: a cross-band V-bar corruption (a missing `band_height` clamp) was present in *both* our decoder and the oracle — only FreeRDP's `clear.c` (`if ((y + count) > vBarPixelCount) count = vBarPixelCount - y`) exposed it.
+2. **The RemoteFX composed reference (B) glues *our* compositing logic.** (B) assembles the oracle's math primitives, but the region/tile blit/clip loop "is ours" (Decision §2). So the region-assembly layer is self-referential: **#117** — an empty `TS_RFX_REGION` (`numRects==0`) that must paint the full surface but painted nothing — would pass a reference that mirrors the same (wrong) region handling.
+3. **The oracle *encoder* never emits the adversarial shapes** (cross-band cache hits, `numRects==0`), so those assembly paths have no differential coverage at all, independent of points 1–2.
+
+### Decision (addition)
+
+The oracle diff (ADR-0003) and the primitives-based (A)+(B) above remain the proof for the **transform/math stages** — entropy, dequantize, inverse DWT, subband, colour — which are genuinely the oracle's own independent math. But for the **assembly layer** — residual/band/V-bar/RLEX compositing and cache reconstruction (ClearCodec); region/tile blit and clipping (RemoteFX) — correctness MUST be proven by a conformance test whose expected output is derived **independently of our implementation**: hand-computed from the normative spec, or cross-checked against FreeRDP's `clear.c` / `rfx.c`. A green diff against a same-lineage oracle is *necessary but not sufficient* there.
+
+The established pattern is the **#116 / #117 regression tests**: they assert against hand-derived expectations (FreeRDP clamp semantics; the opaque-black-init invariant), never against the shared-lineage oracle. New compositing / cache / region work follows this pattern.
+
+### Consequence
+
+- Verification is now explicitly two-tier: **primitives → oracle-diff (independent math); assembly → spec- or FreeRDP-independent conformance (the oracle is same-lineage).**
+- The specific ClearCodec / RemoteFX behavioural divergences from FreeRDP that the shared oracle hides are tracked as their own issues (RLEX over-region clip #120, single-palette RLEX layout #121, and the remaining lenient divergences #127) rather than left implicit in a green differential.
