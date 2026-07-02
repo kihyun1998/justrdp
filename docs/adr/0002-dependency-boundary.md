@@ -1,6 +1,6 @@
 # 0002 — Dependency boundary: own RDP protocol, depend on crypto
 
-- Status: Accepted — the `sspi` half refined by [ADR-0004](0004-sspi-contribute-and-bridge.md) (2026-06-11)
+- Status: Accepted — the `sspi` half refined by [ADR-0004](0004-sspi-contribute-and-bridge.md) (2026-06-11); the codec-ownership half given an independent rationale in the Amendment below (#100, 2026-07-02)
 - Date: 2026-06-08
 
 ## Context
@@ -58,3 +58,26 @@ justrdp owns **all RDP-specific protocol** but depends on **leaf, non-RDP-specif
 ## Open questions resolved
 
 This decision resolves design question 13 from the plan: "Pure-Rust only, or allow the `sspi` crate?" **Answer: allow `sspi` (and `rustls`); they are non-RDP-specific, security-critical, and free of the negotiation bottleneck.** The outcome is a dependency graph of: `justrdp-pdu` (wire + PDUs) → `justrdp` (sans-IO core) → { `rustls`, `sspi`, `ironrdp-graphics` (temporary) } rather than `justrdp` → everything in `ironrdp` or nothing.
+
+## Amendment (2026-07-02, #100): independent rationale for full codec self-ownership
+
+### Gap this closes
+
+The original decision (§What we own) lists "Graphics codecs … initially via `ironrdp-graphics` as a differential-test oracle, then self-owned per the phased-c2 strategy," but the *why* leans on the same premise as the whole rebuild: `CONTEXT.md` motivates justrdp via a **connector** defect (`ironrdp-connector` 0.9 hardcoding away `SUPPORT_DYN_VC_GFX_PROTOCOL`). That argues for owning the **connector** and negotiation — it does **not**, on its own, argue for rewriting **codecs** (RemoteFX, ClearCodec, …) that IronRDP already implements. So codec self-ownership currently rests on an implicit rationale. This amendment records the independent rationale so the decision stands on its own, without borrowing the connector's motivation.
+
+### Independent rationale
+
+1. **No-C trust boundary.** These decoders parse **untrusted server bytes**; a memory-safety bug is a direct attack surface (cf. the FreeRDP OOB CVE history in rle/planar/clearcodec/nsc). Pure-Rust decoders keep "zero C in the trust boundary" (ADR-0002's thesis). The realistic alternatives for *not* owning a codec — binding OpenH264 or FFmpeg for H.264, for instance — reintroduce C into exactly the path that must be safe, and break the pure-Rust property outright.
+2. **`no_std` / WASM reach.** A pure-Rust codec core is portable and embeddable, independent of any C codec library's build system. Owning the decoders keeps the core reachable in `no_std`/WASM targets that a C dependency would foreclose.
+3. **Governance independence.** Owning the codecs decouples us from a single vendor's (Devolutions) roadmap and release cadence. This is not hypothetical: ADR-0004's `sspi` fork-bridge already demonstrates the cost of that coupling, and — verified against the real source on 2026-07-02 — **every** IronRDP codec crate is still pre-1.0 (`ironrdp-graphics` 0.8.1, `ironrdp-nscodec` 0.1.0; the umbrella `ironrdp` 0.16.0), so under semver each carries no cross-minor API-stability guarantee. Leaning on them as a *runtime* dependency inherits that churn; using them only as a version-pinned dev-dependency oracle (ADR-0003) does not.
+
+The earlier counterargument — "is full self-ownership worth the labor, given IronRDP already has these?" — has been explicitly rejected: AI-assisted development makes the codec/channel long tail tractable for a small team, which strengthens this decision rather than weakening it.
+
+### Forward-looking note: oracle availability is not uniform (verified 2026-07-02)
+
+Self-ownership is *chosen* for most codecs and *forced* for one — and the distinction turns on what IronRDP actually ships, not on its version number. Checked against `Devolutions/IronRDP` real source:
+
+- **RemoteFX (full), RLGR, zgfx, RLE, planar (rdp6), ClearCodec, RemoteFX Progressive** — implemented and `pub` in `ironrdp-graphics`; **NSCodec** ships as the separate `ironrdp-nscodec` crate. All are pre-1.0, but a **version-pinned dev-dependency** oracle (ADR-0003/0007) does not need a stable API — it needs a fixed, reproducible one. So for these, byte-identical differential testing against IronRDP is available.
+- **H.264 / AVC420 / AVC444** — **absent** from IronRDP entirely (no crate, no module). Here there is **no oracle at all**, so stage-boundary verification (ADR-0007) is the only path, and self-ownership is **forced, not merely chosen**.
+
+This corrects a conflation in the originating issue (#100), which stated IronRDP "cannot be a complete oracle" for ClearCodec/NSCodec/Progressive/H.264 alike: the accurate statement is that pre-1.0 status bounds them as a *runtime* dependency (rationale 3), not as an oracle — only H.264/AVC lacks an oracle, because the code does not exist.
