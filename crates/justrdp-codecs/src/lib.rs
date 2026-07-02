@@ -17,6 +17,7 @@ pub mod clearcodec;
 pub mod color;
 #[cfg(feature = "egfx-bootstrap")]
 pub mod egfx;
+pub mod nscodec;
 pub mod planar;
 pub mod pointer;
 pub mod rfx;
