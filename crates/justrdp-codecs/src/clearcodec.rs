@@ -7,8 +7,8 @@
 //!
 //! This decoder is re-derived from the MS-RDPEGFX spec and cross-checked against FreeRDP's
 //! `clear.c`; it does **not** depend on `ironrdp-graphics`. Correctness on streams the oracle
-//! also accepts is proven differentially (`tests/clearcodec_*`). Two oracle bit-level defects
-//! that reject genuine Windows Server 2022 streams are corrected here:
+//! also accepts is proven differentially (`tests/clearcodec_*`). Two places diverge from the
+//! bootstrap oracle — one an oracle defect we correct, one a deliberate tolerance choice:
 //!
 //! 1. **SHORT_VBAR_CACHE_MISS field layout.** The 14 payload bits are `shortVBarYOn` in bits
 //!    `[7:0]` and `shortVBarYOff` in bits `[13:8]` (FreeRDP `vBarYOn = h & 0xFF`,
@@ -18,9 +18,13 @@
 //!    V-bar cache correctly, which transitively removes the oracle's `vbarIndex` "cache miss on
 //!    hit" rejection (bands that previously aborted mid-decode now finish and store their
 //!    columns).
-//! 2. **RLEX region overflow is clipped, not fatal.** When a run+suite would write past the
-//!    region, real servers (and FreeRDP) clip the surplus; the oracle instead rejects with
-//!    `suite exceeds region pixel count`. We stop emitting at the region boundary.
+//!
+//! 2. **RLEX region over-fill is clipped, not fatal.** A captured real Windows Server 2022
+//!    stream over-fills its RLEX region (replay corpus entry 0). FreeRDP `clear.c` and the
+//!    ironrdp oracle both *reject* an over-region run/suite (`:260`/`:286`/`:321`), but a client
+//!    must not drop a live frame over a server's over-encode, so we clip the surplus at the
+//!    region boundary (and short-fill under-runs). This is backed by the capture, **not** by
+//!    FreeRDP — an earlier comment mis-attributed it as "FreeRDP parity" (#120).
 //!
 //! **Alpha contract:** ClearCodec carries no alpha; every output pixel's alpha byte is `0xFF`.
 
@@ -741,6 +745,12 @@ fn decode_rlex_region(
         output[dst + 3] = 0xFF;
     };
 
+    // Clip surplus at the region boundary rather than reject. A captured real Windows Server
+    // 2022 stream over-fills its RLEX region (replay corpus entry 0, 64x32); FreeRDP `clear.c`
+    // and the ironrdp oracle both reject that (`suite exceeds region pixel count`), but a client
+    // must not drop a live frame over a server's over-encode, so we stop emitting at the region
+    // boundary and short-fill under-runs. (NB: this is *not* FreeRDP parity — FreeRDP rejects;
+    // the basis is the real capture, verified 2026-07-02. See #120.)
     'segments: for seg in &rlex.segments {
         if usize::from(seg.start_index) >= palette_len {
             return Err(invalid("rlex", "start_index exceeds palette size"));
@@ -753,7 +763,7 @@ fn decode_rlex_region(
         let run_color = rlex.palette[usize::from(seg.start_index)];
         for _ in 0..seg.run_length {
             if px >= region_pixels {
-                break 'segments; // clip surplus rather than reject (FreeRDP parity)
+                break 'segments;
             }
             put(px, run_color);
             px += 1;
@@ -1043,5 +1053,48 @@ mod tests {
         stream.extend_from_slice(&0u32.to_le_bytes()); // subcodecByteCount
         stream.extend_from_slice(bands);
         stream
+    }
+
+    // #120 — RLEX over/under-region is tolerated, not rejected. A captured real WS2022 stream
+    // over-fills its region (corpus entry 0); FreeRDP `clear.c` and the ironrdp oracle both reject
+    // that, but a client must not drop a live frame, so justrdp clips the surplus and short-fills
+    // under-runs. These assertions pin that intentional tolerance (independent of the oracle,
+    // which rejects). palette_count=2 keeps the test off the single-palette 0-bit path (#121).
+
+    /// A one-segment RLEX bitmap: palette of 2 BGR colors, packed byte `0x00`
+    /// (stopIndex=0, suiteDepth=0, startIndex=0) → `run_length` run px + 1 suite px of palette[0].
+    fn rlex_bitmap(run_length: u8) -> Vec<u8> {
+        vec![2, 10, 20, 30, 40, 50, 60, 0x00, run_length]
+    }
+
+    #[test]
+    fn rlex_over_region_is_clipped_not_rejected() {
+        // run=5 (+1 suite = 6 px) into a 2-px region: paint the 2 region px, drop the surplus,
+        // succeed — the client must not reject a real server's over-encode.
+        let mut out = vec![0u8; 2 * 4];
+        assert!(
+            decode_rlex_region(&rlex_bitmap(5), &mut out, 0, 0, 2, 1, 2).is_ok(),
+            "over-region RLEX must clip, not reject"
+        );
+        assert_eq!(&out[0..4], &[10, 20, 30, 0xFF]); // palette[0]
+        assert_eq!(&out[4..8], &[10, 20, 30, 0xFF]);
+    }
+
+    #[test]
+    fn rlex_under_fill_is_tolerated() {
+        // run=0 (+1 suite = 1 px) into a 4-px region: paint what we have, leave the rest, succeed.
+        let mut out = vec![0u8; 4 * 4];
+        assert!(decode_rlex_region(&rlex_bitmap(0), &mut out, 0, 0, 4, 1, 4).is_ok());
+        assert_eq!(&out[0..4], &[10, 20, 30, 0xFF]); // 1 suite px painted
+        assert_eq!(&out[4..8], &[0, 0, 0, 0]); // remainder untouched
+    }
+
+    #[test]
+    fn rlex_exact_fill_paints_the_whole_region() {
+        // run=1 (+1 suite = 2 px) exactly fills a 2-px region.
+        let mut out = vec![0u8; 2 * 4];
+        assert!(decode_rlex_region(&rlex_bitmap(1), &mut out, 0, 0, 2, 1, 2).is_ok());
+        assert_eq!(&out[0..4], &[10, 20, 30, 0xFF]);
+        assert_eq!(&out[4..8], &[10, 20, 30, 0xFF]);
     }
 }
