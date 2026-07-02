@@ -815,41 +815,31 @@ fn decode_rlex(data: &[u8]) -> Result<RlexData, ClearError> {
         palette.push([b, g, r]);
     }
 
-    // numBits = floor(log2(paletteCount - 1)) + 1; the low numBits of each packed byte hold
-    // stopIndex, the upper bits hold suiteDepth, and startIndex = stopIndex - suiteDepth.
-    let stop_index_bits = if palette_count <= 1 {
-        0
+    // numBits = CLEAR_LOG2_FLOOR[paletteCount - 1] + 1 (FreeRDP `clear.c:200`): the low numBits of
+    // each packed byte hold stopIndex, the upper bits hold suiteDepth, startIndex = stopIndex -
+    // suiteDepth. It is >= 1 even for a single-entry palette (floor(log2(0)) is defined as 0), so a
+    // packed byte is always present — one per segment, no 0-bit special case (#121).
+    let stop_index_bits = if palette_count == 1 {
+        1
     } else {
         bit_length(u32::from(palette_count - 1))
     };
 
     let mut segments = Vec::new();
-    if stop_index_bits == 0 {
-        // Single palette entry: each segment is a bare run length of palette[0].
-        while !c.is_empty() {
-            let run_length = read_run_length(&mut c, "RlexRun")?;
-            segments.push(RlexSegment {
-                start_index: 0,
-                stop_index: 0,
-                run_length,
-            });
-        }
-    } else {
-        let suite_depth_bits = 8 - stop_index_bits;
-        let stop_mask = (1u8 << stop_index_bits) - 1;
-        let depth_mask = (1u8 << suite_depth_bits) - 1;
-        while !c.is_empty() {
-            let packed = c.u8();
-            let stop_index = packed & stop_mask;
-            let suite_depth = (packed >> stop_index_bits) & depth_mask;
-            let start_index = stop_index.saturating_sub(suite_depth);
-            let run_length = read_run_length(&mut c, "RlexRun")?;
-            segments.push(RlexSegment {
-                start_index,
-                stop_index,
-                run_length,
-            });
-        }
+    let suite_depth_bits = 8 - stop_index_bits;
+    let stop_mask = (1u8 << stop_index_bits) - 1;
+    let depth_mask = (1u8 << suite_depth_bits) - 1;
+    while !c.is_empty() {
+        let packed = c.u8();
+        let stop_index = packed & stop_mask;
+        let suite_depth = (packed >> stop_index_bits) & depth_mask;
+        let start_index = stop_index.saturating_sub(suite_depth);
+        let run_length = read_run_length(&mut c, "RlexRun")?;
+        segments.push(RlexSegment {
+            start_index,
+            stop_index,
+            run_length,
+        });
     }
 
     Ok(RlexData { palette, segments })
@@ -1096,5 +1086,37 @@ mod tests {
         assert!(decode_rlex_region(&rlex_bitmap(1), &mut out, 0, 0, 2, 1, 2).is_ok());
         assert_eq!(&out[0..4], &[10, 20, 30, 0xFF]);
         assert_eq!(&out[4..8], &[10, 20, 30, 0xFF]);
+    }
+
+    // #121 — single-palette RLEX. FreeRDP `numBits = CLEAR_LOG2_FLOOR[paletteCount-1] + 1` = 1 for
+    // paletteCount==1 (`clear.c:200`), so a packed stop/suite byte is present per segment even for a
+    // one-entry palette. The old 0-bit special case read no packed byte, misparsing genuine streams.
+    // (Rendered output for a *valid* single-palette stream is identical either way — one colour — so
+    // this is a spec/byte-consumption conformance fix, not an output change; the observable effect is
+    // that the packed index byte is now validated.)
+
+    #[test]
+    fn single_palette_rlex_validates_the_packed_index_byte() {
+        // palette_count=1, palette=[10,20,30]; packed byte 0x01 → stopIndex=1, which exceeds the
+        // single-entry palette → reject (FreeRDP `clear.c` `startIndex/stopIndex >= paletteCount`).
+        // Under the old 0-bit layout this byte was misread as a bare run length and accepted.
+        let bitmap = vec![1, 10, 20, 30, 0x01, 0x00];
+        let mut out = vec![0u8; 4 * 4];
+        assert!(
+            decode_rlex_region(&bitmap, &mut out, 0, 0, 4, 1, 4).is_err(),
+            "single-palette RLEX must read and validate the packed index byte"
+        );
+    }
+
+    #[test]
+    fn single_palette_rlex_valid_stream_fills_the_region() {
+        // Valid FreeRDP-format single-palette RLEX: packed 0x00 (stopIndex=0, suiteDepth=0), run=2
+        // → 2 run + 1 suite = 3 px of palette[0].
+        let bitmap = vec![1, 10, 20, 30, 0x00, 2];
+        let mut out = vec![0u8; 3 * 4];
+        assert!(decode_rlex_region(&bitmap, &mut out, 0, 0, 3, 1, 3).is_ok());
+        for px in out.chunks_exact(4) {
+            assert_eq!(px, &[10, 20, 30, 0xFF]);
+        }
     }
 }
