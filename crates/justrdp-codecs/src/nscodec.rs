@@ -216,6 +216,88 @@ fn nsc_rle_decode(input: &[u8], original_size: usize) -> Result<Vec<u8>, NscErro
     Ok(out)
 }
 
+fn round_up(v: usize, n: usize) -> usize {
+    v.div_ceil(n) * n
+}
+
+/// The aligned plane dimensions FreeRDP allocates (`nsc_context_initialize`): width up to a
+/// multiple of 8, height up to a multiple of 2. Only relevant when chroma is subsampled.
+fn temp_dims(width: usize, height: usize) -> (usize, usize) {
+    (round_up(width, 8), round_up(height, 2))
+}
+
+/// Expected decoded byte counts of the four planes `[Y, Co, Cg, Alpha]` for a `width`×`height`
+/// bitmap (FreeRDP `OrgByteCount`). When subsampled the luma plane is padded to `tempWidth` and the
+/// two chroma planes are quarter-area; alpha is always full resolution. Used to size the RLE decode
+/// (#140) and to bound reconstruction.
+pub fn plane_sizes(width: usize, height: usize, chroma_subsampled: bool) -> [usize; 4] {
+    if chroma_subsampled {
+        let (tw, th) = temp_dims(width, height);
+        let chroma = (tw >> 1) * (th >> 1);
+        [tw * height, chroma, chroma, width * height]
+    } else {
+        let n = width * height;
+        [n, n, n, n]
+    }
+}
+
+/// Reconstruct `width`×`height` **BGRA** pixels from the four decoded planes `[Y, Co, Cg, Alpha]`,
+/// in one pass (FreeRDP `nsc_decode`): colour-loss recovery (`shift = ColorLossLevel - 1`), chroma
+/// supersampling (4:2:0 — each Co/Cg sample covers a 2×2 block when subsampled), and AYCoCg→RGB
+/// (`R = Y + Co − Cg`, `G = Y + Cg`, `B = Y − Co − Cg`, each clamped to `0..=255`). Chroma bytes are
+/// shifted then sign-truncated to a signed delta (`(i8)((byte) << shift)`). Output byte order is
+/// BGRA, matching the ClearCodec output buffer (#141). Plane accesses are bounds-checked: a plane
+/// shorter than its geometry is a malformed stream, not a panic.
+pub fn reconstruct(
+    planes: &[Vec<u8>; 4],
+    width: usize,
+    height: usize,
+    color_loss_level: u8,
+    chroma_subsampled: bool,
+) -> Result<Vec<u8>, NscError> {
+    let total = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or(NscError::InvalidField {
+            field: "dimensions",
+            reason: "width * height * 4 overflows usize",
+        })?;
+    let short = || NscError::NotEnoughBytes {
+        ctx: "NSCodecPlanes",
+    };
+
+    let shift = color_loss_level.saturating_sub(1);
+    let (temp_width, _) = temp_dims(width, height);
+    let [y_plane, co_plane, cg_plane, a_plane] = planes;
+    let (y_stride, co_stride) = if chroma_subsampled {
+        (temp_width, temp_width >> 1)
+    } else {
+        (width, width)
+    };
+
+    let mut out = Vec::with_capacity(total);
+    for y in 0..height {
+        let y_row = y * y_stride;
+        let co_row = if chroma_subsampled { y >> 1 } else { y } * co_stride;
+        let a_row = y * width;
+        for x in 0..width {
+            let co_idx = if chroma_subsampled { x >> 1 } else { x };
+            let y_val = i16::from(*y_plane.get(y_row + x).ok_or_else(short)?);
+            let co_raw = *co_plane.get(co_row + co_idx).ok_or_else(short)?;
+            let cg_raw = *cg_plane.get(co_row + co_idx).ok_or_else(short)?;
+            let alpha = *a_plane.get(a_row + x).ok_or_else(short)?;
+            // `(i8)((i16)byte << shift)`: low byte reinterpreted as a signed chroma delta.
+            let co = i16::from(((i16::from(co_raw) << shift) as u8) as i8);
+            let cg = i16::from(((i16::from(cg_raw) << shift) as u8) as i8);
+            let r = (y_val + co - cg).clamp(0, 255) as u8;
+            let g = (y_val + cg).clamp(0, 255) as u8;
+            let b = (y_val - co - cg).clamp(0, 255) as u8;
+            out.extend_from_slice(&[b, g, r, alpha]);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +452,76 @@ mod tests {
         assert!(parts[PLANE_ALPHA].is_empty());
     }
 
+    // --- slice 3: colour reconstruction. Vectors are hand-computed from the AYCoCg→RGB math and
+    // the FreeRDP `nsc_decode` indexing (no oracle — pure spec math, per ADR-0007 / #118).
+
+    #[test]
+    fn reconstruct_non_subsampled_applies_the_aycocg_matrix() {
+        // 2×1, ColorLossLevel 1 (shift 0). px0: Y100 Co10 Cg5 → R=105 G=105 B=85. px1: Y50 → grey.
+        let planes = [vec![100, 50], vec![10, 0], vec![5, 0], vec![255, 128]];
+        let out = reconstruct(&planes, 2, 1, 1, false).unwrap();
+        assert_eq!(out, [85, 105, 105, 255, 50, 50, 50, 128]);
+    }
+
+    #[test]
+    fn reconstruct_applies_the_colour_loss_shift() {
+        // 1×1, ColorLossLevel 3 (shift 2): Co 3→12, Cg 1→4. R=108 G=104 B=84.
+        let planes = [vec![100], vec![3], vec![1], vec![255]];
+        assert_eq!(
+            reconstruct(&planes, 1, 1, 3, false).unwrap(),
+            [84, 104, 108, 255]
+        );
+    }
+
+    #[test]
+    fn reconstruct_sign_truncates_chroma_and_clamps() {
+        // 1×1, shift 2: Co 100 → (100<<2)=400 → (u8)144 → (i8)-112. R=100-112→clamp 0, B=100+112=212.
+        let planes = [vec![100], vec![100], vec![0], vec![255]];
+        assert_eq!(
+            reconstruct(&planes, 1, 1, 3, false).unwrap(),
+            [212, 100, 0, 255]
+        );
+    }
+
+    #[test]
+    fn reconstruct_subsampled_shares_one_chroma_sample_across_the_2x2_block() {
+        // 2×2 subsampled: Y is padded to tempWidth=8 (row 1 at index 8); a single Co/Cg sample
+        // (Co0=5, Cg0=2) covers all four pixels; alpha stays full-resolution.
+        let planes = [
+            vec![10, 20, 0, 0, 0, 0, 0, 0, 30, 40, 0, 0, 0, 0, 0, 0], // Y, stride 8
+            vec![5, 0, 0, 0],                                         // Co (quarter-area)
+            vec![2, 0, 0, 0],                                         // Cg
+            vec![255, 254, 253, 252],                                 // Alpha, stride 2
+        ];
+        let out = reconstruct(&planes, 2, 2, 1, true).unwrap();
+        assert_eq!(
+            out,
+            [
+                3, 12, 13, 255, 13, 22, 23, 254, // row 0
+                23, 32, 33, 253, 33, 42, 43, 252, // row 1
+            ]
+        );
+    }
+
+    #[test]
+    fn plane_sizes_match_freerdp_orgbytecount() {
+        assert_eq!(plane_sizes(3, 2, false), [6, 6, 6, 6]);
+        // subsampled 3×2: tempW=8, tempH=2 → Y=16, chroma=(4)*(1)=4, alpha=6.
+        assert_eq!(plane_sizes(3, 2, true), [16, 4, 4, 6]);
+    }
+
+    #[test]
+    fn reconstruct_short_plane_is_a_typed_error() {
+        // Y has only 1 byte for a 2×1 bitmap.
+        let planes = [vec![100], vec![0, 0], vec![0, 0], vec![255, 255]];
+        assert_eq!(
+            reconstruct(&planes, 2, 1, 1, false),
+            Err(NscError::NotEnoughBytes {
+                ctx: "NSCodecPlanes",
+            })
+        );
+    }
+
     proptest! {
         // ADR-0008 / issue #97 — the no-panic robustness property. The whole buffer is the
         // unbounded, attacker-controlled blob; parsing must always be a typed error or Ok, never a
@@ -390,6 +542,23 @@ mod tests {
             data in proptest::collection::vec(any::<u8>(), 0..=512),
         ) {
             let _ = decode_plane(&data, original_size);
+        }
+
+        // Reconstruction over arbitrary (possibly too-short) planes and any colour-loss level: bounded
+        // dims keep the output small; a plane that underruns its geometry is a typed error, not a panic.
+        #[test]
+        fn reconstruct_never_panics_on_arbitrary_input(
+            width in 0usize..=32,
+            height in 0usize..=32,
+            color_loss in 1u8..=7,
+            subsampled in any::<bool>(),
+            p0 in proptest::collection::vec(any::<u8>(), 0..=256),
+            p1 in proptest::collection::vec(any::<u8>(), 0..=256),
+            p2 in proptest::collection::vec(any::<u8>(), 0..=256),
+            p3 in proptest::collection::vec(any::<u8>(), 0..=256),
+        ) {
+            let planes = [p0, p1, p2, p3];
+            let _ = reconstruct(&planes, width, height, color_loss, subsampled);
         }
     }
 }
