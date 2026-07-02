@@ -87,6 +87,18 @@ impl fmt::Display for ClearError {
 
 impl std::error::Error for ClearError {}
 
+impl From<crate::nscodec::NscError> for ClearError {
+    fn from(e: crate::nscodec::NscError) -> Self {
+        // The two codec error enums share a shape; map an NSCodec-subcodec failure through verbatim.
+        match e {
+            crate::nscodec::NscError::NotEnoughBytes { ctx } => ClearError::NotEnoughBytes { ctx },
+            crate::nscodec::NscError::InvalidField { field, reason } => {
+                ClearError::InvalidField { field, reason }
+            }
+        }
+    }
+}
+
 fn invalid(field: &'static str, reason: &'static str) -> ClearError {
     ClearError::InvalidField { field, reason }
 }
@@ -623,13 +635,11 @@ impl ClearDecoder {
             match codec_id {
                 0x00 => decode_raw_region(bitmap, output, x_start, y_start, width, height, sw)?,
                 0x02 => decode_rlex_region(bitmap, output, x_start, y_start, width, height, sw)?,
-                // NSCodec (0x01) is a valid subcodec FreeRDP decodes (clear.c:543) that we do not
-                // implement yet. Real Windows Server 2022 *does* send it (replay corpus entry 30,
-                // 48x78 — verified 2026-07-02), so failing the tile would drop a live frame: we
-                // skip this sub-region (it keeps the residual/band content already drawn) and
-                // continue. The decode gap is tracked in #132. (#121; the earlier "not produced by
-                // EGFX servers in practice" comment was wrong — the capture disproves it.)
-                0x01 => {}
+                // NSCodec (0x01): a real WS2022 stream sends it (replay corpus entry 30, 48x78).
+                // Decoded via the self-owned NSCodec codec (epic #132) and composited like the raw
+                // subcodec. The ironrdp oracle still *skips* NSCodec, so this sub-region is the one
+                // place our output legitimately exceeds the oracle (see the corpus differential).
+                0x01 => decode_nscodec_region(bitmap, output, x_start, y_start, width, height, sw)?,
                 _ => return Err(invalid("subCodecId", "unknown subcodec ID")),
             }
         }
@@ -703,6 +713,33 @@ fn reconstruct_full_vbar(
         pixels.extend_from_slice(&[bg_blue, bg_green, bg_red]);
     }
     FullVBar { pixels }
+}
+
+/// Decode an NSCodec subcodec region (codecId 0x01) via the self-owned NSCodec codec and composite
+/// its BGRA output into the ClearCodec surface, like the raw subcodec. Region bounds were validated
+/// by the caller; NSCodec produces exactly `width*height*4` bytes on success.
+fn decode_nscodec_region(
+    bitmap: &[u8],
+    output: &mut [u8],
+    x_start: u16,
+    y_start: u16,
+    width: u16,
+    height: u16,
+    sw: usize,
+) -> Result<(), ClearError> {
+    let pixels = crate::nscodec::decode(bitmap, width, height)?;
+    let w = usize::from(width);
+    let h = usize::from(height);
+    for row in 0..h {
+        for col in 0..w {
+            let x = usize::from(x_start) + col;
+            let y = usize::from(y_start) + row;
+            let src = (row * w + col) * 4;
+            let dst = (y * sw + x) * 4;
+            output[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+        }
+    }
+    Ok(())
 }
 
 fn decode_raw_region(
@@ -1157,28 +1194,36 @@ mod tests {
     }
 
     #[test]
-    fn nscodec_subcodec_is_skipped_not_rejected() {
-        // NSCodec (0x01) is a valid subcodec real WS2022 servers send (replay corpus entry 30) that
-        // we do not implement yet (#132). It must be skipped — the sub-region keeps prior content —
-        // so the frame still decodes; rejecting would drop a live frame (verified: a hard error
-        // breaks the corpus replay). This pins the interop-required tolerance (#121).
-        let subcodec: Vec<u8> = vec![
-            0, 0, // x_start
-            0, 0, // y_start
-            1, 0, // width = 1
-            1, 0, // height = 1
-            0, 0, 0, 0,    // bitmapByteCount = 0
-            0x01, // codecId = NSCodec
-        ];
+    fn nscodec_subcodec_decodes_into_the_region() {
+        // An NSCodec subcodec (0x01) is now decoded via the self-owned codec (epic #132) and
+        // composited, not skipped. A 1×1 NSCodec stream (raw planes, ColorLossLevel 1) wrapped in a
+        // ClearCodec subcodec region must paint its pixel.
+        let mut nsc = Vec::new();
+        for c in [1u32, 1, 1, 1] {
+            nsc.extend_from_slice(&c.to_le_bytes()); // plane byte counts
+        }
+        nsc.push(1); // ColorLossLevel
+        nsc.push(0); // ChromaSubsamplingLevel
+        nsc.extend_from_slice(&[0, 0]); // reserved
+        nsc.extend_from_slice(&[100, 10, 5, 255]); // Y, Co, Cg, A (1 raw byte each)
+
+        let mut subcodec = Vec::new();
+        subcodec.extend_from_slice(&0u16.to_le_bytes()); // x_start
+        subcodec.extend_from_slice(&0u16.to_le_bytes()); // y_start
+        subcodec.extend_from_slice(&1u16.to_le_bytes()); // width
+        subcodec.extend_from_slice(&1u16.to_le_bytes()); // height
+        subcodec.extend_from_slice(&u32::try_from(nsc.len()).unwrap().to_le_bytes());
+        subcodec.push(0x01); // codecId = NSCodec
+        subcodec.extend_from_slice(&nsc);
+
         let mut stream = vec![0x00, 0x00]; // flags, seq
         stream.extend_from_slice(&0u32.to_le_bytes()); // residualByteCount
         stream.extend_from_slice(&0u32.to_le_bytes()); // bandsByteCount
         stream.extend_from_slice(&u32::try_from(subcodec.len()).unwrap().to_le_bytes());
         stream.extend_from_slice(&subcodec);
 
-        assert!(
-            ClearDecoder::new().decode(&stream, 1, 1).is_ok(),
-            "an NSCodec subcodec must be skipped, not rejected (real servers send it)"
-        );
+        let out = ClearDecoder::new().decode(&stream, 1, 1).unwrap();
+        // Y100 Co10 Cg5, shift 0 → R=105 G=105 B=85; BGRA.
+        assert_eq!(&out[0..4], &[85, 105, 105, 255]);
     }
 }
