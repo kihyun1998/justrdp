@@ -3,9 +3,11 @@
 //! [`FrameUpdate`] the host's frame sink receives. Mirrors the decode-complete reference
 //! model of ironrdp-session's image buffer (plan.md §7).
 
-/// One rectangle of fresh pixels for the host: position, size, and RGBA8888 data (top-down,
-/// stride = `width × 4`, little-endian byte order R,G,B,A).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One rectangle of the framebuffer that changed: position and size only. The pixels live in
+/// the retained [`Framebuffer`] (ADR-0010) — the host reads them by borrow via
+/// [`Framebuffer::copy_rect_into`] (or [`Framebuffer::pixels`] + the rect), inside the
+/// synchronous frame sink. Coordinates are top-down framebuffer pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameUpdate {
     /// Left edge in framebuffer coordinates.
     pub x: u16,
@@ -15,8 +17,6 @@ pub struct FrameUpdate {
     pub width: u16,
     /// Height in pixels.
     pub height: u16,
-    /// `width × height × 4` RGBA bytes.
-    pub pixels: Vec<u8>,
 }
 
 /// The desktop-sized RGBA8888 pixel buffer.
@@ -68,7 +68,9 @@ impl Framebuffer {
 
     /// Copy a `copy_width × copy_height` region out of `src` (an RGBA image `src_stride_px`
     /// pixels wide) to `(x, y)`, clipped to the framebuffer bounds, and return the resulting
-    /// [`FrameUpdate`] — `None` when the region lies entirely outside the framebuffer.
+    /// dirty [`FrameUpdate`] rect — `None` when the region lies entirely outside the framebuffer.
+    /// The pixels are written into the retained framebuffer only; the host reads them back via
+    /// [`Self::copy_rect_into`] (ADR-0010 — no owned per-region copy).
     pub fn blit(
         &mut self,
         x: u16,
@@ -89,32 +91,48 @@ impl Framebuffer {
         }
 
         let fb_stride = usize::from(self.width) * 4;
-        let mut pixels = Vec::with_capacity(width * height * 4);
         for row in 0..height {
             let src_off = row * src_stride_px * 4;
             let src_row = &src[src_off..src_off + width * 4];
             let dst_off = (usize::from(y) + row) * fb_stride + usize::from(x) * 4;
             self.pixels[dst_off..dst_off + width * 4].copy_from_slice(src_row);
-            pixels.extend_from_slice(src_row);
         }
         Some(FrameUpdate {
             x,
             y,
             width: width as u16,
             height: height as u16,
-            pixels,
         })
     }
 
-    /// The whole framebuffer as one [`FrameUpdate`] (the full-screen re-emit after
-    /// reactivation).
+    /// The whole framebuffer as one [`FrameUpdate`] rect (the full-screen re-emit after
+    /// reactivation). The pixels stay in the framebuffer; the host reads them via
+    /// [`Self::pixels`] / [`Self::copy_rect_into`].
     pub fn full_frame(&self) -> FrameUpdate {
         FrameUpdate {
             x: 0,
             y: 0,
             width: self.width,
             height: self.height,
-            pixels: self.pixels.clone(),
+        }
+    }
+
+    /// Copy the `width × height` region at `(x, y)` out of the framebuffer into `dst` (tightly
+    /// packed top-down RGBA8888, exactly `width × height × 4` bytes), handling the framebuffer
+    /// stride. This is how a host materializes a [`FrameUpdate`]'s pixels (ADR-0010): the region
+    /// is strided inside the retained framebuffer, so it is not a single contiguous slice — a
+    /// host uploading a dirty rect to a GPU texture instead copies it out row by row here.
+    ///
+    /// Preconditions (always met by a [`FrameUpdate`] this framebuffer produced): the region lies
+    /// within the framebuffer and `dst.len() >= width × height × 4`.
+    pub fn copy_rect_into(&self, x: u16, y: u16, width: u16, height: u16, dst: &mut [u8]) {
+        let fb_stride = usize::from(self.width) * 4;
+        let row_bytes = usize::from(width) * 4;
+        for row in 0..usize::from(height) {
+            let src_off = (usize::from(y) + row) * fb_stride + usize::from(x) * 4;
+            let dst_off = row * row_bytes;
+            dst[dst_off..dst_off + row_bytes]
+                .copy_from_slice(&self.pixels[src_off..src_off + row_bytes]);
         }
     }
 }
@@ -136,7 +154,10 @@ mod tests {
             (update.x, update.y, update.width, update.height),
             (1, 2, 2, 2)
         );
-        assert_eq!(&update.pixels[..4], &[255, 0, 0, 255]);
+        // The host reads the region back out of the retained framebuffer (ADR-0010).
+        let mut region = vec![0u8; 2 * 2 * 4];
+        fb.copy_rect_into(update.x, update.y, update.width, update.height, &mut region);
+        assert_eq!(&region[..4], &[255, 0, 0, 255]);
         // Framebuffer row 2, col 1 holds red; col 0 stays black.
         let stride = 4 * 4;
         assert_eq!(&fb.pixels()[2 * stride..2 * stride + 4], &[0, 0, 0, 255]);
