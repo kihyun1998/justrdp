@@ -16,7 +16,8 @@
 //! Progressive, so the real VM cannot exercise it; the synthetic differential corpus is the
 //! verification ceiling).
 
-use crate::dvc::{DvcProcessor, EgfxRegion, ProcessorOutput};
+use crate::dvc::{DvcProcessor, ProcessorOutput};
+use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::clearcodec::Clear;
 use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::egfx::{Progressive, Zgfx};
@@ -385,7 +386,7 @@ impl GraphicsProcessor {
                 tracing::trace!(target: "rdp_egfx", frame_id, "EndFrame");
                 self.in_frame = false;
                 self.frames_decoded = self.frames_decoded.wrapping_add(1);
-                self.flush_dirty(outputs);
+                // The dirty regions are blitted by `flush_frames` after the payload (#163).
                 // Raw, not segment-wrapped — client→server EGFX asymmetry, see start().
                 outputs.push(ProcessorOutput::Send(egfx::encode_frame_acknowledge(
                     frame_id,
@@ -622,15 +623,14 @@ impl GraphicsProcessor {
         for pdu in egfx::decode_all(blob)? {
             self.handle(pdu, &mut outputs)?;
         }
-        if !self.in_frame {
-            // Draw ops outside a Start/End Frame bracket (spec-legal, rare): show them now.
-            self.flush_dirty(&mut outputs);
-        }
         Ok(outputs)
     }
 
-    /// Emit the accumulated dirty regions of every output-mapped surface as frames.
-    fn flush_dirty(&mut self, outputs: &mut Vec<ProcessorOutput>) {
+    /// Blit the accumulated dirty regions of every output-mapped surface straight into
+    /// `framebuffer` — no intermediate owned extract (ADR-0010 slice #163) — and return the
+    /// dirty rects in output coordinates.
+    fn blit_dirty(&mut self, framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
+        let mut frames = Vec::new();
         for surface in &mut self.surfaces {
             if surface.dirty.is_empty() {
                 continue;
@@ -639,19 +639,11 @@ impl GraphicsProcessor {
                 surface.dirty.clear(); // off-screen scratch surface: nothing to show yet
                 continue;
             };
+            let sw = usize::from(surface.width);
             let rects = core::mem::take(&mut surface.dirty);
             for (x, y, w, h) in rects {
-                let (w, h, pixels) = {
-                    let stride = usize::from(surface.width) * 4;
-                    let w = w.min(surface.width.saturating_sub(x));
-                    let h = h.min(surface.height.saturating_sub(y));
-                    let mut out = Vec::with_capacity(usize::from(w) * usize::from(h) * 4);
-                    for row in 0..usize::from(h) {
-                        let off = (usize::from(y) + row) * stride + usize::from(x) * 4;
-                        out.extend_from_slice(&surface.rgba[off..off + usize::from(w) * 4]);
-                    }
-                    (w, h, out)
-                };
+                let w = w.min(surface.width.saturating_sub(x));
+                let h = h.min(surface.height.saturating_sub(y));
                 if w == 0 || h == 0 {
                     continue;
                 }
@@ -665,15 +657,18 @@ impl GraphicsProcessor {
                 ) else {
                     continue; // mapped beyond the addressable output: nothing visible
                 };
-                outputs.push(ProcessorOutput::Frame(EgfxRegion {
-                    x: out_x,
-                    y: out_y,
-                    width: w,
-                    height: h,
-                    pixels,
-                }));
+                // Blit the surface sub-region directly: pass the region's start offset and the
+                // full surface stride so `Framebuffer::blit` copies it row by row into the
+                // framebuffer — the extract Vec the bridge used to carry is gone (#163).
+                let src_off = (usize::from(y) * sw + usize::from(x)) * 4;
+                if let Some(update) =
+                    framebuffer.blit(out_x, out_y, w, h, &surface.rgba[src_off..], sw)
+                {
+                    frames.push(update);
+                }
             }
         }
+        frames
     }
 }
 
@@ -715,6 +710,16 @@ impl DvcProcessor for GraphicsProcessor {
             .and_then(|()| self.process_blob(&blob));
         self.zgfx_blob = blob;
         result
+    }
+
+    fn flush_frames(&mut self, framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
+        // Only flush completed frames: mid-bracket dirty (a Start Frame whose End Frame is in a
+        // later payload) waits, matching the pre-#163 behavior where the EndFrame handler drove
+        // the flush. Unbracketed draw ops (in_frame already false) flush at once.
+        if self.in_frame {
+            return Vec::new();
+        }
+        self.blit_dirty(framebuffer)
     }
 
     fn close(&mut self) {
@@ -769,6 +774,24 @@ mod tests {
             body.extend_from_slice(&v.to_le_bytes());
         }
         body
+    }
+
+    /// Blit the processor's accumulated dirty regions into a fresh framebuffer big enough for
+    /// these tests' mapped outputs, returning it with the dirty rects (ADR-0010 #163). The
+    /// framebuffer is the authoritative screen state, so tests assert its pixels — not the frame
+    /// list, whose granularity now coalesces per payload (e.g. a map's whole-surface rect plus a
+    /// fill rect).
+    fn flush(p: &mut GraphicsProcessor) -> (Framebuffer, Vec<FrameUpdate>) {
+        let mut fb = Framebuffer::new(256, 256);
+        let frames = p.flush_frames(&mut fb);
+        (fb, frames)
+    }
+
+    /// One flushed rect's RGBA pixels, read back out of the framebuffer.
+    fn region(fb: &Framebuffer, f: &FrameUpdate) -> Vec<u8> {
+        let mut px = vec![0u8; usize::from(f.width) * usize::from(f.height) * 4];
+        fb.copy_rect_into(f.x, f.y, f.width, f.height, &mut px);
+        px
     }
 
     #[test]
@@ -830,9 +853,9 @@ mod tests {
     fn solid_fill_inside_a_frame_flushes_at_end_frame_with_ack() {
         let mut p = GraphicsProcessor::default();
         create_surface(&mut p, 1, 16, 8);
-        // Mapping marks the whole surface dirty, but un-bracketed ops flush immediately.
-        let outputs = map_surface(&mut p, 1, 0, 0);
-        assert_eq!(outputs.len(), 1, "map flushes the initial (black) surface");
+        // Mapping marks the whole surface dirty but no longer flushes mid-process (ADR-0010 #163:
+        // the session drains dirty into the framebuffer after the payload).
+        assert!(map_surface(&mut p, 1, 0, 0).is_empty());
 
         // StartFrame; fill red; nothing flushes until EndFrame.
         let mut start = vec![0u8; 8];
@@ -847,14 +870,28 @@ mod tests {
             .is_empty()
         );
         let outputs = feed(&mut p, egfx::CMDID_END_FRAME, &7u32.to_le_bytes());
-        let [Out::Frame(frame), Out::Send(ack)] = outputs.as_slice() else {
-            panic!("expected frame + ack, got {outputs:?}");
+        // EndFrame now emits only the raw FrameAcknowledge; the pixels flush separately.
+        let [Out::Send(ack)] = outputs.as_slice() else {
+            panic!("expected the frame ack, got {outputs:?}");
         };
-        assert_eq!((frame.x, frame.y, frame.width, frame.height), (2, 1, 4, 2));
-        assert!(frame.pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
         // The ack is a RAW FrameAcknowledge for frame 7 (no segment wrapping outbound).
         assert_eq!(&ack[..2], &egfx::CMDID_FRAME_ACKNOWLEDGE.to_le_bytes());
         assert_eq!(&ack[12..16], &7u32.to_le_bytes());
+        // Flush drains the dirty into the framebuffer: the red fill lands at (2,1,4,2). The
+        // framebuffer is authoritative, so read it at the known rect (frame-list granularity now
+        // coalesces per payload).
+        let (fb, frames) = flush(&mut p);
+        assert!(!frames.is_empty(), "the fill flushes");
+        let fill = region(
+            &fb,
+            &FrameUpdate {
+                x: 2,
+                y: 1,
+                width: 4,
+                height: 2,
+            },
+        );
+        assert!(fill.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
     }
 
     #[test]
@@ -862,15 +899,20 @@ mod tests {
         let mut p = GraphicsProcessor::default();
         create_surface(&mut p, 1, 8, 8);
         map_surface(&mut p, 1, 100, 50);
-        let outputs = feed(
-            &mut p,
-            egfx::CMDID_SOLID_FILL,
-            &solid_fill_body(1, [1, 2, 3, 0], [0, 0, 4, 4]),
+        assert!(
+            feed(
+                &mut p,
+                egfx::CMDID_SOLID_FILL,
+                &solid_fill_body(1, [1, 2, 3, 0], [0, 0, 4, 4]),
+            )
+            .is_empty()
         );
-        let [Out::Frame(frame)] = outputs.as_slice() else {
-            panic!("expected one frame, got {outputs:?}");
-        };
-        assert_eq!((frame.x, frame.y), (100, 50));
+        let (_fb, frames) = flush(&mut p);
+        assert!(!frames.is_empty(), "the mapped surface flushes");
+        assert!(
+            frames.iter().all(|f| (f.x, f.y) == (100, 50)),
+            "every dirty rect translates to the (100,50) output origin, got {frames:?}"
+        );
     }
 
     #[test]
@@ -888,12 +930,18 @@ mod tests {
         let data: Vec<u8> = (0..4).flat_map(|_| [10u8, 20, 30, 0]).collect(); // BGRX
         body.extend_from_slice(&(data.len() as u32).to_le_bytes());
         body.extend_from_slice(&data);
-        let outputs = feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &body);
-        let [Out::Frame(frame)] = outputs.as_slice() else {
-            panic!("expected one frame, got {outputs:?}");
-        };
-        assert_eq!((frame.x, frame.y, frame.width, frame.height), (1, 1, 2, 2));
-        assert_eq!(&frame.pixels[..4], &[30, 20, 10, 255]); // BGR → RGB
+        assert!(feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &body).is_empty());
+        let (fb, _frames) = flush(&mut p);
+        let px = region(
+            &fb,
+            &FrameUpdate {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            },
+        );
+        assert_eq!(&px[..4], &[30, 20, 10, 255]); // BGR → RGB
     }
 
     #[test]
@@ -923,12 +971,18 @@ mod tests {
         for v in [6i16, 6] {
             body.extend_from_slice(&v.to_le_bytes());
         }
-        let outputs = feed(&mut p, egfx::CMDID_CACHE_TO_SURFACE, &body);
-        let [Out::Frame(frame)] = outputs.as_slice() else {
-            panic!("expected one frame, got {outputs:?}");
-        };
-        assert_eq!((frame.x, frame.y, frame.width, frame.height), (6, 6, 2, 2));
-        assert!(frame.pixels.chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
+        assert!(feed(&mut p, egfx::CMDID_CACHE_TO_SURFACE, &body).is_empty());
+        let (fb, _frames) = flush(&mut p);
+        let px = region(
+            &fb,
+            &FrameUpdate {
+                x: 6,
+                y: 6,
+                width: 2,
+                height: 2,
+            },
+        );
+        assert!(px.chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
         // Evict frees the budget.
         feed(&mut p, egfx::CMDID_EVICT_CACHE_ENTRY, &5u16.to_le_bytes());
         assert_eq!(p.cache_bytes, 0);
@@ -955,12 +1009,18 @@ mod tests {
         for v in [1i16, 1] {
             body.extend_from_slice(&v.to_le_bytes());
         }
-        let outputs = feed(&mut p, egfx::CMDID_SURFACE_TO_SURFACE, &body);
-        let [Out::Frame(frame)] = outputs.as_slice() else {
-            panic!("expected one frame, got {outputs:?}");
-        };
-        assert_eq!((frame.x, frame.y, frame.width, frame.height), (1, 1, 2, 2));
-        assert_eq!(&frame.pixels[..4], &[9, 9, 9, 255]);
+        assert!(feed(&mut p, egfx::CMDID_SURFACE_TO_SURFACE, &body).is_empty());
+        let (fb, _frames) = flush(&mut p);
+        let px = region(
+            &fb,
+            &FrameUpdate {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            },
+        );
+        assert_eq!(&px[..4], &[9, 9, 9, 255]);
     }
 
     #[test]
@@ -1057,21 +1117,22 @@ mod tests {
         }
         body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         body.extend_from_slice(&payload);
-        let outputs = feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &body);
-        let [Out::Frame(frame)] = outputs.as_slice() else {
-            panic!("expected one frame, got {outputs:?}");
-        };
-        assert_eq!(
-            (frame.x, frame.y, frame.width, frame.height),
-            (0, 0, 64, 64)
+        assert!(feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &body).is_empty());
+        let (fb, frames) = flush(&mut p);
+        assert!(!frames.is_empty(), "the cavideo frame flushes");
+        let pixels = region(
+            &fb,
+            &FrameUpdate {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            },
         );
         assert!(
-            frame
-                .pixels
-                .chunks_exact(4)
-                .all(|p| p == [128, 128, 128, 255]),
+            pixels.chunks_exact(4).all(|p| p == [128, 128, 128, 255]),
             "zero spectrum must decode to mid gray, got {:?}…",
-            &frame.pixels[..8]
+            &pixels[..8]
         );
     }
 
@@ -1088,14 +1149,18 @@ mod tests {
         let mut p = GraphicsProcessor::default();
         create_surface(&mut p, 1, 4, 4);
         assert!(map_surface(&mut p, 1, u32::MAX, u32::MAX).is_empty());
-        let outputs = feed(
-            &mut p,
-            egfx::CMDID_SOLID_FILL,
-            &solid_fill_body(1, [1, 1, 1, 0], [0, 0, 4, 4]),
-        );
         assert!(
-            outputs.is_empty(),
-            "unaddressable mapping must drop frames, got {outputs:?}"
+            feed(
+                &mut p,
+                egfx::CMDID_SOLID_FILL,
+                &solid_fill_body(1, [1, 1, 1, 0], [0, 0, 4, 4]),
+            )
+            .is_empty()
+        );
+        let (_fb, frames) = flush(&mut p);
+        assert!(
+            frames.is_empty(),
+            "unaddressable mapping must drop frames, got {frames:?}"
         );
     }
 
