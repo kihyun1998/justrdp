@@ -16,8 +16,7 @@
 //! Progressive, so the real VM cannot exercise it; the synthetic differential corpus is the
 //! verification ceiling).
 
-use crate::dvc::{DvcProcessor, ProcessorOutput};
-use crate::framebuffer::FrameUpdate;
+use crate::dvc::{DvcProcessor, EgfxRegion, ProcessorOutput};
 use justrdp_codecs::clearcodec::Clear;
 use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::egfx::{Progressive, Zgfx};
@@ -666,7 +665,7 @@ impl GraphicsProcessor {
                 ) else {
                     continue; // mapped beyond the addressable output: nothing visible
                 };
-                outputs.push(ProcessorOutput::Frame(FrameUpdate {
+                outputs.push(ProcessorOutput::Frame(EgfxRegion {
                     x: out_x,
                     y: out_y,
                     width: w,

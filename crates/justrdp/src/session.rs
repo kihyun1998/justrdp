@@ -896,6 +896,15 @@ mod tests {
     const DRDYNVC: u16 = 1005;
     const SHARE: u32 = 0x0001_03EA;
 
+    /// Read a delivered frame's pixels back out of the retained framebuffer — the host's job
+    /// now that [`FrameUpdate`] carries only the dirty rect (ADR-0010).
+    fn frame_pixels(sm: &SessionStateMachine, frame: &FrameUpdate) -> Vec<u8> {
+        let mut px = vec![0u8; usize::from(frame.width) * usize::from(frame.height) * 4];
+        sm.framebuffer()
+            .copy_rect_into(frame.x, frame.y, frame.width, frame.height, &mut px);
+        px
+    }
+
     fn config() -> SessionConfig {
         SessionConfig {
             user_channel_id: USER,
@@ -1298,7 +1307,7 @@ mod tests {
         };
         assert_eq!((frame.x, frame.y, frame.width, frame.height), (2, 1, 4, 2));
         // BGR [10,20,30] → RGBA [30,20,10,255].
-        assert_eq!(&frame.pixels[..4], &[30, 20, 10, 255]);
+        assert_eq!(&frame_pixels(&sm, frame)[..4], &[30, 20, 10, 255]);
         // And the framebuffer holds it at (2,1): row 1 × stride 16 px + col 2, ×4 bytes.
         let off = (16 + 2) * 4;
         assert_eq!(&sm.framebuffer().pixels()[off..off + 4], &[30, 20, 10, 255]);
@@ -1327,8 +1336,9 @@ mod tests {
         let [SessionOutput::Frame(frame)] = outputs.as_slice() else {
             panic!("expected one frame, got {outputs:?}");
         };
-        assert_eq!(&frame.pixels[..4], &[255, 0, 0, 255]);
-        assert!(frame.pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+        let px = frame_pixels(&sm, frame);
+        assert_eq!(&px[..4], &[255, 0, 0, 255]);
+        assert!(px.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
     }
 
     #[test]
@@ -1366,7 +1376,7 @@ mod tests {
         let [SessionOutput::Frame(frame)] = outputs.as_slice() else {
             panic!("expected one frame");
         };
-        assert_eq!(&frame.pixels[..4], &[1, 2, 3, 255]);
+        assert_eq!(&frame_pixels(&sm, frame)[..4], &[1, 2, 3, 255]);
     }
 
     #[test]
@@ -1471,7 +1481,7 @@ mod tests {
             panic!("expected one frame, got {outputs:?}");
         };
         assert_eq!((frame.x, frame.y), (1, 1));
-        assert_eq!(&frame.pixels[..4], &[60, 50, 40, 255]);
+        assert_eq!(&frame_pixels(&sm, frame)[..4], &[60, 50, 40, 255]);
     }
 
     #[test]
@@ -1511,7 +1521,7 @@ mod tests {
             panic!("expected the reassembled frame, got {outputs:?}");
         };
         assert_eq!((frame.width, frame.height), (8, 4));
-        assert_eq!(&frame.pixels[..4], &[3, 2, 1, 255]);
+        assert_eq!(&frame_pixels(&sm, frame)[..4], &[3, 2, 1, 255]);
     }
 
     #[test]

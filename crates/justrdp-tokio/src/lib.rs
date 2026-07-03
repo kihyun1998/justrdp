@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use justrdp::{
     Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, CursorEvent,
-    DisconnectReason, Event, FrameUpdate, InputEvent, LicenseEntropy, McsConnectResult,
-    SessionError, SessionOutput, SessionStateMachine,
+    DisconnectReason, Event, FrameUpdate, Framebuffer, InputEvent, LicenseEntropy,
+    McsConnectResult, SessionError, SessionOutput, SessionStateMachine,
 };
 use rustls::pki_types::ServerName;
 use sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, TsRequest};
@@ -642,7 +642,7 @@ impl core::error::Error for SessionFailure {}
 pub async fn run_session(
     stream: &mut TlsStream<TcpStream>,
     machine: &mut SessionStateMachine,
-    on_frame: impl FnMut(&FrameUpdate),
+    on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
     on_cursor: impl FnMut(&CursorEvent),
 ) -> Result<DisconnectReason, SessionFailure> {
     // A pre-closed input channel: the input branch disables itself on the first (None) recv.
@@ -663,7 +663,7 @@ pub async fn run_session(
 pub async fn run_session_with_input(
     stream: &mut TlsStream<TcpStream>,
     machine: &mut SessionStateMachine,
-    mut on_frame: impl FnMut(&FrameUpdate),
+    mut on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
     mut on_cursor: impl FnMut(&CursorEvent),
     input: &mut tokio::sync::mpsc::Receiver<Vec<InputEvent>>,
 ) -> Result<DisconnectReason, SessionFailure> {
@@ -685,7 +685,7 @@ pub async fn run_session_with_input(
                         height = frame.height,
                         "frame update"
                     );
-                    on_frame(&frame);
+                    on_frame(&frame, machine.framebuffer());
                 }
                 SessionOutput::Cursor(event) => {
                     tracing::trace!(?event, "cursor event");
@@ -777,7 +777,7 @@ pub enum SessionEvent {
 pub async fn run_session_with_commands(
     stream: &mut TlsStream<TcpStream>,
     machine: &mut SessionStateMachine,
-    mut on_frame: impl FnMut(&FrameUpdate),
+    mut on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
     mut on_cursor: impl FnMut(&CursorEvent),
     mut on_event: impl FnMut(SessionEvent),
     commands: &mut tokio::sync::mpsc::Receiver<SessionCommand>,
@@ -791,7 +791,7 @@ pub async fn run_session_with_commands(
     loop {
         for output in pending.drain(..) {
             match output {
-                SessionOutput::Frame(frame) => on_frame(&frame),
+                SessionOutput::Frame(frame) => on_frame(&frame, machine.framebuffer()),
                 SessionOutput::Cursor(event) => on_cursor(&event),
                 SessionOutput::WriteBytes(bytes) => {
                     stream.write_all(&bytes).await.map_err(SessionFailure::Io)?;
@@ -2322,7 +2322,7 @@ mod tests {
             run_session(
                 &mut stream,
                 &mut machine,
-                |frame| {
+                |frame, _fb| {
                     frames += 1;
                     covered += u64::from(frame.width) * u64::from(frame.height);
                 },
@@ -2456,7 +2456,7 @@ mod tests {
             run_session_with_commands(
                 &mut stream,
                 &mut machine,
-                |_| {},
+                |_, _fb| {},
                 |_| {},
                 |_| {},
                 &mut commands,
@@ -2534,7 +2534,7 @@ mod tests {
         run_session(
             &mut stream,
             &mut machine,
-            |_| {},
+            |_, _fb| {},
             |c| cursors.push(c.clone()),
         )
         .await
@@ -2594,7 +2594,7 @@ mod tests {
             },
             Vec::new(),
         );
-        run_session(&mut stream, &mut machine, |_| {}, |_| {}).await
+        run_session(&mut stream, &mut machine, |_, _fb| {}, |_| {}).await
     }
 
     /// A server→client MCS Send Data Indication frame on `channel` (initiator 1002), TPKT
@@ -2700,7 +2700,7 @@ mod tests {
             run_session(
                 &mut stream,
                 &mut machine,
-                |frame| {
+                |frame, _fb| {
                     frames += 1;
                     covered += u64::from(frame.width) * u64::from(frame.height);
                 },
@@ -2802,7 +2802,7 @@ mod tests {
         // Clear area, so a longer window captures a richer corpus.
         let _ = tokio::time::timeout(
             Duration::from_secs(20),
-            run_session(&mut stream, &mut machine, |_| {}, |_| {}),
+            run_session(&mut stream, &mut machine, |_, _fb| {}, |_| {}),
         )
         .await;
 
@@ -2916,7 +2916,7 @@ mod tests {
         };
         let resized_in_sink = resized_seen.clone();
         let canceller = cancel.clone();
-        let on_frame = move |frame: &FrameUpdate| {
+        let on_frame = move |frame: &FrameUpdate, _fb: &Framebuffer| {
             if (frame.width, frame.height) == target && (frame.x, frame.y) == (0, 0) {
                 // The post-reactivation full-screen re-emit at the new size.
                 eprintln!(
@@ -3081,7 +3081,7 @@ mod tests {
             run_session_with_input(
                 &mut stream,
                 &mut machine,
-                |_| {
+                |_, _fb| {
                     frames_in_sink.fetch_add(1, Ordering::SeqCst);
                 },
                 |_| {},
@@ -3203,7 +3203,7 @@ mod tests {
             run_session_with_input(
                 &mut stream,
                 &mut machine,
-                |_| {
+                |_, _fb| {
                     frames_in_sink.fetch_add(1, Ordering::SeqCst);
                 },
                 |_| {},
@@ -3293,7 +3293,7 @@ mod tests {
             run_session(
                 &mut stream,
                 &mut machine,
-                |_| {
+                |_, _fb| {
                     frames.fetch_add(1, Ordering::SeqCst);
                 },
                 |_| {},
@@ -3468,7 +3468,7 @@ mod tests {
             run_session_with_input(
                 &mut stream,
                 &mut machine,
-                |_| {
+                |_, _fb| {
                     frames_in_sink.fetch_add(1, Ordering::SeqCst);
                 },
                 |c| cursor_events.push(c.clone()),
@@ -3601,7 +3601,7 @@ mod tests {
             run_session_with_input(
                 &mut stream,
                 &mut machine,
-                |_| {
+                |_, _fb| {
                     frames_in_sink.fetch_add(1, Ordering::SeqCst);
                 },
                 |_| {},
