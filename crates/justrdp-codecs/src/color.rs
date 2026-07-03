@@ -41,6 +41,16 @@ pub enum ColorError {
         /// Bytes available.
         got: usize,
     },
+    /// A `width × height`-derived buffer size overflows `usize` on this target — only reachable on
+    /// a **32-bit** target (notably **wasm32**, a stated reach goal — ADR-0002 amendment / #100),
+    /// where the `usize` params can make `width × bpp × height` or `width × height × 4` exceed
+    /// `u32::MAX`. Returned instead of a debug panic / release wrap. Sibling of #151 (#155).
+    DimensionsOverflow {
+        /// The requested width.
+        width: usize,
+        /// The requested height.
+        height: usize,
+    },
 }
 
 impl core::fmt::Display for ColorError {
@@ -54,6 +64,9 @@ impl core::fmt::Display for ColorError {
                     f,
                     "source pixel buffer too short: need {needed}, have {got}"
                 )
+            }
+            ColorError::DimensionsOverflow { width, height } => {
+                write!(f, "{width}x{height} pixels overflow usize on this target")
             }
         }
     }
@@ -91,8 +104,12 @@ pub fn to_rgba(
     bottom_up: bool,
 ) -> Result<Vec<u8>, ColorError> {
     let bpp = bytes_per_pixel(bits_per_pixel)?;
-    let row_bytes = width * bpp;
-    let needed = row_bytes * height;
+    // width/height are usize, so on a 32-bit target a caller can make width × bpp × height (the
+    // source length) or width × height × 4 (the output) exceed usize (#155). Check both before
+    // allocating rather than panic (debug) / wrap-then-OOB (release).
+    let overflow = || ColorError::DimensionsOverflow { width, height };
+    let row_bytes = width.checked_mul(bpp).ok_or_else(overflow)?;
+    let needed = row_bytes.checked_mul(height).ok_or_else(overflow)?;
     if src.len() < needed {
         return Err(ColorError::SourceTooShort {
             needed,
@@ -100,7 +117,11 @@ pub fn to_rgba(
         });
     }
 
-    let mut out = Vec::with_capacity(width * height * 4);
+    let out_cap = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(overflow)?;
+    let mut out = Vec::with_capacity(out_cap);
     for out_row in 0..height {
         let src_row = if bottom_up {
             height - 1 - out_row
@@ -209,6 +230,22 @@ fn scale6(c: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Dimensions whose product overflows `usize` are a typed error, never a panic or wrap (#155,
+    // sibling of #151). Only reachable on a 32-bit `usize`: 100_000 × 100_000 = 1e10 > u32::MAX but
+    // fits 64-bit — hence the target gate. The checked source-length product fires before the
+    // output buffer is allocated. Proven on i686-pc-windows-msvc.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn overflowing_dimensions_are_a_typed_error_not_a_panic() {
+        assert_eq!(
+            to_rgba(&[], 100_000, 100_000, 8, &Palette::default(), false),
+            Err(ColorError::DimensionsOverflow {
+                width: 100_000,
+                height: 100_000,
+            })
+        );
+    }
 
     #[test]
     fn palette_lookup_converts_8bpp() {

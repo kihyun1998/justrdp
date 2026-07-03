@@ -20,6 +20,16 @@
 pub enum PlanarError {
     /// `width` or `height` is zero.
     EmptyImage,
+    /// A `width × height`-derived buffer size overflows `usize` on this target — only reachable on
+    /// a **32-bit** target (notably **wasm32**, a stated reach goal — ADR-0002 amendment / #100),
+    /// where the `usize` params can make `width × height` (or the ×3 BGR output) exceed `u32::MAX`.
+    /// Returned instead of a debug panic / release wrap. Sibling of the pointer guard (#151 / #155).
+    DimensionsOverflow {
+        /// The requested width.
+        width: usize,
+        /// The requested height.
+        height: usize,
+    },
     /// The stream ended inside a header, segment, or plane.
     TruncatedInput,
     /// An RLE segment is malformed (zero control byte, or a segment overrunning its scanline).
@@ -30,6 +40,9 @@ impl core::fmt::Display for PlanarError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             PlanarError::EmptyImage => write!(f, "empty image (zero width or height)"),
+            PlanarError::DimensionsOverflow { width, height } => {
+                write!(f, "{width}x{height} pixels overflow usize on this target")
+            }
             PlanarError::TruncatedInput => write!(f, "planar stream ended early"),
             PlanarError::InvalidSegment => write!(f, "malformed RDP6 RLE segment"),
         }
@@ -64,7 +77,11 @@ pub fn decompress(src: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Pl
     } else {
         (width, height)
     };
-    let full_size = width * height;
+    // width/height are usize, so on a 32-bit target a caller can make width × height exceed usize
+    // (#155). Guard it once here; chroma_size ≤ full_size, so it needs no separate check.
+    let full_size = width
+        .checked_mul(height)
+        .ok_or(PlanarError::DimensionsOverflow { width, height })?;
     let chroma_size = chroma_w * chroma_h;
 
     // Decode the three color planes (the alpha plane is decoded only to advance the cursor —
@@ -93,8 +110,13 @@ pub fn decompress(src: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Pl
         )?;
     } else {
         let alpha_size = if use_alpha { full_size } else { 0 };
-        // Raw planes are stored back to back; a single pad byte may trail the stream.
-        let needed = alpha_size + full_size + 2 * chroma_size;
+        // Raw planes are stored back to back; a single pad byte may trail the stream. The sum can
+        // itself overflow on 32-bit even when each term fit (#155), so accumulate it checked.
+        let needed = chroma_size
+            .checked_mul(2)
+            .and_then(|c2| c2.checked_add(alpha_size))
+            .and_then(|s| s.checked_add(full_size))
+            .ok_or(PlanarError::DimensionsOverflow { width, height })?;
         if body.len() < needed {
             return Err(PlanarError::TruncatedInput);
         }
@@ -104,8 +126,12 @@ pub fn decompress(src: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Pl
         plane2.copy_from_slice(&body[p1 + chroma_size..p1 + 2 * chroma_size]);
     }
 
-    // Reassemble to BGR24.
-    let mut out = Vec::with_capacity(full_size * 3);
+    // Reassemble to BGR24. full_size fit above, but full_size × 3 can still overflow on 32-bit
+    // (reachable only if the full_size plane allocations above succeeded first) — check it (#155).
+    let out_cap = full_size
+        .checked_mul(3)
+        .ok_or(PlanarError::DimensionsOverflow { width, height })?;
+    let mut out = Vec::with_capacity(out_cap);
     if cll == 0 {
         // ARGB definition: planes are literally R, G, B.
         for i in 0..full_size {
@@ -208,6 +234,22 @@ fn decode_rle_plane(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // Dimensions whose product overflows `usize` are a typed error, never a panic or wrap (#155,
+    // sibling of #151). Only reachable on a 32-bit `usize`: 100_000 × 100_000 = 1e10 > u32::MAX but
+    // fits 64-bit — hence the target gate. The `width × height` guard fires before any plane is
+    // allocated, so no giant allocation is attempted. Proven on i686-pc-windows-msvc.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn overflowing_dimensions_are_a_typed_error_not_a_panic() {
+        assert_eq!(
+            decompress(&[0x00], 100_000, 100_000),
+            Err(PlanarError::DimensionsOverflow {
+                width: 100_000,
+                height: 100_000,
+            })
+        );
+    }
 
     proptest! {
         // ADR-0008 / issue #97 — the no-panic robustness property. `PlanarError`'s contract says

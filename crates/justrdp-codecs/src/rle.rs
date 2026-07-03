@@ -21,6 +21,17 @@ pub enum RleError {
     },
     /// `width` or `height` is zero.
     EmptyImage,
+    /// `width × pixel-size × height` overflows `usize` on this target — only reachable on a
+    /// **32-bit** target (notably **wasm32**, a stated reach goal — ADR-0002 amendment / #100),
+    /// where a large `width × height` product (the params are `usize`, so a caller can exceed
+    /// `u32::MAX` without either dim being near it) wraps. Returned instead of a debug panic /
+    /// release wrap. Sibling of the pointer guard (#151); this decoder is #155.
+    DimensionsOverflow {
+        /// The requested width.
+        width: usize,
+        /// The requested height.
+        height: usize,
+    },
     /// The compressed stream ended inside an order.
     TruncatedInput,
     /// An order writes past the `width × height` output buffer.
@@ -41,6 +52,9 @@ impl core::fmt::Display for RleError {
                 write!(f, "unsupported interleaved-RLE depth: {bits_per_pixel} bpp")
             }
             RleError::EmptyImage => write!(f, "empty image (zero width or height)"),
+            RleError::DimensionsOverflow { width, height } => {
+                write!(f, "{width}x{height} pixels overflow usize on this target")
+            }
             RleError::TruncatedInput => write!(f, "compressed stream ended inside an order"),
             RleError::OutputOverflow => write!(f, "order writes past the output buffer"),
             RleError::ZeroRunLength => write!(f, "MEGA_MEGA order with zero run length"),
@@ -97,11 +111,15 @@ pub fn decompress(
     if width == 0 || height == 0 {
         return Err(RleError::EmptyImage);
     }
-    let row_bytes = width * pixel_size;
+    // width/height are usize, so a caller can make width × pixel-size × height exceed usize on a
+    // 32-bit target (#155). Check before allocating rather than panic (debug) / wrap-then-OOB.
+    let overflow = || RleError::DimensionsOverflow { width, height };
+    let row_bytes = width.checked_mul(pixel_size).ok_or_else(overflow)?;
+    let total = row_bytes.checked_mul(height).ok_or_else(overflow)?;
     let mut decoder = Decoder {
         src,
         src_pos: 0,
-        dst: vec![0; row_bytes * height],
+        dst: vec![0; total],
         dst_pos: 0,
         pixel_size,
         row_bytes,
@@ -367,6 +385,23 @@ fn decode_order(header: u8) -> u8 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // Dimensions whose product overflows `usize` are a typed error, never a panic or wrap (#155,
+    // sibling of #151). Only reachable on a 32-bit `usize`: 100_000 × 100_000 = 1e10 > u32::MAX but
+    // fits 64-bit, so this case cannot exist on 64-bit — hence the target gate. Each dim is modest,
+    // so no giant allocation is attempted before the checked product returns the error. Proven on
+    // i686-pc-windows-msvc.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn overflowing_dimensions_are_a_typed_error_not_a_panic() {
+        assert_eq!(
+            decompress(&[], 100_000, 100_000, 8),
+            Err(RleError::DimensionsOverflow {
+                width: 100_000,
+                height: 100_000,
+            })
+        );
+    }
 
     proptest! {
         // ADR-0008 / issue #97 — the no-panic robustness property. `RleError`'s contract says
