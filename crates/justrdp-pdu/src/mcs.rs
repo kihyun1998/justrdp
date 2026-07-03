@@ -408,6 +408,31 @@ mod tests {
     }
 
     #[test]
+    fn dpum_round_trips_all_five_t125_reasons() {
+        // The T.125 `Reason` ENUMERATED is 3 bits (5 values), straddling b1[1:0] + b2[7] under the
+        // 6-bit DomainMCSPDU CHOICE tag. RN_CHANNEL_PURGED (4) is the ONLY value whose MSB (bit 2)
+        // is set, so it is the single case that distinguishes our correct 3-bit decode
+        // (`(b1 & 0x03) << 1 | b2 >> 7`) from a naive 2-bit read (FreeRDP's `b1 & 0x01`, which
+        // decodes 4 as 0 — a benign quirk, but ours is the spec-correct one, matching ironrdp).
+        // Narrowing our mask to 0x01 passes every other test; this one pins it (#159).
+        for reason in [
+            RN_DOMAIN_DISCONNECTED,
+            RN_PROVIDER_INITIATED,
+            RN_TOKEN_PURGED,
+            RN_USER_REQUESTED,
+            RN_CHANNEL_PURGED,
+        ] {
+            let frame = encode_disconnect_provider_ultimatum(reason);
+            assert!(
+                DisconnectProviderUltimatum::matches(&frame),
+                "reason {reason}"
+            );
+            let dpum = DisconnectProviderUltimatum::decode(&frame).unwrap();
+            assert_eq!(dpum.reason, reason, "reason {reason} must round-trip");
+        }
+    }
+
+    #[test]
     fn dpum_decodes_the_canonical_user_requested_bytes() {
         // The textbook DPum frame: b1 = (8 << 2) | (3 >> 1) = 0x21, b2 = (3 & 1) << 7 = 0x80
         // — choice 8 (disconnect-provider-ultimatum), reason rn-user-requested(3). The 3-bit
