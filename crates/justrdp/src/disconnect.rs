@@ -58,12 +58,29 @@ impl DisconnectReason {
                 classify(*info)
             }
             DisconnectReason::ServerDisconnected(ServerDisconnectCause::ProviderUltimatum {
-                ..
-            }) => DisconnectClass::Unknown,
+                reason,
+            }) => classify_ultimatum(*reason),
             DisconnectReason::UnexpectedDisconnect | DisconnectReason::LocalClosed => {
                 DisconnectClass::Unknown
             }
         }
+    }
+}
+
+/// Classify an MCS Disconnect Provider Ultimatum by its T.125 `reason` into a host-reaction
+/// bucket (pure). This is the reason-less path — when a Set Error Info PDU is also present its
+/// specific code outranks the ultimatum (`session.rs`), so this only decides the generic farewell.
+///
+/// Only `RN_USER_REQUESTED` (3) carries a reaction: the user asked to disconnect their own session,
+/// so — like the Set-Error-Info `LogoffByUser`/`RpcInitiatedDisconnectByUser` codes (#119) — it is a
+/// [`DisconnectClass::UserLogoff`]. Every other reason (domain-disconnected, provider-initiated,
+/// token/channel purged) and any out-of-enumeration value describes an infrastructure event with no
+/// host reaction, so it stays [`DisconnectClass::Unknown`]. Reason value from FreeRDP `mcs.c`
+/// (`rn-user-requested = 3`) / IronRDP (`DisconnectReason::UserRequested = 3`) — issue #149.
+fn classify_ultimatum(reason: u8) -> DisconnectClass {
+    match reason {
+        justrdp_pdu::mcs::RN_USER_REQUESTED => DisconnectClass::UserLogoff,
+        _ => DisconnectClass::Unknown,
     }
 }
 
@@ -151,5 +168,33 @@ mod tests {
             DisconnectReason::UnexpectedDisconnect.class(),
             DisconnectClass::Unknown
         );
+    }
+
+    #[test]
+    fn user_requested_ultimatum_is_userlogoff_others_unknown() {
+        use justrdp_pdu::mcs::{
+            RN_CHANNEL_PURGED, RN_DOMAIN_DISCONNECTED, RN_PROVIDER_INITIATED, RN_TOKEN_PURGED,
+            RN_USER_REQUESTED,
+        };
+        let ult = |reason| {
+            DisconnectReason::ServerDisconnected(ServerDisconnectCause::ProviderUltimatum {
+                reason,
+            })
+            .class()
+        };
+        // The one ultimatum reason that carries a host reaction: the user asked to disconnect (#149,
+        // sibling of #119's Set-Error-Info side). Cross-checked against FreeRDP (rn-user-requested = 3)
+        // and IronRDP (DisconnectReason::UserRequested = 3).
+        assert_eq!(ult(RN_USER_REQUESTED), DisconnectClass::UserLogoff);
+        // Every other T.125 reason — including out-of-enumeration values — has no reaction.
+        for reason in [
+            RN_DOMAIN_DISCONNECTED,
+            RN_PROVIDER_INITIATED,
+            RN_TOKEN_PURGED,
+            RN_CHANNEL_PURGED,
+            0x7F, // out of the T.125 enumeration, preserved verbatim on decode
+        ] {
+            assert_eq!(ult(reason), DisconnectClass::Unknown, "reason {reason}");
+        }
     }
 }
