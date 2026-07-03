@@ -34,6 +34,19 @@ pub enum PointerError {
         /// Bytes received.
         got: usize,
     },
+    /// The shape's dimensions overflow `usize` on this target. Only reachable on a **32-bit**
+    /// target — notably **wasm32**, a stated reach goal (ADR-0002 amendment / #100 / #151): a
+    /// `stride × height` product, or the `width × height × 4` output length, exceeds `usize::MAX`
+    /// (e.g. width near `u16::MAX` at 32 bpp). On 64-bit these u16-derived products always fit, so
+    /// this never occurs there. Returned instead of a debug panic / release wrap-then-OOB.
+    DimensionsOverflow {
+        /// The shape width.
+        width: u16,
+        /// The shape height.
+        height: u16,
+        /// The declared `xorBpp`.
+        xor_bpp: u16,
+    },
 }
 
 impl core::fmt::Display for PointerError {
@@ -47,6 +60,14 @@ impl core::fmt::Display for PointerError {
                 expected,
                 got,
             } => write!(f, "{mask} is {got} bytes, expected {expected}"),
+            PointerError::DimensionsOverflow {
+                width,
+                height,
+                xor_bpp,
+            } => write!(
+                f,
+                "pointer {width}x{height} at {xor_bpp} bpp overflows usize on this target"
+            ),
         }
     }
 }
@@ -72,28 +93,44 @@ pub fn decode_pointer(
         return Err(PointerError::UnsupportedBpp { bpp: xor_bpp });
     }
 
+    // Capture the original u16 dims for a typed overflow error before shadowing to usize.
+    let overflow = || PointerError::DimensionsOverflow {
+        width,
+        height,
+        xor_bpp,
+    };
+
     let (width, height) = (usize::from(width), usize::from(height));
     // Scan lines are padded to 2-byte boundaries — for the AND mask (1 bpp) and the XOR mask
-    // (xorBpp) alike.
+    // (xorBpp) alike. `width * xor_bpp` ≤ 65535 × 32 always fits usize; but the `stride × height`
+    // products and the `width × height × 4` output length can exceed a 32-bit usize (width near
+    // u16::MAX — wasm32, #151), so they are checked. Different bpp overflow different products
+    // (32 bpp → xor_len; 1 bpp → out_len), so all three are guarded. On 64-bit none can overflow.
     let and_stride = width.div_ceil(16) * 2;
     let xor_stride = (width * usize::from(xor_bpp)).div_ceil(16) * 2;
+    let xor_len = xor_stride.checked_mul(height).ok_or_else(overflow)?;
+    let and_len = and_stride.checked_mul(height).ok_or_else(overflow)?;
+    let out_len = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(overflow)?;
 
-    if xor_mask.len() != xor_stride * height {
+    if xor_mask.len() != xor_len {
         return Err(PointerError::BadMaskSize {
             mask: "xorMaskData",
-            expected: xor_stride * height,
+            expected: xor_len,
             got: xor_mask.len(),
         });
     }
-    if !and_mask.is_empty() && and_mask.len() != and_stride * height {
+    if !and_mask.is_empty() && and_mask.len() != and_len {
         return Err(PointerError::BadMaskSize {
             mask: "andMaskData",
-            expected: and_stride * height,
+            expected: and_len,
             got: and_mask.len(),
         });
     }
 
-    let mut out = Vec::with_capacity(width * height * 4);
+    let mut out = Vec::with_capacity(out_len);
     for out_row in 0..height {
         // Both masks are bottom-up (MS-RDPBCGR 2.2.9.1.1.4.4: "bottom-up XOR mask scan-line
         // data", at every xorBpp).
@@ -320,6 +357,35 @@ mod tests {
         assert_eq!(
             decode_pointer(0, 0, 32, &[], &[], &Palette::default()).unwrap(),
             Vec::<u8>::new()
+        );
+    }
+
+    // Dimensions that overflow `usize` are a typed error, never a panic or a wrap-then-OOB (#151).
+    // Only reachable on a 32-bit `usize` (wasm32 / i686): on 64-bit the u16×u16 products always
+    // fit, so `decode_pointer(65535, 65535, ..)` there hits the mask-length check (BadMaskSize)
+    // instead — this case cannot exist on 64-bit, hence the target gate. The huge XOR mask is
+    // never allocated: the overflow is caught before the length compare, so a tiny slice suffices.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn overflowing_dimensions_are_a_typed_error_not_a_panic() {
+        // 32 bpp overflows the xor `stride × height` product first.
+        assert_eq!(
+            decode_pointer(65535, 65535, 32, &[], &[], &Palette::default()),
+            Err(PointerError::DimensionsOverflow {
+                width: 65535,
+                height: 65535,
+                xor_bpp: 32,
+            })
+        );
+        // 1 bpp keeps every stride tiny, so it is the `width × height × 4` output length that
+        // overflows — proving the third guard, not just the xor one.
+        assert_eq!(
+            decode_pointer(65535, 65535, 1, &[], &[], &Palette::default()),
+            Err(PointerError::DimensionsOverflow {
+                width: 65535,
+                height: 65535,
+                xor_bpp: 1,
+            })
         );
     }
 
