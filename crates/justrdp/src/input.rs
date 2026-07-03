@@ -374,6 +374,124 @@ mod tests {
         assert_eq!(scancode_from_macos_keycode(0x3F), None); // kVK_Function
         assert_eq!(scancode_from_linux_evdev(119), None); // KEY_PAUSE
         assert_eq!(scancode_from_linux_evdev(113), None); // KEY_MUTE
+        assert_eq!(scancode_from_windows_vk(0xFF), None); // unassigned
+        assert_eq!(scancode_from_macos_keycode(0xFF), None);
+        assert_eq!(scancode_from_linux_evdev(0), None); // KEY_RESERVED
+        assert_eq!(scancode_from_linux_evdev(200), None); // past the table
+    }
+
+    /// Every physical key common to all three OSes must map to the *same* set-1 scancode — the
+    /// property that catches a per-table transcription error (#147). Columns:
+    /// (name, Windows VK, macOS keycode, Linux evdev, set-1 code, extended). Covers the letter,
+    /// digit, function, modifier, and navigation arms of all three tables at once.
+    #[rustfmt::skip]
+    const CROSS: &[(&str, u16, u16, u16, u8, bool)] = &[
+        // Letters A–Z.
+        ("A",0x41,0x00,30,0x1E,false), ("B",0x42,0x0B,48,0x30,false), ("C",0x43,0x08,46,0x2E,false),
+        ("D",0x44,0x02,32,0x20,false), ("E",0x45,0x0E,18,0x12,false), ("F",0x46,0x03,33,0x21,false),
+        ("G",0x47,0x05,34,0x22,false), ("H",0x48,0x04,35,0x23,false), ("I",0x49,0x22,23,0x17,false),
+        ("J",0x4A,0x26,36,0x24,false), ("K",0x4B,0x28,37,0x25,false), ("L",0x4C,0x25,38,0x26,false),
+        ("M",0x4D,0x2E,50,0x32,false), ("N",0x4E,0x2D,49,0x31,false), ("O",0x4F,0x1F,24,0x18,false),
+        ("P",0x50,0x23,25,0x19,false), ("Q",0x51,0x0C,16,0x10,false), ("R",0x52,0x0F,19,0x13,false),
+        ("S",0x53,0x01,31,0x1F,false), ("T",0x54,0x11,20,0x14,false), ("U",0x55,0x20,22,0x16,false),
+        ("V",0x56,0x09,47,0x2F,false), ("W",0x57,0x0D,17,0x11,false), ("X",0x58,0x07,45,0x2D,false),
+        ("Y",0x59,0x10,21,0x15,false), ("Z",0x5A,0x06,44,0x2C,false),
+        // Digits 0–9.
+        ("0",0x30,0x1D,11,0x0B,false), ("1",0x31,0x12,2,0x02,false), ("2",0x32,0x13,3,0x03,false),
+        ("3",0x33,0x14,4,0x04,false), ("4",0x34,0x15,5,0x05,false), ("5",0x35,0x17,6,0x06,false),
+        ("6",0x36,0x16,7,0x07,false), ("7",0x37,0x1A,8,0x08,false), ("8",0x38,0x1C,9,0x09,false),
+        ("9",0x39,0x19,10,0x0A,false),
+        // Editing / whitespace / modifiers.
+        ("Esc",0x1B,0x35,1,0x01,false), ("Space",0x20,0x31,57,0x39,false), ("Tab",0x09,0x30,15,0x0F,false),
+        ("Enter",0x0D,0x24,28,0x1C,false), ("Backspace",0x08,0x33,14,0x0E,false),
+        ("Caps",0x14,0x39,58,0x3A,false), ("LShift",0x10,0x38,42,0x2A,false),
+        ("LCtrl",0x11,0x3B,29,0x1D,false), ("LAlt",0x12,0x3A,56,0x38,false),
+        // Function keys F1–F12.
+        ("F1",0x70,0x7A,59,0x3B,false), ("F2",0x71,0x78,60,0x3C,false), ("F3",0x72,0x63,61,0x3D,false),
+        ("F4",0x73,0x76,62,0x3E,false), ("F5",0x74,0x60,63,0x3F,false), ("F6",0x75,0x61,64,0x40,false),
+        ("F7",0x76,0x62,65,0x41,false), ("F8",0x77,0x64,66,0x42,false), ("F9",0x78,0x65,67,0x43,false),
+        ("F10",0x79,0x6D,68,0x44,false), ("F11",0x7A,0x67,87,0x57,false), ("F12",0x7B,0x6F,88,0x58,false),
+        // Navigation cluster + right-side modifiers + Win keys — all E0-extended.
+        ("Left",0x25,0x7B,105,0x4B,true), ("Right",0x27,0x7C,106,0x4D,true),
+        ("Up",0x26,0x7E,103,0x48,true), ("Down",0x28,0x7D,108,0x50,true),
+        ("Home",0x24,0x73,102,0x47,true), ("End",0x23,0x77,107,0x4F,true),
+        ("PgUp",0x21,0x74,104,0x49,true), ("PgDn",0x22,0x79,109,0x51,true),
+        ("Insert",0x2D,0x72,110,0x52,true), ("Delete",0x2E,0x75,111,0x53,true),
+        ("RCtrl",0xA3,0x3E,97,0x1D,true), ("RAlt",0xA5,0x3D,100,0x38,true),
+        ("LWin",0x5B,0x37,125,0x5B,true), ("RWin",0x5C,0x36,126,0x5C,true),
+        ("KpSlash",0x6F,0x4B,98,0x35,true),
+    ];
+
+    #[test]
+    fn every_common_key_maps_identically_across_all_three_tables() {
+        for &(name, vk, mac, linux, code, extended) in CROSS {
+            let want = Some(Scancode { code, extended });
+            assert_eq!(scancode_from_windows_vk(vk), want, "windows {name}");
+            assert_eq!(scancode_from_macos_keycode(mac), want, "macos {name}");
+            assert_eq!(scancode_from_linux_evdev(linux), want, "linux {name}");
+        }
+    }
+
+    #[test]
+    fn windows_numpad_oem_and_lock_keys() {
+        #[rustfmt::skip]
+        let cases: &[(u16, u8, bool)] = &[
+            // Numpad (NumLock-on positions are the non-extended nav codes).
+            (0x60,0x52,false),(0x61,0x4F,false),(0x62,0x50,false),(0x63,0x51,false),(0x64,0x4B,false),
+            (0x65,0x4C,false),(0x66,0x4D,false),(0x67,0x47,false),(0x68,0x48,false),(0x69,0x49,false),
+            (0x6A,0x37,false),(0x6B,0x4E,false),(0x6D,0x4A,false),(0x6E,0x53,false),(0x6F,0x35,true),
+            // Locks / system.
+            (0x90,0x45,false),(0x91,0x46,false),(0x2C,0x37,true), // NumLock, ScrollLock, PrintScreen
+            (0x5D,0x5D,true), // VK_APPS (menu)
+            // OEM punctuation.
+            (0xBA,0x27,false),(0xBB,0x0D,false),(0xBC,0x33,false),(0xBD,0x0C,false),(0xBE,0x34,false),
+            (0xBF,0x35,false),(0xC0,0x29,false),(0xDB,0x1A,false),(0xDC,0x2B,false),(0xDD,0x1B,false),
+            (0xDE,0x28,false),(0xE2,0x56,false),
+        ];
+        for &(vk, code, extended) in cases {
+            assert_eq!(
+                scancode_from_windows_vk(vk),
+                Some(Scancode { code, extended }),
+                "vk {vk:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_keypad_and_iso_keys() {
+        #[rustfmt::skip]
+        let cases: &[(u16, u8, bool)] = &[
+            (0x0A,0x56,false), // ISO section key
+            (0x18,0x0D,false),(0x1E,0x1B,false),(0x21,0x1A,false),(0x27,0x28,false),(0x29,0x27,false),
+            (0x2A,0x2B,false),(0x32,0x29,false), // = ] [ ' ; \ `
+            (0x41,0x53,false),(0x43,0x37,false),(0x45,0x4E,false),(0x47,0x45,false),(0x4C,0x1C,true),
+            (0x4E,0x4A,false),(0x52,0x52,false),(0x53,0x4F,false),(0x54,0x50,false),(0x55,0x51,false),
+            (0x56,0x4B,false),(0x57,0x4C,false),(0x58,0x4D,false),(0x59,0x47,false),(0x5B,0x48,false),
+            (0x5C,0x49,false), // keypad cluster
+            (0x4B,0x35,true), // keypad /
+        ];
+        for &(kc, code, extended) in cases {
+            assert_eq!(
+                scancode_from_macos_keycode(kc),
+                Some(Scancode { code, extended }),
+                "keycode {kc:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_main_block_is_set1_and_extended_block_maps() {
+        // The 1..=88 main block is set-1 verbatim.
+        for key in 1u16..=88 {
+            assert_eq!(
+                scancode_from_linux_evdev(key),
+                Some(Scancode::plain(key as u8))
+            );
+        }
+        // Extended (post-88) keys not already in CROSS.
+        for &(key, code) in &[(96u16, 0x1Cu8), (99, 0x37), (127, 0x5D)] {
+            assert_eq!(scancode_from_linux_evdev(key), Some(Scancode::ext(code)));
+        }
     }
 
     #[test]
