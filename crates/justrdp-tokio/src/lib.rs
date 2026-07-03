@@ -2031,6 +2031,84 @@ mod tests {
         assert!(frame_len > 0);
     }
 
+    /// Probe for issue #150 (standalone NSCodec via Surface Bits): does this VM advertise the
+    /// infrastructure that path needs — a SurfaceCommands capset (CAPSTYPE 0x001C, without which the
+    /// server never sends Surface Bits) and a BitmapCodecs capset (0x001D) listing the NSCodec GUID?
+    /// Prints the server's full Demand-Active capset inventory so the #150 defer-vs-build decision
+    /// rests on what the real WS2022 negotiates rather than an assumption. Advisory: it asserts only
+    /// that session-active was reached, never that the codecs are present — the VM is free not to
+    /// offer them (the expected outcome, since modern Windows prefers EGFX/RemoteFX and emits NSCodec
+    /// only as a ClearCodec subcodec, already covered by the replay corpus). Run with `--nocapture`.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn vm_advertised_bitmap_codecs_and_surface_commands() {
+        let _vm = VM_SESSION.lock().await;
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let credentials = Credentials {
+            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
+            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
+            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
+        };
+        let outcome = connect_danger(addr, legacy_graphics_config(), credentials, |_| {})
+            .await
+            .expect("connect should reach session-active against the real VM");
+
+        // The NSCodec GUID in wire order (Data1/2/3 little-endian, Data4 verbatim) — the same bytes
+        // justrdp-pdu's activation differential test pins.
+        const NSCODEC_GUID: [u8; 16] = [
+            0xb9, 0x1b, 0x8d, 0xca, 0x0f, 0x00, 0x4f, 0x15, //
+            0x58, 0x9f, 0xae, 0x2d, 0x1a, 0x87, 0xe2, 0xd6,
+        ];
+        // CAPSTYPE_SURFACE_COMMANDS (MS-RDPBCGR 2.2.7.2.9) — not yet a named constant in justrdp-pdu,
+        // so a server that sends it lands in CapabilitySet::Unknown with this raw type.
+        const CAPSET_SURFACE_COMMANDS: u16 = 0x001C;
+
+        let caps = &outcome.activation.server_capabilities;
+        eprintln!("server advertised {} capability sets:", caps.len());
+        let (mut has_surface_commands, mut has_nscodec) = (false, false);
+        for set in caps {
+            use justrdp_pdu::capability::CapabilitySet;
+            match set {
+                CapabilitySet::BitmapCodecs(b) => {
+                    for c in &b.codecs {
+                        let is_nsc = c.guid == NSCODEC_GUID;
+                        has_nscodec |= is_nsc;
+                        eprintln!(
+                            "  BitmapCodecs codec id={} guid={:02x?}{}",
+                            c.id,
+                            c.guid,
+                            if is_nsc { "  <- NSCodec" } else { "" }
+                        );
+                    }
+                }
+                CapabilitySet::Unknown { set_type, data } => {
+                    let tag = if *set_type == CAPSET_SURFACE_COMMANDS {
+                        has_surface_commands = true;
+                        "  <- SurfaceCommands"
+                    } else {
+                        ""
+                    };
+                    eprintln!(
+                        "  Unknown capset type={set_type:#06x} ({} body bytes){tag}",
+                        data.len()
+                    );
+                }
+                other => eprintln!("  {other:?}"),
+            }
+        }
+        eprintln!(
+            "#150 probe: SurfaceCommands(0x1C)={has_surface_commands}  NSCodec-in-BitmapCodecs={has_nscodec}"
+        );
+        eprintln!(
+            "  => NSCodec-standalone is {} on this VM",
+            if has_surface_commands && has_nscodec {
+                "POSSIBLE — a future Surface-Bits build would have a DoD-4 proof path here"
+            } else {
+                "NOT offered — defer #150 as unprovable against this VM"
+            }
+        );
+    }
+
     /// Caller policy for a *legacy-graphics* (bitmap update) session: do NOT advertise
     /// SUPPORT_DYN_VC_GFX_PROTOCOL (and skip drdynvc). A server seeing the EGFX gate flag
     /// negotiates graphics over the dynamic channel and never falls back to bitmap updates
