@@ -793,20 +793,6 @@ impl SessionStateMachine {
                 DvcEvent::DisplayControlReady => {
                     outputs.push(SessionOutput::DisplayControlReady);
                 }
-                // EGFX pixels land in the same framebuffer the slow path writes — the
-                // framebuffer stays the single authoritative screen state either way.
-                DvcEvent::Frame(frame) => {
-                    if let Some(update) = self.framebuffer.blit(
-                        frame.x,
-                        frame.y,
-                        frame.width,
-                        frame.height,
-                        &frame.pixels,
-                        usize::from(frame.width),
-                    ) {
-                        outputs.push(SessionOutput::Frame(update));
-                    }
-                }
                 DvcEvent::OutputResized { width, height } => {
                     if (width, height) != self.config.desktop_size {
                         self.config.desktop_size = (width, height);
@@ -814,6 +800,12 @@ impl SessionStateMachine {
                     }
                 }
             }
+        }
+        // EGFX draw ops marked surface regions dirty during processing; blit them straight into
+        // the framebuffer now (ADR-0010 #163 — no owned copy on the bridge). The framebuffer is
+        // the single authoritative screen state the slow path writes too.
+        for update in self.drdynvc.flush_frames(&mut self.framebuffer) {
+            outputs.push(SessionOutput::Frame(update));
         }
         Ok(())
     }

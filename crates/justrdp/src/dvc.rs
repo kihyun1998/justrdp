@@ -9,6 +9,7 @@
 //! sees MCS framing.
 
 use crate::egfx::GraphicsProcessor;
+use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::displaycontrol::{self, DisplayControlPdu};
 use justrdp_pdu::dvc::{self, DvcMessage};
@@ -47,27 +48,16 @@ pub(crate) trait DvcProcessor {
     fn start(&mut self, channel_id: u32) -> Vec<ProcessorOutput>;
     /// One complete (reassembled) channel message.
     fn process(&mut self, message: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError>;
+    /// Blit any pixels this processor accumulated during [`Self::process`] straight into the
+    /// session framebuffer and return the dirty rects (ADR-0010 slice #163). Called by the
+    /// manager after each SVC payload, so a processor that renders (EGFX) writes the framebuffer
+    /// in place — no intermediate owned copy — while a non-rendering processor keeps the default
+    /// no-op. Coordinates in the returned [`FrameUpdate`]s are framebuffer/output pixels.
+    fn flush_frames(&mut self, _framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
+        Vec::new()
+    }
     /// The channel closed (server Close PDU); drop per-channel state.
     fn close(&mut self);
-}
-
-/// EGFX pixels in output coordinates, carried from the surface processor to the session
-/// framebuffer. This is an **internal** bridge type: the host-facing [`crate::FrameUpdate`] is
-/// coordinates only (ADR-0010), but the EGFX surface still hands its pixels to the framebuffer
-/// through this carrier. The extract copy that fills `pixels` (`egfx.rs` `flush_dirty`) is removed
-/// in the follow-up slice #163, which will let the surface blit into the framebuffer directly.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EgfxRegion {
-    /// Left edge in output coordinates.
-    pub x: u16,
-    /// Top edge in output coordinates.
-    pub y: u16,
-    /// Width in pixels.
-    pub width: u16,
-    /// Height in pixels.
-    pub height: u16,
-    /// `width × height × 4` RGBA bytes extracted from the surface.
-    pub pixels: Vec<u8>,
 }
 
 /// What a [`DvcProcessor`] wants done, in order.
@@ -77,8 +67,6 @@ pub(crate) enum ProcessorOutput {
     Send(Vec<u8>),
     /// Display Control: the server's caps arrived — resize requests are valid now.
     DisplayControlCaps(displaycontrol::Caps),
-    /// EGFX: fresh pixels in output coordinates for the session framebuffer.
-    Frame(EgfxRegion),
     /// EGFX: the server reset the output size (ResetGraphics).
     OutputResized {
         /// New output width in pixels.
@@ -96,8 +84,6 @@ pub(crate) enum DvcEvent {
     /// The Display Control channel is open and the server's caps arrived: resize requests
     /// are valid from now on.
     DisplayControlReady,
-    /// EGFX pixels in output coordinates (the session machine blits its framebuffer).
-    Frame(EgfxRegion),
     /// EGFX output resize (the session machine rebuilds its framebuffer).
     OutputResized {
         /// New output width in pixels.
@@ -208,6 +194,18 @@ impl Drdynvc {
     /// PDU before sending a Monitor Layout).
     pub(crate) fn display_control(&self) -> Option<(u32, displaycontrol::Caps)> {
         self.display_control
+    }
+
+    /// Blit every processor's pixels accumulated since the last flush into `framebuffer`,
+    /// returning the dirty rects (ADR-0010 slice #163). The session calls this right after
+    /// [`Self::on_svc_payload`]: EGFX draw ops mark surface regions dirty during processing, and
+    /// this drains them straight into the framebuffer — no owned per-region copy on the bridge.
+    pub(crate) fn flush_frames(&mut self, framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
+        let mut frames = Vec::new();
+        for processor in &mut self.processors {
+            frames.extend(processor.flush_frames(framebuffer));
+        }
+        frames
     }
 
     /// Consume one MCS-delivered SVC payload on the drdynvc channel.
@@ -395,7 +393,6 @@ impl Drdynvc {
                     self.display_control = Some((channel_id, caps));
                     events.push(DvcEvent::DisplayControlReady);
                 }
-                ProcessorOutput::Frame(frame) => events.push(DvcEvent::Frame(frame)),
                 ProcessorOutput::OutputResized { width, height } => {
                     events.push(DvcEvent::OutputResized { width, height });
                 }
