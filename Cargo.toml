@@ -33,7 +33,7 @@ rustls-platform-verifier = { version = "0.7", default-features = false }
 ring = "0.17"
 # X.509 SubjectPublicKeyInfo extraction for CredSSP public-key binding — a leaf ASN.1/encoding lib,
 # not RDP protocol (ADR-0002). Lives in `justrdp` only; `justrdp-pdu` stays zero-dependency.
-x509-cert = "0.2"
+x509-cert = "0.3"
 # NLA authentication (slice-3, ADR-0002 / plan.md decision 10): `sspi` owns CredSSP / SPNEGO / NTLM /
 # Kerberos verbatim — security-critical, non-RDP. Lives in the adapter (`justrdp-tokio`) only, the
 # same place `rustls` landed: it drives the `CredSspClient` token loop, so the sans-IO core never
