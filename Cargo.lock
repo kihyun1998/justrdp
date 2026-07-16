@@ -1098,7 +1098,7 @@ dependencies = [
  "bitvec",
  "byteorder",
  "ironrdp-core",
- "ironrdp-pdu",
+ "ironrdp-pdu 0.8.0",
  "num-derive",
  "num-traits",
  "yuv",
@@ -1109,6 +1109,29 @@ name = "ironrdp-pdu"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a27ab729591c84f992a408ba1b8b29fab354d85aa8d464f053a42fbb5f51e7b"
+dependencies = [
+ "bit_field",
+ "bitflags 2.13.0",
+ "byteorder",
+ "der-parser",
+ "ironrdp-core",
+ "ironrdp-error",
+ "md-5 0.10.6",
+ "num-bigint 0.4.6",
+ "num-derive",
+ "num-integer",
+ "num-traits",
+ "pkcs1 0.7.5",
+ "sha1 0.10.6",
+ "tap",
+ "x509-cert",
+]
+
+[[package]]
+name = "ironrdp-pdu"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ccd1179a4d106df1930347701388b5c79bc3725fa7dab4438d57db0d9d19347"
 dependencies = [
  "bit_field",
  "bitflags 2.13.0",
@@ -1207,7 +1230,7 @@ dependencies = [
 name = "justrdp"
 version = "0.1.0"
 dependencies = [
- "ironrdp-pdu",
+ "ironrdp-pdu 0.9.0",
  "justrdp-codecs",
  "justrdp-pdu",
  "rcgen",
@@ -1220,7 +1243,7 @@ name = "justrdp-codecs"
 version = "0.1.0"
 dependencies = [
  "ironrdp-graphics",
- "ironrdp-pdu",
+ "ironrdp-pdu 0.9.0",
  "justrdp-pdu",
  "proptest",
 ]
@@ -1229,7 +1252,7 @@ dependencies = [
 name = "justrdp-pdu"
 version = "0.1.0"
 dependencies = [
- "ironrdp-pdu",
+ "ironrdp-pdu 0.9.0",
  "proptest",
 ]
 
