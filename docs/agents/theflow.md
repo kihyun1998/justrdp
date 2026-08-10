@@ -109,7 +109,7 @@ and prove by differential test, not structural similarity (ADR-0003).
 | **Wire / PDU / codec layout** | the **normative spec first** — `[MS-RDPBCGR]`, `[MS-RDPRFX]`, `[MS-RDPEGDI]`, `[MS-RDPEGFX]`, … — for layout, flags, state transitions (cite the section number). The spec is the "first principles" source RDP has that a terminal does not |
 | **Hidden state · server tolerance · edges** | **FreeRDP** (C, the CVE knowledge source) + **IronRDP** (Rust) real source. Spec-unwritten tolerance (caps servers violate — #101, ADR-0009) exists only here |
 | **Concept ≠ mechanism** | a codec we newly own may be absent from IronRDP, but its *components* (bit reader, tile boundaries, colour conversion, sub-band layout) exist in FreeRDP and in the spec — read **both**. A feature being "new" never justifies skipping the mechanism reference |
-| **Published / external state** | crates.io / the upstream repo, never a sentence about them. Live example: Devolutions/sspi-rs#689 merged 2026-06-17 and shipped in `sspi` **0.21.1 (2026-06-26)**, so ADR-0004's exit condition is **already met** while `[patch.crates-io]` is still pinned — and #61, named as the tracker in three artifacts, is **closed**. See [`docs/map/`](../map/territory/nla-credssp.md) `## Known holes / open` |
+| **Published / external state** | crates.io / the upstream repo, never a sentence about them. Worked example: three artifacts said *"remove the `sspi` fork when #689 ships"*; it had shipped six weeks earlier (0.21.1, 2026-06-26) and nobody re-read them. One registry query settled it — see ADR-0004's 2026-08-10 Amendment and [`docs/map/`](../map/territory/nla-credssp.md) |
 
 **Spec ≠ interop.** Code that matches the spec can still not be byte-identical to a
 real server — *derive from spec, prove against oracle/VM* (Step 4).
@@ -164,9 +164,10 @@ long as the server advertises X*"), in the issue.
 are contracts justrdp deliberately holds — "the core should resolve this for me" is a
 host standing on nothing valid.
 
-**No consumer workaround for an upstream defect.** The live instance is the `sspi` fork
-(ADR-0004, #61): the defect was fixed *upstream* and bridged with `[patch.crates-io]`,
-not worked around locally. When you feel the urge to compensate in a shallower layer to
+**No consumer workaround for an upstream defect.** The worked instance is the `sspi`
+CredSSP defect (ADR-0004): it was reported and fixed *upstream*, bridged meanwhile with
+`[patch.crates-io]`, and the bridge was deleted once the fix shipped (2026-08-10) — not
+worked around locally at any point. When you feel the urge to compensate in a shallower layer to
 make a test pass — **stop, explain, ask** — do not work around it alone and do not
 silently file an issue and move on.
 
@@ -267,8 +268,9 @@ is **silent** (wrong, and nothing crashes) or **irreversible**:
    this one decision.
 3. **The NLA credential path** — the CredSSP token loop in `crates/justrdp-tokio/src/lib.rs`
    plus the SPKI public-key binding it authenticates against (`x509-cert`, in
-   `crates/justrdp/src/{tls,connect}.rs`), including the `[patch.crates-io]` fork bridge
-   (ADR-0004, #61). A wrong binding or token order can still complete a handshake.
+   `crates/justrdp/src/{tls,connect}.rs`), and every `sspi` version bump (ADR-0004
+   requires the real-VM suite for one). A wrong binding or token order can still
+   complete a handshake.
 
 A gap sends you back to Step 3. **Never drop a corpus because the fix looks small.**
 
@@ -289,9 +291,11 @@ A gap sends you back to Step 3. **Never drop a corpus because the fix looks smal
   yes, the change **does not land** until an `invariant/` note exists. (May **not**
   lag: the first site to hit a fact is where it is discovered, and at that moment no
   node exists — which is exactly how #151→#155 and #85→#162→#163 happened.)
-- **`[patch.crates-io]` in `Cargo.toml`** — the temporary `sspi` fork; remove it and bump
-  `sspi` — the exit condition was met on 2026-06-26 and the block is still there
-  (ADR-0004; #61, its named tracker, is closed).
+- **`Cargo.toml`'s dependency comments** — each one states *why* a crate is here and,
+  where it is temporary, what ends it. Those sentences are load-bearing and unchecked:
+  the `sspi` fork-bridge comment outlived its condition by six weeks (ADR-0004
+  Amendment 2026-08-10). When a dependency's rationale changes, the comment is part of
+  the change.
 - **Rustdoc on the public surface** ships as the crate's API docs — the surface most likely
   to still describe the old behavior.
 - **Changelog: none.** No `CHANGELOG.md` and nothing published, so there is no snapshotted

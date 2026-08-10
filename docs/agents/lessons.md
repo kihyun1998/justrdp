@@ -64,15 +64,20 @@ Read this before starting so the bindings do not read as abstractions.
   design (its own `[workspace]`), so `cargo test --workspace` does not build it. A
   public-API change needs a separate `cargo check --manifest-path fuzz/Cargo.toml`.
 - **"Temporary and tracked" decayed into "still here and untracked" — the war story
-  for *external facts are verification targets too*.** `[patch.crates-io]` points at
-  `kihyun1998/sspi-rs` pending Devolutions/sspi-rs#689. That fix **merged 2026-06-17
-  and shipped in `sspi` 0.21.1 on 2026-06-26**, so the bridge has been obsolete for
-  six weeks — and #61, named as the removal tracker by `Cargo.toml`,
-  `.github/dependabot.yml` *and* ADR-0004, is **closed**, against its own comment
-  saying it must not be. Three artifacts stating a status, none of them checked, and
-  the Dependabot "tripwire" cannot fire for a condition already met. The lesson is the
-  citation form: *"remove when X ships"* is a status claim that rots, and nobody
-  re-reads it (ADR-0004, #61; memory `sspi_rs_contribution_setup`).
+  for *external facts are verification targets too*.** The `[patch.crates-io]` bridge
+  to `kihyun1998/sspi-rs` waited on Devolutions/sspi-rs#689, which **merged 2026-06-17
+  and shipped in `sspi` 0.21.1 on 2026-06-26** — and it was still in the tree six weeks
+  later. #61, named as the removal tracker by `Cargo.toml`, `.github/dependabot.yml`
+  *and* ADR-0004, was **closed** against its own comment saying it must not be; the
+  Dependabot "tripwire" could not fire because its condition was already met; and
+  ADR-0004's own amendment asserted the bridge *did not exist*, so nothing greppable
+  contradicted any of it. **Removed 2026-08-10** (`sspi = "=0.21.3"`, exact pin per the
+  ADR), with the loopback full-CredSSP test green on the published crate — the real-VM
+  gate deferred because the VM's credentials fail, which an A/B run proved is not a
+  client regression. Two lessons: *"remove when X ships"* is a **status** claim that
+  rots the moment it comes true, and a record asserting the **absence** of something is
+  the hardest drift to notice (ADR-0004 Amendment 2026-08-10; memory
+  `sspi_rs_contribution_setup`).
 - **Supply-chain is a gate** — `just-shield` scans for SHA-pinned actions (ADR-0006,
   `supply-chain.yml`; memory `justrdp_ci_policy`).
 - **No `Co-Authored-By` / AI-attribution** in commits (memory

@@ -14,9 +14,11 @@ and binding the exchange to the server's public key.
   and non-RDP, so it is delegated verbatim and lives in the adapter. **The core
   never sees a `TSRequest`.**
 - [ADR-0004](../../adr/0004-sspi-contribute-and-bridge.md) — contribute upstream and
-  bridge with `[patch.crates-io]` in the meantime; the long-term direction (*not yet
-  scheduled*, per the record itself) moves the ADR-0002 boundary one layer down and
-  owns the RDP-adjacent auth layers.
+  bridge with `[patch.crates-io]` in the meantime, with an exact version pin and the
+  real-VM suite as the version-bump gate. The bridge was carried (#61) and **exited on
+  2026-08-10** (Amendment). The long-term direction (*not yet scheduled*, per the
+  record itself) moves the ADR-0002 boundary one layer down and owns the RDP-adjacent
+  auth layers.
 
 ## Design model
 
@@ -41,7 +43,8 @@ and binding the exchange to the server's public key.
   `Credentials`, the `Action::StartNla` arm
 - `justrdp/src/connect.rs` — `Action::StartNla`, `Event::NlaComplete`,
   `ConnectStateMachine`
-- `Cargo.toml` — the `[patch.crates-io]` `sspi` fork pin (ADR-0004 bridge)
+- `Cargo.toml` — `sspi = "=0.21.3"`, the exact pin ADR-0004 requires (the
+  `[patch.crates-io]` bridge that used to sit here was removed 2026-08-10)
 - Stage string: `nla-credssp`
 
 ## Reference behaviour
@@ -69,20 +72,21 @@ defect), #689 (the maintainer's rework that fixed it).
 
 ## Known holes / open
 
-- **The fork bridge is obsolete and still in the tree, and its tracker is closed.**
-  Devolutions/sspi-rs#689 merged upstream **2026-06-17** and first shipped on
-  crates.io in **sspi 0.21.1 (2026-06-26)**, so ADR-0004's exit condition has been
-  met for weeks — but `[patch.crates-io]` is still pinned to `kihyun1998/sspi-rs`,
-  and the three artifacts that name **#61** as the tracker (`Cargo.toml`,
-  `.github/dependabot.yml`, ADR-0004) all point at a **closed** issue whose own
-  comment says it must not close before the patch is deleted.
-- **The removal is verified except for the one gate ADR-0004 names.** Measured
-  2026-08-10: with the patch removed and `sspi = "0.21.3"`, `cargo test --workspace`
-  is green *including* `connect_completes_credssp_against_a_loopback_server` — the
-  test that existed only because of the fork. The **real-VM suite cannot certify it**:
-  all 12 VM tests fail `STATUS_LOGON_FAILURE [0xc000006d]`, and an A/B run with the
-  fork restored fails **identically**, so the blocker is the VM's credentials, not the
-  bump. The removal is held until that is resolved.
+- **The version-bump gate ADR-0004 requires has not run for the current pin.** The
+  fork bridge was removed and `sspi` pinned at `=0.21.3` on 2026-08-10 with
+  `cargo test --workspace` green — *including*
+  `connect_completes_credssp_against_a_loopback_server`, the test that existed only
+  because of the fork, which is the direct evidence that the published crate carries
+  Devolutions/sspi-rs#689. But the **real-VM acceptance suite could not run**: all 12
+  VM tests fail `STATUS_LOGON_FAILURE [0xc000006d]`, and an A/B run with the fork
+  restored fails **identically**, so the blocker is the VM's account state, not the
+  bump. Re-run `cargo test -p justrdp-tokio -- --ignored` once credentials are
+  restored and record it in ADR-0004.
+- **Why it took six weeks, recorded because the mechanism is reusable.** #61 — named
+  as the removal tracker by `Cargo.toml`, `.github/dependabot.yml` *and* ADR-0004 —
+  was closed against its own comment; Dependabot's "new release is the signal"
+  tripwire cannot fire for a condition already met; and ADR-0004's earlier amendment
+  asserted the bridge *did not exist*. Nothing greppable disagreed with anything.
 - **Kerberos NLA is not built** — epic #45 (sspi `NetworkRequest` driving + KDC
   discovery). Today's path is SPNEGO/NTLM only.
 - ADR-0004's end state ("own the RDP-adjacent auth layers") is explicitly *not

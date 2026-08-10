@@ -1,6 +1,6 @@
 # 0004 — sspi strategy: contribute-and-bridge now, own the RDP-adjacent auth layers as the end state
 
-- Status: Accepted (amended 2026-06-18 — #687 resolved upstream by the maintainer's own rework, not our PR; see Amendment)
+- Status: Accepted (amended 2026-06-18 — #687 resolved upstream by the maintainer's own rework, not our PR; amended again 2026-08-10 — a fork-bridge *was* carried after all, and has now been exited; see both Amendments)
 - Date: 2026-06-11
 - Refines: [ADR-0002](0002-dependency-boundary.md) (the `sspi` half; the `rustls` half and the "protocol omissions, not crypto complexity, are the bottleneck" insight stand unchanged)
 
@@ -55,7 +55,7 @@ The first real exercise of the contribute-and-bridge loop closed out, and it did
 
 ### Consequences for this ADR
 
-1. **No fork-bridge was needed for #687.** Because upstream fixed it directly, we never carried a `[patch.crates-io]` commit. The bridge mechanism stays unused for now; the exit discipline ("patch deleted the moment upstream releases") is moot for this bug — we simply pin the released version that contains #689 once it ships to crates.io and run the real-VM acceptance suite against it (the existing version-bump gate).
+1. **No fork-bridge was needed for #687.** ⚠ **Superseded — see the 2026-08-10 Amendment: this became false days after it was written.** A bridge *was* carried (issue #61, to resurrect the loopback CredSSP test before the fix reached crates.io) and was not removed until 2026-08-10. Read the rest of this item as the intent at the time, not as the state of the tree. ~~Because upstream fixed it directly, we never carried a `[patch.crates-io]` commit.~~ The bridge mechanism stays unused for now; the exit discipline ("patch deleted the moment upstream releases") is moot for this bug — we simply pin the released version that contains #689 once it ships to crates.io and run the real-VM acceptance suite against it (the existing version-bump gate).
 
 2. **A PR closed in favor of the maintainer's own rework does NOT fire the upstream-health trigger.** That trigger reads "an upstream PR of ours is rejected or sits unreviewed for 60 days → escalate to self-ownership." Read literally, "#688 was closed" looks like a hit. It is the opposite signal: the maintainer engaged within days, validated the bug, kept our test, and shipped a *better* fix. The trigger is about **upstream neglect or hostility**, not about our specific patch being superseded by a cleaner one. Escalation is warranted when upstream won't move; here it moved fast and well. Do not misread this event as a tripwire.
 
@@ -67,3 +67,25 @@ The first real exercise of the contribute-and-bridge loop closed out, and it did
 
 - **One concern per PR.** The maintainer asked that the CI-matrix change be split out: "We try not to mix CI and library code changes." Our coming `__test-data` CI PR is therefore correctly a separate PR, not a rider on a fix. Apply this by default to all contribute-and-bridge PRs — library fix, test, and CI/tooling each stand alone.
 - **Lead with a self-contained repro and a failing test.** Both #687 (issue) and #688 (PR) carried a hermetic repro / regression test, and that is what the maintainer kept even after discarding our fix. The test is the durable contribution; the patch is negotiable.
+
+## Amendment (2026-08-10) — the bridge was carried after all, and is now exited
+
+Consequence 1 of the 2026-06-18 amendment says *"we never carried a `[patch.crates-io]` commit"*. **That became false shortly after it was written**, and stayed in the record for weeks: issue #61 landed the bridge (`[patch.crates-io] sspi = { git = "https://github.com/kihyun1998/sspi-rs", rev = "96d055b…" }`) so the loopback full-CredSSP test could be resurrected before the fix reached crates.io. A decision record asserting the *absence* of a thing is the hardest kind of drift to notice: nothing greps for a bridge the ADR says does not exist.
+
+### The exit, executed
+
+- Upstream [#689](https://github.com/Devolutions/sspi-rs/pull/689) merged **2026-06-17** and first shipped on crates.io in **sspi 0.21.1 (2026-06-26)**.
+- The `[patch.crates-io]` block and the fork pin are **removed**; `sspi` is pinned exactly at `=0.21.3` per this ADR's Decision. `Cargo.lock` now resolves `sspi` from the registry with a checksum and carries **no** reference to the fork.
+- The exit is late by roughly six weeks. The exit discipline says *"the patch is deleted the moment upstream releases"*; nothing observed that moment (see the tripwire note below).
+
+### What proved it, and what did not
+
+- **Green:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo check --manifest-path fuzz/Cargo.toml` — including `connect_completes_credssp_against_a_loopback_server`, the test that existed *only* because of the fork and is the direct proof that published 0.21.3 carries #689's fix.
+- **Not run:** the **real-VM acceptance suite** this ADR's Decision requires for a version bump. All 12 VM tests fail `STATUS_LOGON_FAILURE [0xc000006d]` — a logon failure from the CredSSP *server*. An A/B run with the fork restored fails **identically**, so the blocker is the test VM's account state, not the bump. The gate is deferred, not waived: re-run `cargo test -p justrdp-tokio -- --ignored` once the VM credentials are restored, and record the result here.
+
+### The tripwire did not fire, and could not have
+
+`Cargo.toml`, `.github/dependabot.yml` and this ADR all named **#61** as the removal tracker. #61 was **closed** on 2026-06-11 — against its own comment stating it must not close until the patch is deleted — so the obligation was unowned from that day. Dependabot was designated as the backstop ("a new sspi release is the signal to run the removal checklist"), but three releases (0.21.1 / .2 / .3) shipped with the patch still in place; a tripwire whose condition is *already met* never fires again. Two generalisations worth keeping:
+
+1. **A removal obligation cannot live in a closed issue, and "the bot will notice" is not ownership.** Prefer an obligation stated where the thing itself is (the manifest comment, which did survive) *plus* a condition someone re-evaluates, over a tracker entry that can be closed by anyone tidying a backlog.
+2. **Cite evidence, not status.** *"Remove when #689 ships"* is a status claim; it rots silently the moment it comes true. The map's [NLA / CredSSP](../map/territory/nla-credssp.md) and [supply chain](../map/territory/supply-chain-and-gates.md) territories now carry the dated facts instead, indexed by area rather than by event.

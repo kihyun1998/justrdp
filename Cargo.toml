@@ -38,7 +38,12 @@ x509-cert = "0.2"
 # Kerberos verbatim — security-critical, non-RDP. Lives in the adapter (`justrdp-tokio`) only, the
 # same place `rustls` landed: it drives the `CredSspClient` token loop, so the sans-IO core never
 # sees a TSRequest.
-sspi = "0.21"
+#
+# Pinned exactly, per ADR-0004's Decision ("`sspi` stays pinned exactly (`=x.y.z`); version bumps
+# must pass the real-VM acceptance suite"). 0.21.3 is the first pin after the fork-bridge exit: the
+# loopback CredSSP fix (Devolutions/sspi-rs#689, merged 2026-06-17) shipped in 0.21.1, so anything
+# below that silently reintroduces the defect the bridge existed to work around.
+sspi = "=0.21.3"
 # Cancellation plumbing for the adapter's session loop (slice-8): `CancellationToken` lets the
 # host cancel a resize / tear the session down without racing the select loop. Adapter-only,
 # like tokio itself.
@@ -52,11 +57,9 @@ rcgen = "0.14"
 # on stable (unlike coverage-guided cargo-fuzz, which is a nightly CI-only lane — issue #99).
 proptest = "1"
 
-# ADR-0004 fork-bridge (issue #61): sspi 0.21.0's CredSspServer cannot complete a Negotiate-NTLM
-# handshake with its own CredSspClient (Devolutions/sspi-rs#687) — which blocks our loopback
-# full-CredSSP test. #687 is now fixed upstream by the maintainer's rework (Devolutions/sspi-rs#689,
-# merged) — our own #688 was closed in favor of it — but it has not yet shipped on crates.io. Until
-# it does we ride the fork at our CI branch tip (PR #691 head = upstream master incl. #689, plus our
-# CI/test gate). REMOVE this block and bump sspi when #689 is released on crates.io (see issue #61).
-[patch.crates-io]
-sspi = { git = "https://github.com/kihyun1998/sspi-rs", rev = "96d055b52ce96090d78a150ddff4466e36c720ba" }
+# The ADR-0004 fork-bridge that used to live here is GONE — its exit condition was met. sspi 0.21.0's
+# CredSspServer could not complete a Negotiate-NTLM handshake with its own CredSspClient
+# (Devolutions/sspi-rs#687), which blocked our loopback full-CredSSP test; the maintainer's rework
+# (Devolutions/sspi-rs#689) merged 2026-06-17 and first shipped on crates.io in sspi 0.21.1
+# (2026-06-26). The `[patch.crates-io]` block and the `kihyun1998/sspi-rs` pin were removed on the
+# published 0.21.3, with the loopback test and the real-VM suite green (ADR-0004 exit discipline).
