@@ -6,17 +6,37 @@
 //! entropy decode, sub-band diffing, multi-pass coefficient refinement, dequantization,
 //! inverse DWT, ICT — lives in `justrdp-codecs` (epic #158 slices 2–5).
 //!
-//! **The block-type numbers collide with the sibling WireToSurface1 parser's.** `0xCCC4` is
-//! `WBT_REGION` here and `WBT_FRAME_BEGIN` in [`super`]; `0xCCC5` is `WBT_TILE_SIMPLE` here
-//! and `WBT_FRAME_END` there. The two namespaces overlap by value and disagree by meaning, so
-//! a constant must never be imported across the module boundary — only [`super::SYNC_MAGIC`],
-//! [`super::SYNC_VERSION`] and [`super::TILE_DIM`], whose values the two streams genuinely
-//! share, are reused here.
+//! **The block-type numbers collide with the sibling WireToSurface1 parser's.** Both streams
+//! number their blocks `0xCCCx` and only two of the eight agree: `0xCCC0` is Sync and `0xCCC3`
+//! is Context in each. The other six mean different things — `0xCCC1` CodecVersions vs
+//! FrameBegin, `0xCCC2` Channels vs FrameEnd, `0xCCC4` FrameBegin vs Region, `0xCCC5`
+//! FrameEnd vs TileSimple, `0xCCC6` Region vs TileFirst, `0xCCC7` TileSet vs TileUpgrade
+//! ([`super`] holds the first of each pair). So **no block constant crosses the module
+//! boundary**; this module declares its own eight. What *is* shared is only what the two
+//! streams genuinely agree on: [`super::SYNC_MAGIC`], [`super::SYNC_VERSION`],
+//! [`super::TILE_DIM`], and the [`super::RfxRect`] type, which is one structure in both.
 //!
 //! Structure differs from WireToSurface1 in one more way that shapes the API: the tile blocks
 //! are **not** stream-level. They live inside a region block's declared `tileDataSize` window,
 //! so [`ProgressiveMessage`] has no tile variant and [`ProgressiveRegion::tiles`] is the only
 //! place a tile can appear.
+//!
+//! **What this layer deliberately does not check, and who inherits it.** Recorded here because
+//! a parse layer that validates *most* of a field's constraints reads, from downstream, like
+//! one that validated all of them:
+//!
+//! - **Block ordering.** FreeRDP tracks a `WBT_STATE_FLAG` machine — duplicate `SYNC`,
+//!   `FRAME_BEGIN` twice, a region outside a frame, `FRAME_BEGIN` after `FRAME_END`. None of it
+//!   is here: like the sibling WireToSurface1 parser, a message list may legitimately start
+//!   mid-frame, so ordering is decoder state. It belongs to the context lifecycle (#170).
+//! - **Quant *values*.** The bands are 4-bit so `<= 15` holds by construction, but the `>= 6`
+//!   floor the dequantizer needs is not enforced. The sources genuinely contradict each other:
+//!   FreeRDP rejects such a region outright, while `ironrdp-graphics` defines a rounding
+//!   right-shift for `q < 6` and decodes it. Left open on purpose — and note the trap for
+//!   #171, since agreeing with the oracle here proves nothing, the oracle being the reference
+//!   that tolerates it (`docs/map/invariant/oracle-agreement-is-not-independence.md`).
+//! - **Tile grid position.** `x_idx`/`y_idx` are unbounded here because the surface dimensions
+//!   are not in this stream; they are bounded where the tile is placed (#169).
 
 use super::{RfxRect, SYNC_MAGIC, SYNC_VERSION, TILE_DIM};
 use crate::cursor::ReadCursor;
@@ -52,6 +72,11 @@ pub const REGION_FLAG_DWT_REDUCE_EXTRAPOLATE: u8 = 0x01;
 /// `RFX_TILE_DIFFERENCE` — [`FirstPassTile::flags`]: this tile's coefficients are a difference
 /// against the stored ones rather than a replacement.
 pub const TILE_FLAG_DIFFERENCE: u8 = 0x01;
+
+/// The `quality` value that is a **sentinel, not an index**: full quality, i.e. no progressive
+/// quantization on top of the region's base table. Both references special-case it before
+/// indexing `prog_quants`, so it is in range whatever that table's length is.
+pub const QUALITY_FULL: u8 = 0xFF;
 
 /// The largest quantization table a region may declare (both references reject 8 or more).
 const MAX_QUANT: usize = 7;
@@ -156,9 +181,14 @@ pub struct FirstPassTile<'a> {
     pub y_idx: u16,
     /// Tile flags — see [`TILE_FLAG_DIFFERENCE`].
     pub flags: u8,
-    /// The quality level, indexing the region's progressive-quant table. `None` on
-    /// TILE_SIMPLE, which has no such field on the wire — a single-pass tile is complete at
-    /// the region's base quantization and no upgrade pass refines it.
+    /// The quality level, indexing the region's progressive-quant table — except for
+    /// [`QUALITY_FULL`], which is a sentinel rather than an index. Validated against
+    /// [`ProgressiveRegion::prog_quants`] at parse time.
+    ///
+    /// `None` on TILE_SIMPLE, which has no such field on the wire — a single-pass tile is
+    /// complete at the region's base quantization and no upgrade pass refines it. (FreeRDP
+    /// synthesizes [`QUALITY_FULL`] here instead; a value the wire never carried is exactly
+    /// what `None` avoids inventing.)
     pub quality: Option<u8>,
     /// RLGR-coded luma coefficients.
     pub y_data: &'a [u8],
@@ -185,7 +215,9 @@ pub struct UpgradeTile<'a> {
     pub x_idx: u16,
     /// Tile row in the 64×64 grid (pixel y = `y_idx * 64`).
     pub y_idx: u16,
-    /// The quality level this pass upgrades to, indexing the progressive-quant table.
+    /// The quality level this pass upgrades to, indexing the region's progressive-quant table
+    /// — except for [`QUALITY_FULL`], which is a sentinel rather than an index. Validated
+    /// against [`ProgressiveRegion::prog_quants`] at parse time.
     pub quality: u8,
     /// SRL-coded luma refinement.
     pub y_srl: &'a [u8],
@@ -219,10 +251,12 @@ pub enum ProgressiveTile<'a> {
 pub struct ProgressiveRegion<'a> {
     /// The clip rectangles, in pixels relative to the surface origin. At least one.
     pub rects: Vec<RfxRect>,
-    /// The base quantization table (at most [`MAX_QUANT`] entries); every tile index is
-    /// validated against its length.
+    /// The base quantization table (at most seven entries); every tile's `quantIdx` is
+    /// validated against its length. The band *values* are not range-checked — see the module
+    /// doc for why that is left to the layer that consumes them.
     pub quants: Vec<ProgressiveQuant>,
-    /// The progressive (per-quality bit-position) table upgrade passes index by quality.
+    /// The progressive (per-quality bit-position) table tiles index by `quality`; every tile's
+    /// `quality` is validated against its length, [`QUALITY_FULL`] excepted.
     pub prog_quants: Vec<ProgressiveCodecQuant>,
     /// Region flags — see [`REGION_FLAG_DWT_REDUCE_EXTRAPOLATE`].
     pub flags: u8,
@@ -390,9 +424,16 @@ fn decode_region<'a>(cur: &mut ReadCursor<'a>) -> Result<ProgressiveRegion<'a>, 
     let num_prog_quant = usize::from(cur.read_u8()?);
     let flags = cur.read_u8()?;
     // `numTiles` is deliberately not bound to a variable: the tile loop below is driven by the
-    // declared `tileDataSize` window instead, and a server that over-declares this count is an
-    // inconsistency the decoder tolerates rather than an error (FreeRDP
-    // `progressive_process_tiles` warns; IronRDP drives by this count and drops the window).
+    // declared `tileDataSize` window instead, and a count that disagrees with what the window
+    // holds is tolerated rather than rejected.
+    //
+    // This is **more tolerant than either reference**, not a copy of one. FreeRDP requires both
+    // to agree — `progressive_process_tiles` drives by the window and then returns -1044 on a
+    // `numTiles` mismatch and -1041 unless the window is consumed exactly (the WLOG_WARN there
+    // is the log level, not the outcome). IronRDP drives by the count and discards the window
+    // entirely. Tolerance is the permitted direction on a receive path: a server whose count
+    // and window disagree has still framed the tiles unambiguously, and the alternative is
+    // dropping a frame we can read.
     let _num_tiles = cur.read_u16_le()?;
     let tile_data_size = cur.read_u32_le()? as usize;
 
@@ -437,7 +478,11 @@ fn decode_region<'a>(cur: &mut ReadCursor<'a>) -> Result<ProgressiveRegion<'a>, 
         prog_quants.push(ProgressiveCodecQuant::decode(cur)?);
     }
 
-    let tiles = decode_tiles(cur.read_slice(tile_data_size)?, quants.len())?;
+    let tiles = decode_tiles(
+        cur.read_slice(tile_data_size)?,
+        quants.len(),
+        prog_quants.len(),
+    )?;
     Ok(ProgressiveRegion {
         rects,
         quants,
@@ -447,13 +492,21 @@ fn decode_region<'a>(cur: &mut ReadCursor<'a>) -> Result<ProgressiveRegion<'a>, 
     })
 }
 
-/// Walk the region's tile window. The window bounds the walk: a block whose length runs past
-/// it is an error, and trailing bytes too short to hold a header are left unread rather than
-/// treated as a truncated tile (the sibling WireToSurface1 parser's tolerance for a block body
-/// it did not fully consume).
+/// Walk the region's tile window, validating every table index the tiles carry against the
+/// tables the region declared — the two are in hand together exactly here, and nowhere later.
+///
+/// The window bounds the walk: a block whose length runs past it is an error. Trailing bytes
+/// too short to hold a header are left unread, which is **laxer than either reference** (both
+/// require the window consumed exactly). The asymmetry with [`decode_all`], which rejects the
+/// same 1–5 stray bytes at stream level, is deliberate and is about what the slack can do: at
+/// stream level nothing declared how long the stream was, so a partial header means the framing
+/// has desynchronized and every later block is suspect; inside a window whose length the server
+/// itself declared, slack is padding the walk skips wholesale and no later block can be
+/// misaligned by it.
 fn decode_tiles(
     window: &[u8],
     quant_count: usize,
+    prog_quant_count: usize,
 ) -> Result<Vec<ProgressiveTile<'_>>, DecodeError> {
     let mut cur = ReadCursor::new(window, "RFX_PROGRESSIVE_REGION tile window");
     let mut tiles = Vec::new();
@@ -471,19 +524,34 @@ fn decode_tiles(
                 ));
             }
         };
-        let (idx_y, idx_cb, idx_cr) = match tile {
+        let (quant_indices, quality) = match tile {
             ProgressiveTile::Simple(t) | ProgressiveTile::First(t) => {
-                (t.quant_idx_y, t.quant_idx_cb, t.quant_idx_cr)
+                ([t.quant_idx_y, t.quant_idx_cb, t.quant_idx_cr], t.quality)
             }
-            ProgressiveTile::Upgrade(t) => (t.quant_idx_y, t.quant_idx_cb, t.quant_idx_cr),
+            ProgressiveTile::Upgrade(t) => (
+                [t.quant_idx_y, t.quant_idx_cb, t.quant_idx_cr],
+                Some(t.quality),
+            ),
         };
-        for idx in [idx_y, idx_cb, idx_cr] {
+        for idx in quant_indices {
             if usize::from(idx) >= quant_count {
                 return Err(invalid(
                     "RFX_PROGRESSIVE_TILE.quantIdx",
                     "index beyond the region's quant table",
                 ));
             }
+        }
+        // `quality` indexes the region's *other* table, so it needs the same bound — leaving it
+        // out would have made this walk validate one wire-supplied table index and not the
+        // other. [`QUALITY_FULL`] is a sentinel, not an index, and is in range by definition.
+        if let Some(quality) = quality
+            && quality != QUALITY_FULL
+            && usize::from(quality) >= prog_quant_count
+        {
+            return Err(invalid(
+                "RFX_PROGRESSIVE_TILE.quality",
+                "index beyond the region's progressive-quant table",
+            ));
         }
         tiles.push(tile);
     }
@@ -639,7 +707,7 @@ mod tests {
     #[expect(clippy::too_many_arguments, reason = "one argument per wire field")]
     fn first_pass_tile_block(
         block_type: u16,
-        quant_idx: u8,
+        quant_idx: [u8; 3],
         x_idx: u16,
         y_idx: u16,
         flags: u8,
@@ -649,7 +717,7 @@ mod tests {
         cr: &[u8],
         tail: &[u8],
     ) -> Vec<u8> {
-        let mut body = vec![quant_idx, quant_idx, quant_idx];
+        let mut body = quant_idx.to_vec();
         body.extend_from_slice(&x_idx.to_le_bytes());
         body.extend_from_slice(&y_idx.to_le_bytes());
         body.push(flags);
@@ -666,13 +734,13 @@ mod tests {
     }
 
     fn upgrade_tile_block(
-        quant_idx: u8,
+        quant_idx: [u8; 3],
         x_idx: u16,
         y_idx: u16,
         quality: u8,
         runs: [&[u8]; 6],
     ) -> Vec<u8> {
-        let mut body = vec![quant_idx, quant_idx, quant_idx];
+        let mut body = quant_idx.to_vec();
         body.extend_from_slice(&x_idx.to_le_bytes());
         body.extend_from_slice(&y_idx.to_le_bytes());
         body.push(quality);
@@ -730,9 +798,11 @@ mod tests {
             &context_body(0, CONTEXT_FLAG_SUBBAND_DIFFING),
         );
         push_block(&mut data, BLOCK_FRAME_BEGIN, &frame_begin_body(7, 1));
+        // Distinct values throughout: a different quant index per component, an asymmetric
+        // rect, and x_idx != y_idx — so a parser that transposed any pair would be caught.
         let tile = first_pass_tile_block(
             BLOCK_TILE_SIMPLE,
-            0,
+            [0, 1, 2],
             2,
             3,
             0,
@@ -746,8 +816,8 @@ mod tests {
             &mut data,
             BLOCK_REGION,
             &region_body(
-                &[(0, 0, 64, 64)],
-                &[quant_bytes(6)],
+                &[(16, 32, 64, 128)],
+                &[quant_bytes(6), quant_bytes(7), quant_bytes(8)],
                 &[],
                 REGION_FLAG_DWT_REDUCE_EXTRAPOLATE,
                 &[tile],
@@ -778,21 +848,24 @@ mod tests {
         assert_eq!(
             region.rects,
             vec![RfxRect {
-                x: 0,
-                y: 0,
+                x: 16,
+                y: 32,
                 width: 64,
-                height: 64
+                height: 128
             }]
         );
-        assert_eq!(region.quants, vec![quant_from(6)]);
+        assert_eq!(
+            region.quants,
+            vec![quant_from(6), quant_from(7), quant_from(8)]
+        );
         assert!(region.prog_quants.is_empty());
         assert_eq!(region.flags, REGION_FLAG_DWT_REDUCE_EXTRAPOLATE);
         assert_eq!(
             region.tiles,
             vec![ProgressiveTile::Simple(FirstPassTile {
                 quant_idx_y: 0,
-                quant_idx_cb: 0,
-                quant_idx_cr: 0,
+                quant_idx_cb: 1,
+                quant_idx_cr: 2,
                 x_idx: 2,
                 y_idx: 3,
                 flags: 0,
@@ -808,51 +881,64 @@ mod tests {
 
     #[test]
     fn the_progressive_quant_nibble_order_is_not_the_classic_one() {
-        // The same five bytes decoded by the two parsers must disagree on HL/LH at each
-        // level — this is the transposition that would otherwise be silent.
+        // Run *both* parsers over the same five bytes. The classic one is the sibling module's
+        // `Quant`, reached here because a child module sees its parent's private items — which
+        // makes this a comparison against production code, not against a test helper.
         let bytes = quant_bytes(0);
-        let progressive = quant_from(0);
-        assert_eq!(progressive.hl3, 1);
-        assert_eq!(progressive.lh3, 2);
-        assert_eq!(progressive.hl2, 4);
-        assert_eq!(progressive.lh2, 5);
-        assert_eq!(progressive.hl1, 7);
-        assert_eq!(progressive.lh1, 8);
+        let classic = crate::rfx::Quant::decode(&mut ReadCursor::new(&bytes, "classic quant"))
+            .expect("five bytes are a whole quant");
 
-        let mut region = Vec::new();
+        let mut data = Vec::new();
         push_block(
-            &mut region,
+            &mut data,
             BLOCK_REGION,
             &region_body(&[(0, 0, 64, 64)], &[bytes], &[], 0, &[]),
         );
-        let messages = decode_all(&region).expect("region parses");
+        let messages = decode_all(&data).expect("region parses");
         let ProgressiveMessage::Region(region) = &messages[0] else {
             panic!("expected a region");
         };
-        assert_eq!(region.quants, vec![progressive]);
-        // Classic order would have read nibble 1 as lh3 and nibble 2 as hl3.
-        assert_ne!(region.quants[0].hl3, progressive.lh3);
+        let progressive = region.quants[0];
+
+        // HL and LH are transposed at all three levels...
+        assert_eq!(progressive.hl3, classic.lh3);
+        assert_eq!(progressive.lh3, classic.hl3);
+        assert_ne!(progressive.hl3, classic.hl3);
+        assert_eq!(progressive.hl2, classic.lh2);
+        assert_eq!(progressive.lh2, classic.hl2);
+        assert_ne!(progressive.hl2, classic.hl2);
+        assert_eq!(progressive.hl1, classic.lh1);
+        assert_eq!(progressive.lh1, classic.hl1);
+        assert_ne!(progressive.hl1, classic.hl1);
+        // ...and only there: LL3 and the three diagonal bands read identically, which is why
+        // the wrong decoder yields a plausible quant rather than an obviously broken one.
+        assert_eq!(progressive.ll3, classic.ll3);
+        assert_eq!(progressive.hh3, classic.hh3);
+        assert_eq!(progressive.hh2, classic.hh2);
+        assert_eq!(progressive.hh1, classic.hh1);
     }
 
     #[test]
     fn a_region_carries_first_and_upgrade_tiles_with_their_quality_tables() {
         let first = first_pass_tile_block(
             BLOCK_TILE_FIRST,
-            1,
+            [1, 0, 1],
             0,
             0,
             TILE_FLAG_DIFFERENCE,
-            Some(4),
+            Some(0),
             &[0x11],
             &[0x22],
             &[0x33],
             &[],
         );
+        // A different grid position from the first-pass tile, and x != y, so a transposition
+        // in the upgrade path cannot hide behind (0, 0).
         let upgrade = upgrade_tile_block(
-            1,
-            0,
-            0,
+            [1, 1, 0],
             5,
+            9,
+            1,
             [&[0x41], &[0x42, 0x43], &[0x44], &[], &[0x45], &[0x46]],
         );
         let mut data = Vec::new();
@@ -895,12 +981,12 @@ mod tests {
             vec![
                 ProgressiveTile::First(FirstPassTile {
                     quant_idx_y: 1,
-                    quant_idx_cb: 1,
+                    quant_idx_cb: 0,
                     quant_idx_cr: 1,
                     x_idx: 0,
                     y_idx: 0,
                     flags: TILE_FLAG_DIFFERENCE,
-                    quality: Some(4),
+                    quality: Some(0),
                     y_data: &[0x11],
                     cb_data: &[0x22],
                     cr_data: &[0x33],
@@ -909,10 +995,10 @@ mod tests {
                 ProgressiveTile::Upgrade(UpgradeTile {
                     quant_idx_y: 1,
                     quant_idx_cb: 1,
-                    quant_idx_cr: 1,
-                    x_idx: 0,
-                    y_idx: 0,
-                    quality: 5,
+                    quant_idx_cr: 0,
+                    x_idx: 5,
+                    y_idx: 9,
+                    quality: 1,
                     y_srl: &[0x41],
                     y_raw: &[0x42, 0x43],
                     cb_srl: &[0x44],
@@ -928,7 +1014,18 @@ mod tests {
     fn a_tile_block_at_stream_level_is_rejected() {
         // The WireToSurface1 sibling would have skipped an unrecognised block by its length.
         // Here a stream-level tile is a framing error: tiles exist only inside a region.
-        let data = first_pass_tile_block(BLOCK_TILE_SIMPLE, 0, 0, 0, 0, None, &[], &[], &[], &[]);
+        let data = first_pass_tile_block(
+            BLOCK_TILE_SIMPLE,
+            [0, 0, 0],
+            0,
+            0,
+            0,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
         assert!(decode_all(&data).is_err());
     }
 
@@ -1007,7 +1104,7 @@ mod tests {
     fn a_tile_quant_index_beyond_the_region_table_is_rejected() {
         let tile = first_pass_tile_block(
             BLOCK_TILE_SIMPLE,
-            3,
+            [3, 0, 0],
             0,
             0,
             0,
@@ -1025,7 +1122,7 @@ mod tests {
     fn a_tile_run_longer_than_its_block_is_rejected() {
         let mut tile = first_pass_tile_block(
             BLOCK_TILE_SIMPLE,
-            0,
+            [0, 0, 0],
             0,
             0,
             0,
@@ -1044,13 +1141,13 @@ mod tests {
 
     #[test]
     fn tiles_are_bounded_by_tile_data_size_not_by_num_tiles() {
-        // FreeRDP drives the tile loop by the declared byte window and treats a numTiles
-        // mismatch as an inconsistency to tolerate, not an error (progressive.c
-        // `progressive_process_tiles`); IronRDP drives by numTiles and drops tileDataSize.
-        // The receive path follows FreeRDP: parse what the window holds.
+        // Parse what the window holds, and do not police the count against it. This is laxer
+        // than both references — FreeRDP's `progressive_process_tiles` drives by the window but
+        // then rejects a numTiles mismatch outright (-1044), and IronRDP drives by the count
+        // and ignores the window. Tolerance is the permitted direction on a receive path.
         let tile = first_pass_tile_block(
             BLOCK_TILE_SIMPLE,
-            0,
+            [0, 0, 0],
             0,
             0,
             0,
@@ -1082,7 +1179,7 @@ mod tests {
     fn bytes_past_the_tile_window_are_not_read_as_tiles() {
         let tile = first_pass_tile_block(
             BLOCK_TILE_SIMPLE,
-            0,
+            [0, 0, 0],
             0,
             0,
             0,
@@ -1108,5 +1205,70 @@ mod tests {
             panic!("expected a region");
         };
         assert_eq!(region.tiles.len(), 1);
+    }
+
+    #[test]
+    fn a_tile_quality_beyond_the_progressive_quant_table_is_rejected() {
+        // `quality` is the region's *other* wire-supplied table index; leaving it unbounded
+        // would have made this walk check one of the two. Both references bound it.
+        let upgrade = upgrade_tile_block([0, 0, 0], 0, 0, 2, [&[0x41], &[], &[], &[], &[], &[]]);
+        let body = region_body(
+            &[(0, 0, 64, 64)],
+            &[quant_bytes(6)],
+            &[(0, 6), (1, 7)], // two entries, so quality 2 is one past the end
+            0,
+            &[upgrade],
+        );
+        assert!(decode_all(&block(BLOCK_REGION, &body)).is_err());
+
+        // The same shape with a region that declared no progressive quants at all.
+        let first = first_pass_tile_block(
+            BLOCK_TILE_FIRST,
+            [0, 0, 0],
+            0,
+            0,
+            0,
+            Some(0),
+            &[0xAA],
+            &[],
+            &[],
+            &[],
+        );
+        let body = region_body(&[(0, 0, 64, 64)], &[quant_bytes(6)], &[], 0, &[first]);
+        assert!(decode_all(&block(BLOCK_REGION, &body)).is_err());
+    }
+
+    #[test]
+    fn quality_full_is_a_sentinel_and_needs_no_table_entry() {
+        // 0xFF means "no progressive quantization", not "entry 255" — a region with an empty
+        // progressive table must still accept it, or every full-quality tile would be rejected.
+        let upgrade = upgrade_tile_block(
+            [0, 0, 0],
+            1,
+            2,
+            QUALITY_FULL,
+            [&[0x41], &[], &[], &[], &[], &[]],
+        );
+        let body = region_body(&[(0, 0, 64, 64)], &[quant_bytes(6)], &[], 0, &[upgrade]);
+        let data = block(BLOCK_REGION, &body);
+        let messages = decode_all(&data).expect("QUALITY_FULL needs no table entry");
+        let ProgressiveMessage::Region(region) = &messages[0] else {
+            panic!("expected a region");
+        };
+        let ProgressiveTile::Upgrade(tile) = region.tiles[0] else {
+            panic!("expected an upgrade tile");
+        };
+        assert_eq!(tile.quality, QUALITY_FULL);
+        assert!(region.prog_quants.is_empty());
+    }
+
+    #[test]
+    fn stray_bytes_at_stream_level_are_rejected() {
+        // The counterpart of `bytes_past_the_tile_window_are_not_read_as_tiles`, and the
+        // opposite outcome on purpose: nothing declared how long the stream is, so a partial
+        // header means the framing has desynchronized rather than that the server padded.
+        let mut data = block(BLOCK_SYNC, &sync_body());
+        data.extend_from_slice(&[0x00, 0x00, 0x00]);
+        assert!(decode_all(&data).is_err());
     }
 }

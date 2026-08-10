@@ -70,7 +70,7 @@ ls fuzz/fuzz_targets/                      # what is fuzzed
 rg --files crates/justrdp-pdu/src -g '*.rs'   # what parses untrusted bytes
 ```
 
-Today the first list is codec-shaped (10 targets) and the second is twice as long:
+Today the first list is codec-shaped (11 targets) and the second is twice as long:
 `gcc`, `mcs`, `x224`, `tpkt`, `ber`, `per`, `nego`, `share`, `update`, `dvc`, `svc`,
 `displaycontrol` and `errinfo` parse wire bytes with **no fuzz target**. That is not
 a claim that they are wrong — it is the statement that this invariant is currently

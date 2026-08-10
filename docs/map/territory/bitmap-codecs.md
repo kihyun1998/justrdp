@@ -36,17 +36,23 @@ attacker-controlled bytes in the repo.
   it, rather than returning an owned `Vec` — the copy ADR-0010 removed.
 - **RemoteFX has two block namespaces that collide by value.** WireToSurface1's
   `TS_RFX_*` and WireToSurface2's `RFX_PROGRESSIVE_*` both number their blocks
-  `0xCCCx`, and four of the numbers mean different things: `0xCCC4` is FrameBegin in
-  the first and Region in the second, `0xCCC5` FrameEnd vs TileSimple, `0xCCC6`
-  Region vs TileFirst, `0xCCC7` TileSet vs TileUpgrade. The two parsers therefore
-  share no block constants. The same trap repeats one level down: progressive's
-  `RFX_COMPONENT_CODEC_QUANT` swaps HL and LH at every DWT level relative to classic
-  `TS_RFX_CODEC_QUANT`, so a quant read with the wrong decoder yields plausible
-  values with two bands transposed rather than an error (#167).
-- **A region's tiles are bounded by its declared `tileDataSize` window, not by its
-  `numTiles` count.** The two references disagree here — FreeRDP drives the tile loop
-  by the byte window and warns on a `numTiles` mismatch, IronRDP drives by the count
-  and discards the window — and the receive-path tie-breaker takes FreeRDP's (#167).
+  `0xCCCx`, and only **two of the eight agree** — `0xCCC0` Sync and `0xCCC3` Context.
+  The other six differ: `0xCCC1` CodecVersions vs FrameBegin, `0xCCC2` Channels vs
+  FrameEnd, `0xCCC4` FrameBegin vs Region, `0xCCC5` FrameEnd vs TileSimple, `0xCCC6`
+  Region vs TileFirst, `0xCCC7` TileSet vs TileUpgrade (WireToSurface1 first in each
+  pair). So no block constant crosses between the two parsers. The same trap repeats
+  one level down: progressive's `RFX_COMPONENT_CODEC_QUANT` swaps HL and LH at every
+  DWT level relative to classic `TS_RFX_CODEC_QUANT`, so a quant read with the wrong
+  decoder yields plausible values with two bands transposed rather than an error
+  (#167). What makes both silent is that the wrong reading still *parses*: `0xCCC2`
+  routed to the WireToSurface1 walker decodes as a channel list.
+- **A region's tiles are bounded by its declared `tileDataSize` window, and the
+  `numTiles` count is not policed against it.** This is **laxer than both
+  references**, not a copy of either: FreeRDP drives by the window and then rejects a
+  `numTiles` mismatch (`progressive_process_tiles` returns -1044; its `WLOG_WARN`
+  there is the log level, not the outcome) and also rejects unless the window is
+  consumed exactly; IronRDP drives by the count and discards the window. Tolerance is
+  the permitted direction on a receive path (#167).
 
 ## Code
 
