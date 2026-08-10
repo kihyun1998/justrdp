@@ -99,3 +99,10 @@ path = "fuzz_targets/nscodec.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "progressive"
+path = "fuzz_targets/progressive.rs"
+test = false
+doc = false
+bench = false

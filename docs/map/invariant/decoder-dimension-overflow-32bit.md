@@ -65,7 +65,17 @@ rg -n 'usize::from|as usize' crates/justrdp-codecs/src crates/justrdp/src/egfx.r
    crates/justrdp/src/framebuffer.rs | rg '\*'
 ```
 
-Hand-written additions no tool can find: none recorded yet. If a site satisfies the
+Hand-written additions no tool can find:
+
+- `justrdp-pdu/src/rfx/progressive.rs`, `decode_region` — sums the region's declared
+  table sizes (`numRects * 8 + numQuant * 5 + numProgQuant * 16`) to check them
+  against the block body before reserving. Satisfied **by construction**: the counts
+  are a `u16` and two `u8`s and `numQuant` is rejected above 7 *before* the sum, so
+  the total cannot exceed ~528 KB and cannot overflow a 32-bit `usize`. Outside the
+  `rg` scope above, which covers `justrdp-codecs` and two `justrdp` files only —
+  this is the first site in `justrdp-pdu` to size an allocation from a server count.
+
+If a site satisfies the
 invariant by *construction* (a dimension already clamped by a `u16` cap earlier in
 the same function), say so in a comment at that site and add it here — a grep for
 the checked-multiplication idiom will never surface it.
