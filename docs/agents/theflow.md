@@ -340,6 +340,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo check --manifest-path fuzz/Cargo.toml     # out-of-workspace blind spot
+python .github/scripts/check_map.py             # docs/map: links, anchors, symbols, reciprocity
 # + just-shield supply-chain scan (ADR-0006): SHA-pinned actions
 # + 32-bit guards, when the change touches dimension/offset arithmetic:
 #   cargo test -p justrdp-codecs --target i686-pc-windows-msvc
@@ -352,7 +353,8 @@ cannot fail), and **never move a threshold to turn a build green**.
 
 | Workflow | Gate? | Notes |
 |---|---|---|
-| `test.yml` | **yes** | fmt → clippy `-D warnings` → `cargo test --workspace`, stable, on PR + master |
+| `test.yml` → job `test` | **yes** | fmt → clippy `-D warnings` → `cargo test --workspace`, stable, on PR + master |
+| `test.yml` → job `map` | **yes** | `.github/scripts/check_map.py` — [`docs/map/`](../map/README.md) links, `#anchors`, `## Code` symbols, section sets, invariant↔territory reciprocity. Toolchain-free, so a docs-only PR answers without waiting for cargo |
 | `fuzz.yml` | **yes** | nightly cargo-fuzz lane (#99) — a *new* target is not covered on the day it lands |
 | `supply-chain.yml` | **yes** | just-shield, SHA-pinned actions (ADR-0006); pins auto-managed by `just-shield fix` + Dependabot |
 | `coverage.yml` | **no** | cargo-llvm-cov discovery tool (#102), post-merge/dispatch, **no threshold**; scopes to the sans-IO core and excludes `justrdp-tokio` (its tests need the VM) |

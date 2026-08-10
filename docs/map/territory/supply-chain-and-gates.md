@@ -23,10 +23,16 @@ like any other.
 
 ## Design model
 
-- **Three gates and one report.** `test.yml` (fmt → clippy `-D warnings` → `cargo
-  test --workspace`), `fuzz.yml` (nightly libFuzzer), `supply-chain.yml`
-  (`just-shield`) gate; `coverage.yml` reports with no threshold and does not fail a
-  build.
+- **Three gating workflows and one report.** `test.yml` — two jobs: `test`
+  (fmt → clippy `-D warnings` → `cargo test --workspace`) and `map`
+  (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
+  waiting for cargo); `fuzz.yml` (nightly libFuzzer); `supply-chain.yml`
+  (`just-shield`). `coverage.yml` reports with no threshold and does not fail a build.
+- **A gate is only as good as its failure directions.** The map gate was verified to
+  pass on known-good notes, fail on each of five defect kinds (broken link, broken
+  anchor, missing section, unresolvable symbol, one-way invariant edge), and ignore
+  link-shaped text inside code spans — because a gate with false positives gets
+  ignored, and an ignored gate returns its defect class to being silent.
 - **`--workspace` is not "everything".** `fuzz` has its own `[workspace]`, so the top
   gate does not even *build* it; a public-API change needs
   `cargo check --manifest-path fuzz/Cargo.toml`.
@@ -40,7 +46,10 @@ like any other.
 
 ## Code
 
-- `.github/workflows/` — `test.yml`, `fuzz.yml`, `supply-chain.yml`, `coverage.yml`
+- `.github/workflows/` — `test.yml` (jobs `test` + `map`), `fuzz.yml`,
+  `supply-chain.yml`, `coverage.yml`
+- `.github/scripts/check_map.py` — the map gate; its scope is declared in its own
+  docstring rather than inferred
 - `.github/dependabot.yml` — weekly cargo + github-actions ecosystems
 - `Cargo.toml` — `[workspace.dependencies]` (exact pin `sspi = "=0.21.3"` per ADR-0004)
 - `fuzz/Cargo.toml` — the out-of-workspace member
@@ -80,7 +89,10 @@ checked ad hoc rather than recorded.
   dependency is the one supply-chain hole `just-shield` does not scan for.
 - **No i686 / 32-bit job exists**, so the dimension-overflow class is unguarded in CI
   (see [the invariant](../invariant/decoder-dimension-overflow-32bit.md)).
-- Nothing gates documentation: no rustdoc build, no link check — which is how a
-  docs.rs sentence like the adapter's "~30 lines" stays wrong.
+- **Documentation is only half-gated.** `docs/map/` now has a link/anchor/symbol/
+  section/reciprocity gate, but **rustdoc is still unbuilt in CI** — no
+  `cargo doc --no-deps` with `-D warnings`, so a public doc-comment can link a private
+  item, or describe behaviour that no longer exists, and every gate stays green. That
+  is exactly how the adapter's "~30 lines" sentence shipped to docs.rs.
 - No release/publish workflow exists yet; nothing is on crates.io, so the whole
   cross-repo half of the discipline is inert by construction.

@@ -36,3 +36,24 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # Gate for docs/map/ (the dependency graph). Its own job, not a step of `test`: it needs no Rust
+  # toolchain and no cache, so it starts and finishes while the build is still compiling — and a
+  # docs-only PR gets its answer without waiting for cargo.
+  #
+  # No new third-party action to pin (ADR-0006): the checkout below reuses the same SHA as the job
+  # above, and the checker is stdlib Python already present on the runner.
+  #
+  # What it catches that nothing else does: a broken `#anchor` fails *silently* — it falls back to
+  # the top of the target document, so a link that used to land on one row starts pointing at a
+  # whole file and the reader is misrouted without a signal. Plus symbol/path resolution under
+  # `## Code` (the map carries symbols, never line numbers), the per-kind section set (an empty
+  # section is a finding, so it may not be deleted), and invariant<->territory reciprocity, which
+  # found four one-way edges on its first run.
+  map:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Map gate (links, anchors, symbols, sections, reciprocity)
+        run: python3 .github/scripts/check_map.py
