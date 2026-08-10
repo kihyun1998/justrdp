@@ -84,6 +84,18 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   here, because a second hand-kept list is what diverges.
 - **One VM is one server.** The WS2022 box advertises a fixed cap set; paths it does
   not advertise have never been exercised against anything.
+- **The VM suite does not isolate its own sessions, and the symptom masquerades as
+  several unrelated failures.** Two properties, both measured 2026-08-10: it must run
+  with `--test-threads=1` (in parallel, 6 of 12 fail and the same 6 pass serially —
+  they race for one VM), and **no test tears down its Windows session**, so each
+  connect reattaches to the previous test's disconnected session and windows
+  accumulate. `keyboard_and_mouse_input_drive_the_real_vm` leaves Notepad open;
+  `logoff_inside_the_session_yields_the_typed_reason` then stalls on Windows' *"close
+  N apps and sign out"* confirmation — **N tracked the number of input tests that had
+  run before it** — and that modal swallows the input of every later test. One
+  leftover window therefore reads as three or four independent bugs. Every test passes
+  on a clean session; no single run has been 12/12. The failure set moves between
+  runs, which is the tell.
 - **32-bit guards need an i686 run** that no CI job performs — the class closed in
   #151/#155 is provable only on a target the gate does not build.
 - No captured-stream replay harness exists for the connect sequence: a VM run is the
