@@ -108,6 +108,10 @@ impl Progressive {
     }
 
     /// Decode one WireToSurface2 block stream, returning every tile the pass updated.
+    ///
+    /// When `JUSTRDP_PROGRESSIVE_CAPTURE_DIR` is set, the raw block stream and its decode
+    /// status are dumped there first (see [`capture_progressive_payload`]) — the corpus
+    /// harness for the epic #158 rewrite, exactly as `JUSTRDP_CLEAR_CAPTURE_DIR` served #56.
     pub fn decode(
         &mut self,
         codec_context_id: u32,
@@ -118,10 +122,29 @@ impl Progressive {
         // Track on reference: the oracle creates the context lazily inside `decode_bitmap`, so
         // recording here (even when the decode later errors) keeps the count a safe superset.
         self.contexts.insert(codec_context_id);
-        let tiles = self
+        let decoded = self
             .inner
             .decode_bitmap(codec_context_id, surface_width, surface_height, data)
-            .map_err(|e| EgfxCodecError::Progressive(e.to_string()))?;
+            .map_err(|e| EgfxCodecError::Progressive(e.to_string()));
+        // An *empty* value counts as unset — otherwise `Path::new("")` resolves to the process
+        // CWD and litters it with `prog-*.bin`.
+        if let Ok(dir) = std::env::var("JUSTRDP_PROGRESSIVE_CAPTURE_DIR")
+            && !dir.is_empty()
+        {
+            let status = match &decoded {
+                Ok(tiles) => format!("ok:{}", tiles.len()),
+                Err(e) => format!("err:{e}"),
+            };
+            capture_progressive_payload(
+                &dir,
+                data,
+                codec_context_id,
+                surface_width,
+                surface_height,
+                &status,
+            );
+        }
+        let tiles = decoded?;
         Ok(tiles
             .into_iter()
             .map(|t| ProgressiveTile {
@@ -153,6 +176,46 @@ impl Progressive {
 impl Default for Progressive {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Test-only corpus capture, gated by the `JUSTRDP_PROGRESSIVE_CAPTURE_DIR` env var: append
+/// one WireToSurface2 block stream (`prog-NNNN.bin`) plus a manifest row
+/// (`idx⇥ctx⇥w⇥h⇥len⇥status`) to that directory. Sibling of ClearCodec's
+/// `JUSTRDP_CLEAR_CAPTURE_DIR` harness, and it exists for the same reason: epic #158's
+/// differential needs the streams a *real* server emits. It is also how #193 was found —
+/// the payloads it captured were the evidence that WireToSurface2 was handing four bytes of
+/// `bitmapDataLength` to the codec. Best-effort: any IO error is swallowed so capture never
+/// perturbs decoding.
+fn capture_progressive_payload(
+    dir: &str,
+    data: &[u8],
+    codec_context_id: u32,
+    width: u16,
+    height: u16,
+    status: &str,
+) {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let idx = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let dir = std::path::Path::new(dir);
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(format!("prog-{idx:04}.bin")), data);
+    if let Ok(mut manifest) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("manifest.tsv"))
+    {
+        let _ = writeln!(
+            manifest,
+            "{idx}\t{codec_context_id}\t{width}\t{height}\t{}\t{status}",
+            data.len()
+        );
     }
 }
 
