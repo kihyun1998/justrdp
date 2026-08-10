@@ -325,6 +325,7 @@ a spine — a cluster with a home never gets a second one). All **Accepted**; no
 | 0008 | robustness testing — fuzz & property (#97/#98/#99) |
 | 0009 | tolerant negotiation posture (#101) |
 | 0010 | `FrameUpdate` dirty-rect contract (#85) |
+| 0011 | zero `ironrdp` as the terminal state; the oracle retires per codec (#194) |
 
 **Tracker parent/child: GitHub sub-issues are available and currently unused.** The epics
 (#158, #10–#29, #45) are grouped by **title prose** only — `gh api
