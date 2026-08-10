@@ -1919,116 +1919,112 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn connect_reaches_session_active_against_real_vm() {
-        let _vm = VM_SESSION.lock().await;
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let config = test_config();
-        let requested = config.requested;
-        let requested_size = (config.core.desktop_width, config.core.desktop_height);
-        let credentials = Credentials {
-            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
-            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
-            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
-        };
+        with_vm_session(|vm| async move {
+            let config = test_config();
+            let requested = config.requested;
+            let requested_size = (config.core.desktop_width, config.core.desktop_height);
 
-        let mut stages = Vec::new();
-        // The VM presents a self-signed cert: trusting it is an explicit, test-site decision
-        // (issue #36) — the default chain policy is not weakened to make the suite pass.
-        let result =
-            connect_danger(addr, config, credentials, |s| stages.push(s.to_string())).await;
-        eprintln!("stages: {stages:?}");
-        let outcome = result.expect("connect should reach session-active against the real VM");
-        eprintln!("mcs result: {:?}", outcome.mcs);
-        eprintln!(
-            "activation: share_id={:#010x} desktop={:?} server_capsets={} leftover={}",
-            outcome.activation.share_id,
-            outcome.activation.desktop_size,
-            outcome.activation.server_capabilities.len(),
-            outcome.activation.leftover.len(),
-        );
-
-        // The server must select exactly one protocol from the set we advertised...
-        assert!(outcome.mcs.selected.bits() != 0);
-        assert!(requested.contains(outcome.mcs.selected));
-        // ...the MCS exchange must yield a valid user channel (T.125 UserIds start at 1001)
-        // and the I/O channel...
-        assert!(outcome.mcs.user_channel_id >= 1001);
-        assert!(outcome.mcs.io_channel_id >= 1001);
-        // ...the requested static channels are answered (granted or refused, never dropped)...
-        assert!(outcome.mcs.static_channels.len() <= 2);
-        for ch in &outcome.mcs.static_channels {
-            assert!(
-                ch.id >= 1001,
-                "granted channel {} has id {}",
-                ch.name,
-                ch.id
+            let mut stages = Vec::new();
+            // The VM presents a self-signed cert: trusting it is an explicit, test-site decision
+            // (issue #36) — the default chain policy is not weakened to make the suite pass.
+            let result = vm.try_connect(config, |s| stages.push(s.to_string())).await;
+            eprintln!("stages: {stages:?}");
+            let outcome = result.expect("connect should reach session-active against the real VM");
+            eprintln!("mcs result: {:?}", outcome.mcs);
+            eprintln!(
+                "activation: share_id={:#010x} desktop={:?} server_capsets={} leftover={}",
+                outcome.activation.share_id,
+                outcome.activation.desktop_size,
+                outcome.activation.server_capabilities.len(),
+                outcome.activation.leftover.len(),
             );
-        }
-        // ...and the connect sequence walked every canonical stage, ending in session-active.
-        assert_eq!(stages.first().map(String::as_str), Some("tcp-connect"));
-        for expected in [
-            "x224-negotiate",
-            "tls-handshake",
-            "nla-credssp",
-            "capability-exchange",
-            "activation",
-        ] {
-            assert!(
-                stages.contains(&expected.to_string()),
-                "expected to reach the {expected} stage, got {stages:?}"
-            );
-        }
-        assert_eq!(stages.last().map(String::as_str), Some("session-active"));
 
-        // Capability exchange settled the desktop size: the VM honors the requested size
-        // (compare against the server's own Bitmap capability set as the source of truth).
-        let server_bitmap = outcome
-            .activation
-            .server_capabilities
-            .iter()
-            .find_map(|set| match set {
-                justrdp_pdu::capability::CapabilitySet::Bitmap(bitmap) => Some(bitmap),
-                _ => None,
-            })
-            .expect("the server's Demand Active carries a Bitmap capability set");
-        assert_eq!(
-            outcome.activation.desktop_size,
-            (server_bitmap.desktop_width, server_bitmap.desktop_height),
-            "ConnectionResult must record the server-negotiated size"
-        );
-        assert_eq!(
-            outcome.activation.desktop_size, requested_size,
-            "this VM honors the requested desktop size"
-        );
-        assert!(outcome.activation.share_id != 0);
-
-        // Session-active proof: the server starts streaming on its own (graphics / pointer /
-        // logon notifications). At least one complete inbound PDU must arrive — either already
-        // buffered in `leftover` or readable from the live stream.
-        let mut stream = outcome.stream;
-        let mut inbox = outcome.activation.leftover;
-        let mut buf = [0u8; 8192];
-        let frame_len = loop {
-            match justrdp_pdu::tpkt::frame_len(&inbox) {
-                Ok(n) if inbox.len() >= n => break n,
-                Ok(_) | Err(justrdp_pdu::DecodeError::NotEnoughBytes { .. }) => {
-                    let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf))
-                        .await
-                        .expect("server should send a first PDU after session-active")
-                        .expect("read from the live stream");
-                    assert!(n > 0, "server closed right after session-active");
-                    inbox.extend_from_slice(&buf[..n]);
-                }
-                // Post-active traffic may be fast-path (no TPKT); any bytes at all prove the
-                // session is live.
-                Err(_) => break inbox.len(),
+            // The server must select exactly one protocol from the set we advertised...
+            assert!(outcome.mcs.selected.bits() != 0);
+            assert!(requested.contains(outcome.mcs.selected));
+            // ...the MCS exchange must yield a valid user channel (T.125 UserIds start at 1001)
+            // and the I/O channel...
+            assert!(outcome.mcs.user_channel_id >= 1001);
+            assert!(outcome.mcs.io_channel_id >= 1001);
+            // ...the requested static channels are answered (granted or refused, never dropped)...
+            assert!(outcome.mcs.static_channels.len() <= 2);
+            for ch in &outcome.mcs.static_channels {
+                assert!(
+                    ch.id >= 1001,
+                    "granted channel {} has id {}",
+                    ch.name,
+                    ch.id
+                );
             }
-        };
-        eprintln!(
-            "first post-active pdu: {} bytes (of {} buffered)",
-            frame_len,
-            inbox.len()
-        );
-        assert!(frame_len > 0);
+            // ...and the connect sequence walked every canonical stage, ending in session-active.
+            assert_eq!(stages.first().map(String::as_str), Some("tcp-connect"));
+            for expected in [
+                "x224-negotiate",
+                "tls-handshake",
+                "nla-credssp",
+                "capability-exchange",
+                "activation",
+            ] {
+                assert!(
+                    stages.contains(&expected.to_string()),
+                    "expected to reach the {expected} stage, got {stages:?}"
+                );
+            }
+            assert_eq!(stages.last().map(String::as_str), Some("session-active"));
+
+            // Capability exchange settled the desktop size: the VM honors the requested size
+            // (compare against the server's own Bitmap capability set as the source of truth).
+            let server_bitmap = outcome
+                .activation
+                .server_capabilities
+                .iter()
+                .find_map(|set| match set {
+                    justrdp_pdu::capability::CapabilitySet::Bitmap(bitmap) => Some(bitmap),
+                    _ => None,
+                })
+                .expect("the server's Demand Active carries a Bitmap capability set");
+            assert_eq!(
+                outcome.activation.desktop_size,
+                (server_bitmap.desktop_width, server_bitmap.desktop_height),
+                "ConnectionResult must record the server-negotiated size"
+            );
+            assert_eq!(
+                outcome.activation.desktop_size, requested_size,
+                "this VM honors the requested desktop size"
+            );
+            assert!(outcome.activation.share_id != 0);
+
+            // Session-active proof: the server starts streaming on its own (graphics / pointer /
+            // logon notifications). At least one complete inbound PDU must arrive — either already
+            // buffered in `leftover` or readable from the live stream.
+            let mut stream = outcome.stream;
+            let mut inbox = outcome.activation.leftover;
+            let mut buf = [0u8; 8192];
+            let frame_len = loop {
+                match justrdp_pdu::tpkt::frame_len(&inbox) {
+                    Ok(n) if inbox.len() >= n => break n,
+                    Ok(_) | Err(justrdp_pdu::DecodeError::NotEnoughBytes { .. }) => {
+                        let n =
+                            tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf))
+                                .await
+                                .expect("server should send a first PDU after session-active")
+                                .expect("read from the live stream");
+                        assert!(n > 0, "server closed right after session-active");
+                        inbox.extend_from_slice(&buf[..n]);
+                    }
+                    // Post-active traffic may be fast-path (no TPKT); any bytes at all prove the
+                    // session is live.
+                    Err(_) => break inbox.len(),
+                }
+            };
+            eprintln!(
+                "first post-active pdu: {} bytes (of {} buffered)",
+                frame_len,
+                inbox.len()
+            );
+            assert!(frame_len > 0);
+        })
+        .await
     }
 
     /// Probe for issue #150 (standalone NSCodec via Surface Bits): does this VM advertise the
@@ -2042,16 +2038,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn vm_advertised_bitmap_codecs_and_surface_commands() {
-        let _vm = VM_SESSION.lock().await;
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let credentials = Credentials {
-            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
-            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
-            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
-        };
-        let outcome = connect_danger(addr, legacy_graphics_config(), credentials, |_| {})
-            .await
-            .expect("connect should reach session-active against the real VM");
+        with_vm_session(|vm| async move {
+        let outcome = vm.connect(legacy_graphics_config()).await;
 
         // The NSCodec GUID in wire order (Data1/2/3 little-endian, Data4 verbatim) — the same bytes
         // justrdp-pdu's activation differential test pins.
@@ -2107,6 +2095,8 @@ mod tests {
                 "NOT offered — defer #150 as unprovable against this VM"
             }
         );
+        })
+        .await
     }
 
     /// Caller policy for a *legacy-graphics* (bitmap update) session: do NOT advertise
@@ -2132,127 +2122,125 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn captured_bitmap_rectangles_decode_identically_in_ironrdp() {
-        let _vm = VM_SESSION.lock().await;
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let credentials = Credentials {
-            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
-            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
-            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
-        };
-        let outcome = connect_danger(addr, legacy_graphics_config(), credentials, |_| {})
-            .await
-            .expect("connect should reach session-active");
-        let mut stream = outcome.stream;
-        let mut inbox = outcome.activation.leftover;
-        let mut buf = [0u8; 16384];
+        with_vm_session(|vm| async move {
+            let outcome = vm.connect(legacy_graphics_config()).await;
+            let mut stream = outcome.stream;
+            let mut inbox = outcome.activation.leftover;
+            let mut buf = [0u8; 16384];
 
-        // Capture compressed rectangles straight off the wire, reassembling fragmented
-        // fast-path bitmap updates (large compressed bitmaps are exactly the ones servers
-        // fragment).
-        let mut captured: Vec<justrdp_pdu::update::BitmapData> = Vec::new();
-        let mut fragment: Vec<u8> = Vec::new();
-        let mut total_rects = 0usize;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-        'capture: while captured.len() < 32 {
-            while let Some(&first) = inbox.first() {
-                let len = if justrdp_pdu::fastpath::is_fastpath(first) {
-                    justrdp_pdu::fastpath::frame_len(&inbox)
-                } else {
-                    justrdp_pdu::tpkt::frame_len(&inbox)
-                };
-                let len = match len {
-                    Ok(n) if inbox.len() >= n => n,
-                    _ => break,
-                };
-                let frame: Vec<u8> = inbox.drain(..len).collect();
-                if !justrdp_pdu::fastpath::is_fastpath(first) {
-                    continue;
-                }
-                for section in justrdp_pdu::fastpath::decode_updates(&frame).unwrap() {
-                    if section.code != justrdp_pdu::fastpath::FP_UPDATE_BITMAP {
+            // Capture compressed rectangles straight off the wire, reassembling fragmented
+            // fast-path bitmap updates (large compressed bitmaps are exactly the ones servers
+            // fragment).
+            let mut captured: Vec<justrdp_pdu::update::BitmapData> = Vec::new();
+            let mut fragment: Vec<u8> = Vec::new();
+            let mut total_rects = 0usize;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            'capture: while captured.len() < 32 {
+                while let Some(&first) = inbox.first() {
+                    let len = if justrdp_pdu::fastpath::is_fastpath(first) {
+                        justrdp_pdu::fastpath::frame_len(&inbox)
+                    } else {
+                        justrdp_pdu::tpkt::frame_len(&inbox)
+                    };
+                    let len = match len {
+                        Ok(n) if inbox.len() >= n => n,
+                        _ => break,
+                    };
+                    let frame: Vec<u8> = inbox.drain(..len).collect();
+                    if !justrdp_pdu::fastpath::is_fastpath(first) {
                         continue;
                     }
-                    // Reassemble fragmented updates too — large (compressed) bitmaps are
-                    // exactly the ones servers fragment.
-                    let complete: Option<Vec<u8>> = match section.fragmentation {
-                        justrdp_pdu::fastpath::FP_FRAGMENT_SINGLE => Some(section.data.to_vec()),
-                        justrdp_pdu::fastpath::FP_FRAGMENT_FIRST => {
-                            fragment = section.data.to_vec();
-                            None
+                    for section in justrdp_pdu::fastpath::decode_updates(&frame).unwrap() {
+                        if section.code != justrdp_pdu::fastpath::FP_UPDATE_BITMAP {
+                            continue;
                         }
-                        _ => {
-                            fragment.extend_from_slice(section.data);
-                            if section.fragmentation == justrdp_pdu::fastpath::FP_FRAGMENT_LAST {
-                                Some(std::mem::take(&mut fragment))
-                            } else {
+                        // Reassemble fragmented updates too — large (compressed) bitmaps are
+                        // exactly the ones servers fragment.
+                        let complete: Option<Vec<u8>> = match section.fragmentation {
+                            justrdp_pdu::fastpath::FP_FRAGMENT_SINGLE => {
+                                Some(section.data.to_vec())
+                            }
+                            justrdp_pdu::fastpath::FP_FRAGMENT_FIRST => {
+                                fragment = section.data.to_vec();
                                 None
                             }
-                        }
-                    };
-                    let Some(data) = complete else { continue };
-                    let mut cur = justrdp_pdu::cursor::ReadCursor::new(&data, "capture");
-                    cur.read_u16_le().unwrap(); // updateType
-                    let update = justrdp_pdu::update::BitmapUpdate::decode(&mut cur)
-                        .expect("captured bitmap update decodes");
-                    for rect in update.rectangles {
-                        total_rects += 1;
-                        if rect.compressed {
-                            captured.push(rect);
+                            _ => {
+                                fragment.extend_from_slice(section.data);
+                                if section.fragmentation == justrdp_pdu::fastpath::FP_FRAGMENT_LAST
+                                {
+                                    Some(std::mem::take(&mut fragment))
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        let Some(data) = complete else { continue };
+                        let mut cur = justrdp_pdu::cursor::ReadCursor::new(&data, "capture");
+                        cur.read_u16_le().unwrap(); // updateType
+                        let update = justrdp_pdu::update::BitmapUpdate::decode(&mut cur)
+                            .expect("captured bitmap update decodes");
+                        for rect in update.rectangles {
+                            total_rects += 1;
+                            if rect.compressed {
+                                captured.push(rect);
+                            }
                         }
                     }
                 }
+                match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => inbox.extend_from_slice(&buf[..n]),
+                    _ => break 'capture,
+                }
             }
-            match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => inbox.extend_from_slice(&buf[..n]),
-                _ => break 'capture,
-            }
-        }
-        eprintln!(
-            "captured {} compressed rectangles from the live server ({total_rects} total)",
-            captured.len()
-        );
-        assert!(
-            captured.len() >= 4,
-            "expected the server to produce compressed bitmap rectangles to capture"
-        );
+            eprintln!(
+                "captured {} compressed rectangles from the live server ({total_rects} total)",
+                captured.len()
+            );
+            assert!(
+                captured.len() >= 4,
+                "expected the server to produce compressed bitmap rectangles to capture"
+            );
 
-        for (i, rect) in captured.iter().enumerate() {
-            let (w, h) = (usize::from(rect.width), usize::from(rect.height));
-            if rect.bits_per_pixel == 32 {
-                let ours = justrdp_codecs::planar::decompress(&rect.data, w, h)
-                    .unwrap_or_else(|e| panic!("rect {i}: ours failed: {e}"));
-                let mut theirs = Vec::new();
-                ironrdp_graphics::rdp6::BitmapStreamDecoder::default()
-                    .decode_bitmap_stream_to_rgb24(&rect.data, &mut theirs, w, h)
+            for (i, rect) in captured.iter().enumerate() {
+                let (w, h) = (usize::from(rect.width), usize::from(rect.height));
+                if rect.bits_per_pixel == 32 {
+                    let ours = justrdp_codecs::planar::decompress(&rect.data, w, h)
+                        .unwrap_or_else(|e| panic!("rect {i}: ours failed: {e}"));
+                    let mut theirs = Vec::new();
+                    ironrdp_graphics::rdp6::BitmapStreamDecoder::default()
+                        .decode_bitmap_stream_to_rgb24(&rect.data, &mut theirs, w, h)
+                        .unwrap_or_else(|e| panic!("rect {i}: oracle failed: {e:?}"));
+                    let ours_rgb: Vec<u8> = ours
+                        .chunks_exact(3)
+                        .flat_map(|bgr| [bgr[2], bgr[1], bgr[0]])
+                        .collect();
+                    assert_eq!(ours_rgb, theirs, "rect {i} ({w}x{h} planar) diverged");
+                } else {
+                    let ours =
+                        justrdp_codecs::rle::decompress(&rect.data, w, h, rect.bits_per_pixel)
+                            .unwrap_or_else(|e| panic!("rect {i}: ours failed: {e}"));
+                    let mut theirs = Vec::new();
+                    ironrdp_graphics::rle::decompress(
+                        &rect.data,
+                        &mut theirs,
+                        w,
+                        h,
+                        usize::from(rect.bits_per_pixel),
+                    )
                     .unwrap_or_else(|e| panic!("rect {i}: oracle failed: {e:?}"));
-                let ours_rgb: Vec<u8> = ours
-                    .chunks_exact(3)
-                    .flat_map(|bgr| [bgr[2], bgr[1], bgr[0]])
-                    .collect();
-                assert_eq!(ours_rgb, theirs, "rect {i} ({w}x{h} planar) diverged");
-            } else {
-                let ours = justrdp_codecs::rle::decompress(&rect.data, w, h, rect.bits_per_pixel)
-                    .unwrap_or_else(|e| panic!("rect {i}: ours failed: {e}"));
-                let mut theirs = Vec::new();
-                ironrdp_graphics::rle::decompress(
-                    &rect.data,
-                    &mut theirs,
-                    w,
-                    h,
-                    usize::from(rect.bits_per_pixel),
-                )
-                .unwrap_or_else(|e| panic!("rect {i}: oracle failed: {e:?}"));
-                assert_eq!(
-                    ours, theirs,
-                    "rect {i} ({w}x{h} @ {} bpp RLE) diverged",
-                    rect.bits_per_pixel
-                );
+                    assert_eq!(
+                        ours, theirs,
+                        "rect {i} ({w}x{h} @ {} bpp RLE) diverged",
+                        rect.bits_per_pixel
+                    );
+                }
             }
-        }
-        eprintln!(
-            "all {} captured rectangles byte-identical in both stacks",
-            captured.len()
-        );
+            eprintln!(
+                "all {} captured rectangles byte-identical in both stacks",
+                captured.len()
+            );
+        })
+        .await
     }
 
     /// Assemble the [`justrdp::SessionConfig`] from a connect outcome — including the server's
@@ -2294,98 +2282,331 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn first_frames_render_the_desktop_against_real_vm() {
-        let _vm = VM_SESSION.lock().await;
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let config = legacy_graphics_config();
-        let session_capabilities = config.capabilities.clone();
-        let credentials = Credentials {
-            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
-            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
-            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
-        };
-        let outcome = connect_danger(addr, config, credentials, |_| {})
-            .await
-            .expect("connect should reach session-active");
+        with_vm_session(|vm| async move {
+            let config = legacy_graphics_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
 
-        let mut machine = SessionStateMachine::new(
-            session_config_from(&outcome, session_capabilities),
-            outcome.activation.leftover,
-        );
-        let mut stream = outcome.stream;
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover,
+            );
+            let mut stream = outcome.stream;
 
-        // Let the session run for a few seconds: the server paints the full desktop right
-        // after activation. The timeout is the expected exit (a session never ends itself).
-        let mut frames = 0usize;
-        let mut covered: u64 = 0;
-        let ended = tokio::time::timeout(
-            Duration::from_secs(8),
-            run_session(
-                &mut stream,
-                &mut machine,
-                |frame, _fb| {
-                    frames += 1;
-                    covered += u64::from(frame.width) * u64::from(frame.height);
-                },
-                |_| {},
-            ),
-        )
-        .await;
-        if let Ok(result) = ended {
-            result.expect("session failed before the observation window closed");
-            panic!("server closed the session unexpectedly early");
-        }
+            // Let the session run for a few seconds: the server paints the full desktop right
+            // after activation. The timeout is the expected exit (a session never ends itself).
+            let mut frames = 0usize;
+            let mut covered: u64 = 0;
+            let ended = tokio::time::timeout(
+                Duration::from_secs(8),
+                run_session(
+                    &mut stream,
+                    &mut machine,
+                    |frame, _fb| {
+                        frames += 1;
+                        covered += u64::from(frame.width) * u64::from(frame.height);
+                    },
+                    |_| {},
+                ),
+            )
+            .await;
+            if let Ok(result) = ended {
+                result.expect("session failed before the observation window closed");
+                panic!("server closed the session unexpectedly early");
+            }
 
-        let fb = machine.framebuffer();
-        let total = u64::from(fb.width()) * u64::from(fb.height());
-        eprintln!(
-            "frames={frames} covered={covered}px of {total}px ({}x{})",
-            fb.width(),
-            fb.height()
-        );
-        assert!(frames >= 1, "no FrameUpdate was emitted");
-        assert!(
-            covered >= total / 2,
-            "expected at least half the desktop painted, got {covered} of {total}"
-        );
+            let fb = machine.framebuffer();
+            let total = u64::from(fb.width()) * u64::from(fb.height());
+            eprintln!(
+                "frames={frames} covered={covered}px of {total}px ({}x{})",
+                fb.width(),
+                fb.height()
+            );
+            assert!(frames >= 1, "no FrameUpdate was emitted");
+            assert!(
+                covered >= total / 2,
+                "expected at least half the desktop painted, got {covered} of {total}"
+            );
 
-        // Monochrome output would mean the decode silently produced garbage.
-        let mut distinct = std::collections::HashSet::new();
-        for px in fb.pixels().chunks_exact(4) {
-            distinct.insert([px[0], px[1], px[2]]);
-            if distinct.len() > 16 {
-                break;
+            // Monochrome output would mean the decode silently produced garbage.
+            let mut distinct = std::collections::HashSet::new();
+            for px in fb.pixels().chunks_exact(4) {
+                distinct.insert([px[0], px[1], px[2]]);
+                if distinct.len() > 16 {
+                    break;
+                }
+            }
+            assert!(
+                distinct.len() > 16,
+                "framebuffer is near-monochrome ({} colors) — decode likely broken",
+                distinct.len()
+            );
+
+            // Visual confirmation artifact (open with any image viewer).
+            let path = std::env::temp_dir().join("justrdp-slice6-first-frame.ppm");
+            let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+            for px in fb.pixels().chunks_exact(4) {
+                ppm.extend_from_slice(&px[..3]);
+            }
+            std::fs::write(&path, ppm).expect("write the visual dump");
+            eprintln!("visual dump for confirmation: {}", path.display());
+        })
+        .await
+    }
+
+    /// The real-VM harness (issue #182) — **the only way a test reaches the test VM**.
+    ///
+    /// Every `#[ignore]`d VM test runs its body inside [`with_vm_session`], which owns the three
+    /// things a session needs and exports none of them: the VM's address, the credentials, and
+    /// the process-wide serialisation lock. A test that tried to call [`connect_danger`] itself
+    /// would have no server to name and no account to name it with, so "go through the harness"
+    /// is enforced by construction rather than by review.
+    ///
+    /// It exists because the suite previously shared one Windows session across all twelve tests
+    /// and never tore it down. Each connect reattaches to the previous test's *disconnected*
+    /// session, so a window one test opened was still open for the next one — and the failure did
+    /// not look like that. One leftover Notepad made `logoff_…` stall on Windows' *"close N apps
+    /// and sign out"* screen, and that modal then swallowed the input of every later test: one
+    /// leftover window read as three or four independent bugs, and the failing set moved between
+    /// runs.
+    mod vm {
+        use super::*;
+        use std::any::Any;
+        use std::future::Future;
+        use std::panic::AssertUnwindSafe;
+        use std::task::Poll;
+
+        /// The test VM. Deliberately private: see the module docs.
+        const VM_ADDR: &str = "192.168.136.136:3389";
+
+        /// All real-VM tests drive the same Windows session, so they must not overlap: a
+        /// concurrent logon with the same account takes the session over and kicks the other
+        /// test mid-run.
+        ///
+        /// This lock is **not** what `--test-threads=1` used to provide. A static
+        /// `tokio::sync::Mutex` already serialises across the separate current-thread runtimes
+        /// `#[tokio::test]` builds (measured: six tests holding a 300 ms critical section never
+        /// overlap and take 1.85 s in total). What running in parallel actually changed was the
+        /// *order* tests acquired it in — and an order-dependent suite is what the teardown
+        /// below exists to abolish.
+        static VM_SESSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        /// Credentials from the environment, so none is committed to the repo.
+        fn credentials() -> Credentials {
+            Credentials {
+                username: std::env::var("JUSTRDP_TEST_USERNAME")
+                    .expect("set JUSTRDP_TEST_USERNAME"),
+                password: std::env::var("JUSTRDP_TEST_PASSWORD")
+                    .expect("set JUSTRDP_TEST_PASSWORD"),
+                domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
             }
         }
-        assert!(
-            distinct.len() > 16,
-            "framebuffer is near-monochrome ({} colors) — decode likely broken",
-            distinct.len()
-        );
 
-        // Visual confirmation artifact (open with any image viewer).
-        let path = std::env::temp_dir().join("justrdp-slice6-first-frame.ppm");
-        let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-        for px in fb.pixels().chunks_exact(4) {
-            ppm.extend_from_slice(&px[..3]);
+        /// A claim on the test VM, handed to the body of [`with_vm_session`]. Holding one means
+        /// the lock is held and the desktop will be tidied afterwards.
+        pub(super) struct Vm {
+            _seal: (),
         }
-        std::fs::write(&path, ppm).expect("write the visual dump");
-        eprintln!("visual dump for confirmation: {}", path.display());
-    }
 
-    /// All real-VM tests log on to the same Windows session on the test VM; a concurrent
-    /// logon with the same account takes the session over and kicks the other test mid-run
-    /// (observed as a flake when the whole `--ignored` suite runs in parallel). Serialize
-    /// them on one process-wide lock.
-    static VM_SESSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        impl Vm {
+            /// The VM's address — for a test that must interpose something (a proxy) in front
+            /// of it. An address alone reaches no session; the credentials stay in here.
+            pub(super) fn addr(&self) -> SocketAddr {
+                VM_ADDR.parse().expect("the VM address is a literal")
+            }
 
-    /// Credentials from the environment for the real-VM tests.
-    fn vm_credentials() -> Credentials {
-        Credentials {
-            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
-            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
-            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
+            /// Connect and require session-active.
+            pub(super) async fn connect(&self, config: ConnectConfig) -> ConnectOutcome {
+                self.try_connect_through(self.addr(), config, |_| {})
+                    .await
+                    .expect("connect should reach session-active")
+            }
+
+            /// [`Vm::connect`] through `addr` rather than straight at the VM — for the
+            /// severed-transport test, which dials its own kill-switch proxy.
+            pub(super) async fn connect_through(
+                &self,
+                addr: SocketAddr,
+                config: ConnectConfig,
+            ) -> ConnectOutcome {
+                self.try_connect_through(addr, config, |_| {})
+                    .await
+                    .expect("connect should reach session-active")
+            }
+
+            /// Connect, reporting each stage as it is entered, and surface the failure rather
+            /// than panicking — the stage-sequence acceptance test asserts on both.
+            pub(super) async fn try_connect(
+                &self,
+                config: ConnectConfig,
+                on_stage: impl FnMut(&str),
+            ) -> Result<ConnectOutcome, ConnectFailure> {
+                self.try_connect_through(self.addr(), config, on_stage)
+                    .await
+            }
+
+            async fn try_connect_through(
+                &self,
+                addr: SocketAddr,
+                config: ConnectConfig,
+                on_stage: impl FnMut(&str),
+            ) -> Result<ConnectOutcome, ConnectFailure> {
+                connect_danger(addr, config, credentials(), on_stage).await
+            }
+        }
+
+        /// Run `body` against the test VM under the suite lock, then **always** return the
+        /// Windows session to a known-clean state — including when the body panicked, which is
+        /// the case that matters: a failing test that leaves a window open is exactly how one
+        /// defect became four.
+        pub(super) async fn with_vm_session<F, Fut, T>(body: F) -> T
+        where
+            F: FnOnce(Vm) -> Fut,
+            Fut: Future<Output = T>,
+        {
+            let _guard = VM_SESSION.lock().await;
+            let outcome = catch_panic(body(Vm { _seal: () })).await;
+            let tidy = catch_panic(tidy_session()).await;
+            match (outcome, tidy) {
+                // The body's verdict wins: a teardown failure must never mask it, but it must
+                // still be visible, because the next test is about to inherit the mess.
+                (Err(panic), tidy) => {
+                    if tidy.is_err() {
+                        eprintln!(
+                            "vm harness: teardown ALSO failed after the test panicked — the \
+                             next test starts from a dirty session"
+                        );
+                    }
+                    std::panic::resume_unwind(panic)
+                }
+                (Ok(_), Err(panic)) => std::panic::resume_unwind(panic),
+                (Ok(value), Ok(())) => value,
+            }
+        }
+
+        /// Return the VM to a clean desktop by **signing the Windows session out**, forcibly.
+        ///
+        /// Why a sign-out and not a sweep of the open windows: closing windows from the client
+        /// side means synthesising keystrokes, and a reattached RDP session has focus on
+        /// *nothing* — measured, twice: with no focus every keystroke is swallowed (Alt+F4 five
+        /// times over, zero repaint), and a click is the only input class that always lands.
+        /// A keyboard sweep therefore has to guess what is on screen, and guessing wrong is not
+        /// free: an Alt+F4 that reaches the bare desktop raises the *Shut Down Windows* dialog
+        /// on Server 2022, which a later stray Enter would act on.
+        ///
+        /// The sign-out costs nothing on the next connect — a cold logon reaches session-active
+        /// in ~380 ms, indistinguishable from the ~350 ms reattach it replaces, because the
+        /// connect returns at session-active and Windows finishes the profile work behind it.
+        ///
+        /// `shutdown /l /f` rather than `logoff`: `/f` forces applications closed instead of
+        /// letting one with unsaved work (Notepad, in this suite) raise the *"close N apps and
+        /// sign out"* screen — the very screen whose appearance produced issue #182.
+        async fn tidy_session() -> () {
+            let vm = Vm { _seal: () };
+            let config = legacy_graphics_config();
+            let capabilities = config.capabilities.clone();
+            let Ok(outcome) = vm.try_connect_through(vm.addr(), config, |_| {}).await else {
+                // Nothing to tidy that we can reach; say so rather than failing the test that
+                // just passed.
+                eprintln!("vm harness: teardown could not connect — session left as-is");
+                return;
+            };
+            let desktop = outcome.activation.desktop_size;
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, capabilities),
+                outcome.activation.leftover,
+            );
+            let mut stream = outcome.stream;
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(32);
+            let driver = tokio::spawn(async move {
+                // The desktop repaints in a burst after a connect; type into it too early and
+                // the Start menu is not up yet.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                // Click Start. The mouse is the input class that lands regardless of focus,
+                // which is what makes the typing that follows reach anything at all.
+                let (x, y) = (24u16, desktop.1.saturating_sub(20));
+                for flags in [
+                    justrdp_pdu::input::PTRFLAGS_MOVE,
+                    justrdp_pdu::input::PTRFLAGS_DOWN | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                    justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                ] {
+                    let _ = tx
+                        .send(vec![InputEvent::Mouse {
+                            flags,
+                            wheel_units: 0,
+                            x,
+                            y,
+                        }])
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                // "shutdown /l /f" — Start search runs it; every character is a plain VK, so
+                // no shift chord is needed. (S H U T D O W N ␣ / L ␣ / F)
+                for vk in [
+                    0x53u16, 0x48, 0x55, 0x54, 0x44, 0x4F, 0x57, 0x4E, 0x20, 0xBF, 0x4C, 0x20,
+                    0xBF, 0x46,
+                ] {
+                    let _ = tx.send(tap(vk)).await;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = tx.send(tap(0x0D)).await; // Enter
+                // Hold the input channel open so the session loop keeps its input branch until
+                // the server closes the session.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+            // The sign-out ends the session, so the session loop returning *is* the success
+            // signal; a timeout means the sign-out never took.
+            let ended = tokio::time::timeout(
+                Duration::from_secs(45),
+                run_session_with_input(&mut stream, &mut machine, |_, _| {}, |_| {}, &mut rx),
+            )
+            .await;
+            driver.abort();
+            match ended {
+                Ok(Ok(reason)) => {
+                    tracing::debug!(?reason, "vm harness: session signed out");
+                }
+                Ok(Err(e)) => panic!("vm harness: teardown session failed: {e}"),
+                Err(_elapsed) => {
+                    // Dump what the desktop looked like: reading that PPM is what made #182
+                    // diagnosable in the first place.
+                    let fb = machine.framebuffer();
+                    let path = std::env::temp_dir().join("justrdp-vm-teardown-timeout.ppm");
+                    let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+                    for px in fb.pixels().chunks_exact(4) {
+                        ppm.extend_from_slice(&px[..3]);
+                    }
+                    let _ = std::fs::write(&path, ppm);
+                    panic!(
+                        "vm harness: the session did not sign out within 45s — the next test \
+                         would inherit this desktop; dumped to {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        /// Await `fut`, converting a panic in it into an `Err` instead of unwinding through the
+        /// harness — so teardown still runs when the body fails.
+        ///
+        /// `AssertUnwindSafe` is load-bearing and honest here: the state a panicking test body
+        /// leaves behind is exactly what we are about to discard by signing the session out.
+        async fn catch_panic<T>(
+            fut: impl Future<Output = T>,
+        ) -> Result<T, Box<dyn Any + Send + 'static>> {
+            let mut fut = Box::pin(fut);
+            std::future::poll_fn(move |cx| {
+                match std::panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+                    Err(panic) => Poll::Ready(Err(panic)),
+                }
+            })
+            .await
         }
     }
+    use vm::with_vm_session;
 
     /// Cancel-safety (issue #8): cancelling the token ends `run_session_with_commands`
     /// promptly and cleanly even while the server is silent and a refused resize command is
@@ -2678,85 +2899,84 @@ mod tests {
     #[traced_test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn egfx_graphics_pipeline_renders_the_desktop_against_real_vm() {
-        let _vm = VM_SESSION.lock().await;
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let config = test_config(); // EGFX flag ON + drdynvc channel
-        let session_capabilities = config.capabilities.clone();
-        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
-            .await
-            .expect("connect should reach session-active");
-        let session_config = session_config_from(&outcome, session_capabilities);
-        assert!(
-            session_config.drdynvc_channel_id.is_some(),
-            "the VM should grant the drdynvc static channel"
-        );
-        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
-        let mut stream = outcome.stream;
+        with_vm_session(|vm| async move {
+            let config = test_config(); // EGFX flag ON + drdynvc channel
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            assert!(
+                session_config.drdynvc_channel_id.is_some(),
+                "the VM should grant the drdynvc static channel"
+            );
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut stream = outcome.stream;
 
-        let mut frames = 0usize;
-        let mut covered: u64 = 0;
-        let ended = tokio::time::timeout(
-            Duration::from_secs(10),
-            run_session(
-                &mut stream,
-                &mut machine,
-                |frame, _fb| {
-                    frames += 1;
-                    covered += u64::from(frame.width) * u64::from(frame.height);
-                },
-                |_| {},
-            ),
-        )
-        .await;
-        if let Ok(result) = ended {
-            result.expect("session failed during the observation window");
-            panic!("server closed the session unexpectedly early");
-        }
-
-        let fb = machine.framebuffer();
-        let total = u64::from(fb.width()) * u64::from(fb.height());
-        eprintln!(
-            "EGFX frames={frames} covered={covered}px of {total}px ({}x{})",
-            fb.width(),
-            fb.height()
-        );
-        assert!(frames >= 1, "no EGFX FrameUpdate was emitted");
-        assert!(
-            covered >= total / 2,
-            "expected at least half the desktop painted via EGFX, got {covered} of {total}"
-        );
-
-        // The caps handshake must have been observed on the wire (not inferred).
-        assert!(
-            logs_contain("rdp_egfx_caps"),
-            "EGFX caps milestones never logged"
-        );
-        assert!(
-            logs_contain("EGFX caps confirmed"),
-            "server never confirmed EGFX caps"
-        );
-
-        // Monochrome output would mean the tile decode silently produced garbage.
-        let mut distinct = std::collections::HashSet::new();
-        for px in fb.pixels().chunks_exact(4) {
-            distinct.insert([px[0], px[1], px[2]]);
-            if distinct.len() > 16 {
-                break;
+            let mut frames = 0usize;
+            let mut covered: u64 = 0;
+            let ended = tokio::time::timeout(
+                Duration::from_secs(10),
+                run_session(
+                    &mut stream,
+                    &mut machine,
+                    |frame, _fb| {
+                        frames += 1;
+                        covered += u64::from(frame.width) * u64::from(frame.height);
+                    },
+                    |_| {},
+                ),
+            )
+            .await;
+            if let Ok(result) = ended {
+                result.expect("session failed during the observation window");
+                panic!("server closed the session unexpectedly early");
             }
-        }
-        assert!(
-            distinct.len() > 16,
-            "framebuffer is near-monochrome ({} colors) — EGFX decode likely broken",
-            distinct.len()
-        );
 
-        let path = std::env::temp_dir().join("justrdp-slice9-egfx-frame.ppm");
-        let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-        for px in fb.pixels().chunks_exact(4) {
-            ppm.extend_from_slice(&px[..3]);
-        }
-        std::fs::write(&path, ppm).expect("write the visual dump");
-        eprintln!("visual dump for confirmation: {}", path.display());
+            let fb = machine.framebuffer();
+            let total = u64::from(fb.width()) * u64::from(fb.height());
+            eprintln!(
+                "EGFX frames={frames} covered={covered}px of {total}px ({}x{})",
+                fb.width(),
+                fb.height()
+            );
+            assert!(frames >= 1, "no EGFX FrameUpdate was emitted");
+            assert!(
+                covered >= total / 2,
+                "expected at least half the desktop painted via EGFX, got {covered} of {total}"
+            );
+
+            // The caps handshake must have been observed on the wire (not inferred).
+            assert!(
+                logs_contain("rdp_egfx_caps"),
+                "EGFX caps milestones never logged"
+            );
+            assert!(
+                logs_contain("EGFX caps confirmed"),
+                "server never confirmed EGFX caps"
+            );
+
+            // Monochrome output would mean the tile decode silently produced garbage.
+            let mut distinct = std::collections::HashSet::new();
+            for px in fb.pixels().chunks_exact(4) {
+                distinct.insert([px[0], px[1], px[2]]);
+                if distinct.len() > 16 {
+                    break;
+                }
+            }
+            assert!(
+                distinct.len() > 16,
+                "framebuffer is near-monochrome ({} colors) — EGFX decode likely broken",
+                distinct.len()
+            );
+
+            let path = std::env::temp_dir().join("justrdp-slice9-egfx-frame.ppm");
+            let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+            for px in fb.pixels().chunks_exact(4) {
+                ppm.extend_from_slice(&px[..3]);
+            }
+            std::fs::write(&path, ppm).expect("write the visual dump");
+            eprintln!("visual dump for confirmation: {}", path.display());
+        })
+        .await
     }
 
     /// Corpus-capture harness for #56 (the self-owned ClearCodec rewrite). Drives a real-VM
@@ -2775,78 +2995,76 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn capture_clearcodec_corpus_against_real_vm() {
-        let _vm = VM_SESSION.lock().await;
-
-        let dump = std::env::temp_dir().join("justrdp-clearcodec-corpus");
-        let _ = std::fs::remove_dir_all(&dump);
-        std::fs::create_dir_all(&dump).expect("create the capture dir");
-        // SAFETY: set before the session task spins up and removed after it ends; the VM_SESSION
-        // lock serialises real-VM tests and nothing else touches this var, so no concurrent
-        // reader/writer races the process environment.
-        unsafe {
-            std::env::set_var("JUSTRDP_CLEAR_CAPTURE_DIR", &dump);
-        }
-
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let config = test_config(); // EGFX flag ON + drdynvc channel
-        let session_capabilities = config.capabilities.clone();
-        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
-            .await
-            .expect("connect should reach session-active");
-        let session_config = session_config_from(&outcome, session_capabilities);
-        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
-        let mut stream = outcome.stream;
-
-        // Run long enough to surface Clear-coded regions. The desktop's taskbar/tray was
-        // Clear-coded in slice-9; interacting with the desktop (opening windows) widens the
-        // Clear area, so a longer window captures a richer corpus.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(20),
-            run_session(&mut stream, &mut machine, |_, _fb| {}, |_| {}),
-        )
-        .await;
-
-        // SAFETY: see the matching `set_var` above — same serialised, single-writer context.
-        unsafe {
-            std::env::remove_var("JUSTRDP_CLEAR_CAPTURE_DIR");
-        }
-
-        let manifest = std::fs::read_to_string(dump.join("manifest.tsv")).unwrap_or_default();
-        let rows: Vec<&str> = manifest.lines().collect();
-        let mut ok = 0usize;
-        let mut signatures: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        for row in &rows {
-            let status = row.splitn(5, '\t').nth(4).unwrap_or("");
-            if status == "ok" {
-                ok += 1;
-            } else if let Some(msg) = status.strip_prefix("err:") {
-                // The oracle messages read `ClearCodec decode: [path @ file:line] invalid
-                // `field`: detail`; bucket by the part after the location bracket so the
-                // signature — not the crate path — is the key.
-                let sig = msg
-                    .rsplit_once("] ")
-                    .map(|(_, s)| s)
-                    .unwrap_or(msg)
-                    .trim()
-                    .to_string();
-                *signatures.entry(sig).or_default() += 1;
+        with_vm_session(|vm| async move {
+            let dump = std::env::temp_dir().join("justrdp-clearcodec-corpus");
+            let _ = std::fs::remove_dir_all(&dump);
+            std::fs::create_dir_all(&dump).expect("create the capture dir");
+            // SAFETY: set before the session task spins up and removed after it ends; the harness
+            // lock serialises real-VM tests and nothing else touches this var, so no concurrent
+            // reader/writer races the process environment.
+            unsafe {
+                std::env::set_var("JUSTRDP_CLEAR_CAPTURE_DIR", &dump);
             }
-        }
-        eprintln!(
-            "ClearCodec corpus: {} payloads captured ({ok} decoded ok, {} rejected) -> {}",
-            rows.len(),
-            rows.len() - ok,
-            dump.display()
-        );
-        for (sig, n) in &signatures {
-            eprintln!("  rejected x{n}: {sig}");
-        }
-        assert!(
-            !rows.is_empty(),
-            "no ClearCodec payloads captured — the VM may not have Clear-coded any region this \
+
+            let config = test_config(); // EGFX flag ON + drdynvc channel
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut stream = outcome.stream;
+
+            // Run long enough to surface Clear-coded regions. The desktop's taskbar/tray was
+            // Clear-coded in slice-9; interacting with the desktop (opening windows) widens the
+            // Clear area, so a longer window captures a richer corpus.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(20),
+                run_session(&mut stream, &mut machine, |_, _fb| {}, |_| {}),
+            )
+            .await;
+
+            // SAFETY: see the matching `set_var` above — same serialised, single-writer context.
+            unsafe {
+                std::env::remove_var("JUSTRDP_CLEAR_CAPTURE_DIR");
+            }
+
+            let manifest = std::fs::read_to_string(dump.join("manifest.tsv")).unwrap_or_default();
+            let rows: Vec<&str> = manifest.lines().collect();
+            let mut ok = 0usize;
+            let mut signatures: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for row in &rows {
+                let status = row.splitn(5, '\t').nth(4).unwrap_or("");
+                if status == "ok" {
+                    ok += 1;
+                } else if let Some(msg) = status.strip_prefix("err:") {
+                    // The oracle messages read `ClearCodec decode: [path @ file:line] invalid
+                    // `field`: detail`; bucket by the part after the location bracket so the
+                    // signature — not the crate path — is the key.
+                    let sig = msg
+                        .rsplit_once("] ")
+                        .map(|(_, s)| s)
+                        .unwrap_or(msg)
+                        .trim()
+                        .to_string();
+                    *signatures.entry(sig).or_default() += 1;
+                }
+            }
+            eprintln!(
+                "ClearCodec corpus: {} payloads captured ({ok} decoded ok, {} rejected) -> {}",
+                rows.len(),
+                rows.len() - ok,
+                dump.display()
+            );
+            for (sig, n) in &signatures {
+                eprintln!("  rejected x{n}: {sig}");
+            }
+            assert!(
+                !rows.is_empty(),
+                "no ClearCodec payloads captured — the VM may not have Clear-coded any region this \
              run; interact with the desktop (open windows) to widen the Clear area and retry"
-        );
+            );
+        })
+        .await
     }
 
     /// Real-VM acceptance test for slice-8: drdynvc + Display Control resize. Connect with
@@ -2865,127 +3083,128 @@ mod tests {
     #[traced_test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn display_control_resize_against_real_vm() {
-        let _vm = VM_SESSION.lock().await;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        with_vm_session(|vm| async move {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
 
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let mut config = legacy_graphics_config();
-        config
-            .channels
-            .push(gcc::ChannelDef::new("drdynvc", gcc::CHANNEL_OPTION_INITIALIZED).unwrap());
-        let session_capabilities = config.capabilities.clone();
-        let initial_size = (config.core.desktop_width, config.core.desktop_height);
-        let target = if initial_size == (1024, 768) {
-            (1280, 1024)
-        } else {
-            (1024, 768)
-        };
+            let mut config = legacy_graphics_config();
+            config
+                .channels
+                .push(gcc::ChannelDef::new("drdynvc", gcc::CHANNEL_OPTION_INITIALIZED).unwrap());
+            let session_capabilities = config.capabilities.clone();
+            let initial_size = (config.core.desktop_width, config.core.desktop_height);
+            let target = if initial_size == (1024, 768) {
+                (1280, 1024)
+            } else {
+                (1024, 768)
+            };
 
-        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
-            .await
-            .expect("connect should reach session-active");
-        let session_config = session_config_from(&outcome, session_capabilities);
-        assert!(
-            session_config.drdynvc_channel_id.is_some(),
-            "the VM should grant the drdynvc static channel; granted: {:?}",
-            outcome.mcs.static_channels
-        );
-        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
-        let mut stream = outcome.stream;
-
-        let (tx, mut commands) = tokio::sync::mpsc::channel(4);
-        let cancel = CancellationToken::new();
-        let ready_seen = Arc::new(AtomicBool::new(false));
-        let resized_seen = Arc::new(AtomicBool::new(false));
-
-        let ready_in_event = ready_seen.clone();
-        let on_event = move |event: SessionEvent| {
-            assert_eq!(event, SessionEvent::DisplayControlReady);
-            eprintln!("milestone: DisplayControlReady (drdynvc caps + create + EDISP caps done)");
-            ready_in_event.store(true, Ordering::SeqCst);
-            tx.try_send(SessionCommand::Resize {
-                width: target.0,
-                height: target.1,
-            })
-            .expect("queue the resize command");
-            eprintln!(
-                "milestone: Monitor Layout resize to {}x{} queued",
-                target.0, target.1
-            );
-        };
-        let resized_in_sink = resized_seen.clone();
-        let canceller = cancel.clone();
-        let on_frame = move |frame: &FrameUpdate, _fb: &Framebuffer| {
-            if (frame.width, frame.height) == target && (frame.x, frame.y) == (0, 0) {
-                // The post-reactivation full-screen re-emit at the new size.
-                eprintln!(
-                    "milestone: reactivation complete, full frame at {}x{}",
-                    frame.width, frame.height
-                );
-                resized_in_sink.store(true, Ordering::SeqCst);
-                canceller.cancel();
-            }
-        };
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(30),
-            run_session_with_commands(
-                &mut stream,
-                &mut machine,
-                on_frame,
-                |_| {},
-                on_event,
-                &mut commands,
-                &cancel,
-            ),
-        )
-        .await
-        .expect("resize cycle should complete well within the window");
-        result.expect("session failed during the resize cycle");
-
-        assert!(
-            ready_seen.load(Ordering::SeqCst),
-            "DisplayControlReady never fired"
-        );
-        assert!(
-            resized_seen.load(Ordering::SeqCst),
-            "no full-screen frame at the new size"
-        );
-        let fb = machine.framebuffer();
-        assert_eq!(
-            (fb.width(), fb.height()),
-            target,
-            "framebuffer was not rebuilt at the negotiated size"
-        );
-
-        // The wire sequence, as observed PDUs (issue #8: "log the sequence of PDU types
-        // exchanged") — each milestone must have actually been seen on the wire, not
-        // inferred from pixels.
-        for (target_name, what) in [
-            ("rdp_drdynvc", "DYNVC capabilities/create traffic"),
-            ("rdp_displaycontrol_caps", "DISPLAYCONTROL_CAPS"),
-            ("rdp_displaycontrol_resize", "Monitor Layout resize request"),
-            ("rdp_deactivate_all", "DeactivateAll"),
-            ("rdp_demand_active", "Demand Active"),
-            ("rdp_font_map", "Font Map (reactivation complete)"),
-        ] {
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
             assert!(
-                logs_contain(target_name),
-                "{what} was never logged ({target_name})"
+                session_config.drdynvc_channel_id.is_some(),
+                "the VM should grant the drdynvc static channel; granted: {:?}",
+                outcome.mcs.static_channels
             );
-        }
-        eprintln!(
-            "PDU sequence observed: DYNVC caps → create → EDISP caps → Monitor Layout → \
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut stream = outcome.stream;
+
+            let (tx, mut commands) = tokio::sync::mpsc::channel(4);
+            let cancel = CancellationToken::new();
+            let ready_seen = Arc::new(AtomicBool::new(false));
+            let resized_seen = Arc::new(AtomicBool::new(false));
+
+            let ready_in_event = ready_seen.clone();
+            let on_event = move |event: SessionEvent| {
+                assert_eq!(event, SessionEvent::DisplayControlReady);
+                eprintln!(
+                    "milestone: DisplayControlReady (drdynvc caps + create + EDISP caps done)"
+                );
+                ready_in_event.store(true, Ordering::SeqCst);
+                tx.try_send(SessionCommand::Resize {
+                    width: target.0,
+                    height: target.1,
+                })
+                .expect("queue the resize command");
+                eprintln!(
+                    "milestone: Monitor Layout resize to {}x{} queued",
+                    target.0, target.1
+                );
+            };
+            let resized_in_sink = resized_seen.clone();
+            let canceller = cancel.clone();
+            let on_frame = move |frame: &FrameUpdate, _fb: &Framebuffer| {
+                if (frame.width, frame.height) == target && (frame.x, frame.y) == (0, 0) {
+                    // The post-reactivation full-screen re-emit at the new size.
+                    eprintln!(
+                        "milestone: reactivation complete, full frame at {}x{}",
+                        frame.width, frame.height
+                    );
+                    resized_in_sink.store(true, Ordering::SeqCst);
+                    canceller.cancel();
+                }
+            };
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    on_frame,
+                    |_| {},
+                    on_event,
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("resize cycle should complete well within the window");
+            result.expect("session failed during the resize cycle");
+
+            assert!(
+                ready_seen.load(Ordering::SeqCst),
+                "DisplayControlReady never fired"
+            );
+            assert!(
+                resized_seen.load(Ordering::SeqCst),
+                "no full-screen frame at the new size"
+            );
+            let fb = machine.framebuffer();
+            assert_eq!(
+                (fb.width(), fb.height()),
+                target,
+                "framebuffer was not rebuilt at the negotiated size"
+            );
+
+            // The wire sequence, as observed PDUs (issue #8: "log the sequence of PDU types
+            // exchanged") — each milestone must have actually been seen on the wire, not
+            // inferred from pixels.
+            for (target_name, what) in [
+                ("rdp_drdynvc", "DYNVC capabilities/create traffic"),
+                ("rdp_displaycontrol_caps", "DISPLAYCONTROL_CAPS"),
+                ("rdp_displaycontrol_resize", "Monitor Layout resize request"),
+                ("rdp_deactivate_all", "DeactivateAll"),
+                ("rdp_demand_active", "Demand Active"),
+                ("rdp_font_map", "Font Map (reactivation complete)"),
+            ] {
+                assert!(
+                    logs_contain(target_name),
+                    "{what} was never logged ({target_name})"
+                );
+            }
+            eprintln!(
+                "PDU sequence observed: DYNVC caps → create → EDISP caps → Monitor Layout → \
              DeactivateAll → Demand Active → Font Map"
-        );
-        eprintln!(
-            "resize verified: {}x{} → {}x{}",
-            initial_size.0,
-            initial_size.1,
-            fb.width(),
-            fb.height()
-        );
+            );
+            eprintln!(
+                "resize verified: {}x{} → {}x{}",
+                initial_size.0,
+                initial_size.1,
+                fb.width(),
+                fb.height()
+            );
+        })
+        .await
     }
 
     /// Queue one press+release pair for the key a Windows VK maps to.
@@ -3003,17 +3222,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn logoff_inside_the_session_yields_the_typed_reason() {
-        let _vm = VM_SESSION.lock().await;
+        with_vm_session(|vm| async move {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
         let config = test_config();
         let session_capabilities = config.capabilities.clone();
         let requested_size = (config.core.desktop_width, config.core.desktop_height);
-        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
-            .await
-            .expect("connect should reach session-active");
+        let outcome = vm.connect(config).await;
         let mut machine = SessionStateMachine::new(
             session_config_from(&outcome, session_capabilities),
             outcome.activation.leftover,
@@ -3113,6 +3329,8 @@ mod tests {
             "expected a server-attributed disconnect, got {reason:?}"
         );
         assert_eq!(reason.class(), justrdp::DisconnectClass::UserLogoff);
+        })
+        .await
     }
 
     /// Real-VM acceptance (issue #42 C7): a server-side **disconnect** (not logoff) — driven by
@@ -3126,100 +3344,99 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn tsdiscon_inside_the_session_yields_a_typed_server_disconnect() {
-        let _vm = VM_SESSION.lock().await;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        with_vm_session(|vm| async move {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let config = test_config();
-        let session_capabilities = config.capabilities.clone();
-        let requested_size = (config.core.desktop_width, config.core.desktop_height);
-        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
-            .await
-            .expect("connect should reach session-active");
-        let mut machine = SessionStateMachine::new(
-            session_config_from(&outcome, session_capabilities),
-            outcome.activation.leftover,
-        );
-        let mut stream = outcome.stream;
+            let config = test_config();
+            let session_capabilities = config.capabilities.clone();
+            let requested_size = (config.core.desktop_width, config.core.desktop_height);
+            let outcome = vm.connect(config).await;
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover,
+            );
+            let mut stream = outcome.stream;
 
-        let frames_in_sink = Arc::new(AtomicUsize::new(0));
-        let frames_in_driver = frames_in_sink.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(8);
-        tokio::spawn(async move {
-            let _ = tx
-                .send(vec![InputEvent::Sync {
-                    toggle_flags: keyboard_toggle_flags(),
-                }])
-                .await;
-            // Wait until the desktop has painted AND settled.
-            let mut last = frames_in_driver.load(Ordering::SeqCst);
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let now = frames_in_driver.load(Ordering::SeqCst);
-                if now == last && now > 0 {
-                    break;
+            let frames_in_sink = Arc::new(AtomicUsize::new(0));
+            let frames_in_driver = frames_in_sink.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(8);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(vec![InputEvent::Sync {
+                        toggle_flags: keyboard_toggle_flags(),
+                    }])
+                    .await;
+                // Wait until the desktop has painted AND settled.
+                let mut last = frames_in_driver.load(Ordering::SeqCst);
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let now = frames_in_driver.load(Ordering::SeqCst);
+                    if now == last && now > 0 {
+                        break;
+                    }
+                    last = now;
                 }
-                last = now;
-            }
-            // Click the Start button, then type `tsdiscon` into the Start search and run it.
-            let (x, y) = (24u16, requested_size.1.saturating_sub(20));
-            let _ = tx
-                .send(vec![
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
-                        wheel_units: 0,
-                        x,
-                        y,
-                    },
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_DOWN
-                            | justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                        wheel_units: 0,
-                        x,
-                        y,
-                    },
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                        wheel_units: 0,
-                        x,
-                        y,
-                    },
-                ])
-                .await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            // T S D I S C O N
-            for vk in [0x54u16, 0x53, 0x44, 0x49, 0x53, 0x43, 0x4F, 0x4E] {
-                let _ = tx.send(tap(vk)).await;
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let _ = tx.send(tap(0x0D)).await; // Enter
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
+                // Click the Start button, then type `tsdiscon` into the Start search and run it.
+                let (x, y) = (24u16, requested_size.1.saturating_sub(20));
+                let _ = tx
+                    .send(vec![
+                        InputEvent::Mouse {
+                            flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                            wheel_units: 0,
+                            x,
+                            y,
+                        },
+                        InputEvent::Mouse {
+                            flags: justrdp_pdu::input::PTRFLAGS_DOWN
+                                | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                            wheel_units: 0,
+                            x,
+                            y,
+                        },
+                        InputEvent::Mouse {
+                            flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                            wheel_units: 0,
+                            x,
+                            y,
+                        },
+                    ])
+                    .await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                // T S D I S C O N
+                for vk in [0x54u16, 0x53, 0x44, 0x49, 0x53, 0x43, 0x4F, 0x4E] {
+                    let _ = tx.send(tap(vk)).await;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = tx.send(tap(0x0D)).await; // Enter
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
 
-        let ended = tokio::time::timeout(
-            Duration::from_secs(60),
-            run_session_with_input(
-                &mut stream,
-                &mut machine,
-                |_, _fb| {
-                    frames_in_sink.fetch_add(1, Ordering::SeqCst);
-                },
-                |_| {},
-                &mut rx,
-            ),
-        )
-        .await;
-        let reason = ended
-            .expect("the server should disconnect within 60s of tsdiscon")
-            .expect("the disconnect must classify, not fail");
+            let ended = tokio::time::timeout(
+                Duration::from_secs(60),
+                run_session_with_input(
+                    &mut stream,
+                    &mut machine,
+                    |_, _fb| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    &mut rx,
+                ),
+            )
+            .await;
+            let reason = ended
+                .expect("the server should disconnect within 60s of tsdiscon")
+                .expect("the disconnect must classify, not fail");
 
-        eprintln!("tsdiscon terminal value: {reason:?} → {:?}", reason.class());
-        assert!(
-            matches!(reason, justrdp::DisconnectReason::ServerDisconnected(_)),
-            "tsdiscon should be a server-attributed disconnect, got {reason:?}"
-        );
+            eprintln!("tsdiscon terminal value: {reason:?} → {:?}", reason.class());
+            assert!(
+                matches!(reason, justrdp::DisconnectReason::ServerDisconnected(_)),
+                "tsdiscon should be a server-attributed disconnect, got {reason:?}"
+            );
+        })
+        .await
     }
 
     /// A controllable TCP forwarding proxy in front of the VM: it accepts one client connection,
@@ -3253,59 +3470,60 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn a_severed_transport_yields_unexpected_disconnect() {
-        let _vm = VM_SESSION.lock().await;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        with_vm_session(|vm| async move {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let vm: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let (proxy_addr, kill) = kill_switch_proxy(vm).await;
+            // The only test that dials something other than the VM: the kill-switch proxy stands
+            // in front of it, which is what [`Vm::addr`] and [`Vm::connect_through`] exist for.
+            let (proxy_addr, kill) = kill_switch_proxy(vm.addr()).await;
 
-        let config = test_config();
-        let session_capabilities = config.capabilities.clone();
-        let outcome = connect_danger(proxy_addr, config, vm_credentials(), |_| {})
-            .await
-            .expect("connect should reach session-active through the proxy");
-        let mut machine = SessionStateMachine::new(
-            session_config_from(&outcome, session_capabilities),
-            outcome.activation.leftover,
-        );
-        let mut stream = outcome.stream;
+            let config = test_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect_through(proxy_addr, config).await;
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover,
+            );
+            let mut stream = outcome.stream;
 
-        let frames = Arc::new(AtomicUsize::new(0));
-        let frames_watch = frames.clone();
-        tokio::spawn(async move {
-            // Wait until the desktop has painted AND settled, then cut the transport.
-            let mut last = frames_watch.load(Ordering::SeqCst);
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let now = frames_watch.load(Ordering::SeqCst);
-                if now == last && now > 0 {
-                    break;
+            let frames = Arc::new(AtomicUsize::new(0));
+            let frames_watch = frames.clone();
+            tokio::spawn(async move {
+                // Wait until the desktop has painted AND settled, then cut the transport.
+                let mut last = frames_watch.load(Ordering::SeqCst);
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let now = frames_watch.load(Ordering::SeqCst);
+                    if now == last && now > 0 {
+                        break;
+                    }
+                    last = now;
                 }
-                last = now;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let _ = kill.send(()); // sever the network
-        });
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = kill.send(()); // sever the network
+            });
 
-        let ended = tokio::time::timeout(
-            Duration::from_secs(60),
-            run_session(
-                &mut stream,
-                &mut machine,
-                |_, _fb| {
-                    frames.fetch_add(1, Ordering::SeqCst);
-                },
-                |_| {},
-            ),
-        )
-        .await;
-        let reason = ended
-            .expect("the session must end within 60s of the transport being cut")
-            .expect("a severed transport is a clean terminal value, not a SessionFailure");
+            let ended = tokio::time::timeout(
+                Duration::from_secs(60),
+                run_session(
+                    &mut stream,
+                    &mut machine,
+                    |_, _fb| {
+                        frames.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                ),
+            )
+            .await;
+            let reason = ended
+                .expect("the session must end within 60s of the transport being cut")
+                .expect("a severed transport is a clean terminal value, not a SessionFailure");
 
-        eprintln!("severed-transport terminal value: {reason:?}");
-        assert_eq!(reason, justrdp::DisconnectReason::UnexpectedDisconnect);
+            eprintln!("severed-transport terminal value: {reason:?}");
+            assert_eq!(reason, justrdp::DisconnectReason::UnexpectedDisconnect);
+        })
+        .await
     }
 
     /// Real-VM acceptance test for slice-7: keyboard + mouse input over fast-path. Clicks
@@ -3322,16 +3540,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn keyboard_and_mouse_input_drive_the_real_vm() {
-        let _vm = VM_SESSION.lock().await;
+        with_vm_session(|vm| async move {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
         let config = legacy_graphics_config();
         let session_capabilities = config.capabilities.clone();
-        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
-            .await
-            .expect("connect should reach session-active");
+        let outcome = vm.connect(config).await;
         let session_config = session_config_from(&outcome, session_capabilities);
         assert!(
             session_config.server_input_flags
@@ -3540,6 +3755,8 @@ mod tests {
         }
         std::fs::write(&path, ppm).expect("write the visual dump");
         eprintln!("visual dump for confirmation: {}", path.display());
+        })
+        .await
     }
 
     /// Real-VM test for the slow-path input fallback: force `server_input_flags` to
@@ -3549,75 +3766,74 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn slowpath_input_fallback_works_on_the_real_vm() {
-        let _vm = VM_SESSION.lock().await;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        with_vm_session(|vm| async move {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
-        let config = legacy_graphics_config();
-        let session_capabilities = config.capabilities.clone();
-        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
-            .await
-            .expect("connect should reach session-active");
-        let mut session_config = session_config_from(&outcome, session_capabilities);
-        // The fallback seam under test: pretend the server never advertised fast-path input.
-        session_config.server_input_flags = justrdp_pdu::capability::INPUT_FLAG_SCANCODES;
-        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
-        let mut stream = outcome.stream;
+            let config = legacy_graphics_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let mut session_config = session_config_from(&outcome, session_capabilities);
+            // The fallback seam under test: pretend the server never advertised fast-path input.
+            session_config.server_input_flags = justrdp_pdu::capability::INPUT_FLAG_SCANCODES;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut stream = outcome.stream;
 
-        let frames = Arc::new(AtomicUsize::new(0));
-        let frames_in_sink = frames.clone();
-        let frames_in_driver = frames.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(16);
-        let driver = tokio::spawn(async move {
-            // Same settle-then-measure protocol as the fast-path test.
-            let mut last = frames_in_driver.load(Ordering::SeqCst);
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let now = frames_in_driver.load(Ordering::SeqCst);
-                if now == last {
-                    break;
+            let frames = Arc::new(AtomicUsize::new(0));
+            let frames_in_sink = frames.clone();
+            let frames_in_driver = frames.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(16);
+            let driver = tokio::spawn(async move {
+                // Same settle-then-measure protocol as the fast-path test.
+                let mut last = frames_in_driver.load(Ordering::SeqCst);
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let now = frames_in_driver.load(Ordering::SeqCst);
+                    if now == last {
+                        break;
+                    }
+                    last = now;
                 }
-                last = now;
-            }
-            tx.send(vec![InputEvent::Sync { toggle_flags: 0 }])
-                .await
-                .expect("session loop alive");
-            let idle_frames = frames_in_driver.load(Ordering::SeqCst);
-            // Apps key (context menu) then Escape: a visible open/close round trip carried
-            // entirely over slow-path Input Event PDUs.
-            let apps = justrdp::input::scancode_from_windows_vk(0x5D).unwrap();
-            tx.send(vec![apps.press(), apps.release()])
-                .await
-                .expect("session loop alive");
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            tx.send(tap(0x1B)).await.expect("session loop alive"); // Escape closes it
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            (idle_frames, frames_in_driver.load(Ordering::SeqCst))
-        });
+                tx.send(vec![InputEvent::Sync { toggle_flags: 0 }])
+                    .await
+                    .expect("session loop alive");
+                let idle_frames = frames_in_driver.load(Ordering::SeqCst);
+                // Apps key (context menu) then Escape: a visible open/close round trip carried
+                // entirely over slow-path Input Event PDUs.
+                let apps = justrdp::input::scancode_from_windows_vk(0x5D).unwrap();
+                tx.send(vec![apps.press(), apps.release()])
+                    .await
+                    .expect("session loop alive");
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                tx.send(tap(0x1B)).await.expect("session loop alive"); // Escape closes it
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                (idle_frames, frames_in_driver.load(Ordering::SeqCst))
+            });
 
-        let ended = tokio::time::timeout(
-            Duration::from_secs(25),
-            run_session_with_input(
-                &mut stream,
-                &mut machine,
-                |_, _fb| {
-                    frames_in_sink.fetch_add(1, Ordering::SeqCst);
-                },
-                |_| {},
-                &mut rx,
-            ),
-        )
-        .await;
-        if let Ok(result) = ended {
-            result.expect("session failed while slow-path input was in flight");
-            panic!("server closed the session during slow-path input");
-        }
-        let (idle_frames, after_frames) = driver.await.expect("input driver");
-        eprintln!("slow-path: frames before input {idle_frames}, after {after_frames}");
-        assert!(
-            after_frames > idle_frames,
-            "the server did not respond to slow-path input ({idle_frames} → {after_frames})"
-        );
+            let ended = tokio::time::timeout(
+                Duration::from_secs(25),
+                run_session_with_input(
+                    &mut stream,
+                    &mut machine,
+                    |_, _fb| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    &mut rx,
+                ),
+            )
+            .await;
+            if let Ok(result) = ended {
+                result.expect("session failed while slow-path input was in flight");
+                panic!("server closed the session during slow-path input");
+            }
+            let (idle_frames, after_frames) = driver.await.expect("input driver");
+            eprintln!("slow-path: frames before input {idle_frames}, after {after_frames}");
+            assert!(
+                after_frames > idle_frames,
+                "the server did not respond to slow-path input ({idle_frames} → {after_frames})"
+            );
+        })
+        .await
     }
 }
