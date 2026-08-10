@@ -74,7 +74,11 @@ phase-2 rewrite (epic #158) *depends* on a reference comparison — the oracle i
 
 - **zgfx and RemoteFX Progressive are still `ironrdp-graphics` wrappers** behind
   `egfx-bootstrap`; epic #158 (slices #167–#172) is the rewrite, and #91 the
-  bit-reader performance work alongside it.
+  bit-reader performance work alongside it. **A consequence that is easy to miss: an
+  oracle bump is a *live-path* change for these two**, not only a test change — the
+  0.8 → 0.9 move (#184/#186) shipped Devolutions/IronRDP#1395, which stops Progressive
+  requiring a `WBT_CONTEXT` block on every frame once a context exists. Recorded on
+  #170, whose self-owned lifecycle must reproduce that behaviour.
 - H.264 / AVC420 / AVC444 (epic #21) is absent — no oracle exists for it either
   (ADR-0002's amendment says so explicitly).
 - Surface-to-surface and surface-to-cache commands are implemented against one
