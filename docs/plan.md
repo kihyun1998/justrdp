@@ -1550,6 +1550,14 @@ This section is **independent of protocol layers** — it's orthogonal quality a
 
 ## 22. Completeness audit — MS-RDP spec coverage
 
+> **Snapshot, not the roster (decided 2026-08-10).** §22 and §23 are a point-in-time audit of
+> what was missing when they were written. **The live roster of unbuilt work is the issue
+> tracker** — the `epic`-labelled issues, which carry scope, checklists and their own state.
+> These two sections are kept because the *audit* is the thing of value (how the gaps were
+> found, and against what), and they are deliberately not updated as work lands: an item here
+> that reads as missing may already be closed upstream in the tracker. Check the tracker before
+> concluding anything is absent. Two homes for one roster is how each ends up half right.
+
 1. **GDI Orders** - not explicitly mentioned in plan (section 2.2.8 of MS-RDPBCGR)
 2. **Server Redirection** (MS-RDPNSC) - not covered
 3. **Session Logon/Save Session Info** - partially covered but not comprehensively documented
@@ -1626,6 +1634,9 @@ Here are the NOT/THINLY covered specifications to add:
 4. **Correlation Info (MS-RDPBCGR § 3.1.5.2):** Does the target server use load-balanced redirects? If yes, this becomes `M`; if not, safe to leave `O`.
 
 ## 23. Completeness audit — FreeRDP / mstsc parity gaps
+
+> **Snapshot, not the roster** — see the note under §22. The tracker's `epic` issues are the
+> live list; this section records the parity audit that produced them.
 
 ### Layer 1 — Connection sequence (additional items)
 

@@ -63,8 +63,10 @@ a recurrence test.
   exactly that comparison. This is the map's single largest finding, and it is a
   measurement, not an opinion.
 - **The map does not track what is not built.** `## Known holes / open` names the
-  gaps per territory, but the authoritative catalogue of deliberate absence is
-  `docs/plan.md` §22–§23 (~294 lines, 16% of that file) plus the open epics.
+  gaps per territory; the **live roster of unbuilt work is the tracker** — the
+  `epic`-labelled issues (decided 2026-08-10, when the two homes were found to
+  disagree). `docs/plan.md` §22–§23 (~294 lines, 16% of that file) is the *audit that
+  produced them*, kept as a dated snapshot and deliberately not updated as work lands.
 
 ## Measurements (M1–M5, taken 2026-08-10)
 
@@ -149,5 +151,6 @@ ls docs/map/territory/ docs/map/invariant/                                     #
 connect sequence, the session loop, the graphics path, input, channels, the wire
 layer, the adapter, verification and the supply chain. Unbuilt protocol areas
 (clipboard, audio, redirection, drawing orders, RD Gateway, H.264, multi-monitor…)
-have **no territory** — they are tracked as epics and in `docs/plan.md` §22–§23, and
-a territory appears when the first slice lands.
+have **no territory** — they live as `epic` issues in the tracker (the roster), with
+`docs/plan.md` §22–§23 as the audit snapshot behind them, and a territory appears when
+the first slice lands.
