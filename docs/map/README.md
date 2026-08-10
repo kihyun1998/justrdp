@@ -74,10 +74,11 @@ a recurrence test.
   `connect` 5/10, both subjects of none. `cursor` and `clipboard`: 0/10.
 - **The adapter is 1032 lines of code** (3623 with tests) — the crate where every
   concern the sans-IO core refuses ends up, and the largest file in the repo.
-- **A live obligation cites a closed issue.** `Cargo.toml`, `.github/dependabot.yml`
-  and ADR-0004 all name **#61** as the `[patch.crates-io]` removal tracker; #61 is
-  **closed** and the patch is still pinned, six weeks after its exit condition was met
-  (Devolutions/sspi-rs#689 shipped in `sspi` 0.21.1 on 2026-06-26).
+- **A removal obligation outlived its tracker by six weeks.** `Cargo.toml`,
+  `.github/dependabot.yml` and ADR-0004 all named the **closed** #61 as the
+  `[patch.crates-io]` removal tracker, while ADR-0004's own amendment asserted the
+  bridge did not exist — so nothing greppable disagreed. Found by this map's first
+  measurement pass; the bridge was removed on 2026-08-10.
 - **The `~30-line adapter` claim was false and is now fixed** — it is 1032 lines of
   code (3623 with tests); "~30 lines" was true of the drive loop only, and shipped to
   docs.rs. Corrected in `CLAUDE.md` and `justrdp/src/lib.rs` when this map landed.

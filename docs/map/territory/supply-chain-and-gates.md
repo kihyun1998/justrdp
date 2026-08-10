@@ -4,9 +4,10 @@
 
 What has to be true before a change lands, and what the project trusts to build it:
 four GitHub Actions workflows (three gating, one discovery), SHA-pinned third-party
-actions kept current by Dependabot, a small and deliberately-chosen dependency set,
-and one temporary `[patch.crates-io]` fork bridge. Shipping is something the system
-does, so this is a territory like any other.
+actions kept current by Dependabot, and a small, deliberately-chosen, registry-only
+dependency set (the one `[patch.crates-io]` fork bridge this repo ever carried was
+exited on 2026-08-10). Shipping is something the system does, so this is a territory
+like any other.
 
 ## Governing decisions
 
@@ -41,7 +42,7 @@ does, so this is a territory like any other.
 
 - `.github/workflows/` — `test.yml`, `fuzz.yml`, `supply-chain.yml`, `coverage.yml`
 - `.github/dependabot.yml` — weekly cargo + github-actions ecosystems
-- `Cargo.toml` — `[workspace.dependencies]`, `[patch.crates-io]`
+- `Cargo.toml` — `[workspace.dependencies]` (exact pin `sspi = "=0.21.3"` per ADR-0004)
 - `fuzz/Cargo.toml` — the out-of-workspace member
 
 ## Reference behaviour
@@ -67,16 +68,16 @@ checked ad hoc rather than recorded.
 
 ## Known holes / open
 
-- **A git dependency outlived its reason, and its tracker is closed.** The
-  `[patch.crates-io]` fork pin is still here although Devolutions/sspi-rs#689 shipped
-  in `sspi` 0.21.1 on **2026-06-26**; the three artifacts naming **#61** — `Cargo.toml`,
-  `.github/dependabot.yml`, ADR-0004 — point at a closed issue. See
-  [NLA / CredSSP](nla-credssp.md) `## Known holes / open` for the measured removal
-  attempt and what blocks it (the VM's credentials, not the bump).
-- **Dependabot's tripwire cannot fire for a condition already met.** Its comment
-  frames a *new* sspi release as the signal to run the removal checklist — but three
-  releases (0.21.1/.2/.3) have shipped since the fix and the patch is still here, so
-  the mechanism the ADR relies on has already been observed not to work.
+- **A git dependency outlived its reason by six weeks, and the tripwire meant to catch
+  that could not fire.** The `[patch.crates-io]` fork pin was removed on 2026-08-10
+  (see [NLA / CredSSP](nla-credssp.md)), but it should have gone when
+  Devolutions/sspi-rs#689 shipped in `sspi` 0.21.1 on **2026-06-26**. Dependabot's
+  comment frames *a new sspi release* as the signal to run the removal checklist —
+  three releases shipped and nothing happened, because the condition was already met
+  by the first one. **A tripwire that fires on a transition cannot catch a state.**
+- **The dependency graph is now registry-only again** — no `git` sources in
+  `Cargo.lock`, so every dependency carries a checksum. Worth keeping true: a git
+  dependency is the one supply-chain hole `just-shield` does not scan for.
 - **No i686 / 32-bit job exists**, so the dimension-overflow class is unguarded in CI
   (see [the invariant](../invariant/decoder-dimension-overflow-32bit.md)).
 - Nothing gates documentation: no rustdoc build, no link check — which is how a
