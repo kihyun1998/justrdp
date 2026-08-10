@@ -39,5 +39,5 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 rcgen = { workspace = true }
 # Differential oracle for the live-capture codec test (gate #6 fix note 3): bitmap rectangles
 # captured from the real VM are decoded by both our codecs and ironrdp's (ADR-0003).
-ironrdp-graphics = "0.8"
+ironrdp-graphics = "0.9"
 justrdp-codecs.workspace = true
