@@ -28,8 +28,8 @@ pub enum TlsCertError {
 /// hashes the same inner key and aborts the TLS session if our binding disagrees.
 pub fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, TlsCertError> {
     let cert = Certificate::from_der(cert_der).map_err(|_| TlsCertError::MalformedCertificate)?;
-    cert.tbs_certificate
-        .subject_public_key_info
+    cert.tbs_certificate()
+        .subject_public_key_info()
         .subject_public_key
         .as_bytes()
         .map(<[u8]>::to_vec)
