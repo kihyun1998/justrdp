@@ -2849,6 +2849,174 @@ mod tests {
         );
     }
 
+    /// DoD ④ for #193: does a WireToSurface2 payload from a real server actually **decode**?
+    ///
+    /// Before the `bitmapDataLength` fix it could not — the four length bytes reached the codec
+    /// as the head of the block stream, every Progressive pass failed, and `justrdp`'s EGFX
+    /// processor warn-and-skipped it, so a session still painted (via ClearCodec and
+    /// WireToSurface1) and nothing in the suite went red. A synthetic vector could not catch
+    /// that, because the vector was written to the same wrong layout as the parser.
+    ///
+    /// Runs an EGFX session with `JUSTRDP_PROGRESSIVE_CAPTURE_DIR` set, then reads the manifest
+    /// the codec chokepoint wrote. Every captured payload is also re-parsed with the self-owned
+    /// slice-1 parser (`justrdp_pdu::rfx::progressive`) and censused by block type — which is
+    /// what epic #158 needs from a real server, and in particular whether this one ever sends
+    /// `WBT_TILE_UPGRADE`. Run with `--nocapture`.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn progressive_payloads_decode_against_real_vm() {
+        use justrdp_pdu::rfx::progressive::{self, ProgressiveMessage, ProgressiveTile};
+
+        let _vm = VM_SESSION.lock().await;
+
+        let dump = std::env::temp_dir().join("justrdp-progressive-corpus");
+        let _ = std::fs::remove_dir_all(&dump);
+        std::fs::create_dir_all(&dump).expect("create the capture dir");
+        // SAFETY: set before the session task spins up and removed after it ends; the VM_SESSION
+        // lock serialises real-VM tests and nothing else touches this var, so no concurrent
+        // reader/writer races the process environment.
+        unsafe {
+            std::env::set_var("JUSTRDP_PROGRESSIVE_CAPTURE_DIR", &dump);
+        }
+
+        let addr: SocketAddr = "192.168.136.136:3389".parse().unwrap();
+        let config = test_config(); // EGFX flag ON + drdynvc channel
+        let session_capabilities = config.capabilities.clone();
+        let outcome = connect_danger(addr, config, vm_credentials(), |_| {})
+            .await
+            .expect("connect should reach session-active");
+        let session_config = session_config_from(&outcome, session_capabilities);
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+        let mut stream = outcome.stream;
+
+        // Upgrade passes refine a tile the server already sent coarsely, so they only appear
+        // once a region has been left alone long enough for the server to spend bandwidth
+        // improving it. A short window can miss them — which would be a negative result about
+        // the window, not about the server.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(25),
+            run_session(&mut stream, &mut machine, |_, _fb| {}, |_| {}),
+        )
+        .await;
+
+        // SAFETY: see the matching `set_var` above — same serialised, single-writer context.
+        unsafe {
+            std::env::remove_var("JUSTRDP_PROGRESSIVE_CAPTURE_DIR");
+        }
+
+        let manifest = std::fs::read_to_string(dump.join("manifest.tsv")).unwrap_or_default();
+        let rows: Vec<&str> = manifest.lines().collect();
+
+        let mut decoded_ok = 0usize;
+        let mut decode_errors: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let (mut simple, mut first, mut upgrade) = (0usize, 0usize, 0usize);
+        let mut parse_errors: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut region_flags: std::collections::BTreeMap<u8, usize> =
+            std::collections::BTreeMap::new();
+        let mut context_flags: std::collections::BTreeMap<u8, usize> =
+            std::collections::BTreeMap::new();
+        let mut qualities: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+        let mut prog_quant_counts: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
+
+        for row in &rows {
+            let fields: Vec<&str> = row.split('\t').collect();
+            let Some(idx) = fields.first().and_then(|s| s.parse::<usize>().ok()) else {
+                continue;
+            };
+            match fields.get(5) {
+                Some(s) if s.starts_with("ok:") => decoded_ok += 1,
+                Some(s) => {
+                    let sig = s
+                        .strip_prefix("err:")
+                        .unwrap_or(s)
+                        .rsplit_once("] ")
+                        .map(|(_, t)| t)
+                        .unwrap_or(s)
+                        .trim()
+                        .to_string();
+                    *decode_errors.entry(sig).or_default() += 1;
+                }
+                None => {}
+            }
+
+            let Ok(bytes) = std::fs::read(dump.join(format!("prog-{idx:04}.bin"))) else {
+                continue;
+            };
+            match progressive::decode_all(&bytes) {
+                Ok(messages) => {
+                    for message in &messages {
+                        match message {
+                            ProgressiveMessage::Context { flags, .. } => {
+                                *context_flags.entry(*flags).or_default() += 1;
+                            }
+                            ProgressiveMessage::Region(region) => {
+                                *region_flags.entry(region.flags).or_default() += 1;
+                                prog_quant_counts.insert(region.prog_quants.len());
+                                for tile in &region.tiles {
+                                    match tile {
+                                        ProgressiveTile::Simple(_) => simple += 1,
+                                        ProgressiveTile::First(t) => {
+                                            first += 1;
+                                            if let Some(q) = t.quality {
+                                                qualities.insert(q);
+                                            }
+                                        }
+                                        ProgressiveTile::Upgrade(t) => {
+                                            upgrade += 1;
+                                            qualities.insert(t.quality);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => *parse_errors.entry(format!("{e}")).or_default() += 1,
+            }
+        }
+
+        eprintln!(
+            "#193 proof: {} WireToSurface2 payloads captured, {decoded_ok} decoded -> {}",
+            rows.len(),
+            dump.display()
+        );
+        eprintln!("  TILE_SIMPLE={simple}  TILE_FIRST={first}  TILE_UPGRADE={upgrade}");
+        eprintln!("  context flags: {context_flags:?}  (bit0 = RFX_SUBBAND_DIFFING)");
+        eprintln!("  region flags:  {region_flags:?}  (bit0 = RFX_DWT_REDUCE_EXTRAPOLATE)");
+        eprintln!("  quality values: {qualities:?}   numProgQuant values: {prog_quant_counts:?}");
+        for (sig, n) in &decode_errors {
+            eprintln!("  DECODE ERROR x{n}: {sig}");
+        }
+        for (sig, n) in &parse_errors {
+            eprintln!("  PARSE ERROR x{n}: {sig}");
+        }
+
+        assert!(
+            !rows.is_empty(),
+            "no WireToSurface2 payloads captured — the VM may not have used Progressive this run"
+        );
+        // What this fix proves: the **self-owned** parser accepts every stream the real server
+        // sends. Before the `bitmapDataLength` fix it accepted none of them.
+        assert!(
+            parse_errors.is_empty(),
+            "the self-owned parser rejected a stream the real server sent: {parse_errors:?}"
+        );
+        // `decoded_ok` is deliberately reported and **not** asserted. The bootstrap oracle still
+        // rejects this server's first-pass tiles — it indexes the progressive-quant table by
+        // `quality` without honouring the 0xFF full-quality sentinel that FreeRDP special-cases
+        // — so gating on it here would make this fix hostage to a defect it cannot reach.
+        // That is #194's subject, and #172 is what removes the oracle from this path.
+        if decoded_ok == 0 {
+            eprintln!(
+                "  note: the bootstrap oracle decoded none of them — expected while #194 is open"
+            );
+        }
+    }
+
     /// Real-VM acceptance test for slice-8: drdynvc + Display Control resize. Connect with
     /// the `drdynvc` static channel (EGFX gate flag deliberately **off**, so graphics stay on
     /// the proven bitmap path), wait for the server to negotiate drdynvc caps, create the
