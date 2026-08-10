@@ -74,6 +74,27 @@ subject to this.** The test is one question, asked before acting on a divergence
 > section / the corpus says Y"* survives; *"ironrdp-graphics does it differently"*
 > does not.
 
+**And it recurs on a schedule nobody sets: whenever the oracle's own version moves.**
+A dependency bump normally changes the code under test; this one changes the
+*measuring instrument*, so a green suite afterwards means "the two still agree",
+which is a different sentence from "we are still correct". The bump is therefore
+gated on **reading the upstream changelog for codec-behaviour changes**, not on the
+suite going green — and the reading has three possible answers, each with a
+different consequence:
+
+| The oracle changed… | What it means here |
+|---|---|
+| a codec we **delegate to at runtime** (`egfx-bootstrap`: zgfx, Progressive) | a live-path change, not just a test change — prove it on the VM |
+| a codec we **self-own** | our differential's expected value moved; adjudicate against FreeRDP/corpus before touching our code |
+| a path we **do not implement** | expected no-op; say so, and check the differential actually walks the case rather than assuming |
+
+Worked example, 0.8 → 0.9 (#184/#186): the single behavioural change was
+Devolutions/IronRDP#1395 (Progressive stops requiring a CONTEXT block per frame) —
+row 1, so it was proven against the real VM and recorded on #170, whose slice must
+reproduce it. `ironrdp-pdu`'s mouse wheel-rotation decode fix was row 3, because
+justrdp encodes input and has no mouse decode path. Nothing touched ClearCodec,
+NSCodec, pointer or RemoteFX WTS1, so the #127 tolerances were not re-litigated.
+
 Concretely:
 
 - Adjudicate a divergence against **FreeRDP source and `clearcodec_corpus`**, not
