@@ -37,7 +37,7 @@ Inputs are manufactured in the harness from the oracle's encoder family — for 
 
 Synthetic corpora test only the inputs we choose to generate, so a variant we forget to emit is a variant we never test. Each corpus therefore **asserts that every variant path was actually exercised** (e.g. RLGR1 and RLGR3 counts each `> 0`), mirroring the `oracle_rejections > 0` guard the ClearCodec corpus uses. A future change that silently stops covering a mode fails the build.
 
-The oracle crates remain **dev-dependencies only** (ADR-0003); nothing here adds a runtime dependency.
+The oracle crates remain **dev-dependencies only** (ADR-0003); nothing here adds a runtime dependency. *(Scope, not duration — see [ADR-0011](0011-zero-ironrdp-terminal-state.md): a codec's oracle dev-dependency retires once that codec's correctness rests on a basis we own.)*
 
 ## Consequences
 
