@@ -72,16 +72,12 @@ defect), #689 (the maintainer's rework that fixed it).
 
 ## Known holes / open
 
-- **The version-bump gate ADR-0004 requires has not run for the current pin.** The
-  fork bridge was removed and `sspi` pinned at `=0.21.3` on 2026-08-10 with
-  `cargo test --workspace` green — *including*
-  `connect_completes_credssp_against_a_loopback_server`, the test that existed only
-  because of the fork, which is the direct evidence that the published crate carries
-  Devolutions/sspi-rs#689. But the **real-VM acceptance suite could not run**: all 12
-  VM tests fail `STATUS_LOGON_FAILURE [0xc000006d]`, and an A/B run with the fork
-  restored fails **identically**, so the blocker is the VM's account state, not the
-  bump. Re-run `cargo test -p justrdp-tokio -- --ignored` once credentials are
-  restored and record it in ADR-0004.
+- **The version-bump gate ADR-0004 requires is satisfied for the current pin** (`sspi
+  = "=0.21.3"`, fork bridge removed 2026-08-10). `connect_reaches_session_active_against_real_vm`
+  — the whole X.224 → TLS → CredSSP → MCS/GCC → activation sequence against the live
+  WS2022 box — passes, as does the loopback full-CredSSP test that existed only
+  because of the fork. See ADR-0004's *Result* section for the run detail and for the
+  suite's session-isolation caveat.
 - **Why it took six weeks, recorded because the mechanism is reusable.** #61 — named
   as the removal tracker by `Cargo.toml`, `.github/dependabot.yml` *and* ADR-0004 —
   was closed against its own comment; Dependabot's "new release is the signal"

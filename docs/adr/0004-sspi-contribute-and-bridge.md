@@ -81,7 +81,20 @@ Consequence 1 of the 2026-06-18 amendment says *"we never carried a `[patch.crat
 ### What proved it, and what did not
 
 - **Green:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo check --manifest-path fuzz/Cargo.toml` — including `connect_completes_credssp_against_a_loopback_server`, the test that existed *only* because of the fork and is the direct proof that published 0.21.3 carries #689's fix.
-- **Not run:** the **real-VM acceptance suite** this ADR's Decision requires for a version bump. All 12 VM tests fail `STATUS_LOGON_FAILURE [0xc000006d]` — a logon failure from the CredSSP *server*. An A/B run with the fork restored fails **identically**, so the blocker is the test VM's account state, not the bump. The gate is deferred, not waived: re-run `cargo test -p justrdp-tokio -- --ignored` once the VM credentials are restored, and record the result here.
+- **Deferred at first, then run — see the Result below.** The initial attempt could not reach the server at all: all 12 VM tests failed `STATUS_LOGON_FAILURE [0xc000006d]`, a logon failure from the CredSSP *server*, and an A/B run with the fork restored failed **identically** — so the blocker was the test VM's account state, not the bump.
+
+### Result of the real-VM acceptance suite (2026-08-10, VM rebuilt)
+
+**The version-bump gate is satisfied for what an `sspi` bump can break.** With the account restored, `connect_reaches_session_active_against_real_vm` — the full X.224 → TLS → **CredSSP/NLA** → MCS/GCC → licensing → activation sequence against the live WS2022 box — passed in **every** run, as did EGFX rendering, first-frame rendering, keyboard/mouse input, the ClearCodec corpus capture, the ironrdp differential decode of captured bitmap rectangles, the advertised-caps probe, and severed-transport classification.
+
+**Every one of the 12 tests passed on a clean session; no single run was 12/12.** The tail is a harness property, not a product defect, and it is worth recording because it will recur on the next bump:
+
+- The suite **must run serially** (`--test-threads=1`). In parallel, 6 tests failed; the same 6 passed serially — the tests share one VM and race for its session.
+- The tests **share one Windows session and never tear down**. Each connect reattaches to the previous test's disconnected session, so windows accumulate: `keyboard_and_mouse_input_drive_the_real_vm` leaves Notepad open, and `logoff_inside_the_session_yields_the_typed_reason` then stalls on Windows' *"close N apps and sign out"* confirmation — **N tracked the number of input tests that had run before it** (2 in one run, 1 in the next; both captured in the test's own PPM dump). That modal then swallows the input of every test after it, so one leftover window reads as three or four independent failures.
+- Run in isolation on a clean session, the stragglers pass: `logoff`, `slowpath_input_fallback` and `tsdiscon` were re-run together and all three passed in 65s.
+- A one-off `tsdiscon.exe` start failure (`0xc0000142`) appeared once under the polluted session and did not reproduce afterwards; it was not a VM defect.
+
+So: **the sspi bump is proven against the real server**, and the suite's session-isolation gap is a separate, pre-existing item that touches no part of the NLA path.
 
 ### The tripwire did not fire, and could not have
 
