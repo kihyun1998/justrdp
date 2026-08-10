@@ -49,19 +49,30 @@ Read this before starting so the bindings do not read as abstractions.
 
 ## Step 5 — adversarial completeness is automated (ADR-0008)
 
-- **proptest no-panic (#98) + cargo-fuzz (#99)** are the two-lens completeness axis
-  made continuous for untrusted parsing — the decoder enumeration you cannot trust
-  yourself to have finished.
+- **proptest no-panic (#98) + cargo-fuzz (#99)** make the completeness axis
+  *continuous* for untrusted parsing — the decoder enumeration you cannot trust
+  yourself to have finished. (They are two automations of **one** property, not two
+  lenses; the pass itself is one lens briefed on both corpora — see the bindings.)
+- **Its surface is half-covered, and the map says so by derivation rather than by a
+  list**: ten fuzz targets exist, all codec/capability/license, while the
+  connect-sequence parsers have none —
+  [`docs/map/invariant/untrusted-decode-never-panics.md`](../map/invariant/untrusted-decode-never-panics.md).
 
 ## Step 6/7 — surfaces & gates
 
 - **The `fuzz` crate is the `--workspace` blind spot** — out of the workspace by
   design (its own `[workspace]`), so `cargo test --workspace` does not build it. A
   public-API change needs a separate `cargo check --manifest-path fuzz/Cargo.toml`.
-- **The `sspi` fork is temporary and tracked** — `[patch.crates-io]` points at
-  `kihyun1998/sspi-rs`; remove it and bump `sspi` once Devolutions/sspi-rs#689
-  (loopback CredSSP fix) lands on crates.io (ADR-0004, #61; memory
-  `sspi_rs_contribution_setup`).
+- **"Temporary and tracked" decayed into "still here and untracked" — the war story
+  for *external facts are verification targets too*.** `[patch.crates-io]` points at
+  `kihyun1998/sspi-rs` pending Devolutions/sspi-rs#689. That fix **merged 2026-06-17
+  and shipped in `sspi` 0.21.1 on 2026-06-26**, so the bridge has been obsolete for
+  six weeks — and #61, named as the removal tracker by `Cargo.toml`,
+  `.github/dependabot.yml` *and* ADR-0004, is **closed**, against its own comment
+  saying it must not be. Three artifacts stating a status, none of them checked, and
+  the Dependabot "tripwire" cannot fire for a condition already met. The lesson is the
+  citation form: *"remove when X ships"* is a status claim that rots, and nobody
+  re-reads it (ADR-0004, #61; memory `sspi_rs_contribution_setup`).
 - **Supply-chain is a gate** — `just-shield` scans for SHA-pinned actions (ADR-0006,
   `supply-chain.yml`; memory `justrdp_ci_policy`).
 - **No `Co-Authored-By` / AI-attribution** in commits (memory

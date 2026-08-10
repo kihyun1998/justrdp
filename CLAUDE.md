@@ -1,6 +1,6 @@
 # justrdp
 
-바닥부터 짜는 **순수 Rust RDP 클라이언트 라이브러리**. `ironrdp` 을 대체하되, RDP 고유 프로토콜 층(X.224·MCS·GCC·capability·session loop·virtual channel·codec·surface)을 *전부 자체 소유*하고, 보안 크리티컬·비-RDP 크레이트(`rustls`=TLS, `sspi`=NLA)만 위임한다. 코어는 **sans-IO 상태머신** — connect 시퀀스와 session loop 이 순수 상태변환(bytes in → actions/bytes out)이고, ~30줄 tokio I/O 어댑터가 그걸 현실로 만든다.
+바닥부터 짜는 **순수 Rust RDP 클라이언트 라이브러리**. `ironrdp` 을 대체하되, RDP 고유 프로토콜 층(X.224·MCS·GCC·capability·session loop·virtual channel·codec·surface)을 *전부 자체 소유*하고, 보안 크리티컬·비-RDP 크레이트(`rustls`=TLS, `sspi`=NLA)만 위임한다. 코어는 **sans-IO 상태머신** — connect 시퀀스와 session loop 이 순수 상태변환(bytes in → actions/bytes out)이고, tokio I/O 어댑터가 그걸 현실로 만든다. 어댑터의 *구동 루프* 자체는 `Action` 에 대한 match 수십 줄이지만, 크레이트 전체는 그것만이 아니다 — TLS 핸드셰이크·CredSSP 토큰 루프·스테이지별 타임아웃·세션 러너가 같이 산다(코드 ~1,000줄). 코어에 두지 *않기로* 한 것들이 거기 모여 있는 것이다.
 
 - **상세 계약(구현 시 참조)**: `CONTEXT.md`(ubiquitous language·경계) + `docs/adr/`(결정 근거) + `docs/plan.md`(빌드플랜 §2–§23).
 - **첫 동기**: ironrdp-connector 0.9.0 이 `SUPPORT_DYN_VC_GFX_PROTOCOL`(0x0100) 를 빠뜨려 EGFX 를 못 켜는 단일-플래그 감춤 — 호스트가 *모든* RDP 피처 플래그를 쥐게 하려는 재작성. 자세히는 `CONTEXT.md` §Project intent.
@@ -11,6 +11,13 @@ Substantive 변경이면 **`theflow` 스킬**로 짠다 — 착수 시 `/theflow
 (크레이트 맵·스펙 라우팅·경계 규칙·oracle/VM 증명·게이트)은 **`docs/agents/theflow.md`**,
 규칙에 이빨을 주는 실증(ADR·이슈 앵커)은 **`docs/agents/lessons.md`** 에 산다. 착수 전에
 둘 다 읽는다. (justerm 과 같은 규율의 형제 — flow·mindset 은 이제 theflow 가 담는다.)
+
+## 착수 전 배선도 — `docs/map/`
+
+**무엇을 건드리면 무엇이 같이 움직이는지**(영토별 `## Blast radius`)와 **영토를 넘어 성립하는
+사실**(`invariant/`)의 지도. 허브는 **[`docs/map/README.md`](docs/map/README.md)**. 설계를
+확정하기 *전에* 연다 — theflow Step 1 의 세 번째 원장이고, Step 5·Step 6 에서 다시 쓰인다.
+ADR 은 *결정이 다퉈진 날*로, plan.md 는 *빌드 순서*로 색인돼 있어 이 질문에 답하지 못한다.
 
 ## 경계 invariant (이게 정체성)
 
@@ -30,7 +37,7 @@ justrdp 가 **하지 않는 것** (의존성으로 끌어들이지도 말 것):
 가상 워크스페이스(edition 2024). 멤버 4 + 워크스페이스 밖 `fuzz`:
 `justrdp-pdu`(무의존 PDU) · `justrdp`(sans-IO 코어) · `justrdp-codecs`(코덱, ironrdp-graphics 오라클) · `justrdp-tokio`(~30줄 I/O 어댑터 — tokio/sspi/rustls 는 여기만) · `fuzz`(워크스페이스 밖, nightly). 상세 표·`--workspace` 사각지대는 `docs/agents/theflow.md`.
 
-**위임 의존(ADR-0002, 전부 leaf·보안 크리티컬·비-RDP)**: `rustls`(`ring` provider)·`rustls-platform-verifier`(#36)·`sspi`·`x509-cert`. **sspi fork patch(임시)**: `[patch.crates-io]` 로 `kihyun1998/sspi-rs` 를 탐 — Devolutions/sspi-rs#689 가 crates.io 에 풀리면 제거+범프(ADR-0004, #61; 메모리 `sspi_rs_contribution_setup`).
+**위임 의존(ADR-0002, 전부 leaf·보안 크리티컬·비-RDP)**: `rustls`(`ring` provider)·`rustls-platform-verifier`(#36)·`sspi`·`x509-cert`. **sspi fork patch(임시 — 이미 만료)**: `[patch.crates-io]` 로 `kihyun1998/sspi-rs` 를 탐. 탈출 조건은 **이미 충족**됐다 — Devolutions/sspi-rs#689 는 2026-06-17 머지, `sspi` **0.21.1(2026-06-26)** 로 crates.io 출시. 제거+범프가 밀린 상태이고, 추적처로 적힌 #61 은 닫혀 있다(ADR-0004; 메모리 `sspi_rs_contribution_setup`; 측정·차단 사유는 [`docs/map/territory/nla-credssp.md`](docs/map/territory/nla-credssp.md)).
 
 ## 핵심 규칙
 
