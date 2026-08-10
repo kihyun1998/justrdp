@@ -10,6 +10,8 @@
 //! repeats frames (FrameBegin → Region → TileSet → FrameEnd); servers send the headers only
 //! once per stream, so a parsed message list may legitimately start mid-frame.
 
+pub mod progressive;
+
 use crate::cursor::ReadCursor;
 use crate::error::DecodeError;
 

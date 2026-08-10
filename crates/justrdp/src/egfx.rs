@@ -1171,6 +1171,7 @@ mod tests {
         body.extend_from_slice(&codec_id.to_le_bytes());
         body.extend_from_slice(&ctx_id.to_le_bytes());
         body.push(egfx::PIXEL_FORMAT_XRGB_8888);
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes()); // bitmapDataLength (#193)
         body.extend_from_slice(data);
         // Garbage Progressive payloads warn-and-skip (no frame), so no output is expected.
         assert!(feed(p, egfx::CMDID_WIRE_TO_SURFACE_2, &body).is_empty());

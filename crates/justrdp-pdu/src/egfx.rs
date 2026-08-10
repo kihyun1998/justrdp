@@ -367,7 +367,12 @@ fn decode_body(cmd_id: u16, body: &[u8]) -> Result<EgfxPdu<'_>, DecodeError> {
             let codec_id = cur.read_u16_le()?;
             let codec_context_id = cur.read_u32_le()?;
             let pixel_format = cur.read_u8()?;
-            let data = cur.read_slice(cur.remaining())?;
+            // `bitmapDataLength` sits between `pixelFormat` and `bitmapData`, exactly as it
+            // does in WireToSurface1 above. Slicing by `remaining()` instead handed the four
+            // length bytes to the codec as the head of its stream, which silently disabled
+            // the whole Progressive path against a real server (#193).
+            let data_length = cur.read_u32_le()? as usize;
+            let data = cur.read_slice(data_length)?;
             EgfxPdu::WireToSurface2 {
                 surface_id,
                 codec_id,
@@ -633,24 +638,67 @@ mod tests {
         assert_eq!((dest_rect.width(), dest_rect.height()), (2, 1));
         assert_eq!(data.len(), 8);
 
+        // WireToSurface2 carries `bitmapDataLength` between `pixelFormat` and `bitmapData`,
+        // exactly as WireToSurface1 above does — the field a real server sends and this vector
+        // used to omit, which is why the decoder could skip it and still pass (#193).
         let mut body = Vec::new();
         body.extend_from_slice(&5u16.to_le_bytes());
         body.extend_from_slice(&CODECID_CAPROGRESSIVE.to_le_bytes());
         body.extend_from_slice(&9u32.to_le_bytes());
         body.push(PIXEL_FORMAT_XRGB_8888);
+        body.extend_from_slice(&16u32.to_le_bytes());
         body.extend_from_slice(&[0xAA; 16]);
         let blob = pdu(CMDID_WIRE_TO_SURFACE_2, &body);
         let pdus = decode_all(&blob).unwrap();
-        assert!(matches!(
-            pdus[0],
-            EgfxPdu::WireToSurface2 {
-                surface_id: 5,
-                codec_id: CODECID_CAPROGRESSIVE,
-                codec_context_id: 9,
-                data: &[0xAA, ..],
-                ..
-            }
-        ));
+        let EgfxPdu::WireToSurface2 {
+            surface_id,
+            codec_id,
+            codec_context_id,
+            data,
+            ..
+        } = pdus[0]
+        else {
+            panic!("expected WTS2, got {pdus:?}");
+        };
+        assert_eq!(surface_id, 5);
+        assert_eq!(codec_id, CODECID_CAPROGRESSIVE);
+        assert_eq!(codec_context_id, 9);
+        // The declared length, byte for byte — not merely "starts with 0xAA", which the
+        // length prefix itself would satisfy once it leaks into the payload.
+        assert_eq!(data, &[0xAA; 16]);
+    }
+
+    #[test]
+    fn wire_to_surface_2_bitmap_data_is_bounded_by_its_declared_length() {
+        // A server may pack trailing bytes after the declared bitmapData; slicing by
+        // `remaining()` instead of by the field would swallow them into the codec stream.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&CODECID_CAPROGRESSIVE.to_le_bytes());
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(PIXEL_FORMAT_XRGB_8888);
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        body.extend_from_slice(&[0xFF; 8]); // beyond the declared length
+        let blob = pdu(CMDID_WIRE_TO_SURFACE_2, &body);
+        let pdus = decode_all(&blob).unwrap();
+        let EgfxPdu::WireToSurface2 { data, .. } = pdus[0] else {
+            panic!("expected WTS2");
+        };
+        assert_eq!(data, &[0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn wire_to_surface_2_rejects_a_length_longer_than_the_pdu() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&CODECID_CAPROGRESSIVE.to_le_bytes());
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(PIXEL_FORMAT_XRGB_8888);
+        body.extend_from_slice(&64u32.to_le_bytes()); // claims 64, carries 2
+        body.extend_from_slice(&[0x11, 0x22]);
+        let blob = pdu(CMDID_WIRE_TO_SURFACE_2, &body);
+        assert!(decode_all(&blob).is_err());
     }
 
     #[test]

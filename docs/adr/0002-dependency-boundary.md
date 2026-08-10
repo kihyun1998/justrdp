@@ -57,7 +57,7 @@ justrdp owns **all RDP-specific protocol** but depends on **leaf, non-RDP-specif
 
 ## Open questions resolved
 
-This decision resolves design question 13 from the plan: "Pure-Rust only, or allow the `sspi` crate?" **Answer: allow `sspi` (and `rustls`); they are non-RDP-specific, security-critical, and free of the negotiation bottleneck.** The outcome is a dependency graph of: `justrdp-pdu` (wire + PDUs) → `justrdp` (sans-IO core) → { `rustls`, `sspi`, `ironrdp-graphics` (temporary) } rather than `justrdp` → everything in `ironrdp` or nothing.
+This decision resolves design question 13 from the plan: "Pure-Rust only, or allow the `sspi` crate?" **Answer: allow `sspi` (and `rustls`); they are non-RDP-specific, security-critical, and free of the negotiation bottleneck.** The outcome is a dependency graph of: `justrdp-pdu` (wire + PDUs) → `justrdp` (sans-IO core) → { `rustls`, `sspi`, `ironrdp-graphics` (temporary) } rather than `justrdp` → everything in `ironrdp` or nothing. *("Temporary" gained a terminal condition in [ADR-0011](0011-zero-ironrdp-terminal-state.md): zero `ironrdp` crates, development graph included.)*
 
 ## Amendment (2026-07-02, #100): independent rationale for full codec self-ownership
 
