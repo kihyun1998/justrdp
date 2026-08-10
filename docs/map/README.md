@@ -125,6 +125,13 @@ Invariants: [decoder-dimension-overflow-32bit](invariant/decoder-dimension-overf
 [frame-path-carries-no-owned-pixels](invariant/frame-path-carries-no-owned-pixels.md) ·
 [oracle-agreement-is-not-independence](invariant/oracle-agreement-is-not-independence.md)
 
+**The graph is gated.** `python .github/scripts/check_map.py` (CI: `test.yml` job
+`map`) checks that every link and `#anchor` resolves, that every symbol and path under
+`## Code` exists, that each note carries its full section set, and that every territory
+an invariant claims claims it back. Anchors are the half that fails *silently* — a
+missing one falls back to the top of the target document — and the reciprocity check
+found four one-way edges on its first run.
+
 **No roster table here on purpose** — "which node is governed by what" lives in the
 notes and would rot within days as a second copy. Ask instead:
 
