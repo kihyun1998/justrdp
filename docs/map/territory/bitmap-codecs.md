@@ -34,6 +34,19 @@ attacker-controlled bytes in the repo.
   no counterpart to compare against (RemoteFX, ADR-0007).
 - **Decoders write into a caller-provided buffer** wherever the frame path allows
   it, rather than returning an owned `Vec` — the copy ADR-0010 removed.
+- **RemoteFX has two block namespaces that collide by value.** WireToSurface1's
+  `TS_RFX_*` and WireToSurface2's `RFX_PROGRESSIVE_*` both number their blocks
+  `0xCCCx`, and four of the numbers mean different things: `0xCCC4` is FrameBegin in
+  the first and Region in the second, `0xCCC5` FrameEnd vs TileSimple, `0xCCC6`
+  Region vs TileFirst, `0xCCC7` TileSet vs TileUpgrade. The two parsers therefore
+  share no block constants. The same trap repeats one level down: progressive's
+  `RFX_COMPONENT_CODEC_QUANT` swaps HL and LH at every DWT level relative to classic
+  `TS_RFX_CODEC_QUANT`, so a quant read with the wrong decoder yields plausible
+  values with two bands transposed rather than an error (#167).
+- **A region's tiles are bounded by its declared `tileDataSize` window, not by its
+  `numTiles` count.** The two references disagree here — FreeRDP drives the tile loop
+  by the byte window and warns on a `numTiles` mismatch, IronRDP drives by the count
+  and discards the window — and the receive-path tie-breaker takes FreeRDP's (#167).
 
 ## Code
 
@@ -48,6 +61,9 @@ attacker-controlled bytes in the repo.
   `Palette`
 - `justrdp-pdu/src/rfx.rs` — `RfxMessage`, `TileSet`, `Tile`, `Quant`, `RfxRect`,
   `EntropyAlgorithm`, `decode_all`
+- `justrdp-pdu/src/rfx/progressive.rs` — `ProgressiveMessage`, `ProgressiveRegion`,
+  `ProgressiveTile`, `FirstPassTile`, `UpgradeTile`, `ProgressiveQuant`,
+  `ProgressiveCodecQuant`, `decode_all`
 - Spec sections cited inline: `[MS-RDPBCGR]` 3.1.9, 2.2.9.1.1.3.1.2.4;
   `[MS-RDPEGDI]` 2.2.2.5.1, 3.1.9.1.2; `[MS-RDPRFX]` 3.1.8.1.3/.4/.7;
   `[MS-RDPEGFX]` 2.2.4.1.x
@@ -84,7 +100,10 @@ as citations.
 
 - **Standalone NSCodec (surface bits / bitmap cache) is not built** — #150; today's
   NSCodec exists as the ClearCodec subcodec only.
-- **RemoteFX Progressive is not self-owned** — epic #158, slices #167–#172; #91 is
+- **RemoteFX Progressive is not self-owned** — epic #158. Slice 1 (#167) landed the
+  wire parser above; the decode half (SRL entropy #168, multi-pass tile state #169,
+  context lifecycle #170, oracle + real-VM proof #171) and the bootstrap drop (#172)
+  are open, so `egfx.rs` still delegates Progressive to `ironrdp-graphics`. #91 is
   the RLGR bit-reader performance work.
 - H.264 (epic #21) has neither an implementation nor an oracle.
 - The fuzz lane is nightly-only, so a newly added target is unguarded on the day it

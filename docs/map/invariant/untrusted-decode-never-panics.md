@@ -67,7 +67,7 @@ subject to this.** Two derivations, and the gap between them is the finding:
 
 ```sh
 ls fuzz/fuzz_targets/                      # what is fuzzed
-ls crates/justrdp-pdu/src/*.rs             # what parses untrusted bytes
+rg --files crates/justrdp-pdu/src -g '*.rs'   # what parses untrusted bytes
 ```
 
 Today the first list is codec-shaped (10 targets) and the second is twice as long:
