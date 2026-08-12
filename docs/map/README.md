@@ -47,6 +47,7 @@ not call each other:
 | Frame path carries no owned pixels | #85 (design) → #162/#165 (`FrameUpdate`) → #163/#166 (EGFX blit) | three layers, each found after the previous fix |
 | Untrusted decode never panics | #98 (proptest) → #99 (fuzz) | one property, two automations |
 | Oracle agreement ≠ independence | ADR-0007 amendment #118 → #127 (ClearCodec) | the oracle *lost* an argument it was assumed to win |
+| Capture coverage follows what we advertise | #193 (harness) → #194 (`connectionType` sweep) | a whole entropy layer read as absent from the server |
 
 Each is now an [`invariant/`](invariant/) note carrying its own discovery history and
 a recurrence test.
@@ -125,7 +126,8 @@ Territories: [x224-negotiation](territory/x224-negotiation.md) ·
 Invariants: [decoder-dimension-overflow-32bit](invariant/decoder-dimension-overflow-32bit.md) ·
 [untrusted-decode-never-panics](invariant/untrusted-decode-never-panics.md) ·
 [frame-path-carries-no-owned-pixels](invariant/frame-path-carries-no-owned-pixels.md) ·
-[oracle-agreement-is-not-independence](invariant/oracle-agreement-is-not-independence.md)
+[oracle-agreement-is-not-independence](invariant/oracle-agreement-is-not-independence.md) ·
+[capture-coverage-follows-what-we-advertise](invariant/capture-coverage-follows-what-we-advertise.md)
 
 **The graph is gated.** `python .github/scripts/check_map.py` (CI: `test.yml` job
 `map`) checks that every link and `#anchor` resolves, that every symbol and path under

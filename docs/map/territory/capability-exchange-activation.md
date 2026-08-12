@@ -57,7 +57,9 @@ with no pinned FreeRDP citation to check them against.
 
 ## Cross-cutting invariants
 
-**None.**
+- [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
+  — this territory builds the advertised config, so it is where a capture's coverage is
+  decided, one connect sequence before anything is observed.
 
 ## Blast radius
 

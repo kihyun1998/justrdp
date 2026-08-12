@@ -27,6 +27,16 @@ everywhere else.
 - **The corpus encodes tolerances that no spec states** — `clearcodec_corpus`
   fixtures are real Server 2022 streams, and the divergences from FreeRDP they force
   are requirements, not bugs (#127).
+- **The oracle is scaffolding with a retirement condition, not a standing gate**
+  (ADR-0011). A codec's oracle dev-dependency drops once its correctness rests on an
+  owned basis: a real-server corpus plus expectations derived independently of our
+  implementation. Progressive is the worked example (#194) — there the oracle decodes
+  **2 of 52** real payloads, so a green diff against it would measure nothing.
+- **An owned basis has two halves, and a corpus is only one of them.** A capture proves
+  *acceptance* — that nothing a real server sends is rejected. It cannot prove *values*
+  without independently-derived expectations, because the pixels a stream should produce
+  are the very thing in question. `progressive_srl_freerdp.rs` is the second half:
+  hand-computed from FreeRDP with its bit-level derivation written out.
 - **Robustness is a property, not a vector**: "decode never panics on arbitrary
   bytes" covers an input space hand-written vectors cannot reach.
 - **The VM proves what only a server can** — the full connect sequence, licensing's
@@ -38,12 +48,13 @@ everywhere else.
 
 - `justrdp-codecs/tests/` — `differential_ironrdp_graphics.rs`,
   `differential_rfx.rs`, `differential_pointer_ironrdp.rs`, `clearcodec_corpus.rs`,
-  `fixtures/`
+  `progressive_corpus.rs`, `progressive_srl_freerdp.rs`, `fixtures/`
 - `justrdp-pdu/tests/` — `differential_ironrdp.rs`, `differential_activation.rs`
 - `justrdp/tests/` — `differential_input_ironrdp.rs`,
   `differential_license_crypto.rs`
 - `fuzz/fuzz_targets/` — `capability.rs`, `clearcodec.rs`, `egfx.rs`, `fastpath.rs`,
-  `license.rs`, `nscodec.rs`, `planar.rs`, `pointer.rs`, `rfx.rs`, `rle.rs`
+  `license.rs`, `nscodec.rs`, `planar.rs`, `pointer.rs`, `progressive.rs`, `rfx.rs`,
+  `rle.rs`
 - `justrdp-tokio/src/lib.rs` — the `#[ignore]`d VM tests and the loopback CredSSP
   test
 - Target list derivation: `ls fuzz/fuzz_targets/`
@@ -62,6 +73,8 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   the property this harness automates.
 - [Decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md)
   — the class x64 CI structurally cannot observe.
+- [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
+  — a corpus is evidence about a server *and* a client config, never the server alone.
 
 ## Blast radius
 

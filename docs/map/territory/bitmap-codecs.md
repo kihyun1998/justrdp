@@ -88,6 +88,7 @@ as citations.
 - [Decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md)
 - [Oracle agreement is not independence](../invariant/oracle-agreement-is-not-independence.md)
 - [The frame path carries no owned pixels](../invariant/frame-path-carries-no-owned-pixels.md)
+- [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
 
 ## Blast radius
 
@@ -108,9 +109,11 @@ as citations.
   NSCodec exists as the ClearCodec subcodec only.
 - **RemoteFX Progressive is not self-owned** — epic #158. Slice 1 (#167) landed the
   wire parser above; the decode half (SRL entropy #168, multi-pass tile state #169,
-  context lifecycle #170, oracle + real-VM proof #171) and the bootstrap drop (#172)
-  are open, so `egfx.rs` still delegates Progressive to `ironrdp-graphics`. #91 is
-  the RLGR bit-reader performance work.
+  context lifecycle #170, real-VM proof #171) and the bootstrap drop (#172) are open,
+  so `egfx.rs` still delegates Progressive to `ironrdp-graphics`. #91 is the RLGR
+  bit-reader performance work. **Its verification basis is owned as of #194** — a
+  real-server corpus plus FreeRDP-derived SRL expectations, not an oracle diff, because
+  the oracle decodes 2 of 52 real payloads (ADR-0011).
 - H.264 (epic #21) has neither an implementation nor an oracle.
 - The fuzz lane is nightly-only, so a newly added target is unguarded on the day it
   lands (ADR-0008).
