@@ -70,12 +70,37 @@ ls fuzz/fuzz_targets/                      # what is fuzzed
 rg --files crates/justrdp-pdu/src -g '*.rs'   # what parses untrusted bytes
 ```
 
-Today the first list is codec-shaped (11 targets) and the second is twice as long:
-`gcc`, `mcs`, `x224`, `tpkt`, `ber`, `per`, `nego`, `share`, `update`, `dvc`, `svc`,
-`displaycontrol` and `errinfo` parse wire bytes with **no fuzz target**. That is not
-a claim that they are wrong — it is the statement that this invariant is currently
-enforced on one half of its surface.
+The gap used to be the whole connect sequence. #200 closed the mechanical half of it —
+`tpkt`, `x224`, `nego`, `dvc`, `svc` and `displaycontrol` now carry a target and a
+property — so what the second command still finds without a target is:
+
+- **`gcc` (9 block types) and `mcs` (5 PDU types)**, which have no single top-level
+  `decode` to point a target at. One target per type, or one with a selector byte, is a
+  shape decision rather than an omission.
+- **`ber` and `per`**, which are ASN.1 *primitives* (`read_length`, `read_integer`,
+  `read_octet_string`), not PDU parsers. Fuzzing them in isolation asserts little; the
+  reachable surface is the one their callers above expose. Probably correct to leave
+  without targets, which is a decision, not an oversight — recorded so nobody re-derives it.
+- **`share`, `update`, `errinfo`**, which parse post-activation session bytes.
+
+The bootstrap question was measured while closing the first bullet (#200): undirected
+bytes reach **16.5%–48.8%** of the regions in the connect-sequence parsers, against
+**8.9%** for `rfx::progressive`. So this family does *not* need a seed corpus the way
+Progressive does — its headers are short enough that a mutator finds valid values by
+chance. `displaycontrol` at 16.5% is the closest to the wall and the one to re-measure
+first if a target here ever looks stuck.
 
 New decoder ⇒ a proptest no-panic property in the same PR (stable gate), and a fuzz
-target in `fuzz/fuzz_targets/` — remembering that the fuzz lane is nightly, so the
-target does not run on the day it lands.
+target — which is **two** artifacts, not one: `fuzz/fuzz_targets/<name>.rs` *and* its
+`[[bin]]` in `fuzz/Cargo.toml`. A file without the manifest entry is never compiled by
+anything, so it reads as covered and is not.
+
+**The lane runs whatever is in the directory** (#200): `fuzz.yml` derives its matrix
+from `ls fuzz/fuzz_targets/` and fails if the manifest disagrees, so a new target is
+covered on the day it lands — but the lane is *nightly*, so it is not covered by the
+PR gate that day. That gap is why the proptest half is not optional.
+
+This rule used to stop at "a fuzz target in `fuzz/fuzz_targets/`", and #143 and #192
+each satisfied it exactly as written while the lane's hand-kept matrix ran neither
+target for months. A recurrence test that names an artifact but not the thing that
+consumes it is satisfiable without the coverage it exists to buy.

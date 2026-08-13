@@ -106,3 +106,49 @@ path = "fuzz_targets/progressive.rs"
 test = false
 doc = false
 bench = false
+
+# The connect-sequence and channel-framing parsers (#200). Added once the lane derived its own
+# roster, so these are covered from the run they land in rather than whenever someone remembers
+# to update a matrix. Undirected bytes already reach 16-49% of each of these files (measured), so
+# unlike `progressive` they bootstrap without a seed corpus.
+[[bin]]
+name = "tpkt"
+path = "fuzz_targets/tpkt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x224"
+path = "fuzz_targets/x224.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nego"
+path = "fuzz_targets/nego.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dvc"
+path = "fuzz_targets/dvc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svc"
+path = "fuzz_targets/svc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "displaycontrol"
+path = "fuzz_targets/displaycontrol.rs"
+test = false
+doc = false
+bench = false

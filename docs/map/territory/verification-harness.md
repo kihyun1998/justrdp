@@ -57,7 +57,9 @@ everywhere else.
   `rle.rs`
 - `justrdp-tokio/src/lib.rs` — the `#[ignore]`d VM tests and the loopback CredSSP
   test
-- Target list derivation: `ls fuzz/fuzz_targets/`
+- Target list derivation: `ls fuzz/fuzz_targets/` — and since #200 this is not just how
+  a reader derives it but how `.github/workflows/fuzz.yml` builds its matrix, so the
+  roster has one home
 
 ## Reference behaviour
 
@@ -89,12 +91,28 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
 
 ## Known holes / open
 
-- **Fuzz coverage is codec-shaped, not parser-shaped.** Ten targets exist, all
-  graphics/capability/license, while roughly twice as many wire parsers have none.
-  The enumeration is **owned by**
+- **Fuzz coverage was codec-shaped and is now partly parser-shaped.** #200 gave the
+  connect-sequence framing layer targets and no-panic properties; what remains
+  uncovered is `gcc`/`mcs` (a shape decision — no single top-level `decode` to aim at),
+  `ber`/`per` (ASN.1 primitives, probably correctly left alone) and the post-activation
+  `share`/`update`/`errinfo`. The enumeration is **owned by**
   [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md),
   which carries the two commands that derive both lists — deliberately not copied
-  here, because a second hand-kept list is what diverges.
+  here, because a second hand-kept list is what diverges. This bullet said "ten
+  targets" until #200, having been written when that was true and left alone when
+  `progressive` landed: a *count* is a hand-kept list with one entry, and it rots the
+  same way.
+- **"The target runs" and "the target covers anything" are separate claims, and for one
+  format the gap was total.** `fuzz/corpus/` is not committed — corpora live as Actions
+  cache entries — so a new target starts from nothing. Measured across two runs of the
+  same target at the same 300s budget (#200): from empty, `progressive` ended
+  `cov: 62 corp: 6/29b` after **149M executions** with coverage flat from the 8M mark,
+  never having assembled a valid block header; seeded from the real-VM capture it ended
+  `cov: 425 corp: 198/1153Kb` in **8M** executions. `nscodec`, cold in the same first run,
+  reached `corp: 85/9477b` — so the wall is the input grammar (magic plus nested lengths),
+  not cold starts as such. The lane now seeds from committed fixtures where one exists,
+  which is a **derivation, not a second corpus**: `.github/scripts/seed_fuzz_corpus.py`
+  splits the fixture at run time rather than duplicating ~900 KB into `fuzz/`.
 - **One VM is one server.** The WS2022 box advertises a fixed cap set; paths it does
   not advertise have never been exercised against anything.
 - **The VM suite does not isolate its own sessions, and the symptom masquerades as

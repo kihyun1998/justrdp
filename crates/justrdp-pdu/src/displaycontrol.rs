@@ -164,6 +164,24 @@ pub fn encode_monitor_layout(monitors: &[Monitor]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
+        // parser, added with this module's fuzz target (#200). `DisplayControlPdu::decode` reads a
+        // type/length header and then a server-declared *count* of monitor layout entries — the
+        // arithmetic half of the untrusted-decode class (a count that multiplies into a size)
+        // rather than the plain-length half. Malformed bytes must surface as a typed
+        // `DecodeError`, never a panic / overflow / OOB. Reaching the end without unwinding IS the
+        // assertion.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_never_panics_on_arbitrary_input(
+            message in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = DisplayControlPdu::decode(&message);
+        }
+    }
 
     #[test]
     fn caps_pdu_decodes() {

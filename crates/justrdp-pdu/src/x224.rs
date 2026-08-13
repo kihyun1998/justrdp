@@ -94,6 +94,30 @@ pub fn decode_data(tpdu: &[u8]) -> Result<&[u8], DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
+        // parser, added with this module's fuzz target (#200). Both entry points take a
+        // server-framed TPDU and return an interior slice computed from its length indicator:
+        // `decode_connection_confirm` on the connect path, `decode_data` on every session PDU
+        // after it. Malformed bytes must surface as a typed `DecodeError`, never a panic /
+        // overflow / OOB. Reaching the end without unwinding IS the assertion.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_connection_confirm_never_panics_on_arbitrary_input(
+            tpdu in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decode_connection_confirm(&tpdu);
+        }
+
+        #[test]
+        fn decode_data_never_panics_on_arbitrary_input(
+            tpdu in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decode_data(&tpdu);
+        }
+    }
 
     #[test]
     fn data_tpdu_round_trips_user_data() {

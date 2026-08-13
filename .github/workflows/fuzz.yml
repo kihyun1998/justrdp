@@ -6,6 +6,12 @@
 # catches hangs that proptest cannot, and coverage guidance reaches deeper paths.
 #
 # Non-blocking: this runs on a weekly schedule (and on demand), never as a per-PR merge gate.
+#
+# The target list is **derived, never listed here** (#200). A hand-kept matrix duplicated a roster
+# the filesystem already answers, and drifted twice without a signal: `nscodec` landed in #143 and
+# `progressive` in #192, and neither PR touched the copy — so both decoders sat in the repo with a
+# compiling fuzz target that CI had never once executed. The `targets` job below reads
+# `fuzz/fuzz_targets/` and a new target is covered on the day it lands.
 name: fuzz
 
 on:
@@ -19,22 +25,61 @@ permissions:
   contents: read
 
 jobs:
+  # The roster, derived once so the matrix below cannot disagree with it.
+  #
+  # Derived from the **filesystem**, not from `fuzz/Cargo.toml`, because the two failure directions
+  # are not symmetric. A `[[bin]]` with no file fails the build — loud. A file with no `[[bin]]` is
+  # never compiled by anything, not even `cargo check --manifest-path fuzz/Cargo.toml`, so a target
+  # can be written, reviewed and merged while existing only as dead text — the same silent class
+  # this job exists to close. Deriving from the directory and asserting the manifest agrees makes
+  # that direction loud too.
+  #
+  # No new third-party action to pin (ADR-0006): the checkout reuses the SHA the fuzz job below
+  # already carries, and `python3` is present on the runner with no setup step — the same basis
+  # test.yml's `map` job runs `check_map.py` on.
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.derive.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Derive the target list from fuzz/fuzz_targets/
+        id: derive
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, sys
+
+          files = sorted(p.stem for p in pathlib.Path("fuzz/fuzz_targets").glob("*.rs"))
+          manifest = pathlib.Path("fuzz/Cargo.toml").read_text(encoding="utf-8")
+          declared = set(re.findall(r'^path = "fuzz_targets/(.+?)\.rs"$', manifest, re.M))
+
+          undeclared = [n for n in files if n not in declared]
+          orphaned = sorted(declared - set(files))
+          for n in undeclared:
+              print(f"::error::fuzz_targets/{n}.rs has no [[bin]] entry in fuzz/Cargo.toml, so cargo "
+                    f"never builds it and it cannot be fuzzed")
+          for n in orphaned:
+              print(f"::error::fuzz/Cargo.toml declares [[bin]] {n} but fuzz_targets/{n}.rs is absent")
+          if undeclared or orphaned:
+              sys.exit(1)
+          if not files:
+              print("::error::fuzz/fuzz_targets/ is empty — the matrix would be a silent no-op")
+              sys.exit(1)
+
+          print(f"{len(files)} targets: {' '.join(files)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"matrix={json.dumps(files)}\n")
+          PY
+
   fuzz:
+    needs: targets
     runs-on: ubuntu-latest
     strategy:
       # One target's crash must not cancel the others — each is an independent safety net.
       fail-fast: false
       matrix:
-        target:
-          - rle
-          - planar
-          - clearcodec
-          - pointer
-          - rfx
-          - egfx
-          - fastpath
-          - capability
-          - license
+        target: ${{ fromJSON(needs.targets.outputs.matrix) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -52,6 +97,16 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
+
+      # After the restore, never before it: seeding is additive, so it must land beside the corpus
+      # libFuzzer evolved rather than replacing it. A target with no seeder is a no-op.
+      #
+      # Not every target needs this, and which do is measured rather than assumed — see the script.
+      # The short version: `progressive`'s first run ever retained 6 inputs totalling 29 bytes from
+      # 149M executions, because a magic-plus-nested-lengths grammar is a wall a mutator cannot
+      # climb from empty. `nscodec`, cold in the same run, reached 85 inputs / 9477 bytes.
+      - name: Seed ${{ matrix.target }} corpus from committed fixtures
+        run: python3 .github/scripts/seed_fuzz_corpus.py ${{ matrix.target }}
 
       # -max_total_time bounds the run; -timeout=10 fails an input that runs >10s, which is how
       # hangs (infinite loops) are caught — the gap proptest leaves open.
