@@ -57,6 +57,8 @@ phase-2 rewrite (epic #158) *depends* on a reference comparison — the oracle i
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md)
 - [Decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md)
   — surface allocation is `width × height × 4`.
+- [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
+  — the Progressive quality ladder only appears if the client asks for a slow link.
 
 ## Blast radius
 

@@ -46,6 +46,7 @@ confidently a lens reports it.
 | **ClearCodec tolerances** — RLEX runs that overflow the declared rect are clipped; the NSCodec subcodec path is skipped rather than rejected | FreeRDP treats both as errors | #127 + memory `clearcodec_corpus_required_tolerances` — the real-server corpus *requires* them. A lens reporting "FreeRDP rejects this" is `DELIBERATE`, cited to the corpus, not a defect |
 | **`FrameUpdate` carries a dirty rect and no owned pixels**; surfaces blit straight into the host framebuffer | IronRDP's `DecodedImage` owns a full-frame copy the consumer reads out of | ADR-0010 (#85), realized in #162/#165 and #163/#166. "Let the core own the frame" reverses a measured performance decision |
 | **Accept capability sets and negotiation responses that violate the letter of the spec** | a **strict reading of `[MS-RDPBCGR]`** — note the divergence here is from the *spec's strict interpretation*, **not** from FreeRDP/IronRDP, both of which are tolerant too | ADR-0009 (#101) |
+| **Progressive: `quality = 0xFF` is a full-quality sentinel, and a region needs no preceding `WBT_CONTEXT` for its `codecContextId`** | `ironrdp-graphics` indexes its progressive-quant table by `quality` (0.9.0 `progressive.rs:1231`, `:1268`) and errors on an undeclared context id — note this diverges from **the oracle only**, not from FreeRDP, which special-cases the sentinel (`progressive.c:997`, `:1407`) and gates a region on `FLAG_WBT_FRAME_BEGIN` alone (`:2129`) | #194 + the corpus at `justrdp-codecs/tests/fixtures/progressive/`, where the real server needs both tolerances (2 of 52 payloads survive the oracle). Binds #169/#170: "require a context block" is not an open question |
 
 Add a row when a decision *chooses against* a reference or against a strict spec
 reading — that is cheaper than re-defending it every time a lens finds it.
@@ -327,12 +328,20 @@ a spine — a cluster with a home never gets a second one). All **Accepted**; no
 | 0010 | `FrameUpdate` dirty-rect contract (#85) |
 | 0011 | zero `ironrdp` as the terminal state; the oracle retires per codec (#194) |
 
-**Tracker parent/child: GitHub sub-issues are available and currently unused.** The epics
-(#158, #10–#29, #45) are grouped by **title prose** only — `gh api
-repos/kihyun1998/justrdp/issues/158/sub_issues` returns empty. So the relation theflow
-leans on twice (the follow-up tree, and a spine's derived roster) exists but is not yet in
-use: **use the sub-issue relation** for new follow-ups and spines rather than adding
-another prose convention, and enrol an epic's existing slices when you next touch it.
+**Tracker parent/child: GitHub sub-issues are available and now in use — barely.** The
+relation theflow leans on twice (the follow-up tree, and a spine's derived roster) has
+exactly **one** edge: #200 under #194, added when #194's completeness pass produced it
+(2026-08-13). Everything else is still grouped by **title prose** — the epics (#158,
+#10–#29, #45) included, so `gh api repos/kihyun1998/justrdp/issues/158/sub_issues` still
+returns empty. **Use the sub-issue relation** for new follow-ups and spines rather than
+adding another prose convention, and enrol an epic's existing slices when you next touch
+it. The `sub_issue_id` is the issue's **database id**, not its number, and `gh api` needs
+`-F` rather than `-f` or it sends a string and the API answers 422:
+
+```sh
+ID=$(gh api repos/kihyun1998/justrdp/issues/<child> --jq .id)
+gh api --method POST repos/kihyun1998/justrdp/issues/<parent>/sub_issues -F sub_issue_id=$ID
+```
 
 ## Step 7 — gate matrix + PR
 

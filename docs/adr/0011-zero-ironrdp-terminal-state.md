@@ -2,6 +2,21 @@
 
 - Status: Accepted
 - Date: 2026-08-10
+- **Amendment (2026-08-13, #194): the basis exists, and the oracle is less capable than this
+  record assumed.** Progressive's owned basis landed — a 52-payload real-server corpus
+  (`justrdp-codecs/tests/fixtures/progressive/`) plus FreeRDP-derived SRL expectations
+  (`tests/progressive_srl_freerdp.rs`), each defect pinned by a canary. Two corrections to the
+  Context below, both measured. **(a)** The oracle decodes **2 of 52** payloads, not "rejects
+  the first frame" — and a *fourth* defect is the larger cause: it demands a `WBT_CONTEXT`
+  block per `codecContextId`, while this server sends one such block ever and then rotates
+  through 24 ids. FreeRDP imposes no such requirement (`progressive.c:2129`, `:314`). The two
+  failures are independent; skipping the sentinel payload does not save the rest. **(b)** The
+  premise that a real-server SRL vector might be unobtainable was **false**, and the cause was
+  ours: the capture advertised `connectionType = LAN`, so the server sent full quality on the
+  first pass and never refined. Advertising `MODEM` yields 3250 upgrade tiles. Promoted to
+  [`capture-coverage-follows-what-we-advertise`](../map/invariant/capture-coverage-follows-what-we-advertise.md).
+  The Decision is unchanged; the oracle dev-dependency stays until the self-owned decoder
+  exists (#171/#172), and the canaries are what use it.
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
 

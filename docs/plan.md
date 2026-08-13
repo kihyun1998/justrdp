@@ -136,6 +136,22 @@ These cost real time to find. Bake them into the design from day one.
   YCbCr→RGB), and a `SurfaceTiles` grid (866). So β is mostly *wiring* WireToSurface2 → these
   → FrameUpdate, **not** implementing the codec (the earlier "primitives-only / unknown
   completeness" worry was wrong).
+- **`connectionType` decides whether Progressive refinement exists at all** (#194, measured
+  2026-08-13). The Client Core Data `connectionType` ([MS-RDPBCGR] 2.2.1.3.2) is a *hint*, and
+  this server takes it literally. Advertising `LAN` (0x06) makes it send `TILE_FIRST` at
+  `quality = 0xFF` — full quality on the first pass, nothing left to refine — so a capture
+  yields **1 payload and zero `TILE_UPGRADE` tiles, hence zero SRL bytes on the wire**.
+  Advertising `MODEM` (0x01) over the same link yields **52 payloads, 2943 first-pass and 3250
+  upgrade tiles**. The generalisation is the trap: **what a capture harness observes is a
+  function of what the client advertised**, so "the server never does X" is only ever a claim
+  about the config that was advertised. See
+  [`docs/map/invariant/capture-coverage-follows-what-we-advertise.md`](map/invariant/capture-coverage-follows-what-we-advertise.md).
+- **This server sends `WBT_CONTEXT` once and then rotates `codecContextId`** (#194, same
+  capture): 24 distinct ids across 52 payloads, one per refinement group, and **no context
+  block for any id after the first**. A decoder that requires a context block per id rejects
+  49 of 52 real payloads — which is what the bootstrap oracle does. FreeRDP requires none:
+  it gates a region on `FLAG_WBT_FRAME_BEGIN` alone and keys tile state by `surfaceId`
+  (`progressive.c:2129`, `:314`). Load-bearing for #169/#170.
 - **HYBRID_EX early-auth PDU.** A HYBRID_EX server sends a 4-byte LE **Early User Authorization
   Result** PDU immediately after CredSSP, *before* MCS. If not consumed, capability exchange
   desyncs and hangs.

@@ -3233,6 +3233,246 @@ mod tests {
         .await
     }
 
+    /// Harvest the RemoteFX Progressive corpus that #194 makes Progressive's **primary**
+    /// verification gate (ADR-0011: the oracle is scaffolding, an owned basis retires it).
+    ///
+    /// Sibling of `capture_clearcodec_corpus_against_real_vm`, with two differences that a
+    /// static-desktop capture proved necessary — the harness #193 left behind captured
+    /// **one** payload per run, which is not a corpus:
+    ///
+    /// 1. **It drives the desktop.** A connect-and-wait session paints once and then has
+    ///    nothing to send. Mouse sweeps and Start-menu open/close force large repaints, so
+    ///    the server actually spends WireToSurface2 traffic. Nothing is *launched* — the
+    ///    session is left as it was found, because no VM test tears its session down (#198).
+    /// 2. **It advertises a slow link.** `connectionType` ([MS-RDPBCGR] 2.2.1.3.2) is the
+    ///    hint the server sizes its quality ladder against, and on `LAN` it sent
+    ///    `TILE_FIRST` at `quality = 0xFF` — full quality, first pass, nothing left to
+    ///    refine, hence **zero** `TILE_UPGRADE` and no SRL bytes on the wire. Overridable
+    ///    via `JUSTRDP_CAPTURE_CONNECTION_TYPE` so the ladder can be swept without a rebuild.
+    ///    Performance flags are cleared too (the default `0x7` suppresses wallpaper, full
+    ///    window drag and menu animation — exactly the repaint this wants).
+    ///
+    /// Writes `replay.bin` beside the raw dump in the corpus format
+    /// `tests/fixtures/progressive/README.md` documents, **in arrival order**: Progressive is
+    /// stateful across PDUs (codec contexts, and cross-pass tile coefficients), so a payload
+    /// decoded in isolation is a different input from the same payload decoded in sequence —
+    /// the same reason ClearCodec's corpus is one ordered file. Run with `--nocapture`.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn capture_progressive_corpus_against_real_vm() {
+        with_vm_session(|vm| async move {
+        use justrdp_pdu::rfx::progressive::{self, ProgressiveMessage, ProgressiveTile};
+
+        let dump = std::env::temp_dir().join("justrdp-progressive-corpus");
+        let _ = std::fs::remove_dir_all(&dump);
+        std::fs::create_dir_all(&dump).expect("create the capture dir");
+        // SAFETY: set before the session task spins up and removed after it ends; the harness
+        // lock serialises real-VM tests and nothing else touches this var, so no concurrent
+        // reader/writer races the process environment.
+        unsafe {
+            std::env::set_var("JUSTRDP_PROGRESSIVE_CAPTURE_DIR", &dump);
+        }
+
+        // 0x01 MODEM … 0x06 LAN ([MS-RDPBCGR] 2.2.1.3.2). Default to the slowest rung: it is
+        // the one that gives the server a reason to send a coarse first pass and refine it.
+        let connection_type: u8 = std::env::var("JUSTRDP_CAPTURE_CONNECTION_TYPE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x01);
+
+        let mut config = test_config(); // EGFX flag ON + drdynvc channel
+        config.core.connection_type = connection_type;
+        config.client_info.performance_flags = 0; // wallpaper/drag/animation ON → more repaint
+        let session_capabilities = config.capabilities.clone();
+        let outcome = vm.connect(config).await;
+        let session_config = session_config_from(&outcome, session_capabilities);
+        let desktop = session_config.desktop_size;
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+        let mut stream = outcome.stream;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+        let driver = tokio::spawn(async move {
+            let mv = |x: u16, y: u16| {
+                vec![InputEvent::Mouse {
+                    flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                    wheel_units: 0,
+                    x,
+                    y,
+                }]
+            };
+            // Let the initial full-desktop paint drain before adding traffic of our own.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            for round in 0..3u16 {
+                // A diagonal sweep: the cursor crosses taskbar, desktop and window chrome,
+                // so the server repaints a wide, visually varied band rather than one rect.
+                for step in 0..12u16 {
+                    let x = (desktop.0 / 12).saturating_mul(step).max(4);
+                    let y = (desktop.1 / 12)
+                        .saturating_mul((step + round * 4) % 12)
+                        .max(4);
+                    if tx.send(mv(x, y)).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+                // Start menu: the largest single repaint reachable without launching an app.
+                let start = (24u16, desktop.1.saturating_sub(20));
+                let click = vec![
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                        wheel_units: 0,
+                        x: start.0,
+                        y: start.1,
+                    },
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_DOWN
+                            | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                        wheel_units: 0,
+                        x: start.0,
+                        y: start.1,
+                    },
+                    InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                        wheel_units: 0,
+                        x: start.0,
+                        y: start.1,
+                    },
+                ];
+                if tx.send(click).await.is_err() {
+                    return;
+                }
+                // Hold still. An upgrade pass is what a server sends when a region has been
+                // left alone long enough to be worth refining, so the idle is not padding —
+                // it is the condition being probed.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if tx.send(tap(0x1B)).await.is_err() {
+                    return; // Esc — closes the menu, leaves no window behind
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            // tx drops here: the input branch disables, the session stays up for the tail.
+        });
+
+        // The timeout is the expected exit — a healthy session never ends on its own.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(75),
+            run_session_with_input(&mut stream, &mut machine, |_, _fb| {}, |_| {}, &mut rx),
+        )
+        .await;
+        driver.abort();
+
+        // SAFETY: see the matching `set_var` above — same serialised, single-writer context.
+        unsafe {
+            std::env::remove_var("JUSTRDP_PROGRESSIVE_CAPTURE_DIR");
+        }
+
+        // Assemble `replay.bin` from the raw dump, in arrival order.
+        let manifest = std::fs::read_to_string(dump.join("manifest.tsv")).unwrap_or_default();
+        let mut replay: Vec<u8> = Vec::new();
+        let mut entries = 0u32;
+        let mut body: Vec<u8> = Vec::new();
+        let (mut simple, mut first, mut upgrade) = (0usize, 0usize, 0usize);
+        let mut qualities: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+        let mut prog_quant_counts: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
+        let mut context_flags: std::collections::BTreeMap<u8, usize> =
+            std::collections::BTreeMap::new();
+        let mut region_flags: std::collections::BTreeMap<u8, usize> =
+            std::collections::BTreeMap::new();
+        let mut parse_errors: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+
+        for row in manifest.lines() {
+            let f: Vec<&str> = row.split('\t').collect();
+            let (Some(idx), Some(ctx), Some(w), Some(h)) = (
+                f.first().and_then(|s| s.parse::<usize>().ok()),
+                f.get(1).and_then(|s| s.parse::<u32>().ok()),
+                f.get(2).and_then(|s| s.parse::<u16>().ok()),
+                f.get(3).and_then(|s| s.parse::<u16>().ok()),
+            ) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(dump.join(format!("prog-{idx:04}.bin"))) else {
+                continue;
+            };
+            body.extend_from_slice(&ctx.to_le_bytes());
+            body.extend_from_slice(&w.to_le_bytes());
+            body.extend_from_slice(&h.to_le_bytes());
+            body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            body.extend_from_slice(&bytes);
+            entries += 1;
+
+            match progressive::decode_all(&bytes) {
+                Ok(messages) => {
+                    for message in &messages {
+                        match message {
+                            ProgressiveMessage::Context { flags, .. } => {
+                                *context_flags.entry(*flags).or_default() += 1;
+                            }
+                            ProgressiveMessage::Region(region) => {
+                                *region_flags.entry(region.flags).or_default() += 1;
+                                prog_quant_counts.insert(region.prog_quants.len());
+                                for tile in &region.tiles {
+                                    match tile {
+                                        ProgressiveTile::Simple(_) => simple += 1,
+                                        ProgressiveTile::First(t) => {
+                                            first += 1;
+                                            if let Some(q) = t.quality {
+                                                qualities.insert(q);
+                                            }
+                                        }
+                                        ProgressiveTile::Upgrade(t) => {
+                                            upgrade += 1;
+                                            qualities.insert(t.quality);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => *parse_errors.entry(format!("{e}")).or_default() += 1,
+            }
+        }
+        replay.extend_from_slice(&entries.to_le_bytes());
+        replay.extend_from_slice(&body);
+        let replay_path = dump.join("replay.bin");
+        std::fs::write(&replay_path, &replay).expect("write replay.bin");
+
+        eprintln!(
+            "#194 corpus: {entries} payloads, {} bytes -> {}",
+            replay.len(),
+            replay_path.display()
+        );
+        eprintln!("  connectionType={connection_type:#04x}  (0x01 MODEM … 0x06 LAN)");
+        eprintln!("  TILE_SIMPLE={simple}  TILE_FIRST={first}  TILE_UPGRADE={upgrade}");
+        eprintln!("  context flags: {context_flags:?}  (bit0 = RFX_SUBBAND_DIFFING)");
+        eprintln!("  region flags:  {region_flags:?}  (bit0 = RFX_DWT_REDUCE_EXTRAPOLATE)");
+        eprintln!("  quality values: {qualities:?}   numProgQuant values: {prog_quant_counts:?}");
+        for (sig, n) in &parse_errors {
+            eprintln!("  PARSE ERROR x{n}: {sig}");
+        }
+        if upgrade == 0 {
+            eprintln!(
+                "  note: no TILE_UPGRADE at connectionType={connection_type:#04x} — sweep \
+                 JUSTRDP_CAPTURE_CONNECTION_TYPE before concluding this server never sends them"
+            );
+        }
+
+        assert!(
+            entries > 0,
+            "no WireToSurface2 payloads captured — the VM may not have used Progressive this run"
+        );
+        assert!(
+            parse_errors.is_empty(),
+            "the self-owned parser rejected a stream the real server sent: {parse_errors:?}"
+        );
+        })
+        .await;
+    }
+
     /// Real-VM acceptance test for slice-8: drdynvc + Display Control resize. Connect with
     /// the `drdynvc` static channel (EGFX gate flag deliberately **off**, so graphics stay on
     /// the proven bitmap path), wait for the server to negotiate drdynvc caps, create the
