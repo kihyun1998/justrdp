@@ -85,8 +85,12 @@ a recurrence test.
 - **The `~30-line adapter` claim was false and is now fixed** — it is 1032 lines of
   code (3623 with tests); "~30 lines" was true of the drive loop only, and shipped to
   docs.rs. Corrected in `CLAUDE.md` and `justrdp/src/lib.rs` when this map landed.
-- **Fuzzing covers half its surface**: 10 targets, all codec/capability/license;
-  13 wire parsers in `justrdp-pdu` have none.
+- **Fuzzing covers half its surface**: every target is codec/capability/license, while
+  roughly twice as many wire parsers in `justrdp-pdu` have none — the two commands that
+  derive both lists live with
+  [the invariant](invariant/untrusted-decode-never-panics.md), because a count written
+  here is a copy that rots. This bullet said "10 targets" until #200, having been true
+  when written.
 
 ## Conventions
 
