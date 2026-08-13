@@ -81,6 +81,24 @@ pub fn encode_chunks(message: &[u8]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
+        // parser, added with this module's fuzz target (#200). `ChannelChunk::decode` reads the
+        // channel PDU header whose `length` declares the size of a message reassembled across
+        // *several* chunks, so a wrong value is not bounded by the current buffer — the
+        // reassembly-length shape the untrusted-decode invariant names. Malformed bytes must
+        // surface as a typed `DecodeError`, never a panic / overflow / OOB. Reaching the end
+        // without unwinding IS the assertion.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_never_panics_on_arbitrary_input(
+            payload in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ChannelChunk::decode(&payload);
+        }
+    }
 
     #[test]
     fn small_message_is_one_first_and_last_chunk() {

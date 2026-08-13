@@ -91,9 +91,11 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
 
 ## Known holes / open
 
-- **Fuzz coverage is codec-shaped, not parser-shaped.** Every target is
-  graphics/capability/license, while roughly twice as many wire parsers have none.
-  The enumeration is **owned by**
+- **Fuzz coverage was codec-shaped and is now partly parser-shaped.** #200 gave the
+  connect-sequence framing layer targets and no-panic properties; what remains
+  uncovered is `gcc`/`mcs` (a shape decision — no single top-level `decode` to aim at),
+  `ber`/`per` (ASN.1 primitives, probably correctly left alone) and the post-activation
+  `share`/`update`/`errinfo`. The enumeration is **owned by**
   [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md),
   which carries the two commands that derive both lists — deliberately not copied
   here, because a second hand-kept list is what diverges. This bullet said "ten

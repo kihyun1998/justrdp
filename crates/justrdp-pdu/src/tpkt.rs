@@ -67,6 +67,23 @@ pub fn frame_len(buf: &[u8]) -> Result<usize, DecodeError> {
 mod tests {
     use super::*;
     use crate::error::DecodeError;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
+        // parser, added with this module's fuzz target (#200). `decode` reads the 4-byte TPKT
+        // header and returns the body its `u16` length declares, so the length is server-supplied
+        // and checked against a buffer the server also framed. Malformed bytes must surface as a
+        // typed `DecodeError`, never a panic / overflow / OOB. Reaching the end without unwinding
+        // IS the assertion; proptest shrinks any failure to a minimal counterexample.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_never_panics_on_arbitrary_input(
+            buf in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = decode(&buf);
+        }
+    }
 
     #[test]
     fn frame_len_peeks_total_length_without_needing_the_payload() {
