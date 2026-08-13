@@ -328,12 +328,20 @@ a spine — a cluster with a home never gets a second one). All **Accepted**; no
 | 0010 | `FrameUpdate` dirty-rect contract (#85) |
 | 0011 | zero `ironrdp` as the terminal state; the oracle retires per codec (#194) |
 
-**Tracker parent/child: GitHub sub-issues are available and currently unused.** The epics
-(#158, #10–#29, #45) are grouped by **title prose** only — `gh api
-repos/kihyun1998/justrdp/issues/158/sub_issues` returns empty. So the relation theflow
-leans on twice (the follow-up tree, and a spine's derived roster) exists but is not yet in
-use: **use the sub-issue relation** for new follow-ups and spines rather than adding
-another prose convention, and enrol an epic's existing slices when you next touch it.
+**Tracker parent/child: GitHub sub-issues are available and now in use — barely.** The
+relation theflow leans on twice (the follow-up tree, and a spine's derived roster) has
+exactly **one** edge: #200 under #194, added when #194's completeness pass produced it
+(2026-08-13). Everything else is still grouped by **title prose** — the epics (#158,
+#10–#29, #45) included, so `gh api repos/kihyun1998/justrdp/issues/158/sub_issues` still
+returns empty. **Use the sub-issue relation** for new follow-ups and spines rather than
+adding another prose convention, and enrol an epic's existing slices when you next touch
+it. The `sub_issue_id` is the issue's **database id**, not its number, and `gh api` needs
+`-F` rather than `-f` or it sends a string and the API answers 422:
+
+```sh
+ID=$(gh api repos/kihyun1998/justrdp/issues/<child> --jq .id)
+gh api --method POST repos/kihyun1998/justrdp/issues/<parent>/sub_issues -F sub_issue_id=$ID
+```
 
 ## Step 7 — gate matrix + PR
 
