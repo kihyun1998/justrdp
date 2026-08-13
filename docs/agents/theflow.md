@@ -328,17 +328,34 @@ a spine — a cluster with a home never gets a second one). All **Accepted**; no
 | 0010 | `FrameUpdate` dirty-rect contract (#85) |
 | 0011 | zero `ironrdp` as the terminal state; the oracle retires per codec (#194) |
 
-**Tracker parent/child: GitHub sub-issues are available and now in use — barely.** The
-relation theflow leans on twice (the follow-up tree, and a spine's derived roster) has
-exactly **one** edge: #200 under #194, added when #194's completeness pass produced it
-(2026-08-13). Everything else is still grouped by **title prose** — the epics (#158,
-#10–#29, #45) included, so `gh api repos/kihyun1998/justrdp/issues/158/sub_issues` still
-returns empty. **Use the sub-issue relation** for new follow-ups and spines rather than
-adding another prose convention, and enrol an epic's existing slices when you next touch
-it. The `sub_issue_id` is the issue's **database id**, not its number, and `gh api` needs
-`-F` rather than `-f` or it sends a string and the API answers 422:
+**Tracker parent/child: GitHub sub-issues are in use on one cluster and nowhere else.**
+Measured 2026-08-13, not inferred — an earlier revision of this paragraph asserted the
+relation was unused because it said so, and the one command that checks it disagreed:
+
+| Epic | `sub_issues` |
+|---|---|
+| **#158** (Progressive) | **7** — slices #167–#172, plus #194; #194 in turn carries #200 |
+| #132, #45, #29, #21, #28, … | **0** |
+
+**A `- [ ] #NNN` task list in the body does not create the relation.** #132's body lists
+`#137`–`#141` in exactly the format #158's uses and has zero sub-issues, so #158's tree is
+a deliberate act someone performed, not a side effect of the checklist. Enrolling an epic's
+slices is therefore real work with a real result, and it is worth doing when you next touch
+one. **Use the relation** for new follow-ups and spines rather than adding another prose
+convention.
+
+The API has two traps, both cost a few minutes to rediscover:
+
+- `sub_issue_id` is the issue's **database id**, not its number, and `gh api` needs `-F`
+  rather than `-f` — with `-f` it sends a string and the API answers **422**.
+- Re-adding an existing child *also* answers **422**, with a message that reads as if the
+  child belongs to some other parent: *"Issue may not contain duplicate sub-issues and Sub
+  issue may only have one parent."* It usually means the edge is already there. **List the
+  parent's `sub_issues` before believing it** — `.parent` is absent from the REST issue
+  payload, so a child's own record cannot answer the question.
 
 ```sh
+gh api repos/kihyun1998/justrdp/issues/<parent>/sub_issues --jq '.[].number'   # check first
 ID=$(gh api repos/kihyun1998/justrdp/issues/<child> --jq .id)
 gh api --method POST repos/kihyun1998/justrdp/issues/<parent>/sub_issues -F sub_issue_id=$ID
 ```
