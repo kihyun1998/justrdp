@@ -98,6 +98,16 @@ jobs:
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
 
+      # After the restore, never before it: seeding is additive, so it must land beside the corpus
+      # libFuzzer evolved rather than replacing it. A target with no seeder is a no-op.
+      #
+      # Not every target needs this, and which do is measured rather than assumed — see the script.
+      # The short version: `progressive`'s first run ever retained 6 inputs totalling 29 bytes from
+      # 149M executions, because a magic-plus-nested-lengths grammar is a wall a mutator cannot
+      # climb from empty. `nscodec`, cold in the same run, reached 85 inputs / 9477 bytes.
+      - name: Seed ${{ matrix.target }} corpus from committed fixtures
+        run: python3 .github/scripts/seed_fuzz_corpus.py ${{ matrix.target }}
+
       # -max_total_time bounds the run; -timeout=10 fails an input that runs >10s, which is how
       # hangs (infinite loops) are caught — the gap proptest leaves open.
       - name: Fuzz ${{ matrix.target }}

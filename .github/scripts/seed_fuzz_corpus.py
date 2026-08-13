@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Seed a fuzz target's corpus from a test fixture the repo already commits (#200).
+
+    python3 .github/scripts/seed_fuzz_corpus.py <target>
+
+Exits 0 having done nothing when the target has no seeder — most do not need one.
+
+## Why any of this exists
+
+A target with no corpus starts from an empty input and mutates. Whether that bootstraps
+depends entirely on the input grammar, and it is not a judgement call — it was measured on
+the run that first executed both of the lane's newest targets, same 300s budget, both
+genuinely cold:
+
+    nscodec       #57,174,947   cov: 125   corp: 85/9477b
+    progressive  #148,786,349   cov:  62   corp: 6/29b
+
+`progressive` ran 2.6x more executions for half the coverage and retained **29 bytes**,
+with coverage flat from the 8M mark: guidance never assembled a valid block header, so the
+three-deep length nesting the target exists for was never reached. A magic-plus-nested-
+lengths format is a wall a mutator cannot climb from empty; a flatter one is not.
+
+## Why derived rather than committed
+
+The payloads are already in the repo, as `justrdp-codecs`'s Progressive corpus fixture.
+Committing a second copy under `fuzz/corpus/` would be ~900 KB of duplicate bytes and a
+sixth hand-kept roster of exactly the kind #200 exists to remove — the two would drift the
+first time the fixture is recaptured. This reads the fixture at run time instead, so there
+is one copy and the seeds cannot disagree with it.
+
+Seeding is additive and idempotent: it writes fixed filenames beside whatever the corpus
+cache restored, so a re-run neither duplicates nor discards the inputs libFuzzer evolved.
+
+Printed output is ASCII-only on purpose. The CI runner is UTF-8, but the maintainer's host
+console is cp949, where a single em dash in a status line raises `UnicodeEncodeError` and
+takes the script with it -- measured, not guessed, on the first local run of this file.
+"""
+
+USAGE = "usage: python3 .github/scripts/seed_fuzz_corpus.py <target>"
+
+import pathlib
+import struct
+import sys
+
+REPO = pathlib.Path(__file__).resolve().parents[2]
+
+
+def seed_progressive(out_dir):
+    """Split the real-VM `WireToSurface2` capture into one file per payload.
+
+    Format is documented in the fixture's README: `u32 count`, then `count` records of
+    `u32 codec_context_id, u16 width, u16 height, u32 len, u8 payload[len]`. Only the
+    payload is a fuzz input — the target takes the raw block stream, and the context id and
+    surface dimensions are the decoder state it was captured against.
+    """
+    fixture = REPO / "crates/justrdp-codecs/tests/fixtures/progressive/replay.bin"
+    if not fixture.is_file():
+        print(f"::error::seed fixture missing: {fixture.relative_to(REPO)}")
+        return None
+
+    buf = fixture.read_bytes()
+    (count,) = struct.unpack_from("<I", buf, 0)
+    pos = 4
+    written = 0
+    for i in range(count):
+        _ctx, _w, _h, length = struct.unpack_from("<IHHI", buf, pos)
+        pos += 12
+        (out_dir / f"replay-{i:03d}.bin").write_bytes(buf[pos : pos + length])
+        pos += length
+        written += 1
+    return written
+
+
+SEEDERS = {"progressive": seed_progressive}
+
+
+def main(argv):
+    if len(argv) != 2:
+        print(USAGE)
+        return 2
+    target = argv[1]
+
+    seeder = SEEDERS.get(target)
+    if seeder is None:
+        print(f"no seeder for '{target}': starting from whatever the corpus cache holds")
+        return 0
+
+    out_dir = REPO / "fuzz/corpus" / target
+    out_dir.mkdir(parents=True, exist_ok=True)
+    before = len(list(out_dir.glob("*")))
+    written = seeder(out_dir)
+    if written is None:
+        return 1
+    after = len(list(out_dir.glob("*")))
+    print(f"seeded '{target}': {written} payloads written, corpus {before} -> {after} files")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
