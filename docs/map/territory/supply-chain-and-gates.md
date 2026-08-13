@@ -35,7 +35,16 @@ like any other.
   ignored, and an ignored gate returns its defect class to being silent.
 - **`--workspace` is not "everything".** `fuzz` has its own `[workspace]`, so the top
   gate does not even *build* it; a public-API change needs
-  `cargo check --manifest-path fuzz/Cargo.toml`.
+  `cargo check --manifest-path fuzz/Cargo.toml`. Note what that command still does not
+  reach: it builds the `[[bin]]` targets the manifest declares, so a `fuzz_targets/*.rs`
+  with no `[[bin]]` entry is invisible to it too.
+- **A workflow may not keep its own copy of a list the repo already answers** (#200).
+  `fuzz.yml`'s matrix was a hand-kept transcription of `ls fuzz/fuzz_targets/` and
+  drifted twice in silence — `nscodec` (#143) and `progressive` (#192) each shipped a
+  compiling target that CI never ran. It now derives the matrix in a `targets` job and
+  fails when `fuzz/Cargo.toml` disagrees with the directory. **Derived from the
+  directory, not the manifest**, because the manifest is the copy that can be wrong
+  quietly: a missing `[[bin]]` compiles nothing and reports nothing.
 - **Pinning is cheap only because it is automated** — `just-shield fix` writes the
   SHA, Dependabot bumps it with a version comment. That pairing is the whole reason
   the earlier "pinning is unmaintainable" objection was resolved.

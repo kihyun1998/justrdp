@@ -57,7 +57,9 @@ everywhere else.
   `rle.rs`
 - `justrdp-tokio/src/lib.rs` — the `#[ignore]`d VM tests and the loopback CredSSP
   test
-- Target list derivation: `ls fuzz/fuzz_targets/`
+- Target list derivation: `ls fuzz/fuzz_targets/` — and since #200 this is not just how
+  a reader derives it but how `.github/workflows/fuzz.yml` builds its matrix, so the
+  roster has one home
 
 ## Reference behaviour
 
@@ -89,12 +91,15 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
 
 ## Known holes / open
 
-- **Fuzz coverage is codec-shaped, not parser-shaped.** Ten targets exist, all
+- **Fuzz coverage is codec-shaped, not parser-shaped.** Every target is
   graphics/capability/license, while roughly twice as many wire parsers have none.
   The enumeration is **owned by**
   [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md),
   which carries the two commands that derive both lists — deliberately not copied
-  here, because a second hand-kept list is what diverges.
+  here, because a second hand-kept list is what diverges. This bullet said "ten
+  targets" until #200, having been written when that was true and left alone when
+  `progressive` landed: a *count* is a hand-kept list with one entry, and it rots the
+  same way.
 - **One VM is one server.** The WS2022 box advertises a fixed cap set; paths it does
   not advertise have never been exercised against anything.
 - **The VM suite does not isolate its own sessions, and the symptom masquerades as

@@ -77,5 +77,16 @@ a claim that they are wrong — it is the statement that this invariant is curre
 enforced on one half of its surface.
 
 New decoder ⇒ a proptest no-panic property in the same PR (stable gate), and a fuzz
-target in `fuzz/fuzz_targets/` — remembering that the fuzz lane is nightly, so the
-target does not run on the day it lands.
+target — which is **two** artifacts, not one: `fuzz/fuzz_targets/<name>.rs` *and* its
+`[[bin]]` in `fuzz/Cargo.toml`. A file without the manifest entry is never compiled by
+anything, so it reads as covered and is not.
+
+**The lane runs whatever is in the directory** (#200): `fuzz.yml` derives its matrix
+from `ls fuzz/fuzz_targets/` and fails if the manifest disagrees, so a new target is
+covered on the day it lands — but the lane is *nightly*, so it is not covered by the
+PR gate that day. That gap is why the proptest half is not optional.
+
+This rule used to stop at "a fuzz target in `fuzz/fuzz_targets/`", and #143 and #192
+each satisfied it exactly as written while the lane's hand-kept matrix ran neither
+target for months. A recurrence test that names an artifact but not the thing that
+consumes it is satisfiable without the coverage it exists to buy.

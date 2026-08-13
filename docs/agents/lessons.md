@@ -54,8 +54,10 @@ Read this before starting so the bindings do not read as abstractions.
   yourself to have finished. (They are two automations of **one** property, not two
   lenses; the pass itself is one lens briefed on both corpora — see the bindings.)
 - **Its surface is half-covered, and the map says so by derivation rather than by a
-  list**: ten fuzz targets exist, all codec/capability/license, while the
-  connect-sequence parsers have none —
+  list** — every fuzz target is codec/capability/license, while the
+  connect-sequence parsers have none. (This bullet read "ten fuzz targets exist"
+  until #200 — a sentence praising derivation while hand-copying the number in its
+  own second half, and wrong from the day `progressive` landed.) —
   [`docs/map/invariant/untrusted-decode-never-panics.md`](../map/invariant/untrusted-decode-never-panics.md).
 
 ## Step 6/7 — surfaces & gates
@@ -63,6 +65,23 @@ Read this before starting so the bindings do not read as abstractions.
 - **The `fuzz` crate is the `--workspace` blind spot** — out of the workspace by
   design (its own `[workspace]`), so `cargo test --workspace` does not build it. A
   public-API change needs a separate `cargo check --manifest-path fuzz/Cargo.toml`.
+- **A gate that keeps its own copy of a list is a gate that will one day run on the
+  wrong list — the war story for *derive, don't copy*, applied to CI (#200).**
+  `fuzz.yml`'s matrix transcribed `ls fuzz/fuzz_targets/` by hand and drifted **twice
+  without a signal**: `nscodec` (#143) and `progressive` (#192) each landed a
+  compiling fuzz target that CI never once executed, `nscodec` for months. Nothing
+  was violated — both PRs satisfied the recurrence test in
+  [untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md)
+  exactly as it was written, because it named the artifact and not the thing that
+  consumes it. Three lessons, and the second is the one that shaped the fix:
+  **a rule is only as strong as its most literal reading**; **the roster had five
+  copies, not two** — the directory, `fuzz/Cargo.toml`'s `[[bin]]` entries, the
+  matrix, and a *count* in prose in two more places, both of which had also gone
+  stale at #192, so a hand-kept number is a hand-kept list with one entry; and
+  **derive from the copy whose failure is loud** — the matrix now reads the directory
+  and asserts the manifest agrees, because a `.rs` with no `[[bin]]` is compiled by
+  nothing, not even `cargo check --manifest-path fuzz/Cargo.toml`, and so reads as
+  covered while being dead text.
 - **"Temporary and tracked" decayed into "still here and untracked" — the war story
   for *external facts are verification targets too*.** The `[patch.crates-io]` bridge
   to `kihyun1998/sspi-rs` waited on Devolutions/sspi-rs#689, which **merged 2026-06-17
