@@ -100,16 +100,17 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   targets" until #200, having been written when that was true and left alone when
   `progressive` landed: a *count* is a hand-kept list with one entry, and it rots the
   same way.
-- **A fuzz target is not evidence until it has a corpus, and one target is measurably
-  stuck without one.** `fuzz/corpus/` is not in the repo — corpora exist only as Actions
-  cache entries — so a newly-added target starts from nothing. Measured on the run that
-  first executed both (#200), same 300s budget, both genuinely cold: `nscodec` reached
-  `corp: 85/9477b`, and **`progressive` reached `corp: 6/29b` after 149M executions**
-  with coverage flat from the 8M mark. Guidance never built a valid block header, so the
-  three-deep nesting the target exists for is unreached. The difference is the input
-  grammar — magic plus nested lengths is a wall a mutator cannot climb from empty — so
-  "the target runs" and "the target covers anything" are separate claims for this class
-  of format.
+- **"The target runs" and "the target covers anything" are separate claims, and for one
+  format the gap was total.** `fuzz/corpus/` is not committed — corpora live as Actions
+  cache entries — so a new target starts from nothing. Measured across two runs of the
+  same target at the same 300s budget (#200): from empty, `progressive` ended
+  `cov: 62 corp: 6/29b` after **149M executions** with coverage flat from the 8M mark,
+  never having assembled a valid block header; seeded from the real-VM capture it ended
+  `cov: 425 corp: 198/1153Kb` in **8M** executions. `nscodec`, cold in the same first run,
+  reached `corp: 85/9477b` — so the wall is the input grammar (magic plus nested lengths),
+  not cold starts as such. The lane now seeds from committed fixtures where one exists,
+  which is a **derivation, not a second corpus**: `.github/scripts/seed_fuzz_corpus.py`
+  splits the fixture at run time rather than duplicating ~900 KB into `fuzz/`.
 - **One VM is one server.** The WS2022 box advertises a fixed cap set; paths it does
   not advertise have never been exercised against anything.
 - **The VM suite does not isolate its own sessions, and the symptom masquerades as

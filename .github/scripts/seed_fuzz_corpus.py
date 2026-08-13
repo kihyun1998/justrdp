@@ -20,6 +20,14 @@ with coverage flat from the 8M mark: guidance never assembled a valid block head
 three-deep length nesting the target exists for was never reached. A magic-plus-nested-
 lengths format is a wall a mutator cannot climb from empty; a flatter one is not.
 
+Seeding it closed exactly that gap, on the next run of the same target at the same budget:
+
+    empty    #148,786,349   cov:  62   ft:   64   corp: 6/29b       exec/s: 494,306
+    seeded   #  8,277,846   cov: 425   ft: 1713   corp: 198/1153Kb  exec/s:  27,501
+
+6.9x the coverage in 18x fewer executions, and the exec/s collapse is the tell: the target
+is now decoding rather than bouncing off a length check.
+
 ## Why derived rather than committed
 
 The payloads are already in the repo, as `justrdp-codecs`'s Progressive corpus fixture.
