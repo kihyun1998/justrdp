@@ -100,6 +100,16 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   targets" until #200, having been written when that was true and left alone when
   `progressive` landed: a *count* is a hand-kept list with one entry, and it rots the
   same way.
+- **A fuzz target is not evidence until it has a corpus, and one target is measurably
+  stuck without one.** `fuzz/corpus/` is not in the repo — corpora exist only as Actions
+  cache entries — so a newly-added target starts from nothing. Measured on the run that
+  first executed both (#200), same 300s budget, both genuinely cold: `nscodec` reached
+  `corp: 85/9477b`, and **`progressive` reached `corp: 6/29b` after 149M executions**
+  with coverage flat from the 8M mark. Guidance never built a valid block header, so the
+  three-deep nesting the target exists for is unreached. The difference is the input
+  grammar — magic plus nested lengths is a wall a mutator cannot climb from empty — so
+  "the target runs" and "the target covers anything" are separate claims for this class
+  of format.
 - **One VM is one server.** The WS2022 box advertises a fixed cap set; paths it does
   not advertise have never been exercised against anything.
 - **The VM suite does not isolate its own sessions, and the symptom masquerades as
