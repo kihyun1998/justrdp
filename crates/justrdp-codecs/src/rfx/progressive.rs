@@ -997,7 +997,7 @@ pub fn order_payload<'m, 'a>(messages: &'m [ProgressiveMessage<'a>]) -> PayloadO
 /// | `RDPGFX_CMDID_DELETESURFACE` | **free** — the only free path | `gdi/gfx.c:1366` |
 /// | `RDPGFX_CMDID_DELETEENCODINGCONTEXT` | **nothing** | `gdi/gfx.c:1239-1246` |
 /// | `RDPGFX_CMDID_RESETGRAPHICS` | **nothing** (surface *pixels* are wiped) | `progressive.c:2635` |
-/// | channel close | free everything | — |
+/// | channel close | free everything, **by dropping this** — there is no method | `justrdp/src/egfx.rs:725` |
 ///
 /// **`DELETEENCODINGCONTEXT` frees nothing, but not because it names nothing.** The PDU
 /// carries a `surfaceId` beside the `codecContextId` (`[MS-RDPEGFX]` 2.2.2.13; our parser
@@ -1026,6 +1026,22 @@ pub fn order_payload<'m, 'a>(messages: &'m [ProgressiveMessage<'a>]) -> PayloadO
 /// a difference tile at all, since a diff against zero is a plain first pass. So keeping is
 /// harmless when the server resets and necessary when it does not, while clearing is wrong in
 /// the second case. `[MS-RDPEGFX]` 2.2.2.14 is silent, so neither branch is spec-mandated.
+///
+/// # There is deliberately no `reset`, and that is the guard rather than a doc note
+///
+/// Clearing every store at once is a real event — the EGFX channel closing — and it already has
+/// a mechanism: `GraphicsProcessor::close()` is `*self = GraphicsProcessor::default()`
+/// (`justrdp/src/egfx.rs:725`, reached from `dvc.rs:356` on `DvcMessage::Close`), which drops
+/// this store along with the surfaces, the cache and the mappings. A `reset` here would
+/// duplicate that, and of the two only the duplicate can be misused: `*self = default()` is
+/// obviously wrong in a `RESETGRAPHICS` handler because it discards far more than the PDU
+/// touches, while `store.reset()` reads exactly right there and is the desync above.
+///
+/// So the method is absent, and what remains is [`SurfaceStore::delete_surface`], which
+/// **requires a surface id**. `RDPGFX_CMDID_RESETGRAPHICS` carries a width and a height and no
+/// surface id (`[MS-RDPEGFX]` 2.2.2.14), so it has nothing to call: the mistake is unspellable
+/// rather than merely documented. Keep it that way — an "and clear everything" convenience here
+/// hands the footgun straight back.
 ///
 /// # The live client still does the opposite, and a passing test pins it
 ///
@@ -1148,16 +1164,6 @@ impl SurfaceStore {
     /// `gdi/gfx.c:1239-1246`), and under surface keying a `codecContextId` names nothing this
     /// store holds. See the type doc for why the id is not an identity on the real wire.
     pub fn delete_context(&mut self, _codec_context_id: u32) {}
-
-    /// Free every surface's store — the EGFX channel closing, or the decoder being rebuilt.
-    ///
-    /// **Not** `RDPGFX_CMDID_RESETGRAPHICS`, which must leave the stores alone; see the type
-    /// doc for the desync that would cause, and for the call site that does the opposite today.
-    /// The same observability note as [`SurfaceStore::delete_surface`] applies, multiplied by
-    /// the number of live surfaces.
-    pub fn reset(&mut self) {
-        self.grids.clear();
-    }
 
     /// How many surfaces currently hold a tile store. The observable #170's lifecycle tests
     /// assert against, and the count #171 needs to charge tile state to the surface budget.
@@ -1573,13 +1579,25 @@ mod tests {
         assert_eq!(store.live_surfaces(), 0);
     }
 
+    /// **Clearing every store at once is a drop, not a method.** The EGFX channel closing is
+    /// the only event that wants it, and `GraphicsProcessor::close()` already provides it by
+    /// replacing itself wholesale (`justrdp/src/egfx.rs:725`). This asserts the half that lives
+    /// in this crate: the store owns its grids outright, so dropping it takes them with it —
+    /// which is what makes a `reset` method redundant, and therefore only a way to clear the
+    /// stores on `RESETGRAPHICS`, where clearing is wrong.
     #[test]
-    fn a_reset_frees_every_surface() {
+    fn dropping_the_store_is_what_frees_every_surface() {
         let mut store = SurfaceStore::new();
         paint_one(&mut store, 7, 1280, 800);
         paint_one(&mut store, 8, 640, 480);
-        store.reset();
-        assert_eq!(store.live_surfaces(), 0);
+        assert_eq!(store.live_surfaces(), 2);
+
+        drop(store);
+
+        // And the type offers no other way to reach zero in one call: `delete_surface` takes a
+        // surface id, which `RDPGFX_CMDID_RESETGRAPHICS` does not carry. A rebuilt store is
+        // empty, which is the whole of what a `reset` would have bought.
+        assert_eq!(SurfaceStore::new().live_surfaces(), 0);
     }
 
     /// **A grid whose stride would be wrong is replaced, not cleared** — the hole #169 handed
