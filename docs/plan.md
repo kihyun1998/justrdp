@@ -154,6 +154,14 @@ These cost real time to find. Bake them into the design from day one.
   49 of 52 real payloads — which is what the bootstrap oracle does. FreeRDP requires none:
   it gates a region on `FLAG_WBT_FRAME_BEGIN` alone and keys tile state by `surfaceId`
   (`progressive.c:2129`, `:314`). Load-bearing for #169/#170.
+- **The Progressive block-ordering rules are per *payload*, not per stream** (#170, measured on
+  the same capture). FreeRDP's `WBT_STATE_FLAG` mask reads like decoder state and is zeroed at
+  the top of `progressive_decompress` (`progressive.c:2463`), which the EGFX layer calls once
+  per surface command (`gdi/gfx.c:1116`). 51 of the 52 payloads are `FRAME_BEGIN REGION
+  FRAME_END` with no `SYNC` and no `CONTEXT`, so carrying the mask across payloads makes every
+  one after the first a *duplicate* `FRAME_BEGIN` **and** a `FRAME_BEGIN` after `FRAME_END` —
+  both hard errors. Measured: per-payload rejects 0 of 52, per-stream rejects 51. #167's
+  handover and #170's own body both said per-stream; do not re-derive it from them.
 - **HYBRID_EX early-auth PDU.** A HYBRID_EX server sends a 4-byte LE **Early User Authorization
   Result** PDU immediately after CredSSP, *before* MCS. If not consumed, capability exchange
   desyncs and hangs.
