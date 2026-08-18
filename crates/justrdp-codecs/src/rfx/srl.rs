@@ -12,8 +12,10 @@
 //! # Verification basis — FreeRDP, not the oracle
 //!
 //! This stage is **not** gated on the `ironrdp-graphics` differential (ADR-0003/0007's usual
-//! method). The oracle's SRL is measured to disagree with FreeRDP on four separate counts, and
-//! its own tests round-trip against its own encoder, so it cannot arbitrate (#194, ADR-0011).
+//! method). The oracle's SRL is measured to disagree with FreeRDP on every count listed below,
+//! and its own tests round-trip against its own encoder, so it cannot arbitrate (#194,
+//! ADR-0011). (No count in this sentence on purpose — the list is the authority, and a
+//! hand-copied number beside a derived list is the drift `lessons.md` records for #200.)
 //! `docs/agents/theflow.md`'s tie-breaker for codec byte-exactness names the **oracle**, *with
 //! FreeRDP as the tie-break when the oracle and we disagree* — and here the oracle is
 //! disqualified outright, so what remains is FreeRDP. This module is therefore derived from
