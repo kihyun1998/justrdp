@@ -50,8 +50,21 @@ Two shapes, and neither announces itself:
    that ClearCodec **corrects two bit-level defects in the oracle** which otherwise
    reject genuine Server 2022 streams — so this is not hypothetical here.
 
-The tell for both: the argument for a change is *"the oracle does X"* with no
-FreeRDP citation and no corpus fixture.
+3. **An owned basis that quietly borrows the oracle's state.** The subtlest shape, and
+   the only one that survives *replacing* the oracle: the hand-derived expectations
+   written to be independent of it are computed against the oracle's initial
+   conditions, so the two agree for a reason nobody stated and the basis certifies
+   whatever the oracle would have. #168 is the worked case — five of eight
+   FreeRDP-derived SRL vectors were derived at `kp = 0`, `ironrdp-graphics`'s initial
+   value, because FreeRDP's `kp = 8` is set by the *caller* of the function the
+   vectors cited, 110 lines outside the cited range. What identified it was not the
+   disagreement but the fit: re-running the vectors at `kp = 0` reproduced all eight
+   claimed values exactly.
+
+The tell for the first two: the argument for a change is *"the oracle does X"* with no
+FreeRDP citation and no corpus fixture. The tell for the third is different and worth
+naming separately — **a citation that spans fewer lines than the state it depends on**.
+Initial state is set by callers; a range that covers only the algorithm cannot show it.
 
 ## Discovery history
 
@@ -62,6 +75,11 @@ FreeRDP citation and no corpus fixture.
 - **#127** — ClearCodec divergences from FreeRDP adjudicated as **required
   tolerances**, backed by the `clearcodec_corpus` fixtures (memory
   `clearcodec_corpus_required_tolerances`). The oracle lost that argument.
+- **#194 → #168** — the third shape above, found one slice after the basis landed.
+  #194 built an owned basis precisely *because* the oracle could not arbitrate SRL,
+  and the basis inherited the oracle's `kp` anyway. The lesson is not that #194 was
+  careless: it is that "derived from FreeRDP" is a claim about a *range of lines*, and
+  the range that holds the algorithm is rarely the range that holds its initial state.
 - Memory `ironrdp_oracle_shares_lineage` records the lineage limit itself, naming
   ClearCodec and RemoteFX compositing as the weakest cases for DoD ④ independence.
 
@@ -104,3 +122,9 @@ Concretely:
 - When the tie-break lands *against* the oracle, record it as a deliberate
   divergence in [`docs/agents/theflow.md`](../../agents/theflow.md), or the next
   completeness pass proposes reverting it.
+- **When a hand-derived expectation is written, derive its initial state from the
+  reference's caller, not only from the function being transcribed** — and prove the
+  basis is independent without the oracle's help. `rfx::srl`'s bit-cursor unit tests
+  do that job for the SRL vectors: they pin bit order and end-of-stream behaviour with
+  no second implementation involved, which is what the vectors' old "positive controls"
+  only appeared to do.

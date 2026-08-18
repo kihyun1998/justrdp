@@ -332,3 +332,98 @@ fn the_oracle_decodes_almost_none_of_the_corpus() {
         outcome.other
     );
 }
+
+/// **Slice 2's real-input gate (#168).** Every SRL and raw run the real server actually sent is
+/// driven through the self-owned upgrade decoder, and none of them may be rejected.
+///
+/// What this proves and what it does not, kept explicit because the distinction is the whole
+/// reason #194 built two gates instead of one:
+///
+/// - It **does** prove totality over real bytes: 3250 `TILE_UPGRADE` tiles × 3 components,
+///   decoded with no error, no panic and no unbounded loop. That is the acceptance property,
+///   and it is the one a corpus can carry.
+/// - It **does not** prove values. The real per-band `num_bits` is
+///   `previous_pass_bit_pos - (quant + prog_quant)`, and the previous pass's bit positions live
+///   in the cross-pass `TileState` that slice 3 (#169) builds — so this drives the widths the
+///   capture's quant range makes real (1 and 2, plus 0 as the skip case) rather than the exact
+///   ones. Values are gated by `progressive_srl_freerdp.rs`.
+///
+/// Driving a width the stream was not encoded at is deliberate rather than a compromise: it is
+/// strictly harder than the real configuration, because the decoder runs past the end of every
+/// real run and must still terminate cleanly on the zero-fill.
+#[test]
+fn the_self_owned_srl_decoder_accepts_every_real_upgrade_run() {
+    use justrdp_codecs::rfx::quant::COMPONENT_LEN;
+    use justrdp_codecs::rfx::srl;
+    use justrdp_pdu::rfx::progressive::ProgressiveQuant;
+
+    let uniform = |v: u8| ProgressiveQuant {
+        ll3: v,
+        hl3: v,
+        lh3: v,
+        hh3: v,
+        hl2: v,
+        lh2: v,
+        hh2: v,
+        hl1: v,
+        lh1: v,
+        hh1: v,
+    };
+
+    let mut components = 0usize;
+    let mut srl_bytes = 0usize;
+    let mut raw_bytes = 0usize;
+
+    for (i, e) in load_replay().iter().enumerate() {
+        for message in progressive::decode_all(&e.data).expect("the corpus parses") {
+            let ProgressiveMessage::Region(region) = message else {
+                continue;
+            };
+            for tile in region.tiles {
+                let ProgressiveTile::Upgrade(t) = tile else {
+                    continue;
+                };
+                for (srl_run, raw_run) in [
+                    (t.y_srl, t.y_raw),
+                    (t.cb_srl, t.cb_raw),
+                    (t.cr_srl, t.cr_raw),
+                ] {
+                    srl_bytes += srl_run.len();
+                    raw_bytes += raw_run.len();
+                    components += 1;
+                    // The widths the capture makes real: {0, 1, 2} bit positions, so a band's
+                    // num_bits is 0 (skip), 1 or 2.
+                    for width in [0u8, 1, 2] {
+                        let mut current = [0i16; COMPONENT_LEN];
+                        let mut sign = [0i16; COMPONENT_LEN];
+                        srl::upgrade_component(
+                            srl_run,
+                            raw_run,
+                            &uniform(6),
+                            &uniform(width),
+                            &mut current,
+                            &mut sign,
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "payload {i}: a real upgrade run was rejected at num_bits={width}: {err}"
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Guard against a vacuous pass: the loop above is a no-op if the corpus stops carrying
+    // upgrade tiles, and a green test would then say nothing.
+    assert!(
+        components >= 3 * 3000,
+        "too few upgrade components exercised ({components}) — the corpus may have changed"
+    );
+    assert!(
+        srl_bytes > 0 && raw_bytes > 0,
+        "the corpus carried no entropy bytes to decode (srl {srl_bytes}, raw {raw_bytes})"
+    );
+    eprintln!("upgrade components decoded: {components} (srl {srl_bytes} B, raw {raw_bytes} B)");
+}

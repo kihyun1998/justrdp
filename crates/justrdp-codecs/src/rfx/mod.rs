@@ -16,6 +16,7 @@
 pub mod dwt;
 pub mod quant;
 pub mod rlgr;
+pub mod srl;
 
 use justrdp_pdu::rfx::{self, EntropyAlgorithm, Quant, RfxMessage, RfxRect, Tile};
 

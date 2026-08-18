@@ -17,6 +17,19 @@
   [`capture-coverage-follows-what-we-advertise`](../map/invariant/capture-coverage-follows-what-we-advertise.md).
   The Decision is unchanged; the oracle dev-dependency stays until the self-owned decoder
   exists (#171/#172), and the canaries are what use it.
+- **Amendment (2026-08-18, #168): the oracle's reach extended into the owned basis itself.**
+  Slice 2 measured a **fifth** oracle divergence — its SRL state starts at `kp = 0` where
+  FreeRDP's starts at `8` (`progressive.c:1272`, unchanged since 2.11.7), so the two
+  desynchronise on the first symbol of every component, ahead of the three divergences #194
+  named. The finding that matters for *this* record is where it was found: five of the eight
+  hand-derived FreeRDP vectors had themselves been computed at `kp = 0`, so the basis built to
+  be independent of the oracle had silently adopted its initial state. Re-deriving them
+  reproduced the claimed values exactly at `kp = 0`, which is what identified the cause. The
+  Decision is unchanged and the argument for it is stronger: an instrument that shapes even the
+  expectations written to replace it is scaffolding whose removal has to be *scheduled*, not
+  left to taste. Promoted to
+  [`oracle-agreement-is-not-independence`](../map/invariant/oracle-agreement-is-not-independence.md)
+  as a third violation shape.
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
 
