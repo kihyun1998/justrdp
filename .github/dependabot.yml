@@ -7,6 +7,15 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+  # `fuzz` is its own workspace (the `--workspace` blind spot), so the root entry above does not
+  # reach it and its lock file would otherwise be a pin nobody watches — the shape ADR-0004's
+  # Amendment records, where the `[patch.crates-io]` bridge outlived its exit condition by six
+  # weeks because nothing was looking at it. The lane is nightly-only, so a break here surfaces
+  # slowly; a bump PR is the signal that it is about to.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
   # Keeps the GitHub Actions used by the fuzz + supply-chain workflows current. With actions
   # pinned to commit SHAs (ADR-0006), this is what makes SHA-pinning cheap: Dependabot opens the
   # bump PR with the new SHA and a version comment, so pins stay both immutable and up to date.
