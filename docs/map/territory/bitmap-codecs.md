@@ -52,11 +52,21 @@ attacker-controlled bytes in the repo.
   reads only `progressive_rfx_srl_read` gets a decoder that is correct symbol-by-symbol
   and desynchronised from the first symbol of every component, because `k = kp / 8` is
   1 rather than 0 and the zero-encoding phase reads a run-length bit the other decoder
-  never reads. `ironrdp-graphics` starts at 0 (`srl.rs:26`), which makes the mistake
-  agree with the oracle and is how it survived into #194's owned basis (#168; see
+  never reads. Both references make the mistake easy: `ironrdp-graphics` starts at 0
+  (`srl.rs:26`), and FreeRDP declares the state `WINPR_C_ARRAY_INIT` before assigning
+  `kp`, so stopping at the declaration also lands on 0. That is how it survived into
+  #194's owned basis and out again in #168 (see
   [oracle agreement is not independence](../invariant/oracle-agreement-is-not-independence.md)).
   This is the same silence as the block-namespace collision above: the wrong reading
   still decodes.
+- **A band's `num_bits` and `shift` are not 4-bit nibbles — they reach 30 and 29.** A
+  bit position is `quant + prog_quant`, the *sum* of two nibbles; `num_bits` is the
+  difference of two such positions and `shift` is one minus one. Sizing anything on
+  "it's a nibble, so ≤ 15" is wrong in the direction that does not announce itself:
+  #168 capped the truncated-unary magnitude loop at `i16::MAX` on that premise, which
+  is correct for every `num_bits ≤ 15` and silently desynchronises the shared SRL
+  cursor above it. Exported as `rfx::srl::MAX_BIT_POS` so #169 inherits the derivation
+  rather than the conclusion.
 - **A region's tiles are bounded by its declared `tileDataSize` window, and the
   `numTiles` count is not policed against it.** This is **laxer than both
   references**, not a copy of either: FreeRDP drives by the window and then rejects a

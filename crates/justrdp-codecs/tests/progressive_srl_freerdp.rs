@@ -9,8 +9,9 @@
 //!    *own* `encode_srl`, so they are self-consistent by construction and say nothing about the
 //!    wire — the tautological-proof shape ADR-0007's #118 amendment exists to route around.
 //! 2. **The two references disagree with each other**, so "match the reference" is not a single
-//!    instruction. `docs/agents/theflow.md` names **FreeRDP** as the tie-breaker for codec
-//!    byte-exactness, so FreeRDP is what these vectors encode.
+//!    instruction. `docs/agents/theflow.md`'s codec byte-exactness row names the **oracle**,
+//!    *with FreeRDP as the tie-break when the oracle and we disagree*; ADR-0011 disqualifies the
+//!    oracle for this stage, so FreeRDP is what remains and what these vectors encode.
 //! 3. **A real-server corpus cannot settle it either.** `fixtures/progressive/replay.bin` does
 //!    carry genuine SRL bytes, but a captured stream proves a decoder only once you already
 //!    know the pixels it should produce — which is the thing in question. The corpus is the
@@ -24,13 +25,22 @@
 //! (`progressive.c:1272`), 110 lines past the end of the cited `:1075-1162` range. The value is
 //! unchanged across FreeRDP 2.11.7 (`:1249`), 3.0.0 (`:1230`) and master.
 //!
-//! Five of the eight expectations were wrong as a result, and the `kp = 0` column reproduced
-//! all eight exactly — which is what identifies the cause rather than merely the symptom. `kp`
-//! of 0 is `ironrdp-graphics`'s initial value (`srl.rs:26`), so the owned basis had silently
-//! inherited the state of the implementation it exists to be independent of. That is
-//! [`oracle-agreement-is-not-independence`](../../../docs/map/invariant/oracle-agreement-is-not-independence.md)
-//! reaching one level deeper than the invariant's own examples: not a decoder agreeing with the
-//! oracle, but a *hand-derived expectation* agreeing with it.
+//! Five of the eight expectations were wrong as a result, and the `kp = 0` column reproduced all
+//! eight exactly — so the wrong initial state is the whole of the error, not one contributor
+//! among several.
+//!
+//! **What produced that `0` is not settled, and two hypotheses fit the evidence equally.** `kp`
+//! of 0 is `ironrdp-graphics`'s initial value (`srl.rs:26`), so the basis may have adopted the
+//! state of the implementation it exists to be independent of. But FreeRDP itself declares
+//! `RFX_PROGRESSIVE_UPGRADE_STATE state = WINPR_C_ARRAY_INIT;` before assigning `kp`, so a
+//! reader who stops at the declaration also gets 0. Both predict the identical 8-of-8 fit, and
+//! nothing here discriminates them.
+//!
+//! What survives either way is the mechanical lesson, and it needs no attribution: **the cited
+//! range held the algorithm and not its initial state.** Initial state is set by callers, so a
+//! citation that spans fewer lines than the state it depends on is not the proof it looks like.
+//! Recorded on
+//! [`oracle-agreement-is-not-independence`](../../../docs/map/invariant/oracle-agreement-is-not-independence.md).
 //!
 //! The vector set below is re-derived, and re-designed — the old set's three "positive
 //! controls" were controls only under the wrong initial state (see the harness note below), and

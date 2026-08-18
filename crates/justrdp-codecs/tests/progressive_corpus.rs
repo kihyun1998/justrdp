@@ -373,6 +373,7 @@ fn the_self_owned_srl_decoder_accepts_every_real_upgrade_run() {
     let mut components = 0usize;
     let mut srl_bytes = 0usize;
     let mut raw_bytes = 0usize;
+    let mut raw_routed = 0usize;
 
     for (i, e) in load_replay().iter().enumerate() {
         for message in progressive::decode_all(&e.data).expect("the corpus parses") {
@@ -393,22 +394,38 @@ fn the_self_owned_srl_decoder_accepts_every_real_upgrade_run() {
                     components += 1;
                     // The widths the capture makes real: {0, 1, 2} bit positions, so a band's
                     // num_bits is 0 (skip), 1 or 2.
+                    //
+                    // Each width is driven against three starting states, and the last two are
+                    // what make this gate non-vacuous. `BANDS` tiles the component exactly once,
+                    // so a run driven with `sign` all-zero routes **every** non-lowpass
+                    // coefficient to SRL: the `sign > 0` and `sign < 0` arms never execute, the
+                    // raw stream is read only by `LL3`, and every accumulate lands on a zero
+                    // prior — which is precisely the state the "unreachable on real traffic"
+                    // claim on `SrlError::ValueOverflow` depends on. Seeding the sign array
+                    // exercises the raw routing over real bytes; seeding the coefficient store
+                    // is the closest this slice can get to a pass refining what a previous pass
+                    // left, which is #169's to prove properly.
                     for width in [0u8, 1, 2] {
-                        let mut current = [0i16; COMPONENT_LEN];
-                        let mut sign = [0i16; COMPONENT_LEN];
-                        srl::upgrade_component(
-                            srl_run,
-                            raw_run,
-                            &uniform(6),
-                            &uniform(width),
-                            &mut current,
-                            &mut sign,
-                        )
-                        .unwrap_or_else(|err| {
-                            panic!(
-                                "payload {i}: a real upgrade run was rejected at num_bits={width}: {err}"
+                        for (seed, sign_seed) in [(0i16, 0i16), (0, 1), (4096, -1)] {
+                            let mut current = [seed; COMPONENT_LEN];
+                            let mut sign = [sign_seed; COMPONENT_LEN];
+                            srl::upgrade_component(
+                                srl_run,
+                                raw_run,
+                                &uniform(6),
+                                &uniform(width),
+                                &mut current,
+                                &mut sign,
                             )
-                        });
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "payload {i}: a real upgrade run was rejected at                                      num_bits={width}, seed={seed}, sign_seed={sign_seed}: {err}"
+                                )
+                            });
+                            if sign_seed != 0 {
+                                raw_routed += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -425,5 +442,11 @@ fn the_self_owned_srl_decoder_accepts_every_real_upgrade_run() {
         srl_bytes > 0 && raw_bytes > 0,
         "the corpus carried no entropy bytes to decode (srl {srl_bytes}, raw {raw_bytes})"
     );
-    eprintln!("upgrade components decoded: {components} (srl {srl_bytes} B, raw {raw_bytes} B)");
+    assert!(
+        raw_routed >= 2 * components,
+        "the non-lowpass raw branches were not driven over real bytes ({raw_routed})"
+    );
+    eprintln!(
+        "upgrade components decoded: {components} (srl {srl_bytes} B, raw {raw_bytes} B present);          {raw_routed} drives took the non-lowpass raw routing"
+    );
 }

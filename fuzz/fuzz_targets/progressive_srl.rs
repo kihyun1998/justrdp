@@ -22,12 +22,21 @@ use justrdp_pdu::rfx::progressive::ProgressiveQuant;
 /// fields are plain `pub u8`, so the guarantee is the parser's and not the type's — and masking
 /// here would make this target unable to reach the class of defect the #168 completeness pass
 /// found by hand (a shift overflow at `num_bits >= 32`).
+///
+/// `seed` and `sign_seed` fill the coefficient and sign arrays, and they are **not** optional
+/// dressing. `BANDS` tiles the component exactly once, so with both arrays zeroed every
+/// coefficient is visited once against a zero prior and every sign entry routes to SRL — which
+/// makes two of the three routing arms unreachable, confines `raw_read` to `LL3`, and makes an
+/// accumulate onto an already-large coefficient impossible. The first revision of this target
+/// zeroed them and could not reach the very defect class it was added for.
 #[derive(Arbitrary, Debug)]
 struct Input {
     srl: Vec<u8>,
     raw: Vec<u8>,
     shift: [u8; 10],
     width: [u8; 10],
+    seed: i16,
+    sign_seed: i16,
 }
 
 fn quant(n: [u8; 10]) -> ProgressiveQuant {
@@ -46,8 +55,8 @@ fn quant(n: [u8; 10]) -> ProgressiveQuant {
 }
 
 fuzz_target!(|input: Input| {
-    let mut current = [0i16; COMPONENT_LEN];
-    let mut sign = [0i16; COMPONENT_LEN];
+    let mut current = [input.seed; COMPONENT_LEN];
+    let mut sign = [input.sign_seed; COMPONENT_LEN];
     let _ = justrdp_codecs::rfx::srl::upgrade_component(
         &input.srl,
         &input.raw,
