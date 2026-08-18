@@ -48,6 +48,7 @@ not call each other:
 | Untrusted decode never panics | #98 (proptest) → #99 (fuzz) | one property, two automations |
 | Oracle agreement ≠ independence | ADR-0007 amendment #118 → #127 (ClearCodec) | the oracle *lost* an argument it was assumed to win |
 | Capture coverage follows what we advertise | #193 (harness) → #194 (`connectionType` sweep) | a whole entropy layer read as absent from the server |
+| A later stage can hide an earlier defect | #169, three instances in one slice | each test carried a doc comment asserting the property it could not see |
 
 Each is now an [`invariant/`](invariant/) note carrying its own discovery history and
 a recurrence test.
@@ -132,7 +133,8 @@ Invariants: [decoder-dimension-overflow-32bit](invariant/decoder-dimension-overf
 [untrusted-decode-never-panics](invariant/untrusted-decode-never-panics.md) ·
 [frame-path-carries-no-owned-pixels](invariant/frame-path-carries-no-owned-pixels.md) ·
 [oracle-agreement-is-not-independence](invariant/oracle-agreement-is-not-independence.md) ·
-[capture-coverage-follows-what-we-advertise](invariant/capture-coverage-follows-what-we-advertise.md)
+[capture-coverage-follows-what-we-advertise](invariant/capture-coverage-follows-what-we-advertise.md) ·
+[a-later-stage-can-hide-an-earlier-defect](invariant/a-later-stage-can-hide-an-earlier-defect.md)
 
 **The graph is gated.** `python .github/scripts/check_map.py` (CI: `test.yml` job
 `map`) checks that every link and `#anchor` resolves, that every symbol and path under

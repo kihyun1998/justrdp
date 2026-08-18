@@ -130,12 +130,14 @@ These cost real time to find. Bake them into the design from day one.
   decoder) is the right target; H.264/AVC needs a separate AVC decoder **backend — undecided**
   (a C lib like openh264/ffmpeg, an OS-API Platform-FFI backend like WMF/VideoToolbox/VAAPI, or
   skip it — RemoteFX/Progressive carry the desktop; don't hardcode openh264).
-  **Correction verified in source (this sweep):** ironrdp-graphics 0.8 has a *near-complete*
-  Progressive decoder — `TileState` (cross-pass coefficient/sign store, progressive.rs:687),
-  `decode_first`/`decode_upgrade` (736/775), `reconstruct_to_rgba` (810, full inverse DWT +
-  YCbCr→RGB), and a `SurfaceTiles` grid (866). So β is mostly *wiring* WireToSurface2 → these
-  → FrameUpdate, **not** implementing the codec (the earlier "primitives-only / unknown
-  completeness" worry was wrong).
+  **The "β is mostly wiring" correction is itself superseded (2026-08-18, #169).** It read
+  ironrdp-graphics 0.8's Progressive decoder as near-complete — `TileState`,
+  `decode_first`/`decode_upgrade`, `reconstruct_to_rgba`, a `SurfaceTiles` grid — and
+  concluded the work was plumbing. Present *and* correct are different properties: seven
+  measured divergences from FreeRDP now span its parse, entropy, first pass and transform
+  (ADR-0011 amendments), it decodes 2 of 52 real payloads, and the epic self-owns the codec.
+  Left in place rather than deleted because the shape is the lesson: a source sweep answered
+  "does the function exist" and was read as answering "does it decode this server".
 - **`connectionType` decides whether Progressive refinement exists at all** (#194, measured
   2026-08-13). The Client Core Data `connectionType` ([MS-RDPBCGR] 2.2.1.3.2) is a *hint*, and
   this server takes it literally. Advertising `LAN` (0x06) makes it send `TILE_FIRST` at

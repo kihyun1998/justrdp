@@ -32,6 +32,25 @@
   Promoted to
   [`oracle-agreement-is-not-independence`](../map/invariant/oracle-agreement-is-not-independence.md)
   as a third violation shape.
+- **Amendment (2026-08-18, #169): two more divergences, both in the first pass, and neither
+  one the oracle could be patched out of.** Slice 3 measured a **sixth** and **seventh**:
+  (6) the oracle captures the DAS sign array *after* dequantization
+  (`progressive.rs:84`) where FreeRDP captures it off the raw entropy output
+  (`progressive.c:876`) — measured over the corpus, the two capture points disagree on **8369
+  of 8829** real components, because the LL3 delta reconstruction runs between them, and the
+  error is permanent rather than per-frame because the sign array routes every later
+  refinement of that coefficient; (7) the oracle's `dwt_extrapolate` narrows every lifting tap
+  with `value as i16` where FreeRDP saturates (`clampi16`), so on an overflowing tap the two
+  differ by a full `u16`.
+  Two things follow for this record. First, the count is now seven, spread across the parse,
+  the entropy layer, the first pass and the transform — the oracle is not defective at a point
+  but at every layer of this codec, which is what makes "fix it upstream" (rejected
+  alternative B) unavailable rather than merely unattractive. Second, and more useful: **one
+  oracle primitive survived and is still in use.** `dwt_extrapolate` is a self-contained
+  transform with no stream state, and it agrees coefficient-for-coefficient wherever the
+  narrowing seam is unreachable, which is what makes it a usable ADR-0007 stage-boundary
+  cross-check. Retirement stays *per codec and per stage*, on evidence — that is the Decision
+  working, not an exception to it.
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
 
