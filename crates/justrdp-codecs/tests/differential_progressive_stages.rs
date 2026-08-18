@@ -84,9 +84,15 @@ fn in_range_cases() -> Vec<(&'static str, Vec<i16>)> {
 /// arithmetic. Mutating a single tap, the `/ 2` rounding, a band offset or a tail arm is
 /// invisible to them and immediately visible here.
 ///
-/// **Validity condition**: this proves the two agree *given* that no tap overflows on these
-/// inputs. It is asserted rather than assumed — a saturating result would mean the case set
-/// drifted into the seam and the agreement below stopped meaning what it claims.
+/// **Validity condition, and its exact limit.** The guard below asserts that no *output*
+/// landed on a saturation bound. That is not the same as "no tap overflowed": the horizontal
+/// pass writes into scratch the guard never inspects, and a value saturated at level 3 is
+/// consumed as level 2's lowpass, where `x0 = clamp16(low - h0)` moves it back off the bound.
+/// A spectrum with saturating intermediates and no saturated outputs exists, and on one of
+/// those this test would still go red — but it would report a "first divergence at
+/// coefficient N", i.e. diagnose a seam case as a structural bug. The amplitudes here are
+/// small enough that the measured intermediate-saturation count is zero, so the guard is
+/// sound for this case set; it is a tripwire on the case set, not a proof about the inputs.
 #[test]
 fn the_reduce_extrapolate_inverse_dwt_matches_the_oracle_primitive_in_range() {
     for (name, input) in in_range_cases() {

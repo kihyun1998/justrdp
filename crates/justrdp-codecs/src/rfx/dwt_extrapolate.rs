@@ -28,12 +28,19 @@
 //! # The band-count branch, and why one of FreeRDP's three tail arms is unreachable
 //!
 //! FreeRDP's line tail has three arms, selected by `nLowCount` against `nHighCount`. Only two
-//! can be reached, and the derivation is short: `low = (n + 2) / 2` and `high = n - low`, so
-//! for even `n`, `low = high + 2`, and for odd `n`, `low = high + 1`. `low <= high` is
-//! therefore false for every `n >= 2`, and the three levels this decoder runs are `n = 64`
-//! (even), `n = 33` and `n = 17` (odd). The unreachable arm is omitted rather than
-//! transcribed-and-never-exercised; a test pins the derivation so a future level count cannot
-//! silently need it.
+//! are reachable at the three levels this decoder runs, and the derivation is short:
+//! `low = (n + 2) / 2` and `high = n - low`, so for even `n`, `low = high + 2`, and for odd
+//! `n`, `low = high + 1`. `low <= high` is therefore false for every `n >= 2`, and the levels
+//! are `n = 64` (even), `n = 33` and `n = 17` (odd). The unreachable arm is omitted rather
+//! than transcribed-and-never-exercised.
+//!
+//! **The derivation is about the formula above, not about FreeRDP's.** FreeRDP parameterizes
+//! the same split through `progressive_rfx_get_band_l_count` / `_h_count`
+//! (`progressive.c:744-755`), which agree with `(n + 2) / 2` at every level it runs but
+//! **diverge at level 7**: `L = (64 >> 7) + 1 = 1` and `H = (64 + 64) >> 7 = 1`, so `low <= high`
+//! and the omitted arm *would* be reachable. Nothing runs level 7 — a 64-sample tile has three
+//! — so the claim holds where it is used; it would stop holding if a deeper transform were
+//! added using FreeRDP's band-count formulas rather than these.
 
 use super::quant::{BANDS_EXTRAPOLATE, COMPONENT_LEN};
 
@@ -135,6 +142,10 @@ fn idwt_x(
     high_count: usize,
     dst_count: usize,
 ) {
+    debug_assert!(
+        high_count >= 1,
+        "a line with no highpass sample has no first tap"
+    );
     for line in 0..dst_count {
         let low = &low[line * low_step..];
         let high = &high[line * high_step..];
@@ -192,6 +203,10 @@ fn idwt_y(
     high_count: usize,
     dst_count: usize,
 ) {
+    debug_assert!(
+        high_count >= 1,
+        "a column with no highpass sample has no first tap"
+    );
     for column in 0..dst_count {
         let mut h0 = i32::from(high[column]);
         let mut x0 = clamp16(i32::from(low[column]) - h0);
@@ -229,9 +244,10 @@ fn idwt_y(
 mod tests {
     use super::*;
 
-    /// The derivation the module doc rests on: a reduce-extrapolate split never produces
-    /// `low <= high`, so FreeRDP's third tail arm cannot be reached at any level this decoder
-    /// runs — nor at any level a deeper transform could add.
+    /// The derivation the module doc rests on: **this module's** split never produces
+    /// `low <= high`, so the omitted tail arm cannot be reached at any level driven through
+    /// `low_count`/`high_count`. It is *not* a statement about FreeRDP's band-count formulas,
+    /// which give `L == H` at level 7 — see the module doc.
     #[test]
     fn the_line_split_never_reaches_freerdps_third_tail_arm() {
         for n in 2..=1024usize {

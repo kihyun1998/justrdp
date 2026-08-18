@@ -49,7 +49,7 @@
 //! # The layout hazard, and how slice 3 closed it
 //!
 //! This module walks `quant::BANDS_EXTRAPOLATE` and [`upgrade_component`] takes no flag to
-//! select another, because the upgrade path has none to select (`progressive.c:1281-1321`).
+//! select another, because the upgrade path has none to select (`progressive.c:1284-1324`).
 //! The *first-pass* decoder does branch (`:877`), so on a region without
 //! `RFX_DWT_REDUCE_EXTRAPOLATE` FreeRDP writes the first pass at one set of band offsets and
 //! applies refinements at another — plausible pixels, no error, the silent shape
@@ -74,7 +74,7 @@ use justrdp_pdu::rfx::progressive::ProgressiveQuant;
 // The extrapolate band layout an upgrade pass walks, in the order FreeRDP drives them:
 // `HL1 LH1 HH1 HL2 LH2 HH2 HL3 LH3 HH3` and finally `LL3`. **There is no non-extrapolate
 // variant here** — unlike the first-pass component decoder, which branches on it
-// (`progressive.c:876-921`), the upgrade path hardcodes this one layout (`:1281-1321`). The
+// (`progressive.c:876-921`), the upgrade path hardcodes this one layout (`:1284-1324`). The
 // table itself is `quant`'s, shared with the first-pass decoder and the inverse DWT so a
 // transposed band cannot be introduced by editing one copy of three (#169).
 use super::quant::{BANDS_EXTRAPOLATE as BANDS, COMPONENT_LEN};
