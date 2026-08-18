@@ -15,6 +15,7 @@
 
 pub mod dwt;
 pub mod dwt_extrapolate;
+pub mod progressive;
 pub mod quant;
 pub mod rlgr;
 pub mod srl;
