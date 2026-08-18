@@ -59,6 +59,7 @@ phase-2 rewrite (epic #158) *depends* on a reference comparison — the oracle i
   — surface allocation is `width × height × 4`.
 - [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
   — the Progressive quality ladder only appears if the client asks for a slow link.
+- [A later stage can hide an earlier defect](../invariant/a-later-stage-can-hide-an-earlier-defect.md)
 
 ## Blast radius
 

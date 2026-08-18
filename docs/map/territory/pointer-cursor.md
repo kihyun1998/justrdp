@@ -46,6 +46,7 @@ behaviour as a test rather than recording it as a citable fact.
   — this is the invariant's **first discovery site** (`decode_pointer`, #151).
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md)
 - [Oracle agreement is not independence](../invariant/oracle-agreement-is-not-independence.md)
+- [A later stage can hide an earlier defect](../invariant/a-later-stage-can-hide-an-earlier-defect.md)
 
 ## Blast radius
 

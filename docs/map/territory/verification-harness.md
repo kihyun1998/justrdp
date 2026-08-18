@@ -77,6 +77,7 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   — the class x64 CI structurally cannot observe.
 - [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
   — a corpus is evidence about a server *and* a client config, never the server alone.
+- [A later stage can hide an earlier defect](../invariant/a-later-stage-can-hide-an-earlier-defect.md)
 
 ## Blast radius
 

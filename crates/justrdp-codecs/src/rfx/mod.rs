@@ -14,6 +14,8 @@
 //! error, and 4:4:4 fixed 64×64 tiles are the only shape WTS1 carries.
 
 pub mod dwt;
+pub mod dwt_extrapolate;
+pub mod progressive;
 pub mod quant;
 pub mod rlgr;
 pub mod srl;

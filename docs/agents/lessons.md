@@ -102,6 +102,46 @@ Read this before starting so the bindings do not read as abstractions.
   two hypotheses. Restated as the weaker claim that survives. A pass that only ever
   confirms the author is not adversarial.
 
+- **#169 (Progressive slice 3) — the pass found three defects the author's own tests
+  were structurally unable to see, and broke six claims the change made about itself.**
+  Same two-lens stance split as #168, same unconditional trigger, and worth recording
+  separately because *what* it caught was a different class.
+
+  The three defects shared one root: **a tile's store has a history, and the history
+  was not modelled.** The layout guard read the current region's extrapolate flag
+  rather than the layout the store was written at — and region flags are
+  per-`WBT_REGION`, so a first pass in one region followed by an upgrade in another
+  slipped through exactly the silent mismatch the guard existed to refuse. A first
+  pass that failed at its second component left one component from this pass and two
+  from the last, which a later upgrade then refined and returned `Ok(())`. And nothing
+  anywhere asserted that an upgrade pass *changes* a coefficient: deleting the
+  refinement entirely left the whole corpus gate green.
+
+  The refuting lens then broke the claim that had **justified a decision**. The store's
+  key had been argued as a resource question — both keys decode the corpus, so the
+  difference was said to be memory. The evidence offered was a count of "non-black"
+  tiles, which cannot see a pixel change at all, because the colour step writes
+  `alpha = 255` unconditionally. Hashing the tiles showed the two keyings *paint
+  differently*, and the mechanism was measurable in the corpus: 1405 of 2943 first
+  passes carry `RFX_TILE_DIFFERENCE`, which adds to whatever store is held for that
+  grid position. It was a correctness question, and the test had asserted the opposite.
+
+  Two rules earned here. **A test's discriminating power has to be asserted in the same
+  run as the thing it asserts** — three of this slice's tests passed against wrong
+  implementations because a later stage (a clamp, a constant alpha, a private helper
+  standing in for its caller) destroyed the difference before the assertion saw it.
+  Promoted to [`a later stage can hide an earlier
+  defect`](../map/invariant/a-later-stage-can-hide-an-earlier-defect.md). And **check
+  that a mutation landed before believing it survived**: a "surviving" mutant in the
+  first sweep turned out to be a `replace(…, 1)` that hit a doc comment rather than the
+  code, and a timed-out sweep left a live mutation in the tree that the next sweep then
+  took as its baseline. A mutation harness needs the same trust gate as a test.
+
+  Also: **twelve FreeRDP line citations were off by 1–15 lines.** #168's whole lesson
+  was that a cited range can hold the algorithm and not its initial state; this slice
+  re-learned the cheaper half, that a range can simply be wrong. Grepping each cited
+  symbol for its line number cost minutes and is now the only way these are written.
+
 ## Step 6/7 — surfaces & gates
 
 - **The `fuzz` crate is the `--workspace` blind spot** — out of the workspace by

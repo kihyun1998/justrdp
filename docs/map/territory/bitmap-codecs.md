@@ -67,6 +67,41 @@ attacker-controlled bytes in the repo.
   is correct for every `num_bits ≤ 15` and silently desynchronises the shared SRL
   cursor above it. Exported as `rfx::srl::MAX_BIT_POS` so #169 inherits the derivation
   rather than the conclusion.
+- **Reduce-extrapolate is a second inverse DWT, not the classic one with different
+  offsets.** An `n`-sample line splits `low = (n + 2) / 2`, `high = n - low` rather
+  than in half, so 64 → 33/31, 33 → 17/16, 17 → 9/8. Three things change together:
+  every subband offset *and length* (not only `LL3`, which is the half the epic
+  originally recorded), the lifting tail (two shapes instead of a mirror), and the
+  narrowing — FreeRDP `clampi16` saturates where the classic `trunc16` deliberately
+  wraps, and the two differ by a full `u16` on an overflowing tap. Every region in
+  the real capture asks for it, so it is the live path and the classic transform is
+  the exotic one here.
+- **A tile's store has a history, and the history is state.** Progressive's
+  cross-pass store holds coefficients, signs and bit positions — and, less
+  obviously, *the band layout it was written at* and *whether it is completely
+  written*. Both were missing in #169's first revision and both produced silent
+  wrong pixels: region flags are per-`WBT_REGION`, so reading the current region's
+  extrapolate flag to judge a refinement answers a question about the wrong pass;
+  and a first pass that fails at its second component leaves one component from
+  this pass and two from the last, which a later upgrade refines with `Ok(())`.
+  The general form is the rule #168 already paid for — **state that describes a
+  buffer belongs with the buffer, not in whoever last touched it.**
+- **The DAS sign array is the *quantized* coefficient, captured off the raw entropy
+  output** (`progressive.c:876`) — before the LL3 delta and before the
+  dequantization shifts. The oracle captures it after both (`progressive.rs:84`),
+  and the two disagree on 8369 of 8829 real components, because the LL3 delta is a
+  prefix sum that runs between the two points. The error is permanent rather than
+  per-frame: the sign array routes every later refinement of that coefficient
+  between the SRL and raw streams.
+- **`RFX_TILE_DIFFERENCE` is an inter-frame delta against the persistent store, and
+  it is a different mechanism from the LL3 delta.** The LL3 reconstruction is
+  unconditional (`progressive.c:879`, `:921`); the flag selects
+  `buffer += current` (saturating, both operands written) over `current = buffer`
+  in the DWT entry (`:821-826`). Conflating them is easy — #169's own handover
+  notes did — and it decides what the tile store must be keyed by: 1405 of 2943
+  real first passes carry the flag, so a store keyed by anything other than the
+  surface grid position adds the difference to the wrong thing.
+
 - **A region's tiles are bounded by its declared `tileDataSize` window, and the
   `numTiles` count is not policed against it.** This is **laxer than both
   references**, not a copy of either: FreeRDP drives by the window and then rejects a
@@ -83,8 +118,10 @@ attacker-controlled bytes in the repo.
   `decode_plane`, `reconstruct`, `plane_sizes`, `NscHeader`, `NscError`
 - `justrdp-codecs/src/clearcodec.rs` — `Clear`, `ClearDecoder`, `ClearError`
 - `justrdp-codecs/src/rfx/` — `mod.rs` (`RemoteFx`, `RfxError`), `rlgr.rs`
-  (`decode`), `dwt.rs` (`decode`), `quant.rs` (`dequantize`, `ll3_delta_decode`),
-  `srl.rs` (`upgrade_component`, `SrlError`)
+  (`decode`), `dwt.rs` (`decode`), `dwt_extrapolate.rs` (`decode`), `quant.rs`
+  (`dequantize`, `ll3_delta_decode`, `BANDS_STANDARD`, `BANDS_EXTRAPOLATE`),
+  `srl.rs` (`upgrade_component`, `SrlError`), `progressive.rs` (`TileGrid`,
+  `TileState`, `Scratch`, `ProgressiveError`)
 - `justrdp-codecs/src/color.rs` — `to_rgba`, `rfx_ycbcr_to_rgba`, `bytes_per_pixel`,
   `Palette`
 - `justrdp-pdu/src/rfx.rs` — `RfxMessage`, `TileSet`, `Tile`, `Quant`, `RfxRect`,
@@ -111,6 +148,7 @@ as citations.
 - [Oracle agreement is not independence](../invariant/oracle-agreement-is-not-independence.md)
 - [The frame path carries no owned pixels](../invariant/frame-path-carries-no-owned-pixels.md)
 - [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
+- [A later stage can hide an earlier defect](../invariant/a-later-stage-can-hide-an-earlier-defect.md)
 
 ## Blast radius
 
@@ -130,10 +168,11 @@ as citations.
 - **Standalone NSCodec (surface bits / bitmap cache) is not built** — #150; today's
   NSCodec exists as the ClearCodec subcodec only.
 - **RemoteFX Progressive is not self-owned** — epic #158. Slice 1 (#167) landed the
-  wire parser above and slice 2 (#168) the upgrade-pass entropy layer (`rfx/srl.rs`);
-  the rest of the decode half (multi-pass tile state #169, context lifecycle #170,
-  real-VM proof #171) and the bootstrap drop (#172) are open, so `egfx.rs` still
-  delegates Progressive to `ironrdp-graphics`. #91 is the RLGR bit-reader performance
+  wire parser above, slice 2 (#168) the upgrade-pass entropy layer (`rfx/srl.rs`)
+  and slice 3 (#169) the multi-pass tile decode plus the reduce-extrapolate inverse
+  DWT (`rfx/progressive.rs`, `rfx/dwt_extrapolate.rs`); the context lifecycle
+  (#170), the assembly and real-VM proof (#171) and the bootstrap drop (#172) are
+  open, so `egfx.rs` still delegates Progressive to `ironrdp-graphics`. #91 is the RLGR bit-reader performance
   work. **Its verification basis is owned as of #194** — a real-server corpus plus
   FreeRDP-derived SRL expectations, not an oracle diff, because the oracle decodes 2 of
   52 real payloads (ADR-0011). The SRL half of that basis was **re-derived in #168**:
