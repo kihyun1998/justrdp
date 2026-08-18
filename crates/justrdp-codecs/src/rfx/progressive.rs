@@ -28,8 +28,9 @@
 //! instead, which is why `justrdp::egfx` carries a per-surface eviction workaround (#83) — it
 //! records that the self-owned decoder retires it, and this is that decoder.
 //!
-//! Context-id *lifecycle* (`RDPGFX_CMDID_DELETEENCODINGCONTEXT`, reset) is slice 4's (#170).
-//! What this slice fixes is only what the store is keyed by.
+//! The store's *lifecycle* — what creates a grid, what frees one, and what only looks as if it
+//! should — is [`SurfaceStore`] (#170), which also owns the per-payload block ordering
+//! ([`order_payload`]). What slice 3 fixed is only what the store is keyed by.
 //!
 //! # Two places the arithmetic can fail, and one place the references disagree
 //!
@@ -75,7 +76,7 @@ use std::collections::HashMap;
 
 use justrdp_pdu::rfx::TILE_DIM;
 use justrdp_pdu::rfx::progressive::{
-    FirstPassTile, ProgressiveQuant, ProgressiveRegion, QUALITY_FULL,
+    FirstPassTile, ProgressiveMessage, ProgressiveQuant, ProgressiveRegion, QUALITY_FULL,
     REGION_FLAG_DWT_REDUCE_EXTRAPOLATE, TILE_FLAG_DIFFERENCE, UpgradeTile,
 };
 
@@ -120,8 +121,17 @@ pub enum ProgressiveError {
     /// both, but [`ProgressiveRegion`]'s fields are `pub`, so the guarantee lives in the
     /// parser and not in the type — the same shape as #211.
     QuantIndexOutOfRange,
-    /// The tile's grid coordinates fall outside the surface
-    /// (`zIdx >= surface->tilesSize`, `progressive.c:473-477`).
+    /// The tile's grid coordinates fall outside the surface.
+    ///
+    /// **Checked per axis, where the reference checks the linear index.** FreeRDP's bound is
+    /// `zIdx >= surface->tilesSize` alone (`progressive.c:473-477`), so `(gridWidth + 5, 0)`
+    /// passes it and aliases onto `(5, 1)` — a silent write to the wrong tile. Ours refuses
+    /// that. It is also narrower in the other direction: FreeRDP's grid rounds *up to the next
+    /// multiple* (`gridWidth = (width + (64 - width % 64)) / 64`, `progressive.c:447`, so
+    /// 1280 -> 21 where `div_ceil` gives 20) and it 16-aligns the width before that
+    /// (`gdi/gfx.c:1284`), so its grid is at least as wide as ours for every surface and it
+    /// accepts a column we reject. Unreachable on the corpus, whose widest tile index is 19 on
+    /// a 1280-wide surface.
     TileOutsideSurface {
         /// Column index the tile claimed.
         x_idx: u16,
@@ -147,6 +157,12 @@ pub enum ProgressiveError {
     LayoutChangedBetweenPasses,
     /// The caller's output buffer is not [`TILE_RGBA_LEN`] bytes.
     OutputBufferSize(usize),
+    /// A payload carried two `RFX_PROGRESSIVE_FRAME_BEGIN` blocks. One of only two ordering
+    /// violations FreeRDP refuses to continue past (`-1008`, `progressive.c:1921-1925`).
+    DuplicateFrameBegin,
+    /// A payload carried `RFX_PROGRESSIVE_FRAME_BEGIN` after `RFX_PROGRESSIVE_FRAME_END`. The
+    /// other hard error (`progressive.c:1927-1932`).
+    FrameBeginAfterFrameEnd,
 }
 
 impl core::fmt::Display for ProgressiveError {
@@ -190,6 +206,13 @@ impl core::fmt::Display for ProgressiveError {
                     "tile output buffer is {n} bytes, expected {TILE_RGBA_LEN}"
                 )
             }
+            ProgressiveError::DuplicateFrameBegin => {
+                write!(f, "duplicate RFX_PROGRESSIVE_FRAME_BEGIN in one payload")
+            }
+            ProgressiveError::FrameBeginAfterFrameEnd => write!(
+                f,
+                "RFX_PROGRESSIVE_FRAME_BEGIN after RFX_PROGRESSIVE_FRAME_END in one payload"
+            ),
         }
     }
 }
@@ -366,26 +389,24 @@ impl TileGrid {
     /// row or column is partial still has a tile for it (the corpus' 1280×800 surface is
     /// 20 × 13 tiles, and the bottom row covers only 32 of its 64 rows).
     pub fn new(width: u16, height: u16) -> Self {
+        let (grid_width, grid_height) = grid_size_for(width, height);
         Self {
-            grid_width: usize::from(width).div_ceil(usize::from(TILE_DIM)),
-            grid_height: usize::from(height).div_ceil(usize::from(TILE_DIM)),
+            grid_width,
+            grid_height,
             tiles: HashMap::new(),
         }
+    }
+
+    /// The grid's `(columns, rows)` — the stride a tile index is resolved against, and
+    /// therefore the thing that decides whether a resized surface may keep this store
+    /// ([`SurfaceStore::grid_mut`]).
+    pub fn grid_size(&self) -> (usize, usize) {
+        (self.grid_width, self.grid_height)
     }
 
     /// The number of tiles this surface currently holds cross-pass state for.
     pub fn painted_tiles(&self) -> usize {
         self.tiles.len()
-    }
-
-    /// Drop every tile's state — a channel reset, or the surface being deleted.
-    ///
-    /// **Not sufficient for a resize.** `grid_width`/`grid_height` are fixed at construction,
-    /// so a resized surface needs a new [`TileGrid`]; clearing this one would keep mapping
-    /// `(x_idx, y_idx)` through the old grid width and, on a surface that shrank, accept
-    /// coordinates now outside it. Owning that lifecycle is slice 4's (#170).
-    pub fn clear(&mut self) {
-        self.tiles.clear();
     }
 
     /// The cross-pass state of one tile, if a first pass has painted it.
@@ -792,6 +813,369 @@ fn dequantize_first_pass(component: &mut [i16], shift: &ProgressiveQuant, extrap
     }
 }
 
+/// An ordering rule the payload broke that FreeRDP **tolerates** — it logs and carries on.
+///
+/// Reported rather than logged because this crate has no logging dependency, and reported at
+/// all because the alternative is silence: the assembly layer (#171) turns these into the
+/// `WLog_WARN` FreeRDP emits, and a test can assert that a stream tripped exactly the row it
+/// was built to trip. The two violations FreeRDP does *not* tolerate are
+/// [`ProgressiveError::DuplicateFrameBegin`] and [`ProgressiveError::FrameBeginAfterFrameEnd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderAnomaly {
+    /// A second `RFX_PROGRESSIVE_SYNC` (`progressive.c:1879-1880`).
+    DuplicateSync,
+    /// A second `RFX_PROGRESSIVE_CONTEXT` (`progressive.c:2012-2013`).
+    DuplicateContext,
+    /// `RFX_PROGRESSIVE_CONTEXT` after `RFX_PROGRESSIVE_FRAME_BEGIN` (`progressive.c:2008`).
+    ContextAfterFrameBegin,
+    /// `RFX_PROGRESSIVE_CONTEXT` after `RFX_PROGRESSIVE_FRAME_END` (`progressive.c:2010`).
+    ContextAfterFrameEnd,
+    /// `RFX_PROGRESSIVE_FRAME_END` with no preceding `FRAME_BEGIN` (`progressive.c:1967`).
+    ///
+    /// Tolerated, but it still ends the frame: everything after it sees `FLAG_WBT_FRAME_END`,
+    /// so a later `FRAME_BEGIN` is fatal and a later region is skipped. A stray `FRAME_END`
+    /// therefore costs the rest of the payload even though the block itself is forgiven.
+    FrameEndWithoutFrameBegin,
+    /// A second `RFX_PROGRESSIVE_FRAME_END` (`progressive.c:1969-1970`).
+    DuplicateFrameEnd,
+    /// A region arrived before `FRAME_BEGIN`; **this region is skipped**, the payload
+    /// continues (`progressive.c:2146-2150`).
+    RegionBeforeFrameBegin,
+    /// A region arrived after `FRAME_END`; skipped the same way (`progressive.c:2151-2155`).
+    RegionAfterFrameEnd,
+}
+
+/// Which of one payload's regions survive the block-ordering rules, and what the payload broke
+/// getting there. Produced by [`order_payload`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadOrder<'m, 'a> {
+    /// The regions to decode into the surface's store, in wire order. Shorter than the
+    /// payload's region count exactly when a region was skipped — every skip has a matching
+    /// [`OrderAnomaly`].
+    ///
+    /// **Decoding these is not the same as presenting them.** FreeRDP clips a payload's whole
+    /// accumulated dirty set against one region's rects and blits that
+    /// (`update_tiles`, `progressive.c:2329-2352`) — it does not blit each region as it walks.
+    /// Where a payload carries more than one region, or [`Self::fatal`] is set, "decode these"
+    /// and "show these" diverge, and resolving that is the assembly layer's (#171).
+    pub regions: Vec<&'m ProgressiveRegion<'a>>,
+    /// Every tolerated rule violation, in the order the blocks tripped them. A payload may
+    /// trip several: FreeRDP's checks are independent `if`s, not an `else if` chain.
+    pub anomalies: Vec<OrderAnomaly>,
+    /// The ordering violation that ended the walk, if one did — always
+    /// [`ProgressiveError::DuplicateFrameBegin`] or
+    /// [`ProgressiveError::FrameBeginAfterFrameEnd`], the only two FreeRDP refuses to continue
+    /// past.
+    ///
+    /// **The regions before it still stand.** This is deliberately not an `Err`, because the
+    /// alternative contradicts this function's own rule for the skip rows — a stray region
+    /// must not cost the well-formed ones beside it, and neither may a late block. FreeRDP
+    /// decodes each region into the store as it walks (`progressive.c:2461-2467`) and its
+    /// `goto fail` skips only the blit, leaving `rc = 1`: the payload reports **success** and
+    /// the already-decoded tiles stay dirty for the next payload of the frame. So a caller
+    /// decodes [`Self::regions`] either way and withholds the *presentation* when this is set.
+    pub fatal: Option<ProgressiveError>,
+}
+
+/// Apply FreeRDP's block-ordering rules to **one** `WireToSurface2` payload's message list.
+///
+/// # This is per payload, and that is the whole design
+///
+/// FreeRDP keeps the rules in a bitmask (`WBT_STATE_FLAG`, `progressive.h:204-210`) that reads
+/// like decoder state — and `progressive_decompress` zeroes it at its top
+/// (`progressive.c:2463`), while `gdi_SurfaceCommand_Progressive` calls that function once per
+/// surface command (`gdi/gfx.c:1116`). So the mask never spans two payloads, and this is a
+/// pure function over one message list rather than a field on a decoder.
+///
+/// The distinction is not academic. Censused over the 52-payload corpus, **51 payloads are
+/// `FRAME_BEGIN REGION FRAME_END`** with no `SYNC` and no `CONTEXT` — the server sends the
+/// header blocks once per stream. Carried across payloads, payload 2's `FRAME_BEGIN` is a
+/// duplicate *and* follows payload 1's `FRAME_END`, so both hard errors fire: measured,
+/// per-stream state rejects **51 of 52** real payloads where per-payload state rejects none.
+/// [`crate::rfx::progressive`]'s corpus test asserts that number rather than describing it.
+///
+/// # Three outcomes, not two
+///
+/// FreeRDP's six conditions produce three different outcomes, so a single "validate the
+/// ordering" pass would be wrong on four of the six rows: two are fatal, two skip *one region*
+/// and continue, and the rest are logged and ignored. Neither `SYNC` nor `CONTEXT` is ever
+/// *required* — nothing anywhere reads `FLAG_WBT_SYNC` or `FLAG_WBT_CONTEXT` except its own
+/// duplicate check, which is the same tolerance the deliberate-divergence table records for
+/// `codecContextId` (#194).
+///
+/// # The one thing this drops, and why it is inert rather than harmless
+///
+/// `PROGRESSIVE_BLOCK_CONTEXT` *is* cross-payload state in FreeRDP — a decoder struct field
+/// (`progressive.h:220`) that `progressive->state = 0` does not touch, so on a payload with no
+/// `CONTEXT` block its `flags` are whatever the last one left. This function takes a message
+/// list and returns regions; those flags go nowhere. That is safe **only for as long as
+/// `RFX_SUBBAND_DIFFING` stays inert**: both consumers declare the parameter dead
+/// (`WINPR_ATTR_UNUSED BOOL subbandDiff`, `progressive.c:866` and `:1265`) and the sole live
+/// read of `context->flags` is a `WLog_WARN` (`:1436`). #168 settled the same point from the
+/// other direction. If a reference ever gives the flag an effect, this is the line that breaks.
+pub fn order_payload<'m, 'a>(messages: &'m [ProgressiveMessage<'a>]) -> PayloadOrder<'m, 'a> {
+    // FreeRDP's `WBT_STATE_FLAG` bits, as booleans — the mask buys nothing here, and the
+    // names are what the conditions below actually read.
+    let (mut sync, mut context, mut frame_begin, mut frame_end) = (false, false, false, false);
+    let mut order = PayloadOrder {
+        regions: Vec::new(),
+        anomalies: Vec::new(),
+        fatal: None,
+    };
+
+    for message in messages {
+        match message {
+            ProgressiveMessage::Sync => {
+                if sync {
+                    order.anomalies.push(OrderAnomaly::DuplicateSync);
+                }
+                sync = true;
+            }
+            ProgressiveMessage::Context { .. } => {
+                // Three independent checks, in FreeRDP's order — a block can trip all three.
+                if frame_begin {
+                    order.anomalies.push(OrderAnomaly::ContextAfterFrameBegin);
+                }
+                if frame_end {
+                    order.anomalies.push(OrderAnomaly::ContextAfterFrameEnd);
+                }
+                if context {
+                    order.anomalies.push(OrderAnomaly::DuplicateContext);
+                }
+                context = true;
+            }
+            ProgressiveMessage::FrameBegin { .. } => {
+                // The walk stops here, but what it already accepted is kept — see
+                // `PayloadOrder::fatal`.
+                if frame_begin {
+                    order.fatal = Some(ProgressiveError::DuplicateFrameBegin);
+                    break;
+                }
+                if frame_end {
+                    order.fatal = Some(ProgressiveError::FrameBeginAfterFrameEnd);
+                    break;
+                }
+                frame_begin = true;
+            }
+            ProgressiveMessage::FrameEnd => {
+                if !frame_begin {
+                    order
+                        .anomalies
+                        .push(OrderAnomaly::FrameEndWithoutFrameBegin);
+                }
+                if frame_end {
+                    order.anomalies.push(OrderAnomaly::DuplicateFrameEnd);
+                }
+                frame_end = true;
+            }
+            ProgressiveMessage::Region(region) => {
+                // The skip is per region, not per payload: a stray region must not cost the
+                // well-formed ones beside it.
+                if !frame_begin {
+                    order.anomalies.push(OrderAnomaly::RegionBeforeFrameBegin);
+                } else if frame_end {
+                    order.anomalies.push(OrderAnomaly::RegionAfterFrameEnd);
+                } else {
+                    order.regions.push(region);
+                }
+            }
+        }
+    }
+
+    order
+}
+
+/// Every live surface's Progressive tile store — the object whose lifecycle is issue #170.
+///
+/// # What frees a store, and what does not
+///
+/// Read off the reference rather than reasoned from the PDU names, because the two disagree:
+///
+/// | Event | Effect | Reference |
+/// |---|---|---|
+/// | first `WireToSurface2` for a surface | create, lazily | `progressive.c:543-563` |
+/// | `RDPGFX_CMDID_DELETESURFACE` | **free** — the only free path | `gdi/gfx.c:1366` |
+/// | `RDPGFX_CMDID_DELETEENCODINGCONTEXT` | **nothing** | `gdi/gfx.c:1239-1246` |
+/// | `RDPGFX_CMDID_RESETGRAPHICS` | **nothing** (surface *pixels* are wiped) | `progressive.c:2635` |
+/// | channel close | free everything | — |
+///
+/// **`DELETEENCODINGCONTEXT` frees nothing, but not because it names nothing.** The PDU
+/// carries a `surfaceId` beside the `codecContextId` (`[MS-RDPEGFX]` 2.2.2.13; our parser
+/// decodes both, `justrdp-pdu/src/egfx.rs:224-228`), so a surface-keyed store *could* honour
+/// it exactly. The reason to ignore it is tolerance, not inability: `[MS-RDPEGFX]` has no
+/// client-side processing rule compelling the free, FreeRDP's handler is a literal no-op
+/// (`WINPR_UNUSED` on both arguments), and a server that sends this and then a
+/// `RFX_TILE_DIFFERENCE` tile is decoded **correctly** by keeping the store and against
+/// zeroes by freeing it. Under ADR-0009 the tolerant branch wins. What that gives up is the
+/// server's only way to say "you may reclaim this", which leaves `DELETESURFACE` as the sole
+/// free path on a desktop surface that is never deleted.
+///
+/// The `codecContextId` is separately not an identity here: FreeRDP reads it once, warns when
+/// it is non-zero (`progressive.c:1999`) and never uses it again, and the corpus carries 24
+/// distinct ids over 52 payloads on **one** surface.
+///
+/// **`RESETGRAPHICS` not freeing needs its citation read to the end.** `gdi_ResetGraphics`
+/// runs to `gdi/gfx.c:170`, and after wiping the surfaces it calls `freerdp_client_codecs_reset`
+/// twice (`:156`, `:161`) — which reaches `progressive_context_reset`. That looks like a free
+/// and is not: the function is `return (progressive != nullptr);` (`progressive.c:2635`). The
+/// row is right because of the stub, so the stub is what it cites.
+///
+/// Keeping is also the weakly dominant choice on its own terms. The server's *encoder* holds
+/// reference frames across a reset, and `RFX_TILE_DIFFERENCE` — which 1405 of 2943 real first
+/// passes carry — adds against that shared reference; an encoder that *did* reset cannot send
+/// a difference tile at all, since a diff against zero is a plain first pass. So keeping is
+/// harmless when the server resets and necessary when it does not, while clearing is wrong in
+/// the second case. `[MS-RDPEGFX]` 2.2.2.14 is silent, so neither branch is spec-mandated.
+///
+/// # The live client still does the opposite, and a passing test pins it
+///
+/// `justrdp::egfx` today calls `Progressive::reset()` on `RESETGRAPHICS`
+/// (`justrdp/src/egfx.rs:319`) and really frees on `DELETEENCODINGCONTEXT` (`:484`), and
+/// `reset_graphics_clears_contexts_but_keeps_surfaces` (`:1206`) asserts the first. Both are
+/// **correct for the bootstrap oracle**, which keys by `codecContextId` with no cap — that is
+/// #83's fix, and under id keying an unfreed context is an unbounded leak. They stop being
+/// correct the moment the store is surface-keyed. Retiring those two call sites and that test
+/// belongs to the slice that swaps the decoder (#172); it is named here because a green test
+/// asserting the retired behaviour is the strongest possible "do not touch this", and nothing
+/// else in the tree says otherwise.
+///
+/// # What this table does *not* cover
+///
+/// FreeRDP's per-surface context holds a second sub-state with its own reset trigger:
+/// `frameId`, `numUpdatedTiles`, `updatedTileIndices` and a per-tile `dirty` flag
+/// (`progressive.h:190-201`), cleared not by any of the rows above but by the frame id
+/// changing (`progressive.c:2437-2441`). It decides *what gets blitted* — `update_tiles` walks
+/// every tile dirtied so far in the current frame, not just this payload's (`:2346`) — which
+/// is why FreeRDP persists decoded pixels per tile at all. [`TileGrid`] keeps coefficients and
+/// writes pixels into a caller's buffer, so it models none of this. Deferred-blit behaviour is
+/// therefore not merely unimplemented but unreachable from the current shape; it is the
+/// assembly layer's (#171), recorded here so that slice does not inherit a table that reads
+/// complete.
+///
+/// # The leak is closed by the key, not by a cap
+///
+/// #83 asked for a defensive cap on the live-context count, because an id-keyed map with no
+/// cap grows for the life of the session — on the corpus, 24 contexts in 75 seconds with no
+/// teardown, and 2940 live tile stores against 260. Keyed by surface there is nothing left to
+/// cap: the store holds one grid per live surface and `justrdp::egfx` already budgets those
+/// (`MAX_TOTAL_SURFACE_BYTES`). What that budget does *not* yet see is the grid's own cost —
+/// a `TileState` is 48 KiB per 16 KiB of RGBA — which is why [`SurfaceStore::live_surfaces`]
+/// and [`TileGrid::painted_tiles`] are observable; the accounting itself is #171's.
+///
+/// # What the corpus cannot say
+///
+/// It contains **no teardown at all** — no `DELETESURFACE`, no `DELETEENCODINGCONTEXT`, no
+/// reset. So every row above except "create, lazily" rests on FreeRDP alone, which under this
+/// repo's receive-path tie-breaker makes them hypotheses rather than measured behaviour
+/// (`docs/agents/theflow.md`). They are recorded here so the next capture can falsify them.
+#[derive(Debug, Default)]
+pub struct SurfaceStore {
+    grids: HashMap<u16, TileGrid>,
+}
+
+impl SurfaceStore {
+    /// A store holding no surfaces.
+    pub fn new() -> Self {
+        Self {
+            grids: HashMap::new(),
+        }
+    }
+
+    /// This surface's tile store, created on first use and **reused** afterwards — the reuse
+    /// is what carries a tile's coefficients from one payload to the next.
+    ///
+    /// A grid whose dimensions would no longer match `width`/`height` is **replaced** rather
+    /// than reused, and that is a deliberate divergence: FreeRDP's create is idempotent on the
+    /// surface id alone (`progressive.c:546-548`), so a surface recreated at a new size keeps
+    /// the old `gridWidth` and every `zIdx = yIdx * gridWidth + xIdx` silently addresses the
+    /// wrong tile.
+    ///
+    /// The comparison is on the **grid**, not on the pixel dimensions: a surface that shrinks
+    /// from 1280 to 1277 keeps a 20-column grid, so every tile index still means what it meant
+    /// and there is nothing to discard. Only the *width* can invalidate an index that way;
+    /// height is compared too, and deliberately — a grid that lost rows has tiles addressable
+    /// past its own end, and discarding is the safe direction on the axis that cannot alias.
+    ///
+    /// **This branch is currently unreachable through the client, and that is the point.**
+    /// `[MS-RDPEGFX]` has no surface-resize PDU and `justrdp::egfx` writes a surface's
+    /// dimensions once at `CREATESURFACE` (`justrdp/src/egfx.rs:354`), dropping the whole
+    /// surface through `remove_surface` when an id is reused — so the dims handed here always
+    /// match. That is a property of today's caller, not of this type, and it is exactly the
+    /// kind of caller-side guarantee that stops holding quietly. The check costs one
+    /// comparison; the failure it prevents is silent wrong pixels.
+    ///
+    /// It does **not** cover a `CREATESURFACE` that reuses an id at the *same* size: the
+    /// stride is unchanged, so a brand-new surface inherits the previous one's coefficients
+    /// while its RGBA starts zeroed. FreeRDP has the same hole. Closing it needs the caller to
+    /// call [`SurfaceStore::delete_surface`] on the replace path, which is #172's wiring.
+    pub fn grid_mut(&mut self, surface_id: u16, width: u16, height: u16) -> &mut TileGrid {
+        let wanted = grid_size_for(width, height);
+        if self
+            .grids
+            .get(&surface_id)
+            .is_some_and(|g| g.grid_size() != wanted)
+        {
+            self.grids.remove(&surface_id);
+        }
+        self.grids
+            .entry(surface_id)
+            .or_insert_with(|| TileGrid::new(width, height))
+    }
+
+    /// This surface's tile store, if one has been created — the read-only view, for callers
+    /// that must not create one by asking.
+    pub fn grid(&self, surface_id: u16) -> Option<&TileGrid> {
+        self.grids.get(&surface_id)
+    }
+
+    /// Free one surface's store: `RDPGFX_CMDID_DELETESURFACE`, or a `CREATESURFACE` that
+    /// replaces a live id. Freeing a surface that has no store is a no-op — a server may
+    /// delete a surface no `WireToSurface2` ever reached.
+    ///
+    /// Discarding a **painted** store is the desync this type's doc argues about, seen from
+    /// the inside: every later `RFX_TILE_DIFFERENCE` tile for that surface then adds against
+    /// zeroes, and [`TileGrid::decode_first`] reports `Ok` while doing it. Nothing here can
+    /// prevent that — the server asked — but a caller that wants it in a log can read
+    /// [`SurfaceStore::grid`] and [`TileGrid::painted_tiles`] before calling.
+    pub fn delete_surface(&mut self, surface_id: u16) {
+        self.grids.remove(&surface_id);
+    }
+
+    /// `RDPGFX_CMDID_DELETEENCODINGCONTEXT` — **deliberately frees nothing.**
+    ///
+    /// It exists as a method rather than as an absence so the decision is met at the call
+    /// site: FreeRDP's handler is a literal no-op (`WINPR_UNUSED` on both arguments,
+    /// `gdi/gfx.c:1239-1246`), and under surface keying a `codecContextId` names nothing this
+    /// store holds. See the type doc for why the id is not an identity on the real wire.
+    pub fn delete_context(&mut self, _codec_context_id: u32) {}
+
+    /// Free every surface's store — the EGFX channel closing, or the decoder being rebuilt.
+    ///
+    /// **Not** `RDPGFX_CMDID_RESETGRAPHICS`, which must leave the stores alone; see the type
+    /// doc for the desync that would cause, and for the call site that does the opposite today.
+    /// The same observability note as [`SurfaceStore::delete_surface`] applies, multiplied by
+    /// the number of live surfaces.
+    pub fn reset(&mut self) {
+        self.grids.clear();
+    }
+
+    /// How many surfaces currently hold a tile store. The observable #170's lifecycle tests
+    /// assert against, and the count #171 needs to charge tile state to the surface budget.
+    pub fn live_surfaces(&self) -> usize {
+        self.grids.len()
+    }
+}
+
+/// The tile grid a `width × height` surface addresses — rounded up, so a partial last row or
+/// column still has a tile. Shared by [`TileGrid::new`] and the staleness check in
+/// [`SurfaceStore::grid_mut`], which must agree by construction rather than by inspection.
+fn grid_size_for(width: u16, height: u16) -> (usize, usize) {
+    (
+        usize::from(width).div_ceil(usize::from(TILE_DIM)),
+        usize::from(height).div_ceil(usize::from(TILE_DIM)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,6 +1262,355 @@ mod tests {
             Scratch::new(),
             vec![0u8; TILE_RGBA_LEN],
         )
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Block ordering (#170). FreeRDP's `WBT_STATE_FLAG` mask, which `progressive_decompress`
+    // zeroes at its top (`progressive.c:2463`) — so these are **per-payload** rules.
+    // ---------------------------------------------------------------------------------------
+
+    fn frame_begin() -> ProgressiveMessage<'static> {
+        ProgressiveMessage::FrameBegin {
+            index: 0,
+            regions: 1,
+        }
+    }
+
+    fn context() -> ProgressiveMessage<'static> {
+        ProgressiveMessage::Context {
+            ctx_id: 0,
+            flags: 0,
+        }
+    }
+
+    fn any_region() -> ProgressiveMessage<'static> {
+        ProgressiveMessage::Region(extrapolate_region(6, Some(1)))
+    }
+
+    /// **51 of the corpus' 52 payloads are exactly this shape** — no `SYNC`, no `CONTEXT`,
+    /// because the server sends the header blocks once per *stream* and this is payload 2..52.
+    /// FreeRDP never checks for either block's presence; only for duplicates.
+    #[test]
+    fn a_payload_with_no_sync_and_no_context_is_the_ordinary_case() {
+        let msgs = vec![frame_begin(), any_region(), ProgressiveMessage::FrameEnd];
+        let order = order_payload(&msgs);
+        assert_eq!(order.fatal, None, "nothing here is fatal");
+        assert_eq!(order.regions.len(), 1, "the region must be decoded");
+        assert!(
+            order.anomalies.is_empty(),
+            "no rule is violated: {:?}",
+            order.anomalies
+        );
+    }
+
+    /// The remaining payload — the one that opens the stream.
+    #[test]
+    fn the_stream_opening_payload_carries_sync_and_context() {
+        let msgs = vec![
+            ProgressiveMessage::Sync,
+            context(),
+            frame_begin(),
+            any_region(),
+            ProgressiveMessage::FrameEnd,
+        ];
+        let order = order_payload(&msgs);
+        assert_eq!(order.regions.len(), 1);
+        assert!(order.anomalies.is_empty(), "{:?}", order.anomalies);
+    }
+
+    /// One of FreeRDP's two hard errors (`-1008`, `progressive.c:1921-1925`) — **and it does
+    /// not cost the regions already accepted.** FreeRDP decodes each region into the store as
+    /// it walks (`progressive.c:2461-2467`) and its `goto fail` skips only the blit, leaving
+    /// `rc = 1`; refusing the whole payload here would also contradict this module's own rule
+    /// for the skip rows, that one bad block must not cost the well-formed ones beside it.
+    #[test]
+    fn a_duplicate_frame_begin_ends_the_walk_without_discarding_what_it_accepted() {
+        let bare = vec![frame_begin(), frame_begin()];
+        assert_eq!(
+            order_payload(&bare).fatal,
+            Some(ProgressiveError::DuplicateFrameBegin)
+        );
+
+        let with_a_good_region = vec![frame_begin(), any_region(), frame_begin(), any_region()];
+        let order = order_payload(&with_a_good_region);
+        assert_eq!(
+            order.fatal,
+            Some(ProgressiveError::DuplicateFrameBegin),
+            "the walk still stops"
+        );
+        assert_eq!(
+            order.regions.len(),
+            1,
+            "the region before the fatal block survives; the one after it is never reached"
+        );
+    }
+
+    /// The other (`progressive.c:1927-1932`) — and it is reachable **only** through a stray
+    /// `FRAME_END`, because the duplicate check above it runs first. A well-formed
+    /// `FRAME_BEGIN … FRAME_END … FRAME_BEGIN` therefore reports the *duplicate*, which is the
+    /// order FreeRDP's two `if`s impose and worth pinning: the two errors are not
+    /// interchangeable diagnostics for one condition.
+    #[test]
+    fn a_frame_begin_after_a_frame_end_fails_the_payload() {
+        let stray_end = vec![ProgressiveMessage::FrameEnd, frame_begin()];
+        assert_eq!(
+            order_payload(&stray_end).fatal,
+            Some(ProgressiveError::FrameBeginAfterFrameEnd)
+        );
+
+        let reopened = vec![frame_begin(), ProgressiveMessage::FrameEnd, frame_begin()];
+        assert_eq!(
+            order_payload(&reopened).fatal,
+            Some(ProgressiveError::DuplicateFrameBegin),
+            "the duplicate check runs first, so this is not the after-end error"
+        );
+    }
+
+    /// A region outside a frame is **dropped, not fatal** — the third of FreeRDP's three
+    /// outcomes (`progressive_wb_skip_region`, `progressive.c:2146-2155`). The distinction is
+    /// the whole reason this is not a single "validate ordering" pass: a payload that carries
+    /// one bad region and one good one must still decode the good one.
+    #[test]
+    fn a_region_outside_a_frame_is_skipped_and_the_rest_of_the_payload_survives() {
+        let before = vec![
+            any_region(),
+            frame_begin(),
+            any_region(),
+            ProgressiveMessage::FrameEnd,
+        ];
+        let order = order_payload(&before);
+        assert_eq!(
+            order.regions.len(),
+            1,
+            "the in-frame region decodes, the stray one does not"
+        );
+        assert_eq!(order.anomalies, vec![OrderAnomaly::RegionBeforeFrameBegin]);
+
+        let after = vec![frame_begin(), ProgressiveMessage::FrameEnd, any_region()];
+        let order = order_payload(&after);
+        assert!(order.regions.is_empty());
+        assert_eq!(order.anomalies, vec![OrderAnomaly::RegionAfterFrameEnd]);
+    }
+
+    /// The tolerate-and-continue rows, each asserted with its *side condition*: the region
+    /// still decodes. A test that only checked the anomaly would pass against an
+    /// implementation that dropped the payload.
+    #[test]
+    fn the_tolerated_violations_are_reported_without_costing_the_region() {
+        let cases: Vec<(Vec<ProgressiveMessage<'_>>, OrderAnomaly)> = vec![
+            (
+                vec![
+                    ProgressiveMessage::Sync,
+                    ProgressiveMessage::Sync,
+                    frame_begin(),
+                    any_region(),
+                    ProgressiveMessage::FrameEnd,
+                ],
+                OrderAnomaly::DuplicateSync,
+            ),
+            (
+                vec![
+                    context(),
+                    context(),
+                    frame_begin(),
+                    any_region(),
+                    ProgressiveMessage::FrameEnd,
+                ],
+                OrderAnomaly::DuplicateContext,
+            ),
+            (
+                vec![
+                    frame_begin(),
+                    context(),
+                    any_region(),
+                    ProgressiveMessage::FrameEnd,
+                ],
+                OrderAnomaly::ContextAfterFrameBegin,
+            ),
+        ];
+        for (msgs, expected) in cases {
+            let order = order_payload(&msgs);
+            assert!(
+                order.anomalies.contains(&expected),
+                "expected {expected:?}, got {:?}",
+                order.anomalies
+            );
+            assert_eq!(
+                order.regions.len(),
+                1,
+                "{expected:?} must not cost the region"
+            );
+        }
+    }
+
+    /// **A stray `FRAME_END` is forgiven and still ends the frame.** FreeRDP warns and then
+    /// sets `FLAG_WBT_FRAME_END` anyway (`progressive.c:1967-1972`), so everything after it is
+    /// judged against a closed frame: a following region is skipped and a following
+    /// `FRAME_BEGIN` is fatal. The block is tolerated; the rest of the payload is not. This is
+    /// the row that makes "tolerated" and "harmless" different words.
+    #[test]
+    fn a_stray_frame_end_is_tolerated_and_still_closes_the_frame() {
+        let alone = vec![ProgressiveMessage::FrameEnd];
+        let order = order_payload(&alone);
+        assert_eq!(
+            order.anomalies,
+            vec![OrderAnomaly::FrameEndWithoutFrameBegin]
+        );
+        assert!(order.regions.is_empty());
+
+        let then_region = vec![ProgressiveMessage::FrameEnd, any_region()];
+        let order = order_payload(&then_region);
+        assert_eq!(
+            order.anomalies,
+            vec![
+                OrderAnomaly::FrameEndWithoutFrameBegin,
+                OrderAnomaly::RegionBeforeFrameBegin
+            ],
+            "skipped — and reported as before-begin, which is the check FreeRDP returns on first (`progressive.c:2146`), not as after-end"
+        );
+        assert!(order.regions.is_empty());
+    }
+
+    /// `CONTEXT` after `FRAME_END` warns on its own row (`progressive.c:2010`), and a payload
+    /// that trips several rows reports each — FreeRDP's checks are independent `if`s, not an
+    /// `else if` chain.
+    #[test]
+    fn a_payload_reports_every_rule_it_breaks() {
+        let msgs = vec![
+            frame_begin(),
+            ProgressiveMessage::FrameEnd,
+            context(),
+            ProgressiveMessage::FrameEnd,
+        ];
+        let order = order_payload(&msgs);
+        assert_eq!(
+            order.anomalies,
+            vec![
+                OrderAnomaly::ContextAfterFrameBegin,
+                OrderAnomaly::ContextAfterFrameEnd,
+                OrderAnomaly::DuplicateFrameEnd,
+            ]
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Surface-store lifecycle (#170).
+    // ---------------------------------------------------------------------------------------
+
+    /// Paint one tile into a surface's grid, so a later assertion can tell a *kept* store from
+    /// a freshly created empty one. `painted_tiles()` is the observable.
+    fn paint_one(store: &mut SurfaceStore, surface_id: u16, w: u16, h: u16) {
+        let mut scratch = Scratch::new();
+        let mut rgba = vec![0u8; TILE_RGBA_LEN];
+        let region = extrapolate_region(6, Some(1));
+        store
+            .grid_mut(surface_id, w, h)
+            .decode_first(
+                &first(MIXED_SIGNS, Some(0), 0),
+                &region,
+                &mut scratch,
+                &mut rgba,
+            )
+            .expect("a well-formed first pass");
+    }
+
+    /// FreeRDP creates a surface's store lazily and idempotently
+    /// (`progressive_create_surface_context`, `progressive.c:543-563`): the second call finds
+    /// the existing one and returns it **without resetting it**, which is what makes a tile's
+    /// cross-pass state survive from one payload to the next.
+    #[test]
+    fn a_surfaces_store_is_created_lazily_and_then_reused() {
+        let mut store = SurfaceStore::new();
+        assert_eq!(store.live_surfaces(), 0);
+        paint_one(&mut store, 7, 1280, 800);
+        assert_eq!(store.live_surfaces(), 1);
+        assert_eq!(store.grid_mut(7, 1280, 800).painted_tiles(), 1);
+        assert_eq!(
+            store.live_surfaces(),
+            1,
+            "reuse must not add a second store"
+        );
+    }
+
+    /// **`DELETEENCODINGCONTEXT` frees nothing.** FreeRDP's handler is a literal no-op —
+    /// `WINPR_UNUSED` on both arguments, `return CHANNEL_RC_OK` (`gdi/gfx.c:1239-1246`) — and
+    /// under surface keying there is nothing for a `codecContextId` to name. This is the
+    /// assertion that pins #83's semantics to their post-#169 shape.
+    #[test]
+    fn deleting_an_encoding_context_frees_nothing() {
+        let mut store = SurfaceStore::new();
+        paint_one(&mut store, 7, 1280, 800);
+        store.delete_context(1);
+        store.delete_context(24);
+        assert_eq!(store.live_surfaces(), 1, "the surface's store is untouched");
+        assert_eq!(
+            store.grid_mut(7, 1280, 800).painted_tiles(),
+            1,
+            "and so is every tile in it"
+        );
+    }
+
+    /// `DeleteSurface` is the only free path (`gdi/gfx.c:1366`).
+    #[test]
+    fn deleting_a_surface_frees_its_store_and_only_its_store() {
+        let mut store = SurfaceStore::new();
+        paint_one(&mut store, 7, 1280, 800);
+        paint_one(&mut store, 8, 1280, 800);
+        store.delete_surface(7);
+        assert_eq!(store.live_surfaces(), 1);
+        assert_eq!(store.grid_mut(8, 1280, 800).painted_tiles(), 1);
+        assert_eq!(
+            store.grid_mut(7, 1280, 800).painted_tiles(),
+            0,
+            "surface 7 comes back empty, not resurrected"
+        );
+    }
+
+    #[test]
+    fn deleting_a_surface_that_was_never_painted_is_a_no_op() {
+        let mut store = SurfaceStore::new();
+        store.delete_surface(9);
+        assert_eq!(store.live_surfaces(), 0);
+    }
+
+    #[test]
+    fn a_reset_frees_every_surface() {
+        let mut store = SurfaceStore::new();
+        paint_one(&mut store, 7, 1280, 800);
+        paint_one(&mut store, 8, 640, 480);
+        store.reset();
+        assert_eq!(store.live_surfaces(), 0);
+    }
+
+    /// **A grid whose stride would be wrong is replaced, not cleared** — the hole #169 handed
+    /// over. `TileGrid::clear()` keeps `grid_width`, so a surface that shrank would keep
+    /// mapping `(x_idx, y_idx)` through the old stride and accept coordinates now outside it.
+    /// FreeRDP does *not* do this: its create is idempotent on the id alone, so a recreated
+    /// surface keeps the old grid.
+    #[test]
+    fn a_surface_recreated_at_a_new_size_gets_a_new_grid_not_the_old_one() {
+        let mut store = SurfaceStore::new();
+        paint_one(&mut store, 7, 1280, 800);
+        assert_eq!(store.grid_mut(7, 1280, 800).grid_size(), (20, 13));
+
+        // Same id, smaller surface: the stride changes, so the store cannot be carried over.
+        let grid = store.grid_mut(7, 640, 480);
+        assert_eq!(grid.grid_size(), (10, 8));
+        assert_eq!(grid.painted_tiles(), 0, "the old stride's tiles are gone");
+        assert_eq!(store.live_surfaces(), 1, "and it is still one surface");
+    }
+
+    /// A dimension change too small to move the grid keeps the store — the comparison is on
+    /// the *stride*, which is what a tile index means, not on the pixel count.
+    #[test]
+    fn a_surface_resized_within_its_tile_grid_keeps_its_store() {
+        let mut store = SurfaceStore::new();
+        paint_one(&mut store, 7, 1280, 800);
+        assert_eq!(
+            store.grid_mut(7, 1277, 799).painted_tiles(),
+            1,
+            "20 x 13 either way, so every tile index still means what it meant"
+        );
     }
 
     /// **The sign store is the *quantized* coefficient, captured before the LL3 delta and the

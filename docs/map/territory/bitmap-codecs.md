@@ -102,6 +102,25 @@ attacker-controlled bytes in the repo.
   real first passes carry the flag, so a store keyed by anything other than the
   surface grid position adds the difference to the wrong thing.
 
+- **The block-ordering rules are per payload, and the mask that holds them is not decoder
+  state.** FreeRDP keeps them in `WBT_STATE_FLAG` (`progressive.h:204-210`), which reads like
+  decoder state and is zeroed at the top of every `progressive_decompress` call
+  (`progressive.c:2463`) — one call per surface command (`gdi/gfx.c:1116`). Scope is the whole
+  design here: per-payload makes ordering a pure function over one parsed message list,
+  per-stream makes it a field someone has to reset. Measured over the capture, the wrong
+  reading rejects **51 of 52** payloads, because 51 carry `FRAME_BEGIN` with no `SYNC` and no
+  `CONTEXT` and a carried mask sees each as a duplicate. Six conditions, **three** outcomes —
+  two fatal, two skip one region and continue, the rest logged — so a single "validate the
+  ordering" pass is wrong on four of the six rows (#170).
+- **The tile store's free paths are not the PDUs named after them.** `DELETEENCODINGCONTEXT`
+  frees nothing (FreeRDP's handler is a literal no-op, `gdi/gfx.c:1239-1246`) and
+  `RESETGRAPHICS` frees nothing (it reaches `progressive_context_reset`, which is a stub —
+  `progressive.c:2635`); `DELETESURFACE` is the only free (`gdi/gfx.c:1366`), and creation is
+  lazy and idempotent per surface (`progressive.c:543-563`). Keeping the store across a reset
+  is not merely FreeRDP-shaped: the server's *encoder* holds its reference frames across one,
+  and `RFX_TILE_DIFFERENCE` adds against that shared reference, so a client that cleared while
+  the server did not would decode every later difference tile against zeroes. An encoder that
+  *did* reset cannot send a difference tile at all, so keeping is weakly dominant (#170).
 - **A region's tiles are bounded by its declared `tileDataSize` window, and the
   `numTiles` count is not policed against it.** This is **laxer than both
   references**, not a copy of either: FreeRDP drives by the window and then rejects a
@@ -121,7 +140,8 @@ attacker-controlled bytes in the repo.
   (`decode`), `dwt.rs` (`decode`), `dwt_extrapolate.rs` (`decode`), `quant.rs`
   (`dequantize`, `ll3_delta_decode`, `BANDS_STANDARD`, `BANDS_EXTRAPOLATE`),
   `srl.rs` (`upgrade_component`, `SrlError`), `progressive.rs` (`TileGrid`,
-  `TileState`, `Scratch`, `ProgressiveError`)
+  `TileState`, `Scratch`, `ProgressiveError`, `SurfaceStore`, `order_payload`,
+  `PayloadOrder`, `OrderAnomaly`)
 - `justrdp-codecs/src/color.rs` — `to_rgba`, `rfx_ycbcr_to_rgba`, `bytes_per_pixel`,
   `Palette`
 - `justrdp-pdu/src/rfx.rs` — `RfxMessage`, `TileSet`, `Tile`, `Quant`, `RfxRect`,
@@ -170,9 +190,19 @@ as citations.
 - **RemoteFX Progressive is not self-owned** — epic #158. Slice 1 (#167) landed the
   wire parser above, slice 2 (#168) the upgrade-pass entropy layer (`rfx/srl.rs`)
   and slice 3 (#169) the multi-pass tile decode plus the reduce-extrapolate inverse
-  DWT (`rfx/progressive.rs`, `rfx/dwt_extrapolate.rs`); the context lifecycle
-  (#170), the assembly and real-VM proof (#171) and the bootstrap drop (#172) are
-  open, so `egfx.rs` still delegates Progressive to `ironrdp-graphics`. #91 is the RLGR bit-reader performance
+  DWT (`rfx/progressive.rs`, `rfx/dwt_extrapolate.rs`) and slice 4 (#170) the store's
+  lifecycle plus the per-payload block ordering (`SurfaceStore`, `order_payload`); the
+  assembly and real-VM proof (#171) and the bootstrap drop (#172) are open, so `egfx.rs`
+  still delegates Progressive to `ironrdp-graphics`. **Two consequences of that ordering are
+  live right now:** nothing composes `order_payload` with `SurfaceStore` and the tile decode
+  outside the corpus test, and `justrdp::egfx` still frees on `RESETGRAPHICS`
+  (`justrdp/src/egfx.rs:319`) and on `DELETEENCODINGCONTEXT` (`:484`) — correct for the
+  id-keyed bootstrap oracle (#83), wrong once the surface-keyed store is wired, and pinned by
+  a passing test (`:1206`) that #172 has to retire. FreeRDP also carries **per-surface,
+  per-frame blit state** — `frameId`, `numUpdatedTiles`, `updatedTileIndices`, a per-tile
+  `dirty` flag (`progressive.h:190-201`), reset by the frame id changing
+  (`progressive.c:2437-2441`) and driving a deferred re-blit of the whole frame's dirty set
+  (`:2346`) — which `TileGrid` models not at all; that is #171's. #91 is the RLGR bit-reader performance
   work. **Its verification basis is owned as of #194** — a real-server corpus plus
   FreeRDP-derived SRL expectations, not an oracle diff, because the oracle decodes 2 of
   52 real payloads (ADR-0011). The SRL half of that basis was **re-derived in #168**:

@@ -21,6 +21,15 @@
 //!   pass's positions, and the discard-on-error path.
 //! - **The passes may target different tiles.** A grid with more than one live tile is what
 //!   separates "the store works" from "the store is indexed correctly".
+//!
+//! **`SurfaceStore` and `order_payload` (#170) are deliberately outside this target**, so the
+//! absence reads as a decision rather than an oversight. Neither can fail on arbitrary bytes:
+//! `order_payload` does no arithmetic and no indexing, and its `match` is exhaustive with no
+//! wildcard, so a new `ProgressiveMessage` variant breaks the build instead of falling
+//! through; `SurfaceStore` is a `HashMap` keyed by a `u16` the caller supplies, and the only
+//! arithmetic under it is `grid_size_for`, which is `u16 -> div_ceil(64) <= 1024` and is
+//! already covered by `TileGrid::new` below. What a fuzzer would add is coverage of the
+//! *composition*, and that composition does not exist until the assembly layer (#171).
 
 use libfuzzer_sys::arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;

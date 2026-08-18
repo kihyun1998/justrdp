@@ -80,8 +80,10 @@ phase-2 rewrite (epic #158) *depends* on a reference comparison — the oracle i
   bit-reader performance work alongside it. **A consequence that is easy to miss: an
   oracle bump is a *live-path* change for these two**, not only a test change — the
   0.8 → 0.9 move (#184/#186) shipped Devolutions/IronRDP#1395, which stops Progressive
-  requiring a `WBT_CONTEXT` block on every frame once a context exists. Recorded on
-  #170, whose self-owned lifecycle must reproduce that behaviour.
+  requiring a `WBT_CONTEXT` block on every frame once a context exists. #170's self-owned
+  lifecycle reproduces it and then some: `order_payload` never gates a region on a context
+  block at all, which is FreeRDP's rule and the one the real server needs (51 of its 52
+  payloads carry no `CONTEXT`).
 - H.264 / AVC420 / AVC444 (epic #21) is absent — no oracle exists for it either
   (ADR-0002's amendment says so explicitly).
 - Surface-to-surface and surface-to-cache commands are implemented against one

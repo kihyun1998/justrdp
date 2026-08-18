@@ -29,7 +29,8 @@
 use std::collections::HashMap;
 
 use justrdp_codecs::rfx::progressive::{
-    ProgressiveError, Scratch, TILE_RGBA_LEN, TileGrid, TileState,
+    OrderAnomaly, ProgressiveError, Scratch, SurfaceStore, TILE_RGBA_LEN, TileGrid, TileState,
+    order_payload,
 };
 use justrdp_pdu::rfx::progressive::{
     self, ProgressiveMessage, ProgressiveQuant, ProgressiveRegion, ProgressiveTile, QUALITY_FULL,
@@ -54,6 +55,11 @@ fn prog_bands(region: &ProgressiveRegion<'_>, quality: Option<u8>) -> [u8; 10] {
             .map_or([0; 10], |e| bands_of(&e.y)),
     }
 }
+
+/// The surface id the corpus is replayed against. The capture is a single surface and the
+/// replay format does not carry its id, so any constant serves — what matters is that every
+/// payload uses the *same* one, which is the whole content of "keyed by surface".
+const CORPUS_SURFACE_ID: u16 = 0;
 
 /// One captured `WireToSurface2` payload with the codec context and surface dimensions it was
 /// decoded against.
@@ -134,25 +140,33 @@ fn replay(entries: &[Entry], per_context: bool) -> Replay {
         pixel_hash: 0xcbf2_9ce4_8422_2325,
         ..Replay::default()
     };
-    let mut grids: HashMap<u32, TileGrid> = HashMap::new();
+    // The surface-keyed side is driven through the real `SurfaceStore` (#170) rather than a
+    // second copy of its lookup, so the two cannot drift. The context-keyed side stays a bare
+    // map on purpose: it is the counterfactual this file exists to price, and `SurfaceStore`
+    // deliberately cannot express it.
+    let mut store = SurfaceStore::new();
+    let mut context_grids: HashMap<u32, TileGrid> = HashMap::new();
     let mut scratch = Scratch::new();
     let mut rgba = vec![0u8; TILE_RGBA_LEN];
 
     for entry in entries {
-        let key = if per_context {
-            entry.codec_context_id
+        let grid = if per_context {
+            context_grids
+                .entry(entry.codec_context_id)
+                .or_insert_with(|| TileGrid::new(entry.width, entry.height))
         } else {
-            0
+            store.grid_mut(CORPUS_SURFACE_ID, entry.width, entry.height)
         };
-        let grid = grids
-            .entry(key)
-            .or_insert_with(|| TileGrid::new(entry.width, entry.height));
 
         let messages = progressive::decode_all(&entry.data).expect("corpus payload must parse");
-        for message in &messages {
-            let ProgressiveMessage::Region(region) = message else {
-                continue;
-            };
+        // Through the block-ordering machine, not around it — otherwise nothing in the repo
+        // composes `order_payload` with the decode it gates (#170).
+        let order = order_payload(&messages);
+        assert!(
+            order.fatal.is_none(),
+            "no real payload is fatally mis-ordered"
+        );
+        for region in order.regions {
             for tile in &region.tiles {
                 let result = match tile {
                     ProgressiveTile::Simple(t) | ProgressiveTile::First(t) => {
@@ -241,7 +255,13 @@ fn replay(entries: &[Entry], per_context: bool) -> Replay {
             }
         }
     }
-    out.painted_tiles = grids.values().map(TileGrid::painted_tiles).sum();
+    out.painted_tiles = if per_context {
+        context_grids.values().map(TileGrid::painted_tiles).sum()
+    } else {
+        store
+            .grid(CORPUS_SURFACE_ID)
+            .map_or(0, TileGrid::painted_tiles)
+    };
     out
 }
 
@@ -643,4 +663,158 @@ fn the_replay_is_deterministic() {
     assert_eq!(a.non_black_tiles, b.non_black_tiles);
     assert_eq!(a.first_passes, b.first_passes);
     assert_eq!(a.upgrade_passes, b.upgrade_passes);
+}
+
+// -------------------------------------------------------------------------------------------
+// Block ordering over the real capture (#170).
+// -------------------------------------------------------------------------------------------
+
+/// **The census that decides whether the ordering rules are per payload or per stream.**
+///
+/// Every payload the real server sent, run through [`order_payload`]. Two things are asserted,
+/// and the second is what gives the first any weight:
+///
+/// 1. all 52 payloads order cleanly — every region survives, no rule is broken;
+/// 2. the *same* messages, judged as one continuous stream, are **rejected** — which is the
+///    counterfactual for the reading #170 and #167 were written against.
+///
+/// 51 of the 52 payloads are `FRAME_BEGIN REGION FRAME_END` with no `SYNC` and no `CONTEXT`,
+/// because the server sends the header blocks once per stream. Carried across payloads, the
+/// second `FRAME_BEGIN` is a duplicate and every later one follows a `FRAME_END` — so a
+/// per-stream mask rejects the whole session after payload 0. FreeRDP zeroes its mask at the
+/// top of `progressive_decompress` (`progressive.c:2463`), which `gdi_SurfaceCommand_Progressive`
+/// calls once per surface command (`gdi/gfx.c:1116`); this test is that fact, measured on our
+/// own parser against real bytes rather than read off theirs.
+#[test]
+fn every_real_payload_orders_cleanly_and_the_same_bytes_as_one_stream_do_not() {
+    let entries = load_replay();
+    assert_eq!(entries.len(), 52, "the committed corpus is 52 payloads");
+
+    let mut sequences: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut regions = 0usize;
+    let mut anomalies: Vec<OrderAnomaly> = Vec::new();
+
+    for entry in &entries {
+        let messages = progressive::decode_all(&entry.data).expect("the corpus parses (#167)");
+
+        let shape: Vec<&str> = messages
+            .iter()
+            .map(|m| match m {
+                ProgressiveMessage::Sync => "SYNC",
+                ProgressiveMessage::Context { .. } => "CONTEXT",
+                ProgressiveMessage::FrameBegin { .. } => "FRAME_BEGIN",
+                ProgressiveMessage::FrameEnd => "FRAME_END",
+                ProgressiveMessage::Region(_) => "REGION",
+            })
+            .collect();
+        *sequences.entry(shape.join(" ")).or_default() += 1;
+
+        let order = order_payload(&messages);
+        assert!(
+            order.fatal.is_none(),
+            "a real payload is never fatally mis-ordered"
+        );
+        regions += order.regions.len();
+        anomalies.extend(order.anomalies);
+    }
+
+    assert_eq!(
+        sequences.get("FRAME_BEGIN REGION FRAME_END").copied(),
+        Some(51),
+        "the ordinary payload carries neither header block: {sequences:?}"
+    );
+    assert_eq!(
+        sequences
+            .get("SYNC CONTEXT FRAME_BEGIN REGION FRAME_END")
+            .copied(),
+        Some(1),
+        "exactly one payload opens the stream: {sequences:?}"
+    );
+    assert_eq!(regions, 52, "no region may be skipped");
+    assert!(
+        anomalies.is_empty(),
+        "the real server breaks no ordering rule: {anomalies:?}"
+    );
+
+    // The counterfactual. Concatenating the payloads *is* the per-stream reading — one mask
+    // over every block the session sent — and it is fatal on the second payload.
+    let all: Vec<Vec<u8>> = entries.iter().map(|e| e.data.clone()).collect();
+    let mut stream = Vec::new();
+    for data in &all {
+        stream.extend(progressive::decode_all(data).expect("parses"));
+    }
+    let one_stream = order_payload(&stream);
+    assert_eq!(
+        one_stream.fatal,
+        Some(ProgressiveError::DuplicateFrameBegin),
+        "read as one stream, the session dies at payload 1 — which is why the mask is per payload"
+    );
+    assert_eq!(
+        one_stream.regions.len(),
+        1,
+        "and it dies having accepted exactly payload 0's region"
+    );
+}
+
+/// The lifecycle this slice owns, driven by the corpus rather than by hand-built messages.
+///
+/// The capture contains **no teardown of any kind** — no `DELETESURFACE`, no
+/// `DELETEENCODINGCONTEXT`, no reset — so what it can prove is the *accumulation* side: one
+/// surface, 24 distinct `codecContextId`s, and a store that stays at exactly one grid. That is
+/// #83's leak in the form it actually takes, and the form in which the surface key closes it.
+#[test]
+fn the_whole_session_lives_in_one_surface_store_across_twenty_four_context_ids() {
+    let entries = load_replay();
+    let context_ids: std::collections::BTreeSet<u32> =
+        entries.iter().map(|e| e.codec_context_id).collect();
+    assert_eq!(
+        context_ids.len(),
+        24,
+        "the server rotates the context id per refinement group"
+    );
+
+    let mut store = SurfaceStore::new();
+    let mut scratch = Scratch::new();
+    let mut rgba = vec![0u8; TILE_RGBA_LEN];
+    for entry in &entries {
+        // What the assembly layer (#171) will do per payload: reach for the surface's grid,
+        // never for the context id's — and actually decode into it, because a store that is
+        // never painted cannot tell a kept one from a cleared one.
+        let messages = progressive::decode_all(&entry.data).expect("parses");
+        let grid = store.grid_mut(CORPUS_SURFACE_ID, entry.width, entry.height);
+        for region in order_payload(&messages).regions {
+            for tile in &region.tiles {
+                let _ = match tile {
+                    ProgressiveTile::Simple(t) | ProgressiveTile::First(t) => {
+                        grid.decode_first(t, region, &mut scratch, &mut rgba)
+                    }
+                    ProgressiveTile::Upgrade(t) => {
+                        grid.decode_upgrade(t, region, &mut scratch, &mut rgba)
+                    }
+                };
+            }
+        }
+        // The server rotates the context id per refinement group; each rotation is a chance
+        // for a store keyed by it to start from zeroes. This must cost nothing.
+        store.delete_context(entry.codec_context_id);
+    }
+    assert_eq!(
+        store.live_surfaces(),
+        1,
+        "24 context ids, one surface, one store — and DELETEENCODINGCONTEXT freed none of it"
+    );
+    assert_eq!(
+        store.grid(CORPUS_SURFACE_ID).map(TileGrid::painted_tiles),
+        Some(260),
+        "every tile of the 20 x 13 grid survived all 52 delete_context calls"
+    );
+
+    store.delete_surface(CORPUS_SURFACE_ID);
+    assert_eq!(store.live_surfaces(), 0, "DeleteSurface is the free path");
+    assert_eq!(
+        store.grid(CORPUS_SURFACE_ID).map(TileGrid::painted_tiles),
+        None,
+        "and it takes every painted tile with it"
+    );
 }
