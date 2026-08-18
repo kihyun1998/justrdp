@@ -46,17 +46,19 @@
 //!   consumes **nothing** for `n >= 32` (`bitstream.h`). Unreachable here: the only call passes
 //!   `k <= 10`.
 //!
-//! # A hazard this module cannot close, for slice 3 (#169)
+//! # The layout hazard, and how slice 3 closed it
 //!
-//! [`BANDS`] is the extrapolate layout and [`upgrade_component`] takes no flag to select
-//! another, because the upgrade path has none to select (`progressive.c:1281-1321`). The
-//! *first-pass* decoder does branch (`:877`), so a region without
-//! `RFX_DWT_REDUCE_EXTRAPOLATE` gets its first pass written at one set of band offsets and its
-//! refinements applied at another — plausible pixels, no error, which is the silent shape
-//! `docs/map/territory/bitmap-codecs.md` records for #167. The capture cannot see it (52 of 52
-//! regions set the flag). Whichever way #169 resolves it — one layout for both halves, or a
-//! flag on this entry point and a refusal on mismatch — it is that slice's call, and doing
-//! neither is the outcome to avoid.
+//! This module walks `quant::BANDS_EXTRAPOLATE` and [`upgrade_component`] takes no flag to
+//! select another, because the upgrade path has none to select (`progressive.c:1281-1321`).
+//! The *first-pass* decoder does branch (`:877`), so on a region without
+//! `RFX_DWT_REDUCE_EXTRAPOLATE` FreeRDP writes the first pass at one set of band offsets and
+//! applies refinements at another — plausible pixels, no error, the silent shape
+//! `docs/map/territory/bitmap-codecs.md` records for #167. **#169 refuses that combination**
+//! rather than reproducing it: [`super::progressive`] rejects an upgrade tile on a
+//! non-extrapolate region, so this entry point is only ever reached for a layout that matches
+//! the one it walks. That refusal is stricter than FreeRDP on a receive path and carries a
+//! deliberate-divergence row; the capture cannot arbitrate it either way (52 of 52 regions set
+//! the flag).
 //!
 //! # What this module deliberately does not do
 //!
@@ -69,7 +71,13 @@
 
 use justrdp_pdu::rfx::progressive::ProgressiveQuant;
 
-use super::quant::COMPONENT_LEN;
+// The extrapolate band layout an upgrade pass walks, in the order FreeRDP drives them:
+// `HL1 LH1 HH1 HL2 LH2 HH2 HL3 LH3 HH3` and finally `LL3`. **There is no non-extrapolate
+// variant here** — unlike the first-pass component decoder, which branches on it
+// (`progressive.c:876-921`), the upgrade path hardcodes this one layout (`:1281-1321`). The
+// table itself is `quant`'s, shared with the first-pass decoder and the inverse DWT so a
+// transposed band cannot be introduced by editing one copy of three (#169).
+use super::quant::{BANDS_EXTRAPOLATE as BANDS, COMPONENT_LEN};
 
 /// Why an upgrade pass failed to decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,26 +188,6 @@ impl<'a> Bits<'a> {
         acc
     }
 }
-
-/// The extrapolate band layout an upgrade pass walks, as `(offset, length)` in the order
-/// FreeRDP drives them: `HL1 LH1 HH1 HL2 LH2 HH2 HL3 LH3 HH3` and finally `LL3`.
-///
-/// **There is no non-extrapolate variant here** — unlike the first-pass component decoder,
-/// which branches on it (`progressive.c:876-921`), the upgrade path hardcodes this one layout
-/// (`:1281-1321`). Consistent with the capture: all 52 payloads declare
-/// `RFX_DWT_REDUCE_EXTRAPOLATE` (#194).
-const BANDS: [(usize, usize); 10] = [
-    (0, 1023),
-    (1023, 1023),
-    (2046, 961),
-    (3007, 272),
-    (3279, 272),
-    (3551, 256),
-    (3807, 72),
-    (3879, 72),
-    (3951, 64),
-    (4015, 81),
-];
 
 /// The per-band nibbles of a [`ProgressiveQuant`] in [`BANDS`] order.
 fn band_values(q: &ProgressiveQuant) -> [u8; 10] {
@@ -724,16 +712,14 @@ mod tests {
         );
     }
 
-    /// The band table covers the component exactly once, with no gap and no overlap — the
-    /// property that makes the offsets above meaningful.
+    /// The band table this module walks is the *extrapolate* one, not the classic layout the
+    /// sibling WireToSurface1 decoder uses. Tiling is asserted where the tables live
+    /// (`quant::both_band_layouts_tile_the_component_exactly_once`); what belongs here is that
+    /// this module reads the right one of the two.
     #[test]
-    fn the_band_table_tiles_the_component_exactly() {
-        let mut next = 0usize;
-        for (offset, length) in BANDS {
-            assert_eq!(offset, next, "band table has a gap or an overlap");
-            next += length;
-        }
-        assert_eq!(next, COMPONENT_LEN);
+    fn the_upgrade_walk_uses_the_extrapolate_layout() {
+        assert_eq!(BANDS, super::super::quant::BANDS_EXTRAPOLATE);
+        assert_ne!(BANDS, super::super::quant::BANDS_STANDARD);
     }
 
     /// **Regression, #168 completeness pass.** [`ProgressiveQuant`]'s fields are `pub u8`, so a
