@@ -39,7 +39,7 @@ exists as data rather than as a test assertion.
 
 ## What a violation looks like
 
-Two shapes, and neither announces itself:
+Three shapes, and none of them announces itself:
 
 1. **A green oracle pass read as correctness.** Both implementations mishandle the
    same ambiguous field identically; the test is byte-identical and the picture is
@@ -50,8 +50,30 @@ Two shapes, and neither announces itself:
    that ClearCodec **corrects two bit-level defects in the oracle** which otherwise
    reject genuine Server 2022 streams — so this is not hypothetical here.
 
-The tell for both: the argument for a change is *"the oracle does X"* with no
-FreeRDP citation and no corpus fixture.
+3. **An owned basis that is derived too narrowly to be independent of anything.** The
+   subtlest shape, and the only one that survives *replacing* the oracle: hand-derived
+   expectations, written precisely because the oracle could not arbitrate, transcribe a
+   function without the initial state its caller sets — and so certify a decoder that is
+   correct symbol-by-symbol and wrong from the first symbol on. #168 is the worked
+   case: five of eight FreeRDP-derived SRL vectors were computed at `kp = 0`, where
+   FreeRDP's `progressive_rfx_upgrade_component` sets `kp = 8` — 110 lines outside the
+   range the vectors cited. Re-running them at `kp = 0` reproduced all eight claimed
+   values exactly, so the wrong initial state was the whole of the error.
+
+   **Whether the oracle *caused* it is not settled, and the shape does not need it to
+   be.** `kp = 0` is `ironrdp-graphics`'s initial value, so the basis may have adopted
+   the state of the thing it was replacing; but FreeRDP also declares its state
+   `WINPR_C_ARRAY_INIT` before assigning `kp`, so a reader who stops at the declaration
+   lands on 0 too. Both hypotheses predict the same 8-of-8 fit and nothing separates
+   them. Recorded here as the weaker, load-bearing claim rather than the stronger,
+   unfalsifiable one — a shape stated beyond its evidence is the next thing to be
+   walked past.
+
+The tell for the first two: the argument for a change is *"the oracle does X"* with no
+FreeRDP citation and no corpus fixture. The tell for the third is mechanical and needs
+no attribution at all — **a citation that spans fewer lines than the state it depends
+on**. Initial state is set by callers; a range that covers only the algorithm cannot
+show it.
 
 ## Discovery history
 
@@ -62,6 +84,14 @@ FreeRDP citation and no corpus fixture.
 - **#127** — ClearCodec divergences from FreeRDP adjudicated as **required
   tolerances**, backed by the `clearcodec_corpus` fixtures (memory
   `clearcodec_corpus_required_tolerances`). The oracle lost that argument.
+- **#194 → #168** — the third shape above, found one slice after the basis landed.
+  #194 built an owned basis precisely *because* the oracle could not arbitrate SRL, and
+  the basis was still derived at the wrong initial state. The lesson is not that #194
+  was careless: it is that "derived from FreeRDP" is a claim about a *range of lines*,
+  and the range that holds the algorithm is rarely the range that holds its initial
+  state. A second round of the same pass then found the mirror image — properties and a
+  fuzz target *generated inside* the guarantee they existed to be independent of, so
+  neither could reach the defects they were added for.
 - Memory `ironrdp_oracle_shares_lineage` records the lineage limit itself, naming
   ClearCodec and RemoteFX compositing as the weakest cases for DoD ④ independence.
 
@@ -104,3 +134,9 @@ Concretely:
 - When the tie-break lands *against* the oracle, record it as a deliberate
   divergence in [`docs/agents/theflow.md`](../../agents/theflow.md), or the next
   completeness pass proposes reverting it.
+- **When a hand-derived expectation is written, derive its initial state from the
+  reference's caller, not only from the function being transcribed** — and prove the
+  basis is independent without the oracle's help. `rfx::srl`'s bit-cursor unit tests
+  do that job for the SRL vectors: they pin bit order and end-of-stream behaviour with
+  no second implementation involved, which is what the vectors' old "positive controls"
+  only appeared to do.

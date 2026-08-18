@@ -60,6 +60,48 @@ Read this before starting so the bindings do not read as abstractions.
   own second half, and wrong from the day `progressive` landed.) —
   [`docs/map/invariant/untrusted-decode-never-panics.md`](../map/invariant/untrusted-decode-never-panics.md).
 
+- **The first incident, and it is about the pass declaring victory (#168).** A solo
+  completeness pass on the Progressive SRL decoder found two panics, fixed them, and
+  recorded convergence. A second pass — **two subagent lenses split by stance**, one
+  hunting gaps and one briefed to *refute* the first's claims, both reading both
+  corpora — refuted that convergence and found more than the first round had:
+  - **A wrong premise, not a wrong line.** The first round asserted `num_bits` and
+    `shift` were 4-bit nibbles bounded by 15 and sized two guards on it. A bit
+    position is `quant + prog_quant`, the *sum* of two nibbles, so the real range is
+    `0..=30`. One guard then truncated the SRL magnitude loop above 15, leaving the
+    shared bit cursor short — **plausible wrong coefficients with `Ok(())`**, which
+    the invariant ranks worse than a panic.
+  - **`checked_shl` checks the shift amount, never the value.** `2i64 << 63` is
+    `Some(0)`, so a real refinement was accepted as a no-op and the pass reported
+    success having applied nothing.
+  - **A mutant that passed the entire suite.** Resetting `kp`/`nz`/`mode` at every
+    band boundary while leaving both bit readers threaded changed 15,786 of 19,500
+    real corpus decodes and went green everywhere — because all nine value vectors
+    drove a single band, and the one multi-band test set every sign non-zero so the
+    SRL path was never entered. The property it broke was one the module names as
+    load-bearing.
+  - **Two generators built inside the guarantee they existed to test.** The first
+    round caught this shape in its proptest ("seeded, not zeroed") and reproduced it
+    in the very fuzz target and corpus gate it added in the same commit — both
+    zeroed the coefficient and sign arrays, which made two of three routing arms
+    unreachable and the divergence's own reachability claim unfalsifiable.
+
+  Three things this pins that the rules only asserted. **The second, refuting lens
+  earns its cost on an unconditional trigger** — the bindings say so and this is the
+  evidence. **Splitting by stance rather than by corpus is what made the findings
+  arrive adjudicated**: both lenses had read FreeRDP *and* the map, so each could say
+  which way a divergence went instead of handing it back cold. And **a lens report is
+  a candidate, not a finding** — reproducing each one locally is what narrowed the
+  reported "family" of four shift sites to exactly one (`planar` is bounded by its
+  mask, `nscodec` by parse-time validation), which is a different and more useful
+  issue than the one that would have been filed on the report alone (#211).
+
+  The refuting lens also **weakened a claim in the fix itself**: the docs had said the
+  owned basis inherited the *oracle's* initial `kp`, when FreeRDP's own
+  `WINPR_C_ARRAY_INIT` declaration predicts the same mistake and nothing separates the
+  two hypotheses. Restated as the weaker claim that survives. A pass that only ever
+  confirms the author is not adversarial.
+
 ## Step 6/7 — surfaces & gates
 
 - **The `fuzz` crate is the `--workspace` blind spot** — out of the workspace by

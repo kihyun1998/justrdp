@@ -46,6 +46,27 @@ attacker-controlled bytes in the repo.
   decoder yields plausible values with two bands transposed rather than an error
   (#167). What makes both silent is that the wrong reading still *parses*: `0xCCC2`
   routed to the WireToSurface1 walker decodes as a channel list.
+- **Progressive's upgrade entropy state starts at `kp = 8`, and that constant is not
+  where the algorithm is.** FreeRDP sets it in `progressive_rfx_upgrade_component`
+  (`progressive.c:1272`), the sole caller of the SRL reader — so a transcription that
+  reads only `progressive_rfx_srl_read` gets a decoder that is correct symbol-by-symbol
+  and desynchronised from the first symbol of every component, because `k = kp / 8` is
+  1 rather than 0 and the zero-encoding phase reads a run-length bit the other decoder
+  never reads. Both references make the mistake easy: `ironrdp-graphics` starts at 0
+  (`srl.rs:26`), and FreeRDP declares the state `WINPR_C_ARRAY_INIT` before assigning
+  `kp`, so stopping at the declaration also lands on 0. That is how it survived into
+  #194's owned basis and out again in #168 (see
+  [oracle agreement is not independence](../invariant/oracle-agreement-is-not-independence.md)).
+  This is the same silence as the block-namespace collision above: the wrong reading
+  still decodes.
+- **A band's `num_bits` and `shift` are not 4-bit nibbles — they reach 30 and 29.** A
+  bit position is `quant + prog_quant`, the *sum* of two nibbles; `num_bits` is the
+  difference of two such positions and `shift` is one minus one. Sizing anything on
+  "it's a nibble, so ≤ 15" is wrong in the direction that does not announce itself:
+  #168 capped the truncated-unary magnitude loop at `i16::MAX` on that premise, which
+  is correct for every `num_bits ≤ 15` and silently desynchronises the shared SRL
+  cursor above it. Exported as `rfx::srl::MAX_BIT_POS` so #169 inherits the derivation
+  rather than the conclusion.
 - **A region's tiles are bounded by its declared `tileDataSize` window, and the
   `numTiles` count is not policed against it.** This is **laxer than both
   references**, not a copy of either: FreeRDP drives by the window and then rejects a
@@ -62,7 +83,8 @@ attacker-controlled bytes in the repo.
   `decode_plane`, `reconstruct`, `plane_sizes`, `NscHeader`, `NscError`
 - `justrdp-codecs/src/clearcodec.rs` — `Clear`, `ClearDecoder`, `ClearError`
 - `justrdp-codecs/src/rfx/` — `mod.rs` (`RemoteFx`, `RfxError`), `rlgr.rs`
-  (`decode`), `dwt.rs` (`decode`), `quant.rs` (`dequantize`, `ll3_delta_decode`)
+  (`decode`), `dwt.rs` (`decode`), `quant.rs` (`dequantize`, `ll3_delta_decode`),
+  `srl.rs` (`upgrade_component`, `SrlError`)
 - `justrdp-codecs/src/color.rs` — `to_rgba`, `rfx_ycbcr_to_rgba`, `bytes_per_pixel`,
   `Palette`
 - `justrdp-pdu/src/rfx.rs` — `RfxMessage`, `TileSet`, `Tile`, `Quant`, `RfxRect`,
@@ -108,12 +130,19 @@ as citations.
 - **Standalone NSCodec (surface bits / bitmap cache) is not built** — #150; today's
   NSCodec exists as the ClearCodec subcodec only.
 - **RemoteFX Progressive is not self-owned** — epic #158. Slice 1 (#167) landed the
-  wire parser above; the decode half (SRL entropy #168, multi-pass tile state #169,
-  context lifecycle #170, real-VM proof #171) and the bootstrap drop (#172) are open,
-  so `egfx.rs` still delegates Progressive to `ironrdp-graphics`. #91 is the RLGR
-  bit-reader performance work. **Its verification basis is owned as of #194** — a
-  real-server corpus plus FreeRDP-derived SRL expectations, not an oracle diff, because
-  the oracle decodes 2 of 52 real payloads (ADR-0011).
+  wire parser above and slice 2 (#168) the upgrade-pass entropy layer (`rfx/srl.rs`);
+  the rest of the decode half (multi-pass tile state #169, context lifecycle #170,
+  real-VM proof #171) and the bootstrap drop (#172) are open, so `egfx.rs` still
+  delegates Progressive to `ironrdp-graphics`. #91 is the RLGR bit-reader performance
+  work. **Its verification basis is owned as of #194** — a real-server corpus plus
+  FreeRDP-derived SRL expectations, not an oracle diff, because the oracle decodes 2 of
+  52 real payloads (ADR-0011). The SRL half of that basis was **re-derived in #168**:
+  five of its eight vectors had been computed at the oracle's initial `kp`.
+- **The upgrade path's band walk has no non-extrapolate variant**, matching FreeRDP
+  (`progressive.c:1281-1322`) and the capture, where all 52 payloads set
+  `RFX_DWT_REDUCE_EXTRAPOLATE`. The first-pass decoder does branch on it, so #169 needs
+  both layouts where #168 needed one — and `quant.rs`'s `LL3_OFFSET` is the
+  **non**-extrapolate constant.
 - H.264 (epic #21) has neither an implementation nor an oracle.
 - The fuzz lane is nightly-only, so a newly added target is unguarded on the day it
   lands (ADR-0008).

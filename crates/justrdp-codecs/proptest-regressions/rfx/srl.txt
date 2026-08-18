@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d5f7cfa15f42d0029426d9b4d407f9d8394f0e596f0aeed8c23dff2be8af0e5b # shrinks to srl = [1], raw = [], shift_nibbles = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], width_nibbles = [32, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc ef023e3877deb2f57905b02d3840e9de9e00237433f987547a45e2386ccadad0 # shrinks to srl = [], raw = [128], shift_nibbles = [30, 0, 0, 0, 0, 0, 0, 0, 0, 0], width_nibbles = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0], seed = -1, sign_seed = 1
