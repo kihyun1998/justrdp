@@ -121,6 +121,11 @@ attacker-controlled bytes in the repo.
   and `RFX_TILE_DIFFERENCE` adds against that shared reference, so a client that cleared while
   the server did not would decode every later difference tile against zeroes. An encoder that
   *did* reset cannot send a difference tile at all, so keeping is weakly dominant (#170).
+  **The guard for that is the absence of a method, not a comment:** `SurfaceStore` offers only
+  `delete_surface(surface_id)`, and `RDPGFX_CMDID_RESETGRAPHICS` carries no surface id, so the
+  wrong call cannot be written. Clearing everything at once is already `close()`'s whole-object
+  replacement (`justrdp/src/egfx.rs:725`), which is safe precisely because it is *obviously* too
+  broad to reach for in a `RESETGRAPHICS` handler.
 - **A region's tiles are bounded by its declared `tileDataSize` window, and the
   `numTiles` count is not policed against it.** This is **laxer than both
   references**, not a copy of either: FreeRDP drives by the window and then rejects a
