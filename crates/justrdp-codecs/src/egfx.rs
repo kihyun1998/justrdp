@@ -5,6 +5,13 @@
 //! dependency (ADR-0003 phases 2–3). ClearCodec already crossed that line and moved out of this
 //! feature-gated module entirely — it now lives, self-owned and ungated, in
 //! [`crate::clearcodec`].
+//!
+//! **Progressive has crossed that line too, and this wrapper has not yet been retired.**
+//! [`crate::rfx::progressive::Progressive`] is the self-owned decoder (#171), gated on a
+//! real-server corpus rather than on the oracle (ADR-0011). The two do not agree about the
+//! picture: this one hands back whole 64 x 64 tiles for the caller to blit, the self-owned one
+//! clips each tile to its region's rects, which is a measured 57 386-pixel difference over one
+//! captured 1 280 x 800 session. #172 is the swap.
 
 use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::zgfx;

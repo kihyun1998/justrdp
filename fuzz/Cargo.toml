@@ -166,3 +166,10 @@ path = "fuzz_targets/progressive_multipass.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "progressive_assembly"
+path = "fuzz_targets/progressive_assembly.rs"
+test = false
+doc = false
+bench = false

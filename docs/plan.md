@@ -162,6 +162,24 @@ These cost real time to find. Bake them into the design from day one.
   one after the first a *duplicate* `FRAME_BEGIN` **and** a `FRAME_BEGIN` after `FRAME_END` —
   both hard errors. Measured: per-payload rejects 0 of 52, per-stream rejects 51. #167's
   handover and #170's own body both said per-stream; do not re-derive it from them.
+- **A Progressive region's rects clip its tiles, and that decides pixels — not just dirty
+  rects** (#171, measured 2026-08-19). This server's region rects are 64-tall bands one tile
+  row high but of arbitrary width (narrowest measured: 20 px), so a tile at a band's edge is
+  genuinely cut: **909 of 6193** corpus tiles are. Blitting whole tiles instead paints 6.10%
+  more pixels than the server declared damaged **and leaves 57 386 of a 1 280 x 800 surface's
+  1 024 000 pixels different** after the same 52 payloads. FreeRDP clips (`update_tiles`,
+  `progressive.c:2329-2412`); `ironrdp-graphics` does not clip at all, and neither did this
+  client's WTS2 arm before #171. The generalisation: *"the codec produced a tile" and "the
+  tile belongs on the screen" are different questions*, and only the payload answers the
+  second.
+- **One EGFX frame can carry more than one WireToSurface2 payload** (#171, probed live
+  2026-08-19): **4 of 65** frames did. This is the precondition for FreeRDP's deferred
+  re-blit (`frameId` / `updatedTileIndices`, `progressive.c:2437-2441`, `:2346`), so that
+  mechanism is *reachable* here rather than absent — the comfortable answer the probe was
+  expected to give. Replaying the same capture both ways, the carried-over dirty set
+  contributed **0 rectangles and 0 pixels**, so the omission is inert *as long as a frame's
+  successive regions do not overlap each other's tiles*. Recorded with its validity condition
+  rather than as "we checked and it was fine".
 - **HYBRID_EX early-auth PDU.** A HYBRID_EX server sends a 4-byte LE **Early User Authorization
   Result** PDU immediately after CredSSP, *before* MCS. If not consumed, capability exchange
   desyncs and hangs.
