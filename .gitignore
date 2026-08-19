@@ -1,3 +1,6 @@
 /target
 /fuzz/corpus/
 /fuzz/artifacts/
+# Byte-code from importing .github/scripts/*.py (the map gate's self-test runs the
+# script as a subprocess and makes none, but a measurement that imports it does).
+__pycache__/

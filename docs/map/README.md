@@ -137,11 +137,22 @@ Invariants: [decoder-dimension-overflow-32bit](invariant/decoder-dimension-overf
 [a-later-stage-can-hide-an-earlier-defect](invariant/a-later-stage-can-hide-an-earlier-defect.md)
 
 **The graph is gated.** `python .github/scripts/check_map.py` (CI: `test.yml` job
-`map`) checks that every link and `#anchor` resolves, that every symbol and path under
-`## Code` exists, that each note carries its full section set, and that every territory
-an invariant claims claims it back. Anchors are the half that fails *silently* — a
-missing one falls back to the top of the target document — and the reciprocity check
-found four one-way edges on its first run.
+`map`) checks that every link and `#anchor` resolves, that every path under `## Code`
+exists **and that each symbol exists in the file that bullet names**, that each note
+carries its full section set, and that every territory an invariant claims claims it
+back. Anchors are the half that fails *silently* — a missing one falls back to the top
+of the target document — and the reciprocity check found four one-way edges on its
+first run.
+
+The symbol check was tree-wide until #224, which is why the convention above (*symbols,
+never line numbers*) needed the correction: **which file a symbol lives in is owned by
+the compiler too**, so checking only that the name exists somewhere gated half of what
+a bullet claims. It had already cost something — in #221 a bullet kept naming
+`Progressive` and `ProgressiveTile` at a path they had moved out of and passed, because
+both names still existed elsewhere. A bullet that names no path keeps the tree-wide
+search, which is the right check there rather than a weaker one: the *stage-string*
+bullets deliberately claim no location. Run `--selftest` to see the gate fail on each
+defect kind it claims to catch.
 
 **No roster table here on purpose** — "which node is governed by what" lives in the
 notes and would rot within days as a second copy. Ask instead:

@@ -28,11 +28,21 @@ like any other.
   (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
   waiting for cargo); `fuzz.yml` (nightly libFuzzer); `supply-chain.yml`
   (`just-shield`). `coverage.yml` reports with no threshold and does not fail a build.
-- **A gate is only as good as its failure directions.** The map gate was verified to
-  pass on known-good notes, fail on each of five defect kinds (broken link, broken
-  anchor, missing section, unresolvable symbol, one-way invariant edge), and ignore
-  link-shaped text inside code spans — because a gate with false positives gets
-  ignored, and an ignored gate returns its defect class to being silent.
+- **A gate is only as good as its failure directions, and that is now a command
+  rather than a memory** — `python3 .github/scripts/check_map.py --selftest`, run in
+  CI ahead of the gate itself. It builds a throwaway mini-map in a temp directory,
+  breaks one thing at a time, and requires the gate to notice: **eight defect kinds**
+  (broken link, broken anchor, missing section, symbol absent from the tree, symbol
+  absent from *the file the bullet names*, symbol outside *the directory the bullet
+  names*, path that does not exist, one-way invariant edge) plus a **baseline** case
+  requiring a known-good map to pass clean. The baseline is not ceremony: a gate with
+  false positives gets ignored, and an ignored gate returns its defect class to being
+  silent, so "does not fire on good input" is a failure direction like the others —
+  and it is the case that caught two of the five mutations run against #224's change.
+  This bullet used to say "was verified … fail on each of five defect kinds", which was
+  true, unrepeatable, and had already drifted: the fifth kind was checked tree-wide, so
+  a bullet could name a symbol at a path it had moved out of and pass (#221, fixed in
+  #224).
 - **`--workspace` is not "everything".** `fuzz` has its own `[workspace]`, so the top
   gate does not even *build* it; a public-API change needs
   `cargo check --manifest-path fuzz/Cargo.toml`. Note what that command still does not
@@ -57,7 +67,8 @@ like any other.
 
 - `.github/workflows/` — `test.yml` (jobs `test` + `map`), `fuzz.yml`,
   `supply-chain.yml`, `coverage.yml`
-- `.github/scripts/check_map.py` — the map gate; its scope is declared in its own
+- `.github/scripts/check_map.py` — the map gate (`selftest`, `scope_text`,
+  `check_code`, `check_links`, `check_reciprocity`); its scope is declared in its own
   docstring rather than inferred
 - `.github/dependabot.yml` — weekly cargo + github-actions ecosystems
 - `Cargo.toml` — `[workspace.dependencies]` (exact pin `sspi = "=0.21.3"` per ADR-0004)
