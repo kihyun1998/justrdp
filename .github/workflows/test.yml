@@ -55,5 +55,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
+      # The gate's own defect kinds, before it is trusted to judge the notes. The
+      # territory note used to record that this had been verified by hand once (#224);
+      # a memory of a verification is the shape #200's hand-kept matrix had, so it is a
+      # command now. Builds a throwaway mini-map in a temp dir, breaks one thing at a
+      # time, and requires the gate to notice each one.
+      - name: Map gate self-test (does it still fail on each defect kind?)
+        run: python3 .github/scripts/check_map.py --selftest
+
       - name: Map gate (links, anchors, symbols, sections, reciprocity)
         run: python3 .github/scripts/check_map.py

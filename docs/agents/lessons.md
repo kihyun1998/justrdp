@@ -264,6 +264,44 @@ Read this before starting so the bindings do not read as abstractions.
 - **The `fuzz` crate is the `--workspace` blind spot** — out of the workspace by
   design (its own `[workspace]`), so `cargo test --workspace` does not build it. A
   public-API change needs a separate `cargo check --manifest-path fuzz/Cargo.toml`.
+- **A gate that keeps a *memory* of its own verification is the same failure one
+  level up (#224).** `supply-chain-and-gates.md` recorded that the map gate *"was
+  verified to pass on known-good notes, fail on each of five defect kinds, and ignore
+  link-shaped text inside code spans"*. True when written, unrepeatable, and by the time
+  anyone re-read it one of the five had **silently weakened**: the symbol check searched
+  the whole tree rather than the file the bullet named, so a note could claim a symbol at
+  a path it had moved out of and pass. That is exactly what #221 did with `Progressive`
+  and `ProgressiveTile`, and the gate said `0 failing`. The fix is the same shape as the
+  entry below — make the claim a command, not prose: `check_map.py --selftest` builds a
+  throwaway mini-map, breaks one thing at a time, and requires the gate to notice each of
+  eight defect kinds plus a clean baseline.
+
+  Three things this pins that the #200 entry could not.
+
+  - **"Verified once" and "not verified" are indistinguishable from the outside**, and
+    the artifact that records the verification is written by the person least likely to
+    re-run it. A sentence in a note is a test with no runner.
+  - **A baseline case is a failure direction, not ceremony.** Of five mutations run
+    against the fix, **two** were caught only by "a known-good map still passes clean" —
+    breaking the directory walk and dropping `.rs` from the readable extensions both make
+    *valid* notes fail. The territory's own principle says why that matters more than it
+    looks: a gate with false positives gets ignored, and an ignored gate returns its
+    defect class to being silent.
+  - **A test case that never goes red under any mutation is not a case.** The first
+    directory-scope case named a symbol that existed nowhere, so it was a duplicate of
+    "symbol not in the tree" and survived every mutation green. Rewriting it to name a
+    symbol that exists **outside** the named directory is what gave it the one thing it
+    was for: separating *scoped* from *scoped correctly*.
+
+- **Precision made the gate nine times cheaper, which is the opposite of the assumption
+  (#224).** Scoping each symbol search to its bullet's own files took the map gate from
+  **1.885s to 0.215s** per run — measured interleaved (after, before, after) because the
+  first reading was taken in order and could have been warm-cache noise. The cause is
+  arithmetic rather than cleverness: ~295 `re.search` calls over a multi-megabyte
+  concatenation of every source file became ~295 searches over a few KB each. Worth
+  keeping because the instinct runs the other way — "check more precisely" reads as
+  "check more" — and that instinct is what makes a gate stay coarse.
+
 - **A gate that keeps its own copy of a list is a gate that will one day run on the
   wrong list — the war story for *derive, don't copy*, applied to CI (#200).**
   `fuzz.yml`'s matrix transcribed `ls fuzz/fuzz_targets/` by hand and drifted **twice

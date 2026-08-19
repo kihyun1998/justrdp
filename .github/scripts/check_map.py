@@ -18,9 +18,15 @@ What it checks, and why each one is silent without it:
    used to land on one row starts pointing at a whole file and the reader never
    learns they were misrouted. Anchors are also the volatile half — headings get
    rewritten by routine maintenance, breaking links in files nobody touched.
-2. **Every symbol and path named under `## Code` exists.** The map deliberately
-   carries symbol names, never line numbers (a line number is an ungated copy of
-   something the compiler owns). This is what keeps that trade honest.
+2. **Every symbol and path named under `## Code` exists, and the symbol exists in
+   the file the same bullet names.** The map deliberately carries symbol names, never
+   line numbers (a line number is an ungated copy of something the compiler owns) —
+   but *which file a symbol lives in* is owned by the compiler too, so checking only
+   that the name exists somewhere leaves half the bullet's claim ungated. It did: in
+   #221 a bullet kept naming `Progressive` and `ProgressiveTile` at a path they had
+   moved out of, and passed, because both names still existed elsewhere (#224). A
+   bullet that names no path keeps the tree-wide check, which is the right one there
+   — the stage-string bullets deliberately claim no location.
 3. **The section set is complete per note kind.** Empty sections are load-bearing:
    `**None.**` under `## Governing decisions` *is* the finding, so a note may not
    drop the heading to hide the hole.
@@ -79,6 +85,36 @@ def source_text():
 
 
 SRC_TEXT = source_text()
+
+# Read when a `## Code` bullet names a whole directory. A bullet names a directory to
+# mean "the files under it", so binaries sitting beside them (the codec fixtures) carry
+# no symbol and are skipped rather than decoded.
+SCOPE_EXTS = (".rs", ".toml", ".yml", ".yaml", ".py", ".md", ".txt")
+
+_SCOPE_CACHE = {}
+
+
+def scope_text(paths):
+    """The text of the paths one `## Code` bullet names — the haystack for its symbols.
+
+    A named *file* is read whatever its extension, because the bullet already asserted
+    it exists and the extension carries no meaning at that point (`test.yml`'s job names
+    are symbols in a `.yml`). A named *directory* is walked for text files.
+    """
+    key = tuple(paths)
+    if key not in _SCOPE_CACHE:
+        parts = []
+        for path in paths:
+            if os.path.isfile(path):
+                parts.append(open(path, encoding="utf-8", errors="replace").read())
+            elif os.path.isdir(path):
+                for dirpath, _, names in os.walk(path):
+                    for name in sorted(names):
+                        if name.endswith(SCOPE_EXTS):
+                            full = os.path.join(dirpath, name)
+                            parts.append(open(full, encoding="utf-8", errors="replace").read())
+        _SCOPE_CACHE[key] = "\n".join(parts)
+    return _SCOPE_CACHE[key]
 
 
 def rel(path):
@@ -167,24 +203,39 @@ def check_links(path, body, errs):
 
 
 def check_code(raw, errs):
+    """A `## Code` bullet makes two claims — these paths exist, and these symbols live
+    in them. Both are checked, in that order, because the second needs the first's
+    result: the bullet's own paths are the haystack its symbols are searched in."""
     for bullet in bullets(section(raw, "## Code")):
         dirs = re.findall(r"`([^`\n]*/)`", bullet)
+        roots = PATH_ROOTS + [os.path.join(r, d) for d in dirs for r in PATH_ROOTS]
+        scope, symbols = [], []
         for tok in (t.strip() for t in re.findall(r"`([^`\n]+)`", bullet)):
             if tok.startswith("[MS-") or any(c in tok for c in '"|$'):
                 continue  # spec citation or shell fragment
             if tok.split(" ")[0] in ("grep", "ls", "rg", "cargo", "python", "python3", "sed"):
                 continue  # a derivation command, not a name
-            if "/" in tok or tok.endswith((".rs", ".toml", ".yml")):
+            if "/" in tok or tok.endswith((".rs", ".toml", ".yml", ".py")):
                 p = tok.rstrip("/")
-                roots = PATH_ROOTS + [os.path.join(r, d) for d in dirs for r in PATH_ROOTS]
-                if not any(os.path.exists(os.path.join(r, p)) for r in roots):
+                hit = next((os.path.join(r, p) for r in roots if os.path.exists(os.path.join(r, p))), None)
+                if hit is None:
                     errs.append(f"path under ## Code does not exist: {tok}")
+                else:
+                    scope.append(hit)
                 continue
             name = re.split(r"[^A-Za-z0-9_:]", tok)[0].split("::")[-1]
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or ""):
                 continue
-            if not re.search(r"\b" + re.escape(name) + r"\b", SRC_TEXT):
-                errs.append(f"symbol not found in tree: {name}  (from `{tok}`)")
+            symbols.append((tok, name))
+
+        # A bullet that names no path claims no location — the stage-string bullets do
+        # this on purpose, because the string spans the core and the adapter. There the
+        # tree-wide search is the honest check rather than a weakened one.
+        haystack = scope_text(scope) if scope else SRC_TEXT
+        where = ", ".join(rel(path) for path in scope) if scope else "tree"
+        for tok, name in symbols:
+            if not re.search(r"\b" + re.escape(name) + r"\b", haystack):
+                errs.append(f"symbol not found in {where}: {name}  (from `{tok}`)")
 
 
 def check_sentinel(raw, errs):
@@ -229,7 +280,202 @@ def check_reciprocity():
     return errs
 
 
+
+# --------------------------------------------------------------------- self-test --
+#
+# `docs/map/territory/supply-chain-and-gates.md` records that this gate "was verified to
+# pass on known-good notes, fail on each of five defect kinds, and ignore link-shaped text
+# inside code spans". That was true and it was a *memory* — nothing re-ran it, so the
+# sentence could outlive the behaviour exactly the way #200's hand-kept fuzz matrix did.
+# This makes it a command.
+#
+# It runs the script as a subprocess against a throwaway mini-map in a temp directory,
+# rather than calling the check functions in-process: every root here (`ROOT`, `MAP`,
+# `PATH_ROOTS`, `SRC_TEXT`) is derived from the working directory at import time, so
+# `cwd=` is the whole fixture and there are no globals to monkeypatch.
+
+_ST_TERRITORY = """# T
+
+## What it is
+
+A throwaway territory.
+
+## Governing decisions
+
+**None.**
+
+## Design model
+
+- One rule.
+
+## Code
+
+- `mini/src/thing.rs` — `Alpha`
+- `mini/src/` — `Beta`
+
+## Reference behaviour
+
+**None.**
+
+## Cross-cutting invariants
+
+- [I](../invariant/i.md)
+
+## Blast radius
+
+**None.**
+
+## Known holes / open
+
+**None.**
+"""
+
+_ST_INVARIANT = """# I
+
+## The fact
+
+A throwaway invariant.
+
+## Why it is cross-cutting
+
+Because.
+
+## Territories it holds in
+
+- [T](../territory/t.md)
+
+## What a violation looks like
+
+Like this.
+
+## Discovery history
+
+- Somewhere.
+
+## Where it will recur
+
+See the [hub](../README.md#reading-protocol). Link-shaped text in a span, `[x](nope.md)`,
+must not be followed.
+"""
+
+_ST_HUB = """# Hub
+
+## Reading protocol
+
+Read it.
+"""
+
+# (name, file to patch, old, new, expected substring in the output — None means clean)
+_ST_CASES = [
+    ("baseline", None, None, None, None),
+    (
+        "symbol at a path it does not live in",
+        "territory/t.md",
+        "- `mini/src/thing.rs` — `Alpha`",
+        "- `mini/src/thing.rs` — `Alpha`, `Beta`",
+        "symbol not found in",
+    ),
+    (
+        "symbol nowhere in the tree",
+        "territory/t.md",
+        "- `mini/src/thing.rs` — `Alpha`",
+        "- `mini/src/thing.rs` — `Gamma`",
+        "symbol not found in",
+    ),
+    (
+        "path under ## Code does not exist",
+        "territory/t.md",
+        "- `mini/src/thing.rs` — `Alpha`",
+        "- `mini/src/gone.rs` — `Alpha`",
+        "path under ## Code does not exist",
+    ),
+    ("missing section", "territory/t.md", "## Blast radius", "## Blast radii", "missing section"),
+    ("broken link", "invariant/i.md", "(../README.md#reading-protocol)", "(../GONE.md)", "broken link"),
+    (
+        "broken anchor",
+        "invariant/i.md",
+        "(../README.md#reading-protocol)",
+        "(../README.md#no-such-heading)",
+        "broken anchor",
+    ),
+    (
+        # `Epsilon` exists in the tree, outside the directory the bullet names. A
+        # scope that is merely *a* scope rather than *this* one still finds it, so
+        # this is the case that separates "scoped" from "scoped correctly".
+        "symbol outside the named directory",
+        "territory/t.md",
+        "- `mini/src/` — `Beta`",
+        "- `mini/src/` — `Epsilon`",
+        "symbol not found in",
+    ),
+    (
+        "one-way invariant edge",
+        "territory/t.md",
+        "- [I](../invariant/i.md)",
+        "**None.**",
+        "one-way edge",
+    ),
+]
+
+
+def selftest():
+    """Build a mini-map, break one thing at a time, and require the gate to notice."""
+    import subprocess
+    import tempfile
+
+    failures = 0
+    for name, target, old, new, expect in _ST_CASES:
+        with tempfile.TemporaryDirectory() as tmp:
+            for sub in (
+                "docs/map/territory",
+                "docs/map/invariant",
+                "crates/mini/src",
+                "crates/elsewhere/src",
+            ):
+                os.makedirs(os.path.join(tmp, sub))
+            files = {
+                "docs/map/README.md": _ST_HUB,
+                "docs/map/territory/t.md": _ST_TERRITORY,
+                "docs/map/invariant/i.md": _ST_INVARIANT,
+                "crates/mini/src/thing.rs": "pub struct Alpha;\n",
+                "crates/mini/src/other.rs": "pub struct Beta;\n",
+                "crates/elsewhere/src/far.rs": "pub struct Epsilon;\n",
+            }
+            if target:
+                key = "docs/map/" + target
+                assert files[key].count(old) == 1, f"self-test fixture drifted: {name}"
+                files[key] = files[key].replace(old, new)
+            for path, body in files.items():
+                with open(os.path.join(tmp, path), "w", encoding="utf-8") as fh:
+                    fh.write(body)
+
+            run = subprocess.run(
+                [sys.executable, os.path.abspath(__file__)],
+                cwd=tmp,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            out = (run.stdout or "") + (run.stderr or "")
+
+        if expect is None:
+            ok = run.returncode == 0 and "0 failing" in out
+        else:
+            ok = run.returncode == 1 and expect in out
+        print(("ok   " if ok else "FAIL ") + name)
+        if not ok:
+            failures += 1
+            for line in out.strip().splitlines():
+                print(f"       {line}")
+
+    kinds = len(_ST_CASES) - 1
+    print(f"\nself-test: {kinds} defect kind(s) + baseline, {failures} failing")
+    return 1 if failures else 0
+
+
 def main():
+    if sys.argv[1:2] == ["--selftest"]:
+        return selftest()
     targets = sys.argv[1:] or sorted(glob.glob(os.path.join(MAP, "**", "*.md"), recursive=True))
     if not targets:
         sys.exit("map gate: no notes found under docs/map/ — has the scope drifted?")
