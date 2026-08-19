@@ -36,6 +36,10 @@ sixth hand-kept roster of exactly the kind #200 exists to remove — the two wou
 first time the fixture is recaptured. This reads the fixture at run time instead, so there
 is one copy and the seeds cannot disagree with it.
 
+That rule is about *bootstrap* seeds, and there is a second kind it does not cover:
+`seed_progressive_srl` commits 54 bytes because a crash artifact has no fixture to be derived
+from. See its docstring for why both halves of the argument above are absent there.
+
 Seeding is additive and idempotent: it writes fixed filenames beside whatever the corpus
 cache restored, so a re-run neither duplicates nor discards the inputs libFuzzer evolved.
 
@@ -46,6 +50,7 @@ takes the script with it -- measured, not guessed, on the first local run of thi
 
 USAGE = "usage: python3 .github/scripts/seed_fuzz_corpus.py <target>"
 
+import base64
 import pathlib
 import struct
 import sys
@@ -139,9 +144,53 @@ def seed_progressive_assembly(out_dir):
     return written
 
 
+# The minimised libFuzzer artifact from run 32206659799, which panicked `rfx::srl::accumulate`
+# with `attempt to add with overflow` (#219). Under the pinned `arbitrary 1.4.2` these 54 bytes
+# decode to exactly the `Input` CI reported -- verified by decoding them through that version,
+# not assumed:
+#
+#     srl [255, 0, 255, 255, 8, 0], raw [],
+#     shift [63, 0, 0, 0, 17, 32, 8, 255, 255, 160],
+#     width [4, 253, 119, 10, 255, 17, 0, 32, 33, 255],
+#     seed -1, sign_seed 0
+CRASH_219 = "ff+zAAX/////CAEAAIA/AAAAESAI//+gBP13Cv8RACAh////AAAKAAAAAAAAJwACAAAA////"
+
+
+def seed_progressive_srl(out_dir):
+    """Replay #219's crashing input every run -- a *regression* seed, not a bootstrap one.
+
+    The two kinds are worth keeping apart, because the module docstring above argues seeds
+    should be **derived, never committed**, and this one is committed bytes. Both halves of
+    that argument are absent here:
+
+    - There is nothing to derive it from. The other seeders project a fixture the repo
+      already holds; a crash is a *found* artifact, and 54 bytes is not the ~900 KB duplicate
+      the rule was written against.
+    - `progressive_srl` does not need bootstrapping. Its grammar is `Arbitrary`-derived and
+      flat, so it is not behind the magic-plus-nested-lengths wall the measurement above is
+      about -- which is why it had no seeder until a crash gave it a reason.
+
+    What this buys over the unit-test regressions in `rfx::srl` (which are the actual proof,
+    and which replay the same input at the public surface): the corpus is restored from a
+    GitHub cache that evicts after 7 days of no access, and this lane runs **weekly** -- right
+    at that edge. One eviction and libFuzzer's memory of the base unit this crash was mutated
+    from is gone, so a green re-run would stop meaning anything. A committed seed does not
+    evict.
+
+    The encoding is `arbitrary`'s derived one, an implementation detail that would reinterpret
+    these bytes on a version bump. That is tolerable *here* and was not in the unit test: a
+    stale seed is merely another input, where a stale test would keep passing while asserting
+    nothing. And `fuzz/Cargo.lock` is tracked, so the bump that would do it arrives as a
+    reviewable diff rather than silently.
+    """
+    (out_dir / "regression-219-i64-min.bin").write_bytes(base64.b64decode(CRASH_219))
+    return 1
+
+
 SEEDERS = {
     "progressive": seed_progressive,
     "progressive_assembly": seed_progressive_assembly,
+    "progressive_srl": seed_progressive_srl,
 }
 
 
