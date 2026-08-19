@@ -354,11 +354,22 @@ impl<'a> UpgradeState<'a> {
 /// `shift` (see [`MAX_BIT_POS`]) but not for an out-of-range one, where `i32::checked_shl` still
 /// permits `shift == 31` and the *addition* then overflows.
 ///
-/// `checked_shl` alone is **not** enough even at `i64`, and the difference is a silent one: it
-/// rejects an out-of-range shift *amount* and says nothing about the *value*, so `2 << 63` is
-/// `Some(0)` and a real refinement is accepted as a no-op. The round-trip below is what actually
-/// detects a lost bit; `try_from` then rejects anything that will not fit a coefficient. Both
-/// are needed, and neither subsumes the other.
+/// **Three guards, none of which subsumes another** — the width of the accumulator is not one of
+/// them, which is the correction the fuzz lane forced:
+///
+/// - `checked_shl` rejects an out-of-range shift *amount* and says nothing about the *value*, so
+///   `2 << 63` is `Some(0)` — a real refinement silently accepted as a no-op.
+/// - The round-trip catches that: a shift that dropped a significant bit does not come back.
+///   It has exactly one blind spot, `i64::MIN`, because an arithmetic right shift of `i64::MIN`
+///   by 63 is `-1` — so `-1 << 63` round-trips perfectly while having wrapped, and so does every
+///   `-(1 << j)` at `shift == 63 - j`.
+/// - `checked_add` closes that spot. Widening to `i64` makes the addition total for every
+///   *representable* refinement, but `i64::MIN` plus a negative coefficient is not one, and a
+///   panicking add in a decoder fed by the wire is what
+///   [`untrusted decode never panics`](../../../../docs/map/invariant/untrusted-decode-never-panics.md)
+///   forbids. Regression: `progressive_srl`, CI run 32206659799.
+///
+/// `try_from` then rejects anything that will not fit a coefficient.
 fn accumulate(coefficient: &mut i16, input: i16, shift: u32) -> Result<(), SrlError> {
     let shifted = i64::from(input)
         .checked_shl(shift)
@@ -366,7 +377,9 @@ fn accumulate(coefficient: &mut i16, input: i16, shift: u32) -> Result<(), SrlEr
     if shifted >> shift != i64::from(input) {
         return Err(SrlError::ValueOverflow);
     }
-    let refined = i64::from(*coefficient) + shifted;
+    let refined = i64::from(*coefficient)
+        .checked_add(shifted)
+        .ok_or(SrlError::ValueOverflow)?;
     *coefficient = i16::try_from(refined).map_err(|_| SrlError::ValueOverflow)?;
     Ok(())
 }
@@ -786,6 +799,104 @@ mod tests {
         }
     }
 
+    /// **Regression, #99 fuzz lane.** `progressive_srl` crashed on CI run 32206659799 with
+    /// `attempt to add with overflow` — the first crash this lane has produced, and one the
+    /// sibling proptest could not reach.
+    ///
+    /// The blind spot is exactly one value wide. [`accumulate`] rejects a shift that lost bits
+    /// by round-tripping it (`shifted >> shift == input`), which is sound for every result
+    /// *except* `i64::MIN`: an arithmetic right shift of `i64::MIN` by 63 is `-1`, so an input
+    /// of `-1` shifted by 63 round-trips perfectly having wrapped all the way. The guard is
+    /// satisfied, and the widening to `i64` — the very thing the accumulate leans on to make
+    /// its addition total — is one value short of holding the result.
+    ///
+    /// It is a family rather than a point: any `input == -(1 << j)` at `shift == 63 - j` lands
+    /// on `i64::MIN`, and each overflows the addition for any negative coefficient. Driven at
+    /// [`accumulate`] because reaching every member through the public surface would mean
+    /// hand-building 16 raw bit patterns to assert one line of arithmetic.
+    ///
+    /// Not reachable through [`super::super::progressive`]: the parser masks every quant field
+    /// to a nibble, `quant_add` saturates two of them at 30 and `upgrade_shift` subtracts one,
+    /// so the real path tops out at `shift == 29`. What this defends is [`upgrade_component`]'s
+    /// *declared* contract — total for any `u8` — which is the guarantee this module chose to
+    /// make precisely because [`ProgressiveQuant`]'s fields are plain `pub u8` and the bound
+    /// lives in arithmetic elsewhere rather than in the type.
+    #[test]
+    fn a_refinement_landing_on_i64_min_is_an_error_not_a_panic() {
+        for j in 0..16u32 {
+            // Computed in `i32` and narrowed: `j == 15` is a real member of the family
+            // (`i16::MIN << 48` is `i64::MIN` too), and negating `1i16 << 15` to reach it
+            // overflows in the *test* — the same arithmetic this is about, one type down.
+            let input = i16::try_from(-(1i32 << j)).expect("-(1 << 15) is i16::MIN");
+            let shift = 63 - j;
+            // Every sign of the prior coefficient: only a negative one overflows the addition,
+            // but all three must reach the same typed error rather than three behaviours.
+            for coefficient in [-1i16, 0, i16::MAX] {
+                let mut c = coefficient;
+                assert_eq!(
+                    accumulate(&mut c, input, shift),
+                    Err(SrlError::ValueOverflow),
+                    "input {input} << {shift} onto {coefficient} was accepted"
+                );
+            }
+        }
+    }
+
+    /// **Regression, #99 fuzz lane** — the crashing input itself, replayed at the public
+    /// surface so the fix is pinned where a caller stands rather than only at the private
+    /// arithmetic [`a_refinement_landing_on_i64_min_is_an_error_not_a_panic`] drives.
+    ///
+    /// Transcribed from the `Debug` of the artifact libFuzzer minimised on run 32206659799
+    /// rather than from its bytes: the bytes are `Arbitrary`'s derived encoding, which is that
+    /// crate's implementation detail and would decode to something else on a version bump,
+    /// silently turning this into a test of nothing.
+    ///
+    /// `hl1` is the first band walked, its shift is 63, and the seeded coefficients are `-1`
+    /// with signs at 0 — so the very first coefficient routes to SRL, reads `-1`, and lands on
+    /// `i64::MIN`. The assertion is the typed error, not merely the absence of a panic, because
+    /// "it returned" is also what a silently truncated refinement looks like.
+    #[test]
+    fn the_fuzz_reproducer_is_a_typed_error() {
+        let shifts = ProgressiveQuant {
+            hl1: 63,
+            lh1: 0,
+            hh1: 0,
+            hl2: 0,
+            lh2: 17,
+            hh2: 32,
+            hl3: 8,
+            lh3: 255,
+            hh3: 255,
+            ll3: 160,
+        };
+        let widths = ProgressiveQuant {
+            hl1: 4,
+            lh1: 253,
+            hh1: 119,
+            hl2: 10,
+            lh2: 255,
+            hh2: 17,
+            hl3: 0,
+            lh3: 32,
+            hh3: 33,
+            ll3: 255,
+        };
+
+        let mut current = [-1i16; COMPONENT_LEN];
+        let mut sign = [0i16; COMPONENT_LEN];
+        assert_eq!(
+            upgrade_component(
+                &[255, 0, 255, 255, 8, 0],
+                &[],
+                &shifts,
+                &widths,
+                &mut current,
+                &mut sign
+            ),
+            Err(SrlError::ValueOverflow)
+        );
+    }
+
     /// **Regression, #168 completeness pass (second round).** At `num_bits >= 16` the
     /// truncated-unary magnitude loop must run to the real `(1 << num_bits) - 1` cap, because
     /// `num_bits` reaches 30 rather than 15 ([`MAX_BIT_POS`]). Capping the *loop* at `i16::MAX`
@@ -917,6 +1028,14 @@ mod tests {
         /// at `num_bits >= 32`, and an `i32` addition overflowing at `shift == 31`). A property
         /// generated inside the guarantee it is meant to be independent of asserts nothing about
         /// the guarantee.
+        ///
+        /// **Full range is still not depth**, and this property is not the guard for the
+        /// accumulate's boundary — the fuzz lane is. It generates every value the `i64::MIN`
+        /// crash needed (#219) and has done since #168; what it cannot do is make three of them
+        /// *coincide* — `shift == 63 - j`, an input of exactly `-(1 << j)`, and a negative prior
+        /// coefficient. Widening the generator until it hits that is writing the answer into the
+        /// test, so the depth stays where it belongs, in
+        /// [`a_refinement_landing_on_i64_min_is_an_error_not_a_panic`] and in `progressive_srl`.
         #[test]
         fn upgrade_component_never_panics_on_arbitrary_input(
             srl in proptest::collection::vec(proptest::num::u8::ANY, 0..512),
