@@ -75,9 +75,13 @@
 use std::collections::HashMap;
 
 use justrdp_pdu::rfx::TILE_DIM;
+// `ProgressiveTile` is aliased on the way in: in the *bootstrap* module that name is a decoded
+// RGBA tile, and here it is the undecoded wire block. Two different things one name apart is
+// the shape that made the two RemoteFX block namespaces confusable (#167).
 use justrdp_pdu::rfx::progressive::{
-    FirstPassTile, ProgressiveMessage, ProgressiveQuant, ProgressiveRegion, QUALITY_FULL,
-    REGION_FLAG_DWT_REDUCE_EXTRAPOLATE, TILE_FLAG_DIFFERENCE, UpgradeTile,
+    FirstPassTile, ProgressiveMessage, ProgressiveQuant, ProgressiveRegion,
+    ProgressiveTile as ProgressiveTileBlock, QUALITY_FULL, REGION_FLAG_DWT_REDUCE_EXTRAPOLATE,
+    TILE_FLAG_DIFFERENCE, UpgradeTile,
 };
 
 use super::quant::{BANDS_EXTRAPOLATE, BANDS_STANDARD, COMPONENT_LEN};
@@ -87,11 +91,17 @@ use crate::color;
 /// Bytes one decoded tile occupies as RGBA8888.
 pub const TILE_RGBA_LEN: usize = (TILE_DIM as usize) * (TILE_DIM as usize) * 4;
 
-/// Why a Progressive tile failed to decode. Malformed input is always a typed error, never a
-/// panic — [`crate::rfx::RfxError`]'s contract, and the invariant
+/// Why a Progressive payload or one of its tiles failed to decode. Malformed input is always a
+/// typed error, never a panic — [`crate::rfx::RfxError`]'s contract, and the invariant
 /// `docs/map/invariant/untrusted-decode-never-panics.md` judges this surface.
+///
+/// Every variant but [`ProgressiveError::Parse`] is **per tile**: the payload survives it, and
+/// [`Progressive::decode`] reports it through [`PayloadOutcome`] rather than failing the call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressiveError {
+    /// The `RFX_PROGRESSIVE_*` block stream itself is malformed, so the payload carries no
+    /// regions to decode. The only variant [`Progressive::decode`] returns as an `Err`.
+    Parse(justrdp_pdu::DecodeError),
     /// A first-pass component's RLGR stream is malformed.
     Rlgr(rlgr::RlgrError),
     /// An upgrade pass's SRL/raw refinement could not be applied. The tile's store is
@@ -163,11 +173,21 @@ pub enum ProgressiveError {
     /// A payload carried `RFX_PROGRESSIVE_FRAME_BEGIN` after `RFX_PROGRESSIVE_FRAME_END`. The
     /// other hard error (`progressive.c:1927-1932`).
     FrameBeginAfterFrameEnd,
+    /// Seeding this tile's cross-pass store would take [`Progressive`]'s store past its byte
+    /// budget, so the tile is skipped rather than admitted.
+    ///
+    /// **A skip, never a payload failure**, and the direction matters: refusing the *new* tile
+    /// keeps every tile already in the store refinable, where failing the payload would strand
+    /// a whole frame on a budget the server cannot see. FreeRDP has no analogue — it allocates
+    /// the full grid up front at `progressive_create_surface_context` (`progressive.c:426`),
+    /// which is a different bound (per surface, not per session) reached at a different time.
+    StoreBudgetExceeded,
 }
 
 impl core::fmt::Display for ProgressiveError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            ProgressiveError::Parse(e) => write!(f, "RFX_PROGRESSIVE block stream: {e}"),
             ProgressiveError::Rlgr(e) => write!(f, "RLGR decode: {e}"),
             ProgressiveError::Srl(e) => write!(f, "upgrade-pass refinement: {e}"),
             ProgressiveError::ZeroBitPosition => {
@@ -213,11 +233,21 @@ impl core::fmt::Display for ProgressiveError {
                 f,
                 "RFX_PROGRESSIVE_FRAME_BEGIN after RFX_PROGRESSIVE_FRAME_END in one payload"
             ),
+            ProgressiveError::StoreBudgetExceeded => write!(
+                f,
+                "the Progressive tile store is at its byte budget, so this tile is skipped"
+            ),
         }
     }
 }
 
 impl core::error::Error for ProgressiveError {}
+
+impl From<justrdp_pdu::DecodeError> for ProgressiveError {
+    fn from(e: justrdp_pdu::DecodeError) -> Self {
+        ProgressiveError::Parse(e)
+    }
+}
 
 impl From<rlgr::RlgrError> for ProgressiveError {
     fn from(e: rlgr::RlgrError) -> Self {
@@ -1170,6 +1200,12 @@ impl SurfaceStore {
     pub fn live_surfaces(&self) -> usize {
         self.grids.len()
     }
+
+    /// Tiles held across **every** surface — the quantity [`Progressive`]'s store budget is
+    /// measured in, since a budget that only bounded one surface would be no bound at all.
+    pub fn painted_tiles(&self) -> usize {
+        self.grids.values().map(TileGrid::painted_tiles).sum()
+    }
 }
 
 /// The tile grid a `width × height` surface addresses — rounded up, so a partial last row or
@@ -1180,6 +1216,357 @@ fn grid_size_for(width: u16, height: u16) -> (usize, usize) {
         usize::from(width).div_ceil(usize::from(TILE_DIM)),
         usize::from(height).div_ceil(usize::from(TILE_DIM)),
     )
+}
+
+/// Bytes one [`TileState`] occupies — three components × 4096 coefficients × two `i16` arrays.
+///
+/// It covers 64 × 64 pixels, i.e. 16 KiB of RGBA, so a fully-painted surface costs **three
+/// bytes of cross-pass state per byte of framebuffer**. That multiplier is why the store has a
+/// budget of its own rather than riding the surface cap: `justrdp::egfx` admits 256 MiB of
+/// surface, which is 16 384 tiles and therefore ~768 MiB of state its `total_surface_bytes`
+/// accounting cannot see, against dimensions a server chose.
+pub const TILE_STATE_BYTES: usize = 3 * COMPONENT_LEN * 2 * core::mem::size_of::<i16>();
+
+/// The default ceiling on [`Progressive`]'s whole tile store, across every surface.
+///
+/// 256 MiB is 5461 tiles — about 2.7 fully-painted 4K screens (3840 × 2160 is 60 × 34 = 2040
+/// tiles, 98 MiB), and 21× what the corpus session actually holds (260 tiles, 12.2 MiB). It is
+/// deliberately the *same* number as `justrdp::egfx`'s surface cap, so the two bounds read as
+/// one pair rather than as a cap and a hidden multiplier: worst case is 256 MiB of pixels plus
+/// 256 MiB of state, both stated.
+pub const MAX_STORE_BYTES: usize = 256 << 20;
+
+/// One clipped piece of a decoded tile, handed to [`Progressive::decode`]'s sink for blitting.
+///
+/// **It borrows the decoder's tile buffer rather than owning pixels**, which is the
+/// `docs/map/invariant/frame-path-carries-no-owned-pixels.md` contract: a `Vec<u8>` per tile
+/// would be 16 KiB of allocation per pass — 6193 of them in the 75-second corpus session —
+/// and a second write of every pixel before the host sees one. The buffer is reused for the
+/// next tile as soon as the sink returns.
+#[derive(Debug, Clone, Copy)]
+pub struct PaintedRect<'a> {
+    /// Left edge in surface coordinates.
+    pub x: u16,
+    /// Top edge in surface coordinates.
+    pub y: u16,
+    /// Width in pixels.
+    pub width: u16,
+    /// Height in pixels.
+    pub height: u16,
+    /// Left edge within [`Self::tile`], in pixels — non-zero exactly when a region rect cut
+    /// the tile's left side.
+    pub src_x: u16,
+    /// Top edge within [`Self::tile`], in pixels.
+    pub src_y: u16,
+    /// The whole 64 × 64 RGBA8888 tile, top-down, stride 64 pixels ([`TILE_RGBA_LEN`] bytes).
+    /// Only the sub-rectangle this struct names is being painted.
+    pub tile: &'a [u8],
+}
+
+/// What one `WireToSurface2` payload did. Everything here is *reportable*, not fatal — the
+/// payload parsed, and the assembly layer's job is to say what happened inside it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PayloadOutcome {
+    /// Tiles whose pass applied cleanly.
+    pub tiles_decoded: usize,
+    /// Tiles skipped — a per-tile [`ProgressiveError`], or the store budget. The payload's
+    /// other tiles are unaffected.
+    pub tiles_skipped: usize,
+    /// Rectangles handed to the sink. A clipped tile can meet more than one region rect, so
+    /// this is not a tile count.
+    pub rects_painted: usize,
+    /// Tolerated block-ordering violations, in the order the blocks tripped them
+    /// ([`order_payload`]). FreeRDP logs these; a sans-IO core has no logger, so they come
+    /// back for the host adapter to log.
+    pub anomalies: Vec<OrderAnomaly>,
+    /// The ordering violation that ended the block walk, if one did. **When this is set the
+    /// sink is never called**, and that is FreeRDP's behaviour rather than a stricter one: its
+    /// `goto fail` skips `update_tiles` and leaves `rc = 1` (`progressive.c:2482-2486`), so the
+    /// regions still reach the store and the frame simply is not presented.
+    pub fatal: Option<ProgressiveError>,
+    /// The first per-tile error, kept so a host can log something specific without the
+    /// decoder allocating a vector per payload.
+    pub first_error: Option<ProgressiveError>,
+}
+
+/// The self-owned RemoteFX **Progressive** decoder: one `WireToSurface2` payload in, clipped
+/// RGBA rectangles out (epic #158, slice 5 / #171).
+///
+/// This is the assembly layer over slices 1–4 — [`justrdp_pdu::rfx::progressive::decode_all`]
+/// parses, [`order_payload`] applies the per-payload block-ordering rules, [`SurfaceStore`] /
+/// [`TileGrid`] hold the cross-pass state and run the multi-pass decode, and what this type
+/// adds is the three things a tile decoder deliberately does not answer: **where the pixels
+/// go**, **what a rejected tile costs**, and **how much state a server may make us hold**.
+///
+/// # Where the pixels go: clipped to the region's rects
+///
+/// A region carries clip rectangles and a tile grid, and the two do not line up — this
+/// server's rects are 64-tall bands one tile row high but of arbitrary width (the narrowest
+/// measured is 20 px), so a tile at a band's edge is genuinely cut. FreeRDP intersects every
+/// dirty tile with the region's rects and copies only the intersections (`update_tiles`,
+/// `progressive.c:2329-2412`); the pre-#171 client blitted whole tiles.
+///
+/// **Those are two different pictures, not two spellings of one.** Replayed over the 52-payload
+/// corpus they leave **57 386 of 1 024 000** surface pixels different, and blitting whole tiles
+/// paints 6.10% more pixels than the server declared damaged — which under
+/// ADR-0010 (`docs/adr/0010-frameupdate-dirty-rect-contract.md`) is 6.10% of a
+/// redraw the host is asked to do for nothing. Clipping is therefore not a tidiness choice, and
+/// the corpus gate asserts the number rather than describing it.
+///
+/// # Two divergences from `update_tiles`, both unreachable on the corpus
+///
+/// Stated here rather than argued each time a reader notices them:
+///
+/// - **Overlapping region rects are painted twice.** FreeRDP unions the rects into a `REGION16`
+///   first, so its copies are disjoint; we intersect per rect. Both writes come from the same
+///   tile buffer at the same source offsets, so the *pixels* are identical — the cost is one
+///   redundant blit and a doubled dirty area. Measured: **0 overlapping rect pairs** across the
+///   corpus' 52 regions.
+/// - **Each region is clipped against its own rects.** FreeRDP clips the frame's whole
+///   accumulated dirty set against `progressive->region`, which after the parse loop holds the
+///   payload's **last** region — so on a multi-region payload it clips earlier regions' tiles
+///   with a later region's rects. Measured: **52 of 52 payloads carry exactly one region**, so
+///   the two agree on every byte this server has sent.
+///
+/// # What is deliberately not modelled: the deferred re-blit
+///
+/// FreeRDP keeps per-surface frame state — `frameId`, `numUpdatedTiles`, `updatedTileIndices`
+/// and a per-tile `dirty` flag (`progressive.h:190-201`), cleared when the frame id changes
+/// (`progressive.c:2437-2441`) — so that *every* tile touched so far in the current frame is
+/// re-blitted on every payload of that frame, clipped to that payload's rects. Reproducing it
+/// needs the decoded **pixels** of every tile retained, not just its coefficients: +16 KiB per
+/// tile on top of the 48 KiB of [`TileState`], a third more memory.
+///
+/// It is skipped, and **the condition under which that is safe is measured rather than
+/// assumed**, because the obvious guess was wrong. The mechanism matters only when one EGFX
+/// frame spans more than one `WireToSurface2` payload — which the corpus cannot answer, since
+/// the frame bracket lives a layer up in `justrdp::egfx` and `replay.bin` does not record it.
+/// Instrumented against the live VM on 2026-08-19 (a throwaway probe on the `StartFrame` /
+/// `EndFrame` / WireToSurface2 handlers, removed again):
+///
+/// - **4 of 65 frames carried two payloads**, so the mechanism is *reachable*, not inert by
+///   absence — the comfortable answer this probe was expected to give;
+/// - and replaying that capture both ways, FreeRDP's carried-over dirty set contributed
+///   **0 extra rectangles and 0 extra pixels**, leaving the two surfaces **byte-identical**.
+///
+/// So the omission is inert on measured traffic **as long as a frame's successive regions do
+/// not overlap each other's tiles** — which is what a server splitting one frame's damage into
+/// two payloads by region produces. That is the validity condition; a capture that breaks it is
+/// what would make this worth building.
+#[derive(Debug)]
+pub struct Progressive {
+    store: SurfaceStore,
+    scratch: Scratch,
+    /// One tile buffer for the life of the decoder — the sink borrows it, so no pass ever
+    /// allocates pixels.
+    tile: Box<[u8; TILE_RGBA_LEN]>,
+    store_budget: usize,
+}
+
+impl Default for Progressive {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Progressive {
+    /// A decoder holding no surfaces, with the [`MAX_STORE_BYTES`] store budget.
+    pub fn new() -> Self {
+        Self::with_store_budget(MAX_STORE_BYTES)
+    }
+
+    /// A decoder whose whole tile store may not exceed `bytes`. Tiles past the budget are
+    /// skipped ([`ProgressiveError::StoreBudgetExceeded`]), never fatal.
+    pub fn with_store_budget(bytes: usize) -> Self {
+        Self {
+            store: SurfaceStore::new(),
+            scratch: Scratch::new(),
+            tile: Box::new([0; TILE_RGBA_LEN]),
+            store_budget: bytes,
+        }
+    }
+
+    /// Decode one `WireToSurface2` block stream into `surface_id`'s store, calling `paint` once
+    /// per clipped rectangle of every tile the payload updated.
+    ///
+    /// `surface_width`/`surface_height` come from the surface's `CREATESURFACE`, not from the
+    /// block stream — the grid a tile index resolves against is a property of the surface, so
+    /// the parse layer structurally cannot bound it (#167's handover).
+    ///
+    /// Returns `Err` only for [`ProgressiveError::Parse`]: a payload whose block stream is
+    /// malformed carries no regions, so there is nothing to report about. Every other failure
+    /// is per tile and lands in [`PayloadOutcome`], because one bad tile must not cost the
+    /// well-formed ones beside it.
+    pub fn decode(
+        &mut self,
+        surface_id: u16,
+        surface_width: u16,
+        surface_height: u16,
+        data: &[u8],
+        mut paint: impl FnMut(PaintedRect<'_>),
+    ) -> Result<PayloadOutcome, ProgressiveError> {
+        let messages = justrdp_pdu::rfx::progressive::decode_all(data)?;
+        let order = order_payload(&messages);
+        let mut outcome = PayloadOutcome {
+            anomalies: order.anomalies,
+            fatal: order.fatal,
+            ..PayloadOutcome::default()
+        };
+        // FreeRDP's `goto fail` skips the blit and keeps the decode: the regions before the
+        // violation still reach the store, and the frame is simply not presented.
+        let present = outcome.fatal.is_none();
+
+        // Ensure the grid first (it may *replace* one whose dimensions no longer match), then
+        // read the store-wide count, then take the mutable borrow. `others` is constant for the
+        // rest of this call because only this surface's grid can grow inside it.
+        self.store
+            .grid_mut(surface_id, surface_width, surface_height);
+        let others = self.store.painted_tiles()
+            - self
+                .store
+                .grid(surface_id)
+                .map_or(0, TileGrid::painted_tiles);
+        let budget_tiles = self.store_budget / TILE_STATE_BYTES;
+        let grid = self
+            .store
+            .grid_mut(surface_id, surface_width, surface_height);
+
+        for region in order.regions {
+            for tile in &region.tiles {
+                let (x_idx, y_idx) = tile_indices(tile);
+                let result = match tile {
+                    ProgressiveTileBlock::Simple(t) | ProgressiveTileBlock::First(t) => {
+                        // Charged before the decode, so a refused tile costs no work — and only
+                        // for a tile the store does not already hold, so a session that fits its
+                        // budget keeps refining forever.
+                        if grid.tile(x_idx, y_idx).is_none()
+                            && others + grid.painted_tiles() >= budget_tiles
+                        {
+                            Err(ProgressiveError::StoreBudgetExceeded)
+                        } else {
+                            grid.decode_first(t, region, &mut self.scratch, &mut self.tile[..])
+                        }
+                    }
+                    ProgressiveTileBlock::Upgrade(t) => {
+                        grid.decode_upgrade(t, region, &mut self.scratch, &mut self.tile[..])
+                    }
+                };
+                if let Err(e) = result {
+                    outcome.tiles_skipped += 1;
+                    outcome.first_error.get_or_insert(e);
+                    continue;
+                }
+                outcome.tiles_decoded += 1;
+                if present {
+                    outcome.rects_painted += paint_tile(
+                        x_idx,
+                        y_idx,
+                        surface_width,
+                        surface_height,
+                        region,
+                        &self.tile[..],
+                        &mut paint,
+                    );
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Free one surface's tile store: `RDPGFX_CMDID_DELETESURFACE`, or a `CREATESURFACE` that
+    /// replaces a live id. See [`SurfaceStore::delete_surface`].
+    pub fn delete_surface(&mut self, surface_id: u16) {
+        self.store.delete_surface(surface_id);
+    }
+
+    /// `RDPGFX_CMDID_DELETEENCODINGCONTEXT` — **deliberately frees nothing**, and exists so the
+    /// decision is met at the call site. See [`SurfaceStore::delete_context`].
+    pub fn delete_context(&mut self, codec_context_id: u32) {
+        self.store.delete_context(codec_context_id);
+    }
+
+    /// Surfaces currently holding a tile store.
+    pub fn live_surfaces(&self) -> usize {
+        self.store.live_surfaces()
+    }
+
+    /// Tiles held across every surface.
+    pub fn painted_tiles(&self) -> usize {
+        self.store.painted_tiles()
+    }
+
+    /// What the tile store currently costs, in bytes — [`TILE_STATE_BYTES`] per painted tile.
+    /// The number a host charges against its own memory posture; the budget it is measured
+    /// against is [`Progressive::with_store_budget`]'s.
+    pub fn store_bytes(&self) -> usize {
+        self.store.painted_tiles() * TILE_STATE_BYTES
+    }
+
+    /// This surface's tile store, if one exists — the read-only view tests and hosts inspect.
+    pub fn grid(&self, surface_id: u16) -> Option<&TileGrid> {
+        self.store.grid(surface_id)
+    }
+}
+
+/// A tile block's grid coordinates, whichever pass kind it is.
+fn tile_indices(tile: &ProgressiveTileBlock<'_>) -> (u16, u16) {
+    match tile {
+        ProgressiveTileBlock::Simple(t) | ProgressiveTileBlock::First(t) => (t.x_idx, t.y_idx),
+        ProgressiveTileBlock::Upgrade(t) => (t.x_idx, t.y_idx),
+    }
+}
+
+/// Emit one [`PaintedRect`] per intersection of this tile with the region's clip rectangles,
+/// bounded by the surface. Returns how many were emitted.
+///
+/// The surface bound is applied to the *tile* before the rects are met, which is what makes a
+/// partial bottom row free: the corpus' 1280 × 800 surface is 20 × 13 tiles and its last row
+/// covers 32 of 64 lines. FreeRDP reaches the same place from the other end, checking
+/// `rect->left + width > surface->width` after the intersection (`progressive.c:2387-2390`).
+fn paint_tile(
+    x_idx: u16,
+    y_idx: u16,
+    surface_width: u16,
+    surface_height: u16,
+    region: &ProgressiveRegion<'_>,
+    tile: &[u8],
+    paint: &mut impl FnMut(PaintedRect<'_>),
+) -> usize {
+    let dim = u32::from(TILE_DIM);
+    let (tile_left, tile_top) = (u32::from(x_idx) * dim, u32::from(y_idx) * dim);
+    let tile_right = (tile_left + dim).min(u32::from(surface_width));
+    let tile_bottom = (tile_top + dim).min(u32::from(surface_height));
+    if tile_left >= tile_right || tile_top >= tile_bottom {
+        // Wholly off-surface. `TileGrid::z_index` already refuses an index outside the grid, so
+        // this is only reachable for the trailing partial tile of a zero-height axis.
+        return 0;
+    }
+
+    let mut emitted = 0;
+    for rect in &region.rects {
+        let left = tile_left.max(u32::from(rect.x));
+        let top = tile_top.max(u32::from(rect.y));
+        let right = tile_right.min(u32::from(rect.x) + u32::from(rect.width));
+        let bottom = tile_bottom.min(u32::from(rect.y) + u32::from(rect.height));
+        if left >= right || top >= bottom {
+            continue;
+        }
+        // Every value is bounded by a `u16` surface dimension or by a `u16` rect edge, so the
+        // casts below cannot truncate (`docs/map/invariant/decoder-dimension-overflow-32bit.md`
+        // — the arithmetic is done in `u32` from `u16` inputs precisely so 32-bit targets carry
+        // no separate case).
+        paint(PaintedRect {
+            x: left as u16,
+            y: top as u16,
+            width: (right - left) as u16,
+            height: (bottom - top) as u16,
+            src_x: (left - tile_left) as u16,
+            src_y: (top - tile_top) as u16,
+            tile,
+        });
+        emitted += 1;
+    }
+    emitted
 }
 
 #[cfg(test)]
@@ -2266,6 +2653,229 @@ mod tests {
         assert_eq!(grid.tiles[&0].bit_pos[0], uniform(6), "bitPos = quant + 0");
     }
 
+    // ---------------------------------------------------------------------------------------
+    // The assembly layer (#171): where the pixels go, what a bad tile costs, and the budget.
+    // ---------------------------------------------------------------------------------------
+
+    /// A region carrying `rects` and nothing else — [`paint_tile`] reads only that field.
+    fn clip_region(rects: &[(u16, u16, u16, u16)]) -> ProgressiveRegion<'static> {
+        ProgressiveRegion {
+            rects: rects
+                .iter()
+                .map(|&(x, y, width, height)| justrdp_pdu::rfx::RfxRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+                .collect(),
+            quants: Vec::new(),
+            prog_quants: Vec::new(),
+            flags: 0,
+            tiles: Vec::new(),
+        }
+    }
+
+    /// Every rectangle [`paint_tile`] emits for one tile, as
+    /// `(x, y, width, height, src_x, src_y)`.
+    fn clipped(
+        x_idx: u16,
+        y_idx: u16,
+        surface: (u16, u16),
+        rects: &[(u16, u16, u16, u16)],
+    ) -> Vec<(u16, u16, u16, u16, u16, u16)> {
+        let region = clip_region(rects);
+        let tile = [0u8; TILE_RGBA_LEN];
+        let mut out = Vec::new();
+        let emitted = paint_tile(
+            x_idx,
+            y_idx,
+            surface.0,
+            surface.1,
+            &region,
+            &tile,
+            &mut |r: PaintedRect<'_>| {
+                out.push((r.x, r.y, r.width, r.height, r.src_x, r.src_y));
+            },
+        );
+        assert_eq!(emitted, out.len(), "the count must match the sink's calls");
+        out
+    }
+
+    /// The base case: a rect that swallows the tile paints it whole, at source origin.
+    #[test]
+    fn a_tile_inside_the_region_paints_once_and_whole() {
+        assert_eq!(
+            clipped(1, 2, (1280, 800), &[(0, 0, 1280, 800)]),
+            vec![(64, 128, 64, 64, 0, 0)]
+        );
+    }
+
+    /// The arithmetic `update_tiles` does: `nXSrc = rect->left - updateRect.left`
+    /// (`progressive.c:2381-2384`). A rect starting 16 px into the tile paints 48 columns from
+    /// source column 16 — the offset is what a "clip by shrinking the width" bug gets wrong,
+    /// and it would be invisible in a test that only checked the destination rectangle.
+    #[test]
+    fn a_rect_that_cuts_the_tile_carries_the_source_offset() {
+        // Tile (1, 0) spans x 64..128. The rect starts at 80 and ends at 112.
+        assert_eq!(
+            clipped(1, 0, (1280, 800), &[(80, 0, 32, 64)]),
+            vec![(80, 0, 32, 64, 16, 0)]
+        );
+        // The same on the vertical axis: tile (0, 1) spans y 64..128.
+        assert_eq!(
+            clipped(0, 1, (1280, 800), &[(0, 100, 64, 28)]),
+            vec![(0, 100, 64, 28, 0, 36)]
+        );
+    }
+
+    /// This server's rects are 64-tall bands, so a tile row can meet several of them — and a
+    /// tile that meets two paints twice. Rect count and tile count are different quantities,
+    /// which is why [`PayloadOutcome`] reports both.
+    #[test]
+    fn a_tile_meeting_two_rects_paints_once_per_rect() {
+        assert_eq!(
+            clipped(0, 0, (1280, 800), &[(0, 0, 20, 64), (40, 0, 24, 64)]),
+            vec![(0, 0, 20, 64, 0, 0), (40, 0, 24, 64, 40, 0)]
+        );
+    }
+
+    /// **The recorded divergence, pinned rather than described.** FreeRDP unions the region's
+    /// rects into a `REGION16` before intersecting, so its copies are disjoint; we intersect
+    /// per rect and therefore paint an overlap twice. The pixels are identical — same tile
+    /// buffer, same source offsets — so the cost is one redundant blit, and no region in the
+    /// 52-payload corpus has overlapping rects at all.
+    #[test]
+    fn overlapping_rects_paint_the_overlap_twice_where_freerdp_unions_them() {
+        let painted = clipped(0, 0, (1280, 800), &[(0, 0, 40, 64), (20, 0, 44, 64)]);
+        assert_eq!(
+            painted,
+            vec![(0, 0, 40, 64, 0, 0), (20, 0, 44, 64, 20, 0)],
+            "columns 20..40 are painted by both rects"
+        );
+    }
+
+    /// A tile no rect touches paints nothing — and is still *decoded*, because its coefficients
+    /// are what the next pass refines. Decoding and presenting are separate.
+    #[test]
+    fn a_tile_outside_every_rect_paints_nothing() {
+        assert!(clipped(5, 5, (1280, 800), &[(0, 0, 64, 64)]).is_empty());
+    }
+
+    /// The partial last row costs nothing extra: the tile is bounded by the surface before the
+    /// rects are met. The corpus surface is 1280 x 800 — 20 x 13 tiles, the last row covering
+    /// 32 of its 64 lines.
+    #[test]
+    fn the_partial_bottom_row_is_bounded_by_the_surface() {
+        assert_eq!(
+            clipped(0, 12, (1280, 800), &[(0, 0, 1280, 800)]),
+            vec![(0, 768, 64, 32, 0, 0)]
+        );
+        // And a rect that reaches past the surface cannot drag the paint past it either.
+        assert_eq!(
+            clipped(19, 12, (1280, 800), &[(1216, 768, 4096, 4096)]),
+            vec![(1216, 768, 64, 32, 0, 0)]
+        );
+    }
+
+    /// One block: `blockType(u16) + blockLen(u32, header included) + body`.
+    fn push_block(out: &mut Vec<u8>, block_type: u16, body: &[u8]) {
+        out.extend_from_slice(&block_type.to_le_bytes());
+        out.extend_from_slice(&((6 + body.len()) as u32).to_le_bytes());
+        out.extend_from_slice(body);
+    }
+
+    fn frame_begin_body() -> Vec<u8> {
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b
+    }
+
+    /// A malformed block stream is the **only** thing that fails the whole call — everything
+    /// else the payload can get wrong is per tile and lands in [`PayloadOutcome`].
+    #[test]
+    fn a_malformed_block_stream_is_the_only_err() {
+        let mut p = Progressive::new();
+        assert!(matches!(
+            p.decode(1, 128, 128, &[0xFF; 16], |_| unreachable!()),
+            Err(ProgressiveError::Parse(_))
+        ));
+    }
+
+    /// An empty payload is well-formed and does nothing — the degenerate case a `while
+    /// remaining > 0` loop gets wrong by looping forever or by erroring.
+    #[test]
+    fn an_empty_payload_is_a_no_op() {
+        let mut p = Progressive::new();
+        let outcome = p.decode(1, 128, 128, &[], |_| unreachable!()).unwrap();
+        assert_eq!(outcome, PayloadOutcome::default());
+        assert_eq!(p.live_surfaces(), 1, "the surface's store is still created");
+    }
+
+    /// A fatal ordering violation is reported and **suppresses the paint**, matching FreeRDP's
+    /// `goto fail` past `update_tiles` with `rc = 1` (`progressive.c:2482-2486`).
+    #[test]
+    fn a_fatal_ordering_violation_reports_and_paints_nothing() {
+        let mut stream = Vec::new();
+        push_block(&mut stream, 0xCCC1, &frame_begin_body());
+        push_block(&mut stream, 0xCCC1, &frame_begin_body());
+        let mut p = Progressive::new();
+        let outcome = p.decode(1, 128, 128, &stream, |_| unreachable!()).unwrap();
+        assert_eq!(outcome.fatal, Some(ProgressiveError::DuplicateFrameBegin));
+        assert_eq!(outcome.rects_painted, 0);
+    }
+
+    /// Tolerated violations come back for the host to log, because a sans-IO core has no
+    /// logger — `WLog_WARN` is what FreeRDP does with the same conditions.
+    ///
+    /// **The second `FRAME_END` trips two rows, not one**, and that is the reference rather
+    /// than an artefact: `progressive_wb_frame_end` tests `FRAME_BEGIN`-unset and
+    /// `FRAME_END`-already-set as two independent `if`s (`progressive.c:1967-1970`), so a
+    /// duplicate that also had no opening block logs both warnings. Pinned here because an
+    /// `else if` chain is the obvious way to write this and would silently drop a row.
+    #[test]
+    fn a_tolerated_ordering_violation_is_reported_not_swallowed() {
+        let mut stream = Vec::new();
+        push_block(&mut stream, 0xCCC2, &[]); // FRAME_END with no FRAME_BEGIN
+        push_block(&mut stream, 0xCCC2, &[]); // and then a duplicate, still with none
+        let mut p = Progressive::new();
+        let outcome = p.decode(1, 128, 128, &stream, |_| unreachable!()).unwrap();
+        assert_eq!(
+            outcome.anomalies,
+            vec![
+                OrderAnomaly::FrameEndWithoutFrameBegin,
+                OrderAnomaly::FrameEndWithoutFrameBegin,
+                OrderAnomaly::DuplicateFrameEnd
+            ]
+        );
+        assert!(outcome.fatal.is_none(), "neither one ends the walk");
+    }
+
+    /// A budget of zero admits no tile at all — the boundary the `>=` comparison decides, and
+    /// the one an off-by-one would let through.
+    #[test]
+    fn a_zero_store_budget_admits_no_tile() {
+        let mut p = Progressive::with_store_budget(0);
+        assert_eq!(p.store_bytes(), 0);
+        // Reached through the grid the decoder owns, so the check is the one `decode` runs.
+        assert_eq!(p.painted_tiles(), 0);
+        let mut stream = Vec::new();
+        push_block(&mut stream, 0xCCC1, &frame_begin_body());
+        p.decode(1, 128, 128, &stream, |_| unreachable!()).unwrap();
+        assert_eq!(p.painted_tiles(), 0);
+    }
+
+    /// `TILE_STATE_BYTES` is derived from the arrays rather than written down, but the number
+    /// it derives to is load-bearing — it is the 3x multiplier the budget is reasoned about
+    /// in, and it appears in #158, #169 and #170's write-ups.
+    #[test]
+    fn a_tile_state_is_48_kib_against_16_kib_of_rgba() {
+        assert_eq!(TILE_STATE_BYTES, 49_152);
+        assert_eq!(TILE_RGBA_LEN, 16_384);
+        assert_eq!(TILE_STATE_BYTES, 3 * TILE_RGBA_LEN);
+        assert_eq!(MAX_STORE_BYTES / TILE_STATE_BYTES, 5_461);
+    }
+
     #[test]
     fn a_wrongly_sized_output_buffer_is_an_error() {
         let (mut grid, mut scratch, _) = grid_and_scratch();
@@ -2321,6 +2931,44 @@ mod tests {
             u.y_idx = y_idx;
             let _ = grid.decode_upgrade(&u, &r, &mut scratch, &mut rgba);
             let _ = grid.decode_upgrade(&u, &r, &mut scratch, &mut rgba);
+        }
+    }
+
+    proptest! {
+        // ADR-0008 / #97 for the **assembly layer** — a new untrusted-input surface, and the
+        // one the WireToSurface2 bytes reach first. The layers below it each have their own
+        // property (`decode_all` in `justrdp-pdu`, the multi-pass path above), and none of
+        // them exercises the composition: the block ordering deciding which regions run, the
+        // clip arithmetic reading a *region's* rects against a *surface's* dimensions, and a
+        // store that survives between calls.
+        //
+        // Two things are generated outside what a real server sends, on purpose: the surface
+        // dimensions (so a tile index can be out of range in either axis, and so a 1-pixel
+        // surface exercises the empty-intersection branch), and a **sequence** of payloads
+        // against one decoder, because the store is the only state a single call cannot reach.
+        #![proptest_config(ProptestConfig::with_cases(512))]
+        #[test]
+        fn the_assembled_decode_never_panics_on_arbitrary_input(
+            width in 1u16..=512,
+            height in 1u16..=512,
+            surface_id in any::<u16>(),
+            payloads in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..=384), 1..=3),
+        ) {
+            let mut decoder = Progressive::with_store_budget(64 * TILE_STATE_BYTES);
+            for payload in &payloads {
+                let _ = decoder.decode(surface_id, width, height, payload, |rect| {
+                    // The sink's contract is what a host relies on, so assert it here rather
+                    // than trusting it: the named sub-rectangle must be inside the tile buffer
+                    // and inside the surface. `assert!` rather than `prop_assert!` because the
+                    // sink returns `()` — a panic here still fails and shrinks the case.
+                    assert_eq!(rect.tile.len(), TILE_RGBA_LEN);
+                    assert!(usize::from(rect.src_x) + usize::from(rect.width) <= 64);
+                    assert!(usize::from(rect.src_y) + usize::from(rect.height) <= 64);
+                    assert!(u32::from(rect.x) + u32::from(rect.width) <= u32::from(width));
+                    assert!(u32::from(rect.y) + u32::from(rect.height) <= u32::from(height));
+                });
+            }
         }
     }
 }

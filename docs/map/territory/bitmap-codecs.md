@@ -144,9 +144,10 @@ attacker-controlled bytes in the repo.
 - `justrdp-codecs/src/rfx/` — `mod.rs` (`RemoteFx`, `RfxError`), `rlgr.rs`
   (`decode`), `dwt.rs` (`decode`), `dwt_extrapolate.rs` (`decode`), `quant.rs`
   (`dequantize`, `ll3_delta_decode`, `BANDS_STANDARD`, `BANDS_EXTRAPOLATE`),
-  `srl.rs` (`upgrade_component`, `SrlError`), `progressive.rs` (`TileGrid`,
-  `TileState`, `Scratch`, `ProgressiveError`, `SurfaceStore`, `order_payload`,
-  `PayloadOrder`, `OrderAnomaly`)
+  `srl.rs` (`upgrade_component`, `SrlError`), `progressive.rs` (`Progressive`,
+  `PaintedRect`, `PayloadOutcome`, `TileGrid`, `TileState`, `Scratch`,
+  `ProgressiveError`, `SurfaceStore`, `order_payload`, `PayloadOrder`,
+  `OrderAnomaly`, `TILE_STATE_BYTES`, `MAX_STORE_BYTES`)
 - `justrdp-codecs/src/color.rs` — `to_rgba`, `rfx_ycbcr_to_rgba`, `bytes_per_pixel`,
   `Palette`
 - `justrdp-pdu/src/rfx.rs` — `RfxMessage`, `TileSet`, `Tile`, `Quant`, `RfxRect`,
@@ -192,26 +193,33 @@ as citations.
 
 - **Standalone NSCodec (surface bits / bitmap cache) is not built** — #150; today's
   NSCodec exists as the ClearCodec subcodec only.
-- **RemoteFX Progressive is not self-owned** — epic #158. Slice 1 (#167) landed the
-  wire parser above, slice 2 (#168) the upgrade-pass entropy layer (`rfx/srl.rs`)
-  and slice 3 (#169) the multi-pass tile decode plus the reduce-extrapolate inverse
-  DWT (`rfx/progressive.rs`, `rfx/dwt_extrapolate.rs`) and slice 4 (#170) the store's
-  lifecycle plus the per-payload block ordering (`SurfaceStore`, `order_payload`); the
-  assembly and real-VM proof (#171) and the bootstrap drop (#172) are open, so `egfx.rs`
-  still delegates Progressive to `ironrdp-graphics`. **Two consequences of that ordering are
-  live right now:** nothing composes `order_payload` with `SurfaceStore` and the tile decode
-  outside the corpus test, and `justrdp::egfx` still frees on `RESETGRAPHICS`
+- **RemoteFX Progressive is self-owned but not yet wired** — epic #158. Slices 1–5 landed
+  the wire parser (#167), the upgrade-pass entropy layer (#168, `rfx/srl.rs`), the multi-pass
+  tile decode plus the reduce-extrapolate inverse DWT (#169), the store's lifecycle plus the
+  per-payload block ordering (#170) and the full-pipeline assembly (#171, `Progressive`).
+  **Only the bootstrap drop (#172) is open, and it is the wiring**: `justrdp-codecs/src/egfx.rs`
+  still delegates Progressive to `ironrdp-graphics`, so nothing a *server* sends reaches the
+  self-owned decoder in the live client — only the corpus and the `#[ignore]`d VM proof do.
+  Two consequences stay live until #172: `justrdp::egfx` still frees on `RESETGRAPHICS`
   (`justrdp/src/egfx.rs:319`) and on `DELETEENCODINGCONTEXT` (`:484`) — correct for the
   id-keyed bootstrap oracle (#83), wrong once the surface-keyed store is wired, and pinned by
-  a passing test (`:1206`) that #172 has to retire. FreeRDP also carries **per-surface,
-  per-frame blit state** — `frameId`, `numUpdatedTiles`, `updatedTileIndices`, a per-tile
+  a passing test (`:1206`) that #172 has to retire; and the live WTS2 arm blits **whole tiles**
+  where the self-owned decoder clips to the region's rects, which #171 measured to be a
+  57 386-pixel difference on a 1 280 x 800 surface rather than a dirty-rect nicety. #91 is the
+  RLGR bit-reader performance work. **Its verification basis is owned as of #194** — a
+  real-server corpus plus FreeRDP-derived SRL expectations, not an oracle diff, because the
+  oracle decodes 2 of 52 real payloads (ADR-0011). The SRL half of that basis was
+  **re-derived in #168**: five of its eight vectors had been computed at the oracle's initial
+  `kp`.
+- **FreeRDP's deferred re-blit is not modelled, and that is measured rather than assumed.**
+  Its per-surface frame state — `frameId`, `numUpdatedTiles`, `updatedTileIndices`, a per-tile
   `dirty` flag (`progressive.h:190-201`), reset by the frame id changing
-  (`progressive.c:2437-2441`) and driving a deferred re-blit of the whole frame's dirty set
-  (`:2346`) — which `TileGrid` models not at all; that is #171's. #91 is the RLGR bit-reader performance
-  work. **Its verification basis is owned as of #194** — a real-server corpus plus
-  FreeRDP-derived SRL expectations, not an oracle diff, because the oracle decodes 2 of
-  52 real payloads (ADR-0011). The SRL half of that basis was **re-derived in #168**:
-  five of its eight vectors had been computed at the oracle's initial `kp`.
+  (`progressive.c:2437-2441`) — re-blits the frame's whole accumulated dirty set on every
+  payload (`:2346`). Probed live on 2026-08-19 (#171): **4 of 65 frames carried two
+  WireToSurface2 payloads**, so the mechanism is reachable — and replaying that capture both
+  ways, the carried-over set contributed **0 rectangles and 0 pixels**, leaving the two
+  surfaces byte-identical. Inert *as long as a frame's successive regions do not overlap each
+  other's tiles*; a capture that breaks that is what would make it worth building.
 - **The upgrade path's band walk has no non-extrapolate variant**, matching FreeRDP
   (`progressive.c:1281-1322`) and the capture, where all 52 payloads set
   `RFX_DWT_REDUCE_EXTRAPOLATE`. The first-pass decoder does branch on it, so #169 needs

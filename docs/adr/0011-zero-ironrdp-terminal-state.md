@@ -51,6 +51,29 @@
   narrowing seam is unreachable, which is what makes it a usable ADR-0007 stage-boundary
   cross-check. Retirement stays *per codec and per stage*, on evidence — that is the Decision
   working, not an exception to it.
+- **Amendment (2026-08-19, #171): the self-owned decoder exists, and the basis proved something
+  the oracle structurally could not.** Slice 5 assembled the pipeline
+  (`justrdp_codecs::rfx::progressive::Progressive`) and gated it on the owned basis this record
+  requires — the 52-payload corpus plus FreeRDP-derived expectations — with a fresh real-VM run
+  as the round-trip (**0 tiles skipped, 0 failures**, over 862 tiles the server sent that day).
+  Two things belong on this record rather than only in the issue.
+  **(a) The oracle is not merely unable to decode this traffic; on the assembly layer it is on
+  the wrong side of a picture-changing question.** `ironrdp-graphics::progressive` returns whole
+  64 x 64 tiles and never clips them to the region's rects; FreeRDP clips (`update_tiles`,
+  `progressive.c:2329-2412`). Measured over the corpus, the two policies leave **57 386 of a
+  1 280 x 800 surface's 1 024 000 pixels different**. So a differential against the oracle would
+  not merely have been *unmeetable* here — passing it would have required painting the wrong
+  picture, which is a stronger statement than the Context below makes and the one that
+  retroactively justifies rejecting alternative (B).
+  **(b) The owned basis found something no oracle diff could have.** The corpus carries no
+  expected pixels, so the decisive instrument was a *counterfactual* — replaying the same bytes
+  under both policies and diffing the surfaces. That is only available to a basis you own; a
+  differential can compare two implementations but cannot price one implementation's own
+  alternative. Recorded because "the owned basis is weaker than a diff, just necessary" is the
+  easy reading of this record, and this is a case where it was strictly stronger.
+  The Decision is unchanged. The dev-dependency now supports only the canaries and the
+  `dwt_extrapolate` stage cross-check; the **runtime** dependency for Progressive drops in #172,
+  which is wiring rather than decoding.
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
 

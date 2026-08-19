@@ -3473,6 +3473,317 @@ mod tests {
         .await;
     }
 
+    /// **Slice 5's real-VM gate (#171).** Drive a live EGFX session, then assemble the pixels
+    /// the server actually sent with the **self-owned** Progressive decoder — parse, block
+    /// ordering, multi-pass tile decode, region clipping — and assert the result is a desktop.
+    ///
+    /// # Why this is a round-trip and not a second corpus replay
+    ///
+    /// `progressive_assembly_corpus.rs` gates the decoder against 52 payloads committed on
+    /// 2026-08-13. This runs against whatever the server sends *today*: a different session, a
+    /// different desktop, a different refinement schedule (which regions a server codes is
+    /// non-deterministic — the corpus README says so). A decoder that had been fitted to the
+    /// committed bytes would pass there and fail here, which is the whole point of keeping both.
+    ///
+    /// It is deliberately **not** the same claim as
+    /// `egfx_graphics_pipeline_renders_the_desktop_against_real_vm`: that one proves the live
+    /// client paints a desktop, and it does so over ClearCodec and WireToSurface1, because
+    /// `justrdp::egfx` still routes WireToSurface2 through the bootstrap oracle. Wiring this
+    /// decoder into that path is #172's, so the proof available here is *these bytes through
+    /// this decoder*, which is exactly what slice 5 owns.
+    ///
+    /// # Two traps this inherits rather than rediscovers (`docs/plan.md` §0)
+    ///
+    /// - **`connectionType` decides whether refinement exists at all.** On `LAN` the server has
+    ///   bandwidth to spare and sends `TILE_FIRST` at `quality = 0xFF` with **zero** upgrades,
+    ///   so a run that forgot this would measure half the codec and report success. `MODEM`.
+    /// - **A static desktop sends one payload.** The mouse sweeps and Start-menu open/close are
+    ///   what make the server spend WireToSurface2 traffic, and the idle windows between them
+    ///   are the condition an upgrade pass is sent under, not padding.
+    ///
+    /// Run with `--nocapture`; it dumps a PPM of the assembled surface for human confirmation.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn progressive_assembles_the_desktop_against_real_vm() {
+        with_vm_session(|vm| async move {
+            use justrdp_codecs::rfx::progressive::Progressive;
+            use justrdp_pdu::rfx::progressive::{self, ProgressiveMessage, ProgressiveTile};
+
+            let dump = std::env::temp_dir().join("justrdp-progressive-assembly");
+            let _ = std::fs::remove_dir_all(&dump);
+            std::fs::create_dir_all(&dump).expect("create the capture dir");
+            // SAFETY: set before the session task spins up and removed after it ends; the
+            // harness lock serialises real-VM tests and nothing else touches this var.
+            unsafe {
+                std::env::set_var("JUSTRDP_PROGRESSIVE_CAPTURE_DIR", &dump);
+            }
+
+            let mut config = test_config(); // EGFX flag ON + drdynvc channel
+            config.core.connection_type = 0x01; // MODEM — see the doc above
+            config.client_info.performance_flags = 0; // wallpaper/drag/animation ON
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut stream = outcome.stream;
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            let driver = tokio::spawn(async move {
+                let mv = |x: u16, y: u16| {
+                    vec![InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    }]
+                };
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                for round in 0..2u16 {
+                    for step in 0..12u16 {
+                        let x = (desktop.0 / 12).saturating_mul(step).max(4);
+                        let y = (desktop.1 / 12)
+                            .saturating_mul((step + round * 4) % 12)
+                            .max(4);
+                        if tx.send(mv(x, y)).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                    }
+                    let start = (24u16, desktop.1.saturating_sub(20));
+                    let click = vec![
+                        InputEvent::Mouse {
+                            flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                            wheel_units: 0,
+                            x: start.0,
+                            y: start.1,
+                        },
+                        InputEvent::Mouse {
+                            flags: justrdp_pdu::input::PTRFLAGS_DOWN
+                                | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                            wheel_units: 0,
+                            x: start.0,
+                            y: start.1,
+                        },
+                        InputEvent::Mouse {
+                            flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                            wheel_units: 0,
+                            x: start.0,
+                            y: start.1,
+                        },
+                    ];
+                    if tx.send(click).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if tx.send(tap(0x1B)).await.is_err() {
+                        return; // Esc — closes the menu, leaves no window behind
+                    }
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                }
+            });
+
+            // The timeout is the expected exit — a healthy session never ends on its own.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(55),
+                run_session_with_input(&mut stream, &mut machine, |_, _fb| {}, |_| {}, &mut rx),
+            )
+            .await;
+            driver.abort();
+
+            // SAFETY: see the matching `set_var` above — same serialised, single-writer context.
+            unsafe {
+                std::env::remove_var("JUSTRDP_PROGRESSIVE_CAPTURE_DIR");
+            }
+
+            // ---- assemble the captured payloads with the self-owned decoder ----------------
+            const SURFACE_ID: u16 = 0;
+            let manifest = std::fs::read_to_string(dump.join("manifest.tsv")).unwrap_or_default();
+            let mut decoder = Progressive::new();
+            let mut canvas: Vec<u8> = Vec::new();
+            let (mut canvas_w, mut canvas_h) = (0usize, 0usize);
+
+            let mut payloads = 0usize;
+            let (mut simple, mut first, mut upgrade) = (0usize, 0usize, 0usize);
+            let mut tiles_decoded = 0usize;
+            let mut tiles_skipped = 0usize;
+            let mut rects_painted = 0usize;
+            let mut painted_px = 0u64;
+            let mut clipped_rects = 0usize;
+            let mut anomalies: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut failures: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut qualities: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+
+            for row in manifest.lines() {
+                let f: Vec<&str> = row.split('\t').collect();
+                let (Some(idx), Some(w), Some(h)) = (
+                    f.first().and_then(|s| s.parse::<usize>().ok()),
+                    f.get(2).and_then(|s| s.parse::<u16>().ok()),
+                    f.get(3).and_then(|s| s.parse::<u16>().ok()),
+                ) else {
+                    continue;
+                };
+                let Ok(bytes) = std::fs::read(dump.join(format!("prog-{idx:04}.bin"))) else {
+                    continue;
+                };
+                payloads += 1;
+
+                // Census the block stream independently of the decode, so "it decoded" and
+                // "it contained upgrade passes" stay separate claims.
+                if let Ok(messages) = progressive::decode_all(&bytes) {
+                    for message in &messages {
+                        if let ProgressiveMessage::Region(region) = message {
+                            for tile in &region.tiles {
+                                match tile {
+                                    ProgressiveTile::Simple(_) => simple += 1,
+                                    ProgressiveTile::First(t) => {
+                                        first += 1;
+                                        if let Some(q) = t.quality {
+                                            qualities.insert(q);
+                                        }
+                                    }
+                                    ProgressiveTile::Upgrade(t) => {
+                                        upgrade += 1;
+                                        qualities.insert(t.quality);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if canvas.is_empty() {
+                    canvas_w = usize::from(w);
+                    canvas_h = usize::from(h);
+                    canvas = vec![0; canvas_w * canvas_h * 4];
+                }
+                let (cw, ch) = (canvas_w, canvas_h);
+
+                let outcome = decoder.decode(SURFACE_ID, w, h, &bytes, |rect| {
+                    rects_painted += 1;
+                    painted_px += u64::from(rect.width) * u64::from(rect.height);
+                    if rect.width != 64 || rect.height != 64 {
+                        clipped_rects += 1;
+                    }
+                    // The surface the capture was taken against never changes mid-session, so a
+                    // rect outside this canvas would be a decoder defect rather than a resize.
+                    if usize::from(rect.x) + usize::from(rect.width) > cw
+                        || usize::from(rect.y) + usize::from(rect.height) > ch
+                    {
+                        panic!("painted rect escaped the surface");
+                    }
+                    for row in 0..usize::from(rect.height) {
+                        let src = ((usize::from(rect.src_y) + row) * 64
+                            + usize::from(rect.src_x))
+                            * 4;
+                        let dst = ((usize::from(rect.y) + row) * cw + usize::from(rect.x)) * 4;
+                        let n = usize::from(rect.width) * 4;
+                        canvas[dst..dst + n].copy_from_slice(&rect.tile[src..src + n]);
+                    }
+                });
+
+                match outcome {
+                    Ok(o) => {
+                        tiles_decoded += o.tiles_decoded;
+                        tiles_skipped += o.tiles_skipped;
+                        for a in &o.anomalies {
+                            *anomalies.entry(format!("{a:?}")).or_default() += 1;
+                        }
+                        if let Some(e) = &o.fatal {
+                            *failures.entry(format!("fatal: {e}")).or_default() += 1;
+                        }
+                        if let Some(e) = &o.first_error {
+                            *failures.entry(format!("tile: {e}")).or_default() += 1;
+                        }
+                    }
+                    Err(e) => *failures.entry(format!("payload: {e}")).or_default() += 1,
+                }
+            }
+
+            eprintln!(
+                "#171 assembly proof: {payloads} WireToSurface2 payloads, surface {canvas_w}x{canvas_h}"
+            );
+            eprintln!("  TILE_SIMPLE={simple}  TILE_FIRST={first}  TILE_UPGRADE={upgrade}");
+            eprintln!("  quality values: {qualities:?}");
+            eprintln!(
+                "  tiles decoded={tiles_decoded} skipped={tiles_skipped}  \
+                 rects painted={rects_painted} (clipped: {clipped_rects})  pixels={painted_px}"
+            );
+            eprintln!(
+                "  store: {} surfaces, {} tiles, {} bytes",
+                decoder.live_surfaces(),
+                decoder.painted_tiles(),
+                decoder.store_bytes()
+            );
+            for (sig, n) in &anomalies {
+                eprintln!("  ORDERING ANOMALY x{n}: {sig}");
+            }
+            for (sig, n) in &failures {
+                eprintln!("  FAILURE x{n}: {sig}");
+            }
+
+            assert!(
+                payloads > 0,
+                "no WireToSurface2 payloads captured — the VM may not have used Progressive"
+            );
+            assert!(
+                failures.is_empty(),
+                "the assembled decoder rejected something the real server sent: {failures:?}"
+            );
+            assert_eq!(
+                tiles_skipped, 0,
+                "no tile the real server sent may be skipped"
+            );
+            assert!(tiles_decoded > 0 && rects_painted > 0);
+            assert!(
+                upgrade > 0,
+                "no TILE_UPGRADE at connectionType=MODEM — the refinement half of the codec was \
+                 not exercised, so this run proves only the first pass"
+            );
+            assert!(
+                clipped_rects > 0,
+                "no tile was clipped by its region's rects — the seam this slice owns was not \
+                 exercised, so a green run here would not mean what it looks like"
+            );
+
+            // A decode that silently produced garbage looks like a monochrome or barely-painted
+            // surface, so both are checked: neither alone rules the other out.
+            let total = (canvas_w * canvas_h) as u64;
+            let lit = canvas
+                .chunks_exact(4)
+                .filter(|px| px[..3].iter().any(|&b| b != 0))
+                .count() as u64;
+            let mut distinct = std::collections::HashSet::new();
+            for px in canvas.chunks_exact(4) {
+                distinct.insert([px[0], px[1], px[2]]);
+                if distinct.len() > 64 {
+                    break;
+                }
+            }
+            eprintln!("  lit={lit} of {total}px, {}+ distinct colours", distinct.len());
+            assert!(
+                distinct.len() > 64,
+                "assembled surface is near-monochrome ({} colours) — the decode produced garbage",
+                distinct.len()
+            );
+            assert!(
+                lit * 4 >= total,
+                "expected at least a quarter of the surface painted, got {lit} of {total}"
+            );
+
+            let path = std::env::temp_dir().join("justrdp-171-progressive-assembly.ppm");
+            let mut ppm = format!("P6\n{canvas_w} {canvas_h}\n255\n").into_bytes();
+            for px in canvas.chunks_exact(4) {
+                ppm.extend_from_slice(&px[..3]);
+            }
+            std::fs::write(&path, ppm).expect("write the visual dump");
+            eprintln!("visual dump for confirmation: {}", path.display());
+        })
+        .await;
+    }
+
     /// Real-VM acceptance test for slice-8: drdynvc + Display Control resize. Connect with
     /// the `drdynvc` static channel (EGFX gate flag deliberately **off**, so graphics stay on
     /// the proven bitmap path), wait for the server to negotiate drdynvc caps, create the

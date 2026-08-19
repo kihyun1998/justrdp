@@ -79,7 +79,70 @@ def seed_progressive(out_dir):
     return written
 
 
-SEEDERS = {"progressive": seed_progressive}
+def seed_progressive_assembly(out_dir):
+    """Wrap the same capture in the assembly target's header, one seed per payload plus a few
+    multi-payload runs.
+
+    The target reads its own byte layout rather than deriving `Arbitrary` precisely so this
+    function can exist -- the layout is declared in `fuzz_targets/progressive_assembly.rs` and
+    this is its only other appearance:
+
+        u16 width | u16 height | u8 flags | (u32 len, payload)*
+
+    The dimensions written are the *real* ones the capture was taken against, which is the whole
+    reason the target clamps rather than takes a modulo: a bound small enough to look prudent
+    would put these seeds outside their own tile grid, and every tile would come back
+    `TileOutsideSurface`. A seed that decodes nothing is worse than no seed, because it looks
+    like coverage.
+
+    The multi-payload runs are the point of this target over `progressive`: a first pass and the
+    upgrades that refine it, against one live store, is the composition no single payload
+    reaches. Consecutive payloads are used because the capture is in arrival order.
+    """
+    fixture = REPO / "crates/justrdp-codecs/tests/fixtures/progressive/replay.bin"
+    if not fixture.is_file():
+        print(f"::error::seed fixture missing: {fixture.relative_to(REPO)}")
+        return None
+
+    buf = fixture.read_bytes()
+    (count,) = struct.unpack_from("<I", buf, 0)
+    pos = 4
+    payloads = []
+    dims = None
+    for _ in range(count):
+        _ctx, w, h, length = struct.unpack_from("<IHHI", buf, pos)
+        pos += 12
+        payloads.append(buf[pos : pos + length])
+        pos += length
+        if dims is None:
+            dims = (w, h)
+
+    header = struct.pack("<HHB", dims[0], dims[1], 0)
+
+    def record(chunks):
+        out = bytearray(header)
+        for c in chunks:
+            out += struct.pack("<I", len(c))
+            out += c
+        return bytes(out)
+
+    written = 0
+    for i, payload in enumerate(payloads):
+        (out_dir / f"single-{i:03d}.bin").write_bytes(record([payload]))
+        written += 1
+    # Runs of two and three, which is where the cross-payload store is exercised. Strided so the
+    # set spans the session rather than clustering at its start.
+    for n in (2, 3):
+        for i in range(0, len(payloads) - n + 1, n):
+            (out_dir / f"run{n}-{i:03d}.bin").write_bytes(record(payloads[i : i + n]))
+            written += 1
+    return written
+
+
+SEEDERS = {
+    "progressive": seed_progressive,
+    "progressive_assembly": seed_progressive_assembly,
+}
 
 
 def main(argv):

@@ -8,9 +8,11 @@
 //! The pipeline per tile component is the spec's inverse chain: RLGR entropy decode
 //! ([`rlgr`]) → LL3 delta reconstruction → dequantization ([`quant`]) → three-level inverse
 //! DWT ([`dwt`]) → ICT color transform (`color::rfx_ycbcr_to_rgba`). The pure-math stages
-//! are deliberately separate, reusable functions: a future RemoteFX **Progressive** rewrite
-//! consumes the same transforms (issue #58's "natural companion" note), it must not
-//! re-implement them. Scope: image mode only — the legacy inter-frame video mode is a typed
+//! are deliberately separate, reusable functions: the RemoteFX **Progressive** decoder
+//! ([`progressive`], epic #158) consumes the same transforms (issue #58's "natural companion"
+//! note) rather than re-implementing them — with one measured exception, the reduce-extrapolate
+//! inverse DWT ([`dwt_extrapolate`], #169), which is a second transform and not a variant of
+//! [`dwt`]. Scope: image mode only — the legacy inter-frame video mode is a typed
 //! error, and 4:4:4 fixed 64×64 tiles are the only shape WTS1 carries.
 
 pub mod dwt;
