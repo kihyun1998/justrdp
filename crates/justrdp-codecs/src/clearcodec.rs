@@ -205,9 +205,10 @@ struct GlyphEntry {
 /// Stateful ClearCodec wrapper — the V-bar / glyph caches persist across PDUs.
 ///
 /// This is the API the EGFX core consumes (`new` + `decode_to_bgra`). It is intentionally
-/// **ungated** — ClearCodec no longer rides the `egfx-bootstrap` feature, since its decoder
-/// ([`ClearDecoder`]) owns every layer and pulls in no `ironrdp-graphics`. The wrapper also
-/// hosts the corpus-capture hook.
+/// **ungated**: its decoder ([`ClearDecoder`]) owns every layer and pulls in no
+/// `ironrdp-graphics`. #56 took it off the `egfx-bootstrap` feature; #189 removed that feature
+/// altogether, so there is no gate left for anything here to ride. The wrapper also hosts the
+/// corpus-capture hook.
 pub struct Clear {
     inner: ClearDecoder,
 }

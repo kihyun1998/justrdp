@@ -6,9 +6,9 @@
 //! cache, the blit/fill/cache ops, and the dirty-region batching live here. Every codec on this
 //! path is now self-owned — zgfx bulk decompression was the last delegation and it went in #189,
 //! so `ironrdp-graphics` is out of the runtime graph entirely (ADR-0003 phase 3, ADR-0011).
-//! The client speaks first: `start()` sends a Caps Advertise pinned
-//! to CAPVERSION_8 — the RemoteFX/Progressive/Clear/Planar era — which structurally keeps the
-//! server away from AVC (H.264), for which no decoder exists yet.
+//! The client speaks first: `start()` sends a Caps Advertise pinned to CAPVERSION_8 — the
+//! RemoteFX/Progressive/Clear/Planar era — which structurally keeps the server away from AVC
+//! (H.264), for which no decoder exists yet.
 //!
 //! WireToSurface1 RemoteFX (`CODECID_CAVIDEO`) decodes through the self-owned
 //! `justrdp-codecs::rfx` decoder (issue #58, ADR-0007) — it skipped the bootstrap phase
