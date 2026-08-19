@@ -11,10 +11,13 @@ acknowledge frames. It is server→client only, and it is reachable only if
 
 ## Governing decisions
 
-- [ADR-0003](../../adr/0003-phased-codecs-differential-oracle.md) — the EGFX
-  decoders (zgfx, RemoteFX Progressive) are the ones still on the phase-1
-  `egfx-bootstrap` wrapper, so this territory is where the phased-ownership plan is
-  visibly unfinished (epic #158).
+- [ADR-0003](../../adr/0003-phased-codecs-differential-oracle.md) — this territory
+  held the phase-1 `egfx-bootstrap` wrappers longest and is where the plan finished:
+  Progressive left in #171/#172 (epic #158) and zgfx in #189, which deleted the
+  feature. Phase 3 for every decoder here.
+- [ADR-0011](../../adr/0011-zero-ironrdp-terminal-state.md) — #189's removal is the
+  runtime half of that record reaching its terminal state: no `ironrdp` crate is in
+  the runtime graph at all.
 - [ADR-0010](../../adr/0010-frameupdate-dirty-rect-contract.md) — surfaces blit
   straight into the framebuffer with no intermediate extract copy (#163).
 
@@ -37,19 +40,24 @@ acknowledge frames. It is server→client only, and it is reachable only if
 - `justrdp/src/egfx.rs` — `Surface`, `CachedBitmap` (`mapped`, `dirty`)
 - `justrdp-pdu/src/egfx.rs` — `EgfxPdu`, `Rect16`, `Point16`, `decode_all`,
   `encode_caps_advertise`, `encode_frame_acknowledge`, `wrap_uncompressed`
-- `justrdp-codecs/src/egfx.rs` — `Zgfx` (behind the `egfx-bootstrap` feature — the
-  last phase-1 wrapper; Progressive left it in #172)
+- `justrdp-codecs/src/zgfx.rs` — `Zgfx`, `ZgfxError`, `History`, `BitReader`,
+  `TOKEN_TABLE` (self-owned since #189, which deleted the bootstrap wrapper module
+  that used to sit here)
 - `justrdp-codecs/src/rfx/progressive.rs` — `Progressive`, `PaintedRect`,
   `PayloadOutcome`, `SurfaceStore` (self-owned, ungated, live since #172)
 - `justrdp-codecs/src/capture.rs` — `progressive_capture_dir`, `progressive_payload`
-  (the real-server corpus harness, ungated so it does not ride zgfx's feature flag)
+  (the real-server corpus harness; ungated since #172, when it was moved off the
+  bootstrap wrapper's feature flag — a flag that no longer exists after #189)
 - Spec sections cited inline: `[MS-RDPEGFX]` 2.2.2.14, 3.3.8.2
 
 ## Reference behaviour
 
 **None.** No verified external-fact store. Note that this is the territory whose
-phase-2 rewrite (epic #158) *depends* on a reference comparison — the oracle is
-`ironrdp-graphics`, and its shared lineage is itself an invariant below.
+phase-2 rewrites (epic #158, then #189) *depended* on a reference comparison — the
+oracle is `ironrdp-graphics`, and its shared lineage is itself an invariant below.
+zgfx is the one case here where the references supplied a genuinely independent
+expectation instead: FreeRDP and `ironrdp-graphics` reproduce the `[MS-RDPEGFX]`
+sample byte-identically, so agreeing with it is not agreeing with either of them.
 
 ## Cross-cutting invariants
 
@@ -79,8 +87,8 @@ phase-2 rewrite (epic #158) *depends* on a reference comparison — the oracle i
 
 ## Known holes / open
 
-- **zgfx alone is still an `ironrdp-graphics` wrapper** behind `egfx-bootstrap`; #189 is
-  its rewrite. Epic #158 (slices #167–#172) closed the Progressive half: the self-owned
+- **Both decoders are self-owned.** zgfx crossed in #189 and epic #158 (slices #167–#172)
+  closed the Progressive half: the self-owned
   decoder (`justrdp_codecs::rfx::progressive::Progressive`) is the **live** WTS2 decoder as
   of #172, so this territory no longer holds two decoders that disagree about the picture.
   What the swap changed on the wire-visible side: a tile is now painted only where its
@@ -89,13 +97,25 @@ phase-2 rewrite (epic #158) *depends* on a reference comparison — the oracle i
   which is 6193 x 16 KiB of allocation per session that
   [the frame path carries no owned pixels](../invariant/frame-path-carries-no-owned-pixels.md)
   never reached because it stopped at the surface→framebuffer step.
-  **A consequence that is easy to miss: an
-  oracle bump is a *live-path* change for zgfx**, not only a test change — the
-  0.8 → 0.9 move (#184/#186) shipped Devolutions/IronRDP#1395, which stops Progressive
-  requiring a `WBT_CONTEXT` block on every frame once a context exists. #170's self-owned
-  lifecycle reproduces it and then some: `order_payload` never gates a region on a context
-  block at all, which is FreeRDP's rule and the one the real server needs (51 of its 52
-  payloads carry no `CONTEXT`).
+  **An oracle bump is no longer a live-path change for anything in this territory** — that
+  used to be true of zgfx and stopped being true in #189, so the
+  [oracle-bump table](../invariant/oracle-agreement-is-not-independence.md) has no row-1
+  case left. What #189 added instead is the reason a *correct* delegate was still worth
+  removing: the delegated decompressor panicked on 5 of 7 crafted messages and the panic
+  reached `GraphicsProcessor::process`, because a dependency's decode path cannot appear in
+  a fuzz roster derived from `ls fuzz/fuzz_targets/` or in proptests that live in our own
+  modules. The 0.8 → 0.9 move (#184/#186) shipped Devolutions/IronRDP#1395, which stops
+  Progressive requiring a `WBT_CONTEXT` block on every frame once a context exists; #170's
+  self-owned lifecycle reproduces it and then some — `order_payload` never gates a region on
+  a context block at all, which is FreeRDP's rule and the one the real server needs (51 of
+  its 52 payloads carry no `CONTEXT`).
+- **The VM has never sent a multipart zgfx message.** Measured over one session: 25
+  messages, every one `ZGFX_SEGMENTED_SINGLE` and `PACKET_COMPRESSED`; the `0xE1`
+  descriptor's decode path is proved by the `[MS-RDPEGFX]` sample and the oracle
+  differential, not by a real server. Same shape as
+  [capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md),
+  with no advertised flag to change — a server sends multipart only when a message exceeds
+  65535 bytes, and this one's largest was 10 680.
 - H.264 / AVC420 / AVC444 (epic #21) is absent — no oracle exists for it either
   (ADR-0002's amendment says so explicitly).
 - Surface-to-surface and surface-to-cache commands are implemented against one

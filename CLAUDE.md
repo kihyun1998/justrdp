@@ -35,7 +35,7 @@ justrdp 가 **하지 않는 것** (의존성으로 끌어들이지도 말 것):
 ## 크레이트 구조 (ADR-0001)
 
 가상 워크스페이스(edition 2024). 멤버 4 + 워크스페이스 밖 `fuzz`:
-`justrdp-pdu`(무의존 PDU) · `justrdp`(sans-IO 코어) · `justrdp-codecs`(코덱, ironrdp-graphics 오라클) · `justrdp-tokio`(~30줄 I/O 어댑터 — tokio/sspi/rustls 는 여기만) · `fuzz`(워크스페이스 밖, nightly). 상세 표·`--workspace` 사각지대는 `docs/agents/theflow.md`.
+`justrdp-pdu`(무의존 PDU) · `justrdp`(sans-IO 코어) · `justrdp-codecs`(코덱 — 전부 자체 소유, ironrdp-graphics 는 **dev 오라클로만**; #189 이후 런타임 그래프에 ironrdp 없음) · `justrdp-tokio`(~30줄 I/O 어댑터 — tokio/sspi/rustls 는 여기만) · `fuzz`(워크스페이스 밖, nightly). 상세 표·`--workspace` 사각지대는 `docs/agents/theflow.md`.
 
 **위임 의존(ADR-0002, 전부 leaf·보안 크리티컬·비-RDP)**: `rustls`(`ring` provider)·`rustls-platform-verifier`(#36)·`sspi`·`x509-cert`. **sspi 포크 브리지는 끝났다(2026-08-10)**: `[patch.crates-io]` 제거, `sspi = "=0.21.3"` 정확 핀(ADR-0004 Decision 이 요구하는 형태). Devolutions/sspi-rs#689 가 0.21.1 로 출시되며 탈출 조건이 충족됐고, 루프백 full-CredSSP 테스트가 퍼블리시 크레이트에서 통과한다. **실 VM 스위트는 아직 못 돌렸다** — VM 자격증명이 `STATUS_LOGON_FAILURE`(클라이언트 회귀 아님, A/B 확인). ADR-0004 Amendment(2026-08-10) + [`docs/map/territory/nla-credssp.md`](docs/map/territory/nla-credssp.md).
 

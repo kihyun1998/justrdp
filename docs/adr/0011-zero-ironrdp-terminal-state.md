@@ -85,6 +85,40 @@
   *removes* the per-tile `Vec<u8>` the bootstrap wrapper allocated, 6193 x 16 KiB over one
   captured session, which is the frame path's no-owned-pixels invariant reaching one stage
   further up than it had.
+- **Amendment (2026-08-19, #189): the runtime half of this record is done, and the reason it
+  mattered turned out to be broader than correctness.** zgfx is self-owned
+  (`justrdp_codecs::zgfx`), the `egfx-bootstrap` feature is deleted, and
+  `cargo tree -p justrdp-tokio -e normal` names **no `ironrdp` crate at all** — the Decision's
+  point 1 reached, and the graph is `justrdp → { rustls, sspi }` as ADR-0002 §Notes wrote it.
+  Three things belong on the record.
+  **(a) A runtime delegation exports the robustness posture too, and no oracle diff measures
+  that.** This record's Context is about the oracle being *wrong*; for zgfx it is not wrong —
+  it decodes everything its own compressor emits, and the differential in
+  `tests/differential_zgfx.rs` passes over sequences. What it *was* is unguarded: probed
+  directly, **five of seven** crafted `RDP_SEGMENTED_DATA` messages panicked inside
+  `ironrdp_graphics::zgfx` (`mid > len` from a `split_at` on an untrusted `u32`, `attempt to
+  subtract with overflow` from `8 * (len - 1) - last_byte`, and three bit-cursor index
+  panics), and the panic reached `justrdp::egfx::GraphicsProcessor::process` — the live path,
+  because this decompressor sees every EGFX byte before the PDU parser does. That gap was
+  **structural, not an oversight**: the fuzz roster derives from `ls fuzz/fuzz_targets/` and
+  the no-panic properties live in this repo's own modules, so a delegated decode path cannot
+  appear in either by construction. Retiring a delegation is therefore worth doing even where
+  the delegate is *correct*.
+  **(b) zgfx did not need an owned basis in Progressive's sense, and got one anyway.** The
+  `[MS-RDPEGFX]` sample is reproduced byte-identically by FreeRDP
+  (`libfreerdp/codec/test/TestFreeRDPCodecZGfx.c`, *"Sample from [MS-RDPEGFX]"*) and by
+  `ironrdp-graphics`, so an expectation derived independently of both implementations was
+  available for the asking — and its compressed segment matches at distance 31 back into an
+  *earlier segment*, which is the cross-message history contract in one vector. The oracle
+  keeps its dev-dependency role here as breadth, which is what point 3 of the Decision
+  intends.
+  **(c) The coverage ceiling, measured rather than assumed.** Instrumented against the VM for
+  one session: **25 messages, every one `ZGFX_SEGMENTED_SINGLE` and every one
+  `PACKET_COMPRESSED`** — 18 488 literal tokens, 19 024 matches, 7 unencoded runs, longest
+  match 5 062 bytes, **longest distance 133 937**, which is past a single segment's 65 535
+  ceiling and so is direct evidence of the window spanning messages on a real wire. The
+  multipart descriptor `0xE1` **never appeared**; its proof is the spec vector and the
+  oracle differential, not the VM.
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
 
@@ -138,8 +172,8 @@ is an end date.
 dependency graph — runtime *and* development.**
 
 1. **Runtime.** Unchanged from ADR-0003: the `egfx-bootstrap` delegation drops per codec as each
-   is self-owned. Progressive's dropped in #172 (see the 2026-08-19 amendment); **zgfx (#189) is
-   the last holder**, and when it lands the runtime graph is `justrdp → { rustls, sspi }`.
+   is self-owned. Progressive's dropped in #172 and zgfx's in #189, which deleted the feature
+   itself — **done**: the runtime graph is `justrdp → { rustls, sspi }`.
 2. **Development.** The oracle is a *bootstrapping instrument with a retirement condition*, not
    a standing gate. A codec's oracle dev-dependency drops when that codec's correctness rests on
    a basis we own — a real-server corpus plus expectations derived independently of our
@@ -174,9 +208,10 @@ coherent, not why it is compelled.
   duration.
 - **Progressive is the first codec to exercise this**, because it is the first where the oracle
   demonstrably cannot decode real traffic (#194).
-- **The runtime dependency is down to one codec, and both halves stay tracked**:
-  `ironrdp-graphics` at runtime by #189 alone now that #172 has landed, and the dev-dependency
-  per codec by each codec's own basis. No new tracker structure is created by this record.
+- **The runtime half is closed and the development half is not.** `ironrdp-graphics` left the
+  runtime graph entirely in #189 (2026-08-19 amendment); it remains a **dev-dependency** of
+  `justrdp-codecs`, as does `ironrdp-pdu` of `justrdp-pdu` and `justrdp`, and each retires on
+  that codec's or layer's own owned basis. No new tracker structure is created by this record.
 - **The `ironrdp-pdu` dev-dependency in `justrdp-pdu` is in scope too.** It is the differential
   oracle for wire round-trips (`tests/differential_ironrdp.rs`), the same instrument in a
   different layer, and the same retirement condition applies: an owned basis, then drop.

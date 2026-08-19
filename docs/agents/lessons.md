@@ -27,6 +27,17 @@ Read this before starting so the bindings do not read as abstractions.
 - **Derive, don't copy (ADR-0003).** IronRDP code is re-derived from spec, and
   correctness is proven by differential test, not structural similarity — which is
   also what lets the `ironrdp-graphics` dependency be *dropped* once the oracle passes.
+- **A dependency's decode path is a surface neither of this repo's rosters can
+  name (#189).** zgfx was the *outermost* decoder on the EGFX path — every server byte
+  crosses it before `justrdp_pdu::egfx::decode_all` — and it had neither a proptest nor a
+  fuzz target, not by oversight but because it was delegated to `ironrdp-graphics`. The two
+  derivations the never-panics invariant carries (`ls fuzz/fuzz_targets/` and a walk of
+  `crates/*/src`) both enumerate *our* code, so they answered "fully covered" while a live
+  decoder sat outside them. Probed rather than reasoned about: **5 of 7** crafted
+  `RDP_SEGMENTED_DATA` messages panicked, and the panic surfaced at
+  `justrdp::egfx::GraphicsProcessor::process` — the core. The generalisation is small and
+  worth keeping: **a completeness claim inherits the scope of the list it was derived from**,
+  so the question to ask a green roster is what it enumerates, not how long it is.
 - **CVE knowledge is a reference, not a memory** — rle/planar/clearcodec/nsc OOB
   points (memory `rdp_decoder_robustness_refs`); read them at FreeRDP source.
 
@@ -39,6 +50,24 @@ Read this before starting so the bindings do not read as abstractions.
 - **`ring` over `aws-lc-rs`** — the rustls provider is chosen to avoid the NASM
   build requirement on Windows; `rustls-platform-verifier` supplies the OS trust
   store (#36).
+
+## Step 3 — the test-trust gate
+
+- **A mutation harness can report a false green, and the tell is not in its output
+  (#189).** Nine mutations were run in batches: write the mutation, `cargo test`, parse the
+  FAILED lines, revert. One of them — a single wrong literal in the zgfx token table —
+  came back **"no test went red"**, which reads as a coverage hole in the differential and
+  would have been written up as one. Re-run alone it turns **two** tests red. The cause is
+  mtime granularity: the previous mutation's revert and this one's write landed in the same
+  filesystem timestamp tick, so cargo skipped the rebuild and the batch tested *unmutated*
+  code. The harness never checked `returncode`, so "no failures parsed" and "nothing ran"
+  were indistinguishable in its output.
+  Two things this pins. **The instrument that proves a test can fail must itself be provably
+  running** — the gate turned on itself, and the cheapest guard is asserting the process
+  actually failed (`returncode != 0`) rather than trusting a parse of its stdout. And **a
+  false green here is worse than a false red**: a false red gets investigated, while a false
+  green is *evidence of a hole that does not exist*, which sends the next hour into writing
+  a test for a case already covered.
 
 ## Step 4 — real round-trip, not a fake (ADR-0003/0007)
 
@@ -72,6 +101,20 @@ Read this before starting so the bindings do not read as abstractions.
   sides see every codec in arrival order — which needs a core-side replay seam that
   does not exist).
 
+- **The VM proves what the VM sends, and the only way to know that is to count it
+  (#189).** The zgfx swap's round-trip was the existing EGFX acceptance test, and it passed —
+  198 frames, a correct Server 2022 desktop, dumped and looked at. What the pass does *not*
+  say is which of the decoder's paths carried it, so a throwaway probe counted: **25 messages,
+  every one `ZGFX_SEGMENTED_SINGLE` and every one `PACKET_COMPRESSED`** — 18 488 literals,
+  19 024 matches, 7 unencoded runs, longest match 5 062 bytes, **longest distance 133 937**.
+  Two opposite conclusions came out of the same five minutes, and neither was guessable. The
+  token decoder is *heavily* exercised, and the 133 937 is direct evidence of the history
+  window spanning messages on a real wire — stronger than the hand-built test that asserts the
+  same thing. And the **multipart descriptor never appeared at all**, so `0xE1`'s framing is
+  proved by the spec vector and the oracle differential and by nothing a server has done.
+  Recorded in the territory's `## Known holes`, because "the VM renders the desktop" would
+  otherwise have been written as if it covered the whole module.
+
 ## Step 5 — adversarial completeness is automated (ADR-0008)
 
 - **proptest no-panic (#98) + cargo-fuzz (#99)** make the completeness axis
@@ -85,6 +128,20 @@ Read this before starting so the bindings do not read as abstractions.
   own second half, and wrong from the day `progressive` landed.) —
   [`docs/map/invariant/untrusted-decode-never-panics.md`](../map/invariant/untrusted-decode-never-panics.md).
 
+- **The pass found a panic in the code written to remove panics (#189).** The whole
+  point of self-owning zgfx was that the delegated decompressor panicked on untrusted input;
+  the replacement shipped with three no-panic proptests, two of them *directed* (prefixed with
+  a valid wrapper, because a descriptor byte and a compression-type nibble gate the token
+  decoder behind 1-in-2048 of random prefixes). All green at 2048 cases each. The adversarial
+  pass then walked the bit cursor's invariants by hand and found that the byte-alignment step
+  before an unencoded run could push the position **past** the segment's budget, after which
+  `remaining()`'s subtraction underflows. Reproduced in one hand-built message, confirmed as a
+  real panic, fixed by making the alignment refusable.
+  Why the property could not find it: the input needs a specific first body byte, a specific
+  trailing unused-bit count *and* a specific length to coincide — the same three-way
+  coincidence #219 records, and the same conclusion. It also sharpens what "directed" buys: the
+  prefix got the generator past the wrapper, which is necessary and nowhere near sufficient,
+  because the depth that matters is *inside* the bitstream's own arithmetic.
 - **The lane's first crash, and it is the sequel to the entry below (#219).** The
   #168 bullet *"`checked_shl` checks the shift amount, never the value"* records why
   `rfx::srl::accumulate` grew a round-trip guard. On 2026-08-19 the nightly fuzz lane

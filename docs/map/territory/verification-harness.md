@@ -47,14 +47,15 @@ everywhere else.
 ## Code
 
 - `justrdp-codecs/tests/` — `differential_ironrdp_graphics.rs`,
-  `differential_rfx.rs`, `differential_pointer_ironrdp.rs`, `clearcodec_corpus.rs`,
-  `progressive_corpus.rs`, `progressive_srl_freerdp.rs`, `fixtures/`
+  `differential_rfx.rs`, `differential_pointer_ironrdp.rs`, `differential_zgfx.rs`,
+  `clearcodec_corpus.rs`, `progressive_corpus.rs`, `progressive_srl_freerdp.rs`,
+  `fixtures/`
 - `justrdp-pdu/tests/` — `differential_ironrdp.rs`, `differential_activation.rs`
 - `justrdp/tests/` — `differential_input_ironrdp.rs`,
   `differential_license_crypto.rs`
-- `fuzz/fuzz_targets/` — `capability.rs`, `clearcodec.rs`, `egfx.rs`, `fastpath.rs`,
-  `license.rs`, `nscodec.rs`, `planar.rs`, `pointer.rs`, `progressive.rs`, `rfx.rs`,
-  `rle.rs`
+- `fuzz/fuzz_targets/` — **not enumerated here on purpose**; the list below is the
+  derivation and this file kept a copy of it that was already four targets stale by #200
+  and would have gone stale again with #189's `zgfx.rs`
 - `justrdp-tokio/src/lib.rs` — the `#[ignore]`d VM tests and the loopback CredSSP
   test
 - Target list derivation: `ls fuzz/fuzz_targets/` — and since #200 this is not just how
