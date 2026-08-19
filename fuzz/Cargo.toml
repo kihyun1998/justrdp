@@ -173,3 +173,13 @@ path = "fuzz_targets/progressive_assembly.rs"
 test = false
 doc = false
 bench = false
+
+# zgfx (#189): the outermost EGFX decoder. Added with the self-owned decompressor rather than
+# after it — the wrapper it replaces had neither a target nor a property, and it is the one
+# decoder every EGFX byte crosses.
+[[bin]]
+name = "zgfx"
+path = "fuzz_targets/zgfx.rs"
+test = false
+doc = false
+bench = false

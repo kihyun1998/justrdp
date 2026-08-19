@@ -31,7 +31,7 @@ This creates a tempo tension: if we depend on `ironrdp-graphics` for codecs, we 
 
 - **"Reference = copy = vendoring" is explicitly avoided.** We re-derive the codec logic from the MS-RDP spec, not copy ironrdp's code, and we prove correctness via differential testing, not by structural similarity. This keeps us honest about understanding the protocol.
 
-- **Workspace footprint.** `justrdp-codecs` depends on `ironrdp-graphics` initially; the dependency is feature-gated and removed once all codecs are self-owned. Downstream applications can pin `ironrdp-graphics` to zero if they use a version of justrdp with no ironrdp-graphics dependency.
+- **Workspace footprint.** `justrdp-codecs` depends on `ironrdp-graphics` initially; the dependency is feature-gated and removed once all codecs are self-owned. Downstream applications can pin `ironrdp-graphics` to zero if they use a version of justrdp with no ironrdp-graphics dependency. *(Realized 2026-08-19 in #189: zgfx was the last feature-gated codec, so the `egfx-bootstrap` feature is gone and `justrdp-codecs` carries `ironrdp-graphics` as a dev-dependency only. Phase 3 is reached for every codec in the crate; see [ADR-0011](0011-zero-ironrdp-terminal-state.md) for the development half, which is not.)*
 
 - **No "forever fork" of ironrdp.** We are not maintaining a parallel codec implementation alongside theirs; we own ours completely and move on once it works.
 

@@ -1,7 +1,8 @@
 //! Self-owned WireToSurface1 RemoteFX decoder (MS-RDPRFX, `RDPGFX_CODECID_CAVIDEO`) —
 //! issue #58, ADR-0003 phase-2. The first self-owned EGFX tile codec: it skipped the
 //! bootstrap phase entirely (the bootstrap crate never had an assembled RemoteFX decoder),
-//! so there is no `egfx-bootstrap` gate to drop — `ironrdp-graphics` appears only as the
+//! so it never had a feature gate to drop — and since #189 nothing here does, because
+//! `egfx-bootstrap` is gone with its last holder. `ironrdp-graphics` appears only as the
 //! dev-dependency oracle, verified per ADR-0007 (stage-boundary + composed-reference
 //! differentials; the real VM never emits CAVIDEO, so synthetic streams are the corpus).
 //!

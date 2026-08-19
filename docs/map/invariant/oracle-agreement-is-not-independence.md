@@ -114,7 +114,7 @@ different consequence:
 
 | The oracle changed… | What it means here |
 |---|---|
-| a codec we **delegate to at runtime** (`egfx-bootstrap`: zgfx alone since #172) | a live-path change, not just a test change — prove it on the VM |
+| a codec we **delegate to at runtime** — **none since #189**, when zgfx was self-owned and `egfx-bootstrap` deleted; kept as a row because the answer "there is no live path" is the thing to re-check, not to assume | was: a live-path change, not just a test change — prove it on the VM |
 | a codec we **self-own** | our differential's expected value moved; adjudicate against FreeRDP/corpus before touching our code |
 | a path we **do not implement** | expected no-op; say so, and check the differential actually walks the case rather than assuming |
 

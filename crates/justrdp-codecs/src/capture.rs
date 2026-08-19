@@ -9,9 +9,11 @@
 //! `capture_progressive_corpus_against_real_vm`, `progressive_assembles_the_desktop_against_real_vm`)
 //! are all `#[ignore]`d and need the VM.
 //!
-//! Ungated on purpose. The bootstrap module it came from is behind `egfx-bootstrap`, which now
-//! covers zgfx alone — a capture harness that disappears with an unrelated codec's feature flag
-//! is the same silent-drift shape one layer up.
+//! Ungated on purpose, and the reason outlived the thing it was reasoning about. This harness
+//! used to live inside the bootstrap wrapper, behind `egfx-bootstrap`; #172 moved it out because
+//! a capture harness that disappears with an unrelated codec's feature flag is the same
+//! silent-drift shape one layer up. #189 then deleted that feature outright, so the hazard is
+//! gone — but "ungated" is now simply what every module here is.
 //!
 //! **What it captures is the wire payload, not a decode.** That is why it is a free function
 //! taking bytes rather than a hook inside a decoder: the self-owned

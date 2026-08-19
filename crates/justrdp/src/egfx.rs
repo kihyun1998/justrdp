@@ -3,12 +3,12 @@
 //! project exists to unlock (the ironrdp 0x0100 gate-flag story, plan.md §0).
 //!
 //! justrdp **owns the surface model** (ADR-0002): the off-screen surface store, the bitmap
-//! cache, the blit/fill/cache ops, and the dirty-region batching live here. The tile *codecs*
-//! are phase-1 bootstrap wrappers (`justrdp-codecs::egfx`, ADR-0003): zgfx bulk
-//! decompression, RemoteFX Progressive, and ClearCodec ride `ironrdp-graphics` until the
-//! self-owned rewrites land. The client speaks first: `start()` sends a Caps Advertise pinned
-//! to CAPVERSION_8 — the RemoteFX/Progressive/Clear/Planar era — which structurally keeps the
-//! server away from AVC (H.264), for which no decoder exists yet.
+//! cache, the blit/fill/cache ops, and the dirty-region batching live here. Every codec on this
+//! path is now self-owned — zgfx bulk decompression was the last delegation and it went in #189,
+//! so `ironrdp-graphics` is out of the runtime graph entirely (ADR-0003 phase 3, ADR-0011).
+//! The client speaks first: `start()` sends a Caps Advertise pinned to CAPVERSION_8 — the
+//! RemoteFX/Progressive/Clear/Planar era — which structurally keeps the server away from AVC
+//! (H.264), for which no decoder exists yet.
 //!
 //! WireToSurface1 RemoteFX (`CODECID_CAVIDEO`) decodes through the self-owned
 //! `justrdp-codecs::rfx` decoder (issue #58, ADR-0007) — it skipped the bootstrap phase
@@ -20,7 +20,7 @@ use crate::dvc::{DvcProcessor, ProcessorOutput};
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::clearcodec::Clear;
 use justrdp_codecs::color::{self, Palette};
-use justrdp_codecs::egfx::Zgfx;
+use justrdp_codecs::zgfx::Zgfx;
 // The self-owned Progressive decoder (#171), wired here in #172. It keys its tile store by
 // **surface**, which is what retires the `codecContextId` bookkeeping this module used to carry.
 use justrdp_codecs::planar;
@@ -1241,6 +1241,29 @@ mod tests {
     fn garbage_zgfx_is_a_typed_error() {
         let mut p = GraphicsProcessor::default();
         assert!(p.process(&[0x12, 0x34]).is_err());
+    }
+
+    /// The #189 regression, pinned at the boundary the panic actually reached rather than one
+    /// layer down. Each of these crafted `RDP_SEGMENTED_DATA` messages **panicked** through the
+    /// bootstrap wrapper — `mid > len` from a `split_at` on a server-chosen `u32`, `attempt to
+    /// subtract with overflow` from the unused-bit arithmetic, and a bit-cursor index — and a
+    /// panic here kills the host's session, which is what
+    /// `docs/map/invariant/untrusted-decode-never-panics.md` forbids. zgfx is the outermost
+    /// decoder on this path, so it is also the one every EGFX byte crosses first.
+    #[test]
+    fn crafted_segmented_data_is_a_typed_error_not_a_panic() {
+        for message in [
+            &[0xE1u8, 1, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0x7F][..],
+            &[0xE0, 0x24, 0x05][..],
+            &[0xE0, 0x24, 0x00, 0x00][..],
+            &[0xE0, 0x24, 0x88, 0x00, 0x00, 0x00, 0x07][..],
+        ] {
+            let mut p = GraphicsProcessor::default();
+            assert!(
+                p.process(message).is_err(),
+                "expected a typed error for {message:02x?}"
+            );
+        }
     }
 
     #[test]

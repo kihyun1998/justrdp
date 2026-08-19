@@ -63,6 +63,21 @@ that trusts its server too much) rather than as memory safety.
   (`i64::MIN >> 63` is `-1`, so `-1 << 63` round-trips having wrapped). The sibling
   proptest generates every one of the three values involved — it needed them to
   *coincide*, which is the depth coverage guidance buys and random sampling does not.
+- **#189** — the gap the two automations above **cannot** see. zgfx was the outermost
+  decoder on the EGFX path (every server byte crosses it before the PDU parser) and had
+  neither a proptest nor a fuzz target, because it was *delegated*: the fuzz roster derives
+  from `ls fuzz/fuzz_targets/` and the properties live in this repo's modules, so a
+  dependency's decode path is outside both **by construction**. Probed directly, five of
+  seven crafted `RDP_SEGMENTED_DATA` messages panicked inside `ironrdp_graphics::zgfx` and
+  the panic reached `justrdp::egfx::GraphicsProcessor::process`. Self-owning it closed the
+  hole; the general rule is below.
+- **#189, second finding: a 2048-case property missed a panic in the replacement.** The
+  self-owned decoder's own byte-alignment step could push the bit cursor past its budget,
+  underflowing `remaining()`. Three no-panic proptests — one undirected, two prefixed with a
+  valid wrapper — ran green over it, because the input needs a specific first byte, a
+  specific trailing unused-bit count *and* a specific length to coincide. Found by the
+  adversarial pass instead. Same shape as #219: random sampling generates every value and
+  cannot make three of them coincide.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
@@ -95,6 +110,14 @@ bytes reach **16.5%–48.8%** of the regions in the connect-sequence parsers, ag
 Progressive does — its headers are short enough that a mutator finds valid values by
 chance. `displaycontrol` at 16.5% is the closest to the wall and the one to re-measure
 first if a target here ever looks stuck.
+
+**A decoder we do not own is subject to this and invisible to both derivations above.**
+Neither `ls fuzz/fuzz_targets/` nor a walk of `crates/*/src` can name a decode path that
+lives in a dependency, so "everything we parse is covered" was true and beside the point
+while `ironrdp-graphics::zgfx` sat on the live EGFX path (#189). There is no such path
+today — `cargo tree -p justrdp-tokio -e normal` names no `ironrdp` crate — which makes the
+recurrence test a one-liner rather than a hole: **if that command ever prints a decoder
+again, this invariant does not reach it.**
 
 New decoder ⇒ a proptest no-panic property in the same PR (stable gate), and a fuzz
 target — which is **two** artifacts, not one: `fuzz/fuzz_targets/<name>.rs` *and* its
