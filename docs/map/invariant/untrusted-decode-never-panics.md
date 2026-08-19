@@ -57,6 +57,12 @@ that trusts its server too much) rather than as memory safety.
 - **#99** — coverage-guided `cargo-fuzz` on a nightly CI lane, because proptest's
   random sampling does not reach depth. Two automations for one property: that
   duplication *is* the discovery history.
+- **#219** — the lane's **first crash**, which turned the line above from an argument
+  into a measurement. `progressive_srl` panicked in `rfx::srl::accumulate` on a
+  refinement that lands on exactly `i64::MIN`, where the round-trip guard is blind
+  (`i64::MIN >> 63` is `-1`, so `-1 << 63` round-trips having wrapped). The sibling
+  proptest generates every one of the three values involved — it needed them to
+  *coincide*, which is the depth coverage guidance buys and random sampling does not.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
