@@ -16,7 +16,7 @@
   first pass and never refined. Advertising `MODEM` yields 3250 upgrade tiles. Promoted to
   [`capture-coverage-follows-what-we-advertise`](../map/invariant/capture-coverage-follows-what-we-advertise.md).
   The Decision is unchanged; the oracle dev-dependency stays until the self-owned decoder
-  exists (#171/#172), and the canaries are what use it.
+  exists (#171) and is live (#172), and the canaries are what use it.
 - **Amendment (2026-08-18, #168): the oracle's reach extended into the owned basis itself.**
   Slice 2 measured a **fifth** oracle divergence — its SRL state starts at `kp = 0` where
   FreeRDP's starts at `8` (`progressive.c:1272`, unchanged since 2.11.7), so the two
@@ -72,8 +72,19 @@
   alternative. Recorded because "the owned basis is weaker than a diff, just necessary" is the
   easy reading of this record, and this is a case where it was strictly stronger.
   The Decision is unchanged. The dev-dependency now supports only the canaries and the
-  `dwt_extrapolate` stage cross-check; the **runtime** dependency for Progressive drops in #172,
-  which is wiring rather than decoding.
+  `dwt_extrapolate` stage cross-check; the **runtime** dependency for Progressive dropped in
+  #172 (2026-08-19 amendment), which was wiring rather than decoding.
+- **Amendment (2026-08-19, #172): Progressive's runtime delegation is gone, and the wiring
+  falsified one of epic #158's own recorded premises.** The self-owned decoder is the live
+  WireToSurface2 decoder; `ironrdp-graphics` now serves Progressive only as a dev-dependency
+  for the canaries and the `dwt_extrapolate` stage cross-check. The runtime graph still holds
+  it for **zgfx alone** (#189). Two things worth keeping off the PR body: the epic recorded
+  that `Surface::blit` "cannot express a source offset" and that this slice would have to widen
+  it — **measured false**, because the blit's slice start and its stride are independent
+  parameters, so a source offset is a slice rather than a signature change; and the swap
+  *removes* the per-tile `Vec<u8>` the bootstrap wrapper allocated, 6193 x 16 KiB over one
+  captured session, which is the frame path's no-owned-pixels invariant reaching one stage
+  further up than it had.
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
 
@@ -127,8 +138,8 @@ is an end date.
 dependency graph — runtime *and* development.**
 
 1. **Runtime.** Unchanged from ADR-0003: the `egfx-bootstrap` delegation drops per codec as each
-   is self-owned. The remaining holders are RemoteFX Progressive (epic #158, slice #172) and
-   zgfx (#189). When both land, the runtime graph is `justrdp → { rustls, sspi }`.
+   is self-owned. Progressive's dropped in #172 (see the 2026-08-19 amendment); **zgfx (#189) is
+   the last holder**, and when it lands the runtime graph is `justrdp → { rustls, sspi }`.
 2. **Development.** The oracle is a *bootstrapping instrument with a retirement condition*, not
    a standing gate. A codec's oracle dev-dependency drops when that codec's correctness rests on
    a basis we own — a real-server corpus plus expectations derived independently of our
@@ -163,9 +174,9 @@ coherent, not why it is compelled.
   duration.
 - **Progressive is the first codec to exercise this**, because it is the first where the oracle
   demonstrably cannot decode real traffic (#194).
-- **Two dependencies remain to retire, and both are already tracked**: `ironrdp-graphics` at
-  runtime by #172 and #189, and the dev-dependency per codec by each codec's own basis. No new
-  tracker structure is created by this record.
+- **The runtime dependency is down to one codec, and both halves stay tracked**:
+  `ironrdp-graphics` at runtime by #189 alone now that #172 has landed, and the dev-dependency
+  per codec by each codec's own basis. No new tracker structure is created by this record.
 - **The `ironrdp-pdu` dev-dependency in `justrdp-pdu` is in scope too.** It is the differential
   oracle for wire round-trips (`tests/differential_ironrdp.rs`), the same instrument in a
   different layer, and the same retirement condition applies: an owned basis, then drop.

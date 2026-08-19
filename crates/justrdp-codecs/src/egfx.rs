@@ -1,21 +1,16 @@
-//! Phase-1 EGFX decoders (ADR-0003 bootstrap): zgfx bulk decompression and RemoteFX
-//! Progressive, backed by `ironrdp-graphics` behind this crate's own types so the core never
-//! names oracle types. Each will be replaced by a self-owned decoder verified against the same
-//! crate as a differential oracle, then the `egfx-bootstrap` feature gate drops the runtime
-//! dependency (ADR-0003 phases 2–3). ClearCodec already crossed that line and moved out of this
-//! feature-gated module entirely — it now lives, self-owned and ungated, in
-//! [`crate::clearcodec`].
+//! Phase-1 EGFX bulk decompression (ADR-0003 bootstrap): zgfx, backed by `ironrdp-graphics`
+//! behind this crate's own type so the core never names an oracle type. It will be replaced by a
+//! self-owned decoder verified against the same crate as a differential oracle, after which the
+//! `egfx-bootstrap` feature drops the runtime dependency entirely (ADR-0003 phases 2-3).
 //!
-//! **Progressive has crossed that line too, and this wrapper has not yet been retired.**
-//! [`crate::rfx::progressive::Progressive`] is the self-owned decoder (#171), gated on a
-//! real-server corpus rather than on the oracle (ADR-0011). The two do not agree about the
-//! picture: this one hands back whole 64 x 64 tiles for the caller to blit, the self-owned one
-//! clips each tile to its region's rects, which is a measured 57 386-pixel difference over one
-//! captured 1 280 x 800 session. #172 is the swap.
+//! **zgfx is the last one here.** ClearCodec crossed the line first and moved out to
+//! [`crate::clearcodec`]; RemoteFX Progressive crossed it in #171 and was wired in over this
+//! wrapper in #172, so [`crate::rfx::progressive::Progressive`] is now the only Progressive
+//! decoder in the tree — self-owned, ungated, and gated on a real-server corpus rather than on
+//! the oracle (ADR-0011). The corpus *capture* harness this module used to carry moved with it,
+//! to [`crate::capture`], which is ungated for that reason.
 
-use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::zgfx;
-use std::collections::BTreeSet;
 
 /// Why an EGFX codec stage failed. Carries the bootstrap decoder's message — the typed
 /// distinctions that matter (which stage) are ours; the details are diagnostic.
@@ -23,15 +18,12 @@ use std::collections::BTreeSet;
 pub enum EgfxCodecError {
     /// RDP_SEGMENTED_DATA / RDP8 bulk (zgfx) decompression failed.
     Zgfx(String),
-    /// The RemoteFX Progressive block stream failed to decode.
-    Progressive(String),
 }
 
 impl core::fmt::Display for EgfxCodecError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             EgfxCodecError::Zgfx(e) => write!(f, "zgfx decompression: {e}"),
-            EgfxCodecError::Progressive(e) => write!(f, "RemoteFX Progressive decode: {e}"),
         }
     }
 }
@@ -81,155 +73,9 @@ impl Default for Zgfx {
     }
 }
 
-/// One decoded 64×64 Progressive tile: grid coordinates plus RGBA pixels.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProgressiveTile {
-    /// Tile column in the surface's 64-pixel grid.
-    pub x_idx: u16,
-    /// Tile row in the surface's 64-pixel grid.
-    pub y_idx: u16,
-    /// 64×64 RGBA pixels (16384 bytes).
-    pub rgba: Vec<u8>,
-}
-
-/// Stateful RemoteFX Progressive decoder — per-context tile state survives across
-/// WireToSurface2 PDUs (first pass + upgrade passes refine the same coefficients).
-pub struct Progressive {
-    inner: ProgressiveDecoder,
-    /// Codec-context ids this decoder has been asked to decode and not since freed — a
-    /// conservative superset of the oracle's live contexts. The bootstrap oracle keys contexts
-    /// by `codecContextId` alone, with **no cap** and no surface scoping, so the EGFX processor
-    /// must drive freeing explicitly (issue #83); this mirror lets it — and tests — observe the
-    /// live-context count. A parse error before the oracle creates its context leaves a harmless
-    /// phantom here that the next `delete_context`/`reset` clears.
-    contexts: BTreeSet<u32>,
-}
-
-impl Progressive {
-    /// A decoder with no codec contexts.
-    pub fn new() -> Self {
-        Self {
-            inner: ProgressiveDecoder::new(),
-            contexts: BTreeSet::new(),
-        }
-    }
-
-    /// Decode one WireToSurface2 block stream, returning every tile the pass updated.
-    ///
-    /// When `JUSTRDP_PROGRESSIVE_CAPTURE_DIR` is set, the raw block stream and its decode
-    /// status are dumped there first (see [`capture_progressive_payload`]) — the corpus
-    /// harness for the epic #158 rewrite, exactly as `JUSTRDP_CLEAR_CAPTURE_DIR` served #56.
-    pub fn decode(
-        &mut self,
-        codec_context_id: u32,
-        surface_width: u16,
-        surface_height: u16,
-        data: &[u8],
-    ) -> Result<Vec<ProgressiveTile>, EgfxCodecError> {
-        // Track on reference: the oracle creates the context lazily inside `decode_bitmap`, so
-        // recording here (even when the decode later errors) keeps the count a safe superset.
-        self.contexts.insert(codec_context_id);
-        let decoded = self
-            .inner
-            .decode_bitmap(codec_context_id, surface_width, surface_height, data)
-            .map_err(|e| EgfxCodecError::Progressive(e.to_string()));
-        // An *empty* value counts as unset — otherwise `Path::new("")` resolves to the process
-        // CWD and litters it with `prog-*.bin`.
-        if let Ok(dir) = std::env::var("JUSTRDP_PROGRESSIVE_CAPTURE_DIR")
-            && !dir.is_empty()
-        {
-            let status = match &decoded {
-                Ok(tiles) => format!("ok:{}", tiles.len()),
-                Err(e) => format!("err:{e}"),
-            };
-            capture_progressive_payload(
-                &dir,
-                data,
-                codec_context_id,
-                surface_width,
-                surface_height,
-                &status,
-            );
-        }
-        let tiles = decoded?;
-        Ok(tiles
-            .into_iter()
-            .map(|t| ProgressiveTile {
-                x_idx: t.x_idx,
-                y_idx: t.y_idx,
-                rgba: t.pixels,
-            })
-            .collect())
-    }
-
-    /// Free a codec context (`RDPGFX_CMDID_DELETEENCODINGCONTEXT`, or a per-surface eviction).
-    pub fn delete_context(&mut self, codec_context_id: u32) {
-        self.contexts.remove(&codec_context_id);
-        self.inner.delete_context(codec_context_id);
-    }
-
-    /// Drop every codec context (EGFX `ResetGraphics` / channel reset).
-    pub fn reset(&mut self) {
-        self.contexts.clear();
-        self.inner.reset();
-    }
-
-    /// The number of live codec contexts currently tracked.
-    pub fn context_count(&self) -> usize {
-        self.contexts.len()
-    }
-}
-
-impl Default for Progressive {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Test-only corpus capture, gated by the `JUSTRDP_PROGRESSIVE_CAPTURE_DIR` env var: append
-/// one WireToSurface2 block stream (`prog-NNNN.bin`) plus a manifest row
-/// (`idx⇥ctx⇥w⇥h⇥len⇥status`) to that directory. Sibling of ClearCodec's
-/// `JUSTRDP_CLEAR_CAPTURE_DIR` harness, and it exists for the same reason: epic #158's
-/// differential needs the streams a *real* server emits. It is also how #193 was found —
-/// the payloads it captured were the evidence that WireToSurface2 was handing four bytes of
-/// `bitmapDataLength` to the codec. Best-effort: any IO error is swallowed so capture never
-/// perturbs decoding.
-fn capture_progressive_payload(
-    dir: &str,
-    data: &[u8],
-    codec_context_id: u32,
-    width: u16,
-    height: u16,
-    status: &str,
-) {
-    use std::io::Write as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let idx = SEQ.fetch_add(1, Ordering::Relaxed);
-
-    let dir = std::path::Path::new(dir);
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let _ = std::fs::write(dir.join(format!("prog-{idx:04}.bin")), data);
-    if let Ok(mut manifest) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("manifest.tsv"))
-    {
-        let _ = writeln!(
-            manifest,
-            "{idx}\t{codec_context_id}\t{width}\t{height}\t{}\t{status}",
-            data.len()
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
     #[test]
     fn zgfx_unwraps_uncompressed_single_segments() {
@@ -275,48 +121,5 @@ mod tests {
             z.decompress(&[0x00, 0x01]),
             Err(EgfxCodecError::Zgfx(_))
         ));
-    }
-
-    #[test]
-    fn progressive_rejects_garbage_streams() {
-        let mut p = Progressive::new();
-        assert!(matches!(
-            p.decode(1, 64, 64, &[0xFF; 16]),
-            Err(EgfxCodecError::Progressive(_))
-        ));
-    }
-
-    #[test]
-    fn delete_context_and_reset_track_the_live_count() {
-        // The count is the mirror the EGFX processor drives to avoid the unbounded-context
-        // leak (#83). Even garbage decodes are tracked (record-on-reference), so the lifecycle
-        // is observable without a valid Progressive stream.
-        let mut p = Progressive::new();
-        let _ = p.decode(7, 64, 64, &[0xFF; 16]);
-        let _ = p.decode(9, 64, 64, &[0xFF; 16]);
-        assert_eq!(p.context_count(), 2);
-        p.delete_context(7);
-        assert_eq!(p.context_count(), 1);
-        p.delete_context(123); // freeing an unknown id is a no-op, never underflows
-        assert_eq!(p.context_count(), 1);
-        p.reset();
-        assert_eq!(p.context_count(), 0);
-    }
-
-    proptest! {
-        // ADR-0008 / issue #97 — no-panic robustness for the Progressive decode path, the
-        // untrusted WireToSurface2 blob. Surface dims are bounded (they come from the fixed
-        // CreateSurface fields); the block stream is fully arbitrary.
-        #![proptest_config(ProptestConfig::with_cases(1024))]
-        #[test]
-        fn progressive_decode_never_panics_on_arbitrary_input(
-            ctx in any::<u32>(),
-            w in 1u16..=256,
-            h in 1u16..=256,
-            data in proptest::collection::vec(any::<u8>(), 0..=512),
-        ) {
-            let mut p = Progressive::new();
-            let _ = p.decode(ctx, w, h, &data);
-        }
     }
 }
