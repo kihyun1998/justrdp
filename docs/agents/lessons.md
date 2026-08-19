@@ -47,6 +47,31 @@ Read this before starting so the bindings do not read as abstractions.
   is the gate to drop the oracle dependency. connect/session proof is a real VM
   round-trip (`192.168.136.136`, memory `test_environment`) — a demo is not proof.
 
+- **A measurement that can misread itself, built and thrown away (#172).** The
+  bindings name that trap; this is what it looked like. Wiring the self-owned
+  Progressive decoder into `justrdp::egfx` seemed to admit a decisive check: assemble
+  the *same* real-VM payloads twice — once through the core (`Surface::blit`, the
+  dirty list, the surface→framebuffer blit) and once directly onto a canvas — and
+  since the decoder is shared, any disagreement localises in the new wiring. It
+  measured **17–19% agreement**, which reads as a serious defect and is not one. The
+  replay canvas is a WireToSurface2-only *accumulation* that never forgets — it still
+  held the wallpaper, a Start menu closed thirty seconds earlier, and a boot-time
+  overlay — while the live `Surface` receives ClearCodec and WireToSurface1 blits into
+  the same buffer and holds the session's true final screen. The number was **the
+  fraction of pixels where Progressive happened to be the last writer**: a property of
+  the server's codec scheduling, not of this client.
+
+  Two things it pins. **The artifacts have to be produced before the assertion, or a
+  70-second run costs 70 seconds and leaves nothing to look at** — the first two runs
+  panicked before the PPM dumps and the number was unreadable; moving the dumps ahead
+  of the check settled it in one glance. And **a plausible number is the dangerous
+  outcome**, not an implausible one: 0% would have been read as "the comparison is
+  broken" immediately, where 18% invites tuning the threshold until it passes. The
+  comparison was removed rather than tuned, with what would make it well-posed
+  recorded where it stood (drive the replay through a `GraphicsProcessor` so both
+  sides see every codec in arrival order — which needs a core-side replay seam that
+  does not exist).
+
 ## Step 5 — adversarial completeness is automated (ADR-0008)
 
 - **proptest no-panic (#98) + cargo-fuzz (#99)** make the completeness axis
@@ -59,6 +84,41 @@ Read this before starting so the bindings do not read as abstractions.
   until #200 — a sentence praising derivation while hand-copying the number in its
   own second half, and wrong from the day `progressive` landed.) —
   [`docs/map/invariant/untrusted-decode-never-panics.md`](../map/invariant/untrusted-decode-never-panics.md).
+
+- **The lane's first crash, and it is the sequel to the entry below (#219).** The
+  #168 bullet *"`checked_shl` checks the shift amount, never the value"* records why
+  `rfx::srl::accumulate` grew a round-trip guard. On 2026-08-19 the nightly fuzz lane
+  panicked in that same function — `attempt to add with overflow` — because the
+  round-trip has a blind spot exactly one value wide: an arithmetic right shift of
+  `i64::MIN` by 63 is `-1`, so `-1 << 63` round-trips **perfectly having wrapped all
+  the way**, and the widening to `i64` that the addition leaned on is one value short.
+  A family, not a point: any `input == -(1 << j)` at `shift == 63 - j`.
+
+  Four things this pins that #168's entry could only assert.
+
+  - **Two automations of one property is not redundancy, and now there is a
+    measurement.** `fuzz.yml`'s header argued the lane exists because coverage
+    guidance reaches depth random sampling does not. The sibling proptest generates
+    **every value involved** and has since #168 — full-`u8` quant nibbles, `i16::ANY`
+    seeds. What it cannot do is make *three* of them coincide. Recorded in the
+    invariant's discovery history rather than left in a PR body.
+  - **A test can cover the line and miss the sign.**
+    `a_shift_that_discards_the_whole_refinement_is_an_error_not_a_no_op` **already
+    drove `shift == 63`** — with `sign = 1`, so it landed on the positive branch where
+    `2 << 63 == 0` and the guard fires correctly. Line coverage would have called this
+    surface done.
+  - **The defect was in a written argument, not in a line.** The doc comment directly
+    above the panicking `+` named two guards and rested the third on the accumulator's
+    width. Which is the shape Step 1's *"external facts and secondhand statements are
+    verification targets too"* warns about, turned inward: a rationale committed to
+    the repo gets believed, including by its own author one slice later.
+  - **"Unreachable through the parser" is not a severity argument on this surface.**
+    The parser masks quant fields to nibbles, `quant_add` saturates at 30 and
+    `upgrade_shift` subtracts one, so the live path tops out at `shift == 29`. What
+    broke was `upgrade_component`'s *declared* contract — total for any `u8` — which
+    the module chose deliberately because `ProgressiveQuant`'s fields are plain
+    `pub u8` and the bound lives in arithmetic elsewhere. #211 is the same family at
+    `rfx/quant.rs` and its evidence table cited this site as already settled.
 
 - **The first incident, and it is about the pass declaring victory (#168).** A solo
   completeness pass on the Progressive SRL decoder found two panics, fixed them, and
