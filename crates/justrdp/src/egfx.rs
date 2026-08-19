@@ -20,9 +20,12 @@ use crate::dvc::{DvcProcessor, ProcessorOutput};
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::clearcodec::Clear;
 use justrdp_codecs::color::{self, Palette};
-use justrdp_codecs::egfx::{Progressive, Zgfx};
+use justrdp_codecs::egfx::Zgfx;
+// The self-owned Progressive decoder (#171), wired here in #172. It keys its tile store by
+// **surface**, which is what retires the `codecContextId` bookkeeping this module used to carry.
 use justrdp_codecs::planar;
 use justrdp_codecs::rfx::RemoteFx;
+use justrdp_codecs::rfx::progressive::Progressive;
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::egfx::{self, EgfxPdu, Rect16};
 
@@ -166,12 +169,6 @@ pub(crate) struct GraphicsProcessor {
     surfaces: Vec<Surface>,
     cache: std::collections::HashMap<u16, CachedBitmap>,
     cache_bytes: usize,
-    /// The live Progressive codec context of each surface (surface_id → codec_context_id).
-    /// The bootstrap oracle keys contexts by id alone with no cap and frees them only on an
-    /// explicit DeleteEncodingContext; binding each context to its surface here — FreeRDP's
-    /// model — lets DeleteSurface/ResetGraphics free them and caps a live surface to one
-    /// context, closing the unbounded-growth leak (issue #83).
-    progressive_contexts: std::collections::BTreeMap<u16, u32>,
     confirmed_version: Option<u32>,
     frames_decoded: u32,
     in_frame: bool,
@@ -188,7 +185,6 @@ impl Default for GraphicsProcessor {
             surfaces: Vec::new(),
             cache: std::collections::HashMap::new(),
             cache_bytes: 0,
-            progressive_contexts: std::collections::BTreeMap::new(),
             confirmed_version: None,
             frames_decoded: 0,
             in_frame: false,
@@ -205,13 +201,15 @@ impl GraphicsProcessor {
         self.surfaces.iter_mut().find(|s| s.id == id)
     }
 
-    /// Remove a surface and free the Progressive codec context bound to it (#83). Used by both
+    /// Remove a surface and free the Progressive tile store held for it. Used by both
     /// DeleteSurface and the CreateSurface replace path — a server that recreates a surface id
-    /// (resize/reconnect) must not strand the old surface's context in the id-keyed oracle.
+    /// (resize/reconnect) must not strand the old grid's 48 KiB-per-tile state.
+    ///
+    /// **This is the only thing that frees Progressive state**, which is #170's decision and the
+    /// inverse of what this module did while it drove the id-keyed bootstrap decoder: see the
+    /// `ResetGraphics` and `DeleteEncodingContext` arms for why the other two frees had to go.
     fn remove_surface(&mut self, surface_id: u16) {
-        if let Some(ctx) = self.progressive_contexts.remove(&surface_id) {
-            self.progressive.delete_context(ctx);
-        }
+        self.progressive.delete_surface(surface_id);
         self.surfaces.retain(|s| s.id != surface_id);
     }
 
@@ -313,11 +311,18 @@ impl GraphicsProcessor {
             }
             EgfxPdu::ResetGraphics { width, height } => {
                 tracing::debug!(target: "rdp_egfx", width, height, "ResetGraphics");
-                // A reset invalidates all graphics state: drop every Progressive context so it
-                // cannot survive into the new layout (issue #83). Surfaces are left to the
-                // server's explicit Create/Delete, as before.
-                self.progressive.reset();
-                self.progressive_contexts.clear();
+                // **Frees nothing, deliberately** (#170/#172). Dropping Progressive state here
+                // was correct while the bootstrap decoder keyed contexts by `codecContextId`
+                // with no cap — an unfreed context was an unbounded leak, which is #83's fix.
+                // Keyed by surface it inverts into a desync: the server's *encoder* keeps its
+                // reference frames across a reset, and `RFX_TILE_DIFFERENCE` (1405 of 2943 real
+                // first passes) adds against them, so a client that cleared while the server did
+                // not decodes every later difference tile against zeroes — silently, with `Ok`,
+                // until the next non-difference first pass repairs that tile. An encoder that
+                // *did* reset cannot send a difference tile at all, so keeping cannot desync.
+                // `SurfaceStore` has no `reset` and this PDU carries no surface id: there is
+                // nothing to call, and a loop over live surfaces would reintroduce the defect.
+                // Surfaces are left to the server's explicit Create/Delete, as before.
                 let width = u16::try_from(width).map_err(|_| {
                     invalid("RDPGFX_RESET_GRAPHICS_PDU", "output width exceeds u16")
                 })?;
@@ -427,64 +432,108 @@ impl GraphicsProcessor {
                     tracing::debug!(target: "rdp_egfx", codec_id, "unsupported WTS2 codec skipped");
                     return Ok(());
                 }
-                let (sw, sh) = match self.surfaces.iter().find(|s| s.id == surface_id) {
-                    Some(s) => (s.width, s.height),
-                    None => {
-                        return Err(invalid(
-                            "RDPGFX_WIRE_TO_SURFACE_PDU_2",
-                            "unknown destination surface",
-                        ));
-                    }
+                // Held across the decode rather than looked up again after it. The decoder
+                // paints through a sink, so the surface must be borrowed *while* it walks the
+                // payload — which the previous shape could not do, because `surface_mut` takes
+                // `&mut self` and would have borrowed the decoder with it. Reaching for the two
+                // fields directly keeps the borrows disjoint.
+                let Some(surface) = self.surfaces.iter_mut().find(|s| s.id == surface_id) else {
+                    return Err(invalid(
+                        "RDPGFX_WIRE_TO_SURFACE_PDU_2",
+                        "unknown destination surface",
+                    ));
                 };
-                // One Progressive context per surface — FreeRDP keys by surfaceId, but the
-                // bootstrap oracle keys by codecContextId alone with no cap (issue #83). When a
-                // surface's stream moves to a new context id, free the old one so a single live
-                // surface cannot accumulate contexts without bound. Tracked on *reference* (not
-                // decode success) because the oracle creates the context lazily inside decode.
-                // Caveat: two surfaces sharing one id collide under id-only keying — the
-                // self-owned (surfaceId, contextId) decoder (ADR-0003 phase 2) retires both the
-                // caveat and this per-surface workaround.
-                if let Some(&prev) = self.progressive_contexts.get(&surface_id)
-                    && prev != codec_context_id
-                {
-                    self.progressive.delete_context(prev);
-                }
-                self.progressive_contexts
-                    .insert(surface_id, codec_context_id);
-                // Warn-and-skip on failure, like the WTS1 codecs: a bootstrap-decoder
-                // limitation must not kill the session (the tile state may desync until the
-                // next first-pass repaint, which servers send periodically).
-                let Ok(tiles) = self.progressive.decode(codec_context_id, sw, sh, data).map_err(
-                    |e| {
-                        tracing::warn!(target: "rdp_egfx", error = %e, "progressive decode failed — pass skipped");
-                    },
-                ) else {
-                    return Ok(());
-                };
-                // Re-fetched rather than held across the decode (borrow split with the
-                // progressive decoder); a vanished surface is a skip, never a panic.
-                let Some(surface) = self.surface_mut(surface_id) else {
-                    return Ok(());
-                };
-                for tile in tiles {
+                let (sw, sh) = (surface.width, surface.height);
+                // No context bookkeeping: the store is keyed by surface (#170), so a stream
+                // moving to a new `codecContextId` is not an event at all. The eviction this
+                // arm used to perform existed only to cap the id-keyed oracle (#83).
+                let decoded = self.progressive.decode(surface_id, sw, sh, data, |rect| {
+                    // The source offset rides the *slice*, not a parameter: `blit`'s slice start
+                    // and `src_stride_px` are independent, so row `r` of the copy lands on tile
+                    // pixel `(src_x, src_y + r)` at a stride of `TILE_DIM`. #158 recorded that
+                    // `Surface::blit` "cannot express a source offset" and that this issue would
+                    // have to widen it — measured false, see
+                    // `blit_expresses_a_source_offset_by_slicing_the_tile`.
+                    let stride = usize::from(justrdp_pdu::rfx::TILE_DIM);
+                    let off = (usize::from(rect.src_y) * stride + usize::from(rect.src_x)) * 4;
+                    // `get`, not an index. `src_x`/`src_y` are inside the tile by the decoder's
+                    // contract — asserted on every input the `progressive_assembly` fuzz target
+                    // sees — but that contract is held by arithmetic, not by a type, and this is
+                    // the core panicking on a value a *server* ultimately drove
+                    // (`docs/map/invariant/untrusted-decode-never-panics.md`). A skipped
+                    // rectangle costs one tile of one frame; a panic costs the session.
+                    let Some(src) = rect.tile.get(off..) else {
+                        return;
+                    };
                     surface.blit(
-                        i32::from(tile.x_idx) * 64,
-                        i32::from(tile.y_idx) * 64,
-                        64,
-                        64,
-                        &tile.rgba,
-                        64,
+                        i32::from(rect.x),
+                        i32::from(rect.y),
+                        rect.width,
+                        rect.height,
+                        src,
+                        stride,
                     );
+                });
+                // The corpus-capture harness (ADR-0011's other half). It rode inside the
+                // bootstrap decoder until #172; the payload is what is being captured, not a
+                // decode, so it is a free function over the wire bytes now — and it stays here
+                // because the fixture format records the `codecContextId`, which the
+                // surface-keyed decoder never sees (`justrdp-codecs/src/capture.rs`).
+                if let Some(dir) = justrdp_codecs::capture::progressive_capture_dir() {
+                    let status = match &decoded {
+                        Ok(o) => format!("ok:{}", o.tiles_decoded),
+                        Err(e) => format!("err:{e}"),
+                    };
+                    justrdp_codecs::capture::progressive_payload(
+                        &dir,
+                        data,
+                        codec_context_id,
+                        sw,
+                        sh,
+                        &status,
+                    );
+                }
+                // Warn-and-skip on failure, like the WTS1 codecs: a malformed payload must not
+                // kill the session (the tile state may desync until the next first-pass
+                // repaint, which servers send periodically).
+                match decoded {
+                    Err(e) => {
+                        tracing::warn!(target: "rdp_egfx", error = %e, "progressive payload rejected — pass skipped");
+                    }
+                    Ok(outcome) => {
+                        // A per-tile failure is not a payload failure, so it is reported rather
+                        // than returned — logging it is the only thing that makes the difference
+                        // between a painted pass and a wholly skipped one visible at all.
+                        if outcome.fatal.is_some()
+                            || outcome.first_error.is_some()
+                            || !outcome.anomalies.is_empty()
+                        {
+                            tracing::warn!(
+                                target: "rdp_egfx",
+                                surface_id,
+                                decoded = outcome.tiles_decoded,
+                                skipped = outcome.tiles_skipped,
+                                painted = outcome.rects_painted,
+                                anomalies = outcome.anomalies.len(),
+                                fatal = ?outcome.fatal,
+                                first_error = ?outcome.first_error,
+                                "progressive payload decoded with findings",
+                            );
+                        }
+                    }
                 }
             }
             EgfxPdu::DeleteEncodingContext {
                 surface_id: _,
                 codec_context_id,
             } => {
+                // **A no-op, deliberately** (#170/#172), and the call is kept as the record of
+                // that: `SurfaceStore::delete_context` exists and does nothing, because the
+                // store is keyed by surface and a context id names nothing it holds. FreeRDP's
+                // handler is a literal no-op too (`gdi/gfx.c:1239-1246`). Freeing here was
+                // #83's fix for the id-keyed bootstrap decoder and inverts for the same reason
+                // `ResetGraphics` does — see that arm.
                 self.progressive.delete_context(codec_context_id);
-                // Keep the per-surface tracking consistent with the explicit free.
-                self.progressive_contexts
-                    .retain(|_, &mut ctx| ctx != codec_context_id);
             }
             EgfxPdu::SolidFill {
                 surface_id,
@@ -745,6 +794,58 @@ mod tests {
     fn feed(p: &mut GraphicsProcessor, cmd_id: u16, body: &[u8]) -> Vec<Out> {
         let message = egfx::wrap_uncompressed(&header(cmd_id, body));
         p.process(&message).unwrap()
+    }
+
+    /// **This falsifies #158's recorded claim** that `Surface::blit` "cannot express a
+    /// source offset". It can: the source *slice start* and `src_stride_px` are independent, so
+    /// a rectangle at `(src_x, src_y)` of a 64-px-stride tile is reached by slicing the tile and
+    /// keeping the stride at 64. Row `r` then lands at `(src_x, src_y + r)` by construction.
+    #[test]
+    fn blit_expresses_a_source_offset_by_slicing_the_tile() {
+        // A 4x4 tile whose pixels encode their own coordinates in R and G.
+        let stride = 4usize;
+        let mut tile = vec![0u8; stride * 4 * 4];
+        for y in 0..4usize {
+            for x in 0..stride {
+                let o = (y * stride + x) * 4;
+                tile[o] = x as u8;
+                tile[o + 1] = y as u8;
+                tile[o + 3] = 255;
+            }
+        }
+
+        let mut surface = Surface {
+            id: 1,
+            width: 8,
+            height: 8,
+            rgba: vec![0; 8 * 8 * 4],
+            mapped: None,
+            dirty: Vec::new(),
+        };
+        // Paint the tile's bottom-right 2x2 (src 2,2) at destination (5,3) — a *positive*
+        // destination, which is the case the negative-x trick cannot reach.
+        let (src_x, src_y, w, h) = (2usize, 2usize, 2u16, 2u16);
+        surface.blit(5, 3, w, h, &tile[(src_y * stride + src_x) * 4..], stride);
+
+        let at = |x: usize, y: usize| {
+            let o = (y * 8 + x) * 4;
+            (surface.rgba[o], surface.rgba[o + 1])
+        };
+        assert_eq!(at(5, 3), (2, 2), "top-left of the copy");
+        assert_eq!(at(6, 3), (3, 2));
+        assert_eq!(at(5, 4), (2, 3));
+        assert_eq!(at(6, 4), (3, 3), "bottom-right of the copy");
+        // Nothing outside the 2x2 was touched, so the offset moved the *source* and not the
+        // destination — the failure mode a stride/offset mix-up produces.
+        assert_eq!(at(4, 3), (0, 0));
+        assert_eq!(at(7, 3), (0, 0));
+        assert_eq!(at(5, 2), (0, 0));
+        assert_eq!(at(5, 5), (0, 0));
+        assert_eq!(
+            surface.dirty,
+            vec![(5, 3, 2, 2)],
+            "dirty is the painted rect"
+        );
     }
 
     fn create_surface(p: &mut GraphicsProcessor, id: u16, w: u16, h: u16) {
@@ -1177,88 +1278,288 @@ mod tests {
         assert!(feed(p, egfx::CMDID_WIRE_TO_SURFACE_2, &body).is_empty());
     }
 
+    /// The **minimum** Progressive payload that puts a tile in the store: one region with one
+    /// clip rect (`clip`, in surface coordinates) and one `WBT_TILE_SIMPLE` at grid (0, 0)
+    /// whose three component streams are one zero byte each.
+    ///
+    /// Wire knowledge duplicated here on purpose, and kept to the degenerate case for the same
+    /// reason. Every other Progressive test in this module has only ever fed *garbage*, so
+    /// nothing here has ever proved that a payload reaches a surface at all — the shape
+    /// `docs/map/invariant/a-later-stage-can-hide-an-earlier-defect.md` names, since the blit
+    /// runs happily over whatever the decoder returns, including nothing. What the pixels
+    /// should be is the corpus suite's question
+    /// (`justrdp-codecs/tests/progressive_assembly_corpus.rs`); what this answers is whether
+    /// the wiring carries them, which is the only half that lives in this crate.
+    ///
+    /// One byte per component rather than zero, which is not a detail: an *empty* stream is
+    /// `Rlgr(EmptyInput)` and the tile is skipped, so a payload that looks even more minimal
+    /// would have quietly asserted nothing. A single zero byte decodes to zero coefficients, so
+    /// the tile is flat mid-grey (`128, 128, 128, 255` — `YCbCr(0,0,0)`), which is *visible*
+    /// against a zeroed surface. Being flat, it cannot discriminate a **source-offset** error;
+    /// that is `blit_expresses_a_source_offset_by_slicing_the_tile`'s job here and the corpus
+    /// suite's over real tiles.
+    fn progressive_one_tile_payload(clip: (u16, u16, u16, u16)) -> Vec<u8> {
+        use justrdp_pdu::rfx::progressive as prog;
+
+        fn block(out: &mut Vec<u8>, block_type: u16, body: &[u8]) {
+            out.extend_from_slice(&block_type.to_le_bytes());
+            out.extend_from_slice(&((6 + body.len()) as u32).to_le_bytes());
+            out.extend_from_slice(body);
+        }
+
+        // WBT_TILE_SIMPLE: quantIdx x3, xIdx, yIdx, flags, then four zero lengths.
+        let mut tile_body = vec![0u8, 0, 0];
+        tile_body.extend_from_slice(&0u16.to_le_bytes()); // xIdx
+        tile_body.extend_from_slice(&0u16.to_le_bytes()); // yIdx
+        tile_body.push(0); // flags: not RFX_TILE_DIFFERENCE
+        for _ in 0..3 {
+            tile_body.extend_from_slice(&1u16.to_le_bytes()); // yLen / cbLen / crLen
+        }
+        tile_body.extend_from_slice(&0u16.to_le_bytes()); // tailLen
+        tile_body.extend_from_slice(&[0x00, 0x00, 0x00]); // one RLGR byte per component
+        let mut tiles = Vec::new();
+        block(&mut tiles, prog::BLOCK_TILE_SIMPLE, &tile_body);
+
+        let mut region = vec![64u8]; // tileSize, the only value CT_TILE_64x64 permits
+        region.extend_from_slice(&1u16.to_le_bytes()); // numRects
+        region.push(1); // numQuant
+        region.push(0); // numProgQuant
+        region.push(prog::REGION_FLAG_DWT_REDUCE_EXTRAPOLATE); // 52 of 52 real regions set it
+        region.extend_from_slice(&1u16.to_le_bytes()); // numTiles
+        region.extend_from_slice(&(tiles.len() as u32).to_le_bytes()); // tileDataSize
+        for v in [clip.0, clip.1, clip.2, clip.3] {
+            region.extend_from_slice(&v.to_le_bytes()); // the region's one clip rect
+        }
+        // One quant table, every band at 6 — the corpus minimum, and the floor below which
+        // FreeRDP would reject the region (we decode it, see the divergence table).
+        region.extend_from_slice(&[0x66; 5]);
+        region.extend_from_slice(&tiles);
+
+        let mut out = Vec::new();
+        let mut frame_begin = 0u32.to_le_bytes().to_vec();
+        frame_begin.extend_from_slice(&1u16.to_le_bytes()); // regionCount
+        block(&mut out, prog::BLOCK_FRAME_BEGIN, &frame_begin);
+        block(&mut out, prog::BLOCK_REGION, &region);
+        block(&mut out, prog::BLOCK_FRAME_END, &[]);
+        out
+    }
+
     fn delete_surface(p: &mut GraphicsProcessor, id: u16) {
         feed(p, egfx::CMDID_DELETE_SURFACE, &id.to_le_bytes());
     }
 
+    /// **The first test in this crate to prove a Progressive payload reaches a surface.**
+    /// Every other one here has fed garbage, so the blit ran over an empty tile list and passed
+    /// — the shape `docs/map/invariant/a-later-stage-can-hide-an-earlier-defect.md` names. What
+    /// the pixels should be for a *real* stream is the corpus suite's question; that they arrive
+    /// at all is this crate's, and it had no answer until #172 wired the self-owned decoder.
     #[test]
-    fn delete_surface_frees_the_progressive_context() {
+    fn a_progressive_payload_paints_its_tile_into_the_surface() {
         let mut p = GraphicsProcessor::default();
         create_surface(&mut p, 1, 64, 64);
-        // The (surface, context) link is recorded on reference even though the garbage stream
-        // warn-skips on decode — that link is exactly what DeleteSurface must later free (#83).
-        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &[0xFF; 8]);
-        assert_eq!(p.progressive_contexts.get(&1), Some(&7));
-        assert_eq!(p.progressive.context_count(), 1);
+        let payload = progressive_one_tile_payload((0, 0, 64, 64));
+        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &payload);
 
-        delete_surface(&mut p, 1);
+        assert_eq!(p.progressive.painted_tiles(), 1);
+        assert_eq!(
+            &p.surfaces[0].rgba[..4],
+            &[128, 128, 128, 255],
+            "a flat zero-coefficient tile is mid-grey, and the surface started at zero"
+        );
         assert!(
-            p.progressive_contexts.is_empty(),
-            "DeleteSurface must drop the surface's context tracking"
+            p.surfaces[0]
+                .rgba
+                .chunks(4)
+                .all(|px| px == [128, 128, 128, 255]),
+            "the whole 64x64 tile is painted when the region's rect covers it"
+        );
+        assert_eq!(p.surfaces[0].dirty, vec![(0, 0, 64, 64)]);
+    }
+
+    /// The clip is what #171 added and #172 wires: a tile is painted **only where its region's
+    /// rects reach**, where the retired bootstrap decoder handed back whole 64x64 tiles for the
+    /// caller to blit entire. Measured over the captured session the difference is 57 386 of
+    /// 1 024 000 pixels, so this is a picture change and not a dirty-rect optimisation.
+    ///
+    /// Asserted as a *boundary* — inside grey, outside untouched — because a clip that is off by
+    /// a row or that ignores the rect entirely both produce "some grey pixels".
+    #[test]
+    fn a_region_rect_clips_the_tile_it_paints() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        let payload = progressive_one_tile_payload((16, 16, 32, 32));
+        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &payload);
+
+        let px = |x: usize, y: usize| {
+            let o = (y * 64 + x) * 4;
+            [
+                p.surfaces[0].rgba[o],
+                p.surfaces[0].rgba[o + 1],
+                p.surfaces[0].rgba[o + 2],
+                p.surfaces[0].rgba[o + 3],
+            ]
+        };
+        const GREY: [u8; 4] = [128, 128, 128, 255];
+        const UNTOUCHED: [u8; 4] = [0, 0, 0, 0];
+        assert_eq!(px(16, 16), GREY, "the rect's top-left corner");
+        assert_eq!(px(47, 47), GREY, "the rect's bottom-right corner");
+        assert_eq!(px(15, 16), UNTOUCHED, "one column left of the rect");
+        assert_eq!(px(16, 15), UNTOUCHED, "one row above the rect");
+        assert_eq!(px(48, 47), UNTOUCHED, "one column right of the rect");
+        assert_eq!(px(47, 48), UNTOUCHED, "one row below the rect");
+        assert_eq!(
+            p.surfaces[0].dirty,
+            vec![(16, 16, 32, 32)],
+            "the dirty rect follows the clip, not the tile"
         );
         assert_eq!(
-            p.progressive.context_count(),
-            0,
-            "DeleteSurface must free the oracle context — no leak across delete/recreate"
+            p.surfaces[0]
+                .rgba
+                .chunks(4)
+                .filter(|px| *px == GREY)
+                .count(),
+            32 * 32,
+            "exactly the rect's area is painted - no spill, no shortfall"
         );
     }
 
+    /// The four tests below pin **lifecycle wiring**: which surface's tile store survives which
+    /// PDU. They drive a real payload rather than the garbage the bootstrap-era versions used,
+    /// and the difference is load-bearing rather than cosmetic. The bootstrap decoder recorded a
+    /// context on *reference*, before decoding, so garbage still registered; the self-owned one
+    /// parses first and never reaches the store. More importantly, `live_surfaces()` alone
+    /// cannot tell a surviving store from one thrown away and re-created empty — the grid is
+    /// ensured on every payload — so these assert on `painted_tiles()`, which is the thing an
+    /// erroneous free actually destroys.
     #[test]
-    fn reset_graphics_clears_contexts_but_keeps_surfaces() {
+    fn delete_surface_frees_the_surfaces_tile_store() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        wts2(
+            &mut p,
+            1,
+            egfx::CODECID_CAPROGRESSIVE,
+            7,
+            &progressive_one_tile_payload((0, 0, 64, 64)),
+        );
+        assert_eq!(p.progressive.painted_tiles(), 1);
+
+        delete_surface(&mut p, 1);
+        assert_eq!(
+            p.progressive.live_surfaces(),
+            0,
+            "DeleteSurface must free the surface's tile store - it is the only thing that does"
+        );
+        assert_eq!(p.progressive.painted_tiles(), 0);
+    }
+
+    /// **The inverse of the retired `reset_graphics_clears_contexts_but_keeps_surfaces`**
+    /// (#170/#172). That test asserted the bootstrap behaviour and passed, which is the
+    /// strongest possible "do not touch this" — so it is inverted here rather than deleted, and
+    /// this doc is why the inversion is the correct direction.
+    ///
+    /// Clearing on `RESETGRAPHICS` is #83's fix and is right while contexts are keyed by
+    /// `codecContextId` with no cap, where an unfreed context is an unbounded leak. Keyed by
+    /// surface it becomes a **desync**: the server's *encoder* keeps its reference frames across
+    /// a reset and `RFX_TILE_DIFFERENCE` adds against them, so a client that cleared while the
+    /// server did not decodes every later difference tile against zeroes — silently, with `Ok`,
+    /// until the next non-difference first pass repairs that tile. An encoder that *did* reset
+    /// cannot send a difference tile at all, so keeping cannot desync in the other direction.
+    #[test]
+    fn reset_graphics_keeps_the_tile_stores_it_used_to_clear() {
         let mut p = GraphicsProcessor::default();
         create_surface(&mut p, 1, 64, 64);
         create_surface(&mut p, 2, 64, 64);
-        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &[0xFF; 8]);
-        wts2(&mut p, 2, egfx::CODECID_CAPROGRESSIVE, 8, &[0xFF; 8]);
-        assert_eq!(p.progressive.context_count(), 2);
+        let payload = progressive_one_tile_payload((0, 0, 64, 64));
+        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &payload);
+        wts2(&mut p, 2, egfx::CODECID_CAPROGRESSIVE, 8, &payload);
+        assert_eq!(p.progressive.painted_tiles(), 2);
 
         let mut body = vec![0u8; 332];
         body[0..4].copy_from_slice(&64u32.to_le_bytes());
         body[4..8].copy_from_slice(&64u32.to_le_bytes());
         feed(&mut p, egfx::CMDID_RESET_GRAPHICS, &body);
 
-        assert!(p.progressive_contexts.is_empty());
-        assert_eq!(p.progressive.context_count(), 0);
+        assert_eq!(
+            p.progressive.painted_tiles(),
+            2,
+            "ResetGraphics must free no tile state - the server's encoder did not reset either"
+        );
+        assert_eq!(p.progressive.live_surfaces(), 2);
         assert_eq!(
             p.surfaces.len(),
             2,
-            "ResetGraphics drops contexts, not surfaces"
+            "ResetGraphics drops neither surfaces nor their stores"
         );
     }
 
+    /// **The inverse of the retired `a_new_context_id_on_a_surface_evicts_the_previous`.** That
+    /// eviction existed only to cap the id-keyed bootstrap decoder, which would otherwise
+    /// accumulate one context per id on a single live surface (#83). Keyed by surface there is
+    /// nothing to accumulate and nothing to evict, so a stream moving to a new `codecContextId`
+    /// must be a **non-event**.
+    ///
+    /// The second payload deliberately paints *nothing* (its region clips to a 1x1 rect outside
+    /// the tile), so the tile that survives can only be the first one's. An earlier revision fed
+    /// an empty payload and asserted `live_surfaces()`, which could not fail: the grid is
+    /// re-ensured on every payload, so a store thrown away and re-created empty reads exactly
+    /// like one that was kept.
     #[test]
-    fn a_new_context_id_on_a_surface_evicts_the_previous() {
-        // The bootstrap oracle keys by context id, so a live surface that switches context id
-        // would otherwise accumulate contexts without bound (FreeRDP keys by surface and holds
-        // exactly one). Assert the collapse: one context per surface, the previous one freed.
+    fn a_new_context_id_on_a_surface_is_not_an_event() {
         let mut p = GraphicsProcessor::default();
-        create_surface(&mut p, 1, 64, 64);
-        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &[0xFF; 8]);
-        assert_eq!(p.progressive.context_count(), 1);
-
-        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 9, &[0xFF; 8]);
-        assert_eq!(p.progressive_contexts.get(&1), Some(&9));
-        assert_eq!(
-            p.progressive.context_count(),
-            1,
-            "switching context id must free the previous context, not accumulate it"
-        );
-    }
-
-    #[test]
-    fn recreating_a_surface_id_frees_the_old_context() {
-        // Servers recreate a surface id on resize/reconnect without a DeleteSurface; the old
-        // surface's Progressive context must be freed on the replace too, not stranded in the
-        // id-keyed oracle (#83).
-        let mut p = GraphicsProcessor::default();
-        create_surface(&mut p, 1, 64, 64);
-        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &[0xFF; 8]);
-        assert_eq!(p.progressive.context_count(), 1);
-
-        // CreateSurface with the same id replaces the surface — and frees its context.
         create_surface(&mut p, 1, 128, 128);
-        assert!(p.progressive_contexts.is_empty());
-        assert_eq!(p.progressive.context_count(), 0);
+        wts2(
+            &mut p,
+            1,
+            egfx::CODECID_CAPROGRESSIVE,
+            7,
+            &progressive_one_tile_payload((0, 0, 64, 64)),
+        );
+        assert_eq!(p.progressive.painted_tiles(), 1);
+
+        wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 9, &[]);
+        assert_eq!(
+            p.progressive.painted_tiles(),
+            1,
+            "one surface is one store, whatever context id its stream claims"
+        );
+
+        // And the explicit free is a no-op for the same reason: a context id names nothing the
+        // store holds. FreeRDP's handler is a literal no-op too (`gdi/gfx.c:1239-1246`).
+        let mut body = 1u16.to_le_bytes().to_vec();
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&9u32.to_le_bytes());
+        feed(&mut p, egfx::CMDID_DELETE_ENCODING_CONTEXT, &body);
+        assert_eq!(
+            p.progressive.painted_tiles(),
+            1,
+            "DeleteEncodingContext must free nothing - the call is kept as the record of that"
+        );
+    }
+
+    #[test]
+    fn recreating_a_surface_id_frees_the_old_tile_store() {
+        // Servers recreate a surface id on resize/reconnect without a DeleteSurface. The old
+        // grid must go with it: its tile indices were computed against the old `gridWidth`, so
+        // keeping it would address every later tile wrongly (#170).
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        wts2(
+            &mut p,
+            1,
+            egfx::CODECID_CAPROGRESSIVE,
+            7,
+            &progressive_one_tile_payload((0, 0, 64, 64)),
+        );
+        assert_eq!(p.progressive.painted_tiles(), 1);
+
+        create_surface(&mut p, 1, 128, 128);
+        assert_eq!(
+            p.progressive.live_surfaces(),
+            0,
+            "the CreateSurface replace path must free the old store, not strand it"
+        );
+        assert_eq!(p.progressive.painted_tiles(), 0);
     }
 
     #[test]

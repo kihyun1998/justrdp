@@ -3485,12 +3485,19 @@ mod tests {
     /// non-deterministic — the corpus README says so). A decoder that had been fitted to the
     /// committed bytes would pass there and fail here, which is the whole point of keeping both.
     ///
-    /// It is deliberately **not** the same claim as
-    /// `egfx_graphics_pipeline_renders_the_desktop_against_real_vm`: that one proves the live
-    /// client paints a desktop, and it does so over ClearCodec and WireToSurface1, because
-    /// `justrdp::egfx` still routes WireToSurface2 through the bootstrap oracle. Wiring this
-    /// decoder into that path is #172's, so the proof available here is *these bytes through
-    /// this decoder*, which is exactly what slice 5 owns.
+    /// # What #172 added, and why it is not a tautology
+    ///
+    /// The paragraph that stood here said this was deliberately *not* a claim about the live
+    /// client, because `justrdp::egfx` routed WireToSurface2 through the bootstrap oracle and
+    /// the only proof available was *these bytes through this decoder*. #172 wired the
+    /// self-owned decoder into that path, so that rationale is retired and the live framebuffer
+    /// became evidence about this codec rather than about ClearCodec.
+    ///
+    /// So the run now proves two things from one session: that these bytes assemble into a
+    /// desktop through this decoder (slice 5's claim, the canvas below), and that the **live
+    /// client** paints a desktop over a WireToSurface2 path with no other decoder behind it
+    /// (slice 6's). A pixel-diff between the two looks like the obvious third claim and is not
+    /// one — see the comment where that comparison used to be.
     ///
     /// # Two traps this inherits rather than rediscovers (`docs/plan.md` §0)
     ///
@@ -3601,6 +3608,7 @@ mod tests {
             let manifest = std::fs::read_to_string(dump.join("manifest.tsv")).unwrap_or_default();
             let mut decoder = Progressive::new();
             let mut canvas: Vec<u8> = Vec::new();
+            let mut painted_mask: Vec<bool> = Vec::new();
             let (mut canvas_w, mut canvas_h) = (0usize, 0usize);
 
             let mut payloads = 0usize;
@@ -3658,6 +3666,11 @@ mod tests {
                     canvas_w = usize::from(w);
                     canvas_h = usize::from(h);
                     canvas = vec![0; canvas_w * canvas_h * 4];
+                    // Which pixels WireToSurface2 ever wrote. Needed for the #172 comparison
+                    // below: an unpainted canvas pixel is black, and black is also a perfectly
+                    // ordinary desktop pixel, so comparing without the mask would score the
+                    // parts neither path touched.
+                    painted_mask = vec![false; canvas_w * canvas_h];
                 }
                 let (cw, ch) = (canvas_w, canvas_h);
 
@@ -3678,9 +3691,11 @@ mod tests {
                         let src = ((usize::from(rect.src_y) + row) * 64
                             + usize::from(rect.src_x))
                             * 4;
-                        let dst = ((usize::from(rect.y) + row) * cw + usize::from(rect.x)) * 4;
+                        let dst_px = (usize::from(rect.y) + row) * cw + usize::from(rect.x);
+                        let dst = dst_px * 4;
                         let n = usize::from(rect.width) * 4;
                         canvas[dst..dst + n].copy_from_slice(&rect.tile[src..src + n]);
+                        painted_mask[dst_px..dst_px + usize::from(rect.width)].fill(true);
                     }
                 });
 
@@ -3773,6 +3788,76 @@ mod tests {
                 "expected at least a quarter of the surface painted, got {lit} of {total}"
             );
 
+            // ---- #172: the live client assembled the same payloads through the core -------
+            let fb = machine.framebuffer();
+            let (fw, fh) = (usize::from(fb.width()), usize::from(fb.height()));
+            let mut live_distinct = std::collections::HashSet::new();
+            for px in fb.pixels().chunks_exact(4) {
+                live_distinct.insert([px[0], px[1], px[2]]);
+                if live_distinct.len() > 64 {
+                    break;
+                }
+            }
+            eprintln!(
+                "#172 live-path proof: framebuffer {fw}x{fh}, {}+ distinct colours",
+                live_distinct.len()
+            );
+            assert!(
+                live_distinct.len() > 64,
+                "the live framebuffer is near-monochrome — the wired decoder painted nothing \
+                 recognisable, and WireToSurface2 has no other decoder now"
+            );
+
+            // ---- what a live/replay pixel diff can and cannot say ------------------------
+            //
+            // An earlier revision of this test compared the live framebuffer against the canvas
+            // above, expecting near-equality because the decoder is shared and only #172's
+            // wiring differs. It measured **17-19% agreement**, and the two PPM dumps show why
+            // the comparison was ill-posed rather than the wiring broken: the canvas is a
+            // WireToSurface2-only *accumulation* that never forgets — it still holds the
+            // wallpaper, a Start menu opened and closed 30 seconds ago, and a boot-time overlay
+            // — while the live `Surface` receives ClearCodec and WireToSurface1 blits into the
+            // same buffer and therefore holds the session's true final screen. The number was
+            // the fraction of pixels where WireToSurface2 happened to be the last writer, which
+            // is a property of the *server's* codec scheduling and not of this client.
+            //
+            // `docs/agents/theflow.md` names exactly this under Step 4: "beware a measurement
+            // that can misread itself". Recorded rather than deleted, because the comparison is
+            // the obvious thing to reach for and re-deriving why it does not work costs another
+            // 70-second run. **It would become well-posed** if the replay were driven through a
+            // `GraphicsProcessor` rather than onto a bare canvas, so that both sides saw every
+            // codec in arrival order; that needs a core-side replay seam which does not exist.
+            //
+            // What survives is well-posed and is the claim #172 actually makes: the live client
+            // paints a real desktop over a WireToSurface2 path that now has **no other decoder**.
+            // Before #172 the same assertion in
+            // `egfx_graphics_pipeline_renders_the_desktop_against_real_vm` was carried by
+            // ClearCodec and WireToSurface1; the counts printed above are what say this run
+            // exercised Progressive at all, and `clipped_rects > 0` that it exercised the seam.
+            let total_px = u64::from(fb.width()) * u64::from(fb.height());
+            let lit_px = fb
+                .pixels()
+                .chunks_exact(4)
+                .filter(|px| px[..3].iter().any(|&b| b != 0))
+                .count() as u64;
+            eprintln!("  live framebuffer: lit={lit_px} of {total_px}px");
+            // An eighth, against a measured 204 054 of 1 024 000 (19.9%) on the run that set
+            // this: the VM's desktop is mostly a black background, so a half-the-screen floor
+            // would fail on a healthy session and a floor set at the measurement would fail on
+            // the next one. It is a blank-screen detector, not a coverage target.
+            assert!(
+                lit_px * 8 >= total_px,
+                "the live framebuffer is barely painted ({lit_px} of {total_px}) — a desktop                  whose only WireToSurface2 decoder is the self-owned one should not be blank"
+            );
+
+            let live_path = std::env::temp_dir().join("justrdp-172-live-framebuffer.ppm");
+            let mut live_ppm = format!("P6\n{fw} {fh}\n255\n").into_bytes();
+            for px in fb.pixels().chunks_exact(4) {
+                live_ppm.extend_from_slice(&px[..3]);
+            }
+            std::fs::write(&live_path, live_ppm).expect("write the live dump");
+            eprintln!("live framebuffer dump: {}", live_path.display());
+
             let path = std::env::temp_dir().join("justrdp-171-progressive-assembly.ppm");
             let mut ppm = format!("P6\n{canvas_w} {canvas_h}\n255\n").into_bytes();
             for px in canvas.chunks_exact(4) {
@@ -3780,6 +3865,7 @@ mod tests {
             }
             std::fs::write(&path, ppm).expect("write the visual dump");
             eprintln!("visual dump for confirmation: {}", path.display());
+
         })
         .await;
     }

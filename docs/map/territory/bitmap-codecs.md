@@ -193,20 +193,18 @@ as citations.
 
 - **Standalone NSCodec (surface bits / bitmap cache) is not built** — #150; today's
   NSCodec exists as the ClearCodec subcodec only.
-- **RemoteFX Progressive is self-owned but not yet wired** — epic #158. Slices 1–5 landed
-  the wire parser (#167), the upgrade-pass entropy layer (#168, `rfx/srl.rs`), the multi-pass
-  tile decode plus the reduce-extrapolate inverse DWT (#169), the store's lifecycle plus the
-  per-payload block ordering (#170) and the full-pipeline assembly (#171, `Progressive`).
-  **Only the bootstrap drop (#172) is open, and it is the wiring**: `justrdp-codecs/src/egfx.rs`
-  still delegates Progressive to `ironrdp-graphics`, so nothing a *server* sends reaches the
-  self-owned decoder in the live client — only the corpus and the `#[ignore]`d VM proof do.
-  Two consequences stay live until #172: `justrdp::egfx` still frees on `RESETGRAPHICS`
-  (`justrdp/src/egfx.rs:319`) and on `DELETEENCODINGCONTEXT` (`:484`) — correct for the
-  id-keyed bootstrap oracle (#83), wrong once the surface-keyed store is wired, and pinned by
-  a passing test (`:1206`) that #172 has to retire; and the live WTS2 arm blits **whole tiles**
-  where the self-owned decoder clips to the region's rects, which #171 measured to be a
-  57 386-pixel difference on a 1 280 x 800 surface rather than a dirty-rect nicety. #91 is the
-  RLGR bit-reader performance work. **Its verification basis is owned as of #194** — a
+- **RemoteFX Progressive is self-owned and live** — epic #158, closed by #172. Slices 1–5
+  landed the wire parser (#167), the upgrade-pass entropy layer (#168, `rfx/srl.rs`), the
+  multi-pass tile decode plus the reduce-extrapolate inverse DWT (#169), the store's lifecycle
+  plus the per-payload block ordering (#170) and the full-pipeline assembly (#171,
+  `Progressive`); slice 6 (#172) wired it into `justrdp::egfx` and retired the bootstrap
+  delegation. What the wiring inverted, and why a green test had to be inverted with it:
+  `justrdp::egfx` used to free Progressive state on `RESETGRAPHICS` and on
+  `DELETEENCODINGCONTEXT`, which is correct for the id-keyed bootstrap oracle (#83) and a
+  **desync** once the store is keyed by surface — the server's encoder keeps its reference
+  frames across a reset and `RFX_TILE_DIFFERENCE` adds against them. Both frees are gone;
+  `DELETESURFACE` and the `CREATESURFACE` replace path are the only things that free now.
+  #91 is the RLGR bit-reader performance work. **Its verification basis is owned as of #194** — a
   real-server corpus plus FreeRDP-derived SRL expectations, not an oracle diff, because the
   oracle decodes 2 of 52 real payloads (ADR-0011). The SRL half of that basis was
   **re-derived in #168**: five of its eight vectors had been computed at the oracle's initial

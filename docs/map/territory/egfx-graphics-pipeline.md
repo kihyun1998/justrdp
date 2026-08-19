@@ -37,8 +37,12 @@ acknowledge frames. It is server→client only, and it is reachable only if
 - `justrdp/src/egfx.rs` — `Surface`, `CachedBitmap` (`mapped`, `dirty`)
 - `justrdp-pdu/src/egfx.rs` — `EgfxPdu`, `Rect16`, `Point16`, `decode_all`,
   `encode_caps_advertise`, `encode_frame_acknowledge`, `wrap_uncompressed`
-- `justrdp-codecs/src/egfx.rs` — `Zgfx`, `Progressive`, `ProgressiveTile`
-  (behind the `egfx-bootstrap` feature — the remaining phase-1 wrappers)
+- `justrdp-codecs/src/egfx.rs` — `Zgfx` (behind the `egfx-bootstrap` feature — the
+  last phase-1 wrapper; Progressive left it in #172)
+- `justrdp-codecs/src/rfx/progressive.rs` — `Progressive`, `PaintedRect`,
+  `PayloadOutcome`, `SurfaceStore` (self-owned, ungated, live since #172)
+- `justrdp-codecs/src/capture.rs` — `progressive_capture_dir`, `progressive_payload`
+  (the real-server corpus harness, ungated so it does not ride zgfx's feature flag)
 - Spec sections cited inline: `[MS-RDPEGFX]` 2.2.2.14, 3.3.8.2
 
 ## Reference behaviour
@@ -75,16 +79,18 @@ phase-2 rewrite (epic #158) *depends* on a reference comparison — the oracle i
 
 ## Known holes / open
 
-- **zgfx and RemoteFX Progressive are still `ironrdp-graphics` wrappers** behind
-  `egfx-bootstrap`; epic #158 (slices #167–#172) is the rewrite, and #91 the
-  bit-reader performance work alongside it. **Progressive's replacement now exists and is
-  unwired** (#171: `justrdp_codecs::rfx::progressive::Progressive`), so this territory
-  currently holds two Progressive decoders that disagree about the picture — the live one
-  blits whole tiles, the self-owned one clips each tile to its region's rects, a measured
-  57 386-pixel difference over one captured 1 280 x 800 session. #172 is what makes the live
-  path the proven one; until it lands, this territory's WTS2 behaviour is the *unproven* half
-  of that pair. **A second consequence that is easy to miss: an
-  oracle bump is a *live-path* change for these two**, not only a test change — the
+- **zgfx alone is still an `ironrdp-graphics` wrapper** behind `egfx-bootstrap`; #189 is
+  its rewrite. Epic #158 (slices #167–#172) closed the Progressive half: the self-owned
+  decoder (`justrdp_codecs::rfx::progressive::Progressive`) is the **live** WTS2 decoder as
+  of #172, so this territory no longer holds two decoders that disagree about the picture.
+  What the swap changed on the wire-visible side: a tile is now painted only where its
+  region's rects reach — a measured 57 386-pixel difference over one captured
+  1 280 x 800 session — and the per-tile `Vec<u8>` the bootstrap wrapper returned is gone,
+  which is 6193 x 16 KiB of allocation per session that
+  [the frame path carries no owned pixels](../invariant/frame-path-carries-no-owned-pixels.md)
+  never reached because it stopped at the surface→framebuffer step.
+  **A consequence that is easy to miss: an
+  oracle bump is a *live-path* change for zgfx**, not only a test change — the
   0.8 → 0.9 move (#184/#186) shipped Devolutions/IronRDP#1395, which stops Progressive
   requiring a `WBT_CONTEXT` block on every frame once a context exists. #170's self-owned
   lifecycle reproduces it and then some: `order_payload` never gates a region on a context
