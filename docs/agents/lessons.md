@@ -69,6 +69,33 @@ Read this before starting so the bindings do not read as abstractions.
   green is *evidence of a hole that does not exist*, which sends the next hour into writing
   a test for a case already covered.
 
+- **When the suite is already green, the discriminating power has to come from somewhere
+  that is not the suite (#198).** The change made every synthesised desktop step wait for the
+  server's own repaint before sending the next one — and the VM suite passed 15/15 both before
+  and after, because the race it removes is a race. A VM run therefore proves *nothing about
+  this change*; it only shows nothing broke. What proved it were two things that need no VM at
+  all. **Six mutations**, each turning one part of the fix off and each caught by a named test:
+  dropping the `> 0` settle guard, settling on any non-decreasing read, counting the count you
+  started from, forgetting the `/` that `shutdown /l` needs, sending the Start click once
+  instead of retrying, and not counting the retried clicks. And **a fake shell** — a task that
+  reads the input channel and simply declines to draw for the first two clicks, which is
+  exactly a cold logon where the desktop is up and the taskbar is not. The retry is the new
+  behaviour, so it is the one worth proving against something that can be made to misbehave on
+  demand; the real VM cannot be asked to have a slow shell.
+  The corollary is about *where* the primitives live. Extracting `await_desktop` /
+  `painted_since` / `vk_for` out of five open-coded copies is what made them testable at all —
+  the same logic inside a `tokio::spawn` in a `#[ignore]`d test is reachable only by a VM.
+- **`0 == 0` is a settled desktop, and that is the whole bug (#198).** Five VM tests spun on
+  *"the frame count stopped changing"*; **three** wrote `now == last && now > 0` and **two**
+  wrote `now == last`. The guard looks like defensive padding and is load-bearing: before the
+  first frame ever arrives the count is 0, has been 0, and the loop exits immediately — so the
+  test proceeds to click Start and type into a desktop that has not painted a pixel. It only
+  became reachable when #197 replaced the suite's warm reattach with a cold logon, and the one
+  test #197 measured red is one of the two without the guard. Two readings: **a guard present
+  in most copies of a pattern and absent in the rest is a finding, not a style difference** —
+  the divergence is cheap to grep for and it names the bug; and a fix that deletes the copies
+  is what stops the next one being written without it.
+
 ## Step 4 — real round-trip, not a fake (ADR-0003/0007)
 
 - **Codec proof is byte-identical, or it is not proof.** The same bitstream through
@@ -114,6 +141,95 @@ Read this before starting so the bindings do not read as abstractions.
   proved by the spec vector and the oracle differential and by nothing a server has done.
   Recorded in the territory's `## Known holes`, because "the VM renders the desktop" would
   otherwise have been written as if it covered the whole module.
+
+- **A five-minute probe killed a direction the issue had spent a day arguing for (#198).**
+  #198 listed three ways to make the VM teardown robust and chose none; the second — implement
+  the RDP Shutdown Request PDU — came with a real argument (it is a protocol capability we lack,
+  and it would turn a refusal into a *typed* answer instead of a modal to read off a
+  screenshot). The issue also recorded, honestly, that *"the spec pages do not state the
+  condition under which the server denies"*. One throwaway probe answered it: send `pduType2`
+  **0x24** to this VM on a **clean** desktop — nothing open, nothing unsaved — and **0x25,
+  Shutdown Denied**, comes back and the session stays up. The direction dies as a teardown
+  mechanism in five minutes rather than after a day of implementing it.
+  Two things worth keeping beyond the number. **`docs/plan.md` had already guessed it** —
+  §V.3's slice reads *"assert the server replies with Shutdown Denied (typical)"*, written
+  long before — so the ledger Step 1 makes you open contained the answer to the question the
+  issue said was open, and reading it first is what made the probe a confirmation rather than
+  a discovery. And **the direction is still worth doing, just not for this**: the probe turns
+  §6b's unwritten slice from speculative into pre-measured, which is the difference between
+  killing an idea and relocating it.
+- **The premise was already false before the work started — and so was the issue's (#198).**
+  Two of them, in opposite directions, and both had to be measured rather than reasoned about.
+  *Its Definition of Done was already met*: #198 was filed at 11 of 12 passing and asks for
+  "12/12 in parallel, twice"; measured before touching anything, the suite was **15/15 in
+  parallel** (it had grown to 15 tests), 620 s. So the acceptance criterion could have been
+  signed off on a green run, and should not have been — **a green run does not make an
+  open-loop step closed-loop, it makes it lucky today.**
+  *And its central claim was wrong.* The issue rests on Microsoft's `shutdown` reference —
+  *"the /l parameter works independently and can't be combined with any other parameters …
+  is ignored"* — to conclude that the `/f` in `shutdown /l /f` is dead text and the comment
+  crediting it with forcing applications closed is false. Acting on that read the flag was
+  removed, the suite went red at exactly the test that leaves Notepad holding unsaved work,
+  and the PPM the teardown dumps showed **Notepad's own save prompt**. A/B from a clean
+  session, one variable: `/l /f` signs out in 63 s, `/l` is blocked at 150 s. The flag is
+  load-bearing and the documentation does not describe this path.
+  The lesson is sharper than *"verify external facts"*, because that rule was followed — the
+  reference was fetched and read verbatim off its primary source rather than taken from the
+  issue's quote, and it was still wrong about the machine. **A correctly-read document is a
+  claim, not an observation**, and for what a real system *does* only the system arbitrates
+  (the receive-side half of the bindings' tie-breaker, and ADR-0009's posture one layer out).
+  The thing that made it recoverable in one run is #182's PPM dump: two modals with two
+  different causes — Notepad's *"save changes?"* and Windows' *"close N apps and sign out"* —
+  are indistinguishable from a timeout message and obvious from a screenshot.
+
+- **Eight green mutations, two green fake shells, and the real VM found the defect anyway
+  (#198).** The change made every synthesised desktop step wait for the server's repaint. It
+  was mutation-tested (eight, each caught by a named test) and driven against a fake shell
+  that declines to draw. All green. The VM then failed at the first teardown, and the PPM
+  showed the Start search box holding **`hutdown /l /f`** — Windows answering *"no results"*
+  to a command whose leading `s` had been dropped.
+  The bug is one word wide: `painted_since` answers **"it started drawing"**, and typing needs
+  **"it finished"**. A menu that has begun opening is not yet taking input. Closing a loop on
+  the wrong *edge* is its own defect class, and none of the VM-free machinery could see it
+  because every one of those tests modelled a shell that draws instantly.
+  Three things worth keeping. **A fake is only as good as the failure it can express** — the
+  fix was not to trust the VM more but to teach the fake shell to swallow input while it is
+  still painting, at which point the mutation goes red like the others. **The blind
+  `sleep(2s)` this change removed happened to cover exactly this case**, which is the honest
+  reading of a fixed sleep: not wrong about everything, *unfalsifiable* — it covered this and
+  missed the cold logon, and the code said which for neither. And the pass that found it is
+  the one this repo already had: **Step 4 is not a formality when Steps 3 and 5 came back
+  clean**, it is precisely then that it is load-bearing.
+- **A guard nothing can turn red is a decoration (#198).** Of the two quiescence waits added
+  above, mutating the first turned a test red and mutating the second turned **nothing** red —
+  it guarded Enter committing a half-resolved search result, which no fake modelled. That is
+  the same finding as #224's non-discriminating self-test case, one layer out: the fix is to
+  extend the fake until the mutation bites, not to keep the guard on the strength of the
+  argument for it. Both are now caught by the same shell.
+- **A mutation harness that aborts leaves the tree mutated (#198, after #189).** #189 taught
+  it to check `returncode`; this run taught the other half. Two aborts — one where a `cargo
+  fmt` had reformatted a mutation's target string so the pre-write assert threw, one where the
+  reader closed the pipe — each left a *previous* iteration's mutation on disk, and the next
+  run then captured the mutated file as its `ORIGINAL`, so the restore would have written the
+  mutation back permanently. The guard is one line, `atexit.register` the restore, and the
+  tell that you need it is that the harness's own failure mode is silent: the tests still
+  pass, on code you did not write.
+
+- **"Remove the hazard" beat "handle the hazard" on paper and lost on the VM (#198).** The
+  teardown signs out through the Windows UI and an application holding unsaved work can veto
+  that; slice-7 was the only test that left any. Two ways out: force past it (the sign-out's
+  `/f`, measured) or delete the cause (launch a console instead of Notepad, close it with
+  `exit`). The second is strictly safer by inspection — nothing to save, nothing to veto,
+  nothing to guess at — and it is what the maintainer chose when the modal count reached six.
+  The VM priced it in one run: a console's client area carries the **same arrow as the
+  desktop**, so the server never pushes a *decoded* pointer shape and slice-7's `shapes >= 1`
+  (issue #41) saw 60 cursor events without a single `Set`. The I-beam over Notepad's edit area
+  is the only surface in the suite that produces one.
+  The generalisable part is not about Notepad. **The hazard was also carrying a proof**, and
+  nothing in the reasoning that removed it could see that, because the proof lived in a
+  different assertion in the same test — one about pointers, not about sign-outs. Before
+  deleting a thing to remove its risk, ask what *else* is standing on it; a test that asserts
+  two unrelated properties is exactly where that goes unnoticed.
 
 ## Step 5 — adversarial completeness is automated (ADR-0008)
 
