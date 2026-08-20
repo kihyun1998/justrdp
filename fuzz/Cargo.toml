@@ -183,3 +183,22 @@ path = "fuzz_targets/zgfx.rs"
 test = false
 doc = false
 bench = false
+
+# gcc and mcs (#203): the two connect-sequence parsers #200 could not add mechanically, because
+# neither has a single top-level `decode`. Each is one target with an `Arbitrary` selector over
+# its entry points rather than one target per entry point -- see the target headers for why the
+# nine `gcc` entry points are two trees, and why `gcc` needs the seed corpus #203 predicted it
+# would not.
+[[bin]]
+name = "gcc"
+path = "fuzz_targets/gcc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcs"
+path = "fuzz_targets/mcs.rs"
+test = false
+doc = false
+bench = false

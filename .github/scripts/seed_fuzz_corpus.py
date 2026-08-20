@@ -187,10 +187,85 @@ def seed_progressive_srl(out_dir):
     return 1
 
 
+
+# The connect-sequence fixtures `capture_connect_response_against_real_vm` writes, and the arms
+# of the two selector targets they belong to. See `fuzz_targets/{gcc,mcs}.rs` for the layout.
+CONNECT_FIXTURES = REPO / "crates/justrdp-pdu/tests/fixtures/connect"
+GCC_ARMS = 9
+MCS_ARMS = 5
+
+
+def _selector(arm, arm_count):
+    """The 4-byte little-endian prefix that makes `arbitrary` 1.4.2 pick variant `arm`.
+
+    `derive_arbitrary` reads a `u32` from the front and resolves the variant as
+    `(sel * arm_count) >> 32`, so the smallest selector landing on `arm` is
+    `ceil(arm * 2**32 / arm_count)`. Measured against the pinned version rather than read off
+    the derive macro, and `fuzz/Cargo.lock` is tracked so a bump arrives as a reviewable diff --
+    the argument `seed_progressive_srl` records for its own encoding dependency.
+
+    `progressive_assembly` declares a hand-rolled layout precisely so its seeder can exist, and
+    that precedent does not bind here: its records are variable-length and repeated, while this
+    reduces to a fixed 4-byte prefix in front of the payload verbatim, because the targets take
+    `&[u8]` rather than `Vec<u8>`. That choice is load-bearing -- a `Vec<u8>` field consumes one
+    byte per element from the front *and* one from the back, so a seed written into it would not
+    survive as the bytes anyone captured.
+    """
+    return struct.pack("<I", -((-arm << 32) // arm_count))
+
+
+def _seed_connect(out_dir, fixture_name, arm_count, prefix):
+    """Seed a connect-sequence target from one captured fixture, one file per arm.
+
+    Every arm gets the same real payload under its own selector. Only arm 0 parses it -- it is
+    that arm's exact input -- and the rest get structurally rich bytes to mutate rather than the
+    empty file they would otherwise start from.
+
+    **This is a bootstrap seeder that turned out not to be bootstrapping anything**, and the
+    distinction is worth keeping rather than quietly deleting. #203 measured 11.98% of `gcc.rs`'s
+    regions from 200k undirected inputs -- every per-block decoder dark behind a ~12-byte magic
+    prefix -- and read that as `rfx::progressive`'s wall. The A/B on the lane says otherwise:
+
+        empty    cov: 515  ft: 1207  corp: 255/21Kb   exec/s: 178573
+        seeded   cov: 699  ft: 1987  corp: 391/94Kb   exec/s:  46166
+
+    Coverage guidance climbs a magic prefix unaided, because a comparison against a byte string
+    feeds libFuzzer's auto-dictionary; random sampling has no such mechanism, so the local number
+    was measuring the *proptest* half of ADR-0008 and not this one. `progressive`'s wall is nested
+    lengths that must agree with each other, which no dictionary entry can synthesise -- a
+    different kind of barrier, and the one worth predicting from.
+
+    So this stays for the 36% coverage and 65% features it measurably buys in 4x fewer executions,
+    not because the target is blind without it. If it ever has to be dropped, dropping it costs
+    that and nothing more.
+    """
+    fixture = CONNECT_FIXTURES / fixture_name
+    if not fixture.is_file():
+        print(f"::error::seed fixture missing: {fixture.relative_to(REPO)}")
+        return None
+
+    payload = fixture.read_bytes()
+    for arm in range(arm_count):
+        (out_dir / f"{prefix}-arm{arm}.bin").write_bytes(_selector(arm, arm_count) + payload)
+    return arm_count
+
+
+def seed_gcc(out_dir):
+    """Seed `gcc` from the captured GCC Conference Create Response."""
+    return _seed_connect(out_dir, "conference-create-response.bin", GCC_ARMS, "ccr")
+
+
+def seed_mcs(out_dir):
+    """Seed `mcs` from the captured MCS Connect-Response."""
+    return _seed_connect(out_dir, "connect-response.bin", MCS_ARMS, "connect-response")
+
+
 SEEDERS = {
     "progressive": seed_progressive,
     "progressive_assembly": seed_progressive_assembly,
     "progressive_srl": seed_progressive_srl,
+    "gcc": seed_gcc,
+    "mcs": seed_mcs,
 }
 
 

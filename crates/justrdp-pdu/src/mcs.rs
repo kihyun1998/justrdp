@@ -397,6 +397,46 @@ mod tests {
         ) {
             let _ = decode_connect_response(&body);
         }
+
+        // The four PER `DomainMCSPDU` parsers, added with this module's fuzz target (#203).
+        // Shallower than the BER path above -- each is a choice byte plus two or three PER
+        // integers -- but every one of them is `pub` over bytes an X.224 Data TPDU carried, and
+        // `SendDataIndication` reads a PER length determinant that sizes the slice it hands to
+        // the session loop, which is the reassembly-length shape the untrusted-decode invariant
+        // names. That clamp is load-bearing rather than defensive: replacing
+        // `read_slice(length.min(cur.remaining()))` with a direct `&body[..length]` turns this
+        // property red, which is how its discriminating power was checked.
+        #[test]
+        fn attach_user_confirm_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = AttachUserConfirm::decode(&body);
+        }
+
+        #[test]
+        fn send_data_indication_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = SendDataIndication::decode(&body);
+        }
+
+        #[test]
+        fn channel_join_confirm_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ChannelJoinConfirm::decode(&body);
+        }
+
+        // `matches` is driven beside `decode` because it is the session loop's pre-test: it is a
+        // separate `pub fn` over the same server bytes, so a property on `decode` alone leaves it
+        // undriven on a surface the invariant's derivation enumerates.
+        #[test]
+        fn disconnect_provider_ultimatum_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = DisconnectProviderUltimatum::matches(&body);
+            let _ = DisconnectProviderUltimatum::decode(&body);
+        }
     }
 
     #[test]

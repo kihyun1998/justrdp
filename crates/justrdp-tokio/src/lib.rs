@@ -585,8 +585,54 @@ async fn connect_inner(
             )));
         }
         tracing::debug!(bytes = n, stage = sm.stage(), "read from socket");
+        capture_connect_chunk(&readbuf[..n]);
         queue.extend(sm.process(Event::Received(&readbuf[..n])));
         announce_stage(&mut sm, &mut announced, &mut on_stage);
+    }
+}
+
+/// The env var that arms [`capture_connect_chunk`]. An **empty** value counts as unset, for the
+/// same reason the codec harness gives: `Path::new("")` resolves to the process CWD.
+const CONNECT_CAPTURE_FILE: &str = "JUSTRDP_CONNECT_CAPTURE_FILE";
+
+/// Append one server-to-client chunk read during the connect sequence to the capture file.
+///
+/// Sibling of `justrdp_codecs::capture`, and it exists for the reason that survived #203's
+/// measurements: this repo has **no server-side encoder at all** — every encoder in
+/// `justrdp-pdu` writes client-to-server, because justrdp is a client — so a server PDU can only
+/// be obtained, never synthesised. Everything downstream that wants real server bytes (the fuzz
+/// seed, the acceptance test, the truncation and bit-corruption sweeps) comes through here.
+///
+///
+/// **It lives in the adapter, not the core.** A file append inside `ConnectStateMachine` is
+/// exactly the I/O that ADR-0001's boundary exists to keep out; the adapter already owns the
+/// socket, so capturing what it reads costs the boundary nothing. That is a difference from the
+/// codec harness, which had no such layer beneath it.
+///
+/// **Raw chunks, not reassembled frames.** Reassembly is the core's job and the adapter would
+/// have to duplicate it to capture frames instead -- so the reader walks the TPKT framing itself
+/// with `justrdp_pdu::tpkt`, which also makes the capture a test of the public framing API
+/// rather than a private dump format.
+///
+/// **Server-to-client only**, because this is the read path: the Client Info PDU carrying the
+/// password crosses the same socket in the other direction and never reaches here. A capture is
+/// therefore safe to commit as a fixture.
+///
+/// Best-effort: every IO error is swallowed, so capture can never perturb a connect.
+fn capture_connect_chunk(bytes: &[u8]) {
+    let Ok(path) = std::env::var(CONNECT_CAPTURE_FILE) else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(bytes);
     }
 }
 
@@ -3530,6 +3576,134 @@ mod tests {
             }
             std::fs::write(&path, ppm).expect("write the visual dump");
             eprintln!("visual dump for confirmation: {}", path.display());
+        })
+        .await
+    }
+
+    /// Capture the MCS Connect-Response a real server sends, and commit it as the fixture that
+    /// seeds the `gcc` and `mcs` fuzz targets (#203).
+    ///
+    /// The fixture seeds those targets, asserts real-server acceptance in the stable gate, and is
+    /// the repo's only offline connect-sequence bytes. It is **not** a rescue from a coverage
+    /// wall, which is what #203 expected and what the lane disproved: `gcc` reaches `cov: 515`
+    /// from an empty corpus against `cov: 699` seeded, because coverage guidance climbs a magic
+    /// prefix on its own. The 11.98% of `gcc.rs`'s regions that 200k undirected inputs reach
+    /// measures proptest's half of ADR-0008, not this one.
+    ///
+    /// The seed has to come from a **real server**, and that is a structural fact rather than a
+    /// preference: `justrdp-pdu` contains no server-side encoder that could synthesise one,
+    /// because every encoder in it writes client-to-server. justrdp is a client, so the
+    /// server-PDU decoders are precisely the half a round-trip test can never reach -- which is
+    /// the same asymmetry that left #98 able to give `decode_connect_response` a no-panic
+    /// property but no round-trip.
+    ///
+    /// The other two candidates were rejected by derivation rather than by taste. Encoding one
+    /// with `ironrdp-pdu` (which `differential_ironrdp.rs` already does) would make the seed's
+    /// authority the oracle, against ADR-0011's direction, and would put an `ironrdp` dependency
+    /// in the fuzz crate. Hand-building one from our own `per`/`ber` writers would be our decoder
+    /// grading our encoder.
+    ///
+    /// Unlike the ClearCodec and Progressive harnesses this asserts rather than only summarises,
+    /// because there is exactly one Connect-Response per connect and its shape is not
+    /// server-mood-dependent the way a repaint is.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn capture_connect_response_against_real_vm() {
+        with_vm_session(|vm| async move {
+            let dump = std::env::temp_dir().join("justrdp-connect-capture.bin");
+            let _ = std::fs::remove_file(&dump);
+            // SAFETY: set before the connect and removed straight after it; the harness lock
+            // serialises real-VM tests and nothing else reads this var, so no concurrent
+            // reader/writer races the process environment.
+            unsafe {
+                std::env::set_var(CONNECT_CAPTURE_FILE, &dump);
+            }
+            let outcome = vm.connect(test_config()).await;
+            // SAFETY: see the matching `set_var` above -- same serialised, single-writer context.
+            unsafe {
+                std::env::remove_var(CONNECT_CAPTURE_FILE);
+            }
+            drop(outcome);
+
+            let raw = std::fs::read(&dump).expect("the connect capture file");
+            assert!(!raw.is_empty(), "the capture armed but wrote nothing");
+
+            // Walk the TPKT framing with the public parser rather than a private dump format --
+            // the adapter captured raw socket chunks precisely so that reassembly stays the
+            // core's job and this stays a test of the shipped framing API.
+            let mut off = 0usize;
+            let mut frames = 0usize;
+            let mut connect_response: Option<Vec<u8>> = None;
+            while off < raw.len() {
+                let Ok(total) = justrdp_pdu::tpkt::frame_len(&raw[off..]) else {
+                    break;
+                };
+                if total == 0 || off + total > raw.len() {
+                    break;
+                }
+                let frame = &raw[off..off + total];
+                off += total;
+                frames += 1;
+                let Ok(payload) = justrdp_pdu::tpkt::decode(frame) else {
+                    continue;
+                };
+                // The X.224 Connection Confirm is not a Data TPDU, so this rejects it and the
+                // walk moves on -- the Connect-Response is the first frame that is both.
+                let Ok(mcs_body) = justrdp_pdu::x224::decode_data(payload) else {
+                    continue;
+                };
+                if justrdp_pdu::mcs::decode_connect_response(mcs_body).is_ok() {
+                    connect_response = Some(mcs_body.to_vec());
+                    break;
+                }
+            }
+
+            let body = connect_response.unwrap_or_else(|| {
+                panic!("no MCS Connect-Response in {frames} captured frames ({} bytes)", raw.len())
+            });
+
+            // Assert what the fixture is before committing it: a seed nobody checked is a seed
+            // that can quietly stop being a Connect-Response.
+            let response = justrdp_pdu::mcs::decode_connect_response(&body)
+                .expect("the captured body decodes");
+            assert_eq!(response.result, 0, "the server did not report rt-successful");
+            let blocks = &response.conference.blocks;
+            assert_ne!(blocks.network.io_channel, 0, "no I/O channel in the server's network data");
+
+            // The `gcc` target is handed the GCC user data, not the whole MCS body, so the
+            // fixture set needs that slice too. It is found by asking the parser rather than by
+            // hardcoding the T.124 prefix here: the user data is the first offset at which
+            // `ConferenceCreateResponse::decode` succeeds, which cannot silently desync from the
+            // parser the way a copied marker could.
+            let gcc_offset = (0..body.len())
+                .find(|&i| justrdp_pdu::gcc::ConferenceCreateResponse::decode(&body[i..]).is_ok())
+                .expect("the captured body contains a decodable ConferenceCreateResponse");
+            let user_data = &body[gcc_offset..];
+            assert!(
+                user_data.len() > 32,
+                "implausibly short GCC user data ({} bytes)",
+                user_data.len()
+            );
+
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("justrdp-pdu")
+                .join("tests")
+                .join("fixtures")
+                .join("connect");
+            std::fs::create_dir_all(&fixture).expect("create the fixture dir");
+            std::fs::write(fixture.join("connect-response.bin"), &body)
+                .expect("write the MCS fixture");
+            std::fs::write(fixture.join("conference-create-response.bin"), user_data)
+                .expect("write the GCC fixture");
+            eprintln!(
+                "walked {} frames; wrote a {}-byte Connect-Response and its {}-byte GCC user data (at offset {}) to {}",
+                frames,
+                body.len(),
+                user_data.len(),
+                gcc_offset,
+                fixture.display()
+            );
         })
         .await
     }
