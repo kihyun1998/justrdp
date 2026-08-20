@@ -1,0 +1,55 @@
+#![no_main]
+//! Fuzz the MCS (T.125) PDU parsers (issue #203). Sibling of mcs's five
+//! `*_never_panics_on_arbitrary_input` proptests.
+//!
+//! ## Why one target with a selector rather than five
+//!
+//! Unlike `gcc`, these five really are five grammars — but four of them are 2-to-8-byte PER
+//! `DomainMCSPDU`s sharing one `read_domain_choice` prefix, and they saturate in seconds. Five
+//! lane jobs would be one target doing work and four idling through a 300s budget. The selector
+//! is the shape `rfx.rs` already uses here for the same reason.
+//!
+//! `decode_connect_response` is the odd one: BER rather than PER, and the only entry point that
+//! recurses into another module (the whole `gcc` server tree hangs off it). It is also the one
+//! with a prefix deep enough to hide `DomainParameters::decode`, which 200k undirected inputs
+//! never reached — so this target is seeded from a real Connect-Response captured off the test
+//! VM, the same way `progressive` is seeded from its corpus fixture (#200).
+//!
+//! Measured, 200k undirected inputs across all five: `mcs.rs` reaches 33.9% of its regions and
+//! 6 of its 19 functions. #203 predicted this family would bootstrap without a seed and that
+//! holds for the four PER PDUs; it is the BER path that does not.
+
+use libfuzzer_sys::arbitrary::{self, Arbitrary};
+use libfuzzer_sys::fuzz_target;
+
+/// Which parser `data` is handed to.
+#[derive(Arbitrary, Debug)]
+enum Entry {
+    ConnectResponse,
+    AttachUserConfirm,
+    SendDataIndication,
+    ChannelJoinConfirm,
+    DisconnectProviderUltimatum,
+}
+
+#[derive(Arbitrary, Debug)]
+struct Input {
+    entry: Entry,
+    data: Vec<u8>,
+}
+
+fuzz_target!(|input: Input| {
+    use justrdp_pdu::mcs::*;
+    let d = &input.data[..];
+    // Total by construction (`body.first()`), so it costs nothing to drive on every input rather
+    // than spending a selector arm on it — and it is a `pub fn` over server bytes, so leaving it
+    // undriven would be a gap the invariant's derivation would keep finding.
+    let _ = DisconnectProviderUltimatum::matches(d);
+    match input.entry {
+        Entry::ConnectResponse => { let _ = decode_connect_response(d); },
+        Entry::AttachUserConfirm => { let _ = AttachUserConfirm::decode(d); },
+        Entry::SendDataIndication => { let _ = SendDataIndication::decode(d); },
+        Entry::ChannelJoinConfirm => { let _ = ChannelJoinConfirm::decode(d); },
+        Entry::DisconnectProviderUltimatum => { let _ = DisconnectProviderUltimatum::decode(d); },
+    }
+});

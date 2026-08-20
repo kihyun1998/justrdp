@@ -791,6 +791,7 @@ impl ConferenceCreateResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn core_data() -> ClientCoreData {
         ClientCoreData {
@@ -939,5 +940,92 @@ mod tests {
         let decoded = ServerSecurityData::decode(&body).unwrap();
         assert_eq!(decoded.encryption_method, 2);
         assert_eq!(decoded.encryption_level, 1);
+    }
+
+    // ADR-0008 / issue #97 - the no-panic robustness properties for this module, added with its
+    // fuzz target (#203). Every length and count below is server-supplied, so malformed bytes
+    // must surface as a typed `DecodeError`, never a panic / overflow / OOB. Reaching the end
+    // without unwinding IS the assertion; proptest shrinks any failure to a minimal
+    // counterexample.
+    //
+    // Nine entry points, but two trees. `ConferenceCreateResponse::decode` is the wire-reachable
+    // root (`mcs::decode_connect_response` calls it) and everything `Server*` hangs off it;
+    // `ClientGccBlocks::decode` is a round-trip aid with no caller outside this crate's tests.
+    // Both trees get properties anyway: they are `pub fn`s over `&[u8]` on a published surface,
+    // and they share the `read_block` walk, which is where the length arithmetic lives.
+    //
+    // The inner blocks are driven directly rather than only through their root, and that is
+    // measured rather than stylistic. 200k undirected inputs reach 11.98% of this file's regions
+    // and leave all six per-block decoders dark, because the root demands ~12 bytes of exact
+    // magic (the T.124 OID and the literal "McDn") before it parses a single block -- and
+    // `read_block` then needs an exact `u16` block type on top. Checked by mutation rather than
+    // inferred: an out-of-bounds read injected into `ServerNetworkData::decode` turns that
+    // parser's own property red while `server_gcc_blocks_...`, which *calls* it, stays green.
+    // A property that only drove the root would have passed over the defect.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn conference_create_response_decode_never_panics_on_arbitrary_input(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ConferenceCreateResponse::decode(&bytes);
+        }
+
+        #[test]
+        fn server_gcc_blocks_decode_never_panics_on_arbitrary_input(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ServerGccBlocks::decode(&bytes);
+        }
+
+        #[test]
+        fn server_core_data_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ServerCoreData::decode(&body);
+        }
+
+        #[test]
+        fn server_network_data_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ServerNetworkData::decode(&body);
+        }
+
+        #[test]
+        fn server_security_data_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ServerSecurityData::decode(&body);
+        }
+
+        #[test]
+        fn client_gcc_blocks_decode_never_panics_on_arbitrary_input(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ClientGccBlocks::decode(&bytes);
+        }
+
+        #[test]
+        fn client_core_data_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ClientCoreData::decode(&body);
+        }
+
+        #[test]
+        fn client_security_data_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ClientSecurityData::decode(&body);
+        }
+
+        #[test]
+        fn client_network_data_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = ClientNetworkData::decode(&body);
+        }
     }
 }
