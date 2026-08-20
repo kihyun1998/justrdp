@@ -3698,7 +3698,7 @@ mod tests {
             std::fs::write(fixture.join("conference-create-response.bin"), user_data)
                 .expect("write the GCC fixture");
             eprintln!(
-                "captured {} frames; wrote {}-byte Connect-Response and {}-byte                  ConferenceCreateResponse (at offset {}) to {}",
+                "walked {} frames; wrote a {}-byte Connect-Response and its {}-byte GCC user data (at offset {}) to {}",
                 frames,
                 body.len(),
                 user_data.len(),
