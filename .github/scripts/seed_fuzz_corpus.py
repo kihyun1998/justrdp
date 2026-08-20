@@ -187,10 +187,71 @@ def seed_progressive_srl(out_dir):
     return 1
 
 
+
+# The connect-sequence fixtures `capture_connect_response_against_real_vm` writes, and the arms
+# of the two selector targets they belong to. See `fuzz_targets/{gcc,mcs}.rs` for the layout.
+CONNECT_FIXTURES = REPO / "crates/justrdp-pdu/tests/fixtures/connect"
+GCC_ARMS = 9
+MCS_ARMS = 5
+
+
+def _selector(arm, arm_count):
+    """The 4-byte little-endian prefix that makes `arbitrary` 1.4.2 pick variant `arm`.
+
+    `derive_arbitrary` reads a `u32` from the front and resolves the variant as
+    `(sel * arm_count) >> 32`, so the smallest selector landing on `arm` is
+    `ceil(arm * 2**32 / arm_count)`. Measured against the pinned version rather than read off
+    the derive macro, and `fuzz/Cargo.lock` is tracked so a bump arrives as a reviewable diff --
+    the argument `seed_progressive_srl` records for its own encoding dependency.
+
+    `progressive_assembly` declares a hand-rolled layout precisely so its seeder can exist, and
+    that precedent does not bind here: its records are variable-length and repeated, while this
+    reduces to a fixed 4-byte prefix in front of the payload verbatim, because the targets take
+    `&[u8]` rather than `Vec<u8>`. That choice is load-bearing -- a `Vec<u8>` field consumes one
+    byte per element from the front *and* one from the back, so a seed written into it would not
+    survive as the bytes anyone captured.
+    """
+    return struct.pack("<I", -((-arm << 32) // arm_count))
+
+
+def _seed_connect(out_dir, fixture_name, arm_count, prefix):
+    """Seed a connect-sequence target from one captured fixture, one file per arm.
+
+    Every arm gets the same real payload under its own selector. Only arm 0 parses it -- it is
+    that arm's exact input -- and the rest get structurally rich bytes to mutate rather than the
+    empty file they would otherwise start from. Arm 0 is the one that needs it: undirected bytes
+    reach 11.98% of `gcc.rs` and leave every per-block decoder dark, because
+    `ConferenceCreateResponse::decode` wants ~12 bytes of exact magic before it parses anything
+    (#203). The inner arms are reachable from random bytes by construction, which is why they are
+    arms at all.
+    """
+    fixture = CONNECT_FIXTURES / fixture_name
+    if not fixture.is_file():
+        print(f"::error::seed fixture missing: {fixture.relative_to(REPO)}")
+        return None
+
+    payload = fixture.read_bytes()
+    for arm in range(arm_count):
+        (out_dir / f"{prefix}-arm{arm}.bin").write_bytes(_selector(arm, arm_count) + payload)
+    return arm_count
+
+
+def seed_gcc(out_dir):
+    """Seed `gcc` from the captured GCC Conference Create Response."""
+    return _seed_connect(out_dir, "conference-create-response.bin", GCC_ARMS, "ccr")
+
+
+def seed_mcs(out_dir):
+    """Seed `mcs` from the captured MCS Connect-Response."""
+    return _seed_connect(out_dir, "connect-response.bin", MCS_ARMS, "connect-response")
+
+
 SEEDERS = {
     "progressive": seed_progressive,
     "progressive_assembly": seed_progressive_assembly,
     "progressive_srl": seed_progressive_srl,
+    "gcc": seed_gcc,
+    "mcs": seed_mcs,
 }
 
 

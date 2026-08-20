@@ -78,6 +78,19 @@ that trusts its server too much) rather than as memory safety.
   specific trailing unused-bit count *and* a specific length to coincide. Found by the
   adversarial pass instead. Same shape as #219: random sampling generates every value and
   cannot make three of them coincide.
+- **#203** — `gcc` and `mcs`, the two #200 could not add mechanically. The premise it was
+  filed on was **falsified by measurement on both halves**, which is the more useful outcome
+  than confirming it. Its "nine `gcc` entry points" are two trees with one root each and only
+  one reachable from the wire, so the shape question was never 14 targets versus one selector.
+  And its "seeding is probably not needed, and that is measured" held for `mcs` (33.9% of
+  regions from undirected bytes) but not for `gcc`, which it had honestly left unmeasured:
+  **11.98%, 4 of 32 functions, every per-block decoder dark**, because
+  `ConferenceCreateResponse::decode` wants ~12 bytes of exact magic first. That is below
+  `displaycontrol`'s 16.5% and near `rfx::progressive`'s 8.9% — the wall band. The seed is a
+  real Connect-Response captured off the VM, because no encoder here could synthesise one:
+  every encoder in `justrdp-pdu` writes client-to-server, since justrdp is a client. **That
+  asymmetry is why this invariant carries the receive path alone** — a round-trip test cannot
+  reach a decoder whose encoder does not exist.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
@@ -93,16 +106,32 @@ rg --files crates/justrdp-pdu/src -g '*.rs'   # what parses untrusted bytes
 
 The gap used to be the whole connect sequence. #200 closed the mechanical half of it —
 `tpkt`, `x224`, `nego`, `dvc`, `svc` and `displaycontrol` now carry a target and a
-property — so what the second command still finds without a target is:
+property — and #203 closed `gcc` and `mcs`. So what the second command still finds without
+a target is:
 
-- **`gcc` (9 block types) and `mcs` (5 PDU types)**, which have no single top-level
-  `decode` to point a target at. One target per type, or one with a selector byte, is a
-  shape decision rather than an omission.
 - **`ber` and `per`**, which are ASN.1 *primitives* (`read_length`, `read_integer`,
   `read_octet_string`), not PDU parsers. Fuzzing them in isolation asserts little; the
   reachable surface is the one their callers above expose. Probably correct to leave
   without targets, which is a decision, not an oversight — recorded so nobody re-derives it.
+  The same reasoning, checked rather than assumed, covers **`justrdp_pdu::rfx::decode_all`**:
+  `justrdp_codecs::rfx::RemoteFx::decode_to_rgba` is its only caller and carries both artifacts.
 - **`share`, `update`, `errinfo`**, which parse post-activation session bytes.
+- **`justrdp_pdu::pointer::{decode_slowpath, decode_fastpath}`** and
+  **`justrdp_pdu::client_info::decode_basic_security_header`**, which have neither artifact and
+  *are* on the live path (`justrdp/src/session.rs:374`, `:554`, `justrdp/src/connect.rs:854`).
+  Found by #203; see the derivation caveat below for why they had been read as covered.
+
+**Two derivations by name, and a name can be taken by a covered sibling in another crate.**
+`ls fuzz/fuzz_targets/` prints `pointer` and `rfx`, and both files exist — but they target
+`justrdp_codecs`, and the identically-named `justrdp-pdu` modules are different code. For `rfx`
+the codec calls the PDU parser, so the coverage is real and transitive; for `pointer` it does
+**not**: `justrdp_codecs::pointer::decode_pointer` takes `width`, `height`, `xor_bpp` and two
+mask slices *already parsed*, so the `TS_POINTERATTRIBUTE` header parse that produced them is
+reached by nothing. Reading the two lists side by side answers "is there a file called X", and
+the question is "is this function driven" — the same gap between an artifact and the thing that
+consumes it that #143 and #192 fell into, one level up. **Cross-reference by entry point, not by
+module name**, and note that the modules where this bites are exactly the ones split across
+crates.
 
 The bootstrap question was measured while closing the first bullet (#200): undirected
 bytes reach **16.5%–48.8%** of the regions in the connect-sequence parsers, against

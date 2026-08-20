@@ -37,6 +37,24 @@
 //! Connect-Response captured off the test VM, and the inner arms exist so that a mutation which
 //! breaks the `"McDn"` magic does not put the block walk back out of reach.
 
+//! ## The byte layout, which is pinned by measurement because a seeder depends on it
+//!
+//! `data` is `&[u8]` rather than `Vec<u8>`, and that is load-bearing rather than a borrow-checker
+//! preference. Measured against `arbitrary` 1.4.2: a `Vec<u8>` field consumes **two** bytes per
+//! element -- the element from the front and a keep-going byte from the *back* of the buffer --
+//! so a 64-byte input yields a 32-byte `data` that is not the bytes anyone wrote. A trailing
+//! `&[u8]` takes the remainder verbatim. The whole input is therefore
+//!
+//! ```text
+//! [4-byte little-endian u32 selector] ++ [payload, verbatim]
+//! arm = (selector as u64 * ARM_COUNT) >> 32
+//! ```
+//!
+//! which is what `.github/scripts/seed_fuzz_corpus.py` writes, and what makes a corpus entry
+//! readable as "a selector and a real PDU". `fuzz/Cargo.lock` is tracked, so the `arbitrary` bump
+//! that would reinterpret it arrives as a reviewable diff -- the same argument `seed_progressive_srl`
+//! records for its committed bytes.
+
 use libfuzzer_sys::arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
 
@@ -57,14 +75,14 @@ enum Entry {
 }
 
 #[derive(Arbitrary, Debug)]
-struct Input {
+struct Input<'a> {
     entry: Entry,
-    data: Vec<u8>,
+    data: &'a [u8],
 }
 
-fuzz_target!(|input: Input| {
+fuzz_target!(|input: Input<'_>| {
     use justrdp_pdu::gcc::*;
-    let d = &input.data[..];
+    let d = input.data;
     match input.entry {
         Entry::ConferenceCreateResponse => { let _ = ConferenceCreateResponse::decode(d); },
         Entry::ServerBlocks => { let _ = ServerGccBlocks::decode(d); },
