@@ -597,12 +597,12 @@ const CONNECT_CAPTURE_FILE: &str = "JUSTRDP_CONNECT_CAPTURE_FILE";
 
 /// Append one server-to-client chunk read during the connect sequence to the capture file.
 ///
-/// Sibling of `justrdp_codecs::capture`, and it exists for the same reason one layer out: #203
-/// measured that undirected bytes reach 11.98% of `gcc.rs` and leave every per-block decoder
-/// dark, because `ConferenceCreateResponse::decode` wants ~12 bytes of exact magic first. A fuzz
-/// target for that parser is only worth its 300s if it starts from bytes a real server sent, and
-/// this repo has no server-side encoder that could synthesise one -- every encoder in
-/// `justrdp-pdu` writes client-to-server, because justrdp is a client.
+/// Sibling of `justrdp_codecs::capture`, and it exists for the reason that survived #203's
+/// measurements: this repo has **no server-side encoder at all** — every encoder in
+/// `justrdp-pdu` writes client-to-server, because justrdp is a client — so a server PDU can only
+/// be obtained, never synthesised. Everything downstream that wants real server bytes (the fuzz
+/// seed, the acceptance test, the truncation and bit-corruption sweeps) comes through here.
+///
 ///
 /// **It lives in the adapter, not the core.** A file append inside `ConnectStateMachine` is
 /// exactly the I/O that ADR-0001's boundary exists to keep out; the adapter already owns the
@@ -3583,13 +3583,12 @@ mod tests {
     /// Capture the MCS Connect-Response a real server sends, and commit it as the fixture that
     /// seeds the `gcc` and `mcs` fuzz targets (#203).
     ///
-    /// #203 recorded corpus seeding as measured-unnecessary for `mcs` and explicitly *unknown*
-    /// for `gcc`. Measuring it inverted the answer: 200k undirected inputs reach **11.98%** of
-    /// `gcc.rs`'s regions and 4 of its 32 functions, with all six per-block decoders dark,
-    /// because `ConferenceCreateResponse::decode` demands ~12 bytes of exact magic -- the T.124
-    /// OBJECT IDENTIFIER and the literal `"McDn"` -- before it parses a single block. That is
-    /// below `displaycontrol`'s 16.5% and near `rfx::progressive`'s 8.9%, the format #200
-    /// measured as unable to bootstrap from an empty corpus.
+    /// The fixture seeds those targets, asserts real-server acceptance in the stable gate, and is
+    /// the repo's only offline connect-sequence bytes. It is **not** a rescue from a coverage
+    /// wall, which is what #203 expected and what the lane disproved: `gcc` reaches `cov: 515`
+    /// from an empty corpus against `cov: 699` seeded, because coverage guidance climbs a magic
+    /// prefix on its own. The 11.98% of `gcc.rs`'s regions that 200k undirected inputs reach
+    /// measures proptest's half of ADR-0008, not this one.
     ///
     /// The seed has to come from a **real server**, and that is a structural fact rather than a
     /// preference: `justrdp-pdu` contains no server-side encoder that could synthesise one,

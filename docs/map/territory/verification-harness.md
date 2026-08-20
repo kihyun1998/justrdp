@@ -115,6 +115,15 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   as a corpus that merely decodes badly — indistinguishable from one doing its job. It is also
   the first server-to-client connect bytes in the repo that no encoder of ours produced, which
   is what makes it an acceptance proof rather than a round-trip.
+- **"Undirected bytes barely reach it" is not "the fuzz lane barely reaches it", and #203 spent an
+  A/B learning the difference.** `gcc.rs` takes 11.98% of its regions from 200k random inputs and
+  **515 `cov:` from an empty corpus on the lane** — coverage guidance climbs a magic prefix on its
+  own, because a comparison against a byte string feeds libFuzzer's auto-dictionary. The seed is
+  still worth its capture (699 vs 515 `cov:`, 1987 vs 1207 `ft:`, in 4x fewer executions) but it
+  is an improvement, not a rescue. `progressive`'s wall was **nested lengths that must agree**,
+  which no dictionary can synthesise, and that is the distinction to test before predicting a wall
+  from a coverage percentage. The derivation to run is the A/B on the lane, not the local
+  llvm-cov number: the second one measures proptest's reach, which is a different automation.
 - **"The target runs" and "the target covers anything" are separate claims, and for one
   format the gap was total.** `fuzz/corpus/` is not committed — corpora live as Actions
   cache entries — so a new target starts from nothing. Measured across two runs of the

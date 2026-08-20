@@ -10,15 +10,16 @@
 //! is the shape `rfx.rs` already uses here for the same reason.
 //!
 //! `decode_connect_response` is the odd one: BER rather than PER, and the only entry point that
-//! recurses into another module (the whole `gcc` server tree hangs off it). It is also the one
-//! with a prefix deep enough to hide `DomainParameters::decode`, which 200k undirected inputs
-//! never reached — so this target is seeded from a real Connect-Response captured off the test
-//! VM, the same way `progressive` is seeded from its corpus fixture (#200).
+//! recurses into another module (the whole `gcc` server tree hangs off it). Its prefix is deep
+//! enough to hide `DomainParameters::decode` from 200k **undirected** inputs — the measurement
+//! that governs the proptest beside this target, since proptest samples the same way. `mcs.rs`
+//! reaches 33.9% of its regions and 6 of its 19 functions that way.
 //!
-//! Measured, 200k undirected inputs across all five: `mcs.rs` reaches 33.9% of its regions and
-//! 6 of its 19 functions. #203 predicted this family would bootstrap without a seed and that
-//! holds for the four PER PDUs; it is the BER path that does not.
-
+//! It is seeded from a real Connect-Response captured off the test VM, but as an improvement
+//! rather than a rescue: the A/B in `gcc.rs` shows coverage guidance climbing a magic prefix on
+//! its own. #203 predicted this family would bootstrap without a seed, and for the fuzz lane that
+//! prediction held — the undirected figure was never the binding constraint it looked like.
+//!
 //! ## The byte layout, which is pinned by measurement because a seeder depends on it
 //!
 //! `data` is `&[u8]` rather than `Vec<u8>`, and that is load-bearing rather than a borrow-checker

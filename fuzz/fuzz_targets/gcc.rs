@@ -22,21 +22,36 @@
 //! Every entry point is an arm here instead: one lane job, and each parser still has a door that
 //! no magic guards.
 //!
-//! ## The wall, which is measured rather than assumed
+//! ## The magic prefix, and the two different things it does
 //!
 //! `ConferenceCreateResponse::decode` demands ~12 bytes of near-exact magic before it reaches a
 //! single block — the T.124 OBJECT IDENTIFIER, the `conferenceCreateResponse` choice, `tag == 1`,
 //! `result == 0`, one user-data set, the h221NonStandard choice and the literal `"McDn"`. Driven
-//! with 200k undirected inputs, `gcc.rs` reaches **11.98% of its regions and 4 of its 32
-//! functions**, with all six per-block decoders dark. That is below `displaycontrol`'s 16.5% —
-//! the connect-sequence parser #200 called the closest to the wall — and near `rfx::progressive`'s
-//! 8.9%, the format that turned out to need a seed corpus.
+//! with 200k **undirected** inputs, `gcc.rs` reaches only **11.98% of its regions and 4 of its 32
+//! functions**, with all six per-block decoders dark.
 //!
-//! #203 recorded "seeding is probably not needed" as measured for `mcs` and explicitly *unknown*
-//! for `gcc`. Measuring it inverted the answer here: this target is seeded from a real
-//! Connect-Response captured off the test VM, and the inner arms exist so that a mutation which
-//! breaks the `"McDn"` magic does not put the block walk back out of reach.
-
+//! That number governs the *proptest* half of this module's coverage, because proptest is
+//! undirected random sampling — which is the argument for the nine per-entry-point properties
+//! beside this target rather than one on the root.
+//!
+//! **It does not predict what libFuzzer reaches, and #203 assumed it did.** Measured on this
+//! lane, same 300s budget, gcc against itself:
+//!
+//! ```text
+//! empty    cov: 515  ft: 1207  corp: 255/21Kb  exec/s: 178573  (53.8M runs)
+//! seeded   cov: 699  ft: 1987  corp: 391/94Kb  exec/s:  46166  (13.9M runs)
+//! ```
+//!
+//! No wall: coverage guidance climbs the magic unaided, because a comparison against a byte
+//! string feeds libFuzzer's auto-dictionary (`__sanitizer_cov_trace_cmp`) and random sampling has
+//! no such mechanism. `rfx::progressive` needed its seed for a different reason — **nested length
+//! fields that must agree with each other**, which no dictionary entry can synthesise. Magic
+//! constants are climbable; self-consistent arithmetic is not.
+//!
+//! The seed is kept because it is a measured 36% more coverage and 65% more features in 4x fewer
+//! executions, not because the target would be blind without it. The inner arms are kept for what
+//! the A/B does not cover: they make each per-block decoder reachable with no prefix at all.
+//!
 //! ## The byte layout, which is pinned by measurement because a seeder depends on it
 //!
 //! `data` is `&[u8]` rather than `Vec<u8>`, and that is load-bearing rather than a borrow-checker

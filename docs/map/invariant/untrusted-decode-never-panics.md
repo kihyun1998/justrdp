@@ -78,19 +78,35 @@ that trusts its server too much) rather than as memory safety.
   specific trailing unused-bit count *and* a specific length to coincide. Found by the
   adversarial pass instead. Same shape as #219: random sampling generates every value and
   cannot make three of them coincide.
-- **#203** — `gcc` and `mcs`, the two #200 could not add mechanically. The premise it was
-  filed on was **falsified by measurement on both halves**, which is the more useful outcome
-  than confirming it. Its "nine `gcc` entry points" are two trees with one root each and only
-  one reachable from the wire, so the shape question was never 14 targets versus one selector.
-  And its "seeding is probably not needed, and that is measured" held for `mcs` (33.9% of
-  regions from undirected bytes) but not for `gcc`, which it had honestly left unmeasured:
-  **11.98%, 4 of 32 functions, every per-block decoder dark**, because
-  `ConferenceCreateResponse::decode` wants ~12 bytes of exact magic first. That is below
-  `displaycontrol`'s 16.5% and near `rfx::progressive`'s 8.9% — the wall band. The seed is a
-  real Connect-Response captured off the VM, because no encoder here could synthesise one:
-  every encoder in `justrdp-pdu` writes client-to-server, since justrdp is a client. **That
-  asymmetry is why this invariant carries the receive path alone** — a round-trip test cannot
-  reach a decoder whose encoder does not exist.
+- **#203** — `gcc` and `mcs`, the two #200 could not add mechanically. Its "nine `gcc` entry
+  points" are two trees with one root each and only one reachable from the wire, so the shape
+  question was never 14 targets versus one selector.
+- **#203, and the correction that matters more than the issue: undirected reach does not predict
+  coverage-guided reach.** #203 was filed with `gcc` unmeasured; measuring it gave **11.98% of
+  regions, 4 of 32 functions, every per-block decoder dark** against 200k random inputs, which
+  read as `rfx::progressive`'s wall (8.9%) and was taken as proof that a seed corpus was
+  mandatory. **The lane disagreed.** Same target, same 300s, seeded against empty:
+
+  | | cov | ft | corp | exec/s |
+  |---|---|---|---|---|
+  | empty | 515 | 1207 | 255 / 21Kb | 178 573 |
+  | seeded | 699 | 1987 | 391 / 94Kb | 46 166 |
+
+  Not progressive's 62-versus-425 collapse: guidance climbs the ~12-byte magic prefix unaided.
+  The mechanism is that a comparison against a byte string feeds libFuzzer's auto-dictionary
+  (`__sanitizer_cov_trace_cmp`), which random sampling has no equivalent of. So the two walls are
+  different in kind — **magic constants are climbable, self-consistent nested lengths are not** —
+  and `progressive` needed its seed for the second reason, not the first.
+
+  What the undirected figure *does* govern is the **proptest** half, which samples the same way:
+  11.98% is why `gcc` carries nine per-entry-point properties instead of one on the root. The two
+  automations ADR-0008 pairs are not interchangeable, and this is the first measurement of how
+  they differ rather than an argument that they do.
+- **#203, third: a round-trip cannot reach a decoder whose encoder does not exist.** Every encoder
+  in `justrdp-pdu` writes client-to-server, because justrdp is a client — so no server PDU can be
+  synthesised here, and the seed had to be a real capture. That asymmetry is why this invariant
+  carries the receive path alone, and why #98 could give `decode_connect_response` a no-panic
+  property but no round-trip.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 

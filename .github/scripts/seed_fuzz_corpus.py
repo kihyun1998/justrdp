@@ -219,11 +219,25 @@ def _seed_connect(out_dir, fixture_name, arm_count, prefix):
 
     Every arm gets the same real payload under its own selector. Only arm 0 parses it -- it is
     that arm's exact input -- and the rest get structurally rich bytes to mutate rather than the
-    empty file they would otherwise start from. Arm 0 is the one that needs it: undirected bytes
-    reach 11.98% of `gcc.rs` and leave every per-block decoder dark, because
-    `ConferenceCreateResponse::decode` wants ~12 bytes of exact magic before it parses anything
-    (#203). The inner arms are reachable from random bytes by construction, which is why they are
-    arms at all.
+    empty file they would otherwise start from.
+
+    **This is a bootstrap seeder that turned out not to be bootstrapping anything**, and the
+    distinction is worth keeping rather than quietly deleting. #203 measured 11.98% of `gcc.rs`'s
+    regions from 200k undirected inputs -- every per-block decoder dark behind a ~12-byte magic
+    prefix -- and read that as `rfx::progressive`'s wall. The A/B on the lane says otherwise:
+
+        empty    cov: 515  ft: 1207  corp: 255/21Kb   exec/s: 178573
+        seeded   cov: 699  ft: 1987  corp: 391/94Kb   exec/s:  46166
+
+    Coverage guidance climbs a magic prefix unaided, because a comparison against a byte string
+    feeds libFuzzer's auto-dictionary; random sampling has no such mechanism, so the local number
+    was measuring the *proptest* half of ADR-0008 and not this one. `progressive`'s wall is nested
+    lengths that must agree with each other, which no dictionary entry can synthesise -- a
+    different kind of barrier, and the one worth predicting from.
+
+    So this stays for the 36% coverage and 65% features it measurably buys in 4x fewer executions,
+    not because the target is blind without it. If it ever has to be dropped, dropping it costs
+    that and nothing more.
     """
     fixture = CONNECT_FIXTURES / fixture_name
     if not fixture.is_file():
