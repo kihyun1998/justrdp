@@ -19,9 +19,12 @@ one of its four outputs. Neither says what the loop dispatches or in what order.
 
 ## Design model
 
-- **Four outputs, and the host's whole view of a live session is these**:
-  `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `DisplayControlReady`.
-  Anything the host cannot learn from one of these, it cannot learn at all.
+- **Five outputs, and the host's whole view of a live session is these**:
+  `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `DisplayControlReady` ·
+  `ShutdownDenied`. Anything the host cannot learn from one of these, it cannot learn at all
+  — which is the argument #228 turned on: a `pduType2` that falls into the
+  decoded-and-skipped arm is not "handled quietly", it is **unlearnable**, and a host asking
+  for a shutdown then looks exactly like a host that never asked.
 - **The loop is fed, never reads.** It has no socket; the adapter feeds it bytes and
   drains the outputs, which is what makes a captured stream a complete test input.
 - **`DisplayControlReady` is a capability gate, not an event of interest** — it is
@@ -34,13 +37,14 @@ one of its four outputs. Neither says what the loop dispatches or in what order.
 ## Code
 
 - `justrdp/src/session.rs` — `SessionStateMachine`, `SessionConfig`, `SessionOutput`,
-  `SessionError`, `Phase`, `ResizeError`, `cursor_event_for`
+  `SessionError`, `Phase`, `ResizeError`, `cursor_event_for`, `request_shutdown`
 - `justrdp/src/disconnect.rs` — `classify`, `DisconnectClass`, `DisconnectReason`,
   `ServerDisconnectCause`
 - `justrdp-pdu/src/fastpath.rs` — `is_fastpath`, `frame_len`, `decode_updates`
 - `justrdp-pdu/src/share.rs`, `justrdp-pdu/src/update.rs` — `ShareDataHeader`,
   `BitmapUpdate`, `BitmapData`, `PaletteUpdate`
 - `justrdp-pdu/src/errinfo.rs` — `ErrorInfo`, `decode_set_error_info`
+- `justrdp-pdu/src/share.rs` — `PDU_TYPE2_SHUTDOWN_REQUEST`, `PDU_TYPE2_SHUTDOWN_DENIED`
 
 ## Reference behaviour
 

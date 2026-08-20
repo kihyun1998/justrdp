@@ -231,6 +231,24 @@ Read this before starting so the bindings do not read as abstractions.
   deleting a thing to remove its risk, ask what *else* is standing on it; a test that asserts
   two unrelated properties is exactly where that goes unnoticed.
 
+- **A throwaway probe's bytes outlive the probe, and they are the best send-path test there
+  is (#228).** #198's probe hand-built a Shutdown Request to find out what the VM would answer.
+  The answer settled that issue; the **32 bytes** settled the next one. `request_shutdown` is
+  pinned to them exactly — `request_shutdown_encodes_the_frame_the_vm_answered` — so the test
+  does not say *"we read `[MS-RDPBCGR]` 2.2.2.1 the same way twice"*, it says **a real Windows
+  server parsed this frame and replied to it**. That is a different class of evidence, and it
+  costs nothing but remembering to keep the array.
+  The generalisation: a probe run to answer a question is also a **capture**. Copy the bytes
+  into the issue before deleting the probe — Step 1 already says to record the number, and
+  this is the same rule one level down, on the wire.
+- **"Decoded and skipped" is not handled quietly, it is unlearnable (#228).** `pduType2` 0x25
+  fell into `on_data_pdu`'s catch-all, so a host that sent a Shutdown Request and a host that
+  sent nothing produced **identical** observable behaviour — the session simply carried on in
+  both cases. The map's own rule is what names this: the five `SessionOutput` variants are the
+  host's whole view of a live session, so anything not among them cannot be learned at all. A
+  catch-all arm is a fine default for PDUs nobody asked about; it stops being one the moment
+  the client can *cause* the PDU.
+
 ## Step 5 — adversarial completeness is automated (ADR-0008)
 
 - **proptest no-panic (#98) + cargo-fuzz (#99)** make the completeness axis

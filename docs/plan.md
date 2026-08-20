@@ -383,7 +383,13 @@ advertise X, the server silently never offers Y. Capture every such coupling up 
 - [ ] **M** — Fast-path output processing: fragmentation reassembly (Single/First/Next/Last) + bulk decompression. *ironrdp ref: session/fast_path.rs.*
 - [ ] **M** — Server-initiated disconnect reasons: MCS Disconnect Provider Ultimatum + Set Error Info PDU (typed, 80+ codes) vs abrupt EOF. *ironrdp ref: ironrdp-pdu/rdp/server_error_info.rs, session/x224.*
 - [ ] **M** — Error classification in-session (decode vs protocol vs I/O vs decompression; unknown PDU = warn+continue, decompression fail = fatal).
-- [ ] **O** — Graceful Shutdown Request/Denied (then MCS ultimatum). *session/active_stage.rs.*
+- [x] **O** — Graceful Shutdown Request/Denied (then MCS ultimatum). *session/active_stage.rs.*
+      Done in #228: `SessionStateMachine::request_shutdown` sends it, the refusal arrives as
+      `SessionOutput::ShutdownDenied`, and the adapter exposes both
+      (`SessionCommand::Shutdown` / `SessionEvent::ShutdownDenied`). **The MCS ultimatum half
+      is deliberately not included** — this VM never grants, so a client-initiated ultimatum
+      after a grant has no server here to prove it against, and writing it blind is the kind
+      of untested machinery this project declines elsewhere.
       `PDUTYPE2_SHUTDOWN_REQUEST` = 36 / `PDUTYPE2_SHUTDOWN_DENIED` = 37, both bodyless (the
       Share Data header *is* the PDU). **FreeRDP's client never sends one** — only its server
       side names the request, and `rdp_recv_server_shutdown_denied_pdu` is a bare `return TRUE`
@@ -1591,7 +1597,7 @@ The existing `tests/integration_real_vm.rs` pattern is the **proven methodology*
 - [ ] **M — Desktop-size negotiation in-session.** Current test asserts `session-active` + at least one `FrameUpdate` + Display Control resize. Expand this to: (a) connect at default desktop size, (b) request via Display Control to a new size, (c) assert DeactivateAll fires, (d) assert reactivation runs to completion, (e) assert new desktop size is reported in the size sink. *This is already in the PoC;* formalize it as M.
 - [ ] **M — Input path smoke test (keyboard + mouse + click).** Send a key-press, pointer-move, and click; assert the session survives (no disconnect). *Already in the PoC (lines 243–270).* Formalize as M; extend to test each input type (KeyboardScancode, MouseX, relative-mouse if `MOUSE_RELATIVE` is negotiated).
 - [ ] **M — Per-Windows-version test matrix.** Run the integration test harness against **workgroup**: Windows Server 2016/2019/2022 + Win10/11, and **AD-joined** (if KDC available): 2019/2022 with Kerberos. Document each run's (Server, Negotiated Security, Desktop Size, Codec, any errors) in a table (see V.5 below). *Spec: none.* **Your work:** coordinate with test-VM ops to spin up the matrix; CI/CD can be later.
-- [ ] **O — Graceful disconnect validation.** Send Graceful Shutdown Request; assert the server replies with Shutdown Denied (typical) or Shutdown Complete; then MCS ultimatum; assert session ends cleanly with no decode errors. *ironrdp ref: session/active_stage.rs (graceful_shutdown_sequence).* Low risk; can defer. **The "(typical)" is now measured, not guessed** — #198 probed this VM and got Denied on a clean desktop (§0), so this slice's assertion is known before it is written, and the Shutdown-Complete branch has no server here to exercise it.
+- [x] **O — Graceful disconnect validation.** Done in #228: `a_shutdown_request_is_denied_by_the_real_vm` sends the request through `run_session_with_commands` and asserts the refusal arrives as a typed `SessionEvent`, with the session surviving it. The *"(typical)"* in the original line was a guess and is now measured — this server denies on a **clean** desktop, so the Shutdown-Complete branch and the ultimatum that would follow it have no server here to exercise them, and are not written. *ironrdp ref: session/active_stage.rs (graceful_shutdown_sequence).* **The "(typical)" is now measured, not guessed** — #198 probed this VM and got Denied on a clean desktop (§0), so this slice's assertion is known before it is written, and the Shutdown-Complete branch has no server here to exercise it.
 
 ### V.4. Codec fuzzing (untrusted server input)
 
