@@ -255,12 +255,16 @@ Read this before starting so the bindings do not read as abstractions.
   *continuous* for untrusted parsing — the decoder enumeration you cannot trust
   yourself to have finished. (They are two automations of **one** property, not two
   lenses; the pass itself is one lens briefed on both corpora — see the bindings.)
-- **Its surface is half-covered, and the map says so by derivation rather than by a
-  list** — every fuzz target is codec/capability/license, while the
-  connect-sequence parsers have none. (This bullet read "ten fuzz targets exist"
-  until #200 — a sentence praising derivation while hand-copying the number in its
-  own second half, and wrong from the day `progressive` landed.) —
-  [`docs/map/invariant/untrusted-decode-never-panics.md`](../map/invariant/untrusted-decode-never-panics.md).
+- **Its surface is covered by derivation rather than by a list, and this bullet is the
+  worked example of why** — it read "ten fuzz targets exist" until #200 (a sentence
+  praising derivation while hand-copying the number in its own second half, wrong from
+  the day `progressive` landed), then read "the connect-sequence parsers have none"
+  until #203, having been left alone while #200 gave six of them both artifacts. Twice
+  stale, both times in the half that was a hand-kept fact rather than a rule. The
+  standing derivation is in
+  [`docs/map/invariant/untrusted-decode-never-panics.md`](../map/invariant/untrusted-decode-never-panics.md);
+  what it now finds uncovered is `ber`/`per` (deliberate), `share`/`update`/`errinfo`,
+  and the #230 pair.
 
 - **The pass found a panic in the code written to remove panics (#189).** The whole
   point of self-owning zgfx was that the delegated decompressor panicked on untrusted input;
@@ -392,6 +396,64 @@ Read this before starting so the bindings do not read as abstractions.
   was that a cited range can hold the algorithm and not its initial state; this slice
   re-learned the cheaper half, that a range can simply be wrong. Grepping each cited
   symbol for its line number cost minutes and is now the only way these are written.
+
+- **The measurement was right and the inference was wrong, and only an A/B could tell
+  them apart (#203).** `gcc` and `mcs` were the two parsers #200 could not add a target
+  to. Two of #203's own statements were checked rather than inherited, and they came out
+  opposite ways — which is the point of the entry, because they *felt* equally solid.
+
+  - **Its shape premise was false, and the call graph said so for free.** "Nine `gcc`
+    entry points, no single top-level `decode`" is a true count and a misleading shape:
+    they are two trees with one root each, and `ClientGccBlocks::decode` — four of the
+    nine — has no caller outside the crate's own tests and parses bytes no server sends.
+    The decision was never 14 targets versus one selector; it was reachability. Reading
+    the entry points is what #200 already had to do to get its own census right, and it
+    is cheap enough that not doing it has no excuse.
+  - **Its seeding prediction was true, including the half it had left unmeasured — and
+    this work claimed the opposite first.** 200k undirected inputs reach **11.98%** of
+    `gcc.rs`'s regions, every per-block decoder dark behind a ~12-byte magic prefix.
+    That reads exactly like `rfx::progressive`'s 8.9% wall, and it was taken as proof a
+    seed corpus was mandatory. The lane disagreed: **empty `cov: 515` against seeded
+    `cov: 699`**, nothing like progressive's 62-versus-425 collapse.
+  - **Why they diverge, which is the reusable half.** A comparison against a byte string
+    feeds libFuzzer's auto-dictionary (`__sanitizer_cov_trace_cmp`); random sampling has
+    no equivalent. So **magic constants are climbable and self-consistent nested lengths
+    are not**, and `progressive` needed its seed for the second reason. `fuzz.yml`'s own
+    header says "magic-plus-nested-lengths"; the load-bearing half is the nesting.
+  - **The undirected number still governs — the other automation.** proptest samples the
+    same way libFuzzer does not, so 11.98% is why `gcc` carries nine per-entry-point
+    properties rather than one on the root. ADR-0008 pairs two automations and this is
+    the first time they were measured *against each other* here rather than assumed to
+    agree. The #219 entry above showed they are not redundant; this shows a number from
+    one of them does not transfer to the other.
+  - **The arm layout was settled by mutation, not by the percentage.** An out-of-bounds
+    read injected into `ServerNetworkData::decode` turns that parser's own property red
+    while `server_gcc_blocks_…`, which *calls* it, stays green — random bytes never hit
+    the exact `u16` block type. A property driving only the root passes over the defect,
+    which is the same "covers the line, misses the case" shape as #219's entry.
+  - **Two real-byte sweeps, and only one of them discriminates.** The captured
+    Connect-Response is truncated at all 101 offsets and bit-flipped in all 496
+    positions. The injected defect turns the **corruption** sweep red and leaves the
+    **truncation** sweep green: truncation always fails in an outer parser first
+    (`read_block` wants `block_len >= 4` and then a `read_slice` a clipped buffer cannot
+    satisfy), while a flipped byte can set that same length *to* 4. Kept as two sweeps
+    for that reason rather than merged.
+  - **A round-trip cannot reach a decoder whose encoder does not exist.** Every encoder
+    in `justrdp-pdu` writes client-to-server, because justrdp is a client — so the seed
+    had to be captured off the VM, and no amount of test-writing substitutes. It is also
+    why #98 gave `decode_connect_response` a no-panic property and no round-trip.
+  - **The derivations match by name, and a name can be taken by a covered sibling in
+    another crate.** `pointer` and `rfx` appear in both of the invariant's lists.
+    `rfx` is genuinely covered (the codec calls the PDU parser); `pointer` is not —
+    `justrdp_codecs::pointer::decode_pointer` takes dimensions and masks *already
+    parsed*, so the `TS_POINTERATTRIBUTE` header parse is driven by nothing while
+    sitting on the live session path. Filed as #230. Same shape as #200's stale count
+    one level up: the roster answers *"is there a file called X"*, the question is
+    *"is this function driven"*.
+  - **A piped gate cannot fail, and it was reproduced while checking a retraction.**
+    `cargo clippy … | tail -2; echo "GATE: $?"` printed `0` over a real compile error,
+    because the exit status is `tail`'s. The gate matrix already says *run each gate
+    bare*; knowing the rule did not help, running it did.
 
 ## Step 6/7 — surfaces & gates
 

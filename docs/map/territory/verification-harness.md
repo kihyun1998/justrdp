@@ -50,7 +50,8 @@ everywhere else.
   `differential_rfx.rs`, `differential_pointer_ironrdp.rs`, `differential_zgfx.rs`,
   `clearcodec_corpus.rs`, `progressive_corpus.rs`, `progressive_srl_freerdp.rs`,
   `fixtures/`
-- `justrdp-pdu/tests/` — `differential_ironrdp.rs`, `differential_activation.rs`
+- `justrdp-pdu/tests/` — `differential_ironrdp.rs`, `differential_activation.rs`,
+  `real_server_connect.rs`, `fixtures/connect/`
 - `justrdp/tests/` — `differential_input_ironrdp.rs`,
   `differential_license_crypto.rs`
 - `fuzz/fuzz_targets/` — **not enumerated here on purpose**; the list below is the
