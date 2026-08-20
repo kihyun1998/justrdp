@@ -64,6 +64,9 @@ pub enum SessionOutput {
     /// The Display Control channel is open and the server's caps arrived:
     /// [`SessionStateMachine::request_resize`] is valid from now on.
     DisplayControlReady,
+    /// The server refused a [`SessionStateMachine::request_shutdown`] — `[MS-RDPBCGR]` 2.2.2.2.
+    /// The session is **unaffected**: it keeps running and the host may carry on or give up.
+    ShutdownDenied,
 }
 
 /// Why a [`SessionStateMachine::request_resize`] call was refused (the session itself is
@@ -551,6 +554,18 @@ impl SessionStateMachine {
                 let update = PointerUpdate::decode_slowpath(cur).map_err(SessionError::Decode)?;
                 self.on_pointer(update, outputs)
             }
+            share::PDU_TYPE2_SHUTDOWN_DENIED => {
+                // The refusal to a request we sent (issue #228). Surfaced rather than skipped:
+                // a host that can ask has to be able to hear "no", and the alternative — the
+                // request simply having no visible effect — is indistinguishable from the PDU
+                // never having been sent.
+                tracing::info!(
+                    target: "rdp_shutdown_denied",
+                    "server denied the shutdown request"
+                );
+                outputs.push(SessionOutput::ShutdownDenied);
+                Ok(())
+            }
             share::PDU_TYPE2_SET_ERROR_INFO => {
                 // The server's attribution for the close that usually follows (issue #42).
                 // ERRINFO_NONE (0) clears rather than attributes.
@@ -810,6 +825,30 @@ impl SessionStateMachine {
         Ok(())
     }
 
+    /// Ask the server to end this session — the Shutdown Request PDU (`[MS-RDPBCGR]` 2.2.2.1).
+    ///
+    /// The returned frames go to the socket verbatim. The PDU is **bodyless**: its Share Data
+    /// header is the whole thing, which is why this takes no arguments and cannot fail.
+    ///
+    /// What it is *not* is session control. The server decides, and may refuse — Windows Server
+    /// 2022 refuses **unconditionally**, measured against the test VM with nothing open and
+    /// nothing unsaved (issue #228, `docs/plan.md` §0). A refusal arrives as
+    /// [`SessionOutput::ShutdownDenied`]; a grant arrives as the session ending, which the
+    /// adapter already classifies through [`Self::disconnect_reason`]. So a host that needs the
+    /// session *gone* cannot rely on this, and one that wants to ask politely — and to know it
+    /// was refused rather than ignored — now can.
+    ///
+    /// Valid whenever the session is live; there is no capability to negotiate first.
+    pub fn request_shutdown(&self) -> Vec<Vec<u8>> {
+        vec![self.wrap_io(&share::encode_share_data(
+            self.config.user_channel_id,
+            self.config.share_id,
+            share::STREAM_MED,
+            share::PDU_TYPE2_SHUTDOWN_REQUEST,
+            &[],
+        ))]
+    }
+
     /// Encode a client-initiated resize as a Display Control Monitor Layout PDU
     /// (MS-RDPEDISP 2.2.2.2): one primary monitor at the origin with the requested size. The
     /// returned frames go to the socket verbatim; the server answers with
@@ -907,6 +946,78 @@ mod tests {
             server_input_flags: capability::INPUT_FLAG_SCANCODES
                 | capability::INPUT_FLAG_FASTPATH_INPUT2,
             drdynvc_channel_id: Some(DRDYNVC),
+        }
+    }
+
+    /// The exact 32 bytes this client put on the wire during #198's probe, which the real VM
+    /// **parsed and answered** (with `PDUTYPE2_SHUTDOWN_DENIED`). Pinned here rather than
+    /// re-derived from the spec, because "a server accepted this" is a stronger statement about
+    /// a send path than "we read the layout the same way twice".
+    ///
+    /// Decoded, so a future reader does not have to:
+    ///
+    /// ```text
+    /// 03 00 00 20                 TPKT   version 3, length 32
+    /// 02 f0 80                    X.224  Data TPDU
+    /// 64 00 05 03 eb 70 12        MCS    SendDataRequest, initiator 1006, channel 1003, 18 bytes
+    /// 12 00 17 00 ee 03           Share  totalLength 18, PDUTYPE_DATA | version 0x0010, source 1006
+    /// ea 03 01 00                 shareId 0x000103EA
+    /// 00 02 00 00 24 00 00 00     Data   pad, STREAM_MED, uncompressed 0, pduType2 0x24, no compression
+    /// ```
+    ///
+    /// The body is empty: `[MS-RDPBCGR]` 2.2.2.1 makes the Share Data header the whole PDU.
+    #[test]
+    fn request_shutdown_encodes_the_frame_the_vm_answered() {
+        let sm = SessionStateMachine::new(
+            SessionConfig {
+                user_channel_id: 1006,
+                io_channel_id: 1003,
+                share_id: 0x0001_03EA,
+                ..config()
+            },
+            Vec::new(),
+        );
+        let frames = sm.request_shutdown();
+        assert_eq!(frames.len(), 1, "one frame, not a batch");
+        assert_eq!(
+            frames[0],
+            vec![
+                0x03, 0x00, 0x00, 0x20, 0x02, 0xf0, 0x80, 0x64, 0x00, 0x05, 0x03, 0xeb, 0x70, 0x12,
+                0x12, 0x00, 0x17, 0x00, 0xee, 0x03, 0xea, 0x03, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00,
+                0x24, 0x00, 0x00, 0x00,
+            ]
+        );
+    }
+
+    /// The refusal is the *point*: a host that asks for a shutdown has to be able to hear "no",
+    /// and before this it was a `pduType2` the dispatcher skipped in silence.
+    #[test]
+    fn a_shutdown_denied_surfaces_to_the_host() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let outputs = sm
+            .process_bytes(&server_data_pdu(share::PDU_TYPE2_SHUTDOWN_DENIED, &[]))
+            .expect("a bodyless refusal decodes");
+        assert_eq!(outputs, vec![SessionOutput::ShutdownDenied]);
+    }
+
+    /// …and it is *only* the refusal that surfaces. A neighbouring `pduType2` must not, or the
+    /// host learns "the server refused" from a PDU that said nothing of the kind — the same
+    /// side-condition that makes the positive assertion above mean anything.
+    #[test]
+    fn a_neighbouring_data_pdu_is_not_mistaken_for_a_refusal() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        for pdu_type2 in [
+            share::PDU_TYPE2_SHUTDOWN_REQUEST, // 0x24 — ours to send, never to receive
+            0x26,                              // Save Session Info, decoded-and-skipped
+            0x29,                              // Set Keyboard Indicators, likewise
+        ] {
+            let outputs = sm
+                .process_bytes(&server_data_pdu(pdu_type2, &[]))
+                .expect("an unhandled data PDU is skipped, not fatal");
+            assert!(
+                outputs.is_empty(),
+                "pduType2 {pdu_type2:#04x} must not surface as a refusal"
+            );
         }
     }
 

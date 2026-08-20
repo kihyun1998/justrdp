@@ -694,6 +694,12 @@ pub async fn run_session_with_input(
                 SessionOutput::WriteBytes(bytes) => {
                     stream.write_all(&bytes).await.map_err(SessionFailure::Io)?;
                 }
+                SessionOutput::ShutdownDenied => {
+                    // Same shape as the line below: this entry point has no event sink, so the
+                    // refusal is logged. A host that wants to *act* on it uses
+                    // run_session_with_commands, which is also the only way to send the request.
+                    tracing::debug!(target: "rdp_shutdown_denied", "shutdown request denied");
+                }
                 SessionOutput::DisplayControlReady => {
                     // This entry point predates resize commands; hosts that want resize use
                     // run_session_with_commands, which surfaces the event.
@@ -756,6 +762,13 @@ pub enum SessionCommand {
         /// Requested desktop height.
         height: u16,
     },
+    /// Ask the server to end the session — the Shutdown Request PDU (MS-RDPBCGR 2.2.2.1,
+    /// issue #228). The server decides: a refusal arrives as
+    /// [`SessionEvent::ShutdownDenied`] and leaves the session running, a grant arrives as
+    /// the session ending with its usual attribution. Windows Server 2022 refuses
+    /// unconditionally (measured — `docs/plan.md` §0), so this is a request, never a
+    /// teardown: a host that needs the session *gone* still has to end it from inside.
+    Shutdown,
 }
 
 /// A session milestone surfaced to the host by [`run_session_with_commands`].
@@ -764,6 +777,8 @@ pub enum SessionEvent {
     /// The Display Control dynamic channel is open and the server's caps arrived:
     /// [`SessionCommand::Resize`] is valid from now on.
     DisplayControlReady,
+    /// The server refused a [`SessionCommand::Shutdown`]. The session is unaffected.
+    ShutdownDenied,
 }
 
 /// [`run_session_with_input`] generalized to host *commands* (input + resize) and
@@ -799,6 +814,10 @@ pub async fn run_session_with_commands(
                 SessionOutput::DisplayControlReady => {
                     tracing::debug!(target: "rdp_displaycontrol_caps", "display control ready");
                     on_event(SessionEvent::DisplayControlReady);
+                }
+                SessionOutput::ShutdownDenied => {
+                    tracing::debug!(target: "rdp_shutdown_denied", "shutdown request denied");
+                    on_event(SessionEvent::ShutdownDenied);
                 }
             }
         }
@@ -839,6 +858,12 @@ pub async fn run_session_with_commands(
                             // Not fatal: the session is unaffected, the host may retry
                             // (e.g. after DisplayControlReady fires).
                             Err(e) => tracing::warn!(width, height, error = %e, "resize refused"),
+                        }
+                    }
+                    Some(SessionCommand::Shutdown) => {
+                        tracing::info!("shutdown requested");
+                        for frame in machine.request_shutdown() {
+                            stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
                         }
                     }
                     // Sender dropped: stop polling, keep the session alive.
@@ -4644,6 +4669,90 @@ mod tests {
         let sc = justrdp::input::scancode_from_windows_vk(vk)
             .unwrap_or_else(|| panic!("VK {vk:#04x} should map to a set-1 scancode"));
         vec![sc.press(), sc.release()]
+    }
+
+    /// Real-VM acceptance (issue #228, `docs/plan.md` §V.3): the client asks the server to end
+    /// the session, and the server's **refusal arrives as a typed output** rather than as
+    /// nothing at all.
+    ///
+    /// The assertion was known before this test was written, which is unusual and worth saying:
+    /// #198 probed this path with a throwaway build and Windows Server 2022 answered
+    /// `PDUTYPE2_SHUTDOWN_DENIED` on a **clean** desktop — nothing open, nothing unsaved — with
+    /// the session still alive 30 s later. §V.3 had guessed *"Denied (typical)"* long before
+    /// either; this pins it for this server.
+    ///
+    /// So what is under test is not *whether* the server grants it. It is that we can ask at
+    /// all (the send path, byte-identical to the frame that probe put on the wire — see
+    /// `request_shutdown_encodes_the_frame_the_vm_answered`), and that the answer is
+    /// distinguishable from silence. Before #228 this `pduType2` fell into the
+    /// decoded-and-skipped arm, so a host asking for a shutdown and a host asking for nothing
+    /// looked identical from the outside.
+    ///
+    /// The session surviving is asserted too, and it is not padding: a *grant* would end the
+    /// session, so "denied **and** still running" is the pair that says the server understood
+    /// the request rather than dropping the connection for an unrelated reason.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_shutdown_request_is_denied_by_the_real_vm() {
+        with_vm_session(|vm| async move {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let config = legacy_graphics_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover,
+            );
+            let mut stream = outcome.stream;
+
+            let denied = Arc::new(AtomicBool::new(false));
+            let denied_in_sink = denied.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionCommand>(4);
+            let cancel = CancellationToken::new();
+            let stop = cancel.clone();
+
+            tokio::spawn(async move {
+                // Ask once the session has settled, so a refusal cannot be confused with the
+                // server still finishing the connect burst.
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                let _ = tx.send(SessionCommand::Shutdown).await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                stop.cancel();
+            });
+
+            let ended = tokio::time::timeout(
+                Duration::from_secs(60),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {},
+                    |_| {},
+                    |event| {
+                        if event == SessionEvent::ShutdownDenied {
+                            denied_in_sink.store(true, Ordering::SeqCst);
+                        }
+                    },
+                    &mut rx,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("the session loop should return on cancel, not hang");
+
+            assert!(
+                denied.load(Ordering::SeqCst),
+                "the server answered the shutdown request with neither a refusal nor a \
+                 disconnect — before #228 that was indistinguishable from never asking"
+            );
+            // The cancel is what ended the loop, i.e. the session outlived the refusal. A
+            // granted shutdown would have closed it first and this would be a server-attributed
+            // disconnect instead.
+            let reason = ended.expect("the cancelled session ends cleanly");
+            eprintln!("shutdown request → denied; session ended by cancel as {reason:?}");
+        })
+        .await
     }
 
     /// Real-VM acceptance (issue #42): logging off inside the session ends it with the
