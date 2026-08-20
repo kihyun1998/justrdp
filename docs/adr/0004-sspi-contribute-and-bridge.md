@@ -96,6 +96,18 @@ Consequence 1 of the 2026-06-18 amendment says *"we never carried a `[patch.crat
 
 So: **the sspi bump is proven against the real server**, and the suite's session-isolation gap is a separate, pre-existing item that touches no part of the NLA path.
 
+> **The four bullets above are a dated observation, not current state (superseded 2026-08-19).**
+> They are kept verbatim because the next bump's operator needs the *shape* of what a polluted
+> session looks like, and because the run that produced them is the evidence for this ADR's
+> Result. But the gate they describe has changed, and reading them as instructions would now be
+> wrong: **#182/#197** gave the suite a harness that owns the VM and signs the session out after
+> every test, so `--test-threads=1` is no longer required, and **#198** made every synthesised
+> desktop step wait for the server's own repaint before the next one is sent. The suite is
+> **15 tests, not 12** (it grew with the Progressive slices), and it now runs **15/15 in
+> parallel**. What a bump's operator should do today is simply
+> `cargo test -p justrdp-tokio -- --ignored` and read the result; the PPM-dump advice still
+> stands, because that is what makes a teardown failure diagnosable rather than a hang.
+
 ### The tripwire did not fire, and could not have
 
 `Cargo.toml`, `.github/dependabot.yml` and this ADR all named **#61** as the removal tracker. #61 was **closed** on 2026-06-11 — against its own comment stating it must not close until the patch is deleted — so the obligation was unowned from that day. Dependabot was designated as the backstop ("a new sspi release is the signal to run the removal checklist"), but three releases (0.21.1 / .2 / .3) shipped with the patch still in place; a tripwire whose condition is *already met* never fires again. Two generalisations worth keeping:

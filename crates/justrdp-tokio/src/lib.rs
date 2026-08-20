@@ -2374,6 +2374,8 @@ mod tests {
         use std::any::Any;
         use std::future::Future;
         use std::panic::AssertUnwindSafe;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::task::Poll;
 
         /// The test VM. Deliberately private: see the module docs.
@@ -2455,6 +2457,291 @@ mod tests {
             }
         }
 
+        /// How long the frame stream must stay quiet before the desktop counts as painted.
+        const DESKTOP_QUIET: Duration = Duration::from_secs(2);
+        /// How long a desktop gets to paint and settle before it is declared absent. Measured
+        /// at 4–8 s on this VM's cold logon, so this is ~6x headroom rather than a guess.
+        pub(super) const DESKTOP_DEADLINE: Duration = Duration::from_secs(45);
+        /// How long one synthesised step gets to draw something before it is retried.
+        const STEP_ACK: Duration = Duration::from_secs(5);
+        /// How many times the Start button is re-clicked before the shell is declared absent.
+        const START_ATTEMPTS: usize = 6;
+        /// How long a menu or a search result gets to *finish* drawing. Shorter than
+        /// [`DESKTOP_DEADLINE`] because something is already known to be painting by then.
+        pub(super) const MENU_DEADLINE: Duration = Duration::from_secs(15);
+
+        /// Wait until the server has painted *something* and then gone quiet for
+        /// [`DESKTOP_QUIET`]; returns the frame count it settled at.
+        ///
+        /// The `> 0` half is the whole point, and it is not defensive padding. Every VM test
+        /// spun on "the frame count stopped changing", which is trivially true **before the
+        /// first frame ever arrives** — so on the cold logon that #197's teardown introduced,
+        /// the loop fell straight through and the body drove a desktop that had not painted.
+        /// Three of the five copies carried the guard; of the two that did not, one is the
+        /// test #198 records as typing `notepad` into a shell that was not up, and the other
+        /// escaped only because it drives the Apps key rather than the Start menu — it needs
+        /// no shell, so it never had to notice.
+        pub(super) async fn await_desktop(
+            frames: &AtomicUsize,
+            deadline: Duration,
+        ) -> Result<usize, String> {
+            let start = tokio::time::Instant::now();
+            let mut last = frames.load(Ordering::SeqCst);
+            loop {
+                tokio::time::sleep(DESKTOP_QUIET).await;
+                let now = frames.load(Ordering::SeqCst);
+                if now == last && now > 0 {
+                    return Ok(now);
+                }
+                if start.elapsed() > deadline {
+                    return Err(format!(
+                        "the desktop never painted and settled within {deadline:?} ({now} frames)"
+                    ));
+                }
+                last = now;
+            }
+        }
+
+        /// Wait until at least `want` pixels are non-black.
+        ///
+        /// [`await_desktop`] answers *"the screen stopped changing"*. A test that measures how
+        /// much of the desktop got assembled needs *"the screen is painted"*, and on a slow
+        /// logon the first is true well before the second: painting pauses while the shell is
+        /// still putting the desktop together. Measured on this VM, same code both times —
+        /// alone the assembly test saw 36 payloads / 5429 tiles / 1 023 562 lit px; run
+        /// back-to-back in the suite, 15–19 payloads / ~750 tiles / ~7 400 lit. It was not
+        /// receiving a broken desktop, it was measuring one that had not arrived.
+        ///
+        /// Sharing the threshold with the assertion is the point, and it is the same shape as
+        /// [`start_menu_run`] returning the counts slice-7 asserts on: the wait and the claim
+        /// are one measurement, so they cannot drift apart and the wait cannot silently become
+        /// weaker than the thing it guards.
+        pub(super) async fn await_painted(
+            lit: &AtomicUsize,
+            want: usize,
+            deadline: Duration,
+        ) -> Result<usize, String> {
+            let start = tokio::time::Instant::now();
+            loop {
+                let now = lit.load(Ordering::SeqCst);
+                if now >= want {
+                    return Ok(now);
+                }
+                if start.elapsed() > deadline {
+                    return Err(format!(
+                        "the desktop never painted more than {now} px within {deadline:?} \
+                         (wanted {want})"
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
+        /// Count the non-black pixels of `fb`. Cheap enough to run on a sampled frame, not on
+        /// every one: a 1280x800 scan is ~1 ms.
+        pub(super) fn lit_pixels(fb: &Framebuffer) -> usize {
+            fb.pixels()
+                .chunks_exact(4)
+                .filter(|px| px[..3].iter().any(|&b| b != 0))
+                .count()
+        }
+
+        /// True when the frame count rises above `from` within `within` — the acknowledgement
+        /// that a synthesised step reached something that draws.
+        async fn painted_since(frames: &AtomicUsize, from: usize, within: Duration) -> bool {
+            let start = tokio::time::Instant::now();
+            while start.elapsed() < within {
+                if frames.load(Ordering::SeqCst) > from {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            false
+        }
+
+        /// The Windows VK for one character of a Start-search command. Deliberately partial:
+        /// a character with no mapping is a caller bug, surfaced rather than silently dropped.
+        fn vk_for(ch: char) -> Option<u16> {
+            match ch {
+                'a'..='z' => Some(ch.to_ascii_uppercase() as u16),
+                'A'..='Z' | '0'..='9' => Some(ch as u16),
+                ' ' => Some(0x20),
+                '/' => Some(0xBF), // VK_OEM_2
+                '.' => Some(0xBE), // VK_OEM_PERIOD
+                _ => None,
+            }
+        }
+
+        /// What [`start_menu_run`] observed on its way through: the frame count at each step,
+        /// and how many input events it sent.
+        ///
+        /// These are not diagnostics bolted on afterwards — they *are* the acknowledgements the
+        /// driver waited for, which is why slice-7 no longer asserts *"the mouse visibly
+        /// responded"* and *"the keyboard visibly responded"* itself: those were the driver's
+        /// preconditions all along, and `start_menu_run` cannot return without both. What the
+        /// numbers buy the caller is the next claim up — that keystrokes reached a *launched
+        /// application* and not merely the shell — which needs `after_typing` as its baseline
+        /// and which the single "after typing" count slice-7 kept before #198 could not
+        /// separate from the search box responding.
+        #[derive(Debug)]
+        pub(super) struct StartMenuRun {
+            /// Frames at the moment the desktop settled, before any input was sent.
+            pub(super) idle: usize,
+            /// Frames once the Start click had been acknowledged by a repaint.
+            pub(super) after_click: usize,
+            /// Frames once the typed command had been acknowledged by a repaint.
+            pub(super) after_typing: usize,
+            /// Input events sent (press and release count separately).
+            pub(super) sent: usize,
+        }
+
+        /// Run `command` from the Start menu, **checking each step against the frame stream**
+        /// instead of sleeping and hoping (issue #198).
+        ///
+        /// #198's finding is that driving Windows by synthesised keystrokes is *open-loop*:
+        /// the harness types into whatever happens to be on screen and finds out much later
+        /// that it was not what it assumed. Every failure in that issue's table has that
+        /// shape, and this suite open-coded the same blind sequence in four places.
+        ///
+        /// But the acknowledgement is already in hand — **we are the RDP client**, so the
+        /// server tells us when the screen changed. A Start click that opened the menu
+        /// repaints; one that landed on a shell still coming up does not. Re-clicking until
+        /// that repaint arrives is what turns *the click was sent* into *the click worked*,
+        /// and it is why this survives a cold logon where a fixed sleep does not.
+        ///
+        /// The mouse leads for a second reason, measured in #197: a session that has just
+        /// logged on has focus on **nothing**, and every keystroke is swallowed — a click is
+        /// the only input class that always lands.
+        pub(super) async fn start_menu_run(
+            tx: &tokio::sync::mpsc::Sender<Vec<InputEvent>>,
+            frames: &AtomicUsize,
+            desktop: (u16, u16),
+            command: &str,
+        ) -> Result<StartMenuRun, String> {
+            let closed = || "the session loop closed the input channel".to_string();
+            let idle = await_desktop(frames, DESKTOP_DEADLINE).await?;
+            let mut sent = 0usize;
+
+            let (x, y) = (24u16, desktop.1.saturating_sub(20));
+            let click = vec![
+                InputEvent::Mouse {
+                    flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                    wheel_units: 0,
+                    x,
+                    y,
+                },
+                InputEvent::Mouse {
+                    flags: justrdp_pdu::input::PTRFLAGS_DOWN | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                    wheel_units: 0,
+                    x,
+                    y,
+                },
+                InputEvent::Mouse {
+                    flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                    wheel_units: 0,
+                    x,
+                    y,
+                },
+            ];
+            let mut after_click = None;
+            for attempt in 1..=START_ATTEMPTS {
+                let before = frames.load(Ordering::SeqCst);
+                sent += click.len();
+                tx.send(click.clone()).await.map_err(|_| closed())?;
+                if painted_since(frames, before, STEP_ACK).await {
+                    after_click = Some(frames.load(Ordering::SeqCst));
+                    break;
+                }
+                eprintln!("vm harness: Start click {attempt} drew nothing — the shell is not up");
+            }
+            let Some(after_click) = after_click else {
+                return Err(format!(
+                    "the Start button drew nothing after {START_ATTEMPTS} clicks — the shell \
+                     never came up"
+                ));
+            };
+
+            // Now wait for the menu to *finish* opening. `painted_since` above answered a
+            // different question — "it started" — and the two are not the same
+            // acknowledgement. Typing into a menu that is still painting **loses the leading
+            // character**: measured on the real VM, the search box read `hutdown /l /f` and
+            // Windows answered "no results", so the sign-out was never run and the teardown
+            // timed out 150 s later with no indication of why but the screenshot.
+            //
+            // The blind `sleep(2s)` this replaced happened to cover it. That is worth stating
+            // plainly rather than quietly fixing: a fixed sleep is not *wrong* about
+            // everything, it is unfalsifiable — it covered this and missed the cold logon,
+            // and neither was visible from the code. Quiescence covers both and says which
+            // it is waiting for.
+            await_desktop(frames, MENU_DEADLINE)
+                .await
+                .map_err(|why| format!("the Start menu never finished opening: {why}"))?;
+
+            // Type the command into the search box. That it draws at all is the proof the
+            // keystrokes reached a search box rather than the bare desktop.
+            let before = frames.load(Ordering::SeqCst);
+            for ch in command.chars() {
+                let vk = vk_for(ch).ok_or_else(|| format!("no VK mapping for {ch:?}"))?;
+                let events = tap(vk);
+                sent += events.len();
+                tx.send(events).await.map_err(|_| closed())?;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            if !painted_since(frames, before, STEP_ACK).await {
+                return Err(format!(
+                    "typing {command:?} drew nothing — the keystrokes reached no search box"
+                ));
+            }
+            let after_typing = frames.load(Ordering::SeqCst);
+            // Let the search settle on its best match before committing to it — the same
+            // "finished, not started" distinction as above, and the same reason: Enter
+            // commits whatever the highlighted result happens to be at that instant.
+            await_desktop(frames, MENU_DEADLINE)
+                .await
+                .map_err(|why| format!("the Start search never settled: {why}"))?;
+            let enter = tap(0x0D);
+            sent += enter.len();
+            tx.send(enter).await.map_err(|_| closed())?;
+            Ok(StartMenuRun {
+                idle,
+                after_click,
+                after_typing,
+                sent,
+            })
+        }
+
+        /// The sign-out command the teardown types into the Start search.
+        ///
+        /// **The `/f` is load-bearing, and Microsoft's own reference says it cannot be.** That
+        /// page states, verbatim: *"The **/l** parameter works independently and can't be
+        /// combined with any other parameters. Attempts to combine **/l** with any other
+        /// parameter is ignored."* #198 was filed on the strength of that sentence — the flag
+        /// is dead text, so the comment crediting it with forcing applications closed is false.
+        /// It is not. A/B against this VM, same test, same clean starting session, one variable:
+        ///
+        /// | command | `keyboard_and_mouse_input_drive_the_real_vm` leaves Notepad holding `aaa` |
+        /// |---|---|
+        /// | `shutdown /l /f` | teardown signs out, 63 s |
+        /// | `shutdown /l` | teardown **blocked** on Notepad's *"save changes?"* prompt, 150 s |
+        ///
+        /// That test still leaves the unsaved buffer, so this A/B is reproducible from the suite
+        /// as it stands. #198 briefly removed the veto instead — a console, closed with `exit` —
+        /// and the VM priced it: the console never makes the server push a decoded pointer shape,
+        /// so #41's proof in that test went with it. The `/f` is the cheaper of the two.
+        ///
+        /// The full-suite runs agree at the other scale: 15/15 with the flag, and without it a
+        /// failure at exactly that test. So the `/f` is what force-closes an application holding
+        /// unsaved work before it can veto the sign-out, and the documentation does not describe
+        /// what this path does.
+        ///
+        /// Keeping it is the same discipline as ADR-0009 one layer out: **for what a real system
+        /// does, the real system is the authority** — a vendor sentence read correctly off its
+        /// primary source is still a claim, and it lost to a measurement. The screenshot is the
+        /// reason this is knowable at all: the teardown dumps the desktop as a PPM on timeout,
+        /// and it showed Notepad's save dialog rather than the *"close N apps and sign out"*
+        /// screen #182 had trained everyone to expect.
+        const SIGN_OUT: &str = "shutdown /l /f";
+
         /// Run `body` against the test VM under the suite lock, then **always** return the
         /// Windows session to a known-clean state — including when the body panicked, which is
         /// the case that matters: a failing test that leaves a window open is exactly how one
@@ -2494,13 +2781,13 @@ mod tests {
         /// free: an Alt+F4 that reaches the bare desktop raises the *Shut Down Windows* dialog
         /// on Server 2022, which a later stray Enter would act on.
         ///
-        /// The sign-out costs nothing on the next connect — a cold logon reaches session-active
-        /// in ~380 ms, indistinguishable from the ~350 ms reattach it replaces, because the
-        /// connect returns at session-active and Windows finishes the profile work behind it.
+        /// The sign-out costs the *connect* nothing — a cold logon reaches session-active in
+        /// ~380 ms, indistinguishable from the ~350 ms reattach it replaces, because the connect
+        /// returns at session-active and Windows finishes the profile work behind it. What it
+        /// does cost is that everything after session-active now starts from a shell that is
+        /// still coming up, which is what [`start_menu_run`] exists to survive (#198).
         ///
-        /// `shutdown /l /f` rather than `logoff`: `/f` forces applications closed instead of
-        /// letting one with unsaved work (Notepad, in this suite) raise the *"close N apps and
-        /// sign out"* screen — the very screen whose appearance produced issue #182.
+        /// The command is [`SIGN_OUT`]; why it is no longer `shutdown /l /f` is recorded there.
         async fn tidy_session() -> () {
             let vm = Vm { _seal: () };
             let config = legacy_graphics_config();
@@ -2517,49 +2804,42 @@ mod tests {
                 outcome.activation.leftover,
             );
             let mut stream = outcome.stream;
+            let frames = Arc::new(AtomicUsize::new(0));
+            let frames_in_sink = frames.clone();
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(32);
             let driver = tokio::spawn(async move {
-                // The desktop repaints in a burst after a connect; type into it too early and
-                // the Start menu is not up yet.
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                // Click Start. The mouse is the input class that lands regardless of focus,
-                // which is what makes the typing that follows reach anything at all.
-                let (x, y) = (24u16, desktop.1.saturating_sub(20));
-                for flags in [
-                    justrdp_pdu::input::PTRFLAGS_MOVE,
-                    justrdp_pdu::input::PTRFLAGS_DOWN | justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                    justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                ] {
-                    let _ = tx
-                        .send(vec![InputEvent::Mouse {
-                            flags,
-                            wheel_units: 0,
-                            x,
-                            y,
-                        }])
-                        .await;
+                if let Err(why) = start_menu_run(&tx, &frames, desktop, SIGN_OUT).await {
+                    // Say it here rather than only failing below: this is the sentence that
+                    // distinguishes "the sign-out was refused" from "the sign-out was never
+                    // typed", and #182's whole cost was not being able to tell those apart.
+                    eprintln!("vm harness: teardown could not reach the Start menu: {why}");
+                    return;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                // "shutdown /l /f" — Start search runs it; every character is a plain VK, so
-                // no shift chord is needed. (S H U T D O W N ␣ / L ␣ / F)
-                for vk in [
-                    0x53u16, 0x48, 0x55, 0x54, 0x44, 0x4F, 0x57, 0x4E, 0x20, 0xBF, 0x4C, 0x20,
-                    0xBF, 0x46,
-                ] {
-                    let _ = tx.send(tap(vk)).await;
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let _ = tx.send(tap(0x0D)).await; // Enter
                 // Hold the input channel open so the session loop keeps its input branch until
                 // the server closes the session.
                 tokio::time::sleep(Duration::from_secs(60)).await;
             });
             // The sign-out ends the session, so the session loop returning *is* the success
             // signal; a timeout means the sign-out never took.
+            //
+            // This budget must **exceed the driver's own worst case**, or the parent gives up
+            // while the driver is still waiting and the sentence that says *why* — the one
+            // `start_menu_run` returns — is never printed, which is the failure mode this
+            // whole change exists to remove. The driver's worst case is
+            // `DESKTOP_DEADLINE` (45 s) + `START_ATTEMPTS` x `STEP_ACK` (30 s) + the typing
+            // and its acknowledgement (~8 s) = ~83 s, and Windows' own sign-out measures ~20 s
+            // on top of a measured ~28 s happy path.
             let ended = tokio::time::timeout(
-                Duration::from_secs(45),
-                run_session_with_input(&mut stream, &mut machine, |_, _| {}, |_| {}, &mut rx),
+                Duration::from_secs(150),
+                run_session_with_input(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    &mut rx,
+                ),
             )
             .await;
             driver.abort();
@@ -2572,19 +2852,269 @@ mod tests {
                     // Dump what the desktop looked like: reading that PPM is what made #182
                     // diagnosable in the first place.
                     let fb = machine.framebuffer();
-                    let path = std::env::temp_dir().join("justrdp-vm-teardown-timeout.ppm");
+                    // Name the dump after the test whose teardown failed. One fixed path
+                    // meant a run with three failures kept only the **last** screenshot —
+                    // and the first is the root cause, the other two its dominoes. #182's
+                    // whole lesson is that this image is what makes the difference between
+                    // one diagnosis and three separate investigations.
+                    let path = std::env::temp_dir().join(format!(
+                        "justrdp-vm-teardown-{}.ppm",
+                        std::thread::current()
+                            .name()
+                            .unwrap_or("unnamed")
+                            .replace("::", "-")
+                    ));
                     let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
                     for px in fb.pixels().chunks_exact(4) {
                         ppm.extend_from_slice(&px[..3]);
                     }
                     let _ = std::fs::write(&path, ppm);
                     panic!(
-                        "vm harness: the session did not sign out within 45s — the next test \
+                        "vm harness: the session did not sign out within 150s — the next test \
                          would inherit this desktop; dumped to {}",
                         path.display()
                     );
                 }
             }
+        }
+
+        /// The `> 0` half of [`await_desktop`], which is the whole of #198's cold-logon
+        /// failure: *"the frame count stopped changing"* is trivially true of `0 == 0`, so a
+        /// settle loop without it hands over a desktop that has not painted a single pixel.
+        /// Two of the five copies in this file were missing it, and one of those two is the
+        /// test #197 measured red.
+        #[tokio::test(start_paused = true)]
+        async fn await_desktop_refuses_a_desktop_that_never_painted() {
+            let frames = AtomicUsize::new(0);
+            let err = await_desktop(&frames, Duration::from_secs(30))
+                .await
+                .expect_err("a desktop that never painted has not settled");
+            assert!(err.contains("(0 frames)"), "{err}");
+        }
+
+        /// …and it returns the count it settled at, not an intermediate one: the caller uses
+        /// that number as the baseline every later "did this draw?" is measured against, so a
+        /// count read mid-burst would make the next step's acknowledgement unfalsifiable.
+        #[tokio::test(start_paused = true)]
+        async fn await_desktop_returns_the_count_it_settled_at() {
+            let frames = Arc::new(AtomicUsize::new(0));
+            let painting = frames.clone();
+            tokio::spawn(async move {
+                for _ in 0..3 {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    painting.fetch_add(5, Ordering::SeqCst);
+                }
+            });
+            assert_eq!(
+                await_desktop(&frames, Duration::from_secs(60)).await,
+                Ok(15)
+            );
+        }
+
+        /// A desktop that never stops repainting is a failure with a name, not a hang. The
+        /// deadline exists because the caller is a teardown: the honest outcome is a message
+        /// the next run can read, and #182's whole cost was a symptom with no message.
+        #[tokio::test(start_paused = true)]
+        async fn await_desktop_gives_up_on_a_desktop_that_never_settles() {
+            let frames = Arc::new(AtomicUsize::new(0));
+            let painting = frames.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    painting.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let err = await_desktop(&frames, Duration::from_secs(10))
+                .await
+                .expect_err("a desktop that keeps repainting never settles");
+            assert!(err.contains("never painted and settled"), "{err}");
+        }
+
+        /// The per-step acknowledgement: it is false when nothing draws — which is what makes
+        /// a Start click retryable instead of merely sent — and true as soon as something does.
+        #[tokio::test(start_paused = true)]
+        async fn painted_since_answers_whether_the_step_drew_anything() {
+            let frames = Arc::new(AtomicUsize::new(7));
+            assert!(
+                !painted_since(&frames, 7, Duration::from_secs(3)).await,
+                "a step that drew nothing must not read as acknowledged"
+            );
+            let drawing = frames.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                drawing.fetch_add(1, Ordering::SeqCst);
+            });
+            assert!(painted_since(&frames, 7, Duration::from_secs(3)).await);
+            // A count that rose *before* the step is not the step's acknowledgement: the
+            // caller re-reads `before` immediately prior to sending, and this is the property
+            // that makes that discipline load-bearing rather than stylistic.
+            assert!(!painted_since(&frames, 8, Duration::from_secs(3)).await);
+        }
+
+        /// Every command this suite types has a VK for every character — checked here rather
+        /// than discovered on the VM, where a command that typed six of its eight letters
+        /// would not fail, it would run *something else*.
+        #[test]
+        fn vk_for_covers_every_character_the_suite_types() {
+            for command in [SIGN_OUT, "logoff", "tsdiscon", "notepad"] {
+                for ch in command.chars() {
+                    let vk =
+                        vk_for(ch).unwrap_or_else(|| panic!("{command:?} needs a VK for {ch:?}"));
+                    // Both halves of the chain, because `tap` panics on the second: a VK this
+                    // table names but the scancode table does not is indistinguishable, here,
+                    // from a character it never mapped at all.
+                    assert!(
+                        justrdp::input::scancode_from_windows_vk(vk).is_some(),
+                        "{command:?}: VK {vk:#04x} for {ch:?} has no set-1 scancode"
+                    );
+                }
+            }
+            // Unmapped characters are surfaced, never silently dropped — see above for why
+            // dropping one is worse than refusing it.
+            assert_eq!(vk_for('!'), None);
+            assert_eq!(vk_for('한'), None);
+            // A set-1 scancode does not change with shift, so the letter keys are the VKs of
+            // their uppercase forms either way.
+            assert_eq!(vk_for('l'), vk_for('L'));
+            assert_eq!(vk_for('/'), Some(0xBF));
+            assert_eq!(vk_for(' '), Some(0x20));
+        }
+
+        /// The retry is the behaviour #198 adds, so it is the one worth proving without a VM.
+        /// A shell that ignores the first two clicks and only then starts drawing *is* the
+        /// cold logon #197 introduced — the desktop is up, the taskbar is not — and a single
+        /// blind click is exactly what that issue records failing against it.
+        #[tokio::test(start_paused = true)]
+        async fn start_menu_run_re_clicks_until_the_shell_answers() {
+            let frames = Arc::new(AtomicUsize::new(1)); // the desktop itself has painted
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            let painting = frames.clone();
+            let shell = tokio::spawn(async move {
+                let (mut clicks, mut typed) = (0usize, 0usize);
+                while let Some(events) = rx.recv().await {
+                    if events.iter().any(|e| matches!(e, InputEvent::Mouse { .. })) {
+                        clicks += 1;
+                        // The first two land on a shell that is not up yet: nothing draws.
+                        if clicks >= 3 {
+                            painting.fetch_add(1, Ordering::SeqCst);
+                        }
+                    } else {
+                        typed += 1;
+                        painting.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                (clicks, typed)
+            });
+
+            let run = start_menu_run(&tx, &frames, (1280, 800), "logoff")
+                .await
+                .expect("the third click draws, so the run should succeed");
+            drop(tx);
+            let (clicks, typed) = shell.await.expect("the fake shell");
+
+            assert_eq!(
+                clicks, 3,
+                "it must keep clicking until one draws — and stop there"
+            );
+            assert_eq!(typed, 7, "six letters and the Enter that commits them");
+            // The retried clicks are counted, not quietly forgotten: slice-7 asserts on this
+            // number, and an undercount would let a run that clicked six times report as one
+            // that clicked once.
+            assert_eq!(run.sent, 3 * 3 + 6 * 2 + 2);
+            assert_eq!(run.idle, 1);
+            assert!(run.after_click > run.idle);
+            assert!(run.after_typing > run.after_click);
+        }
+
+        /// The defect the real VM found in this change, modelled so it cannot come back.
+        ///
+        /// `painted_since` answers *"the menu started opening"*; typing on that signal reaches
+        /// a menu that is not yet taking input, and the **leading character is dropped**.
+        /// Measured: the Start search box read `hutdown /l /f`, Windows answered "no results",
+        /// the sign-out never ran, and the teardown timed out 150 s later saying nothing about
+        /// why. This shell reproduces it — a click makes it paint for three seconds, and
+        /// anything typed while it is still painting is swallowed exactly as Windows swallowed
+        /// the `s`.
+        ///
+        /// It is also the case the *blind sleep this change removed* happened to cover. Worth
+        /// having as a test rather than a restored `sleep(2s)`: the sleep covered this and
+        /// missed the cold logon, and nothing in the code said which it was for.
+        ///
+        /// The shell paints again after the **last** character, for the same reason and with
+        /// the same consequence one step later: Enter commits whatever result is highlighted
+        /// at that instant, so pressing it while the search is still resolving runs something
+        /// nobody chose. That guard went red under no test until this shell modelled it —
+        /// which is the only reason it is a guard rather than a decoration.
+        #[tokio::test(start_paused = true)]
+        async fn start_menu_run_waits_for_the_menu_to_finish_opening_before_typing() {
+            let frames = Arc::new(AtomicUsize::new(1));
+            let animating = Arc::new(AtomicBool::new(false));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            let painting = frames.clone();
+            let still_opening = animating.clone();
+            let shell = tokio::spawn(async move {
+                let (mut delivered, mut swallowed) = (0usize, 0usize);
+                // Paint for `ticks` x 200 ms, refusing input for as long as it lasts.
+                let busy = |ticks: usize| {
+                    let painting = painting.clone();
+                    let still_opening = still_opening.clone();
+                    still_opening.store(true, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        for _ in 0..ticks {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            painting.fetch_add(1, Ordering::SeqCst);
+                        }
+                        still_opening.store(false, Ordering::SeqCst);
+                    });
+                };
+                let command_len = SIGN_OUT.chars().count();
+                while let Some(events) = rx.recv().await {
+                    if events.iter().any(|e| matches!(e, InputEvent::Mouse { .. })) {
+                        busy(15); // the menu takes three seconds to open
+                    } else if still_opening.load(Ordering::SeqCst) {
+                        swallowed += 1; // still drawing; the keystroke is lost
+                    } else {
+                        delivered += 1;
+                        painting.fetch_add(1, Ordering::SeqCst);
+                        if delivered == command_len {
+                            busy(10); // the search takes two seconds to resolve
+                        }
+                    }
+                }
+                (delivered, swallowed)
+            });
+
+            let run = start_menu_run(&tx, &frames, (1280, 800), SIGN_OUT)
+                .await
+                .expect("the menu opens, so the run should succeed");
+            drop(tx);
+            let (delivered, swallowed) = shell.await.expect("the fake shell");
+
+            assert_eq!(
+                swallowed, 0,
+                "every keystroke must reach a menu that has finished drawing — the leading \
+                 character of the command, and the Enter that commits it"
+            );
+            assert_eq!(
+                delivered,
+                SIGN_OUT.chars().count() + 1,
+                "the whole command, and the Enter that commits it"
+            );
+            assert!(run.after_typing > run.after_click);
+        }
+
+        /// …and a shell that never comes up at all is a message, not a hang. This is the
+        /// sentence that separates *"the sign-out was refused"* from *"the sign-out was never
+        /// typed"* — telling those apart is the entire cost #182 paid.
+        #[tokio::test(start_paused = true)]
+        async fn start_menu_run_reports_a_shell_that_never_comes_up() {
+            let frames = Arc::new(AtomicUsize::new(1));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let err = start_menu_run(&tx, &frames, (1280, 800), SIGN_OUT)
+                .await
+                .expect_err("a shell that draws nothing cannot have run the command");
+            assert!(err.contains("the Start button drew nothing"), "{err}");
         }
 
         /// Await `fut`, converting a panic in it into an `Err` instead of unwinding through the
@@ -2606,7 +3136,7 @@ mod tests {
             .await
         }
     }
-    use vm::with_vm_session;
+    use vm::{start_menu_run, with_vm_session};
 
     /// Cancel-safety (issue #8): cancelling the token ends `run_session_with_commands`
     /// promptly and cleanly even while the server is silent and a refused resize command is
@@ -3291,6 +3821,12 @@ mod tests {
         let mut stream = outcome.stream;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+        let lit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lit_in_sink = lit.clone();
+        // The driver is spawned and later aborted without ever being joined, so a panic inside
+        // it goes nowhere. This carries its verdict back out.
+        let driver_fault = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let fault_in_driver = driver_fault.clone();
         let driver = tokio::spawn(async move {
             let mv = |x: u16, y: u16| {
                 vec![InputEvent::Mouse {
@@ -3300,8 +3836,18 @@ mod tests {
                     y,
                 }]
             };
-            // Let the initial full-desktop paint drain before adding traffic of our own.
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            // Let the initial full-desktop paint drain before adding traffic of our own —
+            // waited for, not slept at (#198). This is the sibling of
+            // `progressive_assembles`, which had the identical `sleep(3s)` and measured a
+            // quarter of the desktop when it ran behind another test's sign-out. Here the
+            // same miss is **silent**: this test captures a corpus rather than asserting on
+            // one, so starting early writes a thin corpus that every later differential test
+            // then treats as coverage.
+            if let Err(why) = vm::await_painted(&lit, 2_000, Duration::from_secs(90)).await {
+                *fault_in_driver.lock().expect("driver fault slot") =
+                    Some(format!("the desktop never painted before the capture: {why}"));
+                return;
+            }
 
             for round in 0..3u16 {
                 // A diagonal sweep: the cursor crosses taskbar, desktop and window chrome,
@@ -3356,11 +3902,31 @@ mod tests {
 
         // The timeout is the expected exit — a healthy session never ends on its own.
         let _ = tokio::time::timeout(
-            Duration::from_secs(75),
-            run_session_with_input(&mut stream, &mut machine, |_, _fb| {}, |_| {}, &mut rx),
+            // Covers the settle above plus the driver's own sweeps; a cold logon behind a
+            // sign-out is the slow case this has to leave room for.
+            Duration::from_secs(140),
+            run_session_with_input(
+                &mut stream,
+                &mut machine,
+                {
+                    let mut seen = 0usize;
+                    move |_: &FrameUpdate, fb: &Framebuffer| {
+                        seen += 1;
+                        if seen.is_multiple_of(16) {
+                            lit_in_sink
+                                .store(vm::lit_pixels(fb), std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                },
+                |_| {},
+                &mut rx,
+            ),
         )
         .await;
         driver.abort();
+        if let Some(why) = driver_fault.lock().expect("driver fault slot").take() {
+            panic!("{why} — the corpus this run would have written is not one to keep");
+        }
 
         // SAFETY: see the matching `set_var` above — same serialised, single-writer context.
         unsafe {
@@ -3535,6 +4101,8 @@ mod tests {
             let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
             let mut stream = outcome.stream;
 
+            let lit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let lit_in_sink = lit.clone();
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
             let driver = tokio::spawn(async move {
                 let mv = |x: u16, y: u16| {
@@ -3545,7 +4113,17 @@ mod tests {
                         y,
                     }]
                 };
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                // Wait for the desktop to be *painted*, not merely to stop changing (#198).
+                // This test measures how much of the screen the decoder assembled, so starting
+                // before the screen exists does not make it slow — it makes it **wrong**, and
+                // its failure then reads as a decoder fault. The threshold here is the same one
+                // asserted below, deliberately: the wait and the claim are one measurement.
+                if let Err(why) =
+                    vm::await_painted(&lit, LIVE_FURNITURE_FLOOR as usize, Duration::from_secs(90))
+                        .await
+                {
+                    panic!("the desktop never painted before the assembly probe: {why}");
+                }
                 for round in 0..2u16 {
                     for step in 0..12u16 {
                         let x = (desktop.0 / 12).saturating_mul(step).max(4);
@@ -3592,8 +4170,27 @@ mod tests {
 
             // The timeout is the expected exit — a healthy session never ends on its own.
             let _ = tokio::time::timeout(
-                Duration::from_secs(55),
-                run_session_with_input(&mut stream, &mut machine, |_, _fb| {}, |_| {}, &mut rx),
+                // Covers the settle above plus the driver's own ~21 s of mouse work; a cold
+                // logon behind a sign-out is the slow case this has to leave room for.
+                Duration::from_secs(120),
+                run_session_with_input(
+                    &mut stream,
+                    &mut machine,
+                    {
+                        // Sampled, not per-frame: a full scan is ~1 ms and the desktop paint
+                        // arrives over hundreds of frames.
+                        let mut seen = 0usize;
+                        move |_: &FrameUpdate, fb: &Framebuffer| {
+                            seen += 1;
+                            if seen.is_multiple_of(16) {
+                                lit_in_sink
+                                    .store(vm::lit_pixels(fb), std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    },
+                    |_| {},
+                    &mut rx,
+                ),
             )
             .await;
             driver.abort();
@@ -3841,15 +4438,40 @@ mod tests {
                 .filter(|px| px[..3].iter().any(|&b| b != 0))
                 .count() as u64;
             eprintln!("  live framebuffer: lit={lit_px} of {total_px}px");
-            // An eighth, against a measured 204 054 of 1 024 000 (19.9%) on the run that set
-            // this: the VM's desktop is mostly a black background, so a half-the-screen floor
-            // would fail on a healthy session and a floor set at the measurement would fail on
-            // the next one. It is a blank-screen detector, not a coverage target.
-            assert!(
-                lit_px * 8 >= total_px,
-                "the live framebuffer is barely painted ({lit_px} of {total_px}) — a desktop                  whose only WireToSurface2 decoder is the self-owned one should not be blank"
-            );
+            // A blank-screen detector, and the *second* one — `live_distinct > 64` above is the
+            // same claim and is the robust half. This one is an absolute floor, deliberately,
+            // and the story of why is worth the paragraph (#198).
+            //
+            // It used to read `lit_px * 8 >= total_px`: an eighth of the screen, calibrated
+            // against a measured 204 054 of 1 024 000 (19.9%). **That measurement included a
+            // wallpaper, and this test forbids one.** `connectionType = MODEM` is required here
+            // (see the doc comment: LAN sends zero upgrade passes), and the server reads the
+            // connection type as an experience setting and strips the wallpaper — measured three
+            // ways in one probe, same account, same session: MODEM + `performanceFlags = 0` →
+            // 10 322 lit; **LAN + 0 → 1 023 477**; MODEM + 0x7 → 11 574. The flags are ignored;
+            // the connection type decides. So `performance_flags = 0` above does *not* turn the
+            // wallpaper on, whatever it used to claim, and an eighth of the screen was
+            // unreachable by construction.
+            //
+            // It passed for a long time anyway, on **borrowed pixels**: while the harness
+            // teardown was unreliable the Windows session survived between tests, so this one
+            // reattached to a desktop another test's session had already painted — wallpaper
+            // included. #198 made teardown reliable, every test now gets a fresh logon, and the
+            // borrowing stopped. A correctness proof was resting on another test's leftovers.
+            //
+            // What MODEM does leave is the desktop furniture: icons, taskbar, clock. Measured
+            // across five runs it is 7 253 / 7 325 / 7 355 / 7 415 / 7 448 — stable to within
+            // 3%. The floor is set well below that and infinitely above a blank screen, which
+            // is 0. It is not a coverage target and never was; the `> 64 distinct colours`
+            // assertion above is what would catch a decoder painting garbage.
+            /// Non-black pixels a MODEM desktop shows with no wallpaper: icons, taskbar,
+            /// clock. Measured 7 253–7 448 across five runs; a blank screen is 0.
+            const LIVE_FURNITURE_FLOOR: u64 = 2_000;
 
+            // The dump comes *before* the assertion it is evidence for. It used to come
+            // after, so the one run that needed the screenshot was the one run that never
+            // wrote it — the same defect as the teardown's single fixed PPM path, and it cost
+            // two diagnoses in this issue alone.
             let live_path = std::env::temp_dir().join("justrdp-172-live-framebuffer.ppm");
             let mut live_ppm = format!("P6\n{fw} {fh}\n255\n").into_bytes();
             for px in fb.pixels().chunks_exact(4) {
@@ -3857,6 +4479,13 @@ mod tests {
             }
             std::fs::write(&live_path, live_ppm).expect("write the live dump");
             eprintln!("live framebuffer dump: {}", live_path.display());
+            assert!(
+                lit_px >= LIVE_FURNITURE_FLOOR,
+                "the live framebuffer is barely painted ({lit_px} of {total_px}, floor \
+                 {LIVE_FURNITURE_FLOOR}) — a desktop whose only WireToSurface2 decoder is the \
+                 self-owned one should not be blank; dumped to {}",
+                live_path.display()
+            );
 
             let path = std::env::temp_dir().join("justrdp-171-progressive-assembly.ppm");
             let mut ppm = format!("P6\n{canvas_w} {canvas_h}\n255\n").into_bytes();
@@ -4019,7 +4648,7 @@ mod tests {
 
     /// Real-VM acceptance (issue #42): logging off inside the session ends it with the
     /// server's **typed** attribution (ERRINFO_LOGOFF_BY_USER → the UserLogoff bucket), not
-    /// an unexplained EOF. The logoff is driven the same way slice-7 launches Notepad —
+    /// an unexplained EOF. The logoff is driven the same way slice-7 launches its app —
     /// click Start, type the command into the search, Enter — because this VM ignores the
     /// Windows logo key (server-side policy, probed in slice-7), so Win+R is unavailable.
     #[tokio::test]
@@ -4048,49 +4677,13 @@ mod tests {
                     toggle_flags: keyboard_toggle_flags(),
                 }])
                 .await;
-            // Wait until the desktop has painted AND settled.
-            let mut last = frames_in_driver.load(Ordering::SeqCst);
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let now = frames_in_driver.load(Ordering::SeqCst);
-                if now == last && now > 0 {
-                    break;
-                }
-                last = now;
+            // Start button, then `logoff` typed into the Start search — each step waited
+            // on rather than slept through (#198).
+            if let Err(why) =
+                start_menu_run(&tx, &frames_in_driver, requested_size, "logoff").await
+            {
+                panic!("could not reach the Start menu to log off: {why}");
             }
-            // Click the Start button (the slice-7-proven launch path), then type the
-            // command into the Start search and run it.
-            let (x, y) = (24u16, requested_size.1.saturating_sub(20));
-            let _ = tx
-                .send(vec![
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
-                        wheel_units: 0,
-                        x,
-                        y,
-                    },
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_DOWN
-                            | justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                        wheel_units: 0,
-                        x,
-                        y,
-                    },
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                        wheel_units: 0,
-                        x,
-                        y,
-                    },
-                ])
-                .await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            for vk in [0x4Cu16, 0x4F, 0x47, 0x4F, 0x46, 0x46] {
-                let _ = tx.send(tap(vk)).await; // L O G O F F
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let _ = tx.send(tap(0x0D)).await; // Enter
             // Keep tx alive until the session ends so the input branch stays open.
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
@@ -4142,7 +4735,7 @@ mod tests {
     /// [`DisconnectReason::ServerDisconnected`], never an unexplained EOF. The exact class is
     /// VM-policy-dependent (commonly `ProviderUltimatum`), so it is logged rather than pinned;
     /// the invariant under test is *attributed vs unexpected*. `tsdiscon` is launched the same
-    /// way slice-7 launches Notepad — Start button, type the command, Enter — because this VM
+    /// way slice-7 launches its app — Start button, type the command, Enter — because this VM
     /// ignores the Windows logo key (server-side policy probed in slice-7).
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
@@ -4170,49 +4763,13 @@ mod tests {
                         toggle_flags: keyboard_toggle_flags(),
                     }])
                     .await;
-                // Wait until the desktop has painted AND settled.
-                let mut last = frames_in_driver.load(Ordering::SeqCst);
-                loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let now = frames_in_driver.load(Ordering::SeqCst);
-                    if now == last && now > 0 {
-                        break;
-                    }
-                    last = now;
+                // Start button, then `tsdiscon` typed into the Start search — each step
+                // waited on rather than slept through (#198).
+                if let Err(why) =
+                    start_menu_run(&tx, &frames_in_driver, requested_size, "tsdiscon").await
+                {
+                    panic!("could not reach the Start menu to run tsdiscon: {why}");
                 }
-                // Click the Start button, then type `tsdiscon` into the Start search and run it.
-                let (x, y) = (24u16, requested_size.1.saturating_sub(20));
-                let _ = tx
-                    .send(vec![
-                        InputEvent::Mouse {
-                            flags: justrdp_pdu::input::PTRFLAGS_MOVE,
-                            wheel_units: 0,
-                            x,
-                            y,
-                        },
-                        InputEvent::Mouse {
-                            flags: justrdp_pdu::input::PTRFLAGS_DOWN
-                                | justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                            wheel_units: 0,
-                            x,
-                            y,
-                        },
-                        InputEvent::Mouse {
-                            flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                            wheel_units: 0,
-                            x,
-                            y,
-                        },
-                    ])
-                    .await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                // T S D I S C O N
-                for vk in [0x54u16, 0x53, 0x44, 0x49, 0x53, 0x43, 0x4F, 0x4E] {
-                    let _ = tx.send(tap(vk)).await;
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let _ = tx.send(tap(0x0D)).await; // Enter
                 tokio::time::sleep(Duration::from_secs(60)).await;
             });
 
@@ -4294,14 +4851,8 @@ mod tests {
             let frames_watch = frames.clone();
             tokio::spawn(async move {
                 // Wait until the desktop has painted AND settled, then cut the transport.
-                let mut last = frames_watch.load(Ordering::SeqCst);
-                loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let now = frames_watch.load(Ordering::SeqCst);
-                    if now == last && now > 0 {
-                        break;
-                    }
-                    last = now;
+                if let Err(why) = vm::await_desktop(&frames_watch, vm::DESKTOP_DEADLINE).await {
+                    panic!("the desktop never came up before the transport cut: {why}");
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let _ = kill.send(()); // sever the network
@@ -4344,220 +4895,202 @@ mod tests {
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn keyboard_and_mouse_input_drive_the_real_vm() {
         with_vm_session(|vm| async move {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let config = legacy_graphics_config();
-        let session_capabilities = config.capabilities.clone();
-        let outcome = vm.connect(config).await;
-        let session_config = session_config_from(&outcome, session_capabilities);
-        assert!(
-            session_config.server_input_flags
-                & (justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT
-                    | justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT2)
-                != 0,
-            "this VM advertises fast-path input; flags={:#06x}",
-            session_config.server_input_flags
-        );
-        let desktop = session_config.desktop_size;
-        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
-        let mut stream = outcome.stream;
+            let config = legacy_graphics_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            assert!(
+                session_config.server_input_flags
+                    & (justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT
+                        | justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT2)
+                    != 0,
+                "this VM advertises fast-path input; flags={:#06x}",
+                session_config.server_input_flags
+            );
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut stream = outcome.stream;
 
-        let frames = Arc::new(AtomicUsize::new(0));
-        let frames_in_sink = frames.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            let frames = Arc::new(AtomicUsize::new(0));
+            let frames_in_sink = frames.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
 
-        let frames_in_driver = frames.clone();
-        let driver = tokio::spawn(async move {
-            let mut sent = 0usize;
-            let send = |events: Vec<InputEvent>, sent: &mut usize| {
-                *sent += events.len();
-                let tx = tx.clone();
-                async move { tx.send(events).await.expect("session loop alive") }
-            };
-            // Wait for the initial desktop paint to settle (no frames for 2 seconds), so
-            // every later frame delta is attributable to our input alone.
-            let mut last = frames_in_driver.load(Ordering::SeqCst);
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let now = frames_in_driver.load(Ordering::SeqCst);
-                if now == last {
-                    break;
-                }
-                last = now;
-            }
-            // Toggle sync first, as a real client would (criterion: lock-state sync on
-            // session start, from the OS's live state).
-            send(
-                vec![InputEvent::Sync {
-                    toggle_flags: keyboard_toggle_flags(),
-                }],
-                &mut sent,
-            )
-            .await;
-            let idle_frames = frames_in_driver.load(Ordering::SeqCst);
-
-            // Mouse: click the Start button (bottom-left corner).
-            let click = |x: u16, y: u16| {
-                vec![
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
-                        wheel_units: 0,
-                        x,
-                        y,
-                    },
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_DOWN
-                            | justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                        wheel_units: 0,
-                        x,
-                        y,
-                    },
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_BUTTON1,
-                        wheel_units: 0,
-                        x,
-                        y,
-                    },
-                ]
-            };
-            send(click(24, desktop.1.saturating_sub(20)), &mut sent).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let after_click = frames_in_driver.load(Ordering::SeqCst);
-
-            // Keyboard: type "notepad" into the Start search, Enter to launch it.
-            for vk in [0x4Eu16, 0x4F, 0x54, 0x45, 0x50, 0x41, 0x44] {
-                send(tap(vk), &mut sent).await; // N O T E P A D
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            send(tap(0x0D), &mut sent).await; // Enter
-            tokio::time::sleep(Duration::from_secs(4)).await;
-            for _ in 0..3 {
-                send(tap(0x41), &mut sent).await; // A → "aaa" in Notepad
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-            // Wheel scroll for good measure (vertical wheel, both directions).
-            let (cx, cy) = (desktop.0 / 2, desktop.1 / 2);
-            send(
-                vec![
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_WHEEL,
-                        wheel_units: -120,
-                        x: cx,
-                        y: cy,
-                    },
-                    InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_WHEEL,
-                        wheel_units: 120,
-                        x: cx,
-                        y: cy,
-                    },
-                ],
-                &mut sent,
-            )
-            .await;
-            // Hover moves for the pointer slice (#41): over Notepad's edit area (an I-beam
-            // shape) and then over the desktop edge (an arrow) — each move makes the server
-            // push the pointer shape for what's under the cursor.
-            for (x, y) in [(cx, cy), (4, 4), (cx, cy)] {
+            let frames_in_driver = frames.clone();
+            let driver = tokio::spawn(async move {
+                let mut sent = 0usize;
+                let send = |events: Vec<InputEvent>, sent: &mut usize| {
+                    *sent += events.len();
+                    let tx = tx.clone();
+                    async move { tx.send(events).await.expect("session loop alive") }
+                };
+                // Toggle sync first, as a real client would (criterion: lock-state sync on
+                // session start, from the OS's live state). It draws nothing, so it does not
+                // disturb the settle the driver waits on next.
                 send(
-                    vec![InputEvent::Mouse {
-                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
-                        wheel_units: 0,
-                        x,
-                        y,
+                    vec![InputEvent::Sync {
+                        toggle_flags: keyboard_toggle_flags(),
                     }],
                     &mut sent,
                 )
                 .await;
-                tokio::time::sleep(Duration::from_millis(700)).await;
+
+                // Mouse then keyboard, each step held until the server acknowledges it with a
+                // repaint (#198). *"The click landed"* and *"the mouse visibly responded"* are
+                // the same measurement, so the driver's own precondition is this test's
+                // assertion — it cannot return without both, which is why neither is re-asserted
+                // below and why this survives the cold logon a fixed sleep raced.
+                let run = start_menu_run(&tx, &frames_in_driver, desktop, "notepad")
+                    .await
+                    .expect("the Start menu should launch Notepad");
+                sent += run.sent;
+
+                // Notepad takes a moment to come up. Typing into *it* is a claim the
+                // Start-search paint cannot make: those keystrokes reached the shell, these
+                // have to reach a launched application.
+                //
+                // #198 swapped this for a console — nothing unsaved, closes with `exit`, so the
+                // teardown's sign-out could never be vetoed — and the VM priced it: a console's
+                // client area carries the **same arrow as the desktop**, so the hovers below saw
+                // 60 cursor events and not one `Set`. The I-beam over Notepad's edit area is
+                // what makes the server push a *decoded* shape at all, which is the whole of
+                // #41's proof here. The veto the swap was avoiding is handled by the sign-out's
+                // `/f` instead, measured three times; see [`SIGN_OUT`].
+                // Wait for Notepad to finish appearing rather than sleeping four seconds at
+                // it (#198). `start_menu_run` proved the command was typed and committed; that
+                // the *application* is up is a separate fact, and a launch slower than the sleep
+                // sends the "aaa" to the desktop and leaves the hovers below with no edit area
+                // to find — measured across runs of identical code: 1 SetCursor, then 0, then 1.
+                if let Err(why) = vm::await_desktop(&frames_in_driver, vm::MENU_DEADLINE).await {
+                    panic!("Notepad never finished appearing: {why}");
+                }
+                for _ in 0..3 {
+                    send(tap(0x41), &mut sent).await; // A → "aaa" in Notepad
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                // Wheel scroll for good measure (vertical wheel, both directions).
+                let (cx, cy) = (desktop.0 / 2, desktop.1 / 2);
+                send(
+                    vec![
+                        InputEvent::Mouse {
+                            flags: justrdp_pdu::input::PTRFLAGS_WHEEL,
+                            wheel_units: -120,
+                            x: cx,
+                            y: cy,
+                        },
+                        InputEvent::Mouse {
+                            flags: justrdp_pdu::input::PTRFLAGS_WHEEL,
+                            wheel_units: 120,
+                            x: cx,
+                            y: cy,
+                        },
+                    ],
+                    &mut sent,
+                )
+                .await;
+                // Hover moves for the pointer slice (#41): over Notepad's edit area (an I-beam
+                // shape) and then over the desktop edge (an arrow) — each move makes the server
+                // push the pointer shape for what's under the cursor.
+                for (x, y) in [(cx, cy), (4, 4), (cx, cy)] {
+                    send(
+                        vec![InputEvent::Mouse {
+                            flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                            wheel_units: 0,
+                            x,
+                            y,
+                        }],
+                        &mut sent,
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let after_app = frames_in_driver.load(Ordering::SeqCst);
+                (sent, run, after_app)
+                // tx drops here: the input branch disables, the session stays up.
+            });
+
+            // The timeout is the expected exit — a healthy session never ends on its own.
+            let mut cursor_events: Vec<justrdp::CursorEvent> = Vec::new();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(45),
+                run_session_with_input(
+                    &mut stream,
+                    &mut machine,
+                    |_, _fb| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |c| cursor_events.push(c.clone()),
+                    &mut rx,
+                ),
+            )
+            .await;
+            if let Ok(result) = ended {
+                result.expect("session failed while input was in flight");
+                panic!("server closed the session during the input exchange");
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let after_typing = frames_in_driver.load(Ordering::SeqCst);
-            (sent, idle_frames, after_click, after_typing)
-            // tx drops here: the input branch disables, the session stays up.
-        });
+            let (sent, run, after_app) = driver.await.expect("input driver");
 
-        // The timeout is the expected exit — a healthy session never ends on its own.
-        let mut cursor_events: Vec<justrdp::CursorEvent> = Vec::new();
-        let ended = tokio::time::timeout(
-            Duration::from_secs(45),
-            run_session_with_input(
-                &mut stream,
-                &mut machine,
-                |_, _fb| {
-                    frames_in_sink.fetch_add(1, Ordering::SeqCst);
-                },
-                |c| cursor_events.push(c.clone()),
-                &mut rx,
-            ),
-        )
-        .await;
-        if let Ok(result) = ended {
-            result.expect("session failed while input was in flight");
-            panic!("server closed the session during the input exchange");
-        }
-        let (sent, idle_frames, after_click, after_typing) = driver.await.expect("input driver");
-
-        // Pointer verification (#41): the hover moves above make the server push cursor
-        // shapes (arrow over the desktop, an I-beam over Notepad's edit area). Every decoded
-        // shape must be plausible: spec-capped dimensions, hotspot inside the shape, RGBA
-        // sized exactly width × height × 4.
-        let mut shapes = 0usize;
-        for event in &cursor_events {
-            if let justrdp::CursorEvent::Set(image) = event {
-                shapes += 1;
-                eprintln!(
-                    "cursor shape: {}x{} hotspot ({}, {})",
-                    image.width, image.height, image.hotspot_x, image.hotspot_y
-                );
-                assert!(image.width > 0 && image.width <= 96);
-                assert!(image.height > 0 && image.height <= 96);
-                assert!(image.hotspot_x < image.width && image.hotspot_y < image.height);
-                assert_eq!(
-                    image.rgba.len(),
-                    usize::from(image.width) * usize::from(image.height) * 4
-                );
+            // Pointer verification (#41): the hover moves above make the server push cursor
+            // shapes (arrow over the desktop, an I-beam over Notepad's edit area). Every decoded
+            // shape must be plausible: spec-capped dimensions, hotspot inside the shape, RGBA
+            // sized exactly width × height × 4.
+            let mut shapes = 0usize;
+            for event in &cursor_events {
+                if let justrdp::CursorEvent::Set(image) = event {
+                    shapes += 1;
+                    eprintln!(
+                        "cursor shape: {}x{} hotspot ({}, {})",
+                        image.width, image.height, image.hotspot_x, image.hotspot_y
+                    );
+                    assert!(image.width > 0 && image.width <= 96);
+                    assert!(image.height > 0 && image.height <= 96);
+                    assert!(image.hotspot_x < image.width && image.hotspot_y < image.height);
+                    assert_eq!(
+                        image.rgba.len(),
+                        usize::from(image.width) * usize::from(image.height) * 4
+                    );
+                }
             }
-        }
-        eprintln!(
-            "cursor events: {} total, {shapes} SetCursor",
-            cursor_events.len()
-        );
-        assert!(
-            shapes >= 1,
-            "expected at least one decoded pointer shape from the VM, got {cursor_events:?}"
-        );
+            eprintln!(
+                "cursor events: {} total, {shapes} SetCursor",
+                cursor_events.len()
+            );
+            assert!(
+                shapes >= 1,
+                "expected at least one decoded pointer shape from the VM, got {cursor_events:?}"
+            );
 
-        eprintln!(
-            "sent {sent} input events; frames: settled={idle_frames} → after click={after_click} \
-             → after typing={after_typing}"
-        );
-        // 10+ mixed events were sent and the session survived them (the timeout fired with
-        // no protocol error)…
-        assert!(sent >= 10, "expected to send 10+ events, sent {sent}");
-        // …the *mouse* visibly responded (the Start menu painted after the click)…
-        assert!(
-            after_click > idle_frames,
-            "no graphics followed the Start-button click ({idle_frames} → {after_click})"
-        );
-        // …and the *keyboard* visibly responded (search results / Notepad painted), where a
-        // settled desktop paints nothing on its own.
-        assert!(
-            after_typing > after_click,
-            "no graphics followed the typing ({after_click} → {after_typing})"
-        );
+            eprintln!(
+                "sent {sent} input events; frames: settled={} → after Start click={} → after \
+             Start-search typing={} → after typing into Notepad={after_app}",
+                run.idle, run.after_click, run.after_typing
+            );
+            // 10+ mixed events were sent and the session survived them (the timeout fired with
+            // no protocol error)…
+            assert!(sent >= 10, "expected to send 10+ events, sent {sent}");
+            // …and the keystrokes reached the *launched application*, not merely the shell. This
+            // is the one the driver cannot make for us, and it is a step finer than what this
+            // test asserted before #198, which measured a single "after typing" count covering
+            // the Start search and Notepad together — a green there could have been the search
+            // box alone.
+            assert!(
+                after_app > run.after_typing,
+                "no graphics followed the keystrokes sent to Notepad ({} → {after_app})",
+                run.after_typing
+            );
 
-        // Visual confirmation artifact: Notepad with "aaa" typed into it.
-        let fb = machine.framebuffer();
-        let path = std::env::temp_dir().join("justrdp-slice7-input.ppm");
-        let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-        for px in fb.pixels().chunks_exact(4) {
-            ppm.extend_from_slice(&px[..3]);
-        }
-        std::fs::write(&path, ppm).expect("write the visual dump");
-        eprintln!("visual dump for confirmation: {}", path.display());
+            // Visual confirmation artifact: Notepad with "aaa" typed into it.
+            let fb = machine.framebuffer();
+            let path = std::env::temp_dir().join("justrdp-slice7-input.ppm");
+            let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+            for px in fb.pixels().chunks_exact(4) {
+                ppm.extend_from_slice(&px[..3]);
+            }
+            std::fs::write(&path, ppm).expect("write the visual dump");
+            eprintln!("visual dump for confirmation: {}", path.display());
         })
         .await
     }
@@ -4587,20 +5120,14 @@ mod tests {
             let frames_in_driver = frames.clone();
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(16);
             let driver = tokio::spawn(async move {
-                // Same settle-then-measure protocol as the fast-path test.
-                let mut last = frames_in_driver.load(Ordering::SeqCst);
-                loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let now = frames_in_driver.load(Ordering::SeqCst);
-                    if now == last {
-                        break;
-                    }
-                    last = now;
-                }
+                // Same settle-then-measure protocol as the fast-path test — and through the
+                // same helper, which is what supplies the `> 0` half this copy was missing.
+                let idle_frames = vm::await_desktop(&frames_in_driver, vm::DESKTOP_DEADLINE)
+                    .await
+                    .expect("the desktop should paint and settle");
                 tx.send(vec![InputEvent::Sync { toggle_flags: 0 }])
                     .await
                     .expect("session loop alive");
-                let idle_frames = frames_in_driver.load(Ordering::SeqCst);
                 // Apps key (context menu) then Escape: a visible open/close round trip carried
                 // entirely over slow-path Input Event PDUs.
                 let apps = justrdp::input::scancode_from_windows_vk(0x5D).unwrap();

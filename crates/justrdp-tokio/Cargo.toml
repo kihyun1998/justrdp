@@ -30,7 +30,18 @@ sspi = { workspace = true }
 
 [dev-dependencies]
 # "sync" feeds the SNI observed by the mock TLS server back to the test (oneshot channel).
-tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros", "sync"] }
+# "test-util" gives the VM harness's frame-acknowledgement primitives (#198) virtual time, so
+# they are tested against their real 2 s / 5 s / 90 s constants without spending 20 s of the
+# default gate on sleeps — a real clock here would make the cheap tests the slow ones.
+tokio = { workspace = true, features = [
+    "net",
+    "io-util",
+    "time",
+    "rt",
+    "macros",
+    "sync",
+    "test-util",
+] }
 # Captures tracing events in-test so we can assert on the emitted debug logs (criterion 14).
 # "no-env-filter" keeps events from the `justrdp` core crate (PDU-milestone targets like
 # rdp_deactivate_all) visible to the slice-8 wire-sequence assertions.

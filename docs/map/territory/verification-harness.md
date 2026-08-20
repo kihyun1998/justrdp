@@ -117,18 +117,117 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   splits the fixture at run time rather than duplicating ~900 KB into `fuzz/`.
 - **One VM is one server.** The WS2022 box advertises a fixed cap set; paths it does
   not advertise have never been exercised against anything.
-- **The VM suite does not isolate its own sessions, and the symptom masquerades as
-  several unrelated failures.** Two properties, both measured 2026-08-10: it must run
-  with `--test-threads=1` (in parallel, 6 of 12 fail and the same 6 pass serially —
-  they race for one VM), and **no test tears down its Windows session**, so each
-  connect reattaches to the previous test's disconnected session and windows
-  accumulate. `keyboard_and_mouse_input_drive_the_real_vm` leaves Notepad open;
-  `logoff_inside_the_session_yields_the_typed_reason` then stalls on Windows' *"close
-  N apps and sign out"* confirmation — **N tracked the number of input tests that had
-  run before it** — and that modal swallows the input of every later test. One
-  leftover window therefore reads as three or four independent bugs. Every test passes
-  on a clean session; no single run has been 12/12. The failure set moves between
-  runs, which is the tell.
+- **A test can pass on pixels another test's session painted, and only a working teardown
+  exposes it.** `progressive_assembles`' live-framebuffer floor (≥ 1/8 of the screen
+  non-black) asserts that the client paints a desktop over a WireToSurface2 path. That test
+  connects with `connectionType = MODEM`, which it needs — LAN gives the server bandwidth to
+  spare and it sends `TILE_FIRST` at `quality = 0xFF` with **zero** upgrade passes, so half
+  the codec goes unexercised. But MODEM also makes the server strip the wallpaper, and
+  `performanceFlags = 0` does **not** override it (measured: MODEM+0 → 10 322 lit,
+  LAN+0 → 1 023 477, MODEM+0x7 → 11 574). A MODEM desktop is icons, taskbar and clock on
+  black — about 7 400 lit — so the floor is unreachable by construction.
+  It nevertheless passed for a long time, on **borrowed pixels**: while teardown was
+  unreliable the session survived between tests, so this one reattached to a desktop another
+  test's session had already painted with a wallpaper. #198 made teardown reliable, every
+  test now gets a fresh logon, and the borrowing stopped. The finding is the shape, not the
+  number: **a correctness proof was resting on another test's leftovers, and the thing that
+  revealed it was fixing the isolation.**
+- **The suite has a named VM-configuration dependency, and it is not in the repo.** The
+  teardown signs out through the Windows UI, and Server 2022 answers a sign-out with the
+  **Shutdown Event Tracker** — a dialog whose description field is *mandatory*, so its OK
+  button stays disabled and no blind keystroke clears it. It is raised on the **next
+  logon**, not at the shutdown, so a single occurrence poisons every later test exactly the
+  way #182's leftover window did. Any VM this suite drives needs the policy off:
+  `ShutdownReason` ("Display Shutdown Event Tracker"), key
+  `HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Reliability`, value `ShutdownReasonOn` = 0
+  — verified against `C:\Windows\PolicyDefinitions\Reliability.admx` rather than inferred
+  from a support article, which gives only the Group Policy path.
+  This is the honest shape of the fix and worth stating as such: it is **not** a guard the
+  harness can hold. #198 tabulated four blocking modals, this work found a fifth, and each
+  fix revealed the next — which is the signal that the set is not enumerable from inside a
+  client driving a UI it does not own. The alternative that *is* enumerable is out-of-band
+  (WinRM), and it was declined because it moves the configuration burden onto every machine
+  that runs the suite instead of onto the one VM.
+- **Driving a desktop by synthesised keystrokes is open-loop, and the acknowledgement
+  the harness needs is the one it already receives.** Every VM test that has to make
+  something happen *inside* Windows — sign out, launch an app, run `tsdiscon` — types
+  into whatever happens to be on screen and finds out much later that it was not what it
+  assumed (#198). We are the RDP client, so the screen answers: a Start click that opened
+  the menu repaints, one that landed on a shell still loading does not. `start_menu_run`
+  waits for that repaint and re-clicks, and its three frame counts *are* the assertions
+  the input test makes — the check that keeps the step reliable and the check that makes
+  the test meaningful are one measurement rather than two that can drift apart. The
+  specific shape it cost: **"the frame count stopped changing" is trivially true of
+  `0 == 0`**, so a settle loop written without a `> 0` guard falls through *before the
+  first frame arrives*; three of five copies had the guard, and the two that did not
+  included the one test #197 measured red.
+- **Closing a loop on the wrong edge is its own defect, and the first closed-loop
+  version of `start_menu_run` had it.** *"Something drew"* answers **it started**; the
+  step needs **it finished**. Typing on the first frame of the opening Start menu loses
+  the leading character — measured, the search box read `hutdown /l /f`, Windows
+  answered "no results", the command never ran, and the only evidence was the PPM. Every
+  typed step now waits for the repaint to *quiesce*, and so does the Enter that commits
+  whichever result is highlighted. The blind `sleep(2s)` that preceded all this happened
+  to cover exactly this case and missed the cold logon: **a fixed sleep is not wrong
+  about everything, it is unfalsifiable**, and that is the argument for quiescence rather
+  than for a longer sleep.
+- **One dump path is one dump.** The teardown wrote every timeout to
+  `%TEMP%\justrdp-vm-teardown-timeout.ppm`, so a run with three failures kept only the
+  **last** screenshot — and the first is the root cause while the others are its
+  dominoes. The name now carries the test's thread name. #182's whole lesson is that
+  this image is the difference between one diagnosis and three investigations, and a
+  fixed filename quietly converts a cascade back into three unrelated bugs.
+- **Session isolation is fixed and the numbers that described it are dead** — kept here
+  because the shape recurs, not as current state. Until #197 the suite shared one Windows
+  session across all its tests and never tore it down, so each connect reattached to the
+  previous test's *disconnected* session and windows accumulated:
+  `keyboard_and_mouse_input_drive_the_real_vm` left Notepad open,
+  `logoff_inside_the_session_yields_the_typed_reason` then stalled on Windows' *"close N
+  apps and sign out"* confirmation — **N tracked the number of input tests that had run
+  before it** — and that modal swallowed every later test's input, so one leftover window
+  read as three or four independent bugs and the failing set moved between runs. #197 gave
+  the suite `with_vm_session`, which owns the VM address, the credentials and the
+  serialisation lock and signs the session out afterwards *even when the body panicked*.
+  The suite no longer needs `--test-threads=1`, and **15 of 15 pass in parallel** (measured
+  2026-08-19; PLACEHOLDER_RUNS). Most of that run is teardown: a single-test run
+  (`connect_reaches_session_active_against_real_vm`, whose body is a connect and three
+  assertions) measures **28.8 s end to end**, so the sign-out is ~26 s of it — and it runs
+  after *every* test, including the twelve that dirty nothing. That is the price of #182's
+  actual lesson, which is that "whichever test makes a mess cleans it up" is the property
+  that failed.
+- **A vendor document read correctly off its primary source still lost to a
+  measurement (#198).** The teardown types `shutdown /l /f`, and Microsoft's reference
+  states verbatim that `/l` *"works independently and can't be combined with any other
+  parameters. Attempts to combine /l with any other parameter is ignored."* #198 was
+  filed on that sentence — the flag is dead text, so the comment crediting it with
+  forcing applications closed must be false. **It is not.** A/B against this VM, same
+  test, same clean starting session, one variable:
+
+  | command | slice-7 leaving Notepad holding `aaa` (what it did at the time) |
+  |---|---|
+  | `shutdown /l /f` | teardown signs out, 63 s |
+  | `shutdown /l` | teardown **blocked** on Notepad's *"save changes?"* prompt, 150 s |
+
+  The full-suite runs agree at the other scale: 15/15 with the flag, and a failure at
+  exactly that test without it. So the `/f` force-closes an application holding unsaved
+  work before it can veto the sign-out. Same discipline as [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)
+  one layer out — **for what a real system does, the real system is the authority** — and
+  the reason it is knowable at all is the PPM the teardown dumps on timeout: it showed
+  Notepad's *own* save dialog, not the *"close N apps and sign out"* screen #182 had
+  trained everyone to expect. Two different modals, two different causes, and only the
+  screenshot tells them apart.
+
+  **The obvious alternative was tried and the VM priced it.** #198 briefly removed the
+  veto instead of forcing past it — slice-7 launching a console and closing it with `exit`,
+  so nothing in the suite would hold unsaved work at all. It cost an assertion nothing else
+  can make: a console's client area carries the **same arrow as the desktop**, so the
+  server never pushes a *decoded* pointer shape and slice-7's `shapes >= 1` (issue #41) saw
+  60 cursor events without a single `Set`. The I-beam over Notepad's edit area is the only
+  surface in this suite that produces one. So the unsaved buffer stays and the `/f` handles
+  it, which also keeps the A/B above reproducible from the suite as it stands.
+  Worth keeping as a shape: **"remove the hazard" and "handle the hazard" are not
+  interchangeable when the hazard is also carrying a proof.** The console looked strictly
+  safer right up to the point where a real server was asked.
 - **32-bit guards need an i686 run** that no CI job performs — the class closed in
   #151/#155 is provable only on a target the gate does not build.
 - No captured-stream replay harness exists for the connect sequence: a VM run is the

@@ -203,6 +203,60 @@ These cost real time to find. Bake them into the design from day one.
   CredSSP"). CredSSP/NLA works fine over **TLS 1.3** against this VM — no TLS-version pin needed.
 - **`write` is not cancel-safe** in an async session loop (ironrdp's `Framed::write_all`):
   interrupting a partial write and retrying duplicates bytes. `read_pdu` IS cancel-safe.
+- **This server answers a Shutdown Request PDU with Shutdown Denied — on a *clean* desktop**
+  (#198, probed 2026-08-19; `pduType2` 0x24 out, 0x25 back, session alive for the full 30 s
+  observation). §V.3 below already guessed *"Denied (typical)"* and it is now measured, with
+  the condition the spec pages leave unstated pinned down on the receive side: **no** open
+  application, **no** unsaved work, and it is still refused. So the PDU is a real protocol gap
+  worth closing on its own merits (§6b), and it is **not** a way to end a session — anything
+  that needs the session *gone* must still sign out from inside it.
+- **`shutdown /l /f` force-closes an app holding unsaved work, and the documentation says it
+  cannot.** Microsoft's `shutdown` reference: *"The /l parameter works independently and can't
+  be combined with any other parameters. Attempts to combine /l with any other parameter is
+  ignored."* Measured A/B on this VM (#198), same test, same clean start, one variable:
+  `shutdown /l /f` signs out past Notepad's *"save changes?"* prompt in 63 s; `shutdown /l`
+  is **blocked** by it and times out at 150 s. Do not "fix" this flag on the strength of the
+  documentation — that is exactly what #198 was filed to do, and the machine disagreed.
+- **`connectionType` overrides `performanceFlags`: setting the flags to 0 does not turn the
+  wallpaper on.** Measured three ways against this VM in one probe (#198), same account, same
+  session, 15 s each:
+
+  | client config | lit pixels of 1 024 000 |
+  |---|---|
+  | `connectionType = MODEM`, `performanceFlags = 0` | 10 322 |
+  | `connectionType = LAN`, `performanceFlags = 0` | **1 023 477** |
+  | `connectionType = MODEM`, `performanceFlags = 0x7` | 11 574 |
+
+  The connection type decides and the flags are ignored, which is what FreeRDP models on the
+  client side — `freerdp_apply_connection_type` (`client/common/cmdline.c`) derives
+  `DisableWallpaper` / `DisableFullWindowDrag` / `DisableMenuAnims` **from** the connection
+  type, with MODEM setting all three. Sending `MODEM` together with `performanceFlags = 0` is
+  therefore a contradiction on the wire, and the server resolves it in favour of the
+  connection type. A comment claiming the flags turn the wallpaper back on is false.
+- **Server 2022 answers a sign-out with a modal that has a *mandatory* field, and it is
+  raised on the NEXT logon.** The Shutdown Event Tracker (*"시스템 종료 이벤트 추적기"* /
+  *"why did the computer shut down unexpectedly?"*) demands a description before its OK button
+  enables, so it cannot be cleared by a blind Enter — and because it appears at the *following*
+  logon rather than at the shutdown, one occurrence poisons every later test. Disable the
+  policy on any VM this suite drives: **`ShutdownReason`** ("Display Shutdown Event Tracker"),
+  key `HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Reliability`, value `ShutdownReasonOn`
+  = 0 (verified against `C:\Windows\PolicyDefinitions\Reliability.admx`, not inferred).
+- **Driving Windows by synthesised keystrokes is open-loop, and the fix is already in hand.**
+  Every failure #198 tabulates is the harness typing into something other than what it assumed
+  was on screen. We are the RDP client, so the *screen* is the acknowledgement: a Start click
+  that opened the menu repaints and one that landed on a shell still loading does not. Wait for
+  the repaint and re-click, rather than sleeping a fixed interval and hoping. The specific way
+  this bit: *"the frame count stopped changing"* is trivially true of `0 == 0`, so a settle loop
+  written without a `> 0` guard falls straight through **before the first frame ever arrives**.
+- **"It started drawing" and "it finished drawing" are different acknowledgements, and typing on
+  the first one loses the leading character.** A Start click's *first* frame means the menu began
+  opening; type then and Windows drops the first keystroke — measured, the search box read
+  `hutdown /l /f`, Windows answered *"no results"*, the command never ran, and the harness found
+  out 150 s later from a screenshot. Wait for the repaint to **quiesce**, not to start, before
+  every typed step — and again before the Enter that commits whichever result is highlighted.
+  Worth stating because it is what the blind `sleep(2s)` this replaced happened to cover: a fixed
+  sleep is not wrong about everything, it is *unfalsifiable* — it covered this and missed the cold
+  logon, and the code said which for neither.
 
 ---
 
@@ -330,6 +384,11 @@ advertise X, the server silently never offers Y. Capture every such coupling up 
 - [ ] **M** — Server-initiated disconnect reasons: MCS Disconnect Provider Ultimatum + Set Error Info PDU (typed, 80+ codes) vs abrupt EOF. *ironrdp ref: ironrdp-pdu/rdp/server_error_info.rs, session/x224.*
 - [ ] **M** — Error classification in-session (decode vs protocol vs I/O vs decompression; unknown PDU = warn+continue, decompression fail = fatal).
 - [ ] **O** — Graceful Shutdown Request/Denied (then MCS ultimatum). *session/active_stage.rs.*
+      `PDUTYPE2_SHUTDOWN_REQUEST` = 36 / `PDUTYPE2_SHUTDOWN_DENIED` = 37, both bodyless (the
+      Share Data header *is* the PDU). **FreeRDP's client never sends one** — only its server
+      side names the request, and `rdp_recv_server_shutdown_denied_pdu` is a bare `return TRUE`
+      — so IronRDP's `ActiveStage::graceful_shutdown` is the sole reference for the send side.
+      Measured against the VM in #198: it answers Denied even with nothing open (§0).
 - [ ] **O** — Refresh Rect PDU (redraw regions after unobscure). *rdp/refresh_rectangle.rs.*
 - [ ] **O** — Suppress Output PDU (pause graphics when minimized). *rdp/suppress_output.rs.*
 - [ ] **O** — Auto-Reconnect Cookie (server cookie at logon → resume on reconnect). *rdp/session_info/logon_extended.rs.*
@@ -1532,7 +1591,7 @@ The existing `tests/integration_real_vm.rs` pattern is the **proven methodology*
 - [ ] **M — Desktop-size negotiation in-session.** Current test asserts `session-active` + at least one `FrameUpdate` + Display Control resize. Expand this to: (a) connect at default desktop size, (b) request via Display Control to a new size, (c) assert DeactivateAll fires, (d) assert reactivation runs to completion, (e) assert new desktop size is reported in the size sink. *This is already in the PoC;* formalize it as M.
 - [ ] **M — Input path smoke test (keyboard + mouse + click).** Send a key-press, pointer-move, and click; assert the session survives (no disconnect). *Already in the PoC (lines 243–270).* Formalize as M; extend to test each input type (KeyboardScancode, MouseX, relative-mouse if `MOUSE_RELATIVE` is negotiated).
 - [ ] **M — Per-Windows-version test matrix.** Run the integration test harness against **workgroup**: Windows Server 2016/2019/2022 + Win10/11, and **AD-joined** (if KDC available): 2019/2022 with Kerberos. Document each run's (Server, Negotiated Security, Desktop Size, Codec, any errors) in a table (see V.5 below). *Spec: none.* **Your work:** coordinate with test-VM ops to spin up the matrix; CI/CD can be later.
-- [ ] **O — Graceful disconnect validation.** Send Graceful Shutdown Request; assert the server replies with Shutdown Denied (typical) or Shutdown Complete; then MCS ultimatum; assert session ends cleanly with no decode errors. *ironrdp ref: session/active_stage.rs (graceful_shutdown_sequence).* Low risk; can defer.
+- [ ] **O — Graceful disconnect validation.** Send Graceful Shutdown Request; assert the server replies with Shutdown Denied (typical) or Shutdown Complete; then MCS ultimatum; assert session ends cleanly with no decode errors. *ironrdp ref: session/active_stage.rs (graceful_shutdown_sequence).* Low risk; can defer. **The "(typical)" is now measured, not guessed** — #198 probed this VM and got Denied on a clean desktop (§0), so this slice's assertion is known before it is written, and the Shutdown-Complete branch has no server here to exercise it.
 
 ### V.4. Codec fuzzing (untrusted server input)
 
