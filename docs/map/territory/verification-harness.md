@@ -103,13 +103,20 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   targets" until #200, having been written when that was true and left alone when
   `progressive` landed: a *count* is a hand-kept list with one entry, and it rots the
   same way.
-- **The two derivations match by name, and #203 found a name that lies.** `pointer` and `rfx`
-  appear in both lists, so both read as covered; both targets drive `justrdp-codecs`, and the
-  identically-named `justrdp-pdu` modules are different code. `rfx` is covered anyway (the codec
-  calls the PDU parser), `pointer` is not — `decode_pointer` takes dimensions and masks already
-  parsed, so the `TS_POINTERATTRIBUTE` header parse behind them is driven by nothing. Same shape
-  as the count above one level up: the roster answers *"is there a file called X"* and the
-  question is *"is this function driven"*.
+- **The two derivations match by name, and #203 found a name that lies — then #230 found the
+  form with no tell.** `pointer` and `rfx` appear in both lists, so both read as covered; both
+  targets drive `justrdp-codecs`, and the identically-named `justrdp-pdu` modules are different
+  code. `rfx` is covered anyway (the codec calls the PDU parser), `pointer` is not —
+  `decode_pointer` takes dimensions and masks already parsed, so the `TS_POINTERATTRIBUTE` header
+  parse behind them is driven by nothing. Same shape as the count above one level up: the roster
+  answers *"is there a file called X"* and the question is *"is this function driven"*.
+  **`license` is the harder case, and it is the one to remember**: same crate, same module, no
+  twin to be suspicious of, and four of its five live-path parsers had neither artifact because
+  the target and the property both named `ServerLicenseRequest::decode`, which calls none of
+  them. #230 closed `pointer`, `client_info` and `license`; the enumeration and the mechanical
+  cross-reference that finds the next one are
+  **owned by** [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md),
+  not copied here.
 - **A capture is a seed only if something else reads it.** #203's Connect-Response fixture is
   the `gcc`/`mcs` seed corpus *and* is asserted by `justrdp-pdu/tests/real_server_connect.rs` in
   the stable gate, because the lane that consumes it is nightly and would report a stale fixture

@@ -403,6 +403,39 @@ impl ClientInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008 / issue #230. `decode_basic_security_header` is a `pub fn` over server bytes on
+        // the live path — `justrdp/src/connect.rs:854` hands it the raw MCS user data of every
+        // licensing message — and it carried neither a property nor a fuzz target, having simply
+        // not been in the uncovered list the untrusted-decode invariant derived.
+        //
+        // It is the shallowest parser in this crate: two bounds-checked `read_u16_le`s and no
+        // length, count or offset arithmetic, so it is total by inspection. The property is here
+        // anyway because "total by inspection" is a claim about today's body, and this keeps
+        // holding it over an input space no vector covers — measured by mutation: replacing
+        // either `read_u16_le()?` with an unchecked read turns this red.
+        //
+        // It is **not** the only thing holding it, and an earlier revision of this comment said
+        // it was. `truncated_input_is_a_typed_error_not_a_panic` below predates this property and
+        // goes red on the identical mutation, because it cuts the encoded buffer at 0 and 3 bytes
+        // — which is exactly the short header. What this adds over that test is the space between
+        // and beyond those two lengths, not the first line of defence.
+        //
+        // For the same reason it gets no fuzz target of its own; it is driven inside
+        // `fuzz/fuzz_targets/licensing.rs`, which starts where its only live caller does. A
+        // 4-byte total parser given its own lane job would idle through a 300s budget.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn decode_basic_security_header_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&body, "proptest basic security header");
+            let _ = decode_basic_security_header(&mut cur);
+        }
+    }
 
     fn client_info() -> ClientInfo {
         ClientInfo {

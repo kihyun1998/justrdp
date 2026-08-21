@@ -52,6 +52,10 @@ decision of its own. That inference has never been written down as a record.
   — `differential_license_crypto` is this territory's *only* proof, and it compares
   against a codebase sharing this project's lineage. The VM cannot supplement it: it
   has no licensing server.
+- [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) — every
+  message here is server-supplied, and #230 found four of the five parsers driven by neither
+  artifact while the module read as covered. Listed only from that issue onward: the omission
+  is why it read as covered.
 
 ## Blast radius
 

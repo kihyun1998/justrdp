@@ -83,6 +83,41 @@ mod tests {
         ) {
             let _ = decode(&buf);
         }
+
+        // `frame_len` is a *second* parse of the same four bytes, not a helper `decode` calls, and
+        // #230's completeness pass found it carrying neither artifact. The two disagree in shape
+        // where it matters -- `decode` rejects a short frame with `checked_sub`, this one with an
+        // explicit `total < HEADER_LEN` -- so a property on `decode` says nothing about it. It is
+        // also the more-reached of the pair: `justrdp/src/session.rs:254` and `connect.rs:555`
+        // call it on *every* frame to size `&rest[..frame_len]`, before `decode` sees anything.
+        //
+        // `frame_len_peeks_total_length_without_needing_the_payload` below already pins the
+        // truncated-header case (measured: an unchecked read here turns that test red), so this is
+        // not the first line of defence -- it is the input space between and beyond the three
+        // vectors that test names.
+        //
+        // The generator is weighted rather than undirected, and that is measured rather than
+        // stylistic: with plain `vec(any::<u8>(), 0..=512)` this property caught an unchecked
+        // length read in **0 of 3** runs. `buf[0]` has to be the `VERSION` byte (1/256) *and* the
+        // buffer has to end mid-header, which random bytes of a random length essentially never
+        // do together. The `any::<u8>()` version arm keeps the reject branch driven.
+        #[test]
+        fn frame_len_never_panics_on_arbitrary_input(
+            version in prop_oneof![3 => Just(VERSION), 1 => any::<u8>()],
+            reserved in any::<u8>(),
+            total in any::<u16>(),
+            tail in proptest::collection::vec(any::<u8>(), 0..=64),
+            truncate_to in prop_oneof![3 => Just(usize::MAX), 2 => 0usize..=6],
+        ) {
+            let mut buf = vec![version, reserved];
+            buf.extend_from_slice(&total.to_be_bytes());
+            buf.extend_from_slice(&tail);
+            buf.truncate(truncate_to);
+            let _ = frame_len(&buf);
+            // `decode` re-parses the same four bytes with different arithmetic, so it costs
+            // nothing to hand it the shapes this strategy reaches.
+            let _ = decode(&buf);
+        }
     }
 
     #[test]

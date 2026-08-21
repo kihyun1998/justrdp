@@ -176,6 +176,189 @@ mod tests {
     use super::*;
     use crate::DecodeError;
     use crate::cursor::ReadCursor;
+    use proptest::prelude::*;
+
+    // ADR-0008 / issue #230 — the no-panic robustness properties for this module. Both entry
+    // points are `pub fn`s the session loop drives straight off server bytes
+    // (`justrdp/src/session.rs:374` fast-path, `:554` slow-path) and neither carried a property or
+    // a fuzz target until now: `fuzz/fuzz_targets/pointer.rs` targets
+    // `justrdp_codecs::pointer::decode_pointer`, which takes `width`/`height`/`xor_bpp` and both
+    // masks *already parsed*, so the `TS_*POINTERATTRIBUTE` header parse that produces them was
+    // driven by nothing. Same module name, different code — see
+    // `docs/map/invariant/untrusted-decode-never-panics.md`.
+    //
+    // ## Why the generators are structured, which is measured rather than stylistic
+    //
+    // The attacker-controlled arithmetic lives in `ColorPointerAttribute::decode`: two `u16`
+    // length fields size the slices the codec then walks, and nothing on the wire makes them
+    // agree with `width`/`height`. **Undirected bytes do not reach it.** A first version of these
+    // properties generated `vec(any::<u8>(), 0..=512)` and was green over an out-of-bounds read
+    // injected into the AND-mask `read_slice` — while `malformed_pointers_are_typed_errors`, the
+    // hand-written test beside it, went red on the same mutation.
+    //
+    // The reason is arithmetic, and it differs per entry point rather than being one number for
+    // all three. Both dimensions must land inside the 96-pixel cap — (97/65536)^2, about 2.2e-6,
+    // which is roughly 0.45% of a 2048-case run — and `decode_slowpath` additionally needs
+    // `messageType` on one of two values, taking it to about **6.7e-11** per case. So the slow
+    // path could not reach the masks at all and the other two reached them a few times per run,
+    // which was enough to be green on a bad day and is not a property anyone should rely on.
+    //
+    // So the header fields are **weighted** into the range the parser admits, not bounded to it:
+    // every strategy below keeps an `any::<...>()` arm, so the reject arms — an unknown
+    // `messageType`, an unknown `updateCode`, an over-cap dimension — stay driven. A generator
+    // bounded to what the parser accepts would assert the parser rather than the function under
+    // test, which is the mirror-image failure #211 measured in `nscodec`'s property.
+    //
+    // **Weighting is something you add, never something you substitute**, and the first version
+    // of this block got that wrong in the other direction: replacing the unstructured body with a
+    // structured one made the deep reads reachable and the shallow ones unreachable. See
+    // `truncate_to` on the slow-path property below for the read that cost.
+    /// The five `messageType`s `decode_slowpath` dispatches, weighted against arbitrary values.
+    fn slowpath_message_type() -> impl Strategy<Value = u16> {
+        prop_oneof![
+            5 => proptest::sample::select(vec![
+                PTRMSGTYPE_SYSTEM,
+                PTRMSGTYPE_POSITION,
+                PTRMSGTYPE_COLOR,
+                PTRMSGTYPE_CACHED,
+                PTRMSGTYPE_POINTER,
+            ]),
+            1 => any::<u16>(),
+        ]
+    }
+
+    /// The six `updateCode`s the session loop dispatches into this module
+    /// (`justrdp/src/session.rs:368`), weighted against arbitrary bytes.
+    fn pointer_update_code() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            6 => proptest::sample::select(vec![
+                crate::fastpath::FP_UPDATE_PTR_NULL,
+                crate::fastpath::FP_UPDATE_PTR_DEFAULT,
+                crate::fastpath::FP_UPDATE_PTR_POSITION,
+                crate::fastpath::FP_UPDATE_COLOR_POINTER,
+                crate::fastpath::FP_UPDATE_CACHED_POINTER,
+                crate::fastpath::FP_UPDATE_NEW_POINTER,
+            ]),
+            1 => any::<u8>(),
+        ]
+    }
+
+    /// A mask length: weighted into the neighbourhood of how many bytes the generator below
+    /// actually appends, against a fully arbitrary `u16`.
+    ///
+    /// The arbitrary arm alone leaves the *second* read thinly covered, and the difference is
+    /// measured. `lengthXorMask` is read first, so an arbitrary `u16` (mean 32768) against a tail
+    /// of at most 512 bytes errors before the AND read in almost every case. Injecting an
+    /// out-of-bounds read into the AND mask, three runs each with the rebuild verified:
+    ///
+    /// | | `decode_fastpath` red | `decode_slowpath` red | attribute property red |
+    /// |---|---|---|---|
+    /// | arbitrary length only | **1 of 3** | 3 of 3 | 3 of 3 |
+    /// | weighted (this fn) | 3 of 3 | 3 of 3 | 3 of 3 |
+    ///
+    /// So the effect is flaky-to-reliable rather than green-to-red, which is worth stating
+    /// precisely: an earlier revision of this comment claimed the entry-point properties were
+    /// *green* without the weighting, and that number came from a mutation harness whose rebuild
+    /// had been skipped (`lessons.md` §Step 3, the #189 trap). Two sequential reads from one
+    /// hostile-length family still need satisfiable lengths, or the second one is only reached by
+    /// accident.
+    fn mask_length() -> impl Strategy<Value = u16> {
+        prop_oneof![
+            1 => 0u16..=600,
+            1 => any::<u16>(),
+        ]
+    }
+
+    /// `TS_COLORPOINTERATTRIBUTE` bytes with the header weighted into the admitted range and the
+    /// two length fields hostile — nothing here makes `lengthXorMask` / `lengthAndMask` agree with
+    /// the dimensions, with each other, or with how many bytes follow.
+    fn color_pointer_attribute_bytes() -> impl Strategy<Value = Vec<u8>> {
+        (
+            any::<u16>(),                                                      // cacheIndex
+            (any::<u16>(), any::<u16>()),                                      // hotSpot
+            prop_oneof![4 => 0u16..=MAX_POINTER_DIMENSION, 1 => any::<u16>()], // width
+            prop_oneof![4 => 0u16..=MAX_POINTER_DIMENSION, 1 => any::<u16>()], // height
+            (mask_length(), mask_length()), // lengthAndMask, lengthXorMask
+            proptest::collection::vec(any::<u8>(), 0..=512), // the mask bytes, however many
+        )
+            .prop_map(|(cache_index, hot, width, height, lengths, masks)| {
+                let mut out = Vec::with_capacity(14 + masks.len());
+                for v in [
+                    cache_index,
+                    hot.0,
+                    hot.1,
+                    width,
+                    height,
+                    lengths.0,
+                    lengths.1,
+                ] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out.extend_from_slice(&masks);
+                out
+            })
+    }
+
+    /// A message body for either entry point: unstructured bytes, a shape attribute, or a `u16`
+    /// `xorBpp` in front of one (the New-pointer layout, whose extra field would otherwise shift
+    /// every attribute field by two bytes and put the cap back out of reach).
+    fn pointer_message_body() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            2 => proptest::collection::vec(any::<u8>(), 0..=512),
+            3 => color_pointer_attribute_bytes(),
+            3 => (any::<u16>(), color_pointer_attribute_bytes()).prop_map(|(bpp, attr)| {
+                let mut out = bpp.to_le_bytes().to_vec();
+                out.extend_from_slice(&attr);
+                out
+            }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        // The private shape parser, driven with no dispatch prefix at all — the same reason #203
+        // gave `gcc`'s six per-block decoders their own properties rather than only driving the
+        // root that calls them. This is the one that goes red on an injected out-of-bounds read
+        // in either mask; the two entry-point properties below reach it through their dispatch.
+        #[test]
+        fn color_pointer_attribute_decode_never_panics_on_arbitrary_input(
+            body in pointer_message_body(),
+        ) {
+            let mut cur = ReadCursor::new(&body, "proptest pointer attribute");
+            let _ = ColorPointerAttribute::decode(&mut cur);
+        }
+
+        // `truncate_to` is the correction to the correction, and it is the reason weighting is
+        // stated above as something you *add*. Prefixing every body with `messageType` and
+        // `pad2Octets` made the shape parser reachable and made a body shorter than four bytes
+        // **impossible to generate**, so the `pad2Octets` read at :116 was covered by nothing —
+        // measured, 3 runs of an unchecked read injected there, no test in this module red.
+        // `Vec::truncate` past the end is a no-op, so the `usize::MAX` arm is the ordinary case.
+        #[test]
+        fn decode_slowpath_never_panics_on_arbitrary_input(
+            message_type in slowpath_message_type(),
+            pad in any::<u16>(),
+            rest in pointer_message_body(),
+            truncate_to in prop_oneof![9 => Just(usize::MAX), 1 => 0usize..=8],
+        ) {
+            let mut body = message_type.to_le_bytes().to_vec();
+            body.extend_from_slice(&pad.to_le_bytes());
+            body.extend_from_slice(&rest);
+            body.truncate(truncate_to);
+            let mut cur = ReadCursor::new(&body, "proptest pointer slow-path");
+            let _ = PointerUpdate::decode_slowpath(&mut cur);
+        }
+
+        #[test]
+        fn decode_fastpath_never_panics_on_arbitrary_input(
+            code in pointer_update_code(),
+            body in pointer_message_body(),
+        ) {
+            let mut cur = ReadCursor::new(&body, "proptest pointer fast-path");
+            let _ = PointerUpdate::decode_fastpath(code, &mut cur);
+        }
+    }
 
     /// TS_COLORPOINTERATTRIBUTE bytes (2.2.9.1.1.4.4). Mind the trap the format is famous
     /// for: the *length* fields are AND-first, the *data* is XOR-first.

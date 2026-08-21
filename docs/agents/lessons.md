@@ -38,6 +38,18 @@ Read this before starting so the bindings do not read as abstractions.
   `justrdp::egfx::GraphicsProcessor::process` — the core. The generalisation is small and
   worth keeping: **a completeness claim inherits the scope of the list it was derived from**,
   so the question to ask a green roster is what it enumerates, not how long it is.
+- **A blocker nobody re-checked was inherited by two issues in a row (#230).** #203 and #230
+  both recorded that the `&mut ReadCursor<'_>` entry points *"have no signature to point
+  `fuzz_target!` at directly"*, and #230 named that as why #200 could not add them mechanically.
+  It is false twice over: `cursor` is a `pub mod`, and `fuzz_targets/license.rs` has built a
+  cursor inside the target since **#99**, two issues before the claim was first written. What
+  actually blocked #200 was that `gcc` and `mcs` have no single top-level `decode` — a real
+  constraint that happened to travel with the same modules and got restated as this one.
+  The cost was not a wrong implementation; it was a **wrong estimate**, carried across three
+  issues, of how hard a piece of work was. `grep` for one existing target settled it, and the
+  general rule is the one this section already states about external facts: the rationale *this
+  repo* writes is a verification target too, and a filed issue is exactly where an unre-read
+  sentence goes to be believed.
 - **CVE knowledge is a reference, not a memory** — rle/planar/clearcodec/nsc OOB
   points (memory `rdp_decoder_robustness_refs`); read them at FreeRDP source.
 
@@ -69,6 +81,55 @@ Read this before starting so the bindings do not read as abstractions.
   green is *evidence of a hole that does not exist*, which sends the next hour into writing
   a test for a case already covered.
 
+- **A no-panic property can be structurally unable to reach the arithmetic it is named after,
+  and the hand-written test beside it is what exposes that (#230).** `pointer`'s two entry-point
+  properties were written the way every other one in this repo is — `vec(any::<u8>(), 0..=512)`
+  into the `pub fn` — and both passed over an out-of-bounds read injected into the mask
+  `read_slice`, while `malformed_pointers_are_typed_errors`, four screens down the same file,
+  went red on it. Random bytes must land `messageType` on one of two values (2/65536) **and**
+  both dimensions inside the 96-pixel cap ((97/65536)²) before either mask read executes: about
+  **6.7e-11** per case against a 2048-case budget.
+  This is #211's `nscodec` finding run backwards, and the pair is the thing to remember. There a
+  generator **bounded** to the parser's range asserted the parser instead of the function; here
+  a generator too **wide** to satisfy the parser asserted the dispatch instead of the function.
+  Same worthless green from opposite directions, and the only instrument that tells either of
+  them from a real one is the mutation. The shape that works is to **weight** each header field
+  into the range the parser admits while keeping an `any::<...>()` arm on it, so the reject arms
+  stay driven — a bound with no arm is the #211 failure, an arm with no weight is this one.
+- **Two sequential reads from one hostile-length family: the first masks the second (#230).**
+  Same change, found by running the mutation twice. With both pointer mask lengths generated as
+  arbitrary `u16` (mean 32768) against a tail of at most 512 bytes, `read_slice(lengthXorMask)`
+  errors before the AND read in nearly every case, so an out-of-bounds read injected into the AND
+  mask is caught by `decode_fastpath` in **1 of 3** runs — against **3 of 3** once the length
+  strategy also emits satisfiable values. The generator needs both kinds of length, or everything
+  downstream of the first length field is reached only by accident.
+  The cheap general form: **mutate every read in the sequence, not the first one that goes red.**
+  One red is enough to claim discriminating power and not enough to know what it discriminates.
+- **Weighting a generator is something you *add*; substituting is how the shallow reads go dark
+  (#230).** Fixing the reachability problem above by replacing the undirected body with a
+  structured one made the mask arithmetic reachable and made `decode_slowpath`'s `pad2Octets`
+  read **unreachable** — every generated body now carried a 4-byte prefix, so a body too short
+  for that read could not be produced at all. Measured: an unchecked read injected there, three
+  runs, nothing in the module red. One `truncate_to` arm at 10% weight took it to 3 of 3. The
+  shape to watch for is a generator that *assembles* rather than *samples*: it can only produce
+  inputs at least as long as what it assembles.
+- **The #189 mutation-harness trap recurred, in the repo that already had the note, and it
+  fabricated a finding (#230).** A harness that mutates, tests, reverts and immediately writes
+  the next mutation lands two writes in one filesystem timestamp tick; cargo skips the rebuild
+  and the run tests unmutated code. Three numbers came out wrong: an AND-mask row that read
+  "green" is "1 of 3", a run that read 0 red is 3, and an entire finding about `license`'s
+  `MACData` bound — *"5 of 10 property-runs red, a coin flip"* — evaporated on re-measurement
+  (unweighted catches it 2 of 2, every run). A weighted generator had already been written to fix
+  it and was reverted.
+  Three things this pins beyond #189's own entry. **The guard has to be in the harness, not in
+  the operator** — knowing the note existed did not prevent it; adding `Compiling <crate>` to the
+  assertions did. **A false green does not merely cost an hour, it manufactures a hole**, and
+  work then flows toward guarding a case nobody observed — which is the same waste as #171's
+  region-union machinery, arrived at from the other direction. And **a subagent lens using the
+  same broken instrument produces confident, reproducible, wrong numbers**: the refuting lens on
+  this change reported the `license` finding at 1/5 and 3/5, and it was reproduced here before
+  anyone thought to doubt the instrument. Reproducing a lens's claim with the lens's method is
+  not verification.
 - **When the suite is already green, the discriminating power has to come from somewhere
   that is not the suite (#198).** The change made every synthesised desktop step wait for the
   server's own repaint before sending the next one — and the VM suite passed 15/15 both before
@@ -450,6 +511,21 @@ Read this before starting so the bindings do not read as abstractions.
     sitting on the live session path. Filed as #230. Same shape as #200's stale count
     one level up: the roster answers *"is there a file called X"*, the question is
     *"is this function driven"*.
+  - **#230 then found the same defect with no cross-crate tell, and it was the bigger
+    one.** `license` sits in one crate, in one module, with no twin to be suspicious of
+    — and four of its five live-path parsers had neither artifact, because the target
+    and the property both name `ServerLicenseRequest::decode`, which calls none of
+    `LicensePreamble` / `LicenseError` / `PlatformChallenge` / `NewLicense`. **ADR-0008
+    itself carried the claim** (*"the `fuzz/` lane carries libFuzzer targets for the same
+    entry points"*), which is what a false status report looks like when it reaches the
+    decision trail. Two readings worth keeping. **A same-name match across crates is
+    conspicuous and a same-name match inside one module is not**, so the cross-crate case
+    is the easy half of this family, not the representative one. And the fix is a
+    mechanical cross-reference rather than more care: list the `pub fn`s in
+    `justrdp-pdu` that `crates/justrdp/src` names, check each **by function** against the
+    properties and the targets. Run once, that census also surfaced `finalization`
+    (`Synchronize` / `Control` / `FontMap`), which no roster and no known-holes list had
+    ever mentioned.
   - **A piped gate cannot fail, and it was reproduced while checking a retraction.**
     `cargo clippy … | tail -2; echo "GATE: $?"` printed `0` over a real compile error,
     because the exit status is `tail`'s. The gate matrix already says *run each gate
