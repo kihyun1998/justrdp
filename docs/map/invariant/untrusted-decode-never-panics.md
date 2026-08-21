@@ -211,7 +211,11 @@ parser, and #211 found two such consumers panicking. The test for that class is 
 parse" but **"does its signature admit a value the arithmetic has no meaning for"** — which a
 plain `pub` field or a bare `u8` parameter always does, whatever the parser guarantees.
 [ADR-0012](../../adr/0012-consumption-site-totality.md) owns that class; what belongs here is
-that neither command below can see it.
+that neither command below can see it. The class has a third known member and no enumeration:
+`justrdp_codecs::color::to_rgba` sizes two buffers from wire dimensions across the same crate
+boundary, and #230's refuting lens found it with neither artifact — **#238**, filed with the
+scoping question attached, because a property on one function does not answer what ADR-0012
+asks.
 
 Two derivations, and the gap between them is the finding:
 
