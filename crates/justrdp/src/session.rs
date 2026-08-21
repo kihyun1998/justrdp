@@ -1441,7 +1441,7 @@ mod tests {
         };
         let px = frame_pixels(&sm, frame);
         assert_eq!(&px[..4], &[255, 0, 0, 255]);
-        assert!(px.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+        assert!(px.as_chunks::<4>().0.iter().all(|p| *p == [255, 0, 0, 255]));
     }
 
     #[test]

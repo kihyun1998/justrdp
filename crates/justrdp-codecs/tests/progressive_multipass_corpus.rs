@@ -240,7 +240,9 @@ fn replay(entries: &[Entry], per_context: bool) -> Replay {
                         // is true of every successful decode and measures nothing. The RGB
                         // channels are the ones that can be black.
                         if rgba
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .any(|px| px[..3].iter().any(|&b| b != 0))
                         {
                             out.non_black_tiles += 1;

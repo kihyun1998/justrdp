@@ -100,8 +100,10 @@ impl Canvas {
 
     fn pixels_differing_from(&self, other: &Canvas) -> usize {
         self.rgba
-            .chunks_exact(4)
-            .zip(other.rgba.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(other.rgba.as_chunks::<4>().0)
             .filter(|(a, b)| a != b)
             .count()
     }
@@ -270,7 +272,9 @@ fn the_whole_session_assembles_without_rejecting_a_tile() {
     // clipping bug breaks. Alpha is unconditionally 255, so RGB is what can be black.
     let lit = canvas
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[..3].iter().any(|&b| b != 0))
         .count();
     assert!(
@@ -338,7 +342,7 @@ fn clipping_to_the_region_rects_changes_the_picture_not_only_the_dirty_rect() {
     // is what rules out "the clipped run simply painted less".
     for canvas in [&clipped, &unclipped] {
         assert!(
-            canvas.rgba.chunks_exact(4).all(|px| px[3] == 255),
+            canvas.rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 255),
             "every pixel of the surface is painted under both policies"
         );
     }

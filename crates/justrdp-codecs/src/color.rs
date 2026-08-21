@@ -137,7 +137,7 @@ pub fn to_rgba(
                 }
             }
             15 => {
-                for px in row.chunks_exact(2) {
+                for px in row.as_chunks::<2>().0 {
                     let v = u16::from_le_bytes([px[0], px[1]]);
                     let r = scale5((v >> 10) as u8 & 0x1F);
                     let g = scale5((v >> 5) as u8 & 0x1F);
@@ -146,7 +146,7 @@ pub fn to_rgba(
                 }
             }
             16 => {
-                for px in row.chunks_exact(2) {
+                for px in row.as_chunks::<2>().0 {
                     let v = u16::from_le_bytes([px[0], px[1]]);
                     let r = scale5((v >> 11) as u8 & 0x1F);
                     let g = scale6((v >> 5) as u8 & 0x3F);
@@ -155,12 +155,12 @@ pub fn to_rgba(
                 }
             }
             24 => {
-                for px in row.chunks_exact(3) {
+                for px in row.as_chunks::<3>().0 {
                     out.extend_from_slice(&[px[2], px[1], px[0], 255]);
                 }
             }
             32 => {
-                for px in row.chunks_exact(4) {
+                for px in row.as_chunks::<4>().0 {
                     out.extend_from_slice(&[px[2], px[1], px[0], 255]);
                 }
             }
@@ -206,7 +206,7 @@ pub fn rfx_ycbcr_to_rgba(y: &[i16], cb: &[i16], cr: &[i16], out: &mut [u8]) {
         .iter()
         .zip(cb.iter())
         .zip(cr.iter())
-        .zip(out.chunks_exact_mut(4))
+        .zip(out.as_chunks_mut::<4>().0)
     {
         let yy = (i64::from(y) + 4096) * PRECISION;
         px[0] = clamp8(yy + CR_R * i64::from(cr));

@@ -209,7 +209,9 @@ fn rdp6_planar_decodes_ironrdp_encoder_output_identically() {
         // channel order of each API.
         let ours = planar::decompress(stream, width, height).expect("ours decodes the stream");
         let ours_as_rgb: Vec<u8> = ours
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|bgr| [bgr[2], bgr[1], bgr[0]])
             .collect();
         assert_eq!(
@@ -266,7 +268,9 @@ fn rdp6_aycocg_variants_match_the_oracle_decoder() {
             .expect("oracle decodes the AYCoCg stream");
         let ours = planar::decompress(&stream, width, height).expect("ours decodes it too");
         let ours_as_rgb: Vec<u8> = ours
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|bgr| [bgr[2], bgr[1], bgr[0]])
             .collect();
         assert_eq!(

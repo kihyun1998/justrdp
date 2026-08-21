@@ -240,10 +240,8 @@ fn read_utf16_padded(cur: &mut ReadCursor<'_>, total: usize) -> Result<String, D
 
 /// Decode UTF-16LE bytes up to the first null unit.
 fn utf16_string(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    let (pairs, _odd_trailing_byte) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
     let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
     String::from_utf16_lossy(&units[..end])
 }
