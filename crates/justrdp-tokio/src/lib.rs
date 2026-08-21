@@ -2282,7 +2282,9 @@ mod tests {
                         .decode_bitmap_stream_to_rgb24(&rect.data, &mut theirs, w, h)
                         .unwrap_or_else(|e| panic!("rect {i}: oracle failed: {e:?}"));
                     let ours_rgb: Vec<u8> = ours
-                        .chunks_exact(3)
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
                         .flat_map(|bgr| [bgr[2], bgr[1], bgr[0]])
                         .collect();
                     assert_eq!(ours_rgb, theirs, "rect {i} ({w}x{h} planar) diverged");
@@ -2401,7 +2403,7 @@ mod tests {
 
             // Monochrome output would mean the decode silently produced garbage.
             let mut distinct = std::collections::HashSet::new();
-            for px in fb.pixels().chunks_exact(4) {
+            for px in fb.pixels().as_chunks::<4>().0 {
                 distinct.insert([px[0], px[1], px[2]]);
                 if distinct.len() > 16 {
                     break;
@@ -2416,7 +2418,7 @@ mod tests {
             // Visual confirmation artifact (open with any image viewer).
             let path = std::env::temp_dir().join("justrdp-slice6-first-frame.ppm");
             let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-            for px in fb.pixels().chunks_exact(4) {
+            for px in fb.pixels().as_chunks::<4>().0 {
                 ppm.extend_from_slice(&px[..3]);
             }
             std::fs::write(&path, ppm).expect("write the visual dump");
@@ -2612,7 +2614,9 @@ mod tests {
         /// every one: a 1280x800 scan is ~1 ms.
         pub(super) fn lit_pixels(fb: &Framebuffer) -> usize {
             fb.pixels()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|px| px[..3].iter().any(|&b| b != 0))
                 .count()
         }
@@ -2936,7 +2940,7 @@ mod tests {
                             .replace("::", "-")
                     ));
                     let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-                    for px in fb.pixels().chunks_exact(4) {
+                    for px in fb.pixels().as_chunks::<4>().0 {
                         ppm.extend_from_slice(&px[..3]);
                     }
                     let _ = std::fs::write(&path, ppm);
@@ -3557,7 +3561,7 @@ mod tests {
 
             // Monochrome output would mean the tile decode silently produced garbage.
             let mut distinct = std::collections::HashSet::new();
-            for px in fb.pixels().chunks_exact(4) {
+            for px in fb.pixels().as_chunks::<4>().0 {
                 distinct.insert([px[0], px[1], px[2]]);
                 if distinct.len() > 16 {
                     break;
@@ -3571,7 +3575,7 @@ mod tests {
 
             let path = std::env::temp_dir().join("justrdp-slice9-egfx-frame.ppm");
             let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-            for px in fb.pixels().chunks_exact(4) {
+            for px in fb.pixels().as_chunks::<4>().0 {
                 ppm.extend_from_slice(&px[..3]);
             }
             std::fs::write(&path, ppm).expect("write the visual dump");
@@ -4563,11 +4567,11 @@ mod tests {
             // surface, so both are checked: neither alone rules the other out.
             let total = (canvas_w * canvas_h) as u64;
             let lit = canvas
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .filter(|px| px[..3].iter().any(|&b| b != 0))
                 .count() as u64;
             let mut distinct = std::collections::HashSet::new();
-            for px in canvas.chunks_exact(4) {
+            for px in canvas.as_chunks::<4>().0 {
                 distinct.insert([px[0], px[1], px[2]]);
                 if distinct.len() > 64 {
                     break;
@@ -4588,7 +4592,7 @@ mod tests {
             let fb = machine.framebuffer();
             let (fw, fh) = (usize::from(fb.width()), usize::from(fb.height()));
             let mut live_distinct = std::collections::HashSet::new();
-            for px in fb.pixels().chunks_exact(4) {
+            for px in fb.pixels().as_chunks::<4>().0 {
                 live_distinct.insert([px[0], px[1], px[2]]);
                 if live_distinct.len() > 64 {
                     break;
@@ -4633,7 +4637,7 @@ mod tests {
             let total_px = u64::from(fb.width()) * u64::from(fb.height());
             let lit_px = fb
                 .pixels()
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .filter(|px| px[..3].iter().any(|&b| b != 0))
                 .count() as u64;
             eprintln!("  live framebuffer: lit={lit_px} of {total_px}px");
@@ -4673,7 +4677,7 @@ mod tests {
             // two diagnoses in this issue alone.
             let live_path = std::env::temp_dir().join("justrdp-172-live-framebuffer.ppm");
             let mut live_ppm = format!("P6\n{fw} {fh}\n255\n").into_bytes();
-            for px in fb.pixels().chunks_exact(4) {
+            for px in fb.pixels().as_chunks::<4>().0 {
                 live_ppm.extend_from_slice(&px[..3]);
             }
             std::fs::write(&live_path, live_ppm).expect("write the live dump");
@@ -4688,7 +4692,7 @@ mod tests {
 
             let path = std::env::temp_dir().join("justrdp-171-progressive-assembly.ppm");
             let mut ppm = format!("P6\n{canvas_w} {canvas_h}\n255\n").into_bytes();
-            for px in canvas.chunks_exact(4) {
+            for px in canvas.as_chunks::<4>().0 {
                 ppm.extend_from_slice(&px[..3]);
             }
             std::fs::write(&path, ppm).expect("write the visual dump");
@@ -4991,7 +4995,7 @@ mod tests {
                 let fb = machine.framebuffer();
                 let path = std::env::temp_dir().join("justrdp-issue42-timeout.ppm");
                 let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-                for px in fb.pixels().chunks_exact(4) {
+                for px in fb.pixels().as_chunks::<4>().0 {
                     ppm.extend_from_slice(&px[..3]);
                 }
                 std::fs::write(&path, ppm).expect("write the visual dump");
@@ -5369,7 +5373,7 @@ mod tests {
             let fb = machine.framebuffer();
             let path = std::env::temp_dir().join("justrdp-slice7-input.ppm");
             let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-            for px in fb.pixels().chunks_exact(4) {
+            for px in fb.pixels().as_chunks::<4>().0 {
                 ppm.extend_from_slice(&px[..3]);
             }
             std::fs::write(&path, ppm).expect("write the visual dump");

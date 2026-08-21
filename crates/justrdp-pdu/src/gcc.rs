@@ -238,10 +238,8 @@ fn put_utf16_fixed(out: &mut Vec<u8>, s: &str, total: usize) {
 /// Read a fixed UTF-16LE field of `total` bytes, trimming trailing nulls.
 fn read_utf16_fixed(cur: &mut ReadCursor<'_>, total: usize) -> Result<String, DecodeError> {
     let bytes = cur.read_slice(total)?;
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    let (pairs, _odd_trailing_byte) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
     let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
     Ok(String::from_utf16_lossy(&units[..end]))
 }

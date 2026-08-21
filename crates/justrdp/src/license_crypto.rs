@@ -43,7 +43,7 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
     let (mut a0, mut b0, mut c0, mut d0) =
         (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
 
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
             *w = u32::from_le_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
@@ -93,7 +93,7 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
 
     let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
 
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());

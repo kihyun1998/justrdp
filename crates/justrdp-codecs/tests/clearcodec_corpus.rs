@@ -85,7 +85,9 @@ fn self_owned_replays_full_capture_without_error() {
             "entry {i} decoded to the wrong BGRA size"
         );
         nonblack_total += out
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
             .count();
     }

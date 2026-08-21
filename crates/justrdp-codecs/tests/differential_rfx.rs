@@ -520,7 +520,7 @@ fn build_stream(
 fn reference_decode(data: &[u8], w: usize, h: usize) -> Vec<u8> {
     use oracle_rfx::{Block, CodecChannel};
     let mut out = vec![0u8; w * h * 4];
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         px[3] = 255;
     }
     let mut cursor = ReadCursor::new(data);

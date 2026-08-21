@@ -143,7 +143,10 @@ impl Surface {
         let stride = usize::from(self.width) * 4;
         for row in 0..usize::from(h) {
             let off = (usize::from(y) + row) * stride + usize::from(x) * 4;
-            for px in self.rgba[off..off + usize::from(w) * 4].chunks_exact_mut(4) {
+            for px in self.rgba[off..off + usize::from(w) * 4]
+                .as_chunks_mut::<4>()
+                .0
+            {
                 px.copy_from_slice(&rgba);
             }
         }
@@ -992,7 +995,12 @@ mod tests {
                 height: 2,
             },
         );
-        assert!(fill.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+        assert!(
+            fill.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [255, 0, 0, 255])
+        );
     }
 
     #[test]
@@ -1083,7 +1091,7 @@ mod tests {
                 height: 2,
             },
         );
-        assert!(px.chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
+        assert!(px.as_chunks::<4>().0.iter().all(|p| *p == [0, 255, 0, 255]));
         // Evict frees the budget.
         feed(&mut p, egfx::CMDID_EVICT_CACHE_ENTRY, &5u16.to_le_bytes());
         assert_eq!(p.cache_bytes, 0);
@@ -1231,7 +1239,11 @@ mod tests {
             },
         );
         assert!(
-            pixels.chunks_exact(4).all(|p| p == [128, 128, 128, 255]),
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [128, 128, 128, 255]),
             "zero spectrum must decode to mid gray, got {:?}…",
             &pixels[..8]
         );

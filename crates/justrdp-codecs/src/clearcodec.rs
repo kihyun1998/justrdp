@@ -1176,7 +1176,7 @@ mod tests {
         let bitmap = vec![1, 10, 20, 30, 0x00, 2];
         let mut out = vec![0u8; 3 * 4];
         assert!(decode_rlex_region(&bitmap, &mut out, 0, 0, 3, 1, 3).is_ok());
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             assert_eq!(px, &[10, 20, 30, 0xFF]);
         }
     }

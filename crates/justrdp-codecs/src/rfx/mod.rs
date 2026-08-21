@@ -176,7 +176,7 @@ impl Default for TilePlanes {
 
 fn opaque_black(w: usize, h: usize) -> Vec<u8> {
     let mut out = vec![0u8; w * h * 4];
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         px[3] = 255;
     }
     out
