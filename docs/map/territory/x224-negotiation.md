@@ -55,7 +55,9 @@ on has never been written down for this territory.
 
 ## Cross-cutting invariants
 
-**None.**
+- [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) — `x224` and `nego` carry both artifacts since #200. The edge is drawn by #237 because it was
+  missing, not because anything here is uncovered — this section read **None.** while the
+  territory parsed the connect sequence's first server bytes.
 
 ## Blast radius
 

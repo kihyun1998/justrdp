@@ -57,6 +57,13 @@ with no pinned FreeRDP citation to check them against.
 
 ## Cross-cutting invariants
 
+- [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) — every PDU
+  this territory parses is server-supplied: the Demand Active capability walk, the Share
+  headers, and the three finalization replies. **Listed only from #237 onward, and the
+  omission is the finding**: `finalization`'s three parsers had neither artifact and appeared
+  in no uncovered list either, because this edge was the one place a reader would have been
+  sent from. `check_map.py`'s reciprocity gate cannot catch that — it verifies that the edges
+  which *exist* run both ways.
 - [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
   — this territory builds the advertised config, so it is where a capture's coverage is
   decided, one connect sequence before anything is observed.

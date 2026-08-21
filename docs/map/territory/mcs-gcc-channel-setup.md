@@ -58,7 +58,10 @@ recorded.
 
 ## Cross-cutting invariants
 
-**None.**
+- [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) — `gcc` and `mcs` carry both artifacts since #203, and `ber` / `per` are the recorded
+  exception (primitives; their callers are covered). The edge is drawn by #237 because it was
+  missing, not because anything here is uncovered — this section read **None.** while the
+  territory parsed the whole Connect-Response.
 
 ## Blast radius
 
