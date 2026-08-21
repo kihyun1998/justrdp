@@ -196,10 +196,11 @@ a target is:
 - **`share`, `update`, `errinfo`**, which parse post-activation session bytes.
 - **`finalization::{Synchronize, Control, FontMap}::decode`**, which are the connect sequence's
   own last three server parses (`justrdp/src/connect.rs:1116`, `:1132`, `:1137`, and
-  `justrdp/src/session.rs:545` on reactivation). Found by #230's completeness pass, and the
-  reason it is worth naming rather than folding into the bullet above: unlike `share` / `update`
-  / `errinfo` it had never been *recorded* as uncovered at all, so nothing here was wrong about
-  it — nothing here mentioned it.
+  `justrdp/src/session.rs:545` on reactivation). Found by #230's completeness pass, tracked as
+  **#237**, and the reason it is worth naming rather than folding into the bullet above: unlike
+  `share` / `update` / `errinfo` it had never been *recorded* as uncovered at all, so nothing
+  here was wrong about it — nothing here mentioned it. An unlisted gap is indistinguishable from
+  a closed one; a listed gap is a decision someone can disagree with.
 
 **Two derivations by name, and a name can be taken by different code — in another crate, or in
 the same module.** Both forms have now been measured, and the second is the one that hides.
