@@ -50,6 +50,28 @@ Read this before starting so the bindings do not read as abstractions.
   general rule is the one this section already states about external facts: the rationale *this
   repo* writes is a verification target too, and a filed issue is exactly where an unre-read
   sentence goes to be believed.
+- **An ADR read through a citation of it is a secondhand fact, and this repo's own records are
+  the easiest place to forget that (#237).** ADR-0009 §3(a) was quoted all through #230 and #237
+  from **#233's issue body** rather than from
+  `docs/adr/0009-tolerant-negotiation-posture.md`, and the paraphrase had drifted: the record
+  says *"a tolerated order with a malformed body is still a typed error"* — a rule about
+  malformed bodies — while the borrowed reading treated it as a rule about *trusting field
+  values*. On that reading our Font Map length check looked like receive-path strictness with no
+  record behind it; on the actual text it is exactly what §3(a) prescribes. One `sed -n` on the
+  file settled it.
+  Two things this pins beyond the existing "external facts are verification targets" rule.
+  **The rule covers crates.io and upstream repos and reads as being about *outside* sources**,
+  which is precisely why an in-repo ADR slips past it — a decision record is the most citable
+  artifact the project has and therefore the one most often met through a citation. And **a
+  paraphrase inherits every reader after it**: the misreading went into the refuting lens's
+  brief as if it were the record, so the lens graded a `DELIBERATE` as `CONFIRMED` and returned
+  it with a reproduction attached. *The lens was not wrong; it was correctly applying a rule it
+  had been handed wrong.*
+  The general shape, which the #189 harness entry in §Step 3 is the other half of:
+  **verification counts only when the source differs from the thing being verified.** There it
+  was reproducing a lens's claim with the lens's own broken instrument; here it was checking a
+  grade against a quotation of the record instead of the record. Both passed a step called
+  verification and neither was one.
 - **A missing map edge is invisible to the gate that checks map edges (#237).** The
   untrusted-decode invariant carries two derivation commands *and* a human-readable
   **Territories it holds in** list — which is the one a reader following the map lands on, and
