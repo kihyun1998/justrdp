@@ -126,6 +126,59 @@ impl FontMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cursor::ReadCursor;
+    use proptest::prelude::*;
+
+    // ADR-0008 / issue #237 -- the no-panic robustness properties for the connect sequence's last
+    // three server parses. All three are `pub fn`s driven straight off server bytes
+    // (`justrdp/src/connect.rs:1132`, `:1137`, `:1116`, and `session.rs:545` for `FontMap` on
+    // reactivation) and none carried either artifact.
+    //
+    // What made this module invisible is worth keeping, because it is *not* the failure #230
+    // closed. There the roster matched by module name and a name lied -- `pointer` and `license`
+    // both appeared covered because a file of that name existed on each side. `finalization`
+    // appeared nowhere at all: not in the fuzz roster, not in the uncovered enumeration, not in
+    // this territory's known holes. The reason is one edge in the map:
+    // `docs/map/territory/capability-exchange-activation.md`, which owns this module, never
+    // claimed [untrusted decode never panics], so the invariant's own list of territories could
+    // not point anyone here. `check_map.py`'s reciprocity gate cannot see that -- it verifies
+    // that edges which *exist* run both ways.
+    //
+    // The generators are plain `vec(any::<u8>(), 0..=512)`, and that is measured rather than
+    // assumed. #230 found four properties that could not reach the arithmetic they were named
+    // after, every one of them behind an exact-match gate (a version byte, a flags mask, ASN.1
+    // tags, a `messageType` dispatch plus a dimension cap). These three have **no gate at all**:
+    // every read is unconditional and fixed-width, so the only thing needed to drive a bounds
+    // check is a short buffer, which a `0..=512` length hits in ~1.6% of cases. Mutation-checked
+    // at 5 runs each, rebuild asserted: an unchecked read in any of the three turns its own
+    // property red every time.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn synchronize_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&body, "proptest synchronize");
+            let _ = Synchronize::decode(&mut cur);
+        }
+
+        #[test]
+        fn control_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&body, "proptest control");
+            let _ = Control::decode(&mut cur);
+        }
+
+        #[test]
+        fn font_map_decode_never_panics_on_arbitrary_input(
+            body in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&body, "proptest font map");
+            let _ = FontMap::decode(&mut cur);
+        }
+    }
 
     #[test]
     fn synchronize_round_trips() {

@@ -222,3 +222,13 @@ path = "fuzz_targets/licensing.rs"
 test = false
 doc = false
 bench = false
+
+# finalization (#237): the connect sequence's last three server parses. Unlike the two above it
+# was not a name that lied -- the module appeared in no roster at all, because the territory that
+# owns it never claimed the untrusted-decode invariant.
+[[bin]]
+name = "finalization"
+path = "fuzz_targets/finalization.rs"
+test = false
+doc = false
+bench = false

@@ -35,6 +35,14 @@ property of the whole untrusted surface.
 - [Licensing](../territory/licensing.md) — five server parses off one cursor, every length
   server-supplied. Added by #230, which is also when four of the five acquired their first
   artifact.
+- [Capability exchange & activation](../territory/capability-exchange-activation.md) — the
+  Demand Active walk, the Share headers, and the three finalization replies. Added by #237,
+  which is also when `finalization` acquired its first artifact; the missing edge is why it
+  had none.
+- [MCS / GCC channel setup](../territory/mcs-gcc-channel-setup.md) — the BER and PER length
+  determinants. Edge added by #237; the code has carried both artifacts since #203.
+- [X.224 negotiation](../territory/x224-negotiation.md) — the connect-sequence entry point.
+  Edge added by #237; the code has carried both artifacts since #200.
 - [Verification harness](../territory/verification-harness.md) — the only territory
   that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz nightly.
 
@@ -198,6 +206,22 @@ that trusts its server too much) rather than as memory safety.
   not done when it passes — it is done when a mutation of the read it names has been seen to turn
   it red**, and #203's `gcc` measurement (11.98% of regions from 200k undirected inputs) was this
   same fact stated as a coverage number a year of properties earlier.
+- **#237 — this note has a *third* enumeration, and it is the one that had the hole.** The two
+  commands below are the derivation; the **Territories it holds in** list above is the
+  human-readable index, and it is what a reader following the map actually lands on. It was
+  missing three territories: **capability exchange & activation**, **MCS / GCC channel setup**
+  and **X.224 negotiation**, each of which parses server bytes on the connect path. Two of the
+  three were fully covered anyway (#200, #203) — the edge was simply never drawn. The third is
+  where `finalization`'s parsers lived, and it is why they were invisible in a way #230's family
+  was not: `pointer` and `license` were names that *lied*, while `finalization` appeared in no
+  list at all.
+
+  **The reciprocity gate cannot see this class**, which is the part worth keeping.
+  `check_map.py` verifies that an edge which exists runs both ways; a territory that claims no
+  invariant and an invariant that claims no territory are consistent with each other and with
+  the gate. The check that does find it is one line and belongs in a completeness pass, not in
+  CI: list every territory whose `## Code` names a parser module, and ask which of them do
+  **not** claim this invariant.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
@@ -239,13 +263,6 @@ the next one is spelled out below. So what remains without a target is:
   The same reasoning, checked rather than assumed, covers **`justrdp_pdu::rfx::decode_all`**:
   `justrdp_codecs::rfx::RemoteFx::decode_to_rgba` is its only caller and carries both artifacts.
 - **`share`, `update`, `errinfo`**, which parse post-activation session bytes.
-- **`finalization::{Synchronize, Control, FontMap}::decode`**, which are the connect sequence's
-  own last three server parses (`justrdp/src/connect.rs:1116`, `:1132`, `:1137`, and
-  `justrdp/src/session.rs:545` on reactivation). Found by #230's completeness pass, tracked as
-  **#237**, and the reason it is worth naming rather than folding into the bullet above: unlike
-  `share` / `update` / `errinfo` it had never been *recorded* as uncovered at all, so nothing
-  here was wrong about it — nothing here mentioned it. An unlisted gap is indistinguishable from
-  a closed one; a listed gap is a decision someone can disagree with.
 
 **Two derivations by name, and a name can be taken by different code — in another crate, or in
 the same module.** Both forms have now been measured, and the second is the one that hides.
