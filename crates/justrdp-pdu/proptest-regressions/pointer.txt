@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bac2c896d30126024a4416487a497007ec6856f0b92314494fdafac279986172 # shrinks to body = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 220, 0, 114, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc c7e430e3e780ce6a6135255b0c457469099c18a02579026c5241bbeb0bcbacfb # shrinks to message_type = 8, pad = 0, rest = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 184, 0]
+cc fac83b2b10998a7abef6500a7686c3bf96adb4c4703d3239d6407e4edcf89b1a # shrinks to body = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 73, 1]
+cc eccf111b6c381a4a9d087bdd717b5f20df2df2e3fc3ea5ad46d3f2eb698d3b38 # shrinks to code = 9, body = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 193, 1]
+cc b6441288771fa3e536960e8c389f9d474c18d5c7854c00522d7fd42f37cd48fc # shrinks to body = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc 47c20d7a9b82e63a6b85589766cf15e312613c621a5cfcc196e68d7faed63f26 # shrinks to message_type = 8, pad = 0, rest = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77, 0]
+cc f63b8095601159fec2050ee4324a0688d22b47b25b7044b33643d2c7ef5d170c # shrinks to code = 9, body = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 246, 1]

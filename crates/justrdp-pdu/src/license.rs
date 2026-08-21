@@ -458,6 +458,53 @@ mod tests {
             let mut cur = ReadCursor::new(&data, "proptest license-request");
             let _ = ServerLicenseRequest::decode(&mut cur);
         }
+
+        // Issue #230 — the other four parsers on the same live path, added because the module
+        // read as covered and was not. `license` appears both in `ls fuzz/fuzz_targets/` and in
+        // the walk of what parses untrusted bytes, so the invariant's two derivations matched it
+        // by name; the target and the property above drive `ServerLicenseRequest::decode` alone,
+        // which calls none of these. `justrdp/src/connect.rs` drives all five off the same
+        // cursor — the preamble at `:865` and then one of `:869` / `:889` / `:914` / `:950` by
+        // `msg_type`. Same shape as the `pointer` name the invariant already records, one module
+        // over (`docs/map/invariant/untrusted-decode-never-panics.md`).
+        //
+        // `PlatformChallenge` and `NewLicense` are the two that carry arithmetic: `read_blob`
+        // takes a server `u16` length and hands the slice on, and both then `copy_from_slice`
+        // into a fixed `[u8; MAC_SIZE]` — a panicking API whose only guard is `read_slice`
+        // returning exactly that many bytes or erroring. `LicensePreamble` and `LicenseError`
+        // are fixed-width reads, driven for the same reason the header in `client_info` is:
+        // totality is a claim about the current body, and this is what keeps holding it.
+        #[test]
+        fn license_preamble_decode_never_panics_on_arbitrary_input(
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&data, "proptest license preamble");
+            let _ = LicensePreamble::decode(&mut cur);
+        }
+
+        #[test]
+        fn license_error_decode_never_panics_on_arbitrary_input(
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&data, "proptest license error");
+            let _ = LicenseError::decode(&mut cur);
+        }
+
+        #[test]
+        fn platform_challenge_decode_never_panics_on_arbitrary_input(
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&data, "proptest platform challenge");
+            let _ = PlatformChallenge::decode(&mut cur);
+        }
+
+        #[test]
+        fn new_license_decode_never_panics_on_arbitrary_input(
+            data in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let mut cur = ReadCursor::new(&data, "proptest new license");
+            let _ = NewLicense::decode(&mut cur);
+        }
     }
 
     /// Build a proprietary certificate blob around a tiny RSA key (64-bit modulus).

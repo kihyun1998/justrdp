@@ -32,6 +32,9 @@ property of the whole untrusted surface.
 - [Session loop & PDU dispatch](../territory/session-loop-dispatch.md) — the
   dispatcher that hands bytes to all of the above.
 - [Pointer & cursor](../territory/pointer-cursor.md) — mask/stride arithmetic.
+- [Licensing](../territory/licensing.md) — five server parses off one cursor, every length
+  server-supplied. Added by #230, which is also when four of the five acquired their first
+  artifact.
 - [Verification harness](../territory/verification-harness.md) — the only territory
   that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz nightly.
 
@@ -126,6 +129,37 @@ that trusts its server too much) rather than as memory safety.
   bound is genuinely threat-model-faithful (ADR-0008's strategy design rule — a `u16` wire
   field stays a `u16`), the test is *whether the function's own signature admits more*: a bare
   `pub fn` parameter always does.
+- **#230 — the stated blocker did not exist, which is worth more than the fix.** #203 and #230
+  both recorded that `&mut ReadCursor<'_>` entry points *"have no signature to point
+  `fuzz_target!` at directly"*, and #230 named that as the reason these three were not
+  mechanical for #200. It is false in both directions: `cursor` is a `pub mod`, and
+  `fuzz_targets/license.rs` has constructed a cursor inside the target since #99. What actually
+  blocked #200 was that `gcc` and `mcs` have no single top-level `decode` — a different problem
+  that happened to travel with the same modules. A rationale nobody re-reads gets inherited by
+  the next issue, and this one was inherited twice.
+- **#230, second: an undirected no-panic property can be structurally unable to reach the
+  arithmetic it is named after.** The first version of `pointer`'s properties generated
+  `vec(any::<u8>(), 0..=512)` and passed over an out-of-bounds read injected into the mask
+  `read_slice` — while `malformed_pointers_are_typed_errors`, the hand-written test beside it,
+  went red on the same mutation. Random bytes must land `messageType` on one of two values
+  (2/65536) **and** both dimensions inside the 96-pixel cap ((97/65536)²) to reach either mask
+  read: about 6.7e-11 per case, against 2048 cases.
+
+  This is the mirror image of #211's `nscodec` finding rather than a new shape. There a
+  generator **bounded** to the parser's range asserted the parser instead of the function; here
+  a generator too **wide** to satisfy the parser asserted the dispatch instead of the function.
+  Both produce a green that means nothing, and only mutation tells them apart from a green that
+  does. The fix is to **weight** the header fields into the admitted range while keeping an
+  `any::<...>()` arm on every one of them, so the reject arms stay driven — which is what
+  `justrdp-codecs`'s own `decode_pointer` property already did for `xor_bpp` and did not do for
+  `width`/`height`.
+- **#230, third: the first length field masks the second.** With both mask lengths generated as
+  arbitrary `u16` (mean 32768) against a tail of at most 512 bytes, `read_slice(lengthXorMask)`
+  errors before the AND read in nearly every case. Measured: injecting an out-of-bounds read
+  into the **XOR** mask turned all three properties red, and the same injection into the **AND**
+  mask left both entry-point properties green. Two sequential reads from one hostile-length
+  family need the length strategy to produce *satisfiable* values too, or only the first one is
+  ever under test.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
@@ -160,22 +194,36 @@ a target is:
   The same reasoning, checked rather than assumed, covers **`justrdp_pdu::rfx::decode_all`**:
   `justrdp_codecs::rfx::RemoteFx::decode_to_rgba` is its only caller and carries both artifacts.
 - **`share`, `update`, `errinfo`**, which parse post-activation session bytes.
-- **`justrdp_pdu::pointer::{decode_slowpath, decode_fastpath}`** and
-  **`justrdp_pdu::client_info::decode_basic_security_header`**, which have neither artifact and
-  *are* on the live path (`justrdp/src/session.rs:374`, `:554`, `justrdp/src/connect.rs:854`).
-  Found by #203; see the derivation caveat below for why they had been read as covered.
+- **`finalization::{Synchronize, Control, FontMap}::decode`**, which are the connect sequence's
+  own last three server parses (`justrdp/src/connect.rs:1116`, `:1132`, `:1137`, and
+  `justrdp/src/session.rs:545` on reactivation). Found by #230's completeness pass, and the
+  reason it is worth naming rather than folding into the bullet above: unlike `share` / `update`
+  / `errinfo` it had never been *recorded* as uncovered at all, so nothing here was wrong about
+  it — nothing here mentioned it.
 
-**Two derivations by name, and a name can be taken by a covered sibling in another crate.**
-`ls fuzz/fuzz_targets/` prints `pointer` and `rfx`, and both files exist — but they target
-`justrdp_codecs`, and the identically-named `justrdp-pdu` modules are different code. For `rfx`
-the codec calls the PDU parser, so the coverage is real and transitive; for `pointer` it does
-**not**: `justrdp_codecs::pointer::decode_pointer` takes `width`, `height`, `xor_bpp` and two
-mask slices *already parsed*, so the `TS_POINTERATTRIBUTE` header parse that produced them is
-reached by nothing. Reading the two lists side by side answers "is there a file called X", and
-the question is "is this function driven" — the same gap between an artifact and the thing that
-consumes it that #143 and #192 fell into, one level up. **Cross-reference by entry point, not by
-module name**, and note that the modules where this bites are exactly the ones split across
-crates.
+**Two derivations by name, and a name can be taken by different code — in another crate, or in
+the same module.** Both forms have now been measured, and the second is the one that hides.
+
+- **Across crates (#203).** `ls fuzz/fuzz_targets/` prints `pointer` and `rfx`, and both files
+  exist — but they target `justrdp_codecs`, and the identically-named `justrdp-pdu` modules are
+  different code. For `rfx` the codec calls the PDU parser, so the coverage is real and
+  transitive; for `pointer` it does **not**: `justrdp_codecs::pointer::decode_pointer` takes
+  `width`, `height`, `xor_bpp` and two mask slices *already parsed*, so the
+  `TS_POINTERATTRIBUTE` header parse that produced them was reached by nothing.
+- **Within one module (#230).** `license` appears in both lists, in the same crate, with no
+  sibling to confuse it with — and four of its five live-path parsers had neither artifact.
+  `fuzz_targets/license.rs` and the property beside it drive `ServerLicenseRequest::decode`,
+  which calls none of `LicensePreamble` / `LicenseError` / `PlatformChallenge` / `NewLicense`;
+  `justrdp/src/connect.rs:854-950` drives all of them off one cursor. There is no cross-crate
+  tell here at all, which is why this form is worse: the `pointer` case at least *looks*
+  suspicious once you notice two files share a name.
+
+Reading the two lists side by side answers "is there a file called X", and the question is "is
+this function driven" — the same gap between an artifact and the thing that consumes it that
+#143 and #192 fell into, one level up. **Cross-reference by entry point, not by module name.**
+The cheap mechanical form, which is what found `finalization`: list the `pub fn`s in
+`justrdp-pdu` that `crates/justrdp/src` names, and check each against the properties and the
+targets *by function*.
 
 The bootstrap question was measured while closing the first bullet (#200): undirected
 bytes reach **16.5%–48.8%** of the regions in the connect-sequence parsers, against

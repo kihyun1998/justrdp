@@ -202,3 +202,23 @@ path = "fuzz_targets/mcs.rs"
 test = false
 doc = false
 bench = false
+
+# pointer_pdu and licensing (#230): the live-path parsers whose modules read as covered because a
+# target of the same name drives *different code*. `pointer.rs` targets `justrdp-codecs`, whose
+# `decode_pointer` takes the header fields already parsed; `license.rs` targets
+# `ServerLicenseRequest::decode`, which calls none of the other four license parsers. Named apart
+# from the targets they sit beside rather than folded into them -- each covers a distinct grammar
+# and would otherwise share one budget with an unrelated one.
+[[bin]]
+name = "pointer_pdu"
+path = "fuzz_targets/pointer_pdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "licensing"
+path = "fuzz_targets/licensing.rs"
+test = false
+doc = false
+bench = false
