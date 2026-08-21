@@ -1,0 +1,201 @@
+# 0012 — A parser's guarantee is not held at the point of use: consumption-site totality
+
+- Status: Accepted (promoted while working issue #211; conformance items #211, #233)
+- Date: 2026-08-21
+
+## Context
+
+`justrdp-pdu` is deliberately dependency-free, and every PDU struct in it carries plain `pub`
+fields. Parsing establishes value constraints — `Quant::decode` masks each band with `& 0x0F`
+so a quant exponent is `0..=15`; `RfxMessage`'s tileset walk checks every `quantIdx` against the
+table it indexes; `parse_header` rejects an NSCodec colour-loss level outside `1..=7`. Those
+constraints are real, and they are **not carried by any type**. `justrdp-codecs` then consumes
+the same values as *arithmetic*: shift amounts, table indices, buffer offsets.
+
+Nothing re-checks the join. The constraint and the use sit in different crates, reached through
+a plain field or a bare parameter, so the compiler connects them not at all and a reader
+connects them only by remembering. Four times now that join has come up as a question, and each
+time it was decided from scratch:
+
+| Decision | Site | What was decided |
+|---|---|---|
+| #168 (PR #210) | `rfx::srl::accumulate` | total for **every** `u8` shift, unrepresentable result is a typed error |
+| #169 (PR #214) | `rfx::progressive::first_pass_shift` | derive the whole ten-band table and validate it *before* any state is touched; `shift >= 16` is a typed error |
+| #169 (PR #214) | `ProgressiveError::QuantIndexOutOfRange` | typed error at the index, although the parser validates every index |
+| #211 | `rfx::quant::dequantize` | open — the issue this record was promoted out of |
+
+Four combinations of the same two participants (a value the parser constrained, a consumer that
+does arithmetic with it), decided four times, with the reasoning re-derived on each occasion and
+recorded — where it was recorded at all — on the branch of code that happened to raise it. The
+`theflow` promotion bar is two of five triggers; four fire here:
+
+- **A pair already decided, in a different combination.** The table above.
+- **An earlier issue's premise measured false.** #168's completeness pass reported this as a
+  family across the codec decoders; #211's census measured that as one site, then this record's
+  own sweep found it was three (below). Separately, #211's citation `quant.rs:37` went stale
+  four hours after filing, when #169 moved the line to `:77`.
+- **The reference cannot arbitrate.** FreeRDP contradicts itself across its own call sites:
+  `prim_shift.c:38-39` refuses a shift of 16 or wider by returning `-1`, and
+  `rfx_quantization.c:73-82` calls it ten times discarding every return value before `:83`
+  returns `TRUE` unconditionally. The differential oracle is not a second opinion either — its
+  `quantization.rs` is structurally identical to ours, down to the `factor > 0` guard, because
+  it shares this code's lineage (`docs/map/invariant/oracle-agreement-is-not-independence.md`).
+- **Two in-repo artifacts require opposite things.** `quant.rs:117` pins a WireToSurface1 quant
+  exponent of `0` as *skip the band and continue*; `progressive.rs:2342` pins the identically
+  undefined Progressive `bitPos == 0` as *fail the tile with a typed error*. Both green, neither
+  citing the other. Tracked as #233.
+
+The state space here is combinatorial — parser-side constraint × consumer-side arithmetic ×
+crate boundary × reachability — so each new combination arrives looking like a fresh judgement
+call, and each one silently reinterprets the last. That is what this record ends.
+
+[ADR-0008](0008-robustness-testing-fuzz-and-property.md) governs *whether* a decode path may
+panic and *how that is tested*. It does not say **which module owns a guarantee** once the
+validation and the use have been separated, which is the question all four rows above are
+answers to.
+
+## Decision
+
+A function that consumes a wire-derived value as arithmetic is **total over its parameter
+types**, not over the subset its parser happens to produce.
+
+### 1. Refusal lives at the consumption site
+
+If the arithmetic is undefined for some value the parameter's *type* permits, the function
+refuses that value with a typed error — whether or not the wire can produce it. The parser's
+constraint is evidence about **reachability**, which governs priority; it is never evidence
+about **totality**, which governs the contract.
+
+Three independent grounds, each already paid for by one of the rows above:
+
+- **The constraint and the use are in different crates**, joined by a plain `pub` field or a
+  bare parameter, so nothing re-checks when either end moves. This is not hypothetical: #211's
+  own line citation was stale within four hours of being written.
+- **The value at the use site is frequently *derived*, not the parsed value.** `bitPos = quant +
+  prog_quant` is the sum of two nibbles and reaches 30; `num_bits` is a difference of two such
+  positions; `shift` is one less again. #168 sized two guards on "it is a nibble, so `<= 15`"
+  and **both were wrong**, one of them silently desynchronising the shared SRL cursor rather
+  than panicking. A guarantee about an input is not a guarantee about what is computed from it.
+- **The functions are public.** `justrdp-codecs` exports `rfx::quant::dequantize` and
+  `nscodec::reconstruct`; a host can construct their arguments. "Unreachable from the wire" and
+  "unreachable" are different claims, and only the first has been established.
+
+### 2. The threshold is written on the quantity the arithmetic uses
+
+Not on the wire field it was derived from. `dequantize` shifts an `i16` by `factor = q - 1`, so
+it is undefined at `factor >= 16` — that is `q >= 17`, and `q == 16` is well defined (it yields
+`1 << 15`). A guard written as `q > 15` therefore diverges by one from `first_pass_shift`'s
+`shift >= 16`, and the two stages would refuse different inputs while claiming the same reason.
+Write the guard where the arithmetic is, and the two agree by construction.
+
+### 3. One undefined input, one answer, across every stage of a family
+
+Where two stages of one codec family consume the same quantity, they give it the same answer —
+or the divergence is a recorded row naming **both** sides. A row that names only one side is a
+false status report.
+
+This record does not settle the outstanding instance, it makes it visible: `q == 0` is skipped
+by WireToSurface1 and refused by Progressive, and the choice between those is #233.
+
+### 4. Derive-and-validate is a separate function from apply
+
+The shape that gives a refusal somewhere to live without making a hot loop fallible, already
+built once in this repo:
+
+```
+first_pass_shift(&ProgressiveQuant) -> Result<ProgressiveQuant, ProgressiveError>  // validates ten bands
+dequantize_first_pass(&mut [i16], &ProgressiveQuant, bool)                          // infallible + debug_assert
+```
+
+A consumer that does both in one function has nowhere to put a `Result` without making the
+per-coefficient loop fallible, which is the whole of why `dequantize` was written infallible and
+then could not be fixed in place.
+
+### 5. The standing rule
+
+A new public function that consumes a wire-derived value as arithmetic carries its totality
+argument in the same change: either a validating step that refuses what the arithmetic cannot
+take, or — where the arithmetic is total for the whole parameter type — a comment saying so and
+why. A no-panic property whose generator is bounded to the parser's range does **not** discharge
+this; it asserts the parser, not the function.
+
+## Consequences
+
+- **It derives the four decisions rather than listing them, and answers a fifth nobody had
+  made.** §1 gives #168's "total for every `u8`" and #169's `QuantIndexOutOfRange`; §1+§2+§4
+  give #169's `first_pass_shift` and settle #211 with no new judgement. Applied to a site nobody
+  had considered, it produces an answer immediately: `nscodec::reconstruct` (`nscodec.rs:251`)
+  is a `pub fn` taking `color_loss_level: u8` and shifting by `color_loss_level - 1`, validated
+  `1..=7` in `parse_header` — **a different function**. It panics at `color_loss_level >= 17`,
+  reproduced. That is the third site in what #211's census had recorded as two, and it is the
+  evidence that this record is a rule rather than a filing cabinet.
+- **It is not a newtype mandate.** §1 is satisfied by a check at the consumption site; the
+  guarantee is *not* required to move into the type. See the rejected alternative below for why
+  the type-side answer was measured and declined.
+- **Reachability keeps its job, and loses the other one.** "The wire cannot produce this" still
+  decides priority — #211 is P2 precisely because nothing reachable panics — and no longer
+  decides whether the contract holds.
+- **A generator bounded to the parser's range is now a recorded defect shape.**
+  `nscodec.rs:626-639`'s property is documented as covering *"any colour-loss level"* and
+  generates `1u8..=7`, which is exactly the range that hides the panic above. The opposite
+  convention is already written down twice, in `fuzz/fuzz_targets/progressive_srl.rs` and
+  `progressive_multipass.rs`, both of which hand quant nibbles over **unmasked** on purpose and
+  say why. This record makes the second convention the one the family follows.
+- **Relationship to [ADR-0009](0009-tolerant-negotiation-posture.md).** §Decision 3(a) —
+  *"Tolerance is about which features are allowed to appear, never about trusting their
+  contents"* — is the same sentence read from the parser's side. This record is its
+  point-of-use half. Nothing here narrows the tolerance posture: refusing a value the arithmetic
+  has no meaning for is not strictness about *what a server may send*, and where the two could
+  be confused (#233) the question is routed to a decision rather than answered by this record.
+- **Relationship to [ADR-0008](0008-robustness-testing-fuzz-and-property.md).** 0008 governs
+  whether a path may panic and how that is tested; this governs where the guarantee lives when
+  validation and use are separated. Neither subsumes the other: 0008's two lanes could be fully
+  green over a function this record fails, which is what `nscodec::reconstruct` demonstrates.
+- **New tracker structure.** Areas this record now governs file **conformance items under it**
+  rather than opening a spine. #211 and #233 are its first two.
+
+## Rejected alternatives
+
+- **Move the guarantee into the type — a nibble newtype in `justrdp-pdu` that only the parser
+  can construct** (#211's option (b)). Rejected on cost and coverage, having measured both.
+  *Coverage:* it does not reach the family. `nscodec::reconstruct`'s `color_loss_level` is a
+  bare `u8` **parameter**, and `planar.rs`'s `cll` is a local computed inside `decompress` — a
+  newtype on a PDU struct field reaches neither, so §1 would still be needed for two of the
+  three sites. *Cost:* `ProgressiveQuant` is not only a parsed value, it is the codec crate's
+  ten-band `u8` carrier for derived quantities that deliberately exceed 15 — `quant_add`,
+  `quant_sub`, `upgrade_shift`, `TileState::bit_pos`, and the **public** accessor
+  `bit_positions()`, whose return type would become a lie at the API boundary. Every one of
+  those round-trips through `quant_from_bands([u8; 10])`, which cannot compile against a
+  parser-only constructor, so a second ten-band type inside `justrdp-codecs` is forced. Both
+  Progressive fuzz targets exist *specifically* to hand unmasked nibbles past the parser and say
+  so in their headers; a parser-only constructor removes their stated reason to exist. And the
+  escape hatch is twenty `pub` fields across two structs, so the change is twenty fields made
+  private plus twenty accessors, in a crate where every other PDU struct is plain-pub.
+  **The precedent argument #211 recorded against this option is withdrawn as wrong**, and it is
+  worth withdrawing explicitly because it would otherwise be re-cited: the issue says a newtype
+  "would be the only one in the crate", and there are five (`SecurityProtocol`,
+  `NegFailureCode`, `ClientEarlyCapabilityFlags`, `ServerEarlyCapabilityFlags`,
+  `ClientInfoFlags`) plus `EntropyAlgorithm` twelve lines above `Quant` in the same file, whose
+  `from_bits` is private and which makes illegal values unrepresentable — the exact shape the
+  option asks for. The option is declined on what it costs and what it misses, not on there
+  being no precedent for it.
+- **Saturate or clamp at the point of use.** Rejected by ADR-0009 §Decision 3(b): *"Silent
+  masking is forbidden — a tolerance you cannot see is indistinguishable from a bug."* Note the
+  reason is *not* "release already masks the shift": release wraps modulo the type width rather
+  than clamping (`q = 17` yields the value unchanged, `q = 200` yields `1 << 7`), so a clamp
+  agrees with release on no input at all. The argument from ADR-0009 stands without reference to
+  release behaviour, and the argument from release behaviour does not stand at all.
+- **Rely on the parser and document the assumption.** This is the status quo, and #168 measured
+  what it costs: two guards sized on the parser's word, both wrong, one of them producing
+  `Ok(())` on a desynchronised stream. A comment is not re-checked when the code on either side
+  of it moves.
+- **`debug_assert!` alone.** Rejected as the whole answer — the workspace sets no
+  `[profile.*]`, so `overflow-checks` is off in release and the panic becomes silently wrong
+  values rather than a crash. `debug_assert!` is correct in the *apply* half of §4, where the
+  validating half has already refused the input, and that is where it is used
+  (`dequantize_first_pass`).
+- **A single shared "validated nibble" helper across the codec crate.** Deferred rather than
+  rejected: the three sites take their values by different routes (struct field, bare parameter,
+  local), and the shape that fits all three is not yet visible. Extract it when a fourth site
+  makes the duplication real, per the same reasoning ADR-0008 applied to a shared generator
+  crate.

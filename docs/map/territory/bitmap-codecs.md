@@ -19,6 +19,11 @@ attacker-controlled bytes in the repo.
   independence.
 - [ADR-0008](../../adr/0008-robustness-testing-fuzz-and-property.md) — property
   tests and fuzzing for untrusted-input parsers.
+- [ADR-0012](../../adr/0012-consumption-site-totality.md) — a value the parser
+  constrained is consumed here as arithmetic across a crate boundary, so the
+  refusal lives at the consumption site and the threshold is written on the
+  quantity the arithmetic uses. Where ADR-0008 governs *whether* a path may panic,
+  this governs *which module owns the guarantee* once validation and use are apart.
 
 ## Design model
 
@@ -67,6 +72,30 @@ attacker-controlled bytes in the repo.
   is correct for every `num_bits ≤ 15` and silently desynchronises the shared SRL
   cursor above it. Exported as `rfx::srl::MAX_BIT_POS` so #169 inherits the derivation
   rather than the conclusion.
+- **A guarantee the parser proves is not held where the value is used, and this
+  territory is where that bites** ([ADR-0012](../../adr/0012-consumption-site-totality.md)).
+  `justrdp-pdu` masks quant nibbles to `0..=15` and rejects an NSCodec colour-loss
+  level outside `1..=7`; `justrdp-codecs` then shifts by those values across a crate
+  boundary, through plain `pub` fields and bare `u8` parameters that carry none of it.
+  Three sites, and the census kept mis-sizing itself because each is safe for a
+  *different* reason: `planar.rs`'s `cll` is safe **by construction** (`header & 0x07`),
+  `progressive::dequantize_first_pass` **by a validating caller** (`first_pass_shift`),
+  and `quant::dequantize` / `nscodec::reconstruct` were safe **only by the parser's
+  word** — the one reason that does not survive either function being `pub`. Both
+  panicked at a shift of 16 or wider, reproduced. The threshold is on the **shift**:
+  an exponent of 16 shifts by 15 and is fine, so a guard written as "the nibble
+  exceeds 15" is off by one and would make the two dequantizers refuse different
+  inputs for the same stated reason.
+- **A no-panic property whose generator is bounded to the parser's range asserts the
+  parser, not the function.** `nscodec`'s `reconstruct_never_panics_on_arbitrary_input`
+  documented itself as covering *"any colour-loss level"* and generated `1u8..=7`.
+  Measured: with the guard removed and that generator restored — master's exact state —
+  the property passes **green over a live panic**, while the unit test beside it goes
+  red. Same shape as
+  [a later stage can hide an earlier defect](../invariant/a-later-stage-can-hide-an-earlier-defect.md),
+  one layer out into the harness. The opposite convention was already written twice,
+  in `fuzz/fuzz_targets/progressive_srl.rs` and `progressive_multipass.rs`, both of
+  which hand quant nibbles over unmasked on purpose and say why.
 - **Reduce-extrapolate is a second inverse DWT, not the classic one with different
   offsets.** An `n`-sample line splits `low = (n + 2) / 2`, `high = n - low` rather
   than in half, so 64 → 33/31, 33 → 17/16, 17 → 9/8. Three things change together:
@@ -143,7 +172,8 @@ attacker-controlled bytes in the repo.
 - `justrdp-codecs/src/clearcodec.rs` — `Clear`, `ClearDecoder`, `ClearError`
 - `justrdp-codecs/src/rfx/` — `mod.rs` (`RemoteFx`, `RfxError`), `rlgr.rs`
   (`decode`), `dwt.rs` (`decode`), `dwt_extrapolate.rs` (`decode`), `quant.rs`
-  (`dequantize`, `ll3_delta_decode`, `BANDS_STANDARD`, `BANDS_EXTRAPOLATE`),
+  (`shifts`, `dequantize`, `ll3_delta_decode`, `BANDS_STANDARD`,
+  `BANDS_EXTRAPOLATE`),
   `srl.rs` (`upgrade_component`, `SrlError`), `progressive.rs` (`Progressive`,
   `PaintedRect`, `PayloadOutcome`, `TileGrid`, `TileState`, `Scratch`,
   `ProgressiveError`, `SurfaceStore`, `order_payload`, `PayloadOrder`,

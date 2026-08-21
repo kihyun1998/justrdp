@@ -266,7 +266,20 @@ pub fn reconstruct(
         ctx: "NSCodecPlanes",
     };
 
+    // The chroma recovery below shifts an `i16` by this, so it is undefined at 16 or wider.
+    // `parse_header` rejects anything outside `1..=7`, but that is a **different function** and
+    // this one is `pub` and takes the level as a bare `u8` — so the guarantee does not reach
+    // this contract ([ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §1). The
+    // threshold is written on the shift rather than on the level, so it refuses exactly what the
+    // arithmetic cannot take and nothing else (§2): re-imposing `1..=7` here would duplicate the
+    // parser's *policy* rather than close the totality hole.
     let shift = color_loss_level.saturating_sub(1);
+    if shift >= 16 {
+        return Err(NscError::InvalidField {
+            field: "ColorLossLevel",
+            reason: "leaves a chroma shift of 16 or wider, which has no meaning for i16",
+        });
+    }
     let (temp_width, _) = temp_dims(width, height);
     let [y_plane, co_plane, cg_plane, a_plane] = planes;
     let (y_stride, co_stride) = if chroma_subsampled {
@@ -497,6 +510,39 @@ mod tests {
         );
     }
 
+    /// **Regression, #211's third site.** `reconstruct` is `pub` and takes the colour-loss level
+    /// as a bare `u8`; the `1..=7` check lives in `parse_header`, a different function, so it
+    /// never reached this contract. A level of 17 or more gave a chroma shift of 16 or more and
+    /// panicked with *"attempt to shift left with overflow"* — the same threshold, the same
+    /// shape and the same crate as `rfx::quant::dequantize` (ADR-0012 §1–§2).
+    ///
+    /// The boundary is on the shift, not on the level: 16 is accepted because it shifts by 15.
+    #[test]
+    fn reconstruct_is_total_for_every_colour_loss_level() {
+        let planes = || [vec![100u8], vec![3], vec![1], vec![255]];
+        for level in 0u8..=16 {
+            reconstruct(&planes(), 1, 1, level, false)
+                .unwrap_or_else(|e| panic!("level {level} must decode, got {e:?}"));
+        }
+        for level in [17u8, 18, 100, 255] {
+            assert!(
+                matches!(
+                    reconstruct(&planes(), 1, 1, level, false),
+                    Err(NscError::InvalidField {
+                        field: "ColorLossLevel",
+                        ..
+                    })
+                ),
+                "level {level} must be a typed error, not a panic"
+            );
+        }
+        // The validity condition that makes it unreachable from the wire: `parse_header` never
+        // emits a level outside `1..=7`. Red here before anything else if that stops holding.
+        for level in 1u8..=7 {
+            reconstruct(&planes(), 1, 1, level, false).expect("the parser's whole range decodes");
+        }
+    }
+
     #[test]
     fn reconstruct_sign_truncates_chroma_and_clamps() {
         // 1×1, shift 2: Co 100 → (100<<2)=400 → (u8)144 → (i8)-112. R=100-112→clamp 0, B=100+112=212.
@@ -624,11 +670,18 @@ mod tests {
 
         // Reconstruction over arbitrary (possibly too-short) planes and any colour-loss level: bounded
         // dims keep the output small; a plane that underruns its geometry is a typed error, not a panic.
+        //
+        // **The colour-loss level is generated over the whole `u8`, not over the parser's `1..=7`.**
+        // It used to be bounded to the parser's range while this comment already claimed "any
+        // colour-loss level", and that gap is exactly where the `>= 17` shift panic lived: `reconstruct`
+        // is `pub` and takes the level as a bare parameter, so a generator bounded to `parse_header`'s
+        // output asserts the parser rather than this function (ADR-0012 §5). Same convention the two
+        // Progressive fuzz targets state for quant nibbles.
         #[test]
         fn reconstruct_never_panics_on_arbitrary_input(
             width in 0usize..=32,
             height in 0usize..=32,
-            color_loss in 1u8..=7,
+            color_loss in any::<u8>(),
             subsampled in any::<bool>(),
             p0 in proptest::collection::vec(any::<u8>(), 0..=256),
             p1 in proptest::collection::vec(any::<u8>(), 0..=256),

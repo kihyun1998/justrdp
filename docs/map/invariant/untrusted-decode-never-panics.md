@@ -107,13 +107,41 @@ that trusts its server too much) rather than as memory safety.
   synthesised here, and the seed had to be a real capture. That asymmetry is why this invariant
   carries the receive path alone, and why #98 could give `decode_connect_response` a no-panic
   property but no round-trip.
+- **#211/#233 → [ADR-0012](../../adr/0012-consumption-site-totality.md) — the derivation
+  below exempts a whole class, and the class panics.** Both commands are *byte*-scoped:
+  one lists fuzz targets, the other lists what parses untrusted bytes. `rfx::quant::dequantize`
+  and `nscodec::reconstruct` parse nothing — they take an *already-parsed* struct field and an
+  already-validated `u8` parameter and shift by them, across a crate boundary that carries
+  neither constraint. Both are `pub`, and both panicked at a shift of 16 or wider (reproduced;
+  in release the shift wraps modulo the type width instead, so the same input yields silently
+  wrong coefficients). The general rule is ADR-0012's, and the half that belongs here is the
+  recurrence clause below.
+- **#211, second: a property can be green over a live panic when its generator is bounded to
+  the parser's range.** `nscodec`'s no-panic property documented itself as covering *"any
+  colour-loss level"* and generated `1u8..=7` — exactly the range `parse_header` already
+  enforces. Measured by mutation: with the guard removed and that generator restored, the
+  property **passes** while the unit test beside it fails. A generator bounded to what the
+  parser emits asserts the parser, not the function under test — which is the same
+  artifact-versus-consumer gap as #143/#192 and #203, one layer out into the harness. Where a
+  bound is genuinely threat-model-faithful (ADR-0008's strategy design rule — a `u16` wire
+  field stays a `u16`), the test is *whether the function's own signature admits more*: a bare
+  `pub fn` parameter always does.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
 ## Where it will recur
 
 **If a function reads a length, count or offset from bytes it did not produce, it is
-subject to this.** Two derivations, and the gap between them is the finding:
+subject to this** — **and so is a function that takes such a value already parsed and does
+arithmetic with it.** The second clause is not a restatement: the sentence as originally
+written is byte-scoped, so both derivations below are blind to a consumer one hop past the
+parser, and #211 found two such consumers panicking. The test for that class is not "does it
+parse" but **"does its signature admit a value the arithmetic has no meaning for"** — which a
+plain `pub` field or a bare `u8` parameter always does, whatever the parser guarantees.
+[ADR-0012](../../adr/0012-consumption-site-totality.md) owns that class; what belongs here is
+that neither command below can see it.
+
+Two derivations, and the gap between them is the finding:
 
 ```sh
 ls fuzz/fuzz_targets/                      # what is fuzzed

@@ -385,7 +385,9 @@ fn every_inverse_stage_matches_the_oracle_primitive_at_its_boundary() {
 
                     // Stage 3: dequantization.
                     quantization::decode(&mut theirs, &quant);
-                    ours::quant::dequantize(&mut mine, &our_quant(&quant));
+                    let our_shifts =
+                        ours::quant::shifts(&our_quant(&quant)).expect("wire quants are nibbles");
+                    ours::quant::dequantize(&mut mine, &our_shifts);
                     assert_eq!(mine, theirs, "dequantize diverged ({ctx})");
 
                     // Stage 4: inverse DWT.
