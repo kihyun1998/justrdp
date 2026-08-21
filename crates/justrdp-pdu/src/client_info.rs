@@ -413,9 +413,15 @@ mod tests {
         //
         // It is the shallowest parser in this crate: two bounds-checked `read_u16_le`s and no
         // length, count or offset arithmetic, so it is total by inspection. The property is here
-        // anyway because "total by inspection" is a claim about today's body, and this is the one
-        // gate that keeps holding it — measured by mutation: replacing either `read_u16_le()?`
-        // with a direct index into the buffer turns this red.
+        // anyway because "total by inspection" is a claim about today's body, and this keeps
+        // holding it over an input space no vector covers — measured by mutation: replacing
+        // either `read_u16_le()?` with an unchecked read turns this red.
+        //
+        // It is **not** the only thing holding it, and an earlier revision of this comment said
+        // it was. `truncated_input_is_a_typed_error_not_a_panic` below predates this property and
+        // goes red on the identical mutation, because it cuts the encoded buffer at 0 and 3 bytes
+        // — which is exactly the short header. What this adds over that test is the space between
+        // and beyond those two lengths, not the first line of defence.
         //
         // For the same reason it gets no fuzz target of its own; it is driven inside
         // `fuzz/fuzz_targets/licensing.rs`, which starts where its only live caller does. A

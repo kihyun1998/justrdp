@@ -155,11 +155,27 @@ that trusts its server too much) rather than as memory safety.
   `width`/`height`.
 - **#230, third: the first length field masks the second.** With both mask lengths generated as
   arbitrary `u16` (mean 32768) against a tail of at most 512 bytes, `read_slice(lengthXorMask)`
-  errors before the AND read in nearly every case. Measured: injecting an out-of-bounds read
-  into the **XOR** mask turned all three properties red, and the same injection into the **AND**
-  mask left both entry-point properties green. Two sequential reads from one hostile-length
-  family need the length strategy to produce *satisfiable* values too, or only the first one is
-  ever under test.
+  errors before the AND read in nearly every case, so an out-of-bounds read injected into the
+  **AND** mask is caught by `decode_fastpath` in **1 of 3** runs against **3 of 3** once the
+  length strategy also produces satisfiable values. Two sequential reads from one hostile-length
+  family need both kinds of length, or the second one is only reached by accident.
+- **#230, fourth, and the one that cost the most: the mutation harness reported false greens, in
+  the repo that already had a note about it.** Three separate numbers above were measured wrong
+  the first time — the AND-mask row read "green" instead of "1 of 3", a `pointer` run read 0 red
+  where the truth is 3, and an entire finding about `license`'s `MACData` bound (5 of 10
+  property-runs red, "a coin flip") **did not survive re-measurement at all**: the unweighted
+  generator catches that mutation 2 of 2, every run. The cause is #189's exactly: a harness that
+  writes a mutation, tests, reverts, and immediately writes the next one lands two writes in the
+  same filesystem timestamp tick, cargo skips the rebuild, and the run tests *unmutated* code.
+  Knowing the note existed did not help; running the guard did.
+
+  **A mutation harness must prove the mutated code was compiled** — assert `Compiling <crate>` in
+  the output, or make each write's content unique so no fingerprint can match. The reason this
+  belongs in an invariant about decoders rather than only in the lessons file: every claim this
+  note makes about what a property covers is a mutation measurement, so a harness that can report
+  a false green is the instrument all of them are made with. A false green here does not just
+  waste an hour — it **manufactures a coverage hole that does not exist**, and the work that
+  follows is machinery built to guard an unobserved case.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 

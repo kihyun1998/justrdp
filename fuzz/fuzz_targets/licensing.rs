@@ -29,10 +29,18 @@
 //!
 //! The direct arms exist for the reason #203 gave `gcc`'s per-block decoders their own: the
 //! sequence has an eight-byte prefix in front of every body parser, and each of those parsers is a
-//! `pub fn` reachable with no prefix at all. Measured on the proptest side, which samples the same
-//! way an unguided mutator does, the prefix is not a wall here — `PlatformChallenge` and
-//! `NewLicense` reach their trailing `MACData` read from undirected bytes often enough to catch a
-//! removed bound. The arms are still cheaper than relying on that.
+//! `pub fn` reachable with no prefix at all.
+//!
+//! The prefix is **not** a wall on the proptest side, which samples the way an unguided mutator
+//! does: `PlatformChallenge` and `NewLicense` reach their trailing `MACData` read from undirected
+//! bytes reliably enough that removing the `read_slice(MAC_SIZE)` bound turns both properties red
+//! on every run. That is measured, and it is the opposite of what `pointer` measured for its mask
+//! reads two modules over — the difference is that a licensing blob is one `u16` length in front
+//! of the read, where a pointer mask is a `messageType` dispatch and a 96-pixel dimension cap in
+//! front of it. **A prefix is not a wall by being long; it is a wall by how many of its fields
+//! have to coincide.** The arms are kept anyway: they cost one selector value and they make each
+//! parser reachable with no prefix at all, which is what keeps the target honest if the sequence
+//! ever grows a check.
 //!
 //! ## Byte layout
 //!

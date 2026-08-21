@@ -99,13 +99,37 @@ Read this before starting so the bindings do not read as abstractions.
 - **Two sequential reads from one hostile-length family: the first masks the second (#230).**
   Same change, found by running the mutation twice. With both pointer mask lengths generated as
   arbitrary `u16` (mean 32768) against a tail of at most 512 bytes, `read_slice(lengthXorMask)`
-  errors before the AND read in nearly every case — so injecting an out-of-bounds read into the
-  **XOR** mask turned all three properties red, and the identical injection into the **AND**
-  mask left both entry-point properties green. The generator needs to produce *satisfiable*
-  lengths as well as hostile ones, or everything downstream of the first length field is
-  untested and the property still reports covered.
+  errors before the AND read in nearly every case, so an out-of-bounds read injected into the AND
+  mask is caught by `decode_fastpath` in **1 of 3** runs — against **3 of 3** once the length
+  strategy also emits satisfiable values. The generator needs both kinds of length, or everything
+  downstream of the first length field is reached only by accident.
   The cheap general form: **mutate every read in the sequence, not the first one that goes red.**
   One red is enough to claim discriminating power and not enough to know what it discriminates.
+- **Weighting a generator is something you *add*; substituting is how the shallow reads go dark
+  (#230).** Fixing the reachability problem above by replacing the undirected body with a
+  structured one made the mask arithmetic reachable and made `decode_slowpath`'s `pad2Octets`
+  read **unreachable** — every generated body now carried a 4-byte prefix, so a body too short
+  for that read could not be produced at all. Measured: an unchecked read injected there, three
+  runs, nothing in the module red. One `truncate_to` arm at 10% weight took it to 3 of 3. The
+  shape to watch for is a generator that *assembles* rather than *samples*: it can only produce
+  inputs at least as long as what it assembles.
+- **The #189 mutation-harness trap recurred, in the repo that already had the note, and it
+  fabricated a finding (#230).** A harness that mutates, tests, reverts and immediately writes
+  the next mutation lands two writes in one filesystem timestamp tick; cargo skips the rebuild
+  and the run tests unmutated code. Three numbers came out wrong: an AND-mask row that read
+  "green" is "1 of 3", a run that read 0 red is 3, and an entire finding about `license`'s
+  `MACData` bound — *"5 of 10 property-runs red, a coin flip"* — evaporated on re-measurement
+  (unweighted catches it 2 of 2, every run). A weighted generator had already been written to fix
+  it and was reverted.
+  Three things this pins beyond #189's own entry. **The guard has to be in the harness, not in
+  the operator** — knowing the note existed did not prevent it; adding `Compiling <crate>` to the
+  assertions did. **A false green does not merely cost an hour, it manufactures a hole**, and
+  work then flows toward guarding a case nobody observed — which is the same waste as #171's
+  region-union machinery, arrived at from the other direction. And **a subagent lens using the
+  same broken instrument produces confident, reproducible, wrong numbers**: the refuting lens on
+  this change reported the `license` finding at 1/5 and 3/5, and it was reproduced here before
+  anyone thought to doubt the instrument. Reproducing a lens's claim with the lens's method is
+  not verification.
 - **When the suite is already green, the discriminating power has to come from somewhere
   that is not the suite (#198).** The change made every synthesised desktop step wait for the
   server's own repaint before sending the next one — and the VM suite passed 15/15 both before

@@ -196,15 +196,23 @@ mod tests {
     // injected into the AND-mask `read_slice` — while `malformed_pointers_are_typed_errors`, the
     // hand-written test beside it, went red on the same mutation.
     //
-    // The reason is arithmetic. To reach either `read_slice`, random bytes must land
-    // `message_type` on one of two values (2/65536) *and* both dimensions inside the 96-pixel cap
-    // ((97/65536)^2), which is about 6.7e-11 per case against a 2048-case budget.
+    // The reason is arithmetic, and it differs per entry point rather than being one number for
+    // all three. Both dimensions must land inside the 96-pixel cap — (97/65536)^2, about 2.2e-6,
+    // which is roughly 0.45% of a 2048-case run — and `decode_slowpath` additionally needs
+    // `messageType` on one of two values, taking it to about **6.7e-11** per case. So the slow
+    // path could not reach the masks at all and the other two reached them a few times per run,
+    // which was enough to be green on a bad day and is not a property anyone should rely on.
     //
     // So the header fields are **weighted** into the range the parser admits, not bounded to it:
     // every strategy below keeps an `any::<...>()` arm, so the reject arms — an unknown
     // `messageType`, an unknown `updateCode`, an over-cap dimension — stay driven. A generator
     // bounded to what the parser accepts would assert the parser rather than the function under
     // test, which is the mirror-image failure #211 measured in `nscodec`'s property.
+    //
+    // **Weighting is something you add, never something you substitute**, and the first version
+    // of this block got that wrong in the other direction: replacing the unstructured body with a
+    // structured one made the deep reads reachable and the shallow ones unreachable. See
+    // `truncate_to` on the slow-path property below for the read that cost.
     /// The five `messageType`s `decode_slowpath` dispatches, weighted against arbitrary values.
     fn slowpath_message_type() -> impl Strategy<Value = u16> {
         prop_oneof![
@@ -238,13 +246,22 @@ mod tests {
     /// A mask length: weighted into the neighbourhood of how many bytes the generator below
     /// actually appends, against a fully arbitrary `u16`.
     ///
-    /// The arbitrary arm alone is not enough, and the difference is measured. `lengthXorMask` is
-    /// read *first*, so an arbitrary `u16` (mean 32768) against a tail of at most 512 bytes errors
-    /// before the AND read in almost every case — the first length field masks the second. With
-    /// only the arbitrary arm, an out-of-bounds read injected into the **AND** mask left both
-    /// entry-point properties green while the same injection into the **XOR** mask turned all
-    /// three red. Weighting a small value in gives each read its own chance to be the one that
-    /// runs past the end.
+    /// The arbitrary arm alone leaves the *second* read thinly covered, and the difference is
+    /// measured. `lengthXorMask` is read first, so an arbitrary `u16` (mean 32768) against a tail
+    /// of at most 512 bytes errors before the AND read in almost every case. Injecting an
+    /// out-of-bounds read into the AND mask, three runs each with the rebuild verified:
+    ///
+    /// | | `decode_fastpath` red | `decode_slowpath` red | attribute property red |
+    /// |---|---|---|---|
+    /// | arbitrary length only | **1 of 3** | 3 of 3 | 3 of 3 |
+    /// | weighted (this fn) | 3 of 3 | 3 of 3 | 3 of 3 |
+    ///
+    /// So the effect is flaky-to-reliable rather than green-to-red, which is worth stating
+    /// precisely: an earlier revision of this comment claimed the entry-point properties were
+    /// *green* without the weighting, and that number came from a mutation harness whose rebuild
+    /// had been skipped (`lessons.md` §Step 3, the #189 trap). Two sequential reads from one
+    /// hostile-length family still need satisfiable lengths, or the second one is only reached by
+    /// accident.
     fn mask_length() -> impl Strategy<Value = u16> {
         prop_oneof![
             1 => 0u16..=600,
@@ -312,15 +329,23 @@ mod tests {
             let _ = ColorPointerAttribute::decode(&mut cur);
         }
 
+        // `truncate_to` is the correction to the correction, and it is the reason weighting is
+        // stated above as something you *add*. Prefixing every body with `messageType` and
+        // `pad2Octets` made the shape parser reachable and made a body shorter than four bytes
+        // **impossible to generate**, so the `pad2Octets` read at :116 was covered by nothing —
+        // measured, 3 runs of an unchecked read injected there, no test in this module red.
+        // `Vec::truncate` past the end is a no-op, so the `usize::MAX` arm is the ordinary case.
         #[test]
         fn decode_slowpath_never_panics_on_arbitrary_input(
             message_type in slowpath_message_type(),
             pad in any::<u16>(),
             rest in pointer_message_body(),
+            truncate_to in prop_oneof![9 => Just(usize::MAX), 1 => 0usize..=8],
         ) {
             let mut body = message_type.to_le_bytes().to_vec();
             body.extend_from_slice(&pad.to_le_bytes());
             body.extend_from_slice(&rest);
+            body.truncate(truncate_to);
             let mut cur = ReadCursor::new(&body, "proptest pointer slow-path");
             let _ = PointerUpdate::decode_slowpath(&mut cur);
         }

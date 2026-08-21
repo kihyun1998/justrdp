@@ -54,8 +54,14 @@ struct Input<'a> {
 }
 
 /// What `justrdp::session::on_pointer` does with a decoded shape, minus the cursor cache (which is
-/// core state, not a parser). 8-bpp shapes resolve through the session palette; a pointer message
-/// carries none of its own, so the session default is the faithful input.
+/// core state, not a parser).
+///
+/// The palette is `Palette::default()` because this target has no session to carry one, **not**
+/// because a default is what the live path passes. 8-bpp shapes resolve through the *session*
+/// palette, which the server sets via `FP_UPDATE_PALETTE` (`justrdp/src/session.rs:363`) and which
+/// `set_cursor_shape` forwards (`:437`). The substitution is inert for this target's purpose: the
+/// lookup is an index into a fixed 256-entry array, total for every palette, so no palette can
+/// reach a panic another cannot.
 fn blit(update: PointerUpdate) {
     let (xor_bpp, attr) = match update {
         // The Color message is implicitly 24-bpp; New carries its own depth.
