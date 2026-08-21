@@ -39,6 +39,16 @@ pub enum RfxError {
     /// The stream's context declares video mode (inter-frame diffing) — outside the image
     /// path WTS1 uses and outside issue #58's scope.
     VideoMode,
+    /// A band's dequantization shift is 16 or wider, which `i16 <<` has no meaning for.
+    ///
+    /// Unreachable from the wire — `Quant::decode` masks every exponent to `0..=15`, so the
+    /// widest shift a server can ask for is 14. The variant exists because that guarantee lives
+    /// in `justrdp-pdu`'s parser and not in `Quant`, whose fields are plain `pub u8`
+    /// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1). Named to match
+    /// `super::progressive::ProgressiveError::ShiftOutOfRange`, which is the same condition at
+    /// the same threshold in the sibling stage — where it *is* reachable, because a Progressive
+    /// shift is `quant + prog_quant - 1` and runs to 29.
+    ShiftOutOfRange(u8),
 }
 
 impl core::fmt::Display for RfxError {
@@ -47,6 +57,12 @@ impl core::fmt::Display for RfxError {
             RfxError::Parse(e) => write!(f, "TS_RFX parse: {e}"),
             RfxError::Rlgr(e) => write!(f, "RLGR decode: {e}"),
             RfxError::VideoMode => write!(f, "RemoteFX video mode is not supported"),
+            RfxError::ShiftOutOfRange(n) => {
+                write!(
+                    f,
+                    "a band's dequantization shift is {n}, which must be under 16"
+                )
+            }
         }
     }
 }
@@ -198,10 +214,13 @@ fn decode_tile(
         (tile.cr_data, tile.quant_idx_cr, &mut planes.cr),
     ];
     for (data, quant_idx, plane) in parts {
+        // The parser validated every index against the table. The shift table is derived and
+        // validated before a coefficient is touched (ADR-0012 §4), which is what leaves
+        // `dequantize` itself infallible.
+        let shifts = quant::shifts(&quants[usize::from(quant_idx)])?;
         rlgr::decode(entropy, data, component)?;
         quant::ll3_delta_decode(&mut component[quant::LL3_OFFSET..]);
-        // The parser validated every index against the table.
-        quant::dequantize(component, &quants[usize::from(quant_idx)]);
+        quant::dequantize(component, &shifts);
         dwt::decode(component, scratch);
         plane.copy_from_slice(component);
     }

@@ -9,6 +9,8 @@
 
 use justrdp_pdu::rfx::Quant;
 
+use super::RfxError;
+
 /// The coefficient count of one tile component (64×64).
 pub const COMPONENT_LEN: usize = 64 * 64;
 /// Offset of the LL3 subband — the last 64 coefficients.
@@ -54,28 +56,65 @@ pub const BANDS_EXTRAPOLATE: [(usize, usize); 10] = [
     (4015, 81),
 ];
 
-/// Undo scalar quantization in place: each subband's coefficients shift left by its quant
-/// exponent − 1 (an exponent of 0 or 1 leaves the band untouched).
-pub fn dequantize(buffer: &mut [i16], quant: &Quant) {
-    debug_assert_eq!(buffer.len(), COMPONENT_LEN);
-    let bands: [(usize, usize, u8); 10] = [
-        (0, 1024, quant.hl1),
-        (1024, 1024, quant.lh1),
-        (2048, 1024, quant.hh1),
-        (3072, 256, quant.hl2),
-        (3328, 256, quant.lh2),
-        (3584, 256, quant.hh2),
-        (3840, 64, quant.hl3),
-        (3904, 64, quant.lh3),
-        (3968, 64, quant.hh3),
-        (4032, 64, quant.ll3),
+/// The ten per-band left shifts a [`Quant`] asks for, in [`BANDS_STANDARD`] order — derived and
+/// validated as a **table**, before [`dequantize`] touches a coefficient.
+///
+/// `shift = exponent - 1`, and an exponent of 0 or 1 leaves its band untouched.
+///
+/// **The refusal is here rather than at the shift, and it is written on the shift rather than
+/// on the nibble** ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1–§2).
+/// `Quant::decode` masks every field to `0..=15`, so no server can reach the error — but the
+/// guarantee lives in the parser and the fields are plain `pub u8`, so it does not reach this
+/// function's contract. The threshold is `shift >= 16` because that is where `i16 <<` is
+/// undefined; stating it as "the exponent exceeds 15" would be off by one (an exponent of 16
+/// shifts by 15, which is well defined) and would refuse a different set of inputs than the
+/// sibling Progressive dequantizer does for the same stated reason
+/// (`super::progressive::first_pass_shift`).
+///
+/// FreeRDP refuses the same width in the shift primitive itself — `-1` from
+/// `general_lShiftC_16s_inplace` (`prim_shift.c:38-39`) — and then **discards** it: all ten
+/// `rfx_quantization_decode_block` calls drop the status and `rfx_quantization_decode` returns
+/// `TRUE` regardless (`rfx_quantization.c:73-83`), leaving the band unshifted. We fail the
+/// component instead, which is a deliberate divergence from FreeRDP's *handling* rather than
+/// from its threshold — the same split `super::progressive`'s first pass already records.
+///
+/// An exponent of **0** is left unshifted rather than refused, which is what FreeRDP rejects
+/// outright (`if (val < 1) return FALSE`, propagated through `rfx_decode.c`). That tolerance is
+/// unchanged here on purpose and is the open question in #233: the Progressive sibling refuses
+/// the identically undefined `bitPos == 0`, and this record does not settle which of the two is
+/// right.
+pub fn shifts(quant: &Quant) -> Result<[u8; 10], RfxError> {
+    let exponents = [
+        quant.hl1, quant.lh1, quant.hh1, quant.hl2, quant.lh2, quant.hh2, quant.hl3, quant.lh3,
+        quant.hh3, quant.ll3,
     ];
-    for (offset, len, q) in bands {
-        let factor = i16::from(q) - 1;
-        if factor > 0 {
-            for value in &mut buffer[offset..offset + len] {
-                *value <<= factor;
-            }
+    let mut out = [0u8; 10];
+    for (slot, exponent) in out.iter_mut().zip(exponents) {
+        let shift = exponent.saturating_sub(1);
+        if shift >= 16 {
+            return Err(RfxError::ShiftOutOfRange(shift));
+        }
+        *slot = shift;
+    }
+    Ok(out)
+}
+
+/// Undo scalar quantization in place: each subband's coefficients shift left by the amount
+/// [`shifts`] derived for it. A shift of 0 leaves the band untouched.
+///
+/// Infallible by construction: every shift came from [`shifts`], which refused anything `i16 <<`
+/// cannot take. Splitting the two is what lets the per-coefficient loop stay total without the
+/// caller threading a `Result` through it (ADR-0012 §4) — the shape
+/// `super::progressive::{first_pass_shift, dequantize_first_pass}` already uses.
+pub fn dequantize(buffer: &mut [i16], shifts: &[u8; 10]) {
+    debug_assert_eq!(buffer.len(), COMPONENT_LEN);
+    for (&(offset, len), &shift) in BANDS_STANDARD.iter().zip(shifts) {
+        debug_assert!(shift < 16, "shifts() rejects a wider shift");
+        if shift == 0 {
+            continue;
+        }
+        for value in &mut buffer[offset..offset + len] {
+            *value <<= shift;
         }
     }
 }
@@ -107,17 +146,126 @@ mod tests {
             hh1: 9,
         };
         let mut buffer = vec![1i16; COMPONENT_LEN];
-        dequantize(&mut buffer, &quant);
+        dequantize(
+            &mut buffer,
+            &shifts(&quant).expect("every exponent is in range"),
+        );
         assert_eq!(buffer[0], 1); // HL1, exponent 1 → untouched
         assert_eq!(buffer[1024], 1 << 7); // LH1, exponent 8
         assert_eq!(buffer[2048], 1 << 8); // HH1, exponent 9
         assert_eq!(buffer[3072], 1); // HL2, exponent 1
         assert_eq!(buffer[3328], 1 << 6); // LH2, exponent 7
         assert_eq!(buffer[3584], 1 << 7); // HH2, exponent 8
-        assert_eq!(buffer[3840], 1); // HL3, exponent 0
+        // HL3, exponent 0 — left untouched rather than failing the component. This is the
+        // tolerance #233 is open on: the Progressive sibling refuses the identically undefined
+        // `bitPos == 0` (`progressive::first_pass_shift` → `ZeroBitPosition`). Unchanged here
+        // deliberately; when #233 settles, this assertion is the artifact that moves.
+        assert_eq!(buffer[3840], 1);
         assert_eq!(buffer[3904], 1); // LH3, exponent 1
         assert_eq!(buffer[3968], 1 << 1); // HH3, exponent 2
         assert_eq!(buffer[LL3_OFFSET], 1 << 5); // LL3, exponent 6
+    }
+
+    /// The same exponent in every band.
+    fn uniform(exponent: u8) -> Quant {
+        Quant {
+            ll3: exponent,
+            lh3: exponent,
+            hl3: exponent,
+            hh3: exponent,
+            lh2: exponent,
+            hl2: exponent,
+            hh2: exponent,
+            lh1: exponent,
+            hl1: exponent,
+            hh1: exponent,
+        }
+    }
+
+    /// **Regression, #211.** `dequantize` used to take the `Quant` itself and shift by
+    /// `exponent - 1` with no bound, so a hand-constructed exponent of 17 or more panicked with
+    /// *"attempt to shift left with overflow"* — and in release, where `overflow-checks` is off,
+    /// silently wrapped the shift amount modulo 16 instead (exponent 200 shifted by 7).
+    ///
+    /// The contract is totality over the *parameter type*, not over the subset the parser
+    /// produces (ADR-0012 §1): `Quant`'s fields are plain `pub u8`, so every one of the 256
+    /// values is constructible by a caller even though no server can send one above 15.
+    #[test]
+    fn shifts_is_total_for_every_exponent_the_type_permits() {
+        for exponent in 0u8..=255 {
+            match shifts(&uniform(exponent)) {
+                Ok(table) => {
+                    assert!(
+                        exponent <= 16,
+                        "exponent {exponent} should have been refused"
+                    );
+                    // Whatever it accepted, applying it must also be total.
+                    let mut buffer = vec![i16::MAX; COMPONENT_LEN];
+                    dequantize(&mut buffer, &table);
+                }
+                Err(RfxError::ShiftOutOfRange(shift)) => {
+                    assert!(
+                        exponent >= 17,
+                        "exponent {exponent} should have been accepted"
+                    );
+                    assert_eq!(u32::from(shift), u32::from(exponent) - 1);
+                }
+                Err(other) => panic!("unexpected error for exponent {exponent}: {other:?}"),
+            }
+        }
+    }
+
+    /// **The off-by-one this issue was filed with, pinned.** #211's body reads "a `Quant` whose
+    /// nibbles exceed 15", and the boundary is one higher: an exponent of 16 shifts by 15, which
+    /// `i16 <<` is perfectly happy with. Writing the guard on the nibble rather than on the
+    /// shift would refuse a different set of inputs than the sibling Progressive dequantizer
+    /// does for the same stated reason (`first_pass_shift`'s `if shift >= 16`), which is the
+    /// whole point of ADR-0012 §2.
+    #[test]
+    fn the_refusal_threshold_is_the_shift_not_the_nibble() {
+        assert_eq!(shifts(&uniform(15)).expect("15 is in range")[0], 14);
+        assert_eq!(shifts(&uniform(16)).expect("16 shifts by 15")[0], 15);
+        assert_eq!(shifts(&uniform(17)), Err(RfxError::ShiftOutOfRange(16)));
+
+        // And the accepted edge really does shift: 1 << 15 is i16::MIN, not a no-op.
+        let mut buffer = vec![1i16; COMPONENT_LEN];
+        dequantize(&mut buffer, &shifts(&uniform(16)).expect("16 shifts by 15"));
+        assert_eq!(buffer[0], i16::MIN);
+    }
+
+    /// The validity condition under which the refusal is unreachable, asserted rather than
+    /// asserted-in-prose: `Quant::decode` masks every field with `& 0x0F` / `>> 4`, so the
+    /// widest exponent a server can send is 15. If that ever stops holding, this goes red before
+    /// anything else does.
+    #[test]
+    fn no_exponent_the_parser_can_produce_is_refused() {
+        for exponent in 0u8..=15 {
+            shifts(&uniform(exponent)).expect("the parser's whole range must decode");
+        }
+    }
+
+    /// Each of the ten bands carries the refusal independently — a table validated in nine
+    /// places and not the tenth would be the silent shape this territory keeps finding.
+    #[test]
+    fn every_band_carries_its_own_refusal() {
+        let mut quants = [uniform(1); 10];
+        quants[0].hl1 = 17;
+        quants[1].lh1 = 17;
+        quants[2].hh1 = 17;
+        quants[3].hl2 = 17;
+        quants[4].lh2 = 17;
+        quants[5].hh2 = 17;
+        quants[6].hl3 = 17;
+        quants[7].lh3 = 17;
+        quants[8].hh3 = 17;
+        quants[9].ll3 = 17;
+        for (band, quant) in quants.iter().enumerate() {
+            assert_eq!(
+                shifts(quant),
+                Err(RfxError::ShiftOutOfRange(16)),
+                "band {band} did not carry the refusal"
+            );
+        }
     }
 
     #[test]
