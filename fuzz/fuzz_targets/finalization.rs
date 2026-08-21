@@ -27,14 +27,27 @@
 //! input is the raw `&[u8]` rather than an `Arbitrary` struct — nothing outside this file
 //! depends on a layout.
 //!
-//! ## What the lane adds over the properties
+//! ## What the lane adds over the properties: almost nothing, and the honest reason is not
+//! the usual one
 //!
-//! Less than usual, and saying so is the honest form of the entry. These parsers have no
-//! exact-match gate in front of their reads, so undirected bytes reach every one of them:
-//! measured at 5 runs each, an unchecked read in any of the three turns its own proptest red
-//! every time. The lane's distinct value here is its `-timeout` (a hang, which proptest cannot
-//! catch) and coverage guidance over the `Control`/`FontMap` field combinations — not
-//! reachability, which the stable gate already has.
+//! These parsers have no exact-match gate in front of their reads, so undirected bytes reach
+//! every one of them — measured at 5 runs each, an unchecked read in any of the three turns its
+//! own proptest red every time. So the stable gate already has reachability.
+//!
+//! An earlier revision of this header claimed the lane's remaining value was `-timeout` (hangs)
+//! and coverage guidance over field combinations. **Both are false here, and the correction is
+//! worth keeping because the sentence is a template that fits most targets in this directory.**
+//! No branch in any of the three parsers depends on a field *value* — every read is stored or
+//! discarded unconditionally — so libFuzzer's entire feature set is the nine length checks in
+//! `ReadCursor::ensure`, saturated by inputs of length 0..8. And there is no loop anywhere in
+//! the three, so `-timeout` has no hang to catch.
+//!
+//! What the target is actually for: **roster uniformity and regression insurance.** `fuzz.yml`
+//! derives its matrix from this directory, so a parser family with no file reads as a decision
+//! nobody made — which is the shape #237 exists to close — and the day one of these grows a
+//! length field or a loop, the target is already there and already in the matrix. That is a
+//! weaker claim than the one it replaces, and it is the true one. The cost is one 300s matrix
+//! job guarding nine branches.
 
 use libfuzzer_sys::fuzz_target;
 use justrdp_pdu::cursor::ReadCursor;

@@ -151,7 +151,17 @@ mod tests {
     // every read is unconditional and fixed-width, so the only thing needed to drive a bounds
     // check is a short buffer, which a `0..=512` length hits in ~1.6% of cases. Mutation-checked
     // at 5 runs each, rebuild asserted: an unchecked read in any of the three turns its own
-    // property red every time.
+    // property red every time, and that holds for **every** read rather than the first one --
+    // all nine were mutated, because #230's second round came from stopping at the first red.
+    //
+    // "No gate" is true of the parsers and false of the *path*, which is why these properties
+    // drive the `pub fn` rather than `justrdp::connect::finalization_step`. Through the live
+    // path a body must first satisfy `ShareControlHeader.pduType & 0x000F == 0x7` and then an
+    // exact `ShareDataHeader.pduType2`, so undirected bytes reach `FontMap::decode`'s first read
+    // with P ~ 2.4e-4 and its *fourth* with P ~ 9.5e-7 -- about two thousandths of a hit across a
+    // whole 2048-case run. A live-path property would have been green over the `entrySize`
+    // mutation. ADR-0008 targets the entry point a server can reach, and the entry point is what
+    // this crate publishes.
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2048))]
 

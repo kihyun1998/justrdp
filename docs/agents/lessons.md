@@ -60,9 +60,15 @@ Read this before starting so the bindings do not read as abstractions.
   edge which *exists* runs both ways, and a territory claiming no invariant is consistent with
   an invariant claiming no territory. **A reciprocity gate proves the edges you drew are
   symmetric, never that you drew them** — the same shape as #200's hand-kept matrix and #230's
-  module-name roster, one artifact further out. The check that finds it is one line in a
-  completeness pass: list every territory whose `## Code` names a parser module and ask which
-  do not claim the invariant.
+  module-name roster, one artifact further out. The check that finds it belongs in a
+  completeness pass: list every territory whose `## Code` names a parser module and ask which do
+  not claim the invariant — a candidate list a human adjudicates rather than an answer, since a
+  constant-table territory (`pdu-constants`, which names eight parser modules) legitimately
+  claims nothing.
+  **And the check is bounded by the invariant's own derivation, which is the harder half.** That
+  derivation greps `crates/justrdp-pdu/src` only, so a decode path in `crates/justrdp/src` is
+  outside it *by construction* — the same blindness #189 recorded for a decoder living in a
+  dependency, one crate closer to home.
 - **CVE knowledge is a reference, not a memory** — rle/planar/clearcodec/nsc OOB
   points (memory `rdp_decoder_robustness_refs`); read them at FreeRDP source.
 
