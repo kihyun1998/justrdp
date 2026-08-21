@@ -441,6 +441,23 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// A DER length field as `read_der_length` accepts it: the short form, both long forms it
+    /// supports, and the unsupported ones. The *value* is unconstrained in every arm -- a length
+    /// that overshoots the buffer is the whole point -- so this generates the encoding, not a
+    /// bound on what it may claim.
+    fn der_length() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            3 => (0u8..=0x7F).prop_map(|n| vec![n]),
+            2 => any::<u8>().prop_map(|n| vec![0x81, n]),
+            3 => any::<u16>().prop_map(|n| {
+                let mut v = vec![0x82];
+                v.extend_from_slice(&n.to_be_bytes());
+                v
+            }),
+            1 => any::<u8>().prop_map(|n| vec![n]),
+        ]
+    }
+
     proptest! {
         // ADR-0008 / issue #97 — the no-panic robustness property for a server-controlled PDU
         // parser. `ServerLicenseRequest::decode` is the deepest license parse: it walks the
@@ -504,6 +521,46 @@ mod tests {
         ) {
             let mut cur = ReadCursor::new(&data, "proptest new license");
             let _ = NewLicense::decode(&mut cur);
+        }
+
+        // `RsaPublicKey::from_pkcs1_der` is the fifth live-path parser in this module and the one
+        // #230's own census missed on its first pass, because it does not hang off the preamble
+        // dispatch: `justrdp/src/connect.rs:1003` hands it the `subjectPublicKey` of the server's
+        // X.509 licensing leaf, on a path `ServerLicenseRequest::decode` never reaches (that
+        // decoder only collects the certificate as a raw blob).
+        //
+        // It is the *most* arithmetic-carrying parser here, not the least: a hand-walked DER
+        // reader with its own tag checks, its own length decoder including the `0x82` two-byte
+        // long form, a `read_slice(modulus_len)`, and two leading-zero trim loops. Measured before
+        // it was written: an unchecked modulus read leaves the entire workspace suite green.
+        //
+        // And measured again after: with `vec(any::<u8>(), 0..=512)` this property caught that
+        // same injection in **0 of 3** runs. Three exact tag bytes have to line up (`0x30`, then
+        // `0x02`, then `0x02`) before the modulus read happens at all, which is the `gcc` magic
+        // prefix one crate over. So the shape is generated and only the *lengths* are hostile --
+        // the `any::<u8>()` arms on each tag keep every reject branch driven.
+        #[test]
+        fn from_pkcs1_der_never_panics_on_arbitrary_input(
+            seq_tag in prop_oneof![4 => Just(0x30u8), 1 => any::<u8>()],
+            seq_len in der_length(),
+            mod_tag in prop_oneof![4 => Just(0x02u8), 1 => any::<u8>()],
+            mod_len in der_length(),
+            modulus in proptest::collection::vec(any::<u8>(), 0..=64),
+            exp_tag in prop_oneof![4 => Just(0x02u8), 1 => any::<u8>()],
+            exp_len in der_length(),
+            exponent in proptest::collection::vec(any::<u8>(), 0..=8),
+            truncate_to in prop_oneof![3 => Just(usize::MAX), 2 => 0usize..=12],
+        ) {
+            let mut der = vec![seq_tag];
+            der.extend_from_slice(&seq_len);
+            der.push(mod_tag);
+            der.extend_from_slice(&mod_len);
+            der.extend_from_slice(&modulus);
+            der.push(exp_tag);
+            der.extend_from_slice(&exp_len);
+            der.extend_from_slice(&exponent);
+            der.truncate(truncate_to);
+            let _ = RsaPublicKey::from_pkcs1_der(&der);
         }
     }
 

@@ -161,6 +161,46 @@ mod tests {
         ) {
             let _ = decode_updates(&frame);
         }
+
+        // `frame_len` re-parses the same header `decode_updates` re-parses, and #230's
+        // completeness pass found it driven by nothing at all -- measured, not inferred: an
+        // unchecked read injected into its `length2` branch leaves the **entire workspace suite
+        // green**, where the `tpkt` sibling at least has a hand-written test.
+        //
+        // The pair is also this repo's own ADR-0012 shape sitting in plain sight:
+        // `decode_updates` opens with `cur.read_u8()?; // fpOutputHeader (validated by frame_len)`
+        // -- a consumption site holding a guarantee a *different* call site established. That
+        // comment is true of the session loop and says nothing about a caller reaching
+        // `decode_updates` directly, which its own `pub` signature admits and its fuzz target
+        // does on every input.
+        //
+        // `is_fastpath` is driven beside it because it is a `pub fn` over the same first byte the
+        // session loop demuxes on (`justrdp/src/session.rs:251`); it reads nothing, so it is total
+        // by construction and costs one line to keep out of the uncovered enumeration.
+        // Weighted for the same measured reason as `tpkt`'s sibling: undirected bytes caught an
+        // unchecked `length2` read in **1 of 3** runs. The header byte must clear `0xC0`, the
+        // first length byte must set its high bit to reach the two-byte form, and the buffer must
+        // then end exactly there. The unweighted arms keep the encrypted-flags reject branch and
+        // the one-byte length form driven.
+        #[test]
+        fn frame_len_never_panics_on_arbitrary_input(
+            header in prop_oneof![3 => 0u8..=0x3F, 1 => any::<u8>()],
+            length1 in prop_oneof![3 => 0x80u8..=0xFF, 1 => any::<u8>()],
+            tail in proptest::collection::vec(any::<u8>(), 0..=64),
+            truncate_to in prop_oneof![3 => Just(usize::MAX), 2 => 0usize..=4],
+        ) {
+            let mut buf = vec![header, length1];
+            buf.extend_from_slice(&tail);
+            buf.truncate(truncate_to);
+            if let Some(&first) = buf.first() {
+                let _ = is_fastpath(first);
+            }
+            let _ = frame_len(&buf);
+            // `decode_updates` re-parses the same header, and its own comment says it is
+            // "validated by frame_len" -- a guarantee held at a different call site (ADR-0012).
+            // Driving both from one strategy is what makes that comment testable.
+            let _ = decode_updates(&buf);
+        }
     }
 
     #[test]

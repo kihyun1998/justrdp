@@ -176,6 +176,28 @@ that trusts its server too much) rather than as memory safety.
   a false green is the instrument all of them are made with. A false green here does not just
   waste an hour — it **manufactures a coverage hole that does not exist**, and the work that
   follows is machinery built to guard an unobserved case.
+
+  A second-order consequence, and the reason this change commits **no** `proptest-regressions`
+  file: a committed seed can make a mutation deterministically red whatever the strategy does, so
+  the next person's discriminating-power measurement is answered by the seed rather than by the
+  generator. Seeds harvested from deliberately-broken builds are worth less than the measurement
+  they distort. (`gcc.txt` / `mcs.txt` / `tpkt.txt` predate this and are left alone.)
+- **#230, fifth: an undirected no-panic property is the exception, not the default, and three
+  more instances landed in one change.** After `pointer`, the same measurement was run on every
+  entry point this issue added, and **`tpkt::frame_len` (0 of 3 runs red), `fastpath::frame_len`
+  (1 of 3) and `license::RsaPublicKey::from_pkcs1_der` (0 of 3)** each shipped green over an
+  injected out-of-bounds read before their generators were structured. Weighted, all four are 5
+  of 5.
+
+  Four instances make it a rule rather than a story: **if a parser has any exact-match gate in
+  front of its arithmetic — a version byte, a flags mask, an ASN.1 tag, a dispatch code, a
+  dimension cap — `vec(any::<u8>(), 0..=N)` does not reach past it**, and the property is
+  asserting the gate. Generate the shape, keep an `any::<...>()` arm on every gate so its reject
+  branch stays driven, leave the *lengths* hostile, and add a truncation arm so the shallow reads
+  behind the shape stay reachable. The corollary is the cheap one: **a new no-panic property is
+  not done when it passes — it is done when a mutation of the read it names has been seen to turn
+  it red**, and #203's `gcc` measurement (11.98% of regions from 200k undirected inputs) was this
+  same fact stated as a coverage number a year of properties earlier.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
@@ -200,8 +222,11 @@ rg --files crates/justrdp-pdu/src -g '*.rs'   # what parses untrusted bytes
 
 The gap used to be the whole connect sequence. #200 closed the mechanical half of it —
 `tpkt`, `x224`, `nego`, `dvc`, `svc` and `displaycontrol` now carry a target and a
-property — and #203 closed `gcc` and `mcs`. So what the second command still finds without
-a target is:
+property — and #203 closed `gcc` and `mcs`. **Read that sentence as the module claim it is**:
+#230 re-ran the derivation by entry point and found `tpkt::frame_len` and `fastpath::frame_len`
+uncovered inside two of those very modules, each a *second* parse of the same header its
+`decode` re-parses rather than a helper it calls. Both are closed now, and the census that finds
+the next one is spelled out below. So what remains without a target is:
 
 - **`ber` and `per`**, which are ASN.1 *primitives* (`read_length`, `read_integer`,
   `read_octet_string`), not PDU parsers. Fuzzing them in isolation asserts little; the

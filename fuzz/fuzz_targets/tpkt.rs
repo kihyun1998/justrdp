@@ -10,5 +10,10 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    // `frame_len` is a second parse of the same header, not a helper `decode` calls, and it is
+    // the one the session loop runs on every frame to size its slice (#230). Driven on every
+    // input rather than behind a selector: it is four bytes of work, so the arm would cost more
+    // than the call.
+    let _ = justrdp_pdu::tpkt::frame_len(data);
     let _ = justrdp_pdu::tpkt::decode(data);
 });

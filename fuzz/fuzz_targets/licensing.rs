@@ -9,10 +9,16 @@
 //! `fuzz_targets/license.rs` drives `ServerLicenseRequest::decode` — the deepest parse, and the
 //! reason it was the one worth a target first. It calls none of the others. So `license` appeared
 //! in `ls fuzz_targets/` and the module appeared in the walk of what parses untrusted bytes, the
-//! two derivations matched **by name**, and four `pub fn`s on the live path were left driven by
-//! nothing: `LicensePreamble::decode`, `LicenseError::decode`, `PlatformChallenge::decode` and
-//! `NewLicense::decode`. Identical shape to the `pointer` name the invariant already records, one
-//! module over — see `docs/map/invariant/untrusted-decode-never-panics.md`.
+//! two derivations matched **by name**, and five `pub fn`s on the live path were left driven by
+//! nothing: `LicensePreamble::decode`, `LicenseError::decode`, `PlatformChallenge::decode`,
+//! `NewLicense::decode` and `RsaPublicKey::from_pkcs1_der`. Identical shape to the `pointer` name
+//! the invariant already records, one module over — see
+//! `docs/map/invariant/untrusted-decode-never-panics.md`.
+//!
+//! `from_pkcs1_der` is the one the first pass of that census also missed, because it does not hang
+//! off the preamble dispatch at all: `connect.rs:1003` reaches it through the X.509 certificate.
+//! Measured before it got either artifact — an unchecked modulus read left the entire workspace
+//! suite green.
 //!
 //! `client_info::decode_basic_security_header` joins them here rather than taking a target of its
 //! own. It is four bytes — two bounds-checked `read_u16_le`s, no length, count or offset
@@ -21,11 +27,13 @@
 //! seconds and then idle through a 300s budget, which is the same reason `mcs.rs` spends one
 //! target on five parsers rather than five.
 //!
-//! ## The two arms
+//! ## The arms
 //!
 //! `Sequence` walks what `license_step` walks, off one cursor: security header, preamble, then the
 //! body parser `bMsgType` selects (`justrdp/src/connect.rs:854-950`). That is the composition a
 //! server actually drives, and it is where a length consumed by one parser can misplace the next.
+//! `RsaPublicKey` is the arm with no sequence behind it — nothing in the preamble dispatch
+//! reaches the certificate path, so a direct arm is the only way it is driven at all.
 //!
 //! The direct arms exist for the reason #203 gave `gcc`'s per-block decoders their own: the
 //! sequence has an eight-byte prefix in front of every body parser, and each of those parsers is a
@@ -70,6 +78,7 @@ enum Entry {
     Request,
     PlatformChallenge,
     NewLicense,
+    RsaPublicKey,
 }
 
 #[derive(Arbitrary, Debug)]
@@ -127,6 +136,12 @@ fuzz_target!(|input: Input<'_>| {
         }
         Entry::NewLicense => {
             let _ = license::NewLicense::decode(&mut cur);
+        }
+        // Not reachable from `sequence`: `connect.rs:1003` calls this on the `subjectPublicKey`
+        // of the server's X.509 licensing leaf, a path the preamble dispatch never crosses. It is
+        // the module's only hand-walked DER reader, and nothing drove it until #230.
+        Entry::RsaPublicKey => {
+            let _ = license::RsaPublicKey::from_pkcs1_der(d);
         }
     }
 });
