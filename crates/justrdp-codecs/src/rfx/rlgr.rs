@@ -263,4 +263,147 @@ mod tests {
         decode(EntropyAlgorithm::Rlgr3, &[0x00; 8], &mut out).expect("zero runs decode");
         assert!(out.iter().all(|&v| v == 0));
     }
+
+    // --- BitReader contracts -------------------------------------------------
+    //
+    // The ADR-0007 stage differential only compares streams *both* implementations
+    // accept (see `differential_rfx.rs`), so it structurally cannot see the truncation
+    // and end-of-stream behaviour these pin. Each asserts a side condition — the cursor
+    // after a refused read, the absence of a terminator — not just a happy value.
+    //
+    // They exist because #91 proposed replacing this reader with a word-buffered one and
+    // the measurement rejected it: real RLGR streams have a **mean run length of 1.0
+    // bits** (66.7% of runs are zero-length, 0.01% reach 64 bits), so leading-zero
+    // counting has nothing to count, and `rlgr::decode` is 4.6% of a real corpus decode
+    // to begin with. The contracts are the same either way, so the tests stayed. Anyone
+    // re-attempting that optimization inherits the safety net rather than rebuilding it.
+
+    #[test]
+    fn read_bits_is_all_or_nothing_and_leaves_the_cursor_put() {
+        let mut r = BitReader::new(&[0b1010_0000]);
+        assert_eq!(r.read_bits(3), Some(0b101));
+        assert_eq!(r.remaining(), 5);
+        // Six bits asked of five: refused, and the cursor must not have moved.
+        assert_eq!(r.read_bits(6), None);
+        assert_eq!(r.remaining(), 5, "a refused read may not consume anything");
+        assert_eq!(r.read_bits(5), Some(0b00000), "the cursor is still usable");
+    }
+
+    #[test]
+    fn read_bits_of_zero_reads_nothing() {
+        let mut r = BitReader::new(&[0xFF]);
+        assert_eq!(r.read_bits(0), Some(0));
+        assert_eq!(r.remaining(), 8, "a zero-width read consumes no bits");
+    }
+
+    #[test]
+    fn read_bits_is_msb_first_across_byte_boundaries() {
+        let mut r = BitReader::new(&[0b0001_0010, 0b0011_0100]);
+        assert_eq!(r.read_bits(4), Some(0b0001));
+        // Straddles the boundary: 0010 from byte 0, then 0011 from byte 1.
+        assert_eq!(r.read_bits(8), Some(0b0010_0011));
+        assert_eq!(r.read_bits(4), Some(0b0100));
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn read_bits_handles_the_widest_read_the_decoder_asks_for() {
+        // RLGR3 reads `32 - code.leading_zeros()` bits, so 32 is reachable.
+        let mut r = BitReader::new(&[0xDE, 0xAD, 0xBE, 0xEF, 0x55]);
+        assert_eq!(r.read_bits(32), Some(0xDEAD_BEEF));
+        assert_eq!(r.remaining(), 8);
+        // And at a non-zero bit offset, where a buffered load has to shift.
+        let mut r = BitReader::new(&[0x0D, 0xEA, 0xDB, 0xEE, 0xF5]);
+        assert_eq!(r.read_bits(4), Some(0));
+        assert_eq!(r.read_bits(32), Some(0xDEAD_BEEF));
+        assert_eq!(r.remaining(), 4);
+    }
+
+    #[test]
+    fn count_leading_stops_at_the_stream_end_without_a_terminator() {
+        // Eight 1-bits and nothing after: the run is 8, not an error and not 9.
+        let mut r = BitReader::new(&[0xFF]);
+        assert_eq!(r.count_leading(true), 8);
+        assert_eq!(r.remaining(), 0);
+        assert_eq!(
+            r.read_bits(1),
+            None,
+            "the terminator the caller then asks for is genuinely absent"
+        );
+    }
+
+    #[test]
+    fn count_leading_does_not_count_the_zero_padding_past_the_end() {
+        // The bit-at-a-time reader gets this from its `pos < len * 8` bound. A buffered
+        // one has to work for it: counting 1s means counting the leading zeros of an
+        // inverted window, and a window zero-padded past the buffer inverts to 1s, so
+        // an unclamped count reports a run longer than the stream.
+        for len in 1..=9usize {
+            let data = vec![0xFFu8; len];
+            let mut r = BitReader::new(&data);
+            assert_eq!(
+                r.count_leading(true),
+                len * 8,
+                "all-ones run of {len} byte(s) must be exactly {} bits",
+                len * 8
+            );
+            assert_eq!(r.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn count_leading_of_zeros_stops_at_the_end_of_a_short_stream() {
+        // Zeros are the asymmetric case, and the reason `remaining` clamps the run at all.
+        // Counting 1s is self-terminating: the window's zero padding inverts to 1s and ends
+        // the leading-zero count on its own. Counting 0s has no such brake — the padding
+        // *matches* the value — so only `remaining` stops it. Every other zero-run test here
+        // happens to end on a byte-and-window boundary or carries a terminator, which is why
+        // dropping the clamp left them all green.
+        for len in 1..=7usize {
+            let data = vec![0x00u8; len];
+            let mut r = BitReader::new(&data);
+            assert_eq!(
+                r.count_leading(false),
+                len * 8,
+                "an unterminated zero run of {len} byte(s) is {} bits, not a whole window",
+                len * 8
+            );
+            assert_eq!(r.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn count_leading_spans_more_than_one_word() {
+        // 100 bytes of 0xFF is 800 consecutive 1-bits — far past any single 32- or 64-bit
+        // window, so a reader that counts one window and stops reports 32 or 64 instead.
+        let data = vec![0xFFu8; 100];
+        let mut r = BitReader::new(&data);
+        assert_eq!(r.count_leading(true), 800);
+
+        // The same for zeros, and with a terminating 1 so the run is bounded by data
+        // rather than by the end of the stream.
+        let mut data = vec![0x00u8; 100];
+        data.push(0x80);
+        let mut r = BitReader::new(&data);
+        assert_eq!(r.count_leading(false), 800);
+        assert_eq!(r.read_bits(1), Some(1), "the terminator is next");
+    }
+
+    #[test]
+    fn count_leading_starts_from_a_mid_byte_cursor() {
+        // 0b0000_0111 then 0xFF: after consuming 5 bits the run of 1s is 3 + 8 = 11.
+        let mut r = BitReader::new(&[0b0000_0111, 0xFF]);
+        assert_eq!(r.read_bits(5), Some(0));
+        assert_eq!(r.count_leading(true), 11);
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn count_leading_of_a_non_matching_first_bit_is_zero() {
+        let mut r = BitReader::new(&[0b0111_1111]);
+        assert_eq!(r.count_leading(true), 0, "the first bit is 0");
+        assert_eq!(r.remaining(), 8, "and nothing was consumed");
+        assert_eq!(r.count_leading(false), 1);
+        assert_eq!(r.count_leading(true), 7);
+    }
 }

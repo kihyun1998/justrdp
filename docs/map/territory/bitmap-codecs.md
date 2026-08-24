@@ -258,11 +258,19 @@ as citations.
   **desync** once the store is keyed by surface — the server's encoder keeps its reference
   frames across a reset and `RFX_TILE_DIFFERENCE` adds against them. Both frees are gone;
   `DELETESURFACE` and the `CREATESURFACE` replace path are the only things that free now.
-  #91 is the RLGR bit-reader performance work. **Its verification basis is owned as of #194** — a
-  real-server corpus plus FreeRDP-derived SRL expectations, not an oracle diff, because the
-  oracle decodes 2 of 52 real payloads (ADR-0011). The SRL half of that basis was
-  **re-derived in #168**: five of its eight vectors had been computed at the oracle's initial
-  `kp`.
+  #91 proposed a word-buffered RLGR bit reader and **the measurement rejected it**: `rlgr::decode`
+  is **4.6%** of a real corpus decode, and real streams have a **mean run length of 1.0 bits**
+  (66.7% of runs are zero-length, 0.01% reach 64 bits, none reaches 256), so leading-zero
+  counting has nothing to count. Two implementations were measured — a peek-per-call reader at
+  2.1× slower and FreeRDP's incremental-accumulator shape at 6–12% slower on the dominant path
+  against 1.93× faster on long runs the server never sends. What landed instead is the reader's
+  **contract tests**, which the ADR-0007 stage differential structurally cannot supply: it
+  compares only streams *both* implementations accept, so truncation and end-of-stream behaviour
+  are outside it. **Its verification basis is owned as of #194** — a real-server corpus plus
+  FreeRDP-derived SRL expectations, not an oracle diff, because the oracle decodes 2 of 52 real
+  payloads (ADR-0011); the *stage* differential remains valid and discriminating, which is a
+  different layer from the whole-payload one. The SRL half of that basis was **re-derived in
+  #168**: five of its eight vectors had been computed at the oracle's initial `kp`.
 - **FreeRDP's deferred re-blit is not modelled, and that is measured rather than assumed.**
   Its per-surface frame state — `frameId`, `numUpdatedTiles`, `updatedTileIndices`, a per-tile
   `dirty` flag (`progressive.h:190-201`), reset by the frame id changing
