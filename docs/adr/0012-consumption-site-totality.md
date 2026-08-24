@@ -4,6 +4,12 @@
   - Amendment 2026-08-24 (#233): §3's outstanding instance is settled — WireToSurface1 refuses a
     zero quantization exponent, so the two RemoteFX dequantizers now answer it alike and the
     record needs no divergence row. See §3.
+  - Amendment 2026-08-24 (#241/#238): the class this record owns **has an enumeration now**, and
+    it is a derivation rather than a list — ③ in
+    [untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md). Producing
+    it is what #238 turned out to be: it named eight uncovered members where the issue had named
+    one, and working them found four defects (two wire-reachable). Conformance items: #211, #233,
+    #238, #241.
 - Date: 2026-08-21
 
 ## Context
@@ -162,6 +168,14 @@ this; it asserts the parser, not the function.
   `1..=7` in `parse_header` — **a different function**. It panics at `color_loss_level >= 17`,
   reproduced. That is the third site in what #211's census had recorded as two, and it is the
   evidence that this record is a rule rather than a filing cabinet.
+
+  **Re-measured 2026-08-24 (#241/#238), and "three sites" was itself an artefact of hand-counting.**
+  Deriving the class instead of listing it turned up **eight** uncovered members, five of which no
+  issue had named — four of those in `justrdp::framebuffer`, a module the invariant listed as a
+  *territory* while nobody had listed its functions. Two of the four defects found are reachable
+  from the wire (`framebuffer::resize`, `nscodec::plane_sizes`), which is a different distribution
+  than this record's first four instances suggested: reachability is not rare in this class, it was
+  under-sampled.
 - **It is not a newtype mandate.** §1 is satisfied by a check at the consumption site; the
   guarantee is *not* required to move into the type. See the rejected alternative below for why
   the type-side answer was measured and declined.

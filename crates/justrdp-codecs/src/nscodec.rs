@@ -24,6 +24,16 @@ pub enum NscError {
         /// Why it is invalid.
         reason: &'static str,
     },
+    /// The declared geometry's byte count overflows `usize` on this target.
+    ///
+    /// Reachable from `decode`'s own `u16` parameters on a 32-bit target: `temp_dims` rounds the
+    /// width up to a multiple of 8, so 65535 becomes 65536 and `65536 * 65535` passes `u32::MAX`.
+    DimensionsOverflow {
+        /// The declared width.
+        width: usize,
+        /// The declared height.
+        height: usize,
+    },
 }
 
 impl fmt::Display for NscError {
@@ -31,6 +41,9 @@ impl fmt::Display for NscError {
         match self {
             NscError::NotEnoughBytes { ctx } => write!(f, "not enough bytes for {ctx}"),
             NscError::InvalidField { field, reason } => write!(f, "invalid `{field}`: {reason}"),
+            NscError::DimensionsOverflow { width, height } => {
+                write!(f, "{width}x{height} pixels overflow usize on this target")
+            }
         }
     }
 }
@@ -230,14 +243,32 @@ fn temp_dims(width: usize, height: usize) -> (usize, usize) {
 /// bitmap (FreeRDP `OrgByteCount`). When subsampled the luma plane is padded to `tempWidth` and the
 /// two chroma planes are quarter-area; alpha is always full resolution. Used to size the RLE decode
 /// (#140) and to bound reconstruction.
-pub fn plane_sizes(width: usize, height: usize, chroma_subsampled: bool) -> [usize; 4] {
+/// Fails when a product overflows `usize` — which on i686 and wasm32 is 32 bits, so
+/// `decode`'s own `u16` geometry can reach it: `temp_dims` rounds the width up to a multiple of
+/// 8, so a declared 65535 becomes 65536 and `65536 * 65535` passes `u32::MAX`. Reproduced by the
+/// property below before this returned a `Result`.
+///
+/// **Saturating would have been the wrong kind of total.** These four numbers are *bounds* that
+/// `decode_plane` then trusts, and its empty-input branch is `vec![0xFF; original_size]` — so a
+/// saturated `usize::MAX` turns an arithmetic overflow into an allocation of the whole address
+/// space. Refusing is the only answer that stays a refusal downstream
+/// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1).
+pub fn plane_sizes(
+    width: usize,
+    height: usize,
+    chroma_subsampled: bool,
+) -> Result<[usize; 4], NscError> {
+    let mul = |a: usize, b: usize| {
+        a.checked_mul(b)
+            .ok_or(NscError::DimensionsOverflow { width, height })
+    };
     if chroma_subsampled {
         let (tw, th) = temp_dims(width, height);
-        let chroma = (tw >> 1) * (th >> 1);
-        [tw * height, chroma, chroma, width * height]
+        let chroma = mul(tw >> 1, th >> 1)?;
+        Ok([mul(tw, height)?, chroma, chroma, mul(width, height)?])
     } else {
-        let n = width * height;
-        [n, n, n, n]
+        let n = mul(width, height)?;
+        Ok([n, n, n, n])
     }
 }
 
@@ -318,7 +349,7 @@ pub fn reconstruct(
 pub fn decode(data: &[u8], width: u16, height: u16) -> Result<Vec<u8>, NscError> {
     let (w, h) = (usize::from(width), usize::from(height));
     let (header, planes) = parse_header(data)?;
-    let sizes = plane_sizes(w, h, header.chroma_subsampled);
+    let sizes = plane_sizes(w, h, header.chroma_subsampled)?;
     let slices = split_planes(planes, &header.plane_byte_counts)?;
     let decoded = [
         decode_plane(slices[0], sizes[0])?,
@@ -575,9 +606,9 @@ mod tests {
 
     #[test]
     fn plane_sizes_match_freerdp_orgbytecount() {
-        assert_eq!(plane_sizes(3, 2, false), [6, 6, 6, 6]);
+        assert_eq!(plane_sizes(3, 2, false).unwrap(), [6, 6, 6, 6]);
         // subsampled 3×2: tempW=8, tempH=2 → Y=16, chroma=(4)*(1)=4, alpha=6.
-        assert_eq!(plane_sizes(3, 2, true), [16, 4, 4, 6]);
+        assert_eq!(plane_sizes(3, 2, true).unwrap(), [16, 4, 4, 6]);
     }
 
     #[test]
@@ -644,6 +675,21 @@ mod tests {
             decode(&s, 2, 1).unwrap(),
             [85, 105, 105, 255, 50, 50, 50, 255]
         );
+    }
+
+    proptest! {
+        /// `plane_sizes` multiplies wire dimensions in `usize` and returns four byte counts that
+        /// **bound** the RLE decode and the reconstruction — so a wrapped product does not merely
+        /// produce a wrong number, it produces a wrong *bound*. ADR-0012's class, and the member
+        /// the #238 enumeration turned up beside `to_rgba`.
+        #[test]
+        fn plane_sizes_is_total_over_arbitrary_dimensions(
+            width in prop_oneof![0usize..=64, 60_000usize..=70_000, any::<usize>()],
+            height in prop_oneof![0usize..=64, 60_000usize..=70_000, any::<usize>()],
+            subsampled in any::<bool>(),
+        ) {
+            let _ = plane_sizes(width, height, subsampled);
+        }
     }
 
     proptest! {

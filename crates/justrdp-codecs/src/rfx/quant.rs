@@ -343,6 +343,38 @@ mod tests {
         assert_eq!(buffer[0], 7);
     }
 
+    proptest::proptest! {
+        /// [untrusted decode never panics](../../../../../docs/map/invariant/untrusted-decode-never-panics.md)
+        /// for ADR-0012's own worked example. `shifts` and `dequantize` were the pair that opened
+        /// the record (#211) and the pair that closed its outstanding instance (#233), and until
+        /// now neither carried a property — only hand-written vectors, which is precisely the
+        /// evidence ADR-0012 §5 says does not discharge the obligation.
+        ///
+        /// The generator is the **whole `u8` range**, not the nibble range `Quant::decode`
+        /// produces. A generator bounded to the parser's output asserts the parser (ADR-0012
+        /// Consequences), and here that would hide both refusals: the zero at one end and the
+        /// 16-or-wider shift at the other.
+        #[test]
+        fn shifts_then_dequantize_is_total_over_every_exponent_tuple(
+            bands in proptest::collection::vec(proptest::prelude::any::<u8>(), 10..=10),
+        ) {
+            let quant = Quant {
+                hl1: bands[0], lh1: bands[1], hh1: bands[2],
+                hl2: bands[3], lh2: bands[4], hh2: bands[5],
+                hl3: bands[6], lh3: bands[7], hh3: bands[8],
+                ll3: bands[9],
+            };
+            if let Ok(table) = shifts(&quant) {
+                // Every accepted table must also apply without panicking, at the extreme
+                // coefficient values — the half a `shifts`-only property would miss.
+                let mut buffer = vec![i16::MIN; COMPONENT_LEN];
+                dequantize(&mut buffer, &table);
+                let mut buffer = vec![i16::MAX; COMPONENT_LEN];
+                dequantize(&mut buffer, &table);
+            }
+        }
+    }
+
     #[test]
     fn both_band_layouts_tile_the_component_exactly_once() {
         // A silently transposed or short band is this territory's recorded failure mode

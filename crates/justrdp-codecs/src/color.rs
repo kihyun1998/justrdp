@@ -230,6 +230,7 @@ fn scale6(c: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // Dimensions whose product overflows `usize` are a typed error, never a panic or wrap (#155,
     // sibling of #151). Only reachable on a 32-bit `usize`: 100_000 × 100_000 = 1e10 > u32::MAX but
@@ -309,6 +310,98 @@ mod tests {
     fn xrgb32_ignores_the_server_alpha_byte() {
         let out = to_rgba(&[9, 8, 7, 0], 1, 1, 32, &Palette::default(), false).unwrap();
         assert_eq!(out, [7, 8, 9, 255]);
+    }
+
+    /// The supported depths, as a strategy. **The bias is the point.** `bytes_per_pixel` is an
+    /// exact-match gate on `{8, 15, 16, 24, 32}`, so a uniform `u16` clears it about **5 times in
+    /// 65536** and everything past the gate — the `checked_mul` guards, the per-bpp row walks, the
+    /// `bottom_up` flip — would go unexercised while the property still ran green. This repo has
+    /// already shipped that exact defect once: `nscodec`'s no-panic property documented itself as
+    /// covering *"any colour-loss level"*, generated `1u8..=7`, and passed over a live panic
+    /// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) Consequences).
+    fn depth() -> impl Strategy<Value = u16> {
+        prop_oneof![
+            9 => prop::sample::select(vec![8u16, 15, 16, 24, 32]),
+            1 => any::<u16>(),
+        ]
+    }
+
+    /// Dimensions biased toward the two places the arithmetic changes behaviour: small values
+    /// that produce a real conversion, and values whose product overflows a **32-bit** `usize`
+    /// (#155). The second range does nothing on x86-64 — `checked_mul` succeeds and the
+    /// source-length check refuses — which is why the `overflow-32bit` CI job runs this crate.
+    fn dimension() -> impl Strategy<Value = usize> {
+        prop_oneof![
+            6 => 0usize..=32,
+            2 => 60_000usize..=70_000,
+            1 => any::<usize>(),
+        ]
+    }
+
+    proptest! {
+        /// [untrusted decode never panics](../../../../docs/map/invariant/untrusted-decode-never-panics.md).
+        /// `to_rgba` takes `width`, `height` and `bits_per_pixel` straight off the wire — a bitmap
+        /// update rectangle (`session.rs`) or an EGFX surface/cache command (`egfx.rs`) — and
+        /// sizes two buffers from their products. It is the third member of ADR-0012's class and
+        /// the one that had neither artifact (#238).
+        #[test]
+        fn to_rgba_is_total_over_arbitrary_dimensions(
+            bits in depth(),
+            width in dimension(),
+            height in dimension(),
+            src_len in 0usize..=1024,
+            bottom_up in any::<bool>(),
+        ) {
+            let src = vec![0xA5u8; src_len];
+            let _ = to_rgba(&src, width, height, bits, &Palette::default(), bottom_up);
+        }
+
+        /// The guard on its own, over the whole parameter type rather than the five values a
+        /// server sends.
+        #[test]
+        fn bytes_per_pixel_is_total_over_every_depth(bits in any::<u16>()) {
+            match bytes_per_pixel(bits) {
+                Ok(n) => prop_assert!(matches!((bits, n), (8, 1) | (15 | 16, 2) | (24, 3) | (32, 4))),
+                Err(ColorError::UnsupportedBitsPerPixel { .. }) => {
+                    prop_assert!(!matches!(bits, 8 | 15 | 16 | 24 | 32));
+                }
+                Err(other) => prop_assert!(false, "bytes_per_pixel returned {other:?}"),
+            }
+        }
+    }
+
+    /// **The generator's reach, asserted rather than assumed** — the bar the `nscodec` property
+    /// failed. A no-panic property that never gets past the depth gate asserts the gate, and
+    /// nothing about a green run says which it did. This walks the same strategy space
+    /// deterministically and requires that it produces both real conversions and refusals.
+    #[test]
+    fn the_generator_reaches_past_the_depth_gate() {
+        let mut converted = 0usize;
+        let mut refused = 0usize;
+        for (w, h, bits) in [
+            (2usize, 2usize, 8u16),
+            (2, 2, 15),
+            (2, 2, 16),
+            (2, 2, 24),
+            (2, 2, 32),
+            (0, 0, 32),
+            (70_000, 70_000, 32),
+            (2, 2, 7),
+        ] {
+            let src = vec![0xA5u8; 1024];
+            match to_rgba(&src, w, h, bits, &Palette::default(), false) {
+                Ok(_) => converted += 1,
+                Err(_) => refused += 1,
+            }
+        }
+        assert!(
+            converted >= 5,
+            "only {converted} of the supported depths converted"
+        );
+        assert!(
+            refused >= 2,
+            "only {refused} refusals — the guards are not being reached"
+        );
     }
 
     #[test]

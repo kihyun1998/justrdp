@@ -53,6 +53,21 @@ the exact shape the map's *reference behaviour* section exists to make visible.
 - [Decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md)
   — `width × height × 4` is computed here too.
 
+- **The framebuffer's own geometry is server-declared, and until #241/#238 nothing bounded
+  it.** `resize` computed `width * height * 4` unguarded from `DemandActive`'s desktop size and
+  from a Display Control `OutputResized`, neither clamped on the way in. On a 32-bit target that
+  product passes `u32::MAX` at the type's own maximum (reproduced on `i686-pc-windows-msvc`:
+  *"attempt to multiply with overflow"*; in release it wraps and leaves `width`/`height`
+  describing a buffer that was never allocated). It is now capped at `MAX_DESKTOP_DIM = 16384` —
+  **the same constant `justrdp::egfx` caps a surface at**, because an EGFX surface tracks the
+  desktop and two ceilings would differ only by accident — and at the cap the product is exactly
+  1 GiB, so it fits by construction rather than by a check.
+- **`blit` and `copy_rect_into` are refusals, not clips, and neither is wire-reachable.** Both
+  are `pub` and both had a total-arithmetic hole (`src_stride_px * 4` overflowing on *every*
+  target; an out-of-range slice index on a rect outside the buffer). Their callers pass values
+  a `FrameUpdate` produced, so reachability sets the priority and not the contract
+  ([ADR-0012](../../adr/0012-consumption-site-totality.md) §1).
+
 ## Blast radius
 
 - [Session loop & PDU dispatch](session-loop-dispatch.md) — emits the frame updates

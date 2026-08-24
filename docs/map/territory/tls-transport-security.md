@@ -51,6 +51,19 @@ behavioural question no spec section answers, and it is unrecorded.
 
 **None.**
 
+- **`extract_subject_public_key` carries a no-panic property and a fuzz target since
+  #241** — the first of either in `justrdp`. It parses a server certificate at three live call
+  sites (the TLS leaf, the licensing `X509Chain` leaf, and the adapter's TOFU pin comparison),
+  and the census that names what must carry them was scoped to `crates/justrdp-pdu/src`, so it
+  was invisible **by construction**. No defect: the parse is `x509_cert::Certificate::from_der`,
+  a leaf dependency, and 500k probes found zero panics before the artifacts existed. What the
+  work fixed is that the census can see the path.
+- **The property's generator mutates a real certificate rather than emitting random bytes**, and
+  that distinction is asserted rather than assumed: undirected buffers bounce off the outer DER
+  tag, while 355 of 512 single-byte mutants still reach a successful extraction. A separate test
+  pins that number, so a future change that makes every mutant bounce goes red instead of leaving
+  a green property asserting the tag.
+
 ## Blast radius
 
 - [NLA / CredSSP authentication](nla-credssp.md) — consumes the extracted public

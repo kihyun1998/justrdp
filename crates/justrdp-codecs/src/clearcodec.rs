@@ -95,6 +95,14 @@ impl From<crate::nscodec::NscError> for ClearError {
             crate::nscodec::NscError::InvalidField { field, reason } => {
                 ClearError::InvalidField { field, reason }
             }
+            // The shapes stop matching here: ClearCodec has no dimensions-overflow variant of its
+            // own, and inventing one would widen this enum for a case its own geometry cannot
+            // reach — a ClearCodec NSCodec subcodec region is bounded by the rect it decodes into.
+            // Mapped to the nearest true statement rather than to a new variant.
+            crate::nscodec::NscError::DimensionsOverflow { .. } => ClearError::InvalidField {
+                field: "NSCodecSubcodecGeometry",
+                reason: "declared plane dimensions overflow usize on this target",
+            },
         }
     }
 }

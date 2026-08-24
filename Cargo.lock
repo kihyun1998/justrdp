@@ -1220,6 +1220,7 @@ dependencies = [
  "ironrdp-pdu",
  "justrdp-codecs",
  "justrdp-pdu",
+ "proptest",
  "rcgen",
  "tracing",
  "x509-cert 0.3.0",

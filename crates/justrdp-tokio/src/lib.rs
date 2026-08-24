@@ -2363,7 +2363,8 @@ mod tests {
             let mut machine = SessionStateMachine::new(
                 session_config_from(&outcome, session_capabilities),
                 outcome.activation.leftover,
-            );
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             // Let the session run for a few seconds: the server paints the full desktop right
@@ -2877,7 +2878,8 @@ mod tests {
             let mut machine = SessionStateMachine::new(
                 session_config_from(&outcome, capabilities),
                 outcome.activation.leftover,
-            );
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
             let frames = Arc::new(AtomicUsize::new(0));
             let frames_in_sink = frames.clone();
@@ -3260,7 +3262,8 @@ mod tests {
                 drdynvc_channel_id: None,
             },
             Vec::new(),
-        );
+        )
+        .expect("the test desktop size is within MAX_DESKTOP_DIM");
 
         let (tx, mut commands) = tokio::sync::mpsc::channel(4);
         // A resize before DisplayControlReady: refused (warn + drop), session keeps running.
@@ -3354,7 +3357,8 @@ mod tests {
                 drdynvc_channel_id: None,
             },
             Vec::new(),
-        );
+        )
+        .expect("the test desktop size is within MAX_DESKTOP_DIM");
 
         let mut cursors: Vec<justrdp::CursorEvent> = Vec::new();
         run_session(
@@ -3419,7 +3423,8 @@ mod tests {
                 drdynvc_channel_id: None,
             },
             Vec::new(),
-        );
+        )
+        .expect("the test desktop size is within MAX_DESKTOP_DIM");
         run_session(&mut stream, &mut machine, |_, _fb| {}, |_| {}).await
     }
 
@@ -3513,7 +3518,8 @@ mod tests {
                 session_config.drdynvc_channel_id.is_some(),
                 "the VM should grant the drdynvc static channel"
             );
-            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             let mut frames = 0usize;
@@ -3743,7 +3749,8 @@ mod tests {
             let session_capabilities = config.capabilities.clone();
             let outcome = vm.connect(config).await;
             let session_config = session_config_from(&outcome, session_capabilities);
-            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             // Run long enough to surface Clear-coded regions. The desktop's taskbar/tray was
@@ -3833,7 +3840,7 @@ mod tests {
         let session_capabilities = config.capabilities.clone();
         let outcome = vm.connect(config).await;
         let session_config = session_config_from(&outcome, session_capabilities);
-        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover).expect("the test desktop size is within MAX_DESKTOP_DIM");
         let mut stream = outcome.stream;
 
         // Upgrade passes refine a tile the server already sent coarsely, so they only appear
@@ -4020,7 +4027,7 @@ mod tests {
         let outcome = vm.connect(config).await;
         let session_config = session_config_from(&outcome, session_capabilities);
         let desktop = session_config.desktop_size;
-        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover).expect("the test desktop size is within MAX_DESKTOP_DIM");
         let mut stream = outcome.stream;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
@@ -4301,7 +4308,7 @@ mod tests {
             let outcome = vm.connect(config).await;
             let session_config = session_config_from(&outcome, session_capabilities);
             let desktop = session_config.desktop_size;
-            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover).expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             let lit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4741,7 +4748,8 @@ mod tests {
                 "the VM should grant the drdynvc static channel; granted: {:?}",
                 outcome.mcs.static_channels
             );
-            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             let (tx, mut commands) = tokio::sync::mpsc::channel(4);
@@ -4882,7 +4890,8 @@ mod tests {
             let mut machine = SessionStateMachine::new(
                 session_config_from(&outcome, session_capabilities),
                 outcome.activation.leftover,
-            );
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             let denied = Arc::new(AtomicBool::new(false));
@@ -4952,7 +4961,7 @@ mod tests {
         let mut machine = SessionStateMachine::new(
             session_config_from(&outcome, session_capabilities),
             outcome.activation.leftover,
-        );
+        ).expect("the test desktop size is within MAX_DESKTOP_DIM");
         let mut stream = outcome.stream;
 
         let frames_in_sink = Arc::new(AtomicUsize::new(0));
@@ -5038,7 +5047,8 @@ mod tests {
             let mut machine = SessionStateMachine::new(
                 session_config_from(&outcome, session_capabilities),
                 outcome.activation.leftover,
-            );
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             let frames_in_sink = Arc::new(AtomicUsize::new(0));
@@ -5131,7 +5141,8 @@ mod tests {
             let mut machine = SessionStateMachine::new(
                 session_config_from(&outcome, session_capabilities),
                 outcome.activation.leftover,
-            );
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             let frames = Arc::new(AtomicUsize::new(0));
@@ -5198,7 +5209,8 @@ mod tests {
                 session_config.server_input_flags
             );
             let desktop = session_config.desktop_size;
-            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             let frames = Arc::new(AtomicUsize::new(0));
@@ -5399,7 +5411,8 @@ mod tests {
             let mut session_config = session_config_from(&outcome, session_capabilities);
             // The fallback seam under test: pretend the server never advertised fast-path input.
             session_config.server_input_flags = justrdp_pdu::capability::INPUT_FLAG_SCANCODES;
-            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
             let frames = Arc::new(AtomicUsize::new(0));
