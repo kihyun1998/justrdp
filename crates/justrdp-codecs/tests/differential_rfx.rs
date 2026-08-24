@@ -385,8 +385,12 @@ fn every_inverse_stage_matches_the_oracle_primitive_at_its_boundary() {
 
                     // Stage 3: dequantization.
                     quantization::decode(&mut theirs, &quant);
-                    let our_shifts =
-                        ours::quant::shifts(&our_quant(&quant)).expect("wire quants are nibbles");
+                    let our_shifts = ours::quant::shifts(&our_quant(&quant)).expect(
+                        // Not "they are nibbles" — since #233 a zero nibble is refused.
+                        // Both harness tables are 6 or above, which is also what
+                        // `[MS-RDPRFX]` allows an encoder to emit.
+                        "both harness quant tables are in the encoder's 6..=15 range",
+                    );
                     ours::quant::dequantize(&mut mine, &our_shifts);
                     assert_eq!(mine, theirs, "dequantize diverged ({ctx})");
 

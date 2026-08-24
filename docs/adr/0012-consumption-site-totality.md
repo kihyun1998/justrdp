@@ -1,6 +1,9 @@
 # 0012 — A parser's guarantee is not held at the point of use: consumption-site totality
 
 - Status: Accepted (promoted while working issue #211; conformance items #211, #233)
+  - Amendment 2026-08-24 (#233): §3's outstanding instance is settled — WireToSurface1 refuses a
+    zero quantization exponent, so the two RemoteFX dequantizers now answer it alike and the
+    record needs no divergence row. See §3.
 - Date: 2026-08-21
 
 ## Context
@@ -94,8 +97,38 @@ Where two stages of one codec family consume the same quantity, they give it the
 or the divergence is a recorded row naming **both** sides. A row that names only one side is a
 false status report.
 
-This record does not settle the outstanding instance, it makes it visible: `q == 0` is skipped
-by WireToSurface1 and refused by Progressive, and the choice between those is #233.
+When this record was written it did not settle its own outstanding instance, it made it
+visible: `q == 0` was skipped by WireToSurface1 and refused by Progressive.
+
+**Settled in #233 (2026-08-24): both refuse.** `quant::shifts` derives its table with
+`checked_sub(1)` and returns `RfxError::ZeroQuantExponent`, the sibling of
+`ProgressiveError::ZeroBitPosition` that `first_pass_shift` already returned; the two functions
+now differ only in their error type. The whole defect was one token — `saturating_sub` cannot
+tell `exponent == 0`, which names no shift, from `exponent == 1`, which names a shift of zero,
+and the spec asks for opposite treatment of the two.
+
+Three things about that resolution are worth keeping, because each was measured rather than
+argued:
+
+- **The escape hatch was available and did not fit.** A divergence row was the alternative, and
+  every row in the project's table records justrdp choosing against *prior art*. This would have
+  been the only justrdp-against-justrdp row — which is not a decision being recorded, it is an
+  inconsistency wearing a decision's clothes. Nobody had chosen `saturating_sub` over
+  `checked_sub`; they were written at different times.
+- **The receive-path objection does not reach it, and ADR-0009 §3(a) is why — as a removal of
+  the objection, not as the mandate.** §3(a) scopes tolerance to *which features may appear* and
+  holds typed errors unconditionally over contents, so refusing here is not the strictness that
+  posture forbids. The mandate is §1 of this record (the arithmetic is undefined) and §3 (one
+  family, one answer). Sharpest form: `shift = -1` is not a value we dislike, it is the absence
+  of one — the same line #189 drew for zgfx between *what did the server mean* and *what could
+  any encoder have meant*.
+- **This is the family's first wire-reachable refusal, and that is stated rather than glossed.**
+  `ShiftOutOfRange` cannot be reached (a nibble shifts by at most 14); a `0x00` byte is two zero
+  nibbles, so `ZeroQuantExponent` can. It stays outside what any conforming encoder emits —
+  `[MS-RDPRFX]` constrains the encoder to 6..=15 — and the real VM cannot corroborate either way,
+  because it never emits CAVIDEO. So the safety of refusing rests on FreeRDP agreeing
+  (`rfx_quantization.c:66-71`, propagated through `rfx_decode.c:66-67` to `rfx.c:1082-1086`) and
+  is recorded as a FreeRDP-derived position, not an observed one.
 
 ### 4. Derive-and-validate is a separate function from apply
 
@@ -146,7 +179,8 @@ this; it asserts the parser, not the function.
   contents"* — is the same sentence read from the parser's side. This record is its
   point-of-use half. Nothing here narrows the tolerance posture: refusing a value the arithmetic
   has no meaning for is not strictness about *what a server may send*, and where the two could
-  be confused (#233) the question is routed to a decision rather than answered by this record.
+  be confused (#233) the question was routed to a decision rather than answered by this record —
+  and that decision, recorded in §3 above, went the way §1 pointed.
 - **Relationship to [ADR-0008](0008-robustness-testing-fuzz-and-property.md).** 0008 governs
   whether a path may panic and how that is tested; this governs where the guarantee lives when
   validation and use are separated. Neither subsumes the other: 0008's two lanes could be fully

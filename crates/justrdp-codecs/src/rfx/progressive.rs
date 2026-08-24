@@ -2368,6 +2368,60 @@ mod tests {
         );
     }
 
+    /// **#233 — the family answers one quantity once.** The two RemoteFX dequantizers meet the
+    /// structurally identical condition: `shift = exponent - 1` where the exponent is 0. This
+    /// pins that they refuse it *together*, in one assertion rather than two tests in two files
+    /// that could drift apart — which is what happened, and is why
+    /// [ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3 exists.
+    ///
+    /// The two errors are deliberately distinct types: this stage's `bitPos` is `quant +
+    /// prog_quant`, a derived sum, while WireToSurface1's is a parsed nibble. They agree on the
+    /// answer, not on the vocabulary.
+    ///
+    /// Before #233 this test could not have been written — `quant::shifts` used
+    /// `saturating_sub`, so the same input returned `Ok` on one side and `Err` on the other.
+    #[test]
+    fn a_zero_exponent_is_refused_by_both_dequantizers() {
+        let progressive = first_pass_shift(&quant_from_bands([6, 6, 6, 6, 6, 6, 0, 6, 6, 6]));
+        assert_eq!(progressive, Err(ProgressiveError::ZeroBitPosition));
+
+        let wire_to_surface_1 = crate::rfx::quant::shifts(&justrdp_pdu::rfx::Quant {
+            ll3: 6,
+            lh3: 6,
+            hl3: 0,
+            hh3: 6,
+            lh2: 6,
+            hl2: 6,
+            hh2: 6,
+            lh1: 6,
+            hl1: 6,
+            hh1: 6,
+        });
+        assert_eq!(
+            wire_to_surface_1,
+            Err(crate::rfx::RfxError::ZeroQuantExponent)
+        );
+
+        // And both still accept 1, where the shift is defined and happens to be zero. A fix
+        // that refused "everything the old saturating_sub flattened" would fail here.
+        assert!(first_pass_shift(&quant_from_bands([1; 10])).is_ok());
+        assert!(
+            crate::rfx::quant::shifts(&justrdp_pdu::rfx::Quant {
+                ll3: 1,
+                lh3: 1,
+                hl3: 1,
+                hh3: 1,
+                lh2: 1,
+                hl2: 1,
+                hh2: 1,
+                lh1: 1,
+                hl1: 1,
+                hh1: 1,
+            })
+            .is_ok()
+        );
+    }
+
     /// `shift = quant + prog_quant - 1` runs to 29, and FreeRDP's shift primitive refuses 16
     /// and above by returning `-1` (`prim_shift.c:38-39`), which fails the tile. Easy to miss,
     /// because both operands look like nibbles bounded by 15.
