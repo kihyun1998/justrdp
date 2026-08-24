@@ -78,11 +78,25 @@ pub const BANDS_EXTRAPOLATE: [(usize, usize); 10] = [
 /// component instead, which is a deliberate divergence from FreeRDP's *handling* rather than
 /// from its threshold — the same split `super::progressive`'s first pass already records.
 ///
-/// An exponent of **0** is left unshifted rather than refused, which is what FreeRDP rejects
-/// outright (`if (val < 1) return FALSE`, propagated through `rfx_decode.c`). That tolerance is
-/// unchanged here on purpose and is the open question in #233: the Progressive sibling refuses
-/// the identically undefined `bitPos == 0`, and this record does not settle which of the two is
-/// right.
+/// An exponent of **0** is refused, and this is the one refusal here a server can actually
+/// reach — a `0x00` byte is two zero nibbles. `shift = exponent - 1` names no shift at `0`, so
+/// unlike the width above this is not a value we dislike but the absence of one; FreeRDP takes
+/// the same view and in the same shape, validating all ten before touching a coefficient
+/// (`if (val < 1) return FALSE`, `rfx_quantization.c:66-71`) and propagating it through
+/// `rfx_decode.c:66-67` to `rfx.c:1082-1086`. The oracle disagrees — `decode_block`'s
+/// `if factor > 0` makes `0` and `1` alike no-ops (`quantization.rs`) — but it shares this
+/// decoder's lineage and carries #211's unbounded shift besides, so it is not a second opinion
+/// here.
+///
+/// The reason it is refused rather than skipped is **not** that FreeRDP refuses: it is that
+/// `super::progressive::first_pass_shift` already refused the identically undefined
+/// `bitPos == 0`, and one quantity gets one answer across a codec family
+/// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3). #233 settled it;
+/// the two functions now differ only in their error type.
+///
+/// `exponent == 1` is untouched by that and must stay so — it shifts by 0, which is a band the
+/// spec asks to leave alone. `saturating_sub` could not tell the two apart, which is the whole
+/// of what was wrong.
 pub fn shifts(quant: &Quant) -> Result<[u8; 10], RfxError> {
     let exponents = [
         quant.hl1, quant.lh1, quant.hh1, quant.hl2, quant.lh2, quant.hh2, quant.hl3, quant.lh3,
@@ -90,7 +104,7 @@ pub fn shifts(quant: &Quant) -> Result<[u8; 10], RfxError> {
     ];
     let mut out = [0u8; 10];
     for (slot, exponent) in out.iter_mut().zip(exponents) {
-        let shift = exponent.saturating_sub(1);
+        let shift = exponent.checked_sub(1).ok_or(RfxError::ZeroQuantExponent)?;
         if shift >= 16 {
             return Err(RfxError::ShiftOutOfRange(shift));
         }
@@ -136,7 +150,7 @@ mod tests {
         let quant = Quant {
             ll3: 6,
             lh3: 1,
-            hl3: 0,
+            hl3: 3,
             hh3: 2,
             lh2: 7,
             hl2: 1,
@@ -156,11 +170,7 @@ mod tests {
         assert_eq!(buffer[3072], 1); // HL2, exponent 1
         assert_eq!(buffer[3328], 1 << 6); // LH2, exponent 7
         assert_eq!(buffer[3584], 1 << 7); // HH2, exponent 8
-        // HL3, exponent 0 — left untouched rather than failing the component. This is the
-        // tolerance #233 is open on: the Progressive sibling refuses the identically undefined
-        // `bitPos == 0` (`progressive::first_pass_shift` → `ZeroBitPosition`). Unchanged here
-        // deliberately; when #233 settles, this assertion is the artifact that moves.
-        assert_eq!(buffer[3840], 1);
+        assert_eq!(buffer[3840], 1 << 2); // HL3, exponent 3
         assert_eq!(buffer[3904], 1); // LH3, exponent 1
         assert_eq!(buffer[3968], 1 << 1); // HH3, exponent 2
         assert_eq!(buffer[LL3_OFFSET], 1 << 5); // LL3, exponent 6
@@ -196,7 +206,7 @@ mod tests {
             match shifts(&uniform(exponent)) {
                 Ok(table) => {
                     assert!(
-                        exponent <= 16,
+                        (1..=16).contains(&exponent),
                         "exponent {exponent} should have been refused"
                     );
                     // Whatever it accepted, applying it must also be total.
@@ -209,6 +219,12 @@ mod tests {
                         "exponent {exponent} should have been accepted"
                     );
                     assert_eq!(u32::from(shift), u32::from(exponent) - 1);
+                }
+                // #233. The two refusals partition the refused set with no overlap, which is
+                // what makes each one's message true: 0 has no shift, 17 and up have one that
+                // `i16 <<` cannot take.
+                Err(RfxError::ZeroQuantExponent) => {
+                    assert_eq!(exponent, 0, "only a zero exponent names no shift");
                 }
                 Err(other) => panic!("unexpected error for exponent {exponent}: {other:?}"),
             }
@@ -233,14 +249,19 @@ mod tests {
         assert_eq!(buffer[0], i16::MIN);
     }
 
-    /// The validity condition under which the refusal is unreachable, asserted rather than
-    /// asserted-in-prose: `Quant::decode` masks every field with `& 0x0F` / `>> 4`, so the
+    /// The validity condition under which the **width** refusal is unreachable, asserted rather
+    /// than asserted-in-prose: `Quant::decode` masks every field with `& 0x0F` / `>> 4`, so the
     /// widest exponent a server can send is 15. If that ever stops holding, this goes red before
     /// anything else does.
+    ///
+    /// The range starts at 1, not 0, and that is the part worth reading. Since #233 the parser's
+    /// range is **not** entirely accepted: a zero nibble is reachable and refused, so this stage
+    /// has one wire-reachable refusal and one unreachable one. Writing the loop from 0 would
+    /// conflate them and quietly assert the opposite of what #233 decided.
     #[test]
-    fn no_exponent_the_parser_can_produce_is_refused() {
-        for exponent in 0u8..=15 {
-            shifts(&uniform(exponent)).expect("the parser's whole range must decode");
+    fn no_exponent_the_parser_can_produce_is_refused_for_its_width() {
+        for exponent in 1u8..=15 {
+            shifts(&uniform(exponent)).expect("the parser's defined range must decode");
         }
     }
 
@@ -266,6 +287,60 @@ mod tests {
                 "band {band} did not carry the refusal"
             );
         }
+
+        // And the same for #233's refusal, because the loop that carries one carries both only
+        // if it is really a loop — a table validated in nine places and not the tenth is this
+        // territory's recorded failure mode.
+        let mut zeroed = [uniform(6); 10];
+        zeroed[0].hl1 = 0;
+        zeroed[1].lh1 = 0;
+        zeroed[2].hh1 = 0;
+        zeroed[3].hl2 = 0;
+        zeroed[4].lh2 = 0;
+        zeroed[5].hh2 = 0;
+        zeroed[6].hl3 = 0;
+        zeroed[7].lh3 = 0;
+        zeroed[8].hh3 = 0;
+        zeroed[9].ll3 = 0;
+        for (band, quant) in zeroed.iter().enumerate() {
+            assert_eq!(
+                shifts(quant),
+                Err(RfxError::ZeroQuantExponent),
+                "band {band} did not carry the zero refusal"
+            );
+        }
+    }
+
+    /// **#233.** An exponent of 0 asks for `shift = -1`, which is not a value this stage
+    /// dislikes — it is the absence of one. The sibling Progressive dequantizer already refused
+    /// the identically undefined `bitPos == 0` (`progressive::first_pass_shift` →
+    /// `ZeroBitPosition`), and ADR-0012 §3 requires one answer per quantity across a family.
+    ///
+    /// Unlike [`RfxError::ShiftOutOfRange`], this one **is** reachable from the wire: a `0x00`
+    /// byte produces two zero nibbles, so `Quant::decode` hands one straight through. It is
+    /// still outside what any conforming encoder emits — `[MS-RDPRFX]` constrains the encoder
+    /// to 6..=15 — which is why refusing it is not strictness about what a server may say.
+    #[test]
+    fn a_zero_exponent_is_refused() {
+        assert_eq!(shifts(&uniform(0)), Err(RfxError::ZeroQuantExponent));
+
+        // One is enough: a single zero band refuses the whole table, before any coefficient
+        // is touched, exactly as the shift-width refusal does.
+        let mut quant = uniform(6);
+        quant.hl3 = 0;
+        assert_eq!(shifts(&quant), Err(RfxError::ZeroQuantExponent));
+    }
+
+    /// The neighbour that must **not** move with it. `shift = q - 1` is perfectly defined at
+    /// `q == 1` — it is zero, a band the spec asks to leave alone — so an implementation that
+    /// refused "everything `saturating_sub` used to flatten" would take this with it. The old
+    /// code could not tell the two apart; that is the whole defect.
+    #[test]
+    fn an_exponent_of_one_is_still_an_untouched_band() {
+        assert_eq!(shifts(&uniform(1)).expect("1 is defined")[0], 0);
+        let mut buffer = vec![7i16; COMPONENT_LEN];
+        dequantize(&mut buffer, &shifts(&uniform(1)).expect("1 is defined"));
+        assert_eq!(buffer[0], 7);
     }
 
     #[test]

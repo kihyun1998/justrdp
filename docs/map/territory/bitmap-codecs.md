@@ -86,6 +86,21 @@ attacker-controlled bytes in the repo.
   an exponent of 16 shifts by 15 and is fine, so a guard written as "the nibble
   exceeds 15" is off by one and would make the two dequantizers refuse different
   inputs for the same stated reason.
+- **The two RemoteFX dequantizers give one quantity one answer, and the one that
+  cost a decision was `exponent == 0`** (#233, [ADR-0012](../../adr/0012-consumption-site-totality.md) §3).
+  `progressive::first_pass_shift` refused it from the start (`ZeroBitPosition`);
+  `quant::shifts` skipped the band, because `saturating_sub(1)` cannot tell an
+  exponent of 0 — which names no shift — from an exponent of 1, which names a shift
+  of zero and must stay untouched. Both behaviours were pinned by green tests that
+  did not cite each other. It is now `checked_sub` on both sides. Two things this
+  leaves that the width refusal does not: it is the family's **first refusal a server
+  can reach** (a `0x00` byte is two zero nibbles), and it is **not corroborated by the
+  VM**, which never emits CAVIDEO — the safety of refusing rests on FreeRDP agreeing,
+  so it is recorded as a FreeRDP-derived position rather than an observed one. The
+  differential oracle disagrees and stays green only because no harness quant table
+  carries a zero: `Quant::default()` is the MS server's own table (6..7) and the
+  harness's second table is 8..12. **If one ever carries a zero the differential goes
+  red, and that is the correct signal, not a false one.**
 - **A no-panic property whose generator is bounded to the parser's range asserts the
   parser, not the function.** `nscodec`'s `reconstruct_never_panics_on_arbitrary_input`
   documented itself as covering *"any colour-loss level"* and generated `1u8..=7`.

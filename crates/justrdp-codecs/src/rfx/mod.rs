@@ -49,6 +49,22 @@ pub enum RfxError {
     /// the same threshold in the sibling stage — where it *is* reachable, because a Progressive
     /// shift is `quant + prog_quant - 1` and runs to 29.
     ShiftOutOfRange(u8),
+    /// A band's quantization exponent is 0, so the spec's `shift = exponent - 1` names no
+    /// shift at all.
+    ///
+    /// **Reachable from the wire**, unlike [`RfxError::ShiftOutOfRange`]: `Quant::decode` masks
+    /// each field to a nibble and a `0x00` byte is two zero nibbles, so a server can send this.
+    /// It is refused anyway, and the distinction that makes that tolerable on a receive path is
+    /// the one [ADR-0009](../../../../docs/adr/0009-tolerant-negotiation-posture.md) §3(a)
+    /// already draws: tolerance is about *which features may appear*, never about trusting
+    /// their contents — and `-1` is not a shift we dislike, it is the absence of one. No
+    /// conforming encoder emits it (`[MS-RDPRFX]` constrains the encoder to 6..=15), so there
+    /// is no server intent to be tolerant *of*.
+    ///
+    /// Named to match `super::progressive::ProgressiveError::ZeroBitPosition`, which is the same
+    /// condition in the sibling stage. That the two agree is the requirement, not a coincidence
+    /// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3, resolving #233).
+    ZeroQuantExponent,
 }
 
 impl core::fmt::Display for RfxError {
@@ -61,6 +77,12 @@ impl core::fmt::Display for RfxError {
                 write!(
                     f,
                     "a band's dequantization shift is {n}, which must be under 16"
+                )
+            }
+            RfxError::ZeroQuantExponent => {
+                write!(
+                    f,
+                    "a band's quantization exponent is 0, which names no shift"
                 )
             }
         }
