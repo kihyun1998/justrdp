@@ -394,8 +394,19 @@ cargo check --manifest-path fuzz/Cargo.toml     # out-of-workspace blind spot
 python .github/scripts/check_map.py --selftest  # the gate's own defect kinds, first
 python .github/scripts/check_map.py             # docs/map: links, anchors, symbols, reciprocity
 # + just-shield supply-chain scan (ADR-0006): SHA-pinned actions
-# + 32-bit guards, when the change touches dimension/offset arithmetic:
-#   cargo test -p justrdp-codecs --target i686-pc-windows-msvc
+# + 32-bit guards. `overflow-32bit.yml` now runs this in CI on any change under the three
+#   crates, so locally it is a pre-check rather than the only proof it used to be.
+#   Two things this line used to get wrong, both measured:
+#   - It named `-p justrdp-codecs` alone, and the invariant names five territories — two of
+#     them (EGFX surface allocation, the framebuffer) live in `justrdp`. The command was
+#     narrower than the thing it guards.
+#   - The `target add` is not ceremony. A rustup target is per-toolchain, so ADR-0013's pin
+#     means a target added under the old default is absent under the pinned one; it had
+#     silently gone missing within a day of #235. `targets` is deliberately kept out of
+#     `rust-toolchain.toml` (the file is shared with the ubuntu runners), so this line is
+#     what keeps it runnable.
+#   rustup target add i686-pc-windows-msvc
+#   cargo test -p justrdp-codecs -p justrdp --target i686-pc-windows-msvc
 ```
 
 Run each gate **bare, never piped** (a pipeline's exit status is `tail`'s, so the gate
@@ -410,7 +421,7 @@ behind the runner and a lint that failed the gate could not fire locally at all.
 differ in **OS** — the runner is `ubuntu-latest`, the host is Windows MSVC — so a
 platform-conditional path is the residue this does not cover.
 
-**CI jobs — four workflows, three of them gates:**
+**CI jobs — five workflows, four of them gates:**
 
 | Workflow | Gate? | Notes |
 |---|---|---|
@@ -418,6 +429,7 @@ platform-conditional path is the residue this does not cover.
 | `test.yml` → job `map` | **yes** | `.github/scripts/check_map.py` — [`docs/map/`](../map/README.md) links, `#anchors`, `## Code` symbols **at the path their bullet names** (#224), section sets, invariant↔territory reciprocity. Runs `--selftest` first, which requires the gate to fail on each of its eight defect kinds. Toolchain-free, so a docs-only PR answers without waiting for cargo |
 | `fuzz.yml` | **yes** | nightly cargo-fuzz lane (#99) — a *new* target is not covered on the day it lands |
 | `supply-chain.yml` | **yes** | just-shield, SHA-pinned actions (ADR-0006); pins auto-managed by `just-shield fix` + Dependabot |
+| `overflow-32bit.yml` | **yes** | `cargo test -p justrdp-codecs -p justrdp --target i686-pc-windows-msvc` on `windows-latest`. The only gate that can reach the dimension-overflow class ([the invariant](../map/invariant/decoder-dimension-overflow-32bit.md)) — on x86-64 a wrapping `width * height * bpp` is merely a large number, so every other gate is green over it. **Path-filtered** to the three crates that hold the sites, because a Windows runner bills at 2x and the class only moves when the arithmetic does |
 | `coverage.yml` | **no** | cargo-llvm-cov discovery tool (#102), post-merge/dispatch, **no threshold**; scopes to the sans-IO core and excludes `justrdp-tokio` (its tests need the VM) |
 
 - Branch → commit `feat(<scope>): … (#issue)` (**no `Co-Authored-By` / AI-attribution

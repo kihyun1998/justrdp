@@ -256,7 +256,11 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   Worth keeping as a shape: **"remove the hazard" and "handle the hazard" are not
   interchangeable when the hazard is also carrying a proof.** The console looked strictly
   safer right up to the point where a real server was asked.
-- **32-bit guards need an i686 run** that no CI job performs — the class closed in
-  #151/#155 is provable only on a target the gate does not build.
+- ~~**32-bit guards need an i686 run** that no CI job performs.~~ **Closed** —
+  `.github/workflows/overflow-32bit.yml` builds `justrdp-codecs` + `justrdp` for
+  `i686-pc-windows-msvc`, so the class closed in #151/#155 is now gated rather than
+  remembered. The residue is local, not CI: a rustup target is per-toolchain, so after every
+  toolchain bump the local run needs its own `rustup target add` (it silently stopped working
+  a day after ADR-0013's pin landed).
 - No captured-stream replay harness exists for the connect sequence: a VM run is the
   only end-to-end proof, and it is not reproducible offline.
