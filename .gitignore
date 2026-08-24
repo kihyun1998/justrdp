@@ -4,3 +4,7 @@
 # Byte-code from importing .github/scripts/*.py (the map gate's self-test runs the
 # script as a subprocess and makes none, but a measurement that imports it does).
 __pycache__/
+
+# thegraph run state (docs/agents/thegraph.md § Run state). A cache during the run;
+# the issue is the durable record, so a cache that reaches a review is noise.
+/.thegraph/
