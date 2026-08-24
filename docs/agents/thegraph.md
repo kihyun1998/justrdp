@@ -85,6 +85,20 @@ you touch this — opening one and finding nothing to do is a correct outcome),
 6 invariant notes, 18 territory notes. Add `docs/plan.md` §0 (traps already PROVEN
 on the real VM — do not re-discover) and §1 (capability → feature coupling).
 
+**If no territory matches, that is an exit this node owes an answer for — and the
+hub already has it.** [`README.md` § *Coverage*](../map/README.md#coverage) settles
+which of the two it is: an **unbuilt** protocol area correctly has no territory
+(clipboard, audio, redirection, drawing orders, RD Gateway, H.264, multi-monitor —
+their roster is the `epic`-labelled issues, and *"a territory appears when the
+first slice lands"*), while code you are changing that nobody mapped is a
+**finding**, and this change's rather than the backlog's, because you are the first
+person standing there with the evidence. It does not block — coverage may lag
+(`sweep` surface 3 ①) — so it is carried as a candidate to `batch`, never written
+unasked. Two shapes to distrust before reading an empty result as clean: your
+**search** may be what was empty (search by artifact — the PDU, the field, the
+capability — never by feature name), and the **invariant** half does not lag at all
+(`sweep` surface 3 ②, which blocks).
+
 **Where the hidden-state list lives** (`enumerate` reads this): VM-observed traps
 → `docs/plan.md` §0. Per-territory state → the map's `## Design model`.
 Cross-territory facts → an [`invariant/`](../map/invariant/) note, each carrying a
