@@ -234,19 +234,70 @@ written is byte-scoped, so both derivations below are blind to a consumer one ho
 parser, and #211 found two such consumers panicking. The test for that class is not "does it
 parse" but **"does its signature admit a value the arithmetic has no meaning for"** — which a
 plain `pub` field or a bare `u8` parameter always does, whatever the parser guarantees.
-[ADR-0012](../../adr/0012-consumption-site-totality.md) owns that class; what belongs here is
-that neither command below can see it. The class has a third known member and no enumeration:
-`justrdp_codecs::color::to_rgba` sizes two buffers from wire dimensions across the same crate
-boundary, and #230's refuting lens found it with neither artifact — **#238**, filed with the
-scoping question attached, because a property on one function does not answer what ADR-0012
-asks.
+[ADR-0012](../../adr/0012-consumption-site-totality.md) owns that class. **It now has an
+enumeration — derivation ③ below — and producing it is what #238 turned out to be.** The issue
+named one member (`justrdp_codecs::color::to_rgba`) and asked whether the unit of work was that
+function or a pass over the class; the enumeration answered it by turning up **eight** uncovered
+members, five of which neither #238 nor #241 had named. Four were in `justrdp::framebuffer`,
+which this note listed as a *territory* the fact holds in while nobody had ever listed its
+functions.
 
-Two derivations, and the gap between them is the finding:
+Working the list found **four defects**, and the split between them is the useful part:
+
+| Site | Defect | Reachable from the wire? |
+|---|---|---|
+| `framebuffer::resize` | `w * h * 4` unguarded — 17_179_344_900 at the type's maximum | **yes**, `DemandActive`'s declared desktop and Display Control `OutputResized`, neither clamped |
+| `nscodec::plane_sizes` | `tw * height` unguarded, and `temp_dims` rounds 65535 up to 65536 | **yes on 32-bit**, through `decode`'s own `u16` parameters |
+| `framebuffer::blit` | `src_stride_px * 4` overflows on **every** target | no — callers pass `u16`-derived and `MAX_SURFACE_DIM`-bounded strides |
+| `framebuffer::copy_rect_into` | out-of-range slice index on a rect outside the buffer | no — the host calls it with a `FrameUpdate` we produced |
+
+The last two are the case ADR-0012 §1 exists for: *reachability governs priority, never the
+contract*. The first two are not — they are live, and every other gate was green over both.
+
+**One of them also shows why "total" and "does not panic" are different requirements.**
+`plane_sizes` returns bounds that `decode_plane` trusts, and its empty-input branch is
+`vec![0xFF; original_size]` — so making the multiply *saturating* would have converted an
+arithmetic overflow into an allocation of the entire address space. It refuses instead.
+
+**Three derivations, and the gaps between them are the finding.** There were two until
+#241/#238, and each of those issues had found a different hole in them — one by **location**,
+one by **kind**:
 
 ```sh
-ls fuzz/fuzz_targets/                      # what is fuzzed
-rg --files crates/justrdp-pdu/src -g '*.rs'   # what parses untrusted bytes
+# ① what is fuzzed
+ls fuzz/fuzz_targets/
+
+# ② what parses untrusted bytes — no longer justrdp-pdu alone (#241)
+rg --files crates/justrdp-pdu/src crates/justrdp/src crates/justrdp-tokio/src -g '*.rs'
+
+# ③ what CONSUMES an already-parsed wire value as arithmetic — ADR-0012's class (#238).
+#    An over-approximation on purpose: it lists candidates, and the adjudication is the
+#    judgement ADR-0012 §1 states ("does the signature admit a value the arithmetic has no
+#    meaning for"). Roughly 40 candidates today, of which ~20 are members.
+rg -U "pub fn [a-z_0-9]+ *(<[^>]*>)? *\([^)]*\b(u8|u16|u32|usize|i8|i16|i32)\b" \
+   crates/justrdp-codecs/src crates/justrdp/src
+
+# and what each already carries, to subtract:
+rg -n 'fn [a-z_0-9]+_never_panics' crates/justrdp-codecs/src crates/justrdp/src crates/justrdp-pdu/src
 ```
+
+**Match the names exactly when subtracting ③, or the census lies in the safe-looking
+direction.** Measured while writing this: a loose `rg to_rgba` reported `color::to_rgba` as
+*covered*, because it matched inside `decode_to_rgba_never_panics` — a different function in a
+different module. That is the same substring trap this note already records twice below, for
+`pointer` across crates and `license` within one module, and the third instance was the
+census command itself.
+
+**② was widened rather than exempted, and the rule that adjudicates its new members is part of
+the widening.** `crates/justrdp/src` holds exactly one live parser of server bytes that
+`justrdp-pdu` does not own — `tls::extract_subject_public_key`, whose parse is
+`x509_cert::Certificate::from_der`. A parse performed entirely inside a security-critical leaf
+dependency (ADR-0002) is that dependency's contract, so what this note requires of such a member
+is coverage of **our wrapper on the live path**, not a claim about the decoder. The audit that
+produced that answer is cheap and worth repeating rather than trusting: `connect.rs:507`'s
+`.get(..4)` AUTHZ read is bounded by construction, `license_crypto`'s `md5`/`sha1` take slices
+and belong to ③ if anywhere, and the two `from_le_bytes` hits in `egfx.rs`/`session.rs` are in
+test code.
 
 The gap used to be the whole connect sequence. #200 closed the mechanical half of it —
 `tpkt`, `x224`, `nego`, `dvc`, `svc` and `displaycontrol` now carry a target and a

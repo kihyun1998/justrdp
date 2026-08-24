@@ -28,3 +28,10 @@ rcgen.workspace = true
 # (Connect-Response, AttachUserConfirm, ChannelJoinConfirm) with ironrdp's encoders and feed
 # them to our state machine — their encoder against our decoder, never our own bytes.
 ironrdp-pdu = "0.9.0"
+# Property-based robustness (ADR-0008). This is the **first** proptest dependency in the core
+# crate, and it is here because the census that names what must carry a no-panic property was
+# scoped to `crates/justrdp-pdu/src` and so could not see this crate at all (#241/#238). Two
+# members it was blind to live here: `tls::extract_subject_public_key`, which parses a
+# server-supplied X.509 through a leaf dependency, and `framebuffer`, which sizes and indexes
+# from server-declared dimensions.
+proptest.workspace = true

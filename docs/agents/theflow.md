@@ -281,8 +281,11 @@ is **silent** (wrong, and nothing crashes) or **irreversible**:
    control; a wrong bound yields plausible pixels or a panic (DoS), not an error. **Do
    not enumerate the surfaces here** — the derivation lives once, with the invariant:
    [untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md)
-   carries the two commands that produce *what is parsed* and *what is fuzzed*, and the
-   gap between them. The continuous half of this axis is **proptest (#98) + cargo-fuzz
+   carries the commands that produce *what is parsed*, *what is fuzzed* and *what consumes an
+   already-parsed value as arithmetic*, and the gaps between them. **Three of them since
+   #241/#238, not two** — the parse derivation was scoped to `crates/justrdp-pdu/src` and so
+   could not see a parser in the core, and both original commands were byte-scoped and so could
+   not describe a consumption site at all. The continuous half of this axis is **proptest (#98) + cargo-fuzz
    (#99)** (ADR-0008) — the fuzz lane is **nightly-only**, so a *new* target is not
    covered by the PR gate on the day it lands.
 2. **The TLS trust decision** — `crates/justrdp-tokio/src/trust.rs` and

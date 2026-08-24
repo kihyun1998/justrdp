@@ -21,6 +21,10 @@ libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 # The decoders under test, by path — the same public entry points the no-panic proptests drive.
 justrdp-codecs = { path = "../crates/justrdp-codecs" }
 justrdp-pdu = { path = "../crates/justrdp-pdu" }
+# The sans-IO core. Added for #241/#238: the fuzz half of the census could not name a target in
+# this crate because the manifest could not reach it, which is a different failure from "nobody
+# wrote the target" and is why both issues stalled at the same wall.
+justrdp = { path = "../crates/justrdp" }
 
 [workspace]
 
@@ -61,6 +65,18 @@ bench = false
 [[bin]]
 name = "rfx"
 path = "fuzz_targets/rfx.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tls"
+path = "fuzz_targets/tls.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "color"
+path = "fuzz_targets/color.rs"
 test = false
 doc = false
 bench = false

@@ -106,6 +106,14 @@ impl core::error::Error for ResizeError {}
 pub enum SessionError {
     /// A malformed PDU.
     Decode(justrdp_pdu::DecodeError),
+    /// The desktop size the server declared cannot be allocated
+    /// ([`crate::framebuffer::FramebufferError`]).
+    ///
+    /// Reachable three ways, all server-driven and none clamped before arrival: the
+    /// `SessionConfig` the connect sequence hands over, a reactivation `DemandActive`, and a
+    /// Display Control `OutputResized`. Refused rather than clamped because a silent tolerance
+    /// is indistinguishable from a bug (ADR-0009 §3(b)).
+    Framebuffer(crate::framebuffer::FramebufferError),
     /// Interleaved-RLE bitmap data failed to decompress.
     Rle(rle::RleError),
     /// RDP6 planar bitmap data failed to decompress.
@@ -124,6 +132,7 @@ impl core::fmt::Display for SessionError {
             SessionError::Planar(e) => write!(f, "RDP6 planar: {e}"),
             SessionError::Color(e) => write!(f, "pixel conversion: {e}"),
             SessionError::Pointer(e) => write!(f, "pointer shape: {e}"),
+            SessionError::Framebuffer(e) => write!(f, "framebuffer: {e}"),
         }
     }
 }
@@ -181,8 +190,13 @@ impl SessionStateMachine {
     /// Build the machine straight off the connect results. `leftover` is
     /// [`crate::ActivationResult::leftover`] — bytes already consumed from the socket that
     /// belong to this machine; they are processed by the first [`Self::process_bytes`] call.
-    pub fn new(config: SessionConfig, leftover: Vec<u8>) -> Self {
-        let framebuffer = Framebuffer::new(config.desktop_size.0, config.desktop_size.1);
+    /// Fails when the connect sequence hands over a desktop size past
+    /// [`crate::framebuffer::MAX_DESKTOP_DIM`] — a server-declared value that reaches an
+    /// allocation, so refusing it here is what keeps the allocation total
+    /// (ADR-0012 §1; the 32-bit overflow it prevents is reproduced in `framebuffer`'s tests).
+    pub fn new(config: SessionConfig, leftover: Vec<u8>) -> Result<Self, SessionError> {
+        let framebuffer = Framebuffer::new(config.desktop_size.0, config.desktop_size.1)
+            .map_err(SessionError::Framebuffer)?;
         // The cache honors what the caller advertised in its Pointer capability set:
         // `pointerCacheSize` when present (the cache New Pointer messages address), else
         // `colorPointerCacheSize`; no Pointer set advertised means no cache (a conforming
@@ -199,7 +213,7 @@ impl SessionStateMachine {
                 _ => None,
             })
             .unwrap_or(0);
-        Self {
+        Ok(Self {
             config,
             framebuffer,
             palette: Palette::default(),
@@ -210,7 +224,7 @@ impl SessionStateMachine {
             error_info: None,
             ultimatum_reason: None,
             drdynvc: Drdynvc::default(),
-        }
+        })
     }
 
     /// Why the session ended, as far as the server said (issue #42). The adapter calls this
@@ -667,8 +681,10 @@ impl SessionStateMachine {
             "Demand Active received (reactivation)"
         );
         if (width, height) != self.config.desktop_size {
+            self.framebuffer
+                .resize(width, height)
+                .map_err(SessionError::Framebuffer)?;
             self.config.desktop_size = (width, height);
-            self.framebuffer.resize(width, height);
         }
 
         let mut caps = self.config.capabilities.clone();
@@ -810,8 +826,13 @@ impl SessionStateMachine {
                 }
                 DvcEvent::OutputResized { width, height } => {
                     if (width, height) != self.config.desktop_size {
+                        // Resize first, commit the new size only if it succeeded — otherwise a
+                        // refused size would still be recorded and every later blit would index
+                        // against dimensions the buffer does not have.
+                        self.framebuffer
+                            .resize(width, height)
+                            .map_err(SessionError::Framebuffer)?;
                         self.config.desktop_size = (width, height);
-                        self.framebuffer.resize(width, height);
                     }
                 }
             }
@@ -932,7 +953,8 @@ mod tests {
     fn frame_pixels(sm: &SessionStateMachine, frame: &FrameUpdate) -> Vec<u8> {
         let mut px = vec![0u8; usize::from(frame.width) * usize::from(frame.height) * 4];
         sm.framebuffer()
-            .copy_rect_into(frame.x, frame.y, frame.width, frame.height, &mut px);
+            .copy_rect_into(frame.x, frame.y, frame.width, frame.height, &mut px)
+            .expect("a FrameUpdate this framebuffer produced is in bounds");
         px
     }
 
@@ -976,7 +998,8 @@ mod tests {
                 ..config()
             },
             Vec::new(),
-        );
+        )
+        .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let frames = sm.request_shutdown();
         assert_eq!(frames.len(), 1, "one frame, not a batch");
         assert_eq!(
@@ -993,7 +1016,8 @@ mod tests {
     /// and before this it was a `pduType2` the dispatcher skipped in silence.
     #[test]
     fn a_shutdown_denied_surfaces_to_the_host() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let outputs = sm
             .process_bytes(&server_data_pdu(share::PDU_TYPE2_SHUTDOWN_DENIED, &[]))
             .expect("a bodyless refusal decodes");
@@ -1005,7 +1029,8 @@ mod tests {
     /// side-condition that makes the positive assertion above mean anything.
     #[test]
     fn a_neighbouring_data_pdu_is_not_mistaken_for_a_refusal() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         for pdu_type2 in [
             share::PDU_TYPE2_SHUTDOWN_REQUEST, // 0x24 — ours to send, never to receive
             0x26,                              // Save Session Info, decoded-and-skipped
@@ -1164,7 +1189,8 @@ mod tests {
 
     #[test]
     fn fastpath_new_pointer_emits_set_cursor_and_caches_the_shape() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
 
         let body = new_pointer_body(3, [10, 20, 30, 200], (5, 4));
         let outputs = sm
@@ -1199,7 +1225,8 @@ mod tests {
     fn frames_split_across_process_bytes_calls_reassemble() {
         // The inbox contract (#86): a frame arriving in two chunks produces nothing on the
         // first call and the full output on the second.
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let frame = bitmap_update_frame(0, 0, 4, 4, [9, 8, 7]);
         let (a, b) = frame.split_at(5);
         assert!(sm.process_bytes(a).unwrap().is_empty());
@@ -1212,7 +1239,8 @@ mod tests {
 
     #[test]
     fn multiple_frames_in_one_call_process_in_order() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let mut bytes = bitmap_update_frame(0, 0, 4, 4, [1, 2, 3]);
         bytes.extend_from_slice(&bitmap_update_frame(4, 0, 4, 4, [4, 5, 6]));
         let outputs = sm.process_bytes(&bytes).unwrap();
@@ -1224,7 +1252,8 @@ mod tests {
 
     #[test]
     fn fastpath_hidden_and_default_pointers_emit_their_events() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
 
         let outputs = sm
             .process_bytes(&fastpath_pointer_pdu(fastpath::FP_UPDATE_PTR_NULL, &[]))
@@ -1248,7 +1277,8 @@ mod tests {
         body.extend_from_slice(&7u16.to_le_bytes());
         body.extend_from_slice(&6u16.to_le_bytes());
 
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let outputs = sm
             .process_bytes(&server_data_pdu(share::PDU_TYPE2_POINTER, &body))
             .unwrap();
@@ -1274,7 +1304,8 @@ mod tests {
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(&attr);
 
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let outputs = sm
             .process_bytes(&server_data_pdu(share::PDU_TYPE2_POINTER, &body))
             .unwrap();
@@ -1288,7 +1319,8 @@ mod tests {
     fn cached_pointer_misuse_is_a_typed_error() {
         // Index beyond the advertised cache size (default capset: 20 entries): protocol
         // violation, fatal per plan.md §11c.
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         assert!(matches!(
             sm.process_bytes(&fastpath_pointer_pdu(
                 fastpath::FP_UPDATE_CACHED_POINTER,
@@ -1298,7 +1330,8 @@ mod tests {
         ));
 
         // A never-filled slot inside the bounds is the same desync.
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         assert!(matches!(
             sm.process_bytes(&fastpath_pointer_pdu(
                 fastpath::FP_UPDATE_CACHED_POINTER,
@@ -1310,7 +1343,8 @@ mod tests {
 
     #[test]
     fn a_set_error_info_pdu_becomes_the_disconnect_attribution() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         // Before anything arrives, a close is unattributable.
         assert_eq!(
             sm.disconnect_reason(),
@@ -1339,7 +1373,8 @@ mod tests {
     #[test]
     fn errinfo_none_does_not_attribute_the_disconnect() {
         // ERRINFO_NONE (0): servers send it to clear state — not an attribution.
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         sm.process_bytes(&server_data_pdu(
             share::PDU_TYPE2_SET_ERROR_INFO,
             &0u32.to_le_bytes(),
@@ -1353,7 +1388,8 @@ mod tests {
 
     #[test]
     fn a_disconnect_provider_ultimatum_attributes_the_disconnect() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let frame = tpkt::encode(&x224::encode_data(
             &mcs::encode_disconnect_provider_ultimatum(mcs::RN_PROVIDER_INITIATED),
         ));
@@ -1371,7 +1407,8 @@ mod tests {
     fn an_error_info_outranks_the_generic_ultimatum() {
         // The usual server farewell is Error Info (specific) followed by a DPum (generic)
         // followed by close: the specific attribution must win regardless of order.
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         sm.process_bytes(&server_data_pdu(
             share::PDU_TYPE2_SET_ERROR_INFO,
             &0x0000_000Cu32.to_le_bytes(),
@@ -1389,7 +1426,8 @@ mod tests {
 
     #[test]
     fn a_truncated_error_info_body_is_a_typed_error() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         assert!(matches!(
             sm.process_bytes(&server_data_pdu(
                 share::PDU_TYPE2_SET_ERROR_INFO,
@@ -1401,7 +1439,8 @@ mod tests {
 
     #[test]
     fn uncompressed_bitmap_yields_a_frame_update() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let outputs = sm
             .process_bytes(&bitmap_update_frame(2, 1, 4, 2, [10, 20, 30]))
             .unwrap();
@@ -1432,7 +1471,8 @@ mod tests {
         body.extend_from_slice(&(stream.len() as u16).to_le_bytes());
         body.extend_from_slice(&stream);
 
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let outputs = sm
             .process_bytes(&server_data_pdu(share::PDU_TYPE2_UPDATE, &body))
             .unwrap();
@@ -1446,7 +1486,8 @@ mod tests {
 
     #[test]
     fn palette_update_applies_to_subsequent_8bpp_bitmaps() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         // Palette: entry 5 = (1,2,3).
         let mut body = Vec::new();
         body.extend_from_slice(&update::UPDATETYPE_PALETTE.to_le_bytes());
@@ -1484,7 +1525,8 @@ mod tests {
 
     #[test]
     fn deactivate_reactivate_resizes_and_reemits_full_screen() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
 
         // DeactivateAll: graphics stop, no output.
         let deactivate = server_io_frame(&share::encode_share_control(
@@ -1572,7 +1614,8 @@ mod tests {
 
     #[test]
     fn fastpath_bitmap_update_yields_a_frame() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let body = bitmap_update_body(1, 1, 4, 2, [40, 50, 60]);
         let pdu = fastpath::encode_pdu(&[(
             fastpath::FP_UPDATE_BITMAP,
@@ -1589,7 +1632,8 @@ mod tests {
 
     #[test]
     fn fragmented_fastpath_update_reassembles() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let body = bitmap_update_body(0, 0, 8, 4, [1, 2, 3]);
         let (a, rest) = body.split_at(10);
         let (b, c) = rest.split_at(15);
@@ -1631,7 +1675,8 @@ mod tests {
     fn oversized_bitmap_dimensions_are_rejected_before_allocation() {
         // A ~30-byte PDU declaring a 65535×65535 compressed bitmap must yield a typed
         // error, not a multi-gigabyte allocation (gate #6 fix note 1).
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let mut body = Vec::new();
         body.extend_from_slice(&update::UPDATETYPE_BITMAP.to_le_bytes());
         body.extend_from_slice(&1u16.to_le_bytes());
@@ -1659,7 +1704,8 @@ mod tests {
     fn fragment_reassembly_is_capped() {
         // An endless FIRST + NEXT stream must hit the reassembly cap (typed error), not
         // grow without bound (gate #6 fix note 1). Test desktop is 16×8 → cap ≈ 1 MiB.
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let chunk = vec![0u8; 16 << 10];
         assert!(
             sm.process_bytes(&fastpath::encode_pdu(&[(
@@ -1689,7 +1735,8 @@ mod tests {
 
     #[test]
     fn fragment_continuation_without_first_is_a_typed_error() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let err = sm
             .process_bytes(&fastpath::encode_pdu(&[(
                 fastpath::FP_UPDATE_BITMAP,
@@ -1702,7 +1749,8 @@ mod tests {
 
     #[test]
     fn non_io_channels_and_unknown_pdus_are_skipped() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         // Data PDUs without a handler produce nothing (pointer PDUs graduated to handled in
         // issue #41 — save-session-info and set-error-info remain decode-and-skip).
         for (t2, body) in [
@@ -1728,7 +1776,8 @@ mod tests {
 
     #[test]
     fn input_uses_fastpath_when_the_server_advertised_it() {
-        let sm = SessionStateMachine::new(config(), Vec::new());
+        let sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let frames = sm.encode_input(&[InputEvent::ScanCode {
             code: 0x1E,
             release: false,
@@ -1753,7 +1802,8 @@ mod tests {
     fn input_falls_back_to_slowpath_without_the_server_flag() {
         let mut cfg = config();
         cfg.server_input_flags = capability::INPUT_FLAG_SCANCODES;
-        let sm = SessionStateMachine::new(cfg, Vec::new());
+        let sm = SessionStateMachine::new(cfg, Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let event = InputEvent::Mouse {
             flags: input::PTRFLAGS_MOVE,
             wheel_units: 0,
@@ -1775,7 +1825,8 @@ mod tests {
 
     #[test]
     fn input_mouse_coordinates_clamp_to_the_desktop() {
-        let sm = SessionStateMachine::new(config(), Vec::new()); // 16×8 desktop
+        let sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM"); // 16×8 desktop
         let frames = sm.encode_input(&[InputEvent::Mouse {
             flags: input::PTRFLAGS_MOVE,
             wheel_units: 0,
@@ -1790,7 +1841,8 @@ mod tests {
 
     #[test]
     fn input_batches_over_255_events_spill_into_multiple_pdus() {
-        let sm = SessionStateMachine::new(config(), Vec::new());
+        let sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let events = vec![
             InputEvent::ScanCode {
                 code: 0x1E,
@@ -1810,7 +1862,8 @@ mod tests {
 
     #[test]
     fn drdynvc_caps_request_is_answered_on_the_drdynvc_channel() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let caps_request = vec![0x50, 0x00, 0x03, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut outputs = Vec::new();
         for frame in server_dvc_frames(&caps_request) {
@@ -1832,7 +1885,8 @@ mod tests {
 
     #[test]
     fn display_control_ready_enables_request_resize() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));
         display_control_ready(&mut sm, 8192, 8192);
 
@@ -1852,7 +1906,8 @@ mod tests {
 
     #[test]
     fn request_resize_rounds_odd_widths_down_and_validates_ranges() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         display_control_ready(&mut sm, 1920, 1080);
 
         // Odd width 1281 → 1280 on the wire (MS-RDPEDISP forbids odd widths).
@@ -1883,7 +1938,8 @@ mod tests {
         // debug-build panic when the client validates a resize. The product
         // saturates, so an in-range resize still proceeds. Parallel of slice-9's
         // hostile_map_origin_does_not_overflow_or_emit.
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         // All three caps factors maxed → the product is u32³ ≈ 2^96, which
         // overflows u64 (monitors must also be large; the 2-arg helper pins it to
         // 1, where MAX² still fits u64 and would not exercise the guard).
@@ -1896,7 +1952,8 @@ mod tests {
 
     #[test]
     fn refused_dynamic_channels_get_a_negative_creation_status() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let mut create = vec![0x10, 0x09];
         create.extend_from_slice(b"Microsoft::Windows::RDS::Geometry\0");
         let mut outputs = Vec::new();
@@ -1919,7 +1976,8 @@ mod tests {
 
     #[test]
     fn resize_then_deactivate_reactivate_applies_the_new_size() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         display_control_ready(&mut sm, 8192, 8192);
         sm.request_resize(8, 4).unwrap_err(); // below 200: validated
         let _ = sm.request_resize(1280, 1024).unwrap();
@@ -1944,7 +2002,8 @@ mod tests {
     fn without_a_drdynvc_channel_resize_is_not_ready_and_traffic_is_skipped() {
         let mut cfg = config();
         cfg.drdynvc_channel_id = None;
-        let mut sm = SessionStateMachine::new(cfg, Vec::new());
+        let mut sm = SessionStateMachine::new(cfg, Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));
         // What would have been drdynvc traffic is now unknown-static-channel noise: skipped.
         let caps_request = vec![0x50, 0x00, 0x01, 0x00];
@@ -1955,7 +2014,8 @@ mod tests {
 
     #[test]
     fn malformed_bitmap_data_is_a_typed_error_not_a_panic() {
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         // Compressed flag with garbage RLE that overruns the image.
         let mut body = Vec::new();
         body.extend_from_slice(&update::UPDATETYPE_BITMAP.to_le_bytes());
@@ -1974,7 +2034,8 @@ mod tests {
         assert!(matches!(err, SessionError::Rle(_)), "got {err:?}");
 
         // Bytes split across reads still reassemble (chunked TPKT).
-        let mut sm = SessionStateMachine::new(config(), Vec::new());
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let frame = bitmap_update_frame(0, 0, 4, 2, [1, 2, 3]);
         let (a, b) = frame.split_at(7);
         assert!(sm.process_bytes(a).unwrap().is_empty());

@@ -886,7 +886,8 @@ mod tests {
     /// list, whose granularity now coalesces per payload (e.g. a map's whole-surface rect plus a
     /// fill rect).
     fn flush(p: &mut GraphicsProcessor) -> (Framebuffer, Vec<FrameUpdate>) {
-        let mut fb = Framebuffer::new(256, 256);
+        let mut fb =
+            Framebuffer::new(256, 256).expect("the test desktop size is within MAX_DESKTOP_DIM");
         let frames = p.flush_frames(&mut fb);
         (fb, frames)
     }
@@ -894,7 +895,8 @@ mod tests {
     /// One flushed rect's RGBA pixels, read back out of the framebuffer.
     fn region(fb: &Framebuffer, f: &FrameUpdate) -> Vec<u8> {
         let mut px = vec![0u8; usize::from(f.width) * usize::from(f.height) * 4];
-        fb.copy_rect_into(f.x, f.y, f.width, f.height, &mut px);
+        fb.copy_rect_into(f.x, f.y, f.width, f.height, &mut px)
+            .expect("a FrameUpdate this framebuffer produced is in bounds");
         px
     }
 

@@ -264,3 +264,12 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   a day after ADR-0013's pin landed).
 - No captured-stream replay harness exists for the connect sequence: a VM run is the
   only end-to-end proof, and it is not reproducible offline.
+- **The census the no-panic obligation is derived from was scoped by crate until #241/#238,
+  and both halves of it were blind in different ways.** `rg --files crates/justrdp-pdu/src`
+  could not see a parser in the core (`tls::extract_subject_public_key`), and both commands
+  were *byte*-scoped so neither could describe a consumption site at all. `justrdp` now carries
+  `proptest` and a fuzz target for the first time, and the derivations live in
+  [the invariant](../invariant/untrusted-decode-never-panics.md). What remains open is that
+  derivation ③ is an **over-approximation adjudicated by hand** — it lists ~56 candidate
+  `pub fn`s and the membership judgement is ADR-0012 §1's, so it bounds the work rather than
+  deciding it.

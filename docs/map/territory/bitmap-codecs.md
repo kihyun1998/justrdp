@@ -101,6 +101,15 @@ attacker-controlled bytes in the repo.
   carries a zero: `Quant::default()` is the MS server's own table (6..7) and the
   harness's second table is 8..12. **If one ever carries a zero the differential goes
   red, and that is the correct signal, not a false one.**
+- **Two more members of ADR-0012's class were found by enumerating it, and both were live**
+  (#238). `color::to_rgba` sizes two buffers from wire dimensions and had neither artifact — the
+  member the issue named. `nscodec::plane_sizes` multiplied `tw * height` unguarded, and
+  `temp_dims` rounds a declared 65535 up to 65536, so `decode`'s own `u16` parameters reach an
+  overflow on a 32-bit target. **`plane_sizes` refuses rather than saturates**, and the reason is
+  worth keeping: its four numbers are *bounds* `decode_plane` trusts, whose empty-input branch is
+  `vec![0xFF; original_size]` — a saturated `usize::MAX` would have turned an arithmetic overflow
+  into an allocation of the address space. "Total" and "does not panic" are not the same
+  requirement.
 - **A no-panic property whose generator is bounded to the parser's range asserts the
   parser, not the function.** `nscodec`'s `reconstruct_never_panics_on_arbitrary_input`
   documented itself as covering *"any colour-loss level"* and generated `1u8..=7`.
