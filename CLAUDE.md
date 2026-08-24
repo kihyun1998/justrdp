@@ -5,19 +5,26 @@
 - **상세 계약(구현 시 참조)**: `CONTEXT.md`(ubiquitous language·경계) + `docs/adr/`(결정 근거) + `docs/plan.md`(빌드플랜 §2–§23).
 - **첫 동기**: ironrdp-connector 0.9.0 이 `SUPPORT_DYN_VC_GFX_PROTOCOL`(0x0100) 를 빠뜨려 EGFX 를 못 켜는 단일-플래그 감춤 — 호스트가 *모든* RDP 피처 플래그를 쥐게 하려는 재작성. 자세히는 `CONTEXT.md` §Project intent.
 
-## 작업 규율 — `theflow`
+## 작업 규율 — `thegraph`
 
-Substantive 변경이면 **`theflow` 스킬**로 짠다 — 착수 시 `/theflow`. 이 repo 전용 바인딩
-(크레이트 맵·스펙 라우팅·경계 규칙·oracle/VM 증명·게이트)은 **`docs/agents/theflow.md`**,
-규칙에 이빨을 주는 실증(ADR·이슈 앵커)은 **`docs/agents/lessons.md`** 에 산다. 착수 전에
-둘 다 읽는다. (justerm 과 같은 규율의 형제 — flow·mindset 은 이제 theflow 가 담는다.)
+Substantive 변경이면 **`thegraph` 스킬**로 짠다 — 착수 시 `/thegraph`. 고정된 step 목록이
+아니라 **노드 카탈로그 + 네 invariant**이고, 이 repo 의 실제 그래프(어느 노드가 몇 개
+있는지, 각 가드와 decider, 무엇이 에이전트·스크립트로 추출됐는지)는 **계약 문서
+`docs/agents/thegraph.md`** 에 컴파일돼 있다 — 착수 전에 그것을 연다.
+
+두 표는 **`docs/agents/theflow.md` 가 계속 소유**한다: layer 별 **tie-breaker**(무엇이
+논쟁을 이기는가)와 **deliberate divergence 23행**(어느 논쟁이 이미 끝났는가). 이슈가
+랜딩할 때마다 수정되는 표라 사본을 두지 않는다 — 그 파일이 은퇴하면 표를 *옮긴다*, 지우지
+않는다. 규칙에 이빨을 주는 실증(ADR·이슈 앵커)은 **`docs/agents/lessons.md`**.
+
+(`theflow` 는 여전히 유효한 형제 규율이고 `/theflow` 로 부를 수 있다. 기본은 `thegraph`.)
 
 ## 착수 전 배선도 — `docs/map/`
 
 **무엇을 건드리면 무엇이 같이 움직이는지**(영토별 `## Blast radius`)와 **영토를 넘어 성립하는
 사실**(`invariant/`)의 지도. 허브는 **[`docs/map/README.md`](docs/map/README.md)**. 설계를
-확정하기 *전에* 연다 — theflow Step 1 의 세 번째 원장이고, Step 5·Step 6 에서 다시 쓰인다.
-ADR 은 *결정이 다퉈진 날*로, plan.md 는 *빌드 순서*로 색인돼 있어 이 질문에 답하지 못한다.
+확정하기 *전에* 연다 — `map` 노드는 `boundary` 보다 **앞**에 있고, `verify` 의
+corpus ① 과 `sweep` 이 다시 읽는다. ADR 은 *결정이 다퉈진 날*로, plan.md 는 *빌드 순서*로 색인돼 있어 이 질문에 답하지 못한다.
 
 ## 경계 invariant (이게 정체성)
 
@@ -59,6 +66,8 @@ Five canonical triage roles mapped 1:1 to default label strings (`needs-triage`,
 Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ### CI gates
-네 게이트: `test.yml`(build/test/clippy + map) + `fuzz.yml`(nightly cargo-fuzz) + `supply-chain.yml`(just-shield, ADR-0006) + `overflow-32bit.yml`(i686 — x64 게이트가 **구조적으로** 못 잡는 dimension-overflow 클래스, path-filtered). 상세는 메모리 `justrdp_ci_policy` + `docs/agents/theflow.md` Step 7.
+네 게이트: `test.yml`(build/test/clippy + map) + `fuzz.yml`(nightly cargo-fuzz) + `supply-chain.yml`(just-shield, ADR-0006) + `overflow-32bit.yml`(i686 — x64 게이트가 **구조적으로** 못 잡는 dimension-overflow 클래스, path-filtered). 상세는 **`docs/agents/thegraph.md` § `gate`**(8게이트·9커맨드·사각지대) + 메모리
+`justrdp_ci_policy`. 실행 가능한 사본은 **`scripts/thegraph/gates.py`** 하나다 — 각
+게이트를 파이프 없이 bare 로 돌린다.
 
 **컴파일러는 핀돼 있다(ADR-0013, #235)** — `rust-toolchain.toml` 이 정확 버전을 고정하고 `rust-toolchain` Dependabot ecosystem 이 올린다. 그래서 로컬 게이트가 CI 를 미러한다; 그 전엔 3개월 차이가 나서 CI 를 빨갛게 만든 lint 가 로컬에선 **아예 발화하지 못했다**. nightly 는 `+nightly` 가 핀을 이기므로 fuzz 레인은 무영향.

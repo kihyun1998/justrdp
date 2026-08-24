@@ -100,7 +100,9 @@ that ground**, not skipped. When a consumer appears, derive the list on the spot
 ## Step 1 — verify against real source, before guessing
 
 Read real source with `gh api repos/<owner>/<repo>/contents/<path> --jq .content |
-base64 -d > "$SCRATCH/x"`, then `grep -n` / `sed -n`. **WebFetch is banned** — it
+base64 -d > "$SCRATCH/x"`, then `grep -n` / `sed -n` — **`SCRATCH` is not
+exported for you**, so set it first (`SCRATCH="${SCRATCH:-$(mktemp -d)}"`) or the
+redirect writes to `/x`. **WebFetch is banned** — it
 summarizes and silently drops handler bodies from large files, so a decoder branch
 that *is* there reads as absent. **Derive, don't copy** — re-derive from the spec
 and prove by differential test, not structural similarity (ADR-0003).
