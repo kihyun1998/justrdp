@@ -11,7 +11,8 @@
 # Runs post-merge on master and on demand (not per-PR) to keep it low-ceremony. cargo-llvm-cov is
 # installed with `cargo install` rather than a marketplace action, so no new third-party action needs
 # SHA-pinning (ADR-0006). Confirmed to run on stable Windows MSVC locally too (issue #102), so the
-# maintainer can reproduce this off-CI.
+# maintainer can reproduce this off-CI — and since #235 that reproduction is exact, because the
+# compiler is pinned rather than whatever `stable` meant on the day (ADR-0013).
 name: coverage
 
 on:
@@ -29,8 +30,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
-      - name: Install stable toolchain
-        run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+      # The pinned toolchain (ADR-0013) plus one component only this job needs. `llvm-tools-preview`
+      # stays out of `rust-toolchain.toml` deliberately: that file is every contributor's and every
+      # job's, and coverage is the only consumer.
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup component add llvm-tools-preview
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 

@@ -1,0 +1,25 @@
+# The compiler is a build input, and an unpinned input makes the gate mean something
+# different on every host (ADR-0013). Before this file, `test.yml` installed whatever
+# `stable` resolved to on the day it ran while the maintainer's host stayed three months
+# behind, so `cargo clippy -D warnings` passing locally said nothing about the PR gate —
+# measured in #235, where a `justrdp-codecs` change went red on 40 pre-existing sites in
+# four crates it never touched.
+#
+# The pin is exact (three-part), not `"1.98"`: a two-part channel resolves to the latest
+# patch release, so a compiler nobody reviewed would reach the gate the same way a
+# floating `stable` does. Same posture as `sspi = "=0.21.3"` (ADR-0004) and the SHA-pinned
+# actions (ADR-0006).
+#
+# Raising it is Dependabot's job, not a memory: the `rust-toolchain` ecosystem in
+# `.github/dependabot.yml` opens the bump PR. That pairing is what makes the pin cheap and
+# is the condition ADR-0013 requires — a pin whose bump has no owner is the shape ADR-0004
+# documents, where a bridge outlived its exit condition by six weeks.
+#
+# `targets` is deliberately absent. This file is shared with CI, which runs on
+# `ubuntu-latest`, so naming the 32-bit Windows target used by the overflow proofs
+# (`i686-pc-windows-msvc`, #151/#155) would make every Linux job fetch a cross-target std
+# it never builds. That proof stays a local step until an i686 job exists.
+[toolchain]
+channel = "1.98.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

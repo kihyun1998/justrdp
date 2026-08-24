@@ -5,8 +5,11 @@
 # and kept current by the github-actions Dependabot ecosystem (ADR-0006), so the pins stay
 # immutable and up to date with no manual upkeep. Reinstated on that basis.
 #
-# Runs on the stable toolchain (no nightly needed) — the proptest robustness properties (ADR-0008)
-# ride in `cargo test --workspace` here; the nightly libFuzzer lane is separate (fuzz.yml).
+# Runs on the toolchain `rust-toolchain.toml` pins (ADR-0013), so this gate and the maintainer's
+# local one are the same compiler — before the pin they were three months apart and a PR went red on
+# 40 pre-existing sites it never touched (#235). No nightly needed: the proptest robustness
+# properties (ADR-0008) ride in `cargo test --workspace` here; the libFuzzer lane is separate
+# (fuzz.yml) and selects nightly explicitly, which outranks the pin.
 name: test
 
 on:
@@ -23,8 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install stable toolchain
-        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      # No toolchain named here on purpose: argless `install` reads `rust-toolchain.toml`, which
+      # carries the channel, `profile = "minimal"` and the clippy/rustfmt components. Naming
+      # `stable` would install a second, *different* compiler that the pin then overrides — the
+      # gate would still be right and the log would be a lie about what ran.
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 

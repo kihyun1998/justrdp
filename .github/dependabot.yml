@@ -16,6 +16,19 @@ updates:
     directory: "/fuzz"
     schedule:
       interval: "weekly"
+  # The compiler pin in `rust-toolchain.toml` (ADR-0013). This entry is not an optimization — it is
+  # the condition the pin ships with: a pinned input whose bump has no owner is exactly the shape
+  # ADR-0004's Amendment records, where the `[patch.crates-io]` bridge outlived its exit condition by
+  # six weeks because the artifact said "remove when #689 ships" and nobody re-read it.
+  #
+  # The ecosystem is first-class in dependabot-core (`rust_toolchain`, initial updater 2025-06-18)
+  # and its update checker bumps a *version* channel while deliberately declining a bare stability
+  # channel — `stable` gets no PRs, `"1.98.0"` does, and the two- vs three-part format is preserved.
+  # That is why the pin is exact: it is the only form this lane actually watches.
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    schedule:
+      interval: "weekly"
   # Keeps the GitHub Actions used by the fuzz + supply-chain workflows current. With actions
   # pinned to commit SHAs (ADR-0006), this is what makes SHA-pinning cheap: Dependabot opens the
   # bump PR with the new SHA and a version comment, so pins stay both immutable and up to date.

@@ -83,6 +83,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Nightly is named explicitly here and every `fuzz` invocation below says `+nightly`, which
+      # outranks `rust-toolchain.toml` in rustup's override order — so the ADR-0013 pin does not
+      # reach libFuzzer, which needs nightly by construction. It *does* reach `cargo install`
+      # below, which is the intent (one reproducible compiler builds the tool); the boundary
+      # condition is that a pin left far enough behind cargo-fuzz's own MSRV would fail here
+      # rather than in the fuzzing itself.
       - name: Install nightly toolchain and cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
