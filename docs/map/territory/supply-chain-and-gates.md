@@ -26,11 +26,23 @@ like any other.
 
 ## Design model
 
-- **Three gating workflows and one report.** `test.yml` — two jobs: `test`
+- **Four gating workflows and one report.** `test.yml` — two jobs: `test`
   (fmt → clippy `-D warnings` → `cargo test --workspace`) and `map`
   (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
   waiting for cargo); `fuzz.yml` (nightly libFuzzer); `supply-chain.yml`
-  (`just-shield`). `coverage.yml` reports with no threshold and does not fail a build.
+  (`just-shield`); `overflow-32bit.yml` (the 32-bit target, below). `coverage.yml`
+  reports with no threshold and does not fail a build.
+- **One gate exists because the others structurally cannot fail.** On x86-64 a wrapping
+  `width * height * bytes_per_pixel` is merely a large number, so the dimension-overflow
+  guards ([the invariant](../invariant/decoder-dimension-overflow-32bit.md)) are green
+  everywhere the other gates run. `overflow-32bit.yml` builds
+  `justrdp-codecs` + `justrdp` for `i686-pc-windows-msvc` on a Windows runner, path-filtered
+  to the three crates that hold the sites because that runner bills at 2x. Two scoping notes
+  that were measured rather than assumed: the pre-existing local command named
+  `-p justrdp-codecs` **alone**, which does not reach the EGFX and framebuffer sites the
+  invariant lists in `justrdp`; and `i686-unknown-linux-gnu` on ubuntu would give the same
+  32-bit `usize` at 1x, but nothing here has run it, so the cheaper shape is a measurement
+  away rather than an argument away.
 - **A gate is only as good as its failure directions, and that is now a command
   rather than a memory** — `python3 .github/scripts/check_map.py --selftest`, run in
   CI ahead of the gate itself. It builds a throwaway mini-map in a temp directory,
@@ -87,7 +99,7 @@ like any other.
 ## Code
 
 - `.github/workflows/` — `test.yml` (jobs `test` + `map`), `fuzz.yml`,
-  `supply-chain.yml`, `coverage.yml`
+  `supply-chain.yml`, `overflow-32bit.yml`, `coverage.yml`
 - `.github/scripts/check_map.py` — the map gate (`selftest`, `scope_text`,
   `check_code`, `check_links`, `check_reciprocity`); its scope is declared in its own
   docstring rather than inferred
@@ -141,11 +153,12 @@ and never re-read. Verify at the source before a decision rests on it.
 - **The dependency graph is now registry-only again** — no `git` sources in
   `Cargo.lock`, so every dependency carries a checksum. Worth keeping true: a git
   dependency is the one supply-chain hole `just-shield` does not scan for.
-- **No i686 / 32-bit job exists**, so the dimension-overflow class is unguarded in CI
-  (see [the invariant](../invariant/decoder-dimension-overflow-32bit.md)). ADR-0013's pin
-  deliberately does **not** close this: `targets` is left out of `rust-toolchain.toml`
-  because the file is shared with `ubuntu-latest`, so the i686 proof stays a local step
-  until a job of its own exists.
+- ~~**No i686 / 32-bit job exists.**~~ **Closed** by `overflow-32bit.yml` (see the design
+  model above). What remains is a smaller, named gap: `targets` is still deliberately out of
+  `rust-toolchain.toml` because that file is shared with the ubuntu runners, so the **local**
+  i686 run needs its own `rustup target add` after every toolchain bump — which is exactly how
+  it silently stopped working a day after ADR-0013 landed. The gate matrix carries the line;
+  nothing enforces it locally.
 - **The bump lane's *timing* is upstream's, and upstream has an open defect in it.**
   dependabot-core#15596 (*"Fix cooldown filtering for Rust toolchains"*) is open, so a
   toolchain bump PR may arrive later than the weekly schedule implies. The lane's existence

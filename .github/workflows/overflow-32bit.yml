@@ -1,0 +1,77 @@
+# The 32-bit gate for the dimension-overflow class
+# (docs/map/invariant/decoder-dimension-overflow-32bit.md).
+#
+# Why a job at all: `usize` is 32 bits on i686 and wasm32, so `width * height * bytes_per_pixel`
+# wraps there and the undersized allocation is then written past its end. On x86-64 the same
+# expression is merely large — every test passes, the fuzzer finds nothing, the VM is happy. The
+# guards that catch it therefore cannot go red on any host this repo's other gates run on, and
+# until now the class was held by "a command someone has to remember to run", in the invariant's
+# own words. That premise failed within a day of being written down: ADR-0013's toolchain pin is
+# exact and a rustup target is per-toolchain, so the locally-added i686 target silently went
+# missing under the new pin and the command stopped working with no signal.
+#
+# Scope is `justrdp-codecs` **and** `justrdp`, not codecs alone. The gate line recorded in
+# docs/agents/theflow.md named only codecs, and the invariant names five territories — two of
+# which (EGFX surface allocation, the framebuffer) live in `justrdp`. Automating the narrower
+# command would have made the gap permanent, which is #200's shape: a workflow may not keep its
+# own narrower copy of something the repo already answers. `justrdp-tokio` is out because its
+# tests need the real VM and are `#[ignore]`d in CI regardless.
+#
+# Measured before this job existed, on the maintainer's host at the pinned toolchain:
+# 386 passed, 0 failed across 16 binaries. So this lands green rather than importing a red gate.
+#
+# Path-filtered on purpose. A Windows runner bills at 2x, and this class only moves when the
+# arithmetic does — so the job runs when the crates that hold the sites change, not on every PR.
+# The cheaper shape was considered and **not** taken: `i686-unknown-linux-gnu` on `ubuntu-latest`
+# has the same 32-bit `usize` at 1x billing, but nothing here has ever run it (it needs
+# `gcc-multilib` for linking, and the maintainer's host cannot execute the binaries to check).
+# Switching is a measurement away, not an argument away — take it if the billing ever matters.
+#
+# No new third-party action to pin (ADR-0006): the checkout below reuses the SHA the other
+# workflows already carry, and everything else is rustup and cargo.
+name: overflow-32bit
+
+on:
+  pull_request:
+    paths:
+      - "crates/justrdp-codecs/**"
+      - "crates/justrdp/**"
+      - "crates/justrdp-pdu/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/overflow-32bit.yml"
+  push:
+    branches: [master]
+    paths:
+      - "crates/justrdp-codecs/**"
+      - "crates/justrdp/**"
+      - "crates/justrdp-pdu/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/overflow-32bit.yml"
+  workflow_dispatch:
+
+# Least privilege (just-shield R7): the job only reads the repo.
+permissions:
+  contents: read
+
+jobs:
+  overflow-32bit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # No toolchain named: argless `install` reads rust-toolchain.toml (ADR-0013). The
+      # `target add` is a separate step and not ceremony — a rustup target belongs to a
+      # toolchain, so the pin does not carry it and a pin bump would drop it again.
+      - name: Install the pinned toolchain and the 32-bit target
+        run: |
+          rustup toolchain install
+          rustup target add i686-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: i686
+
+      # Not `--workspace`: that would pull in justrdp-tokio, whose tests need the VM. Not
+      # `-p justrdp-codecs` alone either — see the scope note in the header.
+      - name: Test on 32-bit
+        run: cargo test -p justrdp-codecs -p justrdp --target i686-pc-windows-msvc

@@ -32,8 +32,14 @@ thing is an *arithmetic assumption about the host*, not a dependency.
 - [Framebuffer & frame delivery](../territory/framebuffer-frame-delivery.md) — the
   framebuffer itself is allocated the same way, from the negotiated desktop size.
 - [Verification harness](../territory/verification-harness.md) — where the proof
-  obligation lives, and where it is currently unmet: no CI job builds a 32-bit
-  target, so this class is guarded by a command someone has to remember to run.
+  obligation lives, and where it is now **met**: `.github/workflows/overflow-32bit.yml`
+  builds and tests `justrdp-codecs` + `justrdp` on `i686-pc-windows-msvc`. It used to
+  say the class was "guarded by a command someone has to remember to run", and that
+  premise failed in a measurable way before the job existed — ADR-0013's toolchain pin
+  is exact and a rustup target is per-toolchain, so the locally-added target went
+  missing under the new pin with no signal at all. The job's scope is deliberately
+  wider than the command that preceded it: that command named `justrdp-codecs` alone,
+  which does not reach the EGFX and framebuffer sites listed above.
 
 ## What a violation looks like
 

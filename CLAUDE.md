@@ -59,6 +59,6 @@ Five canonical triage roles mapped 1:1 to default label strings (`needs-triage`,
 Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ### CI gates
-세 게이트: `test.yml`(build/test/clippy) + `fuzz.yml`(nightly cargo-fuzz) + `supply-chain.yml`(just-shield, ADR-0006). 상세는 메모리 `justrdp_ci_policy` + `docs/agents/theflow.md` Step 7.
+네 게이트: `test.yml`(build/test/clippy + map) + `fuzz.yml`(nightly cargo-fuzz) + `supply-chain.yml`(just-shield, ADR-0006) + `overflow-32bit.yml`(i686 — x64 게이트가 **구조적으로** 못 잡는 dimension-overflow 클래스, path-filtered). 상세는 메모리 `justrdp_ci_policy` + `docs/agents/theflow.md` Step 7.
 
 **컴파일러는 핀돼 있다(ADR-0013, #235)** — `rust-toolchain.toml` 이 정확 버전을 고정하고 `rust-toolchain` Dependabot ecosystem 이 올린다. 그래서 로컬 게이트가 CI 를 미러한다; 그 전엔 3개월 차이가 나서 CI 를 빨갛게 만든 lint 가 로컬에선 **아예 발화하지 못했다**. nightly 는 `+nightly` 가 핀을 이기므로 fuzz 레인은 무영향.
