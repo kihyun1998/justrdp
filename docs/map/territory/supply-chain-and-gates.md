@@ -4,8 +4,8 @@
 
 What has to be true before a change lands, and what the project trusts to build it:
 four GitHub Actions workflows (three gating, one discovery), SHA-pinned third-party
-actions kept current by Dependabot, and a small, deliberately-chosen, registry-only
-dependency set (the one `[patch.crates-io]` fork bridge this repo ever carried was
+actions and an exactly-pinned compiler both kept current by Dependabot, and a small,
+deliberately-chosen, registry-only dependency set (the one `[patch.crates-io]` fork bridge this repo ever carried was
 exited on 2026-08-10). Shipping is something the system does, so this is a territory
 like any other.
 
@@ -20,6 +20,9 @@ like any other.
   its removal obligation.
 - [ADR-0008](../../adr/0008-robustness-testing-fuzz-and-property.md) — why fuzzing is
   a nightly lane rather than a PR gate.
+- [ADR-0013](../../adr/0013-pinned-build-inputs.md) — a build input is pinned to an exact
+  version and every pin names its bumper; the compiler is the third participant, after
+  actions (0006) and `sspi` (0004).
 
 ## Design model
 
@@ -58,6 +61,24 @@ like any other.
 - **Pinning is cheap only because it is automated** — `just-shield fix` writes the
   SHA, Dependabot bumps it with a version comment. That pairing is the whole reason
   the earlier "pinning is unmaintainable" objection was resolved.
+- **The compiler is a pinned input too, and the gate only means something because of it**
+  (ADR-0013). `rust-toolchain.toml` pins `channel = "1.98.0"` exactly; the `rust-toolchain`
+  Dependabot ecosystem raises it. Before the pin, `test.yml` installed whatever `stable`
+  resolved to that day while the maintainer's host sat three months back, so a green local
+  `clippy` said nothing about the PR gate — #235, where a `justrdp-codecs` change went red
+  on 40 pre-existing sites in four crates it never touched, and the lint that failed it
+  **could not fire locally at all**. Three properties of the pin are load-bearing rather
+  than incidental: it is **three-part** (a two-part channel resolves to the newest patch,
+  which is an unreviewed compiler by a smaller door); CI installs it by **naming no
+  toolchain** (argless `rustup toolchain install` reads the file, where naming `stable`
+  would install a second compiler the pin then overrides and leave the log misreporting
+  what ran); and it carries **no `targets`**, because this file is shared with
+  `ubuntu-latest` runners that would fetch the i686 Windows std they never build.
+- **The pin does not reach the fuzz lane, by rustup's own ordering.** An explicit
+  `+toolchain` outranks `rust-toolchain.toml`, so `cargo +nightly fuzz run` keeps nightly —
+  which libFuzzer needs by construction. It *does* reach `cargo install cargo-fuzz`, which
+  is intended, with the boundary condition that a pin far enough behind cargo-fuzz's MSRV
+  fails at install time rather than during fuzzing.
 - **A fork bridge is temporary by construction**: it may contain only commits already
   PR'd upstream, and it carries a removal obligation.
 - **The Dependabot cargo job is a tripwire, not just an updater** — its `sspi` bump
@@ -70,15 +91,28 @@ like any other.
 - `.github/scripts/check_map.py` — the map gate (`selftest`, `scope_text`,
   `check_code`, `check_links`, `check_reciprocity`); its scope is declared in its own
   docstring rather than inferred
-- `.github/dependabot.yml` — weekly cargo + github-actions ecosystems
+- `.github/dependabot.yml` — weekly cargo, rust-toolchain and github-actions ecosystems
+- `rust-toolchain.toml` — the exact compiler pin (ADR-0013); read by every `cargo`
+  invocation in the tree, `fuzz/` included, since rustup discovers it by walking up
 - `Cargo.toml` — `[workspace.dependencies]` (exact pin `sspi = "=0.21.3"` per ADR-0004)
 - `fuzz/Cargo.toml` — the out-of-workspace member
 
 ## Reference behaviour
 
-**None.** No verified external-fact store. The one external fact this territory
-depends on continuously — *which `sspi` version on crates.io contains the fix* — is
-checked ad hoc rather than recorded.
+**None.** No verified external-fact store, and this territory is the one that keeps paying
+for that. Two external facts it depends on continuously are checked ad hoc rather than
+recorded, and **both have now been wrong in an artifact**:
+
+- *Which `sspi` version on crates.io contains the fix.* Three artifacts said "remove the
+  fork when #689 ships"; it had shipped six weeks earlier (ADR-0004 Amendment).
+- *What Dependabot can watch.* #235 weighed its whole decision against "Dependabot does not
+  watch `rust-toolchain.toml`". `rust_toolchain` had been a first-class ecosystem in
+  `dependabot-core` since 2025-06-18 and is documented by GitHub as
+  `package-ecosystem: "rust-toolchain"`. One query settled it, and it collapsed the issue's
+  three options into one.
+
+The shape is identical both times: a sentence about an external system, written once, load-bearing,
+and never re-read. Verify at the source before a decision rests on it.
 
 ## Cross-cutting invariants
 
@@ -108,7 +142,15 @@ checked ad hoc rather than recorded.
   `Cargo.lock`, so every dependency carries a checksum. Worth keeping true: a git
   dependency is the one supply-chain hole `just-shield` does not scan for.
 - **No i686 / 32-bit job exists**, so the dimension-overflow class is unguarded in CI
-  (see [the invariant](../invariant/decoder-dimension-overflow-32bit.md)).
+  (see [the invariant](../invariant/decoder-dimension-overflow-32bit.md)). ADR-0013's pin
+  deliberately does **not** close this: `targets` is left out of `rust-toolchain.toml`
+  because the file is shared with `ubuntu-latest`, so the i686 proof stays a local step
+  until a job of its own exists.
+- **The bump lane's *timing* is upstream's, and upstream has an open defect in it.**
+  dependabot-core#15596 (*"Fix cooldown filtering for Rust toolchains"*) is open, so a
+  toolchain bump PR may arrive later than the weekly schedule implies. The lane's existence
+  is what ADR-0013 requires and that is verified at source; its punctuality is not, and a
+  pin that stays behind is a quiet loss of new diagnostics rather than a red gate.
 - **Documentation is only half-gated.** `docs/map/` now has a link/anchor/symbol/
   section/reciprocity gate, but **rustdoc is still unbuilt in CI** — no
   `cargo doc --no-deps` with `-D warnings`, so a public doc-comment can link a private

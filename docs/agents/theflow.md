@@ -349,6 +349,7 @@ a spine — a cluster with a home never gets a second one). All **Accepted**; no
 | 0010 | `FrameUpdate` dirty-rect contract (#85) |
 | 0011 | zero `ironrdp` as the terminal state; the oracle retires per codec (#194) |
 | 0012 | consumption-site totality — a parser's guarantee is not held at the point of use (#211/#233) |
+| 0013 | pinned build inputs — every pin names its bumper; the compiler pin (#235) |
 
 **Tracker parent/child: GitHub sub-issues are in use on one cluster and nowhere else.**
 Measured 2026-08-13, not inferred — an earlier revision of this paragraph asserted the
@@ -398,6 +399,15 @@ python .github/scripts/check_map.py             # docs/map: links, anchors, symb
 
 Run each gate **bare, never piped** (a pipeline's exit status is `tail`'s, so the gate
 cannot fail), and **never move a threshold to turn a build green**.
+
+**These commands mirror CI because the compiler is pinned, and only because of that**
+(ADR-0013, #235). `rust-toolchain.toml` fixes the channel at an exact version and CI installs
+it by naming no toolchain, so the skill's *"do not sit watching CI during implementation — the
+local gates mirror it"* is a fact rather than a hope. It stops being one the moment the pin is
+removed or CI names a toolchain of its own: before #235 the maintainer's host was three months
+behind the runner and a lint that failed the gate could not fire locally at all. The two still
+differ in **OS** — the runner is `ubuntu-latest`, the host is Windows MSVC — so a
+platform-conditional path is the residue this does not cover.
 
 **CI jobs — four workflows, three of them gates:**
 
