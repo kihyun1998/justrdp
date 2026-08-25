@@ -56,6 +56,9 @@ transcription error.
 
 ## Cross-cutting invariants
 
+- [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
+  — a constant table is where a spec-fixed value gets a name; the field that carries it is
+  where nobody checks it. `ShareDataHeader`'s compression pair is the open instance (#253).
 **None.**
 
 ## Blast radius

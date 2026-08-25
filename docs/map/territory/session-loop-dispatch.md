@@ -22,9 +22,10 @@ one of its four outputs. Neither says what the loop dispatches or in what order.
 - **Five outputs, and the host's whole view of a live session is these**:
   `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `DisplayControlReady` ·
   `ShutdownDenied`. Anything the host cannot learn from one of these, it cannot learn at all
-  — which is the argument #228 turned on: a `pduType2` that falls into the
-  decoded-and-skipped arm is not "handled quietly", it is **unlearnable**, and a host asking
-  for a shutdown then looks exactly like a host that never asked.
+  — which is the argument #228 turned on: a `pduType2` that falls into the catch-all
+  (**skipped, cursor unread** — the arm never decoded anything, whatever its comment said
+  until #252) is not "handled quietly", it is **unlearnable**, and a host asking for a
+  shutdown then looks exactly like a host that never asked.
 - **The loop is fed, never reads.** It has no socket; the adapter feeds it bytes and
   drains the outputs, which is what makes a captured stream a complete test input.
 - **`DisplayControlReady` is a capability gate, not an event of interest** — it is
@@ -52,6 +53,9 @@ one of its four outputs. Neither says what the loop dispatches or in what order.
 
 ## Cross-cutting invariants
 
+- [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
+  — `ShareDataHeader.compressed_type` states "must be 0 here" and has no reader, while
+  `dvc.rs` rejects the identical violation class with a typed error and a test (#253).
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) —
   every byte this loop dispatches came from the network.
 - [The frame path carries no owned pixels](../invariant/frame-path-carries-no-owned-pixels.md)

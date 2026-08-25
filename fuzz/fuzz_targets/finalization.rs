@@ -19,28 +19,40 @@
 //!
 //! `gcc` and `mcs` spend a selector arm per entry point because their parsers are separate
 //! grammars with real depth. These three are the shallowest decoders in the crate — two, three
-//! and four fixed-width reads respectively, no dispatch, no length field, no cap — so every
-//! input drives all three. A selector would cost more than the calls it guards, which is the
-//! same judgement `tpkt.rs` and `fastpath.rs` make for their `frame_len` siblings.
+//! and four fixed-width reads respectively, no length field, no cap — so every input drives all
+//! three. A selector would cost more than the calls it guards, which is the same judgement
+//! `tpkt.rs` and `fastpath.rs` make for their `frame_len` siblings. (**"No dispatch" stopped
+//! being true in #252**, which put a `messageType == SYNCMSGTYPE_SYNC` gate on `Synchronize`;
+//! every input still *enters* all three, it just no longer reaches past that one.)
 //!
-//! There is no seeder for this target and no captured finalization PDU in the repo, so the
-//! input is the raw `&[u8]` rather than an `Arbitrary` struct — nothing outside this file
-//! depends on a layout.
+//! The input is the raw `&[u8]` rather than an `Arbitrary` struct — nothing outside this file
+//! depends on a layout. This used to add "and no captured finalization PDU in the repo", which
+//! **#252 made false**: `justrdp-pdu/tests/fixtures/connect/finalization-replies.bin` holds four
+//! real server replies, and `.github/scripts/seed_fuzz_corpus.py`'s `SEEDERS` table is the
+//! mechanism for turning them into a seed. Not done here — recorded so it is a decision rather
+//! than an omission, and #252's gate is exactly what makes a seed worth more than it used to be.
 //!
-//! ## What the lane adds over the properties: almost nothing, and the honest reason is not
-//! the usual one
+//! ## What the lane adds over the properties: for two of the three, almost nothing
 //!
-//! These parsers have no exact-match gate in front of their reads, so undirected bytes reach
-//! every one of them — measured at 5 runs each, an unchecked read in any of the three turns its
-//! own proptest red every time. So the stable gate already has reachability.
+//! `Control` and `FontMap` have no exact-match gate in front of their reads, so undirected bytes
+//! reach every one of them — measured at 5 runs each, an unchecked read in either turns its own
+//! proptest red every time. So the stable gate already has reachability there.
 //!
 //! An earlier revision of this header claimed the lane's remaining value was `-timeout` (hangs)
-//! and coverage guidance over field combinations. **Both are false here, and the correction is
+//! and coverage guidance over field combinations. **Both were false here, and the correction is
 //! worth keeping because the sentence is a template that fits most targets in this directory.**
-//! No branch in any of the three parsers depends on a field *value* — every read is stored or
-//! discarded unconditionally — so libFuzzer's entire feature set is the nine length checks in
+//! No branch in any of the three parsers depended on a field *value* — every read was stored or
+//! discarded unconditionally — so libFuzzer's entire feature set was the nine length checks in
 //! `ReadCursor::ensure`, saturated by inputs of length 0..8. And there is no loop anywhere in
-//! the three, so `-timeout` has no hang to catch.
+//! the three, so `-timeout` still has no hang to catch.
+//!
+//! **#252 inverted the first half for `Synchronize`, and that is worth more than the retraction
+//! costs.** Its decode now branches on a field value, so a two-byte comparison stands between
+//! undirected input and the `targetUser` read — and climbing a comparison from coverage feedback
+//! is precisely what libFuzzer's auto-dictionary does and what `vec(any::<u8>(), 0..=512)`
+//! structurally cannot: the proptest needs a hand-weighted arm (it has one) while the lane gets
+//! there on its own. For this one parser the nightly lane is now the *stronger* instrument, which
+//! is the reverse of what this header spent three paragraphs establishing.
 //!
 //! What the target is actually for: **roster uniformity and regression insurance.** `fuzz.yml`
 //! derives its matrix from this directory, so a parser family with no file reads as a decision
