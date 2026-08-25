@@ -82,7 +82,10 @@ Read **before `boundary`** — reaching for it at `verify` turns everything it w
 have told you into rework. Per territory: `## Blast radius` (what else moves when
 you touch this — opening one and finding nothing to do is a correct outcome),
 `## Cross-cutting invariants`, `## Governing decisions`, `## Known holes / open`.
-6 invariant notes, 18 territory notes. Add `docs/plan.md` §0 (traps already PROVEN
+`ls docs/map/invariant/ docs/map/territory/` is the roster — this line carried the two
+counts and they rotted the day #252 promoted a note, which is the failure
+[`docs/map/README.md`](../map/README.md) already records against itself ("a count written
+here is a copy that rots"). Add `docs/plan.md` §0 (traps already PROVEN
 on the real VM — do not re-discover) and §1 (capability → feature coupling).
 
 **If no territory matches, that is an exit this node owes an answer for — and the
