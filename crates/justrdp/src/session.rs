@@ -564,8 +564,11 @@ impl SessionStateMachine {
             // dropped unread, so `connect.rs` checked a server `action` this path never looked
             // at — one family, two answers. #252 decided *against* gating session-active on
             // their arrival; this is only the value check, held identically on both legs.
-            // (ADR-0012 §3's "one undefined input, one answer across a family" is the shape, but
-            // its own wording scopes it to codec families — precedent here, not authority.)
+            // ADR-0012 §3's "one undefined input, one answer across a family". Its own sentence
+            // says *codec* family, so this was precedent rather than authority until the
+            // Amendment 2026-08-25 extended the reach to PDU families on the strength of this
+            // very site — one of the two non-codec cases that showed the rule derives past the
+            // layer it was written about.
             //
             // **Observability is not yet symmetric.** `connect.rs` emits an `rdp_finalization`
             // record per reply; these two arms emit nothing, so a reactivation is still three
@@ -1601,7 +1604,9 @@ mod tests {
     /// Control(GrantedControl) → Font Map` — the same four replies as the connect leg. Before
     /// this, three of them fell to the catch-all and the `ReadCursor` was dropped unread, so
     /// the connect path validated a server `action` the reactivation path never even looked at.
-    /// That is one family with two answers, which is the shape ADR-0012 §3 exists to end.
+    /// That is one family with two answers, which is the shape ADR-0012 §3 exists to end — and
+    /// this site is half the evidence for its Amendment 2026-08-25, which extended the rule from
+    /// codec families to PDU families rather than leaving two records citing it as precedent.
     ///
     /// (`justrdp-tokio`'s resize test printed a "PDU sequence observed" line naming only
     /// DeactivateAll → Demand Active → Font Map. The capture refutes it; it was a hardcoded

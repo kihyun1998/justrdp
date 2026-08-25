@@ -1,6 +1,20 @@
 # 0009 — Negotiation posture: tolerant of server self-inconsistency in rendering, strict on security integrity
 
 - Status: Accepted
+  - Amendment 2026-08-25 (#252): **§1 and §2 are not a partition, and that is measured rather
+    than argued.** A wire field whose legal values `[MS-RDPBCGR]` fixes — `Synchronize.messageType`,
+    a server `Control.action` — is refused by both reference clients and by us, and it falls in
+    neither half: §1's predicate is *"where a violation is an attack vector"* and none is
+    constructible for a peer that has already completed CredSSP, MCS, channel join and licensing,
+    while §2's grant is scoped **by enumeration** to rendering-feature self-inconsistency (a
+    drawing order, an under- or over-advertised capability, a misreported version). **§3(a) is
+    what licenses the refusal** — *"tolerance is about which features are allowed to appear,
+    never about trusting their contents"* — as a removal of the objection rather than a mandate.
+    [ADR-0012](0012-consumption-site-totality.md) §3 hit the same wall from the codec side and
+    routed around it the same way (#233); two instances at opposite layers is why this is
+    recorded instead of re-derived a third time. **What this does not decide** is the
+    *completeness* question — whether the Font Map alone may gate session-active — which #252
+    settled as "no ladder" on its own evidence and which is not a posture question at all.
 - Date: 2026-07-03
 - Closes issue #101
 
