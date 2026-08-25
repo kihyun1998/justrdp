@@ -1,6 +1,18 @@
 # 0012 — A parser's guarantee is not held at the point of use: consumption-site totality
 
-- Status: Accepted (promoted while working issue #211; conformance items #211, #233)
+- Status: Accepted (promoted while working issue #211; conformance items #211, #233, #252)
+  - Amendment 2026-08-25 (#252): **§3 derives a case outside codecs, which is evidence for the
+    rule rather than a limit on it.** Its sentence says *"two stages of one **codec** family"*,
+    and two non-codec sites now reach for it: #253 (a Share Data header field enforced in one
+    module and unenforced in another) and `justrdp::session`'s reactivation arms, which checked
+    a server `Control.action` the connect leg checked and the reactivation leg did not — one PDU
+    family, two answers, closed by #252. Both cite §3 as **precedent**, which is the honest
+    reading of the text as written. This amendment extends the reach rather than rewriting the
+    sentence, per the ADR-0002/0007 house pattern: **where two consumption sites of one family —
+    codec *or* PDU — consume the same quantity, they give it the same answer, or the divergence
+    is a row naming both sides.** The Consequences already claim this record *derives* its
+    decisions rather than listing them; a fifth derivation outside the layer it was written
+    about is what that claim predicts.
   - Amendment 2026-08-24 (#233): §3's outstanding instance is settled — WireToSurface1 refuses a
     zero quantization exponent, so the two RemoteFX dequantizers now answer it alike and the
     record needs no divergence row. See §3.
