@@ -566,6 +566,11 @@ impl SessionStateMachine {
             // their arrival; this is only the value check, held identically on both legs.
             // (ADR-0012 §3's "one undefined input, one answer across a family" is the shape, but
             // its own wording scopes it to codec families — precedent here, not authority.)
+            //
+            // **Observability is not yet symmetric.** `connect.rs` emits an `rdp_finalization`
+            // record per reply; these two arms emit nothing, so a reactivation is still three
+            // asserted milestones out of six PDUs. The value checks match on both legs; the
+            // milestones do not, and this comment is here so the gap is a known one.
             share::PDU_TYPE2_SYNCHRONIZE if self.phase == Phase::Reactivating => {
                 finalization::Synchronize::decode(cur).map_err(SessionError::Decode)?;
                 Ok(())
