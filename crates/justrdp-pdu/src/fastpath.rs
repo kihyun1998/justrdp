@@ -33,7 +33,11 @@ pub const FP_UPDATE_CACHED_POINTER: u8 = 0xA;
 /// `updateCode`: variable-bpp pointer shape (`TS_FP_POINTERATTRIBUTE`).
 pub const FP_UPDATE_NEW_POINTER: u8 = 0xB;
 /// `updateCode`: large pointer shape (≤384×384; only sent if the client advertises the
-/// Large Pointer capability, which this client does not — decoded-and-skipped).
+/// Large Pointer capability, which this client does not. **Named, not handled** — this
+/// constant has no reference site, so a server that sent one would fall to the dispatch's
+/// catch-all with its cursor unread. The doc said "decoded-and-skipped" until #252, which
+/// was wrong twice over; `FP_UPDATE_ORDERS` and `FP_UPDATE_SURFCMDS` are the same shape and
+/// say nothing, which is the honest form.
 pub const FP_UPDATE_LARGE_POINTER: u8 = 0xC;
 
 /// `fragmentation`: a complete update in one PDU.
