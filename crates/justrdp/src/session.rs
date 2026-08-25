@@ -555,6 +555,26 @@ impl SessionStateMachine {
                 }
                 Ok(())
             }
+            // The server's other finalization replies on the reactivation leg. Measured against
+            // the real VM (#252): a resize produces `DeactivateAll → Demand Active →
+            // Synchronize → Control(Cooperate) → Control(GrantedControl) → Font Map`, the same
+            // four the connect leg gets. They used to fall to the catch-all with the cursor
+            // dropped unread, so `connect.rs` checked a server `action` this path never looked
+            // at — one family, two answers. #252 decided *against* gating session-active on
+            // their arrival; this is only the value check, held identically on both legs.
+            // (ADR-0012 §3's "one undefined input, one answer across a family" is the shape, but
+            // its own wording scopes it to codec families — precedent here, not authority.)
+            share::PDU_TYPE2_SYNCHRONIZE if self.phase == Phase::Reactivating => {
+                finalization::Synchronize::decode(cur).map_err(SessionError::Decode)?;
+                Ok(())
+            }
+            share::PDU_TYPE2_CONTROL if self.phase == Phase::Reactivating => {
+                finalization::Control::decode(cur)
+                    .map_err(SessionError::Decode)?
+                    .check_server_action()
+                    .map_err(SessionError::Decode)?;
+                Ok(())
+            }
             share::PDU_TYPE2_FONT_MAP if self.phase == Phase::Reactivating => {
                 finalization::FontMap::decode(cur).map_err(SessionError::Decode)?;
                 tracing::debug!(target: "rdp_font_map", "Font Map received — reactivation complete");
@@ -598,8 +618,9 @@ impl SessionStateMachine {
                 }
                 Ok(())
             }
-            // Save Session Info, Set Error Info, server Synchronize/Control during
-            // reactivation, … : decoded-and-skipped until their epics.
+            // Save Session Info and the rest: skipped, cursor unread, until their epics.
+            // (Set Error Info and the reactivation Synchronize/Control have their own arms
+            // above — this comment used to claim both, and to call the skip a decode; #252.)
             _ => Ok(()),
         }
     }
@@ -1138,6 +1159,50 @@ mod tests {
         assert!(ready, "DisplayControlReady never surfaced");
     }
 
+    /// A machine parked in [`Phase::Reactivating`]: DeactivateAll, then a Demand Active for an
+    /// 8x4 desktop. This is the state the server's Synchronize / Control replies arrive in on a
+    /// real resize (#252, measured against the VM).
+    fn reactivating() -> SessionStateMachine {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let deactivate = server_io_frame(&share::encode_share_control(
+            share::PDU_TYPE_DEACTIVATE_ALL,
+            1002,
+            SHARE,
+            &[],
+        ));
+        assert!(sm.process_bytes(&deactivate).unwrap().is_empty());
+
+        let sets = vec![CapabilitySet::Bitmap(capability::BitmapCapabilitySet {
+            preferred_bits_per_pixel: 24,
+            desktop_width: 8,
+            desktop_height: 4,
+            desktop_resize_flag: 1,
+            drawing_flags: 0,
+        })];
+        let mut caps = Vec::new();
+        for set in &sets {
+            set.encode(&mut caps);
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&((caps.len() + 4) as u16).to_le_bytes());
+        body.extend_from_slice(b"RDP\0");
+        body.extend_from_slice(&(sets.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&caps);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        let demand = server_io_frame(&share::encode_share_control(
+            share::PDU_TYPE_DEMAND_ACTIVE,
+            1002,
+            SHARE + 1,
+            &body,
+        ));
+        let outputs = sm.process_bytes(&demand).unwrap();
+        assert_eq!(outputs.len(), 5, "Confirm Active + the finalization batch");
+        sm
+    }
+
     fn server_data_pdu(pdu_type2: u8, body: &[u8]) -> Vec<u8> {
         server_io_frame(&share::encode_share_data(
             1002,
@@ -1521,6 +1586,72 @@ mod tests {
             panic!("expected one frame");
         };
         assert_eq!(&frame_pixels(&sm, frame)[..4], &[1, 2, 3, 255]);
+    }
+
+    /// Issue #252, and this half was found by **measurement**, not by reading. A capture of
+    /// `display_control_resize_against_real_vm` (real VM, 2026-08-25) shows the server's
+    /// reactivation is `DeactivateAll → Demand Active → Synchronize → Control(Cooperate) →
+    /// Control(GrantedControl) → Font Map` — the same four replies as the connect leg. Before
+    /// this, three of them fell to the catch-all and the `ReadCursor` was dropped unread, so
+    /// the connect path validated a server `action` the reactivation path never even looked at.
+    /// That is one family with two answers, which is the shape ADR-0012 §3 exists to end.
+    ///
+    /// (`justrdp-tokio`'s resize test printed a "PDU sequence observed" line naming only
+    /// DeactivateAll → Demand Active → Font Map. The capture refutes it; it was a hardcoded
+    /// string, not an observation.)
+    #[test]
+    fn reactivation_holds_the_connect_paths_control_action_rule() {
+        let mut sm = reactivating();
+
+        // The two the server actually sends are accepted and change nothing observable.
+        for action in [
+            finalization::CTRLACTION_COOPERATE,
+            finalization::CTRLACTION_GRANTED_CONTROL,
+        ] {
+            let body = finalization::Control {
+                action,
+                grant_id: 1007,
+                control_id: 1002,
+            }
+            .encode();
+            let outputs = sm
+                .process_bytes(&server_data_pdu(share::PDU_TYPE2_CONTROL, &body))
+                .expect("a server Control the spec allows is not an error");
+            assert!(outputs.is_empty(), "got {outputs:?}");
+        }
+        // A Synchronize with the mandated messageType likewise.
+        let sync = finalization::Synchronize { target_user: 0 }.encode();
+        assert!(
+            sm.process_bytes(&server_data_pdu(share::PDU_TYPE2_SYNCHRONIZE, &sync))
+                .expect("a well-formed Synchronize is not an error")
+                .is_empty()
+        );
+
+        // …and the ones neither reference accepts are typed errors here too.
+        let mut sm = reactivating();
+        let detach = finalization::Control {
+            action: finalization::CTRLACTION_DETACH,
+            grant_id: 0,
+            control_id: 0,
+        }
+        .encode();
+        assert!(
+            matches!(
+                sm.process_bytes(&server_data_pdu(share::PDU_TYPE2_CONTROL, &detach)),
+                Err(SessionError::Decode(_))
+            ),
+            "a server Control(Detach) during reactivation should be a typed error"
+        );
+
+        let mut sm = reactivating();
+        let bad_sync = [0x02, 0x00, 0x00, 0x00]; // messageType 2
+        assert!(
+            matches!(
+                sm.process_bytes(&server_data_pdu(share::PDU_TYPE2_SYNCHRONIZE, &bad_sync)),
+                Err(SessionError::Decode(_))
+            ),
+            "a Synchronize whose messageType is not SYNCMSGTYPE_SYNC should be a typed error"
+        );
     }
 
     #[test]

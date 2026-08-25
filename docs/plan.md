@@ -311,7 +311,20 @@ advertise X, the server silently never offers Y. Capture every such coupling up 
 - [ ] **O — Connect-time auto-detect.** Server RTT/bandwidth probe → response (UDP/multitransport adaptation). ironrdp skips it. Needed only if you do `SUPPORT_NET_CHAR_AUTODETECT`/UDP.
 - [ ] **M — Licensing exchange (MS-RDPELE).** Server License Request → client New/Info License Request → Platform Challenge → Response → License OK. Optional persistent license cache (client-supplied). *ironrdp ref: ironrdp-pdu/rdp/server_license.rs, connector/license_exchange.rs.* Must complete or capability exchange blocks.
 - [ ] **M — Capability exchange.** Server **Demand Active** (capsets + share_id + negotiated desktop size) → client **Confirm Active**. *ironrdp ref: ironrdp-pdu/rdp/capability_sets.rs, connector/connection_activation.rs.* A **DeactivateAll may arrive here** (some servers) — decode & discard, keep waiting for Demand Active. Use the *negotiated* size for the framebuffer.
-- [ ] **M — Connection finalization.** Client pipelines Synchronize → Control(Cooperate) → Control(RequestControl) → Font List; server replies Sync/Control(Cooperate)/Control(GrantedControl)/**Font Map**. Font Map = session-active gate. *ironrdp ref: ironrdp-pdu/rdp/finalization_messages.rs, connector/connection_finalization.rs.*
+- **(§0 trap, #252)** **The server sends all four finalization replies on the reactivation leg
+  too, and nothing in the client could have told you that.** Captured 2026-08-25, four
+  activations across two tests, connect leg and reactivation leg identical: `DEMAND_ACTIVE →
+  SYNCHRONIZE(messageType=1, targetUser=0) → CONTROL(Cooperate) → CONTROL(GrantedControl,
+  grantId=<user channel>, controlId=0x03EA) → FONT_MAP(mapFlags=0x0003, entrySize=4)`. Pinned at
+  `crates/justrdp-pdu/tests/fixtures/connect/finalization-replies.bin`. The trap is not the
+  order — it is that **#242 asserted this order as a premise and no artifact in the repo could
+  confirm or deny it**: the connect machine records no arrival, `connect.rs` emits zero
+  `tracing::` calls, and the resize test printed a "PDU sequence observed" line that was a
+  hardcoded string naming three of the six PDUs. A passing suite was equally consistent with the
+  server sending only the Font Map. Generalisation: **a sequence nobody logs is a sequence
+  nobody has observed**, however many green tests run through it.
+
+- [ ] **M — Connection finalization.** Client pipelines Synchronize → Control(Cooperate) → Control(RequestControl) → Font List; server replies Sync/Control(Cooperate)/Control(GrantedControl)/**Font Map**. Font Map = session-active gate, and that is a **decision** as of #252, not an incidental: the other three replies are value-checked on both legs and their arrival is deliberately not tracked. *ironrdp ref: ironrdp-pdu/rdp/finalization_messages.rs, connector/connection_finalization.rs.*
 - [ ] **M — Session-active base state.** Bidirectional I/O begins (input out; graphics/pointer/channel/error in). *ironrdp ref: connector `ConnectionResult` (io/user channel ids, share_id, static_channels, desktop_size, compression).*
 - [ ] **M — Deactivation–Reactivation sequence.** Server DeactivateAll → re-run capability exchange + finalization → (possibly new) desktop size; rebuild framebuffer; in-session (no reconnect). *ironrdp ref: connector/connection_activation.rs (reset).* **Most common trigger = resize.** Drive cancel-aware.
 
@@ -1697,7 +1710,7 @@ Here are the NOT/THINLY covered specifications to add:
 
 - [ ] **O — MS-RDPBCGR § 2.2.15 (Slow-path Bitmap Compression Headers).** RDP4/5/6/7 compression type encoding (CMPREFIX + flags); per-scanline/per-plane framing; RLE subsets. *ironrdp ref: ironrdp-pdu/basic_output/bitmap/ (PDU frame only, not compression engine).* Must decompress to feed framebuffer; fallback if zgfx fails.
 
-- [ ] **M — MS-RDPBCGR § 2.2.3 (Slow-path Synchronization & Control).** `TS_SYNCHRONIZE_PDU`, `TS_CONTROL_PDU` (Cooperate/RequestControl/GrantedControl/Detach); state machine ordering during finalization & reset. *ironrdp ref: ironrdp-pdu/rdp/finalization_messages.rs.* Already listed but needs explicit PDU-level detail; governs session-active gate.
+- [ ] **M — MS-RDPBCGR § 2.2.3 (Slow-path Synchronization & Control).** `TS_SYNCHRONIZE_PDU`, `TS_CONTROL_PDU` (Cooperate/RequestControl/GrantedControl/Detach); state machine ordering during finalization & reset. *ironrdp ref: ironrdp-pdu/rdp/finalization_messages.rs.* **Answered rather than implemented (#252):** the spec states no client-side ordering obligation — 1.3.1.1 phrases finalization entirely as a *server* obligation and the client-processing sections 3.2.5.3.19–.22 impose no arrival precondition — so these do **not** govern the session-active gate; the Font Map alone does, by decision. What is enforced is the field values the spec does fix (`Synchronize.messageType`, a server `Control.action`), on the connect leg and the reactivation leg alike. PDU-level detail is pinned at `crates/justrdp-pdu/tests/fixtures/connect/finalization-replies.bin`.
 
 - [ ] **O — MS-RDPBCGR § 2.2.2 (Slow-path Font List/Font Map).** `TS_FONT_LIST_PDU` (client → server) and `TS_FONT_MAP_PDU` (server → client); glyph handles; end-of-finalization marker. *ironrdp ref: ironrdp-pdu/rdp/finalization_messages.rs.* Already listed; confirm no gaps in Font Map handling (session-active gate).
 

@@ -354,7 +354,12 @@ enum Stage {
     /// and stray data PDUs). Still `capability-exchange` — this is its second half.
     CapabilityExchange { selected: SecurityProtocol },
     /// Confirm Active + the finalization batch are on the wire; awaiting the server's
-    /// Synchronize / Control / **Font Map** — the session-active gate. Label: `activation`.
+    /// **Font Map**, which is the session-active gate on its own. The Synchronize and Control
+    /// replies that precede it are checked when they arrive but not tracked: #252 measured the
+    /// real VM sending all four in order on every activation, and decided against a
+    /// completeness gate because the one reference that shipped a rejecting form
+    /// (FreeRDP `ff2509bbc`) reverted it within a day when a real server broke on it.
+    /// Label: `activation`.
     Finalization { selected: SecurityProtocol },
     /// Terminal: the machine emitted [`Action::SessionActive`] or [`Action::FailWith`] and will
     /// accept no further events (each yields [`ConnectError::UnexpectedEvent`]). Internal only —
@@ -1097,9 +1102,12 @@ impl ConnectStateMachine {
         }
     }
 
-    /// One Share PDU arrived during finalization. The Font Map is the session-active gate;
-    /// the server's Synchronize / Control replies are decoded and noted; everything else is
-    /// skipped. A DeactivateAll (or a fresh Demand Active) re-runs capability exchange.
+    /// One Share PDU arrived during finalization. The Font Map is the session-active gate; the
+    /// server's Synchronize / Control replies are decoded and their fields checked, then
+    /// discarded — **their arrival is not recorded**, so the Font Map alone reaches
+    /// `session-active` (#252 decided that deliberately; see the `Stage::Finalization` note).
+    /// Everything else is skipped. A DeactivateAll (or a fresh Demand Active) re-runs
+    /// capability exchange.
     fn finalization_step(
         &mut self,
         selected: SecurityProtocol,
@@ -1134,7 +1142,10 @@ impl ConnectStateMachine {
                         Ok(Vec::new())
                     }
                     share::PDU_TYPE2_CONTROL => {
-                        finalization::Control::decode(&mut cur).map_err(ConnectError::Decode)?;
+                        finalization::Control::decode(&mut cur)
+                            .map_err(ConnectError::Decode)?
+                            .check_server_action()
+                            .map_err(ConnectError::Decode)?;
                         Ok(Vec::new())
                     }
                     // Anything else the server interleaves here (Save Session Info, Set Error
@@ -2573,6 +2584,52 @@ mod tests {
         ))));
         assert!(actions.is_empty());
         assert_eq!(sm.stage(), "activation");
+    }
+
+    /// Issue #252. `[MS-RDPBCGR]` 2.2.1.20/2.2.1.21 fix what a *server* may put in `action`:
+    /// `CTRLACTION_COOPERATE` or `CTRLACTION_GRANTED_CONTROL`, nothing else. Both references
+    /// treat anything else as fatal -- FreeRDP `activation.c:167-173` (`default:` →
+    /// `return FALSE`), IronRDP `connection_finalization.rs` (`_ => return Err(...)`) -- and
+    /// justrdp was alone in decoding the field and dropping it, which made a server
+    /// `Control(Detach)` indistinguishable from `Control(GrantedControl)`.
+    ///
+    /// Not a completeness gate: #252 decided against tracking *arrival* of the finalization
+    /// replies. This is the orthogonal half -- the values the spec already mandates for the
+    /// replies that do arrive. Measured on the real VM (#252): 4/4 activations sent exactly
+    /// Cooperate then GrantedControl, the latter with `grantId` = our user channel and
+    /// `controlId` = 0x03EA, so this guard costs the proven server nothing.
+    #[test]
+    fn a_server_control_action_outside_the_two_the_spec_allows_is_a_typed_error() {
+        for (action, what) in [
+            (finalization::CTRLACTION_DETACH, "Detach"),
+            (finalization::CTRLACTION_REQUEST_CONTROL, "Request Control"),
+            (0x0000u16, "zero"),
+            (0xFFFFu16, "out of range"),
+        ] {
+            let mut sm = finalizing();
+            let body = finalization::Control {
+                action,
+                grant_id: 0,
+                control_id: 0,
+            }
+            .encode();
+            let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
+                share::PDU_TYPE2_CONTROL,
+                &body,
+            ))));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::FailWith(ConnectError::Decode(_))]
+                ),
+                "a server Control({what}) should be a typed error, got {actions:?}"
+            );
+        }
+
+        // The two the spec does allow still pass, and still reach session-active — the guard
+        // rejects values, it does not add an ordering or arrival requirement.
+        let (sm, _) = session_active();
+        assert_eq!(sm.stage(), "session-active");
     }
 
     #[test]

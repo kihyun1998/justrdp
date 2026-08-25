@@ -58,6 +58,10 @@ recorded.
 
 ## Cross-cutting invariants
 
+- [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
+  — `ServerCoreData.client_requested_protocols` is the server's echo of what we asked for
+  and nothing compares it, though `connect.rs` already rejects a *selected* protocol we
+  never advertised. Downgrade evidence, unread.
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) — `gcc` and `mcs` carry both artifacts since #203, and `ber` / `per` are the recorded
   exception (primitives; their callers are covered). The edge is drawn by #237 because it was
   missing, not because anything here is uncovered — this section read **None.** while the

@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# Provenance (#252): this seed did NOT come from a discovered defect. It was produced by
+# the deliberate mutation that proved the weighted generator above it reaches past the
+# `messageType` gate -- `targetUser`'s checked read was replaced with one that panics on a
+# short buffer, and proptest shrank to the minimal input that gets there. It is kept
+# because it is exactly the shape the gate made hard to reach: two bytes that clear
+# `SYNCMSGTYPE_SYNC` and then stop, so the read behind the gate is truncated. Re-run first
+# on every future run, which is the regression insurance the plain generator lost.
+cc 6b579458e995799b517ff0076849e18d75466a0e9727bf44566cba960635685c # shrinks to body = [1, 0]

@@ -343,7 +343,7 @@ Read this before starting so the bindings do not read as abstractions.
   The generalisation: a probe run to answer a question is also a **capture**. Copy the bytes
   into the issue before deleting the probe — Step 1 already says to record the number, and
   this is the same rule one level down, on the wire.
-- **"Decoded and skipped" is not handled quietly, it is unlearnable (#228).** `pduType2` 0x25
+- **"Decoded and skipped" is not handled quietly, it is unlearnable (#228) — and the arm was not decoding anything either (#252).** `pduType2` 0x25
   fell into `on_data_pdu`'s catch-all, so a host that sent a Shutdown Request and a host that
   sent nothing produced **identical** observable behaviour — the session simply carried on in
   both cases. The map's own rule is what names this: the five `SessionOutput` variants are the

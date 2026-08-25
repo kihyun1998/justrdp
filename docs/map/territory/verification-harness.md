@@ -263,7 +263,10 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   toolchain bump the local run needs its own `rustup target add` (it silently stopped working
   a day after ADR-0013's pin landed).
 - No captured-stream replay harness exists for the connect sequence: a VM run is the
-  only end-to-end proof, and it is not reproducible offline.
+  only end-to-end proof, and it is not reproducible offline. **Narrowed by #252**, which
+  captured the finalization leg via `JUSTRDP_CONNECT_CAPTURE_FILE` and walks it offline
+  through `tpkt` → `x224` → `mcs` → `share` → `finalization`. That is a PDU-level replay,
+  not a state-machine one — the machine still never sees the bytes.
 - **The census the no-panic obligation is derived from was scoped by crate until #241/#238,
   and both halves of it were blind in different ways.** `rg --files crates/justrdp-pdu/src`
   could not see a parser in the core (`tls::extract_subject_public_key`), and both commands

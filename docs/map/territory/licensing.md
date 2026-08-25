@@ -48,6 +48,10 @@ decision of its own. That inference has never been written down as a record.
 
 ## Cross-cutting invariants
 
+- [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
+  — `LicensePreamble.flags` (the protocol version in its low nibble) and `msg_size` (a
+  declared length never compared to the actual body) have no readers anywhere, tests
+  included.
 - [Oracle agreement is not independence](../invariant/oracle-agreement-is-not-independence.md)
   — `differential_license_crypto` is this territory's *only* proof, and it compares
   against a codebase sharing this project's lineage. The VM cannot supplement it: it

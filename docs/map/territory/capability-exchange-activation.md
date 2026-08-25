@@ -33,6 +33,16 @@ Deactivation–Reactivation, which is how a resize actually happens.
   not this phase — decides what order/codec support means.
 - **Reactivation is the same exchange with session state alive.** `Phase::Reactivating`
   re-runs it; caches belong to the *connection*, not the share, so they survive.
+- **The Font Map alone gates `session-active`, deliberately.** The server's Synchronize and
+  Control replies are decoded and their values checked, then discarded — their *arrival* is
+  recorded nowhere, so there is no completeness or ordering ladder. #252 decided this against
+  a capture rather than by default; the grounds are in `## Reference behaviour`. The Font Map's
+  own *body* is still strictly parsed — a separate question, settled by #237/#242.
+- **Both legs answer the same question the same way.** `connect.rs`'s finalization arms and
+  `session.rs`'s `Phase::Reactivating` arms call the same parsers and the same
+  `Control::check_server_action`. Until #252 they did not: the reactivation leg dropped the
+  `ReadCursor` unread, so a server `Control(Detach)` was fatal on connect and invisible on
+  resize.
 
 ## Code
 
@@ -43,20 +53,70 @@ Deactivation–Reactivation, which is how a resize actually happens.
 - `justrdp-pdu/src/share.rs` — `ShareControlHeader`, `ShareDataHeader`,
   `encode_share_control`, `encode_share_data`
 - `justrdp-pdu/src/finalization.rs` — `Synchronize`, `Control`, `FontMap`,
-  `encode_font_list`
+  `Control::check_server_action`, `encode_font_list`
 - `justrdp/src/connect.rs` — `ActivationResult`, `Stage`
 - `justrdp/src/session.rs` — `Phase::Reactivating`, `ResizeError`
 - Stage strings: `capability-exchange`, `session-active`
 
 ## Reference behaviour
 
-**None.** No verified external-fact store — and this is the territory where its
-absence costs most: ADR-0009's tolerance rules were derived from real-server
-behaviour that is now recorded only as prose in the ADR and in `docs/plan.md` §0,
-with no pinned FreeRDP citation to check them against.
+Opened by #252. It read **"None"** until then, with the note that this was the
+territory where the absence cost most — and it did: #252 opened on the premise
+*"the real VM sends all four finalization replies, in order"*, which nothing in
+the repo could confirm or deny.
+
+**What the real server sends** — captured 2026-08-25 via
+`JUSTRDP_CONNECT_CAPTURE_FILE` (server-to-client only, hence commitable), four
+activations across two tests, **identical on the connect leg and the
+reactivation leg**:
+
+```
+DEMAND_ACTIVE
+SYNCHRONIZE   messageType=1   targetUser=0
+CONTROL       action=0x0004 (Cooperate)        grantId=0     controlId=0
+CONTROL       action=0x0002 (Granted Control)  grantId=1007  controlId=0x03EA
+FONT_MAP      mapFlags=0x0003  entrySize=4
+```
+
+`grantId` is the MCS user channel and `controlId` is the server channel — the two
+values `[MS-RDPBCGR]` 2.2.1.21 marks MUST. Pinned as
+`justrdp-pdu/tests/fixtures/connect/finalization-replies.bin`, walked by
+`a_real_servers_finalization_replies_decode_in_order`. **One WS2022 box on one
+advertised config**: it proves what *this* server sends, never what servers send
+(see [capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)).
+
+**What the references require of the client.** The `[MS-*]` half is thinner than
+it looks: 1.3.1.1 phrases every finalization rule as a *server* obligation
+("is sent in response to", "is sent after transmitting"), and the client-side
+processing sections 3.2.5.3.19–.22 are one sentence each plus a MUST-ignore
+field list — **no ordering obligation, no arrival precondition**, and §3.2.1's
+abstract data model has no finalization-arrival variable. So the spec does not
+answer the question this territory kept asking.
+
+FreeRDP does track arrival (`finalize_sc_pdus`, `rdp_handle_sc_flags` in
+`libfreerdp/core/rdp.c`), and two things about it are routinely misread:
+
+- **It is a completeness gate, not an ordering gate.** The flag word is only
+  ever OR-ed and is cleared solely at reset, so out-of-order replies still
+  satisfy every rung, one PDU behind.
+- **It never fails.** The else branch warns and leaves `status` untouched, so a
+  missing reply parks the client on the rung rather than dropping the session.
+  It **did** fail once: `ff2509bbc4e9` (2022-11-29, *"relax sc flags state
+  checks"*) deleted `status = STATE_RUN_FAILED` one day after FreeRDP#8458 — an
+  xrdp resolution change disconnecting on the reactivation leg.
+
+IronRDP tracks nothing: one flat wait state, `FontMap → Finished`.
+
+**What justrdp does with that** (#252): no completeness gate — the Font Map alone
+reaches session-active, deliberately — but the field values the spec does fix are
+checked, identically on both legs.
 
 ## Cross-cutting invariants
 
+- [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
+  — the discovery site. `Synchronize.messageType` was discarded under a spec citation the
+  spec does not make, and a server `Control.action` was decoded and dropped; both closed by
+  #252, both rejected by both references.
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) — every PDU
   this territory parses is server-supplied: the Demand Active capability walk, the Share
   headers, and the three finalization replies. **Listed only from #237 onward, and the
@@ -72,6 +132,10 @@ with no pinned FreeRDP citation to check them against.
 
 - [Session loop & PDU dispatch](session-loop-dispatch.md) — receives `share_id`,
   the capability sets and the leftover bytes; every one of the three is a contract.
+  **And a fourth since #252**: it re-runs this territory's finalization parsers on the
+  reactivation leg, `Control::check_server_action` included, so a change to what a server
+  reply may contain moves `session.rs` too. That edge was silent before #252, and the
+  silence is what let the two legs disagree.
 - [Framebuffer & frame delivery](framebuffer-frame-delivery.md) — allocated from
   the negotiated size, and reallocated on reactivation.
 - [Bitmap codecs](bitmap-codecs.md) — `BitmapCodecsCapabilitySet` decides which

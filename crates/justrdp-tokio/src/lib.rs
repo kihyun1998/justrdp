@@ -4717,10 +4717,16 @@ mod tests {
     /// Deactivation–Reactivation cycle; the test passes when the full-screen re-emit arrives
     /// at the new size and the framebuffer matches.
     ///
-    /// The PDU sequence (issue #8's logging criterion) is captured through the core's
-    /// tracing milestones — `rdp_drdynvc` (caps/create), `rdp_displaycontrol_caps`,
+    /// Six PDU **milestones** (issue #8's logging criterion) are asserted through the core's
+    /// tracing targets — `rdp_drdynvc` (caps/create), `rdp_displaycontrol_caps`,
     /// `rdp_displaycontrol_resize`, `rdp_deactivate_all`, `rdp_demand_active`,
-    /// `rdp_font_map` — asserted below and visible with `--nocapture`.
+    /// `rdp_font_map` — visible with `--nocapture`.
+    ///
+    /// **Milestones, not the sequence**, and this doc claimed the sequence until #252. A capture
+    /// of this very test shows the server also sending Synchronize and both Controls between the
+    /// last two, and no finalization reply has a tracing target at all (`connect.rs` emits none),
+    /// so #8's criterion — *log the sequence of PDU types exchanged* — is **not yet met here**.
+    /// `docs/plan.md` §V plans `rdp_finalization_complete` / `rdp_session_active` for it.
     #[tokio::test]
     #[traced_test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
@@ -4836,8 +4842,10 @@ mod tests {
                 );
             }
             eprintln!(
-                "PDU sequence observed: DYNVC caps → create → EDISP caps → Monitor Layout → \
-             DeactivateAll → Demand Active → Font Map"
+                "PDU milestones asserted: DYNVC caps → create → EDISP caps → Monitor Layout → \
+             DeactivateAll → Demand Active → Font Map. The server also sends Synchronize and \
+             both Controls between the last two — measured by capture in #252 — but neither has \
+             a tracing target, so this line is what the test asserts, not the whole sequence."
             );
             eprintln!(
                 "resize verified: {}x{} → {}x{}",
