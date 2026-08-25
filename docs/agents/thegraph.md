@@ -7,12 +7,22 @@ invariants, reasoning habits); this file holds justrdp's **graph**. The method
 defers every concrete value here.
 
 **Build stamp** — built from `thegraph/SKILL.md`
-`md5:f75be113416e647c1d0df2b841f092e1` (54 224 bytes, mtime 2026-08-10). Compiled
-2026-08-24 by `/grill-the-graph` from [`theflow.md`](theflow.md) (the bindings),
-`CLAUDE.md`, `CONTEXT.md`, `docs/adr/`, `docs/map/`, the manifests and the
-workflows. Every generated artifact carries the same stamp. If the stamp is
+`md5:ea2d94a3591f092e76e5ff29dbdbc3ce` (61 515 bytes, mtime 2026-08-24). Recompiled
+2026-08-25 by `/grill-the-graph` as an **update** — from [`theflow.md`](theflow.md)
+(the bindings), `CLAUDE.md`, `CONTEXT.md`, `docs/adr/`, `docs/map/`, the manifests
+and the workflows. Every generated artifact carries the same stamp. If the stamp is
 behind, **warn and continue** — never rebuild on your own; a rebuild writes agents
 and scripts, and those pass through the maintainer.
+
+**What the first recompile measured, so nobody re-derives it.** The skill grew ~13%
+between the revision this was first built from and the one above, and it produced
+**no empty slot** — every one of thegraph's nine required slots was already answered.
+The growth was **method**: the third test-trust bar, the rule that a proof artifact
+must name which assertion can observe the change, `sweep`'s "judge by what it cannot
+see, never by its hit count", and the candidate envelope's last three columns. Method
+is exactly what this file deliberately does not carry, so the thin-artifact rule
+absorbed the change. What *did* go stale was repo reality — a promoted invariant note,
+and a guard that could not answer one of `classify`'s three routes.
 
 **Relationship to [`theflow.md`](theflow.md).** The bindings doc is this build's
 **input**, and it stays live — `theflow` keeps working, and retirement is the
@@ -62,7 +72,7 @@ migration, and Step 4's *"link into a real consumer"* proof (its fifth row). The
 | 1 | **`[MS-*]` normative specs** — `[MS-RDPBCGR]`, `[MS-RDPRFX]`, `[MS-RDPEGDI]`, `[MS-RDPEGFX]`, … Governs **what we emit**: layout, flags, state transitions. Cite the section number | `curl -sL "<learn.microsoft.com/…>" > "$SCRATCH/spec.html"`, then `grep -n`. The WebFetch ban is on **summarization, not on the web** — same pattern as class 2 | **raw** — may reach `CONFIRMED`. If the fetch fails, **downgrade this run explicitly**; never a silent `CONFIRMED` |
 | 2 | **FreeRDP (C) + IronRDP (Rust) real source** — hidden state, server tolerance, edges, the CVE points. Spec-unwritten tolerance exists **only** here | `gh api repos/<owner>/<repo>/contents/<path> --jq .content \| base64 -d > "$SCRATCH/x"`, then `grep -n` / `sed -n`. **`WebFetch` is banned** — it drops handler bodies from large files, so a decoder branch that *is* there reads as absent | **raw** |
 | 3 | **Published / external state** — crates.io, the upstream repo's own state | a registry query / `gh api`, never a sentence about them | **raw** |
-| 4 | **The real VM** — `192.168.136.136` (memory `test_environment`). The authority for **what we accept** | a **throwaway probe**: instrument, read the number, delete the probe, **record the number in the issue**. Reading the code is not observing what it does | **raw observation**. Caveat carried on the node: it is **one WS2022 box** (memory `vm_advertised_graphics_caps`) — it proves the paths it advertises and says nothing about the ones it does not. *"The VM is happy"* is not *"servers are happy"* |
+| 4 | **The real VM** — `192.168.136.136` (memory `test_environment`). The authority for **what we accept** | a **throwaway probe**: instrument, read the number, delete the probe, **record the number in the issue**. Reading the code is not observing what it does. **And a probe whose output is server-to-client bytes outlives the probe** — the number-in-the-issue form is the floor, not the ceiling. `JUSTRDP_CONNECT_CAPTURE_FILE` (`justrdp-tokio`, adapter-side) records the read path only, so a capture carries no credential and is **committable**; #252 captured the finalization leg, committed 156 bytes as a fixture and walks it with the shipped parsers, turning a one-run observation into a standing test. Prefer that whenever the fact is server-to-client. **What a fixture still cannot do**: a conforming server cannot redden a guard that only fires on non-conforming input, so its discriminating power is over *false positives* — name which assertion observes the change and mutate **both** ways before recording it (#252 ran both) | **raw observation**. Caveat carried on the node: it is **one WS2022 box** (memory `vm_advertised_graphics_caps`) — it proves the paths it advertises and says nothing about the ones it does not. *"The VM is happy"* is not *"servers are happy"* |
 
 **Not a source class**, and recorded so no run re-derives it: *performance claims*
 resolve to **our own measurement on a `--release` build** — that is the
@@ -113,7 +123,7 @@ palette/run state) → into the issue **before** implementing.
 
 | Layer | Real proof | What this proof structurally cannot see (the tautological trap) |
 |---|---|---|
-| **`justrdp-pdu`** | `encode → decode` round-trip on hand-built PDUs **plus** the proptest no-panic / round-trip properties (ADR-0008, #98) | A decoder that only ever sees vectors *we* authored is untested against the input space a server spans. And **a census can be blind to a whole class**: #241/#238 — the no-panic census's derivations were byte-scoped and path-scoped, so one could not see a parser in the core and neither could describe a consumption site at all. Both classes held live defects |
+| **`justrdp-pdu`** | `encode → decode` round-trip on hand-built PDUs **plus** the proptest no-panic / round-trip properties (ADR-0008, #98) | A decoder that only ever sees vectors *we* authored is untested against the input space a server spans — **narrowed but not closed since #203/#252**: `tests/fixtures/connect/` now holds real server bytes for the MCS/GCC leg *and* the finalization leg, obtained rather than synthesised, because every encoder in this crate writes client-to-server. And **a census can be blind to a whole class**: #241/#238 — the no-panic census's derivations were byte-scoped and path-scoped, so one could not see a parser in the core and neither could describe a consumption site at all. Both classes held live defects |
 | **`justrdp-codecs`** | a **differential oracle** (ADR-0003/0007): same bitstream to *our* decoder **and** `ironrdp-graphics`, assert the output `Vec<u8>` is **byte-identical**. Stage-boundary verification applies **per pipeline stage**, not only end-to-end. 100% pass is the gate to drop the dependency (ADR-0011) | **The oracle shares our lineage** (memory `ironrdp_oracle_shares_lineage`, [the invariant](../map/invariant/oracle-agreement-is-not-independence.md)) — byte-identical agreement is **not** independence; cross-check FreeRDP before calling a match "proof". **A vector proves only what it contains**: a corpus can supply an axis and miss the *combination* (a codec exercised, but never at a tile boundary, never with a quant table that changes mid-frame) — measure what the fixture exercises, never infer coverage from what it was named for. **x64 cannot reach the 32-bit guards** (memory `wasm32_overflow_proof_via_i686`) |
 | **`justrdp` (connect / session)** | a **real VM** round-trip — the full connect sequence to session-active, not a mock server | **One VM is one server.** It can prove the paths it exercises (#150/#91) and cannot speak about caps it does not advertise |
 | **`justrdp-tokio`** | the same VM, driven end-to-end. Its integration tests are `#[ignore]`d in CI **by design** (they need the VM), which is why `coverage.yml` excludes this crate | **A demo or a fake is a smoke test, not proof** (DoD ④). Coverage silence here is expected, so it cannot be read as a signal either way |
@@ -121,12 +131,20 @@ palette/run state) → into the issue **before** implementing.
 Step 4's fifth row — *"strongest: a real consumer"* — is **N/A, no consumer
 exists**, so it is not a layer. See the `downstream` roster row for the reversal.
 
-**Test-trust gate** (`implement`'s self-loop, decider `code`) has two
+**Test-trust gate** (`implement`'s self-loop, decider `code`) has three
 justrdp-shaped traps for the discriminating-power bar: a **differential-oracle test
 can be green for the wrong reason** (a vector both implementations decode
-identically proves agreement, not correctness), and **a guard only 32-bit reaches
+identically proves agreement, not correctness); **a guard only 32-bit reaches
 cannot go red on x64** — mutate and re-run on `i686-pc-windows-msvc` (#151/#155),
-or the RED you never saw is on a target the gate never ran.
+or the RED you never saw is on a target the gate never ran; and — found by **#252** —
+**adding an exact-match gate to a parser silently kills its own no-panic property's
+reachability**. `messageType == SYNCMSGTYPE_SYNC` put the read behind it at **1/65536**
+under `vec(any::<u8>(), 0..=512)`, ~0.03 hits per 2048-case run, so an out-of-bounds read
+there would have shipped green. [untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md)
+states the rule and calls four instances *"a rule rather than a story"*; this was the
+fifth, added in the module whose own comment enumerates *"a `messageType` dispatch"* among
+the four. **Adding a guard is a generator change**, and the mutation has to be *watched* to
+redden rather than asserted — weight the generator, never substitute it.
 
 ### `verify` — sacred paths, as concrete paths
 
@@ -136,6 +154,17 @@ because the diff looks small. Absent a path hit, the guard is enumeration risk
 (`AI`) — many edges, domain semantics, cross-feature interaction. justrdp has **no
 money path, no production mutation and nothing destructive**; here a path is
 sacred when it is **silent** (wrong, and nothing crashes) or **irreversible**.
+
+**The guard has a third answer, and it exists because a run needed it.** `classify`'s
+**open-decision** route runs `verify` on the *options*, before any code exists — so the
+diff is empty **by construction**, and *"no sacred path in the diff"* is not what is true
+there. `triggers.py` answers an empty diff with **`2` (cannot answer)**, not `0`, which is
+the code it already reserves for *"the script could not answer"*. Exit `2` is what makes
+the substitution visible: the run resolves the guard by reading the sacred-path list
+directly, says which slot it substituted for, and writes it to `build_gaps`. Measured on
+**#252** — the script returned `0`, both lenses were in fact mandatory
+(`crates/justrdp/src/**` is surface 1), and only the run's own judgement caught it. A
+`code` decider resolved by judgement is invariant ④ pointing at itself.
 
 | # | Sacred surface | Paths the script matches | Why |
 |---|---|---|---|
@@ -390,7 +419,7 @@ toolchain-free by design). They live in **`scripts/thegraph/`**, kept distinct f
 | `.claude/agents/thegraph-lens.md` | `verify` | both corpora paths (`docs/map/` + `docs/plan.md` §0; FreeRDP/IronRDP + the `[MS-*]` section) · the tie-breaker row for the layer · the deliberate-divergence pointer · the frontier |
 | `.claude/agents/thegraph-refuter.md` | `verify` (2nd) | the same material, **opposing stance** in its brief |
 | `.claude/agents/thegraph-sweep.md` | `sweep` | the 6 surfaces and how each is read |
-| `scripts/thegraph/triggers.py` | `verify` inbound guard | the 3 sacred-path groups, matched against the diff |
+| `scripts/thegraph/triggers.py` | `verify` inbound guard | the 3 sacred-path groups, matched against the diff · **the empty-diff answer (`2`, not `0`)** |
 | `scripts/thegraph/gates.py` | `gate` | the 9 commands, each invoked **bare** |
 | `scripts/thegraph/cluster.py` | `search` | the tracker query by artifact · the 13 record-carrying areas |
 
