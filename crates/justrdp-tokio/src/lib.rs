@@ -1988,6 +1988,7 @@ mod tests {
     /// Font Map, then proves the session is live by receiving the server's first post-active
     /// PDU (slice-5 acceptance).
     #[tokio::test]
+    #[traced_test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn connect_reaches_session_active_against_real_vm() {
         with_vm_session(|vm| async move {
@@ -2094,6 +2095,39 @@ mod tests {
                 inbox.len()
             );
             assert!(frame_len > 0);
+
+            // The connect leg's PDU milestones (#252). `connect.rs` emitted **no** tracing at
+            // all until then, which is why this test could prove it reached session-active and
+            // say nothing about how — and why the resize test printed a "PDU sequence observed"
+            // line that was a hardcoded string naming three of six PDUs.
+            //
+            // These assert the milestone *fired*, which is the half a green connect cannot
+            // supply on its own: a session that reaches session-active proves the Font Map
+            // arrived and proves nothing about the three replies before it. What the capture
+            // in `justrdp-pdu/tests/fixtures/connect/finalization-replies.bin` pins as bytes,
+            // this pins as observable events on a live server.
+            for (target, what) in [
+                ("rdp_demand_active", "Demand Active on the connect leg"),
+                ("rdp_finalization", "the server's finalization replies"),
+                ("rdp_session_active", "the session-active transition"),
+            ] {
+                assert!(logs_contain(target), "{what} was never logged ({target})");
+            }
+            // Not just "something finalization-shaped": all three replies, named. This is the
+            // assertion #252 wanted and could not write.
+            // `reply="..."`, not the bare word: `logs_contain("control")` is satisfied by the
+            // `control_id=` field of a record that never fired, which is an assertion a bug can
+            // make true.
+            for reply in ["synchronize", "control", "font-map"] {
+                assert!(
+                    logs_contain(&format!("reply=\"{reply}\"")),
+                    "no `rdp_finalization` record with reply=\"{reply}\""
+                );
+            }
+            eprintln!(
+                "milestones observed: rdp_demand_active → rdp_finalization(synchronize, \
+                 control, font-map) → rdp_session_active"
+            );
         })
         .await
     }
@@ -4722,11 +4756,14 @@ mod tests {
     /// `rdp_displaycontrol_resize`, `rdp_deactivate_all`, `rdp_demand_active`,
     /// `rdp_font_map` — visible with `--nocapture`.
     ///
-    /// **Milestones, not the sequence**, and this doc claimed the sequence until #252. A capture
-    /// of this very test shows the server also sending Synchronize and both Controls between the
-    /// last two, and no finalization reply has a tracing target at all (`connect.rs` emits none),
-    /// so #8's criterion — *log the sequence of PDU types exchanged* — is **not yet met here**.
-    /// `docs/plan.md` §V plans `rdp_finalization_complete` / `rdp_session_active` for it.
+    /// **Milestones, not the sequence** — this doc claimed the sequence until #252, and a
+    /// capture of this very test shows the server also sending Synchronize and both Controls
+    /// between the last two. The *connect* leg now names them (`rdp_finalization`, one record
+    /// per reply, asserted in `connect_reaches_session_active_against_real_vm`), so #8's
+    /// criterion is met there. **It is not met on this leg**: `session.rs`'s reactivation arms
+    /// decode and check those replies but emit nothing, so the list below is still six
+    /// milestones out of nine PDUs. Extending `rdp_finalization` to the reactivation arms is
+    /// the obvious next step and is deliberately not in #252's scope.
     #[tokio::test]
     #[traced_test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]

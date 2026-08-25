@@ -1090,6 +1090,13 @@ impl ConnectStateMachine {
                         &body,
                     )));
                 }
+                tracing::debug!(
+                    target: "rdp_demand_active",
+                    width = self.negotiated_size.0,
+                    height = self.negotiated_size.1,
+                    capsets = self.server_capabilities.len(),
+                    "Demand Active received (connect); Confirm Active + finalization batch sent"
+                );
                 self.stage = Stage::Finalization { selected };
                 Ok(actions)
             }
@@ -1121,9 +1128,23 @@ impl ConnectStateMachine {
                     share::ShareDataHeader::decode(&mut cur).map_err(ConnectError::Decode)?;
                 match data.pdu_type2 {
                     share::PDU_TYPE2_FONT_MAP => {
-                        finalization::FontMap::decode(&mut cur).map_err(ConnectError::Decode)?;
+                        let map = finalization::FontMap::decode(&mut cur)
+                            .map_err(ConnectError::Decode)?;
+                        tracing::debug!(
+                            target: "rdp_finalization",
+                            reply = "font-map",
+                            map_flags = format_args!("{:#06x}", map.map_flags),
+                            "server Font Map"
+                        );
                         // Session-active: the terminal stage keeps the glossary label so the
                         // host observes the `session-active` transition (CONTEXT.md stage 7).
+                        tracing::debug!(
+                            target: "rdp_session_active",
+                            width = self.negotiated_size.0,
+                            height = self.negotiated_size.1,
+                            leftover = self.inbox.len(),
+                            "session-active"
+                        );
                         self.stage = Stage::Done {
                             last: "session-active",
                         };
@@ -1139,13 +1160,31 @@ impl ConnectStateMachine {
                     share::PDU_TYPE2_SYNCHRONIZE => {
                         finalization::Synchronize::decode(&mut cur)
                             .map_err(ConnectError::Decode)?;
+                        tracing::debug!(
+                            target: "rdp_finalization",
+                            reply = "synchronize",
+                            "server Synchronize"
+                        );
                         Ok(Vec::new())
                     }
                     share::PDU_TYPE2_CONTROL => {
-                        finalization::Control::decode(&mut cur)
-                            .map_err(ConnectError::Decode)?
+                        let control = finalization::Control::decode(&mut cur)
+                            .map_err(ConnectError::Decode)?;
+                        control
                             .check_server_action()
                             .map_err(ConnectError::Decode)?;
+                        // `action` is the whole content of this reply and #252 is why it is
+                        // logged rather than only checked: it distinguishes Cooperate from
+                        // Granted Control, and until a watcher can see which arrived, "the
+                        // server sent all four in order" is an assertion nobody can test.
+                        tracing::debug!(
+                            target: "rdp_finalization",
+                            reply = "control",
+                            action = format_args!("{:#06x}", control.action),
+                            grant_id = control.grant_id,
+                            control_id = control.control_id,
+                            "server Control"
+                        );
                         Ok(Vec::new())
                     }
                     // Anything else the server interleaves here (Save Session Info, Set Error
