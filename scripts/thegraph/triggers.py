@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """thegraph `verify` inbound guard (justrdp) — sacred paths x the diff.
 
-Build stamp: thegraph/SKILL.md md5:f75be113416e647c1d0df2b841f092e1 (2026-08-10).
+Build stamp: thegraph/SKILL.md md5:ea2d94a3591f092e76e5ff29dbdbc3ce (2026-08-24).
 Graph: docs/agents/thegraph.md. Method: the `thegraph` skill.
 
 This is the guard's `code` decider. A hit makes the adversarial completeness pass
@@ -12,7 +12,9 @@ risk, which is an `AI` judgement and not this script's business.
 Exit codes:
     0   no sacred path in the diff  -- the guard did not fire
     10  a sacred path is in the diff -- the pass is mandatory (both lenses)
-    2   the script could not answer (bad ref, not a git repo)
+    2   the script could not answer (bad ref, not a git repo, or an EMPTY DIFF --
+        `classify`'s open-decision route runs `verify` on the OPTIONS before any
+        code exists, so "no sacred path in the diff" is not what is true there)
 
 Usage:
     python scripts/thegraph/triggers.py                 # vs merge-base with master
@@ -146,8 +148,30 @@ def main() -> int:
 
     files = changed_files(args.base, args.staged)
     if not files:
-        print("triggers: the diff is empty -- nothing to guard.")
-        return 0
+        # Not `0`. An empty diff is `classify`'s open-decision route in its normal
+        # state -- `verify` runs on the OPTIONS, before any code exists -- and
+        # answering "no sacred path" there is a false negative, not a clean result.
+        # Measured on #252: this returned 0, both lenses were in fact mandatory
+        # (`crates/justrdp/src/**` is surface 1), and only the run's own judgement
+        # caught it. A `code` decider resolved by judgement is invariant 4 pointing
+        # at itself, so the script says it cannot answer and hands over what an
+        # answer needs -- a judgement that read the list is not the same act as a
+        # skip, and only one of the two leaves a trace.
+        print(
+            "triggers: the diff is empty -- the guard CANNOT ANSWER, which is not the\n"
+            "          same as 'no sacred path'. `classify`'s open-decision route runs\n"
+            "          `verify` on the OPTIONS before any code exists, so an empty diff\n"
+            "          is that route's normal state rather than a clean one.\n"
+            "          Resolve it by reading the list below against the change you are\n"
+            "          ABOUT to make, say which slot you substituted for, and write it to\n"
+            "          `build_gaps`. Measured on #252: this returned 0, both lenses were\n"
+            "          in fact mandatory, and only the run's own judgement caught it."
+        )
+        for name, patterns, _why in SACRED:
+            print(f"\n  {name}")
+            for pattern in patterns:
+                print(f"    - {pattern}")
+        return 2
 
     hits: list[tuple[str, list[str], str]] = []
     for name, patterns, why in SACRED:

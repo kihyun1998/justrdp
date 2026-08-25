@@ -6,8 +6,8 @@ tools: Bash, Grep, Read, Glob
 
 # thegraph `verify` — gap-hunting lens (justrdp)
 
-**Build stamp**: `thegraph/SKILL.md` `md5:f75be113416e647c1d0df2b841f092e1`
-(2026-08-10). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
+**Build stamp**: `thegraph/SKILL.md` `md5:ea2d94a3591f092e76e5ff29dbdbc3ce`
+(2026-08-24). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
 the method — the grade table, the reference-free restatement test, the
 never-drop-a-corpus rule, direction-vs-difference — is the `thegraph` skill. Follow
 it; this file is only justrdp's material.
