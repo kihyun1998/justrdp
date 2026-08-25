@@ -48,7 +48,14 @@ tokio = { workspace = true, features = [
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # The mock TLS server in the adapter tests presents a throwaway self-signed cert.
 rcgen = { workspace = true }
-# Differential oracle for the live-capture codec test (gate #6 fix note 3): bitmap rectangles
-# captured from the real VM are decoded by both our codecs and ironrdp's (ADR-0003).
+# **R1 verifier** (ADR-0011's 2026-08-26 table) for the live-capture codec test (gate #6 fix
+# note 3): bitmap rectangles captured from the real VM are decoded by both our codecs and
+# ironrdp's and asserted byte-identical (`src/lib.rs:2315` planar, `:2330` rle).
+# **What ends it (ADR-0011):** an owned basis for planar and rle. Note the shape this crate is in
+# — the test captures real server bytes on every VM run and **writes none of them to disk**, so
+# the *acceptance* half of that basis is produced and discarded each time. Persisting it is not
+# the whole job: the *values* half must not come from the oracle, or the fixture bakes the
+# instrument's answer in permanently (`docs/map/invariant/oracle-agreement-is-not-independence.md`,
+# violation shape 3). Left open deliberately by #225.
 ironrdp-graphics = "0.9"
 justrdp-codecs.workspace = true

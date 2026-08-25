@@ -19,6 +19,12 @@ everywhere else.
   assembly-layer independence.
 - [ADR-0008](../../adr/0008-robustness-testing-fuzz-and-property.md) — proptest on
   stable in the PR gate, coverage-guided fuzzing on a nightly CI lane.
+- [ADR-0011](../../adr/0011-zero-ironrdp-terminal-state.md) — the oracle is scaffolding
+  with a **retirement** condition, keyed on **role** since its 2026-08-26 amendment. It
+  narrows ADR-0003 (phase 3's exit criterion is no longer sufficient on its own) and
+  ADR-0007 (which keeps its method and loses its permanence). This list omitted it until
+  #225, while the Design model below had cited it since it landed — the governing record
+  for the instrument this whole territory is about.
 
 ## Design model
 
@@ -46,14 +52,10 @@ everywhere else.
 
 ## Code
 
-- `justrdp-codecs/tests/` — `differential_ironrdp_graphics.rs`,
-  `differential_rfx.rs`, `differential_pointer_ironrdp.rs`, `differential_zgfx.rs`,
-  `clearcodec_corpus.rs`, `progressive_corpus.rs`, `progressive_srl_freerdp.rs`,
-  `fixtures/`
-- `justrdp-pdu/tests/` — `differential_ironrdp.rs`, `differential_activation.rs`,
-  `real_server_connect.rs`, `fixtures/connect/`
-- `justrdp/tests/` — `differential_input_ironrdp.rs`,
-  `differential_license_crypto.rs`
+- `crates/justrdp-codecs/tests/`, `crates/justrdp-pdu/tests/`, `crates/justrdp/tests/`,
+  `crates/justrdp-codecs/tests/fixtures/`, `crates/justrdp-pdu/tests/fixtures/connect/` — **the
+  oracle-consuming files are not enumerated here on purpose**, for the same reason the fuzz
+  targets below are not; the derivation is in Known holes and ADR-0011's #225 amendment names it
 - `fuzz/fuzz_targets/` — **not enumerated here on purpose**; the list below is the
   derivation and this file kept a copy of it that was already four targets stale by #200
   and would have gone stale again with #189's `zgfx.rs`
@@ -94,6 +96,34 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
 
 ## Known holes / open
 
+- **The oracle roster is derived, never listed — and the obvious derivation is wrong.** This
+  file's `## Code` section named seven files under `justrdp-codecs/tests/` when there were ten;
+  the three it never gained arrived over #168/#169/#171 with the map gate **green throughout**,
+  because that gate checks everything *named* exists and structurally cannot see what exists and
+  is *not* named. So it rotted exactly the way the fuzz roster two bullets down had already
+  rotted, in the same file, after that one was converted to a derivation. The derivation, which
+  ADR-0011's 2026-08-26 amendment also names:
+  `grep -rln "ironrdp_[a-z]*::\|use ironrdp" --include=*.rs crates/` — **15** files on
+  2026-08-26. Matching the bare name instead answers **42** and is wrong 27 times: this crate
+  family discusses the oracle in its doc comments throughout, so two dozen `src/` modules match
+  while linking nothing, and so do `progressive_assembly_corpus.rs`,
+  `progressive_multipass_corpus.rs` and `real_server_connect.rs`. Match on the **path** — a `use`
+  or a `::` — never on the name. **Three of the fifteen live in `src/` inside `#[cfg(test)]`**,
+  which is what any `tests/`-scoped roster misses by construction, #225's own included.
+- **Two records in this territory assert an obligation lives in an issue, and neither one does.**
+  [ADR-0011](../../adr/0011-zero-ironrdp-terminal-state.md) §Consequences said *"Each codec's issue
+  states which basis retires its oracle"* — #194, the example its own Decision names, says the
+  opposite (*"keep the oracle as a cross-check ... not as the exit criterion"*), and #127, #189
+  and all seven of #158's children state none. [ADR-0007](../../adr/0007-stage-boundary-codec-verification.md)
+  §Consequences said the CAVIDEO ceiling *"is stated in the issue"* — #58 is that issue and does
+  not state it. Both were struck through while working #225.
+  **This is a harder drift than the one [ADR-0004](../../adr/0004-sspi-contribute-and-bridge.md)
+  records**, and worth separating from it: there, three artifacts named a tracker item and the item
+  closed, so the check was one click. Here the sentence *is* the claim and there is nothing to
+  click — the assertion reads as the evidence that it happened. **Two instances, both inside this
+  territory**, which is why this is a territory fact and not an `invariant/` note; a third outside
+  it promotes. The test, when writing one: *if this record says the work lives elsewhere, open
+  elsewhere before merging.*
 - **Fuzz coverage was codec-shaped and is now parser-shaped.** #200 gave the
   connect-sequence framing layer targets and no-panic properties and #203 added `gcc` and
   `mcs`, so the connect sequence is covered end to end. The enumeration of what is left is
