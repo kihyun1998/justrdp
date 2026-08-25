@@ -4,9 +4,11 @@
 //! (Deactivation–Reactivation re-runs capability exchange in-session, plan.md §0's resize
 //! trap). Implemented so far: slow-path *and* fast-path output graphics (bitmap + palette
 //! updates, with fast-path fragment reassembly — slice-6) and outbound keyboard/mouse input
-//! (slice-7). Orders and pointers are later slices — their PDUs are decoded-and-skipped per
-//! the robustness policy (plan.md §11c: unknown-but-well-formed never kills the session,
-//! malformed input does).
+//! (slice-7), and slow-path pointer updates. Orders are a later slice: an order update falls
+//! to the dispatch's catch-all with its cursor unread — **skipped, not decoded** (the phrase
+//! here said "decoded-and-skipped" until #252, and neither half was true of it). The
+//! robustness policy is unchanged (plan.md §11c: unknown-but-well-formed never kills the
+//! session, malformed input does); what changed is the claim about *how* it is unknown.
 
 use crate::cursor::{CursorEvent, CursorImage};
 use crate::disconnect::{DisconnectReason, ServerDisconnectCause};
@@ -1054,7 +1056,7 @@ mod tests {
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
         for pdu_type2 in [
             share::PDU_TYPE2_SHUTDOWN_REQUEST, // 0x24 — ours to send, never to receive
-            0x26,                              // Save Session Info, decoded-and-skipped
+            0x26,                              // Save Session Info — catch-all, cursor unread
             0x29,                              // Set Keyboard Indicators, likewise
         ] {
             let outputs = sm

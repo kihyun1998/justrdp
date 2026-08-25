@@ -4878,9 +4878,9 @@ mod tests {
     /// So what is under test is not *whether* the server grants it. It is that we can ask at
     /// all (the send path, byte-identical to the frame that probe put on the wire — see
     /// `request_shutdown_encodes_the_frame_the_vm_answered`), and that the answer is
-    /// distinguishable from silence. Before #228 this `pduType2` fell into the
-    /// decoded-and-skipped arm, so a host asking for a shutdown and a host asking for nothing
-    /// looked identical from the outside.
+    /// distinguishable from silence. Before #228 this `pduType2` fell into the catch-all arm
+    /// — skipped with its cursor unread, not decoded (#252) — so a host asking for a shutdown
+    /// and a host asking for nothing looked identical from the outside.
     ///
     /// The session surviving is asserted too, and it is not padding: a *grant* would end the
     /// session, so "denied **and** still running" is the pair that says the server understood
