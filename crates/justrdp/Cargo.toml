@@ -24,9 +24,17 @@ tracing = { workspace = true, features = ["std"] }
 # Generates a throwaway self-signed cert so the key-extraction test can assert the extracted
 # bytes are the inner subjectPublicKey (a strict subset of the key pair's full SPKI DER).
 rcgen.workspace = true
-# Differential oracle (ADR-0001): the MCS-stage machine tests build realistic *server* frames
-# (Connect-Response, AttachUserConfirm, ChannelJoinConfirm) with ironrdp's encoders and feed
-# them to our state machine — their encoder against our decoder, never our own bytes.
+# Two roles in one entry (ADR-0011's 2026-08-26 role table), and they exit differently:
+#   * **R2 generator** — the MCS-stage machine tests build realistic *server* frames
+#     (Connect-Response, AttachUserConfirm, ChannelJoinConfirm) with ironrdp's encoders and feed
+#     them to our state machine (`src/connect.rs:1251`). Their encoder against our decoder, never
+#     our own bytes. **What ends it:** we write the server-side encoder, or a committed capture
+#     replaces it. No corpus retires a generator — a corpus holds what a server *sent*, and these
+#     tests need frames a server never sends (`:1836` patches a result byte ironrdp hardcodes).
+#   * **R3 acceptance** — `ironrdp_pdu::decode` parses the frames *we* wrote (`:1897`, `:1904`,
+#     `:1947`), so their decoder grades our encoder. **What ends it:** a real-server capture of
+#     the client-to-server leg, which no `JUSTRDP_CONNECT_CAPTURE_FILE` run produces today.
+# ADR-0011 supersedes ADR-0003 phase 3 here; this comment cited ADR-0001 until #225.
 ironrdp-pdu = "0.9.0"
 # Property-based robustness (ADR-0008). This is the **first** proptest dependency in the core
 # crate, and it is here because the census that names what must carry a no-panic property was

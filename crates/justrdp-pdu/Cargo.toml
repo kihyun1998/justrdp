@@ -9,6 +9,13 @@ repository.workspace = true
 [dependencies]
 
 [dev-dependencies]
+# Differential oracle for wire round-trips (`tests/differential_ironrdp.rs`,
+# `tests/differential_activation.rs`) — role **R1 verifier** in ADR-0011's 2026-08-26 role table.
+# **What ends it (ADR-0011):** an owned basis for this layer — real server bytes plus expectations
+# derived independently of our encoder. `tests/fixtures/connect/` is the start of one (#203, #252)
+# and `tests/real_server_connect.rs` is what reads it; every encoder in this crate writes
+# client-to-server, so the oracle is currently the only thing that grades a server-to-client
+# decode. This entry carried **no comment at all** until #225, which is why it is spelled out.
 ironrdp-pdu = "0.9.0"
 # Property-based robustness tests for the server-controlled PDU parsers (ADR-0008, issue #97):
 # "decode never panics on arbitrary bytes". The differential oracle only checks correctness on

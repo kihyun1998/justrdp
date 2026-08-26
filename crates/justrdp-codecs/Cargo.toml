@@ -16,11 +16,23 @@ repository.workspace = true
 justrdp-pdu.workspace = true
 
 [dev-dependencies]
-# The differential test oracle (ADR-0003): diff our decode output against ironrdp's on
-# identical bytes (and use its compressor to generate valid streams for the decoders).
+# The most overloaded entry in the workspace — four of ADR-0011's five roles (2026-08-26 table):
+#   * **R1 verifier** — diff our decode output against ironrdp's on identical bytes.
+#   * **R2 generator** — its compressor/encoder authors the streams our decoders then read
+#     (`tests/differential_rfx.rs:18`, `src/clearcodec.rs:965`). **No corpus ends this one.**
+#   * **R4 canary** — six tests whose *subject* is the oracle's own defect, so an owned basis is
+#     their precondition, not their exit; they end by **deletion** with the last R1 holder.
+#   * **R5 stage-boundary math** (ADR-0007) — `dwt_extrapolate`, kept deliberately by ADR-0011's
+#     #169 amendment.
+# **What ends it (ADR-0011):** R1 drops per codec on an owned basis, *except* where an amendment
+# keeps it as breadth (zgfx, #189). The entry itself leaves only when the last role does.
 ironrdp-graphics = "0.9"
-# Constructs the pointer-attribute inputs the ironrdp-graphics pointer oracle consumes
-# (issue #41 differential tests only).
+# **R2 generator** only (ADR-0011's 2026-08-26 table): constructs the pointer-attribute inputs the
+# ironrdp-graphics pointer oracle consumes (`tests/differential_pointer_ironrdp.rs:12`, issue #41),
+# and the TS_RFX container in `tests/differential_rfx.rs:21`. **What ends it:** we write those
+# encoders. An owned corpus does not — `differential_rfx.rs:14` records why in its own header, the
+# VM never emits CAVIDEO, so the synthetic streams *are* the corpus and the instrument generating
+# them is the one grading them.
 ironrdp-pdu = "0.9"
 # Property-based robustness tests for the untrusted-input codec decoders (ADR-0008, issue #97):
 # "decode never panics on arbitrary bytes". The differential oracle only checks correctness on
