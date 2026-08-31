@@ -132,7 +132,7 @@ Concretely:
 - Check `crates/justrdp-codecs/tests/fixtures/` for a corpus case covering the input
   in question — a tolerance that exists there is a requirement.
 - When the tie-break lands *against* the oracle, record it as a deliberate
-  divergence in [`docs/agents/theflow.md`](../../agents/theflow.md), or the next
+  divergence in [`docs/agents/thegraph.md`](../../agents/thegraph.md), or the next
   completeness pass proposes reverting it.
 - **When a hand-derived expectation is written, derive its initial state from the
   reference's caller, not only from the function being transcribed** — and prove the

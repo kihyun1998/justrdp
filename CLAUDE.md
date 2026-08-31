@@ -12,12 +12,16 @@ Substantive 변경이면 **`thegraph` 스킬**로 짠다 — 착수 시 `/thegra
 있는지, 각 가드와 decider, 무엇이 에이전트·스크립트로 추출됐는지)는 **계약 문서
 `docs/agents/thegraph.md`** 에 컴파일돼 있다 — 착수 전에 그것을 연다.
 
-두 표는 **`docs/agents/theflow.md` 가 계속 소유**한다: layer 별 **tie-breaker**(무엇이
-논쟁을 이기는가)와 **deliberate divergence 23행**(어느 논쟁이 이미 끝났는가). 이슈가
-랜딩할 때마다 수정되는 표라 사본을 두지 않는다 — 그 파일이 은퇴하면 표를 *옮긴다*, 지우지
-않는다. 규칙에 이빨을 주는 실증(ADR·이슈 앵커)은 **`docs/agents/lessons.md`**.
+두 표도 **같은 파일이 소유**한다: layer 별 **tie-breaker**(무엇이 논쟁을 이기는가)와
+**deliberate divergence 28행**(어느 논쟁이 이미 끝났는가). 이슈가 랜딩할 때마다 수정되는
+표라 **사본을 두지 않는다** — 예전엔 `theflow.md` 가 소유했고, 그 파일이 은퇴하며 표를
+*옮겼다*(지운 게 아니라). 규칙에 이빨을 주는 실증(ADR·이슈 앵커)은
+**`docs/agents/lessons.md`**.
 
-(`theflow` 는 여전히 유효한 형제 규율이고 `/theflow` 로 부를 수 있다. 기본은 `thegraph`.)
+(**`theflow` 는 은퇴했고 스킬도 제거됐다** — `/theflow` 는 더 이상 호출되지 않는다.
+`docs/agents/theflow.md` 파일은 남아 있지만, 그건 출하되는 rustdoc·ADR-0011/0012/0013·
+`docs/map/` 이 그 파일의 *Step* 번호와 war-story 앵커를 인용하기 때문이지 살아있는
+규율이어서가 아니다. 두 표는 거기 없다.)
 
 ## 착수 전 배선도 — `docs/map/`
 

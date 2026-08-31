@@ -61,7 +61,7 @@ a recurrence test.
 - **There is no verified external-fact store.** `## Reference behaviour` is
   `**None.**` in **every** territory: no FreeRDP/IronRDP behaviour is recorded
   anywhere with a pinned `file:line`, although
-  [`docs/agents/theflow.md`](../agents/theflow.md)'s tie-breaker table depends on
+  [`docs/agents/thegraph.md`](../agents/thegraph.md)'s tie-breaker table depends on
   exactly that comparison. This is the map's single largest finding, and it is a
   measurement, not an opinion.
 - **The map does not track what is not built.** `## Known holes / open` names the
