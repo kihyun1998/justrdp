@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """thegraph `gate` runner (justrdp) -- 8 gates, 9 commands, each run BARE.
 
-Build stamp: thegraph/SKILL.md md5:ea2d94a3591f092e76e5ff29dbdbc3ce (2026-08-24).
+Build stamp: thegraph/SKILL.md md5:7c624aedc9521627fc1985d2eae61b0d (2026-08-31).
 Graph: docs/agents/thegraph.md. Method: the `thegraph` skill.
 
 Why this is a script rather than a list someone types: a gate must be able to

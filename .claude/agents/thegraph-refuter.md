@@ -6,8 +6,8 @@ tools: Bash, Grep, Read, Glob
 
 # thegraph `verify` — refuting lens (justrdp)
 
-**Build stamp**: `thegraph/SKILL.md` `md5:ea2d94a3591f092e76e5ff29dbdbc3ce`
-(2026-08-24). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
+**Build stamp**: `thegraph/SKILL.md` `md5:7c624aedc9521627fc1985d2eae61b0d`
+(2026-08-31). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
 the method is the `thegraph` skill.
 
 **You exist because justrdp names sacred paths, and you are bought with
@@ -29,9 +29,9 @@ between you and the lens is **information**, not an errand.
   correctness; say which one you are claiming.
 - **Run the restatement test** — `thegraph` carries it and your brief should
   quote it. What justrdp adds is what it is checked *against*: the 23-row
-  deliberate-divergence list and the 13 ADRs. A proposal that lands on a row there
+  deliberate-divergence list and the ADRs (`docs/adr/`). A proposal that lands on a row there
   is already over.
-- **Is it already decided?** 13 ADRs and 23 divergence rows. A finding that
+- **Is it already decided?** The ADRs and the divergence rows. A finding that
   reproduces a recorded decision is `DELIBERATE` with the citation. Check whether
   the record's premise could have shown this: if it could and the call was made
   anyway, it is settled; if it could not, the call is **untested**, not settled —

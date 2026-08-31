@@ -7,30 +7,50 @@ invariants, reasoning habits); this file holds justrdp's **graph**. The method
 defers every concrete value here.
 
 **Build stamp** — built from `thegraph/SKILL.md`
-`md5:ea2d94a3591f092e76e5ff29dbdbc3ce` (61 515 bytes, mtime 2026-08-24). Recompiled
-2026-08-25 by `/grill-the-graph` as an **update** — from [`theflow.md`](theflow.md)
-(the bindings), `CLAUDE.md`, `CONTEXT.md`, `docs/adr/`, `docs/map/`, the manifests
-and the workflows. Every generated artifact carries the same stamp. If the stamp is
-behind, **warn and continue** — never rebuild on your own; a rebuild writes agents
-and scripts, and those pass through the maintainer.
+`md5:7c624aedc9521627fc1985d2eae61b0d` (77 920 bytes, mtime 2026-08-31). Recompiled
+2026-08-31 by `/grill-the-graph` as an **update** — diffed against the repo, *not*
+recompiled from the bindings, which the first build consumed. Every generated
+artifact carries the same stamp. If the stamp is behind, **warn and continue** —
+never rebuild on your own; a rebuild writes agents and scripts, and those pass
+through the maintainer.
 
-**What the first recompile measured, so nobody re-derives it.** The skill grew ~13%
-between the revision this was first built from and the one above, and it produced
-**no empty slot** — every one of thegraph's nine required slots was already answered.
-The growth was **method**: the third test-trust bar, the rule that a proof artifact
-must name which assertion can observe the change, `sweep`'s "judge by what it cannot
-see, never by its hit count", and the candidate envelope's last three columns. Method
-is exactly what this file deliberately does not carry, so the thin-artifact rule
-absorbed the change. What *did* go stale was repo reality — a promoted invariant note,
-and a guard that could not answer one of `classify`'s three routes.
+**What this recompile measured, so nobody re-derives it.** The skill grew
+61 515 → 77 920 bytes (+27%) since the last stamp, and unlike the previous recompile
+that growth was **not** all method: it added a node type's slot. Four findings.
 
-**Relationship to [`theflow.md`](theflow.md).** The bindings doc is this build's
-**input**, and it stays live — `theflow` keeps working, and retirement is the
-maintainer's call. Two tables are **co-owned rather than copied**: the
-**tie-breaker** and the **deliberate-divergence list**. They are amended as issues
-land (a row moved when #172 landed), so a second copy here would be the divergence
-seed with a 23-row surface. Both are read by pointer, below. **Retiring
-`theflow.md` means moving those two tables here, not deleting them.**
+① **`place` was missing entirely** — no roster row, no data, no guard. The catalog
+gives it count **1 unconditionally** (every repo has a tree), so its absence was
+never an answered *"none"*; it was a hole, and a hole that reads as an answer is the
+thing an update run exists to find. Filled below by `plat` against four
+maintainer-confirmed peers.
+
+② **`theflow` is retired and uninstalled**, and two required slots — the
+**tie-breaker** and the **deliberate-divergence list** — were held here as pointers
+into [`theflow.md`](theflow.md). That pointer was right while the file was live and
+amended as issues land; nothing maintains it now, so it aimed at residue. **Both
+tables are moved into this file** — moved, not copied, so no second copy exists and
+the divergence seed the pointer avoided is still avoided. This is what the previous
+build already committed to (*"retiring `theflow.md` means moving those two tables
+here, not deleting them"*). Two consequences, both real: `CLAUDE.md` still says
+`theflow.md` owns them and is **wrong there now**, and the `gate` command list drops
+from three copies to two. One repair was made in the move and nothing else: stray
+blank lines *inside* the divergence table, which split it into headerless fragments.
+
+③ **Build gap #250 is resolved into the graph.** The `proof` table had no method for
+a **performance** claim, so #91 reached this node with a slot that could not answer
+it and spent three measurements — two of them unusable — finding out. `proof` gains
+a **claim-class axis** below; the layer count stays 4, because performance cuts
+across the layers rather than adding a fifth. The bench-harness half stays open in
+#250 on purpose.
+
+④ **Four schema slots are `unowned`** — see [*Split coverage*](#split-coverage--four-slots-unowned).
+That is a `thegraph` change rather than a build value, so those slots carry their
+data **and** a marker.
+
+**Re-measured and unchanged, so not re-asked**: ADRs still 0001–0013 (the `search`
+list is current) · 5 workflows, 4 of them gates · every sacred path still resolves to
+a real file · all 7 generated artifacts present · nothing published, so `downstream`
+stays absent.
 
 ---
 
@@ -44,6 +64,7 @@ seed with a 23-row surface. Both are read by pointer, below. **Retiring
 | `reference` | **4** | 3 routing-table rows naming an external source, **+ the real VM** as its own class (below) |
 | `enumerate` | 1 | catalog. **Never delegated** |
 | `boundary` | 1 | catalog. **Never delegated**. The seam is in-repo — see *Boundary rule* |
+| `place` | **1** | catalog — **every repo has a tree**, so no input can zero this out. **Never delegated.** Tree rule below, compiled by `plat` against four confirmed peers |
 | `implement` | **4** | one per claim class in Step 4's proof table |
 | `proof` | **4** | one per claim class, each with its own method and its own blind spot |
 | `verify` | **2** | 1 gap-hunting + 1 refuting, because the sacred-path list is **non-empty** |
@@ -65,7 +86,7 @@ migration, and Step 4's *"link into a real consumer"* proof (its fifth row). The
 
 ## Per-node data
 
-### `reference` — 4 source classes, routed by `change_type`
+### `reference` — 5 source classes, routed by `change_type`
 
 | # | Class | How it is reached | Summarized? |
 |---|---|---|---|
@@ -73,6 +94,7 @@ migration, and Step 4's *"link into a real consumer"* proof (its fifth row). The
 | 2 | **FreeRDP (C) + IronRDP (Rust) real source** — hidden state, server tolerance, edges, the CVE points. Spec-unwritten tolerance exists **only** here | `gh api repos/<owner>/<repo>/contents/<path> --jq .content \| base64 -d > "$SCRATCH/x"`, then `grep -n` / `sed -n`. **`WebFetch` is banned** — it drops handler bodies from large files, so a decoder branch that *is* there reads as absent | **raw** |
 | 3 | **Published / external state** — crates.io, the upstream repo's own state | a registry query / `gh api`, never a sentence about them | **raw** |
 | 4 | **The real VM** — `192.168.136.136` (memory `test_environment`). The authority for **what we accept** | a **throwaway probe**: instrument, read the number, delete the probe, **record the number in the issue**. Reading the code is not observing what it does. **And a probe whose output is server-to-client bytes outlives the probe** — the number-in-the-issue form is the floor, not the ceiling. `JUSTRDP_CONNECT_CAPTURE_FILE` (`justrdp-tokio`, adapter-side) records the read path only, so a capture carries no credential and is **committable**; #252 captured the finalization leg, committed 156 bytes as a fixture and walks it with the shipped parsers, turning a one-run observation into a standing test. Prefer that whenever the fact is server-to-client. **What a fixture still cannot do**: a conforming server cannot redden a guard that only fires on non-conforming input, so its discriminating power is over *false positives* — name which assertion observes the change and mutate **both** ways before recording it (#252 ran both) | **raw observation**. Caveat carried on the node: it is **one WS2022 box** (memory `vm_advertised_graphics_caps`) — it proves the paths it advertises and says nothing about the ones it does not. *"The VM is happy"* is not *"servers are happy"* |
+| 5 | **Layout prior art** — the maintainer-confirmed peer packages `quinn-proto` / `quinn` / `quinn-udp`, `ironrdp-pdu` / `ironrdp-graphics` / `ironrdp-tokio`, `rustls`, `h2` (hyperium). Governs **where a file goes** and nothing else. `place` **reads** this class; it never fetches it | `gh api repos/<owner>/<repo>/contents/<path>` against the **real tree**. A layout read off a documentation site, a blog post or a starter template is **summarized** and can never confirm anything; a repository's actual tree can | **raw**. **Their trees are never stored** — the rule is kept here, the peers are kept by name, and the contents are read again when acted on. A stored copy of somebody else's tree is a derivable fact that rots |
 
 **Not a source class**, and recorded so no run re-derives it: *performance claims*
 resolve to **our own measurement on a `--release` build** — that is the
@@ -119,6 +141,68 @@ Cross-territory facts → an [`invariant/`](../map/invariant/) note, each carryi
 does not yet name (tile boundaries, quant tables, progressive pass state,
 palette/run state) → into the issue **before** implementing.
 
+### `place` — the tree rule, as concrete paths
+
+Runs **before `implement`**: a directory boundary is where the seam is *physically*
+expressed, so a file written to the wrong one breaks the seam while producing no
+error, no failing test and no warning — and read *after* the code is green,
+everything it would have said arrives as rework. **Decider AI, never delegated** —
+choosing between the tree rule and what the peers do is adjudication.
+
+Compiled 2026-08-31 by `plat` against four **maintainer-confirmed** peers (source
+class 5). A declared rule outranks what the tree merely looks like — and here the
+two never conflicted: the declared dependency boundary has **zero violators**, and
+measurement is *stricter* than the declaration. `justrdp-codecs` has **no external
+dependency at all**, and the four crates depend only downward. `CLAUDE.md`'s
+"sspi·rustls live in the adapter" is a lossier statement of a rule the code already
+keeps.
+
+| Path | Owns | Grounds |
+|---|---|---|
+| `crates/justrdp-pdu/src/*.rs` | one file per `[MS-*]` protocol area — bytes↔types only. **Zero external dependencies** | ADR-0001 / ADR-0002, measured 0 violators |
+| `crates/justrdp-pdu/src/<area>/` | a protocol area that outgrew one file. Module root is **`<area>.rs` beside it** | spelling rule below |
+| `crates/justrdp-codecs/src/*.rs` | one codec per file — **pixel math only**. Depends on `justrdp-pdu` and nothing else | ADR-0003 / ADR-0007, measured |
+| `crates/justrdp-codecs/src/<codec>/` | a codec that outgrew one file | spelling rule below |
+| `crates/justrdp/src/*.rs` | the sans-IO state machines and the host-facing output types. **No `tokio`, no `rustls`, no `sspi`** | ADR-0001; measured: `x509-cert` + `tracing` only |
+| `crates/justrdp-tokio/src/*.rs` | **the only place `tokio`, `rustls`, `sspi` or `ring` may appear.** Policy injection | ADR-0002, measured 0 violators |
+| `crates/*/tests/*.rs` | **differential-oracle and real-corpus tests only.** Unit tests stay inline `#[cfg(test)]` | measured **16/16**; undeclared anywhere until this build |
+| `crates/*/tests/fixtures/<name>/` | captured real-server bytes plus a `README.md`. Appears **only** in a crate whose tests replay them | which is *why* `crates/justrdp/tests/` has none — both its tests are differential |
+| `crates/*/proptest-regressions/` | generated. Never authored | — |
+| `fuzz/fuzz_targets/*.rs` | fuzz targets, **out of the workspace** | matches 3/3 peers that run a fuzz lane |
+| `.github/workflows/*.yml` · `.github/scripts/*.py` | things that **are** CI gates | — |
+| `scripts/thegraph/*.py` | scripts this graph runs **locally**, never in CI | the split from `.github/scripts/` is deliberate |
+| `.claude/agents/thegraph-*.md` | generated graph agents | extraction plan |
+| `docs/adr/NNNN-<kebab>.md` · `docs/agents/*.md` · `docs/map/territory/<area>.md` · `docs/map/invariant/<claim>.md` | decision records · agent contracts · the wiring map | — |
+
+**Module-root spelling: `<area>.rs` + `<area>/`** (the 2018 form), decided
+2026-08-31 **because the evidence could not decide it**. The repo held exactly two
+directory modules and one of each form; the peers disagree (IronRDP, rustls and h2
+use `mod.rs`; **quinn mixes both** — `config/mod.rs` beside `congestion.rs` +
+`congestion/`). Majority is evidence, not authority, and where neither it nor a
+measured reason settles a difference the call is the maintainer's. The single
+outlier is `crates/justrdp-codecs/src/rfx/mod.rs`; **the move is a separate change**,
+because a move made before the rule is written drifts straight back.
+
+**Three suspected splits dissolved under a content sort**, recorded so nobody
+re-opens them by reading filenames. `pointer`/`cursor` across three crates sorts
+**4/4** on role — wire fields (`justrdp-pdu/src/pointer.rs`), the byte reader
+(`justrdp-pdu/src/cursor.rs`), pixel math (`justrdp-codecs/src/pointer.rs`), host
+type (`justrdp/src/cursor.rs`). The two `cursor.rs` are a **name collision between
+different roles**, which is the difference that bites and is not drift. `rfx` living
+in both `justrdp-pdu` and `justrdp-codecs` sorts **2/2** — block framing versus
+pixel math, exactly as ADR-0003 declares. And `crates/justrdp/tests/` lacking a
+`fixtures/` directory is a *consequence* of the fixture rule, not an exception to it.
+
+**Out-edge to `decide`. Guard: the change needs a new top-level area**, or the tree
+rule and the peers disagree and no tie-breaker settles it. Both are structure calls.
+**Writes `triggers`** when the same placement is argued twice — a tree rule being
+re-decided is a record waiting to be written, and `promote` counts it.
+
+**Guard mechanism**: `scripts/thegraph/place.py`, decider `code` — the tree rule is
+a path list and a diff is a path list, so the check is a match, not a recollection.
+Prose alone would make this node a bar with no firing mechanism, which is the exact
+defect its own argument is against.
+
 ### `implement` / `proof` — 4 layers, each with its own blind spot
 
 | Layer | Real proof | What this proof structurally cannot see (the tautological trap) |
@@ -130,6 +214,34 @@ palette/run state) → into the issue **before** implementing.
 
 Step 4's fifth row — *"strongest: a real consumer"* — is **N/A, no consumer
 exists**, so it is not a layer. See the `downstream` roster row for the reversal.
+
+**The table above answers a *correctness* claim. A performance claim is a different
+class, and it cuts across all four layers rather than adding a fifth** — so the layer
+count stays **4**. Recorded because #91 arrived at this node with no method at all,
+and **#250** is the flush that says so.
+
+| For a performance claim | Why — measured on #91 |
+|---|---|
+| **Isolate before you time.** A component's share of the pipeline is itself a measurement, and it comes **first** | RLGR is **4.6%** of a corpus decode, which caps a 2x win at 2.3% — the question can already be closed before a stopwatch comes out |
+| **Measure the workload's shape, not only its duration** | The verdict came from a histogram, not a timer: real streams have a **mean run length of 1.0 bits** (66.7% of runs zero-length, 0.01% reaching 64) |
+| **State the noise floor with the number** — repeat on the same build and report the spread | Four runs of the *same* build spanned 298 / 308 / 322 / 327 ms. A single before/after pair across a **9.6%** instrument is not evidence |
+| **The probe is a throwaway**, `--release` only — instrument, read the number, delete the probe, record it in the issue | `reference` class 4's rule, which held once it was reached. Nothing *routed* a perf claim to it, and that was the gap |
+
+**Its tautological trap, and it was not among the ones this build already named:**
+**timing the whole system to detect a component.** 300 101 µs before against
+298 099 µs after read as *"a wash"* and was noise — *a measurement that cannot
+resolve its own effect is indistinguishable from one that found nothing.* The
+synthetic micro-benchmark that followed resolved cleanly and still only *bracketed*
+the answer (1.93x faster on long runs, 6–12% slower on dense symbols), because
+neither shape was known to be the real one. Only isolation plus the distribution
+decided it.
+
+**No bench harness exists** — no `benches/`, no `[[bench]]`, no `criterion` — and
+that stays **deliberately open in #250**, not answered here. `plat` measured that
+**all four confirmed peers have a dedicated bench location** (`quinn/bench` +
+`perf`, `rustls-bench`, `h2/benches`, `ironrdp-bench`), which is evidence for one and
+does not outrank ADR-0002's argued dependency list. Until it is decided, `benches/`
+is **not** in the tree rule, and a performance claim is proved by throwaway probe.
 
 **Test-trust gate** (`implement`'s self-loop, decider `code`) has three
 justrdp-shaped traps for the discriminating-power bar: a **differential-oracle test
@@ -217,10 +329,10 @@ cargo test -p justrdp-codecs -p justrdp --target i686-pc-windows-msvc
 ```
 
 **The runnable copy is `scripts/thegraph/gates.py`, and it is the one that
-decides.** This block describes it; `theflow.md` Step 7 holds the same list under
-the old structure. Three copies is one more than is safe, so a command change
-touches the script **and** both docs — or `theflow.md` retires and the count drops
-to two.
+decides.** This block describes it. There were three copies until 2026-08-31 —
+`theflow.md` Step 7 held the same list under the old structure — and that file's
+retirement dropped the count to **two**, which is the safe number: a command change
+touches the script **and** this block, and nothing else.
 
 **Each gate bare, never piped** — a pipeline's exit status is the last command's,
 so `test … | tail -1 && commit` always commits. **A gate you cannot fail is not a
@@ -379,25 +491,91 @@ move on.
 
 ---
 
-## Tie-breaker — by pointer
+## Tie-breaker — what wins when prior art and justrdp's own evidence disagree
 
-**[`theflow.md` § Tie-breaker](theflow.md#tie-breaker--what-wins-when-prior-art-and-justrdps-own-evidence-disagree)**
-— 5 rows. Not one value: the authority differs **by layer**, and flattening it
-breaks one of them (the sharpest case is send vs. receive — writing to spec and
-accepting what a real server sends are opposite disciplines on the same protocol).
-`verify`'s brief carries **the row for the layer this change sits on**. A layer not
-in that table has **no recorded tie-breaker** — say so and ask, rather than
-borrowing a neighbouring row.
+Not one value: the authority differs **by layer**, and flattening it breaks one of
+them. The sharpest case is send vs. receive — writing to the spec and accepting
+what a real server sends are opposite disciplines on the same protocol, so a single
+tie-breaker is necessarily wrong on one side.
 
-## Deliberate divergences — by pointer
+| Layer | Authority | Grounds |
+|---|---|---|
+| **What we emit** — wire layout, flags, state transitions | the **`[MS-*]` spec**, cited by section | Writing to spec is what makes us connect to servers nobody tested us against. ADR-0003 *derive, don't copy*: FreeRDP/IronRDP are cross-checks, never the source |
+| **What we accept** — server tolerance, violated caps, absent/oversized fields, and **receive-side state transitions the spec phrases as server obligations** (#252) | the **real VM's observed behaviour**, then FreeRDP's tolerance code | ADR-0009 / #101: servers violate the spec and mstsc connects anyway, so strictness on the receive path is a defect, not rigor. **Caveat:** the VM is one WS2022 box (memory `vm_advertised_graphics_caps`) — a tolerance derived from it alone is a hypothesis until FreeRDP shows the same shape |
+| **Codec byte-exactness** | an **owned basis** where one exists (real-server corpus + independently-derived expectations), else the **differential oracle** (`ironrdp-graphics`) — with **FreeRDP as the tie-break** when the oracle and we disagree | ADR-0003/0007, **narrowed by ADR-0011 §3** (#225): *"The oracle never outranks the owned basis"* — this row named the oracle as the authority outright until then, which is the pre-ADR-0011 answer. The oracle shares justrdp's own code lineage (memory `ironrdp_oracle_shares_lineage`), so agreement is weaker evidence than it looks and disagreement is not automatically ours |
+| **Public API shape** — `FrameUpdate`, feature-flag exposure, host injection points | **this repo's own precedent + `CLAUDE.md` identity** | IronRDP's API is the thing being replaced. It is a design *input*, never a validator |
+| **Performance claims** | **our own measurement on a `--release` build** | No precedent yet; stated so a debug-build number never becomes a claim |
+| **Directory layout** — which path owns what | **this project's own measured rule**, then the confirmed layout peers (`reference` class 5) | `plat`, 2026-08-31. Four peers doing the same thing is a strong prior and still loses to a rule this repo already keeps: measured, the declared dependency boundary has **0 violators** and the tree is *stricter* than the declaration. Where neither settles it, it is the maintainer's call and **not a vote** — the module-root spelling was decided exactly that way |
 
-**[`theflow.md` § Deliberate divergences](theflow.md#deliberate-divergences--where-justrdp-does-not-follow-its-prior-art-on-purpose)**
-— 23 rows as of 2026-08-24. The tie-breaker says who wins an argument; this says
-**which arguments are already over**. It is what the **reference-free restatement
-test** is checked against: a finding that lands here is `DELIBERATE` with the
-citation, never a defect, however confidently a lens reports it. Add a row when a
-decision *chooses against* a reference or against a strict spec reading — cheaper
-than re-defending it every time a lens finds it.
+A layer not in this table has **no recorded tie-breaker** — say so and ask, rather
+than borrowing a neighbouring row.
+
+## Deliberate divergences — where justrdp does *not* follow its prior art, on purpose
+
+The table above says who wins an argument; this says **which arguments are already
+over**. It is what `verify`'s reference-free restatement test is checked against: a
+finding that lands here is `DELIBERATE` with the citation, never a defect, however
+confidently a lens reports it.
+
+| We do | The prior art does | Decided by |
+|---|---|---|
+| **The host holds every RDP feature flag** — the core hides no capability bit | `ironrdp-connector` 0.9.0 curates them internally and omits `SUPPORT_DYN_VC_GFX_PROTOCOL` (0x0100), so EGFX cannot be enabled | `CONTEXT.md` §Project intent — that single hidden flag is *why this project exists*. "Narrow the surface to a curated config" is not an open question |
+| **ClearCodec tolerances** — RLEX runs that overflow the declared rect are clipped; the NSCodec subcodec path is skipped rather than rejected | FreeRDP treats both as errors | #127 + memory `clearcodec_corpus_required_tolerances` — the real-server corpus *requires* them. A lens reporting "FreeRDP rejects this" is `DELIBERATE`, cited to the corpus, not a defect |
+| **`FrameUpdate` carries a dirty rect and no owned pixels**; surfaces blit straight into the host framebuffer | IronRDP's `DecodedImage` owns a full-frame copy the consumer reads out of | ADR-0010 (#85), realized in #162/#165 and #163/#166. "Let the core own the frame" reverses a measured performance decision |
+| **Accept capability sets and negotiation responses that violate the letter of the spec** | a **strict reading of `[MS-RDPBCGR]`** — note the divergence here is from the *spec's strict interpretation*, **not** from FreeRDP/IronRDP, both of which are tolerant too | ADR-0009 (#101) |
+| **Progressive: `quality = 0xFF` is a full-quality sentinel, and a region needs no preceding `WBT_CONTEXT` for its `codecContextId`** | `ironrdp-graphics` indexes its progressive-quant table by `quality` (0.9.0 `progressive.rs:1231`, `:1268`) and errors on an undeclared context id — note this diverges from **the oracle only**, not from FreeRDP, which special-cases the sentinel (`progressive.c:997`, `:1407`) and gates a region on `FLAG_WBT_FRAME_BEGIN` alone (`:2129`) | #194 + the corpus at `justrdp-codecs/tests/fixtures/progressive/`, where the real server needs both tolerances (2 of 52 payloads survive the oracle). Binds #169/#170: "require a context block" is not an open question |
+| **Progressive upgrade: a refinement that cannot be represented in `i16` is a typed error** (whether from the accumulate, a too-wide raw read, or a shift that discards it) | **FreeRDP** truncates — `WINPR_ASSERTING_INT_CAST` is an assert in debug and a plain cast in release (`progressive.c:1223`, `:1252`), and `rawShift` (`:1192-1201`) uses a plain cast | #168. The receive-path row normally makes FreeRDP's tolerance the authority and this deliberately goes the other way: the coefficient store **survives across passes**, so a wrapped value corrupts every later refinement of that tile rather than one frame of it — the error is not local, so tolerating it is not tolerance. **Two caveats kept on the record rather than argued away:** reachability is *not* established — the corpus bounds the addend (`shift` 5..=11 against a magnitude ≤ 3) but says nothing about the accumulated coefficient it is added to, and no gate yet drives a pass against a non-zero store (#169); and because the pass refines in place, the error leaves a partially-refined store, so the caller's obligation is to **discard the tile's state**, not merely skip the tile |
+| **Progressive first pass: the reduce-extrapolate inverse DWT saturates** its lifting taps | the **oracle** wraps (`dwt_extrapolate.rs:420-422`, `t(v) = v as i16`) | #169. FreeRDP's `clampi16` (`progressive.c:591-598`) is the tie-break, and the two differ by a full `u16` on an overflowing tap — a wrapped tap turns a clipped highlight into its photographic negative. Diverges from **the oracle only**; asserted by a test rather than left as a doc claim |
+| **Progressive: a base quant band below 6 is decoded, not rejected** | **FreeRDP** rejects the whole region (`progressive_rfx_quant_lcmp_greater_equal(quantVal, 6)`, `progressive.c:2177`) | #169 + ADR-0009. The shift formula is total for `1 <= bitPos <= 16` and FreeRDP's floor sits inside that window, so the check buys no arithmetic safety on a receive path. **The oracle is not a second opinion here** — it has no such branch in any published version, and #167's "it defines a rounding right-shift for `q < 6`" described the *encoder* (`progressive.rs:315`). Unreachable on the corpus: no real region goes below 6 |
+| **Progressive: an upgrade pass whose band layout disagrees with the layout its tile's store was written at is refused** | **FreeRDP** hardcodes the extrapolate walk and forwards the *current* region's flag to the DWT, so it refines one layout and reconstructs another | #169. Silent by construction — plausible pixels, no error, the shape #167 records. Stricter than the reference on a receive path, and **unreachable on the corpus** (52 of 52 regions set the flag), so it is a FreeRDP-derived hypothesis rather than a measured behaviour: guessing what such a server meant would be worse than refusing it |
+| **Progressive: a first-pass dequantization shift of 16 or wider fails the tile** | **FreeRDP** refuses the same widths (`prim_shift.c:38-39`, generic and SSE3 alike) and then **discards the refusal** — the tile work callback is `void` (`progressive.c:1659-1684`), so the stale tile is blitted and the region reports success | #169. Reachable: `shift = quant + prog_quant - 1` runs to 29, not 15. Painting a stale tile from an already-overwritten sign store is the silent-corruption shape this territory refuses, so the divergence is from FreeRDP's *handling*, not from its threshold |
+| **Progressive: the tile store is keyed by surface** | the **bootstrap oracle** keys by `codecContextId` alone with no cap (#83) | #169, and it is a **correctness** difference, not only a leak: `RFX_TILE_DIFFERENCE` adds a tile's coefficients to the store held for that grid position, and 1405 of 2943 real first passes carry it. Under context keying a rotated id starts from zeroes and the previous frame's contribution is dropped — measured, the two keyings paint differently. FreeRDP keys by `surfaceId` (`progressive.c:314`, `:471`). It also bounds the memory: 260 live stores against 2940 over one session |
+| **Progressive: the tile store is freed by `DELETESURFACE` and by nothing else** — `DELETEENCODINGCONTEXT` and `RESETGRAPHICS` free nothing | the **bootstrap oracle path** frees on both (`justrdp/src/egfx.rs:319`, `:484`), which is #83's fix and is correct while contexts are keyed by `codecContextId` with no cap | #170. FreeRDP agrees with us on every row — its `DELETEENCODINGCONTEXT` handler is a literal no-op (`gdi/gfx.c:1239-1246`) and its `RESETGRAPHICS` reaches `progressive_context_reset`, a stub (`progressive.c:2635`) — so this diverges from *our own current call sites*, not from the reference. `RESETGRAPHICS` is the load-bearing one: the server's encoder keeps its reference frames across a reset and `RFX_TILE_DIFFERENCE` adds against them, so clearing desyncs while keeping cannot (an encoder that did reset cannot send a difference tile at all). **Landed in #172**: both call sites are retired and the passing test that pinned them was *inverted* rather than deleted (`reset_graphics_keeps_the_tile_stores_it_used_to_clear`), because a green test asserting the retired behaviour is the strongest possible "do not touch this" and deleting it would have thrown away the reason it was wrong |
+| **Progressive: a tile index is bounded per axis, and a grid is replaced when the surface's grid dimensions change** | **FreeRDP** bounds the *linear* index only (`zIdx >= surface->tilesSize`, `progressive.c:473`) and its create is idempotent on the surface id alone (`:546-548`) | #170. Two different silences on the reference's side: a linear-only bound lets `(gridWidth + 5, 0)` alias onto `(5, 1)` and write the wrong tile, and an idempotent create lets a surface recreated at a new size keep the old `gridWidth` so every `zIdx` addresses the wrong tile. FreeRDP's grid is also **wider than ours for every surface** — it rounds up to the next multiple rather than `div_ceil` (`:447`) and 16-aligns the width first (`gdi/gfx.c:1284`) — so it accepts a column we reject. Unreachable on the corpus (widest index 19 on a 1280-wide surface), so the accept-side half is a hypothesis; the alias-side half is not |
+| **Progressive assembly: a tile is clipped to its region's rects, and each region is clipped against its *own* rects** | **`ironrdp-graphics`** does not clip at all — `decode_bitmap` hands back whole 64 x 64 tiles — and **FreeRDP** clips the frame's accumulated dirty set against `progressive->region`, which after the parse loop holds the payload's *last* region (`update_tiles`, `progressive.c:2329-2412`) | #171. We follow FreeRDP on *whether* to clip and diverge on *which* region, and both halves are measured rather than argued: not clipping leaves **57 386 of 1 024 000** surface pixels different over the corpus (909 of 6193 tiles are genuinely cut), and **52 of 52 payloads carry exactly one region**, so the last-region rule and the per-region rule agree on every byte this server has sent. The oracle agreeing with the pre-#171 client here is [oracle-agreement-is-not-independence](../map/invariant/oracle-agreement-is-not-independence.md) again, not a second opinion |
+| **Progressive assembly: overlapping region rects paint the overlap twice** | **FreeRDP** unions the rects into a `REGION16` first (`progressive.c:2331-2344`), so its copies are disjoint | #171. Both writes come from the same tile buffer at the same source offsets, so the *pixels* are identical and the cost is one redundant blit plus a doubled dirty area. Measured: **0 overlapping rect pairs** across the corpus' 52 regions, so a region-union implementation would be untested machinery guarding an unobserved case |
+| **Progressive assembly: FreeRDP's deferred re-blit is not modelled** | **FreeRDP** re-blits the frame's whole accumulated dirty set on every payload of that frame (`frameId` / `updatedTileIndices`, `progressive.c:2437-2441`, `:2346`), which needs every tile's decoded *pixels* retained (+16 KiB on top of `TileState`'s 48 KiB) | #171, and the validity condition is recorded because the mechanism turned out to be **reachable**: probed live, **4 of 65** frames carried two WireToSurface2 payloads. Replaying that capture both ways, the carried-over set contributed **0 rectangles and 0 pixels** — inert *as long as a frame's successive regions do not overlap each other's tiles* |
+| **Progressive assembly: the tile store has its own byte budget, and exceeding it skips the new tile** | **FreeRDP** allocates the whole grid up front per surface (`progressive_allocate_tile_cache`, `progressive.c:426`) and has no session-wide bound at all | #171. A `TileState` is 48 KiB per 16 KiB of RGBA, so `justrdp::egfx`'s 256 MiB surface cap admits ~768 MiB of store its accounting cannot see, against dimensions a *server* chose. Skipping the new tile rather than failing the payload is the direction that keeps every already-admitted tile refinable |
+| **zgfx bounds what one compressed segment may expand to (65 536) and what a multipart may declare (64 MiB)** | **FreeRDP** caps the segment at the same number (a fixed `OutputBuffer[65536]`, `zgfx.c`) but bounds a multipart only by its own `u32` `uncompressedSize`, so ~400 KiB of input can demand 4 GiB; **`ironrdp-graphics`** has *no* output bound at all, and a ~20-byte segment can demand gigabytes (a match length is `2^(k+1) + v` for a unary-coded `k` the stream picks) | #189, and the requirement is older than the slice — `docs/plan.md` §V.3 wrote *"malformed sequences could cause OOM; use a max-decompressed-size limit"* before either decoder existed. The **uncompressed** segment path is deliberately left uncapped, diverging from FreeRDP the other way: those bytes are copied rather than expanded, so they are already bounded by the input the DVC layer capped, and refusing a long one would only kill a channel over wasted bandwidth |
+| **zgfx refuses what no conforming encoder can emit** — a match distance past the 2.5 MB window, a bit pattern matching no token (`10000` and `101111111` name none), a compressed segment longer than the spec's own ceiling — **and tolerates what costs nothing**, an empty compressed segment | **FreeRDP** wraps an over-long distance modulo the window and emits whatever is there, silently skips an unknown token by consuming nine bits, and *refuses* the empty segment (`segmentSize < 2`); **`ironrdp-graphics`** panics on the first and errors on the second | #189. Refusing here is not strictness on a receive path: the referenced bytes have never existed, so there is no server intent to be tolerant *of* — where ADR-0009 applies (an empty segment, an over-long uncompressed one) this goes the tolerant way instead. The tell that the two halves are different questions: one is "what did the server mean", the other is "what could any encoder have meant" |
+| **WireToSurface1: a dequantization shift of 16 or wider fails the component**, and an NSCodec colour-loss level that implies one fails the reconstruction | **FreeRDP** refuses the same width inside the shift primitive (`-1` from `general_lShiftC_16s_inplace`, `prim_shift.c:38-39`) and then **discards** the refusal — all ten `rfx_quantization_decode_block` calls drop the status and `rfx_quantization_decode` returns `TRUE` regardless (`rfx_quantization.c:73-83`), leaving the band unshifted and the tile decoding. `ironrdp-graphics`'s `quantization.rs` has no bound at all and carries the identical latent panic | #211 + [ADR-0012](../adr/0012-consumption-site-totality.md). Same split #169 already recorded for the Progressive first pass: the divergence is from FreeRDP's *handling*, not from its threshold. **Unreachable from the wire on both sites** — `Quant::decode` masks to nibbles (widest shift 14) and `parse_header` bounds the colour-loss level to `1..=7` — so this is a contract about what the `pub fn` admits, not a live guard; the priority (P2) follows the reachability and the contract does not. Note the threshold is on the **shift**, not on the nibble: an exponent of 16 shifts by 15 and is accepted |
+| **WireToSurface1: a quantization exponent of 0 fails the component** — and it is the first refusal in this family a server can actually reach, a `0x00` byte being two zero nibbles | the **oracle** treats `0` and `1` alike as no-ops (`quantization.rs` `decode_block`, `if factor > 0`), so it under-scales the subband and decodes on. **FreeRDP agrees with us** and in the same shape — validate all ten, then apply — refusing at `if (val < 1) return FALSE` (`rfx_quantization.c:66-71`) and propagating it through `rfx_decode.c:66-67` to `rfx.c:1082-1086`, though its threadpool path (`rfx.c:787-788`) logs and continues instead | #233 + [ADR-0012](../adr/0012-consumption-site-totality.md) §3, which is the reason rather than FreeRDP: `progressive::first_pass_shift` already refused the identically undefined `bitPos == 0`, and one quantity gets one answer across a family. Diverges from **the oracle only**, which is no second opinion here — it shares this decoder's lineage and carries #211's unbounded shift besides. The receive-path objection is removed by ADR-0009 §3(a) (tolerance scopes to *which features may appear*; typed errors hold over contents), not by a tolerance judgement: `shift = -1` is the absence of a value, not one we dislike — the line #189 drew for zgfx. **The VM cannot corroborate** (it never emits CAVIDEO), so this is a FreeRDP-derived position, not an observed one; `[MS-RDPRFX]` constrains the *encoder* to 6..=15, so no conforming encoder emits it |
+| **A failed zgfx message poisons the decompressor** — every later call is a typed error | **both references** leave the object usable with a half-written history window | #189. Same reasoning as #168's Progressive store and for the same structural reason: the 2.5 MB window spans messages, so a half-written one silently mis-decodes every later match rather than failing locally. Unreachable in the client (`justrdp::egfx` already treats a zgfx error as fatal for the channel), so it is a contract assertion rather than a live guard — and it is what makes the ordering contract testable, which the issue asked for |
+| **A Font Map whose body is shorter than its mandatory 8 bytes is a typed error, and the connect fails** | **FreeRDP** refuses to fail: `rdp_recv_font_map_pdu` (`libfreerdp/core/activation.c:552`) carries the comment *"Do not fail here, see https://github.com/FreeRDP/FreeRDP/issues/925"*, warns on a short payload, and still calls `rdp_finalize_set_flag(rdp, FINALIZE_SC_FONT_MAP_PDU)` — so finalization completes on a zero-byte body. **But that tolerance is bought, not free**: FreeRDP gates every finalization advance on `rdp_handle_sc_flags` (`libfreerdp/core/rdp.c:1867`) walking four states (`rdp.c:2176-2190`, Sync → Cooperate → GrantedControl → FontMap), so reaching `CONNECTION_STATE_ACTIVE` already proves all four replies arrived and parsed. It relaxes the **body** because it never relaxed the **place**. **Two corrections #252 measured, both to sentences this row used to carry.** It is a *completeness* gate, not an *ordered* one: `finalize_sc_pdus` is only ever OR-ed (`rdp.c:2714`) and cleared solely at reset (`:2699`/`:2701`), so out-of-order replies satisfy every rung one PDU behind and still reach ACTIVE. And it is the **transition** that is gated, not the handler — `rdp_recv_data_pdu`'s switch (`rdp.c:1235-1311`) consults no connection state, so `rdp_recv_font_map_pdu` runs at any rung. **And the gate never fails**: the else branch (`rdp.c:1884-1893`) warns and leaves `status` untouched, so a missing reply parks FreeRDP on the rung rather than dropping the session. It failed for one stretch of 2022 and was deliberately relaxed — `ff2509bbc4e9` (Armin Novak, 2022-11-29, *"[core,client] relax sc flags state checks"*) deleted `status = STATE_RUN_FAILED`, one day after FreeRDP#8458 reported an xrdp resolution change disconnecting on the reactivation leg (*"microsoft's clients seem to work"*). And the maintainer who landed it said so on the record (`bmiklautz`, #925, 2013-02-11): *"It's not really clean solution since it violates the protocol imho."* **IronRDP** rejects, like us, and goes further by rejecting unknown `SequenceFlags` bits — enforcing a spec `SHOULD` as a `MUST`, since `[MS-RDPBCGR]` 2.2.1.22.1 marks all four body fields `SHOULD` and only the Share Data header fields `MUST` | #237 + [ADR-0009](../adr/0009-tolerant-negotiation-posture.md) §3(a), which is the record and reads against the reference here: *"A tolerated order with a malformed body is still a typed error."* A missing mandatory body **is** a malformed body, and §2's tolerance is scoped to *rendering-feature self-inconsistency* — an unadvertised order, an over-advertised capability — which a truncated finalization PDU is not. **The open question is at the consumption site, not the parser**: `FontMap::decode` returning `NotEnoughBytes` is what §3(a) prescribes; whether `justrdp::connect::finalization_step` should tolerate that error the way FreeRDP does would widen §2 past rendering features, which is an ADR amendment rather than a fix. **Settled by #242 (2026-08-25): the row stands, and here is what the earlier version of it left out.** *"A real server produced it"* was true and incomplete — #925's server is **Oracle VirtualBox VRDP 4.2.6**, and the reporter adds *"i can connect to Ms RDP Windows"*. One modern Microsoft instance exists (winapps-org/winapps#244, 2024, FreeRDP 3.8.0, Windows 10 LTSC, `paylaod size is 0 instead of 8`) — but it is preceded 28 ms earlier by two `SSL_CERT_NOT_ON_SERVER` failures, and `nego.c`'s handler for that code disables nothing (unlike `SSL_REQUIRED_BY_SERVER`/`HYBRID_REQUIRED_BY_SERVER`), so the ladder steps down. With no server certificate every TLS-bearing rung fails for one reason, leaving **`PROTOCOL_RDP` as the only survivor** — Standard RDP Security, which `connect.rs:577` rejects (`selected.bits() != 0`) six stages before `finalization_step` exists. **So every published observation of this input arrives over a transport justrdp refuses.** That is not *"no server sends it"*: the search was FreeRDP's `paylaod` typo across public GitHub, which cannot see mstsc users, private trackers, or pre-3.x log text — unconfirmed ≠ absent. **Validity condition: this holds only while justrdp refuses `PROTOCOL_RDP`.** Supporting Standard RDP Security reopens #242 by itself. The larger finding #242 produced is not the body check — it is that justrdp has **no ladder at all** and reaches session-active on the Font Map alone. **Settled by #252 (2026-08-25): no ladder, deliberately, and now measured rather than argued.** A capture of the real VM (`JUSTRDP_CONNECT_CAPTURE_FILE`, four activations, connect leg *and* reactivation leg, pinned as `justrdp-pdu/tests/fixtures/connect/finalization-replies.bin`) shows it sends all four in spec order every time — the premise #242 asserted and nothing in the repo could check. ADR-0009 reaches the case from neither side: §1's predicate is *"where a violation is an attack vector"* and no scenario is constructible for a peer that has already completed CredSSP, MCS and licensing; §2's grant is scoped by enumeration to rendering-feature self-inconsistency, which a missing finalization PDU is not. So the record was extended, not the machine — with one exception, the orthogonal half: the **field values** the spec does fix are now checked on both legs (`Synchronize.messageType`, and a server `Control.action` restricted to Cooperate / Granted Control), where justrdp had been the sole outlier against both references. The completeness question stays open on purpose and its home is #252 |
+| **`connect` and `session` live in one crate** — `crates/justrdp/src/connect.rs` and `session.rs` | **IronRDP** splits them into two crates, `ironrdp-connector` and `ironrdp-session` | ADR-0001 + `docs/plan.md` decision 6 (*"pragmatic 3+1"*). The two share one state machine and one capability set, so a crate boundary between them would run *through the middle of a state machine* rather than along a seam. `plat`, 2026-08-31 |
+| **One adapter crate**, `justrdp-tokio` | **IronRDP** ships four — `ironrdp-async`, `ironrdp-tokio`, `ironrdp-blocking`, `ironrdp-futures` | ADR-0001. The adapter is ~1 000 lines and *which runtime* is a host policy, not a layer of ours — the core is runtime-agnostic precisely so a second runtime never needs a second crate here. `plat`, 2026-08-31 |
+| **`justrdp-pdu/src/` is flat** — one file per `[MS-*]` protocol area, 25 of them | **IronRDP** nests by area: `basic_output/`, `gcc/`, `input/`, `rdp/`, `codecs/` | `docs/map/territory/` depends on a **1:1 area↔file correspondence**, and nesting breaks the thing the map is read for. The threshold is already in the tree rule rather than in judgement: nest when an area outgrows one file, which is what `rfx/` already is. `plat`, 2026-08-31 |
+| **Unit tests are inline `#[cfg(test)]`; `crates/*/tests/` holds differential and corpus tests only** | **h2** and **quinn** put ordinary integration tests in a top-level `tests/` (quinn also `src/tests/`); **rustls** keeps a whole `rustls-test` crate | Measured **16/16** and **declared nowhere** until this build — so it is recorded here rather than discovered again. The peers disagree among themselves, so majority answers nothing and this project's own kept rule wins by the tie-breaker's layout row. `plat`, 2026-08-31 |
+
+Add a row when a decision *chooses against* a reference or against a strict spec
+reading — that is cheaper than re-defending it every time a lens finds it.
+
+---
+
+## Split coverage — four slots `unowned`
+
+Run once per build: every entry in thegraph's *"What the build must supply"* is
+checked against its *"What is invariant, what the build decides"* split. Four sit on
+**neither** side. Each is perfectly answerable — which is exactly what let them pass
+unnoticed.
+
+| Slot | Status |
+|---|---|
+| `proof` method per layer, and this project's tautological-proof traps | `pending — needs a thegraph change` |
+| areas already carrying a decision record | `pending — needs a thegraph change` |
+| tracker capability | `pending — needs a thegraph change` |
+| war-story index | `pending — needs a thegraph change` |
+
+All four are unambiguous under the split's **rule** — a repository may answer each
+differently without breaking the method, so the build decides it — and all four are
+absent from its enumerated *"Decided by the build"* list. **The change is to place
+them, never to add them**: the slots already exist, and what is missing is the
+sentence saying who answers them. This is the same shape the split section already
+records against itself for the seams, which were *"named all along"* in the schema
+and missing from the list.
+
+**Their data is filled above regardless.** A marker is not an empty slot, and no run
+should read one as the other.
 
 ---
 
@@ -420,6 +598,7 @@ toolchain-free by design). They live in **`scripts/thegraph/`**, kept distinct f
 | `.claude/agents/thegraph-refuter.md` | `verify` (2nd) | the same material, **opposing stance** in its brief |
 | `.claude/agents/thegraph-sweep.md` | `sweep` | the 6 surfaces and how each is read |
 | `scripts/thegraph/triggers.py` | `verify` inbound guard | the 3 sacred-path groups, matched against the diff · **the empty-diff answer (`2`, not `0`)** |
+| `scripts/thegraph/place.py` | `place`, and `gate` again on the final diff | the tree rule as a path list, matched against the changed paths |
 | `scripts/thegraph/gates.py` | `gate` | the 9 commands, each invoked **bare** |
 | `scripts/thegraph/cluster.py` | `search` | the tracker query by artifact · the 13 record-carrying areas |
 
