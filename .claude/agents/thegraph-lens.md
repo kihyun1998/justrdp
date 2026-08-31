@@ -6,8 +6,8 @@ tools: Bash, Grep, Read, Glob
 
 # thegraph `verify` — gap-hunting lens (justrdp)
 
-**Build stamp**: `thegraph/SKILL.md` `md5:ea2d94a3591f092e76e5ff29dbdbc3ce`
-(2026-08-24). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
+**Build stamp**: `thegraph/SKILL.md` `md5:7c624aedc9521627fc1985d2eae61b0d`
+(2026-08-31). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
 the method — the grade table, the reference-free restatement test, the
 never-drop-a-corpus rule, direction-vs-difference — is the `thegraph` skill. Follow
 it; this file is only justrdp's material.
@@ -48,16 +48,20 @@ disagree but not which one is wrong.
 ## What decides a finding's grade
 
 - **The tie-breaker row for the layer this change sits on** —
-  [`theflow.md` § Tie-breaker](../../docs/agents/theflow.md#tie-breaker--what-wins-when-prior-art-and-justrdps-own-evidence-disagree).
-  Five rows; the authority differs **by layer** (what we emit → the spec; what we
-  accept → the VM then FreeRDP; codec byte-exactness → the oracle with FreeRDP as
-  tie-break; public API shape → this repo's own precedent; performance → our own
-  `--release` measurement). **A layer not in that table has no recorded
-  tie-breaker** — say so; do not borrow a neighbouring row.
+  [`thegraph.md` § Tie-breaker](../../docs/agents/thegraph.md#tie-breaker--what-wins-when-prior-art-and-justrdps-own-evidence-disagree).
+  The authority differs **by layer** (what we emit → the spec; what we accept →
+  the VM then FreeRDP; codec byte-exactness → the owned basis, else the oracle with
+  FreeRDP as tie-break; public API shape → this repo's own precedent; performance →
+  our own `--release` measurement; directory layout → our own measured rule, then
+  the confirmed peers). **A layer not in that table has no recorded tie-breaker** —
+  say so; do not borrow a neighbouring row. No row count is carried here: a count
+  written into an artifact is a copy that rots, and the pointer is authoritative.
 - **The deliberate-divergence list** —
-  [`theflow.md` § Deliberate divergences](../../docs/agents/theflow.md#deliberate-divergences--where-justrdp-does-not-follow-its-prior-art-on-purpose).
-  23 rows. A finding that lands there is `DELIBERATE` **with the citation**, never
-  a defect, however confidently it reads. Check this **before** reporting.
+  [`thegraph.md` § Deliberate divergences](../../docs/agents/thegraph.md#deliberate-divergences--where-justrdp-does-not-follow-its-prior-art-on-purpose).
+  A finding that lands there is `DELIBERATE` **with the citation**, never a defect,
+  however confidently it reads. Check this **before** reporting. The list is
+  co-authored — the project's rows come from the build, a run's `human` calls from
+  the issue — so read it at the pointer rather than from memory.
 - **A summarized source can never yield `CONFIRMED`.** If the spec fetch failed
   and you are working from recollection, the finding carries forward as *needs
   raw-source confirmation*.
