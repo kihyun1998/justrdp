@@ -61,5 +61,17 @@ behaviour as a test rather than recording it as a citable fact.
 
 - **No governing record**, and the cursor is invisible in the decision trail — the
   0/10 measurement above is itself the finding.
+- **Closed in #263: `decode_pointer`'s dimension guard was bounded at the wrong ceiling.**
+  This territory found the class (#151) and held its cleanest instance: the three guards
+  were `checked_mul`s, so they stopped at `usize::MAX`, while `Vec` refuses above
+  `isize::MAX`. `out_len` now narrows through `justrdp_codecs::allocatable`. `decode_pointer(65535, 8500, 1, &[0u8; 69_632_000], &[], ..)` panics with
+  *capacity overflow* on `i686-pc-windows-msvc`, requesting 2_228_190_000 bytes. **The exact
+  mask-length checks do not close it** — at 1 bpp the output is 32x the mask, so 66 MB of
+  `xorMaskData` is enough — which is why "is there a length check above it" was the wrong
+  question. Both parameters are `u16`, so this is
+  [ADR-0012](../../adr/0012-consumption-site-totality.md) §1's shape exactly: not
+  wire-reachable (`decode_fastpath` caps a pointer at 96 pixels), and admitted by the
+  signature anyway — which is why it was fixed rather than filed. The rest of the family:
+  [decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md).
 - Nothing pins the *behavioural* contract on cache eviction: an out-of-range cache
   index has a defined decode result but no recorded intent.

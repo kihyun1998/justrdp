@@ -24,6 +24,17 @@ pub enum PlanarError {
     /// a **32-bit** target (notably **wasm32**, a stated reach goal — ADR-0002 amendment / #100),
     /// where the `usize` params can make `width × height` (or the ×3 BGR output) exceed `u32::MAX`.
     /// Returned instead of a debug panic / release wrap. Sibling of the pointer guard (#151 / #155).
+    ///
+    /// **It covers two ceilings, not one (#263)**: a `checked_mul` stops at `usize::MAX` while
+    /// `Vec` refuses above `isize::MAX`, so the `full_size * 3` reservation had the same 2 GiB
+    /// gap the sibling decoders were measured in. Closed here on the **contract rather than on
+    /// a reproduction**, which is the honest description: two probes on `i686-pc-windows-msvc`
+    /// hit an earlier guard (`TruncatedInput` on the raw path, `InvalidSegment` on the RLE
+    /// path), and reaching the reservation needs three ~720 MB plane allocations to succeed
+    /// first, marginal in a 32-bit address space. `full_size` narrows through
+    /// [`crate::allocatable`] regardless — the family gets one answer whether or not each
+    /// member's band was individually reached. See
+    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
     DimensionsOverflow {
         /// The requested width.
         width: usize,
@@ -81,6 +92,7 @@ pub fn decompress(src: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Pl
     // (#155). Guard it once here; chroma_size ≤ full_size, so it needs no separate check.
     let full_size = width
         .checked_mul(height)
+        .and_then(crate::allocatable)
         .ok_or(PlanarError::DimensionsOverflow { width, height })?;
     let chroma_size = chroma_w * chroma_h;
 
@@ -256,8 +268,12 @@ mod tests {
         // "malformed input is always a typed error, never a panic"; this asserts that contract
         // across the whole input space, not just the hand-picked vectors below. The planar `src`
         // is the unbounded, attacker-controlled blob (header byte + plane data), so it is fully
-        // arbitrary; width/height are bounded because they arrive from fixed u16 `TS_BITMAP_DATA`
-        // header fields, never the stream. Reaching the end without unwinding IS the assertion —
+        // arbitrary; width/height are bounded as a **budget trade**. The old wording — "they
+        // arrive from fixed u16 `TS_BITMAP_DATA` header fields, never the stream" — is retracted
+        // twice over (#263, ADR-0008 amendment 2026-08-31): a header field *is* the stream, and
+        // `decompress` takes `usize`, so its signature carries no `u16` bound at all. Not widened
+        // here: three plane allocations of `width * height` each precede the interesting
+        // arithmetic, so an unbounded arm buys allocation time rather than coverage. Reaching the end without unwinding IS the assertion —
         // proptest fails (and shrinks to a minimal counterexample) on any panic / arithmetic
         // overflow / OOB. This is not hypothetical: FreeRDP's RDP6 planar decoder took an OOB
         // read here (CVE-2024-32458, `planar_skip_plane_rle`).

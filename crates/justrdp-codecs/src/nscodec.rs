@@ -301,6 +301,7 @@ pub fn reconstruct(
     let total = width
         .checked_mul(height)
         .and_then(|v| v.checked_mul(4))
+        .and_then(crate::allocatable)
         .ok_or(NscError::InvalidField {
             field: "dimensions",
             reason: "width * height * 4 overflows usize",

@@ -39,6 +39,20 @@ pub enum PointerError {
     /// `stride × height` product, or the `width × height × 4` output length, exceeds `usize::MAX`
     /// (e.g. width near `u16::MAX` at 32 bpp). On 64-bit these u16-derived products always fit, so
     /// this never occurs there. Returned instead of a debug panic / release wrap-then-OOB.
+    ///
+    /// **It covers two ceilings, not one (#263).** A `checked_mul` stops at `usize::MAX` while
+    /// `Vec` refuses above `isize::MAX`, and in that band [`decode_pointer`] panicked with
+    /// *capacity overflow* instead of returning this — reproduced on `i686-pc-windows-msvc`
+    /// with
+    /// `decode_pointer(65535, 8500, 1, &[0u8; 69_632_000], &[], ..)`, which requests
+    /// 2_228_190_000. **The exact mask-length checks do not close it**: at 1 bpp the output is
+    /// 32x the mask, so 66 MB of `xorMaskData` is enough. Worth stating loudly here because
+    /// this function's dimensions are `u16` — the shape
+    /// [ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §1 is written about,
+    /// where the wire cannot reach the value (`decode_fastpath` caps a pointer at 96 pixels)
+    /// and the signature admits it anyway. `out_len` now narrows through
+    /// [`crate::allocatable`], the family's one answer to that threshold. See
+    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
     DimensionsOverflow {
         /// The shape width.
         width: u16,
@@ -113,6 +127,7 @@ pub fn decode_pointer(
     let out_len = width
         .checked_mul(height)
         .and_then(|n| n.checked_mul(4))
+        .and_then(crate::allocatable)
         .ok_or_else(overflow)?;
 
     if xor_mask.len() != xor_len {
@@ -207,8 +222,14 @@ mod tests {
         // the codecs' shared one: malformed input is always a typed error, never a panic. Both
         // masks are the unbounded, attacker-controlled blobs (their lengths must match the
         // stride × height the header implies, but nothing stops a server from lying), so they are
-        // fully arbitrary; width/height/xor_bpp are bounded because they arrive from fixed u16
-        // `TS_*POINTERATTRIBUTE` header fields. xor_bpp is biased toward the five real depths so
+        // fully arbitrary; width/height/xor_bpp are bounded as a **budget trade**. The old wording
+        // — "they arrive from fixed u16 `TS_*POINTERATTRIBUTE` header fields" — is retracted
+        // (#263, ADR-0008 amendment 2026-08-31): a header field is the stream, and the real range
+        // of a `u16` is 0..=65535. The bound that is genuinely live-path is a different one and
+        // worth naming instead — `decode_fastpath` caps a pointer at 96 pixels. What the narrow
+        // generator cannot reach is recorded on `DimensionsOverflow`: at 1 bpp the output is 32x
+        // the mask, so the exact mask-length gate still admits an over-`isize::MAX` reservation.
+        // xor_bpp is biased toward the five real depths so
         // the per-bpp pixel paths are actually exercised (not just the UnsupportedBpp early-out),
         // with arbitrary values mixed in. The palette is the fixed session default — pointer
         // shapes carry none of their own. Reaching the end without unwinding IS the assertion:

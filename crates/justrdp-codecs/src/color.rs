@@ -45,6 +45,15 @@ pub enum ColorError {
     /// a **32-bit** target (notably **wasm32**, a stated reach goal — ADR-0002 amendment / #100),
     /// where the `usize` params can make `width × bpp × height` or `width × height × 4` exceed
     /// `u32::MAX`. Returned instead of a debug panic / release wrap. Sibling of #151 (#155).
+    ///
+    /// **It covers two ceilings, not one (#263).** A `checked_mul` stops at `usize::MAX` while
+    /// `Vec` refuses above `isize::MAX`, and in that band [`to_rgba`] panicked with *capacity
+    /// overflow* instead of returning this — reproduced on `i686-pc-windows-msvc` with
+    /// `to_rgba(&vec![0u8; 558_000_000], 30_000, 18_600, 8, .., false)`, requesting
+    /// 2_232_000_000. The source-length check bounds the request only by the 4x amplification
+    /// of a 1-byte-per-pixel source. The reserve now narrows through [`crate::allocatable`],
+    /// which is the family's one answer to that threshold. See
+    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
     DimensionsOverflow {
         /// The requested width.
         width: usize,
@@ -164,6 +173,7 @@ pub fn to_rgba(
     let out_cap = width
         .checked_mul(height)
         .and_then(|n| n.checked_mul(4))
+        .and_then(crate::allocatable)
         .ok_or_else(overflow)?;
     let mut out = Vec::with_capacity(out_cap);
     for out_row in 0..height {
@@ -289,6 +299,25 @@ mod tests {
                 width: 100_000,
                 height: 100_000,
             })
+        );
+        // The `isize::MAX` half is **deliberately not asserted here**, and the reason is a
+        // measurement rather than a preference. `out_cap`'s band needs `width * height > 2^29`,
+        // and `src.len() < needed` sits above it — so any input that reaches the reserve carries
+        // at least ~536 MB of source. Reproduced at 30_000 x 18_600 x 8bpp with a real 558 MB
+        // buffer (#263); allocating that inside a 32-bit test process to assert one comparison
+        // is not a trade worth making, and a cheaper input returns `SourceTooShort` instead —
+        // which is what this test would have silently asserted.
+        //
+        // So the threshold itself is pinned once, on `crate::allocatable`, and what stays
+        // untested here is the *wiring*. Said out loud because a chain nobody reddens is exactly
+        // what this file's siblings assumed about themselves until #263 measured them.
+        assert_eq!(
+            to_rgba(&[], 30_000, 18_600, 8, &Palette::default(), false),
+            Err(ColorError::SourceTooShort {
+                needed: 558_000_000,
+                got: 0
+            }),
+            "a short source is refused above the reserve, so the reserve's own ceiling is              unreachable from here"
         );
     }
 

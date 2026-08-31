@@ -65,6 +65,30 @@ pub enum RfxError {
     /// condition in the sibling stage. That the two agree is the requirement, not a coincidence
     /// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3, resolving #233).
     ZeroQuantExponent,
+    /// The destination rectangle's RGBA byte count cannot be materialized on this target.
+    ///
+    /// Two ceilings, one quantity. It **overflows `usize`** where `usize` is 32 bits (`i686`,
+    /// and `wasm32`, a stated reach goal — ADR-0002 amendment / #100): `[MS-RDPEGFX]` 2.2.1.2
+    /// bounds a `RDPGFX_RECT16`'s fields at `u16` and states no maximum, and 2.2.2.1 makes the
+    /// rectangle the bitmap's own dimensions, so a server picks both factors and
+    /// 65535 x 65535 x 4 = 17_179_344_900 exceeds `u32::MAX`. Or it **exceeds `isize::MAX`**,
+    /// the ceiling `Vec` itself enforces — above which it panics with *capacity overflow*
+    /// rather than allocating — which on 32-bit is a 2 GiB band the first ceiling does not
+    /// cover: `40000 x 20000 x 4` is 3_200_000_000, passes `checked_mul`, and panicked.
+    /// Measured, not reasoned about.
+    ///
+    /// Named to match the same condition in the five sibling codecs that carry it — `color`,
+    /// `planar`, `pointer`, `rle`, `nscodec` — one quantity, one answer across a family
+    /// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3). **`clearcodec`
+    /// is deliberately not in that list**: `clearcodec.rs:98-104` records why it has no variant
+    /// of its own and maps the `nscodec` one to `InvalidField` instead. Returned instead of a
+    /// debug panic / release wrap (#263, sibling of #151 / #155).
+    DimensionsOverflow {
+        /// The requested width.
+        width: u16,
+        /// The requested height.
+        height: u16,
+    },
 }
 
 impl core::fmt::Display for RfxError {
@@ -84,6 +108,9 @@ impl core::fmt::Display for RfxError {
                     f,
                     "a band's quantization exponent is 0, which names no shift"
                 )
+            }
+            RfxError::DimensionsOverflow { width, height } => {
+                write!(f, "{width}x{height} pixels overflow usize on this target")
             }
         }
     }
@@ -129,8 +156,39 @@ impl RemoteFx {
         width: u16,
         height: u16,
     ) -> Result<Option<Vec<u8>>, RfxError> {
-        let messages = rfx::decode_all(data)?;
         let (w, h) = (usize::from(width), usize::from(height));
+        // The output buffer is `w * h * 4` bytes and both factors are `u16`s a server chose:
+        // `[MS-RDPEGFX]` 2.2.1.2 bounds a `RDPGFX_RECT16`'s fields at `u16` and nothing else, and
+        // 2.2.2.1 makes the rectangle the bitmap's own dimensions. 65535 x 65535 x 4 is
+        // 17_179_344_900, which wraps a 32-bit `usize`
+        // ([the invariant](../../../../docs/map/invariant/decoder-dimension-overflow-32bit.md)).
+        // Refused once, here, before a single block is walked — a rectangle whose pixels cannot
+        // be addressed is not decodable at all, so there is nothing to be tolerant *of*.
+        //
+        // What this does **not** do is bound the *magnitude* below `isize::MAX`. On 64-bit the
+        // same product fits and 93 bytes of tileset buy a 16 GiB allocation (measured, #263);
+        // that half is **bounded** — not closed — by `justrdp::egfx` refusing a rectangle larger
+        // than any admissible surface before it reaches any codec. A magnitude comparison here
+        // would reach it too, so the reason it is not here is ownership rather than visibility:
+        // the number that would make such a cap principled is `MAX_TOTAL_SURFACE_BYTES`, which
+        // belongs to the surface model and not to a codec. Keeping the two separate is
+        // deliberate — this is the totality
+        // [ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1 requires of a
+        // `pub fn`'s own signature, that is reachability.
+        let out_len = w
+            .checked_mul(h)
+            .and_then(|n| n.checked_mul(4))
+            // `isize::MAX`, not `usize::MAX` — see `crate::allocatable`, which is the family's
+            // one answer to that threshold. Measured on i686: `40000 x 20000 x 4` is
+            // 3_200_000_000, passes `checked_mul`, and then panics with *capacity overflow*.
+            .and_then(crate::allocatable)
+            .ok_or(RfxError::DimensionsOverflow { width, height })?;
+        // Before the parse, not after it. The sibling codecs check their dimensions first
+        // (`planar.rs`, `nscodec.rs`) and the reason is measurable here: behind `decode_all`,
+        // this arm is reachable only by a payload that parses as a TILESET, which random bytes
+        // never are — so the no-panic property below could not drive it at all. Measured both
+        // ways; see that property's note.
+        let messages = rfx::decode_all(data)?;
 
         let mut out: Option<Vec<u8>> = None;
         // The clip region in force for the current frame: `None` until a TS_RFX_REGION
@@ -171,7 +229,7 @@ impl RemoteFx {
                     if self.video_mode {
                         return Err(RfxError::VideoMode);
                     }
-                    let out = out.get_or_insert_with(|| opaque_black(w, h));
+                    let out = out.get_or_insert_with(|| opaque_black(out_len));
                     for tile in &tileset.tiles {
                         decode_tile(
                             tile,
@@ -212,8 +270,10 @@ impl Default for TilePlanes {
     }
 }
 
-fn opaque_black(w: usize, h: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h * 4];
+/// Takes the byte count rather than the dimensions, so the caller's `checked_mul` is the only
+/// place the product is formed and this function has no arithmetic left to get wrong.
+fn opaque_black(len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
     for px in out.as_chunks_mut::<4>().0 {
         px[3] = 255;
     }
@@ -301,16 +361,47 @@ mod tests {
         // malformed input is always a typed error, never a panic — and `decode_to_rgba` is the
         // top-level WTS1 entry, so this one property covers the whole inverse pipeline (TS_RFX
         // block parse → RLGR entropy → LL3 delta → dequant → inverse DWT → ICT) from raw bytes.
-        // `data` is the unbounded, attacker-controlled blob, so it is fully arbitrary; width/height
-        // are bounded because they arrive from fixed u16 destination-rect fields, never the stream.
+        // `data` is the unbounded, attacker-controlled blob, so it is fully arbitrary.
+        //
+        // **The dimension arms used to read `0u16..=128`, on the rationale that width/height
+        // "arrive from fixed u16 destination-rect fields, never the stream". That rationale was
+        // false and it hid #263.** A `RDPGFX_RECT16` *is* a stream field — `[MS-RDPEGFX]` 2.2.1.2
+        // bounds it at `u16` and states no maximum — so being a `u16` bounds these at 65535, not
+        // at 128, and the overflow they are now expected to refuse needs roughly 32768. A
+        // generator narrowed to a range no parser enforces asserts nothing about the reject arm,
+        // which is #211's `nscodec` finding on the other axis (there: narrowed to a range the
+        // parser *did* enforce). Weighted rather than replaced, so the ordinary small-rectangle
+        // path stays the common case and the reject arm is still driven — the shape #230
+        // settled for `pointer`.
+        //
+        // Measured rather than asserted, with the dimension guard removed:
+        //
+        // | generator | i686 |
+        // |---|---|
+        // | widened, as below | **RED** |
+        // | the old `0..=128` | green |
+        //
+        // **And the widening only earns that because the guard was moved ahead of
+        // `decode_all`.** Behind the parse it was green either way: random bytes never form a
+        // TILESET, so no generator could drive it. Two changes were needed and the measurement
+        // is what separated them — a widened generator alone would have been machinery that
+        // reads as coverage.
+        //
+        // Residue, stated rather than left implicit: on a **64-bit** target the widened arms
+        // refuse nothing, because 65535 x 65535 x 4 fits. A case that reached a valid TILESET
+        // there would allocate 16 GiB rather than fail — unreachable by chance for the same
+        // reason as above, and bounded a layer out in `justrdp::egfx`, not here. What this
+        // property still cannot reach on any target is `opaque_black` itself; the directed test
+        // above is what covers that.
+        //
         // A fresh decoder per case keeps each run independent of the persisted video-mode verdict.
         // Reaching the end without unwinding IS the assertion — proptest fails (and shrinks to a
         // minimal counterexample) on any panic / arithmetic overflow / OOB.
         #![proptest_config(ProptestConfig::with_cases(2048))]
         #[test]
         fn decode_to_rgba_never_panics_on_arbitrary_input(
-            width in 0u16..=128,
-            height in 0u16..=128,
+            width in prop_oneof![6 => 0u16..=128, 2 => 60_000u16..=u16::MAX, 1 => any::<u16>()],
+            height in prop_oneof![6 => 0u16..=128, 2 => 60_000u16..=u16::MAX, 1 => any::<u16>()],
             data in proptest::collection::vec(any::<u8>(), 0..=512),
         ) {
             let _ = RemoteFx::new().decode_to_rgba(&data, width, height);
@@ -377,6 +468,54 @@ mod tests {
         }
         push_block(&mut data, rfx::BLOCK_TILESET, Some(0), &ts);
         data
+    }
+
+    /// A `destRect` is bounded by `u16` and by nothing else — `[MS-RDPEGFX]` 2.2.1.2 states no
+    /// maximum and no non-zero requirement — and 2.2.2.1 makes it *"the dimensions of the bitmap
+    /// data encapsulated in the bitmapData field"*, so it sizes this function's output directly.
+    /// A **93-byte** tileset therefore declares 65535 x 65535 x 4 = 17_179_344_900 bytes of it.
+    /// Both targets were measured before this guard existed (#263), by a throwaway probe calling
+    /// this function with that payload:
+    ///
+    /// | target | before |
+    /// |---|---|
+    /// | `i686-pc-windows-msvc` | panic, *attempt to multiply with overflow*, at `opaque_black` |
+    /// | `x86_64-pc-windows-msvc` | `Ok(Some(17_179_344_900))` — 16 GiB allocated, 18.9 s, no error |
+    ///
+    /// Target-gated like its four siblings (`color`, `planar`, `pointer`, `rle`): on 64-bit the
+    /// product does not overflow, so `checked_mul` has nothing to refuse. **That is the finding
+    /// rather than a limitation of the test** — the 64-bit row is closed one layer out, by
+    /// `justrdp::egfx` bounding the rectangle itself, because no arithmetic guard here can see a
+    /// multiplication that fits. What this half owns is the obligation
+    /// [ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1 puts on a `pub fn`
+    /// whose own signature admits the value, whatever its caller happens to guarantee.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn a_rect_whose_rgba_cannot_be_addressed_is_a_typed_error_not_a_panic() {
+        let frame = stream(&[(0, 0, 64, 64)], &[(0, 0, vec![0x00; 8])]);
+        assert_eq!(
+            RemoteFx::new().decode_to_rgba(&frame, u16::MAX, u16::MAX),
+            Err(RfxError::DimensionsOverflow {
+                width: u16::MAX,
+                height: u16::MAX,
+            })
+        );
+        // The second ceiling, and the one a `checked_mul` alone does not reach: 40000 x 20000 x 4
+        // is 3_200_000_000 — under `usize::MAX` on this target, over `isize::MAX`, and therefore
+        // a *capacity overflow* panic inside `Vec` rather than an allocation. Measured that way
+        // before the `.filter`. The first version of this test asserted nothing here and said
+        // the boundary "would fail for a reason that has nothing to do with the guard"; the
+        // reason had everything to do with the guard, which was written against the wrong
+        // ceiling.
+        assert_eq!(
+            RemoteFx::new().decode_to_rgba(&frame, 40_000, 20_000),
+            Err(RfxError::DimensionsOverflow {
+                width: 40_000,
+                height: 20_000,
+            })
+        );
+        // And it must not over-refuse.
+        assert!(RemoteFx::new().decode_to_rgba(&frame, 64, 64).is_ok());
     }
 
     #[test]
