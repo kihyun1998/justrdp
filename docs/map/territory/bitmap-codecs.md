@@ -153,6 +153,37 @@ attacker-controlled bytes in the repo.
   bit down**. Everything else in this territory is bounded by construction (`clearcodec`'s
   region walks and `pointer::decode_pointer` are `usize::from(<u16>)`) or guarded above the
   loop.
+- **A `checked_mul` is not a bound, because `Vec`'s ceiling is `isize::MAX` and not
+  `usize::MAX`** (#263). Every dimension guard in this territory — `color`, `planar`,
+  `pointer`, `rle`, `nscodec`, `clearcodec` — was written as a `checked_mul` on the
+  strength of the invariant note's own sentence, and that leaves a **2 GiB band** on a
+  32-bit target where the guard returns `Some` and the allocation panics with *capacity
+  overflow* inside `raw_vec`. Measured on `i686-pc-windows-msvc`: `40000 x 20000 x 4` is
+  3_200_000_000. **Every guard in this territory now narrows through
+  `justrdp_codecs::allocatable`**, one crate-private helper rather than six comparisons,
+  because the largest buffer any of them may ask for is one quantity and ADR-0012 §3 asks
+  a family for one answer. Four sites were reproduced in the band before it existed —
+  `rle::decompress` (8 bytes of source requested 2_400_000_000), `pointer::decode_pointer`
+  (66 MB of 1-bpp mask requested 2_228_190_000, from two `u16` parameters),
+  `color::to_rgba` (558 MB of 8-bpp source requested 2_232_000_000) and `rfx`, which was
+  reached *with a `checked_mul` already in place*. What sorts them is the **amplification
+  factor**, not whether a length check exists: a gate against a buffer the caller holds
+  bounds the request only by how much the decoder expands, and expanding is what these
+  are for. The per-site adjudication is the table in
+  [decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md).
+  The rule the family now follows: **the guard's threshold is the one the operation that
+  can fail actually enforces**, and the safe sites here all satisfy it the same way — by
+  measuring against a buffer that already exists rather than against a type's maximum.
+- **The rectangle a WireToSurface1 payload declares is not this territory's to bound, and
+  that is a boundary rather than an omission** (#263). `rfx::decode_to_rgba` refuses a
+  `destRect` whose RGBA cannot be *addressed* — that is totality for its own `u16`
+  signature, [ADR-0012](../../adr/0012-consumption-site-totality.md) §1 — and does not
+  refuse one that is merely enormous, because the number that would make such a cap
+  principled (`MAX_TOTAL_SURFACE_BYTES`) belongs to the surface model in
+  [EGFX](egfx-graphics-pipeline.md). On 64-bit the arithmetic guard refuses nothing at
+  all: 65535 x 65535 x 4 fits, and a 93-byte tileset returned `Ok` after allocating
+  16 GiB in 18.9 s. Two halves, two owners, stated so neither is read as covering the
+  other.
 - **A no-panic property whose generator is bounded to the parser's range asserts the
   parser, not the function.** `nscodec`'s `reconstruct_never_panics_on_arbitrary_input`
   documented itself as covering *"any colour-loss level"* and generated `1u8..=7`.
@@ -276,7 +307,11 @@ as citations.
 ## Blast radius
 
 - [EGFX graphics pipeline](egfx-graphics-pipeline.md) — the consumer of most codec
-  output, and the home of the two decoders still on bootstrap wrappers.
+  output. It used to say *"and the home of the two decoders still on bootstrap wrappers"*;
+  there are none since #172 and #189. What the edge actually carries now is a bound: the
+  `destRect` that layer admits is what sizes every expanding codec's output here, so its
+  `MAX_TOTAL_SURFACE_BYTES` is the magnitude ceiling none of these decoders can write for
+  itself (#263).
 - [Framebuffer & frame delivery](framebuffer-frame-delivery.md) — stride, colour
   order and the blit target.
 - [Pointer & cursor](pointer-cursor.md) — `decode_pointer` shares this territory's
@@ -344,6 +379,24 @@ as citations.
   widened past `0..=32`. Derivation ④ of
   [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) is the census
   that finds the next one.
+- **Closed in #263: four decoders carried the `usize::MAX` threshold in a band that was reproduced.**
+  `decompress(&[0u8; 8], 40_000, 20_000, 24)` on `i686-pc-windows-msvc` panics with
+  *capacity overflow*: `dst` is `vec![0; total]`, sized from the dimensions with no
+  source-length check above it, so 8 bytes of input request 2_400_000_000. Two more were
+  reproduced the same way: `pointer::decode_pointer(65535, 8500, 1, &[0u8; 69_632_000],
+  &[], ..)` requests 2_228_190_000 — and **its dimensions are `u16`**, so it is the
+  cleanest instance of ADR-0012 §1 in the crate — and `to_rgba(&vec![0u8; 558_000_000],
+  30_000, 18_600, 8, .., false)` requested 2_232_000_000. **The exact mask-length gate in
+  `pointer` is why "there is a length check above it" was the wrong sorting question**: it
+  bounds the request by the 32x amplification of 1-bpp, not by the allocator. None was
+  wire-reachable — `apply_bitmap` bounds a slow-path rectangle to the negotiated desktop
+  and `decode_fastpath` caps a pointer at 96 pixels — so all of them sat at the priority
+  ADR-0012 §1 gives that class, and at its contract, which is why they were fixed rather
+  than filed. All now narrow through `justrdp_codecs::allocatable`; `planar::decompress`
+  carried the same threshold behind preconditions that outrun a 32-bit address space and
+  is closed on the contract rather than on a reproduction. The adjudication per site, and
+  what is and is not asserted, is the table in
+  [decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md).
 - H.264 (epic #21) has neither an implementation nor an oracle.
 - The fuzz lane is nightly-only, so a newly added target is unguarded on the day it
   lands (ADR-0008).

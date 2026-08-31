@@ -34,10 +34,33 @@ acknowledge frames. It is server→client only, and it is reachable only if
   Deactivation–Reactivation, which is stated in the session code and matters here.
 - **The EGFX channel is a DVC**, so its framing is the dynamic-channel layer's
   problem, not this territory's.
+- **A `destRect` is the bitmap's dimensions, not just where it lands** — `[MS-RDPEGFX]`
+  2.2.2.1 says it specifies *"the dimensions (width and height) of the bitmap data
+  encapsulated in the bitmapData field"*, and 2.2.1.2 bounds its four `RDPGFX_RECT16`
+  fields at `u16` and states nothing else — no maximum, no non-zero requirement, no
+  ordering rule. So for every codec that **expands** its input, the rectangle alone
+  decides how much memory the decode allocates, and a server picks it. 65535 x 65535 x 4
+  is 17_179_344_900 bytes, and #263 measured 93 bytes of TS_RFX buying exactly that.
+- **This territory owns the *magnitude* bound for the whole codec family, because it is
+  the only one holding a defensible number.** `MAX_TOTAL_SURFACE_BYTES` (256 MiB) is
+  *derived*, not picked: `CREATE_SURFACE` refuses when `total_surface_bytes() +
+  Surface::bytes(w, h)` passes it, so no single admissible surface exceeds it, and a
+  `destRect` is in surface coordinates — a rectangle whose RGBA is larger than every
+  surface that can exist names a bitmap nothing could hold. A codec cannot write this
+  bound: an *arithmetic* guard there closes only the 32-bit half, and the number that
+  would make a magnitude cap principled belongs to the surface model (#263).
+- **The bound is deliberately *not* the destination surface's own dimensions**, which is
+  tighter and is what FreeRDP does (`is_within_surface`, `gdi/gfx.c:386`, refusing before
+  its `1ull * bpp * w * h` at `:390`; `ironrdp-egfx` checks the same condition and only
+  `warn!`s). A partially off-surface rectangle is clipped by `Surface::blit` today, and
+  ADR-0009 says not to trade a tolerance we already have for a bound the spec never asked
+  for — recorded with the honest caveat that no capture here has ever shown a real server
+  sending an off-surface `destRect`, so the tolerance being kept is unobserved too.
 
 ## Code
 
-- `justrdp/src/egfx.rs` — `Surface`, `CachedBitmap` (`mapped`, `dirty`)
+- `justrdp/src/egfx.rs` — `GraphicsProcessor`, `Surface`, `CachedBitmap` (`mapped`,
+  `dirty`), `MAX_SURFACE_DIM`, `MAX_TOTAL_SURFACE_BYTES`
 - `justrdp-pdu/src/egfx.rs` — `EgfxPdu`, `Rect16`, `Point16`, `decode_all`,
   `encode_caps_advertise`, `encode_frame_acknowledge`, `wrap_uncompressed`
 - `justrdp-codecs/src/zgfx.rs` — `Zgfx`, `ZgfxError`, `History`, `BitReader`,
@@ -68,7 +91,11 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   — the surface→framebuffer blit is where the last extract copy was removed (#163).
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md)
 - [Decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md)
-  — surface allocation is `width × height × 4`.
+  — surface allocation is `width × height × 4`, and since #263 so is a
+  WireToSurface1 `destRect`. This territory carries the note's *magnitude* half: the
+  32-bit `checked_mul` closes the target that already failed loudly, and only a bound on
+  the rectangle reaches the 64-bit one, where the product fits and the allocation
+  succeeds.
 - [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
   — the Progressive quality ladder only appears if the client asks for a slow link.
 - [A later stage can hide an earlier defect](../invariant/a-later-stage-can-hide-an-earlier-defect.md)
@@ -76,7 +103,11 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
 ## Blast radius
 
 - [Bitmap codecs](bitmap-codecs.md) — wire-to-surface payloads are codec streams;
-  the Progressive rewrite moves work across this boundary.
+  the Progressive rewrite moves work across this boundary. **The edge also runs the other
+  way, which #263 is what made visible**: the `destRect` bound here is what every codec
+  arm's allocation is sized under, so a magnitude hazard in a codec can be closed at this
+  layer and a change to `MAX_TOTAL_SURFACE_BYTES` moves what every one of them may be
+  asked to decode.
 - [Framebuffer & frame delivery](framebuffer-frame-delivery.md) — the blit target.
 - [Virtual channels](virtual-channels.md) — the EGFX channel's framing, chunking and
   lifecycle.
@@ -86,6 +117,20 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   commands and frame-ack are capability-gated.
 
 ## Known holes / open
+
+- **An inverted `destRect` is silently an empty one, and both references refuse it.**
+  `Rect16::width()` is `right.saturating_sub(left)`, so `right < left` yields extent 0 and
+  (since #262) `Ok(Vec::new())` — nothing painted, no error. FreeRDP returns
+  `ERROR_INVALID_DATA` for it (`channels/rdpgfx/client/rdpgfx_main.c`, checked on the recv
+  path before anything else) and `ironrdp-egfx` returns `Err` (`client.rs`, where the
+  *ordering* check is its one hard error and the surface-bounds check is only a `warn!`).
+  `[MS-RDPEGFX]` 2.2.1.2 states no ordering requirement, so tolerating it is spec-legal —
+  but it is a divergence from **both** references with no row recording it, and #262's row
+  covers only `right == left`, which is a different case: that one is a legal empty
+  rectangle, this one is malformed. Cost of tolerating it is currently zero, which is why
+  #263 left it alone rather than filing it. **A `## Deliberate divergences` row is owed**;
+  that table is owned by [`docs/agents/thegraph.md`](../../agents/thegraph.md) and only a
+  `/grill-the-graph` run may write it, so it is recorded here in the meantime.
 
 - **Both decoders are self-owned.** zgfx crossed in #189 and epic #158 (slices #167–#172)
   closed the Progressive half: the self-owned
@@ -116,6 +161,15 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   [capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md),
   with no advertised flag to change — a server sends multipart only when a message exceeds
   65535 bytes, and this one's largest was 10 680.
+- **The off-surface `destRect` tolerance is not observable, which ADR-0009 §3(b) requires**
+  (found sweeping #263). `Surface::blit` clips a rectangle that runs past the surface
+  silently — no `tracing` record on the clip path — and #263's bound is argued *on the
+  strength of that tolerance being kept* (the alternative, FreeRDP's `is_within_surface`,
+  refuses). So the record the posture relies on to justify keeping it is a record nobody
+  emits: *"a tolerance you cannot see is indistinguishable from a bug"* is §3(b)'s own
+  sentence. Not an ADR-0009 amendment — the rule is right and the code does not follow it —
+  and worth a `rdp_egfx` warn naming declared-versus-clipped, which would also be the first
+  evidence in this repo about whether a real server ever sends one.
 - H.264 / AVC420 / AVC444 (epic #21) is absent — no oracle exists for it either
   (ADR-0002's amendment says so explicitly).
 - Surface-to-surface and surface-to-cache commands are implemented against one

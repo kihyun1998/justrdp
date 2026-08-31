@@ -939,8 +939,13 @@ mod tests {
         // ADR-0008 / issue #97 — the no-panic robustness property. `ClearError`'s contract is the
         // same as the other codecs': malformed input is always a typed error, never a panic. The
         // ClearCodec `data` is the unbounded, attacker-controlled blob (flags + glyph/band/subcodec
-        // structure, cache indices), so it is fully arbitrary; width/height are bounded because they
-        // arrive from fixed u16 EGFX wire fields, never the stream. A fresh decoder per case keeps
+        // structure, cache indices), so it is fully arbitrary; width/height are bounded as a
+        // **budget trade**. The old wording — "they arrive from fixed u16 EGFX wire fields, never
+        // the stream" — is a contradiction and is retracted (#263, ADR-0008 amendment
+        // 2026-08-31): these are a WireToSurface1 `destRect`, which `[MS-RDPEGFX]` 2.2.1.2 bounds
+        // at `u16` with no maximum, so the real range is 0..=65535. What keeps the band closed
+        // here is a length gate rather than the generator — every ClearCodec allocation is sized
+        // against `bitmap.len()`. A fresh decoder per case keeps
         // each run independent of cache state. Reaching the end without unwinding IS the assertion —
         // proptest fails (and shrinks to a minimal counterexample) on any panic / arithmetic
         // overflow / OOB — the class that produced repeated ClearCodec OOB CVEs in FreeRDP

@@ -14,6 +14,40 @@
   and over-claims about the coverage. What actually bounds the class is neither lane: every job
   in all five workflows now carries `timeout-minutes`, where none did before and GitHub's
   360-minute default applied. See the corrected Consequences bullet below.
+- Amended: 2026-08-31 (#263) — **the Strategy design rule's worked example is false, and it
+  propagated verbatim to ten artifacts before anything measured it.** The rule says a wire
+  header field is *"bounded in the generator to its **real range**"*, which is right; the
+  example then bounds `width`/`height` on the ground that *"leaving them unbounded would
+  manufacture OOM/overflow 'failures' that no real server could trigger"*, and **that clause is
+  the one that failed**. A server picks a `RDPGFX_RECT16` freely — `[MS-RDPEGFX]` 2.2.1.2
+  bounds it at `u16` and states no maximum, 2.2.2.1 makes it the bitmap's own dimensions — so
+  65535 is the real range, the resulting `65535 × 65535 × 4` is 17_179_344_900, and the failure
+  it produces is a **live defect**, not a test artifact: measured, a 93-byte tileset panicked on
+  `i686-pc-windows-msvc` and allocated 16 GiB on `x86_64` in 18.9 s.
+
+  Two distinct errors travelled together, and separating them is the point of recording this.
+  **(a) "Real range" was read as "a comfortable number."** Every artifact derived from this
+  example bounds a `u16` field at `u8` or `0..=128`, which is not the field's range by three
+  orders of magnitude. **(b) Several copies added *"never the stream"*, which is a
+  contradiction** — a `TS_BITMAP_DATA` header field, an EGFX wire field and a
+  `TS_*POINTERATTRIBUTE` header field *are* the stream. Nobody re-read either clause for two
+  years of artifacts; #263's proptest was green over a live 32-bit overflow because of it.
+
+  **So the rule extends rather than moves:** bound a generator to the field's **declared type**,
+  and where a smaller bound is kept, keep it *as a stated budget trade* (fuzzer bytes, proptest
+  runtime) with a weighted arm at the full type range so the reject branch stays driven — the
+  shape #230 settled for `pointer` and #263 applied to `rfx`. That makes three recorded ways a
+  generator can make a green mean nothing, and they are different bugs: **#211** bounded to what
+  the parser *does* enforce (asserts the parser), **#230** too wide to satisfy the parser
+  (asserts the dispatch), **#263** bounded below what *anything* enforces, justified by an
+  enforcement that does not exist. The invariant note already read the rule the corrected way
+  (*"a `u16` wire field stays a `u16`"*,
+  [untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md), #211); this
+  record's own text was the outlier and is what the artifacts copied. **Widening a generator is
+  not automatically the fix**: measured on `rfx`, widening alone stayed green because the
+  arithmetic sat behind a parse random bytes never satisfy, and it only went red once the guard
+  moved in front of that gate. And a generator is not widened where the lane cannot observe the
+  arm — `fuzz.yml` runs on `ubuntu-latest`, where none of these products overflow.
 - Date: 2026-06-18
 
 ## Context
@@ -41,6 +75,18 @@ Two properties:
 - **Round-trip.** Where an encoder exists for the type, `decode(encode(x)) == x` over generated `x`. (Not all decoders have an encoder — e.g. the RLE decoder ships no compressor — so this property applies only where the inverse exists. It does **not** apply to lossy codecs, per ADR-0007.)
 
 **Strategy design rule (threat-model-faithful generation).** A field that arrives from a fixed-size wire header is bounded in the generator to its real range; only the attacker-controlled, variable-length blob is left fully arbitrary. Example (RLE): the compressed stream is generated as arbitrary bytes, but `width`/`height` are bounded because they come from fixed `u16` `TS_BITMAP_DATA` fields — leaving them unbounded would manufacture OOM/overflow "failures" that no real server could trigger, i.e. test artifacts rather than defects.
+
+**Extended 2026-08-31 (#263) — "its real range" is the field's declared type, and the example
+above got its own justification wrong.** A `u16` wire field's real range is `0..=65535`, so a
+generator bounded at `u8` or `0..=128` is **not** threat-model-faithful; it is a budget trade,
+and it must be written as one. The example's *"no real server could trigger"* is false for any
+field the spec leaves unconstrained within its type: `[MS-RDPEGFX]` 2.2.1.2 lets a server pick
+65535 for both axes of a `RDPGFX_RECT16`, and doing so is a live defect rather than a test
+artifact (#263, measured on two targets). Where a smaller bound is kept for budget, keep a
+weighted arm at the full type range so the reject branch stays driven; where the *lane* cannot
+observe the arm (the fuzz lane is 64-bit, so a 32-bit overflow cannot fire there), say that
+instead of widening. See the 2026-08-31 amendment above for the three failure modes this rule
+now has to distinguish.
 
 ### 2. Coverage-guided fuzzing (`cargo-fuzz` / libFuzzer) — CI lane only
 

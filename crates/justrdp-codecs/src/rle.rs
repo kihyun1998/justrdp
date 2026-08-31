@@ -26,6 +26,17 @@ pub enum RleError {
     /// where a large `width × height` product (the params are `usize`, so a caller can exceed
     /// `u32::MAX` without either dim being near it) wraps. Returned instead of a debug panic /
     /// release wrap. Sibling of the pointer guard (#151); this decoder is #155.
+    ///
+    /// **It covers two ceilings, not one (#263).** A `checked_mul` stops at `usize::MAX` while
+    /// `Vec` refuses above `isize::MAX`, and in that 2 GiB band [`decompress`] panicked with
+    /// *capacity overflow* instead of returning this — reproduced on `i686-pc-windows-msvc`
+    /// with `decompress(&[0u8; 8], 40_000, 20_000, 24)`, where **8 bytes** of source requested
+    /// 2_400_000_000, because `dst` is sized from the dimensions with no source-length check
+    /// above it. **The cheapest instance in the family, which is why this is the site whose
+    /// wiring is asserted end-to-end**; the threshold itself is pinned once on
+    /// [`crate::allocatable`], through which every guard in the family now narrows. Per-site
+    /// state, and what is deliberately not asserted, in
+    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
     DimensionsOverflow {
         /// The requested width.
         width: usize,
@@ -115,7 +126,10 @@ pub fn decompress(
     // 32-bit target (#155). Check before allocating rather than panic (debug) / wrap-then-OOB.
     let overflow = || RleError::DimensionsOverflow { width, height };
     let row_bytes = width.checked_mul(pixel_size).ok_or_else(overflow)?;
-    let total = row_bytes.checked_mul(height).ok_or_else(overflow)?;
+    let total = row_bytes
+        .checked_mul(height)
+        .and_then(crate::allocatable)
+        .ok_or_else(overflow)?;
     let mut decoder = Decoder {
         src,
         src_pos: 0,
@@ -401,6 +415,20 @@ mod tests {
                 height: 100_000,
             })
         );
+        // The second ceiling, and the one a `checked_mul` alone does not reach: `Vec` refuses
+        // above `isize::MAX`, not above `usize::MAX`, so this request passes the multiply and
+        // then panics with *capacity overflow*. Reproduced before `crate::allocatable` existed
+        // (#263); the case below is the one that was measured.
+        // **8 bytes** of source requested 2_400_000_000 — the widest amplification measured
+        // in this family, because `dst` is sized from the dimensions with no source-length check
+        // above it.
+        assert_eq!(
+            decompress(&[0u8; 8], 40_000, 20_000, 24),
+            Err(RleError::DimensionsOverflow {
+                width: 40_000,
+                height: 20_000,
+            })
+        );
     }
 
     proptest! {
@@ -408,8 +436,15 @@ mod tests {
         // "malformed input is always a typed error, never a panic"; this asserts that contract
         // across the whole input space, not just the hand-picked vectors below. The compressed
         // `src` is the unbounded, attacker-controlled blob, so it is fully arbitrary; width/height
-        // are bounded because they arrive from fixed u16 `TS_BITMAP_DATA` header fields, never the
-        // stream. bpp is biased toward the four real interleaved-RLE depths so decode paths are
+        // are bounded as a **budget trade**, not a threat-model claim. The old wording — "they
+        // arrive from fixed u16 `TS_BITMAP_DATA` header fields, never the stream" — is retracted
+        // twice over (#263, ADR-0008 amendment 2026-08-31): a header field *is* the stream, and
+        // this function's parameters are `usize`, so nothing on the wire bounds its signature.
+        // Not widened here, and the reason is stated rather than assumed: `decompress` allocates
+        // `width * pixel_size * height` with no source-length gate, so an unbounded arm would
+        // trade this property's runtime for allocations rather than for coverage — see the
+        // `DimensionsOverflow` doc, which records the `isize::MAX` band this leaves open. bpp is
+        // biased toward the four real interleaved-RLE depths so decode paths are
         // actually exercised (not just the UnsupportedBitsPerPixel early-out), with arbitrary
         // values mixed in. Reaching the end without unwinding IS the assertion — proptest fails
         // (and shrinks to a minimal counterexample) on any panic / arithmetic overflow / OOB.

@@ -255,6 +255,49 @@ that trusts its server too much) rather than as memory safety.
     [decoder dimension overflow on 32-bit](decoder-dimension-overflow-32bit.md), whose *Where it
     will recur* scopes itself to **allocation sizing** (`rg 'usize::from|as usize' … | rg '\*'`).
     A loop bound is not an allocation size, and this defect allocates nothing.
+- **#263 — the census subtracted a member as covered, and the covering property could not
+  reach the arm.** `justrdp_codecs::rfx::RemoteFx::decode_to_rgba` is a derivation ③ member
+  (`pub fn`, `width: u16`, `height: u16`) and the subtract command
+  (`rg -n 'fn [a-z_0-9]+_never_panics'`) returns
+  `decode_to_rgba_never_panics_on_arbitrary_input` beside it, so the census reads it as
+  **done**. It was green over a `w * h * 4` that panicked on `i686` at a maximal
+  destination rectangle, because its dimension arms generated `0u16..=128`. So the
+  subtract half of ③ has the same defect as the two lists further down: it answers *"is
+  there a property named after this function"*, and the question is *"can that property's
+  generators reach the arithmetic"*. **A covered member is a stronger hiding place than an
+  uncovered one**, because the census reports it as work already done.
+
+  Three things about it, each measured:
+  - **The generator's stated rationale was false about the wire, which is a third variant
+    of the #211/#230 pair rather than a repeat of either.** It read *"width/height are
+    bounded because they arrive from fixed u16 destination-rect fields, never the
+    stream"*. A `RDPGFX_RECT16` **is** a stream field — `[MS-RDPEGFX]` 2.2.1.2 bounds it at
+    `u16` and states no maximum — so being a `u16` bounds it at 65535 and nothing bounds it
+    at 128. #211's generator was narrowed to a range the parser **did** enforce; this one
+    was narrowed to a range **nothing** enforces, on a sentence nobody re-read. The reject
+    arm it now has to drive needs roughly 32768.
+  - **Widening the generator earned nothing until the guard moved, and that is #230's
+    exact-match-gate rule reaching its fifth instance.** With the guard removed: widened
+    generator behind `rfx::decode_all` → **green**; the same generator with the guard
+    ahead of the parse → **RED**; old `0..=128` generator, guard ahead of the parse →
+    **green**. Random bytes never form a TS_RFX TILESET, so the block magic is the
+    exact-match gate and the arithmetic sat behind it. The resolution here is the one
+    #230 did not use — instead of generating the shape, **put the dimension refusal in
+    front of the gate**, which is where it belongs anyway (a rectangle whose pixels cannot
+    be addressed is not decodable at all, so there is nothing to parse first).
+  - **On 64-bit the widened arms refuse nothing**, because 65535 x 65535 x 4 fits. The
+    fuzz lane is x86-64, so the reject arm cannot fire there either; that half is proved
+    by a target-gated unit test on `i686-pc-windows-msvc` and bounded a layer out in
+    `justrdp::egfx`.
+
+  **Deliberately not recorded here:** the arithmetic rule this issue also corrected — that
+  a `checked_mul` against `usize::MAX` is not a bound, because `Vec` refuses at
+  `isize::MAX` — and the widening of the *allocation-sizing* derivation that could not see
+  the site. Both belong to
+  [decoder dimension overflow on 32-bit](decoder-dimension-overflow-32bit.md), and this
+  note records only the half about what a property can observe. **No row is added to
+  derivation ④'s table either**: ④ adjudicates loop trip counts, and this defect allocates
+  rather than loops.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 

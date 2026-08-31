@@ -60,6 +60,13 @@ struct Surface {
 }
 
 impl Surface {
+    /// Total by construction, and said here because
+    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md) requires
+    /// a site that satisfies it that way to say so: every caller is downstream of
+    /// `CREATE_SURFACE`'s `> MAX_SURFACE_DIM` refusal, so both factors are at most 16384 and the
+    /// product is at most 1 GiB, which fits a 32-bit `usize`. The note's derivation *does* return
+    /// this line, so without this comment a reader running it lands on a hit with nothing to
+    /// adjudicate against.
     fn bytes(width: u16, height: u16) -> usize {
         usize::from(width) * usize::from(height) * 4
     }
@@ -119,6 +126,13 @@ impl Surface {
     }
 
     /// Extract a rectangle (clipped) as `(width, height, tight RGBA)`.
+    ///
+    /// Total by construction, for the same reason `Surface::bytes` is and stated for the same
+    /// reason ([the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md)
+    /// asks a by-construction site to say so, and its derivation returns this line): the first
+    /// two statements clip `w`/`h` to *this* surface's own dimensions before any multiply, so
+    /// the reserve is bounded by a buffer that already exists — and therefore by
+    /// `MAX_TOTAL_SURFACE_BYTES`, not by the arguments.
     fn extract(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, Vec<u8>) {
         let w = w.min(self.width.saturating_sub(x));
         let h = h.min(self.height.saturating_sub(y));
@@ -232,7 +246,20 @@ impl GraphicsProcessor {
         let (uw, uh) = (usize::from(w), usize::from(h));
         match codec_id {
             egfx::CODECID_UNCOMPRESSED => {
-                if data.len() < uw * uh * 4 {
+                // Total for the whole `Rect16`, not only for what the caller's `MAX_SURFACE_DIM`
+                // bound admits — ADR-0012 §1: the parser's guarantee is not held at the point of
+                // use, and this function's signature takes a bare rectangle. Only observable
+                // where `usize` is 32 bits; on 64-bit the widest product fits.
+                let needed = uw
+                    .checked_mul(uh)
+                    .and_then(|n| n.checked_mul(4))
+                    .ok_or_else(|| {
+                        invalid(
+                            "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                            "destination rectangle's byte count overflows usize",
+                        )
+                    })?;
+                if data.len() < needed {
                     return Err(invalid(
                         "RDPGFX_WIRE_TO_SURFACE_PDU_1",
                         "uncompressed data shorter than the destination rectangle",
@@ -408,6 +435,63 @@ impl GraphicsProcessor {
                 dest_rect,
                 data,
             } => {
+                // A destination rectangle is not merely *where* the bitmap lands, it is the
+                // bitmap's dimensions: `[MS-RDPEGFX]` 2.2.2.1 says destRect specifies "the
+                // dimensions (width and height) of the bitmap data encapsulated in the
+                // bitmapData field", and 2.2.1.2 bounds its four fields at `u16` and states
+                // nothing else — no maximum, no non-zero requirement. So for every codec that
+                // *expands* its input, the rectangle alone decides how much memory the decode
+                // allocates, and a server picks it. 65535 x 65535 x 4 is 17_179_344_900 bytes.
+                // Measured on the CAVIDEO arm with a 93-byte tileset (#263): i686 panicked with
+                // a multiply overflow inside `rfx::opaque_black`, and x86-64 — where that
+                // product does *not* overflow — allocated the whole 16 GiB and returned `Ok`
+                // after 18.9 seconds. That second row is **host-conditional and the condition
+                // makes it worse, not better**: it held on a box with 24.8 GiB of commit
+                // available, and on a smaller one `alloc_zeroed` fails, which is
+                // `handle_alloc_error` and therefore `abort` — not a `Result`, not catchable,
+                // and fatal to the host process rather than to the RDP task. **No *overflow*
+                // check can reach either outcome**, which is why this bounds the rectangle
+                // rather than checking the multiplication. (A magnitude comparison is also an
+                // arithmetic guard and could reach it; what the codec lacks is a principled
+                // number, which this layer has.)
+                //
+                // The ceiling is `MAX_TOTAL_SURFACE_BYTES`, and it is *derived* rather than
+                // picked: `CREATE_SURFACE` below refuses when `total_surface_bytes() +
+                // Surface::bytes(w, h)` passes it, so **no single admissible surface exceeds it**
+                // — and a destRect is in surface coordinates. A rectangle whose RGBA is larger
+                // than every surface that can exist therefore names a bitmap nothing could ever
+                // hold, and refusing it loses no legitimate rectangle at all. A per-axis
+                // `MAX_SURFACE_DIM` bound was written first and is 4x looser: 16384 x 16384 x 4
+                // is 1 GiB, i.e. four times the budget the whole surface set has to share.
+                //
+                // Deliberately *not* the destination surface's own width and height, which is
+                // tighter again and what FreeRDP does (`is_within_surface`, `gdi/gfx.c:386`,
+                // refusing before its `1ull * bpp * w * h` at `:390`; `ironrdp-egfx` checks the
+                // same condition and only `warn!`s): a partially off-surface rectangle is
+                // clipped by `Surface::blit` today, and ADR-0009 says not to trade a tolerance
+                // we already have for a bound the spec never asked for. Stated as the code fact
+                // it is — no capture in this repo has ever recorded a real server sending an
+                // off-surface destRect, so the tolerance being kept is unobserved too.
+                //
+                // Here rather than inside `decode_wts1` for two reasons that agree. It is fatal
+                // for *every* codec — including the tile codecs `decode_wts1` warn-and-skips,
+                // whose own comment scopes that tolerance to "the decoder may simply be
+                // incomplete" and names allocation bounds as staying fatal — and every expanding
+                // arm carried the hazard, not just CAVIDEO: PLANAR allocates `w*h` per plane and
+                // ClearCodec expands likewise, so a per-arm guard would have been three guards.
+                // Keeping it out of the dispatcher also leaves that function total for its own
+                // bare `Rect16` signature and, crucially, *testable* for it — a guard placed
+                // where it makes the arithmetic below unreachable cannot redden.
+                let admissible = usize::from(dest_rect.width())
+                    .checked_mul(usize::from(dest_rect.height()))
+                    .and_then(|px| px.checked_mul(4))
+                    .is_some_and(|bytes| bytes <= MAX_TOTAL_SURFACE_BYTES);
+                if !admissible {
+                    return Err(invalid(
+                        "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                        "destination rectangle is larger than any admissible surface",
+                    ));
+                }
                 if let Some(rgba) = self.decode_wts1(codec_id, dest_rect, data)? {
                     let (w, h) = (dest_rect.width(), dest_rect.height());
                     let surface = self.surface_mut(surface_id).ok_or(invalid(
@@ -1163,6 +1247,132 @@ mod tests {
         body.extend_from_slice(&4u32.to_le_bytes());
         body.extend_from_slice(&[0xAB; 4]);
         assert!(feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &body).is_empty());
+    }
+
+    /// `[MS-RDPEGFX]` 2.2.1.2 bounds a `RDPGFX_RECT16`'s four fields at `u16` and states nothing
+    /// else — no maximum, no non-zero requirement, no ordering rule — and 2.2.2.1 makes the
+    /// rectangle *"the dimensions of the bitmap data encapsulated in the bitmapData field"*. So on
+    /// any arm whose codec **expands** its input, the rectangle alone decides the output size, and
+    /// 65535 x 65535 x 4 is 17_179_344_900 bytes. Measured before this guard (#263), driving the
+    /// CAVIDEO arm with a **93-byte** tileset:
+    ///
+    /// | target | before |
+    /// |---|---|
+    /// | `i686-pc-windows-msvc` | panic in `rfx::opaque_black`, *attempt to multiply with overflow* |
+    /// | `x86_64-pc-windows-msvc` | `Ok`, 16 GiB allocated, 18.9 s, no error — 93 bytes in |
+    ///
+    /// **The second row is why the guard bounds the rectangle instead of only checking the
+    /// arithmetic.** #263 proposed a `checked_mul`; that closes the target which already failed
+    /// loudly and cannot see the one that quietly serves the allocation, because on 64-bit the
+    /// product does not overflow. Both references reach the same place from the other side:
+    /// FreeRDP's `is_within_surface` (`gdi/gfx.c:386`) refuses *before* its `1ull * bpp * w * h`
+    /// at `:390`, and `ironrdp-egfx` checks the same condition and only `warn!`s.
+    ///
+    /// The boundary case pins that it is a bound and not a rejection of large rectangles: at
+    /// exactly `MAX_SURFACE_DIM` the PDU is admitted and fails on its *own* short payload.
+    #[test]
+    fn a_destination_rectangle_no_surface_could_hold_is_refused_before_any_decode() {
+        fn wts1(codec_id: u16, right: u16, bottom: u16, data: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&1u16.to_le_bytes()); // surfaceId
+            body.extend_from_slice(&codec_id.to_le_bytes());
+            body.push(egfx::PIXEL_FORMAT_XRGB_8888);
+            for v in [0u16, 0, right, bottom] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            body.extend_from_slice(data);
+            body
+        }
+
+        // The CAVIDEO arm: a valid tileset, so the decode is actually entered. This is the case
+        // that allocated 16 GiB on x86-64 and panicked on i686.
+        let payload = cavideo_payload(&[0x00; 8]);
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        let message = egfx::wrap_uncompressed(&header(
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &wts1(egfx::CODECID_CAVIDEO, u16::MAX, u16::MAX, &payload),
+        ));
+        assert!(
+            p.process(&message).is_err(),
+            "a maximal destRect must be refused before the codec is reached"
+        );
+
+        // The uncompressed arm reaches the same refusal, and reaches it at the same place —
+        // above the `match`, so no arm can be added that quietly skips it.
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        let message = egfx::wrap_uncompressed(&header(
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &wts1(egfx::CODECID_UNCOMPRESSED, u16::MAX, u16::MAX, &[0xAB; 16]),
+        ));
+        assert!(p.process(&message).is_err());
+
+        // Not a rejection of large rectangles. `MAX_TOTAL_SURFACE_BYTES` is 256 MiB, so the
+        // widest admitted square is 8192 x 8192 (exactly 268_435_456 bytes of RGBA): at the cap
+        // the bound admits the PDU and the *payload* is what fails, and one pixel past it the
+        // bound is what fails. Both outcomes are `Err`, so `is_err()` cannot tell them apart —
+        // the assertion has to name which error, or an off-by-one is invisible. Measured: it
+        // was. Written first as a direct `decode_wts1` call, this stayed green under a
+        // `>` -> `>=` mutation, because a direct call does not pass the call site the bound
+        // lives at. It goes through `process` for that reason.
+        let at = |right: u16, bottom: u16| {
+            let mut p = GraphicsProcessor::default();
+            create_surface(&mut p, 1, 64, 64);
+            let message = egfx::wrap_uncompressed(&header(
+                egfx::CMDID_WIRE_TO_SURFACE_1,
+                &wts1(egfx::CODECID_UNCOMPRESSED, right, bottom, &[0xAB; 16]),
+            ));
+            p.process(&message).unwrap_err()
+        };
+        assert_eq!(
+            at(8192, 8192),
+            invalid(
+                "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                "uncompressed data shorter than the destination rectangle"
+            ),
+            "at the cap the rectangle is admitted and the short payload is what fails"
+        );
+        assert_eq!(
+            at(8192, 8193),
+            invalid(
+                "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                "destination rectangle is larger than any admissible surface"
+            ),
+            "one row past the cap the bound is what fails"
+        );
+    }
+
+    /// The other half of the pair above, and the reason the `MAX_SURFACE_DIM` bound was lifted
+    /// out of `decode_wts1` rather than left inside it: with the bound in the same function, the
+    /// `checked_mul` below it could never be reached and its mutation could not redden — a guard
+    /// with no firing mechanism, which is the defect the graph's own `place` node argues against.
+    /// Called directly with a bare `Rect16`, `decode_wts1` is total for the whole parameter type
+    /// ([ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §1: the caller's
+    /// guarantee is not this function's contract).
+    ///
+    /// Target-gated like the five sibling codec guards (`color`, `planar`, `pointer`, `rle`,
+    /// `rfx`): 65535 x 65535 x 4 = 17_179_344_900 exceeds `u32::MAX` and fits 64 bits, so only
+    /// a 32-bit `usize` can observe the refusal (memory `wasm32_overflow_proof_via_i686`).
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn decode_wts1_is_total_for_a_rectangle_its_caller_would_have_refused() {
+        let mut p = GraphicsProcessor::default();
+        let rect = Rect16 {
+            left: 0,
+            top: 0,
+            right: u16::MAX,
+            bottom: u16::MAX,
+        };
+        assert_eq!(
+            p.decode_wts1(egfx::CODECID_UNCOMPRESSED, rect, &[0xAB; 16])
+                .unwrap_err(),
+            invalid(
+                "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                "destination rectangle's byte count overflows usize"
+            )
+        );
     }
 
     /// Build a minimal valid TS_RFX payload: one full-tile region plus one tile whose three

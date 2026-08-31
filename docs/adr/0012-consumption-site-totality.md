@@ -1,6 +1,42 @@
 # 0012 — A parser's guarantee is not held at the point of use: consumption-site totality
 
-- Status: Accepted (promoted while working issue #211; conformance items #211, #233, #252, #262)
+- Status: Accepted (promoted while working issue #211; conformance items #211, #233, #252,
+  #262, #263)
+  - Amendment 2026-08-31 (#263): **§2 says which *quantity* to guard and is silent about
+    which *ceiling* to guard it against, and the silence is load-bearing for every site in
+    this class that allocates.** A guard written as `checked_mul` discharges §5 exactly — it
+    is *"a validating step that refuses what the arithmetic cannot take"* — and it is not a
+    bound: `Vec` refuses any request above **`isize::MAX`**, not above `usize::MAX`, so on a
+    32-bit target there is a 2 GiB window where the guard returns `Some` and the allocation
+    panics with *capacity overflow* inside `raw_vec`. Measured on `i686-pc-windows-msvc` with
+    the `checked_mul` guard in place: `40000 x 20000 x 4` is 3_200_000_000, passed, and
+    panicked. That is this record's own discharge condition being satisfied over a live
+    panic, which is the strongest available form of the finding — the same shape §2 already
+    records one order of magnitude smaller, where a guard written as `q > 15` diverges by one
+    from where the arithmetic is undefined. **So §2 extends: the threshold is written on the
+    quantity the arithmetic uses, *at the ceiling the operation that can fail enforces*.**
+    `usize::MAX` is the type's ceiling and belongs to no operation. See §2 below and
+    [decoder dimension overflow on 32-bit](../map/invariant/decoder-dimension-overflow-32bit.md),
+    which owns the per-site adjudication and records that only `rfx` is corrected so far.
+
+    **Second, and the reason this is an amendment rather than a note: totality is not the
+    whole obligation, and a site can satisfy this record completely and still be the defect.**
+    `justrdp_codecs::rfx::RemoteFx::decode_to_rgba` is total for its `(u16, u16)` signature
+    once the refusal is written, and on **64-bit** that refusal fires on nothing at all,
+    because 65535 x 65535 x 4 = 17_179_344_900 is representable. Measured: a **93-byte**
+    TS_RFX tileset with `destRect = (0,0,65535,65535)` returned `Ok(Some(17_179_344_900))`
+    on `x86_64-pc-windows-msvc` — 16 GiB allocated, 18.9 s, no error — and on a
+    commit-constrained host `alloc_zeroed` fails, which is `handle_alloc_error` and therefore
+    **`abort`**: not a `Result`, not catchable, fatal to the host process rather than to the
+    RDP task. Totality is about *representability*; that failure is about *magnitude*, and no
+    guard written from the parameter type can reach it. The bound has to come from a layer
+    holding a defensible number — `justrdp::egfx`'s `MAX_TOTAL_SURFACE_BYTES`, which is
+    derived (no admissible surface exceeds it, so no legitimate `destRect` does) rather than
+    picked. **§1 is unchanged and the split is deliberate**: the codec owns totality for its
+    own signature, the surface model owns magnitude, and §3's *one quantity, one answer* is
+    not in play because the two are answering different questions. Recorded so a future
+    reader does not take a discharged §5 argument as evidence that a consumption site is
+    safe.
   - Amendment 2026-08-31 (#262): **§5's disjunction is not exhaustive, and the missing half is
     a loop rather than an expression.** As written it offers two ways to discharge the standing
     rule — refuse what the arithmetic cannot take, or *"where the arithmetic is total for the
@@ -142,6 +178,21 @@ it is undefined at `factor >= 16` — that is `q >= 17`, and `q == 16` is well d
 `shift >= 16`, and the two stages would refuse different inputs while claiming the same reason.
 Write the guard where the arithmetic is, and the two agree by construction.
 
+**Extended 2026-08-31 (#263): the ceiling is part of "the quantity the arithmetic uses".**
+Choosing the right quantity and then bounding it at the wrong number is the same defect one
+order of magnitude larger, and it is what happened to every allocation-sizing guard in
+`justrdp-codecs`. `checked_mul` bounds a product at `usize::MAX`, which is the *type's*
+ceiling; the operation that actually fails is the allocation, and `Vec` refuses above
+`isize::MAX`. On a 32-bit target that is a 2 GiB window in which the guard passes and the
+allocation panics — `40000 x 20000 x 4` is 3_200_000_000, measured on
+`i686-pc-windows-msvc`. So: **write the guard where the arithmetic is, at the threshold the
+failing operation enforces.** For an allocation that is `isize::MAX` at worst, and better a
+domain bound the caller can defend. `rfx::RemoteFx::decode_to_rgba` carries the corrected
+form (`.filter(|n| *n <= isize::MAX as usize)`); the sites that do not yet are enumerated in
+[decoder dimension overflow on 32-bit](../map/invariant/decoder-dimension-overflow-32bit.md),
+because a record that implied the family was closed would be a false status report in the
+sense §3 already names.
+
 ### 3. One undefined input, one answer, across every stage of a family
 
 Where two stages of one codec family consume the same quantity, they give it the same answer —
@@ -243,6 +294,14 @@ this; it asserts the parser, not the function.
   the codec and framebuffer paths is either `u16`-derived or guarded before the loop
   (`framebuffer::blit`, `egfx`'s surface ops). Derivation ④ in the invariant note is the
   command that finds the next one.
+- **A discharged §5 argument is not a safety claim, and #263 is the instance.** The
+  standing rule asks for a validating step or a totality comment; both were producible for a
+  function that panicked on 32-bit *and* served a 16 GiB allocation on 64-bit. What the rule
+  cannot see is a threshold sized against a type rather than against the failing operation
+  (now §2), and a hazard that is about magnitude rather than representability (now the
+  Amendment). Both were found by a throwaway probe on two targets, not by any gate: the
+  32-bit half is now covered by `overflow-32bit.yml`, and **the 64-bit half is covered by
+  nothing at all** — a decode that succeeds is green in every lane this project runs.
 - **It is not a newtype mandate.** §1 is satisfied by a check at the consumption site; the
   guarantee is *not* required to move into the type. See the rejected alternative below for why
   the type-side answer was measured and declined.
