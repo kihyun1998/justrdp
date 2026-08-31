@@ -1,7 +1,39 @@
 # 0012 — A parser's guarantee is not held at the point of use: consumption-site totality
 
 - Status: Accepted (promoted while working issue #211; conformance items #211, #233, #252,
-  #262, #263)
+  #262, #263, #268)
+  - Amendment 2026-09-01 (#268): **§5's totality comment is discharged against a *step*, and a
+    reader takes it as a claim about the *function*.** The #263 Amendment below records that a
+    discharged §5 argument is not a safety claim, and gives two reasons the rule cannot see —
+    a threshold sized against a type, and a hazard about magnitude. This is a third and it is
+    cheaper than either: the argument can be **entirely true** and still not be about the thing
+    that fails. `justrdp::egfx`'s `Surface::extract` carried exactly the comment §5 asks for —
+    *the first two statements clip `w`/`h` to this surface's own dimensions before any multiply,
+    so the reserve is bounded by a buffer that already exists*. True, and about the multiply.
+    Clipping `w` does not clip `x`, so at `x > self.width` the extent goes to zero, the row loop
+    still runs, and `&self.rgba[off..off]` panics on a slice whose **start** is past the end.
+    Reached from the wire through `SURFACE_TO_SURFACE` and `SURFACE_TO_CACHE` on an ordinary
+    1920x1080 surface: `left == 1920` is `Ok` and `left == 1921` panics. **So §5 gains a
+    qualifier rather than a clause** — where the totality argument is a comment, it names the
+    step it covers, because a comment that reads as covering the function is how a §5 discharge
+    stops being re-checked. **Two of §1's three grounds hold and the third does not**, which
+    is worth saying because the one that fails is the one that usually carries this record:
+    `extract` is **private**, so *"the functions are public"* does not apply. The other two do —
+    the constraint is established in `justrdp-pdu` (`Rect16`) and consumed in `justrdp` across a
+    crate boundary, and the value the indexing uses (`off`) is *derived* from `x` rather than
+    being `x`. Both call sites pass `src_rect.left` / `src_rect.top` unclamped, so reachability
+    is **yes** and, per §1, that sets the priority and never the contract.
+
+    **A Consequences clause below was false when it was written, and is true now.** The #262
+    bullet ends *"every other loop in the codec and framebuffer paths is either `u16`-derived or
+    guarded before the loop (`framebuffer::blit`, `egfx`'s surface ops)"*. The disjunction holds
+    — `extract`'s loop **is** `u16`-derived and terminates — but the parenthetical cites
+    `egfx`'s surface ops as a family that was guarded before the loop, and one of the four was
+    not. It is the identical failure the code comment made, one document up: a claim checked at
+    some members, written about the set. Corrected by the change rather than by this record, and
+    left standing with this note attached per the ADR-0002/0007 house pattern. §1–§5 are
+    unaffected.
+
   - Amendment 2026-08-31 (#263): **§2 says which *quantity* to guard and is silent about
     which *ceiling* to guard it against, and the silence is load-bearing for every site in
     this class that allocates.** A guard written as `checked_mul` discharges §5 exactly — it

@@ -52,10 +52,28 @@ acknowledge frames. It is server→client only, and it is reachable only if
 - **The bound is deliberately *not* the destination surface's own dimensions**, which is
   tighter and is what FreeRDP does (`is_within_surface`, `gdi/gfx.c:386`, refusing before
   its `1ull * bpp * w * h` at `:390`; `ironrdp-egfx` checks the same condition and only
-  `warn!`s). A partially off-surface rectangle is clipped by `Surface::blit` today, and
+  `warn!`s). An off-surface rectangle is **clipped** rather than refused, and
   ADR-0009 says not to trade a tolerance we already have for a bound the spec never asked
   for — recorded with the honest caveat that no capture here has ever shown a real server
   sending an off-surface `destRect`, so the tolerance being kept is unobserved too.
+
+  **The tolerance holds at all four surface routines as of #268, and this bullet used to assert
+  it from one.** The sentence above read *"a partially off-surface rectangle is clipped by
+  `Surface::blit` today"*, which was true — `blit` is the routine the `destRect` path actually
+  reaches — and was **read as a statement about the surface model**, because that is what the
+  decision it supports is about. `Surface::extract`, which `SURFACE_TO_SURFACE` and
+  `SURFACE_TO_CACHE` reach with a `src_rect` taken straight off the wire, clipped `w`/`h` and
+  never `x`, and was the one of the four routines without a zero-extent early return: the row
+  loop still ran and evaluated `&self.rgba[off..off]` with `off` past the end of the buffer — a
+  zero-length slice at an out-of-range **start**, which panics. On an ordinary 1920x1080 surface
+  `left == 1920` is the last legal offset and `left == 1921` panicked
+  (`range start index 8294404 out of range for slice of length 8294400`), reachable with
+  `destPtsCount == 1` and no unusual geometry. **The decision is unchanged and was never in
+  doubt** — declining `is_within_surface` costs nothing now that the tolerance is real at every
+  site. What was wrong is this record's account of its own coverage, and the way it was wrong is
+  the part to carry forward: the claim was checked at one routine and written as if it covered
+  the family. Generalised one level out in
+  [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md).
 
 ## Code
 
@@ -170,6 +188,13 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   sentence. Not an ADR-0009 amendment — the rule is right and the code does not follow it —
   and worth a `rdp_egfx` warn naming declared-versus-clipped, which would also be the first
   evidence in this repo about whether a real server ever sends one.
+
+  **#268 widened this hole rather than closing it, and sharpened why it is one.** The clip is
+  now silent at four routines instead of three, and the one that was added is the one that
+  *panicked* — so for the whole time the tolerance was argued from, `extract` was emitting no
+  record of clipping and also not clipping. An unobservable tolerance is not only
+  indistinguishable from a bug to a reader; it is indistinguishable from an absent one to the
+  test suite, which is the concrete cost §3(b)'s sentence had not yet been charged here.
 - H.264 / AVC420 / AVC444 (epic #21) is absent — no oracle exists for it either
   (ADR-0002's amendment says so explicitly).
 - Surface-to-surface and surface-to-cache commands are implemented against one

@@ -113,6 +113,23 @@ that trusts its server too much) rather than as memory safety.
   11.98% is why `gcc` carries nine per-entry-point properties instead of one on the root. The two
   automations ADR-0008 pairs are not interchangeable, and this is the first measurement of how
   they differ rather than an argument that they do.
+- **#268 — a totality claim scoped to one step, written as a claim about the function, and the
+  gap between the two scopes held a live panic.** `justrdp::egfx`'s `Surface::extract` carried a
+  by-construction totality comment that said the reserve is bounded by a buffer that already
+  exists, because the first two statements clip `w`/`h` before any multiply. Every word of that
+  was true, and it is a claim about **the multiply**. The function does more: clipping `w` does
+  not clip `x`, so at `x > self.width` the extent goes to zero, the row loop still runs, and
+  `&self.rgba[off..off]` panics on a slice whose *start* is past the end — a zero-length read at
+  an out-of-range offset, `left == 1920` legal and `left == 1921` fatal on a 1920x1080 surface,
+  reached from the wire by `SURFACE_TO_SURFACE` and `SURFACE_TO_CACHE`. Three separate artifacts
+  had already looked at this function and each cleared the step it was asking about: the comment
+  (the multiply), derivation ④'s adjudication below (the *trip count* — `usize::from(<u16>)`, so
+  bounded), and the EGFX territory's clipping tolerance (checked at `Surface::blit`). **None of
+  the three was wrong and the union of them still did not cover the function**, which is the
+  thing this entry adds: a scoped claim does not fail loudly when it is read wider than it was
+  written, because there is nothing about it that is false. The narrower the step a totality
+  argument is exact about, the more of the function it leaves unspoken for.
+
 - **#203, third: a round-trip cannot reach a decoder whose encoder does not exist.** Every encoder
   in `justrdp-pdu` writes client-to-server, because justrdp is a client — so no server PDU can be
   synthesised here, and the seed had to be a real capture. That asymmetry is why this invariant
@@ -394,7 +411,7 @@ list rather than an answer.** ~60 hits, **two** members:
 | `nscodec::reconstruct` | bare `usize` `height`, `nscodec.rs` `for y in 0..height` | **closed with #262** — the second member, guarded in the same change; its property's dimension generators were widened too, which is what would have found it |
 | `rle::decompress`, `planar::decompress` | bare `usize` | closed **as policy** — both refuse a zero extent with `EmptyImage` above the loop |
 | `framebuffer::blit` | `usize` mins | closed **by a guard** — `if width == 0 \|\| height == 0 { return None }` sits before the loop |
-| `pointer::decode_pointer`, `egfx`'s `blit`/`fill`/`extract`, `clearcodec`'s region walks | `usize::from(<u16>)` | bounded **by construction** — ≤ 65535 rows, so the worst case is slow, not unbounded |
+| `pointer::decode_pointer`, `egfx`'s `blit`/`fill`/`extract`, `clearcodec`'s region walks | `usize::from(<u16>)` | bounded **by construction** — ≤ 65535 rows, so the worst case is slow, not unbounded. **`extract` then panicked inside this loop (#268)**, and the verdict above is still the right answer to ④'s question: a bounded loop is not a safe loop, because ④ adjudicates the *trip count* and says nothing about the body. Read this column as "terminates", never as "cleared" |
 
 **The `u16` row is why this defect never reached a client and the note still records it.** Every
 wire path into `to_rgba` carries a `u16`-derived height (`session.rs`'s bitmap rect,

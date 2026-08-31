@@ -127,15 +127,33 @@ impl Surface {
 
     /// Extract a rectangle (clipped) as `(width, height, tight RGBA)`.
     ///
-    /// Total by construction, for the same reason `Surface::bytes` is and stated for the same
-    /// reason ([the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md)
+    /// The reserve is total by construction, for the same reason `Surface::bytes` is and stated
+    /// for the same reason ([the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md)
     /// asks a by-construction site to say so, and its derivation returns this line): the first
     /// two statements clip `w`/`h` to *this* surface's own dimensions before any multiply, so
     /// the reserve is bounded by a buffer that already exists — and therefore by
     /// `MAX_TOTAL_SURFACE_BYTES`, not by the arguments.
+    ///
+    /// **That is a claim about the multiply and it used to be written as a claim about the
+    /// function** (#268). Clipping `w` does not clip `x`: at `x > self.width` the width goes to
+    /// zero while the row loop still runs, and `&self.rgba[off..off]` panics on a slice whose
+    /// *start* is past the end — a zero-length read at an out-of-range offset. The zero-extent
+    /// return below is what `blit`, `fill` and `blit_dirty` each already had; this was the one
+    /// of the four without it, which is also why the territory's "an off-surface rectangle is
+    /// clipped by `Surface::blit` today" read as covering all four sites and did not.
+    ///
+    /// **Only the `w` half is load-bearing, and the `h` half is kept anyway.** Measured: mutating
+    /// the condition to `w == 0` alone leaves the test green, because at `h == 0` the row loop
+    /// never runs and the pre-guard behaviour is already identical. It stays because `blit`,
+    /// `fill` and `blit_dirty` all read `w == 0 || h == 0` and a reader comparing the four should
+    /// not have to work out why one is spelled differently — ADR-0012 §3, one quantity one answer
+    /// across a family. Said here so the symmetry is not later mistaken for coverage.
     fn extract(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, Vec<u8>) {
         let w = w.min(self.width.saturating_sub(x));
         let h = h.min(self.height.saturating_sub(y));
+        if w == 0 || h == 0 {
+            return (w, h, Vec::new());
+        }
         let stride = usize::from(self.width) * 4;
         let mut out = Vec::with_capacity(usize::from(w) * usize::from(h) * 4);
         for row in 0..usize::from(h) {
@@ -472,6 +490,12 @@ impl GraphicsProcessor {
                 // we already have for a bound the spec never asked for. Stated as the code fact
                 // it is — no capture in this repo has ever recorded a real server sending an
                 // off-surface destRect, so the tolerance being kept is unobserved too.
+                //
+                // `Surface::blit` is named here because it is the only routine a *destRect*
+                // reaches, not as shorthand for the surface model. The same sentence copied into
+                // the territory record dropped that scope and was read as covering all four
+                // surface routines, one of which (`Surface::extract`) clipped its extent and
+                // indexed by an unclipped origin until #268.
                 //
                 // Here rather than inside `decode_wts1` for two reasons that agree. It is fatal
                 // for *every* codec — including the tile codecs `decode_wts1` warn-and-skips,
@@ -1845,5 +1869,66 @@ mod tests {
             matches!(outputs.last(), Some(Out::Send(_))),
             "ack must close the frame"
         );
+    }
+    /// `SURFACE_TO_SURFACE` and `SURFACE_TO_CACHE` hand `Surface::extract` a `src_rect` straight
+    /// off the wire, and the territory's recorded position is that an off-surface rectangle is
+    /// **clipped** rather than refused (the reason justrdp declines FreeRDP's `is_within_surface`).
+    /// That was true of `blit` and `fill` and false here: `extract` clipped `w`/`h` but never `x`,
+    /// and with no zero-extent early return the loop still ran and indexed `rgba` past its end.
+    ///
+    /// The boundary is exact — `left == width` lands the slice start on `rgba.len()`, which is a
+    /// legal empty slice, and one pixel further is out of range. So the assertion has to sit on
+    /// both sides of it or it is asserting the arithmetic it was written for.
+    #[test]
+    fn a_source_rect_past_the_surface_is_clipped_rather_than_indexed() {
+        fn s2c(p: &mut GraphicsProcessor, id: u16, r: [u16; 4]) -> Vec<Out> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&id.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&9u16.to_le_bytes());
+            for f in r {
+                b.extend_from_slice(&f.to_le_bytes());
+            }
+            feed(p, egfx::CMDID_SURFACE_TO_CACHE, &b)
+        }
+        fn s2s(p: &mut GraphicsProcessor, src: u16, dst: u16, r: [u16; 4]) -> Vec<Out> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&src.to_le_bytes());
+            b.extend_from_slice(&dst.to_le_bytes());
+            for f in r {
+                b.extend_from_slice(&f.to_le_bytes());
+            }
+            b.extend_from_slice(&1u16.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            feed(p, egfx::CMDID_SURFACE_TO_SURFACE, &b)
+        }
+
+        // A plain desktop-sized surface: the defect needs no unusual geometry and no large count.
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 1920, 1080);
+        create_surface(&mut p, 2, 1920, 1080);
+
+        // `left == width` — the last in-range start offset, and already fine before the guard.
+        assert!(s2c(&mut p, 1, [1920, 1079, 1921, 1080]).is_empty());
+        // One pixel past it, which is where the slice start leaves the buffer.
+        assert!(s2c(&mut p, 1, [1921, 1079, 1922, 1080]).is_empty());
+        // And far past, so the assertion is not pinned to an off-by-one.
+        assert!(s2c(&mut p, 1, [60000, 0, 60001, 1080]).is_empty());
+        // The same rectangle reaches `extract` through the other command too.
+        assert!(s2s(&mut p, 1, 2, [1921, 1079, 1922, 1080]).is_empty());
+        assert!(s2s(&mut p, 1, 2, [60000, 0, 60001, 1080]).is_empty());
+
+        // Clipped means *nothing painted*, not "painted somewhere else": an out-of-surface
+        // source contributes no pixels, so the destination is untouched and stays undirtied.
+        assert!(
+            p.surfaces[1].dirty.is_empty(),
+            "an off-surface source must paint nothing",
+        );
+        // The top axis clips independently of the left one. **This line observes nothing about
+        // the panic** and is here as documentation, not as coverage: at `h == 0` the row loop
+        // never runs, so the guard's `h` half is inert and its mutation is green (see `extract`).
+        assert!(s2c(&mut p, 1, [0, 1081, 1920, 1082]).is_empty());
     }
 }
