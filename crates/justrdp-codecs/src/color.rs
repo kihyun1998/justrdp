@@ -95,6 +95,14 @@ pub fn bytes_per_pixel(bits_per_pixel: u16) -> Result<usize, ColorError> {
 /// (the up-to-3-pixel overhang), which makes the tight stride hold at every supported depth.
 /// A spec-legal but non-4-aligned width at 8/24 bpp would carry per-row pad bytes this
 /// function does not skip.
+///
+/// **A zero `width` or `height` is `Ok` with no pixels**, whatever `src` and `bottom_up` hold —
+/// a zero-extent rectangle is zero work, not a malformed input, and `[MS-RDPEGFX]` 2.2.1.2
+/// makes one spec-legal (`RDPGFX_RECT16` is exclusive, so `right == left` is expressible).
+/// The check sits *after* the depth check, so an unsupported `bits_per_pixel` is still
+/// `UnsupportedBitsPerPixel` at any extent. Note the sibling *stream* decoders answer the
+/// other way — `rle::decompress` and `planar::decompress` refuse a zero extent as malformed
+/// input — so a caller switching between them sees two answers for one geometry, deliberately.
 pub fn to_rgba(
     src: &[u8],
     width: usize,
@@ -104,6 +112,42 @@ pub fn to_rgba(
     bottom_up: bool,
 ) -> Result<Vec<u8>, ColorError> {
     let bpp = bytes_per_pixel(bits_per_pixel)?;
+    // A zero extent is zero work, and saying so is what makes this function total on its own
+    // terms. Every guard below passes at `width == 0` — `0 * bpp` and `0 * height` are 0, and
+    // `src.len() < 0` is false — so nothing refuses and the row loop still runs `height` times
+    // over empty rows, with `height` a bare `usize` (#262). The arithmetic was never the
+    // undefined part; the loop's trip count was. This discharges
+    // [ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) **§5** — a public function
+    // consuming a wire-derived value as arithmetic carries its totality argument in the same
+    // change. Not §3: that one is titled *one **undefined** input, one answer*, and a zero extent
+    // is not undefined for anybody — `rle` and `planar` know exactly what it means and refuse it
+    // as **policy**, where this bounds a **loop**. Same line `nscodec::reconstruct` draws for its
+    // own parameter ("would duplicate the parser's *policy* rather than close the totality hole").
+    //
+    // **`Ok` here is a deliberate divergence from FreeRDP, not agreement with it.** The reference
+    // splits on *who owns the destination*, not on decoder-versus-converter: everything writing
+    // into a caller-supplied buffer returns success at a zero extent (`freerdp_image_copy`
+    // `color.c:1155`, `_no_overlap`, `_overlap`, `freerdp_image_fill`), and everything that
+    // *allocates and returns* refuses — including `freerdp_glyph_convert_ex` (`color.c:265-267`,
+    // `if ((len == 0) || (width == 0) || (height == 0)) return nullptr;`), which is a converter of
+    // exactly this shape. `to_rgba` allocates and returns, so that axis puts it with the refusers.
+    //
+    // We go the other way because of what the one reachable consumption site does with the error.
+    // `[MS-RDPEGFX]` 2.2.1.2 makes `RDPGFX_RECT16` **exclusive** with no non-zero requirement, so
+    // `right == left` is spec-legal and `Rect16::width()` yields 0 — and `justrdp::egfx`'s
+    // uncompressed WTS1 arm propagates a `ColorError` with `?`, which is **fatal for the channel**,
+    // where every other codec arm there warn-and-skips. Refusing would drop a healthy session over
+    // a legal empty rectangle: the receive-path strictness [ADR-0009](../../../docs/adr/0009-tolerant-negotiation-posture.md)
+    // calls a defect rather than rigor. `pointer::decode_pointer` reaches `Ok(Vec::new())` too, but
+    // it is **not** the precedent — its rationale is a protocol semantic ("a zero-sized shape,
+    // which servers use as 'no shape'") that a bitmap has no counterpart for.
+    //
+    // Placed **after** the depth check, which is `rle::decompress`'s order rather than
+    // `pointer::decode_pointer`'s: an unsupported depth stays `UnsupportedBitsPerPixel` at any
+    // extent, so this adds a return without removing a typed error. It is total either way.
+    if width == 0 || height == 0 {
+        return Ok(Vec::new());
+    }
     // width/height are usize, so on a 32-bit target a caller can make width × bpp × height (the
     // source length) or width × height × 4 (the output) exceed usize (#155). Check both before
     // allocating rather than panic (debug) / wrap-then-OOB (release).
@@ -330,6 +374,14 @@ mod tests {
     /// that produce a real conversion, and values whose product overflows a **32-bit** `usize`
     /// (#155). The second range does nothing on x86-64 — `checked_mul` succeeds and the
     /// source-length check refuses — which is why the `overflow-32bit` CI job runs this crate.
+    ///
+    /// **The arm that bit was `any::<usize>()`, and the sentence above is why nobody looked at
+    /// it** (#262). It is true only for `width > 0`: at `width == 0` the source-length check
+    /// *passes* rather than refusing, because `needed` is 0 — so the draw that reached ~1.8e19
+    /// rows was never the overflow arm this comment was watching. The arm stays unbounded on
+    /// purpose. Narrowing it would restore the green by removing the reach, and this file's own
+    /// [`the_generator_reaches_past_the_depth_gate`] exists because a property that never
+    /// reaches its subject asserts nothing; the guard belongs in `to_rgba`, and is there.
     fn dimension() -> impl Strategy<Value = usize> {
         prop_oneof![
             6 => 0usize..=32,
@@ -413,6 +465,76 @@ mod tests {
         assert!(matches!(
             to_rgba(&[], 1, 1, 12, &Palette::default(), false),
             Err(ColorError::UnsupportedBitsPerPixel { bits_per_pixel: 12 })
+        ));
+    }
+
+    /// **A hang is not a red.** `to_rgba_is_total_over_arbitrary_dimensions` above cannot
+    /// observe non-termination — a seed that does not terminate makes the property *hang*
+    /// rather than fail, which is how a `width == 0` draw cost four `test.yml` runs six
+    /// runner-hours each before anyone read the cancelled log (#262). So the bound is
+    /// asserted here explicitly instead of being left to the harness: the call is driven on
+    /// a worker thread and this test fails at the deadline rather than waiting with it.
+    #[test]
+    fn to_rgba_returns_promptly_for_a_zero_extent_of_any_height() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // `width == 0` passes every guard rather than tripping one: `0 * bpp` is 0,
+            // `0 * height` is 0, and `src.len() < 0` is false, so the source-length check
+            // *succeeds* where the 60_000..=70_000 arm's comment assumed it refuses. Only
+            // the row loop is unbounded, and `height` is a bare `usize`.
+            let _ = tx.send(to_rgba(&[], 0, usize::MAX, 32, &Palette::default(), false));
+        });
+        let out = rx
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .expect("to_rgba did not return within 5s for a zero-width rectangle");
+        assert_eq!(out, Ok(Vec::new()));
+
+        // **A second witness below `usize::MAX`, because the extreme is the point that lies.**
+        // `nscodec::reconstruct` has this same hole, and probing it at `usize::MAX` alone reports
+        // "returns promptly" — an unchecked multiply in its `temp_dims` panics before its loop is
+        // reached, so the extreme masks the hang that lives one bit down. Nothing in `to_rgba`
+        // does arithmetic ahead of the guard today; this pins that it stays that way, and keeps
+        // the assertion shape transferable to the sibling. `1 << 30` rather than `1 << 34` so the
+        // witness is a legal `usize` on the 32-bit target the overflow gate runs.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(to_rgba(
+                &[],
+                0,
+                1usize << 30,
+                32,
+                &Palette::default(),
+                false,
+            ));
+        });
+        assert_eq!(
+            rx.recv_timeout(core::time::Duration::from_secs(5)),
+            Ok(Ok(Vec::new()))
+        );
+
+        // A non-empty source at a zero extent: the guard returns before reading `src`, so no
+        // source byte reaches the output. Unasserted otherwise — every case above passes `&[]`,
+        // which cannot tell "returned early" from "read nothing because there was nothing".
+        assert_eq!(
+            to_rgba(&[1, 2, 3, 4], 0, 8, 32, &Palette::default(), false),
+            Ok(Vec::new())
+        );
+        // …and on the flipping path, which takes a different branch inside the loop.
+        assert_eq!(
+            to_rgba(&[1, 2, 3, 4], 0, 8, 32, &Palette::default(), true),
+            Ok(Vec::new())
+        );
+
+        // The guard sits **after** the depth check, so an unsupported depth is still reported at
+        // a zero extent. That is the one consequence of the placement a caller can observe, and
+        // it is pinned here because the opposite order is equally total and was the tempting one:
+        // `pointer::decode_pointer` guards first, but its zero case is a protocol semantic a
+        // bitmap does not share. Moving the guard above `bytes_per_pixel` turns this red.
+        assert!(matches!(
+            to_rgba(&[], 5, 0, 999, &Palette::default(), false),
+            Err(ColorError::UnsupportedBitsPerPixel {
+                bits_per_pixel: 999
+            })
         ));
     }
 }

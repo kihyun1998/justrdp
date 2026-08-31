@@ -43,6 +43,21 @@ like any other.
   invariant lists in `justrdp`; and `i686-unknown-linux-gnu` on ubuntu would give the same
   32-bit `usize` at 1x, but nothing here has run it, so the cheaper shape is a measurement
   away rather than an argument away.
+- **Every job is bounded, and the number that justifies it lives in exactly one place.** A job
+  with no `timeout-minutes` gets GitHub's default of **360**, so a hang costs six runner-hours
+  and is indistinguishable from a slow queue. Measured on 2026-08-31 (#262), when a hanging
+  `justrdp-codecs` property ran to the kill: **10 cancelled jobs, ~56.4 runner-hours in one
+  day** — `test` 6 jobs (140/360/360/360/360/361 min) and `coverage` 4 jobs at 360 each. Every
+  job in all five workflows now carries a bound (test 20, map 10, coverage 30, overflow-32bit
+  30, just-shield 10, fuzz `targets` 10, fuzz `fuzz` 30), each sized against its own measured
+  healthy maximum, and **`test.yml`'s block is the one that carries the incident numbers** —
+  the others point at it rather than copying them, for the same reason the fuzz matrix is
+  derived rather than transcribed. Two scoping notes: `coverage.yml` is in that table because
+  it runs `cargo llvm-cov --workspace --exclude justrdp-tokio`, i.e. the *same* property, so
+  bounding only the gating file would have left 24 of those 56 hours unbounded on the
+  post-merge lane nobody watches a PR check for; and `overflow-32bit.yml` was never killed but
+  runs the same property on a Windows runner that bills at **2x**, which makes an unbounded
+  hang there the most expensive one available.
 - **A gate is only as good as its failure directions, and that is now a command
   rather than a memory** — `python3 .github/scripts/check_map.py --selftest`, run in
   CI ahead of the gate itself. It builds a throwaway mini-map in a temp directory,
@@ -169,5 +184,13 @@ and never re-read. Verify at the source before a decision rests on it.
   `cargo doc --no-deps` with `-D warnings`, so a public doc-comment can link a private
   item, or describe behaviour that no longer exists, and every gate stays green. That
   is exactly how the adapter's "~30 lines" sentence shipped to docs.rs.
+- **A timeout bounds the *gate*, not the loop, and the local run is still unbounded.**
+  `timeout-minutes` is a GitHub-Actions key; a maintainer running `cargo test --workspace` on
+  the pinned toolchain has no equivalent and a hanging property still hangs forever there. This
+  does not falsify ADR-0013's *"the local gate mirrors CI"* consequence — that claim is about
+  the **compiler**, and it holds — but it is the one axis on which local and CI now genuinely
+  differ, and it is worth naming rather than discovering. The in-repo mitigation is per-test and
+  belongs to whoever writes the test: drive the call on a worker thread and fail at a deadline,
+  which is what `to_rgba_returns_promptly_for_a_zero_extent_of_any_height` does.
 - No release/publish workflow exists yet; nothing is on crates.io, so the whole
   cross-repo half of the discipline is inert by construction.

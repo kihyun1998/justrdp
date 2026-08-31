@@ -222,6 +222,39 @@ that trusts its server too much) rather than as memory safety.
   the gate. The check that does find it is one line and belongs in a completeness pass, not in
   CI: list every territory whose `## Code` names a parser module, and ask which of them do
   **not** claim this invariant.
+- **#262 — the census listed the member, the pass gave it an artifact, and the artifact could
+  not observe the defect.** `color::to_rgba` is derivation ③'s named member (#238); #241/#238
+  worked it and shipped a no-panic property. What that property could not see is the half of
+  this note's own **fact** that is not a panic: *loop unboundedly*. At `width == 0` every guard
+  in `to_rgba` **passes** rather than refusing — `0 * bpp` is 0, `0 * height` is 0, and
+  `src.len() < 0` is false, so the source-length check *succeeds* — and `for out_row in
+  0..height` then walks a bare `usize`. The property's own generator has a `1 => any::<usize>()`
+  arm, so it hung on ~43% of seeds.
+
+  **A hang is not a red, and that is what makes this class expensive.** The property does not
+  fail; it *runs*. Nothing shrinks, so nothing lands in `proptest-regressions/` — the backstop
+  every other finding in this note relies on is structurally unavailable here. The mutation
+  methodology this note made a rule (*"done when a mutation of the read it names has been seen
+  to turn it red"*) cannot see it either: it asks whether removing a guard turns the property
+  red, and the guard that was missing turns it *silent*. Measured cost before anyone read a
+  cancelled log: **10 cancelled jobs, ~56.4 runner-hours** in one day — `test` 6 jobs
+  (140/360/360/360/360/361 min) and `coverage` 4 jobs at the 360-minute default each, because
+  `coverage.yml` runs `cargo llvm-cov --workspace --exclude justrdp-tokio`, i.e. the same
+  property, on a post-merge lane nobody watches a PR check for.
+
+  Three consequences, each of which is a different artifact:
+  - **The defect fix is a guard on the loop**, `Ok(Vec::new())` at a zero extent, and it is a
+    deliberate divergence from FreeRDP rather than agreement with it — the reference splits on
+    *who owns the destination*, so `freerdp_glyph_convert_ex` (`color.c:265-267`), which
+    allocates and returns exactly as `to_rgba` does, refuses. Argued at the site on what the one
+    reachable consumer does with the error.
+  - **The class fix is a job timeout**, because a guard fixes one defect and a bound fixes the
+    class. Every job in all five workflows now carries `timeout-minutes`; none did before.
+  - **The recurrence test is derivation ④ below**, because ①–③ are all blind to this by
+    construction and so is
+    [decoder dimension overflow on 32-bit](decoder-dimension-overflow-32bit.md), whose *Where it
+    will recur* scopes itself to **allocation sizing** (`rg 'usize::from|as usize' … | rg '\*'`).
+    A loop bound is not an allocation size, and this defect allocates nothing.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
@@ -242,7 +275,23 @@ members, five of which neither #238 nor #241 had named. Four were in `justrdp::f
 which this note listed as a *territory* the fact holds in while nobody had ever listed its
 functions.
 
-Working the list found **four defects**, and the split between them is the useful part:
+**The membership question has a second half, and it was added after the first half answered
+*no* over a live defect (#262).** *"Does the signature admit a value the arithmetic has no
+meaning for"* answers **no** for a zero extent — every product is 0, every guard passes, and the
+arithmetic is perfectly meaningful — while the function still does not return. So ask both:
+
+> **Does its signature admit a value that passes every arithmetic guard and leaves a loop's
+> trip count unbounded?**
+
+A guard chain that validates arithmetic does not bound a loop. The two questions fail on
+disjoint inputs — `to_rgba` refuses `usize::MAX` dimensions on the first and hung on the second
+— so neither subsumes the other, and derivation ③ cannot find the members of the second half
+anyway: it matches on the *signature*, and both halves have the same one. That is what ④ is for.
+
+Working the list found **four defects**, and the split between them is the useful part
+(**a fifth arrived on 2026-08-31 in a member of this very table's source list** —
+`color::to_rgba`'s unbounded row loop, #262, found by a CI bill rather than by the census;
+see the Discovery history entry, and note that it is a **loop bound**, not an allocation):
 
 | Site | Defect | Reachable from the wire? |
 |---|---|---|
@@ -259,9 +308,11 @@ contract*. The first two are not — they are live, and every other gate was gre
 `vec![0xFF; original_size]` — so making the multiply *saturating* would have converted an
 arithmetic overflow into an allocation of the entire address space. It refuses instead.
 
-**Three derivations, and the gaps between them are the finding.** There were two until
+**Four derivations, and the gaps between them are the finding.** There were two until
 #241/#238, and each of those issues had found a different hole in them — one by **location**,
-one by **kind**:
+one by **kind**. #262 found a fourth hole in the *third*, by **shape**: ③ matches signatures,
+and a member whose defect is a loop bound has the same signature as one whose defect is an
+overflow, so ③ lists it and the adjudication clears it:
 
 ```sh
 # ① what is fuzzed
@@ -273,13 +324,42 @@ rg --files crates/justrdp-pdu/src crates/justrdp/src crates/justrdp-tokio/src -g
 # ③ what CONSUMES an already-parsed wire value as arithmetic — ADR-0012's class (#238).
 #    An over-approximation on purpose: it lists candidates, and the adjudication is the
 #    judgement ADR-0012 §1 states ("does the signature admit a value the arithmetic has no
-#    meaning for"). Roughly 40 candidates today, of which ~20 are members.
+#    meaning for"). Roughly 40 candidates today, of which ~20 are members. That question alone
+#    is NOT sufficient — it answers "no" for a zero extent, over a live hang (#262). Ask the
+#    second half above with it, and run ④ for the sites it cannot describe.
 rg -U "pub fn [a-z_0-9]+ *(<[^>]*>)? *\([^)]*\b(u8|u16|u32|usize|i8|i16|i32)\b" \
    crates/justrdp-codecs/src crates/justrdp/src
+
+# ④ what LOOPS over a wire-derived count — the half ③'s membership question answers "no" to,
+#    and the half neither ①, ② nor `decoder-dimension-overflow-32bit.md` can see (#262). That
+#    note's derivation is scoped to *allocation sizing* (`rg 'usize::from|as usize' | rg '\*'`),
+#    and a loop bound is not an allocation size. Adjudicate each hit on two questions: is the
+#    trip count a **bare `usize`** rather than `usize::from(<u16>)`, and does a zero extent
+#    reach the loop rather than being refused above it?
+rg -n 'for [a-z_0-9]+ in 0\.\.' crates/justrdp-codecs/src crates/justrdp/src crates/justrdp-pdu/src
 
 # and what each already carries, to subtract:
 rg -n 'fn [a-z_0-9]+_never_panics' crates/justrdp-codecs/src crates/justrdp/src crates/justrdp-pdu/src
 ```
+
+**④ adjudicated in full on 2026-08-31, because an over-approximation nobody has walked is a
+list rather than an answer.** ~60 hits, **two** members:
+
+| Site | Trip count | Verdict |
+|---|---|---|
+| `color::to_rgba` | bare `usize` `height` | **was the defect** — guarded at `width == 0 \|\| height == 0` (#262) |
+| `nscodec::reconstruct` | bare `usize` `height`, `nscodec.rs` `for y in 0..height` | **closed with #262** — the second member, guarded in the same change; its property's dimension generators were widened too, which is what would have found it |
+| `rle::decompress`, `planar::decompress` | bare `usize` | closed **as policy** — both refuse a zero extent with `EmptyImage` above the loop |
+| `framebuffer::blit` | `usize` mins | closed **by a guard** — `if width == 0 \|\| height == 0 { return None }` sits before the loop |
+| `pointer::decode_pointer`, `egfx`'s `blit`/`fill`/`extract`, `clearcodec`'s region walks | `usize::from(<u16>)` | bounded **by construction** — ≤ 65535 rows, so the worst case is slow, not unbounded |
+
+**The `u16` row is why this defect never reached a client and the note still records it.** Every
+wire path into `to_rgba` carries a `u16`-derived height (`session.rs`'s bitmap rect,
+`egfx.rs`'s `Rect16`), so the worst reachable case was 65535 empty rows returning the same
+value. `width == 0` *is* wire-reachable — `Rect16::width()` is `right.saturating_sub(left)` and
+`[MS-RDPEGFX]` 2.2.1.2 makes the rect exclusive with no non-zero requirement — but the **hang**
+is not. Reachability set the priority and not the contract, exactly as ADR-0012 §1 says, and
+the cost landed on CI instead of on a host.
 
 **Match the names exactly when subtracting ③, or the census lies in the safe-looking
 direction.** Measured while writing this: a loose `rg to_rgba` reported `color::to_rgba` as

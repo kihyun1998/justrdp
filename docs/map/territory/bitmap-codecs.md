@@ -101,6 +101,15 @@ attacker-controlled bytes in the repo.
   carries a zero: `Quant::default()` is the MS server's own table (6..7) and the
   harness's second table is 8..12. **If one ever carries a zero the differential goes
   red, and that is the correct signal, not a false one.**
+- **A property can be green on every seed it finishes and still be the most expensive artifact
+  in the repo** (#262). `color::to_rgba`'s no-panic property — added by #238/#241, mutation-
+  checked, three tests red with the guard off — hung on ~43% of seeds, because a **hang is not
+  a red**: the property does not fail, it runs, and a hang never shrinks so nothing lands in
+  `proptest-regressions/`. Cost before anyone read a cancelled log: **10 jobs, ~56.4
+  runner-hours**. This is the third distinct way a green property in this territory has meant
+  nothing — after a generator *bounded* to the parser's range (#211) and one too *wide* to
+  satisfy the parser (#230) — and it is the first that no mutation can detect, because the
+  missing guard turns the property silent rather than red.
 - **Two more members of ADR-0012's class were found by enumerating it, and both were live**
   (#238). `color::to_rgba` sizes two buffers from wire dimensions and had neither artifact — the
   member the issue named. `nscodec::plane_sizes` multiplied `tw * height` unguarded, and
@@ -110,6 +119,40 @@ attacker-controlled bytes in the repo.
   `vec![0xFF; original_size]` — a saturated `usize::MAX` would have turned an arithmetic overflow
   into an allocation of the address space. "Total" and "does not panic" are not the same
   requirement.
+- **A zero extent passes every guard and bounds no loop, and `to_rgba` is where that cost
+  something** (#262, [ADR-0012](../../adr/0012-consumption-site-totality.md) §5). At
+  `width == 0` the checks that exist all *succeed* rather than refusing — `0 * bpp` is 0,
+  `0 * height` is 0, and `src.len() < 0` is false, so the source-length check reports a
+  satisfied source — and `for out_row in 0..height` then walks a bare `usize`. **The arithmetic
+  was never the undefined part; the trip count was.** The guard is `Ok(Vec::new())`, placed
+  *after* the depth check (`rle::decompress`'s order, so an unsupported depth stays
+  `UnsupportedBitsPerPixel` at any extent).
+  **`Ok` is a deliberate divergence from FreeRDP, not agreement with it**, and the axis is the
+  part to remember: the reference splits on **who owns the destination**, not on
+  decoder-versus-converter. Everything writing into a caller-supplied buffer succeeds at a zero
+  extent (`freerdp_image_copy` `color.c:1155`, `_no_overlap`, `_overlap`, `freerdp_image_fill`);
+  everything that *allocates and returns* refuses, including `freerdp_glyph_convert_ex`
+  (`color.c:265-267`, `return nullptr`), which is `to_rgba`'s exact shape. We go the other way
+  on what the one reachable consumer does with the error: `justrdp::egfx`'s uncompressed WTS1
+  arm propagates a `ColorError` with `?`, **fatal for the channel** where every other codec arm
+  there warn-and-skips, and `[MS-RDPEGFX]` 2.2.1.2 makes `RDPGFX_RECT16` exclusive with no
+  non-zero requirement — so `right == left` is spec-legal and refusing would drop a healthy
+  session over a legal empty rectangle ([ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)
+  receive-path posture). `pointer::decode_pointer` also returns empty and is **not** the
+  precedent: its reason is a protocol semantic (*a zero-sized shape means "no shape"*) that a
+  bitmap has no counterpart for. **The `rle`/`planar` refusal is not a divergence row against
+  this** — they refuse a zero extent as *policy*, which is a different act from bounding a loop,
+  so ADR-0012 §3 is not the section in play.
+- **The same hole was open one module over, and closed in the same change.**
+  `nscodec::reconstruct` is `pub`, took `height` as a bare `usize`, and looped
+  `for y in 0..height` with no zero guard — the second and only other member of the class, per
+  derivation ④ in
+  [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md). Probing it at
+  `usize::MAX` alone reports "returns promptly" and is misleading: an unchecked multiply in
+  `temp_dims` panics before the loop is reached, so **the extreme masks the hang that lives one
+  bit down**. Everything else in this territory is bounded by construction (`clearcodec`'s
+  region walks and `pointer::decode_pointer` are `usize::from(<u16>)`) or guarded above the
+  loop.
 - **A no-panic property whose generator is bounded to the parser's range asserts the
   parser, not the function.** `nscodec`'s `reconstruct_never_panics_on_arbitrary_input`
   documented itself as covering *"any colour-loss level"* and generated `1u8..=7`.
@@ -242,6 +285,11 @@ as citations.
   only as good as the oracle, corpus and property lanes.
 - [Capability exchange & activation](capability-exchange-activation.md) —
   `BitmapCodecsCapabilitySet` decides which of these can be reached at all.
+- [Supply chain & gates](supply-chain-and-gates.md) — this territory's properties are what the
+  gates actually spend their minutes on, in **four** workflows (`test`, `coverage`,
+  `overflow-32bit`, and `fuzz` for the targeted decoders). #262 is the measurement that made
+  this edge worth drawing rather than assuming: a test-only change here ran three of those
+  lanes to their kill. That territory already listed this one.
 
 ## Known holes / open
 
@@ -285,6 +333,17 @@ as citations.
   `RFX_DWT_REDUCE_EXTRAPOLATE`. The first-pass decoder does branch on it, so #169 needs
   both layouts where #168 needed one — and `quant.rs`'s `LL3_OFFSET` is the
   **non**-extrapolate constant.
+- **`nscodec::reconstruct` had `to_rgba`'s zero-extent hole; closed 2026-08-31 (#262).** `pub fn`, `height`
+  a bare `usize`, `for y in 0..height` with no guard above it, and the inner `for x in 0..width`
+  contributes nothing at `width == 0`. Not wire-reachable — `nscodec::decode`'s own parameters
+  are `u16` — so it was the same priority `to_rgba`'s was, and the same contract question.
+  Closed alongside it rather than filed, because the two are one quantity with one answer; the
+  same change made `round_up` refuse instead of wrapping (its caller's doc-comment had named
+  that multiply as *the* reachable overflow path while it stayed unchecked) and capped the
+  output reservation against `y_plane`, which is what let the property's dimension generators be
+  widened past `0..=32`. Derivation ④ of
+  [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) is the census
+  that finds the next one.
 - H.264 (epic #21) has neither an implementation nor an oracle.
 - The fuzz lane is nightly-only, so a newly added target is unguarded on the day it
   lands (ADR-0008).

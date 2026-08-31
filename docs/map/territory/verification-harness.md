@@ -45,6 +45,16 @@ everywhere else.
   hand-computed from FreeRDP with its bit-level derivation written out.
 - **Robustness is a property, not a vector**: "decode never panics on arbitrary
   bytes" covers an input space hand-written vectors cannot reach.
+- **A hang is not a red, so a no-panic property is silent on half the fact it automates**
+  (#262). [The invariant](../invariant/untrusted-decode-never-panics.md) says *panic, over-read,
+  **or loop unboundedly***, and only the first two make a property fail — non-termination makes
+  it *run*. Three of this territory's instruments go with it: nothing shrinks, so nothing lands
+  in `proptest-regressions/`; the mutation methodology asks whether removing a guard turns a
+  property **red** and a missing loop bound turns it **silent**; and the fuzz lane, which
+  ADR-0008 names as the answer for hangs, has no target for ADR-0012's consumption sites
+  because its roster is `ls fuzz/fuzz_targets/` and those functions parse nothing. **The only
+  structural backstop is a job timeout**, which is a gate fact rather than a harness one — see
+  [supply chain & gates](supply-chain-and-gates.md).
 - **The VM proves what only a server can** — the full connect sequence, licensing's
   "error means proceed", the graphics caps a real host advertises.
 - **Coverage is a discovery tool with no threshold**, scoped to the sans-IO core;
@@ -297,6 +307,18 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   captured the finalization leg via `JUSTRDP_CONNECT_CAPTURE_FILE` and walks it offline
   through `tpkt` → `x224` → `mcs` → `share` → `finalization`. That is a PDU-level replay,
   not a state-machine one — the machine still never sees the bytes.
+- **The most expensive thing this harness has ever done is run green for six hours** (#262).
+  `color::tests::to_rgba_is_total_over_arbitrary_dimensions` — a property this territory's own
+  #238/#241 pass had just added, mutation-checked and green — hung on ~43% of seeds, because its
+  `dimension()` generator has a `1 => any::<usize>()` arm and `to_rgba` looped `height` times at
+  `width == 0`. **10 cancelled jobs, ~56.4 runner-hours in one day**: `test` 6 jobs
+  (140/360/360/360/360/361 min = 32.4 h) and `coverage` 4 jobs at 360 each (24.0 h), the latter
+  because `cargo llvm-cov --workspace --exclude justrdp-tokio` runs the same property on a lane
+  that reports and does not gate, so nobody was watching it. Two things worth keeping:
+  **the generator arm stayed** — narrowing it would have restored the green by removing the
+  reach, and this file's whole *"a property that never reaches its subject asserts nothing"*
+  position forbids that; and **the fix that bounds the class is not in this territory at all**,
+  it is a `timeout-minutes` on every CI job.
 - **The census the no-panic obligation is derived from was scoped by crate until #241/#238,
   and both halves of it were blind in different ways.** `rg --files crates/justrdp-pdu/src`
   could not see a parser in the core (`tls::extract_subject_public_key`), and both commands
@@ -305,4 +327,9 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   [the invariant](../invariant/untrusted-decode-never-panics.md). What remains open is that
   derivation ③ is an **over-approximation adjudicated by hand** — it lists ~56 candidate
   `pub fn`s and the membership judgement is ADR-0012 §1's, so it bounds the work rather than
-  deciding it.
+  deciding it. **And the judgement was the half that failed, not the list** (#262): ③ named
+  `color::to_rgba`, the pass gave it an artifact, and the adjudication question (*does the
+  signature admit a value the arithmetic has no meaning for*) answers **no** for a zero extent
+  — correctly, and beside the point, because the defect was a loop bound. The question now has
+  a second half and the note carries a fourth derivation (④) that matches loops rather than
+  signatures.

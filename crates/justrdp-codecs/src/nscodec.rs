@@ -229,14 +229,25 @@ fn nsc_rle_decode(input: &[u8], original_size: usize) -> Result<Vec<u8>, NscErro
     Ok(out)
 }
 
-fn round_up(v: usize, n: usize) -> usize {
-    v.div_ceil(n) * n
+/// `None` when the rounded value overflows `usize`. **Checked rather than saturating, and the
+/// distinction is this module's own** — `plane_sizes` records that its four numbers are *bounds*
+/// `decode_plane` trusts, whose empty-input branch is `vec![0xFF; original_size]`, so a saturated
+/// `usize::MAX` turns an arithmetic overflow into an allocation of the address space. The same
+/// argument reaches one level down: this is the multiply that produces those bounds (#262).
+fn round_up(v: usize, n: usize) -> Option<usize> {
+    v.div_ceil(n).checked_mul(n)
 }
 
 /// The aligned plane dimensions FreeRDP allocates (`nsc_context_initialize`): width up to a
 /// multiple of 8, height up to a multiple of 2. Only relevant when chroma is subsampled.
-fn temp_dims(width: usize, height: usize) -> (usize, usize) {
-    (round_up(width, 8), round_up(height, 2))
+///
+/// `None` on overflow. This used to multiply unchecked while `plane_sizes`' doc-comment already
+/// named it as *the* reachable overflow path ("a declared 65535 becomes 65536 and `65536 * 65535`
+/// passes `u32::MAX`") — so the function panicked before returning the `Result` it promised.
+/// #211/#238 guarded the multiplies *in* `plane_sizes` and not the one in the helper it calls
+/// first (#262).
+fn temp_dims(width: usize, height: usize) -> Option<(usize, usize)> {
+    Some((round_up(width, 8)?, round_up(height, 2)?))
 }
 
 /// Expected decoded byte counts of the four planes `[Y, Co, Cg, Alpha]` for a `width`×`height`
@@ -263,7 +274,8 @@ pub fn plane_sizes(
             .ok_or(NscError::DimensionsOverflow { width, height })
     };
     if chroma_subsampled {
-        let (tw, th) = temp_dims(width, height);
+        let (tw, th) =
+            temp_dims(width, height).ok_or(NscError::DimensionsOverflow { width, height })?;
         let chroma = mul(tw >> 1, th >> 1)?;
         Ok([mul(tw, height)?, chroma, chroma, mul(width, height)?])
     } else {
@@ -311,7 +323,18 @@ pub fn reconstruct(
             reason: "leaves a chroma shift of 16 or wider, which has no meaning for i16",
         });
     }
-    let (temp_width, _) = temp_dims(width, height);
+    // A zero extent is zero work, and it has to be said here rather than inferred from the
+    // arithmetic: `total` is 0, every guard passes, and `for y in 0..height` below then walks a
+    // bare `usize` over empty rows. Identical to `color::to_rgba`'s hole and closed the same way
+    // (#262) — `Ok` with no pixels, placed after the `ColorLossLevel` check so an undefined shift
+    // is still reported at any extent. [ADR-0012](../../../docs/adr/0012-consumption-site-totality.md)
+    // §5: the totality argument covers the trip count of every loop a parameter bounds, not only
+    // the arithmetic inside it.
+    if width == 0 || height == 0 {
+        return Ok(Vec::new());
+    }
+    let (temp_width, _) =
+        temp_dims(width, height).ok_or(NscError::DimensionsOverflow { width, height })?;
     let [y_plane, co_plane, cg_plane, a_plane] = planes;
     let (y_stride, co_stride) = if chroma_subsampled {
         (temp_width, temp_width >> 1)
@@ -319,7 +342,13 @@ pub fn reconstruct(
         (width, width)
     };
 
-    let mut out = Vec::with_capacity(total);
+    // `total` is derived from the *declared* geometry, so reserving it outright lets a caller
+    // ask for an allocation the planes cannot possibly fill — an abort rather than the typed
+    // error the loop below would reach via `short()`. Each row reads `width` bytes of `y_plane`,
+    // so 4 bytes of output per luma byte is a true ceiling, and capping the *reservation* against
+    // it changes no result. Same ordering `color::to_rgba` gets for free by checking `src.len()`
+    // before `with_capacity`.
+    let mut out = Vec::with_capacity(total.min(y_plane.len().saturating_mul(4)));
     for y in 0..height {
         let y_row = y * y_stride;
         let co_row = if chroma_subsampled { y >> 1 } else { y } * co_stride;
@@ -523,6 +552,57 @@ mod tests {
     // --- slice 3: colour reconstruction. Vectors are hand-computed from the AYCoCg→RGB math and
     // the FreeRDP `nsc_decode` indexing (no oracle — pure spec math, per ADR-0007 / #118).
 
+    /// **A hang is not a red**, and `reconstruct_never_panics_on_arbitrary_input` below cannot
+    /// observe one — it would hang instead of failing. Same defect and same shape as
+    /// `color::to_rgba`'s (#262): at `width == 0` the `checked_mul` chain yields `total == 0`,
+    /// every guard passes, and `for y in 0..height` then walks a bare `usize`. Measured before
+    /// the guard: `Ok` after ~9 s at `1 << 30`, i.e. ~5 000 years at `usize::MAX`.
+    #[test]
+    fn reconstruct_returns_promptly_for_a_zero_extent_of_any_height() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let planes = [vec![0u8; 4], vec![0u8; 4], vec![0u8; 4], vec![0u8; 4]];
+            let _ = tx.send(reconstruct(&planes, 0, usize::MAX, 1, false));
+        });
+        let out = rx
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .expect("reconstruct did not return within 5s for a zero-width bitmap");
+        assert_eq!(out, Ok(Vec::new()));
+
+        // A second witness below the extreme, because the extreme is the point that lies here:
+        // `round_up`'s multiply inside `temp_dims` panics at `usize::MAX` and would report
+        // "returns promptly" while the hang lives one bit down.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let planes = [vec![0u8; 4], vec![0u8; 4], vec![0u8; 4], vec![0u8; 4]];
+            let _ = tx.send(reconstruct(&planes, 0, 1usize << 30, 1, true));
+        });
+        assert_eq!(
+            rx.recv_timeout(core::time::Duration::from_secs(5)),
+            Ok(Ok(Vec::new()))
+        );
+    }
+
+    /// `plane_sizes`' own doc-comment names `temp_dims` as the reachable overflow path — "a
+    /// declared 65535 becomes 65536 and `65536 * 65535` passes `u32::MAX`" — and returns a
+    /// `Result` to say so. `round_up` was `v.div_ceil(n) * n`, unchecked, so the function
+    /// panicked *before* the `Result` it promised. #211/#238 guarded the multiplies in
+    /// `plane_sizes` and not the one in the helper it calls first.
+    #[test]
+    fn plane_sizes_refuses_an_overflowing_round_up_instead_of_panicking() {
+        assert!(matches!(
+            plane_sizes(0, usize::MAX, true),
+            Err(NscError::DimensionsOverflow { .. })
+        ));
+        assert!(matches!(
+            plane_sizes(usize::MAX, 1, true),
+            Err(NscError::DimensionsOverflow { .. })
+        ));
+        // The checked path was always fine; pin it so the fix does not over-refuse.
+        assert!(plane_sizes(usize::MAX, 1, false).is_ok());
+        assert!(plane_sizes(64, 64, true).is_ok());
+    }
+
     #[test]
     fn reconstruct_non_subsampled_applies_the_aycocg_matrix() {
         // 2×1, ColorLossLevel 1 (shift 0). px0: Y100 Co10 Cg5 → R=105 G=105 B=85. px1: Y50 → grey.
@@ -723,10 +803,19 @@ mod tests {
         // is `pub` and takes the level as a bare parameter, so a generator bounded to `parse_header`'s
         // output asserts the parser rather than this function (ADR-0012 §5). Same convention the two
         // Progressive fuzz targets state for quant nibbles.
+        // **And the dimensions are now generated over the whole parameter type too.** The
+        // paragraph above made exactly this argument for `color_loss_level` and left `width` and
+        // `height` bounded to `0..=32` in the same signature — so the property asserted the
+        // caller for two of its three wire-derived parameters. That is what hid the
+        // non-termination at `width == 0` (#262): a generator that never draws a large `height`
+        // cannot observe a loop that only misbehaves on one. Reaching the extremes is safe now
+        // and was not before — the zero guard returns first, an overflowing `total` refuses, and
+        // the reservation is capped against `y_plane`, so a surviving draw runs at most as many
+        // rows as the generated planes can feed.
         #[test]
         fn reconstruct_never_panics_on_arbitrary_input(
-            width in 0usize..=32,
-            height in 0usize..=32,
+            width in prop_oneof![6 => 0usize..=32, 2 => 60_000usize..=70_000, 1 => any::<usize>()],
+            height in prop_oneof![6 => 0usize..=32, 2 => 60_000usize..=70_000, 1 => any::<usize>()],
             color_loss in any::<u8>(),
             subsampled in any::<bool>(),
             p0 in proptest::collection::vec(any::<u8>(), 0..=256),
