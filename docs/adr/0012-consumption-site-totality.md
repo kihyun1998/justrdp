@@ -1,6 +1,39 @@
 # 0012 — A parser's guarantee is not held at the point of use: consumption-site totality
 
-- Status: Accepted (promoted while working issue #211; conformance items #211, #233, #252)
+- Status: Accepted (promoted while working issue #211; conformance items #211, #233, #252, #262)
+  - Amendment 2026-08-31 (#262): **§5's disjunction is not exhaustive, and the missing half is
+    a loop rather than an expression.** As written it offers two ways to discharge the standing
+    rule — refuse what the arithmetic cannot take, or *"where the arithmetic is total for the
+    whole parameter type, a comment saying so and why"*. `justrdp_codecs::color::to_rgba`
+    satisfies the second **exactly**: at `width == 0` every guard is not merely total but
+    *passes* (`0 * bpp` is 0, `0 * height` is 0, and `src.len() < 0` is false, so the
+    source-length check succeeds rather than refusing), and the function still does not return,
+    because `for out_row in 0..height` walks a bare `usize` over empty rows. A property
+    generating `any::<usize>()` reaches that draw in **0.2% of cases and therefore ~44% of
+    runs** — `P(width == 0) = 6/9 x 1/33`, `P(height from the unbounded arm) = 1/9`, over
+    proptest's default 256 cases — which is why it was invisible until it was not, and why the
+    six healthy runs on either side of a killed one proved nothing. It cost ~56.4 runner-hours
+    across 10 cancelled CI jobs before anyone read a killed log. **So the totality argument §5 requires
+    covers the trip count of every loop a parameter bounds, not only the arithmetic performed
+    inside it** — a guard chain that validates arithmetic does not bound a loop. This is an
+    extension in the ADR-0002/0007 house pattern, not a rewrite: §1–§4 are about which module owns
+    a guarantee and stay as written; what moves is what §5 has to *check* before it is
+    discharged. **Routing note, because the wrong record was the tempting one:** this is not
+    §3. That section is titled *one **undefined** input, one answer*, and a zero extent is
+    defined for every function involved — `rle::decompress` and `planar::decompress` refuse it
+    as **policy** (`EmptyImage`), which is a different act from bounding a loop, and a
+    divergence row naming them against `to_rgba` would report a disagreement that does not
+    exist. **Nor is it the clamp this record rejects.** *Saturate or clamp at the point of use*
+    is declined below under ADR-0009 §3(b) (*"silent masking is forbidden"*), and a clamp is a
+    wrong answer substituted for a right one; `Ok(Vec::new())` for a zero extent is the right
+    answer — `[MS-RDPEGFX]` 2.2.1.2 makes `RDPGFX_RECT16` exclusive with no non-zero
+    requirement, so `right == left` is spec-legal and there is no divergence being hidden.
+    That the answer agrees with FreeRDP's *caller-supplied-destination* family and diverges
+    from its *allocate-and-return* family (`freerdp_glyph_convert_ex`, `color.c:265-267`,
+    `return nullptr`) is deliberate and argued at the site, on what the one reachable consumer
+    does with the error: `justrdp::egfx`'s uncompressed WTS1 arm propagates a `ColorError` with
+    `?`, which is fatal for the channel where every other codec arm there warn-and-skips.
+    See the Consequences bullet below for the second known member.
   - Amendment 2026-08-25 (#252): **§3 derives a case outside codecs, which is evidence for the
     rule rather than a limit on it.** Its sentence says *"two stages of one **codec** family"*,
     and two non-codec sites now reach for it: #253 (a Share Data header field enforced in one
@@ -188,6 +221,28 @@ this; it asserts the parser, not the function.
   from the wire (`framebuffer::resize`, `nscodec::plane_sizes`), which is a different distribution
   than this record's first four instances suggested: reachability is not rare in this class, it was
   under-sampled.
+  **Re-measured again 2026-08-31 (#262), and the enumeration was not the thing that failed.**
+  Derivation ③ *listed* `color::to_rgba`; #238/#241 worked it and gave it a no-panic property.
+  The defect that survived that pass is the one no artifact in either lane can observe — a
+  no-panic property **hangs** rather than failing on non-termination, and a hang never shrinks,
+  so it never lands in `proptest-regressions/` either. So the fifth defect in this class was
+  found by a CI bill, not by the census, and the census was right. What the adjudication step
+  missed is stated as the Amendment above: ③'s membership question (*"does the signature admit
+  a value the arithmetic has no meaning for"*) answers **no** for a zero extent, which is
+  correct and beside the point. `nscodec::reconstruct` (`nscodec.rs`, `for y in 0..height` with
+  `height` a bare `usize`) was the second known member and is **closed in the same change**,
+  because one quantity gets one answer across a family and filing the sibling would have left
+  the family split for as long as the issue sat. Two things travelled with it: `round_up`'s
+  multiply now refuses instead of wrapping — `plane_sizes`' own doc-comment had named that
+  multiply as *the* reachable overflow path while it stayed unchecked, so the function panicked
+  before returning the `Result` it promised — and the output reservation is capped against
+  `y_plane`, without which widening the property's dimension generators past `0..=32` would have
+  traded a hang for an allocation abort. That widening is the §5 argument this record already
+  makes for `color_loss_level`, applied to the two parameters in the same signature it had been
+  left off. It is the only other member — `rle`/`planar` refuse a zero extent as policy, and every other loop in
+  the codec and framebuffer paths is either `u16`-derived or guarded before the loop
+  (`framebuffer::blit`, `egfx`'s surface ops). Derivation ④ in the invariant note is the
+  command that finds the next one.
 - **It is not a newtype mandate.** §1 is satisfied by a check at the consumption site; the
   guarantee is *not* required to move into the type. See the rejected alternative below for why
   the type-side answer was measured and declined.

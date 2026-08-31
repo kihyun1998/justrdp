@@ -39,6 +39,10 @@ jobs:
   # test.yml's `map` job runs `check_map.py` on.
   targets:
     runs-on: ubuntu-latest
+    # Bounded for the same reason as `test.yml`'s jobs, whose block carries the incident
+    # measurement (#262): an unbounded job burns six runner-hours before GitHub kills it.
+    # Derives the matrix with stdlib Python; seconds.
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.derive.outputs.matrix }}
     steps:
@@ -75,6 +79,11 @@ jobs:
   fuzz:
     needs: targets
     runs-on: ubuntu-latest
+    # Bounded for the same reason as `test.yml`'s jobs, whose block carries the incident
+    # measurement (#262): an unbounded job burns six runner-hours before GitHub kills it.
+    # The fuzzing itself is already self-bounded (`-max_total_time=300`); the nightly
+    # install and the target build are not, which is the part this covers.
+    timeout-minutes: 30
     strategy:
       # One target's crash must not cancel the others — each is an independent safety net.
       fail-fast: false

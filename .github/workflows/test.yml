@@ -23,6 +23,36 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # THE INCIDENT MEASUREMENT FOR THE WHOLE REPO LIVES HERE. Every other workflow carries a
+    # bound and a one-line pointer back to this block rather than a copy of these numbers.
+    #
+    # A job with no `timeout-minutes` gets GitHub's default of 360, so a hang costs six runner-
+    # hours and is indistinguishable from a slow queue (#262). Measured job-level over the last
+    # 120 runs, this job's duration is bimodal: healthy runs sit in a 1-4 minute band and
+    # unhealthy ones run to the kill, with **nothing at all in between**. The bound is chosen
+    # against that gap rather than as a multiple of the healthy maximum -- a multiple rots the
+    # first time a healthy run gets slower, and this one did on its own PR (4.08 min, past the
+    # 3.28 the band held when this was written). The gap does not: 20 sits inside a void that
+    # runs from ~4 to 140 minutes, so it cannot reach a legitimate run and still catches a hang.
+    #
+    #   test      6 jobs cancelled at 140 / 360 / 360 / 360 / 360 / 361 min = 32.4 runner-hours
+    #   coverage  4 jobs cancelled at 360 min each                          = 24.0 runner-hours
+    #                                                                 total ~56.4 runner-hours
+    #
+    # `coverage.yml` is in that table because it runs `cargo llvm-cov --workspace --exclude
+    # justrdp-tokio`, i.e. the *same* justrdp-codecs property — so the incident was never confined
+    # to this file, and bounding only this file would have left 24 of those 56 hours unbounded on
+    # the post-merge lane nobody watches a PR check for. #262 named `test.yml`; the requirement it
+    # gave ("bound every future hang, not this one") is what is actually implemented.
+    #
+    # The two runs that *looked* long at 31 and 105 minutes were queue time — job-level, both took
+    # 2 minutes. Cold-cache checked rather than assumed: the toolchain-pin bumps rotate the
+    # rust-cache key, and the runs following them stay inside the band.
+    #
+    # This is deliberately not folded into the `to_rgba` guard that closed the seed: a guard fixes
+    # one defect, a bound fixes the class. `proptest-regressions/` cannot back it up either — a
+    # hang never shrinks, so it never lands there.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -59,6 +89,9 @@ jobs:
   # found four one-way edges on its first run.
   map:
     runs-on: ubuntu-latest
+    # Stdlib Python over a few dozen Markdown files: this job has completed in under a minute on
+    # every one of the last 30 runs. 10 is far past any of them and still bounds a runaway.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 

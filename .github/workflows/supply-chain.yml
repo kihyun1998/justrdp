@@ -25,6 +25,10 @@ permissions:
 jobs:
   just-shield:
     runs-on: ubuntu-latest
+    # Bounded for the same reason as `test.yml`'s jobs, whose block carries the incident
+    # measurement (#262): an unbounded job burns six runner-hours before GitHub kills it.
+    # Healthy max is under a minute over 37 successes.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
