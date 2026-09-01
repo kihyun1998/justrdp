@@ -15,6 +15,29 @@
     recorded instead of re-derived a third time. **What this does not decide** is the
     *completeness* question — whether the Font Map alone may gate session-active — which #252
     settled as "no ladder" on its own evidence and which is not a posture question at all.
+  - Amendment 2026-08-31 (#268): **§3(b) names a `tracing` target that has never existed, and
+    the first record written *because of* §3(b) could not use it.** The rule says each accepted
+    divergence is logged as *"a `rdp_interop`-targeted debug/warn record"*. `rg rdp_interop`
+    over the whole repository returns **one hit — this line**; `git log -S` finds it in no
+    commit that ever touched `crates/`. The convention that actually shipped is **per-area**:
+    19 `rdp_egfx`, 6 `rdp_drdynvc`, plus `rdp_finalization`, `rdp_shutdown_denied`,
+    `rdp_demand_active` and eight more, each named for where the divergence was seen rather
+    than for the fact that it *is* one. #268's per-frame paint-budget warn follows the shipped
+    convention (`target: "rdp_egfx"`), so **read §3(b) as requiring an observable `tracing`
+    record and not as fixing its target string**. Recorded rather than silently corrected
+    because the mechanism half of §3(b) is the half a reader would otherwise try to obey: it
+    is a decision surface with no gate over it, and it drifted from day one.
+
+    **Second, and reported rather than resolved: §2's enumeration does not reach this
+    instance either.** An over-budget entry count is not a rendering-feature
+    self-inconsistency — it is well-formed, spec-legal, and inconsistent with nothing the
+    server advertised. What justifies skipping it is a **resource ceiling that is ours**, and
+    §3(b) is what obliges the record. That is the same shape the 2026-08-25 amendment above
+    recorded from #252 (§1 and §2 are not a partition; §3 does the licensing), now with a
+    third instance at a third layer, so it is **deliberately not** widened here: the amendment
+    above already says the enumeration is not a partition, and adding "a resource bound we
+    chose" to §2's list would convert an enumeration of *server* behaviours into a mixed list.
+    The posture stands: tolerate, and make it observable.
 - Date: 2026-07-03
 - Closes issue #101
 

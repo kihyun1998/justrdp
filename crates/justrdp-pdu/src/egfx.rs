@@ -390,6 +390,10 @@ fn decode_body(cmd_id: u16, body: &[u8]) -> Result<EgfxPdu<'_>, DecodeError> {
             let mut color_bgrx = [0u8; 4];
             color_bgrx.copy_from_slice(cur.read_slice(4)?);
             let count = usize::from(cur.read_u16_le()?);
+            // A **reservation** cap, not a count cap — the loop below still runs `count`
+            // times, and #268's body was written reading this as the latter. Nothing here
+            // bounds the work: an entry is 8 bytes on the wire and can name a whole surface.
+            // The work bound is `justrdp::egfx`'s per-frame paint budget (#268), not this.
             let mut rects = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
                 rects.push(Rect16::decode(&mut cur)?);
@@ -405,6 +409,8 @@ fn decode_body(cmd_id: u16, body: &[u8]) -> Result<EgfxPdu<'_>, DecodeError> {
             let dest_surface_id = cur.read_u16_le()?;
             let src_rect = Rect16::decode(&mut cur)?;
             let count = usize::from(cur.read_u16_le()?);
+            // Reservation cap, not a count cap; see the `CMDID_SOLID_FILL` arm above. A
+            // destination point is 4 bytes and its cost is a bitmap chosen in another PDU.
             let mut dest_points = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
                 dest_points.push(Point16::decode(&mut cur)?);
@@ -432,6 +438,8 @@ fn decode_body(cmd_id: u16, body: &[u8]) -> Result<EgfxPdu<'_>, DecodeError> {
             let cache_slot = cur.read_u16_le()?;
             let surface_id = cur.read_u16_le()?;
             let count = usize::from(cur.read_u16_le()?);
+            // Reservation cap, not a count cap; see the `CMDID_SOLID_FILL` arm above. A
+            // destination point is 4 bytes and its cost is a bitmap chosen in another PDU.
             let mut dest_points = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
                 dest_points.push(Point16::decode(&mut cur)?);

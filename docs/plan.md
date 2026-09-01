@@ -180,6 +180,45 @@ These cost real time to find. Bake them into the design from day one.
   contributed **0 rectangles and 0 pixels**, so the omission is inert *as long as a frame's
   successive regions do not overlap each other's tiles*. Recorded with its validity condition
   rather than as "we checked and it was fine".
+- **A real server sends `destPtsCount == 1` — always — and the busiest frame it produces paints
+  exactly one desktop, once** (#268, measured 2026-08-31 over two live 1280x800 sessions against
+  this VM; instrumented probe removed, tree verified clean). The three list-bearing EGFX commands
+  each do one unit of surface-clipped pixel work per wire-declared entry, and nothing bounded the
+  count, so a shape this model already admits — two 5120x5120 surfaces (200 MiB of the 256 MiB
+  surface budget) plus a 100 MiB cache entry, every one of them separately legal — turned one
+  262 KB PDU into **~505–540 s of `--release` CPU**, returning `Ok`. What the server actually
+  sends:
+
+  | | observed |
+  |---|---|
+  | `CACHE_TO_SURFACE` | 2 748 PDUs, `destPtsCount == 1` on **every one** |
+  | `SOLID_FILL` | 33 PDUs, `fillRectCount == 1` on **every one** |
+  | `SURFACE_TO_SURFACE` | 10 PDUs, `destPtsCount == 1` on **every one** |
+  | cache entry sizes | **64x64 or 64x32**, nothing else |
+  | painted bytes per frame | 89 frames, max **4 096 000** = exactly 1280 x 800 x 4 |
+  | PDUs per message | max **266** |
+  | draws outside a `StartFrame` bracket | **0** |
+
+  Four of these decide design, not just documentation. **The count distribution is degenerate**,
+  so a cap on the *count* — the cheapest of #268's three candidates, and the one its own body
+  argued for — would be indistinguishable from a cap at 1 against this server and would prove
+  nothing about a real list; the bound had to be on the *work*. **The busiest frame paints one
+  desktop's worth of bytes**, which is what makes `MAX_TOTAL_SURFACE_BYTES` (256 MiB) a *derived*
+  per-frame ceiling rather than a picked one — every surface that could exist, painted once — at
+  ~64x observed traffic. **266 PDUs per message** is why a test helper that wraps one PDU per
+  message cannot tell a per-frame budget reset from a per-message one: several frames genuinely
+  share a message here, so the two mechanisms are only distinguishable inside one blob. And
+  **zero unbracketed draws** is a measurement of a path the code nonetheless has to hold — no arm
+  checks `in_frame` before painting, so a server that never sends `StartFrame` would sit outside
+  frame-scoped accounting forever; that guard is written against a case this server does not
+  produce, and the figure is here so nobody later reads it as dead code.
+
+  Standing caveat, per [capture coverage follows what we
+  advertise](map/invariant/capture-coverage-follows-what-we-advertise.md): **one** WS2022 box,
+  **one** resolution, and **`connectionType` was not recorded for this run** — which matters more
+  here than usual, because §0 already proves that field decides whether the Progressive
+  refinement ladder exists at all, and refinement is what drives these commands. Read every row
+  as *"this server, so configured, never sent a list"*, never as *"servers do not send lists"*.
 - **HYBRID_EX early-auth PDU.** A HYBRID_EX server sends a 4-byte LE **Early User Authorization
   Result** PDU immediately after CredSSP, *before* MCS. If not consumed, capability exchange
   desyncs and hangs.
@@ -601,6 +640,21 @@ no implementation here. Next: grill §10 + the Part II open questions, then slic
   [`docs/map/invariant/decoder-dimension-overflow-32bit.md`](map/invariant/decoder-dimension-overflow-32bit.md)
   for the per-site state, including the two decoders whose guard still uses `usize::MAX`
   where `Vec`'s ceiling is `isize::MAX`.
+
+  **Measured 2026-08-31 (#268), and clause (2) above needs a third category rather than a
+  correction.** The same file now *does* warn-and-skip — `SOLID_FILL`, `SURFACE_TO_SURFACE`
+  and `CACHE_TO_SURFACE` skip the entries past a per-frame paint budget, `tracing::warn!` once
+  per command, and return `Ok` — so the sentence *"both sites that now carry this bound return
+  a typed error"* is a statement about the **allocation** bound and must be read as one. The
+  split #263 wrote has two members (a decoder limitation ⇒ tolerate; an allocation bound ⇒
+  refuse) and the deciding question turns out not to be *"is it an allocation"* but **"is the
+  command well-formed?"**. An over-budget count is: every field is legal, the list is complete,
+  and the PDU is exactly what the spec permits — there is nothing to report an error *about*,
+  and refusing it would drop a session over a resource ceiling that is ours and not the
+  spec's. A `destRect` naming a bitmap no admissible surface could hold is not well-formed, and
+  that is why it refuses. Microsoft's own conformance suite draws the line in the same place
+  (see the `## Deliberate divergences` row owed for this, and #270 on what an EGFX `Err`
+  actually costs today — every one of them drops the whole connection, not the channel).
 - [ ] **M — Zeroization of secrets.** Any in-memory credential (password, PIN, private key, session nonce) must be overwritten with zeros after use so a dump of the process heap doesn't leak it. Use `zeroize` crate or `volatile_write`. *ironrdp ref: `sspi` does this; we inherit it.*
 - [ ] **M — No credentials in logs.** Password is never logged (see 11d redaction). If an error occurs during CredSSP, the error message must not include the challenge/response tokens, only "CredSSP failed: <reason>". *ironrdp ref: this repo's auth.rs + error redaction.*
 - [ ] **O** — Fuzzing of decoders. If codec coverage expands (Progressive, H.264, NSCodec), fuzz the decoders with AFL/libFuzzer to find panics/OOM in untrusted input. *Not in MVP.*

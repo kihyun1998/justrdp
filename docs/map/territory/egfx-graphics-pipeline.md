@@ -49,18 +49,66 @@ acknowledge frames. It is server→client only, and it is reachable only if
   surface that can exist names a bitmap nothing could hold. A codec cannot write this
   bound: an *arithmetic* guard there closes only the 32-bit half, and the number that
   would make a magnitude cap principled belongs to the surface model (#263).
+- **One number answers two different questions here, and the shared derivation is the reason
+  — not the convenience.** `MAX_TOTAL_SURFACE_BYTES` is *also* the **per-frame paint budget**
+  (#268). The three list-bearing commands — `SOLID_FILL`, `SURFACE_TO_SURFACE`,
+  `CACHE_TO_SURFACE` — each did one unit of surface-clipped pixel work per wire-declared entry
+  with nothing bounding the count, so a shape this model already admits (two 5120x5120 surfaces,
+  200 MiB of the 256 MiB set, plus a 100 MiB cache entry, each separately legal) turned a fixed
+  262 KB PDU into **~505–540 s of `--release` CPU**, returning `Ok`. The magnitude bound asks
+  *how much may exist at once*; the work budget asks *how much may happen in one frame*. Both
+  answers are **"every surface that could exist, once"** — past that the frame is repainting
+  pixels it has already painted this frame — so the two are the same derivation applied to two
+  quantities, and a change to the constant moves both. Read the bullet above and this one
+  together before touching the number.
+
+  Three properties of the budget are load-bearing and none is obvious from the constant.
+  **It is charged on *clipped* bytes**, which is why `Surface::blit` and `Surface::fill` now
+  return what they painted: a destination point far off the surface costs nothing and must not
+  be charged as if it did — the same tolerance the bullet above declines `is_within_surface` to
+  keep, now with a price attached. **It resets at `StartFrame` *and* per message when no frame
+  is open**, because nothing in this model requires a frame in order to draw — no arm checks
+  `in_frame` before painting — so a server that never sent `StartFrame` would otherwise sit
+  outside frame-scoped accounting forever. And **over budget skips the remaining entries and
+  returns `Ok`**: the count is well-formed, so there is nothing to raise an error about, and
+  the session and the channel both survive. That direction is a divergence from both references
+  and from nothing in the spec; see `## Known holes`.
+
+  Sized against the real server rather than against the type: the busiest of 89 measured frames
+  painted **4 096 000 bytes — exactly one 1280x800 desktop**, and every `destPtsCount` and
+  `fillRectCount` observed was **1**. The ceiling therefore sits ~64x above observed traffic,
+  which is the evidence that it bounds an attack and not a server (`docs/plan.md` §0).
+
 - **The bound is deliberately *not* the destination surface's own dimensions**, which is
   tighter and is what FreeRDP does (`is_within_surface`, `gdi/gfx.c:386`, refusing before
   its `1ull * bpp * w * h` at `:390`; `ironrdp-egfx` checks the same condition and only
-  `warn!`s). A partially off-surface rectangle is clipped by `Surface::blit` today, and
+  `warn!`s). An off-surface rectangle is **clipped** rather than refused, and
   ADR-0009 says not to trade a tolerance we already have for a bound the spec never asked
   for — recorded with the honest caveat that no capture here has ever shown a real server
   sending an off-surface `destRect`, so the tolerance being kept is unobserved too.
 
+  **The tolerance holds at all four surface routines as of #268, and this bullet used to assert
+  it from one.** The sentence above read *"a partially off-surface rectangle is clipped by
+  `Surface::blit` today"*, which was true — `blit` is the routine the `destRect` path actually
+  reaches — and was **read as a statement about the surface model**, because that is what the
+  decision it supports is about. `Surface::extract`, which `SURFACE_TO_SURFACE` and
+  `SURFACE_TO_CACHE` reach with a `src_rect` taken straight off the wire, clipped `w`/`h` and
+  never `x`, and was the one of the four routines without a zero-extent early return: the row
+  loop still ran and evaluated `&self.rgba[off..off]` with `off` past the end of the buffer — a
+  zero-length slice at an out-of-range **start**, which panics. On an ordinary 1920x1080 surface
+  `left == 1920` is the last legal offset and `left == 1921` panicked
+  (`range start index 8294404 out of range for slice of length 8294400`), reachable with
+  `destPtsCount == 1` and no unusual geometry. **The decision is unchanged and was never in
+  doubt** — declining `is_within_surface` costs nothing now that the tolerance is real at every
+  site. What was wrong is this record's account of its own coverage, and the way it was wrong is
+  the part to carry forward: the claim was checked at one routine and written as if it covered
+  the family. Generalised one level out in
+  [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md).
+
 ## Code
 
 - `justrdp/src/egfx.rs` — `GraphicsProcessor`, `Surface`, `CachedBitmap` (`mapped`,
-  `dirty`), `MAX_SURFACE_DIM`, `MAX_TOTAL_SURFACE_BYTES`
+  `dirty`, `frame_paint`), `MAX_SURFACE_DIM`, `MAX_TOTAL_SURFACE_BYTES`, `note_budget`
 - `justrdp-pdu/src/egfx.rs` — `EgfxPdu`, `Rect16`, `Point16`, `decode_all`,
   `encode_caps_advertise`, `encode_frame_acknowledge`, `wrap_uncompressed`
 - `justrdp-codecs/src/zgfx.rs` — `Zgfx`, `ZgfxError`, `History`, `BitReader`,
@@ -132,6 +180,23 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   that table is owned by [`docs/agents/thegraph.md`](../../agents/thegraph.md) and only a
   `/grill-the-graph` run may write it, so it is recorded here in the meantime.
 
+- **A second `## Deliberate divergences` row is owed, and this one is load-bearing for a
+  decision rather than for a tolerance nobody pays for** (#268). justrdp **skips** the entries
+  past a per-frame paint budget and keeps both the channel and the session. **FreeRDP** closes
+  the graphics channel on a failed graphics command — `drdynvc_main.c`, `if (status !=
+  CHANNEL_RC_OK) status = dvcman_channel_close(...)`, introduced deliberately in `17e0d251`
+  (2020-03-04) *"as expected by Microsoft's windows protocols test suite"*. **IronRDP** does not
+  bound the count at all, and its compositor paint operations are infallible (`-> ()`), so it
+  has no place to put a refusal even if it wanted one. **Microsoft's own conformance suite**
+  expects a whole-connection drop for a *structurally inconsistent* graphics command but
+  expects *tolerate and acknowledge the frame* for a `CACHE_TO_SURFACE` naming a nonexistent
+  cache slot — and **an over-budget count is well-formed**, which puts it on the tolerate side
+  of Microsoft's own line. That is the argument for skip rather than refuse, and it is recorded
+  nowhere else. Two siblings bound how much this could be got wrong: **#270** (which DVC errors
+  should close a channel versus drop the connection — every one drops it today, so "refuse"
+  here would have cost the whole session, not the channel) and **#271** (EGFX caps stop at
+  `CAPVERSION_10`, so the spec's own channel-reset mechanism is unreachable from here).
+
 - **Both decoders are self-owned.** zgfx crossed in #189 and epic #158 (slices #167–#172)
   closed the Progressive half: the self-owned
   decoder (`justrdp_codecs::rfx::progressive::Progressive`) is the **live** WTS2 decoder as
@@ -170,8 +235,37 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   sentence. Not an ADR-0009 amendment — the rule is right and the code does not follow it —
   and worth a `rdp_egfx` warn naming declared-versus-clipped, which would also be the first
   evidence in this repo about whether a real server ever sends one.
+
+  **#268 widened this hole rather than closing it, and sharpened why it is one.** The clip is
+  now silent at four routines instead of three, and the one that was added is the one that
+  *panicked* — so for the whole time the tolerance was argued from, `extract` was emitting no
+  record of clipping and also not clipping. An unobservable tolerance is not only
+  indistinguishable from a bug to a reader; it is indistinguishable from an absent one to the
+  test suite, which is the concrete cost §3(b)'s sentence had not yet been charged here.
+
+  **#268's second half moved it, and by less than it looks.** `note_budget` emits the first
+  `rdp_egfx` warn in this territory that names *declared versus painted* — which is the shape
+  §3(b) has been asking for, and it is exactly the record the bullet above proposed. It fires
+  on the **budget** cut, not on the **clip**: a `CACHE_TO_SURFACE` whose points all land off
+  the surface still paints nothing, is charged nothing, stays inside budget, and says nothing.
+  So the hole is now narrower and sharper rather than closed — the observable case is the one
+  where *we* refused work, and the unobservable case is still the one where the *server's*
+  geometry was discarded, which is the half that would be evidence about a real server. Closing
+  it is a one-line addition at the same four routines and it is deliberately not folded in
+  here, because the budget warn and a clip warn answer different questions and a single record
+  that fires for both would be unreadable as either.
+
 - H.264 / AVC420 / AVC444 (epic #21) is absent — no oracle exists for it either
   (ADR-0002's amendment says so explicitly).
 - Surface-to-surface and surface-to-cache commands are implemented against one
   server's behaviour; the VM's advertised cap set bounds what has ever been
-  exercised.
+  exercised. **#268 put numbers on how thin that is**, which makes the hole smaller and
+  much more precise: over two live 1280x800 sessions this server sent **10**
+  `SURFACE_TO_SURFACE` PDUs and **2 748** `CACHE_TO_SURFACE` PDUs, and **every single one
+  carried `destPtsCount == 1`** — so the *list* half of these commands has never been
+  exercised by a real server at all, at any length above one. Cache entries were **64x64 or
+  64x32** and nothing else. Any claim here about multi-point behaviour is derived from the
+  spec and from our own tests, never observed; and per
+  [capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
+  even that is one box at one resolution with `connectionType` unrecorded for the run
+  (`docs/plan.md` §0).

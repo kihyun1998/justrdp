@@ -181,8 +181,19 @@ Hand-written additions no tool can find:
   and needs something to adjudicate against. Every caller of `Surface::bytes` is
   downstream of `CREATE_SURFACE`'s `> MAX_SURFACE_DIM` refusal, so both factors are at
   most 16384 and the product is at most 1 GiB; `Surface::extract` clips `w`/`h` to the
-  surface's own dimensions before any multiply, so its reserve is bounded by a buffer
+  surface's own dimensions before any multiply, so its **reserve** is bounded by a buffer
   that already exists (#263).
+
+  **Say what the by-construction argument is about, not just that there is one (#268).**
+  `Surface::extract`'s entry above is exact and it is a claim about the multiply; the
+  comment it asks for was written that way and was read as a claim about the function,
+  which panicked on `&self.rgba[off..off]` because clipping `w` does not clip `x`. Nothing
+  in this note was falsified — allocation sizing is its scope and the reserve was never
+  the defect — but this is where the comment it mandates gets written, so the mandate
+  carries the qualifier: **name the step**. A comment reading "total by construction" over
+  a function that also indexes is an invitation to stop reading, and the wider claim is
+  the one a reader takes away. The instance is in
+  [untrusted decode never panics](untrusted-decode-never-panics.md)'s Discovery history.
 
 If a site satisfies the
 invariant by *construction* (a dimension already clamped by a `u16` cap earlier in
