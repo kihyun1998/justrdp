@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""thegraph `gate` runner (justrdp) -- 8 gates, 9 commands, each run BARE.
+"""thegraph `gate` runner (justrdp) -- 8 gates, 10 commands, each run BARE.
 
-Build stamp: thegraph/SKILL.md md5:7c624aedc9521627fc1985d2eae61b0d (2026-08-31).
+Build stamp: thegraph is THREE files as of this stamp --
+  SKILL.md          md5:f73cef09189056e3ed7713a81177becc
+  NODES.md          md5:82d1538acc2c35dd2fbcb3cecded3f66
+  BUILD_CONTRACT.md md5:a4fc95f7e6d1605869a33e8c2bafb2c6   (2026-09-02)
 Graph: docs/agents/thegraph.md. Method: the `thegraph` skill.
 
 Why this is a script rather than a list someone types: a gate must be able to
@@ -108,6 +111,14 @@ GATES: list[tuple[str, str, list[list[str]], str]] = [
         "ADR-0013's pin means one added under the old default is absent under the "
         "pinned one. Names BOTH crates: two of the five territories the invariant "
         "covers (EGFX surface allocation, the framebuffer) live in `justrdp`.",
+    ),
+    (
+        "grants",
+        "grants.py -- invariant (1) over .claude/agents",
+        [[PY, "scripts/thegraph/grants.py"]],
+        "the only gate that can see a generated agent's tool grant. A grant wider "
+        "than its brief compiles, tests green and lints clean, so invariant (1) is "
+        "enforced here or nowhere. Needs no toolchain and no network.",
     ),
 ]
 

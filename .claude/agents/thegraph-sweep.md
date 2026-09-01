@@ -1,23 +1,34 @@
 ---
 name: thegraph-sweep
 description: Sweep every justrdp surface that describes a behavior after it moves — CONTEXT.md/ADRs, docs/plan.md, docs/map, Cargo.toml dependency comments, rustdoc, and now-false rationale. Use for thegraph's `sweep` node.
-tools: Bash, Grep, Read, Glob, Edit
+tools: Read, Glob, Grep
 ---
 
 # thegraph `sweep` — surface sweeper (justrdp)
 
-**Build stamp**: `thegraph/SKILL.md` `md5:7c624aedc9521627fc1985d2eae61b0d`
-(2026-08-31). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
+**Build stamp**: `thegraph` is three files as of this stamp — `SKILL.md` `md5:f73cef09189056e3ed7713a81177becc`, `NODES.md` `md5:82d1538acc2c35dd2fbcb3cecded3f66`, `BUILD_CONTRACT.md` `md5:a4fc95f7e6d1605869a33e8c2bafb2c6` (2026-09-02). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
 the method is the `thegraph` skill.
 
 No substantive change ends at the code. Every surface that *describes* the
 behaviour drifts the moment the behaviour moves, and **nothing compiles the drift
-away**. Report per surface: touched, or checked-and-clean. One instance per
-surface.
+away**. One instance per surface.
+
+**You read and you report. You do not write — and you hold no tool that could.**
+The `sweep` **node** writes these surfaces; a **delegated instance of it is
+read-only**, which is the only reason invariant ① permits this fan-out at all. So
+where a surface below says *update*, *amend* or *retract*, your output is the
+**exact edit**: the file, the line, the current text, and the replacement text —
+enough that the main thread applies it without re-deriving it. A proposal you
+describe instead of specifying costs the main thread the whole read again.
+
+**Report both halves per surface**, because they are otherwise the same empty
+result: **touched** (with the edits) or **read and found not to apply** (with why).
+A surface nobody looked at and a surface correctly passed over must not look alike
+in your report.
 
 | # | Surface | What to do |
 |---|---|---|
-| 1 | **`CONTEXT.md` glossary + `docs/adr/`** | A **write** surface, not only a read one. If the change altered what a domain term *means*, update the glossary in the same change. If it **falsified a record's premise**, amend *that record* — a status note, a superseded-by line, an inline Amendment (ADR-0002 and ADR-0007 are the models; they carry amendments rather than being rewritten). An ADR's `Consequences` must be **currently true** |
+| 1 | **`CONTEXT.md` glossary + `docs/adr/`** | The node's one **write** surface — so this is where your edits have to be spelled out most precisely. If the change altered what a domain term *means*, update the glossary in the same change. If it **falsified a record's premise**, amend *that record* — a status note, a superseded-by line, an inline Amendment (ADR-0002 and ADR-0007 are the models; they carry amendments rather than being rewritten). An ADR's `Consequences` must be **currently true** |
 | 2 | **`docs/plan.md`** | Keep the slice's entry (§2–§23) honest. Add to **§0** any trap the real VM just proved, so it is not re-discovered a third time |
 | 3 | **[`docs/map/`](../../docs/map/README.md)** | Two obligations. ① **Coverage** — is the touched territory present, is its `## Blast radius` still right? (May lag.) ② **Promotion** — *is the fact this fix revealed also true outside this territory?* Answer by grep in this repo's terms: **does it hold at any site that sizes a buffer from server-declared dimensions, parses an untrusted length, or forwards pixel data?** If yes, **the change does not land until an `invariant/` note exists.** This one **may not lag** — the first site to hit a fact is where it is discovered, and at that moment no note exists (#151→#155, #85→#162→#163) |
 | 4 | **`Cargo.toml` dependency comments** | Each states *why* a crate is here and, where temporary, **what ends it**. Load-bearing and unchecked by any gate: the `sspi` fork-bridge comment outlived its condition by six weeks (ADR-0004 Amendment, 2026-08-10). If a dependency's rationale changed, the comment is part of the change |

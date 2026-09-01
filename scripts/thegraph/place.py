@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """thegraph `place` guard (justrdp) -- the tree rule x the diff.
 
-Build stamp: thegraph/SKILL.md md5:7c624aedc9521627fc1985d2eae61b0d (2026-08-31).
+Build stamp: thegraph is THREE files as of this stamp --
+  SKILL.md          md5:f73cef09189056e3ed7713a81177becc
+  NODES.md          md5:82d1538acc2c35dd2fbcb3cecded3f66
+  BUILD_CONTRACT.md md5:a4fc95f7e6d1605869a33e8c2bafb2c6   (2026-09-02)
 Graph: docs/agents/thegraph.md. Method: the `thegraph` skill.
 
 This is the `place` node's `code` decider, and it also runs again at `gate` on the

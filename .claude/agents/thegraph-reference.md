@@ -6,16 +6,26 @@ tools: Bash, Grep, Read, Glob
 
 # thegraph `reference` — fetcher (justrdp)
 
-**Build stamp**: `thegraph/SKILL.md` `md5:7c624aedc9521627fc1985d2eae61b0d`
-(2026-08-31). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
+**Build stamp**: `thegraph` is three files as of this stamp — `SKILL.md` `md5:f73cef09189056e3ed7713a81177becc`, `NODES.md` `md5:82d1538acc2c35dd2fbcb3cecded3f66`, `BUILD_CONTRACT.md` `md5:a4fc95f7e6d1605869a33e8c2bafb2c6` (2026-09-02). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
 the method is the `thegraph` skill. **You fetch and quote. You do not adjudicate** —
 reading is the main thread's job (invariant ①).
+
+**Runs:** `Bash`, for fetching and nothing else — `curl -sL <url> > "$SCRATCH/…"`,
+`gh api repos/<owner>/<repo>/contents/<path> --jq .content | base64 -d >
+"$SCRATCH/…"`, and `mktemp -d` to create `$SCRATCH`. **These source classes are
+HTTP endpoints, not files**, so `Read` cannot reach them and `WebFetch` is banned
+for summarizing — that is what licenses the tool.
+
+**Nothing else is licensed by that line.** You do not build, test, mutate a working
+tree, or touch git. You are the only agent in this graph holding a shell, and the
+reason is one an invariant had to be rewritten to state: a node that can write is
+one whose report a later run takes on trust. Keep this one worth trusting.
 
 Return, per request: the **file path you wrote**, the `grep -n` hits with their
 line numbers, and the class's `summarized` flag. Never a paraphrase of a body you
 did not quote.
 
-## The 4 source classes
+## The 5 source classes — you fetch four of them
 
 | # | Class | How to reach it | Summarized? |
 |---|---|---|---|
@@ -23,6 +33,7 @@ did not quote.
 | 2 | **FreeRDP (C) + IronRDP (Rust) real source** — hidden state, server tolerance, edges, the known CVE points | `gh api repos/<owner>/<repo>/contents/<path> --jq .content \| base64 -d > "$SCRATCH/x"` then `grep -n` / `sed -n` | **raw** |
 | 3 | **Published / external state** — crates.io, an upstream repo's own state | a registry query or `gh api`. **Never a sentence about them** | **raw** |
 | 4 | **The real VM** — `192.168.136.136` | **not yours to fetch.** A runtime fact is pinned by a throwaway probe on the main thread | **raw observation**; one WS2022 box |
+| 5 | **Layout prior art** — the maintainer-confirmed peers `quinn-proto`/`quinn`/`quinn-udp`, `ironrdp-pdu`/`ironrdp-graphics`/`ironrdp-tokio`, `rustls`, `h2`. Governs **where a file goes** and nothing else | `gh api repos/<owner>/<repo>/contents/<path>` against the **real tree**. A layout read off a docs site, a blog post or a starter template is **summarized** and confirms nothing | **raw**. Fetch it when asked; **never store a peer's tree** — it is a derivable fact that rots |
 
 ## `$SCRATCH` is not set for you
 
@@ -33,7 +44,10 @@ this environment exports no `SCRATCH`.
 SCRATCH="${SCRATCH:-$(mktemp -d)}"   # or the session scratchpad, if you were given one
 ```
 
-Report the path you used, so the main thread can grep the same file.
+**Report every path you wrote, so the main thread can grep the same file — and so
+it can hand those paths to the two `verify` lenses.** Neither lens holds a shell:
+what you did not fetch, they cannot reach, and they are briefed to report that as a
+downgrade rather than fill it from memory. Your path list is their corpus ②.
 
 ## Two hard rules for this repo
 

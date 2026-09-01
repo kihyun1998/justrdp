@@ -1,13 +1,12 @@
 ---
 name: thegraph-lens
 description: Adversarial completeness lens for a justrdp change — hunts enumeration gaps against both corpora (this repo's siblings via docs/map, and FreeRDP/IronRDP/[MS-*] real source) and returns graded findings. Use for thegraph's `verify` node.
-tools: Bash, Grep, Read, Glob
+tools: Read, Glob, Grep
 ---
 
 # thegraph `verify` — gap-hunting lens (justrdp)
 
-**Build stamp**: `thegraph/SKILL.md` `md5:7c624aedc9521627fc1985d2eae61b0d`
-(2026-08-31). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
+**Build stamp**: `thegraph` is three files as of this stamp — `SKILL.md` `md5:f73cef09189056e3ed7713a81177becc`, `NODES.md` `md5:82d1538acc2c35dd2fbcb3cecded3f66`, `BUILD_CONTRACT.md` `md5:a4fc95f7e6d1605869a33e8c2bafb2c6` (2026-09-02). The graph is [`docs/agents/thegraph.md`](../../docs/agents/thegraph.md);
 the method — the grade table, the reference-free restatement test, the
 never-drop-a-corpus rule, direction-vs-difference — is the `thegraph` skill. Follow
 it; this file is only justrdp's material.
@@ -27,19 +26,28 @@ disagree but not which one is wrong.
 - **`docs/plan.md` §0** — traps already PROVEN on the real VM. §1 is the
   capability → feature coupling table.
 - **`CONTEXT.md`** for any term the change reuses or redefines.
-- The 6 invariant notes are the enumeration you would otherwise redo by hand:
-  32-bit dimension overflow · no-owned-pixels · never-panic decode ·
-  oracle-agreement-is-not-independence · a-later-stage-can-hide-an-earlier-defect ·
-  capture-coverage-follows-what-we-advertise.
+- **`docs/map/invariant/*.md`** is the enumeration you would otherwise redo by
+  hand. **Glob the directory — do not trust a count.** This file carried "the 6
+  invariant notes" and named six while the directory held seven, which is the same
+  hand-kept-copy failure the bullet above warns about, one bullet down.
 
 ## Corpus ② — the reference
 
+**You do not fetch this corpus, and you have no tool that could.** The `reference`
+node runs before you on the main thread and has already pulled it raw into a
+scratch directory; **the invocation gives you the paths**. Read and grep them like
+any other file.
+
 - **FreeRDP (C) + IronRDP (Rust) real source**, at the known decoder CVE points
-  (rle / planar / clearcodec / nsc OOB) — `gh api … | base64 -d > "$SCRATCH/x"`
-  then `grep -n`. **`WebFetch` is banned**: it drops handler bodies, so a branch
-  that *is* there reads as absent.
-- **The `[MS-*]` section that governs the field**, fetched raw and cited by
-  section number.
+  (rle / planar / clearcodec / nsc OOB). It reaches you **raw**, never through a
+  summarizing fetch — summary drops handler bodies, so a branch that *is* there
+  reads as absent. If what you got is a summary, say so: it caps every finding off
+  it below `CONFIRMED`.
+- **The `[MS-*]` section that governs the field**, raw, cited by section number.
+- **If the invocation did not give you a path your brief names, say exactly that
+  and name the file.** Do not substitute a remembered spec sentence, a recollection
+  of FreeRDP's shape, or a weaker source — and do not treat the absence as an
+  answer. An unreachable corpus is a **downgrade you report**, not a gap you fill.
 - **The oracle (`ironrdp-graphics`) is not a second opinion.** It shares this
   decoder's lineage — see
   [oracle-agreement-is-not-independence](../../docs/map/invariant/oracle-agreement-is-not-independence.md).
