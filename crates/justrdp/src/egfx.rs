@@ -98,7 +98,19 @@ impl Surface {
 
     /// Copy `src` (RGBA, `src_stride_px` pixels per row, `copy_w × copy_h`) to `(x, y)`,
     /// clipping to the surface; negative destinations clip the source accordingly.
-    fn blit(&mut self, x: i32, y: i32, copy_w: u16, copy_h: u16, src: &[u8], src_stride_px: usize) {
+    ///
+    /// Returns the bytes actually painted **after clipping**, which is what the per-frame paint
+    /// budget is charged (#268). The clipped figure is the only honest one: a destination point
+    /// far off the surface costs nothing and must not be charged as if it did.
+    fn blit(
+        &mut self,
+        x: i32,
+        y: i32,
+        copy_w: u16,
+        copy_h: u16,
+        src: &[u8],
+        src_stride_px: usize,
+    ) -> usize {
         let skip_x = usize::try_from(-x.min(0)).unwrap_or(0);
         let skip_y = usize::try_from(-y.min(0)).unwrap_or(0);
         let dst_x = usize::try_from(x.max(0)).unwrap_or(0);
@@ -111,7 +123,7 @@ impl Surface {
             .saturating_sub(skip_y)
             .min(usize::from(self.height).saturating_sub(dst_y));
         if w == 0 || h == 0 {
-            return;
+            return 0;
         }
         let stride = usize::from(self.width) * 4;
         for row in 0..h {
@@ -123,6 +135,7 @@ impl Surface {
             self.rgba[dst_off..dst_off + w * 4].copy_from_slice(src_row);
         }
         self.mark_dirty((dst_x as u16, dst_y as u16, w as u16, h as u16));
+        w * h * 4
     }
 
     /// Extract a rectangle (clipped) as `(width, height, tight RGBA)`.
@@ -163,14 +176,15 @@ impl Surface {
         (w, h, out)
     }
 
-    /// Fill a rectangle (clipped) with one RGBA pixel.
-    fn fill(&mut self, rect: Rect16, rgba: [u8; 4]) {
+    /// Fill a rectangle (clipped) with one RGBA pixel. Returns the bytes painted after
+    /// clipping, for the per-frame paint budget (#268) — see [`Surface::blit`].
+    fn fill(&mut self, rect: Rect16, rgba: [u8; 4]) -> usize {
         let x = rect.left.min(self.width);
         let y = rect.top.min(self.height);
         let w = rect.width().min(self.width.saturating_sub(x));
         let h = rect.height().min(self.height.saturating_sub(y));
         if w == 0 || h == 0 {
-            return;
+            return 0;
         }
         let stride = usize::from(self.width) * 4;
         for row in 0..usize::from(h) {
@@ -183,6 +197,27 @@ impl Surface {
             }
         }
         self.mark_dirty((x, y, w, h));
+        usize::from(w) * usize::from(h) * 4
+    }
+}
+
+/// Record that a list-bearing command was cut short by the per-frame paint budget (#268).
+///
+/// Skipping is the tolerant direction and it is **silent by construction** — the frame still
+/// acknowledges and the session continues, so the only difference a host can observe is pixels
+/// that were never painted. ADR-0009 §3(b) is explicit that a tolerance nobody can see is
+/// indistinguishable from a bug, and this territory already carries a `## Known holes` entry
+/// for exactly that shape on the clipping path. The record is what makes this a tolerance.
+fn note_budget(pdu: &'static str, declared: usize, painted: usize) {
+    if declared > painted {
+        tracing::warn!(
+            target: "rdp_egfx",
+            pdu,
+            declared,
+            painted,
+            skipped = declared - painted,
+            "per-frame paint budget reached; the remaining entries were skipped",
+        );
     }
 }
 
@@ -207,6 +242,13 @@ pub(crate) struct GraphicsProcessor {
     confirmed_version: Option<u32>,
     frames_decoded: u32,
     in_frame: bool,
+    /// RGBA bytes painted by the list-bearing commands since this frame opened (#268). The
+    /// ceiling is [`MAX_TOTAL_SURFACE_BYTES`], **derived rather than picked**: the most a frame
+    /// can legitimately paint is every surface that could exist, once — and past that it is
+    /// repainting pixels it already painted. Measured against a real WS2022 server, the busiest
+    /// of 89 frames painted 4 096 000 bytes, exactly one 1280x800 desktop, so the ceiling sits
+    /// ~64x above observed traffic while the unbounded case reached ~6.4 TiB in one PDU.
+    frame_paint: usize,
 }
 
 impl Default for GraphicsProcessor {
@@ -223,6 +265,7 @@ impl Default for GraphicsProcessor {
             confirmed_version: None,
             frames_decoded: 0,
             in_frame: false,
+            frame_paint: 0,
         }
     }
 }
@@ -434,6 +477,7 @@ impl GraphicsProcessor {
             EgfxPdu::StartFrame { frame_id } => {
                 tracing::trace!(target: "rdp_egfx", frame_id, "StartFrame");
                 self.in_frame = true;
+                self.frame_paint = 0;
             }
             EgfxPdu::EndFrame { frame_id } => {
                 tracing::trace!(target: "rdp_egfx", frame_id, "EndFrame");
@@ -652,13 +696,23 @@ impl GraphicsProcessor {
                 rects,
             } => {
                 let rgba = [color_bgrx[2], color_bgrx[1], color_bgrx[0], 255];
+                let budget = MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint);
                 let surface = self.surface_mut(surface_id).ok_or(invalid(
                     "RDPGFX_SOLIDFILL_PDU",
                     "unknown destination surface",
                 ))?;
+                let declared = rects.len();
+                let mut painted = 0usize;
+                let mut done = 0usize;
                 for rect in rects {
-                    surface.fill(rect, rgba);
+                    if painted >= budget {
+                        break;
+                    }
+                    painted += surface.fill(rect, rgba);
+                    done += 1;
                 }
+                self.frame_paint += painted;
+                note_budget("RDPGFX_SOLIDFILL_PDU", declared, done);
             }
             EgfxPdu::SurfaceToSurface {
                 src_surface_id,
@@ -680,12 +734,19 @@ impl GraphicsProcessor {
                         src_rect.width(),
                         src_rect.height(),
                     );
+                let budget = MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint);
                 let dest = self.surface_mut(dest_surface_id).ok_or(invalid(
                     "RDPGFX_SURFACE_TO_SURFACE_PDU",
                     "unknown destination surface",
                 ))?;
+                let declared = dest_points.len();
+                let mut painted = 0usize;
+                let mut done = 0usize;
                 for pt in dest_points {
-                    dest.blit(
+                    if painted >= budget {
+                        break;
+                    }
+                    painted += dest.blit(
                         i32::from(pt.x),
                         i32::from(pt.y),
                         w,
@@ -693,7 +754,10 @@ impl GraphicsProcessor {
                         &pixels,
                         usize::from(w),
                     );
+                    done += 1;
                 }
+                self.frame_paint += painted;
+                note_budget("RDPGFX_SURFACE_TO_SURFACE_PDU", declared, done);
             }
             EgfxPdu::SurfaceToCache {
                 surface_id,
@@ -739,6 +803,7 @@ impl GraphicsProcessor {
                 surface_id,
                 dest_points,
             } => {
+                let budget = MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint);
                 let entry = self
                     .cache
                     .get(&cache_slot)
@@ -754,8 +819,14 @@ impl GraphicsProcessor {
                         "RDPGFX_CACHE_TO_SURFACE_PDU",
                         "unknown destination surface",
                     ))?;
+                let declared = dest_points.len();
+                let mut painted = 0usize;
+                let mut done = 0usize;
                 for pt in dest_points {
-                    dest.blit(
+                    if painted >= budget {
+                        break;
+                    }
+                    painted += dest.blit(
                         i32::from(pt.x),
                         i32::from(pt.y),
                         entry.width,
@@ -763,7 +834,10 @@ impl GraphicsProcessor {
                         &entry.rgba,
                         usize::from(entry.width),
                     );
+                    done += 1;
                 }
+                self.frame_paint += painted;
+                note_budget("RDPGFX_CACHE_TO_SURFACE_PDU", declared, done);
             }
             EgfxPdu::EvictCacheEntry { cache_slot } => {
                 if let Some(old) = self.cache.remove(&cache_slot) {
@@ -779,6 +853,14 @@ impl GraphicsProcessor {
 
     /// Handle every EGFX PDU in one decompressed blob.
     fn process_blob(&mut self, blob: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError> {
+        // The paint budget is scoped to a frame, and draw commands do not require one: no arm
+        // checks `in_frame` before painting, so a server that never sends StartFrame would sit
+        // outside frame-scoped accounting forever. Charging unbracketed painting per *message*
+        // closes that without narrowing the frame case. The real server measured for #268 sent
+        // 0 unbracketed draws, so this guards a path nothing observed rather than a common one.
+        if !self.in_frame {
+            self.frame_paint = 0;
+        }
         let mut outputs = Vec::new();
         for pdu in egfx::decode_all(blob)? {
             self.handle(pdu, &mut outputs)?;
@@ -1930,5 +2012,234 @@ mod tests {
         // the panic** and is here as documentation, not as coverage: at `h == 0` the row loop
         // never runs, so the guard's `h` half is inert and its mutation is green (see `extract`).
         assert!(s2c(&mut p, 1, [0, 1081, 1920, 1082]).is_empty());
+    }
+    fn cache_body(surface: u16, slot: u16, w: u16, h: u16) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&surface.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&slot.to_le_bytes());
+        for f in [0u16, 0, w, h] {
+            b.extend_from_slice(&f.to_le_bytes());
+        }
+        b
+    }
+
+    fn paste_body(slot: u16, surface: u16, n: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&slot.to_le_bytes());
+        b.extend_from_slice(&surface.to_le_bytes());
+        b.extend_from_slice(&(n as u16).to_le_bytes());
+        for _ in 0..n {
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+        }
+        b
+    }
+
+    /// Feed several PDUs in ONE message, which is what a real server does — the WS2022 VM
+    /// measured for #268 sent up to 266 PDUs per message. A helper that wraps one PDU per
+    /// message cannot tell a per-frame reset from a per-message one.
+    fn feed_many(p: &mut GraphicsProcessor, pdus: &[(u16, Vec<u8>)]) -> Vec<Out> {
+        let mut blob = Vec::new();
+        for (cmd_id, body) in pdus {
+            blob.extend_from_slice(&header(*cmd_id, body));
+        }
+        p.process(&egfx::wrap_uncompressed(&blob)).unwrap()
+    }
+
+    /// Two surfaces of `dim x dim` and a cache entry of the same size in slot 7.
+    fn two_surfaces_and_a_cached_bitmap(dim: u16) -> GraphicsProcessor {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, dim, dim);
+        create_surface(&mut p, 2, dim, dim);
+        assert!(
+            feed(
+                &mut p,
+                egfx::CMDID_SURFACE_TO_CACHE,
+                &cache_body(1, 7, dim, dim)
+            )
+            .is_empty()
+        );
+        p
+    }
+
+    /// `CACHE_TO_SURFACE` blits once per server-declared point, and both the count and the
+    /// cached bitmap are the server's to choose — so a fixed 262 KB PDU bought unbounded CPU
+    /// and returned `Ok` (#268). The bound is a per-frame paint budget, and the ceiling is
+    /// `MAX_TOTAL_SURFACE_BYTES` **derived, not picked**: the most a frame can legitimately
+    /// paint is every surface that could exist, once.
+    ///
+    /// The assertion is on the *budget*, never on elapsed time — #262 paid 56.4 runner-hours
+    /// for the lesson that a test which takes two minutes and passes is indistinguishable from
+    /// one that hangs.
+    #[test]
+    fn a_paste_list_is_cut_at_the_per_frame_paint_budget() {
+        // A 1 MiB cached bitmap: the budget admits 256 pastes of it and no more.
+        let mut p = two_surfaces_and_a_cached_bitmap(64);
+        let one_paste = 64 * 64 * 4;
+
+        let outputs = feed(
+            &mut p,
+            egfx::CMDID_CACHE_TO_SURFACE,
+            &paste_body(7, 2, 65535),
+        );
+        assert!(outputs.is_empty(), "the command is tolerated, not refused");
+        assert_eq!(
+            p.frame_paint, MAX_TOTAL_SURFACE_BYTES,
+            "65535 pastes must stop exactly at the budget, not run past it",
+        );
+        assert_eq!(
+            MAX_TOTAL_SURFACE_BYTES / one_paste,
+            16_384,
+            "16384 pastes fit"
+        );
+    }
+
+    /// The budget must not refuse what a real server sends. Measured against the WS2022 VM for
+    /// #268: 2 748 `CACHE_TO_SURFACE` PDUs, **every one with `destPtsCount == 1`**, cache
+    /// entries of 64x64 or 64x32, and a busiest frame of 4 096 000 bytes — exactly one
+    /// 1280x800 desktop, which is ~64x under the ceiling.
+    #[test]
+    fn the_budget_does_not_reach_traffic_the_real_server_sends() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 1280, 800);
+        create_surface(&mut p, 2, 1280, 800);
+        assert!(
+            feed(
+                &mut p,
+                egfx::CMDID_SURFACE_TO_CACHE,
+                &cache_body(1, 7, 64, 64)
+            )
+            .is_empty()
+        );
+
+        let mut start = vec![0u8; 8];
+        start[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert!(feed(&mut p, egfx::CMDID_START_FRAME, &start).is_empty());
+        // One paste per PDU, as observed, many times over.
+        for _ in 0..2_000 {
+            assert!(feed(&mut p, egfx::CMDID_CACHE_TO_SURFACE, &paste_body(7, 2, 1)).is_empty());
+        }
+        assert_eq!(
+            p.frame_paint,
+            2_000 * 64 * 64 * 4,
+            "every observed-shape paste must land, none skipped",
+        );
+        assert!(p.frame_paint < MAX_TOTAL_SURFACE_BYTES);
+    }
+
+    /// The budget is per *frame*, so it must come back — and the two resets are different
+    /// mechanisms that a one-PDU-per-message helper cannot tell apart. A real server packs
+    /// many PDUs into one message (266 measured), so several frames share a message and the
+    /// StartFrame reset is the one doing the work there. Measured by mutation: with only the
+    /// per-message reset, the second paste below paints nothing.
+    #[test]
+    fn a_new_frame_restores_the_budget_within_a_single_message() {
+        let mut p = two_surfaces_and_a_cached_bitmap(64);
+        let one_paste = 64 * 64 * 4;
+        let mut start = vec![0u8; 8];
+        start[4..8].copy_from_slice(&9u32.to_le_bytes());
+
+        // One message: exhaust the budget, open a frame, paste four more.
+        let outputs = feed_many(
+            &mut p,
+            &[
+                (egfx::CMDID_CACHE_TO_SURFACE, paste_body(7, 2, 65535)),
+                (egfx::CMDID_START_FRAME, start),
+                (egfx::CMDID_CACHE_TO_SURFACE, paste_body(7, 2, 4)),
+            ],
+        );
+        assert!(outputs.is_empty(), "tolerated, not refused");
+        assert_eq!(
+            p.frame_paint,
+            4 * one_paste,
+            "StartFrame must restore the budget mid-message, not only between messages",
+        );
+    }
+
+    /// And the per-message reset covers the case StartFrame cannot: draw commands do not
+    /// require a frame — no arm checks `in_frame` before painting — so a server that never
+    /// sends StartFrame would otherwise sit outside the accounting forever.
+    #[test]
+    fn an_unbracketed_message_restores_the_budget_on_its_own() {
+        let mut p = two_surfaces_and_a_cached_bitmap(64);
+        let one_paste = 64 * 64 * 4;
+
+        assert!(
+            feed(
+                &mut p,
+                egfx::CMDID_CACHE_TO_SURFACE,
+                &paste_body(7, 2, 65535)
+            )
+            .is_empty()
+        );
+        assert_eq!(p.frame_paint, MAX_TOTAL_SURFACE_BYTES, "budget exhausted");
+        assert!(feed(&mut p, egfx::CMDID_CACHE_TO_SURFACE, &paste_body(7, 2, 4)).is_empty());
+        assert_eq!(
+            p.frame_paint,
+            4 * one_paste,
+            "a message with no frame open starts fresh",
+        );
+    }
+
+    /// Inside one frame the budget is shared rather than granted per PDU.
+    #[test]
+    fn pdus_inside_one_frame_share_the_budget() {
+        let mut p = two_surfaces_and_a_cached_bitmap(64);
+        let mut start = vec![0u8; 8];
+        start[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let outputs = feed_many(
+            &mut p,
+            &[
+                (egfx::CMDID_START_FRAME, start),
+                (egfx::CMDID_CACHE_TO_SURFACE, paste_body(7, 2, 10_000)),
+                (egfx::CMDID_CACHE_TO_SURFACE, paste_body(7, 2, 10_000)),
+            ],
+        );
+        assert!(outputs.is_empty());
+        assert_eq!(
+            p.frame_paint, MAX_TOTAL_SURFACE_BYTES,
+            "two PDUs in one frame share one budget rather than each getting their own",
+        );
+    }
+
+    /// `SOLID_FILL` and `SURFACE_TO_SURFACE` carry the same wire shape and were not named in
+    /// the issue. ADR-0012 §3 asks a family for one answer, so all three are charged.
+    #[test]
+    fn solid_fill_and_surface_to_surface_are_charged_to_the_same_budget() {
+        let mut p = two_surfaces_and_a_cached_bitmap(64);
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&[0u8, 0, 255, 0]);
+        body.extend_from_slice(&65535u16.to_le_bytes());
+        for _ in 0..65535 {
+            for f in [0u16, 0, 64, 64] {
+                body.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        assert!(feed(&mut p, egfx::CMDID_SOLID_FILL, &body).is_empty());
+        assert_eq!(
+            p.frame_paint, MAX_TOTAL_SURFACE_BYTES,
+            "SOLID_FILL is bounded"
+        );
+
+        let mut p = two_surfaces_and_a_cached_bitmap(64);
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        for f in [0u16, 0, 64, 64] {
+            body.extend_from_slice(&f.to_le_bytes());
+        }
+        body.extend_from_slice(&65535u16.to_le_bytes());
+        for _ in 0..65535 {
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+        }
+        assert!(feed(&mut p, egfx::CMDID_SURFACE_TO_SURFACE, &body).is_empty());
+        assert_eq!(
+            p.frame_paint, MAX_TOTAL_SURFACE_BYTES,
+            "SURFACE_TO_SURFACE is bounded",
+        );
     }
 }

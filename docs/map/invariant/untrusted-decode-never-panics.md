@@ -130,6 +130,45 @@ that trusts its server too much) rather than as memory safety.
   written, because there is nothing about it that is false. The narrower the step a totality
   argument is exact about, the more of the function it leaves unspoken for.
 
+- **#268, second: "the count is a `u16`, so the worst case is 65535 *empty* iterations" — and
+  that argument stops the moment the iterations are not empty.** #262's entry above states
+  exactly why its hang never reached a client: every wire path into `to_rgba` carries a
+  `u16`-derived height, *"so the worst reachable case was 65535 empty rows returning the same
+  value"*. Derivation ④'s table clears `egfx`'s `blit`/`fill`/`extract` on the same ground.
+  Both are correct, and **both are claims about one loop**. EGFX's three list-bearing commands —
+  `SOLID_FILL`, `SURFACE_TO_SURFACE`, `CACHE_TO_SURFACE` — put a wire-declared `u16` count
+  *around* one of those loops, and the inner body's size is chosen by the server in an **earlier
+  PDU** (`SURFACE_TO_CACHE`, whose entry may be 100 MiB). The product is what matters and no
+  derivation in this note computes a product: 65535 x (a clipped surface blit) measured at
+  **~505–540 s of `--release` CPU from one 262 KB PDU**, returning `Ok`.
+
+  Three things make this its own entry rather than a repeat of the first:
+  - **It is a different failure of ④ from #268's first half.** That one was *a bounded loop can
+    still panic in its body*; this one is *a bounded loop can be cheap and a bounded loop
+    nested in a bounded loop can be ruinous*. ④ asks one question per hit and never asks it of
+    two hits together.
+  - **It is on the reachable side of this note's own `or loop unboundedly` clause**, which #262
+    was not: #262's hang was produced by its property's `1 => any::<usize>()` arm, and no wire
+    path could deliver it. This one needs nothing unusual — a `u16` count, a cache entry the
+    server itself established, and both PDUs are exactly what the spec permits.
+  - **The wire-byte intuition that makes the slow path safe does not hold here.** In
+    `justrdp::session`'s `TS_UPDATE_BITMAP_DATA` loop each rectangle consumes its own
+    `bitmapLength` from the cursor (`update.rs`, `cur.read_slice(length)`), so an entry's cost is
+    *paid for in wire bytes* and the PDU size bounds the work. An EGFX destination point is
+    **4 bytes** and its cost comes from state established in a previous message. **That
+    decoupling — cost per entry not funded by bytes per entry — is the membership test for this
+    shape**, and it is what to grep for: a `for` over a wire count whose body's magnitude comes
+    from anywhere other than the same cursor.
+
+  Closed by a per-frame **paint budget** charged on *clipped* bytes rather than on the count,
+  ceiling `MAX_TOTAL_SURFACE_BYTES` (see
+  [EGFX graphics pipeline](../territory/egfx-graphics-pipeline.md)). Charging the count would
+  have been unprovable against this server anyway: it sends `destPtsCount == 1` on every one of
+  2 748 measured PDUs, so a count cap would be indistinguishable from a cap at 1.
+  **One instance of this shape is knowingly still open**: Progressive's `WireToSurface2` path,
+  where `paint_tile` walks `region.rects` once per tile, is quadratic in `numTiles x numRects`
+  with both from the wire. It is out of #268's scope and is **not** bounded today.
+
 - **#203, third: a round-trip cannot reach a decoder whose encoder does not exist.** Every encoder
   in `justrdp-pdu` writes client-to-server, because justrdp is a client — so no server PDU can be
   synthesised here, and the seed had to be a real capture. That asymmetry is why this invariant
@@ -348,6 +387,24 @@ disjoint inputs — `to_rgba` refuses `usize::MAX` dimensions on the first and h
 — so neither subsumes the other, and derivation ③ cannot find the members of the second half
 anyway: it matches on the *signature*, and both halves have the same one. That is what ④ is for.
 
+**A third question was added on 2026-08-31 (#268), and it is the one the first two answer *yes*
+to while the site is still a DoS.** A loop can be bounded and its body can be total, and the
+product of the two can still be ruinous:
+
+> **Is the trip count from the wire, and is the body's magnitude funded by something other
+> than the same bytes?**
+
+The test is the *funding*, not the size. `justrdp::session`'s `TS_UPDATE_BITMAP_DATA` loop runs
+a wire count and is safe, because each rectangle consumes its own `bitmapLength` from the same
+cursor — the PDU has to pay in bytes for the work it asks for. EGFX's `CACHE_TO_SURFACE` runs a
+wire count where each entry is **4 bytes** and its cost is a bitmap the server established in an
+*earlier* message, so 262 KB bought ~505–540 s (#268). Neither of the two questions above sees
+this: the trip count is `usize::from(<u16>)` and every arithmetic guard passes. Where the answer
+is yes, the bound belongs on the **work** and not on the count — and it needs a number with a
+derivation, which is why #268's ceiling is `MAX_TOTAL_SURFACE_BYTES` reused rather than a new
+constant. **Known open member: `rfx::progressive`'s `paint_tile`**, quadratic in
+`numTiles x numRects`, both from the wire, unbounded today.
+
 Working the list found **four defects**, and the split between them is the useful part
 (**a fifth arrived on 2026-08-31 in a member of this very table's source list** —
 `color::to_rgba`'s unbounded row loop, #262, found by a CI bill rather than by the census;
@@ -393,9 +450,11 @@ rg -U "pub fn [a-z_0-9]+ *(<[^>]*>)? *\([^)]*\b(u8|u16|u32|usize|i8|i16|i32)\b" 
 # ④ what LOOPS over a wire-derived count — the half ③'s membership question answers "no" to,
 #    and the half neither ①, ② nor `decoder-dimension-overflow-32bit.md` can see (#262). That
 #    note's derivation is scoped to *allocation sizing* (`rg 'usize::from|as usize' | rg '\*'`),
-#    and a loop bound is not an allocation size. Adjudicate each hit on two questions: is the
-#    trip count a **bare `usize`** rather than `usize::from(<u16>)`, and does a zero extent
-#    reach the loop rather than being refused above it?
+#    and a loop bound is not an allocation size. Adjudicate each hit on THREE questions: is the
+#    trip count a **bare `usize`** rather than `usize::from(<u16>)`; does a zero extent reach the
+#    loop rather than being refused above it; and — added by #268 — is the body's magnitude
+#    funded by bytes this same cursor consumed, or by state a previous message established?
+#    A `usize::from(<u16>)` verdict answers only the first.
 rg -n 'for [a-z_0-9]+ in 0\.\.' crates/justrdp-codecs/src crates/justrdp/src crates/justrdp-pdu/src
 
 # and what each already carries, to subtract:
@@ -411,7 +470,7 @@ list rather than an answer.** ~60 hits, **two** members:
 | `nscodec::reconstruct` | bare `usize` `height`, `nscodec.rs` `for y in 0..height` | **closed with #262** — the second member, guarded in the same change; its property's dimension generators were widened too, which is what would have found it |
 | `rle::decompress`, `planar::decompress` | bare `usize` | closed **as policy** — both refuse a zero extent with `EmptyImage` above the loop |
 | `framebuffer::blit` | `usize` mins | closed **by a guard** — `if width == 0 \|\| height == 0 { return None }` sits before the loop |
-| `pointer::decode_pointer`, `egfx`'s `blit`/`fill`/`extract`, `clearcodec`'s region walks | `usize::from(<u16>)` | bounded **by construction** — ≤ 65535 rows, so the worst case is slow, not unbounded. **`extract` then panicked inside this loop (#268)**, and the verdict above is still the right answer to ④'s question: a bounded loop is not a safe loop, because ④ adjudicates the *trip count* and says nothing about the body. Read this column as "terminates", never as "cleared" |
+| `pointer::decode_pointer`, `egfx`'s `blit`/`fill`/`extract`, `clearcodec`'s region walks | `usize::from(<u16>)` | bounded **by construction** — ≤ 65535 rows, so the worst case is slow, not unbounded. **`extract` then panicked inside this loop (#268)**, and the verdict above is still the right answer to ④'s question: a bounded loop is not a safe loop, because ④ adjudicates the *trip count* and says nothing about the body. Read this column as "terminates", never as "cleared". **And "slow" was carrying more than it says**: `egfx`'s three list-bearing commands nest one of these loops inside a *second* wire-declared `u16` count whose body size the server chose in an earlier PDU, and the product measured ~505–540 s of release CPU (#268, second half). ④ adjudicates one loop's trip count; **it does not multiply two, and no derivation here does** |
 
 **The `u16` row is why this defect never reached a client and the note still records it.** Every
 wire path into `to_rgba` carries a `u16`-derived height (`session.rs`'s bitmap rect,
