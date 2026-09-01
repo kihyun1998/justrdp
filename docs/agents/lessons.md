@@ -1,11 +1,18 @@
 # Lessons — justrdp (war-story index)
 
-What gives each `theflow` rule its teeth in this repo. Indexed by step, anchored
-to the ADRs and issues. This project is young (0.1.0, plan-driven), so most
+What gives each `thegraph` rule its teeth in this repo. Anchored to the ADRs and
+issues.
+
+**Indexed by the retired `theflow`'s step numbers**, kept because shipped rustdoc,
+ADR-0011/0012/0013 and `docs/map/` cite them. The mapping onto the graph's nodes:
+Step 1 → `reference` + `map` · Step 2 → `boundary` · Step 3 → `implement`'s
+test-trust self-loop · Step 4 → `proof` · Step 5 → `verify` · Step 6 → `sweep` +
+`search` · Step 7 → `gate`. The live graph is
+[`thegraph.md`](thegraph.md). This project is young (0.1.0, plan-driven), so most
 entries are **decision anchors** — the concrete reason a rule exists here — rather
 than "a step was skipped and it cost us" incidents; add the latter as they occur.
 
-Read this before starting so the bindings do not read as abstractions.
+Read this before starting so the graph does not read as abstractions.
 
 ---
 

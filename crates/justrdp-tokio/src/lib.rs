@@ -4662,7 +4662,7 @@ mod tests {
             // the fraction of pixels where WireToSurface2 happened to be the last writer, which
             // is a property of the *server's* codec scheduling and not of this client.
             //
-            // `docs/agents/theflow.md` names exactly this under Step 4: "beware a measurement
+            // `docs/agents/thegraph.md` names exactly this under `proof`: "beware a measurement
             // that can misread itself". Recorded rather than deleted, because the comparison is
             // the obvious thing to reach for and re-deriving why it does not work costs another
             // 70-second run. **It would become well-posed** if the replay were driven through a

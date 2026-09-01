@@ -24,7 +24,7 @@ sites across all four crates, none of them touched by that change. The maintaine
 `clippy 0.1.96 (2026-05-25)` and CI on `1.98.0 (2026-08-18)` — so the lint that failed the gate
 **could not fire locally at all**. Three properties made that worse than a one-off:
 
-1. **The local gate stopped answering its own question.** `docs/agents/theflow.md` Step 7 tells the
+1. **The local gate stopped answering its own question.** The build's `gate` node tells the
    agent not to sit watching CI during implementation, *"the local gates mirror it"*. While the
    compiler floats, that sentence is false.
 2. **The failure was unbounded from the inside.** `clippy` stops per crate, so a red run names only
@@ -83,7 +83,7 @@ this pin?"*, not *"should this be pinned?"*.
 
 ## Consequences
 
-- **The local gate mirrors CI again, so `theflow` Step 7's premise is true rather than
+- **The local gate mirrors CI again, so the `gate` node's premise is true rather than
   aspirational.** Green locally now means green on the PR gate for the same reasons, and the
   maintainer's host and the runner disagree only about the operating system.
 - **Toolchain drift arrives as its own reviewable change.** A new default-on lint lands in the

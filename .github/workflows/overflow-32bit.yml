@@ -10,8 +10,8 @@
 # exact and a rustup target is per-toolchain, so the locally-added i686 target silently went
 # missing under the new pin and the command stopped working with no signal.
 #
-# Scope is `justrdp-codecs` **and** `justrdp`, not codecs alone. The gate line recorded in
-# docs/agents/theflow.md named only codecs, and the invariant names five territories — two of
+# Scope is `justrdp-codecs` **and** `justrdp`, not codecs alone. The gate line the build
+# recorded then named only codecs, and the invariant names five territories — two of
 # which (EGFX surface allocation, the framebuffer) live in `justrdp`. Automating the narrower
 # command would have made the gap permanent, which is #200's shape: a workflow may not keep its
 # own narrower copy of something the repo already answers. `justrdp-tokio` is out because its

@@ -386,8 +386,8 @@ python scripts/thegraph/grants.py                     # invariant ① over .clau
 
 **The runnable copy is `scripts/thegraph/gates.py`, and it is the one that
 decides.** This block describes it. There were three copies until 2026-08-31 —
-`theflow.md` Step 7 held the same list under the old structure — and that file's
-retirement dropped the count to **two**, which is the safe number: a command change
+the retired `theflow.md` held the same list under the old structure, and its
+deletion dropped the count to **two**, which is the safe number: a command change
 touches the script **and** this block, and nothing else.
 
 **Each gate bare, never piped** — a pipeline's exit status is the last command's,

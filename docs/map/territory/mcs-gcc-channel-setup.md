@@ -85,7 +85,7 @@ recorded.
 - **No governing record** for the flag-exposure posture, although it is the
   project's founding motivation — it exists as identity prose in `CLAUDE.md` and
   `CONTEXT.md` §Project intent, and as a deliberate-divergence row in
-  [`docs/agents/theflow.md`](../../agents/theflow.md).
+  [`docs/agents/thegraph.md`](../../agents/thegraph.md).
 - Multi-monitor and DPI (epic #27) add GCC monitor data that is not built.
 - `SUPPORT_SKIP_CHANNELJOIN` is defined as a constant; whether the client honours
   the skip path is not recorded anywhere.

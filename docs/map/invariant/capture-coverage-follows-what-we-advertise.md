@@ -57,7 +57,7 @@ produced it:
    missing tile type reads identically whether the server cannot send it or was never given a
    reason to.
 
-The tell for both is an absence with no config beside it. `docs/agents/theflow.md`'s
+The tell for both is an absence with no config beside it. `docs/agents/thegraph.md`'s
 *"unconfirmed ≠ absent"* is the general rule; this is the specific mechanism by which the
 confusion arises here.
 

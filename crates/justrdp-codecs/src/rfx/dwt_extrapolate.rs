@@ -20,7 +20,7 @@
 //!    tap that overflows the two differ by ~65536, so this is not a detail that washes out.
 //!
 //! Transcribed from `progressive_rfx_idwt_x` / `_y` / `progressive_rfx_dwt_2d_decode_block`
-//! (`progressive.c:600-807`), because `docs/agents/theflow.md`'s codec byte-exactness row
+//! (`progressive.c:600-807`), because `docs/agents/thegraph.md`'s codec byte-exactness row
 //! names the oracle *with FreeRDP as the tie-break* and ADR-0011 / #194 disqualify the oracle
 //! for Progressive. `ironrdp-graphics::dwt_extrapolate` is a stage-boundary cross-check only
 //! (ADR-0007), never the definition.
