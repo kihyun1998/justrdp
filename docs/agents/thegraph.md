@@ -6,61 +6,82 @@ and scripts. `thegraph` holds the portable **method** (node-type catalog, four
 invariants, reasoning habits); this file holds justrdp's **graph**. The method
 defers every concrete value here.
 
-**Build stamp** — built from `thegraph/SKILL.md`
-`md5:7c624aedc9521627fc1985d2eae61b0d` (77 920 bytes, mtime 2026-08-31). Recompiled
-2026-08-31 by `/grill-the-graph` as an **update** — diffed against the repo, *not*
-recompiled from the bindings, which the first build consumed. Every generated
-artifact carries the same stamp. If the stamp is behind, **warn and continue** —
-never rebuild on your own; a rebuild writes agents and scripts, and those pass
-through the maintainer.
+**Build stamp** — built from the `thegraph` skill, which is now **three files**, not one:
 
-**What this recompile measured, so nobody re-derives it.** The skill grew
-61 515 → 77 920 bytes (+27%) since the last stamp, and unlike the previous recompile
-that growth was **not** all method: it added a node type's slot. Four findings.
+| File | md5 | bytes |
+|---|---|---|
+| `thegraph/SKILL.md` — the method: invariants, catalog, habits, traversal | `f73cef09189056e3ed7713a81177becc` | 41 951 |
+| `thegraph/NODES.md` — the per-node contracts (**new since the last stamp**) | `82d1538acc2c35dd2fbcb3cecded3f66` | 45 572 |
+| `thegraph/BUILD_CONTRACT.md` — the schema this file fills (**new since the last stamp**) | `a4fc95f7e6d1605869a33e8c2bafb2c6` | 9 231 |
 
-① **`place` was missing entirely** — no roster row, no data, no guard. The catalog
-gives it count **1 unconditionally** (every repo has a tree), so its absence was
-never an answered *"none"*; it was a hole, and a hole that reads as an answer is the
-thing an update run exists to find. Filled below by `plat` against four
-maintainer-confirmed peers.
+Measured 2026-09-02. Recompiled 2026-09-02 by `/grill-the-graph` as an **update** —
+diffed against the repo and against the `build_gaps` past runs flushed, *not* recompiled
+from the bindings, which the first build consumed. Every generated artifact carries the
+same stamp. If the stamp is behind, **warn and continue** — never rebuild on your own; a
+rebuild writes agents and scripts, and those pass through the maintainer.
 
-② **`theflow` is retired and uninstalled**, and two required slots — the
-**tie-breaker** and the **deliberate-divergence list** — were held here as pointers
-into [`theflow.md`](theflow.md). That pointer was right while the file was live and
-amended as issues land; nothing maintains it now, so it aimed at residue. **Both
-tables are moved into this file** — moved, not copied, so no second copy exists and
-the divergence seed the pointer avoided is still avoided. This is what the previous
-build already committed to (*"retiring `theflow.md` means moving those two tables
-here, not deleting them"*).
+**A one-file stamp is what let two-thirds of the method move unseen.** The previous stamp
+named `SKILL.md` alone at 77 920 bytes. The method has since been **split**: `SKILL.md` is
+now smaller than that number while the method as a whole is larger, so a check comparing
+one size against one file could report either "behind" or "ahead" and neither would
+describe what happened. Stamp all three or the check answers a question nobody asked.
 
-**Corrected before this build landed: the sentence above described the intent, not
-the state.** As first written the commit wrote the tables here and left the originals
-standing in `theflow.md`, so for the length of that branch there were two copies —
-and they had already drifted in both directions: this one was missing the
-`color::to_rgba` zero-extent row (#262, landed on `master` first), and `theflow.md`'s
-was missing the four layout rows `plat` added. Both halves are reconciled here now and
-`theflow.md` carries a pointer where its tables were. Recorded rather than quietly
-fixed, because a build note asserting a move that did not happen is the same class of
-defect as the stale pointer it was replacing. `CLAUDE.md` is updated in the same
-change — it named `theflow.md` as the owner and said `/theflow` was callable, and the
-skill is uninstalled. The `gate` command list drops from three copies to two. One repair was made in the move and nothing else: stray
-blank lines *inside* the divergence table, which split it into headerless fragments.
+**What this recompile measured, so nobody re-derives it.** Nine findings; two of them are
+repairs to this build's own artifacts and one is a finding that fixed itself upstream.
 
-③ **Build gap #250 is resolved into the graph.** The `proof` table had no method for
-a **performance** claim, so #91 reached this node with a slot that could not answer
-it and spent three measurements — two of them unusable — finding out. `proof` gains
-a **claim-class axis** below; the layer count stays 4, because performance cuts
-across the layers rather than adding a fifth. The bench-harness half stays open in
-#250 on purpose.
+① **Invariant ① was violated by all four generated agents — and this build is the
+incident the method now records as its war story.** All four carried `Bash`, none carried
+a `Runs:` declaration, and `thegraph-sweep` carried `Edit` besides. Read-only is now the
+**default** rather than a claim to be matched: only an explicit declaration naming a tool
+moves one. Repaired in the [extraction plan](#extraction-plan) — `thegraph-reference`
+keeps `Bash` **with** a declaration (its source classes are `curl` / `gh api`, and
+`WebFetch` is banned for summarizing); the other three drop everything that can run or
+write.
 
-④ **Four schema slots are `unowned`** — see [*Split coverage*](#split-coverage--four-slots-unowned).
-That is a `thegraph` change rather than a build value, so those slots carry their
-data **and** a marker.
+② **The check that enforces ① did not exist.** A grant wider than a brief is invisible to
+every other gate — it compiles, tests green and lints clean — so
+`scripts/thegraph/grants.py` is generated and joins the `gate` list, which goes **9 → 10
+commands**. It asserts the **default**, never the claim: an agent whose description reads
+*"proposes edits rather than making them"* passes a check that greps for *"read-only"*.
 
-**Re-measured and unchanged, so not re-asked**: ADRs still 0001–0013 (the `search`
-list is current) · 5 workflows, 4 of them gates · every sacred path still resolves to
-a real file · all 7 generated artifacts present · nothing published, so `downstream`
-stays absent.
+③ **`build_gaps` recurred #263 → #268, and that is why this run happened.** The `proof`
+table's `justrdp` row named a real-VM round-trip, which a conforming server structurally
+cannot use to prove a *refusal* of non-conforming input. Two runs substituted two
+different things by judgement. `proof` gains a **claim-class axis** on that layer
+(conformance / refusal / performance); the layer count stays **4**, exactly as when #250
+added the performance class.
+
+④ **The four `unowned` slots are resolved upstream — the coverage check now returns
+zero.** `BUILD_CONTRACT.md` names the tracker capability and the war-story index outright,
+and generalises node data to *"everything it reads and everything it checks against … its
+method, its traps, and the policies it applies to a surface"*, which places the other two
+without naming them. **No value in this file changed as a result**, which is the shape the
+split itself predicts.
+
+⑤ **`verify`'s exit-2 prose had drifted against its own script.** It prescribed a
+`build_gaps` entry for an empty diff; #252 had since made `2` the script's *designed,
+documented* answer for that case. So the build was requesting a re-grill for a question it
+already answers, and every open-decision run filed one — #268 did. Prose corrected; the
+script is unchanged and correct.
+
+⑥ **`reference` said 4 in the roster and 5 in its own section.** `plat` added class 5
+(layout prior art) and neither the roster row nor the artifact row followed. It is **5**.
+
+⑦ **`crates/*/tests/*.rs` is 15, not 16.** The rule held — all fifteen are differential
+or corpus — only the count moved.
+
+⑧ **The skill files changed twice *during* this run** (`NODES.md` grew 42 741 → 45 572
+bytes between two measurements minutes apart). The stamp above is a point-in-time
+measurement, and a mismatch on the next run is the expected case rather than evidence this
+build was wrong. It is a **warn**, never a rebuild trigger.
+
+**Re-measured and unchanged, so not re-asked**: ADRs still 0001–0013 (the `search` list is
+current) · 5 workflows, 4 of them gates · `gates.py` holds every command this file names ·
+every sacred path still resolves to a real file · `crates/justrdp-codecs/src/rfx/mod.rs`
+is still the single module-root spelling outlier, still a separate change · no `benches/`,
+no `[[bench]]`, no `criterion`, so #250's bench-harness half stays deliberately open ·
+nothing published, so `downstream` stays **absent** · the sub-issue relation is live
+(#270 and #271 enrolled under #268).
 
 ---
 
@@ -71,7 +92,7 @@ stays absent.
 | `classify` | 1 | catalog |
 | `spine` | 1 | catalog. The tracker **has** the relation — see *Tracker capability* |
 | `map` | 1 | the bindings name a territory map: [`docs/map/README.md`](../map/README.md) |
-| `reference` | **4** | 3 routing-table rows naming an external source, **+ the real VM** as its own class (below) |
+| `reference` | **5** | 3 routing-table rows naming an external source, **+ the real VM** as its own class, **+ layout prior art** (`plat`'s confirmed peers) — all five below |
 | `enumerate` | 1 | catalog. **Never delegated** |
 | `boundary` | 1 | catalog. **Never delegated**. The seam is in-repo — see *Boundary rule* |
 | `place` | **1** | catalog — **every repo has a tree**, so no input can zero this out. **Never delegated.** Tree rule below, compiled by `plat` against four confirmed peers |
@@ -79,7 +100,7 @@ stays absent.
 | `proof` | **4** | one per claim class, each with its own method and its own blind spot |
 | `verify` | **2** | 1 gap-hunting + 1 refuting, because the sacred-path list is **non-empty** |
 | `sweep` | 1 | fanning out over **6** surfaces |
-| `gate` | 1 | **8** gates / 9 commands, blind spots included |
+| `gate` | 1 | **8** gates / **10** commands, blind spots included |
 | `search` | once per candidate | catalog |
 | `batch` | 1 | catalog. **Never delegated, never bypassed** |
 | `stop`, `decide` | edge-triggered | catalog |
@@ -175,7 +196,7 @@ keeps.
 | `crates/justrdp-codecs/src/<codec>/` | a codec that outgrew one file | spelling rule below |
 | `crates/justrdp/src/*.rs` | the sans-IO state machines and the host-facing output types. **No `tokio`, no `rustls`, no `sspi`** | ADR-0001; measured: `x509-cert` + `tracing` only |
 | `crates/justrdp-tokio/src/*.rs` | **the only place `tokio`, `rustls`, `sspi` or `ring` may appear.** Policy injection | ADR-0002, measured 0 violators |
-| `crates/*/tests/*.rs` | **differential-oracle and real-corpus tests only.** Unit tests stay inline `#[cfg(test)]` | measured **16/16**; undeclared anywhere until this build |
+| `crates/*/tests/*.rs` | **differential-oracle and real-corpus tests only.** Unit tests stay inline `#[cfg(test)]` | measured **15/15** (16/16 at the previous build; the rule held, the count moved) |
 | `crates/*/tests/fixtures/<name>/` | captured real-server bytes plus a `README.md`. Appears **only** in a crate whose tests replay them | which is *why* `crates/justrdp/tests/` has none — both its tests are differential |
 | `crates/*/proptest-regressions/` | generated. Never authored | — |
 | `fuzz/fuzz_targets/*.rs` | fuzz targets, **out of the workspace** | matches 3/3 peers that run a fuzz lane |
@@ -224,6 +245,21 @@ defect its own argument is against.
 
 Step 4's fifth row — *"strongest: a real consumer"* — is **N/A, no consumer
 exists**, so it is not a layer. See the `downstream` roster row for the reversal.
+
+**The `justrdp` row above answers a *conformance* claim and structurally cannot
+answer a *refusal* claim** — a conforming server cannot produce non-conforming
+input, so the VM is unable to exercise a guard that only fires on input it will
+never send. Recorded because it recurred: **#263** substituted the codecs row's
+32-bit rule by judgement, **#268** substituted a wire-format round-trip, and two
+substitutions in a row is a re-grill request rather than a one-off. The layer count
+stays **4** — like performance, this is a claim-class axis and not a fifth layer.
+
+| Claim class on `justrdp` | Method | The trap it still carries |
+|---|---|---|
+| **conformance** — we speak the protocol a real server speaks | the **real VM** round-trip, full connect to session-active | **one VM is one server**: it proves the paths it advertises and nothing about the ones it does not |
+| **refusal** — we reject what no conforming server can send | a **wire-format round-trip through the public entry point**: build the non-conforming PDU as bytes (`wrap_uncompressed` + header + body) and drive it through `GraphicsProcessor::process` / the public session API — **never a mock and never the private method**. **Plus mutate-and-re-run on `i686-pc-windows-msvc` wherever the guard is arithmetic** — the `gate` command already names `-p justrdp-codecs -p justrdp` for exactly this, so the layer row now knows what the gate row knew | **the PDU is a vector *we* authored** — the `justrdp-pdu` row's trap recurring one layer up. It bounds false positives, not false negatives: the VM capture (`reference` class 4) stays the only authority on what a server actually sends |
+| **performance** | unchanged — the isolate-first table below | timing the whole system to detect a component |
+
 
 **The table above answers a *correctness* claim. A performance claim is a different
 class, and it cuts across all four layers rather than adding a fifth** — so the layer
@@ -282,11 +318,20 @@ sacred when it is **silent** (wrong, and nothing crashes) or **irreversible**.
 diff is empty **by construction**, and *"no sacred path in the diff"* is not what is true
 there. `triggers.py` answers an empty diff with **`2` (cannot answer)**, not `0`, which is
 the code it already reserves for *"the script could not answer"*. Exit `2` is what makes
-the substitution visible: the run resolves the guard by reading the sacred-path list
-directly, says which slot it substituted for, and writes it to `build_gaps`. Measured on
-**#252** — the script returned `0`, both lenses were in fact mandatory
-(`crates/justrdp/src/**` is surface 1), and only the run's own judgement caught it. A
-`code` decider resolved by judgement is invariant ④ pointing at itself.
+the substitution visible: the run resolves the guard by **reading the sacred-path list
+directly** — against the paths the change is *about to* touch — and says which slot it
+substituted for. Measured on **#252** — the script returned `0`, both lenses were in fact
+mandatory (`crates/justrdp/src/**` is surface 1), and only the run's own judgement caught
+it. A `code` decider resolved by judgement is invariant ④ pointing at itself.
+
+**Exit `2` on an empty diff is not a `build_gaps` entry.** This section used to say it
+was — and #252's fix then made `2` the script's *designed, documented* answer for exactly
+that case, its docstring included — so the build was prescribing a re-grill request for a
+question it already answers, and **every open-decision run filed one**. #268 did. Write a
+gap only where reading the list directly is itself ambiguous: the paths the change will
+touch are not yet knowable, or they sit outside every group. Exit `2` from a **non-empty**
+diff is untouched by this — that is a real *"the script could not answer"*, and it does
+carry a gap.
 
 | # | Sacred surface | Paths the script matches | Why |
 |---|---|---|---|
@@ -324,7 +369,7 @@ obligation. What lands there: the root **confirmed or falsified**, the numbers
 measured, any new sibling **enrolled into the tree** (never announced in prose),
 what is still open. The roster itself never goes in the body.
 
-### `gate` — 8 gates, 9 commands, each run bare
+### `gate` — 8 gates, 10 commands, each run bare
 
 ```sh
 cargo fmt --all --check
@@ -336,12 +381,13 @@ python .github/scripts/check_map.py                   # docs/map: links, anchors
 just-shield scan . --strict                           # ADR-0006; CI passes strict: true
 rustup target add i686-pc-windows-msvc                # prerequisite, not ceremony (see below)
 cargo test -p justrdp-codecs -p justrdp --target i686-pc-windows-msvc
+python scripts/thegraph/grants.py                     # invariant ① over .claude/agents
 ```
 
 **The runnable copy is `scripts/thegraph/gates.py`, and it is the one that
 decides.** This block describes it. There were three copies until 2026-08-31 —
-`theflow.md` Step 7 held the same list under the old structure — and that file's
-retirement dropped the count to **two**, which is the safe number: a command change
+the retired `theflow.md` held the same list under the old structure, and its
+deletion dropped the count to **two**, which is the safe number: a command change
 touches the script **and** this block, and nothing else.
 
 **Each gate bare, never piped** — a pipeline's exit status is the last command's,
@@ -378,6 +424,11 @@ Blind spots, each an answer rather than an omission:
   and it is Dependabot's `rust-toolchain` ecosystem that raises it.
 - **The fuzz lane is nightly-only**, so a *new* fuzz target is not covered by the
   PR gate on the day it lands.
+- **The grant check is a gate because nothing else could be.** A generated agent's
+  tool grant is derived from its brief, and a grant wider than the brief is invisible
+  to every other gate here — it compiles, it tests green, it lints clean. Invariant ①
+  is enforced by `scripts/thegraph/grants.py` or by nothing. It runs offline over
+  `.claude/agents/thegraph-*.md` and is the one gate that needs no toolchain.
 - **`coverage.yml` is deliberately not a gate** — a cargo-llvm-cov discovery tool
   (#102), post-merge/dispatch, **no threshold**, scoped to the sans-IO core and
   excluding `justrdp-tokio` (its tests need the VM).
@@ -556,37 +607,42 @@ confidently a lens reports it.
 | **`connect` and `session` live in one crate** — `crates/justrdp/src/connect.rs` and `session.rs` | **IronRDP** splits them into two crates, `ironrdp-connector` and `ironrdp-session` | ADR-0001 + `docs/plan.md` decision 6 (*"pragmatic 3+1"*). The two share one state machine and one capability set, so a crate boundary between them would run *through the middle of a state machine* rather than along a seam. `plat`, 2026-08-31 |
 | **One adapter crate**, `justrdp-tokio` | **IronRDP** ships four — `ironrdp-async`, `ironrdp-tokio`, `ironrdp-blocking`, `ironrdp-futures` | ADR-0001. The adapter is ~1 000 lines and *which runtime* is a host policy, not a layer of ours — the core is runtime-agnostic precisely so a second runtime never needs a second crate here. `plat`, 2026-08-31 |
 | **`justrdp-pdu/src/` is flat** — one file per `[MS-*]` protocol area, 25 of them | **IronRDP** nests by area: `basic_output/`, `gcc/`, `input/`, `rdp/`, `codecs/` | `docs/map/territory/` depends on a **1:1 area↔file correspondence**, and nesting breaks the thing the map is read for. The threshold is already in the tree rule rather than in judgement: nest when an area outgrows one file, which is what `rfx/` already is. `plat`, 2026-08-31 |
-| **Unit tests are inline `#[cfg(test)]`; `crates/*/tests/` holds differential and corpus tests only** | **h2** and **quinn** put ordinary integration tests in a top-level `tests/` (quinn also `src/tests/`); **rustls** keeps a whole `rustls-test` crate | Measured **16/16** and **declared nowhere** until this build — so it is recorded here rather than discovered again. The peers disagree among themselves, so majority answers nothing and this project's own kept rule wins by the tie-breaker's layout row. `plat`, 2026-08-31 |
+| **Unit tests are inline `#[cfg(test)]`; `crates/*/tests/` holds differential and corpus tests only** | **h2** and **quinn** put ordinary integration tests in a top-level `tests/` (quinn also `src/tests/`); **rustls** keeps a whole `rustls-test` crate | Measured **15/15** and **declared nowhere** until the 2026-08-31 build — so it is recorded here rather than discovered again. The peers disagree among themselves, so majority answers nothing and this project's own kept rule wins by the tie-breaker's layout row. `plat`, 2026-08-31 |
 
 Add a row when a decision *chooses against* a reference or against a strict spec
 reading — that is cheaper than re-defending it every time a lens finds it.
 
 ---
 
-## Split coverage — four slots `unowned`
+## Split coverage — **zero `unowned`** (all four resolved upstream)
 
 Run once per build: every entry in thegraph's *"What the build must supply"* is
-checked against its *"What is invariant, what the build decides"* split. Four sit on
-**neither** side. Each is perfectly answerable — which is exactly what let them pass
-unnoticed.
+checked against its *"What is invariant, what the build decides"* split. This run
+finds **no slot on neither side**.
 
-| Slot | Status |
+The 2026-08-31 build reported **four** — the `proof` method per layer and its traps,
+the areas already carrying a decision record, the tracker capability, and the
+war-story index. All four are now placed, and by both mechanisms the split has:
+
+| Slot | How it is now placed |
 |---|---|
-| `proof` method per layer, and this project's tautological-proof traps | `pending — needs a thegraph change` |
-| areas already carrying a decision record | `pending — needs a thegraph change` |
-| tracker capability | `pending — needs a thegraph change` |
-| war-story index | `pending — needs a thegraph change` |
+| tracker capability | **named explicitly** in *"Decided by the build"* |
+| war-story index | **named explicitly** in *"Decided by the build"* |
+| `proof` method per layer, and its tautological traps | covered by the generalised phrase — each node's data is *"everything it reads and everything it checks against … along with its **method**, its **traps**, and the policies it applies to a surface"* |
+| areas already carrying a decision record | the same phrase — it is what `search` **checks against** |
 
-All four are unambiguous under the split's **rule** — a repository may answer each
-differently without breaking the method, so the build decides it — and all four are
-absent from its enumerated *"Decided by the build"* list. **The change is to place
-them, never to add them**: the slots already exist, and what is missing is the
-sentence saying who answers them. This is the same shape the split section already
-records against itself for the seams, which were *"named all along"* in the schema
-and missing from the list.
+**The generalisation is the load-bearing half, not the two new names.** The split now
+states that the kinds it lists after *"data"* are examples and never the definition,
+and that the coverage check asks *"is it something a node reads or checks against,
+and is it not a bound?"* rather than *"is it one of the kinds listed?"* — which is
+what closes the other two without naming them. Recorded rather than deleted: a
+finding that was real and is now fixed upstream is the one thing an update run can
+show that a first build cannot, and a section that simply vanished would read as
+though the finding had been wrong.
 
-**Their data is filled above regardless.** A marker is not an empty slot, and no run
-should read one as the other.
+**Nothing in this file changed as a result**, which is the shape the split predicts:
+these slots were answerable all along, and *"placing them changes no build"*. Their
+data was filled here before they were placed and is filled here now.
 
 ---
 
@@ -604,14 +660,37 @@ toolchain-free by design). They live in **`scripts/thegraph/`**, kept distinct f
 
 | File | Node | Data slots it carries |
 |---|---|---|
-| `.claude/agents/thegraph-reference.md` | `reference` (fetch only) | the 4 source classes · how each is reached · **which are summarized** (the flag the grade cap reads) |
+| `.claude/agents/thegraph-reference.md` | `reference` (fetch only) | the **4 fetchable** classes of 5 — 1, 2, 3 and 5 · how each is reached · **which are summarized** (the flag the grade cap reads). **Class 4, the real VM, is not here**: it is a throwaway probe on the main thread, not a fetch, and an agent that cannot run one must not carry it as an instruction |
 | `.claude/agents/thegraph-lens.md` | `verify` | both corpora paths (`docs/map/` + `docs/plan.md` §0; FreeRDP/IronRDP + the `[MS-*]` section) · the tie-breaker row for the layer · the deliberate-divergence pointer · the frontier |
 | `.claude/agents/thegraph-refuter.md` | `verify` (2nd) | the same material, **opposing stance** in its brief |
 | `.claude/agents/thegraph-sweep.md` | `sweep` | the 6 surfaces and how each is read |
 | `scripts/thegraph/triggers.py` | `verify` inbound guard | the 3 sacred-path groups, matched against the diff · **the empty-diff answer (`2`, not `0`)** |
 | `scripts/thegraph/place.py` | `place`, and `gate` again on the final diff | the tree rule as a path list, matched against the changed paths |
-| `scripts/thegraph/gates.py` | `gate` | the 9 commands, each invoked **bare** |
+| `scripts/thegraph/gates.py` | `gate` | the 10 commands, each invoked **bare** |
 | `scripts/thegraph/cluster.py` | `search` | the tracker query by artifact · the 13 record-carrying areas |
+| `scripts/thegraph/grants.py` | `gate` (invariant ①) | the generated-agent roster · the write-capable tool list · the `Runs:` declaration form |
+
+**Tool grants — derived from each brief, never defaulted, and checked.** Read-only is
+the **default**; only an explicit `Runs:` declaration naming a tool moves one, and the
+check asserts the default rather than the claim (*"is a write-capable tool granted, and
+does the brief declare it?"* — never *"does the description say read-only?"*, which an
+agent dodges by rephrasing).
+
+| Agent | Grant | Why exactly this |
+|---|---|---|
+| `thegraph-reference` | `Read`, `Glob`, `Grep`, **`Bash`** | The **only** agent licensed to run a command, and it carries the declaration: classes 1/2/3/5 are `curl`, `gh api` and `base64 -d` into `$SCRATCH`, which `Read` cannot reach and `WebFetch` is banned from because it summarizes — the ban that exists so a handler body that *is* there stops reading as absent |
+| `thegraph-lens` | `Read`, `Glob`, `Grep` | **`Bash` removed.** Its brief told it to `gh api … \| base64 -d`, which is the caller's job: `reference` has already fetched into `$SCRATCH` on the main thread by the time `verify` runs, so the brief carries the **paths**, not an instruction to go and get them |
+| `thegraph-refuter` | `Read`, `Glob`, `Grep` | **`Bash` removed.** Its brief never asked for a command — the plainest case, and the one the invariant's war story turns on: the second lens is *the* node whose dissent has to be believed, and a shell it never needed is what cost it that |
+| `thegraph-sweep` | `Read`, `Glob`, `Grep` | **`Bash` and `Edit` removed.** The `sweep` **node** writes surfaces; the **delegated instance** does not — one instance per surface, *"and it is read-only, so invariant ① permits it"*. The instance reports what each surface needs; the main thread applies it |
+
+**Why this table exists at all.** The 2026-08-31 build granted `Bash` to all four and
+`Edit` to the sweeper, **with no brief asking for a command and no declaration anywhere**
+— and that build is the incident the method now records: one agent applied four mutations
+to a live working tree nothing had asked for, while the refuting pass was reading that
+same tree; the refuter then reported a failure it could not reproduce and graded the run
+`UNADJUDICATED`, correctly, from inside evidence the first pass had manufactured. A
+read-only claim asserted in three places and enforced in none is what this row replaces
+with a check.
 
 **Every file carries the build stamp** above. **No file carries the grade table,
 the restatement test, the candidate envelope or the never-drop-a-corpus rule** —

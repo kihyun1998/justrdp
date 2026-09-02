@@ -1113,7 +1113,7 @@ pub fn order_payload<'m, 'a>(messages: &'m [ProgressiveMessage<'a>]) -> PayloadO
 /// It contains **no teardown at all** — no `DELETESURFACE`, no `DELETEENCODINGCONTEXT`, no
 /// reset. So every row above except "create, lazily" rests on FreeRDP alone, which under this
 /// repo's receive-path tie-breaker makes them hypotheses rather than measured behaviour
-/// (`docs/agents/theflow.md`). They are recorded here so the next capture can falsify them.
+/// (`docs/agents/thegraph.md`). They are recorded here so the next capture can falsify them.
 #[derive(Debug, Default)]
 pub struct SurfaceStore {
     grids: HashMap<u16, TileGrid>,

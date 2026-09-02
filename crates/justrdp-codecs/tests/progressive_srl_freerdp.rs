@@ -9,7 +9,7 @@
 //!    *own* `encode_srl`, so they are self-consistent by construction and say nothing about the
 //!    wire — the tautological-proof shape ADR-0007's #118 amendment exists to route around.
 //! 2. **The two references disagree with each other**, so "match the reference" is not a single
-//!    instruction. `docs/agents/theflow.md`'s codec byte-exactness row names the **oracle**,
+//!    instruction. `docs/agents/thegraph.md`'s codec byte-exactness row names the **oracle**,
 //!    *with FreeRDP as the tie-break when the oracle and we disagree*; ADR-0011 disqualifies the
 //!    oracle for this stage, so FreeRDP is what remains and what these vectors encode.
 //! 3. **A real-server corpus cannot settle it either.** `fixtures/progressive/replay.bin` does

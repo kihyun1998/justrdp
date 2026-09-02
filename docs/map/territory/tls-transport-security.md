@@ -84,6 +84,7 @@ behavioural question no spec section answers, and it is unrecorded.
 - **RD Gateway certificates** are out of scope in the same record (epic #23).
 - **Pin-store schema versioning** is unspecified: `FilePinStore` writes a format
   nothing versions, so a later format change has no migration path.
-- This is a **Step 5 unconditional trigger** in
-  [`docs/agents/theflow.md`](../../agents/theflow.md) — a wrong trust decision
+- This is a **sacred path** in
+  [`docs/agents/thegraph.md`](../../agents/thegraph.md), so `verify`'s guard fires on
+  it unconditionally — a wrong trust decision
   produces a working session and no error anywhere.

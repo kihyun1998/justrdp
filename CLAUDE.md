@@ -18,10 +18,11 @@ Substantive 변경이면 **`thegraph` 스킬**로 짠다 — 착수 시 `/thegra
 *옮겼다*(지운 게 아니라). 규칙에 이빨을 주는 실증(ADR·이슈 앵커)은
 **`docs/agents/lessons.md`**.
 
-(**`theflow` 는 은퇴했고 스킬도 제거됐다** — `/theflow` 는 더 이상 호출되지 않는다.
-`docs/agents/theflow.md` 파일은 남아 있지만, 그건 출하되는 rustdoc·ADR-0011/0012/0013·
-`docs/map/` 이 그 파일의 *Step* 번호와 war-story 앵커를 인용하기 때문이지 살아있는
-규율이어서가 아니다. 두 표는 거기 없다.)
+(**`theflow` 는 은퇴했고 스킬도 파일도 없다** — `/theflow` 는 호출되지 않고
+`docs/agents/theflow.md` 는 삭제됐다. 그 파일을 가리키던 참조는 전부 `thegraph.md`
+로 옮겨졌다. 단 **Step 번호는 `lessons.md` 에 그대로 산다** — 출하되는 rustdoc·
+ADR-0011/0012/0013·`docs/map/` 이 그 번호로 인용하기 때문이고, step→node 매핑은
+`lessons.md` 서문에 있다.)
 
 ## 착수 전 배선도 — `docs/map/`
 
@@ -46,7 +47,7 @@ justrdp 가 **하지 않는 것** (의존성으로 끌어들이지도 말 것):
 ## 크레이트 구조 (ADR-0001)
 
 가상 워크스페이스(edition 2024). 멤버 4 + 워크스페이스 밖 `fuzz`:
-`justrdp-pdu`(무의존 PDU) · `justrdp`(sans-IO 코어) · `justrdp-codecs`(코덱 — 전부 자체 소유, ironrdp-graphics 는 **dev 오라클로만**; #189 이후 런타임 그래프에 ironrdp 없음) · `justrdp-tokio`(~30줄 I/O 어댑터 — tokio/sspi/rustls 는 여기만) · `fuzz`(워크스페이스 밖, nightly). 상세 표·`--workspace` 사각지대는 `docs/agents/theflow.md`.
+`justrdp-pdu`(무의존 PDU) · `justrdp`(sans-IO 코어) · `justrdp-codecs`(코덱 — 전부 자체 소유, ironrdp-graphics 는 **dev 오라클로만**; #189 이후 런타임 그래프에 ironrdp 없음) · `justrdp-tokio`(~30줄 I/O 어댑터 — tokio/sspi/rustls 는 여기만) · `fuzz`(워크스페이스 밖, nightly). 상세 트리 규칙은 `docs/agents/thegraph.md` § `place`, `--workspace` 사각지대는 같은 파일 § `gate`.
 
 **위임 의존(ADR-0002, 전부 leaf·보안 크리티컬·비-RDP)**: `rustls`(`ring` provider)·`rustls-platform-verifier`(#36)·`sspi`·`x509-cert`. **sspi 포크 브리지는 끝났다(2026-08-10)**: `[patch.crates-io]` 제거, `sspi = "=0.21.3"` 정확 핀(ADR-0004 Decision 이 요구하는 형태). Devolutions/sspi-rs#689 가 0.21.1 로 출시되며 탈출 조건이 충족됐고, 루프백 full-CredSSP 테스트가 퍼블리시 크레이트에서 통과한다. **실 VM 스위트도 통과한다** — VM 이 재구축되며 자격증명이 살아났고, 전체 스위트가 병렬 15/15(2026-08-19, #198). 이 문장은 한동안 `STATUS_LOGON_FAILURE` 로 막혀 있다고 적혀 있었다(클라이언트 회귀 아님은 A/B 로 확인됐었다). ADR-0004 Amendment(2026-08-10) + [`docs/map/territory/nla-credssp.md`](docs/map/territory/nla-credssp.md).
 

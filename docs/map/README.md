@@ -18,9 +18,9 @@ build order, the issues by the work that shipped. None of them is indexed by
 ## Reading protocol
 
 - **Read before the design, write after the change.** In
-  [`docs/agents/theflow.md`](../agents/theflow.md) the map is Step 1's third ledger
-  — opened *before* the boundary is drawn — and swept at Step 6. Reaching for it at
-  Step 5 turns everything it would have told you into rework.
+  [`docs/agents/thegraph.md`](../agents/thegraph.md) the `map` node runs **before**
+  `boundary` — opened *before* the boundary is drawn — and `sweep` reads it again.
+  Reaching for it at `verify` turns everything it would have told you into rework.
 - **Step 5's lens brief starts here.** A territory's `## Blast radius` is the
   sibling set for corpus ①, and its `## Cross-cutting invariants` are the facts that
   hold beyond the territory you are standing in. The bindings doc no longer
@@ -135,7 +135,8 @@ Invariants: [decoder-dimension-overflow-32bit](invariant/decoder-dimension-overf
 [oracle-agreement-is-not-independence](invariant/oracle-agreement-is-not-independence.md) ·
 [capture-coverage-follows-what-we-advertise](invariant/capture-coverage-follows-what-we-advertise.md) ·
 [a-later-stage-can-hide-an-earlier-defect](invariant/a-later-stage-can-hide-an-earlier-defect.md) ·
-[a-decoded-field-with-no-reader-is-an-unstated-decision](invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
+[a-decoded-field-with-no-reader-is-an-unstated-decision](invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md) ·
+[what-we-advertise-we-must-implement](invariant/what-we-advertise-we-must-implement.md)
 
 **The graph is gated.** `python .github/scripts/check_map.py` (CI: `test.yml` job
 `map`) checks that every link and `#anchor` resolves, that every path under `## Code`

@@ -149,7 +149,7 @@ time it was decided from scratch:
 Four combinations of the same two participants (a value the parser constrained, a consumer that
 does arithmetic with it), decided four times, with the reasoning re-derived on each occasion and
 recorded — where it was recorded at all — on the branch of code that happened to raise it. The
-`theflow` promotion bar is two of five triggers; four fire here:
+`promote` bar is two of five triggers; four fire here:
 
 - **A pair already decided, in a different combination.** The table above.
 - **An earlier issue's premise measured false.** #168's completeness pass reported this as a

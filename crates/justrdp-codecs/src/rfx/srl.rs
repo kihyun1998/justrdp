@@ -16,7 +16,7 @@
 //! and its own tests round-trip against its own encoder, so it cannot arbitrate (#194,
 //! ADR-0011). (No count in this sentence on purpose — the list is the authority, and a
 //! hand-copied number beside a derived list is the drift `lessons.md` records for #200.)
-//! `docs/agents/theflow.md`'s tie-breaker for codec byte-exactness names the **oracle**, *with
+//! `docs/agents/thegraph.md`'s tie-breaker for codec byte-exactness names the **oracle**, *with
 //! FreeRDP as the tie-break when the oracle and we disagree* — and here the oracle is
 //! disqualified outright, so what remains is FreeRDP. This module is therefore derived from
 //! `progressive.c` and gated on the hand-derived vectors in `tests/progressive_srl_freerdp.rs`.
@@ -41,7 +41,7 @@
 //!
 //! - `raw_read` returns [`SrlError::ValueOverflow`] for a read too wide to fit a coefficient,
 //!   where `rawShift` (`:1192-1201`) uses a plain C cast. Same family as the `i16` overflow row
-//!   in `docs/agents/theflow.md`, and covered by the same reasoning.
+//!   in `docs/agents/thegraph.md`, and covered by the same reasoning.
 //! - [`Bits::bits`] consumes `n` bits for any `n`, where winpr's `BitStream_Shift` warns and
 //!   consumes **nothing** for `n >= 32` (`bitstream.h`). Unreachable here: the only call passes
 //!   `k <= 10`.

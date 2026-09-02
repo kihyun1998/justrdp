@@ -235,7 +235,7 @@ dependency graph — runtime *and* development.**
    and is the worked example.
 3. **The oracle never outranks the owned basis.** Where the oracle and a real-server corpus
    disagree, the corpus wins; where the oracle and FreeRDP disagree, the tie-breaker in
-   [`docs/agents/theflow.md`](../agents/theflow.md) already names FreeRDP. This decision adds
+   [`docs/agents/thegraph.md`](../agents/thegraph.md) already names FreeRDP. This decision adds
    only that a green oracle diff is **not** by itself an exit criterion once an owned basis
    exists for that codec.
 4. **`rustls` and `sspi` are unaffected.** They are security-critical, non-RDP-specific leaf

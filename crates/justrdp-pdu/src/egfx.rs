@@ -60,6 +60,34 @@ pub const CAPVERSION_8_1: u32 = 0x0008_0105;
 /// `RDPGFX_CAPVERSION_10` — the modern baseline; AVC is on by default and disabled via
 /// [`CAPS_FLAG_AVC_DISABLED`].
 pub const CAPVERSION_10: u32 = 0x000A_0002;
+/// `RDPGFX_CAPVERSION_101` (2.2.3.4). Its capsData is **sixteen `reserved` bytes that MUST
+/// be zero**, not a flags word — the one capset in 2.2.3 shaped differently, which is why
+/// [`CapSet`] is an enum rather than a `(version, flags)` pair.
+pub const CAPVERSION_101: u32 = 0x000A_0100;
+/// `RDPGFX_CAPVERSION_102` (2.2.3.5).
+pub const CAPVERSION_102: u32 = 0x000A_0200;
+/// `RDPGFX_CAPVERSION_103` (2.2.3.6).
+pub const CAPVERSION_103: u32 = 0x000A_0301;
+/// `RDPGFX_CAPVERSION_104` (2.2.3.7) — the newest version justrdp advertises. Everything
+/// above it obliges a scaled map-surface this client does not implement (1.5.1).
+pub const CAPVERSION_104: u32 = 0x000A_0400;
+/// `RDPGFX_CAPVERSION_105` (2.2.3.8). **Declared, never advertised** — 1.5.1 makes it a MUST
+/// to process `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU`, and there is no flag to decline it.
+/// It is declared because 3.3.5.19 requires ignoring a confirmed capset that is *not*
+/// specified in 2.2.3, which needs the full set to be nameable.
+pub const CAPVERSION_105: u32 = 0x000A_0502;
+/// `RDPGFX_CAPVERSION_106` (2.2.3.9). Declared, never advertised, same reason as
+/// [`CAPVERSION_105`] — a real WS2022 server confirms this one when it is offered and then
+/// sends the scaled map-surface command, painting nothing.
+pub const CAPVERSION_106: u32 = 0x000A_0600;
+/// The value 2.2.3.9 carried before the 180912 errata; the published text now reads
+/// [`CAPVERSION_106`]. Kept nameable because a server built against the old text may send
+/// it, and 3.3.5.19's ignore rule has to be able to recognise it either way.
+pub const CAPVERSION_106_ERR: u32 = 0x000A_0601;
+/// `RDPGFX_CAPVERSION_107` (2.2.3.10). Declared, never advertised: it *can* decline the
+/// obligation with [`CAPS_FLAG_SCALEDMAP_DISABLE`], and nothing measured shows this server
+/// selecting it — offered alongside 104 it chose 104.
+pub const CAPVERSION_107: u32 = 0x000A_0701;
 
 /// `RDPGFX_CAPS_FLAG_AVC420_ENABLED` (8.1): the client can decode AVC420. justrdp does not
 /// set it.
@@ -67,6 +95,10 @@ pub const CAPS_FLAG_AVC420_ENABLED: u32 = 0x0000_0010;
 /// `RDPGFX_CAPS_FLAG_AVC_DISABLED` (10+): the server MUST NOT use AVC — set by justrdp on
 /// every 10.x capset until an H.264 decoder exists.
 pub const CAPS_FLAG_AVC_DISABLED: u32 = 0x0000_0020;
+/// `RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE` (10.7+, 2.2.3.10): the scaled map-surface PDUs are
+/// not supported. The only opt-out 2.2.3 offers for 1.5.1's scaling obligation — 105 and 106
+/// have none, which is what makes them unadvertisable here.
+pub const CAPS_FLAG_SCALEDMAP_DISABLE: u32 = 0x0000_0080;
 
 /// `RDPGFX_CODECID_UNCOMPRESSED` (WireToSurface1).
 pub const CODECID_UNCOMPRESSED: u16 = 0x0000;
@@ -465,16 +497,90 @@ fn header(cmd_id: u16, body_len: usize) -> Vec<u8> {
     out
 }
 
-/// Encode the client's Caps Advertise (MS-RDPEGFX 2.2.2.16): one capset per
-/// `(version, flags)` pair, in preference order.
-pub fn encode_caps_advertise(capsets: &[(u32, u32)]) -> Vec<u8> {
-    let body_len = 2 + capsets.len() * 12;
+/// One capability set in a Caps Advertise, shaped by its **version** rather than by the
+/// caller.
+///
+/// Every capset in `[MS-RDPEGFX]` 2.2.3 carries a four-byte `flags` word except
+/// [`CAPVERSION_101`], whose 2.2.3.4 payload is *sixteen `reserved` bytes that MUST be set to
+/// zero*. A `(version, flags)` pair cannot express that difference, so a caller could hand
+/// 101 a non-zero flag and emit a MUST violation with nothing to stop it. Making the payload
+/// the variant removes the case instead of checking for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapSet {
+    /// A capset whose `capsData` is the four-byte `flags` word (2.2.3.1-.3, .5-.10).
+    Flags {
+        /// One of the `CAPVERSION_*` constants.
+        version: u32,
+        /// The `flags` word for that version.
+        flags: u32,
+    },
+    /// `RDPGFX_CAPSET_VERSION101` (2.2.3.4) — sixteen reserved bytes, all zero. It carries no
+    /// version field of its own because there is exactly one version with this shape.
+    Version101,
+}
+
+impl CapSet {
+    /// The `version` field this capset writes.
+    pub fn version(self) -> u32 {
+        match self {
+            Self::Flags { version, .. } => version,
+            Self::Version101 => CAPVERSION_101,
+        }
+    }
+
+    /// The `capsDataLength` the spec fixes for this capset.
+    pub fn caps_data_length(self) -> u32 {
+        match self {
+            Self::Flags { .. } => 4,
+            Self::Version101 => 0x10,
+        }
+    }
+}
+
+/// Is `version` one of the capability sets `[MS-RDPEGFX]` 2.2.3 specifies?
+///
+/// 3.3.5.19 requires the client to **ignore** a confirmed capability set that is not, which
+/// is why the versions justrdp declines to advertise are still named here: recognising a
+/// value and adhering to it are different acts, and only the second is a choice.
+///
+/// **[`CAPVERSION_106_ERR`] is deliberately absent.** It is what 2.2.3.9 printed before the
+/// 180912 errata and the published text no longer carries it, so it is *not specified in
+/// section 2.2.3* and 3.3.5.19's MUST reaches it. Recognising it as tolerance would buy
+/// nothing today — nothing reads the confirmed version — and would be wrong the moment
+/// something does, because storing it is this client claiming a 10.6 it cannot honour
+/// (1.5.1's scaled map-surface). The constant stays declared so the value has a name.
+pub fn is_specified_capversion(version: u32) -> bool {
+    matches!(
+        version,
+        CAPVERSION_8
+            | CAPVERSION_8_1
+            | CAPVERSION_10
+            | CAPVERSION_101
+            | CAPVERSION_102
+            | CAPVERSION_103
+            | CAPVERSION_104
+            | CAPVERSION_105
+            | CAPVERSION_106
+            | CAPVERSION_107
+    )
+}
+
+/// Encode the client's Caps Advertise (MS-RDPEGFX 2.2.2.16), in preference order.
+pub fn encode_caps_advertise(capsets: &[CapSet]) -> Vec<u8> {
+    let body_len = 2 + capsets
+        .iter()
+        .map(|c| 8 + c.caps_data_length() as usize)
+        .sum::<usize>();
     let mut out = header(CMDID_CAPS_ADVERTISE, body_len);
     out.extend_from_slice(&(capsets.len() as u16).to_le_bytes());
-    for (version, flags) in capsets {
-        out.extend_from_slice(&version.to_le_bytes());
-        out.extend_from_slice(&4u32.to_le_bytes()); // capsDataLength
-        out.extend_from_slice(&flags.to_le_bytes());
+    for capset in capsets {
+        out.extend_from_slice(&capset.version().to_le_bytes());
+        out.extend_from_slice(&capset.caps_data_length().to_le_bytes());
+        match capset {
+            CapSet::Flags { flags, .. } => out.extend_from_slice(&flags.to_le_bytes()),
+            // 2.2.3.4: sixteen reserved bytes, all zero.
+            CapSet::Version101 => out.extend(core::iter::repeat_n(0u8, 0x10)),
+        }
     }
     out
 }
@@ -780,7 +886,10 @@ mod tests {
 
     #[test]
     fn caps_advertise_and_frame_ack_wire_shape() {
-        let adv = encode_caps_advertise(&[(CAPVERSION_8, 0)]);
+        let adv = encode_caps_advertise(&[CapSet::Flags {
+            version: CAPVERSION_8,
+            flags: 0,
+        }]);
         assert_eq!(adv.len(), 8 + 2 + 12);
         assert_eq!(&adv[0..2], &CMDID_CAPS_ADVERTISE.to_le_bytes());
         assert_eq!(&adv[4..8], &(adv.len() as u32).to_le_bytes());

@@ -3624,6 +3624,87 @@ mod tests {
         .await
     }
 
+    /// Real-VM proof for the EGFX capability ladder (#271): the advertised set must produce a
+    /// confirmed version **and a painted desktop**, and it must not oblige a command this
+    /// client does not implement.
+    ///
+    /// The third assertion is the one that carries the ticket. Advertising through
+    /// `CAPVERSION_106` made this same server confirm 10.6 and send
+    /// `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT` (`cmdId` 0x0017), which `GraphicsProcessor` skips
+    /// as unknown — so the surface was never mapped and **zero** frames reached the host while
+    /// the session, the channel and the frame brackets all stayed healthy. A caps-handshake
+    /// assertion cannot see that; a frame count can, and "no EGFX command was skipped" names
+    /// the cause rather than the symptom.
+    ///
+    /// **One WS2022 box.** That this server selects 10.4 from the advertised ladder is an
+    /// observation about this pair (server + our advertised config), not a fact about servers
+    /// — see `docs/map/invariant/capture-coverage-follows-what-we-advertise.md`. What is
+    /// asserted is the invariant: whatever it selects is something we offered, and it paints.
+    #[tokio::test]
+    #[traced_test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn the_egfx_caps_ladder_is_confirmed_and_paints_against_real_vm() {
+        with_vm_session(|vm| async move {
+            let config = test_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let mut frames = 0usize;
+            let mut covered: u64 = 0;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                run_session(
+                    &mut stream,
+                    &mut machine,
+                    |frame, _fb| {
+                        frames += 1;
+                        covered += u64::from(frame.width) * u64::from(frame.height);
+                    },
+                    |_| {},
+                ),
+            )
+            .await;
+
+            // The server confirmed one of the versions we advertised. `version` is logged in
+            // decimal, so the ladder is checked the way the log renders it.
+            assert!(
+                logs_contain("EGFX caps confirmed"),
+                "the server never confirmed EGFX caps"
+            );
+            // **No assertion on *which* version came back**, deliberately, and both halves of
+            // that are load-bearing. A copy of the ladder here is the hand-kept roster beside
+            // a derived list that `docs/agents/lessons.md` records drifting (#200). A
+            // blacklist of the versions that oblige a scaled map is worse than useless: 10.7
+            // carrying `SCALEDMAP_DISABLE` is legitimately advertisable, so such a list turns
+            // a future correct ladder red while detecting nothing the assertions below miss.
+            // The behaviour is the check — a version whose obligation this client cannot
+            // honour shows up as a skipped command and an unpainted desktop, and those are
+            // what fail.
+
+            // The failure this ladder exists to avoid: a healthy channel that paints nothing.
+            let fb = machine.framebuffer();
+            let total = u64::from(fb.width()) * u64::from(fb.height());
+            eprintln!("EGFX caps ladder: frames={frames} covered={covered}px of {total}px");
+            assert!(frames >= 1, "no EGFX FrameUpdate was emitted");
+            assert!(
+                covered >= total / 2,
+                "expected at least half the desktop painted, got {covered} of {total}"
+            );
+
+            // And the cause, not only the symptom: an advertised version must not oblige a
+            // command this client skips.
+            assert!(
+                !logs_contain("unknown EGFX command skipped"),
+                "the server sent an EGFX command this client does not implement — the                  advertised ladder obliges something it cannot honour"
+            );
+        })
+        .await
+    }
+
     /// Capture the MCS Connect-Response a real server sends, and commit it as the fixture that
     /// seeds the `gcc` and `mcs` fuzz targets (#203).
     ///
@@ -4662,7 +4743,7 @@ mod tests {
             // the fraction of pixels where WireToSurface2 happened to be the last writer, which
             // is a property of the *server's* codec scheduling and not of this client.
             //
-            // `docs/agents/theflow.md` names exactly this under Step 4: "beware a measurement
+            // `docs/agents/thegraph.md` names exactly this under `proof`: "beware a measurement
             // that can misread itself". Recorded rather than deleted, because the comparison is
             // the obvious thing to reach for and re-deriving why it does not work costs another
             // 70-second run. **It would become well-posed** if the replay were driven through a

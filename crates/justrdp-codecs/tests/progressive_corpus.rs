@@ -163,7 +163,7 @@ fn self_owned_parser_accepts_the_full_capture() {
     }
 }
 
-/// A corpus proves only what it contains (`docs/agents/theflow.md` Step 4), so measure the
+/// A corpus proves only what it contains (`docs/agents/thegraph.md`, the `proof` table), so measure the
 /// axes rather than inferring them from the fixture's name. Each assertion below is an axis
 /// some open slice of epic #158 needs, and the counts are the ones the capture reported.
 #[test]
@@ -278,7 +278,7 @@ fn oracle_still_rejects_the_full_quality_sentinel() {
 ///
 /// The direction of this divergence does not rest on the oracle at all — restated without
 /// naming it: *a real Server 2022 sends these streams and a real client must paint them, so
-/// refusing them is a receive-path defect.* This is the layer where `docs/agents/theflow.md`
+/// refusing them is a receive-path defect.* This is the layer where `docs/agents/thegraph.md`
 /// gives authority to **the VM's observed behaviour, then FreeRDP's tolerance code** — the
 /// tolerant-receive posture of ADR-0009 — rather than to a strict reading of the spec, so no
 /// claim about what `[MS-RDPEGFX]` obliges is needed here, and none is made.
