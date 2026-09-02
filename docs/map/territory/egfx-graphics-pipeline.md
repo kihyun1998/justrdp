@@ -132,6 +132,12 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
 
 ## Cross-cutting invariants
 
+- [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
+  — **the discovery site (#271)**. The capability version ladder is chosen by which
+  obligations this client can discharge, not by how high the version goes: advertising
+  through `CAPVERSION_106` made a real server confirm 10.6, send
+  `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT` (`cmdId` 0x0017), and paint **zero** frames with the
+  session, the channel and the frame brackets all healthy.
 - [Oracle agreement is not independence](../invariant/oracle-agreement-is-not-independence.md)
   — the phase-2 rewrite is verified against a codebase sharing this project's
   lineage.
@@ -194,8 +200,13 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   of Microsoft's own line. That is the argument for skip rather than refuse, and it is recorded
   nowhere else. Two siblings bound how much this could be got wrong: **#270** (which DVC errors
   should close a channel versus drop the connection — every one drops it today, so "refuse"
-  here would have cost the whole session, not the channel) and **#271** (EGFX caps stop at
-  `CAPVERSION_10`, so the spec's own channel-reset mechanism is unreachable from here).
+  here would have cost the whole session, not the channel) and **#271**, whose premise this territory
+  carried and which is now **false**: the ladder reached only `CAPVERSION_10`, so the spec's
+  own channel-reset mechanism was unreachable from here. It reaches **10.4** as of #271, and
+  3.3.5.19 makes the reset available from 10.3 upward — so the cheapest rung of that ladder
+  exists now, though nothing sends it yet (the reset itself is a sibling: neither reference
+  client implements it, and a probe showed this server honours a mid-session re-advertise and
+  then drops the connection when the client does not hold up 3.3.5.19's two MUSTs).
 
 - **Both decoders are self-owned.** zgfx crossed in #189 and epic #158 (slices #167–#172)
   closed the Progressive half: the self-owned

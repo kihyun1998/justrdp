@@ -58,6 +58,10 @@ recorded.
 
 ## Cross-cutting invariants
 
+- [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
+  — the early capability flags are the outermost instance: `SUPPORT_DYN_VC_GFX_PROTOCOL` is
+  what makes the graphics channel exist at all, so a flag set here is a promise about a whole
+  subsystem.
 - [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
   — `ServerCoreData.client_requested_protocols` is the server's echo of what we asked for
   and nothing compares it, though `connect.rs` already rejects a *selected* protocol we

@@ -113,6 +113,11 @@ checked, identically on both legs.
 
 ## Cross-cutting invariants
 
+- [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
+  — this territory builds the Confirm Active capability sets, which are the general form of
+  the rule: every set sent here tells the server which orders and surface commands it may now
+  use, and a set advertised past what the client handles produces dropped traffic rather than
+  an error.
 - [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
   — the discovery site. `Synchronize.messageType` was discarded under a spec citation the
   spec does not make, and a server `Control.action` was decoded and dropped; both closed by

@@ -47,6 +47,10 @@ glossary, which is vocabulary rather than a decision.
 
 ## Cross-cutting invariants
 
+- [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
+  — `VCCAPS_NO_COMPR` is this territory's instance, and the one place the rule is already
+  *enforced*: a compressed SVC chunk is a typed error precisely because compression was never
+  advertised.
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) —
   chunk reassembly is attacker-controlled length arithmetic.
 

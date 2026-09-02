@@ -135,7 +135,8 @@ Invariants: [decoder-dimension-overflow-32bit](invariant/decoder-dimension-overf
 [oracle-agreement-is-not-independence](invariant/oracle-agreement-is-not-independence.md) ·
 [capture-coverage-follows-what-we-advertise](invariant/capture-coverage-follows-what-we-advertise.md) ·
 [a-later-stage-can-hide-an-earlier-defect](invariant/a-later-stage-can-hide-an-earlier-defect.md) ·
-[a-decoded-field-with-no-reader-is-an-unstated-decision](invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
+[a-decoded-field-with-no-reader-is-an-unstated-decision](invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md) ·
+[what-we-advertise-we-must-implement](invariant/what-we-advertise-we-must-implement.md)
 
 **The graph is gated.** `python .github/scripts/check_map.py` (CI: `test.yml` job
 `map`) checks that every link and `#anchor` resolves, that every path under `## Code`

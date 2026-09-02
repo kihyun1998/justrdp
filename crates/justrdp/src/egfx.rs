@@ -397,6 +397,19 @@ impl GraphicsProcessor {
     ) -> Result<(), DecodeError> {
         match pdu {
             EgfxPdu::CapsConfirm { version, flags } => {
+                // 3.3.5.19: a capability set "not specified in section 2.2.3" MUST be
+                // ignored; only a specified one is stored and adhered to. Recognising a
+                // version and adhering to it are different acts — the versions this client
+                // declines to *advertise* are still recognised here, because a confirm naming
+                // one is a server disagreeing with us, not a malformed PDU.
+                if !egfx::is_specified_capversion(version) {
+                    tracing::warn!(
+                        target: "rdp_egfx_caps",
+                        version,
+                        "EGFX caps confirm names a version outside 2.2.3 — ignored"
+                    );
+                    return Ok(());
+                }
                 tracing::info!(target: "rdp_egfx_caps", version, flags, "EGFX caps confirmed");
                 self.confirmed_version = Some(version);
             }
@@ -920,18 +933,45 @@ impl DvcProcessor for GraphicsProcessor {
     }
 
     fn start(&mut self, _channel_id: u32) -> Vec<ProcessorOutput> {
-        // Newest first, AVC structurally excluded: 10 with AVC_DISABLED, 8.1 without
-        // AVC420_ENABLED, and the V8 baseline. Every confirmed version leaves the server on
-        // codecs justrdp decodes (Progressive / ClearCodec / Planar / Uncompressed).
+        // **Oldest first, and stopping at 10.4.** The ladder is chosen by whether a version
+        // lets this client decline an obligation it does not implement, not by how high the
+        // number goes — `[MS-RDPEGFX]` 1.5.1 makes 10.5, 10.6 and 10.7-without-
+        // SCALEDMAP_DISABLE a MUST to process `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU`.
+        //
+        // *Does not implement*, not *cannot*: `ironrdp-egfx` advertises 10.5/10.6 and
+        // discharges the same MUST without a resampler — it accepts the command, records the
+        // origin and forwards the target size — and this server's scaled map is 1:1 anyway
+        // (measured: `target` equals the surface's own 1280x800). So excluding them is a
+        // **scope decision**, taken deliberately, and not a derivation from impossibility. Measured rather than argued: offered the full ladder, a real WS2022
+        // server confirmed **10.6**, sent that command, and painted **zero** frames while the
+        // session, the channel and the frame brackets all stayed healthy — a black screen
+        // with no error anywhere. Offered this ladder it confirms **10.4** and paints.
+        //
+        // 10.7 *can* decline the obligation and is still not advertised: offered alongside
+        // 10.4 the same server chose 10.4, so nothing measured shows a benefit, and this repo
+        // does not ship machinery for a case no capture contains.
+        //
+        // AVC stays structurally excluded — every 10.x capset carries AVC_DISABLED, and
+        // AVC_THINCLIENT (10.3+) is therefore never applicable. SMALL_CACHE is never set, so
+        // 10.3's rule that it must be cleared there is satisfied by construction.
+        //
+        // The order is the one the measurement used, and it is what both reference clients
+        // send.
         //
         // Sent RAW: EGFX segmentation is asymmetric — only server→client traffic rides
         // RDP_SEGMENTED_DATA; a client→server PDU wrapped in a segment header gets the whole
         // connection reset (proven on the real VM: the server reads 0xE0 0x04 as a garbage
         // cmdId and kills the session; raw proceeds to Caps Confirm).
+        let avc_off = egfx::CAPS_FLAG_AVC_DISABLED;
+        let flags = |version, flags| egfx::CapSet::Flags { version, flags };
         let capsets = [
-            (egfx::CAPVERSION_10, egfx::CAPS_FLAG_AVC_DISABLED),
-            (egfx::CAPVERSION_8_1, 0),
-            (egfx::CAPVERSION_8, 0),
+            flags(egfx::CAPVERSION_8, 0),
+            flags(egfx::CAPVERSION_8_1, 0),
+            flags(egfx::CAPVERSION_10, avc_off),
+            egfx::CapSet::Version101,
+            flags(egfx::CAPVERSION_102, avc_off),
+            flags(egfx::CAPVERSION_103, avc_off),
+            flags(egfx::CAPVERSION_104, avc_off),
         ];
         tracing::debug!(target: "rdp_egfx_caps", count = capsets.len(), "EGFX caps advertised");
         vec![ProcessorOutput::Send(egfx::encode_caps_advertise(&capsets))]
@@ -1116,6 +1156,80 @@ mod tests {
             .unwrap();
         let flags = u32::from_le_bytes(message[v10_at + 8..v10_at + 12].try_into().unwrap());
         assert_eq!(flags, egfx::CAPS_FLAG_AVC_DISABLED);
+    }
+
+    /// The ladder stops where the client can meet the obligation, not where the numbers run
+    /// out. `[MS-RDPEGFX]` 1.5.1 makes VERSION_105, VERSION_106 and VERSION_107-without-
+    /// `SCALEDMAP_DISABLE` a MUST to process `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU`, and
+    /// this client does not — measured: advertising them made a real server confirm 106,
+    /// send that command, and paint **zero** frames while the session stayed healthy.
+    #[test]
+    fn the_advertised_ladder_reaches_104_and_stops_there() {
+        let mut p = GraphicsProcessor::default();
+        let outputs = p.start(11);
+        let [Out::Send(message)] = outputs.as_slice() else {
+            panic!("expected one send, got {outputs:?}");
+        };
+        let advertised = |v: u32| message.windows(4).any(|w| w == v.to_le_bytes());
+        for v in [
+            egfx::CAPVERSION_8,
+            egfx::CAPVERSION_8_1,
+            egfx::CAPVERSION_10,
+            egfx::CAPVERSION_101,
+            egfx::CAPVERSION_102,
+            egfx::CAPVERSION_103,
+            egfx::CAPVERSION_104,
+        ] {
+            assert!(advertised(v), "0x{v:08X} should be advertised");
+        }
+        for v in [
+            egfx::CAPVERSION_105,
+            egfx::CAPVERSION_106,
+            egfx::CAPVERSION_106_ERR,
+            egfx::CAPVERSION_107,
+        ] {
+            assert!(
+                !advertised(v),
+                "0x{v:08X} obliges a scaled map-surface this client cannot honour"
+            );
+        }
+    }
+
+    /// 2.2.3.4 gives VERSION_101 sixteen **reserved** bytes that MUST be zero, where every
+    /// other capset in 2.2.3 carries a four-byte flags word. An encoder that takes a flags
+    /// value and a length can emit a MUST violation; the wire is what pins it.
+    #[test]
+    fn the_101_capset_declares_sixteen_reserved_bytes_and_they_are_zero() {
+        let mut p = GraphicsProcessor::default();
+        let outputs = p.start(11);
+        let [Out::Send(message)] = outputs.as_slice() else {
+            panic!("expected one send, got {outputs:?}");
+        };
+        let at = message
+            .windows(4)
+            .position(|w| w == egfx::CAPVERSION_101.to_le_bytes())
+            .expect("VERSION_101 is advertised");
+        let caps_data_length = u32::from_le_bytes(message[at + 4..at + 8].try_into().unwrap());
+        assert_eq!(caps_data_length, 0x10, "2.2.3.4 fixes this at 0x10");
+        assert!(
+            message[at + 8..at + 8 + 0x10].iter().all(|b| *b == 0),
+            "all sixteen reserved bytes MUST be zero"
+        );
+    }
+
+    /// 3.3.5.19: *"If the capability set received in capsSet field ... is not specified in
+    /// section 2.2.3, the client MUST ignore the capability set."* Storing it would make a
+    /// version we never advertised, and cannot honour, the one the rest of the channel
+    /// adheres to.
+    #[test]
+    fn a_confirm_naming_a_version_outside_2_2_3_is_ignored() {
+        let mut p = GraphicsProcessor::default();
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        assert!(feed(&mut p, egfx::CMDID_CAPS_CONFIRM, &body).is_empty());
+        assert_eq!(p.confirmed_version, None);
     }
 
     #[test]
