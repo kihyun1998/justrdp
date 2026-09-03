@@ -20,6 +20,6 @@
 # (`i686-pc-windows-msvc`, #151/#155) would make every Linux job fetch a cross-target std
 # it never builds. That proof stays a local step until an i686 job exists.
 [toolchain]
-channel = "1.98.0"
+channel = "1.98.1"
 profile = "minimal"
 components = ["clippy", "rustfmt"]
