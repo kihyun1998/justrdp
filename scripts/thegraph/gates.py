@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""thegraph `gate` runner (justrdp) -- 8 gates, 10 commands, each run BARE.
+"""thegraph `gate` runner (justrdp) -- 10 gates, 11 commands, each run BARE.
 
-Build stamp: thegraph is THREE files as of this stamp --
-  SKILL.md          md5:f73cef09189056e3ed7713a81177becc
-  NODES.md          md5:82d1538acc2c35dd2fbcb3cecded3f66
-  BUILD_CONTRACT.md md5:a4fc95f7e6d1605869a33e8c2bafb2c6   (2026-09-02)
+Build stamp: thegraph is the whole skill DIRECTORY as of this stamp --
+  SKILL.md          md5:2d6a25ea8bb45587bd1f78316ffdff87
+  NODES.md          md5:6f3b044bece13d2e7ab24ddaf88b8944
+  BUILD_CONTRACT.md md5:a4fc95f7e6d1605869a33e8c2bafb2c6
+  DELEGATION.md     md5:bb6ef36e828ab465c4cbfc60fb04f5b5
+  CREATION-LOG.md   md5:dbee47f193894a7bf7711239ebdc0a51   (2026-09-04)
 Graph: docs/agents/thegraph.md. Method: the `thegraph` skill.
 
 Why this is a script rather than a list someone types: a gate must be able to
@@ -119,6 +121,16 @@ GATES: list[tuple[str, str, list[list[str]], str]] = [
         "the only gate that can see a generated agent's tool grant. A grant wider "
         "than its brief compiles, tests green and lints clean, so invariant (1) is "
         "enforced here or nowhere. Needs no toolchain and no network.",
+    ),
+    (
+        "authority",
+        "authority.py -- every derived slot vs the fact it names",
+        [[PY, "scripts/thegraph/authority.py"]],
+        "the only gate that fails on the GRAPH DOC being wrong rather than the code. "
+        "A derived slot is a copy, so it is never empty -- it fails by being silently "
+        "wrong, and `build_gaps` fires only on empty. Three consecutive updates came "
+        "in with a clean gap queue and every one found real drift. Also the stamp "
+        "check: a stamp is a label, not a root. Needs no toolchain and no network.",
     ),
 ]
 

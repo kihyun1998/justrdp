@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """thegraph `place` guard (justrdp) -- the tree rule x the diff.
 
-Build stamp: thegraph is THREE files as of this stamp --
-  SKILL.md          md5:f73cef09189056e3ed7713a81177becc
-  NODES.md          md5:82d1538acc2c35dd2fbcb3cecded3f66
-  BUILD_CONTRACT.md md5:a4fc95f7e6d1605869a33e8c2bafb2c6   (2026-09-02)
+Build stamp: thegraph is the whole skill DIRECTORY as of this stamp --
+  SKILL.md          md5:2d6a25ea8bb45587bd1f78316ffdff87
+  NODES.md          md5:6f3b044bece13d2e7ab24ddaf88b8944
+  BUILD_CONTRACT.md md5:a4fc95f7e6d1605869a33e8c2bafb2c6
+  DELEGATION.md     md5:bb6ef36e828ab465c4cbfc60fb04f5b5
+  CREATION-LOG.md   md5:dbee47f193894a7bf7711239ebdc0a51   (2026-09-04)
 Graph: docs/agents/thegraph.md. Method: the `thegraph` skill.
 
 This is the `place` node's `code` decider, and it also runs again at `gate` on the
@@ -259,8 +261,15 @@ def main() -> int:
             "place: the diff is empty -- the guard CANNOT ANSWER, which is not the\n"
             "       same as 'every path is owned'. Resolve it by reading the tree\n"
             "       rule in docs/agents/thegraph.md against the change you are ABOUT\n"
-            "       to make, say which slot you substituted for, and write it to\n"
-            "       `build_gaps`."
+            "       to make, and say which slot you substituted for. This is NOT a\n"
+            "       `build_gaps` entry. `place` runs BEFORE `implement`, so at the\n"
+            "       position this guard is consulted the diff is empty BY\n"
+            "       CONSTRUCTION -- prescribing a re-grill request here files a gap\n"
+            "       on every run that reaches the node. The second call site is\n"
+            "       `gate`, on the final diff, where an empty one means nothing was\n"
+            "       changed, which is not drift either. So there is no position\n"
+            "       where this is a gap. Same answer as triggers.py: one quantity,\n"
+            "       one answer across the family."
         )
         return 2
 

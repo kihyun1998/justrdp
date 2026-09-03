@@ -6,82 +6,91 @@ and scripts. `thegraph` holds the portable **method** (node-type catalog, four
 invariants, reasoning habits); this file holds justrdp's **graph**. The method
 defers every concrete value here.
 
-**Build stamp** — built from the `thegraph` skill, which is now **three files**, not one:
+**Build stamp** — built from the whole `thegraph` skill **directory**, hashed per file. It
+is **five files** now, not the three the previous stamp named:
 
 | File | md5 | bytes |
 |---|---|---|
-| `thegraph/SKILL.md` — the method: invariants, catalog, habits, traversal | `f73cef09189056e3ed7713a81177becc` | 41 951 |
-| `thegraph/NODES.md` — the per-node contracts (**new since the last stamp**) | `82d1538acc2c35dd2fbcb3cecded3f66` | 45 572 |
-| `thegraph/BUILD_CONTRACT.md` — the schema this file fills (**new since the last stamp**) | `a4fc95f7e6d1605869a33e8c2bafb2c6` | 9 231 |
+| `thegraph/SKILL.md` — the method: invariants, catalog, habits, traversal, issue contract | `2d6a25ea8bb45587bd1f78316ffdff87` | 33 175 |
+| `thegraph/NODES.md` — the per-node contracts | `6f3b044bece13d2e7ab24ddaf88b8944` | 47 163 |
+| `thegraph/BUILD_CONTRACT.md` — the schema this file fills | `a4fc95f7e6d1605869a33e8c2bafb2c6` | 9 231 |
+| `thegraph/DELEGATION.md` — the grant, the brief, `**Runs:**` and `**Delegated:**` (**unstamped until now**) | `bb6ef36e828ab465c4cbfc60fb04f5b5` | 5 183 |
+| `thegraph/CREATION-LOG.md` — the incidents behind the rules (**unstamped until now**) | `dbee47f193894a7bf7711239ebdc0a51` | 9 781 |
 
-Measured 2026-09-02. Recompiled 2026-09-02 by `/grill-the-graph` as an **update** —
-diffed against the repo and against the `build_gaps` past runs flushed, *not* recompiled
-from the bindings, which the first build consumed. Every generated artifact carries the
-same stamp. If the stamp is behind, **warn and continue** — never rebuild on your own; a
-rebuild writes agents and scripts, and those pass through the maintainer.
+Measured 2026-09-04. Recompiled 2026-09-04 by `/grill-the-graph` as an **update** — diffed
+against the repo and against the `build_gaps` past runs flushed, *not* recompiled from the
+bindings, which the first build consumed. Every generated artifact carries the same stamp.
+If the stamp is behind, **warn and continue** — never rebuild on your own; a rebuild writes
+agents and scripts, and those pass through the maintainer.
 
-**A one-file stamp is what let two-thirds of the method move unseen.** The previous stamp
-named `SKILL.md` alone at 77 920 bytes. The method has since been **split**: `SKILL.md` is
-now smaller than that number while the method as a whole is larger, so a check comparing
-one size against one file could report either "behind" or "ahead" and neither would
-describe what happened. Stamp all three or the check answers a question nobody asked.
+**The stamp is the directory now, not a list, because a list reproduced its own failure at
+N+1.** The previous stamp named three files *as the fix for having named one*, and wrote the
+lesson down: *"a one-file stamp is what let two-thirds of the method move unseen."* Between
+that build and this one the method became **five**. `SKILL.md` shrank 41 951 → **33 175**
+while the method as a whole grew, `NODES.md` moved 45 572 → **47 163**, and `DELEGATION.md`
+arrived inside the gap — the file holding the `**Runs:**` form that `scripts/thegraph/grants.py`
+exists to enforce. A list of N cannot see file N+1, so the count was never the fix. What
+replaces it is `scripts/thegraph/authority.py`, which hashes **every `.md` in the skill
+directory**: a sixth file is a diff rather than a silence.
 
-**What this recompile measured, so nobody re-derives it.** Nine findings; two of them are
-repairs to this build's own artifacts and one is a finding that fixed itself upstream.
+**Nothing was a false green, and that was checked rather than assumed.** `DELEGATION.md`'s
+declaration form is exactly what `grants.py` asserts — name the tool; a declaration naming
+none licenses none — and its `**Delegated:**` rule constrains `NODES.md`'s node headers, not
+anything this build writes. So the gap cost no correctness. It cost the ability to know that
+without a person going and looking.
 
-① **Invariant ① was violated by all four generated agents — and this build is the
-incident the method now records as its war story.** All four carried `Bash`, none carried
-a `Runs:` declaration, and `thegraph-sweep` carried `Edit` besides. Read-only is now the
-**default** rather than a claim to be matched: only an explicit declaration naming a tool
-moves one. Repaired in the [extraction plan](#extraction-plan) — `thegraph-reference`
-keeps `Bash` **with** a declaration (its source classes are `curl` / `gh api`, and
-`WebFetch` is banned for summarizing); the other three drop everything that can run or
-write.
+**What this recompile measured.** Five findings: three are repairs to this build's own
+artifacts, one is a count in this file, and one is about the detector.
 
-② **The check that enforces ① did not exist.** A grant wider than a brief is invisible to
-every other gate — it compiles, tests green and lints clean — so
-`scripts/thegraph/grants.py` is generated and joins the `gate` list, which goes **9 → 10
-commands**. It asserts the **default**, never the claim: an agent whose description reads
-*"proposes edits rather than making them"* passes a check that greps for *"read-only"*.
+① **The stamp named three files against a method of five** — above.
 
-③ **`build_gaps` recurred #263 → #268, and that is why this run happened.** The `proof`
-table's `justrdp` row named a real-VM round-trip, which a conforming server structurally
-cannot use to prove a *refusal* of non-conforming input. Two runs substituted two
-different things by judgement. `proof` gains a **claim-class axis** on that layer
-(conformance / refusal / performance); the layer count stays **4**, exactly as when #250
-added the performance class.
+② **`gate` is 9 gates, not 8, and this file said 8 in three places.** `gates.py --list`
+yields `fmt · clippy · test · fuzz-check · map-selftest · map · shield · i686 · grants` —
+nine entries, ten commands, `i686` carrying two. The previous build added `grants` and wrote
+*"which goes 9 → 10 commands"*: it moved the **command** count and left the **gate** count
+where it stood. That is the defect this file's own extraction plan records against itself
+(#49 — *"two such counts were emitted here, disagreed with each other and with their source,
+and went stale inside a day"*): a count restated where its authority is elsewhere, in the
+document that argues against doing it. With `authority.py` the roster is **10 gates / 11
+commands**, and the number is now *asserted* against `gates.py --list` rather than only
+written here.
 
-④ **The four `unowned` slots are resolved upstream — the coverage check now returns
-zero.** `BUILD_CONTRACT.md` names the tracker capability and the war-story index outright,
-and generalises node data to *"everything it reads and everything it checks against … its
-method, its traps, and the policies it applies to a surface"*, which places the other two
-without naming them. **No value in this file changed as a result**, which is the shape the
-split itself predicts.
+③ **A retracted instruction was still standing in the script that prints it.** The previous
+build corrected this file's prose — *"Exit `2` on an empty diff is not a `build_gaps`
+entry"* — and recorded *"the script is unchanged and correct"*. The **exit code** was correct.
+The sentence `triggers.py` actually **prints** still ended *"and write it to `build_gaps`"*,
+which is what an operator reads at the one moment it decides anything. `place.py` printed the
+same instruction, and this file's `place` section had never answered the empty-diff case at
+all — where the diff is empty **by construction**, because `place` runs before `implement`.
+As written it asked every run to file a gap. Both messages now mirror the answer already
+decided for `verify`, which is this repo's own rule about one quantity getting one answer
+across a family, applied to a family of scripts rather than of parsers.
 
-⑤ **`verify`'s exit-2 prose had drifted against its own script.** It prescribed a
-`build_gaps` entry for an empty diff; #252 had since made `2` the script's *designed,
-documented* answer for that case. So the build was requesting a re-grill for a question it
-already answers, and every open-decision run filed one — #268 did. Prose corrected; the
-script is unchanged and correct.
+④ **No slot-authority check existed.** The schema requires an artifact asserting every
+**derived** slot against the fact it names, in **both** directions, plus a roster of the
+slots that cannot be asserted at all. ①, ② and ③ are each precisely what it would have
+caught. Generated as `scripts/thegraph/authority.py` and joined to the gate list — see
+[Slot rooting](#slot-rooting).
 
-⑥ **`reference` said 4 in the roster and 5 in its own section.** `plat` added class 5
-(layout prior art) and neither the roster row nor the artifact row followed. It is **5**.
+⑤ **`build_gaps` came in empty and the drift was real — the third consecutive update.**
+Searching every issue for the slot returns **#250 and #263 only**, both already consumed by
+the previous build. That slot fires where a value came up **empty**; every finding above is a
+**derived** slot, which is a copy — never empty, silently wrong, and used without complaint
+by whichever node is handed it. A clean queue is not evidence, and this is the third time it
+has said so.
 
-⑦ **`crates/*/tests/*.rs` is 15, not 16.** The rule held — all fifteen are differential
-or corpus — only the count moved.
-
-⑧ **The skill files changed twice *during* this run** (`NODES.md` grew 42 741 → 45 572
-bytes between two measurements minutes apart). The stamp above is a point-in-time
-measurement, and a mismatch on the next run is the expected case rather than evidence this
-build was wrong. It is a **warn**, never a rebuild trigger.
-
-**Re-measured and unchanged, so not re-asked**: ADRs still 0001–0013 (the `search` list is
-current) · 5 workflows, 4 of them gates · `gates.py` holds every command this file names ·
-every sacred path still resolves to a real file · `crates/justrdp-codecs/src/rfx/mod.rs`
-is still the single module-root spelling outlier, still a separate change · no `benches/`,
-no `[[bench]]`, no `criterion`, so #250's bench-harness half stays deliberately open ·
-nothing published, so `downstream` stays **absent** · the sub-issue relation is live
-(#270 and #271 enrolled under #268).
+**Re-measured and unchanged, so not re-asked**: ADRs read from the record **files** are
+0001–0013, all **Accepted**, none Proposed — `cluster.py`'s thirteen rows match ·
+`crates/*/tests/*.rs` is **15**, every one differential or corpus · 5 workflows, 4 of them
+gates · `justrdp-pdu/src` is **25** flat files with 2 directory modules, and
+`crates/justrdp-codecs/src/rfx/mod.rs` is still the single module-root spelling outlier,
+still a separate change · every sacred path resolves to a real file · `sspi = "=0.21.3"`
+with no `[patch.crates-io]` · no `benches/`, no `[[bench]]`, no `criterion`, so #250's
+bench-harness half stays deliberately open · nothing published, so `downstream` stays
+**absent** · the map gate and its self-test pass over 27 notes · `grants.py` passes over 4
+agents · the sub-issue relation is live and #268 now carries **three** children (#270, #271,
+#272) · **split coverage returns zero `unowned`** — `BUILD_CONTRACT.md` is byte-identical to
+the previous stamp, so that is re-confirmed rather than re-derived.
 
 ---
 
@@ -100,7 +109,7 @@ nothing published, so `downstream` stays **absent** · the sub-issue relation is
 | `proof` | **4** | one per claim class, each with its own method and its own blind spot |
 | `verify` | **2** | 1 gap-hunting + 1 refuting, because the sacred-path list is **non-empty** |
 | `sweep` | 1 | fanning out over **6** surfaces |
-| `gate` | 1 | **8** gates / **10** commands, blind spots included |
+| `gate` | 1 | **10** gates / **11** commands, blind spots included. The runnable roster is `gates.py --list`; this number is asserted against it by `authority.py`, not merely written here |
 | `search` | once per candidate | catalog |
 | `batch` | 1 | catalog. **Never delegated, never bypassed** |
 | `stop`, `decide` | edge-triggered | catalog |
@@ -233,6 +242,18 @@ re-decided is a record waiting to be written, and `promote` counts it.
 a path list and a diff is a path list, so the check is a match, not a recollection.
 Prose alone would make this node a bar with no firing mechanism, which is the exact
 defect its own argument is against.
+
+**The empty-diff answer is `2`, and it is not a `build_gaps` entry** — a slot this section
+had never filled, which is how the script came to prescribe one. `place` runs **before**
+`implement`, so at the position this guard is consulted the diff is empty **by construction**;
+prescribing a re-grill request there files a gap on every run that reaches the node. Exit `2`
+means *the script could not answer*, and the run resolves it the way `verify` already does:
+read the tree rule above against the paths the change is **about to** create, and say which
+slot was substituted for. The script runs a second time at `gate`, on the final diff, and
+there the diff is non-empty — an empty one at *that* position means nothing was changed, which
+is still not a gap. So there is no position where `place` on an empty diff is drift, and the
+answer is the same one already decided for `verify`: one quantity, one answer across the
+family.
 
 ### `implement` / `proof` — 4 layers, each with its own blind spot
 
@@ -369,7 +390,7 @@ obligation. What lands there: the root **confirmed or falsified**, the numbers
 measured, any new sibling **enrolled into the tree** (never announced in prose),
 what is still open. The roster itself never goes in the body.
 
-### `gate` — 8 gates, 10 commands, each run bare
+### `gate` — 10 gates, 11 commands, each run bare
 
 ```sh
 cargo fmt --all --check
@@ -382,6 +403,7 @@ just-shield scan . --strict                           # ADR-0006; CI passes stri
 rustup target add i686-pc-windows-msvc                # prerequisite, not ceremony (see below)
 cargo test -p justrdp-codecs -p justrdp --target i686-pc-windows-msvc
 python scripts/thegraph/grants.py                     # invariant ① over .claude/agents
+python scripts/thegraph/authority.py                  # every derived slot vs the fact it names
 ```
 
 **The runnable copy is `scripts/thegraph/gates.py`, and it is the one that
@@ -429,6 +451,12 @@ Blind spots, each an answer rather than an omission:
   to every other gate here — it compiles, it tests green, it lints clean. Invariant ①
   is enforced by `scripts/thegraph/grants.py` or by nothing. It runs offline over
   `.claude/agents/thegraph-*.md` and is the one gate that needs no toolchain.
+- **The authority check is a gate for the same reason, one level up.** A build value that has
+  drifted from the fact it copied also compiles, tests green and lints clean — it is the only
+  gate that can fail on *this file* being wrong rather than on the code being wrong, and it is
+  what turns the [slot rooting](#slot-rooting) below from a claim into a check. It is also the
+  **stamp** check: the stamp is itself a derived slot with a machine-readable authority, so it
+  is one row in this script rather than a mechanism of its own. Offline, no toolchain.
 - **`coverage.yml` is deliberately not a gate** — a cargo-llvm-cov discovery tool
   (#102), post-merge/dispatch, **no threshold**, scoped to the sans-IO core and
   excluding `justrdp-tokio` (its tests need the VM).
@@ -609,6 +637,8 @@ confidently a lens reports it.
 | **`justrdp-pdu/src/` is flat** — one file per `[MS-*]` protocol area, 25 of them | **IronRDP** nests by area: `basic_output/`, `gcc/`, `input/`, `rdp/`, `codecs/` | `docs/map/territory/` depends on a **1:1 area↔file correspondence**, and nesting breaks the thing the map is read for. The threshold is already in the tree rule rather than in judgement: nest when an area outgrows one file, which is what `rfx/` already is. `plat`, 2026-08-31 |
 | **Unit tests are inline `#[cfg(test)]`; `crates/*/tests/` holds differential and corpus tests only** | **h2** and **quinn** put ordinary integration tests in a top-level `tests/` (quinn also `src/tests/`); **rustls** keeps a whole `rustls-test` crate | Measured **15/15** and **declared nowhere** until the 2026-08-31 build — so it is recorded here rather than discovered again. The peers disagree among themselves, so majority answers nothing and this project's own kept rule wins by the tie-breaker's layout row. `plat`, 2026-08-31 |
 
+| **The EGFX capability ladder is chosen by which obligations the client can discharge, not by how high the version number goes** — it stops at `CAPVERSION_104`, because `[MS-RDPEGFX]` 1.5.1 makes `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU` a **MUST** for 10.5 and 10.6 with no opt-out, and 10.7's `SCALEDMAP_DISABLE` is the first rung that can decline it | **`ironrdp-egfx`** advertises 10.5/10.6 and discharges the obligation with bookkeeping rather than a resampler. **FreeRDP agrees with us** — it compiles both out entirely for want of an image scaler — so this diverges from **the oracle's lineage only**, and both references are conforming; what is *not* conforming is advertising them and skipping the command | #271 + [what we advertise, we must implement](../map/invariant/what-we-advertise-we-must-implement.md). **Measured, not argued**: at 10.6 the server confirmed `0x000A0600`, mapped the surface with the scaled command, the client skipped it as unknown, and **110 frames became 0** — every tile decoding correctly into a surface nobody could see, session up, channel open, no error anywhere. *"We are behind on caps versions"* was the filed framing and the measurement falsified it. **Still open in #273**, and note what that issue is about: *who owns* the ladder, not how high it goes — a host-settable ladder would not reopen this row, it would inherit it as the validation the core still has to keep |
+
 Add a row when a decision *chooses against* a reference or against a strict spec
 reading — that is cheaper than re-defending it every time a lens finds it.
 
@@ -644,6 +674,59 @@ though the finding had been wrong.
 these slots were answerable all along, and *"placing them changes no build"*. Their
 data was filled here before they were placed and is filled here now.
 
+**Re-run 2026-09-04: still zero.** `BUILD_CONTRACT.md` is byte-identical to the previous
+stamp (`a4fc95f7…`), so the schema and the split are both unmoved and this is a
+re-confirmation rather than a re-derivation. Recorded because the check leaves no trace when
+it passes — that is deliberate, and a section that simply went quiet would be
+indistinguishable from one nobody ran.
+
+---
+
+## Slot rooting
+
+Every value in this file is one of two classes, and the class decides what can ever tell you
+it is wrong.
+
+- **Derived** — a copy of a fact that lives somewhere else. Being a copy, it is **never
+  empty**: it fails by being *silently wrong*, and no node notices, because a node handed a
+  value uses it. `build_gaps` cannot see this class at all — it fires on an empty slot — which
+  is why three consecutive updates arrived with an empty queue and found real drift anyway.
+- **Decided** — the maintainer's judgement, with no fact anywhere to check it against. The
+  sacred paths, the tie-breaker, the deliberate divergences, the proof method per layer. These
+  are what a re-grill actually asks about.
+
+**The runnable copy is `scripts/thegraph/authority.py`, and it is the one that decides.** It
+holds the slot→authority map and asserts each entry **both directions** — the fact is in this
+file, *and* nothing in the fact is missing from this file — because a one-way check passes
+happily over a record this file never learned about. It is a gate, so a drifted copy is a red
+build rather than something the next build discovers by hand.
+
+**A stamp is not a root.** A revision written into a file labels it; nothing compares it to
+anything that could have changed. The stamp is therefore a **row in that script** rather than
+a mechanism of its own, and it hashes the skill **directory** — a list of N files is blind to
+file N+1, which is how `DELEGATION.md` arrived unseen.
+
+**The unassertable roster, declared rather than omitted.** A slot that announces it cannot be
+checked is a known hole; one that says nothing is indistinguishable from a checked one. The
+script prints these every run so a slot cannot leave the map by going quiet:
+
+| Slot | Why no assertion is possible |
+|---|---|
+| the **tie-breaker** rows | judgement about which authority wins; there is no in-repo fact to compare against |
+| the **deliberate-divergence** rows | judgement, and the other half of each row lives in FreeRDP/IronRDP source this repo does not vendor. The *citations* resolve; the *call* cannot be checked |
+| the **proof method per layer** and its tautological traps | judgement about what convinces — the traps are precisely the things a passing check cannot see |
+| the **sacred-path** list's membership | the paths are asserted to **exist**; whether the list is the *right* list is the maintainer's, and a surface nobody named is a surface nobody guards |
+| the **boundary rule** and the consumer seams | `CLAUDE.md` states them in prose; the dependency half is measured by `place.py`, the policy half is not mechanically checkable |
+| **`reference` source classes 1–3, 5** | outside the repository — a spec section, another project's tree, a registry. Derived and **unassertable**; dated at measurement rather than checked |
+| **`reference` class 4**, the real VM | one WS2022 box, reachable only when it is up. An observation, not a fact this repo holds |
+
+Note the split inside a single slot, since it is the rooting rule's own point: **a slot's value
+and its existence are separate facts.** The sacred-path list is a judgement nothing can rank,
+while every path in it is a string that must resolve — so the existence half is asserted and
+the value half is declared unassertable. Root the existence even where the value is decided,
+or a rename empties the guard and every copy of the list stays in perfect agreement about a
+file that is gone.
+
 ---
 
 ## Extraction plan
@@ -666,7 +749,8 @@ toolchain-free by design). They live in **`scripts/thegraph/`**, kept distinct f
 | `.claude/agents/thegraph-sweep.md` | `sweep` | the 6 surfaces and how each is read |
 | `scripts/thegraph/triggers.py` | `verify` inbound guard | the 3 sacred-path groups, matched against the diff · **the empty-diff answer (`2`, not `0`)** |
 | `scripts/thegraph/place.py` | `place`, and `gate` again on the final diff | the tree rule as a path list, matched against the changed paths |
-| `scripts/thegraph/gates.py` | `gate` | the 10 commands, each invoked **bare** |
+| `scripts/thegraph/gates.py` | `gate` | the 11 commands, each invoked **bare** |
+| `scripts/thegraph/authority.py` | `gate`, and every **derived** slot | the slot→authority map · each entry asserted **both directions** · the roster of slots declared **unassertable**, so one cannot leave the map by going quiet |
 | `scripts/thegraph/cluster.py` | `search` | the tracker query by artifact · the 13 record-carrying areas |
 | `scripts/thegraph/grants.py` | `gate` (invariant ①) | the generated-agent roster · the write-capable tool list · the `Runs:` declaration form |
 

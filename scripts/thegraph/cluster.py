@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """thegraph `search` router (justrdp) -- route a candidate by the artifact it touches.
 
-Build stamp: thegraph is THREE files as of this stamp --
-  SKILL.md          md5:f73cef09189056e3ed7713a81177becc
-  NODES.md          md5:82d1538acc2c35dd2fbcb3cecded3f66
-  BUILD_CONTRACT.md md5:a4fc95f7e6d1605869a33e8c2bafb2c6   (2026-09-02)
+Build stamp: thegraph is the whole skill DIRECTORY as of this stamp --
+  SKILL.md          md5:2d6a25ea8bb45587bd1f78316ffdff87
+  NODES.md          md5:6f3b044bece13d2e7ab24ddaf88b8944
+  BUILD_CONTRACT.md md5:a4fc95f7e6d1605869a33e8c2bafb2c6
+  DELEGATION.md     md5:bb6ef36e828ab465c4cbfc60fb04f5b5
+  CREATION-LOG.md   md5:dbee47f193894a7bf7711239ebdc0a51   (2026-09-04)
 Graph: docs/agents/thegraph.md. Method: the `thegraph` skill.
 
 Search by the ARTIFACT -- the module, the wire field, the predicate, the config
