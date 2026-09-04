@@ -1,43 +1,6 @@
 # 0009 — Negotiation posture: tolerant of server self-inconsistency in rendering, strict on security integrity
 
-- Status: Accepted
-  - Amendment 2026-08-25 (#252): **§1 and §2 are not a partition, and that is measured rather
-    than argued.** A wire field whose legal values `[MS-RDPBCGR]` fixes — `Synchronize.messageType`,
-    a server `Control.action` — is refused by both reference clients and by us, and it falls in
-    neither half: §1's predicate is *"where a violation is an attack vector"* and none is
-    constructible for a peer that has already completed CredSSP, MCS, channel join and licensing,
-    while §2's grant is scoped **by enumeration** to rendering-feature self-inconsistency (a
-    drawing order, an under- or over-advertised capability, a misreported version). **§3(a) is
-    what licenses the refusal** — *"tolerance is about which features are allowed to appear,
-    never about trusting their contents"* — as a removal of the objection rather than a mandate.
-    [ADR-0012](0012-consumption-site-totality.md) §3 hit the same wall from the codec side and
-    routed around it the same way (#233); two instances at opposite layers is why this is
-    recorded instead of re-derived a third time. **What this does not decide** is the
-    *completeness* question — whether the Font Map alone may gate session-active — which #252
-    settled as "no ladder" on its own evidence and which is not a posture question at all.
-  - Amendment 2026-08-31 (#268): **§3(b) names a `tracing` target that has never existed, and
-    the first record written *because of* §3(b) could not use it.** The rule says each accepted
-    divergence is logged as *"a `rdp_interop`-targeted debug/warn record"*. `rg rdp_interop`
-    over the whole repository returns **one hit — this line**; `git log -S` finds it in no
-    commit that ever touched `crates/`. The convention that actually shipped is **per-area**:
-    19 `rdp_egfx`, 6 `rdp_drdynvc`, plus `rdp_finalization`, `rdp_shutdown_denied`,
-    `rdp_demand_active` and eight more, each named for where the divergence was seen rather
-    than for the fact that it *is* one. #268's per-frame paint-budget warn follows the shipped
-    convention (`target: "rdp_egfx"`), so **read §3(b) as requiring an observable `tracing`
-    record and not as fixing its target string**. Recorded rather than silently corrected
-    because the mechanism half of §3(b) is the half a reader would otherwise try to obey: it
-    is a decision surface with no gate over it, and it drifted from day one.
-
-    **Second, and reported rather than resolved: §2's enumeration does not reach this
-    instance either.** An over-budget entry count is not a rendering-feature
-    self-inconsistency — it is well-formed, spec-legal, and inconsistent with nothing the
-    server advertised. What justifies skipping it is a **resource ceiling that is ours**, and
-    §3(b) is what obliges the record. That is the same shape the 2026-08-25 amendment above
-    recorded from #252 (§1 and §2 are not a partition; §3 does the licensing), now with a
-    third instance at a third layer, so it is **deliberately not** widened here: the amendment
-    above already says the enumeration is not a partition, and adding "a resource bound we
-    chose" to §2's list would convert an enumeration of *server* behaviours into a mixed list.
-    The posture stands: tolerate, and make it observable.
+- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268) and 2026-09-04; see the Amendments below
 - Date: 2026-07-03
 - Closes issue #101
 
@@ -83,6 +46,46 @@ Be **tolerant by default of a server's self-inconsistency in rendering features,
 - **Order decode (#22) is built tolerant from day one** — accept-and-log unannounced orders rather than adding strictness later and then relaxing it.
 - **Generalizes the ADR-0007 codec-tolerance precedent** from the codec layer to the negotiation layer: the corpus-required leniencies were the first instance of this principle; ADR-0009 names it.
 - **Risk: tolerance can mask a bug in our own decoder as "server inconsistency."** Mitigated by invariant (b) — every tolerance is logged — and by the differential/corpus tests that still assert byte-identity wherever an oracle or a captured stream exists. Tolerance widens *what we accept*, never *what we stop verifying*.
+
+## Amendment (2026-08-25, #252): §1 and §2 are not a partition
+
+Measured rather than argued. A wire field whose legal values `[MS-RDPBCGR]` fixes —
+`Synchronize.messageType`, a server `Control.action` — is refused by both reference clients and
+by us, and it falls in neither half: §1's predicate is *"where a violation is an attack vector"*
+and none is constructible for a peer that has already completed CredSSP, MCS, channel join and
+licensing, while §2's grant is scoped **by enumeration** to rendering-feature self-inconsistency
+(a drawing order, an under- or over-advertised capability, a misreported version). **§3(a) is
+what licenses the refusal** — *"tolerance is about which features are allowed to appear, never
+about trusting their contents"* — as a removal of the objection rather than a mandate.
+[ADR-0012](0012-consumption-site-totality.md) §3 hit the same wall from the codec side and
+routed around it the same way (#233); two instances at opposite layers is why this is recorded
+instead of re-derived a third time. **What this does not decide** is the *completeness* question
+— whether the Font Map alone may gate session-active — which #252 settled as "no ladder" on its
+own evidence and which is not a posture question at all.
+
+## Amendment (2026-08-31, #268): §3(b) names a `tracing` target that has never existed
+
+And the first record written *because of* §3(b) could not use it. The rule says each accepted
+divergence is logged as *"a `rdp_interop`-targeted debug/warn record"*. `rg rdp_interop` over the
+whole repository returns **one hit — this line**; `git log -S` finds it in no commit that ever
+touched `crates/`. The convention that actually shipped is **per-area**: 19 `rdp_egfx`, 6
+`rdp_drdynvc`, plus `rdp_finalization`, `rdp_shutdown_denied`, `rdp_demand_active` and eight
+more, each named for where the divergence was seen rather than for the fact that it *is* one.
+#268's per-frame paint-budget warn follows the shipped convention (`target: "rdp_egfx"`), so
+**read §3(b) as requiring an observable `tracing` record and not as fixing its target string**.
+Recorded rather than silently corrected because the mechanism half of §3(b) is the half a reader
+would otherwise try to obey: it is a decision surface with no gate over it, and it drifted from
+day one.
+
+**Second, and reported rather than resolved: §2's enumeration does not reach this instance
+either.** An over-budget entry count is not a rendering-feature self-inconsistency — it is
+well-formed, spec-legal, and inconsistent with nothing the server advertised. What justifies
+skipping it is a **resource ceiling that is ours**, and §3(b) is what obliges the record. That is
+the same shape the 2026-08-25 amendment above recorded from #252 (§1 and §2 are not a partition;
+§3 does the licensing), now with a third instance at a third layer, so it is **deliberately not**
+widened here: the amendment above already says the enumeration is not a partition, and adding "a
+resource bound we chose" to §2's list would convert an enumeration of *server* behaviours into a
+mixed list. The posture stands: tolerate, and make it observable.
 
 ## Amendment (2026-09-04): one VM is one server, and a conformance proof cannot answer a refusal claim
 

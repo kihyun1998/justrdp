@@ -16,7 +16,8 @@ Substantive 변경이면 **`thegraph` 스킬**로 짠다 — 착수 시 `/thegra
 **어떤 표도 그 파일이 소유하지 않는다.** 무엇이 논쟁을 이기는가(layer 별 tie-breaker)와
 어느 논쟁이 이미 끝났는가(deliberate divergence)는 **그 논쟁을 결정한 ADR·이슈가 소유한다** —
 사본이 아니라 원본을 읽는다. 배치 규칙은 **ADR-0001 Amendment**, 의존 경계는 **ADR-0002**,
-codec 오라클 서열은 **ADR-0011 §3**, 수신 경로 관용은 **ADR-0009**. 규칙에 이빨을 주는
+codec 오라클 서열은 **ADR-0003 Amendment**(owned basis → 오라클 → FreeRDP tie-break, 3단 전체)와
+그걸 좁히는 **ADR-0011 §3**, 수신 경로 관용은 **ADR-0009**. 규칙에 이빨을 주는
 실증(ADR·이슈 앵커)은 **`docs/agents/lessons.md`**.
 
 (**`theflow` 는 은퇴했고 스킬도 파일도 없다** — `/theflow` 는 호출되지 않고

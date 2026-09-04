@@ -46,6 +46,13 @@ Host integration (application-specific):
   - Connect-stage progress callback: fn(&str) for diagnostic UI
 ```
 
+> **Two lines of the sketch above are false as written**, and are corrected in the
+> [Amendment](#amendment-2026-09-04-the-tree-rule-as-concrete-paths) below rather than here:
+> `justrdp-codecs` is **not** a re-export shim (codecs are fully self-owned since #189), and
+> `justrdp-tokio` is **~1,000 lines**, not ~30 — that figure described one function and was
+> read as describing the crate. The Amendment also states the tree rule this block only
+> sketches, as concrete per-directory paths.
+
 ## Consequences
 
 **Positive:**
