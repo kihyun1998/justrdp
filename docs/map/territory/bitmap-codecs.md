@@ -33,8 +33,8 @@ attacker-controlled bytes in the repo.
 - **Tolerances are corpus-driven, not spec-driven.** ClearCodec accepts RLEX runs
   that overflow the declared rect (clipping them) and skips the NSCodec subcodec
   path where FreeRDP rejects — both are required by real Server 2022 streams (#127).
-  These are recorded as deliberate divergences in
-  [`docs/agents/thegraph.md`](../../agents/thegraph.md).
+  These are recorded as deliberate divergences against #127 and memory
+  `clearcodec_corpus_required_tolerances`.
 - **Stage boundaries are the unit of verification** where the assembled decoder has
   no counterpart to compare against (RemoteFX, ADR-0007).
 - **Decoders write into a caller-provided buffer** wherever the frame path allows

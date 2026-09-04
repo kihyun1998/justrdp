@@ -17,9 +17,8 @@ build order, the issues by the work that shipped. None of them is indexed by
 
 ## Reading protocol
 
-- **Read before the design, write after the change.** In
-  [`docs/agents/thegraph.md`](../agents/thegraph.md) the `map` node runs **before**
-  `boundary` — opened *before* the boundary is drawn — and `sweep` reads it again.
+- **Read before the design, write after the change.** In the `thegraph` skill's node
+  catalog the `map` node runs **before** `boundary` — opened *before* the boundary is drawn — and `sweep` reads it again.
   Reaching for it at `verify` turns everything it would have told you into rework.
 - **Step 5's lens brief starts here.** A territory's `## Blast radius` is the
   sibling set for corpus ①, and its `## Cross-cutting invariants` are the facts that
@@ -60,9 +59,8 @@ a recurrence test.
   in this repo (epics #10–#29, #45, #158) as first-class objects.
 - **There is no verified external-fact store.** `## Reference behaviour` is
   `**None.**` in **every** territory: no FreeRDP/IronRDP behaviour is recorded
-  anywhere with a pinned `file:line`, although
-  [`docs/agents/thegraph.md`](../agents/thegraph.md)'s tie-breaker table depends on
-  exactly that comparison. This is the map's single largest finding, and it is a
+  anywhere with a pinned `file:line`, although ADR-0003's byte-exactness ranking and
+  ADR-0009's receive-path posture both depend on exactly that comparison. This is the map's single largest finding, and it is a
   measurement, not an opinion.
 - **The map does not track what is not built.** `## Known holes / open` names the
   gaps per territory; the **live roster of unbuilt work is the tracker** — the

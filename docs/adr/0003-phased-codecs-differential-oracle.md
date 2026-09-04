@@ -44,3 +44,33 @@ This creates a tempo tension: if we depend on `ironrdp-graphics` for codecs, we 
 - **(C) Use a separate "oracle" repository.** Rejected: complicates the test harness. The oracle is the `ironrdp-*` crates themselves, pulled as dev-dependencies in `justrdp-codecs/Cargo.toml`. No separate repo needed; the test lives in `justrdp-codecs/tests/oracle.rs` and is the backbone of the verification harness (plan.md §21).
 
 - **(D) Rely only on manual interop testing (servers + mstsc/FreeRDP capture).** Rejected: catches feature-level bugs but misses bit-exact alignment. If our YCbCr→RGB has a rounding error that manifests as a 1-pixel hue shift only on 10% of tiles, manual testing will not catch it; the oracle will.
+
+## Amendment (2026-09-04): what a differential proof structurally cannot see
+
+**The ranking, stated here because it had no owner outside that document.** For codec
+byte-exactness the authority is, in order: an **owned basis** where one exists (a real-server
+corpus plus independently-derived expectations); failing that, the **differential oracle**
+(`ironrdp-graphics`); **with FreeRDP as the tie-break when the oracle and we disagree.**
+[ADR-0011 §3](0011-zero-ironrdp-terminal-state.md) narrows the first clause — *the oracle
+never outranks the owned basis* — and #194 / #189 disqualify the oracle outright for
+Progressive and zgfx, where FreeRDP is therefore what remains.
+
+Salvaged from a retired build document, which held it as the codec layer's *tautological
+trap* — the thing this record's method **cannot** observe, as opposed to what it observes
+badly. Recorded here because a proof method whose blind spot is written only in a generated
+file is a proof method whose blind spot is not written down.
+
+- **The oracle shares our lineage.** `ironrdp-graphics` and justrdp descend from the same
+  reading of the same specs (memory `ironrdp_oracle_shares_lineage`, and
+  [oracle agreement is not independence](../map/invariant/oracle-agreement-is-not-independence.md)).
+  Byte-identical agreement is therefore **not** independence: cross-check FreeRDP before
+  calling a match proof, and do not assume a disagreement is ours. ADR-0011 §3 states the
+  ranking that follows (*the oracle never outranks the owned basis*); this is the reason
+  underneath it.
+- **A vector proves only what it contains.** A corpus can supply an axis and still miss the
+  *combination* — a codec exercised, but never at a tile boundary, never with a quant table
+  that changes mid-frame. **Measure what the fixture exercises; never infer coverage from
+  what it was named for.**
+- **x64 cannot reach the 32-bit guards.** Dimension-overflow guards are unreachable on a
+  64-bit `usize` and must be proven natively on `i686-pc-windows-msvc` (memory
+  `wasm32_overflow_proof_via_i686`, #151/#155). A green x64 suite is silent here, not clean.

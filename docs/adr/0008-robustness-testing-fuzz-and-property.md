@@ -121,3 +121,33 @@ Adding a decoder for untrusted bytes obligates its no-panic property (and round-
 - **Property tests only, no fuzzing.** Rejected — it would leave hang-class defects (non-terminating parse loops) and coverage-directed deep paths permanently untested, and would not match the rigor of the one proven independent Rust RDP implementation (IronRDP fuzzes every core crate).
 - **A shared generator crate (à la `ironrdp-pdu-generators`) up front.** Deferred, not rejected — the per-decoder `proptest` strategies are small and local today; a shared generator crate is worth extracting only once the duplication is real, to avoid speculative structure.
 - **Replace the hand-written LCG synthetic streams (ADR-0007) immediately.** Deferred — those streams already serve as differential *input factories* with a coverage guard; folding them into `proptest` generators (gaining shrinking) is an improvement to make per-codec as the properties roll out, not a precondition of this ADR.
+
+## Amendment (2026-09-04): the blind spots of the proof layers themselves
+
+Salvaged from a retired build document. This record says how untrusted-input parsers are
+proven; what follows is what each proof **structurally cannot see** — recorded because a
+method's blind spots were living only in a generated file, and a blind spot nobody wrote
+down is indistinguishable from an absence of one.
+
+- **`justrdp-pdu` — a decoder that only ever sees vectors *we* authored is untested against
+  the input space a server spans.** Narrowed but not closed since #203/#252:
+  `tests/fixtures/connect/` now holds real server bytes for the MCS/GCC leg *and* the
+  finalization leg, **obtained rather than synthesised** — necessary because every encoder in
+  this crate writes client-to-server, so a round-trip can only ever replay our own idea of the
+  wire. And **a census can be blind to a whole class**: #241/#238's derivations were
+  byte-scoped and path-scoped, so a parser in the core crate was invisible to it by
+  construction. Both classes held live defects.
+- **`justrdp-tokio` — a demo or a fake is a smoke test, not proof.** Its integration tests are
+  `#[ignore]`d in CI by design (they need the VM), and `coverage.yml` excludes the crate.
+  **Coverage silence here is expected, so it cannot be read as a signal either way.**
+- **A performance claim is a different class of claim, and the trap is timing the whole
+  system to detect a component.** 300 101 µs before against 298 099 µs after read as *"a
+  wash"* and was noise — *a measurement that cannot resolve its own effect is
+  indistinguishable from one that found nothing.* So, in order: **isolate before you time**
+  (RLGR is **4.6%** of a corpus decode, which caps a 2× win at 2.3% — the question closes
+  before a stopwatch comes out); **measure the workload's shape, not only its duration** (the
+  #91 verdict came from a histogram: real streams have a mean run length of **1.0 bits**);
+  **state the noise floor with the number** (four runs of the *same* build spanned
+  298/308/322/327 ms — a single before/after pair across a **9.6%** instrument is not
+  evidence); and **the probe is a throwaway**, `--release` only — instrument, read, delete,
+  record the number in the issue.

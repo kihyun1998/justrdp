@@ -83,3 +83,27 @@ Be **tolerant by default of a server's self-inconsistency in rendering features,
 - **Order decode (#22) is built tolerant from day one** — accept-and-log unannounced orders rather than adding strictness later and then relaxing it.
 - **Generalizes the ADR-0007 codec-tolerance precedent** from the codec layer to the negotiation layer: the corpus-required leniencies were the first instance of this principle; ADR-0009 names it.
 - **Risk: tolerance can mask a bug in our own decoder as "server inconsistency."** Mitigated by invariant (b) — every tolerance is logged — and by the differential/corpus tests that still assert byte-identity wherever an oracle or a captured stream exists. Tolerance widens *what we accept*, never *what we stop verifying*.
+
+## Amendment (2026-09-04): one VM is one server, and a conformance proof cannot answer a refusal claim
+
+Salvaged from a retired build document. This record routes receive-path questions to what a
+real server actually does; what follows bounds that authority, and was written down nowhere
+else.
+
+**One VM is one server.** The authority for *what we accept* is a single WS2022 box (memory
+`test_environment`, `vm_advertised_graphics_caps`). It proves the paths it **advertises** and
+says nothing about the ones it does not. *"The VM is happy"* is not *"servers are happy"*, and
+a tolerance derived from it alone is a **hypothesis** until FreeRDP shows the same shape.
+
+**And it structurally cannot answer a refusal claim.** A conforming server cannot produce
+non-conforming input, so the VM is unable to exercise a guard that only fires on input it will
+never send. The two claim classes therefore need different methods:
+
+| Claim | Method | The trap it still carries |
+|---|---|---|
+| **conformance** — we speak the protocol a real server speaks | the **real VM** round-trip, full connect to session-active | one VM is one server, as above |
+| **refusal** — we reject what no conforming server can send | a **wire-format round-trip through the public entry point**: build the non-conforming PDU as bytes and drive it through the public session API — **never a mock, never the private method**. Plus mutate-and-re-run on `i686-pc-windows-msvc` wherever the guard is arithmetic | **the PDU is a vector *we* authored.** It bounds false positives, not false negatives — a real capture stays the only authority on what a server actually sends |
+
+Recorded because it recurred rather than because it is elegant: **#263** substituted the
+32-bit rule by judgement and **#268** substituted a wire-format round-trip, and two
+substitutions in a row is a standing gap, not a one-off.

@@ -182,9 +182,9 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   but it is a divergence from **both** references with no row recording it, and #262's row
   covers only `right == left`, which is a different case: that one is a legal empty
   rectangle, this one is malformed. Cost of tolerating it is currently zero, which is why
-  #263 left it alone rather than filing it. **A `## Deliberate divergences` row is owed**;
-  that table is owned by [`docs/agents/thegraph.md`](../../agents/thegraph.md) and only a
-  `/grill-the-graph` run may write it, so it is recorded here in the meantime.
+  #263 left it alone rather than filing it. **A deliberate-divergence note is owed**; such
+  notes are owned by the record that decides them — ADR-0009 for a receive-path tolerance —
+  so this one belongs in an amendment there, and is recorded here in the meantime.
 
 - **A second `## Deliberate divergences` row is owed, and this one is load-bearing for a
   decision rather than for a tolerance nobody pays for** (#268). justrdp **skips** the entries

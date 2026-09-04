@@ -7,8 +7,9 @@ issues.
 ADR-0011/0012/0013 and `docs/map/` cite them. The mapping onto the graph's nodes:
 Step 1 → `reference` + `map` · Step 2 → `boundary` · Step 3 → `implement`'s
 test-trust self-loop · Step 4 → `proof` · Step 5 → `verify` · Step 6 → `sweep` +
-`search` · Step 7 → `gate`. The live graph is
-[`thegraph.md`](thegraph.md). This project is young (0.1.0, plan-driven), so most
+`search` · Step 7 → `gate`. **The live graph is the `thegraph` skill itself** — this
+repo keeps no copy of it; [`thegraph.md`](thegraph.md) holds only the outside sources
+this project is built against. This project is young (0.1.0, plan-driven), so most
 entries are **decision anchors** — the concrete reason a rule exists here — rather
 than "a step was skipped and it cost us" incidents; add the latter as they occur.
 

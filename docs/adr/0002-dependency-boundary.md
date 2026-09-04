@@ -81,3 +81,19 @@ Self-ownership is *chosen* for most codecs and *forced* for one — and the dist
 - **H.264 / AVC420 / AVC444** — **absent** from IronRDP entirely (no crate, no module). Here there is **no oracle at all**, so stage-boundary verification (ADR-0007) is the only path, and self-ownership is **forced, not merely chosen**.
 
 This corrects a conflation in the originating issue (#100), which stated IronRDP "cannot be a complete oracle" for ClearCodec/NSCodec/Progressive/H.264 alike: the accurate statement is that pre-1.0 status bounds them as a *runtime* dependency (rationale 3), not as an oracle — only H.264/AVC lacks an oracle, because the code does not exist.
+
+## Amendment (2026-09-04): the boundary was measured, and the measurement is stricter than the declaration
+
+Recorded because this record declares a boundary and, until now, nothing in the repo said
+whether the tree actually kept it. Measured against the four crates:
+
+- **Zero violators.** `tokio`, `rustls`, `sspi` and `ring` appear in `crates/justrdp-tokio/`
+  and nowhere else; `crates/justrdp/` carries `x509-cert` + `tracing` only.
+- **`justrdp-codecs` has no external dependency at all** — stricter than "own the codecs",
+  which this record only ever required.
+- The four crates depend **only downward**.
+
+The concrete per-directory rule this measurement was taken against is in
+[ADR-0001's Amendment](0001-sans-io-state-machine-core.md) (2026-09-04). It is stated
+there rather than here because it covers file placement across the whole tree, of which
+the dependency boundary is one column.
