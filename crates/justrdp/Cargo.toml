@@ -43,3 +43,21 @@ ironrdp-pdu = "0.9.0"
 # server-supplied X.509 through a leaf dependency, and `framebuffer`, which sizes and indexes
 # from server-declared dimensions.
 proptest.workspace = true
+
+[features]
+# The fuzz seam (#267). Off by default and never enabled by the workspace build, so the
+# published surface is unchanged: all it does is re-export the EGFX graphics processor and the
+# dynamic-channel processor trait through `justrdp::fuzzing` so the `fuzz/` lane can drive them.
+#
+# **Why a feature and not `pub mod egfx`.** `GraphicsProcessor` is core mechanism, not host API
+# (ADR-0001), and what the host may reach into is the open question in #273 — widening the
+# public surface here would pre-empt a call nobody has made. IronRDP fuzzes the same processor
+# (`ironrdp-fuzzing`'s `egfx_multi_frame` / `egfx_surface_state`) but reaches it through an
+# already-public `GraphicsPipelineClient`, because its egfx lives in a consumer-facing crate;
+# that shape does not transfer. Maintainer's call, 2026-09-07, chosen over `pub mod egfx`, a
+# `#[doc(hidden)]` shim, and shipping the proptest alone.
+#
+# **`cargo clippy --workspace --all-targets` does not build this**, which is why `test.yml`'s
+# clippy step carries `--all-features`: a configuration no gate compiles is the same silent
+# class #200 closed for the fuzz matrix.
+fuzzing = []

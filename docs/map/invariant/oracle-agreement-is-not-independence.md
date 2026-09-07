@@ -132,8 +132,9 @@ Concretely:
 - Check `crates/justrdp-codecs/tests/fixtures/` for a corpus case covering the input
   in question — a tolerance that exists there is a requirement.
 - When the tie-break lands *against* the oracle, record it as a deliberate
-  divergence in [`docs/agents/thegraph.md`](../../agents/thegraph.md), or the next
-  completeness pass proposes reverting it.
+  divergence in the decision record that owns that codec — ADR-0011's amendments for
+  Progressive and zgfx, ADR-0003 for the ranking itself — or the next completeness
+  pass proposes reverting it.
 - **When a hand-derived expectation is written, derive its initial state from the
   reference's caller, not only from the function being transcribed** — and prove the
   basis is independent without the oracle's help. `rfx::srl`'s bit-cursor unit tests

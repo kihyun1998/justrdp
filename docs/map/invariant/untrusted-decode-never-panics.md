@@ -354,6 +354,38 @@ that trusts its server too much) rather than as memory safety.
   note records only the half about what a property can observe. **No row is added to
   derivation ④'s table either**: ④ adjudicates loop trip counts, and this defect allocates
   rather than loops.
+- **#267 — a stateful subject needs a stateful generator, and three mutations each proved
+  something different.** The EGFX graphics processor is the first subject here that carries
+  state across messages (zgfx history, Progressive tile store, ClearCodec caches, surfaces,
+  bitmap cache), so the single-call shape every other property in the repo uses is blind by
+  construction to the class #268 belongs to.
+  - **An undirected generator reaches this subject exactly zero times, measured.** Throwaway
+    probe: 20 000 arbitrary blobs of 0..=512 bytes, wrapped the way the ticket names, gave
+    `decode_all` Ok **44** times — every one the *empty* blob — and decoded a non-empty PDU
+    **0** times; no surface created, no frame painted. `RDPGFX_HEADER`'s
+    `pdu_length < 8 || pdu_length > rest.len()` check refuses essentially every random
+    blob, so undirected bytes do not reach the per-command arms *or* `decode_all`'s body.
+    Sharper than #230's estimated 6.7e-11 for the pointer masks, and the same lesson: **the
+    shape of the generator, not its width, decides whether a property asserts anything.**
+  - **Discriminating power, established:** deleting `Surface::extract`'s zero-extent early
+    return — the #268-era out-of-range slice panic — reddened the property at case 244.
+  - **The same ablation on `Surface::blit` stayed green, and the cause was the generator's
+    *sequence* axis, not its value ranges.** That panic needs a destination past the surface
+    **and** a live cached bitmap to paste — create → surface-to-cache → cache-to-surface, three
+    correlated commands independently drawn ones almost never assemble. Correlated id pools
+    were not enough; a prologue prepended to half the sessions turned it RED. **The general
+    form: correlating the *values* does not correlate the *order*, and a stateful subject
+    needs both.** A second cause sat in the same ablation — one `coord()` strategy fed both
+    rect edges (`u16`) and point coordinates, which `Point16::decode` reads as **`i16`**, so
+    the near-maximal arm folded entirely onto *negative* destinations and the failure window
+    past the right edge was unreachable. Two strategies now, and the split is the point.
+  - **A guard can be hidden by the guard behind it.** Ablating `MAX_SURFACE_DIM`'s refusal left
+    every test green, because 65535 square is 17 GB and `MAX_TOTAL_SURFACE_BYTES` refuses it
+    anyway. No widening would have found that; the close is an assertion naming the inner
+    guard's own boundary. **A mutation two guards cover measures neither.** By the same
+    reading, ablating `Surface::fill`'s zero-extent return is **INERT** rather than a hole:
+    `fill` clamps `x` to `self.width`, so the offset cannot pass the buffer — which is exactly
+    what `extract` did not do, and why only one of the two was ever a defect.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
@@ -497,6 +529,19 @@ produced that answer is cheap and worth repeating rather than trusting: `connect
 `.get(..4)` AUTHZ read is bounded by construction, `license_crypto`'s `md5`/`sha1` take slices
 and belong to ③ if anywhere, and the two `from_le_bytes` hits in `egfx.rs`/`session.rs` are in
 test code.
+
+**And ②'s answer is complete only for *parsers*, which is the half #267 measured.** The
+sentence above is true as written and was read as covering the crate: `justrdp::egfx`'s
+`GraphicsProcessor::process` parses nothing itself — it calls `justrdp_pdu::egfx::decode_all`
+and then *consumes* every field — so ② correctly answers "one" while the live EGFX path stays
+outside it. ③ does not reach it either: `process` takes `&[u8]`, not an already-parsed integer,
+so its signature does not match. **The subject sat in the gap between the two, and both
+derivations reported the module as covered**, because `fuzz_targets/egfx.rs` and
+`decode_all_never_panics_on_arbitrary_input` are the PDU crate's and share the module's name
+— the cross-crate form recorded below, one crate further out again. Closed by #267:
+`graphics_processor_is_total_over_arbitrary_sessions` and `fuzz_targets/egfx_processor`, both
+driving `process` **and** `flush_frames`, which is the pair the channel manager drives and the
+only way to reach `blit_dirty`'s server-controlled `u32` origins.
 
 The gap used to be the whole connect sequence. #200 closed the mechanical half of it —
 `tpkt`, `x224`, `nego`, `dvc`, `svc` and `displaycontrol` now carry a target and a

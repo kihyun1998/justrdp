@@ -8,21 +8,22 @@
 ## 작업 규율 — `thegraph`
 
 Substantive 변경이면 **`thegraph` 스킬**로 짠다 — 착수 시 `/thegraph`. 고정된 step 목록이
-아니라 **노드 카탈로그 + 네 invariant**이고, 이 repo 의 실제 그래프(어느 노드가 몇 개
-있는지, 각 가드와 decider, 무엇이 에이전트·스크립트로 추출됐는지)는 **계약 문서
-`docs/agents/thegraph.md`** 에 컴파일돼 있다 — 착수 전에 그것을 연다.
+아니라 **노드 카탈로그 + 네 invariant**이고, 그 카탈로그는 **스킬이 소유한다** — 이 repo 는
+사본을 두지 않는다. repo 가 대는 것은 **이 프로젝트가 어떤 외부 소스를 상대로 지어졌는지**
+하나뿐이고, 그게 **[`docs/agents/thegraph.md`](docs/agents/thegraph.md)** 다 — 짧다. 그 파일이
+답하지 못하는 질문이 나오면 **그때 묻고 거기 덧붙인다** — 재컴파일하지 않는다.
 
-두 표도 **같은 파일이 소유**한다: layer 별 **tie-breaker**(무엇이 논쟁을 이기는가)와
-**deliberate divergence 28행**(어느 논쟁이 이미 끝났는가). 이슈가 랜딩할 때마다 수정되는
-표라 **사본을 두지 않는다** — 예전엔 `theflow.md` 가 소유했고, 그 파일이 은퇴하며 표를
-*옮겼다*(지운 게 아니라). 규칙에 이빨을 주는 실증(ADR·이슈 앵커)은
-**`docs/agents/lessons.md`**.
+**어떤 표도 그 파일이 소유하지 않는다.** 무엇이 논쟁을 이기는가(layer 별 tie-breaker)와
+어느 논쟁이 이미 끝났는가(deliberate divergence)는 **그 논쟁을 결정한 ADR·이슈가 소유한다** —
+사본이 아니라 원본을 읽는다. 배치 규칙은 **ADR-0001 Amendment**, 의존 경계는 **ADR-0002**,
+codec 오라클 서열은 **ADR-0003 Amendment**(owned basis → 오라클 → FreeRDP tie-break, 3단 전체)와
+그걸 좁히는 **ADR-0011 §3**, 수신 경로 관용은 **ADR-0009**. 규칙에 이빨을 주는
+실증(ADR·이슈 앵커)은 **`docs/agents/lessons.md`**.
 
 (**`theflow` 는 은퇴했고 스킬도 파일도 없다** — `/theflow` 는 호출되지 않고
-`docs/agents/theflow.md` 는 삭제됐다. 그 파일을 가리키던 참조는 전부 `thegraph.md`
-로 옮겨졌다. 단 **Step 번호는 `lessons.md` 에 그대로 산다** — 출하되는 rustdoc·
-ADR-0011/0012/0013·`docs/map/` 이 그 번호로 인용하기 때문이고, step→node 매핑은
-`lessons.md` 서문에 있다.)
+`docs/agents/theflow.md` 는 삭제됐다. 단 **Step 번호는 `lessons.md` 에 그대로 산다** —
+출하되는 rustdoc·ADR-0011/0012/0013·`docs/map/` 이 그 번호로 인용하기 때문이고,
+step→node 매핑은 `lessons.md` 서문에 있다.)
 
 ## 착수 전 배선도 — `docs/map/`
 
@@ -44,10 +45,26 @@ justrdp 가 **하지 않는 것** (의존성으로 끌어들이지도 말 것):
 
 **메커니즘은 core, 정책은 어댑터 (라우팅 규칙, ADR-0001).** 와이어 파싱·상태전이·코덱은 pure state machine core; TLS 신뢰·자격증명·frame sink 는 어댑터(`justrdp-tokio`)가 주입. sspi·rustls 는 보안 크리티컬·비-RDP 라 어댑터에 산다 — 코어는 TSRequest 를 영영 안 본다.
 
+**호스트가 정의상 소유하는 것** (우회가 아니라 정의): 소켓과 런타임, TLS 신뢰 결정, 자격증명,
+frame sink / 프레젠테이션, **입력 장치 의미론**, **클립보드·리디렉션 정책**, **재연결 전략**,
+그리고 **모든 RDP 피처 플래그**. 소비자 seam 은 in-repo 다 — `justrdp-tokio` 하나뿐이고,
+**퍼블리시된 소비자는 없다**.
+
+**계약을 결함으로 오진하지 말 것.** policy-agnosticism 과 dirty-rect `FrameUpdate`(ADR-0010)
+는 justrdp 가 **의도적으로 지키는 계약**이다. *"코어가 이걸 대신 해결해 줘야 한다"* 는 호스트가
+유효하지 않은 것 위에 서 있는 것이고, 그 보고를 결함으로 처리하면 우회가 아니라 **계약을
+지우게 된다**. 보고를 받으면 먼저 묻는다 — *누구의 invariant 가 깨졌나*.
+
+**업스트림 결함을 소비자 쪽에서 우회하지 말 것.** 실증 사례는 `sspi` CredSSP 결함(ADR-0004):
+**업스트림에 보고·수정**됐고, 그동안만 `[patch.crates-io]` 로 다리를 놨으며, 수정이 출시되자
+**다리를 지웠다**(2026-08-10) — 로컬에서 우회한 적이 없다. 테스트를 통과시키려고 **더 얕은
+층에서 보상하고 싶어지는 순간이 `stop` 엣지다: 멈추고, 설명하고, 묻는다.** 혼자 우회하지도,
+조용히 이슈만 열고 넘어가지도 않는다.
+
 ## 크레이트 구조 (ADR-0001)
 
 가상 워크스페이스(edition 2024). 멤버 4 + 워크스페이스 밖 `fuzz`:
-`justrdp-pdu`(무의존 PDU) · `justrdp`(sans-IO 코어) · `justrdp-codecs`(코덱 — 전부 자체 소유, ironrdp-graphics 는 **dev 오라클로만**; #189 이후 런타임 그래프에 ironrdp 없음) · `justrdp-tokio`(~30줄 I/O 어댑터 — tokio/sspi/rustls 는 여기만) · `fuzz`(워크스페이스 밖, nightly). 상세 트리 규칙은 `docs/agents/thegraph.md` § `place`, `--workspace` 사각지대는 같은 파일 § `gate`.
+`justrdp-pdu`(무의존 PDU) · `justrdp`(sans-IO 코어) · `justrdp-codecs`(코덱 — 전부 자체 소유, ironrdp-graphics 는 **dev 오라클로만**; #189 이후 런타임 그래프에 ironrdp 없음) · `justrdp-tokio`(~1,000줄 I/O 어댑터 — tokio/sspi/rustls 는 여기만) · `fuzz`(워크스페이스 밖, nightly). **상세 트리 규칙은 [ADR-0001 Amendment](docs/adr/0001-sans-io-state-machine-core.md)** — 어느 디렉터리가 무엇을 소유하는지 구체적 경로로, 위반 0건으로 측정됨. `--workspace` 가 `fuzz/` 를 못 보는 사각지대도 거기 있다.
 
 **위임 의존(ADR-0002, 전부 leaf·보안 크리티컬·비-RDP)**: `rustls`(`ring` provider)·`rustls-platform-verifier`(#36)·`sspi`·`x509-cert`. **sspi 포크 브리지는 끝났다(2026-08-10)**: `[patch.crates-io]` 제거, `sspi = "=0.21.3"` 정확 핀(ADR-0004 Decision 이 요구하는 형태). Devolutions/sspi-rs#689 가 0.21.1 로 출시되며 탈출 조건이 충족됐고, 루프백 full-CredSSP 테스트가 퍼블리시 크레이트에서 통과한다. **실 VM 스위트도 통과한다** — VM 이 재구축되며 자격증명이 살아났고, 전체 스위트가 병렬 15/15(2026-08-19, #198). 이 문장은 한동안 `STATUS_LOGON_FAILURE` 로 막혀 있다고 적혀 있었다(클라이언트 회귀 아님은 A/B 로 확인됐었다). ADR-0004 Amendment(2026-08-10) + [`docs/map/territory/nla-credssp.md`](docs/map/territory/nla-credssp.md).
 
@@ -71,8 +88,9 @@ Five canonical triage roles mapped 1:1 to default label strings (`needs-triage`,
 Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ### CI gates
-네 게이트: `test.yml`(build/test/clippy + map) + `fuzz.yml`(nightly cargo-fuzz) + `supply-chain.yml`(just-shield, ADR-0006) + `overflow-32bit.yml`(i686 — x64 게이트가 **구조적으로** 못 잡는 dimension-overflow 클래스, path-filtered). 상세는 **`docs/agents/thegraph.md` § `gate`**(8게이트·9커맨드·사각지대) + 메모리
-`justrdp_ci_policy`. 실행 가능한 사본은 **`scripts/thegraph/gates.py`** 하나다 — 각
-게이트를 파이프 없이 bare 로 돌린다.
+네 게이트: `test.yml`(build/test/clippy + map) + `fuzz.yml`(nightly cargo-fuzz) + `supply-chain.yml`(just-shield, ADR-0006) + `overflow-32bit.yml`(i686 — x64 게이트가 **구조적으로** 못 잡는 dimension-overflow 클래스, path-filtered). 권위 있는 목록은 **`.github/workflows/*.yml` 자체**이고 — 사본을 두지 않는다 —
+게이트 정책은 메모리 `justrdp_ci_policy`. **각 게이트는 파이프 없이 bare 로 돌린다**(`bare`
+스킬): 파이프라인의 종료 코드는 마지막 명령의 것이라, 다른 명령을 통과해 걸러진 검사는 늘
+성공하고 **실패할 수 없는 게이트는 게이트가 아니다**.
 
 **컴파일러는 핀돼 있다(ADR-0013, #235)** — `rust-toolchain.toml` 이 정확 버전을 고정하고 `rust-toolchain` Dependabot ecosystem 이 올린다. 그래서 로컬 게이트가 CI 를 미러한다; 그 전엔 3개월 차이가 나서 CI 를 빨갛게 만든 lint 가 로컬에선 **아예 발화하지 못했다**. nightly 는 `+nightly` 가 핀을 이기므로 fuzz 레인은 무영향.

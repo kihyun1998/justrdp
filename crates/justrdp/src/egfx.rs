@@ -6,9 +6,13 @@
 //! cache, the blit/fill/cache ops, and the dirty-region batching live here. Every codec on this
 //! path is now self-owned — zgfx bulk decompression was the last delegation and it went in #189,
 //! so `ironrdp-graphics` is out of the runtime graph entirely (ADR-0003 phase 3, ADR-0011).
-//! The client speaks first: `start()` sends a Caps Advertise pinned to CAPVERSION_8 — the
-//! RemoteFX/Progressive/Clear/Planar era — which structurally keeps the server away from AVC
-//! (H.264), for which no decoder exists yet.
+//! The client speaks first: `start()` sends a Caps Advertise carrying seven capsets, 8 through
+//! CAPVERSION_104. The ladder is chosen by which versions this client can *honour* rather than
+//! by how high the number goes — 10.5 and 10.6 make the scaled map-surface command a MUST, and
+//! offering them to a real WS2022 server got 10.6 confirmed and **zero** frames painted with no
+//! error anywhere (#271). AVC (H.264) stays structurally excluded: every 10.x capset carries
+//! `CAPS_FLAG_AVC_DISABLED`, and no decoder exists for it yet. The derivation is in `start()`;
+//! this paragraph still read "pinned to CAPVERSION_8" after #271 moved it, and #267 swept it.
 //!
 //! WireToSurface1 RemoteFX (`CODECID_CAVIDEO`) decodes through the self-owned
 //! `justrdp-codecs::rfx` decoder (issue #58, ADR-0007) — it skipped the bootstrap phase
@@ -229,7 +233,7 @@ struct CachedBitmap {
 }
 
 /// The EGFX channel processor: transport codec state + the owned surface model.
-pub(crate) struct GraphicsProcessor {
+pub struct GraphicsProcessor {
     zgfx: Zgfx,
     /// Reused zgfx output buffer — one allocation across messages (#86).
     zgfx_blob: Vec<u8>,
@@ -2355,5 +2359,635 @@ mod tests {
             p.frame_paint, MAX_TOTAL_SURFACE_BYTES,
             "SURFACE_TO_SURFACE is bounded",
         );
+    }
+
+    // ── #267 — the ADR-0008 artifacts for the graphics processor ─────────────────────────
+    //
+    // `GraphicsProcessor::process` is the EGFX live path and carried **neither** artifact.
+    // `fuzz_targets/egfx.rs` and `decode_all_never_panics_on_arbitrary_input` are both the
+    // *PDU crate's*, and the invariant's two derivations matched them here **by module name** —
+    // the fourth instance of the trap `untrusted-decode-never-panics.md` already records for
+    // `pointer` (#203), `license` (#230) and `tls` (#241), one crate further out each time. It
+    // is not theoretical here: two defects were found in this module by hand in two weeks —
+    // #268's unbounded paste loop, and `Surface::extract`'s out-of-range slice panic at
+    // `left == width + 1` with `destPtsCount == 1`.
+    //
+    // **The generator is the work, and it generates a *sequence*.** Every other no-panic
+    // property in this workspace drives a stateless parse; this subject is not one. The
+    // processor carries the zgfx LZ77 history, the Progressive tile store, the ClearCodec
+    // caches, the surface list and the bitmap cache across messages — and #268's defect was
+    // funded by exactly that: a 262 KB PDU whose cost came from a bitmap an *earlier* message
+    // had cached, which is the third adjudication question the invariant note asks. A
+    // single-message property is blind to that class by construction.
+    //
+    // **Prior art, read raw rather than summarised.** `ironrdp-fuzzing`'s `egfx_multi_frame`
+    // generates typed PDUs and re-encodes them instead of feeding arbitrary bytes to the
+    // processor. Its mechanism does not transfer — every encoder in `justrdp-pdu` writes
+    // client-to-server (ADR-0008's 2026-09-04 amendment), so there is nothing to re-encode a
+    // *server* PDU with and the bodies are assembled below — but its *shape* is right, and
+    // the reason is now measured rather than inherited.
+    //
+    // **Throwaway probe, 2026-09-07: 20 000 arbitrary blobs of 0..=512 bytes, wrapped the
+    // way this ticket names, produced `decode_all` Ok 44 times — every one of them the
+    // empty blob — and decoded a non-empty PDU ZERO times.** No surface was created and no
+    // frame was painted. So an undirected generator does not reach the per-command arms,
+    // and does not reach `decode_all`'s body either: `RDPGFX_HEADER`'s
+    // `pdu_length < 8 || pdu_length > rest.len()` consistency check refuses essentially
+    // every random blob. That is the whole justification for the structured generator
+    // below, and it is an exact 0/20 000 rather than #230's estimated 6.7e-11. Probe
+    // deleted; the number lives here.
+
+    use proptest::prelude::*;
+
+    /// One server EGFX command as the generator emits it: a `cmdId` and the body bytes
+    /// `decode_all` hands to `GraphicsProcessor::handle`.
+    #[derive(Debug, Clone)]
+    struct Cmd {
+        cmd_id: u16,
+        body: Vec<u8>,
+    }
+
+    /// Little-endian body writer — the generator's half of a wire format this crate only ever
+    /// decodes. It exists because `justrdp-pdu` has no server-side encoder to borrow.
+    #[derive(Default)]
+    struct Body(Vec<u8>);
+
+    impl Body {
+        fn u8(mut self, v: u8) -> Self {
+            self.0.push(v);
+            self
+        }
+        fn u16(mut self, v: u16) -> Self {
+            self.0.extend_from_slice(&v.to_le_bytes());
+            self
+        }
+        fn u32(mut self, v: u32) -> Self {
+            self.0.extend_from_slice(&v.to_le_bytes());
+            self
+        }
+        fn rect(self, r: (u16, u16, u16, u16)) -> Self {
+            self.u16(r.0).u16(r.1).u16(r.2).u16(r.3)
+        }
+        fn bytes(mut self, v: &[u8]) -> Self {
+            self.0.extend_from_slice(v);
+            self
+        }
+        fn done(self, cmd_id: u16) -> Cmd {
+            Cmd {
+                cmd_id,
+                body: self.0,
+            }
+        }
+    }
+
+    /// Surface ids from a **tiny** pool, so a command can find a surface an earlier one
+    /// created. Without the correlation every arm past `surface_mut` short-circuits on "unknown
+    /// surface" and the property asserts the lookup instead of the handler — #211's `nscodec`
+    /// finding in its second form, where the generator is wide enough to be admitted and never
+    /// coincides with the state the arm needs.
+    fn surface_id() -> impl Strategy<Value = u16> {
+        prop_oneof![8 => 0u16..=2, 1 => any::<u16>()]
+    }
+
+    /// Surface dimensions, weighted onto the three places the arithmetic changes: a real
+    /// surface, the `MAX_SURFACE_DIM` refusal on both sides of it, and the full `u16` a server
+    /// may pick (`[MS-RDPEGFX]` 2.2.2.14 caps at 32766; nothing on the wire enforces it).
+    fn dim() -> impl Strategy<Value = u16> {
+        prop_oneof![
+            6 => 1u16..=64,
+            2 => (MAX_SURFACE_DIM - 1)..=(MAX_SURFACE_DIM + 1),
+            1 => any::<u16>(),
+        ]
+    }
+
+    /// Rectangle edges. The near-maximal arm is what #263 was: `[MS-RDPEGFX]` 2.2.1.2 places no
+    /// bound on a `RDPGFX_RECT16` beyond the type, and a maximal `destRect` panicked on i686.
+    fn coord() -> impl Strategy<Value = u16> {
+        prop_oneof![
+            6 => 0u16..=64,
+            2 => 65_400u16..=65_535,
+            1 => any::<u16>(),
+        ]
+    }
+
+    fn rect() -> impl Strategy<Value = (u16, u16, u16, u16)> {
+        (coord(), coord(), coord(), coord())
+    }
+
+    /// A destination **point** coordinate, and it is deliberately not [`coord`].
+    ///
+    /// `Point16::decode` reads the field as `read_u16_le() as i16`, so `coord`'s near-maximal
+    /// arm folds entirely onto *negative* destinations — which clip through the `-x.min(0)`
+    /// path and can never produce the failure that lives past a surface's right edge. Measured:
+    /// with `coord` on both, deleting `Surface::blit`'s zero-extent early return left this
+    /// file's no-panic property **green**, because `dst_x >= width` was unreachable. The window
+    /// below is the one that matters — positive, just past a generated surface, and up against
+    /// `i16::MAX` — with the full type kept on its own arm.
+    fn point_coord() -> impl Strategy<Value = u16> {
+        prop_oneof![
+            5 => 0u16..=64,
+            3 => 65u16..=200,
+            1 => (i16::MAX as u16 - 8)..=(i16::MAX as u16),
+            1 => any::<u16>(),
+        ]
+    }
+
+    /// A `MapSurfaceToOutput` origin: the server-controlled `u32` pair that `blit_dirty` adds a
+    /// surface coordinate to and narrows to `u16`. **Only `flush_frames` reaches it**, which is
+    /// why this property drives the pair rather than `process` alone. Weighted at the `u16`
+    /// boundary, which is where the narrowing decides between a blit and a skip.
+    fn origin() -> impl Strategy<Value = u32> {
+        prop_oneof![
+            5 => 0u32..=64,
+            3 => (u32::from(u16::MAX) - 8)..=(u32::from(u16::MAX) + 8),
+            1 => any::<u32>(),
+        ]
+    }
+
+    /// Cache slots from a tiny pool for the same reason as [`surface_id`]: a paste that names a
+    /// slot no `SURFACE_TO_CACHE` filled never reaches the blit loop. The unconstrained arm is
+    /// kept — the slot is an unchecked `HashMap` key today, where §3.3.1.4 gives 25 600 / 4 096.
+    fn cache_slot() -> impl Strategy<Value = u16> {
+        prop_oneof![8 => 0u16..=3, 1 => any::<u16>()]
+    }
+
+    /// **The exact-match gate this subject's reach turns on.** `decode_wts1` dispatches on
+    /// `codec_id` by equality, so a uniform `u16` clears it ~5 times in 65536 and every codec
+    /// arm goes unexercised while the property still runs green — the shape `color.rs`'s
+    /// `depth()` records and `nscodec` shipped once.
+    fn codec_id() -> impl Strategy<Value = u16> {
+        prop_oneof![
+            8 => prop::sample::select(vec![
+                egfx::CODECID_UNCOMPRESSED,
+                egfx::CODECID_PLANAR,
+                egfx::CODECID_CLEARCODEC,
+                egfx::CODECID_CAVIDEO,
+                egfx::CODECID_CAPROGRESSIVE,
+                egfx::CODECID_ALPHA,
+            ]),
+            1 => any::<u16>(),
+        ]
+    }
+
+    fn pixel_format() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            8 => prop::sample::select(vec![
+                egfx::PIXEL_FORMAT_XRGB_8888,
+                egfx::PIXEL_FORMAT_ARGB_8888,
+            ]),
+            1 => any::<u8>(),
+        ]
+    }
+
+    /// The **declared** entry count of a list-bearing command, at the full type range.
+    ///
+    /// It is deliberately independent of how many entries `entry_budget` actually emits, and
+    /// that split is what buys the full range for free: a declared count larger than the bytes
+    /// present is refused by `Point16::decode`, which is the reject branch, and a declared
+    /// count the bytes *do* cover costs 4-8 bytes each — #268's whole point. So the type range
+    /// is driven without generating 524 KB bodies 512 times.
+    fn declared_count() -> impl Strategy<Value = u16> {
+        prop_oneof![
+            5 => 0u16..=2,
+            3 => 3u16..=64,
+            2 => any::<u16>(),
+        ]
+    }
+
+    /// How many list entries are actually written. **A budget trade, not a threat model** — a
+    /// server may send 65 535 (#268 measured what that costs), and this caps at 600 so a
+    /// 512-case run stays inside `test.yml`'s 20-minute job. `declared_count` keeps the full
+    /// range driven; what this bounds is only the *work*, which `frame_paint` now bounds in
+    /// production too.
+    fn entry_budget() -> impl Strategy<Value = usize> {
+        prop_oneof![7 => 0usize..=8, 2 => 9usize..=64, 1 => 400usize..=600]
+    }
+
+    /// A codec payload. Bounded at 512 bytes on the same budget grounds, and stated because
+    /// ADR-0008's strategy rule was amended (#263) precisely to stop a budget bound being
+    /// written up as fidelity: a real bitstream is far larger, and this reaches each decoder's
+    /// entry and its early refusals rather than its deep loops.
+    fn payload() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 0..=512)
+    }
+
+    /// One command. Every arm a real server sends, plus an arbitrary-`cmdId` arm so the
+    /// `Unknown` skip and the header's own refusals stay driven.
+    fn cmd() -> impl Strategy<Value = Cmd> {
+        prop_oneof![
+            2 => (any::<u32>(), any::<u32>()).prop_map(|(v, f)| Body::default()
+                .u32(v)
+                .u32(4)
+                .u32(f)
+                .done(egfx::CMDID_CAPS_CONFIRM)),
+            2 => (any::<u32>(), any::<u32>()).prop_map(|(w, h)| Body::default()
+                .u32(w)
+                .u32(h)
+                .done(egfx::CMDID_RESET_GRAPHICS)),
+            6 => (surface_id(), dim(), dim(), pixel_format()).prop_map(|(s, w, h, pf)| {
+                Body::default()
+                    .u16(s)
+                    .u16(w)
+                    .u16(h)
+                    .u8(pf)
+                    .done(egfx::CMDID_CREATE_SURFACE)
+            }),
+            2 => surface_id()
+                .prop_map(|s| Body::default().u16(s).done(egfx::CMDID_DELETE_SURFACE)),
+            5 => (surface_id(), origin(), origin()).prop_map(|(s, x, y)| {
+                Body::default()
+                    .u16(s)
+                    .u16(0)
+                    .u32(x)
+                    .u32(y)
+                    .done(egfx::CMDID_MAP_SURFACE_TO_OUTPUT)
+            }),
+            4 => any::<u32>()
+                .prop_map(|f| Body::default().u32(0).u32(f).done(egfx::CMDID_START_FRAME)),
+            4 => any::<u32>().prop_map(|f| Body::default().u32(f).done(egfx::CMDID_END_FRAME)),
+            6 => (surface_id(), codec_id(), pixel_format(), rect(), payload()).prop_map(
+                |(s, c, pf, r, d)| Body::default()
+                    .u16(s)
+                    .u16(c)
+                    .u8(pf)
+                    .rect(r)
+                    .u32(d.len() as u32)
+                    .bytes(&d)
+                    .done(egfx::CMDID_WIRE_TO_SURFACE_1)
+            ),
+            4 => (surface_id(), codec_id(), any::<u32>(), pixel_format(), payload()).prop_map(
+                |(s, c, ctx, pf, d)| Body::default()
+                    .u16(s)
+                    .u16(c)
+                    .u32(ctx)
+                    .u8(pf)
+                    .u32(d.len() as u32)
+                    .bytes(&d)
+                    .done(egfx::CMDID_WIRE_TO_SURFACE_2)
+            ),
+            1 => (surface_id(), any::<u32>()).prop_map(|(s, c)| Body::default()
+                .u16(s)
+                .u32(c)
+                .done(egfx::CMDID_DELETE_ENCODING_CONTEXT)),
+            4 => (
+                surface_id(),
+                any::<[u8; 4]>(),
+                declared_count(),
+                entry_budget(),
+                rect(),
+            )
+                .prop_map(|(s, col, n, k, r)| {
+                    let mut b = Body::default().u16(s).bytes(&col).u16(n);
+                    for _ in 0..k {
+                        b = b.rect(r);
+                    }
+                    b.done(egfx::CMDID_SOLID_FILL)
+                }),
+            4 => (
+                surface_id(),
+                surface_id(),
+                rect(),
+                declared_count(),
+                entry_budget(),
+                point_coord(),
+                point_coord(),
+            )
+                .prop_map(|(src, dst, r, n, k, x, y)| {
+                    let mut b = Body::default().u16(src).u16(dst).rect(r).u16(n);
+                    for _ in 0..k {
+                        b = b.u16(x).u16(y);
+                    }
+                    b.done(egfx::CMDID_SURFACE_TO_SURFACE)
+                }),
+            5 => (surface_id(), any::<u32>(), any::<u32>(), cache_slot(), rect()).prop_map(
+                |(s, lo, hi, slot, r)| Body::default()
+                    .u16(s)
+                    .u32(lo)
+                    .u32(hi)
+                    .u16(slot)
+                    .rect(r)
+                    .done(egfx::CMDID_SURFACE_TO_CACHE)
+            ),
+            5 => (
+                cache_slot(),
+                surface_id(),
+                declared_count(),
+                entry_budget(),
+                point_coord(),
+                point_coord(),
+            )
+                .prop_map(|(slot, s, n, k, x, y)| {
+                    let mut b = Body::default().u16(slot).u16(s).u16(n);
+                    for _ in 0..k {
+                        b = b.u16(x).u16(y);
+                    }
+                    b.done(egfx::CMDID_CACHE_TO_SURFACE)
+                }),
+            1 => cache_slot()
+                .prop_map(|s| Body::default().u16(s).done(egfx::CMDID_EVICT_CACHE_ENTRY)),
+            2 => (any::<u16>(), prop::collection::vec(any::<u8>(), 0..=64))
+                .prop_map(|(id, b)| Body::default().bytes(&b).done(id)),
+        ]
+    }
+
+    /// A session: several messages, each carrying several commands. Both dimensions matter and
+    /// they are not interchangeable — commands in one blob share a `process` call and a paint
+    /// budget, while a new message is where state established earlier gets spent.
+    fn session() -> impl Strategy<Value = Vec<Vec<Cmd>>> {
+        (
+            any::<bool>(),
+            prop::collection::vec(prop::collection::vec(cmd(), 0..=6), 1..=4),
+        )
+            .prop_map(|(bootstrap, mut messages)| {
+                if bootstrap {
+                    messages.insert(0, prologue());
+                }
+                messages
+            })
+    }
+
+    /// A valid opening message: one surface, mapped, with one cache slot filled.
+    ///
+    /// **Measured, not decorative.** Without it, deleting `Surface::blit`'s zero-extent early
+    /// return left the property green: that panic needs `dst_x` past the surface *and* a live
+    /// cached bitmap to paste, which is a three-command correlated sequence
+    /// (create -> surface-to-cache -> cache-to-surface) that independently drawn commands
+    /// almost never assemble. The correlated pools in `surface_id` and `cache_slot` get the
+    /// *ids* to coincide; this gets the *order* to. `ironrdp-fuzzing`'s `egfx_multi_frame` does
+    /// the same thing one step earlier, calling `DvcProcessor::start` before its loop.
+    ///
+    /// It is prepended only half the time, so the reject paths a server hits by sending a draw
+    /// for a surface that does not exist stay driven at the same rate they were.
+    fn prologue() -> Vec<Cmd> {
+        vec![
+            Body::default()
+                .u16(1)
+                .u16(64)
+                .u16(64)
+                .u8(egfx::PIXEL_FORMAT_XRGB_8888)
+                .done(egfx::CMDID_CREATE_SURFACE),
+            Body::default()
+                .u16(1)
+                .u16(0)
+                .u32(0)
+                .u32(0)
+                .done(egfx::CMDID_MAP_SURFACE_TO_OUTPUT),
+            Body::default()
+                .u16(1)
+                .u32(0)
+                .u32(0)
+                .u16(2)
+                .rect((0, 0, 32, 32))
+                .done(egfx::CMDID_SURFACE_TO_CACHE),
+        ]
+    }
+
+    /// Drive one session the way `Drdynvc` does.
+    ///
+    /// **`flush_frames` runs only on an `Ok`**: `Drdynvc::on_svc_payload` propagates a processor
+    /// error with `?` and `session.rs:874`'s flush sits after it, so flushing a payload whose
+    /// `process` failed is a sequence the live path cannot produce. #263 recorded the cost of
+    /// the general form — an assertion routed past the call site the production path uses comes
+    /// back green over a removed guard.
+    fn drive(p: &mut GraphicsProcessor, fb: &mut Framebuffer, session: &[Vec<Cmd>]) {
+        for message in session {
+            let mut blob = Vec::new();
+            for c in message {
+                blob.extend_from_slice(&header(c.cmd_id, &c.body));
+            }
+            if p.process(&egfx::wrap_uncompressed(&blob)).is_ok() {
+                let _ = p.flush_frames(fb);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// [untrusted decode never panics](../../../docs/map/invariant/untrusted-decode-never-panics.md),
+        /// on the EGFX live path (#267). Reaching the end is the assertion; `proptest` shrinks
+        /// any panic to a minimal counterexample.
+        ///
+        /// 512 cases rather than the 2048 the PDU-crate properties use: a case here is a whole
+        /// session of up to 24 commands through five decoders, not one parse.
+        ///
+        /// **`proptest-regressions/egfx.txt` carries two seeds that are not from a real
+        /// failure.** Both were shrunk while ablating a guard to prove this property can
+        /// fail: one replays create-surface -> surface-to-cache and reaches
+        /// `Surface::extract`, the other adds the mapping and a wire-to-surface and reaches
+        /// `Surface::blit`. They are kept deliberately — without them, whether a run drives
+        /// those two routines is left to the RNG. The note is here rather than in that file
+        /// because ADR-0001's tree rule makes `proptest-regressions/` generated and never
+        /// authored, so a comment written into it is one proptest rewrite from gone.
+        ///
+        /// **Three things it deliberately does not reach**, stated because a property is
+        /// judged by what it cannot see and an unstated non-reach reads as coverage:
+        /// - **zgfx.** Every message goes in through `wrap_uncompressed`, so the
+        ///   decompressor is bypassed. That is `fuzz_targets/zgfx.rs`'s subject, and
+        ///   `ironrdp-fuzzing` splits its own the same way and says so.
+        /// - **A lying `pduLength`.** Every command here is emitted with a correct header,
+        ///   so the header walk's own refusals are driven by `fuzz_targets/egfx.rs` on the
+        ///   PDU crate and not from here. The processor adds nothing to that path — it
+        ///   propagates `decode_all`'s error — so this is a stated non-reach, not a hole.
+        /// - **Progressive's deep loops.** Payloads are 512 arbitrary bytes, which reaches
+        ///   each codec's entry and early refusals, not `paint_tile`'s `numTiles`x`numRects`
+        ///   quadratic — an open member the invariant note already names.
+        #[test]
+        fn graphics_processor_is_total_over_arbitrary_sessions(session in session()) {
+            let mut p = GraphicsProcessor::default();
+            let mut fb = Framebuffer::new(1280, 800).expect("framebuffer");
+            drive(&mut p, &mut fb, &session);
+        }
+    }
+
+    /// **The generator's reach, asserted rather than assumed** — the sibling of `color.rs`'s
+    /// `the_generator_reaches_past_the_depth_gate`, and the check #230 measured the need for at
+    /// 6.7e-11 per case.
+    ///
+    /// Each row is a shape `cmd` emits, and each asserts an *observable* effect of the arm it is
+    /// named for. Without it a green here means only that nothing panicked on the way to a
+    /// `surface_mut` that returned `None`.
+    #[test]
+    fn the_generator_reaches_every_stateful_arm() {
+        let mut p = GraphicsProcessor::default();
+        let mut fb = Framebuffer::new(1280, 800).expect("framebuffer");
+
+        // Create + map: the prologue every other arm depends on.
+        let prologue = vec![
+            Body::default()
+                .u16(1)
+                .u16(64)
+                .u16(64)
+                .u8(egfx::PIXEL_FORMAT_XRGB_8888)
+                .done(egfx::CMDID_CREATE_SURFACE),
+            Body::default()
+                .u16(1)
+                .u16(0)
+                .u32(0)
+                .u32(0)
+                .done(egfx::CMDID_MAP_SURFACE_TO_OUTPUT),
+        ];
+        drive(&mut p, &mut fb, &[prologue]);
+        assert_eq!(p.surfaces.len(), 1, "CreateSurface arm reached");
+
+        // The dimension refusal, asserted directly. An ablation of it is **masked**: at 65535
+        // square the byte total is 17 GB and `MAX_TOTAL_SURFACE_BYTES` refuses it anyway, so
+        // removing this guard alone left every test in this file green. Two guards cover the
+        // same input and only the outer one was observable; this row makes the inner one so.
+        let oversize = vec![
+            Body::default()
+                .u16(9)
+                .u16(MAX_SURFACE_DIM + 1)
+                .u16(1)
+                .u8(egfx::PIXEL_FORMAT_XRGB_8888)
+                .done(egfx::CMDID_CREATE_SURFACE),
+        ];
+        drive(&mut p, &mut fb, &[oversize]);
+        assert_eq!(
+            p.surfaces.len(),
+            1,
+            "a surface one pixel past MAX_SURFACE_DIM is refused, and the refusal is this \r
+             guard rather than the byte-total one it hides behind",
+        );
+        assert_eq!(
+            p.surfaces[0].mapped,
+            Some((0, 0)),
+            "MapSurfaceToOutput arm reached"
+        );
+
+        // A bracketed SolidFill: the frame bracket, the paint budget and the dirty list.
+        let frame = vec![
+            Body::default().u32(0).u32(7).done(egfx::CMDID_START_FRAME),
+            Body::default()
+                .u16(1)
+                .bytes(&[1, 2, 3, 0])
+                .u16(1)
+                .rect((0, 0, 8, 8))
+                .done(egfx::CMDID_SOLID_FILL),
+        ];
+        drive(&mut p, &mut fb, &[frame]);
+        assert!(p.in_frame, "StartFrame arm reached");
+        assert_eq!(
+            p.frame_paint,
+            8 * 8 * 4,
+            "SolidFill painted, and was charged"
+        );
+
+        // The cache round trip: fill a slot, then paste it — the #268 shape, and the pair the
+        // correlated `cache_slot()` / `surface_id()` pools exist for.
+        let cache = vec![
+            Body::default()
+                .u16(1)
+                .u32(0)
+                .u32(0)
+                .u16(2)
+                .rect((0, 0, 8, 8))
+                .done(egfx::CMDID_SURFACE_TO_CACHE),
+            Body::default()
+                .u16(2)
+                .u16(1)
+                .u16(1)
+                .u16(4)
+                .u16(4)
+                .done(egfx::CMDID_CACHE_TO_SURFACE),
+        ];
+        drive(&mut p, &mut fb, &[cache]);
+        assert_eq!(p.cache.len(), 1, "SurfaceToCache arm reached");
+        assert!(p.cache_bytes > 0, "the cache accounting moved");
+        assert!(
+            p.frame_paint > 8 * 8 * 4,
+            "CacheToSurface pasted into the same frame"
+        );
+
+        // EndFrame closes the bracket and produces the frame-ack the manager sends.
+        let mut p2 = GraphicsProcessor::default();
+        let mut fb2 = Framebuffer::new(1280, 800).expect("framebuffer");
+        let end = vec![Body::default().u32(7).done(egfx::CMDID_END_FRAME)];
+        drive(&mut p2, &mut fb2, &[end]);
+        assert_eq!(p2.frames_decoded, 1, "EndFrame arm reached");
+
+        // WireToSurface1 with a real codec id: the exact-match gate `codec_id()` is weighted for.
+        let mut p3 = GraphicsProcessor::default();
+        let mut fb3 = Framebuffer::new(1280, 800).expect("framebuffer");
+        let wts1 = vec![
+            Body::default()
+                .u16(1)
+                .u16(4)
+                .u16(4)
+                .u8(egfx::PIXEL_FORMAT_XRGB_8888)
+                .done(egfx::CMDID_CREATE_SURFACE),
+            Body::default()
+                .u16(1)
+                .u16(0)
+                .u32(0)
+                .u32(0)
+                .done(egfx::CMDID_MAP_SURFACE_TO_OUTPUT),
+            Body::default()
+                .u16(1)
+                .u16(egfx::CODECID_UNCOMPRESSED)
+                .u8(egfx::PIXEL_FORMAT_XRGB_8888)
+                .rect((0, 0, 2, 2))
+                .u32(16)
+                .bytes(&[0x7Fu8; 16])
+                .done(egfx::CMDID_WIRE_TO_SURFACE_1),
+        ];
+        let mut blob = Vec::new();
+        for c in &wts1 {
+            blob.extend_from_slice(&header(c.cmd_id, &c.body));
+        }
+        p3.process(&egfx::wrap_uncompressed(&blob))
+            .expect("well-formed");
+        // Not `frame_paint`: the per-frame paint budget is charged by the three *list-bearing*
+        // commands only (#268), so it stays 0 here and would have made this row vacuous. The
+        // dirty region the decode produced is the observable that actually distinguishes
+        // "decoded and painted" from "dispatched and dropped".
+        assert!(
+            p3.surfaces[0].dirty.contains(&(0, 0, 2, 2)),
+            "the uncompressed codec arm decoded and painted; dirty was {:?}",
+            p3.surfaces[0].dirty,
+        );
+        assert!(
+            !p3.flush_frames(&mut fb3).is_empty(),
+            "and the frame reached the framebuffer"
+        );
+
+        // And the `blit_dirty` narrowing, which only `flush_frames` reaches: an origin past the
+        // addressable output must skip rather than blit, and one inside must produce a frame.
+        for (origin, want_any) in [(0u32, true), (u32::from(u16::MAX), false)] {
+            let mut p4 = GraphicsProcessor::default();
+            let mut fb4 = Framebuffer::new(1280, 800).expect("framebuffer");
+            let msg = vec![
+                Body::default()
+                    .u16(1)
+                    .u16(4)
+                    .u16(4)
+                    .u8(egfx::PIXEL_FORMAT_XRGB_8888)
+                    .done(egfx::CMDID_CREATE_SURFACE),
+                Body::default()
+                    .u16(1)
+                    .u16(0)
+                    .u32(origin)
+                    .u32(0)
+                    .done(egfx::CMDID_MAP_SURFACE_TO_OUTPUT),
+                Body::default()
+                    .u16(1)
+                    .bytes(&[1, 2, 3, 0])
+                    .u16(1)
+                    .rect((0, 0, 4, 4))
+                    .done(egfx::CMDID_SOLID_FILL),
+            ];
+            let mut blob = Vec::new();
+            for c in &msg {
+                blob.extend_from_slice(&header(c.cmd_id, &c.body));
+            }
+            p4.process(&egfx::wrap_uncompressed(&blob))
+                .expect("well-formed");
+            assert_eq!(
+                !p4.flush_frames(&mut fb4).is_empty(),
+                want_any,
+                "blit_dirty's u16 narrowing decides this at origin {origin}, and only \r
+                 flush_frames reaches it",
+            );
+        }
     }
 }

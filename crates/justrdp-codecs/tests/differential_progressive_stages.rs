@@ -13,7 +13,7 @@
 //! `docs/map/invariant/oracle-agreement-is-not-independence.md`), so this file is a
 //! *cross-check* on a transform derived from FreeRDP, not the definition of correct. The
 //! definition is `progressive.c:600-807`; where the two disagree, FreeRDP wins
-//! (`docs/agents/thegraph.md`, codec byte-exactness row).
+//! (ADR-0003's byte-exactness ranking).
 //!
 //! # And they do disagree — on exactly one thing
 //!

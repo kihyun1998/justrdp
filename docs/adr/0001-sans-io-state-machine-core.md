@@ -1,6 +1,6 @@
 # 0001 — sans-IO state machine core
 
-- Status: Accepted
+- Status: Accepted — the workspace sketch in Decision superseded by the Amendment below (2026-09-04), which states the tree rule as concrete paths
 - Date: 2026-06-08
 
 ## Context
@@ -45,6 +45,13 @@ Host integration (application-specific):
   - Resize queue: mpsc::UnboundedReceiver<(u32, u32)> for Display Control
   - Connect-stage progress callback: fn(&str) for diagnostic UI
 ```
+
+> **Two lines of the sketch above are false as written**, and are corrected in the
+> [Amendment](#amendment-2026-09-04-the-tree-rule-as-concrete-paths) below rather than here:
+> `justrdp-codecs` is **not** a re-export shim (codecs are fully self-owned since #189), and
+> `justrdp-tokio` is **~1,000 lines**, not ~30 — that figure described one function and was
+> read as describing the crate. The Amendment also states the tree rule this block only
+> sketches, as concrete per-directory paths.
 
 ## Consequences
 
@@ -95,4 +102,65 @@ This defers the problem: the machines are now trait-generic, but the trait is st
 
 ---
 
-OUTPUT: the markdown file content ready to write verbatim to `D:\github\justrdp\docs\adr\0001-sans-io-state-machine-core.md`.
+## Amendment (2026-09-04): the tree rule, as concrete paths
+
+**Gap this closes.** Decision's `Structure:` block sketches the workspace at crate
+granularity and says nothing about which directory owns which *file*. A directory
+boundary is where the seam is physically expressed, so a file written to the wrong one
+breaks the seam while producing **no error, no failing test and no warning** — the one
+class of mistake this repo's gates structurally cannot catch. The rule below was compiled
+by `plat` against four maintainer-confirmed peers (`quinn-proto`/`quinn`/`quinn-udp`,
+`ironrdp-pdu`/`-graphics`/`-tokio`, `rustls`, `h2`) and lived only in a generated build
+document until that document was retired; **no other file in the repo restates it.**
+
+**Two lines of Decision's block are now false, and are corrected here** rather than left
+to be read as current:
+
+- `justrdp-codecs: phased-c2 codec re-exports (transitional)` — codecs are **fully
+  self-owned** since #189; `ironrdp-graphics` is a **dev-dependency oracle only** and is
+  absent from the runtime graph.
+- `justrdp-tokio (later): ~30-line I/O adapter` — the *drive loop* is a few dozen lines
+  of `match` on `Action`, but the crate is **~1,000 lines**: the TLS handshake, the
+  CredSSP token loop, per-stage timeouts and the session runner live there too. The
+  "~30 lines" figure describes one function and was read as describing the crate.
+
+**A declared rule outranks what the tree merely looks like** — and here the two never
+conflicted. Measured: the declared dependency boundary has **zero violators**, and the
+measurement is *stricter* than the declaration (`justrdp-codecs` has no external
+dependency at all; the four crates depend only downward).
+
+| Path | Owns | Grounds |
+|---|---|---|
+| `crates/justrdp-pdu/src/*.rs` | one file per `[MS-*]` protocol area — bytes↔types only. **Zero external dependencies** | this record + ADR-0002, measured 0 violators |
+| `crates/justrdp-pdu/src/<area>/` | a protocol area that outgrew one file. Module root is **`<area>.rs` beside it**, never `mod.rs` | spelling rule |
+| `crates/justrdp-codecs/src/*.rs` | one codec per file — **pixel math only**. Depends on `justrdp-pdu` and nothing else | ADR-0003 / ADR-0007, measured |
+| `crates/justrdp-codecs/src/<codec>/` | a codec that outgrew one file | spelling rule |
+| `crates/justrdp/src/*.rs` | the sans-IO state machines and the host-facing output types. **No `tokio`, no `rustls`, no `sspi`** | this record; measured: `x509-cert` + `tracing` only |
+| `crates/justrdp-tokio/src/*.rs` | **the only place `tokio`, `rustls`, `sspi` or `ring` may appear.** Policy injection | ADR-0002, measured 0 violators |
+| `crates/*/tests/*.rs` | **differential-oracle and real-corpus tests only** | see the test-layout rule below |
+| `crates/*/tests/fixtures/<name>/` | captured real-server bytes plus a `README.md`. Appears **only** in a crate whose tests replay them | which is why `crates/justrdp/tests/` has none — both its tests are differential |
+| `crates/*/proptest-regressions/` | generated. Never authored | — |
+| `fuzz/fuzz_targets/*.rs` | fuzz targets, **out of the workspace** | matches 3/3 peers that run a fuzz lane |
+| `.github/workflows/*.yml` · `.github/scripts/*.py` | things that **are** CI gates | — |
+| `docs/adr/NNNN-<kebab>.md` · `docs/agents/*.md` · `docs/map/territory/<area>.md` · `docs/map/invariant/<claim>.md` | decision records · agent contracts · the wiring map | — |
+
+**`fuzz/` is out of the workspace, and that is a gate blind spot, not an oversight.**
+`cargo <cmd> --workspace` does not build it, so a rename or a public-path change can leave
+it broken while every gate stays green. It needs its own
+`cargo check --manifest-path fuzz/Cargo.toml`.
+
+### Two layout rules that were previously declared nowhere
+
+Both were carried as *deliberate divergences from prior art* in the retired build document
+and, unlike every other row there, **neither named a decision record** — so both are
+recorded here rather than dropped.
+
+- **`justrdp-pdu/src/` is flat** — one file per `[MS-*]` protocol area, 25 of them, where
+  **IronRDP** nests by area (`basic_output/`, `gcc/`, `input/`, `rdp/`, `connection/`).
+  The grounds are not taste: `docs/map/territory/` depends on a **1:1 area↔file
+  correspondence**, so nesting would break the map's addressing scheme, which is how a
+  change's blast radius is looked up before it is designed.
+- **Unit tests are inline `#[cfg(test)]`; `crates/*/tests/` holds differential and corpus
+  tests only** — where **h2** and **quinn** put ordinary integration tests in `tests/`.
+  Measured 15/15 conforming at the time of writing. Keeping `tests/` reserved is what
+  makes "does an owned basis exist for this codec?" answerable by listing a directory.

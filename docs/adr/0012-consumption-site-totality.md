@@ -1,128 +1,8 @@
 # 0012 — A parser's guarantee is not held at the point of use: consumption-site totality
 
 - Status: Accepted (promoted while working issue #211; conformance items #211, #233, #252,
-  #262, #263, #268)
-  - Amendment 2026-09-01 (#268): **§5's totality comment is discharged against a *step*, and a
-    reader takes it as a claim about the *function*.** The #263 Amendment below records that a
-    discharged §5 argument is not a safety claim, and gives two reasons the rule cannot see —
-    a threshold sized against a type, and a hazard about magnitude. This is a third and it is
-    cheaper than either: the argument can be **entirely true** and still not be about the thing
-    that fails. `justrdp::egfx`'s `Surface::extract` carried exactly the comment §5 asks for —
-    *the first two statements clip `w`/`h` to this surface's own dimensions before any multiply,
-    so the reserve is bounded by a buffer that already exists*. True, and about the multiply.
-    Clipping `w` does not clip `x`, so at `x > self.width` the extent goes to zero, the row loop
-    still runs, and `&self.rgba[off..off]` panics on a slice whose **start** is past the end.
-    Reached from the wire through `SURFACE_TO_SURFACE` and `SURFACE_TO_CACHE` on an ordinary
-    1920x1080 surface: `left == 1920` is `Ok` and `left == 1921` panics. **So §5 gains a
-    qualifier rather than a clause** — where the totality argument is a comment, it names the
-    step it covers, because a comment that reads as covering the function is how a §5 discharge
-    stops being re-checked. **Two of §1's three grounds hold and the third does not**, which
-    is worth saying because the one that fails is the one that usually carries this record:
-    `extract` is **private**, so *"the functions are public"* does not apply. The other two do —
-    the constraint is established in `justrdp-pdu` (`Rect16`) and consumed in `justrdp` across a
-    crate boundary, and the value the indexing uses (`off`) is *derived* from `x` rather than
-    being `x`. Both call sites pass `src_rect.left` / `src_rect.top` unclamped, so reachability
-    is **yes** and, per §1, that sets the priority and never the contract.
-
-    **A Consequences clause below was false when it was written, and is true now.** The #262
-    bullet ends *"every other loop in the codec and framebuffer paths is either `u16`-derived or
-    guarded before the loop (`framebuffer::blit`, `egfx`'s surface ops)"*. The disjunction holds
-    — `extract`'s loop **is** `u16`-derived and terminates — but the parenthetical cites
-    `egfx`'s surface ops as a family that was guarded before the loop, and one of the four was
-    not. It is the identical failure the code comment made, one document up: a claim checked at
-    some members, written about the set. Corrected by the change rather than by this record, and
-    left standing with this note attached per the ADR-0002/0007 house pattern. §1–§5 are
-    unaffected.
-
-  - Amendment 2026-08-31 (#263): **§2 says which *quantity* to guard and is silent about
-    which *ceiling* to guard it against, and the silence is load-bearing for every site in
-    this class that allocates.** A guard written as `checked_mul` discharges §5 exactly — it
-    is *"a validating step that refuses what the arithmetic cannot take"* — and it is not a
-    bound: `Vec` refuses any request above **`isize::MAX`**, not above `usize::MAX`, so on a
-    32-bit target there is a 2 GiB window where the guard returns `Some` and the allocation
-    panics with *capacity overflow* inside `raw_vec`. Measured on `i686-pc-windows-msvc` with
-    the `checked_mul` guard in place: `40000 x 20000 x 4` is 3_200_000_000, passed, and
-    panicked. That is this record's own discharge condition being satisfied over a live
-    panic, which is the strongest available form of the finding — the same shape §2 already
-    records one order of magnitude smaller, where a guard written as `q > 15` diverges by one
-    from where the arithmetic is undefined. **So §2 extends: the threshold is written on the
-    quantity the arithmetic uses, *at the ceiling the operation that can fail enforces*.**
-    `usize::MAX` is the type's ceiling and belongs to no operation. See §2 below and
-    [decoder dimension overflow on 32-bit](../map/invariant/decoder-dimension-overflow-32bit.md),
-    which owns the per-site adjudication and records that only `rfx` is corrected so far.
-
-    **Second, and the reason this is an amendment rather than a note: totality is not the
-    whole obligation, and a site can satisfy this record completely and still be the defect.**
-    `justrdp_codecs::rfx::RemoteFx::decode_to_rgba` is total for its `(u16, u16)` signature
-    once the refusal is written, and on **64-bit** that refusal fires on nothing at all,
-    because 65535 x 65535 x 4 = 17_179_344_900 is representable. Measured: a **93-byte**
-    TS_RFX tileset with `destRect = (0,0,65535,65535)` returned `Ok(Some(17_179_344_900))`
-    on `x86_64-pc-windows-msvc` — 16 GiB allocated, 18.9 s, no error — and on a
-    commit-constrained host `alloc_zeroed` fails, which is `handle_alloc_error` and therefore
-    **`abort`**: not a `Result`, not catchable, fatal to the host process rather than to the
-    RDP task. Totality is about *representability*; that failure is about *magnitude*, and no
-    guard written from the parameter type can reach it. The bound has to come from a layer
-    holding a defensible number — `justrdp::egfx`'s `MAX_TOTAL_SURFACE_BYTES`, which is
-    derived (no admissible surface exceeds it, so no legitimate `destRect` does) rather than
-    picked. **§1 is unchanged and the split is deliberate**: the codec owns totality for its
-    own signature, the surface model owns magnitude, and §3's *one quantity, one answer* is
-    not in play because the two are answering different questions. Recorded so a future
-    reader does not take a discharged §5 argument as evidence that a consumption site is
-    safe.
-  - Amendment 2026-08-31 (#262): **§5's disjunction is not exhaustive, and the missing half is
-    a loop rather than an expression.** As written it offers two ways to discharge the standing
-    rule — refuse what the arithmetic cannot take, or *"where the arithmetic is total for the
-    whole parameter type, a comment saying so and why"*. `justrdp_codecs::color::to_rgba`
-    satisfies the second **exactly**: at `width == 0` every guard is not merely total but
-    *passes* (`0 * bpp` is 0, `0 * height` is 0, and `src.len() < 0` is false, so the
-    source-length check succeeds rather than refusing), and the function still does not return,
-    because `for out_row in 0..height` walks a bare `usize` over empty rows. A property
-    generating `any::<usize>()` reaches that draw in **0.2% of cases and therefore ~44% of
-    runs** — `P(width == 0) = 6/9 x 1/33`, `P(height from the unbounded arm) = 1/9`, over
-    proptest's default 256 cases — which is why it was invisible until it was not, and why the
-    six healthy runs on either side of a killed one proved nothing. It cost ~56.4 runner-hours
-    across 10 cancelled CI jobs before anyone read a killed log. **So the totality argument §5 requires
-    covers the trip count of every loop a parameter bounds, not only the arithmetic performed
-    inside it** — a guard chain that validates arithmetic does not bound a loop. This is an
-    extension in the ADR-0002/0007 house pattern, not a rewrite: §1–§4 are about which module owns
-    a guarantee and stay as written; what moves is what §5 has to *check* before it is
-    discharged. **Routing note, because the wrong record was the tempting one:** this is not
-    §3. That section is titled *one **undefined** input, one answer*, and a zero extent is
-    defined for every function involved — `rle::decompress` and `planar::decompress` refuse it
-    as **policy** (`EmptyImage`), which is a different act from bounding a loop, and a
-    divergence row naming them against `to_rgba` would report a disagreement that does not
-    exist. **Nor is it the clamp this record rejects.** *Saturate or clamp at the point of use*
-    is declined below under ADR-0009 §3(b) (*"silent masking is forbidden"*), and a clamp is a
-    wrong answer substituted for a right one; `Ok(Vec::new())` for a zero extent is the right
-    answer — `[MS-RDPEGFX]` 2.2.1.2 makes `RDPGFX_RECT16` exclusive with no non-zero
-    requirement, so `right == left` is spec-legal and there is no divergence being hidden.
-    That the answer agrees with FreeRDP's *caller-supplied-destination* family and diverges
-    from its *allocate-and-return* family (`freerdp_glyph_convert_ex`, `color.c:265-267`,
-    `return nullptr`) is deliberate and argued at the site, on what the one reachable consumer
-    does with the error: `justrdp::egfx`'s uncompressed WTS1 arm propagates a `ColorError` with
-    `?`, which is fatal for the channel where every other codec arm there warn-and-skips.
-    See the Consequences bullet below for the second known member.
-  - Amendment 2026-08-25 (#252): **§3 derives a case outside codecs, which is evidence for the
-    rule rather than a limit on it.** Its sentence says *"two stages of one **codec** family"*,
-    and two non-codec sites now reach for it: #253 (a Share Data header field enforced in one
-    module and unenforced in another) and `justrdp::session`'s reactivation arms, which checked
-    a server `Control.action` the connect leg checked and the reactivation leg did not — one PDU
-    family, two answers, closed by #252. Both cite §3 as **precedent**, which is the honest
-    reading of the text as written. This amendment extends the reach rather than rewriting the
-    sentence, per the ADR-0002/0007 house pattern: **where two consumption sites of one family —
-    codec *or* PDU — consume the same quantity, they give it the same answer, or the divergence
-    is a row naming both sides.** The Consequences already claim this record *derives* its
-    decisions rather than listing them; a fifth derivation outside the layer it was written
-    about is what that claim predicts.
-  - Amendment 2026-08-24 (#233): §3's outstanding instance is settled — WireToSurface1 refuses a
-    zero quantization exponent, so the two RemoteFX dequantizers now answer it alike and the
-    record needs no divergence row. See §3.
-  - Amendment 2026-08-24 (#241/#238): the class this record owns **has an enumeration now**, and
-    it is a derivation rather than a list — ③ in
-    [untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md). Producing
-    it is what #238 turned out to be: it named eight uncovered members where the issue had named
-    one, and working them found four defects (two wire-reachable). Conformance items: #211, #233,
-    #238, #241.
+  #262, #263, #268) — amended 2026-08-24 (#233), 2026-08-24 (#241/#238), 2026-08-25 (#252),
+  2026-08-31 (#262), 2026-08-31 (#263) and 2026-09-01 (#268); see the Amendments below
 - Date: 2026-08-21
 
 ## Context
@@ -405,3 +285,141 @@ this; it asserts the parser, not the function.
   local), and the shape that fits all three is not yet visible. Extract it when a fourth site
   makes the duplication real, per the same reasoning ADR-0008 applied to a shared generator
   crate.
+
+## Amendment (2026-08-24, #233): §3's outstanding instance is settled
+
+§3's outstanding instance is settled — WireToSurface1 refuses a
+zero quantization exponent, so the two RemoteFX dequantizers now answer it alike and the
+record needs no divergence row. See §3.
+
+## Amendment (2026-08-24, #241/#238): the class this record owns has an enumeration now
+
+the class this record owns **has an enumeration now**, and
+it is a derivation rather than a list — ③ in
+[untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md). Producing
+it is what #238 turned out to be: it named eight uncovered members where the issue had named
+one, and working them found four defects (two wire-reachable). Conformance items: #211, #233,
+#238, #241.
+
+## Amendment (2026-08-25, #252): §3 derives a case outside codecs, which is evidence for the rule rather than a limit on it
+
+**§3 derives a case outside codecs, which is evidence for the
+rule rather than a limit on it.** Its sentence says *"two stages of one **codec** family"*,
+and two non-codec sites now reach for it: #253 (a Share Data header field enforced in one
+module and unenforced in another) and `justrdp::session`'s reactivation arms, which checked
+a server `Control.action` the connect leg checked and the reactivation leg did not — one PDU
+family, two answers, closed by #252. Both cite §3 as **precedent**, which is the honest
+reading of the text as written. This amendment extends the reach rather than rewriting the
+sentence, per the ADR-0002/0007 house pattern: **where two consumption sites of one family —
+codec *or* PDU — consume the same quantity, they give it the same answer, or the divergence
+is a row naming both sides.** The Consequences already claim this record *derives* its
+decisions rather than listing them; a fifth derivation outside the layer it was written
+about is what that claim predicts.
+
+## Amendment (2026-08-31, #262): §5's disjunction is not exhaustive, and the missing half is a loop rather than an expression
+
+**§5's disjunction is not exhaustive, and the missing half is
+a loop rather than an expression.** As written it offers two ways to discharge the standing
+rule — refuse what the arithmetic cannot take, or *"where the arithmetic is total for the
+whole parameter type, a comment saying so and why"*. `justrdp_codecs::color::to_rgba`
+satisfies the second **exactly**: at `width == 0` every guard is not merely total but
+*passes* (`0 * bpp` is 0, `0 * height` is 0, and `src.len() < 0` is false, so the
+source-length check succeeds rather than refusing), and the function still does not return,
+because `for out_row in 0..height` walks a bare `usize` over empty rows. A property
+generating `any::<usize>()` reaches that draw in **0.2% of cases and therefore ~44% of
+runs** — `P(width == 0) = 6/9 x 1/33`, `P(height from the unbounded arm) = 1/9`, over
+proptest's default 256 cases — which is why it was invisible until it was not, and why the
+six healthy runs on either side of a killed one proved nothing. It cost ~56.4 runner-hours
+across 10 cancelled CI jobs before anyone read a killed log. **So the totality argument §5 requires
+covers the trip count of every loop a parameter bounds, not only the arithmetic performed
+inside it** — a guard chain that validates arithmetic does not bound a loop. This is an
+extension in the ADR-0002/0007 house pattern, not a rewrite: §1–§4 are about which module owns
+a guarantee and stay as written; what moves is what §5 has to *check* before it is
+discharged. **Routing note, because the wrong record was the tempting one:** this is not
+§3. That section is titled *one **undefined** input, one answer*, and a zero extent is
+defined for every function involved — `rle::decompress` and `planar::decompress` refuse it
+as **policy** (`EmptyImage`), which is a different act from bounding a loop, and a
+divergence row naming them against `to_rgba` would report a disagreement that does not
+exist. **Nor is it the clamp this record rejects.** *Saturate or clamp at the point of use*
+is declined above under ADR-0009 §3(b) (*"silent masking is forbidden"*), and a clamp is a
+wrong answer substituted for a right one; `Ok(Vec::new())` for a zero extent is the right
+answer — `[MS-RDPEGFX]` 2.2.1.2 makes `RDPGFX_RECT16` exclusive with no non-zero
+requirement, so `right == left` is spec-legal and there is no divergence being hidden.
+That the answer agrees with FreeRDP's *caller-supplied-destination* family and diverges
+from its *allocate-and-return* family (`freerdp_glyph_convert_ex`, `color.c:265-267`,
+`return nullptr`) is deliberate and argued at the site, on what the one reachable consumer
+does with the error: `justrdp::egfx`'s uncompressed WTS1 arm propagates a `ColorError` with
+`?`, which is fatal for the channel where every other codec arm there warn-and-skips.
+See the Consequences bullet above for the second known member.
+
+## Amendment (2026-08-31, #263): §2 says which quantity to guard and is silent about which ceiling
+
+**§2 says which *quantity* to guard and is silent about
+which *ceiling* to guard it against, and the silence is load-bearing for every site in
+this class that allocates.** A guard written as `checked_mul` discharges §5 exactly — it
+is *"a validating step that refuses what the arithmetic cannot take"* — and it is not a
+bound: `Vec` refuses any request above **`isize::MAX`**, not above `usize::MAX`, so on a
+32-bit target there is a 2 GiB window where the guard returns `Some` and the allocation
+panics with *capacity overflow* inside `raw_vec`. Measured on `i686-pc-windows-msvc` with
+the `checked_mul` guard in place: `40000 x 20000 x 4` is 3_200_000_000, passed, and
+panicked. That is this record's own discharge condition being satisfied over a live
+panic, which is the strongest available form of the finding — the same shape §2 already
+records one order of magnitude smaller, where a guard written as `q > 15` diverges by one
+from where the arithmetic is undefined. **So §2 extends: the threshold is written on the
+quantity the arithmetic uses, *at the ceiling the operation that can fail enforces*.**
+`usize::MAX` is the type's ceiling and belongs to no operation. See §2 above and
+[decoder dimension overflow on 32-bit](../map/invariant/decoder-dimension-overflow-32bit.md),
+which owns the per-site adjudication and records that only `rfx` is corrected so far.
+
+**Second, and the reason this is an amendment rather than a note: totality is not the
+whole obligation, and a site can satisfy this record completely and still be the defect.**
+`justrdp_codecs::rfx::RemoteFx::decode_to_rgba` is total for its `(u16, u16)` signature
+once the refusal is written, and on **64-bit** that refusal fires on nothing at all,
+because 65535 x 65535 x 4 = 17_179_344_900 is representable. Measured: a **93-byte**
+TS_RFX tileset with `destRect = (0,0,65535,65535)` returned `Ok(Some(17_179_344_900))`
+on `x86_64-pc-windows-msvc` — 16 GiB allocated, 18.9 s, no error — and on a
+commit-constrained host `alloc_zeroed` fails, which is `handle_alloc_error` and therefore
+**`abort`**: not a `Result`, not catchable, fatal to the host process rather than to the
+RDP task. Totality is about *representability*; that failure is about *magnitude*, and no
+guard written from the parameter type can reach it. The bound has to come from a layer
+holding a defensible number — `justrdp::egfx`'s `MAX_TOTAL_SURFACE_BYTES`, which is
+derived (no admissible surface exceeds it, so no legitimate `destRect` does) rather than
+picked. **§1 is unchanged and the split is deliberate**: the codec owns totality for its
+own signature, the surface model owns magnitude, and §3's *one quantity, one answer* is
+not in play because the two are answering different questions. Recorded so a future
+reader does not take a discharged §5 argument as evidence that a consumption site is
+safe.
+
+## Amendment (2026-09-01, #268): §5's totality comment is discharged against a step, and a reader takes it as a claim about the function
+
+**§5's totality comment is discharged against a *step*, and a
+reader takes it as a claim about the *function*.** The #263 Amendment above records that a
+discharged §5 argument is not a safety claim, and gives two reasons the rule cannot see —
+a threshold sized against a type, and a hazard about magnitude. This is a third and it is
+cheaper than either: the argument can be **entirely true** and still not be about the thing
+that fails. `justrdp::egfx`'s `Surface::extract` carried exactly the comment §5 asks for —
+*the first two statements clip `w`/`h` to this surface's own dimensions before any multiply,
+so the reserve is bounded by a buffer that already exists*. True, and about the multiply.
+Clipping `w` does not clip `x`, so at `x > self.width` the extent goes to zero, the row loop
+still runs, and `&self.rgba[off..off]` panics on a slice whose **start** is past the end.
+Reached from the wire through `SURFACE_TO_SURFACE` and `SURFACE_TO_CACHE` on an ordinary
+1920x1080 surface: `left == 1920` is `Ok` and `left == 1921` panics. **So §5 gains a
+qualifier rather than a clause** — where the totality argument is a comment, it names the
+step it covers, because a comment that reads as covering the function is how a §5 discharge
+stops being re-checked. **Two of §1's three grounds hold and the third does not**, which
+is worth saying because the one that fails is the one that usually carries this record:
+`extract` is **private**, so *"the functions are public"* does not apply. The other two do —
+the constraint is established in `justrdp-pdu` (`Rect16`) and consumed in `justrdp` across a
+crate boundary, and the value the indexing uses (`off`) is *derived* from `x` rather than
+being `x`. Both call sites pass `src_rect.left` / `src_rect.top` unclamped, so reachability
+is **yes** and, per §1, that sets the priority and never the contract.
+
+**A Consequences clause above was false when it was written, and is true now.** The #262
+bullet ends *"every other loop in the codec and framebuffer paths is either `u16`-derived or
+guarded before the loop (`framebuffer::blit`, `egfx`'s surface ops)"*. The disjunction holds
+— `extract`'s loop **is** `u16`-derived and terminates — but the parenthetical cites
+`egfx`'s surface ops as a family that was guarded before the loop, and one of the four was
+not. It is the identical failure the code comment made, one document up: a claim checked at
+some members, written about the set. Corrected by the change rather than by this record, and
+left standing with this note attached per the ADR-0002/0007 house pattern. §1–§5 are
+unaffected.

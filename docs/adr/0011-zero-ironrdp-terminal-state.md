@@ -1,177 +1,7 @@
 # 0011 — Zero `ironrdp` is the terminal state: the oracle is scaffolding, not a permanent dependency
 
-- Status: Accepted (conformance items #225)
+- Status: Accepted (conformance items #225) — amended 2026-08-13 (#194), 2026-08-18 (#168), 2026-08-18 (#169), 2026-08-19 (#171), 2026-08-19 (#172), 2026-08-19 (#189) and 2026-08-26 (#225); see the Amendments below
 - Date: 2026-08-10
-- **Amendment (2026-08-13, #194): the basis exists, and the oracle is less capable than this
-  record assumed.** Progressive's owned basis landed — a 52-payload real-server corpus
-  (`justrdp-codecs/tests/fixtures/progressive/`) plus FreeRDP-derived SRL expectations
-  (`tests/progressive_srl_freerdp.rs`), each defect pinned by a canary. Two corrections to the
-  Context below, both measured. **(a)** The oracle decodes **2 of 52** payloads, not "rejects
-  the first frame" — and a *fourth* defect is the larger cause: it demands a `WBT_CONTEXT`
-  block per `codecContextId`, while this server sends one such block ever and then rotates
-  through 24 ids. FreeRDP imposes no such requirement (`progressive.c:2129`, `:314`). The two
-  failures are independent; skipping the sentinel payload does not save the rest. **(b)** The
-  premise that a real-server SRL vector might be unobtainable was **false**, and the cause was
-  ours: the capture advertised `connectionType = LAN`, so the server sent full quality on the
-  first pass and never refined. Advertising `MODEM` yields 3250 upgrade tiles. Promoted to
-  [`capture-coverage-follows-what-we-advertise`](../map/invariant/capture-coverage-follows-what-we-advertise.md).
-  The Decision is unchanged; the oracle dev-dependency stays until the self-owned decoder
-  exists (#171) and is live (#172), and the canaries are what use it.
-- **Amendment (2026-08-18, #168): the oracle's reach extended into the owned basis itself.**
-  Slice 2 measured a **fifth** oracle divergence — its SRL state starts at `kp = 0` where
-  FreeRDP's starts at `8` (`progressive.c:1272`, unchanged since 2.11.7), so the two
-  desynchronise on the first symbol of every component, ahead of the three divergences #194
-  named. The finding that matters for *this* record is where it was found: five of the eight
-  hand-derived FreeRDP vectors had themselves been computed at `kp = 0` — the oracle's initial
-  value, though FreeRDP's own `WINPR_C_ARRAY_INIT` declaration predicts the same mistake, and
-  the evidence does not separate the two. So this is **not** recorded as the oracle having
-  shaped the basis; it is recorded as the basis having been derived from a range too narrow to
-  contain the state it depended on. The Decision is unchanged, and the honest strengthening is
-  narrower than it first looked: the owned basis was wrong on its first attempt, which is an
-  argument for scheduling the oracle's removal rather than for trusting either instrument.
-  Promoted to
-  [`oracle-agreement-is-not-independence`](../map/invariant/oracle-agreement-is-not-independence.md)
-  as a third violation shape.
-- **Amendment (2026-08-18, #169): two more divergences, both in the first pass, and neither
-  one the oracle could be patched out of.** Slice 3 measured a **sixth** and **seventh**:
-  (6) the oracle captures the DAS sign array *after* dequantization
-  (`progressive.rs:84`) where FreeRDP captures it off the raw entropy output
-  (`progressive.c:876`) — measured over the corpus, the two capture points disagree on **8369
-  of 8829** real components, because the LL3 delta reconstruction runs between them, and the
-  error is permanent rather than per-frame because the sign array routes every later
-  refinement of that coefficient; (7) the oracle's `dwt_extrapolate` narrows every lifting tap
-  with `value as i16` where FreeRDP saturates (`clampi16`), so on an overflowing tap the two
-  differ by a full `u16`.
-  Two things follow for this record. First, the count is now seven, spread across the parse,
-  the entropy layer, the first pass and the transform — the oracle is not defective at a point
-  but at every layer of this codec, which is what makes "fix it upstream" (rejected
-  alternative B) unavailable rather than merely unattractive. Second, and more useful: **one
-  oracle primitive survived and is still in use.** `dwt_extrapolate` is a self-contained
-  transform with no stream state, and it agrees coefficient-for-coefficient wherever the
-  narrowing seam is unreachable, which is what makes it a usable ADR-0007 stage-boundary
-  cross-check. Retirement stays *per codec and per stage*, on evidence — that is the Decision
-  working, not an exception to it.
-- **Amendment (2026-08-19, #171): the self-owned decoder exists, and the basis proved something
-  the oracle structurally could not.** Slice 5 assembled the pipeline
-  (`justrdp_codecs::rfx::progressive::Progressive`) and gated it on the owned basis this record
-  requires — the 52-payload corpus plus FreeRDP-derived expectations — with a fresh real-VM run
-  as the round-trip (**0 tiles skipped, 0 failures**, over 862 tiles the server sent that day).
-  Two things belong on this record rather than only in the issue.
-  **(a) The oracle is not merely unable to decode this traffic; on the assembly layer it is on
-  the wrong side of a picture-changing question.** `ironrdp-graphics::progressive` returns whole
-  64 x 64 tiles and never clips them to the region's rects; FreeRDP clips (`update_tiles`,
-  `progressive.c:2329-2412`). Measured over the corpus, the two policies leave **57 386 of a
-  1 280 x 800 surface's 1 024 000 pixels different**. So a differential against the oracle would
-  not merely have been *unmeetable* here — passing it would have required painting the wrong
-  picture, which is a stronger statement than the Context below makes and the one that
-  retroactively justifies rejecting alternative (B).
-  **(b) The owned basis found something no oracle diff could have.** The corpus carries no
-  expected pixels, so the decisive instrument was a *counterfactual* — replaying the same bytes
-  under both policies and diffing the surfaces. That is only available to a basis you own; a
-  differential can compare two implementations but cannot price one implementation's own
-  alternative. Recorded because "the owned basis is weaker than a diff, just necessary" is the
-  easy reading of this record, and this is a case where it was strictly stronger.
-  The Decision is unchanged. The dev-dependency now supports only the canaries and the
-  `dwt_extrapolate` stage cross-check; the **runtime** dependency for Progressive dropped in
-  #172 (2026-08-19 amendment), which was wiring rather than decoding.
-- **Amendment (2026-08-19, #172): Progressive's runtime delegation is gone, and the wiring
-  falsified one of epic #158's own recorded premises.** The self-owned decoder is the live
-  WireToSurface2 decoder; `ironrdp-graphics` now serves Progressive only as a dev-dependency
-  for the canaries and the `dwt_extrapolate` stage cross-check. The runtime graph still holds
-  it for **zgfx alone** (#189). Two things worth keeping off the PR body: the epic recorded
-  that `Surface::blit` "cannot express a source offset" and that this slice would have to widen
-  it — **measured false**, because the blit's slice start and its stride are independent
-  parameters, so a source offset is a slice rather than a signature change; and the swap
-  *removes* the per-tile `Vec<u8>` the bootstrap wrapper allocated, 6193 x 16 KiB over one
-  captured session, which is the frame path's no-owned-pixels invariant reaching one stage
-  further up than it had.
-- **Amendment (2026-08-19, #189): the runtime half of this record is done, and the reason it
-  mattered turned out to be broader than correctness.** zgfx is self-owned
-  (`justrdp_codecs::zgfx`), the `egfx-bootstrap` feature is deleted, and
-  `cargo tree -p justrdp-tokio -e normal` names **no `ironrdp` crate at all** — the Decision's
-  point 1 reached, and the graph is `justrdp → { rustls, sspi }` as ADR-0002 §Notes wrote it.
-  Three things belong on the record.
-  **(a) A runtime delegation exports the robustness posture too, and no oracle diff measures
-  that.** This record's Context is about the oracle being *wrong*; for zgfx it is not wrong —
-  it decodes everything its own compressor emits, and the differential in
-  `tests/differential_zgfx.rs` passes over sequences. What it *was* is unguarded: probed
-  directly, **five of seven** crafted `RDP_SEGMENTED_DATA` messages panicked inside
-  `ironrdp_graphics::zgfx` (`mid > len` from a `split_at` on an untrusted `u32`, `attempt to
-  subtract with overflow` from `8 * (len - 1) - last_byte`, and three bit-cursor index
-  panics), and the panic reached `justrdp::egfx::GraphicsProcessor::process` — the live path,
-  because this decompressor sees every EGFX byte before the PDU parser does. That gap was
-  **structural, not an oversight**: the fuzz roster derives from `ls fuzz/fuzz_targets/` and
-  the no-panic properties live in this repo's own modules, so a delegated decode path cannot
-  appear in either by construction. Retiring a delegation is therefore worth doing even where
-  the delegate is *correct*.
-  **(b) zgfx did not need an owned basis in Progressive's sense, and got one anyway.** The
-  `[MS-RDPEGFX]` sample is reproduced byte-identically by FreeRDP
-  (`libfreerdp/codec/test/TestFreeRDPCodecZGfx.c`, *"Sample from [MS-RDPEGFX]"*) and by
-  `ironrdp-graphics`, so an expectation derived independently of both implementations was
-  available for the asking — and its compressed segment matches at distance 31 back into an
-  *earlier segment*, which is the cross-message history contract in one vector. The oracle
-  keeps its dev-dependency role here as breadth, which is what point 3 of the Decision
-  intends.
-  **(c) The coverage ceiling, measured rather than assumed.** Instrumented against the VM for
-  one session: **25 messages, every one `ZGFX_SEGMENTED_SINGLE` and every one
-  `PACKET_COMPRESSED`** — 18 488 literal tokens, 19 024 matches, 7 unencoded runs, longest
-  match 5 062 bytes, **longest distance 133 937**, which is past a single segment's 65 535
-  ceiling and so is direct evidence of the window spanning messages on a real wire. The
-  multipart descriptor `0xE1` **never appeared**; its proof is the spec vector and the
-  oracle differential, not the VM.
-- **Amendment (2026-08-26, #225): the condition in Decision 2 cannot reach zero as written, and
-  this record's own Consequences assert a distribution that never happened.** #225 asked what the
-  development half's exit condition is now that the runtime half has closed. The measured answer is
-  worse than *"there is none"*: there **is** one, and it is falsified on all three of its own worked
-  examples.
-  **(a) Every surface that meets the condition still holds the dependency, and the amendments above
-  already say why.** Progressive meets it (#171/#194) — the 2026-08-19/#171 amendment: *"The
-  dev-dependency now supports only the canaries and the `dwt_extrapolate` stage cross-check."* zgfx
-  meets it (#189) — *"keeps its dev-dependency role here as breadth."* ClearCodec meets it (#127)
-  and `justrdp-codecs/tests/clearcodec_corpus.rs:107` still requires `oracle_rejections > 0`. The
-  structural reason is one sentence: **a canary's subject is the oracle's own defect**, so *"this
-  codec's correctness rests on a basis we own"* is its **precondition, not its exit** — the canary
-  exists precisely because the owned basis and the oracle disagree. Measured, **six** such tests
-  across four files: `differential_rfx.rs:328`, `progressive_corpus.rs:261` and `:294`,
-  `progressive_srl_freerdp.rs:389` and `:431`, `clearcodec_corpus.rs:107`. They retire by deletion,
-  never by satisfaction.
-  **(b) The Consequences below claim a distributed obligation that does not exist.** *"Each codec's
-  issue states which basis retires its oracle"* is false as written. #194 — the worked example
-  Decision 2 itself names — says the opposite: *"**Keep the oracle as a cross-check where it
-  agrees**, not as the exit criterion."* #127, #189, and all seven of #158's children state none.
-  This is the mirror of [ADR-0004](0004-sspi-contribute-and-bridge.md)'s own amendment, and
-  the harder direction of it: a record asserting an obligation **was** distributed reads as the
-  evidence that it was, so nothing prompts the check.
-  **(c) The corrected rule is keyed on role, not on codec, because the role decides the exit
-  mechanism.** Decision 2 describes one mechanism; there are five.
-
-  | Role | How it exits | Sites today |
-  |---|---|---|
-  | **R1 verifier** — the differential itself | Decision 2 as written: an owned basis, then drop. **Except** where an amendment above keeps it as *breadth* over an input space the basis cannot span (zgfx, #189) | the `differential_*` tests · `clearcodec_corpus.rs` · `justrdp-tokio/src/lib.rs:2315`, `:2330` |
-  | **R2 generator** — `ironrdp` *encodes* what we then decode | **we write the encoder.** No corpus retires this: a corpus supplies streams a server sent, and these tests need streams a server never sends. `differential_rfx.rs:14-16` states the trap in its own header — *"synthetic streams are the corpus"*, generated by the instrument that then grades them | `clearcodec.rs:965` · `differential_rfx.rs:18-22` · `differential_pointer_ironrdp.rs:11-12` · `connect.rs:1251-1255` |
-  | **R3 acceptance** — *their* decoder eats *our* bytes | a committed real-server capture, or the VM run. Decision 2 does not reach it at all: there is no codec, and no *"our correctness"* to rest on a basis | `connect.rs:1897`, `:1904`, `:1947` |
-  | **R4 canary** — the subject is the oracle's own defect | **deletion**, with the last R1 holder in that crate. Each is also a *scheduled* CI red on an upstream fix, and the instruction for that day lives only in the assertion message | the six in (a) |
-  | **R5 stage-boundary math** (ADR-0007) | with the last R1/R4 holder, never before — the 2026-08-18/#169 amendment keeps it explicitly (*"one oracle primitive survived and is still in use"*) | `differential_progressive_stages.rs:110` |
-
-  **(d) "Zero `ironrdp` crates" is four crates, not two.** `Cargo.lock` names `ironrdp-core`,
-  `ironrdp-error`, `ironrdp-graphics` and `ironrdp-pdu`; #225's table counts the two **direct**
-  dev-dependencies. The Decision's wording is the lock's reading, and the two transitive crates
-  leave with the two direct ones — recorded so a future audit does not read a green
-  `cargo tree --depth 1` as the terminal state.
-  **(e) What this does not change.** *"No new tracker structure is created by this record"* stands.
-  #225's option (a) — an epic with per-surface children — was declined, and **not** on its stated
-  cost: that objection was measured false, since #158's seven children (#167–#172, #194) are all
-  closed, as is #158. It was declined because a per-surface roster keyed on *"does an owned basis
-  exist"* would report three surfaces ready on its first day, per (a) above. The roster is
-  **derived, not stored** — the manifests, plus
-  `grep -rln "ironrdp_[a-z]*::\|use ironrdp" --include=*.rs crates/` (15 files today). A bare
-  `ironrdp` grep over-counts: `progressive_assembly_corpus.rs`, `progressive_multipass_corpus.rs`
-  and `real_server_connect.rs` name it only in prose. Conformance items go on the Status line
-  above, the pattern [ADR-0012](0012-consumption-site-totality.md) already runs.
-  **How this was decided, and which half is reversible by whom.** (a)–(d) are **derivations** and
-  fall to a better derivation. The tracking shape in (e) is the maintainer's **product judgement**,
-  taken 2026-08-26 after being shown all four options with the measurements above — including the
-  one that removed (a)'s stated cost — and reversing it is theirs.
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
 
@@ -234,8 +64,14 @@ dependency graph — runtime *and* development.**
    amendment already requires for the assembly layer. #194 defines that basis for Progressive
    and is the worked example.
 3. **The oracle never outranks the owned basis.** Where the oracle and a real-server corpus
-   disagree, the corpus wins; where the oracle and FreeRDP disagree, the tie-breaker in
-   [`docs/agents/thegraph.md`](../agents/thegraph.md) already names FreeRDP. This decision adds
+   disagree, the corpus wins; where the oracle and FreeRDP disagree, ~~the tie-breaker in
+   [`docs/agents/thegraph.md`](../agents/thegraph.md) already names FreeRDP~~ **— the pointer
+   went dangling on 2026-09-04 and the ranking now has a record of its own.** `thegraph.md`
+   was cut to the five outside sources and its one-sentence tie-breaker was dropped; it names
+   FreeRDP today only as an `example`-binding source, which is not a ranking. The three-level
+   authority — owned basis, then the differential oracle, with FreeRDP as the tie-break — is
+   stated in [ADR-0003's Amendment](0003-phased-codecs-differential-oracle.md) (2026-09-04),
+   which this clause narrows rather than restates. This decision adds
    only that a green oracle diff is **not** by itself an exit criterion once an owned basis
    exists for that codec.
 4. **`rustls` and `sspi` are unaffected.** They are security-critical, non-RDP-specific leaf
@@ -295,3 +131,187 @@ coherent, not why it is compelled.
 - **(D) Record this in the issue tracker only.** Rejected — and it is what prompted this record.
   #194 states the consequence for one codec; the position it follows from spans ADR-0002,
   ADR-0003 and ADR-0007, and an issue structurally cannot hold a rule that spans decisions.
+
+## Amendment (2026-08-13, #194): the basis exists, and the oracle is less capable than this record assumed
+
+Progressive's owned basis landed — a 52-payload real-server corpus
+(`justrdp-codecs/tests/fixtures/progressive/`) plus FreeRDP-derived SRL expectations
+(`tests/progressive_srl_freerdp.rs`), each defect pinned by a canary. Two corrections to the
+Context above, both measured. **(a)** The oracle decodes **2 of 52** payloads, not "rejects
+the first frame" — and a *fourth* defect is the larger cause: it demands a `WBT_CONTEXT`
+block per `codecContextId`, while this server sends one such block ever and then rotates
+through 24 ids. FreeRDP imposes no such requirement (`progressive.c:2129`, `:314`). The two
+failures are independent; skipping the sentinel payload does not save the rest. **(b)** The
+premise that a real-server SRL vector might be unobtainable was **false**, and the cause was
+ours: the capture advertised `connectionType = LAN`, so the server sent full quality on the
+first pass and never refined. Advertising `MODEM` yields 3250 upgrade tiles. Promoted to
+[`capture-coverage-follows-what-we-advertise`](../map/invariant/capture-coverage-follows-what-we-advertise.md).
+The Decision is unchanged; the oracle dev-dependency stays until the self-owned decoder
+exists (#171) and is live (#172), and the canaries are what use it.
+
+## Amendment (2026-08-18, #168): the oracle's reach extended into the owned basis itself
+
+Slice 2 measured a **fifth** oracle divergence — its SRL state starts at `kp = 0` where
+FreeRDP's starts at `8` (`progressive.c:1272`, unchanged since 2.11.7), so the two
+desynchronise on the first symbol of every component, ahead of the three divergences #194
+named. The finding that matters for *this* record is where it was found: five of the eight
+hand-derived FreeRDP vectors had themselves been computed at `kp = 0` — the oracle's initial
+value, though FreeRDP's own `WINPR_C_ARRAY_INIT` declaration predicts the same mistake, and
+the evidence does not separate the two. So this is **not** recorded as the oracle having
+shaped the basis; it is recorded as the basis having been derived from a range too narrow to
+contain the state it depended on. The Decision is unchanged, and the honest strengthening is
+narrower than it first looked: the owned basis was wrong on its first attempt, which is an
+argument for scheduling the oracle's removal rather than for trusting either instrument.
+Promoted to
+[`oracle-agreement-is-not-independence`](../map/invariant/oracle-agreement-is-not-independence.md)
+as a third violation shape.
+
+## Amendment (2026-08-18, #169): two more divergences, both in the first pass, and neither one the oracle could be patched out of
+
+Slice 3 measured a **sixth** and **seventh**:
+(6) the oracle captures the DAS sign array *after* dequantization
+(`progressive.rs:84`) where FreeRDP captures it off the raw entropy output
+(`progressive.c:876`) — measured over the corpus, the two capture points disagree on **8369
+of 8829** real components, because the LL3 delta reconstruction runs between them, and the
+error is permanent rather than per-frame because the sign array routes every later
+refinement of that coefficient; (7) the oracle's `dwt_extrapolate` narrows every lifting tap
+with `value as i16` where FreeRDP saturates (`clampi16`), so on an overflowing tap the two
+differ by a full `u16`.
+Two things follow for this record. First, the count is now seven, spread across the parse,
+the entropy layer, the first pass and the transform — the oracle is not defective at a point
+but at every layer of this codec, which is what makes "fix it upstream" (rejected
+alternative B) unavailable rather than merely unattractive. Second, and more useful: **one
+oracle primitive survived and is still in use.** `dwt_extrapolate` is a self-contained
+transform with no stream state, and it agrees coefficient-for-coefficient wherever the
+narrowing seam is unreachable, which is what makes it a usable ADR-0007 stage-boundary
+cross-check. Retirement stays *per codec and per stage*, on evidence — that is the Decision
+working, not an exception to it.
+
+## Amendment (2026-08-19, #171): the self-owned decoder exists, and the basis proved something the oracle structurally could not
+
+Slice 5 assembled the pipeline
+(`justrdp_codecs::rfx::progressive::Progressive`) and gated it on the owned basis this record
+requires — the 52-payload corpus plus FreeRDP-derived expectations — with a fresh real-VM run
+as the round-trip (**0 tiles skipped, 0 failures**, over 862 tiles the server sent that day).
+Two things belong on this record rather than only in the issue.
+**(a) The oracle is not merely unable to decode this traffic; on the assembly layer it is on
+the wrong side of a picture-changing question.** `ironrdp-graphics::progressive` returns whole
+64 x 64 tiles and never clips them to the region's rects; FreeRDP clips (`update_tiles`,
+`progressive.c:2329-2412`). Measured over the corpus, the two policies leave **57 386 of a
+1 280 x 800 surface's 1 024 000 pixels different**. So a differential against the oracle would
+not merely have been *unmeetable* here — passing it would have required painting the wrong
+picture, which is a stronger statement than the Context above makes and the one that
+retroactively justifies rejecting alternative (B).
+**(b) The owned basis found something no oracle diff could have.** The corpus carries no
+expected pixels, so the decisive instrument was a *counterfactual* — replaying the same bytes
+under both policies and diffing the surfaces. That is only available to a basis you own; a
+differential can compare two implementations but cannot price one implementation's own
+alternative. Recorded because "the owned basis is weaker than a diff, just necessary" is the
+easy reading of this record, and this is a case where it was strictly stronger.
+The Decision is unchanged. The dev-dependency now supports only the canaries and the
+`dwt_extrapolate` stage cross-check; the **runtime** dependency for Progressive dropped in
+#172 (2026-08-19 amendment), which was wiring rather than decoding.
+
+## Amendment (2026-08-19, #172): Progressive's runtime delegation is gone, and the wiring falsified one of epic #158's own recorded premises
+
+The self-owned decoder is the live
+WireToSurface2 decoder; `ironrdp-graphics` now serves Progressive only as a dev-dependency
+for the canaries and the `dwt_extrapolate` stage cross-check. The runtime graph still holds
+it for **zgfx alone** (#189). Two things worth keeping off the PR body: the epic recorded
+that `Surface::blit` "cannot express a source offset" and that this slice would have to widen
+it — **measured false**, because the blit's slice start and its stride are independent
+parameters, so a source offset is a slice rather than a signature change; and the swap
+*removes* the per-tile `Vec<u8>` the bootstrap wrapper allocated, 6193 x 16 KiB over one
+captured session, which is the frame path's no-owned-pixels invariant reaching one stage
+further up than it had.
+
+## Amendment (2026-08-19, #189): the runtime half of this record is done, and the reason it mattered turned out to be broader than correctness
+
+zgfx is self-owned
+(`justrdp_codecs::zgfx`), the `egfx-bootstrap` feature is deleted, and
+`cargo tree -p justrdp-tokio -e normal` names **no `ironrdp` crate at all** — the Decision's
+point 1 reached, and the graph is `justrdp → { rustls, sspi }` as ADR-0002 §Notes wrote it.
+Three things belong on the record.
+**(a) A runtime delegation exports the robustness posture too, and no oracle diff measures
+that.** This record's Context is about the oracle being *wrong*; for zgfx it is not wrong —
+it decodes everything its own compressor emits, and the differential in
+`tests/differential_zgfx.rs` passes over sequences. What it *was* is unguarded: probed
+directly, **five of seven** crafted `RDP_SEGMENTED_DATA` messages panicked inside
+`ironrdp_graphics::zgfx` (`mid > len` from a `split_at` on an untrusted `u32`, `attempt to
+subtract with overflow` from `8 * (len - 1) - last_byte`, and three bit-cursor index
+panics), and the panic reached `justrdp::egfx::GraphicsProcessor::process` — the live path,
+because this decompressor sees every EGFX byte before the PDU parser does. That gap was
+**structural, not an oversight**: the fuzz roster derives from `ls fuzz/fuzz_targets/` and
+the no-panic properties live in this repo's own modules, so a delegated decode path cannot
+appear in either by construction. Retiring a delegation is therefore worth doing even where
+the delegate is *correct*.
+**(b) zgfx did not need an owned basis in Progressive's sense, and got one anyway.** The
+`[MS-RDPEGFX]` sample is reproduced byte-identically by FreeRDP
+(`libfreerdp/codec/test/TestFreeRDPCodecZGfx.c`, *"Sample from [MS-RDPEGFX]"*) and by
+`ironrdp-graphics`, so an expectation derived independently of both implementations was
+available for the asking — and its compressed segment matches at distance 31 back into an
+*earlier segment*, which is the cross-message history contract in one vector. The oracle
+keeps its dev-dependency role here as breadth, which is what point 3 of the Decision
+intends.
+**(c) The coverage ceiling, measured rather than assumed.** Instrumented against the VM for
+one session: **25 messages, every one `ZGFX_SEGMENTED_SINGLE` and every one
+`PACKET_COMPRESSED`** — 18 488 literal tokens, 19 024 matches, 7 unencoded runs, longest
+match 5 062 bytes, **longest distance 133 937**, which is past a single segment's 65 535
+ceiling and so is direct evidence of the window spanning messages on a real wire. The
+multipart descriptor `0xE1` **never appeared**; its proof is the spec vector and the
+oracle differential, not the VM.
+
+## Amendment (2026-08-26, #225): the condition in Decision 2 cannot reach zero as written, and this record's own Consequences assert a distribution that never happened
+
+#225 asked what the
+development half's exit condition is now that the runtime half has closed. The measured answer is
+worse than *"there is none"*: there **is** one, and it is falsified on all three of its own worked
+examples.
+**(a) Every surface that meets the condition still holds the dependency, and the amendments above
+already say why.** Progressive meets it (#171/#194) — the 2026-08-19/#171 amendment: *"The
+dev-dependency now supports only the canaries and the `dwt_extrapolate` stage cross-check."* zgfx
+meets it (#189) — *"keeps its dev-dependency role here as breadth."* ClearCodec meets it (#127)
+and `justrdp-codecs/tests/clearcodec_corpus.rs:107` still requires `oracle_rejections > 0`. The
+structural reason is one sentence: **a canary's subject is the oracle's own defect**, so *"this
+codec's correctness rests on a basis we own"* is its **precondition, not its exit** — the canary
+exists precisely because the owned basis and the oracle disagree. Measured, **six** such tests
+across four files: `differential_rfx.rs:328`, `progressive_corpus.rs:261` and `:294`,
+`progressive_srl_freerdp.rs:389` and `:431`, `clearcodec_corpus.rs:107`. They retire by deletion,
+never by satisfaction.
+**(b) The Consequences above claim a distributed obligation that does not exist.** *"Each codec's
+issue states which basis retires its oracle"* is false as written. #194 — the worked example
+Decision 2 itself names — says the opposite: *"**Keep the oracle as a cross-check where it
+agrees**, not as the exit criterion."* #127, #189, and all seven of #158's children state none.
+This is the mirror of [ADR-0004](0004-sspi-contribute-and-bridge.md)'s own amendment, and
+the harder direction of it: a record asserting an obligation **was** distributed reads as the
+evidence that it was, so nothing prompts the check.
+**(c) The corrected rule is keyed on role, not on codec, because the role decides the exit
+mechanism.** Decision 2 describes one mechanism; there are five.
+
+| Role | How it exits | Sites today |
+|---|---|---|
+| **R1 verifier** — the differential itself | Decision 2 as written: an owned basis, then drop. **Except** where an amendment above keeps it as *breadth* over an input space the basis cannot span (zgfx, #189) | the `differential_*` tests · `clearcodec_corpus.rs` · `justrdp-tokio/src/lib.rs:2315`, `:2330` |
+| **R2 generator** — `ironrdp` *encodes* what we then decode | **we write the encoder.** No corpus retires this: a corpus supplies streams a server sent, and these tests need streams a server never sends. `differential_rfx.rs:14-16` states the trap in its own header — *"synthetic streams are the corpus"*, generated by the instrument that then grades them | `clearcodec.rs:965` · `differential_rfx.rs:18-22` · `differential_pointer_ironrdp.rs:11-12` · `connect.rs:1251-1255` |
+| **R3 acceptance** — *their* decoder eats *our* bytes | a committed real-server capture, or the VM run. Decision 2 does not reach it at all: there is no codec, and no *"our correctness"* to rest on a basis | `connect.rs:1897`, `:1904`, `:1947` |
+| **R4 canary** — the subject is the oracle's own defect | **deletion**, with the last R1 holder in that crate. Each is also a *scheduled* CI red on an upstream fix, and the instruction for that day lives only in the assertion message | the six in (a) |
+| **R5 stage-boundary math** (ADR-0007) | with the last R1/R4 holder, never before — the 2026-08-18/#169 amendment keeps it explicitly (*"one oracle primitive survived and is still in use"*) | `differential_progressive_stages.rs:110` |
+
+**(d) "Zero `ironrdp` crates" is four crates, not two.** `Cargo.lock` names `ironrdp-core`,
+`ironrdp-error`, `ironrdp-graphics` and `ironrdp-pdu`; #225's table counts the two **direct**
+dev-dependencies. The Decision's wording is the lock's reading, and the two transitive crates
+leave with the two direct ones — recorded so a future audit does not read a green
+`cargo tree --depth 1` as the terminal state.
+**(e) What this does not change.** *"No new tracker structure is created by this record"* stands.
+#225's option (a) — an epic with per-surface children — was declined, and **not** on its stated
+cost: that objection was measured false, since #158's seven children (#167–#172, #194) are all
+closed, as is #158. It was declined because a per-surface roster keyed on *"does an owned basis
+exist"* would report three surfaces ready on its first day, per (a) above. The roster is
+**derived, not stored** — the manifests, plus
+`grep -rln "ironrdp_[a-z]*::\|use ironrdp" --include=*.rs crates/` (15 files today). A bare
+`ironrdp` grep over-counts: `progressive_assembly_corpus.rs`, `progressive_multipass_corpus.rs`
+and `real_server_connect.rs` name it only in prose. Conformance items go on the Status line
+above, the pattern [ADR-0012](0012-consumption-site-totality.md) already runs.
+**How this was decided, and which half is reversible by whom.** (a)–(d) are **derivations** and
+fall to a better derivation. The tracking shape in (e) is the maintainer's **product judgement**,
+taken 2026-08-26 after being shown all four options with the measurements above — including the
+one that removed (a)'s stated cost — and reversing it is theirs.

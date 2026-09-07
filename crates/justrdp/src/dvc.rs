@@ -40,7 +40,7 @@ const MAX_OPEN_CHANNELS_PER_PROCESSOR: usize = 4;
 /// A dynamic-channel endpoint: one implementation per channel the client supports
 /// (Display Control today; EGFX and friends in their slices). The manager handles transport —
 /// processors receive only complete, reassembled messages.
-pub(crate) trait DvcProcessor {
+pub trait DvcProcessor {
     /// The channel name the server's Create Request must match.
     fn channel_name(&self) -> &'static str;
     /// Called when the server created the channel (after the accepting Create Response is
@@ -62,7 +62,7 @@ pub(crate) trait DvcProcessor {
 
 /// What a [`DvcProcessor`] wants done, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProcessorOutput {
+pub enum ProcessorOutput {
     /// A complete channel message to send (the manager fragments it into DVC data PDUs).
     Send(Vec<u8>),
     /// Display Control: the server's caps arrived — resize requests are valid now.

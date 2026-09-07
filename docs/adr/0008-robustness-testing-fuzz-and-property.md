@@ -1,53 +1,6 @@
 # 0008 — Robustness testing for untrusted-input parsers: property tests + fuzzing
 
-- Status: Accepted (issue #97; first property implemented for the RLE decoder — issue #98)
-- Amended: 2026-06-19 — #98 landed the no-panic property for **all** untrusted-input decoders (not just RLE), and #99 landed the `fuzz/` CI lane; the inline notes below are updated to the as-built state.
-- Amended: 2026-08-21 — the 2026-06-19 amendment's *"all decoders"* was a **module** claim reported as an entry-point one, and #230 measured the gap. See the corrected Consequences bullet below. (The first attempt at this amendment retracted the wrong sentence — the lane/property correspondence it deleted as false is true in every row; recorded because a correction that misses is worse than the claim it was aimed at.)
-- Amended: 2026-08-24 (#241/#238) — **the obligation is not scoped by crate.** The Context below named `justrdp-pdu` and `justrdp-codecs`, and the census in [untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md) had encoded that as `rg --files crates/justrdp-pdu/src`, so a parser in the core crate was invisible to it by construction rather than by oversight (`tls::extract_subject_public_key`, #241) — as was the whole *consumption-site* class the byte-scoped wording could not describe (ADR-0012's, #238). Both derivations are widened in that note, and `justrdp` now carries `proptest` and a fuzz target for the first time. Working the resulting list turned up four defects, two of them wire-reachable; the enumeration is in the note, not here, for the reason the 2026-08-21 amendment gives.
-- Amended: 2026-08-31 (#262) — **this record's most load-bearing prediction came true, and the
-  lane it named as the answer does not cover the class it came true in.** §2 says *"`proptest`
-  has no per-case timeout; an infinite loop hangs the test run rather than failing it"*, and the
-  Consequences call that gap *"exactly the fuzz lane's mandate"*. Measured: a `justrdp-codecs`
-  no-panic property hung on ~43% of seeds and cost **~56.4 runner-hours across 10 cancelled CI
-  jobs** — and `color::to_rgba` has no fuzz target, because it is an ADR-0012 consumption site
-  rather than a decoder, and that whole class has none. So the sentence is right about proptest
-  and over-claims about the coverage. What actually bounds the class is neither lane: every job
-  in all five workflows now carries `timeout-minutes`, where none did before and GitHub's
-  360-minute default applied. See the corrected Consequences bullet below.
-- Amended: 2026-08-31 (#263) — **the Strategy design rule's worked example is false, and it
-  propagated verbatim to ten artifacts before anything measured it.** The rule says a wire
-  header field is *"bounded in the generator to its **real range**"*, which is right; the
-  example then bounds `width`/`height` on the ground that *"leaving them unbounded would
-  manufacture OOM/overflow 'failures' that no real server could trigger"*, and **that clause is
-  the one that failed**. A server picks a `RDPGFX_RECT16` freely — `[MS-RDPEGFX]` 2.2.1.2
-  bounds it at `u16` and states no maximum, 2.2.2.1 makes it the bitmap's own dimensions — so
-  65535 is the real range, the resulting `65535 × 65535 × 4` is 17_179_344_900, and the failure
-  it produces is a **live defect**, not a test artifact: measured, a 93-byte tileset panicked on
-  `i686-pc-windows-msvc` and allocated 16 GiB on `x86_64` in 18.9 s.
-
-  Two distinct errors travelled together, and separating them is the point of recording this.
-  **(a) "Real range" was read as "a comfortable number."** Every artifact derived from this
-  example bounds a `u16` field at `u8` or `0..=128`, which is not the field's range by three
-  orders of magnitude. **(b) Several copies added *"never the stream"*, which is a
-  contradiction** — a `TS_BITMAP_DATA` header field, an EGFX wire field and a
-  `TS_*POINTERATTRIBUTE` header field *are* the stream. Nobody re-read either clause for two
-  years of artifacts; #263's proptest was green over a live 32-bit overflow because of it.
-
-  **So the rule extends rather than moves:** bound a generator to the field's **declared type**,
-  and where a smaller bound is kept, keep it *as a stated budget trade* (fuzzer bytes, proptest
-  runtime) with a weighted arm at the full type range so the reject branch stays driven — the
-  shape #230 settled for `pointer` and #263 applied to `rfx`. That makes three recorded ways a
-  generator can make a green mean nothing, and they are different bugs: **#211** bounded to what
-  the parser *does* enforce (asserts the parser), **#230** too wide to satisfy the parser
-  (asserts the dispatch), **#263** bounded below what *anything* enforces, justified by an
-  enforcement that does not exist. The invariant note already read the rule the corrected way
-  (*"a `u16` wire field stays a `u16`"*,
-  [untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md), #211); this
-  record's own text was the outlier and is what the artifacts copied. **Widening a generator is
-  not automatically the fix**: measured on `rfx`, widening alone stayed green because the
-  arithmetic sat behind a parse random bytes never satisfy, and it only went red once the guard
-  moved in front of that gate. And a generator is not widened where the lane cannot observe the
-  arm — `fuzz.yml` runs on `ubuntu-latest`, where none of these products overflow.
+- Status: Accepted (issue #97; first property implemented for the RLE decoder — issue #98) — amended 2026-06-19 (#98/#99), 2026-08-21 (#230), 2026-08-24 (#241/#238), 2026-08-31 (#262), 2026-08-31 (#263), 2026-09-04 and 2026-09-07 (#267); see the Amendments below
 - Date: 2026-06-18
 
 ## Context
@@ -85,7 +38,7 @@ field the spec leaves unconstrained within its type: `[MS-RDPEGFX]` 2.2.1.2 lets
 artifact (#263, measured on two targets). Where a smaller bound is kept for budget, keep a
 weighted arm at the full type range so the reject branch stays driven; where the *lane* cannot
 observe the arm (the fuzz lane is 64-bit, so a 32-bit overflow cannot fire there), say that
-instead of widening. See the 2026-08-31 amendment above for the three failure modes this rule
+instead of widening. See the 2026-08-31 (#263) amendment below for the three failure modes this rule
 now has to distinguish.
 
 ### 2. Coverage-guided fuzzing (`cargo-fuzz` / libFuzzer) — CI lane only
@@ -121,3 +74,142 @@ Adding a decoder for untrusted bytes obligates its no-panic property (and round-
 - **Property tests only, no fuzzing.** Rejected — it would leave hang-class defects (non-terminating parse loops) and coverage-directed deep paths permanently untested, and would not match the rigor of the one proven independent Rust RDP implementation (IronRDP fuzzes every core crate).
 - **A shared generator crate (à la `ironrdp-pdu-generators`) up front.** Deferred, not rejected — the per-decoder `proptest` strategies are small and local today; a shared generator crate is worth extracting only once the duplication is real, to avoid speculative structure.
 - **Replace the hand-written LCG synthetic streams (ADR-0007) immediately.** Deferred — those streams already serve as differential *input factories* with a coverage guard; folding them into `proptest` generators (gaining shrinking) is an improvement to make per-codec as the properties roll out, not a precondition of this ADR.
+
+## Amendment (2026-06-19, #98/#99): the as-built state
+
+#98 landed the no-panic property for **all** untrusted-input decoders (not just RLE), and #99
+landed the `fuzz/` CI lane; the inline notes throughout this record are updated to the as-built
+state. *("all decoders" is corrected by the 2026-08-21 amendment below.)*
+
+## Amendment (2026-08-21, #230): "all decoders" was a module claim reported as an entry-point one
+
+The 2026-06-19 amendment's *"all decoders"* was a **module** claim reported as an entry-point
+one, and #230 measured the gap. See the corrected Consequences bullet above. (The first attempt
+at this amendment retracted the wrong sentence — the lane/property correspondence it deleted as
+false is true in every row; recorded because a correction that misses is worse than the claim it
+was aimed at.)
+
+## Amendment (2026-08-24, #241/#238): the obligation is not scoped by crate
+
+The Context above named `justrdp-pdu` and `justrdp-codecs`, and the census in [untrusted decode
+never panics](../map/invariant/untrusted-decode-never-panics.md) had encoded that as
+`rg --files crates/justrdp-pdu/src`, so a parser in the core crate was invisible to it by
+construction rather than by oversight (`tls::extract_subject_public_key`, #241) — as was the
+whole *consumption-site* class the byte-scoped wording could not describe (ADR-0012's, #238).
+Both derivations are widened in that note, and `justrdp` now carries `proptest` and a fuzz target
+for the first time. Working the resulting list turned up four defects, two of them wire-reachable;
+the enumeration is in the note, not here, for the reason the 2026-08-21 amendment gives.
+
+## Amendment (2026-08-31, #262): the prediction came true in a class the named lane does not cover
+
+**This record's most load-bearing prediction came true, and the lane it named as the answer does
+not cover the class it came true in.** §2 says *"`proptest` has no per-case timeout; an infinite
+loop hangs the test run rather than failing it"*, and the Consequences call that gap *"exactly
+the fuzz lane's mandate"*. Measured: a `justrdp-codecs` no-panic property hung on ~43% of seeds
+and cost **~56.4 runner-hours across 10 cancelled CI jobs** — and `color::to_rgba` has no fuzz
+target, because it is an ADR-0012 consumption site rather than a decoder, and that whole class
+has none. So the sentence is right about proptest and over-claims about the coverage. What
+actually bounds the class is neither lane: every job in all five workflows now carries
+`timeout-minutes`, where none did before and GitHub's 360-minute default applied. See the
+corrected Consequences bullet above.
+
+## Amendment (2026-08-31, #263): the Strategy design rule's worked example is false
+
+**And it propagated verbatim to ten artifacts before anything measured it.** The rule says a wire
+header field is *"bounded in the generator to its **real range**"*, which is right; the example
+then bounds `width`/`height` on the ground that *"leaving them unbounded would manufacture
+OOM/overflow 'failures' that no real server could trigger"*, and **that clause is the one that
+failed**. A server picks a `RDPGFX_RECT16` freely — `[MS-RDPEGFX]` 2.2.1.2 bounds it at `u16` and
+states no maximum, 2.2.2.1 makes it the bitmap's own dimensions — so 65535 is the real range, the
+resulting `65535 × 65535 × 4` is 17_179_344_900, and the failure it produces is a **live
+defect**, not a test artifact: measured, a 93-byte tileset panicked on `i686-pc-windows-msvc` and
+allocated 16 GiB on `x86_64` in 18.9 s.
+
+Two distinct errors travelled together, and separating them is the point of recording this.
+**(a) "Real range" was read as "a comfortable number."** Every artifact derived from this example
+bounds a `u16` field at `u8` or `0..=128`, which is not the field's range by three orders of
+magnitude. **(b) Several copies added *"never the stream"*, which is a contradiction** — a
+`TS_BITMAP_DATA` header field, an EGFX wire field and a `TS_*POINTERATTRIBUTE` header field *are*
+the stream. Nobody re-read either clause for two years of artifacts; #263's proptest was green
+over a live 32-bit overflow because of it.
+
+**So the rule extends rather than moves:** bound a generator to the field's **declared type**,
+and where a smaller bound is kept, keep it *as a stated budget trade* (fuzzer bytes, proptest
+runtime) with a weighted arm at the full type range so the reject branch stays driven — the shape
+#230 settled for `pointer` and #263 applied to `rfx`. That makes three recorded ways a generator
+can make a green mean nothing, and they are different bugs: **#211** bounded to what the parser
+*does* enforce (asserts the parser), **#230** too wide to satisfy the parser (asserts the
+dispatch), **#263** bounded below what *anything* enforces, justified by an enforcement that does
+not exist. The invariant note already read the rule the corrected way (*"a `u16` wire field stays
+a `u16`"*, [untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md),
+#211); this record's own text was the outlier and is what the artifacts copied. **Widening a
+generator is not automatically the fix**: measured on `rfx`, widening alone stayed green because
+the arithmetic sat behind a parse random bytes never satisfy, and it only went red once the guard
+moved in front of that gate. And a generator is not widened where the lane cannot observe the arm
+— `fuzz.yml` runs on `ubuntu-latest`, where none of these products overflow.
+
+## Amendment (2026-09-04): the blind spots of the proof layers themselves
+
+Salvaged from a retired build document. This record says how untrusted-input parsers are
+proven; what follows is what each proof **structurally cannot see** — recorded because a
+method's blind spots were living only in a generated file, and a blind spot nobody wrote
+down is indistinguishable from an absence of one.
+
+- **`justrdp-pdu` — a decoder that only ever sees vectors *we* authored is untested against
+  the input space a server spans.** Narrowed but not closed since #203/#252:
+  `tests/fixtures/connect/` now holds real server bytes for the MCS/GCC leg *and* the
+  finalization leg, **obtained rather than synthesised** — necessary because every encoder in
+  this crate writes client-to-server, so a round-trip can only ever replay our own idea of the
+  wire. And **a census can be blind to a whole class**: #241/#238's derivations were
+  byte-scoped and path-scoped, so a parser in the core crate was invisible to it by
+  construction. Both classes held live defects.
+- **`justrdp-tokio` — a demo or a fake is a smoke test, not proof.** Its integration tests are
+  `#[ignore]`d in CI by design (they need the VM), and `coverage.yml` excludes the crate.
+  **Coverage silence here is expected, so it cannot be read as a signal either way.**
+- **A performance claim is a different class of claim, and the trap is timing the whole
+  system to detect a component.** 300 101 µs before against 298 099 µs after read as *"a
+  wash"* and was noise — *a measurement that cannot resolve its own effect is
+  indistinguishable from one that found nothing.* So, in order: **isolate before you time**
+  (RLGR is **4.6%** of a corpus decode, which caps a 2× win at 2.3% — the question closes
+  before a stopwatch comes out); **measure the workload's shape, not only its duration** (the
+  #91 verdict came from a histogram: real streams have a mean run length of **1.0 bits**);
+  **state the noise floor with the number** (four runs of the *same* build spanned
+  298/308/322/327 ms — a single before/after pair across a **9.6%** instrument is not
+  evidence); and **the probe is a throwaway**, `--release` only — instrument, read, delete,
+  record the number in the issue.
+
+## Amendment (2026-09-07, #267): the no-panic property's *shape* is per subject, not one shape
+
+§1's property is specified as one call over a generated byte stream, and every artifact in this
+repo had that shape because every subject so far was a **stateless parse**. `justrdp::egfx`'s
+`GraphicsProcessor` is not: it carries the zgfx LZ77 history, the Progressive tile store, the
+ClearCodec caches, the surface list and the bitmap cache across messages, and #268's defect was
+funded by exactly that — a 262 KB PDU whose cost came from a bitmap an *earlier* message had
+cached. **A single-call property is blind to that class by construction**, so the artifact here
+generates a sequence of messages and drives `process` **and** `flush_frames`, which is the pair
+the channel manager drives.
+
+Two things this record should have said and did not:
+
+- **§2 says "one libFuzzer target per highest-risk untrusted-input *decoder*", and the subject
+  here is not a decoder.** It is a *consumer* of a decode — which is the same scoping mistake
+  the 2026-08-24 amendment corrected for crates, now on the axis of *what kind of thing*. The
+  obligation follows the untrusted input, not the noun.
+- **Reaching the subject can require a public-surface decision, and that decision is not this
+  record's to make.** `GraphicsProcessor` is core mechanism behind a private module (ADR-0001),
+  and what a host may reach into is open in #273. The seam landed as a `fuzzing` cargo feature
+  re-exporting the pair through `justrdp::fuzzing` — maintainer's call, taken over widening the
+  module, a `#[doc(hidden)]` shim, and shipping the property alone. `ironrdp-fuzzing` reaches
+  the same subject through an already-public client because its egfx is a consumer-facing
+  crate; that shape does not transfer, and its own `egfx_surface_state` records scoping around
+  the identical wall for private fields.
+
+**And the strategy rule gains a second axis.** The 2026-08-31 (#263) amendment fixed *value*
+ranges — a field's real range is its declared type, and a smaller bound is a budget trade to be
+written as one. That is necessary and, for a stateful subject, not sufficient: correlating the
+values does not correlate the **order**. Measured — with correlated id pools but no opening
+sequence, deleting `Surface::blit`'s zero-extent early return left the property green, because
+the panic needs three commands to arrive in one order. A prologue prepended to half the sessions
+turned it RED. The full measurement, including a mutation that two guards jointly hid and one
+that is inert for a stated reason, is in
+[untrusted decode never panics](../map/invariant/untrusted-decode-never-panics.md).
