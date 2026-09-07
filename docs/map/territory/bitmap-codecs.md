@@ -354,6 +354,18 @@ as citations.
   payloads (ADR-0011); the *stage* differential remains valid and discriminating, which is a
   different layer from the whole-payload one. The SRL half of that basis was **re-derived in
   #168**: five of its eight vectors had been computed at the oracle's initial `kp`.
+
+  **#249 closed the follow-up that investigation left, and it did not unify the readers.** The
+  three bit readers stay separate — their end-of-stream contracts genuinely differ, `rlgr`
+  answering `None` where `srl` zero-fills past the end, and the code says so at both sites.
+  What they now share is the one **quantity** each used to compute for itself: how many bits a
+  slice holds, through `justrdp_codecs::bit_len`, stored once at construction. `zgfx` already
+  had that shape and the other two adopted it. **Sharing an answer is not sharing a reader**,
+  and a reader touched here should reach for the helper rather than write `len() * 8` again.
+  The threshold's own record is in
+  [decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md),
+  which is also where the measurement lives that this family's *second* quantity existed at
+  all.
 - **FreeRDP's deferred re-blit is not modelled, and that is measured rather than assumed.**
   Its per-surface frame state — `frameId`, `numUpdatedTiles`, `updatedTileIndices`, a per-tile
   `dirty` flag (`progressive.h:190-201`), reset by the frame id changing

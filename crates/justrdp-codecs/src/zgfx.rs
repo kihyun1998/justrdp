@@ -242,13 +242,18 @@ struct BitReader<'a> {
     data: &'a [u8],
     /// Absolute bit position.
     pos: usize,
-    /// Total decodable bits — `(data.len()) * 8 - unused`, never more than `data.len() * 8`.
+    /// Total decodable bits — `(data.len()) * 8 - unused`, never more than [`crate::bit_len`]
+    /// of `data`.
+    ///
+    /// **This field is the shape the family adopted in #249.** Computing the bit count once, at
+    /// construction, and reading it thereafter is what this reader already did while `rlgr` and
+    /// `srl` each recomputed `len() * 8` unbounded at every use. They now do this.
     budget: usize,
 }
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8], budget: usize) -> Self {
-        debug_assert!(budget <= data.len() * 8);
+        debug_assert!(crate::bit_len(data.len()).is_some_and(|bits| budget <= bits));
         Self {
             data,
             pos: 0,
@@ -520,7 +525,17 @@ impl Zgfx {
         let (&unused, decodable) = body
             .split_last()
             .expect("caller rejects an empty compressed body");
-        let available = decodable.len() * 8;
+        // Through [`crate::bit_len`] like its two siblings, though **this one cannot fail**:
+        // `body.len() > MAX_COMPRESSED_SEGMENT` six lines up already refused anything whose bit
+        // count could overflow, and `decodable` is one byte shorter still. It narrows anyway,
+        // for the reason `nscodec` takes `allocatable` it cannot reach — one quantity gets one
+        // answer across the family, and a site that opts out on its own local bound is how a
+        // family acquires two answers (ADR-0012 §3). `SegmentTooLong` is reused rather than a
+        // new variant added, because a body too long to count is exactly what it names, and an
+        // unreachable variant is worse than an unreachable arm.
+        let available = crate::bit_len(decodable.len()).ok_or(ZgfxError::SegmentTooLong {
+            len: decodable.len(),
+        })?;
         let unused = usize::from(unused);
         if unused > available {
             return Err(ZgfxError::InvalidUnusedBitCount { unused, available });
