@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d56537976cab04eeeab58e82df97d75f5258133655c8be761352bedab9ca825e # shrinks to session = [[Cmd { cmd_id: 9, body: [0, 0, 1, 0, 33, 0, 32] }], [Cmd { cmd_id: 6, body: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 120, 255] }]]
+cc 0e21e39a259118ad63236032c38f57e929438389f4e0ddbfcb48e5a603f0678d # shrinks to session = [[Cmd { cmd_id: 9, body: [1, 0, 64, 0, 64, 0, 32] }, Cmd { cmd_id: 15, body: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, Cmd { cmd_id: 6, body: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 32, 0, 32, 0] }], [Cmd { cmd_id: 1, body: [1, 0, 0, 0, 32, 120, 255, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0] }]]

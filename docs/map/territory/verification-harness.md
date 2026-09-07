@@ -55,6 +55,15 @@ everywhere else.
   because its roster is `ls fuzz/fuzz_targets/` and those functions parse nothing. **The only
   structural backstop is a job timeout**, which is a gate fact rather than a harness one — see
   [supply chain & gates](supply-chain-and-gates.md).
+
+  **The "parse nothing" half is narrower than it reads, as of #267.** `egfx_processor` targets
+  `justrdp::egfx::GraphicsProcessor`, which parses nothing itself — it drives
+  `justrdp_pdu::egfx::decode_all` and then consumes every field — so the roster's shape was
+  never the obstacle for that one. What was, was **reachability**: the module is private and
+  the processor is core mechanism, so a target could not be written until a seam existed (a
+  `fuzzing` cargo feature; #273 owns the host-facing question). Read the sentence above as
+  what it is — a statement about targets nobody has *written* — and check whether the subject
+  is unreachable before concluding it is unfuzzable.
 - **The VM proves what only a server can** — the full connect sequence, licensing's
   "error means proceed", the graphics caps a real host advertises.
 - **Coverage is a discovery tool with no threshold**, scoped to the sans-IO core;
