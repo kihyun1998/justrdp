@@ -104,12 +104,30 @@ pub enum SrlError {
     /// carries a half-applied pass into every later refinement — the same corruption the choice
     /// to error rather than truncate exists to prevent.
     ValueOverflow,
+    /// A component is long enough that its **bit** count does not fit a `usize` (#249).
+    ///
+    /// The sibling of `RlgrError::BitCountOverflow`, differing only in its type — which is what
+    /// [ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3 asks of one quantity
+    /// across a family, and the shape #233 settled `q == 0` into. Reachable only on a 32-bit
+    /// target above ~512 MiB, which no wire path reaches; refused because
+    /// [`upgrade_component`] is a `pub fn` whose signature admits it, and a fuzz target already
+    /// drives it with arbitrary slices (`fuzz_targets/progressive_srl.rs`).
+    BitCountOverflow {
+        /// The component length whose bit count overflowed.
+        bytes: usize,
+    },
 }
 
 impl core::fmt::Display for SrlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SrlError::ValueOverflow => write!(f, "upgraded coefficient exceeds i16"),
+            SrlError::BitCountOverflow { bytes } => {
+                write!(
+                    f,
+                    "SRL component of {bytes} bytes has no representable bit count"
+                )
+            }
         }
     }
 }
@@ -147,16 +165,30 @@ pub const MAX_BIT_POS: u32 = 30;
 /// answers `None` instead: winpr's `wBitStream` zero-fills its accumulator and prefetch beyond
 /// `capacity` (`winpr/include/winpr/bitstream.h`, the bounds-checked `BitStream_Fetch` /
 /// `BitStream_Prefetch`), and the SRL magnitude loop depends on it — a truncated stream must
-/// still terminate at the `(1 << numBits) - 1` cap rather than stop mid-symbol. Unifying the two
-/// readers is #91's business, not this slice's.
+/// still terminate at the `(1 << numBits) - 1` cap rather than stop mid-symbol.
+///
+/// **The readers were never unified and will not be.** This sentence used to end *"unifying the
+/// two readers is #91's business, not this slice's"*; #91 closed on a measurement that rejected
+/// the rewrite outright, so that pointer outlived its target. What the three readers *do* share,
+/// as of #249, is the one quantity they each used to compute for themselves — how many bits a
+/// slice holds — through [`crate::bit_len`], stored once at construction. Sharing the answer is
+/// not sharing the reader, and the end-of-stream contracts above are exactly why.
 struct Bits<'a> {
     data: &'a [u8],
     pos: usize,
+    /// Total bits in `data`, computed **once** at construction (#249) — see
+    /// [`crate::bit_len`]. `exhausted` used to recompute `data.len() * 8` unbounded; the stored
+    /// form is `zgfx::BitReader`'s, and adopting it is what gives the family one answer to the
+    /// quantity without merging the three readers' deliberately different end-of-stream
+    /// contracts.
+    bits: usize,
 }
 
 impl<'a> Bits<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+    fn new(data: &'a [u8]) -> Result<Self, SrlError> {
+        let bits =
+            crate::bit_len(data.len()).ok_or(SrlError::BitCountOverflow { bytes: data.len() })?;
+        Ok(Self { data, pos: 0, bits })
     }
 
     fn bit(&mut self) -> u32 {
@@ -168,7 +200,7 @@ impl<'a> Bits<'a> {
 
     /// Whether every remaining read will yield a zero-filled bit.
     fn exhausted(&self) -> bool {
-        self.pos >= self.data.len() * 8
+        self.pos >= self.bits
     }
 
     /// Advance without reading — only ever called past the end, where the bits are zero-fill.
@@ -211,14 +243,14 @@ struct UpgradeState<'a> {
 }
 
 impl<'a> UpgradeState<'a> {
-    fn new(srl: &'a [u8], raw: &'a [u8]) -> Self {
-        Self {
-            srl: Bits::new(srl),
-            raw: Bits::new(raw),
+    fn new(srl: &'a [u8], raw: &'a [u8]) -> Result<Self, SrlError> {
+        Ok(Self {
+            srl: Bits::new(srl)?,
+            raw: Bits::new(raw)?,
             nz: 0,
             kp: KP_INIT,
             mode: false,
-        }
+        })
     }
 
     /// One SRL-coded value (`progressive_rfx_srl_read`, `progressive.c:1075-1162`).
@@ -401,7 +433,7 @@ pub fn upgrade_component(
     current: &mut [i16; COMPONENT_LEN],
     sign: &mut [i16; COMPONENT_LEN],
 ) -> Result<(), SrlError> {
-    let mut state = UpgradeState::new(srl, raw);
+    let mut state = UpgradeState::new(srl, raw)?;
     let shifts = band_values(shift);
     let widths = band_values(num_bits);
 
@@ -422,6 +454,12 @@ pub fn upgrade_component(
 
 #[cfg(test)]
 mod tests {
+    /// Shim for the two in-module tests, which predate the fallible constructor (#249). It
+    /// lives here rather than on `Bits` for the reason `rlgr`'s twin does.
+    fn bits(data: &[u8]) -> Bits<'_> {
+        Bits::new(data).expect("test slices are bytes, not gigabytes")
+    }
+
     use super::*;
 
     fn quant(v: u8) -> ProgressiveQuant {
@@ -443,7 +481,7 @@ mod tests {
     /// tests rest on, asserted without reference to either implementation.
     #[test]
     fn bits_read_msb_first_and_zero_fill_past_the_end() {
-        let mut bits = Bits::new(&[0b1011_0010]);
+        let mut bits = bits(&[0b1011_0010]);
         assert_eq!(bits.bit(), 1);
         assert_eq!(bits.bits(3), 0b011);
         assert_eq!(bits.bits(4), 0b0010);
@@ -455,7 +493,7 @@ mod tests {
     /// `bits(0)` consumes nothing — the `k == 0` case in the zero-encoding phase.
     #[test]
     fn reading_zero_bits_consumes_nothing() {
-        let mut bits = Bits::new(&[0b1000_0000]);
+        let mut bits = bits(&[0b1000_0000]);
         assert_eq!(bits.bits(0), 0);
         assert_eq!(bits.bit(), 1);
     }
@@ -463,7 +501,7 @@ mod tests {
     /// The state every component starts from — `kp = 8`, so the first symbol's `k` is 1.
     #[test]
     fn a_component_starts_at_kp_eight() {
-        let state = UpgradeState::new(&[], &[]);
+        let state = UpgradeState::new(&[], &[]).expect("test slices are bytes, not gigabytes");
         assert_eq!(state.kp, KP_INIT);
         assert_eq!(state.kp / 8, 1, "the first symbol reads one run-length bit");
         assert!(!state.mode);
@@ -473,7 +511,8 @@ mod tests {
     /// A band with `num_bits == 0` is skipped without consuming a bit from either stream.
     #[test]
     fn a_zero_width_band_consumes_nothing() {
-        let mut state = UpgradeState::new(&[0xFF], &[0xFF]);
+        let mut state =
+            UpgradeState::new(&[0xFF], &[0xFF]).expect("test slices are bytes, not gigabytes");
         let mut buffer = [5i16; 4];
         let mut sign = [0i16; 4];
         state
@@ -487,7 +526,8 @@ mod tests {
     /// `LL3` reads every coefficient from the raw stream, whatever the sign array says.
     #[test]
     fn the_ll_band_never_touches_the_srl_stream() {
-        let mut state = UpgradeState::new(&[0xFF], &[0b1010_1100]);
+        let mut state = UpgradeState::new(&[0xFF], &[0b1010_1100])
+            .expect("test slices are bytes, not gigabytes");
         let mut buffer = [0i16; 4];
         // Signs that would route to SRL, to raw, and to negated raw on a non-LL band.
         let mut sign = [0i16, 1, -1, 0];
@@ -505,7 +545,8 @@ mod tests {
     #[test]
     fn the_sign_array_routes_each_coefficient_and_srl_fills_the_zero_entries() {
         // raw `01 10` feeds the two signed entries; srl `1 0 0` is one +1 at num_bits == 1.
-        let mut state = UpgradeState::new(&[0b1000_0000], &[0b0110_0000]);
+        let mut state = UpgradeState::new(&[0b1000_0000], &[0b0110_0000])
+            .expect("test slices are bytes, not gigabytes");
         let mut buffer = [0i16; 3];
         let mut sign = [1i16, -1, 0];
         state
@@ -527,7 +568,8 @@ mod tests {
     /// over it — the accumulate that makes a pass a *refinement*.
     #[test]
     fn a_refinement_accumulates_into_the_existing_coefficient() {
-        let mut state = UpgradeState::new(&[], &[0b1100_0000]);
+        let mut state =
+            UpgradeState::new(&[], &[0b1100_0000]).expect("test slices are bytes, not gigabytes");
         let mut buffer = [100i16, -100];
         let mut sign = [1i16, 1];
         state
@@ -541,7 +583,8 @@ mod tests {
     /// never a panic.
     #[test]
     fn an_overflowing_refinement_is_a_typed_error() {
-        let mut state = UpgradeState::new(&[], &[0xFF]);
+        let mut state =
+            UpgradeState::new(&[], &[0xFF]).expect("test slices are bytes, not gigabytes");
         let mut buffer = [i16::MAX];
         let mut sign = [1i16];
         assert_eq!(
@@ -668,7 +711,7 @@ mod tests {
     #[test]
     fn the_adaptive_state_survives_a_band_boundary() {
         let srl = [0u8; 4];
-        let mut state = UpgradeState::new(&srl, &[]);
+        let mut state = UpgradeState::new(&srl, &[]).expect("test slices are bytes, not gigabytes");
         let mut buffer = [0i16; 72];
         let mut sign = [0i16; 72];
         state
@@ -977,7 +1020,8 @@ mod tests {
     /// Asserted rather than reasoned, because it is the bound that keeps that shift total.
     #[test]
     fn kp_stays_within_its_cap_so_the_run_shift_is_bounded() {
-        let mut state = UpgradeState::new(&[0x00; 64], &[]);
+        let mut state =
+            UpgradeState::new(&[0x00; 64], &[]).expect("test slices are bytes, not gigabytes");
         // An all-zero SRL stream is an unbroken chain of zero runs, which is what drives kp up.
         for _ in 0..4096 {
             let _ = state.srl_read(1);

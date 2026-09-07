@@ -165,6 +165,48 @@ which is a fair warning about what (1)'s number was ever counting. Without the c
 filter (2) returns ~286 lines, most of them prose containing `w * h`; the filter is
 part of the command, not an optional tidy-up.
 
+```sh
+# (3) the *second quantity* (#249) — a byte length turned into a BIT count. Derivations (1)
+#     and (2) cannot see it: both match an identifier multiplied by an identifier, and this
+#     is an identifier multiplied by the literal 8. Its ceiling is the type's rather than
+#     the allocator's, because nothing is allocated from a bit count. Scope is `crates`, not
+#     `crates/*/src` — the first form of this command missed three hits, two of them in
+#     `tests/`, and a derivation that cannot see a directory is the failure this note exists
+#     to record.
+rg -n '\.len\(\) *\* *8|\* *8 *-|<< *3' crates -g '*.rs' \ 
+ | rg -v ':\s*(//|///|//!)'
+```
+
+**Adjudicated in full on 2026-09-07, because an over-approximation nobody has walked is a
+list rather than an answer.** On the tree as it stands: **18** hits unfiltered, **13** after
+the comment filter, and **zero** members — because the three below no longer match, which is
+what closing them looks like. They are named from the pre-fix tree, where the same command
+returned them as live expressions:
+
+| Site | Verdict |
+|---|---|
+| `rfx/rlgr.rs` `remaining()` and `count_leading` | **members** — one quantity, two expressions, in one struct, and `decode` is a `pub fn` over an unbounded `&[u8]` |
+| `rfx/srl.rs` `exhausted()` | **member** — `upgrade_component` is a `pub fn` over two, and `fuzz_targets/progressive_srl.rs` already drives it with arbitrary slices |
+| `zgfx.rs` `BitReader::new`'s assert and `available` | **not members** — `body.len() > MAX_COMPRESSED_SEGMENT` refuses six lines above in the same function. They narrow through the helper anyway, for the signature, the way `nscodec` takes an `allocatable` it cannot reach |
+| `justrdp-pdu/src/license.rs:569`, `justrdp/src/connect.rs:2211`, and two files under `tests/` | **false positives, and all four are the same fixture** — a proprietary-certificate builder around a tiny modulus, duplicated four times. The *production* path in that family divides (`bitlen / 8`, `license.rs:269`), which cannot overflow |
+| `color.rs:276`'s `c << 3 \| c >> 2`, and the `1 << 3` / `1 << 30` flag and threshold constants | **false positives** — a shift on a channel value or a literal, not on a length |
+
+**The `<< 3` arm earns its false positives.** A bit count written as a shift is the same
+quantity in a disguise no `* 8` pattern finds, and this family has not written one yet — so
+the arm is there for the site that does not exist, which is the only kind a derivation can
+be widened for in advance.
+
+Two things the walk turned up that the table cannot hold:
+
+- **The only hits outside `justrdp-codecs` are tests, and that is load-bearing rather than
+  lucky.** `justrdp_codecs::bit_len` is `pub(crate)`, so a real member in `justrdp-pdu` or
+  `justrdp` could not reach it and would force a boundary decision nobody has had to make.
+  Recorded so the next member outside this crate is met as a *placement* question and not as
+  a copy of the helper.
+- **The first form of this command was written into this note before it was run**, and it
+  did not run: `rg -E` is `--encoding`, not extended-regex, and the scope was `crates/*/src`,
+  which cannot see `tests/`. Both were caught by executing it. A derivation is the one kind
+  of prose whose value is entirely in whether it executes.
 Hand-written additions no tool can find:
 
 - `justrdp-pdu/src/rfx/progressive.rs`, `decode_region` — sums the region's declared
@@ -210,6 +252,40 @@ the largest buffer any of them may ask for — and
 to one quantity. It was six comparisons for about twenty minutes and that was already
 one inconsistency too many: `rfx` was corrected first and the divergence it created
 against its five siblings is what made the helper obviously right.
+
+**There are two quantities, and the second was found by asking the same question one axis
+over (#249).** `allocatable` answers *may I ask the allocator for this many bytes*.
+`justrdp_codecs::bit_len` answers *how many bits does this slice hold* — `bytes.checked_mul(8)`
+— and the two are **not interchangeable**, because the operation that can fail is different.
+`allocatable`'s ceiling is `isize::MAX`, the one `Vec` enforces; nothing is allocated from a bit
+count, so its only failure is the multiply and its ceiling is the type's. Chaining one onto the
+other would add a refusal at a threshold no operation on that path enforces.
+
+The three bit readers each computed `len() * 8` for themselves, unbounded, at five sites — and
+the sentence above was read as covering them because it says *every guard in the family*. It
+was true of every **allocation** guard. **A one-quantity claim is scoped to its quantity, and
+nothing in its wording says so.**
+
+Two things about the closure are worth keeping:
+
+- **`zgfx` already held the answer and nobody had read it as one.** Its `BitReader` computes
+  the bit count once, at construction, into a `budget` field, because its input is bounded six
+  lines earlier. `rlgr` and `srl` adopted that shape rather than a new one being invented — the
+  fix was to notice the in-repo precedent, not to design against the two references.
+- **Two of the five sites were never members**, and saying so is the point. `zgfx`'s pair sits
+  under `MAX_COMPRESSED_SEGMENT` in the same function, so the ADR-0012 §1 test answers *no* for
+  them. They narrow through the helper anyway, for the reason `nscodec` takes `allocatable` it
+  cannot reach — **a site that opts out on its own local bound is how a family acquires two
+  answers.** Measured: ablating the helper there leaves every test green, and that is INERT by
+  construction rather than a gap.
+
+**And one of the three guards is a loop-termination condition, so it cannot go red at all.**
+Inverting `srl::Bits::exhausted` does not fail the suite — it **hangs** it: >180 s against a
+0.08 s baseline, with no failure reported. That is #262's shape exactly, one module over, and
+what covers it is neither the unit tests nor a property but the fuzz lane's `-timeout=10`
+(`fuzz_targets/progressive_srl.rs`). The other two mutations — removing `count_leading`'s end
+bound, which is the one #91 recorded as invisible to every test in its module, and collapsing
+`remaining()` to the total — go red on 8 and 9 of the 13 reader tests respectively.
 
 The table below is kept because the **reproductions** are the evidence, not the status.
 All four were run on `i686-pc-windows-msvc` on 2026-08-31 and each panicked with

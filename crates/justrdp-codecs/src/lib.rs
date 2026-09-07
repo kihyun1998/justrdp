@@ -51,6 +51,34 @@ pub(crate) fn allocatable(bytes: usize) -> Option<usize> {
     (bytes <= isize::MAX as usize).then_some(bytes)
 }
 
+/// How many bits a byte slice holds, or `None` when the product does not fit a `usize`.
+///
+/// The family's second single quantity, and the sibling of [`allocatable`] for the same reason
+/// [ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §3 gives: three bit readers
+/// each turned a byte length into a bit count with a bare `len() * 8` and there was **no**
+/// recorded answer, in three places (#249).
+///
+/// **It is not `allocatable`, and the difference is which operation can fail.** `allocatable`
+/// answers *may I ask the allocator for this many bytes*, so its ceiling is `isize::MAX`, the
+/// one `Vec` enforces. Nothing is allocated here — the product is a **bound**, compared against
+/// a cursor — so the only operation that can fail is the multiply itself, and its ceiling is the
+/// type's. Chaining `allocatable` onto this would be a second, unrelated refusal at a threshold
+/// no operation on this path enforces.
+///
+/// **Why it matters that this is a bound rather than an allocation.** On a 32-bit target the
+/// product wraps above `usize::MAX / 8` — 536 870 911 bytes, ~512 MiB, a slice a 32-bit process
+/// can hold. A wrapped bit count is worse than a panic here: `rlgr`'s `read_bits` gates on
+/// `remaining()`, so a wrapped value **silently changes which streams are accepted** rather than
+/// failing loudly. On 64-bit the multiply cannot fail, which is why the test below is
+/// target-gated exactly as `allocatable`'s is (memory `wasm32_overflow_proof_via_i686`).
+///
+/// Call it once, where the reader is built, and store the result — `zgfx::BitReader` already had
+/// that shape (a `budget` field computed at construction) and it is the shape the other two
+/// adopted, rather than recomputing the quantity at every use.
+pub(crate) fn bit_len(bytes: usize) -> Option<usize> {
+    bytes.checked_mul(8)
+}
+
 /// Real-server corpus capture (ADR-0011's harness half) — ungated, see the module doc.
 pub mod capture;
 pub mod clearcodec;
@@ -81,5 +109,32 @@ mod tests {
         // The measured case: passes `checked_mul` on a 32-bit target, and `Vec` panics on it.
         assert_eq!(allocatable(2_400_000_000), None);
         assert_eq!(allocatable(0), Some(0));
+    }
+
+    /// The second quantity's threshold, pinned the same way and for the same reason (#249).
+    ///
+    /// Target-gated: on 64-bit the multiply cannot fail — `usize::MAX / 8` is 2^61 bytes and no
+    /// slice reaches it — so the boundary this asserts only exists where the readers actually
+    /// run into it (memory `wasm32_overflow_proof_via_i686`, #151/#155).
+    ///
+    /// **This pins the helper and not the readers**, which is a real limit and is stated rather
+    /// than glossed: reddening a reader would need a live 512 MiB slice inside a 32-bit test
+    /// process. The invariant's `planar::decompress` row closed at the same wall on the contract
+    /// rather than on a reproduction, and this follows it.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn bit_len_refuses_exactly_what_the_multiply_cannot_hold() {
+        use super::bit_len;
+
+        assert_eq!(bit_len(0), Some(0));
+        assert_eq!(bit_len(1), Some(8));
+        // The last slice whose bit count fits, and the first that does not.
+        assert_eq!(bit_len(usize::MAX / 8), Some((usize::MAX / 8) * 8));
+        assert_eq!(bit_len(usize::MAX / 8 + 1), None);
+        assert_eq!(bit_len(usize::MAX), None);
+        // 512 MiB exactly: the smallest round figure in the band, and a slice a 32-bit
+        // process can genuinely hold, which is what makes the band reachable rather than
+        // theoretical.
+        assert_eq!(bit_len(536_870_912), None);
     }
 }

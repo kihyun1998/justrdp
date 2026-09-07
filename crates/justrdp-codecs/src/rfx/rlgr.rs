@@ -18,6 +18,19 @@ pub enum RlgrError {
     EmptyInput,
     /// A decoded magnitude exceeds the 16-bit coefficient range (malformed stream).
     ValueOverflow,
+    /// The component is long enough that its **bit** count does not fit a `usize` (#249).
+    ///
+    /// Reachable only on a 32-bit target, and only above `usize::MAX / 8` — 536 870 911 bytes,
+    /// ~512 MiB. No wire path reaches it: a component is a slice of an already-bounded tile
+    /// payload. It is refused anyway because [`decode`] is a `pub fn` whose signature admits the
+    /// value ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1: reachability
+    /// governs priority, never the contract), and because a *wrapped* count is worse than a
+    /// refusal here — `read_bits` gates on `remaining()`, so wrapping silently changes which
+    /// streams are accepted.
+    BitCountOverflow {
+        /// The component length whose bit count overflowed.
+        bytes: usize,
+    },
 }
 
 impl core::fmt::Display for RlgrError {
@@ -25,6 +38,12 @@ impl core::fmt::Display for RlgrError {
         match self {
             RlgrError::EmptyInput => write!(f, "empty RLGR component data"),
             RlgrError::ValueOverflow => write!(f, "RLGR magnitude exceeds i16"),
+            RlgrError::BitCountOverflow { bytes } => {
+                write!(
+                    f,
+                    "RLGR component of {bytes} bytes has no representable bit count"
+                )
+            }
         }
     }
 }
@@ -43,15 +62,24 @@ struct BitReader<'a> {
     data: &'a [u8],
     /// Absolute bit position.
     pos: usize,
+    /// Total bits in `data`, computed **once** at construction (#249).
+    ///
+    /// It used to be `data.len() * 8`, recomputed at both of the two sites below — one quantity
+    /// with two expressions and no bound on either. `zgfx::BitReader` already carried the
+    /// answer as a stored `budget`; this is that shape, with the multiply narrowed through
+    /// [`crate::bit_len`] so the family gets one answer to one quantity (ADR-0012 §3).
+    bits: usize,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+    fn new(data: &'a [u8]) -> Result<Self, RlgrError> {
+        let bits =
+            crate::bit_len(data.len()).ok_or(RlgrError::BitCountOverflow { bytes: data.len() })?;
+        Ok(Self { data, pos: 0, bits })
     }
 
     fn remaining(&self) -> usize {
-        self.data.len() * 8 - self.pos
+        self.bits - self.pos
     }
 
     fn bit_at(&self, pos: usize) -> bool {
@@ -75,7 +103,7 @@ impl<'a> BitReader<'a> {
     /// Count and consume the run of bits equal to `value`, stopping at the stream end.
     fn count_leading(&mut self, value: bool) -> usize {
         let start = self.pos;
-        while self.pos < self.data.len() * 8 && self.bit_at(self.pos) == value {
+        while self.pos < self.bits && self.bit_at(self.pos) == value {
             self.pos += 1;
         }
         self.pos - start
@@ -106,7 +134,7 @@ pub fn decode(mode: EntropyAlgorithm, input: &[u8], output: &mut [i16]) -> Resul
     let mut kp: u32 = k << LS_GR;
     let mut krp: u32 = kr << LS_GR;
 
-    let mut bits = BitReader::new(input);
+    let mut bits = BitReader::new(input)?;
     let mut out = 0usize;
 
     'symbols: while bits.remaining() > 0 && out < output.len() {
@@ -235,6 +263,13 @@ fn adapt_kr(ones: usize, kr: &mut u32, krp: &mut u32) {
 
 #[cfg(test)]
 mod tests {
+    /// The 10 `BitReader` contract tests (#251) predate the fallible constructor (#249). The
+    /// shim lives here rather than on the reader: a test-only constructor in production code is
+    /// the thing it would be standing in for.
+    fn reader(data: &[u8]) -> BitReader<'_> {
+        BitReader::new(data).expect("test slices are bytes, not gigabytes")
+    }
+
     use super::*;
 
     #[test]
@@ -280,7 +315,7 @@ mod tests {
 
     #[test]
     fn read_bits_is_all_or_nothing_and_leaves_the_cursor_put() {
-        let mut r = BitReader::new(&[0b1010_0000]);
+        let mut r = reader(&[0b1010_0000]);
         assert_eq!(r.read_bits(3), Some(0b101));
         assert_eq!(r.remaining(), 5);
         // Six bits asked of five: refused, and the cursor must not have moved.
@@ -291,14 +326,14 @@ mod tests {
 
     #[test]
     fn read_bits_of_zero_reads_nothing() {
-        let mut r = BitReader::new(&[0xFF]);
+        let mut r = reader(&[0xFF]);
         assert_eq!(r.read_bits(0), Some(0));
         assert_eq!(r.remaining(), 8, "a zero-width read consumes no bits");
     }
 
     #[test]
     fn read_bits_is_msb_first_across_byte_boundaries() {
-        let mut r = BitReader::new(&[0b0001_0010, 0b0011_0100]);
+        let mut r = reader(&[0b0001_0010, 0b0011_0100]);
         assert_eq!(r.read_bits(4), Some(0b0001));
         // Straddles the boundary: 0010 from byte 0, then 0011 from byte 1.
         assert_eq!(r.read_bits(8), Some(0b0010_0011));
@@ -309,11 +344,11 @@ mod tests {
     #[test]
     fn read_bits_handles_the_widest_read_the_decoder_asks_for() {
         // RLGR3 reads `32 - code.leading_zeros()` bits, so 32 is reachable.
-        let mut r = BitReader::new(&[0xDE, 0xAD, 0xBE, 0xEF, 0x55]);
+        let mut r = reader(&[0xDE, 0xAD, 0xBE, 0xEF, 0x55]);
         assert_eq!(r.read_bits(32), Some(0xDEAD_BEEF));
         assert_eq!(r.remaining(), 8);
         // And at a non-zero bit offset, where a buffered load has to shift.
-        let mut r = BitReader::new(&[0x0D, 0xEA, 0xDB, 0xEE, 0xF5]);
+        let mut r = reader(&[0x0D, 0xEA, 0xDB, 0xEE, 0xF5]);
         assert_eq!(r.read_bits(4), Some(0));
         assert_eq!(r.read_bits(32), Some(0xDEAD_BEEF));
         assert_eq!(r.remaining(), 4);
@@ -322,7 +357,7 @@ mod tests {
     #[test]
     fn count_leading_stops_at_the_stream_end_without_a_terminator() {
         // Eight 1-bits and nothing after: the run is 8, not an error and not 9.
-        let mut r = BitReader::new(&[0xFF]);
+        let mut r = reader(&[0xFF]);
         assert_eq!(r.count_leading(true), 8);
         assert_eq!(r.remaining(), 0);
         assert_eq!(
@@ -340,7 +375,7 @@ mod tests {
         // an unclamped count reports a run longer than the stream.
         for len in 1..=9usize {
             let data = vec![0xFFu8; len];
-            let mut r = BitReader::new(&data);
+            let mut r = reader(&data);
             assert_eq!(
                 r.count_leading(true),
                 len * 8,
@@ -361,7 +396,7 @@ mod tests {
         // dropping the clamp left them all green.
         for len in 1..=7usize {
             let data = vec![0x00u8; len];
-            let mut r = BitReader::new(&data);
+            let mut r = reader(&data);
             assert_eq!(
                 r.count_leading(false),
                 len * 8,
@@ -377,14 +412,14 @@ mod tests {
         // 100 bytes of 0xFF is 800 consecutive 1-bits — far past any single 32- or 64-bit
         // window, so a reader that counts one window and stops reports 32 or 64 instead.
         let data = vec![0xFFu8; 100];
-        let mut r = BitReader::new(&data);
+        let mut r = reader(&data);
         assert_eq!(r.count_leading(true), 800);
 
         // The same for zeros, and with a terminating 1 so the run is bounded by data
         // rather than by the end of the stream.
         let mut data = vec![0x00u8; 100];
         data.push(0x80);
-        let mut r = BitReader::new(&data);
+        let mut r = reader(&data);
         assert_eq!(r.count_leading(false), 800);
         assert_eq!(r.read_bits(1), Some(1), "the terminator is next");
     }
@@ -392,7 +427,7 @@ mod tests {
     #[test]
     fn count_leading_starts_from_a_mid_byte_cursor() {
         // 0b0000_0111 then 0xFF: after consuming 5 bits the run of 1s is 3 + 8 = 11.
-        let mut r = BitReader::new(&[0b0000_0111, 0xFF]);
+        let mut r = reader(&[0b0000_0111, 0xFF]);
         assert_eq!(r.read_bits(5), Some(0));
         assert_eq!(r.count_leading(true), 11);
         assert_eq!(r.remaining(), 0);
@@ -400,7 +435,7 @@ mod tests {
 
     #[test]
     fn count_leading_of_a_non_matching_first_bit_is_zero() {
-        let mut r = BitReader::new(&[0b0111_1111]);
+        let mut r = reader(&[0b0111_1111]);
         assert_eq!(r.count_leading(true), 0, "the first bit is 0");
         assert_eq!(r.remaining(), 8, "and nothing was consumed");
         assert_eq!(r.count_leading(false), 1);
