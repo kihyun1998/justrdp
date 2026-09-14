@@ -2,7 +2,7 @@
 //!
 //! Self-owned, ungated (#189): the last phase-1 `egfx-bootstrap` wrapper, and with it the
 //! **runtime** `ironrdp-graphics` dependency, retired here — ADR-0003 phase 3 reached for the
-//! EGFX surface, which is [ADR-0011](../../../docs/adr/0011-zero-ironrdp-terminal-state.md)'s
+//! EGFX surface, which is [ADR-0011]'s
 //! terminal state for the runtime graph. The crate keeps the oracle as a dev-dependency.
 //!
 //! Decompression only. justrdp is a client and never compresses; the compressor half of both
@@ -33,7 +33,7 @@
 //! # Bounds
 //!
 //! Every length here is server-chosen, so
-//! [`untrusted-decode-never-panics`](../../../docs/map/invariant/untrusted-decode-never-panics.md)
+//! [`untrusted-decode-never-panics`]
 //! governs the whole module. Two allocation bounds exist that neither reference has, both
 //! anticipated by `docs/plan.md` §V.3 (*"malformed sequences could cause OOM; use a
 //! max-decompressed-size limit"*):
@@ -44,7 +44,9 @@
 //! - `MAX_DECOMPRESSED_BYTES` caps a multipart message's declared `uncompressedSize`, which
 //!   is a `u32` a hostile server picks freely.
 //!
-//! [`a-later-stage-can-hide-an-earlier-defect`]: ../../../docs/map/invariant/a-later-stage-can-hide-an-earlier-defect.md
+//! [`a-later-stage-can-hide-an-earlier-defect`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/a-later-stage-can-hide-an-earlier-defect.md
+//! [ADR-0011]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0011-zero-ironrdp-terminal-state.md
+//! [`untrusted-decode-never-panics`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
 
 /// The LZ77 sliding window, in bytes (`[MS-RDPEGFX]` 3.1.8.1 — "maximum match distance /
 /// minimum history size"). Both references use exactly this value; a decompressor with a

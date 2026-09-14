@@ -29,9 +29,9 @@
 ///
 /// One helper rather than one comparison per decoder, because this is a single quantity — the
 /// largest buffer any of them may ask for — and
-/// [ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §3 asks a family for one
+/// [ADR-0012] §3 asks a family for one
 /// answer to one quantity. The threshold belongs to the *allocator*, which is what
-/// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md) states as
+/// [the invariant] states as
 /// the rule: a guard's ceiling must be the one the operation that can fail actually enforces.
 /// `usize::MAX` is the type's ceiling and belongs to no operation at all.
 ///
@@ -47,6 +47,9 @@
 ///
 /// This does **not** bound magnitude below `isize::MAX`; a decoder has no defensible number for
 /// that. `justrdp::egfx` does (`MAX_TOTAL_SURFACE_BYTES`) and bounds the rectangle there.
+///
+/// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
+/// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
 pub(crate) fn allocatable(bytes: usize) -> Option<usize> {
     (bytes <= isize::MAX as usize).then_some(bytes)
 }
@@ -54,7 +57,7 @@ pub(crate) fn allocatable(bytes: usize) -> Option<usize> {
 /// How many bits a byte slice holds, or `None` when the product does not fit a `usize`.
 ///
 /// The family's second single quantity, and the sibling of [`allocatable`] for the same reason
-/// [ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §3 gives: three bit readers
+/// [ADR-0012] §3 gives: three bit readers
 /// each turned a byte length into a bit count with a bare `len() * 8` and there was **no**
 /// recorded answer, in three places (#249).
 ///
@@ -75,6 +78,8 @@ pub(crate) fn allocatable(bytes: usize) -> Option<usize> {
 /// Call it once, where the reader is built, and store the result — `zgfx::BitReader` already had
 /// that shape (a `budget` field computed at construction) and it is the shape the other two
 /// adopted, rather than recomputing the quantity at every use.
+///
+/// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
 pub(crate) fn bit_len(bytes: usize) -> Option<usize> {
     bytes.checked_mul(8)
 }

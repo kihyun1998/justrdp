@@ -34,7 +34,9 @@ pub enum PlanarError {
     /// first, marginal in a 32-bit address space. `full_size` narrows through
     /// `crate::allocatable` regardless — the family gets one answer whether or not each
     /// member's band was individually reached. See
-    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
+    /// [the invariant].
+    ///
+    /// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
     DimensionsOverflow {
         /// The requested width.
         width: usize,

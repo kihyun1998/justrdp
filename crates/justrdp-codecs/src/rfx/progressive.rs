@@ -2373,7 +2373,7 @@ mod tests {
     /// structurally identical condition: `shift = exponent - 1` where the exponent is 0. This
     /// pins that they refuse it *together*, in one assertion rather than two tests in two files
     /// that could drift apart — which is what happened, and is why
-    /// [ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3 exists.
+    /// [ADR-0012] §3 exists.
     ///
     /// The two errors are deliberately distinct types: this stage's `bitPos` is `quant +
     /// prog_quant`, a derived sum, while WireToSurface1's is a parsed nibble. They agree on the
@@ -2381,6 +2381,8 @@ mod tests {
     ///
     /// Before #233 this test could not have been written — `quant::shifts` used
     /// `saturating_sub`, so the same input returned `Ok` on one side and `Err` on the other.
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     #[test]
     fn a_zero_exponent_is_refused_by_both_dequantizers() {
         let progressive = first_pass_shift(&quant_from_bands([6, 6, 6, 6, 6, 6, 0, 6, 6, 6]));

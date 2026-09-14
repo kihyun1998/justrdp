@@ -213,9 +213,13 @@ and never re-read. Verify at the source before a decision rests on it.
   which is what `to_rgba_returns_promptly_for_a_zero_extent_of_any_height` does.
 - No release/publish workflow exists yet; nothing is on crates.io, so the whole
   cross-repo half of the discipline is inert by construction.
-  **One thing a first publish would activate** (found by #277): 38 doc-comment links across 15
-  shipped files point at the repository by relative path — `](../../../docs/…)` — and rustdoc
-  does not validate URL links, so the rustdoc gate passes them. Rendered anywhere but a checkout
-  they resolve against the page's own URL, which is derived rather than measured since nothing is
-  published. Recorded here rather than filed, by the maintainer's call, because it is inert until
-  a release exists.
+- **A doc-comment links repository documents by absolute URL.** rustdoc resolves a relative
+  link against the rendered page, not the source file, so `](../../../docs/…)` pointed nowhere
+  in `target/doc` (27 rendered hrefs) and would on docs.rs. Found by #277; all 41 doc-comment
+  sites were rewritten to reference-style definitions on
+  `https://github.com/kihyun1998/justrdp/blob/master/docs/…` — reference-style so the prose line
+  keeps its width. Four of the 41 were broken **even in a checkout**, carrying one `../` too
+  many. Plain `//` comments keep relative paths: rustdoc never renders them, and their reader is
+  in an editor. **Not gated, by the maintainer's call** — no check stops a new relative link
+  in a doc-comment — and the absolute form has its own blind spot: `blob/master` breaks
+  silently when a document is renamed, and `check_map.py` reads only `docs/map/`.

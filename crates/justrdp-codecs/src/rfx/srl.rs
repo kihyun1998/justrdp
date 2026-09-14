@@ -107,11 +107,13 @@ pub enum SrlError {
     /// A component is long enough that its **bit** count does not fit a `usize` (#249).
     ///
     /// The sibling of `RlgrError::BitCountOverflow`, differing only in its type — which is what
-    /// [ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3 asks of one quantity
+    /// [ADR-0012] §3 asks of one quantity
     /// across a family, and the shape #233 settled `q == 0` into. Reachable only on a 32-bit
     /// target above ~512 MiB, which no wire path reaches; refused because
     /// [`upgrade_component`] is a `pub fn` whose signature admits it, and a fuzz target already
     /// drives it with arbitrary slices (`fuzz_targets/progressive_srl.rs`).
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     BitCountOverflow {
         /// The component length whose bit count overflowed.
         bytes: usize,
@@ -205,8 +207,10 @@ impl<'a> Bits<'a> {
 
     /// Advance without reading — only ever called past the end, where the bits are zero-fill.
     /// Saturating because `n` can be up to `u32::MAX` and `usize` is 32 bits on the targets
-    /// [`decoder-dimension-overflow-32bit`](../../../../docs/map/invariant/decoder-dimension-overflow-32bit.md)
+    /// [`decoder-dimension-overflow-32bit`]
     /// covers.
+    ///
+    /// [`decoder-dimension-overflow-32bit`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
     fn skip(&mut self, n: u32) {
         self.pos = self.pos.saturating_add(n as usize);
     }
@@ -398,10 +402,12 @@ impl<'a> UpgradeState<'a> {
 /// - `checked_add` closes that spot. Widening to `i64` makes the addition total for every
 ///   *representable* refinement, but `i64::MIN` plus a negative coefficient is not one, and a
 ///   panicking add in a decoder fed by the wire is what
-///   [`untrusted decode never panics`](../../../../docs/map/invariant/untrusted-decode-never-panics.md)
+///   [`untrusted decode never panics`]
 ///   forbids. Regression: `progressive_srl`, CI run 32206659799.
 ///
 /// `try_from` then rejects anything that will not fit a coefficient.
+///
+/// [`untrusted decode never panics`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
 fn accumulate(coefficient: &mut i16, input: i16, shift: u32) -> Result<(), SrlError> {
     let shifted = i64::from(input)
         .checked_shl(shift)
@@ -985,12 +991,14 @@ mod tests {
     /// debug, which is where this test runs). A tile is 3 components × 10 bands, so a single
     /// malformed PDU buys ~22 seconds of CPU, and a region carries many tiles — the unbounded
     /// loop that
-    /// [`untrusted decode never panics`](../../../../docs/map/invariant/untrusted-decode-never-panics.md)
+    /// [`untrusted decode never panics`]
     /// names alongside the panic and the wrong-pixels case.
     ///
     /// The bound is two seconds against an 18 µs expectation: five orders of magnitude of
     /// headroom, so it cannot flake on a loaded runner, and still four orders below the
     /// unguarded cost.
+    ///
+    /// [`untrusted decode never panics`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
     #[test]
     fn a_wide_num_bits_costs_time_proportional_to_the_stream_not_to_the_cap() {
         let mut widths = quant(0);
@@ -1056,7 +1064,7 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// [`untrusted decode never panics`](../../../../docs/map/invariant/untrusted-decode-never-panics.md):
+        /// [`untrusted decode never panics`]:
         /// both bit streams come off the wire, and `shift` / `num_bits` are wire quant nibbles.
         /// Arbitrary values of all four must yield a value or a typed error — never a panic,
         /// an overflow, or an unbounded loop.
@@ -1080,6 +1088,8 @@ mod tests {
         /// coefficient. Widening the generator until it hits that is writing the answer into the
         /// test, so the depth stays where it belongs, in
         /// [`a_refinement_landing_on_i64_min_is_an_error_not_a_panic`] and in `progressive_srl`.
+        ///
+        /// [`untrusted decode never panics`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
         #[test]
         fn upgrade_component_never_panics_on_arbitrary_input(
             srl in proptest::collection::vec(proptest::num::u8::ANY, 0..512),

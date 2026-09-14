@@ -23,10 +23,12 @@ pub enum RlgrError {
     /// Reachable only on a 32-bit target, and only above `usize::MAX / 8` — 536 870 911 bytes,
     /// ~512 MiB. No wire path reaches it: a component is a slice of an already-bounded tile
     /// payload. It is refused anyway because [`decode`] is a `pub fn` whose signature admits the
-    /// value ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1: reachability
+    /// value ([ADR-0012] §1: reachability
     /// governs priority, never the contract), and because a *wrapped* count is worse than a
     /// refusal here — `read_bits` gates on `remaining()`, so wrapping silently changes which
     /// streams are accepted.
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     BitCountOverflow {
         /// The component length whose bit count overflowed.
         bytes: usize,

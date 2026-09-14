@@ -79,8 +79,10 @@ mod tests {
     }
 
     proptest! {
-        /// [untrusted decode never panics](../../../docs/map/invariant/untrusted-decode-never-panics.md)
+        /// [untrusted decode never panics]
         /// over the input space that actually reaches `x509_cert`'s decoder.
+        ///
+        /// [untrusted decode never panics]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
         #[test]
         fn extract_subject_public_key_never_panics_on_a_mutated_certificate(
             keep in 0.0f64..=1.0,

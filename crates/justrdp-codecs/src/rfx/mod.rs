@@ -44,10 +44,12 @@ pub enum RfxError {
     /// Unreachable from the wire — `Quant::decode` masks every exponent to `0..=15`, so the
     /// widest shift a server can ask for is 14. The variant exists because that guarantee lives
     /// in `justrdp-pdu`'s parser and not in `Quant`, whose fields are plain `pub u8`
-    /// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1). Named to match
+    /// ([ADR-0012] §1). Named to match
     /// `super::progressive::ProgressiveError::ShiftOutOfRange`, which is the same condition at
     /// the same threshold in the sibling stage — where it *is* reachable, because a Progressive
     /// shift is `quant + prog_quant - 1` and runs to 29.
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     ShiftOutOfRange(u8),
     /// A band's quantization exponent is 0, so the spec's `shift = exponent - 1` names no
     /// shift at all.
@@ -55,7 +57,7 @@ pub enum RfxError {
     /// **Reachable from the wire**, unlike [`RfxError::ShiftOutOfRange`]: `Quant::decode` masks
     /// each field to a nibble and a `0x00` byte is two zero nibbles, so a server can send this.
     /// It is refused anyway, and the distinction that makes that tolerable on a receive path is
-    /// the one [ADR-0009](../../../../docs/adr/0009-tolerant-negotiation-posture.md) §3(a)
+    /// the one [ADR-0009] §3(a)
     /// already draws: tolerance is about *which features may appear*, never about trusting
     /// their contents — and `-1` is not a shift we dislike, it is the absence of one. No
     /// conforming encoder emits it (`[MS-RDPRFX]` constrains the encoder to 6..=15), so there
@@ -63,7 +65,10 @@ pub enum RfxError {
     ///
     /// Named to match `super::progressive::ProgressiveError::ZeroBitPosition`, which is the same
     /// condition in the sibling stage. That the two agree is the requirement, not a coincidence
-    /// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3, resolving #233).
+    /// ([ADR-0012] §3, resolving #233).
+    ///
+    /// [ADR-0009]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0009-tolerant-negotiation-posture.md
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     ZeroQuantExponent,
     /// The destination rectangle's RGBA byte count cannot be materialized on this target.
     ///
@@ -79,10 +84,12 @@ pub enum RfxError {
     ///
     /// Named to match the same condition in the five sibling codecs that carry it — `color`,
     /// `planar`, `pointer`, `rle`, `nscodec` — one quantity, one answer across a family
-    /// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3). **`clearcodec`
+    /// ([ADR-0012] §3). **`clearcodec`
     /// is deliberately not in that list**: `clearcodec.rs:98-104` records why it has no variant
     /// of its own and maps the `nscodec` one to `InvalidField` instead. Returned instead of a
     /// debug panic / release wrap (#263, sibling of #151 / #155).
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     DimensionsOverflow {
         /// The requested width.
         width: u16,
@@ -487,8 +494,10 @@ mod tests {
     /// rather than a limitation of the test** — the 64-bit row is closed one layer out, by
     /// `justrdp::egfx` bounding the rectangle itself, because no arithmetic guard here can see a
     /// multiplication that fits. What this half owns is the obligation
-    /// [ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1 puts on a `pub fn`
+    /// [ADR-0012] §1 puts on a `pub fn`
     /// whose own signature admits the value, whatever its caller happens to guarantee.
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     #[cfg(target_pointer_width = "32")]
     #[test]
     fn a_rect_whose_rgba_cannot_be_addressed_is_a_typed_error_not_a_panic() {

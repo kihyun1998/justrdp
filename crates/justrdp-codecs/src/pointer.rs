@@ -48,11 +48,14 @@ pub enum PointerError {
     /// 2_228_190_000. **The exact mask-length checks do not close it**: at 1 bpp the output is
     /// 32x the mask, so 66 MB of `xorMaskData` is enough. Worth stating loudly here because
     /// this function's dimensions are `u16` — the shape
-    /// [ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §1 is written about,
+    /// [ADR-0012] §1 is written about,
     /// where the wire cannot reach the value (`decode_fastpath` caps a pointer at 96 pixels)
     /// and the signature admits it anyway. `out_len` now narrows through
     /// `crate::allocatable`, the family's one answer to that threshold. See
-    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
+    /// [the invariant].
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
+    /// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
     DimensionsOverflow {
         /// The shape width.
         width: u16,

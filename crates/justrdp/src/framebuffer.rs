@@ -29,9 +29,11 @@ pub struct FrameUpdate {
 /// *"attempt to multiply with overflow"* in debug, and in release a wrapped, undersized `Vec`
 /// while `self.width`/`self.height` keep the declared values, so every later `blit` writes past
 /// the end. On x86-64 the same call merely allocates 17 GiB and succeeds, which is why every
-/// other gate was green over it ([the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md)).
+/// other gate was green over it ([the invariant]).
 /// At the cap the product is exactly 1 GiB, so it fits a 32-bit `usize` by construction rather
 /// than by a check that could be forgotten.
+///
+/// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
 pub const MAX_DESKTOP_DIM: u16 = 16384;
 
 /// Why building or resizing a framebuffer failed.
@@ -111,9 +113,11 @@ impl Framebuffer {
     /// Existing content is discarded — the server repaints after reactivation.
     ///
     /// Fallible in place rather than split into a validating step and an infallible apply
-    /// ([ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §4). The split exists so a
+    /// ([ADR-0012] §4). The split exists so a
     /// *per-element loop* need not thread a `Result`; this allocates once per reactivation, so
     /// there is no loop to keep total and nothing to buy by separating them.
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     pub fn resize(&mut self, width: u16, height: u16) -> Result<(), FramebufferError> {
         if width > MAX_DESKTOP_DIM || height > MAX_DESKTOP_DIM {
             return Err(FramebufferError::DesktopTooLarge { width, height });
@@ -212,12 +216,14 @@ impl Framebuffer {
     /// the errors are unreachable through the intended flow. They exist anyway because this is a
     /// `pub fn` a host calls with values it chose: the parser-side guarantee is evidence about
     /// **reachability**, which sets the priority, and never about **totality**, which is the
-    /// contract ([ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §1). Before this
+    /// contract ([ADR-0012] §1). Before this
     /// returned a `Result` it panicked — *"range end index 48940 out of range for slice of length
     /// 433"*, found by the property below, not by a caller.
     ///
     /// Fails when the rectangle is not wholly inside the framebuffer, or when `dst` holds fewer
     /// than `width × height × 4` bytes.
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     pub fn copy_rect_into(
         &self,
         x: u16,
@@ -323,10 +329,12 @@ mod dimension_bounds {
     /// declared values, so every later `blit` indexes past the end. On x86-64 the same call
     /// simply allocates 17 GiB and succeeds — which is why the whole suite, the fuzz lane and the
     /// real VM were green over it
-    /// ([the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md)).
+    /// ([the invariant]).
     ///
     /// Wire-reachable: `session.rs` drives `resize` from `DemandActive`'s declared desktop size
     /// and from a Display Control `OutputResized`, neither clamped before arrival.
+    ///
+    /// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
     #[test]
     fn the_widest_declarable_desktop_is_refused_not_allocated() {
         assert_eq!(
@@ -364,13 +372,15 @@ mod dimension_bounds {
     }
 
     proptest! {
-        /// [untrusted decode never panics](../../../docs/map/invariant/untrusted-decode-never-panics.md)
+        /// [untrusted decode never panics]
         /// over the whole parameter type, not the subset a server realistically sends — which is
         /// the distinction ADR-0012 §1 draws, and the one that hid this defect: every hand-written
         /// vector used a plausible desktop.
         ///
         /// The generator is deliberately biased toward the boundary; uniform `u16`s would reach
         /// `MAX_DESKTOP_DIM` about once in four, and the interesting inputs are the ones near it.
+        ///
+        /// [untrusted decode never panics]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
         #[test]
         fn resize_is_total_over_every_declarable_desktop(
             width in prop_oneof![0u16..=64, 16_300u16..=16_500, any::<u16>()],

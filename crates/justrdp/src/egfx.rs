@@ -65,12 +65,14 @@ struct Surface {
 
 impl Surface {
     /// Total by construction, and said here because
-    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md) requires
+    /// [the invariant] requires
     /// a site that satisfies it that way to say so: every caller is downstream of
     /// `CREATE_SURFACE`'s `> MAX_SURFACE_DIM` refusal, so both factors are at most 16384 and the
     /// product is at most 1 GiB, which fits a 32-bit `usize`. The note's derivation *does* return
     /// this line, so without this comment a reader running it lands on a hit with nothing to
     /// adjudicate against.
+    ///
+    /// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
     fn bytes(width: u16, height: u16) -> usize {
         usize::from(width) * usize::from(height) * 4
     }
@@ -145,7 +147,7 @@ impl Surface {
     /// Extract a rectangle (clipped) as `(width, height, tight RGBA)`.
     ///
     /// The reserve is total by construction, for the same reason `Surface::bytes` is and stated
-    /// for the same reason ([the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md)
+    /// for the same reason ([the invariant]
     /// asks a by-construction site to say so, and its derivation returns this line): the first
     /// two statements clip `w`/`h` to *this* surface's own dimensions before any multiply, so
     /// the reserve is bounded by a buffer that already exists — and therefore by
@@ -165,6 +167,8 @@ impl Surface {
     /// `fill` and `blit_dirty` all read `w == 0 || h == 0` and a reader comparing the four should
     /// not have to work out why one is spelled differently — ADR-0012 §3, one quantity one answer
     /// across a family. Said here so the symmetry is not later mistaken for coverage.
+    ///
+    /// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
     fn extract(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, Vec<u8>) {
         let w = w.min(self.width.saturating_sub(x));
         let h = h.min(self.height.saturating_sub(y));
@@ -1573,12 +1577,14 @@ mod tests {
     /// `checked_mul` below it could never be reached and its mutation could not redden — a guard
     /// with no firing mechanism, which is the defect the graph's own `place` node argues against.
     /// Called directly with a bare `Rect16`, `decode_wts1` is total for the whole parameter type
-    /// ([ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §1: the caller's
+    /// ([ADR-0012] §1: the caller's
     /// guarantee is not this function's contract).
     ///
     /// Target-gated like the five sibling codec guards (`color`, `planar`, `pointer`, `rle`,
     /// `rfx`): 65535 x 65535 x 4 = 17_179_344_900 exceeds `u32::MAX` and fits 64 bits, so only
     /// a 32-bit `usize` can observe the refusal (memory `wasm32_overflow_proof_via_i686`).
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     #[cfg(target_pointer_width = "32")]
     #[test]
     fn decode_wts1_is_total_for_a_rectangle_its_caller_would_have_refused() {
@@ -2764,7 +2770,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
-        /// [untrusted decode never panics](../../../docs/map/invariant/untrusted-decode-never-panics.md),
+        /// [untrusted decode never panics],
         /// on the EGFX live path (#267). Reaching the end is the assertion; `proptest` shrinks
         /// any panic to a minimal counterexample.
         ///
@@ -2792,6 +2798,8 @@ mod tests {
         /// - **Progressive's deep loops.** Payloads are 512 arbitrary bytes, which reaches
         ///   each codec's entry and early refusals, not `paint_tile`'s `numTiles`x`numRects`
         ///   quadratic — an open member the invariant note already names.
+        ///
+        /// [untrusted decode never panics]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
         #[test]
         fn graphics_processor_is_total_over_arbitrary_sessions(session in session()) {
             let mut p = GraphicsProcessor::default();

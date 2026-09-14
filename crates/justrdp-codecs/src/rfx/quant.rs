@@ -62,7 +62,7 @@ pub const BANDS_EXTRAPOLATE: [(usize, usize); 10] = [
 /// `shift = exponent - 1`, and an exponent of 0 or 1 leaves its band untouched.
 ///
 /// **The refusal is here rather than at the shift, and it is written on the shift rather than
-/// on the nibble** ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1–§2).
+/// on the nibble** ([ADR-0012] §1–§2).
 /// `Quant::decode` masks every field to `0..=15`, so no server can reach the error — but the
 /// guarantee lives in the parser and the fields are plain `pub u8`, so it does not reach this
 /// function's contract. The threshold is `shift >= 16` because that is where `i16 <<` is
@@ -91,12 +91,14 @@ pub const BANDS_EXTRAPOLATE: [(usize, usize); 10] = [
 /// The reason it is refused rather than skipped is **not** that FreeRDP refuses: it is that
 /// `super::progressive::first_pass_shift` already refused the identically undefined
 /// `bitPos == 0`, and one quantity gets one answer across a codec family
-/// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §3). #233 settled it;
+/// ([ADR-0012] §3). #233 settled it;
 /// the two functions now differ only in their error type.
 ///
 /// `exponent == 1` is untouched by that and must stay so — it shifts by 0, which is a band the
 /// spec asks to leave alone. `saturating_sub` could not tell the two apart, which is the whole
 /// of what was wrong.
+///
+/// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
 pub fn shifts(quant: &Quant) -> Result<[u8; 10], RfxError> {
     let exponents = [
         quant.hl1, quant.lh1, quant.hh1, quant.hl2, quant.lh2, quant.hh2, quant.hl3, quant.lh3,
@@ -344,7 +346,7 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// [untrusted decode never panics](../../../../../docs/map/invariant/untrusted-decode-never-panics.md)
+        /// [untrusted decode never panics]
         /// for ADR-0012's own worked example. `shifts` and `dequantize` were the pair that opened
         /// the record (#211) and the pair that closed its outstanding instance (#233), and until
         /// now neither carried a property — only hand-written vectors, which is precisely the
@@ -354,6 +356,8 @@ mod tests {
         /// produces. A generator bounded to the parser's output asserts the parser (ADR-0012
         /// Consequences), and here that would hide both refusals: the zero at one end and the
         /// 16-or-wider shift at the other.
+        ///
+        /// [untrusted decode never panics]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
         #[test]
         fn shifts_then_dequantize_is_total_over_every_exponent_tuple(
             bands in proptest::collection::vec(proptest::prelude::any::<u8>(), 10..=10),

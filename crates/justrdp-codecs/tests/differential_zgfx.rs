@@ -4,7 +4,7 @@
 //! **sequences** rather than one message at a time.
 //!
 //! What this instrument is and is not. `ironrdp-graphics` shares this project's code lineage
-//! ([`oracle-agreement-is-not-independence`](../../../docs/map/invariant/oracle-agreement-is-not-independence.md)),
+//! ([`oracle-agreement-is-not-independence`]),
 //! so agreement here is breadth, not independence. The independent expectation lives in
 //! `src/zgfx.rs`'s unit tests: the `[MS-RDPEGFX]` sample that FreeRDP and `ironrdp-graphics`
 //! reproduce identically, which is the basis ADR-0011 asks for. This file's job is the input
@@ -18,6 +18,8 @@
 //! stay under that ceiling; the divergence itself is pinned by
 //! `a_single_segment_expanding_past_the_spec_ceiling_is_refused` below rather than left
 //! implicit.
+//!
+//! [`oracle-agreement-is-not-independence`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/oracle-agreement-is-not-independence.md
 
 use ironrdp_graphics::zgfx::{CompressionMode, Compressor, Decompressor, compress_and_wrap_egfx};
 use justrdp_codecs::zgfx::{Zgfx, ZgfxError};

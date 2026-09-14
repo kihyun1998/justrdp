@@ -40,7 +40,7 @@
 //! range held the algorithm and not its initial state.** Initial state is set by callers, so a
 //! citation that spans fewer lines than the state it depends on is not the proof it looks like.
 //! Recorded on
-//! [`oracle-agreement-is-not-independence`](../../../docs/map/invariant/oracle-agreement-is-not-independence.md).
+//! [`oracle-agreement-is-not-independence`].
 //!
 //! The vector set below is re-derived, and re-designed — the old set's three "positive
 //! controls" were controls only under the wrong initial state (see the harness note below), and
@@ -110,6 +110,8 @@
 //! `reading_zero_bits_consumes_nothing` pin the bit cursor's order and its end-of-stream
 //! behaviour as unit tests. That is a stronger proof than the old controls were, because it
 //! cannot be satisfied by two implementations sharing a mistake.
+//!
+//! [`oracle-agreement-is-not-independence`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/oracle-agreement-is-not-independence.md
 
 use justrdp_codecs::rfx::quant::COMPONENT_LEN;
 use justrdp_codecs::rfx::srl;

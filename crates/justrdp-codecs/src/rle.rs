@@ -36,7 +36,9 @@ pub enum RleError {
     /// wiring is asserted end-to-end**; the threshold itself is pinned once on
     /// `crate::allocatable`, through which every guard in the family now narrows. Per-site
     /// state, and what is deliberately not asserted, in
-    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
+    /// [the invariant].
+    ///
+    /// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
     DimensionsOverflow {
         /// The requested width.
         width: usize,

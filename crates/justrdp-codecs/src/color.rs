@@ -53,7 +53,9 @@ pub enum ColorError {
     /// 2_232_000_000. The source-length check bounds the request only by the 4x amplification
     /// of a 1-byte-per-pixel source. The reserve now narrows through `crate::allocatable`,
     /// which is the family's one answer to that threshold. See
-    /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
+    /// [the invariant].
+    ///
+    /// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
     DimensionsOverflow {
         /// The requested width.
         width: usize,
@@ -391,7 +393,9 @@ mod tests {
     /// `bottom_up` flip — would go unexercised while the property still ran green. This repo has
     /// already shipped that exact defect once: `nscodec`'s no-panic property documented itself as
     /// covering *"any colour-loss level"*, generated `1u8..=7`, and passed over a live panic
-    /// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) Consequences).
+    /// ([ADR-0012] Consequences).
+    ///
+    /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
     fn depth() -> impl Strategy<Value = u16> {
         prop_oneof![
             9 => prop::sample::select(vec![8u16, 15, 16, 24, 32]),
@@ -420,11 +424,13 @@ mod tests {
     }
 
     proptest! {
-        /// [untrusted decode never panics](../../../../docs/map/invariant/untrusted-decode-never-panics.md).
+        /// [untrusted decode never panics].
         /// `to_rgba` takes `width`, `height` and `bits_per_pixel` straight off the wire — a bitmap
         /// update rectangle (`session.rs`) or an EGFX surface/cache command (`egfx.rs`) — and
         /// sizes two buffers from their products. It is the third member of ADR-0012's class and
         /// the one that had neither artifact (#238).
+        ///
+        /// [untrusted decode never panics]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
         #[test]
         fn to_rgba_is_total_over_arbitrary_dimensions(
             bits in depth(),

@@ -263,7 +263,9 @@ fn temp_dims(width: usize, height: usize) -> Option<(usize, usize)> {
 /// `decode_plane` then trusts, and its empty-input branch is `vec![0xFF; original_size]` — so a
 /// saturated `usize::MAX` turns an arithmetic overflow into an allocation of the whole address
 /// space. Refusing is the only answer that stays a refusal downstream
-/// ([ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1).
+/// ([ADR-0012] §1).
+///
+/// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md
 pub fn plane_sizes(
     width: usize,
     height: usize,
