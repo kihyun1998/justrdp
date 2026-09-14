@@ -88,9 +88,10 @@ rather than by capability:
   `ironrdp-egfx` advertises them and discharges the obligation by accepting the command and
   recording the mapping. Both are conforming. What is *not* conforming is advertising them and
   skipping it.
-- **#253** is the same fact one layer down and still open: a Share Data header field whose
-  "must be 0" rests on our never advertising compression, unverified at the boundary, where
-  the DVC layer rejects the identical violation.
+- **#253** was the same fact one layer down: a Share Data header field whose "must be 0"
+  rested on our never advertising compression, unverified at the boundary, where the DVC layer
+  rejected the identical violation. Closed — `ShareDataHeader::decode` now refuses
+  `PACKET_COMPRESSED`, the same answer fast-path and the SVC layer give.
 
 ## Where it will recur
 

@@ -1223,18 +1223,23 @@ mod tests {
         ))
     }
 
+    /// [`server_data_pdu`] with the Share Data header's `compressedType` byte replaced.
+    fn server_data_pdu_compressed_type(pdu_type2: u8, compressed_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut user_data =
+            share::encode_share_data(1002, SHARE, share::STREAM_MED, pdu_type2, body);
+        // shareControlHeader (6) + shareId (4) + pad (1) + streamId (1) + uncompressedLength (2)
+        // + pduType2 (1) puts compressedType at 15.
+        assert_eq!((user_data[14], user_data[15]), (pdu_type2, 0));
+        user_data[15] = compressed_type;
+        server_io_frame(&user_data)
+    }
+
     /// An uncompressed 24-bpp bitmap update: one rect at (x,y), w×h, all pixels `bgr`.
     fn bitmap_update_frame(x: u16, y: u16, w: u16, h: u16, bgr: [u8; 3]) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&update::UPDATETYPE_BITMAP.to_le_bytes());
-        body.extend_from_slice(&1u16.to_le_bytes());
-        for v in [x, y, x + w - 1, y + h - 1, w, h, 24, 0] {
-            body.extend_from_slice(&v.to_le_bytes());
-        }
-        let data: Vec<u8> = (0..w as usize * h as usize).flat_map(|_| bgr).collect();
-        body.extend_from_slice(&(data.len() as u16).to_le_bytes());
-        body.extend_from_slice(&data);
-        server_data_pdu(share::PDU_TYPE2_UPDATE, &body)
+        server_data_pdu(
+            share::PDU_TYPE2_UPDATE,
+            &bitmap_update_body(x, y, w, h, bgr),
+        )
     }
 
     /// A TS_FP_POINTERATTRIBUTE body: a 1×1 shape at `xor_bpp` 32 with one BGRA pixel,
@@ -1310,6 +1315,54 @@ mod tests {
             matches!(outputs.as_slice(), [SessionOutput::Frame(_)]),
             "expected the reassembled frame, got {outputs:?}"
         );
+    }
+
+    /// Issue #253. justrdp has no bulk decompressor, so a Share Data PDU flagged
+    /// `PACKET_COMPRESSED` is a typed error rather than its compressed bytes read as fields —
+    /// the answer fast-path and the SVC layer already give (ADR-0009 §1). The body is a valid
+    /// uncompressed bitmap update, so without the check this paints a frame.
+    #[test]
+    fn a_compressed_share_data_pdu_is_a_typed_error() {
+        let body = bitmap_update_body(0, 0, 4, 4, [9, 8, 7]);
+        for compressed_type in [0x20, 0x21, 0xA1] {
+            let mut sm = SessionStateMachine::new(config(), Vec::new())
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let frame =
+                server_data_pdu_compressed_type(share::PDU_TYPE2_UPDATE, compressed_type, &body);
+            assert!(
+                matches!(
+                    sm.process_bytes(&frame),
+                    Err(SessionError::Decode(
+                        justrdp_pdu::DecodeError::InvalidField {
+                            field: "TS_SHAREDATAHEADER.compressedType",
+                            ..
+                        }
+                    ))
+                ),
+                "compressedType {compressed_type:#04x} should be refused"
+            );
+        }
+    }
+
+    /// The other half of #253's predicate: without `PACKET_COMPRESSED` the payload is plain
+    /// bytes whatever the type nibble, `PACKET_AT_FRONT` or `PACKET_FLUSHED` say
+    /// (2.2.8.1.1.1.2), so none of them is refused.
+    #[test]
+    fn share_data_flags_without_packet_compressed_still_decode() {
+        let body = bitmap_update_body(0, 0, 4, 4, [9, 8, 7]);
+        for compressed_type in [0x01, 0x40, 0x80, 0xCF] {
+            let mut sm = SessionStateMachine::new(config(), Vec::new())
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let frame =
+                server_data_pdu_compressed_type(share::PDU_TYPE2_UPDATE, compressed_type, &body);
+            let outputs = sm
+                .process_bytes(&frame)
+                .unwrap_or_else(|e| panic!("compressedType {compressed_type:#04x}: {e:?}"));
+            assert!(
+                matches!(outputs.as_slice(), [SessionOutput::Frame(_)]),
+                "compressedType {compressed_type:#04x} should paint, got {outputs:?}"
+            );
+        }
     }
 
     #[test]
