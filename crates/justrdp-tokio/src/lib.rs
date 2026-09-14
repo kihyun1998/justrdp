@@ -656,6 +656,7 @@ pub enum SessionFailure {
     /// Socket-level I/O failed.
     Io(io::Error),
     /// The server sent data the session machine rejects (malformed PDU / codec data).
+    /// A dynamic channel's processor failure arrives as [`SessionError::DynamicChannel`].
     Protocol(SessionError),
 }
 

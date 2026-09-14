@@ -12,7 +12,7 @@
 
 use crate::cursor::{CursorEvent, CursorImage};
 use crate::disconnect::{DisconnectReason, ServerDisconnectCause};
-use crate::dvc::{Drdynvc, DvcEvent};
+use crate::dvc::{Drdynvc, DvcError, DvcEvent};
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::{planar, pointer as pointer_codec, rle};
@@ -108,6 +108,18 @@ impl core::error::Error for ResizeError {}
 pub enum SessionError {
     /// A malformed PDU.
     Decode(justrdp_pdu::DecodeError),
+    /// A dynamic channel's processor rejected a complete channel message (ADR-0014 Decision 2).
+    ///
+    /// Only a processor's own verdict lands here. A failure of the drdynvc transport under it —
+    /// SVC chunking, a malformed drdynvc PDU, a reassembly cap — is [`Self::Decode`], even on a
+    /// channel that is open.
+    DynamicChannel {
+        /// The channel name the server created it under, e.g.
+        /// `"Microsoft::Windows::RDS::Graphics"`.
+        channel: &'static str,
+        /// What the processor returned.
+        error: justrdp_pdu::DecodeError,
+    },
     /// The desktop size the server declared cannot be allocated
     /// ([`crate::framebuffer::FramebufferError`]).
     ///
@@ -130,6 +142,9 @@ impl core::fmt::Display for SessionError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SessionError::Decode(e) => write!(f, "malformed session PDU: {e}"),
+            SessionError::DynamicChannel { channel, error } => {
+                write!(f, "dynamic channel {channel}: {error}")
+            }
             SessionError::Rle(e) => write!(f, "interleaved RLE: {e}"),
             SessionError::Planar(e) => write!(f, "RDP6 planar: {e}"),
             SessionError::Color(e) => write!(f, "pixel conversion: {e}"),
@@ -140,6 +155,17 @@ impl core::fmt::Display for SessionError {
 }
 
 impl core::error::Error for SessionError {}
+
+impl From<DvcError> for SessionError {
+    fn from(error: DvcError) -> Self {
+        match error {
+            DvcError::Transport(e) => SessionError::Decode(e),
+            DvcError::Processor { channel, error } => {
+                SessionError::DynamicChannel { channel, error }
+            }
+        }
+    }
+}
 
 /// The event a decoded shape surfaces as: zero-sized shapes are the wire form of "no shape"
 /// (servers send them to blank the cursor), so they arrive as [`CursorEvent::Hidden`].
@@ -839,10 +865,7 @@ impl SessionStateMachine {
         payload: &[u8],
         outputs: &mut Vec<SessionOutput>,
     ) -> Result<(), SessionError> {
-        let events = self
-            .drdynvc
-            .on_svc_payload(payload)
-            .map_err(SessionError::Decode)?;
+        let events = self.drdynvc.on_svc_payload(payload)?;
         for event in events {
             match event {
                 DvcEvent::Send(pdu) => {
@@ -2121,6 +2144,31 @@ mod tests {
             .collect()
     }
 
+    /// A fresh machine with the drdynvc capabilities exchanged and dynamic channel `channel_id`
+    /// created as `name`.
+    fn with_open_dvc(channel_id: u8, name: &str) -> SessionStateMachine {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        for frame in server_dvc_frames(&[0x50, 0x00, 0x01, 0x00])
+            .into_iter()
+            .chain(server_dvc_create(channel_id, name))
+        {
+            sm.process_bytes(&frame).unwrap();
+        }
+        sm
+    }
+
+    /// An `RDPGFX_SOLIDFILL_PDU` body filling one 4×4 rect of surface 1.
+    fn solid_fill_surface_1() -> Vec<u8> {
+        [
+            &1u16.to_le_bytes()[..],
+            &[0, 0, 0xFF, 0],
+            &1u16.to_le_bytes(),
+            &[0, 0, 0, 0, 4, 0, 4, 0],
+        ]
+        .concat()
+    }
+
     /// `[MS-RDPEDYC]` 3.1.1 lets a server reuse a channel id only after a Close, and the probe on
     /// #270 saw this server recycle one within 40 ms — first for two channels we refuse, then
     /// for one we accept. A Create Request for an id that is still bound replaces the binding
@@ -2160,25 +2208,10 @@ mod tests {
             .into_iter()
             .chain([justrdp_pdu::egfx::PIXEL_FORMAT_XRGB_8888])
             .collect::<Vec<u8>>();
-        let solid_fill = [
-            &1u16.to_le_bytes()[..],
-            &[0, 0, 0xFF, 0],
-            &1u16.to_le_bytes(),
-            &[0, 0, 0, 0, 4, 0, 4, 0],
-        ]
-        .concat();
+        let solid_fill = solid_fill_surface_1();
         let open_with_surface = || {
-            let mut sm = SessionStateMachine::new(config(), Vec::new())
-                .expect("the test desktop size is within MAX_DESKTOP_DIM");
-            for frame in server_dvc_frames(&[0x50, 0x00, 0x01, 0x00])
-                .into_iter()
-                .chain(server_dvc_create(8, justrdp_pdu::egfx::CHANNEL_NAME))
-                .chain(server_egfx(
-                    8,
-                    justrdp_pdu::egfx::CMDID_CREATE_SURFACE,
-                    &create_surface,
-                ))
-            {
+            let mut sm = with_open_dvc(8, justrdp_pdu::egfx::CHANNEL_NAME);
+            for frame in server_egfx(8, justrdp_pdu::egfx::CMDID_CREATE_SURFACE, &create_surface) {
                 sm.process_bytes(&frame).unwrap();
             }
             sm
@@ -2202,14 +2235,113 @@ mod tests {
         assert!(
             results.iter().any(|r| matches!(
                 r,
+                Err(SessionError::DynamicChannel {
+                    error: justrdp_pdu::DecodeError::InvalidField {
+                        field: "RDPGFX_SOLIDFILL_PDU",
+                        ..
+                    },
+                    ..
+                })
+            )),
+            "the rebound binding should not know surface 1, got {results:?}"
+        );
+    }
+
+    /// ADR-0014 Decision 2: a session ended by a dynamic-channel processor names the channel.
+    /// Here the graphics processor rejects a fill naming a surface it never created.
+    #[test]
+    fn a_failing_graphics_processor_names_its_channel() {
+        let mut sm = with_open_dvc(8, justrdp_pdu::egfx::CHANNEL_NAME);
+        let results: Vec<_> = server_egfx(
+            8,
+            justrdp_pdu::egfx::CMDID_SOLID_FILL,
+            &solid_fill_surface_1(),
+        )
+        .iter()
+        .map(|frame| sm.process_bytes(frame))
+        .collect();
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                Err(SessionError::DynamicChannel {
+                    channel: "Microsoft::Windows::RDS::Graphics",
+                    error: justrdp_pdu::DecodeError::InvalidField {
+                        field: "RDPGFX_SOLIDFILL_PDU",
+                        ..
+                    },
+                })
+            )),
+            "the failure should name the graphics channel, got {results:?}"
+        );
+    }
+
+    /// The same attribution for the other registered processor: a Display Control PDU whose
+    /// header length does not cover the header.
+    #[test]
+    fn a_failing_display_control_processor_names_its_channel() {
+        let mut sm = with_open_dvc(7, displaycontrol::CHANNEL_NAME);
+        let mut malformed = Vec::new();
+        malformed.extend_from_slice(&displaycontrol::TYPE_CAPS.to_le_bytes());
+        malformed.extend_from_slice(&4u32.to_le_bytes());
+        let results: Vec<_> = dvc::encode_data(7, &malformed)
+            .iter()
+            .flat_map(|pdu| server_dvc_frames(pdu))
+            .map(|frame| sm.process_bytes(&frame))
+            .collect();
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                Err(SessionError::DynamicChannel {
+                    channel: "Microsoft::Windows::RDS::DisplayControl",
+                    error: justrdp_pdu::DecodeError::InvalidField {
+                        field: "DISPLAYCONTROL_HEADER.Length",
+                        ..
+                    },
+                })
+            )),
+            "the failure should name the Display Control channel, got {results:?}"
+        );
+    }
+
+    /// A malformed Share Data PDU is no dynamic channel's failure.
+    #[test]
+    fn a_share_data_failure_is_not_attributed_to_a_channel() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        assert!(matches!(
+            sm.process_bytes(&server_data_pdu(
+                share::PDU_TYPE2_SET_ERROR_INFO,
+                &[0x0C, 0x00]
+            )),
+            Err(SessionError::Decode(_))
+        ));
+    }
+
+    /// Nor is a drdynvc transport failure on a channel that is open: the reassembly cap is the
+    /// manager's bound, not the processor's verdict.
+    #[test]
+    fn an_open_channels_transport_failure_is_not_attributed_to_it() {
+        let mut sm = with_open_dvc(8, justrdp_pdu::egfx::CHANNEL_NAME);
+        // DYNVC_DATA_FIRST (Cmd 2, Sp 2 = 4-byte Length, cbChId 0) on channel 8 declaring a
+        // message past the reassembly cap.
+        let mut data_first = vec![0x28, 8];
+        data_first.extend_from_slice(&u32::MAX.to_le_bytes());
+        data_first.extend_from_slice(&[0; 4]);
+        let results: Vec<_> = server_dvc_frames(&data_first)
+            .iter()
+            .map(|frame| sm.process_bytes(frame))
+            .collect();
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
                 Err(SessionError::Decode(
                     justrdp_pdu::DecodeError::InvalidField {
-                        field: "RDPGFX_SOLIDFILL_PDU",
+                        field: "DYNVC_DATA_FIRST.Length",
                         ..
                     }
                 ))
             )),
-            "the rebound binding should not know surface 1, got {results:?}"
+            "an open channel's transport failure is not its processor's, got {results:?}"
         );
     }
 

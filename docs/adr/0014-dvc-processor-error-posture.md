@@ -1,6 +1,6 @@
 # 0014 — A DVC processor error drops the connection, attributably; the recovery ladder is #272's
 
-- Status: Accepted (issue #270)
+- Status: Accepted (issue #270) — Decision 2 implemented by #285; see the Amendment below (2026-09-15)
 - Date: 2026-09-14
 - Kind: **judgement** — the maintainer chose between three shapes whose consequences were
   enumerated (below). A better derivation does not reopen it; the maintainer does.
@@ -117,3 +117,23 @@ Recorded so the next pass does not read these as settled by it:
   classes, at the split's full cost plus a host API.
 - **Close the graphics channel as FreeRDP does.** The prior art is an example, not an authority;
   this project's own measurement priced it as a frozen screen with no fallback and no signal.
+
+## Amendment (2026-09-15, #285): Decision 2's carrier, and where attribution stops
+
+Decision 2 is implemented, so its *"Today a host receives `SessionFailure::Protocol` and cannot
+tell…"* describes the tree before #285. The carrier is `SessionError::DynamicChannel { channel,
+error }`, reaching the host inside `SessionFailure::Protocol`; `channel` is the name the processor
+registered under (`DvcProcessor::channel_name`). Behaviour is unchanged — the variant still ends
+the session. The carrier's shape is a derivation and falls to a better one.
+
+**Where attribution stops is a judgement**, and it is the maintainer's. Only an error a
+`DvcProcessor::process` returned is attributed. Shown before implementation, with the alternative
+of also naming the channel for it, the maintainer kept a **drdynvc transport failure on a channel
+that is open** — the `DYNVC_DATA_FIRST.Length` reassembly cap — as `SessionError::Decode`: the cap
+is the manager's bound, not the processor's verdict. The same line leaves two channel-originated
+failures unattributed, and neither is settled by this amendment:
+
+- a `SessionError::Framebuffer` raised by an EGFX `OutputResized` — refused in the session machine,
+  outside `process` (#286);
+- the manager errors this record already listed as not covered (SVC reassembly, a malformed
+  drdynvc PDU), which no channel can be blamed for.
