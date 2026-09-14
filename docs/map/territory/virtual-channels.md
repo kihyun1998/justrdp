@@ -11,8 +11,9 @@ exactly one DVC consumer beyond graphics: Display Control.
 
 ## Governing decisions
 
-**None.** No ADR is about channels (measured: "virtual channel" appears in 1 of 10
-records).
+- [ADR-0014](../../adr/0014-dvc-processor-error-posture.md) — every error a `DvcProcessor`
+  returns drops the connection, and the failure must name the channel; the recovery ladder
+  (reset, then what) belongs to #272. Before it, no ADR was about channels.
 
 Adjacent but not governing: `CONTEXT.md` defines **Virtual Channel** in the
 glossary, which is vocabulary rather than a decision.

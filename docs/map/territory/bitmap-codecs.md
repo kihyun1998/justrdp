@@ -134,7 +134,7 @@ attacker-controlled bytes in the repo.
   everything that *allocates and returns* refuses, including `freerdp_glyph_convert_ex`
   (`color.c:265-267`, `return nullptr`), which is `to_rgba`'s exact shape. We go the other way
   on what the one reachable consumer does with the error: `justrdp::egfx`'s uncompressed WTS1
-  arm propagates a `ColorError` with `?`, **fatal for the channel** where every other codec arm
+  arm propagates a `ColorError` with `?`, **fatal for the session** where every other codec arm
   there warn-and-skips, and `[MS-RDPEGFX]` 2.2.1.2 makes `RDPGFX_RECT16` exclusive with no
   non-zero requirement — so `right == left` is spec-legal and refusing would drop a healthy
   session over a legal empty rectangle ([ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)

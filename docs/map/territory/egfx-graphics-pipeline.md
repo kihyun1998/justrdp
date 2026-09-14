@@ -193,14 +193,18 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   CHANNEL_RC_OK) status = dvcman_channel_close(...)`, introduced deliberately in `17e0d251`
   (2020-03-04) *"as expected by Microsoft's windows protocols test suite"*. **IronRDP** does not
   bound the count at all, and its compositor paint operations are infallible (`-> ()`), so it
-  has no place to put a refusal even if it wanted one. **Microsoft's own conformance suite**
-  expects a whole-connection drop for a *structurally inconsistent* graphics command but
-  expects *tolerate and acknowledge the frame* for a `CACHE_TO_SURFACE` naming a nonexistent
-  cache slot — and **an over-budget count is well-formed**, which puts it on the tolerate side
-  of Microsoft's own line. That is the argument for skip rather than refuse, and it is recorded
-  nowhere else. Two siblings bound how much this could be got wrong: **#270** (which DVC errors
-  should close a channel versus drop the connection — every one drops it today, so "refuse"
-  here would have cost the whole session, not the channel) and **#271**, whose premise this territory
+  has no place to put a refusal even if it wanted one. **An over-budget count is well-formed**,
+  and refusing it would drop a session over a resource ceiling that is ours, not the spec's —
+  that is the argument for skip rather than refuse (ADR-0009, 2026-08-31 amendment). This
+  bullet used to add that **Microsoft's conformance suite** draws the same line, tolerating a
+  `CACHE_TO_SURFACE` naming a nonexistent cache slot. **That was false against the suite's
+  code** (#270's enumeration, [ADR-0014](../../adr/0014-dvc-processor-error-posture.md)): the
+  test calls its drop-connection helper and only the design document says *"expect a frame
+  acknowledge"*, and the helper asserts a drop only under a switch the suite turns off for most
+  Windows client versions. The skip stands on the first ground alone. Two siblings bound how much
+  this could be got wrong: **#270** (decided by ADR-0014: every processor error still drops the
+  connection, attributably, so "refuse" here would have cost the whole session, not the channel)
+  and **#271**, whose premise this territory
   carried and which is now **false**: the ladder reached only `CAPVERSION_10`, so the spec's
   own channel-reset mechanism was unreachable from here. It reaches **10.4** as of #271, and
   3.3.5.19 makes the reset available from 10.3 upward — so the cheapest rung of that ladder

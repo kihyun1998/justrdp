@@ -668,9 +668,10 @@ no implementation here. Next: grill §10 + the Part II open questions, then slic
   and the PDU is exactly what the spec permits — there is nothing to report an error *about*,
   and refusing it would drop a session over a resource ceiling that is ours and not the
   spec's. A `destRect` naming a bitmap no admissible surface could hold is not well-formed, and
-  that is why it refuses. Microsoft's own conformance suite draws the line in the same place
-  (see the `## Deliberate divergences` row owed for this, and #270 on what an EGFX `Err`
-  actually costs today — every one of them drops the whole connection, not the channel).
+  that is why it refuses. This entry used to add that Microsoft's conformance suite draws the
+  line in the same place; #270's enumeration found the suite's test code does not, and
+  [ADR-0014](adr/0014-dvc-processor-error-posture.md) records what an EGFX `Err` costs —
+  the whole connection, not the channel, and deliberately so.
 - [ ] **M — Zeroization of secrets.** Any in-memory credential (password, PIN, private key, session nonce) must be overwritten with zeros after use so a dump of the process heap doesn't leak it. Use `zeroize` crate or `volatile_write`. *ironrdp ref: `sspi` does this; we inherit it.*
 - [ ] **M — No credentials in logs.** Password is never logged (see 11d redaction). If an error occurs during CredSSP, the error message must not include the challenge/response tokens, only "CredSSP failed: <reason>". *ironrdp ref: this repo's auth.rs + error redaction.*
 - [ ] **O** — Fuzzing of decoders. If codec coverage expands (Progressive, H.264, NSCodec), fuzz the decoders with AFL/libFuzzer to find panics/OOM in untrusted input. *Not in MVP.*
