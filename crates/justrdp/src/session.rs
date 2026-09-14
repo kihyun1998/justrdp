@@ -2100,6 +2100,119 @@ mod tests {
         assert_eq!(tpkt::frame_len(&frames[0]).unwrap(), frames[0].len());
     }
 
+    /// A server Create Request for dynamic channel `channel_id` named `name`, as SVC frames.
+    fn server_dvc_create(channel_id: u8, name: &str) -> Vec<Vec<u8>> {
+        let mut create = vec![0x10, channel_id];
+        create.extend_from_slice(name.as_bytes());
+        create.push(0);
+        server_dvc_frames(&create)
+    }
+
+    /// One EGFX PDU on dynamic channel `channel_id`, uncompressed-segment wrapped.
+    fn server_egfx(channel_id: u32, cmd_id: u16, body: &[u8]) -> Vec<Vec<u8>> {
+        let mut pdu = Vec::new();
+        pdu.extend_from_slice(&cmd_id.to_le_bytes());
+        pdu.extend_from_slice(&0u16.to_le_bytes());
+        pdu.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
+        pdu.extend_from_slice(body);
+        dvc::encode_data(channel_id, &justrdp_pdu::egfx::wrap_uncompressed(&pdu))
+            .iter()
+            .flat_map(|data| server_dvc_frames(data))
+            .collect()
+    }
+
+    /// `[MS-RDPEDYC]` 3.1.1 lets a server reuse a channel id only after a Close, and the probe on
+    /// #270 saw this server recycle one within 40 ms — first for two channels we refuse, then
+    /// for one we accept. A Create Request for an id that is still bound replaces the binding
+    /// either way, so it must tear the old one down the way a Close does: here the old binding
+    /// was Display Control, and resize requests must stop going to an id the server has reused.
+    #[test]
+    fn a_rebound_channel_id_no_longer_receives_resize_requests() {
+        for (name, what) in [
+            (justrdp_pdu::egfx::CHANNEL_NAME, "an accepted channel"),
+            (
+                "Microsoft::Windows::RDS::Geometry::v08.01",
+                "a refused channel",
+            ),
+        ] {
+            let mut sm = SessionStateMachine::new(config(), Vec::new())
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            display_control_ready(&mut sm, 1920, 1080);
+            assert!(sm.request_resize(1280, 1024).is_ok());
+
+            for frame in server_dvc_create(7, name) {
+                sm.process_bytes(&frame).unwrap();
+            }
+            assert!(
+                matches!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady)),
+                "channel 7 was reused for {what}, not Display Control"
+            );
+        }
+    }
+
+    /// The same teardown for a rebound graphics channel: the new binding starts with no
+    /// surfaces, so a fill naming the old binding's surface is the unknown-surface error rather
+    /// than a paint into stale state.
+    #[test]
+    fn a_rebound_graphics_channel_starts_without_the_old_bindings_surfaces() {
+        let create_surface = [1u16.to_le_bytes(), 16u16.to_le_bytes(), 16u16.to_le_bytes()]
+            .concat()
+            .into_iter()
+            .chain([justrdp_pdu::egfx::PIXEL_FORMAT_XRGB_8888])
+            .collect::<Vec<u8>>();
+        let solid_fill = [
+            &1u16.to_le_bytes()[..],
+            &[0, 0, 0xFF, 0],
+            &1u16.to_le_bytes(),
+            &[0, 0, 0, 0, 4, 0, 4, 0],
+        ]
+        .concat();
+        let open_with_surface = || {
+            let mut sm = SessionStateMachine::new(config(), Vec::new())
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            for frame in server_dvc_frames(&[0x50, 0x00, 0x01, 0x00])
+                .into_iter()
+                .chain(server_dvc_create(8, justrdp_pdu::egfx::CHANNEL_NAME))
+                .chain(server_egfx(
+                    8,
+                    justrdp_pdu::egfx::CMDID_CREATE_SURFACE,
+                    &create_surface,
+                ))
+            {
+                sm.process_bytes(&frame).unwrap();
+            }
+            sm
+        };
+
+        // Control: on the original binding the fill paints surface 1.
+        let mut sm = open_with_surface();
+        for frame in server_egfx(8, justrdp_pdu::egfx::CMDID_SOLID_FILL, &solid_fill) {
+            sm.process_bytes(&frame)
+                .expect("surface 1 exists on the original binding");
+        }
+
+        let mut sm = open_with_surface();
+        for frame in server_dvc_create(8, justrdp_pdu::egfx::CHANNEL_NAME) {
+            sm.process_bytes(&frame).unwrap();
+        }
+        let results: Vec<_> = server_egfx(8, justrdp_pdu::egfx::CMDID_SOLID_FILL, &solid_fill)
+            .iter()
+            .map(|frame| sm.process_bytes(frame))
+            .collect();
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                Err(SessionError::Decode(
+                    justrdp_pdu::DecodeError::InvalidField {
+                        field: "RDPGFX_SOLIDFILL_PDU",
+                        ..
+                    }
+                ))
+            )),
+            "the rebound binding should not know surface 1, got {results:?}"
+        );
+    }
+
     #[test]
     fn request_resize_rounds_odd_widths_down_and_validates_ranges() {
         let mut sm = SessionStateMachine::new(config(), Vec::new())

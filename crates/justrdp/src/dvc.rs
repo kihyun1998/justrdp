@@ -264,6 +264,8 @@ impl Drdynvc {
                 ))])
             }
             DvcMessage::CreateRequest { channel_id, name } => {
+                // A Create for a bound id replaces the binding, accepted or not.
+                self.unbind(channel_id);
                 let Some(processor) = self
                     .processors
                     .iter()
@@ -278,7 +280,6 @@ impl Drdynvc {
                         CREATION_STATUS_REFUSED,
                     ))]);
                 };
-                self.open.retain(|c| c.channel_id != channel_id);
                 if self.open.len() >= self.processors.len() * MAX_OPEN_CHANNELS_PER_PROCESSOR {
                     tracing::warn!(
                         target: "rdp_drdynvc",
@@ -351,13 +352,7 @@ impl Drdynvc {
             }
             DvcMessage::Close { channel_id } => {
                 tracing::debug!(target: "rdp_drdynvc", channel_id, "DYNVC close");
-                if let Some(at) = self.open.iter().position(|c| c.channel_id == channel_id) {
-                    let open = self.open.remove(at);
-                    self.processors[open.processor].close();
-                }
-                if self.display_control.map(|(id, _)| id) == Some(channel_id) {
-                    self.display_control = None;
-                }
+                self.unbind(channel_id);
                 Ok(Vec::new())
             }
             // Compressed / soft-sync / unknown commands: never negotiated, skipped
@@ -366,6 +361,18 @@ impl Drdynvc {
                 tracing::debug!(target: "rdp_drdynvc", cmd, "unsupported DYNVC command skipped");
                 Ok(Vec::new())
             }
+        }
+    }
+
+    /// Drop `channel_id`'s binding, if any: its processor state and the Display Control
+    /// target it may have recorded.
+    fn unbind(&mut self, channel_id: u32) {
+        if let Some(at) = self.open.iter().position(|c| c.channel_id == channel_id) {
+            let open = self.open.remove(at);
+            self.processors[open.processor].close();
+        }
+        if self.display_control.map(|(id, _)| id) == Some(channel_id) {
+            self.display_control = None;
         }
     }
 

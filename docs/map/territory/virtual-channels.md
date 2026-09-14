@@ -25,6 +25,13 @@ glossary, which is vocabulary rather than a decision.
   produces a *plausible* truncated message rather than an error.
 - **DVC is a protocol in a channel, so it has its own lifecycle** — a channel the
   client did not open still sends data if the server thinks it did.
+- **A Create Request for an id that is still bound replaces the binding, accepted or refused,
+  and tears it down exactly as a Close does** — the processor's `close()` and any Display
+  Control target recorded for that id (`Drdynvc::unbind`). `[MS-RDPEDYC]` 3.1.1 makes an id
+  reusable only after a Close, but #270's probe saw this server recycle an id within 40 ms,
+  twice for channels we refuse before one we accept. Until the Close path and the create path
+  shared one teardown, a rebind dropped only the routing entry: resize requests kept going to
+  the recycled id, and a rebound graphics channel kept the old binding's surfaces.
 - **Display Control is pull-capable and gated**: `DisplayControlProcessor` only
   becomes usable once the server's caps arrive, which is the moment the session
   emits `DisplayControlReady`.
