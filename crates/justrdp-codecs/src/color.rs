@@ -146,7 +146,7 @@ pub fn to_rgba(
     // We go the other way because of what the one reachable consumption site does with the error.
     // `[MS-RDPEGFX]` 2.2.1.2 makes `RDPGFX_RECT16` **exclusive** with no non-zero requirement, so
     // `right == left` is spec-legal and `Rect16::width()` yields 0 — and `justrdp::egfx`'s
-    // uncompressed WTS1 arm propagates a `ColorError` with `?`, which is **fatal for the channel**,
+    // uncompressed WTS1 arm propagates a `ColorError` with `?`, which is **fatal for the session**,
     // where every other codec arm there warn-and-skips. Refusing would drop a healthy session over
     // a legal empty rectangle: the receive-path strictness [ADR-0009](../../../docs/adr/0009-tolerant-negotiation-posture.md)
     // calls a defect rather than rigor. `pointer::decode_pointer` reaches `Ok(Vec::new())` too, but
