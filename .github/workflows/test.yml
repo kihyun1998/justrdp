@@ -79,6 +79,14 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Rustdoc's link resolver, which neither clippy nor `cargo test` runs (#277). Private items
+      # and all features on purpose; the scope is recorded in
+      # docs/map/territory/supply-chain-and-gates.md.
+      - name: Rustdoc (intra-doc links, -D warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --document-private-items
+
   # Gate for docs/map/ (the dependency graph). Its own job, not a step of `test`: it needs no Rust
   # toolchain and no cache, so it starts and finishes while the build is still compiling — and a
   # docs-only PR gets its answer without waiting for cargo.

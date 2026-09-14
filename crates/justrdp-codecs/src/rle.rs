@@ -34,7 +34,7 @@ pub enum RleError {
     /// 2_400_000_000, because `dst` is sized from the dimensions with no source-length check
     /// above it. **The cheapest instance in the family, which is why this is the site whose
     /// wiring is asserted end-to-end**; the threshold itself is pinned once on
-    /// [`crate::allocatable`], through which every guard in the family now narrows. Per-site
+    /// `crate::allocatable`, through which every guard in the family now narrows. Per-site
     /// state, and what is deliberately not asserted, in
     /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
     DimensionsOverflow {

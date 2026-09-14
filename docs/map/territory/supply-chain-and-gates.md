@@ -27,7 +27,7 @@ like any other.
 ## Design model
 
 - **Four gating workflows and one report.** `test.yml` — two jobs: `test`
-  (fmt → clippy `-D warnings` → `cargo test --workspace`) and `map`
+  (fmt → clippy `-D warnings` → `cargo test --workspace` → rustdoc `-D warnings`) and `map`
   (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
   waiting for cargo); `fuzz.yml` (nightly libFuzzer); `supply-chain.yml`
   (`just-shield`); `overflow-32bit.yml` (the 32-bit target, below). `coverage.yml`
@@ -43,6 +43,25 @@ like any other.
   invariant lists in `justrdp`; and `i686-unknown-linux-gnu` on ubuntu would give the same
   32-bit `usize` at 1x, but nothing here has run it, so the cheaper shape is a measurement
   away rather than an argument away.
+- **Rustdoc is a gate because nothing else runs its link resolver** (#277). Clippy does not,
+  and `cargo test` compiles doc-tests without resolving intra-doc links, so a doc-comment
+  linking a private item rendered as literal `[brackets]` behind every green gate — nine
+  sites when the step was added, none of them stale (each link was written in the commit
+  that added its target, and had never resolved). The step runs
+  `cargo doc --workspace --all-features --no-deps --document-private-items` with
+  `RUSTDOCFLAGS=-D warnings`. Three things about that command were measured, not assumed:
+  - **`-D warnings` is the gate.** Without it the same broken link prints a warning and
+    exits 0.
+  - **`--document-private-items` is the maintainer's call** (#277): stricter than what
+    docs.rs shows, chosen because most of this repo's reasoning lives on private items. It
+    is not cosmetic — an unresolved link *on* a private item (`srl`'s bit cursor citing
+    `rlgr`'s) is reported only with the flag. `--all-features` matches the clippy step
+    and docs.rs, and was the maintainer's call alongside it.
+  - **A red crate hides the crates after it.** The workspace run stops at the first
+    crate rustdoc rejects, so #277's own count of eight was complete for `justrdp-codecs`
+    and missed a ninth in `justrdp-tokio`. Count per crate (`-p`) before trusting a total.
+  What it still cannot see: prose that describes behaviour that no longer exists. A link
+  that resolves says nothing about whether the sentence around it is true.
 - **Every job is bounded, and the number that justifies it lives in exactly one place.** A job
   with no `timeout-minutes` gets GitHub's default of **360**, so a hang costs six runner-hours
   and is indistinguishable from a slow queue. Measured on 2026-08-31 (#262), when a hanging
@@ -179,11 +198,11 @@ and never re-read. Verify at the source before a decision rests on it.
   toolchain bump PR may arrive later than the weekly schedule implies. The lane's existence
   is what ADR-0013 requires and that is verified at source; its punctuality is not, and a
   pin that stays behind is a quiet loss of new diagnostics rather than a red gate.
-- **Documentation is only half-gated.** `docs/map/` now has a link/anchor/symbol/
-  section/reciprocity gate, but **rustdoc is still unbuilt in CI** — no
-  `cargo doc --no-deps` with `-D warnings`, so a public doc-comment can link a private
-  item, or describe behaviour that no longer exists, and every gate stays green. That
-  is exactly how the adapter's "~30 lines" sentence shipped to docs.rs.
+- ~~**Documentation is only half-gated.**~~ **Links closed** by the rustdoc step (#277, see
+  the design model above). **What remains is the other half of the original hole**: a
+  doc-comment that describes behaviour that no longer exists still passes every gate —
+  that is how the adapter's "~30 lines" sentence shipped to docs.rs, and no command in
+  this repo would catch its successor.
 - **A timeout bounds the *gate*, not the loop, and the local run is still unbounded.**
   `timeout-minutes` is a GitHub-Actions key; a maintainer running `cargo test --workspace` on
   the pinned toolchain has no equivalent and a hanging property still hangs forever there. This
@@ -194,3 +213,9 @@ and never re-read. Verify at the source before a decision rests on it.
   which is what `to_rgba_returns_promptly_for_a_zero_extent_of_any_height` does.
 - No release/publish workflow exists yet; nothing is on crates.io, so the whole
   cross-repo half of the discipline is inert by construction.
+  **One thing a first publish would activate** (found by #277): 38 doc-comment links across 15
+  shipped files point at the repository by relative path — `](../../../docs/…)` — and rustdoc
+  does not validate URL links, so the rustdoc gate passes them. Rendered anywhere but a checkout
+  they resolve against the page's own URL, which is derived rather than measured since nothing is
+  published. Recorded here rather than filed, by the maintainer's call, because it is inert until
+  a release exists.

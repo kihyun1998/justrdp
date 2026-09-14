@@ -239,7 +239,7 @@ impl Clear {
     /// (alpha forced to 0xFF — the wire format carries no alpha).
     ///
     /// When `JUSTRDP_CLEAR_CAPTURE_DIR` is set, the raw payload and its decode status are
-    /// dumped there first (see [`capture_clear_payload`]) — the corpus harness for the #56
+    /// dumped there first (see `capture_clear_payload`) — the corpus harness for the #56
     /// rewrite, which needs the very streams the bootstrap oracle rejects.
     pub fn decode_to_bgra(
         &mut self,

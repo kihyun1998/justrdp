@@ -9,7 +9,7 @@
 //! channel join). The TLS handshake and the CredSSP token exchange run here, not in the core:
 //! rustls and `sspi` are their own state machines, so shuttling their records through the
 //! connect machine would add nothing (plan.md §3, decision 10). After [`Action::StartTls`] the
-//! machine's writes and reads transparently ride the TLS stream ([`Transport`]).
+//! machine's writes and reads transparently ride the TLS stream (`Transport`).
 
 use std::collections::VecDeque;
 use std::future::Future;

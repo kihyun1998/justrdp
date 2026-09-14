@@ -51,7 +51,7 @@ pub enum ColorError {
     /// overflow* instead of returning this — reproduced on `i686-pc-windows-msvc` with
     /// `to_rgba(&vec![0u8; 558_000_000], 30_000, 18_600, 8, .., false)`, requesting
     /// 2_232_000_000. The source-length check bounds the request only by the 4x amplification
-    /// of a 1-byte-per-pixel source. The reserve now narrows through [`crate::allocatable`],
+    /// of a 1-byte-per-pixel source. The reserve now narrows through `crate::allocatable`,
     /// which is the family's one answer to that threshold. See
     /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
     DimensionsOverflow {

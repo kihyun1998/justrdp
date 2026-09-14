@@ -51,7 +51,7 @@ pub enum PointerError {
     /// [ADR-0012](../../../docs/adr/0012-consumption-site-totality.md) §1 is written about,
     /// where the wire cannot reach the value (`decode_fastpath` caps a pointer at 96 pixels)
     /// and the signature admits it anyway. `out_len` now narrows through
-    /// [`crate::allocatable`], the family's one answer to that threshold. See
+    /// `crate::allocatable`, the family's one answer to that threshold. See
     /// [the invariant](../../../docs/map/invariant/decoder-dimension-overflow-32bit.md).
     DimensionsOverflow {
         /// The shape width.

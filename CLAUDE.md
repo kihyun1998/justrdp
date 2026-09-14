@@ -88,7 +88,7 @@ Five canonical triage roles mapped 1:1 to default label strings (`needs-triage`,
 Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ### CI gates
-네 게이트: `test.yml`(build/test/clippy + map) + `fuzz.yml`(nightly cargo-fuzz) + `supply-chain.yml`(just-shield, ADR-0006) + `overflow-32bit.yml`(i686 — x64 게이트가 **구조적으로** 못 잡는 dimension-overflow 클래스, path-filtered). 권위 있는 목록은 **`.github/workflows/*.yml` 자체**이고 — 사본을 두지 않는다 —
+네 게이트: `test.yml`(build/test/clippy/rustdoc + map) + `fuzz.yml`(nightly cargo-fuzz) + `supply-chain.yml`(just-shield, ADR-0006) + `overflow-32bit.yml`(i686 — x64 게이트가 **구조적으로** 못 잡는 dimension-overflow 클래스, path-filtered). 권위 있는 목록은 **`.github/workflows/*.yml` 자체**이고 — 사본을 두지 않는다 —
 게이트 정책은 메모리 `justrdp_ci_policy`. **각 게이트는 파이프 없이 bare 로 돌린다**(`bare`
 스킬): 파이프라인의 종료 코드는 마지막 명령의 것이라, 다른 명령을 통과해 걸러진 검사는 늘
 성공하고 **실패할 수 없는 게이트는 게이트가 아니다**.
