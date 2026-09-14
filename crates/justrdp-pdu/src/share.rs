@@ -26,6 +26,9 @@ const PROTOCOL_VERSION: u16 = 0x0010;
 /// Mask isolating the PDU type nibble from `pduType`.
 const PDU_TYPE_MASK: u16 = 0x000F;
 
+/// `compressedType` flag: the payload is bulk-compressed (`PACKET_COMPRESSED`, 2.2.8.1.1.1.2).
+pub const PACKET_COMPRESSED: u8 = 0x20;
+
 /// `pduType2`: Update PDU (graphics: bitmap, palette, synchronize).
 pub const PDU_TYPE2_UPDATE: u8 = 0x02;
 /// `pduType2`: Pointer Update PDU.
@@ -118,9 +121,13 @@ pub struct ShareDataHeader {
     pub uncompressed_length: u16,
     /// `pduType2` — which Share Data PDU follows (one of the `PDU_TYPE2_*` constants).
     pub pdu_type2: u8,
-    /// `compressedType` — must be 0 here: compression is never advertised by this client.
+    /// `compressedType` — compression type nibble plus flags. [`Self::decode`] refuses
+    /// [`PACKET_COMPRESSED`]: justrdp has no bulk decompressor. The other flags and the type
+    /// nibble are left unchecked, because without that flag the payload is plain bytes
+    /// whatever they say.
     pub compressed_type: u8,
-    /// `compressedLength` — 0 when uncompressed.
+    /// `compressedLength` — describes a compressed payload, which [`Self::decode`] never
+    /// admits, so nothing reads it.
     pub compressed_length: u16,
 }
 
@@ -136,6 +143,12 @@ impl ShareDataHeader {
         let uncompressed_length = cur.read_u16_le()?;
         let pdu_type2 = cur.read_u8()?;
         let compressed_type = cur.read_u8()?;
+        if compressed_type & PACKET_COMPRESSED != 0 {
+            return Err(DecodeError::InvalidField {
+                field: "TS_SHAREDATAHEADER.compressedType",
+                reason: "bulk-compressed Share Data PDU, and no bulk decompressor exists",
+            });
+        }
         let compressed_length = cur.read_u16_le()?;
         Ok(Self {
             stream_id,

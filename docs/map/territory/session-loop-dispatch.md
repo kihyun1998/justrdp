@@ -54,8 +54,9 @@ one of its four outputs. Neither says what the loop dispatches or in what order.
 ## Cross-cutting invariants
 
 - [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
-  — `ShareDataHeader.compressed_type` states "must be 0 here" and has no reader, while
-  `dvc.rs` rejects the identical violation class with a typed error and a test (#253).
+  — `ShareDataHeader.compressed_type` stated "must be 0 here" with no reader while `dvc.rs`
+  rejected the identical class; #253 closed it in the decoder both this loop and the connect
+  leg call. `stream_id` is the same header's remaining instance.
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) —
   every byte this loop dispatches came from the network.
 - [The frame path carries no owned pixels](../invariant/frame-path-carries-no-owned-pixels.md)

@@ -2613,6 +2613,35 @@ mod tests {
         }
     }
 
+    /// Issue #253, on the connect leg: the Share Data header check lives in the decoder both
+    /// legs share, so a compressed Font Map fails the connect instead of reaching
+    /// session-active. The body is a valid Font Map, so without the check it would.
+    #[test]
+    fn a_compressed_finalization_reply_is_a_typed_error() {
+        let mut sm = finalizing();
+        let mut user_data = server_share_data(share::PDU_TYPE2_FONT_MAP, &[0, 0, 0, 0, 3, 0, 4, 0]);
+        // shareControlHeader (6) + shareId (4) + pad, streamId, uncompressedLength (4) +
+        // pduType2 (1) puts compressedType at 15.
+        assert_eq!(
+            (user_data[14], user_data[15]),
+            (share::PDU_TYPE2_FONT_MAP, 0)
+        );
+        user_data[15] = share::PACKET_COMPRESSED;
+        let actions = sm.process(Event::Received(&server_io_frame(&user_data)));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::FailWith(ConnectError::Decode(
+                    justrdp_pdu::DecodeError::InvalidField {
+                        field: "TS_SHAREDATAHEADER.compressedType",
+                        ..
+                    }
+                ))]
+            ),
+            "a compressed Font Map should be a typed error, got {actions:?}"
+        );
+    }
+
     #[test]
     fn unknown_data_pdus_during_finalization_are_skipped() {
         let mut sm = finalizing();

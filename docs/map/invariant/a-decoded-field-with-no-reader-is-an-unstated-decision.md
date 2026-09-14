@@ -43,10 +43,15 @@ wrote, unapplied.
   was the sole outlier.
 - [Session loop & PDU dispatch](../territory/session-loop-dispatch.md) /
   [PDU constants & flag tables](../territory/pdu-constants.md) —
-  `ShareDataHeader.compressed_type` states *"must be 0 here: compression is never advertised
-  by this client"* and has no reader, while `dvc.rs` rejects the identical violation class
-  with a typed error and a test. Open as **#253**. `compressed_length` and `stream_id` are the
-  same header, same shape.
+  `ShareDataHeader.compressed_type` stated *"must be 0 here: compression is never advertised
+  by this client"* and had no reader, while `dvc.rs` rejected the identical violation class
+  with a typed error and a test. **Closed by #253**, taking two different ways out on one
+  header: `compressed_type` is **enforced** (`ShareDataHeader::decode` refuses
+  `PACKET_COMPRESSED`, and only that bit — the spec makes a lone `PACKET_FLUSHED` a plain
+  payload), and `compressed_length` is **recorded** (it describes a payload the decoder never
+  admits). **`stream_id` is still an instance**, left out of #253 by the maintainer's call: it
+  is not an attack vector, and enforcing it is a tolerance question the real server's `0x02`
+  does not settle.
 - [MCS, GCC & channel setup](../territory/mcs-gcc-channel-setup.md) —
   `ServerCoreData.client_requested_protocols` is the server's echo of what *we* asked for, and
   nothing compares it. A mismatch is downgrade evidence, and `connect.rs` already rejects a
@@ -61,6 +66,8 @@ wrote, unapplied.
 /// `compressedType` — must be 0 here: compression is never advertised by this client.
 pub compressed_type: u8,
 ```
+
+(`share.rs` as it read before #253.)
 
 A doc-comment that states an invariant, a decoder that parses the field, and a `grep` for
 `.compressed_type` outside the defining module that returns nothing. The doc-comment is the
@@ -80,6 +87,13 @@ is silence**:
 - **#242** (2026-08-25) — the completeness pass over the Font Map body found
   `ShareDataHeader.compressed_type` asserting *"must be 0"* with no reader, and noticed
   `dvc.rs` rejecting the same class. Filed as **#253**, framed as one site.
+- **#253** (2026-09-14) — closed the Share Data header's compression pair. The references
+  split: FreeRDP decompresses on `PACKET_COMPRESSED` whatever was negotiated (`rdp.c`
+  `rdp_recv_data_pdu` → `codec/bulk.c` `bulk_decompress`, which reads the type off the wire), IronRDP errors on *any* of the three flags without a decompressor. The
+  predicate followed the spec and this repo's own family instead — fast-path and the SVC layer
+  both test the compressed bit alone. The real-server fixture could not choose between the two
+  predicates (every `compressedType` it holds is `0x00`), so a pass-through test is what pins
+  the narrower one.
 - **#252** (2026-08-25) — the finalization pass found two more in a different territory:
   `Synchronize.messageType` (discarded under a spec citation the spec does not make — the
   spec's MUST-ignore field is `targetUser`, the reverse) and a server `Control.action`
@@ -112,6 +126,6 @@ does not apply. If yes, **does anything say why nobody checks it?** If no, that 
 instance — pick one of the three ways out above.
 
 Reading the count alone is the trap: a field with one reader can still be an instance if that
-reader is a test, and `stream_id`, `compressed_type` and `compressed_length` are all exactly
-that — read only by `share.rs`'s own round-trip assertions, which check what our encoder wrote
-rather than what a server sent.
+reader is a test, and `stream_id` is exactly that — read only by `share.rs`'s own round-trip
+assertion, which checks what our encoder wrote rather than what a server sent.
+`compressed_type` and `compressed_length` were the same until #253.
