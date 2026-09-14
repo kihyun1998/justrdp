@@ -42,7 +42,7 @@
 //! - `raw_read` returns [`SrlError::ValueOverflow`] for a read too wide to fit a coefficient,
 //!   where `rawShift` (`:1192-1201`) uses a plain C cast. Same family as the `i16` overflow row
 //!   recorded in ADR-0011's #168 amendment, and covered by the same reasoning.
-//! - [`Bits::bits`] consumes `n` bits for any `n`, where winpr's `BitStream_Shift` warns and
+//! - `Bits::bits` consumes `n` bits for any `n`, where winpr's `BitStream_Shift` warns and
 //!   consumes **nothing** for `n >= 32` (`bitstream.h`). Unreachable here: the only call passes
 //!   `k <= 10`.
 //!
@@ -161,7 +161,7 @@ pub const MAX_BIT_POS: u32 = 30;
 
 /// An MSB-first bit cursor that reads **zero bits past the end** of its data.
 ///
-/// That end-of-stream contract is the reason this is not [`super::rlgr::BitReader`], which
+/// That end-of-stream contract is the reason this is not `rlgr`'s `BitReader`, which
 /// answers `None` instead: winpr's `wBitStream` zero-fills its accumulator and prefetch beyond
 /// `capacity` (`winpr/include/winpr/bitstream.h`, the bounds-checked `BitStream_Fetch` /
 /// `BitStream_Prefetch`), and the SRL magnitude loop depends on it — a truncated stream must

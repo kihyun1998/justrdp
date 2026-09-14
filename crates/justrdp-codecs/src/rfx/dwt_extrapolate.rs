@@ -14,7 +14,7 @@
 //!    ([`super::quant::BANDS_EXTRAPOLATE`]).
 //! 2. **The lifting steps change.** With unequal counts the synthesis cannot mirror at both
 //!    ends, so the tail of each line takes one of two shapes depending on whether the line
-//!    length was odd or even — see [`idwt_x`].
+//!    length was odd or even — see `idwt_x`.
 //! 3. **The taps saturate where the classic ones wrap.** FreeRDP's `clampi16`
 //!    (`progressive.c:591-598`) against [`super::dwt`]'s deliberate 16-bit truncation. On a
 //!    tap that overflows the two differ by ~65536, so this is not a detail that washes out.
