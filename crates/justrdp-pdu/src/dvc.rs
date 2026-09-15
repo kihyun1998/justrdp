@@ -1,8 +1,9 @@
 //! Dynamic virtual channel transport PDUs (MS-RDPEDYC) — the `drdynvc` static channel's
 //! payload format. One byte of header packs `Cmd` (bits 4–7), `Sp` (bits 2–3, command-specific)
 //! and `cbId` (bits 0–1, the ChannelId field width); the messages that exist are Capabilities
-//! (0x05), Create (0x01), DataFirst (0x02), Data (0x03), Close (0x04) and the compressed /
-//! soft-sync variants justrdp never negotiates (it answers capabilities with version 1).
+//! (0x05), Create (0x01), DataFirst (0x02), Data (0x03), Close (0x04), and the compressed data
+//! (0x06/0x07, version 3 only) and soft-sync (multitransport only) variants justrdp never
+//! negotiates.
 //!
 //! Channels are **server-created**: the server sends a Create Request naming the channel and
 //! the client accepts or refuses it in the Create Response — there is no "Open" PDU and the
@@ -22,20 +23,20 @@ pub const CMD_DATA: u8 = 0x03;
 pub const CMD_CLOSE: u8 = 0x04;
 /// `Cmd` — Capabilities Request (server→client) / Response (client→server) (2.2.1).
 pub const CMD_CAPABILITIES: u8 = 0x05;
+/// `Cmd` — Data First Compressed (2.2.3.3); only valid between two version-3 managers.
+pub const CMD_DATA_FIRST_COMPRESSED: u8 = 0x06;
+/// `Cmd` — Data Compressed (2.2.3.4); only valid between two version-3 managers.
+pub const CMD_DATA_COMPRESSED: u8 = 0x07;
 
 /// The largest data block carried by a single Data / Data First PDU; longer messages are
 /// fragmented (MS-RDPEDYC 3.1.5.1.2). With the worst-case 6-byte DVC header this stays within
 /// one 1600-byte SVC chunk.
 pub const MAX_DATA_CHUNK: usize = 1590;
 
-/// The capabilities version justrdp answers with: version 3 (capped at the server's offer).
-/// The server-side Graphics channel manager refuses to run over a version-1 transport
-/// (proven on the real VM: a V1 caps response gets the connection reset right after the EGFX
-/// caps advertise; V3 proceeds). The V3 features stay dormant in practice: compressed data
-/// PDUs are not used for EGFX (its payload is already zgfx-compressed end to end), and
-/// soft-sync only occurs when GCC multitransport is advertised, which justrdp does not send.
-/// Both arrive as `Unsupported` and are skipped if a server violates that.
-pub const CAPS_VERSION: u16 = 3;
+/// The capabilities version justrdp answers with, capped at the server's offer: 2, the highest
+/// that invites no message justrdp does not handle (version 3 adds compressed data, MS-RDPEDYC
+/// 1.7).
+pub const CAPS_VERSION: u16 = 2;
 
 /// One decoded drdynvc message (the server→client direction plus the fields shared by both).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,8 +74,9 @@ pub enum DvcMessage<'a> {
         /// The dynamic channel being closed.
         channel_id: u32,
     },
-    /// A command justrdp never negotiates (compressed data, soft-sync) or does not know.
-    /// Well-formed-but-unknown: the session machine skips it (plan.md §11c).
+    /// A command justrdp never negotiates (compressed data, soft-sync) or does not know. The
+    /// session machine refuses the compressed pair (ADR-0009 §1) and skips the rest
+    /// (plan.md §11c).
     Unsupported {
         /// The header's `Cmd` value.
         cmd: u8,
@@ -119,8 +121,7 @@ impl<'a> DvcMessage<'a> {
             CMD_CAPABILITIES => {
                 cur.read_u8()?; // Pad
                 let version = cur.read_u16_le()?;
-                // Version 2/3 append four priority-charge u16s; irrelevant to a version-1
-                // responder, so they are deliberately not decoded.
+                // Version 2/3 append four priority-charge u16s, which are not decoded.
                 Ok(DvcMessage::CapabilitiesRequest { version })
             }
             CMD_CREATE => {

@@ -41,6 +41,33 @@ glossary, which is vocabulary rather than a decision.
 - **Display Control is pull-capable and gated**: `DisplayControlProcessor` only
   becomes usable once the server's caps arrive, which is the moment the session
   emits `DisplayControlReady`.
+- **The drdynvc version answered is 2, and a compressed data PDU is a transport error on any
+  channel** (#287). `[MS-RDPEDYC]` 1.7: version 3 adds *only* `DYNVC_DATA_FIRST_COMPRESSED` /
+  `DYNVC_DATA_COMPRESSED`, which a receiver "MUST decompress" (3.1.5.2.6), and 2.2.3.3/2.2.3.4
+  forbid them below version 3. So `CAPS_VERSION` states the obligation we discharge, and a Cmd 6/7
+  that arrives anyway is unannounced compression (ADR-0009 §1) — refused before any channel
+  lookup, unattributed like every manager failure (ADR-0014 Amendment). It had answered 3 since
+  the EGFX bring-up (`b166aff`) on the recorded ground that the server resets a version-1
+  transport; on 2026-09-15 this VM painted normally at 1, 2 and 3 and sent **zero** Cmd 6/7 in
+  five 120 s forced-damage sessions (versions 3/2/1, `connectionType` LAN and MODEM), so that
+  ground no longer holds. **Answering 2 and refusing, over implementing RDP8-lite decompression
+  or only logging the drop, was the maintainer's call** — shown those three options with their
+  consequences (decompression cannot be proven with no server that sends it; a log-only skip is
+  violation #2 of [what we advertise](../invariant/what-we-advertise-we-must-implement.md)).
+  Two parts are derivations, not that call, and fall to a better one. **2 rather than 1**:
+  version 2 invites no server-sent message — its addition is a SHOULD on how the client divides
+  its *own* sending bandwidth by priority class (3.2.3.1.2), which justrdp does not shape — and
+  Appendix A <1> lists version 1 as supported only in Windows Vista; the maintainer was not shown
+  1 as an option, though the VM painted at it. **Refusing on an unopened channel too**: below
+  version 3 the command is invalid before it names any channel, so the unopened-channel ignore
+  below never gets a say. **Both references answer 3**, so this is a deliberate divergence:
+  FreeRDP echoes the server's version and decompresses per channel through its zgfx; IronRDP
+  echoes it too, then rejects Cmd 6/7 as an unsupported `Cmd` — advertising the obligation and
+  refusing it. **Not covered:** soft-sync (gated by multitransport, which justrdp never
+  advertises, not by this version) and unassigned `Cmd` values, still skipped, with 3.1.5.2.4's
+  "MUST terminate" left as ADR-0014's open item; any server but this WS2022 box; and a
+  multitransport UDP-R tunnel. Decompression is revisited when a channel we accept has a server
+  that compresses on it — that capture is its proof.
 - Unknown DVCs are not fatal — an unopened channel's traffic is ignored, in the
   spirit of ADR-0009's tolerance on the rendering side.
 
@@ -52,7 +79,8 @@ glossary, which is vocabulary rather than a decision.
 - `justrdp-pdu/src/displaycontrol.rs` — `DisplayControlPdu`, `Caps`, `Monitor`,
   `encode_monitor_layout`
 - `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`, `DvcError`
-- Spec sections cited inline: `[MS-RDPEDYC]` 2.2.2.2, 3.2; `[MS-RDPEDISP]` 1.3,
+- Spec sections cited inline: `[MS-RDPEDYC]` 1.7, 2.2.2.2, 2.2.3.3, 2.2.3.4, 3.2;
+  `[MS-RDPEDISP]` 1.3,
   2.2.2.2, 2.2.2.2.1
 
 ## Reference behaviour
@@ -62,9 +90,9 @@ glossary, which is vocabulary rather than a decision.
 ## Cross-cutting invariants
 
 - [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
-  — `VCCAPS_NO_COMPR` is this territory's instance, and the one place the rule is already
-  *enforced*: a compressed SVC chunk is a typed error precisely because compression was never
-  advertised.
+  — this territory enforces it twice: a compressed SVC chunk is a typed error because
+  `VCCAPS_NO_COMPR` never advertised compression, and a compressed DVC data PDU is one because
+  the drdynvc version answered never reaches 3 (#287).
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) —
   chunk reassembly is attacker-controlled length arithmetic.
 
@@ -87,5 +115,7 @@ glossary, which is vocabulary rather than a decision.
   exists; the consumers do not.
 - Static channel 1004 traffic is ignored by the session loop with no record of what
   it contains.
+- DVC compressed data (drdynvc version 3) is not implemented and not offered — see the
+  design-model bullet for when that changes.
 - SVC compression (`VirtualChannelCapabilitySet`'s compression flags) is not
   implemented.

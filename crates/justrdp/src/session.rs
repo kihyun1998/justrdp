@@ -2091,9 +2091,9 @@ mod tests {
         let [SessionOutput::WriteBytes(frame)] = outputs.as_slice() else {
             panic!("expected one response frame, got {outputs:?}");
         };
-        // The response embeds the SVC-chunked version-3 caps response and rides the
-        // drdynvc channel (big-endian MCS channelId).
-        let expected_chunk = &svc::encode_chunks(&dvc::encode_capabilities_response(3))[0];
+        // A server offering version 3 gets version 2 back (#287), SVC-chunked on the drdynvc
+        // channel (big-endian MCS channelId).
+        let expected_chunk = &svc::encode_chunks(&dvc::encode_capabilities_response(2))[0];
         assert!(
             frame
                 .windows(expected_chunk.len())
@@ -2343,6 +2343,57 @@ mod tests {
             )),
             "an open channel's transport failure is not its processor's, got {results:?}"
         );
+    }
+
+    /// #287. justrdp answers drdynvc version 2, and `[MS-RDPEDYC]` 2.2.3.3/2.2.3.4 forbid the
+    /// compressed data PDUs below version 3, so either one is a typed transport error whichever
+    /// channel it names, open or never opened.
+    #[test]
+    fn a_compressed_dvc_data_pdu_is_a_typed_error() {
+        // Cmd 6 (Len 0 = 1-byte Length, cbId 0) and Cmd 7 (cbId 0), each carrying a one-byte
+        // uncompressed RDP_SEGMENTED_DATA segment of type PACKET_COMPR_TYPE_RDP8_LITE (2.2.3.3).
+        let first_compressed = [0x60, 8, 0x01, 0xE0, 0x06, 0xAA];
+        let compressed = [0x70, 8, 0xE0, 0x06, 0xAA];
+        for (pdu, field) in [
+            (&first_compressed[..], "DYNVC_DATA_FIRST_COMPRESSED.Cmd"),
+            (&compressed[..], "DYNVC_DATA_COMPRESSED.Cmd"),
+        ] {
+            for (open, what) in [(true, "an open channel"), (false, "an unopened channel")] {
+                let mut sm = if open {
+                    with_open_dvc(8, justrdp_pdu::egfx::CHANNEL_NAME)
+                } else {
+                    with_open_dvc(9, displaycontrol::CHANNEL_NAME)
+                };
+                let results: Vec<_> = server_dvc_frames(pdu)
+                    .iter()
+                    .map(|frame| sm.process_bytes(frame))
+                    .collect();
+                assert!(
+                    results.iter().any(|r| matches!(
+                        r,
+                        Err(SessionError::Decode(
+                            justrdp_pdu::DecodeError::InvalidField { field: f, .. }
+                        )) if *f == field
+                    )),
+                    "{field} on {what} should be refused, got {results:?}"
+                );
+            }
+        }
+    }
+
+    /// Beside that refusal, soft-sync (Cmd 8/9) and an unassigned `Cmd` are still skipped.
+    #[test]
+    fn soft_sync_and_unassigned_dvc_commands_are_still_skipped() {
+        for cmd in [0x08u8, 0x09, 0x0F] {
+            let mut sm = with_open_dvc(8, justrdp_pdu::egfx::CHANNEL_NAME);
+            for frame in server_dvc_frames(&[cmd << 4, 8, 0x00]) {
+                assert_eq!(
+                    sm.process_bytes(&frame),
+                    Ok(Vec::new()),
+                    "Cmd {cmd:#x} should still be skipped"
+                );
+            }
+        }
     }
 
     #[test]
