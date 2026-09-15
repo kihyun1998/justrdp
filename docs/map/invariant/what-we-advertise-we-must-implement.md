@@ -37,7 +37,8 @@ channel. The same shape exists wherever justrdp declares something to a server:
 - the Client Core Data early capability flags, which decide whether a whole channel exists
 - the Confirm Active capability sets, which decide which orders and surface commands may arrive
 - the dynamic-channel capability flags — `VCCAPS_NO_COMPR` says *do not compress*, and the
-  DVC layer rejects a compressed chunk on exactly that ground
+  DVC layer rejects a compressed chunk on exactly that ground — and the drdynvc version, whose
+  only addition at 3 is compressed data (#287)
 - the graphics capability version ladder
 
 And it is the **conformance** half of a coin whose evidence half is already recorded:
@@ -92,6 +93,11 @@ rather than by capability:
   rested on our never advertising compression, unverified at the boundary, where the DVC layer
   rejected the identical violation. Closed — `ShareDataHeader::decode` now refuses
   `PACKET_COMPRESSED`, the same answer fast-path and the SVC layer give.
+- **#287** — the drdynvc capabilities version, one layer below #271 and the same shape: answered
+  as 3, whose only obligation is decompressing Cmd 6/7, while those commands were skipped. It had
+  been raised from 1 to 3 on a recorded server refusal of 1 that a 2026-09-15 control run no
+  longer reproduced, so nothing but version ordering held it at 3 (violation #1 above). Now
+  answered as 2, with Cmd 6/7 refused — see [virtual channels](../territory/virtual-channels.md).
 
 ## Where it will recur
 

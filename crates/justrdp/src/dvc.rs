@@ -1,6 +1,6 @@
 //! The drdynvc manager (MS-RDPEDYC 3.2) — the sans-IO state for the dynamic-virtual-channel
 //! transport riding the `drdynvc` static channel. The manager owns the **transport**: it
-//! answers the server's Capabilities Request (version 1), matches Create Requests against the
+//! answers the server's Capabilities Request (version 2), matches Create Requests against the
 //! registered processors (refusing unknown channel names), and reassembles fragmented channel
 //! data (DataFirst + Data). Each channel is a [`DvcProcessor`] — the
 //! `channel_name`/`start`/`process`/`close` model (issue #8, conceptually after `ironrdp-dvc`,
@@ -21,6 +21,9 @@ const CREATION_STATUS_REFUSED: u32 = 0x8000_4005;
 
 /// Accept a Create Request.
 const CREATION_STATUS_OK: u32 = 0x0000_0000;
+
+// `on_dvc_pdu` refuses compressed data PDUs, which is only right while version 3 is never answered.
+const _: () = assert!(dvc::CAPS_VERSION < 3);
 
 /// One SVC message (a drdynvc PDU) may span several 1600-byte chunks but is itself small;
 /// anything beyond this declared length is treated as malformed (allocation-bound, the
@@ -376,8 +379,21 @@ impl Drdynvc {
                 self.unbind(channel_id);
                 Ok(Vec::new())
             }
-            // Compressed / soft-sync / unknown commands: never negotiated, skipped
-            // (well-formed-but-unknown never kills the session, plan.md §11c).
+            // Compressed data PDUs need version 3, which is never answered.
+            DvcMessage::Unsupported {
+                cmd: dvc::CMD_DATA_FIRST_COMPRESSED,
+            } => Err(DvcError::Transport(DecodeError::InvalidField {
+                field: "DYNVC_DATA_FIRST_COMPRESSED.Cmd",
+                reason: "compressed DVC data but version 3 was never negotiated",
+            })),
+            DvcMessage::Unsupported {
+                cmd: dvc::CMD_DATA_COMPRESSED,
+            } => Err(DvcError::Transport(DecodeError::InvalidField {
+                field: "DYNVC_DATA_COMPRESSED.Cmd",
+                reason: "compressed DVC data but version 3 was never negotiated",
+            })),
+            // Soft-sync (uninvited: no multitransport is advertised) and unassigned commands:
+            // skipped (plan.md §11c).
             DvcMessage::Unsupported { cmd } => {
                 tracing::debug!(target: "rdp_drdynvc", cmd, "unsupported DYNVC command skipped");
                 Ok(Vec::new())
@@ -476,21 +492,18 @@ mod tests {
     #[test]
     fn capabilities_request_is_answered_with_min_of_server_and_ours() {
         let mut manager = Drdynvc::default();
-        // Server offers 3, we support 3 → answer 3.
+        // Server offers 3, we support 2 → answer 2.
         let events = feed(&mut manager, &caps_request());
         assert_eq!(
             events,
-            vec![DvcEvent::Send(dvc::encode_capabilities_response(3))]
+            vec![DvcEvent::Send(dvc::encode_capabilities_response(2))]
         );
-        // Server offers 2 → answer is capped at the server's offer.
+        // Server offers 1 → answer is capped at the server's offer.
         let mut manager = Drdynvc::default();
-        let events = feed(
-            &mut manager,
-            &[0x50, 0x00, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0],
-        );
+        let events = feed(&mut manager, &[0x50, 0x00, 0x01, 0x00]);
         assert_eq!(
             events,
-            vec![DvcEvent::Send(dvc::encode_capabilities_response(2))]
+            vec![DvcEvent::Send(dvc::encode_capabilities_response(1))]
         );
     }
 
