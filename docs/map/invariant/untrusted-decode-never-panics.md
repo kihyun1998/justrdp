@@ -444,7 +444,7 @@ see the Discovery history entry, and note that it is a **loop bound**, not an al
 
 | Site | Defect | Reachable from the wire? |
 |---|---|---|
-| `framebuffer::resize` | `w * h * 4` unguarded — 17_179_344_900 at the type's maximum | **yes**, `DemandActive`'s declared desktop and Display Control `OutputResized`, neither clamped |
+| `framebuffer::resize` | `w * h * 4` unguarded — 17_179_344_900 at the type's maximum | **yes**, `DemandActive`'s declared desktop and EGFX `OutputResized`, neither clamped |
 | `nscodec::plane_sizes` | `tw * height` unguarded, and `temp_dims` rounds 65535 up to 65536 | **yes on 32-bit**, through `decode`'s own `u16` parameters |
 | `framebuffer::blit` | `src_stride_px * 4` overflows on **every** target | no — callers pass `u16`-derived and `MAX_SURFACE_DIM`-bounded strides |
 | `framebuffer::copy_rect_into` | out-of-range slice index on a rect outside the buffer | no — the host calls it with a `FrameUpdate` we produced |

@@ -84,9 +84,9 @@ pub enum RfxError {
     ///
     /// Named to match the same condition in the five sibling codecs that carry it — `color`,
     /// `planar`, `pointer`, `rle`, `nscodec` — one quantity, one answer across a family
-    /// ([ADR-0012] §3). **`clearcodec`
-    /// is deliberately not in that list**: `clearcodec.rs:98-104` records why it has no variant
-    /// of its own and maps the `nscodec` one to `InvalidField` instead. Returned instead of a
+    /// ([ADR-0012] §3). **`clearcodec` is deliberately not in that list**: `ClearError`'s
+    /// `From<NscError>` records why it has no variant of its own and maps the `nscodec` one to
+    /// `InvalidField` instead. Returned instead of a
     /// debug panic / release wrap (#263, sibling of #151 / #155).
     ///
     /// [ADR-0012]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0012-consumption-site-totality.md

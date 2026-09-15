@@ -1027,11 +1027,11 @@ pub fn order_payload<'m, 'a>(messages: &'m [ProgressiveMessage<'a>]) -> PayloadO
 /// | `RDPGFX_CMDID_DELETESURFACE` | **free** — the only free path | `gdi/gfx.c:1366` |
 /// | `RDPGFX_CMDID_DELETEENCODINGCONTEXT` | **nothing** | `gdi/gfx.c:1239-1246` |
 /// | `RDPGFX_CMDID_RESETGRAPHICS` | **nothing** (surface *pixels* are wiped) | `progressive.c:2635` |
-/// | channel close | free everything, **by dropping this** — there is no method | `justrdp/src/egfx.rs:725` |
+/// | channel close | free everything, **by dropping this** — there is no method | `GraphicsProcessor::close` |
 ///
 /// **`DELETEENCODINGCONTEXT` frees nothing, but not because it names nothing.** The PDU
 /// carries a `surfaceId` beside the `codecContextId` (`[MS-RDPEGFX]` 2.2.2.13; our parser
-/// decodes both, `justrdp-pdu/src/egfx.rs:224-228`), so a surface-keyed store *could* honour
+/// decodes both, `EgfxPdu::DeleteEncodingContext`), so a surface-keyed store *could* honour
 /// it exactly. The reason to ignore it is tolerance, not inability: `[MS-RDPEGFX]` has no
 /// client-side processing rule compelling the free, FreeRDP's handler is a literal no-op
 /// (`WINPR_UNUSED` on both arguments), and a server that sends this and then a
@@ -1061,7 +1061,7 @@ pub fn order_payload<'m, 'a>(messages: &'m [ProgressiveMessage<'a>]) -> PayloadO
 ///
 /// Clearing every store at once is a real event — the EGFX channel closing — and it already has
 /// a mechanism: `GraphicsProcessor::close()` is `*self = GraphicsProcessor::default()`
-/// (`justrdp/src/egfx.rs:725`, reached from `Drdynvc::unbind` on `DvcMessage::Close`), which drops
+/// (reached from `Drdynvc::unbind` on `DvcMessage::Close`), which drops
 /// this store along with the surfaces, the cache and the mappings. A `reset` here would
 /// duplicate that, and of the two only the duplicate can be misused: `*self = default()` is
 /// obviously wrong in a `RESETGRAPHICS` handler because it discards far more than the PDU
@@ -1073,17 +1073,15 @@ pub fn order_payload<'m, 'a>(messages: &'m [ProgressiveMessage<'a>]) -> PayloadO
 /// rather than merely documented. Keep it that way — an "and clear everything" convenience here
 /// hands the footgun straight back.
 ///
-/// # The live client still does the opposite, and a passing test pins it
+/// # The live client agrees, and a test pins it
 ///
-/// `justrdp::egfx` today calls `Progressive::reset()` on `RESETGRAPHICS`
-/// (`justrdp/src/egfx.rs:319`) and really frees on `DELETEENCODINGCONTEXT` (`:484`), and
-/// `reset_graphics_clears_contexts_but_keeps_surfaces` (`:1206`) asserts the first. Both are
-/// **correct for the bootstrap oracle**, which keys by `codecContextId` with no cap — that is
-/// #83's fix, and under id keying an unfreed context is an unbounded leak. They stop being
-/// correct the moment the store is surface-keyed. Retiring those two call sites and that test
-/// belongs to the slice that swaps the decoder (#172); it is named here because a green test
-/// asserting the retired behaviour is the strongest possible "do not touch this", and nothing
-/// else in the tree says otherwise.
+/// `GraphicsProcessor::handle` frees nothing on `RESETGRAPHICS` and hands
+/// `DELETEENCODINGCONTEXT` to `SurfaceStore::delete_context`, which does nothing;
+/// `reset_graphics_keeps_the_tile_stores_it_used_to_clear` asserts the first. Until #172 the
+/// client did the opposite — reset on `RESETGRAPHICS`, a real free on `DELETEENCODINGCONTEXT` —
+/// which was correct for the bootstrap oracle: it keyed contexts by `codecContextId` with no cap,
+/// so an unfreed context was an unbounded leak (#83's fix). It stops being correct once the
+/// store is keyed by surface.
 ///
 /// # What this table does *not* cover
 ///
@@ -1145,7 +1143,7 @@ impl SurfaceStore {
     ///
     /// **This branch is currently unreachable through the client, and that is the point.**
     /// `[MS-RDPEGFX]` has no surface-resize PDU and `justrdp::egfx` writes a surface's
-    /// dimensions once at `CREATESURFACE` (`justrdp/src/egfx.rs:354`), dropping the whole
+    /// dimensions once at `CREATESURFACE` (`GraphicsProcessor::handle`), dropping the whole
     /// surface through `remove_surface` when an id is reused — so the dims handed here always
     /// match. That is a property of today's caller, not of this type, and it is exactly the
     /// kind of caller-side guarantee that stops holding quietly. The check costs one
@@ -1969,7 +1967,7 @@ mod tests {
 
     /// **Clearing every store at once is a drop, not a method.** The EGFX channel closing is
     /// the only event that wants it, and `GraphicsProcessor::close()` already provides it by
-    /// replacing itself wholesale (`justrdp/src/egfx.rs:725`). This asserts the half that lives
+    /// replacing itself wholesale (`GraphicsProcessor::close`). This asserts the half that lives
     /// in this crate: the store owns its grids outright, so dropping it takes them with it —
     /// which is what makes a `reset` method redundant, and therefore only a way to clear the
     /// stores on `RESETGRAPHICS`, where clearing is wrong.

@@ -16,21 +16,21 @@
 //! `docs/map/invariant/untrusted-decode-never-panics.md`.
 //!
 //! `from_pkcs1_der` is the one the first pass of that census also missed, because it does not hang
-//! off the preamble dispatch at all: `connect.rs:1003` reaches it through the X.509 certificate.
+//! off the preamble dispatch at all: `server_license_key` reaches it through the X.509 certificate.
 //! Measured before it got either artifact — an unchecked modulus read left the entire workspace
 //! suite green.
 //!
 //! `client_info::decode_basic_security_header` joins them here rather than taking a target of its
 //! own. It is four bytes — two bounds-checked `read_u16_le`s, no length, count or offset
 //! arithmetic — so it is total by inspection, and its only live caller is the licensing step this
-//! target reproduces (`justrdp/src/connect.rs:854`). A lane job of its own would saturate in
+//! target reproduces (`ConnectStateMachine::license_step`). A lane job of its own would saturate in
 //! seconds and then idle through a 300s budget, which is the same reason `mcs.rs` spends one
 //! target on five parsers rather than five.
 //!
 //! ## The arms
 //!
 //! `Sequence` walks what `license_step` walks, off one cursor: security header, preamble, then the
-//! body parser `bMsgType` selects (`justrdp/src/connect.rs:854-950`). That is the composition a
+//! body parser `bMsgType` selects (`license_step`). That is the composition a
 //! server actually drives, and it is where a length consumed by one parser can misplace the next.
 //! `RsaPublicKey` is the arm with no sequence behind it — nothing in the preamble dispatch
 //! reaches the certificate path, so a direct arm is the only way it is driven at all.
@@ -137,7 +137,7 @@ fuzz_target!(|input: Input<'_>| {
         Entry::NewLicense => {
             let _ = license::NewLicense::decode(&mut cur);
         }
-        // Not reachable from `sequence`: `connect.rs:1003` calls this on the `subjectPublicKey`
+        // Not reachable from `sequence`: `server_license_key` calls this on the `subjectPublicKey`
         // of the server's X.509 licensing leaf, a path the preamble dispatch never crosses. It is
         // the module's only hand-walked DER reader, and nothing drove it until #230.
         Entry::RsaPublicKey => {

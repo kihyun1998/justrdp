@@ -179,8 +179,8 @@ mod tests {
         // does on every input.
         //
         // `is_fastpath` is driven beside it because it is a `pub fn` over the same first byte the
-        // session loop demuxes on (`justrdp/src/session.rs:251`); it reads nothing, so it is total
-        // by construction and costs one line to keep out of the uncovered enumeration.
+        // session loop demuxes on (`SessionStateMachine::process_bytes`); it reads nothing, so it
+        // is total by construction and costs one line to keep out of the uncovered enumeration.
         // Weighted for the same measured reason as `tpkt`'s sibling: undirected bytes caught an
         // unchecked `length2` read in **1 of 3** runs. The header byte must clear `0xC0`, the
         // first length byte must set its high bit to reach the two-byte form, and the buffer must

@@ -407,9 +407,9 @@ mod tests {
 
     proptest! {
         // ADR-0008 / issue #230. `decode_basic_security_header` is a `pub fn` over server bytes on
-        // the live path — `justrdp/src/connect.rs:854` hands it the raw MCS user data of every
-        // licensing message — and it carried neither a property nor a fuzz target, having simply
-        // not been in the uncovered list the untrusted-decode invariant derived.
+        // the live path — `ConnectStateMachine::license_step` hands it the raw MCS user data of
+        // every licensing message — and it carried neither a property nor a fuzz target, having
+        // simply not been in the uncovered list the untrusted-decode invariant derived.
         //
         // It is the shallowest parser in this crate: two bounds-checked `read_u16_le`s and no
         // length, count or offset arithmetic, so it is total by inspection. The property is here

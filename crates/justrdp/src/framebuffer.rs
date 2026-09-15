@@ -42,7 +42,7 @@ pub enum FramebufferError {
     /// A desktop dimension exceeds [`MAX_DESKTOP_DIM`].
     ///
     /// Reachable from the wire: `session.rs` drives the resize from `DemandActive`'s
-    /// `desktopWidth`/`desktopHeight` and from a Display Control `OutputResized`, neither of
+    /// `desktopWidth`/`desktopHeight` and from an EGFX `OutputResized`, neither of
     /// which is clamped before it arrives.
     DesktopTooLarge {
         /// The declared width.
@@ -332,7 +332,7 @@ mod dimension_bounds {
     /// ([the invariant]).
     ///
     /// Wire-reachable: `session.rs` drives `resize` from `DemandActive`'s declared desktop size
-    /// and from a Display Control `OutputResized`, neither clamped before arrival.
+    /// and from an EGFX `OutputResized`, neither clamped before arrival.
     ///
     /// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
     #[test]
