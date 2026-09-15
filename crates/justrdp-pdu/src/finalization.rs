@@ -164,8 +164,8 @@ mod tests {
 
     // ADR-0008 / issue #237 -- the no-panic robustness properties for the connect sequence's last
     // three server parses. All three are `pub fn`s driven straight off server bytes
-    // (`justrdp/src/connect.rs:1132`, `:1137`, `:1116`, and `session.rs:545` for `FontMap` on
-    // reactivation) and none carried either artifact.
+    // (`ConnectStateMachine::finalization_step`, and `SessionStateMachine::on_data_pdu` for
+    // `FontMap` on reactivation) and none carried either artifact.
     //
     // What made this module invisible is worth keeping, because it is *not* the failure #230
     // closed. There the roster matched by module name and a name lied -- `pointer` and `license`

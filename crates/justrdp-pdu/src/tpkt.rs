@@ -88,8 +88,9 @@ mod tests {
         // #230's completeness pass found it carrying neither artifact. The two disagree in shape
         // where it matters -- `decode` rejects a short frame with `checked_sub`, this one with an
         // explicit `total < HEADER_LEN` -- so a property on `decode` says nothing about it. It is
-        // also the more-reached of the pair: `justrdp/src/session.rs:254` and `connect.rs:555`
-        // call it on *every* frame to size `&rest[..frame_len]`, before `decode` sees anything.
+        // also the more-reached of the pair: `SessionStateMachine::process_bytes` and
+        // `ConnectStateMachine::drain_frames` call it on *every* frame to size
+        // `&rest[..frame_len]`, before `decode` sees anything.
         //
         // `frame_len_peeks_total_length_without_needing_the_payload` below already pins the
         // truncated-header case (measured: an unchecked read here turns that test red), so this is

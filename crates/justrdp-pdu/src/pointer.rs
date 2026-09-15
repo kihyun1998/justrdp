@@ -180,8 +180,8 @@ mod tests {
 
     // ADR-0008 / issue #230 — the no-panic robustness properties for this module. Both entry
     // points are `pub fn`s the session loop drives straight off server bytes
-    // (`justrdp/src/session.rs:374` fast-path, `:554` slow-path) and neither carried a property or
-    // a fuzz target until now: `fuzz/fuzz_targets/pointer.rs` targets
+    // (`SessionStateMachine::on_fastpath_pdu` fast-path, `on_data_pdu` slow-path) and neither
+    // carried a property or a fuzz target until now: `fuzz/fuzz_targets/pointer.rs` targets
     // `justrdp_codecs::pointer::decode_pointer`, which takes `width`/`height`/`xor_bpp` and both
     // masks *already parsed*, so the `TS_*POINTERATTRIBUTE` header parse that produces them was
     // driven by nothing. Same module name, different code — see
@@ -228,7 +228,7 @@ mod tests {
     }
 
     /// The six `updateCode`s the session loop dispatches into this module
-    /// (`justrdp/src/session.rs:368`), weighted against arbitrary bytes.
+    /// (`SessionStateMachine::on_fastpath_pdu`), weighted against arbitrary bytes.
     fn pointer_update_code() -> impl Strategy<Value = u8> {
         prop_oneof![
             6 => proptest::sample::select(vec![

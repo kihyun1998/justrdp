@@ -55,7 +55,7 @@ the exact shape the map's *reference behaviour* section exists to make visible.
 
 - **The framebuffer's own geometry is server-declared, and until #241/#238 nothing bounded
   it.** `resize` computed `width * height * 4` unguarded from `DemandActive`'s desktop size and
-  from a Display Control `OutputResized`, neither clamped on the way in. On a 32-bit target that
+  from an EGFX `OutputResized`, neither clamped on the way in. On a 32-bit target that
   product passes `u32::MAX` at the type's own maximum (reproduced on `i686-pc-windows-msvc`:
   *"attempt to multiply with overflow"*; in release it wraps and leaves `width`/`height`
   describing a buffer that was never allocated). It is now capped at `MAX_DESKTOP_DIM = 16384` —

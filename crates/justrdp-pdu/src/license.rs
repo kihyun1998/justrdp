@@ -525,9 +525,9 @@ mod tests {
 
         // `RsaPublicKey::from_pkcs1_der` is the fifth live-path parser in this module and the one
         // #230's own census missed on its first pass, because it does not hang off the preamble
-        // dispatch: `justrdp/src/connect.rs:1003` hands it the `subjectPublicKey` of the server's
-        // X.509 licensing leaf, on a path `ServerLicenseRequest::decode` never reaches (that
-        // decoder only collects the certificate as a raw blob).
+        // dispatch: `ConnectStateMachine::server_license_key` hands it the `subjectPublicKey` of
+        // the server's X.509 licensing leaf, on a path `ServerLicenseRequest::decode` never
+        // reaches (that decoder only collects the certificate as a raw blob).
         //
         // It is the *most* arithmetic-carrying parser here, not the least: a hand-walked DER
         // reader with its own tag checks, its own length decoder including the `0x82` two-byte

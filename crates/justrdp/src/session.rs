@@ -125,7 +125,7 @@ pub enum SessionError {
     ///
     /// Reachable three ways, all server-driven and none clamped before arrival: the
     /// `SessionConfig` the connect sequence hands over, a reactivation `DemandActive`, and a
-    /// Display Control `OutputResized`. Refused rather than clamped because a silent tolerance
+    /// EGFX `OutputResized`. Refused rather than clamped because a silent tolerance
     /// is indistinguishable from a bug (ADR-0009 §3(b)).
     Framebuffer(crate::framebuffer::FramebufferError),
     /// Interleaved-RLE bitmap data failed to decompress.

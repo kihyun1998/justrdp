@@ -16,11 +16,11 @@
 //! ## Why it chains into the codec
 //!
 //! `justrdp::session::on_pointer` decodes the PDU and hands the fields straight to
-//! `decode_pointer` (`justrdp/src/session.rs:374`, `:554`), so that composition is the live path
-//! and this target drives it whole. It is not redundant with `pointer.rs`: that target generates
-//! `width`/`height` as `u8`, while this one reaches the codec only through the parser's own
-//! 96-pixel cap and its two `u16` mask lengths — a different slice of `decode_pointer`'s input
-//! space, and the one a server can actually produce.
+//! `decode_pointer` (from `on_fastpath_pdu` and `on_data_pdu`), so that composition is the live
+//! path and this target drives it whole. It is not redundant with `pointer.rs`: that target
+//! generates `width`/`height` as `u8`, while this one reaches the codec only through the
+//! parser's own 96-pixel cap and its two `u16` mask lengths — a different slice of
+//! `decode_pointer`'s input space, and the one a server can actually produce.
 //!
 //! ## Why no `Entry` selector
 //!
@@ -58,8 +58,8 @@ struct Input<'a> {
 ///
 /// The palette is `Palette::default()` because this target has no session to carry one, **not**
 /// because a default is what the live path passes. 8-bpp shapes resolve through the *session*
-/// palette, which the server sets via `FP_UPDATE_PALETTE` (`justrdp/src/session.rs:363`) and which
-/// `set_cursor_shape` forwards (`:437`). The substitution is inert for this target's purpose: the
+/// palette, which the server sets via `FP_UPDATE_PALETTE` (`SessionStateMachine::on_fastpath_pdu`)
+/// and which `set_cursor_shape` forwards. The substitution is inert for this target's purpose: the
 /// lookup is an index into a fixed 256-entry array, total for every palette, so no palette can
 /// reach a panic another cannot.
 fn blit(update: PointerUpdate) {
