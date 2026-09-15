@@ -93,6 +93,27 @@ pub(crate) enum DvcEvent {
     },
 }
 
+/// Why the manager rejected an SVC payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DvcError {
+    /// A failure of the drdynvc transport itself — SVC chunking, a drdynvc PDU, a reassembly
+    /// cap — attributed to no channel.
+    Transport(DecodeError),
+    /// The processor bound to `channel` rejected a complete message (ADR-0014 Decision 2).
+    Processor {
+        /// The failed processor's channel name.
+        channel: &'static str,
+        /// What the processor returned.
+        error: DecodeError,
+    },
+}
+
+impl From<DecodeError> for DvcError {
+    fn from(error: DecodeError) -> Self {
+        DvcError::Transport(error)
+    }
+}
+
 /// The Display Control channel processor (MS-RDPEDISP): consumes the server's Caps PDU —
 /// the channel's only server→client message — and surfaces it; everything else on the
 /// channel is skipped as well-formed-but-unknown.
@@ -209,35 +230,35 @@ impl Drdynvc {
     }
 
     /// Consume one MCS-delivered SVC payload on the drdynvc channel.
-    pub(crate) fn on_svc_payload(&mut self, payload: &[u8]) -> Result<Vec<DvcEvent>, DecodeError> {
+    pub(crate) fn on_svc_payload(&mut self, payload: &[u8]) -> Result<Vec<DvcEvent>, DvcError> {
         let chunk = svc::ChannelChunk::decode(payload)?;
         if chunk.flags & svc::CHANNEL_FLAG_PACKET_COMPRESSED != 0 {
             // justrdp advertises VCCAPS_NO_COMPR; compressed chunks are a violation.
-            return Err(DecodeError::InvalidField {
+            return Err(DvcError::Transport(DecodeError::InvalidField {
                 field: "CHANNEL_PDU_HEADER.flags",
                 reason: "compressed SVC chunk but compression was never advertised",
-            });
+            }));
         }
         if chunk.total_length as usize > SVC_MESSAGE_CAP {
-            return Err(DecodeError::InvalidField {
+            return Err(DvcError::Transport(DecodeError::InvalidField {
                 field: "CHANNEL_PDU_HEADER.length",
                 reason: "drdynvc SVC message exceeds the reassembly cap",
-            });
+            }));
         }
         if chunk.flags & svc::CHANNEL_FLAG_FIRST != 0 {
             self.svc_buffer.clear();
             self.svc_in_flight = true;
         } else if !self.svc_in_flight {
-            return Err(DecodeError::InvalidField {
+            return Err(DvcError::Transport(DecodeError::InvalidField {
                 field: "CHANNEL_PDU_HEADER.flags",
                 reason: "SVC continuation chunk without a first chunk",
-            });
+            }));
         }
         if self.svc_buffer.len() + chunk.data.len() > SVC_MESSAGE_CAP {
-            return Err(DecodeError::InvalidField {
+            return Err(DvcError::Transport(DecodeError::InvalidField {
                 field: "CHANNEL_PDU_HEADER.length",
                 reason: "drdynvc SVC message grew past its declared length cap",
-            });
+            }));
         }
         self.svc_buffer.extend_from_slice(chunk.data);
         if chunk.flags & svc::CHANNEL_FLAG_LAST == 0 {
@@ -249,7 +270,7 @@ impl Drdynvc {
     }
 
     /// Handle one complete drdynvc PDU.
-    fn on_dvc_pdu(&mut self, pdu: &[u8]) -> Result<Vec<DvcEvent>, DecodeError> {
+    fn on_dvc_pdu(&mut self, pdu: &[u8]) -> Result<Vec<DvcEvent>, DvcError> {
         match DvcMessage::decode(pdu)? {
             DvcMessage::CapabilitiesRequest { version } => {
                 let answered = version.min(dvc::CAPS_VERSION);
@@ -315,10 +336,10 @@ impl Drdynvc {
                     return Ok(Vec::new()); // data on a refused channel: skipped
                 };
                 if total_length as usize > DVC_MESSAGE_CAP {
-                    return Err(DecodeError::InvalidField {
+                    return Err(DvcError::Transport(DecodeError::InvalidField {
                         field: "DYNVC_DATA_FIRST.Length",
                         reason: "dynamic channel message exceeds the reassembly cap",
-                    });
+                    }));
                 }
                 if data.len() >= total_length as usize {
                     // Degenerate single-fragment DataFirst: complete immediately.
@@ -377,11 +398,17 @@ impl Drdynvc {
     }
 
     /// Route one complete message to its channel's processor and apply the outputs.
-    fn dispatch(&mut self, channel_id: u32, message: &[u8]) -> Result<Vec<DvcEvent>, DecodeError> {
+    fn dispatch(&mut self, channel_id: u32, message: &[u8]) -> Result<Vec<DvcEvent>, DvcError> {
         let Some(open) = self.open.iter().find(|c| c.channel_id == channel_id) else {
             return Ok(Vec::new());
         };
-        let outputs = self.processors[open.processor].process(message)?;
+        let processor = &mut self.processors[open.processor];
+        let outputs = processor
+            .process(message)
+            .map_err(|error| DvcError::Processor {
+                channel: processor.channel_name(),
+                error,
+            })?;
         Ok(self.apply_outputs(channel_id, outputs))
     }
 

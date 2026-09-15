@@ -2751,10 +2751,10 @@ mod tests {
     /// Drive one session the way `Drdynvc` does.
     ///
     /// **`flush_frames` runs only on an `Ok`**: `Drdynvc::on_svc_payload` propagates a processor
-    /// error with `?` and `session.rs:874`'s flush sits after it, so flushing a payload whose
-    /// `process` failed is a sequence the live path cannot produce. #263 recorded the cost of
-    /// the general form — an assertion routed past the call site the production path uses comes
-    /// back green over a removed guard.
+    /// error with `?` and `SessionStateMachine::on_drdynvc`'s flush sits after it, so flushing a
+    /// payload whose `process` failed is a sequence the live path cannot produce. #263 recorded
+    /// the cost of the general form — an assertion routed past the call site the production path
+    /// uses comes back green over a removed guard.
     fn drive(p: &mut GraphicsProcessor, fb: &mut Framebuffer, session: &[Vec<Cmd>]) {
         for message in session {
             let mut blob = Vec::new();

@@ -1061,7 +1061,7 @@ pub fn order_payload<'m, 'a>(messages: &'m [ProgressiveMessage<'a>]) -> PayloadO
 ///
 /// Clearing every store at once is a real event — the EGFX channel closing — and it already has
 /// a mechanism: `GraphicsProcessor::close()` is `*self = GraphicsProcessor::default()`
-/// (`justrdp/src/egfx.rs:725`, reached from `dvc.rs:356` on `DvcMessage::Close`), which drops
+/// (`justrdp/src/egfx.rs:725`, reached from `Drdynvc::unbind` on `DvcMessage::Close`), which drops
 /// this store along with the surfaces, the cache and the mappings. A `reset` here would
 /// duplicate that, and of the two only the duplicate can be misused: `*self = default()` is
 /// obviously wrong in a `RESETGRAPHICS` handler because it discards far more than the PDU

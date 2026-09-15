@@ -32,6 +32,12 @@ glossary, which is vocabulary rather than a decision.
   twice for channels we refuse before one we accept. Until the Close path and the create path
   shared one teardown, a rebind dropped only the routing entry: resize requests kept going to
   the recycled id, and a rebound graphics channel kept the old binding's surfaces.
+- **A processor's error names its channel; the transport under it does not.** `Drdynvc::dispatch`
+  wraps what `DvcProcessor::process` returns as `DvcError::Processor`, which the session machine
+  surfaces as `SessionError::DynamicChannel`; every drdynvc transport failure — SVC chunking, a
+  malformed drdynvc PDU, the `DYNVC_DATA_FIRST.Length` cap even on an open channel — stays
+  `SessionError::Decode`. Where that line sits was the maintainer's call (ADR-0014 Amendment
+  2026-09-15, #285).
 - **Display Control is pull-capable and gated**: `DisplayControlProcessor` only
   becomes usable once the server's caps arrive, which is the moment the session
   emits `DisplayControlReady`.
@@ -45,7 +51,7 @@ glossary, which is vocabulary rather than a decision.
   `encode_capabilities_response`, `encode_data`, `encode_close`
 - `justrdp-pdu/src/displaycontrol.rs` — `DisplayControlPdu`, `Caps`, `Monitor`,
   `encode_monitor_layout`
-- `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`
+- `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`, `DvcError`
 - Spec sections cited inline: `[MS-RDPEDYC]` 2.2.2.2, 3.2; `[MS-RDPEDISP]` 1.3,
   2.2.2.2, 2.2.2.2.1
 
