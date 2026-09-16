@@ -32,12 +32,20 @@ glossary, which is vocabulary rather than a decision.
   twice for channels we refuse before one we accept. Until the Close path and the create path
   shared one teardown, a rebind dropped only the routing entry: resize requests kept going to
   the recycled id, and a rebound graphics channel kept the old binding's surfaces.
-- **A processor's error names its channel; the transport under it does not.** `Drdynvc::dispatch`
+- **A channel's processor names its channel; the transport under it does not.** `Drdynvc::dispatch`
   wraps what `DvcProcessor::process` returns as `DvcError::Processor`, which the session machine
   surfaces as `SessionError::DynamicChannel`; every drdynvc transport failure — SVC chunking, a
   malformed drdynvc PDU, the `DYNVC_DATA_FIRST.Length` cap even on an open channel — stays
   `SessionError::Decode`. Where that line sits was the maintainer's call (ADR-0014 Amendment
   2026-09-15, #285).
+
+  **The line is drawn at the *origin*, not at the call, and this bullet said "a processor's error"
+  until #286.** A processor can produce a `ProcessorOutput` the session machine then refuses —
+  EGFX `ResetGraphics` is the one instance: the size leaves `process` as `OutputResized` and the
+  framebuffer refuses it outside any processor call. That is attributed too, by `DvcEvent`
+  carrying the processor's `channel_name()` into `SessionError::Framebuffer`'s `channel` field
+  (ADR-0014 Amendment 2026-09-16, #286). The reassembly cap stays unattributed on the unchanged
+  ground: it is the manager's bound, and no processor produced it.
 - **Display Control is pull-capable and gated**: `DisplayControlProcessor` only
   becomes usable once the server's caps arrive, which is the moment the session
   emits `DisplayControlReady`.

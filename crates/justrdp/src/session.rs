@@ -127,7 +127,17 @@ pub enum SessionError {
     /// `SessionConfig` the connect sequence hands over, a reactivation `DemandActive`, and a
     /// EGFX `OutputResized`. Refused rather than clamped because a silent tolerance
     /// is indistinguishable from a bug (ADR-0009 §3(b)).
-    Framebuffer(crate::framebuffer::FramebufferError),
+    ///
+    /// Only the third has a channel to name, and it is named — the refusal happens here rather
+    /// than inside `DvcProcessor::process`, so [`Self::DynamicChannel`] cannot carry it
+    /// (ADR-0014's 2026-09-16 amendment, #286).
+    Framebuffer {
+        /// The dynamic channel whose PDU declared the size, for the one of the three paths
+        /// that has one; `None` for the connect sequence and for a reactivation Demand Active.
+        channel: Option<&'static str>,
+        /// Why the framebuffer refused it.
+        error: crate::framebuffer::FramebufferError,
+    },
     /// Interleaved-RLE bitmap data failed to decompress.
     Rle(rle::RleError),
     /// RDP6 planar bitmap data failed to decompress.
@@ -149,7 +159,14 @@ impl core::fmt::Display for SessionError {
             SessionError::Planar(e) => write!(f, "RDP6 planar: {e}"),
             SessionError::Color(e) => write!(f, "pixel conversion: {e}"),
             SessionError::Pointer(e) => write!(f, "pointer shape: {e}"),
-            SessionError::Framebuffer(e) => write!(f, "framebuffer: {e}"),
+            SessionError::Framebuffer {
+                channel: Some(channel),
+                error,
+            } => write!(f, "framebuffer, from dynamic channel {channel}: {error}"),
+            SessionError::Framebuffer {
+                channel: None,
+                error,
+            } => write!(f, "framebuffer: {error}"),
         }
     }
 }
@@ -223,8 +240,13 @@ impl SessionStateMachine {
     /// allocation, so refusing it here is what keeps the allocation total
     /// (ADR-0012 §1; the 32-bit overflow it prevents is reproduced in `framebuffer`'s tests).
     pub fn new(config: SessionConfig, leftover: Vec<u8>) -> Result<Self, SessionError> {
-        let framebuffer = Framebuffer::new(config.desktop_size.0, config.desktop_size.1)
-            .map_err(SessionError::Framebuffer)?;
+        let framebuffer =
+            Framebuffer::new(config.desktop_size.0, config.desktop_size.1).map_err(|error| {
+                SessionError::Framebuffer {
+                    channel: None,
+                    error,
+                }
+            })?;
         // The cache honors what the caller advertised in its Pointer capability set:
         // `pointerCacheSize` when present (the cache New Pointer messages address), else
         // `colorPointerCacheSize`; no Pointer set advertised means no cache (a conforming
@@ -740,7 +762,10 @@ impl SessionStateMachine {
         if (width, height) != self.config.desktop_size {
             self.framebuffer
                 .resize(width, height)
-                .map_err(SessionError::Framebuffer)?;
+                .map_err(|error| SessionError::Framebuffer {
+                    channel: None,
+                    error,
+                })?;
             self.config.desktop_size = (width, height);
         }
 
@@ -878,14 +903,21 @@ impl SessionStateMachine {
                 DvcEvent::DisplayControlReady => {
                     outputs.push(SessionOutput::DisplayControlReady);
                 }
-                DvcEvent::OutputResized { width, height } => {
+                DvcEvent::OutputResized {
+                    channel,
+                    width,
+                    height,
+                } => {
                     if (width, height) != self.config.desktop_size {
                         // Resize first, commit the new size only if it succeeded — otherwise a
                         // refused size would still be recorded and every later blit would index
                         // against dimensions the buffer does not have.
-                        self.framebuffer
-                            .resize(width, height)
-                            .map_err(SessionError::Framebuffer)?;
+                        self.framebuffer.resize(width, height).map_err(|error| {
+                            SessionError::Framebuffer {
+                                channel: Some(channel),
+                                error,
+                            }
+                        })?;
                         self.config.desktop_size = (width, height);
                     }
                 }
@@ -2300,6 +2332,87 @@ mod tests {
                 })
             )),
             "the failure should name the Display Control channel, got {results:?}"
+        );
+    }
+
+    /// An `RDPGFX_RESET_GRAPHICS_PDU` body. `[MS-RDPEGFX]` 2.2.2.14 fixes `pduLength` at 340
+    /// including the 8-byte header; only `width` and `height` are consumed, so `monitorCount`
+    /// and the monitor array are a single monitor and zeroes.
+    fn reset_graphics_body(width: u32, height: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&width.to_le_bytes());
+        body.extend_from_slice(&height.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.resize(340 - 8, 0);
+        body
+    }
+
+    /// ADR-0014's amendment left one channel-originated failure unattributed: a `ResetGraphics`
+    /// size the framebuffer refuses (#286). It leaves `process` as a `ProcessorOutput`, so the
+    /// refusal happens in the session machine, and only the size band `MAX_DESKTOP_DIM + 1 ..=
+    /// u16::MAX` reaches it — below that the framebuffer accepts, above it `u16::try_from`
+    /// refuses inside `process` and the existing attribution already applies.
+    #[test]
+    fn an_output_resize_the_framebuffer_refuses_names_its_channel() {
+        let mut sm = with_open_dvc(8, justrdp_pdu::egfx::CHANNEL_NAME);
+        let width = u32::from(crate::framebuffer::MAX_DESKTOP_DIM) + 1;
+        let results: Vec<_> = server_egfx(
+            8,
+            justrdp_pdu::egfx::CMDID_RESET_GRAPHICS,
+            &reset_graphics_body(width, 768),
+        )
+        .iter()
+        .map(|frame| sm.process_bytes(frame))
+        .collect();
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                Err(SessionError::Framebuffer {
+                    channel: Some("Microsoft::Windows::RDS::Graphics"),
+                    error: crate::framebuffer::FramebufferError::DesktopTooLarge {
+                        width: 16385,
+                        height: 768,
+                    },
+                })
+            )),
+            "the refusal should name the graphics channel, got {results:?}"
+        );
+    }
+
+    /// The happy path of the arm the two tests above bracket, which had no session-level
+    /// coverage at all: `egfx`'s own `reset_graphics_resizes_the_output` stops at the
+    /// `ProcessorOutput`. It is also what proves `reset_graphics_body` builds a PDU this path
+    /// consumes, rather than one that fails for a framing reason and reads as a refusal.
+    #[test]
+    fn an_output_resize_within_the_cap_rebuilds_the_framebuffer() {
+        let mut sm = with_open_dvc(8, justrdp_pdu::egfx::CHANNEL_NAME);
+        for frame in server_egfx(
+            8,
+            justrdp_pdu::egfx::CMDID_RESET_GRAPHICS,
+            &reset_graphics_body(64, 32),
+        ) {
+            sm.process_bytes(&frame).expect("64x32 is within the cap");
+        }
+        assert_eq!(
+            sm.framebuffer.pixels().len(),
+            64 * 32 * 4,
+            "the framebuffer should have been rebuilt at the size the server declared"
+        );
+    }
+
+    /// The other side of the line the variant draws: the same error from a path no dynamic
+    /// channel produced stays unattributed. Asserting it is what stops a later blanket
+    /// `Some(..)` from passing the test above.
+    #[test]
+    fn a_framebuffer_refusal_the_connect_sequence_produced_names_no_channel() {
+        let mut config = config();
+        config.desktop_size = (crate::framebuffer::MAX_DESKTOP_DIM + 1, 768);
+        assert!(
+            matches!(
+                SessionStateMachine::new(config, Vec::new()),
+                Err(SessionError::Framebuffer { channel: None, .. })
+            ),
+            "a desktop size from the connect sequence belongs to no channel"
         );
     }
 

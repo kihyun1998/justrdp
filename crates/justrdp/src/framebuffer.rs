@@ -31,7 +31,9 @@ pub struct FrameUpdate {
 /// the end. On x86-64 the same call merely allocates 17 GiB and succeeds, which is why every
 /// other gate was green over it ([the invariant]).
 /// At the cap the product is exactly 1 GiB, so it fits a 32-bit `usize` by construction rather
-/// than by a check that could be forgotten.
+/// than by a check that could be forgotten — and it clears `isize::MAX`, the ceiling `Vec`
+/// actually enforces, which 1 GiB is under as well. Why it is not raised to the 32766
+/// MS-RDPEGFX 2.2.2.14 allows: ADR-0009's 2026-09-16 amendment (#286).
 ///
 /// [the invariant]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/decoder-dimension-overflow-32bit.md
 pub const MAX_DESKTOP_DIM: u16 = 16384;

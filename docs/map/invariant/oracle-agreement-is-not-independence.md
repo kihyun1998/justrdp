@@ -94,6 +94,17 @@ show it.
   neither could reach the defects they were added for.
 - Memory `ironrdp_oracle_shares_lineage` records the lineage limit itself, naming
   ClearCodec and RemoteFX compositing as the weakest cases for DoD ④ independence.
+- **#286 — the first instance at the *design-constant* layer**, and every row above it is
+  about decode output. `ironrdp-egfx`'s compositor carries `MAX_SURFACE_DIM: u16 = 16384`
+  and `MAX_COMPOSITOR_BYTES = 256 * 1024 * 1024` — both of `justrdp::egfx`'s constants, at
+  the same values, with near-identical justifying prose about a 4K surface being ~33 MiB and
+  servers keeping a handful of those. The direction of the lineage was not established; the
+  independence was. What it cost was an **argument**, not a test: the most natural defence of
+  keeping 16384 was *"neither reference client goes higher"*, and that sentence is
+  self-citation. The independent reference, FreeRDP, caps neither site. Adjudicated in
+  [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s 2026-09-16 amendment. **The
+  restatement test below catches this one too** — *"our constant is 16384 and no server has
+  ever sent more"* survives without naming ironrdp, and that is what the decision rests on.
 
 ## Where it will recur
 

@@ -33,8 +33,11 @@ use justrdp_codecs::rfx::progressive::Progressive;
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::egfx::{self, EgfxPdu, Rect16};
 
-/// Per-axis cap on surface dimensions. The spec ceiling is 32766 (MS-RDPEGFX 2.2.2.14); real
-/// surfaces track the desktop. The cap bounds a hostile CreateSurface before allocation.
+/// Per-axis cap on surface dimensions, and **ours rather than the spec's**: MS-RDPEGFX 2.2.2.9
+/// states no maximum for a `CreateSurface` edge, so the wire ceiling is `u16::MAX`. 2.2.2.14's
+/// 32766 is [`crate::framebuffer::MAX_DESKTOP_DIM`]'s quantity, not this one. Real surfaces
+/// track the desktop; the cap bounds a hostile CreateSurface before allocation. Why it is not
+/// raised, and what that diverges from: ADR-0009's 2026-09-16 amendment (#286).
 const MAX_SURFACE_DIM: u16 = 16384;
 
 /// Total RGBA bytes across all live surfaces (allocation bound, the reassembly-cap

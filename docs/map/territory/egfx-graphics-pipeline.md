@@ -20,6 +20,9 @@ acknowledge frames. It is server→client only, and it is reachable only if
   the runtime graph at all.
 - [ADR-0010](../../adr/0010-frameupdate-dirty-rect-contract.md) — surfaces blit
   straight into the framebuffer with no intermediate extract copy (#163).
+- [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md) — the 2026-09-16 amendment
+  (#286) is where this territory's **deliberate divergences** finally have a home, and it
+  carries the first row: `MAX_SURFACE_DIM`.
 
 ## Design model
 
@@ -182,11 +185,20 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   but it is a divergence from **both** references with no row recording it, and #262's row
   covers only `right == left`, which is a different case: that one is a legal empty
   rectangle, this one is malformed. Cost of tolerating it is currently zero, which is why
-  #263 left it alone rather than filing it. **A deliberate-divergence note is owed**; such
-  notes are owned by the record that decides them — ADR-0009 for a receive-path tolerance —
-  so this one belongs in an amendment there, and is recorded here in the meantime.
+  #263 left it alone rather than filing it. **The note it was owed is written**, in
+  [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s 2026-09-16 amendment (#286) as
+  row 2 — such notes are owned by the record that decides them, and ADR-0009 is the one for a
+  receive-path tolerance. Both reference citations were re-opened at source when it was written.
 
-- **A second `## Deliberate divergences` row is owed, and this one is load-bearing for a
+- **This territory's deliberate divergences have a home, and all three rows are in it.**
+  Two bullets here asked for one for months and neither could name a destination.
+  [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s 2026-09-16 amendment (#286)
+  is it: row 1 the per-axis dimension caps, row 2 the inverted `destRect` (#263), row 3 the
+  paint-budget skip (#268). **What the two bullets kept is their evidence**, which is the half
+  a decision record does not carry — the numbers, the discovery history, and how each claim was
+  once wrong. The *verdict* is the ADR's.
+
+- **Row 3, and this one is load-bearing for a
   decision rather than for a tolerance nobody pays for** (#268). justrdp **skips** the entries
   past a per-frame paint budget and keeps both the channel and the session. **FreeRDP** closes
   the graphics channel on a failed graphics command — `drdynvc_main.c`, `if (status !=
