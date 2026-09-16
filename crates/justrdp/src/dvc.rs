@@ -89,6 +89,11 @@ pub(crate) enum DvcEvent {
     DisplayControlReady,
     /// EGFX output resize (the session machine rebuilds its framebuffer).
     OutputResized {
+        /// The name the processor that asked for it registered under
+        /// ([`DvcProcessor::channel_name`]). The session machine can refuse the size, and the
+        /// refusal happens outside [`DvcProcessor::process`], so the name travels with the
+        /// event rather than being recovered from the error.
+        channel: &'static str,
         /// New output width in pixels.
         width: u16,
         /// New output height in pixels.
@@ -326,8 +331,9 @@ impl Drdynvc {
                     channel_id,
                     CREATION_STATUS_OK,
                 ))];
+                let channel = self.processors[processor].channel_name();
                 let outputs = self.processors[processor].start(channel_id);
-                events.extend(self.apply_outputs(channel_id, outputs));
+                events.extend(self.apply_outputs(channel_id, channel, outputs));
                 Ok(events)
             }
             DvcMessage::DataFirst {
@@ -419,18 +425,21 @@ impl Drdynvc {
             return Ok(Vec::new());
         };
         let processor = &mut self.processors[open.processor];
+        let channel = processor.channel_name();
         let outputs = processor
             .process(message)
-            .map_err(|error| DvcError::Processor {
-                channel: processor.channel_name(),
-                error,
-            })?;
-        Ok(self.apply_outputs(channel_id, outputs))
+            .map_err(|error| DvcError::Processor { channel, error })?;
+        Ok(self.apply_outputs(channel_id, channel, outputs))
     }
 
     /// Turn processor outputs into manager events (fragmenting sends, recording the
     /// Display Control milestone).
-    fn apply_outputs(&mut self, channel_id: u32, outputs: Vec<ProcessorOutput>) -> Vec<DvcEvent> {
+    fn apply_outputs(
+        &mut self,
+        channel_id: u32,
+        channel: &'static str,
+        outputs: Vec<ProcessorOutput>,
+    ) -> Vec<DvcEvent> {
         let mut events = Vec::new();
         for output in outputs {
             match output {
@@ -444,7 +453,11 @@ impl Drdynvc {
                     events.push(DvcEvent::DisplayControlReady);
                 }
                 ProcessorOutput::OutputResized { width, height } => {
-                    events.push(DvcEvent::OutputResized { width, height });
+                    events.push(DvcEvent::OutputResized {
+                        channel,
+                        width,
+                        height,
+                    });
                 }
             }
         }

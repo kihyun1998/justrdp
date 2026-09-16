@@ -1,6 +1,6 @@
 # 0009 — Negotiation posture: tolerant of server self-inconsistency in rendering, strict on security integrity
 
-- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268) and 2026-09-04; see the Amendments below
+- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268), 2026-09-04 and 2026-09-16 (#286); see the Amendments below
 - Date: 2026-07-03
 - Closes issue #101
 
@@ -110,3 +110,120 @@ never send. The two claim classes therefore need different methods:
 Recorded because it recurred rather than because it is elegant: **#263** substituted the
 32-bit rule by judgement and **#268** substituted a wire-format round-trip, and two
 substitutions in a row is a standing gap, not a one-off.
+
+
+## Amendment (2026-09-16, #286): the per-axis dimension caps are a deliberate divergence, and this is the row
+
+§3's invariants license **tolerances**. This records the one standing **refusal** that is ours
+rather than the spec's, because a refusal nobody wrote down reads as a defect to whoever meets
+it next — which is how #286 came to be filed.
+
+### What justrdp does
+
+A surface edge above `MAX_SURFACE_DIM` (16384) is refused by `GraphicsProcessor::process`; an
+output size above `MAX_DESKTOP_DIM` (the same 16384) is refused by the framebuffer. Both end the
+session, per [ADR-0014](0014-dvc-processor-error-posture.md) Decision 1.
+
+### What the wire allows, read raw rather than from either client
+
+| Section | Field width | Stated maximum |
+|---|---|---|
+| `[MS-RDPEGFX]` 2.2.2.9 `RDPGFX_CREATE_SURFACE_PDU` | `u16` | **none** — the section states no maximum at all, so the wire ceiling is 65535 |
+| `[MS-RDPEGFX]` 2.2.2.14 `RDPGFX_RESET_GRAPHICS_PDU` | `u32` | **32766**, with `monitorCount` MUST ≤ 16 |
+| `[MS-RDPEDISP]` 2.2.2.2.1 `DISPLAYCONTROL_MONITOR_LAYOUT` | `u32` | **8192** per monitor, and ≥ 200 |
+
+Two consequences the ticket did not carry. **32766 is not a surface number** — `egfx.rs` cited
+2.2.2.14 as the ceiling for `MAX_SURFACE_DIM` until this change, and that section bounds the
+Graphics Output Buffer, a different quantity. And **32766 bounds a virtual desktop spanning up
+to sixteen monitors**, while a single monitor's legal maximum is 8192 — which justrdp's own
+`request_resize` already enforces on the outbound side. justrdp does not consume `monitorCount`
+(`justrdp-pdu/src/egfx.rs` decodes width and height and skips the rest), so it cannot tell a
+one-monitor 32766-wide output from a four-monitor one. Multi-monitor is epic #27, unbuilt.
+
+### What the references do, each re-opened at source
+
+- **Microsoft's client conformance suite** (`microsoft/WindowsProtocolTestSuites` `2447a665`)
+  exercises 32766 in two `[TestCategory("Positive")]` tests that expect a frame acknowledge:
+  `RDPEGFX_SurfaceToScreen_PositiveTest_CreateSurface_MaxWidth` and
+  `RDPEGFX_SurfaceToScreen_PositiveTest_ResetGraphic_MaxHeighWidth`, both in
+  `RdpegfxSurfaceToScreenTest.cs`. **Neither asks for 32766 square.** The other axis is the
+  1024x768 test desktop, so the largest allocation either demands is 134_209_536 bytes —
+  128 MiB, already under `MAX_TOTAL_SURFACE_BYTES`. justrdp fails both, and it fails them at the
+  first `ResetGraphics` rather than at `CreateSurface`. (The suite's own inline comment
+  *"the output window is too large 32766\*32766"* is wrong about its own test.)
+- **FreeRDP caps neither site.** `gdi_CreateSurface` scanline-aligns and lets
+  `winpr_aligned_malloc` return NULL; `gdi_ResetGraphics` sets `FreeRDP_DesktopWidth`/`Height`
+  with no check (`libfreerdp/gdi/gfx.c`). It is the **only independent reference here**, and it
+  would pass both tests.
+- **IronRDP is not a second vote.** `ironrdp-egfx`'s compositor carries
+  `MAX_SURFACE_DIM: u16 = 16384` and `MAX_COMPOSITOR_BYTES = 256 * 1024 * 1024` — both of
+  justrdp's constants, at the same values, with near-identical justifying prose about a 4K
+  surface being ~33 MiB and servers keeping a handful. The direction of the lineage is
+  unestablished; the independence is not
+  ([oracle agreement is not independence](../map/invariant/oracle-agreement-is-not-independence.md)),
+  and this is that invariant's first instance at the **design-constant** layer rather than at
+  decode output. Its *output* handling is inapplicable for a second, structural reason: its
+  compositor holds no retained output buffer — `output_width`/`output_height` are clip bounds and
+  output leaves as `OutputUpdate` deltas — so its `unwrap_or(u16::MAX)` clamp bounds nothing.
+  justrdp holds the retained framebuffer by [ADR-0010](0010-frameupdate-dirty-rect-contract.md).
+
+### Decision
+
+**Keep 16384 at both sites and record the divergence rather than closing it.** The licence is
+the one the 2026-08-31 amendment above already names: this is **a resource ceiling that is
+ours**, and the spec asks for it neither way. Two measurements decide it against raising:
+
+- **No server has ever sent a dimension above 16384.** The one VM is 1280x800, and per the
+  2026-09-04 amendment a conforming server *structurally cannot* exercise a refusal guard. There
+  is therefore no further evidence to gather here; the choice is made on what exists.
+- **Raising it is not a constant change.** At 16384 the product is exactly 1 GiB and fits a
+  32-bit `usize` by construction. At 32766 it is 4_294_443_024 — which clears `u32::MAX` by
+  524_271 bytes and then overflows on the very addition that checks it against
+  `MAX_TOTAL_SURFACE_BYTES`, and which is twice `isize::MAX`, the band
+  [ADR-0012](0012-consumption-site-totality.md) §2's 2026-08-31 extension measured. So the
+  alternative is a checked product at both sites, a framebuffer byte ceiling that does not exist
+  and has no derivation (the 256 MiB is derived for *surfaces*), a placement decision for a
+  helper that is `pub(crate)` in another crate, and two *by construction* comments plus an
+  invariant entry rewritten — for a geometry no server has asked for.
+
+**Kind: judgement.** Three shapes were enumerated with their consequences and the maintainer
+chose this one. A better derivation does not reopen it; the maintainer does.
+
+### What this does not decide
+
+- **Whether a refusal in this class should keep ending the session.** That is ADR-0014
+  Decision 1, and the recovery ladder is #272's. If that ladder ever gives the core a non-fatal
+  verdict, this row is a candidate for it — ADR-0014's own not-covered list named this rung.
+
+### The two rows this record was already owed
+
+`egfx-graphics-pipeline.md` recorded both as *"a deliberate-divergence note is owed"* and
+neither had anywhere to go. Both citations below were re-opened at source on 2026-09-16 rather
+than copied from that note.
+
+**Row 2 — an inverted `destRect` is tolerated as an empty rectangle; both references refuse it.**
+`Rect16::width()` is `right.saturating_sub(left)`, so `right < left` yields extent 0 and, since
+#262, `Ok(Vec::new())` — nothing painted, no error. FreeRDP refuses it on the receive path before
+anything else: `RecvWireToSurface1Pdu` logs and returns `ERROR_INVALID_DATA` for `right < left`
+and again for `bottom < top` (`channels/rdpgfx/client/rdpgfx_main.c`). `ironrdp-egfx` returns
+`Err(pdu_other_err!("invalid destination rectangle ordering"))` for the same condition
+(`crates/ironrdp-egfx/src/client.rs`) — and it is that crate's **one** hard error on this path;
+the surface-bounds check immediately below it only `warn!`s. `[MS-RDPEGFX]` 2.2.1.2 states no
+ordering requirement, so tolerating it is spec-legal, and §3(a) holds: the bytes are still fully
+validated. **Kept**, because the cost of tolerating it is zero — an empty rectangle paints
+nothing either way. Note that all three clients compare *strictly*, so `right == left` is
+accepted everywhere; that is a legal empty rectangle and a different case, which is #262's.
+
+**Row 3 — an over-budget paint entry is skipped, and both the channel and the session survive.**
+Past the per-frame paint budget the three list-bearing commands skip their remaining entries and
+return `Ok` (#268). FreeRDP closes the dynamic channel whenever a processor fails:
+`if (status != CHANNEL_RC_OK) status = dvcman_channel_close(channel, FALSE, FALSE);`
+(`channels/drdynvc/client/drdynvc_main.c`, at both the data-first and data paths). `ironrdp-egfx`
+does not bound the count at all, and its compositor's `solid_fill`, `surface_to_surface`,
+`surface_to_cache` and `cache_to_surface` all return `()` — so it has no place to put a refusal
+even if it wanted one. **Kept**, on the ground the 2026-08-31 amendment already names: an
+over-budget count is well-formed and spec-legal, and refusing it would end a session over a
+resource ceiling that is ours — which [ADR-0014](0014-dvc-processor-error-posture.md) then priced
+at the whole session rather than the channel. This row used to carry a second ground, that
+Microsoft's conformance suite drew the same line; ADR-0014's enumeration **measured that false**,
+and the row stands on the first ground alone.

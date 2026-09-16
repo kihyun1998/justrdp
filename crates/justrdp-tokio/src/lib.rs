@@ -656,7 +656,11 @@ pub enum SessionFailure {
     /// Socket-level I/O failed.
     Io(io::Error),
     /// The server sent data the session machine rejects (malformed PDU / codec data).
-    /// A dynamic channel's processor failure arrives as [`SessionError::DynamicChannel`].
+    ///
+    /// A dynamic channel's failure names the channel, in one of two carriers: what its
+    /// processor returned is [`SessionError::DynamicChannel`], and an output size its
+    /// processor asked for that the framebuffer then refused is
+    /// [`SessionError::Framebuffer`] with `channel` set (ADR-0014 and its amendments).
     Protocol(SessionError),
 }
 

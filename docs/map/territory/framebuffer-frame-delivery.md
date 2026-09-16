@@ -15,6 +15,12 @@ renderer begins.
   framebuffer by borrow inside the synchronous frame sink (issue #85).
 - [ADR-0001](../../adr/0001-sans-io-state-machine-core.md) — the frame sink is
   host-injected policy; the core neither renders nor schedules.
+- [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md) — the 2026-09-16 amendment
+  (#286) records `MAX_DESKTOP_DIM` as a **deliberate divergence**: a resource ceiling that is
+  ours, kept at 16384 against a spec that allows 32766 and a conformance suite that exercises
+  it. The refusal is also §3(b)'s *refuse rather than clamp*.
+- [ADR-0014](../../adr/0014-dvc-processor-error-posture.md) — the same amendment attributes
+  the refusal to the channel that declared the size, when one did.
 
 ## Design model
 
@@ -61,7 +67,18 @@ the exact shape the map's *reference behaviour* section exists to make visible.
   describing a buffer that was never allocated). It is now capped at `MAX_DESKTOP_DIM = 16384` —
   **the same constant `justrdp::egfx` caps a surface at**, because an EGFX surface tracks the
   desktop and two ceilings would differ only by accident — and at the cap the product is exactly
-  1 GiB, so it fits by construction rather than by a check.
+  1 GiB, so it fits by construction rather than by a check. **Also under `isize::MAX`**, which
+  is the ceiling `Vec` enforces and the one the invariant names after #263 — the two agree only
+  because 1 GiB is below both, and at the spec's own 32766 the product is *twice* `isize::MAX`.
+- **The cap is ours, not the spec's, and the two ends of it are different quantities**
+  (#286). `[MS-RDPEGFX]` 2.2.2.14 allows a Graphics Output Buffer of 32766 per axis (fields are
+  `u32`) with `monitorCount` up to 16; `[MS-RDPEDISP]` 2.2.2.2.1 caps a **single monitor** at
+  8192, which `SessionStateMachine::request_resize` already enforces outbound. So 32766 describes
+  a multi-monitor span, justrdp does not decode `monitorCount`, and multi-monitor is epic #27 —
+  unbuilt, and the Known hole below says this single buffer does not anticipate it. Microsoft's
+  conformance suite exercises 32766 on one axis in two positive tests; justrdp fails both, at the
+  `ResetGraphics`. Kept rather than raised, as a judgement, in
+  [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s 2026-09-16 amendment.
 - **`blit` and `copy_rect_into` are refusals, not clips, and neither is wire-reachable.** Both
   are `pub` and both had a total-arithmetic hole (`src_stride_px * 4` overflowing on *every*
   target; an out-of-range slice index on a rect outside the buffer). Their callers pass values

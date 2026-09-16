@@ -1,6 +1,6 @@
 # 0014 — A DVC processor error drops the connection, attributably; the recovery ladder is #272's
 
-- Status: Accepted (issue #270) — Decision 2 implemented by #285; see the Amendment below (2026-09-15)
+- Status: Accepted (issue #270) — Decision 2 implemented by #285; see the Amendments below (2026-09-15, 2026-09-16)
 - Date: 2026-09-14
 - Kind: **judgement** — the maintainer chose between three shapes whose consequences were
   enumerated (below). A better derivation does not reopen it; the maintainer does.
@@ -137,3 +137,60 @@ failures unattributed, and neither is settled by this amendment:
   outside `process` (#286);
 - the manager errors this record already listed as not covered (SVC reassembly, a malformed
   drdynvc PDU), which no channel can be blamed for.
+
+
+## Amendment (2026-09-16, #286): attribution follows the channel that produced the event, not the call that failed
+
+Two things this record left open are settled, and both by the same change.
+
+**The first not-covered bullet is covered.** *"The rung for a spec-legal surface or output size
+above `MAX_SURFACE_DIM` (16384), which the conformance suite exercises in positive tests at
+32766"* is decided: **the cap stays at 16384 and the refusal keeps ending the session**, recorded
+as a deliberate divergence in [ADR-0009](0009-tolerant-negotiation-posture.md)'s 2026-09-16
+amendment, where the spec sections, the suite's two positive tests and both references are read
+at source. Decision 1 is untouched — it is the *rung* that was open, not the posture, and the
+answer is the rung this record already gives everything else.
+
+**And the 2026-09-15 amendment's first unattributed case is closed.** That amendment left *"a
+`SessionError::Framebuffer` raised by an EGFX `OutputResized` — refused in the session machine,
+outside `process` (#286)"* unsettled. It is now attributed.
+
+### Where attribution stops, restated
+
+Decision 2's line was *"only an error a `DvcProcessor::process` returned is attributed"*, and that
+wording made the boundary the **call** rather than the **origin**. The line the maintainer chose
+here is: **attribution follows the channel whose processor produced the thing that failed**, and
+it is reached by carrying the name rather than by recovering it from an error.
+
+Concretely, `DvcEvent::OutputResized` carries the processor's `channel_name()`, and
+`SessionError::Framebuffer` becomes `{ channel: Option<&'static str>, error }` — `Some` for the
+EGFX resize, `None` for the two paths no channel produced (the connect sequence's `SessionConfig`
+and a reactivation Demand Active). Behaviour is unchanged; the session still ends.
+
+**This does not widen attribution to the manager.** The 2026-09-15 amendment's other case — the
+`DYNVC_DATA_FIRST.Length` reassembly cap on an open channel — stays `SessionError::Decode`, and
+for the reason recorded there: the cap is the manager's bound, not a processor's verdict. The
+distinction this amendment adds is between *a channel's processor produced this* and *a call into
+a processor returned this*; the reassembly cap is neither.
+
+**Kind: judgement**, on the same footing as the line it moves. Shown the alternative — moving the
+size check into `GraphicsProcessor::process` so the existing path applies untouched — the
+maintainer chose the carrier, because the alternative puts the framebuffer's ceiling in a second
+place and [ADR-0012](0012-consumption-site-totality.md) §3 asks a family for one answer to one
+quantity. The carrier's *shape* remains a derivation and falls to a better one.
+
+### Proof
+
+Wire-format round-trips through `SessionStateMachine::process_bytes`, per ADR-0009's 2026-09-04
+amendment (never a mock, never the private method): an EGFX `ResetGraphics` at
+`MAX_DESKTOP_DIM + 1` names the Graphics channel, and a desktop size from the connect sequence
+names none. Each was seen to fail under its own mutation — attribution off; blanket attribution at
+the connect site; a plausible but wrong channel name — and only the targeted test failed each
+time.
+
+### Still not covered
+
+The remaining entries of this record's own not-covered list are untouched: drdynvc-manager errors
+no channel can be blamed for, `[MS-RDPEDYC]` 3.1.5.2.4's "MUST terminate" for the skipped soft-sync
+and unassigned `Cmd` values (narrowed by #287 to exclude Cmd 6/7), and the rung for a malformed
+Display Control PDU.
