@@ -99,6 +99,11 @@ rather than by capability:
   longer reproduced, so nothing but version ordering held it at 3 (violation #1 above). Now
   answered as 2, with Cmd 6/7 refused — see [virtual channels](../territory/virtual-channels.md).
 
+- **#273** — the ladder became the host's to narrow (ADR-0015), and the rule moved with it: the
+  host picks from `HONOURED_VERSIONS` and is **refused**, not silently trimmed, outside it; the
+  per-version flags stay derived in the core. The same change found the rule's other direction —
+  a confirmed 10.3 imposes a 16 MB cache (3.3.1.4) the budget had never read.
+
 ## Where it will recur
 
 **Whenever a capability, flag, version or feature bit is added to something this client

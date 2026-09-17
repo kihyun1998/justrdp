@@ -52,6 +52,8 @@ pub struct SessionConfig {
     /// the channel was not requested/granted — dynamic channels (Display Control resize,
     /// EGFX, …) are then unavailable.
     pub drdynvc_channel_id: Option<u16>,
+    /// What the graphics channel advertises when the server opens it.
+    pub egfx: crate::EgfxConfig,
 }
 
 /// One effect of feeding bytes to the machine, in order.
@@ -138,6 +140,8 @@ pub enum SessionError {
         /// Why the framebuffer refused it.
         error: crate::framebuffer::FramebufferError,
     },
+    /// [`SessionConfig::egfx`] cannot be advertised.
+    EgfxConfig(crate::EgfxConfigError),
     /// Interleaved-RLE bitmap data failed to decompress.
     Rle(rle::RleError),
     /// RDP6 planar bitmap data failed to decompress.
@@ -155,6 +159,7 @@ impl core::fmt::Display for SessionError {
             SessionError::DynamicChannel { channel, error } => {
                 write!(f, "dynamic channel {channel}: {error}")
             }
+            SessionError::EgfxConfig(e) => write!(f, "EGFX config: {e}"),
             SessionError::Rle(e) => write!(f, "interleaved RLE: {e}"),
             SessionError::Planar(e) => write!(f, "RDP6 planar: {e}"),
             SessionError::Color(e) => write!(f, "pixel conversion: {e}"),
@@ -247,6 +252,8 @@ impl SessionStateMachine {
                     error,
                 }
             })?;
+        let graphics =
+            crate::egfx::GraphicsProcessor::new(&config.egfx).map_err(SessionError::EgfxConfig)?;
         // The cache honors what the caller advertised in its Pointer capability set:
         // `pointerCacheSize` when present (the cache New Pointer messages address), else
         // `colorPointerCacheSize`; no Pointer set advertised means no cache (a conforming
@@ -273,7 +280,7 @@ impl SessionStateMachine {
             cursor_cache: vec![None; usize::from(cache_size)],
             error_info: None,
             ultimatum_reason: None,
-            drdynvc: Drdynvc::default(),
+            drdynvc: Drdynvc::new(graphics),
         })
     }
 
@@ -1054,6 +1061,7 @@ mod tests {
             server_input_flags: capability::INPUT_FLAG_SCANCODES
                 | capability::INPUT_FLAG_FASTPATH_INPUT2,
             drdynvc_channel_id: Some(DRDYNVC),
+            egfx: Default::default(),
         }
     }
 
@@ -2304,6 +2312,53 @@ mod tests {
                 })
             )),
             "the failure should name the graphics channel, got {results:?}"
+        );
+    }
+
+    /// The host's `SessionConfig::egfx` is what the graphics channel advertises when the server
+    /// opens it.
+    #[test]
+    fn the_graphics_channel_advertises_the_session_config() {
+        let egfx = crate::EgfxConfig {
+            versions: Some(vec![justrdp_pdu::egfx::CAPVERSION_10]),
+            cache: crate::EgfxCacheMode::Small,
+        };
+        let mut sm =
+            SessionStateMachine::new(SessionConfig { egfx, ..config() }, Vec::new()).unwrap();
+        let mut writes = Vec::new();
+        for frame in server_dvc_frames(&[0x50, 0x00, 0x01, 0x00])
+            .into_iter()
+            .chain(server_dvc_create(8, justrdp_pdu::egfx::CHANNEL_NAME))
+        {
+            for output in sm.process_bytes(&frame).unwrap() {
+                if let SessionOutput::WriteBytes(bytes) = output {
+                    writes.push(bytes);
+                }
+            }
+        }
+        let advertise =
+            justrdp_pdu::egfx::encode_caps_advertise(&[justrdp_pdu::egfx::CapSet::Flags {
+                version: justrdp_pdu::egfx::CAPVERSION_10,
+                flags: justrdp_pdu::egfx::CAPS_FLAG_AVC_DISABLED
+                    | justrdp_pdu::egfx::CAPS_FLAG_SMALL_CACHE,
+            }]);
+        assert!(
+            writes.iter().any(|w| w.ends_with(&advertise)),
+            "the channel's advertise is the configured one, got {writes:02X?}"
+        );
+    }
+
+    #[test]
+    fn a_graphics_config_that_cannot_be_advertised_refuses_the_session() {
+        let egfx = crate::EgfxConfig {
+            versions: Some(vec![justrdp_pdu::egfx::CAPVERSION_106]),
+            ..crate::EgfxConfig::default()
+        };
+        assert_eq!(
+            SessionStateMachine::new(SessionConfig { egfx, ..config() }, Vec::new()).err(),
+            Some(SessionError::EgfxConfig(
+                crate::EgfxConfigError::NotAdvertisable(justrdp_pdu::egfx::CAPVERSION_106)
+            ))
         );
     }
 

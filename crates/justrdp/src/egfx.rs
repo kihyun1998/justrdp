@@ -6,13 +6,13 @@
 //! cache, the blit/fill/cache ops, and the dirty-region batching live here. Every codec on this
 //! path is now self-owned — zgfx bulk decompression was the last delegation and it went in #189,
 //! so `ironrdp-graphics` is out of the runtime graph entirely (ADR-0003 phase 3, ADR-0011).
-//! The client speaks first: `start()` sends a Caps Advertise carrying seven capsets, 8 through
-//! CAPVERSION_104. The ladder is chosen by which versions this client can *honour* rather than
-//! by how high the number goes — 10.5 and 10.6 make the scaled map-surface command a MUST, and
-//! offering them to a real WS2022 server got 10.6 confirmed and **zero** frames painted with no
-//! error anywhere (#271). AVC (H.264) stays structurally excluded: every 10.x capset carries
-//! `CAPS_FLAG_AVC_DISABLED`, and no decoder exists for it yet. The derivation is in `start()`;
-//! this paragraph still read "pinned to CAPVERSION_8" after #271 moved it, and #267 swept it.
+//! The client speaks first: `start()` sends a Caps Advertise carrying the host's `EgfxConfig`
+//! (ADR-0015) — by default seven capsets, 8 through CAPVERSION_104. The ladder is chosen by which
+//! versions this client can *honour* rather than by how high the number goes — 10.5 and 10.6 make
+//! the scaled map-surface command a MUST, and offering them to a real WS2022 server got 10.6
+//! confirmed and **zero** frames painted with no error anywhere (#271). AVC (H.264) stays
+//! structurally excluded: every 10.x capset carries `CAPS_FLAG_AVC_DISABLED`, and no decoder exists
+//! for it yet. The derivation is in `caps_advertise()` and `capset()`.
 //!
 //! WireToSurface1 RemoteFX (`CODECID_CAVIDEO`) decodes through the self-owned
 //! `justrdp-codecs::rfx` decoder (issue #58, ADR-0007) — it skipped the bootstrap phase
@@ -44,8 +44,126 @@ const MAX_SURFACE_DIM: u16 = 16384;
 /// precedent). A 4K desktop's primary surface is ~33 MiB; servers keep a handful.
 const MAX_TOTAL_SURFACE_BYTES: usize = 256 << 20;
 
-/// The bitmap-cache budget for CAPVERSION_8 with no SMALL_CACHE flag (MS-RDPEGFX 3.3.8.2).
+/// The bitmap-cache budget when the confirmed capset asks for no small cache
+/// (MS-RDPEGFX 3.3.1.4).
 const MAX_CACHE_BYTES: usize = 100 << 20;
+
+/// The bitmap-cache budget under a confirmed 10.3, THINCLIENT or SMALL_CACHE (3.3.1.4).
+const SMALL_CACHE_BYTES: usize = 16 << 20;
+
+/// The capability versions this client can honour, oldest first: the default ladder, and the
+/// set [`EgfxConfig::versions`] is drawn from.
+const HONOURED_VERSIONS: [u32; 7] = [
+    egfx::CAPVERSION_8,
+    egfx::CAPVERSION_8_1,
+    egfx::CAPVERSION_10,
+    egfx::CAPVERSION_101,
+    egfx::CAPVERSION_102,
+    egfx::CAPVERSION_103,
+    egfx::CAPVERSION_104,
+];
+
+/// What the graphics channel advertises in its Caps Advertise (MS-RDPEGFX 2.2.2.18).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgfxConfig {
+    /// The capability versions to advertise, in any order, drawn from `CAPVERSION_8`, `_8_1`,
+    /// `_10`, `_101`, `_102`, `_103` and `_104`; `None` advertises all of them. They reach the
+    /// wire oldest first, each with the flags this client derives for it.
+    pub versions: Option<Vec<u32>>,
+    /// The bitmap cache to ask the server for.
+    pub cache: EgfxCacheMode,
+}
+
+/// The bitmap cache an [`EgfxConfig`] asks for (MS-RDPEGFX 2.2.3, 3.3.1.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EgfxCacheMode {
+    /// 100 MB: no cache flag.
+    #[default]
+    Standard,
+    /// 16 MB: `CAPS_FLAG_SMALL_CACHE` on every advertised version that defines it.
+    Small,
+    /// `CAPS_FLAG_THINCLIENT` on 8 and 8.1 (16 MB, and RemoteFX in place of RemoteFX
+    /// Progressive); `CAPS_FLAG_SMALL_CACHE` on the later versions that define it.
+    ThinClient,
+}
+
+/// Why an [`EgfxConfig`] cannot be advertised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgfxConfigError {
+    /// `versions` names no version (3.3.5.18: one or more capsets).
+    Empty,
+    /// `versions` names this version more than once (3.3.5.18).
+    Duplicate(u32),
+    /// A version this client cannot honour, or one 2.2.3 does not specify.
+    NotAdvertisable(u32),
+}
+
+impl core::fmt::Display for EgfxConfigError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "no EGFX capability version to advertise"),
+            Self::Duplicate(v) => write!(f, "EGFX capability version 0x{v:08X} named twice"),
+            Self::NotAdvertisable(v) => {
+                write!(f, "EGFX capability version 0x{v:08X} cannot be advertised")
+            }
+        }
+    }
+}
+
+impl core::error::Error for EgfxConfigError {}
+
+impl EgfxConfig {
+    /// The capsets this config advertises, oldest first.
+    fn capsets(&self) -> Result<Vec<egfx::CapSet>, EgfxConfigError> {
+        if let Some(versions) = &self.versions {
+            if versions.is_empty() {
+                return Err(EgfxConfigError::Empty);
+            }
+            for (i, version) in versions.iter().enumerate() {
+                if !HONOURED_VERSIONS.contains(version) {
+                    return Err(EgfxConfigError::NotAdvertisable(*version));
+                }
+                if versions[..i].contains(version) {
+                    return Err(EgfxConfigError::Duplicate(*version));
+                }
+            }
+        }
+        Ok(ladder(self.versions.as_deref(), self.cache))
+    }
+}
+
+/// The capsets for `versions` (every honoured version when `None`), oldest first.
+fn ladder(versions: Option<&[u32]>, cache: EgfxCacheMode) -> Vec<egfx::CapSet> {
+    HONOURED_VERSIONS
+        .into_iter()
+        .filter(|version| versions.is_none_or(|versions| versions.contains(version)))
+        .map(|version| capset(version, cache))
+        .collect()
+}
+
+/// One honoured version's capset: `AVC_DISABLED` on every 10.x, and the cache flag where 2.2.3
+/// defines one for that version.
+fn capset(version: u32, cache: EgfxCacheMode) -> egfx::CapSet {
+    if version == egfx::CAPVERSION_101 {
+        return egfx::CapSet::Version101;
+    }
+    let early = matches!(version, egfx::CAPVERSION_8 | egfx::CAPVERSION_8_1);
+    let avc = if early {
+        0
+    } else {
+        egfx::CAPS_FLAG_AVC_DISABLED
+    };
+    let cache = match cache {
+        EgfxCacheMode::Standard => 0,
+        _ if version == egfx::CAPVERSION_103 => 0,
+        EgfxCacheMode::ThinClient if early => egfx::CAPS_FLAG_THINCLIENT,
+        EgfxCacheMode::Small | EgfxCacheMode::ThinClient => egfx::CAPS_FLAG_SMALL_CACHE,
+    };
+    egfx::CapSet::Flags {
+        version,
+        flags: avc | cache,
+    }
+}
 
 /// Above this many dirty rectangles a frame flush collapses to one bounding box per surface
 /// (bounds the per-frame output count without dropping content).
@@ -241,6 +359,8 @@ struct CachedBitmap {
 
 /// The EGFX channel processor: transport codec state + the owned surface model.
 pub struct GraphicsProcessor {
+    /// The capsets every Caps Advertise on this channel carries.
+    capsets: Vec<egfx::CapSet>,
     zgfx: Zgfx,
     /// Reused zgfx output buffer — one allocation across messages (#86).
     zgfx_blob: Vec<u8>,
@@ -251,6 +371,8 @@ pub struct GraphicsProcessor {
     cache: std::collections::HashMap<u16, CachedBitmap>,
     cache_bytes: usize,
     confirmed_version: Option<u32>,
+    /// The `flags` of the confirmed capset.
+    confirmed_flags: u32,
     frames_decoded: u32,
     in_frame: bool,
     /// RGBA bytes painted by the list-bearing commands since this frame opened (#268). The
@@ -289,6 +411,7 @@ fn miss(field: &'static str, reason: &'static str) -> Failure {
 impl Default for GraphicsProcessor {
     fn default() -> Self {
         Self {
+            capsets: ladder(None, EgfxCacheMode::Standard),
             zgfx: Zgfx::new(),
             zgfx_blob: Vec::new(),
             progressive: Progressive::new(),
@@ -298,6 +421,7 @@ impl Default for GraphicsProcessor {
             cache: std::collections::HashMap::new(),
             cache_bytes: 0,
             confirmed_version: None,
+            confirmed_flags: 0,
             frames_decoded: 0,
             in_frame: false,
             frame_paint: 0,
@@ -449,6 +573,7 @@ impl GraphicsProcessor {
                 }
                 tracing::info!(target: "rdp_egfx_caps", version, flags, "EGFX caps confirmed");
                 self.confirmed_version = Some(version);
+                self.confirmed_flags = flags;
             }
             EgfxPdu::ResetGraphics { width, height } => {
                 tracing::debug!(target: "rdp_egfx", width, height, "ResetGraphics");
@@ -837,10 +962,10 @@ impl GraphicsProcessor {
                 if let Some(old) = self.cache.remove(&cache_slot) {
                     self.cache_bytes -= old.rgba.len();
                 }
-                if self.cache_bytes + rgba.len() > MAX_CACHE_BYTES {
+                if self.cache_bytes + rgba.len() > self.cache_budget() {
                     return Err(invalid(
                         "RDPGFX_SURFACE_TO_CACHE_PDU",
-                        "bitmap cache exceeds the CAPVERSION_8 budget",
+                        "bitmap cache exceeds the confirmed capset's budget",
                     )
                     .into());
                 }
@@ -937,7 +1062,7 @@ impl GraphicsProcessor {
                         "EGFX channel reset (3.3.5.19)"
                     );
                     self.reset_channel();
-                    outputs.push(ProcessorOutput::Send(Self::caps_advertise()));
+                    outputs.push(ProcessorOutput::Send(self.caps_advertise()));
                 }
             }
         }
@@ -964,6 +1089,7 @@ impl GraphicsProcessor {
     /// server's confirm.
     fn reset_channel(&mut self) {
         *self = GraphicsProcessor {
+            capsets: core::mem::take(&mut self.capsets),
             zgfx: core::mem::take(&mut self.zgfx),
             zgfx_blob: core::mem::take(&mut self.zgfx_blob),
             awaiting_confirm: true,
@@ -1019,50 +1145,30 @@ impl GraphicsProcessor {
 }
 
 impl GraphicsProcessor {
-    /// The client's Caps Advertise: what [`DvcProcessor::start`] sends and a reset resends.
-    fn caps_advertise() -> Vec<u8> {
-        // **Oldest first, and stopping at 10.4.** The ladder is chosen by whether a version
-        // lets this client decline an obligation it does not implement, not by how high the
-        // number goes — `[MS-RDPEGFX]` 1.5.1 makes 10.5, 10.6 and 10.7-without-
-        // SCALEDMAP_DISABLE a MUST to process `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU`.
-        //
-        // *Does not implement*, not *cannot*: `ironrdp-egfx` advertises 10.5/10.6 and
-        // discharges the same MUST without a resampler — it accepts the command, records the
-        // origin and forwards the target size — and this server's scaled map is 1:1 anyway
-        // (measured: `target` equals the surface's own 1280x800). So excluding them is a
-        // **scope decision**, taken deliberately, and not a derivation from impossibility. Measured rather than argued: offered the full ladder, a real WS2022
-        // server confirmed **10.6**, sent that command, and painted **zero** frames while the
-        // session, the channel and the frame brackets all stayed healthy — a black screen
-        // with no error anywhere. Offered this ladder it confirms **10.4** and paints.
-        //
-        // 10.7 *can* decline the obligation and is still not advertised: offered alongside
-        // 10.4 the same server chose 10.4, so nothing measured shows a benefit, and this repo
-        // does not ship machinery for a case no capture contains.
-        //
-        // AVC stays structurally excluded — every 10.x capset carries AVC_DISABLED, and
-        // AVC_THINCLIENT (10.3+) is therefore never applicable. SMALL_CACHE is never set, so
-        // 10.3's rule that it must be cleared there is satisfied by construction.
-        //
-        // The order is the one the measurement used, and it is what both reference clients
-        // send.
-        //
-        // Sent RAW: EGFX segmentation is asymmetric — only server→client traffic rides
-        // RDP_SEGMENTED_DATA; a client→server PDU wrapped in a segment header gets the whole
-        // connection reset (proven on the real VM: the server reads 0xE0 0x04 as a garbage
-        // cmdId and kills the session; raw proceeds to Caps Confirm).
-        let avc_off = egfx::CAPS_FLAG_AVC_DISABLED;
-        let flags = |version, flags| egfx::CapSet::Flags { version, flags };
-        let capsets = [
-            flags(egfx::CAPVERSION_8, 0),
-            flags(egfx::CAPVERSION_8_1, 0),
-            flags(egfx::CAPVERSION_10, avc_off),
-            egfx::CapSet::Version101,
-            flags(egfx::CAPVERSION_102, avc_off),
-            flags(egfx::CAPVERSION_103, avc_off),
-            flags(egfx::CAPVERSION_104, avc_off),
-        ];
-        tracing::debug!(target: "rdp_egfx_caps", count = capsets.len(), "EGFX caps advertised");
-        egfx::encode_caps_advertise(&capsets)
+    /// The client's Caps Advertise: what [`DvcProcessor::start`] sends and a reset resends, as a
+    /// raw EGFX PDU with no segment header.
+    fn caps_advertise(&self) -> Vec<u8> {
+        let count = self.capsets.len();
+        tracing::debug!(target: "rdp_egfx_caps", count, "EGFX caps advertised");
+        egfx::encode_caps_advertise(&self.capsets)
+    }
+
+    /// A processor that advertises `config`.
+    pub fn new(config: &EgfxConfig) -> Result<Self, EgfxConfigError> {
+        Ok(Self {
+            capsets: config.capsets()?,
+            ..Self::default()
+        })
+    }
+
+    /// The bitmap-cache size the confirmed capset allows (3.3.1.4).
+    fn cache_budget(&self) -> usize {
+        let small = egfx::CAPS_FLAG_THINCLIENT | egfx::CAPS_FLAG_SMALL_CACHE;
+        match self.confirmed_version {
+            Some(egfx::CAPVERSION_103) => SMALL_CACHE_BYTES,
+            Some(_) if self.confirmed_flags & small != 0 => SMALL_CACHE_BYTES,
+            _ => MAX_CACHE_BYTES,
+        }
     }
 }
 
@@ -1072,7 +1178,7 @@ impl DvcProcessor for GraphicsProcessor {
     }
 
     fn start(&mut self, _channel_id: u32) -> Vec<ProcessorOutput> {
-        vec![ProcessorOutput::Send(Self::caps_advertise())]
+        vec![ProcessorOutput::Send(self.caps_advertise())]
     }
 
     fn process(&mut self, message: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError> {
@@ -1103,7 +1209,10 @@ impl DvcProcessor for GraphicsProcessor {
     }
 
     fn close(&mut self) {
-        *self = GraphicsProcessor::default();
+        *self = GraphicsProcessor {
+            capsets: core::mem::take(&mut self.capsets),
+            ..GraphicsProcessor::default()
+        };
     }
 }
 
@@ -1312,6 +1421,229 @@ mod tests {
         assert!(
             message[at + 8..at + 8 + 0x10].iter().all(|b| *b == 0),
             "all sixteen reserved bytes MUST be zero"
+        );
+    }
+
+    /// The capsets a Caps Advertise carries, as `(version, capsData)` in wire order.
+    fn advertised_capsets(message: &[u8]) -> Vec<(u32, Vec<u8>)> {
+        let count = u16::from_le_bytes(message[8..10].try_into().unwrap());
+        let mut at = 10;
+        let mut capsets = Vec::new();
+        for _ in 0..count {
+            let version = u32::from_le_bytes(message[at..at + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(message[at + 4..at + 8].try_into().unwrap()) as usize;
+            capsets.push((version, message[at + 8..at + 8 + len].to_vec()));
+            at += 8 + len;
+        }
+        assert_eq!(at, message.len(), "the advertise holds exactly its capsets");
+        capsets
+    }
+
+    fn started(config: &EgfxConfig) -> Vec<(u32, Vec<u8>)> {
+        let mut p = GraphicsProcessor::new(config).expect("a valid config");
+        let outputs = p.start(11);
+        let [Out::Send(message)] = outputs.as_slice() else {
+            panic!("expected one send, got {outputs:?}");
+        };
+        advertised_capsets(message)
+    }
+
+    fn flags_of(capsets: &[(u32, Vec<u8>)]) -> Vec<(u32, Option<u32>)> {
+        capsets
+            .iter()
+            .map(|(version, data)| {
+                let flags =
+                    (data.len() == 4).then(|| u32::from_le_bytes(data[..].try_into().unwrap()));
+                (*version, flags)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_config_naming_versions_advertises_only_those() {
+        let config = EgfxConfig {
+            versions: Some(vec![egfx::CAPVERSION_104, egfx::CAPVERSION_10]),
+            ..EgfxConfig::default()
+        };
+        assert_eq!(
+            flags_of(&started(&config)),
+            vec![
+                (egfx::CAPVERSION_10, Some(egfx::CAPS_FLAG_AVC_DISABLED)),
+                (egfx::CAPVERSION_104, Some(egfx::CAPS_FLAG_AVC_DISABLED)),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_default_config_advertises_the_default_ladder() {
+        let avc_off = Some(egfx::CAPS_FLAG_AVC_DISABLED);
+        assert_eq!(
+            flags_of(&started(&EgfxConfig::default())),
+            vec![
+                (egfx::CAPVERSION_8, Some(0)),
+                (egfx::CAPVERSION_8_1, Some(0)),
+                (egfx::CAPVERSION_10, avc_off),
+                (egfx::CAPVERSION_101, None),
+                (egfx::CAPVERSION_102, avc_off),
+                (egfx::CAPVERSION_103, avc_off),
+                (egfx::CAPVERSION_104, avc_off),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_version_the_client_cannot_honour_is_refused() {
+        for version in [
+            egfx::CAPVERSION_105,
+            egfx::CAPVERSION_106,
+            egfx::CAPVERSION_106_ERR,
+            egfx::CAPVERSION_107,
+            0xDEAD_BEEF,
+        ] {
+            let config = EgfxConfig {
+                versions: Some(vec![egfx::CAPVERSION_104, version]),
+                ..EgfxConfig::default()
+            };
+            assert_eq!(
+                GraphicsProcessor::new(&config).err(),
+                Some(EgfxConfigError::NotAdvertisable(version))
+            );
+        }
+    }
+
+    /// 3.3.5.18: *"one or more of the capability sets"*, and *"Each capability set type MUST NOT
+    /// appear more than once."*
+    #[test]
+    fn an_empty_or_repeated_version_list_is_refused() {
+        let empty = EgfxConfig {
+            versions: Some(Vec::new()),
+            ..EgfxConfig::default()
+        };
+        assert_eq!(
+            GraphicsProcessor::new(&empty).err(),
+            Some(EgfxConfigError::Empty)
+        );
+        let repeated = EgfxConfig {
+            versions: Some(vec![
+                egfx::CAPVERSION_10,
+                egfx::CAPVERSION_8,
+                egfx::CAPVERSION_10,
+            ]),
+            ..EgfxConfig::default()
+        };
+        assert_eq!(
+            GraphicsProcessor::new(&repeated).err(),
+            Some(EgfxConfigError::Duplicate(egfx::CAPVERSION_10))
+        );
+    }
+
+    /// Each flag goes only where 2.2.3 defines it for that version: SMALL_CACHE is absent from
+    /// 10.1 (reserved bytes) and 10.3 (whose selection implies the small cache, 3.3.1.4), and
+    /// THINCLIENT exists only on 8 and 8.1, so a thin client asks for the small cache above them.
+    #[test]
+    fn the_cache_mode_sets_each_flag_only_where_its_version_defines_it() {
+        let avc_off = egfx::CAPS_FLAG_AVC_DISABLED;
+        let small = egfx::CAPS_FLAG_SMALL_CACHE;
+        let thin = egfx::CAPS_FLAG_THINCLIENT;
+        for (cache, v8, above) in [
+            (EgfxCacheMode::Small, small, small),
+            (EgfxCacheMode::ThinClient, thin, small),
+        ] {
+            let config = EgfxConfig {
+                cache,
+                ..EgfxConfig::default()
+            };
+            assert_eq!(
+                flags_of(&started(&config)),
+                vec![
+                    (egfx::CAPVERSION_8, Some(v8)),
+                    (egfx::CAPVERSION_8_1, Some(v8)),
+                    (egfx::CAPVERSION_10, Some(avc_off | above)),
+                    (egfx::CAPVERSION_101, None),
+                    (egfx::CAPVERSION_102, Some(avc_off | above)),
+                    (egfx::CAPVERSION_103, Some(avc_off)),
+                    (egfx::CAPVERSION_104, Some(avc_off | above)),
+                ],
+                "{cache:?}"
+            );
+        }
+    }
+
+    /// The configured ladder is what a 3.3.5.19 reset and a reopened channel advertise too.
+    #[test]
+    fn a_reset_and_a_reopened_channel_advertise_the_configured_ladder() {
+        let config = EgfxConfig {
+            versions: Some(vec![egfx::CAPVERSION_104]),
+            cache: EgfxCacheMode::Small,
+        };
+        let mut p = GraphicsProcessor::new(&config).unwrap();
+        let opening = p.start(0);
+        assert_eq!(
+            opening,
+            vec![Out::Send(egfx::encode_caps_advertise(&[
+                egfx::CapSet::Flags {
+                    version: egfx::CAPVERSION_104,
+                    flags: egfx::CAPS_FLAG_AVC_DISABLED | egfx::CAPS_FLAG_SMALL_CACHE,
+                }
+            ]))]
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_CAPS_CONFIRM,
+            &caps_confirm_body(egfx::CAPVERSION_104),
+        );
+        let outputs = feed(
+            &mut p,
+            egfx::CMDID_CACHE_TO_SURFACE,
+            &cache_to_surface_body(9, 1),
+        );
+        assert_eq!(
+            outputs, opening,
+            "the reset re-advertises the configured ladder"
+        );
+
+        p.close();
+        assert_eq!(p.start(0), opening, "a reopened channel advertises it");
+    }
+
+    /// 3.3.1.4: the bitmap cache is 16 MB when the confirmed capset is 10.3, or when it carries
+    /// THINCLIENT or SMALL_CACHE; 100 MB otherwise.
+    #[test]
+    fn the_cache_budget_follows_the_confirmed_capset() {
+        // 2048x2049 RGBA is 8 KiB past 16 MiB.
+        let over_16_mib = |version: u32, flags: u32| {
+            let mut p = GraphicsProcessor::default();
+            let confirm = [
+                version.to_le_bytes(),
+                4u32.to_le_bytes(),
+                flags.to_le_bytes(),
+            ]
+            .concat();
+            feed(&mut p, egfx::CMDID_CAPS_CONFIRM, &confirm);
+            create_surface(&mut p, 1, 2048, 2049);
+            let mut body = Vec::new();
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&0u64.to_le_bytes());
+            body.extend_from_slice(&5u16.to_le_bytes());
+            for v in [0u16, 0, 2048, 2049] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            let message = egfx::wrap_uncompressed(&header(egfx::CMDID_SURFACE_TO_CACHE, &body));
+            p.process(&message).is_ok()
+        };
+        assert!(over_16_mib(egfx::CAPVERSION_104, 0), "100 MB at 10.4");
+        assert!(over_16_mib(egfx::CAPVERSION_8, 0), "100 MB at 8");
+        assert!(
+            !over_16_mib(egfx::CAPVERSION_103, 0),
+            "16 MB at 10.3, flags or not"
+        );
+        assert!(
+            !over_16_mib(egfx::CAPVERSION_104, egfx::CAPS_FLAG_SMALL_CACHE),
+            "16 MB with SMALL_CACHE"
+        );
+        assert!(
+            !over_16_mib(egfx::CAPVERSION_8, egfx::CAPS_FLAG_THINCLIENT),
+            "16 MB with THINCLIENT"
         );
     }
 

@@ -204,10 +204,17 @@ impl core::fmt::Debug for Drdynvc {
 
 impl Default for Drdynvc {
     fn default() -> Self {
+        Self::new(GraphicsProcessor::default())
+    }
+}
+
+impl Drdynvc {
+    /// The manager with Display Control and `graphics` registered.
+    pub(crate) fn new(graphics: GraphicsProcessor) -> Self {
         Self {
             processors: vec![
                 Box::new(DisplayControlProcessor::default()),
-                Box::new(GraphicsProcessor::default()),
+                Box::new(graphics),
             ],
             open: Vec::new(),
             svc_buffer: Vec::new(),

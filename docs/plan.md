@@ -1961,7 +1961,7 @@ Here are the NOT/THINLY covered specifications to add:
 
 - [ ] **O — Surface Commands frame acknowledgment + flow control.** FrameAcknowledge capset (0x1e) → client sends frame-ack PDU after each surface frame; server throttles output. *spec-only; ironrdp session has no frame-ack emit loop.* Prevents buffer bloat on slow clients / high-latency links.
 
-- [ ] **O — GFX thin-client mode (small cache + streaming).** EGFX capset includes cache-size negotiation; low-memory clients can request server-side cache (e.g., 32 MB vs 256 MB). *spec-only; ironrdp-egfx owns graphics pipeline but no cache-size config.* Embedded / thin-client scenarios (Raspberry Pi RDP).
+- [ ] **O — GFX thin-client mode (small cache + streaming).** *Cache half done in #273 (ADR-0015: `EgfxCacheMode::Small`/`ThinClient`, budget read off the confirm); streaming still open.* EGFX capset includes cache-size negotiation; low-memory clients can request server-side cache (e.g., 32 MB vs 256 MB). *spec-only; ironrdp-egfx owns graphics pipeline but no cache-size config.* Embedded / thin-client scenarios (Raspberry Pi RDP).
 
 - [ ] **O — Progressive frame-diff hint.** RemoteFX Progressive includes "first frame" optimization (full tile) vs "upgrade" (delta). Plan lists primitives only; full pipeline = tracking which tiles changed, signaling to server. *spec-only beyond primitives.* Bandwidth optimization for animation-heavy sessions.
 
