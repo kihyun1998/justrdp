@@ -111,7 +111,8 @@ acknowledge frames. It is server→client only, and it is reachable only if
 ## Code
 
 - `justrdp/src/egfx.rs` — `GraphicsProcessor`, `Surface`, `CachedBitmap` (`mapped`,
-  `dirty`, `frame_paint`), `MAX_SURFACE_DIM`, `MAX_TOTAL_SURFACE_BYTES`, `note_budget`
+  `dirty`, `frame_paint`), `MAX_SURFACE_DIM`, `MAX_TOTAL_SURFACE_BYTES`, `note_budget`,
+  `Failure`, `can_reset`, `reset_channel`, `caps_advertise`
 - `justrdp-pdu/src/egfx.rs` — `EgfxPdu`, `Rect16`, `Point16`, `decode_all`,
   `encode_caps_advertise`, `encode_frame_acknowledge`, `wrap_uncompressed`
 - `justrdp-codecs/src/zgfx.rs` — `Zgfx`, `ZgfxError`, `History`, `BitReader`,
@@ -220,9 +221,9 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   carried and which is now **false**: the ladder reached only `CAPVERSION_10`, so the spec's
   own channel-reset mechanism was unreachable from here. It reaches **10.4** as of #271, and
   3.3.5.19 makes the reset available from 10.3 upward — so the cheapest rung of that ladder
-  exists now, though nothing sends it yet — measured and parked by #272, see the next bullet.
+  exists now, and #272 sends it on a semantic miss — see the next bullet.
 
-- **The 3.3.5.19 reset works, and nothing sends it on purpose** (#272,
+- **The 3.3.5.19 reset is the rung for a semantic miss** (#272,
   [ADR-0014](../../adr/0014-dvc-processor-error-posture.md)'s 2026-09-17 amendment). All
   measured on 2026-09-17 on the WS2022 VM at confirmed **10.4**, with throwaway probes that
   were never committed. Neither reference client ever re-advertises (FreeRDP only in
@@ -252,16 +253,27 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
     **not** `close()`'s `*self = GraphicsProcessor::default()`, which also rebuilds zgfx, and it is
     **not** `ResetGraphics`, which frees nothing because that server's encoder keeps its reference
     frames. Three events with three different retention rules.
-  - **No processor error to recover from.** Two 120 s forced-damage sessions (Start menu, typed
-    search text, mouse sweeps over icons and taskbar), with every `handle` error logged and
-    skipped instead of propagated: **0** processor errors, **0** rung-1 warn-and-skip events,
-    **0** unknown commands. That is why the ladder is parked. What would un-park it is a capture
-    holding a processor error, and the probe that counted is the instrument for finding one.
+  - **No real server has produced an error to recover from.** Every `handle` error was logged
+    and skipped instead of propagated over four forced-damage sessions: two 120 s (Start menu,
+    typed search text, mouse sweeps) and two 170 s (File Explorer and Control Panel, window
+    drags, maximise and restore, scrolling, Alt+Tab, six Display Control resizes each,
+    `connectionType` LAN and MODEM, 11 269 and 10 360 frame updates). Result: **0** processor
+    errors, **0** rung-1 warn-and-skip events, **0** unknown commands, and no multipart zgfx
+    message (largest 34 263 bytes). The rung was built anyway, on the maintainer's call (see the
+    amendment), so what it recovers from in the field is still unobserved. The census probe
+    is the instrument for finding a first instance.
+  - **The built rung, live.** A throwaway probe appended a `CacheToSurface` for an unfilled
+    slot after decompression; injecting it on the wire would have written bytes the server never
+    compressed into the history. The production reset fired, the confirm ended the wait, and
+    the session survived 70 s with four more Start-menu cycles (576 frame updates) painting
+    clean. The framebuffer is left untouched by the reset, because the full repaint above
+    covers it.
   - **Not measured:** Progressive, RemoteFX and planar kept against fresh (not expected to matter;
     see the amendment); any server but this one; any version but 10.4; blob boundaries around the
     confirm (in the two short runs, which logged boundaries, the confirm arrived alone in a
-    20-byte message, so per-PDU switching is derived from `decode_all`'s shape, not observed); how long the black frame lasts between the zeroed
-    framebuffer and the repaint.
+    20-byte message, so per-PDU switching is derived from `decode_all`'s shape, not observed); how
+    long stale pixels stay before the repaint; a server that does *not* repaint everything
+    after the confirm.
 
 - **Both decoders are self-owned.** zgfx crossed in #189 and epic #158 (slices #167–#172)
   closed the Progressive half: the self-owned

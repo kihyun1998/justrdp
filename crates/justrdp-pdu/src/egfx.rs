@@ -545,10 +545,10 @@ impl CapSet {
 ///
 /// **[`CAPVERSION_106_ERR`] is deliberately absent.** It is what 2.2.3.9 printed before the
 /// 180912 errata and the published text no longer carries it, so it is *not specified in
-/// section 2.2.3* and 3.3.5.19's MUST reaches it. Recognising it as tolerance would buy
-/// nothing today — nothing reads the confirmed version — and would be wrong the moment
-/// something does, because storing it is this client claiming a 10.6 it cannot honour
-/// (1.5.1's scaled map-surface). The constant stays declared so the value has a name.
+/// section 2.2.3* and 3.3.5.19's MUST reaches it. Storing it would be this client claiming a
+/// 10.6 it cannot honour (1.5.1's scaled map-surface), and the confirmed version is read: it
+/// decides whether the graphics processor may take the 3.3.5.19 reset. The constant stays
+/// declared so the value has a name.
 pub fn is_specified_capversion(version: u32) -> bool {
     matches!(
         version,

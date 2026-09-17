@@ -2307,6 +2307,49 @@ mod tests {
         );
     }
 
+    /// The same failure once the server has confirmed 10.4 takes the 3.3.5.19 reset instead
+    /// (ADR-0014, 2026-09-17 amendment): the session survives and the client's next write on
+    /// the graphics channel is the Caps Advertise its opening sent.
+    #[test]
+    fn a_graphics_miss_at_10_4_resends_the_advertise_and_keeps_the_session() {
+        use crate::dvc::DvcProcessor;
+        let advertise = crate::egfx::GraphicsProcessor::default().start(8);
+        let [crate::dvc::ProcessorOutput::Send(advertise)] = advertise.as_slice() else {
+            panic!("start sends one advertise");
+        };
+        let confirm = [
+            justrdp_pdu::egfx::CAPVERSION_104.to_le_bytes(),
+            4u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        let writes = |sm: &mut SessionStateMachine, cmd_id, body: &[u8]| {
+            let mut writes = Vec::new();
+            for frame in server_egfx(8, cmd_id, body) {
+                for output in sm.process_bytes(&frame).expect("the session survives") {
+                    if let SessionOutput::WriteBytes(bytes) = output {
+                        writes.push(bytes);
+                    }
+                }
+            }
+            writes
+        };
+
+        let mut sm = with_open_dvc(8, justrdp_pdu::egfx::CHANNEL_NAME);
+        writes(&mut sm, justrdp_pdu::egfx::CMDID_CAPS_CONFIRM, &confirm);
+        let sent = writes(
+            &mut sm,
+            justrdp_pdu::egfx::CMDID_SOLID_FILL,
+            &solid_fill_surface_1(),
+        );
+        assert!(
+            sent.iter().any(|bytes| bytes
+                .windows(advertise.len())
+                .any(|w| w == advertise.as_slice())),
+            "the reset should resend the advertise, wrote {sent:02x?}"
+        );
+    }
+
     /// The same attribution for the other registered processor: a Display Control PDU whose
     /// header length does not cover the header.
     #[test]

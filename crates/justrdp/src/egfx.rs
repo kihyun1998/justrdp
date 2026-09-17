@@ -260,6 +260,30 @@ pub struct GraphicsProcessor {
     /// of 89 frames painted 4 096 000 bytes, exactly one 1280x800 desktop, so the ceiling sits
     /// ~64x above observed traffic while the unbounded case reached ~6.4 TiB in one PDU.
     frame_paint: usize,
+    /// A 3.3.5.19 reset was sent and its confirm has not arrived: every server PDU but a
+    /// confirm is ignored.
+    awaiting_confirm: bool,
+    /// This channel binding has spent its one reset.
+    reset_spent: bool,
+}
+
+/// Why handling one EGFX PDU failed.
+enum Failure {
+    /// A reference to state this client does not hold — a surface or cache slot — or an
+    /// uncompressed payload that does not decode. A 3.3.5.19 reset can recover it.
+    Miss(DecodeError),
+    /// Every other failure ends the session.
+    Fatal(DecodeError),
+}
+
+impl From<DecodeError> for Failure {
+    fn from(error: DecodeError) -> Self {
+        Failure::Fatal(error)
+    }
+}
+
+fn miss(field: &'static str, reason: &'static str) -> Failure {
+    Failure::Miss(invalid(field, reason))
 }
 
 impl Default for GraphicsProcessor {
@@ -277,6 +301,8 @@ impl Default for GraphicsProcessor {
             frames_decoded: 0,
             in_frame: false,
             frame_paint: 0,
+            awaiting_confirm: false,
+            reset_spent: false,
         }
     }
 }
@@ -405,7 +431,7 @@ impl GraphicsProcessor {
         &mut self,
         pdu: EgfxPdu<'_>,
         outputs: &mut Vec<ProcessorOutput>,
-    ) -> Result<(), DecodeError> {
+    ) -> Result<(), Failure> {
         match pdu {
             EgfxPdu::CapsConfirm { version, flags } => {
                 // 3.3.5.19: a capability set "not specified in section 2.2.3" MUST be
@@ -457,7 +483,8 @@ impl GraphicsProcessor {
                     return Err(invalid(
                         "RDPGFX_CREATE_SURFACE_PDU",
                         "surface dimensions out of bounds",
-                    ));
+                    )
+                    .into());
                 }
                 self.remove_surface(surface_id);
                 if self.total_surface_bytes() + Surface::bytes(width, height)
@@ -466,7 +493,8 @@ impl GraphicsProcessor {
                     return Err(invalid(
                         "RDPGFX_CREATE_SURFACE_PDU",
                         "total surface allocation exceeds the cap",
-                    ));
+                    )
+                    .into());
                 }
                 tracing::debug!(target: "rdp_egfx", surface_id, width, height, "CreateSurface");
                 self.surfaces.push(Surface {
@@ -582,11 +610,15 @@ impl GraphicsProcessor {
                     return Err(invalid(
                         "RDPGFX_WIRE_TO_SURFACE_PDU_1",
                         "destination rectangle is larger than any admissible surface",
-                    ));
+                    )
+                    .into());
                 }
-                if let Some(rgba) = self.decode_wts1(codec_id, dest_rect, data)? {
+                if let Some(rgba) = self
+                    .decode_wts1(codec_id, dest_rect, data)
+                    .map_err(Failure::Miss)?
+                {
                     let (w, h) = (dest_rect.width(), dest_rect.height());
-                    let surface = self.surface_mut(surface_id).ok_or(invalid(
+                    let surface = self.surface_mut(surface_id).ok_or(miss(
                         "RDPGFX_WIRE_TO_SURFACE_PDU_1",
                         "unknown destination surface",
                     ))?;
@@ -617,7 +649,7 @@ impl GraphicsProcessor {
                 // `&mut self` and would have borrowed the decoder with it. Reaching for the two
                 // fields directly keeps the borrows disjoint.
                 let Some(surface) = self.surfaces.iter_mut().find(|s| s.id == surface_id) else {
-                    return Err(invalid(
+                    return Err(miss(
                         "RDPGFX_WIRE_TO_SURFACE_PDU_2",
                         "unknown destination surface",
                     ));
@@ -721,10 +753,9 @@ impl GraphicsProcessor {
             } => {
                 let rgba = [color_bgrx[2], color_bgrx[1], color_bgrx[0], 255];
                 let budget = MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint);
-                let surface = self.surface_mut(surface_id).ok_or(invalid(
-                    "RDPGFX_SOLIDFILL_PDU",
-                    "unknown destination surface",
-                ))?;
+                let surface = self
+                    .surface_mut(surface_id)
+                    .ok_or(miss("RDPGFX_SOLIDFILL_PDU", "unknown destination surface"))?;
                 let declared = rects.len();
                 let mut painted = 0usize;
                 let mut done = 0usize;
@@ -748,7 +779,7 @@ impl GraphicsProcessor {
                     .surfaces
                     .iter()
                     .find(|s| s.id == src_surface_id)
-                    .ok_or(invalid(
+                    .ok_or(miss(
                         "RDPGFX_SURFACE_TO_SURFACE_PDU",
                         "unknown source surface",
                     ))?
@@ -759,7 +790,7 @@ impl GraphicsProcessor {
                         src_rect.height(),
                     );
                 let budget = MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint);
-                let dest = self.surface_mut(dest_surface_id).ok_or(invalid(
+                let dest = self.surface_mut(dest_surface_id).ok_or(miss(
                     "RDPGFX_SURFACE_TO_SURFACE_PDU",
                     "unknown destination surface",
                 ))?;
@@ -793,7 +824,7 @@ impl GraphicsProcessor {
                     .surfaces
                     .iter()
                     .find(|s| s.id == surface_id)
-                    .ok_or(invalid(
+                    .ok_or(miss(
                         "RDPGFX_SURFACE_TO_CACHE_PDU",
                         "unknown source surface",
                     ))?
@@ -810,7 +841,8 @@ impl GraphicsProcessor {
                     return Err(invalid(
                         "RDPGFX_SURFACE_TO_CACHE_PDU",
                         "bitmap cache exceeds the CAPVERSION_8 budget",
-                    ));
+                    )
+                    .into());
                 }
                 self.cache_bytes += rgba.len();
                 self.cache.insert(
@@ -831,7 +863,7 @@ impl GraphicsProcessor {
                 let entry = self
                     .cache
                     .get(&cache_slot)
-                    .ok_or(invalid("RDPGFX_CACHE_TO_SURFACE_PDU", "unknown cache slot"))?;
+                    .ok_or(miss("RDPGFX_CACHE_TO_SURFACE_PDU", "unknown cache slot"))?;
                 // Field-level borrows (`cache` immutably, `surfaces` mutably) are disjoint,
                 // so the cached pixels blit without a per-apply clone of the whole entry
                 // (#84) — the `surface_mut` helper would borrow all of `self` and force it.
@@ -839,7 +871,7 @@ impl GraphicsProcessor {
                     .surfaces
                     .iter_mut()
                     .find(|s| s.id == surface_id)
-                    .ok_or(invalid(
+                    .ok_or(miss(
                         "RDPGFX_CACHE_TO_SURFACE_PDU",
                         "unknown destination surface",
                     ))?;
@@ -887,9 +919,57 @@ impl GraphicsProcessor {
         }
         let mut outputs = Vec::new();
         for pdu in egfx::decode_all(blob)? {
-            self.handle(pdu, &mut outputs)?;
+            if self.awaiting_confirm {
+                if !matches!(pdu, EgfxPdu::CapsConfirm { .. }) {
+                    continue;
+                }
+                self.awaiting_confirm = false;
+            }
+            match self.handle(pdu, &mut outputs) {
+                Ok(()) => {}
+                Err(Failure::Fatal(error)) => return Err(error),
+                Err(Failure::Miss(error)) if !self.can_reset() => return Err(error),
+                Err(Failure::Miss(error)) => {
+                    tracing::warn!(
+                        target: "rdp_egfx",
+                        %error,
+                        version = self.confirmed_version,
+                        "EGFX channel reset (3.3.5.19)"
+                    );
+                    self.reset_channel();
+                    outputs.push(ProcessorOutput::Send(Self::caps_advertise()));
+                }
+            }
         }
         Ok(outputs)
+    }
+
+    /// 3.3.5.19 offers the reset once VERSION103 or later is confirmed; a channel binding
+    /// spends at most one.
+    fn can_reset(&self) -> bool {
+        !self.reset_spent
+            && matches!(
+                self.confirmed_version,
+                Some(
+                    egfx::CAPVERSION_103
+                        | egfx::CAPVERSION_104
+                        | egfx::CAPVERSION_105
+                        | egfx::CAPVERSION_106
+                        | egfx::CAPVERSION_107
+                )
+            )
+    }
+
+    /// Return the channel to its initial state, keeping the zgfx history, and wait for the
+    /// server's confirm.
+    fn reset_channel(&mut self) {
+        *self = GraphicsProcessor {
+            zgfx: core::mem::take(&mut self.zgfx),
+            zgfx_blob: core::mem::take(&mut self.zgfx_blob),
+            awaiting_confirm: true,
+            reset_spent: true,
+            ..GraphicsProcessor::default()
+        };
     }
 
     /// Blit the accumulated dirty regions of every output-mapped surface straight into
@@ -938,12 +1018,9 @@ impl GraphicsProcessor {
     }
 }
 
-impl DvcProcessor for GraphicsProcessor {
-    fn channel_name(&self) -> &'static str {
-        egfx::CHANNEL_NAME
-    }
-
-    fn start(&mut self, _channel_id: u32) -> Vec<ProcessorOutput> {
+impl GraphicsProcessor {
+    /// The client's Caps Advertise: what [`DvcProcessor::start`] sends and a reset resends.
+    fn caps_advertise() -> Vec<u8> {
         // **Oldest first, and stopping at 10.4.** The ladder is chosen by whether a version
         // lets this client decline an obligation it does not implement, not by how high the
         // number goes — `[MS-RDPEGFX]` 1.5.1 makes 10.5, 10.6 and 10.7-without-
@@ -985,7 +1062,17 @@ impl DvcProcessor for GraphicsProcessor {
             flags(egfx::CAPVERSION_104, avc_off),
         ];
         tracing::debug!(target: "rdp_egfx_caps", count = capsets.len(), "EGFX caps advertised");
-        vec![ProcessorOutput::Send(egfx::encode_caps_advertise(&capsets))]
+        egfx::encode_caps_advertise(&capsets)
+    }
+}
+
+impl DvcProcessor for GraphicsProcessor {
+    fn channel_name(&self) -> &'static str {
+        egfx::CHANNEL_NAME
+    }
+
+    fn start(&mut self, _channel_id: u32) -> Vec<ProcessorOutput> {
+        vec![ProcessorOutput::Send(Self::caps_advertise())]
     }
 
     fn process(&mut self, message: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError> {
@@ -1252,6 +1339,440 @@ mod tests {
         body.extend_from_slice(&0u32.to_le_bytes());
         assert!(feed(&mut p, egfx::CMDID_CAPS_CONFIRM, &body).is_empty());
         assert_eq!(p.confirmed_version, Some(egfx::CAPVERSION_8));
+    }
+
+    fn caps_confirm_body(version: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&version.to_le_bytes());
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body
+    }
+
+    fn cache_to_surface_body(slot: u16, surface: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&slot.to_le_bytes());
+        body.extend_from_slice(&surface.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0]);
+        body
+    }
+
+    fn create_surface_body(id: u16, w: u16, h: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_le_bytes());
+        body.extend_from_slice(&w.to_le_bytes());
+        body.extend_from_slice(&h.to_le_bytes());
+        body.push(egfx::PIXEL_FORMAT_XRGB_8888);
+        body
+    }
+
+    /// Several PDUs in one uncompressed message, as one `process` call.
+    fn feed_blob(
+        p: &mut GraphicsProcessor,
+        pdus: &[(u16, Vec<u8>)],
+    ) -> Result<Vec<Out>, DecodeError> {
+        let mut blob = Vec::new();
+        for (cmd_id, body) in pdus {
+            blob.extend_from_slice(&header(*cmd_id, body));
+        }
+        p.process(&egfx::wrap_uncompressed(&blob))
+    }
+
+    fn advertise() -> Out {
+        GraphicsProcessor::default().start(0).remove(0)
+    }
+
+    /// A processor whose server confirmed `version`, with surface 1 (8x8) created.
+    fn confirmed(version: u32) -> GraphicsProcessor {
+        let mut p = GraphicsProcessor::default();
+        feed(
+            &mut p,
+            egfx::CMDID_CAPS_CONFIRM,
+            &caps_confirm_body(version),
+        );
+        create_surface(&mut p, 1, 8, 8);
+        p
+    }
+
+    /// 3.3.5.19: from a confirmed 10.3 the client "can resend the RDPGFX_CAPS_ADVERTISE_PDU
+    /// message during the connection to reset the protocol". A semantic miss — here a
+    /// `CacheToSurface` naming a slot never filled — takes that rung instead of failing.
+    /// Outputs produced earlier in the same message (the frame acknowledgement) are kept and
+    /// precede the advertise, which is the one [`DvcProcessor::start`] sends.
+    #[test]
+    fn a_semantic_miss_at_10_4_resends_the_advertise_instead_of_failing() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        let outputs = feed_blob(
+            &mut p,
+            &[
+                (egfx::CMDID_START_FRAME, vec![0; 8]),
+                (egfx::CMDID_END_FRAME, vec![0; 4]),
+                (egfx::CMDID_CACHE_TO_SURFACE, cache_to_surface_body(9, 1)),
+            ],
+        )
+        .expect("a miss at 10.4 is recovered, not returned");
+        assert_eq!(
+            outputs,
+            vec![Out::Send(egfx::encode_frame_acknowledge(0, 1)), advertise()]
+        );
+        assert!(p.surfaces.is_empty(), "the channel state is reset");
+        assert_eq!(
+            p.confirmed_version, None,
+            "nothing is confirmed until the new confirm"
+        );
+    }
+
+    /// 3.3.5.19: the client "MUST ignore any messages sent by the server until
+    /// RDPGFX_CAPS_CONFIRM_PDU message is received" — per PDU, so a confirm sharing a message
+    /// with what follows it lets what follows through.
+    #[test]
+    fn until_the_confirm_every_server_pdu_is_ignored() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(
+            &mut p,
+            egfx::CMDID_CACHE_TO_SURFACE,
+            &cache_to_surface_body(9, 1),
+        );
+        let outputs = feed_blob(
+            &mut p,
+            &[
+                (egfx::CMDID_CREATE_SURFACE, create_surface_body(2, 8, 8)),
+                (egfx::CMDID_START_FRAME, vec![0; 8]),
+                (egfx::CMDID_END_FRAME, vec![0; 4]),
+                (
+                    egfx::CMDID_CAPS_CONFIRM,
+                    caps_confirm_body(egfx::CAPVERSION_104),
+                ),
+                (egfx::CMDID_CREATE_SURFACE, create_surface_body(3, 8, 8)),
+            ],
+        )
+        .unwrap();
+        assert!(
+            outputs.is_empty(),
+            "an ignored EndFrame is not acknowledged"
+        );
+        let ids: Vec<u16> = p.surfaces.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![3]);
+        assert_eq!(p.confirmed_version, Some(egfx::CAPVERSION_104));
+    }
+
+    /// A confirm naming a version outside 2.2.3 is ignored as a capability set but still ends
+    /// the wait: waiting for one this client would store would leave the channel ignoring the
+    /// server for the rest of the session.
+    #[test]
+    fn a_confirm_outside_2_2_3_still_ends_the_wait() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(
+            &mut p,
+            egfx::CMDID_CACHE_TO_SURFACE,
+            &cache_to_surface_body(9, 1),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_CAPS_CONFIRM,
+            &caps_confirm_body(0xDEAD_BEEF),
+        );
+        create_surface(&mut p, 4, 8, 8);
+        assert_eq!(p.surfaces.len(), 1);
+        assert_eq!(p.confirmed_version, None);
+    }
+
+    /// 3.3.5.19 offers the resend from VERSION103 upward only; below it, and with no confirm at
+    /// all, a miss still ends the session (ADR-0014 Decision 1).
+    #[test]
+    fn below_10_3_a_miss_still_fails() {
+        for version in [None, Some(egfx::CAPVERSION_8), Some(egfx::CAPVERSION_102)] {
+            let mut p = GraphicsProcessor::default();
+            if let Some(v) = version {
+                feed(&mut p, egfx::CMDID_CAPS_CONFIRM, &caps_confirm_body(v));
+            }
+            create_surface(&mut p, 1, 8, 8);
+            assert!(
+                feed_blob(
+                    &mut p,
+                    &[(egfx::CMDID_CACHE_TO_SURFACE, cache_to_surface_body(9, 1))]
+                )
+                .is_err(),
+                "confirmed {version:?} cannot reset"
+            );
+        }
+        for version in [
+            egfx::CAPVERSION_103,
+            egfx::CAPVERSION_104,
+            egfx::CAPVERSION_105,
+            egfx::CAPVERSION_106,
+            egfx::CAPVERSION_107,
+        ] {
+            let mut p = confirmed(version);
+            assert_eq!(
+                feed_blob(
+                    &mut p,
+                    &[(egfx::CMDID_CACHE_TO_SURFACE, cache_to_surface_body(9, 1))]
+                ),
+                Ok(vec![advertise()]),
+                "confirmed 0x{version:08X} can reset"
+            );
+        }
+    }
+
+    /// One reset per channel binding: a second miss after the new confirm fails, so a miss the
+    /// server reproduces after every reset cannot loop.
+    #[test]
+    fn a_second_miss_after_a_reset_fails() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(
+            &mut p,
+            egfx::CMDID_CACHE_TO_SURFACE,
+            &cache_to_surface_body(9, 1),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_CAPS_CONFIRM,
+            &caps_confirm_body(egfx::CAPVERSION_104),
+        );
+        create_surface(&mut p, 1, 8, 8);
+        assert!(
+            feed_blob(
+                &mut p,
+                &[(egfx::CMDID_CACHE_TO_SURFACE, cache_to_surface_body(9, 1))]
+            )
+            .is_err()
+        );
+        // A new binding starts with a fresh allowance.
+        p.close();
+        let mut p2 = p;
+        feed(
+            &mut p2,
+            egfx::CMDID_CAPS_CONFIRM,
+            &caps_confirm_body(egfx::CAPVERSION_104),
+        );
+        assert_eq!(
+            feed_blob(
+                &mut p2,
+                &[(egfx::CMDID_CACHE_TO_SURFACE, cache_to_surface_body(9, 1))]
+            ),
+            Ok(vec![advertise()])
+        );
+    }
+
+    /// Which failures take the reset rung (ADR-0014, 2026-09-17 amendment): references to state
+    /// this client does not hold, and an uncompressed payload that does not decode. Every other
+    /// failure still ends the session, at 10.4 as below it.
+    #[test]
+    fn only_semantic_misses_take_the_reset() {
+        let wts1 = |surface: u16, codec: u16, rect: (u16, u16, u16, u16), data: &[u8]| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&surface.to_le_bytes());
+            b.extend_from_slice(&codec.to_le_bytes());
+            b.push(egfx::PIXEL_FORMAT_XRGB_8888);
+            for v in [rect.0, rect.1, rect.2, rect.3] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            b.extend_from_slice(data);
+            b
+        };
+        let s2s = |src: u16, dst: u16| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&src.to_le_bytes());
+            b.extend_from_slice(&dst.to_le_bytes());
+            b.extend_from_slice(&[0, 0, 0, 0, 2, 0, 2, 0]);
+            b.extend_from_slice(&1u16.to_le_bytes());
+            b.extend_from_slice(&[0, 0, 0, 0]);
+            b
+        };
+        let s2c = |surface: u16| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&surface.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(&5u16.to_le_bytes());
+            b.extend_from_slice(&[0, 0, 0, 0, 2, 0, 2, 0]);
+            b
+        };
+        let mut wts2 = Vec::new();
+        wts2.extend_from_slice(&7u16.to_le_bytes());
+        wts2.extend_from_slice(&egfx::CODECID_CAPROGRESSIVE.to_le_bytes());
+        wts2.extend_from_slice(&1u32.to_le_bytes());
+        wts2.push(egfx::PIXEL_FORMAT_XRGB_8888);
+        wts2.extend_from_slice(&0u32.to_le_bytes());
+
+        let misses: [(&str, u16, Vec<u8>); 9] = [
+            (
+                "WTS1 unknown surface",
+                egfx::CMDID_WIRE_TO_SURFACE_1,
+                wts1(7, egfx::CODECID_UNCOMPRESSED, (0, 0, 1, 1), &[0; 4]),
+            ),
+            (
+                "WTS1 uncompressed too short",
+                egfx::CMDID_WIRE_TO_SURFACE_1,
+                wts1(1, egfx::CODECID_UNCOMPRESSED, (0, 0, 2, 2), &[0; 4]),
+            ),
+            ("WTS2 unknown surface", egfx::CMDID_WIRE_TO_SURFACE_2, wts2),
+            (
+                "SolidFill unknown surface",
+                egfx::CMDID_SOLID_FILL,
+                solid_fill_body(7, [0; 4], [0, 0, 1, 1]),
+            ),
+            (
+                "SurfaceToSurface unknown source",
+                egfx::CMDID_SURFACE_TO_SURFACE,
+                s2s(7, 1),
+            ),
+            (
+                "SurfaceToSurface unknown destination",
+                egfx::CMDID_SURFACE_TO_SURFACE,
+                s2s(1, 7),
+            ),
+            (
+                "SurfaceToCache unknown surface",
+                egfx::CMDID_SURFACE_TO_CACHE,
+                s2c(7),
+            ),
+            (
+                "CacheToSurface unknown slot",
+                egfx::CMDID_CACHE_TO_SURFACE,
+                cache_to_surface_body(9, 1),
+            ),
+            (
+                "CacheToSurface unknown surface",
+                egfx::CMDID_CACHE_TO_SURFACE,
+                cache_to_surface_body(5, 7),
+            ),
+        ];
+        for (name, cmd_id, body) in misses {
+            let mut p = confirmed(egfx::CAPVERSION_104);
+            feed(&mut p, egfx::CMDID_SURFACE_TO_CACHE, &s2c(1));
+            assert_eq!(
+                feed_blob(&mut p, &[(cmd_id, body)]),
+                Ok(vec![advertise()]),
+                "{name} should take the reset"
+            );
+        }
+
+        let mut reset_graphics = vec![0u8; 332];
+        reset_graphics[..4].copy_from_slice(&70_000u32.to_le_bytes());
+        reset_graphics[4..8].copy_from_slice(&600u32.to_le_bytes());
+        let fatals: [(&str, u16, Vec<u8>); 4] = [
+            (
+                "CreateSurface out of bounds",
+                egfx::CMDID_CREATE_SURFACE,
+                create_surface_body(2, 0, 8),
+            ),
+            (
+                "ResetGraphics wider than u16",
+                egfx::CMDID_RESET_GRAPHICS,
+                reset_graphics,
+            ),
+            (
+                "WTS1 rectangle no surface could hold",
+                egfx::CMDID_WIRE_TO_SURFACE_1,
+                wts1(1, egfx::CODECID_UNCOMPRESSED, (0, 0, 65535, 65535), &[]),
+            ),
+            ("framing", egfx::CMDID_START_FRAME, vec![0; 2]),
+        ];
+        for (name, cmd_id, body) in fatals {
+            let mut p = confirmed(egfx::CAPVERSION_104);
+            assert!(
+                feed_blob(&mut p, &[(cmd_id, body)]).is_err(),
+                "{name} should still fail"
+            );
+        }
+    }
+
+    /// The server keeps its zgfx history across the reset (measured, #272), so the client must
+    /// too: a message after the reset whose only token is a back-reference into bytes written
+    /// before it decodes to the confirm. With a fresh window it would decode to zeroes, which
+    /// fail as framing.
+    #[test]
+    fn the_zgfx_history_survives_a_reset() {
+        let mut p = GraphicsProcessor::default();
+        let confirm = header(
+            egfx::CMDID_CAPS_CONFIRM,
+            &caps_confirm_body(egfx::CAPVERSION_104),
+        );
+        let miss = header(egfx::CMDID_CACHE_TO_SURFACE, &cache_to_surface_body(9, 1));
+        assert_eq!((confirm.len(), miss.len()), (20, 18));
+        let mut first = confirm.clone();
+        first.extend_from_slice(&miss);
+        assert_eq!(
+            p.process(&egfx::wrap_uncompressed(&first)),
+            Ok(vec![advertise()])
+        );
+        // One match token: 10010 (7 value bits, base 32) 0000110 (distance 38), then the length
+        // 20 as 1110 (k = 3) 0100 (16 + 4) — 20 bits, 4 unused.
+        let second = [0xE0, 0x24, 0b1001_0000, 0b0110_1110, 0b0100_0000, 0x04];
+        assert_eq!(p.process(&second), Ok(vec![]));
+        assert_eq!(p.confirmed_version, Some(egfx::CAPVERSION_104));
+    }
+
+    /// The server resets its ClearCodec glyph and V-bar state across the reset (measured,
+    /// #272: kept caches painted wrong glyphs), so the client must too: a glyph hit after the
+    /// reset on an index stored before it misses and paints nothing.
+    #[test]
+    fn clearcodec_glyphs_do_not_survive_a_reset() {
+        let clear = |surface: u16, stream: &[u8]| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&surface.to_le_bytes());
+            b.extend_from_slice(&egfx::CODECID_CLEARCODEC.to_le_bytes());
+            b.push(egfx::PIXEL_FORMAT_XRGB_8888);
+            for v in [0u16, 0, 4, 4] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+            b.extend_from_slice(stream);
+            b
+        };
+        // Store glyph 7: a 4x4 white residual run. Then hit it.
+        let mut store = vec![0x01, 0, 7, 0];
+        store.extend_from_slice(&4u32.to_le_bytes());
+        store.extend_from_slice(&0u32.to_le_bytes());
+        store.extend_from_slice(&0u32.to_le_bytes());
+        store.extend_from_slice(&[0xFF, 0xFF, 0xFF, 16]);
+        let hit = [0x03, 1, 7, 0];
+        let white_at_origin = |p: &mut GraphicsProcessor| {
+            map_surface(p, 1, 0, 0);
+            let (fb, _) = flush(p);
+            region(
+                &fb,
+                &FrameUpdate {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            ) == [255, 255, 255, 255]
+        };
+
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &clear(1, &store));
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0; 4], [0, 0, 4, 4]),
+        );
+        feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &clear(1, &hit));
+        assert!(
+            white_at_origin(&mut p),
+            "the hit paints the stored glyph before a reset"
+        );
+
+        feed(
+            &mut p,
+            egfx::CMDID_CACHE_TO_SURFACE,
+            &cache_to_surface_body(9, 1),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_CAPS_CONFIRM,
+            &caps_confirm_body(egfx::CAPVERSION_104),
+        );
+        create_surface(&mut p, 1, 8, 8);
+        feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &clear(1, &hit));
+        assert!(
+            !white_at_origin(&mut p),
+            "the glyph did not survive the reset"
+        );
     }
 
     #[test]
@@ -2589,6 +3110,12 @@ mod tests {
                 .u32(4)
                 .u32(f)
                 .done(egfx::CMDID_CAPS_CONFIRM)),
+            // A version a semantic miss can reset from; an arbitrary `u32` is almost never one.
+            1 => any::<u32>().prop_map(|f| Body::default()
+                .u32(egfx::CAPVERSION_104)
+                .u32(4)
+                .u32(f)
+                .done(egfx::CMDID_CAPS_CONFIRM)),
             2 => (any::<u32>(), any::<u32>()).prop_map(|(w, h)| Body::default()
                 .u32(w)
                 .u32(h)
@@ -2916,6 +3443,29 @@ mod tests {
         let end = vec![Body::default().u32(7).done(egfx::CMDID_END_FRAME)];
         drive(&mut p2, &mut fb2, &[end]);
         assert_eq!(p2.frames_decoded, 1, "EndFrame arm reached");
+
+        // The 3.3.5.19 reset: a confirm at 10.4, then a paste from a slot never filled.
+        let mut p5 = GraphicsProcessor::default();
+        let mut fb5 = Framebuffer::new(1280, 800).expect("framebuffer");
+        let reset = vec![
+            Body::default()
+                .u32(egfx::CAPVERSION_104)
+                .u32(4)
+                .u32(0)
+                .done(egfx::CMDID_CAPS_CONFIRM),
+            Body::default()
+                .u16(3)
+                .u16(1)
+                .u16(1)
+                .u16(0)
+                .u16(0)
+                .done(egfx::CMDID_CACHE_TO_SURFACE),
+        ];
+        drive(&mut p5, &mut fb5, &[reset]);
+        assert!(
+            p5.awaiting_confirm && p5.reset_spent,
+            "the reset arm reached"
+        );
 
         // WireToSurface1 with a real codec id: the exact-match gate `codec_id()` is weighted for.
         let mut p3 = GraphicsProcessor::default();

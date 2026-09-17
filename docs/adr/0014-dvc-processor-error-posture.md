@@ -1,6 +1,6 @@
 # 0014 — A DVC processor error drops the connection, attributably; the recovery ladder is #272's
 
-- Status: Accepted (issue #270) — Decision 2 implemented by #285; Decision 3's ladder measured and parked by #272; see the Amendments below (2026-09-15, 2026-09-16, 2026-09-17)
+- Status: Accepted (issue #270) — Decision 2 implemented by #285; Decision 3's reset rung built by #272; see the Amendments below (2026-09-15, 2026-09-16, 2026-09-17)
 - Date: 2026-09-14
 - Kind: **judgement** — the maintainer chose between three shapes whose consequences were
   enumerated (below). A better derivation does not reopen it; the maintainer does.
@@ -195,74 +195,114 @@ no channel can be blamed for, `[MS-RDPEDYC]` 3.1.5.2.4's "MUST terminate" for th
 and unassigned `Cmd` values (narrowed by #287 to exclude Cmd 6/7), and the rung for a malformed
 Display Control PDU.
 
-## Amendment (2026-09-17, #272): the reset works, nothing has ever needed it, and the ladder waits for a capture that does
+## Amendment (2026-09-17, #272): the 3.3.5.19 reset is the rung for a semantic miss
 
-Decision 3 handed #272 the recovery ladder. #272 measured the reset before designing the ladder,
-and the measurement changed what there is to build. The numbers and how they were taken are in
-[EGFX graphics pipeline](../map/territory/egfx-graphics-pipeline.md) under *The 3.3.5.19 reset*;
-this amendment records what they decide.
+Decision 3 handed #272 the recovery ladder. #272 measured the reset before building it; the
+numbers and how they were taken are in
+[EGFX graphics pipeline](../map/territory/egfx-graphics-pipeline.md) under *The 3.3.5.19 reset*.
+This amendment records what was decided on them and what the implementation holds.
+
+**Decision 1 narrows.** A `DvcProcessor` error still drops the connection. What changes is that
+the graphics processor no longer *returns* an error for a semantic miss once the server has
+confirmed VERSION103 or later: it resets the channel and returns `Ok`.
 
 ### Judgements — the maintainer's, and only the maintainer reverses them
 
-1. **Measure before building, and build only on a real trigger.** Shown three directions —
-   measure then build, record and park, build now against synthetic errors — with their
-   consequences (an automatic ladder recovers from a case no capture contains, which `start()`'s
-   own rationale says this repo does not ship machinery for), the maintainer chose to measure
-   first and to build only if a real server produced a processor error. **It produced none**:
-   zero processor errors and zero rung-1 warn-and-skip events over two 120 s forced-damage
-   sessions that logged and skipped every error instead of propagating it, and no processor
-   error the probe had not induced in three shorter sessions (one WS2022 box, 10.4). So **the ladder is parked**
-   and Decision 1 stands unchanged: every processor error still drops the connection. What
-   un-parks it is the first capture that holds a processor error.
-2. **When a ladder is built, only semantic misses attempt a reset.** Shown the class lines —
-   semantic only, every feasible class, or a host on/off switch over a core-chosen line — the
-   maintainer chose **semantic only**: an unknown surface id or cache slot and a codec decode
-   failure attempt a reset. **Framing errors keep dropping**, because a zgfx history
-   desynchronised by an earlier defect decodes to plausible bytes whose only visible symptom is
-   often an inconsistent `pduLength`, so resetting on one re-enters with a history that is
-   poisoned without being flagged. **Server-driven refusals keep dropping** (`MAX_SURFACE_DIM`,
-   the cache budget), because a reset makes the server resend the same shape: it recreated the
-   same 1280x800 surface every time. This answers [ADR-0009](0009-tolerant-negotiation-posture.md)'s
-   2026-09-16 amendment, which named its `MAX_SURFACE_DIM` row *"a candidate"* for a non-fatal
-   verdict: it is not one. What the maintainer was *not* shown, and this judgement does
-   not settle: which specific `DecodeError` sites fall on which side (`InvalidField` is shared
-   across both, so the split is made at the call site), and whether a host switch is added later
-   (#273's territory).
+1. **Build the reset, proven against injected errors, although no real server has produced
+   one.** The same day, in order. First the maintainer chose *measure, then build only on a real
+   trigger* over *record and park* and *build now*. The measurement found none: 0 processor
+   errors and 0 rung-1 warn-and-skip events over two 120 s Start-menu sessions. The ladder was
+   recorded as parked (#294). Asked whether a reproduction could be built instead, the
+   maintainer was shown the two kinds and what each proves. **Injected** errors prove the
+   mechanism but not that a server ever needs it; a **wider real workload** proves the need if
+   it finds one. A trigger found in real traffic is more likely a decoder bug than a transient,
+   and a reset does not fix a bug the server reproduces. The maintainer chose both: widen the
+   census, then build regardless, with the census result recorded. The widened census also found
+   none: 0 errors over two 170 s sessions (File Explorer and Control Panel, window drags,
+   maximise and restore, scrolling, Alt+Tab, six Display Control resizes each, `connectionType`
+   LAN and MODEM, 11 269 and 10 360 frame updates). **So this rung recovers from a failure no
+   capture here contains**, and it was built knowing that. That is the part of `start()`'s own
+   rationale ("does not ship machinery for a case no capture contains") this judgement
+   overrides, and for this rung only.
+2. **Only semantic misses take the reset.** Shown the class lines — semantic only, every feasible
+   class, or a host on/off switch over a core-chosen line — the maintainer chose **semantic
+   only**: an unknown surface id or cache slot, and a codec decode failure. **Framing errors keep
+   dropping**, because a zgfx history desynchronised by an earlier defect decodes to plausible
+   bytes whose only visible symptom is often an inconsistent `pduLength`, so resetting on one
+   re-enters with a history that is poisoned without being flagged. **Server-driven refusals keep
+   dropping** (`MAX_SURFACE_DIM`, the surface and cache budgets), because a reset makes the
+   server resend the same shape: it recreated the same 1280x800 surface every time. This answers
+   [ADR-0009](0009-tolerant-negotiation-posture.md)'s 2026-09-16 amendment, which named its
+   `MAX_SURFACE_DIM` row *"a candidate"* for a non-fatal verdict: it is not one.
 
 ### Derivations — they fall to a better derivation or a better measurement
-
-What a built ladder has to hold, established by the #272 probe and an adversarial read of this
-tree and both references:
 
 - **Recovery is decided inside `process` and returned as `Ok`.** An `Err` that the session
   survives is unsound, not just lossy: `process_bytes` breaks before consuming the failing frame
   and restores the inbox with that frame in it, so the next call decompresses the same EGFX
-  message again and advances the zgfx history twice. This also keeps the harness premise in
-  `lib.rs`'s `fuzzing` module and `fuzz/fuzz_targets/egfx_processor.rs` literally true.
+  message again and advances the zgfx history twice. So the `DvcProcessor` trait, the manager and
+  the session machine are unchanged, no new fallible call carries a channel name (#285's concern
+  stays inert), and the harness premise in `lib.rs`'s `fuzzing` module and
+  `fuzz/fuzz_targets/egfx_processor.rs` stays literally true.
+- **Which call sites are misses.** The judgement named classes; the sites are a derivation.
+  `Failure::Miss`: an unknown surface in `WireToSurface1`, `WireToSurface2`, `SolidFill`,
+  `SurfaceToSurface` (source or destination), `SurfaceToCache` and `CacheToSurface`; an unknown
+  cache slot; and an uncompressed `WireToSurface1` payload shorter than its rectangle or failing
+  conversion. The tile codecs already warn-and-skip (rung 1), so theirs never reaches here.
+  Everything else is `Failure::Fatal`.
 - **The zgfx history survives the reset, and ClearCodec's caches do not.** Measured both ways
   on the VM: the server keeps its compressor history (a fresh decompressor decoded 0 of 20
   post-reset messages identically, with no error), and it resets its ClearCodec glyph and V-bar
   state (kept caches painted silently wrong glyphs; fresh caches painted clean). Each is a
-  silent failure when wrong, so `close()`'s `*self = GraphicsProcessor::default()` is the wrong
-  model for a reset: it rebuilds zgfx.
+  silent failure when wrong, which is why the reset is not `close()`'s
+  `*self = GraphicsProcessor::default()`: that rebuilds zgfx.
 - **A zgfx failure is not resettable.** A poisoned history can be rebuilt only by a server that
   restarts its compressor, and this one does not.
-- **Ignored messages are still decompressed.** "MUST ignore until the confirm" is per PDU after
-  decompression; about one frame (72 PDUs in two messages) arrived in flight and its unacked
-  `EndFrame` was tolerated, as 3.2.5.18's *"assume that the client has disregarded all the
-  messages"* predicts.
-- **The ignore window ends on any confirm.** Today a confirm naming a version outside 2.2.3 is
-  ignored; if the window waited for an accepted one, such a confirm would leave graphics dead
-  with the session healthy, which is rung 3's cost without its signal.
-- **An attempt bound survives the state reset**, or a bound of "once" is re-armed by the reset
-  it bounds.
+- **Ignored messages are still decompressed, and the window is per PDU.** About one frame (72
+  PDUs in two messages) arrived in flight and its unacknowledged `EndFrame` was tolerated, as
+  3.2.5.18's *"assume that the client has disregarded all the messages"* predicts. Outputs the
+  failing message produced *before* the miss are kept and precede the advertise.
+- **The window ends on any confirm.** A confirm naming a version outside 2.2.3 is still ignored as
+  a capability set; if the window waited for an accepted one, such a confirm would leave graphics
+  dead with the session healthy, which is rung 3's cost without its signal.
+- **One reset per channel binding**, held in state the reset itself does not clear. A miss the
+  server reproduces after the reset therefore drops the connection instead of looping. A new
+  binding (a server Create after Close) starts with a fresh allowance. The *number* is the
+  cheapest bound that terminates, not a measured one: nothing here has ever needed a second.
+- **The framebuffer is left alone.** After the confirm the server recreated its surface and
+  repainted the whole desktop every time, so neither a clear nor a host event is needed to
+  avoid stale pixels on this server. The reset is visible as an `rdp_egfx` warn, per ADR-0009
+  §3(b).
+
+### Proof
+
+Unit tests drive `GraphicsProcessor::process`, and one test drives `SessionStateMachine::process_bytes`
+round-trips on the wire format. Each was seen to fail under its own mutation, and only its target
+test failed:
+- a zgfx rebuilt by the reset;
+- ClearCodec kept;
+- VERSION102 admitted;
+- the bound not held;
+- no ignore window;
+- a window that ends only on a specified version;
+- a fatal site classified as a miss and the reverse;
+- earlier outputs dropped;
+- the reset disabled or the advertise not sent (the session-level test).
+
+On the real VM a throwaway probe appended a `CacheToSurface` for an unfilled slot *after*
+decompression. The probe is not in the tree. Injecting on the wire would have written bytes the
+server never compressed into the history. The production path took the reset, the confirm
+arrived, and the session survived the 70 s window with four further Start-menu cycles (576 frame
+updates) painting clean.
 
 ### What this amendment did not cover
 
-The rung for the other channel-originated failure (#286's `SessionError::Framebuffer`, refused
-outside `process`) and the not-covered lists of the amendments above are untouched. Progressive,
-RemoteFX and planar state across a reset were not compared kept-against-fresh: Progressive is
-keyed by surface and the server recreated its surface, planar holds no cross-message state, and
-RemoteFX holds only its sticky video-mode refusal. So none is expected to matter, but none is
-measured. Every probe ran on one WS2022 box
-at confirmed 10.4.
+- The rung for #286's `SessionError::Framebuffer`, refused outside `process`, which therefore
+  still ends the session. The ordering hazard recorded on #272 stays unobservable.
+- The not-covered lists of the amendments above.
+- Progressive, RemoteFX and planar state compared kept against fresh across a reset. Progressive
+  is keyed by surface and the server recreated its surface, planar holds no cross-message state,
+  and RemoteFX holds only its sticky video-mode refusal. So none is expected to matter, but none
+  is measured.
+- Whether a host switch is added (#273's territory).
+- Any server but one WS2022 box, at any version but 10.4.

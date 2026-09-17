@@ -113,6 +113,8 @@ enum Cmd {
     CacheToSurface(u16, u16, u16, Vec<(u16, u16)>),
     EvictCacheEntry(u16),
     Raw(u16, Vec<u8>),
+    /// A confirm at VERSION104, from which a semantic miss takes the 3.3.5.19 reset.
+    ResettableConfirm(u32),
 }
 
 impl Cmd {
@@ -200,6 +202,11 @@ impl Cmd {
                 .u16(*slot)
                 .header(egfx::CMDID_EVICT_CACHE_ENTRY),
             Cmd::Raw(id, body) => Body::default().bytes(body).header(*id),
+            Cmd::ResettableConfirm(f) => Body::default()
+                .u32(egfx::CAPVERSION_104)
+                .u32(4)
+                .u32(*f)
+                .header(egfx::CMDID_CAPS_CONFIRM),
         }
     }
 }
