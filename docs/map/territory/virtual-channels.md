@@ -13,8 +13,9 @@ exactly one DVC consumer beyond graphics: Display Control.
 
 - [ADR-0014](../../adr/0014-dvc-processor-error-posture.md) — every error a `DvcProcessor`
   returns drops the connection, and the failure must name the channel; the recovery ladder
-  (reset, then what) belongs to #272, which measured the reset and parked the ladder until a
-  capture holds a processor error (2026-09-17 amendment). Before it, no ADR was about channels.
+  (reset, then what) belongs to #272, which made the graphics processor take the 3.3.5.19
+  reset for a semantic miss instead of returning an error (2026-09-17 amendment). Before it,
+  no ADR was about channels.
 
 Adjacent but not governing: `CONTEXT.md` defines **Virtual Channel** in the
 glossary, which is vocabulary rather than a decision.

@@ -478,8 +478,8 @@ advertise X, the server silently never offers Y. Capture every such coupling up 
   mid-session `CAPS_ADVERTISE` resend** with a second `CAPS_CONFIRM` and a full channel
   rebuild, then drops the connection when the client does not also perform 3.3.5.19's two
   MUSTs. (That resend was measured at confirmed **10.2**, outside the versions 3.3.5.19
-  grants. At 10.4, with both MUSTs held, the session survives 4/4; #272 measured it and parked
-  the recovery ladder, see `egfx-graphics-pipeline.md`.) Promoted to
+  grants. At 10.4, with both MUSTs held, the session survives 4/4; #272 built the reset as
+  the rung for a semantic miss, see `egfx-graphics-pipeline.md`.) Promoted to
   [what we advertise, we must implement](map/invariant/what-we-advertise-we-must-implement.md).
 - [ ] **O** — ClearCodec (EGFX lossless, mandatory *for EGFX* per spec): residual + vbar cache + subcodec (Raw/NSCodec/RLEX) + 4000-glyph cache. **Decode-complete in `graphics/clearcodec`** (BGRA, alpha=0xFF).
 - [ ] **O** — NSCodec (lossy subcodec): RLGR+AYCoCg, color-loss 0–7, chroma subsample. **ironrdp = PDU/caps only, no decoder.**
