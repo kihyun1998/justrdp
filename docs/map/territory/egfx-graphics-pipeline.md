@@ -23,8 +23,47 @@ acknowledge frames. It is server→client only, and it is reachable only if
 - [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md) — the 2026-09-16 amendment
   (#286) is where this territory's **deliberate divergences** finally have a home, and it
   carries the first row: `MAX_SURFACE_DIM`.
+- [ADR-0015](../../adr/0015-host-chosen-egfx-capabilities.md) — the host picks which honoured
+  versions and which cache are advertised (`EgfxConfig`); the core derives each version's flags
+  and refuses a version it cannot honour (#273).
 
 ## Design model
+
+- **The advertised ladder is the host's narrowing of what the core can honour** (#273).
+  `HONOURED_VERSIONS` is the ceiling and the default; `EgfxConfig::versions` picks from it and is
+  refused outside it. The host never sets a flag, because which flag a version may carry is a
+  per-version fact of 2.2.3: THINCLIENT exists only on 8/8.1, SMALL_CACHE is absent from 10.1
+  (reserved bytes) and 10.3 (small cache implied), and every 10.x needs AVC_DISABLED.
+  `EgfxCacheMode::ThinClient` therefore means THINCLIENT on 8/8.1 and SMALL_CACHE above them —
+  above 8.1 the 16 MB half of thin-client mode is the only half the wire can carry.
+- **The honoured set stops at 10.4 by scope, not by impossibility** (#271). `[MS-RDPEGFX]` 1.5.1
+  makes 10.5, 10.6 and 10.7-without-`SCALEDMAP_DISABLE` a MUST to process
+  `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU`, and this client does not. `ironrdp-egfx` advertises
+  10.5/10.6 and discharges the MUST without a resampler — it accepts the command, records the
+  origin and forwards the target size — and this server's scaled map is 1:1 anyway (measured:
+  `target` equals the surface's own 1280x800). Offered the full ladder, the WS2022 VM confirmed
+  10.6 and painted zero frames; offered the honoured set it confirms 10.4 and paints. 10.7 *can*
+  decline the obligation and is still left out: offered beside 10.4 the same server chose 10.4, so
+  nothing measured shows a benefit. The wire order is the one that measurement used and what both
+  reference clients send.
+- **The Caps Advertise goes out raw.** EGFX segmentation is asymmetric: only server→client traffic
+  rides `RDP_SEGMENTED_DATA`. A client→server PDU wrapped in a segment header gets the connection
+  reset — measured on the VM, the server reads `0xE0 0x04` as a garbage `cmdId` and ends the
+  session, while the raw PDU proceeds to Caps Confirm.
+- **The capsets live on the processor and outlive its resets.** `reset_channel` and `close` both
+  rebuild from `Default`, so each carries `capsets` across explicitly; forgetting one would make a
+  3.3.5.19 reset or a reopened channel silently advertise the default ladder.
+- **The bitmap-cache budget is read off the confirm, not off the request** (3.3.1.4): 16 MB at a
+  confirmed 10.3 or when the confirm carries THINCLIENT/SMALL_CACHE, 100 MB otherwise. Until #273
+  it was 100 MB always, which let a server that stops at 10.3 use six times its budget. FreeRDP
+  sizes its slots from its own setting instead (`rdpgfx_main.c`, `MaxCacheSlots`).
+- **Measured against the WS2022 VM (2026-09-17, #273 probe, 45 s each with mouse sweeps and three
+  Start-menu opens):** `EgfxConfig::versions` narrowed to 10.3 confirmed `0x000A0301` flags `0x20`;
+  10.4 with `Small` confirmed `0x000A0400` flags `0x22` (the server echoes `SMALL_CACHE`); 8 + 8.1
+  with `ThinClient` confirmed `0x00080105` flags `0x01`; the default confirmed 10.4 flags `0x20`.
+  Every run stayed up, painted (1571 / 1768 / 1678 / 162 frame updates — the thin-client run's
+  RemoteFX updates are fewer and larger), skipped no command, took no reset, and **none hit the
+  16 MB budget**. That bounds only this traffic: no run measured peak cache use.
 
 - **A surface is an addressable off-screen buffer with its own dirty list**, and it
   becomes visible only when `MapSurfaceToOutput` gives it an output-space origin.
@@ -112,7 +151,8 @@ acknowledge frames. It is server→client only, and it is reachable only if
 
 - `justrdp/src/egfx.rs` — `GraphicsProcessor`, `Surface`, `CachedBitmap` (`mapped`,
   `dirty`, `frame_paint`), `MAX_SURFACE_DIM`, `MAX_TOTAL_SURFACE_BYTES`, `note_budget`,
-  `Failure`, `can_reset`, `reset_channel`, `caps_advertise`
+  `Failure`, `can_reset`, `reset_channel`, `caps_advertise`, `cache_budget`, `EgfxConfig`,
+  `EgfxCacheMode`, `EgfxConfigError`, `HONOURED_VERSIONS`, `ladder`, `capset`
 - `justrdp-pdu/src/egfx.rs` — `EgfxPdu`, `Rect16`, `Point16`, `decode_all`,
   `encode_caps_advertise`, `encode_frame_acknowledge`, `wrap_uncompressed`
 - `justrdp-codecs/src/zgfx.rs` — `Zgfx`, `ZgfxError`, `History`, `BitReader`,
@@ -123,7 +163,7 @@ acknowledge frames. It is server→client only, and it is reachable only if
 - `justrdp-codecs/src/capture.rs` — `progressive_capture_dir`, `progressive_payload`
   (the real-server corpus harness; ungated since #172, when it was moved off the
   bootstrap wrapper's feature flag — a flag that no longer exists after #189)
-- Spec sections cited inline: `[MS-RDPEGFX]` 2.2.2.14, 3.3.8.2
+- Spec sections cited inline: `[MS-RDPEGFX]` 2.2.2.14, 2.2.3, 3.3.1.4, 3.3.5.18
 
 ## Reference behaviour
 
@@ -175,6 +215,13 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   commands and frame-ack are capability-gated.
 
 ## Known holes / open
+
+- **`EgfxCacheMode::Small` cannot reach a server that stops at 10.1.** 2.2.3.4 carries no flags
+  and 3.3.1.4 does not name 10.1, so such a server confirms the 100 MB cache the host asked to
+  avoid. Leaving 10.1 out under `Small` is the alternative; FreeRDP keeps it. Not decided by
+  ADR-0015; #296.
+- **The cache slot count is not bounded.** 3.3.1.4 caps slots at 25 600 (100 MB) or 4 096 (16 MB);
+  only the byte budget is enforced, and the `HashMap` is keyed by the server's `u16` (#297).
 
 - **An inverted `destRect` is silently an empty one, and both references refuse it.**
   `Rect16::width()` is `right.saturating_sub(left)`, so `right < left` yields extent 0 and

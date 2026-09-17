@@ -27,6 +27,7 @@ pub use connect::{
 };
 pub use cursor::{CursorEvent, CursorImage};
 pub use disconnect::{DisconnectClass, DisconnectReason, ServerDisconnectCause};
+pub use egfx::{EgfxCacheMode, EgfxConfig, EgfxConfigError};
 pub use framebuffer::{FrameUpdate, Framebuffer};
 pub use input::Scancode;
 pub use justrdp_pdu::input::InputEvent;

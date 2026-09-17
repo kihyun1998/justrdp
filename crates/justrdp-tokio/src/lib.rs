@@ -2383,6 +2383,7 @@ mod tests {
                 .iter()
                 .find(|c| c.name == "drdynvc")
                 .map(|c| c.id),
+            egfx: Default::default(),
         }
     }
 
@@ -3299,6 +3300,7 @@ mod tests {
                 capabilities: Vec::new(),
                 server_input_flags: 0,
                 drdynvc_channel_id: None,
+                egfx: Default::default(),
             },
             Vec::new(),
         )
@@ -3394,6 +3396,7 @@ mod tests {
                 )],
                 server_input_flags: 0,
                 drdynvc_channel_id: None,
+                egfx: Default::default(),
             },
             Vec::new(),
         )
@@ -3460,6 +3463,7 @@ mod tests {
                 capabilities: Vec::new(),
                 server_input_flags: 0,
                 drdynvc_channel_id: None,
+                egfx: Default::default(),
             },
             Vec::new(),
         )

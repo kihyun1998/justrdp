@@ -89,6 +89,11 @@ pub const CAPVERSION_106_ERR: u32 = 0x000A_0601;
 /// selecting it — offered alongside 104 it chose 104.
 pub const CAPVERSION_107: u32 = 0x000A_0701;
 
+/// `RDPGFX_CAPS_FLAG_THINCLIENT` (8, 8.1 — 2.2.3.1, 2.2.3.2): a 16 MB bitmap cache, and RemoteFX
+/// in place of RemoteFX Progressive.
+pub const CAPS_FLAG_THINCLIENT: u32 = 0x0000_0001;
+/// `RDPGFX_CAPS_FLAG_SMALL_CACHE` (8, 8.1, 10, 10.2, 10.4–10.7): a 16 MB bitmap cache.
+pub const CAPS_FLAG_SMALL_CACHE: u32 = 0x0000_0002;
 /// `RDPGFX_CAPS_FLAG_AVC420_ENABLED` (8.1): the client can decode AVC420. justrdp does not
 /// set it.
 pub const CAPS_FLAG_AVC420_ENABLED: u32 = 0x0000_0010;
