@@ -62,7 +62,8 @@ pub const CAPVERSION_8_1: u32 = 0x0008_0105;
 pub const CAPVERSION_10: u32 = 0x000A_0002;
 /// `RDPGFX_CAPVERSION_101` (2.2.3.4). Its capsData is **sixteen `reserved` bytes that MUST
 /// be zero**, not a flags word — the one capset in 2.2.3 shaped differently, which is why
-/// [`CapSet`] is an enum rather than a `(version, flags)` pair.
+/// [`CapSet`] is an enum rather than a `(version, flags)` pair. **Declared, never advertised**:
+/// 1.7 has it imply AVC/H.264 in YUV444v2 mode, with no `AVC_DISABLED` to decline it.
 pub const CAPVERSION_101: u32 = 0x000A_0100;
 /// `RDPGFX_CAPVERSION_102` (2.2.3.5).
 pub const CAPVERSION_102: u32 = 0x000A_0200;
@@ -907,6 +908,24 @@ mod tests {
         assert_eq!(&ack[8..12], &QUEUE_DEPTH_UNAVAILABLE.to_le_bytes());
         assert_eq!(&ack[12..16], &7u32.to_le_bytes());
         assert_eq!(&ack[16..20], &42u32.to_le_bytes());
+    }
+
+    /// 2.2.3.4 gives VERSION_101 sixteen **reserved** bytes that MUST be zero, where every
+    /// other capset in 2.2.3 carries a four-byte flags word.
+    #[test]
+    fn the_101_capset_encodes_sixteen_zero_reserved_bytes() {
+        let adv = encode_caps_advertise(&[CapSet::Version101]);
+        assert_eq!(adv.len(), 8 + 2 + 8 + 0x10);
+        assert_eq!(&adv[10..14], &CAPVERSION_101.to_le_bytes());
+        assert_eq!(
+            &adv[14..18],
+            &0x10u32.to_le_bytes(),
+            "2.2.3.4 fixes this at 0x10"
+        );
+        assert!(
+            adv[18..].iter().all(|b| *b == 0),
+            "all sixteen reserved bytes MUST be zero"
+        );
     }
 
     #[test]

@@ -103,6 +103,10 @@ rather than by capability:
   host picks from `HONOURED_VERSIONS` and is **refused**, not silently trimmed, outside it; the
   per-version flags stay derived in the core. The same change found the rule's other direction —
   a confirmed 10.3 imposes a 16 MB cache (3.3.1.4) the budget had never read.
+- **#296** — the same ladder, missed by #271's own derivation. 10.1 carried no 1.5.1 obligation and
+  went in, but 1.7 has it imply AVC444v2, and its reserved bytes cannot carry `AVC_DISABLED`. The
+  obligation lived in the **overview**, not in the section listing obligations, and ordering hid it:
+  no server picks 10.1 while 10.2+ sit beside it. Now left out.
 
 ## Where it will recur
 
@@ -115,7 +119,9 @@ sends.** The test is one question, asked before the advertisement lands:
 Concretely:
 
 - Adding a capability set, a capability flag, or a version to any advertised list **names the
-  messages it gates**, in the same change, and either implements them or does not advertise it.
+  messages it gates** — searched across the whole specification, overview included, since #296's
+  obligation sat in 1.7 rather than beside the version's own definition — in the same change,
+  and either implements them or does not advertise it.
 - A branch that skips an unknown message **states whether the message was invited**. A skip on
   the receive path is tolerance; a skip on something we advertised for is a defect that
   produces no error.

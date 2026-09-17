@@ -7,12 +7,13 @@
 //! path is now self-owned — zgfx bulk decompression was the last delegation and it went in #189,
 //! so `ironrdp-graphics` is out of the runtime graph entirely (ADR-0003 phase 3, ADR-0011).
 //! The client speaks first: `start()` sends a Caps Advertise carrying the host's `EgfxConfig`
-//! (ADR-0015) — by default seven capsets, 8 through CAPVERSION_104. The ladder is chosen by which
-//! versions this client can *honour* rather than by how high the number goes — 10.5 and 10.6 make
-//! the scaled map-surface command a MUST, and offering them to a real WS2022 server got 10.6
-//! confirmed and **zero** frames painted with no error anywhere (#271). AVC (H.264) stays
-//! structurally excluded: every 10.x capset carries `CAPS_FLAG_AVC_DISABLED`, and no decoder exists
-//! for it yet. The derivation is in `caps_advertise()` and `capset()`.
+//! (ADR-0015) — by default six capsets, 8 through CAPVERSION_104 without 10.1. The ladder is chosen
+//! by which versions this client can *honour* rather than by how high the number goes — 10.5 and
+//! 10.6 make the scaled map-surface command a MUST, and offering them to a real WS2022 server got
+//! 10.6 confirmed and **zero** frames painted with no error anywhere (#271). AVC (H.264) stays
+//! structurally excluded: every advertised 10.x capset carries `CAPS_FLAG_AVC_DISABLED`, and 10.1,
+//! which implies AVC444v2 with no flag to decline it, is not advertised (#296). The derivation is
+//! in `caps_advertise()` and `capset()`.
 //!
 //! WireToSurface1 RemoteFX (`CODECID_CAVIDEO`) decodes through the self-owned
 //! `justrdp-codecs::rfx` decoder (issue #58, ADR-0007) — it skipped the bootstrap phase
@@ -53,11 +54,10 @@ const SMALL_CACHE_BYTES: usize = 16 << 20;
 
 /// The capability versions this client can honour, oldest first: the default ladder, and the
 /// set [`EgfxConfig::versions`] is drawn from.
-const HONOURED_VERSIONS: [u32; 7] = [
+const HONOURED_VERSIONS: [u32; 6] = [
     egfx::CAPVERSION_8,
     egfx::CAPVERSION_8_1,
     egfx::CAPVERSION_10,
-    egfx::CAPVERSION_101,
     egfx::CAPVERSION_102,
     egfx::CAPVERSION_103,
     egfx::CAPVERSION_104,
@@ -67,7 +67,7 @@ const HONOURED_VERSIONS: [u32; 7] = [
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EgfxConfig {
     /// The capability versions to advertise, in any order, drawn from `CAPVERSION_8`, `_8_1`,
-    /// `_10`, `_101`, `_102`, `_103` and `_104`; `None` advertises all of them. They reach the
+    /// `_10`, `_102`, `_103` and `_104`; `None` advertises all of them. They reach the
     /// wire oldest first, each with the flags this client derives for it.
     pub versions: Option<Vec<u32>>,
     /// The bitmap cache to ask the server for.
@@ -144,9 +144,6 @@ fn ladder(versions: Option<&[u32]>, cache: EgfxCacheMode) -> Vec<egfx::CapSet> {
 /// One honoured version's capset: `AVC_DISABLED` on every 10.x, and the cache flag where 2.2.3
 /// defines one for that version.
 fn capset(version: u32, cache: EgfxCacheMode) -> egfx::CapSet {
-    if version == egfx::CAPVERSION_101 {
-        return egfx::CapSet::Version101;
-    }
     let early = matches!(version, egfx::CAPVERSION_8 | egfx::CAPVERSION_8_1);
     let avc = if early {
         0
@@ -1370,6 +1367,8 @@ mod tests {
     /// `SCALEDMAP_DISABLE` a MUST to process `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU`, and
     /// this client does not — measured: advertising them made a real server confirm 106,
     /// send that command, and paint **zero** frames while the session stayed healthy.
+    /// VERSION_101 is absent for the same reason: 1.7 has it imply AVC/H.264 in YUV444v2 mode,
+    /// and its reserved bytes leave no `AVC_DISABLED` to decline that with.
     #[test]
     fn the_advertised_ladder_reaches_104_and_stops_there() {
         let mut p = GraphicsProcessor::default();
@@ -1382,13 +1381,16 @@ mod tests {
             egfx::CAPVERSION_8,
             egfx::CAPVERSION_8_1,
             egfx::CAPVERSION_10,
-            egfx::CAPVERSION_101,
             egfx::CAPVERSION_102,
             egfx::CAPVERSION_103,
             egfx::CAPVERSION_104,
         ] {
             assert!(advertised(v), "0x{v:08X} should be advertised");
         }
+        assert!(
+            !advertised(egfx::CAPVERSION_101),
+            "0x000A0100 obliges AVC444v2 this client cannot decode"
+        );
         for v in [
             egfx::CAPVERSION_105,
             egfx::CAPVERSION_106,
@@ -1400,28 +1402,6 @@ mod tests {
                 "0x{v:08X} obliges a scaled map-surface this client cannot honour"
             );
         }
-    }
-
-    /// 2.2.3.4 gives VERSION_101 sixteen **reserved** bytes that MUST be zero, where every
-    /// other capset in 2.2.3 carries a four-byte flags word. An encoder that takes a flags
-    /// value and a length can emit a MUST violation; the wire is what pins it.
-    #[test]
-    fn the_101_capset_declares_sixteen_reserved_bytes_and_they_are_zero() {
-        let mut p = GraphicsProcessor::default();
-        let outputs = p.start(11);
-        let [Out::Send(message)] = outputs.as_slice() else {
-            panic!("expected one send, got {outputs:?}");
-        };
-        let at = message
-            .windows(4)
-            .position(|w| w == egfx::CAPVERSION_101.to_le_bytes())
-            .expect("VERSION_101 is advertised");
-        let caps_data_length = u32::from_le_bytes(message[at + 4..at + 8].try_into().unwrap());
-        assert_eq!(caps_data_length, 0x10, "2.2.3.4 fixes this at 0x10");
-        assert!(
-            message[at + 8..at + 8 + 0x10].iter().all(|b| *b == 0),
-            "all sixteen reserved bytes MUST be zero"
-        );
     }
 
     /// The capsets a Caps Advertise carries, as `(version, capsData)` in wire order.
@@ -1483,7 +1463,6 @@ mod tests {
                 (egfx::CAPVERSION_8, Some(0)),
                 (egfx::CAPVERSION_8_1, Some(0)),
                 (egfx::CAPVERSION_10, avc_off),
-                (egfx::CAPVERSION_101, None),
                 (egfx::CAPVERSION_102, avc_off),
                 (egfx::CAPVERSION_103, avc_off),
                 (egfx::CAPVERSION_104, avc_off),
@@ -1498,6 +1477,7 @@ mod tests {
             egfx::CAPVERSION_106,
             egfx::CAPVERSION_106_ERR,
             egfx::CAPVERSION_107,
+            egfx::CAPVERSION_101,
             0xDEAD_BEEF,
         ] {
             let config = EgfxConfig {
@@ -1538,7 +1518,7 @@ mod tests {
     }
 
     /// Each flag goes only where 2.2.3 defines it for that version: SMALL_CACHE is absent from
-    /// 10.1 (reserved bytes) and 10.3 (whose selection implies the small cache, 3.3.1.4), and
+    /// 10.3 (whose selection implies the small cache, 3.3.1.4), and
     /// THINCLIENT exists only on 8 and 8.1, so a thin client asks for the small cache above them.
     #[test]
     fn the_cache_mode_sets_each_flag_only_where_its_version_defines_it() {
@@ -1559,7 +1539,6 @@ mod tests {
                     (egfx::CAPVERSION_8, Some(v8)),
                     (egfx::CAPVERSION_8_1, Some(v8)),
                     (egfx::CAPVERSION_10, Some(avc_off | above)),
-                    (egfx::CAPVERSION_101, None),
                     (egfx::CAPVERSION_102, Some(avc_off | above)),
                     (egfx::CAPVERSION_103, Some(avc_off)),
                     (egfx::CAPVERSION_104, Some(avc_off | above)),
