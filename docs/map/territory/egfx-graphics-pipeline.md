@@ -220,9 +220,48 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   carried and which is now **false**: the ladder reached only `CAPVERSION_10`, so the spec's
   own channel-reset mechanism was unreachable from here. It reaches **10.4** as of #271, and
   3.3.5.19 makes the reset available from 10.3 upward — so the cheapest rung of that ladder
-  exists now, though nothing sends it yet (the reset itself is a sibling: neither reference
-  client implements it, and a probe showed this server honours a mid-session re-advertise and
-  then drops the connection when the client does not hold up 3.3.5.19's two MUSTs).
+  exists now, though nothing sends it yet — measured and parked by #272, see the next bullet.
+
+- **The 3.3.5.19 reset works, and nothing sends it on purpose** (#272,
+  [ADR-0014](../../adr/0014-dvc-processor-error-posture.md)'s 2026-09-17 amendment). All
+  measured on 2026-09-17 on the WS2022 VM at confirmed **10.4**, with throwaway probes that
+  were never committed. Neither reference client ever re-advertises (FreeRDP only in
+  `rdpgfx_on_open`, `ironrdp-egfx` only in `start`), so this server is the only evidence.
+  - **With both MUSTs held, the session survives: 4/4 sessions**, two short and two with two
+    resets each. The client sent the same advertise as `start()`, reset the processor state and
+    ignored every decoded PDU until the confirm. The server re-confirmed 10.4, then sent
+    `CreateSurface(0, 1280x800)`, `MapSurfaceToOutput`, a run of `DeleteEncodingContext` and a
+    full-desktop repaint (245–525 frame updates) onto a framebuffer the probe had zeroed.
+    #271's earlier 2/2 disconnects were measured at **10.2**, outside the range 3.3.5.19 grants,
+    with the advertise sent and nothing else done, so they are not evidence against the reset.
+  - **About one frame is in flight** between the advertise and the confirm: 72 PDUs in two
+    messages (a whole `StartFrame`…`EndFrame`), 7 PDUs in one, or none. Ignoring them, including their
+    `EndFrame` acknowledgement, cost nothing, as 3.2.5.18 says: the server *"MUST also reset the
+    protocol to the initial state and assume that the client has disregarded all the messages
+    sent by the server prior to RDPGFX_CAPS_CONFIRM_PDU"*.
+  - **The server keeps its zgfx history.** Every post-reset message, in flight and after the
+    confirm, was decompressed twice: 0 of 20 came out identical under a fresh `Zgfx`. Lengths
+    matched and no error was raised, so a client that resets the history paints **silent
+    garbage**. The mutation run (client resets zgfx) happened to trip `RDPGFX_HEADER.pduLength`
+    on the first in-flight message and lost the session. So "ignore" means decompress, then
+    discard, and a zgfx failure can never be recovered by a reset.
+  - **The server resets its ClearCodec state.** Kept against fresh `Clear` over the same payloads:
+    54 of 139 and 75 of 175 decodes differed with both sides `Ok`, on V-bar hits (`flags` 0x00),
+    glyph stores (0x01) and glyph hits (0x03). The kept caches painted glyph fragments and bars
+    across desktop labels, the taskbar and the clock; the fresh ones painted clean. So a reset is
+    **not** `close()`'s `*self = GraphicsProcessor::default()`, which also rebuilds zgfx, and it is
+    **not** `ResetGraphics`, which frees nothing because that server's encoder keeps its reference
+    frames. Three events with three different retention rules.
+  - **No processor error to recover from.** Two 120 s forced-damage sessions (Start menu, typed
+    search text, mouse sweeps over icons and taskbar), with every `handle` error logged and
+    skipped instead of propagated: **0** processor errors, **0** rung-1 warn-and-skip events,
+    **0** unknown commands. That is why the ladder is parked. What would un-park it is a capture
+    holding a processor error, and the probe that counted is the instrument for finding one.
+  - **Not measured:** Progressive, RemoteFX and planar kept against fresh (not expected to matter;
+    see the amendment); any server but this one; any version but 10.4; blob boundaries around the
+    confirm (in the two short runs, which logged boundaries, the confirm arrived alone in a
+    20-byte message, so per-PDU switching is derived from `decode_all`'s shape, not observed); how long the black frame lasts between the zeroed
+    framebuffer and the repaint.
 
 - **Both decoders are self-owned.** zgfx crossed in #189 and epic #158 (slices #167–#172)
   closed the Progressive half: the self-owned

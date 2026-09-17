@@ -1,6 +1,6 @@
 # 0014 — A DVC processor error drops the connection, attributably; the recovery ladder is #272's
 
-- Status: Accepted (issue #270) — Decision 2 implemented by #285; see the Amendments below (2026-09-15, 2026-09-16)
+- Status: Accepted (issue #270) — Decision 2 implemented by #285; Decision 3's ladder measured and parked by #272; see the Amendments below (2026-09-15, 2026-09-16, 2026-09-17)
 - Date: 2026-09-14
 - Kind: **judgement** — the maintainer chose between three shapes whose consequences were
   enumerated (below). A better derivation does not reopen it; the maintainer does.
@@ -194,3 +194,75 @@ The remaining entries of this record's own not-covered list are untouched: drdyn
 no channel can be blamed for, `[MS-RDPEDYC]` 3.1.5.2.4's "MUST terminate" for the skipped soft-sync
 and unassigned `Cmd` values (narrowed by #287 to exclude Cmd 6/7), and the rung for a malformed
 Display Control PDU.
+
+## Amendment (2026-09-17, #272): the reset works, nothing has ever needed it, and the ladder waits for a capture that does
+
+Decision 3 handed #272 the recovery ladder. #272 measured the reset before designing the ladder,
+and the measurement changed what there is to build. The numbers and how they were taken are in
+[EGFX graphics pipeline](../map/territory/egfx-graphics-pipeline.md) under *The 3.3.5.19 reset*;
+this amendment records what they decide.
+
+### Judgements — the maintainer's, and only the maintainer reverses them
+
+1. **Measure before building, and build only on a real trigger.** Shown three directions —
+   measure then build, record and park, build now against synthetic errors — with their
+   consequences (an automatic ladder recovers from a case no capture contains, which `start()`'s
+   own rationale says this repo does not ship machinery for), the maintainer chose to measure
+   first and to build only if a real server produced a processor error. **It produced none**:
+   zero processor errors and zero rung-1 warn-and-skip events over two 120 s forced-damage
+   sessions that logged and skipped every error instead of propagating it, and no processor
+   error the probe had not induced in three shorter sessions (one WS2022 box, 10.4). So **the ladder is parked**
+   and Decision 1 stands unchanged: every processor error still drops the connection. What
+   un-parks it is the first capture that holds a processor error.
+2. **When a ladder is built, only semantic misses attempt a reset.** Shown the class lines —
+   semantic only, every feasible class, or a host on/off switch over a core-chosen line — the
+   maintainer chose **semantic only**: an unknown surface id or cache slot and a codec decode
+   failure attempt a reset. **Framing errors keep dropping**, because a zgfx history
+   desynchronised by an earlier defect decodes to plausible bytes whose only visible symptom is
+   often an inconsistent `pduLength`, so resetting on one re-enters with a history that is
+   poisoned without being flagged. **Server-driven refusals keep dropping** (`MAX_SURFACE_DIM`,
+   the cache budget), because a reset makes the server resend the same shape: it recreated the
+   same 1280x800 surface every time. This answers [ADR-0009](0009-tolerant-negotiation-posture.md)'s
+   2026-09-16 amendment, which named its `MAX_SURFACE_DIM` row *"a candidate"* for a non-fatal
+   verdict: it is not one. What the maintainer was *not* shown, and this judgement does
+   not settle: which specific `DecodeError` sites fall on which side (`InvalidField` is shared
+   across both, so the split is made at the call site), and whether a host switch is added later
+   (#273's territory).
+
+### Derivations — they fall to a better derivation or a better measurement
+
+What a built ladder has to hold, established by the #272 probe and an adversarial read of this
+tree and both references:
+
+- **Recovery is decided inside `process` and returned as `Ok`.** An `Err` that the session
+  survives is unsound, not just lossy: `process_bytes` breaks before consuming the failing frame
+  and restores the inbox with that frame in it, so the next call decompresses the same EGFX
+  message again and advances the zgfx history twice. This also keeps the harness premise in
+  `lib.rs`'s `fuzzing` module and `fuzz/fuzz_targets/egfx_processor.rs` literally true.
+- **The zgfx history survives the reset, and ClearCodec's caches do not.** Measured both ways
+  on the VM: the server keeps its compressor history (a fresh decompressor decoded 0 of 20
+  post-reset messages identically, with no error), and it resets its ClearCodec glyph and V-bar
+  state (kept caches painted silently wrong glyphs; fresh caches painted clean). Each is a
+  silent failure when wrong, so `close()`'s `*self = GraphicsProcessor::default()` is the wrong
+  model for a reset: it rebuilds zgfx.
+- **A zgfx failure is not resettable.** A poisoned history can be rebuilt only by a server that
+  restarts its compressor, and this one does not.
+- **Ignored messages are still decompressed.** "MUST ignore until the confirm" is per PDU after
+  decompression; about one frame (72 PDUs in two messages) arrived in flight and its unacked
+  `EndFrame` was tolerated, as 3.2.5.18's *"assume that the client has disregarded all the
+  messages"* predicts.
+- **The ignore window ends on any confirm.** Today a confirm naming a version outside 2.2.3 is
+  ignored; if the window waited for an accepted one, such a confirm would leave graphics dead
+  with the session healthy, which is rung 3's cost without its signal.
+- **An attempt bound survives the state reset**, or a bound of "once" is re-armed by the reset
+  it bounds.
+
+### What this amendment did not cover
+
+The rung for the other channel-originated failure (#286's `SessionError::Framebuffer`, refused
+outside `process`) and the not-covered lists of the amendments above are untouched. Progressive,
+RemoteFX and planar state across a reset were not compared kept-against-fresh: Progressive is
+keyed by surface and the server recreated its surface, planar holds no cross-message state, and
+RemoteFX holds only its sticky video-mode refusal. So none is expected to matter, but none is
+measured. Every probe ran on one WS2022 box
+at confirmed 10.4.
