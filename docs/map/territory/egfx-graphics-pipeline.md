@@ -32,10 +32,20 @@ acknowledge frames. It is server→client only, and it is reachable only if
 - **The advertised ladder is the host's narrowing of what the core can honour** (#273).
   `HONOURED_VERSIONS` is the ceiling and the default; `EgfxConfig::versions` picks from it and is
   refused outside it. The host never sets a flag, because which flag a version may carry is a
-  per-version fact of 2.2.3: THINCLIENT exists only on 8/8.1, SMALL_CACHE is absent from 10.1
-  (reserved bytes) and 10.3 (small cache implied), and every 10.x needs AVC_DISABLED.
+  per-version fact of 2.2.3: THINCLIENT exists only on 8/8.1, SMALL_CACHE is absent from 10.3
+  (small cache implied), and every 10.x needs AVC_DISABLED.
   `EgfxCacheMode::ThinClient` therefore means THINCLIENT on 8/8.1 and SMALL_CACHE above them —
   above 8.1 the 16 MB half of thin-client mode is the only half the wire can carry.
+- **10.1 is not honoured** (#296). `[MS-RDPEGFX]` 1.7: *"Usage of the MPEG-4 AVC/H.264 Codec in
+  YUV444v2 mode is implied by the RDPGFX_CAPSET_VERSION101 structure"*, and 2.2.3.4 gives it
+  sixteen reserved bytes where every other 10.x has the flags word that carries `AVC_DISABLED`. So
+  advertising it promises an H.264 decoder this client does not have, with no way to decline.
+  #271 put it in the ladder because 1.5.1 names no obligation for it; the obligation is in 1.7.
+  Servers read it that way: FreeRDP's shadow server and GNOME Remote Desktop derive AVC444 from
+  `!(flags & AVC_DISABLED)`, which is true for 10.1's zero bytes, and `ironrdp-egfx` maps a
+  confirmed 10.1 to `avc444: true`. It was unreachable only by ordering — a server picks the highest
+  version offered, and 10.2–10.4 were offered beside it — so a server stopping at 10.1 would have
+  been the one to send H.264. Removing it also retired the question of `Small` at a confirmed 10.1.
 - **The honoured set stops at 10.4 by scope, not by impossibility** (#271). `[MS-RDPEGFX]` 1.5.1
   makes 10.5, 10.6 and 10.7-without-`SCALEDMAP_DISABLE` a MUST to process
   `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU`, and this client does not. `ironrdp-egfx` advertises
@@ -216,10 +226,6 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
 
 ## Known holes / open
 
-- **`EgfxCacheMode::Small` cannot reach a server that stops at 10.1.** 2.2.3.4 carries no flags
-  and 3.3.1.4 does not name 10.1, so such a server confirms the 100 MB cache the host asked to
-  avoid. Leaving 10.1 out under `Small` is the alternative; FreeRDP keeps it. Not decided by
-  ADR-0015; #296.
 - **The cache slot count is not bounded.** 3.3.1.4 caps slots at 25 600 (100 MB) or 4 096 (16 MB);
   only the byte budget is enforced, and the `HashMap` is keyed by the server's `u16` (#297).
 

@@ -1,6 +1,6 @@
 # 0015 — The host chooses which EGFX versions and cache are advertised; the core refuses what it cannot honour
 
-- Status: Accepted (issue #273)
+- Status: Accepted (issue #273) — amended 2026-09-17 (#296): 10.1 left the honoured set
 - Date: 2026-09-17
 - Kind: **judgement** — the maintainer chose between four shapes whose consequences were
   enumerated (below). A better derivation does not reopen it; the maintainer does.
@@ -64,8 +64,6 @@ Which versions *can* be honoured is known only to the core.
 
 ### What this decision did not cover
 
-- **10.1 with a small cache.** A server that stops at 10.1 has no way to learn the host asked for
-  16 MB; whether `Small` should leave 10.1 out is unsettled (FreeRDP keeps it) — #296.
 - **A confirm naming a version the host did not advertise** is still adhered to, as before.
 - **The cache slot count** (25 600 / 4 096, 3.3.1.4) is not enforced; the byte budget is — #297.
 - **AVC and 10.5+** stay out of the honoured set; this decision does not decide when they enter.
@@ -77,3 +75,19 @@ Which versions *can* be honoured is known only to the core.
   processor from `Default`.
 - A host that set nothing is unaffected; a host with an invalid config learns before the session
   starts, not from a black screen.
+
+## Amendment (2026-09-17, #296): 10.1 is not honoured
+
+This record's Context and Decision list 10.1 in the ladder, and its not-covered list asked whether
+`Small` should leave 10.1 out. Both premises were incomplete. `[MS-RDPEGFX]` 1.7 has
+`RDPGFX_CAPSET_VERSION101` **imply AVC/H.264 in YUV444v2 mode**, and its reserved bytes have no
+`AVC_DISABLED` to decline that — so advertising it breaks
+[what we advertise, we must implement](../map/invariant/what-we-advertise-we-must-implement.md)
+for as long as there is no H.264 decoder. Server implementations read it that way (FreeRDP shadow,
+GNOME Remote Desktop, and `ironrdp-egfx`'s own confirm mapping all treat it as AVC444-enabled).
+
+The removal is a **derivation** from that sentence, not a new judgement: Decision 2's rule
+already says the core offers only what it can honour. `HONOURED_VERSIONS` is now 8, 8.1, 10, 10.2,
+10.3 and 10.4; a host naming 10.1 gets `EgfxConfigError::NotAdvertisable`; the not-covered
+question about `Small` at a confirmed 10.1 no longer arises. A confirm naming 10.1 is still
+recognised (3.3.5.19), as 10.5+ are.
