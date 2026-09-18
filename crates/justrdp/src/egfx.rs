@@ -52,6 +52,12 @@ const MAX_CACHE_BYTES: usize = 100 << 20;
 /// The bitmap-cache budget under a confirmed 10.3, THINCLIENT or SMALL_CACHE (3.3.1.4).
 const SMALL_CACHE_BYTES: usize = 16 << 20;
 
+/// The highest one-based cache slot [`MAX_CACHE_BYTES`] pairs with (3.3.1.4).
+const MAX_CACHE_SLOTS: u16 = 25_600;
+
+/// The highest one-based cache slot [`SMALL_CACHE_BYTES`] pairs with (3.3.1.4).
+const SMALL_CACHE_SLOTS: u16 = 4_096;
+
 /// The capability versions this client can honour, oldest first: the default ladder, and the
 /// set [`EgfxConfig::versions`] is drawn from.
 const HONOURED_VERSIONS: [u32; 6] = [
@@ -942,6 +948,9 @@ impl GraphicsProcessor {
                 cache_slot,
                 src_rect,
             } => {
+                if self.cache_slot_out_of_range("RDPGFX_SURFACE_TO_CACHE_PDU", cache_slot) {
+                    return Ok(());
+                }
                 let (w, h, rgba) = self
                     .surfaces
                     .iter()
@@ -981,6 +990,9 @@ impl GraphicsProcessor {
                 surface_id,
                 dest_points,
             } => {
+                if self.cache_slot_out_of_range("RDPGFX_CACHE_TO_SURFACE_PDU", cache_slot) {
+                    return Ok(());
+                }
                 let budget = MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint);
                 let entry = self
                     .cache
@@ -1018,6 +1030,9 @@ impl GraphicsProcessor {
                 note_budget("RDPGFX_CACHE_TO_SURFACE_PDU", declared, done);
             }
             EgfxPdu::EvictCacheEntry { cache_slot } => {
+                if self.cache_slot_out_of_range("RDPGFX_EVICT_CACHE_ENTRY_PDU", cache_slot) {
+                    return Ok(());
+                }
                 if let Some(old) = self.cache.remove(&cache_slot) {
                     self.cache_bytes -= old.rgba.len();
                 }
@@ -1158,14 +1173,51 @@ impl GraphicsProcessor {
         })
     }
 
-    /// The bitmap-cache size the confirmed capset allows (3.3.1.4).
-    fn cache_budget(&self) -> usize {
+    /// Whether the confirmed capset selected the 16 MB cache (3.3.1.4). Both the byte budget
+    /// and the slot maximum read it, so the two cannot disagree about which cache was confirmed.
+    fn small_cache(&self) -> bool {
         let small = egfx::CAPS_FLAG_THINCLIENT | egfx::CAPS_FLAG_SMALL_CACHE;
         match self.confirmed_version {
-            Some(egfx::CAPVERSION_103) => SMALL_CACHE_BYTES,
-            Some(_) if self.confirmed_flags & small != 0 => SMALL_CACHE_BYTES,
-            _ => MAX_CACHE_BYTES,
+            Some(egfx::CAPVERSION_103) => true,
+            Some(_) => self.confirmed_flags & small != 0,
+            None => false,
         }
+    }
+
+    /// The bitmap-cache size the confirmed capset allows (3.3.1.4).
+    fn cache_budget(&self) -> usize {
+        if self.small_cache() {
+            SMALL_CACHE_BYTES
+        } else {
+            MAX_CACHE_BYTES
+        }
+    }
+
+    /// The highest cache slot the confirmed capset allows (3.3.1.4).
+    fn max_cache_slot(&self) -> u16 {
+        if self.small_cache() {
+            SMALL_CACHE_SLOTS
+        } else {
+            MAX_CACHE_SLOTS
+        }
+    }
+
+    /// Whether `cache_slot` falls outside 3.3.1.4's one-based range for the confirmed cache.
+    /// Out-of-range is warned and the PDU is skipped (ADR-0009 row 4); the check runs before
+    /// the cache lookup, so it never becomes the [`Failure::Miss`] an unfilled slot produces.
+    fn cache_slot_out_of_range(&self, pdu: &'static str, cache_slot: u16) -> bool {
+        let max = self.max_cache_slot();
+        let out = cache_slot == 0 || cache_slot > max;
+        if out {
+            tracing::warn!(
+                target: "rdp_egfx",
+                pdu,
+                cache_slot,
+                max,
+                "cache slot outside 3.3.1.4's one-based range; the PDU was skipped",
+            );
+        }
+        out
     }
 }
 
@@ -1626,6 +1678,194 @@ mod tests {
         );
     }
 
+    /// 3.3.1.4: a bitmap is stored in "a variable-length slot (identified by a one-based slot
+    /// index)", and "the maximum possible number of variable-length slots is 25,600 in the case
+    /// of a 100 MB cache and 4,096 in the case of a 16 MB cache". A slot outside that range is
+    /// skipped and the session continues (ADR-0009 row 4).
+    #[test]
+    fn a_cache_slot_outside_3_3_1_4s_range_is_skipped() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        for slot in [0u16, 25_601, u16::MAX] {
+            feed(
+                &mut p,
+                egfx::CMDID_SURFACE_TO_CACHE,
+                &surface_to_cache_body(1, slot, 8, 8),
+            );
+            assert!(p.cache.is_empty(), "slot {slot} must not be stored");
+            assert_eq!(p.cache_bytes, 0, "slot {slot} must not be charged");
+        }
+        for slot in [1u16, 25_600] {
+            feed(
+                &mut p,
+                egfx::CMDID_SURFACE_TO_CACHE,
+                &surface_to_cache_body(1, slot, 8, 8),
+            );
+            assert!(p.cache.contains_key(&slot), "slot {slot} is in range");
+        }
+    }
+
+    /// The slot maximum and the byte budget are the same derivation off the confirmed capset,
+    /// so the two cannot disagree about which cache size was confirmed.
+    #[test]
+    fn the_cache_slot_maximum_follows_the_confirmed_capset() {
+        let stored = |version: u32, flags: u32, slot: u16| {
+            let mut p = GraphicsProcessor::default();
+            let confirm = [
+                version.to_le_bytes(),
+                4u32.to_le_bytes(),
+                flags.to_le_bytes(),
+            ]
+            .concat();
+            feed(&mut p, egfx::CMDID_CAPS_CONFIRM, &confirm);
+            create_surface(&mut p, 1, 8, 8);
+            feed(
+                &mut p,
+                egfx::CMDID_SURFACE_TO_CACHE,
+                &surface_to_cache_body(1, slot, 8, 8),
+            );
+            p.cache.contains_key(&slot)
+        };
+        assert!(stored(egfx::CAPVERSION_103, 0, 4_096), "4096 fits 16 MB");
+        assert!(
+            !stored(egfx::CAPVERSION_103, 0, 4_097),
+            "4097 is past the 16 MB cache's slots"
+        );
+        assert!(
+            !stored(egfx::CAPVERSION_104, egfx::CAPS_FLAG_SMALL_CACHE, 4_097),
+            "SMALL_CACHE narrows the slots as it narrows the bytes"
+        );
+        assert!(
+            !stored(egfx::CAPVERSION_8, egfx::CAPS_FLAG_THINCLIENT, 4_097),
+            "THINCLIENT narrows the slots as it narrows the bytes"
+        );
+        assert!(
+            stored(egfx::CAPVERSION_104, 0, 4_097),
+            "the 100 MB cache reaches past 4096"
+        );
+        assert!(
+            !stored(egfx::CAPVERSION_104, 0, 25_601),
+            "25601 is past the 100 MB cache's slots"
+        );
+    }
+
+    /// The slot range must not skip what a real server sends. Measured against the WS2022 VM on
+    /// 2026-09-18, four runs and 9 965 observations: slots are a plain counter from **2**,
+    /// contiguous and strictly increasing, never reused and never evicted, and the highest seen
+    /// was **216** — in the run that confirmed 10.3, whose 4 096 is the tighter of the two
+    /// bounds. So the guard sits ~19x above the traffic it has to let through, and this pins
+    /// that: narrowing either constant under observed traffic reddens here rather than in the
+    /// field.
+    #[test]
+    fn the_slot_range_does_not_reach_the_slots_the_real_server_sends() {
+        let mut p = GraphicsProcessor::default();
+        let confirm = [
+            egfx::CAPVERSION_103.to_le_bytes(),
+            4u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        feed(&mut p, egfx::CMDID_CAPS_CONFIRM, &confirm);
+        create_surface(&mut p, 1, 8, 8);
+        for slot in 2u16..=216 {
+            feed(
+                &mut p,
+                egfx::CMDID_SURFACE_TO_CACHE,
+                &surface_to_cache_body(1, slot, 8, 8),
+            );
+        }
+        assert_eq!(
+            p.cache.len(),
+            215,
+            "every slot the real server was seen to use must be stored, none skipped"
+        );
+        assert!(
+            p.max_cache_slot() >= 216,
+            "the 16 MB cache's slot bound still clears observed traffic"
+        );
+    }
+
+    /// Before any Caps Confirm the 100 MB default applies to the slots as it does to the bytes.
+    #[test]
+    fn the_slot_maximum_defaults_to_the_100_mb_cache_before_any_confirm() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 8, 8);
+        feed(
+            &mut p,
+            egfx::CMDID_SURFACE_TO_CACHE,
+            &surface_to_cache_body(1, 25_600, 8, 8),
+        );
+        assert!(
+            p.cache.contains_key(&25_600),
+            "the pre-confirm default is 100 MB"
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_SURFACE_TO_CACHE,
+            &surface_to_cache_body(1, 25_601, 8, 8),
+        );
+        assert!(!p.cache.contains_key(&25_601), "and it still has a maximum");
+    }
+
+    /// The range check is **not** a semantic miss: it runs before the lookup, so an
+    /// out-of-range slot skips rather than taking 3.3.5.19's reset. The in-range unfilled slot
+    /// keeps taking the reset — that contrast is the whole point of the ordering.
+    #[test]
+    fn an_out_of_range_paste_skips_where_an_unfilled_one_resets() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        let outputs = feed(
+            &mut p,
+            egfx::CMDID_CACHE_TO_SURFACE,
+            &cache_to_surface_body(0, 1),
+        );
+        assert!(outputs.is_empty(), "an out-of-range paste sends nothing");
+        assert_eq!(
+            p.confirmed_version,
+            Some(egfx::CAPVERSION_104),
+            "and the channel is not reset"
+        );
+
+        let outputs = feed(
+            &mut p,
+            egfx::CMDID_CACHE_TO_SURFACE,
+            &cache_to_surface_body(9, 1),
+        );
+        assert_eq!(
+            outputs,
+            vec![advertise()],
+            "an unfilled in-range slot resets"
+        );
+    }
+
+    /// An evict naming a slot outside the range frees nothing — which was **already** true
+    /// before the range check, because the fill path is what keeps such a slot from ever being
+    /// occupied. So this asserts the in-range behaviour and the absence of collateral damage;
+    /// the guard's own effect on this PDU is the `rdp_egfx` warn, and this crate has no
+    /// tracing-assertion facility to reach it (neither does #268's row-3 warn).
+    #[test]
+    fn an_out_of_range_evict_frees_nothing_and_an_in_range_one_still_works() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(
+            &mut p,
+            egfx::CMDID_SURFACE_TO_CACHE,
+            &surface_to_cache_body(1, 1, 8, 8),
+        );
+        let charged = p.cache_bytes;
+        assert!(charged > 0, "the cache was filled");
+
+        for slot in [0u16, 25_601] {
+            feed(&mut p, egfx::CMDID_EVICT_CACHE_ENTRY, &evict_body(slot));
+        }
+        assert!(
+            p.cache.contains_key(&1),
+            "an out-of-range evict frees nothing"
+        );
+        assert_eq!(p.cache_bytes, charged, "and charges nothing back");
+
+        feed(&mut p, egfx::CMDID_EVICT_CACHE_ENTRY, &evict_body(1));
+        assert!(p.cache.is_empty(), "an in-range evict still works");
+        assert_eq!(p.cache_bytes, 0);
+    }
+
     /// 3.3.5.19: *"If the capability set received in capsSet field ... is not specified in
     /// section 2.2.3, the client MUST ignore the capability set."* Storing it would make a
     /// version we never advertised, and cannot honour, the one the rest of the channel
@@ -1667,6 +1907,21 @@ mod tests {
         body.extend_from_slice(&1u16.to_le_bytes());
         body.extend_from_slice(&[0, 0, 0, 0]);
         body
+    }
+
+    fn surface_to_cache_body(surface: u16, slot: u16, w: u16, h: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&surface.to_le_bytes());
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&slot.to_le_bytes());
+        for v in [0u16, 0, w, h] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    fn evict_body(slot: u16) -> Vec<u8> {
+        slot.to_le_bytes().to_vec()
     }
 
     fn create_surface_body(id: u16, w: u16, h: u16) -> Vec<u8> {
@@ -3346,8 +3601,10 @@ mod tests {
     }
 
     /// Cache slots from a tiny pool for the same reason as [`surface_id`]: a paste that names a
-    /// slot no `SURFACE_TO_CACHE` filled never reaches the blit loop. The unconstrained arm is
-    /// kept — the slot is an unchecked `HashMap` key today, where §3.3.1.4 gives 25 600 / 4 096.
+    /// slot no `SURFACE_TO_CACHE` filled never reaches the blit loop. The pool keeps **0**, and
+    /// the unconstrained arm is kept, because since #297 both are the skipped side of §3.3.1.4's
+    /// one-based range (25 600 / 4 096) rather than unchecked `HashMap` keys — so between them
+    /// the two arms drive the guard as well as the slots that clear it.
     fn cache_slot() -> impl Strategy<Value = u16> {
         prop_oneof![8 => 0u16..=3, 1 => any::<u16>()]
     }

@@ -65,7 +65,11 @@ Which versions *can* be honoured is known only to the core.
 ### What this decision did not cover
 
 - **A confirm naming a version the host did not advertise** is still adhered to, as before.
-- **The cache slot count** (25 600 / 4 096, 3.3.1.4) is not enforced; the byte budget is — #297.
+- **The cache slot count** (25 600 / 4 096, 3.3.1.4) was not enforced when this was written;
+  the byte budget was. #297 closed it on 2026-09-18 — the slot maximum now reads the **same**
+  `small_cache()` predicate as the budget, and an out-of-range slot is warned and skipped
+  ([ADR-0009](0009-tolerant-negotiation-posture.md) row 4). So this decision's derivation of the
+  cache size from the confirm is what the slot bound is built on.
 - **AVC and 10.5+** stay out of the honoured set; this decision does not decide when they enter.
 
 ## Consequences

@@ -67,6 +67,20 @@ acknowledge frames. It is server→client only, and it is reachable only if
   confirmed 10.3 or when the confirm carries THINCLIENT/SMALL_CACHE, 100 MB otherwise. Until #273
   it was 100 MB always, which let a server that stops at 10.3 use six times its budget. FreeRDP
   sizes its slots from its own setting instead (`rdpgfx_main.c`, `MaxCacheSlots`).
+- **The slot maximum and the byte budget are one derivation, not two** (#297). 3.3.1.4 pairs
+  25 600 slots with the 100 MB cache and 4 096 with the 16 MB one, so `small_cache()` is the single
+  predicate and `cache_budget()` / `max_cache_slot()` both read it — two independent readings of
+  the confirm could disagree about which cache was confirmed, and nothing would catch it. A slot
+  outside the one-based range is warned and skipped ([ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)
+  row 4); the check runs **before** the cache lookup, so it never becomes the `Failure::Miss` an
+  unfilled in-range slot produces. That ordering is what keeps the two rungs apart, and it is
+  pinned by mutation: deleting the `CACHE_TO_SURFACE` guard makes the out-of-range paste take the
+  3.3.5.19 reset, and the test reddens.
+  **The reset widens both**, and that is inherited rather than chosen: `reset_channel` rebuilds
+  from `Default`, so `confirmed_version` goes back to `None` and `small_cache()` is false again
+  — a server confirmed at 10.3 gets 100 MB and 25 600 slots for the length of the ignore window,
+  until its new confirm narrows them. The byte budget has behaved this way since #273; #297 only
+  gave it a second reader.
 - **Measured against the WS2022 VM (2026-09-17, #273 probe, 45 s each with mouse sweeps and three
   Start-menu opens):** `EgfxConfig::versions` narrowed to 10.3 confirmed `0x000A0301` flags `0x20`;
   10.4 with `Small` confirmed `0x000A0400` flags `0x22` (the server echoes `SMALL_CACHE`); 8 + 8.1
@@ -161,8 +175,9 @@ acknowledge frames. It is server→client only, and it is reachable only if
 
 - `justrdp/src/egfx.rs` — `GraphicsProcessor`, `Surface`, `CachedBitmap` (`mapped`,
   `dirty`, `frame_paint`), `MAX_SURFACE_DIM`, `MAX_TOTAL_SURFACE_BYTES`, `note_budget`,
-  `Failure`, `can_reset`, `reset_channel`, `caps_advertise`, `cache_budget`, `EgfxConfig`,
-  `EgfxCacheMode`, `EgfxConfigError`, `HONOURED_VERSIONS`, `ladder`, `capset`
+  `Failure`, `can_reset`, `reset_channel`, `caps_advertise`, `small_cache`, `cache_budget`,
+  `max_cache_slot`, `cache_slot_out_of_range`, `MAX_CACHE_SLOTS`, `SMALL_CACHE_SLOTS`,
+  `EgfxConfig`, `EgfxCacheMode`, `EgfxConfigError`, `HONOURED_VERSIONS`, `ladder`, `capset`
 - `justrdp-pdu/src/egfx.rs` — `EgfxPdu`, `Rect16`, `Point16`, `decode_all`,
   `encode_caps_advertise`, `encode_frame_acknowledge`, `wrap_uncompressed`
 - `justrdp-codecs/src/zgfx.rs` — `Zgfx`, `ZgfxError`, `History`, `BitReader`,
@@ -173,7 +188,7 @@ acknowledge frames. It is server→client only, and it is reachable only if
 - `justrdp-codecs/src/capture.rs` — `progressive_capture_dir`, `progressive_payload`
   (the real-server corpus harness; ungated since #172, when it was moved off the
   bootstrap wrapper's feature flag — a flag that no longer exists after #189)
-- Spec sections cited inline: `[MS-RDPEGFX]` 2.2.2.14, 2.2.3, 3.3.1.4, 3.3.5.18
+- Spec sections cited inline: `[MS-RDPEGFX]` 2.2.2.6, 2.2.2.7, 2.2.2.8, 2.2.2.14, 2.2.3, 3.3.1.4, 3.3.5.18
 
 ## Reference behaviour
 
@@ -226,8 +241,59 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
 
 ## Known holes / open
 
-- **The cache slot count is not bounded.** 3.3.1.4 caps slots at 25 600 (100 MB) or 4 096 (16 MB);
-  only the byte budget is enforced, and the `HashMap` is keyed by the server's `u16` (#297).
+- **The cache slot range is bounded as of #297, and this is the evidence the verdict does not
+  carry.** The verdict is [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s row 4
+  (2026-09-18): out of 3.3.1.4's one-based range is warned and skipped, not refused.
+  **Measured here on the WS2022 VM, 2026-09-18**, with throwaway `eprintln!` instrumentation in
+  the three cache arms that was never committed — two invocations, four runs, ~45 s of mouse
+  sweeps and Start-menu opens each, **9,965 slot observations**:
+
+  | | default | `versions: [CAPVERSION_103]` |
+  |---|---|---|
+  | confirmed | `0x000a0400` flags `0x20` → 100 MB / 25 600 | `0x000a0301` flags `0x20` → 16 MB / **4 096** |
+  | `SURFACE_TO_CACHE` | n=201, slots **2..202** | n=215, slots **2..216** |
+  | `CACHE_TO_SURFACE` | n=2 196, slots 2..170 | n=2 197, slots 2..186 |
+  | `EVICT_CACHE_ENTRY` | **n=0** | **n=0** |
+  | slot 0 / slots > 4 096 | 0 / 0 | 0 / 0 |
+
+  Three things only a measurement could say. **The server does not track the maximum**: slots are
+  a plain counter from 2, contiguous and strictly increasing, never reused and never evicted — and
+  the *16 MB* run used **more** slots than the 100 MB one, so the number follows session length,
+  not the budget. At this rate a confirmed-10.3 session crosses 4 096 in roughly fifteen minutes.
+  **`EVICT_CACHE_ENTRY` never arrived at all**, so one of the three guarded PDUs is unexercised by
+  this server. And **the bound sat ~19x below even the tighter limit**, which is why no
+  counterexample appeared and nothing reopened the triage decision — the rung was chosen on the
+  first two facts, not on a refusal this traffic could trigger.
+
+  **A fifth run settled the remaining question and corrected the row's first argument.** Entry
+  sizes at a confirmed 10.3, 43 entries: exactly two values, **16 384 bytes (64x64 RGBA) and
+  8 192 (64x32)** — independently the same shapes #268 measured one issue earlier. Break-even for
+  the slot bound to bind before the byte budget is `16 MB / 4 096 = 4 KiB`, and the **smallest**
+  entry this server produces is twice that. So **the byte budget always fires first at a confirmed
+  10.3** — by slot ~2 048 worst case, ~1 240 at the mean — and the slot bound is unreachable there.
+  The rung stands on the normative reading and on the server not tracking the maximum; what this
+  changes is that skip over refuse costs nothing measurable against this server.
+
+- **The bitmap cache only grows, and nothing here evicts it — so a long enough session ends on
+  the byte budget.** Falls out of #297's measurements rather than being looked for. `SurfaceToCache`
+  removes the entry at the slot it is about to fill, and `EvictCacheEntry` removes the slot it
+  names; the server allocates **contiguous, strictly increasing, never-reused** slots and sent
+  **zero** `EVICT_CACHE_ENTRY` in four runs, so neither path ever fires and `cache_bytes` is
+  monotonic. Past `cache_budget()` the `SURFACE_TO_CACHE` arm returns the **fatal** refusal
+  (#273) and the session ends.
+
+  **Extrapolated, not observed** — every run here is under 45 s and the territory note above
+  records that none hit the budget. At the measured mean entry of 13 526 bytes: the heavy run's
+  215 entries per 45 s is ~2.8 MiB per 45 s, which reaches **16 MiB in ~4 minutes** at a confirmed
+  10.3; the light mouse-only run's 43 entries per 40 s reaches it in **~19 minutes**. The 100 MB
+  cache is ~6x either figure. Two things would have to be true for this to be benign and neither
+  is established: that a real desktop session stops caching new regions once it has cached the
+  common ones, or that the server evicts under some condition no run here reached. **3.3.1.4's one
+  MUST is on the server** — *"the size of the bitmap data stored across all of the in-use
+  variable-length slots at any point in time MUST NOT exceed the total size of the cache"* — so if
+  the server really does run past it, ending the session is a defensible reading of ADR-0014
+  Decision 2; but nothing here has watched it happen, and a client that kills a healthy session
+  after four minutes would be the more likely explanation.
 
 - **An inverted `destRect` is silently an empty one, and both references refuse it.**
   `Rect16::width()` is `right.saturating_sub(left)`, so `right < left` yields extent 0 and
@@ -244,11 +310,11 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   row 2 — such notes are owned by the record that decides them, and ADR-0009 is the one for a
   receive-path tolerance. Both reference citations were re-opened at source when it was written.
 
-- **This territory's deliberate divergences have a home, and all three rows are in it.**
+- **This territory's deliberate divergences have a home, and all four rows are in it.**
   Two bullets here asked for one for months and neither could name a destination.
   [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s 2026-09-16 amendment (#286)
   is it: row 1 the per-axis dimension caps, row 2 the inverted `destRect` (#263), row 3 the
-  paint-budget skip (#268). **What the two bullets kept is their evidence**, which is the half
+  paint-budget skip (#268), and row 4 the cache-slot range skip (#297, 2026-09-18). **What the two bullets kept is their evidence**, which is the half
   a decision record does not carry — the numbers, the discovery history, and how each claim was
   once wrong. The *verdict* is the ADR's.
 
