@@ -265,11 +265,35 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   counterexample appeared and nothing reopened the triage decision — the rung was chosen on the
   first two facts, not on a refusal this traffic could trigger.
 
-  **Not measured, and it would settle the remaining question:** whether the 16 MB byte budget
-  fires before slot 4 096 at a confirmed 10.3. It turns on the average cached bitmap being above
-  or below `16 MB / 4 096 = 4 KiB`; 215 entries fitted under 16 MB, which bounds the average
-  without pinning it. If the bytes always go first, the slot bound is unreachable by construction
-  and the posture choice costs nothing either way.
+  **A fifth run settled the remaining question and corrected the row's first argument.** Entry
+  sizes at a confirmed 10.3, 43 entries: exactly two values, **16 384 bytes (64x64 RGBA) and
+  8 192 (64x32)** — independently the same shapes #268 measured one issue earlier. Break-even for
+  the slot bound to bind before the byte budget is `16 MB / 4 096 = 4 KiB`, and the **smallest**
+  entry this server produces is twice that. So **the byte budget always fires first at a confirmed
+  10.3** — by slot ~2 048 worst case, ~1 240 at the mean — and the slot bound is unreachable there.
+  The rung stands on the normative reading and on the server not tracking the maximum; what this
+  changes is that skip over refuse costs nothing measurable against this server.
+
+- **The bitmap cache only grows, and nothing here evicts it — so a long enough session ends on
+  the byte budget.** Falls out of #297's measurements rather than being looked for. `SurfaceToCache`
+  removes the entry at the slot it is about to fill, and `EvictCacheEntry` removes the slot it
+  names; the server allocates **contiguous, strictly increasing, never-reused** slots and sent
+  **zero** `EVICT_CACHE_ENTRY` in four runs, so neither path ever fires and `cache_bytes` is
+  monotonic. Past `cache_budget()` the `SURFACE_TO_CACHE` arm returns the **fatal** refusal
+  (#273) and the session ends.
+
+  **Extrapolated, not observed** — every run here is under 45 s and the territory note above
+  records that none hit the budget. At the measured mean entry of 13 526 bytes: the heavy run's
+  215 entries per 45 s is ~2.8 MiB per 45 s, which reaches **16 MiB in ~4 minutes** at a confirmed
+  10.3; the light mouse-only run's 43 entries per 40 s reaches it in **~19 minutes**. The 100 MB
+  cache is ~6x either figure. Two things would have to be true for this to be benign and neither
+  is established: that a real desktop session stops caching new regions once it has cached the
+  common ones, or that the server evicts under some condition no run here reached. **3.3.1.4's one
+  MUST is on the server** — *"the size of the bitmap data stored across all of the in-use
+  variable-length slots at any point in time MUST NOT exceed the total size of the cache"* — so if
+  the server really does run past it, ending the session is a defensible reading of ADR-0014
+  Decision 2; but nothing here has watched it happen, and a client that kills a healthy session
+  after four minutes would be the more likely explanation.
 
 - **An inverted `destRect` is silently an empty one, and both references refuse it.**
   `Rect16::width()` is `right.saturating_sub(left)`, so `right < left` yields extent 0 and

@@ -289,12 +289,25 @@ runs, **9,965 slot observations**, each run ~45 s of mouse sweeps and Start-menu
 server does not track the maximum**: slots are a plain counter from 2, contiguous and strictly
 increasing, with no reuse and no eviction — and the run that confirmed the *16 MB* cache used
 *more* slots (216) than the 100 MB run (202), so the number follows session length and not the
-budget. At ~215 slots per 45 s of this activity a confirmed-10.3 session crosses 4,096 in roughly
-fifteen minutes, which is a session, not a hypothetical. Second, **`EVICT_CACHE_ENTRY` was never
-sent**, so a refusal there would put a session-ending failure on a path nothing has observed.
-Both bound only this traffic: no run measured peak cache use, and whether the byte budget fires
-before slot 4,096 at a confirmed 10.3 is **not measured** — it turns on the average cached bitmap
-being above or below `16 MB / 4,096 = 4 KiB`.
+budget. Second, **`EVICT_CACHE_ENTRY` was never sent**, so a refusal there would put a
+session-ending failure on a path nothing has observed.
+
+**A fifth run settled what the first four left open, and it corrects an argument this row
+originally carried.** Entry sizes at a confirmed 10.3, 43 entries: exactly two values, **16 384
+bytes (64x64 RGBA) and 8 192 (64x32)** — independently the same shapes #268 measured. Break-even
+for the slot bound to bind first is `16 MB / 4 096 = 4 096` bytes, and the **smallest** entry this
+server produces is twice that, so the 16 MB budget is reached by slot ~2 048 in the worst observed
+case and ~1 240 at the mean. **The byte budget always fires first at a confirmed 10.3, and the
+slot bound is unreachable there.** This row first argued the opposite — that a 10.3 session
+crosses 4 096 in about fifteen minutes — which was an extrapolation from slot counts with no
+entry size behind it. The rung does not change: it rests on the normative reading and on the
+server not tracking the maximum, neither of which this touches. What changes is that **choosing
+skip over refuse costs nothing measurable against this server**, because the range this guard
+protects cannot be entered before a different guard ends the session.
+
+Still bounding only this traffic: **no run measured peak cache use**, and the cache-exhaustion
+consequence that falls out of these numbers is a separate finding, not this row's — see
+[the EGFX territory note](../map/territory/egfx-graphics-pipeline.md)'s Known holes.
 
 **Kept as a skip**, on the ground row 3 already names: the refusal would end a session over a
 ceiling that is ours in the only sense that counts here — the section's own MUST is the byte
