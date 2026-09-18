@@ -259,7 +259,9 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   Three things only a measurement could say. **The server does not track the maximum**: slots are
   a plain counter from 2, contiguous and strictly increasing, never reused and never evicted — and
   the *16 MB* run used **more** slots than the 100 MB one, so the number follows session length,
-  not the budget. At this rate a confirmed-10.3 session crosses 4 096 in roughly fifteen minutes.
+  not the budget. (This bullet first added that a 10.3 session would cross 4 096 in about fifteen
+  minutes; it cannot — the byte budget binds first, below, and a 25-minute session reached under
+  200 slots, in the bullet after this one.)
   **`EVICT_CACHE_ENTRY` never arrived at all**, so one of the three guarded PDUs is unexercised by
   this server. And **the bound sat ~19x below even the tighter limit**, which is why no
   counterexample appeared and nothing reopened the triage decision — the rung was chosen on the
@@ -274,26 +276,32 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   The rung stands on the normative reading and on the server not tracking the maximum; what this
   changes is that skip over refuse costs nothing measurable against this server.
 
-- **The bitmap cache only grows, and nothing here evicts it — so a long enough session ends on
-  the byte budget.** Falls out of #297's measurements rather than being looked for. `SurfaceToCache`
-  removes the entry at the slot it is about to fill, and `EvictCacheEntry` removes the slot it
-  names; the server allocates **contiguous, strictly increasing, never-reused** slots and sent
-  **zero** `EVICT_CACHE_ENTRY` in four runs, so neither path ever fires and `cache_bytes` is
-  monotonic. Past `cache_budget()` the `SURFACE_TO_CACHE` arm returns the **fatal** refusal
-  (#273) and the session ends.
+- **The bitmap cache only grows, and nothing here evicts it — but in 25 minutes it grew to less
+  than a fifth of the 16 MB budget.** Falls out of #297's measurements rather than being looked
+  for. `SurfaceToCache` removes the entry at the slot it is about to fill, and `EvictCacheEntry`
+  removes the slot it names; the server allocates **contiguous, strictly increasing, never-reused**
+  slots and has sent **zero** `EVICT_CACHE_ENTRY` in every run here, so neither path fires and
+  `cache_bytes` is monotonic. Past `cache_budget()` the `SURFACE_TO_CACHE` arm returns the
+  **fatal** refusal (#273), so reaching the budget ends the session.
 
-  **Extrapolated, not observed** — every run here is under 45 s and the territory note above
-  records that none hit the budget. At the measured mean entry of 13 526 bytes: the heavy run's
-  215 entries per 45 s is ~2.8 MiB per 45 s, which reaches **16 MiB in ~4 minutes** at a confirmed
-  10.3; the light mouse-only run's 43 entries per 40 s reaches it in **~19 minutes**. The 100 MB
-  cache is ~6x either figure. Two things would have to be true for this to be benign and neither
-  is established: that a real desktop session stops caching new regions once it has cached the
-  common ones, or that the server evicts under some condition no run here reached. **3.3.1.4's one
-  MUST is on the server** — *"the size of the bitmap data stored across all of the in-use
-  variable-length slots at any point in time MUST NOT exceed the total size of the cache"* — so if
-  the server really does run past it, ending the session is a defensible reading of ADR-0014
-  Decision 2; but nothing here has watched it happen, and a client that kills a healthy session
-  after four minutes would be the more likely explanation.
+  **Measured on 2026-09-18, one 25-minute session at a confirmed 10.3** (throwaway
+  instrumentation, never committed; mouse sweeps and a Start-menu open/close every ~4 s, 360
+  rounds, 63 779 frame updates): the session stayed up until the probe's own timeout, with **no
+  fatal and no evict**. The cache was at slot 150 / ~2.25 MiB by the 13-minute mark and ended
+  between slot 175 and 199 and **under 3 MiB** — the log kept every 25th slot and each MiB
+  crossing, without timestamps, so those are bounds, not a curve. **Growth is front-loaded:** the
+  server caches the regions it paints and then pastes them from the cache, so a repeated workload
+  plateaus.
+
+  **This corrects the extrapolation #297 first recorded here** — 16 MiB in ~4 minutes at 10.3 and
+  ~27 at 100 MB, from the first 45 s's fill rate held constant. The first seconds are the fill;
+  holding their rate constant was the error, and the cumulative number was never measured until
+  this run. **Still not established:** a long session whose content keeps changing (documents
+  scrolled, pages browsed, video) rather than repeating, and what the server does as it nears the
+  budget. 3.3.1.4's one MUST is on the server — *"the size of the bitmap data stored across all of
+  the in-use variable-length slots at any point in time MUST NOT exceed the total size of the
+  cache"* — so evicting before the cap is the server's job, and this server has had no occasion
+  to show whether it does it.
 
 - **An inverted `destRect` is silently an empty one, and both references refuse it.**
   `Rect16::width()` is `right.saturating_sub(left)`, so `right < left` yields extent 0 and
