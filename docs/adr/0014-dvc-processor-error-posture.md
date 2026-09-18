@@ -249,7 +249,13 @@ confirmed VERSION103 or later: it resets the channel and returns `Ok`.
   `SurfaceToSurface` (source or destination), `SurfaceToCache` and `CacheToSurface`; an unknown
   cache slot; and an uncompressed `WireToSurface1` payload shorter than its rectangle or failing
   conversion. The tile codecs already warn-and-skip (rung 1), so theirs never reaches here.
-  Everything else is `Failure::Fatal`.
+  Everything else is `Failure::Fatal`. **Amended 2026-09-18 (#297): "everything else" is no
+  longer exhaustive.** A `cache_slot` outside 3.3.1.4's one-based range is neither — it is rung 1,
+  warned and skipped, and its guard runs *before* the cache lookup precisely so it cannot become
+  the unknown-slot `Miss` named above. Decision 2's parenthetical (`MAX_SURFACE_DIM`, the surface
+  and cache budgets) enumerates byte and dimension **magnitudes**; a slot index is not one, and
+  the rung for it was decided on its own evidence in
+  [ADR-0009](0009-tolerant-negotiation-posture.md)'s row 4.
 - **The zgfx history survives the reset, and ClearCodec's caches do not.** Measured both ways
   on the VM: the server keeps its compressor history (a fresh decompressor decoded 0 of 20
   post-reset messages identically, with no error), and it resets its ClearCodec glyph and V-bar

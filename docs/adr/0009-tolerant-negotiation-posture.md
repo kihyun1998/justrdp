@@ -1,6 +1,6 @@
 # 0009 — Negotiation posture: tolerant of server self-inconsistency in rendering, strict on security integrity
 
-- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268), 2026-09-04 and 2026-09-16 (#286); see the Amendments below
+- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268), 2026-09-04, 2026-09-16 (#286) and 2026-09-18 (#297); see the Amendments below
 - Date: 2026-07-03
 - Closes issue #101
 
@@ -227,3 +227,95 @@ resource ceiling that is ours — which [ADR-0014](0014-dvc-processor-error-post
 at the whole session rather than the channel. This row used to carry a second ground, that
 Microsoft's conformance suite drew the same line; ADR-0014's enumeration **measured that false**,
 and the row stands on the first ground alone.
+
+## Amendment (2026-09-18, #297): row 4 — a cache slot outside 3.3.1.4's one-based range is skipped
+
+`GraphicsProcessor` keyed its bitmap cache by whatever `u16` the server sent, so slot 0 and slots
+above the confirmed cache's maximum were stored, pasted and evicted like any other. Memory was
+never at risk — the byte budget (#273) bounds it — so this was a conformance gap. It is now
+closed on **rung 1**: out of range is warned (`rdp_egfx`) and the PDU is skipped, on all three of
+`RDPGFX_SURFACE_TO_CACHE_PDU` (2.2.2.6), `RDPGFX_CACHE_TO_SURFACE_PDU` (2.2.2.7) and
+`RDPGFX_EVICT_CACHE_ENTRY_PDU` (2.2.2.8). The maximum reads the **same predicate** as the byte
+budget, so the two cannot disagree about which cache was confirmed.
+
+### What the spec actually says, re-opened at source on 2026-09-18
+
+`[MS-RDPEGFX]` 3.3.1.4 has **one MUST, and it is on bytes**: *"The size of the bitmap data stored
+across all of the in-use variable-length slots at any point in time MUST NOT exceed the total size
+of the cache."* The slot index is described, not mandated — *"a variable-length slot (identified
+by a one-based slot index)"* and *"The maximum possible number of variable-length slots is 25,600
+in the case of a 100 MB cache and 4,096 in the case of a 16 MB cache."* The three PDU sections say
+only *"The value of this field is constrained as specified in section 3.3.1.4."*
+
+**This matters because #297 was filed, and triaged, on the reading that an out-of-range slot
+violates a MUST.** It does not. The maintainer's original call (refuse, ending the session) was
+made against that reading, so it was untested rather than settled, and it was re-taken on the
+corrected one.
+
+### Both references, re-opened at source on 2026-09-18
+
+**FreeRDP refuses it**, `ERROR_INVALID_INDEX`, in `rdpgfx_set_cache_slot_data` and
+`rdpgfx_get_cache_slot_data` (`channels/rdpgfx/client/rdpgfx_main.c`), and the error propagates
+out of `rdpgfx_recv_pdu`. **Part of that check is memory safety rather than posture**: its cache
+is `void* CacheSlots[25600]` (`channels/rdpgfx/client/rdpgfx_main.h`) indexed directly as
+`CacheSlots[cacheSlot - 1]`, so an unchecked slot is an out-of-bounds write and `cacheSlot == 0`
+underflows. Two things separate the rest from the guard, and both were checked: the array is
+`[25600]` **whatever the cache size**, while `MaxCacheSlots` is `4096` under `FreeRDP_GfxSmallCache`
+(`rdpgfx_main.c`, `init_plugin_cb`) — 6.25x tighter than safety needs, so the small-cache bound is
+a conformance choice; and FreeRDP does **not** bound surface ids at all, because `SurfaceTable` is
+a `wHashTable`. It also sizes `MaxCacheSlots` from its **own setting** at plugin init and never
+from the Caps Confirm, which is the opposite of what this change does.
+
+**`ironrdp-egfx` does not bound it at all.** `Compositor::cache_to_surface` is
+`let Some(tile) = self.cache.get(&cache_slot) else { return; }` and every cache operation returns
+`()` (`crates/ironrdp-egfx/src/compositor.rs`) — the same structural reason row 3 already records
+for the paint budget: it has nowhere to put a refusal.
+
+### Measured on the WS2022 VM, 2026-09-18
+
+Throwaway `eprintln!` instrumentation in the three arms, never committed; two invocations, four
+runs, **9,965 slot observations**, each run ~45 s of mouse sweeps and Start-menu opens.
+
+| | default config | `versions: [CAPVERSION_103]` |
+|---|---|---|
+| confirmed capset | `0x000a0400`, flags `0x20` | `0x000a0301`, flags `0x20` |
+| so the budget is | 100 MB → 25,600 slots | 16 MB → **4,096 slots** |
+| `SURFACE_TO_CACHE` | n=201, slots **2..202** | n=215, slots **2..216** |
+| `CACHE_TO_SURFACE` | n=2,196, slots 2..170 | n=2,197, slots 2..186 |
+| `EVICT_CACHE_ENTRY` | **n=0** | **n=0** |
+| slot 0, and slots > 4,096 | **0, 0** | **0, 0** |
+
+**No counterexample, so nothing reopened.** Two facts decided the rung instead. First, **the
+server does not track the maximum**: slots are a plain counter from 2, contiguous and strictly
+increasing, with no reuse and no eviction — and the run that confirmed the *16 MB* cache used
+*more* slots (216) than the 100 MB run (202), so the number follows session length and not the
+budget. At ~215 slots per 45 s of this activity a confirmed-10.3 session crosses 4,096 in roughly
+fifteen minutes, which is a session, not a hypothetical. Second, **`EVICT_CACHE_ENTRY` was never
+sent**, so a refusal there would put a session-ending failure on a path nothing has observed.
+Both bound only this traffic: no run measured peak cache use, and whether the byte budget fires
+before slot 4,096 at a confirmed 10.3 is **not measured** — it turns on the average cached bitmap
+being above or below `16 MB / 4,096 = 4 KiB`.
+
+**Kept as a skip**, on the ground row 3 already names: the refusal would end a session over a
+ceiling that is ours in the only sense that counts here — the section's own MUST is the byte
+total, which is enforced and still drops (ADR-0014's 2026-09-17 amendment, Decision 2) — and
+ADR-0014 prices a processor refusal at the whole session rather than the channel. §3(a) holds
+unchanged: the bytes are still fully validated, and this narrows only which slots may appear.
+
+**Kind: judgement.** Four postures were enumerated with their consequences — refuse (fatal),
+warn-and-skip, semantic miss taking the 3.3.5.19 reset, and do not implement — and the maintainer
+chose warn-and-skip. A better derivation does not reopen it; the maintainer does.
+
+### What this does not decide
+
+- **Whether the evict-side guard earns its place.** Its skip is unobservable by construction: the
+  fill path already prevents an out-of-range slot from being occupied, so `remove` was always a
+  no-op there. Mutation testing confirms it — deleting that one guard reddens no test. It is kept
+  for the warn and for uniformity across the three PDUs, and this crate has no tracing-assertion
+  facility to pin the warn (neither does #268's row-3 warn).
+- **Whether an in-range unfilled slot should keep taking the reset.** Unchanged, and neither
+  reference has this two-rung split: FreeRDP fails both cases identically and `ironrdp-egfx`
+  tolerates both silently.
+- **Cache import** (2.2.2.16/.17) and the persistent bitmap cache (3.3.1.5, epic #28), neither of
+  which this client implements.
+- Any server but one WS2022 box, at any version but 10.4 and 10.3.
