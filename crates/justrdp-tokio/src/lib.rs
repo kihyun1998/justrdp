@@ -2738,6 +2738,15 @@ mod tests {
             let idle = await_desktop(frames, DESKTOP_DEADLINE).await?;
             let mut sent = 0usize;
 
+            // Esc first, so the click below always opens the Start menu rather than toggling
+            // shut one that is already open.
+            let esc = tap(0x1B);
+            sent += esc.len();
+            tx.send(esc).await.map_err(|_| closed())?;
+            await_desktop(frames, MENU_DEADLINE)
+                .await
+                .map_err(|why| format!("the desktop never settled after Esc: {why}"))?;
+
             let (x, y) = (24u16, desktop.1.saturating_sub(20));
             let click = vec![
                 InputEvent::Mouse {
@@ -3097,6 +3106,71 @@ mod tests {
             assert_eq!(vk_for(' '), Some(0x20));
         }
 
+        /// The Start button is a toggle. This shell starts with the menu **open** — the state a run
+        /// that failed after its click leaves behind — and counts the keystrokes that reach the
+        /// window behind the menu instead of the search box.
+        #[tokio::test(start_paused = true)]
+        async fn start_menu_run_does_not_assume_the_menu_starts_closed() {
+            let frames = Arc::new(AtomicUsize::new(1));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            let painting = frames.clone();
+            let closing = Arc::new(AtomicBool::new(false));
+            let shell = tokio::spawn(async move {
+                let mut open = true;
+                let (mut searched, mut misdirected) = (0usize, 0usize);
+                while let Some(events) = rx.recv().await {
+                    if events.iter().any(|e| matches!(e, InputEvent::Mouse { .. })) {
+                        // A click while the menu is still closing is swallowed — but the
+                        // closing animation keeps drawing, which is what a click's
+                        // acknowledgement would otherwise read.
+                        if !closing.load(Ordering::SeqCst) {
+                            open = !open;
+                            painting.fetch_add(1, Ordering::SeqCst);
+                        }
+                    } else if events
+                        .iter()
+                        .any(|e| matches!(e, InputEvent::ScanCode { code: 0x01, .. }))
+                    {
+                        if open {
+                            open = false;
+                            closing.store(true, Ordering::SeqCst);
+                            let (painting, closing) = (painting.clone(), closing.clone());
+                            tokio::spawn(async move {
+                                for _ in 0..5 {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    painting.fetch_add(1, Ordering::SeqCst);
+                                }
+                                closing.store(false, Ordering::SeqCst);
+                            });
+                        }
+                    } else if open {
+                        searched += 1;
+                        painting.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        // The window behind the menu takes it, and draws it.
+                        misdirected += 1;
+                        painting.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                (searched, misdirected)
+            });
+
+            start_menu_run(&tx, &frames, (1280, 800), SIGN_OUT)
+                .await
+                .expect("both acknowledgements are satisfied whichever way the click toggled");
+            drop(tx);
+            let (searched, misdirected) = shell.await.expect("the fake shell");
+            assert_eq!(
+                misdirected, 0,
+                "no keystroke may reach the window behind the menu"
+            );
+            assert_eq!(
+                searched,
+                SIGN_OUT.chars().count() + 1,
+                "the command and its Enter reach the search box"
+            );
+        }
+
         /// The retry is the behaviour #198 adds, so it is the one worth proving without a VM.
         /// A shell that ignores the first two clicks and only then starts drawing *is* the
         /// cold logon #197 introduced — the desktop is up, the taskbar is not — and a single
@@ -3115,6 +3189,11 @@ mod tests {
                         if clicks >= 3 {
                             painting.fetch_add(1, Ordering::SeqCst);
                         }
+                    } else if events
+                        .iter()
+                        .any(|e| matches!(e, InputEvent::ScanCode { code: 0x01, .. }))
+                    {
+                        // Esc with no menu open: nothing to close, nothing drawn.
                     } else {
                         typed += 1;
                         painting.fetch_add(1, Ordering::SeqCst);
@@ -3137,7 +3216,11 @@ mod tests {
             // The retried clicks are counted, not quietly forgotten: slice-7 asserts on this
             // number, and an undercount would let a run that clicked six times report as one
             // that clicked once.
-            assert_eq!(run.sent, 3 * 3 + 6 * 2 + 2);
+            assert_eq!(
+                run.sent,
+                2 + 3 * 3 + 6 * 2 + 2,
+                "Esc, three clicks, six letters, Enter"
+            );
             assert_eq!(run.idle, 1);
             assert!(run.after_click > run.idle);
             assert!(run.after_typing > run.after_click);
@@ -3188,6 +3271,11 @@ mod tests {
                 while let Some(events) = rx.recv().await {
                     if events.iter().any(|e| matches!(e, InputEvent::Mouse { .. })) {
                         busy(15); // the menu takes three seconds to open
+                    } else if events
+                        .iter()
+                        .any(|e| matches!(e, InputEvent::ScanCode { code: 0x01, .. }))
+                    {
+                        // Esc with no menu open: nothing to close, nothing drawn.
                     } else if still_opening.load(Ordering::SeqCst) {
                         swallowed += 1; // still drawing; the keystroke is lost
                     } else {
