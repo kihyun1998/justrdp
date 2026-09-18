@@ -248,6 +248,28 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   to cover exactly this case and missed the cold logon: **a fixed sleep is not wrong
   about everything, it is unfalsifiable**, and that is the argument for quiescence rather
   than for a longer sleep.
+- **A repaint cannot say which way a toggle went, so `start_menu_run` fixes the starting
+  state instead of reading it.** The Start button toggles, and every `?` in `start_menu_run`
+  returns *after* its click with nothing to close the menu again, so a run that fails midway
+  leaves the menu open for the next caller. That caller's click then **closes** it — which
+  repaints, and so passes the click's acknowledgement — and focus falls back to whatever window
+  was under the menu; the typed command lands there and draws there, so the typing
+  acknowledgement passes too. Both closed loops close on a true signal about the wrong thing.
+  Measured on 2026-09-18 when a #297 probe left the menu open over Notepad: the teardown's
+  `shutdown /l /f` went into the Notepad buffer, the sign-out never ran, the 150 s timeout
+  fired, and the session was then sitting at the **lock screen**, which failed every later VM
+  test — reconnecting did not clear it, and it took typing the password in to recover. So the
+  cost of one failed step is #182's cascade again, arriving through an error path.
+  **Esc before the click** is the fix, and it holds in every state the menu can be in: it
+  closes an open menu, is swallowed by a session with no focus, and does nothing to the
+  application behind a closed one. The wait after it is not padding — a menu that is still
+  animating shut draws frames a click's acknowledgement would read, and swallows the click
+  that was meant to open it (`start_menu_run_does_not_assume_the_menu_starts_closed` models
+  both, and reddens without the wait). It costs one quiet window, `DESKTOP_QUIET`, per run.
+  Choosing Esc over reading the framebuffer for the menu's state, over closing the menu on the
+  error path and over an out-of-band logoff was the maintainer's call (2026-09-18); the
+  framebuffer read is the named fallback if Esc turns out not to reach an open menu in a
+  reattached session.
 - **One dump path is one dump.** The teardown wrote every timeout to
   `%TEMP%\justrdp-vm-teardown-timeout.ppm`, so a run with three failures kept only the
   **last** screenshot — and the first is the root cause while the others are its
