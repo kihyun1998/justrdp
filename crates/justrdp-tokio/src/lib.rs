@@ -756,6 +756,12 @@ pub async fn run_session_with_input(
                     // run_session_with_commands, which surfaces the event.
                     tracing::debug!(target: "rdp_displaycontrol_caps", "display control ready");
                 }
+                SessionOutput::SaveSessionInfo(_) => {
+                    // Same shape as the two above: no event sink here, and the core already
+                    // emitted the `rdp_save_session_info` record, so re-logging it would only
+                    // say it twice. A host that wants the session ID or the reconnect cookie
+                    // uses run_session_with_commands.
+                }
             }
         }
         tokio::select! {
@@ -823,13 +829,24 @@ pub enum SessionCommand {
 }
 
 /// A session milestone surfaced to the host by [`run_session_with_commands`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy` since #304: [`Self::SaveSessionInfo`] carries the logon's domain and user name,
+/// which are owned `String`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     /// The Display Control dynamic channel is open and the server's caps arrived:
     /// [`SessionCommand::Resize`] is valid from now on.
     DisplayControlReady,
     /// The server refused a [`SessionCommand::Shutdown`]. The session is unaffected.
     ShutdownDenied,
+    /// The server said who logged on, into which session, and — in the extended variant — the
+    /// cookie that would resume it (`[MS-RDPBCGR]` 2.2.10.1, issue #304).
+    ///
+    /// Storing the cookie is the host's, by definition: 3.2.5.10.1 says the client SHOULD save
+    /// it, and where is policy (CLAUDE.md). It is a live credential — treat it the way the
+    /// password is treated, and note that
+    /// [`SaveSessionInfo`](justrdp_pdu::session_info::SaveSessionInfo)'s `Debug` redacts it.
+    SaveSessionInfo(justrdp_pdu::session_info::SaveSessionInfo),
 }
 
 /// [`run_session_with_input`] generalized to host *commands* (input + resize) and
@@ -838,7 +855,8 @@ pub enum SessionEvent {
 /// never deadlock on the session (issue #8's cancel-safety criterion). Dropping the returned
 /// future remains equally safe — the machine is pure and the socket is caller-owned.
 ///
-/// `on_event` receives session milestones (currently [`SessionEvent::DisplayControlReady`]);
+/// `on_event` receives session milestones ([`SessionEvent::DisplayControlReady`],
+/// [`SessionEvent::ShutdownDenied`], [`SessionEvent::SaveSessionInfo`]);
 /// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
 pub async fn run_session_with_commands(
     stream: &mut TlsStream<TcpStream>,
@@ -869,6 +887,9 @@ pub async fn run_session_with_commands(
                 SessionOutput::ShutdownDenied => {
                     tracing::debug!(target: "rdp_shutdown_denied", "shutdown request denied");
                     on_event(SessionEvent::ShutdownDenied);
+                }
+                SessionOutput::SaveSessionInfo(info) => {
+                    on_event(SessionEvent::SaveSessionInfo(info));
                 }
             }
         }
@@ -2133,6 +2154,161 @@ mod tests {
                 "milestones observed: rdp_demand_active → rdp_finalization(synchronize, \
                  control, font-map) → rdp_session_active"
             );
+        })
+        .await
+    }
+
+    /// Issue #304's DoD ④: the logon notification actually reaches a host, against the real
+    /// server rather than against bytes this repo wrote.
+    ///
+    /// **Which leg was the open question, and it is now measured.** The connect leg sees
+    /// **none** and the session leg sees **two** — an `INFOTYPE_LOGON_EXTENDED_INFO` followed by
+    /// an `INFOTYPE_LOGON_LONG` — so `ActivationResult::save_session_info` is empty on this VM
+    /// and `SessionOutput::SaveSessionInfo` carries everything. Both legs are built because the
+    /// PDU is not bound to either by the spec; only one of them fires here, and a capture from
+    /// one WS2022 box on one advertised configuration proves what *this* server does
+    /// (`docs/map/invariant/capture-coverage-follows-what-we-advertise.md`).
+    ///
+    /// **This is also why `crates/justrdp-pdu/tests/fixtures/session/` exists.**
+    /// `capture_connect_chunk` runs only in the connect read loop and stops at
+    /// `Action::SessionActive`, so the repo's committable-capture mechanism structurally cannot
+    /// see this PDU. The fixture beside that README was teed by hand during #304 and the offline
+    /// assertions live in `justrdp-pdu/tests/real_server_session.rs`; this test is the live half,
+    /// and what it adds is that the bytes reach a **host sink** rather than merely decoding.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn save_session_info_reaches_the_host_against_real_vm() {
+        use justrdp_pdu::session_info::SaveSessionInfo;
+
+        with_vm_session(|vm| async move {
+            let config = test_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+
+            let connect_leg = outcome.activation.save_session_info.clone();
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+            let (_tx, mut commands) = tokio::sync::mpsc::channel(4);
+            let cancel = CancellationToken::new();
+            let canceller = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                canceller.cancel();
+            });
+
+            let mut session_leg: Vec<SaveSessionInfo> = Vec::new();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(40),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {},
+                    |_| {},
+                    |event| {
+                        if let SessionEvent::SaveSessionInfo(info) = event {
+                            session_leg.push(info);
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+
+            eprintln!(
+                "#304: connect leg {} PDU(s), session leg {} PDU(s)",
+                connect_leg.len(),
+                session_leg.len()
+            );
+            for info in connect_leg.iter().chain(session_leg.iter()) {
+                eprintln!("  {info:?}");
+            }
+
+            // The host's view is both legs together: the PDU is not bound to either, so a test
+            // that asserted only one would encode this VM's timing as the contract.
+            let all: Vec<&SaveSessionInfo> = connect_leg.iter().chain(session_leg.iter()).collect();
+
+            // **The count is not fixed, and asserting one was this test's own defect.** Five
+            // logons: four produced `LogonLong` + `Extended`, one produced `LogonLong` alone.
+            // The first three agreed, which is exactly how a transient becomes a contract — so
+            // what is asserted now is the *shape* of what arrives, not how much of it. The
+            // condition that decides whether `Extended` comes is not established; the run that
+            // lacked it was the first logon after the VM's account was reset.
+            //
+            // The `Vec` handover is *reinforced* by this, not weakened: one logon has been seen
+            // to produce both one notification and two, so no fixed-arity carrier is right.
+            assert!(
+                !all.is_empty(),
+                "a logon produced no notification at all, on either leg"
+            );
+            for info in &all {
+                assert!(
+                    matches!(
+                        info,
+                        SaveSessionInfo::LogonLong(_) | SaveSessionInfo::Extended(_)
+                    ),
+                    "this server has only ever sent LogonLong and Extended; {info:?} is news \
+                     and the fixture README needs it"
+                );
+            }
+
+            // Exactly one names the account, always.
+            let logons: Vec<_> = all
+                .iter()
+                .filter_map(|i| match i {
+                    SaveSessionInfo::Logon(l) | SaveSessionInfo::LogonLong(l) => Some(l.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                logons.len(),
+                1,
+                "one logon names the account once, got {logons:?}"
+            );
+            let logon = &logons[0];
+            assert_eq!(
+                logon.user,
+                std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
+                "the server names the account this test logged on with"
+            );
+            assert_ne!(logon.session_id, 0, "the server assigns a session");
+
+            // `Extended` is optional *and the optionality is reported*, which is the difference
+            // between a conditional assertion and a vacuous one: a run that skipped these says
+            // so in its output rather than passing in silence.
+            match all.iter().find_map(|i| match i {
+                SaveSessionInfo::Extended(e) => Some(e),
+                _ => None,
+            }) {
+                None => eprintln!(
+                    "#304: no Logon Info Extended this run — the cookie and session-ID \
+                     assertions did not execute"
+                ),
+                Some(ext) => {
+                    assert!(
+                        ext.auto_reconnect.is_none(),
+                        "this VM has never sent a cookie; if that changed, #306 just acquired a \
+                         proof path and the fixture README needs correcting"
+                    );
+                    let err = ext
+                        .logon_error
+                        .expect("LOGON_EX_LOGONERRORS is the only field this server sets");
+                    // `errorNotificationData` is the session ID for this notification type, not
+                    // an error code — which is why `LogonErrorsInfo` carries a raw `u32` rather
+                    // than IronRDP's enum, whose `0..=3` mapping reads it as a bogus code.
+                    // Four pairs so far: 2/2, 3/3, 6/6, 4/4.
+                    assert_eq!(
+                        err.notification_data, logon.session_id,
+                        "the notification data tracks the session, so it is an ID not a code"
+                    );
+                    eprintln!(
+                        "#304: Extended present; data {} == session id",
+                        err.notification_data
+                    );
+                }
+            }
         })
         .await
     }

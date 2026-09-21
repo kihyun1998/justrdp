@@ -21,8 +21,8 @@ use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::input::InputEvent;
 use justrdp_pdu::pointer::PointerUpdate;
 use justrdp_pdu::{
-    displaycontrol, dvc, fastpath, finalization, input, mcs, pointer, share, svc, tpkt, update,
-    x224,
+    displaycontrol, dvc, fastpath, finalization, input, mcs, pointer, session_info, share, svc,
+    tpkt, update, x224,
 };
 
 /// Everything the session machine needs from the completed connect sequence: channel
@@ -71,6 +71,71 @@ pub enum SessionOutput {
     /// The server refused a [`SessionStateMachine::request_shutdown`] — `[MS-RDPBCGR]` 2.2.2.2.
     /// The session is **unaffected**: it keeps running and the host may carry on or give up.
     ShutdownDenied,
+    /// Who logged on, into which session, whether the logon carried an error, and the cookie
+    /// that would resume it — `[MS-RDPBCGR]` 2.2.10.1 (issue #304).
+    ///
+    /// What the host does with any of it is the host's (CLAUDE.md): 3.2.5.10.1 says only that
+    /// the client SHOULD save the cookie and MAY act on the rest. A logon error here is a
+    /// **notification, not a disconnect** — unlike [`Self::ShutdownDenied`] it may precede one,
+    /// and the attribution for a close that follows is still Set Error Info.
+    SaveSessionInfo(session_info::SaveSessionInfo),
+}
+
+/// Record one Save Session Info at its arrival, for whichever leg received it.
+///
+/// Shared because the connect leg and the session leg both dispatch this PDU, and the existing
+/// asymmetry is already a known hole: `on_data_pdu`'s reactivation arms note that `connect.rs`
+/// emits an `rdp_finalization` record per reply while they emit nothing. One function is the
+/// same move `Control::check_server_action` made for a value check in #252 — one family, one
+/// answer, whichever leg asks.
+///
+/// `arcRandomBits` is never a field here. It is the HMAC key that resumes the session
+/// (`[MS-RDPBCGR]` 5.5), and a log is exactly the place it must not reach — which is also why
+/// [`session_info::ServerAutoReconnect`] hand-writes its `Debug`.
+pub(crate) fn log_save_session_info(leg: &'static str, info: &session_info::SaveSessionInfo) {
+    match info {
+        session_info::SaveSessionInfo::Logon(i) | session_info::SaveSessionInfo::LogonLong(i) => {
+            tracing::debug!(
+                target: "rdp_save_session_info",
+                leg,
+                session_id = i.session_id,
+                domain = %i.domain,
+                user = %i.user,
+                "server logon info"
+            );
+        }
+        session_info::SaveSessionInfo::PlainNotify => {
+            tracing::debug!(target: "rdp_save_session_info", leg, "server plain logon notify");
+        }
+        session_info::SaveSessionInfo::Extended(ext) => {
+            tracing::debug!(
+                target: "rdp_save_session_info",
+                leg,
+                fields_present = format_args!("{:#010x}", ext.fields_present),
+                cookie_logon_id = ext.auto_reconnect.as_ref().map(|c| c.logon_id),
+                "server extended logon info"
+            );
+            if let Some(err) = ext.logon_error {
+                tracing::info!(
+                    target: "rdp_logon_error",
+                    leg,
+                    notification_type = format_args!("{:#010x}", err.notification_type.as_u32()),
+                    notification_data = format_args!("{:#010x}", err.notification_data),
+                    data_is_session_id = err.notification_type.data_is_session_id(),
+                    description = %err.description(),
+                    "server logon notification"
+                );
+            }
+        }
+        session_info::SaveSessionInfo::Unknown { info_type } => {
+            tracing::debug!(
+                target: "rdp_save_session_info",
+                leg,
+                info_type = format_args!("{info_type:#010x}"),
+                "server Save Session Info of an undefined infoType"
+            );
+        }
+    }
 }
 
 /// Why a [`SessionStateMachine::request_resize`] call was refused (the session itself is
@@ -683,9 +748,19 @@ impl SessionStateMachine {
                 }
                 Ok(())
             }
-            // Save Session Info and the rest: skipped, cursor unread, until their epics.
-            // (Set Error Info and the reactivation Synchronize/Control have their own arms
-            // above — this comment used to claim both, and to call the skip a decode; #252.)
+            share::PDU_TYPE2_SAVE_SESSION_INFO => {
+                // Who logged on, into which session, and the cookie that would resume it
+                // (issue #304). No phase guard: 2.2.10.1 ties this PDU to the logon, not to
+                // the share, so it may arrive at any point a share is up.
+                let info =
+                    session_info::SaveSessionInfo::decode(cur).map_err(SessionError::Decode)?;
+                log_save_session_info("session", &info);
+                outputs.push(SessionOutput::SaveSessionInfo(info));
+                Ok(())
+            }
+            // The rest: skipped, cursor unread, until their epics. (Set Error Info, the
+            // reactivation Synchronize/Control and Save Session Info have their own arms above
+            // — this comment used to claim both, and to call the skip a decode; #252.)
             _ => Ok(()),
         }
     }
@@ -1118,6 +1193,16 @@ mod tests {
         assert_eq!(outputs, vec![SessionOutput::ShutdownDenied]);
     }
 
+    /// A Save Session Info body carrying a Plain Notify — the shortest well-formed one there
+    /// is, and the only variant with nothing to assert about its contents.
+    fn plain_notify_body() -> Vec<u8> {
+        let mut body = session_info::INFOTYPE_LOGON_PLAINNOTIFY
+            .to_le_bytes()
+            .to_vec();
+        body.extend_from_slice(&[0u8; 576]);
+        body
+    }
+
     /// …and it is *only* the refusal that surfaces. A neighbouring `pduType2` must not, or the
     /// host learns "the server refused" from a PDU that said nothing of the kind — the same
     /// side-condition that makes the positive assertion above mean anything.
@@ -1127,8 +1212,7 @@ mod tests {
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
         for pdu_type2 in [
             share::PDU_TYPE2_SHUTDOWN_REQUEST, // 0x24 — ours to send, never to receive
-            0x26,                              // Save Session Info — catch-all, cursor unread
-            0x29,                              // Set Keyboard Indicators, likewise
+            0x29,                              // Set Keyboard Indicators — catch-all, unread
         ] {
             let outputs = sm
                 .process_bytes(&server_data_pdu(pdu_type2, &[]))
@@ -1138,6 +1222,21 @@ mod tests {
                 "pduType2 {pdu_type2:#04x} must not surface as a refusal"
             );
         }
+        // 0x26 used to sit in that list, as a `pduType2` the dispatcher skipped in silence.
+        // Since #304 it has a handler, so the side condition it carries is the stronger one:
+        // two handled neighbours must not be mistaken for each other.
+        let outputs = sm
+            .process_bytes(&server_data_pdu(
+                share::PDU_TYPE2_SAVE_SESSION_INFO,
+                &plain_notify_body(),
+            ))
+            .expect("a well-formed Save Session Info decodes");
+        assert_eq!(
+            outputs,
+            vec![SessionOutput::SaveSessionInfo(
+                session_info::SaveSessionInfo::PlainNotify
+            )]
+        );
     }
 
     fn test_core() -> justrdp_pdu::gcc::ClientCoreData {
@@ -1905,8 +2004,16 @@ mod tests {
             )]))
             .unwrap();
         assert!(outputs.is_empty());
-        let tpkt_between = server_data_pdu(share::PDU_TYPE2_SAVE_SESSION_INFO, &[0; 4]);
-        assert!(sm.process_bytes(&tpkt_between).unwrap().is_empty());
+        // A slow-path PDU between two fast-path fragments, and since #304 a *handled* one:
+        // it must consume its whole body and leave the reassembly buffer alone.
+        let tpkt_between =
+            server_data_pdu(share::PDU_TYPE2_SAVE_SESSION_INFO, &plain_notify_body());
+        assert_eq!(
+            sm.process_bytes(&tpkt_between).unwrap(),
+            vec![SessionOutput::SaveSessionInfo(
+                session_info::SaveSessionInfo::PlainNotify
+            )]
+        );
         assert!(
             sm.process_bytes(&fastpath::encode_pdu(&[(
                 fastpath::FP_UPDATE_BITMAP,
@@ -2010,18 +2117,14 @@ mod tests {
     fn non_io_channels_and_unknown_pdus_are_skipped() {
         let mut sm = SessionStateMachine::new(config(), Vec::new())
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
-        // Data PDUs without a handler produce nothing (pointer PDUs graduated to handled in
-        // issue #41 — save-session-info and set-error-info remain decode-and-skip).
-        for (t2, body) in [
-            (share::PDU_TYPE2_SAVE_SESSION_INFO, vec![0u8; 12]),
-            (share::PDU_TYPE2_SET_ERROR_INFO, vec![0u8; 4]),
-        ] {
-            assert!(
-                sm.process_bytes(&server_data_pdu(t2, &body))
-                    .unwrap()
-                    .is_empty()
-            );
-        }
+        // Set Error Info is the last data PDU that decodes and produces no output: it is
+        // recorded on the machine and read at disconnect rather than surfaced. This was a
+        // loop over two until #41 took the pointer PDUs and #304 took save-session-info.
+        assert!(
+            sm.process_bytes(&server_data_pdu(share::PDU_TYPE2_SET_ERROR_INFO, &[0u8; 4]))
+                .unwrap()
+                .is_empty()
+        );
         // Traffic on a static channel (1004) is ignored for now.
         let mut body = vec![0x68];
         body.extend_from_slice(&(1002u16 - 1001).to_be_bytes());

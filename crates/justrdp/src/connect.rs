@@ -200,6 +200,19 @@ pub struct ActivationResult {
     /// the transport, so the session loop must process these **before** reading the socket
     /// (servers start streaming graphics immediately).
     pub leftover: Vec<u8>,
+    /// Every Save Session Info (`[MS-RDPBCGR]` 2.2.10.1) the server sent before the Font Map,
+    /// in arrival order (issue #304).
+    ///
+    /// A `Vec` and not an `Option` because nothing bounds the count: 3.2.5.10.1 phrases the
+    /// logon notification and the auto-reconnect cookie as separate cases, and FreeRDP fills
+    /// `logon_info` and `logon_info_ex` from separate PDUs into separate settings. One of the
+    /// two silently overwriting the other is the defect this field exists to end.
+    ///
+    /// **Usually empty.** The connect machine stops at the Font Map, so a server that sends
+    /// this PDU after activation delivers it to the session loop as
+    /// [`crate::SessionOutput::SaveSessionInfo`] instead. Both legs, one PDU: read whichever
+    /// arrives.
+    pub save_session_info: Vec<justrdp_pdu::session_info::SaveSessionInfo>,
 }
 
 /// An input handed to the machine by the host adapter.
@@ -430,6 +443,8 @@ pub struct ConnectStateMachine {
     share_id: u32,
     negotiated_size: (u16, u16),
     server_capabilities: Vec<CapabilitySet>,
+    /// Save Session Info PDUs seen before the Font Map, handed over in [`ActivationResult`].
+    save_session_info: Vec<justrdp_pdu::session_info::SaveSessionInfo>,
 }
 
 impl ConnectStateMachine {
@@ -449,6 +464,7 @@ impl ConnectStateMachine {
             share_id: 0,
             negotiated_size: (0, 0),
             server_capabilities: Vec::new(),
+            save_session_info: Vec::new(),
         }
     }
 
@@ -1154,6 +1170,7 @@ impl ConnectStateMachine {
                                 desktop_size: self.negotiated_size,
                                 server_capabilities: std::mem::take(&mut self.server_capabilities),
                                 leftover: std::mem::take(&mut self.inbox),
+                                save_session_info: std::mem::take(&mut self.save_session_info),
                             },
                         }])
                     }
@@ -1187,9 +1204,21 @@ impl ConnectStateMachine {
                         );
                         Ok(Vec::new())
                     }
-                    // Anything else the server interleaves here (Save Session Info, Set Error
-                    // Info, keyboard indicators, …) is session-loop material: skipped now,
-                    // handled by the corresponding epics.
+                    share::PDU_TYPE2_SAVE_SESSION_INFO => {
+                        // The logon notification, which this server may interleave with the
+                        // finalization replies (issue #304). It is not a finalization reply and
+                        // reaches no stage: it is accumulated and handed to the session loop in
+                        // `ActivationResult`, because the connect machine's actions are
+                        // instructions to the adapter and the host sees none of them.
+                        let info = justrdp_pdu::session_info::SaveSessionInfo::decode(&mut cur)
+                            .map_err(ConnectError::Decode)?;
+                        crate::session::log_save_session_info("connect", &info);
+                        self.save_session_info.push(info);
+                        Ok(Vec::new())
+                    }
+                    // Anything else the server interleaves here (Set Error Info, keyboard
+                    // indicators, …) is session-loop material: skipped now, handled by the
+                    // corresponding epics.
                     _ => Ok(Vec::new()),
                 }
             }
@@ -2594,6 +2623,9 @@ mod tests {
         assert_eq!(result.desktop_size, (1920, 1080));
         assert_eq!(result.server_capabilities.len(), 3);
         assert!(result.leftover.is_empty());
+        // This server sent no logon notification before the Font Map; #304's field is empty
+        // rather than absent, which is what lets the session leg be the other half.
+        assert!(result.save_session_info.is_empty());
     }
 
     #[test]
@@ -2645,13 +2677,109 @@ mod tests {
     #[test]
     fn unknown_data_pdus_during_finalization_are_skipped() {
         let mut sm = finalizing();
-        // Save Session Info (logon notification) interleaves here on real servers.
+        // Set Keyboard Indicators (0x29) interleaves here on real servers and has no handler
+        // yet (#305). Save Session Info used to stand in for this and now has one (#304).
         let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
-            share::PDU_TYPE2_SAVE_SESSION_INFO,
-            &[0u8; 12],
+            0x29, &[0u8; 12],
         ))));
         assert!(actions.is_empty());
         assert_eq!(sm.stage(), "activation");
+    }
+
+    /// A Save Session Info body carrying a Plain Notify, plus one carrying a Logon Info V1.
+    fn plain_notify_body() -> Vec<u8> {
+        let mut body = justrdp_pdu::session_info::INFOTYPE_LOGON_PLAINNOTIFY
+            .to_le_bytes()
+            .to_vec();
+        body.extend_from_slice(&[0u8; 576]);
+        body
+    }
+
+    fn logon_v1_body(domain: &str, user: &str, session_id: u32) -> Vec<u8> {
+        fn utf16z(s: &str) -> Vec<u8> {
+            let mut out: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            out.extend_from_slice(&[0, 0]);
+            out
+        }
+        let (d, u) = (utf16z(domain), utf16z(user));
+        let mut body = justrdp_pdu::session_info::INFOTYPE_LOGON
+            .to_le_bytes()
+            .to_vec();
+        body.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        let mut f = d.clone();
+        f.resize(52, 0);
+        body.extend_from_slice(&f);
+        body.extend_from_slice(&(u.len() as u32).to_le_bytes());
+        let mut f = u.clone();
+        f.resize(512, 0);
+        body.extend_from_slice(&f);
+        body.extend_from_slice(&session_id.to_le_bytes());
+        body
+    }
+
+    /// Issue #304 on the connect leg. Save Session Info is not a finalization reply: it reaches
+    /// no stage and produces no [`Action`], because the connect machine's actions are
+    /// instructions to the adapter and the host sees none of them. It rides out in
+    /// [`ActivationResult`] instead, which is already the connect→session handover.
+    ///
+    /// **Two of them, and both survive.** Nothing bounds the count — 3.2.5.10.1 phrases the
+    /// logon notification and the auto-reconnect cookie as separate cases — so an `Option` here
+    /// would drop one silently, which is the defect this slice exists to end rather than to
+    /// relocate.
+    #[test]
+    fn save_session_info_during_finalization_rides_out_in_the_activation_result() {
+        let mut sm = finalizing();
+        for body in [logon_v1_body("CONTOSO", "rdptest", 3), plain_notify_body()] {
+            let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
+                share::PDU_TYPE2_SAVE_SESSION_INFO,
+                &body,
+            ))));
+            assert!(
+                actions.is_empty(),
+                "a logon notification is not a connect action, got {actions:?}"
+            );
+            assert_eq!(sm.stage(), "activation", "and it advances no stage");
+        }
+        let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
+            share::PDU_TYPE2_FONT_MAP,
+            &[0, 0, 0, 0, 3, 0, 4, 0],
+        ))));
+        let [Action::SessionActive { result }] = actions.as_slice() else {
+            panic!("expected SessionActive, got {actions:?}");
+        };
+        assert_eq!(
+            result.save_session_info,
+            vec![
+                justrdp_pdu::session_info::SaveSessionInfo::Logon(
+                    justrdp_pdu::session_info::LogonInfo {
+                        domain: "CONTOSO".to_string(),
+                        user: "rdptest".to_string(),
+                        session_id: 3,
+                    }
+                ),
+                justrdp_pdu::session_info::SaveSessionInfo::PlainNotify,
+            ]
+        );
+    }
+
+    /// A malformed one fails the connect rather than being skipped, the way every other body
+    /// this leg decodes does. Before #304 it could not: the arm never decoded anything.
+    #[test]
+    fn a_malformed_save_session_info_fails_the_connect() {
+        let mut sm = finalizing();
+        let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
+            share::PDU_TYPE2_SAVE_SESSION_INFO,
+            &justrdp_pdu::session_info::INFOTYPE_LOGON_PLAINNOTIFY.to_le_bytes(),
+        ))));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::FailWith(ConnectError::Decode(
+                    justrdp_pdu::DecodeError::NotEnoughBytes { .. }
+                ))]
+            ),
+            "a Plain Notify missing its 576-byte pad should be typed, got {actions:?}"
+        );
     }
 
     /// Issue #252. `[MS-RDPBCGR]` 2.2.1.20/2.2.1.21 fix what a *server* may put in `action`:

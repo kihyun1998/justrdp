@@ -55,6 +55,7 @@ Deactivation–Reactivation, which is how a resize actually happens.
 - `justrdp-pdu/src/finalization.rs` — `Synchronize`, `Control`, `FontMap`,
   `Control::check_server_action`, `encode_font_list`
 - `justrdp/src/connect.rs` — `ActivationResult`, `Stage`
+- `justrdp-pdu/src/session_info.rs` — `SaveSessionInfo`
 - `justrdp/src/session.rs` — `Phase::Reactivating`, `ResizeError`
 - Stage strings: `capability-exchange`, `session-active`
 

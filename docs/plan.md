@@ -970,37 +970,43 @@ Good! I found KDC proxy support. Now let me compile comprehensive information ab
 ### 9a. Save Session Info PDU (MS-RDPBCGR 2.2.10)  
 *(Sent by server during finalization and at runtime to save credentials, sync reconnect cookies, signal logon events.)*
 
-- [ ] **M — SaveSessionInfoPdu dispatcher.** Type field (u32) selects variant: Logon (0x00), LogonLong (0x01), PlainNotify (0x02), LogonExtended (0x03). Each carries session/domain/user and optional auto-reconnect/error info. *ironrdp ref: ironrdp-pdu/rdp/session_info/mod.rs.*
+- [x] **M — SaveSessionInfoPdu dispatcher.** Type field (u32) selects variant: Logon (0x00), LogonLong (0x01), PlainNotify (0x02), LogonExtended (0x03). Each carries session/domain/user and optional auto-reconnect/error info. *ironrdp ref: ironrdp-pdu/rdp/session_info/mod.rs.*
 
 #### Logon Info Version 1 & 2  
-- [ ] **M — Logon Info Version 1 (TS_LOGON_INFO_V1).** Fixed: 4-byte domain-size + 52 bytes domain-buffer (UTF-16 LE, null-terminated) + 4-byte user-size + 512 bytes user-buffer + 4-byte session-id. Pre-RDP6. *ironrdp ref: logon_info.rs LogonInfoVersion1.* **Deprecated but load-bearing** for legacy servers.
-- [ ] **M — Logon Info Version 2 (TS_LOGON_INFO_V2).** 2-byte version(0x0001) + 4-byte size(18) + 4-byte session-id + 4-byte domain-size + 4-byte user-size + 558-byte padding + variable domain-string (UTF-16 LE, null-terminated) + variable user-string. RDP6+. *ironrdp ref: logon_info.rs LogonInfoVersion2.* Identical data to V1, different framing.
+- [x] **M — Logon Info Version 1 (TS_LOGON_INFO_V1).** Fixed: 4-byte domain-size + 52 bytes domain-buffer (UTF-16 LE, null-terminated) + 4-byte user-size + 512 bytes user-buffer + 4-byte session-id. Pre-RDP6. *ironrdp ref: logon_info.rs LogonInfoVersion1.* **Deprecated but load-bearing** for legacy servers.
+- [x] **M — Logon Info Version 2 (TS_LOGON_INFO_V2).** 2-byte version(0x0001) + 4-byte size (**576** per 2.2.10.1.1.2, which excludes the two variable strings; Windows Server 2019 sends **18** and FreeRDP accepts both, so #304 reads it and ignores it) + 4-byte session-id + 4-byte domain-size + 4-byte user-size + 558-byte padding + variable domain-string (UTF-16 LE, null-terminated) + variable user-string. RDP6+. *ironrdp ref: logon_info.rs LogonInfoVersion2.* Identical data to V1, different framing.
 
 #### Logon Info Extended (TS_LOGON_INFO_EXTENDED_V2)  
-- [ ] **M — LogonInfoExtended header.** 2-byte length (internal size, ≤576+size-of-fields) + 4-byte flags (LogonExFlags), optionally followed by auto-reconnect and/or error-info blocks, padded to 570 bytes. *ironrdp ref: logon_extended.rs.* **Gate keeper for downstream fields.**
-- [ ] **M — LogonExFlags (0x0001 | 0x0002 bits).** AUTO_RECONNECT_COOKIE (0x0001) ⇒ ServerAutoReconnect present. LOGON_ERRORS (0x0002) ⇒ LogonErrorsInfo present. Both optional. *ironrdp ref: logon_extended.rs LogonExFlags.*
-- [ ] **M — ServerAutoReconnect block.** 4-byte data-length(28) + 4-byte packet-length(28) + 4-byte version(0x0000_0001) + 4-byte logon-id + 16-byte random_bits. **This cookie + logon_id allow transparent resume on reconnect.** *ironrdp ref: ServerAutoReconnect.* Server generates; client stores and replays on `[ms-rdpbcgr] 2.2.1.11.1.1 cbAutoReconnectCookie / autoReconnectCookie` fields in next Client Info PDU.
-- [ ] **M — LogonErrorsInfo block.** 4-byte data-length(8) + 4-byte error-type (LogonErrorNotificationType enum) + 4-byte error-data (either LogonErrorNotificationDataErrorCode enum OR session-id u32). *ironrdp ref: logon_extended.rs LogonErrorsInfo.* **See §9b for codes.**
-- [ ] **O — PlainNotify (0x0002).** No payload, just 576 bytes padding. Server sends this when logon completes without error/cookie/extended info. *ironrdp ref: session_info/mod.rs InfoData::PlainNotify.*
+- [x] **M — LogonInfoExtended header.** 2-byte length (2.2.10.1.1.4: *"the total size in bytes of this structure, including the variable LogonFields field"* — which reads as including the 570-byte pad, while IronRDP's encoder writes it without; neither reference frames from it and neither does #304) + 4-byte flags (LogonExFlags), optionally followed by auto-reconnect and/or error-info blocks, padded to 570 bytes. *ironrdp ref: logon_extended.rs.* **Gate keeper for downstream fields.**
+- [x] **M — LogonExFlags (0x0001 | 0x0002 bits).** AUTO_RECONNECT_COOKIE (0x0001) ⇒ ServerAutoReconnect present. LOGON_ERRORS (0x0002) ⇒ LogonErrorsInfo present. Both optional. *ironrdp ref: logon_extended.rs LogonExFlags.*
+- [ ] **M — ServerAutoReconnect block.** *(decode landed in #304 — `ServerAutoReconnect` with `version` / `logon_id` / `random_bits`, redacted in `Debug`; the replay half below is **#306** and is what keeps this box open.)* 4-byte data-length(28) + 4-byte packet-length(28) + 4-byte version(0x0000_0001) + 4-byte logon-id + 16-byte random_bits. **This cookie + logon_id allow transparent resume on reconnect.** *ironrdp ref: ServerAutoReconnect.* Server generates; client stores and replays on `[ms-rdpbcgr] 2.2.1.11.1.1 cbAutoReconnectCookie / autoReconnectCookie` fields in next Client Info PDU.
+- [x] **M — LogonErrorsInfo block.** 4-byte data-length(8) + 4-byte error-type (LogonErrorNotificationType enum) + 4-byte error-data (either LogonErrorNotificationDataErrorCode enum OR session-id u32). *ironrdp ref: logon_extended.rs LogonErrorsInfo.* **See §9b for codes.**
+- [x] **O — PlainNotify (0x0002).** No payload, just 576 bytes padding. Server sends this when logon completes without error/cookie/extended info. *ironrdp ref: session_info/mod.rs InfoData::PlainNotify.*
 
 ### 9b. Logon Error Notifications (TS_LOGON_ERRORS_INFO)  
 *(Real errors/warnings that must surface to the user; flow to UI layer.)*
 
+> Ticked by **#304** for the core's half only: every type and code below is decoded, named and
+> carried out on `SessionOutput::SaveSessionInfo` / `ActivationResult::save_session_info`, with
+> `LogonErrorsInfo::description()` for the text. What a host *does* with one — the re-auth
+> prompt, the retry, the message — is host policy by CLAUDE.md's boundary and is not tracked
+> here. The replay half of 9a (`cbAutoReconnectCookie`) is **#306** and stays open.
+
 **Error Type enum** (`LogonErrorNotificationType`; applies M=Mandatory-to-handle, O=Optional):  
-- [ ] **M — AccessDenied (0xFFFF_FFFF).** Generic access-denied; user lacks permission. Carry error-data field (status code).
-- [ ] **M — DisconnectRefused (0xFFFF_FFF9).** Server actively refused connection (no auto-reconnect). Surface as "connection refused."
-- [ ] **M — NoPermission (0xFFFF_FFFA).** User lacks access to desktop/session. "Session unavailable / permissions denied."
-- [ ] **M — SessionTerminate (0xFFFF_FFFD).** Another session booted this one. "Session terminated by another connection."
-- [ ] **O — SessionContinue (0xFFFF_FFFE).** Resumption of prior session; informational.
-- [ ] **O — SessionBusyOptions (0xFFFF_FFF8).** Session busy (e.g., license busy). Handle as transient; may retry.
-- [ ] **O — BumpOptions (0xFFFF_FFFB).** Session in use; bump/disconnect incumbent. Admin intervention required.
-- [ ] **O — ReconnectOptions (0xFFFF_FFFC).** Server offering reconnect capability. Hint to client: save & reuse logon cookie.
+- [x] **M — AccessDenied (0xFFFF_FFFF).** Generic access-denied; user lacks permission. Carry error-data field (status code).
+- [x] **M — DisconnectRefused (0xFFFF_FFF9).** Server actively refused connection (no auto-reconnect). Surface as "connection refused."
+- [x] **M — NoPermission (0xFFFF_FFFA).** User lacks access to desktop/session. "Session unavailable / permissions denied."
+- [x] **M — SessionTerminate (0xFFFF_FFFD).** Another session booted this one. "Session terminated by another connection."
+- [x] **O — SessionContinue (0xFFFF_FFFE).** Resumption of prior session; informational.
+- [x] **O — SessionBusyOptions (0xFFFF_FFF8).** Session busy (e.g., license busy). Handle as transient; may retry.
+- [x] **O — BumpOptions (0xFFFF_FFFB).** Session in use; bump/disconnect incumbent. Admin intervention required.
+- [x] **O — ReconnectOptions (0xFFFF_FFFC).** Server offering reconnect capability. Hint to client: save & reuse logon cookie.
 
 **Error Data (if type carries error-code; else session-id):**  
-- [ ] **M — FailedBadPassword (0x0000_0000).** Authentication failed: bad password. Prompts UI for re-auth.
-- [ ] **M — FailedUpdatePassword (0x0000_0001).** Password expired; update required. UI must prompt password-change flow.
-- [ ] **M — FailedOther (0x0000_0002).** Generic auth failure (account disabled, locked, etc.). Surface error + no auto-retry.
-- [ ] **M — Warning (0x0000_0003).** Non-fatal warning (e.g., password expiring soon, cap-lock on). Surface but allow continue.
+- [x] **M — FailedBadPassword (0x0000_0000).** Authentication failed: bad password. Prompts UI for re-auth.
+- [x] **M — FailedUpdatePassword (0x0000_0001).** Password expired; update required. UI must prompt password-change flow.
+- [x] **M — FailedOther (0x0000_0002).** Generic auth failure (account disabled, locked, etc.). Surface error + no auto-retry.
+- [x] **M — Warning (0x0000_0003).** Non-fatal warning (e.g., password expiring soon, cap-lock on). Surface but allow continue.
 - [ ] **O — SessionId.** If error-type is session-busy / bump / reconnect, carries the conflicting session ID (u32); admin tools use it for conflict resolution.
 
 ### 9c. Server Error Info PDU (MS-RDPBCGR 2.2.2.5 Set Error Info)  

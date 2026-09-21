@@ -26,6 +26,7 @@ pub mod nego;
 pub mod per;
 pub mod pointer;
 pub mod rfx;
+pub mod session_info;
 pub mod share;
 pub mod svc;
 pub mod tpkt;
