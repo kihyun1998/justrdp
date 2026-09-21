@@ -45,8 +45,9 @@ behaviour as a test rather than recording it as a citable fact.
 | What is under the pointer | What the server sends |
 |---|---|
 | Logon, before any input | either one `FP_UPDATE_NEW_POINTER` (32 bpp, 32×32, hotspot 16,16) or a stream of `FP_UPDATE_PTR_DEFAULT` at ~20 Hz; it varies between runs of the same code |
-| After typing, on the first move | `FP_UPDATE_PTR_NULL` (the pointer hidden while typing) |
-| Notepad's menu bar, the desktop | nothing new: the arrow is `SYSPTR_DEFAULT` |
+| The first move after typing | `FP_UPDATE_PTR_NULL`, just before the shape for the new position (why was not checked) |
+| From the edit area to the desktop | `FP_UPDATE_PTR_DEFAULT`: the arrow is `SYSPTR_DEFAULT` |
+| From Notepad's menu bar to the desktop | nothing: arrow to arrow is no change |
 | Notepad's edit area | `FP_UPDATE_NEW_POINTER` (1 bpp, 32×32, hotspot 8,9): the I-beam |
 | The edit area again, after leaving it | `FP_UPDATE_CACHED_POINTER` index 0 |
 

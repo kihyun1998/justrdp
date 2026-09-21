@@ -344,6 +344,13 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   were the ones that left no screenshot. Measured after: 3/3 green, each with the I-beam as
   `New` then `Cached`. With the target forced back to the centre: red, `[Hidden, Default]` after
   the hover.
+  **The late-launch race is still open in principle and was measured narrow.** `await_desktop`
+  answers "quiet for 2 s", not "Notepad is up". On three warm runs, everything the Enter caused
+  painted in a single burst (0.13–0.26 s after Enter, 314 frames), with the edit area already
+  on screen at its end. The largest gap between frames was 0.09 s, about 22 times below the
+  quiet window. So a launch has to stall mid-paint for over 2 s to slip through, and a cold
+  launch was not measured. If it does slip through, `edit_area_point` finds no edit area and
+  the test fails with that message. It no longer turns green on the logon cursor.
 - ~~**32-bit guards need an i686 run** that no CI job performs.~~ **Closed** —
   `.github/workflows/overflow-32bit.yml` builds `justrdp-codecs` + `justrdp` for
   `i686-pc-windows-msvc`, so the class closed in #151/#155 is now gated rather than
