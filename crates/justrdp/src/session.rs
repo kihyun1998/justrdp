@@ -637,6 +637,13 @@ impl SessionStateMachine {
                 Ok(())
             }
             share::PDU_TYPE_DEMAND_ACTIVE => self.on_demand_active(header, &mut cur, outputs),
+            // 2.2.8.1.1.1.1: a T.128 Flow PDU MUST be ignored (#309). Named rather than left to
+            // the catch-all so both legs say the same thing about it — the connect leg's
+            // catch-all is strict, and needed the arm to survive one.
+            share::PDU_TYPE_FLOW_CONTROL => {
+                tracing::debug!(target: "rdp_flow_control", "T.128 Flow PDU ignored");
+                Ok(())
+            }
             // Anything else mid-session (e.g. a Server Redirect, the broker epic) is
             // unsupported but well-formed at this layer: skipped.
             _ => Ok(()),
@@ -1191,6 +1198,57 @@ mod tests {
             .process_bytes(&server_data_pdu(share::PDU_TYPE2_SHUTDOWN_DENIED, &[]))
             .expect("a bodyless refusal decodes");
         assert_eq!(outputs, vec![SessionOutput::ShutdownDenied]);
+    }
+
+    /// Issue #309, at the level the defect showed up. A Flow Control PDU used to **end the
+    /// session**: the header decoder demanded ten bytes of an eight-byte PDU. 2.2.8.1.1.1.1 says
+    /// it MUST be ignored — so the proof is that the session survives *and the next PDU still
+    /// reaches the host*, not merely that the decode stopped failing.
+    ///
+    /// **All three T.128 flow types, and the reason is the first one.** This test was written
+    /// with only `0x42` and a mutation removing the `0x8000` branch left it green: `0x42 & 0xF`
+    /// is 2, which is no Share PDU type, so the ordinary path skipped it by luck. `0x41` masks
+    /// to 1 — `PDUTYPE_DEMANDACTIVEPDU` — and without the branch the machine runs a
+    /// reactivation over two bytes of flow header. Values are FreeRDP's `PDU_TYPE_FLOW_*`.
+    #[test]
+    fn a_flow_control_pdu_is_ignored_and_the_session_keeps_going() {
+        const FLOW_TEST: u8 = 0x41;
+        const FLOW_RESPONSE: u8 = 0x42;
+        const FLOW_STOP: u8 = 0x43;
+        for flow_type in [FLOW_TEST, FLOW_RESPONSE, FLOW_STOP] {
+            let mut sm = SessionStateMachine::new(config(), Vec::new())
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            // totalLength = 0x8000, pduTypeFlow, pad, flowIdentifier, flowNumber, pduSource
+            let flow = [0x00, 0x80, flow_type, 0x00, 0x01, 0x02, 0xEA, 0x03];
+            let outputs = sm
+                .process_bytes(&server_io_frame(&flow))
+                .unwrap_or_else(|e| panic!("Flow PDU {flow_type:#04x} must be ignored: {e:?}"));
+            assert!(outputs.is_empty(), "{flow_type:#04x}: nothing surfaces");
+            assert_eq!(
+                sm.phase,
+                Phase::Active,
+                "{flow_type:#04x}: and the machine does not move"
+            );
+
+            let outputs = sm
+                .process_bytes(&server_data_pdu(share::PDU_TYPE2_SHUTDOWN_DENIED, &[]))
+                .unwrap_or_else(|e| panic!("{flow_type:#04x}: the session must survive: {e:?}"));
+            assert_eq!(outputs, vec![SessionOutput::ShutdownDenied]);
+        }
+    }
+
+    /// Issue #309. A header-only Deactivate All — six bytes, the spec's whole header, no
+    /// `shareId` — used to end the session. IronRDP records xrdp sending exactly this.
+    #[test]
+    fn a_header_only_deactivate_all_deactivates_instead_of_ending_the_session() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let mut deactivate = 6u16.to_le_bytes().to_vec();
+        deactivate.extend_from_slice(&(share::PDU_TYPE_DEACTIVATE_ALL | 0x0010).to_le_bytes());
+        deactivate.extend_from_slice(&1002u16.to_le_bytes());
+        sm.process_bytes(&server_io_frame(&deactivate))
+            .expect("a six-byte header is not malformed");
+        assert_eq!(sm.phase, Phase::Deactivated);
     }
 
     /// A Save Session Info body carrying a Plain Notify — the shortest well-formed one there

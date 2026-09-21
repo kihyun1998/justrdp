@@ -1116,6 +1116,9 @@ impl ConnectStateMachine {
                 self.stage = Stage::Finalization { selected };
                 Ok(actions)
             }
+            // 2.2.8.1.1.1.1: a T.128 Flow PDU MUST be ignored (#309). Its own arm, ahead of a
+            // catch-all that stays strict for a pduType that is genuinely unknown.
+            share::PDU_TYPE_FLOW_CONTROL => Ok(Vec::new()),
             _ => Err(ConnectError::Decode(
                 justrdp_pdu::DecodeError::InvalidField {
                     field: "ShareControlHeader.pduType",
@@ -1229,6 +1232,8 @@ impl ConnectStateMachine {
             }
             // A fresh Demand Active without an explicit deactivate: re-run the exchange.
             share::PDU_TYPE_DEMAND_ACTIVE => self.capability_step(selected, user_data),
+            // As in capability exchange: ignored per 2.2.8.1.1.1.1 (#309), and only this type.
+            share::PDU_TYPE_FLOW_CONTROL => Ok(Vec::new()),
             _ => Err(ConnectError::Decode(
                 justrdp_pdu::DecodeError::InvalidField {
                     field: "ShareControlHeader.pduType",
@@ -2684,6 +2689,75 @@ mod tests {
         ))));
         assert!(actions.is_empty());
         assert_eq!(sm.stage(), "activation");
+    }
+
+    /// Issue #309 on the connect leg, which the session-leg fix did not reach. Here the
+    /// catch-all is **strict** — an unknown `pduType` during connect is a typed error, and
+    /// deliberately so — so a Flow PDU that the header decoder now reports as
+    /// `PDU_TYPE_FLOW_CONTROL` still failed the connect until it got its own arm.
+    /// 2.2.8.1.1.1.1's "MUST be ignored" does not distinguish legs. All three T.128 flow types,
+    /// for the reason the session-leg test gives: `0x41` masks to `PDUTYPE_DEMANDACTIVEPDU`.
+    #[test]
+    fn a_flow_control_pdu_is_ignored_in_both_connect_stages() {
+        for flow_type in [0x41u8, 0x42, 0x43] {
+            let flow = [0x00, 0x80, flow_type, 0x00, 0x01, 0x02, 0xEA, 0x03];
+
+            // Capability exchange: ignored, and the Demand Active after it still proceeds.
+            let mut sm = capability_waiting();
+            let actions = sm.process(Event::Received(&server_io_frame(&flow)));
+            assert!(
+                actions.is_empty(),
+                "{flow_type:#04x} before Demand Active must be ignored, got {actions:?}"
+            );
+            assert_eq!(sm.stage(), "capability-exchange");
+            let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
+                1920, 1080,
+            ))));
+            assert_eq!(actions, expected_confirm_and_batch(1920, 1080));
+
+            // Finalization: ignored, and the Font Map after it still reaches session-active.
+            let mut sm = finalizing();
+            let actions = sm.process(Event::Received(&server_io_frame(&flow)));
+            assert!(
+                actions.is_empty(),
+                "{flow_type:#04x} during finalization must be ignored, got {actions:?}"
+            );
+            assert_eq!(sm.stage(), "activation");
+            let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
+                share::PDU_TYPE2_FONT_MAP,
+                &[0, 0, 0, 0, 3, 0, 4, 0],
+            ))));
+            assert!(
+                matches!(actions.as_slice(), [Action::SessionActive { .. }]),
+                "{flow_type:#04x}: the Font Map after it must still activate, got {actions:?}"
+            );
+        }
+    }
+
+    /// The side condition that makes the arm above mean anything: the strict catch-all still
+    /// fires for a `pduType` that is genuinely unknown. Adding a Flow Control arm must not have
+    /// been done by loosening the catch-all.
+    #[test]
+    fn an_unknown_share_control_type_still_fails_the_connect() {
+        let mut ud = 10u16.to_le_bytes().to_vec();
+        ud.extend_from_slice(&(0x000Bu16 | 0x0010).to_le_bytes()); // 0xB: no such pduType
+        ud.extend_from_slice(&1002u16.to_le_bytes());
+        ud.extend_from_slice(&SHARE_ID.to_le_bytes());
+        for mut sm in [capability_waiting(), finalizing()] {
+            let actions = sm.process(Event::Received(&server_io_frame(&ud)));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::FailWith(ConnectError::Decode(
+                        justrdp_pdu::DecodeError::InvalidField {
+                            field: "ShareControlHeader.pduType",
+                            ..
+                        }
+                    ))]
+                ),
+                "an unknown pduType must stay fatal on the connect leg, got {actions:?}"
+            );
+        }
     }
 
     /// A Save Session Info body carrying a Plain Notify, plus one carrying a Logon Info V1.
