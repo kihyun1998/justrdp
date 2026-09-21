@@ -5,11 +5,17 @@ the password travels the other way and never reaches a capture. Captured from th
 (`docs/agents/thegraph.md`'s third source; memory `test_environment`), one WS2022 box on one
 advertised configuration — **they prove what this server sends, never what servers send.**
 
-The sibling `connect/` holds bytes from before the Font Map, which
-`justrdp_tokio`'s `JUSTRDP_CONNECT_CAPTURE_FILE` hook can record on its own. This directory
-exists because **that hook stops at `Action::SessionActive`**, so nothing in the repo could
-record a session-leg PDU. These were teed by a throwaway drive loop in the adapter's test
-module during #304 and carved down to the frames that matter.
+The sibling `connect/` holds bytes from before the Font Map, recorded by `justrdp_tokio`'s
+`JUSTRDP_CONNECT_CAPTURE_FILE` hook. This directory exists because **that hook stopped at
+`Action::SessionActive`**, so nothing in the repo could record a session-leg PDU: these bytes
+were teed by a throwaway drive loop written by hand during #304 and carved down to the frames
+that matter.
+
+**#308 closed that, and the capture was reproduced through it.** `JUSTRDP_SESSION_CAPTURE_FILE`
+now records every session read, and a run through it yielded the same two frames at the same
+sizes — plus a third the hand-tee never saw, because the capture is per **process** and the
+harness reconnects to sign out. Use the env var for the next one; this file stays as it was
+carved.
 
 ## `save-session-info.bin`
 

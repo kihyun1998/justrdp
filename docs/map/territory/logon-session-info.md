@@ -148,10 +148,17 @@ server sends, never what servers send.
 
 ## Known holes / open
 
-- **The capture hook still stops at session-active.** `capture_connect_chunk` runs only in the
-  adapter's connect read loop, so this area's fixture had to be teed by hand during #304 rather
-  than produced by the mechanism the repo has for exactly this. Every future session-leg PDU
-  slice meets the same wall.
+- ~~The capture hook stops at session-active.~~ **Closed by #308**, which this area surfaced:
+  `capture_session_chunk` now tees every session read, so a session-leg PDU can become a
+  committable fixture without a hand-written drive loop. This area's fixture was teed by hand
+  first and then **re-captured through the new hook** — same two frames, 625 + 661 bytes, and a
+  third the hand-tee never saw because the capture is per process and spans the harness's own
+  teardown reconnect.
+- **A logon can produce one notification or two, and the difference is per *logon*, not per
+  server state.** The #308 re-capture caught three 0x26 frames in one process: `Extended` +
+  `LogonLong` for the test's own session, then `LogonLong` **alone** for the harness's teardown
+  reconnect to the same `SessionId`. So whatever selects `Extended` is decided at logon time and
+  is still unidentified.
 - **Three of the five decoder arms have no server here — and one of them is unreachable by
   our own configuration, not by the server's choice.** 2.2.10.1.1 ties `INFOTYPE_LOGON_LONG` to
   the `LONG_CREDENTIALS_SUPPORTED` flag, and `capability.rs`'s `GeneralCapabilitySet` sets it,

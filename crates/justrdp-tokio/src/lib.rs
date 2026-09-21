@@ -620,9 +620,22 @@ const CONNECT_CAPTURE_FILE: &str = "JUSTRDP_CONNECT_CAPTURE_FILE";
 ///
 /// Best-effort: every IO error is swallowed, so capture can never perturb a connect.
 fn capture_connect_chunk(bytes: &[u8]) {
-    let Ok(path) = std::env::var(CONNECT_CAPTURE_FILE) else {
+    append_capture(CONNECT_CAPTURE_FILE, bytes);
+}
+
+/// Append `bytes` to whatever file `var` names, or do nothing. Shared by the connect and session
+/// captures so the two cannot drift on the rules that make a capture safe to commit.
+fn append_capture(var: &str, bytes: &[u8]) {
+    let Ok(path) = std::env::var(var) else {
         return;
     };
+    append_to(&path, bytes);
+}
+
+/// The half of [`append_capture`] that does not read the environment, so it can be tested
+/// without `set_var` — which is `unsafe` under edition 2024 and racy against every other test
+/// thread reading a variable.
+fn append_to(path: &str, bytes: &[u8]) {
     if path.is_empty() {
         return;
     }
@@ -630,10 +643,53 @@ fn capture_connect_chunk(bytes: &[u8]) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         let _ = f.write_all(bytes);
     }
+}
+
+/// The env var that arms [`capture_session_chunk`]. Deliberately **not** the one the connect
+/// capture uses: `tests/fixtures/connect/` and `tests/fixtures/session/` are separate corpora and
+/// the connect replay walks its file assuming it holds connect bytes only.
+const SESSION_CAPTURE_FILE: &str = "JUSTRDP_SESSION_CAPTURE_FILE";
+
+/// Append one server-to-client chunk read **after** session-active to the capture file.
+///
+/// The session-leg sibling of [`capture_connect_chunk`], and it exists because that one stops at
+/// `Action::SessionActive` (issue #308). Until this, nothing the server sent after the Font Map
+/// could become a committable fixture — `crates/justrdp-pdu/tests/fixtures/` held a `connect/`
+/// directory and nothing else, and #304's Save Session Info capture had to be teed by a
+/// throwaway drive loop written by hand.
+///
+/// **Where the stream starts.** The first bytes here are the first *socket read* after
+/// session-active, not the first bytes the session machine sees:
+/// [`ActivationResult::leftover`] was read by the connect loop, is captured in **that** file,
+/// and is handed to [`SessionStateMachine::new`] rather than re-read. So a TPKT frame straddling
+/// the Font Map has its head in the connect capture and its tail here. A replay walker notices —
+/// `tpkt::frame_len` fails on the partial head — rather than decoding something wrong.
+///
+/// Server-to-client only, best-effort, and every IO error is swallowed, for the same three
+/// reasons the connect capture gives.
+fn capture_session_chunk(bytes: &[u8]) {
+    append_capture(SESSION_CAPTURE_FILE, bytes);
+}
+
+/// Feed one socket read to the session machine, capturing it on the way past.
+///
+/// **The funnel is the point.** #308's definition of done names "a third read site added later
+/// without the call" as the failure to design against, so the capture is not a line to remember
+/// at each site — it is on the only path that reaches
+/// [`SessionStateMachine::process_bytes`] from the socket. Forgetting it now requires bypassing
+/// this function rather than omitting a statement.
+fn feed_session(
+    machine: &mut SessionStateMachine,
+    bytes: &[u8],
+) -> Result<Vec<SessionOutput>, SessionFailure> {
+    capture_session_chunk(bytes);
+    machine
+        .process_bytes(bytes)
+        .map_err(SessionFailure::Protocol)
 }
 
 /// Notify `on_stage` only when the machine's stage actually changed, so each connect stage is
@@ -770,9 +826,7 @@ pub async fn run_session_with_input(
                     // Orderly server close: surface whatever the server attributed.
                     Ok(0) => return Ok(machine.disconnect_reason()),
                     Ok(n) => {
-                        pending = machine
-                            .process_bytes(&readbuf[..n])
-                            .map_err(SessionFailure::Protocol)?;
+                        pending = feed_session(machine, &readbuf[..n])?;
                     }
                     // A broken read (reset, missing close_notify, dead network) ends the
                     // session the same way — with the recorded attribution if the server
@@ -902,9 +956,7 @@ pub async fn run_session_with_commands(
                 match received {
                     Ok(0) => return Ok(machine.disconnect_reason()), // orderly server close
                     Ok(n) => {
-                        pending = machine
-                            .process_bytes(&readbuf[..n])
-                            .map_err(SessionFailure::Protocol)?;
+                        pending = feed_session(machine, &readbuf[..n])?;
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "session read failed; classifying the disconnect");
@@ -1367,6 +1419,51 @@ mod tests {
         assert!(logs_contain("nla-credssp"), "nla-credssp stage not logged");
         // ...and byte counts are logged for the plaintext bytes written and read.
         assert!(logs_contain("bytes="), "byte counts not logged");
+    }
+
+    /// A capture appends rather than truncates, because one session is many socket reads and a
+    /// truncating writer would leave the last chunk alone — which still looks like a file. Both
+    /// captures route through here, so both get the rule.
+    ///
+    /// **Two things this cannot see, measured rather than assumed.**
+    ///
+    /// The empty-path half holds with the `is_empty` guard *removed* — `OpenOptions::open("")`
+    /// errors and the error is swallowed, so the two behaviours never differ at this call site.
+    /// The assertion pins the behaviour callers depend on and says nothing about the guard,
+    /// which is explicitness rather than mechanism. Deleting it would rest the rule on an OS
+    /// error staying an error.
+    ///
+    /// And it does not reach [`feed_session`], so **nothing offline proves the session read path
+    /// captures at all**: removing `capture_session_chunk` from that funnel leaves this green.
+    /// The evidence is the real-VM run that produced
+    /// `crates/justrdp-pdu/tests/fixtures/session/`, which is `#[ignore]`d — and the funnel
+    /// itself, which exists so the call cannot be omitted by a new read site (#308).
+    #[test]
+    fn a_capture_appends_and_an_empty_path_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("justrdp-capture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("capture.bin");
+        let _ = std::fs::remove_file(&path);
+        let name = path.to_str().expect("utf-8 path");
+
+        append_to(name, &[1, 2, 3]);
+        append_to(name, &[4, 5]);
+        assert_eq!(
+            std::fs::read(&path).expect("the capture exists"),
+            vec![1, 2, 3, 4, 5],
+            "the second chunk must follow the first, not replace it"
+        );
+
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        append_to("", &[9, 9, 9]);
+        let after = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(before, after, "an empty path must create nothing");
+        assert_eq!(
+            std::fs::read(&path).expect("the capture exists"),
+            vec![1, 2, 3, 4, 5],
+            "and must not touch an existing capture either"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
