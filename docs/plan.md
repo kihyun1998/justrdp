@@ -1007,7 +1007,7 @@ Good! I found KDC proxy support. Now let me compile comprehensive information ab
 - [x] **M — FailedUpdatePassword (0x0000_0001).** Password expired; update required. UI must prompt password-change flow.
 - [x] **M — FailedOther (0x0000_0002).** Generic auth failure (account disabled, locked, etc.). Surface error + no auto-retry.
 - [x] **M — Warning (0x0000_0003).** Non-fatal warning (e.g., password expiring soon, cap-lock on). Surface but allow continue.
-- [ ] **O — SessionId.** If error-type is session-busy / bump / reconnect, carries the conflicting session ID (u32); admin tools use it for conflict resolution.
+- [ ] **O — SessionId.** For **all seven** `LOGON_MSG_*` error types (not only session-busy / bump / reconnect, as this line said until #304 read 2.2.10.1.1.4.1.1), carries the session ID (u32); for `ERROR_CODE_ACCESS_DENIED` it SHOULD be ignored; for an NTSTATUS type it is a `LOGON_FAILED_*` code. Decoded side done in #304 (`LogonErrorNotification::data_is_session_id`); what admin tooling does with it is host policy, so the box stays open.
 
 ### 9c. Server Error Info PDU (MS-RDPBCGR 2.2.2.5 Set Error Info)  
 *(Typed disconnect reason sent during session lifecycle; different channel from logon-errors.)*
