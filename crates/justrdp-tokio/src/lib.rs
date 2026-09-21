@@ -620,9 +620,22 @@ const CONNECT_CAPTURE_FILE: &str = "JUSTRDP_CONNECT_CAPTURE_FILE";
 ///
 /// Best-effort: every IO error is swallowed, so capture can never perturb a connect.
 fn capture_connect_chunk(bytes: &[u8]) {
-    let Ok(path) = std::env::var(CONNECT_CAPTURE_FILE) else {
+    append_capture(CONNECT_CAPTURE_FILE, bytes);
+}
+
+/// Append `bytes` to whatever file `var` names, or do nothing. Shared by the connect and session
+/// captures so the two cannot drift on the rules that make a capture safe to commit.
+fn append_capture(var: &str, bytes: &[u8]) {
+    let Ok(path) = std::env::var(var) else {
         return;
     };
+    append_to(&path, bytes);
+}
+
+/// The half of [`append_capture`] that does not read the environment, so it can be tested
+/// without `set_var` — which is `unsafe` under edition 2024 and racy against every other test
+/// thread reading a variable.
+fn append_to(path: &str, bytes: &[u8]) {
     if path.is_empty() {
         return;
     }
@@ -630,10 +643,53 @@ fn capture_connect_chunk(bytes: &[u8]) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         let _ = f.write_all(bytes);
     }
+}
+
+/// The env var that arms [`capture_session_chunk`]. Deliberately **not** the one the connect
+/// capture uses: `tests/fixtures/connect/` and `tests/fixtures/session/` are separate corpora and
+/// the connect replay walks its file assuming it holds connect bytes only.
+const SESSION_CAPTURE_FILE: &str = "JUSTRDP_SESSION_CAPTURE_FILE";
+
+/// Append one server-to-client chunk read **after** session-active to the capture file.
+///
+/// The session-leg sibling of [`capture_connect_chunk`], and it exists because that one stops at
+/// `Action::SessionActive` (issue #308). Until this, nothing the server sent after the Font Map
+/// could become a committable fixture — `crates/justrdp-pdu/tests/fixtures/` held a `connect/`
+/// directory and nothing else, and #304's Save Session Info capture had to be teed by a
+/// throwaway drive loop written by hand.
+///
+/// **Where the stream starts.** The first bytes here are the first *socket read* after
+/// session-active, not the first bytes the session machine sees:
+/// [`ActivationResult::leftover`] was read by the connect loop, is captured in **that** file,
+/// and is handed to [`SessionStateMachine::new`] rather than re-read. So a TPKT frame straddling
+/// the Font Map has its head in the connect capture and its tail here. A replay walker notices —
+/// `tpkt::frame_len` fails on the partial head — rather than decoding something wrong.
+///
+/// Server-to-client only, best-effort, and every IO error is swallowed, for the same three
+/// reasons the connect capture gives.
+fn capture_session_chunk(bytes: &[u8]) {
+    append_capture(SESSION_CAPTURE_FILE, bytes);
+}
+
+/// Feed one socket read to the session machine, capturing it on the way past.
+///
+/// **The funnel is the point.** #308's definition of done names "a third read site added later
+/// without the call" as the failure to design against, so the capture is not a line to remember
+/// at each site — it is on the only path that reaches
+/// [`SessionStateMachine::process_bytes`] from the socket. Forgetting it now requires bypassing
+/// this function rather than omitting a statement.
+fn feed_session(
+    machine: &mut SessionStateMachine,
+    bytes: &[u8],
+) -> Result<Vec<SessionOutput>, SessionFailure> {
+    capture_session_chunk(bytes);
+    machine
+        .process_bytes(bytes)
+        .map_err(SessionFailure::Protocol)
 }
 
 /// Notify `on_stage` only when the machine's stage actually changed, so each connect stage is
@@ -756,6 +812,12 @@ pub async fn run_session_with_input(
                     // run_session_with_commands, which surfaces the event.
                     tracing::debug!(target: "rdp_displaycontrol_caps", "display control ready");
                 }
+                SessionOutput::SaveSessionInfo(_) => {
+                    // Same shape as the two above: no event sink here, and the core already
+                    // emitted the `rdp_save_session_info` record, so re-logging it would only
+                    // say it twice. A host that wants the session ID or the reconnect cookie
+                    // uses run_session_with_commands.
+                }
             }
         }
         tokio::select! {
@@ -764,9 +826,7 @@ pub async fn run_session_with_input(
                     // Orderly server close: surface whatever the server attributed.
                     Ok(0) => return Ok(machine.disconnect_reason()),
                     Ok(n) => {
-                        pending = machine
-                            .process_bytes(&readbuf[..n])
-                            .map_err(SessionFailure::Protocol)?;
+                        pending = feed_session(machine, &readbuf[..n])?;
                     }
                     // A broken read (reset, missing close_notify, dead network) ends the
                     // session the same way — with the recorded attribution if the server
@@ -823,13 +883,24 @@ pub enum SessionCommand {
 }
 
 /// A session milestone surfaced to the host by [`run_session_with_commands`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy` since #304: [`Self::SaveSessionInfo`] carries the logon's domain and user name,
+/// which are owned `String`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     /// The Display Control dynamic channel is open and the server's caps arrived:
     /// [`SessionCommand::Resize`] is valid from now on.
     DisplayControlReady,
     /// The server refused a [`SessionCommand::Shutdown`]. The session is unaffected.
     ShutdownDenied,
+    /// The server said who logged on, into which session, and — in the extended variant — the
+    /// cookie that would resume it (`[MS-RDPBCGR]` 2.2.10.1, issue #304).
+    ///
+    /// Storing the cookie is the host's, by definition: 3.2.5.10.1 says the client SHOULD save
+    /// it, and where is policy (CLAUDE.md). It is a live credential — treat it the way the
+    /// password is treated, and note that
+    /// [`SaveSessionInfo`](justrdp_pdu::session_info::SaveSessionInfo)'s `Debug` redacts it.
+    SaveSessionInfo(justrdp_pdu::session_info::SaveSessionInfo),
 }
 
 /// [`run_session_with_input`] generalized to host *commands* (input + resize) and
@@ -838,7 +909,8 @@ pub enum SessionEvent {
 /// never deadlock on the session (issue #8's cancel-safety criterion). Dropping the returned
 /// future remains equally safe — the machine is pure and the socket is caller-owned.
 ///
-/// `on_event` receives session milestones (currently [`SessionEvent::DisplayControlReady`]);
+/// `on_event` receives session milestones ([`SessionEvent::DisplayControlReady`],
+/// [`SessionEvent::ShutdownDenied`], [`SessionEvent::SaveSessionInfo`]);
 /// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
 pub async fn run_session_with_commands(
     stream: &mut TlsStream<TcpStream>,
@@ -870,6 +942,9 @@ pub async fn run_session_with_commands(
                     tracing::debug!(target: "rdp_shutdown_denied", "shutdown request denied");
                     on_event(SessionEvent::ShutdownDenied);
                 }
+                SessionOutput::SaveSessionInfo(info) => {
+                    on_event(SessionEvent::SaveSessionInfo(info));
+                }
             }
         }
         tokio::select! {
@@ -881,9 +956,7 @@ pub async fn run_session_with_commands(
                 match received {
                     Ok(0) => return Ok(machine.disconnect_reason()), // orderly server close
                     Ok(n) => {
-                        pending = machine
-                            .process_bytes(&readbuf[..n])
-                            .map_err(SessionFailure::Protocol)?;
+                        pending = feed_session(machine, &readbuf[..n])?;
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "session read failed; classifying the disconnect");
@@ -1346,6 +1419,51 @@ mod tests {
         assert!(logs_contain("nla-credssp"), "nla-credssp stage not logged");
         // ...and byte counts are logged for the plaintext bytes written and read.
         assert!(logs_contain("bytes="), "byte counts not logged");
+    }
+
+    /// A capture appends rather than truncates, because one session is many socket reads and a
+    /// truncating writer would leave the last chunk alone — which still looks like a file. Both
+    /// captures route through here, so both get the rule.
+    ///
+    /// **Two things this cannot see, measured rather than assumed.**
+    ///
+    /// The empty-path half holds with the `is_empty` guard *removed* — `OpenOptions::open("")`
+    /// errors and the error is swallowed, so the two behaviours never differ at this call site.
+    /// The assertion pins the behaviour callers depend on and says nothing about the guard,
+    /// which is explicitness rather than mechanism. Deleting it would rest the rule on an OS
+    /// error staying an error.
+    ///
+    /// And it does not reach [`feed_session`], so **nothing offline proves the session read path
+    /// captures at all**: removing `capture_session_chunk` from that funnel leaves this green.
+    /// The evidence is the real-VM run that produced
+    /// `crates/justrdp-pdu/tests/fixtures/session/`, which is `#[ignore]`d — and the funnel
+    /// itself, which exists so the call cannot be omitted by a new read site (#308).
+    #[test]
+    fn a_capture_appends_and_an_empty_path_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("justrdp-capture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("capture.bin");
+        let _ = std::fs::remove_file(&path);
+        let name = path.to_str().expect("utf-8 path");
+
+        append_to(name, &[1, 2, 3]);
+        append_to(name, &[4, 5]);
+        assert_eq!(
+            std::fs::read(&path).expect("the capture exists"),
+            vec![1, 2, 3, 4, 5],
+            "the second chunk must follow the first, not replace it"
+        );
+
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        append_to("", &[9, 9, 9]);
+        let after = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(before, after, "an empty path must create nothing");
+        assert_eq!(
+            std::fs::read(&path).expect("the capture exists"),
+            vec![1, 2, 3, 4, 5],
+            "and must not touch an existing capture either"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2133,6 +2251,161 @@ mod tests {
                 "milestones observed: rdp_demand_active → rdp_finalization(synchronize, \
                  control, font-map) → rdp_session_active"
             );
+        })
+        .await
+    }
+
+    /// Issue #304's DoD ④: the logon notification actually reaches a host, against the real
+    /// server rather than against bytes this repo wrote.
+    ///
+    /// **Which leg was the open question, and it is now measured.** The connect leg sees
+    /// **none** and the session leg sees **two** — an `INFOTYPE_LOGON_EXTENDED_INFO` followed by
+    /// an `INFOTYPE_LOGON_LONG` — so `ActivationResult::save_session_info` is empty on this VM
+    /// and `SessionOutput::SaveSessionInfo` carries everything. Both legs are built because the
+    /// PDU is not bound to either by the spec; only one of them fires here, and a capture from
+    /// one WS2022 box on one advertised configuration proves what *this* server does
+    /// (`docs/map/invariant/capture-coverage-follows-what-we-advertise.md`).
+    ///
+    /// **This is also why `crates/justrdp-pdu/tests/fixtures/session/` exists.**
+    /// `capture_connect_chunk` runs only in the connect read loop and stops at
+    /// `Action::SessionActive`, so the repo's committable-capture mechanism structurally cannot
+    /// see this PDU. The fixture beside that README was teed by hand during #304 and the offline
+    /// assertions live in `justrdp-pdu/tests/real_server_session.rs`; this test is the live half,
+    /// and what it adds is that the bytes reach a **host sink** rather than merely decoding.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn save_session_info_reaches_the_host_against_real_vm() {
+        use justrdp_pdu::session_info::SaveSessionInfo;
+
+        with_vm_session(|vm| async move {
+            let config = test_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+
+            let connect_leg = outcome.activation.save_session_info.clone();
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+            let (_tx, mut commands) = tokio::sync::mpsc::channel(4);
+            let cancel = CancellationToken::new();
+            let canceller = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                canceller.cancel();
+            });
+
+            let mut session_leg: Vec<SaveSessionInfo> = Vec::new();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(40),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {},
+                    |_| {},
+                    |event| {
+                        if let SessionEvent::SaveSessionInfo(info) = event {
+                            session_leg.push(info);
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+
+            eprintln!(
+                "#304: connect leg {} PDU(s), session leg {} PDU(s)",
+                connect_leg.len(),
+                session_leg.len()
+            );
+            for info in connect_leg.iter().chain(session_leg.iter()) {
+                eprintln!("  {info:?}");
+            }
+
+            // The host's view is both legs together: the PDU is not bound to either, so a test
+            // that asserted only one would encode this VM's timing as the contract.
+            let all: Vec<&SaveSessionInfo> = connect_leg.iter().chain(session_leg.iter()).collect();
+
+            // **The count is not fixed, and asserting one was this test's own defect.** Five
+            // logons: four produced `LogonLong` + `Extended`, one produced `LogonLong` alone.
+            // The first three agreed, which is exactly how a transient becomes a contract — so
+            // what is asserted now is the *shape* of what arrives, not how much of it. The
+            // condition that decides whether `Extended` comes is not established; the run that
+            // lacked it was the first logon after the VM's account was reset.
+            //
+            // The `Vec` handover is *reinforced* by this, not weakened: one logon has been seen
+            // to produce both one notification and two, so no fixed-arity carrier is right.
+            assert!(
+                !all.is_empty(),
+                "a logon produced no notification at all, on either leg"
+            );
+            for info in &all {
+                assert!(
+                    matches!(
+                        info,
+                        SaveSessionInfo::LogonLong(_) | SaveSessionInfo::Extended(_)
+                    ),
+                    "this server has only ever sent LogonLong and Extended; {info:?} is news \
+                     and the fixture README needs it"
+                );
+            }
+
+            // Exactly one names the account, always.
+            let logons: Vec<_> = all
+                .iter()
+                .filter_map(|i| match i {
+                    SaveSessionInfo::Logon(l) | SaveSessionInfo::LogonLong(l) => Some(l.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                logons.len(),
+                1,
+                "one logon names the account once, got {logons:?}"
+            );
+            let logon = &logons[0];
+            assert_eq!(
+                logon.user,
+                std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
+                "the server names the account this test logged on with"
+            );
+            assert_ne!(logon.session_id, 0, "the server assigns a session");
+
+            // `Extended` is optional *and the optionality is reported*, which is the difference
+            // between a conditional assertion and a vacuous one: a run that skipped these says
+            // so in its output rather than passing in silence.
+            match all.iter().find_map(|i| match i {
+                SaveSessionInfo::Extended(e) => Some(e),
+                _ => None,
+            }) {
+                None => eprintln!(
+                    "#304: no Logon Info Extended this run — the cookie and session-ID \
+                     assertions did not execute"
+                ),
+                Some(ext) => {
+                    assert!(
+                        ext.auto_reconnect.is_none(),
+                        "this VM has never sent a cookie; if that changed, #306 just acquired a \
+                         proof path and the fixture README needs correcting"
+                    );
+                    let err = ext
+                        .logon_error
+                        .expect("LOGON_EX_LOGONERRORS is the only field this server sets");
+                    // `errorNotificationData` is the session ID for this notification type, not
+                    // an error code — which is why `LogonErrorsInfo` carries a raw `u32` rather
+                    // than IronRDP's enum, whose `0..=3` mapping reads it as a bogus code.
+                    // Four pairs so far: 2/2, 3/3, 6/6, 4/4.
+                    assert_eq!(
+                        err.notification_data, logon.session_id,
+                        "the notification data tracks the session, so it is an ID not a code"
+                    );
+                    eprintln!(
+                        "#304: Extended present; data {} == session id",
+                        err.notification_data
+                    );
+                }
+            }
         })
         .await
     }
@@ -3802,8 +4075,17 @@ mod tests {
         .await
     }
 
+    /// The env var that lets [`capture_connect_response_against_real_vm`] write the committed
+    /// connect fixtures. Unset, the test only compares against them (#311).
+    const WRITE_CONNECT_FIXTURES: &str = "JUSTRDP_WRITE_CONNECT_FIXTURES";
+
     /// Capture the MCS Connect-Response a real server sends, and commit it as the fixture that
     /// seeds the `gcc` and `mcs` fuzz targets (#203).
+    ///
+    /// **It writes only when asked** — `JUSTRDP_WRITE_CONNECT_FIXTURES=1`. Without that it
+    /// captures, asserts, and compares the bytes against the committed fixtures, failing if they
+    /// differ (#311). Running the VM suite is verification, and verification does not edit
+    /// `crates/`.
     ///
     /// The fixture seeds those targets, asserts real-server acceptance in the stable gate, and is
     /// the repo's only offline connect-sequence bytes. It is **not** a rescue from a coverage
@@ -3913,17 +4195,44 @@ mod tests {
                 .join("tests")
                 .join("fixtures")
                 .join("connect");
-            std::fs::create_dir_all(&fixture).expect("create the fixture dir");
-            std::fs::write(fixture.join("connect-response.bin"), &body)
-                .expect("write the MCS fixture");
-            std::fs::write(fixture.join("conference-create-response.bin"), user_data)
-                .expect("write the GCC fixture");
+            let files = [
+                ("connect-response.bin", body.as_slice()),
+                ("conference-create-response.bin", user_data),
+            ];
+
+            // Verifying never writes (#311). This used to write both files on every run, so the
+            // documented `--ignored` suite regenerated committed fixtures as a side effect — and
+            // a changed server would have rewritten them silently. Regeneration is now an
+            // explicit act; the default run compares instead, so divergence fails rather than
+            // being absorbed.
+            let write = std::env::var(WRITE_CONNECT_FIXTURES).is_ok_and(|v| !v.is_empty());
+            if write {
+                std::fs::create_dir_all(&fixture).expect("create the fixture dir");
+                for (name, bytes) in files {
+                    std::fs::write(fixture.join(name), bytes).expect("write the fixture");
+                }
+            } else {
+                for (name, bytes) in files {
+                    let committed = std::fs::read(fixture.join(name))
+                        .unwrap_or_else(|e| panic!("read the committed {name}: {e}"));
+                    assert!(
+                        committed == bytes,
+                        "{name}: this server sent {} bytes that differ from the committed {} — \
+                         the fixture is stale for this server. Regenerate deliberately with \
+                         {WRITE_CONNECT_FIXTURES}=1 and review the diff before committing it",
+                        bytes.len(),
+                        committed.len()
+                    );
+                }
+            }
             eprintln!(
-                "walked {} frames; wrote a {}-byte Connect-Response and its {}-byte GCC user data (at offset {}) to {}",
+                "walked {} frames; {} a {}-byte Connect-Response and its {}-byte GCC user data (at offset {}) {} {}",
                 frames,
+                if write { "wrote" } else { "matched" },
                 body.len(),
                 user_data.len(),
                 gcc_offset,
+                if write { "to" } else { "against" },
                 fixture.display()
             );
         })
@@ -4980,7 +5289,16 @@ mod tests {
 
             let ready_in_event = ready_seen.clone();
             let on_event = move |event: SessionEvent| {
-                assert_eq!(event, SessionEvent::DisplayControlReady);
+                // Strict about everything but the logon notification. This was an `assert_eq!`
+                // against `DisplayControlReady` alone until #304 added `SaveSessionInfo`, which
+                // every logon sends one or two of — the first real-VM run after #304 panicked
+                // here on it. The strictness is kept rather than dropped: an event this flow
+                // has no reason to produce is still a failure.
+                match event {
+                    SessionEvent::DisplayControlReady => {}
+                    SessionEvent::SaveSessionInfo(_) => return,
+                    other => panic!("unexpected session event during resize: {other:?}"),
+                }
                 eprintln!(
                     "milestone: DisplayControlReady (drdynvc caps + create + EDISP caps done)"
                 );

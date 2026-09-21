@@ -336,6 +336,8 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
 - No captured-stream replay harness exists for the connect sequence: a VM run is the
   only end-to-end proof, and it is not reproducible offline. **Narrowed by #252**, which
   captured the finalization leg via `JUSTRDP_CONNECT_CAPTURE_FILE` and walks it offline
+  (its session-leg sibling is `JUSTRDP_SESSION_CAPTURE_FILE`, added by #308 — see
+  [logon-session-info](logon-session-info.md))
   through `tpkt` → `x224` → `mcs` → `share` → `finalization`. That is a PDU-level replay,
   not a state-machine one — the machine still never sees the bytes.
 - **The most expensive thing this harness has ever done is run green for six hours** (#262).

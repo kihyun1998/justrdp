@@ -59,6 +59,12 @@ wrote, unapplied.
 - [Licensing](../territory/licensing.md) — `LicensePreamble.flags` (low nibble is the protocol
   version) and `msg_size` (preamble + body length, an untrusted length never checked against
   the actual body) have no readers anywhere, tests included.
+- [Logon & Save Session Info](../territory/logon-session-info.md) — the first site to take
+  **way #2 deliberately and in advance**, on three declared lengths at once: Logon Info V2's
+  `Size`, Logon Info Extended's `Length`, and `TS_LOGON_INFO_FIELD`'s `cbFieldData` are each
+  read, recorded in the decoder's doc, and not enforced — because the references disagree
+  about two of them and neither frames from any. `ServerAutoReconnect::version` is the
+  fourth, whose reader is #306 by the maintainer's call rather than by inference.
 
 ## What a violation looks like
 

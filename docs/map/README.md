@@ -57,11 +57,15 @@ a recurrence test.
 - **Only `.md` files in this repo are nodes.** Issues, epics and source files are
   *text inside* notes, never nodes — so the graph cannot show you the hottest things
   in this repo (epics #10–#29, #45, #158) as first-class objects.
-- **There is no verified external-fact store.** `## Reference behaviour` is
-  `**None.**` in **every** territory: no FreeRDP/IronRDP behaviour is recorded
-  anywhere with a pinned `file:line`, although ADR-0003's byte-exactness ranking and
-  ADR-0009's receive-path posture both depend on exactly that comparison. This is the map's single largest finding, and it is a
-  measurement, not an opinion.
+- **The verified external-fact store covers 2 territories of 19.** `## Reference
+  behaviour` reads `**None.**` in the other **17** — derived by the `rg` command under
+  *Conventions*, not counted by hand. ADR-0003's byte-exactness ranking and ADR-0009's
+  receive-path posture both depend on exactly that comparison, so this remains the map's
+  single largest finding; it is now a shrinking one rather than a total one.
+  [capability-exchange-activation](territory/capability-exchange-activation.md) was opened by
+  #252 and [logon-session-info](territory/logon-session-info.md) was born with its fixture in
+  #304. **This bullet said "every territory" until #304**, having been true when written and
+  false since #252 — the sentence outlived the measurement it reported.
 - **The map does not track what is not built.** `## Known holes / open` names the
   gaps per territory; the **live roster of unbuilt work is the tracker** — the
   `epic`-labelled issues (decided 2026-08-10, when the two homes were found to
@@ -115,6 +119,7 @@ Territories: [x224-negotiation](territory/x224-negotiation.md) ·
 [capability-exchange-activation](territory/capability-exchange-activation.md) ·
 [licensing](territory/licensing.md) ·
 [session-loop-dispatch](territory/session-loop-dispatch.md) ·
+[logon-session-info](territory/logon-session-info.md) ·
 [framebuffer-frame-delivery](territory/framebuffer-frame-delivery.md) ·
 [egfx-graphics-pipeline](territory/egfx-graphics-pipeline.md) ·
 [bitmap-codecs](territory/bitmap-codecs.md) ·
@@ -167,9 +172,9 @@ ls docs/map/territory/ docs/map/invariant/                                     #
 
 ## Coverage
 
-**Complete for what is built**, as of 2026-08-10: 18 territories covering the
-connect sequence, the session loop, the graphics path, input, channels, the wire
-layer, the adapter, verification and the supply chain. Unbuilt protocol areas
+**Complete for what is built**, as of 2026-09-21: 19 territories covering the
+connect sequence, the session loop, the logon notifications, the graphics path, input,
+channels, the wire layer, the adapter, verification and the supply chain. Unbuilt protocol areas
 (clipboard, audio, redirection, drawing orders, RD Gateway, H.264, multi-monitor…)
 have **no territory** — they live as `epic` issues in the tracker (the roster), with
 `docs/plan.md` §22–§23 as the audit snapshot behind them, and a territory appears when

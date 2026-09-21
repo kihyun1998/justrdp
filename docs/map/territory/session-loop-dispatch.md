@@ -6,7 +6,8 @@ The state machine that runs once the connection is active: bytes arrive, get fra
 (fast-path or slow-path share PDUs), and are dispatched to whatever handles them —
 bitmap updates, palette, pointer, dynamic-channel traffic, error info, server
 disconnect. Its outputs are what the host actually consumes: frame updates, cursor
-events, bytes to write, and the signal that resize became possible.
+events, bytes to write, the signal that resize became possible, a refused shutdown, and
+who logged on.
 
 ## Governing decisions
 
@@ -15,13 +16,14 @@ events, bytes to write, and the signal that resize became possible.
 Adjacent but not governing: [ADR-0001](../../adr/0001-sans-io-state-machine-core.md)
 makes it sans-IO (bytes in → outputs out);
 [ADR-0010](../../adr/0010-frameupdate-dirty-rect-contract.md) decides the shape of
-one of its four outputs. Neither says what the loop dispatches or in what order.
+one of its outputs. Neither says what the loop dispatches or in what order.
 
 ## Design model
 
-- **Five outputs, and the host's whole view of a live session is these**:
+- **Six outputs, and the host's whole view of a live session is these**:
   `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `DisplayControlReady` ·
-  `ShutdownDenied`. Anything the host cannot learn from one of these, it cannot learn at all
+  `ShutdownDenied` · `SaveSessionInfo`. Anything the host cannot learn from one of these,
+  it cannot learn at all
   — which is the argument #228 turned on: a `pduType2` that falls into the catch-all
   (**skipped, cursor unread** — the arm never decoded anything, whatever its comment said
   until #252) is not "handled quietly", it is **unlearnable**, and a host asking for a
@@ -45,7 +47,9 @@ one of its four outputs. Neither says what the loop dispatches or in what order.
 - `justrdp-pdu/src/share.rs`, `justrdp-pdu/src/update.rs` — `ShareDataHeader`,
   `BitmapUpdate`, `BitmapData`, `PaletteUpdate`
 - `justrdp-pdu/src/errinfo.rs` — `ErrorInfo`, `decode_set_error_info`
-- `justrdp-pdu/src/share.rs` — `PDU_TYPE2_SHUTDOWN_REQUEST`, `PDU_TYPE2_SHUTDOWN_DENIED`
+- `justrdp-pdu/src/share.rs` — `PDU_TYPE2_SHUTDOWN_REQUEST`, `PDU_TYPE2_SHUTDOWN_DENIED`,
+  `PDU_TYPE2_SAVE_SESSION_INFO`
+- `justrdp-pdu/src/session_info.rs` — `SaveSessionInfo`
 
 ## Reference behaviour
 
@@ -77,6 +81,8 @@ one of its four outputs. Neither says what the loop dispatches or in what order.
   **before** its first socket read.
 - [Adapter drive loop](adapter-drive-loop.md) — owns the select loop, cancellation
   and the ordering between input writes and output drains.
+- [Logon & Save Session Info](logon-session-info.md) — the sixth output, and the only
+  `pduType2` this loop dispatches that the connect leg dispatches too.
 
 ## Known holes / open
 

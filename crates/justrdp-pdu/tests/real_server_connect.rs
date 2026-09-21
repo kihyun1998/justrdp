@@ -1,8 +1,10 @@
 //! What a real server actually sent, asserted against the shipped parsers (#203).
 //!
-//! The fixtures are captured by `justrdp-tokio`'s `capture_connect_response_against_real_vm`
-//! and are the seed corpus for the `gcc` and `mcs` fuzz targets. They are read here as well,
-//! and not only by the nightly lane, for two reasons:
+//! Two of the three fixtures are captured by `justrdp-tokio`'s
+//! `capture_connect_response_against_real_vm` and are the seed corpus for the `gcc` and `mcs`
+//! fuzz targets; the third, `finalization-replies.bin`, has no generator (#252 carved it by
+//! hand). `fixtures/connect/README.md` says which is which and how each is regenerated. They are
+//! read here as well, and not only by the nightly lane, for two reasons:
 //!
 //! - **A fixture only the fuzz lane reads is a fixture nothing checks.** The lane is nightly and
 //!   its seeder would report a stale file as a corpus that merely decodes badly, which is

@@ -13,7 +13,7 @@
 //!
 //! Wire-format reference: ironrdp-pdu `rdp/client_info.rs` (the differential oracle).
 
-use crate::cursor::ReadCursor;
+use crate::cursor::{ReadCursor, utf16_string};
 use crate::error::DecodeError;
 
 /// `TS_SECURITY_HEADER` flag: the payload is a Client Info PDU (`SEC_INFO_PKT`).
@@ -236,14 +236,6 @@ fn put_utf16_padded(out: &mut Vec<u8>, s: &str, total: usize) {
 fn read_utf16_padded(cur: &mut ReadCursor<'_>, total: usize) -> Result<String, DecodeError> {
     let bytes = cur.read_slice(total)?;
     Ok(utf16_string(bytes))
-}
-
-/// Decode UTF-16LE bytes up to the first null unit.
-fn utf16_string(bytes: &[u8]) -> String {
-    let (pairs, _odd_trailing_byte) = bytes.as_chunks::<2>();
-    let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
-    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-    String::from_utf16_lossy(&units[..end])
 }
 
 impl ClientInfo {

@@ -42,6 +42,9 @@ property of the whole untrusted surface.
 - [MCS / GCC channel setup](../territory/mcs-gcc-channel-setup.md) — the BER and PER length
   determinants. Edge added by #237; the code has carried both artifacts since #203.
 - [X.224 negotiation](../territory/x224-negotiation.md) — the connect-sequence entry point.
+- [Logon & Save Session Info](../territory/logon-session-info.md) — three fixed pads (576,
+  570, 558) and four server-declared lengths in one PDU, dispatched on both legs. Added by
+  #304, with the area's first artifact.
   Edge added by #237; the code has carried both artifacts since #200.
 - [Verification harness](../territory/verification-harness.md) — the only territory
   that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz nightly.

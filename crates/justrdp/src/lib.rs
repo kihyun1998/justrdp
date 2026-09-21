@@ -31,6 +31,12 @@ pub use egfx::{EgfxCacheMode, EgfxConfig, EgfxConfigError};
 pub use framebuffer::{FrameUpdate, Framebuffer};
 pub use input::Scancode;
 pub use justrdp_pdu::input::InputEvent;
+// `SessionOutput::SaveSessionInfo` carries these, so a host that matches on it must be able
+// to name them without depending on `justrdp-pdu` itself (issue #304).
+pub use justrdp_pdu::session_info::{
+    LogonErrorNotification, LogonErrorsInfo, LogonInfo, LogonInfoExtended, SaveSessionInfo,
+    ServerAutoReconnect,
+};
 pub use session::{ResizeError, SessionConfig, SessionError, SessionOutput, SessionStateMachine};
 
 /// The `fuzz/` lane's door into the EGFX graphics processor (#267) — **not host API**.

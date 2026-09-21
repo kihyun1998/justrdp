@@ -42,6 +42,11 @@ concluding anything is absent.
   ladder is the worked instance.
 - [Capability exchange & activation](../territory/capability-exchange-activation.md) — where the
   advertised config is built, and therefore where the coverage is decided.
+- [Logon & Save Session Info](../territory/logon-session-info.md) — the VM sends two of the five
+  `infoType` arms (V2 and Extended) and has never set `LOGON_EX_AUTORECONNECTCOOKIE`, so Logon
+  Info V1, Plain Notify, an undefined type and the whole `ARC_SC_PRIVATE_PACKET` branch are
+  unobserved rather than absent. Added by #304, which is also when this territory got its first
+  fixture.
 
 ## What a violation looks like
 
