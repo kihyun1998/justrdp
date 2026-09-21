@@ -4075,8 +4075,17 @@ mod tests {
         .await
     }
 
+    /// The env var that lets [`capture_connect_response_against_real_vm`] write the committed
+    /// connect fixtures. Unset, the test only compares against them (#311).
+    const WRITE_CONNECT_FIXTURES: &str = "JUSTRDP_WRITE_CONNECT_FIXTURES";
+
     /// Capture the MCS Connect-Response a real server sends, and commit it as the fixture that
     /// seeds the `gcc` and `mcs` fuzz targets (#203).
+    ///
+    /// **It writes only when asked** — `JUSTRDP_WRITE_CONNECT_FIXTURES=1`. Without that it
+    /// captures, asserts, and compares the bytes against the committed fixtures, failing if they
+    /// differ (#311). Running the VM suite is verification, and verification does not edit
+    /// `crates/`.
     ///
     /// The fixture seeds those targets, asserts real-server acceptance in the stable gate, and is
     /// the repo's only offline connect-sequence bytes. It is **not** a rescue from a coverage
@@ -4186,17 +4195,44 @@ mod tests {
                 .join("tests")
                 .join("fixtures")
                 .join("connect");
-            std::fs::create_dir_all(&fixture).expect("create the fixture dir");
-            std::fs::write(fixture.join("connect-response.bin"), &body)
-                .expect("write the MCS fixture");
-            std::fs::write(fixture.join("conference-create-response.bin"), user_data)
-                .expect("write the GCC fixture");
+            let files = [
+                ("connect-response.bin", body.as_slice()),
+                ("conference-create-response.bin", user_data),
+            ];
+
+            // Verifying never writes (#311). This used to write both files on every run, so the
+            // documented `--ignored` suite regenerated committed fixtures as a side effect — and
+            // a changed server would have rewritten them silently. Regeneration is now an
+            // explicit act; the default run compares instead, so divergence fails rather than
+            // being absorbed.
+            let write = std::env::var(WRITE_CONNECT_FIXTURES).is_ok_and(|v| !v.is_empty());
+            if write {
+                std::fs::create_dir_all(&fixture).expect("create the fixture dir");
+                for (name, bytes) in files {
+                    std::fs::write(fixture.join(name), bytes).expect("write the fixture");
+                }
+            } else {
+                for (name, bytes) in files {
+                    let committed = std::fs::read(fixture.join(name))
+                        .unwrap_or_else(|e| panic!("read the committed {name}: {e}"));
+                    assert!(
+                        committed == bytes,
+                        "{name}: this server sent {} bytes that differ from the committed {} — \
+                         the fixture is stale for this server. Regenerate deliberately with \
+                         {WRITE_CONNECT_FIXTURES}=1 and review the diff before committing it",
+                        bytes.len(),
+                        committed.len()
+                    );
+                }
+            }
             eprintln!(
-                "walked {} frames; wrote a {}-byte Connect-Response and its {}-byte GCC user data (at offset {}) to {}",
+                "walked {} frames; {} a {}-byte Connect-Response and its {}-byte GCC user data (at offset {}) {} {}",
                 frames,
+                if write { "wrote" } else { "matched" },
                 body.len(),
                 user_data.len(),
                 gcc_offset,
+                if write { "to" } else { "against" },
                 fixture.display()
             );
         })
