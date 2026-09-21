@@ -2948,6 +2948,42 @@ mod tests {
             false
         }
 
+        /// Side of the all-white square a point must sit in to count as inside an edit area.
+        const EDIT_AREA_PROBE: usize = 120;
+
+        /// A point inside the edit area of the window on screen, read from an RGBA8888
+        /// framebuffer: the midpoint of every position where an [`EDIT_AREA_PROBE`]-sided square
+        /// is pure white. `None` when no such square exists or the midpoint is not one of them.
+        pub(super) fn edit_area_point(rgba: &[u8], width: u16, height: u16) -> Option<(u16, u16)> {
+            let (w, h) = (usize::from(width), usize::from(height));
+            let half = EDIT_AREA_PROBE / 2;
+            let white = |x: usize, y: usize| {
+                rgba.get((y * w + x) * 4..(y * w + x) * 4 + 3) == Some(&[0xFF; 3][..])
+            };
+            let clear = |cx: usize, cy: usize| {
+                (cy - half..cy + half)
+                    .step_by(4)
+                    .all(|y| (cx - half..cx + half).step_by(4).all(|x| white(x, y)))
+            };
+            let (mut lo, mut hi) = ((usize::MAX, usize::MAX), (0, 0));
+            for cy in (half..h.saturating_sub(half)).step_by(16) {
+                for cx in (half..w.saturating_sub(half)).step_by(16) {
+                    if clear(cx, cy) {
+                        lo = (lo.0.min(cx), lo.1.min(cy));
+                        hi = (hi.0.max(cx), hi.1.max(cy));
+                    }
+                }
+            }
+            if lo.0 > hi.0 {
+                return None;
+            }
+            let (x, y) = ((lo.0 + hi.0) / 2, (lo.1 + hi.1) / 2);
+            if !clear(x, y) {
+                return None;
+            }
+            Some((u16::try_from(x).ok()?, u16::try_from(y).ok()?))
+        }
+
         /// The Windows VK for one character of a Start-search command. Deliberately partial:
         /// a character with no mapping is a caller bug, surfaced rather than silently dropped.
         fn vk_for(ch: char) -> Option<u16> {
@@ -3377,6 +3413,81 @@ mod tests {
             assert_eq!(vk_for('l'), vk_for('L'));
             assert_eq!(vk_for('/'), Some(0xBF));
             assert_eq!(vk_for(' '), Some(0x20));
+        }
+
+        /// An RGBA8888 black desktop with `white` rectangles `(x, y, w, h)` painted on it.
+        fn desktop_with(
+            width: u16,
+            height: u16,
+            white: &[(usize, usize, usize, usize)],
+        ) -> Vec<u8> {
+            let w = usize::from(width);
+            let mut rgba = vec![0u8; w * usize::from(height) * 4];
+            for &(x0, y0, rw, rh) in white {
+                for y in y0..y0 + rh {
+                    for x in x0..x0 + rw {
+                        rgba[(y * w + x) * 4..][..4].copy_from_slice(&[0xFF; 4]);
+                    }
+                }
+            }
+            rgba
+        }
+
+        /// Notepad as the VM restored it: a white title + menu block (y 364–411) over a
+        /// separator, then the white edit area. The desktop centre (640, 400) is on the menu
+        /// bar, so the point must come from the pixels, and must be below the separator.
+        #[test]
+        fn edit_area_point_lands_in_the_edit_area_not_the_menu_bar() {
+            let mut rgba = desktop_with(1280, 800, &[(186, 364, 944, 48), (186, 414, 928, 346)]);
+            // The separator under the menu bar, in the colour the VM paints it.
+            for y in 412..414 {
+                for x in 186..1130 {
+                    rgba[(y * 1280 + x) * 4..][..4].copy_from_slice(&[247, 243, 247, 0xFF]);
+                }
+            }
+            // "aaa" and the caret at the edit area's top-left.
+            for y in 418..436 {
+                for x in 190..216 {
+                    rgba[(y * 1280 + x) * 4..][..4].copy_from_slice(&[0, 0, 0, 0xFF]);
+                }
+            }
+            let (x, y) = edit_area_point(&rgba, 1280, 800).expect("an edit area is on screen");
+            assert!(
+                (186..1114).contains(&x) && (414..760).contains(&y),
+                "({x}, {y})"
+            );
+            assert_ne!((x, y), (640, 400));
+        }
+
+        /// The same window restored somewhere else: the point follows it.
+        #[test]
+        fn edit_area_point_follows_the_window() {
+            let rgba = desktop_with(1280, 800, &[(0, 0, 600, 40), (0, 50, 600, 450)]);
+            let (x, y) = edit_area_point(&rgba, 1280, 800).expect("an edit area is on screen");
+            assert!(
+                (0..600).contains(&x) && (50..500).contains(&y),
+                "({x}, {y})"
+            );
+        }
+
+        /// White too thin to hold the probe square — a title bar, a menu bar — is not an edit
+        /// area, and neither is a desktop with no white on it.
+        #[test]
+        fn edit_area_point_refuses_a_screen_with_no_edit_area() {
+            let strip = desktop_with(1280, 800, &[(186, 364, 944, 48)]);
+            assert_eq!(edit_area_point(&strip, 1280, 800), None);
+            assert_eq!(
+                edit_area_point(&desktop_with(1280, 800, &[]), 1280, 800),
+                None
+            );
+        }
+
+        /// Two white windows side by side: their shared midpoint is the black gap between
+        /// them, which is inside neither, so there is no single edit area to point at.
+        #[test]
+        fn edit_area_point_refuses_a_midpoint_outside_every_white_square() {
+            let two = desktop_with(1280, 800, &[(0, 200, 400, 400), (880, 200, 400, 400)]);
+            assert_eq!(edit_area_point(&two, 1280, 800), None);
         }
 
         /// The Start button is a toggle. This shell starts with the menu **open** — the state a run
@@ -5734,8 +5845,8 @@ mod tests {
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn keyboard_and_mouse_input_drive_the_real_vm() {
         with_vm_session(|vm| async move {
-            use std::sync::Arc;
-            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::sync::{Arc, Mutex};
 
             let config = legacy_graphics_config();
             let session_capabilities = config.capabilities.clone();
@@ -5757,9 +5868,17 @@ mod tests {
             let frames = Arc::new(AtomicUsize::new(0));
             let frames_in_sink = frames.clone();
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            // The driver asks for one framebuffer copy; the frame sink takes it on its next frame.
+            let want_snapshot = Arc::new(AtomicBool::new(false));
+            let snapshot = Arc::new(Mutex::new(None::<Vec<u8>>));
+            let hovering = Arc::new(AtomicBool::new(false));
+            let hovering_in_sink = hovering.clone();
 
             let frames_in_driver = frames.clone();
+            let (want_snapshot_in_driver, snapshot_in_driver) =
+                (want_snapshot.clone(), snapshot.clone());
             let driver = tokio::spawn(async move {
+                let (want_snapshot, hovering) = (want_snapshot_in_driver, hovering);
                 let mut sent = 0usize;
                 let send = |events: Vec<InputEvent>, sent: &mut usize| {
                     *sent += events.len();
@@ -5799,19 +5918,33 @@ mod tests {
                 // #41's proof here. The veto the swap was avoiding is handled by the sign-out's
                 // `/f` instead, measured three times; see [`SIGN_OUT`].
                 // Wait for Notepad to finish appearing rather than sleeping four seconds at
-                // it (#198). `start_menu_run` proved the command was typed and committed; that
-                // the *application* is up is a separate fact, and a launch slower than the sleep
-                // sends the "aaa" to the desktop and leaves the hovers below with no edit area
-                // to find — measured across runs of identical code: 1 SetCursor, then 0, then 1.
+                // it (#198): `start_menu_run` proved the command was committed, not that the
+                // application is up.
                 if let Err(why) = vm::await_desktop(&frames_in_driver, vm::MENU_DEADLINE).await {
                     panic!("Notepad never finished appearing: {why}");
                 }
+                // The first frame the typing paints carries the whole framebuffer, Notepad
+                // included; the hover target is read from it (#310).
+                want_snapshot.store(true, Ordering::SeqCst);
                 for _ in 0..3 {
                     send(tap(0x41), &mut sent).await; // A → "aaa" in Notepad
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }
+                let (cx, cy) = {
+                    let start = tokio::time::Instant::now();
+                    loop {
+                        if let Some(pixels) = snapshot_in_driver.lock().unwrap().take() {
+                            break vm::edit_area_point(&pixels, desktop.0, desktop.1)
+                                .expect("Notepad's edit area should be on screen after typing");
+                        }
+                        assert!(
+                            start.elapsed() < Duration::from_secs(5),
+                            "typing into Notepad painted no frame to read the hover target from"
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                };
                 // Wheel scroll for good measure (vertical wheel, both directions).
-                let (cx, cy) = (desktop.0 / 2, desktop.1 / 2);
                 send(
                     vec![
                         InputEvent::Mouse {
@@ -5830,9 +5963,10 @@ mod tests {
                     &mut sent,
                 )
                 .await;
-                // Hover moves for the pointer slice (#41): over Notepad's edit area (an I-beam
-                // shape) and then over the desktop edge (an arrow) — each move makes the server
-                // push the pointer shape for what's under the cursor.
+                // Hover moves for the pointer slice (#41): into Notepad's edit area (the I-beam,
+                // pushed as a new pointer), out to the desktop edge, and back in (the same
+                // I-beam, now from the pointer cache).
+                hovering.store(true, Ordering::SeqCst);
                 for (x, y) in [(cx, cy), (4, 4), (cx, cy)] {
                     send(
                         vec![InputEvent::Mouse {
@@ -5848,21 +5982,25 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let after_app = frames_in_driver.load(Ordering::SeqCst);
-                (sent, run, after_app)
+                (sent, run, after_app, (cx, cy))
                 // tx drops here: the input branch disables, the session stays up.
             });
 
             // The timeout is the expected exit — a healthy session never ends on its own.
-            let mut cursor_events: Vec<justrdp::CursorEvent> = Vec::new();
+            // Each cursor event is paired with whether the hovers had started when it arrived.
+            let mut cursor_events: Vec<(bool, justrdp::CursorEvent)> = Vec::new();
             let ended = tokio::time::timeout(
                 Duration::from_secs(45),
                 run_session_with_input(
                     &mut stream,
                     &mut machine,
-                    |_, _fb| {
+                    |_, fb| {
                         frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                        if want_snapshot.swap(false, Ordering::SeqCst) {
+                            *snapshot.lock().unwrap() = Some(fb.pixels().to_vec());
+                        }
                     },
-                    |c| cursor_events.push(c.clone()),
+                    |c| cursor_events.push((hovering_in_sink.load(Ordering::SeqCst), c.clone())),
                     &mut rx,
                 ),
             )
@@ -5871,18 +6009,33 @@ mod tests {
                 result.expect("session failed while input was in flight");
                 panic!("server closed the session during the input exchange");
             }
-            let (sent, run, after_app) = driver.await.expect("input driver");
+            let (sent, run, after_app, hover) = driver.await.expect("input driver");
 
-            // Pointer verification (#41): the hover moves above make the server push cursor
-            // shapes (arrow over the desktop, an I-beam over Notepad's edit area). Every decoded
-            // shape must be plausible: spec-capped dimensions, hotspot inside the shape, RGBA
-            // sized exactly width × height × 4.
-            let mut shapes = 0usize;
-            for event in &cursor_events {
+            // Visual dump, written before any assertion so a failing run leaves it behind:
+            // Notepad with "aaa" typed into it.
+            let fb = machine.framebuffer();
+            let path = std::env::temp_dir().join("justrdp-slice7-input.ppm");
+            let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+            for px in fb.pixels().as_chunks::<4>().0 {
+                ppm.extend_from_slice(&px[..3]);
+            }
+            std::fs::write(&path, ppm).expect("write the visual dump");
+            eprintln!("visual dump for confirmation: {}", path.display());
+
+            // Pointer verification (#41): every decoded shape must be plausible — spec-capped
+            // dimensions, hotspot inside the shape, RGBA sized exactly width × height × 4 — and
+            // at least one must have arrived after the hovers started.
+            let mut shapes = (0usize, 0usize);
+            for (after_hover, event) in &cursor_events {
                 if let justrdp::CursorEvent::Set(image) = event {
-                    shapes += 1;
+                    if *after_hover {
+                        shapes.1 += 1;
+                    } else {
+                        shapes.0 += 1;
+                    }
                     eprintln!(
-                        "cursor shape: {}x{} hotspot ({}, {})",
+                        "cursor shape: {}x{} hotspot ({}, {}), after the hovers started: \
+                         {after_hover}",
                         image.width, image.height, image.hotspot_x, image.hotspot_y
                     );
                     assert!(image.width > 0 && image.width <= 96);
@@ -5894,13 +6047,24 @@ mod tests {
                     );
                 }
             }
+            let after: Vec<_> = cursor_events
+                .iter()
+                .filter(|(h, _)| *h)
+                .map(|(_, c)| c)
+                .collect();
             eprintln!(
-                "cursor events: {} total, {shapes} SetCursor",
-                cursor_events.len()
+                "cursor events: {} total, {} SetCursor before the hovers, {} after",
+                cursor_events.len(),
+                shapes.0,
+                shapes.1
             );
             assert!(
-                shapes >= 1,
-                "expected at least one decoded pointer shape from the VM, got {cursor_events:?}"
+                shapes.1 >= 1,
+                "expected a decoded pointer shape after hovering over Notepad's edit area at \
+                 {hover:?}; the {} cursor events after the first hover were {after:?} ({} shapes \
+                 arrived before it and do not count)",
+                after.len(),
+                shapes.0
             );
 
             eprintln!(
@@ -5921,16 +6085,6 @@ mod tests {
                 "no graphics followed the keystrokes sent to Notepad ({} → {after_app})",
                 run.after_typing
             );
-
-            // Visual confirmation artifact: Notepad with "aaa" typed into it.
-            let fb = machine.framebuffer();
-            let path = std::env::temp_dir().join("justrdp-slice7-input.ppm");
-            let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-            for px in fb.pixels().as_chunks::<4>().0 {
-                ppm.extend_from_slice(&px[..3]);
-            }
-            std::fs::write(&path, ppm).expect("write the visual dump");
-            eprintln!("visual dump for confirmation: {}", path.display());
         })
         .await
     }

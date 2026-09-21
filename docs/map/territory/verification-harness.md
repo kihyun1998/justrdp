@@ -327,6 +327,23 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
   Worth keeping as a shape: **"remove the hazard" and "handle the hazard" are not
   interchangeable when the hazard is also carrying a proof.** The console looked strictly
   safer right up to the point where a real server was asked.
+- **Closed in #310: slice-7's I-beam proof was satisfied by a shape the hover never caused.**
+  The hovers went to the desktop centre `(640, 400)`, and Notepad, restored at the same place on
+  every measured run (window y 364–760), has its **menu bar** there: an arrow, so no shape. Over
+  five measured runs of the committed test, the hovers produced **zero** shapes each time. Pass
+  or fail was decided by the logon cursor alone, which this server sends either as one
+  `New bpp=32` pointer at t ≈ 0.2 s (green) or as a stream of `SYSPTR_DEFAULT` at ~20 Hz (red).
+  That was the "1, then 0, then 1" once blamed on a late Notepad launch; the instrumented runs
+  refuted that (Notepad was up and holding `aaa` before the first hover). Two changes, one per
+  failure: the hover target is **read from the framebuffer** (`edit_area_point`: the midpoint of
+  every pure-white 120-px square, which the menu bar at 48 px cannot hold, and the
+  `(247,243,247)` separator under it keeps apart from the edit area), and only a `Set` that
+  arrives **after the first hover** counts. Maximising Notepad was the alternative and was
+  rejected: the system-menu accelerator is locale-dependent, and on an already-maximised window
+  it leaves the menu open. The PPM is now written before the assertions, since the failing runs
+  were the ones that left no screenshot. Measured after: 3/3 green, each with the I-beam as
+  `New` then `Cached`. With the target forced back to the centre: red, `[Hidden, Default]` after
+  the hover.
 - ~~**32-bit guards need an i686 run** that no CI job performs.~~ **Closed** —
   `.github/workflows/overflow-32bit.yml` builds `justrdp-codecs` + `justrdp` for
   `i686-pc-windows-msvc`, so the class closed in #151/#155 is now gated rather than

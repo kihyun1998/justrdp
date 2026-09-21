@@ -37,8 +37,22 @@ pixels in the frame — but nothing records that as a decision.
 
 ## Reference behaviour
 
-**None.** No verified external-fact store; `differential_pointer_ironrdp` compares
+No verified external-fact store; `differential_pointer_ironrdp` compares
 behaviour as a test rather than recording it as a citable fact.
+
+**Measured against the WS2022 test VM (#310, 2026-09-22), over fast-path:**
+
+| What is under the pointer | What the server sends |
+|---|---|
+| Logon, before any input | either one `FP_UPDATE_NEW_POINTER` (32 bpp, 32×32, hotspot 16,16) or a stream of `FP_UPDATE_PTR_DEFAULT` at ~20 Hz; it varies between runs of the same code |
+| After typing, on the first move | `FP_UPDATE_PTR_NULL` (the pointer hidden while typing) |
+| Notepad's menu bar, the desktop | nothing new: the arrow is `SYSPTR_DEFAULT` |
+| Notepad's edit area | `FP_UPDATE_NEW_POINTER` (1 bpp, 32×32, hotspot 8,9): the I-beam |
+| The edit area again, after leaving it | `FP_UPDATE_CACHED_POINTER` index 0 |
+
+`FP_UPDATE_LARGE_POINTER` never arrived (it is not advertised). So a live proof of the
+decoder needs the pointer **over a text field**. Anywhere else, the server has no
+shape to decode.
 
 ## Cross-cutting invariants
 
