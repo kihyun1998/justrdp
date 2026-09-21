@@ -23,7 +23,9 @@ pub const LOGON_EX_AUTORECONNECTCOOKIE: u32 = 0x0000_0001;
 /// `FieldsPresent`: `LogonFields` holds a Logon Errors Info (2.2.10.1.1.4.1.1).
 pub const LOGON_EX_LOGONERRORS: u32 = 0x0000_0002;
 
-/// `errorNotificationType` values (2.2.10.1.1.4.1.1).
+/// `errorNotificationData` (2.2.10.1.1.4.1.1): the credentials supplied were invalid. The data
+/// field carries one of these four when the type is an NTSTATUS
+/// ([`LogonErrorNotification::Other`]); for the seven `LOGON_MSG_*` types it is a session ID.
 pub const LOGON_FAILED_BAD_PASSWORD: u32 = 0x0000_0000;
 /// `errorNotificationData`: the password must be changed.
 pub const LOGON_FAILED_UPDATE_PASSWORD: u32 = 0x0000_0001;
@@ -58,7 +60,8 @@ pub enum LogonErrorNotification {
     SessionContinue,
     /// 0xFFFFFFFF — access was denied.
     AccessDenied,
-    /// Anything outside the eight this revision names, preserved verbatim.
+    /// Any other value — which 2.2.10.1.1.4.1.1 defines as an **NTSTATUS** (`[MS-ERREF]` 2.3.1),
+    /// not as an unknown. Its `errorNotificationData` is one of the `LOGON_FAILED_*` codes.
     Other(u32),
 }
 
@@ -96,22 +99,16 @@ impl LogonErrorNotification {
     /// Whether [`LogonErrorsInfo::notification_data`] is a **session ID** rather than one of
     /// the `LOGON_FAILED_*` codes.
     ///
-    /// The meaning of that field is discriminated by *this* value and not by its own, which is
-    /// the distinction a decoder is most likely to get wrong: IronRDP maps `0..=3` to an
-    /// error-code enum whatever the type says, and the real VM sends
-    /// [`Self::SessionContinue`] with the session ID in it — 2, 3 and 6 on logons whose
-    /// `SessionId` was 2, 3 and 6, so all three read as a bogus error code there.
+    /// `[MS-RDPBCGR]` 2.2.10.1.1.4.1.1 decides it by the type, and says so for each value: all
+    /// seven `LOGON_MSG_*` types read *"The session identifier is specified by the
+    /// ErrorNotificationData field"*; for [`Self::AccessDenied`] the data *"SHOULD be ignored"*;
+    /// and any other type is an NTSTATUS, whose data is a `LOGON_FAILED_*` code.
     ///
-    /// The three offer-shaped notifications carry an ID; `[MS-RDPBCGR]` 2.2.10.1.1.4.1.1 gives
-    /// the data field no meaning for the others, so they are treated as codes.
+    /// Deciding it by the data's own value is the mistake to avoid. IronRDP maps `0..=3` to an
+    /// error-code enum whatever the type says, and the real VM sends [`Self::SessionContinue`]
+    /// with the logon's `SessionId` in it — small numbers that land inside that range.
     pub fn data_is_session_id(&self) -> bool {
-        matches!(
-            self,
-            Self::SessionBusyOptions
-                | Self::BumpOptions
-                | Self::ReconnectOptions
-                | Self::SessionContinue
-        )
+        !matches!(self, Self::AccessDenied | Self::Other(_))
     }
 }
 
@@ -407,7 +404,7 @@ impl LogonErrorsInfo {
                 LOGON_FAILED_UPDATE_PASSWORD => "logon failed: the password must be changed".into(),
                 LOGON_FAILED_OTHER => "logon failed".into(),
                 LOGON_WARNING => "logon warning".into(),
-                _ => format!("unrecognised logon notification {raw:#010x}"),
+                _ => format!("logon failed with NTSTATUS {raw:#010x}"),
             },
         }
     }
@@ -729,9 +726,10 @@ mod tests {
         }
     }
 
-    /// An unrecognised `errorNotificationType` is carried, not rejected.
+    /// An `errorNotificationType` outside the eight named ones is carried, not rejected.
     ///
-    /// The `Other(u32)` arm is what made typing this field safe at all — `errinfo::ErrorInfo`
+    /// 2.2.10.1.1.4.1.1 defines any such value as an NTSTATUS, so it is expected rather than
+    /// exotic. The `Other(u32)` arm is what made typing this field safe at all — `errinfo::ErrorInfo`
     /// took the same exit for the same reason. IronRDP enumerates the same eight values with no
     /// fallback and errors on a ninth, which turns a notification the client could have ignored
     /// into a dead session.
@@ -756,30 +754,44 @@ mod tests {
         );
     }
 
-    /// What `errorNotificationData` *means* is decided by the type and not by its own value.
+    /// Which `errorNotificationType` values make `errorNotificationData` a session ID.
     ///
-    /// This is the distinction a decoder is most likely to collapse: IronRDP maps `0..=3` to an
-    /// error-code enum whatever the type says, and the real VM sends `SessionContinue` carrying
-    /// a session ID that was 2, 3 and 6 on three logons — every one of which lands inside that
-    /// range and reads as a bogus error code there.
+    /// **The expected values come from `[MS-RDPBCGR]` 2.2.10.1.1.4.1.1, not from the code.** This
+    /// test used to assert a classification derived from plan.md and IronRDP — four
+    /// "offer-shaped" types — and the code shared the same model, so the two confirmed each other
+    /// and mutations that broke the code reddened it. The spec says otherwise: every one of the
+    /// seven `LOGON_MSG_*` values reads *"The session identifier is specified by the
+    /// ErrorNotificationData field"*, `ERROR_CODE_ACCESS_DENIED`'s data *"SHOULD be ignored"*, and
+    /// any other type is an NTSTATUS, whose data is one of the `LOGON_FAILED_*` codes.
+    ///
+    /// The real VM agrees where it reaches: `SessionContinue` carried the logon's `SessionId`
+    /// on seven of seven logons.
     #[test]
-    fn the_data_field_is_a_session_id_only_for_the_offer_shaped_types() {
+    fn the_data_field_is_a_session_id_for_every_logon_msg_type_per_the_spec() {
+        // "The session identifier is specified by the ErrorNotificationData field."
         for t in [
             LogonErrorNotification::SessionBusyOptions,
-            LogonErrorNotification::BumpOptions,
-            LogonErrorNotification::ReconnectOptions,
-            LogonErrorNotification::SessionContinue,
-        ] {
-            assert!(t.data_is_session_id(), "{t:?} carries an ID");
-        }
-        for t in [
             LogonErrorNotification::DisconnectRefused,
             LogonErrorNotification::NoPermission,
+            LogonErrorNotification::BumpOptions,
+            LogonErrorNotification::ReconnectOptions,
             LogonErrorNotification::SessionTerminate,
-            LogonErrorNotification::AccessDenied,
-            LogonErrorNotification::Other(0),
+            LogonErrorNotification::SessionContinue,
         ] {
-            assert!(!t.data_is_session_id(), "{t:?} does not carry an ID");
+            assert!(
+                t.data_is_session_id(),
+                "{t:?}: the spec says the data is a session ID"
+            );
+        }
+        // ERROR_CODE_ACCESS_DENIED: "SHOULD be ignored". An NTSTATUS: a LOGON_FAILED_* code.
+        for t in [
+            LogonErrorNotification::AccessDenied,
+            LogonErrorNotification::Other(0xC000_006D), // STATUS_LOGON_FAILURE
+        ] {
+            assert!(
+                !t.data_is_session_id(),
+                "{t:?}: the data is not a session ID"
+            );
         }
     }
 

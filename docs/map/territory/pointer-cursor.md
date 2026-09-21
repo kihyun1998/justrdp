@@ -51,7 +51,7 @@ behaviour as a test rather than recording it as a citable fact.
 ## Blast radius
 
 - [Session loop & PDU dispatch](session-loop-dispatch.md) — pointer updates are
-  dispatched there and become one of the four session outputs.
+  dispatched there and become one of the session outputs (`SessionOutput::Cursor`).
 - [Bitmap codecs](bitmap-codecs.md) — shares the mask/stride arithmetic and the
   colour conversion helpers.
 - [Capability exchange & activation](capability-exchange-activation.md) —

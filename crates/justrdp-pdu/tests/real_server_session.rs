@@ -90,7 +90,7 @@ fn a_real_servers_logon_notifications_decode_in_order() {
     );
     assert!(
         err.notification_type.data_is_session_id(),
-        "this notification type is one of the four whose data field is an ID"
+        "every LOGON_MSG_* type carries a session ID in its data field (2.2.10.1.1.4.1.1)"
     );
 
     let session_info::SaveSessionInfo::LogonLong(logon) = &infos[1] else {

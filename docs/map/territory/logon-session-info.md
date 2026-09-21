@@ -177,6 +177,10 @@ server sends, never what servers send.
   input that slice needs and takes none of its decisions.
 - **Set Keyboard Indicators (0x29) is still in the catch-all** (#305) — the other half of
   epic #25 and the last `pduType2` this area's neighbours drop in silence.
-- **`LogonErrorsInfo::notification_data` is polymorphic and typed as `u32`.** For the
-  reconnect-offering notification types it is a session ID, not an error code; the decoder
-  carries the raw value and `description()` does not distinguish them.
+- **`LogonErrorsInfo::notification_data` is polymorphic and typed as `u32`.** Which meaning it
+  has is decided by the type, per 2.2.10.1.1.4.1.1: a session ID for all seven `LOGON_MSG_*`
+  types, to be ignored for `ERROR_CODE_ACCESS_DENIED`, and a `LOGON_FAILED_*` code when the type
+  is an NTSTATUS. `LogonErrorNotification::data_is_session_id` encodes that rule; the field
+  itself stays raw. **#304 first shipped this rule wrong** — four types instead of seven, taken
+  from plan.md and IronRDP without reading the section — and its test shared the model, so the
+  two agreed. Corrected against the spec text, which is now the test's stated source.
