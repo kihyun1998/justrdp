@@ -5253,7 +5253,16 @@ mod tests {
 
             let ready_in_event = ready_seen.clone();
             let on_event = move |event: SessionEvent| {
-                assert_eq!(event, SessionEvent::DisplayControlReady);
+                // Strict about everything but the logon notification. This was an `assert_eq!`
+                // against `DisplayControlReady` alone until #304 added `SaveSessionInfo`, which
+                // every logon sends one or two of — the first real-VM run after #304 panicked
+                // here on it. The strictness is kept rather than dropped: an event this flow
+                // has no reason to produce is still a failure.
+                match event {
+                    SessionEvent::DisplayControlReady => {}
+                    SessionEvent::SaveSessionInfo(_) => return,
+                    other => panic!("unexpected session event during resize: {other:?}"),
+                }
                 eprintln!(
                     "milestone: DisplayControlReady (drdynvc caps + create + EDISP caps done)"
                 );
