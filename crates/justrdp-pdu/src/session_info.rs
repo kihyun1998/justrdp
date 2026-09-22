@@ -312,8 +312,8 @@ impl LogonInfoExtended {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ServerAutoReconnect {
     /// `Version` — carried rather than checked. IronRDP rejects anything but 1 and drops the
-    /// field; FreeRDP echoes the server's value back on reconnect, which is what #306 decided
-    /// this client does, so the host is its reader.
+    /// field; FreeRDP echoes the server's value back on reconnect, and so does this client
+    /// (#306), which makes the `ARC_CS_PRIVATE_PACKET` derivation its reader.
     pub version: u32,
     /// `LogonId` — the session this cookie resumes.
     pub logon_id: u32,

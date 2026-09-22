@@ -50,12 +50,13 @@ Two complete TPKT frames, 625 + 661 = 1286 bytes, carved out of a 27 260-byte se
 
 ### What it cannot see
 
-**No auto-reconnect cookie.** This server sent `LOGON_EX_LOGONERRORS` alone across every
-observed justrdp logon — it does send FreeRDP a cookie (#305's FreeRDP run), so the absence is
-this client's, not the server's. The `ARC_SC_PRIVATE_PACKET` path has **no fixture yet** —
-`docs/map/invariant/capture-coverage-follows-what-we-advertise.md` applies, and #306's
-"capture the cookie, reconnect with it" acceptance has no proof path until justrdp is
-configured the way that gets one.
+**No auto-reconnect cookie in this capture.** It was taken while justrdp did not advertise
+`AUTORECONNECT_SUPPORTED`, which is what the server issues a cookie for (#306:
+0 of 19 logons without it, 16 of 16 with it) — so the absence here is the advertised config's,
+not the server's (`docs/map/invariant/capture-coverage-follows-what-we-advertise.md`). A cookie
+is not captured into this directory on purpose: its random is a live session credential. The
+`ARC_SC_PRIVATE_PACKET` path stays covered by hand-built bodies in
+`justrdp-pdu/src/session_info.rs`.
 The cookie branch is covered by hand-built bodies in `justrdp-pdu/src/session_info.rs` only.
 
 Nor does it exercise Logon Info **V1**, Plain Notify, or an undefined `infoType` — and the

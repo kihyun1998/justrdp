@@ -98,10 +98,14 @@ pub struct ClientInfoConfig {
     pub client_dir: String,
     /// The client time zone.
     pub timezone: client_info::TimezoneInfo,
-    /// `clientSessionId` (0 unless reconnecting).
+    /// `clientSessionId` — 2.2.1.11.1.1.1: ignored by the server, SHOULD be zero.
     pub session_id: u32,
     /// `performanceFlags` (`PERF_*` bits).
     pub performance_flags: u32,
+    /// The auto-reconnect cookie a previous session's Save Session Info carried (issue #306),
+    /// as the server sent it. The Client Info PDU carries the verifier derived from it
+    /// (`[MS-RDPBCGR]` 5.5), never these bytes. `None` sends no cookie.
+    pub reconnect_cookie: Option<justrdp_pdu::session_info::ServerAutoReconnect>,
 }
 
 /// A static virtual channel the server granted: the requested name paired with the MCS channel
@@ -826,8 +830,12 @@ impl ConnectStateMachine {
                 timezone: self.config.client_info.timezone.clone(),
                 session_id: self.config.client_info.session_id,
                 performance_flags: self.config.client_info.performance_flags,
-                // Empty until epic #25 replays a Save Session Info cookie.
-                reconnect_cookie: None,
+                reconnect_cookie: self
+                    .config
+                    .client_info
+                    .reconnect_cookie
+                    .as_ref()
+                    .map(crate::auto_reconnect::client_cookie),
             },
         };
         let payload = info.encode();
@@ -1345,6 +1353,7 @@ mod tests {
                 },
                 session_id: 0,
                 performance_flags: 0x7,
+                reconnect_cookie: None,
             },
             capabilities: capability::default_client_capabilities(&core_for_caps()),
             license: LicenseConfig {
@@ -1966,8 +1975,74 @@ mod tests {
         assert_eq!(
             info.extra_info.optional_data.reconnect_cookie(),
             None,
-            "cbAutoReconnectCookie stays zero until epic #25"
+            "no cookie configured, none sent"
         );
+    }
+
+    /// The `autoReconnectCookie` the machine writes for `config`, read back by ironrdp.
+    fn sent_reconnect_cookie(config: ConnectConfig) -> Option<[u8; 28]> {
+        let mut sm = awaiting_connect_response(config);
+        sm.process(Event::Received(&iron_connect_response(
+            false,
+            vec![1004, 1005],
+        )));
+        sm.process(Event::Received(&iron_attach_user_confirm(1007)));
+        let mut batch = Vec::new();
+        for id in [1007u16, 1003, 1004, 1005] {
+            batch.extend_from_slice(&iron_channel_join_confirm(1007, id, 0));
+        }
+        let actions = sm.process(Event::Received(&batch));
+        let Action::WriteBytes(frame) = &actions[0] else {
+            panic!("expected the Client Info write, got {actions:?}");
+        };
+        let parsed: IronX224<iron_mcs::McsMessage<'_>> = ironrdp_pdu::decode(frame).unwrap();
+        let iron_mcs::McsMessage::SendDataRequest(req) = parsed.0 else {
+            panic!("expected a SendDataRequest");
+        };
+        let pdu: ironrdp_pdu::rdp::ClientInfoPdu =
+            ironrdp_pdu::decode(req.user_data.as_ref()).unwrap();
+        pdu.client_info
+            .extra_info
+            .optional_data
+            .reconnect_cookie()
+            .copied()
+    }
+
+    /// Issue #306: a configured server cookie goes out as `ARC_CS_PRIVATE_PACKET` — the
+    /// server's `Version` and `LogonId`, and `HMAC-MD5(ArcRandomBits, 32 × 0x00)` in place of
+    /// the random itself (`[MS-RDPBCGR]` 5.5). The verifier is Python's
+    /// `hmac.new(b"¥" * 16, bytes(32), hashlib.md5)`.
+    #[test]
+    fn a_configured_cookie_is_sent_as_its_derived_verifier() {
+        let mut config = config();
+        config.client_info.reconnect_cookie =
+            Some(justrdp_pdu::session_info::ServerAutoReconnect {
+                version: 1,
+                logon_id: 48,
+                random_bits: [0xA5; 16],
+            });
+        let cookie = sent_reconnect_cookie(config).expect("a cookie is sent");
+        assert_eq!(&cookie[..4], &28u32.to_le_bytes(), "cbLen");
+        assert_eq!(&cookie[4..8], &1u32.to_le_bytes(), "Version, echoed");
+        assert_eq!(&cookie[8..12], &48u32.to_le_bytes(), "LogonId, echoed");
+        assert_eq!(
+            &cookie[12..],
+            &[
+                0x94, 0x99, 0x40, 0xad, 0x86, 0xc0, 0x0c, 0x6a, 0x4f, 0x4c, 0x1e, 0x5a, 0x67, 0x35,
+                0x74, 0xbb
+            ],
+            "SecurityVerifier"
+        );
+        assert_ne!(
+            &cookie[12..],
+            &[0xA5; 16],
+            "the random itself never goes out"
+        );
+    }
+
+    #[test]
+    fn no_configured_cookie_sends_none() {
+        assert_eq!(sent_reconnect_cookie(config()), None);
     }
 
     #[test]

@@ -38,6 +38,9 @@ pub const CAPSET_BITMAP_CODECS: u16 = 0x001D;
 pub const GENERAL_FASTPATH_OUTPUT_SUPPORTED: u16 = 0x0001;
 /// `extraFlags`: long credentials supported.
 pub const GENERAL_LONG_CREDENTIALS_SUPPORTED: u16 = 0x0004;
+/// `extraFlags`: auto-reconnection supported — the server then issues an auto-reconnect cookie
+/// in Save Session Info (issue #306).
+pub const GENERAL_AUTORECONNECT_SUPPORTED: u16 = 0x0008;
 /// `extraFlags`: no bitmap compression header.
 pub const GENERAL_NO_BITMAP_COMPRESSION_HDR: u16 = 0x0400;
 
@@ -588,6 +591,7 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
             // arrive, zero bitmap data).
             extra_flags: GENERAL_FASTPATH_OUTPUT_SUPPORTED
                 | GENERAL_LONG_CREDENTIALS_SUPPORTED
+                | GENERAL_AUTORECONNECT_SUPPORTED
                 | GENERAL_NO_BITMAP_COMPRESSION_HDR,
             refresh_rect_support: 0,
             suppress_output_support: 0,
@@ -724,6 +728,27 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Issue #306: the default General set advertises auto-reconnect, which the client then
+    /// implements by answering the server's cookie with a verifier.
+    #[test]
+    fn default_general_capset_advertises_auto_reconnect() {
+        let sets = default_client_capabilities(&sample_core());
+        let general = sets
+            .iter()
+            .find_map(|s| match s {
+                CapabilitySet::General(g) => Some(g),
+                _ => None,
+            })
+            .expect("defaults include a General capset");
+        assert_eq!(
+            general.extra_flags,
+            GENERAL_FASTPATH_OUTPUT_SUPPORTED
+                | GENERAL_LONG_CREDENTIALS_SUPPORTED
+                | GENERAL_AUTORECONNECT_SUPPORTED
+                | GENERAL_NO_BITMAP_COMPRESSION_HDR
+        );
     }
 
     #[test]

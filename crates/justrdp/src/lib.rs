@@ -10,6 +10,7 @@
 //! See ADR-0001 (sans-IO core), ADR-0002 (own the RDP protocol; depend on `rustls` + `sspi`),
 //! ADR-0003 (phased codecs), and `docs/plan.md`.
 
+mod auto_reconnect;
 pub mod connect;
 pub mod cursor;
 pub mod disconnect;

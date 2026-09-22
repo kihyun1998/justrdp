@@ -5,7 +5,7 @@
 //! Layout: a [`basic security header`](encode_basic_security_header) with [`SEC_INFO_PKT`],
 //! then `TS_INFO_PACKET` (code page, INFO_* flags, five length-prefixed strings) followed by
 //! `TS_EXTENDED_INFO_PACKET` (client address, directory, time zone, session id, performance
-//! flags, and the auto-reconnect cookie length — zero until epic #25 populates it).
+//! flags, and the auto-reconnect cookie: [`ClientAutoReconnect`], or a zero length).
 //!
 //! Length-field semantics differ between the two packets and are the classic trap here: the
 //! `TS_INFO_PACKET` `cb*` fields **exclude** each string's mandatory null terminator, while the
@@ -175,13 +175,42 @@ pub struct ExtendedClientInfo {
     pub dir: String,
     /// The client time zone.
     pub timezone: TimezoneInfo,
-    /// `clientSessionId` (0 unless reconnecting to a known session).
+    /// `clientSessionId` — 2.2.1.11.1.1.1: ignored by the server, SHOULD be zero.
     pub session_id: u32,
     /// `performanceFlags` (`PERF_*` bits, raw — caller policy).
     pub performance_flags: u32,
-    /// The 28-byte auto-reconnect cookie, replayed from a previous session's Save Session Info
-    /// (epic #25). `None` encodes `cbAutoReconnectCookie = 0` — the field is always present.
-    pub reconnect_cookie: Option<[u8; 28]>,
+    /// `autoReconnectCookie`, the client's answer to a previous session's auto-reconnect cookie
+    /// (issue #306). `None` encodes `cbAutoReconnectCookie = 0` — the field is always present.
+    pub reconnect_cookie: Option<ClientAutoReconnect>,
+}
+
+/// `ARC_CS_PRIVATE_PACKET` (`[MS-RDPBCGR]` 2.2.4.3): the 28-byte packet that asks the server to
+/// resume a session.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientAutoReconnect {
+    /// `Version` (`AUTO_RECONNECT_VERSION_1` is the only defined value).
+    pub version: u32,
+    /// `LogonId` — the session to resume.
+    pub logon_id: u32,
+    /// `SecurityVerifier` — `HMAC-MD5(ArcRandomBits, ClientRandom)` (5.5).
+    pub security_verifier: [u8; 16],
+}
+
+impl ClientAutoReconnect {
+    /// `cbLen`, which 2.2.4.3 fixes at 28.
+    pub const LEN: u32 = 28;
+}
+
+/// The verifier proves possession of the session's auto-reconnect random, so it is redacted
+/// the way [`crate::session_info::ServerAutoReconnect`] redacts that random.
+impl core::fmt::Debug for ClientAutoReconnect {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ClientAutoReconnect")
+            .field("version", &self.version)
+            .field("logon_id", &self.logon_id)
+            .field("security_verifier", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The Client Info PDU body (security header excluded — see [`ClientInfo::encode`] for the
@@ -302,13 +331,15 @@ impl ClientInfo {
         self.extra.timezone.encode_into(out);
         out.extend_from_slice(&self.extra.session_id.to_le_bytes());
         out.extend_from_slice(&self.extra.performance_flags.to_le_bytes());
-        match self.extra.reconnect_cookie {
-            // cbAutoReconnectCookie is always emitted; zero means "no cookie yet" (epic #25
-            // populates it from Save Session Info).
+        match &self.extra.reconnect_cookie {
+            // cbAutoReconnectCookie is always emitted; zero means "no cookie".
             None => out.extend_from_slice(&0u16.to_le_bytes()),
             Some(cookie) => {
-                out.extend_from_slice(&(cookie.len() as u16).to_le_bytes());
-                out.extend_from_slice(&cookie);
+                out.extend_from_slice(&(ClientAutoReconnect::LEN as u16).to_le_bytes());
+                out.extend_from_slice(&ClientAutoReconnect::LEN.to_le_bytes());
+                out.extend_from_slice(&cookie.version.to_le_bytes());
+                out.extend_from_slice(&cookie.logon_id.to_le_bytes());
+                out.extend_from_slice(&cookie.security_verifier);
             }
         }
     }
@@ -359,9 +390,21 @@ impl ClientInfo {
         let reconnect_cookie = match cookie_len {
             0 => None,
             28 => {
-                let mut cookie = [0u8; 28];
-                cookie.copy_from_slice(cur.read_slice(28)?);
-                Some(cookie)
+                if cur.read_u32_le()? != ClientAutoReconnect::LEN {
+                    return Err(DecodeError::InvalidField {
+                        field: "ARC_CS_PRIVATE_PACKET.cbLen",
+                        reason: "not 28",
+                    });
+                }
+                let version = cur.read_u32_le()?;
+                let logon_id = cur.read_u32_le()?;
+                let mut security_verifier = [0u8; 16];
+                security_verifier.copy_from_slice(cur.read_slice(16)?);
+                Some(ClientAutoReconnect {
+                    version,
+                    logon_id,
+                    security_verifier,
+                })
             }
             _ => {
                 return Err(DecodeError::InvalidField {
@@ -512,18 +555,66 @@ mod tests {
     #[test]
     fn empty_cookie_encodes_a_zero_length_field() {
         let bytes = client_info().encode();
-        // The very last two bytes are cbAutoReconnectCookie = 0 (the criterion: the field is
-        // present and empty until epic #25 populates it).
+        // The very last two bytes are cbAutoReconnectCookie = 0: the field is present and
+        // empty when no cookie is configured.
         assert_eq!(&bytes[bytes.len() - 2..], &[0x00, 0x00]);
+    }
+
+    fn arc_cs() -> ClientAutoReconnect {
+        ClientAutoReconnect {
+            version: 1,
+            logon_id: 0x0102_0304,
+            security_verifier: core::array::from_fn(|i| 0xA0 + i as u8),
+        }
+    }
+
+    /// 2.2.4.3: `cbLen` (28), `Version`, `LogonId`, `SecurityVerifier`, after a
+    /// `cbAutoReconnectCookie` of 28 (2.2.1.11.1.1.1).
+    #[test]
+    fn the_client_auto_reconnect_packet_is_28_bytes_in_spec_order() {
+        let mut info = client_info();
+        info.extra.reconnect_cookie = Some(arc_cs());
+        let bytes = info.encode();
+        let tail = &bytes[bytes.len() - 30..];
+        let mut want = vec![28, 0, 28, 0, 0, 0, 1, 0, 0, 0, 0x04, 0x03, 0x02, 0x01];
+        want.extend(0xA0u8..0xB0);
+        assert_eq!(tail, &want[..]);
     }
 
     #[test]
     fn reconnect_cookie_round_trips_when_present() {
         let mut info = client_info();
-        info.extra.reconnect_cookie = Some([0xAB; 28]);
+        info.extra.reconnect_cookie = Some(arc_cs());
         let bytes = info.encode();
         let decoded = ClientInfo::decode(&bytes).unwrap();
-        assert_eq!(decoded.extra.reconnect_cookie, Some([0xAB; 28]));
+        assert_eq!(decoded.extra.reconnect_cookie, Some(arc_cs()));
+    }
+
+    #[test]
+    fn a_client_auto_reconnect_packet_whose_cb_len_is_not_28_is_rejected() {
+        let mut info = client_info();
+        info.extra.reconnect_cookie = Some(arc_cs());
+        let mut bytes = info.encode();
+        let at = bytes.len() - 28;
+        bytes[at] = 27;
+        assert!(matches!(
+            ClientInfo::decode(&bytes),
+            Err(DecodeError::InvalidField {
+                field: "ARC_CS_PRIVATE_PACKET.cbLen",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_security_verifier_is_not_printed_by_debug() {
+        let shown = format!("{:?}", arc_cs());
+        assert!(shown.contains("logon_id"), "{shown}");
+        assert!(
+            !shown.contains("160"),
+            "the verifier's first byte leaked: {shown}"
+        );
+        assert!(!shown.to_lowercase().contains("a0"), "{shown}");
     }
 
     #[test]
