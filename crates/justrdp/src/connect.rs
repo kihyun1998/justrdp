@@ -1222,9 +1222,8 @@ impl ConnectStateMachine {
                         self.save_session_info.push(info);
                         Ok(Vec::new())
                     }
-                    // Anything else the server interleaves here (Set Error Info, keyboard
-                    // indicators, …) is session-loop material: skipped now, handled by the
-                    // corresponding epics.
+                    // Anything else the server interleaves here is skipped. Set Error Info and
+                    // Set Keyboard Indicators (#305) are handled on the session leg only.
                     _ => Ok(Vec::new()),
                 }
             }
@@ -2688,10 +2687,10 @@ mod tests {
     #[test]
     fn unknown_data_pdus_during_finalization_are_skipped() {
         let mut sm = finalizing();
-        // Set Keyboard Indicators (0x29) interleaves here on real servers and has no handler
-        // yet (#305). Save Session Info used to stand in for this and now has one (#304).
+        // Set Keyboard Indicators is handled on the session leg only and skipped here (#305).
         let actions = sm.process(Event::Received(&server_io_frame(&server_share_data(
-            0x29, &[0u8; 12],
+            share::PDU_TYPE2_SET_KEYBOARD_INDICATORS,
+            &[0u8; 12],
         ))));
         assert!(actions.is_empty());
         assert_eq!(sm.stage(), "activation");

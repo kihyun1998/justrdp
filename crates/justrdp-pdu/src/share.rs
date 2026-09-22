@@ -43,6 +43,8 @@ pub const PDU_TYPE2_FONT_LIST: u8 = 0x27;
 pub const PDU_TYPE2_FONT_MAP: u8 = 0x28;
 /// `pduType2`: Save Session Info PDU (server → client, logon notifications).
 pub const PDU_TYPE2_SAVE_SESSION_INFO: u8 = 0x26;
+/// `pduType2`: Set Keyboard Indicators PDU (server → client, the lock state; 2.2.8.2.1).
+pub const PDU_TYPE2_SET_KEYBOARD_INDICATORS: u8 = 0x29;
 /// `pduType2`: Set Error Info PDU (server → client, disconnect reasons).
 pub const PDU_TYPE2_SET_ERROR_INFO: u8 = 0x2F;
 /// `pduType2`: Input Event PDU (client → server, the slow-path input fallback).

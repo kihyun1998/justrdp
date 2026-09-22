@@ -8,6 +8,12 @@
 //! - **Slow-path** (`TS_INPUT_PDU_DATA`, 2.2.8.1.1.3): the Share Data PDU body
 //!   (`pduType2` = [`crate::share::PDU_TYPE2_INPUT`]) used as the fallback
 //!   ([`encode_slowpath_input_body`]).
+//!
+//! And the one server → client keyboard PDU, [`KeyboardIndicators`] (2.2.8.2.1.1), whose
+//! `ledFlags` use the same bits as the Synchronize event's `toggleFlags`.
+
+use crate::DecodeError;
+use crate::cursor::ReadCursor;
 
 /// `pointerFlags`: the wheel rotation is negative (toward the user).
 pub const PTRFLAGS_WHEEL_NEGATIVE: u16 = 0x0100;
@@ -41,6 +47,51 @@ pub const SYNC_NUM_LOCK: u8 = 0x02;
 pub const SYNC_CAPS_LOCK: u8 = 0x04;
 /// Sync toggle flag: Kana Lock is on.
 pub const SYNC_KANA_LOCK: u8 = 0x08;
+
+/// Set Keyboard Indicators PDU Data (`TS_SET_KEYBOARD_INDICATORS_PDU`, `[MS-RDPBCGR]`
+/// 2.2.8.2.1.1) — the server's view of the keyboard locks, the Share Data body of
+/// [`crate::share::PDU_TYPE2_SET_KEYBOARD_INDICATORS`].
+///
+/// `unitId` is not decoded: the spec says the client SHOULD ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardIndicators {
+    /// `ledFlags` as sent: the `SYNC_*` bits for the locks that are on. Bits the spec does not
+    /// define are kept.
+    pub led_flags: u16,
+}
+
+impl KeyboardIndicators {
+    /// Decode the Share Data body.
+    pub fn decode(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        cur.read_u16_le()?; // unitId
+        let led_flags = cur.read_u16_le()?;
+        Ok(Self { led_flags })
+    }
+
+    fn is_set(self, bit: u8) -> bool {
+        self.led_flags & u16::from(bit) != 0
+    }
+
+    /// Scroll Lock is on ([`SYNC_SCROLL_LOCK`]).
+    pub fn scroll_lock(self) -> bool {
+        self.is_set(SYNC_SCROLL_LOCK)
+    }
+
+    /// Num Lock is on ([`SYNC_NUM_LOCK`]).
+    pub fn num_lock(self) -> bool {
+        self.is_set(SYNC_NUM_LOCK)
+    }
+
+    /// Caps Lock is on ([`SYNC_CAPS_LOCK`]).
+    pub fn caps_lock(self) -> bool {
+        self.is_set(SYNC_CAPS_LOCK)
+    }
+
+    /// Kana Lock is on ([`SYNC_KANA_LOCK`]).
+    pub fn kana_lock(self) -> bool {
+        self.is_set(SYNC_KANA_LOCK)
+    }
+}
 
 // Fast-path eventCode values (the high 3 bits of the event header byte).
 const FP_EVENT_SCANCODE: u8 = 0;
@@ -456,5 +507,57 @@ mod tests {
     #[should_panic(expected = "1-255 events")]
     fn fastpath_rejects_an_empty_batch() {
         encode_fastpath_input(&[]);
+    }
+
+    fn indicators(body: &[u8]) -> Result<KeyboardIndicators, crate::DecodeError> {
+        KeyboardIndicators::decode(&mut crate::cursor::ReadCursor::new(body, "test"))
+    }
+
+    fn locks(k: KeyboardIndicators) -> [bool; 4] {
+        [k.scroll_lock(), k.num_lock(), k.caps_lock(), k.kana_lock()]
+    }
+
+    #[test]
+    fn each_indicator_bit_alone_lights_only_its_lock() {
+        for (bit, want) in [
+            (SYNC_SCROLL_LOCK, [true, false, false, false]),
+            (SYNC_NUM_LOCK, [false, true, false, false]),
+            (SYNC_CAPS_LOCK, [false, false, true, false]),
+            (SYNC_KANA_LOCK, [false, false, false, true]),
+        ] {
+            let k = indicators(&[0, 0, bit, 0]).expect("a 4-byte body decodes");
+            assert_eq!(k.led_flags, u16::from(bit));
+            assert_eq!(locks(k), want, "ledFlags {bit:#06x}");
+        }
+    }
+
+    #[test]
+    fn indicator_bits_combine() {
+        let k = indicators(&[0, 0, SYNC_NUM_LOCK | SYNC_CAPS_LOCK, 0]).unwrap();
+        assert_eq!(locks(k), [false, true, true, false]);
+        let k = indicators(&[0, 0, 0x0F, 0]).unwrap();
+        assert_eq!(locks(k), [true; 4]);
+        let k = indicators(&[0, 0, 0, 0]).unwrap();
+        assert_eq!(locks(k), [false; 4]);
+    }
+
+    #[test]
+    fn a_nonzero_unit_id_is_ignored() {
+        // 2.2.8.2.1.1: the client SHOULD ignore unitId.
+        let k = indicators(&[0x34, 0x12, SYNC_CAPS_LOCK, 0]).expect("unitId is not checked");
+        assert_eq!(k, KeyboardIndicators { led_flags: 0x0004 });
+    }
+
+    #[test]
+    fn undefined_led_bits_pass_through() {
+        let k = indicators(&[0, 0, 0x01, 0x80]).unwrap();
+        assert_eq!(k.led_flags, 0x8001);
+        assert_eq!(locks(k), [true, false, false, false]);
+    }
+
+    #[test]
+    fn a_truncated_indicators_body_is_a_typed_error() {
+        assert!(indicators(&[0, 0, 4]).is_err());
+        assert!(indicators(&[0]).is_err());
     }
 }
