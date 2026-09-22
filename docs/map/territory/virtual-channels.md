@@ -104,8 +104,19 @@ glossary, which is vocabulary rather than a decision.
     errors ([ADR-0009](../../adr/0009-tolerant-negotiation-posture.md) §3(a); both
     references refuse the same shapes). An overrun is refused at the chunk that causes it,
     because without that check a sequence whose LAST never comes grows past the cap.
-  - `CHANNEL_FLAG_SUSPEND`/`RESUME` chunks are skipped with an `rdp_svc` record (FreeRDP's
-    drdynvc does the same). Suspending *our* sending, which 2.2.6.1.1 asks for, is not built.
+  - `CHANNEL_FLAG_SUSPEND`/`RESUME` chunks carry no message and are skipped by the
+    reassembler. FreeRDP's drdynvc does the same. **Suspending our own sending**, which
+    2.2.6.1.1 asks for ("all virtual channel traffic MUST be suspended"), **was built at the
+    maintainer's call (2026-09-22)**. They were shown three options: build it now, file it, or
+    leave it to the map. *How* it works is a derivation. From SUSPEND to RESUME, every outbound
+    virtual channel frame is held, whichever channel the flag arrived on. That covers
+    `send_channel`, the machine's own drdynvc responses and a Display Control resize. The frames
+    are released in order as `WriteBytes` by the call that processes the RESUME. Holding
+    rather than refusing is what reaches the traffic the machine produces itself, and it spares
+    the host from tracking the resume. The host's held messages are bounded by
+    `CHANNEL_MESSAGE_CAP`; past it `send_channel` returns `SuspendedQueueFull`. The machine's
+    own responses are not bounded, because each one answers a server message of similar size.
+    **No server has been seen sending either flag**, so this is proven by unit tests only.
   - **a FIRST while a message is in flight is a typed error**, as both references treat it.
     drdynvc used to abandon the message and start over, and #307 first kept that. Refusing it
     was **the maintainer's call (2026-09-22)**, shown three options: refuse now, keep starting
