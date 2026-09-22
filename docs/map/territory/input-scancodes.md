@@ -53,9 +53,9 @@ crate is pulled in — neither decides the mapping itself.
   it across in `ActivationResult` the way #304 carries Save Session Info. What it was decided
   on: FreeRDP's handler returns `FALSE` below `CONNECTION_STATE_ACTIVE` and its finalization
   states route data PDUs into it, so a pre-Font-Map 0x29 fails FreeRDP's connect, which
-  suggests servers do not send one. That was prior art, not a measurement: the VM has never
-  sent 0x29 on either leg (`## Reference behaviour`), so the decision is **untested** against
-  a server that does.
+  suggests servers do not send one. That was prior art, not a measurement. The one observed
+  0x29 (FreeRDP's run) arrived about 16 s after session-active, so it says nothing about the
+  connect leg either; the decision stays **untested** against a server that sends one there.
 
 ## Code
 
@@ -77,21 +77,26 @@ that is the single largest gap in the map: the three tables were derived once, a
 is no recorded comparison against FreeRDP's keyboard maps, which is the only artifact that
 could settle a disputed row.
 
-**Set Keyboard Indicators: this WS2022 VM never sends it** (#305, 2026-09-22). Four runs,
-raw session and connect captures scanned for every `pduType2`: 0x26, 0x2F and the
-finalization replies are there, 0x29 never. The stimuli covered a client Synchronize of none,
-Caps, and Scroll+Num+Caps, and Caps, Num and Scroll Lock each pressed twice, with and without
-a focusing click first. So #305's premise that *"the server answers 0x29 when its own view
-differs"* is **false for this server**, and what makes a Windows server send one is not
-established. The layout rests on the spec and FreeRDP's handler agreeing (`unitId` u16 LE,
+**Set Keyboard Indicators: this VM sends it, and not to justrdp's stimuli** (#305,
+2026-09-22). Five justrdp runs, raw session and connect captures scanned for every `pduType2`:
+0x26, 0x2F and the finalization replies are there, 0x29 never. The stimuli covered a client
+Synchronize of none, Caps, and Scroll+Num+Caps, and Caps, Num and Scroll Lock each pressed
+twice, with and without a focusing click first. **#305 first recorded that as "this server
+never sends it", which was wrong**: one FreeRDP session against the same VM received
+`Set Keyboard Indicators Data PDU (0x29), length: 22` — 18 bytes of Share Data header and the
+4-byte body this decoder reads — once, while Caps Lock was pressed and the on-screen keyboard
+used. Which of the two provoked it, and what justrdp does differently, is not established.
+The procedure is in [Verification harness](verification-harness.md) §Reference behaviour. The layout rests on the spec and FreeRDP's handler agreeing (`unitId` u16 LE,
 then `ledFlags` u16 LE), plus hand-built bodies. `keyboard_indicators_probe_against_real_vm`
 re-runs the stimuli, prints any 0x29 it sees, and asserts only that the session survives —
-advisory by the maintainer's call, because no assertion about the arm can fail on this VM.
+advisory by the maintainer's call, made when no justrdp stimulus had produced a 0x29.
 
 ## Cross-cutting invariants
 
 - [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
   — `unitId`, taken the third way out.
+- [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
+  — 0x29 reached FreeRDP and never justrdp on the same server.
 
 ## Blast radius
 

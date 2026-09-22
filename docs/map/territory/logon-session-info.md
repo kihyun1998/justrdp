@@ -167,17 +167,22 @@ server sends, never what servers send.
   at its sharpest: the V1 arm is not waiting on a different server, it is waiting on a different
   capability set. **Plain Notify** and an undefined `infoType` are genuinely unobserved. All
   three rest on hand-built bodies and the two references.
-- **No auto-reconnect cookie on this VM.** `FieldsPresent` has been `LOGON_EX_LOGONERRORS` alone
+- **No auto-reconnect cookie for justrdp on this VM — FreeRDP gets one.** Two FreeRDP sessions
+  (#305, 2026-09-22) logged `Logon Extended Info [cookie: TRUE, LogonId: 46]` from the same VM,
+  so the proof path below exists; what justrdp advertises or does differently is not
+  established. Original record: `FieldsPresent` has been `LOGON_EX_LOGONERRORS` alone
   on every observed logon, so the `ARC_SC_PRIVATE_PACKET` branch has no real bytes —
   [capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md).
   #306's *"capture the cookie, reconnect with it, assert the session resumed"* acceptance has
-  **no proof path on this VM as configured**, which that slice needs to know before it starts.
+  **no proof path on this VM as justrdp is configured**, which that slice needs to know before it
+  starts.
 - **The cookie is decoded and nothing replays it** (#306). `ClientInfo::reconnect_cookie` is
   still `None` on every connection, so no session is ever resumed — this area supplies the
   input that slice needs and takes none of its decisions.
 - ~~**Set Keyboard Indicators (0x29) is still in the catch-all** (#305).~~ **Closed by #305**
   on the session leg. It lives in [Input & platform scancode tables](input-scancodes.md),
-  next to the Synchronize event whose bits it shares, and this VM has never sent one.
+  next to the Synchronize event whose bits it shares. This VM has sent one to FreeRDP and none
+  to justrdp.
 - **`LogonErrorsInfo::notification_data` is polymorphic and typed as `u32`.** Which meaning it
   has is decided by the type, per 2.2.10.1.1.4.1.1: a session ID for all seven `LOGON_MSG_*`
   types, to be ignored for `ERROR_CODE_ACCESS_DENIED`, and a `LOGON_FAILED_*` code when the type
