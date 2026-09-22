@@ -54,6 +54,16 @@ impl<'a> ChannelChunk<'a> {
 /// chunk and SHOW_PROTOCOL on each when there is more than one. Each returned payload is ready to be wrapped in an MCS Send Data Request and is at
 /// most [`CHANNEL_CHUNK_LENGTH`] bytes long.
 pub fn encode_chunks(message: &[u8]) -> Vec<Vec<u8>> {
+    chunk_message(message, false)
+}
+
+/// [`encode_chunks`] for a channel opened with `CHANNEL_OPTION_SHOW_PROTOCOL`: SHOW_PROTOCOL on
+/// every chunk, a single-chunk message included.
+pub fn encode_chunks_show_protocol(message: &[u8]) -> Vec<Vec<u8>> {
+    chunk_message(message, true)
+}
+
+fn chunk_message(message: &[u8], always_show: bool) -> Vec<Vec<u8>> {
     const DATA_PER_CHUNK: usize = CHANNEL_CHUNK_LENGTH - 8;
     let total = message.len() as u32;
     let mut chunks: Vec<&[u8]> = message.chunks(DATA_PER_CHUNK).collect();
@@ -65,7 +75,7 @@ pub fn encode_chunks(message: &[u8]) -> Vec<Vec<u8>> {
         .iter()
         .enumerate()
         .map(|(i, data)| {
-            let mut flags = if last > 0 {
+            let mut flags = if always_show || last > 0 {
                 CHANNEL_FLAG_SHOW_PROTOCOL
             } else {
                 0
@@ -143,6 +153,29 @@ mod tests {
             .flat_map(|c| c.data.iter().copied())
             .collect();
         assert_eq!(reassembled, message);
+    }
+
+    /// A channel opened with `CHANNEL_OPTION_SHOW_PROTOCOL` shows the header on every chunk,
+    /// a single-chunk message included (`[MS-RDPERP]` 1.5 requires it of the RAIL channel).
+    #[test]
+    fn show_protocol_chunks_carry_the_flag_on_every_chunk() {
+        let one = encode_chunks_show_protocol(&[0xAA]);
+        let flags = ChannelChunk::decode(&one[0]).unwrap().flags;
+        assert_eq!(
+            flags,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST | CHANNEL_FLAG_SHOW_PROTOCOL
+        );
+        let many = encode_chunks_show_protocol(&vec![7u8; 4000]);
+        assert_eq!(many.len(), 3);
+        assert!(
+            many.iter()
+                .all(|c| ChannelChunk::decode(c).unwrap().flags & CHANNEL_FLAG_SHOW_PROTOCOL != 0)
+        );
+        // The data is chunked exactly as encode_chunks chunks it.
+        let plain = encode_chunks(&vec![7u8; 4000]);
+        for (a, b) in many.iter().zip(&plain) {
+            assert_eq!(a[8..], b[8..]);
+        }
     }
 
     #[test]

@@ -130,7 +130,12 @@ glossary, which is vocabulary rather than a decision.
 - **A multi-chunk message we send carries `CHANNEL_FLAG_SHOW_PROTOCOL` on every chunk**
   (`encode_chunks`), because 3.1.5.2.1 says chunked data MUST. IronRDP does the same;
   FreeRDP sets it only for a channel opened with `CHANNEL_OPTION_SHOW_PROTOCOL`. A
-  single-chunk message carries FIRST|LAST alone.
+  single-chunk message carries FIRST|LAST alone, **unless the host opened the channel with
+  `CHANNEL_OPTION_SHOW_PROTOCOL`**. Then every chunk carries it, which is FreeRDP's rule
+  (`channels.c`). The case that needs it is RAIL: `[MS-RDPERP]` 1.5 says the RAIL server
+  expects the header visible on all data over the RAIL channel, so the flag "has to be set".
+  Building it now, rather than leaving it to #14, was the maintainer's call (2026-09-22).
+  `StaticChannel` carries the requested `options` so the machine can tell.
 - **A host channel's message cap is 64 MiB** (`CHANNEL_MESSAGE_CAP`), against drdynvc's
   64 KiB. The value is unmeasured: 64 MiB leaves room for a 4K clipboard DIB (3840×2160×4 ≈
   33 MB), which is the largest message a channel we know of plausibly carries.

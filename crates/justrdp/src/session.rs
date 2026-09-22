@@ -1255,7 +1255,15 @@ impl SessionStateMachine {
             }
             self.held_bytes = held_bytes;
         }
-        let frames = svc::encode_chunks(message)
+        let show_protocol = self.config.static_channels.iter().any(|c| {
+            c.id == channel && c.options & justrdp_pdu::gcc::CHANNEL_OPTION_SHOW_PROTOCOL != 0
+        });
+        let chunks = if show_protocol {
+            svc::encode_chunks_show_protocol(message)
+        } else {
+            svc::encode_chunks(message)
+        };
+        let frames = chunks
             .iter()
             .map(|chunk| self.wrap_channel(channel, chunk))
             .collect();
@@ -1291,6 +1299,7 @@ mod tests {
     const DRDYNVC: u16 = 1005;
     const CLIPRDR: u16 = 1004;
     const RDPDR: u16 = 1006;
+    const RAIL: u16 = 1008;
     const SHARE: u32 = 0x0001_03EA;
 
     /// Read a delivered frame's pixels back out of the retained framebuffer — the host's job
@@ -1313,13 +1322,19 @@ mod tests {
             server_input_flags: capability::INPUT_FLAG_SCANCODES
                 | capability::INPUT_FLAG_FASTPATH_INPUT2,
             drdynvc_channel_id: Some(DRDYNVC),
-            static_channels: [("cliprdr", CLIPRDR), ("drdynvc", DRDYNVC), ("rdpdr", RDPDR)]
-                .into_iter()
-                .map(|(name, id)| crate::StaticChannel {
-                    name: name.to_string(),
-                    id,
-                })
-                .collect(),
+            static_channels: [
+                ("cliprdr", CLIPRDR, 0),
+                ("drdynvc", DRDYNVC, 0),
+                ("rdpdr", RDPDR, 0),
+                ("rail", RAIL, justrdp_pdu::gcc::CHANNEL_OPTION_SHOW_PROTOCOL),
+            ]
+            .into_iter()
+            .map(|(name, id, options)| crate::StaticChannel {
+                name: name.to_string(),
+                id,
+                options,
+            })
+            .collect(),
             egfx: Default::default(),
         }
     }
@@ -2627,6 +2642,32 @@ mod tests {
                 "the frame must carry the chunk verbatim"
             );
         }
+    }
+
+    /// A channel the host opened with `CHANNEL_OPTION_SHOW_PROTOCOL` shows the header on every
+    /// chunk, a single-chunk message included; any other channel does only when it chunks.
+    #[test]
+    fn send_channel_honours_the_show_protocol_option() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let flags_of = |frames: &[Vec<u8>]| -> Vec<u32> {
+            frames
+                .iter()
+                .map(|frame| {
+                    let body = x224::decode_data(tpkt::decode(frame).unwrap()).unwrap();
+                    // The frame ends with the chunk: an 8-byte header, then the 4-byte message.
+                    let chunk = &body[body.len() - 12..];
+                    u32::from_le_bytes(chunk[4..8].try_into().unwrap())
+                })
+                .collect()
+        };
+        let whole = svc::CHANNEL_FLAG_FIRST | svc::CHANNEL_FLAG_LAST;
+        let rail = sm.send_channel(RAIL, b"exec").unwrap();
+        assert_eq!(
+            flags_of(&rail),
+            vec![whole | svc::CHANNEL_FLAG_SHOW_PROTOCOL]
+        );
+        let rdpdr = sm.send_channel(RDPDR, b"exec").unwrap();
+        assert_eq!(flags_of(&rdpdr), vec![whole]);
     }
 
     #[test]

@@ -112,6 +112,8 @@ pub struct StaticChannel {
     pub name: String,
     /// The server-assigned MCS channel ID.
     pub id: u16,
+    /// The `CHANNEL_OPTION_*` bits it was requested with.
+    pub options: u32,
 }
 
 /// The outcome of a completed MCS connect: everything downstream slices (Client Info,
@@ -699,6 +701,7 @@ impl ConnectStateMachine {
             .map(|(def, &id)| StaticChannel {
                 name: def.name_str().to_string(),
                 id,
+                options: def.options,
             })
             .collect();
 
@@ -1778,11 +1781,13 @@ mod tests {
                     static_channels: vec![
                         StaticChannel {
                             name: "cliprdr".to_string(),
-                            id: 1004
+                            id: 1004,
+                            options: CHANNEL_OPTION_INITIALIZED,
                         },
                         StaticChannel {
                             name: "drdynvc".to_string(),
-                            id: 1005
+                            id: 1005,
+                            options: CHANNEL_OPTION_INITIALIZED,
                         },
                     ],
                     desktop_size: (1280, 800),
@@ -1856,7 +1861,8 @@ mod tests {
                     result.static_channels,
                     vec![StaticChannel {
                         name: "cliprdr".to_string(),
-                        id: 1004
+                        id: 1004,
+                        options: CHANNEL_OPTION_INITIALIZED,
                     }]
                 );
             }
