@@ -2340,16 +2340,35 @@ mod tests {
                 .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
 
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
             let (tx, mut commands) = tokio::sync::mpsc::channel(4);
             let cancel = CancellationToken::new();
-            let done = cancel.clone();
+            // The session ends once the exchange is done *and* the desktop has painted and
+            // settled, as every other VM test does before it lets go of the session.
+            let frames = Arc::new(AtomicUsize::new(0));
+            let exchanged = Arc::new(AtomicBool::new(false));
+            let watcher = {
+                let (frames, exchanged, done) = (frames.clone(), exchanged.clone(), cancel.clone());
+                tokio::spawn(async move {
+                    let settled = vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await;
+                    while !exchanged.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    done.cancel();
+                    settled
+                })
+            };
+            let frames_in_sink = frames.clone();
             let mut received: Vec<(u16, Vec<u8>)> = Vec::new();
             let ended = tokio::time::timeout(
-                Duration::from_secs(40),
+                Duration::from_secs(90),
                 run_session_with_commands(
                     &mut stream,
                     &mut machine,
-                    |_, _| {},
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
                     |_| {},
                     |event| {
                         let SessionEvent::ChannelData { channel, data } = event else {
@@ -2367,15 +2386,15 @@ mod tests {
                             .expect("the command queue has room");
                         }
                         received.push((channel, data));
-                        // Done once both have happened: the ID confirmed on rdpdr, and cliprdr's
-                        // Monitor Ready, which this server sends after the rdpdr exchange.
+                        // The exchange is done once both have happened: the ID confirmed on rdpdr,
+                        // and cliprdr's Monitor Ready, which may come before or after it.
                         let seen = |ch: u16, prefix: &[u8]| {
                             received
                                 .iter()
                                 .any(|(c, d)| *c == ch && d.starts_with(prefix))
                         };
                         if seen(rdpdr, b"rDCC") && seen(cliprdr, &[0x01, 0x00]) {
-                            done.cancel();
+                            exchanged.store(true, Ordering::SeqCst);
                         }
                     },
                     &mut commands,
@@ -2391,8 +2410,12 @@ mod tests {
                 );
             }
             ended
-                .expect("the server confirmed the client ID within 40 s")
+                .expect("the exchange completed and the desktop settled within 90 s")
                 .expect("the session ran without a protocol failure");
+            watcher
+                .await
+                .expect("the watcher task")
+                .expect("the desktop painted and settled");
 
             let on = |channel: u16| received.iter().filter(move |(c, _)| *c == channel);
             // cliprdr: the server's Clipboard Capabilities, whose dataLen matches what arrived.
