@@ -106,9 +106,11 @@ glossary, which is vocabulary rather than a decision.
     because without that check a sequence whose LAST never comes grows past the cap.
   - `CHANNEL_FLAG_SUSPEND`/`RESUME` chunks are skipped with an `rdp_svc` record (FreeRDP's
     drdynvc does the same). Suspending *our* sending, which 2.2.6.1.1 asks for, is not built.
-  - a FIRST while a message is in flight abandons it and starts over, as drdynvc always did,
-    now with an `rdp_svc` record. **Both references refuse it instead**; changing that was
-    not part of the call and is carried as an open question.
+  - **a FIRST while a message is in flight is a typed error**, as both references treat it.
+    drdynvc used to abandon the message and start over, and #307 first kept that. Refusing it
+    was **the maintainer's call (2026-09-22)**, shown three options: refuse now, keep starting
+    over, or file a `decide:` issue. The spec does not address the case, and this VM never
+    sent it, so a conforming server is not expected to reach it.
   - `CHANNEL_FLAG_SHOW_PROTOCOL` asks that the header reach the endpoint. The core *is*
     the endpoint's reassembly, so the host gets the reassembled message and never a header.
 - **Data on a channel ID that was never granted is skipped with an `rdp_svc` record**, not

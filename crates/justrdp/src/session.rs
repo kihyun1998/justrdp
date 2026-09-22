@@ -2387,6 +2387,31 @@ mod tests {
         );
     }
 
+    /// A FIRST chunk while a message is in flight on a host channel ends the session: both
+    /// reference clients refuse it, and so does this machine.
+    #[test]
+    fn a_first_chunk_mid_sequence_on_a_host_channel_ends_the_session() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let first = |total: u32, data: &[u8]| {
+            let mut chunk = total.to_le_bytes().to_vec();
+            chunk.extend_from_slice(&svc::CHANNEL_FLAG_FIRST.to_le_bytes());
+            chunk.extend_from_slice(data);
+            server_channel_frame(CLIPRDR, &chunk)
+        };
+        assert!(sm.process_bytes(&first(9, b"old")).unwrap().is_empty());
+        let err = sm.process_bytes(&first(3, b"new")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                    field: "CHANNEL_PDU_HEADER.flags",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+    }
+
     /// drdynvc is granted and listed with the host's channels, and still never reaches the
     /// host: its traffic is the dynamic-channel manager's.
     #[test]

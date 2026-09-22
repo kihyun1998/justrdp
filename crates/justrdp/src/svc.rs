@@ -68,15 +68,13 @@ impl Reassembler {
             return Ok(Some(chunk.data.to_vec()));
         }
         if first {
-            if let Some(abandoned) = self.expected {
-                tracing::debug!(
-                    target: "rdp_svc",
-                    abandoned_length = abandoned,
-                    received = self.buffer.len(),
-                    "SVC first chunk mid-sequence; the message in flight is abandoned"
-                );
+            if self.expected.is_some() {
+                self.reset();
+                return Err(DecodeError::InvalidField {
+                    field: "CHANNEL_PDU_HEADER.flags",
+                    reason: "SVC first chunk while a message is in flight",
+                });
             }
-            self.buffer.clear();
             self.expected = Some(total);
         } else {
             match self.expected {
@@ -260,16 +258,15 @@ mod tests {
         assert_eq!(r.push(&chunk(1, 0, b"z")).unwrap(), Some(b"z".to_vec()));
     }
 
-    /// A FIRST while a message is in flight abandons it and starts over.
+    /// A FIRST while a message is in flight is refused, and the refusal leaves nothing behind.
     #[test]
-    fn a_first_chunk_mid_sequence_starts_a_new_message() {
+    fn a_first_chunk_mid_sequence_is_refused() {
         let mut r = Reassembler::new(1 << 20);
         assert_eq!(r.push(&chunk(9, CHANNEL_FLAG_FIRST, b"old")).unwrap(), None);
         let whole = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST;
-        assert_eq!(
-            r.push(&chunk(3, whole, b"new")).unwrap(),
-            Some(b"new".to_vec())
-        );
+        let err = r.push(&chunk(3, whole, b"new")).unwrap_err();
+        assert_eq!(invalid_field(err), "CHANNEL_PDU_HEADER.flags");
+        assert_eq!(r.push(&chunk(1, 0, b"z")).unwrap(), Some(b"z".to_vec()));
     }
 
     /// SUSPEND and RESUME chunks carry no message data and leave a sequence in flight alone.
