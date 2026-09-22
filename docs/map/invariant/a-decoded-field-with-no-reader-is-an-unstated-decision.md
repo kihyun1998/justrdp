@@ -65,6 +65,10 @@ wrote, unapplied.
   read, recorded in the decoder's doc, and not enforced — because the references disagree
   about two of them and neither frames from any. `ServerAutoReconnect::version` is the
   fourth, whose reader is #306 by the maintainer's call rather than by inference.
+- [Input & platform scancode tables](../territory/input-scancodes.md) — Set Keyboard
+  Indicators' `unitId`, the first site to take **way #3 in advance** (#305): not decoded,
+  because 2.2.8.2.1.1 says the client SHOULD ignore it, so a field would have had no reader
+  by the spec's own instruction.
 
 ## What a violation looks like
 

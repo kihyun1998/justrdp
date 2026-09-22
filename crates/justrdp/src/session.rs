@@ -83,6 +83,10 @@ pub enum SessionOutput {
     /// **notification, not a disconnect** — unlike [`Self::ShutdownDenied`] it may precede one,
     /// and the attribution for a close that follows is still Set Error Info.
     SaveSessionInfo(session_info::SaveSessionInfo),
+    /// The server's view of the keyboard locks — `[MS-RDPBCGR]` 2.2.8.2.1.1 (issue #305), in
+    /// the bits of [`InputEvent::Sync`]. What the host does with it (LEDs, a status display,
+    /// nothing) is the host's.
+    KeyboardIndicators(input::KeyboardIndicators),
     /// One whole message on a static channel the host requested (issue #307), reassembled
     /// from its chunks (`[MS-RDPBCGR]` 3.1.5.2.2). What the bytes mean is the host's.
     ChannelData {
@@ -842,9 +846,23 @@ impl SessionStateMachine {
                 outputs.push(SessionOutput::SaveSessionInfo(info));
                 Ok(())
             }
+            share::PDU_TYPE2_SET_KEYBOARD_INDICATORS => {
+                // The server's lock state (issue #305). No phase guard, as for Save Session
+                // Info: it concerns the keyboard, not the share.
+                let indicators =
+                    input::KeyboardIndicators::decode(cur).map_err(SessionError::Decode)?;
+                tracing::debug!(
+                    target: "rdp_keyboard_indicators",
+                    led_flags = format_args!("{:#06x}", indicators.led_flags),
+                    "server Set Keyboard Indicators"
+                );
+                outputs.push(SessionOutput::KeyboardIndicators(indicators));
+                Ok(())
+            }
             // The rest: skipped, cursor unread, until their epics. (Set Error Info, the
-            // reactivation Synchronize/Control and Save Session Info have their own arms above
-            // — this comment used to claim both, and to call the skip a decode; #252.)
+            // reactivation Synchronize/Control, Save Session Info and Set Keyboard Indicators
+            // have their own arms above — this comment used to claim the first two, and to
+            // call the skip a decode; #252.)
             _ => Ok(()),
         }
     }
@@ -1462,7 +1480,7 @@ mod tests {
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
         for pdu_type2 in [
             share::PDU_TYPE2_SHUTDOWN_REQUEST, // 0x24 — ours to send, never to receive
-            0x29,                              // Set Keyboard Indicators — catch-all, unread
+            0x2D,                              // Set Keyboard IME Status — catch-all, unread
         ] {
             let outputs = sm
                 .process_bytes(&server_data_pdu(pdu_type2, &[]))
@@ -1472,9 +1490,9 @@ mod tests {
                 "pduType2 {pdu_type2:#04x} must not surface as a refusal"
             );
         }
-        // 0x26 used to sit in that list, as a `pduType2` the dispatcher skipped in silence.
-        // Since #304 it has a handler, so the side condition it carries is the stronger one:
-        // two handled neighbours must not be mistaken for each other.
+        // 0x26 and 0x29 used to sit in that list, as `pduType2`s the dispatcher skipped in
+        // silence. Since #304 and #305 each has a handler, so the side condition they carry is
+        // the stronger one: handled neighbours must not be mistaken for each other.
         let outputs = sm
             .process_bytes(&server_data_pdu(
                 share::PDU_TYPE2_SAVE_SESSION_INFO,
@@ -1486,6 +1504,57 @@ mod tests {
             vec![SessionOutput::SaveSessionInfo(
                 session_info::SaveSessionInfo::PlainNotify
             )]
+        );
+        let outputs = sm
+            .process_bytes(&server_data_pdu(
+                share::PDU_TYPE2_SET_KEYBOARD_INDICATORS,
+                &[0, 0, input::SYNC_CAPS_LOCK, 0],
+            ))
+            .expect("a well-formed Set Keyboard Indicators decodes");
+        assert_eq!(
+            outputs,
+            vec![SessionOutput::KeyboardIndicators(
+                input::KeyboardIndicators { led_flags: 0x0004 }
+            )]
+        );
+    }
+
+    /// Issue #305: the server's lock state reaches the host, one output per PDU, as sent.
+    #[test]
+    fn set_keyboard_indicators_surfaces_the_server_lock_state() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        for led_flags in [0x0000u16, 0x0002, 0x0006, 0x000F] {
+            let mut body = 0u16.to_le_bytes().to_vec(); // unitId
+            body.extend_from_slice(&led_flags.to_le_bytes());
+            let outputs = sm
+                .process_bytes(&server_data_pdu(
+                    share::PDU_TYPE2_SET_KEYBOARD_INDICATORS,
+                    &body,
+                ))
+                .expect("a well-formed Set Keyboard Indicators decodes");
+            assert_eq!(
+                outputs,
+                vec![SessionOutput::KeyboardIndicators(
+                    input::KeyboardIndicators { led_flags }
+                )],
+                "ledFlags {led_flags:#06x}"
+            );
+        }
+        assert_eq!(sm.phase, Phase::Active);
+    }
+
+    #[test]
+    fn a_truncated_set_keyboard_indicators_is_a_typed_error() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let result = sm.process_bytes(&server_data_pdu(
+            share::PDU_TYPE2_SET_KEYBOARD_INDICATORS,
+            &[0, 0, 4],
+        ));
+        assert!(
+            matches!(result, Err(SessionError::Decode(_))),
+            "got {result:?}"
         );
     }
 

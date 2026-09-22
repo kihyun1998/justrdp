@@ -43,6 +43,9 @@ Deactivation–Reactivation, which is how a resize actually happens.
   `Control::check_server_action`. Until #252 they did not: the reactivation leg dropped the
   `ReadCursor` unread, so a server `Control(Detach)` was fatal on connect and invisible on
   resize.
+- **Set Keyboard Indicators (0x29) is the exception, deliberately.** The session leg surfaces
+  it and this leg's catch-all skips it — the maintainer's call in #305, recorded with what it
+  was decided on in [Input & platform scancode tables](input-scancodes.md).
 
 ## Code
 

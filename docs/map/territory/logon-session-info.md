@@ -175,8 +175,9 @@ server sends, never what servers send.
 - **The cookie is decoded and nothing replays it** (#306). `ClientInfo::reconnect_cookie` is
   still `None` on every connection, so no session is ever resumed — this area supplies the
   input that slice needs and takes none of its decisions.
-- **Set Keyboard Indicators (0x29) is still in the catch-all** (#305) — the other half of
-  epic #25 and the last `pduType2` this area's neighbours drop in silence.
+- ~~**Set Keyboard Indicators (0x29) is still in the catch-all** (#305).~~ **Closed by #305**
+  on the session leg. It lives in [Input & platform scancode tables](input-scancodes.md),
+  next to the Synchronize event whose bits it shares, and this VM has never sent one.
 - **`LogonErrorsInfo::notification_data` is polymorphic and typed as `u32`.** Which meaning it
   has is decided by the type, per 2.2.10.1.1.4.1.1: a session ID for all seven `LOGON_MSG_*`
   types, to be ignored for `ERROR_CODE_ACCESS_DENIED`, and a `LOGON_FAILED_*` code when the type

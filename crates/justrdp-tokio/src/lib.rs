@@ -818,6 +818,10 @@ pub async fn run_session_with_input(
                     // say it twice. A host that wants the session ID or the reconnect cookie
                     // uses run_session_with_commands.
                 }
+                SessionOutput::KeyboardIndicators(_) => {
+                    // As for Save Session Info: no event sink here, and the core already
+                    // emitted the `rdp_keyboard_indicators` record.
+                }
                 SessionOutput::ChannelData { channel, data } => {
                     // No event sink here either: a host that uses static channels receives
                     // them through run_session_with_commands, which can also send on them.
@@ -915,6 +919,9 @@ pub enum SessionEvent {
     /// password is treated, and note that
     /// [`SaveSessionInfo`](justrdp_pdu::session_info::SaveSessionInfo)'s `Debug` redacts it.
     SaveSessionInfo(justrdp_pdu::session_info::SaveSessionInfo),
+    /// The server's view of the keyboard locks (`[MS-RDPBCGR]` 2.2.8.2.1.1, issue #305). Driving
+    /// LEDs from it, or not, is the host's.
+    KeyboardIndicators(justrdp_pdu::input::KeyboardIndicators),
     /// One whole message on a static channel the host requested (issue #307). What it means,
     /// and whether anything answers it, is the host's.
     ChannelData {
@@ -932,7 +939,8 @@ pub enum SessionEvent {
 /// future remains equally safe — the machine is pure and the socket is caller-owned.
 ///
 /// `on_event` receives session milestones ([`SessionEvent::DisplayControlReady`],
-/// [`SessionEvent::ShutdownDenied`], [`SessionEvent::SaveSessionInfo`]);
+/// [`SessionEvent::ShutdownDenied`], [`SessionEvent::SaveSessionInfo`],
+/// [`SessionEvent::KeyboardIndicators`], [`SessionEvent::ChannelData`]);
 /// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
 pub async fn run_session_with_commands(
     stream: &mut TlsStream<TcpStream>,
@@ -966,6 +974,9 @@ pub async fn run_session_with_commands(
                 }
                 SessionOutput::SaveSessionInfo(info) => {
                     on_event(SessionEvent::SaveSessionInfo(info));
+                }
+                SessionOutput::KeyboardIndicators(indicators) => {
+                    on_event(SessionEvent::KeyboardIndicators(indicators));
                 }
                 SessionOutput::ChannelData { channel, data } => {
                     on_event(SessionEvent::ChannelData { channel, data });
@@ -2570,6 +2581,135 @@ mod tests {
                         err.notification_data
                     );
                 }
+            }
+        })
+        .await
+    }
+
+    /// Probe for issue #305: every lock stimulus a client can send, and any Set Keyboard
+    /// Indicators the server answers with. Advisory: it asserts only that the session survives
+    /// the stimuli, never that an indicator arrives, because this VM has never sent one
+    /// (`docs/map/territory/logon-session-info.md`). Run with `--nocapture`.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn keyboard_indicators_probe_against_real_vm() {
+        use justrdp_pdu::input::{
+            KeyboardIndicators, PTRFLAGS_BUTTON1, PTRFLAGS_DOWN, PTRFLAGS_MOVE, SYNC_CAPS_LOCK,
+            SYNC_NUM_LOCK, SYNC_SCROLL_LOCK,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        with_vm_session(|vm| async move {
+            let config = test_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let frames = Arc::new(AtomicUsize::new(0));
+            let frames_in_sink = frames.clone();
+            let seen: Arc<Mutex<Vec<(&'static str, KeyboardIndicators)>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let seen_in_event = seen.clone();
+            let stage: Arc<Mutex<&'static str>> = Arc::new(Mutex::new("logon"));
+            let stage_in_event = stage.clone();
+            let (tx, mut commands) = tokio::sync::mpsc::channel(8);
+            let cancel = CancellationToken::new();
+            let canceller = cancel.clone();
+
+            let driver = tokio::spawn(async move {
+                let result = async {
+                    vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                    let (x, y) = (400u16, 300u16);
+                    let click = vec![
+                        InputEvent::Mouse {
+                            flags: PTRFLAGS_MOVE,
+                            wheel_units: 0,
+                            x,
+                            y,
+                        },
+                        InputEvent::Mouse {
+                            flags: PTRFLAGS_DOWN | PTRFLAGS_BUTTON1,
+                            wheel_units: 0,
+                            x,
+                            y,
+                        },
+                        InputEvent::Mouse {
+                            flags: PTRFLAGS_BUTTON1,
+                            wheel_units: 0,
+                            x,
+                            y,
+                        },
+                    ];
+                    let sync = |toggle_flags| vec![InputEvent::Sync { toggle_flags }];
+                    // A click first: a fresh logon has focus on nothing and swallows keys.
+                    // Every lock pressed twice, so the session ends with the state it began.
+                    for (label, events) in [
+                        ("click", click),
+                        ("sync none", sync(0)),
+                        ("sync caps", sync(SYNC_CAPS_LOCK)),
+                        (
+                            "sync all",
+                            sync(SYNC_SCROLL_LOCK | SYNC_NUM_LOCK | SYNC_CAPS_LOCK),
+                        ),
+                        ("sync none", sync(0)),
+                        ("caps", tap(0x14)),
+                        ("caps", tap(0x14)),
+                        ("num lock", tap(0x90)),
+                        ("num lock", tap(0x90)),
+                        ("scroll lock", tap(0x91)),
+                        ("scroll lock", tap(0x91)),
+                    ] {
+                        *stage.lock().unwrap() = label;
+                        tx.send(SessionCommand::Input(events))
+                            .await
+                            .map_err(|_| format!("the session loop closed before {label}"))?;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    Ok::<_, String>(())
+                }
+                .await;
+                canceller.cancel();
+                result
+            });
+
+            let ended = tokio::time::timeout(
+                Duration::from_secs(120),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    move |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    move |event| {
+                        if let SessionEvent::KeyboardIndicators(k) = event {
+                            let after = *stage_in_event.lock().unwrap();
+                            seen_in_event.lock().unwrap().push((after, k));
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("the probe finishes within its window");
+
+            driver
+                .await
+                .expect("the driver task ran")
+                .expect("the desktop should paint and settle");
+            assert_eq!(
+                ended.expect("the session survives every lock stimulus"),
+                DisconnectReason::LocalClosed
+            );
+            let seen = seen.lock().unwrap();
+            eprintln!("#305: {} Set Keyboard Indicators PDU(s)", seen.len());
+            for (after, k) in seen.iter() {
+                eprintln!("  after {after}: ledFlags {:#06x}", k.led_flags);
             }
         })
         .await

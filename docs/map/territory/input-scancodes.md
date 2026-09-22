@@ -6,7 +6,8 @@ Turning host input into RDP input PDUs: mouse movement and buttons, and — the 
 half — keyboard events, which RDP expresses as **PC/AT scancodes with an extended
 flag**, not as characters or platform key codes. So the library carries three
 translation tables (Windows virtual-key, macOS keycode, Linux evdev), the multi-event
-Pause sequence, and the toggle-key state a session must synchronise on.
+Pause sequence, and the toggle-key state a session must synchronise on — sent as the
+Synchronize event, and heard back as the server's Set Keyboard Indicators PDU (0x29).
 
 **This is a "nobody touches it, and it breaks silently" area.** A wrong row shows up
 as *one key that does nothing* on *one platform*, and neither the test suite nor the
@@ -34,32 +35,69 @@ crate is pulled in — neither decides the mapping itself.
 - **Toggle state is synchronised, not inferred.** `keyboard_toggle_flags()` is
   `cfg`-split per platform in the adapter — it reads real OS state, which is why it
   lives outside the core.
+- **The server's lock state comes back as data, not as action** (#305). Set Keyboard
+  Indicators decodes to `KeyboardIndicators` and surfaces as
+  `SessionOutput::KeyboardIndicators` / `SessionEvent::KeyboardIndicators`; driving an LED,
+  or showing a lock where the OS has none, is the host's. `ledFlags` stays a raw `u16`
+  with the four `SYNC_*` accessors, because 2.2.8.2.1.1 says its bits are the Synchronize
+  event's, and an undefined bit is passed through rather than dropped.
+- **`unitId` is not decoded.** 2.2.8.2.1.1: *"This field SHOULD be ignored by the client"*.
+  That is way #3 of [a decoded field with no reader](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md),
+  taken on the spec's word. FreeRDP warns on a non-zero one and IronRDP never parses the
+  body; neither acts on it. A truncated body (under 4 bytes) is a typed error, as in FreeRDP.
+  **Not logged either — the maintainer's call** (#305): the plan first shown logged a
+  non-zero `unitId` as FreeRDP does, which would have needed a field whose only reader is
+  that record; the maintainer kept the skip. No real `unitId` has ever been observed.
+- **Session leg only — the maintainer's call, not a derivation** (#305, 2026-09-22). The
+  connect leg's finalization catch-all still skips 0x29. The alternative shown was carrying
+  it across in `ActivationResult` the way #304 carries Save Session Info. What it was decided
+  on: FreeRDP's handler returns `FALSE` below `CONNECTION_STATE_ACTIVE` and its finalization
+  states route data PDUs into it, so a pre-Font-Map 0x29 fails FreeRDP's connect, which
+  suggests servers do not send one. That was prior art, not a measurement: the VM has never
+  sent 0x29 on either leg (`## Reference behaviour`), so the decision is **untested** against
+  a server that does.
 
 ## Code
 
 - `justrdp/src/input.rs` — `Scancode`, `scancode_from_windows_vk`,
   `scancode_from_macos_keycode`, `scancode_from_linux_evdev`, `pause_sequence`
 - `justrdp-pdu/src/input.rs` — `InputEvent`, `encode_fastpath_input`,
-  `encode_slowpath_input_body`
+  `encode_slowpath_input_body`, `KeyboardIndicators`, `SYNC_*`
+- `justrdp-pdu/src/share.rs` — `PDU_TYPE2_SET_KEYBOARD_INDICATORS`
+- `justrdp/src/session.rs` — `SessionOutput::KeyboardIndicators`
 - `justrdp-tokio/src/lib.rs` — `keyboard_toggle_flags` (two `cfg` variants),
-  `run_session_with_input`, `SessionCommand`
-- Spec section cited inline: `[MS-RDPBCGR]` 2.2.8.1.2.2.1
+  `run_session_with_input`, `SessionCommand`, `SessionEvent::KeyboardIndicators`,
+  `keyboard_indicators_probe_against_real_vm`
+- Spec sections cited inline: `[MS-RDPBCGR]` 2.2.8.1.2.2.1, 2.2.8.2.1.1
 
 ## Reference behaviour
 
-**None.** No verified external-fact store — and for this territory that is the
-single largest gap in the map: the three tables were derived once, and there is no
-recorded comparison against FreeRDP's keyboard maps, which is the only artifact that
+**The scancode tables: none.** No verified external-fact store — and for this territory
+that is the single largest gap in the map: the three tables were derived once, and there
+is no recorded comparison against FreeRDP's keyboard maps, which is the only artifact that
 could settle a disputed row.
+
+**Set Keyboard Indicators: this WS2022 VM never sends it** (#305, 2026-09-22). Four runs,
+raw session and connect captures scanned for every `pduType2`: 0x26, 0x2F and the
+finalization replies are there, 0x29 never. The stimuli covered a client Synchronize of none,
+Caps, and Scroll+Num+Caps, and Caps, Num and Scroll Lock each pressed twice, with and without
+a focusing click first. So #305's premise that *"the server answers 0x29 when its own view
+differs"* is **false for this server**, and what makes a Windows server send one is not
+established. The layout rests on the spec and FreeRDP's handler agreeing (`unitId` u16 LE,
+then `ledFlags` u16 LE), plus hand-built bodies. `keyboard_indicators_probe_against_real_vm`
+re-runs the stimuli, prints any 0x29 it sees, and asserts only that the session survives —
+advisory by the maintainer's call, because no assertion about the arm can fail on this VM.
 
 ## Cross-cutting invariants
 
-**None.**
+- [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
+  — `unitId`, taken the third way out.
 
 ## Blast radius
 
 - [Session loop & PDU dispatch](session-loop-dispatch.md) — input is written through
-  the session's byte output, interleaved with graphics traffic.
+  the session's byte output, interleaved with graphics traffic; and the Set Keyboard
+  Indicators arm and its output live there.
 - [Adapter drive loop](adapter-drive-loop.md) — owns `SessionCommand`, the input
   channel, and the platform toggle-flag read.
 - [Capability exchange & activation](capability-exchange-activation.md) —

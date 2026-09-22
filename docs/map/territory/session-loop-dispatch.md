@@ -20,9 +20,9 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 
 ## Design model
 
-- **Seven outputs, and the host's whole view of a live session is these**:
+- **Eight outputs, and the host's whole view of a live session is these**:
   `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `DisplayControlReady` ·
-  `ShutdownDenied` · `SaveSessionInfo` · `ChannelData`. Anything the host cannot learn from one of these,
+  `ShutdownDenied` · `SaveSessionInfo` · `KeyboardIndicators` · `ChannelData`. Anything the host cannot learn from one of these,
   it cannot learn at all
   — which is the argument #228 turned on: a `pduType2` that falls into the catch-all
   (**skipped, cursor unread** — the arm never decoded anything, whatever its comment said
@@ -51,7 +51,7 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   `BitmapUpdate`, `BitmapData`, `PaletteUpdate`
 - `justrdp-pdu/src/errinfo.rs` — `ErrorInfo`, `decode_set_error_info`
 - `justrdp-pdu/src/share.rs` — `PDU_TYPE2_SHUTDOWN_REQUEST`, `PDU_TYPE2_SHUTDOWN_DENIED`,
-  `PDU_TYPE2_SAVE_SESSION_INFO`
+  `PDU_TYPE2_SAVE_SESSION_INFO`, `PDU_TYPE2_SET_KEYBOARD_INDICATORS`
 - `justrdp-pdu/src/session_info.rs` — `SaveSessionInfo`
 
 ## Reference behaviour
@@ -86,6 +86,8 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   and the ordering between input writes and output drains.
 - [Logon & Save Session Info](logon-session-info.md) — the sixth output, and the only
   `pduType2` this loop dispatches that the connect leg dispatches too.
+- [Input & platform scancode tables](input-scancodes.md) — `KeyboardIndicators`, the
+  server's lock state in the Synchronize event's bits; session leg only, by the maintainer's call.
 
 ## Known holes / open
 
