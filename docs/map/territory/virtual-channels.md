@@ -162,7 +162,14 @@ glossary, which is vocabulary rather than a decision.
   FIRST|LAST chunk, so **no multi-chunk receive has been observed live**; that path is
   proven by the unit tests alone.
 - **`rdpdr` announces only when `rdpsnd` is requested too**: 0 of 2 runs without it, 4 of 4
-  with it. Why was not investigated.
+  with it. The specs do not ask for it: `[MS-RDPEFS]` 1.4/1.5 and `[MS-RDPEA]` 1.4/1.5 each
+  depend only on the channel transport. **FreeRDP always requests the two together**
+  (`client/common/cmdline.c`). Enabling `rdpsnd` forces device redirection on ("rdpsnd
+  requires rdpdr to be registered"). Enabling `rdpdr` without `rdpsnd` adds an `rdpsnd` with
+  the silent `sys:fake` backend, in place since 2012 (`e0b37aa97e`) with no rationale
+  recorded. So this reads as a Windows-server dependency rather than a protocol one. Which
+  channels to request is the host's, so the pairing is the host's to know. `rdpsnd` itself
+  sent nothing in 20 s, even with `rdpdr` present.
 - A Client Announce Reply sent on `rdpdr` is answered with Server Core Capability Request
   (`rDPS`, 84 bytes) and Server Client ID Confirm (`rDCC`) echoing the ClientId. Without the
   reply no `rDCC` arrives. That is the live send proof.
