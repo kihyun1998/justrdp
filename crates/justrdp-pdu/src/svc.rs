@@ -16,6 +16,9 @@ pub const CHANNEL_CHUNK_LENGTH: usize = 1600;
 pub const CHANNEL_FLAG_FIRST: u32 = 0x0000_0001;
 /// This chunk is the last of its message.
 pub const CHANNEL_FLAG_LAST: u32 = 0x0000_0002;
+/// The channel PDU header is visible to the endpoint (MS-RDPBCGR 2.2.6.1.1); a sender sets it
+/// on every chunk of a message that spans several (3.1.5.2.1).
+pub const CHANNEL_FLAG_SHOW_PROTOCOL: u32 = 0x0000_0010;
 /// The chunk data is compressed (`CHANNEL_PACKET_COMPRESSED`). justrdp advertises
 /// `VCCAPS_NO_COMPR`, so an inbound compressed chunk is a protocol violation.
 pub const CHANNEL_FLAG_PACKET_COMPRESSED: u32 = 0x0020_0000;
@@ -48,7 +51,7 @@ impl<'a> ChannelChunk<'a> {
 }
 
 /// Split `message` into SVC chunk payloads (header + data each), FIRST/LAST flags set per
-/// chunk. Each returned payload is ready to be wrapped in an MCS Send Data Request and is at
+/// chunk and SHOW_PROTOCOL on each when there is more than one. Each returned payload is ready to be wrapped in an MCS Send Data Request and is at
 /// most [`CHANNEL_CHUNK_LENGTH`] bytes long.
 pub fn encode_chunks(message: &[u8]) -> Vec<Vec<u8>> {
     const DATA_PER_CHUNK: usize = CHANNEL_CHUNK_LENGTH - 8;
@@ -62,7 +65,11 @@ pub fn encode_chunks(message: &[u8]) -> Vec<Vec<u8>> {
         .iter()
         .enumerate()
         .map(|(i, data)| {
-            let mut flags = 0;
+            let mut flags = if last > 0 {
+                CHANNEL_FLAG_SHOW_PROTOCOL
+            } else {
+                0
+            };
             if i == 0 {
                 flags |= CHANNEL_FLAG_FIRST;
             }
@@ -120,9 +127,16 @@ mod tests {
             .iter()
             .map(|c| ChannelChunk::decode(c).unwrap())
             .collect();
-        assert_eq!(decoded[0].flags, CHANNEL_FLAG_FIRST);
-        assert_eq!(decoded[1].flags, 0);
-        assert_eq!(decoded[2].flags, CHANNEL_FLAG_LAST);
+        // 3.1.5.2.1: every chunk of a chunked message carries SHOW_PROTOCOL.
+        assert_eq!(
+            decoded[0].flags,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_SHOW_PROTOCOL
+        );
+        assert_eq!(decoded[1].flags, CHANNEL_FLAG_SHOW_PROTOCOL);
+        assert_eq!(
+            decoded[2].flags,
+            CHANNEL_FLAG_LAST | CHANNEL_FLAG_SHOW_PROTOCOL
+        );
         assert!(decoded.iter().all(|c| c.total_length == 4000));
         let reassembled: Vec<u8> = decoded
             .iter()

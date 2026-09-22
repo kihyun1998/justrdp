@@ -818,6 +818,11 @@ pub async fn run_session_with_input(
                     // say it twice. A host that wants the session ID or the reconnect cookie
                     // uses run_session_with_commands.
                 }
+                SessionOutput::ChannelData { channel, data } => {
+                    // No event sink here either: a host that uses static channels receives
+                    // them through run_session_with_commands, which can also send on them.
+                    tracing::debug!(target: "rdp_svc", channel, bytes = data.len(), "static channel message");
+                }
             }
         }
         tokio::select! {
@@ -880,6 +885,15 @@ pub enum SessionCommand {
     /// unconditionally (measured — `docs/plan.md` §0), so this is a request, never a
     /// teardown: a host that needs the session *gone* still has to end it from inside.
     Shutdown,
+    /// Send one message on a host static channel (issue #307), chunked by the machine. A
+    /// channel the machine refuses ([`justrdp::ChannelSendError`]) is logged and dropped — the
+    /// session keeps running.
+    ChannelData {
+        /// The MCS channel ID, as in [`justrdp::SessionConfig::static_channels`].
+        channel: u16,
+        /// The message.
+        data: Vec<u8>,
+    },
 }
 
 /// A session milestone surfaced to the host by [`run_session_with_commands`].
@@ -901,6 +915,14 @@ pub enum SessionEvent {
     /// password is treated, and note that
     /// [`SaveSessionInfo`](justrdp_pdu::session_info::SaveSessionInfo)'s `Debug` redacts it.
     SaveSessionInfo(justrdp_pdu::session_info::SaveSessionInfo),
+    /// One whole message on a static channel the host requested (issue #307). What it means,
+    /// and whether anything answers it, is the host's.
+    ChannelData {
+        /// The MCS channel ID it arrived on, as in [`justrdp::SessionConfig::static_channels`].
+        channel: u16,
+        /// The message.
+        data: Vec<u8>,
+    },
 }
 
 /// [`run_session_with_input`] generalized to host *commands* (input + resize) and
@@ -945,6 +967,9 @@ pub async fn run_session_with_commands(
                 SessionOutput::SaveSessionInfo(info) => {
                     on_event(SessionEvent::SaveSessionInfo(info));
                 }
+                SessionOutput::ChannelData { channel, data } => {
+                    on_event(SessionEvent::ChannelData { channel, data });
+                }
             }
         }
         tokio::select! {
@@ -988,6 +1013,17 @@ pub async fn run_session_with_commands(
                         tracing::info!("shutdown requested");
                         for frame in machine.request_shutdown() {
                             stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                        }
+                    }
+                    Some(SessionCommand::ChannelData { channel, data }) => {
+                        match machine.send_channel(channel, &data) {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                                }
+                            }
+                            // Not fatal: the session is unaffected.
+                            Err(e) => tracing::warn!(channel, error = %e, "channel send refused"),
                         }
                     }
                     // Sender dropped: stop polling, keep the session alive.
@@ -2272,6 +2308,112 @@ mod tests {
     /// see this PDU. The fixture beside that README was teed by hand during #304 and the offline
     /// assertions live in `justrdp-pdu/tests/real_server_session.rs`; this test is the live half,
     /// and what it adds is that the bytes reach a **host sink** rather than merely decoding.
+    /// Real-VM acceptance for #307: static channels carry messages both ways. The server's
+    /// first `cliprdr` and `rdpdr` messages reach the host byte-exact, and an `rdpdr` Client
+    /// Announce Reply sent through [`SessionCommand::ChannelData`] is answered with a Server
+    /// Client ID Confirm carrying the ID the reply echoed. The RDPDR bytes are built here from
+    /// `[MS-RDPEFS]` 4.4; the library knows none of it.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn static_channels_carry_messages_both_ways_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            // rdpsnd is requested only because this server announces rdpdr only alongside it.
+            config.channels = ["cliprdr", "rdpsnd", "rdpdr"]
+                .iter()
+                .map(|name| gcc::ChannelDef::new(name, gcc::CHANNEL_OPTION_INITIALIZED).unwrap())
+                .collect();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let granted = |name: &str| {
+                outcome
+                    .mcs
+                    .static_channels
+                    .iter()
+                    .find(|c| c.name == name)
+                    .unwrap_or_else(|| panic!("the VM grants {name}"))
+                    .id
+            };
+            let (cliprdr, rdpdr) = (granted("cliprdr"), granted("rdpdr"));
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (tx, mut commands) = tokio::sync::mpsc::channel(4);
+            let cancel = CancellationToken::new();
+            let done = cancel.clone();
+            let mut received: Vec<(u16, Vec<u8>)> = Vec::new();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(40),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {},
+                    |_| {},
+                    |event| {
+                        let SessionEvent::ChannelData { channel, data } = event else {
+                            return;
+                        };
+                        if channel == rdpdr && data.starts_with(b"rDnI") {
+                            // Client Announce Reply: version 1.12 and the server's ClientId.
+                            let mut reply = b"rDCC".to_vec();
+                            reply.extend_from_slice(&[0x01, 0x00, 0x0C, 0x00]);
+                            reply.extend_from_slice(&data[8..12]);
+                            tx.try_send(SessionCommand::ChannelData {
+                                channel: rdpdr,
+                                data: reply,
+                            })
+                            .expect("the command queue has room");
+                        }
+                        received.push((channel, data));
+                        // Done once both have happened: the ID confirmed on rdpdr, and cliprdr's
+                        // Monitor Ready, which this server sends after the rdpdr exchange.
+                        let seen = |ch: u16, prefix: &[u8]| {
+                            received
+                                .iter()
+                                .any(|(c, d)| *c == ch && d.starts_with(prefix))
+                        };
+                        if seen(rdpdr, b"rDCC") && seen(cliprdr, &[0x01, 0x00]) {
+                            done.cancel();
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            for (channel, data) in &received {
+                eprintln!(
+                    "channel {channel}: {} bytes {:02x?}",
+                    data.len(),
+                    &data[..data.len().min(16)]
+                );
+            }
+            ended
+                .expect("the server confirmed the client ID within 40 s")
+                .expect("the session ran without a protocol failure");
+
+            let on = |channel: u16| received.iter().filter(move |(c, _)| *c == channel);
+            // cliprdr: the server's Clipboard Capabilities, whose dataLen matches what arrived.
+            let server_caps = on(cliprdr).next().expect("the VM opens cliprdr");
+            assert_eq!(&server_caps.1[..2], &[0x07, 0x00]);
+            let data_len = u32::from_le_bytes(server_caps.1[4..8].try_into().unwrap());
+            assert_eq!(server_caps.1.len(), 8 + data_len as usize);
+            // rdpdr: the Server Announce Request (`rDnI`, version, ClientId), then the Server
+            // Client ID Confirm answering our reply with the same ClientId.
+            let announce = on(rdpdr).next().expect("the VM announces rdpdr");
+            assert_eq!(announce.1.len(), 12);
+            assert_eq!(&announce.1[..4], b"rDnI");
+            let confirm = on(rdpdr)
+                .find(|(_, d)| d.starts_with(b"rDCC"))
+                .expect("the VM confirms the client ID");
+            assert_eq!(confirm.1.len(), 12);
+            assert_eq!(&confirm.1[8..12], &announce.1[8..12]);
+        })
+        .await
+    }
+
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn save_session_info_reaches_the_host_against_real_vm() {
@@ -2656,6 +2798,7 @@ mod tests {
                 .iter()
                 .find(|c| c.name == "drdynvc")
                 .map(|c| c.id),
+            static_channels: outcome.mcs.static_channels.clone(),
             egfx: Default::default(),
         }
     }
@@ -3772,6 +3915,7 @@ mod tests {
                 capabilities: Vec::new(),
                 server_input_flags: 0,
                 drdynvc_channel_id: None,
+                static_channels: Vec::new(),
                 egfx: Default::default(),
             },
             Vec::new(),
@@ -3868,6 +4012,7 @@ mod tests {
                 )],
                 server_input_flags: 0,
                 drdynvc_channel_id: None,
+                static_channels: Vec::new(),
                 egfx: Default::default(),
             },
             Vec::new(),
@@ -3935,6 +4080,7 @@ mod tests {
                 capabilities: Vec::new(),
                 server_input_flags: 0,
                 drdynvc_channel_id: None,
+                static_channels: Vec::new(),
                 egfx: Default::default(),
             },
             Vec::new(),

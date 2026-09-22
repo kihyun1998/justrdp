@@ -19,6 +19,7 @@ pub mod framebuffer;
 pub mod input;
 pub mod license_crypto;
 pub mod session;
+mod svc;
 pub mod tls;
 
 pub use connect::{
@@ -37,7 +38,9 @@ pub use justrdp_pdu::session_info::{
     LogonErrorNotification, LogonErrorsInfo, LogonInfo, LogonInfoExtended, SaveSessionInfo,
     ServerAutoReconnect,
 };
-pub use session::{ResizeError, SessionConfig, SessionError, SessionOutput, SessionStateMachine};
+pub use session::{
+    ChannelSendError, ResizeError, SessionConfig, SessionError, SessionOutput, SessionStateMachine,
+};
 
 /// The `fuzz/` lane's door into the EGFX graphics processor (#267) — **not host API**.
 ///
