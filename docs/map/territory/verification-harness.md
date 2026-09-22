@@ -86,9 +86,39 @@ everywhere else.
 
 ## Reference behaviour
 
-**None.** No verified external-fact store — which is a pointed absence *here*: the
+**No verified external-fact store** — which is a pointed absence *here*: the
 oracle compares behaviour at test time and records nothing, so a divergence
 adjudicated once (say, in #127) leaves no citable artifact behind, only a fixture.
+
+**A second client against the same VM** (#305, 2026-09-22). FreeRDP connected to
+`192.168.136.136` shows what the server sends a client that advertises what FreeRDP
+advertises, so it is the check to run before any *"the VM never sends X"* is recorded
+([capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)).
+Its first two runs overturned two such records at once: the VM sent Set Keyboard Indicators
+(0x29), which five justrdp runs never received, and set `LOGON_EX_AUTORECONNECTCOOKIE`, which no
+justrdp logon ever has (#306).
+
+```sh
+# WSL Ubuntu 24.04; FreeRDP 3.31.0 from apt. WSLg supplies the display.
+sudo apt install -y freerdp3-x11
+WLOG_FILTER=com.freerdp.core.rdp:DEBUG \
+  xfreerdp3 /v:192.168.136.136 /u:<user> /p:<password> /cert:ignore 2>&1 | tee fr.log
+grep -o 'recv [A-Za-z ]* Data PDU (0x[0-9A-F]*)' fr.log | sort | uniq -c
+grep 'client_common_save_session_info' fr.log   # Logon Info, and whether a cookie arrived
+```
+
+- **`WLOG_FILTER`, not `/log-filters`.** The command-line filter is parsed after the
+  `com.freerdp.core.rdp` logger exists (`rdp.c` creates it with the context), so it never takes
+  effect there: the first run logged no `Data PDU` line at all, and read as *"no 0x29"* until
+  that was noticed. The environment variable is read when WLog initialises.
+- **Check the log could see before reading an absence.** The same run must show the
+  finalization replies (`0x1F`, `0x14`, `0x28`) and Save Session Info (`0x26`); if they are
+  missing the log is blind, and a missing `0x29` means nothing.
+- **Manual and unscripted.** A person drives the session. Note what was done and roughly when,
+  because the log has timestamps and nothing else — the #305 run caught one 0x29 during a
+  session where Caps Lock was pressed and the on-screen keyboard used, and which one caused it
+  was not recorded.
+- `/cert:ignore` is for this lab VM only.
 
 ## Cross-cutting invariants
 

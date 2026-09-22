@@ -51,9 +51,11 @@ Two complete TPKT frames, 625 + 661 = 1286 bytes, carved out of a 27 260-byte se
 ### What it cannot see
 
 **No auto-reconnect cookie.** This server sent `LOGON_EX_LOGONERRORS` alone across every
-observed logon, so the `ARC_SC_PRIVATE_PACKET` path has **no fixture and no server here** —
+observed justrdp logon — it does send FreeRDP a cookie (#305's FreeRDP run), so the absence is
+this client's, not the server's. The `ARC_SC_PRIVATE_PACKET` path has **no fixture yet** —
 `docs/map/invariant/capture-coverage-follows-what-we-advertise.md` applies, and #306's
-"capture the cookie, reconnect with it" acceptance has no proof path on this VM as configured.
+"capture the cookie, reconnect with it" acceptance has no proof path until justrdp is
+configured the way that gets one.
 The cookie branch is covered by hand-built bodies in `justrdp-pdu/src/session_info.rs` only.
 
 Nor does it exercise Logon Info **V1**, Plain Notify, or an undefined `infoType` — and the

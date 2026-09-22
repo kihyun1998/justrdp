@@ -43,10 +43,13 @@ concluding anything is absent.
 - [Capability exchange & activation](../territory/capability-exchange-activation.md) — where the
   advertised config is built, and therefore where the coverage is decided.
 - [Logon & Save Session Info](../territory/logon-session-info.md) — the VM sends two of the five
-  `infoType` arms (V2 and Extended) and has never set `LOGON_EX_AUTORECONNECTCOOKIE`, so Logon
-  Info V1, Plain Notify, an undefined type and the whole `ARC_SC_PRIVATE_PACKET` branch are
-  unobserved rather than absent. Added by #304, which is also when this territory got its first
-  fixture.
+  `infoType` arms (V2 and Extended) and has never set `LOGON_EX_AUTORECONNECTCOOKIE` **for
+  justrdp** — it does for FreeRDP (#305's FreeRDP run), so the cookie is gated by something this
+  client advertises or does. Logon Info V1, Plain Notify and an undefined type remain unobserved
+  rather than absent. Added by #304, which is also when this territory got its first fixture.
+- [Input & platform scancode tables](../territory/input-scancodes.md) — #305 recorded that the
+  VM never sends Set Keyboard Indicators, after five justrdp runs; one FreeRDP session received
+  one.
 
 ## What a violation looks like
 
@@ -75,6 +78,10 @@ confusion arises here.
   (`justrdp-codecs/tests/fixtures/progressive/`) exists because of this, and its README records
   the advertised config as provenance.
 - Memory `vm_advertised_graphics_caps` records the server-side half of the same limit.
+- **#305** — committed the exact shape item 1 above warns against: *"this WS2022 VM never sends
+  0x29"*, from five justrdp runs, into a territory note and an epic comment. Connecting FreeRDP
+  to the same VM refuted it in one session, and refuted #306's *"no cookie on this VM"* in the
+  same log. What was missing was not a sweep of our own fields but a second client.
 
 ## Where it will recur
 
@@ -93,3 +100,7 @@ Concretely:
   type, performance flags, the advertised capability set, the early capability flags.
 - A corpus README states **what it does not contain**, next to the config it was captured under,
   so a later reader can tell a real absence from an unprovoked one.
+- **Before sweeping, connect FreeRDP to the same server** (procedure in
+  [Verification harness](../territory/verification-harness.md) §Reference behaviour). If it
+  receives X, the absence is ours and the sweep has a target; if it does not either, the
+  absence is at least not specific to this client.

@@ -2562,8 +2562,9 @@ mod tests {
                 Some(ext) => {
                     assert!(
                         ext.auto_reconnect.is_none(),
-                        "this VM has never sent a cookie; if that changed, #306 just acquired a \
-                         proof path and the fixture README needs correcting"
+                        "this VM has never sent justrdp a cookie (it sends FreeRDP one); if \
+                         that changed, #306 has a proof path and the fixture README needs \
+                         correcting"
                     );
                     let err = ext
                         .logon_error
@@ -2588,8 +2589,8 @@ mod tests {
 
     /// Probe for issue #305: every lock stimulus a client can send, and any Set Keyboard
     /// Indicators the server answers with. Advisory: it asserts only that the session survives
-    /// the stimuli, never that an indicator arrives, because this VM has never sent one
-    /// (`docs/map/territory/logon-session-info.md`). Run with `--nocapture`.
+    /// the stimuli, never that an indicator arrives, because this VM has never sent one to
+    /// these stimuli (`docs/map/territory/input-scancodes.md`). Run with `--nocapture`.
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn keyboard_indicators_probe_against_real_vm() {
