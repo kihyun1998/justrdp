@@ -1295,6 +1295,7 @@ mod tests {
                 timezone: client_info::TimezoneInfo::utc(),
                 session_id: 0,
                 performance_flags: 0x7,
+                reconnect_cookie: None,
             },
             license: justrdp::LicenseConfig {
                 entropy: generate_license_entropy().expect("OS RNG"),
@@ -2548,41 +2549,143 @@ mod tests {
             );
             assert_ne!(logon.session_id, 0, "the server assigns a session");
 
-            // `Extended` is optional *and the optionality is reported*, which is the difference
-            // between a conditional assertion and a vacuous one: a run that skipped these says
-            // so in its output rather than passing in silence.
-            match all.iter().find_map(|i| match i {
-                SaveSessionInfo::Extended(e) => Some(e),
-                _ => None,
-            }) {
+            // Two `Extended` PDUs can arrive, each carrying one field: the logon notification
+            // (`LOGON_EX_LOGONERRORS`) and, since #306 advertises `AUTORECONNECT_SUPPORTED`, the
+            // auto-reconnect cookie (`LOGON_EX_AUTORECONNECTCOOKIE`).
+            let extended: Vec<_> = all
+                .iter()
+                .filter_map(|i| match i {
+                    SaveSessionInfo::Extended(e) => Some(e),
+                    _ => None,
+                })
+                .collect();
+
+            // The notification is optional *and the optionality is reported*, which is the
+            // difference between a conditional assertion and a vacuous one.
+            match extended.iter().find_map(|e| e.logon_error) {
                 None => eprintln!(
-                    "#304: no Logon Info Extended this run — the cookie and session-ID \
-                     assertions did not execute"
+                    "#304: no logon notification this run — the session-ID assertion did not                      execute"
                 ),
-                Some(ext) => {
-                    assert!(
-                        ext.auto_reconnect.is_none(),
-                        "this VM has never sent justrdp a cookie (it sends FreeRDP one); if \
-                         that changed, #306 has a proof path and the fixture README needs \
-                         correcting"
-                    );
-                    let err = ext
-                        .logon_error
-                        .expect("LOGON_EX_LOGONERRORS is the only field this server sets");
+                Some(err) => {
                     // `errorNotificationData` is the session ID for this notification type, not
                     // an error code — which is why `LogonErrorsInfo` carries a raw `u32` rather
                     // than IronRDP's enum, whose `0..=3` mapping reads it as a bogus code.
-                    // Four pairs so far: 2/2, 3/3, 6/6, 4/4.
                     assert_eq!(
                         err.notification_data, logon.session_id,
                         "the notification data tracks the session, so it is an ID not a code"
                     );
                     eprintln!(
-                        "#304: Extended present; data {} == session id",
+                        "#304: notification present; data {} == session id",
                         err.notification_data
                     );
                 }
             }
+
+            // The cookie is not optional: it is what advertising `AUTORECONNECT_SUPPORTED` buys.
+            let cookie = extended
+                .iter()
+                .find_map(|e| e.auto_reconnect.as_ref())
+                .expect("a client that advertises AUTORECONNECT_SUPPORTED is issued a cookie");
+            assert_eq!(cookie.version, 1, "AUTO_RECONNECT_VERSION_1");
+            assert_eq!(
+                cookie.logon_id, logon.session_id,
+                "the cookie resumes the session this logon landed in"
+            );
+        })
+        .await
+    }
+
+    /// Real-VM acceptance for issue #306: the cookie one session is issued is sent on the next
+    /// connect, after a drop with no Shutdown or Disconnect Provider Ultimatum, and the server
+    /// accepts it and puts the client back in the same session.
+    ///
+    /// What this cannot show: that the server *checked* the verifier. The VM enforces NLA, so
+    /// CredSSP reattaches the session whatever the cookie holds — a corrupted verifier and no
+    /// cookie at all measured identical. The verifier's correctness rests on
+    /// `auto_reconnect`'s known answers and a cross-check against FreeRDP's own reconnect
+    /// (`docs/map/territory/logon-session-info.md`).
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn auto_reconnect_cookie_is_accepted_on_reconnect_against_real_vm() {
+        use justrdp_pdu::session_info::{SaveSessionInfo, ServerAutoReconnect};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        /// Connect with `cookie`, let the desktop settle, and return the session ID and the
+        /// cookie this logon was issued. The stream is dropped without a word to the server.
+        async fn session(
+            vm: &vm::Vm,
+            cookie: Option<ServerAutoReconnect>,
+        ) -> (u32, Option<ServerAutoReconnect>) {
+            let mut config = test_config();
+            config.client_info.reconnect_cookie = cookie;
+            let capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let mut infos: Vec<SaveSessionInfo> = outcome.activation.save_session_info.clone();
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, capabilities),
+                outcome.activation.leftover,
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+            let frames = Arc::new(AtomicUsize::new(0));
+            let frames_in_sink = frames.clone();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let seen_in_event = seen.clone();
+            let (_tx, mut commands) = tokio::sync::mpsc::channel(4);
+            let cancel = CancellationToken::new();
+            let canceller = cancel.clone();
+            tokio::spawn(async move {
+                let _ = vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await;
+                canceller.cancel();
+            });
+            tokio::time::timeout(
+                Duration::from_secs(90),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    move |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    move |event| {
+                        if let SessionEvent::SaveSessionInfo(info) = event {
+                            seen_in_event.lock().unwrap().push(info);
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("the session settles within its window")
+            .expect("the session runs until the desktop settles");
+            infos.extend(seen.lock().unwrap().iter().cloned());
+            drop(stream);
+            let session_id = infos
+                .iter()
+                .find_map(|i| match i {
+                    SaveSessionInfo::Logon(l) | SaveSessionInfo::LogonLong(l) => Some(l.session_id),
+                    _ => None,
+                })
+                .expect("the logon names its session");
+            let issued = infos.iter().rev().find_map(|i| match i {
+                SaveSessionInfo::Extended(e) => e.auto_reconnect.clone(),
+                _ => None,
+            });
+            (session_id, issued)
+        }
+
+        with_vm_session(|vm| async move {
+            let (first, cookie) = session(&vm, None).await;
+            let cookie = cookie.expect("the first logon is issued a cookie");
+            let (second, reissued) = session(&vm, Some(cookie)).await;
+            eprintln!("#306: session {first} -> {second}");
+            assert_eq!(second, first, "the reconnect lands in the same session");
+            assert!(
+                reissued.is_some_and(|c| c.logon_id == second),
+                "the resumed session is issued a fresh cookie for itself"
+            );
         })
         .await
     }

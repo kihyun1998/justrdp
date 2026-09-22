@@ -42,11 +42,11 @@ concluding anything is absent.
   ladder is the worked instance.
 - [Capability exchange & activation](../territory/capability-exchange-activation.md) — where the
   advertised config is built, and therefore where the coverage is decided.
-- [Logon & Save Session Info](../territory/logon-session-info.md) — the VM sends two of the five
-  `infoType` arms (V2 and Extended) and has never set `LOGON_EX_AUTORECONNECTCOOKIE` **for
-  justrdp** — it does for FreeRDP (#305's FreeRDP run), so the cookie is gated by something this
-  client advertises or does. Logon Info V1, Plain Notify and an undefined type remain unobserved
-  rather than absent. Added by #304, which is also when this territory got its first fixture.
+- [Logon & Save Session Info](../territory/logon-session-info.md) — the auto-reconnect cookie was
+  absent from every justrdp logon and present for FreeRDP; the gate turned out to be one bit of
+  the General capability set, `AUTORECONNECT_SUPPORTED` (#306: 0 of 19 logons without it, 16 of
+  16 with it). Logon Info V1, Plain Notify and an undefined type remain unobserved rather than
+  absent. Added by #304, which is also when this territory got its first fixture.
 - [Input & platform scancode tables](../territory/input-scancodes.md) — #305 recorded that the
   VM never sends Set Keyboard Indicators, after five justrdp runs; one FreeRDP session received
   one.
@@ -82,6 +82,9 @@ confusion arises here.
   0x29"*, from five justrdp runs, into a territory note and an epic comment. Connecting FreeRDP
   to the same VM refuted it in one session, and refuted #306's *"no cookie on this VM"* in the
   same log. What was missing was not a sweep of our own fields but a second client.
+- **#306** — found the cookie's gate by diffing the second client's wire bytes against ours
+  (FreeRDP's `/dump:record` records PDUs before TLS), then A/B-testing the one field that
+  differed. Matching its Client Info flags first changed nothing; the capability set did.
 
 ## Where it will recur
 

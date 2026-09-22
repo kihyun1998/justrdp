@@ -7,7 +7,8 @@
 //!
 //! **Not general-purpose cryptography.** MD5/SHA-1/RC4/unpadded RSA are broken primitives by
 //! modern standards; they exist here solely because the licensing wire format requires them.
-//! Nothing outside the licensing exchange may use this module.
+//! Nothing outside the licensing exchange and auto-reconnect (`[MS-RDPBCGR]` 5.5, whose
+//! verifier is HMAC-MD5 by the same frozen spec) may use this module.
 
 /// One MD5 digest (RFC 1321). Used by the licensing key derivation and MAC.
 pub fn md5(data: &[u8]) -> [u8; 16] {

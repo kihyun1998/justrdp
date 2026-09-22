@@ -350,6 +350,52 @@ fn our_client_info_pdu_decodes_identically_in_ironrdp() {
     assert_eq!(info.extra_info.optional_data.reconnect_cookie(), None);
 }
 
+/// Issue #306: a present `ARC_CS_PRIVATE_PACKET` frames as ironrdp reads it — 28 bytes after a
+/// `cbAutoReconnectCookie` of 28, in 2.2.4.3's field order.
+#[test]
+fn our_client_auto_reconnect_cookie_decodes_in_ironrdp() {
+    use justrdp_pdu::client_info as ci;
+
+    let cookie = ci::ClientAutoReconnect {
+        version: 1,
+        logon_id: 48,
+        security_verifier: [0x5A; 16],
+    };
+    let ours = ci::ClientInfo {
+        code_page: 0,
+        flags: ci::ClientInfoFlags::MOUSE,
+        domain: String::new(),
+        username: "u".to_string(),
+        password: String::new(),
+        alternate_shell: String::new(),
+        work_dir: String::new(),
+        extra: ci::ExtendedClientInfo {
+            address_family: ci::ADDRESS_FAMILY_INET,
+            address: String::new(),
+            dir: String::new(),
+            timezone: ci::TimezoneInfo::utc(),
+            session_id: 0,
+            performance_flags: 0,
+            reconnect_cookie: Some(cookie),
+        },
+    };
+    let theirs: ironrdp_pdu::rdp::ClientInfoPdu =
+        ironrdp_decode(&ours.encode()).expect("ironrdp decodes our Client Info PDU");
+    let mut want = [0u8; 28];
+    want[0] = 28;
+    want[4] = 1;
+    want[8] = 48;
+    want[12..].fill(0x5A);
+    assert_eq!(
+        theirs
+            .client_info
+            .extra_info
+            .optional_data
+            .reconnect_cookie(),
+        Some(&want)
+    );
+}
+
 #[test]
 fn our_send_data_request_decodes_in_ironrdp_with_the_client_info_payload() {
     use justrdp_pdu::client_info as ci;

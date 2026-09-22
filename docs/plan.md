@@ -449,7 +449,7 @@ advertise X, the server silently never offers Y. Capture every such coupling up 
       Measured against the VM in #198: it answers Denied even with nothing open (§0).
 - [ ] **O** — Refresh Rect PDU (redraw regions after unobscure). *rdp/refresh_rectangle.rs.*
 - [ ] **O** — Suppress Output PDU (pause graphics when minimized). *rdp/suppress_output.rs.*
-- [ ] **O** — Auto-Reconnect Cookie (server cookie at logon → resume on reconnect). *rdp/session_info/logon_extended.rs.*
+- [x] **O** — Auto-Reconnect Cookie (server cookie at logon → resume on reconnect). Done in #306: the host hands back the `ServerAutoReconnect` it was given, the core sends the derived `ARC_CS`. *rdp/session_info/logon_extended.rs.*
 - [ ] **O** — Heartbeat / keep-alive (RTT responses or periodic no-op; idle-timeout ~5min).
 - [ ] **O** — Reconnect-with-resume (vs in-session DeactivateAll).
 
@@ -979,7 +979,7 @@ Good! I found KDC proxy support. Now let me compile comprehensive information ab
 #### Logon Info Extended (TS_LOGON_INFO_EXTENDED_V2)  
 - [x] **M — LogonInfoExtended header.** 2-byte length (2.2.10.1.1.4: *"the total size in bytes of this structure, including the variable LogonFields field"* — which reads as including the 570-byte pad, while IronRDP's encoder writes it without; neither reference frames from it and neither does #304) + 4-byte flags (LogonExFlags), optionally followed by auto-reconnect and/or error-info blocks, padded to 570 bytes. *ironrdp ref: logon_extended.rs.* **Gate keeper for downstream fields.**
 - [x] **M — LogonExFlags (0x0001 | 0x0002 bits).** AUTO_RECONNECT_COOKIE (0x0001) ⇒ ServerAutoReconnect present. LOGON_ERRORS (0x0002) ⇒ LogonErrorsInfo present. Both optional. *ironrdp ref: logon_extended.rs LogonExFlags.*
-- [ ] **M — ServerAutoReconnect block.** *(decode landed in #304 — `ServerAutoReconnect` with `version` / `logon_id` / `random_bits`, redacted in `Debug`; the replay half below is **#306** and is what keeps this box open.)* 4-byte data-length(28) + 4-byte packet-length(28) + 4-byte version(0x0000_0001) + 4-byte logon-id + 16-byte random_bits. **This cookie + logon_id allow transparent resume on reconnect.** *ironrdp ref: ServerAutoReconnect.* Server generates; client stores and replays on `[ms-rdpbcgr] 2.2.1.11.1.1 cbAutoReconnectCookie / autoReconnectCookie` fields in next Client Info PDU.
+- [x] **M — ServerAutoReconnect block.** *(decode landed in #304; the client half landed in #306 — the server issues the cookie only to a client advertising `AUTORECONNECT_SUPPORTED`, and what goes back is a derived `ARC_CS`, not these bytes.)* 4-byte data-length(28) + 4-byte packet-length(28) + 4-byte version(0x0000_0001) + 4-byte logon-id + 16-byte random_bits. **This cookie + logon_id allow transparent resume on reconnect.** *ironrdp ref: ServerAutoReconnect.* Server generates; client stores and replays on `[ms-rdpbcgr] 2.2.1.11.1.1 cbAutoReconnectCookie / autoReconnectCookie` fields in next Client Info PDU.
 - [x] **M — LogonErrorsInfo block.** 4-byte data-length(8) + 4-byte error-type (LogonErrorNotificationType enum) + 4-byte error-data (either LogonErrorNotificationDataErrorCode enum OR session-id u32). *ironrdp ref: logon_extended.rs LogonErrorsInfo.* **See §9b for codes.**
 - [x] **O — PlainNotify (0x0002).** No payload, just 576 bytes padding. Server sends this when logon completes without error/cookie/extended info. *ironrdp ref: session_info/mod.rs InfoData::PlainNotify.*
 
@@ -990,7 +990,7 @@ Good! I found KDC proxy support. Now let me compile comprehensive information ab
 > carried out on `SessionOutput::SaveSessionInfo` / `ActivationResult::save_session_info`, with
 > `LogonErrorsInfo::description()` for the text. What a host *does* with one — the re-auth
 > prompt, the retry, the message — is host policy by CLAUDE.md's boundary and is not tracked
-> here. The replay half of 9a (`cbAutoReconnectCookie`) is **#306** and stays open.
+> here. The replay half of 9a (`cbAutoReconnectCookie`) landed in #306.
 
 **Error Type enum** (`LogonErrorNotificationType`; applies M=Mandatory-to-handle, O=Optional):  
 - [x] **M — AccessDenied (0xFFFF_FFFF).** Generic access-denied; user lacks permission. Carry error-data field (status code).
@@ -1034,7 +1034,7 @@ Good! I found KDC proxy support. Now let me compile comprehensive information ab
 
 ### 9f. Integration points & gotchas  
 - [ ] **M — Logon-error surface.** SaveSessionInfo with LOGON_ERRORS flag is **post-auth**, so credentials already verified; error codes primarily inform UI (show warning, prompt password-change, prevent auto-reconnect). **Not a re-auth gate** like CredSSP failures.
-- [ ] **M — Auto-reconnect cookie lifetime.** Server-provided cookie + logon_id must be **saved persistently** (config file / secure store) and **replayed on next connection** via Client Info PDU (cbAutoReconnectCookie + autoReconnectCookie fields). **Missing replay = session-loss on disconnect.** *ironrdp ref: Layer 1, Client Info PDU fields.*
+- [x] **M — Auto-reconnect cookie lifetime.** The client sends `ARC_CS` in the Client Info PDU (#306). *Where and how long the cookie is kept is the host's — the core takes it back through `ClientInfoConfig::reconnect_cookie`. This line used to say the cookie is "replayed"; what goes out is a verifier derived from it ([MS-RDPBCGR] 5.5).*
 - [ ] **M — Logon-notify (0x0002) vs error.** PlainNotify signals "logon OK, no special data." Common on RDP8+. **Do not treat as error.**
 - [ ] **M — Error-info PDU vs logon-error block.** ServerSetErrorInfoPdu arrives in the main session loop (any time, reason for disconnect). SaveSessionInfo logon-errors are bound to finalization (post-auth, pre-session-active). **Both must be handled; both can disconnect.** *ironrdp ref: Layer 1 finalization; Layer 4 session loop.*
 - [ ] **O — IME state tracking.** If not doing CJK/IME, ignore SetKeyboardImeStatus; still decode SaveSessionInfo (which may carry it) to avoid desynch.

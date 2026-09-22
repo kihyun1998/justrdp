@@ -120,6 +120,21 @@ grep 'client_common_save_session_info' fr.log   # Logon Info, and whether a cook
   was not recorded.
 - `/cert:ignore` is for this lab VM only.
 
+**What FreeRDP sends, not only what it receives** (#306). `/dump:record,file:<path>` writes every
+PDU **before TLS**, in both directions, as records of `u64` tick, `u8` direction, `u32` CRC,
+`u64` length and the bytes. For a client the direction byte reads inverted: `1` marks what the
+client sent. That is how #306 read FreeRDP's GCC core data, Client Info and Confirm Active and
+found the one capability bit that gates the cookie. **The dump holds the Client Info password
+in clear**, so delete it once read.
+
+**A FreeRDP auto-reconnect on demand** (#306). WSL's kernel has no `INET_DIAG_DESTROY`, so
+`ss -K` cannot cut a socket; a proxy can. Run
+`socat TCP-LISTEN:13389,bind=127.0.0.1,fork,reuseaddr TCP:192.168.136.136:3389`, connect
+`xfreerdp3 /v:127.0.0.1:13389 +auto-reconnect /dump:record,…`, and `kill -9` the socat child
+that carries the session. FreeRDP logs `Network disconnect!`, reconnects through the proxy, and
+its reconnect Client Info carries its `ARC_CS_PRIVATE_PACKET` — the independent verifier #306
+was checked against.
+
 ## Cross-cutting invariants
 
 - [Oracle agreement is not independence](../invariant/oracle-agreement-is-not-independence.md)
@@ -144,6 +159,12 @@ grep 'client_common_save_session_info' fr.log   # Logon Info, and whether a cook
 - [Adapter drive loop](adapter-drive-loop.md) — hosts the VM and loopback tests.
 
 ## Known holes / open
+
+- **A mutation restored by moving its backup back is not restored for cargo** (#306). `move`
+  keeps the backup's older mtime, cargo's fingerprint then calls the source unchanged, and the
+  mutated build stays in `target/`. It surfaced as a VM run advertising `extraFlags = 0x0405`
+  from a source that said `0x040d`. Restore by writing the original content, or `touch` the
+  file, before trusting any later result.
 
 - **A VM test must not let go of the session before the desktop has painted and settled
   (#307).** Measured on 2026-09-22: when #307's channel test ended its session within 1–2 s

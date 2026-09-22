@@ -10,7 +10,8 @@ server picks one per PDU.
 
 It is **received on two legs and never sent**. justrdp is a client, so this area has a
 decoder and no encoder; the cookie the client eventually *sends* is a different structure
-(`ARC_CS_PRIVATE_PACKET`) derived from this one, and that belongs to #306.
+(`ARC_CS_PRIVATE_PACKET`) derived from this one, and since #306 the core derives it
+(`auto_reconnect::client_cookie`) from the cookie the host hands back.
 
 ## Governing decisions
 
@@ -58,6 +59,20 @@ host's rather than the core's. Neither is about this PDU.
   this repo's other server status code. The data field's *meaning* is discriminated by the
   type rather than by its own value — `LogonErrorNotification::data_is_session_id` is that
   rule — so typing it by value is wrong, which is exactly what IronRDP does.
+- **The client half (#306): the host carries `ARC_SC` across connections, the core derives
+  `ARC_CS`.** The host stores the `ServerAutoReconnect` a session surfaced and returns it as
+  `ClientInfoConfig::reconnect_cookie`. The Client Info PDU then carries `Version` and
+  `LogonId` echoed and `SecurityVerifier = HMAC-MD5(ArcRandomBits, 32 × 0x00)`, since 5.5 has
+  the client random assumed zero under Enhanced RDP Security. The random itself never goes out.
+  Three calls here are the **maintainer's**, not derivations: `ARC_SC` rather than `ARC_CS`
+  crosses the seam (2026-09-21, on ADR-0001's mechanism/policy split); `Version` is echoed
+  rather than fixed at 1 (FreeRDP's behaviour, IronRDP's differs); and
+  **`AUTORECONNECT_SUPPORTED` is on in `default_client_capabilities`** (2026-09-22; the
+  alternative shown was host opt-in), because it is what makes the server issue a cookie.
+- **HMAC-MD5 is built on `license_crypto::md5`**, whose use rule was widened in #306 from the
+  licensing exchange to licensing plus 5.5: both are MD5 by a frozen spec, inside
+  authenticated TLS. No dependency entered (ADR-0002).
+- `clientSessionId` stays 0: 2.2.1.11.1.1.1 says the server ignores it and it SHOULD be zero.
 
 ## Code
 
@@ -69,8 +84,13 @@ host's rather than the core's. Neither is about this PDU.
 - `justrdp-pdu/src/share.rs` — `PDU_TYPE2_SAVE_SESSION_INFO`
 - `justrdp-pdu/src/cursor.rs` — `utf16_string`
 - `justrdp/src/session.rs` — `SessionOutput::SaveSessionInfo`, `log_save_session_info`
-- `justrdp/src/connect.rs` — `ActivationResult`
-- `justrdp-tokio/src/lib.rs` — `SessionEvent`
+- `justrdp/src/connect.rs` — `ActivationResult`, `ClientInfoConfig`
+- `justrdp/src/auto_reconnect.rs` — `client_cookie`, `security_verifier`, `hmac_md5`
+- `justrdp-pdu/src/client_info.rs` — `ClientAutoReconnect`, `ExtendedClientInfo`
+- `justrdp-pdu/src/capability.rs` — `GENERAL_AUTORECONNECT_SUPPORTED`,
+  `default_client_capabilities`
+- `justrdp-tokio/src/lib.rs` — `SessionEvent`,
+  `auto_reconnect_cookie_is_accepted_on_reconnect_against_real_vm`
 - `justrdp-pdu/tests/real_server_session.rs` — `decode_all`
 - `justrdp-pdu/tests/fixtures/session/` — the capture and its README
 
@@ -118,6 +138,27 @@ trailing padding** after Logon Info V2's strings, and FreeRDP seeks past it. Tha
 consumption is not an invariant of this PDU and why the decoder does not assert it — the corpus
 test does, because *this* server consumes exactly.
 
+**The cookie is gated by `AUTORECONNECT_SUPPORTED`** (#306, 2026-09-22). A FreeRDP stream
+dump showed its General capability set advertising `extraFlags = 0x041d`, while justrdp sent
+`0x0405`. Changing only that bit: **0 of 19** justrdp logons without it were issued a cookie,
+and **16 of 16** with it were. The cookie comes in a Logon Info Extended of its own,
+`FieldsPresent = 0x1`, beside the logon-errors one (`0x2`) — FreeRDP's log shows the same
+split.
+
+**Under enforced NLA the verifier is unobservable.** Reconnecting with the right verifier,
+with a corrupted one, and with no cookie at all produced the same thing: the same session, a
+fresh cookie, no logon notification, no Auto-Reconnect Status PDU. CredSSP has already
+authenticated the user by the time Client Info arrives, so the server reattaches the session
+either way. The VM refuses a TLS-only connect (`HYBRID_REQUIRED_BY_SERVER`), and justrdp is
+NLA-mandatory by `plan.md`'s scope note, so the differential that would expose the verifier —
+a credential-less reconnect — is not available here.
+
+**What does stand behind the verifier.** RFC 2202's HMAC-MD5 vectors, Python's `hmac` for
+5.5's own input, and a cross-check on real server bytes: FreeRDP auto-reconnected through a
+proxy that cut its connection, and our derivation of the cookie it had been issued equals the
+`ARC_CS` verifier it sent (`d1734b75…`). A malformed `ARC_CS` (the inner `cbLen` dropped) makes
+the server refuse the connect, so the live test does guard the framing.
+
 **Bounded: one WS2022 box, one advertised configuration, one account.** It proves what this
 server sends, never what servers send.
 
@@ -128,10 +169,10 @@ server sends, never what servers send.
   area and the easiest to truncate into.
 - [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
   — `Size`, `Length` and `cbFieldData` are three instances taken the *recorded* way out in the
-  same change, and `ServerAutoReconnect::version` is a fourth whose reader arrives with #306.
+  same change, and `ServerAutoReconnect::version` is a fourth, read by #306's echo.
 - [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
-  — this VM sends two of the five `infoType` arms and never a cookie, so three arms and the
-  whole `ARC_SC` branch are unobserved rather than absent.
+  — the cookie is the sharpest instance: absent from every justrdp logon for a day and a half,
+  and gated by one advertised bit.
 
 ## Blast radius
 
@@ -167,18 +208,15 @@ server sends, never what servers send.
   at its sharpest: the V1 arm is not waiting on a different server, it is waiting on a different
   capability set. **Plain Notify** and an undefined `infoType` are genuinely unobserved. All
   three rest on hand-built bodies and the two references.
-- **No auto-reconnect cookie for justrdp on this VM — FreeRDP gets one.** Two FreeRDP sessions
-  (#305, 2026-09-22) logged `Logon Extended Info [cookie: TRUE, LogonId: 46]` from the same VM,
-  so the proof path below exists; what justrdp advertises or does differently is not
-  established. Original record: `FieldsPresent` has been `LOGON_EX_LOGONERRORS` alone
-  on every observed logon, so the `ARC_SC_PRIVATE_PACKET` branch has no real bytes —
-  [capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md).
-  #306's *"capture the cookie, reconnect with it, assert the session resumed"* acceptance has
-  **no proof path on this VM as justrdp is configured**, which that slice needs to know before it
-  starts.
-- **The cookie is decoded and nothing replays it** (#306). `ClientInfo::reconnect_cookie` is
-  still `None` on every connection, so no session is ever resumed — this area supplies the
-  input that slice needs and takes none of its decisions.
+- ~~**No auto-reconnect cookie for justrdp on this VM.**~~ **Closed by #306**: it was
+  `AUTORECONNECT_SUPPORTED`, which justrdp did not advertise (`## Reference behaviour`).
+- ~~**The cookie is decoded and nothing replays it.**~~ **Closed by #306.**
+- **Whether the server checks our verifier is not observable on this VM.** Enforced NLA
+  reattaches the session whatever the cookie holds. A server that accepts TLS-only would show
+  it, and justrdp has no TLS-only path (`plan.md` scope note). The verifier stands on the known
+  answers and the FreeRDP cross-check instead.
+- **No committed fixture of an `ARC_SC_PRIVATE_PACKET`.** The real bytes carry a live session
+  credential; the cookie branch is still covered by hand-built bodies in `session_info.rs`.
 - ~~**Set Keyboard Indicators (0x29) is still in the catch-all** (#305).~~ **Closed by #305**
   on the session leg. It lives in [Input & platform scancode tables](input-scancodes.md),
   next to the Synchronize event whose bits it shares. This VM has sent one to FreeRDP and none
