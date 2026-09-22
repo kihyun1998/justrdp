@@ -20,9 +20,9 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 
 ## Design model
 
-- **Six outputs, and the host's whole view of a live session is these**:
+- **Seven outputs, and the host's whole view of a live session is these**:
   `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `DisplayControlReady` ·
-  `ShutdownDenied` · `SaveSessionInfo`. Anything the host cannot learn from one of these,
+  `ShutdownDenied` · `SaveSessionInfo` · `ChannelData`. Anything the host cannot learn from one of these,
   it cannot learn at all
   — which is the argument #228 turned on: a `pduType2` that falls into the catch-all
   (**skipped, cursor unread** — the arm never decoded anything, whatever its comment said
@@ -35,7 +35,10 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 - **Reactivation is in-scope for this machine** (`Phase::Reactivating`): a resize
   round-trips through capability exchange while the session's caches survive,
   because caches belong to the connection rather than the share.
-- Static-channel traffic on channel 1004 is currently **ignored**, deliberately.
+- **Static-channel traffic goes three ways** (#307): `drdynvc` to the dynamic-channel
+  manager, a granted host channel to its reassembler and out as `ChannelData`, and a channel
+  ID that was never granted is skipped with an `rdp_svc` record. See
+  [Virtual channels](virtual-channels.md) for the reassembly rules and whose call each was.
 
 ## Code
 
@@ -86,8 +89,8 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 
 ## Known holes / open
 
-- **Static channel 1004 traffic is dropped**, with no record of what is being
-  dropped or when that stops being acceptable.
+- ~~**Static channel 1004 traffic is dropped**, with no record of what is being
+  dropped or when that stops being acceptable.~~ **Closed in #307.**
 - Drawing orders (epic #22), clipboard (#10), audio (#11/#12), device redirection
   (#13) all dispatch through here and none exist — the dispatch table is a small
   fraction of the protocol's surface.

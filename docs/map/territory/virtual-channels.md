@@ -6,8 +6,10 @@ The transport every non-core RDP feature rides on. **Static** virtual channels (
 are negotiated at GCC, get an MCS channel ID, and carry chunked data with a length
 and flags. **Dynamic** virtual channels (DVC) are a protocol *inside* one static
 channel (`drdynvc`): create/open/close/data messages with their own IDs, which is
-how EGFX and Display Control arrive. Today the library implements the transport and
-exactly one DVC consumer beyond graphics: Display Control.
+how EGFX and Display Control arrive. The library implements the transport, exactly one DVC
+consumer beyond graphics (Display Control), and, since #307, the host's seam onto every other
+static channel: messages in as `SessionOutput::ChannelData`, messages out through
+`SessionStateMachine::send_channel`.
 
 ## Governing decisions
 
@@ -80,6 +82,63 @@ glossary, which is vocabulary rather than a decision.
   that compresses on it — that capture is its proof.
 - Unknown DVCs are not fatal — an unopened channel's traffic is ignored, in the
   spirit of ADR-0009's tolerance on the rendering side.
+- **Requesting a static channel is the host's declaration of interest, and every granted
+  channel but `drdynvc` is delivered** (#307). There is no registration API and no
+  per-channel processor: a reassembled message surfaces as `SessionOutput::ChannelData
+  { channel, data }` with the MCS channel ID, and `send_channel` chunks a message onto one.
+  So "granted but unconsumed" is not a state the core has; what the host does with a message
+  it asked for is policy. **That model, over an IronRDP-style `SvcProcessor` the host
+  registers into the core, was the maintainer's call (2026-09-22)**, shown both plus
+  splitting the question into a `decide:` issue. The processor model's cost as shown: host
+  code running inside the core, outside the output-enum model, with an error-attribution
+  rule ADR-0014 would have to grow. **Not covered by that call:** a host that wants a
+  channel granted but *not* delivered, and whether `ChannelData` should carry the name.
+- **One reassembler per channel, shared by drdynvc** (`justrdp/src/svc.rs`), because
+  `[MS-RDPBCGR]` 1.3.3 makes each channel an independent stream. Sharing it with drdynvc was
+  the maintainer's call (2026-09-22): the old drdynvc path refused a chunk with neither
+  FIRST nor LAST outside a sequence, which 3.1.5.2.2 says is a whole message. IronRDP
+  follows the spec here; FreeRDP's drdynvc plugin fails the same chunk. The rest of the
+  reassembler's rules are **derivations**, not that call, and fall to a better one:
+  - the chunks must add up to the declared `totalLength`: short, long, a length that changes
+    mid-sequence, and an unchunked message whose data differs from its length are all typed
+    errors ([ADR-0009](../../adr/0009-tolerant-negotiation-posture.md) §3(a); both
+    references refuse the same shapes). An overrun is refused at the chunk that causes it,
+    because without that check a sequence whose LAST never comes grows past the cap.
+  - `CHANNEL_FLAG_SUSPEND`/`RESUME` chunks carry no message and are skipped by the
+    reassembler. FreeRDP's drdynvc does the same. **Suspending our own sending**, which
+    2.2.6.1.1 asks for ("all virtual channel traffic MUST be suspended"), **was built at the
+    maintainer's call (2026-09-22)**. They were shown three options: build it now, file it, or
+    leave it to the map. *How* it works is a derivation. From SUSPEND to RESUME, every outbound
+    virtual channel frame is held, whichever channel the flag arrived on. That covers
+    `send_channel`, the machine's own drdynvc responses and a Display Control resize. The frames
+    are released in order as `WriteBytes` by the call that processes the RESUME. Holding
+    rather than refusing is what reaches the traffic the machine produces itself, and it spares
+    the host from tracking the resume. The host's held messages are bounded by
+    `CHANNEL_MESSAGE_CAP`; past it `send_channel` returns `SuspendedQueueFull`. The machine's
+    own responses are not bounded, because each one answers a server message of similar size.
+    **No server has been seen sending either flag**, so this is proven by unit tests only.
+  - **a FIRST while a message is in flight is a typed error**, as both references treat it.
+    drdynvc used to abandon the message and start over, and #307 first kept that. Refusing it
+    was **the maintainer's call (2026-09-22)**, shown three options: refuse now, keep starting
+    over, or file a `decide:` issue. The spec does not address the case, and this VM never
+    sent it, so a conforming server is not expected to reach it.
+  - `CHANNEL_FLAG_SHOW_PROTOCOL` asks that the header reach the endpoint. The core *is*
+    the endpoint's reassembly, so the host gets the reassembled message and never a header.
+- **Data on a channel ID that was never granted is skipped with an `rdp_svc` record**, not
+  refused: nothing about it is a security integrity question (ADR-0009 §2/§3(b)), and it
+  was silent before #307.
+- **A multi-chunk message we send carries `CHANNEL_FLAG_SHOW_PROTOCOL` on every chunk**
+  (`encode_chunks`), because 3.1.5.2.1 says chunked data MUST. IronRDP does the same;
+  FreeRDP sets it only for a channel opened with `CHANNEL_OPTION_SHOW_PROTOCOL`. A
+  single-chunk message carries FIRST|LAST alone, **unless the host opened the channel with
+  `CHANNEL_OPTION_SHOW_PROTOCOL`**. Then every chunk carries it, which is FreeRDP's rule
+  (`channels.c`). The case that needs it is RAIL: `[MS-RDPERP]` 1.5 says the RAIL server
+  expects the header visible on all data over the RAIL channel, so the flag "has to be set".
+  Building it now, rather than leaving it to #14, was the maintainer's call (2026-09-22).
+  `StaticChannel` carries the requested `options` so the machine can tell.
+- **A host channel's message cap is 64 MiB** (`CHANNEL_MESSAGE_CAP`), against drdynvc's
+  64 KiB. The value is unmeasured: 64 MiB leaves room for a 4K clipboard DIB (3840×2160×4 ≈
+  33 MB), which is the largest message a channel we know of plausibly carries.
 
 ## Code
 
@@ -89,13 +148,42 @@ glossary, which is vocabulary rather than a decision.
 - `justrdp-pdu/src/displaycontrol.rs` — `DisplayControlPdu`, `Caps`, `Monitor`,
   `encode_monitor_layout`
 - `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`, `DvcError`
-- Spec sections cited inline: `[MS-RDPEDYC]` 1.7, 2.2.2.2, 2.2.3.3, 2.2.3.4, 3.2;
+- `justrdp/src/svc.rs` — `Reassembler`, `CHANNEL_MESSAGE_CAP`
+- `justrdp/src/session.rs` — `SessionOutput::ChannelData`, `send_channel`, `ChannelSendError`
+- Spec sections cited inline: `[MS-RDPBCGR]` 1.3.3, 2.2.6.1.1, 3.1.5.2.1, 3.1.5.2.2;
+  `[MS-RDPEDYC]` 1.7, 2.2.2.2, 2.2.3.3, 2.2.3.4, 3.2;
   `[MS-RDPEDISP]` 1.3,
   2.2.2.2, 2.2.2.2.1
 
 ## Reference behaviour
 
-**None.** No verified external-fact store.
+**Measured against the WS2022 test VM (#307, 2026-09-22):**
+
+- Every requested channel is granted: `cliprdr`, `rdpsnd`, `rdpdr`, `rail` and `drdynvc` got
+  consecutive IDs from 1004. The server's Virtual Channel capset is `flags=2`
+  (`VCCAPS_COMPR_CS_8K`), `VCChunkSize=1600`.
+- Unprompted, the server sends `cliprdr` Clipboard Capabilities (24 bytes) and Monitor Ready
+  (8 bytes), and `rdpdr` Server Announce (`rDnI`, 12 bytes). Every one arrived as a single
+  FIRST|LAST chunk, so **no multi-chunk receive has been observed live**; that path is
+  proven by the unit tests alone.
+- **`rdpdr` announces only when `rdpsnd` is requested too**: 0 of 2 runs without it, 4 of 4
+  with it. The specs do not ask for it: `[MS-RDPEFS]` 1.4/1.5 and `[MS-RDPEA]` 1.4/1.5 each
+  depend only on the channel transport. **FreeRDP always requests the two together**
+  (`client/common/cmdline.c`). Enabling `rdpsnd` forces device redirection on ("rdpsnd
+  requires rdpdr to be registered"). Enabling `rdpdr` without `rdpsnd` adds an `rdpsnd` with
+  the silent `sys:fake` backend, in place since 2012 (`e0b37aa97e`) with no rationale
+  recorded. So this reads as a Windows-server dependency rather than a protocol one. Which
+  channels to request is the host's, so the pairing is the host's to know. `rdpsnd` itself
+  sent nothing in 20 s, even with `rdpdr` present.
+- A Client Announce Reply sent on `rdpdr` is answered with Server Core Capability Request
+  (`rDPS`, 84 bytes) and Server Client ID Confirm (`rDCC`) echoing the ClientId. Without the
+  reply no `rDCC` arrives. That is the live send proof.
+- **`cliprdr` does not answer a client Format List**, single-chunk or chunked, after the
+  client's capabilities: 0 of 3 runs, in 40 s each, with the frames confirmed written. Not
+  investigated. A server-side clipboard-direction policy is one candidate and is untested.
+- A chunked client message (a 2018-byte `rdpdr` Client Name, sent without SHOW_PROTOCOL)
+  did not end the session, but nothing the server sends depends on it. So **a multi-chunk
+  send is not proven live either.**
 
 ## Cross-cutting invariants
 
@@ -123,8 +211,9 @@ glossary, which is vocabulary rather than a decision.
   output (#11), audio input (#12), device/drive/printer/smartcard (#13), RemoteApp
   (#14), multitouch (#15), video (#17), camera (#19), location (#20). The transport
   exists; the consumers do not.
-- Static channel 1004 traffic is ignored by the session loop with no record of what
-  it contains.
+- ~~Static channel 1004 traffic is ignored by the session loop with no record of what
+  it contains.~~ **Closed in #307**: 1004 is `cliprdr`, and a granted channel's messages
+  now reach the host. The remaining gaps are the multi-chunk live proofs above.
 - DVC compressed data (drdynvc version 3) is not implemented and not offered — see the
   design-model bullet for when that changes.
 - SVC compression (`VirtualChannelCapabilitySet`'s compression flags) is not

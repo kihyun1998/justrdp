@@ -52,6 +52,10 @@ pub struct SessionConfig {
     /// the channel was not requested/granted — dynamic channels (Display Control resize,
     /// EGFX, …) are then unavailable.
     pub drdynvc_channel_id: Option<u16>,
+    /// The granted static channels ([`crate::McsConnectResult::static_channels`]). Every one
+    /// but [`Self::drdynvc_channel_id`] is the host's: its messages surface as
+    /// [`SessionOutput::ChannelData`] and [`SessionStateMachine::send_channel`] sends on it.
+    pub static_channels: Vec<crate::StaticChannel>,
     /// What the graphics channel advertises when the server opens it.
     pub egfx: crate::EgfxConfig,
 }
@@ -79,6 +83,14 @@ pub enum SessionOutput {
     /// **notification, not a disconnect** — unlike [`Self::ShutdownDenied`] it may precede one,
     /// and the attribution for a close that follows is still Set Error Info.
     SaveSessionInfo(session_info::SaveSessionInfo),
+    /// One whole message on a static channel the host requested (issue #307), reassembled
+    /// from its chunks (`[MS-RDPBCGR]` 3.1.5.2.2). What the bytes mean is the host's.
+    ChannelData {
+        /// The MCS channel ID it arrived on, as in [`SessionConfig::static_channels`].
+        channel: u16,
+        /// The message.
+        data: Vec<u8>,
+    },
 }
 
 /// Record one Save Session Info at its arrival, for whichever leg received it.
@@ -168,6 +180,51 @@ impl core::fmt::Display for ResizeError {
 }
 
 impl core::error::Error for ResizeError {}
+
+/// Why a [`SessionStateMachine::send_channel`] call was refused (the session itself is
+/// unaffected).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelSendError {
+    /// The channel is not one of [`SessionConfig::static_channels`].
+    NotGranted {
+        /// The MCS channel ID asked for.
+        channel: u16,
+    },
+    /// The channel is `drdynvc`, whose traffic the machine itself produces.
+    CoreOwned {
+        /// The MCS channel ID asked for.
+        channel: u16,
+    },
+    /// The server suspended virtual channel traffic and the messages held for its resume
+    /// would exceed the channel message cap (64 MiB) with this one.
+    SuspendedQueueFull {
+        /// The MCS channel ID asked for.
+        channel: u16,
+    },
+}
+
+impl core::fmt::Display for ChannelSendError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ChannelSendError::NotGranted { channel } => {
+                write!(f, "static channel {channel} was not granted")
+            }
+            ChannelSendError::CoreOwned { channel } => {
+                write!(
+                    f,
+                    "static channel {channel} is drdynvc, which the session owns"
+                )
+            }
+            ChannelSendError::SuspendedQueueFull { channel } => write!(
+                f,
+                "virtual channel traffic is suspended and the held messages would exceed the cap \
+                 (channel {channel})"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ChannelSendError {}
 
 /// Why the session failed. Malformed server data is fatal (likely protocol desync,
 /// plan.md §11c); everything else never reaches this type.
@@ -299,6 +356,13 @@ pub struct SessionStateMachine {
     ultimatum_reason: Option<u8>,
     /// The drdynvc transport + Display Control state (slice-8).
     drdynvc: Drdynvc,
+    /// Chunk reassembly for each host static channel, keyed by MCS channel ID.
+    channels: Vec<(u16, crate::svc::Reassembler)>,
+    /// Outbound virtual channel frames held while the server has suspended virtual channel
+    /// traffic (`CHANNEL_FLAG_SUSPEND`); `None` while it flows.
+    suspended: Option<Vec<Vec<u8>>>,
+    /// Bytes of host messages among the held frames.
+    held_bytes: usize,
 }
 
 impl SessionStateMachine {
@@ -335,6 +399,17 @@ impl SessionStateMachine {
                 _ => None,
             })
             .unwrap_or(0);
+        let channels = config
+            .static_channels
+            .iter()
+            .filter(|c| Some(c.id) != config.drdynvc_channel_id)
+            .map(|c| {
+                (
+                    c.id,
+                    crate::svc::Reassembler::new(crate::svc::CHANNEL_MESSAGE_CAP),
+                )
+            })
+            .collect();
         Ok(Self {
             config,
             framebuffer,
@@ -346,6 +421,9 @@ impl SessionStateMachine {
             error_info: None,
             ultimatum_reason: None,
             drdynvc: Drdynvc::new(graphics),
+            channels,
+            suspended: None,
+            held_bytes: 0,
         })
     }
 
@@ -622,8 +700,7 @@ impl SessionStateMachine {
             if Some(indication.channel_id) == self.config.drdynvc_channel_id {
                 return self.on_drdynvc(indication.channel_id, indication.user_data, outputs);
             }
-            // Other static channel traffic (cliprdr, rdpsnd, …) — later slices' epics.
-            return Ok(());
+            return self.on_static_channel(indication.channel_id, indication.user_data, outputs);
         }
         let mut cur = ReadCursor::new(indication.user_data, "session share pdu");
         let header = share::ShareControlHeader::decode(&mut cur).map_err(SessionError::Decode)?;
@@ -970,6 +1047,63 @@ impl SessionStateMachine {
         }
     }
 
+    /// Consume one MCS-delivered payload on a static channel other than I/O and drdynvc: a
+    /// host channel's chunk goes to its reassembler, and anything else was never granted.
+    fn on_static_channel(
+        &mut self,
+        channel: u16,
+        payload: &[u8],
+        outputs: &mut Vec<SessionOutput>,
+    ) -> Result<(), SessionError> {
+        let Some((_, reassembler)) = self.channels.iter_mut().find(|(id, _)| *id == channel) else {
+            tracing::debug!(
+                target: "rdp_svc",
+                channel,
+                bytes = payload.len(),
+                "data on a static channel that was never granted; skipped"
+            );
+            return Ok(());
+        };
+        let data = reassembler.push(payload).map_err(SessionError::Decode)?;
+        self.note_channel_flow(payload, outputs);
+        if let Some(data) = data {
+            outputs.push(SessionOutput::ChannelData { channel, data });
+        }
+        Ok(())
+    }
+
+    /// Track `CHANNEL_FLAG_SUSPEND` / `RESUME` on a received chunk (`[MS-RDPBCGR]` 2.2.6.1.1):
+    /// a suspend starts holding outbound virtual channel frames, a resume releases them in order.
+    fn note_channel_flow(&mut self, payload: &[u8], outputs: &mut Vec<SessionOutput>) {
+        let Some(flags) = payload
+            .get(4..8)
+            .map(|f| u32::from_le_bytes([f[0], f[1], f[2], f[3]]))
+        else {
+            return;
+        };
+        if flags & crate::svc::CHANNEL_FLAG_SUSPEND != 0 && self.suspended.is_none() {
+            tracing::debug!(target: "rdp_svc", "virtual channel traffic suspended");
+            self.suspended = Some(Vec::new());
+        } else if flags & crate::svc::CHANNEL_FLAG_RESUME != 0
+            && let Some(held) = self.suspended.take()
+        {
+            tracing::debug!(target: "rdp_svc", frames = held.len(), "virtual channel traffic resumed");
+            outputs.extend(held.into_iter().map(SessionOutput::WriteBytes));
+            self.held_bytes = 0;
+        }
+    }
+
+    /// `frames` to write now, or none while suspended (they are held for the resume).
+    fn unless_suspended(&mut self, frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        match &mut self.suspended {
+            Some(held) => {
+                held.extend(frames);
+                Vec::new()
+            }
+            None => frames,
+        }
+    }
+
     /// Consume one MCS-delivered payload on the drdynvc static channel: SVC reassembly →
     /// drdynvc dispatch (caps response, Display Control create, channel data) → outbound
     /// responses and the [`SessionOutput::DisplayControlReady`] milestone.
@@ -980,14 +1114,19 @@ impl SessionStateMachine {
         outputs: &mut Vec<SessionOutput>,
     ) -> Result<(), SessionError> {
         let events = self.drdynvc.on_svc_payload(payload)?;
+        self.note_channel_flow(payload, outputs);
         for event in events {
             match event {
                 DvcEvent::Send(pdu) => {
-                    for chunk in svc::encode_chunks(&pdu) {
-                        outputs.push(SessionOutput::WriteBytes(
-                            self.wrap_channel(mcs_channel_id, &chunk),
-                        ));
-                    }
+                    let frames: Vec<Vec<u8>> = svc::encode_chunks(&pdu)
+                        .iter()
+                        .map(|chunk| self.wrap_channel(mcs_channel_id, chunk))
+                        .collect();
+                    outputs.extend(
+                        self.unless_suspended(frames)
+                            .into_iter()
+                            .map(SessionOutput::WriteBytes),
+                    );
                 }
                 DvcEvent::DisplayControlReady => {
                     outputs.push(SessionOutput::DisplayControlReady);
@@ -1054,7 +1193,7 @@ impl SessionStateMachine {
     ///
     /// Valid only after [`SessionOutput::DisplayControlReady`]. An odd `width` is rounded
     /// down to even (the spec forbids odd widths; mstsc does the same).
-    pub fn request_resize(&self, width: u16, height: u16) -> Result<Vec<Vec<u8>>, ResizeError> {
+    pub fn request_resize(&mut self, width: u16, height: u16) -> Result<Vec<Vec<u8>>, ResizeError> {
         let drdynvc_id = self
             .config
             .drdynvc_channel_id
@@ -1091,7 +1230,44 @@ impl SessionStateMachine {
                 frames.push(self.wrap_channel(drdynvc_id, &chunk));
             }
         }
-        Ok(frames)
+        Ok(self.unless_suspended(frames))
+    }
+
+    /// Encode `message` for the host static channel `channel`: split into chunks
+    /// (`[MS-RDPBCGR]` 3.1.5.2.1), each a complete outbound frame for the socket. While the
+    /// server has suspended virtual channel traffic the frames are held instead, returned
+    /// empty here, and surface as [`SessionOutput::WriteBytes`] when it resumes.
+    pub fn send_channel(
+        &mut self,
+        channel: u16,
+        message: &[u8],
+    ) -> Result<Vec<Vec<u8>>, ChannelSendError> {
+        if Some(channel) == self.config.drdynvc_channel_id {
+            return Err(ChannelSendError::CoreOwned { channel });
+        }
+        if !self.channels.iter().any(|(id, _)| *id == channel) {
+            return Err(ChannelSendError::NotGranted { channel });
+        }
+        if self.suspended.is_some() {
+            let held_bytes = self.held_bytes.saturating_add(message.len());
+            if held_bytes > crate::svc::CHANNEL_MESSAGE_CAP {
+                return Err(ChannelSendError::SuspendedQueueFull { channel });
+            }
+            self.held_bytes = held_bytes;
+        }
+        let show_protocol = self.config.static_channels.iter().any(|c| {
+            c.id == channel && c.options & justrdp_pdu::gcc::CHANNEL_OPTION_SHOW_PROTOCOL != 0
+        });
+        let chunks = if show_protocol {
+            svc::encode_chunks_show_protocol(message)
+        } else {
+            svc::encode_chunks(message)
+        };
+        let frames = chunks
+            .iter()
+            .map(|chunk| self.wrap_channel(channel, chunk))
+            .collect();
+        Ok(self.unless_suspended(frames))
     }
 
     /// Wrap a channel payload into a complete outbound frame on `channel_id`.
@@ -1121,6 +1297,9 @@ mod tests {
     const IO: u16 = 1003;
     const USER: u16 = 1007;
     const DRDYNVC: u16 = 1005;
+    const CLIPRDR: u16 = 1004;
+    const RDPDR: u16 = 1006;
+    const RAIL: u16 = 1008;
     const SHARE: u32 = 0x0001_03EA;
 
     /// Read a delivered frame's pixels back out of the retained framebuffer — the host's job
@@ -1143,6 +1322,19 @@ mod tests {
             server_input_flags: capability::INPUT_FLAG_SCANCODES
                 | capability::INPUT_FLAG_FASTPATH_INPUT2,
             drdynvc_channel_id: Some(DRDYNVC),
+            static_channels: [
+                ("cliprdr", CLIPRDR, 0),
+                ("drdynvc", DRDYNVC, 0),
+                ("rdpdr", RDPDR, 0),
+                ("rail", RAIL, justrdp_pdu::gcc::CHANNEL_OPTION_SHOW_PROTOCOL),
+            ]
+            .into_iter()
+            .map(|(name, id, options)| crate::StaticChannel {
+                name: name.to_string(),
+                id,
+                options,
+            })
+            .collect(),
             egfx: Default::default(),
         }
     }
@@ -2183,15 +2375,316 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // Traffic on a static channel (1004) is ignored for now.
+        // Traffic on a static channel that was never granted (1009) is skipped.
         let mut body = vec![0x68];
         body.extend_from_slice(&(1002u16 - 1001).to_be_bytes());
-        body.extend_from_slice(&1004u16.to_be_bytes());
+        body.extend_from_slice(&1009u16.to_be_bytes());
         body.push(0x70);
         body.push(2);
         body.extend_from_slice(&[0xAB, 0xCD]);
         let frame = tpkt::encode(&x224::encode_data(&body));
         assert!(sm.process_bytes(&frame).unwrap().is_empty());
+    }
+
+    /// The Server Announce Request the test VM sends on `rdpdr` right after logon, captured
+    /// on 2026-09-22 (#307): one chunk, FIRST|LAST, `rDnI` + version 1.13 + clientId 12.
+    const VM_RDPDR_SERVER_ANNOUNCE: [u8; 12] = [
+        0x72, 0x44, 0x6E, 0x49, 0x01, 0x00, 0x0D, 0x00, 0x0C, 0x00, 0x00, 0x00,
+    ];
+
+    fn channel_data(channel: u16, data: &[u8]) -> SessionOutput {
+        SessionOutput::ChannelData {
+            channel,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_granted_channels_message_reaches_the_host_intact() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let chunk = &svc::encode_chunks(&VM_RDPDR_SERVER_ANNOUNCE)[0];
+        let outputs = sm
+            .process_bytes(&server_channel_frame(RDPDR, chunk))
+            .unwrap();
+        assert_eq!(
+            outputs,
+            vec![channel_data(RDPDR, &VM_RDPDR_SERVER_ANNOUNCE)]
+        );
+    }
+
+    /// A message spanning several MCS payloads surfaces once, whole, on its last chunk — and
+    /// a message on another channel in between is its own stream (`[MS-RDPBCGR]` 1.3.3).
+    #[test]
+    fn chunked_messages_reassemble_per_channel() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let big: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let chunks = svc::encode_chunks(&big);
+        assert!(chunks.len() > 2);
+        assert!(
+            sm.process_bytes(&server_channel_frame(CLIPRDR, &chunks[0]))
+                .unwrap()
+                .is_empty()
+        );
+        let rdpdr = &svc::encode_chunks(&VM_RDPDR_SERVER_ANNOUNCE)[0];
+        assert_eq!(
+            sm.process_bytes(&server_channel_frame(RDPDR, rdpdr))
+                .unwrap(),
+            vec![channel_data(RDPDR, &VM_RDPDR_SERVER_ANNOUNCE)]
+        );
+        let mut outputs = Vec::new();
+        for chunk in &chunks[1..] {
+            outputs.extend(
+                sm.process_bytes(&server_channel_frame(CLIPRDR, chunk))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(outputs, vec![channel_data(CLIPRDR, &big)]);
+    }
+
+    /// `VCCAPS_NO_COMPR` was advertised, so a compressed chunk on a host channel is a
+    /// transport error, as it is on drdynvc.
+    #[test]
+    fn a_compressed_chunk_on_a_host_channel_ends_the_session() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let mut chunk = 1u32.to_le_bytes().to_vec();
+        chunk.extend_from_slice(
+            &(svc::CHANNEL_FLAG_FIRST
+                | svc::CHANNEL_FLAG_LAST
+                | svc::CHANNEL_FLAG_PACKET_COMPRESSED)
+                .to_le_bytes(),
+        );
+        chunk.push(0xAA);
+        let err = sm
+            .process_bytes(&server_channel_frame(CLIPRDR, &chunk))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                    field: "CHANNEL_PDU_HEADER.flags",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A FIRST chunk while a message is in flight on a host channel ends the session: both
+    /// reference clients refuse it, and so does this machine.
+    #[test]
+    fn a_first_chunk_mid_sequence_on_a_host_channel_ends_the_session() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let first = |total: u32, data: &[u8]| {
+            let mut chunk = total.to_le_bytes().to_vec();
+            chunk.extend_from_slice(&svc::CHANNEL_FLAG_FIRST.to_le_bytes());
+            chunk.extend_from_slice(data);
+            server_channel_frame(CLIPRDR, &chunk)
+        };
+        assert!(sm.process_bytes(&first(9, b"old")).unwrap().is_empty());
+        let err = sm.process_bytes(&first(3, b"new")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionError::Decode(justrdp_pdu::DecodeError::InvalidField {
+                    field: "CHANNEL_PDU_HEADER.flags",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A header-only chunk carrying `flags` (SUSPEND / RESUME carry no message data).
+    fn flag_chunk(flags: u32) -> Vec<u8> {
+        let mut chunk = 0u32.to_le_bytes().to_vec();
+        chunk.extend_from_slice(&flags.to_le_bytes());
+        chunk
+    }
+
+    /// `[MS-RDPBCGR]` 2.2.6.1.1: after SUSPEND, all virtual channel traffic is suspended until
+    /// RESUME. A host message is held, not sent and not refused, and goes out on the RESUME.
+    #[test]
+    fn a_host_send_while_suspended_goes_out_on_resume() {
+        let expected = SessionStateMachine::new(config(), Vec::new())
+            .unwrap()
+            .send_channel(RDPDR, b"hello")
+            .unwrap();
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let suspend = server_channel_frame(CLIPRDR, &flag_chunk(crate::svc::CHANNEL_FLAG_SUSPEND));
+        assert!(sm.process_bytes(&suspend).unwrap().is_empty());
+        assert_eq!(
+            sm.send_channel(RDPDR, b"hello").unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        let resume = server_channel_frame(CLIPRDR, &flag_chunk(crate::svc::CHANNEL_FLAG_RESUME));
+        let outputs = sm.process_bytes(&resume).unwrap();
+        let written: Vec<SessionOutput> = expected
+            .into_iter()
+            .map(SessionOutput::WriteBytes)
+            .collect();
+        assert_eq!(outputs, written);
+        // Resumed: the next send goes straight out.
+        assert_eq!(sm.send_channel(RDPDR, b"hello").unwrap().len(), 1);
+    }
+
+    /// The machine's own virtual channel traffic is held too: a drdynvc response while
+    /// suspended, and a Display Control resize.
+    #[test]
+    fn the_machines_own_channel_traffic_is_held_while_suspended() {
+        let caps_request = [0x50u8, 0x00, 0x03, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut fresh = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let mut expected = Vec::new();
+        for frame in server_dvc_frames(&caps_request) {
+            expected.extend(fresh.process_bytes(&frame).unwrap());
+        }
+        assert!(matches!(
+            expected.as_slice(),
+            [SessionOutput::WriteBytes(_)]
+        ));
+
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let suspend = server_channel_frame(DRDYNVC, &flag_chunk(crate::svc::CHANNEL_FLAG_SUSPEND));
+        assert!(sm.process_bytes(&suspend).unwrap().is_empty());
+        for frame in server_dvc_frames(&caps_request) {
+            assert!(sm.process_bytes(&frame).unwrap().is_empty());
+        }
+        let resume = server_channel_frame(DRDYNVC, &flag_chunk(crate::svc::CHANNEL_FLAG_RESUME));
+        assert_eq!(sm.process_bytes(&resume).unwrap(), expected);
+
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        display_control_ready(&mut sm, 8192, 8192);
+        let resize = sm.request_resize(1280, 1024).unwrap();
+        assert!(sm.process_bytes(&suspend).unwrap().is_empty());
+        assert_eq!(
+            sm.request_resize(1280, 1024).unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        let written: Vec<SessionOutput> =
+            resize.into_iter().map(SessionOutput::WriteBytes).collect();
+        assert_eq!(sm.process_bytes(&resume).unwrap(), written);
+    }
+
+    /// What the host can have held is bounded; past it the send is refused, and nothing of
+    /// the refused message is held.
+    #[test]
+    fn a_host_send_past_the_suspended_bound_is_refused() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let suspend = server_channel_frame(CLIPRDR, &flag_chunk(crate::svc::CHANNEL_FLAG_SUSPEND));
+        sm.process_bytes(&suspend).unwrap();
+        let too_big = vec![0u8; crate::svc::CHANNEL_MESSAGE_CAP + 1];
+        assert_eq!(
+            sm.send_channel(RDPDR, &too_big),
+            Err(ChannelSendError::SuspendedQueueFull { channel: RDPDR })
+        );
+        let resume = server_channel_frame(CLIPRDR, &flag_chunk(crate::svc::CHANNEL_FLAG_RESUME));
+        assert!(sm.process_bytes(&resume).unwrap().is_empty());
+    }
+
+    /// A RESUME with nothing suspended changes nothing.
+    #[test]
+    fn a_resume_without_a_suspend_is_harmless() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let resume = server_channel_frame(CLIPRDR, &flag_chunk(crate::svc::CHANNEL_FLAG_RESUME));
+        assert!(sm.process_bytes(&resume).unwrap().is_empty());
+        assert_eq!(sm.send_channel(RDPDR, b"x").unwrap().len(), 1);
+    }
+
+    /// drdynvc is granted and listed with the host's channels, and still never reaches the
+    /// host: its traffic is the dynamic-channel manager's.
+    #[test]
+    fn drdynvc_traffic_is_not_host_channel_data() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let caps_request = vec![0x50, 0x00, 0x03, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut outputs = Vec::new();
+        for frame in server_dvc_frames(&caps_request) {
+            outputs.extend(sm.process_bytes(&frame).unwrap());
+        }
+        assert!(
+            matches!(outputs.as_slice(), [SessionOutput::WriteBytes(_)]),
+            "{outputs:?}"
+        );
+    }
+
+    /// `[MS-RDPBCGR]` 3.1.5.2.2: a chunk with neither FIRST nor LAST outside a sequence is a
+    /// whole message. drdynvc refused it until #307 gave it the shared reassembler.
+    #[test]
+    fn a_flagless_single_chunk_is_answered_on_drdynvc() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let caps_request = [0x50u8, 0x00, 0x03, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut chunk = (caps_request.len() as u32).to_le_bytes().to_vec();
+        chunk.extend_from_slice(&0u32.to_le_bytes());
+        chunk.extend_from_slice(&caps_request);
+        let outputs = sm
+            .process_bytes(&server_channel_frame(DRDYNVC, &chunk))
+            .unwrap();
+        assert!(
+            matches!(outputs.as_slice(), [SessionOutput::WriteBytes(_)]),
+            "{outputs:?}"
+        );
+    }
+
+    #[test]
+    fn send_channel_chunks_the_message_onto_the_channel() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let message: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        let frames = sm.send_channel(CLIPRDR, &message).unwrap();
+        let chunks = svc::encode_chunks(&message);
+        assert_eq!(frames.len(), chunks.len());
+        for (frame, chunk) in frames.iter().zip(&chunks) {
+            assert_eq!(tpkt::frame_len(frame).unwrap(), frame.len());
+            let body = x224::decode_data(tpkt::decode(frame).unwrap()).unwrap();
+            // SendDataRequest: choice 0x64, initiator (USER - 1001), channel, priority, length.
+            assert_eq!(body[0], 0x64);
+            assert_eq!(&body[1..3], &(USER - 1001).to_be_bytes());
+            assert_eq!(&body[3..5], &CLIPRDR.to_be_bytes());
+            assert!(
+                body.ends_with(chunk),
+                "the frame must carry the chunk verbatim"
+            );
+        }
+    }
+
+    /// A channel the host opened with `CHANNEL_OPTION_SHOW_PROTOCOL` shows the header on every
+    /// chunk, a single-chunk message included; any other channel does only when it chunks.
+    #[test]
+    fn send_channel_honours_the_show_protocol_option() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let flags_of = |frames: &[Vec<u8>]| -> Vec<u32> {
+            frames
+                .iter()
+                .map(|frame| {
+                    let body = x224::decode_data(tpkt::decode(frame).unwrap()).unwrap();
+                    // The frame ends with the chunk: an 8-byte header, then the 4-byte message.
+                    let chunk = &body[body.len() - 12..];
+                    u32::from_le_bytes(chunk[4..8].try_into().unwrap())
+                })
+                .collect()
+        };
+        let whole = svc::CHANNEL_FLAG_FIRST | svc::CHANNEL_FLAG_LAST;
+        let rail = sm.send_channel(RAIL, b"exec").unwrap();
+        assert_eq!(
+            flags_of(&rail),
+            vec![whole | svc::CHANNEL_FLAG_SHOW_PROTOCOL]
+        );
+        let rdpdr = sm.send_channel(RDPDR, b"exec").unwrap();
+        assert_eq!(flags_of(&rdpdr), vec![whole]);
+    }
+
+    #[test]
+    fn send_channel_refuses_a_channel_the_host_does_not_own() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        assert_eq!(
+            sm.send_channel(1009, b"x"),
+            Err(ChannelSendError::NotGranted { channel: 1009 })
+        );
+        assert_eq!(
+            sm.send_channel(IO, b"x"),
+            Err(ChannelSendError::NotGranted { channel: IO })
+        );
+        assert_eq!(
+            sm.send_channel(DRDYNVC, b"x"),
+            Err(ChannelSendError::CoreOwned { channel: DRDYNVC })
+        );
     }
 
     #[test]
@@ -2866,6 +3359,7 @@ mod tests {
     fn without_a_drdynvc_channel_resize_is_not_ready_and_traffic_is_skipped() {
         let mut cfg = config();
         cfg.drdynvc_channel_id = None;
+        cfg.static_channels.retain(|c| c.id != DRDYNVC);
         let mut sm = SessionStateMachine::new(cfg, Vec::new())
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
         assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));

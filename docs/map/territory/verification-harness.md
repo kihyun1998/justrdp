@@ -115,6 +115,19 @@ adjudicated once (say, in #127) leaves no citable artifact behind, only a fixtur
 
 ## Known holes / open
 
+- **A VM test must not let go of the session before the desktop has painted and settled
+  (#307).** Measured on 2026-09-22: when #307's channel test ended its session within 1–2 s
+  of logon, as soon as the channel messages it waited for had arrived, the Windows session was
+  left black. Every later connection, including the harness's own sign-out, got one colour, so
+  every later test failed, master `ff97721` included. That happened 4 of 4 times. With the test
+  waiting on `await_desktop` first, it happened 0 of 3 times, with the same half-finished
+  `rdpdr` handshake in both runs. So the early disconnect is the cause, and the protocol state
+  was not. Nothing else in the suite ends that early, which is why this never showed before.
+  **Recovery needs the VM console** (`query session` → `logoff <id>`): the harness cannot sign
+  out of a shell that does not paint, and the VM's RPC is not reachable from the host
+  (`Error 1722`). The 2026-09-21 occurrence in memory `test_environment` has the same symptom
+  and an unknown trigger.
+
 - **The oracle roster is derived, never listed — and the obvious derivation is wrong.** This
   file's `## Code` section named seven files under `justrdp-codecs/tests/` when there were ten;
   the three it never gained arrived over #168/#169/#171 with the map gate **green throughout**,

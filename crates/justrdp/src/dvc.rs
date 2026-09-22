@@ -13,7 +13,6 @@ use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::displaycontrol::{self, DisplayControlPdu};
 use justrdp_pdu::dvc::{self, DvcMessage};
-use justrdp_pdu::svc;
 
 /// Refuse a Create Request with this `CreationStatus` (`E_FAIL` — any negative HRESULT
 /// refuses, MS-RDPEDYC 2.2.2.2).
@@ -187,8 +186,7 @@ pub(crate) struct Drdynvc {
     processors: Vec<Box<dyn DvcProcessor + Send>>,
     open: Vec<OpenChannel>,
     /// SVC chunk reassembly for the drdynvc channel itself.
-    svc_buffer: Vec<u8>,
-    svc_in_flight: bool,
+    svc: crate::svc::Reassembler,
     /// The Display Control channel ID + server caps, recorded off the processor's output.
     display_control: Option<(u32, displaycontrol::Caps)>,
 }
@@ -217,8 +215,7 @@ impl Drdynvc {
                 Box::new(graphics),
             ],
             open: Vec::new(),
-            svc_buffer: Vec::new(),
-            svc_in_flight: false,
+            svc: crate::svc::Reassembler::new(SVC_MESSAGE_CAP),
             display_control: None,
         }
     }
@@ -246,42 +243,10 @@ impl Drdynvc {
 
     /// Consume one MCS-delivered SVC payload on the drdynvc channel.
     pub(crate) fn on_svc_payload(&mut self, payload: &[u8]) -> Result<Vec<DvcEvent>, DvcError> {
-        let chunk = svc::ChannelChunk::decode(payload)?;
-        if chunk.flags & svc::CHANNEL_FLAG_PACKET_COMPRESSED != 0 {
-            // justrdp advertises VCCAPS_NO_COMPR; compressed chunks are a violation.
-            return Err(DvcError::Transport(DecodeError::InvalidField {
-                field: "CHANNEL_PDU_HEADER.flags",
-                reason: "compressed SVC chunk but compression was never advertised",
-            }));
+        match self.svc.push(payload)? {
+            Some(message) => self.on_dvc_pdu(&message),
+            None => Ok(Vec::new()),
         }
-        if chunk.total_length as usize > SVC_MESSAGE_CAP {
-            return Err(DvcError::Transport(DecodeError::InvalidField {
-                field: "CHANNEL_PDU_HEADER.length",
-                reason: "drdynvc SVC message exceeds the reassembly cap",
-            }));
-        }
-        if chunk.flags & svc::CHANNEL_FLAG_FIRST != 0 {
-            self.svc_buffer.clear();
-            self.svc_in_flight = true;
-        } else if !self.svc_in_flight {
-            return Err(DvcError::Transport(DecodeError::InvalidField {
-                field: "CHANNEL_PDU_HEADER.flags",
-                reason: "SVC continuation chunk without a first chunk",
-            }));
-        }
-        if self.svc_buffer.len() + chunk.data.len() > SVC_MESSAGE_CAP {
-            return Err(DvcError::Transport(DecodeError::InvalidField {
-                field: "CHANNEL_PDU_HEADER.length",
-                reason: "drdynvc SVC message grew past its declared length cap",
-            }));
-        }
-        self.svc_buffer.extend_from_slice(chunk.data);
-        if chunk.flags & svc::CHANNEL_FLAG_LAST == 0 {
-            return Ok(Vec::new());
-        }
-        self.svc_in_flight = false;
-        let message = core::mem::take(&mut self.svc_buffer);
-        self.on_dvc_pdu(&message)
     }
 
     /// Handle one complete drdynvc PDU.
@@ -475,6 +440,7 @@ impl Drdynvc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use justrdp_pdu::svc;
 
     fn svc_payloads(message: &[u8]) -> Vec<Vec<u8>> {
         svc::encode_chunks(message)

@@ -16,6 +16,9 @@ pub const CHANNEL_CHUNK_LENGTH: usize = 1600;
 pub const CHANNEL_FLAG_FIRST: u32 = 0x0000_0001;
 /// This chunk is the last of its message.
 pub const CHANNEL_FLAG_LAST: u32 = 0x0000_0002;
+/// The channel PDU header is visible to the endpoint (MS-RDPBCGR 2.2.6.1.1); a sender sets it
+/// on every chunk of a message that spans several (3.1.5.2.1).
+pub const CHANNEL_FLAG_SHOW_PROTOCOL: u32 = 0x0000_0010;
 /// The chunk data is compressed (`CHANNEL_PACKET_COMPRESSED`). justrdp advertises
 /// `VCCAPS_NO_COMPR`, so an inbound compressed chunk is a protocol violation.
 pub const CHANNEL_FLAG_PACKET_COMPRESSED: u32 = 0x0020_0000;
@@ -48,9 +51,19 @@ impl<'a> ChannelChunk<'a> {
 }
 
 /// Split `message` into SVC chunk payloads (header + data each), FIRST/LAST flags set per
-/// chunk. Each returned payload is ready to be wrapped in an MCS Send Data Request and is at
+/// chunk and SHOW_PROTOCOL on each when there is more than one. Each returned payload is ready to be wrapped in an MCS Send Data Request and is at
 /// most [`CHANNEL_CHUNK_LENGTH`] bytes long.
 pub fn encode_chunks(message: &[u8]) -> Vec<Vec<u8>> {
+    chunk_message(message, false)
+}
+
+/// [`encode_chunks`] for a channel opened with `CHANNEL_OPTION_SHOW_PROTOCOL`: SHOW_PROTOCOL on
+/// every chunk, a single-chunk message included.
+pub fn encode_chunks_show_protocol(message: &[u8]) -> Vec<Vec<u8>> {
+    chunk_message(message, true)
+}
+
+fn chunk_message(message: &[u8], always_show: bool) -> Vec<Vec<u8>> {
     const DATA_PER_CHUNK: usize = CHANNEL_CHUNK_LENGTH - 8;
     let total = message.len() as u32;
     let mut chunks: Vec<&[u8]> = message.chunks(DATA_PER_CHUNK).collect();
@@ -62,7 +75,11 @@ pub fn encode_chunks(message: &[u8]) -> Vec<Vec<u8>> {
         .iter()
         .enumerate()
         .map(|(i, data)| {
-            let mut flags = 0;
+            let mut flags = if always_show || last > 0 {
+                CHANNEL_FLAG_SHOW_PROTOCOL
+            } else {
+                0
+            };
             if i == 0 {
                 flags |= CHANNEL_FLAG_FIRST;
             }
@@ -120,15 +137,45 @@ mod tests {
             .iter()
             .map(|c| ChannelChunk::decode(c).unwrap())
             .collect();
-        assert_eq!(decoded[0].flags, CHANNEL_FLAG_FIRST);
-        assert_eq!(decoded[1].flags, 0);
-        assert_eq!(decoded[2].flags, CHANNEL_FLAG_LAST);
+        // 3.1.5.2.1: every chunk of a chunked message carries SHOW_PROTOCOL.
+        assert_eq!(
+            decoded[0].flags,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_SHOW_PROTOCOL
+        );
+        assert_eq!(decoded[1].flags, CHANNEL_FLAG_SHOW_PROTOCOL);
+        assert_eq!(
+            decoded[2].flags,
+            CHANNEL_FLAG_LAST | CHANNEL_FLAG_SHOW_PROTOCOL
+        );
         assert!(decoded.iter().all(|c| c.total_length == 4000));
         let reassembled: Vec<u8> = decoded
             .iter()
             .flat_map(|c| c.data.iter().copied())
             .collect();
         assert_eq!(reassembled, message);
+    }
+
+    /// A channel opened with `CHANNEL_OPTION_SHOW_PROTOCOL` shows the header on every chunk,
+    /// a single-chunk message included (`[MS-RDPERP]` 1.5 requires it of the RAIL channel).
+    #[test]
+    fn show_protocol_chunks_carry_the_flag_on_every_chunk() {
+        let one = encode_chunks_show_protocol(&[0xAA]);
+        let flags = ChannelChunk::decode(&one[0]).unwrap().flags;
+        assert_eq!(
+            flags,
+            CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST | CHANNEL_FLAG_SHOW_PROTOCOL
+        );
+        let many = encode_chunks_show_protocol(&vec![7u8; 4000]);
+        assert_eq!(many.len(), 3);
+        assert!(
+            many.iter()
+                .all(|c| ChannelChunk::decode(c).unwrap().flags & CHANNEL_FLAG_SHOW_PROTOCOL != 0)
+        );
+        // The data is chunked exactly as encode_chunks chunks it.
+        let plain = encode_chunks(&vec![7u8; 4000]);
+        for (a, b) in many.iter().zip(&plain) {
+            assert_eq!(a[8..], b[8..]);
+        }
     }
 
     #[test]
