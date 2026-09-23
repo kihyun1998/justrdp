@@ -174,10 +174,11 @@ glossary, which is vocabulary rather than a decision.
   (`cliprdr_client_capabilities`). With no server Capabilities before Monitor Ready the
   server's flags are zero, which `[MS-RDPECLIP]` 2.2.2.1.1.1 makes a MUST and FreeRDP
   follows (`cliprdr_process_monitor_ready`), so short names are used.
-  The file-transfer flags join the set in #324/#325. **The initial Format List is empty**, as
-  FreeRDP's was against the VM: every format announced entitles the server to a Format Data Request,
-  which is #322's, so announcing one here would advertise what nothing answers. A server
-  Format List is answered with
+  The file-transfer flags join the set in #324/#325. **The initial Format List holds what the
+  host announced before Monitor Ready, and nothing by default**, as FreeRDP's was against the
+  VM. Every format announced entitles the server to a Format Data Request, which the host now
+  answers through `DataRequested` and `respond` (#322); #321 kept the list empty because
+  nothing answered one yet. A server Format List is answered with
   `CB_RESPONSE_OK` before it is surfaced as `RemoteFormatList`, because the answer carries no
   policy. **A server Format List that does not decode is answered with `CB_RESPONSE_FAIL`**
   and surfaced as `FormatListRejected`, because `[MS-RDPECLIP]` 3.1.5.2.2 says a failure
@@ -186,6 +187,34 @@ glossary, which is vocabulary rather than a decision.
   maintainer's call (2026-09-23)**, shown three options: build it in #321, defer it to #322,
   or record the references' behaviour and drop it. Anything else the helper does not decode is
   skipped with an `rdp_cliprdr` record.
+- **The paste sequence's state is the helper's, because a Format Data Response names no
+  format** (#322, `[MS-RDPECLIP]` 2.2.5.2), so a response can only be paired with its request
+  by order. Both directions follow from that, and all of it is derivation:
+  - **This side asking.** `request` remembers the one format it asked for and refuses a second
+    request while that one waits (`RequestError::Pending`). IronRDP's `initiate_paste`
+    overwrites its `pending_format_data_request` instead, and clears it when a new server Format
+    List arrives. justrdp keeps the wait across a new list, because the server still owes the
+    answer. A response that does not decode ends the wait and is returned as the error, and
+    `cancel_request` ends it for a host that stops waiting; how long to wait is the host's.
+    `request` also refuses a format the server's latest Format List does not hold
+    (`NotAnnounced`), because 2.2.5.1 says the requested ID MUST be one listed. A server Format
+    List that does not decode empties that list. A response nothing asked for is skipped with an
+    `rdp_cliprdr` record.
+  - **The server asking.** Every server request gets exactly one response, in the order the
+    requests came: the helper queues what it owes, and `respond` answers the oldest
+    `DataRequested` and releases any failures queued behind it. A refusal never jumps ahead of an
+    answer the host still owes, or the server would pair the two the wrong way round. FreeRDP's
+    X11 client keeps a single `requestedFormatId` slot, which a second request overwrites; the
+    VM has not been seen sending two at once. A request that does not decode is answered with a
+    failure, like one for an unannounced format.
+- **A server request this side cannot honour is answered `CB_RESPONSE_FAIL` by the helper and
+  never reaches the host** (#322): a format this side never announced, and any format after the
+  server refused this side's Format List, which `[MS-RDPECLIP]` 3.1.5.4.3 makes a MUST.
+  Answering an unannounced format is FreeRDP's behaviour (`xf_cliprdr_server_format_data_request`
+  finds no local format and sends the failure); IronRDP forwards every request to its backend
+  unchecked. Under [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md) it is the
+  server's inconsistency, so the session goes on and the refusal is logged. A new `announce`
+  clears the refused state. That is a derivation.
 - **How strictly a clipboard message is read** is a set of derivations, and they fall to a
   better one. `dataLen` must equal the rest of the message, where FreeRDP only needs it not to
   exceed it: one message is one PDU, and every VM message was exact. A capability set other
@@ -198,7 +227,11 @@ glossary, which is vocabulary rather than a decision.
   Windows server has been seen doing either. **A 16-character short name with no NUL is
   accepted**: FreeRDP records Windows sending exactly that (`cliprdr_read_format_list`), so it
   is the server's real form rather than a malformation. An ASCII short name may fill all 32
-  bytes the same way, where FreeRDP keeps 31.
+  bytes the same way, where FreeRDP keeps 31. A Format Data Request's body must be exactly
+  one format ID, and a failed Format Data Response must carry no data, which 2.2.5.2 makes a
+  MUST (#322).
+- **`CF_UNICODETEXT` is UTF-16LE ending at its first NUL** (`encode_unicode_text`,
+  `decode_unicode_text`). What follows the NUL is not text, and a trailing odd byte is dropped.
 
 ## Code
 
@@ -211,15 +244,17 @@ glossary, which is vocabulary rather than a decision.
 - `justrdp/src/svc.rs` — `Reassembler`, `CHANNEL_MESSAGE_CAP`
 - `justrdp/src/session.rs` — `SessionOutput::ChannelData`, `send_channel`, `ChannelSendError`
 - `justrdp-pdu/src/cliprdr.rs` — `ClipboardPdu`, `GeneralCapability`, `Format`,
-  `encode_capabilities`, `encode_format_list`, `encode_format_list_response`
-- `justrdp/src/cliprdr.rs` — `Clipboard`, `ClipboardOutput`, `channel_def`, `CHANNEL_OPTIONS`,
-  `ADVERTISED_FLAGS`
+  `encode_capabilities`, `encode_format_list`, `encode_format_list_response`,
+  `encode_format_data_request`, `encode_format_data_response`, `encode_unicode_text`,
+  `decode_unicode_text`
+- `justrdp/src/cliprdr.rs` — `Clipboard`, `ClipboardOutput`, `RequestError`, `channel_def`,
+  `CHANNEL_OPTIONS`, `ADVERTISED_FLAGS`
 - Spec sections cited inline: `[MS-RDPBCGR]` 1.3.3, 2.2.6.1.1, 3.1.5.2.1, 3.1.5.2.2;
   `[MS-RDPEDYC]` 1.7, 2.2.2.2, 2.2.3.3, 2.2.3.4, 3.2;
   `[MS-RDPEDISP]` 1.3,
   2.2.2.2, 2.2.2.2.1;
   `[MS-RDPECLIP]` 1.3.2.1, 2.1, 2.2.1, 2.2.2.1, 2.2.2.1.1, 2.2.2.1.1.1, 2.2.2.2, 2.2.3.1,
-  2.2.3.1.2, 2.2.3.2, 3.1.5.2.2
+  2.2.3.1.2, 2.2.3.2, 2.2.5.1, 2.2.5.2, 3.1.5.2.2, 3.1.5.4.3
 
 ## Reference behaviour
 
@@ -256,8 +291,19 @@ glossary, which is vocabulary rather than a decision.
   dropping `CB_CAN_LOCK_CLIPDATA`, then an empty Format List (8 bytes); the server replies
   `CB_RESPONSE_OK`. A later one-format list (`CF_UNICODETEXT`, long names, 14 bytes) is
   answered OK too. Taken with `/dump` and `WLOG_FILTER=com.freerdp.channels.cliprdr.client:TRACE`.
-- The server sent no Format List of its own during the handshake, with its clipboard empty, so
-  **a server Format List has not been decoded live**; the unit tests alone cover it.
+- The server sent no Format List of its own during the handshake, with its clipboard empty.
+
+**Measured against the WS2022 test VM (#322, 2026-09-23):**
+
+- Text copied in Notepad arrives as a server Format List of `13` (`CF_UNICODETEXT`), `16`
+  (`CF_LOCALE`), `1` (`CF_TEXT`) and `7` (`CF_OEMTEXT`), every name empty, in long-name
+  layout. So **a server Format List has been decoded live**, and so have Format Data Requests
+  and Responses in both directions.
+- `INPUT_FLAG_UNICODE` is advertised, and Unicode input events typed into Notepad come back
+  through the clipboard byte-exact, a surrogate pair (`😀`) included.
+- A host Format List of `CF_UNICODETEXT` is answered OK. Pasting in Notepad sends a Format Data
+  Request for `13`, and the host's text, copied back out of Notepad, is intact. Both texts fit
+  one chunk, so this proves nothing about multi-chunk messages; that is still #323's.
 - A chunked client message (a 2018-byte `rdpdr` Client Name, sent without SHOW_PROTOCOL)
   did not end the session, but nothing the server sends depends on it. So **a multi-chunk
   send is not proven live either.**
@@ -287,8 +333,8 @@ glossary, which is vocabulary rather than a decision.
 - **Every redirection feature but the clipboard's handshake is an unopened channel**: audio
   output (#11), audio input (#12), device/drive/printer/smartcard (#13), RemoteApp
   (#14), multitouch (#15), video (#17), camera (#19), location (#20). The transport
-  exists; the consumers do not. The clipboard (#10) moves no data yet: text is #322, images
-  #323, files #324/#325.
+  exists; the consumers do not. The clipboard (#10) moves text since #322; images are #323,
+  files #324/#325.
 - ~~Static channel 1004 traffic is ignored by the session loop with no record of what
   it contains.~~ **Closed in #307**: 1004 is `cliprdr`, and a granted channel's messages
   now reach the host. The remaining gaps are the multi-chunk live proofs above.

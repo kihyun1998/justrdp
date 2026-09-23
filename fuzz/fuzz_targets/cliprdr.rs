@@ -4,7 +4,8 @@
 //!
 //! `ClipboardPdu::decode` reads a header whose `dataLen` must cover the message, then walks
 //! server-declared capability sets or a Format List whose long names end only at a NUL. The
-//! first byte picks the Format List layout the two sides negotiated.
+//! first byte picks the Format List layout the two sides negotiated. The same bytes are read as
+//! `CF_UNICODETEXT` data too, which is what a Format Data Response carries.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -13,4 +14,5 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let _ = justrdp_pdu::cliprdr::ClipboardPdu::decode(message, mode & 1 != 0);
+    let _ = justrdp_pdu::cliprdr::decode_unicode_text(message);
 });
