@@ -10,6 +10,7 @@
 pub mod ber;
 pub mod capability;
 pub mod client_info;
+pub mod cliprdr;
 pub mod cursor;
 pub mod displaycontrol;
 pub mod dvc;
