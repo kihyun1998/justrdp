@@ -1,6 +1,6 @@
 //! Clipboard virtual channel PDUs (MS-RDPECLIP), carried over the static channel
-//! [`CHANNEL_NAME`]. Every PDU is one whole channel message: a `CLIPRDR_HEADER` (2.2.1) and
-//! `dataLen` bytes of body. The initialization sequence (1.3.2.1) is server Capabilities and
+//! [`CHANNEL_NAME`]. Every PDU is one whole channel message: a `CLIPRDR_HEADER` (2.2.1),
+//! `dataLen` bytes of body, and possibly padding ([`padding`]). The initialization sequence (1.3.2.1) is server Capabilities and
 //! Monitor Ready, then client Capabilities and a Format List, answered by a Format List
 //! Response.
 
@@ -22,6 +22,14 @@ pub const CB_FORMAT_DATA_REQUEST: u16 = 0x0004;
 pub const CB_FORMAT_DATA_RESPONSE: u16 = 0x0005;
 /// `CB_CLIP_CAPS` (2.2.2.1).
 pub const CB_CLIP_CAPS: u16 = 0x0007;
+/// `CB_FILECONTENTS_REQUEST` (2.2.5.3).
+pub const CB_FILECONTENTS_REQUEST: u16 = 0x0008;
+/// `CB_FILECONTENTS_RESPONSE` (2.2.5.4).
+pub const CB_FILECONTENTS_RESPONSE: u16 = 0x0009;
+/// `CB_LOCK_CLIPDATA` (2.2.4.1).
+pub const CB_LOCK_CLIPDATA: u16 = 0x000A;
+/// `CB_UNLOCK_CLIPDATA` (2.2.4.2).
+pub const CB_UNLOCK_CLIPDATA: u16 = 0x000B;
 
 /// `msgFlags`: the request succeeded.
 pub const CB_RESPONSE_OK: u16 = 0x0001;
@@ -53,6 +61,71 @@ pub const CF_DIB: u32 = 8;
 pub const CF_UNICODETEXT: u32 = 13;
 /// `CF_DIBV5`, a device-independent bitmap with a `BITMAPV5HEADER`.
 pub const CF_DIBV5: u32 = 17;
+
+/// The registered format name whose data is a [`FileDescriptor`] list (`CLIPRDR_FILELIST`,
+/// 2.2.5.2.3).
+pub const FILE_GROUP_DESCRIPTOR_W: &str = "FileGroupDescriptorW";
+
+/// `FILECONTENTS_SIZE`: a File Contents Request for a file's size.
+pub const FILECONTENTS_SIZE: u32 = 0x0000_0001;
+/// `FILECONTENTS_RANGE`: a File Contents Request for a range of a file's bytes.
+pub const FILECONTENTS_RANGE: u32 = 0x0000_0002;
+
+/// `FD_ATTRIBUTES`: a descriptor's `fileAttributes` is valid.
+pub const FD_ATTRIBUTES: u32 = 0x0000_0004;
+/// `FD_WRITESTIME`: a descriptor's `lastWriteTime` is valid.
+pub const FD_WRITESTIME: u32 = 0x0000_0020;
+/// `FD_FILESIZE`: a descriptor's file size is valid.
+pub const FD_FILESIZE: u32 = 0x0000_0040;
+/// `FILE_ATTRIBUTE_DIRECTORY`.
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+
+/// The size of a `CLIPRDR_FILEDESCRIPTOR`.
+const FILE_DESCRIPTOR_SIZE: usize = 592;
+/// The size of a descriptor's `fileName` field.
+const FILE_NAME_BYTES: usize = 520;
+
+/// One file in a `CLIPRDR_FILELIST` (2.2.5.2.3.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDescriptor {
+    /// `flags` (`FD_ATTRIBUTES`, `FD_WRITESTIME`, `FD_FILESIZE`, ...).
+    pub flags: u32,
+    /// `fileAttributes`, meaningful with [`FD_ATTRIBUTES`].
+    pub attributes: u32,
+    /// `lastWriteTime`, meaningful with [`FD_WRITESTIME`].
+    pub last_write_time: u64,
+    /// The file size, `Some` with [`FD_FILESIZE`].
+    pub size: Option<u64>,
+    /// `fileName`: a relative path whose components are separated by `\`.
+    pub name: String,
+}
+
+/// What a File Contents Request asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileContentsOp {
+    /// The file's size (`FILECONTENTS_SIZE`).
+    Size,
+    /// Up to `len` bytes from `position` (`FILECONTENTS_RANGE`).
+    Range {
+        /// The offset into the file.
+        position: u64,
+        /// The most bytes to return (`cbRequested`).
+        len: u32,
+    },
+}
+
+/// A File Contents Request (2.2.5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileContentsRequest {
+    /// `streamId`, echoed by the response.
+    pub stream_id: u32,
+    /// `lindex`: the file's index in the file list.
+    pub index: u32,
+    /// What is asked for.
+    pub op: FileContentsOp,
+    /// `clipDataId`, when the file list was locked.
+    pub clip_data_id: Option<u32>,
+}
 
 /// The size of a `CLIPRDR_HEADER`.
 const HEADER_SIZE: usize = 8;
@@ -109,6 +182,25 @@ pub enum ClipboardPdu {
         /// `requestedFormatData`.
         data: Option<Vec<u8>>,
     },
+    /// File Contents Request (2.2.5.3).
+    FileContentsRequest(FileContentsRequest),
+    /// File Contents Response (2.2.5.4). `data` is `None` for `CB_RESPONSE_FAIL`.
+    FileContentsResponse {
+        /// `streamId`.
+        stream_id: u32,
+        /// `requestedFileContentsData`.
+        data: Option<Vec<u8>>,
+    },
+    /// Lock Clipboard Data (2.2.4.1).
+    LockClipData {
+        /// `clipDataId`.
+        clip_data_id: u32,
+    },
+    /// Unlock Clipboard Data (2.2.4.2).
+    UnlockClipData {
+        /// `clipDataId`.
+        clip_data_id: u32,
+    },
     /// A message type this module does not decode.
     Unknown {
         /// `msgType`.
@@ -120,16 +212,17 @@ pub enum ClipboardPdu {
 
 impl ClipboardPdu {
     /// Decode one complete clipboard message. `long_format_names` is whether both sides
-    /// advertised [`CB_USE_LONG_FORMAT_NAMES`], which decides a Format List's layout.
+    /// advertised [`CB_USE_LONG_FORMAT_NAMES`], which decides a Format List's layout. Bytes after
+    /// `dataLen` are padding and are not read ([`padding`]).
     pub fn decode(message: &[u8], long_format_names: bool) -> Result<Self, DecodeError> {
         let mut cur = ReadCursor::new(message, "CLIPRDR_HEADER");
         let msg_type = cur.read_u16_le()?;
         let msg_flags = cur.read_u16_le()?;
         let data_len = cur.read_u32_le()? as usize;
-        if data_len != cur.remaining() {
+        if data_len > cur.remaining() {
             return Err(DecodeError::InvalidField {
                 field: "CLIPRDR_HEADER.dataLen",
-                reason: "does not match the message length",
+                reason: "runs past the message",
             });
         }
         let body = cur.read_slice(data_len)?;
@@ -171,12 +264,91 @@ impl ClipboardPdu {
                     reason: "a response must be exactly one of CB_RESPONSE_OK and CB_RESPONSE_FAIL",
                 }),
             },
+            CB_FILECONTENTS_REQUEST => decode_file_contents_request(body),
+            CB_FILECONTENTS_RESPONSE => {
+                let mut cur = ReadCursor::new(body, "CLIPRDR_FILECONTENTS_RESPONSE");
+                let stream_id = cur.read_u32_le()?;
+                let data = cur.read_slice(cur.remaining())?;
+                match msg_flags & (CB_RESPONSE_OK | CB_RESPONSE_FAIL) {
+                    CB_RESPONSE_OK => Ok(ClipboardPdu::FileContentsResponse {
+                        stream_id,
+                        data: Some(data.to_vec()),
+                    }),
+                    CB_RESPONSE_FAIL => Ok(ClipboardPdu::FileContentsResponse {
+                        stream_id,
+                        data: None,
+                    }),
+                    _ => Err(DecodeError::InvalidField {
+                        field: "CLIPRDR_HEADER.msgFlags",
+                        reason: "a response must be exactly one of CB_RESPONSE_OK and CB_RESPONSE_FAIL",
+                    }),
+                }
+            }
+            CB_LOCK_CLIPDATA => Ok(ClipboardPdu::LockClipData {
+                clip_data_id: one_u32(body, "CLIPRDR_LOCK_CLIPDATA")?,
+            }),
+            CB_UNLOCK_CLIPDATA => Ok(ClipboardPdu::UnlockClipData {
+                clip_data_id: one_u32(body, "CLIPRDR_UNLOCK_CLIPDATA")?,
+            }),
             msg_type => Ok(ClipboardPdu::Unknown {
                 msg_type,
                 msg_flags,
             }),
         }
     }
+}
+
+fn one_u32(body: &[u8], field: &'static str) -> Result<u32, DecodeError> {
+    let bytes: [u8; 4] = body.try_into().map_err(|_| DecodeError::InvalidField {
+        field,
+        reason: "the body is one 4-byte value",
+    })?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn decode_file_contents_request(body: &[u8]) -> Result<ClipboardPdu, DecodeError> {
+    let mut cur = ReadCursor::new(body, "CLIPRDR_FILECONTENTS_REQUEST");
+    let stream_id = cur.read_u32_le()?;
+    let index = cur.read_u32_le()?;
+    let flags = cur.read_u32_le()?;
+    let low = cur.read_u32_le()?;
+    let high = cur.read_u32_le()?;
+    let len = cur.read_u32_le()?;
+    let clip_data_id = match cur.remaining() {
+        0 => None,
+        4 => Some(cur.read_u32_le()?),
+        _ => {
+            return Err(DecodeError::InvalidField {
+                field: "CLIPRDR_FILECONTENTS_REQUEST.clipDataId",
+                reason: "the optional clipDataId is 4 bytes",
+            });
+        }
+    };
+    let op = match flags & (FILECONTENTS_SIZE | FILECONTENTS_RANGE) {
+        FILECONTENTS_SIZE if low == 0 && high == 0 && len == 8 => FileContentsOp::Size,
+        FILECONTENTS_SIZE => {
+            return Err(DecodeError::InvalidField {
+                field: "CLIPRDR_FILECONTENTS_REQUEST.cbRequested",
+                reason: "a size request asks for 8 bytes at position 0",
+            });
+        }
+        FILECONTENTS_RANGE => FileContentsOp::Range {
+            position: u64::from(high) << 32 | u64::from(low),
+            len,
+        },
+        _ => {
+            return Err(DecodeError::InvalidField {
+                field: "CLIPRDR_FILECONTENTS_REQUEST.dwFlags",
+                reason: "exactly one of FILECONTENTS_SIZE and FILECONTENTS_RANGE",
+            });
+        }
+    };
+    Ok(ClipboardPdu::FileContentsRequest(FileContentsRequest {
+        stream_id,
+        index,
+        op,
+        clip_data_id,
+    }))
 }
 
 fn decode_capabilities(body: &[u8]) -> Result<ClipboardPdu, DecodeError> {
@@ -304,6 +476,20 @@ fn with_header(msg_type: u16, msg_flags: u16, body: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// The bytes of `message` after its header's `dataLen`, which [`ClipboardPdu::decode`] skips.
+pub fn padding(message: &[u8]) -> usize {
+    match message.get(4..8) {
+        Some(len) => {
+            let data_len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+            message
+                .len()
+                .saturating_sub(HEADER_SIZE)
+                .saturating_sub(data_len)
+        }
+        None => 0,
+    }
+}
+
 /// Encode a client Clipboard Capabilities PDU carrying one general set.
 pub fn encode_capabilities(general: GeneralCapability) -> Vec<u8> {
     let mut body = Vec::with_capacity(4 + GENERAL_CAPABILITY_SIZE as usize);
@@ -368,6 +554,131 @@ pub fn decode_unicode_text(data: &[u8]) -> String {
             .map(|&u| u16::from_le_bytes(u))
             .take_while(|&u| u != 0),
     )
+}
+
+/// The files in `CLIPRDR_FILELIST` data (2.2.5.2.3). A name that is empty, starts with a
+/// separator, holds a `:` or a `.` or `..` component is refused, and so is the whole list.
+pub fn decode_file_list(data: &[u8]) -> Result<Vec<FileDescriptor>, DecodeError> {
+    let mut cur = ReadCursor::new(data, "CLIPRDR_FILELIST");
+    let count = cur.read_u32_le()? as usize;
+    let (descriptors, rest) = data[4..].as_chunks::<FILE_DESCRIPTOR_SIZE>();
+    if descriptors.len() != count || !rest.is_empty() {
+        return Err(DecodeError::InvalidField {
+            field: "CLIPRDR_FILELIST.cItems",
+            reason: "the list does not hold exactly cItems descriptors",
+        });
+    }
+    descriptors.iter().map(decode_file_descriptor).collect()
+}
+
+fn decode_file_descriptor(d: &[u8; FILE_DESCRIPTOR_SIZE]) -> Result<FileDescriptor, DecodeError> {
+    let u32_at = |at: usize| u32::from_le_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]]);
+    let flags = u32_at(0);
+    let high = u32_at(64);
+    let low = u32_at(68);
+    let units = d[72..72 + FILE_NAME_BYTES]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&u| u16::from_le_bytes(u));
+    let len = units
+        .clone()
+        .position(|u| u == 0)
+        .ok_or(DecodeError::InvalidField {
+            field: "CLIPRDR_FILEDESCRIPTOR.fileName",
+            reason: "the name has no terminator",
+        })?;
+    let name = utf16_to_string(units.take(len));
+    let escapes = name.contains(':')
+        || name
+            .split(['\\', '/'])
+            .any(|part| part.is_empty() || part == "." || part == "..");
+    if escapes {
+        return Err(DecodeError::InvalidField {
+            field: "CLIPRDR_FILEDESCRIPTOR.fileName",
+            reason: "the name is not a relative path inside the paste target",
+        });
+    }
+    Ok(FileDescriptor {
+        flags,
+        attributes: u32_at(36),
+        last_write_time: u64::from(u32_at(60)) << 32 | u64::from(u32_at(56)),
+        size: (flags & FD_FILESIZE != 0).then_some(u64::from(high) << 32 | u64::from(low)),
+        name,
+    })
+}
+
+/// `CLIPRDR_FILELIST` data for `files`. A name longer than 259 UTF-16 code units is cut.
+pub fn encode_file_list(files: &[FileDescriptor]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + files.len() * FILE_DESCRIPTOR_SIZE);
+    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for file in files {
+        let mut d = [0u8; FILE_DESCRIPTOR_SIZE];
+        d[0..4].copy_from_slice(&file.flags.to_le_bytes());
+        d[36..40].copy_from_slice(&file.attributes.to_le_bytes());
+        d[56..64].copy_from_slice(&file.last_write_time.to_le_bytes());
+        let size = file.size.unwrap_or(0);
+        d[64..68].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
+        d[68..72].copy_from_slice(&(size as u32).to_le_bytes());
+        let name = file.name.encode_utf16().take(FILE_NAME_BYTES / 2 - 1);
+        for (slot, unit) in d[72..72 + FILE_NAME_BYTES]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(name)
+        {
+            *slot = unit.to_le_bytes();
+        }
+        out.extend_from_slice(&d);
+    }
+    out
+}
+
+/// Encode a File Contents Request PDU.
+pub fn encode_file_contents_request(request: &FileContentsRequest) -> Vec<u8> {
+    let (flags, position, len) = match request.op {
+        FileContentsOp::Size => (FILECONTENTS_SIZE, 0, 8),
+        FileContentsOp::Range { position, len } => (FILECONTENTS_RANGE, position, len),
+    };
+    let mut body = Vec::with_capacity(28);
+    for value in [
+        request.stream_id,
+        request.index,
+        flags,
+        position as u32,
+        (position >> 32) as u32,
+        len,
+    ] {
+        body.extend_from_slice(&value.to_le_bytes());
+    }
+    if let Some(id) = request.clip_data_id {
+        body.extend_from_slice(&id.to_le_bytes());
+    }
+    with_header(CB_FILECONTENTS_REQUEST, 0, body)
+}
+
+/// Encode a File Contents Response PDU: `Some` is `CB_RESPONSE_OK` with the data, `None`
+/// `CB_RESPONSE_FAIL` with none.
+pub fn encode_file_contents_response(stream_id: u32, data: Option<&[u8]>) -> Vec<u8> {
+    let mut body = stream_id.to_le_bytes().to_vec();
+    let flags = match data {
+        Some(data) => {
+            body.extend_from_slice(data);
+            CB_RESPONSE_OK
+        }
+        None => CB_RESPONSE_FAIL,
+    };
+    with_header(CB_FILECONTENTS_RESPONSE, flags, body)
+}
+
+/// Encode a Lock Clipboard Data PDU.
+pub fn encode_lock_clip_data(clip_data_id: u32) -> Vec<u8> {
+    with_header(CB_LOCK_CLIPDATA, 0, clip_data_id.to_le_bytes().to_vec())
+}
+
+/// Encode an Unlock Clipboard Data PDU.
+pub fn encode_unlock_clip_data(clip_data_id: u32) -> Vec<u8> {
+    with_header(CB_UNLOCK_CLIPDATA, 0, clip_data_id.to_le_bytes().to_vec())
 }
 
 /// Encode a Format List Response PDU.
@@ -622,14 +933,38 @@ mod tests {
     }
 
     #[test]
-    fn a_data_length_that_disagrees_with_the_message_is_refused() {
-        let mut long = VM_MONITOR_READY.to_vec();
-        long.push(0);
-        assert!(ClipboardPdu::decode(&long, true).is_err());
+    fn a_data_length_past_the_message_is_refused() {
         let mut short = VM_SERVER_CAPS.to_vec();
         short.pop();
         assert!(ClipboardPdu::decode(&short, true).is_err());
         assert!(ClipboardPdu::decode(&VM_MONITOR_READY[..7], true).is_err());
+    }
+
+    /// The VM's File Contents Response for `small.txt` (#324): `dataLen` is 16, and four zero
+    /// bytes follow the body. What follows `dataLen` is padding, not part of the PDU.
+    #[test]
+    fn bytes_after_the_data_length_are_padding() {
+        let vm_response: [u8; 28] = [
+            0x09, 0x00, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x68, 0x65,
+            0x6c, 0x6c, 0x6f, 0x20, 0xed, 0x8c, 0x8c, 0xec, 0x9d, 0xbc, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            ClipboardPdu::decode(&vm_response, true).unwrap(),
+            ClipboardPdu::FileContentsResponse {
+                stream_id: 1,
+                data: Some("hello 파일".as_bytes().to_vec())
+            }
+        );
+        let mut padded = VM_MONITOR_READY.to_vec();
+        padded.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            ClipboardPdu::decode(&padded, true).unwrap(),
+            ClipboardPdu::MonitorReady
+        );
+        assert_eq!(padding(&padded), 4);
+        assert_eq!(padding(&vm_response), 4);
+        assert_eq!(padding(&VM_MONITOR_READY), 0);
+        assert_eq!(padding(&VM_MONITOR_READY[..6]), 0);
     }
 
     #[test]
@@ -775,6 +1110,196 @@ mod tests {
         assert_eq!(decode_unicode_text(&[]), "");
     }
 
+    fn file(name: &str, size: Option<u64>) -> FileDescriptor {
+        FileDescriptor {
+            flags: FD_ATTRIBUTES | FD_WRITESTIME | if size.is_some() { FD_FILESIZE } else { 0 },
+            attributes: 0x20,
+            last_write_time: 0x01DA_0000_1234_5678,
+            size,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn file_lists_round_trip() {
+        let files = vec![
+            file("big.bin", Some(300_000)),
+            file("dir\\small.txt", Some(12)),
+            file("파일.txt", None),
+        ];
+        let data = encode_file_list(&files);
+        assert_eq!(data.len(), 4 + 3 * FILE_DESCRIPTOR_SIZE);
+        assert_eq!(decode_file_list(&data).unwrap(), files);
+    }
+
+    /// The field layout of 2.2.5.2.3.1, checked byte by byte on one descriptor.
+    #[test]
+    fn a_file_descriptor_is_laid_out_as_the_spec_says() {
+        let data = encode_file_list(&[file("a", Some(0x1_0000_0002))]);
+        assert_eq!(&data[..4], &1u32.to_le_bytes());
+        let d = &data[4..];
+        assert_eq!(
+            &d[0..4],
+            &(FD_ATTRIBUTES | FD_WRITESTIME | FD_FILESIZE).to_le_bytes()
+        );
+        assert!(d[4..36].iter().all(|&b| b == 0));
+        assert_eq!(&d[36..40], &0x20u32.to_le_bytes());
+        assert!(d[40..56].iter().all(|&b| b == 0));
+        assert_eq!(&d[56..64], &0x01DA_0000_1234_5678u64.to_le_bytes());
+        assert_eq!(&d[64..68], &1u32.to_le_bytes());
+        assert_eq!(&d[68..72], &2u32.to_le_bytes());
+        assert_eq!(&d[72..76], &[b'a', 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_file_list_must_hold_exactly_its_items() {
+        let mut data = encode_file_list(&[file("a", None)]);
+        data.push(0);
+        assert!(decode_file_list(&data).is_err());
+        data.truncate(data.len() - 2);
+        assert!(decode_file_list(&data).is_err());
+        assert!(decode_file_list(&[1, 0, 0]).is_err());
+        let mut two = encode_file_list(&[file("a", None)]);
+        two[0] = 2;
+        assert!(decode_file_list(&two).is_err());
+        assert_eq!(decode_file_list(&0u32.to_le_bytes()).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn a_file_name_without_its_terminator_is_refused() {
+        let mut data = encode_file_list(&[file("a", None)]);
+        let name = 4 + 72;
+        for b in &mut data[name..name + FILE_NAME_BYTES] {
+            *b = b'a';
+        }
+        assert!(decode_file_list(&data).is_err());
+    }
+
+    /// The maintainer's call (#324): a name that could leave the directory the host chose, or
+    /// name another stream or drive, refuses the whole list.
+    #[test]
+    fn a_file_name_that_could_escape_is_refused() {
+        for name in [
+            "", "..", "..\\x", "a\\..\\b", "a/../b", ".", "a\\.\\b", "\\x", "/x", "C:x",
+            "a:stream", "a\\",
+        ] {
+            let data = encode_file_list(&[file("ok", None), file(name, None)]);
+            assert!(
+                decode_file_list(&data).is_err(),
+                "{name:?} should be refused"
+            );
+        }
+        let data = encode_file_list(&[file("dir\\sub\\f.txt", None), file("..x", None)]);
+        assert!(decode_file_list(&data).is_ok());
+    }
+
+    #[test]
+    fn file_contents_requests_round_trip() {
+        let size = FileContentsRequest {
+            stream_id: 7,
+            index: 1,
+            op: FileContentsOp::Size,
+            clip_data_id: Some(3),
+        };
+        let encoded = encode_file_contents_request(&size);
+        assert_eq!(
+            encoded,
+            [
+                0x08, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 7, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 3, 0, 0, 0
+            ]
+        );
+        assert_eq!(
+            ClipboardPdu::decode(&encoded, true).unwrap(),
+            ClipboardPdu::FileContentsRequest(size)
+        );
+        let range = FileContentsRequest {
+            stream_id: 8,
+            index: 0,
+            op: FileContentsOp::Range {
+                position: 0x1_0000_0010,
+                len: 65536,
+            },
+            clip_data_id: None,
+        };
+        let encoded = encode_file_contents_request(&range);
+        assert_eq!(encoded.len(), 8 + 24);
+        assert_eq!(&encoded[20..28], &[0x10, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(
+            ClipboardPdu::decode(&encoded, true).unwrap(),
+            ClipboardPdu::FileContentsRequest(range)
+        );
+    }
+
+    /// 2.2.5.3: SIZE and RANGE are exclusive, and a SIZE request asks for 8 bytes at 0.
+    #[test]
+    fn malformed_file_contents_requests_are_refused() {
+        let body = |flags: u32, low: u32, cb: u32| {
+            let mut b = Vec::new();
+            for v in [1u32, 0, flags, low, 0, cb] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            header(CB_FILECONTENTS_REQUEST, 0, &b)
+        };
+        assert!(ClipboardPdu::decode(&body(3, 0, 8), true).is_err());
+        assert!(ClipboardPdu::decode(&body(0, 0, 8), true).is_err());
+        assert!(ClipboardPdu::decode(&body(1, 0, 4), true).is_err());
+        assert!(ClipboardPdu::decode(&body(1, 5, 8), true).is_err());
+        let mut long = body(2, 0, 8);
+        long.extend_from_slice(&[0; 5]);
+        long[4] += 5;
+        assert!(ClipboardPdu::decode(&long, true).is_err());
+    }
+
+    #[test]
+    fn file_contents_responses_round_trip() {
+        let ok = encode_file_contents_response(9, Some(b"abc"));
+        assert_eq!(
+            ok,
+            [0x09, 0, 0x01, 0, 7, 0, 0, 0, 9, 0, 0, 0, b'a', b'b', b'c']
+        );
+        assert_eq!(
+            ClipboardPdu::decode(&ok, true).unwrap(),
+            ClipboardPdu::FileContentsResponse {
+                stream_id: 9,
+                data: Some(b"abc".to_vec())
+            }
+        );
+        let fail = encode_file_contents_response(9, None);
+        assert_eq!(
+            ClipboardPdu::decode(&fail, true).unwrap(),
+            ClipboardPdu::FileContentsResponse {
+                stream_id: 9,
+                data: None
+            }
+        );
+        assert!(
+            ClipboardPdu::decode(&header(CB_FILECONTENTS_RESPONSE, 1, &[9, 0, 0]), true).is_err()
+        );
+        let both = CB_RESPONSE_OK | CB_RESPONSE_FAIL;
+        assert!(
+            ClipboardPdu::decode(&header(CB_FILECONTENTS_RESPONSE, both, &[9, 0, 0, 0]), true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn lock_and_unlock_round_trip() {
+        let lock = encode_lock_clip_data(5);
+        assert_eq!(lock, [0x0a, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0]);
+        assert_eq!(
+            ClipboardPdu::decode(&lock, true).unwrap(),
+            ClipboardPdu::LockClipData { clip_data_id: 5 }
+        );
+        let unlock = encode_unlock_clip_data(5);
+        assert_eq!(unlock, [0x0b, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0]);
+        assert_eq!(
+            ClipboardPdu::decode(&unlock, true).unwrap(),
+            ClipboardPdu::UnlockClipData { clip_data_id: 5 }
+        );
+        assert!(ClipboardPdu::decode(&header(CB_LOCK_CLIPDATA, 0, &[5, 0, 0]), true).is_err());
+    }
+
     proptest! {
         // ADR-0008: a server-controlled clipboard message surfaces as a typed `DecodeError`,
         // never a panic. Reaching the end without unwinding is the assertion.
@@ -786,6 +1311,7 @@ mod tests {
         ) {
             let _ = ClipboardPdu::decode(&message, long_format_names);
             let _ = decode_unicode_text(&message);
+            let _ = decode_file_list(&message);
         }
     }
 }

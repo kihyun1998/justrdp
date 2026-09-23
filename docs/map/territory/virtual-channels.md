@@ -207,11 +207,13 @@ glossary, which is vocabulary rather than a decision.
   implement, and the VM answered without `ENCRYPT_RDP`. That is a derivation.
 - **The helper advertises only what it implements** ([what we advertise, we must
   implement](../invariant/what-we-advertise-we-must-implement.md)): `ADVERTISED_FLAGS` is
-  `CB_USE_LONG_FORMAT_NAMES` alone, intersected with the server's flags as FreeRDP does
+  `CB_USE_LONG_FORMAT_NAMES` plus, since #324, `CB_STREAM_FILECLIP_ENABLED`,
+  `CB_FILECLIP_NO_FILE_PATHS`, `CB_CAN_LOCK_CLIPDATA` and `CB_HUGE_FILE_SUPPORT_ENABLED`,
+  intersected with the server's flags as FreeRDP does
   (`cliprdr_client_capabilities`). With no server Capabilities before Monitor Ready the
   server's flags are zero, which `[MS-RDPECLIP]` 2.2.2.1.1.1 makes a MUST and FreeRDP
   follows (`cliprdr_process_monitor_ready`), so short names are used.
-  The file-transfer flags join the set in #324/#325. **The initial Format List holds what the
+  **The initial Format List holds what the
   host announced before Monitor Ready, and nothing by default**, as FreeRDP's was against the
   VM. Every format announced entitles the server to a Format Data Request, which the host now
   answers through `DataRequested` and `respond` (#322); #321 kept the list empty because
@@ -253,8 +255,10 @@ glossary, which is vocabulary rather than a decision.
   server's inconsistency, so the session goes on and the refusal is logged. A new `announce`
   clears the refused state. That is a derivation.
 - **How strictly a clipboard message is read** is a set of derivations, and they fall to a
-  better one. `dataLen` must equal the rest of the message, where FreeRDP only needs it not to
-  exceed it: one message is one PDU, and every VM message was exact. A capability set other
+  better one. **`dataLen` must not run past the message, and what follows it is padding**
+  (`padding`, logged under `rdp_cliprdr`), which is FreeRDP's rule. Until #324 it had to equal
+  the rest of the message, on the ground that every VM message was exact. #324 falsified that
+  ground: the VM's File Contents Response carries four zero bytes after `dataLen`. A capability set other
   than the general one is refused, as FreeRDP refuses it; only that one is defined
   (`[MS-RDPECLIP]` 2.2.2.1.1). A Format List Response must set exactly one of OK and FAIL. A
   long format name without its NUL, and a short list that is not whole 36-byte entries, are
@@ -274,6 +278,40 @@ glossary, which is vocabulary rather than a decision.
   MUST (#322).
 - **`CF_UNICODETEXT` is UTF-16LE ending at its first NUL** (`encode_unicode_text`,
   `decode_unicode_text`). What follows the NUL is not text, and a trailing odd byte is dropped.
+- **Files the server copied are fetched under a lock that only the host releases** (#324).
+  - **Lock.** Nothing is locked when a server Format List names `FileGroupDescriptorW`.
+    `request_file_list` sends the Lock Clipboard Data and then the Format Data Request, and
+    returns the lock's id at once. So no lock exists that the host has not asked for and
+    cannot release. A list that fails or does not decode releases its own lock
+    (`FileListFailed`). FreeRDP locks every announcement before answering it, and IronRDP
+    locks after answering; the VM announces a copy twice, so both take locks nobody asked for.
+    #324's first version locked on the announcement and leaked exactly those.
+  - **The file list.** It arrives as `FileList { clip_data_id, files }`. A plain `request` of
+    the same format ID is plain data, whatever a later Format List says.
+  - **Fetching.** `request_file_contents(index, Size | Range, clip_data_id)` allocates a
+    nonzero `streamId` no pending request uses, as both references do, and pairs the answer by
+    it (`FileSize` / `FileRange`). A response for an unknown stream is skipped and recorded. A
+    size that is not 8 bytes, or a range longer than was asked for, arrives as a failure, as in
+    IronRDP. A range past 2 GiB needs `CB_HUGE_FILE_SUPPORT_ENABLED` on both sides, as
+    `[MS-RDPECLIP]` 2.2.5.3 asks.
+  - **Releasing.** A new server list takes a new lock and releases nothing; `release` sends the
+    Unlock. FreeRDP unlocks every old entry on the next list, and IronRDP expires locks after
+    60 s idle or 2 h in all. Neither fits a core with no clock, and the first would break a
+    transfer in flight, so when to let go is the host's.
+  - **Cancelling.** `cancel_file_request` ends a wait. The VM does not answer an unlocked
+    request for files it no longer holds (measured below), and how long to wait is the host's.
+  - **The reverse direction.** A server File Contents Request is answered with a failure until
+    #325, since this side announces no files.
+
+  All of this is derivation, and it falls to a better one. **The name rule is not:** a
+  descriptor name that is empty, holds a `:`, or has an empty, `.` or `..` component, which
+  covers a leading or trailing separator, refuses the whole list as `FileListRejected`.
+  Relative paths (`dir\f`) pass. **Refusing in the core was the maintainer's call
+  (2026-09-23)**. They were shown three options: FreeRDP's (a `..` component fails the whole
+  list, though a `goto` bug can still report success), IronRDP's (the core normalises the name
+  and renames a rejected one `unnamed_file`), and passing names raw with a checker for the host.
+  **Not covered by that call:** Windows device names (`CON`, `NUL`), trailing dots and spaces,
+  and look-alike separators. Those stay the host's, as they do in IronRDP.
 
 ## Code
 
@@ -290,15 +328,18 @@ glossary, which is vocabulary rather than a decision.
 - `justrdp-pdu/src/cliprdr.rs` — `ClipboardPdu`, `GeneralCapability`, `Format`,
   `encode_capabilities`, `encode_format_list`, `encode_format_list_response`,
   `encode_format_data_request`, `encode_format_data_response`, `encode_unicode_text`,
-  `decode_unicode_text`
-- `justrdp/src/cliprdr.rs` — `Clipboard`, `ClipboardOutput`, `RequestError`, `channel_def`,
-  `CHANNEL_OPTIONS`, `ADVERTISED_FLAGS`
+  `decode_unicode_text`, `padding`, `FileDescriptor`, `decode_file_list`, `encode_file_list`,
+  `FileContentsRequest`, `FileContentsOp`, `encode_file_contents_request`,
+  `encode_file_contents_response`, `encode_lock_clip_data`, `encode_unlock_clip_data`
+- `justrdp/src/cliprdr.rs` — `Clipboard`, `ClipboardOutput`, `RequestError`,
+  `FileRequestError`, `channel_def`, `CHANNEL_OPTIONS`, `ADVERTISED_FLAGS`
 - Spec sections cited inline: `[MS-RDPBCGR]` 1.3.3, 2.2.6.1.1, 3.1.5.2.1, 3.1.5.2.2;
   `[MS-RDPEDYC]` 1.7, 2.2.2.2, 2.2.3.3, 2.2.3.4, 3.2;
   `[MS-RDPEDISP]` 1.3,
   2.2.2.2, 2.2.2.2.1;
   `[MS-RDPECLIP]` 1.3.2.1, 2.1, 2.2.1, 2.2.2.1, 2.2.2.1.1, 2.2.2.1.1.1, 2.2.2.2, 2.2.3.1,
-  2.2.3.1.2, 2.2.3.2, 2.2.5.1, 2.2.5.2, 3.1.5.2.2, 3.1.5.4.3; `[MS-RDPBCGR]` 3.1.5.2.2.1
+  2.2.3.1.2, 2.2.3.2, 2.2.4.1, 2.2.4.2, 2.2.5.1, 2.2.5.2, 2.2.5.2.3, 2.2.5.2.3.1, 2.2.5.3,
+  2.2.5.4, 3.1.5.2.2, 3.1.5.3.1, 3.1.5.4.3, 3.1.5.4.5; `[MS-RDPBCGR]` 3.1.5.2.2.1
 
 ## Reference behaviour
 
@@ -365,6 +406,27 @@ glossary, which is vocabulary rather than a decision.
 - Under a 1 MiB cap the Print Screen response is dropped and reported, and the session goes
   on. With the cap back at 64 MiB, a second Print Screen arrives whole.
 
+**Measured against the WS2022 test VM (#324, 2026-09-23):**
+
+- `Set-Clipboard -Path` with two files is announced **twice**, as `49315`
+  ("FileGroupDescriptorW"), `49264` ("FileContents") and `49320` ("Preferred DropEffect").
+  An empty list comes first.
+  - While the helper locked on every announcement, a request sent on the first announcement
+    came back as a failure, in the one run that tried it.
+  - With the lock taken by `request_file_list`, a request on the first announcement is
+    answered, 3 of 3 runs.
+  - Why the first shape failed is not proven: the announcement arriving twice, and a lock
+    already on the first one, are the two candidates. Hosts need no settle wait either way.
+- The file list holds both files in the order given. Each descriptor has flags `0x4064`
+  (`FD_ATTRIBUTES | FD_WRITESTIME | FD_FILESIZE | FD_SHOWPROGRESSUI`), attributes `0x20` and
+  the true size. The names are bare, as `CB_FILECLIP_NO_FILE_PATHS` asks.
+- **The File Contents Response carries four zero bytes after `dataLen`.** This is what
+  falsified the exact-length rule above.
+- `small.txt` (12 bytes) and a 300,000-byte `big.bin`, fetched in 65,536-byte ranges, arrive
+  byte-exact. The server then copies text (announced as an empty list, then the text list
+  twice), and the rest of `big.bin` still arrives under the lock. **Without the lock, the
+  first request after that copy gets no answer in 60 s**: not a failure, silence.
+
 ## Cross-cutting invariants
 
 - [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
@@ -390,8 +452,8 @@ glossary, which is vocabulary rather than a decision.
 - **Every redirection feature but the clipboard's handshake is an unopened channel**: audio
   output (#11), audio input (#12), device/drive/printer/smartcard (#13), RemoteApp
   (#14), multitouch (#15), video (#17), camera (#19), location (#20). The transport
-  exists; the consumers do not. The clipboard (#10) moves text since #322 and images since
-  #323; files are #324/#325.
+  exists; the consumers do not. The clipboard (#10) moves text since #322, images since #323,
+  and server files to the host since #324; host files to the server are #325.
 - ~~Static channel 1004 traffic is ignored by the session loop with no record of what
   it contains.~~ **Closed in #307**: 1004 is `cliprdr`, and a granted channel's messages
   now reach the host. The multi-chunk live proofs it left open closed in #323.
