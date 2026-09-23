@@ -2527,6 +2527,7 @@ mod tests {
                                 ClipboardOutput::FormatListRejected(error) => {
                                     panic!("the VM's Format List decodes: {error}")
                                 }
+                                other => panic!("nothing was requested or announced: {other:?}"),
                             }
                         }
                     },
@@ -2546,6 +2547,270 @@ mod tests {
             assert_eq!(
                 clipboard.general_flags(),
                 justrdp_pdu::cliprdr::CB_USE_LONG_FORMAT_NAMES
+            );
+        })
+        .await
+    }
+
+    /// Real-VM acceptance for #322: plain text crosses the clipboard both ways. Text typed into
+    /// Notepad as Unicode input and copied there reaches the host through a Format Data
+    /// Request. Text the host offers is pasted into Notepad, copied again, and comes back
+    /// intact. Both strings carry non-ASCII text and a surrogate pair.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn text_crosses_the_clipboard_both_ways_on_the_real_vm() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+        use justrdp_pdu::cliprdr::{
+            CF_UNICODETEXT, Format, decode_unicode_text, encode_unicode_text,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const TYPED_ON_SERVER: &str = "server → host: Hé 한글 😀";
+        const OFFERED_BY_HOST: &str = "host → server: Grüße 日本語 🎉";
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![cliprdr::channel_def()];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let channel = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "cliprdr")
+                .expect("the VM grants cliprdr")
+                .id;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            assert!(
+                session_config.server_input_flags & justrdp_pdu::capability::INPUT_FLAG_UNICODE
+                    != 0,
+                "this VM accepts Unicode input; flags={:#06x}",
+                session_config.server_input_flags
+            );
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(64);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let clipboard = Arc::new(Mutex::new(Clipboard::new()));
+            let handshake_done = Arc::new(AtomicBool::new(false));
+            let (texts_tx, mut texts) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+            let (host_list_tx, mut host_list_answered) =
+                tokio::sync::mpsc::unbounded_channel::<bool>();
+            let host_text_requested = Arc::new(AtomicUsize::new(0));
+
+            // Input from the desktop helpers reaches the session as `SessionCommand::Input`.
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let driver = {
+                let (frames, cancel, clipboard, handshake_done) = (
+                    frames.clone(),
+                    cancel.clone(),
+                    clipboard.clone(),
+                    handshake_done.clone(),
+                );
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        let start = tokio::time::Instant::now();
+                        while !handshake_done.load(Ordering::SeqCst) {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err("the clipboard handshake never completed".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        vm::start_menu_run(&input_tx, &frames, desktop, "notepad").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+
+                        let key = |vk: u16| {
+                            justrdp::input::scancode_from_windows_vk(vk)
+                                .unwrap_or_else(|| panic!("VK {vk:#04x} maps to a scancode"))
+                        };
+                        let chord = |vk: u16| {
+                            let (ctrl, k) = (key(0x11), key(vk));
+                            vec![ctrl.press(), k.press(), k.release(), ctrl.release()]
+                        };
+                        let send = |events: Vec<InputEvent>| {
+                            let input_tx = input_tx.clone();
+                            async move {
+                                input_tx
+                                    .send(events)
+                                    .await
+                                    .map_err(|_| "the session closed".to_string())
+                            }
+                        };
+                        async fn next_text(
+                            texts: &mut tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+                        ) -> Result<String, String> {
+                            tokio::time::timeout(Duration::from_secs(20), texts.recv())
+                                .await
+                                .map_err(|_| "no text reached the host within 20 s".to_string())?
+                                .ok_or_else(|| "the session closed".to_string())?
+                                .ok_or_else(|| {
+                                    "the server failed the Format Data Request".to_string()
+                                })
+                        }
+
+                        // Server to host: type, select all, copy.
+                        for unit in TYPED_ON_SERVER.encode_utf16() {
+                            send(vec![
+                                InputEvent::Unicode {
+                                    code_unit: unit,
+                                    release: false,
+                                },
+                                InputEvent::Unicode {
+                                    code_unit: unit,
+                                    release: true,
+                                },
+                            ])
+                            .await?;
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                        }
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        send(chord(0x41)).await?;
+                        send(chord(0x43)).await?;
+                        let copied = next_text(&mut texts).await?;
+
+                        // Host to server: offer text, paste it over the selection, copy it back.
+                        let list = clipboard.lock().unwrap().announce(vec![Format {
+                            id: CF_UNICODETEXT,
+                            name: String::new(),
+                        }]);
+                        commands_tx
+                            .send(SessionCommand::ChannelData {
+                                channel,
+                                data: list.expect("the handshake is done, so the list is sent now"),
+                            })
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+                        let accepted = tokio::time::timeout(
+                            Duration::from_secs(20),
+                            host_list_answered.recv(),
+                        )
+                        .await
+                        .map_err(|_| {
+                            "the server never answered the host's Format List".to_string()
+                        })?;
+                        if accepted != Some(true) {
+                            return Err(format!(
+                                "the server answered the host's Format List with {accepted:?}"
+                            ));
+                        }
+                        send(chord(0x41)).await?;
+                        send(chord(0x56)).await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        send(chord(0x41)).await?;
+                        send(chord(0x43)).await?;
+                        let round_trip = next_text(&mut texts).await?;
+                        Ok((copied, round_trip))
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let frames_in_sink = frames.clone();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(240),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        let SessionEvent::ChannelData { channel: on, data } = event else {
+                            return;
+                        };
+                        assert_eq!(on, channel, "only cliprdr was requested");
+                        let mut clipboard = clipboard.lock().unwrap();
+                        let outputs = clipboard
+                            .process(&data)
+                            .expect("the VM's clipboard message decodes");
+                        let send = |data: Vec<u8>| {
+                            commands_tx
+                                .try_send(SessionCommand::ChannelData { channel, data })
+                                .expect("the command queue has room")
+                        };
+                        for output in outputs {
+                            match output {
+                                ClipboardOutput::Send(data) => send(data),
+                                ClipboardOutput::FormatListResponse { ok } => {
+                                    if handshake_done.swap(true, Ordering::SeqCst) {
+                                        let _ = host_list_tx.send(ok);
+                                    } else {
+                                        assert!(ok, "the server accepts the initial Format List");
+                                    }
+                                }
+                                ClipboardOutput::RemoteFormatList(formats) => {
+                                    eprintln!("server formats: {formats:?}");
+                                    if formats.iter().any(|f| f.id == CF_UNICODETEXT) {
+                                        send(
+                                            clipboard
+                                                .request(CF_UNICODETEXT)
+                                                .expect("the server listed CF_UNICODETEXT"),
+                                        );
+                                    }
+                                }
+                                ClipboardOutput::FormatData { data, .. } => {
+                                    let _ = texts_tx.send(data.map(|d| decode_unicode_text(&d)));
+                                }
+                                ClipboardOutput::DataRequested { format_id } => {
+                                    assert_eq!(format_id, CF_UNICODETEXT);
+                                    host_text_requested.fetch_add(1, Ordering::SeqCst);
+                                    let text = encode_unicode_text(OFFERED_BY_HOST);
+                                    for data in clipboard.respond(Some(&text)) {
+                                        send(data);
+                                    }
+                                }
+                                ClipboardOutput::FormatListRejected(error) => {
+                                    panic!("the VM's Format List decodes: {error}")
+                                }
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+            ended
+                .expect("the session ended within 240 s")
+                .expect("the session ran without a protocol failure");
+            let (copied, round_trip) = driven.expect("the desktop was driven");
+            assert_eq!(
+                copied, TYPED_ON_SERVER,
+                "text copied on the server reaches the host"
+            );
+            assert!(
+                host_text_requested.load(Ordering::SeqCst) >= 1,
+                "pasting on the server asked the host for its text"
+            );
+            assert_eq!(
+                round_trip, OFFERED_BY_HOST,
+                "the host's text was pasted on the server intact"
             );
         })
         .await

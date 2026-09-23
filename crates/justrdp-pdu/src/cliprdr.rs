@@ -16,6 +16,10 @@ pub const CB_MONITOR_READY: u16 = 0x0001;
 pub const CB_FORMAT_LIST: u16 = 0x0002;
 /// `CB_FORMAT_LIST_RESPONSE` (2.2.3.2).
 pub const CB_FORMAT_LIST_RESPONSE: u16 = 0x0003;
+/// `CB_FORMAT_DATA_REQUEST` (2.2.5.1).
+pub const CB_FORMAT_DATA_REQUEST: u16 = 0x0004;
+/// `CB_FORMAT_DATA_RESPONSE` (2.2.5.2).
+pub const CB_FORMAT_DATA_RESPONSE: u16 = 0x0005;
 /// `CB_CLIP_CAPS` (2.2.2.1).
 pub const CB_CLIP_CAPS: u16 = 0x0007;
 
@@ -90,6 +94,16 @@ pub enum ClipboardPdu {
         /// `CB_RESPONSE_OK` rather than `CB_RESPONSE_FAIL`.
         ok: bool,
     },
+    /// Format Data Request (2.2.5.1).
+    FormatDataRequest {
+        /// `requestedFormatId`.
+        format_id: u32,
+    },
+    /// Format Data Response (2.2.5.2). `None` is `CB_RESPONSE_FAIL`.
+    FormatDataResponse {
+        /// `requestedFormatData`.
+        data: Option<Vec<u8>>,
+    },
     /// A message type this module does not decode.
     Unknown {
         /// `msgType`.
@@ -122,6 +136,31 @@ impl ClipboardPdu {
             CB_FORMAT_LIST_RESPONSE => match msg_flags & (CB_RESPONSE_OK | CB_RESPONSE_FAIL) {
                 CB_RESPONSE_OK => Ok(ClipboardPdu::FormatListResponse { ok: true }),
                 CB_RESPONSE_FAIL => Ok(ClipboardPdu::FormatListResponse { ok: false }),
+                _ => Err(DecodeError::InvalidField {
+                    field: "CLIPRDR_HEADER.msgFlags",
+                    reason: "a response must be exactly one of CB_RESPONSE_OK and CB_RESPONSE_FAIL",
+                }),
+            },
+            CB_FORMAT_DATA_REQUEST => {
+                let bytes: [u8; 4] = body.try_into().map_err(|_| DecodeError::InvalidField {
+                    field: "CLIPRDR_FORMAT_DATA_REQUEST",
+                    reason: "the body is one 4-byte format ID",
+                })?;
+                Ok(ClipboardPdu::FormatDataRequest {
+                    format_id: u32::from_le_bytes(bytes),
+                })
+            }
+            CB_FORMAT_DATA_RESPONSE => match msg_flags & (CB_RESPONSE_OK | CB_RESPONSE_FAIL) {
+                CB_RESPONSE_OK => Ok(ClipboardPdu::FormatDataResponse {
+                    data: Some(body.to_vec()),
+                }),
+                CB_RESPONSE_FAIL if body.is_empty() => {
+                    Ok(ClipboardPdu::FormatDataResponse { data: None })
+                }
+                CB_RESPONSE_FAIL => Err(DecodeError::InvalidField {
+                    field: "CLIPRDR_FORMAT_DATA_RESPONSE.requestedFormatData",
+                    reason: "a failed response carries no data",
+                }),
                 _ => Err(DecodeError::InvalidField {
                     field: "CLIPRDR_HEADER.msgFlags",
                     reason: "a response must be exactly one of CB_RESPONSE_OK and CB_RESPONSE_FAIL",
@@ -273,6 +312,39 @@ pub fn encode_format_list(formats: &[Format], long_format_names: bool) -> Vec<u8
         }
     }
     with_header(CB_FORMAT_LIST, 0, body)
+}
+
+/// Encode a Format Data Request PDU.
+pub fn encode_format_data_request(format_id: u32) -> Vec<u8> {
+    with_header(CB_FORMAT_DATA_REQUEST, 0, format_id.to_le_bytes().to_vec())
+}
+
+/// Encode a Format Data Response PDU: `Some` is `CB_RESPONSE_OK` with the data, `None` is
+/// `CB_RESPONSE_FAIL` with none.
+pub fn encode_format_data_response(data: Option<&[u8]>) -> Vec<u8> {
+    match data {
+        Some(data) => with_header(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, data.to_vec()),
+        None => with_header(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_FAIL, Vec::new()),
+    }
+}
+
+/// `CF_UNICODETEXT` data for `text`: UTF-16LE with a NUL terminator.
+pub fn encode_unicode_text(text: &str) -> Vec<u8> {
+    text.encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+/// The text in `CF_UNICODETEXT` data, up to its NUL terminator or the end of the data.
+pub fn decode_unicode_text(data: &[u8]) -> String {
+    utf16_to_string(
+        data.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&u| u16::from_le_bytes(u))
+            .take_while(|&u| u != 0),
+    )
 }
 
 /// Encode a Format List Response PDU.
@@ -564,12 +636,106 @@ mod tests {
     #[test]
     fn unknown_message_types_decode_as_unknown() {
         assert_eq!(
-            ClipboardPdu::decode(&header(0x0004, 0, &[0x0d, 0, 0, 0]), true).unwrap(),
+            ClipboardPdu::decode(&header(0x0006, 0, &[0x0d, 0, 0, 0]), true).unwrap(),
             ClipboardPdu::Unknown {
-                msg_type: 0x0004,
+                msg_type: 0x0006,
                 msg_flags: 0
             }
         );
+    }
+
+    #[test]
+    fn format_data_requests_encode_and_decode() {
+        let encoded = encode_format_data_request(CF_UNICODETEXT);
+        assert_eq!(
+            encoded,
+            [
+                0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00
+            ]
+        );
+        assert_eq!(
+            ClipboardPdu::decode(&encoded, true).unwrap(),
+            ClipboardPdu::FormatDataRequest {
+                format_id: CF_UNICODETEXT
+            }
+        );
+    }
+
+    #[test]
+    fn a_format_data_request_is_one_format_id() {
+        assert!(
+            ClipboardPdu::decode(&header(CB_FORMAT_DATA_REQUEST, 0, &[0x0d, 0, 0]), true).is_err()
+        );
+        assert!(
+            ClipboardPdu::decode(
+                &header(CB_FORMAT_DATA_REQUEST, 0, &[0x0d, 0, 0, 0, 0]),
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn format_data_responses_encode_and_decode() {
+        let ok = encode_format_data_response(Some(b"hi"));
+        assert_eq!(
+            ok,
+            [0x05, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, b'h', b'i']
+        );
+        assert_eq!(
+            ClipboardPdu::decode(&ok, true).unwrap(),
+            ClipboardPdu::FormatDataResponse {
+                data: Some(b"hi".to_vec())
+            }
+        );
+        let fail = encode_format_data_response(None);
+        assert_eq!(fail, [0x05, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            ClipboardPdu::decode(&fail, true).unwrap(),
+            ClipboardPdu::FormatDataResponse { data: None }
+        );
+    }
+
+    /// 2.2.5.2: exactly one of OK and FAIL, and a failure carries no data.
+    #[test]
+    fn malformed_format_data_responses_are_refused() {
+        assert!(ClipboardPdu::decode(&header(CB_FORMAT_DATA_RESPONSE, 0, b"x"), true).is_err());
+        let both = CB_RESPONSE_OK | CB_RESPONSE_FAIL;
+        assert!(ClipboardPdu::decode(&header(CB_FORMAT_DATA_RESPONSE, both, b"x"), true).is_err());
+        assert!(
+            ClipboardPdu::decode(
+                &header(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_FAIL, b"x"),
+                true
+            )
+            .is_err()
+        );
+    }
+
+    /// An empty successful response is data of length zero, not a failure.
+    #[test]
+    fn an_empty_successful_response_is_empty_data() {
+        assert_eq!(
+            ClipboardPdu::decode(&encode_format_data_response(Some(&[])), true).unwrap(),
+            ClipboardPdu::FormatDataResponse {
+                data: Some(Vec::new())
+            }
+        );
+    }
+
+    #[test]
+    fn unicode_text_is_nul_terminated_utf16() {
+        assert_eq!(encode_unicode_text("hé"), [b'h', 0, 0xe9, 0, 0, 0]);
+        let text = "Hé 한글 😀";
+        assert_eq!(decode_unicode_text(&encode_unicode_text(text)), text);
+    }
+
+    /// The text ends at the first NUL; what follows it is not text.
+    #[test]
+    fn unicode_text_stops_at_its_terminator() {
+        assert_eq!(decode_unicode_text(&[b'a', 0, 0, 0, b'b', 0]), "a");
+        assert_eq!(decode_unicode_text(&[b'a', 0, b'b', 0]), "ab");
+        assert_eq!(decode_unicode_text(&[b'a', 0, b'b']), "a");
+        assert_eq!(decode_unicode_text(&[]), "");
     }
 
     proptest! {
@@ -582,6 +748,7 @@ mod tests {
             long_format_names in any::<bool>(),
         ) {
             let _ = ClipboardPdu::decode(&message, long_format_names);
+            let _ = decode_unicode_text(&message);
         }
     }
 }
