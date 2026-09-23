@@ -11,6 +11,7 @@
 //! ADR-0003 (phased codecs), and `docs/plan.md`.
 
 mod auto_reconnect;
+pub mod cliprdr;
 pub mod connect;
 pub mod cursor;
 pub mod disconnect;

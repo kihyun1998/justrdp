@@ -53,8 +53,9 @@ about what we owe; both start at the same bytes.
   capability version ladder and the scaled map-surface obligation.
 - [Capability exchange & activation](../territory/capability-exchange-activation.md) — where
   the Confirm Active capability sets are built, and the general form of the rule.
-- [Virtual channels](../territory/virtual-channels.md) — `VCCAPS_NO_COMPR` and the dynamic
-  channel capability exchange.
+- [Virtual channels](../territory/virtual-channels.md) — `VCCAPS_NO_COMPR`, the dynamic
+  channel capability exchange, and the clipboard's `generalFlags` and initial Format List
+  (#321): a format announced is a Format Data Request the server may send.
 - [MCS / GCC channel setup](../territory/mcs-gcc-channel-setup.md) — the early capability
   flags, where advertising `SUPPORT_DYN_VC_GFX_PROTOCOL` is what makes EGFX exist at all.
 

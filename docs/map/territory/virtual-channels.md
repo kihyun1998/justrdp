@@ -9,7 +9,8 @@ channel (`drdynvc`): create/open/close/data messages with their own IDs, which i
 how EGFX and Display Control arrive. The library implements the transport, exactly one DVC
 consumer beyond graphics (Display Control), and, since #307, the host's seam onto every other
 static channel: messages in as `SessionOutput::ChannelData`, messages out through
-`SessionStateMachine::send_channel`.
+`SessionStateMachine::send_channel`. Since #321 it also carries the clipboard channel's
+initialization sequence as a helper the host drives over that seam (`justrdp::cliprdr`).
 
 ## Governing decisions
 
@@ -132,13 +133,72 @@ glossary, which is vocabulary rather than a decision.
   FreeRDP sets it only for a channel opened with `CHANNEL_OPTION_SHOW_PROTOCOL`. A
   single-chunk message carries FIRST|LAST alone, **unless the host opened the channel with
   `CHANNEL_OPTION_SHOW_PROTOCOL`**. Then every chunk carries it, which is FreeRDP's rule
-  (`channels.c`). The case that needs it is RAIL: `[MS-RDPERP]` 1.5 says the RAIL server
+  (`channels.c`). Two cases need it. RAIL: `[MS-RDPERP]` 1.5 says the RAIL server
   expects the header visible on all data over the RAIL channel, so the flag "has to be set".
+  And `cliprdr`, which no spec says but the VM enforces (#321, the clipboard bullet below).
   Building it now, rather than leaving it to #14, was the maintainer's call (2026-09-22).
   `StaticChannel` carries the requested `options` so the machine can tell.
 - **A host channel's message cap is 64 MiB** (`CHANNEL_MESSAGE_CAP`), against drdynvc's
   64 KiB. The value is unmeasured: 64 MiB leaves room for a 4K clipboard DIB (3840×2160×4 ≈
   33 MB), which is the largest message a channel we know of plausibly carries.
+- **The clipboard is a sans-IO helper the host drives, not a session consumer** (#321). The
+  host requests the channel with `cliprdr::channel_def()`, feeds each `ChannelData` message on
+  it to `Clipboard::process`, and passes every `ClipboardOutput::Send` to `send_channel`; the
+  session still never interprets `cliprdr` bytes, which is #307's contract left intact. **That
+  placement was the maintainer's call (2026-09-23)**, chosen over the session machine owning
+  CLIPRDR the way it owns drdynvc and handing the host decoded events. They were shown that the
+  second conflicts with #307's contract. **Not covered by that call:** whether a later slice
+  (#322-#325) may need state the session holds, such as whether the channel is suspended.
+- **`cliprdr` must be requested with `CHANNEL_OPTION_SHOW_PROTOCOL`, because the server answers
+  only chunks that carry `CHANNEL_FLAG_SHOW_PROTOCOL`** (#321). The spec does not say so:
+  `[MS-RDPECLIP]` 2.1 names the channel and nothing else, unlike `[MS-RDPERP]` 1.5 for RAIL.
+  Measured on the VM with byte-identical Capabilities and Format List: 4 of 4 answered with
+  the flag on the client's chunks (16-164 ms after Monitor Ready in the three probes that timed
+  it), and 0 of 4 without it in 30-90 s (plus #307's
+  0 of 3). **One unflagged message is enough to lose what follows it.** #307 also saw no
+  answer to a *chunked* Format List, whose chunks `encode_chunks` always flags. Its
+  Capabilities went first as one chunk without the flag. Reproduced on the VM with a
+  2608-byte list: unflagged Capabilities and then the flagged chunks, 0 of 1 answered; the
+  same chunks with no Capabilities before them, 1 of 1. So flagging only multi-chunk messages,
+  IronRDP's default, would not have been enough here. The
+  GCC option does not matter by itself: with the option set but the flag forced off, 0 of 1;
+  with the option clear but the flag forced on, 1 of 1. Both references agree: FreeRDP opens
+  the channel with `INITIALIZED|ENCRYPT_RDP|COMPRESS_RDP|SHOW_PROTOCOL`, so every chunk
+  carries the flag through the per-channel rule above; IronRDP adds `SHOW_PROTOCOL` to every
+  cliprdr message ("a must", `ironrdp-cliprdr`). `CHANNEL_OPTIONS` carries
+  `INITIALIZED|SHOW_PROTOCOL` only: `COMPRESS_RDP` would invite compression we never
+  implement, and the VM answered without `ENCRYPT_RDP`. That is a derivation.
+- **The helper advertises only what it implements** ([what we advertise, we must
+  implement](../invariant/what-we-advertise-we-must-implement.md)): `ADVERTISED_FLAGS` is
+  `CB_USE_LONG_FORMAT_NAMES` alone, intersected with the server's flags as FreeRDP does
+  (`cliprdr_client_capabilities`). With no server Capabilities before Monitor Ready the
+  server's flags are zero, which `[MS-RDPECLIP]` 2.2.2.1.1.1 makes a MUST and FreeRDP
+  follows (`cliprdr_process_monitor_ready`), so short names are used.
+  The file-transfer flags join the set in #324/#325. **The initial Format List is empty**, as
+  FreeRDP's was against the VM: every format announced entitles the server to a Format Data Request,
+  which is #322's, so announcing one here would advertise what nothing answers. A server
+  Format List is answered with
+  `CB_RESPONSE_OK` before it is surfaced as `RemoteFormatList`, because the answer carries no
+  policy. **A server Format List that does not decode is answered with `CB_RESPONSE_FAIL`**
+  and surfaced as `FormatListRejected`, because `[MS-RDPECLIP]` 3.1.5.2.2 says a failure
+  response MUST be sent; any other undecodable message stays an error. Neither reference sends
+  it: FreeRDP and IronRDP return the error and answer nothing. **Sending it now was the
+  maintainer's call (2026-09-23)**, shown three options: build it in #321, defer it to #322,
+  or record the references' behaviour and drop it. Anything else the helper does not decode is
+  skipped with an `rdp_cliprdr` record.
+- **How strictly a clipboard message is read** is a set of derivations, and they fall to a
+  better one. `dataLen` must equal the rest of the message, where FreeRDP only needs it not to
+  exceed it: one message is one PDU, and every VM message was exact. A capability set other
+  than the general one is refused, as FreeRDP refuses it; only that one is defined
+  (`[MS-RDPECLIP]` 2.2.2.1.1). A Format List Response must set exactly one of OK and FAIL. A
+  long format name without its NUL, and a short list that is not whole 36-byte entries, are
+  refused. **Two of those diverge from both references**: bytes after the last long name (FreeRDP
+  reads entries while 4 bytes remain, "some clients pad the format list"; IronRDP while 6 do)
+  and a general set whose `lengthCapability` is not exactly 12 (FreeRDP takes 4 or more). No
+  Windows server has been seen doing either. **A 16-character short name with no NUL is
+  accepted**: FreeRDP records Windows sending exactly that (`cliprdr_read_format_list`), so it
+  is the server's real form rather than a malformation. An ASCII short name may fill all 32
+  bytes the same way, where FreeRDP keeps 31.
 
 ## Code
 
@@ -150,10 +210,16 @@ glossary, which is vocabulary rather than a decision.
 - `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`, `DvcError`
 - `justrdp/src/svc.rs` — `Reassembler`, `CHANNEL_MESSAGE_CAP`
 - `justrdp/src/session.rs` — `SessionOutput::ChannelData`, `send_channel`, `ChannelSendError`
+- `justrdp-pdu/src/cliprdr.rs` — `ClipboardPdu`, `GeneralCapability`, `Format`,
+  `encode_capabilities`, `encode_format_list`, `encode_format_list_response`
+- `justrdp/src/cliprdr.rs` — `Clipboard`, `ClipboardOutput`, `channel_def`, `CHANNEL_OPTIONS`,
+  `ADVERTISED_FLAGS`
 - Spec sections cited inline: `[MS-RDPBCGR]` 1.3.3, 2.2.6.1.1, 3.1.5.2.1, 3.1.5.2.2;
   `[MS-RDPEDYC]` 1.7, 2.2.2.2, 2.2.3.3, 2.2.3.4, 3.2;
   `[MS-RDPEDISP]` 1.3,
-  2.2.2.2, 2.2.2.2.1
+  2.2.2.2, 2.2.2.2.1;
+  `[MS-RDPECLIP]` 1.3.2.1, 2.1, 2.2.1, 2.2.2.1, 2.2.2.1.1, 2.2.2.1.1.1, 2.2.2.2, 2.2.3.1,
+  2.2.3.1.2, 2.2.3.2, 3.1.5.2.2
 
 ## Reference behaviour
 
@@ -178,9 +244,20 @@ glossary, which is vocabulary rather than a decision.
 - A Client Announce Reply sent on `rdpdr` is answered with Server Core Capability Request
   (`rDPS`, 84 bytes) and Server Client ID Confirm (`rDCC`) echoing the ClientId. Without the
   reply no `rDCC` arrives. That is the live send proof.
-- **`cliprdr` does not answer a client Format List**, single-chunk or chunked, after the
-  client's capabilities: 0 of 3 runs, in 40 s each, with the frames confirmed written. Not
-  investigated. A server-side clipboard-direction policy is one candidate and is untested.
+- ~~**`cliprdr` does not answer a client Format List**~~ — it does, to chunks that carry
+  `CHANNEL_FLAG_SHOW_PROTOCOL`, which #307's probe did not send (#321; the design-model bullet
+  above has the counts). The clipboard-direction policy #307 suspected was not the cause:
+  FreeRDP against the same VM is answered in 63 ms.
+
+**Measured against the WS2022 test VM (#321, 2026-09-23):**
+
+- The server's general capability set is version 2 with `generalFlags=0x3E`: long format
+  names, stream fileclip, no file paths, can lock, huge files. FreeRDP 3.31 answers `0x2E`,
+  dropping `CB_CAN_LOCK_CLIPDATA`, then an empty Format List (8 bytes); the server replies
+  `CB_RESPONSE_OK`. A later one-format list (`CF_UNICODETEXT`, long names, 14 bytes) is
+  answered OK too. Taken with `/dump` and `WLOG_FILTER=com.freerdp.channels.cliprdr.client:TRACE`.
+- The server sent no Format List of its own during the handshake, with its clipboard empty, so
+  **a server Format List has not been decoded live**; the unit tests alone cover it.
 - A chunked client message (a 2018-byte `rdpdr` Client Name, sent without SHOW_PROTOCOL)
   did not end the session, but nothing the server sends depends on it. So **a multi-chunk
   send is not proven live either.**
@@ -207,10 +284,11 @@ glossary, which is vocabulary rather than a decision.
 
 ## Known holes / open
 
-- **Every redirection feature is an unopened channel**: clipboard (#10), audio
+- **Every redirection feature but the clipboard's handshake is an unopened channel**: audio
   output (#11), audio input (#12), device/drive/printer/smartcard (#13), RemoteApp
   (#14), multitouch (#15), video (#17), camera (#19), location (#20). The transport
-  exists; the consumers do not.
+  exists; the consumers do not. The clipboard (#10) moves no data yet: text is #322, images
+  #323, files #324/#325.
 - ~~Static channel 1004 traffic is ignored by the session loop with no record of what
   it contains.~~ **Closed in #307**: 1004 is `cliprdr`, and a granted channel's messages
   now reach the host. The remaining gaps are the multi-chunk live proofs above.

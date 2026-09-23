@@ -2449,6 +2449,108 @@ mod tests {
         .await
     }
 
+    /// Real-VM acceptance for #321: the clipboard initialization sequence completes. The
+    /// server's Capabilities and Monitor Ready reach [`justrdp::cliprdr::Clipboard`], its
+    /// Capabilities and Format List go back through [`SessionCommand::ChannelData`], and the
+    /// server answers with a Format List Response that accepts them.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn the_clipboard_handshake_is_answered_on_the_real_vm() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![cliprdr::channel_def()];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let channel = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "cliprdr")
+                .expect("the VM grants cliprdr")
+                .id;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let (tx, mut commands) = tokio::sync::mpsc::channel(4);
+            let cancel = CancellationToken::new();
+            // The session ends once the server has answered *and* the desktop has painted and
+            // settled, as every other VM test does before it lets go of the session.
+            let frames = Arc::new(AtomicUsize::new(0));
+            let answered = Arc::new(AtomicBool::new(false));
+            let watcher = {
+                let (frames, answered, done) = (frames.clone(), answered.clone(), cancel.clone());
+                tokio::spawn(async move {
+                    let settled = vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await;
+                    while !answered.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    done.cancel();
+                    settled
+                })
+            };
+            let frames_in_sink = frames.clone();
+            let mut clipboard = Clipboard::new();
+            let mut responses = Vec::new();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(90),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        let SessionEvent::ChannelData { channel: on, data } = event else {
+                            return;
+                        };
+                        assert_eq!(on, channel, "only cliprdr was requested");
+                        for output in clipboard
+                            .process(&data)
+                            .expect("the VM's clipboard message decodes")
+                        {
+                            match output {
+                                ClipboardOutput::Send(data) => tx
+                                    .try_send(SessionCommand::ChannelData { channel, data })
+                                    .expect("the command queue has room"),
+                                ClipboardOutput::FormatListResponse { ok } => {
+                                    responses.push(ok);
+                                    answered.store(true, Ordering::SeqCst);
+                                }
+                                ClipboardOutput::RemoteFormatList(_) => {}
+                                ClipboardOutput::FormatListRejected(error) => {
+                                    panic!("the VM's Format List decodes: {error}")
+                                }
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            ended
+                .expect("the server answered the Format List and the desktop settled within 90 s")
+                .expect("the session ran without a protocol failure");
+            watcher
+                .await
+                .expect("the watcher task")
+                .expect("the desktop painted and settled");
+            assert_eq!(responses, vec![true], "one Format List, accepted");
+            assert_eq!(
+                clipboard.general_flags(),
+                justrdp_pdu::cliprdr::CB_USE_LONG_FORMAT_NAMES
+            );
+        })
+        .await
+    }
+
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn save_session_info_reaches_the_host_against_real_vm() {
