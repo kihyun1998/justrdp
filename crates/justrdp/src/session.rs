@@ -95,6 +95,15 @@ pub enum SessionOutput {
         /// The message.
         data: Vec<u8>,
     },
+    /// A message on a host static channel was larger than that channel's message cap
+    /// ([`SessionStateMachine::set_channel_message_cap`]), so it was skipped unbuffered. The
+    /// session goes on.
+    ChannelMessageDropped {
+        /// The MCS channel ID it arrived on.
+        channel: u16,
+        /// Its declared length.
+        total_length: usize,
+    },
 }
 
 /// Record one Save Session Info at its arrival, for whichever leg received it.
@@ -185,8 +194,9 @@ impl core::fmt::Display for ResizeError {
 
 impl core::error::Error for ResizeError {}
 
-/// Why a [`SessionStateMachine::send_channel`] call was refused (the session itself is
-/// unaffected).
+/// Why [`SessionStateMachine::send_channel`] or
+/// [`SessionStateMachine::set_channel_message_cap`] was refused (the session itself is
+/// unaffected). Only `send_channel` can return [`ChannelSendError::SuspendedQueueFull`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelSendError {
     /// The channel is not one of [`SessionConfig::static_channels`].
@@ -200,7 +210,7 @@ pub enum ChannelSendError {
         channel: u16,
     },
     /// The server suspended virtual channel traffic and the messages held for its resume
-    /// would exceed the channel message cap (64 MiB) with this one.
+    /// would exceed 64 MiB with this one, whatever the channel's receive cap.
     SuspendedQueueFull {
         /// The MCS channel ID asked for.
         channel: u16,
@@ -221,7 +231,7 @@ impl core::fmt::Display for ChannelSendError {
             }
             ChannelSendError::SuspendedQueueFull { channel } => write!(
                 f,
-                "virtual channel traffic is suspended and the held messages would exceed the cap \
+                "virtual channel traffic is suspended and the held messages would exceed 64 MiB \
                  (channel {channel})"
             ),
         }
@@ -410,7 +420,7 @@ impl SessionStateMachine {
             .map(|c| {
                 (
                     c.id,
-                    crate::svc::Reassembler::new(crate::svc::CHANNEL_MESSAGE_CAP),
+                    crate::svc::Reassembler::dropping(crate::svc::CHANNEL_MESSAGE_CAP),
                 )
             })
             .collect();
@@ -1084,9 +1094,38 @@ impl SessionStateMachine {
         };
         let data = reassembler.push(payload).map_err(SessionError::Decode)?;
         self.note_channel_flow(payload, outputs);
-        if let Some(data) = data {
-            outputs.push(SessionOutput::ChannelData { channel, data });
+        match data {
+            Some(crate::svc::Reassembled::Message(data)) => {
+                outputs.push(SessionOutput::ChannelData { channel, data });
+            }
+            Some(crate::svc::Reassembled::Dropped { total_length }) => {
+                outputs.push(SessionOutput::ChannelMessageDropped {
+                    channel,
+                    total_length,
+                });
+            }
+            None => {}
         }
+        Ok(())
+    }
+
+    /// Set the largest message the host static channel `channel` delivers; a larger one is
+    /// skipped and reported as [`SessionOutput::ChannelMessageDropped`]. The default is 64 MiB.
+    /// A message already arriving keeps the cap its first chunk met.
+    pub fn set_channel_message_cap(
+        &mut self,
+        channel: u16,
+        cap: usize,
+    ) -> Result<(), ChannelSendError> {
+        if Some(channel) == self.config.drdynvc_channel_id {
+            return Err(ChannelSendError::CoreOwned { channel });
+        }
+        let (_, reassembler) = self
+            .channels
+            .iter_mut()
+            .find(|(id, _)| *id == channel)
+            .ok_or(ChannelSendError::NotGranted { channel })?;
+        reassembler.set_cap(cap);
         Ok(())
     }
 
@@ -2466,6 +2505,76 @@ mod tests {
             channel,
             data: data.to_vec(),
         }
+    }
+
+    /// A host channel message over its cap is skipped and reported, and the session goes on
+    /// to deliver the next one.
+    #[test]
+    fn a_host_message_over_its_cap_is_dropped_and_the_session_goes_on() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        sm.set_channel_message_cap(CLIPRDR, 3000).unwrap();
+        let big = vec![7u8; 5000];
+        let mut outputs = Vec::new();
+        for chunk in svc::encode_chunks(&big) {
+            outputs.extend(
+                sm.process_bytes(&server_channel_frame(CLIPRDR, &chunk))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            outputs,
+            vec![SessionOutput::ChannelMessageDropped {
+                channel: CLIPRDR,
+                total_length: 5000
+            }]
+        );
+        let small = &svc::encode_chunks(b"next")[0];
+        assert_eq!(
+            sm.process_bytes(&server_channel_frame(CLIPRDR, small))
+                .unwrap(),
+            vec![channel_data(CLIPRDR, b"next")]
+        );
+    }
+
+    #[test]
+    fn a_host_can_raise_a_channels_cap() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let big: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        let deliver = |sm: &mut SessionStateMachine| {
+            let mut outputs = Vec::new();
+            for chunk in svc::encode_chunks(&big) {
+                outputs.extend(
+                    sm.process_bytes(&server_channel_frame(CLIPRDR, &chunk))
+                        .unwrap(),
+                );
+            }
+            outputs
+        };
+        sm.set_channel_message_cap(CLIPRDR, 100).unwrap();
+        assert_eq!(
+            deliver(&mut sm),
+            vec![SessionOutput::ChannelMessageDropped {
+                channel: CLIPRDR,
+                total_length: 5000
+            }]
+        );
+        sm.set_channel_message_cap(CLIPRDR, 5000).unwrap();
+        assert_eq!(deliver(&mut sm), vec![channel_data(CLIPRDR, &big)]);
+    }
+
+    /// Only a host channel has a cap to set: drdynvc keeps its own, and an ungranted channel has
+    /// none.
+    #[test]
+    fn only_a_host_channels_cap_can_be_set() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        assert_eq!(
+            sm.set_channel_message_cap(DRDYNVC, 1),
+            Err(ChannelSendError::CoreOwned { channel: DRDYNVC })
+        );
+        assert_eq!(
+            sm.set_channel_message_cap(IO, 1),
+            Err(ChannelSendError::NotGranted { channel: IO })
+        );
     }
 
     #[test]

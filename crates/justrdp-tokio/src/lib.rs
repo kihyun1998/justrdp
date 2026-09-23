@@ -827,6 +827,9 @@ pub async fn run_session_with_input(
                     // them through run_session_with_commands, which can also send on them.
                     tracing::debug!(target: "rdp_svc", channel, bytes = data.len(), "static channel message");
                 }
+                SessionOutput::ChannelMessageDropped { .. } => {
+                    // The core already emitted the `rdp_svc` record for the skipped message.
+                }
             }
         }
         tokio::select! {
@@ -898,6 +901,15 @@ pub enum SessionCommand {
         /// The message.
         data: Vec<u8>,
     },
+    /// Set the largest message a host static channel delivers (issue #323), as
+    /// [`justrdp::SessionStateMachine::set_channel_message_cap`]. A channel the machine refuses
+    /// is logged and keeps its cap.
+    SetChannelMessageCap {
+        /// The MCS channel ID.
+        channel: u16,
+        /// The new cap in bytes.
+        cap: usize,
+    },
 }
 
 /// A session milestone surfaced to the host by [`run_session_with_commands`].
@@ -930,6 +942,15 @@ pub enum SessionEvent {
         /// The message.
         data: Vec<u8>,
     },
+    /// A message on a host static channel was over that channel's cap
+    /// ([`justrdp::SessionStateMachine::set_channel_message_cap`]) and was skipped (issue
+    /// #323). The session goes on; a host waiting for that message stops waiting.
+    ChannelMessageDropped {
+        /// The MCS channel ID it arrived on.
+        channel: u16,
+        /// Its declared length.
+        total_length: usize,
+    },
 }
 
 /// [`run_session_with_input`] generalized to host *commands* (input + resize) and
@@ -940,7 +961,8 @@ pub enum SessionEvent {
 ///
 /// `on_event` receives session milestones ([`SessionEvent::DisplayControlReady`],
 /// [`SessionEvent::ShutdownDenied`], [`SessionEvent::SaveSessionInfo`],
-/// [`SessionEvent::KeyboardIndicators`], [`SessionEvent::ChannelData`]);
+/// [`SessionEvent::KeyboardIndicators`], [`SessionEvent::ChannelData`],
+/// [`SessionEvent::ChannelMessageDropped`]);
 /// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
 pub async fn run_session_with_commands(
     stream: &mut TlsStream<TcpStream>,
@@ -980,6 +1002,15 @@ pub async fn run_session_with_commands(
                 }
                 SessionOutput::ChannelData { channel, data } => {
                     on_event(SessionEvent::ChannelData { channel, data });
+                }
+                SessionOutput::ChannelMessageDropped {
+                    channel,
+                    total_length,
+                } => {
+                    on_event(SessionEvent::ChannelMessageDropped {
+                        channel,
+                        total_length,
+                    });
                 }
             }
         }
@@ -1035,6 +1066,12 @@ pub async fn run_session_with_commands(
                             }
                             // Not fatal: the session is unaffected.
                             Err(e) => tracing::warn!(channel, error = %e, "channel send refused"),
+                        }
+                    }
+                    Some(SessionCommand::SetChannelMessageCap { channel, cap }) => {
+                        if let Err(e) = machine.set_channel_message_cap(channel, cap) {
+                            // Not fatal: the channel keeps its cap.
+                            tracing::warn!(channel, error = %e, "channel message cap refused");
                         }
                     }
                     // Sender dropped: stop polling, keep the session alive.
@@ -2811,6 +2848,455 @@ mod tests {
             assert_eq!(
                 round_trip, OFFERED_BY_HOST,
                 "the host's text was pasted on the server intact"
+            );
+        })
+        .await
+    }
+
+    /// The pixels of `CF_DIB` data as top-down RGB rows: `(width, height, rgb)`. Reads the
+    /// `BITMAPINFOHEADER` forms a clipboard carries: 24 or 32 bits per pixel, `BI_RGB` or
+    /// `BI_BITFIELDS` with byte-aligned masks, bottom-up or top-down.
+    fn dib_rgb(dib: &[u8]) -> Result<(usize, usize, Vec<[u8; 3]>), String> {
+        let u32_at = |at: usize| -> Result<u32, String> {
+            dib.get(at..at + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .ok_or_else(|| format!("the DIB ends before byte {at}"))
+        };
+        let header_size = u32_at(0)? as usize;
+        let width = u32_at(4)? as i32;
+        let height = u32_at(8)? as i32;
+        let bpp = u16::from_le_bytes([dib[14], dib[15]]);
+        let compression = u32_at(16)?;
+        let colors_used = u32_at(32)? as usize;
+        if width <= 0 || height == 0 || !matches!(bpp, 24 | 32) {
+            return Err(format!("unsupported DIB: {width}x{height} at {bpp} bpp"));
+        }
+        // Blue, green and red byte offsets inside a pixel.
+        let (mut offsets, mut pixels_at) = ([0usize, 1, 2], header_size);
+        match compression {
+            0 => {}
+            3 => {
+                // A V1 header is followed by the three masks; later headers hold them.
+                let masks_at = 40;
+                if header_size == 40 {
+                    pixels_at += 12;
+                }
+                let shift = |mask: u32| -> Result<usize, String> {
+                    match mask {
+                        0x0000_00FF => Ok(0),
+                        0x0000_FF00 => Ok(1),
+                        0x00FF_0000 => Ok(2),
+                        0xFF00_0000 => Ok(3),
+                        _ => Err(format!("DIB mask {mask:#010x} is not byte-aligned")),
+                    }
+                };
+                offsets = [
+                    shift(u32_at(masks_at + 8)?)?,
+                    shift(u32_at(masks_at + 4)?)?,
+                    shift(u32_at(masks_at)?)?,
+                ];
+            }
+            other => return Err(format!("DIB compression {other} is not read here")),
+        }
+        pixels_at += colors_used * 4;
+        let (width, rows) = (width as usize, height.unsigned_abs() as usize);
+        let bytes = usize::from(bpp) / 8;
+        let stride = (width * bytes).div_ceil(4) * 4;
+        let pixels = dib
+            .get(pixels_at..pixels_at + stride * rows)
+            .ok_or_else(|| format!("the DIB holds {} bytes, short of its pixels", dib.len()))?;
+        let mut rgb = Vec::with_capacity(width * rows);
+        for row in 0..rows {
+            let stored = if height > 0 { rows - 1 - row } else { row };
+            let line = &pixels[stored * stride..];
+            for x in 0..width {
+                let px = &line[x * bytes..];
+                rgb.push([px[offsets[2]], px[offsets[1]], px[offsets[0]]]);
+            }
+        }
+        Ok((width, rows, rgb))
+    }
+
+    #[test]
+    fn dib_rgb_reads_the_forms_a_clipboard_carries() {
+        // 2x2, 24 bpp, bottom-up, rows padded to 8 bytes: bottom row blue, green; top red, white.
+        let mut dib = vec![0u8; 40];
+        dib[0] = 40;
+        dib[4] = 2;
+        dib[8] = 2;
+        dib[12] = 1;
+        dib[14] = 24;
+        dib.extend_from_slice(&[255, 0, 0, 0, 255, 0, 0, 0]);
+        dib.extend_from_slice(&[0, 0, 255, 255, 255, 255, 0, 0]);
+        let (w, h, rgb) = dib_rgb(&dib).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(
+            rgb,
+            vec![[255, 0, 0], [255, 255, 255], [0, 0, 255], [0, 255, 0]]
+        );
+
+        // 1x1, 32 bpp, BI_BITFIELDS with red in the low byte, top-down.
+        let mut dib = vec![0u8; 40];
+        dib[0] = 40;
+        dib[4] = 1;
+        dib[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        dib[12] = 1;
+        dib[14] = 32;
+        dib[16] = 3;
+        for mask in [0x0000_00FFu32, 0x0000_FF00, 0x00FF_0000] {
+            dib.extend_from_slice(&mask.to_le_bytes());
+        }
+        dib.extend_from_slice(&[10, 20, 30, 0]);
+        assert_eq!(dib_rgb(&dib).unwrap(), (1, 1, vec![[10, 20, 30]]));
+    }
+
+    /// A 24 bpp `BI_RGB` bottom-up `CF_DIB` of a `size`-square gradient, and its top-down RGB.
+    fn gradient_dib(size: usize) -> (Vec<u8>, Vec<[u8; 3]>) {
+        let pixel = |x: usize, y: usize| {
+            [
+                (x * 255 / size) as u8,
+                (y * 255 / size) as u8,
+                ((x + y) % 256) as u8,
+            ]
+        };
+        let mut dib = vec![0u8; 40];
+        dib[0] = 40;
+        dib[4..8].copy_from_slice(&(size as i32).to_le_bytes());
+        dib[8..12].copy_from_slice(&(size as i32).to_le_bytes());
+        dib[12] = 1;
+        dib[14] = 24;
+        let stride = (size * 3).div_ceil(4) * 4;
+        dib[20..24].copy_from_slice(&((stride * size) as u32).to_le_bytes());
+        for stored in 0..size {
+            let y = size - 1 - stored;
+            let mut line = Vec::with_capacity(stride);
+            for x in 0..size {
+                let [r, g, b] = pixel(x, y);
+                line.extend_from_slice(&[b, g, r]);
+            }
+            line.resize(stride, 0);
+            dib.extend_from_slice(&line);
+        }
+        let rgb = (0..size)
+            .flat_map(|y| (0..size).map(move |x| pixel(x, y)))
+            .collect();
+        (dib, rgb)
+    }
+
+    /// Real-VM acceptance for #323: images cross the clipboard both ways, as messages of many
+    /// channel chunks. Print Screen puts the desktop on the server's clipboard; its `CF_DIB`
+    /// reaches the host and matches the framebuffer the session decoded. A gradient the host
+    /// offers is pasted into Paint, copied back, and comes back pixel for pixel.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn images_cross_the_clipboard_both_ways_on_the_real_vm() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+        use justrdp_pdu::cliprdr::{CF_DIB, Format};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const GRADIENT: usize = 256;
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![cliprdr::channel_def()];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let channel = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "cliprdr")
+                .expect("the VM grants cliprdr")
+                .id;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(64);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let latest_frame = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let clipboard = Arc::new(Mutex::new(Clipboard::new()));
+            let handshake_done = Arc::new(AtomicBool::new(false));
+            // Each image the host receives, with the framebuffer as it stood on arrival.
+            let (images_tx, mut images) =
+                tokio::sync::mpsc::unbounded_channel::<(Option<Vec<u8>>, Vec<u8>)>();
+            let (host_list_tx, mut host_list_answered) =
+                tokio::sync::mpsc::unbounded_channel::<bool>();
+            let (dib, gradient) = gradient_dib(GRADIENT);
+            let dib_requested = Arc::new(AtomicUsize::new(0));
+            let (dropped_tx, mut dropped) = tokio::sync::mpsc::unbounded_channel::<usize>();
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let driver = {
+                let (frames, cancel, clipboard, handshake_done) = (
+                    frames.clone(),
+                    cancel.clone(),
+                    clipboard.clone(),
+                    handshake_done.clone(),
+                );
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        let start = tokio::time::Instant::now();
+                        while !handshake_done.load(Ordering::SeqCst) {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err("the clipboard handshake never completed".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        let key = |vk: u16| {
+                            justrdp::input::scancode_from_windows_vk(vk)
+                                .unwrap_or_else(|| panic!("VK {vk:#04x} maps to a scancode"))
+                        };
+                        let chord = |vk: u16| {
+                            let (ctrl, k) = (key(0x11), key(vk));
+                            vec![ctrl.press(), k.press(), k.release(), ctrl.release()]
+                        };
+                        let send = |events: Vec<InputEvent>| {
+                            let input_tx = input_tx.clone();
+                            async move {
+                                input_tx
+                                    .send(events)
+                                    .await
+                                    .map_err(|_| "the session closed".to_string())
+                            }
+                        };
+                        async fn next_image(
+                            images: &mut tokio::sync::mpsc::UnboundedReceiver<(
+                                Option<Vec<u8>>,
+                                Vec<u8>,
+                            )>,
+                        ) -> Result<(Vec<u8>, Vec<u8>), String> {
+                            let (data, frame) =
+                                tokio::time::timeout(Duration::from_secs(30), images.recv())
+                                    .await
+                                    .map_err(|_| {
+                                        "no image reached the host within 30 s".to_string()
+                                    })?
+                                    .ok_or_else(|| "the session closed".to_string())?;
+                            Ok((
+                                data.ok_or_else(|| {
+                                    "the server failed the Format Data Request".to_string()
+                                })?,
+                                frame,
+                            ))
+                        }
+
+                        let set_cap = |cap: usize| {
+                            let commands_tx = commands_tx.clone();
+                            async move {
+                                commands_tx
+                                    .send(SessionCommand::SetChannelMessageCap { channel, cap })
+                                    .await
+                                    .map_err(|_| "the session closed".to_string())
+                            }
+                        };
+                        let print_screen = key(0x2C);
+
+                        // Under a 1 MiB cap the screenshot is dropped, and the session goes on.
+                        set_cap(1 << 20).await?;
+                        send(vec![print_screen.press(), print_screen.release()]).await?;
+                        let dropped_length =
+                            tokio::time::timeout(Duration::from_secs(30), dropped.recv())
+                                .await
+                                .map_err(|_| "no message was dropped within 30 s".to_string())?
+                                .ok_or_else(|| "the session closed".to_string())?;
+
+                        // Server to host: with the default cap back, Print Screen copies the
+                        // desktop.
+                        set_cap(64 << 20).await?;
+                        send(vec![print_screen.press(), print_screen.release()]).await?;
+                        let screenshot = next_image(&mut images).await?;
+
+                        // Host to server: offer the gradient, paste it into Paint, copy it back.
+                        let list = clipboard.lock().unwrap().announce(vec![Format {
+                            id: CF_DIB,
+                            name: String::new(),
+                        }]);
+                        commands_tx
+                            .send(SessionCommand::ChannelData {
+                                channel,
+                                data: list.expect("the handshake is done, so the list is sent now"),
+                            })
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+                        let accepted = tokio::time::timeout(
+                            Duration::from_secs(20),
+                            host_list_answered.recv(),
+                        )
+                        .await
+                        .map_err(|_| {
+                            "the server never answered the host's Format List".to_string()
+                        })?;
+                        if accepted != Some(true) {
+                            return Err(format!(
+                                "the server answered the host's Format List with {accepted:?}"
+                            ));
+                        }
+                        vm::start_menu_run(&input_tx, &frames, desktop, "mspaint").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        send(chord(0x56)).await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        send(chord(0x43)).await?;
+                        let (round_trip, _) = next_image(&mut images).await?;
+                        Ok((dropped_length, screenshot, round_trip))
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let (frames_in_sink, latest_in_sink) = (frames.clone(), latest_frame.clone());
+            let ended = tokio::time::timeout(
+                Duration::from_secs(300),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, fb| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                        let mut latest = latest_in_sink.lock().unwrap();
+                        latest.clear();
+                        latest.extend_from_slice(fb.pixels());
+                    },
+                    |_| {},
+                    |event| {
+                        if let SessionEvent::ChannelMessageDropped {
+                            channel: on,
+                            total_length,
+                        } = event
+                        {
+                            assert_eq!(on, channel, "only cliprdr was requested");
+                            // The dropped message was the answer to our request.
+                            assert_eq!(clipboard.lock().unwrap().cancel_request(), Some(CF_DIB));
+                            let _ = dropped_tx.send(total_length);
+                            return;
+                        }
+                        let SessionEvent::ChannelData { channel: on, data } = event else {
+                            return;
+                        };
+                        assert_eq!(on, channel, "only cliprdr was requested");
+                        eprintln!("cliprdr message: {} bytes", data.len());
+                        let mut clipboard = clipboard.lock().unwrap();
+                        let outputs = clipboard
+                            .process(&data)
+                            .expect("the VM's clipboard message decodes");
+                        let send = |data: Vec<u8>| {
+                            eprintln!("host sends {} bytes", data.len());
+                            commands_tx
+                                .try_send(SessionCommand::ChannelData { channel, data })
+                                .expect("the command queue has room")
+                        };
+                        for output in outputs {
+                            match output {
+                                ClipboardOutput::Send(data) => send(data),
+                                ClipboardOutput::FormatListResponse { ok } => {
+                                    if handshake_done.swap(true, Ordering::SeqCst) {
+                                        let _ = host_list_tx.send(ok);
+                                    } else {
+                                        assert!(ok, "the server accepts the initial Format List");
+                                    }
+                                }
+                                ClipboardOutput::RemoteFormatList(formats) => {
+                                    eprintln!("server formats: {formats:?}");
+                                    if formats.iter().any(|f| f.id == CF_DIB) {
+                                        send(
+                                            clipboard
+                                                .request(CF_DIB)
+                                                .expect("the server listed CF_DIB"),
+                                        );
+                                    }
+                                }
+                                ClipboardOutput::FormatData { data, .. } => {
+                                    let frame = latest_frame.lock().unwrap().clone();
+                                    let _ = images_tx.send((data, frame));
+                                }
+                                ClipboardOutput::DataRequested { format_id } => {
+                                    assert_eq!(format_id, CF_DIB);
+                                    dib_requested.fetch_add(1, Ordering::SeqCst);
+                                    for data in clipboard.respond(Some(&dib)) {
+                                        send(data);
+                                    }
+                                }
+                                ClipboardOutput::FormatListRejected(error) => {
+                                    panic!("the VM's Format List decodes: {error}")
+                                }
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+            ended
+                .expect("the session ended within 300 s")
+                .expect("the session ran without a protocol failure");
+            let (dropped_length, (screenshot, frame), round_trip) =
+                driven.expect("the desktop was driven");
+
+            // The dropped message was the screenshot's Format Data Response: its header and the
+            // DIB the second Print Screen delivered.
+            assert_eq!(dropped_length, 8 + screenshot.len());
+
+            // Server to host: the screenshot is the decoded desktop.
+            eprintln!(
+                "screenshot CF_DIB: {} bytes, header {:02x?}",
+                screenshot.len(),
+                &screenshot[..screenshot.len().min(56)]
+            );
+            let (w, h, shot) = dib_rgb(&screenshot).expect("the screenshot is a readable DIB");
+            assert_eq!((w, h), (usize::from(desktop.0), usize::from(desktop.1)));
+            // The session runs at 16 bpp, so each channel reached the host as its top 5 or 6
+            // bits, widened again by repeating the top bits.
+            let rgb565 = |[r, g, b]: [u8; 3]| {
+                let five = |c: u8| (c >> 3) << 3 | c >> 5;
+                let six = |c: u8| (c >> 2) << 2 | c >> 6;
+                [five(r), six(g), five(b)]
+            };
+            let differing = shot
+                .iter()
+                .zip(frame.as_chunks::<4>().0)
+                .filter(|(s, f)| rgb565(**s)[..] != f[..3])
+                .count();
+            assert_eq!(
+                differing, 0,
+                "the screenshot, at the session's 16 bpp, matches the framebuffer pixel for pixel"
+            );
+
+            // Host to server: Paint gave the gradient back.
+            assert!(
+                dib_requested.load(Ordering::SeqCst) >= 1,
+                "pasting in Paint asked the host for its CF_DIB"
+            );
+            eprintln!("round-trip CF_DIB: {} bytes", round_trip.len());
+            let (w, h, back) = dib_rgb(&round_trip).expect("Paint's copy is a readable DIB");
+            assert_eq!((w, h), (GRADIENT, GRADIENT));
+            let differing = back.iter().zip(&gradient).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                differing, 0,
+                "the host's image was pasted on the server intact"
             );
         })
         .await

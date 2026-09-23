@@ -88,7 +88,7 @@ pub struct Clipboard {
     ready: bool,
     local_formats: Vec<Format>,
     local_list_refused: bool,
-    remote_formats: Vec<Format>,
+    remote_format_ids: Vec<u32>,
     requested: Option<u32>,
     owed: VecDeque<Owed>,
 }
@@ -119,7 +119,7 @@ impl Clipboard {
         if let Some(format_id) = self.requested {
             return Err(RequestError::Pending { format_id });
         }
-        if !self.remote_formats.iter().any(|f| f.id == format_id) {
+        if !self.remote_format_ids.contains(&format_id) {
             return Err(RequestError::NotAnnounced { format_id });
         }
         self.requested = Some(format_id);
@@ -169,7 +169,7 @@ impl Clipboard {
         tracing::warn!(target: "rdp_cliprdr", ?msg_type, %error, "clipboard message refused");
         match msg_type {
             Some(pdu::CB_FORMAT_LIST) => {
-                self.remote_formats.clear();
+                self.remote_format_ids.clear();
                 Ok(vec![
                     ClipboardOutput::Send(pdu::encode_format_list_response(false)),
                     ClipboardOutput::FormatListRejected(error),
@@ -216,7 +216,7 @@ impl Clipboard {
                 ])
             }
             ClipboardPdu::FormatList(formats) => {
-                self.remote_formats = formats.clone();
+                self.remote_format_ids = formats.iter().map(|f| f.id).collect();
                 Ok(vec![
                     ClipboardOutput::Send(pdu::encode_format_list_response(true)),
                     ClipboardOutput::RemoteFormatList(formats),
