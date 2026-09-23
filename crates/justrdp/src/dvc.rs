@@ -244,8 +244,8 @@ impl Drdynvc {
     /// Consume one MCS-delivered SVC payload on the drdynvc channel.
     pub(crate) fn on_svc_payload(&mut self, payload: &[u8]) -> Result<Vec<DvcEvent>, DvcError> {
         match self.svc.push(payload)? {
-            Some(message) => self.on_dvc_pdu(&message),
-            None => Ok(Vec::new()),
+            Some(crate::svc::Reassembled::Message(message)) => self.on_dvc_pdu(&message),
+            Some(crate::svc::Reassembled::Dropped { .. }) | None => Ok(Vec::new()),
         }
     }
 

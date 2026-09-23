@@ -46,8 +46,13 @@ pub const CB_CAN_LOCK_CLIPDATA: u32 = 0x0000_0010;
 /// `generalFlags`: files of 4 GiB and more are supported.
 pub const CB_HUGE_FILE_SUPPORT_ENABLED: u32 = 0x0000_0020;
 
+/// `CF_DIB`, the standard clipboard format for a device-independent bitmap: a
+/// `BITMAPINFO` header followed by the pixels.
+pub const CF_DIB: u32 = 8;
 /// `CF_UNICODETEXT`, the standard clipboard format for UTF-16 text.
 pub const CF_UNICODETEXT: u32 = 13;
+/// `CF_DIBV5`, a device-independent bitmap with a `BITMAPV5HEADER`.
+pub const CF_DIBV5: u32 = 17;
 
 /// The size of a `CLIPRDR_HEADER`.
 const HEADER_SIZE: usize = 8;
@@ -242,28 +247,46 @@ fn decode_short_format_list(body: &[u8], ascii: bool) -> Result<ClipboardPdu, De
 
 fn decode_long_format_list(body: &[u8]) -> Result<ClipboardPdu, DecodeError> {
     let mut cur = ReadCursor::new(body, "CLIPRDR_LONG_FORMAT_NAME");
-    let mut formats = Vec::new();
+    let mut count = 0usize;
     while cur.remaining() != 0 {
-        let id = cur.read_u32_le()?;
-        let mut units = Vec::new();
-        loop {
-            if cur.remaining() < 2 {
-                return Err(DecodeError::InvalidField {
-                    field: "CLIPRDR_LONG_FORMAT_NAME.wszFormatName",
-                    reason: "the name has no terminator",
-                });
-            }
-            match cur.read_u16_le()? {
-                0 => break,
-                unit => units.push(unit),
-            }
-        }
+        next_long_format_name(&mut cur, body)?;
+        count += 1;
+    }
+    let mut formats = Vec::with_capacity(count);
+    let mut cur = ReadCursor::new(body, "CLIPRDR_LONG_FORMAT_NAME");
+    while cur.remaining() != 0 {
+        let (id, name) = next_long_format_name(&mut cur, body)?;
         formats.push(Format {
             id,
-            name: utf16_to_string(units),
+            name: utf16_to_string(
+                name.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&u| u16::from_le_bytes(u)),
+            ),
         });
     }
     Ok(ClipboardPdu::FormatList(formats))
+}
+
+/// One `CLIPRDR_LONG_FORMAT_NAME`: its format ID and its name's UTF-16LE bytes, without the NUL.
+fn next_long_format_name<'a>(
+    cur: &mut ReadCursor<'a>,
+    body: &'a [u8],
+) -> Result<(u32, &'a [u8]), DecodeError> {
+    let id = cur.read_u32_le()?;
+    let start = cur.position();
+    loop {
+        if cur.remaining() < 2 {
+            return Err(DecodeError::InvalidField {
+                field: "CLIPRDR_LONG_FORMAT_NAME.wszFormatName",
+                reason: "the name has no terminator",
+            });
+        }
+        if cur.read_u16_le()? == 0 {
+            return Ok((id, &body[start..cur.position() - 2]));
+        }
+    }
 }
 
 fn utf16_to_string(units: impl IntoIterator<Item = u16>) -> String {
@@ -546,6 +569,20 @@ mod tests {
         body.extend(utf16z("HTML"));
         body.extend_from_slice(&[0x0d, 0x00]);
         assert!(ClipboardPdu::decode(&header(CB_FORMAT_LIST, 0, &body), true).is_err());
+    }
+
+    /// The list is counted before it is allocated, as FreeRDP's `cliprdr_read_format_list`
+    /// does, so a long list costs its formats and no growth headroom.
+    #[test]
+    fn a_long_list_is_allocated_exactly() {
+        let formats: Vec<Format> = (0..5).map(|i| named(0xC100 + i, "F")).collect();
+        let ClipboardPdu::FormatList(decoded) =
+            ClipboardPdu::decode(&encode_format_list(&formats, true), true).unwrap()
+        else {
+            panic!("a Format List");
+        };
+        assert_eq!(decoded, formats);
+        assert_eq!(decoded.capacity(), decoded.len());
     }
 
     #[test]

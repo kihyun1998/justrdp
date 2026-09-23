@@ -138,9 +138,46 @@ glossary, which is vocabulary rather than a decision.
   And `cliprdr`, which no spec says but the VM enforces (#321, the clipboard bullet below).
   Building it now, rather than leaving it to #14, was the maintainer's call (2026-09-22).
   `StaticChannel` carries the requested `options` so the machine can tell.
-- **A host channel's message cap is 64 MiB** (`CHANNEL_MESSAGE_CAP`), against drdynvc's
-  64 KiB. The value is unmeasured: 64 MiB leaves room for a 4K clipboard DIB (3840×2160×4 ≈
-  33 MB), which is the largest message a channel we know of plausibly carries.
+- **A host channel message over its cap is skipped and reported, and the session goes on**
+  (#323). The reassembler counts the chunks of a message whose `totalLength` is over the cap,
+  checks them as it checks any other, buffers none of them, and on the last chunk reports
+  `SessionOutput::ChannelMessageDropped { channel, total_length }` (adapter:
+  `SessionEvent::ChannelMessageDropped`). The cap is 64 MiB unless the host sets its own per
+  channel with `SessionStateMachine::set_channel_message_cap` (adapter:
+  `SessionCommand::SetChannelMessageCap`). Until #323 an over-cap message ended the session.
+  **Dropping it and letting the host set the cap was the maintainer's call (2026-09-23)**. They
+  chose it twice. The first time was on consequences alone. The second was after being shown
+  that neither the spec nor either reference has a cap:
+  - `[MS-RDPBCGR]` 2.2.6.1.1 makes `length` a u32, and 3.1.5.2.2.1 says the reassembly buffer
+    MUST be created with `totalLength`.
+  - FreeRDP's `channel_client_post_message` grows its stream until an allocation fails. It then
+    returns `CHANNEL_RC_NO_MEMORY`, which cliprdr only logs, so the message is lost and the
+    session lives.
+  - IronRDP's `ChunkProcessor::dechunkify` checks only against the declared length.
+
+  They were also shown three alternatives: dropping at a fixed 64 MiB, removing the cap (a
+  server could grow a buffer to 4 GiB, and 32-bit or wasm32 aborts when the allocation fails),
+  and keeping the old behaviour.
+  This is the ADR-0009 2026-08-31 amendment's shape: a ceiling that is ours, so what is over it
+  is skipped and recorded rather than fatal. **It is a deliberate divergence from the spec's
+  MUST** on the buffer. **Not covered by that call:**
+  - drdynvc keeps its 64 KiB cap and still ends the session (ADR-0014), so the two transports
+    now differ.
+  - The send-side bound on held messages (`SuspendedQueueFull`) stays a fixed 64 MiB whatever
+    a channel's receive cap is.
+  - A dropped clipboard response leaves `Clipboard::request` waiting until the host calls
+    `cancel_request`: the helper never sees session events.
+  - A dropped server Format List gets no Format List Response, because nothing knows which PDU
+    was dropped. The server is left waiting for one.
+
+  The setter returns `ChannelSendError` (`NotGranted`, `CoreOwned`) rather than a type of its
+  own, though it sets a receive-side cap. **Keeping the name was the maintainer's call
+  (2026-09-23)**. They were shown two alternatives: renaming it to `ChannelError`, or adding a
+  separate `ChannelCapError`.
+
+  Measured sizes (#323): a 1280×800 Print Screen `CF_DIB` is a 4,096,060-byte message. By
+  arithmetic at 32 bpp, 4K is about 31.6 MiB, 5K about 56.3 MiB and 8K about 126.6 MiB, so the
+  default holds up to 5K.
 - **The clipboard is a sans-IO helper the host drives, not a session consumer** (#321). The
   host requests the channel with `cliprdr::channel_def()`, feeds each `ChannelData` message on
   it to `Clipboard::process`, and passes every `ClipboardOutput::Send` to `send_channel`; the
@@ -227,7 +264,12 @@ glossary, which is vocabulary rather than a decision.
   Windows server has been seen doing either. **A 16-character short name with no NUL is
   accepted**: FreeRDP records Windows sending exactly that (`cliprdr_read_format_list`), so it
   is the server's real form rather than a malformation. An ASCII short name may fill all 32
-  bytes the same way, where FreeRDP keeps 31. A Format Data Request's body must be exactly
+  bytes the same way, where FreeRDP keeps 31. **A long-name list is counted before it is
+  allocated** (#323), as FreeRDP's `cliprdr_read_format_list` does; IronRDP grows its vector.
+  Neither reference bounds the count. **Choosing exact allocation over a count limit or leaving
+  it was the maintainer's call (2026-09-23)**, after they were shown both references. The
+  per-channel cap above is what bounds a list's size. The helper keeps only the server's format
+  IDs, not a copy of the list it hands the host. A Format Data Request's body must be exactly
   one format ID, and a failed Format Data Response must carry no data, which 2.2.5.2 makes a
   MUST (#322).
 - **`CF_UNICODETEXT` is UTF-16LE ending at its first NUL** (`encode_unicode_text`,
@@ -241,7 +283,9 @@ glossary, which is vocabulary rather than a decision.
 - `justrdp-pdu/src/displaycontrol.rs` — `DisplayControlPdu`, `Caps`, `Monitor`,
   `encode_monitor_layout`
 - `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`, `DvcError`
-- `justrdp/src/svc.rs` — `Reassembler`, `CHANNEL_MESSAGE_CAP`
+- `justrdp/src/svc.rs` — `Reassembler`, `Reassembled`, `CHANNEL_MESSAGE_CAP`
+- `justrdp/src/session.rs` — `SessionOutput::ChannelMessageDropped`,
+  `SessionStateMachine::set_channel_message_cap`
 - `justrdp/src/session.rs` — `SessionOutput::ChannelData`, `send_channel`, `ChannelSendError`
 - `justrdp-pdu/src/cliprdr.rs` — `ClipboardPdu`, `GeneralCapability`, `Format`,
   `encode_capabilities`, `encode_format_list`, `encode_format_list_response`,
@@ -254,7 +298,7 @@ glossary, which is vocabulary rather than a decision.
   `[MS-RDPEDISP]` 1.3,
   2.2.2.2, 2.2.2.2.1;
   `[MS-RDPECLIP]` 1.3.2.1, 2.1, 2.2.1, 2.2.2.1, 2.2.2.1.1, 2.2.2.1.1.1, 2.2.2.2, 2.2.3.1,
-  2.2.3.1.2, 2.2.3.2, 2.2.5.1, 2.2.5.2, 3.1.5.2.2, 3.1.5.4.3
+  2.2.3.1.2, 2.2.3.2, 2.2.5.1, 2.2.5.2, 3.1.5.2.2, 3.1.5.4.3; `[MS-RDPBCGR]` 3.1.5.2.2.1
 
 ## Reference behaviour
 
@@ -265,8 +309,7 @@ glossary, which is vocabulary rather than a decision.
   (`VCCAPS_COMPR_CS_8K`), `VCChunkSize=1600`.
 - Unprompted, the server sends `cliprdr` Clipboard Capabilities (24 bytes) and Monitor Ready
   (8 bytes), and `rdpdr` Server Announce (`rDnI`, 12 bytes). Every one arrived as a single
-  FIRST|LAST chunk, so **no multi-chunk receive has been observed live**; that path is
-  proven by the unit tests alone.
+  FIRST|LAST chunk. (#323 later received a multi-chunk message live; see below.)
 - **`rdpdr` announces only when `rdpsnd` is requested too**: 0 of 2 runs without it, 4 of 4
   with it. The specs do not ask for it: `[MS-RDPEFS]` 1.4/1.5 and `[MS-RDPEA]` 1.4/1.5 each
   depend only on the channel transport. **FreeRDP always requests the two together**
@@ -303,10 +346,24 @@ glossary, which is vocabulary rather than a decision.
   through the clipboard byte-exact, a surrogate pair (`😀`) included.
 - A host Format List of `CF_UNICODETEXT` is answered OK. Pasting in Notepad sends a Format Data
   Request for `13`, and the host's text, copied back out of Notepad, is intact. Both texts fit
-  one chunk, so this proves nothing about multi-chunk messages; that is still #323's.
-- A chunked client message (a 2018-byte `rdpdr` Client Name, sent without SHOW_PROTOCOL)
-  did not end the session, but nothing the server sends depends on it. So **a multi-chunk
-  send is not proven live either.**
+  one chunk.
+- #307 sent a chunked client message (a 2018-byte `rdpdr` Client Name, without SHOW_PROTOCOL).
+  It did not end the session, but nothing the server sends depended on it.
+
+**Measured against the WS2022 test VM (#323, 2026-09-23):**
+
+- **A multi-chunk message is received live.** Print Screen lists `8` (`CF_DIB`) and `17`
+  (`CF_DIBV5`). The `CF_DIB` response is one 4,096,060-byte message, about 2,561 chunks at the
+  server's 1600-byte chunk size (computed, not counted). It is a 1280×800 32 bpp `BI_BITFIELDS`
+  DIB and matches the framebuffer pixel for pixel. The match holds at 16 bpp: this session
+  negotiates RGB565. 1,018,462 of the 1,024,000 pixels also match at 32 bpp; the rest differ
+  only below the 5-6-5 bits.
+- **A multi-chunk message is sent live.** The host's 196,656-byte `CF_DIB` (a 256×256 24 bpp
+  gradient, 123 chunks, every chunk flagged) is pasted into Paint. Paint's copy comes back
+  pixel for pixel as a 200,712-byte message listing `49156` ("Native"), `3`
+  (`CF_METAFILEPICT`), `8` and `17`.
+- Under a 1 MiB cap the Print Screen response is dropped and reported, and the session goes
+  on. With the cap back at 64 MiB, a second Print Screen arrives whole.
 
 ## Cross-cutting invariants
 
@@ -333,11 +390,11 @@ glossary, which is vocabulary rather than a decision.
 - **Every redirection feature but the clipboard's handshake is an unopened channel**: audio
   output (#11), audio input (#12), device/drive/printer/smartcard (#13), RemoteApp
   (#14), multitouch (#15), video (#17), camera (#19), location (#20). The transport
-  exists; the consumers do not. The clipboard (#10) moves text since #322; images are #323,
-  files #324/#325.
+  exists; the consumers do not. The clipboard (#10) moves text since #322 and images since
+  #323; files are #324/#325.
 - ~~Static channel 1004 traffic is ignored by the session loop with no record of what
   it contains.~~ **Closed in #307**: 1004 is `cliprdr`, and a granted channel's messages
-  now reach the host. The remaining gaps are the multi-chunk live proofs above.
+  now reach the host. The multi-chunk live proofs it left open closed in #323.
 - DVC compressed data (drdynvc version 3) is not implemented and not offered — see the
   design-model bullet for when that changes.
 - SVC compression (`VirtualChannelCapabilitySet`'s compression flags) is not
