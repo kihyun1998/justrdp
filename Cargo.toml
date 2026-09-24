@@ -43,7 +43,7 @@ x509-cert = "0.3"
 # must pass the real-VM acceptance suite"). 0.21.3 is the first pin after the fork-bridge exit: the
 # loopback CredSSP fix (Devolutions/sspi-rs#689, merged 2026-06-17) shipped in 0.21.1, so anything
 # below that silently reintroduces the defect the bridge existed to work around.
-sspi = "=0.21.3"
+sspi = "=0.22.0"
 # Cancellation plumbing for the adapter's session loop (slice-8): `CancellationToken` lets the
 # host cancel a resize / tear the session down without racing the select loop. Adapter-only,
 # like tokio itself.
