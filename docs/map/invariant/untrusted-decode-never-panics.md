@@ -28,6 +28,8 @@ property of the whole untrusted surface.
 - [Bitmap codecs](../territory/bitmap-codecs.md) — the deepest arithmetic.
 - [EGFX graphics pipeline](../territory/egfx-graphics-pipeline.md) — surface and
   cache commands.
+- [Device redirection](../territory/device-redirection.md) — every `rdpdr` message is
+  server-supplied; `RdpdrPdu::decode` has a fuzz target and a proptest (#336).
 - [Virtual channels](../territory/virtual-channels.md) — chunk reassembly lengths.
 - [Session loop & PDU dispatch](../territory/session-loop-dispatch.md) — the
   dispatcher that hands bytes to all of the above.

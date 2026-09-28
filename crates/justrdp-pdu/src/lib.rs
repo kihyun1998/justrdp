@@ -26,6 +26,7 @@ pub mod mcs;
 pub mod nego;
 pub mod per;
 pub mod pointer;
+pub mod rdpdr;
 pub mod rfx;
 pub mod session_info;
 pub mod share;

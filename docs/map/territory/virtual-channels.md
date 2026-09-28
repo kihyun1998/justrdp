@@ -431,8 +431,10 @@ glossary, which is vocabulary rather than a decision.
   (8 bytes), and `rdpdr` Server Announce (`rDnI`, 12 bytes). Every one arrived as a single
   FIRST|LAST chunk. (#323 later received a multi-chunk message live; see below.)
 - **`rdpdr` announces only when `rdpsnd` is requested too**: 0 of 2 runs without it, 4 of 4
-  with it. The specs do not ask for it: `[MS-RDPEFS]` 1.4/1.5 and `[MS-RDPEA]` 1.4/1.5 each
-  depend only on the channel transport. **FreeRDP always requests the two together**
+  with it. ~~The specs do not ask for it~~ — they do, in a product-behaviour note: `[MS-RDPEFS]`
+  2.1 footnote 1 says the server does not use `rdpdr` unless the client advertises `RDPSND`
+  (#336). Sections 1.4/1.5 of `[MS-RDPEFS]` and `[MS-RDPEA]` name only the channel transport,
+  which is where #307 looked. **FreeRDP always requests the two together**
   (`client/common/cmdline.c`). Enabling `rdpsnd` forces device redirection on ("rdpsnd
   requires rdpdr to be registered"). Enabling `rdpdr` without `rdpsnd` adds an `rdpsnd` with
   the silent `sys:fake` backend, in place since 2012 (`e0b37aa97e`) with no rationale
@@ -573,6 +575,8 @@ glossary, which is vocabulary rather than a decision.
   `drdynvc` channel come from there.
 - [Capability exchange & activation](capability-exchange-activation.md) —
   `VirtualChannelCapabilitySet` bounds chunk size and compression.
+- [Device redirection](device-redirection.md) — the `rdpdr` helper rides the static channel
+  seam, and follows the clipboard helper's shape.
 
 ## Known holes / open
 

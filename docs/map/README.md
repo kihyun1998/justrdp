@@ -126,6 +126,7 @@ Territories: [x224-negotiation](territory/x224-negotiation.md) ·
 [pointer-cursor](territory/pointer-cursor.md) ·
 [input-scancodes](territory/input-scancodes.md) ·
 [virtual-channels](territory/virtual-channels.md) ·
+[device-redirection](territory/device-redirection.md) ·
 [wire-framing](territory/wire-framing.md) ·
 [pdu-constants](territory/pdu-constants.md) ·
 [adapter-drive-loop](territory/adapter-drive-loop.md) ·

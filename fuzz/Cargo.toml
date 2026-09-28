@@ -266,3 +266,10 @@ path = "fuzz_targets/finalization.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rdpdr"
+path = "fuzz_targets/rdpdr.rs"
+test = false
+doc = false
+bench = false
