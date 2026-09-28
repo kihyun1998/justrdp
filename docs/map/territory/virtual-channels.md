@@ -297,7 +297,11 @@ glossary, which is vocabulary rather than a decision.
   - **Releasing.** A new server list takes a new lock and releases nothing; `release` sends the
     Unlock. FreeRDP unlocks every old entry on the next list, and IronRDP expires locks after
     60 s idle or 2 h in all. Neither fits a core with no clock, and the first would break a
-    transfer in flight, so when to let go is the host's.
+    transfer in flight, so when to let go is the host's. **The host announcing its own files
+    releases nothing either** (#332): IronRDP's `initiate_file_copy` sends its Unlocks first,
+    on the ground (its PR #1375, with no measurement given) that `rdpclip.exe` then fails to
+    pull the new copy and desyncs. Against the WS2022 VM nothing breaks with the lock held;
+    the measurement is below.
   - **Cancelling.** `cancel_file_request` ends a wait. The VM does not answer an unlocked
     request for files it no longer holds (measured below), and how long to wait is the host's.
   - **The reverse direction** is the next bullet (#325).
@@ -521,13 +525,34 @@ glossary, which is vocabulary rather than a decision.
   pattern it regenerates itself.
 - The host copies other files right after serving `big.bin`'s first range. The second range
   still comes under lock 0 and is served from the first list. After the paste the server
-  sends Unlock 0, and the first list is released. 4 of 4 runs, after the adapter's flush fix.
+  sends Unlock 0, because the host announced again (#332), and the first list is released.
+  4 of 4 runs, after the adapter's flush fix.
 - Test harness, not protocol: the one run whose script did not touch
   `[Windows.Forms.Clipboard]::GetDataObject()` before pasting sent no File Contents Request at
   all; every run that touched it did. One run proves nothing, so the harness keeps the step.
 - Before the adapter flushed its writes, the transfer stopped after the 262,156-byte range
   response whenever nothing followed it; the measurements and the cause are in
   [adapter-drive-loop](adapter-drive-loop.md).
+
+**Measured against the WS2022 test VM (#332, 2026-09-28):**
+
+- **A lock this side holds on the server's files survives the host announcing its own.** The
+  host locks the server's copied files with `request_file_list` (lock 1) and fetches
+  `small.txt`, then announces `small.txt` and a 300,000-byte `big.bin` of its own with lock 1
+  still held. The server locks that announcement (Lock 0), asks for the list, and the shell
+  pastes both files byte-exact, every one of the 5 requests under lock 0; its verdict copy
+  arrives as text. `big.bin`'s first range is then still fetched under lock 1, and the host
+  releases it. A later host text announcement gets Unlock 0, which releases the host's list
+  (`FilesReleased`). 6 of 6 runs; the last step ran in 3. **Not covered:** a host text
+  announcement with the lock held (IronRDP keeps its locks across one on purpose), and a fetch
+  under lock 1 still in flight when the host announces.
+- **With lock 1 unlocked before the announcement, the late fetch comes back as a failed
+  response**, not silence, in the one run that tried it. That is what makes the fetch the
+  observation.
+- Lock 0 stays held after a paste until a later host announcement unlocks it. #325's "Unlock 0
+  after the paste" came from the host's second announcement during the paste: Lock 1 arrived
+  with it and Unlock 0 once the paste ended. With no paste in progress, the text
+  announcement's Unlock 0 came first, and the one run that caught its Lock saw id 0 again.
 
 ## Cross-cutting invariants
 
