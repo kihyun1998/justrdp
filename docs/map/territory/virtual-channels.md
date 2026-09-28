@@ -358,6 +358,23 @@ glossary, which is vocabulary rather than a decision.
 
   A request already handed to the host still owes its answer after its list is released; the
   host answers it with a failure once it has let go of the file.
+- **What the server can make wait on the host is bounded** (#331): at most
+  `MAX_PENDING_SERVER_REQUESTS` (100, the shape of `MAX_SERVER_LOCKS`) in `owed` and as many in
+  `serving`, and a request past either is answered with a failure while the session goes on
+  (ADR-0009). Neither reference bounds them: IronRDP queues without a cap, and FreeRDP answers
+  synchronously so it has no queue. The WS2022 VM sends one File Contents Request and waits for
+  its answer (#325), so only a non-conforming server reaches either bound. All of it is
+  derivation:
+  - **`serving` refuses at once**, because a File Contents Response carries its `streamId`.
+    The duplicate-`streamId` check stays a scan: the bound caps it at 100 entries per request,
+    so a flood costs O(N), not O(N²), and a map would buy nothing at that size.
+  - **`owed` refuses in order**, because a Format Data Response names nothing. A failure sent at
+    once would read as the answer to the oldest request the host still owes, and a failure
+    queued per request would grow the queue the bound exists to stop. So consecutive refusals
+    are one entry holding a count (`Owed::Refused`), and past the bound every request, the
+    helper's own file list answer included, adds to it. The queue holds at most 101 entries;
+    the refusals it counts go out when the host answers what precedes them, so one `respond`
+    can return one failure per request that flooded in.
 
   **Not covered:** time-based expiry (IronRDP's 60 s idle / 2 h, which needs a clock the core
   does not have), and directory walking and reading the files, which are the host's. A folder
@@ -389,7 +406,7 @@ glossary, which is vocabulary rather than a decision.
   `is_contained_file_name`, `FILE_NAME_MAX_UNITS`
 - `justrdp/src/cliprdr.rs` — `Clipboard`, `ClipboardOutput`, `RequestError`,
   `FileRequestError`, `Announcement`, `FileAnnounceError`, `FileRespondError`, `channel_def`,
-  `CHANNEL_OPTIONS`, `ADVERTISED_FLAGS`, `MAX_SERVER_LOCKS`
+  `CHANNEL_OPTIONS`, `ADVERTISED_FLAGS`, `MAX_SERVER_LOCKS`, `MAX_PENDING_SERVER_REQUESTS`
 - Spec sections cited inline: `[MS-RDPBCGR]` 1.3.3, 2.2.6.1.1, 3.1.5.2.1, 3.1.5.2.2;
   `[MS-RDPEDYC]` 1.7, 2.2.2.2, 2.2.3.3, 2.2.3.4, 3.2;
   `[MS-RDPEDISP]` 1.3,
