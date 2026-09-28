@@ -4008,6 +4008,491 @@ mod tests {
         .await
     }
 
+    /// Real-VM measurement for #332: the host announcing its own files while it holds a lock on
+    /// the server's files leaves the server's lock state working. PowerShell copies two files;
+    /// the host locks them with its file list request and fetches `small.txt`, then announces
+    /// files of its own with the lock still held. The shell pastes the host's files byte-exact,
+    /// the server's verdict copy arrives, and `big.bin` is still fetched under the old lock
+    /// before the host releases it.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn announcing_while_holding_a_server_lock_keeps_the_server_working_on_the_real_vm() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+        use justrdp_pdu::cliprdr::{
+            CF_UNICODETEXT, ClipboardPdu, FD_ATTRIBUTES, FD_FILESIZE, FILE_GROUP_DESCRIPTOR_W,
+            FileContentsOp, FileDescriptor, Format, decode_unicode_text,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const BIG: usize = 300_000;
+        const RANGE: u32 = 65_536;
+        const SMALL_TEXT: &str = "hello 파일";
+        const SERVER_COPIES: &str = "$d=\"$env:TEMP\\cliptest\";ni $d -it d -f|out-null;\
+            $b=[byte[]]::new(300000);for($i=0;$i -lt 300000;$i++){$b[$i]=($i*7+3)%251};\
+            [IO.File]::WriteAllBytes(\"$d\\big.bin\",$b);\
+            [IO.File]::WriteAllText(\"$d\\small.txt\",\"hello 파일\");\
+            Set-Clipboard -Path \"$d\\big.bin\",\"$d\\small.txt\"";
+        const SERVER_PASTES: &str = "Add-Type -A System.Windows.Forms;$d=\"$env:TEMP\\pasted\";\
+            ri $d -r -fo -ea 0;ni $d -it d|out-null;\
+            $f=[Windows.Forms.Clipboard]::GetDataObject().GetFormats() -join '|';\
+            (New-Object -ComObject Shell.Application).Namespace($d).Self.InvokeVerb('Paste');\
+            $t=0;while($t -lt 600 -and -not ((Test-Path \"$d\\big.bin\") -and \
+            (gi \"$d\\big.bin\").Length -eq 300000 -and (Test-Path \"$d\\small.txt\"))){sleep -m 100;$t++};\
+            sleep 1;$b=[IO.File]::ReadAllBytes(\"$d\\big.bin\");$ok=$b.Length -eq 300000;\
+            for($i=0;$ok -and $i -lt 300000;$i++){if($b[$i] -ne ($i*7+3)%251){$ok=$false}};\
+            $s=[IO.File]::ReadAllText(\"$d\\small.txt\") -ceq 'hello 파일';\
+            Set-Clipboard -Value \"pasted big=$ok small=$s n=$((gci $d).Count) f=$f\"";
+        let big: Arc<Vec<u8>> = Arc::new((0..BIG).map(|i| ((i * 7 + 3) % 251) as u8).collect());
+        let file = |name: &str, size: usize| FileDescriptor {
+            flags: FD_ATTRIBUTES | FD_FILESIZE,
+            attributes: 0x20,
+            last_write_time: 0,
+            size: Some(size as u64),
+            name: name.to_string(),
+        };
+        let host_list = vec![file("small.txt", SMALL_TEXT.len()), file("big.bin", BIG)];
+
+        /// What the session tells the driver.
+        #[derive(Debug)]
+        enum Seen {
+            ServerCopied { file_list: Option<u32> },
+            Files(Option<u32>, Vec<FileDescriptor>),
+            Range(u32, Option<Vec<u8>>),
+            ListFailed(String),
+            Verdict(String),
+            Released(u32),
+        }
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![cliprdr::channel_def()];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let channel = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "cliprdr")
+                .expect("the VM grants cliprdr")
+                .id;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(4096);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let clipboard = Arc::new(Mutex::new(Clipboard::new()));
+            let handshake_done = Arc::new(AtomicBool::new(false));
+            let host_list_id = Arc::new(Mutex::new(None::<u32>));
+            let served = Arc::new(Mutex::new(Vec::<(Option<u32>, Option<u32>)>::new()));
+            let server_locks = Arc::new(Mutex::new(Vec::<String>::new()));
+            let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel::<Seen>();
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let driver = {
+                let (frames, cancel, clipboard, handshake_done, host_list_id) = (
+                    frames.clone(),
+                    cancel.clone(),
+                    clipboard.clone(),
+                    handshake_done.clone(),
+                    host_list_id.clone(),
+                );
+                let host_list = host_list.clone();
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        let start = tokio::time::Instant::now();
+                        while !handshake_done.load(Ordering::SeqCst) {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err("the clipboard handshake never completed".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        let enter = {
+                            let key = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
+                            vec![key.press(), key.release()]
+                        };
+                        let type_line = |line: &str| {
+                            let (input_tx, enter, units) = (
+                                input_tx.clone(),
+                                enter.clone(),
+                                line.encode_utf16().collect::<Vec<_>>(),
+                            );
+                            async move {
+                                for unit in units {
+                                    input_tx
+                                        .send(vec![
+                                            InputEvent::Unicode {
+                                                code_unit: unit,
+                                                release: false,
+                                            },
+                                            InputEvent::Unicode {
+                                                code_unit: unit,
+                                                release: true,
+                                            },
+                                        ])
+                                        .await
+                                        .map_err(|_| "the session closed".to_string())?;
+                                    tokio::time::sleep(Duration::from_millis(15)).await;
+                                }
+                                input_tx
+                                    .send(enter)
+                                    .await
+                                    .map_err(|_| "the session closed".to_string())
+                            }
+                        };
+                        async fn next(
+                            seen: &mut tokio::sync::mpsc::UnboundedReceiver<Seen>,
+                            what: &str,
+                            within: Duration,
+                        ) -> Result<Seen, String> {
+                            tokio::time::timeout(within, seen.recv())
+                                .await
+                                .map_err(|_| format!("no {what} within {within:?}"))?
+                                .ok_or_else(|| "the session closed".to_string())
+                        }
+                        let send = |data: Vec<u8>| {
+                            let commands_tx = commands_tx.clone();
+                            async move {
+                                commands_tx
+                                    .send(SessionCommand::ChannelData { channel, data })
+                                    .await
+                                    .map_err(|_| "the session closed".to_string())
+                            }
+                        };
+                        let fetch =
+                            async |seen: &mut tokio::sync::mpsc::UnboundedReceiver<Seen>,
+                                   index: u32,
+                                   position: u64,
+                                   lock: Option<u32>| {
+                                let (stream_id, request) = clipboard
+                                    .lock()
+                                    .unwrap()
+                                    .request_file_contents(
+                                        index,
+                                        FileContentsOp::Range {
+                                            position,
+                                            len: RANGE,
+                                        },
+                                        lock,
+                                    )
+                                    .map_err(|e| format!("{e:?}"))?;
+                                send(request).await?;
+                                loop {
+                                    match next(seen, "file range", Duration::from_secs(60)).await? {
+                                        Seen::Range(id, data) if id == stream_id => {
+                                            break data.ok_or_else(|| {
+                                            format!(
+                                                "the server failed range {position} of file {index}"
+                                            )
+                                        });
+                                        }
+                                        Seen::ServerCopied { .. } | Seen::Verdict(_) => continue,
+                                        other => {
+                                            break Err(format!(
+                                                "expected range {stream_id}, got {other:?}"
+                                            ));
+                                        }
+                                    }
+                                }
+                            };
+
+                        vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        type_line(SERVER_COPIES).await?;
+
+                        // The server announces the files, twice; lock and ask on the first.
+                        loop {
+                            match next(&mut seen, "server files", Duration::from_secs(60)).await? {
+                                Seen::ServerCopied { file_list: Some(_) } => break,
+                                _ => continue,
+                            }
+                        }
+                        let request = clipboard
+                            .lock()
+                            .unwrap()
+                            .request_file_list()
+                            .map_err(|e| format!("{e:?}"))?;
+                        for message in request.messages {
+                            send(message).await?;
+                        }
+                        let (lock, files) = loop {
+                            match next(&mut seen, "file list", Duration::from_secs(60)).await? {
+                                Seen::Files(id, files) => break (id, files),
+                                Seen::ServerCopied { .. } => continue,
+                                Seen::ListFailed(why) => {
+                                    return Err(format!("the file list failed: {why}"));
+                                }
+                                other => {
+                                    return Err(format!("expected the file list, got {other:?}"));
+                                }
+                            }
+                        };
+                        let lock = lock.ok_or("the VM can lock, so the list is locked")?;
+                        let at = |name: &str| {
+                            files
+                                .iter()
+                                .position(|f| f.name == name)
+                                .map(|i| i as u32)
+                                .ok_or(format!("no {name}"))
+                        };
+                        let (small_at, big_at) = (at("small.txt")?, at("big.bin")?);
+                        let small = fetch(&mut seen, small_at, 0, Some(lock)).await?;
+                        while let Ok(Some(_)) =
+                            tokio::time::timeout(Duration::from_millis(1500), seen.recv()).await
+                        {
+                        }
+
+                        // The host copies its own files with the server's still locked.
+                        let offer = clipboard
+                            .lock()
+                            .unwrap()
+                            .announce_files(host_list, Vec::new())
+                            .map_err(|e| format!("{e:?}"))?;
+                        *host_list_id.lock().unwrap() = offer.list_id;
+                        send(offer.message.ok_or("the handshake is done")?).await?;
+                        type_line(SERVER_PASTES).await?;
+                        let verdict = loop {
+                            match next(&mut seen, "paste verdict", Duration::from_secs(150)).await?
+                            {
+                                Seen::Verdict(text) => break text,
+                                _ => continue,
+                            }
+                        };
+
+                        // The server's files are still fetched under the lock held throughout.
+                        let late = fetch(&mut seen, big_at, 0, Some(lock)).await;
+                        let unlock = clipboard
+                            .lock()
+                            .unwrap()
+                            .release(lock)
+                            .ok_or("the lock is held")?;
+                        send(unlock).await?;
+
+                        // The server's own lock cycle still turns: a later host copy unlocks the
+                        // host's files.
+                        let text = clipboard.lock().unwrap().announce(vec![Format {
+                            id: CF_UNICODETEXT,
+                            name: String::new(),
+                        }]);
+                        send(text.message.ok_or("the handshake is done")?).await?;
+                        let released = loop {
+                            match next(
+                                &mut seen,
+                                "the host's files released",
+                                Duration::from_secs(30),
+                            )
+                            .await?
+                            {
+                                Seen::Released(list_id) => break list_id,
+                                _ => continue,
+                            }
+                        };
+                        Ok((small, verdict, late, released))
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let frames_in_sink = frames.clone();
+            let (served_in, server_locks_in) = (served.clone(), server_locks.clone());
+            let ended = tokio::time::timeout(
+                Duration::from_secs(360),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        let SessionEvent::ChannelData { channel: on, data } = event else {
+                            return;
+                        };
+                        assert_eq!(on, channel, "only cliprdr was requested");
+                        let mut clipboard = clipboard.lock().unwrap();
+                        let raw = ClipboardPdu::decode(&data, true);
+                        match &raw {
+                            Ok(ClipboardPdu::FileContentsRequest(_))
+                            | Ok(ClipboardPdu::FileContentsResponse { .. }) => {}
+                            Ok(
+                                pdu @ (ClipboardPdu::LockClipData { .. }
+                                | ClipboardPdu::UnlockClipData { .. }),
+                            ) => server_locks_in.lock().unwrap().push(format!("{pdu:?}")),
+                            other => eprintln!("server: {other:?}"),
+                        }
+                        let served_before = served_in.lock().unwrap().len();
+                        let outputs = clipboard
+                            .process(&data)
+                            .expect("the VM's clipboard message decodes");
+                        let send = |data: Vec<u8>| {
+                            commands_tx
+                                .try_send(SessionCommand::ChannelData { channel, data })
+                                .expect("the command queue has room")
+                        };
+                        for output in outputs {
+                            match output {
+                                ClipboardOutput::Send(data) => send(data),
+                                ClipboardOutput::FormatListResponse { ok } => {
+                                    assert!(ok, "the server accepts the host's Format List");
+                                    handshake_done.store(true, Ordering::SeqCst);
+                                }
+                                ClipboardOutput::RemoteFormatList(formats) => {
+                                    eprintln!("server formats: {formats:?}");
+                                    let file_list = formats
+                                        .iter()
+                                        .find(|f| f.name == FILE_GROUP_DESCRIPTOR_W)
+                                        .map(|f| f.id);
+                                    // The server announces a copy twice; one request is enough.
+                                    if formats.iter().any(|f| f.id == CF_UNICODETEXT)
+                                        && let Ok(request) = clipboard.request(CF_UNICODETEXT)
+                                    {
+                                        send(request);
+                                    }
+                                    let _ = seen_tx.send(Seen::ServerCopied { file_list });
+                                }
+                                ClipboardOutput::FormatData { data, .. } => {
+                                    let text = decode_unicode_text(&data.unwrap_or_default());
+                                    eprintln!("server text: {text:?}");
+                                    if text.starts_with("pasted") {
+                                        let _ = seen_tx.send(Seen::Verdict(text));
+                                    }
+                                }
+                                ClipboardOutput::FileList {
+                                    clip_data_id,
+                                    files,
+                                } => {
+                                    eprintln!("file list under {clip_data_id:?}: {files:?}");
+                                    let _ = seen_tx.send(Seen::Files(clip_data_id, files));
+                                }
+                                ClipboardOutput::FileListFailed { error } => {
+                                    let _ = seen_tx.send(Seen::ListFailed(format!("{error:?}")));
+                                }
+                                ClipboardOutput::FileRange { stream_id, data } => {
+                                    let _ = seen_tx.send(Seen::Range(stream_id, data));
+                                }
+                                ClipboardOutput::FileContentsRequested {
+                                    stream_id,
+                                    list_id,
+                                    index,
+                                    op,
+                                } => {
+                                    let clip_data_id = match &raw {
+                                        Ok(ClipboardPdu::FileContentsRequest(r)) => r.clip_data_id,
+                                        _ => None,
+                                    };
+                                    served_in
+                                        .lock()
+                                        .unwrap()
+                                        .push((clip_data_id, Some(list_id)));
+                                    let bytes: &[u8] = if index == 0 {
+                                        SMALL_TEXT.as_bytes()
+                                    } else {
+                                        &big
+                                    };
+                                    let answer = match op {
+                                        FileContentsOp::Size => clipboard
+                                            .respond_file_size(stream_id, Some(bytes.len() as u64)),
+                                        FileContentsOp::Range { position, len } => {
+                                            let from = (position as usize).min(bytes.len());
+                                            let to = (from + len as usize).min(bytes.len());
+                                            clipboard.respond_file_range(
+                                                stream_id,
+                                                Some(&bytes[from..to]),
+                                            )
+                                        }
+                                    };
+                                    send(answer.expect("the request waits for this answer"));
+                                }
+                                ClipboardOutput::FilesReleased { list_id } => {
+                                    let _ = seen_tx.send(Seen::Released(list_id));
+                                }
+                                other => panic!("nothing else was asked for: {other:?}"),
+                            }
+                        }
+                        // A request the helper refused never reached the host.
+                        if let Ok(ClipboardPdu::FileContentsRequest(r)) = &raw
+                            && served_in.lock().unwrap().len() == served_before
+                        {
+                            eprintln!("refused: {r:?}");
+                            served_in.lock().unwrap().push((r.clip_data_id, None));
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+            ended
+                .expect("the session ended within 360 s")
+                .expect("the session ran without a protocol failure");
+            for lock in server_locks.lock().unwrap().iter() {
+                eprintln!("server lock: {lock}");
+            }
+            let served = served.lock().unwrap().clone();
+            eprintln!("served {} requests: {served:?}", served.len());
+            let (small, verdict, late, released) = driven.expect("the desktop was driven");
+
+            assert_eq!(
+                small,
+                SMALL_TEXT.as_bytes(),
+                "small.txt arrives before the host copies"
+            );
+            assert!(
+                verdict.starts_with("pasted big=True small=True n=2 f=FileGroupDescriptorW"),
+                "the server pastes the host's files with the host's lock held: {verdict}"
+            );
+            let host = host_list_id
+                .lock()
+                .unwrap()
+                .expect("the host announced files");
+            assert!(
+                served
+                    .iter()
+                    .all(|&(lock, list)| lock.is_some() && list == Some(host)),
+                "the server locks the host's files and every request is served: {served:?}"
+            );
+            let late = late.expect("the server's files are fetched under the lock held throughout");
+            assert!(
+                late == big[..RANGE as usize],
+                "big.bin's first range arrives byte-exact"
+            );
+            assert_eq!(
+                released, host,
+                "the server's unlock after a later host copy releases the host's files"
+            );
+            let locks = server_locks.lock().unwrap().clone();
+            assert!(
+                locks.contains(&"UnlockClipData { clip_data_id: 0 }".to_string()),
+                "the server still unlocks the host's files: {locks:?}"
+            );
+        })
+        .await
+    }
+
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn save_session_info_reaches_the_host_against_real_vm() {
