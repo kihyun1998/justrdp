@@ -32,6 +32,10 @@ pub const ADVERTISED_FLAGS: u32 = CB_USE_LONG_FORMAT_NAMES
 /// The most server locks kept at once; a Lock Clipboard Data past it is not kept.
 pub const MAX_SERVER_LOCKS: usize = 100;
 
+/// The most Format Data Requests and File Contents Requests each kept waiting for the host; a
+/// request past it is answered with a failure.
+pub const MAX_PENDING_SERVER_REQUESTS: usize = 100;
+
 /// The ID this side gives `FileGroupDescriptorW`, or the next one the host's formats leave free.
 const LOCAL_FILE_LIST_FORMAT: u32 = 0xC0FE;
 
@@ -212,9 +216,10 @@ pub enum FileAnnounceError {
 enum Owed {
     /// The host answers it.
     Host,
-    /// An answer the helper made, sent once every answer before it has gone out: the data,
-    /// or `None` for a failure.
-    Ready(Option<Arc<[u8]>>),
+    /// Data the helper answered with, sent once every answer before it has gone out.
+    Ready(Arc<[u8]>),
+    /// This many failures in a row, sent once every answer before them has gone out.
+    Refused(usize),
 }
 
 /// Files the host announced.
@@ -436,9 +441,15 @@ impl Clipboard {
             return Vec::new();
         }
         let mut out = vec![pdu::encode_format_data_response(data)];
-        while let Some(Owed::Ready(_)) = self.owed.front() {
-            if let Some(Owed::Ready(answer)) = self.owed.pop_front() {
-                out.push(pdu::encode_format_data_response(answer.as_deref()));
+        while self.owed.front().is_some_and(|owed| *owed != Owed::Host) {
+            match self.owed.pop_front() {
+                Some(Owed::Ready(answer)) => {
+                    out.push(pdu::encode_format_data_response(Some(&answer)))
+                }
+                Some(Owed::Refused(count)) => out.extend(
+                    core::iter::repeat_with(|| pdu::encode_format_data_response(None)).take(count),
+                ),
+                _ => {}
             }
         }
         out
@@ -560,6 +571,9 @@ impl Clipboard {
         if self.local_list_refused {
             return refuse_file_contents(request.stream_id, "Format List refused");
         }
+        if self.serving.len() >= MAX_PENDING_SERVER_REQUESTS {
+            return refuse_file_contents(request.stream_id, "too many waiting");
+        }
         if self.serving.iter().any(|(id, _)| *id == request.stream_id) {
             return refuse_file_contents(request.stream_id, "streamId already waiting");
         }
@@ -628,19 +642,46 @@ impl Clipboard {
 
     /// Answer a server request with a failure, after every answer still owed before it.
     fn refuse_request(&mut self) -> Vec<ClipboardOutput> {
-        self.answer_request(None)
+        match self.owed.back_mut() {
+            None => vec![ClipboardOutput::Send(pdu::encode_format_data_response(
+                None,
+            ))],
+            Some(Owed::Refused(count)) => {
+                *count = count.saturating_add(1);
+                Vec::new()
+            }
+            Some(_) => {
+                self.owed.push_back(Owed::Refused(1));
+                Vec::new()
+            }
+        }
     }
 
-    /// Answer a server request with `answer`, after every answer still owed before it.
+    /// Answer a server request with `answer`, after every answer still owed before it, or with
+    /// a failure when `MAX_PENDING_SERVER_REQUESTS` are owed.
     fn answer_request(&mut self, answer: Option<Arc<[u8]>>) -> Vec<ClipboardOutput> {
+        let Some(answer) = answer else {
+            return self.refuse_request();
+        };
         if self.owed.is_empty() {
             vec![ClipboardOutput::Send(pdu::encode_format_data_response(
-                answer.as_deref(),
+                Some(&answer),
             ))]
+        } else if self.owed_full() {
+            self.refuse_request()
         } else {
             self.owed.push_back(Owed::Ready(answer));
             Vec::new()
         }
+    }
+
+    /// Whether `MAX_PENDING_SERVER_REQUESTS` answers are owed, so the request in hand is refused.
+    fn owed_full(&self) -> bool {
+        if self.owed.len() >= MAX_PENDING_SERVER_REQUESTS {
+            tracing::warn!(target: "rdp_cliprdr", "Format Data Request refused: too many waiting");
+            return true;
+        }
+        false
     }
 
     /// Handle a message that does not decode, by the type its header names.
@@ -771,6 +812,9 @@ impl Clipboard {
                         .and_then(|id| self.announced.iter().find(|list| list.id == id))
                         .map(|list| list.encoded.clone());
                     return Ok(self.answer_request(list));
+                }
+                if self.owed_full() {
+                    return Ok(self.refuse_request());
                 }
                 self.owed.push_back(Owed::Host);
                 Ok(vec![ClipboardOutput::DataRequested { format_id }])
@@ -1237,6 +1281,44 @@ mod tests {
                 pdu::encode_format_data_response(None)
             ]
         );
+    }
+
+    /// A server asking faster than the host answers is refused past the bound, and the owed
+    /// queue stays bounded however long it keeps asking; the refusals go out in order.
+    #[test]
+    fn server_requests_past_the_bound_are_refused_in_order() {
+        let mut clipboard = ready();
+        clipboard.announce(vec![unicode_text()]);
+        for _ in 0..MAX_PENDING_SERVER_REQUESTS {
+            assert_eq!(
+                clipboard.process(&data_request(CF_UNICODETEXT)).unwrap(),
+                vec![ClipboardOutput::DataRequested {
+                    format_id: CF_UNICODETEXT
+                }]
+            );
+        }
+        let flood = 3 * MAX_PENDING_SERVER_REQUESTS;
+        for _ in 0..flood {
+            assert!(
+                clipboard
+                    .process(&data_request(CF_UNICODETEXT))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(clipboard.owed.len() <= MAX_PENDING_SERVER_REQUESTS + 1);
+        for _ in 1..MAX_PENDING_SERVER_REQUESTS {
+            assert_eq!(clipboard.respond(Some(b"t")).len(), 1);
+        }
+        let last = clipboard.respond(Some(b"t"));
+        assert_eq!(last.len(), 1 + flood);
+        assert_eq!(last[0], pdu::encode_format_data_response(Some(b"t")));
+        assert!(
+            last[1..]
+                .iter()
+                .all(|r| *r == pdu::encode_format_data_response(None))
+        );
+        assert!(clipboard.owed.is_empty());
     }
 
     /// A request whose body does not decode is still answered, with a failure.
@@ -1747,6 +1829,35 @@ mod tests {
         );
     }
 
+    /// The helper's own file list answer counts toward the bound too: past it, a request for
+    /// the list is refused instead of queued.
+    #[test]
+    fn the_file_list_answer_past_the_bound_is_refused() {
+        let mut clipboard = ready();
+        let offer = clipboard
+            .announce_files(host_files(), vec![unicode_text()])
+            .unwrap();
+        let file_list_format = file_list_format_in(&offer);
+        for _ in 0..MAX_PENDING_SERVER_REQUESTS {
+            clipboard.process(&data_request(CF_UNICODETEXT)).unwrap();
+        }
+        for _ in 0..2 {
+            clipboard.process(&data_request(file_list_format)).unwrap();
+        }
+        assert_eq!(clipboard.owed.len(), MAX_PENDING_SERVER_REQUESTS + 1);
+        for _ in 1..MAX_PENDING_SERVER_REQUESTS {
+            clipboard.respond(Some(b"t"));
+        }
+        assert_eq!(
+            clipboard.respond(Some(b"t")),
+            vec![
+                pdu::encode_format_data_response(Some(b"t")),
+                pdu::encode_format_data_response(None),
+                pdu::encode_format_data_response(None),
+            ]
+        );
+    }
+
     fn server_asks(stream_id: u32, index: u32, op: FileContentsOp, lock: Option<u32>) -> Vec<u8> {
         pdu::encode_file_contents_request(&FileContentsRequest {
             stream_id,
@@ -1960,6 +2071,35 @@ mod tests {
             ))]
         );
         assert!(clipboard.respond_file_size(5, Some(12)).is_ok());
+    }
+
+    /// File Contents Requests the host has not answered are bounded; one past the bound is
+    /// refused at once, and answering one makes room again.
+    #[test]
+    fn file_requests_past_the_bound_are_refused() {
+        let mut clipboard = ready();
+        clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        let bound = MAX_PENDING_SERVER_REQUESTS as u32;
+        for stream_id in 1..=bound {
+            let outputs = clipboard
+                .process(&server_asks(stream_id, 0, FileContentsOp::Size, None))
+                .unwrap();
+            assert!(asked_list(&outputs).is_some());
+        }
+        assert_eq!(
+            clipboard
+                .process(&server_asks(bound + 1, 0, FileContentsOp::Size, None))
+                .unwrap(),
+            vec![ClipboardOutput::Send(pdu::encode_file_contents_response(
+                bound + 1,
+                None
+            ))]
+        );
+        assert!(clipboard.respond_file_size(1, Some(12)).is_ok());
+        let outputs = clipboard
+            .process(&server_asks(bound + 2, 0, FileContentsOp::Size, None))
+            .unwrap();
+        assert!(asked_list(&outputs).is_some());
     }
 
     #[test]
