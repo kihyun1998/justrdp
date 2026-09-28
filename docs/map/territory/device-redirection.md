@@ -8,8 +8,8 @@ holds the PDUs and `justrdp::rdpdr::DeviceRedirection` is a sans-IO helper the h
 as `cliprdr::Clipboard` is: the host feeds it each message received on the channel and sends
 what it returns. Only drives are redirected (#13); printers, smartcards, serial ports and USB
 are not. The helper completes the initialization sequence and announces the host's drives
-(#336), and the server can open, describe and list a drive's folders (#337); reading,
-writing and adding or removing drives are #338-#340.
+(#336), the server can open, describe and list a drive's folders (#337) and read its files
+(#338); writing and adding or removing drives are #339-#340.
 
 ## Governing decisions
 
@@ -64,8 +64,9 @@ writing and adding or removing drives are #338-#340.
   drives with one `device_id`.
 - **The host answers facts; the helper speaks the wire.** A Create reaches the host as
   `DriveRequest::Open`, Query Volume Information as `QueryVolume`, Query Information as
-  `QueryInformation`, and a first Query Directory as `ListDirectory`. The host answers with
-  `respond_open`, `respond_volume`, `respond_information` or `respond_listing`, by
+  `QueryInformation`, a first Query Directory as `ListDirectory`, and a Read as `Read`. The
+  host answers with `respond_open`, `respond_volume`, `respond_information`,
+  `respond_listing` or `respond_read`, by
   `CompletionId` and in any order, with typed values (`Opened`, `VolumeInformation`,
   `FileInformation`, `DirectoryEntry`) or an NTSTATUS; the helper encodes the `[MS-FSCC]`
   structures. An answer of the wrong kind, or for no waiting request, is refused
@@ -95,16 +96,31 @@ writing and adding or removing drives are #338-#340.
   is server-sized, and filling from every reachable position made a 400,000-character one
   take 10.5 s against 0.33 s. A Query Directory on a file is `STATUS_NOT_A_DIRECTORY`; a
   change notification is `STATUS_NOT_SUPPORTED`, as FreeRDP answers it.
+- **A Read hands the host an offset and the most bytes to read**, and the host answers with
+  the bytes: fewer at the file's end, or an NTSTATUS such as `STATUS_END_OF_FILE` at or past
+  it, which `[MS-FSA]` 2.1.5.3 gives. **An answer longer than the read asked for is refused**
+  (`RespondError::TooLong`) and the read keeps waiting, so the server never receives more
+  than it asked for. What 2.1.5.3 decides before a file's data is reached the helper answers
+  itself: a `Length` of zero is `STATUS_SUCCESS` with nothing read, and an `Offset` plus
+  `Length` past `0x7FFFFFFFFFFFFFFF`, a 64-bit overflow included, is
+  `STATUS_INVALID_PARAMETER`. A Read of a directory is `STATUS_INVALID_DEVICE_REQUEST`, as
+  Wine maps `EISDIR`; one of a file not open is `STATUS_UNSUCCESSFUL`. The request decodes
+  from its first 12 bytes, since 2.2.1.4.3's 20 bytes of `Padding` MUST be ignored, as
+  FreeRDP reads it. **The server's `Length` is not capped here**: the helper holds only what
+  the host answers, so how much to read at once is the host's; IronRDP's Windows backend
+  refuses above 1 MiB with `STATUS_INVALID_PARAMETER`, and FreeRDP trims it to what is left
+  of the file.
 - **Only the classes the server was measured to use are implemented**: Query Volume
   Information `FileFsVolumeInformation` (1), `FileFsAttributeInformation` (5) and
-  `FileFsFullSizeInformation` (7); Query Information `FileBasicInformation` (4) and
-  `FileStandardInformation` (5); Query Directory `FileFullDirectoryInformation` (2) and
+  `FileFsFullSizeInformation` (7); Query Information `FileBasicInformation` (4),
+  `FileStandardInformation` (5) and, since a copy asks it after its first Read (#338),
+  `FileAttributeTagInformation` (0x23), whose `ReparseTag` is zero, as FreeRDP sends; Query
+  Directory `FileFullDirectoryInformation` (2) and
   `FileBothDirectoryInformation` (3). Any other class is `STATUS_NOT_SUPPORTED` without the
   host, among them the ones FreeRDP also implements: `FileFsSizeInformation` (3),
-  `FileFsDeviceInformation` (4), `FileAttributeTagInformation` (0x23),
-  `FileDirectoryInformation` (1) and `FileNamesInformation` (0xC). The `Reserved` fields
+  `FileFsDeviceInformation` (4), `FileDirectoryInformation` (1) and `FileNamesInformation` (0xC). The `Reserved` fields
   2.2.3.3.6, 2.2.3.3.8 and 2.2.3.3.10 exclude are left out: Volume has 17 bytes before its
-  label, Basic is 36 bytes, Standard 22, and a Both entry's name starts at 93.
+  label, Basic is 36 bytes, Standard 22, Attribute Tag 8, and a Both entry's name starts at 93.
 - **What waits is bounded**: at most `MAX_PENDING_REQUESTS` (100, #331's shape) requests
   wait for the host, and one past it is `STATUS_INSUFFICIENT_RESOURCES`; a `CompletionId`
   already waiting is `STATUS_UNSUCCESSFUL`. At most `MAX_OPEN_FILES` (1024) files are open,
@@ -132,7 +148,7 @@ writing and adding or removing drives are #338-#340.
 ## Code
 
 - `justrdp-pdu/src/rdpdr.rs` — `RdpdrPdu`, `CapabilitySet`, `GeneralCapability`,
-  `IoRequest`, `IoBody`, `CreateRequest`, `DeviceAnnounce`, `FileInformation`,
+  `IoRequest`, `IoBody` (`Read` among its bodies), `CreateRequest`, `DeviceAnnounce`, `FileInformation`,
   `VolumeInformation`, `encode_client_announce_reply`, `encode_client_name`,
   `encode_client_capabilities`, `encode_device_list_announce`, `encode_io_completion`,
   `encode_file_information`, `encode_volume_information`, `encode_directory_entry`,
@@ -143,10 +159,10 @@ writing and adding or removing drives are #338-#340.
   `matches_pattern`
 - `fuzz/fuzz_targets/rdpdr.rs` — `RdpdrPdu`
 - `justrdp-tokio/src/lib.rs` — `the_device_redirection_handshake_accepts_a_drive_on_the_real_vm`,
-  `the_server_lists_a_host_drive_on_the_real_vm`
+  `the_server_lists_and_reads_a_host_drive_on_the_real_vm`
 - Spec sections cited inline: `[MS-RDPEFS]` 1.3.1, 1.7, 2.1, 2.2.1.3, 2.2.1.4, 2.2.1.5.1-5,
-  2.2.2.3, 2.2.2.7.1, 2.2.3.1, 2.2.3.3.6, 2.2.3.3.8, 2.2.3.3.10, 2.2.3.4, 3.1.5.2, 3.2.5.1.2,
-  3.2.5.1.3, 3.2.5.1.6, 3.2.5.1.8, 3.2.5.1.9, 3.2.5.2.3, 3.2.5.2.5; `[MS-FSA]` 2.1.4.4
+  2.2.1.4.3, 2.2.1.5.3, 2.2.2.3, 2.2.2.7.1, 2.2.3.1, 2.2.3.3.6, 2.2.3.3.8, 2.2.3.3.10, 2.2.3.4, 3.1.5.2, 3.2.5.1.2,
+  3.2.5.1.3, 3.2.5.1.6, 3.2.5.1.8, 3.2.5.1.9, 3.2.5.2.3, 3.2.5.2.5; `[MS-FSA]` 2.1.4.4, 2.1.5.3
 
 ## Reference behaviour
 
@@ -184,6 +200,23 @@ writing and adding or removing drives are #338-#340.
   84 requests per run, 3 of 3 runs alike.
 - No `.` or `..` entry is needed: the host lists neither and both listings are complete.
 
+**Measured against the WS2022 test VM (#338, 2026-09-29):**
+
+- `Copy-Item` of `hello.txt` (12 bytes of UTF-8) and `big.bin` (300,000 bytes, byte `i` is
+  `i % 251`) lands on the server byte-exact, checked there, 2 of 2 runs alike.
+- **The server's Read sizes**: `hello.txt` is read at offset 0 as 4096, 4096, then 12, its
+  size; `big.bin` as 32,768 at 0, 32,768 at 270,336 (the 32 KiB-aligned block holding its
+  end), 32,768 at 32,768, then 131,072 at 0, 131,072 and 262,144. No read exceeded
+  131,072 bytes.
+- **Reads were sequential**: every IRP of the run carried `CompletionId` 0 or 1, so no two
+  waited at once, as `ENABLE_ASYNCIO` left clear implies.
+- After its first Read of a file, the copy asks Query Information `FileAttributeTagInformation`
+  (0x23). Answered `STATUS_NOT_SUPPORTED`, the copy failed with "I/O device error" and the
+  server sent nothing more for the file; answered, it goes on.
+- **A Read response over one chunk was lost while chunks carried `CHANNEL_FLAG_SHOW_PROTOCOL`**
+  ("the device is not connected", no IRP after it); see
+  [Virtual channels](virtual-channels.md) for the rule that replaced it.
+
 ## Cross-cutting invariants
 
 - [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
@@ -203,6 +236,6 @@ writing and adding or removing drives are #338-#340.
 
 ## Known holes / open
 
-- IRPs: reading (#338), writing (#339) and adding or removing drives during a session
-  (#340). Until then a file can be opened and described but not read.
+- IRPs: writing (#339) and adding or removing drives during a session (#340). Until then a
+  file can be read but not written.
 - Printer, smartcard, serial and USB redirection are outside #13.

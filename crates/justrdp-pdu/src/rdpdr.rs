@@ -118,6 +118,8 @@ pub const FILE_BOTH_DIRECTORY_INFORMATION: u32 = 3;
 pub const FILE_BASIC_INFORMATION: u32 = 4;
 /// `FileStandardInformation` (`[MS-FSCC]` 2.4.47).
 pub const FILE_STANDARD_INFORMATION: u32 = 5;
+/// `FileAttributeTagInformation` (`[MS-FSCC]` 2.4.6).
+pub const FILE_ATTRIBUTE_TAG_INFORMATION: u32 = 0x23;
 /// `FileFsVolumeInformation` (`[MS-FSCC]` 2.5.9).
 pub const FILE_FS_VOLUME_INFORMATION: u32 = 1;
 /// `FileFsAttributeInformation` (`[MS-FSCC]` 2.5.1).
@@ -137,6 +139,8 @@ pub const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
 pub const STATUS_NO_SUCH_FILE: u32 = 0xC000_000F;
 /// `STATUS_INVALID_PARAMETER`.
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// `STATUS_INVALID_DEVICE_REQUEST`.
+pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
 /// `STATUS_ACCESS_DENIED`.
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 /// `STATUS_OBJECT_NAME_INVALID`.
@@ -211,6 +215,13 @@ pub struct IoRequest {
 pub enum IoBody {
     /// Device Create Request (2.2.1.4.1).
     Create(CreateRequest),
+    /// Device Read Request (2.2.1.4.3).
+    Read {
+        /// `Length`: the most bytes to read.
+        length: u32,
+        /// `Offset`: where in the file to read from.
+        offset: u64,
+    },
     /// Query Volume Information Request (2.2.3.3.6).
     QueryVolumeInformation {
         /// `FsInformationClass`.
@@ -414,6 +425,12 @@ fn decode_io_body(major: u32, minor: u32, body: &[u8]) -> Result<IoBody, DecodeE
                 create_options,
                 path,
             }))
+        }
+        (IRP_MJ_READ, _) => {
+            let mut cur = ReadCursor::new(body, "DR_READ_REQ");
+            let length = cur.read_u32_le()?;
+            let offset = u64::from(cur.read_u32_le()?) | u64::from(cur.read_u32_le()?) << 32;
+            Ok(IoBody::Read { length, offset })
         }
         (IRP_MJ_QUERY_VOLUME_INFORMATION, _) => Ok(IoBody::QueryVolumeInformation {
             class: ReadCursor::new(body, "DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ").read_u32_le()?,
@@ -687,6 +704,10 @@ pub fn encode_file_information(class: u32, file: &FileInformation) -> Option<Vec
             out.extend_from_slice(&1u32.to_le_bytes());
             out.push(0);
             out.push(u8::from(file.is_directory()));
+        }
+        FILE_ATTRIBUTE_TAG_INFORMATION => {
+            out.extend_from_slice(&file.attributes.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
         }
         _ => return None,
     }
@@ -1057,6 +1078,37 @@ mod tests {
         );
     }
 
+    /// 2.2.1.4.3: `Length`, then `Offset`, then 20 bytes of `Padding` that MUST be ignored, so
+    /// a body without it still decodes.
+    #[test]
+    fn a_read_request_body_decodes() {
+        let read = |padding: usize| {
+            let mut m = io_header(IRP_MJ_READ, 0);
+            m.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+            m.extend_from_slice(&0x1_0000_0002u64.to_le_bytes());
+            m.extend_from_slice(&vec![0xAA; padding]);
+            RdpdrPdu::decode(&m)
+        };
+        for padding in [20, 0] {
+            let Ok(RdpdrPdu::IoRequest(request)) = read(padding) else {
+                panic!("the request decodes");
+            };
+            assert_eq!(
+                request.body,
+                Ok(IoBody::Read {
+                    length: 0x0001_0000,
+                    offset: 0x1_0000_0002,
+                })
+            );
+        }
+        let mut short = io_header(IRP_MJ_READ, 0);
+        short.extend_from_slice(&[0; 11]);
+        let Ok(RdpdrPdu::IoRequest(request)) = RdpdrPdu::decode(&short) else {
+            panic!("the header decodes");
+        };
+        assert!(request.body.is_err());
+    }
+
     /// 2.2.3.3.10: `PathLength` sits unaligned after the one-byte `InitialQuery`, and the path
     /// of a later query is ignored.
     #[test]
@@ -1131,7 +1183,11 @@ mod tests {
         assert_eq!(&standard[0..8], &8u64.to_le_bytes());
         assert_eq!(&standard[8..16], &5u64.to_le_bytes());
         assert_eq!(standard[21], 1, "Directory");
-        assert_eq!(encode_file_information(0x23, &file), None);
+        let tag = encode_file_information(0x23, &file).unwrap();
+        let mut expected = FILE_ATTRIBUTE_DIRECTORY.to_le_bytes().to_vec();
+        expected.extend_from_slice(&[0; 4]);
+        assert_eq!(tag, expected, "FileAttributes, then no ReparseTag");
+        assert_eq!(encode_file_information(0x22, &file), None);
     }
 
     /// `FileFsVolumeInformation` has 17 bytes before its label, which counts its NUL.
