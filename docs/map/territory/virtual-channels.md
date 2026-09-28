@@ -300,8 +300,7 @@ glossary, which is vocabulary rather than a decision.
     transfer in flight, so when to let go is the host's.
   - **Cancelling.** `cancel_file_request` ends a wait. The VM does not answer an unlocked
     request for files it no longer holds (measured below), and how long to wait is the host's.
-  - **The reverse direction.** A server File Contents Request is answered with a failure until
-    #325, since this side announces no files.
+  - **The reverse direction** is the next bullet (#325).
 
   All of this is derivation, and it falls to a better one. **The name rule is not:** a
   descriptor name that is empty, holds a `:`, or has an empty, `.` or `..` component, which
@@ -312,6 +311,62 @@ glossary, which is vocabulary rather than a decision.
   and renames a rejected one `unnamed_file`), and passing names raw with a checker for the host.
   **Not covered by that call:** Windows device names (`CON`, `NUL`), trailing dots and spaces,
   and look-alike separators. Those stay the host's, as they do in IronRDP.
+- **Files the host copied are served from lists the helper holds, and each server lock pins
+  one** (#325). **The helper holding the host's file list was the maintainer's call
+  (2026-09-28)**, confirmed with the reading. The alternative shown was a thinner helper that
+  routes lock ids and passes every request to the host, which would then answer the file list
+  request itself and keep the `owed` order itself. The rest is derivation, and it falls to a
+  better one:
+  - **Announcing.** `announce_files(files, formats)` adds `FileGroupDescriptorW` (ID `0xC0FE`,
+    or the next one the host's formats leave free) and returns an `Announcement` whose
+    `list_id` the server's requests for those files arrive under. It needs the Monitor Ready
+    and `CB_STREAM_FILECLIP_ENABLED` on both sides, and refuses a name that fails the name rule
+    above, holds a NUL, or is longer than the 259 units a descriptor holds, which
+    `encode_file_list` would otherwise cut. IronRDP skips such a file and announces the rest.
+    Without `CB_HUGE_FILE_SUPPORT_ENABLED` on both sides it also refuses a file over
+    4,294,967,295 bytes, which 2.2.2.1.1.1 says cannot be exchanged (`TooLarge`).
+    `announce` now returns an `Announcement` too, because a plain copy can release a file list.
+  - **The file list request is answered by the helper, in `owed` order.** A Format Data
+    Response names no format, so the list waits behind any answer the host still owes, like a
+    refusal does. IronRDP answers it inline, ahead of the queue. The list is encoded once, when
+    it is announced, and every queued answer shares it, so a server cannot grow the queue by a
+    list's size per request.
+  - **Server locks.** Lock N pins the host's current list, and nothing when there is none
+    (3.1.5.3.2). Unlock N releases the pin; an unknown N is ignored (3.1.5.3.4). A second
+    Lock N moves the pin to the list current then. At most `MAX_SERVER_LOCKS` (100, IronRDP's
+    bound) are kept; a lock past it is logged and not kept, so its requests fail. FreeRDP keys
+    its local streams by the latest lock id; IronRDP copies the list on Lock, as here.
+  - **Serving.** A request with a `clipDataId` is served from the list that lock pins, and one
+    without from the current list. A valid one reaches the host as `FileContentsRequested
+    { stream_id, list_id, index, op }`, answered with `respond_file_size` or
+    `respond_file_range`, paired by `streamId` and in any order. The helper refuses an answer
+    of the wrong kind, a range longer than asked, and a `streamId` nothing waits on.
+  - **Refused without reaching the host, with a failed response, and the session goes on**
+    (ADR-0009): an unknown lock, an index past the list, a `streamId` the host still owes an
+    answer to, and every request while the server has refused this side's latest Format List,
+    which 3.1.5.4.7 makes a MUST; IronRDP drops its file list on that refusal. IronRDP falls
+    back to the current list for an unknown lock, which 3.1.5.4.6 does not allow ("the locked
+    File Stream data ... MUST be used"); FreeRDP fails it, as here. **A range at 2 GiB or later
+    without huge-file support is served**: 2.2.5.3 makes that bound a SHOULD on the sender, so
+    refusing it would fail a file up to 4 GiB that the capability allows. That is the reverse
+    of this side's own requests, which keep to the SHOULD (`TooFar`).
+  - **Releasing.** A list neither current nor pinned is forgotten, and the host is told so it
+    can close its files: `Announcement::released` when a new announcement replaced it,
+    `FilesReleased` when the last Unlock or a moved lock let go of it, and `FilesReleased` for
+    every list on a new Monitor Ready, whose initial Format List drops `FileGroupDescriptorW`.
+    Neither reference tells its host.
+
+  A request already handed to the host still owes its answer after its list is released; the
+  host answers it with a failure once it has let go of the file.
+
+  **Not covered:** time-based expiry (IronRDP's 60 s idle / 2 h, which needs a clock the core
+  does not have), and directory walking and reading the files, which are the host's. A folder
+  entry before its children, which FreeRDP emits, is the host's to include. Two races the
+  protocol leaves open: a host copy between the server's Lock and its Format Data Request
+  answers that request with the newer list, and a host copy between a server reading a Format
+  List and sending its Lock pins the newer list. A Format Data Request names no lock, so
+  nothing on this side can tell; FreeRDP has the same windows, and the measured order (Format
+  List, Lock, request) did not hit them.
 
 ## Code
 
@@ -330,16 +385,19 @@ glossary, which is vocabulary rather than a decision.
   `encode_format_data_request`, `encode_format_data_response`, `encode_unicode_text`,
   `decode_unicode_text`, `padding`, `FileDescriptor`, `decode_file_list`, `encode_file_list`,
   `FileContentsRequest`, `FileContentsOp`, `encode_file_contents_request`,
-  `encode_file_contents_response`, `encode_lock_clip_data`, `encode_unlock_clip_data`
+  `encode_file_contents_response`, `encode_lock_clip_data`, `encode_unlock_clip_data`,
+  `is_contained_file_name`, `FILE_NAME_MAX_UNITS`
 - `justrdp/src/cliprdr.rs` — `Clipboard`, `ClipboardOutput`, `RequestError`,
-  `FileRequestError`, `channel_def`, `CHANNEL_OPTIONS`, `ADVERTISED_FLAGS`
+  `FileRequestError`, `Announcement`, `FileAnnounceError`, `FileRespondError`, `channel_def`,
+  `CHANNEL_OPTIONS`, `ADVERTISED_FLAGS`, `MAX_SERVER_LOCKS`
 - Spec sections cited inline: `[MS-RDPBCGR]` 1.3.3, 2.2.6.1.1, 3.1.5.2.1, 3.1.5.2.2;
   `[MS-RDPEDYC]` 1.7, 2.2.2.2, 2.2.3.3, 2.2.3.4, 3.2;
   `[MS-RDPEDISP]` 1.3,
   2.2.2.2, 2.2.2.2.1;
   `[MS-RDPECLIP]` 1.3.2.1, 2.1, 2.2.1, 2.2.2.1, 2.2.2.1.1, 2.2.2.1.1.1, 2.2.2.2, 2.2.3.1,
   2.2.3.1.2, 2.2.3.2, 2.2.4.1, 2.2.4.2, 2.2.5.1, 2.2.5.2, 2.2.5.2.3, 2.2.5.2.3.1, 2.2.5.3,
-  2.2.5.4, 3.1.5.2.2, 3.1.5.3.1, 3.1.5.4.3, 3.1.5.4.5; `[MS-RDPBCGR]` 3.1.5.2.2.1
+  2.2.5.4, 3.1.5.2.2, 3.1.5.3.1, 3.1.5.3.2, 3.1.5.3.4, 3.1.5.4.3, 3.1.5.4.5, 3.1.5.4.6;
+  `[MS-RDPBCGR]` 3.1.5.2.2.1
 
 ## Reference behaviour
 
@@ -427,6 +485,33 @@ glossary, which is vocabulary rather than a decision.
   twice), and the rest of `big.bin` still arrives under the lock. **Without the lock, the
   first request after that copy gets no answer in 60 s**: not a failure, silence.
 
+**Measured against the WS2022 test VM (#325, 2026-09-28):**
+
+- **The server locks every host announcement and unlocks the one before.** Lock `clipDataId` 0
+  arrives right after the host's Format List naming `FileGroupDescriptorW`, then a Format Data
+  Request for it. Each later announcement, files or text, gets the next lock and at once an
+  Unlock of the previous one, so the ids alternate 0 and 1 and at most two are held; a text
+  announcement's lock pins nothing, and its Unlock of the last file lock releases that list
+  (`FilesReleased`), measured over three unpasted file announcements and one text one. During
+  a paste the previous lock is kept until the paste ends. So `MAX_SERVER_LOCKS` is not reached
+  against this server.
+- `FileGroupDescriptorW` alone is enough. The server's clipboard then offers
+  `FileGroupDescriptorW` (plus `CanIncludeInClipboardHistory` and `CanUploadToCloudClipboard`),
+  and the shell pastes from it. FreeRDP also announces only that format.
+- A shell paste (`Shell.Application` `InvokeVerb('Paste')` into a folder) asks, per file, for
+  the size and then 262,144-byte ranges, every request under `clipDataId` 0. `small.txt` (12
+  bytes) and a 300,000-byte `big.bin` land byte-exact, checked on the server against the
+  pattern it regenerates itself.
+- The host copies other files right after serving `big.bin`'s first range. The second range
+  still comes under lock 0 and is served from the first list. After the paste the server
+  sends Unlock 0, and the first list is released. 4 of 4 runs, after the adapter's flush fix.
+- Test harness, not protocol: the one run whose script did not touch
+  `[Windows.Forms.Clipboard]::GetDataObject()` before pasting sent no File Contents Request at
+  all; every run that touched it did. One run proves nothing, so the harness keeps the step.
+- Before the adapter flushed its writes, the transfer stopped after the 262,156-byte range
+  response whenever nothing followed it; the measurements and the cause are in
+  [adapter-drive-loop](adapter-drive-loop.md).
+
 ## Cross-cutting invariants
 
 - [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
@@ -453,7 +538,7 @@ glossary, which is vocabulary rather than a decision.
   output (#11), audio input (#12), device/drive/printer/smartcard (#13), RemoteApp
   (#14), multitouch (#15), video (#17), camera (#19), location (#20). The transport
   exists; the consumers do not. The clipboard (#10) moves text since #322, images since #323,
-  and server files to the host since #324; host files to the server are #325.
+  server files to the host since #324, and host files to the server since #325.
 - ~~Static channel 1004 traffic is ignored by the session loop with no record of what
   it contains.~~ **Closed in #307**: 1004 is `cliprdr`, and a granted channel's messages
   now reach the host. The multi-chunk live proofs it left open closed in #323.

@@ -1,12 +1,14 @@
 //! The clipboard channel (MS-RDPECLIP) as a sans-IO helper the host drives: the
 //! initialization sequence (1.3.2.1), Format Lists both ways, and Format Data Requests and
-//! Responses both ways, and files the server copied, fetched with File Contents Requests under a
-//! clipboard lock. The session never interprets `cliprdr` bytes: the host requests the channel
-//! with [`channel_def`], feeds each `SessionOutput::ChannelData` message on it to
-//! [`Clipboard::process`], and passes every [`ClipboardOutput::Send`] to
+//! Responses both ways, files the server copied, fetched with File Contents Requests under a
+//! clipboard lock, and files the host copied, served to the server's File Contents Requests from
+//! the list each server lock pins. The session never interprets `cliprdr` bytes: the host
+//! requests the channel with [`channel_def`], feeds each `SessionOutput::ChannelData` message on
+//! it to [`Clipboard::process`], and passes every [`ClipboardOutput::Send`] to
 //! `SessionStateMachine::send_channel`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::cliprdr::{
@@ -26,6 +28,12 @@ pub const ADVERTISED_FLAGS: u32 = CB_USE_LONG_FORMAT_NAMES
     | CB_FILECLIP_NO_FILE_PATHS
     | CB_CAN_LOCK_CLIPDATA
     | CB_HUGE_FILE_SUPPORT_ENABLED;
+
+/// The most server locks kept at once; a Lock Clipboard Data past it is not kept.
+pub const MAX_SERVER_LOCKS: usize = 100;
+
+/// The ID this side gives `FileGroupDescriptorW`, or the next one the host's formats leave free.
+const LOCAL_FILE_LIST_FORMAT: u32 = 0xC0FE;
 
 /// The Client Network Data entry for the clipboard channel.
 pub fn channel_def() -> ChannelDef {
@@ -90,6 +98,26 @@ pub enum ClipboardOutput {
         /// The bytes, at most the length asked for.
         data: Option<Vec<u8>>,
     },
+    /// The server asked for the size or a range of file `index` of the host's list `list_id`.
+    /// The host answers with [`Clipboard::respond_file_size`] or
+    /// [`Clipboard::respond_file_range`].
+    FileContentsRequested {
+        /// The request's `streamId`, which the answer names.
+        stream_id: u32,
+        /// The [`Announcement::list_id`] the file belongs to.
+        list_id: u32,
+        /// The file's position in that list.
+        index: u32,
+        /// What is asked for.
+        op: FileContentsOp,
+    },
+    /// The host's file list `list_id` is neither on its clipboard nor held by a server lock,
+    /// so no request for it will be handed to the host again. A request already handed over
+    /// still owes its answer, a failure if the host has let go of the file.
+    FilesReleased {
+        /// The [`Announcement::list_id`] released.
+        list_id: u32,
+    },
 }
 
 /// Why [`Clipboard::request_file_contents`] sent nothing.
@@ -105,6 +133,17 @@ pub enum FileRequestError {
     /// The range starts at 2 GiB or later, which needs `CB_HUGE_FILE_SUPPORT_ENABLED` on both
     /// sides.
     TooFar,
+}
+
+/// Why [`Clipboard::respond_file_size`] or [`Clipboard::respond_file_range`] sent nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileRespondError {
+    /// No server request with this `streamId` is waiting for the host.
+    NotRequested,
+    /// The request asked for the other of size and range.
+    WrongKind,
+    /// The range is longer than the request asked for.
+    TooLong,
 }
 
 /// Why [`Clipboard::request`] sent nothing.
@@ -135,13 +174,57 @@ pub struct FileListRequest {
     pub messages: Vec<Vec<u8>>,
 }
 
-/// A Format Data Response this side owes the server, in the order the requests came.
+/// What [`Clipboard::announce`] or [`Clipboard::announce_files`] announced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Announcement {
+    /// The Format List to send, `None` before the server's Monitor Ready.
+    pub message: Option<Vec<u8>>,
+    /// The id the server's File Contents Requests for the announced files arrive under; `None`
+    /// when no files were announced.
+    pub list_id: Option<u32>,
+    /// A file list this announcement replaced and no server lock holds, which the host no
+    /// longer serves.
+    pub released: Option<u32>,
+}
+
+/// Why [`Clipboard::announce_files`] announced nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAnnounceError {
+    /// The server's Monitor Ready has not arrived, or the two sides did not both advertise
+    /// `CB_STREAM_FILECLIP_ENABLED`.
+    NotNegotiated,
+    /// File `index` has a name that is not a relative path inside the paste target, holds a
+    /// NUL, or is longer than the 259 UTF-16 code units a descriptor holds.
+    BadName {
+        /// The file's position in the list.
+        index: usize,
+    },
+    /// File `index` is larger than 4,294,967,295 bytes, which needs
+    /// `CB_HUGE_FILE_SUPPORT_ENABLED` on both sides.
+    TooLarge {
+        /// The file's position in the list.
+        index: usize,
+    },
+}
+
+/// A Format Data Response this side owes the server, in the order the requests came.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Owed {
     /// The host answers it.
     Host,
-    /// A failure, sent once every answer before it has gone out.
-    Refusal,
+    /// An answer the helper made, sent once every answer before it has gone out: the data,
+    /// or `None` for a failure.
+    Ready(Option<Arc<[u8]>>),
+}
+
+/// Files the host announced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnnouncedList {
+    id: u32,
+    /// How many files the list holds.
+    count: usize,
+    /// The list as `CLIPRDR_FILELIST` data.
+    encoded: Arc<[u8]>,
 }
 
 /// The client side of one clipboard channel.
@@ -165,6 +248,17 @@ pub struct Clipboard {
     /// File Contents Requests waiting for their response.
     file_requests: Vec<(u32, FileContentsOp)>,
     last_stream_id: u32,
+    /// Every file list the host announced that is still served.
+    announced: Vec<AnnouncedList>,
+    /// The id of the file list on the host's clipboard now.
+    current_files: Option<u32>,
+    /// The ID of `FileGroupDescriptorW` in this side's latest Format List.
+    local_file_list_format: Option<u32>,
+    last_list_id: u32,
+    /// Server File Contents Requests the host has not answered.
+    serving: Vec<(u32, FileContentsOp)>,
+    /// Each server lock's `clipDataId` and the host file list it holds.
+    server_locks: Vec<(u32, u32)>,
 }
 
 impl Clipboard {
@@ -179,12 +273,71 @@ impl Clipboard {
     }
 
     /// Announce the formats now on the host's clipboard. Before the server's Monitor Ready they
-    /// are kept for the initial Format List and nothing is returned; after it, the Format List
-    /// to send is.
-    pub fn announce(&mut self, formats: Vec<Format>) -> Option<Vec<u8>> {
+    /// are kept for the initial Format List and no message is returned; after it, the Format
+    /// List to send is.
+    pub fn announce(&mut self, formats: Vec<Format>) -> Announcement {
+        let released = self.replace_current_files(None);
+        self.local_file_list_format = None;
         self.local_formats = formats;
         self.local_list_refused = false;
-        self.ready.then(|| self.local_format_list())
+        Announcement {
+            message: self.ready.then(|| self.local_format_list()),
+            list_id: None,
+            released,
+        }
+    }
+
+    /// Announce files on the host's clipboard, with `formats` beside them. The helper adds
+    /// `FileGroupDescriptorW` to the Format List and answers the server's request for it; the
+    /// host serves the files' contents through [`ClipboardOutput::FileContentsRequested`].
+    pub fn announce_files(
+        &mut self,
+        files: Vec<FileDescriptor>,
+        mut formats: Vec<Format>,
+    ) -> Result<Announcement, FileAnnounceError> {
+        if !self.ready || self.general_flags & CB_STREAM_FILECLIP_ENABLED == 0 {
+            return Err(FileAnnounceError::NotNegotiated);
+        }
+        if let Some(index) = files.iter().position(|f| {
+            !pdu::is_contained_file_name(&f.name)
+                || f.name.contains('\0')
+                || f.name.encode_utf16().count() > pdu::FILE_NAME_MAX_UNITS
+        }) {
+            return Err(FileAnnounceError::BadName { index });
+        }
+        if self.general_flags & CB_HUGE_FILE_SUPPORT_ENABLED == 0
+            && let Some(index) = files
+                .iter()
+                .position(|f| f.size.is_some_and(|size| size > u64::from(u32::MAX)))
+        {
+            return Err(FileAnnounceError::TooLarge { index });
+        }
+        let mut format_id = LOCAL_FILE_LIST_FORMAT;
+        while formats.iter().any(|f| f.id == format_id) {
+            format_id += 1;
+        }
+        formats.push(Format {
+            id: format_id,
+            name: pdu::FILE_GROUP_DESCRIPTOR_W.to_string(),
+        });
+        let announced = &self.announced;
+        let list_id = next_id(&mut self.last_list_id, |id| {
+            announced.iter().any(|list| list.id == id)
+        });
+        self.announced.push(AnnouncedList {
+            id: list_id,
+            count: files.len(),
+            encoded: pdu::encode_file_list(&files).into(),
+        });
+        let released = self.replace_current_files(Some(list_id));
+        self.local_file_list_format = Some(format_id);
+        self.local_formats = formats;
+        self.local_list_refused = false;
+        Ok(Announcement {
+            message: Some(self.local_format_list()),
+            list_id: Some(list_id),
+            released,
+        })
     }
 
     /// The Format Data Request for `format_id` from the server's clipboard. The answer arrives
@@ -283,11 +436,47 @@ impl Clipboard {
             return Vec::new();
         }
         let mut out = vec![pdu::encode_format_data_response(data)];
-        while self.owed.front() == Some(&Owed::Refusal) {
-            self.owed.pop_front();
-            out.push(pdu::encode_format_data_response(None));
+        while let Some(Owed::Ready(_)) = self.owed.front() {
+            if let Some(Owed::Ready(answer)) = self.owed.pop_front() {
+                out.push(pdu::encode_format_data_response(answer.as_deref()));
+            }
         }
         out
+    }
+
+    /// The File Contents Response carrying the size of the file a server size request named,
+    /// or a failure for `None`.
+    pub fn respond_file_size(
+        &mut self,
+        stream_id: u32,
+        size: Option<u64>,
+    ) -> Result<Vec<u8>, FileRespondError> {
+        self.take_serving(stream_id, |op| match op {
+            FileContentsOp::Size => Ok(()),
+            FileContentsOp::Range { .. } => Err(FileRespondError::WrongKind),
+        })?;
+        let size = size.map(u64::to_le_bytes);
+        Ok(pdu::encode_file_contents_response(
+            stream_id,
+            size.as_ref().map(|s| s.as_slice()),
+        ))
+    }
+
+    /// The File Contents Response carrying the bytes a server range request asked for, fewer
+    /// at the end of the file, or a failure for `None`.
+    pub fn respond_file_range(
+        &mut self,
+        stream_id: u32,
+        data: Option<&[u8]>,
+    ) -> Result<Vec<u8>, FileRespondError> {
+        self.take_serving(stream_id, |op| match op {
+            FileContentsOp::Range { len, .. } if data.is_some_and(|d| d.len() > len as usize) => {
+                Err(FileRespondError::TooLong)
+            }
+            FileContentsOp::Range { .. } => Ok(()),
+            FileContentsOp::Size => Err(FileRespondError::WrongKind),
+        })?;
+        Ok(pdu::encode_file_contents_response(stream_id, data))
     }
 
     /// Stop waiting for the answer to [`Clipboard::request`] or
@@ -296,6 +485,103 @@ impl Clipboard {
     pub fn cancel_request(&mut self) -> Option<u32> {
         self.requested_file_list = None;
         self.requested.take()
+    }
+
+    /// Make `list_id` the host's current file list, returning the one it replaced when no
+    /// server lock holds it.
+    fn replace_current_files(&mut self, list_id: Option<u32>) -> Option<u32> {
+        let old = core::mem::replace(&mut self.current_files, list_id)?;
+        self.release_if_unheld(old)
+    }
+
+    /// Forget file list `list_id` when it is neither current nor held by a server lock,
+    /// returning it.
+    fn release_if_unheld(&mut self, list_id: u32) -> Option<u32> {
+        let held = self.current_files == Some(list_id)
+            || self.server_locks.iter().any(|&(_, list)| list == list_id);
+        if held {
+            return None;
+        }
+        self.announced.retain(|list| list.id != list_id);
+        Some(list_id)
+    }
+
+    /// A server Lock Clipboard Data: `clip_data_id` holds the host's current file list, if
+    /// there is one (3.1.5.3.2).
+    fn server_lock(&mut self, clip_data_id: u32) -> Vec<ClipboardOutput> {
+        let Some(current) = self.current_files else {
+            tracing::debug!(target: "rdp_cliprdr", clip_data_id, "server lock with no host files");
+            return Vec::new();
+        };
+        let outputs = self.server_unlock(clip_data_id);
+        if self.server_locks.len() >= MAX_SERVER_LOCKS {
+            tracing::warn!(target: "rdp_cliprdr", clip_data_id, "server lock not kept: too many held");
+            return outputs;
+        }
+        self.server_locks.push((clip_data_id, current));
+        outputs
+    }
+
+    /// A server Unlock Clipboard Data: `clip_data_id` holds nothing any more (3.1.5.3.4).
+    fn server_unlock(&mut self, clip_data_id: u32) -> Vec<ClipboardOutput> {
+        let Some(at) = self
+            .server_locks
+            .iter()
+            .position(|&(id, _)| id == clip_data_id)
+        else {
+            return Vec::new();
+        };
+        let (_, list_id) = self.server_locks.remove(at);
+        self.release_if_unheld(list_id)
+            .map(|list_id| ClipboardOutput::FilesReleased { list_id })
+            .into_iter()
+            .collect()
+    }
+
+    /// Remove the server request `stream_id` once `fits` accepts the answer for its op.
+    fn take_serving(
+        &mut self,
+        stream_id: u32,
+        fits: impl FnOnce(FileContentsOp) -> Result<(), FileRespondError>,
+    ) -> Result<(), FileRespondError> {
+        let at = self
+            .serving
+            .iter()
+            .position(|(id, _)| *id == stream_id)
+            .ok_or(FileRespondError::NotRequested)?;
+        fits(self.serving[at].1)?;
+        self.serving.remove(at);
+        Ok(())
+    }
+
+    /// A server File Contents Request for a file the host announced, handed to the host, or
+    /// answered with a failure when it names no such file.
+    fn serve_file_contents(&mut self, request: FileContentsRequest) -> Vec<ClipboardOutput> {
+        if self.local_list_refused {
+            return refuse_file_contents(request.stream_id, "Format List refused");
+        }
+        if self.serving.iter().any(|(id, _)| *id == request.stream_id) {
+            return refuse_file_contents(request.stream_id, "streamId already waiting");
+        }
+        let list_id = match request.clip_data_id {
+            Some(clip_data_id) => self
+                .server_locks
+                .iter()
+                .find(|&&(id, _)| id == clip_data_id)
+                .map(|&(_, list)| list),
+            None => self.current_files,
+        };
+        let list = list_id.and_then(|id| self.announced.iter().find(|list| list.id == id));
+        let Some(list) = list.filter(|list| (request.index as usize) < list.count) else {
+            return refuse_file_contents(request.stream_id, "no such file");
+        };
+        self.serving.push((request.stream_id, request.op));
+        vec![ClipboardOutput::FileContentsRequested {
+            stream_id: request.stream_id,
+            list_id: list.id,
+            index: request.index,
+            op: request.op,
+        }]
     }
 
     /// Take a lock on the server's current clipboard, when both sides can lock.
@@ -342,12 +628,17 @@ impl Clipboard {
 
     /// Answer a server request with a failure, after every answer still owed before it.
     fn refuse_request(&mut self) -> Vec<ClipboardOutput> {
+        self.answer_request(None)
+    }
+
+    /// Answer a server request with `answer`, after every answer still owed before it.
+    fn answer_request(&mut self, answer: Option<Arc<[u8]>>) -> Vec<ClipboardOutput> {
         if self.owed.is_empty() {
             vec![ClipboardOutput::Send(pdu::encode_format_data_response(
-                None,
+                answer.as_deref(),
             ))]
         } else {
-            self.owed.push_back(Owed::Refusal);
+            self.owed.push_back(Owed::Ready(answer));
             Vec::new()
         }
     }
@@ -421,12 +712,21 @@ impl Clipboard {
                 Ok(Vec::new())
             }
             ClipboardPdu::MonitorReady => {
-                // A new initialization sequence: nothing the old one asked for or locked stands.
+                // A new initialization sequence: nothing the old one asked for, locked or
+                // announced as files stands.
+                let mut outputs: Vec<_> = self
+                    .announced
+                    .iter()
+                    .map(|list| ClipboardOutput::FilesReleased { list_id: list.id })
+                    .collect();
+                let mut local_formats = core::mem::take(&mut self.local_formats);
+                local_formats.retain(|f| Some(f.id) != self.local_file_list_format);
                 *self = Self {
                     server_flags: self.server_flags,
-                    local_formats: core::mem::take(&mut self.local_formats),
+                    local_formats,
                     last_clip_data_id: self.last_clip_data_id,
                     last_stream_id: self.last_stream_id,
+                    last_list_id: self.last_list_id,
                     ..Self::default()
                 };
                 self.general_flags = ADVERTISED_FLAGS & self.server_flags;
@@ -435,10 +735,9 @@ impl Clipboard {
                     version: CB_CAPS_VERSION_2,
                     general_flags: self.general_flags,
                 });
-                Ok(vec![
-                    ClipboardOutput::Send(caps),
-                    ClipboardOutput::Send(self.local_format_list()),
-                ])
+                outputs.push(ClipboardOutput::Send(caps));
+                outputs.push(ClipboardOutput::Send(self.local_format_list()));
+                Ok(outputs)
             }
             ClipboardPdu::FormatList(formats) => {
                 self.remote_format_ids = formats.iter().map(|f| f.id).collect();
@@ -466,6 +765,13 @@ impl Clipboard {
                     );
                     return Ok(self.refuse_request());
                 }
+                if Some(format_id) == self.local_file_list_format {
+                    let list = self
+                        .current_files
+                        .and_then(|id| self.announced.iter().find(|list| list.id == id))
+                        .map(|list| list.encoded.clone());
+                    return Ok(self.answer_request(list));
+                }
                 self.owed.push_back(Owed::Host);
                 Ok(vec![ClipboardOutput::DataRequested { format_id }])
             }
@@ -488,18 +794,9 @@ impl Clipboard {
                 let (_, op) = self.file_requests.remove(at);
                 Ok(vec![file_contents(stream_id, op, data)])
             }
-            ClipboardPdu::FileContentsRequest(request) => {
-                // This side announces no files, so it has none to give.
-                tracing::warn!(target: "rdp_cliprdr", stream_id = request.stream_id, "File Contents Request refused");
-                Ok(vec![ClipboardOutput::Send(
-                    pdu::encode_file_contents_response(request.stream_id, None),
-                )])
-            }
-            ClipboardPdu::LockClipData { clip_data_id }
-            | ClipboardPdu::UnlockClipData { clip_data_id } => {
-                tracing::debug!(target: "rdp_cliprdr", clip_data_id, "server lock message not handled");
-                Ok(Vec::new())
-            }
+            ClipboardPdu::FileContentsRequest(request) => Ok(self.serve_file_contents(request)),
+            ClipboardPdu::LockClipData { clip_data_id } => Ok(self.server_lock(clip_data_id)),
+            ClipboardPdu::UnlockClipData { clip_data_id } => Ok(self.server_unlock(clip_data_id)),
             ClipboardPdu::Unknown {
                 msg_type,
                 msg_flags,
@@ -514,6 +811,14 @@ impl Clipboard {
             }
         }
     }
+}
+
+/// A failed File Contents Response for a server request the helper cannot serve.
+fn refuse_file_contents(stream_id: u32, why: &'static str) -> Vec<ClipboardOutput> {
+    tracing::warn!(target: "rdp_cliprdr", stream_id, why, "File Contents Request refused");
+    vec![ClipboardOutput::Send(pdu::encode_file_contents_response(
+        stream_id, None,
+    ))]
 }
 
 /// The `streamId` of a File Contents Request or Response, when the message holds one.
@@ -741,7 +1046,7 @@ mod tests {
     #[test]
     fn formats_announced_early_are_the_initial_list() {
         let mut clipboard = Clipboard::new();
-        assert_eq!(clipboard.announce(vec![unicode_text()]), None);
+        assert_eq!(clipboard.announce(vec![unicode_text()]).message, None);
         clipboard.process(&VM_SERVER_CAPS).unwrap();
         let outputs = clipboard.process(&VM_MONITOR_READY).unwrap();
         assert_eq!(
@@ -754,7 +1059,7 @@ mod tests {
     fn formats_announced_later_are_sent_at_once() {
         let mut clipboard = ready();
         assert_eq!(
-            clipboard.announce(vec![unicode_text()]),
+            clipboard.announce(vec![unicode_text()]).message,
             Some(encode_format_list(&[unicode_text()], true))
         );
     }
@@ -1368,8 +1673,8 @@ mod tests {
         );
     }
 
-    /// This side announces no files, so a server File Contents Request gets a failure, even one
-    /// that does not decode as long as its streamId can be read.
+    /// With no files announced, a server File Contents Request gets a failure, even one that does
+    /// not decode as long as its streamId can be read.
     #[test]
     fn a_server_file_contents_request_is_refused() {
         let mut clipboard = ready();
@@ -1387,6 +1692,505 @@ mod tests {
         both[16] = 3;
         assert_eq!(clipboard.process(&both).unwrap(), refusal);
         assert!(clipboard.process(&request[..10]).is_err());
+    }
+
+    fn host_files() -> Vec<FileDescriptor> {
+        vec![a_file("small.txt", 12), a_file("big.bin", 300_000)]
+    }
+
+    /// The host's files are announced as `FileGroupDescriptorW`, and the server's request for
+    /// that format is answered with the list by the helper.
+    #[test]
+    fn announced_files_answer_the_file_list_request() {
+        let mut clipboard = ready();
+        let offer = clipboard
+            .announce_files(host_files(), vec![unicode_text()])
+            .unwrap();
+        let listed = pdu::ClipboardPdu::decode(offer.message.as_ref().unwrap(), true).unwrap();
+        let ClipboardPdu::FormatList(formats) = listed else {
+            panic!("expected a Format List, got {listed:?}");
+        };
+        assert_eq!(formats[0], unicode_text());
+        assert_eq!(formats[1].name, pdu::FILE_GROUP_DESCRIPTOR_W);
+        assert_eq!(offer.released, None);
+        let answer = clipboard.process(&data_request(formats[1].id)).unwrap();
+        assert_eq!(
+            answer,
+            vec![ClipboardOutput::Send(pdu::encode_format_data_response(
+                Some(&pdu::encode_file_list(&host_files()))
+            ))]
+        );
+    }
+
+    /// Responses name no format, so the helper's file list waits behind an answer the host
+    /// still owes.
+    #[test]
+    fn the_file_list_answer_waits_behind_an_owed_one() {
+        let mut clipboard = ready();
+        let offer = clipboard
+            .announce_files(host_files(), vec![unicode_text()])
+            .unwrap();
+        let file_list_format = file_list_format_in(&offer);
+        clipboard.process(&data_request(CF_UNICODETEXT)).unwrap();
+        assert!(
+            clipboard
+                .process(&data_request(file_list_format))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            clipboard.respond(Some(b"t")),
+            vec![
+                pdu::encode_format_data_response(Some(b"t")),
+                pdu::encode_format_data_response(Some(&pdu::encode_file_list(&host_files()))),
+            ]
+        );
+    }
+
+    fn server_asks(stream_id: u32, index: u32, op: FileContentsOp, lock: Option<u32>) -> Vec<u8> {
+        pdu::encode_file_contents_request(&FileContentsRequest {
+            stream_id,
+            index,
+            op,
+            clip_data_id: lock,
+        })
+    }
+
+    /// A server File Contents Request for an announced file reaches the host, which answers
+    /// it by `streamId`, in any order.
+    #[test]
+    fn the_host_serves_the_files_it_announced() {
+        let mut clipboard = ready();
+        let list_id = clipboard
+            .announce_files(host_files(), Vec::new())
+            .unwrap()
+            .list_id
+            .unwrap();
+        assert_eq!(
+            clipboard
+                .process(&server_asks(7, 1, FileContentsOp::Size, None))
+                .unwrap(),
+            vec![ClipboardOutput::FileContentsRequested {
+                stream_id: 7,
+                list_id,
+                index: 1,
+                op: FileContentsOp::Size,
+            }]
+        );
+        assert_eq!(
+            clipboard
+                .process(&server_asks(8, 1, range(4, 3), None))
+                .unwrap(),
+            vec![ClipboardOutput::FileContentsRequested {
+                stream_id: 8,
+                list_id,
+                index: 1,
+                op: range(4, 3),
+            }]
+        );
+        assert_eq!(
+            clipboard.respond_file_range(8, Some(b"abc")),
+            Ok(pdu::encode_file_contents_response(8, Some(b"abc")))
+        );
+        assert_eq!(
+            clipboard.respond_file_size(7, Some(300_000)),
+            Ok(pdu::encode_file_contents_response(
+                7,
+                Some(&300_000u64.to_le_bytes())
+            ))
+        );
+        assert_eq!(
+            clipboard.respond_file_size(7, Some(1)),
+            Err(FileRespondError::NotRequested)
+        );
+    }
+
+    /// The host answers each request with what it asked for, and at most the length asked.
+    #[test]
+    fn a_host_answer_must_fit_its_request() {
+        let mut clipboard = ready();
+        clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        clipboard
+            .process(&server_asks(1, 0, range(0, 2), None))
+            .unwrap();
+        clipboard
+            .process(&server_asks(2, 0, FileContentsOp::Size, None))
+            .unwrap();
+        assert_eq!(
+            clipboard.respond_file_range(1, Some(b"abc")),
+            Err(FileRespondError::TooLong)
+        );
+        assert_eq!(
+            clipboard.respond_file_size(1, Some(3)),
+            Err(FileRespondError::WrongKind)
+        );
+        assert_eq!(
+            clipboard.respond_file_range(2, Some(b"")),
+            Err(FileRespondError::WrongKind)
+        );
+        assert_eq!(
+            clipboard.respond_file_range(1, None),
+            Ok(pdu::encode_file_contents_response(1, None))
+        );
+        assert_eq!(
+            clipboard.respond_file_size(2, None),
+            Ok(pdu::encode_file_contents_response(2, None))
+        );
+    }
+
+    /// A request this side cannot serve gets a failed response, never reaches the host, and
+    /// the session goes on (#325).
+    #[test]
+    fn a_request_for_no_such_file_is_refused() {
+        let refused = |stream_id| {
+            vec![ClipboardOutput::Send(pdu::encode_file_contents_response(
+                stream_id, None,
+            ))]
+        };
+        let mut clipboard = ready();
+        clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        assert_eq!(
+            clipboard
+                .process(&server_asks(1, 2, FileContentsOp::Size, None))
+                .unwrap(),
+            refused(1)
+        );
+        assert_eq!(
+            clipboard
+                .process(&server_asks(2, u32::MAX, range(0, 8), None))
+                .unwrap(),
+            refused(2)
+        );
+        assert_eq!(
+            clipboard.respond_file_size(1, Some(1)),
+            Err(FileRespondError::NotRequested)
+        );
+    }
+
+    /// 2.2.5.3 asks the server not to send an offset at 2 GiB or later without huge-file support,
+    /// as a SHOULD, so one that arrives is still served.
+    #[test]
+    fn a_far_offset_is_served_without_huge_file_support() {
+        let mut clipboard = Clipboard::new();
+        clipboard
+            .process(&caps_with(
+                CB_USE_LONG_FORMAT_NAMES | CB_STREAM_FILECLIP_ENABLED,
+            ))
+            .unwrap();
+        clipboard.process(&VM_MONITOR_READY).unwrap();
+        clipboard
+            .announce_files(vec![a_file("big", 3 << 30)], Vec::new())
+            .unwrap();
+        assert!(matches!(
+            clipboard
+                .process(&server_asks(3, 0, range(1 << 31, 8), None))
+                .unwrap()[..],
+            [ClipboardOutput::FileContentsRequested { stream_id: 3, .. }]
+        ));
+    }
+
+    /// 2.2.2.1.1.1: without huge-file support only files up to 4,294,967,295 bytes are exchanged.
+    #[test]
+    fn a_file_over_4_gib_needs_huge_file_support() {
+        let mut clipboard = Clipboard::new();
+        clipboard
+            .process(&caps_with(
+                CB_USE_LONG_FORMAT_NAMES | CB_STREAM_FILECLIP_ENABLED,
+            ))
+            .unwrap();
+        clipboard.process(&VM_MONITOR_READY).unwrap();
+        let limit = u64::from(u32::MAX);
+        assert!(
+            clipboard
+                .announce_files(vec![a_file("at", limit)], Vec::new())
+                .is_ok()
+        );
+        assert_eq!(
+            clipboard.announce_files(vec![a_file("a", 1), a_file("over", limit + 1)], Vec::new()),
+            Err(FileAnnounceError::TooLarge { index: 1 })
+        );
+        assert!(
+            ready()
+                .announce_files(vec![a_file("over", limit + 1)], Vec::new())
+                .is_ok()
+        );
+    }
+
+    /// 3.1.5.4.7: after the server refused this side's Format List, every File Contents Request
+    /// fails, until the host announces again.
+    #[test]
+    fn after_a_refused_format_list_files_are_not_served() {
+        let mut clipboard = ready();
+        clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        clipboard.process(&lock(9)).unwrap();
+        let refused = [0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
+        clipboard.process(&refused).unwrap();
+        for (stream_id, lock) in [(1, None), (2, Some(9))] {
+            assert_eq!(
+                clipboard
+                    .process(&server_asks(stream_id, 0, FileContentsOp::Size, lock))
+                    .unwrap(),
+                vec![ClipboardOutput::Send(pdu::encode_file_contents_response(
+                    stream_id, None
+                ))]
+            );
+        }
+        clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        let asked = clipboard
+            .process(&server_asks(3, 0, FileContentsOp::Size, None))
+            .unwrap();
+        assert!(asked_list(&asked).is_some());
+    }
+
+    /// A second request under a `streamId` the host still owes would make the answers
+    /// ambiguous, so it is refused.
+    #[test]
+    fn a_stream_id_already_waiting_is_refused() {
+        let mut clipboard = ready();
+        clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        clipboard
+            .process(&server_asks(5, 0, FileContentsOp::Size, None))
+            .unwrap();
+        assert_eq!(
+            clipboard
+                .process(&server_asks(5, 1, range(0, 8), None))
+                .unwrap(),
+            vec![ClipboardOutput::Send(pdu::encode_file_contents_response(
+                5, None
+            ))]
+        );
+        assert!(clipboard.respond_file_size(5, Some(12)).is_ok());
+    }
+
+    #[test]
+    fn files_need_streaming_and_contained_names() {
+        let mut clipboard = Clipboard::new();
+        assert_eq!(
+            clipboard.announce_files(host_files(), Vec::new()),
+            Err(FileAnnounceError::NotNegotiated)
+        );
+        clipboard
+            .process(&caps_with(CB_USE_LONG_FORMAT_NAMES))
+            .unwrap();
+        clipboard.process(&VM_MONITOR_READY).unwrap();
+        assert_eq!(
+            clipboard.announce_files(host_files(), Vec::new()),
+            Err(FileAnnounceError::NotNegotiated)
+        );
+
+        let long = "x".repeat(pdu::FILE_NAME_MAX_UNITS);
+        assert!(
+            ready()
+                .announce_files(vec![a_file(&long, 1)], Vec::new())
+                .is_ok()
+        );
+        for name in ["..\\x", "c:x", "", "a\0b", &format!("{long}y")] {
+            assert_eq!(
+                ready().announce_files(vec![a_file("ok", 1), a_file(name, 1)], Vec::new()),
+                Err(FileAnnounceError::BadName { index: 1 }),
+                "{name:?}"
+            );
+        }
+    }
+
+    fn lock(clip_data_id: u32) -> Vec<u8> {
+        pdu::encode_lock_clip_data(clip_data_id)
+    }
+
+    fn unlock(clip_data_id: u32) -> Vec<u8> {
+        pdu::encode_unlock_clip_data(clip_data_id)
+    }
+
+    fn asked_list(outputs: &[ClipboardOutput]) -> Option<u32> {
+        match outputs {
+            [ClipboardOutput::FileContentsRequested { list_id, .. }] => Some(*list_id),
+            _ => None,
+        }
+    }
+
+    /// 3.1.5.3.2: a server lock keeps the files on the host's clipboard then servable under
+    /// its `clipDataId` after the host copies something else, until the Unlock.
+    #[test]
+    fn a_server_lock_keeps_the_host_files_it_found() {
+        let mut clipboard = ready();
+        let first = clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        assert!(clipboard.process(&lock(9)).unwrap().is_empty());
+        let second = clipboard
+            .announce_files(vec![a_file("other.txt", 1)], Vec::new())
+            .unwrap();
+        assert_eq!(second.released, None);
+        let (first, second) = (first.list_id.unwrap(), second.list_id.unwrap());
+        assert_ne!(first, second);
+        let locked = clipboard
+            .process(&server_asks(1, 1, FileContentsOp::Size, Some(9)))
+            .unwrap();
+        assert_eq!(asked_list(&locked), Some(first));
+        let current = clipboard
+            .process(&server_asks(2, 0, FileContentsOp::Size, None))
+            .unwrap();
+        assert_eq!(asked_list(&current), Some(second));
+        // The second list holds one file, so index 1 exists only under the lock.
+        let beyond = clipboard
+            .process(&server_asks(3, 1, FileContentsOp::Size, None))
+            .unwrap();
+        assert_eq!(asked_list(&beyond), None);
+
+        assert_eq!(
+            clipboard.process(&unlock(9)).unwrap(),
+            vec![ClipboardOutput::FilesReleased { list_id: first }]
+        );
+        assert_eq!(
+            clipboard
+                .process(&server_asks(4, 1, FileContentsOp::Size, Some(9)))
+                .unwrap(),
+            vec![ClipboardOutput::Send(pdu::encode_file_contents_response(
+                4, None
+            ))]
+        );
+    }
+
+    /// Unlocking the list still on the host's clipboard releases nothing.
+    #[test]
+    fn unlocking_the_current_list_keeps_it() {
+        let mut clipboard = ready();
+        clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        clipboard.process(&lock(9)).unwrap();
+        assert!(clipboard.process(&unlock(9)).unwrap().is_empty());
+        let asked = clipboard
+            .process(&server_asks(1, 0, FileContentsOp::Size, None))
+            .unwrap();
+        assert!(asked_list(&asked).is_some());
+    }
+
+    /// A list the host replaces while nothing locks it is released at once.
+    #[test]
+    fn an_unlocked_list_is_released_by_the_next_announcement() {
+        let mut clipboard = ready();
+        let files = clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        let text = clipboard.announce(vec![unicode_text()]);
+        assert_eq!(text.released, files.list_id);
+        assert_eq!(text.list_id, None);
+        assert_eq!(
+            clipboard
+                .process(&server_asks(1, 0, FileContentsOp::Size, None))
+                .unwrap(),
+            vec![ClipboardOutput::Send(pdu::encode_file_contents_response(
+                1, None
+            ))]
+        );
+    }
+
+    /// 3.1.5.3.2 and 3.1.5.3.4: a lock with no files stores nothing, and an unlock for an id
+    /// that stores nothing is ignored.
+    #[test]
+    fn locks_without_files_are_ignored() {
+        let mut clipboard = ready();
+        assert!(clipboard.process(&lock(1)).unwrap().is_empty());
+        clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        assert_eq!(
+            clipboard
+                .process(&server_asks(1, 0, FileContentsOp::Size, Some(1)))
+                .unwrap(),
+            vec![ClipboardOutput::Send(pdu::encode_file_contents_response(
+                1, None
+            ))]
+        );
+        assert!(clipboard.process(&unlock(2)).unwrap().is_empty());
+    }
+
+    /// A lock id taken again moves to the files on the clipboard now, and a list it was the
+    /// last lock on is released.
+    #[test]
+    fn a_lock_id_taken_again_moves() {
+        let mut clipboard = ready();
+        let first = clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        clipboard.process(&lock(9)).unwrap();
+        let second = clipboard
+            .announce_files(vec![a_file("other.txt", 1)], Vec::new())
+            .unwrap();
+        assert_eq!(
+            clipboard.process(&lock(9)).unwrap(),
+            vec![ClipboardOutput::FilesReleased {
+                list_id: first.list_id.unwrap()
+            }]
+        );
+        let asked = clipboard
+            .process(&server_asks(1, 0, FileContentsOp::Size, Some(9)))
+            .unwrap();
+        assert_eq!(asked_list(&asked), second.list_id);
+    }
+
+    /// The server's locks are bounded; one past the bound is not kept.
+    #[test]
+    fn server_locks_are_bounded() {
+        let mut clipboard = ready();
+        clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        for id in 1..=MAX_SERVER_LOCKS as u32 + 1 {
+            clipboard.process(&lock(id)).unwrap();
+        }
+        let kept = clipboard
+            .process(&server_asks(
+                1,
+                0,
+                FileContentsOp::Size,
+                Some(MAX_SERVER_LOCKS as u32),
+            ))
+            .unwrap();
+        assert!(asked_list(&kept).is_some());
+        let over = clipboard
+            .process(&server_asks(
+                2,
+                0,
+                FileContentsOp::Size,
+                Some(MAX_SERVER_LOCKS as u32 + 1),
+            ))
+            .unwrap();
+        assert_eq!(asked_list(&over), None);
+    }
+
+    /// A new Monitor Ready releases every list the host announced, and its initial Format List
+    /// names no files.
+    #[test]
+    fn a_new_monitor_ready_releases_the_host_files() {
+        let mut clipboard = ready();
+        let first = clipboard
+            .announce_files(host_files(), vec![unicode_text()])
+            .unwrap();
+        clipboard.process(&lock(9)).unwrap();
+        let second = clipboard.announce_files(host_files(), Vec::new()).unwrap();
+        clipboard
+            .process(&server_asks(1, 0, FileContentsOp::Size, None))
+            .unwrap();
+        let outputs = clipboard.process(&VM_MONITOR_READY).unwrap();
+        let released: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                ClipboardOutput::FilesReleased { list_id } => Some(*list_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            released,
+            vec![first.list_id.unwrap(), second.list_id.unwrap()]
+        );
+        assert_eq!(sent(&outputs)[1], encode_format_list(&[], true));
+        assert_eq!(
+            clipboard.respond_file_size(1, Some(1)),
+            Err(FileRespondError::NotRequested)
+        );
+    }
+
+    fn file_list_format_in(offer: &Announcement) -> u32 {
+        match pdu::ClipboardPdu::decode(offer.message.as_ref().unwrap(), true).unwrap() {
+            ClipboardPdu::FormatList(formats) => {
+                formats
+                    .iter()
+                    .find(|f| f.name == pdu::FILE_GROUP_DESCRIPTOR_W)
+                    .unwrap()
+                    .id
+            }
+            other => panic!("expected a Format List, got {other:?}"),
+        }
     }
 
     /// A new Monitor Ready starts over: waits and locks from before it are gone.
