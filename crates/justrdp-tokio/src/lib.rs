@@ -4493,6 +4493,134 @@ mod tests {
         .await
     }
 
+    /// Real-VM acceptance for #336: the device redirection initialization completes and the
+    /// server accepts a host drive. `rdpsnd` is requested beside `rdpdr`, because this server
+    /// starts `rdpdr` only then, and nothing ever answers it. Every Device I/O Request is
+    /// refused at this stage; the ones the server sends unprompted are recorded.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn the_device_redirection_handshake_accepts_a_drive_on_the_real_vm() {
+        use justrdp::rdpdr::{self, DeviceRedirection, DeviceRedirectionOutput, Drive};
+        use justrdp_pdu::rdpdr::RdpdrPdu;
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![
+                rdpdr::channel_def(),
+                gcc::ChannelDef::new("rdpsnd", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
+            ];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let granted = |name: &str| {
+                outcome
+                    .mcs
+                    .static_channels
+                    .iter()
+                    .find(|c| c.name == name)
+                    .unwrap_or_else(|| panic!("the VM grants {name}"))
+                    .id
+            };
+            let (channel, rdpsnd) = (granted("rdpdr"), granted("rdpsnd"));
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let (tx, mut commands) = tokio::sync::mpsc::channel(64);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let answered = Arc::new(AtomicBool::new(false));
+            // The session ends once the drive is answered, the server has had 10 s more to send
+            // requests of its own, and the desktop has painted and settled.
+            let watcher = {
+                let (frames, answered, done) = (frames.clone(), answered.clone(), cancel.clone());
+                tokio::spawn(async move {
+                    let settled = vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await;
+                    while !answered.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    done.cancel();
+                    settled
+                })
+            };
+            let frames_in_sink = frames.clone();
+            let mut redirection = DeviceRedirection::new(
+                "justrdp-test",
+                vec![Drive {
+                    device_id: 1,
+                    name: "justrdp".to_string(),
+                }],
+                0x5EED_1D00,
+            )
+            .expect("the drive is valid");
+            let mut answers = Vec::new();
+            let mut requests = Vec::new();
+            let mut rdpsnd_messages = 0;
+            let ended = tokio::time::timeout(
+                Duration::from_secs(120),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        let SessionEvent::ChannelData { channel: on, data } = event else {
+                            return;
+                        };
+                        if on == rdpsnd {
+                            rdpsnd_messages += 1;
+                            return;
+                        }
+                        assert_eq!(on, channel, "only rdpdr and rdpsnd were requested");
+                        match RdpdrPdu::decode(&data) {
+                            Ok(RdpdrPdu::IoRequest(request)) => requests.push(request),
+                            other => eprintln!("server: {other:?}"),
+                        }
+                        for output in redirection.process(&data) {
+                            match output {
+                                DeviceRedirectionOutput::Send(data) => tx
+                                    .try_send(SessionCommand::ChannelData { channel, data })
+                                    .expect("the command queue has room"),
+                                DeviceRedirectionOutput::Terminated(error) => {
+                                    panic!("the VM's rdpdr messages decode: {error}")
+                                }
+                                answer => {
+                                    answers.push(answer);
+                                    answered.store(true, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            ended
+                .expect("the drive was answered and the desktop settled within 120 s")
+                .expect("the session ran without a protocol failure");
+            watcher
+                .await
+                .expect("the watcher task")
+                .expect("the desktop painted and settled");
+            eprintln!("rdpsnd messages, unanswered: {rdpsnd_messages}");
+            for request in &requests {
+                eprintln!("refused: {request:?}");
+            }
+            assert_eq!(
+                answers,
+                vec![DeviceRedirectionOutput::DriveAccepted { device_id: 1 }],
+                "the server accepts the drive"
+            );
+        })
+        .await
+    }
+
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn save_session_info_reaches_the_host_against_real_vm() {
