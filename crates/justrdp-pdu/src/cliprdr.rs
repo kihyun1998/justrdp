@@ -84,6 +84,8 @@ pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_DESCRIPTOR_SIZE: usize = 592;
 /// The size of a descriptor's `fileName` field.
 const FILE_NAME_BYTES: usize = 520;
+/// The most UTF-16 code units a descriptor's name holds before its NUL.
+pub const FILE_NAME_MAX_UNITS: usize = FILE_NAME_BYTES / 2 - 1;
 
 /// One file in a `CLIPRDR_FILELIST` (2.2.5.2.3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -589,11 +591,7 @@ fn decode_file_descriptor(d: &[u8; FILE_DESCRIPTOR_SIZE]) -> Result<FileDescript
             reason: "the name has no terminator",
         })?;
     let name = utf16_to_string(units.take(len));
-    let escapes = name.contains(':')
-        || name
-            .split(['\\', '/'])
-            .any(|part| part.is_empty() || part == "." || part == "..");
-    if escapes {
+    if !is_contained_file_name(&name) {
         return Err(DecodeError::InvalidField {
             field: "CLIPRDR_FILEDESCRIPTOR.fileName",
             reason: "the name is not a relative path inside the paste target",
@@ -608,6 +606,15 @@ fn decode_file_descriptor(d: &[u8; FILE_DESCRIPTOR_SIZE]) -> Result<FileDescript
     })
 }
 
+/// Whether `name` is a relative path inside the paste target: no `:`, and no empty, `.` or `..`
+/// component between `\` or `/` separators, so not empty either.
+pub fn is_contained_file_name(name: &str) -> bool {
+    !name.contains(':')
+        && !name
+            .split(['\\', '/'])
+            .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
 /// `CLIPRDR_FILELIST` data for `files`. A name longer than 259 UTF-16 code units is cut.
 pub fn encode_file_list(files: &[FileDescriptor]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + files.len() * FILE_DESCRIPTOR_SIZE);
@@ -620,7 +627,7 @@ pub fn encode_file_list(files: &[FileDescriptor]) -> Vec<u8> {
         let size = file.size.unwrap_or(0);
         d[64..68].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
         d[68..72].copy_from_slice(&(size as u32).to_le_bytes());
-        let name = file.name.encode_utf16().take(FILE_NAME_BYTES / 2 - 1);
+        let name = file.name.encode_utf16().take(FILE_NAME_MAX_UNITS);
         for (slot, unit) in d[72..72 + FILE_NAME_BYTES]
             .as_chunks_mut::<2>()
             .0

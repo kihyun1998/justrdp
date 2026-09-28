@@ -29,7 +29,7 @@ use sspi::generator::GeneratorState;
 use sspi::negotiate::NegotiateConfig;
 use sspi::ntlm::NtlmConfig;
 use sspi::{AuthIdentity, Credentials as SspiCredentials, Secret, Username};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -98,11 +98,17 @@ enum Transport {
     Absent,
 }
 
+/// Write `bytes` and flush, so no part of them waits in the TLS session for a later write.
+async fn write_frame(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> io::Result<()> {
+    stream.write_all(bytes).await?;
+    stream.flush().await
+}
+
 impl Transport {
     async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
-            Transport::Tcp(s) => s.write_all(bytes).await,
-            Transport::Tls(s) => s.write_all(bytes).await,
+            Transport::Tcp(s) => write_frame(s, bytes).await,
+            Transport::Tls(s) => write_frame(s, bytes).await,
             Transport::Absent => Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "write before the socket is connected",
@@ -369,10 +375,11 @@ pub async fn connect_with_options(
 /// Apply the connect-time socket options to a freshly dialed session socket.
 ///
 /// Disables Nagle (`TCP_NODELAY`): the session carries tiny interactive input PDUs (a fast-path
-/// input PDU is ~10-20 bytes), each written one `write_all` at a time. With Nagle on, such a small
-/// write can be held until the server's delayed ACK arrives (~40-200 ms), landing directly on
-/// perceived input latency. Interactive RDP clients (mstsc, FreeRDP) set `TCP_NODELAY` as standard
-/// practice. One call covers the whole connection — the TLS stream rides this same socket (#82).
+/// input PDU is ~10-20 bytes), each written and flushed on its own (`write_frame`). With Nagle
+/// on, such a small write can be held until the server's delayed ACK arrives (~40-200 ms), landing
+/// directly on perceived input latency. Interactive RDP clients (mstsc, FreeRDP) set
+/// `TCP_NODELAY` as standard practice. One call covers the whole connection — the TLS stream
+/// rides this same socket (#82).
 fn configure_session_socket(s: &TcpStream) -> io::Result<()> {
     s.set_nodelay(true)
 }
@@ -799,7 +806,9 @@ pub async fn run_session_with_input(
                     on_cursor(&event);
                 }
                 SessionOutput::WriteBytes(bytes) => {
-                    stream.write_all(&bytes).await.map_err(SessionFailure::Io)?;
+                    write_frame(stream, &bytes)
+                        .await
+                        .map_err(SessionFailure::Io)?;
                 }
                 SessionOutput::ShutdownDenied => {
                     // Same shape as the line below: this entry point has no event sink, so the
@@ -858,7 +867,7 @@ pub async fn run_session_with_input(
                                 bytes = frame.len(),
                                 "input pdu"
                             );
-                            stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                            write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
                         }
                     }
                     // Sender dropped: stop polling the channel, keep the session alive.
@@ -984,7 +993,9 @@ pub async fn run_session_with_commands(
                 SessionOutput::Frame(frame) => on_frame(&frame, machine.framebuffer()),
                 SessionOutput::Cursor(event) => on_cursor(&event),
                 SessionOutput::WriteBytes(bytes) => {
-                    stream.write_all(&bytes).await.map_err(SessionFailure::Io)?;
+                    write_frame(stream, &bytes)
+                        .await
+                        .map_err(SessionFailure::Io)?;
                 }
                 SessionOutput::DisplayControlReady => {
                     tracing::debug!(target: "rdp_displaycontrol_caps", "display control ready");
@@ -1035,7 +1046,7 @@ pub async fn run_session_with_commands(
                 match command {
                     Some(SessionCommand::Input(events)) => {
                         for frame in machine.encode_input(&events) {
-                            stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                            write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
                         }
                     }
                     Some(SessionCommand::Resize { width, height }) => {
@@ -1043,7 +1054,7 @@ pub async fn run_session_with_commands(
                             Ok(frames) => {
                                 tracing::info!(width, height, "resize requested");
                                 for frame in frames {
-                                    stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                                    write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
                                 }
                             }
                             // Not fatal: the session is unaffected, the host may retry
@@ -1054,14 +1065,14 @@ pub async fn run_session_with_commands(
                     Some(SessionCommand::Shutdown) => {
                         tracing::info!("shutdown requested");
                         for frame in machine.request_shutdown() {
-                            stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                            write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
                         }
                     }
                     Some(SessionCommand::ChannelData { channel, data }) => {
                         match machine.send_channel(channel, &data) {
                             Ok(frames) => {
                                 for frame in frames {
-                                    stream.write_all(&frame).await.map_err(SessionFailure::Io)?;
+                                    write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
                                 }
                             }
                             // Not fatal: the session is unaffected.
@@ -1213,7 +1224,7 @@ async fn write_ts_request(
         .map_err(|e| ConnectFailure::Nla {
             reason: e.to_string(),
         })?;
-    stream.write_all(&buf).await?;
+    write_frame(stream, &buf).await?;
     Ok(())
 }
 
@@ -2733,7 +2744,9 @@ mod tests {
                         commands_tx
                             .send(SessionCommand::ChannelData {
                                 channel,
-                                data: list.expect("the handshake is done, so the list is sent now"),
+                                data: list
+                                    .message
+                                    .expect("the handshake is done, so the list is sent now"),
                             })
                             .await
                             .map_err(|_| "the session closed".to_string())?;
@@ -3135,7 +3148,9 @@ mod tests {
                         commands_tx
                             .send(SessionCommand::ChannelData {
                                 channel,
-                                data: list.expect("the handshake is done, so the list is sent now"),
+                                data: list
+                                    .message
+                                    .expect("the handshake is done, so the list is sent now"),
                             })
                             .await
                             .map_err(|_| "the session closed".to_string())?;
@@ -3650,6 +3665,344 @@ mod tests {
             assert!(
                 received == big,
                 "big.bin arrives byte-exact across the later copy"
+            );
+        })
+        .await
+    }
+
+    /// Real-VM acceptance for #325: files copied on the host are pasted on the server
+    /// byte-exact. The host announces `small.txt` and a 300,000-byte `big.bin`, larger than one
+    /// of the server's ranges; PowerShell pastes them into a folder through the shell, checks
+    /// the bytes against the pattern it generates itself, and copies the verdict as text. Every
+    /// request names the server's lock and is served from the list it locked: right after
+    /// serving the first range of `big.bin` the host copies other files, so the rest arrives
+    /// only under that lock.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn files_copied_on_the_host_paste_on_the_server_on_the_real_vm() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+        use justrdp_pdu::cliprdr::{
+            CF_UNICODETEXT, ClipboardPdu, FD_ATTRIBUTES, FD_FILESIZE, FileContentsOp,
+            FileDescriptor, decode_unicode_text,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const BIG: usize = 300_000;
+        const SMALL_TEXT: &str = "hello 파일";
+        const SCRIPT: &str = "Add-Type -A System.Windows.Forms;$d=\"$env:TEMP\\pasted\";\
+            ri $d -r -fo -ea 0;ni $d -it d|out-null;\
+            $f=[Windows.Forms.Clipboard]::GetDataObject().GetFormats() -join '|';\
+            (New-Object -ComObject Shell.Application).Namespace($d).Self.InvokeVerb('Paste');\
+            $t=0;while($t -lt 600 -and -not ((Test-Path \"$d\\big.bin\") -and \
+            (gi \"$d\\big.bin\").Length -eq 300000 -and (Test-Path \"$d\\small.txt\"))){sleep -m 100;$t++};\
+            sleep 1;$b=[IO.File]::ReadAllBytes(\"$d\\big.bin\");$ok=$b.Length -eq 300000;\
+            for($i=0;$ok -and $i -lt 300000;$i++){if($b[$i] -ne ($i*7+3)%251){$ok=$false}};\
+            $s=[IO.File]::ReadAllText(\"$d\\small.txt\") -ceq 'hello 파일';\
+            Set-Clipboard -Value \"pasted big=$ok small=$s n=$((gci $d).Count) f=$f\"";
+        let big: Arc<Vec<u8>> = Arc::new((0..BIG).map(|i| ((i * 7 + 3) % 251) as u8).collect());
+        let file = |name: &str, size: usize| FileDescriptor {
+            flags: FD_ATTRIBUTES | FD_FILESIZE,
+            attributes: 0x20,
+            last_write_time: 0,
+            size: Some(size as u64),
+            name: name.to_string(),
+        };
+        let first_list = vec![file("small.txt", SMALL_TEXT.len()), file("big.bin", BIG)];
+        let other_list = vec![file("other.txt", 5)];
+
+        /// A server File Contents Request as it arrived, and which host list it resolved to.
+        #[derive(Debug, Clone)]
+        struct Asked {
+            index: u32,
+            op: FileContentsOp,
+            clip_data_id: Option<u32>,
+            list_id: Option<u32>,
+        }
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![cliprdr::channel_def()];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let channel = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "cliprdr")
+                .expect("the VM grants cliprdr")
+                .id;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(4096);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let clipboard = Arc::new(Mutex::new(Clipboard::new()));
+            let handshake_done = Arc::new(AtomicBool::new(false));
+            let first_list_id = Arc::new(Mutex::new(None::<u32>));
+            let switched = Arc::new(AtomicBool::new(false));
+            let asked = Arc::new(Mutex::new(Vec::<Asked>::new()));
+            let released = Arc::new(Mutex::new(Vec::<u32>::new()));
+            let (verdict_tx, mut verdict) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let driver = {
+                let (frames, cancel, clipboard, handshake_done, first_list_id) = (
+                    frames.clone(),
+                    cancel.clone(),
+                    clipboard.clone(),
+                    handshake_done.clone(),
+                    first_list_id.clone(),
+                );
+                let first_list = first_list.clone();
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        let start = tokio::time::Instant::now();
+                        while !handshake_done.load(Ordering::SeqCst) {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err("the clipboard handshake never completed".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        let offer = clipboard
+                            .lock()
+                            .unwrap()
+                            .announce_files(first_list, Vec::new())
+                            .map_err(|e| format!("{e:?}"))?;
+                        *first_list_id.lock().unwrap() = offer.list_id;
+                        commands_tx
+                            .send(SessionCommand::ChannelData {
+                                channel,
+                                data: offer.message.ok_or("the handshake is done")?,
+                            })
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+
+                        let enter = {
+                            let key = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
+                            vec![key.press(), key.release()]
+                        };
+                        vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        for unit in SCRIPT.encode_utf16() {
+                            input_tx
+                                .send(vec![
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: false,
+                                    },
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: true,
+                                    },
+                                ])
+                                .await
+                                .map_err(|_| "the session closed".to_string())?;
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        input_tx
+                            .send(enter)
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+
+                        tokio::time::timeout(Duration::from_secs(150), verdict.recv())
+                            .await
+                            .map_err(|_| "no verdict from the server within 150 s".to_string())?
+                            .ok_or_else(|| "the session closed".to_string())
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let frames_in_sink = frames.clone();
+            let (asked_in, released_in, switched_in) =
+                (asked.clone(), released.clone(), switched.clone());
+            let ended = tokio::time::timeout(
+                Duration::from_secs(300),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        let SessionEvent::ChannelData { channel: on, data } = event else {
+                            return;
+                        };
+                        assert_eq!(on, channel, "only cliprdr was requested");
+                        let mut clipboard = clipboard.lock().unwrap();
+                        let raw = ClipboardPdu::decode(&data, true);
+                        match &raw {
+                            Ok(ClipboardPdu::FileContentsRequest(_)) => {}
+                            other => eprintln!("server: {other:?}"),
+                        }
+                        let outputs = clipboard
+                            .process(&data)
+                            .expect("the VM's clipboard message decodes");
+                        let send = |data: Vec<u8>| {
+                            commands_tx
+                                .try_send(SessionCommand::ChannelData { channel, data })
+                                .expect("the command queue has room")
+                        };
+                        for output in outputs {
+                            match output {
+                                ClipboardOutput::Send(data) => send(data),
+                                ClipboardOutput::FormatListResponse { ok } => {
+                                    assert!(ok, "the server accepts the host's Format List");
+                                    handshake_done.store(true, Ordering::SeqCst);
+                                }
+                                ClipboardOutput::RemoteFormatList(formats) => {
+                                    // The server announces a copy twice; one request is enough.
+                                    if formats.iter().any(|f| f.id == CF_UNICODETEXT)
+                                        && let Ok(request) = clipboard.request(CF_UNICODETEXT)
+                                    {
+                                        send(request);
+                                    }
+                                }
+                                ClipboardOutput::FormatData { data, .. } => {
+                                    let text = decode_unicode_text(&data.unwrap_or_default());
+                                    eprintln!("server text: {text:?}");
+                                    if text.starts_with("pasted") {
+                                        let _ = verdict_tx.send(text);
+                                    }
+                                }
+                                ClipboardOutput::FileContentsRequested {
+                                    stream_id,
+                                    list_id,
+                                    index,
+                                    op,
+                                } => {
+                                    let clip_data_id = match &raw {
+                                        Ok(ClipboardPdu::FileContentsRequest(r)) => r.clip_data_id,
+                                        _ => None,
+                                    };
+                                    asked_in.lock().unwrap().push(Asked {
+                                        index,
+                                        op,
+                                        clip_data_id,
+                                        list_id: Some(list_id),
+                                    });
+                                    let first = Some(list_id) == *first_list_id.lock().unwrap();
+                                    let bytes: &[u8] = match (first, index) {
+                                        (true, 0) => SMALL_TEXT.as_bytes(),
+                                        (true, _) => &big,
+                                        (false, _) => b"other",
+                                    };
+                                    let answer = match op {
+                                        FileContentsOp::Size => clipboard
+                                            .respond_file_size(stream_id, Some(bytes.len() as u64)),
+                                        FileContentsOp::Range { position, len } => {
+                                            let from = (position as usize).min(bytes.len());
+                                            let to = (from + len as usize).min(bytes.len());
+                                            clipboard.respond_file_range(
+                                                stream_id,
+                                                Some(&bytes[from..to]),
+                                            )
+                                        }
+                                    };
+                                    send(answer.expect("the request waits for this answer"));
+                                    let big_range = first
+                                        && index == 1
+                                        && matches!(op, FileContentsOp::Range { .. });
+                                    if big_range && !switched_in.swap(true, Ordering::SeqCst) {
+                                        let offer = clipboard
+                                            .announce_files(other_list.clone(), Vec::new())
+                                            .expect("streaming is negotiated");
+                                        send(offer.message.expect("the handshake is done"));
+                                    }
+                                }
+                                ClipboardOutput::FilesReleased { list_id } => {
+                                    released_in.lock().unwrap().push(list_id);
+                                }
+                                other => panic!("nothing else was asked for: {other:?}"),
+                            }
+                        }
+                        // What the server asked for that the helper refused never reached here.
+                        if let Ok(ClipboardPdu::FileContentsRequest(r)) = &raw {
+                            let reached = asked_in.lock().unwrap().iter().any(|a| {
+                                a.index == r.index
+                                    && a.op == r.op
+                                    && a.clip_data_id == r.clip_data_id
+                            });
+                            if !reached {
+                                eprintln!("refused: {r:?}");
+                                asked_in.lock().unwrap().push(Asked {
+                                    index: r.index,
+                                    op: r.op,
+                                    clip_data_id: r.clip_data_id,
+                                    list_id: None,
+                                });
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+            ended
+                .expect("the session ended within 300 s")
+                .expect("the session ran without a protocol failure");
+            let asked = asked.lock().unwrap().clone();
+            for a in &asked {
+                eprintln!("asked: {a:?}");
+            }
+            let verdict = driven.expect("the desktop was driven");
+
+            assert!(
+                verdict.starts_with("pasted big=True small=True n=2 f=FileGroupDescriptorW"),
+                "{verdict}"
+            );
+            let first = first_list_id
+                .lock()
+                .unwrap()
+                .expect("the host announced files");
+            assert!(
+                asked.iter().all(|a| a.list_id == Some(first)),
+                "every request was served from the first list"
+            );
+            let big_ranges: Vec<_> = asked
+                .iter()
+                .filter(|a| a.index == 1 && matches!(a.op, FileContentsOp::Range { .. }))
+                .collect();
+            assert!(
+                big_ranges.len() >= 2,
+                "big.bin took more than one range, so part of it came after the host's copy"
+            );
+            assert!(switched.load(Ordering::SeqCst));
+            assert!(
+                asked.iter().all(|a| a.clip_data_id.is_some()),
+                "the server locks what it pastes"
+            );
+            assert_eq!(
+                *released.lock().unwrap(),
+                vec![first],
+                "the server's unlock after the paste releases the list it pinned"
             );
         })
         .await
@@ -5427,6 +5780,102 @@ mod tests {
             matches!(result, Ok(Ok(DisconnectReason::LocalClosed))),
             "cancellation should end the loop cleanly as LocalClosed, got {result:?}"
         );
+    }
+
+    /// A large channel message reaches the server whole with nothing written after it (#325).
+    /// The mock reads nothing at first, so the client's socket fills mid-message, then reads
+    /// slowly. TLS ciphertext that could not be written when the socket filled leaves only on a
+    /// flush or a later write, and the client writes nothing later.
+    #[tokio::test]
+    async fn a_large_channel_message_is_written_whole() {
+        const CHANNEL: u16 = 1004;
+        let config = justrdp::SessionConfig {
+            user_channel_id: 1007,
+            io_channel_id: 1003,
+            share_id: 0x0001_03EA,
+            desktop_size: (16, 8),
+            capabilities: Vec::new(),
+            server_input_flags: 0,
+            drdynvc_channel_id: None,
+            static_channels: vec![justrdp::StaticChannel {
+                name: "cliprdr".to_string(),
+                id: CHANNEL,
+                options: 0,
+            }],
+            egfx: Default::default(),
+        };
+        let message = vec![0x5A; 8 * 1024 * 1024];
+        let expected: usize = SessionStateMachine::new(config.clone(), Vec::new())
+            .unwrap()
+            .send_channel(CHANNEL, &message)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = ck.signing_key.serialize_der();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut received = 0;
+            while received < expected {
+                match tls.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let _ = received_tx.send(received);
+            let mut rest = [0u8; 256];
+            while let Ok(n) = tls.read(&mut rest).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
+        let mut stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), sock)
+            .await
+            .unwrap();
+        let mut machine = SessionStateMachine::new(config, Vec::new()).unwrap();
+        let (tx, mut commands) = tokio::sync::mpsc::channel(4);
+        tx.send(SessionCommand::ChannelData {
+            channel: CHANNEL,
+            data: message,
+        })
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let session = run_session_with_commands(
+            &mut stream,
+            &mut machine,
+            |_, _fb| {},
+            |_| {},
+            |_| {},
+            &mut commands,
+            &cancel,
+        );
+        let received = tokio::select! {
+            received = tokio::time::timeout(Duration::from_secs(20), received_rx) => received,
+            ended = session => panic!("the session ended first: {ended:?}"),
+        };
+        let received = received
+            .expect("the whole message within 20 s")
+            .expect("the mock reports what it received");
+        assert_eq!(received, expected);
     }
 
     /// Cursor events reach the host's synchronous cursor sink (issue #41), mirroring the

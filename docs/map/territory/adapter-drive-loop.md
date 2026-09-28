@@ -43,6 +43,20 @@ read as the adapter growing a third of its size.
   subscriber, so observability does not compromise portability.
 - **The VM-dependent tests live here and are `#[ignore]`d**, which is why the
   coverage job excludes this crate.
+- **Every write goes out through `write_frame`, which flushes** (#325). The connect driver, the
+  CredSSP loop and all three session runners use it. The trap: `tokio-rustls`'s
+  `poll_write` returns `Ok(n)` once rustls has taken the plaintext, even when the socket
+  would block on the ciphertext (0.26.5, `common/mod.rs`). Unflushed, that ciphertext stays
+  in the TLS session until the next write, and before #325 nothing flushed. Small messages
+  never filled the socket, and later traffic always pushed the rest out, so the bug stayed
+  hidden until a 262,156-byte clipboard response was the last thing written. Measured on the
+  VM (#325): with nothing written after it, the server never got the rest, 3 of 3 runs; with
+  the flush, 3 of 3 arrived. A Format List written after it by chance rescued 4 of 6 runs.
+  Flushing every write, rather than once per batch, is a derivation; the flush on an empty
+  session costs one socket poll. `a_large_channel_message_is_written_whole` is the
+  regression test: a mock server stops reading so the client's socket fills mid-message.
+  **Fixing it in #325 rather than in its own issue was the maintainer's call (2026-09-28)**,
+  after being shown two alternatives: file it and fix it first, or fix only the channel path.
 
 ## Code
 
@@ -51,7 +65,7 @@ read as the adapter growing a third of its size.
   `configure_session_socket`, `Transport`, `ConnectOutcome`, `ConnectOptions`,
   `ConnectTimeouts`, `ConnectFailure`, `Credentials`, `ServerAddr`, `run_session`,
   `run_session_with_input`, `run_session_with_commands`, `SessionCommand`,
-  `SessionEvent`, `SessionFailure`, `generate_license_entropy`
+  `SessionEvent`, `SessionFailure`, `generate_license_entropy`, `write_frame`
 - `justrdp-tokio/src/trust.rs` — the injected policy (see
   [TLS transport security](tls-transport-security.md))
 
