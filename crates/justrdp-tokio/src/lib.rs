@@ -4495,12 +4495,15 @@ mod tests {
 
     /// Real-VM acceptance for #336: the device redirection initialization completes and the
     /// server accepts a host drive. `rdpsnd` is requested beside `rdpdr`, because this server
-    /// starts `rdpdr` only then, and nothing ever answers it. Every Device I/O Request is
-    /// refused at this stage; the ones the server sends unprompted are recorded.
+    /// starts `rdpdr` only then, and nothing ever answers it. The host has no files here, so
+    /// it refuses whatever the server asks; the requests the server sends unprompted are
+    /// recorded.
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn the_device_redirection_handshake_accepts_a_drive_on_the_real_vm() {
-        use justrdp::rdpdr::{self, DeviceRedirection, DeviceRedirectionOutput, Drive};
+        use justrdp::rdpdr::{
+            self, DeviceRedirection, DeviceRedirectionOutput, Drive, DriveRequest,
+        };
         use justrdp_pdu::rdpdr::RdpdrPdu;
 
         with_vm_session(|vm| async move {
@@ -4589,6 +4592,23 @@ mod tests {
                                 DeviceRedirectionOutput::Terminated(error) => {
                                     panic!("the VM's rdpdr messages decode: {error}")
                                 }
+                                DeviceRedirectionOutput::DriveRequest {
+                                    completion_id,
+                                    request: DriveRequest::Open { .. },
+                                    ..
+                                } => {
+                                    let refused = redirection
+                                        .respond_open(completion_id, Err(0xC000_0022))
+                                        .expect("the Open waits for this answer");
+                                    tx.try_send(SessionCommand::ChannelData {
+                                        channel,
+                                        data: refused,
+                                    })
+                                    .expect("the command queue has room");
+                                }
+                                other @ DeviceRedirectionOutput::DriveRequest { .. } => {
+                                    panic!("only files are opened, and none exist: {other:?}")
+                                }
                                 answer => {
                                     answers.push(answer);
                                     answered.store(true, Ordering::SeqCst);
@@ -4616,6 +4636,378 @@ mod tests {
                 answers,
                 vec![DeviceRedirectionOutput::DriveAccepted { device_id: 1 }],
                 "the server accepts the drive"
+            );
+        })
+        .await
+    }
+
+    /// Real-VM acceptance for #337: the server lists a host drive's folders. The host serves an
+    /// in-memory tree; PowerShell lists `\\tsclient\justrdp` recursively and copies the names
+    /// and sizes as text, which comes back over the clipboard. Every Device I/O Request is
+    /// recorded by major and minor function and information class.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn the_server_lists_a_host_drive_on_the_real_vm() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+        use justrdp::rdpdr::{
+            self, DeviceRedirection, DeviceRedirectionOutput, DirectoryEntry, Disposition, Drive,
+            DriveRequest, FileInformation, OpenKind, Opened, VolumeInformation,
+        };
+        use justrdp_pdu::cliprdr::{CF_UNICODETEXT, decode_unicode_text};
+        use justrdp_pdu::rdpdr::{FILE_ATTRIBUTE_DIRECTORY, IoBody, RdpdrPdu};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const SCRIPT: &str = "try{$r=(gci \\\\tsclient\\justrdp -r -ea Stop|%{$_.Name+'='+\
+            $(if($_.PSIsContainer){'d'}else{$_.Length})}|sort) -join ';';\
+            $d=(cmd /c dir \\\\tsclient\\justrdp\\sub 2>&1) -join '|';\
+            Set-Clipboard -Value \"listed $r ## $d\"}catch{Set-Clipboard -Value \"listed error $_\"}";
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+
+        /// The host's tree: every path, and what is there.
+        fn tree() -> HashMap<Vec<String>, FileInformation> {
+            let at = |time: u64, size: u64, directory: bool| FileInformation {
+                creation_time: time,
+                last_access_time: time,
+                last_write_time: time,
+                change_time: time,
+                end_of_file: size,
+                allocation_size: size.div_ceil(4096) * 4096,
+                attributes: if directory {
+                    FILE_ATTRIBUTE_DIRECTORY
+                } else {
+                    0x20
+                },
+            };
+            // 2026-01-01 as a FILETIME.
+            let t = 134_116_992_000_000_000;
+            let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            HashMap::from([
+                (path(&[]), at(t, 0, true)),
+                (path(&["hello.txt"]), at(t, 12, false)),
+                (path(&["big.bin"]), at(t, 300_000, false)),
+                (path(&["sub"]), at(t, 0, true)),
+                (path(&["sub", "inner.txt"]), at(t, 5, false)),
+            ])
+        }
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![
+                rdpdr::channel_def(),
+                gcc::ChannelDef::new("rdpsnd", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
+                cliprdr::channel_def(),
+            ];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let granted = |name: &str| {
+                outcome
+                    .mcs
+                    .static_channels
+                    .iter()
+                    .find(|c| c.name == name)
+                    .unwrap_or_else(|| panic!("the VM grants {name}"))
+                    .id
+            };
+            let (drive_channel, clip_channel) = (granted("rdpdr"), granted("cliprdr"));
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(4096);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let ready = Arc::new(AtomicUsize::new(0));
+            let (verdict_tx, mut verdict) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+            let terminated = Arc::new(AtomicBool::new(false));
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let driver = {
+                let (frames, cancel, ready) = (frames.clone(), cancel.clone(), ready.clone());
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        // The clipboard handshake and the drive's acceptance.
+                        let start = tokio::time::Instant::now();
+                        while ready.load(Ordering::SeqCst) < 2 {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err(
+                                    "the clipboard or the drive never became ready".to_string()
+                                );
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        let enter = {
+                            let key = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
+                            vec![key.press(), key.release()]
+                        };
+                        vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        for unit in SCRIPT.encode_utf16() {
+                            input_tx
+                                .send(vec![
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: false,
+                                    },
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: true,
+                                    },
+                                ])
+                                .await
+                                .map_err(|_| "the session closed".to_string())?;
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        input_tx
+                            .send(enter)
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+                        tokio::time::timeout(Duration::from_secs(120), verdict.recv())
+                            .await
+                            .map_err(|_| "no listing from the server within 120 s".to_string())?
+                            .ok_or_else(|| "the session closed".to_string())
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let frames_in_sink = frames.clone();
+            let (requests_in, terminated_in, ready_in) =
+                (requests.clone(), terminated.clone(), ready.clone());
+            let mut clipboard = Clipboard::new();
+            let mut redirection = DeviceRedirection::new(
+                "justrdp-test",
+                vec![Drive {
+                    device_id: 1,
+                    name: "justrdp".to_string(),
+                }],
+                0x5EED_1D00,
+            )
+            .expect("the drive is valid");
+            let tree = tree();
+            let mut open: HashMap<u32, Vec<String>> = HashMap::new();
+            let volume = VolumeInformation {
+                label: "justrdp".to_string(),
+                serial_number: 0x1D00_5EED,
+                creation_time: 134_116_992_000_000_000,
+                total_units: 1 << 20,
+                available_units: 1 << 19,
+                sectors_per_unit: 8,
+                bytes_per_sector: 512,
+                file_system: "NTFS".to_string(),
+                file_system_attributes: 0x0000_0007,
+                max_component_length: 255,
+            };
+            let ended = tokio::time::timeout(
+                Duration::from_secs(300),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        let SessionEvent::ChannelData { channel, data } = event else {
+                            return;
+                        };
+                        let send = |channel, data| {
+                            commands_tx
+                                .try_send(SessionCommand::ChannelData { channel, data })
+                                .expect("the command queue has room")
+                        };
+                        if channel == clip_channel {
+                            for output in clipboard
+                                .process(&data)
+                                .expect("the VM's clipboard message decodes")
+                            {
+                                match output {
+                                    ClipboardOutput::Send(data) => send(clip_channel, data),
+                                    ClipboardOutput::FormatListResponse { .. } => {
+                                        ready_in.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                    ClipboardOutput::RemoteFormatList(formats) => {
+                                        if formats.iter().any(|f| f.id == CF_UNICODETEXT)
+                                            && let Ok(request) = clipboard.request(CF_UNICODETEXT)
+                                        {
+                                            send(clip_channel, request);
+                                        }
+                                    }
+                                    ClipboardOutput::FormatData { data, .. } => {
+                                        let text = decode_unicode_text(&data.unwrap_or_default());
+                                        if text.starts_with("listed") {
+                                            let _ = verdict_tx.send(text);
+                                        }
+                                    }
+                                    other => eprintln!("clipboard: {other:?}"),
+                                }
+                            }
+                            return;
+                        }
+                        if channel != drive_channel {
+                            return;
+                        }
+                        if let Ok(RdpdrPdu::IoRequest(r)) = RdpdrPdu::decode(&data) {
+                            let class = match &r.body {
+                                Ok(IoBody::QueryVolumeInformation { class })
+                                | Ok(IoBody::QueryInformation { class })
+                                | Ok(IoBody::QueryDirectory { class, .. }) => {
+                                    format!(" class {class}")
+                                }
+                                _ => String::new(),
+                            };
+                            eprintln!(
+                                "irp cid {} file {} major {} minor {}{class} body {:?}",
+                                r.completion_id, r.file_id, r.major, r.minor, r.body
+                            );
+                            requests_in
+                                .lock()
+                                .unwrap()
+                                .push(format!("major {} minor {}{class}", r.major, r.minor));
+                        }
+                        for output in redirection.process(&data) {
+                            let answer = match output {
+                                DeviceRedirectionOutput::Send(data) => Some(data),
+                                DeviceRedirectionOutput::DriveAccepted { .. } => {
+                                    ready_in.fetch_add(1, Ordering::SeqCst);
+                                    None
+                                }
+                                DeviceRedirectionOutput::DriveRequest {
+                                    completion_id,
+                                    request,
+                                    ..
+                                } => Some(
+                                    match request {
+                                        DriveRequest::Open {
+                                            file_id,
+                                            path,
+                                            kind,
+                                            disposition,
+                                            ..
+                                        } => {
+                                            let answer = match tree.get(&path) {
+                                                Some(info)
+                                                    if kind == OpenKind::Directory
+                                                        && !info.is_directory() =>
+                                                {
+                                                    Err(STATUS_NOT_A_DIRECTORY)
+                                                }
+                                                Some(info) => {
+                                                    open.insert(file_id, path);
+                                                    Ok(if info.is_directory() {
+                                                        Opened::Directory
+                                                    } else {
+                                                        Opened::File
+                                                    })
+                                                }
+                                                None if matches!(
+                                                    disposition,
+                                                    Disposition::Open | Disposition::Overwrite
+                                                ) =>
+                                                {
+                                                    Err(STATUS_OBJECT_NAME_NOT_FOUND)
+                                                }
+                                                None => Err(STATUS_ACCESS_DENIED),
+                                            };
+                                            redirection.respond_open(completion_id, answer)
+                                        }
+                                        DriveRequest::QueryVolume => {
+                                            redirection.respond_volume(completion_id, Ok(&volume))
+                                        }
+                                        DriveRequest::QueryInformation { file_id } => {
+                                            let info = open.get(&file_id).and_then(|p| tree.get(p));
+                                            redirection.respond_information(
+                                                completion_id,
+                                                info.ok_or(STATUS_OBJECT_NAME_NOT_FOUND),
+                                            )
+                                        }
+                                        DriveRequest::ListDirectory { path, .. } => {
+                                            let entries = tree
+                                                .iter()
+                                                .filter(|(p, _)| {
+                                                    p.len() == path.len() + 1
+                                                        && p[..path.len()] == path[..]
+                                                })
+                                                .map(|(p, info)| DirectoryEntry {
+                                                    name: p[path.len()].clone(),
+                                                    info: *info,
+                                                })
+                                                .collect();
+                                            redirection.respond_listing(completion_id, Ok(entries))
+                                        }
+                                    }
+                                    .expect("the request waits for this answer"),
+                                ),
+                                DeviceRedirectionOutput::FileClosed { file_id, .. } => {
+                                    open.remove(&file_id);
+                                    None
+                                }
+                                DeviceRedirectionOutput::Terminated(error) => {
+                                    eprintln!("rdpdr ended: {error}");
+                                    terminated_in.store(true, Ordering::SeqCst);
+                                    None
+                                }
+                                other => {
+                                    eprintln!("rdpdr: {other:?}");
+                                    None
+                                }
+                            };
+                            if let Some(data) = answer {
+                                send(drive_channel, data);
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+            ended
+                .expect("the session ended within 300 s")
+                .expect("the session ran without a protocol failure");
+            let requests = requests.lock().unwrap().clone();
+            let mut kinds = requests.clone();
+            kinds.sort();
+            kinds.dedup();
+            eprintln!("{} requests; kinds: {kinds:#?}", requests.len());
+            let verdict = driven.expect("the desktop was driven");
+            assert!(!terminated.load(Ordering::SeqCst), "the channel stayed up");
+            let (listed, dir) = verdict
+                .split_once(" ## ")
+                .unwrap_or_else(|| panic!("the listing ran: {verdict}"));
+            eprintln!("dir: {dir}");
+            assert_eq!(
+                listed,
+                "listed big.bin=300000;hello.txt=12;inner.txt=5;sub=d"
+            );
+            assert!(
+                dir.contains("inner.txt"),
+                "cmd's dir lists the folder: {dir}"
             );
         })
         .await

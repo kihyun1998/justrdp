@@ -1,5 +1,7 @@
 //! The device redirection channel (MS-RDPEFS) as a sans-IO helper the host drives: the
-//! initialization sequence (1.3.1) and the announcement of the host's drives. The session never
+//! initialization sequence (1.3.1), the announcement of the host's drives, and the drive
+//! requests the server sends, which reach the host as [`DeviceRedirectionOutput::DriveRequest`]
+//! and are answered by `CompletionId`. The session never
 //! interprets `rdpdr` bytes: the host requests the channel with [`channel_def`], feeds each
 //! `SessionOutput::ChannelData` message on it to [`DeviceRedirection::process`], and passes
 //! every [`DeviceRedirectionOutput::Send`] to `SessionStateMachine::send_channel`.
@@ -9,12 +11,18 @@
 
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::gcc::{CHANNEL_OPTION_INITIALIZED, ChannelDef};
+use std::collections::VecDeque;
+
 use justrdp_pdu::rdpdr::{
-    self as pdu, CAP_DRIVE_TYPE, CapabilitySet, DOS_NAME_SIZE, DRIVE_CAPABILITY_VERSION_02,
-    DeviceAnnounce, GENERAL_CAPABILITY_VERSION_02, GeneralCapability, IO_CODE1_ALWAYS_SET,
-    IoRequest, RDPDR_CLIENT_DISPLAY_NAME_PDU, RDPDR_DTYP_FILESYSTEM, RDPDR_USER_LOGGEDON_PDU,
-    RdpdrPdu, STATUS_NOT_SUPPORTED, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    self as pdu, CAP_DRIVE_TYPE, CapabilitySet, CreateRequest, DOS_NAME_SIZE,
+    DRIVE_CAPABILITY_VERSION_02, DeviceAnnounce, GENERAL_CAPABILITY_VERSION_02, GeneralCapability,
+    IO_CODE1_ALWAYS_SET, IoBody, IoRequest, RDPDR_CLIENT_DISPLAY_NAME_PDU, RDPDR_DTYP_FILESYSTEM,
+    RDPDR_USER_LOGGEDON_PDU, RdpdrPdu, STATUS_ACCESS_DENIED, STATUS_CANCELLED,
+    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_NO_MORE_FILES,
+    STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY, STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_INVALID,
+    STATUS_SUCCESS, STATUS_TOO_MANY_OPENED_FILES, STATUS_UNSUCCESSFUL,
 };
+pub use justrdp_pdu::rdpdr::{FileInformation, VolumeInformation};
 
 /// The `VersionMinor` values a client may send, highest first (2.2.2.3).
 const CLIENT_VERSIONS: [u16; 5] = [0x000D, 0x000C, 0x000A, 0x0005, 0x0002];
@@ -47,6 +55,20 @@ pub enum DriveError {
     DuplicateId(u32),
 }
 
+/// The most Device I/O Requests kept waiting for the host; one past it is answered with
+/// `STATUS_INSUFFICIENT_RESOURCES`.
+pub const MAX_PENDING_REQUESTS: usize = 100;
+
+/// The most files kept open at once; a Create past it is answered with
+/// `STATUS_TOO_MANY_OPENED_FILES`.
+pub const MAX_OPEN_FILES: usize = 1024;
+
+/// The names 3.2.5.2.3 requires a Create to refuse with `STATUS_ACCESS_DENIED`.
+const RESERVED_NAMES: [&str; 23] = [
+    "CON", "PRN", "AUX", "NUL", "CLOCK$", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+    "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// What processing one device redirection message produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceRedirectionOutput {
@@ -64,9 +86,168 @@ pub enum DeviceRedirectionOutput {
         /// The server's `ResultCode`, an NTSTATUS.
         status: u32,
     },
+    /// The server asks the host about a drive. The host answers with the `respond_*` method
+    /// the request names, by `completion_id`, in any order.
+    DriveRequest {
+        /// The ID the answer is paired by.
+        completion_id: u32,
+        /// The drive's `device_id`.
+        device_id: u32,
+        /// What the server asks.
+        request: DriveRequest,
+    },
+    /// A file the host opened is closed: the server closed it, or the channel started over or
+    /// ended. Requests about it that the host still owes are no longer awaited.
+    FileClosed {
+        /// The drive's `device_id`.
+        device_id: u32,
+        /// The file's ID, from its [`DriveRequest::Open`].
+        file_id: u32,
+    },
     /// The server sent a message this side cannot read, so the channel is ended (3.1.5.2): every
     /// later message on it is ignored. The rest of the session goes on.
     Terminated(DecodeError),
+}
+
+/// What a Create asks the opened file to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenKind {
+    /// A file or a directory.
+    Any,
+    /// A directory (`FILE_DIRECTORY_FILE`); a file is answered `STATUS_NOT_A_DIRECTORY`.
+    Directory,
+    /// Not a directory (`FILE_NON_DIRECTORY_FILE`).
+    File,
+}
+
+/// A Create's `CreateDisposition` (2.2.1.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Replace the file if it exists, create it if not.
+    Supersede,
+    /// Open the file; fail if it does not exist.
+    Open,
+    /// Create the file; fail if it exists.
+    Create,
+    /// Open the file, creating it if it does not exist.
+    OpenIf,
+    /// Overwrite the file; fail if it does not exist.
+    Overwrite,
+    /// Overwrite the file, creating it if it does not exist.
+    OverwriteIf,
+}
+
+impl Disposition {
+    fn from_wire(value: u32) -> Option<Self> {
+        Some(match value {
+            pdu::FILE_SUPERSEDE => Self::Supersede,
+            pdu::FILE_OPEN => Self::Open,
+            pdu::FILE_CREATE => Self::Create,
+            pdu::FILE_OPEN_IF => Self::OpenIf,
+            pdu::FILE_OVERWRITE => Self::Overwrite,
+            pdu::FILE_OVERWRITE_IF => Self::OverwriteIf,
+            _ => return None,
+        })
+    }
+
+    /// A successful Create's `Information`, which 2.2.1.5.1 derives from the disposition.
+    fn information(self) -> u8 {
+        match self {
+            Self::OpenIf => pdu::FILE_OPENED,
+            Self::OverwriteIf => pdu::FILE_OVERWRITTEN,
+            _ => pdu::FILE_SUPERSEDED,
+        }
+    }
+}
+
+/// What the server asks the host about a drive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveRequest {
+    /// Open `path` as `file_id`. Answer with [`DeviceRedirection::respond_open`].
+    Open {
+        /// The ID later requests name the file by, chosen by the helper.
+        file_id: u32,
+        /// The path's components below the drive's root; empty for the root. None is empty,
+        /// `.` or `..`, or holds a NUL, `/`, `\` or `:`.
+        path: Vec<String>,
+        /// Whether the file must be a directory, or must not.
+        kind: OpenKind,
+        /// What to do when the file exists or does not.
+        disposition: Disposition,
+        /// `DesiredAccess`, the access the server asks for.
+        desired_access: u32,
+    },
+    /// Describe the drive's volume. Answer with [`DeviceRedirection::respond_volume`].
+    QueryVolume,
+    /// Describe the open file `file_id`. Answer with [`DeviceRedirection::respond_information`].
+    QueryInformation {
+        /// The file.
+        file_id: u32,
+    },
+    /// List the directory `path`, opened as `file_id`: every entry, which the helper matches
+    /// against the server's pattern and hands out one at a time. Answer with
+    /// [`DeviceRedirection::respond_listing`].
+    ListDirectory {
+        /// The directory, as opened.
+        file_id: u32,
+        /// The directory's components below the drive's root, by the rules of
+        /// [`DriveRequest::Open`]'s `path`.
+        path: Vec<String>,
+    },
+}
+
+/// What an opened file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opened {
+    /// A file.
+    File,
+    /// A directory.
+    Directory,
+}
+
+/// One entry of a directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    /// The entry's name.
+    pub name: String,
+    /// The entry's times, size and attributes.
+    pub info: FileInformation,
+}
+
+/// Why a `respond_*` method refused the host's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespondError {
+    /// No request waits under that `completion_id`.
+    NotRequested,
+    /// The request under that `completion_id` asks for a different answer.
+    WrongKind,
+}
+
+/// A request waiting for the host, and what its answer needs.
+#[derive(Debug, Clone)]
+struct Pending {
+    completion_id: u32,
+    device_id: u32,
+    file_id: u32,
+    kind: PendingKind,
+}
+
+#[derive(Debug, Clone)]
+enum PendingKind {
+    Open { disposition: Disposition },
+    Volume { class: u32 },
+    Information { class: u32 },
+    Listing { class: u32, pattern: Vec<char> },
+}
+
+/// A file the host opened.
+#[derive(Debug, Clone)]
+struct OpenFile {
+    device_id: u32,
+    file_id: u32,
+    directory: bool,
+    /// The entries of the directory's current search not yet handed out.
+    listing: VecDeque<DirectoryEntry>,
 }
 
 /// The client side of one device redirection channel.
@@ -80,6 +261,11 @@ pub struct DeviceRedirection {
     announced_as: Option<(u16, u32)>,
     devices_announced: bool,
     terminated: bool,
+    /// Requests waiting for the host.
+    pending: Vec<Pending>,
+    /// Files the host opened and the server has not closed.
+    files: Vec<OpenFile>,
+    last_file_id: u32,
 }
 
 impl DeviceRedirection {
@@ -105,6 +291,9 @@ impl DeviceRedirection {
             announced_as: None,
             devices_announced: false,
             terminated: false,
+            pending: Vec::new(),
+            files: Vec::new(),
+            last_file_id: 0,
         })
     }
 
@@ -117,6 +306,133 @@ impl DeviceRedirection {
             Ok(pdu) => self.handle(pdu),
             Err(error) => self.terminate(error),
         }
+    }
+
+    /// The answer to [`DriveRequest::Open`]: what the host opened, or the NTSTATUS it failed
+    /// with.
+    pub fn respond_open(
+        &mut self,
+        completion_id: u32,
+        answer: Result<Opened, u32>,
+    ) -> Result<Vec<u8>, RespondError> {
+        let pending =
+            self.take_pending(completion_id, |k| matches!(k, PendingKind::Open { .. }))?;
+        let PendingKind::Open { disposition } = pending.kind else {
+            unreachable!("take_pending matched an Open")
+        };
+        Ok(match answer {
+            Ok(opened) => {
+                self.files.push(OpenFile {
+                    device_id: pending.device_id,
+                    file_id: pending.file_id,
+                    directory: opened == Opened::Directory,
+                    listing: VecDeque::new(),
+                });
+                let mut body = pending.file_id.to_le_bytes().to_vec();
+                body.push(disposition.information());
+                complete(&pending, STATUS_SUCCESS, &body)
+            }
+            Err(status) => complete(&pending, status, pdu::failure_body(pdu::IRP_MJ_CREATE)),
+        })
+    }
+
+    /// The answer to [`DriveRequest::QueryVolume`]: the volume, or the NTSTATUS the host
+    /// failed with.
+    pub fn respond_volume(
+        &mut self,
+        completion_id: u32,
+        answer: Result<&VolumeInformation, u32>,
+    ) -> Result<Vec<u8>, RespondError> {
+        let pending =
+            self.take_pending(completion_id, |k| matches!(k, PendingKind::Volume { .. }))?;
+        let PendingKind::Volume { class } = pending.kind else {
+            unreachable!("take_pending matched a Volume")
+        };
+        Ok(match answer {
+            Ok(volume) => {
+                let buffer = pdu::encode_volume_information(class, volume)
+                    .expect("only an implemented class is asked for");
+                complete(
+                    &pending,
+                    STATUS_SUCCESS,
+                    &pdu::length_prefixed(&buffer, true),
+                )
+            }
+            Err(status) => complete(
+                &pending,
+                status,
+                pdu::failure_body(pdu::IRP_MJ_QUERY_VOLUME_INFORMATION),
+            ),
+        })
+    }
+
+    /// The answer to [`DriveRequest::QueryInformation`]: the file's information, or the
+    /// NTSTATUS the host failed with.
+    pub fn respond_information(
+        &mut self,
+        completion_id: u32,
+        answer: Result<&FileInformation, u32>,
+    ) -> Result<Vec<u8>, RespondError> {
+        let pending = self.take_pending(completion_id, |k| {
+            matches!(k, PendingKind::Information { .. })
+        })?;
+        let PendingKind::Information { class } = pending.kind else {
+            unreachable!("take_pending matched an Information")
+        };
+        Ok(match answer {
+            Ok(file) => {
+                let buffer = pdu::encode_file_information(class, file)
+                    .expect("only an implemented class is asked for");
+                complete(
+                    &pending,
+                    STATUS_SUCCESS,
+                    &pdu::length_prefixed(&buffer, false),
+                )
+            }
+            Err(status) => complete(
+                &pending,
+                status,
+                pdu::failure_body(pdu::IRP_MJ_QUERY_INFORMATION),
+            ),
+        })
+    }
+
+    /// The answer to [`DriveRequest::ListDirectory`]: every entry of the directory, or the
+    /// NTSTATUS the host failed with. The helper keeps the entries the server's pattern matches
+    /// and answers with the first; the server's later queries take the rest.
+    pub fn respond_listing(
+        &mut self,
+        completion_id: u32,
+        answer: Result<Vec<DirectoryEntry>, u32>,
+    ) -> Result<Vec<u8>, RespondError> {
+        let pending =
+            self.take_pending(completion_id, |k| matches!(k, PendingKind::Listing { .. }))?;
+        let PendingKind::Listing { class, ref pattern } = pending.kind else {
+            unreachable!("take_pending matched a Listing")
+        };
+        let entries = match answer {
+            Ok(entries) => entries,
+            Err(status) => {
+                return Ok(complete(
+                    &pending,
+                    status,
+                    pdu::failure_body(pdu::IRP_MJ_DIRECTORY_CONTROL),
+                ));
+            }
+        };
+        let matched: VecDeque<_> = entries
+            .into_iter()
+            .filter(|entry| matches_pattern(pattern, &entry.name))
+            .collect();
+        let Some(file) = self.file_mut(pending.device_id, pending.file_id) else {
+            return Ok(complete(
+                &pending,
+                STATUS_CANCELLED,
+                pdu::failure_body(pdu::IRP_MJ_DIRECTORY_CONTROL),
+            ));
+        };
+        file.listing = matched;
+        Ok(next_entry(&pending, class, file, STATUS_NO_SUCH_FILE))
     }
 
     fn handle(&mut self, pdu: RdpdrPdu) -> Vec<DeviceRedirectionOutput> {
@@ -133,12 +449,12 @@ impl DeviceRedirection {
                 } else {
                     self.random_client_id
                 };
+                let mut outputs = self.close_all();
                 self.announced_as = Some((version, client_id));
                 self.devices_announced = false;
-                vec![
-                    Send(pdu::encode_client_announce_reply(version, client_id)),
-                    Send(pdu::encode_client_name(&self.computer_name)),
-                ]
+                outputs.push(Send(pdu::encode_client_announce_reply(version, client_id)));
+                outputs.push(Send(pdu::encode_client_name(&self.computer_name)));
+                outputs
             }
             RdpdrPdu::ServerCapabilities(_) => {
                 let Some((version, _)) = self.announced_as else {
@@ -183,7 +499,7 @@ impl DeviceRedirection {
                     }
                 }]
             }
-            RdpdrPdu::IoRequest(request) => self.refuse_io(request),
+            RdpdrPdu::IoRequest(request) => self.io_request(request),
             RdpdrPdu::Unknown {
                 component,
                 packet_id,
@@ -201,10 +517,8 @@ impl DeviceRedirection {
         self.devices_announced && self.drives.iter().any(|d| d.device_id == device_id)
     }
 
-    /// Answer a Device I/O Request with a failure: `STATUS_NOT_SUPPORTED` for a major function
-    /// 2.2.1.4 defines, `STATUS_UNSUCCESSFUL` for any other (3.1.5.2). One for a device never
-    /// announced is ignored (3.1.5.2).
-    fn refuse_io(&mut self, request: IoRequest) -> Vec<DeviceRedirectionOutput> {
+    /// Handle a Device I/O Request. One for a device never announced is ignored (3.1.5.2).
+    fn io_request(&mut self, request: IoRequest) -> Vec<DeviceRedirectionOutput> {
         if !self.is_announced(request.device_id) {
             tracing::warn!(
                 target: "rdp_rdpdr",
@@ -213,31 +527,418 @@ impl DeviceRedirection {
             );
             return Vec::new();
         }
-        let status = if pdu::is_known_major(request.major) {
-            STATUS_NOT_SUPPORTED
-        } else {
-            STATUS_UNSUCCESSFUL
+        let reject = |status| refuse(&request, status);
+        let body = match &request.body {
+            Ok(body) => body.clone(),
+            Err(error) => {
+                tracing::warn!(target: "rdp_rdpdr", %error, major = request.major, "Device I/O Request refused");
+                return reject(STATUS_UNSUCCESSFUL);
+            }
         };
-        tracing::debug!(
-            target: "rdp_rdpdr",
-            major = request.major,
-            minor = request.minor,
-            status,
-            "Device I/O Request refused"
-        );
-        vec![DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+        match (request.major, body) {
+            (pdu::IRP_MJ_CREATE, IoBody::Create(create)) => self.create(&request, create),
+            (pdu::IRP_MJ_CLOSE, _) => self.close(&request),
+            (pdu::IRP_MJ_QUERY_VOLUME_INFORMATION, IoBody::QueryVolumeInformation { class }) => {
+                if pdu::encode_volume_information(class, &VolumeInformation::default()).is_none() {
+                    return reject(STATUS_NOT_SUPPORTED);
+                }
+                self.ask(
+                    &request,
+                    PendingKind::Volume { class },
+                    DriveRequest::QueryVolume,
+                )
+            }
+            (pdu::IRP_MJ_QUERY_INFORMATION, IoBody::QueryInformation { class }) => {
+                if self.file_mut(request.device_id, request.file_id).is_none() {
+                    return reject(STATUS_UNSUCCESSFUL);
+                }
+                if pdu::encode_file_information(class, &FileInformation::default()).is_none() {
+                    return reject(STATUS_NOT_SUPPORTED);
+                }
+                let file_id = request.file_id;
+                self.ask(
+                    &request,
+                    PendingKind::Information { class },
+                    DriveRequest::QueryInformation { file_id },
+                )
+            }
+            (
+                pdu::IRP_MJ_DIRECTORY_CONTROL,
+                IoBody::QueryDirectory {
+                    class,
+                    initial,
+                    path,
+                },
+            ) => self.query_directory(&request, class, initial, &path),
+            (major, _) if pdu::is_known_major(major) => reject(STATUS_NOT_SUPPORTED),
+            _ => reject(STATUS_UNSUCCESSFUL),
+        }
+    }
+
+    /// A Create: the path checked against the drive's wire rules, then handed to the host under
+    /// a new `file_id`.
+    fn create(
+        &mut self,
+        request: &IoRequest,
+        create: CreateRequest,
+    ) -> Vec<DeviceRedirectionOutput> {
+        let path = match drive_path(&create.path, true) {
+            Ok(path) => path,
+            Err(status) => return refuse(request, status),
+        };
+        let Some(disposition) = Disposition::from_wire(create.create_disposition) else {
+            return refuse(request, STATUS_INVALID_PARAMETER);
+        };
+        let opening = self
+            .pending
+            .iter()
+            .filter(|p| matches!(p.kind, PendingKind::Open { .. }))
+            .count();
+        if self.files.len() + opening >= MAX_OPEN_FILES {
+            tracing::warn!(target: "rdp_rdpdr", "Create refused: too many files open");
+            return refuse(request, STATUS_TOO_MANY_OPENED_FILES);
+        }
+        let kind = if create.create_options & pdu::FILE_DIRECTORY_FILE != 0 {
+            OpenKind::Directory
+        } else if create.create_options & pdu::FILE_NON_DIRECTORY_FILE != 0 {
+            OpenKind::File
+        } else {
+            OpenKind::Any
+        };
+        let (files, pending) = (&self.files, &self.pending);
+        let file_id = next_id(&mut self.last_file_id, |id| {
+            files.iter().any(|f| f.file_id == id) || pending.iter().any(|p| p.file_id == id)
+        });
+        let open = DriveRequest::Open {
+            file_id,
+            path,
+            kind,
+            disposition,
+            desired_access: create.desired_access,
+        };
+        let mut request = request.clone();
+        request.file_id = file_id;
+        self.ask(&request, PendingKind::Open { disposition }, open)
+    }
+
+    /// A Close: the file is forgotten, requests the host still owes about it are answered
+    /// `STATUS_CANCELLED` (3.2.5.2.5), and the host is told.
+    fn close(&mut self, request: &IoRequest) -> Vec<DeviceRedirectionOutput> {
+        let Some(at) = self
+            .files
+            .iter()
+            .position(|f| f.device_id == request.device_id && f.file_id == request.file_id)
+        else {
+            return refuse(request, STATUS_UNSUCCESSFUL);
+        };
+        let file = self.files.remove(at);
+        let mut outputs =
+            self.cancel_pending(|p| p.device_id == file.device_id && p.file_id == file.file_id);
+        outputs.push(DeviceRedirectionOutput::FileClosed {
+            device_id: file.device_id,
+            file_id: file.file_id,
+        });
+        outputs.push(DeviceRedirectionOutput::Send(pdu::encode_io_completion(
             request.device_id,
             request.completion_id,
-            status,
-            pdu::failure_body(request.major),
-        ))]
+            STATUS_SUCCESS,
+            pdu::failure_body(pdu::IRP_MJ_CLOSE),
+        )));
+        outputs
+    }
+
+    /// A Query Directory: a first query asks the host for the directory's entries, and a later
+    /// one takes the next entry that matched (2.2.3.3.10).
+    fn query_directory(
+        &mut self,
+        request: &IoRequest,
+        class: u32,
+        initial: bool,
+        path: &[u16],
+    ) -> Vec<DeviceRedirectionOutput> {
+        let Some(file) = self.file_mut(request.device_id, request.file_id) else {
+            return refuse(request, STATUS_UNSUCCESSFUL);
+        };
+        if !file.directory {
+            return refuse(request, STATUS_NOT_A_DIRECTORY);
+        }
+        if pdu::encode_directory_entry(class, "", &FileInformation::default()).is_none() {
+            return refuse(request, STATUS_NOT_SUPPORTED);
+        }
+        if !initial {
+            let pending = Pending {
+                completion_id: request.completion_id,
+                device_id: request.device_id,
+                file_id: request.file_id,
+                kind: PendingKind::Listing {
+                    class,
+                    pattern: Vec::new(),
+                },
+            };
+            return vec![DeviceRedirectionOutput::Send(next_entry(
+                &pending,
+                class,
+                file,
+                STATUS_NO_MORE_FILES,
+            ))];
+        }
+        file.listing.clear();
+        let mut path = match drive_path(path, false) {
+            Ok(path) => path,
+            Err(status) => return refuse(request, status),
+        };
+        let pattern = path.pop().unwrap_or_else(|| "*".to_string());
+        let file_id = request.file_id;
+        self.ask(
+            request,
+            PendingKind::Listing {
+                class,
+                pattern: pattern.chars().collect(),
+            },
+            DriveRequest::ListDirectory { file_id, path },
+        )
+    }
+
+    /// Hand `drive_request` to the host, or refuse it when [`MAX_PENDING_REQUESTS`] already
+    /// wait or its `CompletionId` is already waiting.
+    fn ask(
+        &mut self,
+        request: &IoRequest,
+        kind: PendingKind,
+        drive_request: DriveRequest,
+    ) -> Vec<DeviceRedirectionOutput> {
+        if self.pending.len() >= MAX_PENDING_REQUESTS {
+            tracing::warn!(target: "rdp_rdpdr", "Device I/O Request refused: too many waiting");
+            return refuse(request, STATUS_INSUFFICIENT_RESOURCES);
+        }
+        if self
+            .pending
+            .iter()
+            .any(|p| p.completion_id == request.completion_id)
+        {
+            return refuse(request, STATUS_UNSUCCESSFUL);
+        }
+        self.pending.push(Pending {
+            completion_id: request.completion_id,
+            device_id: request.device_id,
+            file_id: request.file_id,
+            kind,
+        });
+        vec![DeviceRedirectionOutput::DriveRequest {
+            completion_id: request.completion_id,
+            device_id: request.device_id,
+            request: drive_request,
+        }]
+    }
+
+    fn take_pending(
+        &mut self,
+        completion_id: u32,
+        fits: impl FnOnce(&PendingKind) -> bool,
+    ) -> Result<Pending, RespondError> {
+        let at = self
+            .pending
+            .iter()
+            .position(|p| p.completion_id == completion_id)
+            .ok_or(RespondError::NotRequested)?;
+        if !fits(&self.pending[at].kind) {
+            return Err(RespondError::WrongKind);
+        }
+        Ok(self.pending.remove(at))
+    }
+
+    /// Answer every waiting request `which` selects with `STATUS_CANCELLED`.
+    fn cancel_pending(&mut self, which: impl Fn(&Pending) -> bool) -> Vec<DeviceRedirectionOutput> {
+        let (cancelled, kept) = core::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|p| which(p));
+        self.pending = kept;
+        cancelled
+            .iter()
+            .map(|p: &Pending| {
+                let major = match p.kind {
+                    PendingKind::Open { .. } => pdu::IRP_MJ_CREATE,
+                    PendingKind::Volume { .. } => pdu::IRP_MJ_QUERY_VOLUME_INFORMATION,
+                    PendingKind::Information { .. } => pdu::IRP_MJ_QUERY_INFORMATION,
+                    PendingKind::Listing { .. } => pdu::IRP_MJ_DIRECTORY_CONTROL,
+                };
+                DeviceRedirectionOutput::Send(complete(
+                    p,
+                    STATUS_CANCELLED,
+                    pdu::failure_body(major),
+                ))
+            })
+            .collect()
+    }
+
+    /// Forget every file and waiting request, telling the host of each file.
+    fn close_all(&mut self) -> Vec<DeviceRedirectionOutput> {
+        self.pending.clear();
+        self.files
+            .drain(..)
+            .map(|f| DeviceRedirectionOutput::FileClosed {
+                device_id: f.device_id,
+                file_id: f.file_id,
+            })
+            .collect()
+    }
+
+    fn file_mut(&mut self, device_id: u32, file_id: u32) -> Option<&mut OpenFile> {
+        self.files
+            .iter_mut()
+            .find(|f| f.device_id == device_id && f.file_id == file_id)
     }
 
     fn terminate(&mut self, error: DecodeError) -> Vec<DeviceRedirectionOutput> {
         tracing::warn!(target: "rdp_rdpdr", %error, "device redirection channel ended");
         self.terminated = true;
-        vec![DeviceRedirectionOutput::Terminated(error)]
+        let mut outputs = self.close_all();
+        outputs.push(DeviceRedirectionOutput::Terminated(error));
+        outputs
     }
+}
+
+/// A Device I/O Response to the request `pending` stands for.
+fn complete(pending: &Pending, status: u32, body: &[u8]) -> Vec<u8> {
+    pdu::encode_io_completion(pending.device_id, pending.completion_id, status, body)
+}
+
+/// A failed response to `request`, its fields zeroed.
+fn refuse(request: &IoRequest, status: u32) -> Vec<DeviceRedirectionOutput> {
+    tracing::debug!(
+        target: "rdp_rdpdr",
+        major = request.major,
+        minor = request.minor,
+        status,
+        "Device I/O Request refused"
+    );
+    vec![DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+        request.device_id,
+        request.completion_id,
+        status,
+        pdu::failure_body(request.major),
+    ))]
+}
+
+/// The Query Directory response carrying `file`'s next matched entry, or `none_left` when
+/// there is none.
+fn next_entry(pending: &Pending, class: u32, file: &mut OpenFile, none_left: u32) -> Vec<u8> {
+    match file.listing.pop_front() {
+        Some(entry) => {
+            let buffer = pdu::encode_directory_entry(class, &entry.name, &entry.info)
+                .expect("only an implemented class is asked for");
+            complete(
+                pending,
+                STATUS_SUCCESS,
+                &pdu::length_prefixed(&buffer, true),
+            )
+        }
+        None => complete(pending, none_left, &pdu::length_prefixed(&[], true)),
+    }
+}
+
+/// The next nonzero id after `last` that `in_use` does not claim.
+fn next_id(last: &mut u32, in_use: impl Fn(u32) -> bool) -> u32 {
+    loop {
+        *last = last.wrapping_add(1);
+        if *last != 0 && !in_use(*last) {
+            return *last;
+        }
+    }
+}
+
+/// A server path's components below the drive's root, or the NTSTATUS refusing it. A path
+/// that is not UTF-16, holds a NUL, or has a component that is `.` or `..` or holds `/` or `:`
+/// cannot stay inside the drive and is `STATUS_OBJECT_NAME_INVALID`. For a Create
+/// (`reserved`), a path naming a device 3.2.5.2.3 lists is `STATUS_ACCESS_DENIED`.
+fn drive_path(units: &[u16], reserved: bool) -> Result<Vec<String>, u32> {
+    let path = String::from_utf16(units).map_err(|_| STATUS_OBJECT_NAME_INVALID)?;
+    let components: Vec<String> = path
+        .split('\\')
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect();
+    let escapes = |c: &String| c == "." || c == ".." || c.contains(['\0', '/', ':']);
+    if components.iter().any(escapes) {
+        return Err(STATUS_OBJECT_NAME_INVALID);
+    }
+    if reserved
+        && let [name] = components.as_slice()
+        && RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name))
+    {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    Ok(components)
+}
+
+/// Whether `name` matches `pattern` as a Windows file system does (`[MS-FSA]` 2.1.4.4),
+/// ignoring case: `*` any run of characters, `?` any one, and the DOS wildcards `<` (any run
+/// up to the name's last `.`), `>` (any one, or none at a `.` or the end) and `"` (a `.`, or
+/// none at the end).
+fn matches_pattern(pattern: &[char], name: &str) -> bool {
+    let name: Vec<char> = name.chars().flat_map(char::to_lowercase).collect();
+    let pattern: Vec<char> = pattern.iter().flat_map(|c| c.to_lowercase()).collect();
+    let last_dot = name.iter().rposition(|&c| c == '.');
+    // reachable[j]: the pattern so far can end having consumed `name[..j]`.
+    let mut reachable = vec![false; name.len() + 1];
+    reachable[0] = true;
+    for &p in &pattern {
+        let Some(first) = reachable.iter().position(|&r| r) else {
+            return false;
+        };
+        let mut next = vec![false; name.len() + 1];
+        // `*` and `<` reach every position from the first reachable one on, so each is one
+        // pass over the name rather than one per reachable position.
+        if p == '*' {
+            next[first..].fill(true);
+            reachable = next;
+            continue;
+        }
+        if p == '<' {
+            let stop = last_dot.unwrap_or(name.len());
+            if first <= stop {
+                next[first..=stop].fill(true);
+            }
+            for j in stop + 1..=name.len() {
+                next[j] |= reachable[j];
+            }
+            reachable = next;
+            continue;
+        }
+        for j in first..=name.len() {
+            if !reachable[j] {
+                continue;
+            }
+            match p {
+                '?' => {
+                    if j < name.len() {
+                        next[j + 1] = true;
+                    }
+                }
+                '>' => {
+                    if j < name.len() && name[j] != '.' {
+                        next[j + 1] = true;
+                    } else {
+                        next[j] = true;
+                    }
+                }
+                '"' => {
+                    if j < name.len() && name[j] == '.' {
+                        next[j + 1] = true;
+                    } else if j == name.len() {
+                        next[j] = true;
+                    }
+                }
+                c => {
+                    if j < name.len() && name[j] == c {
+                        next[j + 1] = true;
+                    }
+                }
+            }
+        }
+        reachable = next;
+    }
+    reachable[name.len()]
 }
 
 /// A message that arrived before the Server Announce it depends on, skipped (3.1.5.2 allows
@@ -276,7 +977,7 @@ fn client_capabilities(version: u16) -> [CapabilitySet; 2] {
 }
 
 /// A drive's announcement: its name cut to fit `PreferredDosName`, and in full as
-/// NUL-terminated UTF-16 in `DeviceData` (2.2.3.1).
+/// NUL-terminated ASCII in `DeviceData`, which the server reads as 8-bit characters.
 fn drive_announce(drive: Drive) -> Result<DeviceAnnounce, DriveError> {
     let name = &drive.name;
     let last = name.len().saturating_sub(1);
@@ -290,11 +991,7 @@ fn drive_announce(drive: Drive) -> Result<DeviceAnnounce, DriveError> {
     let mut preferred_dos_name = [0; DOS_NAME_SIZE];
     let fits = name.len().min(DOS_NAME_SIZE - 1);
     preferred_dos_name[..fits].copy_from_slice(&name.as_bytes()[..fits]);
-    let device_data = name
-        .encode_utf16()
-        .chain([0])
-        .flat_map(u16::to_le_bytes)
-        .collect();
+    let device_data = name.bytes().chain([0]).collect();
     Ok(DeviceAnnounce {
         device_type: RDPDR_DTYP_FILESYSTEM,
         device_id: drive.device_id,
@@ -472,11 +1169,7 @@ mod tests {
     fn a_drive_name_fills_both_fields() {
         let announce = drive_announce(drive(3, "projects")).unwrap();
         assert_eq!(&announce.preferred_dos_name, b"project\0");
-        let full: Vec<u8> = "projects\0"
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        assert_eq!(announce.device_data, full);
+        assert_eq!(announce.device_data, b"projects\0");
         assert_eq!(announce.device_type, RDPDR_DTYP_FILESYSTEM);
     }
 
@@ -498,13 +1191,12 @@ mod tests {
 
     /// Every I/O request is refused with its body's fields zeroed: not supported for a known
     /// major function, unsuccessful for an unknown one; one for no announced device is ignored.
+    /// A known major function not implemented yet is `STATUS_NOT_SUPPORTED`, an unknown one
+    /// `STATUS_UNSUCCESSFUL`, each with its body's fields zeroed; a request for no announced
+    /// device is ignored.
     #[test]
-    fn io_requests_are_refused_until_implemented() {
+    fn unimplemented_requests_are_refused() {
         let mut h = ready();
-        assert_eq!(
-            sent(&h.process(&io_request(1, 5, IRP_MJ_CREATE))),
-            vec![pdu::encode_io_completion(1, 5, STATUS_NOT_SUPPORTED, &[0; 5]).as_slice()]
-        );
         assert_eq!(
             sent(&h.process(&io_request(1, 6, IRP_MJ_READ))),
             vec![pdu::encode_io_completion(1, 6, STATUS_NOT_SUPPORTED, &[0; 4]).as_slice()]
@@ -514,6 +1206,537 @@ mod tests {
             vec![pdu::encode_io_completion(1, 7, STATUS_UNSUCCESSFUL, &[]).as_slice()]
         );
         assert!(h.process(&io_request(2, 8, IRP_MJ_CREATE)).is_empty());
+    }
+
+    /// A request whose header reads but whose body does not is refused, and the channel goes
+    /// on.
+    #[test]
+    fn a_request_with_a_malformed_body_is_refused() {
+        let mut h = ready();
+        assert_eq!(
+            sent(&h.process(&io_request(1, 5, IRP_MJ_CREATE))),
+            vec![pdu::encode_io_completion(1, 5, STATUS_UNSUCCESSFUL, &[0; 5]).as_slice()]
+        );
+        assert!(!h.terminated);
+    }
+
+    fn utf16(path: &str) -> Vec<u8> {
+        path.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    fn header(file_id: u32, completion_id: u32, major: u32, minor: u32) -> Vec<u8> {
+        let mut m = vec![0x72, 0x44, 0x52, 0x49];
+        for field in [1, file_id, completion_id, major, minor] {
+            m.extend_from_slice(&field.to_le_bytes());
+        }
+        m
+    }
+
+    fn create(completion_id: u32, disposition: u32, options: u32, path: &str) -> Vec<u8> {
+        let mut m = header(0, completion_id, IRP_MJ_CREATE, 0);
+        let path = utf16(path);
+        for field in [0x0012_0089u32, 0, 0, 0x80, 7, disposition, options] {
+            m.extend_from_slice(&field.to_le_bytes());
+        }
+        m.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        m.extend_from_slice(&path);
+        m
+    }
+
+    fn close(completion_id: u32, file_id: u32) -> Vec<u8> {
+        let mut m = header(file_id, completion_id, pdu::IRP_MJ_CLOSE, 0);
+        m.extend_from_slice(&[0; 32]);
+        m
+    }
+
+    fn query(completion_id: u32, file_id: u32, major: u32, class: u32) -> Vec<u8> {
+        let mut m = header(file_id, completion_id, major, 0);
+        m.extend_from_slice(&class.to_le_bytes());
+        m.extend_from_slice(&0u32.to_le_bytes());
+        m.extend_from_slice(&[0; 24]);
+        m
+    }
+
+    fn query_directory(
+        completion_id: u32,
+        file_id: u32,
+        class: u32,
+        path: Option<&str>,
+    ) -> Vec<u8> {
+        let mut m = header(
+            file_id,
+            completion_id,
+            pdu::IRP_MJ_DIRECTORY_CONTROL,
+            pdu::IRP_MN_QUERY_DIRECTORY,
+        );
+        let path = path.map(utf16);
+        m.extend_from_slice(&class.to_le_bytes());
+        m.push(u8::from(path.is_some()));
+        let path = path.unwrap_or_default();
+        m.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        m.extend_from_slice(&[0; 23]);
+        m.extend_from_slice(&path);
+        m
+    }
+
+    fn asked(outputs: &[DeviceRedirectionOutput]) -> &DriveRequest {
+        match outputs {
+            [DeviceRedirectionOutput::DriveRequest { request, .. }] => request,
+            other => panic!("expected one drive request, got {other:?}"),
+        }
+    }
+
+    /// Open `path` as a directory and answer that it is one, returning its `file_id`.
+    fn open_directory(h: &mut DeviceRedirection, completion_id: u32, path: &str) -> u32 {
+        let outputs = h.process(&create(completion_id, pdu::FILE_OPEN, 1, path));
+        let DriveRequest::Open { file_id, .. } = *asked(&outputs) else {
+            panic!("expected an Open");
+        };
+        h.respond_open(completion_id, Ok(Opened::Directory))
+            .unwrap();
+        file_id
+    }
+
+    fn file(name: &str, size: u64, directory: bool) -> DirectoryEntry {
+        DirectoryEntry {
+            name: name.to_string(),
+            info: FileInformation {
+                end_of_file: size,
+                attributes: if directory {
+                    pdu::FILE_ATTRIBUTE_DIRECTORY
+                } else {
+                    0x20
+                },
+                ..FileInformation::default()
+            },
+        }
+    }
+
+    /// A Create reaches the host as an Open under a new file ID, with the path split below the
+    /// drive's root; the answer carries that ID and the `Information` its disposition implies.
+    #[test]
+    fn a_create_is_opened_by_the_host() {
+        let mut h = ready();
+        let outputs = h.process(&create(5, pdu::FILE_OPEN_IF, 0x40, "\\docs\\a.txt"));
+        let DriveRequest::Open {
+            file_id,
+            path,
+            kind,
+            disposition,
+            desired_access,
+        } = asked(&outputs).clone()
+        else {
+            panic!("expected an Open");
+        };
+        assert_eq!(path, ["docs", "a.txt"]);
+        assert_eq!(kind, OpenKind::File);
+        assert_eq!(disposition, Disposition::OpenIf);
+        assert_eq!(desired_access, 0x0012_0089);
+        let mut body = file_id.to_le_bytes().to_vec();
+        body.push(pdu::FILE_OPENED);
+        assert_eq!(
+            h.respond_open(5, Ok(Opened::File)),
+            Ok(pdu::encode_io_completion(1, 5, STATUS_SUCCESS, &body))
+        );
+        assert_eq!(
+            h.respond_open(5, Ok(Opened::File)),
+            Err(RespondError::NotRequested)
+        );
+        let outputs = h.process(&create(6, pdu::FILE_OPEN, 1, ""));
+        assert!(matches!(
+            asked(&outputs),
+            DriveRequest::Open { path, kind: OpenKind::Directory, file_id: next, .. }
+                if path.is_empty() && *next != file_id
+        ));
+        assert_eq!(
+            h.respond_open(6, Err(pdu::STATUS_NO_SUCH_FILE)),
+            Ok(pdu::encode_io_completion(
+                1,
+                6,
+                pdu::STATUS_NO_SUCH_FILE,
+                &[0; 5]
+            ))
+        );
+    }
+
+    /// A path that would leave the drive never reaches the host.
+    #[test]
+    fn a_path_escaping_the_drive_is_refused() {
+        let mut h = ready();
+        for (at, path) in [
+            "\\..\\secret",
+            "\\a\\..\\..\\b",
+            "\\.\\a",
+            "C:\\Windows",
+            "\\a/..\\b",
+            "\\a\0b",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = 10 + at as u32;
+            assert_eq!(
+                sent(&h.process(&create(id, pdu::FILE_OPEN, 0, path))),
+                vec![
+                    pdu::encode_io_completion(1, id, STATUS_OBJECT_NAME_INVALID, &[0; 5])
+                        .as_slice()
+                ],
+                "{path:?}"
+            );
+        }
+        let mut lone_surrogate = header(0, 20, IRP_MJ_CREATE, 0);
+        for field in [0u32, 0, 0, 0, 0, pdu::FILE_OPEN, 0, 4] {
+            lone_surrogate.extend_from_slice(&field.to_le_bytes());
+        }
+        lone_surrogate.extend_from_slice(&[0x00, 0xD8, 0, 0]);
+        assert_eq!(
+            sent(&h.process(&lone_surrogate)),
+            vec![pdu::encode_io_completion(1, 20, STATUS_OBJECT_NAME_INVALID, &[0; 5]).as_slice()]
+        );
+        assert!(h.pending.is_empty());
+    }
+
+    /// 3.2.5.2.3: a Create naming a reserved device is `STATUS_ACCESS_DENIED`; the same name
+    /// deeper in a path is the host's to judge.
+    #[test]
+    fn a_reserved_device_name_is_denied() {
+        let mut h = ready();
+        for (id, path) in [(1, "CON"), (2, "\\lpt9"), (3, "\\Clock$")] {
+            assert_eq!(
+                sent(&h.process(&create(id, pdu::FILE_OPEN, 0, path))),
+                vec![pdu::encode_io_completion(1, id, STATUS_ACCESS_DENIED, &[0; 5]).as_slice()],
+                "{path:?}"
+            );
+        }
+        assert!(matches!(
+            asked(&h.process(&create(4, pdu::FILE_OPEN, 0, "\\dir\\con"))),
+            DriveRequest::Open { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unknown_disposition_is_invalid() {
+        let mut h = ready();
+        assert_eq!(
+            sent(&h.process(&create(5, 9, 0, "\\a"))),
+            vec![pdu::encode_io_completion(1, 5, STATUS_INVALID_PARAMETER, &[0; 5]).as_slice()]
+        );
+    }
+
+    /// Volume and file information reach the host; an unimplemented class is refused without
+    /// it, and so is a query for a file never opened.
+    #[test]
+    fn information_is_asked_of_the_host() {
+        let mut h = ready();
+        let root = open_directory(&mut h, 1, "");
+        let class = pdu::FILE_FS_VOLUME_INFORMATION;
+        let outputs = h.process(&query(2, root, pdu::IRP_MJ_QUERY_VOLUME_INFORMATION, class));
+        assert_eq!(asked(&outputs), &DriveRequest::QueryVolume);
+        let volume = VolumeInformation {
+            label: "justrdp".to_string(),
+            ..VolumeInformation::default()
+        };
+        let buffer = pdu::encode_volume_information(class, &volume).unwrap();
+        assert_eq!(
+            h.respond_volume(2, Ok(&volume)),
+            Ok(pdu::encode_io_completion(
+                1,
+                2,
+                STATUS_SUCCESS,
+                &pdu::length_prefixed(&buffer, true)
+            ))
+        );
+        assert_eq!(
+            sent(&h.process(&query(3, root, pdu::IRP_MJ_QUERY_VOLUME_INFORMATION, 2))),
+            vec![pdu::encode_io_completion(1, 3, STATUS_NOT_SUPPORTED, &[0; 4]).as_slice()]
+        );
+
+        let class = pdu::FILE_BASIC_INFORMATION;
+        let outputs = h.process(&query(4, root, pdu::IRP_MJ_QUERY_INFORMATION, class));
+        assert_eq!(
+            asked(&outputs),
+            &DriveRequest::QueryInformation { file_id: root }
+        );
+        let info = file("x", 0, true).info;
+        let buffer = pdu::encode_file_information(class, &info).unwrap();
+        assert_eq!(
+            h.respond_information(4, Ok(&info)),
+            Ok(pdu::encode_io_completion(
+                1,
+                4,
+                STATUS_SUCCESS,
+                &pdu::length_prefixed(&buffer, false)
+            ))
+        );
+        assert_eq!(
+            sent(&h.process(&query(5, root, pdu::IRP_MJ_QUERY_INFORMATION, 99))),
+            vec![pdu::encode_io_completion(1, 5, STATUS_NOT_SUPPORTED, &[0; 4]).as_slice()]
+        );
+        assert_eq!(
+            sent(&h.process(&query(6, 999, pdu::IRP_MJ_QUERY_INFORMATION, class))),
+            vec![pdu::encode_io_completion(1, 6, STATUS_UNSUCCESSFUL, &[0; 4]).as_slice()]
+        );
+    }
+
+    /// A first Query Directory asks the host for the directory's entries; those the pattern
+    /// matches come out one per query, then `STATUS_NO_MORE_FILES`.
+    #[test]
+    fn a_directory_is_listed_one_entry_at_a_time() {
+        let mut h = ready();
+        let dir = open_directory(&mut h, 1, "\\sub");
+        let class = pdu::FILE_BOTH_DIRECTORY_INFORMATION;
+        let outputs = h.process(&query_directory(2, dir, class, Some("\\sub\\*.txt")));
+        assert_eq!(
+            asked(&outputs),
+            &DriveRequest::ListDirectory {
+                file_id: dir,
+                path: vec!["sub".to_string()]
+            }
+        );
+        let entries = vec![
+            file("a.txt", 3, false),
+            file("b.bin", 4, false),
+            file("C.TXT", 5, false),
+        ];
+        let entry = |e: &DirectoryEntry| {
+            pdu::encode_io_completion(
+                1,
+                0,
+                STATUS_SUCCESS,
+                &pdu::length_prefixed(
+                    &pdu::encode_directory_entry(class, &e.name, &e.info).unwrap(),
+                    true,
+                ),
+            )
+        };
+        let with_id = |mut m: Vec<u8>, id: u32| {
+            m[8..12].copy_from_slice(&id.to_le_bytes());
+            m
+        };
+        assert_eq!(
+            h.respond_listing(2, Ok(entries.clone())),
+            Ok(with_id(entry(&entries[0]), 2))
+        );
+        assert_eq!(
+            sent(&h.process(&query_directory(3, dir, class, None))),
+            vec![with_id(entry(&entries[2]), 3).as_slice()]
+        );
+        assert_eq!(
+            sent(&h.process(&query_directory(4, dir, class, None))),
+            vec![pdu::encode_io_completion(1, 4, STATUS_NO_MORE_FILES, &[0; 5]).as_slice()]
+        );
+        h.process(&query_directory(5, dir, class, Some("\\sub\\nothing")));
+        assert_eq!(
+            h.respond_listing(5, Ok(entries)),
+            Ok(pdu::encode_io_completion(
+                1,
+                5,
+                pdu::STATUS_NO_SUCH_FILE,
+                &[0; 5]
+            ))
+        );
+    }
+
+    /// A Query Directory on a file, with an unimplemented class, or a change notification is
+    /// refused without the host.
+    #[test]
+    fn a_directory_query_the_host_cannot_answer_is_refused() {
+        let mut h = ready();
+        h.process(&create(1, pdu::FILE_OPEN, 0, "\\a.txt"));
+        h.respond_open(1, Ok(Opened::File)).unwrap();
+        let DriveRequest::Open { file_id, .. } =
+            *asked(&h.process(&create(2, pdu::FILE_OPEN, 0, "\\b")))
+        else {
+            panic!("expected an Open");
+        };
+        h.respond_open(2, Ok(Opened::Directory)).unwrap();
+        let file_id_a = h.files[0].file_id;
+        assert_eq!(
+            sent(&h.process(&query_directory(3, file_id_a, 1, Some("\\a.txt\\*")))),
+            vec![pdu::encode_io_completion(1, 3, STATUS_NOT_A_DIRECTORY, &[0; 5]).as_slice()]
+        );
+        assert_eq!(
+            sent(&h.process(&query_directory(4, file_id, 0x3F, Some("\\b\\*")))),
+            vec![pdu::encode_io_completion(1, 4, STATUS_NOT_SUPPORTED, &[0; 5]).as_slice()]
+        );
+        let mut notify = header(
+            file_id,
+            5,
+            pdu::IRP_MJ_DIRECTORY_CONTROL,
+            pdu::IRP_MN_NOTIFY_CHANGE_DIRECTORY,
+        );
+        notify.extend_from_slice(&[0; 32]);
+        assert_eq!(
+            sent(&h.process(&notify)),
+            vec![pdu::encode_io_completion(1, 5, STATUS_NOT_SUPPORTED, &[0; 5]).as_slice()]
+        );
+    }
+
+    /// Answers pair by `CompletionId` in any order; one of the wrong kind is refused and the
+    /// request keeps waiting.
+    #[test]
+    fn answers_pair_by_completion_id_in_any_order() {
+        let mut h = ready();
+        h.process(&create(1, pdu::FILE_OPEN, 0, "\\a"));
+        h.process(&create(2, pdu::FILE_OPEN, 0, "\\b"));
+        assert_eq!(
+            h.respond_volume(2, Err(STATUS_UNSUCCESSFUL)),
+            Err(RespondError::WrongKind)
+        );
+        assert!(h.respond_open(2, Ok(Opened::File)).is_ok());
+        assert!(h.respond_open(1, Ok(Opened::File)).is_ok());
+        assert_eq!(h.files.len(), 2);
+    }
+
+    /// Requests past the bound are refused and the session goes on; so is a `CompletionId`
+    /// already waiting.
+    #[test]
+    fn waiting_requests_are_bounded() {
+        let mut h = ready();
+        for id in 0..MAX_PENDING_REQUESTS as u32 {
+            assert!(matches!(
+                asked(&h.process(&create(id, pdu::FILE_OPEN, 0, "\\a"))),
+                DriveRequest::Open { .. }
+            ));
+        }
+        let over = MAX_PENDING_REQUESTS as u32;
+        assert_eq!(
+            sent(&h.process(&create(over, pdu::FILE_OPEN, 0, "\\a"))),
+            vec![
+                pdu::encode_io_completion(1, over, STATUS_INSUFFICIENT_RESOURCES, &[0; 5])
+                    .as_slice()
+            ]
+        );
+        h.respond_open(0, Ok(Opened::File)).unwrap();
+        assert_eq!(
+            sent(&h.process(&create(1, pdu::FILE_OPEN, 0, "\\a"))),
+            vec![pdu::encode_io_completion(1, 1, STATUS_UNSUCCESSFUL, &[0; 5]).as_slice()]
+        );
+        assert!(matches!(
+            asked(&h.process(&create(over, pdu::FILE_OPEN, 0, "\\a"))),
+            DriveRequest::Open { .. }
+        ));
+    }
+
+    /// Open files are bounded too: a Create past the bound is refused without the host.
+    #[test]
+    fn open_files_are_bounded() {
+        let mut h = ready();
+        for id in 0..MAX_OPEN_FILES as u32 {
+            h.process(&create(id, pdu::FILE_OPEN, 0, "\\a"));
+            h.respond_open(id, Ok(Opened::File)).unwrap();
+        }
+        assert_eq!(
+            sent(&h.process(&create(9999, pdu::FILE_OPEN, 0, "\\a"))),
+            vec![
+                pdu::encode_io_completion(1, 9999, STATUS_TOO_MANY_OPENED_FILES, &[0; 5])
+                    .as_slice()
+            ]
+        );
+    }
+
+    /// A Close forgets the file, cancels what the host still owes about it, and tells the host.
+    #[test]
+    fn a_close_cancels_what_is_owed_and_tells_the_host() {
+        let mut h = ready();
+        let dir = open_directory(&mut h, 1, "\\d");
+        h.process(&query(
+            2,
+            dir,
+            pdu::IRP_MJ_QUERY_INFORMATION,
+            pdu::FILE_BASIC_INFORMATION,
+        ));
+        let outputs = h.process(&close(3, dir));
+        assert_eq!(
+            outputs,
+            vec![
+                DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+                    1,
+                    2,
+                    STATUS_CANCELLED,
+                    &[0; 4]
+                )),
+                DeviceRedirectionOutput::FileClosed {
+                    device_id: 1,
+                    file_id: dir
+                },
+                DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+                    1,
+                    3,
+                    STATUS_SUCCESS,
+                    &[0; 4]
+                )),
+            ]
+        );
+        assert_eq!(
+            h.respond_information(2, Ok(&FileInformation::default())),
+            Err(RespondError::NotRequested)
+        );
+        assert_eq!(
+            sent(&h.process(&close(4, dir))),
+            vec![pdu::encode_io_completion(1, 4, STATUS_UNSUCCESSFUL, &[0; 4]).as_slice()]
+        );
+    }
+
+    /// A new Server Announce, like the channel ending, closes every file for the host.
+    #[test]
+    fn starting_over_closes_every_file() {
+        let mut h = ready();
+        let dir = open_directory(&mut h, 1, "\\d");
+        let outputs = h.process(&server_announce(0x0d, 9));
+        assert_eq!(
+            outputs[0],
+            DeviceRedirectionOutput::FileClosed {
+                device_id: 1,
+                file_id: dir
+            }
+        );
+        assert!(h.files.is_empty());
+
+        let mut h = ready();
+        let dir = open_directory(&mut h, 1, "\\d");
+        let outputs = h.process(&[0x72, 0x44, 0x99, 0x99]);
+        assert_eq!(
+            outputs[0],
+            DeviceRedirectionOutput::FileClosed {
+                device_id: 1,
+                file_id: dir
+            }
+        );
+    }
+
+    #[test]
+    fn patterns_match_as_windows_does() {
+        let m =
+            |pattern: &str, name: &str| matches_pattern(&pattern.chars().collect::<Vec<_>>(), name);
+        assert!(m("*", "anything.txt"));
+        assert!(m("*", ""));
+        assert!(m("*.txt", "Notes.TXT"));
+        assert!(!m("*.txt", "notes.txt.bak"));
+        assert!(m("a?c", "abc"));
+        assert!(!m("a?c", "ac"));
+        assert!(m("exact", "EXACT"));
+        assert!(!m("exact", "exactly"));
+        // DOS_STAR stops at the name's last dot; DOS_QM and DOS_DOT may match nothing there.
+        assert!(m("<.txt", "a.b.txt"));
+        assert!(!m("<.txt", "a.b.txt.bak"));
+        assert!(m("<", "no-dot"));
+        assert!(m("ab>>", "ab"));
+        assert!(m("a>\"txt", "a.txt"));
+        assert!(m("a\"", "a"));
+    }
+
+    /// A server-sized pattern costs one pass per character, not one per reachable position.
+    #[test]
+    fn a_long_pattern_is_matched_in_linear_passes() {
+        let pattern: Vec<char> = "*<".repeat(200_000).chars().collect();
+        let name = "x".repeat(255);
+        let start = std::time::Instant::now();
+        assert!(matches_pattern(&pattern, &name));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     /// Before the drives are announced no device exists, so a request is ignored.

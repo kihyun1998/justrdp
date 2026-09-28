@@ -77,6 +77,53 @@ pub const IRP_MJ_DIRECTORY_CONTROL: u32 = 0x0000_000C;
 pub const IRP_MJ_DEVICE_CONTROL: u32 = 0x0000_000E;
 /// `IRP_MJ_LOCK_CONTROL` (2.2.1.4).
 pub const IRP_MJ_LOCK_CONTROL: u32 = 0x0000_0011;
+/// `IRP_MN_QUERY_DIRECTORY`, a Directory Control's minor function (2.2.1.4).
+pub const IRP_MN_QUERY_DIRECTORY: u32 = 0x0000_0001;
+/// `IRP_MN_NOTIFY_CHANGE_DIRECTORY`, a Directory Control's minor function (2.2.1.4).
+pub const IRP_MN_NOTIFY_CHANGE_DIRECTORY: u32 = 0x0000_0002;
+
+/// `CreateOptions`: the file opened must be a directory.
+pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+/// `CreateOptions`: the file opened must not be a directory.
+pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+
+/// `CreateDisposition` `FILE_SUPERSEDE`.
+pub const FILE_SUPERSEDE: u32 = 0x0000_0000;
+/// `CreateDisposition` `FILE_OPEN`.
+pub const FILE_OPEN: u32 = 0x0000_0001;
+/// `CreateDisposition` `FILE_CREATE`.
+pub const FILE_CREATE: u32 = 0x0000_0002;
+/// `CreateDisposition` `FILE_OPEN_IF`.
+pub const FILE_OPEN_IF: u32 = 0x0000_0003;
+/// `CreateDisposition` `FILE_OVERWRITE`.
+pub const FILE_OVERWRITE: u32 = 0x0000_0004;
+/// `CreateDisposition` `FILE_OVERWRITE_IF`.
+pub const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
+
+/// A Create response's `Information` `FILE_SUPERSEDED` (2.2.1.5.1).
+pub const FILE_SUPERSEDED: u8 = 0x00;
+/// A Create response's `Information` `FILE_OPENED` (2.2.1.5.1).
+pub const FILE_OPENED: u8 = 0x01;
+/// A Create response's `Information` `FILE_OVERWRITTEN` (2.2.1.5.1).
+pub const FILE_OVERWRITTEN: u8 = 0x03;
+
+/// `FileAttributes`: a directory (`[MS-FSCC]` 2.6).
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+
+/// `FileFullDirectoryInformation` (`[MS-FSCC]` 2.4.17).
+pub const FILE_FULL_DIRECTORY_INFORMATION: u32 = 2;
+/// `FileBothDirectoryInformation` (`[MS-FSCC]` 2.4.8).
+pub const FILE_BOTH_DIRECTORY_INFORMATION: u32 = 3;
+/// `FileBasicInformation` (`[MS-FSCC]` 2.4.7).
+pub const FILE_BASIC_INFORMATION: u32 = 4;
+/// `FileStandardInformation` (`[MS-FSCC]` 2.4.47).
+pub const FILE_STANDARD_INFORMATION: u32 = 5;
+/// `FileFsVolumeInformation` (`[MS-FSCC]` 2.5.9).
+pub const FILE_FS_VOLUME_INFORMATION: u32 = 1;
+/// `FileFsAttributeInformation` (`[MS-FSCC]` 2.5.1).
+pub const FILE_FS_ATTRIBUTE_INFORMATION: u32 = 5;
+/// `FileFsFullSizeInformation` (`[MS-FSCC]` 2.5.4).
+pub const FILE_FS_FULL_SIZE_INFORMATION: u32 = 7;
 
 /// `STATUS_SUCCESS`.
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
@@ -84,6 +131,24 @@ pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 /// `STATUS_NOT_SUPPORTED`.
 pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+/// `STATUS_NO_MORE_FILES`: a later Query Directory found nothing more (2.2.3.3.10).
+pub const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
+/// `STATUS_NO_SUCH_FILE`: a first Query Directory found nothing (2.2.3.3.10).
+pub const STATUS_NO_SUCH_FILE: u32 = 0xC000_000F;
+/// `STATUS_INVALID_PARAMETER`.
+pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// `STATUS_ACCESS_DENIED`.
+pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+/// `STATUS_OBJECT_NAME_INVALID`.
+pub const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+/// `STATUS_INSUFFICIENT_RESOURCES`.
+pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+/// `STATUS_NOT_A_DIRECTORY`.
+pub const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+/// `STATUS_TOO_MANY_OPENED_FILES`.
+pub const STATUS_TOO_MANY_OPENED_FILES: u32 = 0xC000_011F;
+/// `STATUS_CANCELLED`.
+pub const STATUS_CANCELLED: u32 = 0xC000_0120;
 
 /// The `PreferredDosName` field's size, NUL included (2.2.1.3).
 pub const DOS_NAME_SIZE: usize = 8;
@@ -124,8 +189,8 @@ pub enum CapabilitySet {
     },
 }
 
-/// A Device I/O Request's header (2.2.1.4). The body after it depends on `major`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A Device I/O Request (2.2.1.4): its header, and the body its `major` and `minor` define.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IoRequest {
     /// The device the request is for.
     pub device_id: u32,
@@ -137,6 +202,54 @@ pub struct IoRequest {
     pub major: u32,
     /// `MinorFunction`.
     pub minor: u32,
+    /// The request's body, or why it does not decode.
+    pub body: Result<IoBody, DecodeError>,
+}
+
+/// The body of a Device I/O Request a drive answers (2.2.1.4, 2.2.3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IoBody {
+    /// Device Create Request (2.2.1.4.1).
+    Create(CreateRequest),
+    /// Query Volume Information Request (2.2.3.3.6).
+    QueryVolumeInformation {
+        /// `FsInformationClass`.
+        class: u32,
+    },
+    /// Query Information Request (2.2.3.3.8).
+    QueryInformation {
+        /// `FsInformationClass`.
+        class: u32,
+    },
+    /// Query Directory Request (2.2.3.3.10).
+    QueryDirectory {
+        /// `FsInformationClass`.
+        class: u32,
+        /// `InitialQuery`: whether `path` starts a new search.
+        initial: bool,
+        /// The search path, its terminating NUL removed; empty when not `initial`, since
+        /// 2.2.3.3.10 says to ignore it then.
+        path: Vec<u16>,
+    },
+    /// Any other request, whose body this decoder does not read.
+    Other,
+}
+
+/// A Device Create Request's fields (2.2.1.4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRequest {
+    /// `DesiredAccess`.
+    pub desired_access: u32,
+    /// `FileAttributes`.
+    pub file_attributes: u32,
+    /// `SharedAccess`.
+    pub shared_access: u32,
+    /// `CreateDisposition`.
+    pub create_disposition: u32,
+    /// `CreateOptions`.
+    pub create_options: u32,
+    /// `Path`, UTF-16 with its terminating NUL removed.
+    pub path: Vec<u16>,
 }
 
 /// A device in a Client Device List Announce (2.2.1.3).
@@ -232,12 +345,18 @@ impl RdpdrPdu {
             }
             PAKID_CORE_DEVICE_IOREQUEST => {
                 let mut cur = ReadCursor::new(&message[4..], "DR_DEVICE_IOREQUEST");
+                let device_id = cur.read_u32_le()?;
+                let file_id = cur.read_u32_le()?;
+                let completion_id = cur.read_u32_le()?;
+                let major = cur.read_u32_le()?;
+                let minor = cur.read_u32_le()?;
                 Ok(RdpdrPdu::IoRequest(IoRequest {
-                    device_id: cur.read_u32_le()?,
-                    file_id: cur.read_u32_le()?,
-                    completion_id: cur.read_u32_le()?,
-                    major: cur.read_u32_le()?,
-                    minor: cur.read_u32_le()?,
+                    device_id,
+                    file_id,
+                    completion_id,
+                    major,
+                    minor,
+                    body: decode_io_body(major, minor, &message[24..]),
                 }))
             }
             packet_id => Ok(RdpdrPdu::Unknown {
@@ -273,6 +392,72 @@ fn decode_capabilities(body: &[u8]) -> Result<RdpdrPdu, DecodeError> {
         });
     }
     Ok(RdpdrPdu::ServerCapabilities(sets))
+}
+
+fn decode_io_body(major: u32, minor: u32, body: &[u8]) -> Result<IoBody, DecodeError> {
+    match (major, minor) {
+        (IRP_MJ_CREATE, _) => {
+            let mut cur = ReadCursor::new(body, "DR_CREATE_REQ");
+            let desired_access = cur.read_u32_le()?;
+            let _allocation_size = cur.read_slice(8)?;
+            let file_attributes = cur.read_u32_le()?;
+            let shared_access = cur.read_u32_le()?;
+            let create_disposition = cur.read_u32_le()?;
+            let create_options = cur.read_u32_le()?;
+            let path_length = cur.read_u32_le()? as usize;
+            let path = utf16_path(cur.read_slice(path_length)?, "DR_CREATE_REQ.Path")?;
+            Ok(IoBody::Create(CreateRequest {
+                desired_access,
+                file_attributes,
+                shared_access,
+                create_disposition,
+                create_options,
+                path,
+            }))
+        }
+        (IRP_MJ_QUERY_VOLUME_INFORMATION, _) => Ok(IoBody::QueryVolumeInformation {
+            class: ReadCursor::new(body, "DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ").read_u32_le()?,
+        }),
+        (IRP_MJ_QUERY_INFORMATION, _) => Ok(IoBody::QueryInformation {
+            class: ReadCursor::new(body, "DR_DRIVE_QUERY_INFORMATION_REQ").read_u32_le()?,
+        }),
+        (IRP_MJ_DIRECTORY_CONTROL, IRP_MN_QUERY_DIRECTORY) => {
+            let mut cur = ReadCursor::new(body, "DR_DRIVE_QUERY_DIRECTORY_REQ");
+            let class = cur.read_u32_le()?;
+            let initial = cur.read_u8()? != 0;
+            let path_length = cur.read_u32_le()? as usize;
+            let _padding = cur.read_slice(23)?;
+            let path = if initial {
+                utf16_path(
+                    cur.read_slice(path_length)?,
+                    "DR_DRIVE_QUERY_DIRECTORY_REQ.Path",
+                )?
+            } else {
+                Vec::new()
+            };
+            Ok(IoBody::QueryDirectory {
+                class,
+                initial,
+                path,
+            })
+        }
+        _ => Ok(IoBody::Other),
+    }
+}
+
+/// A NUL-terminated UTF-16 path, its trailing NULs removed.
+fn utf16_path(bytes: &[u8], field: &'static str) -> Result<Vec<u16>, DecodeError> {
+    let (pairs, []) = bytes.as_chunks::<2>() else {
+        return Err(DecodeError::InvalidField {
+            field,
+            reason: "an odd number of bytes is not UTF-16",
+        });
+    };
+    let mut units: Vec<u16> = pairs.iter().map(|&pair| u16::from_le_bytes(pair)).collect();
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+    Ok(units)
 }
 
 fn decode_general(version: u32, data: &[u8]) -> Result<GeneralCapability, DecodeError> {
@@ -402,18 +587,17 @@ pub fn encode_io_completion(
 
 /// The zero-filled fields a failed response to `major` carries after its completion header
 /// (2.2.1.5.1-5, 2.2.3.4): a Create's `FileId` and `Information`, a Close's or Lock's
-/// padding, a Write's `Length` and padding, and every other known response's `Length`. An
-/// unknown major function answers with the header alone.
+/// padding, a Write's or Directory Control's `Length` and padding, and every other known
+/// response's `Length`. An unknown major function answers with the header alone.
 pub fn failure_body(major: u32) -> &'static [u8] {
     match major {
-        IRP_MJ_CREATE | IRP_MJ_WRITE | IRP_MJ_LOCK_CONTROL => &[0; 5],
+        IRP_MJ_CREATE | IRP_MJ_WRITE | IRP_MJ_LOCK_CONTROL | IRP_MJ_DIRECTORY_CONTROL => &[0; 5],
         IRP_MJ_CLOSE
         | IRP_MJ_READ
         | IRP_MJ_QUERY_INFORMATION
         | IRP_MJ_SET_INFORMATION
         | IRP_MJ_QUERY_VOLUME_INFORMATION
         | IRP_MJ_SET_VOLUME_INFORMATION
-        | IRP_MJ_DIRECTORY_CONTROL
         | IRP_MJ_DEVICE_CONTROL => &[0; 4],
         _ => &[],
     }
@@ -422,6 +606,174 @@ pub fn failure_body(major: u32) -> &'static [u8] {
 /// Whether `major` is a major function 2.2.1.4 defines.
 pub fn is_known_major(major: u32) -> bool {
     !failure_body(major).is_empty()
+}
+
+/// A file's times, size and attributes as `[MS-FSCC]` structures carry them. Times are
+/// `FILETIME`s: 100-nanosecond intervals since 1601-01-01 UTC.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileInformation {
+    /// `CreationTime`.
+    pub creation_time: u64,
+    /// `LastAccessTime`.
+    pub last_access_time: u64,
+    /// `LastWriteTime`.
+    pub last_write_time: u64,
+    /// `ChangeTime`.
+    pub change_time: u64,
+    /// `EndOfFile`: the size in bytes.
+    pub end_of_file: u64,
+    /// `AllocationSize`.
+    pub allocation_size: u64,
+    /// `FileAttributes` (`[MS-FSCC]` 2.6).
+    pub attributes: u32,
+}
+
+impl FileInformation {
+    /// Whether the attributes name a directory.
+    pub fn is_directory(&self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+}
+
+/// A volume's label, sizes and file system as `[MS-FSCC]` 2.5 structures carry them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeInformation {
+    /// `VolumeLabel`.
+    pub label: String,
+    /// `VolumeSerialNumber`.
+    pub serial_number: u32,
+    /// `VolumeCreationTime`, a `FILETIME`.
+    pub creation_time: u64,
+    /// `TotalAllocationUnits`.
+    pub total_units: u64,
+    /// `AvailableAllocationUnits`.
+    pub available_units: u64,
+    /// `SectorsPerAllocationUnit`.
+    pub sectors_per_unit: u32,
+    /// `BytesPerSector`.
+    pub bytes_per_sector: u32,
+    /// `FileSystemName`, such as `NTFS`.
+    pub file_system: String,
+    /// `FileSystemAttributes`.
+    pub file_system_attributes: u32,
+    /// `MaximumComponentNameLength`: at least 1 and at most 255 (`[MS-FSCC]` 2.5.1).
+    pub max_component_length: u32,
+}
+
+fn utf16_bytes(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// A Query Information buffer of `class` for `file` (2.2.3.3.8): `FileBasicInformation` or
+/// `FileStandardInformation`, the two WS2022 asks for, and `None` for any other. `FileBasicInformation` and `FileStandardInformation` omit the
+/// trailing `Reserved` field, as 2.2.3.3.8 requires.
+pub fn encode_file_information(class: u32, file: &FileInformation) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    match class {
+        FILE_BASIC_INFORMATION => {
+            for time in [
+                file.creation_time,
+                file.last_access_time,
+                file.last_write_time,
+                file.change_time,
+            ] {
+                out.extend_from_slice(&time.to_le_bytes());
+            }
+            out.extend_from_slice(&file.attributes.to_le_bytes());
+        }
+        FILE_STANDARD_INFORMATION => {
+            out.extend_from_slice(&file.allocation_size.to_le_bytes());
+            out.extend_from_slice(&file.end_of_file.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.push(0);
+            out.push(u8::from(file.is_directory()));
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// A Query Volume Information buffer of `class` (2.2.3.3.6): `FileFsVolumeInformation`,
+/// `FileFsAttributeInformation` or `FileFsFullSizeInformation`, the three WS2022 asks for, and
+/// `None` for any other. `FileFsVolumeInformation` omits its `Reserved` byte, as
+/// 2.2.3.3.6 requires, and its label length counts the terminating NUL.
+pub fn encode_volume_information(class: u32, volume: &VolumeInformation) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    match class {
+        FILE_FS_VOLUME_INFORMATION => {
+            let mut label = utf16_bytes(&volume.label);
+            label.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&volume.creation_time.to_le_bytes());
+            out.extend_from_slice(&volume.serial_number.to_le_bytes());
+            out.extend_from_slice(&(label.len() as u32).to_le_bytes());
+            out.push(0);
+            out.extend_from_slice(&label);
+        }
+        FILE_FS_FULL_SIZE_INFORMATION => {
+            out.extend_from_slice(&volume.total_units.to_le_bytes());
+            out.extend_from_slice(&volume.available_units.to_le_bytes());
+            out.extend_from_slice(&volume.available_units.to_le_bytes());
+            out.extend_from_slice(&volume.sectors_per_unit.to_le_bytes());
+            out.extend_from_slice(&volume.bytes_per_sector.to_le_bytes());
+        }
+        FILE_FS_ATTRIBUTE_INFORMATION => {
+            let name = utf16_bytes(&volume.file_system);
+            out.extend_from_slice(&volume.file_system_attributes.to_le_bytes());
+            out.extend_from_slice(&volume.max_component_length.to_le_bytes());
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(&name);
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// One Query Directory entry of `class` for the file `name` (2.2.3.3.10), alone in its
+/// buffer so `NextEntryOffset` is zero: `FileFullDirectoryInformation` or
+/// `FileBothDirectoryInformation`, the two WS2022 asks for, and `None` for any other. `FileBothDirectoryInformation` omits its `Reserved` byte, as 2.2.3.3.10
+/// requires, and its short name is empty.
+pub fn encode_directory_entry(class: u32, name: &str, file: &FileInformation) -> Option<Vec<u8>> {
+    if !matches!(
+        class,
+        FILE_FULL_DIRECTORY_INFORMATION | FILE_BOTH_DIRECTORY_INFORMATION
+    ) {
+        return None;
+    }
+    let name = utf16_bytes(name);
+    let mut out = Vec::new();
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for time in [
+        file.creation_time,
+        file.last_access_time,
+        file.last_write_time,
+        file.change_time,
+    ] {
+        out.extend_from_slice(&time.to_le_bytes());
+    }
+    out.extend_from_slice(&file.end_of_file.to_le_bytes());
+    out.extend_from_slice(&file.allocation_size.to_le_bytes());
+    out.extend_from_slice(&file.attributes.to_le_bytes());
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    if class == FILE_BOTH_DIRECTORY_INFORMATION {
+        out.push(0);
+        out.extend_from_slice(&[0; 24]);
+    }
+    out.extend_from_slice(&name);
+    Some(out)
+}
+
+/// A query response's body: `Length`, the buffer, and for a Query Volume Information or
+/// Query Directory response with an empty buffer the optional padding byte FreeRDP sends.
+pub fn length_prefixed(buffer: &[u8], pad_when_empty: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + buffer.len());
+    out.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+    out.extend_from_slice(buffer);
+    if pad_when_empty && buffer.is_empty() {
+        out.push(0);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -610,6 +962,11 @@ mod tests {
                 completion_id: 3,
                 major: IRP_MJ_CREATE,
                 minor: 0,
+                body: Err(DecodeError::NotEnoughBytes {
+                    context: "DR_CREATE_REQ",
+                    needed: 4,
+                    got: 1,
+                }),
             }))
         );
         assert_eq!(
@@ -635,7 +992,7 @@ mod tests {
         .iter()
         .map(|&major| failure_body(major).len())
         .collect();
-        assert_eq!(lengths, [5, 4, 4, 5, 5, 4, 0]);
+        assert_eq!(lengths, [5, 4, 4, 5, 5, 5, 0]);
         assert!(!is_known_major(0x0000_0001));
     }
 
@@ -650,6 +1007,190 @@ mod tests {
         );
         assert!(RdpdrPdu::decode(&[0x72, 0x44, 0x6e]).is_err());
         assert!(RdpdrPdu::decode(&SERVER_ANNOUNCE[..11]).is_err());
+    }
+
+    fn utf16z(text: &str) -> Vec<u8> {
+        text.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    fn io_header(major: u32, minor: u32) -> Vec<u8> {
+        let mut m = vec![0x72, 0x44, 0x52, 0x49];
+        for field in [1u32, 2, 3, major, minor] {
+            m.extend_from_slice(&field.to_le_bytes());
+        }
+        m
+    }
+
+    #[test]
+    fn a_create_request_body_decodes() {
+        let mut m = io_header(IRP_MJ_CREATE, 0);
+        let path = utf16z("\\dir\\a.txt");
+        for field in [
+            0x0012_0089u32,
+            0,
+            0,
+            0x80,
+            7,
+            FILE_OPEN_IF,
+            FILE_NON_DIRECTORY_FILE,
+        ] {
+            m.extend_from_slice(&field.to_le_bytes());
+        }
+        m.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        m.extend_from_slice(&path);
+        let Ok(RdpdrPdu::IoRequest(request)) = RdpdrPdu::decode(&m) else {
+            panic!("the request decodes");
+        };
+        assert_eq!(
+            request.body,
+            Ok(IoBody::Create(CreateRequest {
+                desired_access: 0x0012_0089,
+                file_attributes: 0x80,
+                shared_access: 7,
+                create_disposition: FILE_OPEN_IF,
+                create_options: FILE_NON_DIRECTORY_FILE,
+                path: "\\dir\\a.txt".encode_utf16().collect(),
+            }))
+        );
+    }
+
+    /// 2.2.3.3.10: `PathLength` sits unaligned after the one-byte `InitialQuery`, and the path
+    /// of a later query is ignored.
+    #[test]
+    fn a_query_directory_body_decodes() {
+        let query = |initial: u8| {
+            let mut m = io_header(IRP_MJ_DIRECTORY_CONTROL, IRP_MN_QUERY_DIRECTORY);
+            let path = utf16z("\\*");
+            m.extend_from_slice(&FILE_BOTH_DIRECTORY_INFORMATION.to_le_bytes());
+            m.push(initial);
+            m.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            m.extend_from_slice(&[0; 23]);
+            m.extend_from_slice(&path);
+            match RdpdrPdu::decode(&m) {
+                Ok(RdpdrPdu::IoRequest(request)) => request.body,
+                other => panic!("expected a request, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            query(1),
+            Ok(IoBody::QueryDirectory {
+                class: FILE_BOTH_DIRECTORY_INFORMATION,
+                initial: true,
+                path: "\\*".encode_utf16().collect(),
+            })
+        );
+        assert_eq!(
+            query(0),
+            Ok(IoBody::QueryDirectory {
+                class: FILE_BOTH_DIRECTORY_INFORMATION,
+                initial: false,
+                path: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_odd_length_path_is_malformed() {
+        let mut m = io_header(IRP_MJ_CREATE, 0);
+        for field in [0u32, 0, 0, 0, 0, FILE_OPEN, 0, 3] {
+            m.extend_from_slice(&field.to_le_bytes());
+        }
+        m.extend_from_slice(&[b'a', 0, 0]);
+        let Ok(RdpdrPdu::IoRequest(request)) = RdpdrPdu::decode(&m) else {
+            panic!("the header decodes");
+        };
+        assert!(request.body.is_err());
+    }
+
+    fn sample_file() -> FileInformation {
+        FileInformation {
+            creation_time: 1,
+            last_access_time: 2,
+            last_write_time: 3,
+            change_time: 4,
+            end_of_file: 5,
+            allocation_size: 8,
+            attributes: FILE_ATTRIBUTE_DIRECTORY,
+        }
+    }
+
+    /// The sizes 2.2.3.3.8 gives once the `Reserved` fields are dropped: Basic 36, Standard
+    /// 22.
+    #[test]
+    fn file_information_has_the_rdpdr_layouts() {
+        let file = sample_file();
+        let basic = encode_file_information(FILE_BASIC_INFORMATION, &file).unwrap();
+        assert_eq!(basic.len(), 36);
+        assert_eq!(&basic[24..32], &4u64.to_le_bytes());
+        assert_eq!(&basic[32..36], &FILE_ATTRIBUTE_DIRECTORY.to_le_bytes());
+        let standard = encode_file_information(FILE_STANDARD_INFORMATION, &file).unwrap();
+        assert_eq!(standard.len(), 22);
+        assert_eq!(&standard[0..8], &8u64.to_le_bytes());
+        assert_eq!(&standard[8..16], &5u64.to_le_bytes());
+        assert_eq!(standard[21], 1, "Directory");
+        assert_eq!(encode_file_information(0x23, &file), None);
+    }
+
+    /// `FileFsVolumeInformation` has 17 bytes before its label, which counts its NUL.
+    #[test]
+    fn volume_information_has_the_rdpdr_layouts() {
+        let volume = VolumeInformation {
+            label: "ab".to_string(),
+            serial_number: 0x1234,
+            file_system: "NTFS".to_string(),
+            max_component_length: 255,
+            ..VolumeInformation::default()
+        };
+        let v = encode_volume_information(FILE_FS_VOLUME_INFORMATION, &volume).unwrap();
+        assert_eq!(v.len(), 17 + 6);
+        assert_eq!(&v[12..16], &6u32.to_le_bytes());
+        assert_eq!(&v[17..], &[b'a', 0, b'b', 0, 0, 0]);
+        let a = encode_volume_information(FILE_FS_ATTRIBUTE_INFORMATION, &volume).unwrap();
+        assert_eq!(&a[4..8], &255u32.to_le_bytes());
+        assert_eq!(&a[8..12], &8u32.to_le_bytes());
+        assert_eq!(a.len(), 12 + 8);
+        assert_eq!(
+            encode_volume_information(FILE_FS_FULL_SIZE_INFORMATION, &volume)
+                .unwrap()
+                .len(),
+            32
+        );
+        for unmeasured in [3, 4] {
+            assert_eq!(encode_volume_information(unmeasured, &volume), None);
+        }
+    }
+
+    /// Each directory class puts the name where its layout does: 68, and 93 with the
+    /// `Reserved` byte dropped as 2.2.3.3.10 requires; no NUL, and `NextEntryOffset` zero.
+    #[test]
+    fn directory_entries_have_the_rdpdr_layouts() {
+        let file = sample_file();
+        for (class, at) in [
+            (FILE_FULL_DIRECTORY_INFORMATION, 68),
+            (FILE_BOTH_DIRECTORY_INFORMATION, 93),
+        ] {
+            let entry = encode_directory_entry(class, "ab", &file).unwrap();
+            assert_eq!(entry.len(), at + 4, "class {class}");
+            assert_eq!(&entry[at..], &[b'a', 0, b'b', 0], "class {class}");
+            assert_eq!(&entry[0..4], &[0; 4]);
+            assert_eq!(&entry[60..64], &4u32.to_le_bytes(), "class {class}");
+        }
+        let both = encode_directory_entry(FILE_BOTH_DIRECTORY_INFORMATION, "ab", &file).unwrap();
+        assert_eq!(&both[40..48], &5u64.to_le_bytes(), "EndOfFile");
+        assert_eq!(&both[56..60], &FILE_ATTRIBUTE_DIRECTORY.to_le_bytes());
+        for unmeasured in [1, 12] {
+            assert_eq!(encode_directory_entry(unmeasured, "ab", &file), None);
+        }
+    }
+
+    #[test]
+    fn an_empty_query_buffer_is_padded() {
+        assert_eq!(length_prefixed(&[], true), [0, 0, 0, 0, 0]);
+        assert_eq!(length_prefixed(&[], false), [0, 0, 0, 0]);
+        assert_eq!(length_prefixed(&[9], true), [1, 0, 0, 0, 9]);
     }
 
     proptest::proptest! {
