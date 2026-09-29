@@ -21,14 +21,21 @@ use justrdp_pdu::rdpdr::{
     STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
     STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY, STATUS_NOT_SUPPORTED,
     STATUS_OBJECT_NAME_INVALID, STATUS_SUCCESS, STATUS_TOO_MANY_OPENED_FILES, STATUS_UNSUCCESSFUL,
+    SetInformation,
 };
-pub use justrdp_pdu::rdpdr::{FileInformation, VolumeInformation};
+pub use justrdp_pdu::rdpdr::{BasicInformation, FileInformation, VolumeInformation};
 
 /// The `VersionMinor` values a client may send, highest first (2.2.2.3).
 const CLIENT_VERSIONS: [u16; 5] = [0x000D, 0x000C, 0x000A, 0x0005, 0x0002];
 
 /// The server version from which the client echoes the server's `ClientId` (3.2.5.1.3).
 const ECHO_CLIENT_ID_FROM: u16 = 0x000C;
+
+/// The client version from which a Write `Offset` of all ones appends (2.2.1.4.4).
+const APPEND_FROM: u16 = 0x000D;
+
+/// `MAXLONGLONG`, the furthest a file's data reaches (`[MS-FSA]` 2.1.5.3, 2.1.5.4).
+const MAX_FILE_END: u64 = i64::MAX as u64;
 
 /// The Client Network Data entry for the device redirection channel.
 pub fn channel_def() -> ChannelDef {
@@ -103,6 +110,9 @@ pub enum DeviceRedirectionOutput {
         device_id: u32,
         /// The file's ID, from its [`DriveRequest::Open`].
         file_id: u32,
+        /// Whether the host deletes the file now: its Open asked for `delete_on_close`, or the
+        /// host last accepted a [`DriveRequest::Delete`] with `delete` set.
+        delete: bool,
     },
     /// The server sent a message this side cannot read, so the channel is ended (3.1.5.2): every
     /// later message on it is ignored. The rest of the session goes on.
@@ -176,6 +186,8 @@ pub enum DriveRequest {
         disposition: Disposition,
         /// `DesiredAccess`, the access the server asks for.
         desired_access: u32,
+        /// Whether the file is deleted when it closes (`FILE_DELETE_ON_CLOSE`).
+        delete_on_close: bool,
     },
     /// Read at most `length` bytes of the open file `file_id` from `offset`. Answer with
     /// [`DeviceRedirection::respond_read`].
@@ -187,6 +199,57 @@ pub enum DriveRequest {
         /// The most bytes to read, as the server sized it: never zero, and `offset + length`
         /// never exceeds `i64::MAX`.
         length: u32,
+    },
+    /// Write `data` to the open file `file_id`. Answer with [`DeviceRedirection::respond_write`].
+    Write {
+        /// The file.
+        file_id: u32,
+        /// Where to write.
+        offset: WriteOffset,
+        /// The bytes to write, possibly none.
+        data: Vec<u8>,
+    },
+    /// Set the size of the open file `file_id`. Answer with [`DeviceRedirection::respond_set`].
+    SetEndOfFile {
+        /// The file, never a directory.
+        file_id: u32,
+        /// The new size in bytes, at most `i64::MAX`.
+        size: u64,
+    },
+    /// Set the allocation size of the open file `file_id`. Answer with
+    /// [`DeviceRedirection::respond_set`].
+    SetAllocationSize {
+        /// The file, never a directory.
+        file_id: u32,
+        /// The new allocation size in bytes, at most `i64::MAX`.
+        size: u64,
+    },
+    /// Set the times and attributes of the open file `file_id`, by `[MS-FSCC]` 2.4.7's
+    /// meanings. Answer with [`DeviceRedirection::respond_set`].
+    SetBasic {
+        /// The file.
+        file_id: u32,
+        /// What to set.
+        info: BasicInformation,
+    },
+    /// Move the open file `file_id` to `path`. Answer with [`DeviceRedirection::respond_set`].
+    Rename {
+        /// The file.
+        file_id: u32,
+        /// The new path's components below the drive's root, never empty, by the rules of
+        /// [`DriveRequest::Open`]'s `path`.
+        path: Vec<String>,
+        /// Whether a file already at `path` is replaced.
+        replace_if_exists: bool,
+    },
+    /// Mark the open file `file_id` to be deleted when it closes, or unmark it. Answer with
+    /// [`DeviceRedirection::respond_set`]; the helper reports the outcome in
+    /// [`DeviceRedirectionOutput::FileClosed`], and the host deletes then.
+    Delete {
+        /// The file.
+        file_id: u32,
+        /// Whether to delete it.
+        delete: bool,
     },
     /// Describe the drive's volume. Answer with [`DeviceRedirection::respond_volume`].
     QueryVolume,
@@ -205,6 +268,15 @@ pub enum DriveRequest {
         /// [`DriveRequest::Open`]'s `path`.
         path: Vec<String>,
     },
+}
+
+/// Where a [`DriveRequest::Write`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOffset {
+    /// At this offset; `offset + data.len()` never exceeds `i64::MAX`.
+    At(u64),
+    /// At the file's end.
+    Append,
 }
 
 /// What an opened file is.
@@ -232,7 +304,8 @@ pub enum RespondError {
     NotRequested,
     /// The request under that `completion_id` asks for a different answer.
     WrongKind,
-    /// The answer holds more bytes than the read asked for.
+    /// The answer holds more bytes than the read asked for, or counts more than the write
+    /// carried.
     TooLong,
 }
 
@@ -247,11 +320,48 @@ struct Pending {
 
 #[derive(Debug, Clone)]
 enum PendingKind {
-    Open { disposition: Disposition },
-    Read { length: u32 },
-    Volume { class: u32 },
-    Information { class: u32 },
-    Listing { class: u32, pattern: Vec<char> },
+    Open {
+        disposition: Disposition,
+        delete_on_close: bool,
+    },
+    Read {
+        length: u32,
+    },
+    Write {
+        length: u32,
+    },
+    /// A Set Information request: its `Length`, and the delete mark an accepted answer sets.
+    Set {
+        length: u32,
+        delete: Option<bool>,
+    },
+    Volume {
+        class: u32,
+    },
+    Information {
+        class: u32,
+    },
+    Listing {
+        class: u32,
+        pattern: Vec<char>,
+    },
+}
+
+impl PendingKind {
+    /// The body of a failed response to the request this stands for: its response layout's
+    /// fields zeroed, a Set Information's `Length` repeated (2.2.3.4.9).
+    fn failed_body(&self) -> Vec<u8> {
+        let major = match self {
+            Self::Open { .. } => pdu::IRP_MJ_CREATE,
+            Self::Read { .. } => pdu::IRP_MJ_READ,
+            Self::Write { .. } => pdu::IRP_MJ_WRITE,
+            Self::Set { length, .. } => return length.to_le_bytes().to_vec(),
+            Self::Volume { .. } => pdu::IRP_MJ_QUERY_VOLUME_INFORMATION,
+            Self::Information { .. } => pdu::IRP_MJ_QUERY_INFORMATION,
+            Self::Listing { .. } => pdu::IRP_MJ_DIRECTORY_CONTROL,
+        };
+        pdu::failure_body(major).to_vec()
+    }
 }
 
 /// A file the host opened.
@@ -260,6 +370,8 @@ struct OpenFile {
     device_id: u32,
     file_id: u32,
     directory: bool,
+    /// Whether the host deletes the file when it closes.
+    delete: bool,
     /// The entries of the directory's current search not yet handed out.
     listing: VecDeque<DirectoryEntry>,
 }
@@ -331,7 +443,11 @@ impl DeviceRedirection {
     ) -> Result<Vec<u8>, RespondError> {
         let pending =
             self.take_pending(completion_id, |k| matches!(k, PendingKind::Open { .. }))?;
-        let PendingKind::Open { disposition } = pending.kind else {
+        let PendingKind::Open {
+            disposition,
+            delete_on_close,
+        } = pending.kind
+        else {
             unreachable!("take_pending matched an Open")
         };
         Ok(match answer {
@@ -340,6 +456,7 @@ impl DeviceRedirection {
                     device_id: pending.device_id,
                     file_id: pending.file_id,
                     directory: opened == Opened::Directory,
+                    delete: delete_on_close,
                     listing: VecDeque::new(),
                 });
                 let mut body = pending.file_id.to_le_bytes().to_vec();
@@ -379,6 +496,61 @@ impl DeviceRedirection {
             }
             Err(status) => complete(&pending, status, pdu::failure_body(pdu::IRP_MJ_READ)),
         })
+    }
+
+    /// The answer to [`DriveRequest::Write`]: how many bytes were written, at most the data's
+    /// length, or the NTSTATUS the host failed with.
+    pub fn respond_write(
+        &mut self,
+        completion_id: u32,
+        answer: Result<u32, u32>,
+    ) -> Result<Vec<u8>, RespondError> {
+        let at = self
+            .pending
+            .iter()
+            .position(|p| p.completion_id == completion_id)
+            .ok_or(RespondError::NotRequested)?;
+        let PendingKind::Write { length } = self.pending[at].kind else {
+            return Err(RespondError::WrongKind);
+        };
+        if answer.is_ok_and(|written| written > length) {
+            return Err(RespondError::TooLong);
+        }
+        let pending = self.pending.remove(at);
+        Ok(match answer {
+            Ok(written) => {
+                let mut body = written.to_le_bytes().to_vec();
+                body.push(0);
+                complete(&pending, STATUS_SUCCESS, &body)
+            }
+            Err(status) => complete(&pending, status, pdu::failure_body(pdu::IRP_MJ_WRITE)),
+        })
+    }
+
+    /// The answer to [`DriveRequest::SetEndOfFile`], [`DriveRequest::SetAllocationSize`],
+    /// [`DriveRequest::SetBasic`], [`DriveRequest::Rename`] and [`DriveRequest::Delete`]:
+    /// done, or the NTSTATUS the host failed with.
+    pub fn respond_set(
+        &mut self,
+        completion_id: u32,
+        answer: Result<(), u32>,
+    ) -> Result<Vec<u8>, RespondError> {
+        let pending = self.take_pending(completion_id, |k| matches!(k, PendingKind::Set { .. }))?;
+        let PendingKind::Set { length, delete } = pending.kind else {
+            unreachable!("take_pending matched a Set")
+        };
+        let status = match answer {
+            Ok(()) => {
+                if let Some(delete) = delete
+                    && let Some(file) = self.file_mut(pending.device_id, pending.file_id)
+                {
+                    file.delete = delete;
+                }
+                STATUS_SUCCESS
+            }
+            Err(status) => status,
+        };
+        Ok(complete(&pending, status, &length.to_le_bytes()))
     }
 
     /// The answer to [`DriveRequest::QueryVolume`]: the volume, or the NTSTATUS the host
@@ -586,6 +758,12 @@ impl DeviceRedirection {
             (pdu::IRP_MJ_READ, IoBody::Read { length, offset }) => {
                 self.read(&request, length, offset)
             }
+            (pdu::IRP_MJ_WRITE, IoBody::Write { offset, data }) => {
+                self.write(&request, offset, data)
+            }
+            (pdu::IRP_MJ_SET_INFORMATION, IoBody::SetInformation { length, info }) => {
+                self.set_information(&request, length, info)
+            }
             (pdu::IRP_MJ_QUERY_VOLUME_INFORMATION, IoBody::QueryVolumeInformation { class }) => {
                 if pdu::encode_volume_information(class, &VolumeInformation::default()).is_none() {
                     return reject(STATUS_NOT_SUPPORTED);
@@ -657,16 +835,25 @@ impl DeviceRedirection {
         let file_id = next_id(&mut self.last_file_id, |id| {
             files.iter().any(|f| f.file_id == id) || pending.iter().any(|p| p.file_id == id)
         });
+        let delete_on_close = create.create_options & pdu::FILE_DELETE_ON_CLOSE != 0;
         let open = DriveRequest::Open {
             file_id,
             path,
             kind,
             disposition,
             desired_access: create.desired_access,
+            delete_on_close,
         };
         let mut request = request.clone();
         request.file_id = file_id;
-        self.ask(&request, PendingKind::Open { disposition }, open)
+        self.ask(
+            &request,
+            PendingKind::Open {
+                disposition,
+                delete_on_close,
+            },
+            open,
+        )
     }
 
     /// A Close: the file is forgotten, requests the host still owes about it are answered
@@ -685,6 +872,7 @@ impl DeviceRedirection {
         outputs.push(DeviceRedirectionOutput::FileClosed {
             device_id: file.device_id,
             file_id: file.file_id,
+            delete: file.delete,
         });
         outputs.push(DeviceRedirectionOutput::Send(pdu::encode_io_completion(
             request.device_id,
@@ -711,7 +899,7 @@ impl DeviceRedirection {
         }
         if offset
             .checked_add(u64::from(length))
-            .is_none_or(|end| end > i64::MAX as u64)
+            .is_none_or(|end| end > MAX_FILE_END)
         {
             return refuse(request, STATUS_INVALID_PARAMETER);
         }
@@ -733,6 +921,111 @@ impl DeviceRedirection {
                 length,
             },
         )
+    }
+
+    /// A Write: handed to the host, except a write to a directory or a file not open, and a
+    /// range past `MAXLONGLONG` (`[MS-FSA]` 2.1.5.4). A zero-length write still reaches the host,
+    /// which refuses it first on a read-only drive.
+    fn write(
+        &mut self,
+        request: &IoRequest,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Vec<DeviceRedirectionOutput> {
+        let appends = self
+            .announced_as
+            .is_some_and(|(version, _)| version >= APPEND_FROM);
+        let Some(file) = self.file_mut(request.device_id, request.file_id) else {
+            return refuse(request, STATUS_UNSUCCESSFUL);
+        };
+        if file.directory {
+            return refuse(request, STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let offset = if appends && offset == u64::MAX {
+            WriteOffset::Append
+        } else {
+            if offset
+                .checked_add(data.len() as u64)
+                .is_none_or(|end| end > MAX_FILE_END)
+            {
+                return refuse(request, STATUS_INVALID_PARAMETER);
+            }
+            WriteOffset::At(offset)
+        };
+        let file_id = request.file_id;
+        self.ask(
+            request,
+            PendingKind::Write {
+                length: data.len() as u32,
+            },
+            DriveRequest::Write {
+                file_id,
+                offset,
+                data,
+            },
+        )
+    }
+
+    /// A Set Information: each class 2.2.3.3.9 names reaches the host as its own request, a
+    /// rename target checked against the wire first. Every response repeats the request's
+    /// `Length` (2.2.3.4.9).
+    fn set_information(
+        &mut self,
+        request: &IoRequest,
+        length: u32,
+        info: SetInformation,
+    ) -> Vec<DeviceRedirectionOutput> {
+        let reject = |status: u32| {
+            vec![DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+                request.device_id,
+                request.completion_id,
+                status,
+                &length.to_le_bytes(),
+            ))]
+        };
+        let Some(file) = self.file_mut(request.device_id, request.file_id) else {
+            return reject(STATUS_UNSUCCESSFUL);
+        };
+        let (directory, file_id) = (file.directory, request.file_id);
+        let mut delete = None;
+        let drive_request = match info {
+            SetInformation::EndOfFile(size) | SetInformation::Allocation(size)
+                if directory || size > MAX_FILE_END =>
+            {
+                return reject(STATUS_INVALID_PARAMETER);
+            }
+            SetInformation::EndOfFile(size) => DriveRequest::SetEndOfFile { file_id, size },
+            SetInformation::Allocation(size) => DriveRequest::SetAllocationSize { file_id, size },
+            SetInformation::Basic(info) => DriveRequest::SetBasic { file_id, info },
+            SetInformation::Disposition { delete_pending } => {
+                delete = Some(delete_pending);
+                DriveRequest::Delete {
+                    file_id,
+                    delete: delete_pending,
+                }
+            }
+            SetInformation::Rename {
+                replace_if_exists,
+                root_directory,
+                path,
+            } => {
+                if root_directory != 0 {
+                    return reject(STATUS_INVALID_PARAMETER);
+                }
+                let path = match drive_path(&path, false) {
+                    Ok(path) if !path.is_empty() => path,
+                    Ok(_) => return reject(STATUS_OBJECT_NAME_INVALID),
+                    Err(status) => return reject(status),
+                };
+                DriveRequest::Rename {
+                    file_id,
+                    path,
+                    replace_if_exists,
+                }
+            }
+            SetInformation::Other { .. } => return reject(STATUS_NOT_SUPPORTED),
+        };
+        self.ask(request, PendingKind::Set { length, delete }, drive_request)
     }
 
     /// A Query Directory: a first query asks the host for the directory's entries, and a later
@@ -795,16 +1088,25 @@ impl DeviceRedirection {
         kind: PendingKind,
         drive_request: DriveRequest,
     ) -> Vec<DeviceRedirectionOutput> {
-        if self.pending.len() >= MAX_PENDING_REQUESTS {
+        let status = if self.pending.len() >= MAX_PENDING_REQUESTS {
             tracing::warn!(target: "rdp_rdpdr", "Device I/O Request refused: too many waiting");
-            return refuse(request, STATUS_INSUFFICIENT_RESOURCES);
-        }
-        if self
+            STATUS_INSUFFICIENT_RESOURCES
+        } else if self
             .pending
             .iter()
             .any(|p| p.completion_id == request.completion_id)
         {
-            return refuse(request, STATUS_UNSUCCESSFUL);
+            STATUS_UNSUCCESSFUL
+        } else {
+            STATUS_SUCCESS
+        };
+        if status != STATUS_SUCCESS {
+            return vec![DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+                request.device_id,
+                request.completion_id,
+                status,
+                &kind.failed_body(),
+            ))];
         }
         self.pending.push(Pending {
             completion_id: request.completion_id,
@@ -844,18 +1146,7 @@ impl DeviceRedirection {
         cancelled
             .iter()
             .map(|p: &Pending| {
-                let major = match p.kind {
-                    PendingKind::Open { .. } => pdu::IRP_MJ_CREATE,
-                    PendingKind::Read { .. } => pdu::IRP_MJ_READ,
-                    PendingKind::Volume { .. } => pdu::IRP_MJ_QUERY_VOLUME_INFORMATION,
-                    PendingKind::Information { .. } => pdu::IRP_MJ_QUERY_INFORMATION,
-                    PendingKind::Listing { .. } => pdu::IRP_MJ_DIRECTORY_CONTROL,
-                };
-                DeviceRedirectionOutput::Send(complete(
-                    p,
-                    STATUS_CANCELLED,
-                    pdu::failure_body(major),
-                ))
+                DeviceRedirectionOutput::Send(complete(p, STATUS_CANCELLED, &p.kind.failed_body()))
             })
             .collect()
     }
@@ -868,6 +1159,7 @@ impl DeviceRedirection {
             .map(|f| DeviceRedirectionOutput::FileClosed {
                 device_id: f.device_id,
                 file_id: f.file_id,
+                delete: f.delete,
             })
             .collect()
     }
@@ -1287,7 +1579,7 @@ mod tests {
     fn unimplemented_requests_are_refused() {
         let mut h = ready();
         assert_eq!(
-            sent(&h.process(&io_request(1, 6, pdu::IRP_MJ_WRITE))),
+            sent(&h.process(&io_request(1, 6, pdu::IRP_MJ_LOCK_CONTROL))),
             vec![pdu::encode_io_completion(1, 6, STATUS_NOT_SUPPORTED, &[0; 5]).as_slice()]
         );
         assert_eq!(
@@ -1527,6 +1819,370 @@ mod tests {
         );
     }
 
+    fn write(completion_id: u32, file_id: u32, offset: u64, data: &[u8]) -> Vec<u8> {
+        let mut m = header(file_id, completion_id, pdu::IRP_MJ_WRITE, 0);
+        m.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        m.extend_from_slice(&offset.to_le_bytes());
+        m.extend_from_slice(&[0; 20]);
+        m.extend_from_slice(data);
+        m
+    }
+
+    fn set_info(completion_id: u32, file_id: u32, class: u32, buffer: &[u8]) -> Vec<u8> {
+        let mut m = header(file_id, completion_id, pdu::IRP_MJ_SET_INFORMATION, 0);
+        m.extend_from_slice(&class.to_le_bytes());
+        m.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+        m.extend_from_slice(&[0; 24]);
+        m.extend_from_slice(buffer);
+        m
+    }
+
+    fn rename_buffer(root_directory: u8, path: &str) -> Vec<u8> {
+        let name: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut b = vec![1, root_directory];
+        b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        b.extend_from_slice(&name);
+        b
+    }
+
+    /// A Write reaches the host with its offset and data; the answer is the count written and a
+    /// padding byte, and a count above what was sent is refused.
+    #[test]
+    fn a_write_is_answered_by_the_host() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        let outputs = h.process(&write(2, file, 5, b"abc"));
+        assert_eq!(
+            asked(&outputs),
+            &DriveRequest::Write {
+                file_id: file,
+                offset: WriteOffset::At(5),
+                data: b"abc".to_vec()
+            }
+        );
+        assert_eq!(h.respond_write(2, Ok(4)), Err(RespondError::TooLong));
+        assert_eq!(
+            h.respond_write(2, Ok(3)),
+            Ok(pdu::encode_io_completion(
+                1,
+                2,
+                STATUS_SUCCESS,
+                &[3, 0, 0, 0, 0]
+            ))
+        );
+        h.process(&write(3, file, 0, b"x"));
+        assert_eq!(
+            h.respond_write(3, Err(pdu::STATUS_MEDIA_WRITE_PROTECTED)),
+            Ok(pdu::encode_io_completion(
+                1,
+                3,
+                pdu::STATUS_MEDIA_WRITE_PROTECTED,
+                &[0; 5]
+            ))
+        );
+        // A zero-length write still reaches the host: a read-only drive refuses it first
+        // (`[MS-FSA]` 2.1.5.4).
+        let outputs = h.process(&write(4, file, 0, b""));
+        assert!(matches!(asked(&outputs), DriveRequest::Write { data, .. } if data.is_empty()));
+    }
+
+    /// An `Offset` of all ones appends when this client announced version 13 or later
+    /// (2.2.1.4.4), and is an offset past `MAXLONGLONG` below it.
+    #[test]
+    fn all_ones_appends_from_version_13() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        let outputs = h.process(&write(2, file, u64::MAX, b"z"));
+        assert!(matches!(
+            asked(&outputs),
+            DriveRequest::Write {
+                offset: WriteOffset::Append,
+                ..
+            }
+        ));
+
+        let mut h = helper();
+        h.process(&server_announce(0x0c, 7));
+        h.process(&SERVER_CAPABILITIES);
+        h.process(&client_id_confirm(7));
+        h.process(&USER_LOGGED_ON);
+        let file = open_file(&mut h, 1, "\\a.txt");
+        assert_eq!(
+            sent(&h.process(&write(2, file, u64::MAX, b"z"))),
+            vec![pdu::encode_io_completion(1, 2, STATUS_INVALID_PARAMETER, &[0; 5]).as_slice()]
+        );
+    }
+
+    /// Writes answered without the host: a directory, a file not open, and a range past
+    /// `MAXLONGLONG` (`[MS-FSA]` 2.1.5.4).
+    #[test]
+    fn a_write_the_helper_can_answer_skips_the_host() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        let dir = open_directory(&mut h, 2, "\\d");
+        for (m, status) in [
+            (write(9, dir, 0, b"x"), STATUS_INVALID_DEVICE_REQUEST),
+            (write(9, 999, 0, b"x"), STATUS_UNSUCCESSFUL),
+            (
+                write(9, file, i64::MAX as u64, b"x"),
+                STATUS_INVALID_PARAMETER,
+            ),
+        ] {
+            assert_eq!(
+                sent(&h.process(&m)),
+                vec![pdu::encode_io_completion(1, 9, status, &[0; 5]).as_slice()]
+            );
+        }
+        let outputs = h.process(&write(9, file, i64::MAX as u64 - 1, b"x"));
+        assert!(matches!(asked(&outputs), DriveRequest::Write { .. }));
+    }
+
+    /// Each class 2.2.3.3.9 names reaches the host as its own request, answered with
+    /// `respond_set`; the response repeats the request's `Length`, a failed one included.
+    #[test]
+    fn set_information_reaches_the_host() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        let cases: Vec<(Vec<u8>, DriveRequest)> = vec![
+            (
+                set_info(
+                    2,
+                    file,
+                    pdu::FILE_END_OF_FILE_INFORMATION,
+                    &7u64.to_le_bytes(),
+                ),
+                DriveRequest::SetEndOfFile {
+                    file_id: file,
+                    size: 7,
+                },
+            ),
+            (
+                set_info(
+                    2,
+                    file,
+                    pdu::FILE_ALLOCATION_INFORMATION,
+                    &9u64.to_le_bytes(),
+                ),
+                DriveRequest::SetAllocationSize {
+                    file_id: file,
+                    size: 9,
+                },
+            ),
+            (
+                set_info(2, file, pdu::FILE_DISPOSITION_INFORMATION, &[]),
+                DriveRequest::Delete {
+                    file_id: file,
+                    delete: true,
+                },
+            ),
+            (
+                set_info(
+                    2,
+                    file,
+                    pdu::FILE_RENAME_INFORMATION,
+                    &rename_buffer(0, "\\sub\\b.txt"),
+                ),
+                DriveRequest::Rename {
+                    file_id: file,
+                    path: vec!["sub".to_string(), "b.txt".to_string()],
+                    replace_if_exists: true,
+                },
+            ),
+        ];
+        for (m, expected) in cases {
+            let length = u32::from_le_bytes(m[28..32].try_into().unwrap());
+            assert_eq!(asked(&h.process(&m)), &expected);
+            assert_eq!(
+                h.respond_set(2, Ok(())),
+                Ok(pdu::encode_io_completion(
+                    1,
+                    2,
+                    STATUS_SUCCESS,
+                    &length.to_le_bytes()
+                ))
+            );
+        }
+        let mut basic = Vec::new();
+        for time in [0i64, -1, 3, 0] {
+            basic.extend_from_slice(&time.to_le_bytes());
+        }
+        basic.extend_from_slice(&0x21u32.to_le_bytes());
+        let outputs = h.process(&set_info(3, file, pdu::FILE_BASIC_INFORMATION, &basic));
+        assert_eq!(
+            asked(&outputs),
+            &DriveRequest::SetBasic {
+                file_id: file,
+                info: pdu::BasicInformation {
+                    creation_time: 0,
+                    last_access_time: -1,
+                    last_write_time: 3,
+                    change_time: 0,
+                    attributes: 0x21,
+                }
+            }
+        );
+        assert_eq!(h.respond_write(3, Ok(0)), Err(RespondError::WrongKind));
+        assert_eq!(
+            h.respond_set(3, Err(pdu::STATUS_MEDIA_WRITE_PROTECTED)),
+            Ok(pdu::encode_io_completion(
+                1,
+                3,
+                pdu::STATUS_MEDIA_WRITE_PROTECTED,
+                &36u32.to_le_bytes()
+            ))
+        );
+    }
+
+    /// A rename target that escapes the drive, names its root, or gives a `RootDirectory` is
+    /// refused without reaching the host, the response repeating `Length`.
+    #[test]
+    fn a_rename_escaping_the_drive_is_refused() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        for (root, path, status) in [
+            (0, "\\..\\b.txt", STATUS_OBJECT_NAME_INVALID),
+            (0, "\\sub\\..\\..\\b.txt", STATUS_OBJECT_NAME_INVALID),
+            (0, "C:\\b.txt", STATUS_OBJECT_NAME_INVALID),
+            (0, "\\b\0.txt", STATUS_OBJECT_NAME_INVALID),
+            (0, "\\sub/..\\b.txt", STATUS_OBJECT_NAME_INVALID),
+            (0, "\\", STATUS_OBJECT_NAME_INVALID),
+            (1, "\\b.txt", STATUS_INVALID_PARAMETER),
+        ] {
+            let buffer = rename_buffer(root, path);
+            assert_eq!(
+                h.process(&set_info(4, file, pdu::FILE_RENAME_INFORMATION, &buffer)),
+                vec![DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+                    1,
+                    4,
+                    status,
+                    &(buffer.len() as u32).to_le_bytes()
+                ))],
+                "{path:?}"
+            );
+        }
+    }
+
+    /// Set Information the helper answers itself still repeats `Length`: an unknown class, a
+    /// file not open, a size past `MAXLONGLONG`, and a size on a directory.
+    #[test]
+    fn set_information_the_helper_refuses_repeats_the_length() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        let dir = open_directory(&mut h, 2, "\\d");
+        let eof = |size: u64| size.to_le_bytes();
+        for (m, status, length) in [
+            (
+                set_info(5, file, 0x22, &[1, 2, 3]),
+                STATUS_NOT_SUPPORTED,
+                3u32,
+            ),
+            (
+                set_info(5, 999, pdu::FILE_DISPOSITION_INFORMATION, &[1]),
+                STATUS_UNSUCCESSFUL,
+                1,
+            ),
+            (
+                set_info(5, file, pdu::FILE_END_OF_FILE_INFORMATION, &eof(1 << 63)),
+                STATUS_INVALID_PARAMETER,
+                8,
+            ),
+            (
+                set_info(5, file, pdu::FILE_ALLOCATION_INFORMATION, &eof(1 << 63)),
+                STATUS_INVALID_PARAMETER,
+                8,
+            ),
+            (
+                set_info(5, dir, pdu::FILE_END_OF_FILE_INFORMATION, &eof(1)),
+                STATUS_INVALID_PARAMETER,
+                8,
+            ),
+        ] {
+            assert_eq!(
+                sent(&h.process(&m)),
+                vec![pdu::encode_io_completion(1, 5, status, &length.to_le_bytes()).as_slice()]
+            );
+        }
+    }
+
+    /// A Set Information the host still owes is cancelled by a Close, repeating its `Length`.
+    #[test]
+    fn a_close_cancels_a_waiting_set_information_with_its_length() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        h.process(&set_info(
+            2,
+            file,
+            pdu::FILE_END_OF_FILE_INFORMATION,
+            &7u64.to_le_bytes(),
+        ));
+        assert_eq!(
+            sent(&h.process(&close(3, file)))[0],
+            pdu::encode_io_completion(1, 2, STATUS_CANCELLED, &8u32.to_le_bytes())
+        );
+    }
+
+    /// A delete the host accepted, or a Create asking for one, happens when the file closes:
+    /// `FileClosed` says so. One cancelled or refused does not.
+    #[test]
+    fn a_delete_happens_when_the_file_closes() {
+        let closed = |outputs: Vec<DeviceRedirectionOutput>| {
+            outputs.into_iter().find_map(|o| match o {
+                DeviceRedirectionOutput::FileClosed { delete, .. } => Some(delete),
+                _ => None,
+            })
+        };
+        let disposition = |pending: u8| [pending];
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        h.process(&set_info(
+            2,
+            file,
+            pdu::FILE_DISPOSITION_INFORMATION,
+            &disposition(1),
+        ));
+        h.respond_set(2, Ok(())).unwrap();
+        assert_eq!(closed(h.process(&close(3, file))), Some(true));
+
+        let file = open_file(&mut h, 4, "\\a.txt");
+        h.process(&set_info(
+            5,
+            file,
+            pdu::FILE_DISPOSITION_INFORMATION,
+            &disposition(1),
+        ));
+        h.respond_set(5, Ok(())).unwrap();
+        h.process(&set_info(
+            6,
+            file,
+            pdu::FILE_DISPOSITION_INFORMATION,
+            &disposition(0),
+        ));
+        h.respond_set(6, Ok(())).unwrap();
+        assert_eq!(closed(h.process(&close(7, file))), Some(false));
+
+        let file = open_file(&mut h, 8, "\\a.txt");
+        h.process(&set_info(
+            9,
+            file,
+            pdu::FILE_DISPOSITION_INFORMATION,
+            &disposition(1),
+        ));
+        h.respond_set(9, Err(pdu::STATUS_CANNOT_DELETE)).unwrap();
+        assert_eq!(closed(h.process(&close(10, file))), Some(false));
+
+        // FILE_DELETE_ON_CLOSE on the Create.
+        let outputs = h.process(&create(11, pdu::FILE_OPEN, 0x1040, "\\a.txt"));
+        let DriveRequest::Open {
+            delete_on_close, ..
+        } = *asked(&outputs)
+        else {
+            panic!("expected an Open");
+        };
+        assert!(delete_on_close);
+        h.respond_open(11, Ok(Opened::File)).unwrap();
+        assert_eq!(closed(h.process(&server_announce(0x0d, 9))), Some(true));
+    }
+
     /// A Create reaches the host as an Open under a new file ID, with the path split below the
     /// drive's root; the answer carries that ID and the `Information` its disposition implies.
     #[test]
@@ -1539,11 +2195,13 @@ mod tests {
             kind,
             disposition,
             desired_access,
+            delete_on_close,
         } = asked(&outputs).clone()
         else {
             panic!("expected an Open");
         };
         assert_eq!(path, ["docs", "a.txt"]);
+        assert!(!delete_on_close);
         assert_eq!(kind, OpenKind::File);
         assert_eq!(disposition, Disposition::OpenIf);
         assert_eq!(desired_access, 0x0012_0089);
@@ -1873,7 +2531,8 @@ mod tests {
                 )),
                 DeviceRedirectionOutput::FileClosed {
                     device_id: 1,
-                    file_id: dir
+                    file_id: dir,
+                    delete: false
                 },
                 DeviceRedirectionOutput::Send(pdu::encode_io_completion(
                     1,
@@ -1903,7 +2562,8 @@ mod tests {
             outputs[0],
             DeviceRedirectionOutput::FileClosed {
                 device_id: 1,
-                file_id: dir
+                file_id: dir,
+                delete: false
             }
         );
         assert!(h.files.is_empty());
@@ -1915,7 +2575,8 @@ mod tests {
             outputs[0],
             DeviceRedirectionOutput::FileClosed {
                 device_id: 1,
-                file_id: dir
+                file_id: dir,
+                delete: false
             }
         );
     }
