@@ -4647,7 +4647,7 @@ mod tests {
     /// recorded by major and minor function and information class.
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
-    async fn the_server_lists_a_host_drive_on_the_real_vm() {
+    async fn the_server_lists_and_reads_a_host_drive_on_the_real_vm() {
         use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
         use justrdp::rdpdr::{
             self, DeviceRedirection, DeviceRedirectionOutput, DirectoryEntry, Disposition, Drive,
@@ -4662,7 +4662,16 @@ mod tests {
         const SCRIPT: &str = "try{$r=(gci \\\\tsclient\\justrdp -r -ea Stop|%{$_.Name+'='+\
             $(if($_.PSIsContainer){'d'}else{$_.Length})}|sort) -join ';';\
             $d=(cmd /c dir \\\\tsclient\\justrdp\\sub 2>&1) -join '|';\
-            Set-Clipboard -Value \"listed $r ## $d\"}catch{Set-Clipboard -Value \"listed error $_\"}";
+            $t=\"$env:TEMP\\jr\";ri $t -r -fo -ea 0;md $t|out-null;\
+            copy \\\\tsclient\\justrdp\\hello.txt,\\\\tsclient\\justrdp\\big.bin $t -ea Stop;\
+            $h=[BitConverter]::ToString([IO.File]::ReadAllBytes(\"$t\\hello.txt\"));\
+            $b=[IO.File]::ReadAllBytes(\"$t\\big.bin\");$x=0;\
+            for($i=0;$i -lt $b.Length;$i++){if($b[$i] -ne $i%251){$x++}};\
+            Set-Clipboard -Value \"listed $r ## $d ## $h ## $($b.Length) $x\"}\
+            catch{Set-Clipboard -Value \"listed error $_\"}";
+        /// `hello.txt`, twelve bytes of UTF-8.
+        const HELLO: &str = "안녕 world";
+        const STATUS_END_OF_FILE: u32 = 0xC000_0011;
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
         const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
@@ -4687,10 +4696,25 @@ mod tests {
             let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             HashMap::from([
                 (path(&[]), at(t, 0, true)),
-                (path(&["hello.txt"]), at(t, 12, false)),
+                (path(&["hello.txt"]), at(t, HELLO.len() as u64, false)),
                 (path(&["big.bin"]), at(t, 300_000, false)),
                 (path(&["sub"]), at(t, 0, true)),
                 (path(&["sub", "inner.txt"]), at(t, 5, false)),
+            ])
+        }
+
+        /// What the host's files hold: `hello.txt`, and `big.bin`, whose byte `i` is `i % 251`.
+        fn contents() -> HashMap<Vec<String>, Vec<u8>> {
+            HashMap::from([
+                (vec!["hello.txt".to_string()], HELLO.as_bytes().to_vec()),
+                (
+                    vec!["big.bin".to_string()],
+                    (0..300_000u32).map(|i| (i % 251) as u8).collect(),
+                ),
+                (
+                    vec!["sub".to_string(), "inner.txt".to_string()],
+                    b"inner".to_vec(),
+                ),
             ])
         }
 
@@ -4726,6 +4750,7 @@ mod tests {
             let (verdict_tx, mut verdict) = tokio::sync::mpsc::unbounded_channel::<String>();
             let requests = Arc::new(Mutex::new(Vec::<String>::new()));
             let terminated = Arc::new(AtomicBool::new(false));
+            let reads = Arc::new(Mutex::new(Vec::<(u64, u32)>::new()));
 
             let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
             {
@@ -4796,8 +4821,12 @@ mod tests {
             };
 
             let frames_in_sink = frames.clone();
-            let (requests_in, terminated_in, ready_in) =
-                (requests.clone(), terminated.clone(), ready.clone());
+            let (requests_in, terminated_in, ready_in, reads_in) = (
+                requests.clone(),
+                terminated.clone(),
+                ready.clone(),
+                reads.clone(),
+            );
             let mut clipboard = Clipboard::new();
             let mut redirection = DeviceRedirection::new(
                 "justrdp-test",
@@ -4809,6 +4838,7 @@ mod tests {
             )
             .expect("the drive is valid");
             let tree = tree();
+            let contents = contents();
             let mut open: HashMap<u32, Vec<String>> = HashMap::new();
             let volume = VolumeInformation {
                 label: "justrdp".to_string(),
@@ -4935,6 +4965,26 @@ mod tests {
                                             };
                                             redirection.respond_open(completion_id, answer)
                                         }
+                                        DriveRequest::Read {
+                                            file_id,
+                                            offset,
+                                            length,
+                                        } => {
+                                            reads_in.lock().unwrap().push((offset, length));
+                                            let data = open
+                                                .get(&file_id)
+                                                .and_then(|p| contents.get(p))
+                                                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
+                                                .and_then(|data| {
+                                                    let from = usize::try_from(offset)
+                                                        .ok()
+                                                        .filter(|&from| from < data.len())
+                                                        .ok_or(STATUS_END_OF_FILE)?;
+                                                    let to = data.len().min(from + length as usize);
+                                                    Ok(&data[from..to])
+                                                });
+                                            redirection.respond_read(completion_id, data)
+                                        }
                                         DriveRequest::QueryVolume => {
                                             redirection.respond_volume(completion_id, Ok(&volume))
                                         }
@@ -4995,11 +5045,12 @@ mod tests {
             kinds.sort();
             kinds.dedup();
             eprintln!("{} requests; kinds: {kinds:#?}", requests.len());
+            eprintln!("reads (offset, length): {:?}", reads.lock().unwrap());
             let verdict = driven.expect("the desktop was driven");
             assert!(!terminated.load(Ordering::SeqCst), "the channel stayed up");
-            let (listed, dir) = verdict
-                .split_once(" ## ")
-                .unwrap_or_else(|| panic!("the listing ran: {verdict}"));
+            let [listed, dir, hello, big] = verdict.split(" ## ").collect::<Vec<_>>()[..] else {
+                panic!("the listing and the copy ran: {verdict}");
+            };
             eprintln!("dir: {dir}");
             assert_eq!(
                 listed,
@@ -5008,6 +5059,16 @@ mod tests {
             assert!(
                 dir.contains("inner.txt"),
                 "cmd's dir lists the folder: {dir}"
+            );
+            let hello_hex = HELLO
+                .bytes()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join("-");
+            assert_eq!(hello, hello_hex, "hello.txt is copied byte-exact");
+            assert_eq!(
+                big, "300000 0",
+                "big.bin is copied whole, no byte differing"
             );
         })
         .await

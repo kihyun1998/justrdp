@@ -2823,7 +2823,7 @@ mod tests {
     }
 
     /// A channel the host opened with `CHANNEL_OPTION_SHOW_PROTOCOL` shows the header on every
-    /// chunk, a single-chunk message included; any other channel does only when it chunks.
+    /// chunk, a single-chunk message included; any other channel never does.
     #[test]
     fn send_channel_honours_the_show_protocol_option() {
         let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
@@ -2846,6 +2846,18 @@ mod tests {
         );
         let rdpdr = sm.send_channel(RDPDR, b"exec").unwrap();
         assert_eq!(flags_of(&rdpdr), vec![whole]);
+        let chunked = sm.send_channel(RDPDR, &[7; 4000]).unwrap();
+        assert_eq!(chunked.len(), 3);
+        for frame in &chunked {
+            let body = x224::decode_data(tpkt::decode(frame).unwrap()).unwrap();
+            let needle = 4000u32.to_le_bytes();
+            let at = body
+                .windows(4)
+                .position(|w| w == needle)
+                .expect("the chunk header's total length");
+            let flags = u32::from_le_bytes(body[at + 4..at + 8].try_into().unwrap());
+            assert_eq!(flags & svc::CHANNEL_FLAG_SHOW_PROTOCOL, 0);
+        }
     }
 
     #[test]

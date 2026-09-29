@@ -128,12 +128,18 @@ glossary, which is vocabulary rather than a decision.
 - **Data on a channel ID that was never granted is skipped with an `rdp_svc` record**, not
   refused: nothing about it is a security integrity question (ADR-0009 §2/§3(b)), and it
   was silent before #307.
-- **A multi-chunk message we send carries `CHANNEL_FLAG_SHOW_PROTOCOL` on every chunk**
-  (`encode_chunks`), because 3.1.5.2.1 says chunked data MUST. IronRDP does the same;
-  FreeRDP sets it only for a channel opened with `CHANNEL_OPTION_SHOW_PROTOCOL`. A
-  single-chunk message carries FIRST|LAST alone, **unless the host opened the channel with
-  `CHANNEL_OPTION_SHOW_PROTOCOL`**. Then every chunk carries it, which is FreeRDP's rule
-  (`channels.c`). Two cases need it. RAIL: `[MS-RDPERP]` 1.5 says the RAIL server
+- **A chunk we send carries `CHANNEL_FLAG_SHOW_PROTOCOL` exactly when the host opened its
+  channel with `CHANNEL_OPTION_SHOW_PROTOCOL`**, a single chunk included, and never
+  otherwise, however many chunks the message spans. That is FreeRDP's rule (`channels.c`).
+  3.1.5.2.1 says chunked data MUST carry the flag, and IronRDP sets it on every multi-chunk
+  message, which `encode_chunks` did until #338. **WS2022 takes 2.2.6.1.1's meaning
+  literally, so the rdpdr endpoint reads each 8-byte header as data**: the first rdpdr
+  message over one chunk, a 32 KiB Read response, lost the drive ("the device is not
+  connected") and no IRP followed; without the flag, the 300,000-byte copy is byte-exact.
+  Following FreeRDP here was **the maintainer's call (2026-09-29, #338)**, shown the VM
+  result, the 3.1.5.2.1 text, IronRDP's divergence, and that `drdynvc` (opened without the
+  option) loses the flag too. The alternatives shown were a separate issue first, and
+  stopping. Two cases need it. RAIL: `[MS-RDPERP]` 1.5 says the RAIL server
   expects the header visible on all data over the RAIL channel, so the flag "has to be set".
   And `cliprdr`, which no spec says but the VM enforces (#321, the clipboard bullet below).
   Building it now, rather than leaving it to #14, was the maintainer's call (2026-09-22).
@@ -193,7 +199,7 @@ glossary, which is vocabulary rather than a decision.
   the flag on the client's chunks (16-164 ms after Monitor Ready in the three probes that timed
   it), and 0 of 4 without it in 30-90 s (plus #307's
   0 of 3). **One unflagged message is enough to lose what follows it.** #307 also saw no
-  answer to a *chunked* Format List, whose chunks `encode_chunks` always flags. Its
+  answer to a *chunked* Format List, whose chunks `encode_chunks` then always flagged. Its
   Capabilities went first as one chunk without the flag. Reproduced on the VM with a
   2608-byte list: unflagged Capabilities and then the flagged chunks, 0 of 1 answered; the
   same chunks with no Capabilities before them, 1 of 1. So flagging only multi-chunk messages,
@@ -470,7 +476,8 @@ glossary, which is vocabulary rather than a decision.
   Request for `13`, and the host's text, copied back out of Notepad, is intact. Both texts fit
   one chunk.
 - #307 sent a chunked client message (a 2018-byte `rdpdr` Client Name, without SHOW_PROTOCOL).
-  It did not end the session, but nothing the server sends depended on it.
+  It did not end the session, but nothing the server sends depended on it. A chunked rdpdr
+  message the server has to read was first sent in #338, and was lost *with* the flag.
 
 **Measured against the WS2022 test VM (#323, 2026-09-23):**
 
@@ -592,3 +599,7 @@ glossary, which is vocabulary rather than a decision.
   design-model bullet for when that changes.
 - SVC compression (`VirtualChannelCapabilitySet`'s compression flags) is not
   implemented.
+- **A multi-chunk `drdynvc` message we send has never been proven live**, with or without
+  `CHANNEL_FLAG_SHOW_PROTOCOL`: no VM test sends a DVC message over one chunk. Since #338 it
+  goes unflagged, as FreeRDP sends it. The first slice that sends a large DVC message (audio
+  input, camera) proves it.

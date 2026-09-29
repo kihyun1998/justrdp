@@ -18,9 +18,9 @@ use justrdp_pdu::rdpdr::{
     DRIVE_CAPABILITY_VERSION_02, DeviceAnnounce, GENERAL_CAPABILITY_VERSION_02, GeneralCapability,
     IO_CODE1_ALWAYS_SET, IoBody, IoRequest, RDPDR_CLIENT_DISPLAY_NAME_PDU, RDPDR_DTYP_FILESYSTEM,
     RDPDR_USER_LOGGEDON_PDU, RdpdrPdu, STATUS_ACCESS_DENIED, STATUS_CANCELLED,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_NO_MORE_FILES,
-    STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY, STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_INVALID,
-    STATUS_SUCCESS, STATUS_TOO_MANY_OPENED_FILES, STATUS_UNSUCCESSFUL,
+    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
+    STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY, STATUS_NOT_SUPPORTED,
+    STATUS_OBJECT_NAME_INVALID, STATUS_SUCCESS, STATUS_TOO_MANY_OPENED_FILES, STATUS_UNSUCCESSFUL,
 };
 pub use justrdp_pdu::rdpdr::{FileInformation, VolumeInformation};
 
@@ -177,6 +177,17 @@ pub enum DriveRequest {
         /// `DesiredAccess`, the access the server asks for.
         desired_access: u32,
     },
+    /// Read at most `length` bytes of the open file `file_id` from `offset`. Answer with
+    /// [`DeviceRedirection::respond_read`].
+    Read {
+        /// The file.
+        file_id: u32,
+        /// Where in the file to read from.
+        offset: u64,
+        /// The most bytes to read, as the server sized it: never zero, and `offset + length`
+        /// never exceeds `i64::MAX`.
+        length: u32,
+    },
     /// Describe the drive's volume. Answer with [`DeviceRedirection::respond_volume`].
     QueryVolume,
     /// Describe the open file `file_id`. Answer with [`DeviceRedirection::respond_information`].
@@ -221,6 +232,8 @@ pub enum RespondError {
     NotRequested,
     /// The request under that `completion_id` asks for a different answer.
     WrongKind,
+    /// The answer holds more bytes than the read asked for.
+    TooLong,
 }
 
 /// A request waiting for the host, and what its answer needs.
@@ -235,6 +248,7 @@ struct Pending {
 #[derive(Debug, Clone)]
 enum PendingKind {
     Open { disposition: Disposition },
+    Read { length: u32 },
     Volume { class: u32 },
     Information { class: u32 },
     Listing { class: u32, pattern: Vec<char> },
@@ -333,6 +347,37 @@ impl DeviceRedirection {
                 complete(&pending, STATUS_SUCCESS, &body)
             }
             Err(status) => complete(&pending, status, pdu::failure_body(pdu::IRP_MJ_CREATE)),
+        })
+    }
+
+    /// The answer to [`DriveRequest::Read`]: the bytes read, at most the `length` asked for
+    /// and fewer at the file's end, or the NTSTATUS the host failed with.
+    pub fn respond_read(
+        &mut self,
+        completion_id: u32,
+        answer: Result<&[u8], u32>,
+    ) -> Result<Vec<u8>, RespondError> {
+        let at = self
+            .pending
+            .iter()
+            .position(|p| p.completion_id == completion_id)
+            .ok_or(RespondError::NotRequested)?;
+        let PendingKind::Read { length } = self.pending[at].kind else {
+            return Err(RespondError::WrongKind);
+        };
+        if let Ok(data) = answer
+            && data.len() > length as usize
+        {
+            return Err(RespondError::TooLong);
+        }
+        let pending = self.pending.remove(at);
+        Ok(match answer {
+            Ok(data) => {
+                let mut body = (data.len() as u32).to_le_bytes().to_vec();
+                body.extend_from_slice(data);
+                complete(&pending, STATUS_SUCCESS, &body)
+            }
+            Err(status) => complete(&pending, status, pdu::failure_body(pdu::IRP_MJ_READ)),
         })
     }
 
@@ -538,6 +583,9 @@ impl DeviceRedirection {
         match (request.major, body) {
             (pdu::IRP_MJ_CREATE, IoBody::Create(create)) => self.create(&request, create),
             (pdu::IRP_MJ_CLOSE, _) => self.close(&request),
+            (pdu::IRP_MJ_READ, IoBody::Read { length, offset }) => {
+                self.read(&request, length, offset)
+            }
             (pdu::IRP_MJ_QUERY_VOLUME_INFORMATION, IoBody::QueryVolumeInformation { class }) => {
                 if pdu::encode_volume_information(class, &VolumeInformation::default()).is_none() {
                     return reject(STATUS_NOT_SUPPORTED);
@@ -645,6 +693,46 @@ impl DeviceRedirection {
             pdu::failure_body(pdu::IRP_MJ_CLOSE),
         )));
         outputs
+    }
+
+    /// A Read: handed to the host, except what `[MS-FSA]` 2.1.5.3 answers before the file's data
+    /// is reached, and a read of a directory or of a file not open.
+    fn read(
+        &mut self,
+        request: &IoRequest,
+        length: u32,
+        offset: u64,
+    ) -> Vec<DeviceRedirectionOutput> {
+        let Some(file) = self.file_mut(request.device_id, request.file_id) else {
+            return refuse(request, STATUS_UNSUCCESSFUL);
+        };
+        if file.directory {
+            return refuse(request, STATUS_INVALID_DEVICE_REQUEST);
+        }
+        if offset
+            .checked_add(u64::from(length))
+            .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return refuse(request, STATUS_INVALID_PARAMETER);
+        }
+        if length == 0 {
+            return vec![DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+                request.device_id,
+                request.completion_id,
+                STATUS_SUCCESS,
+                &0u32.to_le_bytes(),
+            ))];
+        }
+        let file_id = request.file_id;
+        self.ask(
+            request,
+            PendingKind::Read { length },
+            DriveRequest::Read {
+                file_id,
+                offset,
+                length,
+            },
+        )
     }
 
     /// A Query Directory: a first query asks the host for the directory's entries, and a later
@@ -758,6 +846,7 @@ impl DeviceRedirection {
             .map(|p: &Pending| {
                 let major = match p.kind {
                     PendingKind::Open { .. } => pdu::IRP_MJ_CREATE,
+                    PendingKind::Read { .. } => pdu::IRP_MJ_READ,
                     PendingKind::Volume { .. } => pdu::IRP_MJ_QUERY_VOLUME_INFORMATION,
                     PendingKind::Information { .. } => pdu::IRP_MJ_QUERY_INFORMATION,
                     PendingKind::Listing { .. } => pdu::IRP_MJ_DIRECTORY_CONTROL,
@@ -1003,7 +1092,7 @@ fn drive_announce(drive: Drive) -> Result<DeviceAnnounce, DriveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use justrdp_pdu::rdpdr::{IRP_MJ_CREATE, IRP_MJ_READ};
+    use justrdp_pdu::rdpdr::{IRP_MJ_CREATE, IRP_MJ_READ, STATUS_INVALID_DEVICE_REQUEST};
 
     fn server_announce(version_minor: u16, client_id: u32) -> Vec<u8> {
         let mut m = vec![0x72, 0x44, 0x6e, 0x49, 0x01, 0x00];
@@ -1198,8 +1287,8 @@ mod tests {
     fn unimplemented_requests_are_refused() {
         let mut h = ready();
         assert_eq!(
-            sent(&h.process(&io_request(1, 6, IRP_MJ_READ))),
-            vec![pdu::encode_io_completion(1, 6, STATUS_NOT_SUPPORTED, &[0; 4]).as_slice()]
+            sent(&h.process(&io_request(1, 6, pdu::IRP_MJ_WRITE))),
+            vec![pdu::encode_io_completion(1, 6, STATUS_NOT_SUPPORTED, &[0; 5]).as_slice()]
         );
         assert_eq!(
             sent(&h.process(&io_request(1, 7, 0x0000_0001))),
@@ -1313,6 +1402,129 @@ mod tests {
                 ..FileInformation::default()
             },
         }
+    }
+
+    fn read(completion_id: u32, file_id: u32, offset: u64, length: u32) -> Vec<u8> {
+        let mut m = header(file_id, completion_id, IRP_MJ_READ, 0);
+        m.extend_from_slice(&length.to_le_bytes());
+        m.extend_from_slice(&offset.to_le_bytes());
+        m.extend_from_slice(&[0; 20]);
+        m
+    }
+
+    /// Open `path` as a file and answer that it is one, returning its `file_id`.
+    fn open_file(h: &mut DeviceRedirection, completion_id: u32, path: &str) -> u32 {
+        let outputs = h.process(&create(completion_id, pdu::FILE_OPEN, 0x40, path));
+        let DriveRequest::Open { file_id, .. } = *asked(&outputs) else {
+            panic!("expected an Open");
+        };
+        h.respond_open(completion_id, Ok(Opened::File)).unwrap();
+        file_id
+    }
+
+    /// A Read reaches the host with its offset and length; the answer goes back as `Length`
+    /// and the bytes, a short one included, and a failure with `Length` zero.
+    #[test]
+    fn a_read_is_answered_by_the_host() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        let outputs = h.process(&read(2, file, 0x1_0000_0000, 8));
+        assert_eq!(
+            asked(&outputs),
+            &DriveRequest::Read {
+                file_id: file,
+                offset: 0x1_0000_0000,
+                length: 8
+            }
+        );
+        let mut body = 3u32.to_le_bytes().to_vec();
+        body.extend_from_slice(b"abc");
+        assert_eq!(
+            h.respond_read(2, Ok(b"abc")),
+            Ok(pdu::encode_io_completion(1, 2, STATUS_SUCCESS, &body))
+        );
+        h.process(&read(3, file, 0, 8));
+        assert_eq!(
+            h.respond_read(3, Err(STATUS_ACCESS_DENIED)),
+            Ok(pdu::encode_io_completion(
+                1,
+                3,
+                STATUS_ACCESS_DENIED,
+                &[0; 4]
+            ))
+        );
+        assert_eq!(
+            h.respond_information(3, Ok(&FileInformation::default())),
+            Err(RespondError::NotRequested)
+        );
+    }
+
+    /// An answer longer than the read asked for is refused and the read keeps waiting.
+    #[test]
+    fn an_answer_longer_than_the_read_is_refused() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        h.process(&read(2, file, 0, 4));
+        assert_eq!(h.respond_read(2, Ok(b"abcde")), Err(RespondError::TooLong));
+        let mut body = 4u32.to_le_bytes().to_vec();
+        body.extend_from_slice(b"abcd");
+        assert_eq!(
+            h.respond_read(2, Ok(b"abcd")),
+            Ok(pdu::encode_io_completion(1, 2, STATUS_SUCCESS, &body))
+        );
+    }
+
+    /// Reads the host cannot answer differently are answered without it (`[MS-FSA]` 2.1.5.3):
+    /// nothing asked, a range past `MAXLONGLONG`, a directory, a file never opened.
+    #[test]
+    fn a_read_the_helper_can_answer_skips_the_host() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        let dir = open_directory(&mut h, 2, "\\d");
+        let answered = |h: &mut DeviceRedirection, m: &[u8], status: u32| {
+            let outputs = h.process(m);
+            assert_eq!(outputs.len(), 1, "{outputs:?}");
+            assert_eq!(
+                sent(&outputs),
+                vec![pdu::encode_io_completion(1, 9, status, &[0; 4]).as_slice()]
+            );
+        };
+        answered(&mut h, &read(9, file, 5, 0), STATUS_SUCCESS);
+        answered(
+            &mut h,
+            &read(9, file, i64::MAX as u64, 1),
+            STATUS_INVALID_PARAMETER,
+        );
+        answered(
+            &mut h,
+            &read(9, file, u64::MAX, 0),
+            STATUS_INVALID_PARAMETER,
+        );
+        answered(
+            &mut h,
+            &read(9, file, u64::MAX, 1),
+            STATUS_INVALID_PARAMETER,
+        );
+        answered(&mut h, &read(9, dir, 0, 1), STATUS_INVALID_DEVICE_REQUEST);
+        answered(&mut h, &read(9, 999, 0, 1), STATUS_UNSUCCESSFUL);
+        let outputs = h.process(&read(9, file, i64::MAX as u64 - 1, 1));
+        assert!(matches!(asked(&outputs), DriveRequest::Read { .. }));
+    }
+
+    /// A Close cancels a read the host still owes.
+    #[test]
+    fn a_close_cancels_a_waiting_read() {
+        let mut h = ready();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        h.process(&read(2, file, 0, 4));
+        assert_eq!(
+            sent(&h.process(&close(3, file)))[0],
+            pdu::encode_io_completion(1, 2, STATUS_CANCELLED, &[0; 4])
+        );
+        assert_eq!(
+            h.respond_read(2, Ok(b"ab")),
+            Err(RespondError::NotRequested)
+        );
     }
 
     /// A Create reaches the host as an Open under a new file ID, with the path split below the
