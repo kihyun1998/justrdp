@@ -43,6 +43,11 @@ are not. The helper completes the initialization sequence and announces the host
   call (2026-09-29, #338)**, made after the change was confirmed, shown `[MS-FSA]` 2.1.5.3 and
   IronRDP's same refusal; the alternative shown was leaving both to the host. The directory
   and not-open answers were part of the confirmed change.
+- **Answering a Write past `MAXLONGLONG` in the core was the maintainer's call (2026-09-29,
+  #339)**, shown `[MS-FSA]` 2.1.5.4 and that it widened the #338 call on Read, which had not
+  covered Write; the alternative shown was leaving it to the host. What they were also shown:
+  a zero-length Write still reaches the host, unlike a Read, because 2.1.5.4 refuses a
+  read-only volume first.
 
 ## Design model
 
