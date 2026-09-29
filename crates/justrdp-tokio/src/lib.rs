@@ -3753,6 +3753,7 @@ mod tests {
             let asked = Arc::new(Mutex::new(Vec::<Asked>::new()));
             let released = Arc::new(Mutex::new(Vec::<u32>::new()));
             let (verdict_tx, mut verdict) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (released_tx, mut released_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
 
             let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
             {
@@ -3831,10 +3832,35 @@ mod tests {
                             .await
                             .map_err(|_| "the session closed".to_string())?;
 
-                        tokio::time::timeout(Duration::from_secs(150), verdict.recv())
+                        let text = tokio::time::timeout(Duration::from_secs(150), verdict.recv())
                             .await
                             .map_err(|_| "no verdict from the server within 150 s".to_string())?
-                            .ok_or_else(|| "the session closed".to_string())
+                            .ok_or_else(|| "the session closed".to_string())?;
+
+                        // The verdict and the unlock that ends the paste arrive in either order.
+                        let first = first_list_id
+                            .lock()
+                            .unwrap()
+                            .ok_or("files were announced")?;
+                        let waited = tokio::time::Instant::now();
+                        tokio::time::timeout(Duration::from_secs(30), async {
+                            while let Some(list_id) = released_rx.recv().await {
+                                if list_id == first {
+                                    return Ok(());
+                                }
+                            }
+                            Err("the session closed".to_string())
+                        })
+                        .await
+                        .map_err(|_| {
+                            "no Unlock releasing the pasted list within 30 s of the verdict"
+                                .to_string()
+                        })??;
+                        eprintln!(
+                            "first list released {:?} after the verdict",
+                            waited.elapsed()
+                        );
+                        Ok(text)
                     }
                     .await;
                     cancel.cancel();
@@ -3942,6 +3968,7 @@ mod tests {
                                 }
                                 ClipboardOutput::FilesReleased { list_id } => {
                                     released_in.lock().unwrap().push(list_id);
+                                    let _ = released_tx.send(list_id);
                                 }
                                 other => panic!("nothing else was asked for: {other:?}"),
                             }

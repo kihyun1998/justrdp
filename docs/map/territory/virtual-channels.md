@@ -562,6 +562,13 @@ glossary, which is vocabulary rather than a decision.
   after the paste" came from the host's second announcement during the paste: Lock 1 arrived
   with it and Unlock 0 once the paste ended. With no paste in progress, the text
   announcement's Unlock 0 came first, and the one run that caught its Lock saw id 0 again.
+- **That Unlock 0 and the script's verdict copy are unordered** (#343, 2026-09-29). The verdict
+  comes from `Set-Clipboard`, the Unlock from the shell paste ending, and the verdict arrived
+  first in 2 of 6 runs, and the test saw the release at most 0.35 ms after the verdict. The
+  #325 test cancelled the session on the verdict, so whenever the verdict won the Unlock could
+  be dropped with the session (2 of 4 runs while #338 was worked); it now waits for
+  `FilesReleased` on the first list, up to 30 s after the verdict, before it lets go. 6 of 6
+  runs passed that way.
 
 ## Cross-cutting invariants
 
