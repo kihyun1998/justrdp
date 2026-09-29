@@ -184,7 +184,8 @@ pub enum DriveRequest {
         file_id: u32,
         /// Where in the file to read from.
         offset: u64,
-        /// The most bytes to read, never zero; `offset + length` never exceeds `i64::MAX`.
+        /// The most bytes to read, as the server sized it: never zero, and `offset + length`
+        /// never exceeds `i64::MAX`.
         length: u32,
     },
     /// Describe the drive's volume. Answer with [`DeviceRedirection::respond_volume`].

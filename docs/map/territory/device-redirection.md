@@ -36,6 +36,13 @@ are not. The helper completes the initialization sequence and announces the host
   STATUS_ACCESS_DENIED"). The grill had given device names to the host without that text.
   The call covers a Create whose whole path is one of those names; the same name deeper in a
   path, and every other OS name rule, stay the host's.
+- **Leaving the server's Read `Length` uncapped in the core was the maintainer's call
+  (2026-09-29, #338)**, shown the measured sizes (at most 131,072), IronRDP's 1 MiB refusal
+  and FreeRDP's trim to the file's end. How much to read at once is the host's.
+- **Answering a zero-length Read and one past `MAXLONGLONG` in the core was the maintainer's
+  call (2026-09-29, #338)**, made after the change was confirmed, shown `[MS-FSA]` 2.1.5.3 and
+  IronRDP's same refusal; the alternative shown was leaving both to the host. The directory
+  and not-open answers were part of the confirmed change.
 
 ## Design model
 
@@ -109,7 +116,7 @@ are not. The helper completes the initialization sequence and announces the host
   FreeRDP reads it. **The server's `Length` is not capped here**: the helper holds only what
   the host answers, so how much to read at once is the host's; IronRDP's Windows backend
   refuses above 1 MiB with `STATUS_INVALID_PARAMETER`, and FreeRDP trims it to what is left
-  of the file.
+  of the file. A host decides how much to allocate before it reads.
 - **Only the classes the server was measured to use are implemented**: Query Volume
   Information `FileFsVolumeInformation` (1), `FileFsAttributeInformation` (5) and
   `FileFsFullSizeInformation` (7); Query Information `FileBasicInformation` (4),

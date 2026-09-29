@@ -599,3 +599,7 @@ glossary, which is vocabulary rather than a decision.
   design-model bullet for when that changes.
 - SVC compression (`VirtualChannelCapabilitySet`'s compression flags) is not
   implemented.
+- **A multi-chunk `drdynvc` message we send has never been proven live**, with or without
+  `CHANNEL_FLAG_SHOW_PROTOCOL`: no VM test sends a DVC message over one chunk. Since #338 it
+  goes unflagged, as FreeRDP sends it. The first slice that sends a large DVC message (audio
+  input, camera) proves it.
