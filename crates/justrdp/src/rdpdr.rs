@@ -124,7 +124,8 @@ pub enum DeviceRedirectionOutput {
         status: u32,
     },
     /// The server asks the host about a drive. The host answers with the `respond_*` method
-    /// the request names, by `completion_id`, in any order.
+    /// the request names, by `completion_id`, in any order. Several requests on one file may
+    /// wait at once (`ENABLE_ASYNCIO` is advertised).
     DriveRequest {
         /// The ID the answer is paired by.
         completion_id: u32,
@@ -305,7 +306,8 @@ pub enum DriveRequest {
 pub enum WriteOffset {
     /// At this offset; `offset + data.len()` never exceeds `i64::MAX`.
     At(u64),
-    /// At the file's end.
+    /// At the file's end. The host writes two waiting appends to one file in the order they
+    /// arrived.
     Append,
 }
 
@@ -1535,7 +1537,7 @@ fn client_capabilities(version: u16) -> [CapabilitySet; 2] {
             extended_pdu: pdu::RDPDR_DEVICE_REMOVE_PDUS
                 | RDPDR_CLIENT_DISPLAY_NAME_PDU
                 | RDPDR_USER_LOGGEDON_PDU,
-            extra_flags1: 0,
+            extra_flags1: pdu::ENABLE_ASYNCIO,
             special_type_device_cap: 0,
         }),
         CapabilitySet::Other {
@@ -1689,7 +1691,11 @@ mod tests {
             unreachable!()
         };
         assert_eq!(general.io_code1, 0x3FFF);
-        assert_eq!(general.extra_flags1, 0);
+        assert_eq!(
+            general.extra_flags1,
+            pdu::ENABLE_ASYNCIO,
+            "requests are paired by CompletionId, so overlapping ones are allowed"
+        );
         assert_eq!(
             general.extended_pdu & RDPDR_USER_LOGGEDON_PDU,
             RDPDR_USER_LOGGEDON_PDU
