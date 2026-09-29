@@ -7,6 +7,11 @@
 //! See `docs/plan.md` §2 (Layer 0 — wire) and §3 (Layer 1 — connection sequence), and ADR-0001
 //! (sans-IO state machine core).
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/icons/justrdp-icon-light-128.png",
+    html_favicon_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/favicon/favicon-32.png"
+)]
+
 pub mod ber;
 pub mod capability;
 pub mod client_info;

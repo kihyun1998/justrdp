@@ -11,6 +11,11 @@
 //! connect machine would add nothing (plan.md §3, decision 10). After [`Action::StartTls`] the
 //! machine's writes and reads transparently ride the TLS stream (`Transport`).
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/icons/justrdp-icon-light-128.png",
+    html_favicon_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/favicon/favicon-32.png"
+)]
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
