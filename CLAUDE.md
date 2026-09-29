@@ -53,7 +53,8 @@ real VM).
   TSRequest.
 - **The host owns, by definition**: socket and runtime, TLS trust, credentials, frame sink and
   presentation, input-device semantics, clipboard and redirection policy, reconnect strategy, and
-  **every RDP feature flag**. The only consumer seam is in-repo (`justrdp-tokio`); there is no
+  **every policy flag**; the core owns implementation flags and refuses an advertisement it cannot
+  honour (ADR-0016). The only consumer seam is in-repo (`justrdp-tokio`); there is no
   published consumer.
 - **When a report says "the core should solve this for me", first ask whose invariant broke.**
   Policy-agnosticism and the dirty-rect `FrameUpdate` (ADR-0010) are contracts; treating a report

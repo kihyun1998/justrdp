@@ -22,7 +22,7 @@ Read this before starting so the graph does not read as abstractions.
 - **A single hidden flag.** `ironrdp-connector` 0.9.0 omits
   `SUPPORT_DYN_VC_GFX_PROTOCOL` (0x0100), so EGFX cannot be enabled — one flag,
   buried, un-overridable. justrdp is the rewrite that lets the **host hold every
-  RDP feature flag**. The boundary invariant (core owns all RDP-native layers,
+  policy flag** (ADR-0016). The boundary invariant (core owns all RDP-native layers,
   delegates only security-critical non-RDP crates) exists to keep that control.
   (`CONTEXT.md` §Project intent.)
 
