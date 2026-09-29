@@ -325,6 +325,11 @@ advertise X, the server silently never offers Y. Capture every such coupling up 
 
 > **Design rule:** make ALL of the above caller-configurable, default to "advertise everything
 > we can actually handle." The bottleneck risk is always a *missing* advertise, never an extra.
+>
+> **Superseded (ADR-0016, 2026-09-29).** An extra advertise is a risk too: #271 measured one as a
+> black screen ([what we advertise, we must implement](map/invariant/what-we-advertise-we-must-implement.md)).
+> The host owns policy flags; the core owns implementation flags and refuses an advertisement
+> it cannot honour.
 
 ---
 

@@ -25,8 +25,9 @@ and NLA to [`sspi`](https://github.com/Devolutions/sspi-rs).
 
 ## Why
 
-- **The host decides every feature flag.** Nothing in justrdp hardcodes what the client
-  advertises. In particular, all `earlyCapabilityFlags` reach the wire verbatim, including
+- **The host decides every policy flag.** Nothing in justrdp hardcodes a choice that is the
+  host's to make, and nothing advertises what the core cannot handle (ADR-0016). In particular,
+  all `earlyCapabilityFlags` reach the wire as the host sets them, including
   `SUPPORT_DYN_VC_GFX_PROTOCOL`, the flag that turns on the Graphics Pipeline (EGFX) on modern
   Windows servers.
 - **The core does no I/O.** The connect sequence and the session loop are pure transitions:
@@ -129,7 +130,7 @@ and the core never sees a TSRequest.
 
 What stays with the host: the socket and runtime, TLS trust, credentials, the frame sink and how
 it is presented, input device semantics, clipboard and redirection policy, reconnect strategy and
-every RDP feature flag.
+every policy flag.
 
 More detail:
 

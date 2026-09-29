@@ -16,12 +16,12 @@ here, long before any graphics capability is negotiated.
 
 ## Governing decisions
 
-**None.** No ADR is about channel setup.
+- [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md) — the early-capability flags are
+  policy flags, so they are exposed rather than curated, and the core refuses a bit it cannot
+  honour.
 
 Adjacent but not governing: [ADR-0001](../../adr/0001-sans-io-state-machine-core.md)
-places the sequence in a state machine; `CLAUDE.md`'s identity statement ("the host
-holds every RDP feature flag") is the *reason* the early-capability flags are
-exposed rather than curated, but it is an identity claim, not a decision record.
+places the sequence in a state machine.
 
 ## Design model
 

@@ -17,9 +17,9 @@ the server answers differently than expected.
 
 **None.** No ADR is about the constant tables.
 
-Adjacent but not governing: `CLAUDE.md`'s identity claim ("the host holds every RDP
-feature flag") is the reason these are `pub` rather than internal — the exposure is
-the product, but no record decides it.
+Adjacent but not governing: [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md) (the
+host owns policy flags) is the reason these are `pub` rather than internal. It decides who
+sets each flag, not how the constant tables are laid out.
 
 ## Design model
 

@@ -72,8 +72,10 @@ during a session (#340).
   answering in arrival order stays correct. The alternatives shown were keeping it clear, as
   IronRDP does, and letting the host choose, as ADR-0015 lets it choose EGFX versions. **Not
   covered**: whether channel capability flags in general (cliprdr's `ADVERTISED_FLAGS`, this
-  helper's `extendedPDU` and `ioCode1`) should become the host's, as `CONTEXT.md` says every
-  RDP feature flag is. That was shown as a question for all channels, not decided here.
+  helper's `extendedPDU` and `ioCode1`) should become the host's, as `CONTEXT.md` said every
+  RDP feature flag is. That was shown as a question for all channels, not decided here;
+  [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md) (#352) later decided it: all of
+  this helper's General bits are implementation flags and stay the core's.
 
 ## Design model
 
