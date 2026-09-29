@@ -10,6 +10,11 @@
 //! See ADR-0001 (sans-IO core), ADR-0002 (own the RDP protocol; depend on `rustls` + `sspi`),
 //! ADR-0003 (phased codecs), and `docs/plan.md`.
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/icons/justrdp-icon-light-128.png",
+    html_favicon_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/favicon/favicon-32.png"
+)]
+
 mod auto_reconnect;
 pub mod cliprdr;
 pub mod connect;

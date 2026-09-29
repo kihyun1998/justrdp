@@ -18,6 +18,11 @@
 //! `[MS-RDPEGFX]` sample byte-identically, so the oracle keeps a role here as breadth over
 //! generated sequences rather than as the basis. NSCodec arrives with its own phase-2 rewrite.
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/icons/justrdp-icon-light-128.png",
+    html_favicon_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/favicon/favicon-32.png"
+)]
+
 /// Narrow a byte count to one a `Vec` will actually accept, or `None`.
 ///
 /// **`Vec` refuses any request above `isize::MAX`, not above `usize::MAX`** — and it panics with

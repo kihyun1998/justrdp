@@ -143,6 +143,7 @@ dependency at all; the four crates depend only downward).
 | `fuzz/fuzz_targets/*.rs` | fuzz targets, **out of the workspace** | matches 3/3 peers that run a fuzz lane |
 | `.github/workflows/*.yml` · `.github/scripts/*.py` | things that **are** CI gates | — |
 | `docs/adr/NNNN-<kebab>.md` · `docs/agents/*.md` · `docs/map/territory/<area>.md` · `docs/map/invariant/<claim>.md` | decision records · agent contracts · the wiring map | — |
+| `logo/<kind>/` | brand assets. Read by `README.md` and by each crate root's `#![doc(html_logo_url, html_favicon_url)]` through `raw.githubusercontent.com/…/master/logo/…`, so a rename breaks rustdoc silently | — |
 
 **`fuzz/` is out of the workspace, and that is a gate blind spot, not an oversight.**
 `cargo <cmd> --workspace` does not build it, so a rename or a public-path change can leave
