@@ -52,7 +52,7 @@ pub struct Drive {
     pub name: String,
 }
 
-/// Why [`DeviceRedirection::new`] refused the host's drives.
+/// Why [`DeviceRedirection::new`] or [`DeviceRedirection::add_drive`] refused a drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriveError {
     /// A name is empty, not ASCII, holds a NUL or one of `< > " / \ |`, or has a `:` before
@@ -60,6 +60,36 @@ pub enum DriveError {
     InvalidName(String),
     /// Two drives share a `device_id`.
     DuplicateId(u32),
+}
+
+/// Why [`DeviceRedirection::remove_drive`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveError {
+    /// No drive the host holds has that `device_id`.
+    UnknownDrive,
+    /// The drive is announced and the server did not advertise `RDPDR_DEVICE_REMOVE_PDUS`,
+    /// so it cannot be removed; nothing changed.
+    NotSupported,
+}
+
+/// A drive the host redirects, and where its announcement stands.
+#[derive(Debug, Clone)]
+struct HeldDrive {
+    announce: DeviceAnnounce,
+    state: DriveState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriveState {
+    /// Not announced yet: waiting for User Logged On.
+    Unannounced,
+    /// Announced, the server's answer not received. `removed`: the host removed it since, so
+    /// an acceptance is answered with a removal.
+    Waiting {
+        removed: bool,
+    },
+    Accepted,
+    Refused,
 }
 
 /// The most Device I/O Requests kept waiting for the host; one past it is answered with
@@ -380,12 +410,17 @@ struct OpenFile {
 #[derive(Debug, Clone)]
 pub struct DeviceRedirection {
     computer_name: String,
-    drives: Vec<DeviceAnnounce>,
+    drives: Vec<HeldDrive>,
     /// The `ClientId` used when the server's version is below 12, from the host's randomness.
     random_client_id: u32,
     /// The `VersionMinor` and `ClientId` sent in the Client Announce Reply.
     announced_as: Option<(u16, u32)>,
-    devices_announced: bool,
+    /// Whether User Logged On arrived, so drives are announced as they are added.
+    logged_on: bool,
+    /// The `extendedPDU` of the server's General capability set, zero until it arrives.
+    server_extended_pdu: u32,
+    /// The drives removed on the wire since the last Server Announce, whose requests are failed.
+    removed: Vec<u32>,
     terminated: bool,
     /// Requests waiting for the host.
     pending: Vec<Pending>,
@@ -403,24 +438,109 @@ impl DeviceRedirection {
         drives: Vec<Drive>,
         random_client_id: u32,
     ) -> Result<Self, DriveError> {
-        let mut announced: Vec<DeviceAnnounce> = Vec::with_capacity(drives.len());
-        for drive in drives {
-            if announced.iter().any(|d| d.device_id == drive.device_id) {
-                return Err(DriveError::DuplicateId(drive.device_id));
-            }
-            announced.push(drive_announce(drive)?);
-        }
-        Ok(Self {
+        let mut helper = Self {
             computer_name: computer_name.into(),
-            drives: announced,
+            drives: Vec::with_capacity(drives.len()),
             random_client_id,
             announced_as: None,
-            devices_announced: false,
+            logged_on: false,
+            server_extended_pdu: 0,
+            removed: Vec::new(),
             terminated: false,
             pending: Vec::new(),
             files: Vec::new(),
             last_file_id: 0,
-        })
+        };
+        for drive in drives {
+            helper.add_drive(drive)?;
+        }
+        Ok(helper)
+    }
+
+    /// Redirect one more drive. After User Logged On it is announced at once, alone
+    /// (3.2.5.1.9); before it, with the others then. A `device_id` a removed drive used may be
+    /// reused (2.2.3.2).
+    pub fn add_drive(&mut self, drive: Drive) -> Result<Vec<DeviceRedirectionOutput>, DriveError> {
+        if self
+            .drives
+            .iter()
+            .any(|d| d.announce.device_id == drive.device_id)
+        {
+            return Err(DriveError::DuplicateId(drive.device_id));
+        }
+        let announce = drive_announce(drive)?;
+        self.removed.retain(|&id| id != announce.device_id);
+        let announce_now = self.logged_on && !self.terminated;
+        let outputs = if announce_now {
+            vec![DeviceRedirectionOutput::Send(
+                pdu::encode_device_list_announce(std::slice::from_ref(&announce)),
+            )]
+        } else {
+            Vec::new()
+        };
+        self.drives.push(HeldDrive {
+            announce,
+            state: if announce_now {
+                DriveState::Waiting { removed: false }
+            } else {
+                DriveState::Unannounced
+            },
+        });
+        Ok(outputs)
+    }
+
+    /// Stop redirecting the drive `device_id`. An accepted drive has what the host owes on it
+    /// answered `STATUS_CANCELLED`, its files closed for the host, and is removed (2.2.3.2);
+    /// one awaiting the server's answer is removed when the server accepts it. Removing an
+    /// announced drive needs the server's `RDPDR_DEVICE_REMOVE_PDUS`; a drive never announced,
+    /// or one the server refused, goes without it.
+    pub fn remove_drive(
+        &mut self,
+        device_id: u32,
+    ) -> Result<Vec<DeviceRedirectionOutput>, RemoveError> {
+        let at = self
+            .drives
+            .iter()
+            .position(|d| {
+                d.announce.device_id == device_id
+                    && d.state != DriveState::Waiting { removed: true }
+            })
+            .ok_or(RemoveError::UnknownDrive)?;
+        let announced = matches!(
+            self.drives[at].state,
+            DriveState::Waiting { .. } | DriveState::Accepted
+        );
+        if !announced || self.terminated {
+            self.drives.remove(at);
+            return Ok(Vec::new());
+        }
+        if self.server_extended_pdu & pdu::RDPDR_DEVICE_REMOVE_PDUS == 0 {
+            return Err(RemoveError::NotSupported);
+        }
+        if self.drives[at].state == (DriveState::Waiting { removed: false }) {
+            self.drives[at].state = DriveState::Waiting { removed: true };
+            return Ok(Vec::new());
+        }
+        self.drives.remove(at);
+        let mut outputs = self.cancel_pending(|p| p.device_id == device_id);
+        let (closed, kept) = core::mem::take(&mut self.files)
+            .into_iter()
+            .partition(|f| f.device_id == device_id);
+        self.files = kept;
+        outputs.extend(
+            closed
+                .into_iter()
+                .map(|f: OpenFile| DeviceRedirectionOutput::FileClosed {
+                    device_id: f.device_id,
+                    file_id: f.file_id,
+                    delete: f.delete,
+                }),
+        );
+        outputs.push(DeviceRedirectionOutput::Send(
+            pdu::encode_device_list_remove(&[device_id]),
+        ));
+        self.removed.push(device_id);
+        Ok(outputs)
     }
 
     /// Process one whole message received on the device redirection channel.
@@ -668,15 +788,29 @@ impl DeviceRedirection {
                 };
                 let mut outputs = self.close_all();
                 self.announced_as = Some((version, client_id));
-                self.devices_announced = false;
+                self.logged_on = false;
+                self.server_extended_pdu = 0;
+                self.removed.clear();
+                self.drives
+                    .retain(|d| d.state != DriveState::Waiting { removed: true });
+                for drive in &mut self.drives {
+                    drive.state = DriveState::Unannounced;
+                }
                 outputs.push(Send(pdu::encode_client_announce_reply(version, client_id)));
                 outputs.push(Send(pdu::encode_client_name(&self.computer_name)));
                 outputs
             }
-            RdpdrPdu::ServerCapabilities(_) => {
+            RdpdrPdu::ServerCapabilities(sets) => {
                 let Some((version, _)) = self.announced_as else {
                     return out_of_sequence("Server Core Capability Request");
                 };
+                self.server_extended_pdu = sets
+                    .iter()
+                    .find_map(|set| match set {
+                        CapabilitySet::General(general) => Some(general.extended_pdu),
+                        CapabilitySet::Other { .. } => None,
+                    })
+                    .unwrap_or(0);
                 vec![Send(pdu::encode_client_capabilities(&client_capabilities(
                     version,
                 )))]
@@ -693,21 +827,51 @@ impl DeviceRedirection {
                 if self.announced_as.is_none() {
                     return out_of_sequence("Server User Logged On");
                 }
-                if self.devices_announced || self.drives.is_empty() {
+                if self.logged_on {
                     return Vec::new();
                 }
-                self.devices_announced = true;
-                vec![Send(pdu::encode_device_list_announce(&self.drives))]
+                self.logged_on = true;
+                let mut announced = Vec::new();
+                for drive in &mut self.drives {
+                    if drive.state == DriveState::Unannounced {
+                        drive.state = DriveState::Waiting { removed: false };
+                        announced.push(drive.announce.clone());
+                    }
+                }
+                if announced.is_empty() {
+                    return Vec::new();
+                }
+                vec![Send(pdu::encode_device_list_announce(&announced))]
             }
             RdpdrPdu::DeviceAnnounceResponse {
                 device_id,
                 result_code,
             } => {
-                if !self.is_announced(device_id) {
+                let accepted = result_code == STATUS_SUCCESS;
+                if let Some(at) = self.drives.iter().position(|d| {
+                    d.announce.device_id == device_id
+                        && d.state == DriveState::Waiting { removed: true }
+                }) {
+                    self.drives.remove(at);
+                    return if accepted {
+                        self.removed.push(device_id);
+                        vec![Send(pdu::encode_device_list_remove(&[device_id]))]
+                    } else {
+                        Vec::new()
+                    };
+                }
+                let Some(drive) = self.drives.iter_mut().find(|d| {
+                    d.announce.device_id == device_id && d.state != DriveState::Unannounced
+                }) else {
                     tracing::warn!(target: "rdp_rdpdr", device_id, "Device Announce Response for no device");
                     return Vec::new();
-                }
-                vec![if result_code == STATUS_SUCCESS {
+                };
+                drive.state = if accepted {
+                    DriveState::Accepted
+                } else {
+                    DriveState::Refused
+                };
+                vec![if accepted {
                     DeviceRedirectionOutput::DriveAccepted { device_id }
                 } else {
                     DeviceRedirectionOutput::DriveRefused {
@@ -730,12 +894,34 @@ impl DeviceRedirection {
         }
     }
 
+    /// Whether the server may send requests for `device_id`: it was announced and not removed.
     fn is_announced(&self, device_id: u32) -> bool {
-        self.devices_announced && self.drives.iter().any(|d| d.device_id == device_id)
+        self.drives.iter().any(|d| {
+            d.announce.device_id == device_id
+                && matches!(
+                    d.state,
+                    DriveState::Waiting { removed: false }
+                        | DriveState::Accepted
+                        | DriveState::Refused
+                )
+        })
     }
 
-    /// Handle a Device I/O Request. One for a device never announced is ignored (3.1.5.2).
+    /// Handle a Device I/O Request. One for a device never announced is ignored (3.1.5.2); one
+    /// for a drive removed on the wire is `STATUS_UNSUCCESSFUL`.
     fn io_request(&mut self, request: IoRequest) -> Vec<DeviceRedirectionOutput> {
+        if self.removed.contains(&request.device_id) {
+            let body = match &request.body {
+                Ok(IoBody::SetInformation { length, .. }) => length.to_le_bytes().to_vec(),
+                _ => pdu::failure_body(request.major).to_vec(),
+            };
+            return vec![DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+                request.device_id,
+                request.completion_id,
+                STATUS_UNSUCCESSFUL,
+                &body,
+            ))];
+        }
         if !self.is_announced(request.device_id) {
             tracing::warn!(
                 target: "rdp_rdpdr",
@@ -1346,7 +1532,9 @@ fn client_capabilities(version: u16) -> [CapabilitySet; 2] {
             os_version: 0,
             protocol_minor: version,
             io_code1: IO_CODE1_ALWAYS_SET,
-            extended_pdu: RDPDR_CLIENT_DISPLAY_NAME_PDU | RDPDR_USER_LOGGEDON_PDU,
+            extended_pdu: pdu::RDPDR_DEVICE_REMOVE_PDUS
+                | RDPDR_CLIENT_DISPLAY_NAME_PDU
+                | RDPDR_USER_LOGGEDON_PDU,
             extra_flags1: 0,
             special_type_device_cap: 0,
         }),
@@ -1506,6 +1694,11 @@ mod tests {
             general.extended_pdu & RDPDR_USER_LOGGEDON_PDU,
             RDPDR_USER_LOGGEDON_PDU
         );
+        assert_eq!(
+            general.extended_pdu & pdu::RDPDR_DEVICE_REMOVE_PDUS,
+            pdu::RDPDR_DEVICE_REMOVE_PDUS,
+            "removing a drive is implemented, so it is advertised"
+        );
         assert_eq!(general.protocol_minor, 0x0c);
         assert_eq!(
             drive,
@@ -1527,7 +1720,10 @@ mod tests {
         let announce = h.process(&USER_LOGGED_ON);
         assert_eq!(
             sent(&announce),
-            vec![pdu::encode_device_list_announce(&h.drives).as_slice()]
+            vec![
+                pdu::encode_device_list_announce(&[drive_announce(drive(1, "justrdp")).unwrap()])
+                    .as_slice()
+            ]
         );
         assert!(h.process(&USER_LOGGED_ON).is_empty());
         assert_eq!(
@@ -2181,6 +2377,240 @@ mod tests {
         assert!(delete_on_close);
         h.respond_open(11, Ok(Opened::File)).unwrap();
         assert_eq!(closed(h.process(&server_announce(0x0d, 9))), Some(true));
+    }
+
+    /// A Server Core Capability Request whose General set carries `extended_pdu`: the client's
+    /// layout under the server's `PacketId`.
+    fn server_capabilities(extended_pdu: u32) -> Vec<u8> {
+        let mut m = pdu::encode_client_capabilities(&[CapabilitySet::General(GeneralCapability {
+            version: GENERAL_CAPABILITY_VERSION_02,
+            os_type: 0,
+            os_version: 0,
+            protocol_minor: 0x0d,
+            io_code1: 0xFFFF,
+            extended_pdu,
+            extra_flags1: 0,
+            special_type_device_cap: 2,
+        })]);
+        m[2..4].copy_from_slice(&pdu::PAKID_CORE_SERVER_CAPABILITY.to_le_bytes());
+        m
+    }
+
+    /// Through the drive's acceptance, the server allowing removals (`extendedPDU` 7, as the
+    /// VM sends it).
+    fn accepted_with_removal() -> DeviceRedirection {
+        let mut h = helper();
+        h.process(&server_announce(0x0d, 7));
+        h.process(&server_capabilities(7));
+        h.process(&client_id_confirm(7));
+        h.process(&USER_LOGGED_ON);
+        h.process(&device_reply(1, STATUS_SUCCESS));
+        h
+    }
+
+    fn announce(id: u32, name: &str) -> Vec<u8> {
+        pdu::encode_device_list_announce(&[drive_announce(drive(id, name)).unwrap()])
+    }
+
+    /// A drive added after User Logged On is announced alone, at once (3.2.5.1.9), and its
+    /// requests are then served.
+    #[test]
+    fn a_drive_added_after_logon_is_announced_alone() {
+        let mut h = ready();
+        assert_eq!(
+            h.add_drive(drive(2, "late")),
+            Ok(vec![DeviceRedirectionOutput::Send(announce(2, "late"))])
+        );
+        assert_eq!(
+            h.process(&device_reply(2, STATUS_SUCCESS)),
+            vec![DeviceRedirectionOutput::DriveAccepted { device_id: 2 }]
+        );
+        let outputs = h.process(&io_request(2, 5, IRP_MJ_CREATE));
+        assert_eq!(
+            outputs.len(),
+            1,
+            "a request for the added drive is answered"
+        );
+
+        // A helper that started with no drives still announces one added after logon.
+        let mut h = DeviceRedirection::new("host", Vec::new(), 0).unwrap();
+        h.process(&server_announce(0x0d, 7));
+        h.process(&SERVER_CAPABILITIES);
+        h.process(&client_id_confirm(7));
+        assert!(h.process(&USER_LOGGED_ON).is_empty());
+        assert_eq!(
+            h.add_drive(drive(4, "first")),
+            Ok(vec![DeviceRedirectionOutput::Send(announce(4, "first"))])
+        );
+    }
+
+    /// A drive added before User Logged On is announced with the others then.
+    #[test]
+    fn a_drive_added_before_logon_waits_for_it() {
+        let mut h = helper();
+        h.process(&server_announce(0x0d, 7));
+        h.process(&SERVER_CAPABILITIES);
+        h.process(&client_id_confirm(7));
+        assert_eq!(h.add_drive(drive(2, "late")), Ok(Vec::new()));
+        assert_eq!(
+            sent(&h.process(&USER_LOGGED_ON)),
+            vec![
+                pdu::encode_device_list_announce(&[
+                    drive_announce(drive(1, "justrdp")).unwrap(),
+                    drive_announce(drive(2, "late")).unwrap(),
+                ])
+                .as_slice()
+            ]
+        );
+    }
+
+    /// An added drive is held to `new`'s rules, and its `device_id` must be free.
+    #[test]
+    fn an_invalid_added_drive_is_refused() {
+        let mut h = ready();
+        assert_eq!(
+            h.add_drive(drive(2, "a/b")),
+            Err(DriveError::InvalidName("a/b".to_string()))
+        );
+        assert_eq!(
+            h.add_drive(drive(1, "again")),
+            Err(DriveError::DuplicateId(1))
+        );
+    }
+
+    /// Removing an accepted drive cancels what the host owes on it, closes its files for the
+    /// host, then removes it; its requests are ignored after, and its ID can be reused.
+    #[test]
+    fn removing_an_accepted_drive_cancels_then_removes_it() {
+        let mut h = accepted_with_removal();
+        let file = open_file(&mut h, 1, "\\a.txt");
+        h.process(&query(
+            2,
+            file,
+            pdu::IRP_MJ_QUERY_INFORMATION,
+            pdu::FILE_BASIC_INFORMATION,
+        ));
+        assert_eq!(
+            h.remove_drive(1),
+            Ok(vec![
+                DeviceRedirectionOutput::Send(pdu::encode_io_completion(
+                    1,
+                    2,
+                    STATUS_CANCELLED,
+                    &[0; 4]
+                )),
+                DeviceRedirectionOutput::FileClosed {
+                    device_id: 1,
+                    file_id: file,
+                    delete: false
+                },
+                DeviceRedirectionOutput::Send(pdu::encode_device_list_remove(&[1])),
+            ])
+        );
+        // A request crossing the removal is failed, not left unanswered, a Set Information
+        // repeating its `Length`.
+        assert_eq!(
+            sent(&h.process(&io_request(1, 3, IRP_MJ_CREATE))),
+            vec![pdu::encode_io_completion(1, 3, STATUS_UNSUCCESSFUL, &[0; 5]).as_slice()]
+        );
+        assert_eq!(
+            sent(&h.process(&set_info(4, file, pdu::FILE_DISPOSITION_INFORMATION, &[1]))),
+            vec![
+                pdu::encode_io_completion(1, 4, STATUS_UNSUCCESSFUL, &1u32.to_le_bytes())
+                    .as_slice()
+            ]
+        );
+        assert_eq!(h.remove_drive(1), Err(RemoveError::UnknownDrive));
+        assert_eq!(
+            h.add_drive(drive(1, "again")),
+            Ok(vec![DeviceRedirectionOutput::Send(announce(1, "again"))])
+        );
+        assert!(
+            matches!(
+                asked(&h.process(&create(5, pdu::FILE_OPEN, 0, "\\a"))),
+                DriveRequest::Open { .. }
+            ),
+            "a reused ID is served again"
+        );
+    }
+
+    /// Without the server's `RDPDR_DEVICE_REMOVE_PDUS` an announced drive cannot be removed, and
+    /// nothing changes; a drive the server refused, or one never announced, goes without it.
+    #[test]
+    fn without_the_server_bit_remove_reports_it_cannot() {
+        let mut h = ready();
+        h.process(&device_reply(1, STATUS_SUCCESS));
+        assert_eq!(h.remove_drive(1), Err(RemoveError::NotSupported));
+        assert_eq!(
+            h.process(&io_request(1, 5, IRP_MJ_CREATE)).len(),
+            1,
+            "the drive stays"
+        );
+
+        h.add_drive(drive(2, "late")).unwrap();
+        h.process(&device_reply(2, STATUS_UNSUCCESSFUL));
+        assert_eq!(h.remove_drive(2), Ok(Vec::new()));
+
+        let mut h = helper();
+        h.add_drive(drive(3, "early")).unwrap();
+        assert_eq!(h.remove_drive(3), Ok(Vec::new()));
+        assert_eq!(h.remove_drive(9), Err(RemoveError::UnknownDrive));
+    }
+
+    /// A drive removed before the server answered its announcement is removed when the server
+    /// accepts it, and forgotten when it refuses; neither answer reaches the host.
+    #[test]
+    fn a_drive_removed_before_its_answer_is_removed_on_acceptance() {
+        let mut h = accepted_with_removal();
+        h.add_drive(drive(2, "late")).unwrap();
+        assert_eq!(h.remove_drive(2), Ok(Vec::new()));
+        assert!(
+            h.process(&io_request(2, 4, IRP_MJ_CREATE)).is_empty(),
+            "no removal went out yet, so the drive is not served and not failed"
+        );
+        assert_eq!(h.remove_drive(2), Err(RemoveError::UnknownDrive));
+        assert_eq!(h.add_drive(drive(2, "x")), Err(DriveError::DuplicateId(2)));
+        assert_eq!(
+            h.process(&device_reply(2, STATUS_SUCCESS)),
+            vec![DeviceRedirectionOutput::Send(
+                pdu::encode_device_list_remove(&[2])
+            )]
+        );
+        assert_eq!(
+            sent(&h.process(&io_request(2, 5, IRP_MJ_CREATE))),
+            vec![pdu::encode_io_completion(2, 5, STATUS_UNSUCCESSFUL, &[0; 5]).as_slice()]
+        );
+
+        h.add_drive(drive(3, "late")).unwrap();
+        h.remove_drive(3).unwrap();
+        assert!(h.process(&device_reply(3, STATUS_UNSUCCESSFUL)).is_empty());
+        assert_eq!(h.add_drive(drive(3, "x")).map(|o| o.len()), Ok(1));
+    }
+
+    /// A new Server Announce re-announces the drives the host holds now: an added one
+    /// included, a removed one not.
+    #[test]
+    fn starting_over_announces_the_current_drives() {
+        let mut h = accepted_with_removal();
+        h.add_drive(drive(2, "late")).unwrap();
+        h.process(&device_reply(2, STATUS_SUCCESS));
+        h.remove_drive(1).unwrap();
+        // Removed while its announcement waits for an answer that never comes.
+        h.add_drive(drive(3, "gone")).unwrap();
+        h.remove_drive(3).unwrap();
+        h.process(&server_announce(0x0d, 9));
+        h.process(&client_id_confirm(9));
+        assert_eq!(
+            sent(&h.process(&USER_LOGGED_ON)),
+            vec![announce(2, "late").as_slice()]
+        );
+        assert!(
+            h.process(&io_request(1, 8, IRP_MJ_CREATE)).is_empty(),
+            "a drive removed before starting over is one this server never saw"
+        );
+        // This server sent no capabilities: the last server's permission does not carry over.
+        h.process(&device_reply(2, STATUS_SUCCESS));
+        assert_eq!(h.remove_drive(2), Err(RemoveError::NotSupported));
     }
 
     /// A Create reaches the host as an Open under a new file ID, with the path split below the
