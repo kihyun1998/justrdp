@@ -65,6 +65,15 @@ during a session (#340).
 - **Moving the VM tests' in-memory host into `drive_host` and giving #340 its own test was
   the maintainer's call (2026-09-29, #340)**; the alternative shown was growing the one
   list/read/write test further.
+- **Advertising `ENABLE_ASYNCIO` from the core, always, was the maintainer's call
+  (2026-09-29, #349).** They were shown the #349 measurements below: reads 3 to 4 times faster
+  with answers held back 50 ms, no gain with answers sent at once. They were also shown that the
+  helper already pairs answers by `CompletionId` under `MAX_PENDING_REQUESTS`, and that a host
+  answering in arrival order stays correct. The alternatives shown were keeping it clear, as
+  IronRDP does, and letting the host choose, as ADR-0015 lets it choose EGFX versions. **Not
+  covered**: whether channel capability flags in general (cliprdr's `ADVERTISED_FLAGS`, this
+  helper's `extendedPDU` and `ioCode1`) should become the host's, as `CONTEXT.md` says every
+  RDP feature flag is. That was shown as a question for all channels, not decided here.
 
 ## Design model
 
@@ -80,7 +89,9 @@ during a session (#340).
 - **What is advertised.** `ioCode1` is 0x3FFF: bits 0x1-0x2000 are "Unused, always set"
   (2.2.2.7.1), so they gate nothing, and the two security bits stay clear. `extendedPDU` sets
   User Logged On, Device List Remove (since #340) and the always-set display-name bit.
-  `ENABLE_ASYNCIO` is not advertised, as in IronRDP, so requests on one file stay sequential.
+  `ENABLE_ASYNCIO` is advertised (#349), as FreeRDP does and IronRDP does not, so the server
+  may send several reads or writes on one file at once; the host may still answer them in
+  arrival order.
   No printer, port or smartcard set is sent, which 1.7 reads as not supported.
 - **Of the server's capability sets, only the General set's `extendedPDU` is read**: its
   `RDPDR_DEVICE_REMOVE_PDUS` is what allows a removal, and it is forgotten on a new Server
@@ -344,6 +355,30 @@ during a session (#340).
   counts the requests instead, and allows 2.
 - A file the server held open across the removal: its later read is refused by the server
   itself, with no request sent.
+
+**Measured against the WS2022 test VM (#349, 2026-09-29), before the flag was advertised:** a
+throwaway probe, not merged, set `ENABLE_ASYNCIO` from an environment variable. PowerShell
+copied an 8 MiB file (named anew each run) from the drive with `copy` and wrote it back with
+`WriteAllBytes`, each timed with
+`Measure-Command`. The in-memory host answered every request as it arrived. Each run was one
+session and the write-back was byte-exact every time. Flag off and on alternated, 2 runs each
+per condition.
+
+- **With the flag the server overlaps reads on one file.** Off, every request carried one
+  `CompletionId` (0, or 1 in one run). On, reads carried `CompletionId` 0 to 7 or 0 to 8 at
+  once. Offsets still arrived in ascending order in both cases. The three probing reads at
+  the start (32 KiB at 0, at the file's last 32 KiB block, at 61,440) come first either way.
+- **Read sizes grow with the file**: an 8 MiB copy reads 512 KiB (524,288) at a time, after
+  the three 32 KiB reads. #338's 300,000-byte file never read over 131,072. Off, the copy
+  opened the file twice and read 22 times; on, it opened it once and read 19 times.
+- **The write-back is one Write of 8,388,608 bytes**, with or without the flag, so the flag
+  cannot overlap it.
+- **Copy time with answers sent at once**: off 474 and 466 ms, on 557 and 736 ms. No gain.
+- **Copy time with each Read and Write answer held back 50 ms** (a spawned task delayed the
+  send): off 2,847 and 2,381 ms, on 726 and 952 ms. That is 3 to 4 times faster with the
+  flag. The write-back took 525 to 710 ms in every run, since it is one request.
+- **Not covered**: a host that answers overlapping requests out of order (this one answered
+  in arrival order), a real disk backend, a WAN link, and writes large enough to be split.
 
 ## Cross-cutting invariants
 

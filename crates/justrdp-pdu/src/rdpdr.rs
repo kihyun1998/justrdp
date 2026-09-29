@@ -55,6 +55,8 @@ pub const RDPDR_DEVICE_REMOVE_PDUS: u32 = 0x0000_0001;
 pub const RDPDR_CLIENT_DISPLAY_NAME_PDU: u32 = 0x0000_0002;
 /// `extendedPDU`: the server may send User Logged On (2.2.2.7.1).
 pub const RDPDR_USER_LOGGEDON_PDU: u32 = 0x0000_0004;
+/// `extraFlags1`: the server may send several reads or writes on one file at once (2.2.2.7.1).
+pub const ENABLE_ASYNCIO: u32 = 0x0000_0001;
 
 /// `RDPDR_DTYP_FILESYSTEM` (2.2.1.3).
 pub const RDPDR_DTYP_FILESYSTEM: u32 = 0x0000_0008;
