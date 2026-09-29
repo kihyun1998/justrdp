@@ -86,6 +86,8 @@ pub const IRP_MN_NOTIFY_CHANGE_DIRECTORY: u32 = 0x0000_0002;
 pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 /// `CreateOptions`: the file opened must not be a directory.
 pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+/// `CreateOptions`: the file is deleted when it is closed.
+pub const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 
 /// `CreateDisposition` `FILE_SUPERSEDE`.
 pub const FILE_SUPERSEDE: u32 = 0x0000_0000;
@@ -120,6 +122,14 @@ pub const FILE_BASIC_INFORMATION: u32 = 4;
 pub const FILE_STANDARD_INFORMATION: u32 = 5;
 /// `FileAttributeTagInformation` (`[MS-FSCC]` 2.4.6).
 pub const FILE_ATTRIBUTE_TAG_INFORMATION: u32 = 0x23;
+/// `FileRenameInformation` (`[MS-FSCC]` 2.4.42).
+pub const FILE_RENAME_INFORMATION: u32 = 0x0A;
+/// `FileDispositionInformation` (`[MS-FSCC]` 2.4.11).
+pub const FILE_DISPOSITION_INFORMATION: u32 = 0x0D;
+/// `FileAllocationInformation` (`[MS-FSCC]` 2.4.4).
+pub const FILE_ALLOCATION_INFORMATION: u32 = 0x13;
+/// `FileEndOfFileInformation` (`[MS-FSCC]` 2.4.13).
+pub const FILE_END_OF_FILE_INFORMATION: u32 = 0x14;
 /// `FileFsVolumeInformation` (`[MS-FSCC]` 2.5.9).
 pub const FILE_FS_VOLUME_INFORMATION: u32 = 1;
 /// `FileFsAttributeInformation` (`[MS-FSCC]` 2.5.1).
@@ -139,6 +149,10 @@ pub const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
 pub const STATUS_NO_SUCH_FILE: u32 = 0xC000_000F;
 /// `STATUS_INVALID_PARAMETER`.
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// `STATUS_MEDIA_WRITE_PROTECTED`: the drive is read-only.
+pub const STATUS_MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;
+/// `STATUS_CANNOT_DELETE`.
+pub const STATUS_CANNOT_DELETE: u32 = 0xC000_0121;
 /// `STATUS_INVALID_DEVICE_REQUEST`.
 pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
 /// `STATUS_ACCESS_DENIED`.
@@ -222,6 +236,21 @@ pub enum IoBody {
         /// `Offset`: where in the file to read from.
         offset: u64,
     },
+    /// Device Write Request (2.2.1.4.4).
+    Write {
+        /// `Offset`: where in the file to write; all ones asks a client of version 0x0D or
+        /// later to append.
+        offset: u64,
+        /// `WriteData`.
+        data: Vec<u8>,
+    },
+    /// Set Information Request (2.2.3.3.9).
+    SetInformation {
+        /// `Length`, which the response repeats (2.2.3.4.9).
+        length: u32,
+        /// `SetBuffer`, decoded by its `FsInformationClass`.
+        info: SetInformation,
+    },
     /// Query Volume Information Request (2.2.3.3.6).
     QueryVolumeInformation {
         /// `FsInformationClass`.
@@ -244,6 +273,54 @@ pub enum IoBody {
     },
     /// Any other request, whose body this decoder does not read.
     Other,
+}
+
+/// What a Set Information Request sets, by the classes 2.2.3.3.9 names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetInformation {
+    /// `FileBasicInformation` (`[MS-FSCC]` 2.4.7).
+    Basic(BasicInformation),
+    /// `FileEndOfFileInformation` (`[MS-FSCC]` 2.4.13): the new size in bytes.
+    EndOfFile(u64),
+    /// `FileAllocationInformation` (`[MS-FSCC]` 2.4.4): the new allocation size in bytes.
+    Allocation(u64),
+    /// `FileDispositionInformation` (`[MS-FSCC]` 2.4.11); an empty buffer means
+    /// `DeletePending` (2.2.3.3.9).
+    Disposition {
+        /// Whether the file is deleted when it is closed.
+        delete_pending: bool,
+    },
+    /// `RDP_FILE_RENAME_INFORMATION` (2.2.3.3.9.1).
+    Rename {
+        /// `ReplaceIfExists`.
+        replace_if_exists: bool,
+        /// `RootDirectory`, which MUST be zero.
+        root_directory: u8,
+        /// `FileName`, UTF-16 with any terminating NUL removed.
+        path: Vec<u16>,
+    },
+    /// Any other class, whose buffer this decoder does not read.
+    Other {
+        /// `FsInformationClass`.
+        class: u32,
+    },
+}
+
+/// `FILE_BASIC_INFORMATION` as a Set Information Request carries it (`[MS-FSCC]` 2.4.7): a
+/// time of 0 leaves it unchanged, -1 stops its automatic updates and -2 resumes them, and
+/// attributes of 0 leave them unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BasicInformation {
+    /// `CreationTime`.
+    pub creation_time: i64,
+    /// `LastAccessTime`.
+    pub last_access_time: i64,
+    /// `LastWriteTime`.
+    pub last_write_time: i64,
+    /// `ChangeTime`.
+    pub change_time: i64,
+    /// `FileAttributes`.
+    pub attributes: u32,
 }
 
 /// A Device Create Request's fields (2.2.1.4.1).
@@ -429,8 +506,27 @@ fn decode_io_body(major: u32, minor: u32, body: &[u8]) -> Result<IoBody, DecodeE
         (IRP_MJ_READ, _) => {
             let mut cur = ReadCursor::new(body, "DR_READ_REQ");
             let length = cur.read_u32_le()?;
-            let offset = u64::from(cur.read_u32_le()?) | u64::from(cur.read_u32_le()?) << 32;
+            let offset = read_u64_le(&mut cur)?;
             Ok(IoBody::Read { length, offset })
+        }
+        (IRP_MJ_WRITE, _) => {
+            let mut cur = ReadCursor::new(body, "DR_WRITE_REQ");
+            let length = cur.read_u32_le()? as usize;
+            let offset = read_u64_le(&mut cur)?;
+            let _padding = cur.read_slice(20)?;
+            let data = cur.read_slice(length)?.to_vec();
+            Ok(IoBody::Write { offset, data })
+        }
+        (IRP_MJ_SET_INFORMATION, _) => {
+            let mut cur = ReadCursor::new(body, "DR_DRIVE_SET_INFORMATION_REQ");
+            let class = cur.read_u32_le()?;
+            let length = cur.read_u32_le()?;
+            let _padding = cur.read_slice(24)?;
+            let buffer = cur.read_slice(length as usize)?;
+            Ok(IoBody::SetInformation {
+                length,
+                info: decode_set_information(class, buffer)?,
+            })
         }
         (IRP_MJ_QUERY_VOLUME_INFORMATION, _) => Ok(IoBody::QueryVolumeInformation {
             class: ReadCursor::new(body, "DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ").read_u32_le()?,
@@ -460,6 +556,50 @@ fn decode_io_body(major: u32, minor: u32, body: &[u8]) -> Result<IoBody, DecodeE
         }
         _ => Ok(IoBody::Other),
     }
+}
+
+fn read_u64_le(cur: &mut ReadCursor<'_>) -> Result<u64, DecodeError> {
+    Ok(u64::from(cur.read_u32_le()?) | u64::from(cur.read_u32_le()?) << 32)
+}
+
+/// A Set Information Request's `SetBuffer`, read by its class.
+fn decode_set_information(class: u32, buffer: &[u8]) -> Result<SetInformation, DecodeError> {
+    let mut cur = ReadCursor::new(buffer, "DR_DRIVE_SET_INFORMATION_REQ.SetBuffer");
+    Ok(match class {
+        FILE_BASIC_INFORMATION => {
+            let mut times = [0i64; 4];
+            for time in &mut times {
+                *time = read_u64_le(&mut cur)? as i64;
+            }
+            SetInformation::Basic(BasicInformation {
+                creation_time: times[0],
+                last_access_time: times[1],
+                last_write_time: times[2],
+                change_time: times[3],
+                attributes: cur.read_u32_le()?,
+            })
+        }
+        FILE_END_OF_FILE_INFORMATION => SetInformation::EndOfFile(read_u64_le(&mut cur)?),
+        FILE_ALLOCATION_INFORMATION => SetInformation::Allocation(read_u64_le(&mut cur)?),
+        FILE_DISPOSITION_INFORMATION => SetInformation::Disposition {
+            delete_pending: buffer.first().is_none_or(|&b| b != 0),
+        },
+        FILE_RENAME_INFORMATION => {
+            let replace_if_exists = cur.read_u8()? != 0;
+            let root_directory = cur.read_u8()?;
+            let name_length = cur.read_u32_le()? as usize;
+            let path = utf16_path(
+                cur.read_slice(name_length)?,
+                "RDP_FILE_RENAME_INFORMATION.FileName",
+            )?;
+            SetInformation::Rename {
+                replace_if_exists,
+                root_directory,
+                path,
+            }
+        }
+        class => SetInformation::Other { class },
+    })
 }
 
 /// A NUL-terminated UTF-16 path, its trailing NULs removed.
@@ -1075,6 +1215,125 @@ mod tests {
                 create_options: FILE_NON_DIRECTORY_FILE,
                 path: "\\dir\\a.txt".encode_utf16().collect(),
             }))
+        );
+    }
+
+    /// 2.2.1.4.4: `Length`, `Offset`, 20 bytes of `Padding`, then `Length` bytes of data.
+    #[test]
+    fn a_write_request_body_decodes() {
+        let write = |data: &[u8], declared: u32| {
+            let mut m = io_header(IRP_MJ_WRITE, 0);
+            m.extend_from_slice(&declared.to_le_bytes());
+            m.extend_from_slice(&u64::MAX.to_le_bytes());
+            m.extend_from_slice(&[0xAA; 20]);
+            m.extend_from_slice(data);
+            let Ok(RdpdrPdu::IoRequest(request)) = RdpdrPdu::decode(&m) else {
+                panic!("the header decodes");
+            };
+            request.body
+        };
+        assert_eq!(
+            write(b"abc", 3),
+            Ok(IoBody::Write {
+                offset: u64::MAX,
+                data: b"abc".to_vec(),
+            })
+        );
+        assert!(write(b"ab", 3).is_err(), "Length past the message");
+    }
+
+    fn set_information(class: u32, buffer: &[u8]) -> Result<IoBody, DecodeError> {
+        let mut m = io_header(IRP_MJ_SET_INFORMATION, 0);
+        m.extend_from_slice(&class.to_le_bytes());
+        m.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+        m.extend_from_slice(&[0xAA; 24]);
+        m.extend_from_slice(buffer);
+        let Ok(RdpdrPdu::IoRequest(request)) = RdpdrPdu::decode(&m) else {
+            panic!("the header decodes");
+        };
+        request.body
+    }
+
+    /// 2.2.3.3.9: the five classes it names decode; `Length` is kept for the response.
+    #[test]
+    fn set_information_bodies_decode() {
+        let body = |length: u32, info: SetInformation| Ok(IoBody::SetInformation { length, info });
+        assert_eq!(
+            set_information(0x14, &7u64.to_le_bytes()),
+            body(8, SetInformation::EndOfFile(7))
+        );
+        assert_eq!(
+            set_information(0x13, &9u64.to_le_bytes()),
+            body(8, SetInformation::Allocation(9))
+        );
+        // An empty buffer implies DeletePending (2.2.3.3.9).
+        assert_eq!(
+            set_information(0x0D, &[]),
+            body(
+                0,
+                SetInformation::Disposition {
+                    delete_pending: true
+                }
+            )
+        );
+        assert_eq!(
+            set_information(0x0D, &[0]),
+            body(
+                1,
+                SetInformation::Disposition {
+                    delete_pending: false
+                }
+            )
+        );
+        let name: Vec<u8> = "\\b.txt"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut rename = vec![1, 0];
+        rename.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        rename.extend_from_slice(&name);
+        assert_eq!(
+            set_information(0x0A, &rename),
+            body(
+                rename.len() as u32,
+                SetInformation::Rename {
+                    replace_if_exists: true,
+                    root_directory: 0,
+                    path: "\\b.txt".encode_utf16().collect(),
+                }
+            )
+        );
+        let mut basic = Vec::new();
+        for time in [1i64, 0, -1, -2] {
+            basic.extend_from_slice(&time.to_le_bytes());
+        }
+        basic.extend_from_slice(&0x20u32.to_le_bytes());
+        assert_eq!(
+            set_information(0x04, &basic),
+            body(
+                36,
+                SetInformation::Basic(BasicInformation {
+                    creation_time: 1,
+                    last_access_time: 0,
+                    last_write_time: -1,
+                    change_time: -2,
+                    attributes: 0x20,
+                })
+            )
+        );
+        assert_eq!(
+            set_information(0x22, &[1, 2]),
+            body(2, SetInformation::Other { class: 0x22 })
+        );
+        assert!(
+            set_information(0x14, &[0; 7]).is_err(),
+            "a short end of file"
+        );
+        let mut long_name = vec![0, 0];
+        long_name.extend_from_slice(&100u32.to_le_bytes());
+        assert!(
+            set_information(0x0A, &long_name).is_err(),
+            "FileNameLength past the buffer"
         );
     }
 

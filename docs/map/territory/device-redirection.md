@@ -8,8 +8,8 @@ holds the PDUs and `justrdp::rdpdr::DeviceRedirection` is a sans-IO helper the h
 as `cliprdr::Clipboard` is: the host feeds it each message received on the channel and sends
 what it returns. Only drives are redirected (#13); printers, smartcards, serial ports and USB
 are not. The helper completes the initialization sequence and announces the host's drives
-(#336), the server can open, describe and list a drive's folders (#337) and read its files
-(#338); writing and adding or removing drives are #339-#340.
+(#336), the server can open, describe and list a drive's folders (#337), read its files
+(#338), and write, rename and delete them (#339); adding or removing drives is #340.
 
 ## Governing decisions
 
@@ -43,6 +43,11 @@ are not. The helper completes the initialization sequence and announces the host
   call (2026-09-29, #338)**, made after the change was confirmed, shown `[MS-FSA]` 2.1.5.3 and
   IronRDP's same refusal; the alternative shown was leaving both to the host. The directory
   and not-open answers were part of the confirmed change.
+- **Answering a Write past `MAXLONGLONG` in the core was the maintainer's call (2026-09-29,
+  #339)**, shown `[MS-FSA]` 2.1.5.4 and that it widened the #338 call on Read, which had not
+  covered Write; the alternative shown was leaving it to the host. What they were also shown:
+  a zero-length Write still reaches the host, unlike a Read, because 2.1.5.4 refuses a
+  read-only volume first.
 
 ## Design model
 
@@ -71,9 +76,11 @@ are not. The helper completes the initialization sequence and announces the host
   drives with one `device_id`.
 - **The host answers facts; the helper speaks the wire.** A Create reaches the host as
   `DriveRequest::Open`, Query Volume Information as `QueryVolume`, Query Information as
-  `QueryInformation`, a first Query Directory as `ListDirectory`, and a Read as `Read`. The
-  host answers with `respond_open`, `respond_volume`, `respond_information`,
-  `respond_listing` or `respond_read`, by
+  `QueryInformation`, a first Query Directory as `ListDirectory`, a Read as `Read`, a Write
+  as `Write`, and a Set Information as `SetEndOfFile`, `SetAllocationSize`, `SetBasic`,
+  `Rename` or `Delete`. The host answers with `respond_open`, `respond_volume`,
+  `respond_information`, `respond_listing`, `respond_read`, `respond_write` or
+  `respond_set`, by
   `CompletionId` and in any order, with typed values (`Opened`, `VolumeInformation`,
   `FileInformation`, `DirectoryEntry`) or an NTSTATUS; the helper encodes the `[MS-FSCC]`
   structures. An answer of the wrong kind, or for no waiting request, is refused
@@ -117,6 +124,39 @@ are not. The helper completes the initialization sequence and announces the host
   the host answers, so how much to read at once is the host's; IronRDP's Windows backend
   refuses above 1 MiB with `STATUS_INVALID_PARAMETER`, and FreeRDP trims it to what is left
   of the file. A host decides how much to allocate before it reads.
+- **A Write hands the host an offset and the data**, and the host answers with how many bytes
+  it wrote; **a count above the data's length is refused** (`RespondError::TooLong`). An
+  `Offset` of all ones is `WriteOffset::Append` when this client announced version 0x0D or
+  later (2.2.1.4.4), and an offset past `MAXLONGLONG` below it. The helper answers a Write to
+  a directory (`STATUS_INVALID_DEVICE_REQUEST`), to a file not open (`STATUS_UNSUCCESSFUL`)
+  and one reaching past `MAXLONGLONG` (`STATUS_INVALID_PARAMETER`, `[MS-FSA]` 2.1.5.4). **A
+  zero-length Write still reaches the host**, unlike a zero-length Read: 2.1.5.4 refuses a
+  write on a read-only volume before it answers a zero-length one, and read-only is the
+  host's. The response carries the count and one padding byte, as FreeRDP sends it.
+- **Set Information reaches the host one class at a time**, by the five 2.2.3.3.9 names:
+  `FileEndOfFileInformation` as `SetEndOfFile`, `FileAllocationInformation` as
+  `SetAllocationSize`, `FileBasicInformation` as `SetBasic` (raw, with `[MS-FSCC]` 2.4.7's 0,
+  -1 and -2), `FileRenameInformation` as `Rename` and `FileDispositionInformation` (an empty
+  buffer meaning delete, 2.2.3.3.9) as `Delete`; any other class is `STATUS_NOT_SUPPORTED`.
+  All five are implemented, not only the measured ones, since 2.2.3.3.9 closes the list. A
+  size on a directory or past `MAXLONGLONG` is `STATUS_INVALID_PARAMETER` (`[MS-FSA]`
+  2.1.5.15.5), as IronRDP refuses a negative one. **Every response repeats the request's
+  `Length`**, a failed or cancelled one included, since 2.2.3.4.9 says it MUST; FreeRDP does
+  the same.
+- **A rename target is checked like a Create's path**: split below the drive's root, `.`,
+  `..`, a NUL, `/` or `:` refused `STATUS_OBJECT_NAME_INVALID`, and so is the root itself; a
+  nonzero `RootDirectory` is `STATUS_INVALID_PARAMETER` (2.2.3.3.9.1 says it MUST be zero).
+  Reserved device names are not refused here: 3.2.5.2.3 speaks of a Create.
+- **A delete happens when the file closes**, as it does in NT. The helper marks the file when
+  the host accepts a `Delete` (unmarks it on `delete: false`) or when its Create carried
+  `FILE_DELETE_ON_CLOSE`, which `DriveRequest::Open` passes as `delete_on_close` so a
+  read-only host can refuse it; a refused or cancelled `Delete` changes nothing.
+  `FileClosed`'s `delete` then tells the host to delete, on a Close, a new Server Announce or
+  the channel ending alike. FreeRDP keeps the same mark and deletes in its file's free; a
+  directory that is not empty is the host's to refuse (`STATUS_DIRECTORY_NOT_EMPTY`,
+  2.1.5.15.3).
+- **Read-only is the host's**: it answers each change with a status of its choosing.
+  IronRDP's Windows backend uses `STATUS_MEDIA_WRITE_PROTECTED`, which the VM test uses too.
 - **Only the classes the server was measured to use are implemented**: Query Volume
   Information `FileFsVolumeInformation` (1), `FileFsAttributeInformation` (5) and
   `FileFsFullSizeInformation` (7); Query Information `FileBasicInformation` (4),
@@ -139,7 +179,7 @@ are not. The helper completes the initialization sequence and announces the host
   gets `STATUS_UNSUCCESSFUL`, which 3.1.5.2 asks for. A failed completion carries the fields
   its response layout has, zeroed: a Create's `FileId` and `Information`, a Write's or
   Directory Control's `Length` and padding, a Close's or Lock's padding, every other known
-  response's `Length`. An IRP for a device not announced is ignored (3.1.5.2), and one whose
+  response's `Length`, except Set Information's, which is repeated. An IRP for a device not announced is ignored (3.1.5.2), and one whose
   header reads but whose body does not is `STATUS_UNSUCCESSFUL` and the channel goes on.
 - **A message the helper cannot read ends the channel** (3.1.5.2): one that does not decode,
   an unknown `Component` or `PacketId`, or a Client ID Confirm for another `ClientId`. The
@@ -155,21 +195,25 @@ are not. The helper completes the initialization sequence and announces the host
 ## Code
 
 - `justrdp-pdu/src/rdpdr.rs` — `RdpdrPdu`, `CapabilitySet`, `GeneralCapability`,
-  `IoRequest`, `IoBody` (`Read` among its bodies), `CreateRequest`, `DeviceAnnounce`, `FileInformation`,
+  `IoRequest`, `IoBody` (`Read`, `Write` and `SetInformation` among its bodies),
+  `SetInformation`, `BasicInformation`, `CreateRequest`, `DeviceAnnounce`, `FileInformation`,
   `VolumeInformation`, `encode_client_announce_reply`, `encode_client_name`,
   `encode_client_capabilities`, `encode_device_list_announce`, `encode_io_completion`,
   `encode_file_information`, `encode_volume_information`, `encode_directory_entry`,
-  `length_prefixed`, `failure_body`, `is_known_major`, `IO_CODE1_ALWAYS_SET`
+  `length_prefixed`, `failure_body`, `is_known_major`, `IO_CODE1_ALWAYS_SET`,
+  `FILE_DELETE_ON_CLOSE`
 - `justrdp/src/rdpdr.rs` — `DeviceRedirection`, `DeviceRedirectionOutput`, `DriveRequest`,
-  `Opened`, `OpenKind`, `Disposition`, `DirectoryEntry`, `RespondError`, `Drive`,
+  `Opened`, `OpenKind`, `Disposition`, `WriteOffset`, `DirectoryEntry`, `RespondError`,
+  `Drive`,
   `DriveError`, `channel_def`, `MAX_PENDING_REQUESTS`, `MAX_OPEN_FILES`, `drive_path`,
   `matches_pattern`
 - `fuzz/fuzz_targets/rdpdr.rs` — `RdpdrPdu`
 - `justrdp-tokio/src/lib.rs` — `the_device_redirection_handshake_accepts_a_drive_on_the_real_vm`,
-  `the_server_lists_and_reads_a_host_drive_on_the_real_vm`
+  `the_server_lists_reads_and_writes_a_host_drive_on_the_real_vm`
 - Spec sections cited inline: `[MS-RDPEFS]` 1.3.1, 1.7, 2.1, 2.2.1.3, 2.2.1.4, 2.2.1.5.1-5,
-  2.2.1.4.3, 2.2.1.5.3, 2.2.2.3, 2.2.2.7.1, 2.2.3.1, 2.2.3.3.6, 2.2.3.3.8, 2.2.3.3.10, 2.2.3.4, 3.1.5.2, 3.2.5.1.2,
-  3.2.5.1.3, 3.2.5.1.6, 3.2.5.1.8, 3.2.5.1.9, 3.2.5.2.3, 3.2.5.2.5; `[MS-FSA]` 2.1.4.4, 2.1.5.3
+  2.2.1.4.3, 2.2.1.4.4, 2.2.1.5.3, 2.2.1.5.4, 2.2.2.3, 2.2.2.7.1, 2.2.3.1, 2.2.3.3.6, 2.2.3.3.8, 2.2.3.3.9, 2.2.3.3.9.1, 2.2.3.3.10, 2.2.3.4, 2.2.3.4.9, 3.1.5.2, 3.2.5.1.2,
+  3.2.5.1.3, 3.2.5.1.6, 3.2.5.1.8, 3.2.5.1.9, 3.2.5.2.3, 3.2.5.2.5; `[MS-FSA]` 2.1.4.4, 2.1.5.3, 2.1.5.4,
+  2.1.5.15.3, 2.1.5.15.5; `[MS-FSCC]` 2.4.7
 
 ## Reference behaviour
 
@@ -224,6 +268,22 @@ are not. The helper completes the initialization sequence and announces the host
   ("the device is not connected", no IRP after it); see
   [Virtual channels](virtual-channels.md) for the rule that replaced it.
 
+**Measured against the WS2022 test VM (#339, 2026-09-29):**
+
+- On `\\tsclient\justrdp`, `WriteAllText` of a new file, `Rename-Item`, a second
+  `WriteAllText` and `Remove-Item` leave the host's tree with the renamed file holding what
+  was written and neither other file; the server reads the renamed file back. 2 of 2 runs alike.
+- **The server's Set Information classes**: only `FileRenameInformation` (`ReplaceIfExists`
+  0) and `FileDispositionInformation` (delete). Not one end of file, allocation or basic
+  request: those three are proven by unit tests alone.
+- **Writes**: two, each at offset 0 with the whole file (21 and 6 bytes); no append.
+- **A read-only drive's refusal reaches the server's caller**: `WriteAllText` on
+  `\\tsclient\ro`, refused `STATUS_MEDIA_WRITE_PROTECTED` at its Create, throws "쓰기 방지된
+  미디어입니다." (the media is write protected), and the session goes on.
+- The test observes both: with the helper's `FileClosed` always saying `delete: false`, the
+  deleted file stays on the host and the test fails; with the read-only drive writable, the
+  write succeeds and the test fails. 1 run each.
+
 ## Cross-cutting invariants
 
 - [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
@@ -243,6 +303,7 @@ are not. The helper completes the initialization sequence and announces the host
 
 ## Known holes / open
 
-- IRPs: writing (#339) and adding or removing drives during a session (#340). Until then a
-  file can be read but not written.
+- IRPs: adding or removing drives during a session (#340).
+- Set Information's end of file, allocation and basic classes have not been sent by this
+  server; a copy that grows a file in place, or one that keeps its times, may send them.
 - Printer, smartcard, serial and USB redirection are outside #13.
