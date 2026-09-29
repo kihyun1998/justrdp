@@ -9,7 +9,8 @@ as `cliprdr::Clipboard` is: the host feeds it each message received on the chann
 what it returns. Only drives are redirected (#13); printers, smartcards, serial ports and USB
 are not. The helper completes the initialization sequence and announces the host's drives
 (#336), the server can open, describe and list a drive's folders (#337), read its files
-(#338), and write, rename and delete them (#339); adding or removing drives is #340.
+(#338), and write, rename and delete them (#339), and the host adds and removes drives
+during a session (#340).
 
 ## Governing decisions
 
@@ -48,26 +49,62 @@ are not. The helper completes the initialization sequence and announces the host
   covered Write; the alternative shown was leaving it to the host. What they were also shown:
   a zero-length Write still reaches the host, unlike a Read, because 2.1.5.4 refuses a
   read-only volume first.
+- **Answering what the host still owes on a removed drive `STATUS_CANCELLED` was the
+  maintainer's call (2026-09-29, #340)**, shown IronRDP (cancellations before the Remove)
+  and FreeRDP (queued requests discarded with no completion). It covers requests waiting for
+  the host when `remove_drive` runs, not ones arriving after.
+- **Failing a request that arrives for a removed drive was the maintainer's call
+  (2026-09-29, #340)**, made on a measurement: discarded as 3.2.5.2.2 says ("MUST be
+  considered invalid and the request will be discarded"), a Query Information on a file the
+  server still held open crossed the Remove and its caller hung, 2 of 7 runs; answered
+  `STATUS_UNSUCCESSFUL`, 5 of 5 passed, two of them with that same crossing. The
+  alternatives shown were discarding, and failing every unknown device as FreeRDP's
+  `IgnoreInvalidDevices` does, which would also change the 3.1.5.2 rule for devices never
+  announced. **Not covered**: how long to keep answering for a removed ID beyond the next
+  Server Announce or its reuse.
+- **Moving the VM tests' in-memory host into `drive_host` and giving #340 its own test was
+  the maintainer's call (2026-09-29, #340)**; the alternative shown was growing the one
+  list/read/write test further.
 
 ## Design model
 
 - **The sequence** (1.3.1). Server Announce is answered with Client Announce Reply and Client
   Name. Server Core Capability Request is answered at once (3.2.5.1.8) with General and Drive
   capability sets. Server Client ID Confirm must carry the reply's `ClientId` (3.2.5.1.6).
-  Drives are announced once, on User Logged On, as IronRDP and FreeRDP do; 3.2.5.1.9 would
-  also allow announcing earlier.
+  The drives held at User Logged On are announced then, as IronRDP and FreeRDP do; 3.2.5.1.9
+  would also allow announcing earlier.
 - **Version and `ClientId`.** The client sends the highest version it knows (0x0D) not above
   the server's. From server version 12 it echoes the server's `ClientId`; below it, 3.2.5.1.3
   requires a random one, and the sans-IO core has no randomness, so the host passes one to
   `DeviceRedirection::new`, as it passes `LicenseEntropy`.
 - **What is advertised.** `ioCode1` is 0x3FFF: bits 0x1-0x2000 are "Unused, always set"
   (2.2.2.7.1), so they gate nothing, and the two security bits stay clear. `extendedPDU` sets
-  User Logged On and the always-set display-name bit; Device List Remove waits for #340.
+  User Logged On, Device List Remove (since #340) and the always-set display-name bit.
   `ENABLE_ASYNCIO` is not advertised, as in IronRDP, so requests on one file stay sequential.
   No printer, port or smartcard set is sent, which 1.7 reads as not supported.
-- **The server's capability sets are decoded and not read yet.** Its `extendedPDU` Device
-  List Remove bit is what #340 will read before sending a removal; `osType` and `osVersion`
-  are ones 2.2.2.7.1 says to ignore. Nothing else in them changes what this client sends.
+- **Of the server's capability sets, only the General set's `extendedPDU` is read**: its
+  `RDPDR_DEVICE_REMOVE_PDUS` is what allows a removal, and it is forgotten on a new Server
+  Announce. `osType` and `osVersion` are ones 2.2.2.7.1 says to ignore; nothing else in them
+  changes what this client sends.
+- **The host adds and removes drives during a session.** `add_drive` holds a drive to
+  `new`'s rules and a free `device_id`; after User Logged On it announces it at once, alone
+  (3.2.5.1.9), and before it, with the others then, so a helper that began with no drive
+  still announces one. `remove_drive` of an accepted drive answers what the host owes on it
+  `STATUS_CANCELLED`, closes its files for the host (`FileClosed`, with its `delete`), then
+  sends Client Drive Device List Remove (2.2.3.2); both references cancel or discard before
+  removing. A drive whose announcement the server has not answered is removed when the
+  server accepts it, as IronRDP defers it, and forgotten if the server refuses; neither
+  answer reaches the host. A drive never announced, or one the server refused, is dropped
+  with no message. **Removing an announced drive needs the server's
+  `RDPDR_DEVICE_REMOVE_PDUS`**: without it `remove_drive` returns
+  `RemoveError::NotSupported` and nothing changes, as FreeRDP sends a removal only when
+  both sides set the bit. A removed `device_id` may be announced again (2.2.3.2), and a new
+  Server Announce re-announces the drives held then.
+- **A request for a removed drive is failed, not discarded.** The server can send one before
+  it reads the removal, and waits for its completion; the helper keeps the removed IDs until
+  their reuse or a new Server Announce and answers them `STATUS_UNSUCCESSFUL`, a Set
+  Information repeating its `Length`. A request for a device never announced is still
+  ignored (3.1.5.2).
 - **A drive's name** goes in full into `DeviceData` and cut to seven ASCII characters into
   `PreferredDosName`. **`DeviceData` is ASCII, not the UTF-16 2.2.3.1 names**: WS2022 reads
   it as 8-bit characters, so a UTF-16 name registers as its first letter (measured below).
@@ -179,15 +216,16 @@ are not. The helper completes the initialization sequence and announces the host
   gets `STATUS_UNSUCCESSFUL`, which 3.1.5.2 asks for. A failed completion carries the fields
   its response layout has, zeroed: a Create's `FileId` and `Information`, a Write's or
   Directory Control's `Length` and padding, a Close's or Lock's padding, every other known
-  response's `Length`, except Set Information's, which is repeated. An IRP for a device not announced is ignored (3.1.5.2), and one whose
+  response's `Length`, except Set Information's, which is repeated. An IRP for a device
+  never announced is ignored (3.1.5.2), and one whose
   header reads but whose body does not is `STATUS_UNSUCCESSFUL` and the channel goes on.
 - **A message the helper cannot read ends the channel** (3.1.5.2): one that does not decode,
   an unknown `Component` or `PacketId`, or a Client ID Confirm for another `ClientId`. The
   helper reports `Terminated` once and ignores everything after, a new Server Announce
   included; the session goes on, since a static channel cannot be closed alone. A message
   that arrives before Server Announce is skipped instead, which 3.1.5.2 allows.
-- **A later Server Announce starts over** (3.2.5.1.2): the drives are announced again after
-  the next User Logged On.
+- **A later Server Announce starts over** (3.2.5.1.2): the drives held then are announced
+  again after the next User Logged On.
 - **`rdpsnd` must be requested too.** `[MS-RDPEFS]` 2.1 footnote 1: the server does not use
   `rdpdr` unless the client advertises `RDPSND`. Which channels to request is the host's, so
   the helper only says so; nothing has to answer `rdpsnd`.
@@ -198,21 +236,25 @@ are not. The helper completes the initialization sequence and announces the host
   `IoRequest`, `IoBody` (`Read`, `Write` and `SetInformation` among its bodies),
   `SetInformation`, `BasicInformation`, `CreateRequest`, `DeviceAnnounce`, `FileInformation`,
   `VolumeInformation`, `encode_client_announce_reply`, `encode_client_name`,
-  `encode_client_capabilities`, `encode_device_list_announce`, `encode_io_completion`,
+  `encode_client_capabilities`, `encode_device_list_announce`, `encode_device_list_remove`,
+  `encode_io_completion`,
   `encode_file_information`, `encode_volume_information`, `encode_directory_entry`,
   `length_prefixed`, `failure_body`, `is_known_major`, `IO_CODE1_ALWAYS_SET`,
-  `FILE_DELETE_ON_CLOSE`
+  `FILE_DELETE_ON_CLOSE`, `RDPDR_DEVICE_REMOVE_PDUS`, `PAKID_CORE_DEVICELIST_REMOVE`
 - `justrdp/src/rdpdr.rs` — `DeviceRedirection`, `DeviceRedirectionOutput`, `DriveRequest`,
   `Opened`, `OpenKind`, `Disposition`, `WriteOffset`, `DirectoryEntry`, `RespondError`,
   `Drive`,
-  `DriveError`, `channel_def`, `MAX_PENDING_REQUESTS`, `MAX_OPEN_FILES`, `drive_path`,
+  `DriveError`, `RemoveError`, `channel_def`, `MAX_PENDING_REQUESTS`, `MAX_OPEN_FILES`,
+  `drive_path`,
   `matches_pattern`
 - `fuzz/fuzz_targets/rdpdr.rs` — `RdpdrPdu`
 - `justrdp-tokio/src/lib.rs` — `the_device_redirection_handshake_accepts_a_drive_on_the_real_vm`,
-  `the_server_lists_reads_and_writes_a_host_drive_on_the_real_vm`
+  `the_server_lists_reads_and_writes_a_host_drive_on_the_real_vm`,
+  `a_drive_added_and_removed_mid_session_comes_and_goes_on_the_real_vm`, and `drive_host`,
+  the in-memory host both drive tests answer from
 - Spec sections cited inline: `[MS-RDPEFS]` 1.3.1, 1.7, 2.1, 2.2.1.3, 2.2.1.4, 2.2.1.5.1-5,
-  2.2.1.4.3, 2.2.1.4.4, 2.2.1.5.3, 2.2.1.5.4, 2.2.2.3, 2.2.2.7.1, 2.2.3.1, 2.2.3.3.6, 2.2.3.3.8, 2.2.3.3.9, 2.2.3.3.9.1, 2.2.3.3.10, 2.2.3.4, 2.2.3.4.9, 3.1.5.2, 3.2.5.1.2,
-  3.2.5.1.3, 3.2.5.1.6, 3.2.5.1.8, 3.2.5.1.9, 3.2.5.2.3, 3.2.5.2.5; `[MS-FSA]` 2.1.4.4, 2.1.5.3, 2.1.5.4,
+  2.2.1.4.3, 2.2.1.4.4, 2.2.1.5.3, 2.2.1.5.4, 2.2.2.3, 2.2.2.7.1, 2.2.3.1, 2.2.3.2, 2.2.3.3.6, 2.2.3.3.8, 2.2.3.3.9, 2.2.3.3.9.1, 2.2.3.3.10, 2.2.3.4, 2.2.3.4.9, 3.1.5.2, 3.2.5.1.2,
+  3.2.5.1.3, 3.2.5.1.6, 3.2.5.1.8, 3.2.5.1.9, 3.2.5.2.2, 3.2.5.2.3, 3.2.5.2.5, 4.11; `[MS-FSA]` 2.1.4.4, 2.1.5.3, 2.1.5.4,
   2.1.5.15.3, 2.1.5.15.5; `[MS-FSCC]` 2.4.7
 
 ## Reference behaviour
@@ -284,11 +326,30 @@ are not. The helper completes the initialization sequence and announces the host
   deleted file stays on the host and the test fails; with the read-only drive writable, the
   write succeeds and the test fails. 1 run each.
 
+**Measured against the WS2022 test VM (#340, 2026-09-29):**
+
+- A drive added after the desktop is up, to a helper that began with none, is accepted and
+  listed at once (`Test-Path` true on its first try, its file listed). Removed, it is gone on
+  the first check. 5 of 5 runs with the final code; the server advertised
+  `RDPDR_DEVICE_REMOVE_PDUS` (`extendedPDU` 7).
+- **A request crosses the removal on the wire**: after the Remove, exactly one request for
+  the removed drive arrived in each of 15 traced runs, a Create or a Query Information on a file
+  the server still held open. Discarded, the Query Information left its caller waiting
+  forever (2 of 7 runs hung); failed, it did not (5 of 5, then 5 of 5, the crossing Query
+  Information among them).
+- **Without a Remove the server keeps asking**: with the helper's Remove suppressed, 4 and 5
+  requests for the drive arrived after the removal, and PowerShell still reported the drive
+  gone, since the helper failed them. So "gone" on the server cannot tell a removal from a
+  failing drive, and even the error text is the same (`ItemNotFoundException`); the test
+  counts the requests instead, and allows 2.
+- A file the server held open across the removal: its later read is refused by the server
+  itself, with no request sent.
+
 ## Cross-cutting invariants
 
 - [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
   — `extendedPDU`'s User Logged On bit is what makes the server send it, and so what makes
-  the drives be announced; Device List Remove stays clear until #340 implements it.
+  the drives be announced; Device List Remove is set since #340 implements it.
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) — every
   message here is server-supplied; `RdpdrPdu::decode` has a fuzz target and a proptest, and
   a path is decoded from a server-declared length.
@@ -303,7 +364,6 @@ are not. The helper completes the initialization sequence and announces the host
 
 ## Known holes / open
 
-- IRPs: adding or removing drives during a session (#340).
 - Set Information's end of file, allocation and basic classes have not been sent by this
   server; a copy that grows a file in place, or one that keeps its times, may send them.
 - Printer, smartcard, serial and USB redirection are outside #13.

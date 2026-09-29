@@ -4653,14 +4653,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn the_server_lists_reads_and_writes_a_host_drive_on_the_real_vm() {
+        use drive_host::{Host, HostDrive, at};
         use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
         use justrdp::rdpdr::{
-            self, DeviceRedirection, DeviceRedirectionOutput, DirectoryEntry, Disposition, Drive,
-            DriveRequest, FileInformation, OpenKind, Opened, RespondError, VolumeInformation,
-            WriteOffset,
+            self, DeviceRedirection, DeviceRedirectionOutput, Drive, FileInformation,
+            VolumeInformation,
         };
         use justrdp_pdu::cliprdr::{CF_UNICODETEXT, decode_unicode_text};
-        use justrdp_pdu::rdpdr::{FILE_ATTRIBUTE_DIRECTORY, IoBody, RdpdrPdu};
+        use justrdp_pdu::rdpdr::{IoBody, RdpdrPdu};
         use std::collections::HashMap;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
@@ -4681,20 +4681,6 @@ mod tests {
             catch{Set-Clipboard -Value \"listed error $_\"}";
         /// `hello.txt`, twelve bytes of UTF-8.
         const HELLO: &str = "안녕 world";
-        const STATUS_END_OF_FILE: u32 = 0xC000_0011;
-        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
-        const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
-        const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
-        const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
-        const STATUS_FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
-        const STATUS_DIRECTORY_NOT_EMPTY: u32 = 0xC000_0101;
-        const STATUS_MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;
-        /// `FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_WRITE_ATTRIBUTES`, `DELETE` and
-        /// `GENERIC_WRITE`: access a read-only drive refuses.
-        const WRITE_ACCESS: u32 =
-            0x0000_0002 | 0x0000_0004 | 0x0000_0100 | 0x0001_0000 | 0x4000_0000;
-        /// 2026-01-01 as a FILETIME.
-        const T: u64 = 134_116_992_000_000_000;
         const WRITTEN: &str = "written by the server";
 
         /// The writable drive's tree: every path, and what is there.
@@ -4722,312 +4708,6 @@ mod tests {
                     b"inner".to_vec(),
                 ),
             ])
-        }
-
-        fn at(size: u64, directory: bool) -> FileInformation {
-            FileInformation {
-                creation_time: T,
-                last_access_time: T,
-                last_write_time: T,
-                change_time: T,
-                end_of_file: size,
-                allocation_size: size.div_ceil(4096) * 4096,
-                attributes: if directory {
-                    FILE_ATTRIBUTE_DIRECTORY
-                } else {
-                    0x20
-                },
-            }
-        }
-
-        /// One drive the host redirects: its tree, what its files hold, and whether it refuses
-        /// every change.
-        struct HostDrive {
-            read_only: bool,
-            tree: HashMap<Vec<String>, FileInformation>,
-            contents: HashMap<Vec<String>, Vec<u8>>,
-        }
-
-        /// The test's host: its drives by `device_id`, its open files, and what the server asked.
-        #[derive(Default)]
-        struct Host {
-            drives: HashMap<u32, HostDrive>,
-            open: HashMap<u32, (u32, Vec<String>)>,
-            reads: Vec<(u64, u32)>,
-            writes: Vec<(WriteOffset, usize)>,
-            sets: Vec<String>,
-        }
-
-        impl Host {
-            fn answer(
-                &mut self,
-                redirection: &mut DeviceRedirection,
-                completion_id: u32,
-                device_id: u32,
-                request: DriveRequest,
-                volume: &VolumeInformation,
-            ) -> Result<Vec<u8>, RespondError> {
-                let drive = self.drives.get_mut(&device_id).expect("an announced drive");
-                let path_of = |open: &HashMap<u32, (u32, Vec<String>)>, file_id| {
-                    open.get(&file_id)
-                        .map(|(_, p)| p.clone())
-                        .expect("an open file")
-                };
-                match request {
-                    DriveRequest::Open {
-                        file_id,
-                        path,
-                        kind,
-                        disposition,
-                        desired_access,
-                        delete_on_close,
-                    } => {
-                        let exists = drive.tree.get(&path).copied();
-                        let mutates = match disposition {
-                            Disposition::Open => false,
-                            Disposition::OpenIf => exists.is_none(),
-                            _ => true,
-                        } || desired_access & WRITE_ACCESS != 0
-                            || delete_on_close;
-                        let answer = match exists {
-                            _ if drive.read_only && mutates => Err(STATUS_MEDIA_WRITE_PROTECTED),
-                            Some(info) if kind == OpenKind::Directory && !info.is_directory() => {
-                                Err(STATUS_NOT_A_DIRECTORY)
-                            }
-                            Some(info) if kind == OpenKind::File && info.is_directory() => {
-                                Err(STATUS_FILE_IS_A_DIRECTORY)
-                            }
-                            Some(_) if disposition == Disposition::Create => {
-                                Err(STATUS_OBJECT_NAME_COLLISION)
-                            }
-                            Some(info) => {
-                                if !info.is_directory()
-                                    && matches!(
-                                        disposition,
-                                        Disposition::Supersede
-                                            | Disposition::Overwrite
-                                            | Disposition::OverwriteIf
-                                    )
-                                {
-                                    drive.contents.insert(path.clone(), Vec::new());
-                                    drive.tree.insert(path.clone(), at(0, false));
-                                }
-                                Ok(if info.is_directory() {
-                                    Opened::Directory
-                                } else {
-                                    Opened::File
-                                })
-                            }
-                            None if matches!(
-                                disposition,
-                                Disposition::Open | Disposition::Overwrite
-                            ) =>
-                            {
-                                Err(STATUS_OBJECT_NAME_NOT_FOUND)
-                            }
-                            None if !drive
-                                .tree
-                                .get(&path[..path.len().saturating_sub(1)])
-                                .is_some_and(FileInformation::is_directory) =>
-                            {
-                                Err(STATUS_OBJECT_PATH_NOT_FOUND)
-                            }
-                            None => {
-                                let directory = kind == OpenKind::Directory;
-                                drive.tree.insert(path.clone(), at(0, directory));
-                                if !directory {
-                                    drive.contents.insert(path.clone(), Vec::new());
-                                }
-                                Ok(if directory {
-                                    Opened::Directory
-                                } else {
-                                    Opened::File
-                                })
-                            }
-                        };
-                        if answer.is_ok() {
-                            self.open.insert(file_id, (device_id, path));
-                        }
-                        redirection.respond_open(completion_id, answer)
-                    }
-                    DriveRequest::Read {
-                        file_id,
-                        offset,
-                        length,
-                    } => {
-                        self.reads.push((offset, length));
-                        let path = path_of(&self.open, file_id);
-                        let data = drive
-                            .contents
-                            .get(&path)
-                            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
-                            .and_then(|data| {
-                                let from = usize::try_from(offset)
-                                    .ok()
-                                    .filter(|&from| from < data.len())
-                                    .ok_or(STATUS_END_OF_FILE)?;
-                                let to = data.len().min(from + length as usize);
-                                Ok(&data[from..to])
-                            });
-                        redirection.respond_read(completion_id, data)
-                    }
-                    DriveRequest::Write {
-                        file_id,
-                        offset,
-                        data,
-                    } => {
-                        self.writes.push((offset, data.len()));
-                        if drive.read_only {
-                            return redirection
-                                .respond_write(completion_id, Err(STATUS_MEDIA_WRITE_PROTECTED));
-                        }
-                        let path = path_of(&self.open, file_id);
-                        let content = drive.contents.entry(path.clone()).or_default();
-                        let from = match offset {
-                            WriteOffset::At(offset) => offset as usize,
-                            WriteOffset::Append => content.len(),
-                        };
-                        if content.len() < from + data.len() {
-                            content.resize(from + data.len(), 0);
-                        }
-                        content[from..from + data.len()].copy_from_slice(&data);
-                        let size = content.len() as u64;
-                        drive.tree.insert(path, at(size, false));
-                        redirection.respond_write(completion_id, Ok(data.len() as u32))
-                    }
-                    DriveRequest::SetEndOfFile { file_id, size }
-                    | DriveRequest::SetAllocationSize { file_id, size } => {
-                        let end_of_file = matches!(request, DriveRequest::SetEndOfFile { .. });
-                        self.sets.push(format!(
-                            "{} {size}",
-                            if end_of_file {
-                                "end of file"
-                            } else {
-                                "allocation"
-                            }
-                        ));
-                        if drive.read_only {
-                            return redirection
-                                .respond_set(completion_id, Err(STATUS_MEDIA_WRITE_PROTECTED));
-                        }
-                        if end_of_file {
-                            let path = path_of(&self.open, file_id);
-                            drive
-                                .contents
-                                .entry(path.clone())
-                                .or_default()
-                                .resize(size as usize, 0);
-                            drive.tree.insert(path, at(size, false));
-                        }
-                        redirection.respond_set(completion_id, Ok(()))
-                    }
-                    DriveRequest::SetBasic { info, .. } => {
-                        self.sets.push(format!("basic {info:?}"));
-                        let answer = if drive.read_only {
-                            Err(STATUS_MEDIA_WRITE_PROTECTED)
-                        } else {
-                            Ok(())
-                        };
-                        redirection.respond_set(completion_id, answer)
-                    }
-                    DriveRequest::Rename {
-                        file_id,
-                        path: to,
-                        replace_if_exists,
-                    } => {
-                        self.sets
-                            .push(format!("rename to {to:?} replace {replace_if_exists}"));
-                        let from = path_of(&self.open, file_id);
-                        let parent_exists = drive
-                            .tree
-                            .get(&to[..to.len() - 1])
-                            .is_some_and(FileInformation::is_directory);
-                        let answer = if drive.read_only {
-                            Err(STATUS_MEDIA_WRITE_PROTECTED)
-                        } else if drive.tree.contains_key(&to) && !replace_if_exists {
-                            Err(STATUS_OBJECT_NAME_COLLISION)
-                        } else if !parent_exists {
-                            Err(STATUS_OBJECT_PATH_NOT_FOUND)
-                        } else {
-                            let moved = |p: &Vec<String>| {
-                                p.starts_with(&from).then(|| {
-                                    let mut q = to.clone();
-                                    q.extend_from_slice(&p[from.len()..]);
-                                    q
-                                })
-                            };
-                            drive.tree = std::mem::take(&mut drive.tree)
-                                .into_iter()
-                                .map(|(p, i)| (moved(&p).unwrap_or(p), i))
-                                .collect();
-                            drive.contents = std::mem::take(&mut drive.contents)
-                                .into_iter()
-                                .map(|(p, c)| (moved(&p).unwrap_or(p), c))
-                                .collect();
-                            for (_, p) in self.open.values_mut() {
-                                if let Some(q) = moved(p) {
-                                    *p = q;
-                                }
-                            }
-                            Ok(())
-                        };
-                        redirection.respond_set(completion_id, answer)
-                    }
-                    DriveRequest::Delete { file_id, delete } => {
-                        self.sets.push(format!("delete {delete}"));
-                        let path = path_of(&self.open, file_id);
-                        let answer = if drive.read_only {
-                            Err(STATUS_MEDIA_WRITE_PROTECTED)
-                        } else if delete
-                            && drive
-                                .tree
-                                .keys()
-                                .any(|p| p.len() > path.len() && p.starts_with(&path))
-                        {
-                            Err(STATUS_DIRECTORY_NOT_EMPTY)
-                        } else {
-                            Ok(())
-                        };
-                        redirection.respond_set(completion_id, answer)
-                    }
-                    DriveRequest::QueryVolume => {
-                        redirection.respond_volume(completion_id, Ok(volume))
-                    }
-                    DriveRequest::QueryInformation { file_id } => {
-                        let path = path_of(&self.open, file_id);
-                        redirection.respond_information(
-                            completion_id,
-                            drive.tree.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND),
-                        )
-                    }
-                    DriveRequest::ListDirectory { path, .. } => {
-                        let entries = drive
-                            .tree
-                            .iter()
-                            .filter(|(p, _)| {
-                                p.len() == path.len() + 1 && p[..path.len()] == path[..]
-                            })
-                            .map(|(p, info)| DirectoryEntry {
-                                name: p[path.len()].clone(),
-                                info: *info,
-                            })
-                            .collect();
-                        redirection.respond_listing(completion_id, Ok(entries))
-                    }
-                }
-            }
-
-            /// A file closed: forget it, and delete it and what is below it when asked.
-            fn closed(&mut self, file_id: u32, delete: bool) {
-                let Some((device_id, path)) = self.open.remove(&file_id) else {
-                    return;
-                };
-                if delete {
-                    let drive = self.drives.get_mut(&device_id).expect("an announced drive");
-                    drive.tree.retain(|p, _| !p.starts_with(&path));
-                    drive.contents.retain(|p, _| !p.starts_with(&path));
-                }
-            }
         }
 
         with_vm_session(|vm| async move {
@@ -5356,6 +5036,374 @@ mod tests {
                 host.drives[&2].tree.len(),
                 1,
                 "the read-only drive is unchanged"
+            );
+        })
+        .await
+    }
+
+    /// Real-VM acceptance for #340: a drive the host adds once the desktop is up appears on the
+    /// server, and one it removes disappears. The helper starts with no drive at all.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_drive_added_and_removed_mid_session_comes_and_goes_on_the_real_vm() {
+        use drive_host::{Host, HostDrive, at};
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+        use justrdp::rdpdr::{
+            self, DeviceRedirection, DeviceRedirectionOutput, Drive, VolumeInformation,
+        };
+        use justrdp_pdu::cliprdr::{CF_UNICODETEXT, decode_unicode_text};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        /// Waits up to 30 s for the drive, lists it, reports it, then waits up to 30 s for it to
+        /// go and reports whether it went.
+        const SCRIPT: &str = "$n=0;while(!(Test-Path \\\\tsclient\\late) -and $n -lt 60)\
+            {sleep -m 500;$n++};$s=(gci \\\\tsclient\\late -Name -ea SilentlyContinue) -join ',';\
+            $f=[IO.File]::OpenRead('\\\\tsclient\\late\\a.txt');\
+            Set-Clipboard -Value \"late seen $n $s\";$n=0;\
+            while((Test-Path \\\\tsclient\\late) -and $n -lt 60){sleep -m 500;$n++};\
+            $e='read';try{$f.Position=0;$f.ReadByte()|out-null;$f.Length|out-null}catch{$e='refused'};\
+            try{$f.Close()}catch{};\
+            Set-Clipboard -Value \"late gone $(!(Test-Path \\\\tsclient\\late)) $n $e\"";
+        const LATE: u32 = 7;
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![
+                rdpdr::channel_def(),
+                gcc::ChannelDef::new("rdpsnd", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
+                cliprdr::channel_def(),
+            ];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let granted = |name: &str| {
+                outcome
+                    .mcs
+                    .static_channels
+                    .iter()
+                    .find(|c| c.name == name)
+                    .unwrap_or_else(|| panic!("the VM grants {name}"))
+                    .id
+            };
+            let (drive_channel, clip_channel) = (granted("rdpdr"), granted("cliprdr"));
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(4096);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let clipboard_ready = Arc::new(AtomicBool::new(false));
+            let accepted = Arc::new(AtomicBool::new(false));
+            let removed = Arc::new(Mutex::new(None::<Vec<DeviceRedirectionOutput>>));
+            // Requests for the drive after its removal: only ones already in flight when the
+            // server read the Remove, since the server forgets a removed device.
+            let after_removal = Arc::new(AtomicUsize::new(0));
+            let (verdict_tx, mut verdict) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let terminated = Arc::new(AtomicBool::new(false));
+            let redirection = Arc::new(Mutex::new(
+                DeviceRedirection::new("justrdp-test", Vec::new(), 0x5EED_1D00)
+                    .expect("no drive is valid"),
+            ));
+            let host = Arc::new(Mutex::new(Host::default()));
+            host.lock().unwrap().drives.insert(
+                LATE,
+                HostDrive {
+                    read_only: false,
+                    tree: HashMap::from([
+                        (Vec::new(), at(0, true)),
+                        (vec!["a.txt".to_string()], at(3, false)),
+                    ]),
+                    contents: HashMap::from([(vec!["a.txt".to_string()], b"abc".to_vec())]),
+                },
+            );
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let driver = {
+                let (frames, cancel, clipboard_ready, accepted) = (
+                    frames.clone(),
+                    cancel.clone(),
+                    clipboard_ready.clone(),
+                    accepted.clone(),
+                );
+                let (redirection, commands_tx) = (redirection.clone(), commands_tx.clone());
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        let start = tokio::time::Instant::now();
+                        while !clipboard_ready.load(Ordering::SeqCst) {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err("the clipboard never became ready".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        // The desktop is up: the drive arrives mid-session.
+                        let outputs = redirection
+                            .lock()
+                            .unwrap()
+                            .add_drive(Drive {
+                                device_id: LATE,
+                                name: "late".to_string(),
+                            })
+                            .map_err(|e| format!("add_drive: {e:?}"))?;
+                        for output in outputs {
+                            if let DeviceRedirectionOutput::Send(data) = output {
+                                commands_tx
+                                    .send(SessionCommand::ChannelData {
+                                        channel: drive_channel,
+                                        data,
+                                    })
+                                    .await
+                                    .map_err(|_| "the session closed".to_string())?;
+                            }
+                        }
+                        let enter = {
+                            let key = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
+                            vec![key.press(), key.release()]
+                        };
+                        vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        for unit in SCRIPT.encode_utf16() {
+                            input_tx
+                                .send(vec![
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: false,
+                                    },
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: true,
+                                    },
+                                ])
+                                .await
+                                .map_err(|_| "the session closed".to_string())?;
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        input_tx
+                            .send(enter)
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+                        let mut seen = Vec::new();
+                        loop {
+                            let text =
+                                tokio::time::timeout(Duration::from_secs(120), verdict.recv())
+                                    .await
+                                    .map_err(|_| format!("no verdict within 120 s, saw {seen:?}"))?
+                                    .ok_or_else(|| "the session closed".to_string())?;
+                            let done = text.starts_with("late gone");
+                            seen.push(text);
+                            if done {
+                                break;
+                            }
+                        }
+                        if !accepted.load(Ordering::SeqCst) {
+                            return Err("the server never accepted the added drive".to_string());
+                        }
+                        Ok(seen)
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let frames_in_sink = frames.clone();
+            let (terminated_in, clipboard_ready_in, accepted_in, removed_in, after_removal_in) = (
+                terminated.clone(),
+                clipboard_ready.clone(),
+                accepted.clone(),
+                removed.clone(),
+                after_removal.clone(),
+            );
+            let (redirection_in, host_in) = (redirection.clone(), host.clone());
+            let mut clipboard = Clipboard::new();
+            let volume = VolumeInformation {
+                label: "late".to_string(),
+                ..VolumeInformation::default()
+            };
+            let ended = tokio::time::timeout(
+                Duration::from_secs(300),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        let SessionEvent::ChannelData { channel, data } = event else {
+                            return;
+                        };
+                        let send = |channel, data| {
+                            commands_tx
+                                .try_send(SessionCommand::ChannelData { channel, data })
+                                .expect("the command queue has room")
+                        };
+                        let mut redirection = redirection_in.lock().unwrap();
+                        let mut host = host_in.lock().unwrap();
+                        let mut drive_outputs = Vec::new();
+                        if channel == clip_channel {
+                            for output in clipboard
+                                .process(&data)
+                                .expect("the VM's clipboard message decodes")
+                            {
+                                match output {
+                                    ClipboardOutput::Send(data) => send(clip_channel, data),
+                                    ClipboardOutput::FormatListResponse { .. } => {
+                                        clipboard_ready_in.store(true, Ordering::SeqCst);
+                                    }
+                                    ClipboardOutput::RemoteFormatList(formats) => {
+                                        if formats.iter().any(|f| f.id == CF_UNICODETEXT)
+                                            && let Ok(request) = clipboard.request(CF_UNICODETEXT)
+                                        {
+                                            send(clip_channel, request);
+                                        }
+                                    }
+                                    ClipboardOutput::FormatData { data, .. } => {
+                                        let text = decode_unicode_text(&data.unwrap_or_default());
+                                        if text.starts_with("late seen") {
+                                            // The server saw the drive: the host removes it.
+                                            let outputs = redirection
+                                                .remove_drive(LATE)
+                                                .expect("the VM allows removing a drive");
+                                            eprintln!("removed the drive: {outputs:?}");
+                                            *removed_in.lock().unwrap() = Some(outputs.clone());
+                                            drive_outputs.extend(outputs);
+                                        }
+                                        if text.starts_with("late") {
+                                            let _ = verdict_tx.send(text);
+                                        }
+                                    }
+                                    other => eprintln!("clipboard: {other:?}"),
+                                }
+                            }
+                        } else if channel == drive_channel {
+                            drive_outputs = redirection.process(&data);
+                            if let Ok(justrdp_pdu::rdpdr::RdpdrPdu::IoRequest(r)) =
+                                justrdp_pdu::rdpdr::RdpdrPdu::decode(&data)
+                            {
+                                if r.device_id == LATE && removed_in.lock().unwrap().is_some() {
+                                    after_removal_in.fetch_add(1, Ordering::SeqCst);
+                                }
+                                eprintln!(
+                                    "irp device {} cid {} file {} major {} minor {}{}",
+                                    r.device_id,
+                                    r.completion_id,
+                                    r.file_id,
+                                    r.major,
+                                    r.minor,
+                                    if drive_outputs.is_empty() {
+                                        " IGNORED"
+                                    } else {
+                                        ""
+                                    }
+                                );
+                            }
+                        }
+                        for output in drive_outputs {
+                            let answer = match output {
+                                DeviceRedirectionOutput::Send(data) => Some(data),
+                                DeviceRedirectionOutput::DriveAccepted { device_id } => {
+                                    eprintln!("drive {device_id} accepted");
+                                    accepted_in.store(device_id == LATE, Ordering::SeqCst);
+                                    None
+                                }
+                                DeviceRedirectionOutput::DriveRequest {
+                                    completion_id,
+                                    device_id,
+                                    request,
+                                } => Some(
+                                    host.answer(
+                                        &mut redirection,
+                                        completion_id,
+                                        device_id,
+                                        request,
+                                        &volume,
+                                    )
+                                    .expect("the request waits for this answer"),
+                                ),
+                                DeviceRedirectionOutput::FileClosed {
+                                    file_id, delete, ..
+                                } => {
+                                    host.closed(file_id, delete);
+                                    None
+                                }
+                                DeviceRedirectionOutput::Terminated(error) => {
+                                    eprintln!("rdpdr ended: {error}");
+                                    terminated_in.store(true, Ordering::SeqCst);
+                                    None
+                                }
+                                other => {
+                                    eprintln!("rdpdr: {other:?}");
+                                    None
+                                }
+                            };
+                            if let Some(data) = answer {
+                                send(drive_channel, data);
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+            ended
+                .expect("the session ended within 300 s")
+                .expect("the session ran without a protocol failure");
+            let seen = driven.expect("the desktop was driven");
+            eprintln!("verdicts: {seen:?}");
+            assert!(!terminated.load(Ordering::SeqCst), "the channel stayed up");
+            // A removed drive gets only the requests that crossed the removal on the wire.
+            let late_requests = after_removal.load(Ordering::SeqCst);
+            assert!(
+                late_requests <= 2,
+                "the server forgot the removed drive: {late_requests} requests after the removal"
+            );
+            let removal = removed
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the host removed the drive");
+            eprintln!("removal: {removal:?}");
+            assert_eq!(
+                removal.last(),
+                Some(&DeviceRedirectionOutput::Send(
+                    justrdp_pdu::rdpdr::encode_device_list_remove(&[LATE])
+                )),
+                "the removal ends with Device List Remove"
+            );
+            let seen_line = seen
+                .iter()
+                .find(|t| t.starts_with("late seen"))
+                .expect("the server saw the drive");
+            assert!(
+                seen_line.ends_with(" a.txt"),
+                "the added drive lists its file: {seen_line}"
+            );
+            let gone_line = seen.last().expect("a verdict");
+            assert!(
+                gone_line.starts_with("late gone True"),
+                "the removed drive is gone from the server: {gone_line}"
             );
         })
         .await
@@ -6078,6 +6126,338 @@ mod tests {
     /// and sign out"* screen, and that modal then swallowed the input of every later test: one
     /// leftover window read as three or four independent bugs, and the failing set moved between
     /// runs.
+    /// The in-memory host the drive tests redirect: drives by `device_id`, each a tree of
+    /// paths and what its files hold, answering every `DriveRequest` as a file system would.
+    mod drive_host {
+        use justrdp::rdpdr::{
+            DeviceRedirection, DirectoryEntry, Disposition, DriveRequest, FileInformation,
+            OpenKind, Opened, RespondError, VolumeInformation, WriteOffset,
+        };
+        use justrdp_pdu::rdpdr::FILE_ATTRIBUTE_DIRECTORY;
+        use std::collections::HashMap;
+
+        const STATUS_END_OF_FILE: u32 = 0xC000_0011;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+        const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+        const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+        const STATUS_FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
+        const STATUS_DIRECTORY_NOT_EMPTY: u32 = 0xC000_0101;
+        const STATUS_MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;
+        /// `FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_WRITE_ATTRIBUTES`, `DELETE` and
+        /// `GENERIC_WRITE`: access a read-only drive refuses.
+        const WRITE_ACCESS: u32 =
+            0x0000_0002 | 0x0000_0004 | 0x0000_0100 | 0x0001_0000 | 0x4000_0000;
+        /// 2026-01-01 as a FILETIME.
+        const T: u64 = 134_116_992_000_000_000;
+
+        pub(super) fn at(size: u64, directory: bool) -> FileInformation {
+            FileInformation {
+                creation_time: T,
+                last_access_time: T,
+                last_write_time: T,
+                change_time: T,
+                end_of_file: size,
+                allocation_size: size.div_ceil(4096) * 4096,
+                attributes: if directory {
+                    FILE_ATTRIBUTE_DIRECTORY
+                } else {
+                    0x20
+                },
+            }
+        }
+
+        /// One drive the host redirects: its tree, what its files hold, and whether it refuses
+        /// every change.
+        pub(super) struct HostDrive {
+            pub(super) read_only: bool,
+            pub(super) tree: HashMap<Vec<String>, FileInformation>,
+            pub(super) contents: HashMap<Vec<String>, Vec<u8>>,
+        }
+
+        /// The test's host: its drives by `device_id`, its open files, and what the server asked.
+        #[derive(Default)]
+        pub(super) struct Host {
+            pub(super) drives: HashMap<u32, HostDrive>,
+            open: HashMap<u32, (u32, Vec<String>)>,
+            pub(super) reads: Vec<(u64, u32)>,
+            pub(super) writes: Vec<(WriteOffset, usize)>,
+            pub(super) sets: Vec<String>,
+        }
+
+        impl Host {
+            pub(super) fn answer(
+                &mut self,
+                redirection: &mut DeviceRedirection,
+                completion_id: u32,
+                device_id: u32,
+                request: DriveRequest,
+                volume: &VolumeInformation,
+            ) -> Result<Vec<u8>, RespondError> {
+                let drive = self.drives.get_mut(&device_id).expect("an announced drive");
+                let path_of = |open: &HashMap<u32, (u32, Vec<String>)>, file_id| {
+                    open.get(&file_id)
+                        .map(|(_, p)| p.clone())
+                        .expect("an open file")
+                };
+                match request {
+                    DriveRequest::Open {
+                        file_id,
+                        path,
+                        kind,
+                        disposition,
+                        desired_access,
+                        delete_on_close,
+                    } => {
+                        let exists = drive.tree.get(&path).copied();
+                        let mutates = match disposition {
+                            Disposition::Open => false,
+                            Disposition::OpenIf => exists.is_none(),
+                            _ => true,
+                        } || desired_access & WRITE_ACCESS != 0
+                            || delete_on_close;
+                        let answer = match exists {
+                            _ if drive.read_only && mutates => Err(STATUS_MEDIA_WRITE_PROTECTED),
+                            Some(info) if kind == OpenKind::Directory && !info.is_directory() => {
+                                Err(STATUS_NOT_A_DIRECTORY)
+                            }
+                            Some(info) if kind == OpenKind::File && info.is_directory() => {
+                                Err(STATUS_FILE_IS_A_DIRECTORY)
+                            }
+                            Some(_) if disposition == Disposition::Create => {
+                                Err(STATUS_OBJECT_NAME_COLLISION)
+                            }
+                            Some(info) => {
+                                if !info.is_directory()
+                                    && matches!(
+                                        disposition,
+                                        Disposition::Supersede
+                                            | Disposition::Overwrite
+                                            | Disposition::OverwriteIf
+                                    )
+                                {
+                                    drive.contents.insert(path.clone(), Vec::new());
+                                    drive.tree.insert(path.clone(), at(0, false));
+                                }
+                                Ok(if info.is_directory() {
+                                    Opened::Directory
+                                } else {
+                                    Opened::File
+                                })
+                            }
+                            None if matches!(
+                                disposition,
+                                Disposition::Open | Disposition::Overwrite
+                            ) =>
+                            {
+                                Err(STATUS_OBJECT_NAME_NOT_FOUND)
+                            }
+                            None if !drive
+                                .tree
+                                .get(&path[..path.len().saturating_sub(1)])
+                                .is_some_and(FileInformation::is_directory) =>
+                            {
+                                Err(STATUS_OBJECT_PATH_NOT_FOUND)
+                            }
+                            None => {
+                                let directory = kind == OpenKind::Directory;
+                                drive.tree.insert(path.clone(), at(0, directory));
+                                if !directory {
+                                    drive.contents.insert(path.clone(), Vec::new());
+                                }
+                                Ok(if directory {
+                                    Opened::Directory
+                                } else {
+                                    Opened::File
+                                })
+                            }
+                        };
+                        if answer.is_ok() {
+                            self.open.insert(file_id, (device_id, path));
+                        }
+                        redirection.respond_open(completion_id, answer)
+                    }
+                    DriveRequest::Read {
+                        file_id,
+                        offset,
+                        length,
+                    } => {
+                        self.reads.push((offset, length));
+                        let path = path_of(&self.open, file_id);
+                        let data = drive
+                            .contents
+                            .get(&path)
+                            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
+                            .and_then(|data| {
+                                let from = usize::try_from(offset)
+                                    .ok()
+                                    .filter(|&from| from < data.len())
+                                    .ok_or(STATUS_END_OF_FILE)?;
+                                let to = data.len().min(from + length as usize);
+                                Ok(&data[from..to])
+                            });
+                        redirection.respond_read(completion_id, data)
+                    }
+                    DriveRequest::Write {
+                        file_id,
+                        offset,
+                        data,
+                    } => {
+                        self.writes.push((offset, data.len()));
+                        if drive.read_only {
+                            return redirection
+                                .respond_write(completion_id, Err(STATUS_MEDIA_WRITE_PROTECTED));
+                        }
+                        let path = path_of(&self.open, file_id);
+                        let content = drive.contents.entry(path.clone()).or_default();
+                        let from = match offset {
+                            WriteOffset::At(offset) => offset as usize,
+                            WriteOffset::Append => content.len(),
+                        };
+                        if content.len() < from + data.len() {
+                            content.resize(from + data.len(), 0);
+                        }
+                        content[from..from + data.len()].copy_from_slice(&data);
+                        let size = content.len() as u64;
+                        drive.tree.insert(path, at(size, false));
+                        redirection.respond_write(completion_id, Ok(data.len() as u32))
+                    }
+                    DriveRequest::SetEndOfFile { file_id, size }
+                    | DriveRequest::SetAllocationSize { file_id, size } => {
+                        let end_of_file = matches!(request, DriveRequest::SetEndOfFile { .. });
+                        self.sets.push(format!(
+                            "{} {size}",
+                            if end_of_file {
+                                "end of file"
+                            } else {
+                                "allocation"
+                            }
+                        ));
+                        if drive.read_only {
+                            return redirection
+                                .respond_set(completion_id, Err(STATUS_MEDIA_WRITE_PROTECTED));
+                        }
+                        if end_of_file {
+                            let path = path_of(&self.open, file_id);
+                            drive
+                                .contents
+                                .entry(path.clone())
+                                .or_default()
+                                .resize(size as usize, 0);
+                            drive.tree.insert(path, at(size, false));
+                        }
+                        redirection.respond_set(completion_id, Ok(()))
+                    }
+                    DriveRequest::SetBasic { info, .. } => {
+                        self.sets.push(format!("basic {info:?}"));
+                        let answer = if drive.read_only {
+                            Err(STATUS_MEDIA_WRITE_PROTECTED)
+                        } else {
+                            Ok(())
+                        };
+                        redirection.respond_set(completion_id, answer)
+                    }
+                    DriveRequest::Rename {
+                        file_id,
+                        path: to,
+                        replace_if_exists,
+                    } => {
+                        self.sets
+                            .push(format!("rename to {to:?} replace {replace_if_exists}"));
+                        let from = path_of(&self.open, file_id);
+                        let parent_exists = drive
+                            .tree
+                            .get(&to[..to.len() - 1])
+                            .is_some_and(FileInformation::is_directory);
+                        let answer = if drive.read_only {
+                            Err(STATUS_MEDIA_WRITE_PROTECTED)
+                        } else if drive.tree.contains_key(&to) && !replace_if_exists {
+                            Err(STATUS_OBJECT_NAME_COLLISION)
+                        } else if !parent_exists {
+                            Err(STATUS_OBJECT_PATH_NOT_FOUND)
+                        } else {
+                            let moved = |p: &Vec<String>| {
+                                p.starts_with(&from).then(|| {
+                                    let mut q = to.clone();
+                                    q.extend_from_slice(&p[from.len()..]);
+                                    q
+                                })
+                            };
+                            drive.tree = std::mem::take(&mut drive.tree)
+                                .into_iter()
+                                .map(|(p, i)| (moved(&p).unwrap_or(p), i))
+                                .collect();
+                            drive.contents = std::mem::take(&mut drive.contents)
+                                .into_iter()
+                                .map(|(p, c)| (moved(&p).unwrap_or(p), c))
+                                .collect();
+                            for (_, p) in self.open.values_mut() {
+                                if let Some(q) = moved(p) {
+                                    *p = q;
+                                }
+                            }
+                            Ok(())
+                        };
+                        redirection.respond_set(completion_id, answer)
+                    }
+                    DriveRequest::Delete { file_id, delete } => {
+                        self.sets.push(format!("delete {delete}"));
+                        let path = path_of(&self.open, file_id);
+                        let answer = if drive.read_only {
+                            Err(STATUS_MEDIA_WRITE_PROTECTED)
+                        } else if delete
+                            && drive
+                                .tree
+                                .keys()
+                                .any(|p| p.len() > path.len() && p.starts_with(&path))
+                        {
+                            Err(STATUS_DIRECTORY_NOT_EMPTY)
+                        } else {
+                            Ok(())
+                        };
+                        redirection.respond_set(completion_id, answer)
+                    }
+                    DriveRequest::QueryVolume => {
+                        redirection.respond_volume(completion_id, Ok(volume))
+                    }
+                    DriveRequest::QueryInformation { file_id } => {
+                        let path = path_of(&self.open, file_id);
+                        redirection.respond_information(
+                            completion_id,
+                            drive.tree.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND),
+                        )
+                    }
+                    DriveRequest::ListDirectory { path, .. } => {
+                        let entries = drive
+                            .tree
+                            .iter()
+                            .filter(|(p, _)| {
+                                p.len() == path.len() + 1 && p[..path.len()] == path[..]
+                            })
+                            .map(|(p, info)| DirectoryEntry {
+                                name: p[path.len()].clone(),
+                                info: *info,
+                            })
+                            .collect();
+                        redirection.respond_listing(completion_id, Ok(entries))
+                    }
+                }
+            }
+
+            /// A file closed: forget it, and delete it and what is below it when asked.
+            pub(super) fn closed(&mut self, file_id: u32, delete: bool) {
+                let Some((device_id, path)) = self.open.remove(&file_id) else {
+                    return;
+                };
+                if delete {
+                    let drive = self.drives.get_mut(&device_id).expect("an announced drive");
+                    drive.tree.retain(|p, _| !p.starts_with(&path));
+                    drive.contents.retain(|p, _| !p.starts_with(&path));
+                }
+            }
+        }
+    }
+
     mod vm {
         use super::*;
         use std::any::Any;

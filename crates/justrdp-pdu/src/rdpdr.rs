@@ -23,6 +23,8 @@ pub const PAKID_CORE_CLIENTID_CONFIRM: u16 = 0x4343;
 pub const PAKID_CORE_CLIENT_NAME: u16 = 0x434E;
 /// `PAKID_CORE_DEVICELIST_ANNOUNCE` (2.2.2.9).
 pub const PAKID_CORE_DEVICELIST_ANNOUNCE: u16 = 0x4441;
+/// `PAKID_CORE_DEVICELIST_REMOVE`: Client Drive Device List Remove (2.2.3.2).
+pub const PAKID_CORE_DEVICELIST_REMOVE: u16 = 0x444D;
 /// `PAKID_CORE_DEVICE_REPLY`: Server Device Announce Response (2.2.2.1).
 pub const PAKID_CORE_DEVICE_REPLY: u16 = 0x6472;
 /// `PAKID_CORE_DEVICE_IOREQUEST` (2.2.1.4).
@@ -47,6 +49,8 @@ pub const DRIVE_CAPABILITY_VERSION_02: u32 = 0x0000_0002;
 
 /// `ioCode1` bits 0x1 through 0x2000, which 2.2.2.7.1 marks "Unused, always set".
 pub const IO_CODE1_ALWAYS_SET: u32 = 0x0000_3FFF;
+/// `extendedPDU`: the client may send Client Drive Device List Remove (2.2.2.7.1).
+pub const RDPDR_DEVICE_REMOVE_PDUS: u32 = 0x0000_0001;
 /// `extendedPDU`: `RDPDR_CLIENT_DISPLAY_NAME_PDU`, "Unused, always set" (2.2.2.7.1).
 pub const RDPDR_CLIENT_DISPLAY_NAME_PDU: u32 = 0x0000_0002;
 /// `extendedPDU`: the server may send User Logged On (2.2.2.7.1).
@@ -710,6 +714,16 @@ pub fn encode_client_capabilities(sets: &[CapabilitySet]) -> Vec<u8> {
     out
 }
 
+/// A Client Drive Device List Remove (2.2.3.2) for `device_ids`.
+pub fn encode_device_list_remove(device_ids: &[u32]) -> Vec<u8> {
+    let mut out = with_header(PAKID_CORE_DEVICELIST_REMOVE, 4 + 4 * device_ids.len());
+    out.extend_from_slice(&(device_ids.len() as u32).to_le_bytes());
+    for id in device_ids {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
 /// A Client Device List Announce Request (2.2.2.9). The devices follow each other with no
 /// padding.
 pub fn encode_device_list_announce(devices: &[DeviceAnnounce]) -> Vec<u8> {
@@ -1068,6 +1082,17 @@ mod tests {
             0x00, 0x00,
         ];
         assert!(RdpdrPdu::decode(&message).is_err());
+    }
+
+    /// `[MS-RDPEFS]` 4.11.
+    #[test]
+    fn the_spec_device_list_remove_encodes() {
+        assert_eq!(
+            encode_device_list_remove(&[1]),
+            [
+                0x72, 0x44, 0x4d, 0x44, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00
+            ]
+        );
     }
 
     #[test]
