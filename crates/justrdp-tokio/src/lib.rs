@@ -26,7 +26,7 @@ use std::time::Duration;
 use justrdp::{
     Action, ActivationResult, ConnectConfig, ConnectError, ConnectStateMachine, CursorEvent,
     DisconnectReason, Event, FrameUpdate, Framebuffer, InputEvent, LicenseEntropy,
-    McsConnectResult, SessionError, SessionOutput, SessionStateMachine,
+    McsConnectResult, ResizeRequest, SessionError, SessionOutput, SessionStateMachine,
 };
 use rustls::pki_types::ServerName;
 use sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, TsRequest};
@@ -892,16 +892,12 @@ pub enum SessionCommand {
     /// Encode and send a batch of input events (the [`run_session_with_input`] semantics).
     Input(Vec<InputEvent>),
     /// Request a client-initiated desktop resize via the Display Control channel
-    /// (MS-RDPEDISP). Valid once [`SessionEvent::DisplayControlReady`] has fired; a request
-    /// the machine refuses ([`justrdp::ResizeError`]) is logged and dropped — the session
-    /// keeps running and the host may retry. The server answers with
-    /// Deactivation–Reactivation; the new size shows up as a full-screen frame update.
-    Resize {
-        /// Requested desktop width (odd values are rounded down — the spec forbids them).
-        width: u16,
-        /// Requested desktop height.
-        height: u16,
-    },
+    /// (MS-RDPEDISP): the size, scale factors and orientation in the [`ResizeRequest`]. Valid
+    /// once [`SessionEvent::DisplayControlReady`] has fired; a request the machine refuses
+    /// ([`justrdp::ResizeError`]) is logged and dropped — the session keeps running and the
+    /// host may retry. The server answers with Deactivation–Reactivation; the new size shows up
+    /// as a full-screen frame update.
+    Resize(ResizeRequest),
     /// Ask the server to end the session — the Shutdown Request PDU (MS-RDPBCGR 2.2.2.1,
     /// issue #228). The server decides: a refusal arrives as
     /// [`SessionEvent::ShutdownDenied`] and leaves the session running, a grant arrives as
@@ -1063,10 +1059,16 @@ pub async fn run_session_with_commands(
                             write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
                         }
                     }
-                    Some(SessionCommand::Resize { width, height }) => {
-                        match machine.request_resize(width, height) {
+                    Some(SessionCommand::Resize(request)) => {
+                        let (width, height) = (request.width, request.height);
+                        match machine.request_resize(request) {
                             Ok(frames) => {
-                                tracing::info!(width, height, "resize requested");
+                                tracing::info!(
+                                    width,
+                                    height,
+                                    desktop_scale_factor = request.desktop_scale_factor,
+                                    "resize requested"
+                                );
                                 for frame in frames {
                                     write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
                                 }
@@ -7929,12 +7931,9 @@ mod tests {
 
         let (tx, mut commands) = tokio::sync::mpsc::channel(4);
         // A resize before DisplayControlReady: refused (warn + drop), session keeps running.
-        tx.send(SessionCommand::Resize {
-            width: 1024,
-            height: 768,
-        })
-        .await
-        .unwrap();
+        tx.send(SessionCommand::Resize(ResizeRequest::new(1024, 768)))
+            .await
+            .unwrap();
         let cancel = CancellationToken::new();
         let canceller = cancel.clone();
         tokio::spawn(async move {
@@ -9588,6 +9587,260 @@ mod tests {
         .await;
     }
 
+    /// Real-VM acceptance for #356: a resize at 150 percent is honoured. PowerShell reads the
+    /// primary monitor's effective DPI, per-monitor aware, and copies it; the host reads it over
+    /// the clipboard before and after a Monitor Layout carrying `DesktopScaleFactor` 150.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_resize_at_150_percent_changes_the_server_dpi_on_the_real_vm() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+        use justrdp::{DeviceScaleFactor, ResizeRequest};
+        use justrdp_pdu::cliprdr::{CF_UNICODETEXT, decode_unicode_text};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        /// Defines `d`, which copies `dpi=<x>` for the monitor at the origin.
+        const DEFINE: &str = "Add-Type -Namespace W -Name U -MemberDefinition '\
+            [DllImport(\"user32.dll\")] public static extern \
+            IntPtr SetThreadDpiAwarenessContext(IntPtr c);\
+            [DllImport(\"user32.dll\")] public static extern \
+            IntPtr MonitorFromPoint(long p, uint f);\
+            [DllImport(\"shcore.dll\")] public static extern \
+            int GetDpiForMonitor(IntPtr m, int t, out uint x, out uint y);';\
+            function d{[W.U]::SetThreadDpiAwarenessContext([IntPtr]-4)|out-null;\
+            $x=0;$y=0;[W.U]::GetDpiForMonitor([W.U]::MonitorFromPoint(0,1),0,[ref]$x,[ref]$y)|out-null;\
+            Set-Clipboard \"dpi=$x\"}";
+        const TARGET: (u16, u16) = (1280, 1024);
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![
+                cliprdr::channel_def(),
+                gcc::ChannelDef::new("drdynvc", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
+            ];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let channel = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "cliprdr")
+                .expect("the VM grants cliprdr")
+                .id;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            assert_ne!(desktop, TARGET, "the resize must change the size");
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(64);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let clipboard = Arc::new(Mutex::new(Clipboard::new()));
+            let handshake_done = Arc::new(AtomicBool::new(false));
+            let display_ready = Arc::new(AtomicBool::new(false));
+            let resized = Arc::new(AtomicBool::new(false));
+            let (texts_tx, mut texts) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let driver = {
+                let (frames, cancel, handshake_done, display_ready, resized) = (
+                    frames.clone(),
+                    cancel.clone(),
+                    handshake_done.clone(),
+                    display_ready.clone(),
+                    resized.clone(),
+                );
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        let start = tokio::time::Instant::now();
+                        while !handshake_done.load(Ordering::SeqCst)
+                            || !display_ready.load(Ordering::SeqCst)
+                        {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err(
+                                    "the clipboard or Display Control never came up".to_string()
+                                );
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        let enter = {
+                            let key = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
+                            vec![key.press(), key.release()]
+                        };
+                        let type_line = |line: &str| {
+                            let (input_tx, enter, units) = (
+                                input_tx.clone(),
+                                enter.clone(),
+                                line.encode_utf16().collect::<Vec<_>>(),
+                            );
+                            async move {
+                                for unit in units {
+                                    input_tx
+                                        .send(vec![
+                                            InputEvent::Unicode {
+                                                code_unit: unit,
+                                                release: false,
+                                            },
+                                            InputEvent::Unicode {
+                                                code_unit: unit,
+                                                release: true,
+                                            },
+                                        ])
+                                        .await
+                                        .map_err(|_| "the session closed".to_string())?;
+                                    tokio::time::sleep(Duration::from_millis(15)).await;
+                                }
+                                input_tx
+                                    .send(enter)
+                                    .await
+                                    .map_err(|_| "the session closed".to_string())
+                            }
+                        };
+                        async fn next_dpi(
+                            texts: &mut tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+                        ) -> Result<String, String> {
+                            loop {
+                                let text =
+                                    tokio::time::timeout(Duration::from_secs(60), texts.recv())
+                                        .await
+                                        .map_err(|_| {
+                                            "no DPI reached the host within 60 s".to_string()
+                                        })?
+                                        .ok_or_else(|| "the session closed".to_string())?
+                                        .ok_or_else(|| {
+                                            "the server failed the request".to_string()
+                                        })?;
+                                if let Some(dpi) = text.strip_prefix("dpi=") {
+                                    return Ok(dpi.trim().to_string());
+                                }
+                            }
+                        }
+
+                        vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        type_line(DEFINE).await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        type_line("d").await?;
+                        let before = next_dpi(&mut texts).await?;
+
+                        let request = ResizeRequest::new(TARGET.0, TARGET.1)
+                            .with_scale(150, DeviceScaleFactor::Percent100);
+                        commands_tx
+                            .send(SessionCommand::Resize(request))
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+                        let start = tokio::time::Instant::now();
+                        while !resized.load(Ordering::SeqCst) {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err("no full frame at the new size within 30 s".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        type_line("d").await?;
+                        let after = next_dpi(&mut texts).await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        Ok((before, after))
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let frames_in_sink = frames.clone();
+            let resized_in_sink = resized.clone();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(240),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |frame, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                        if (frame.x, frame.y, frame.width, frame.height)
+                            == (0, 0, TARGET.0, TARGET.1)
+                        {
+                            resized_in_sink.store(true, Ordering::SeqCst);
+                        }
+                    },
+                    |_| {},
+                    |event| match event {
+                        SessionEvent::DisplayControlReady => {
+                            display_ready.store(true, Ordering::SeqCst);
+                        }
+                        SessionEvent::ChannelData { channel: on, data } => {
+                            assert_eq!(on, channel, "only cliprdr is a host channel");
+                            let mut clipboard = clipboard.lock().unwrap();
+                            let outputs = clipboard
+                                .process(&data)
+                                .expect("the VM's clipboard message decodes");
+                            let send = |data: Vec<u8>| {
+                                commands_tx
+                                    .try_send(SessionCommand::ChannelData { channel, data })
+                                    .expect("the command queue has room")
+                            };
+                            for output in outputs {
+                                match output {
+                                    ClipboardOutput::Send(data) => send(data),
+                                    ClipboardOutput::FormatListResponse { .. } => {
+                                        handshake_done.store(true, Ordering::SeqCst);
+                                    }
+                                    ClipboardOutput::RemoteFormatList(formats) => {
+                                        if formats.iter().any(|f| f.id == CF_UNICODETEXT)
+                                            && let Ok(request) = clipboard.request(CF_UNICODETEXT)
+                                        {
+                                            send(request);
+                                        }
+                                    }
+                                    ClipboardOutput::FormatData { data, .. } => {
+                                        let _ =
+                                            texts_tx.send(data.map(|d| decode_unicode_text(&d)));
+                                    }
+                                    other => panic!("nothing else was asked for: {other:?}"),
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+            ended
+                .expect("the session ended within 240 s")
+                .expect("the session ran without a protocol failure");
+            let (before, after) = driven.expect("the desktop was driven");
+            eprintln!("#356: effective DPI {before} before, {after} after the 150% resize");
+            assert_eq!(
+                (before.as_str(), after.as_str()),
+                ("96", "144"),
+                "150 percent is 144 DPI"
+            );
+        })
+        .await
+    }
+
     /// Real-VM acceptance test for slice-8: drdynvc + Display Control resize. Connect with
     /// the `drdynvc` static channel (EGFX gate flag deliberately **off**, so graphics stay on
     /// the proven bitmap path), wait for the server to negotiate drdynvc caps, create the
@@ -9661,10 +9914,9 @@ mod tests {
                     "milestone: DisplayControlReady (drdynvc caps + create + EDISP caps done)"
                 );
                 ready_in_event.store(true, Ordering::SeqCst);
-                tx.try_send(SessionCommand::Resize {
-                    width: target.0,
-                    height: target.1,
-                })
+                tx.try_send(SessionCommand::Resize(ResizeRequest::new(
+                    target.0, target.1,
+                )))
                 .expect("queue the resize command");
                 eprintln!(
                     "milestone: Monitor Layout resize to {}x{} queued",
