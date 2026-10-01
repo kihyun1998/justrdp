@@ -29,6 +29,13 @@ pub const ADVERTISED_FLAGS: u32 = CB_USE_LONG_FORMAT_NAMES
     | CB_CAN_LOCK_CLIPDATA
     | CB_HUGE_FILE_SUPPORT_ENABLED;
 
+/// The `generalFlags` of file transfer: [`ADVERTISED_FLAGS`] less these is what
+/// [`Clipboard::without_file_transfer`] advertises.
+pub const FILE_TRANSFER_FLAGS: u32 = CB_STREAM_FILECLIP_ENABLED
+    | CB_FILECLIP_NO_FILE_PATHS
+    | CB_CAN_LOCK_CLIPDATA
+    | CB_HUGE_FILE_SUPPORT_ENABLED;
+
 /// The most server locks kept at once; a Lock Clipboard Data past it is not kept.
 pub const MAX_SERVER_LOCKS: usize = 100;
 
@@ -235,6 +242,8 @@ struct AnnouncedList {
 /// The client side of one clipboard channel.
 #[derive(Debug, Clone, Default)]
 pub struct Clipboard {
+    /// The host chose not to offer file transfer.
+    without_file_transfer: bool,
     server_flags: u32,
     general_flags: u32,
     ready: bool,
@@ -267,9 +276,19 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    /// A clipboard waiting for the server's Monitor Ready.
+    /// A clipboard waiting for the server's Monitor Ready, offering file transfer.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A clipboard waiting for the server's Monitor Ready that does not offer file transfer:
+    /// none of [`FILE_TRANSFER_FLAGS`] is advertised, so the file operations report
+    /// `NotNegotiated` as they do against a server without streaming.
+    pub fn without_file_transfer() -> Self {
+        Self {
+            without_file_transfer: true,
+            ..Self::default()
+        }
     }
 
     /// The `generalFlags` both sides advertised, zero until the server's Monitor Ready.
@@ -763,6 +782,7 @@ impl Clipboard {
                 let mut local_formats = core::mem::take(&mut self.local_formats);
                 local_formats.retain(|f| Some(f.id) != self.local_file_list_format);
                 *self = Self {
+                    without_file_transfer: self.without_file_transfer,
                     server_flags: self.server_flags,
                     local_formats,
                     last_clip_data_id: self.last_clip_data_id,
@@ -770,7 +790,12 @@ impl Clipboard {
                     last_list_id: self.last_list_id,
                     ..Self::default()
                 };
-                self.general_flags = ADVERTISED_FLAGS & self.server_flags;
+                let advertised = if self.without_file_transfer {
+                    ADVERTISED_FLAGS & !FILE_TRANSFER_FLAGS
+                } else {
+                    ADVERTISED_FLAGS
+                };
+                self.general_flags = advertised & self.server_flags;
                 self.ready = true;
                 let caps = pdu::encode_capabilities(GeneralCapability {
                     version: CB_CAPS_VERSION_2,
@@ -2389,5 +2414,73 @@ mod tests {
         let neither = [0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert!(clipboard.process(&neither).is_err());
         assert_eq!(clipboard.held_locks, vec![1]);
+    }
+
+    /// Issue #355: with file transfer off, the Capabilities carry none of the file flags, only
+    /// long names; with it on, the bytes are those `new` always sent.
+    #[test]
+    fn file_transfer_off_advertises_no_file_flags() {
+        let mut off = Clipboard::without_file_transfer();
+        off.process(&VM_SERVER_CAPS).unwrap();
+        let outputs = off.process(&VM_MONITOR_READY).unwrap();
+        assert_eq!(sent(&outputs)[0], caps_with(CB_USE_LONG_FORMAT_NAMES));
+        assert_eq!(off.general_flags(), CB_USE_LONG_FORMAT_NAMES);
+        assert_eq!(FILE_TRANSFER_FLAGS & CB_USE_LONG_FORMAT_NAMES, 0);
+        assert_eq!(
+            ADVERTISED_FLAGS & !FILE_TRANSFER_FLAGS,
+            CB_USE_LONG_FORMAT_NAMES
+        );
+
+        let mut on = Clipboard::new();
+        on.process(&VM_SERVER_CAPS).unwrap();
+        assert_eq!(
+            sent(&on.process(&VM_MONITOR_READY).unwrap())[0],
+            caps_with(0x3e)
+        );
+    }
+
+    /// With file transfer off, every file operation behaves as against a server that did not
+    /// advertise streaming.
+    #[test]
+    fn file_transfer_off_behaves_as_a_server_without_streaming() {
+        let mut off = Clipboard::without_file_transfer();
+        off.process(&caps_with(0xFFFF_FFFF)).unwrap();
+        off.process(&VM_MONITOR_READY).unwrap();
+        let mut unoffered = Clipboard::new();
+        unoffered
+            .process(&caps_with(CB_USE_LONG_FORMAT_NAMES))
+            .unwrap();
+        unoffered.process(&VM_MONITOR_READY).unwrap();
+
+        for clipboard in [&mut off, &mut unoffered] {
+            assert_eq!(
+                clipboard.announce_files(host_files(), Vec::new()),
+                Err(FileAnnounceError::NotNegotiated)
+            );
+            assert_eq!(
+                clipboard.request_file_contents(0, FileContentsOp::Size, None),
+                Err(FileRequestError::NotNegotiated)
+            );
+            assert_eq!(
+                clipboard
+                    .process(&server_asks(7, 0, FileContentsOp::Size, None))
+                    .unwrap(),
+                vec![ClipboardOutput::Send(pdu::encode_file_contents_response(
+                    7, None
+                ))]
+            );
+        }
+        assert_eq!(off.general_flags(), unoffered.general_flags());
+    }
+
+    /// A new initialization sequence keeps the host's choice.
+    #[test]
+    fn file_transfer_off_survives_a_second_monitor_ready() {
+        let mut clipboard = Clipboard::without_file_transfer();
+        clipboard.process(&VM_SERVER_CAPS).unwrap();
+        clipboard.process(&VM_MONITOR_READY).unwrap();
+        let outputs = clipboard.process(&VM_MONITOR_READY).unwrap();
+        assert_eq!(sent(&outputs)[0], caps_with(CB_USE_LONG_FORMAT_NAMES));
+        assert_eq!(clipboard.general_flags(), CB_USE_LONG_FORMAT_NAMES);
     }
 }

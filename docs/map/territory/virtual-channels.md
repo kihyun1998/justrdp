@@ -19,6 +19,9 @@ initialization sequence as a helper the host drives over that seam (`justrdp::cl
   (reset, then what) belongs to #272, which made the graphics processor take the 3.3.5.19
   reset for a semantic miss instead of returning an error (2026-09-17 amendment). Before it,
   no ADR was about channels.
+- [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md) — of the channel flags, only the
+  clipboard's file transfer is a policy flag and so the host's (#355); every other
+  `generalFlags` bit, and every rdpdr General bit, stays the core's.
 
 Adjacent but not governing: `CONTEXT.md` defines **Virtual Channel** in the
 glossary, which is vocabulary rather than a decision.
@@ -219,6 +222,20 @@ glossary, which is vocabulary rather than a decision.
   (`cliprdr_client_capabilities`). With no server Capabilities before Monitor Ready the
   server's flags are zero, which `[MS-RDPECLIP]` 2.2.2.1.1.1 makes a MUST and FreeRDP
   follows (`cliprdr_process_monitor_ready`), so short names are used.
+- **Whether file transfer is offered is the host's** (#355, [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md)
+  Decision 2). `Clipboard::without_file_transfer()` advertises `ADVERTISED_FLAGS` less
+  `FILE_TRANSFER_FLAGS`, which leaves long names alone; `Clipboard::new()` is unchanged. The
+  choice outlives a new Monitor Ready. With it off, every file operation behaves as against a
+  server without streaming. **All four file flags go together, a derivation**: 2.2.2.1.1.1 ties
+  each to file streams (`CB_CAN_LOCK_CLIPDATA` locks *"File Stream data"*), IronRDP lets the
+  backend choose exactly those four, and FreeRDP advertises `STREAM|NO_FILE_PATHS|HUGE` as one
+  unit, only when its file context is available (`cliprdr_file_context_current_flags`; it
+  never advertises locking). The cost of being wrong is only a flag the server reads as "no
+  file streams" either way. **Measured against the VM** (2026-10-01): a file copied by
+  `Set-Clipboard -Path` is announced as three **empty** Format Lists with file transfer off,
+  and as `FileGroupDescriptorW`, `FileContents` and `Preferred DropEffect` with it on; text
+  crosses both ways with it off
+  (`a_clipboard_without_file_transfer_is_offered_no_files_on_the_real_vm`).
   **The initial Format List holds what the
   host announced before Monitor Ready, and nothing by default**, as FreeRDP's was against the
   VM. Every format announced entitles the server to a Format Data Request, which the host now
@@ -416,7 +433,8 @@ glossary, which is vocabulary rather than a decision.
   `is_contained_file_name`, `FILE_NAME_MAX_UNITS`
 - `justrdp/src/cliprdr.rs` — `Clipboard`, `ClipboardOutput`, `RequestError`,
   `FileRequestError`, `Announcement`, `FileAnnounceError`, `FileRespondError`, `channel_def`,
-  `CHANNEL_OPTIONS`, `ADVERTISED_FLAGS`, `MAX_SERVER_LOCKS`, `MAX_PENDING_SERVER_REQUESTS`
+  `CHANNEL_OPTIONS`, `ADVERTISED_FLAGS`, `FILE_TRANSFER_FLAGS`, `Clipboard::without_file_transfer`,
+  `MAX_SERVER_LOCKS`, `MAX_PENDING_SERVER_REQUESTS`
 - Spec sections cited inline: `[MS-RDPBCGR]` 1.3.3, 2.2.6.1.1, 3.1.5.2.1, 3.1.5.2.2;
   `[MS-RDPEDYC]` 1.7, 2.2.2.2, 2.2.3.3, 2.2.3.4, 3.2;
   `[MS-RDPEDISP]` 1.3,
