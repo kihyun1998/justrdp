@@ -21,8 +21,8 @@ use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::input::InputEvent;
 use justrdp_pdu::pointer::PointerUpdate;
 use justrdp_pdu::{
-    displaycontrol, dvc, fastpath, finalization, input, mcs, pointer, session_info, share, svc,
-    tpkt, update, x224,
+    displaycontrol, dvc, fastpath, finalization, input, mcs, pointer, session_info, share, sound,
+    svc, tpkt, update, x224,
 };
 
 /// Everything the session machine needs from the completed connect sequence: channel
@@ -87,6 +87,9 @@ pub enum SessionOutput {
     /// the bits of [`InputEvent::Sync`]. What the host does with it (LEDs, a status display,
     /// nothing) is the host's.
     KeyboardIndicators(input::KeyboardIndicators),
+    /// The server asked for a beep — `[MS-RDPBCGR]` 2.2.9.1.1.5 (issue #354), the PDU the
+    /// default Sound capability set invites. Whether and how it sounds is the host's.
+    PlaySound(sound::PlaySound),
     /// One whole message on a static channel the host requested (issue #307), reassembled
     /// from its chunks (`[MS-RDPBCGR]` 3.1.5.2.2). What the bytes mean is the host's.
     ChannelData {
@@ -869,10 +872,23 @@ impl SessionStateMachine {
                 outputs.push(SessionOutput::KeyboardIndicators(indicators));
                 Ok(())
             }
+            share::PDU_TYPE2_PLAY_SOUND => {
+                // The beep the default Sound set invites (issue #354). No phase guard, as for
+                // Set Keyboard Indicators.
+                let beep = sound::PlaySound::decode(cur).map_err(SessionError::Decode)?;
+                tracing::debug!(
+                    target: "rdp_play_sound",
+                    duration = beep.duration,
+                    frequency = beep.frequency,
+                    "server Play Sound"
+                );
+                outputs.push(SessionOutput::PlaySound(beep));
+                Ok(())
+            }
             // The rest: skipped, cursor unread, until their epics. (Set Error Info, the
-            // reactivation Synchronize/Control, Save Session Info and Set Keyboard Indicators
-            // have their own arms above — this comment used to claim the first two, and to
-            // call the skip a decode; #252.)
+            // reactivation Synchronize/Control, Save Session Info, Set Keyboard Indicators and
+            // Play Sound have their own arms above — this comment used to claim the first two,
+            // and to call the skip a decode; #252.)
             _ => Ok(()),
         }
     }
@@ -1556,6 +1572,19 @@ mod tests {
                 input::KeyboardIndicators { led_flags: 0x0004 }
             )]
         );
+        let outputs = sm
+            .process_bytes(&server_data_pdu(
+                share::PDU_TYPE2_PLAY_SOUND,
+                &[0x2C, 0x01, 0, 0, 0x20, 0x03, 0, 0],
+            ))
+            .expect("a well-formed Play Sound decodes");
+        assert_eq!(
+            outputs,
+            vec![SessionOutput::PlaySound(sound::PlaySound {
+                duration: 300,
+                frequency: 800
+            })]
+        );
     }
 
     /// Issue #305: the server's lock state reaches the host, one output per PDU, as sent.
@@ -1581,6 +1610,43 @@ mod tests {
             );
         }
         assert_eq!(sm.phase, Phase::Active);
+    }
+
+    /// Issue #354: the beep the default Sound set invites reaches the host, as sent.
+    #[test]
+    fn play_sound_surfaces_the_beep() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        for (duration, frequency) in [(300u32, 800u32), (0, 0), (u32::MAX, 37)] {
+            let mut body = duration.to_le_bytes().to_vec();
+            body.extend_from_slice(&frequency.to_le_bytes());
+            let outputs = sm
+                .process_bytes(&server_data_pdu(share::PDU_TYPE2_PLAY_SOUND, &body))
+                .expect("a well-formed Play Sound decodes");
+            assert_eq!(
+                outputs,
+                vec![SessionOutput::PlaySound(sound::PlaySound {
+                    duration,
+                    frequency
+                })],
+                "duration {duration}, frequency {frequency}"
+            );
+        }
+        assert_eq!(sm.phase, Phase::Active);
+    }
+
+    #[test]
+    fn a_truncated_play_sound_is_a_typed_error() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let result = sm.process_bytes(&server_data_pdu(
+            share::PDU_TYPE2_PLAY_SOUND,
+            &[0x2C, 0x01, 0, 0, 0x20, 0x03, 0],
+        ));
+        assert!(
+            matches!(result, Err(SessionError::Decode(_))),
+            "got {result:?}"
+        );
     }
 
     #[test]

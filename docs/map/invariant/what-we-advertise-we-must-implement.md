@@ -53,6 +53,9 @@ about what we owe; both start at the same bytes.
   capability version ladder and the scaled map-surface obligation.
 - [Capability exchange & activation](../territory/capability-exchange-activation.md) — where
   the Confirm Active capability sets are built, and the general form of the rule.
+- [Session loop & PDU dispatch](../territory/session-loop-dispatch.md) — the `pduType2`
+  catch-all is where an advertised-for message goes unhandled without an error; the Play Sound
+  PDU the default Sound set invites sat in it until #354.
 - [Device redirection](../territory/device-redirection.md) — `extendedPDU`'s User Logged On
   bit is what makes the server send it, and so what makes drives be announced (#336).
 - [Virtual channels](../territory/virtual-channels.md) — `VCCAPS_NO_COMPR`, the dynamic
@@ -110,6 +113,13 @@ rather than by capability:
   went in, but 1.7 has it imply AVC444v2, and its reserved bytes cannot carry `AVC_DISABLED`. The
   obligation lived in the **overview**, not in the section listing obligations, and ordering hid it:
   no server picks 10.1 while 10.2+ sit beside it. Now left out.
+
+- **#354** — the default Sound set's `SOUND_FLAG_BEEPS`, whose 2.2.7.1.11 obligation is the
+  Play Sound PDU, which the session skipped. Now decoded and surfaced as
+  `SessionOutput::PlaySound`. Unlike #271 the violation was latent against the test VM: product
+  note <45> routes every Windows 7+ beep through audio redirection, and the VM sent no Play Sound
+  to four beep sources. The obligation is still the client's for any server that does send it,
+  so the proof is unit-level; see [session loop](../territory/session-loop-dispatch.md).
 
 ## Where it will recur
 

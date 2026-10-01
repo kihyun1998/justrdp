@@ -76,3 +76,11 @@ properly" in place of a separate question.
   error type) is left to the slice, which derives it.
 - A server's flags are still intersected with ours, as before. This decision governs only what
   the client offers.
+
+## Amendment (2026-10-01, #354): Decision 4 re-tested on what it was not shown
+
+Decision 4 was decided without `[MS-RDPBCGR]` product note <45>: Windows 7 / Server 2008 R2 and
+later never send the Play Sound PDU, and send beeps through audio redirection. #354 measured the
+same on the test VM (0 Play Sound PDUs for four beep sources). Shown that, the maintainer kept
+`SOUND_FLAG_BEEPS` in the default and the Play Sound event, whose acceptance is proven by unit
+tests rather than by the VM. This is a judgement, like the rest of this record.

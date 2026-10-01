@@ -20,10 +20,11 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 
 ## Design model
 
-- **Eight outputs, and the host's whole view of a live session is these**:
+- **These outputs are the host's whole view of a live session**:
   `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `DisplayControlReady` ·
-  `ShutdownDenied` · `SaveSessionInfo` · `KeyboardIndicators` · `ChannelData`. Anything the host cannot learn from one of these,
-  it cannot learn at all
+  `ShutdownDenied` · `SaveSessionInfo` · `KeyboardIndicators` · `PlaySound` · `ChannelData` ·
+  `ChannelMessageDropped` (the live list is `SessionOutput` in `session.rs`). Anything the
+  host cannot learn from one of these, it cannot learn at all
   — which is the argument #228 turned on: a `pduType2` that falls into the catch-all
   (**skipped, cursor unread** — the arm never decoded anything, whatever its comment said
   until #252) is not "handled quietly", it is **unlearnable**, and a host asking for a
@@ -51,12 +52,24 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   `BitmapUpdate`, `BitmapData`, `PaletteUpdate`
 - `justrdp-pdu/src/errinfo.rs` — `ErrorInfo`, `decode_set_error_info`
 - `justrdp-pdu/src/share.rs` — `PDU_TYPE2_SHUTDOWN_REQUEST`, `PDU_TYPE2_SHUTDOWN_DENIED`,
-  `PDU_TYPE2_SAVE_SESSION_INFO`, `PDU_TYPE2_SET_KEYBOARD_INDICATORS`
+  `PDU_TYPE2_SAVE_SESSION_INFO`, `PDU_TYPE2_SET_KEYBOARD_INDICATORS`, `PDU_TYPE2_PLAY_SOUND`
 - `justrdp-pdu/src/session_info.rs` — `SaveSessionInfo`
+- `justrdp-pdu/src/sound.rs` — `PlaySound` (#354)
 
 ## Reference behaviour
 
-**None.** No verified external-fact store.
+**Play Sound: this VM never sends it, by design** (#354, 2026-10-01). `[MS-RDPBCGR]` product
+behaviour note <45> (on 3.2.5.9.4.1): from Windows 7 / Server 2008 R2 on, *"all system and
+application-generated beeps are dispatched … by using the RDP audio redirection protocol
+[MS-RDPEA]. If a client does not support RDP audio redirection, it will not receive any beep
+notifications."* Measured against the WS2022 VM with the default Sound set (`SOUND_FLAG_BEEPS`)
+and no `rdpsnd`: `[console]::beep(800,300)`, a console BEL, `SystemSounds.Beep` and
+`SystemSounds.Asterisk`, with the script's run confirmed on the framebuffer, gave **0 Play Sound
+PDUs in 3 runs** (`play_sound_probe_against_real_vm`). The decoder and `SessionOutput::PlaySound`
+are proven by unit tests only; a server that sends the PDU (pre-Windows 7, or a non-Windows one
+such as FreeRDP's, whose `update_send_play_sound` exists) is what they are for. A Windows beep
+reaches a client through audio output (#11). Keeping `SOUND_FLAG_BEEPS` advertised on that
+evidence was the maintainer's call, recorded in ADR-0016.
 
 ## Cross-cutting invariants
 
@@ -66,6 +79,9 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   leg call. `stream_id` is the same header's remaining instance.
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) —
   every byte this loop dispatches came from the network.
+- [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
+  — a `pduType2` a capability we send invites needs its own arm, not the catch-all: Play Sound
+  for the default Sound set (#354).
 - [The frame path carries no owned pixels](../invariant/frame-path-carries-no-owned-pixels.md)
   — `SessionOutput::Frame` is a rectangle; the pixels stay in the framebuffer.
 

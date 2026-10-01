@@ -57,8 +57,8 @@ a recurrence test.
 - **Only `.md` files in this repo are nodes.** Issues, epics and source files are
   *text inside* notes, never nodes — so the graph cannot show you the hottest things
   in this repo (epics #10–#29, #45, #158) as first-class objects.
-- **The verified external-fact store covers 2 territories of 19.** `## Reference
-  behaviour` reads `**None.**` in the other **17** — derived by the `rg` command under
+- **The verified external-fact store covers 8 territories of 20** (re-derived in #354). `## Reference
+  behaviour` reads `**None.**` in the other **12** — derived by the `rg` command under
   *Conventions*, not counted by hand. ADR-0003's byte-exactness ranking and ADR-0009's
   receive-path posture both depend on exactly that comparison, so this remains the map's
   single largest finding; it is now a shrinking one rather than a total one.

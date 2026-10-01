@@ -836,6 +836,9 @@ pub async fn run_session_with_input(
                     // As for Save Session Info: no event sink here, and the core already
                     // emitted the `rdp_keyboard_indicators` record.
                 }
+                SessionOutput::PlaySound(_) => {
+                    // As above: the core already emitted the `rdp_play_sound` record.
+                }
                 SessionOutput::ChannelData { channel, data } => {
                     // No event sink here either: a host that uses static channels receives
                     // them through run_session_with_commands, which can also send on them.
@@ -948,6 +951,9 @@ pub enum SessionEvent {
     /// The server's view of the keyboard locks (`[MS-RDPBCGR]` 2.2.8.2.1.1, issue #305). Driving
     /// LEDs from it, or not, is the host's.
     KeyboardIndicators(justrdp_pdu::input::KeyboardIndicators),
+    /// The server asked for a beep (`[MS-RDPBCGR]` 2.2.9.1.1.5, issue #354). Whether and how it
+    /// sounds is the host's.
+    PlaySound(justrdp_pdu::sound::PlaySound),
     /// One whole message on a static channel the host requested (issue #307). What it means,
     /// and whether anything answers it, is the host's.
     ChannelData {
@@ -975,8 +981,8 @@ pub enum SessionEvent {
 ///
 /// `on_event` receives session milestones ([`SessionEvent::DisplayControlReady`],
 /// [`SessionEvent::ShutdownDenied`], [`SessionEvent::SaveSessionInfo`],
-/// [`SessionEvent::KeyboardIndicators`], [`SessionEvent::ChannelData`],
-/// [`SessionEvent::ChannelMessageDropped`]);
+/// [`SessionEvent::KeyboardIndicators`], [`SessionEvent::PlaySound`],
+/// [`SessionEvent::ChannelData`], [`SessionEvent::ChannelMessageDropped`]);
 /// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
 pub async fn run_session_with_commands(
     stream: &mut TlsStream<TcpStream>,
@@ -1015,6 +1021,9 @@ pub async fn run_session_with_commands(
                 }
                 SessionOutput::KeyboardIndicators(indicators) => {
                     on_event(SessionEvent::KeyboardIndicators(indicators));
+                }
+                SessionOutput::PlaySound(beep) => {
+                    on_event(SessionEvent::PlaySound(beep));
                 }
                 SessionOutput::ChannelData { channel, data } => {
                     on_event(SessionEvent::ChannelData { channel, data });
@@ -5802,6 +5811,123 @@ mod tests {
             for (after, k) in seen.iter() {
                 eprintln!("  after {after}: ledFlags {:#06x}", k.led_flags);
             }
+        })
+        .await
+    }
+
+    /// Probe for #354: PowerShell plays a beep four ways, and every Play Sound the server answers
+    /// with is printed. Advisory: it asserts only that the session survives the stimuli, because
+    /// this VM sends none (`docs/map/territory/session-loop-dispatch.md`). Run with
+    /// `--nocapture`.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn play_sound_probe_against_real_vm() {
+        use justrdp_pdu::sound::PlaySound;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = Vec::new();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(64);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let beeps: Arc<Mutex<Vec<PlaySound>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            tokio::spawn(async move {
+                while let Some(events) = input_rx.recv().await {
+                    if commands_tx
+                        .send(SessionCommand::Input(events))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            let driver = {
+                let (frames, cancel) = (frames.clone(), cancel.clone());
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        const SCRIPT: &str = "[console]::beep(800,300);[console]::Write([char]7);                            [Media.SystemSounds]::Beep.Play();[Media.SystemSounds]::Asterisk.Play()";
+                        for unit in SCRIPT.encode_utf16() {
+                            input_tx
+                                .send(vec![
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: false,
+                                    },
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: true,
+                                    },
+                                ])
+                                .await
+                                .map_err(|_| "the session closed".to_string())?;
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        let enter = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
+                        input_tx
+                            .send(vec![enter.press(), enter.release()])
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        Ok::<_, String>(())
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let ended = {
+                let (frames, beeps) = (frames.clone(), beeps.clone());
+                tokio::time::timeout(
+                    Duration::from_secs(180),
+                    run_session_with_commands(
+                        &mut stream,
+                        &mut machine,
+                        move |_, _| {
+                            frames.fetch_add(1, Ordering::SeqCst);
+                        },
+                        |_| {},
+                        move |event| {
+                            if let SessionEvent::PlaySound(beep) = event {
+                                beeps.lock().unwrap().push(beep);
+                            }
+                        },
+                        &mut commands,
+                        &cancel,
+                    ),
+                )
+                .await
+                .expect("the session finishes within its window")
+            };
+
+            driver
+                .await
+                .expect("the driver task ran")
+                .expect("the desktop should paint and run the script");
+            assert_eq!(
+                ended.expect("the session survives every beep"),
+                DisconnectReason::LocalClosed
+            );
+            let beeps = beeps.lock().unwrap();
+            eprintln!("#354: {} Play Sound PDU(s): {beeps:?}", beeps.len());
         })
         .await
     }

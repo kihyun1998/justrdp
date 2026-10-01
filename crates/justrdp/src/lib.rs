@@ -42,6 +42,8 @@ pub use input::Scancode;
 pub use justrdp_pdu::input::InputEvent;
 // `SessionOutput::KeyboardIndicators` carries this (issue #305), as for `SaveSessionInfo` below.
 pub use justrdp_pdu::input::KeyboardIndicators;
+// `SessionOutput::PlaySound` carries this (issue #354).
+pub use justrdp_pdu::sound::PlaySound;
 // `SessionOutput::SaveSessionInfo` carries these, so a host that matches on it must be able
 // to name them without depending on `justrdp-pdu` itself (issue #304).
 pub use justrdp_pdu::session_info::{

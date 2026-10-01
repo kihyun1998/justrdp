@@ -35,6 +35,7 @@ pub mod rdpdr;
 pub mod rfx;
 pub mod session_info;
 pub mod share;
+pub mod sound;
 pub mod svc;
 pub mod tpkt;
 pub mod update;

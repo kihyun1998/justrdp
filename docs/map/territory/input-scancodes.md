@@ -93,6 +93,8 @@ advisory by the maintainer's call, made when no justrdp stimulus had produced a 
 
 ## Cross-cutting invariants
 
+- [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) —
+  `KeyboardIndicators::decode` reads server bytes; its proptest and fuzz target are #354's.
 - [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
   — `unitId`, taken the third way out.
 - [Capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)

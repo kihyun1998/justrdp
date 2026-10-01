@@ -2,9 +2,9 @@
 //! the second half of `capability-exchange`, after MCS/GCC.
 //!
 //! Typed structs cover the sets the connect sequence and the differential criteria actually
-//! consume (General, Bitmap, Order, Pointer, Input, Virtual Channel, Bitmap Codecs); everything
-//! else round-trips as [`CapabilitySet::Unknown`] raw bytes, because the negotiation rule for
-//! unrecognized sets is "ignore, never reject" (MS-RDPBCGR 3.2.5.3.13).
+//! consume (General, Bitmap, Order, Pointer, Input, Virtual Channel, Sound, Bitmap Codecs);
+//! everything else round-trips as [`CapabilitySet::Unknown`] raw bytes, because the negotiation
+//! rule for unrecognized sets is "ignore, never reject" (MS-RDPBCGR 3.2.5.3.13).
 
 use crate::DecodeError;
 use crate::cursor::ReadCursor;
@@ -57,6 +57,10 @@ pub const INPUT_FLAG_FASTPATH_INPUT: u16 = 0x0008;
 pub const INPUT_FLAG_FASTPATH_INPUT2: u16 = 0x0020;
 /// `inputFlags`: horizontal mouse wheel events (`TS_INPUT_FLAG_MOUSE_HWHEEL`).
 pub const INPUT_FLAG_MOUSE_HWHEEL: u16 = 0x0100;
+
+/// `soundFlags`: playing a beep is supported (`SOUND_FLAG_BEEPS`, 2.2.7.1.11) — and so the
+/// Play Sound PDU must be ([`crate::sound::PlaySound`]).
+pub const SOUND_FLAG_BEEPS: u16 = 0x0001;
 
 /// `orderFlags`: order negotiation supported (MUST be set).
 pub const ORDER_NEGOTIATE_SUPPORT: u16 = 0x0002;
@@ -344,6 +348,26 @@ impl VirtualChannelCapabilitySet {
     }
 }
 
+/// Sound Capability Set (TS_SOUND_CAPABILITYSET, 2.2.7.1.11). Client to server only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SoundCapabilitySet {
+    /// `soundFlags` ([`SOUND_FLAG_BEEPS`]). Bits the spec does not define are kept.
+    pub sound_flags: u16,
+}
+
+impl SoundCapabilitySet {
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.sound_flags.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // pad2octetsA
+    }
+
+    fn decode_body(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        let sound_flags = cur.read_u16_le()?;
+        cur.read_u16_le()?; // pad2octetsA
+        Ok(Self { sound_flags })
+    }
+}
+
 /// One codec entry in the Bitmap Codecs Capability Set (TS_BITMAPCODEC, 2.2.7.2.10.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitmapCodec {
@@ -408,6 +432,8 @@ pub enum CapabilitySet {
     Input(InputCapabilitySet),
     /// TS_VIRTUALCHANNEL_CAPABILITYSET.
     VirtualChannel(VirtualChannelCapabilitySet),
+    /// TS_SOUND_CAPABILITYSET.
+    Sound(SoundCapabilitySet),
     /// TS_BITMAPCODECS_CAPABILITYSET.
     BitmapCodecs(BitmapCodecsCapabilitySet),
     /// Any other set, kept as raw body bytes under its `capabilitySetType`.
@@ -447,6 +473,10 @@ impl CapabilitySet {
             CapabilitySet::VirtualChannel(c) => {
                 c.encode_body(&mut body);
                 CAPSET_VIRTUAL_CHANNEL
+            }
+            CapabilitySet::Sound(c) => {
+                c.encode_body(&mut body);
+                CAPSET_SOUND
             }
             CapabilitySet::BitmapCodecs(c) => {
                 c.encode_body(&mut body);
@@ -490,6 +520,7 @@ impl CapabilitySet {
             CAPSET_VIRTUAL_CHANNEL => CapabilitySet::VirtualChannel(
                 VirtualChannelCapabilitySet::decode_body(&mut body_cur)?,
             ),
+            CAPSET_SOUND => CapabilitySet::Sound(SoundCapabilitySet::decode_body(&mut body_cur)?),
             CAPSET_BITMAP_CODECS => {
                 CapabilitySet::BitmapCodecs(BitmapCodecsCapabilitySet::decode_body(&mut body_cur)?)
             }
@@ -649,11 +680,9 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
             flags: 0,         // VCCAPS_NO_COMPR
             chunk_size: 1600, // CHANNEL_CHUNK_LENGTH
         }),
-        // Sound: SOUND_BEEPS_FLAG.
-        CapabilitySet::Unknown {
-            set_type: CAPSET_SOUND,
-            data: vec![1, 0, 0, 0],
-        },
+        CapabilitySet::Sound(SoundCapabilitySet {
+            sound_flags: SOUND_FLAG_BEEPS,
+        }),
     ]
 }
 
@@ -855,6 +884,55 @@ mod tests {
         assert_eq!(&body[18..20], &0x0042u16.to_le_bytes());
         assert_eq!(&body[20..22], &7u16.to_le_bytes());
         assert_eq!(&body[22..25], &[1, 2, 3]);
+    }
+
+    /// Issue #354: the default Sound set is typed and still advertises beeps, in the bytes it
+    /// always sent (`0C 00 08 00 01 00 00 00`).
+    #[test]
+    fn default_sound_capset_is_typed_and_advertises_beeps() {
+        let sets = default_client_capabilities(&sample_core());
+        let sound = sets
+            .iter()
+            .find_map(|s| match s {
+                CapabilitySet::Sound(s) => Some(s),
+                _ => None,
+            })
+            .expect("defaults include a typed Sound capset");
+        assert_eq!(sound.sound_flags, SOUND_FLAG_BEEPS);
+        assert!(
+            !sets.iter().any(|s| matches!(
+                s,
+                CapabilitySet::Unknown {
+                    set_type: CAPSET_SOUND,
+                    ..
+                }
+            )),
+            "the Sound set must not also travel as raw bytes"
+        );
+
+        let mut out = Vec::new();
+        CapabilitySet::Sound(sound.clone()).encode(&mut out);
+        assert_eq!(out, [0x0C, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn sound_capset_round_trips_every_flag_bit() {
+        for sound_flags in [0x0000u16, SOUND_FLAG_BEEPS, 0x8001] {
+            let set = CapabilitySet::Sound(SoundCapabilitySet { sound_flags });
+            let mut out = Vec::new();
+            set.encode(&mut out);
+            let mut cur = ReadCursor::new(&out, "test");
+            assert_eq!(CapabilitySet::decode(&mut cur).unwrap(), set);
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn a_truncated_sound_capset_is_a_typed_error() {
+        // lengthCapability 6: soundFlags present, pad2octetsA missing.
+        let bytes = [0x0C, 0x00, 0x06, 0x00, 0x01, 0x00];
+        let mut cur = ReadCursor::new(&bytes, "test");
+        assert!(CapabilitySet::decode(&mut cur).is_err());
     }
 
     #[test]
