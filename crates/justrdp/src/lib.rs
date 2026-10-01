@@ -15,6 +15,7 @@
     html_favicon_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/favicon/favicon-32.png"
 )]
 
+pub mod advertise;
 mod auto_reconnect;
 pub mod cliprdr;
 pub mod connect;
@@ -30,6 +31,7 @@ pub mod session;
 mod svc;
 pub mod tls;
 
+pub use advertise::ConnectConfigError;
 pub use connect::{
     Action, ActivationResult, ClientInfoConfig, ConnectConfig, ConnectError, ConnectStateMachine,
     Event, EventKind, LicenseConfig, LicenseEntropy, McsConnectResult, StaticChannel,

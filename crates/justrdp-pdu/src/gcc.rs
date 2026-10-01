@@ -18,7 +18,7 @@ use crate::per;
 /// `earlyCapabilityFlags` in the Client Core Data (MS-RDPBCGR 2.2.1.3.2). A dependency-free
 /// bitflag newtype (decision 6), mirroring [`SecurityProtocol`]'s shape. All twelve flags are
 /// caller-set; justrdp never adds or strips one (plan.md §0 — the EGFX gate trap that motivated
-/// this project).
+/// this project), and refuses one it cannot honour (#357).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientEarlyCapabilityFlags(u16);
 
@@ -137,8 +137,15 @@ const SAS_SEQUENCE_DEL: u16 = 0xAA03;
 /// Channel option bits for [`ChannelDef`] (MS-RDPBCGR 2.2.1.3.4.1 CHANNEL_DEF).
 pub const CHANNEL_OPTION_INITIALIZED: u32 = 0x8000_0000;
 pub const CHANNEL_OPTION_ENCRYPT_RDP: u32 = 0x4000_0000;
+pub const CHANNEL_OPTION_ENCRYPT_SC: u32 = 0x2000_0000;
+pub const CHANNEL_OPTION_ENCRYPT_CS: u32 = 0x1000_0000;
+pub const CHANNEL_OPTION_PRI_HIGH: u32 = 0x0800_0000;
+pub const CHANNEL_OPTION_PRI_MED: u32 = 0x0400_0000;
+pub const CHANNEL_OPTION_PRI_LOW: u32 = 0x0200_0000;
 pub const CHANNEL_OPTION_COMPRESS_RDP: u32 = 0x0080_0000;
+pub const CHANNEL_OPTION_COMPRESS: u32 = 0x0040_0000;
 pub const CHANNEL_OPTION_SHOW_PROTOCOL: u32 = 0x0020_0000;
+pub const CHANNEL_OPTION_REMOTE_CONTROL_PERSISTENT: u32 = 0x0010_0000;
 
 /// A static virtual channel definition in the Client Network Data: a 7-character ANSI name
 /// (null-padded to 8 bytes on the wire) plus option bits.
@@ -253,7 +260,8 @@ impl Default for ClientCoreData {
     ///
     /// This is a **default, not a hardcode** (plan.md §0): every field, including
     /// `early_capability_flags`, may be overridden — set, cleared, or extended — and the encoder
-    /// passes whatever bits remain through verbatim (see `early_capability_flags_pass_through_verbatim`).
+    /// passes whatever bits remain through verbatim (see `early_capability_flags_pass_through_verbatim`);
+    /// `justrdp`'s connect layer refuses a bit it cannot honour rather than sending it (#357).
     /// A default-configured client therefore advertises `SUPPORT_ERR_INFO_PDU` and receives
     /// attributable Set Error Info PDUs without the host opting in (issue #42 C4 / #71), while a
     /// host that wants a leaner advertisement can still clear the flags.

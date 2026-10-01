@@ -5,6 +5,7 @@
 //! (MCS/GCC, channel join, Client Info, licensing, Demand/Confirm Active) → `activation`
 //! (Synchronize / Control / Font List ↔ Font Map) → `session-active`.
 
+use crate::advertise::ConnectConfigError;
 use crate::license_crypto;
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::client_info;
@@ -16,7 +17,8 @@ use justrdp_pdu::{finalization, gcc, license, mcs, share, tpkt, x224};
 /// Everything the connect sequence needs from the caller, fixed at construction. The GCC fields
 /// — most critically `core.early_capability_flags`, the EGFX gate (plan.md §0) — reach the wire
 /// **verbatim**: the machine fills in only `core.server_selected_protocol` (the negotiated
-/// protocol, a wire fact, not policy).
+/// protocol, a wire fact, not policy). What the core cannot honour is refused, not sent: see
+/// [`crate::advertise`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectConfig {
     /// Protocols to advertise in the X.224 security negotiation.
@@ -36,7 +38,8 @@ pub struct ConnectConfig {
     /// contract as `core.early_capability_flags` (plan.md §0). The machine touches exactly one
     /// thing: the Bitmap set's desktop size is overwritten with the server-negotiated size from
     /// Demand Active (a wire fact, like `serverSelectedProtocol`). Start from
-    /// [`capability::default_client_capabilities`] and edit as needed.
+    /// [`capability::default_client_capabilities`] and edit as needed, within what
+    /// [`crate::advertise`] honours.
     pub capabilities: Vec<CapabilitySet>,
     /// Licensing parameters for the full MS-RDPELE negotiation (most servers short-circuit it
     /// with `STATUS_VALID_CLIENT` and never consume these).
@@ -79,8 +82,9 @@ pub struct LicenseEntropy {
 /// feature would have to thread a password at the adapter boundary instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientInfoConfig {
-    /// `INFO_*` flags (e.g. AUTOLOGON, MOUSE, LOGON_NOTIFY) — caller policy. The PDU encoder
-    /// adds only `INFO_UNICODE`, which must match the UTF-16 strings it writes.
+    /// `INFO_*` flags (e.g. AUTOLOGON, MOUSE, LOGON_NOTIFY) — caller policy, within
+    /// [`crate::advertise::HONOURED_CLIENT_INFO_FLAGS`]. The PDU encoder adds only
+    /// `INFO_UNICODE`, which must match the UTF-16 strings it writes.
     pub flags: client_info::ClientInfoFlags,
     /// Logon domain (may be empty).
     pub domain: String,
@@ -456,8 +460,12 @@ pub struct ConnectStateMachine {
 impl ConnectStateMachine {
     /// Create a machine that will drive the connect sequence with `config`. The GCC fields are
     /// used verbatim when the MCS Connect-Initial is built — nothing is added or stripped.
-    pub fn new(config: ConnectConfig) -> Self {
-        Self {
+    ///
+    /// Refused, before anything is sent, when `config` advertises something the core cannot
+    /// honour ([`crate::advertise`], ADR-0016 Decision 3).
+    pub fn new(config: ConnectConfig) -> Result<Self, ConnectConfigError> {
+        crate::advertise::check(&config)?;
+        Ok(Self {
             config,
             stage: Stage::TcpConnect,
             inbox: Vec::new(),
@@ -471,7 +479,7 @@ impl ConnectStateMachine {
             negotiated_size: (0, 0),
             server_capabilities: Vec::new(),
             save_session_info: Vec::new(),
-        }
+        })
     }
 
     /// The current connect stage label, for diagnostics / progress UI.
@@ -1284,7 +1292,7 @@ fn decode_mcs_frame(frame: &[u8]) -> Result<&[u8], justrdp_pdu::DecodeError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use justrdp_pdu::gcc::{
         CHANNEL_OPTION_INITIALIZED, COLOR_DEPTH_8BPP, CONNECTION_TYPE_LAN, ChannelDef,
@@ -1392,7 +1400,7 @@ mod tests {
         }
     }
 
-    fn config() -> ConnectConfig {
+    pub(crate) fn config() -> ConnectConfig {
         config_with_flags(
             ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
                 | ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL,
@@ -1401,7 +1409,7 @@ mod tests {
 
     #[test]
     fn start_emits_connect_in_tcp_connect_stage() {
-        let mut sm = ConnectStateMachine::new(config());
+        let mut sm = ConnectStateMachine::new(config()).unwrap();
         let actions = sm.start();
         assert_eq!(actions, vec![Action::Connect]);
         assert_eq!(sm.stage(), "tcp-connect");
@@ -1409,7 +1417,7 @@ mod tests {
 
     #[test]
     fn connected_writes_connection_request_and_enters_x224_stage() {
-        let mut sm = ConnectStateMachine::new(config());
+        let mut sm = ConnectStateMachine::new(config()).unwrap();
         sm.start();
         let actions = sm.process(Event::Connected);
         // The machine writes exactly one frame: TPKT( X.224 CR( RDP_NEG_REQ ) ) advertising
@@ -1454,7 +1462,7 @@ mod tests {
     }
 
     fn negotiating_with(config: ConnectConfig) -> ConnectStateMachine {
-        let mut sm = ConnectStateMachine::new(config);
+        let mut sm = ConnectStateMachine::new(config).unwrap();
         sm.start();
         sm.process(Event::Connected);
         sm
@@ -2050,7 +2058,8 @@ mod tests {
         // The anti-hardcode invariant, end to end through the machine: an arbitrary flag
         // pattern set by the caller appears bit-for-bit in the Connect-Initial the machine
         // writes — decoded back by ironrdp, the independent reference.
-        for bits in [0x0000u16, 0x0FFF, 0x0123] {
+        let all = crate::advertise::HONOURED_EARLY_CAPABILITY_FLAGS.bits();
+        for bits in [0x0000u16, all, 0x0123] {
             let cfg = config_with_flags(ClientEarlyCapabilityFlags::from_bits(bits));
             let mut sm = awaiting_nla_with(cfg, SecurityProtocol::HYBRID);
             let actions = sm.process(Event::NlaComplete);
@@ -2139,7 +2148,7 @@ mod tests {
         type Make = fn() -> ConnectStateMachine;
         let stages: [(Make, &str, &[EventKind]); 12] = [
             (
-                || ConnectStateMachine::new(config()),
+                || ConnectStateMachine::new(config()).unwrap(),
                 "tcp-connect",
                 &[EventKind::Connected],
             ),

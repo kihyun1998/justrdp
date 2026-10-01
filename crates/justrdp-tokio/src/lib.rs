@@ -235,6 +235,9 @@ impl From<SocketAddr> for ServerAddr {
 /// Why the adapter-driven connect failed.
 #[derive(Debug)]
 pub enum ConnectFailure {
+    /// The config advertises something the core cannot honour, so nothing was dialed
+    /// ([`justrdp::advertise`], ADR-0016 Decision 3).
+    Config(justrdp::ConnectConfigError),
     /// A socket-level error.
     Io(io::Error),
     /// The protocol state machine rejected the exchange (includes a malformed server certificate,
@@ -264,6 +267,7 @@ pub enum ConnectFailure {
 impl std::fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConnectFailure::Config(e) => write!(f, "refused before connecting: {e}"),
             ConnectFailure::Io(e) => write!(f, "i/o error: {e}"),
             ConnectFailure::Protocol(e) => write!(f, "protocol error: {e:?}"),
             ConnectFailure::TlsHandshake { reason } => write!(f, "TLS handshake failed: {reason}"),
@@ -404,7 +408,7 @@ async fn connect_inner(
     options: ConnectOptions,
 ) -> Result<ConnectOutcome, ConnectFailure> {
     let timeouts = options.timeouts;
-    let mut sm = ConnectStateMachine::new(config);
+    let mut sm = ConnectStateMachine::new(config).map_err(ConnectFailure::Config)?;
     let mut transport = Transport::Absent;
     let mut readbuf = [0u8; 8192];
     // Filled at the McsConnected milestone; consumed when SessionActive terminates the loop.
@@ -1451,6 +1455,49 @@ mod tests {
             let _ = tls.read(&mut buf).await; // read one byte of the first TSRequest, then drop → close
         });
         (addr, cert_der)
+    }
+
+    /// Issue #357: a config the core cannot honour is refused before the TCP dial — the
+    /// listener never sees a connection, so no byte was sent.
+    #[tokio::test]
+    async fn an_unhonourable_config_is_refused_before_dialing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = test_config();
+        config.core.early_capability_flags = gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
+            | gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU;
+        let mut stages = Vec::new();
+        let err = connect(addr, config, test_credentials(), |s| {
+            stages.push(s.to_string())
+        })
+        .await
+        .expect_err("the config is refused");
+        assert!(
+            matches!(
+                &err,
+                ConnectFailure::Config(justrdp::ConnectConfigError::EarlyCapabilityFlags(bits))
+                    if *bits == gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU
+            ),
+            "got {err:?}"
+        );
+        assert!(stages.is_empty(), "no stage was entered: {stages:?}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "the listener must see no connection"
+        );
+
+        // The same address with the test config connects to the listener: the window above
+        // can observe a dial.
+        let dial = tokio::spawn(connect(addr, test_config(), test_credentials(), |_| {}));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .is_ok(),
+            "an honourable config dials"
+        );
+        dial.abort();
     }
 
     #[tokio::test]

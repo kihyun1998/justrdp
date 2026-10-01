@@ -69,6 +69,23 @@ impl ClientInfoFlags {
     pub const NO_AUDIO_PLAYBACK: Self = Self(0x0008_0000);
     /// `INFO_VIDEO_DISABLE` — disable video redirection.
     pub const VIDEO_DISABLE: Self = Self(0x0040_0000);
+    /// `CompressionTypeMask` — the highest bulk compression package the client supports, read
+    /// with [`Self::COMPRESSION`].
+    pub const COMPRESSION_TYPE_MASK: Self = Self(0x0000_1E00);
+    /// `INFO_REMOTECONSOLEAUDIO` — audio plays on the server, not redirected.
+    pub const REMOTE_CONSOLE_AUDIO: Self = Self(0x0000_2000);
+    /// `INFO_FORCE_ENCRYPTED_CS_PDU` — all client-to-server traffic is encrypted.
+    pub const FORCE_ENCRYPTED_CS_PDU: Self = Self(0x0000_4000);
+    /// `INFO_RAIL` — the session is for remote programs ([MS-RDPERP]).
+    pub const RAIL: Self = Self(0x0000_8000);
+    /// `INFO_PASSWORD_IS_SC_PIN` — the password is a smart card PIN.
+    pub const PASSWORD_IS_SC_PIN: Self = Self(0x0004_0000);
+    /// `INFO_USING_SAVED_CREDS` — the credentials were saved on the client.
+    pub const USING_SAVED_CREDS: Self = Self(0x0010_0000);
+    /// `INFO_AUDIOCAPTURE` — client audio input may be redirected ([MS-RDPEAI]).
+    pub const AUDIO_CAPTURE: Self = Self(0x0020_0000);
+    /// `INFO_HIDEF_RAIL_SUPPORTED` — enhanced RemoteApp; read only with [`Self::RAIL`].
+    pub const HIDEF_RAIL_SUPPORTED: Self = Self(0x0200_0000);
 
     /// No flags set.
     pub const fn empty() -> Self {

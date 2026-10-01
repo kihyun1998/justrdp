@@ -2,7 +2,8 @@
 //! the second half of `capability-exchange`, after MCS/GCC.
 //!
 //! Typed structs cover the sets the connect sequence and the differential criteria actually
-//! consume (General, Bitmap, Order, Pointer, Input, Virtual Channel, Sound, Bitmap Codecs);
+//! consume (General, Bitmap, Order, Bitmap Cache, Pointer, Input, Brush, Glyph Cache, Offscreen
+//! Cache, Virtual Channel, Sound, Bitmap Codecs);
 //! everything else round-trips as [`CapabilitySet::Unknown`] raw bytes, because the negotiation
 //! rule for unrecognized sets is "ignore, never reject" (MS-RDPBCGR 3.2.5.3.13).
 
@@ -41,8 +42,24 @@ pub const GENERAL_LONG_CREDENTIALS_SUPPORTED: u16 = 0x0004;
 /// `extraFlags`: auto-reconnection supported — the server then issues an auto-reconnect cookie
 /// in Save Session Info (issue #306).
 pub const GENERAL_AUTORECONNECT_SUPPORTED: u16 = 0x0008;
+/// `extraFlags`: salted MAC (Standard RDP Security only).
+pub const GENERAL_ENC_SALTED_CHECKSUM: u16 = 0x0010;
 /// `extraFlags`: no bitmap compression header.
 pub const GENERAL_NO_BITMAP_COMPRESSION_HDR: u16 = 0x0400;
+
+/// `drawingFlags`: lossy compression of 32 bpp bitmaps by reducing color fidelity.
+pub const DRAW_ALLOW_DYNAMIC_COLOR_FIDELITY: u8 = 0x02;
+/// `drawingFlags`: chroma subsampling of 32 bpp bitmaps.
+pub const DRAW_ALLOW_COLOR_SUBSAMPLING: u8 = 0x04;
+/// `drawingFlags`: the alpha channel of 32 bpp bitmaps may be dropped.
+pub const DRAW_ALLOW_SKIP_ALPHA: u8 = 0x08;
+/// `drawingFlags`: unused, and ignored.
+pub const DRAW_UNUSED_FLAG: u8 = 0x10;
+
+/// `flags` (Virtual Channel): the client takes compressed server-to-client channel data.
+pub const VCCAPS_COMPR_SC: u32 = 0x0000_0001;
+/// `flags` (Virtual Channel): the server takes compressed client-to-server data, 8K.
+pub const VCCAPS_COMPR_CS_8K: u32 = 0x0000_0002;
 
 /// `inputFlags`: scancode input events (mandatory).
 pub const INPUT_FLAG_SCANCODES: u16 = 0x0001;
@@ -348,6 +365,117 @@ impl VirtualChannelCapabilitySet {
     }
 }
 
+/// Bitmap Cache Capability Set, revision 1 (TS_BITMAPCACHE_CAPABILITYSET, 2.2.7.1.4.1): 24
+/// padding bytes, then three caches.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BitmapCacheCapabilitySet {
+    /// `(CacheNEntries, CacheNMaximumCellSize)` for caches 0, 1 and 2.
+    pub caches: [(u16, u16); 3],
+}
+
+impl BitmapCacheCapabilitySet {
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&[0u8; 24]); // pad1 … pad6
+        for (entries, cell_size) in self.caches {
+            out.extend_from_slice(&entries.to_le_bytes());
+            out.extend_from_slice(&cell_size.to_le_bytes());
+        }
+    }
+
+    fn decode_body(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        cur.read_slice(24)?; // pad1 … pad6
+        let mut caches = [(0, 0); 3];
+        for cache in &mut caches {
+            *cache = (cur.read_u16_le()?, cur.read_u16_le()?);
+        }
+        Ok(Self { caches })
+    }
+}
+
+/// Brush Capability Set (TS_BRUSH_CAPABILITYSET, 2.2.7.1.7).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrushCapabilitySet {
+    /// `brushSupportLevel`: 0 `BRUSH_DEFAULT`, 1 `BRUSH_COLOR_8x8`, 2 `BRUSH_COLOR_FULL`.
+    pub brush_support_level: u32,
+}
+
+impl BrushCapabilitySet {
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.brush_support_level.to_le_bytes());
+    }
+
+    fn decode_body(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            brush_support_level: cur.read_u32_le()?,
+        })
+    }
+}
+
+/// Glyph Cache Capability Set (TS_GLYPHCACHE_CAPABILITYSET, 2.2.7.1.8).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GlyphCacheCapabilitySet {
+    /// `GlyphCache`: ten `(CacheEntries, CacheMaximumCellSize)` definitions.
+    pub glyph_cache: [(u16, u16); 10],
+    /// `FragCache`.
+    pub frag_cache: u32,
+    /// `GlyphSupportLevel`: 0 `GLYPH_SUPPORT_NONE`, 1 `PARTIAL`, 2 `FULL`, 3 `ENCODE`.
+    pub glyph_support_level: u16,
+}
+
+impl GlyphCacheCapabilitySet {
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        for (entries, cell_size) in self.glyph_cache {
+            out.extend_from_slice(&entries.to_le_bytes());
+            out.extend_from_slice(&cell_size.to_le_bytes());
+        }
+        out.extend_from_slice(&self.frag_cache.to_le_bytes());
+        out.extend_from_slice(&self.glyph_support_level.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // pad2octets
+    }
+
+    fn decode_body(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        let mut glyph_cache = [(0, 0); 10];
+        for cache in &mut glyph_cache {
+            *cache = (cur.read_u16_le()?, cur.read_u16_le()?);
+        }
+        let frag_cache = cur.read_u32_le()?;
+        let glyph_support_level = cur.read_u16_le()?;
+        cur.read_u16_le()?; // pad2octets
+        Ok(Self {
+            glyph_cache,
+            frag_cache,
+            glyph_support_level,
+        })
+    }
+}
+
+/// Offscreen Bitmap Cache Capability Set (TS_OFFSCREEN_CAPABILITYSET, 2.2.7.1.9).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OffscreenCacheCapabilitySet {
+    /// `offscreenSupportLevel`: 0 `FALSE`, 1 `TRUE`.
+    pub offscreen_support_level: u32,
+    /// `offscreenCacheSize`, in KB.
+    pub offscreen_cache_size: u16,
+    /// `offscreenCacheEntries`.
+    pub offscreen_cache_entries: u16,
+}
+
+impl OffscreenCacheCapabilitySet {
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.offscreen_support_level.to_le_bytes());
+        out.extend_from_slice(&self.offscreen_cache_size.to_le_bytes());
+        out.extend_from_slice(&self.offscreen_cache_entries.to_le_bytes());
+    }
+
+    fn decode_body(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            offscreen_support_level: cur.read_u32_le()?,
+            offscreen_cache_size: cur.read_u16_le()?,
+            offscreen_cache_entries: cur.read_u16_le()?,
+        })
+    }
+}
+
 /// Sound Capability Set (TS_SOUND_CAPABILITYSET, 2.2.7.1.11). Client to server only.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SoundCapabilitySet {
@@ -416,8 +544,8 @@ impl BitmapCodecsCapabilitySet {
 }
 
 /// One capability set: typed where the connect sequence consumes the fields, raw otherwise.
-/// Unknown sets are preserved verbatim so a caller-supplied Confirm Active list can carry any
-/// set this crate has no struct for yet.
+/// A server's unknown sets decode verbatim. In a client's Confirm Active an unknown set cannot
+/// be judged, so `justrdp`'s connect layer refuses it rather than sending it (#357).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilitySet {
     /// TS_GENERAL_CAPABILITYSET.
@@ -426,10 +554,18 @@ pub enum CapabilitySet {
     Bitmap(BitmapCapabilitySet),
     /// TS_ORDER_CAPABILITYSET.
     Order(OrderCapabilitySet),
+    /// TS_BITMAPCACHE_CAPABILITYSET (revision 1).
+    BitmapCache(BitmapCacheCapabilitySet),
     /// TS_POINTER_CAPABILITYSET.
     Pointer(PointerCapabilitySet),
     /// TS_INPUT_CAPABILITYSET.
     Input(InputCapabilitySet),
+    /// TS_BRUSH_CAPABILITYSET.
+    Brush(BrushCapabilitySet),
+    /// TS_GLYPHCACHE_CAPABILITYSET.
+    GlyphCache(GlyphCacheCapabilitySet),
+    /// TS_OFFSCREEN_CAPABILITYSET.
+    OffscreenCache(OffscreenCacheCapabilitySet),
     /// TS_VIRTUALCHANNEL_CAPABILITYSET.
     VirtualChannel(VirtualChannelCapabilitySet),
     /// TS_SOUND_CAPABILITYSET.
@@ -461,6 +597,22 @@ impl CapabilitySet {
             CapabilitySet::Order(c) => {
                 c.encode_body(&mut body);
                 CAPSET_ORDER
+            }
+            CapabilitySet::BitmapCache(c) => {
+                c.encode_body(&mut body);
+                CAPSET_BITMAP_CACHE
+            }
+            CapabilitySet::Brush(c) => {
+                c.encode_body(&mut body);
+                CAPSET_BRUSH
+            }
+            CapabilitySet::GlyphCache(c) => {
+                c.encode_body(&mut body);
+                CAPSET_GLYPH_CACHE
+            }
+            CapabilitySet::OffscreenCache(c) => {
+                c.encode_body(&mut body);
+                CAPSET_OFFSCREEN_CACHE
             }
             CapabilitySet::Pointer(c) => {
                 c.encode_body(&mut body);
@@ -521,6 +673,16 @@ impl CapabilitySet {
                 VirtualChannelCapabilitySet::decode_body(&mut body_cur)?,
             ),
             CAPSET_SOUND => CapabilitySet::Sound(SoundCapabilitySet::decode_body(&mut body_cur)?),
+            CAPSET_BITMAP_CACHE => {
+                CapabilitySet::BitmapCache(BitmapCacheCapabilitySet::decode_body(&mut body_cur)?)
+            }
+            CAPSET_BRUSH => CapabilitySet::Brush(BrushCapabilitySet::decode_body(&mut body_cur)?),
+            CAPSET_GLYPH_CACHE => {
+                CapabilitySet::GlyphCache(GlyphCacheCapabilitySet::decode_body(&mut body_cur)?)
+            }
+            CAPSET_OFFSCREEN_CACHE => CapabilitySet::OffscreenCache(
+                OffscreenCacheCapabilitySet::decode_body(&mut body_cur)?,
+            ),
             CAPSET_BITMAP_CODECS => {
                 CapabilitySet::BitmapCodecs(BitmapCodecsCapabilitySet::decode_body(&mut body_cur)?)
             }
@@ -610,7 +772,7 @@ pub fn encode_confirm_active(
 ///
 /// This is a **default**, not a policy: the caller owns `ConnectConfig::capabilities` and may
 /// replace or edit any entry (the same anti-hardcode contract as `earlyCapabilityFlags`,
-/// plan.md §0).
+/// plan.md §0), within what `justrdp`'s connect layer honours (#357).
 pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<CapabilitySet> {
     vec![
         CapabilitySet::General(GeneralCapabilitySet {
@@ -637,10 +799,7 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
         CapabilitySet::Order(OrderCapabilitySet::default()),
         // Bitmap Cache rev. 1, all caches empty: mandatory in Confirm Active, but unused
         // because order_support above never advertises MEMBLT.
-        CapabilitySet::Unknown {
-            set_type: CAPSET_BITMAP_CACHE,
-            data: vec![0; 36],
-        },
+        CapabilitySet::BitmapCache(BitmapCacheCapabilitySet::default()),
         CapabilitySet::Pointer(PointerCapabilitySet {
             color_pointer_flag: 1,
             color_pointer_cache_size: 20,
@@ -662,20 +821,11 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
             keyboard_function_key: core.keyboard_functional_keys_count,
         }),
         // Brush: BRUSH_DEFAULT (color brushes handled server-side).
-        CapabilitySet::Unknown {
-            set_type: CAPSET_BRUSH,
-            data: vec![0; 4],
-        },
+        CapabilitySet::Brush(BrushCapabilitySet::default()),
         // Glyph cache: 10 cache slots + frag cache zeroed, glyphSupportLevel GLYPH_SUPPORT_NONE.
-        CapabilitySet::Unknown {
-            set_type: CAPSET_GLYPH_CACHE,
-            data: vec![0; 48],
-        },
+        CapabilitySet::GlyphCache(GlyphCacheCapabilitySet::default()),
         // Offscreen bitmap cache: unsupported.
-        CapabilitySet::Unknown {
-            set_type: CAPSET_OFFSCREEN_CACHE,
-            data: vec![0; 8],
-        },
+        CapabilitySet::OffscreenCache(OffscreenCacheCapabilitySet::default()),
         CapabilitySet::VirtualChannel(VirtualChannelCapabilitySet {
             flags: 0,         // VCCAPS_NO_COMPR
             chunk_size: 1600, // CHANNEL_CHUNK_LENGTH
@@ -884,6 +1034,80 @@ mod tests {
         assert_eq!(&body[18..20], &0x0042u16.to_le_bytes());
         assert_eq!(&body[20..22], &7u16.to_le_bytes());
         assert_eq!(&body[22..25], &[1, 2, 3]);
+    }
+
+    /// Issue #357: the four cache sets the default used to send raw are typed, and encode to
+    /// exactly the bytes they replaced, so a default Confirm Active is unchanged on the wire.
+    #[test]
+    fn the_default_cache_sets_are_typed_and_send_the_same_bytes() {
+        let sets = default_client_capabilities(&sample_core());
+        assert!(
+            !sets
+                .iter()
+                .any(|s| matches!(s, CapabilitySet::Unknown { .. })),
+            "the default carries no set the core cannot read: {sets:?}"
+        );
+        for (set, set_type, body_len) in [
+            (
+                CapabilitySet::BitmapCache(BitmapCacheCapabilitySet::default()),
+                CAPSET_BITMAP_CACHE,
+                36,
+            ),
+            (
+                CapabilitySet::Brush(BrushCapabilitySet::default()),
+                CAPSET_BRUSH,
+                4,
+            ),
+            (
+                CapabilitySet::GlyphCache(GlyphCacheCapabilitySet::default()),
+                CAPSET_GLYPH_CACHE,
+                48,
+            ),
+            (
+                CapabilitySet::OffscreenCache(OffscreenCacheCapabilitySet::default()),
+                CAPSET_OFFSCREEN_CACHE,
+                8,
+            ),
+        ] {
+            assert!(sets.contains(&set), "the default carries {set:?}");
+            let mut typed = Vec::new();
+            set.encode(&mut typed);
+            let mut raw = Vec::new();
+            CapabilitySet::Unknown {
+                set_type,
+                data: vec![0; body_len],
+            }
+            .encode(&mut raw);
+            assert_eq!(typed, raw, "{set_type:#06x}");
+        }
+    }
+
+    #[test]
+    fn the_cache_sets_round_trip_every_field() {
+        for set in [
+            CapabilitySet::BitmapCache(BitmapCacheCapabilitySet {
+                caches: [(1, 2), (0x0304, 0x0506), (u16::MAX, 7)],
+            }),
+            CapabilitySet::Brush(BrushCapabilitySet {
+                brush_support_level: 2,
+            }),
+            CapabilitySet::GlyphCache(GlyphCacheCapabilitySet {
+                glyph_cache: core::array::from_fn(|i| (i as u16 + 1, 0x100 + i as u16)),
+                frag_cache: 0x0102_0304,
+                glyph_support_level: 3,
+            }),
+            CapabilitySet::OffscreenCache(OffscreenCacheCapabilitySet {
+                offscreen_support_level: 1,
+                offscreen_cache_size: 7680,
+                offscreen_cache_entries: 2000,
+            }),
+        ] {
+            let mut out = Vec::new();
+            set.encode(&mut out);
+            let mut cur = ReadCursor::new(&out, "test");
+            assert_eq!(CapabilitySet::decode(&mut cur).unwrap(), set);
+            assert_eq!(cur.remaining(), 0);
+        }
     }
 
     /// Issue #354: the default Sound set is typed and still advertises beeps, in the bytes it

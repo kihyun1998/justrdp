@@ -17,6 +17,9 @@ Deactivation–Reactivation, which is how a resize actually happens.
   contradicts.
 - [ADR-0010](../../adr/0010-frameupdate-dirty-rect-contract.md) — indirectly: the
   negotiated desktop size is what the framebuffer is allocated from.
+- [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md) Decision 3 — the connect layer
+  sends the host's advertisement verbatim, and the core refuses what it cannot honour. The
+  table below is that decision's allow-list (#357).
 
 ## Design model
 
@@ -49,13 +52,53 @@ Deactivation–Reactivation, which is how a resize actually happens.
 - **Set Keyboard Indicators (0x29) is the exception, deliberately.** The session leg surfaces
   it and this leg's catch-all skips it — the maintainer's call in #305, recorded with what it
   was decided on in [Input & platform scancode tables](input-scancodes.md).
+- **The connect layer refuses what it cannot honour, before any byte** (#357).
+  `ConnectStateMachine::new` returns `ConnectConfigError` naming the first refused item, and the
+  adapter returns it as `ConnectFailure::Config` before dialing. The allow-lists are
+  `justrdp::advertise`'s `HONOURED_*` constants plus a per-set judgement, and they grow as the
+  core implements more. The rule for each row: refused if it lets the server send something the
+  core skips or rejects, or obliges the client to do something the core does not do. A row that
+  only describes what the client may send to the server is honoured. Every row below is a
+  derivation from `[MS-RDPBCGR]` (sections cited) plus the dispatch that would receive the
+  traffic.
+
+  | Advertisement | Honoured | Refused, and why |
+  |---|---|---|
+  | `earlyCapabilityFlags` (2.2.1.3.2) | `ERRINFO` (Set Error Info is decoded), `WANT_32BPP` (planar decodes 32 bpp), `STRONG_ASYMMETRIC_KEYS` (Standard RDP Security only, which the connect refuses), `RELATIVE_MOUSE_INPUT` (client to server only), `VALID_CONNECTION_TYPE`, `DYNVC_GFX` (EGFX), `SKIP_CHANNELJOIN` | `STATUSINFO`, `MONITOR_LAYOUT` (PDUs the session skips); `NETCHAR_AUTODETECT`, `HEARTBEAT` (message-channel PDUs nothing handles); `DYNAMIC_TIME_ZONE` (obliges dynamic DST fields the Client Info encoder does not write); undefined `0x1000`–`0x8000` |
+  | Client Info `flags` (2.2.1.11.1.1) | `MOUSE`, `DISABLECTRLALTDEL`, `AUTOLOGON`, `UNICODE`, `MAXIMIZESHELL`, `LOGONNOTIFY` and `LOGONERRORS` (Save Session Info is decoded), `ENABLEWINDOWSKEY`, `REMOTECONSOLEAUDIO`, `NOAUDIOPLAYBACK`, `VIDEO_DISABLE`, `FORCE_ENCRYPTED_CS_PDU`, `PASSWORD_IS_SC_PIN`, `USING_SAVED_CREDS`, `MOUSE_HAS_WHEEL` | `COMPRESSION` and `CompressionTypeMask` (bulk-compressed output, which `ShareDataHeader::decode` refuses); `RAIL`, `HIDEF_RAIL_SUPPORTED` (RemoteApp, #14); `AUDIOCAPTURE` (#12); every undefined or reserved bit |
+  | Static channel `options` (2.2.1.3.4.1) | `INITIALIZED`, `ENCRYPT_*`, `PRI_*`, `SHOW_PROTOCOL`, `REMOTE_CONTROL_PERSISTENT` | `COMPRESS_RDP`, `COMPRESS` (compressed chunks, which the SVC layer refuses); undefined bits |
+  | General | `extraFlags` `FASTPATH_OUTPUT`, `LONG_CREDENTIALS`, `AUTORECONNECT`, `ENC_SALTED_CHECKSUM`, `NO_BITMAP_COMPRESSION_HDR`; the server-only support bytes are ignored in the client's copy | any other `extraFlags` bit |
+  | Bitmap | `drawingFlags` `0x02`/`0x04`/`0x08` (planar decodes CLL, subsampling and NA), `0x10` | any other `drawingFlags` bit |
+  | Order | `orderSupport` all zero | any order (drawing orders are skipped, #22) |
+  | Bitmap Cache rev. 1, Brush, Glyph Cache, Offscreen | every cache empty, `BRUSH_DEFAULT`, `GLYPH_SUPPORT_NONE`, level 0 | anything that invites cache, brush, glyph or offscreen orders |
+  | Pointer, Input | all values (the pointer cache is sized from the set; input flags are client to server) | — |
+  | Virtual Channel | `VCCAPS_COMPR_CS_8K` | `VCCAPS_COMPR_SC` (compressed channel data); undefined bits |
+  | Sound | `SOUND_FLAG_BEEPS` (#354) | any other bit |
+  | Bitmap Codecs | no codecs | any codec (Set Surface Bits is skipped) |
+  | Any other set | — | refused unread: it cannot be judged. Bitmap Cache rev. 2, Large Pointer, Multifragment Update, Surface Commands, Control, Share, Font and the rest wait for a reader |
+
+  #352 had listed `RELATIVE_MOUSE` among the refused bits. The spec gives it no
+  server-to-client traffic (2.2.1.3.2 points only at client input events), so it is honoured.
+  `DYNAMIC_TIME_ZONE` is refused on a different ground than #352 gave: it invites no server
+  PDU, but it promises Client Info fields the encoder does not write.
+- **`DYNVC_GFX` carries an obligation the core does not meet, and it is latent.** 2.2.1.3.2:
+  *"Setting this flag requires that the client support network characteristics detection"*.
+  The core does not implement auto-detect, but those PDUs ride the message channel, which the
+  client never requests (Client Message Channel Data is not sent). So none can arrive. The
+  default keeps the bit; requesting a message channel would make the gap live.
 
 ## Code
 
 - `justrdp-pdu/src/capability.rs` — `DemandActive`, `CapabilitySet`,
   `GeneralCapabilitySet`, `BitmapCapabilitySet`, `OrderCapabilitySet`,
   `PointerCapabilitySet`, `InputCapabilitySet`, `VirtualChannelCapabilitySet`,
-  `SoundCapabilitySet` (`SOUND_FLAG_BEEPS`, #354), `BitmapCodec`, `BitmapCodecsCapabilitySet`
+  `SoundCapabilitySet` (`SOUND_FLAG_BEEPS`, #354), `BitmapCodec`, `BitmapCodecsCapabilitySet`,
+  `BitmapCacheCapabilitySet`, `BrushCapabilitySet`, `GlyphCacheCapabilitySet`,
+  `OffscreenCacheCapabilitySet` (#357)
+- `justrdp/src/advertise.rs` — `check`, `ConnectConfigError`, `HONOURED_EARLY_CAPABILITY_FLAGS`,
+  `HONOURED_CLIENT_INFO_FLAGS`, `HONOURED_CHANNEL_OPTIONS`, `HONOURED_GENERAL_EXTRA_FLAGS`,
+  `HONOURED_DRAWING_FLAGS`, `HONOURED_VIRTUAL_CHANNEL_FLAGS`, `HONOURED_SOUND_FLAGS`
+- `justrdp-tokio/src/lib.rs` — `ConnectFailure::Config`
 - `justrdp-pdu/src/share.rs` — `ShareControlHeader`, `ShareDataHeader`,
   `encode_share_control`, `encode_share_data`
 - `justrdp-pdu/src/finalization.rs` — `Synchronize`, `Control`, `FontMap`,
@@ -66,6 +109,14 @@ Deactivation–Reactivation, which is how a resize actually happens.
 - Stage strings: `capability-exchange`, `session-active`
 
 ## Reference behaviour
+
+**The server's Demand Active carries 17 sets, none of the four #357 typed** (2026-10-01,
+`vm_advertised_bitmap_codecs_and_surface_commands`). Typed: General, Bitmap, Order, Pointer,
+Input, Virtual Channel, Bitmap Codecs (four codecs, NSCodec among them). Unread: `0x0009` Share,
+`0x000A` Color Cache, `0x000E` Font, `0x0012` Bitmap Cache Host Support, `0x0017` Rail, `0x0018`
+Window List, `0x001A` Multifragment Update, `0x001B` Large Pointer, `0x001C` Surface Commands,
+`0x001E` Frame Acknowledge. So the stricter decode of Bitmap Cache, Brush, Glyph Cache and
+Offscreen Cache does not reach this server's receive path.
 
 Opened by #252. It read **"None"** until then, with the note that this was the
 territory where the absence cost most — and it did: #252 opened on the premise
