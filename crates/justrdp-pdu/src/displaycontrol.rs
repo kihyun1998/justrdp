@@ -92,6 +92,60 @@ impl DisplayControlPdu {
     }
 }
 
+/// `DesktopScaleFactor` bounds (2.2.2.2.1): outside them the server ignores both scale factors.
+pub const MIN_DESKTOP_SCALE_FACTOR: u32 = 100;
+/// See [`MIN_DESKTOP_SCALE_FACTOR`].
+pub const MAX_DESKTOP_SCALE_FACTOR: u32 = 500;
+
+/// A monitor's `Orientation` (2.2.2.2.1): the four values the server does not ignore.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Orientation {
+    /// `ORIENTATION_LANDSCAPE` (0): not rotated.
+    #[default]
+    Landscape,
+    /// `ORIENTATION_PORTRAIT` (90): rotated clockwise by 90 degrees.
+    Portrait,
+    /// `ORIENTATION_LANDSCAPE_FLIPPED` (180).
+    LandscapeFlipped,
+    /// `ORIENTATION_PORTRAIT_FLIPPED` (270).
+    PortraitFlipped,
+}
+
+impl Orientation {
+    /// The `Orientation` field value, in degrees.
+    pub fn degrees(self) -> u32 {
+        match self {
+            Self::Landscape => 0,
+            Self::Portrait => 90,
+            Self::LandscapeFlipped => 180,
+            Self::PortraitFlipped => 270,
+        }
+    }
+}
+
+/// A monitor's `DeviceScaleFactor` (2.2.2.2.1): the three values the server does not ignore.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum DeviceScaleFactor {
+    /// 100 percent.
+    #[default]
+    Percent100,
+    /// 140 percent.
+    Percent140,
+    /// 180 percent.
+    Percent180,
+}
+
+impl DeviceScaleFactor {
+    /// The `DeviceScaleFactor` field value, in percent.
+    pub fn percent(self) -> u32 {
+        match self {
+            Self::Percent100 => 100,
+            Self::Percent140 => 140,
+            Self::Percent180 => 180,
+        }
+    }
+}
+
 /// One `DISPLAYCONTROL_MONITOR_LAYOUT` entry (2.2.2.2.1). Every field reaches the wire
 /// verbatim — range rules (even width, 200–8192 bounds, caps area) are the caller's policy,
 /// enforced where the resize request is built.
@@ -164,6 +218,32 @@ pub fn encode_monitor_layout(monitors: &[Monitor]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire values 2.2.2.2.1 gives each orientation and device scale factor.
+    #[test]
+    fn orientation_and_device_scale_carry_their_spec_values() {
+        assert_eq!(
+            [
+                Orientation::Landscape,
+                Orientation::Portrait,
+                Orientation::LandscapeFlipped,
+                Orientation::PortraitFlipped,
+            ]
+            .map(Orientation::degrees),
+            [0, 90, 180, 270]
+        );
+        assert_eq!(
+            [
+                DeviceScaleFactor::Percent100,
+                DeviceScaleFactor::Percent140,
+                DeviceScaleFactor::Percent180,
+            ]
+            .map(DeviceScaleFactor::percent),
+            [100, 140, 180]
+        );
+        assert_eq!(Orientation::default(), Orientation::Landscape);
+        assert_eq!(DeviceScaleFactor::default(), DeviceScaleFactor::Percent100);
+    }
     use proptest::prelude::*;
 
     proptest! {

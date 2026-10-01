@@ -57,6 +57,18 @@ glossary, which is vocabulary rather than a decision.
 - **Display Control is pull-capable and gated**: `DisplayControlProcessor` only
   becomes usable once the server's caps arrive, which is the moment the session
   emits `DisplayControlReady`.
+- **A resize carries the host's scale factors and orientation** (#356,
+  [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md) Decision 2): one entry point,
+  `request_resize(ResizeRequest)`, whose `new(w, h)` is the old 100 percent, unrotated layout.
+  `[MS-RDPEDISP]` 2.2.2.2.1 has the server *ignore* a value outside its set, and both scale
+  factors when either one is, so the core makes the invalid ones unsendable rather than
+  silent: `Orientation` and `DeviceScaleFactor` are enums of the values the server reads, and
+  a `DesktopScaleFactor` outside 100–500 is `ResizeError::InvalidScaleFactor`. That is
+  IronRDP's shape (`ironrdp-displaycontrol`); FreeRDP sends its settings verbatim. Product
+  note <1>: only Windows 8.1 processes `DeviceScaleFactor`, so elsewhere it is a validity
+  gate for the desktop factor and nothing more. Physical size stays 0 (ignored), and the
+  connect-time DPI tail of the Client Core Data is not encoded at all (#27), so a session
+  starts at 100 percent whatever the host's display is.
 - **The drdynvc version answered is 2, and a compressed data PDU is a transport error on any
   channel** (#287). `[MS-RDPEDYC]` 1.7: version 3 adds *only* `DYNVC_DATA_FIRST_COMPRESSED` /
   `DYNVC_DATA_COMPRESSED`, which a receiver "MUST decompress" (3.1.5.2.6), and 2.2.3.3/2.2.3.4
@@ -418,7 +430,9 @@ glossary, which is vocabulary rather than a decision.
 - `justrdp-pdu/src/dvc.rs` — `DvcMessage`, `encode_create_response`,
   `encode_capabilities_response`, `encode_data`, `encode_close`
 - `justrdp-pdu/src/displaycontrol.rs` — `DisplayControlPdu`, `Caps`, `Monitor`,
-  `encode_monitor_layout`
+  `encode_monitor_layout`, `Orientation`, `DeviceScaleFactor`, `MIN_DESKTOP_SCALE_FACTOR`,
+  `MAX_DESKTOP_SCALE_FACTOR`
+- `justrdp/src/session.rs` — `ResizeRequest`, `request_resize`, `ResizeError`
 - `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`, `DvcError`
 - `justrdp/src/svc.rs` — `Reassembler`, `Reassembled`, `CHANNEL_MESSAGE_CAP`
 - `justrdp/src/session.rs` — `SessionOutput::ChannelMessageDropped`,
@@ -445,6 +459,11 @@ glossary, which is vocabulary rather than a decision.
   `[MS-RDPBCGR]` 3.1.5.2.2.1
 
 ## Reference behaviour
+
+**A resize at 150 percent is honoured (#356, 2026-10-01).** PowerShell in the session, per-monitor
+DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor Layout to
+1280x1024 with `DesktopScaleFactor` 150; the same run at 100 percent read 96 after
+(`a_resize_at_150_percent_changes_the_server_dpi_on_the_real_vm`).
 
 **Measured against the WS2022 test VM (#307, 2026-09-22):**
 

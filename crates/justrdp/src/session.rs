@@ -180,6 +180,62 @@ pub enum ResizeError {
         /// Why the dimensions were rejected.
         reason: &'static str,
     },
+    /// The desktop scale factor is outside 2.2.2.2.1's 100–500 percent, where the server
+    /// would ignore it.
+    InvalidScaleFactor {
+        /// The rejected desktop scale factor, in percent.
+        desktop_scale_factor: u32,
+    },
+}
+
+/// A client-initiated resize for [`SessionStateMachine::request_resize`]: one primary monitor
+/// with the host's size, scale factors and orientation (MS-RDPEDISP 2.2.2.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeRequest {
+    /// Desktop width; an odd value is rounded down, as the spec forbids it.
+    pub width: u16,
+    /// Desktop height.
+    pub height: u16,
+    /// `DesktopScaleFactor`, in percent (100–500).
+    pub desktop_scale_factor: u32,
+    /// `DeviceScaleFactor`.
+    pub device_scale_factor: displaycontrol::DeviceScaleFactor,
+    /// `Orientation`.
+    pub orientation: displaycontrol::Orientation,
+}
+
+impl ResizeRequest {
+    /// A resize to `width` × `height` at 100 percent, not rotated.
+    pub fn new(width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            desktop_scale_factor: displaycontrol::MIN_DESKTOP_SCALE_FACTOR,
+            device_scale_factor: displaycontrol::DeviceScaleFactor::Percent100,
+            orientation: displaycontrol::Orientation::Landscape,
+        }
+    }
+
+    /// The same request with these scale factors.
+    pub fn with_scale(
+        self,
+        desktop_scale_factor: u32,
+        device_scale_factor: displaycontrol::DeviceScaleFactor,
+    ) -> Self {
+        Self {
+            desktop_scale_factor,
+            device_scale_factor,
+            ..self
+        }
+    }
+
+    /// The same request with this orientation.
+    pub fn with_orientation(self, orientation: displaycontrol::Orientation) -> Self {
+        Self {
+            orientation,
+            ..self
+        }
+    }
 }
 
 impl core::fmt::Display for ResizeError {
@@ -191,6 +247,13 @@ impl core::fmt::Display for ResizeError {
             ResizeError::InvalidDimensions { reason } => {
                 write!(f, "invalid resize dimensions: {reason}")
             }
+            ResizeError::InvalidScaleFactor {
+                desktop_scale_factor,
+            } => write!(
+                f,
+                "desktop scale factor {desktop_scale_factor}% is outside 100–500 \
+                 (MS-RDPEDISP 2.2.2.2.1)"
+            ),
         }
     }
 }
@@ -1258,7 +1321,8 @@ impl SessionStateMachine {
     }
 
     /// Encode a client-initiated resize as a Display Control Monitor Layout PDU
-    /// (MS-RDPEDISP 2.2.2.2): one primary monitor at the origin with the requested size. The
+    /// (MS-RDPEDISP 2.2.2.2): one primary monitor at the origin with the requested size, scale
+    /// factors and orientation. The
     /// returned frames go to the socket verbatim; the server answers with
     /// Deactivation–Reactivation (DeactivateAll → Demand Active carrying the new size), which
     /// this machine already consumes — the framebuffer rebuilds and a full-screen
@@ -1266,7 +1330,7 @@ impl SessionStateMachine {
     ///
     /// Valid only after [`SessionOutput::DisplayControlReady`]. An odd `width` is rounded
     /// down to even (the spec forbids odd widths; mstsc does the same).
-    pub fn request_resize(&mut self, width: u16, height: u16) -> Result<Vec<Vec<u8>>, ResizeError> {
+    pub fn request_resize(&mut self, request: ResizeRequest) -> Result<Vec<Vec<u8>>, ResizeError> {
         let drdynvc_id = self
             .config
             .drdynvc_channel_id
@@ -1275,8 +1339,8 @@ impl SessionStateMachine {
             .drdynvc
             .display_control()
             .ok_or(ResizeError::NotReady)?;
-        let width = u32::from(width) & !1; // MS-RDPEDISP 2.2.2.2.1: width must be even
-        let height = u32::from(height);
+        let width = u32::from(request.width) & !1; // MS-RDPEDISP 2.2.2.2.1: width must be even
+        let height = u32::from(request.height);
         let range = displaycontrol::MIN_MONITOR_DIMENSION..=displaycontrol::MAX_MONITOR_DIMENSION;
         if !range.contains(&width) || !range.contains(&height) {
             return Err(ResizeError::InvalidDimensions {
@@ -1288,15 +1352,28 @@ impl SessionStateMachine {
                 reason: "requested area exceeds the server's Display Control caps",
             });
         }
+        let scale =
+            displaycontrol::MIN_DESKTOP_SCALE_FACTOR..=displaycontrol::MAX_DESKTOP_SCALE_FACTOR;
+        if !scale.contains(&request.desktop_scale_factor) {
+            return Err(ResizeError::InvalidScaleFactor {
+                desktop_scale_factor: request.desktop_scale_factor,
+            });
+        }
         tracing::debug!(
             target: "rdp_displaycontrol_resize",
             width,
             height,
+            desktop_scale_factor = request.desktop_scale_factor,
+            device_scale_factor = request.device_scale_factor.percent(),
+            orientation = request.orientation.degrees(),
             "Monitor Layout resize request encoded"
         );
-        let layout = displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor::primary(
-            width, height,
-        )]);
+        let layout = displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor {
+            desktop_scale_factor: request.desktop_scale_factor,
+            device_scale_factor: request.device_scale_factor.percent(),
+            orientation: request.orientation.degrees(),
+            ..displaycontrol::Monitor::primary(width, height)
+        }]);
         let mut frames = Vec::new();
         for pdu in dvc::encode_data(channel_id, &layout) {
             for chunk in svc::encode_chunks(&pdu) {
@@ -1366,6 +1443,7 @@ impl SessionStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use justrdp_pdu::displaycontrol::{DeviceScaleFactor, Orientation};
 
     const IO: u16 = 1003;
     const USER: u16 = 1007;
@@ -2797,10 +2875,10 @@ mod tests {
 
         let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
         display_control_ready(&mut sm, 8192, 8192);
-        let resize = sm.request_resize(1280, 1024).unwrap();
+        let resize = sm.request_resize(ResizeRequest::new(1280, 1024)).unwrap();
         assert!(sm.process_bytes(&suspend).unwrap().is_empty());
         assert_eq!(
-            sm.request_resize(1280, 1024).unwrap(),
+            sm.request_resize(ResizeRequest::new(1280, 1024)).unwrap(),
             Vec::<Vec<u8>>::new()
         );
         let written: Vec<SessionOutput> =
@@ -3056,10 +3134,13 @@ mod tests {
     fn display_control_ready_enables_request_resize() {
         let mut sm = SessionStateMachine::new(config(), Vec::new())
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
-        assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));
+        assert_eq!(
+            sm.request_resize(ResizeRequest::new(1280, 1024)),
+            Err(ResizeError::NotReady)
+        );
         display_control_ready(&mut sm, 8192, 8192);
 
-        let frames = sm.request_resize(1280, 1024).unwrap();
+        let frames = sm.request_resize(ResizeRequest::new(1280, 1024)).unwrap();
         assert_eq!(frames.len(), 1, "a 56-byte layout fits one SVC chunk");
         let layout =
             displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor::primary(1280, 1024)]);
@@ -3136,13 +3217,16 @@ mod tests {
             let mut sm = SessionStateMachine::new(config(), Vec::new())
                 .expect("the test desktop size is within MAX_DESKTOP_DIM");
             display_control_ready(&mut sm, 1920, 1080);
-            assert!(sm.request_resize(1280, 1024).is_ok());
+            assert!(sm.request_resize(ResizeRequest::new(1280, 1024)).is_ok());
 
             for frame in server_dvc_create(7, name) {
                 sm.process_bytes(&frame).unwrap();
             }
             assert!(
-                matches!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady)),
+                matches!(
+                    sm.request_resize(ResizeRequest::new(1280, 1024)),
+                    Err(ResizeError::NotReady)
+                ),
                 "channel 7 was reused for {what}, not Display Control"
             );
         }
@@ -3524,7 +3608,7 @@ mod tests {
         display_control_ready(&mut sm, 1920, 1080);
 
         // Odd width 1281 → 1280 on the wire (MS-RDPEDISP forbids odd widths).
-        let frames = sm.request_resize(1281, 1024).unwrap();
+        let frames = sm.request_resize(ResizeRequest::new(1281, 1024)).unwrap();
         let layout_even =
             displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor::primary(1280, 1024)]);
         assert!(
@@ -3535,13 +3619,94 @@ mod tests {
 
         // Out-of-range dimensions and caps-exceeding areas are typed errors.
         assert!(matches!(
-            sm.request_resize(100, 768),
+            sm.request_resize(ResizeRequest::new(100, 768)),
             Err(ResizeError::InvalidDimensions { .. })
         ));
         assert!(matches!(
-            sm.request_resize(8192, 8192), // 64 MPx > 1920×1080 caps area
+            sm.request_resize(ResizeRequest::new(8192, 8192)), // 64 MPx > 1920×1080 caps area
             Err(ResizeError::InvalidDimensions { .. })
         ));
+    }
+
+    /// Issue #356: the host's scale factors and orientation reach the wire in the Monitor
+    /// Layout, as the values 2.2.2.2.1 defines for them.
+    #[test]
+    fn a_resize_carries_the_hosts_scale_and_orientation() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        display_control_ready(&mut sm, 1920, 1080);
+        for (desktop, device, orientation, wire) in [
+            (
+                150,
+                DeviceScaleFactor::Percent100,
+                Orientation::Portrait,
+                (150, 100, 90),
+            ),
+            (
+                100,
+                DeviceScaleFactor::Percent140,
+                Orientation::LandscapeFlipped,
+                (100, 140, 180),
+            ),
+            (
+                500,
+                DeviceScaleFactor::Percent180,
+                Orientation::PortraitFlipped,
+                (500, 180, 270),
+            ),
+            (
+                100,
+                DeviceScaleFactor::Percent100,
+                Orientation::Landscape,
+                (100, 100, 0),
+            ),
+        ] {
+            let request = ResizeRequest::new(1280, 1024)
+                .with_scale(desktop, device)
+                .with_orientation(orientation);
+            let frames = sm.request_resize(request).unwrap();
+            let layout = displaycontrol::encode_monitor_layout(&[displaycontrol::Monitor {
+                desktop_scale_factor: wire.0,
+                device_scale_factor: wire.1,
+                orientation: wire.2,
+                ..displaycontrol::Monitor::primary(1280, 1024)
+            }]);
+            assert!(
+                frames[0].windows(layout.len()).any(|w| w == layout),
+                "{request:?} should encode {wire:?}"
+            );
+        }
+    }
+
+    /// A desktop scale factor the server would ignore (2.2.2.2.1: below 100 or above 500) is
+    /// refused rather than sent.
+    #[test]
+    fn a_desktop_scale_factor_outside_100_to_500_is_refused() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        display_control_ready(&mut sm, 1920, 1080);
+        for desktop in [0, 99, 501, u32::MAX] {
+            assert_eq!(
+                sm.request_resize(
+                    ResizeRequest::new(1280, 1024)
+                        .with_scale(desktop, DeviceScaleFactor::Percent100)
+                ),
+                Err(ResizeError::InvalidScaleFactor {
+                    desktop_scale_factor: desktop
+                }),
+                "{desktop}%"
+            );
+        }
+        for desktop in [100, 500] {
+            assert!(
+                sm.request_resize(
+                    ResizeRequest::new(1280, 1024)
+                        .with_scale(desktop, DeviceScaleFactor::Percent100)
+                )
+                .is_ok(),
+                "{desktop}% is in range"
+            );
+        }
     }
 
     #[test]
@@ -3558,7 +3723,7 @@ mod tests {
         // 1, where MAX² still fits u64 and would not exercise the guard).
         display_control_ready_caps(&mut sm, u32::MAX, u32::MAX, u32::MAX);
         assert!(
-            sm.request_resize(1280, 1024).is_ok(),
+            sm.request_resize(ResizeRequest::new(1280, 1024)).is_ok(),
             "a saturated caps limit must not block a legitimately-bounded resize"
         );
     }
@@ -3584,7 +3749,10 @@ mod tests {
                 .any(|w| w == expected_chunk.as_slice())
         );
         // And resize stays unavailable.
-        assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));
+        assert_eq!(
+            sm.request_resize(ResizeRequest::new(1280, 1024)),
+            Err(ResizeError::NotReady)
+        );
     }
 
     #[test]
@@ -3592,8 +3760,8 @@ mod tests {
         let mut sm = SessionStateMachine::new(config(), Vec::new())
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
         display_control_ready(&mut sm, 8192, 8192);
-        sm.request_resize(8, 4).unwrap_err(); // below 200: validated
-        let _ = sm.request_resize(1280, 1024).unwrap();
+        sm.request_resize(ResizeRequest::new(8, 4)).unwrap_err(); // below 200: validated
+        let _ = sm.request_resize(ResizeRequest::new(1280, 1024)).unwrap();
 
         // The server answers with the Deactivation–Reactivation cycle (already covered by
         // deactivate_reactivate_resizes_and_reemits_full_screen); here we assert the
@@ -3606,7 +3774,7 @@ mod tests {
         ));
         assert!(sm.process_bytes(&deactivate).unwrap().is_empty());
         assert!(
-            sm.request_resize(1024, 768).is_ok(),
+            sm.request_resize(ResizeRequest::new(1024, 768)).is_ok(),
             "resize survives deactivation"
         );
     }
@@ -3618,7 +3786,10 @@ mod tests {
         cfg.static_channels.retain(|c| c.id != DRDYNVC);
         let mut sm = SessionStateMachine::new(cfg, Vec::new())
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
-        assert_eq!(sm.request_resize(1280, 1024), Err(ResizeError::NotReady));
+        assert_eq!(
+            sm.request_resize(ResizeRequest::new(1280, 1024)),
+            Err(ResizeError::NotReady)
+        );
         // What would have been drdynvc traffic is now unknown-static-channel noise: skipped.
         let caps_request = vec![0x50, 0x00, 0x01, 0x00];
         for frame in server_dvc_frames(&caps_request) {

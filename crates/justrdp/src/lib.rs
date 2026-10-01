@@ -50,8 +50,11 @@ pub use justrdp_pdu::session_info::{
     LogonErrorNotification, LogonErrorsInfo, LogonInfo, LogonInfoExtended, SaveSessionInfo,
     ServerAutoReconnect,
 };
+// `ResizeRequest` carries these (issue #356).
+pub use justrdp_pdu::displaycontrol::{DeviceScaleFactor, Orientation};
 pub use session::{
-    ChannelSendError, ResizeError, SessionConfig, SessionError, SessionOutput, SessionStateMachine,
+    ChannelSendError, ResizeError, ResizeRequest, SessionConfig, SessionError, SessionOutput,
+    SessionStateMachine,
 };
 
 /// The `fuzz/` lane's door into the EGFX graphics processor (#267) — **not host API**.
