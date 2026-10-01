@@ -121,6 +121,14 @@ rather than by capability:
   to four beep sources. The obligation is still the client's for any server that does send it,
   so the proof is unit-level; see [session loop](../territory/session-loop-dispatch.md).
 
+- **#357** — the rule became a gate. The connect layer still sends the host's advertisement
+  verbatim, but `ConnectStateMachine::new` refuses any early bit, Client Info flag, channel
+  option or capability set whose traffic the core skips or rejects, and any set it cannot read.
+  The classification is the table in [capability exchange](../territory/capability-exchange-activation.md),
+  each row derived from the spec and the dispatch that would receive the traffic. The same pass
+  found the default's `DYNVC_GFX` obligation to support auto-detect unmet. It is latent while
+  no message channel is requested.
+
 ## Where it will recur
 
 **Whenever a capability, flag, version or feature bit is added to something this client

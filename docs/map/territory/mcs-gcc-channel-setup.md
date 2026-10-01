@@ -18,7 +18,9 @@ here, long before any graphics capability is negotiated.
 
 - [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md) — the early-capability flags are
   policy flags, so they are exposed rather than curated, and the core refuses a bit it cannot
-  honour.
+  honour. Which bits, and why, is the table in
+  [capability exchange](capability-exchange-activation.md) (#357), which also covers channel
+  options.
 
 Adjacent but not governing: [ADR-0001](../../adr/0001-sans-io-state-machine-core.md)
 places the sequence in a state machine.
