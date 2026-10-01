@@ -55,7 +55,7 @@ Deactivation–Reactivation, which is how a resize actually happens.
 - `justrdp-pdu/src/capability.rs` — `DemandActive`, `CapabilitySet`,
   `GeneralCapabilitySet`, `BitmapCapabilitySet`, `OrderCapabilitySet`,
   `PointerCapabilitySet`, `InputCapabilitySet`, `VirtualChannelCapabilitySet`,
-  `BitmapCodec`, `BitmapCodecsCapabilitySet`
+  `SoundCapabilitySet` (`SOUND_FLAG_BEEPS`, #354), `BitmapCodec`, `BitmapCodecsCapabilitySet`
 - `justrdp-pdu/src/share.rs` — `ShareControlHeader`, `ShareDataHeader`,
   `encode_share_control`, `encode_share_data`
 - `justrdp-pdu/src/finalization.rs` — `Synchronize`, `Control`, `FontMap`,

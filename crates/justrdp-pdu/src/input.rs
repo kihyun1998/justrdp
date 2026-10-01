@@ -370,6 +370,21 @@ pub fn encode_slowpath_input_body(events: &[InputEvent]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008: the no-panic property for the one server-to-client keyboard PDU.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn keyboard_indicators_decode_never_panics_on_arbitrary_input(
+            data in proptest::collection::vec(any::<u8>(), 0..=8),
+        ) {
+            let _ = KeyboardIndicators::decode(&mut crate::cursor::ReadCursor::new(
+                &data,
+                "proptest keyboard indicators",
+            ));
+        }
+    }
 
     #[test]
     fn fastpath_scancode_press_and_release() {

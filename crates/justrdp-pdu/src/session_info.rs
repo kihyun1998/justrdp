@@ -430,6 +430,90 @@ fn read_field_length(cur: &mut ReadCursor<'_>, field: &'static str) -> Result<u3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// A `u32` length weighted into `0..=max`, with an `any` arm.
+    fn arb_len(max: u32) -> impl Strategy<Value = u32> {
+        prop_oneof![3 => 0..=max, 1 => any::<u32>()]
+    }
+
+    /// The bytes after `infoType`, built per variant so each one's gates are reachable.
+    fn arb_info_body() -> impl Strategy<Value = Vec<u8>> {
+        let v1 = (arb_len(60), arb_len(520), any::<u32>()).prop_map(|(cb_domain, cb_user, id)| {
+            let mut b = cb_domain.to_le_bytes().to_vec();
+            b.extend_from_slice(&[0x41; DOMAIN_FIELD_LEN]);
+            b.extend_from_slice(&cb_user.to_le_bytes());
+            b.extend_from_slice(&[0x42; USER_FIELD_LEN]);
+            b.extend_from_slice(&id.to_le_bytes());
+            b
+        });
+        let v2 = (
+            prop_oneof![3 => Just(SAVE_SESSION_PDU_VERSION_ONE), 1 => any::<u16>()],
+            arb_len(60),
+            arb_len(520),
+            proptest::collection::vec(any::<u8>(), 0..=600),
+        )
+            .prop_map(|(version, cb_domain, cb_user, tail)| {
+                let mut b = version.to_le_bytes().to_vec();
+                b.extend_from_slice(&[0u8; 8]); // Size, SessionId
+                b.extend_from_slice(&cb_domain.to_le_bytes());
+                b.extend_from_slice(&cb_user.to_le_bytes());
+                b.extend_from_slice(&[0u8; LOGON_INFO_V2_PAD_LEN]);
+                b.extend_from_slice(&tail);
+                b
+            });
+        let extended = (
+            prop_oneof![3 => 0u32..4, 1 => any::<u32>()],
+            arb_len(40),
+            prop_oneof![3 => Just(ARC_SC_PACKET_LEN), 1 => any::<u32>()],
+            arb_len(12),
+            proptest::collection::vec(any::<u8>(), 0..=40),
+        )
+            .prop_map(|(fields, cb_arc, cb_len, cb_err, tail)| {
+                let mut b = 0u16.to_le_bytes().to_vec(); // Length
+                b.extend_from_slice(&fields.to_le_bytes());
+                if fields & LOGON_EX_AUTORECONNECTCOOKIE != 0 {
+                    b.extend_from_slice(&cb_arc.to_le_bytes());
+                    b.extend_from_slice(&cb_len.to_le_bytes());
+                    b.extend_from_slice(&[0u8; 24]);
+                }
+                if fields & LOGON_EX_LOGONERRORS != 0 {
+                    b.extend_from_slice(&cb_err.to_le_bytes());
+                    b.extend_from_slice(&[0u8; 8]);
+                }
+                b.extend_from_slice(&tail);
+                b.extend_from_slice(&[0u8; LOGON_EX_PAD_LEN]);
+                b
+            });
+        prop_oneof![
+            v1,
+            v2,
+            extended,
+            proptest::collection::vec(any::<u8>(), 0..=PLAIN_NOTIFY_PAD_LEN + 8),
+        ]
+    }
+
+    proptest! {
+        // ADR-0008: the no-panic property for Save Session Info. `infoType` is weighted onto the
+        // four variants (undirected bytes reach them at 4 in 2^32), each body is built so its
+        // length checks are reachable, and a cut drives every truncation. The cut is weighted
+        // onto the first 120 bytes too: a uniform one lands in the Extended variant's 16-byte
+        // `ArcRandomBits` about once in 2048 cases, its 570-byte pad diluting the rest.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_never_panics_on_arbitrary_input(
+            info_type in prop_oneof![4 => 0u32..4, 1 => any::<u32>()],
+            body in arb_info_body(),
+            near in prop_oneof![Just(None), (0usize..120).prop_map(Some)],
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let mut bytes = info_type.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&body);
+            let at = near.unwrap_or_else(|| cut.index(bytes.len() + 1));
+            bytes.truncate(at);
+            let _ = SaveSessionInfo::decode(&mut ReadCursor::new(&bytes, "proptest session info"));
+        }
+    }
 
     /// `Size` as 2.2.10.1.1.2 defines it: everything but `Domain` and `UserName`.
     const LOGON_INFO_V2_SIZE_SPEC: u32 = 576;

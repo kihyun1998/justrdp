@@ -148,6 +148,73 @@ impl PaletteUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// One `TS_BITMAP_DATA`, weighted into what the parser admits: flags on the compression
+    /// combinations, `bitmapLength` and the dimensions small enough for the payload to back them,
+    /// with an `any` arm on each so the reject branches stay driven.
+    fn arb_rect() -> impl Strategy<Value = Vec<u8>> {
+        let flags = prop_oneof![
+            Just(0u16),
+            Just(BITMAP_COMPRESSION),
+            Just(BITMAP_COMPRESSION | NO_BITMAP_COMPRESSION_HDR),
+            any::<u16>(),
+        ];
+        let small = || prop_oneof![3 => 0u16..4, 1 => any::<u16>()];
+        let length = prop_oneof![3 => 0u16..24, 1 => any::<u16>()];
+        (
+            proptest::collection::vec(any::<u16>(), 4),
+            small(),
+            small(),
+            any::<u16>(),
+            flags,
+            length,
+            proptest::collection::vec(any::<u8>(), 0..=32),
+        )
+            .prop_map(|(bounds, width, height, bpp, flags, length, payload)| {
+                let mut out = Vec::new();
+                for v in bounds
+                    .into_iter()
+                    .chain([width, height, bpp, flags, length])
+                {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out.extend_from_slice(&payload);
+                out
+            })
+    }
+
+    proptest! {
+        // ADR-0008: the no-panic property for the two slow-path update bodies. Undirected bytes
+        // would declare a rectangle count near 32768 and a `bitmapLength` past the input, so the
+        // bitmap generator builds rectangles field by field; the palette one is weighted onto
+        // the exact 256 its `numberColors` gate admits.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn bitmap_update_decode_never_panics_on_arbitrary_input(
+            count in prop_oneof![3 => 0u16..4, 1 => any::<u16>()],
+            rects in proptest::collection::vec(arb_rect(), 0..4),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let mut body = count.to_le_bytes().to_vec();
+            for rect in rects {
+                body.extend_from_slice(&rect);
+            }
+            body.truncate(cut.index(body.len() + 1));
+            let _ = BitmapUpdate::decode(&mut ReadCursor::new(&body, "proptest bitmap update"));
+        }
+
+        #[test]
+        fn palette_update_decode_never_panics_on_arbitrary_input(
+            count in prop_oneof![3 => Just(256u32), 1 => any::<u32>()],
+            entries in proptest::collection::vec(any::<u8>(), 0..=800),
+        ) {
+            let mut body = vec![0u8, 0];
+            body.extend_from_slice(&count.to_le_bytes());
+            body.extend_from_slice(&entries);
+            let _ = PaletteUpdate::decode(&mut ReadCursor::new(&body, "proptest palette update"));
+        }
+    }
 
     fn rect_bytes(flags: u16, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();

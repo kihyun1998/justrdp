@@ -273,3 +273,45 @@ path = "fuzz_targets/rdpdr.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sound"
+path = "fuzz_targets/sound.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "share"
+path = "fuzz_targets/share.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "update"
+path = "fuzz_targets/update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "errinfo"
+path = "fuzz_targets/errinfo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_info"
+path = "fuzz_targets/session_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "input"
+path = "fuzz_targets/input.rs"
+test = false
+doc = false
+bench = false

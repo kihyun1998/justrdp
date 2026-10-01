@@ -46,7 +46,9 @@ property of the whole untrusted surface.
 - [X.224 negotiation](../territory/x224-negotiation.md) — the connect-sequence entry point.
 - [Logon & Save Session Info](../territory/logon-session-info.md) — three fixed pads (576,
   570, 558) and four server-declared lengths in one PDU, dispatched on both legs. Added by
-  #304, with the area's first artifact.
+  #304, whose artifact was a captured fixture; the proptest and fuzz target came with #354.
+- [Input & platform scancode tables](../territory/input-scancodes.md) — `KeyboardIndicators`,
+  the one server-to-client parser in `input`. Edge and both artifacts added by #354.
   Edge added by #237; the code has carried both artifacts since #200.
 - [Verification harness](../territory/verification-harness.md) — the only territory
   that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz nightly.
@@ -391,6 +393,14 @@ that trusts its server too much) rather than as memory safety.
     reading, ablating `Surface::fill`'s zero-extent return is **INERT** rather than a hole:
     `fill` clamps `x` to `self.width`, so the offset cannot pass the buffer — which is exactly
     what `extract` did not do, and why only one of the two was ever a defect.
+- **#354** — the session-body decoders: `ShareControlHeader`/`ShareDataHeader`,
+  `BitmapUpdate`/`PaletteUpdate`, `decode_set_error_info`, `SaveSessionInfo`,
+  `KeyboardIndicators` and the new `PlaySound`. Every new property was mutation-checked by
+  turning its parser's deepest read into an `unwrap` (14 mutations). Two survived the first
+  `SaveSessionInfo` generator: a uniform truncation point lands in the Extended variant's
+  16-byte `ArcRandomBits` about once per 2048 cases, because the 570-byte pad behind it takes
+  most of the range. Weighting the cut onto the first 120 bytes turned both red. The same
+  too-wide shape as #230's pointer masks, reached through the cut rather than a field.
 - Prior art that made the risk concrete rather than theoretical: FreeRDP's
   rle/planar/clearcodec/nsc OOB CVEs (memory `rdp_decoder_robustness_refs`).
 
@@ -562,7 +572,11 @@ the next one is spelled out below. So what remains without a target is:
   without targets, which is a decision, not an oversight — recorded so nobody re-derives it.
   The same reasoning, checked rather than assumed, covers **`justrdp_pdu::rfx::decode_all`**:
   `justrdp_codecs::rfx::RemoteFx::decode_to_rgba` is its only caller and carries both artifacts.
-- **`share`, `update`, `errinfo`**, which parse post-activation session bytes.
+- ~~**`share`, `update`, `errinfo`**, which parse post-activation session bytes.~~ **Closed by
+  #354**, together with `session_info` and `input::KeyboardIndicators`, which had joined the
+  live path in #304 and #305 with neither artifact and no line here: seven entry points, one
+  weighted proptest and one fuzz target per module. The list above was a module census, so it
+  could not grow when a module it never named gained a parser.
 
 **Two derivations by name, and a name can be taken by different code — in another crate, or in
 the same module.** Both forms have now been measured, and the second is the one that hides.

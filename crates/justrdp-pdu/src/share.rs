@@ -45,6 +45,8 @@ pub const PDU_TYPE2_FONT_MAP: u8 = 0x28;
 pub const PDU_TYPE2_SAVE_SESSION_INFO: u8 = 0x26;
 /// `pduType2`: Set Keyboard Indicators PDU (server → client, the lock state; 2.2.8.2.1).
 pub const PDU_TYPE2_SET_KEYBOARD_INDICATORS: u8 = 0x29;
+/// `pduType2`: Play Sound PDU (server → client, a beep; 2.2.9.1.1.5).
+pub const PDU_TYPE2_PLAY_SOUND: u8 = 0x22;
 /// `pduType2`: Set Error Info PDU (server → client, disconnect reasons).
 pub const PDU_TYPE2_SET_ERROR_INFO: u8 = 0x2F;
 /// `pduType2`: Input Event PDU (client → server, the slow-path input fallback).
@@ -232,6 +234,36 @@ pub fn encode_share_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008: the no-panic property for the two Share headers every session-leg PDU is
+        // framed in. Malformed bytes are a typed `DecodeError`, never a panic. The control
+        // header's first arm is weighted onto the Flow PDU marker, which undirected bytes hit
+        // at 1 in 65536.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn share_control_header_decode_never_panics_on_arbitrary_input(
+            flow in any::<bool>(),
+            data in proptest::collection::vec(any::<u8>(), 0..=16),
+        ) {
+            let mut bytes = if flow {
+                SHARE_CONTROL_FLOW_PDU.to_le_bytes().to_vec()
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(&data);
+            let mut cur = ReadCursor::new(&bytes, "proptest share control");
+            let _ = ShareControlHeader::decode(&mut cur);
+        }
+
+        #[test]
+        fn share_data_header_decode_never_panics_on_arbitrary_input(
+            data in proptest::collection::vec(any::<u8>(), 0..=16),
+        ) {
+            let _ = ShareDataHeader::decode(&mut ReadCursor::new(&data, "proptest share data"));
+        }
+    }
 
     #[test]
     fn share_control_round_trip_pins_layout() {

@@ -284,6 +284,18 @@ mod tests {
     use super::*;
     use crate::DecodeError;
     use crate::cursor::ReadCursor;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ADR-0008: the no-panic property for the Set Error Info body.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn decode_set_error_info_never_panics_on_arbitrary_input(
+            data in proptest::collection::vec(any::<u8>(), 0..=8),
+        ) {
+            let _ = decode_set_error_info(&mut ReadCursor::new(&data, "proptest error info"));
+        }
+    }
 
     #[test]
     fn each_category_decodes_to_its_typed_variant() {
