@@ -3331,6 +3331,299 @@ mod tests {
         .await
     }
 
+    /// Real-VM acceptance for #355: a clipboard built without file transfer advertises no file
+    /// flags, so the server offers no `FileGroupDescriptorW` for files it copies, and text still
+    /// crosses both ways. PowerShell copies a file, then text; the host then offers text, which
+    /// PowerShell reads and copies back with a suffix.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_clipboard_without_file_transfer_is_offered_no_files_on_the_real_vm() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+        use justrdp_pdu::cliprdr::{
+            CB_USE_LONG_FORMAT_NAMES, CF_UNICODETEXT, FILE_GROUP_DESCRIPTOR_W, Format,
+            decode_unicode_text, encode_unicode_text,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const COPY_FILE: &str = "$d=\"$env:TEMP\\cliptest355\";ni $d -it d -f|out-null;\
+            sc \"$d\\a.txt\" 'x';Set-Clipboard -Path \"$d\\a.txt\"";
+        const FROM_SERVER: &str = "server 355 한글";
+        const FROM_HOST: &str = "host 355 日本語";
+        const COPY_BACK: &str = "Set-Clipboard -Value ((Get-Clipboard) + '-back')";
+
+        /// What the session tells the driver.
+        #[derive(Debug)]
+        enum Seen {
+            Formats(Vec<Format>),
+            Text(Option<String>),
+            HostListAnswered(bool),
+        }
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![cliprdr::channel_def()];
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let channel = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "cliprdr")
+                .expect("the VM grants cliprdr")
+                .id;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(64);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let clipboard = Arc::new(Mutex::new(Clipboard::without_file_transfer()));
+            let handshake_done = Arc::new(AtomicBool::new(false));
+            let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel::<Seen>();
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let driver = {
+                let (frames, cancel, clipboard, handshake_done) = (
+                    frames.clone(),
+                    cancel.clone(),
+                    clipboard.clone(),
+                    handshake_done.clone(),
+                );
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        let start = tokio::time::Instant::now();
+                        while !handshake_done.load(Ordering::SeqCst) {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err("the clipboard handshake never completed".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        let flags = clipboard.lock().unwrap().general_flags();
+                        if flags != CB_USE_LONG_FORMAT_NAMES {
+                            return Err(format!("negotiated {flags:#x}, not long names alone"));
+                        }
+                        let enter = {
+                            let key = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
+                            vec![key.press(), key.release()]
+                        };
+                        let type_line = |line: &str| {
+                            let (input_tx, enter, units) = (
+                                input_tx.clone(),
+                                enter.clone(),
+                                line.encode_utf16().collect::<Vec<_>>(),
+                            );
+                            async move {
+                                for unit in units {
+                                    input_tx
+                                        .send(vec![
+                                            InputEvent::Unicode {
+                                                code_unit: unit,
+                                                release: false,
+                                            },
+                                            InputEvent::Unicode {
+                                                code_unit: unit,
+                                                release: true,
+                                            },
+                                        ])
+                                        .await
+                                        .map_err(|_| "the session closed".to_string())?;
+                                    tokio::time::sleep(Duration::from_millis(15)).await;
+                                }
+                                input_tx
+                                    .send(enter)
+                                    .await
+                                    .map_err(|_| "the session closed".to_string())
+                            }
+                        };
+                        async fn next(
+                            seen: &mut tokio::sync::mpsc::UnboundedReceiver<Seen>,
+                            what: &str,
+                        ) -> Result<Seen, String> {
+                            tokio::time::timeout(Duration::from_secs(60), seen.recv())
+                                .await
+                                .map_err(|_| format!("no {what} within 60 s"))?
+                                .ok_or_else(|| "the session closed".to_string())
+                        }
+                        async fn next_text(
+                            seen: &mut tokio::sync::mpsc::UnboundedReceiver<Seen>,
+                        ) -> Result<String, String> {
+                            loop {
+                                match next(seen, "text").await? {
+                                    Seen::Text(Some(text)) => return Ok(text),
+                                    Seen::Text(None) => {
+                                        return Err("the server failed the request".into());
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                        }
+
+                        vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+
+                        // A copied file: every Format List the server sends for it. What arrived
+                        // before the copy is not about it.
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        while seen.try_recv().is_ok() {}
+                        type_line(COPY_FILE).await?;
+                        let mut file_formats = Vec::new();
+                        let window = tokio::time::Instant::now() + Duration::from_secs(5);
+                        while let Ok(Some(event)) =
+                            tokio::time::timeout_at(window, seen.recv()).await
+                        {
+                            if let Seen::Formats(formats) = event {
+                                file_formats.push(formats);
+                            }
+                        }
+
+                        // Server to host.
+                        type_line(&format!("Set-Clipboard -Value '{FROM_SERVER}'")).await?;
+                        let from_server = next_text(&mut seen).await?;
+
+                        // Host to server, and back.
+                        let list = clipboard.lock().unwrap().announce(vec![Format {
+                            id: CF_UNICODETEXT,
+                            name: String::new(),
+                        }]);
+                        commands_tx
+                            .send(SessionCommand::ChannelData {
+                                channel,
+                                data: list.message.expect("the handshake is done"),
+                            })
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+                        loop {
+                            match next(&mut seen, "answer to the host's Format List").await? {
+                                Seen::HostListAnswered(true) => break,
+                                Seen::HostListAnswered(false) => {
+                                    return Err("the server refused the host's list".into());
+                                }
+                                _ => continue,
+                            }
+                        }
+                        type_line(COPY_BACK).await?;
+                        let back = next_text(&mut seen).await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        Ok((file_formats, from_server, back))
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let frames_in_sink = frames.clone();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(240),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        let SessionEvent::ChannelData { channel: on, data } = event else {
+                            return;
+                        };
+                        assert_eq!(on, channel, "only cliprdr was requested");
+                        let mut clipboard = clipboard.lock().unwrap();
+                        let outputs = clipboard
+                            .process(&data)
+                            .expect("the VM's clipboard message decodes");
+                        let send = |data: Vec<u8>| {
+                            commands_tx
+                                .try_send(SessionCommand::ChannelData { channel, data })
+                                .expect("the command queue has room")
+                        };
+                        for output in outputs {
+                            match output {
+                                ClipboardOutput::Send(data) => send(data),
+                                ClipboardOutput::FormatListResponse { ok } => {
+                                    if handshake_done.swap(true, Ordering::SeqCst) {
+                                        let _ = seen_tx.send(Seen::HostListAnswered(ok));
+                                    }
+                                }
+                                ClipboardOutput::RemoteFormatList(formats) => {
+                                    eprintln!("server formats: {formats:?}");
+                                    if formats.iter().any(|f| f.id == CF_UNICODETEXT)
+                                        && !formats
+                                            .iter()
+                                            .any(|f| f.name == FILE_GROUP_DESCRIPTOR_W)
+                                        && let Ok(request) = clipboard.request(CF_UNICODETEXT)
+                                    {
+                                        send(request);
+                                    }
+                                    let _ = seen_tx.send(Seen::Formats(formats));
+                                }
+                                ClipboardOutput::FormatData { data, .. } => {
+                                    let text = data.map(|d| decode_unicode_text(&d));
+                                    let _ = seen_tx.send(Seen::Text(text));
+                                }
+                                ClipboardOutput::DataRequested { format_id } => {
+                                    assert_eq!(format_id, CF_UNICODETEXT);
+                                    let text = encode_unicode_text(FROM_HOST);
+                                    for data in clipboard.respond(Some(&text)) {
+                                        send(data);
+                                    }
+                                }
+                                other => panic!("nothing else was asked for: {other:?}"),
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+            ended
+                .expect("the session ended within 240 s")
+                .expect("the session ran without a protocol failure");
+            let (file_formats, from_server, back) = driven.expect("the desktop was driven");
+            eprintln!("#355: Format Lists for the copied file: {file_formats:?}");
+            assert!(
+                !file_formats.is_empty(),
+                "the server announces the copied file"
+            );
+            assert!(
+                !file_formats
+                    .iter()
+                    .flatten()
+                    .any(|f| f.name == FILE_GROUP_DESCRIPTOR_W),
+                "a copied file is offered without FileGroupDescriptorW: {file_formats:?}"
+            );
+            assert_eq!(from_server, FROM_SERVER, "text crosses server to host");
+            assert_eq!(
+                back,
+                format!("{FROM_HOST}-back"),
+                "text crosses host to server"
+            );
+        })
+        .await
+    }
+
     /// Real-VM acceptance for #324: files copied on the server reach the host byte-exact under
     /// a clipboard lock. PowerShell writes two files and puts them on the clipboard. The host
     /// takes the file list, fetches `small.txt` and the first range of `big.bin`, then the
