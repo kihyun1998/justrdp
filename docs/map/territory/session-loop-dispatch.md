@@ -45,6 +45,15 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   dropped, which is why the connect layer refuses `SURFCMDS_FRAME_MARKER`; acknowledging them would
   need the Frame Acknowledge set, refused too. A command whose `cmdFlags` bit was not advertised is
   still applied, with an `rdp_surface_bits` record (ADR-0009 §3(b)).
+- **One graphics update buys at most `PAINT_BUDGET_FRAMEBUFFERS` desktops of decoding** (#367).
+  A bitmap update's rectangles and a Surface Commands update's surface bits are charged their
+  decoded size, not their clipped one, before they decode; past the budget the rest of the update
+  is skipped with an `rdp_paint_budget` warning and the session continues, on ADR-0009 row 3's
+  ground (a resource ceiling that is ours, against well-formed traffic). The budget is per update,
+  so it bounds how long one `process_bytes` holds the adapter's loop, and the host's cancellation
+  with it; it does not bound what a stream of updates can cost, which no budget can without
+  refusing real RLE and NSCodec traffic. The real server's largest update decodes exactly one
+  desktop (4 of the 20 Surface Commands updates in the #150 capture), so 2 leaves it untouched.
 - **Static-channel traffic goes three ways** (#307): `drdynvc` to the dynamic-channel
   manager, a granted host channel to its reassembler and out as `ChannelData`, and a channel
   ID that was never granted is skipped with an `rdp_svc` record. See
@@ -54,7 +63,8 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 
 - `justrdp/src/session.rs` — `SessionStateMachine`, `SessionConfig`, `SessionOutput`,
   `SessionError`, `Phase`, `ResizeError`, `cursor_event_for`, `request_shutdown`,
-  `apply_surface_bits` (#150)
+  `apply_surface_bits` (#150), `PAINT_BUDGET_FRAMEBUFFERS`, `apply_bitmap_update`,
+  `note_paint_budget` (#367)
 - `justrdp/src/disconnect.rs` — `classify`, `DisconnectClass`, `DisconnectReason`,
   `ServerDisconnectCause`
 - `justrdp-pdu/src/fastpath.rs` — `is_fastpath`, `frame_len`, `decode_updates`

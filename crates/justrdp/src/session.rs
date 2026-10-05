@@ -61,6 +61,40 @@ pub struct SessionConfig {
     pub egfx: crate::EgfxConfig,
 }
 
+/// How many desktops' worth of decoded pixels one graphics update may buy (#367).
+pub(crate) const PAINT_BUDGET_FRAMEBUFFERS: usize = 2;
+
+/// What one bitmap rectangle or surface-bits command did.
+enum Painted {
+    /// Decoded, with the dirty rectangle it left, if any.
+    Frame(Option<FrameUpdate>),
+    /// Not decoded: it would have spent more than the update's paint budget had left.
+    OverBudget,
+}
+
+/// Spend `cost` from `budget`, or leave it untouched and return `false` when it does not fit.
+fn charge(budget: &mut usize, cost: usize) -> bool {
+    match budget.checked_sub(cost) {
+        Some(left) => {
+            *budget = left;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Record that an update was cut short by its paint budget (#367; ADR-0009 §3(b)).
+fn note_paint_budget(update: &'static str, declared: usize, painted: usize) {
+    tracing::warn!(
+        target: "rdp_paint_budget",
+        update,
+        declared,
+        painted,
+        skipped = declared - painted,
+        "paint budget reached; the remaining commands of this update were skipped",
+    );
+}
+
 /// One effect of feeding bytes to the machine, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOutput {
@@ -670,11 +704,7 @@ impl SessionStateMachine {
                     cur.read_u16_le().map_err(SessionError::Decode)?;
                     let bitmap =
                         update::BitmapUpdate::decode(&mut cur).map_err(SessionError::Decode)?;
-                    for rect in &bitmap.rectangles {
-                        if let Some(frame_update) = self.apply_bitmap(rect)? {
-                            outputs.push(SessionOutput::Frame(frame_update));
-                        }
-                    }
+                    self.apply_bitmap_update(&bitmap, outputs)?;
                 }
                 fastpath::FP_UPDATE_PALETTE => {
                     cur.read_u16_le().map_err(SessionError::Decode)?;
@@ -695,15 +725,24 @@ impl SessionStateMachine {
                     self.on_pointer(update, outputs)?;
                 }
                 fastpath::FP_UPDATE_SURFCMDS => {
-                    for command in
-                        surface_commands::decode_all(&data).map_err(SessionError::Decode)?
-                    {
-                        self.note_unadvertised(&command);
+                    let commands =
+                        surface_commands::decode_all(&data).map_err(SessionError::Decode)?;
+                    let mut budget = self.paint_budget();
+                    for (index, command) in commands.iter().enumerate() {
+                        self.note_unadvertised(command);
                         // A Frame Marker is decoded and dropped.
-                        if let SurfaceCommand::SurfaceBits(bits) = command
-                            && let Some(frame_update) = self.apply_surface_bits(&bits)?
-                        {
-                            outputs.push(SessionOutput::Frame(frame_update));
+                        let SurfaceCommand::SurfaceBits(bits) = command else {
+                            continue;
+                        };
+                        match self.apply_surface_bits(bits, &mut budget)? {
+                            Painted::Frame(Some(frame_update)) => {
+                                outputs.push(SessionOutput::Frame(frame_update));
+                            }
+                            Painted::Frame(None) => {}
+                            Painted::OverBudget => {
+                                note_paint_budget("TS_FP_SURFCMDS", commands.len(), index);
+                                break;
+                            }
                         }
                     }
                 }
@@ -858,11 +897,7 @@ impl SessionStateMachine {
                     update::UPDATETYPE_BITMAP => {
                         let bitmap =
                             update::BitmapUpdate::decode(cur).map_err(SessionError::Decode)?;
-                        for rect in &bitmap.rectangles {
-                            if let Some(frame) = self.apply_bitmap(rect)? {
-                                outputs.push(SessionOutput::Frame(frame));
-                            }
-                        }
+                        self.apply_bitmap_update(&bitmap, outputs)?;
                     }
                     update::UPDATETYPE_PALETTE => {
                         let palette =
@@ -1026,7 +1061,8 @@ impl SessionStateMachine {
     fn apply_surface_bits(
         &mut self,
         bits: &SurfaceBits<'_>,
-    ) -> Result<Option<FrameUpdate>, SessionError> {
+        budget: &mut usize,
+    ) -> Result<Painted, SessionError> {
         let bitmap = &bits.bitmap;
         if bitmap.width > self.framebuffer.width() || bitmap.height > self.framebuffer.height() {
             return Err(SessionError::Decode(
@@ -1038,6 +1074,11 @@ impl SessionStateMachine {
         }
         let width = usize::from(bitmap.width);
         let height = usize::from(bitmap.height);
+        let decodes = bitmap.codec_id == 0
+            || (bitmap.codec_id == capability::CODEC_ID_NSCODEC && self.nscodec_advertised);
+        if decodes && !charge(budget, width * height * 4) {
+            return Ok(Painted::OverBudget);
+        }
         // Both layouts are bottom-up.
         let rgba = match bitmap.codec_id {
             0 => color::to_rgba(
@@ -1061,24 +1102,55 @@ impl SessionStateMachine {
                     codec_id,
                     "Set Surface Bits with a codec ID the client did not advertise — skipped"
                 );
-                return Ok(None);
+                return Ok(Painted::Frame(None));
             }
         };
-        Ok(self.framebuffer.blit(
+        Ok(Painted::Frame(self.framebuffer.blit(
             bits.dest_left,
             bits.dest_top,
             bitmap.width,
             bitmap.height,
             &rgba,
             width,
-        ))
+        )))
+    }
+
+    /// Decode every rectangle of one bitmap update, within one paint budget.
+    fn apply_bitmap_update(
+        &mut self,
+        bitmap: &update::BitmapUpdate,
+        outputs: &mut Vec<SessionOutput>,
+    ) -> Result<(), SessionError> {
+        let mut budget = self.paint_budget();
+        for (index, rect) in bitmap.rectangles.iter().enumerate() {
+            match self.apply_bitmap(rect, &mut budget)? {
+                Painted::Frame(Some(frame_update)) => {
+                    outputs.push(SessionOutput::Frame(frame_update));
+                }
+                Painted::Frame(None) => {}
+                Painted::OverBudget => {
+                    note_paint_budget("TS_UPDATE_BITMAP_DATA", bitmap.rectangles.len(), index);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The decoded bytes one graphics update may buy.
+    fn paint_budget(&self) -> usize {
+        usize::from(self.framebuffer.width())
+            * usize::from(self.framebuffer.height())
+            * 4
+            * PAINT_BUDGET_FRAMEBUFFERS
     }
 
     /// Decode one bitmap rectangle into the framebuffer.
     fn apply_bitmap(
         &mut self,
         rect: &update::BitmapData,
-    ) -> Result<Option<FrameUpdate>, SessionError> {
+        budget: &mut usize,
+    ) -> Result<Painted, SessionError> {
         // Bound the wire-declared dimensions BEFORE the decoders allocate width × height
         // buffers: a tiny malicious PDU declaring 65535×65535 would otherwise force a
         // multi-gigabyte allocation (OOM abort, not a typed error — plan.md §11c; same
@@ -1096,6 +1168,9 @@ impl SessionStateMachine {
         }
         let width = usize::from(rect.width);
         let height = usize::from(rect.height);
+        if !charge(budget, width * height * 4) {
+            return Ok(Painted::OverBudget);
+        }
         // All slow-path bitmap layouts are bottom-up; the conversion flips to top-down RGBA.
         let rgba = match (rect.compressed, rect.bits_per_pixel) {
             (false, bpp) => color::to_rgba(&rect.data, width, height, bpp, &self.palette, true)
@@ -1119,14 +1194,14 @@ impl SessionStateMachine {
         // alignment); the destination is inclusive, the overhang is right/bottom padding.
         let dest_w = rect.right.saturating_sub(rect.left).saturating_add(1);
         let dest_h = rect.bottom.saturating_sub(rect.top).saturating_add(1);
-        Ok(self.framebuffer.blit(
+        Ok(Painted::Frame(self.framebuffer.blit(
             rect.left,
             rect.top,
             dest_w.min(rect.width),
             dest_h.min(rect.height),
             &rgba,
             width,
-        ))
+        )))
     }
 
     /// A Demand Active mid-session: the Deactivation–Reactivation sequence (plan.md §0 —
@@ -1779,6 +1854,85 @@ mod tests {
             sm.process_bytes(&surface_commands_pdu(&bits)),
             Err(SessionError::Nscodec(_))
         ));
+    }
+
+    /// A desktop-sized NSCodec stream whose four planes are all empty: the decoder fills every
+    /// plane, so 20 bytes of header buy a full-desktop decode (#367).
+    fn nscodec_empty_planes() -> Vec<u8> {
+        let mut nsc = vec![0u8; 16];
+        nsc.extend_from_slice(&[1, 0, 0, 0]);
+        nsc
+    }
+
+    /// Issue #367: one Surface Commands update buys at most `PAINT_BUDGET_FRAMEBUFFERS`
+    /// desktops of decoding; the commands past it are skipped, not fatal, and the next update
+    /// is charged afresh.
+    #[test]
+    fn surface_bits_past_the_paint_budget_are_skipped() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let body: Vec<u8> = (0..5)
+            .flat_map(|_| {
+                set_surface_bits(
+                    0,
+                    0,
+                    16,
+                    8,
+                    capability::CODEC_ID_NSCODEC,
+                    &nscodec_empty_planes(),
+                )
+            })
+            .collect();
+        for _ in 0..2 {
+            let outputs = sm.process_bytes(&surface_commands_pdu(&body)).unwrap();
+            assert_eq!(
+                outputs.len(),
+                PAINT_BUDGET_FRAMEBUFFERS,
+                "exactly the budget's worth of desktops is painted: {outputs:?}"
+            );
+        }
+    }
+
+    /// The charge is the decoded size, not the clipped one: a desktop-sized bitmap at the last
+    /// pixel paints one pixel and still costs a desktop's decode.
+    #[test]
+    fn the_paint_budget_charges_what_is_decoded_not_what_is_clipped() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let body: Vec<u8> = (0..5)
+            .flat_map(|_| {
+                set_surface_bits(
+                    15,
+                    7,
+                    16,
+                    8,
+                    capability::CODEC_ID_NSCODEC,
+                    &nscodec_empty_planes(),
+                )
+            })
+            .collect();
+        let outputs = sm.process_bytes(&surface_commands_pdu(&body)).unwrap();
+        assert_eq!(outputs.len(), PAINT_BUDGET_FRAMEBUFFERS, "{outputs:?}");
+    }
+
+    /// Issue #367: the slow path's bitmap rectangles are charged the same way.
+    #[test]
+    fn bitmap_rectangles_past_the_paint_budget_are_skipped() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let mut body = update::UPDATETYPE_BITMAP.to_le_bytes().to_vec();
+        body.extend_from_slice(&5u16.to_le_bytes());
+        for _ in 0..5 {
+            for v in [0u16, 0, 15, 7, 16, 8, 24, 0] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body.extend_from_slice(&((16 * 8 * 3) as u16).to_le_bytes());
+            body.extend_from_slice(&[7; 16 * 8 * 3]);
+        }
+        let pdu = fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_BITMAP,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &body,
+        )]);
+        let outputs = sm.process_bytes(&pdu).unwrap();
+        assert_eq!(outputs.len(), PAINT_BUDGET_FRAMEBUFFERS, "{outputs:?}");
     }
 
     fn config() -> SessionConfig {
