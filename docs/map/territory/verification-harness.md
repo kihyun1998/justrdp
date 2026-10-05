@@ -119,6 +119,12 @@ grep 'client_common_save_session_info' fr.log   # Logon Info, and whether a cook
   session where Caps Lock was pressed and the on-screen keyboard used, and which one caused it
   was not recorded.
 - `/cert:ignore` is for this lab VM only.
+- **`-gfx` turns the graphics pipeline on, not off** (FreeRDP 3.31.0, #150). `gfx` takes a value
+  rather than a `+`/`-` sign, so the form is undocumented, and the parser accepts it anyway.
+  `client/common/cmdline.c` routes the `gfx` switch to `parse_gfx_options`, whose first statement
+  sets `SupportGraphicsPipeline` to TRUE whatever the switch's sign. For a legacy session omit
+  `/gfx` and pass `/network:lan`, since an unset connection type autodetects and enables the
+  pipeline too. The tell is `gdi_ResetGraphics` in the log, which only the pipeline calls.
 
 **What FreeRDP sends, not only what it receives** (#306). `/dump:record,file:<path>` writes every
 PDU **before TLS**, in both directions, as records of `u64` tick, `u8` direction, `u32` CRC,
@@ -289,6 +295,18 @@ was checked against.
   client driving a UI it does not own. The alternative that *is* enumerable is out-of-band
   (WinRM), and it was declined because it moves the configuration burden onto every machine
   that runs the suite instead of onto the one VM.
+- **A second VM-configuration dependency, for a different reason: the colour-depth policy**
+  (#150). The VM's *Limit maximum color depth* (Remote Session Environment; the Korean UI files
+  it under 터미널 서비스) was set to 32 bpp on 2026-10-01. Below that the server caps every
+  non-EGFX session at 16 bpp and sends no Surface Bits, so
+  `nscodec_surface_bits_paint_the_desktop_on_the_real_vm` loses its subject on a rebuilt VM; its
+  assertion names the policy. The same change moved every legacy-graphics test: those sessions
+  now paint in NSCodec Set Surface Bits instead of bitmap updates, and
+  `captured_bitmap_rectangles_decode_identically_in_ironrdp` strips the two capability sets to
+  keep bitmap updates as its subject. `images_cross_the_clipboard_both_ways_on_the_real_vm` had
+  hard-coded the 16-bpp session into its pixel comparison and failed on master too once the policy
+  moved; it now reads the depth from the Demand Active and strips the same two sets, since NSCodec
+  is lossy and its comparison is exact.
 - **Driving a desktop by synthesised keystrokes is open-loop, and the acknowledgement
   the harness needs is the one it already receives.** Every VM test that has to make
   something happen *inside* Windows — sign out, launch an app, run `tsdiscon` — types

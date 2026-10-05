@@ -15,11 +15,12 @@ use crate::disconnect::{DisconnectReason, ServerDisconnectCause};
 use crate::dvc::{Drdynvc, DvcError, DvcEvent};
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::color::{self, Palette};
-use justrdp_codecs::{planar, pointer as pointer_codec, rle};
+use justrdp_codecs::{nscodec, planar, pointer as pointer_codec, rle};
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::input::InputEvent;
 use justrdp_pdu::pointer::PointerUpdate;
+use justrdp_pdu::surface_commands::{self, SurfaceBits, SurfaceCommand};
 use justrdp_pdu::{
     displaycontrol, dvc, fastpath, finalization, input, mcs, pointer, session_info, share, sound,
     svc, tpkt, update, x224,
@@ -352,6 +353,8 @@ pub enum SessionError {
     Color(color::ColorError),
     /// A pointer shape failed to decode (bad mask sizes / unsupported depth).
     Pointer(pointer_codec::PointerError),
+    /// NSCodec bitmap data in a Set Surface Bits command failed to decode.
+    Nscodec(nscodec::NscError),
 }
 
 impl core::fmt::Display for SessionError {
@@ -366,6 +369,7 @@ impl core::fmt::Display for SessionError {
             SessionError::Planar(e) => write!(f, "RDP6 planar: {e}"),
             SessionError::Color(e) => write!(f, "pixel conversion: {e}"),
             SessionError::Pointer(e) => write!(f, "pointer shape: {e}"),
+            SessionError::Nscodec(e) => write!(f, "NSCodec surface bits: {e}"),
             SessionError::Framebuffer {
                 channel: Some(channel),
                 error,
@@ -443,6 +447,11 @@ pub struct SessionStateMachine {
     suspended: Option<Vec<Vec<u8>>>,
     /// Bytes of host messages among the held frames.
     held_bytes: usize,
+    /// The Surface Commands `cmdFlags` the Confirm Active advertised.
+    surface_commands: u32,
+    /// Whether the Confirm Active advertised NSCodec, so Set Surface Bits may carry
+    /// [`capability::CODEC_ID_NSCODEC`].
+    nscodec_advertised: bool,
 }
 
 impl SessionStateMachine {
@@ -479,6 +488,19 @@ impl SessionStateMachine {
                 _ => None,
             })
             .unwrap_or(0);
+        let surface_commands = config
+            .capabilities
+            .iter()
+            .find_map(|set| match set {
+                CapabilitySet::SurfaceCommands(s) => Some(s.cmd_flags),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let nscodec_advertised = config.capabilities.iter().any(|set| {
+            matches!(set, CapabilitySet::BitmapCodecs(c)
+                if c.codecs.iter().any(|codec| codec.guid == capability::CODEC_GUID_NSCODEC
+                    && codec.id == capability::CODEC_ID_NSCODEC))
+        });
         let channels = config
             .static_channels
             .iter()
@@ -504,6 +526,8 @@ impl SessionStateMachine {
             channels,
             suspended: None,
             held_bytes: 0,
+            surface_commands,
+            nscodec_advertised,
         })
     }
 
@@ -579,7 +603,8 @@ impl SessionStateMachine {
     }
 
     /// Handle one complete fast-path output PDU: reassemble fragmented updates, then route
-    /// bitmap/palette bodies through the same handlers as their slow-path twins.
+    /// bitmap/palette bodies through the same handlers as their slow-path twins, and surface
+    /// commands to [`Self::apply_surface_bits`].
     fn on_fastpath_pdu(
         &mut self,
         frame: &[u8],
@@ -596,14 +621,14 @@ impl SessionStateMachine {
                     match self.fragment.as_mut() {
                         Some((code, buffer)) if *code == section.code => {
                             // Cap reassembly so an endless NEXT stream cannot grow the
-                            // buffer unboundedly (the TSRequest-cap precedent). A real
-                            // update never exceeds one full desktop of RGBA pixels plus
-                            // headers by a wide margin.
+                            // buffer unboundedly (the TSRequest-cap precedent): one full
+                            // desktop of RGBA pixels plus headers, at least
+                            // `HONOURED_MAX_REQUEST_SIZE`.
                             let cap = (usize::from(self.framebuffer.width())
                                 * usize::from(self.framebuffer.height())
-                                * 4)
-                            .max(1 << 20)
-                                + (64 << 10);
+                                * 4
+                                + (64 << 10))
+                                .max(crate::advertise::HONOURED_MAX_REQUEST_SIZE as usize);
                             if buffer.len() + section.data.len() > cap {
                                 return Err(SessionError::Decode(
                                     justrdp_pdu::DecodeError::InvalidField {
@@ -669,8 +694,20 @@ impl SessionStateMachine {
                         .map_err(SessionError::Decode)?;
                     self.on_pointer(update, outputs)?;
                 }
-                // Synchronize, large pointers (capability never advertised), surface
-                // commands (EGFX slices), orders: skipped.
+                fastpath::FP_UPDATE_SURFCMDS => {
+                    for command in
+                        surface_commands::decode_all(&data).map_err(SessionError::Decode)?
+                    {
+                        self.note_unadvertised(&command);
+                        // A Frame Marker is decoded and dropped.
+                        if let SurfaceCommand::SurfaceBits(bits) = command
+                            && let Some(frame_update) = self.apply_surface_bits(&bits)?
+                        {
+                            outputs.push(SessionOutput::Frame(frame_update));
+                        }
+                    }
+                }
+                // Synchronize, large pointers (capability never advertised), orders: skipped.
                 _ => {}
             }
         }
@@ -954,6 +991,87 @@ impl SessionStateMachine {
             // and to call the skip a decode; #252.)
             _ => Ok(()),
         }
+    }
+
+    /// Record a surface command whose `cmdFlags` bit the Confirm Active did not set (ADR-0009
+    /// §3(b)).
+    fn note_unadvertised(&self, command: &SurfaceCommand<'_>) {
+        let (cmd_type, flag) = match command {
+            SurfaceCommand::SurfaceBits(bits)
+                if bits.cmd_type == surface_commands::CMDTYPE_STREAM_SURFACE_BITS =>
+            {
+                (bits.cmd_type, capability::SURFCMDS_STREAM_SURFACE_BITS)
+            }
+            SurfaceCommand::SurfaceBits(bits) => {
+                (bits.cmd_type, capability::SURFCMDS_SET_SURFACE_BITS)
+            }
+            SurfaceCommand::FrameMarker(_) => (
+                surface_commands::CMDTYPE_FRAME_MARKER,
+                capability::SURFCMDS_FRAME_MARKER,
+            ),
+        };
+        if self.surface_commands & flag == 0 {
+            tracing::debug!(
+                target: "rdp_surface_bits",
+                cmd_type,
+                advertised = self.surface_commands,
+                "surface command the Confirm Active did not advertise"
+            );
+        }
+    }
+
+    /// Decode one Set Surface Bits / Stream Surface Bits command into the framebuffer, at
+    /// `(destLeft, destTop)` with the bitmap's own size (2.2.9.2.1: `destRight`/`destBottom`
+    /// SHOULD be ignored).
+    fn apply_surface_bits(
+        &mut self,
+        bits: &SurfaceBits<'_>,
+    ) -> Result<Option<FrameUpdate>, SessionError> {
+        let bitmap = &bits.bitmap;
+        if bitmap.width > self.framebuffer.width() || bitmap.height > self.framebuffer.height() {
+            return Err(SessionError::Decode(
+                justrdp_pdu::DecodeError::InvalidField {
+                    field: "TS_BITMAP_DATA_EX",
+                    reason: "surface bits exceed the negotiated desktop size",
+                },
+            ));
+        }
+        let width = usize::from(bitmap.width);
+        let height = usize::from(bitmap.height);
+        // Both layouts are bottom-up.
+        let rgba = match bitmap.codec_id {
+            0 => color::to_rgba(
+                bitmap.data,
+                width,
+                height,
+                u16::from(bitmap.bpp),
+                &self.palette,
+                true,
+            )
+            .map_err(SessionError::Color)?,
+            capability::CODEC_ID_NSCODEC if self.nscodec_advertised => {
+                let bgra = nscodec::decode(bitmap.data, bitmap.width, bitmap.height)
+                    .map_err(SessionError::Nscodec)?;
+                color::to_rgba(&bgra, width, height, 32, &Palette::default(), true)
+                    .map_err(SessionError::Color)?
+            }
+            codec_id => {
+                tracing::debug!(
+                    target: "rdp_surface_bits",
+                    codec_id,
+                    "Set Surface Bits with a codec ID the client did not advertise — skipped"
+                );
+                return Ok(None);
+            }
+        };
+        Ok(self.framebuffer.blit(
+            bits.dest_left,
+            bits.dest_top,
+            bitmap.width,
+            bitmap.height,
+            &rgba,
+            width,
+        ))
     }
 
     /// Decode one bitmap rectangle into the framebuffer.
@@ -1461,6 +1579,206 @@ mod tests {
             .copy_rect_into(frame.x, frame.y, frame.width, frame.height, &mut px)
             .expect("a FrameUpdate this framebuffer produced is in bounds");
         px
+    }
+
+    /// One fast-path Surface Commands Update carrying `body`.
+    fn surface_commands_pdu(body: &[u8]) -> Vec<u8> {
+        fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_SURFCMDS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            body,
+        )])
+    }
+
+    /// A Set Surface Bits command at `(x, y)` whose bitmap is `w`×`h` in `codec_id`.
+    fn set_surface_bits(x: u16, y: u16, w: u16, h: u16, codec_id: u8, data: &[u8]) -> Vec<u8> {
+        let mut out = surface_commands::CMDTYPE_SET_SURFACE_BITS
+            .to_le_bytes()
+            .to_vec();
+        for v in [x, y, x + w, y + h] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&[32, 0, 0, codec_id]);
+        out.extend_from_slice(&w.to_le_bytes());
+        out.extend_from_slice(&h.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn frame_marker(action: u16) -> Vec<u8> {
+        let mut out = surface_commands::CMDTYPE_FRAME_MARKER
+            .to_le_bytes()
+            .to_vec();
+        out.extend_from_slice(&action.to_le_bytes());
+        out.extend_from_slice(&9u32.to_le_bytes());
+        out
+    }
+
+    /// A 1×2 NSCodec stream with raw planes and colour-loss level 1. Plane row 0 is
+    /// Y100 Co10 Cg5 (RGB 105,105,85); plane row 1 is Y50 Co0 Cg0 (RGB 50,50,50).
+    fn nscodec_1x2() -> Vec<u8> {
+        let mut nsc = Vec::new();
+        for count in [2u32, 2, 2, 2] {
+            nsc.extend_from_slice(&count.to_le_bytes());
+        }
+        nsc.extend_from_slice(&[1, 0, 0, 0]); // ColorLossLevel, ChromaSubsamplingLevel, reserved
+        nsc.extend_from_slice(&[100, 50, 10, 0, 5, 0, 255, 255]); // Y, Co, Cg, A planes
+        nsc
+    }
+
+    /// Issue #150: NSCodec Set Surface Bits paint at `(destLeft, destTop)` with the bitmap's
+    /// own size, bottom-up: plane row 0 is the bottom row on screen.
+    #[test]
+    fn nscodec_surface_bits_paint_bottom_up_at_the_destination() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let outputs = sm
+            .process_bytes(&surface_commands_pdu(&set_surface_bits(
+                3,
+                2,
+                1,
+                2,
+                capability::CODEC_ID_NSCODEC,
+                &nscodec_1x2(),
+            )))
+            .unwrap();
+        let [SessionOutput::Frame(frame)] = outputs.as_slice() else {
+            panic!("expected one frame, got {outputs:?}");
+        };
+        assert_eq!((frame.x, frame.y, frame.width, frame.height), (3, 2, 1, 2));
+        assert_eq!(
+            frame_pixels(&sm, frame),
+            [50, 50, 50, 255, 105, 105, 85, 255]
+        );
+    }
+
+    /// 2.2.9.2.1: `destRight`/`destBottom` SHOULD be ignored, so a bitmap paints at its own size
+    /// whatever they say.
+    #[test]
+    fn surface_bits_ignore_dest_right_and_bottom() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let mut bits = set_surface_bits(3, 2, 1, 2, capability::CODEC_ID_NSCODEC, &nscodec_1x2());
+        bits[6..10].copy_from_slice(&[0, 0, 0, 0]); // destRight = destBottom = 0
+        let outputs = sm.process_bytes(&surface_commands_pdu(&bits)).unwrap();
+        let [SessionOutput::Frame(frame)] = outputs.as_slice() else {
+            panic!("expected one frame, got {outputs:?}");
+        };
+        assert_eq!((frame.x, frame.y, frame.width, frame.height), (3, 2, 1, 2));
+    }
+
+    /// Issue #150: `codecID` 0 is unencoded, and bottom-up like the slow path's bitmaps.
+    #[test]
+    fn unencoded_surface_bits_paint_bottom_up() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let bgra = [1, 2, 3, 0, 4, 5, 6, 0];
+        let outputs = sm
+            .process_bytes(&surface_commands_pdu(&set_surface_bits(
+                0, 0, 1, 2, 0, &bgra,
+            )))
+            .unwrap();
+        let [SessionOutput::Frame(frame)] = outputs.as_slice() else {
+            panic!("expected one frame, got {outputs:?}");
+        };
+        let px = frame_pixels(&sm, frame);
+        assert_eq!((&px[..3], &px[4..7]), (&[6, 5, 4][..], &[3, 2, 1][..]));
+    }
+
+    /// Frame Markers paint nothing, and do not stop the commands around them.
+    #[test]
+    fn frame_markers_bracket_surface_bits_without_painting() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let mut body = frame_marker(surface_commands::FRAMEACTION_BEGIN);
+        body.extend(set_surface_bits(
+            0,
+            0,
+            1,
+            2,
+            capability::CODEC_ID_NSCODEC,
+            &nscodec_1x2(),
+        ));
+        body.extend(frame_marker(surface_commands::FRAMEACTION_END));
+        let outputs = sm.process_bytes(&surface_commands_pdu(&body)).unwrap();
+        assert!(
+            matches!(outputs.as_slice(), [SessionOutput::Frame(_)]),
+            "{outputs:?}"
+        );
+        let markers_only = frame_marker(surface_commands::FRAMEACTION_BEGIN);
+        assert!(
+            sm.process_bytes(&surface_commands_pdu(&markers_only))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A codec ID the Confirm Active never assigned is skipped, not fatal (ADR-0009 §2) — and so
+    /// is NSCodec's ID when NSCodec was not advertised.
+    #[test]
+    fn surface_bits_in_a_codec_never_advertised_paint_nothing() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let bits = set_surface_bits(0, 0, 1, 2, 3, &[0; 8]);
+        assert_eq!(
+            sm.process_bytes(&surface_commands_pdu(&bits)),
+            Ok(Vec::new())
+        );
+
+        let mut cfg = config();
+        cfg.capabilities
+            .retain(|set| !matches!(set, CapabilitySet::BitmapCodecs(_)));
+        let mut sm = SessionStateMachine::new(cfg, Vec::new()).unwrap();
+        let bits = set_surface_bits(0, 0, 1, 2, capability::CODEC_ID_NSCODEC, &nscodec_1x2());
+        assert_eq!(
+            sm.process_bytes(&surface_commands_pdu(&bits)),
+            Ok(Vec::new())
+        );
+
+        // NSCodec under another codec ID, which the connect layer refuses, does not count.
+        let mut cfg = config();
+        for set in &mut cfg.capabilities {
+            if let CapabilitySet::BitmapCodecs(c) = set {
+                c.codecs[0].id = 2;
+            }
+        }
+        let mut sm = SessionStateMachine::new(cfg, Vec::new()).unwrap();
+        assert_eq!(
+            sm.process_bytes(&surface_commands_pdu(&bits)),
+            Ok(Vec::new())
+        );
+    }
+
+    /// Surface bits larger than the desktop are refused before any decoder allocates.
+    #[test]
+    fn surface_bits_larger_than_the_desktop_are_refused() {
+        for (w, h) in [(17, 1), (1, 9)] {
+            let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+            let bits = set_surface_bits(0, 0, w, h, capability::CODEC_ID_NSCODEC, &[]);
+            assert_eq!(
+                sm.process_bytes(&surface_commands_pdu(&bits)),
+                Err(SessionError::Decode(
+                    justrdp_pdu::DecodeError::InvalidField {
+                        field: "TS_BITMAP_DATA_EX",
+                        reason: "surface bits exceed the negotiated desktop size",
+                    }
+                )),
+                "{w}x{h}"
+            );
+        }
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let bits = set_surface_bits(0, 0, 16, 8, 0, &[0; 16 * 8 * 4]);
+        assert!(
+            sm.process_bytes(&surface_commands_pdu(&bits)).is_ok(),
+            "the desktop size fits"
+        );
+    }
+
+    /// NSCodec bitmap data that does not decode is a typed error.
+    #[test]
+    fn malformed_nscodec_surface_bits_are_a_typed_error() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let bits = set_surface_bits(0, 0, 1, 2, capability::CODEC_ID_NSCODEC, &[0; 4]);
+        assert!(matches!(
+            sm.process_bytes(&surface_commands_pdu(&bits)),
+            Err(SessionError::Nscodec(_))
+        ));
     }
 
     fn config() -> SessionConfig {

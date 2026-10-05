@@ -129,6 +129,16 @@ rather than by capability:
   found the default's `DYNVC_GFX` obligation to support auto-detect unmet. It is latent while
   no message channel is requested.
 
+- **#150** — the allow-list grew by three sets at once (Surface Commands, Multifragment Update,
+  NSCodec in Bitmap Codecs), each row naming what it invites: Set Surface Bits, reassembled
+  updates up to `MaxRequestSize`, and NSCodec streams within the advertised properties. Frame
+  Markers and Stream Surface Bits stay refused, the first because the session drops it and the
+  second because its destination bounds mean something the session does not read. It also found the rule's **other direction**, on the server's side: an advertisement
+  the client can honour may still be one the *server* cannot use alone. Advertising Surface
+  Commands and NSCodec without a Multifragment Update set made this VM close the session with Set
+  Error Info `0x112F` before any surface bits, so the Multifragment set went into the defaults as a
+  condition of the other two rather than as a feature of its own.
+
 ## Where it will recur
 
 **Whenever a capability, flag, version or feature bit is added to something this client

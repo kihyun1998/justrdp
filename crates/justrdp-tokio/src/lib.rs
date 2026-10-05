@@ -3075,8 +3075,28 @@ mod tests {
         with_vm_session(|vm| async move {
             let mut config = legacy_graphics_config();
             config.channels = vec![cliprdr::channel_def()];
+            // NSCodec is lossy, so the framebuffer it paints cannot match a screenshot pixel for
+            // pixel; without these two sets the server paints in lossless bitmap updates.
+            config.capabilities.retain(|set| {
+                !matches!(
+                    set,
+                    justrdp_pdu::capability::CapabilitySet::SurfaceCommands(_)
+                        | justrdp_pdu::capability::CapabilitySet::BitmapCodecs(_)
+                )
+            });
             let session_capabilities = config.capabilities.clone();
             let outcome = vm.connect(config).await;
+            let session_bpp = outcome
+                .activation
+                .server_capabilities
+                .iter()
+                .find_map(|set| match set {
+                    justrdp_pdu::capability::CapabilitySet::Bitmap(b) => {
+                        Some(b.preferred_bits_per_pixel)
+                    }
+                    _ => None,
+                })
+                .expect("the Demand Active carries a Bitmap set");
             let channel = outcome
                 .mcs
                 .static_channels
@@ -3348,19 +3368,23 @@ mod tests {
             assert_eq!((w, h), (usize::from(desktop.0), usize::from(desktop.1)));
             // The session runs at 16 bpp, so each channel reached the host as its top 5 or 6
             // bits, widened again by repeating the top bits.
-            let rgb565 = |[r, g, b]: [u8; 3]| {
-                let five = |c: u8| (c >> 3) << 3 | c >> 5;
-                let six = |c: u8| (c >> 2) << 2 | c >> 6;
-                [five(r), six(g), five(b)]
+            // At 16 bpp the framebuffer holds the screenshot's colours reduced to RGB565.
+            let at_session_depth = |[r, g, b]: [u8; 3]| match session_bpp {
+                16 => {
+                    let five = |c: u8| (c >> 3) << 3 | c >> 5;
+                    let six = |c: u8| (c >> 2) << 2 | c >> 6;
+                    [five(r), six(g), five(b)]
+                }
+                _ => [r, g, b],
             };
             let differing = shot
                 .iter()
                 .zip(frame.as_chunks::<4>().0)
-                .filter(|(s, f)| rgb565(**s)[..] != f[..3])
+                .filter(|(s, f)| at_session_depth(**s)[..] != f[..3])
                 .count();
             assert_eq!(
                 differing, 0,
-                "the screenshot, at the session's 16 bpp, matches the framebuffer pixel for pixel"
+                "the screenshot, at the session's {session_bpp} bpp, matches the framebuffer pixel for pixel"
             );
 
             // Host to server: Paint gave the gradient back.
@@ -6274,29 +6298,16 @@ mod tests {
         .await
     }
 
-    /// Probe for issue #150 (standalone NSCodec via Surface Bits): does this VM advertise the
-    /// infrastructure that path needs — a SurfaceCommands capset (CAPSTYPE 0x001C, without which the
-    /// server never sends Surface Bits) and a BitmapCodecs capset (0x001D) listing the NSCodec GUID?
-    /// Prints the server's full Demand-Active capset inventory so the #150 defer-vs-build decision
-    /// rests on what the real WS2022 negotiates rather than an assumption. Advisory: it asserts only
-    /// that session-active was reached, never that the codecs are present — the VM is free not to
-    /// offer them (the expected outcome, since modern Windows prefers EGFX/RemoteFX and emits NSCodec
-    /// only as a ClearCodec subcodec, already covered by the replay corpus). Run with `--nocapture`.
+    /// Prints the server's Demand Active capability sets, flagging the two Surface Bits with
+    /// NSCodec needs: a Surface Commands set and NSCodec among the Bitmap Codecs. Advisory: it
+    /// asserts only that session-active was reached. A server advertising both need not send
+    /// either (#150: this VM advertised both while capping legacy sessions at 16 bpp, and sent
+    /// no Surface Bits until its colour-depth policy allowed 32). Run with `--nocapture`.
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn vm_advertised_bitmap_codecs_and_surface_commands() {
         with_vm_session(|vm| async move {
         let outcome = vm.connect(legacy_graphics_config()).await;
-
-        // The NSCodec GUID in wire order (Data1/2/3 little-endian, Data4 verbatim) — the same bytes
-        // justrdp-pdu's activation differential test pins.
-        const NSCODEC_GUID: [u8; 16] = [
-            0xb9, 0x1b, 0x8d, 0xca, 0x0f, 0x00, 0x4f, 0x15, //
-            0x58, 0x9f, 0xae, 0x2d, 0x1a, 0x87, 0xe2, 0xd6,
-        ];
-        // CAPSTYPE_SURFACE_COMMANDS (MS-RDPBCGR 2.2.7.2.9) — not yet a named constant in justrdp-pdu,
-        // so a server that sends it lands in CapabilitySet::Unknown with this raw type.
-        const CAPSET_SURFACE_COMMANDS: u16 = 0x001C;
 
         let caps = &outcome.activation.server_capabilities;
         eprintln!("server advertised {} capability sets:", caps.len());
@@ -6306,7 +6317,7 @@ mod tests {
             match set {
                 CapabilitySet::BitmapCodecs(b) => {
                     for c in &b.codecs {
-                        let is_nsc = c.guid == NSCODEC_GUID;
+                        let is_nsc = c.guid == justrdp_pdu::capability::CODEC_GUID_NSCODEC;
                         has_nscodec |= is_nsc;
                         eprintln!(
                             "  BitmapCodecs codec id={} guid={:02x?}{}",
@@ -6316,15 +6327,13 @@ mod tests {
                         );
                     }
                 }
+                CapabilitySet::SurfaceCommands(c) => {
+                    has_surface_commands = true;
+                    eprintln!("  SurfaceCommands cmdFlags={:#010x}", c.cmd_flags);
+                }
                 CapabilitySet::Unknown { set_type, data } => {
-                    let tag = if *set_type == CAPSET_SURFACE_COMMANDS {
-                        has_surface_commands = true;
-                        "  <- SurfaceCommands"
-                    } else {
-                        ""
-                    };
                     eprintln!(
-                        "  Unknown capset type={set_type:#06x} ({} body bytes){tag}",
+                        "  Unknown capset type={set_type:#06x} ({} body bytes)",
                         data.len()
                     );
                 }
@@ -6334,24 +6343,145 @@ mod tests {
         eprintln!(
             "#150 probe: SurfaceCommands(0x1C)={has_surface_commands}  NSCodec-in-BitmapCodecs={has_nscodec}"
         );
-        eprintln!(
-            "  => NSCodec-standalone is {} on this VM",
-            if has_surface_commands && has_nscodec {
-                "POSSIBLE — a future Surface-Bits build would have a DoD-4 proof path here"
-            } else {
-                "NOT offered — defer #150 as unprovable against this VM"
-            }
-        );
         })
         .await
     }
 
-    /// Caller policy for a *legacy-graphics* (bitmap update) session: do NOT advertise
+    /// Issue #150: with the default capability sets and a 32-bpp session, the VM paints the
+    /// whole desktop as NSCodec Set Surface Bits, and the session decodes every one. The test
+    /// drives the socket itself so it can count which fast-path update each frame arrived in.
+    ///
+    /// Needs the VM's *Limit maximum color depth* policy at 32 bpp: at 16 bpp the server never
+    /// sends Surface Bits, so the first assertion names that dependency rather than a codec.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn nscodec_surface_bits_paint_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            use justrdp_pdu::capability::CapabilitySet;
+            use justrdp_pdu::fastpath;
+
+            let config = legacy_graphics_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let server_bpp = outcome
+                .activation
+                .server_capabilities
+                .iter()
+                .find_map(|set| match set {
+                    CapabilitySet::Bitmap(b) => Some(b.preferred_bits_per_pixel),
+                    _ => None,
+                });
+            eprintln!("#150: the server's Demand Active colour depth is {server_bpp:?}");
+
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover.clone(),
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+            let mut inbox = outcome.activation.leftover;
+            let mut readbuf = [0u8; 16 * 1024];
+            let mut updates = std::collections::BTreeMap::<u8, usize>::new();
+            let (width, height) = outcome.activation.desktop_size;
+            let (width, height) = (usize::from(width), usize::from(height));
+            let mut painted = vec![false; width * height];
+            let mut frames = 0usize;
+            let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
+            let mut fed = 0usize;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                for output in pending.drain(..) {
+                    match output {
+                        justrdp::SessionOutput::Frame(frame) => {
+                            frames += 1;
+                            for y in usize::from(frame.y)..usize::from(frame.y + frame.height) {
+                                let row = y * width + usize::from(frame.x);
+                                painted[row..row + usize::from(frame.width)].fill(true);
+                            }
+                        }
+                        justrdp::SessionOutput::WriteBytes(bytes) => {
+                            stream.write_all(&bytes).await.expect("write to the VM");
+                        }
+                        _ => {}
+                    }
+                }
+                // Classify a copy of the stream by fast-path update code.
+                while let Some(&first) = inbox.first() {
+                    let len = if fastpath::is_fastpath(first) {
+                        fastpath::frame_len(&inbox)
+                    } else {
+                        justrdp_pdu::tpkt::frame_len(&inbox)
+                    };
+                    let Ok(len) = len else { break };
+                    if inbox.len() < len {
+                        break;
+                    }
+                    let frame: Vec<u8> = inbox.drain(..len).collect();
+                    if fastpath::is_fastpath(first) {
+                        for section in fastpath::decode_updates(&frame).expect("fast-path frame") {
+                            *updates.entry(section.code).or_default() += 1;
+                        }
+                    }
+                }
+                match tokio::time::timeout_at(deadline, stream.read(&mut readbuf)).await {
+                    Ok(Ok(0)) => panic!("the server closed the session: {updates:?}"),
+                    Ok(Ok(n)) => {
+                        inbox.extend_from_slice(&readbuf[..n]);
+                        fed += n;
+                        pending = feed_session(&mut machine, &readbuf[..n])
+                            .expect("every surface command decodes");
+                    }
+                    Ok(Err(e)) => panic!("read failed: {e}"),
+                    Err(_) => break,
+                }
+            }
+
+            let fb = machine.framebuffer();
+            let covered = painted.iter().filter(|&&p| p).count();
+            eprintln!(
+                "#150: updates by code {updates:?}, frames={frames}, painted {covered} of {} pixels, {fed} session bytes fed",
+                width * height
+            );
+            assert!(
+                updates.get(&fastpath::FP_UPDATE_SURFCMDS).copied().unwrap_or(0) > 0,
+                "no Surface Commands update arrived at {server_bpp:?} bpp: {updates:?} — at 16 bpp the VM sends none (its Limit maximum color depth policy)"
+            );
+            assert_eq!(
+                updates.get(&fastpath::FP_UPDATE_BITMAP),
+                None,
+                "the desktop arrived as bitmap updates, not surface bits"
+            );
+            assert_eq!(covered, width * height, "every pixel of the desktop is painted");
+            let mut distinct = std::collections::HashSet::new();
+            for px in fb.pixels().as_chunks::<4>().0 {
+                distinct.insert([px[0], px[1], px[2]]);
+                if distinct.len() > 16 {
+                    break;
+                }
+            }
+            assert!(
+                distinct.len() > 16,
+                "framebuffer is near-monochrome ({} colors) — decode likely broken",
+                distinct.len()
+            );
+
+            let path = std::env::temp_dir().join("justrdp-150-nscodec-surface-bits.ppm");
+            let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+            for px in fb.pixels().as_chunks::<4>().0 {
+                ppm.extend_from_slice(&px[..3]);
+            }
+            std::fs::write(&path, ppm).expect("write the visual dump");
+            eprintln!("visual dump for confirmation: {}", path.display());
+        })
+        .await
+    }
+
+    /// Caller policy for a *legacy-graphics* session: do NOT advertise
     /// SUPPORT_DYN_VC_GFX_PROTOCOL (and skip drdynvc). A server seeing the EGFX gate flag
-    /// negotiates graphics over the dynamic channel and never falls back to bitmap updates
+    /// negotiates graphics over the dynamic channel and never falls back to the legacy path
     /// (verified against this VM: with the flag set it sends only drdynvc DVC requests and
-    /// zero bitmap data). Until the EGFX slice exists, the caller advertises what the client
-    /// can actually render — exactly the policy seam plan.md §0 demands stays caller-owned.
+    /// zero bitmap data). The capability sets are the defaults, so the server paints in bitmap
+    /// updates or, at 32 bpp, NSCodec Set Surface Bits (#150).
     fn legacy_graphics_config() -> ConnectConfig {
         let mut config = test_config();
         config.core.early_capability_flags = gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
@@ -6370,7 +6500,17 @@ mod tests {
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn captured_bitmap_rectangles_decode_identically_in_ironrdp() {
         with_vm_session(|vm| async move {
-            let outcome = vm.connect(legacy_graphics_config()).await;
+            // Without Surface Commands and Bitmap Codecs the server falls back to bitmap updates,
+            // which are this test's subject (#150).
+            let mut config = legacy_graphics_config();
+            config.capabilities.retain(|set| {
+                !matches!(
+                    set,
+                    justrdp_pdu::capability::CapabilitySet::SurfaceCommands(_)
+                        | justrdp_pdu::capability::CapabilitySet::BitmapCodecs(_)
+                )
+            });
+            let outcome = vm.connect(config).await;
             let mut stream = outcome.stream;
             let mut inbox = outcome.activation.leftover;
             let mut buf = [0u8; 16384];

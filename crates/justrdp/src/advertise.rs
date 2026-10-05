@@ -70,6 +70,13 @@ pub const HONOURED_VIRTUAL_CHANNEL_FLAGS: u32 = capability::VCCAPS_COMPR_CS_8K;
 /// The Sound set's `soundFlags` the core honours.
 pub const HONOURED_SOUND_FLAGS: u16 = capability::SOUND_FLAG_BEEPS;
 
+/// The Surface Commands set's `cmdFlags` the core honours.
+pub const HONOURED_SURFACE_COMMANDS: u32 = capability::SURFCMDS_SET_SURFACE_BITS;
+
+/// The largest Multifragment Update `MaxRequestSize` the core honours: the session's fast-path
+/// reassembly cap at its floor, which no desktop size lowers.
+pub const HONOURED_MAX_REQUEST_SIZE: u32 = (1 << 20) + (64 << 10);
+
 /// Why a [`ConnectConfig`] cannot be advertised.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectConfigError {
@@ -161,7 +168,22 @@ pub fn check(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
     config
         .capabilities
         .iter()
-        .try_for_each(check_capability_set)
+        .try_for_each(check_capability_set)?;
+    let surface_commands = config
+        .capabilities
+        .iter()
+        .any(|set| matches!(set, CapabilitySet::SurfaceCommands(s) if s.cmd_flags != 0));
+    let fastpath_output = config.capabilities.iter().any(|set| {
+        matches!(set, CapabilitySet::General(g)
+            if g.extra_flags & capability::GENERAL_FASTPATH_OUTPUT_SUPPORTED != 0)
+    });
+    if surface_commands && !fastpath_output {
+        return refuse(
+            capability::CAPSET_SURFACE_COMMANDS,
+            "surface commands require FASTPATH_OUTPUT_SUPPORTED in the General set (2.2.7.2.9)",
+        );
+    }
+    Ok(())
 }
 
 fn refuse(set_type: u16, reason: &'static str) -> Result<(), ConnectConfigError> {
@@ -211,10 +233,19 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
             capability::CAPSET_SOUND,
             "soundFlags outside SOUND_FLAG_BEEPS",
         ),
-        CapabilitySet::BitmapCodecs(c) if !c.codecs.is_empty() => refuse(
-            capability::CAPSET_BITMAP_CODECS,
-            "codecs are used by Set Surface Bits, which the session skips",
-        ),
+        CapabilitySet::SurfaceCommands(c) if c.cmd_flags & !HONOURED_SURFACE_COMMANDS != 0 => {
+            refuse(
+                capability::CAPSET_SURFACE_COMMANDS,
+                "cmdFlags outside the honoured set",
+            )
+        }
+        CapabilitySet::MultifragmentUpdate(m) if m.max_request_size > HONOURED_MAX_REQUEST_SIZE => {
+            refuse(
+                capability::CAPSET_MULTIFRAGMENT_UPDATE,
+                "MaxRequestSize above the session's fast-path reassembly cap",
+            )
+        }
+        CapabilitySet::BitmapCodecs(c) => c.codecs.iter().try_for_each(check_bitmap_codec),
         CapabilitySet::Unknown { set_type, .. } => {
             Err(ConnectConfigError::UnreadableCapabilitySet {
                 set_type: *set_type,
@@ -222,6 +253,21 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
         }
         _ => Ok(()),
     }
+}
+
+/// Refuse a Bitmap Codecs entry the session cannot decode: only NSCodec, at the codec ID
+/// 2.2.7.2.10.1.1 fixes for it, with properties the decoder handles.
+fn check_bitmap_codec(codec: &capability::BitmapCodec) -> Result<(), ConnectConfigError> {
+    let reason = if codec.guid != capability::CODEC_GUID_NSCODEC {
+        "the session decodes NSCodec alone"
+    } else if codec.id != capability::CODEC_ID_NSCODEC {
+        "NSCodec's codecID must be 1"
+    } else if capability::NsCodecProperties::decode(&codec.properties).is_err() {
+        "NSCodec properties outside TS_NSCODEC_CAPABILITYSET"
+    } else {
+        return Ok(());
+    };
+    refuse(capability::CAPSET_BITMAP_CODECS, reason)
 }
 
 #[cfg(test)]
@@ -537,7 +583,7 @@ mod tests {
     /// A set the core cannot read cannot be judged, so it is refused.
     #[test]
     fn an_unreadable_capability_set_is_refused() {
-        for set_type in [0x0005, 0x001A, 0x001B, 0x001C, 0x0013] {
+        for set_type in [0x0005, 0x001B, 0x0013, 0x001E] {
             assert_eq!(
                 with_set(CapabilitySet::Unknown {
                     set_type,
@@ -546,5 +592,112 @@ mod tests {
                 Err(ConnectConfigError::UnreadableCapabilitySet { set_type })
             );
         }
+    }
+
+    fn nscodec(id: u8, properties: Vec<u8>) -> CapabilitySet {
+        CapabilitySet::BitmapCodecs(BitmapCodecsCapabilitySet {
+            codecs: vec![BitmapCodec {
+                guid: capability::CODEC_GUID_NSCODEC,
+                id,
+                properties,
+            }],
+        })
+    }
+
+    /// Issue #150: Set Surface Bits carrying NSCodec is honoured at its edges: every honoured
+    /// command flag, the reassembly floor as `MaxRequestSize`, NSCodec at codec ID 1 with any
+    /// properties the spec allows.
+    #[test]
+    fn surface_bits_with_nscodec_pass_at_their_edges() {
+        for set in [
+            CapabilitySet::SurfaceCommands(capability::SurfaceCommandsCapabilitySet {
+                cmd_flags: capability::SURFCMDS_SET_SURFACE_BITS,
+            }),
+            CapabilitySet::MultifragmentUpdate(capability::MultifragmentUpdateCapabilitySet {
+                max_request_size: HONOURED_MAX_REQUEST_SIZE,
+            }),
+            nscodec(capability::CODEC_ID_NSCODEC, vec![0, 0, 1]),
+            nscodec(capability::CODEC_ID_NSCODEC, vec![1, 1, 7]),
+        ] {
+            assert_eq!(with_set(set.clone()), Ok(()), "{set:?}");
+        }
+    }
+
+    /// Issue #150: past those edges each set is refused by its own type.
+    #[test]
+    fn surface_bits_with_nscodec_are_refused_past_their_edges() {
+        for (set, set_type) in [
+            (
+                CapabilitySet::SurfaceCommands(capability::SurfaceCommandsCapabilitySet {
+                    cmd_flags: capability::SURFCMDS_SET_SURFACE_BITS | 0x0000_0001,
+                }),
+                capability::CAPSET_SURFACE_COMMANDS,
+            ),
+            // The session drops Frame Markers, so it does not invite them.
+            (
+                CapabilitySet::SurfaceCommands(capability::SurfaceCommandsCapabilitySet {
+                    cmd_flags: capability::SURFCMDS_SET_SURFACE_BITS
+                        | capability::SURFCMDS_FRAME_MARKER,
+                }),
+                capability::CAPSET_SURFACE_COMMANDS,
+            ),
+            // 2.2.9.2.2 gives Stream Surface Bits' destination bounds a meaning the session
+            // does not read.
+            (
+                CapabilitySet::SurfaceCommands(capability::SurfaceCommandsCapabilitySet {
+                    cmd_flags: capability::SURFCMDS_STREAM_SURFACE_BITS,
+                }),
+                capability::CAPSET_SURFACE_COMMANDS,
+            ),
+            (
+                CapabilitySet::MultifragmentUpdate(capability::MultifragmentUpdateCapabilitySet {
+                    max_request_size: HONOURED_MAX_REQUEST_SIZE + 1,
+                }),
+                capability::CAPSET_MULTIFRAGMENT_UPDATE,
+            ),
+            (nscodec(2, vec![1, 1, 3]), capability::CAPSET_BITMAP_CODECS),
+            (
+                nscodec(capability::CODEC_ID_NSCODEC, vec![1, 1, 8]),
+                capability::CAPSET_BITMAP_CODECS,
+            ),
+            (
+                nscodec(capability::CODEC_ID_NSCODEC, Vec::new()),
+                capability::CAPSET_BITMAP_CODECS,
+            ),
+        ] {
+            assert_eq!(
+                refused_type(with_set(set.clone())),
+                Some(set_type),
+                "{set:?}"
+            );
+        }
+    }
+
+    /// 2.2.7.2.9: a client advertising surface commands MUST set `FASTPATH_OUTPUT_SUPPORTED`.
+    #[test]
+    fn surface_commands_without_fastpath_output_are_refused() {
+        let mut config = config();
+        for set in &mut config.capabilities {
+            if let CapabilitySet::General(g) = set {
+                g.extra_flags &= !capability::GENERAL_FASTPATH_OUTPUT_SUPPORTED;
+            }
+        }
+        config
+            .capabilities
+            .retain(|set| !matches!(set, CapabilitySet::SurfaceCommands(_)));
+        assert_eq!(check(&config), Ok(()), "no surface commands, no obligation");
+        config.capabilities.push(CapabilitySet::SurfaceCommands(
+            capability::SurfaceCommandsCapabilitySet { cmd_flags: 0 },
+        ));
+        assert_eq!(check(&config), Ok(()), "no command flags, no obligation");
+        config.capabilities.push(CapabilitySet::SurfaceCommands(
+            capability::SurfaceCommandsCapabilitySet {
+                cmd_flags: capability::SURFCMDS_SET_SURFACE_BITS,
+            },
+        ));
+        assert_eq!(
+            refused_type(check(&config)),
+            Some(capability::CAPSET_SURFACE_COMMANDS)
+        );
     }
 }

@@ -18,7 +18,7 @@ pub const FP_UPDATE_BITMAP: u8 = 0x1;
 pub const FP_UPDATE_PALETTE: u8 = 0x2;
 /// `updateCode`: synchronize (no payload).
 pub const FP_UPDATE_SYNCHRONIZE: u8 = 0x3;
-/// `updateCode`: surface commands (the EGFX-era path; later slices).
+/// `updateCode`: surface commands (a `TS_FP_SURFCMDS` body, [`crate::surface_commands`]).
 pub const FP_UPDATE_SURFCMDS: u8 = 0x4;
 /// `updateCode`: hide the pointer (the fast-path form of SYSPTR_NULL).
 pub const FP_UPDATE_PTR_NULL: u8 = 0x5;
@@ -36,8 +36,8 @@ pub const FP_UPDATE_NEW_POINTER: u8 = 0xB;
 /// Large Pointer capability, which this client does not. **Named, not handled** — this
 /// constant has no reference site, so a server that sent one would fall to the dispatch's
 /// catch-all with its cursor unread. The doc said "decoded-and-skipped" until #252, which
-/// was wrong twice over; `FP_UPDATE_ORDERS` and `FP_UPDATE_SURFCMDS` are the same shape and
-/// say nothing, which is the honest form.
+/// was wrong twice over; `FP_UPDATE_ORDERS` is the same shape and says nothing, which is the
+/// honest form.
 pub const FP_UPDATE_LARGE_POINTER: u8 = 0xC;
 
 /// `fragmentation`: a complete update in one PDU.

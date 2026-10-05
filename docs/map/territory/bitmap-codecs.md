@@ -289,11 +289,18 @@ attacker-controlled bytes in the repo.
 
 ## Reference behaviour
 
-**None.** No verified external-fact store — despite this being the territory with
-the *most* reference-derived behaviour in the repo (FreeRDP's OOB fixes, IronRDP's
-decoders). What exists instead: the differential tests themselves, and the
-`clearcodec_corpus` fixtures, which encode reference behaviour as data rather than
-as citations.
+**NSCodec over Set Surface Bits is bottom-up** (#150, 2026-10-01). Neither `[MS-RDPNSC]` nor
+`[MS-RDPEGDI]` states a row order; FreeRDP's encoder writes plane row 0 as the bottom image row
+(`nsc_encode.c`) and its client decodes Surface Bits with `FREERDP_FLIP_VERTICAL` (`gdi.c`). The
+real VM agrees: 1432 NSCodec tiles replayed bottom-up render the desktop as the server drew it,
+and the framebuffer hash pinned in `justrdp/tests/real_server_surface_bits.rs` was taken after
+that render was looked at. The stream there is 64×64 tiles (64×32 on the last row), colour-loss
+level 3, 1409 of 1432 chroma-subsampled, none with an alpha plane.
+
+Beyond that, no verified external-fact store — despite this being the territory with the *most*
+reference-derived behaviour in the repo (FreeRDP's OOB fixes, IronRDP's decoders). What exists
+instead: the differential tests themselves, and the `clearcodec_corpus` fixtures, which encode
+reference behaviour as data rather than as citations.
 
 ## Cross-cutting invariants
 
@@ -328,8 +335,11 @@ as citations.
 
 ## Known holes / open
 
-- **Standalone NSCodec (surface bits / bitmap cache) is not built** — #150; today's
-  NSCodec exists as the ClearCodec subcodec only.
+- **NSCodec arrives two ways since #150**: as the ClearCodec subcodec and as Set Surface Bits
+  (`justrdp::session`'s `apply_surface_bits`). The two disagree on orientation: Surface Bits
+  planes are bottom-up, which no `[MS-*]` section states (see `## Reference behaviour`).
+  RemoteFX and Image RemoteFX over Set Surface Bits are not built; the connect layer refuses
+  their GUIDs, so no server is invited to send them.
 - **RemoteFX Progressive is self-owned and live** — epic #158, closed by #172. Slices 1–5
   landed the wire parser (#167), the upgrade-pass entropy layer (#168, `rfx/srl.rs`), the
   multi-pass tile decode plus the reduce-extrapolate inverse DWT (#169), the store's lifecycle

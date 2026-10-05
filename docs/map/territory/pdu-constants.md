@@ -39,7 +39,7 @@ sets each flag, not how the constant tables are laid out.
 - `justrdp-pdu/src/gcc.rs` — `ClientEarlyCapabilityFlags` (14 consts, incl.
   `SUPPORT_DYN_VC_GFX_PROTOCOL = 0x0100`), channel-option flags
 - `justrdp-pdu/src/egfx.rs` — 32 consts (PDU types, caps versions)
-- `justrdp-pdu/src/capability.rs` — 23 consts (capability set type codes)
+- `justrdp-pdu/src/capability.rs` — 39 consts (capability set type codes and their flags)
 - `justrdp-pdu/src/share.rs` — 17 consts (share control/data PDU types)
 - `justrdp-pdu/src/license.rs` — 16 consts; `justrdp-pdu/src/fastpath.rs` — 16;
   `justrdp-pdu/src/input.rs` — 15 (incl. `SYNC_CAPS_LOCK`, `SYNC_NUM_LOCK`,
@@ -81,6 +81,6 @@ transcription error.
   feature that does not turn on, or a real server disagreeing.
 - Unknown capability types decode into an `Unknown` variant carrying the raw type —
   which is the tolerant behaviour ADR-0009 wants, and also means a *missing* constant
-  never announces itself. A live example sits in the adapter's own tests:
-  `CAPSTYPE_SURFACE_COMMANDS` has no named constant, so a real server's cap lands in
+  never announces itself. `CAPSTYPE_SURFACE_COMMANDS` was the live example until #150: the
+  adapter's own probe test carried it as a local literal, and a real server's set landed in
   `CapabilitySet::Unknown`.

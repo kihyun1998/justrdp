@@ -74,13 +74,32 @@ Deactivation–Reactivation, which is how a resize actually happens.
   | Pointer, Input | all values (the pointer cache is sized from the set; input flags are client to server) | — |
   | Virtual Channel | `VCCAPS_COMPR_CS_8K` | `VCCAPS_COMPR_SC` (compressed channel data); undefined bits |
   | Sound | `SOUND_FLAG_BEEPS` (#354) | any other bit |
-  | Bitmap Codecs | no codecs | any codec (Set Surface Bits is skipped) |
-  | Any other set | — | refused unread: it cannot be judged. Bitmap Cache rev. 2, Large Pointer, Multifragment Update, Surface Commands, Control, Share, Font and the rest wait for a reader |
+  | Multifragment Update (2.2.7.2.6) | `MaxRequestSize` up to `HONOURED_MAX_REQUEST_SIZE`, the session's fast-path reassembly cap at its floor (#150) | a larger one: the server may then send a reassembled update the session refuses |
+  | Surface Commands (2.2.7.2.9) | `SETSURFACEBITS`, with `FASTPATH_OUTPUT` in the General set (#150) | `FRAMEMARKER` (the session drops Frame Markers); `STREAMSURFACEBITS` (2.2.9.2.2 makes its destination bounds meaningful where 2.2.9.2.1 says to ignore them, the session reads neither, and no capture holds one); any other bit; any command flag without `FASTPATH_OUTPUT`, which 2.2.7.2.9 makes a MUST |
+  | Bitmap Codecs (2.2.7.2.10) | no codecs, or NSCodec at codec ID 1 with properties `TS_NSCODEC_CAPABILITYSET` allows (#150) | any other codec (Set Surface Bits decodes NSCodec alone); NSCodec at another ID, which 2.2.7.2.10.1.1 forbids |
+  | Any other set | — | refused unread: it cannot be judged. Bitmap Cache rev. 2, Large Pointer, Frame Acknowledge, Control, Share, Font and the rest wait for a reader |
 
   #352 had listed `RELATIVE_MOUSE` among the refused bits. The spec gives it no
   server-to-client traffic (2.2.1.3.2 points only at client input events), so it is honoured.
   `DYNAMIC_TIME_ZONE` is refused on a different ground than #352 gave: it invites no server
   PDU, but it promises Client Info fields the encoder does not write.
+- **The defaults advertise NSCodec over Set Surface Bits, with a Multifragment Update set**
+  (#150). Adding them to `default_client_capabilities` was the maintainer's call, made on
+  plan.md §5a's *"advertise everything we can handle"* and shown against an opt-in-only option;
+  it was made **before** two measurements it could not have seen. The Multifragment set then
+  went in as a derivation: without it this server sent Set Error Info `0x112F` and closed the
+  session before any surface bits, so a default without it would end every 32-bpp legacy
+  session. And with the defaults, a legacy session on a server at 32 bpp paints in NSCodec
+  surface bits rather than bitmap updates, which the decision did not address by name.
+  `SURFCMDS_FRAME_MARKER` is refused: the session decodes and drops markers rather than grouping
+  a frame's tiles, and 2.2.9.2.3 gives markers that purpose.
+- **Two calls after those measurements were the maintainer's** (#150, judgements). Shown that this
+  VM closes a session advertising Surface Commands without a Multifragment Update set, they chose
+  **not** to refuse that combination: the evidence is one server's behaviour, not a spec
+  obligation, and ADR-0016 Decision 3 covers traffic the core drops, not a server's
+  preconditions. Shown that the default NSCodec properties (dynamic fidelity, subsampling,
+  colour-loss level 3, FreeRDP's values) make a 32-bpp legacy session lossy, they kept them; a host
+  wanting lossless pixels sets the properties or leaves NSCodec out of its capability sets.
 - **`DYNVC_GFX` carries an obligation the core does not meet, and it is latent.** 2.2.1.3.2:
   *"Setting this flag requires that the client support network characteristics detection"*.
   The core does not implement auto-detect, but those PDUs ride the message channel, which the
@@ -94,10 +113,13 @@ Deactivation–Reactivation, which is how a resize actually happens.
   `PointerCapabilitySet`, `InputCapabilitySet`, `VirtualChannelCapabilitySet`,
   `SoundCapabilitySet` (`SOUND_FLAG_BEEPS`, #354), `BitmapCodec`, `BitmapCodecsCapabilitySet`,
   `BitmapCacheCapabilitySet`, `BrushCapabilitySet`, `GlyphCacheCapabilitySet`,
-  `OffscreenCacheCapabilitySet` (#357)
+  `OffscreenCacheCapabilitySet` (#357), `MultifragmentUpdateCapabilitySet`,
+  `SurfaceCommandsCapabilitySet`, `NsCodecProperties`, `CODEC_GUID_NSCODEC`, `CODEC_ID_NSCODEC`
+  (#150)
 - `justrdp/src/advertise.rs` — `check`, `ConnectConfigError`, `HONOURED_EARLY_CAPABILITY_FLAGS`,
   `HONOURED_CLIENT_INFO_FLAGS`, `HONOURED_CHANNEL_OPTIONS`, `HONOURED_GENERAL_EXTRA_FLAGS`,
-  `HONOURED_DRAWING_FLAGS`, `HONOURED_VIRTUAL_CHANNEL_FLAGS`, `HONOURED_SOUND_FLAGS`
+  `HONOURED_DRAWING_FLAGS`, `HONOURED_VIRTUAL_CHANNEL_FLAGS`, `HONOURED_SOUND_FLAGS`,
+  `HONOURED_SURFACE_COMMANDS`, `HONOURED_MAX_REQUEST_SIZE`, `check_bitmap_codec`
 - `justrdp-tokio/src/lib.rs` — `ConnectFailure::Config`
 - `justrdp-pdu/src/share.rs` — `ShareControlHeader`, `ShareDataHeader`,
   `encode_share_control`, `encode_share_data`
@@ -112,11 +134,21 @@ Deactivation–Reactivation, which is how a resize actually happens.
 
 **The server's Demand Active carries 17 sets, none of the four #357 typed** (2026-10-01,
 `vm_advertised_bitmap_codecs_and_surface_commands`). Typed: General, Bitmap, Order, Pointer,
-Input, Virtual Channel, Bitmap Codecs (four codecs, NSCodec among them). Unread: `0x0009` Share,
-`0x000A` Color Cache, `0x000E` Font, `0x0012` Bitmap Cache Host Support, `0x0017` Rail, `0x0018`
-Window List, `0x001A` Multifragment Update, `0x001B` Large Pointer, `0x001C` Surface Commands,
-`0x001E` Frame Acknowledge. So the stricter decode of Bitmap Cache, Brush, Glyph Cache and
-Offscreen Cache does not reach this server's receive path.
+Input, Virtual Channel, Multifragment Update, Surface Commands, Bitmap Codecs (NSCodec, RemoteFX,
+Image RemoteFX and `CODEC_GUID_IGNORE`). Unread: `0x0009` Share, `0x000A` Color Cache, `0x000E`
+Font, `0x0012` Bitmap Cache Host Support, `0x0017` Rail, `0x0018` Window List, `0x001B` Large
+Pointer, `0x001E` Frame Acknowledge. So the stricter decode of Bitmap Cache, Brush, Glyph Cache
+and Offscreen Cache does not reach this server's receive path.
+
+**Advertising a codec is not sending it** (#150, 2026-10-01). The same Demand Active offered
+Surface Commands and NSCodec in July, which read as a proof path; the server still sent no
+Surface Bits to a client advertising both, because it capped every non-EGFX session at 16 bpp.
+FreeRDP 3.31 (`+nsc /bpp:32`) got 16 bpp and no Surface Bits too. With the VM's *Limit maximum
+color depth* policy at 32 bpp the server answers a legacy session at 32 bpp, even one asking 24,
+and paints it in NSCodec Set Surface Bits — given a Multifragment Update set, without which it
+closed with Set Error Info `0x112F`. It sent Frame Markers only when `SURFCMDS_FRAME_MARKER` was
+advertised, and needed no Frame Acknowledge set. The capture is
+`justrdp/tests/fixtures/session/nscodec-surface-bits.bin`.
 
 Opened by #252. It read **"None"** until then, with the note that this was the
 territory where the absence cost most — and it did: #252 opened on the premise
@@ -203,8 +235,9 @@ checked, identically on both legs.
   the negotiated size, and reallocated on reactivation.
 - [Bitmap codecs](bitmap-codecs.md) — `BitmapCodecsCapabilitySet` decides which
   decoders can be reached at all (the VM's advertised set bounds what is provable).
-- [EGFX graphics pipeline](egfx-graphics-pipeline.md) — surface commands and frame
-  acknowledgement are capability-gated here.
+- [EGFX graphics pipeline](egfx-graphics-pipeline.md) — the two graphics paths this territory
+  can invite share one framebuffer. Measured on the VM, a server that negotiates EGFX sends no
+  legacy graphics, surface commands included (#150), so they do not paint one session together.
 - [PDU constants & flag tables](pdu-constants.md) — capability type codes and their
   flags.
 
