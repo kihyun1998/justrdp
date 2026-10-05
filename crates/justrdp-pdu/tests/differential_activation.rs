@@ -359,8 +359,31 @@ fn our_confirm_active_with_default_capabilities_decodes_in_ironrdp() {
     assert_eq!(confirm.pdu.capability_sets.len(), caps.len());
 
     // The fields the server actually negotiates on must survive their parse.
+    let mut surface_bits_sets = 0;
     for set in &confirm.pdu.capability_sets {
         match set {
+            // Issue #150: ironrdp names the codec from its GUID, so this also checks
+            // `CODEC_GUID_NSCODEC` against an independent table.
+            iron_caps::CapabilitySet::BitmapCodecs(iron_caps::BitmapCodecs(codecs)) => {
+                let [codec] = codecs.as_slice() else {
+                    panic!("one codec advertised, got {codecs:?}");
+                };
+                assert_eq!(codec.id, capability::CODEC_ID_NSCODEC);
+                let iron_caps::CodecProperty::NsCodec(nsc) = &codec.property else {
+                    panic!("ironrdp did not read NSCodec: {codec:?}");
+                };
+                assert!(nsc.is_dynamic_fidelity_allowed && nsc.is_subsampling_allowed);
+                assert_eq!(nsc.color_loss_level, 3);
+                surface_bits_sets += 1;
+            }
+            iron_caps::CapabilitySet::SurfaceCommands(surface) => {
+                assert_eq!(surface.flags, iron_caps::CmdFlags::SET_SURFACE_BITS);
+                surface_bits_sets += 1;
+            }
+            iron_caps::CapabilitySet::MultiFragmentUpdate(multifragment) => {
+                assert_eq!(multifragment.max_request_size, (1 << 20) + (64 << 10));
+                surface_bits_sets += 1;
+            }
             iron_caps::CapabilitySet::Bitmap(bitmap) => {
                 assert_eq!(bitmap.pref_bits_per_pix, gcc::HIGH_COLOR_DEPTH_24BPP);
                 assert_eq!((bitmap.desktop_width, bitmap.desktop_height), (1280, 800));
@@ -378,6 +401,10 @@ fn our_confirm_active_with_default_capabilities_decodes_in_ironrdp() {
             _ => {}
         }
     }
+    assert_eq!(
+        surface_bits_sets, 3,
+        "Bitmap Codecs, Surface Commands, Multifragment Update"
+    );
 }
 
 // ───────────────────────────────────── finalization ──────────────────────────────────────────

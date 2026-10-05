@@ -282,6 +282,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "surface_commands"
+path = "fuzz_targets/surface_commands.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "share"
 path = "fuzz_targets/share.rs"
 test = false

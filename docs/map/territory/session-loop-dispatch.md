@@ -36,6 +36,15 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 - **Reactivation is in-scope for this machine** (`Phase::Reactivating`): a resize
   round-trips through capability exchange while the session's caches survive,
   because caches belong to the connection rather than the share.
+- **Surface commands paint like bitmap updates** (#150): each Set Surface Bits command decodes
+  into the framebuffer and emits one `Frame`, at the bitmap's own size (2.2.9.2.1 says
+  `destRight`/`destBottom` SHOULD be ignored). Stream Surface Bits, which is never invited, is
+  applied the same way. A codec ID the Confirm Active never
+  assigned is skipped with an `rdp_interop` record (ADR-0009 §2); an NSCodec stream that does not
+  decode is fatal, as a slow-path bitmap that does not decompress is. Frame Markers are decoded and
+  dropped, which is why the connect layer refuses `SURFCMDS_FRAME_MARKER`; acknowledging them would
+  need the Frame Acknowledge set, refused too. A command whose `cmdFlags` bit was not advertised is
+  still applied, with an `rdp_surface_bits` record (ADR-0009 §3(b)).
 - **Static-channel traffic goes three ways** (#307): `drdynvc` to the dynamic-channel
   manager, a granted host channel to its reassembler and out as `ChannelData`, and a channel
   ID that was never granted is skipped with an `rdp_svc` record. See
@@ -44,10 +53,13 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 ## Code
 
 - `justrdp/src/session.rs` — `SessionStateMachine`, `SessionConfig`, `SessionOutput`,
-  `SessionError`, `Phase`, `ResizeError`, `cursor_event_for`, `request_shutdown`
+  `SessionError`, `Phase`, `ResizeError`, `cursor_event_for`, `request_shutdown`,
+  `apply_surface_bits` (#150)
 - `justrdp/src/disconnect.rs` — `classify`, `DisconnectClass`, `DisconnectReason`,
   `ServerDisconnectCause`
 - `justrdp-pdu/src/fastpath.rs` — `is_fastpath`, `frame_len`, `decode_updates`
+- `justrdp-pdu/src/surface_commands.rs` — `decode_all`, `SurfaceCommand`, `SurfaceBits`,
+  `BitmapDataEx`, `FrameMarker` (#150)
 - `justrdp-pdu/src/share.rs`, `justrdp-pdu/src/update.rs` — `ShareDataHeader`,
   `BitmapUpdate`, `BitmapData`, `PaletteUpdate`
 - `justrdp-pdu/src/errinfo.rs` — `ErrorInfo`, `decode_set_error_info`

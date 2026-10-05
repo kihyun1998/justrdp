@@ -145,6 +145,11 @@ dependency at all; the four crates depend only downward).
 | `docs/adr/NNNN-<kebab>.md` · `docs/agents/*.md` · `docs/map/territory/<area>.md` · `docs/map/invariant/<claim>.md` | decision records · agent contracts · the wiring map | — |
 | `logo/<kind>/` | brand assets. Read by `README.md` and by each crate root's `#![doc(html_logo_url, html_favicon_url)]` through `raw.githubusercontent.com/…/master/logo/…`, so a rename breaks rustdoc silently | — |
 
+**Note (2026-10-01, #150): the fixtures row's grounds no longer hold, and the rule does.**
+`crates/justrdp/tests/` now has a corpus test, `real_server_surface_bits.rs`, which replays a
+capture through `SessionStateMachine`, so its fixture lives in `crates/justrdp/tests/fixtures/session/`
+— the crate whose test replays it, as the row requires.
+
 **`fuzz/` is out of the workspace, and that is a gate blind spot, not an oversight.**
 `cargo <cmd> --workspace` does not build it, so a rename or a public-path change can leave
 it broken while every gate stays green. It needs its own

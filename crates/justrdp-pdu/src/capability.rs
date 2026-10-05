@@ -3,7 +3,7 @@
 //!
 //! Typed structs cover the sets the connect sequence and the differential criteria actually
 //! consume (General, Bitmap, Order, Bitmap Cache, Pointer, Input, Brush, Glyph Cache, Offscreen
-//! Cache, Virtual Channel, Sound, Bitmap Codecs);
+//! Cache, Virtual Channel, Sound, Multifragment Update, Surface Commands, Bitmap Codecs);
 //! everything else round-trips as [`CapabilitySet::Unknown`] raw bytes, because the negotiation
 //! rule for unrecognized sets is "ignore, never reject" (MS-RDPBCGR 3.2.5.3.13).
 
@@ -32,6 +32,10 @@ pub const CAPSET_GLYPH_CACHE: u16 = 0x0010;
 pub const CAPSET_OFFSCREEN_CACHE: u16 = 0x0011;
 /// `capabilitySetType`: Virtual Channel.
 pub const CAPSET_VIRTUAL_CHANNEL: u16 = 0x0014;
+/// `capabilitySetType`: Multifragment Update.
+pub const CAPSET_MULTIFRAGMENT_UPDATE: u16 = 0x001A;
+/// `capabilitySetType`: Surface Commands.
+pub const CAPSET_SURFACE_COMMANDS: u16 = 0x001C;
 /// `capabilitySetType`: Bitmap Codecs.
 pub const CAPSET_BITMAP_CODECS: u16 = 0x001D;
 
@@ -74,6 +78,21 @@ pub const INPUT_FLAG_FASTPATH_INPUT: u16 = 0x0008;
 pub const INPUT_FLAG_FASTPATH_INPUT2: u16 = 0x0020;
 /// `inputFlags`: horizontal mouse wheel events (`TS_INPUT_FLAG_MOUSE_HWHEEL`).
 pub const INPUT_FLAG_MOUSE_HWHEEL: u16 = 0x0100;
+
+/// `cmdFlags`: Set Surface Bits is supported (`SURFCMDS_SET_SURFACE_BITS`, 2.2.7.2.9).
+pub const SURFCMDS_SET_SURFACE_BITS: u32 = 0x0000_0002;
+/// `cmdFlags`: Frame Marker is supported (`SURFCMDS_FRAME_MARKER`).
+pub const SURFCMDS_FRAME_MARKER: u32 = 0x0000_0010;
+/// `cmdFlags`: Stream Surface Bits is supported (`SURFCMDS_STREAM_SURFACE_BITS`).
+pub const SURFCMDS_STREAM_SURFACE_BITS: u32 = 0x0000_0040;
+
+/// `codecGUID` of NSCodec (`CODEC_GUID_NSCODEC`, 2.2.7.2.10.1.1) in wire order: `Data1`-`Data3`
+/// little-endian, `Data4` verbatim.
+pub const CODEC_GUID_NSCODEC: [u8; 16] = [
+    0xb9, 0x1b, 0x8d, 0xca, 0x0f, 0x00, 0x4f, 0x15, 0x58, 0x9f, 0xae, 0x2d, 0x1a, 0x87, 0xe2, 0xd6,
+];
+/// `codecID` of NSCodec: 2.2.7.2.10.1.1 fixes it at 1 and reserves 1 for it.
+pub const CODEC_ID_NSCODEC: u8 = 0x01;
 
 /// `soundFlags`: playing a beep is supported (`SOUND_FLAG_BEEPS`, 2.2.7.1.11) — and so the
 /// Play Sound PDU must be ([`crate::sound::PlaySound`]).
@@ -496,6 +515,103 @@ impl SoundCapabilitySet {
     }
 }
 
+/// Multifragment Update Capability Set (TS_MULTIFRAGMENTUPDATE_CAPABILITYSET, 2.2.7.2.6).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MultifragmentUpdateCapabilitySet {
+    /// `MaxRequestSize`: the largest reassembled fast-path update the sender accepts, in bytes.
+    pub max_request_size: u32,
+}
+
+impl MultifragmentUpdateCapabilitySet {
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.max_request_size.to_le_bytes());
+    }
+
+    fn decode_body(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            max_request_size: cur.read_u32_le()?,
+        })
+    }
+}
+
+/// Surface Commands Capability Set (TS_SURFCMDS_CAPABILITYSET, 2.2.7.2.9).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SurfaceCommandsCapabilitySet {
+    /// `cmdFlags` ([`SURFCMDS_SET_SURFACE_BITS`], [`SURFCMDS_FRAME_MARKER`],
+    /// [`SURFCMDS_STREAM_SURFACE_BITS`]). Bits the spec does not define are kept.
+    pub cmd_flags: u32,
+}
+
+impl SurfaceCommandsCapabilitySet {
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.cmd_flags.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    }
+
+    fn decode_body(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        let cmd_flags = cur.read_u32_le()?;
+        cur.read_u32_le()?; // reserved
+        Ok(Self { cmd_flags })
+    }
+}
+
+/// NSCodec Capability Set (TS_NSCODEC_CAPABILITYSET, `[MS-RDPNSC]` 2.2.1): the
+/// `codecProperties` of an NSCodec entry in a Bitmap Codecs set. The receiver configures its
+/// encoder from it (3.1.5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NsCodecProperties {
+    /// `fAllowDynamicFidelity`: lossy colour-loss reduction is allowed.
+    pub allow_dynamic_fidelity: bool,
+    /// `fAllowSubsampling`: chroma subsampling is allowed.
+    pub allow_subsampling: bool,
+    /// `colorLossLevel`, 1..=7.
+    pub color_loss_level: u8,
+}
+
+impl NsCodecProperties {
+    /// The 3-byte `codecProperties` blob.
+    pub fn encode(&self) -> Vec<u8> {
+        vec![
+            u8::from(self.allow_dynamic_fidelity),
+            u8::from(self.allow_subsampling),
+            self.color_loss_level,
+        ]
+    }
+
+    /// Decode a `codecProperties` blob. A flag other than 0 or 1, a `colorLossLevel` outside
+    /// 1..=7, or a blob that is not exactly 3 bytes is a typed error.
+    pub fn decode(properties: &[u8]) -> Result<Self, DecodeError> {
+        let [fidelity, subsampling, color_loss_level] = *properties else {
+            return Err(DecodeError::InvalidField {
+                field: "TS_NSCODEC_CAPABILITYSET",
+                reason: "codecProperties must be exactly 3 bytes",
+            });
+        };
+        let flag = |value: u8, field: &'static str| match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(DecodeError::InvalidField {
+                field,
+                reason: "must be 0 or 1",
+            }),
+        };
+        if !(1..=7).contains(&color_loss_level) {
+            return Err(DecodeError::InvalidField {
+                field: "TS_NSCODEC_CAPABILITYSET.colorLossLevel",
+                reason: "must be in 1..=7",
+            });
+        }
+        Ok(Self {
+            allow_dynamic_fidelity: flag(
+                fidelity,
+                "TS_NSCODEC_CAPABILITYSET.fAllowDynamicFidelity",
+            )?,
+            allow_subsampling: flag(subsampling, "TS_NSCODEC_CAPABILITYSET.fAllowSubsampling")?,
+            color_loss_level,
+        })
+    }
+}
+
 /// One codec entry in the Bitmap Codecs Capability Set (TS_BITMAPCODEC, 2.2.7.2.10.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitmapCodec {
@@ -503,7 +619,7 @@ pub struct BitmapCodec {
     pub guid: [u8; 16],
     /// `codecID` — the per-session ID the server will reference.
     pub id: u8,
-    /// `codecProperties` — codec-specific blob, kept raw (decoded at the codec epics).
+    /// `codecProperties` — codec-specific blob, kept raw ([`NsCodecProperties`] reads NSCodec's).
     pub properties: Vec<u8>,
 }
 
@@ -570,6 +686,10 @@ pub enum CapabilitySet {
     VirtualChannel(VirtualChannelCapabilitySet),
     /// TS_SOUND_CAPABILITYSET.
     Sound(SoundCapabilitySet),
+    /// TS_MULTIFRAGMENTUPDATE_CAPABILITYSET.
+    MultifragmentUpdate(MultifragmentUpdateCapabilitySet),
+    /// TS_SURFCMDS_CAPABILITYSET.
+    SurfaceCommands(SurfaceCommandsCapabilitySet),
     /// TS_BITMAPCODECS_CAPABILITYSET.
     BitmapCodecs(BitmapCodecsCapabilitySet),
     /// Any other set, kept as raw body bytes under its `capabilitySetType`.
@@ -630,6 +750,14 @@ impl CapabilitySet {
                 c.encode_body(&mut body);
                 CAPSET_SOUND
             }
+            CapabilitySet::MultifragmentUpdate(c) => {
+                c.encode_body(&mut body);
+                CAPSET_MULTIFRAGMENT_UPDATE
+            }
+            CapabilitySet::SurfaceCommands(c) => {
+                c.encode_body(&mut body);
+                CAPSET_SURFACE_COMMANDS
+            }
             CapabilitySet::BitmapCodecs(c) => {
                 c.encode_body(&mut body);
                 CAPSET_BITMAP_CODECS
@@ -682,6 +810,12 @@ impl CapabilitySet {
             }
             CAPSET_OFFSCREEN_CACHE => CapabilitySet::OffscreenCache(
                 OffscreenCacheCapabilitySet::decode_body(&mut body_cur)?,
+            ),
+            CAPSET_MULTIFRAGMENT_UPDATE => CapabilitySet::MultifragmentUpdate(
+                MultifragmentUpdateCapabilitySet::decode_body(&mut body_cur)?,
+            ),
+            CAPSET_SURFACE_COMMANDS => CapabilitySet::SurfaceCommands(
+                SurfaceCommandsCapabilitySet::decode_body(&mut body_cur)?,
             ),
             CAPSET_BITMAP_CODECS => {
                 CapabilitySet::BitmapCodecs(BitmapCodecsCapabilitySet::decode_body(&mut body_cur)?)
@@ -766,8 +900,8 @@ pub fn encode_confirm_active(
 }
 
 /// The client capability sets this library can actually honor today: no drawing orders, no
-/// bitmap caches, no glyph support — the server falls back to plain bitmap updates, which is
-/// what the rendering slices implement first (ADR-0003 phased codecs). Keyboard and desktop
+/// bitmap caches, no glyph support, and NSCodec over Set Surface Bits — so a server outside the
+/// graphics pipeline paints in bitmap updates or NSCodec surface bits. Keyboard and desktop
 /// values are copied from the GCC core data so the two advertisements never disagree.
 ///
 /// This is a **default**, not a policy: the caller owns `ConnectConfig::capabilities` and may
@@ -833,6 +967,25 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
         CapabilitySet::Sound(SoundCapabilitySet {
             sound_flags: SOUND_FLAG_BEEPS,
         }),
+        // 1 MiB + 64 KiB.
+        CapabilitySet::MultifragmentUpdate(MultifragmentUpdateCapabilitySet {
+            max_request_size: (1 << 20) + (64 << 10),
+        }),
+        CapabilitySet::SurfaceCommands(SurfaceCommandsCapabilitySet {
+            cmd_flags: SURFCMDS_SET_SURFACE_BITS,
+        }),
+        CapabilitySet::BitmapCodecs(BitmapCodecsCapabilitySet {
+            codecs: vec![BitmapCodec {
+                guid: CODEC_GUID_NSCODEC,
+                id: CODEC_ID_NSCODEC,
+                properties: NsCodecProperties {
+                    allow_dynamic_fidelity: true,
+                    allow_subsampling: true,
+                    color_loss_level: 3,
+                }
+                .encode(),
+            }],
+        }),
     ]
 }
 
@@ -895,11 +1048,13 @@ mod tests {
         while cur.remaining() > 0 {
             decoded.push(CapabilitySet::decode(&mut cur).unwrap());
         }
-        assert_eq!(decoded.len(), sets.len());
-        // Typed sets survive the round trip exactly.
-        assert_eq!(decoded[0], sets[0]);
-        assert_eq!(decoded[1], sets[1]);
-        assert_eq!(decoded[2], sets[2]);
+        // Every default set is typed and survives the round trip exactly.
+        assert_eq!(decoded, sets);
+        assert!(
+            !decoded
+                .iter()
+                .any(|s| matches!(s, CapabilitySet::Unknown { .. }))
+        );
         match (&decoded[1], &sets[1]) {
             (CapabilitySet::Bitmap(d), CapabilitySet::Bitmap(_)) => {
                 assert_eq!((d.desktop_width, d.desktop_height), (1280, 800));
@@ -1157,6 +1312,96 @@ mod tests {
         let bytes = [0x0C, 0x00, 0x06, 0x00, 0x01, 0x00];
         let mut cur = ReadCursor::new(&bytes, "test");
         assert!(CapabilitySet::decode(&mut cur).is_err());
+    }
+
+    /// Issue #150: the Surface Commands and Multifragment Update sets carry their wire layout,
+    /// and the server's 8-byte Surface Commands body decodes typed.
+    #[test]
+    fn surface_commands_and_multifragment_sets_pin_wire_layout() {
+        let mut out = Vec::new();
+        CapabilitySet::SurfaceCommands(SurfaceCommandsCapabilitySet {
+            cmd_flags: SURFCMDS_SET_SURFACE_BITS | SURFCMDS_FRAME_MARKER,
+        })
+        .encode(&mut out);
+        assert_eq!(
+            out,
+            [
+                0x1C, 0x00, 0x0C, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            ]
+        );
+        let mut out = Vec::new();
+        CapabilitySet::MultifragmentUpdate(MultifragmentUpdateCapabilitySet {
+            max_request_size: 0x0011_0000,
+        })
+        .encode(&mut out);
+        assert_eq!(out, [0x1A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x11, 0x00]);
+
+        // A server's reserved field is read past, not kept.
+        let server = [
+            0x1C, 0x00, 0x0C, 0x00, 0x52, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        let mut cur = ReadCursor::new(&server, "test");
+        assert_eq!(
+            CapabilitySet::decode(&mut cur).unwrap(),
+            CapabilitySet::SurfaceCommands(SurfaceCommandsCapabilitySet { cmd_flags: 0x52 })
+        );
+        assert_eq!(cur.remaining(), 0);
+        // The reserved field is part of the set: a body without it is truncated.
+        let truncated = [0x1C, 0x00, 0x08, 0x00, 0x52, 0x00, 0x00, 0x00];
+        assert!(CapabilitySet::decode(&mut ReadCursor::new(&truncated, "test")).is_err());
+    }
+
+    /// Issue #150: the defaults advertise NSCodec at the codec ID 2.2.7.2.10.1.1 fixes, with
+    /// Set Surface Bits to carry it and a Multifragment Update set.
+    #[test]
+    fn the_defaults_advertise_nscodec_over_set_surface_bits() {
+        let sets = default_client_capabilities(&sample_core());
+        let codecs = sets
+            .iter()
+            .find_map(|s| match s {
+                CapabilitySet::BitmapCodecs(c) => Some(c),
+                _ => None,
+            })
+            .expect("defaults include a Bitmap Codecs set");
+        assert_eq!(codecs.codecs.len(), 1);
+        assert_eq!(codecs.codecs[0].guid, CODEC_GUID_NSCODEC);
+        assert_eq!(codecs.codecs[0].id, CODEC_ID_NSCODEC);
+        assert_eq!(codecs.codecs[0].properties, [1, 1, 3]);
+        assert!(sets.iter().any(|s| matches!(
+            s,
+            CapabilitySet::SurfaceCommands(c) if c.cmd_flags == SURFCMDS_SET_SURFACE_BITS
+        )));
+        assert!(
+            sets.iter()
+                .any(|s| matches!(s, CapabilitySet::MultifragmentUpdate(_)))
+        );
+    }
+
+    #[test]
+    fn nscodec_properties_refuse_what_the_spec_forbids() {
+        let props = |b: &[u8]| NsCodecProperties::decode(b);
+        assert_eq!(
+            props(&[1, 0, 7]),
+            Ok(NsCodecProperties {
+                allow_dynamic_fidelity: true,
+                allow_subsampling: false,
+                color_loss_level: 7,
+            })
+        );
+        assert_eq!(props(&[0, 1, 1]).map(|p| p.encode()), Ok(vec![0, 1, 1]));
+        for bad in [
+            &[1, 1, 0][..],
+            &[1, 1, 8],
+            &[2, 1, 3],
+            &[1, 2, 3],
+            &[1, 1],
+            &[1, 1, 3, 0],
+        ] {
+            assert!(
+                matches!(props(bad), Err(DecodeError::InvalidField { .. })),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

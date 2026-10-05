@@ -359,6 +359,15 @@ Read this before starting so the graph does not read as abstractions.
   catch-all arm is a fine default for PDUs nobody asked about; it stops being one the moment
   the client can *cause* the PDU.
 
+- **An advertised codec is not a proof path (#150).** A July probe saw the VM's Demand Active
+  offer Surface Commands and NSCodec and recorded the standalone-NSCodec epic as provable against
+  it. Building it, the first throwaway probe got **0** Surface Bits across three advertised
+  configurations, and FreeRDP got the same: the VM's colour-depth policy capped non-EGFX sessions
+  at 16 bpp, which no capability set reports. Fifteen minutes of probing before the build, rather
+  than after it, is what kept the plan from being implemented against a server that would never
+  have exercised it. The probe also found that the server would not use the path without a
+  Multifragment Update set, which nothing in the plan had listed.
+
 ## Step 5 — adversarial completeness is automated (ADR-0008)
 
 - **proptest no-panic (#98) + cargo-fuzz (#99)** make the completeness axis

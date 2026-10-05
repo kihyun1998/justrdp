@@ -85,6 +85,13 @@ confusion arises here.
 - **#306** — found the cookie's gate by diffing the second client's wire bytes against ours
   (FreeRDP's `/dump:record` records PDUs before TLS), then A/B-testing the one field that
   differed. Matching its Client Info flags first changed nothing; the capability set did.
+- **#150** — the server-side half, and it lies in both directions. The VM's Demand Active had
+  offered Surface Commands and NSCodec since July, which was recorded as a proof path; the server
+  sent no Surface Bits to justrdp or FreeRDP while its colour-depth policy capped legacy sessions
+  at 16 bpp. Once the policy allowed 32, advertising NSCodec moved *every* legacy-graphics session
+  from bitmap updates to NSCodec surface bits, so the bitmap differential test now strips the two
+  capability sets to keep its subject. What a server advertises bounds what it may send; what it
+  sends also depends on state no capability set reports.
 
 ## Where it will recur
 
