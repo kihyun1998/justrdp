@@ -442,8 +442,13 @@ product of the two can still be ruinous:
 > than the same bytes?**
 
 The test is the *funding*, not the size. `justrdp::session`'s `TS_UPDATE_BITMAP_DATA` loop runs
-a wire count and is safe, because each rectangle consumes its own `bitmapLength` from the same
-cursor — the PDU has to pay in bytes for the work it asks for. EGFX's `CACHE_TO_SURFACE` runs a
+a wire count and was recorded here as safe, because each rectangle consumes its own `bitmapLength`
+from the same cursor. **That was true of the loop and false of the work** (#367): the bytes fund
+the rectangle, not its decode, and an expanding decoder turns a few bytes into a desktop. A
+29 406-byte Surface Commands update of 700 NSCodec commands with empty planes cost **4.55 s** in
+`--release`; an interleaved-RLE rectangle paints a desktop from 66 bytes. Both legacy loops now
+charge each command its *decoded* size against a per-update budget before decoding
+(`PAINT_BUDGET_FRAMEBUFFERS` desktops), and the same update costs 11 ms. EGFX's `CACHE_TO_SURFACE` runs a
 wire count where each entry is **4 bytes** and its cost is a bitmap the server established in an
 *earlier* message, so 262 KB bought ~505–540 s (#268). Neither of the two questions above sees
 this: the trip count is `usize::from(<u16>)` and every arithmetic guard passes. Where the answer
