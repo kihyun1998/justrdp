@@ -8,7 +8,7 @@ The core is a **sans-IO state machine**: connect sequence and session loop are p
 deliberately leaves out: the TLS handshake, the CredSSP token loop, per-stage timeouts, the
 session runner.
 
-Before implementing, read `CONTEXT.md` (ubiquitous language, boundary, §Project intent),
+Before implementing, read `GLOSSARY.md` (ubiquitous language, boundary, §Project intent),
 `docs/adr/` (why each decision was made) and `docs/plan.md` (build plan §2–§23).
 
 ## Workflow — `thegraph`
@@ -86,7 +86,7 @@ exactly (`=x.y.z`); a bump passes the real-VM suite before it lands (ADR-0004,
 
 ## Core rules
 
-- **Language**: code comments, `CLAUDE.md`, `CONTEXT.md`, `docs/adr/` and `docs/agents/` in
+- **Language**: code comments, `CLAUDE.md`, `GLOSSARY.md`, `docs/adr/` and `docs/agents/` in
   English (LLM token efficiency); other human-facing docs in Korean.
 - **Comments** say what the code is. Why it is this way, what it deliberately leaves out, the trap
   and the measured value go to the matching note under `docs/map/territory/`; history goes to the
@@ -107,7 +107,7 @@ Issues and PRDs are tracked as GitHub issues on `kihyun1998/justrdp`, via the `g
 Five canonical triage roles mapped 1:1 to default label strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
 
 ### Domain docs
-Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context: one `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ### CI gates
 The gates are `.github/workflows/*.yml`; each file's header says what it guards and whether it
