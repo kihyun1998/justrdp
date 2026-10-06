@@ -698,13 +698,14 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   `VirtualChannelCapabilitySet` bounds chunk size and compression.
 - [Device redirection](device-redirection.md) — the `rdpdr` helper rides the static channel
   seam, and follows the clipboard helper's shape.
+- [Audio output](audio-output.md) — the first helper on the host dynamic channel seam.
 
 ## Known holes / open
 
-- **Every redirection feature but the clipboard's handshake is an unopened channel**: audio
-  output (#11), audio input (#12), device/drive/printer/smartcard (#13), RemoteApp
-  (#14), multitouch (#15), video (#17), camera (#19), location (#20). The transport
-  exists; the consumers do not. The clipboard (#10) moves text since #322, images since #323,
+- **These redirection features are unopened channels**: audio input (#12), RemoteApp (#14),
+  multitouch (#15), video (#17), camera (#19), location (#20). The transport exists; the
+  consumers do not. Drives have been redirected since #336–#340 (printers, smartcards, serial
+  ports and USB have not), and audio output plays since #386. The clipboard (#10) moves text since #322, images since #323,
   server files to the host since #324, and host files to the server since #325.
 - ~~Static channel 1004 traffic is ignored by the session loop with no record of what
   it contains.~~ **Closed in #307**: 1004 is `cliprdr`, and a granted channel's messages
@@ -718,10 +719,10 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   channel's is skipped and reported (`ChannelMessageDropped`, #323). Audio blocks are far below
   it; the first host dynamic channel to carry large messages (camera, #19) meets it. Recorded
   rather than built, at the maintainer's call (2026-10-06).
-- **A host dynamic channel send has not been proven live** (#385): `ECHO` is received live, but
-  nothing on this server answers a host message on it observably, so `send_dynamic_channel` and
-  `close_dynamic_channel` are proven by unit tests. Audio output's Client Audio Formats (#386,
-  #387) is the first host message the server must act on.
+- ~~**A host dynamic channel send has not been proven live**~~ (#385) — it is since #386: on
+  `AUDIO_PLAYBACK_DVC` the server answers the host's Client Audio Formats with Training PDUs and
+  then audio, and takes every Wave Confirm ([Audio output](audio-output.md)). A host
+  `close_dynamic_channel` is still proven by unit tests only.
 - **A multi-chunk `drdynvc` message we send has never been proven live**, with or without
   `CHANNEL_FLAG_SHOW_PROTOCOL`: no VM test sends a DVC message over one chunk. Since #338 it
   goes unflagged, as FreeRDP sends it. The first slice that sends a large DVC message (audio

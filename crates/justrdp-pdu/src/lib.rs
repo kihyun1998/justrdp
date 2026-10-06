@@ -32,6 +32,7 @@ pub mod nego;
 pub mod per;
 pub mod pointer;
 pub mod rdpdr;
+pub mod rdpsnd;
 pub mod rfx;
 pub mod session_info;
 pub mod share;

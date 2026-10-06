@@ -133,7 +133,7 @@ dependency at all; the four crates depend only downward).
 |---|---|---|
 | `crates/justrdp-pdu/src/*.rs` | one file per `[MS-*]` protocol area — bytes↔types only. **Zero external dependencies** | this record + ADR-0002, measured 0 violators |
 | `crates/justrdp-pdu/src/<area>/` | a protocol area that outgrew one file. Module root is **`<area>.rs` beside it**, never `mod.rs` | spelling rule |
-| `crates/justrdp-codecs/src/*.rs` | one codec per file — **pixel math only**. Depends on `justrdp-pdu` and nothing else | ADR-0003 / ADR-0007, measured |
+| `crates/justrdp-codecs/src/*.rs` | one codec per file — **pixel and sample math only**. Depends on `justrdp-pdu` and nothing else | ADR-0003 / ADR-0007, measured |
 | `crates/justrdp-codecs/src/<codec>/` | a codec that outgrew one file | spelling rule |
 | `crates/justrdp/src/*.rs` | the sans-IO state machines and the host-facing output types. **No `tokio`, no `rustls`, no `sspi`** | this record; measured: `x509-cert` + `tracing` only |
 | `crates/justrdp-tokio/src/*.rs` | **the only place `tokio`, `rustls`, `sspi` or `ring` may appear.** Policy injection | ADR-0002, measured 0 violators |
@@ -144,6 +144,10 @@ dependency at all; the four crates depend only downward).
 | `.github/workflows/*.yml` · `.github/scripts/*.py` | things that **are** CI gates | — |
 | `docs/adr/NNNN-<kebab>.md` · `docs/agents/*.md` · `docs/map/territory/<area>.md` · `docs/map/invariant/<claim>.md` | decision records · agent contracts · the wiring map | — |
 | `logo/<kind>/` | brand assets. Read by `README.md` and by each crate root's `#![doc(html_logo_url, html_favicon_url)]` through `raw.githubusercontent.com/…/master/logo/…`, so a rename breaks rustdoc silently | — |
+
+**Note (2026-10-07, #386): the codecs row says "pixel and sample math only".** Audio codecs are
+owned in `justrdp-codecs` too, as epic #11's grilling decided (2026-10-06); `pcm.rs` is the first.
+The row's point, codec math with no protocol state, is unchanged.
 
 **Note (2026-10-01, #150): the fixtures row's grounds no longer hold, and the rule does.**
 `crates/justrdp/tests/` now has a corpus test, `real_server_surface_bits.rs`, which replays a

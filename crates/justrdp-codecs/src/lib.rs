@@ -1,4 +1,4 @@
-//! `justrdp-codecs` — RDP graphics codecs behind a stable, sans-IO decode API.
+//! `justrdp-codecs` — RDP graphics and audio codecs behind a stable, sans-IO decode API.
 //!
 //! **Every codec here is self-owned, and `ironrdp-graphics` is a dev-dependency only.** That
 //! is ADR-0003 phase 3 for the whole crate, reached in #189 when zgfx — the last phase-1
@@ -94,6 +94,7 @@ pub mod capture;
 pub mod clearcodec;
 pub mod color;
 pub mod nscodec;
+pub mod pcm;
 pub mod planar;
 pub mod pointer;
 pub mod rfx;
