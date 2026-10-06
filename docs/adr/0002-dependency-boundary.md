@@ -63,7 +63,7 @@ This decision resolves design question 13 from the plan: "Pure-Rust only, or all
 
 ### Gap this closes
 
-The original decision (§What we own) lists "Graphics codecs … initially via `ironrdp-graphics` as a differential-test oracle, then self-owned per the phased-c2 strategy," but the *why* leans on the same premise as the whole rebuild: `CONTEXT.md` motivates justrdp via a **connector** defect (`ironrdp-connector` 0.9 hardcoding away `SUPPORT_DYN_VC_GFX_PROTOCOL`). That argues for owning the **connector** and negotiation — it does **not**, on its own, argue for rewriting **codecs** (RemoteFX, ClearCodec, …) that IronRDP already implements. So codec self-ownership currently rests on an implicit rationale. This amendment records the independent rationale so the decision stands on its own, without borrowing the connector's motivation.
+The original decision (§What we own) lists "Graphics codecs … initially via `ironrdp-graphics` as a differential-test oracle, then self-owned per the phased-c2 strategy," but the *why* leans on the same premise as the whole rebuild: `GLOSSARY.md` motivates justrdp via a **connector** defect (`ironrdp-connector` 0.9 hardcoding away `SUPPORT_DYN_VC_GFX_PROTOCOL`). That argues for owning the **connector** and negotiation — it does **not**, on its own, argue for rewriting **codecs** (RemoteFX, ClearCodec, …) that IronRDP already implements. So codec self-ownership currently rests on an implicit rationale. This amendment records the independent rationale so the decision stands on its own, without borrowing the connector's motivation.
 
 ### Independent rationale
 

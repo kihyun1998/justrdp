@@ -122,7 +122,7 @@ coherent, not why it is compelled.
 - **(B) Fix the oracle upstream and keep depending on it.** Rejected as the *governing* strategy,
   not as a courtesy: an upstream fix helps everyone and may still be worth sending, but making
   this project's correctness bar depend on another project's release cadence reintroduces the
-  coupling `CONTEXT.md` §Project intent exists to remove. It is also not one defect — findings 2
+  coupling `GLOSSARY.md` §Project intent exists to remove. It is also not one defect — findings 2
   and 3 above are a disagreement between references and an unimplemented flag, neither of which
   an upstream patch resolves.
 - **(C) Drop the oracle immediately, everywhere.** Rejected: the oracle is genuinely independent

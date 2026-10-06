@@ -134,7 +134,7 @@ every policy flag.
 
 More detail:
 
-- [`CONTEXT.md`](CONTEXT.md): vocabulary and the core/adapter boundary
+- [`GLOSSARY.md`](GLOSSARY.md): vocabulary and the core/adapter boundary
 - [`docs/adr/`](docs/adr/): architecture decision records
 - [`docs/plan.md`](docs/plan.md): the build plan
 - [`docs/map/`](docs/map/README.md): what moves when each area changes
