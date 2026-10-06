@@ -47,7 +47,7 @@ These supersede the matching open questions in §10.
    plan.md; it is discarded once plan.md lands in justrdp. The **differential test oracle for
    phased-c2 is the `ironrdp-*` crates pulled as dev-dependencies in justrdp** (diff our decode
    vs theirs on identical bytes) — NOT this repo. justrdp already carries the agent-skills
-   scaffold (issues on `kihyun1998/justrdp`, single `CONTEXT.md` + `docs/adr/`). *(resolves §10
+   scaffold (issues on `kihyun1998/justrdp`, single `GLOSSARY.md` (then `CONTEXT.md`) + `docs/adr/`). *(resolves §10
    Q1 repo half + Q14 cadence → same AFK-agent → gate loop, now against justrdp.)*
 6. **Workspace split = pragmatic 3+1 (e2), split finer when a boundary proves itself.** Crates:
    `justrdp-pdu` (wire encode/decode + every PDU; sans-IO, depends only on a tiny core), `justrdp`

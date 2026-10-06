@@ -7,7 +7,7 @@
 
 ## Context
 
-`CONTEXT.md` and `CLAUDE.md` said the host owns **every RDP feature flag**. The repo held three
+`GLOSSARY.md` (then `CONTEXT.md`) and `CLAUDE.md` said the host owns **every RDP feature flag**. The repo held three
 models:
 
 - The connect layer passes the host's early capability bits, `INFO_*` flags and Confirm Active
