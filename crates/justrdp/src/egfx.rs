@@ -730,17 +730,23 @@ impl GraphicsProcessor {
                 // Keeping it out of the dispatcher also leaves that function total for its own
                 // bare `Rect16` signature and, crucially, *testable* for it — a guard placed
                 // where it makes the arithmetic below unreachable cannot redden.
-                let admissible = usize::from(dest_rect.width())
+                let decoded = usize::from(dest_rect.width())
                     .checked_mul(usize::from(dest_rect.height()))
                     .and_then(|px| px.checked_mul(4))
-                    .is_some_and(|bytes| bytes <= MAX_TOTAL_SURFACE_BYTES);
-                if !admissible {
+                    .filter(|&bytes| bytes <= MAX_TOTAL_SURFACE_BYTES);
+                let Some(decoded) = decoded else {
                     return Err(invalid(
                         "RDPGFX_WIRE_TO_SURFACE_PDU_1",
                         "destination rectangle is larger than any admissible surface",
                     )
                     .into());
+                };
+                // The decode is charged its decoded size before it runs (#372).
+                if decoded > MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint) {
+                    note_budget("RDPGFX_WIRE_TO_SURFACE_PDU_1", 1, 0);
+                    return Ok(());
                 }
+                self.frame_paint += decoded;
                 if let Some(rgba) = self
                     .decode_wts1(codec_id, dest_rect, data)
                     .map_err(Failure::Miss)?
@@ -3375,6 +3381,48 @@ mod tests {
     /// And the per-message reset covers the case StartFrame cannot: draw commands do not
     /// require a frame — no arm checks `in_frame` before painting — so a server that never
     /// sends StartFrame would otherwise sit outside the accounting forever.
+    /// Issue #372: a WireToSurface1 decode is charged its decoded size against the per-frame
+    /// paint budget before it decodes, and skipped once the frame cannot afford it.
+    #[test]
+    fn a_wire_to_surface_decode_is_charged_to_the_frame_budget() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 4, 4);
+        map_surface(&mut p, 1, 0, 0);
+        feed(&mut p, egfx::CMDID_START_FRAME, &[0; 8]);
+        let wts1 = |rgb: u8| {
+            let mut body = 1u16.to_le_bytes().to_vec();
+            body.extend_from_slice(&egfx::CODECID_UNCOMPRESSED.to_le_bytes());
+            body.push(egfx::PIXEL_FORMAT_XRGB_8888);
+            for v in [0u16, 0, 4, 4] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body.extend_from_slice(&64u32.to_le_bytes());
+            body.extend_from_slice(&[rgb; 64]);
+            body
+        };
+        let decoded = 4 * 4 * 4;
+
+        p.frame_paint = MAX_TOTAL_SURFACE_BYTES - decoded;
+        assert!(feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &wts1(10)).is_empty());
+        assert_eq!(
+            p.frame_paint, MAX_TOTAL_SURFACE_BYTES,
+            "an exact fit is decoded and charged"
+        );
+
+        p.frame_paint = MAX_TOTAL_SURFACE_BYTES - decoded + 1;
+        assert!(feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &wts1(20)).is_empty());
+        assert_eq!(
+            p.frame_paint,
+            MAX_TOTAL_SURFACE_BYTES - decoded + 1,
+            "nothing charged"
+        );
+        let surface = p.surfaces.iter().find(|s| s.id == 1).unwrap();
+        assert_eq!(
+            surface.rgba[0], 10,
+            "the over-budget decode painted nothing"
+        );
+    }
+
     #[test]
     fn an_unbracketed_message_restores_the_budget_on_its_own() {
         let mut p = two_surfaces_and_a_cached_bitmap(64);
