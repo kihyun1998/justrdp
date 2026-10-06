@@ -1935,6 +1935,54 @@ mod tests {
         assert_eq!(outputs.len(), PAINT_BUDGET_FRAMEBUFFERS, "{outputs:?}");
     }
 
+    /// One Set Surface Bits command shaped to reach the decoders (#369): a bitmap mostly inside
+    /// a 64x48 desktop, codec 1 most often, and NSCodec planes whose counts often equal their
+    /// decoded sizes, so the planes are copied raw rather than failing the RLE.
+    fn reaching_surface_bits() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        let geometry = (0u16..=72, 0u16..=56, 1u16..=64, 1u16..=48);
+        let codec =
+            prop_oneof![6 => Just(capability::CODEC_ID_NSCODEC), 2 => Just(0u8), 1 => any::<u8>()];
+        let counts = prop_oneof![4 => Just(None), 1 => proptest::collection::vec(0u32..=8192, 4).prop_map(Some)];
+        (geometry, codec, 1u8..=7, any::<bool>(), counts, any::<u8>()).prop_map(
+            |((x, y, w, h), codec_id, cll, subsampled, counts, fill)| {
+                let data = match codec_id {
+                    capability::CODEC_ID_NSCODEC => {
+                        let sizes = nscodec::plane_sizes(w.into(), h.into(), subsampled)
+                            .expect("a 64x48 bitmap's planes are sized");
+                        let counts =
+                            counts.map_or(sizes.map(|n| n as u32), |c| [c[0], c[1], c[2], c[3]]);
+                        let mut nsc = Vec::new();
+                        for count in counts {
+                            nsc.extend_from_slice(&count.to_le_bytes());
+                        }
+                        nsc.extend_from_slice(&[cll, u8::from(subsampled), 0, 0]);
+                        let body: u32 = counts.iter().sum();
+                        nsc.extend(std::iter::repeat_n(fill, body.min(65_536) as usize));
+                        nsc
+                    }
+                    _ => vec![fill; usize::from(w) * usize::from(h) * 4],
+                };
+                set_surface_bits(x, y, w, h, codec_id, &data)
+            },
+        )
+    }
+
+    proptest::proptest! {
+        // ADR-0008 and #369: the session's Surface Bits path never panics, over inputs weighted
+        // to get past the NSCodec header and the size refusal into the decode and the blit.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+        #[test]
+        fn surface_bits_through_the_session_never_panic(
+            commands in proptest::collection::vec(reaching_surface_bits(), 1..=4),
+        ) {
+            let mut cfg = config();
+            cfg.desktop_size = (64, 48);
+            let mut sm = SessionStateMachine::new(cfg, Vec::new()).unwrap();
+            let _ = sm.process_bytes(&surface_commands_pdu(&commands.concat()));
+        }
+    }
+
     fn config() -> SessionConfig {
         SessionConfig {
             user_channel_id: USER,

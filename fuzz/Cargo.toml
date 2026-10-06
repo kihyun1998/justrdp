@@ -289,6 +289,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "session_surface_bits"
+path = "fuzz_targets/session_surface_bits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "share"
 path = "fuzz_targets/share.rs"
 test = false

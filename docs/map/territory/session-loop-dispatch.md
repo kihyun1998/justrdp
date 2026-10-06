@@ -100,7 +100,11 @@ evidence was the maintainer's call, recorded in ADR-0016.
   rejected the identical class; #253 closed it in the decoder both this loop and the connect
   leg call. `stream_id` is the same header's remaining instance.
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md) —
-  every byte this loop dispatches came from the network.
+  every byte this loop dispatches came from the network. The Surface Bits path is driven whole by
+  `surface_bits_through_the_session_never_panic` and the `session_surface_bits` fuzz target
+  (#369), whose generators shape NSCodec planes to their decoded sizes: 76% of cases reach a
+  frame, against ~130 in 300 000 for undirected bytes, and a panic injected after the NSCodec
+  decode or before the blit turns the property red.
 - [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)
   — a `pduType2` a capability we send invites needs its own arm, not the catch-all: Play Sound
   for the default Sound set (#354).
