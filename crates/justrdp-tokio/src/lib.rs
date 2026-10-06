@@ -1239,11 +1239,13 @@ async fn write_ts_request(
     stream: &mut TlsStream<TcpStream>,
     ts: &TsRequest,
 ) -> Result<(), ConnectFailure> {
-    let mut buf = Vec::with_capacity(ts.buffer_len() as usize);
-    ts.encode_ts_request(&mut buf)
-        .map_err(|e| ConnectFailure::Nla {
+    fn nla(e: impl std::fmt::Display) -> ConnectFailure {
+        ConnectFailure::Nla {
             reason: e.to_string(),
-        })?;
+        }
+    }
+    let mut buf = Vec::with_capacity(usize::from(ts.buffer_len().map_err(nla)?));
+    ts.encode_ts_request(&mut buf).map_err(nla)?;
     write_frame(stream, &buf).await?;
     Ok(())
 }
@@ -2181,7 +2183,7 @@ mod tests {
                 };
                 match state {
                     ServerState::ReplyNeeded(reply) => {
-                        let mut out = Vec::with_capacity(reply.buffer_len() as usize);
+                        let mut out = Vec::with_capacity(usize::from(reply.buffer_len().unwrap()));
                         reply.encode_ts_request(&mut out).unwrap();
                         tls.write_all(&out).await.unwrap();
                     }
