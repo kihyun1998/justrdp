@@ -22,6 +22,9 @@ initialization sequence as a helper the host drives over that seam (`justrdp::cl
 - [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md) — of the channel flags, only the
   clipboard's file transfer is a policy flag and so the host's (#355); every other
   `generalFlags` bit, and every rdpdr General bit, stays the core's.
+- [ADR-0018](../../adr/0018-host-terminated-dynamic-channels.md) — a host may register dynamic
+  channel names, whose messages reach it as a static channel's do; one transport-indifferent
+  helper serves a protocol on both (audio output: `RDPSND` and `AUDIO_PLAYBACK_DVC`, epic #11).
 
 Adjacent but not governing: `GLOSSARY.md` defines **Virtual Channel** in the
 glossary, which is vocabulary rather than a decision.

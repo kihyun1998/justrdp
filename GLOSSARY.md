@@ -82,3 +82,13 @@ A Virtual Channel negotiated at GCC from the client's channel list.
 
 **Dynamic Virtual Channel**:
 A Virtual Channel the server opens on demand over the `drdynvc` channel.
+
+**Host-terminated Channel**:
+A Virtual Channel whose protocol the host runs to its end, such as clipboard, device redirection
+and audio output; the core carries its messages without interpreting them.
+_Avoid_: host channel, channel helper
+
+**Core-terminated Channel**:
+A Virtual Channel whose protocol the core runs to its end, such as the Graphics Pipeline and
+Display Control.
+_Avoid_: internal channel, DVC processor
