@@ -491,7 +491,7 @@ impl GraphicsProcessor {
                     ));
                 }
                 // 32bpp BGRX/BGRA, top-down (EGFX surfaces are top-down, unlike the GDI
-                // legacy bottom-up of the slow path).
+                // bottom-up of legacy graphics).
                 let rgba = color::to_rgba(data, uw, uh, 32, &Palette::default(), false)
                     .map_err(|e| {
                         tracing::warn!(target: "rdp_egfx", error = %e, "uncompressed WTS1 conversion failed");

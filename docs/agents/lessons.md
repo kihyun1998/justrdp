@@ -24,7 +24,7 @@ Read this before starting so the graph does not read as abstractions.
   buried, un-overridable. justrdp is the rewrite that lets the **host hold every
   policy flag** (ADR-0016). The boundary invariant (core owns all RDP-native layers,
   delegates only security-critical non-RDP crates) exists to keep that control.
-  (`GLOSSARY.md` §Project intent.)
+  ([ADR-0017](../adr/0017-rebuild-so-the-host-holds-every-policy-flag.md).)
 
 ## Step 1 — spec + real source, derive don't copy
 
