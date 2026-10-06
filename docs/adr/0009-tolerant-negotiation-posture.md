@@ -332,3 +332,28 @@ chose warn-and-skip. A better derivation does not reopen it; the maintainer does
 - **Cache import** (2.2.2.16/.17) and the persistent bitmap cache (3.3.1.5, epic #28), neither of
   which this client implements.
 - Any server but one WS2022 box, at any version but 10.4 and 10.3.
+
+## Amendment (2026-10-06, #376): row 5 — a WireToSurface1 bitmap larger than its surface is skipped
+
+**Kind: judgement.** `RDPGFX_WIRE_TO_SURFACE_PDU_1` refused a `destRect` only past
+`MAX_TOTAL_SURFACE_BYTES` (256 MiB of RGBA), whatever its surface, so one PDU could decode up to
+that much: ~0.25 s and ~0.5 GiB of transient buffers at ClearCodec's measured 0.92 ns per output
+byte (#372). A bitmap wider or taller than its destination surface is now **skipped** with an
+`rdp_egfx` warning, before it is charged or decoded; one that fits and overhangs an edge is still
+clipped, which keeps the tolerance every other surface routine has.
+
+`[MS-RDPEGFX]` says nothing about a `destRect` relative to its surface (2.2.1.2, 2.2.2.1, 3.3.5.1).
+FreeRDP refuses anything not wholly inside it, and its drdynvc then closes the channel; `ironrdp-egfx`
+warns and decodes. No capture records a `destRect` position, so whether a real server ever overhangs
+is unobserved. Every rectangle this skips, FreeRDP refuses too.
+
+The maintainer was shown three options: refuse anything not inside the surface, bound the size only,
+or keep the ceiling and record its cost. Each came with its compatibility risk, the bound it reaches
+and the records it moves. They were also shown that a skip is this record's rows 3 and 4 and that a
+refusal ends the session. They chose the size bound, as a skip.
+
+**What it does not bound, stated so it is not read otherwise:** a surface may itself be up to
+`MAX_TOTAL_SURFACE_BYTES`, so a PDU for such a surface still decodes up to 256 MiB. The per-frame
+total was already bounded by #372. This row bounds the ordinary case and ties a decode to memory the
+server has made resident; the worst case is unchanged.
+
