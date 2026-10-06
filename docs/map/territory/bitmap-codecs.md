@@ -35,6 +35,14 @@ attacker-controlled bytes in the repo.
   path where FreeRDP rejects — both are required by real Server 2022 streams (#127).
   These are recorded as deliberate divergences against #127 and memory
   `clearcodec_corpus_required_tolerances`.
+- **NSCodec accepts a zero luma, Co or Cg plane count, which `[MS-RDPNSC]` 2.2.2 forbids** (#371,
+  the maintainer's call). `decode_plane` fills a zero-length plane with `0xFF`, as FreeRDP does
+  for every plane (`nsc.c`, `nsc_rle_decompress_data`); the spec allows that only for alpha.
+  Shown that refusing would be stricter than FreeRDP and would end a Surface Bits session (an
+  NSCodec decode failure is fatal there), that neither real capture holds such a stream (the
+  ClearCodec corpus and #150's 1432 Surface Bits streams), and that the cost such a stream buys
+  is already bounded (#370's per-update budget, the ClearCodec region's rect), the maintainer kept
+  the tolerance.
 - **Stage boundaries are the unit of verification** where the assembled decoder has
   no counterpart to compare against (RemoteFX, ADR-0007).
 - **Decoders write into a caller-provided buffer** wherever the frame path allows
