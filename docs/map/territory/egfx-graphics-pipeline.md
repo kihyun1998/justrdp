@@ -153,13 +153,19 @@ acknowledge frames. It is server→client only, and it is reachable only if
   `fillRectCount` observed was **1**. The ceiling therefore sits ~64x above observed traffic,
   which is the evidence that it bounds an attack and not a server (`docs/plan.md` §0).
 
-- **The bound is deliberately *not* the destination surface's own dimensions**, which is
-  tighter and is what FreeRDP does (`is_within_surface`, `gdi/gfx.c:386`, refusing before
-  its `1ull * bpp * w * h` at `:390`; `ironrdp-egfx` checks the same condition and only
-  `warn!`s). An off-surface rectangle is **clipped** rather than refused, and
-  ADR-0009 says not to trade a tolerance we already have for a bound the spec never asked
-  for — recorded with the honest caveat that no capture here has ever shown a real server
-  sending an off-surface `destRect`, so the tolerance being kept is unobserved too.
+- **The destination surface bounds a bitmap's size, not its position** (#376, the
+  maintainer's call). A `destRect` wider or taller than its surface is **skipped** with an
+  `rdp_egfx` warning before it decodes or is charged; one that fits and overhangs an edge is
+  **clipped**, as before. The surface is looked up first, so a PDU for an unknown surface no
+  longer decodes before it fails. FreeRDP refuses anything not wholly inside the surface
+  (`is_within_surface`, `gdi/gfx.c`, and its drdynvc then closes the channel); `ironrdp-egfx`
+  only `warn!`s. Shown three options with their consequences, the maintainer chose this one
+  over refusing overhang and over keeping the 256 MiB-per-PDU ceiling, and chose a skip over a
+  refusal. **What it does not bound:** a server may create a surface up to the whole
+  `MAX_TOTAL_SURFACE_BYTES`, and a PDU for that surface may still decode it all. The change
+  bounds the ordinary case (a 1280x800 surface caps a PDU at 4 MB) and makes a decode cost
+  memory the server has already made resident; it does not lower the worst case. The record is
+  ADR-0009's 2026-10-06 amendment, row 5.
 
   **The tolerance holds at all four surface routines as of #268, and this bullet used to assert
   it from one.** The sentence above read *"a partially off-surface rectangle is clipped by
@@ -173,8 +179,8 @@ acknowledge frames. It is server→client only, and it is reachable only if
   `left == 1920` is the last legal offset and `left == 1921` panicked
   (`range start index 8294404 out of range for slice of length 8294400`), reachable with
   `destPtsCount == 1` and no unusual geometry. **The decision is unchanged and was never in
-  doubt** — declining `is_within_surface` costs nothing now that the tolerance is real at every
-  site. What was wrong is this record's account of its own coverage, and the way it was wrong is
+  doubt** — declining `is_within_surface`'s position check costs nothing now that the tolerance
+  is real at every site. What was wrong is this record's account of its own coverage, and the way it was wrong is
   the part to carry forward: the claim was checked at one routine and written as if it covered
   the family. Generalised one level out in
   [untrusted decode never panics](../invariant/untrusted-decode-never-panics.md).

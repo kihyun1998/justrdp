@@ -706,14 +706,9 @@ impl GraphicsProcessor {
                 // `MAX_SURFACE_DIM` bound was written first and is 4x looser: 16384 x 16384 x 4
                 // is 1 GiB, i.e. four times the budget the whole surface set has to share.
                 //
-                // Deliberately *not* the destination surface's own width and height, which is
-                // tighter again and what FreeRDP does (`is_within_surface`, `gdi/gfx.c:386`,
-                // refusing before its `1ull * bpp * w * h` at `:390`; `ironrdp-egfx` checks the
-                // same condition and only `warn!`s): a partially off-surface rectangle is
-                // clipped by `Surface::blit` today, and ADR-0009 says not to trade a tolerance
-                // we already have for a bound the spec never asked for. Stated as the code fact
-                // it is — no capture in this repo has ever recorded a real server sending an
-                // off-surface destRect, so the tolerance being kept is unobserved too.
+                // Below this ceiling the destination surface bounds the bitmap's size, not its
+                // position (#376): one wider or taller than its surface is skipped below, and
+                // one that fits and overhangs an edge is clipped by `Surface::blit`.
                 //
                 // `Surface::blit` is named here because it is the only routine a *destRect*
                 // reaches, not as shorthand for the surface model. The same sentence copied into
@@ -741,6 +736,25 @@ impl GraphicsProcessor {
                     )
                     .into());
                 };
+                let (w, h) = (dest_rect.width(), dest_rect.height());
+                let surface = self.surface_mut(surface_id).ok_or(miss(
+                    "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                    "unknown destination surface",
+                ))?;
+                // A bitmap wider or taller than its surface is skipped (#376); one that fits
+                // and overhangs an edge is clipped by `Surface::blit`.
+                if w > surface.width || h > surface.height {
+                    tracing::warn!(
+                        target: "rdp_egfx",
+                        surface_id,
+                        width = w,
+                        height = h,
+                        surface_width = surface.width,
+                        surface_height = surface.height,
+                        "WireToSurface1 bitmap larger than its surface skipped",
+                    );
+                    return Ok(());
+                }
                 // The decode is charged its decoded size before it runs (#372).
                 if decoded > MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint) {
                     note_budget("RDPGFX_WIRE_TO_SURFACE_PDU_1", 1, 0);
@@ -751,7 +765,6 @@ impl GraphicsProcessor {
                     .decode_wts1(codec_id, dest_rect, data)
                     .map_err(Failure::Miss)?
                 {
-                    let (w, h) = (dest_rect.width(), dest_rect.height());
                     let surface = self.surface_mut(surface_id).ok_or(miss(
                         "RDPGFX_WIRE_TO_SURFACE_PDU_1",
                         "unknown destination surface",
@@ -2640,10 +2653,11 @@ mod tests {
         // the assertion has to name which error, or an off-by-one is invisible. Measured: it
         // was. Written first as a direct `decode_wts1` call, this stayed green under a
         // `>` -> `>=` mutation, because a direct call does not pass the call site the bound
-        // lives at. It goes through `process` for that reason.
+        // lives at. It goes through `process` for that reason. The surface is the largest one
+        // that can exist, so the surface-size skip (#376) is not what answers.
         let at = |right: u16, bottom: u16| {
             let mut p = GraphicsProcessor::default();
-            create_surface(&mut p, 1, 64, 64);
+            create_surface(&mut p, 1, 8192, 8192);
             let message = egfx::wrap_uncompressed(&header(
                 egfx::CMDID_WIRE_TO_SURFACE_1,
                 &wts1(egfx::CODECID_UNCOMPRESSED, right, bottom, &[0xAB; 16]),
@@ -3381,6 +3395,83 @@ mod tests {
     /// And the per-message reset covers the case StartFrame cannot: draw commands do not
     /// require a frame — no arm checks `in_frame` before painting — so a server that never
     /// sends StartFrame would otherwise sit outside the accounting forever.
+    /// A WireToSurface1 uncompressed body for surface 1 at `rect`, every byte `fill`.
+    fn wts1_uncompressed(surface: u16, rect: [u16; 4], fill: u8) -> Vec<u8> {
+        let (w, h) = (
+            usize::from(rect[2] - rect[0]),
+            usize::from(rect[3] - rect[1]),
+        );
+        let mut body = surface.to_le_bytes().to_vec();
+        body.extend_from_slice(&egfx::CODECID_UNCOMPRESSED.to_le_bytes());
+        body.push(egfx::PIXEL_FORMAT_XRGB_8888);
+        for v in rect {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&((w * h * 4) as u32).to_le_bytes());
+        body.extend(std::iter::repeat_n(fill, w * h * 4));
+        body
+    }
+
+    /// Issue #376: a destRect wider or taller than its surface is skipped before it decodes,
+    /// and charges nothing.
+    #[test]
+    fn a_destination_rectangle_larger_than_its_surface_is_skipped() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 4, 4);
+        for rect in [[0, 0, 5, 4], [0, 0, 4, 5]] {
+            assert!(
+                feed(
+                    &mut p,
+                    egfx::CMDID_WIRE_TO_SURFACE_1,
+                    &wts1_uncompressed(1, rect, 9)
+                )
+                .is_empty()
+            );
+            assert_eq!(p.frame_paint, 0, "{rect:?} charged nothing");
+        }
+        let surface = p.surfaces.iter().find(|s| s.id == 1).unwrap();
+        assert!(
+            surface.rgba.chunks(4).all(|px| px[0] != 9),
+            "nothing was painted"
+        );
+    }
+
+    /// Issue #376: a surface-sized destRect that overhangs the surface's edge still decodes and
+    /// is clipped, as every other surface routine clips.
+    #[test]
+    fn a_surface_sized_destination_rectangle_that_overhangs_is_clipped() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 4, 4);
+        assert!(
+            feed(
+                &mut p,
+                egfx::CMDID_WIRE_TO_SURFACE_1,
+                &wts1_uncompressed(1, [2, 2, 6, 6], 9)
+            )
+            .is_empty()
+        );
+        assert_eq!(p.frame_paint, 4 * 4 * 4);
+        let surface = p.surfaces.iter().find(|s| s.id == 1).unwrap();
+        let at = |x: usize, y: usize| surface.rgba[(y * 4 + x) * 4];
+        assert_eq!((at(2, 2), at(3, 3), at(1, 1)), (9, 9, 0));
+    }
+
+    /// Issue #376: an unknown surface is found missing before the decode is charged or run.
+    #[test]
+    fn a_wire_to_surface_for_an_unknown_surface_is_caught_before_the_decode() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 4, 4);
+        let message = egfx::wrap_uncompressed(&header(
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &wts1_uncompressed(2, [0, 0, 4, 4], 9),
+        ));
+        let _ = p.process(&message);
+        assert_eq!(
+            p.frame_paint, 0,
+            "the missing surface was noticed before the charge"
+        );
+    }
+
     /// Issue #372: a WireToSurface1 decode is charged its decoded size against the per-frame
     /// paint budget before it decodes, and skipped once the frame cannot afford it.
     #[test]
