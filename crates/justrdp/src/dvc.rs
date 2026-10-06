@@ -1,12 +1,12 @@
 //! The drdynvc manager (MS-RDPEDYC 3.2) — the sans-IO state for the dynamic-virtual-channel
 //! transport riding the `drdynvc` static channel. The manager owns the **transport**: it
 //! answers the server's Capabilities Request (version 2), matches Create Requests against the
-//! registered processors (refusing unknown channel names), and reassembles fragmented channel
-//! data (DataFirst + Data). Each channel is a [`DvcProcessor`] — the
-//! `channel_name`/`start`/`process`/`close` model (issue #8, conceptually after `ironrdp-dvc`,
-//! implemented here per ADR-0002) — which only ever sees complete messages. The session
-//! machine feeds the manager SVC payloads and wraps whatever it wants sent; this module never
-//! sees MCS framing.
+//! registered processors and the host's channel names (refusing every other name), and
+//! reassembles fragmented channel data (DataFirst + Data). A core channel is a [`DvcProcessor`]
+//! — the `channel_name`/`start`/`process`/`close` model (issue #8, conceptually after
+//! `ironrdp-dvc`, implemented here per ADR-0002); a host channel's messages go to the host as
+//! events (ADR-0018). Both only ever see complete messages. The session machine feeds the
+//! manager SVC payloads and wraps whatever it wants sent; this module never sees MCS framing.
 
 use crate::egfx::GraphicsProcessor;
 use crate::framebuffer::{FrameUpdate, Framebuffer};
@@ -33,11 +33,12 @@ const SVC_MESSAGE_CAP: usize = 64 << 10;
 /// bytes; the cap leaves room for future channels without allowing unbounded allocation.
 const DVC_MESSAGE_CAP: usize = 4 << 20;
 
-/// Cap on simultaneously open dynamic channels, per registered processor. Conforming servers
-/// open one channel per processor (a Close frees its slot before any re-create); a server
-/// minting fresh channel ids for the same name must not grow the open list without bound
-/// (#86 — the allocation-cap discipline). At the cap a Create Request is refused, not fatal.
-const MAX_OPEN_CHANNELS_PER_PROCESSOR: usize = 4;
+/// Cap on simultaneously open dynamic channels, per endpoint: each core processor and each host
+/// channel name. Conforming servers open one channel per name (a Close frees its slot before
+/// any re-create); a server minting fresh channel ids for the same name must not grow the open
+/// list without bound (#86 — the allocation-cap discipline), nor spend another name's slots. At
+/// the cap a Create Request is refused, not fatal.
+const MAX_OPEN_CHANNELS_PER_ENDPOINT: usize = 4;
 
 /// A dynamic-channel endpoint: one implementation per channel the client supports
 /// (Display Control today; EGFX and friends in their slices). The manager handles transport —
@@ -98,7 +99,61 @@ pub(crate) enum DvcEvent {
         /// New output height in pixels.
         height: u16,
     },
+    /// The server opened a host channel (ADR-0018).
+    HostOpened {
+        /// The name the host registered.
+        name: String,
+        /// The id the server gave it.
+        channel_id: u32,
+    },
+    /// One complete message on a host channel.
+    HostData {
+        /// The channel's id.
+        channel_id: u32,
+        /// The message.
+        data: Vec<u8>,
+    },
+    /// The server closed a host channel, or replaced its binding with a new Create Request.
+    HostClosed {
+        /// The channel's id.
+        channel_id: u32,
+    },
 }
+
+/// Why [`crate::SessionStateMachine::send_dynamic_channel`] or
+/// [`crate::SessionStateMachine::close_dynamic_channel`] was refused (the session itself is
+/// unaffected).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicChannelError {
+    /// No host channel with this id is open.
+    NotOpen {
+        /// The id asked for.
+        channel_id: u32,
+    },
+    /// The server suspended virtual channel traffic and the messages held for its resume
+    /// would exceed 64 MiB with this one.
+    SuspendedQueueFull {
+        /// The id asked for.
+        channel_id: u32,
+    },
+}
+
+impl core::fmt::Display for DynamicChannelError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DynamicChannelError::NotOpen { channel_id } => {
+                write!(f, "no host dynamic channel {channel_id} is open")
+            }
+            DynamicChannelError::SuspendedQueueFull { channel_id } => write!(
+                f,
+                "virtual channel traffic is suspended and the held messages would exceed 64 MiB \
+                 (dynamic channel {channel_id})"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for DynamicChannelError {}
 
 /// Why the manager rejected an SVC payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,18 +227,48 @@ impl DvcProcessor for DisplayControlProcessor {
     }
 }
 
-/// One open dynamic channel: its server-assigned ID, the owning processor, and any
+/// Who terminates an open dynamic channel's protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Endpoint {
+    /// A core processor, by its index in [`Drdynvc::processors`].
+    Processor(usize),
+    /// The host, by the index of its name in [`Drdynvc::host_names`] (ADR-0018).
+    Host(usize),
+}
+
+/// One open dynamic channel: its server-assigned ID, the endpoint that terminates it, and any
 /// fragmented message in flight (DataFirst total + accumulated bytes).
 #[derive(Debug)]
 struct OpenChannel {
     channel_id: u32,
-    processor: usize,
+    endpoint: Endpoint,
     reassembly: Option<(usize, Vec<u8>)>,
 }
 
-/// The drdynvc transport state plus the registered channel processors.
+/// A dynamic channel name the host registered that a core processor already terminates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreOwnedDynamicChannel {
+    /// The name.
+    pub name: String,
+}
+
+impl core::fmt::Display for CoreOwnedDynamicChannel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "dynamic channel {} is terminated by the core and cannot be registered by the host",
+            self.name
+        )
+    }
+}
+
+impl core::error::Error for CoreOwnedDynamicChannel {}
+
+/// The drdynvc transport state plus the registered channel processors and host channel names.
 pub(crate) struct Drdynvc {
     processors: Vec<Box<dyn DvcProcessor + Send>>,
+    /// The dynamic channel names whose messages go to the host (ADR-0018).
+    host_names: Vec<String>,
     open: Vec<OpenChannel>,
     /// SVC chunk reassembly for the drdynvc channel itself.
     svc: crate::svc::Reassembler,
@@ -202,22 +287,34 @@ impl core::fmt::Debug for Drdynvc {
 
 impl Default for Drdynvc {
     fn default() -> Self {
-        Self::new(GraphicsProcessor::default())
+        Self::new(GraphicsProcessor::default(), &[]).expect("no host names to refuse")
     }
 }
 
 impl Drdynvc {
-    /// The manager with Display Control and `graphics` registered.
-    pub(crate) fn new(graphics: GraphicsProcessor) -> Self {
-        Self {
-            processors: vec![
-                Box::new(DisplayControlProcessor::default()),
-                Box::new(graphics),
-            ],
+    /// The manager with Display Control and `graphics` registered, and `host_names` delivered to
+    /// the host. A host name a core processor terminates is refused.
+    pub(crate) fn new(
+        graphics: GraphicsProcessor,
+        host_names: &[String],
+    ) -> Result<Self, CoreOwnedDynamicChannel> {
+        let processors: Vec<Box<dyn DvcProcessor + Send>> = vec![
+            Box::new(DisplayControlProcessor::default()),
+            Box::new(graphics),
+        ];
+        if let Some(name) = host_names
+            .iter()
+            .find(|name| processors.iter().any(|p| p.channel_name() == name.as_str()))
+        {
+            return Err(CoreOwnedDynamicChannel { name: name.clone() });
+        }
+        Ok(Self {
+            processors,
+            host_names: host_names.to_vec(),
             open: Vec::new(),
             svc: crate::svc::Reassembler::new(SVC_MESSAGE_CAP),
             display_control: None,
-        }
+        })
     }
 }
 
@@ -266,46 +363,60 @@ impl Drdynvc {
             }
             DvcMessage::CreateRequest { channel_id, name } => {
                 // A Create for a bound id replaces the binding, accepted or not.
-                self.unbind(channel_id);
-                let Some(processor) = self
+                let mut events: Vec<DvcEvent> = self.unbind(channel_id).into_iter().collect();
+                let endpoint = if let Some(processor) = self
                     .processors
                     .iter()
                     .position(|p| p.channel_name() == name)
-                else {
+                {
+                    Endpoint::Processor(processor)
+                } else if let Some(host) = self.host_names.iter().position(|n| n == name) {
+                    Endpoint::Host(host)
+                } else {
                     tracing::debug!(target: "rdp_drdynvc", channel_id, name, "DYNVC create refused");
-                    // Channels with no registered processor are refused, which tells the
-                    // server not to send data on them (EGFX and friends arrive as their own
-                    // slices, each registering a processor).
-                    return Ok(vec![DvcEvent::Send(dvc::encode_create_response(
+                    // A name neither a core processor nor the host registered is refused, which
+                    // tells the server not to send data on it.
+                    events.push(DvcEvent::Send(dvc::encode_create_response(
                         channel_id,
                         CREATION_STATUS_REFUSED,
-                    ))]);
+                    )));
+                    return Ok(events);
                 };
-                if self.open.len() >= self.processors.len() * MAX_OPEN_CHANNELS_PER_PROCESSOR {
+                let open_for_endpoint = self.open.iter().filter(|c| c.endpoint == endpoint).count();
+                if open_for_endpoint >= MAX_OPEN_CHANNELS_PER_ENDPOINT {
                     tracing::warn!(
                         target: "rdp_drdynvc",
                         channel_id,
                         name,
                         "DYNVC create refused — open-channel cap reached"
                     );
-                    return Ok(vec![DvcEvent::Send(dvc::encode_create_response(
+                    events.push(DvcEvent::Send(dvc::encode_create_response(
                         channel_id,
                         CREATION_STATUS_REFUSED,
-                    ))]);
+                    )));
+                    return Ok(events);
                 }
                 tracing::debug!(target: "rdp_drdynvc", channel_id, name, "DYNVC create accepted");
                 self.open.push(OpenChannel {
                     channel_id,
-                    processor,
+                    endpoint,
                     reassembly: None,
                 });
-                let mut events = vec![DvcEvent::Send(dvc::encode_create_response(
+                events.push(DvcEvent::Send(dvc::encode_create_response(
                     channel_id,
                     CREATION_STATUS_OK,
-                ))];
-                let channel = self.processors[processor].channel_name();
-                let outputs = self.processors[processor].start(channel_id);
-                events.extend(self.apply_outputs(channel_id, channel, outputs));
+                )));
+                match endpoint {
+                    Endpoint::Processor(processor) => {
+                        let channel = self.processors[processor].channel_name();
+                        let outputs = self.processors[processor].start(channel_id);
+                        events.extend(self.apply_outputs(channel_id, channel, outputs));
+                    }
+                    Endpoint::Host(host) => events.push(DvcEvent::HostOpened {
+                        name: self.host_names[host].clone(),
+                        channel_id,
+                    }),
+                }
                 Ok(events)
             }
             DvcMessage::DataFirst {
@@ -326,7 +437,7 @@ impl Drdynvc {
                     // Degenerate single-fragment DataFirst: complete immediately.
                     open.reassembly = None;
                     let message = data[..total_length as usize].to_vec();
-                    return self.dispatch(channel_id, &message);
+                    return self.dispatch(channel_id, message);
                 }
                 open.reassembly = Some((total_length as usize, data.to_vec()));
                 Ok(Vec::new())
@@ -340,22 +451,23 @@ impl Drdynvc {
                         buffer.extend_from_slice(data);
                         if buffer.len() >= *total {
                             let total = *total;
-                            let buffer = open.reassembly.take().map(|(_, b)| b).unwrap_or_default();
-                            return self.dispatch(channel_id, &buffer[..total]);
+                            let mut buffer =
+                                open.reassembly.take().map(|(_, b)| b).unwrap_or_default();
+                            buffer.truncate(total);
+                            return self.dispatch(channel_id, buffer);
                         }
                         Ok(Vec::new())
                     }
                     // No DataFirst in flight: the message fits one PDU.
                     None => {
                         let message = data.to_vec();
-                        self.dispatch(channel_id, &message)
+                        self.dispatch(channel_id, message)
                     }
                 }
             }
             DvcMessage::Close { channel_id } => {
                 tracing::debug!(target: "rdp_drdynvc", channel_id, "DYNVC close");
-                self.unbind(channel_id);
-                Ok(Vec::new())
+                Ok(self.unbind(channel_id).into_iter().collect())
             }
             // Compressed data PDUs need version 3, which is never answered.
             DvcMessage::Unsupported {
@@ -380,26 +492,66 @@ impl Drdynvc {
     }
 
     /// Drop `channel_id`'s binding, if any: its processor state and the Display Control
-    /// target it may have recorded.
-    fn unbind(&mut self, channel_id: u32) {
+    /// target it may have recorded. A host channel's binding yields the event that tells the
+    /// host it closed.
+    fn unbind(&mut self, channel_id: u32) -> Option<DvcEvent> {
+        let mut closed = None;
         if let Some(at) = self.open.iter().position(|c| c.channel_id == channel_id) {
-            let open = self.open.remove(at);
-            self.processors[open.processor].close();
+            match self.open.remove(at).endpoint {
+                Endpoint::Processor(processor) => self.processors[processor].close(),
+                Endpoint::Host(_) => closed = Some(DvcEvent::HostClosed { channel_id }),
+            }
         }
         if self.display_control.map(|(id, _)| id) == Some(channel_id) {
             self.display_control = None;
         }
+        closed
     }
 
-    /// Route one complete message to its channel's processor and apply the outputs.
-    fn dispatch(&mut self, channel_id: u32, message: &[u8]) -> Result<Vec<DvcEvent>, DvcError> {
+    /// The drdynvc PDUs carrying `message` on the open host channel `channel_id`.
+    pub(crate) fn host_send(
+        &self,
+        channel_id: u32,
+        message: &[u8],
+    ) -> Result<Vec<Vec<u8>>, DynamicChannelError> {
+        self.host_channel(channel_id)?;
+        Ok(dvc::encode_data(channel_id, message))
+    }
+
+    /// Drop the open host channel `channel_id`'s binding and return the Close PDU to send.
+    pub(crate) fn host_close(&mut self, channel_id: u32) -> Result<Vec<u8>, DynamicChannelError> {
+        let at = self.host_channel(channel_id)?;
+        self.open.remove(at);
+        tracing::debug!(target: "rdp_drdynvc", channel_id, "DYNVC close sent for a host channel");
+        Ok(dvc::encode_close(channel_id))
+    }
+
+    /// The index in [`Self::open`] of the open host channel `channel_id`.
+    fn host_channel(&self, channel_id: u32) -> Result<usize, DynamicChannelError> {
+        self.open
+            .iter()
+            .position(|c| c.channel_id == channel_id && matches!(c.endpoint, Endpoint::Host(_)))
+            .ok_or(DynamicChannelError::NotOpen { channel_id })
+    }
+
+    /// Route one complete message to its channel's endpoint and apply the outputs.
+    fn dispatch(&mut self, channel_id: u32, message: Vec<u8>) -> Result<Vec<DvcEvent>, DvcError> {
         let Some(open) = self.open.iter().find(|c| c.channel_id == channel_id) else {
             return Ok(Vec::new());
         };
-        let processor = &mut self.processors[open.processor];
+        let processor = match open.endpoint {
+            Endpoint::Processor(processor) => processor,
+            Endpoint::Host(_) => {
+                return Ok(vec![DvcEvent::HostData {
+                    channel_id,
+                    data: message,
+                }]);
+            }
+        };
+        let processor = &mut self.processors[processor];
         let channel = processor.channel_name();
         let outputs = processor
-            .process(message)
+            .process(&message)
             .map_err(|error| DvcError::Processor { channel, error })?;
         Ok(self.apply_outputs(channel_id, channel, outputs))
     }
@@ -581,7 +733,7 @@ mod tests {
     #[test]
     fn creates_past_the_open_channel_cap_are_refused() {
         let mut manager = Drdynvc::default();
-        let cap = manager.processors.len() * MAX_OPEN_CHANNELS_PER_PROCESSOR;
+        let cap = MAX_OPEN_CHANNELS_PER_ENDPOINT;
         for id in 0..cap {
             let events = feed(
                 &mut manager,

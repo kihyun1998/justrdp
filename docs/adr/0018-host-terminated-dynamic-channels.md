@@ -21,13 +21,15 @@ dynamic-only.
 
 ## Decision
 
-**A host registers dynamic channel names before connecting, and the drdynvc manager hands their
-messages to the host, which answers and closes them, the way the static channel seam does.**
+**A host registers dynamic channel names in the session configuration, and the drdynvc manager
+hands their messages to the host, which answers and closes them, the way the static channel seam
+does.**
 
 - The manager keeps the transport: Create/Close, fragmentation, reassembly and its caps. The
   host sees only complete messages.
 - A name a core processor registered cannot also be registered by the host; the configuration
-  is refused before connecting.
+  is refused when the session is built, since the server opens dynamic channels only once the
+  session is active.
 - An unregistered name is refused, as today.
 - A protocol the host terminates is run by a sans-IO helper that is indifferent to transport, so
   one audio output helper serves `RDPSND` and `AUDIO_PLAYBACK_DVC`.
@@ -44,3 +46,11 @@ messages to the host, which answers and closes them, the way the static channel 
 - How a Host-terminated Dynamic Virtual Channel's protocol errors are handled. ADR-0014 governs
   core processors; a host helper's error is the host's, as on a static channel.
 - The lossy `AUDIO_PLAYBACK_LOSSY_DVC`, which needs UDP transport (#16).
+
+## Amendment (2026-10-06, #385): where the names are registered
+
+The Decision first said the host registers its names "before connecting" and that a core name
+is refused then. #385 built the registration into the session configuration instead, refused by
+`SessionStateMachine::new`, because the server opens dynamic channels only once the session is
+active. **Keeping that and rewording the Decision was the maintainer's call (2026-10-06)**,
+shown the alternative of a second list in the connect configuration, refused before connecting.

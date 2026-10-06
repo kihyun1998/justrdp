@@ -11,6 +11,7 @@ consumer beyond graphics (Display Control), and, since #307, the host's seam ont
 static channel: messages in as `SessionOutput::ChannelData`, messages out through
 `SessionStateMachine::send_channel`. Since #321 it also carries the clipboard channel's
 initialization sequence as a helper the host drives over that seam (`justrdp::cliprdr`).
+Since #385 the same seam exists for dynamic channels the host registers (ADR-0018).
 
 ## Governing decisions
 
@@ -99,6 +100,45 @@ glossary, which is vocabulary rather than a decision.
   "MUST terminate" left as ADR-0014's open item; any server but this WS2022 box; and a
   multitransport UDP-R tunnel. Decompression is revisited when a channel we accept has a server
   that compresses on it — that capture is its proof.
+- **A dynamic channel can be host-terminated** (#385,
+  [ADR-0018](../../adr/0018-host-terminated-dynamic-channels.md)). The host lists names in
+  `SessionConfig::dynamic_channels`. A Create Request for one is accepted and surfaces as
+  `SessionOutput::DynamicChannelOpened { name, channel_id }`; each reassembled message as
+  `DynamicChannelData`; a server Close, or a Create Request that reuses the id, as
+  `DynamicChannelClosed`. The host answers with `send_dynamic_channel` and ends one with
+  `close_dynamic_channel`, both refused with `DynamicChannelError::NotOpen` for an id that is
+  not an open host channel (a core channel's included). The manager keeps the transport:
+  fragmentation both ways, the 4 MiB reassembly cap (still a transport error, ADR-0014),
+  suspension (a held host message counts against the same 64 MiB bound as a static channel's)
+  and the open-channel cap. A name a core processor terminates is
+  `SessionError::DynamicChannelConfig` from `SessionStateMachine::new`.
+  **Derivations, not the ADR's call**, and they fall to a better one:
+  - The host is told the id and addresses the channel by it, because a server may reuse an id
+    for another name, which only an id-keyed event can show.
+  - A host close drops the binding at once and emits no `DynamicChannelClosed`, since the host
+    already knows. `[MS-RDPEDYC]` 3.2.5.2: the server does not respond to a client-initiated
+    Close, and a Close for an id no longer active MUST be ignored, so a stray one meets no
+    binding.
+  - **The open-channel cap is per endpoint** (#385): 4 for each core processor and each host
+    name. It had been one pool of 4 per processor, so a server minting ids for one name could
+    spend the others' slots; with host names in the pool that would have let a host channel get
+    the Graphics Pipeline refused. A duplicated host name maps to its first entry and adds no
+    slots.
+
+  **Not covered:** a host-terminated channel's protocol errors are the host's, as on a static
+  channel, so ADR-0014's ladder does not reach them.
+  **Two choices recorded at the maintainer's call (2026-10-06, #385)**, each shown with its
+  alternatives:
+  - **The raw id stays the host's handle.** Its known race: a host message queued for id 9 while
+    the server closes 9 and creates 9 again under *another host name* goes to the new channel.
+    It cannot reach a core channel, since a send needs a host endpoint, and with one host name
+    it is harmless. #270 measured this server reusing an id within 40 ms, for refused channels.
+    Revisit when a slice runs several host channels at once (audio input, #12). Shown:
+    per-binding generation handles now, or a follow-up issue.
+  - **A server Close is not answered.** `[MS-RDPEDYC]` 3.2.5.2 makes the reply a MAY; FreeRDP
+    (`dvcchannel_send_close`) and IronRDP (`process_close`) both send one. The host cannot send
+    it either, since the binding is gone when `DynamicChannelClosed` arrives. This predates #385
+    for core channels. Shown: replying as the references do, or a measuring follow-up.
 - Unknown DVCs are not fatal — an unopened channel's traffic is ignored, in the
   spirit of ADR-0009's tolerance on the rendering side.
 - **Requesting a static channel is the host's declaration of interest, and every granted
@@ -436,7 +476,12 @@ glossary, which is vocabulary rather than a decision.
   `encode_monitor_layout`, `Orientation`, `DeviceScaleFactor`, `MIN_DESKTOP_SCALE_FACTOR`,
   `MAX_DESKTOP_SCALE_FACTOR`
 - `justrdp/src/session.rs` — `ResizeRequest`, `request_resize`, `ResizeError`
-- `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`, `DvcError`
+- `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`, `DvcError`, `Endpoint`,
+  `CoreOwnedDynamicChannel`, `DynamicChannelError`
+- `justrdp/src/session.rs` — `SessionConfig::dynamic_channels`,
+  `SessionOutput::DynamicChannelOpened`, `SessionOutput::DynamicChannelData`,
+  `SessionOutput::DynamicChannelClosed`, `send_dynamic_channel`, `close_dynamic_channel`,
+  `SessionError::DynamicChannelConfig`
 - `justrdp/src/svc.rs` — `Reassembler`, `Reassembled`, `CHANNEL_MESSAGE_CAP`
 - `justrdp/src/session.rs` — `SessionOutput::ChannelMessageDropped`,
   `SessionStateMachine::set_channel_message_cap`
@@ -467,6 +512,28 @@ glossary, which is vocabulary rather than a decision.
 DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor Layout to
 1280x1024 with `DesktopScaleFactor` 150; the same run at 100 percent read 96 after
 (`a_resize_at_150_percent_changes_the_server_dpi_on_the_real_vm`).
+
+**Measured against the WS2022 test VM (#385, 2026-10-06):**
+
+- **The server opens `AUDIO_PLAYBACK_DVC` and sends nothing on `rdpsnd`.** With `rdpsnd`, `rdpdr`
+  and `drdynvc` requested and `AUDIO_PLAYBACK_DVC` registered, the Create Request came 134–286 ms
+  into the session in six runs, and no `rdpsnd` static channel message arrived in any. So this
+  server takes the dynamic channel first, as `[MS-RDPEA]` product note 11 says of Windows 8 /
+  Server 2012; WS2022 is not named there.
+- **Nothing arrives on `AUDIO_PLAYBACK_DVC` while the session plays no sound**: 0 messages in
+  90 s, both with `rdpdr` unanswered and with its initialization run to User Logged On (531 ms).
+  FreeRDP 3.31 (`/sound /network:lan`, `WLOG_FILTER=com.freerdp.channels.rdpsnd.client:TRACE`)
+  received none either in 60 s: its log shows the channel opened at 1.1 s and the rdpsnd logger
+  live, and no Server Audio Formats. FreeRDP's client sends nothing first on open
+  (`rdpsnd_on_open` → `rdpsnd_process_connect`, which only loads a backend). This also explains
+  #307's silent `rdpsnd`: that probe refused the dynamic channel. Whether a sound starts the
+  traffic is #386/#387's to measure.
+- **`ECHO` (`[MS-RDPEECO]`) is server-first.** Registered, it is opened within 1 ms and Echo
+  Requests of 8 bytes arrive from 146 ms on (11 in one run), unanswered. It is what the
+  live test of the host DVC receive path stands on
+  (`host_registered_dynamic_channels_reach_the_host_on_the_real_vm`). The server also creates
+  `Microsoft::Windows::RDS::Telemetry`, `…::Video::Control::v08.01`, `…::Video::Data::v08.01`,
+  `…::Geometry::v08.01`, `AUDIO_PLAYBACK_LOSSY_DVC` and `…::Input`, which FreeRDP refuses too.
 
 **Measured against the WS2022 test VM (#307, 2026-09-22):**
 
@@ -646,6 +713,15 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   design-model bullet for when that changes.
 - SVC compression (`VirtualChannelCapabilitySet`'s compression flags) is not
   implemented.
+- **A host dynamic channel has no host-set message cap and no drop path** (#385): a message over
+  the manager's fixed 4 MiB ends the session as a transport error (ADR-0014), where a host static
+  channel's is skipped and reported (`ChannelMessageDropped`, #323). Audio blocks are far below
+  it; the first host dynamic channel to carry large messages (camera, #19) meets it. Recorded
+  rather than built, at the maintainer's call (2026-10-06).
+- **A host dynamic channel send has not been proven live** (#385): `ECHO` is received live, but
+  nothing on this server answers a host message on it observably, so `send_dynamic_channel` and
+  `close_dynamic_channel` are proven by unit tests. Audio output's Client Audio Formats (#386,
+  #387) is the first host message the server must act on.
 - **A multi-chunk `drdynvc` message we send has never been proven live**, with or without
   `CHANNEL_FLAG_SHOW_PROTOCOL`: no VM test sends a DVC message over one chunk. Since #338 it
   goes unflagged, as FreeRDP sends it. The first slice that sends a large DVC message (audio
