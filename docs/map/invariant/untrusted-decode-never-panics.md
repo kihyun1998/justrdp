@@ -172,9 +172,11 @@ that trusts its server too much) rather than as memory safety.
   [EGFX graphics pipeline](../territory/egfx-graphics-pipeline.md)). Charging the count would
   have been unprovable against this server anyway: it sends `destPtsCount == 1` on every one of
   2 748 measured PDUs, so a count cap would be indistinguishable from a cap at 1.
-  **One instance of this shape is knowingly still open**: Progressive's `WireToSurface2` path,
-  where `paint_tile` walks `region.rects` once per tile, is quadratic in `numTiles x numRects`
-  with both from the wire. It is out of #268's scope and is **not** bounded today.
+  **A fourth instance closed with #377**: Progressive's `WireToSurface2` path, where `paint_tile`
+  walks `region.rects` once per tile, is quadratic in `numTiles x numRects` with both from the
+  wire. Each rectangle it paints is now charged its clipped bytes against the same budget. The
+  real-server corpus paints at most one surface per payload (52 payloads, at most 21 rects and
+  259 tiles a region), so the budget sits far above it.
 
 - **#203, third: a round-trip cannot reach a decoder whose encoder does not exist.** Every encoder
   in `justrdp-pdu` writes client-to-server, because justrdp is a client — so no server PDU can be
@@ -454,8 +456,8 @@ wire count where each entry is **4 bytes** and its cost is a bitmap the server e
 this: the trip count is `usize::from(<u16>)` and every arithmetic guard passes. Where the answer
 is yes, the bound belongs on the **work** and not on the count — and it needs a number with a
 derivation, which is why #268's ceiling is `MAX_TOTAL_SURFACE_BYTES` reused rather than a new
-constant. **Known open member: `rfx::progressive`'s `paint_tile`**, quadratic in
-`numTiles x numRects`, both from the wire, unbounded today.
+constant. `rfx::progressive`'s `paint_tile`, quadratic in `numTiles x numRects`, was the known
+open member until #377 charged its painting to the same budget.
 
 Working the list found **four defects**, and the split between them is the useful part
 (**a fifth arrived on 2026-08-31 in a member of this very table's source list** —

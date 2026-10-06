@@ -805,7 +805,15 @@ impl GraphicsProcessor {
                 // No context bookkeeping: the store is keyed by surface (#170), so a stream
                 // moving to a new `codecContextId` is not an event at all. The eviction this
                 // arm used to perform existed only to cap the id-keyed oracle (#83).
+                // Each painted rectangle is charged its clipped bytes (#377), as #268 charges the
+                // list-bearing commands: `paint_tile` meets every tile with every region rect.
+                let budget = MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint);
+                let (mut spent, mut painted, mut over) = (0usize, 0usize, 0usize);
                 let decoded = self.progressive.decode(surface_id, sw, sh, data, |rect| {
+                    if spent >= budget {
+                        over += 1;
+                        return;
+                    }
                     // The source offset rides the *slice*, not a parameter: `blit`'s slice start
                     // and `src_stride_px` are independent, so row `r` of the copy lands on tile
                     // pixel `(src_x, src_y + r)` at a stride of `TILE_DIM`. #158 recorded that
@@ -823,7 +831,7 @@ impl GraphicsProcessor {
                     let Some(src) = rect.tile.get(off..) else {
                         return;
                     };
-                    surface.blit(
+                    spent += surface.blit(
                         i32::from(rect.x),
                         i32::from(rect.y),
                         rect.width,
@@ -831,7 +839,10 @@ impl GraphicsProcessor {
                         src,
                         stride,
                     );
+                    painted += 1;
                 });
+                self.frame_paint += spent;
+                note_budget("RDPGFX_WIRE_TO_SURFACE_PDU_2", painted + over, painted);
                 // The corpus-capture harness (ADR-0011's other half). It rode inside the
                 // bootstrap decoder until #172; the payload is what is being captured, not a
                 // decode, so it is a free function over the wire bytes now — and it stays here
@@ -2961,6 +2972,32 @@ mod tests {
             "the whole 64x64 tile is painted when the region's rect covers it"
         );
         assert_eq!(p.surfaces[0].dirty, vec![(0, 0, 64, 64)]);
+    }
+
+    /// Issue #377: a Progressive tile's painting is charged its clipped bytes against the
+    /// per-frame paint budget, and skipped once the frame cannot afford it.
+    #[test]
+    fn progressive_painting_is_charged_to_the_frame_budget() {
+        let tile = 64 * 64 * 4;
+        let run = |left: usize| {
+            let mut p = GraphicsProcessor::default();
+            create_surface(&mut p, 1, 64, 64);
+            feed(&mut p, egfx::CMDID_START_FRAME, &[0; 8]);
+            p.frame_paint = MAX_TOTAL_SURFACE_BYTES - left;
+            let payload = progressive_one_tile_payload((0, 0, 64, 64));
+            wts2(&mut p, 1, egfx::CODECID_CAPROGRESSIVE, 7, &payload);
+            (p.frame_paint, p.surfaces[0].rgba[0])
+        };
+        assert_eq!(
+            run(tile),
+            (MAX_TOTAL_SURFACE_BYTES, 128),
+            "an affordable tile paints"
+        );
+        assert_eq!(
+            run(0),
+            (MAX_TOTAL_SURFACE_BYTES, 0),
+            "an exhausted frame paints nothing and charges nothing"
+        );
     }
 
     /// The clip is what #171 added and #172 wires: a tile is painted **only where its region's

@@ -133,8 +133,11 @@ acknowledge frames. It is server→client only, and it is reachable only if
   `--release`, so one maximal destRect is ~0.25 s and ~0.5 GiB of transient buffers, and nothing
   bounded how many such PDUs one frame held. The charge is the decoded size; an over-budget PDU
   is skipped with the same `note_budget` record, and the three real-VM EGFX tests drew none.
-  `WIRE_TO_SURFACE_2` (Progressive) is not charged: its decode walks tiles rather than a declared
-  rectangle, and was not measured.
+  **`WIRE_TO_SURFACE_2` (Progressive) is charged its painting since #377**, each `PaintedRect`
+  at its clipped bytes, because the cost there is `paint_tile` meeting every tile with every
+  region rect rather than the decode. Its tile decode stays uncharged on a measurement: the
+  real-server corpus decodes ~42 µs per tile from ~67 wire bytes, so the work is paid for in bytes.
+  That corpus paints at most one surface per payload.
 
   Three properties of the budget are load-bearing and none is obvious from the constant.
   **It is charged on *clipped* bytes**, which is why `Surface::blit` and `Surface::fill` now
