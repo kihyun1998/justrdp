@@ -16,6 +16,9 @@ here, long before any graphics capability is negotiated.
 
 ## Governing decisions
 
+- [ADR-0017](../../adr/0017-rebuild-so-the-host-holds-every-policy-flag.md) — the founding
+  decision: `ironrdp-connector` hardcoding away `SUPPORT_DYN_VC_GFX_PROTOCOL` in this layer's
+  early-capability flags is why justrdp exists.
 - [ADR-0016](../../adr/0016-policy-flags-are-the-hosts.md) — the early-capability flags are
   policy flags, so they are exposed rather than curated, and the core refuses a bit it cannot
   honour. Which bits, and why, is the table in
@@ -88,9 +91,6 @@ recorded.
 
 ## Known holes / open
 
-- **No governing record** for the flag-exposure posture, although it is the
-  project's founding motivation — it exists as identity prose in `CLAUDE.md` and
-  `GLOSSARY.md` §Project intent, and in no decision record at all.
 - Multi-monitor and DPI (epic #27) add GCC monitor data that is not built.
 - `SUPPORT_SKIP_CHANNELJOIN` is defined as a constant; whether the client honours
   the skip path is not recorded anywhere.

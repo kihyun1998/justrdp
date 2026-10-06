@@ -1,74 +1,84 @@
-# Context
+# justrdp
 
-**justrdp** is a from-scratch Rust library implementing a complete RDP client. Unlike its predecessor `ironrdp`, justrdp owns all RDP-specific protocol layers (X.224, MCS, GCC, capability exchange, session loop, virtual channels, codecs, and surface model), while delegating only to security-critical, non-RDP-specific crates (`rustls` for TLS, `sspi` for NLA authentication via CredSSP/SPNEGO/NTLM/Kerberos). The core is architected as a **sans-IO state machine** — the connection sequence and session loop are pure state transformations (bytes in → actions/bytes out) — paired with a ~30-line tokio I/O adapter, unlocking multi-runtime portability, differential-oracle codec testing, and complete host isolation.
+A pure-Rust RDP client library that owns every RDP-native protocol layer, so the host holds every
+policy flag ([ADR-0017](docs/adr/0017-rebuild-so-the-host-holds-every-policy-flag.md)).
 
-## Project intent
+## Language
 
-justrdp replaces ironrdp's hardcoded protocol boundaries by giving the host full control over every [[Policy flag]], particularly `ClientEarlyCapabilityFlags` — the field that gates EGFX (the Graphics Pipeline DVC) on modern Windows servers. The single-flag oversight in ironrdp-connector 0.9.0 that omits `SUPPORT_DYN_VC_GFX_PROTOCOL` (0x0100) motivated the entire rebuild.
+### Connecting
 
-**Scope:** the full multi-month plan (§2–§23 in plan.md) is the backlog; slices will walk the connect sequence, rendering, input, and virtual channels. **MVP-1** delivers Layers 0–4 (wire framing through capability/activation) + framebuffer + slow-path bitmap rendering. **MVP-2** adds EGFX + RemoteFX full codec. **Codecs are phased ("phased-c2"):** bootstrap by depending on `ironrdp-graphics` so rendering works immediately; rewrite each codec (RemoteFX / RemoteFX Progressive / ClearCodec / NSCodec / zgfx) ourselves using `ironrdp-graphics` as a **differential test oracle** (same input → byte-identical pixels) until the dependency can be dropped. **The runtime half is done as of #189** — no `ironrdp` crate is in the runtime graph; the oracle remains a dev-dependency and retires per codec on an owned basis (ADR-0011).
+**Connection**:
+One attempt to establish an RDP session with a server, from the TCP dial until it becomes a
+Session or fails.
 
-## Glossary
+**Connect Stage**:
+A labelled step of the Connection, shared by diagnostic logging and the host's progress UI. There
+are seven, entered in order:
 
-### Connection
-A single attempt to establish an RDP session with a remote server. Begins with TCP dial and ends either in success (becoming a [[Session]]) or failure (emitting a [[Connect Error]]). Driven by the sans-IO [[Connect Stage]] state machine, with I/O supplied by the [[Host Adapter]].
+1. **tcp-connect**: the TCP dial to the server.
+2. **x224-negotiate**: the X.224 Connection Request/Confirm that selects the security protocol
+   (SSL / HYBRID / HYBRID_EX).
+3. **tls-handshake**: the TLS upgrade.
+4. **nla-credssp**: Network Level Authentication over CredSSP.
+5. **capability-exchange**: client/server advertise and negotiate feature flags and desktop size.
+6. **activation**: synchronize, control and font exchange that finalize the session.
+7. **session-active**: entered on successful activation; lasts until disconnect.
 
-### Session
-A live RDP session after the [[Connect Stage]] completes activation. The Session owns the framebuffer, virtual channel processors, and the long-lived TCP stream. The session loop dispatches inbound graphics/input PDUs and emits [[Frame Update]]s, input responses, and other channel data to the host. Ends on disconnect or fatal error.
+**Session**:
+A live RDP session after activation, lasting until disconnect or a fatal error.
 
-### Connect Stage
-A labeled sub-step within the [[Connection]] sequence. There are seven stages, shared between diagnostic logging and the host's progress UI:
+### Shape of the library
 
-1. **tcp-connect** — TCP dial to the RDP server.
-2. **x224-negotiate** — X.224 Connection Request/Confirm, selecting the transport security protocol (SSL / HYBRID / HYBRID_EX). The first protocol exchange after the socket opens, before any TLS upgrade.
-3. **tls-handshake** — TLS upgrade (if SSL/HYBRID/RDSTLS negotiated).
-4. **nla-credssp** — NLA authentication via CredSSP, SPNEGO, and NTLM/Kerberos.
-5. **capability-exchange** — client/server advertise and negotiate feature flags and desktops size.
-6. **activation** — finalize the session (synchronize, grant control, exchange fonts).
-7. **session-active** — entered on successful activation; persists until disconnect.
+**Sans-IO Core**:
+The protocol logic as pure state machines: bytes and events in, actions and outputs out, with no
+socket, runtime or async in it.
 
-Entered linearly; stage completion is observable by the host for both progress indication and error attribution.
+**Host Adapter**:
+The layer that makes the Sans-IO Core real: it owns the socket and runtime, runs the TLS handshake
+and CredSSP loop, and forwards outputs to the host.
 
-### Sans-IO Core
-The pure state-machine logic implementing the RDP protocol without embedding async I/O or socket operations. The `connect` and `session` machines are parameterized on `State`; callers feed them `(Action, bytes)` pairs and receive `(Output, next_state)` back. This separation unlocks multi-runtime portability (tokio, blocking, wasm), deterministic testing, and per-stage timeout/cancel at the [[Host Adapter]] boundary.
-
-### Host Adapter
-The I/O layer supplied by the consumer — typically a ~30-line tokio loop that reads from the TCP socket, feeds bytes to the [[Sans-IO Core]] state machine, writes response bytes back to the socket, and forwards [[Frame Update]]s and other events to the host's frame sink / input handler. No part of justrdp embeds the async runtime or the socket; the core is a pure function, and the adapter makes it real.
-
-### Frame Update
-The unit of communication from justrdp to the host during a [[Session]]. Conceptually a (rectangle, RGBA pixels) tuple: "replace the screen region at (x, y, w, h) with these bytes". Pixels are normalized to RGBA8888, channel order `[R, G, B, A]`, little-endian in memory. Emitted by the [[Slow path]] (RLE bitmap decoding and, since #150, NSCodec Set Surface Bits) and by the [[Graphics Pipeline]] (EGFX surface tile flushes). The host's frame sink is a synchronous callback (`Fn(FrameUpdate)`) to maximize latency predictability.
-
-### Virtual Channel
-A side-band data stream multiplexed over the [[Connection]] alongside main graphics/input traffic, identified by name and used for features beyond the desktop image: clipboard (CLIPRDR), audio (RDPSND), drive redirection (RDPDR), and dynamic resize (Display Control / RDPEDISP). Two kinds: a **Static Virtual Channel (SVC)** is negotiated at GCC (client sends ChannelDef list in Client Network Data); a **Dynamic Virtual Channel (DVC)** is created **by the server** on-demand over the `drdynvc` meta-channel. justrdp **owns** the virtual-channel infrastructure per ADR-0002 — SVC framing (`justrdp-pdu::svc`), the MS-RDPEDYC codec (`justrdp-pdu::dvc`), and the sans-IO drdynvc manager in the core (slice-8). Every other granted static channel is the host's: the core reassembles its messages and surfaces them as `SessionOutput::ChannelData`, and `send_channel` chunks one out, without ever interpreting the bytes (#307). A message over the channel's cap, which the host may set, is skipped and reported as `SessionOutput::ChannelMessageDropped` (#323). The clipboard's protocol is a sans-IO helper the host drives over that seam (`justrdp::cliprdr`, #321), and so is drive redirection's (`justrdp::rdpdr`, #336), so the session still interprets none of it. Each dynamic channel is a `DvcProcessor` (the `channel_name`/`start`/`process`/`close` model, borrowed conceptually from `ironrdp-dvc` but implemented here); the manager owns transport concerns (capabilities, create/refuse, fragmentation reassembly) and hands processors complete messages. Host-facing data crosses the [[Host Adapter]] boundary through plain callbacks and `mpsc` commands, keeping the core pure.
-
-### Policy flag
-A flag or value the client sends that a host may legitimately want different for its own reasons (resources, security, display, whether a feature is on at all): `earlyCapabilityFlags`, `INFO_*`, the EGFX versions and cache mode, the clipboard's file transfer, the monitor scale factor. The host owns it (ADR-0016).
+**Policy flag**:
+A value the client sends that a host may legitimately want different for its own reasons, such as
+`earlyCapabilityFlags` or the EGFX versions. The host owns it.
 _Avoid_: feature flag, policy-bearing field
 
-### Implementation flag
-A flag that only tells the server what the core handles, which a host honours by doing nothing different: rdpdr's `ioCode1`, `extendedPDU` and `ENABLE_ASYNCIO`, the clipboard's long format names and locking. The core owns it, and refuses a host advertisement it cannot honour (ADR-0016).
-_Avoid_: capability flag (ambiguous: both kinds travel in capability sets)
+**Implementation flag**:
+A value that only tells the server what the core handles, such as rdpdr's `ioCode1`. The core owns
+it.
+_Avoid_: capability flag (both kinds travel in capability sets)
 
-### Surface (Graphics Pipeline context)
-In EGFX ([[Graphics Pipeline]]), an off-screen pixel buffer the server creates, draws into (via decoded tiles), caches between, and maps to the visible output. justrdp **owns the surface store** (ADR-0002; slice-9): the core's EGFX processor holds the surfaces, the bitmap cache, and the blit/fill/cache operations, batching dirty regions per server frame into [[Frame Update]]s so the host sees all pixels, whether from slow-path bitmap or EGFX surface commit. **Every codec on this path is self-owned**: ClearCodec and RemoteFX from the start, RemoteFX Progressive as of #171 and live as of #172 (which also made `DELETESURFACE` the only thing that frees its tile store), and zgfx as of #189 — the last runtime delegation, whose removal takes `ironrdp-graphics` out of the runtime graph entirely (ADR-0003 phase 3, ADR-0011).
+### Graphics
 
-### Differential Oracle
-The `ironrdp-graphics` crate, used during **phased-c2** codec development as a byte-diff test reference: feed identical encoded input to both justrdp's decoder and `ironrdp-graphics`, compare RGBA outputs, require byte-identity. It let codecs be rewritten incrementally without reimplementing decode-from-spec.
+**Frame Update**:
+A rectangle of the desktop and its new pixels in RGBA8888, the unit justrdp hands the host during
+a Session.
 
-**It is scaffolding with a retirement condition, and it does not answer "what should this tile look like?" — [ADR-0011](docs/adr/0011-zero-ironrdp-terminal-state.md) (2026-08-10) settled that, and this entry described the superseded position until 2026-08-19.** A codec's oracle drops when its correctness rests on a basis *we* own — a real-server corpus plus expectations derived independently of our implementation — and where the two disagree, the corpus wins. RemoteFX Progressive is the worked case and the reason: the oracle decodes **2 of 52** payloads this server actually sends (#194), and on the assembly layer it never clips a tile to its region's rects where FreeRDP does, which is a measured **57 386-pixel** difference on one 1280×800 surface (#171). A gate defined as agreement with it would have required painting the wrong picture. What survives is narrower and real: its transform primitives are independent math, used as [ADR-0007](docs/adr/0007-stage-boundary-codec-verification.md) stage-boundary cross-checks, plus canaries that pin each known defect so an upgrade cannot silently change the measuring instrument.
+**Legacy graphics**:
+The graphics path of a session without the Graphics Pipeline: bitmap updates and surface commands
+decoded straight into the framebuffer.
+_Avoid_: slow path (MS-RDPBCGR's name for the non-fast-path PDU framing)
 
-### Slow path
-The baseline graphics rendering path: the server sends desktop updates as bitmap rectangles with RLE (or other legacy) compression. justrdp decodes them into the framebuffer and emits [[Frame Update]]s for changed regions. "Slow" is relative to [[Graphics Pipeline]] — a resize forces the server to repaint the entire screen as RLE bitmaps, making the cost visible. It is the first codec path implemented and serves as the reference for all EGFX performance gains.
+**Graphics Pipeline**:
+The production graphics path on modern Windows (MS-RDPEGFX, "EGFX"): codec-compressed updates to
+Surfaces, carried over a Dynamic Virtual Channel and enabled by `SUPPORT_DYN_VC_GFX_PROTOCOL`.
 
-### Graphics Pipeline
-The production graphics path on modern Windows: compressed, incrementally-refined desktop updates carried over a dedicated [[Virtual Channel]] (a DVC, the EGFX channel over `drdynvc`). Updates target off-screen [[Surface]]s rather than one framebuffer, and are advertised/negotiated by codec. Gated by advertising `ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL` (0x0100) in GCC early-capability flags. Supported codecs: RemoteFX (full, non-progressive), RemoteFX Progressive, ClearCodec (lossless), NSCodec (lossy, subcodec), H.264/AVC (external decoder required). EGFX is the core performance win over [[Slow path]] and the reason justrdp exists — ironrdp-connector 0.9 hardcodes away the capability flag.
+**Surface**:
+An off-screen pixel buffer in the Graphics Pipeline that the server creates, draws into, caches
+from and maps onto the visible desktop.
 
----
+**Differential Oracle**:
+A reference decoder (`ironrdp-graphics`) fed the same encoded input as a justrdp codec so their
+outputs can be compared; scaffolding with a retirement condition, never the definition of a
+correct picture.
 
-**Cross-reference key** (terms defined above):
-- [[Connection]] → [[Connect Stage]] → [[Session]]
-- [[Host Adapter]] ↔ [[Sans-IO Core]]
-- [[Frame Update]] ← produced by [[Slow path]] or [[Graphics Pipeline]]
-- [[Graphics Pipeline]] uses [[Virtual Channel]] (EGFX DVC) + [[Surface]]
-- [[Differential Oracle]] validates codec output during phased rewrites
-- [[Virtual Channel]] → `ironrdp`'s DvcProcessor for dynamic channels (pure); static channels are **not** `ironrdp`'s SvcProcessor model: the host receives and sends bytes and no processor is registered (#307)
+### Channels
+
+**Virtual Channel**:
+A named side-band stream multiplexed over the Connection for features beyond the desktop image,
+such as clipboard, audio and drive redirection.
+
+**Static Virtual Channel**:
+A Virtual Channel negotiated at GCC from the client's channel list.
+
+**Dynamic Virtual Channel**:
+A Virtual Channel the server opens on demand over the `drdynvc` channel.

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 justrdp-pdu.workspace = true
-# The slow-path graphics codecs (slice-6): the session machine decodes bitmap rectangles
+# The legacy graphics codecs (slice-6): the session machine decodes bitmap rectangles
 # through this crate's pure decode API (ADR-0003).
 justrdp-codecs.workspace = true
 # X.509 parsing (ADR-0002 leaf dependency). The sans-IO core extracts the server certificate's

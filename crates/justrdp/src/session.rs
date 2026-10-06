@@ -1482,7 +1482,7 @@ impl SessionStateMachine {
         }
         // EGFX draw ops marked surface regions dirty during processing; blit them straight into
         // the framebuffer now (ADR-0010 #163 — no owned copy on the bridge). The framebuffer is
-        // the single authoritative screen state the slow path writes too.
+        // the single authoritative screen state legacy graphics writes too.
         for update in self.drdynvc.flush_frames(&mut self.framebuffer) {
             outputs.push(SessionOutput::Frame(update));
         }
@@ -1741,7 +1741,7 @@ mod tests {
         assert_eq!((frame.x, frame.y, frame.width, frame.height), (3, 2, 1, 2));
     }
 
-    /// Issue #150: `codecID` 0 is unencoded, and bottom-up like the slow path's bitmaps.
+    /// Issue #150: `codecID` 0 is unencoded, and bottom-up like legacy graphics' bitmaps.
     #[test]
     fn unencoded_surface_bits_paint_bottom_up() {
         let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
@@ -1913,7 +1913,7 @@ mod tests {
         assert_eq!(outputs.len(), PAINT_BUDGET_FRAMEBUFFERS, "{outputs:?}");
     }
 
-    /// Issue #367: the slow path's bitmap rectangles are charged the same way.
+    /// Issue #367: legacy graphics' bitmap rectangles are charged the same way.
     #[test]
     fn bitmap_rectangles_past_the_paint_budget_are_skipped() {
         let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();

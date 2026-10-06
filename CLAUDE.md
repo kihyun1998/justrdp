@@ -8,8 +8,8 @@ The core is a **sans-IO state machine**: connect sequence and session loop are p
 deliberately leaves out: the TLS handshake, the CredSSP token loop, per-stage timeouts, the
 session runner.
 
-Before implementing, read `GLOSSARY.md` (ubiquitous language, boundary, §Project intent),
-`docs/adr/` (why each decision was made) and `docs/plan.md` (build plan §2–§23).
+Before implementing, read `GLOSSARY.md` (ubiquitous language), `docs/adr/` (why each decision
+was made; ADR-0017 is why justrdp exists) and `docs/plan.md` (build plan §2–§23).
 
 ## Workflow — `thegraph`
 
