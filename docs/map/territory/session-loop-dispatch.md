@@ -45,6 +45,12 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   dropped, which is why the connect layer refuses `SURFCMDS_FRAME_MARKER`; acknowledging them would
   need the Frame Acknowledge set, refused too. A command whose `cmdFlags` bit was not advertised is
   still applied, with an `rdp_surface_bits` record (ADR-0009 §3(b)).
+- **A fast-path fragment sequence is FIRST (NEXT...) LAST, and any other order ends the
+  session** (#368). `[MS-RDPBCGR]` 3.2.5.9.3.1 says a deviation "SHOULD trigger a disconnect", and
+  FreeRDP fails on one. A NEXT or LAST without a FIRST, a continuation with another update code,
+  and since #368 a FIRST or SINGLE arriving while a sequence is open are all the same
+  `TS_FP_UPDATE.fragmentation` error. Until then the FIRST case replaced the open buffer
+  silently and the SINGLE case left it behind for the next continuation to extend.
 - **One graphics update buys at most `PAINT_BUDGET_FRAMEBUFFERS` desktops of decoding** (#367).
   A bitmap update's rectangles and a Surface Commands update's surface bits are charged their
   decoded size, not their clipped one, before they decode; past the budget the rest of the update

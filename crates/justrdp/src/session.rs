@@ -645,6 +645,18 @@ impl SessionStateMachine {
         outputs: &mut Vec<SessionOutput>,
     ) -> Result<(), SessionError> {
         for section in fastpath::decode_updates(frame).map_err(SessionError::Decode)? {
+            let starts = matches!(
+                section.fragmentation,
+                fastpath::FP_FRAGMENT_SINGLE | fastpath::FP_FRAGMENT_FIRST
+            );
+            if starts && self.fragment.is_some() {
+                return Err(SessionError::Decode(
+                    justrdp_pdu::DecodeError::InvalidField {
+                        field: "TS_FP_UPDATE.fragmentation",
+                        reason: "a fragment sequence was interrupted before its last fragment",
+                    },
+                ));
+            }
             let complete: Option<(u8, Vec<u8>)> = match section.fragmentation {
                 fastpath::FP_FRAGMENT_SINGLE => Some((section.code, section.data.to_vec())),
                 fastpath::FP_FRAGMENT_FIRST => {
@@ -1980,6 +1992,35 @@ mod tests {
             cfg.desktop_size = (64, 48);
             let mut sm = SessionStateMachine::new(cfg, Vec::new()).unwrap();
             let _ = sm.process_bytes(&surface_commands_pdu(&commands.concat()));
+        }
+    }
+
+    /// Issue #368: `[MS-RDPBCGR]` 3.2.5.9.3.1 allows only FIRST (NEXT...) LAST, and "any
+    /// deviation ... SHOULD trigger a disconnect". A FIRST or a SINGLE arriving while a
+    /// fragmented update is open is one, and is refused like a NEXT without a FIRST.
+    #[test]
+    fn a_first_or_single_fragment_inside_an_open_sequence_is_refused() {
+        let body = bitmap_update_body(0, 0, 4, 2, [1, 2, 3]);
+        let (head, _) = body.split_at(10);
+        for interrupting in [fastpath::FP_FRAGMENT_FIRST, fastpath::FP_FRAGMENT_SINGLE] {
+            let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+            let first = fastpath::encode_pdu(&[(
+                fastpath::FP_UPDATE_BITMAP,
+                fastpath::FP_FRAGMENT_FIRST,
+                head,
+            )]);
+            assert_eq!(sm.process_bytes(&first), Ok(Vec::new()));
+            let next = fastpath::encode_pdu(&[(fastpath::FP_UPDATE_BITMAP, interrupting, &body)]);
+            assert_eq!(
+                sm.process_bytes(&next),
+                Err(SessionError::Decode(
+                    justrdp_pdu::DecodeError::InvalidField {
+                        field: "TS_FP_UPDATE.fragmentation",
+                        reason: "a fragment sequence was interrupted before its last fragment",
+                    }
+                )),
+                "fragmentation {interrupting}"
+            );
         }
     }
 
