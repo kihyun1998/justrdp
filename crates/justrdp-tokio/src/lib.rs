@@ -851,6 +851,16 @@ pub async fn run_session_with_input(
                 SessionOutput::ChannelMessageDropped { .. } => {
                     // The core already emitted the `rdp_svc` record for the skipped message.
                 }
+                SessionOutput::DynamicChannelOpened { .. }
+                | SessionOutput::DynamicChannelClosed { .. } => {
+                    // As for static channels: a host that registers dynamic channels receives
+                    // them through run_session_with_commands, and the core already emitted the
+                    // `rdp_drdynvc` record.
+                }
+                SessionOutput::DynamicChannelData { channel_id, data } => {
+                    // No event sink here either; the core keeps no per-message record.
+                    tracing::debug!(target: "rdp_drdynvc", channel_id, bytes = data.len(), "host dynamic channel message");
+                }
             }
         }
         tokio::select! {
@@ -927,6 +937,22 @@ pub enum SessionCommand {
         /// The new cap in bytes.
         cap: usize,
     },
+    /// Send one message on an open host dynamic channel (ADR-0018), as
+    /// [`justrdp::SessionStateMachine::send_dynamic_channel`]. A refused send
+    /// ([`justrdp::DynamicChannelError`]) is logged and dropped — the session keeps running.
+    DynamicChannelData {
+        /// The channel's id, as in [`SessionEvent::DynamicChannelOpened`].
+        channel_id: u32,
+        /// The message.
+        data: Vec<u8>,
+    },
+    /// Close an open host dynamic channel, as
+    /// [`justrdp::SessionStateMachine::close_dynamic_channel`]. A refused close is logged and
+    /// dropped.
+    CloseDynamicChannel {
+        /// The channel's id.
+        channel_id: u32,
+    },
 }
 
 /// A session milestone surfaced to the host by [`run_session_with_commands`].
@@ -971,6 +997,27 @@ pub enum SessionEvent {
         /// Its declared length.
         total_length: usize,
     },
+    /// The server opened a dynamic channel the host registered in
+    /// [`justrdp::SessionConfig::dynamic_channels`] (ADR-0018).
+    DynamicChannelOpened {
+        /// The name the host registered.
+        name: String,
+        /// The id the server gave the channel.
+        channel_id: u32,
+    },
+    /// One whole message on a host dynamic channel. What it means, and whether anything
+    /// answers it, is the host's.
+    DynamicChannelData {
+        /// The channel's id, as in [`Self::DynamicChannelOpened`].
+        channel_id: u32,
+        /// The message.
+        data: Vec<u8>,
+    },
+    /// The server closed a host dynamic channel, or reused its id for a new channel.
+    DynamicChannelClosed {
+        /// The channel's id.
+        channel_id: u32,
+    },
 }
 
 /// [`run_session_with_input`] generalized to host *commands* (input + resize) and
@@ -982,7 +1029,9 @@ pub enum SessionEvent {
 /// `on_event` receives session milestones ([`SessionEvent::DisplayControlReady`],
 /// [`SessionEvent::ShutdownDenied`], [`SessionEvent::SaveSessionInfo`],
 /// [`SessionEvent::KeyboardIndicators`], [`SessionEvent::PlaySound`],
-/// [`SessionEvent::ChannelData`], [`SessionEvent::ChannelMessageDropped`]);
+/// [`SessionEvent::ChannelData`], [`SessionEvent::ChannelMessageDropped`],
+/// [`SessionEvent::DynamicChannelOpened`], [`SessionEvent::DynamicChannelData`],
+/// [`SessionEvent::DynamicChannelClosed`]);
 /// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
 pub async fn run_session_with_commands(
     stream: &mut TlsStream<TcpStream>,
@@ -1036,6 +1085,15 @@ pub async fn run_session_with_commands(
                         channel,
                         total_length,
                     });
+                }
+                SessionOutput::DynamicChannelOpened { name, channel_id } => {
+                    on_event(SessionEvent::DynamicChannelOpened { name, channel_id });
+                }
+                SessionOutput::DynamicChannelData { channel_id, data } => {
+                    on_event(SessionEvent::DynamicChannelData { channel_id, data });
+                }
+                SessionOutput::DynamicChannelClosed { channel_id } => {
+                    on_event(SessionEvent::DynamicChannelClosed { channel_id });
                 }
             }
         }
@@ -1103,6 +1161,28 @@ pub async fn run_session_with_commands(
                         if let Err(e) = machine.set_channel_message_cap(channel, cap) {
                             // Not fatal: the channel keeps its cap.
                             tracing::warn!(channel, error = %e, "channel message cap refused");
+                        }
+                    }
+                    Some(SessionCommand::DynamicChannelData { channel_id, data }) => {
+                        match machine.send_dynamic_channel(channel_id, &data) {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
+                                }
+                            }
+                            // Not fatal: the session is unaffected.
+                            Err(e) => tracing::warn!(channel_id, error = %e, "dynamic channel send refused"),
+                        }
+                    }
+                    Some(SessionCommand::CloseDynamicChannel { channel_id }) => {
+                        match machine.close_dynamic_channel(channel_id) {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
+                                }
+                            }
+                            // Not fatal: the session is unaffected.
+                            Err(e) => tracing::warn!(channel_id, error = %e, "dynamic channel close refused"),
                         }
                     }
                     // Sender dropped: stop polling, keep the session alive.
@@ -2414,6 +2494,147 @@ mod tests {
             );
         })
         .await
+    }
+
+    /// Real-VM acceptance for #385 (ADR-0018): dynamic channels the host registers are opened
+    /// by the server and their messages reach the host. `ECHO` (`[MS-RDPEECO]`) proves the
+    /// receive path, because this server sends Echo Requests on it unprompted. `AUDIO_PLAYBACK_DVC`
+    /// is the channel audio output rides (#11): this server opens it but sends nothing on it
+    /// until the session plays a sound, so here it is only shown to open. `rdpsnd` and `rdpdr`
+    /// are requested because the server starts audio only with `rdpdr` advertised
+    /// (`[MS-RDPEA]` product note 1); the run records whether anything arrived on the `rdpsnd`
+    /// static channel.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn host_registered_dynamic_channels_reach_the_host_on_the_real_vm() {
+        const ECHO: &str = "ECHO";
+        const AUDIO_PLAYBACK_DVC: &str = "AUDIO_PLAYBACK_DVC";
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = ["rdpsnd", "rdpdr", "drdynvc"]
+                .iter()
+                .map(|name| gcc::ChannelDef::new(name, gcc::CHANNEL_OPTION_INITIALIZED).unwrap())
+                .collect();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let rdpsnd = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "rdpsnd")
+                .expect("the VM grants rdpsnd")
+                .id;
+            let mut session_config = session_config_from(&outcome, session_capabilities);
+            session_config.dynamic_channels =
+                vec![ECHO.to_string(), AUDIO_PLAYBACK_DVC.to_string()];
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let (_tx, mut commands) = tokio::sync::mpsc::channel(4);
+            let cancel = CancellationToken::new();
+            // The session ends once both channels opened and an echo arrived *and* the desktop
+            // has painted and settled, as every other VM test does before it lets go.
+            let frames = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::new(AtomicBool::new(false));
+            let watcher = {
+                let (frames, seen, done) = (frames.clone(), seen.clone(), cancel.clone());
+                tokio::spawn(async move {
+                    let settled = vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await;
+                    while !seen.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    done.cancel();
+                    settled
+                })
+            };
+            let frames_in_sink = frames.clone();
+            let started = std::time::Instant::now();
+            let mut opened: Vec<(String, u32, Duration)> = Vec::new();
+            let mut messages: Vec<(u32, Vec<u8>, Duration)> = Vec::new();
+            let mut rdpsnd_messages = 0usize;
+            let ended = tokio::time::timeout(
+                Duration::from_secs(90),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        match event {
+                            SessionEvent::DynamicChannelOpened { name, channel_id } => {
+                                opened.push((name, channel_id, started.elapsed()));
+                            }
+                            SessionEvent::DynamicChannelData { channel_id, data } => {
+                                messages.push((channel_id, data, started.elapsed()));
+                            }
+                            SessionEvent::ChannelData { channel, .. } if channel == rdpsnd => {
+                                rdpsnd_messages += 1;
+                            }
+                            _ => {}
+                        }
+                        let echo = opened.iter().find(|(name, ..)| name == ECHO);
+                        let echoed =
+                            echo.is_some_and(|(_, id, _)| messages.iter().any(|(on, ..)| on == id));
+                        let audio = opened.iter().any(|(name, ..)| name == AUDIO_PLAYBACK_DVC);
+                        if echoed && audio {
+                            seen.store(true, Ordering::SeqCst);
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            eprintln!("opened: {opened:?}");
+            for (channel_id, data, at) in messages.iter().take(4) {
+                eprintln!(
+                    "message on {channel_id} after {at:?}: {} bytes {:02x?}",
+                    data.len(),
+                    &data[..data.len().min(16)]
+                );
+            }
+            eprintln!(
+                "messages: {}; rdpsnd static channel messages: {rdpsnd_messages}",
+                messages.len()
+            );
+            ended
+                .expect("both channels opened, an echo arrived and the desktop settled within 90 s")
+                .expect("the session ran without a protocol failure");
+            watcher
+                .await
+                .expect("the watcher task")
+                .expect("the desktop painted and settled");
+
+            let id_of = |wanted: &str| {
+                opened
+                    .iter()
+                    .find(|(name, ..)| name == wanted)
+                    .map(|(_, id, _)| *id)
+                    .unwrap_or_else(|| panic!("the server opens {wanted}"))
+            };
+            let (echo, audio) = (id_of(ECHO), id_of(AUDIO_PLAYBACK_DVC));
+            assert_ne!(echo, audio);
+            let echoes: Vec<&Vec<u8>> = messages
+                .iter()
+                .filter(|(on, ..)| *on == echo)
+                .map(|(_, data, _)| data)
+                .collect();
+            assert!(
+                !echoes.is_empty(),
+                "the server's Echo Requests reach the host"
+            );
+            assert!(echoes.iter().all(|data| !data.is_empty()));
+            assert!(
+                messages.iter().all(|(on, ..)| *on == echo || *on == audio),
+                "every message arrives on a channel the host was told about"
+            );
+        })
+        .await;
     }
 
     /// Issue #304's DoD ④: the logon notification actually reaches a host, against the real
@@ -6663,6 +6884,7 @@ mod tests {
                 .find(|c| c.name == "drdynvc")
                 .map(|c| c.id),
             static_channels: outcome.mcs.static_channels.clone(),
+            dynamic_channels: Vec::new(),
             egfx: Default::default(),
         }
     }
@@ -8112,6 +8334,7 @@ mod tests {
                 server_input_flags: 0,
                 drdynvc_channel_id: None,
                 static_channels: Vec::new(),
+                dynamic_channels: Vec::new(),
                 egfx: Default::default(),
             },
             Vec::new(),
@@ -8169,6 +8392,7 @@ mod tests {
                 id: CHANNEL,
                 options: 0,
             }],
+            dynamic_channels: Vec::new(),
             egfx: Default::default(),
         };
         let message = vec![0x5A; 8 * 1024 * 1024];
@@ -8302,6 +8526,7 @@ mod tests {
                 server_input_flags: 0,
                 drdynvc_channel_id: None,
                 static_channels: Vec::new(),
+                dynamic_channels: Vec::new(),
                 egfx: Default::default(),
             },
             Vec::new(),
@@ -8370,6 +8595,7 @@ mod tests {
                 server_input_flags: 0,
                 drdynvc_channel_id: None,
                 static_channels: Vec::new(),
+                dynamic_channels: Vec::new(),
                 egfx: Default::default(),
             },
             Vec::new(),

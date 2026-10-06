@@ -12,7 +12,7 @@
 
 use crate::cursor::{CursorEvent, CursorImage};
 use crate::disconnect::{DisconnectReason, ServerDisconnectCause};
-use crate::dvc::{Drdynvc, DvcError, DvcEvent};
+use crate::dvc::{Drdynvc, DvcError, DvcEvent, DynamicChannelError};
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::{nscodec, planar, pointer as pointer_codec, rle};
@@ -57,6 +57,11 @@ pub struct SessionConfig {
     /// but [`Self::drdynvc_channel_id`] is the host's: its messages surface as
     /// [`SessionOutput::ChannelData`] and [`SessionStateMachine::send_channel`] sends on it.
     pub static_channels: Vec<crate::StaticChannel>,
+    /// The dynamic channel names the host terminates (ADR-0018): a Create Request for one is
+    /// accepted, and its messages surface as [`SessionOutput::DynamicChannelData`]. A name the
+    /// core terminates (Display Control, the Graphics Pipeline) is refused by
+    /// [`SessionStateMachine::new`].
+    pub dynamic_channels: Vec<String>,
     /// What the graphics channel advertises when the server opens it.
     pub egfx: crate::EgfxConfig,
 }
@@ -141,6 +146,29 @@ pub enum SessionOutput {
         channel: u16,
         /// Its declared length.
         total_length: usize,
+    },
+    /// The server opened a dynamic channel the host registered in
+    /// [`SessionConfig::dynamic_channels`] (ADR-0018). Messages and sends on it use
+    /// `channel_id` until [`Self::DynamicChannelClosed`] names it, or until the host closes it
+    /// with [`SessionStateMachine::close_dynamic_channel`].
+    DynamicChannelOpened {
+        /// The name the host registered.
+        name: String,
+        /// The id the server gave the channel.
+        channel_id: u32,
+    },
+    /// One whole message on a host dynamic channel, reassembled from its data PDUs
+    /// (`[MS-RDPEDYC]` 3.1.5.2). What the bytes mean is the host's.
+    DynamicChannelData {
+        /// The channel's id, as in [`Self::DynamicChannelOpened`].
+        channel_id: u32,
+        /// The message.
+        data: Vec<u8>,
+    },
+    /// The server closed a host dynamic channel, or reused its id for a new channel.
+    DynamicChannelClosed {
+        /// The channel's id.
+        channel_id: u32,
     },
 }
 
@@ -379,6 +407,8 @@ pub enum SessionError {
     },
     /// [`SessionConfig::egfx`] cannot be advertised.
     EgfxConfig(crate::EgfxConfigError),
+    /// [`SessionConfig::dynamic_channels`] names a channel the core terminates.
+    DynamicChannelConfig(crate::dvc::CoreOwnedDynamicChannel),
     /// Interleaved-RLE bitmap data failed to decompress.
     Rle(rle::RleError),
     /// RDP6 planar bitmap data failed to decompress.
@@ -399,6 +429,7 @@ impl core::fmt::Display for SessionError {
                 write!(f, "dynamic channel {channel}: {error}")
             }
             SessionError::EgfxConfig(e) => write!(f, "EGFX config: {e}"),
+            SessionError::DynamicChannelConfig(e) => write!(f, "dynamic channel config: {e}"),
             SessionError::Rle(e) => write!(f, "interleaved RLE: {e}"),
             SessionError::Planar(e) => write!(f, "RDP6 planar: {e}"),
             SessionError::Color(e) => write!(f, "pixel conversion: {e}"),
@@ -506,6 +537,8 @@ impl SessionStateMachine {
             })?;
         let graphics =
             crate::egfx::GraphicsProcessor::new(&config.egfx).map_err(SessionError::EgfxConfig)?;
+        let drdynvc = Drdynvc::new(graphics, &config.dynamic_channels)
+            .map_err(SessionError::DynamicChannelConfig)?;
         // The cache honors what the caller advertised in its Pointer capability set:
         // `pointerCacheSize` when present (the cache New Pointer messages address), else
         // `colorPointerCacheSize`; no Pointer set advertised means no cache (a conforming
@@ -556,7 +589,7 @@ impl SessionStateMachine {
             cursor_cache: vec![None; usize::from(cache_size)],
             error_info: None,
             ultimatum_reason: None,
-            drdynvc: Drdynvc::new(graphics),
+            drdynvc,
             channels,
             suspended: None,
             held_bytes: 0,
@@ -1490,6 +1523,15 @@ impl SessionStateMachine {
                         self.config.desktop_size = (width, height);
                     }
                 }
+                DvcEvent::HostOpened { name, channel_id } => {
+                    outputs.push(SessionOutput::DynamicChannelOpened { name, channel_id });
+                }
+                DvcEvent::HostData { channel_id, data } => {
+                    outputs.push(SessionOutput::DynamicChannelData { channel_id, data });
+                }
+                DvcEvent::HostClosed { channel_id } => {
+                    outputs.push(SessionOutput::DynamicChannelClosed { channel_id });
+                }
             }
         }
         // EGFX draw ops marked surface regions dirty during processing; blit them straight into
@@ -1623,6 +1665,52 @@ impl SessionStateMachine {
             .map(|chunk| self.wrap_channel(channel, chunk))
             .collect();
         Ok(self.unless_suspended(frames))
+    }
+
+    /// Encode `message` for the host dynamic channel `channel_id` (ADR-0018): drdynvc data
+    /// PDUs, fragmented when longer than one (`[MS-RDPEDYC]` 3.1.5.1.2), each split into chunks
+    /// on the drdynvc channel. While the server has suspended virtual channel traffic the frames
+    /// are held instead, returned empty here, and surface as [`SessionOutput::WriteBytes`] when
+    /// it resumes.
+    pub fn send_dynamic_channel(
+        &mut self,
+        channel_id: u32,
+        message: &[u8],
+    ) -> Result<Vec<Vec<u8>>, DynamicChannelError> {
+        let pdus = self.drdynvc.host_send(channel_id, message)?;
+        if self.suspended.is_some() {
+            let held_bytes = self.held_bytes.saturating_add(message.len());
+            if held_bytes > crate::svc::CHANNEL_MESSAGE_CAP {
+                return Err(DynamicChannelError::SuspendedQueueFull { channel_id });
+            }
+            self.held_bytes = held_bytes;
+        }
+        Ok(self.drdynvc_frames(&pdus))
+    }
+
+    /// Close the host dynamic channel `channel_id` (`[MS-RDPEDYC]` 2.2.4): the channel is gone
+    /// on this side at once, and the returned frames carry the Close PDU. No
+    /// [`SessionOutput::DynamicChannelClosed`] follows for it.
+    pub fn close_dynamic_channel(
+        &mut self,
+        channel_id: u32,
+    ) -> Result<Vec<Vec<u8>>, DynamicChannelError> {
+        let pdu = self.drdynvc.host_close(channel_id)?;
+        Ok(self.drdynvc_frames(&[pdu]))
+    }
+
+    /// The frames carrying drdynvc `pdus` on the drdynvc channel, or none while suspended.
+    /// A host channel is open only when drdynvc was granted, so the channel ID is known.
+    fn drdynvc_frames(&mut self, pdus: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let Some(drdynvc_id) = self.config.drdynvc_channel_id else {
+            return Vec::new();
+        };
+        let frames = pdus
+            .iter()
+            .flat_map(|pdu| svc::encode_chunks(pdu))
+            .map(|chunk| self.wrap_channel(drdynvc_id, &chunk))
+            .collect();
+        self.unless_suspended(frames)
     }
 
     /// Wrap a channel payload into a complete outbound frame on `channel_id`.
@@ -2047,9 +2135,13 @@ mod tests {
                 options,
             })
             .collect(),
+            dynamic_channels: vec![HOST_DVC.to_string()],
             egfx: Default::default(),
         }
     }
+
+    /// The dynamic channel name [`config`] registers for the host.
+    const HOST_DVC: &str = "Test::Host::Channel";
 
     /// The exact 32 bytes this client put on the wire during #198's probe, which the real VM
     /// **parsed and answered** (with `PDUTYPE2_SHUTDOWN_DENIED`). Pinned here rather than
@@ -4386,5 +4478,247 @@ mod tests {
         let (a, b) = frame.split_at(7);
         assert!(sm.process_bytes(a).unwrap().is_empty());
         assert_eq!(sm.process_bytes(b).unwrap().len(), 1);
+    }
+
+    /// The complete outbound frames that carry drdynvc PDU `pdu` on the drdynvc channel.
+    fn client_dvc_frames(sm: &SessionStateMachine, pdu: &[u8]) -> Vec<SessionOutput> {
+        svc::encode_chunks(pdu)
+            .iter()
+            .map(|chunk| SessionOutput::WriteBytes(sm.wrap_channel(DRDYNVC, chunk)))
+            .collect()
+    }
+
+    /// Feed every frame and collect what the machine produced.
+    fn feed_all(sm: &mut SessionStateMachine, frames: Vec<Vec<u8>>) -> Vec<SessionOutput> {
+        frames
+            .iter()
+            .flat_map(|frame| sm.process_bytes(frame).unwrap())
+            .collect()
+    }
+
+    /// One drdynvc data message for dynamic channel `channel_id`, as server SVC frames.
+    fn server_dvc_data(channel_id: u32, message: &[u8]) -> Vec<Vec<u8>> {
+        dvc::encode_data(channel_id, message)
+            .iter()
+            .flat_map(|pdu| server_dvc_frames(pdu))
+            .collect()
+    }
+
+    /// ADR-0018: a Create Request for a name the host registered is accepted, and the host
+    /// learns the id the server gave it.
+    #[test]
+    fn a_host_registered_dynamic_channel_is_accepted_and_announced() {
+        let mut sm = with_open_dvc(9, "Some::Other::Channel");
+        let outputs = feed_all(&mut sm, server_dvc_create(9, HOST_DVC));
+        let mut expected = client_dvc_frames(&sm, &dvc::encode_create_response(9, 0));
+        expected.push(SessionOutput::DynamicChannelOpened {
+            name: HOST_DVC.to_string(),
+            channel_id: 9,
+        });
+        assert_eq!(outputs, expected);
+    }
+
+    /// A host channel's message reaches the host whole, whether it fits one data PDU or arrives
+    /// as Data First plus Data.
+    #[test]
+    fn a_host_dynamic_channel_message_reaches_the_host_whole() {
+        let mut sm = with_open_dvc(9, HOST_DVC);
+        let short = b"one data pdu".to_vec();
+        assert_eq!(
+            feed_all(&mut sm, server_dvc_data(9, &short)),
+            vec![SessionOutput::DynamicChannelData {
+                channel_id: 9,
+                data: short,
+            }]
+        );
+        let long: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        assert!(
+            dvc::encode_data(9, &long).len() > 1,
+            "the message is fragmented"
+        );
+        assert_eq!(
+            feed_all(&mut sm, server_dvc_data(9, &long)),
+            vec![SessionOutput::DynamicChannelData {
+                channel_id: 9,
+                data: long,
+            }]
+        );
+    }
+
+    /// The host learns that its channel ended, from a server Close and from a Create Request
+    /// that reuses the id, and nothing more reaches it on that id.
+    #[test]
+    fn the_host_learns_when_the_server_ends_its_dynamic_channel() {
+        let mut sm = with_open_dvc(9, HOST_DVC);
+        assert_eq!(
+            feed_all(&mut sm, server_dvc_frames(&dvc::encode_close(9))),
+            vec![SessionOutput::DynamicChannelClosed { channel_id: 9 }]
+        );
+        assert!(feed_all(&mut sm, server_dvc_data(9, b"late")).is_empty());
+
+        let mut sm = with_open_dvc(9, HOST_DVC);
+        let outputs = feed_all(&mut sm, server_dvc_create(9, "Some::Other::Channel"));
+        let mut expected = vec![SessionOutput::DynamicChannelClosed { channel_id: 9 }];
+        expected.extend(client_dvc_frames(
+            &sm,
+            &dvc::encode_create_response(9, 0x8000_4005),
+        ));
+        assert_eq!(outputs, expected);
+        assert!(feed_all(&mut sm, server_dvc_data(9, b"late")).is_empty());
+    }
+
+    /// A host message goes out as drdynvc data PDUs on the channel's id, fragmented when it
+    /// is longer than one.
+    #[test]
+    fn a_host_message_goes_out_on_its_dynamic_channel() {
+        let mut sm = with_open_dvc(9, HOST_DVC);
+        for message in [b"short".to_vec(), vec![0x5A; 4000]] {
+            let pdus = dvc::encode_data(9, &message);
+            let expected: Vec<Vec<u8>> = pdus
+                .iter()
+                .flat_map(|pdu| client_dvc_frames(&sm, pdu))
+                .map(|output| match output {
+                    SessionOutput::WriteBytes(frame) => frame,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(sm.send_dynamic_channel(9, &message), Ok(expected));
+        }
+    }
+
+    /// Only an open host channel takes a send or a close: not an id never opened, and not a
+    /// channel a core processor terminates.
+    #[test]
+    fn a_send_or_close_needs_an_open_host_dynamic_channel() {
+        let mut sm = with_open_dvc(7, displaycontrol::CHANNEL_NAME);
+        for channel_id in [7, 9] {
+            assert_eq!(
+                sm.send_dynamic_channel(channel_id, b"x"),
+                Err(DynamicChannelError::NotOpen { channel_id })
+            );
+            assert_eq!(
+                sm.close_dynamic_channel(channel_id),
+                Err(DynamicChannelError::NotOpen { channel_id })
+            );
+        }
+    }
+
+    /// The host closes its channel with a Close PDU; the channel is then gone on this side.
+    /// Data already in flight on it, and a stray Close for it, are ignored (`[MS-RDPEDYC]`
+    /// 3.2.5.2: the server does not answer a client-initiated Close).
+    #[test]
+    fn the_host_closes_its_dynamic_channel() {
+        let mut sm = with_open_dvc(9, HOST_DVC);
+        let expected: Vec<Vec<u8>> = client_dvc_frames(&sm, &dvc::encode_close(9))
+            .into_iter()
+            .map(|output| match output {
+                SessionOutput::WriteBytes(frame) => frame,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(sm.close_dynamic_channel(9), Ok(expected));
+        assert!(feed_all(&mut sm, server_dvc_data(9, b"in flight")).is_empty());
+        assert!(feed_all(&mut sm, server_dvc_frames(&dvc::encode_close(9))).is_empty());
+        assert_eq!(
+            sm.send_dynamic_channel(9, b"x"),
+            Err(DynamicChannelError::NotOpen { channel_id: 9 })
+        );
+    }
+
+    /// A host may not register a name the core terminates.
+    #[test]
+    fn a_host_cannot_register_a_core_dynamic_channel() {
+        for name in [
+            displaycontrol::CHANNEL_NAME,
+            justrdp_pdu::egfx::CHANNEL_NAME,
+        ] {
+            let config = SessionConfig {
+                dynamic_channels: vec![HOST_DVC.to_string(), name.to_string()],
+                ..config()
+            };
+            assert_eq!(
+                SessionStateMachine::new(config, Vec::new()).err(),
+                Some(SessionError::DynamicChannelConfig(
+                    crate::dvc::CoreOwnedDynamicChannel {
+                        name: name.to_string()
+                    }
+                ))
+            );
+        }
+    }
+
+    /// While the server has suspended virtual channel traffic a host dynamic channel message is
+    /// held, and goes out on the resume.
+    #[test]
+    fn a_host_dynamic_channel_send_is_held_while_suspended() {
+        let mut sm = with_open_dvc(9, HOST_DVC);
+        let suspend = server_channel_frame(DRDYNVC, &flag_chunk(crate::svc::CHANNEL_FLAG_SUSPEND));
+        assert!(sm.process_bytes(&suspend).unwrap().is_empty());
+        assert_eq!(sm.send_dynamic_channel(9, b"held"), Ok(Vec::new()));
+        let resume = server_channel_frame(DRDYNVC, &flag_chunk(crate::svc::CHANNEL_FLAG_RESUME));
+        assert_eq!(
+            sm.process_bytes(&resume).unwrap(),
+            client_dvc_frames(&sm, &dvc::encode_data(9, b"held")[0])
+        );
+    }
+
+    /// Held host messages share the 64 MiB bound with static channels; past it a dynamic
+    /// channel send is refused and the session goes on.
+    #[test]
+    fn a_host_dynamic_channel_send_past_the_suspended_bound_is_refused() {
+        let mut sm = with_open_dvc(9, HOST_DVC);
+        let suspend = server_channel_frame(DRDYNVC, &flag_chunk(crate::svc::CHANNEL_FLAG_SUSPEND));
+        sm.process_bytes(&suspend).unwrap();
+        let big = vec![0u8; crate::svc::CHANNEL_MESSAGE_CAP];
+        assert_eq!(sm.send_dynamic_channel(9, &big), Ok(Vec::new()));
+        assert_eq!(
+            sm.send_dynamic_channel(9, b"x"),
+            Err(DynamicChannelError::SuspendedQueueFull { channel_id: 9 })
+        );
+    }
+
+    /// A server minting fresh ids for one host name is capped per name, and cannot spend the
+    /// slots the core's channels need: the Graphics Pipeline still opens.
+    #[test]
+    fn a_host_dynamic_channel_name_cannot_exhaust_the_core_channels() {
+        let mut sm = with_open_dvc(10, HOST_DVC);
+        for id in 11..=13 {
+            feed_all(&mut sm, server_dvc_create(id, HOST_DVC));
+        }
+        let refused = feed_all(&mut sm, server_dvc_create(14, HOST_DVC));
+        assert_eq!(
+            refused,
+            client_dvc_frames(&sm, &dvc::encode_create_response(14, 0x8000_4005)),
+            "a fifth channel for one host name is refused"
+        );
+        let accepted = feed_all(
+            &mut sm,
+            server_dvc_create(15, justrdp_pdu::egfx::CHANNEL_NAME),
+        );
+        assert_eq!(
+            accepted.first(),
+            client_dvc_frames(&sm, &dvc::encode_create_response(15, 0)).first(),
+            "the Graphics Pipeline is still accepted"
+        );
+    }
+
+    /// A final Data PDU that carries more than DataFirst declared still delivers the declared
+    /// length, as it did before host channels existed; the excess is dropped.
+    #[test]
+    fn a_host_dynamic_channel_message_is_cut_at_its_declared_length() {
+        let mut sm = with_open_dvc(9, HOST_DVC);
+        let long: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let mut pdus = dvc::encode_data(9, &long);
+        pdus.last_mut()
+            .expect("fragmented")
+            .extend_from_slice(b"excess");
+        let frames: Vec<Vec<u8>> = pdus.iter().flat_map(|pdu| server_dvc_frames(pdu)).collect();
+        assert_eq!(
+            feed_all(&mut sm, frames),
+            vec![SessionOutput::DynamicChannelData {
+                channel_id: 9,
+                data: long,
+            }]
+        );
     }
 }

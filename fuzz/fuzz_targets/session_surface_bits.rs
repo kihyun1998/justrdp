@@ -80,6 +80,7 @@ fuzz_target!(|input: &[u8]| {
             server_input_flags: capability::INPUT_FLAG_SCANCODES,
             drdynvc_channel_id: None,
             static_channels: Vec::new(),
+            dynamic_channels: Vec::new(),
             egfx: Default::default(),
         },
         Vec::new(),

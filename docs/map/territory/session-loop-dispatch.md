@@ -23,7 +23,8 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 - **These outputs are the host's whole view of a live session**:
   `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `DisplayControlReady` ·
   `ShutdownDenied` · `SaveSessionInfo` · `KeyboardIndicators` · `PlaySound` · `ChannelData` ·
-  `ChannelMessageDropped` (the live list is `SessionOutput` in `session.rs`). Anything the
+  `ChannelMessageDropped` · `DynamicChannelOpened` · `DynamicChannelData` ·
+  `DynamicChannelClosed` (the live list is `SessionOutput` in `session.rs`). Anything the
   host cannot learn from one of these, it cannot learn at all
   — which is the argument #228 turned on: a `pduType2` that falls into the catch-all
   (**skipped, cursor unread** — the arm never decoded anything, whatever its comment said
@@ -62,7 +63,8 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   desktop (4 of the 20 Surface Commands updates in the #150 capture), so 2 leaves it untouched.
 - **Static-channel traffic goes three ways** (#307): `drdynvc` to the dynamic-channel
   manager, a granted host channel to its reassembler and out as `ChannelData`, and a channel
-  ID that was never granted is skipped with an `rdp_svc` record. See
+  ID that was never granted is skipped with an `rdp_svc` record. Inside `drdynvc`, a channel
+  the host registered surfaces as the three `DynamicChannel*` outputs (#385, ADR-0018). See
   [Virtual channels](virtual-channels.md) for the reassembly rules and whose call each was.
 
 ## Code
