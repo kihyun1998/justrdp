@@ -23,7 +23,7 @@ initialization sequence as a helper the host drives over that seam (`justrdp::cl
   clipboard's file transfer is a policy flag and so the host's (#355); every other
   `generalFlags` bit, and every rdpdr General bit, stays the core's.
 
-Adjacent but not governing: `CONTEXT.md` defines **Virtual Channel** in the
+Adjacent but not governing: `GLOSSARY.md` defines **Virtual Channel** in the
 glossary, which is vocabulary rather than a decision.
 
 ## Design model

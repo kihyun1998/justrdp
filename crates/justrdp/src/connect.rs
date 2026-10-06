@@ -338,14 +338,14 @@ pub enum ConnectError {
     },
 }
 
-/// The labeled connect sub-step the machine is in (CONTEXT.md "Connect Stage"). Stages that
+/// The labeled connect sub-step the machine is in (GLOSSARY.md "Connect Stage"). Stages that
 /// follow the X.224 confirm carry the server-selected protocol, so a stage being reachable
 /// proves the data it needs exists — no `Option` to unwrap, no panic path.
 ///
 /// The three MCS sub-states all report the glossary's `capability-exchange` label: GCC *is* the
 /// first half of capability negotiation ("client/server advertise and negotiate feature flags
-/// and desktop size" — CONTEXT.md), with Demand/Confirm Active (slice-5) as the second half.
-/// CONTEXT.md's seven stages remain the complete observable set.
+/// and desktop size" — GLOSSARY.md), with Demand/Confirm Active (slice-5) as the second half.
+/// GLOSSARY.md's seven stages remain the complete observable set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     /// Before the socket is up — the machine has asked the adapter to `Connect`.
@@ -370,7 +370,7 @@ enum Stage {
     ChannelJoin { selected: SecurityProtocol },
     /// The Client Info PDU is on the wire; awaiting the server's first licensing message
     /// (MS-RDPELE). Still `capability-exchange` to observers: licensing is a gatekeeping
-    /// sub-step between the two halves of capability negotiation, and CONTEXT.md's seven
+    /// sub-step between the two halves of capability negotiation, and GLOSSARY.md's seven
     /// stages remain the complete observable set (the same ruling as Client Info, gate #40).
     Licensing { selected: SecurityProtocol },
     /// Licensing completed; awaiting the server's Demand Active (tolerating DeactivateAll
@@ -387,7 +387,7 @@ enum Stage {
     /// Terminal: the machine emitted [`Action::SessionActive`] or [`Action::FailWith`] and will
     /// accept no further events (each yields [`ConnectError::UnexpectedEvent`]). Internal only —
     /// `last` is the label of the stage where the connect ended, and [`Stage::label`] keeps
-    /// reporting it: CONTEXT.md's seven Connect Stages stay the complete observable set (no
+    /// reporting it: GLOSSARY.md's seven Connect Stages stay the complete observable set (no
     /// extra label leaks to the host's `on_stage`), and after a failure `stage()` still names
     /// the stage that failed, preserving error attribution.
     Done { last: &'static str },
@@ -817,7 +817,7 @@ impl ConnectStateMachine {
     /// The Client Info write is the Secure Settings Exchange (MS-RDPBCGR 2.2.1.11) — the server
     /// does not begin licensing until it arrives, so the connect machine owns the send rather
     /// than leaving a silent gap for the host to discover. It happens at the tail of the
-    /// `capability-exchange` stage; per CONTEXT.md's seven-stage glossary no separate label
+    /// `capability-exchange` stage; per GLOSSARY.md's seven-stage glossary no separate label
     /// exists for it (it is a single fire-and-forget write with no response of its own — the
     /// next inbound PDU is licensing).
     fn finish(&mut self, selected: SecurityProtocol) -> Vec<Action> {
@@ -1175,7 +1175,7 @@ impl ConnectStateMachine {
                             "server Font Map"
                         );
                         // Session-active: the terminal stage keeps the glossary label so the
-                        // host observes the `session-active` transition (CONTEXT.md stage 7).
+                        // host observes the `session-active` transition (GLOSSARY.md stage 7).
                         tracing::debug!(
                             target: "rdp_session_active",
                             width = self.negotiated_size.0,
@@ -2274,7 +2274,7 @@ pub(crate) mod tests {
     fn terminal_machine_keeps_the_last_canonical_stage_label() {
         // Termination is internal: stage() keeps attributing to the stage where the connect
         // ended. No non-glossary label is ever observable, so a host's on_stage sees only
-        // CONTEXT.md's seven Connect Stage labels and error attribution survives.
+        // GLOSSARY.md's seven Connect Stage labels and error attribution survives.
         assert_eq!(done_failed().stage(), "x224-negotiate");
         assert_eq!(licensing().stage(), "capability-exchange");
         assert_eq!(session_active().0.stage(), "session-active");
