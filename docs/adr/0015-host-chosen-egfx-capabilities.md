@@ -8,7 +8,7 @@
 ## Context
 
 `GraphicsProcessor` advertised a capability ladder fixed inside the core — 8, 8.1, 10, 10.1, 10.2,
-10.3, 10.4, with no cache flag. `CONTEXT.md` gives the host every RDP feature flag, and this library
+10.3, 10.4, with no cache flag. `GLOSSARY.md` (then `CONTEXT.md`) gives the host every RDP feature flag, and this library
 exists because a capability flag was curated inside `ironrdp-connector`. #271 chose the ladder by
 measurement and left the host no way to narrow it or to ask for the small cache.
 
