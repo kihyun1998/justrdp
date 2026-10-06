@@ -7,7 +7,7 @@
 #
 # The pin is exact (three-part), not `"1.98"`: a two-part channel resolves to the latest
 # patch release, so a compiler nobody reviewed would reach the gate the same way a
-# floating `stable` does. Same posture as `sspi = "=0.21.3"` (ADR-0004) and the SHA-pinned
+# floating `stable` does. Same posture as the exact `sspi` pin (ADR-0004) and the SHA-pinned
 # actions (ADR-0006).
 #
 # Raising it is Dependabot's job, not a memory: the `rust-toolchain` ecosystem in

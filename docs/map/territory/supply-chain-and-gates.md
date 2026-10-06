@@ -140,7 +140,7 @@ like any other.
 - `.github/dependabot.yml` — weekly cargo, rust-toolchain and github-actions ecosystems
 - `rust-toolchain.toml` — the exact compiler pin (ADR-0013); read by every `cargo`
   invocation in the tree, `fuzz/` included, since rustup discovers it by walking up
-- `Cargo.toml` — `[workspace.dependencies]` (exact pin `sspi = "=0.21.3"` per ADR-0004)
+- `Cargo.toml` — `[workspace.dependencies]` (exact `sspi = "=x.y.z"` pin per ADR-0004)
 - `fuzz/Cargo.toml` — the out-of-workspace member
 
 ## Reference behaviour

@@ -10,7 +10,7 @@ This repo already pins two of its inputs, and it decided each one separately.
 - **GitHub Actions** are pinned to 40-character commit SHAs, because a mutable `@v4` ref is one the
   action's author can silently re-point after review (ADR-0006, the tj-actions/CVE-2025-30066
   class).
-- **`sspi`** is pinned to an exact `=0.21.3` rather than a caret range, because ADR-0004's
+- **`sspi`** is pinned to an exact `=x.y.z` version rather than a caret range, because ADR-0004's
   contribute-and-bridge rule requires the version-bump PR to be the thing that runs the real-VM
   suite.
 

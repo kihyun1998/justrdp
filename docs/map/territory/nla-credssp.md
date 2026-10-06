@@ -43,7 +43,7 @@ and binding the exchange to the server's public key.
   `Credentials`, the `Action::StartNla` arm
 - `justrdp/src/connect.rs` — `Action::StartNla`, `Event::NlaComplete`,
   `ConnectStateMachine`
-- `Cargo.toml` — `sspi = "=0.21.3"`, the exact pin ADR-0004 requires (the
+- `Cargo.toml` — `sspi = "=0.22.0"`, the exact pin ADR-0004 requires (the
   `[patch.crates-io]` bridge that used to sit here was removed 2026-08-10)
 - Stage string: `nla-credssp`
 
@@ -73,11 +73,17 @@ defect), #689 (the maintainer's rework that fixed it).
 ## Known holes / open
 
 - **The version-bump gate ADR-0004 requires is satisfied for the current pin** (`sspi
-  = "=0.21.3"`, fork bridge removed 2026-08-10). `connect_reaches_session_active_against_real_vm`
+  = "=0.22.0"`, 2026-10-06). `connect_reaches_session_active_against_real_vm`
   — the whole X.224 → TLS → CredSSP → MCS/GCC → activation sequence against the live
-  WS2022 box — passes, as does the loopback full-CredSSP test that existed only
-  because of the fork. See ADR-0004's *Result* section for the run detail and for the
-  suite's session-isolation caveat.
+  WS2022 box — passes, as do `first_frames_render_the_desktop_against_real_vm` and the
+  loopback full-CredSSP test. The first exact pin after the fork bridge (`=0.21.3`,
+  2026-08-10) passed the same gate; see ADR-0004's *Result* section for that run and
+  for the suite's session-isolation caveat.
+- **0.22 made `TsRequest::buffer_len()` fallible** (`Result<u16>`): a request whose
+  encoded length overflows `u16` is now an error rather than a truncated size.
+  `write_ts_request` surfaces it as `ConnectFailure::Nla`, the same as an encode
+  failure. The same bump moved `md4` 0.10 → 0.11, the hash under the NTLM password
+  — one more reason the real-VM run, not the loopback test, is the gate.
 - **Why it took six weeks, recorded because the mechanism is reusable.** #61 — named
   as the removal tracker by `Cargo.toml`, `.github/dependabot.yml` *and* ADR-0004 —
   was closed against its own comment; Dependabot's "new release is the signal"
