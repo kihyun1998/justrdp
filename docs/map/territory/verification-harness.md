@@ -307,6 +307,29 @@ was checked against.
   hard-coded the 16-bpp session into its pixel comparison and failed on master too once the policy
   moved; it now reads the depth from the Demand Active and strips the same two sets, since NSCodec
   is lossy and its comparison is exact.
+- **Audio input cannot be proven on this VM, and the VM is Windows Server 2019** (#400,
+  2026-10-07). An in-session `Win32_OperatingSystem` read *Microsoft Windows Server 2019
+  Standard*; the records that call it WS2022 predate that reading. The probe was FreeRDP 3.31
+  with `/microphone:sys:pulse` (which sets `INFO_AUDIOCAPTURE`, `client/common/cmdline.c` 3.31.0)
+  and a winmm MCI `record` in the session, its WAV read back over `/drive`. In every
+  configuration tried, the server opened no `AUDIO_INPUT` channel for the whole session and the
+  WAV held a 44-byte header and no data:
+
+  | VM state | MCI `record` |
+  |---|---|
+  | as built: Remote Desktop for Administration (`TerminalServerMode` 0, `RDS-RD-Server` Available) | 328 `MCIERR_WAVE_INPUTSUNSUITABLE` (no capture device) |
+  | + *Allow audio recording redirection* (`fDisableAudioCapture` 0, and 0 on `RDP-Tcp`), reboot | 328 |
+  | + the RD Session Host role | 322 `MCIERR_WAVE_INPUTSINUSE`; the server now also opens `RDCamera_Device_Enumerator` and sends a Server License Request |
+  | + *Do not allow supported Plug and Play device redirection* = Disabled, reboot | 322; the server now also opens `PNPDR` |
+
+  With the role, the session lists a remote recording device, but opening it hangs (*Listen to
+  this device* never applies) and no TerminalServices or audio event log records why; the only
+  warning is `TerminalServices-PnPDevices` 36, which the PnP policy then cleared. mstsc from the
+  host also got 322. The host has no microphone, but its Realtek microphone jack reports an
+  active capture endpoint; that it did so during the mstsc run is inferred, not measured, and
+  **going ahead without that check was the maintainer's call (2026-10-08)**. The role was
+  installed on a snapshot and the VM was reverted to it, so the suite still runs against the
+  administration-mode server, whose licensing short-circuits with `STATUS_VALID_CLIENT`.
 - **Driving a desktop by synthesised keystrokes is open-loop, and the acknowledgement
   the harness needs is the one it already receives.** Every VM test that has to make
   something happen *inside* Windows — sign out, launch an app, run `tsdiscon` — types

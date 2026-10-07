@@ -75,7 +75,11 @@ decision of its own. That inference has never been written down as a record.
 
 - **The grant path is effectively unexercised.** The test VM has no licensing server,
   so only the "error = proceed" branch is proven end-to-end; New License and Platform
-  Challenge rest on the differential test alone.
+  Challenge rest on the differential test alone. **An RD Session Host takes the request
+  path** (#400, 2026-10-07): with the role installed on the test VM, FreeRDP 3.31 logged a
+  Server License Request, its own New License Request, and an error alert with an empty
+  `BB_ERROR_BLOB`, where the administration-mode VM answers `STATUS_VALID_CLIENT` at once.
+  justrdp's `MSG_LICENSE_REQUEST` branch was not run against it, and the VM was reverted.
 - Per-device CAL storage / reuse is not built, and nothing tracks it.
 - The hand-rolled `rc4` / `md5` / `sha1` here are *protocol* primitives, not the
   security boundary — but nothing in the repo says so in a place a reader of this
