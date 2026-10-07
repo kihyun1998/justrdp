@@ -93,6 +93,7 @@ pub(crate) fn bit_len(bytes: usize) -> Option<usize> {
 pub mod capture;
 pub mod clearcodec;
 pub mod color;
+pub mod g711;
 pub mod nscodec;
 pub mod pcm;
 pub mod planar;

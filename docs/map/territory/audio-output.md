@@ -4,7 +4,8 @@
 
 The audio output channel (`[MS-RDPEA]`): the server sends audio samples and the client
 confirms each one once it has played it. `justrdp-pdu::rdpsnd` holds the PDUs,
-`justrdp-codecs::pcm` turns linear PCM into signed 16-bit samples, and
+`justrdp-codecs::pcm` turns linear PCM and `justrdp-codecs::g711` A-law into signed 16-bit
+samples, and
 `justrdp::rdpsnd::AudioOutput` is a sans-IO helper the host drives, as the clipboard and device
 redirection helpers are. The helper does not care which transport carries the messages: the
 same bytes ride the static channel `rdpsnd` or the dynamic channel `AUDIO_PLAYBACK_DVC`
@@ -29,7 +30,8 @@ channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM
   `wFormatTag`s the host takes, most preferred first, each once. The helper answers the
   server's list with every server format of those tags **that the core decodes**, in the
   host's tag order and the server's order within a tag, copied as the server sent it. For PCM
-  that is 8 or 16 bits, at least one channel, and an `nBlockAlign` of exactly one frame, so a
+  that is 8 or 16 bits, for A-law 8 (#388); for both, at least one channel and an
+  `nBlockAlign` of exactly one frame, so a
   block always holds whole frames of `channels` samples (#386's review: the tag alone let
   24-bit PCM and a half-frame `nBlockAlign` through). So the client list is a subset of the server's,
   as 2.2.2.2 requires, `cbSize` data included. This shape was confirmed by the maintainer
@@ -67,6 +69,12 @@ channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM
   `nBlockAlign` frames are `DecodeError`s, which the host gets back from `process`.
 - **The version is 8**, which brings Wave2. `wDGramPort` is always 0, which keeps audio on the
   virtual channel; UDP and the lossy channel are #16's.
+- **A-law is checked against an independent decoder, not ITU-T G.711's table** (#388): the
+  table is drawn in the published PDF rather than set as text, so all 256 codes are compared
+  with CPython 3.12's `audioop.alaw2lin`. Its extremes, 32,256 and 8, are G.711's 4,032 and 1
+  in 13-bit units scaled to 16 bits. The even-bit inversion the decoder undoes is read from
+  G.711's own text (Note 2 of Table 1a, cited by the notes to Tables 3 and 4). That oracle
+  was the maintainer's call (2026-10-07).
 - **8-bit PCM is unsigned around `0x80`, 16-bit PCM is signed little-endian.** Microsoft's
   documentation states the signedness, not the byte order. The byte order is measured below.
 - **Which transport carries audio is the server's, and the host's only lever is registering
@@ -83,6 +91,7 @@ channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM
   `decode_wave`, `encode_client_formats`, `encode_quality_mode`, `encode_training_confirm`,
   `encode_wave_confirm`, `CHANNEL_NAME`, `DVC_CHANNEL_NAME`
 - `justrdp-codecs/src/pcm.rs` — `decode`, `PcmError`
+- `justrdp-codecs/src/g711.rs` — `alaw_to_i16`, `decode_alaw`
 - `justrdp/src/rdpsnd.rs` — `AudioOutput`, `AudioOutputConfig`, `AudioOutputConfigError`,
   `AudioOutputEvent`, `AudioBlock`, `WaveConfirm`, `QualityMode`, `CLIENT_VERSION`,
   `DECODABLE_FORMAT_TAGS`
@@ -92,6 +101,17 @@ channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM
   section 4 (the annotated examples the PDU tests decode byte for byte)
 
 ## Reference behaviour
+
+**Measured against the WS2022 test VM (#388, 2026-10-07):**
+
+- **A host that lists only A-law gets A-law**: the server picked its one A-law format, 22,050 Hz
+  stereo 8-bit, and sent the same sound as 30 Wave2 blocks, 245,760 samples. That is half the
+  PCM run's 491,520 at half its rate, so both are the same 5.57 s of audio
+  (`a_sound_reaches_the_host_in_alaw_when_the_host_takes_only_alaw_on_the_real_vm`).
+- **Every audio VM test asserts the decoded samples read at least ten times smoother than the
+  byte-swapped reading**, 8-bit PCM excepted: its decoded low byte is always zero, so it swaps
+  into small values and the comparison runs backwards. Measured: PCM 158.8 against 17,612.7, A-law 305.0 against 16,089.8.
+  An A-law decoder that skips the even-bit inversion read 5,398.5 against 9,429.4 and failed it.
 
 **Measured against the WS2022 test VM (#387, 2026-10-07):**
 
@@ -165,7 +185,7 @@ channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM
   than its WaveInfo announced is dropped, where FreeRDP and IronRDP take the announced length;
   and a WaveInfo followed by anything but its Wave loses that message, which the spec rules out
   (the PDU after a WaveInfo MUST be a Wave). ADR-0009 §3(a) allows both.
-- **Only PCM decodes.** A-law is #388, and MS-ADPCM and IMA-ADPCM are #389. Measuring this
+- **PCM and A-law decode.** MS-ADPCM and IMA-ADPCM are #389. Measuring this
   server's list re-planned both (the maintainer's calls, 2026-10-07): IMA-ADPCM, which epic #11
   had dropped on product note 4, joined #389, and µ-law, which this server does not offer, left
   #388.

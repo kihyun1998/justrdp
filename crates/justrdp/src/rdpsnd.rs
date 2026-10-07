@@ -11,11 +11,11 @@
 //! copied as the server sent it, so the client list is always a subset of the server's
 //! (2.2.2.2).
 
-use justrdp_codecs::pcm;
+use justrdp_codecs::{g711, pcm};
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::rdpsnd::{
     self as pdu, AudioFormat, ClientFormats, ServerPdu, TSSNDCAPS_ALIVE, TSSNDCAPS_VOLUME,
-    WAVE_FORMAT_PCM,
+    WAVE_FORMAT_ALAW, WAVE_FORMAT_PCM,
 };
 
 /// The `wVersion` this helper implements and so advertises: Windows 8 and later's, which brings
@@ -26,13 +26,17 @@ pub const CLIENT_VERSION: u16 = 0x0008;
 const QUALITY_MODE_FROM: u16 = 0x0006;
 
 /// The `wFormatTag`s the core decodes.
-pub const DECODABLE_FORMAT_TAGS: &[u16] = &[WAVE_FORMAT_PCM];
+pub const DECODABLE_FORMAT_TAGS: &[u16] = &[WAVE_FORMAT_PCM, WAVE_FORMAT_ALAW];
 
-/// Whether the core decodes samples in `format`: PCM at 8 or 16 bits, with at least one channel
-/// and a block that is exactly one frame of them.
+/// Whether the core decodes samples in `format`: PCM at 8 or 16 bits or A-law at 8, with at
+/// least one channel and a block that is exactly one frame of them.
 fn decodable(format: &AudioFormat) -> bool {
-    format.format_tag == WAVE_FORMAT_PCM
-        && matches!(format.bits_per_sample, 8 | 16)
+    let depth = match format.format_tag {
+        WAVE_FORMAT_PCM => matches!(format.bits_per_sample, 8 | 16),
+        WAVE_FORMAT_ALAW => format.bits_per_sample == 8,
+        _ => false,
+    };
+    depth
         && format.channels > 0
         && u32::from(format.block_align)
             == u32::from(format.channels) * u32::from(format.bits_per_sample / 8)
@@ -321,13 +325,17 @@ impl AudioOutput {
         if !data.len().is_multiple_of(usize::from(format.block_align)) {
             return dropped(confirm, "the sample is not a whole number of frames");
         }
-        match pcm::decode(format.bits_per_sample, data) {
+        let samples = match format.format_tag {
+            WAVE_FORMAT_ALAW => Ok(g711::decode_alaw(data)),
+            _ => pcm::decode(format.bits_per_sample, data),
+        };
+        match samples {
             Ok(samples) => AudioOutputEvent::Block(AudioBlock {
                 format: format.clone(),
                 samples,
                 confirm,
             }),
-            Err(_) => dropped(confirm, "the sample is not PCM the core decodes"),
+            Err(_) => dropped(confirm, "the sample is not audio the core decodes"),
         }
     }
 }
@@ -735,17 +743,46 @@ mod tests {
         assert_eq!(block.format, pcm_8);
     }
 
+    /// A host listing A-law gets the server's 8-bit A-law formats in its tag order, and their
+    /// samples decoded to i16 (#388). A-law at another depth is not offered.
+    #[test]
+    fn a_host_listing_alaw_negotiates_and_decodes_it() {
+        let pcm = format(WAVE_FORMAT_PCM, 2, 44100, 16);
+        let alaw = format(WAVE_FORMAT_ALAW, 2, 22050, 8);
+        let alaw_16 = format(WAVE_FORMAT_ALAW, 2, 22050, 16);
+        let mut output = AudioOutput::new(AudioOutputConfig {
+            format_tags: vec![WAVE_FORMAT_ALAW, WAVE_FORMAT_PCM],
+            ..AudioOutputConfig::default()
+        })
+        .unwrap();
+        let events = output
+            .process(&server_formats(8, &[pcm.clone(), alaw_16, alaw.clone()]))
+            .unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&AudioOutputEvent::Negotiated(vec![alaw.clone(), pcm]))
+        );
+        let events = output
+            .process(&wave2(0x0101, 0, 5, &[0xD5, 0x55, 0xAA, 0x2A]))
+            .unwrap();
+        let [AudioOutputEvent::Block(block)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(block.format, alaw);
+        assert_eq!(block.samples, [8, -8, 32256, -32256]);
+    }
+
     /// The host may list only formats the core decodes.
     #[test]
     fn an_undecodable_format_tag_is_refused() {
         assert_eq!(
             AudioOutput::new(AudioOutputConfig {
-                format_tags: vec![WAVE_FORMAT_PCM, WAVE_FORMAT_ALAW],
+                format_tags: vec![WAVE_FORMAT_PCM, pdu::WAVE_FORMAT_MULAW],
                 ..AudioOutputConfig::default()
             })
             .err(),
             Some(AudioOutputConfigError::UndecodableFormat {
-                format_tag: WAVE_FORMAT_ALAW
+                format_tag: pdu::WAVE_FORMAT_MULAW
             })
         );
     }

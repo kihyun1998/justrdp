@@ -2653,9 +2653,11 @@ mod tests {
     /// server is silent on the channel until then (#385), and silent altogether while the VM's
     /// Windows Audio service is stopped (#386). The run records the server's format list, the
     /// format it sent in, which PDUs carried the samples (WaveInfo + Wave or Wave2), when the
-    /// format list came relative to the playback, and whether the 16-bit samples read smoother
-    /// little-endian than byte-swapped, which is what a little-endian stream of real audio does.
-    async fn hear_a_sound_played_in_the_session(transport: AudioTransport) {
+    /// format list came relative to the playback, and whether the decoded samples read far
+    /// smoother than byte-swapped, which is what real audio decoded right does: a wrong byte order
+    /// or a wrong decoder scatters it. 8-bit PCM is left out of that comparison, because its
+    /// decoded low byte is always zero and so swaps into small values.
+    async fn hear_a_sound_played_in_the_session(transport: AudioTransport, format_tags: &[u16]) {
         use justrdp::rdpsnd::{AudioOutput, AudioOutputConfig, AudioOutputEvent};
         use justrdp_pdu::rdpsnd::{AudioFormat, DVC_CHANNEL_NAME, SNDC_FORMATS, ServerPdu};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2723,8 +2725,11 @@ mod tests {
             let heard = Arc::new(Mutex::new(Heard::default()));
             let blocks = Arc::new(AtomicUsize::new(0));
             let played = Arc::new(Mutex::new(None::<Instant>));
-            let mut output =
-                AudioOutput::new(AudioOutputConfig::default()).expect("PCM is decodable");
+            let mut output = AudioOutput::new(AudioOutputConfig {
+                format_tags: format_tags.to_vec(),
+                ..AudioOutputConfig::default()
+            })
+            .expect("the formats are decodable");
 
             let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
             {
@@ -2957,9 +2962,13 @@ mod tests {
             }
             // Mean absolute difference of consecutive samples on each channel, read as sent and
             // byte-swapped: real audio moves in small steps in its true byte order.
+            let compared = |format: &AudioFormat| {
+                !(format.format_tag == justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM
+                    && format.bits_per_sample == 8)
+            };
             let roughness = |swap: bool| {
                 let (mut sum, mut n) = (0f64, 0f64);
-                for (_, format, samples) in &heard.blocks {
+                for (_, format, samples) in heard.blocks.iter().filter(|(_, f, _)| compared(f)) {
                     let channels = usize::from(format.channels.max(1));
                     let read = |s: i16| if swap { s.swap_bytes() } else { s };
                     for pair in samples.windows(channels + 1) {
@@ -2993,17 +3002,25 @@ mod tests {
                 }
             }
             let (_, negotiated) = heard.negotiated.last().expect("the server sent its formats");
-            assert!(!negotiated.is_empty(), "the server offers PCM");
+            assert!(!negotiated.is_empty(), "the server offers the host's formats");
+            if let [only] = format_tags {
+                assert!(
+                    heard.blocks.iter().all(|(_, f, _)| f.format_tag == *only),
+                    "every block is in the one format tag the host takes"
+                );
+            }
             assert!(total > 0, "PCM samples reach the host");
             assert!(heard.dropped.is_empty(), "no sample of the real server is dropped");
             assert!(
                 heard.blocks.iter().all(|(_, f, _)| negotiated.contains(f)),
                 "every block is in a negotiated format"
             );
-            if heard.blocks.iter().any(|(_, f, _)| f.bits_per_sample == 16) {
+            // Real audio decoded right moves in small steps; a wrong byte order or a wrong
+            // decoder scatters it like the byte-swapped reading.
+            if heard.blocks.iter().any(|(_, f, _)| compared(f)) {
                 assert!(
-                    as_sent < swapped,
-                    "16-bit samples read smoother as sent than byte-swapped"
+                    as_sent * 10.0 < swapped,
+                    "the decoded samples read far smoother than byte-swapped"
                 );
             }
         })
@@ -3015,7 +3032,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn a_sound_played_in_the_session_reaches_the_host_as_pcm_on_the_real_vm() {
-        hear_a_sound_played_in_the_session(AudioTransport::Dynamic).await;
+        hear_a_sound_played_in_the_session(
+            AudioTransport::Dynamic,
+            &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM],
+        )
+        .await;
     }
 
     /// Real-VM acceptance for #387: with `AUDIO_PLAYBACK_DVC` not registered, the server's Create
@@ -3026,10 +3047,13 @@ mod tests {
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn a_sound_falls_back_to_the_static_channel_when_the_dynamic_one_is_refused_on_the_real_vm()
      {
-        hear_a_sound_played_in_the_session(AudioTransport::Static {
-            options: gcc::CHANNEL_OPTION_INITIALIZED,
-            with_drdynvc: true,
-        })
+        hear_a_sound_played_in_the_session(
+            AudioTransport::Static {
+                options: gcc::CHANNEL_OPTION_INITIALIZED,
+                with_drdynvc: true,
+            },
+            &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM],
+        )
         .await;
         logs_assert(|lines: &[&str]| {
             lines
@@ -3043,15 +3067,30 @@ mod tests {
         });
     }
 
+    /// Real-VM acceptance for #388: a host that lists only A-law has the server send A-law, and
+    /// the sound reaches the host decoded to i16.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_sound_reaches_the_host_in_alaw_when_the_host_takes_only_alaw_on_the_real_vm() {
+        hear_a_sound_played_in_the_session(
+            AudioTransport::Dynamic,
+            &[justrdp_pdu::rdpsnd::WAVE_FORMAT_ALAW],
+        )
+        .await;
+    }
+
     /// Real-VM measurement for #387: with no `drdynvc` requested, so the server has no dynamic
     /// channel to try, audio comes on `rdpsnd` the same way.
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn a_sound_reaches_the_host_over_the_static_channel_without_drdynvc_on_the_real_vm() {
-        hear_a_sound_played_in_the_session(AudioTransport::Static {
-            options: gcc::CHANNEL_OPTION_INITIALIZED,
-            with_drdynvc: false,
-        })
+        hear_a_sound_played_in_the_session(
+            AudioTransport::Static {
+                options: gcc::CHANNEL_OPTION_INITIALIZED,
+                with_drdynvc: false,
+            },
+            &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM],
+        )
         .await;
     }
 
