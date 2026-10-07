@@ -525,9 +525,11 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   FreeRDP 3.31 (`/sound /network:lan`, `WLOG_FILTER=com.freerdp.channels.rdpsnd.client:TRACE`)
   received none either in 60 s: its log shows the channel opened at 1.1 s and the rdpsnd logger
   live, and no Server Audio Formats. FreeRDP's client sends nothing first on open
-  (`rdpsnd_on_open` → `rdpsnd_process_connect`, which only loads a backend). This also explains
-  #307's silent `rdpsnd`: that probe refused the dynamic channel. Whether a sound starts the
-  traffic is #386/#387's to measure.
+  (`rdpsnd_on_open` → `rdpsnd_process_connect`, which only loads a backend). ~~This also explains
+  #307's silent `rdpsnd`: that probe refused the dynamic channel.~~ It does not: #387 measured the
+  server falling back to `rdpsnd` when the dynamic channel is refused. #307's `rdpsnd` was silent
+  because no sound played, and #386 measured that a sound is what starts the traffic
+  ([Audio output](audio-output.md)).
 - **`ECHO` (`[MS-RDPEECO]`) is server-first.** Registered, it is opened within 1 ms and Echo
   Requests of 8 bytes arrive from 146 ms on (11 in one run), unanswered. It is what the
   live test of the host DVC receive path stands on

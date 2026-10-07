@@ -2637,16 +2637,25 @@ mod tests {
         .await;
     }
 
-    /// Real-VM acceptance for #386: a sound played in the session reaches the host as PCM over
-    /// `AUDIO_PLAYBACK_DVC`, through the audio output helper. PowerShell plays the first stock
-    /// `%windir%\Media\*.wav` with `System.Media.SoundPlayer`; the server is silent on the
-    /// channel until then (#385). The run records the server's format list, the format it sent
-    /// in, which PDUs carried the samples (WaveInfo + Wave or Wave2), when the format list came
-    /// relative to the playback, and whether the 16-bit samples read smoother little-endian than
-    /// byte-swapped, which is what a little-endian stream of real audio does.
-    #[tokio::test]
-    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
-    async fn a_sound_played_in_the_session_reaches_the_host_as_pcm_on_the_real_vm() {
+    /// The transport an audio output VM test hears the session on.
+    #[derive(Debug, Clone, Copy)]
+    enum AudioTransport {
+        /// `AUDIO_PLAYBACK_DVC`, registered for the host (ADR-0018).
+        Dynamic,
+        /// The static channel `rdpsnd`, requested with `options`, with `AUDIO_PLAYBACK_DVC` not
+        /// registered, so the server's Create Request for it is refused. `drdynvc` is requested
+        /// when `with_drdynvc`, which gives the server a dynamic channel to try first.
+        Static { options: u32, with_drdynvc: bool },
+    }
+
+    /// Play a stock sound in the session and hear it through `AudioOutput` over `transport`.
+    /// PowerShell plays the first `%windir%\Media\*.wav` with `System.Media.SoundPlayer`; the
+    /// server is silent on the channel until then (#385), and silent altogether while the VM's
+    /// Windows Audio service is stopped (#386). The run records the server's format list, the
+    /// format it sent in, which PDUs carried the samples (WaveInfo + Wave or Wave2), when the
+    /// format list came relative to the playback, and whether the 16-bit samples read smoother
+    /// little-endian than byte-swapped, which is what a little-endian stream of real audio does.
+    async fn hear_a_sound_played_in_the_session(transport: AudioTransport) {
         use justrdp::rdpsnd::{AudioOutput, AudioOutputConfig, AudioOutputEvent};
         use justrdp_pdu::rdpsnd::{AudioFormat, DVC_CHANNEL_NAME, SNDC_FORMATS, ServerPdu};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2656,27 +2665,53 @@ mod tests {
         const PLAY: &str = "(New-Object Media.SoundPlayer \
                             (Get-ChildItem $env:windir\\Media\\*.wav)[0].FullName).PlaySync()";
 
+        /// How to send a message back on the channel one arrived on.
+        type Reply = Box<dyn Fn(Vec<u8>) -> SessionCommand>;
+
         #[derive(Default)]
         struct Heard {
-            channel: Option<u32>,
+            dynamic_channel: Option<u32>,
             msg_types: Vec<u8>,
             negotiated: Vec<(Instant, Vec<AudioFormat>)>,
             server_formats: Vec<(u16, Vec<AudioFormat>)>,
             blocks: Vec<(Instant, AudioFormat, Vec<i16>)>,
+            static_blocks: usize,
+            dynamic_blocks: usize,
             closed: usize,
             dropped: Vec<&'static str>,
         }
 
         with_vm_session(|vm| async move {
             let mut config = legacy_graphics_config();
-            config.channels = ["rdpsnd", "rdpdr", "drdynvc"]
-                .iter()
-                .map(|name| gcc::ChannelDef::new(name, gcc::CHANNEL_OPTION_INITIALIZED).unwrap())
-                .collect();
+            let (rdpsnd_options, with_drdynvc) = match transport {
+                AudioTransport::Dynamic => (gcc::CHANNEL_OPTION_INITIALIZED, true),
+                AudioTransport::Static {
+                    options,
+                    with_drdynvc,
+                } => (options, with_drdynvc),
+            };
+            config.channels = vec![
+                gcc::ChannelDef::new("rdpsnd", rdpsnd_options).unwrap(),
+                gcc::ChannelDef::new("rdpdr", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
+            ];
+            if with_drdynvc {
+                config
+                    .channels
+                    .push(gcc::ChannelDef::new("drdynvc", gcc::CHANNEL_OPTION_INITIALIZED).unwrap());
+            }
             let session_capabilities = config.capabilities.clone();
             let outcome = vm.connect(config).await;
+            let rdpsnd = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "rdpsnd")
+                .expect("the VM grants rdpsnd")
+                .id;
             let mut session_config = session_config_from(&outcome, session_capabilities);
-            session_config.dynamic_channels = vec![DVC_CHANNEL_NAME.to_string()];
+            if let AudioTransport::Dynamic = transport {
+                session_config.dynamic_channels = vec![DVC_CHANNEL_NAME.to_string()];
+            }
             let desktop = session_config.desktop_size;
             let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
                 .expect("the test desktop size is within MAX_DESKTOP_DIM");
@@ -2790,67 +2825,80 @@ mod tests {
                     |_| {},
                     |event| {
                         let mut heard = heard_in_sink.lock().unwrap();
-                        match event {
-                            SessionEvent::DynamicChannelOpened { name, channel_id }
-                                if name == DVC_CHANNEL_NAME =>
-                            {
-                                heard.channel = Some(channel_id);
-                            }
-                            SessionEvent::DynamicChannelData { channel_id, data }
-                                if Some(channel_id) == heard.channel =>
-                            {
-                                heard.msg_types.push(data.first().copied().unwrap_or(0));
-                                if data.first() == Some(&SNDC_FORMATS)
-                                    && let Ok(ServerPdu::Formats { version, formats, .. }) =
-                                        ServerPdu::decode(&data)
+                        // The audio message, how to send one back on the same channel, and
+                        // whether that channel is the static one.
+                        let (data, reply, on_static): (Vec<u8>, Reply, bool) =
+                            match event {
+                                SessionEvent::DynamicChannelOpened { name, channel_id }
+                                    if name == DVC_CHANNEL_NAME =>
                                 {
-                                    heard.server_formats.push((version, formats));
+                                    heard.dynamic_channel = Some(channel_id);
+                                    return;
                                 }
-                                let arrived = Instant::now();
-                                let events = output
-                                    .process(&data)
-                                    .expect("the VM's audio output message decodes");
-                                for event in events {
-                                    match event {
-                                        AudioOutputEvent::Send(data) => commands_tx
-                                            .try_send(SessionCommand::DynamicChannelData {
-                                                channel_id,
-                                                data,
-                                            })
-                                            .expect("the command queue has room"),
-                                        AudioOutputEvent::Negotiated(formats) => {
-                                            heard.negotiated.push((arrived, formats));
-                                        }
-                                        AudioOutputEvent::Block(block) => {
-                                            let elapsed = arrived.elapsed().as_millis() as u32;
-                                            commands_tx
-                                                .try_send(SessionCommand::DynamicChannelData {
-                                                    channel_id,
-                                                    data: output.confirm(block.confirm, elapsed),
-                                                })
-                                                .expect("the command queue has room");
-                                            heard.blocks.push((
-                                                arrived,
-                                                block.format,
-                                                block.samples,
-                                            ));
-                                            blocks.fetch_add(1, Ordering::SeqCst);
-                                        }
-                                        AudioOutputEvent::Dropped { confirm, reason } => {
-                                            commands_tx
-                                                .try_send(SessionCommand::DynamicChannelData {
-                                                    channel_id,
-                                                    data: output.confirm(confirm, 0),
-                                                })
-                                                .expect("the command queue has room");
-                                            heard.dropped.push(reason);
-                                        }
-                                        AudioOutputEvent::Closed => heard.closed += 1,
-                                        AudioOutputEvent::Volume(_) => {}
+                                SessionEvent::DynamicChannelData { channel_id, data }
+                                    if Some(channel_id) == heard.dynamic_channel =>
+                                {
+                                    (
+                                        data,
+                                        Box::new(move |data| SessionCommand::DynamicChannelData {
+                                            channel_id,
+                                            data,
+                                        }),
+                                        false,
+                                    )
+                                }
+                                SessionEvent::ChannelData { channel, data } if channel == rdpsnd => {
+                                    (
+                                        data,
+                                        Box::new(move |data| SessionCommand::ChannelData {
+                                            channel,
+                                            data,
+                                        }),
+                                        true,
+                                    )
+                                }
+                                _ => return,
+                            };
+                        heard.msg_types.push(data.first().copied().unwrap_or(0));
+                        if data.first() == Some(&SNDC_FORMATS)
+                            && let Ok(ServerPdu::Formats { version, formats, .. }) =
+                                ServerPdu::decode(&data)
+                        {
+                            heard.server_formats.push((version, formats));
+                        }
+                        let arrived = Instant::now();
+                        let send = |data| {
+                            commands_tx
+                                .try_send(reply(data))
+                                .expect("the command queue has room")
+                        };
+                        let events = output
+                            .process(&data)
+                            .expect("the VM's audio output message decodes");
+                        for event in events {
+                            match event {
+                                AudioOutputEvent::Send(data) => send(data),
+                                AudioOutputEvent::Negotiated(formats) => {
+                                    heard.negotiated.push((arrived, formats));
+                                }
+                                AudioOutputEvent::Block(block) => {
+                                    let elapsed = arrived.elapsed().as_millis() as u32;
+                                    send(output.confirm(block.confirm, elapsed));
+                                    heard.blocks.push((arrived, block.format, block.samples));
+                                    if on_static {
+                                        heard.static_blocks += 1;
+                                    } else {
+                                        heard.dynamic_blocks += 1;
                                     }
+                                    blocks.fetch_add(1, Ordering::SeqCst);
                                 }
+                                AudioOutputEvent::Dropped { confirm, reason } => {
+                                    send(output.confirm(confirm, 0));
+                                    heard.dropped.push(reason);
+                                }
+                                AudioOutputEvent::Closed => heard.closed += 1,
+                                AudioOutputEvent::Volume(_) => {}
                             }
-                            _ => {}
                         }
                     },
                     &mut commands,
@@ -2862,6 +2910,10 @@ mod tests {
 
             let heard = heard.lock().unwrap();
             let played = played.lock().unwrap().expect("the playback was typed");
+            eprintln!(
+                "{transport:?}: dynamic channel opened: {:?}",
+                heard.dynamic_channel
+            );
             let mut kinds = heard.msg_types.clone();
             kinds.sort_unstable();
             kinds.dedup();
@@ -2924,7 +2976,22 @@ mod tests {
                 .expect("the session ended within 240 s")
                 .expect("the session ran without a protocol failure");
             driven.expect("the sound was played and its blocks arrived");
-            assert!(heard.channel.is_some(), "the server opens AUDIO_PLAYBACK_DVC");
+            match transport {
+                AudioTransport::Dynamic => {
+                    assert!(
+                        heard.dynamic_channel.is_some(),
+                        "the server opens AUDIO_PLAYBACK_DVC"
+                    );
+                    assert_eq!(heard.static_blocks, 0, "no block comes on rdpsnd");
+                }
+                AudioTransport::Static { .. } => {
+                    assert!(
+                        heard.dynamic_channel.is_none(),
+                        "no dynamic audio channel is open on the static path"
+                    );
+                    assert_eq!(heard.dynamic_blocks, 0, "no block comes on a dynamic channel");
+                }
+            }
             let (_, negotiated) = heard.negotiated.last().expect("the server sent its formats");
             assert!(!negotiated.is_empty(), "the server offers PCM");
             assert!(total > 0, "PCM samples reach the host");
@@ -2941,6 +3008,51 @@ mod tests {
             }
         })
         .await
+    }
+
+    /// Real-VM acceptance for #386: a sound played in the session reaches the host as PCM over
+    /// `AUDIO_PLAYBACK_DVC`, through the audio output helper.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_sound_played_in_the_session_reaches_the_host_as_pcm_on_the_real_vm() {
+        hear_a_sound_played_in_the_session(AudioTransport::Dynamic).await;
+    }
+
+    /// Real-VM acceptance for #387: with `AUDIO_PLAYBACK_DVC` not registered, the server's Create
+    /// Request for it is refused and audio falls back to the static channel `rdpsnd`, requested
+    /// with no options beyond `INITIALIZED`. The same helper hears the same sound there.
+    #[tokio::test]
+    #[traced_test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_sound_falls_back_to_the_static_channel_when_the_dynamic_one_is_refused_on_the_real_vm()
+     {
+        hear_a_sound_played_in_the_session(AudioTransport::Static {
+            options: gcc::CHANNEL_OPTION_INITIALIZED,
+            with_drdynvc: true,
+        })
+        .await;
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("DYNVC create refused")
+                        && line.contains("name=\"AUDIO_PLAYBACK_DVC\"")
+                })
+                .then_some(())
+                .ok_or_else(|| "the server never asked for AUDIO_PLAYBACK_DVC first".to_string())
+        });
+    }
+
+    /// Real-VM measurement for #387: with no `drdynvc` requested, so the server has no dynamic
+    /// channel to try, audio comes on `rdpsnd` the same way.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_sound_reaches_the_host_over_the_static_channel_without_drdynvc_on_the_real_vm() {
+        hear_a_sound_played_in_the_session(AudioTransport::Static {
+            options: gcc::CHANNEL_OPTION_INITIALIZED,
+            with_drdynvc: false,
+        })
+        .await;
     }
 
     /// Issue #304's DoD ④: the logon notification actually reaches a host, against the real
