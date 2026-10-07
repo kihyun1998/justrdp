@@ -90,6 +90,7 @@ pub(crate) fn bit_len(bytes: usize) -> Option<usize> {
 }
 
 /// Real-server corpus capture (ADR-0011's harness half) — ungated, see the module doc.
+pub mod adpcm;
 pub mod capture;
 pub mod clearcodec;
 pub mod color;
