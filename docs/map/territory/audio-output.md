@@ -8,8 +8,8 @@ confirms each one once it has played it. `justrdp-pdu::rdpsnd` holds the PDUs,
 `justrdp::rdpsnd::AudioOutput` is a sans-IO helper the host drives, as the clipboard and device
 redirection helpers are. The helper does not care which transport carries the messages: the
 same bytes ride the static channel `rdpsnd` or the dynamic channel `AUDIO_PLAYBACK_DVC`
-(ADR-0018). Epic #11; #386 decodes PCM over the dynamic channel. The static channel is #387's,
-and A-law/µ-law and MS-ADPCM are #388's and #389's.
+(ADR-0018). Epic #11; #386 decodes PCM over the dynamic channel, and #387 proves the static
+channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM #389's.
 
 ## Governing decisions
 
@@ -69,8 +69,13 @@ and A-law/µ-law and MS-ADPCM are #388's and #389's.
   virtual channel; UDP and the lossy channel are #16's.
 - **8-bit PCM is unsigned around `0x80`, 16-bit PCM is signed little-endian.** Microsoft's
   documentation states the signedness, not the byte order. The byte order is measured below.
-- **A host that does not want audio** requests `rdpsnd` (which the server needs for `rdpdr`)
-  and registers no audio channel.
+- **Which transport carries audio is the server's, and the host's only lever is registering
+  `AUDIO_PLAYBACK_DVC`.** With it registered the server uses the dynamic channel; without it the
+  server's Create Request is refused and audio comes on `rdpsnd`. `rdpsnd` needs no channel
+  option beyond `INITIALIZED`, unlike `cliprdr` (#321). Either way the host feeds the same
+  `AudioOutput`.
+- **A host that does not want audio** requests `rdpsnd` (which the server needs for `rdpdr`),
+  registers no audio channel, and leaves `rdpsnd` unanswered.
 
 ## Code
 
@@ -88,8 +93,27 @@ and A-law/µ-law and MS-ADPCM are #388's and #389's.
 
 ## Reference behaviour
 
+**Measured against the WS2022 test VM (#387, 2026-10-07):**
+
+- **The server falls back to `rdpsnd` when `AUDIO_PLAYBACK_DVC` is refused.** With `rdpsnd`,
+  `rdpdr` and `drdynvc` requested and no audio channel registered, the server asked for
+  `AUDIO_PLAYBACK_DVC` twice in the run whose log was read, was refused both times, and then sent the same stream on `rdpsnd`:
+  the format list, four Training PDUs, 30 Wave2 PDUs of PCM 44.1 kHz stereo 16-bit, 491,520
+  samples, little-endian as on the dynamic channel
+  (`a_sound_falls_back_to_the_static_channel_when_the_dynamic_one_is_refused_on_the_real_vm`,
+  which asserts the refusal record). `[MS-RDPEA]` product note 11 says this of Windows 8 /
+  Server 2012; WS2022 does it too.
+- **Without `drdynvc` at all, audio comes on `rdpsnd` the same way**, the same 30 blocks
+  (`a_sound_reaches_the_host_over_the_static_channel_without_drdynvc_on_the_real_vm`).
+- **`rdpsnd` requested with `INITIALIZED` alone is answered**, so `CHANNEL_OPTION_SHOW_PROTOCOL`,
+  which `cliprdr` needs, was not tried.
+- This also settles #307's silent `rdpsnd`: that probe refused the dynamic channel too, but
+  played no sound, and the server sends nothing on either channel until a sound plays.
+
 **Measured against the WS2022 test VM (#386, 2026-10-07):**
 
+- **Each audio VM test also asserts the transport**: every block arrives on the channel its
+  mode names, and none on the other.
 - **The VM had no audio until its Windows Audio service ran.** `Audiosrv` and
   `AudioEndpointBuilder` were `Stopped`, the default on Windows Server, and the session's
   speaker icon was crossed out. `SoundPlayer.PlaySync()` returned at once and nothing arrived
@@ -135,8 +159,6 @@ and A-law/µ-law and MS-ADPCM are #388's and #389's.
 
 ## Known holes / open
 
-- **The static channel has not been driven** (#387): whether WS2022 falls back to `rdpsnd`
-  when `AUDIO_PLAYBACK_DVC` is refused is unmeasured.
 - **WaveInfo + Wave is proven against the spec's example only**: this server sent Wave2 in
   every block.
 - **Two strictnesses are unmeasured, because this server sent only Wave2.** A Wave PDU longer

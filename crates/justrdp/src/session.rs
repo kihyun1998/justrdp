@@ -4721,4 +4721,97 @@ mod tests {
             }]
         );
     }
+
+    /// Audio output's messages are the same bytes on both transports (#387). A server format
+    /// list (`[MS-RDPEA]` 4.1.1) and a Wave2 PDU longer than one static channel chunk and one
+    /// dynamic channel data PDU reach the host whole on `rdpsnd` and on `AUDIO_PLAYBACK_DVC`, and
+    /// one audio output helper answers each sequence the same way.
+    #[test]
+    fn audio_output_hears_the_same_messages_on_either_transport() {
+        use crate::rdpsnd::{AudioOutput, AudioOutputConfig, AudioOutputEvent};
+        const RDPSND: u16 = 1009;
+        let formats = hex_bytes(concat!(
+            "072b900008fb8b00e0f1090070271f7700000500ff050000010002002256000088580100040010000000",
+            "060002002256000044ac0000020008000000070002002256000044ac000002000800000002000200225600",
+            "0027570000000404002000f403070000010000000200ff00000000c0004000f0000000cc0130ff880118ff",
+            "1100020022560000b9560000000404000200f903",
+        ));
+        // A Wave2 in client format 0 (the server's PCM 22.05 kHz stereo 16-bit), 4000 bytes.
+        let sample: Vec<u8> = (0..4000u32).map(|i| (i * 7 % 256) as u8).collect();
+        let mut wave2 = vec![0x0d, 0x00];
+        wave2.extend_from_slice(&((12 + sample.len()) as u16).to_le_bytes());
+        wave2.extend_from_slice(&[0x16, 0xa1, 0x00, 0x00, 0x02, 0, 0, 0]);
+        wave2.extend_from_slice(&0x0DAC_B8C2u32.to_le_bytes());
+        wave2.extend_from_slice(&sample);
+        let messages = [formats, wave2];
+        assert!(svc::encode_chunks(&messages[1]).len() > 1);
+        assert!(dvc::encode_data(9, &messages[1]).len() > 1);
+
+        let mut config = config();
+        config.static_channels.push(crate::StaticChannel {
+            name: "rdpsnd".to_string(),
+            id: RDPSND,
+            options: 0,
+        });
+        config.dynamic_channels = vec![justrdp_pdu::rdpsnd::DVC_CHANNEL_NAME.to_string()];
+        let mut sm = SessionStateMachine::new(config, Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        for frame in server_dvc_frames(&[0x50, 0x00, 0x01, 0x00])
+            .into_iter()
+            .chain(server_dvc_create(9, justrdp_pdu::rdpsnd::DVC_CHANNEL_NAME))
+        {
+            sm.process_bytes(&frame).unwrap();
+        }
+
+        let mut on_static = Vec::new();
+        let mut on_dynamic = Vec::new();
+        for message in &messages {
+            for chunk in svc::encode_chunks(message) {
+                for output in sm
+                    .process_bytes(&server_channel_frame(RDPSND, &chunk))
+                    .unwrap()
+                {
+                    if let SessionOutput::ChannelData {
+                        channel: RDPSND,
+                        data,
+                    } = output
+                    {
+                        on_static.push(data);
+                    }
+                }
+            }
+            for output in feed_all(&mut sm, server_dvc_data(9, message)) {
+                if let SessionOutput::DynamicChannelData {
+                    channel_id: 9,
+                    data,
+                } = output
+                {
+                    on_dynamic.push(data);
+                }
+            }
+        }
+        assert_eq!(on_static, messages);
+        assert_eq!(on_dynamic, messages);
+
+        let answers = |received: &[Vec<u8>]| {
+            let mut output = AudioOutput::new(AudioOutputConfig::default()).unwrap();
+            received
+                .iter()
+                .flat_map(|message| output.process(message).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let from_static = answers(&on_static);
+        assert!(
+            matches!(from_static.last(), Some(AudioOutputEvent::Block(block)) if block.samples.len() == 2000),
+            "the Wave2 decodes to 2000 samples"
+        );
+        assert_eq!(from_static, answers(&on_dynamic));
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
 }
