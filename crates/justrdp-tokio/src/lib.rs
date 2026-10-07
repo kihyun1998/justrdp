@@ -2678,6 +2678,8 @@ mod tests {
             server_formats: Vec<(u16, Vec<AudioFormat>)>,
             blocks: Vec<(Instant, AudioFormat, Vec<i16>)>,
             static_blocks: usize,
+            /// Each Wave2's `wFormatNo` and sample, as sent.
+            wave2_samples: Vec<(u16, Vec<u8>)>,
             dynamic_blocks: usize,
             closed: usize,
             dropped: Vec<&'static str>,
@@ -2865,6 +2867,10 @@ mod tests {
                                 _ => return,
                             };
                         heard.msg_types.push(data.first().copied().unwrap_or(0));
+                        if data.first() == Some(&justrdp_pdu::rdpsnd::SNDC_WAVE2) && data.len() > 16 {
+                            let format_no = u16::from_le_bytes([data[6], data[7]]);
+                            heard.wave2_samples.push((format_no, data[16..].to_vec()));
+                        }
                         if data.first() == Some(&SNDC_FORMATS)
                             && let Ok(ServerPdu::Formats { version, formats, .. }) =
                                 ServerPdu::decode(&data)
@@ -2914,6 +2920,28 @@ mod tests {
             let driven = driver.await.expect("the driver task");
 
             let heard = heard.lock().unwrap();
+            // With JUSTRDP_AUDIO_CAPTURE_DIR set, the first three Wave2 samples that are not
+            // silence are written there as `<wFormatTag>_<nChannels>ch_<nBlockAlign>_<n>.bin`,
+            // with the format's `cbSize` extra beside each as `.extra`: the raw corpus behind
+            // `justrdp-codecs/tests/fixtures/adpcm/` (#389).
+            if let Ok(dir) = std::env::var("JUSTRDP_AUDIO_CAPTURE_DIR")
+                && let Some((_, negotiated)) = heard.negotiated.last()
+            {
+                let loud = heard.wave2_samples.iter().filter(|(_, sample)| {
+                    sample.iter().filter(|&&b| b != sample[0]).count() > sample.len() / 4
+                });
+                for (n, (format_no, sample)) in loud.take(3).enumerate() {
+                    let format = &negotiated[usize::from(*format_no)];
+                    let name = format!(
+                        "{:04x}_{}ch_{}_{n}.bin",
+                        format.format_tag, format.channels, format.block_align
+                    );
+                    let dir = std::path::Path::new(&dir);
+                    std::fs::write(dir.join(&name), sample).expect("write the audio capture");
+                    std::fs::write(dir.join(name.replace(".bin", ".extra")), &format.extra)
+                        .expect("write the format's extra");
+                }
+            }
             let played = played.lock().unwrap().expect("the playback was typed");
             eprintln!(
                 "{transport:?}: dynamic channel opened: {:?}",
@@ -3065,6 +3093,30 @@ mod tests {
                 .then_some(())
                 .ok_or_else(|| "the server never asked for AUDIO_PLAYBACK_DVC first".to_string())
         });
+    }
+
+    /// Real-VM acceptance for #389: a host that lists only MS-ADPCM has the server send it, and
+    /// the sound reaches the host decoded to i16.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_sound_reaches_the_host_in_ms_adpcm_when_the_host_takes_only_it_on_the_real_vm() {
+        hear_a_sound_played_in_the_session(
+            AudioTransport::Dynamic,
+            &[justrdp_pdu::rdpsnd::WAVE_FORMAT_ADPCM],
+        )
+        .await;
+    }
+
+    /// Real-VM acceptance for #389: a host that lists only IMA-ADPCM has the server send it, and
+    /// the sound reaches the host decoded to i16.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_sound_reaches_the_host_in_ima_adpcm_when_the_host_takes_only_it_on_the_real_vm() {
+        hear_a_sound_played_in_the_session(
+            AudioTransport::Dynamic,
+            &[justrdp_pdu::rdpsnd::WAVE_FORMAT_DVI_ADPCM],
+        )
+        .await;
     }
 
     /// Real-VM acceptance for #388: a host that lists only A-law has the server send A-law, and

@@ -11,11 +11,12 @@
 //! copied as the server sent it, so the client list is always a subset of the server's
 //! (2.2.2.2).
 
+use justrdp_codecs::adpcm::{ImaAdpcm, MsAdpcm};
 use justrdp_codecs::{g711, pcm};
 use justrdp_pdu::DecodeError;
 use justrdp_pdu::rdpsnd::{
     self as pdu, AudioFormat, ClientFormats, ServerPdu, TSSNDCAPS_ALIVE, TSSNDCAPS_VOLUME,
-    WAVE_FORMAT_ALAW, WAVE_FORMAT_PCM,
+    WAVE_FORMAT_ADPCM, WAVE_FORMAT_ALAW, WAVE_FORMAT_DVI_ADPCM, WAVE_FORMAT_PCM,
 };
 
 /// The `wVersion` this helper implements and so advertises: Windows 8 and later's, which brings
@@ -26,20 +27,57 @@ pub const CLIENT_VERSION: u16 = 0x0008;
 const QUALITY_MODE_FROM: u16 = 0x0006;
 
 /// The `wFormatTag`s the core decodes.
-pub const DECODABLE_FORMAT_TAGS: &[u16] = &[WAVE_FORMAT_PCM, WAVE_FORMAT_ALAW];
+pub const DECODABLE_FORMAT_TAGS: &[u16] = &[
+    WAVE_FORMAT_PCM,
+    WAVE_FORMAT_ALAW,
+    WAVE_FORMAT_ADPCM,
+    WAVE_FORMAT_DVI_ADPCM,
+];
 
-/// Whether the core decodes samples in `format`: PCM at 8 or 16 bits or A-law at 8, with at
-/// least one channel and a block that is exactly one frame of them.
-fn decodable(format: &AudioFormat) -> bool {
-    let depth = match format.format_tag {
-        WAVE_FORMAT_PCM => matches!(format.bits_per_sample, 8 | 16),
-        WAVE_FORMAT_ALAW => format.bits_per_sample == 8,
-        _ => false,
-    };
-    depth
-        && format.channels > 0
-        && u32::from(format.block_align)
-            == u32::from(format.channels) * u32::from(format.bits_per_sample / 8)
+/// How the samples of one client format decode.
+#[derive(Debug, Clone)]
+enum Decoder {
+    /// Linear PCM at this many bits.
+    Pcm(u16),
+    /// G.711 A-law.
+    Alaw,
+    /// Microsoft ADPCM.
+    Ms(MsAdpcm),
+    /// IMA ADPCM.
+    Ima(ImaAdpcm),
+}
+
+impl Decoder {
+    /// The decoder for `format`, or `None` when the core does not decode it. PCM at 8 or 16
+    /// bits and A-law at 8 need at least one channel and a block of exactly one frame; the
+    /// ADPCM formats need 4 bits and a `cbSize` extra that agrees with their block size.
+    fn for_format(format: &AudioFormat) -> Option<Self> {
+        let one_frame = format.channels > 0
+            && u32::from(format.block_align)
+                == u32::from(format.channels) * u32::from(format.bits_per_sample / 8);
+        let (channels, block_align, extra) = (format.channels, format.block_align, &format.extra);
+        match (format.format_tag, format.bits_per_sample) {
+            (WAVE_FORMAT_PCM, bits @ (8 | 16)) if one_frame => Some(Decoder::Pcm(bits)),
+            (WAVE_FORMAT_ALAW, 8) if one_frame => Some(Decoder::Alaw),
+            (WAVE_FORMAT_ADPCM, 4) => MsAdpcm::new(channels, block_align, extra)
+                .ok()
+                .map(Decoder::Ms),
+            (WAVE_FORMAT_DVI_ADPCM, 4) => ImaAdpcm::new(channels, block_align, extra)
+                .ok()
+                .map(Decoder::Ima),
+            _ => None,
+        }
+    }
+
+    /// The samples `data` decodes to, or `None` when it is not whole blocks of this format.
+    fn decode(&self, data: &[u8]) -> Option<Vec<i16>> {
+        match self {
+            Decoder::Pcm(bits) => pcm::decode(*bits, data).ok(),
+            Decoder::Alaw => Some(g711::decode_alaw(data)),
+            Decoder::Ms(ms) => ms.decode(data).ok(),
+            Decoder::Ima(ima) => ima.decode(data).ok(),
+        }
+    }
 }
 
 /// The Quality Mode PDU's `wQualityMode` (2.2.2.3). What each means is the server's.
@@ -171,8 +209,8 @@ pub enum AudioOutputEvent {
 #[derive(Debug, Clone)]
 pub struct AudioOutput {
     config: AudioOutputConfig,
-    /// The formats this side sent, indexed by `wFormatNo`.
-    client_formats: Vec<AudioFormat>,
+    /// The formats this side sent, indexed by `wFormatNo`, each with its decoder.
+    client_formats: Vec<(AudioFormat, Decoder)>,
     /// The WaveInfo PDU whose Wave PDU is the next message.
     pending_wave: Option<pdu::WaveInfo>,
 }
@@ -278,13 +316,11 @@ impl AudioOutput {
             .config
             .format_tags
             .iter()
-            .flat_map(|tag| {
-                server_formats
-                    .iter()
-                    .filter(move |f| f.format_tag == *tag && decodable(f))
-            })
-            .cloned()
+            .flat_map(|tag| server_formats.iter().filter(move |f| f.format_tag == *tag))
+            .filter_map(|f| Decoder::for_format(f).map(|decoder| (f.clone(), decoder)))
             .collect();
+        let formats: Vec<AudioFormat> =
+            self.client_formats.iter().map(|(f, _)| f.clone()).collect();
         tracing::debug!(
             target: "rdp_rdpsnd",
             server_version,
@@ -304,7 +340,7 @@ impl AudioOutput {
                 volume: self.config.volume.unwrap_or(0),
                 pitch: 0,
                 version: CLIENT_VERSION,
-                formats: self.client_formats.clone(),
+                formats: formats.clone(),
             },
         ))];
         if server_version >= QUALITY_MODE_FROM {
@@ -312,30 +348,26 @@ impl AudioOutput {
                 self.config.quality_mode.wire(),
             )));
         }
-        events.push(AudioOutputEvent::Negotiated(self.client_formats.clone()));
+        events.push(AudioOutputEvent::Negotiated(formats));
         events
     }
 
-    /// Decode one sample sent in client format `format_no`, or drop it. Every client format is
-    /// [`decodable`], so its `block_align` is not zero.
+    /// Decode one sample sent in client format `format_no`, or drop it. Every client format has
+    /// a decoder, so its `block_align` is not zero.
     fn block(&self, format_no: u16, confirm: WaveConfirm, data: &[u8]) -> AudioOutputEvent {
-        let Some(format) = self.client_formats.get(usize::from(format_no)) else {
+        let Some((format, decoder)) = self.client_formats.get(usize::from(format_no)) else {
             return dropped(confirm, "wFormatNo names no format in the client's list");
         };
         if !data.len().is_multiple_of(usize::from(format.block_align)) {
-            return dropped(confirm, "the sample is not a whole number of frames");
+            return dropped(confirm, "the sample is not a whole number of blocks");
         }
-        let samples = match format.format_tag {
-            WAVE_FORMAT_ALAW => Ok(g711::decode_alaw(data)),
-            _ => pcm::decode(format.bits_per_sample, data),
-        };
-        match samples {
-            Ok(samples) => AudioOutputEvent::Block(AudioBlock {
+        match decoder.decode(data) {
+            Some(samples) => AudioOutputEvent::Block(AudioBlock {
                 format: format.clone(),
                 samples,
                 confirm,
             }),
-            Err(_) => dropped(confirm, "the sample is not audio the core decodes"),
+            None => dropped(confirm, "the sample is not audio the core decodes"),
         }
     }
 }
@@ -770,6 +802,99 @@ mod tests {
         };
         assert_eq!(block.format, alaw);
         assert_eq!(block.samples, [8, -8, 32256, -32256]);
+    }
+
+    /// `[MS-RDPEA]` 4.1.1's server format list, whose MS-ADPCM and IMA-ADPCM entries are the
+    /// shapes WS2022 offers: `nBlockAlign` 1024 stereo, 1012 and 1017 samples per block.
+    fn spec_server_formats() -> Vec<u8> {
+        const HEX: &str = concat!(
+            "072b900008fb8b00e0f1090070271f7700000500ff050000010002002256000088580100040010000000",
+            "060002002256000044ac0000020008000000070002002256000044ac000002000800000002000200225600",
+            "0027570000000404002000f403070000010000000200ff00000000c0004000f0000000cc0130ff880118ff",
+            "1100020022560000b9560000000404000200f903",
+        );
+        (0..HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&HEX[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A host listing IMA-ADPCM and then MS-ADPCM gets the server's ADPCM formats in that order,
+    /// and a sample of whole blocks decodes to the samples each block declares (#389).
+    #[test]
+    fn a_host_listing_adpcm_negotiates_and_decodes_it() {
+        let mut output = AudioOutput::new(AudioOutputConfig {
+            format_tags: vec![pdu::WAVE_FORMAT_DVI_ADPCM, pdu::WAVE_FORMAT_ADPCM],
+            ..AudioOutputConfig::default()
+        })
+        .unwrap();
+        let events = output.process(&spec_server_formats()).unwrap();
+        let Some(AudioOutputEvent::Negotiated(formats)) = events.last() else {
+            panic!("{events:?}");
+        };
+        let tags: Vec<u16> = formats.iter().map(|f| f.format_tag).collect();
+        assert_eq!(tags, [pdu::WAVE_FORMAT_DVI_ADPCM, pdu::WAVE_FORMAT_ADPCM]);
+
+        // Two IMA blocks whose header samples are 0x0102 (left) and -2 (right), all nibbles zero.
+        let mut ima = vec![0u8; 2048];
+        for block in ima.as_chunks_mut::<1024>().0 {
+            block[..8].copy_from_slice(&[0x02, 0x01, 0, 0, 0xFE, 0xFF, 0, 0]);
+        }
+        let events = output.process(&wave2(0, 0, 1, &ima)).unwrap();
+        let [AudioOutputEvent::Block(block)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(block.samples.len(), 2 * 2 * 1017);
+        assert_eq!(&block.samples[..2], &[0x0102, -2]);
+
+        // One MS-ADPCM block: predictor 0, its two samples 5 then 7 on the left, 0 on the right.
+        let mut ms = vec![0u8; 1024];
+        ms[..14].copy_from_slice(&[0, 0, 16, 0, 16, 0, 7, 0, 0, 0, 5, 0, 0, 0]);
+        let events = output.process(&wave2(0, 1, 2, &ms)).unwrap();
+        let [AudioOutputEvent::Block(block)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(block.samples.len(), 2 * 1012);
+        assert_eq!(&block.samples[..4], &[5, 0, 7, 0]);
+    }
+
+    /// An ADPCM format at a depth other than 4 bits is not offered, its extra notwithstanding.
+    #[test]
+    fn an_adpcm_format_at_another_depth_is_not_offered() {
+        let mut formats = spec_server_formats();
+        // IMA's wBitsPerSample, six bytes before the list's end: 4 becomes 8.
+        let at = formats.len() - 6;
+        assert_eq!(formats[at], 4);
+        formats[at] = 8;
+        let mut output = AudioOutput::new(AudioOutputConfig {
+            format_tags: vec![pdu::WAVE_FORMAT_DVI_ADPCM],
+            ..AudioOutputConfig::default()
+        })
+        .unwrap();
+        let events = output.process(&formats).unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&AudioOutputEvent::Negotiated(Vec::new()))
+        );
+    }
+
+    /// An ADPCM format whose extra disagrees with its block size is not offered.
+    #[test]
+    fn an_adpcm_format_with_a_bad_extra_is_not_offered() {
+        let mut formats = spec_server_formats();
+        // IMA's wSamplesPerBlock, the list's last two bytes: 1017 becomes 1016.
+        let at = formats.len() - 2;
+        formats[at] = 0xf8;
+        let mut output = AudioOutput::new(AudioOutputConfig {
+            format_tags: vec![pdu::WAVE_FORMAT_DVI_ADPCM],
+            ..AudioOutputConfig::default()
+        })
+        .unwrap();
+        let events = output.process(&formats).unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&AudioOutputEvent::Negotiated(Vec::new()))
+        );
     }
 
     /// The host may list only formats the core decodes.

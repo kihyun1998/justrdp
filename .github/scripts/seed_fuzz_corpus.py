@@ -260,12 +260,64 @@ def seed_mcs(out_dir):
     return _seed_connect(out_dir, "connect-response.bin", MCS_ARMS, "connect-response")
 
 
+def seed_rdpsnd(out_dir):
+    """Seed `rdpsnd` from the ADPCM fixtures (#389): one input per fixture case.
+
+    The target splits its input into messages, each a `u16` little-endian length and that many
+    bytes, and feeds them to one audio output helper that takes every format the core decodes.
+    A seed is a server format list naming the case's format, then the case's blocks as one
+    Wave2 PDU in that format. Without it a mutator must assemble a format whose
+    `wSamplesPerBlock` matches its block size before any ADPCM byte is decoded.
+    """
+    fixtures = REPO / "crates/justrdp-codecs/tests/fixtures/adpcm"
+    if not fixtures.is_dir():
+        print(f"::error::seed fixtures missing: {fixtures.relative_to(REPO)}")
+        return None
+    standard = [(256, 0), (512, -256), (0, 0), (192, 64), (240, 0), (460, -208), (392, -232)]
+
+    def ms_extra(spb):
+        out = struct.pack("<HH", spb, len(standard))
+        return out + b"".join(struct.pack("<hh", a, b) for a, b in standard)
+
+    def audio_format(tag, channels, block_align, extra):
+        return struct.pack("<HHIIHHH", tag, channels, 44100, 0, block_align, 4, len(extra)) + extra
+
+    def message(body):
+        return struct.pack("<H", len(body)) + body
+
+    written = 0
+    for path in sorted(fixtures.glob("*.adpcm")):
+        name = path.stem
+        channels = 2 if "_stereo_" in name else 1
+        block_align = 1024 if "_vm_" in name else 256 * channels
+        if name.startswith("ms_"):
+            tag = 0x0002
+            extra = (fixtures / "ms_mono_vm.extra").read_bytes() if "_vm_" in name else ms_extra(
+                (block_align - 7 * channels) * 2 // channels + 2
+            )
+        else:
+            tag = 0x0011
+            extra = (fixtures / "ima_mono_vm.extra").read_bytes() if "_vm_" in name else struct.pack(
+                "<H", (block_align - 4 * channels) * 2 // channels + 1
+            )
+        fmt = audio_format(tag, channels, block_align, extra)
+        formats_body = struct.pack("<IIIHHBHB", 0, 0, 0, 0, 1, 0, 8, 0) + fmt
+        formats = struct.pack("<BBH", 0x07, 0, len(formats_body)) + formats_body
+        data = path.read_bytes()
+        wave2_body = struct.pack("<HHB3xI", 0, 0, 1, 0) + data
+        wave2 = struct.pack("<BBH", 0x0D, 0, len(wave2_body)) + wave2_body
+        (out_dir / f"seed-{name}").write_bytes(message(formats) + message(wave2))
+        written += 1
+    return written
+
+
 SEEDERS = {
     "progressive": seed_progressive,
     "progressive_assembly": seed_progressive_assembly,
     "progressive_srl": seed_progressive_srl,
     "gcc": seed_gcc,
     "mcs": seed_mcs,
+    "rdpsnd": seed_rdpsnd,
 }
 
 

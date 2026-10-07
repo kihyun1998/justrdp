@@ -52,6 +52,8 @@ pub const WAVE_FORMAT_ADPCM: u16 = 0x0002;
 pub const WAVE_FORMAT_ALAW: u16 = 0x0006;
 /// `WAVE_FORMAT_MULAW`.
 pub const WAVE_FORMAT_MULAW: u16 = 0x0007;
+/// `WAVE_FORMAT_DVI_ADPCM` (IMA ADPCM).
+pub const WAVE_FORMAT_DVI_ADPCM: u16 = 0x0011;
 
 /// The size of the fixed part of an Audio Formats and Version PDU body.
 const FORMATS_FIXED_SIZE: usize = 20;

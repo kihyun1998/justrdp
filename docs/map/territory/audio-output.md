@@ -4,13 +4,13 @@
 
 The audio output channel (`[MS-RDPEA]`): the server sends audio samples and the client
 confirms each one once it has played it. `justrdp-pdu::rdpsnd` holds the PDUs,
-`justrdp-codecs::pcm` turns linear PCM and `justrdp-codecs::g711` A-law into signed 16-bit
-samples, and
+`justrdp-codecs::pcm` turns linear PCM, `justrdp-codecs::g711` A-law and
+`justrdp-codecs::adpcm` Microsoft and IMA ADPCM into signed 16-bit samples, and
 `justrdp::rdpsnd::AudioOutput` is a sans-IO helper the host drives, as the clipboard and device
 redirection helpers are. The helper does not care which transport carries the messages: the
 same bytes ride the static channel `rdpsnd` or the dynamic channel `AUDIO_PLAYBACK_DVC`
 (ADR-0018). Epic #11; #386 decodes PCM over the dynamic channel, and #387 proves the static
-channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM #389's.
+channel and the server's fallback to it. #388 adds A-law, #389 MS-ADPCM and IMA-ADPCM.
 
 ## Governing decisions
 
@@ -31,7 +31,9 @@ channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM
   server's list with every server format of those tags **that the core decodes**, in the
   host's tag order and the server's order within a tag, copied as the server sent it. For PCM
   that is 8 or 16 bits, for A-law 8 (#388); for both, at least one channel and an
-  `nBlockAlign` of exactly one frame, so a
+  `nBlockAlign` of exactly one frame. For MS-ADPCM and IMA-ADPCM it is 4 bits, one or two
+  channels, and a `cbSize` extra whose `wSamplesPerBlock` is what `nBlockAlign` holds (#389).
+  Each client format is paired with its decoder at negotiation, so a
   block always holds whole frames of `channels` samples (#386's review: the tag alone let
   24-bit PCM and a half-frame `nBlockAlign` through). So the client list is a subset of the server's,
   as 2.2.2.2 requires, `cbSize` data included. This shape was confirmed by the maintainer
@@ -75,6 +77,20 @@ channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM
   in 13-bit units scaled to 16 bits. The even-bit inversion the decoder undoes is read from
   G.711's own text (Note 2 of Table 1a, cited by the notes to Tables 3 and 4). That oracle
   was the maintainer's call (2026-10-07).
+- **ADPCM decodes block by block**, each block's per-channel header restarting the predictor,
+  so a Wave carries whole blocks and nothing passes between them (#389). Three choices
+  diverge from FreeRDP, the oracle, and are **derivations**:
+  - **An IMA block's header sample is its first sample.** WS2022 declares `wSamplesPerBlock`
+    1017 at `nBlockAlign` 1024 stereo and 2041 at 1024 mono, one more per channel than the
+    nibbles hold; FreeRDP's `freerdp_dsp_decode_ima_adpcm` emits only the nibbles, so it loses
+    one sample per channel per block. CPython's `audioop.adpcm2lin` agrees with this decoder.
+    FreeRDP's drop is on the FreeRDP defect ledger, #398.
+  - **MS-ADPCM takes its coefficients from the format's extra**, which carries them;
+    FreeRDP uses the seven standard pairs whatever the server sent. WS2022 sends those seven,
+    so the two agree on every block measured.
+  - **The MS-ADPCM step is capped at `i32::MAX / 768`**, ffmpeg's bound, and the prediction is
+    computed in `i64`. FreeRDP's `INT32` arithmetic overflows, which C leaves undefined, once a
+    hostile stream grows the step; a real encoder's step stays far below the cap.
 - **8-bit PCM is unsigned around `0x80`, 16-bit PCM is signed little-endian.** Microsoft's
   documentation states the signedness, not the byte order. The byte order is measured below.
 - **Which transport carries audio is the server's, and the host's only lever is registering
@@ -92,15 +108,32 @@ channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM
   `encode_wave_confirm`, `CHANNEL_NAME`, `DVC_CHANNEL_NAME`
 - `justrdp-codecs/src/pcm.rs` — `decode`, `PcmError`
 - `justrdp-codecs/src/g711.rs` — `alaw_to_i16`, `decode_alaw`
+- `justrdp-codecs/src/adpcm.rs` — `MsAdpcm`, `ImaAdpcm`, `AdpcmError`
+- `justrdp-codecs/tests/adpcm_oracle.rs` and `justrdp-codecs/tests/fixtures/adpcm/` — the FreeRDP oracle on
+  generated blocks and on WS2022's own (the directory's README says how they were made)
 - `justrdp/src/rdpsnd.rs` — `AudioOutput`, `AudioOutputConfig`, `AudioOutputConfigError`,
   `AudioOutputEvent`, `AudioBlock`, `WaveConfirm`, `QualityMode`, `CLIENT_VERSION`,
   `DECODABLE_FORMAT_TAGS`
-- `fuzz/fuzz_targets/rdpsnd.rs` — the PDU parser and the helper over split input
+- `fuzz/fuzz_targets/rdpsnd.rs` — the PDU parser and the helper over split input, seeded from
+  the ADPCM fixtures by `.github/scripts/seed_fuzz_corpus.py` so every decoder is reached (#389)
 - Spec sections cited inline: `[MS-RDPEA]` 2.1, 2.2.1, 2.2.2.1, 2.2.2.1.1, 2.2.2.2, 2.2.2.3,
   2.2.3.1–2.2.3.4, 2.2.3.8–2.2.3.10, 2.2.4.1, 2.2.4.2, 3.1.1.2, 3.2.5.1.1.2, 3.2.5.2.1.6,
   section 4 (the annotated examples the PDU tests decode byte for byte)
 
 ## Reference behaviour
+
+**Measured against the WS2022 test VM (#389, 2026-10-07):**
+
+- **A host listing only MS-ADPCM, or only IMA-ADPCM, gets it.** Of the eight formats of each
+  that it took, in the server's order with 44.1 kHz stereo first, the server sent **44.1 kHz
+  mono**: the server does not simply take the client list's first format. The same sound came
+  as 30 Wave2 blocks: 244,320 samples (MS) and 244,920 (IMA), the 5.5 s of the PCM run
+  (`a_sound_reaches_the_host_in_{ms,ima}_adpcm_when_the_host_takes_only_it_on_the_real_vm`).
+  Read as sent, the decoded samples step 155.8 (MS) and 153.5 (IMA) against 17,746.5 and
+  17,884.0 byte-swapped.
+- **The extras**: MS-ADPCM 44.1 kHz mono declares 2036 samples per 1024-byte block and the
+  seven standard coefficient pairs; IMA declares 2041. The captured MS blocks use predictors 0
+  and 6, so the real-server corpus exercises a non-trivial coefficient pair.
 
 **Measured against the WS2022 test VM (#388, 2026-10-07):**
 
@@ -185,7 +218,10 @@ channel and the server's fallback to it. A-law is #388's, MS-ADPCM and IMA-ADPCM
   than its WaveInfo announced is dropped, where FreeRDP and IronRDP take the announced length;
   and a WaveInfo followed by anything but its Wave loses that message, which the spec rules out
   (the PDU after a WaveInfo MUST be a Wave). ADR-0009 §3(a) allows both.
-- **PCM and A-law decode.** MS-ADPCM and IMA-ADPCM are #389. Measuring this
+- **PCM, A-law, MS-ADPCM and IMA-ADPCM decode.** GSM 6.10 and AAC, which the server also
+  offers, do not (AAC is #21's decoder-backend question).
+- **ADPCM with more than two channels is refused**: the oracles cover one and two, and the
+  server offers no more. Measuring this
   server's list re-planned both (the maintainer's calls, 2026-10-07): IMA-ADPCM, which epic #11
   had dropped on product note 4, joined #389, and µ-law, which this server does not offer, left
   #388.
