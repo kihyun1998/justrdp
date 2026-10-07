@@ -31,6 +31,8 @@ property of the whole untrusted surface.
 - [Audio output](../territory/audio-output.md) — every audio message is server-supplied,
   and a WaveInfo's `BodySize` announces the next message's length; `ServerPdu::decode` has a
   proptest and a fuzz target that also drives the helper and the PCM conversion (#386).
+- [Audio input](../territory/audio-input.md) — every audio input message is server-supplied;
+  `ServerPdu::decode` has a proptest and a fuzz target that also drives the helper (#401).
 - [Device redirection](../territory/device-redirection.md) — every `rdpdr` message is
   server-supplied; `RdpdrPdu::decode` has a fuzz target and a proptest (#336).
 - [Virtual channels](../territory/virtual-channels.md) — chunk reassembly lengths.

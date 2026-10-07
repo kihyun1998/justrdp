@@ -26,6 +26,7 @@ Since #385 the same seam exists for dynamic channels the host registers (ADR-001
 - [ADR-0018](../../adr/0018-host-terminated-dynamic-channels.md) — a host may register dynamic
   channel names, whose messages reach it as a static channel's do; one transport-indifferent
   helper serves a protocol on both (audio output: `RDPSND` and `AUDIO_PLAYBACK_DVC`, epic #11).
+  Audio input's `AUDIO_INPUT` is dynamic only (#401).
 
 Adjacent but not governing: `GLOSSARY.md` defines **Virtual Channel** in the
 glossary, which is vocabulary rather than a decision.
@@ -701,13 +702,16 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
 - [Device redirection](device-redirection.md) — the `rdpdr` helper rides the static channel
   seam, and follows the clipboard helper's shape.
 - [Audio output](audio-output.md) — the first helper on the host dynamic channel seam.
+- [Audio input](audio-input.md) — the first helper that sends on the seam unprompted: a
+  Data PDU for every packet the host's samples fill.
 
 ## Known holes / open
 
-- **These redirection features are unopened channels**: audio input (#12), RemoteApp (#14),
+- **These redirection features are unopened channels**: RemoteApp (#14),
   multitouch (#15), video (#17), camera (#19), location (#20). The transport exists; the
   consumers do not. Drives have been redirected since #336–#340 (printers, smartcards, serial
-  ports and USB have not), and audio output plays since #386. The clipboard (#10) moves text since #322, images since #323,
+  ports and USB have not), audio output plays since #386, and audio input runs against the
+  spec since #401 with no real server yet (#404). The clipboard (#10) moves text since #322, images since #323,
   server files to the host since #324, and host files to the server since #325.
 - ~~Static channel 1004 traffic is ignored by the session loop with no record of what
   it contains.~~ **Closed in #307**: 1004 is `cliprdr`, and a granted channel's messages
@@ -727,5 +731,5 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   `close_dynamic_channel` is still proven by unit tests only.
 - **A multi-chunk `drdynvc` message we send has never been proven live**, with or without
   `CHANNEL_FLAG_SHOW_PROTOCOL`: no VM test sends a DVC message over one chunk. Since #338 it
-  goes unflagged, as FreeRDP sends it. The first slice that sends a large DVC message (audio
-  input, camera) proves it.
+  goes unflagged, as FreeRDP sends it. The first slice that sends a large DVC message proves
+  it: audio input's Data PDUs are over one chunk at ordinary rates, so #404 is first in line.

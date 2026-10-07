@@ -82,7 +82,7 @@ pub struct AudioFormat {
 }
 
 impl AudioFormat {
-    fn decode(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+    pub(crate) fn decode(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
         let format_tag = cur.read_u16_le()?;
         let channels = cur.read_u16_le()?;
         let samples_per_sec = cur.read_u32_le()?;
@@ -102,7 +102,7 @@ impl AudioFormat {
         })
     }
 
-    fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.format_tag.to_le_bytes());
         out.extend_from_slice(&self.channels.to_le_bytes());
         out.extend_from_slice(&self.samples_per_sec.to_le_bytes());
@@ -114,7 +114,7 @@ impl AudioFormat {
     }
 
     /// The bytes this format takes on the wire.
-    fn encoded_len(&self) -> usize {
+    pub(crate) fn encoded_len(&self) -> usize {
         AUDIO_FORMAT_FIXED_SIZE + self.extra.len()
     }
 }

@@ -128,6 +128,7 @@ Territories: [x224-negotiation](territory/x224-negotiation.md) ·
 [virtual-channels](territory/virtual-channels.md) ·
 [device-redirection](territory/device-redirection.md) ·
 [audio-output](territory/audio-output.md) ·
+[audio-input](territory/audio-input.md) ·
 [wire-framing](territory/wire-framing.md) ·
 [pdu-constants](territory/pdu-constants.md) ·
 [adapter-drive-loop](territory/adapter-drive-loop.md) ·
