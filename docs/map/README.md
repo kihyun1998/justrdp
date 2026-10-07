@@ -57,7 +57,7 @@ a recurrence test.
 - **Only `.md` files in this repo are nodes.** Issues, epics and source files are
   *text inside* notes, never nodes — so the graph cannot show you the hottest things
   in this repo (epics #10–#29, #45, #158) as first-class objects.
-- **The verified external-fact store covers 9 territories of 20** (re-derived in #150). `## Reference
+- **The verified external-fact store covers 10 territories of 21** (re-derived in #386). `## Reference
   behaviour` reads `**None.**` in the other **11** — derived by the `rg` command under
   *Conventions*, not counted by hand. ADR-0003's byte-exactness ranking and ADR-0009's
   receive-path posture both depend on exactly that comparison, so this remains the map's
@@ -127,6 +127,7 @@ Territories: [x224-negotiation](territory/x224-negotiation.md) ·
 [input-scancodes](territory/input-scancodes.md) ·
 [virtual-channels](territory/virtual-channels.md) ·
 [device-redirection](territory/device-redirection.md) ·
+[audio-output](territory/audio-output.md) ·
 [wire-framing](territory/wire-framing.md) ·
 [pdu-constants](territory/pdu-constants.md) ·
 [adapter-drive-loop](territory/adapter-drive-loop.md) ·

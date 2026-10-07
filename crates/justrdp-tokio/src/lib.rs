@@ -2637,6 +2637,312 @@ mod tests {
         .await;
     }
 
+    /// Real-VM acceptance for #386: a sound played in the session reaches the host as PCM over
+    /// `AUDIO_PLAYBACK_DVC`, through the audio output helper. PowerShell plays the first stock
+    /// `%windir%\Media\*.wav` with `System.Media.SoundPlayer`; the server is silent on the
+    /// channel until then (#385). The run records the server's format list, the format it sent
+    /// in, which PDUs carried the samples (WaveInfo + Wave or Wave2), when the format list came
+    /// relative to the playback, and whether the 16-bit samples read smoother little-endian than
+    /// byte-swapped, which is what a little-endian stream of real audio does.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_sound_played_in_the_session_reaches_the_host_as_pcm_on_the_real_vm() {
+        use justrdp::rdpsnd::{AudioOutput, AudioOutputConfig, AudioOutputEvent};
+        use justrdp_pdu::rdpsnd::{AudioFormat, DVC_CHANNEL_NAME, SNDC_FORMATS, ServerPdu};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        const PLAY: &str = "(New-Object Media.SoundPlayer \
+                            (Get-ChildItem $env:windir\\Media\\*.wav)[0].FullName).PlaySync()";
+
+        #[derive(Default)]
+        struct Heard {
+            channel: Option<u32>,
+            msg_types: Vec<u8>,
+            negotiated: Vec<(Instant, Vec<AudioFormat>)>,
+            server_formats: Vec<(u16, Vec<AudioFormat>)>,
+            blocks: Vec<(Instant, AudioFormat, Vec<i16>)>,
+            closed: usize,
+            dropped: Vec<&'static str>,
+        }
+
+        with_vm_session(|vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = ["rdpsnd", "rdpdr", "drdynvc"]
+                .iter()
+                .map(|name| gcc::ChannelDef::new(name, gcc::CHANNEL_OPTION_INITIALIZED).unwrap())
+                .collect();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let mut session_config = session_config_from(&outcome, session_capabilities);
+            session_config.dynamic_channels = vec![DVC_CHANNEL_NAME.to_string()];
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(256);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let heard = Arc::new(Mutex::new(Heard::default()));
+            let blocks = Arc::new(AtomicUsize::new(0));
+            let played = Arc::new(Mutex::new(None::<Instant>));
+            let mut output =
+                AudioOutput::new(AudioOutputConfig::default()).expect("PCM is decodable");
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let driver = {
+                let (frames, cancel, blocks, played) =
+                    (frames.clone(), cancel.clone(), blocks.clone(), played.clone());
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        let enter = {
+                            let key = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
+                            vec![key.press(), key.release()]
+                        };
+                        let type_line = |line: &str| {
+                            let (input_tx, enter, units) = (
+                                input_tx.clone(),
+                                enter.clone(),
+                                line.encode_utf16().collect::<Vec<_>>(),
+                            );
+                            async move {
+                                for unit in units {
+                                    input_tx
+                                        .send(vec![
+                                            InputEvent::Unicode {
+                                                code_unit: unit,
+                                                release: false,
+                                            },
+                                            InputEvent::Unicode {
+                                                code_unit: unit,
+                                                release: true,
+                                            },
+                                        ])
+                                        .await
+                                        .map_err(|_| "the session closed".to_string())?;
+                                    tokio::time::sleep(Duration::from_millis(15)).await;
+                                }
+                                input_tx
+                                    .send(enter)
+                                    .await
+                                    .map_err(|_| "the session closed".to_string())
+                            }
+                        };
+
+                        vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        *played.lock().unwrap() = Some(Instant::now());
+                        type_line(PLAY).await?;
+                        // The sound has played once blocks stop arriving for three seconds.
+                        let start = tokio::time::Instant::now();
+                        let mut last = (0, tokio::time::Instant::now());
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            let now = blocks.load(Ordering::SeqCst);
+                            if now != last.0 {
+                                last = (now, tokio::time::Instant::now());
+                            } else if now > 0 && last.1.elapsed() > Duration::from_secs(3) {
+                                break;
+                            }
+                            if start.elapsed() > Duration::from_secs(60) {
+                                return Err(format!(
+                                    "{now} audio blocks reached the host within 60 s of the playback"
+                                ));
+                            }
+                        }
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        Ok(())
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let frames_in_sink = frames.clone();
+            let heard_in_sink = heard.clone();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(240),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| {
+                        let mut heard = heard_in_sink.lock().unwrap();
+                        match event {
+                            SessionEvent::DynamicChannelOpened { name, channel_id }
+                                if name == DVC_CHANNEL_NAME =>
+                            {
+                                heard.channel = Some(channel_id);
+                            }
+                            SessionEvent::DynamicChannelData { channel_id, data }
+                                if Some(channel_id) == heard.channel =>
+                            {
+                                heard.msg_types.push(data.first().copied().unwrap_or(0));
+                                if data.first() == Some(&SNDC_FORMATS)
+                                    && let Ok(ServerPdu::Formats { version, formats, .. }) =
+                                        ServerPdu::decode(&data)
+                                {
+                                    heard.server_formats.push((version, formats));
+                                }
+                                let arrived = Instant::now();
+                                let events = output
+                                    .process(&data)
+                                    .expect("the VM's audio output message decodes");
+                                for event in events {
+                                    match event {
+                                        AudioOutputEvent::Send(data) => commands_tx
+                                            .try_send(SessionCommand::DynamicChannelData {
+                                                channel_id,
+                                                data,
+                                            })
+                                            .expect("the command queue has room"),
+                                        AudioOutputEvent::Negotiated(formats) => {
+                                            heard.negotiated.push((arrived, formats));
+                                        }
+                                        AudioOutputEvent::Block(block) => {
+                                            let elapsed = arrived.elapsed().as_millis() as u32;
+                                            commands_tx
+                                                .try_send(SessionCommand::DynamicChannelData {
+                                                    channel_id,
+                                                    data: output.confirm(block.confirm, elapsed),
+                                                })
+                                                .expect("the command queue has room");
+                                            heard.blocks.push((
+                                                arrived,
+                                                block.format,
+                                                block.samples,
+                                            ));
+                                            blocks.fetch_add(1, Ordering::SeqCst);
+                                        }
+                                        AudioOutputEvent::Dropped { confirm, reason } => {
+                                            commands_tx
+                                                .try_send(SessionCommand::DynamicChannelData {
+                                                    channel_id,
+                                                    data: output.confirm(confirm, 0),
+                                                })
+                                                .expect("the command queue has room");
+                                            heard.dropped.push(reason);
+                                        }
+                                        AudioOutputEvent::Closed => heard.closed += 1,
+                                        AudioOutputEvent::Volume(_) => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+
+            let heard = heard.lock().unwrap();
+            let played = played.lock().unwrap().expect("the playback was typed");
+            let mut kinds = heard.msg_types.clone();
+            kinds.sort_unstable();
+            kinds.dedup();
+            let count = |t: u8| heard.msg_types.iter().filter(|&&k| k == t).count();
+            eprintln!(
+                "msgTypes seen: {:?}",
+                kinds.iter().map(|&t| (t, count(t))).collect::<Vec<_>>()
+            );
+            for (version, formats) in &heard.server_formats {
+                eprintln!(
+                    "server version {version}, {} formats: {:?}",
+                    formats.len(),
+                    formats
+                        .iter()
+                        .map(|f| (f.format_tag, f.samples_per_sec, f.channels, f.bits_per_sample))
+                        .collect::<Vec<_>>()
+                );
+            }
+            for (at, formats) in &heard.negotiated {
+                let since = at.checked_duration_since(played).map(|d| d.as_millis() as i64);
+                let before = played.checked_duration_since(*at).map(|d| -(d.as_millis() as i64));
+                eprintln!(
+                    "negotiated {} formats at {:?} ms relative to the playback: {:?}",
+                    formats.len(),
+                    since.or(before),
+                    formats
+                        .iter()
+                        .map(|f| (f.samples_per_sec, f.channels, f.bits_per_sample))
+                        .collect::<Vec<_>>()
+                );
+            }
+            let total: usize = heard.blocks.iter().map(|(_, _, s)| s.len()).sum();
+            eprintln!(
+                "blocks: {}, samples: {total}, closed: {}, dropped: {:?}",
+                heard.blocks.len(),
+                heard.closed,
+                heard.dropped
+            );
+            if let Some((_, format, _)) = heard.blocks.first() {
+                eprintln!("first block's format: {format:?}");
+            }
+            // Mean absolute difference of consecutive samples on each channel, read as sent and
+            // byte-swapped: real audio moves in small steps in its true byte order.
+            let roughness = |swap: bool| {
+                let (mut sum, mut n) = (0f64, 0f64);
+                for (_, format, samples) in &heard.blocks {
+                    let channels = usize::from(format.channels.max(1));
+                    let read = |s: i16| if swap { s.swap_bytes() } else { s };
+                    for pair in samples.windows(channels + 1) {
+                        sum += (f64::from(read(pair[channels])) - f64::from(read(pair[0]))).abs();
+                        n += 1.0;
+                    }
+                }
+                sum / n.max(1.0)
+            };
+            let (as_sent, swapped) = (roughness(false), roughness(true));
+            eprintln!("mean step: {as_sent:.1} as sent, {swapped:.1} byte-swapped");
+
+            ended
+                .expect("the session ended within 240 s")
+                .expect("the session ran without a protocol failure");
+            driven.expect("the sound was played and its blocks arrived");
+            assert!(heard.channel.is_some(), "the server opens AUDIO_PLAYBACK_DVC");
+            let (_, negotiated) = heard.negotiated.last().expect("the server sent its formats");
+            assert!(!negotiated.is_empty(), "the server offers PCM");
+            assert!(total > 0, "PCM samples reach the host");
+            assert!(heard.dropped.is_empty(), "no sample of the real server is dropped");
+            assert!(
+                heard.blocks.iter().all(|(_, f, _)| negotiated.contains(f)),
+                "every block is in a negotiated format"
+            );
+            if heard.blocks.iter().any(|(_, f, _)| f.bits_per_sample == 16) {
+                assert!(
+                    as_sent < swapped,
+                    "16-bit samples read smoother as sent than byte-swapped"
+                );
+            }
+        })
+        .await
+    }
+
     /// Issue #304's DoD ④: the logon notification actually reaches a host, against the real
     /// server rather than against bytes this repo wrote.
     ///

@@ -28,6 +28,9 @@ property of the whole untrusted surface.
 - [Bitmap codecs](../territory/bitmap-codecs.md) — the deepest arithmetic.
 - [EGFX graphics pipeline](../territory/egfx-graphics-pipeline.md) — surface and
   cache commands.
+- [Audio output](../territory/audio-output.md) — every audio message is server-supplied,
+  and a WaveInfo's `BodySize` announces the next message's length; `ServerPdu::decode` has a
+  proptest and a fuzz target that also drives the helper and the PCM conversion (#386).
 - [Device redirection](../territory/device-redirection.md) — every `rdpdr` message is
   server-supplied; `RdpdrPdu::decode` has a fuzz target and a proptest (#336).
 - [Virtual channels](../territory/virtual-channels.md) — chunk reassembly lengths.

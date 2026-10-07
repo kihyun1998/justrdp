@@ -56,6 +56,9 @@ about what we owe; both start at the same bytes.
 - [Session loop & PDU dispatch](../territory/session-loop-dispatch.md) — the `pduType2`
   catch-all is where an advertised-for message goes unhandled without an error; the Play Sound
   PDU the default Sound set invites sat in it until #354.
+- [Audio output](../territory/audio-output.md) — the client format list names only formats
+  the core decodes, version 8 promises Wave2, and volume control is advertised only when the
+  host takes Volume PDUs (#386).
 - [Device redirection](../territory/device-redirection.md) — `extendedPDU`'s User Logged On
   bit is what makes the server send it, and so what makes drives be announced (#336).
 - [Virtual channels](../territory/virtual-channels.md) — `VCCAPS_NO_COMPR`, the dynamic

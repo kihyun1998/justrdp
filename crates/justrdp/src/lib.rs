@@ -27,6 +27,7 @@ pub mod framebuffer;
 pub mod input;
 pub mod license_crypto;
 pub mod rdpdr;
+pub mod rdpsnd;
 pub mod session;
 mod svc;
 pub mod tls;
