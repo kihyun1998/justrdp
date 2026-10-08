@@ -129,6 +129,10 @@ against the spec, and #404 proves it against a real server.
 - **Unproven against a real server** (#404): the format list a server offers, the Open PDU's
   fields, whether a server opens `AUDIO_INPUT` without `INFO_AUDIOCAPTURE`, and a recording
   that holds the pushed samples.
+- **`AudioFormat` lives in `justrdp-pdu::rdpsnd`** and `audin` re-exports it, its codec
+  `pub(crate)`: the type is `[MS-RDPEA]`'s, now shared by two channels. Moving it to a neutral
+  module waits for a third user; that was the maintainer's call (2026-10-08), shown the
+  alternative of a `wave` module in this change.
 - **PCM only.** A-law (#402) and MS-ADPCM and IMA-ADPCM (#403) wait on #404's format list; AAC
   on #21's decoder-backend question; GSM 6.10 is not encoded.
 - **A Data PDU large enough to span `drdynvc` chunks has not been sent live**: 16-bit stereo
