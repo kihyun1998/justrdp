@@ -12,6 +12,7 @@
     html_favicon_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/favicon/favicon-32.png"
 )]
 
+pub mod audin;
 pub mod ber;
 pub mod capability;
 pub mod client_info;

@@ -311,7 +311,41 @@ def seed_rdpsnd(out_dir):
     return written
 
 
+def seed_audin(out_dir):
+    """Seed `audin` with a session that reaches recording (#401).
+
+    The target splits its input into messages, each a `u16` little-endian length and that many
+    bytes, answers an Open with success and pushes each message's bytes as samples. A seed is a
+    Version PDU, a Sound Formats PDU of 8- and 16-bit PCM, an Open PDU naming one of them, then a
+    Format Change PDU to the other, so a mutator starts inside the recording state rather than
+    having to assemble the initialization sequence first.
+    """
+
+    def pcm(channels, rate, bits):
+        block_align = channels * bits // 8
+        return struct.pack("<HHIIHHH", 0x0001, channels, rate, rate * block_align, block_align, bits, 0)
+
+    def message(body):
+        return struct.pack("<H", len(body)) + body
+
+    formats = [pcm(1, 8000, 16), pcm(2, 22050, 8)]
+    version = struct.pack("<BI", 0x01, 1)
+    sound_formats = struct.pack("<BII", 0x02, len(formats), 0) + b"".join(formats)
+    written = 0
+    for frames_per_packet, initial, new in [(4, 0, 1), (441, 1, 0)]:
+        open_pdu = struct.pack("<BII", 0x03, frames_per_packet, initial) + formats[initial]
+        format_change = struct.pack("<BI", 0x07, new)
+        samples = bytes(range(64))
+        seed = b"".join(
+            message(m) for m in [version, sound_formats, open_pdu, samples, format_change, samples]
+        )
+        (out_dir / f"seed-pcm-{frames_per_packet}").write_bytes(seed)
+        written += 1
+    return written
+
+
 SEEDERS = {
+    "audin": seed_audin,
     "progressive": seed_progressive,
     "progressive_assembly": seed_progressive_assembly,
     "progressive_srl": seed_progressive_srl,

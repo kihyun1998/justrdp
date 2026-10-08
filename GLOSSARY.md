@@ -84,8 +84,8 @@ A Virtual Channel negotiated at GCC from the client's channel list.
 A Virtual Channel the server opens on demand over the `drdynvc` channel.
 
 **Host-terminated Channel**:
-A Virtual Channel whose protocol the host runs to its end, such as clipboard, device redirection
-and audio output; the core carries its messages without interpreting them.
+A Virtual Channel whose protocol the host runs to its end, such as clipboard, device redirection,
+audio output and audio input; the core carries its messages without interpreting them.
 _Avoid_: host channel, channel helper
 
 **Core-terminated Channel**:

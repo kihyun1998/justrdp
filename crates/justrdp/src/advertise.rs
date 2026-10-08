@@ -37,6 +37,7 @@ pub const HONOURED_CLIENT_INFO_FLAGS: ClientInfoFlags = ClientInfoFlags::from_bi
         | ClientInfoFlags::PASSWORD_IS_SC_PIN.bits()
         | ClientInfoFlags::NO_AUDIO_PLAYBACK.bits()
         | ClientInfoFlags::USING_SAVED_CREDS.bits()
+        | ClientInfoFlags::AUDIO_CAPTURE.bits()
         | ClientInfoFlags::VIDEO_DISABLE.bits(),
 );
 
@@ -426,7 +427,6 @@ mod tests {
             ClientInfoFlags::COMPRESSION,
             ClientInfoFlags::COMPRESSION_TYPE_MASK,
             ClientInfoFlags::RAIL,
-            ClientInfoFlags::AUDIO_CAPTURE,
             ClientInfoFlags::HIDEF_RAIL_SUPPORTED,
         ] {
             config.client_info.flags = ClientInfoFlags::MOUSE | flag;
@@ -435,6 +435,14 @@ mod tests {
                 Err(ConnectConfigError::ClientInfoFlags(flag))
             );
         }
+    }
+
+    /// Audio input redirection is the host's to advertise: the core runs the protocol (#401).
+    #[test]
+    fn the_audio_capture_flag_passes() {
+        let mut config = config();
+        config.client_info.flags = ClientInfoFlags::MOUSE | ClientInfoFlags::AUDIO_CAPTURE;
+        assert_eq!(check(&config), Ok(()));
     }
 
     #[test]
