@@ -111,8 +111,8 @@ pub enum AudioInputEvent {
     /// server offers no format of the host's tags that the core encodes, and it will not ask to
     /// record.
     Negotiated(Vec<AudioFormat>),
-    /// The server asks to start recording, or to start again. The host opens its device and
-    /// answers with [`AudioInput::open_reply`].
+    /// The server asks to start recording. The host opens its device and answers with
+    /// [`AudioInput::open_reply`].
     Open {
         /// The format the samples are sent in: the host pushes interleaved samples of
         /// `format.channels` channels at `format.samples_per_sec` frames a second.
@@ -123,9 +123,7 @@ pub enum AudioInputEvent {
         frames_per_packet: u32,
     },
     /// The server switched to another format from the client's list. Samples the helper held
-    /// for the old format are dropped, and the host pushes in this one from now on. It can
-    /// arrive between an [`AudioInputEvent::Open`] and the host's answer, and then names the
-    /// format recording starts in.
+    /// for the old format are dropped, and the host pushes in this one from now on.
     FormatChanged(AudioFormat),
 }
 
@@ -206,9 +204,9 @@ impl AudioInput {
                 self.stage = Stage::Negotiated;
                 self.negotiate(&formats)
             }
-            (ServerPdu::Open(open), Stage::Negotiated | Stage::Recording(_)) => self.open(open),
-            (ServerPdu::FormatChange(new_format), Stage::Opening(_) | Stage::Recording(_)) => {
-                self.format_change(new_format)
+            (ServerPdu::Open(open), Stage::Negotiated) => self.open(open),
+            (ServerPdu::FormatChange(new_format), Stage::Recording(current)) => {
+                self.format_change(current, new_format)
             }
             (ServerPdu::Unknown { message_id }, _) => {
                 tracing::debug!(target: "rdp_audin", message_id, "unknown audio input PDU ignored");
@@ -283,7 +281,6 @@ impl AudioInput {
             return Vec::new();
         };
         self.stage = Stage::Opening(recording);
-        self.pending.clear();
         vec![
             AudioInputEvent::Send(pdu::encode_format_change(open.initial_format)),
             AudioInputEvent::Open {
@@ -295,10 +292,7 @@ impl AudioInput {
     }
 
     /// Confirm a Format Change PDU, dropping the partial packet held for the old format.
-    fn format_change(&mut self, new_format: u32) -> Vec<AudioInputEvent> {
-        let (Stage::Opening(current) | Stage::Recording(current)) = self.stage else {
-            return Vec::new();
-        };
+    fn format_change(&mut self, current: Recording, new_format: u32) -> Vec<AudioInputEvent> {
         let Some(recording) = self.recording(new_format, current.frames_per_packet) else {
             tracing::warn!(
                 target: "rdp_audin",
@@ -308,10 +302,7 @@ impl AudioInput {
             );
             return Vec::new();
         };
-        self.stage = match self.stage {
-            Stage::Opening(_) => Stage::Opening(recording),
-            _ => Stage::Recording(recording),
-        };
+        self.stage = Stage::Recording(recording);
         self.pending.clear();
         vec![
             AudioInputEvent::Send(pdu::encode_format_change(new_format)),
@@ -696,33 +687,24 @@ mod tests {
         assert_eq!(input.push(&[0; 8000]).len(), 2);
     }
 
-    /// An Open while recording starts the recording again in the format it names, dropping the
-    /// partial packet; nothing is sent until the host answers it.
+    /// Figure 4 (3.1.5) leaves the Opened state only by a Format Change or by closing the
+    /// channel: an Open while recording, and a Format Change while an Open waits for the host,
+    /// are out of sequence and ignored, and recording goes on as it was.
     #[test]
-    fn an_open_while_recording_starts_again() {
+    fn an_open_while_recording_and_a_format_change_while_opening_are_ignored() {
         let formats = [pcm(1, 8000, 16), pcm(2, 8000, 16)];
         let mut input = negotiated(&[WAVE_FORMAT_PCM], &formats);
         input.process(&server_open(2, 0, &formats[0]));
+        assert!(input.process(&encode_format_change(1)).is_empty());
         input.open_reply(0).unwrap();
         assert!(input.push(&[1]).is_empty());
+        assert!(input.process(&server_open(1, 1, &formats[1])).is_empty());
+        assert_eq!(input.open_reply(0), None);
         assert_eq!(
-            input.process(&server_open(1, 1, &formats[1])),
-            [
-                AudioInputEvent::Send(encode_format_change(1)),
-                AudioInputEvent::Open {
-                    format: formats[1].clone(),
-                    capture_format: formats[1].clone(),
-                    frames_per_packet: 1,
-                },
-            ]
-        );
-        assert!(input.push(&[2, 3]).is_empty());
-        input.open_reply(0).unwrap();
-        assert_eq!(
-            input.push(&[4, 5]),
+            input.push(&[2]),
             [
                 pdu::encode_incoming_data(),
-                pdu::encode_data(&pcm::encode(16, &[4, 5]).unwrap())
+                pdu::encode_data(&pcm::encode(16, &[1, 2]).unwrap())
             ]
         );
     }

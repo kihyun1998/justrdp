@@ -43,12 +43,12 @@ against the spec, and #404 proves it against a real server.
   the capture format the server suggests and `FramesPerPacket`; the host opens its device and
   calls `AudioInput::open_reply` with the `HRESULT`. A success code starts recording; an error
   code does not, and another Open is then answered (3.3.5.1.8). Windows ends the protocol 5 s
-  after an unanswered Open (product note 4), and the helper keeps no clock. **An Open while
-  recording starts again** in the format it names, dropping the partial packet: the spec's
-  state diagram (3.1.5) is a figure the text does not repeat, and FreeRDP 3.31 takes an Open in
-  any state, while ignoring it would leave the server waiting on that 5 s timer. A Format Change
-  can arrive while an Open waits for the host; it then names the format recording starts in.
-  **Derivation**, from #401's review.
+  after an unanswered Open (product note 4), and the helper keeps no clock.
+- **The stages are 3.1.5's Figure 4**, which the section's text does not repeat: once recording
+  (Opened), only a Format Change or closing the channel moves the protocol, so **an Open while
+  recording is ignored**, and so is a Format Change while an Open waits for the host's answer.
+  FreeRDP 3.31 takes an Open in any state; the figure is normative and FreeRDP is an example
+  (`docs/agents/thegraph.md`).
 - **The capture format passes through.** The Open PDU's suggested capture format, a
   `WAVEFORMAT_EXTENSIBLE` in the spec's example, reaches the host as the server sent it; the
   helper neither decodes the extensible part nor checks its `cbSize` of 22 (2.2.2.3), since it
@@ -58,8 +58,8 @@ against the spec, and #404 proves it against a real server.
   (3.2.5.3.2). The host learns the new format from `AudioInputEvent::FormatChanged`.
 - **Everything the spec says to ignore is ignored** (3.1.5), unlike the audio output helper,
   whose malformed PDUs are `DecodeError`s: a malformed or unknown PDU, a second Version PDU,
-  formats before the version, an Open before the formats or while one waits, and an index past
-  the client's list. A `FramesPerPacket` of zero would ask for empty packets, so its Open is
+  formats before the version, an Open anywhere but after the formats or a failed Open, a Format
+  Change anywhere but while recording, and an index past the client's list. A `FramesPerPacket` of zero would ask for empty packets, so its Open is
   ignored too. **Derivation**, from 3.1.5.
 - **A packet holds at most one second of its format.** The helper holds pushed samples until
   a packet fills, so a `FramesPerPacket` the server sets near `u32::MAX` would hold them without
