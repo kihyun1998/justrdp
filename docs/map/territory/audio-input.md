@@ -8,7 +8,8 @@ record, and the client sends what it captures as Data PDUs. `justrdp-pdu::audin`
 PDUs, `justrdp-codecs::pcm::encode` turns signed 16-bit samples into linear PCM, and
 `justrdp::audin::AudioInput` is a sans-IO helper the host drives over the host dynamic channel
 seam (ADR-0018), as it drives the audio output helper. Epic #12; #401 builds PCM and proves it
-against the spec, and #404 proves it against a real server.
+against the spec, and #404 proves it against a real server, the Windows 11 VM
+(`192.168.136.163`), by recording a tone the host pushes.
 
 ## Governing decisions
 
@@ -85,6 +86,9 @@ against the spec, and #404 proves it against a real server.
   `AudioInputEvent`, `CLIENT_VERSION`, `ENCODABLE_FORMAT_TAGS`
 - `crates/justrdp/src/advertise.rs` — `HONOURED_CLIENT_INFO_FLAGS`, which holds
   `AUDIO_CAPTURE` since #401
+- `crates/justrdp-tokio/src/lib.rs` — `a_tone_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm`,
+  `without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm`,
+  `record_a_tone_pushed_as_audio_input`
 - `fuzz/fuzz_targets/audin.rs` — the PDU parser and the helper over split input, the host's
   side played, seeded by `.github/scripts/seed_fuzz_corpus.py` with a session that reaches
   recording
@@ -94,14 +98,37 @@ against the spec, and #404 proves it against a real server.
 
 ## Reference behaviour
 
-- **`[MS-RDPEAI]` section 4** is the only wire evidence so far: the PDU tests decode its server
+**Measured against the Windows 11 Enterprise evaluation VM (#404, 2026-10-08)**, which opens
+`AUDIO_INPUT` with no RD Session Host role and no policy; the Server 2019 VM never does (#400):
+
+- **The channel opens when the session starts recording**, not at logon: the server sends its
+  Create Request for `AUDIO_INPUT` as winmm MCI `record` runs, then Version 2, a Sound Formats
+  PDU of **30 formats** (AAC `0xA106` ×8 first, PCM 44.1 kHz stereo 16-bit ×1, MS-ADPCM ×9
+  and IMA-ADPCM ×9 at 44.1, 22.05, 11.025 and 8 kHz, A-law 22.05 kHz stereo ×1, GSM 6.10 ×4;
+  no µ-law), and, to a client answering with PCM alone, an Open PDU with `FramesPerPacket`
+  441 (10 ms), `initialFormat` 0 and a `WAVEFORMAT_EXTENSIBLE` capture format at 44.1 kHz
+  stereo 16-bit (`cbSize` 22). FreeRDP 3.31 saw the same (#400).
+- **A pushed tone is what the session records**: with the host pushing a 440 Hz sine ten
+  milliseconds at a time, each packet a 1,765-byte Data PDU sent as a Data First and a Data
+  PDU, the WAV MCI saves (11,025 Hz 8-bit mono) read back over `rdpdr` holds 440 Hz at about
+  10^5 times the power of any of five other frequencies
+  (`a_tone_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm`). Pushing 620 Hz
+  instead turns it red.
+- **Without `INFO_AUDIOCAPTURE` the server opens no `AUDIO_INPUT` and the session has no
+  capture device**: MCI `record` returns 328, `MCIERR_WAVE_INPUTSUNSUITABLE`
+  (`without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm`). So the flag is
+  what gives a session a microphone, and a host that sets it and registers no `AUDIO_INPUT`
+  offers one the server cannot open.
+- **These Data PDUs found a static channel defect**: each DVC fragment has to ride one SVC
+  chunk, and until #404 an SVC chunk carried 1,592 data bytes where `[MS-RDPBCGR]` 2.2.6.1
+  allows 1,600, so a 1,594-byte fragment straddled two chunks and Windows 11 ended the session
+  with `ERRINFO_VCDECODINGERROR` (`0x1133`) ([Virtual channels](virtual-channels.md)).
+
+- **`[MS-RDPEAI]` section 4** is the spec's wire evidence: the PDU tests decode its server
   Sound Formats PDU (21 formats, PCM, MS-ADPCM, IMA-ADPCM and GSM 6.10 at several rates) and
   its Open PDU, and encode its Version, client Sound Formats, Open Reply, Incoming Data, Data
   and Format Change PDUs byte for byte. Its client list carries the server's 21 formats and 37
   bytes of `ExtraData` that `cbSizeFormatsPacket` (667) leaves out.
-- **No real server has been measured.** The test VM cannot open `AUDIO_INPUT` (#400, recorded
-  in [Verification harness](verification-harness.md)); #404 measures a server once #400 provides
-  one.
 
 ## Cross-cutting invariants
 
@@ -121,20 +148,16 @@ against the spec, and #404 proves it against a real server.
   and the PCM codec module.
 - [Capability exchange & activation](capability-exchange-activation.md) — `INFO_AUDIOCAPTURE`
   is honoured in the Client Info PDU.
-- [Verification harness](verification-harness.md) — the live proof needs a server that opens
-  `AUDIO_INPUT`, which the test VM does not.
+- [Verification harness](verification-harness.md) — the live proof runs against a second VM,
+  the Windows 11 one, through `Target::AudioInput`.
 
 ## Known holes / open
 
-- **Unproven against a real server** (#404): the format list a server offers, the Open PDU's
-  fields, whether a server opens `AUDIO_INPUT` without `INFO_AUDIOCAPTURE`, and a recording
-  that holds the pushed samples.
 - **`AudioFormat` lives in `justrdp-pdu::rdpsnd`** and `audin` re-exports it, its codec
   `pub(crate)`: the type is `[MS-RDPEA]`'s, now shared by two channels. Moving it to a neutral
   module waits for a third user; that was the maintainer's call (2026-10-08), shown the
   alternative of a `wave` module in this change.
-- **PCM only.** A-law (#402) and MS-ADPCM and IMA-ADPCM (#403) wait on #404's format list; AAC
-  on #21's decoder-backend question; GSM 6.10 is not encoded.
-- **A Data PDU large enough to span `drdynvc` chunks has not been sent live**: 16-bit stereo
-  at the spec example's 2205 frames is 8,821 bytes, over one chunk, so #404 is where
-  [Virtual channels](virtual-channels.md)' multi-chunk send gets its proof.
+- **PCM only.** A-law (#402) and MS-ADPCM and IMA-ADPCM (#403) are all in the Windows 11
+  server's list; AAC waits on #21's decoder-backend question; GSM 6.10 is not encoded.
+- **One server.** Only a Windows 11 client SKU has been measured; a Server SKU with the RD
+  Session Host role did not open the channel for FreeRDP or mstsc (#400).

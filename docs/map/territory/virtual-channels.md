@@ -135,7 +135,9 @@ glossary, which is vocabulary rather than a decision.
     It cannot reach a core channel, since a send needs a host endpoint, and with one host name
     it is harmless. #270 measured this server reusing an id within 40 ms, for refused channels.
     Revisit when a slice runs several host channels at once (audio input, #12). Shown:
-    per-binding generation handles now, or a follow-up issue.
+    per-binding generation handles now, or a follow-up issue. Audio input reached that trigger
+    with #404, whose tests open one host dynamic channel; the measurement and the handles are
+    #408 (the maintainer's call, 2026-10-08).
   - **A server Close is not answered.** `[MS-RDPEDYC]` 3.2.5.2 makes the reply a MAY; FreeRDP
     (`dvcchannel_send_close`) and IronRDP (`process_close`) both send one. The host cannot send
     it either, since the binding is gone when `DynamicChannelClosed` arrives. This predates #385
@@ -203,6 +205,16 @@ glossary, which is vocabulary rather than a decision.
   And `cliprdr`, which no spec says but the VM enforces (#321, the clipboard bullet below).
   Building it now, rather than leaving it to #14, was the maintainer's call (2026-09-22).
   `StaticChannel` carries the requested `options` so the machine can tell.
+- **An SVC chunk carries up to `CHANNEL_CHUNK_LENGTH` (1,600) data bytes after its 8-byte
+  header**, as `[MS-RDPBCGR]` 2.2.6.1 bounds `virtualChannelData`, and **every DVC PDU a host
+  message is fragmented into rides exactly one chunk** (`MAX_DATA_CHUNK` 1,590 plus at most a
+  9-byte DVC header). Until #404 `encode_chunks` counted the header inside the 1,600 and
+  carried 1,592, so a 1,594-byte Data First straddled two chunks. Windows 11 ended the session
+  on it with `ERRINFO_VCDECODINGERROR` (`0x1133`); a Data First filled to 1,600 bytes, also
+  straddling, kept the session but its audio never reached the recording. Each fragment in one
+  chunk, both work (measured on the audio input VM, #404). A proptest in `dvc.rs` holds the
+  two modules to that. FreeRDP 3.31's `drdynvc_write_data` fills each DVC PDU to 1,600
+  bytes, which only one chunk at 1,600 data bytes carries.
 - **A host channel message over its cap is skipped and reported, and the session goes on**
   (#323). The reassembler counts the chunks of a message whose `totalLength` is over the cap,
   checks them as it checks any other, buffers none of them, and on the last chunk reports
@@ -710,8 +722,8 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
 - **These redirection features are unopened channels**: RemoteApp (#14),
   multitouch (#15), video (#17), camera (#19), location (#20). The transport exists; the
   consumers do not. Drives have been redirected since #336–#340 (printers, smartcards, serial
-  ports and USB have not), audio output plays since #386, and audio input runs against the
-  spec since #401 with no real server yet (#404). The clipboard (#10) moves text since #322, images since #323,
+  ports and USB have not), audio output plays since #386, and audio input records on the
+  Windows 11 VM since #404. The clipboard (#10) moves text since #322, images since #323,
   server files to the host since #324, and host files to the server since #325.
 - ~~Static channel 1004 traffic is ignored by the session loop with no record of what
   it contains.~~ **Closed in #307**: 1004 is `cliprdr`, and a granted channel's messages
@@ -720,16 +732,18 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   design-model bullet for when that changes.
 - SVC compression (`VirtualChannelCapabilitySet`'s compression flags) is not
   implemented.
+- **The server's `VCChunkSize` is decoded and not used**: chunks always carry 1,600 data bytes,
+  the size `[MS-RDPBCGR]` 2.2.7.1.10 says the server's value MUST be at least, so a larger
+  value only goes unused. Recorded rather than filed at the maintainer's call (2026-10-08).
 - **A host dynamic channel has no host-set message cap and no drop path** (#385): a message over
   the manager's fixed 4 MiB ends the session as a transport error (ADR-0014), where a host static
   channel's is skipped and reported (`ChannelMessageDropped`, #323). Audio blocks are far below
   it; the first host dynamic channel to carry large messages (camera, #19) meets it. Recorded
   rather than built, at the maintainer's call (2026-10-06).
+- ~~**A multi-chunk `drdynvc` message we send has never been proven live**~~ — it is since
+  #404: audio input's 1,765-byte Data PDUs go as a Data First and a Data PDU, and the Windows 11
+  server records them. It took the SVC chunk fix above; Server 2019 was never sent one.
 - ~~**A host dynamic channel send has not been proven live**~~ (#385) — it is since #386: on
   `AUDIO_PLAYBACK_DVC` the server answers the host's Client Audio Formats with Training PDUs and
   then audio, and takes every Wave Confirm ([Audio output](audio-output.md)). A host
   `close_dynamic_channel` is still proven by unit tests only.
-- **A multi-chunk `drdynvc` message we send has never been proven live**, with or without
-  `CHANNEL_FLAG_SHOW_PROTOCOL`: no VM test sends a DVC message over one chunk. Since #338 it
-  goes unflagged, as FreeRDP sends it. The first slice that sends a large DVC message proves
-  it: audio input's Data PDUs are over one chunk at ordinary rates, so #404 is first in line.
