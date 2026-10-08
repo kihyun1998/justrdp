@@ -43,7 +43,16 @@ against the spec, and #404 proves it against a real server.
   the capture format the server suggests and `FramesPerPacket`; the host opens its device and
   calls `AudioInput::open_reply` with the `HRESULT`. A success code starts recording; an error
   code does not, and another Open is then answered (3.3.5.1.8). Windows ends the protocol 5 s
-  after an unanswered Open (product note 4), and the helper keeps no clock.
+  after an unanswered Open (product note 4), and the helper keeps no clock. **An Open while
+  recording starts again** in the format it names, dropping the partial packet: the spec's
+  state diagram (3.1.5) is a figure the text does not repeat, and FreeRDP 3.31 takes an Open in
+  any state, while ignoring it would leave the server waiting on that 5 s timer. A Format Change
+  can arrive while an Open waits for the host; it then names the format recording starts in.
+  **Derivation**, from #401's review.
+- **The capture format passes through.** The Open PDU's suggested capture format, a
+  `WAVEFORMAT_EXTENSIBLE` in the spec's example, reaches the host as the server sent it; the
+  helper neither decodes the extensible part nor checks its `cbSize` of 22 (2.2.2.3), since it
+  is a suggestion the samples are not encoded in.
 - **A Format Change drops the partial packet.** It cannot go short, since every Data PDU holds
   `FramesPerPacket` frames, and everything after the confirmation is in the new format
   (3.2.5.3.2). The host learns the new format from `AudioInputEvent::FormatChanged`.
@@ -52,6 +61,13 @@ against the spec, and #404 proves it against a real server.
   formats before the version, an Open before the formats or while one waits, and an index past
   the client's list. A `FramesPerPacket` of zero would ask for empty packets, so its Open is
   ignored too. **Derivation**, from 3.1.5.
+- **A packet holds at most one second of its format.** The helper holds pushed samples until
+  a packet fills, so a `FramesPerPacket` the server sets near `u32::MAX` would hold them without
+  bound: at 44.1 kHz stereo 16-bit, 176 KB a second, about 15 GB a day, and an allocation
+  failure after about 3.4 hours on a 32-bit host (#401's review). An Open or a Format Change
+  whose `FramesPerPacket` exceeds the format's `nSamplesPerSec` is ignored. The spec's example
+  asks for 2205 frames at 44.1 kHz, 50 ms. **Derivation**: a one-second packet is already far
+  from real-time capture, and FreeRDP refuses only `INT32_MAX` and above.
 - **The version is 2**, as FreeRDP 3.31 advertises; version 2 only adds that the server may
   send Format Change PDUs for AAC (3.3.5.3.1), and the helper takes every Format Change. The
   server's version is answered whatever it is, as 3.2.5.1.2 requires; FreeRDP answers nothing

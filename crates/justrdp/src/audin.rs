@@ -111,9 +111,8 @@ pub enum AudioInputEvent {
     /// server offers no format of the host's tags that the core encodes, and it will not ask to
     /// record.
     Negotiated(Vec<AudioFormat>),
-    /// The server asks to start recording. The host opens its device and answers with
-    /// [`AudioInput::open_reply`]; Windows ends the protocol if no answer comes within 5 s
-    /// (product note 4).
+    /// The server asks to start recording, or to start again. The host opens its device and
+    /// answers with [`AudioInput::open_reply`].
     Open {
         /// The format the samples are sent in: the host pushes interleaved samples of
         /// `format.channels` channels at `format.samples_per_sec` frames a second.
@@ -124,7 +123,9 @@ pub enum AudioInputEvent {
         frames_per_packet: u32,
     },
     /// The server switched to another format from the client's list. Samples the helper held
-    /// for the old format are dropped, and the host pushes in this one from now on.
+    /// for the old format are dropped, and the host pushes in this one from now on. It can
+    /// arrive between an [`AudioInputEvent::Open`] and the host's answer, and then names the
+    /// format recording starts in.
     FormatChanged(AudioFormat),
 }
 
@@ -205,7 +206,7 @@ impl AudioInput {
                 self.stage = Stage::Negotiated;
                 self.negotiate(&formats)
             }
-            (ServerPdu::Open(open), Stage::Negotiated) => self.open(open),
+            (ServerPdu::Open(open), Stage::Negotiated | Stage::Recording(_)) => self.open(open),
             (ServerPdu::FormatChange(new_format), Stage::Opening(_) | Stage::Recording(_)) => {
                 self.format_change(new_format)
             }
@@ -251,10 +252,14 @@ impl AudioInput {
     }
 
     /// The recording that `format_no` and `frames_per_packet` name, or `None` when the index is
-    /// past the client's list, or a packet would hold no samples or more than memory addresses.
+    /// past the client's list, or a packet would hold no frames or more than one second of the
+    /// format.
     fn recording(&self, format_no: u32, frames_per_packet: u32) -> Option<Recording> {
         let format_no = usize::try_from(format_no).ok()?;
         let (format, _) = self.client_formats.get(format_no)?;
+        if frames_per_packet > format.samples_per_sec {
+            return None;
+        }
         let packet_samples = usize::try_from(frames_per_packet)
             .ok()?
             .checked_mul(usize::from(format.channels))?;
@@ -272,11 +277,13 @@ impl AudioInput {
                 target: "rdp_audin",
                 initial_format = open.initial_format,
                 frames_per_packet = open.frames_per_packet,
-                "Open PDU ignored: it names no format in the client's list, or no frames"
+                "Open PDU ignored: it names no format in the client's list, or no frames, or \
+                 more than a second of them"
             );
             return Vec::new();
         };
         self.stage = Stage::Opening(recording);
+        self.pending.clear();
         vec![
             AudioInputEvent::Send(pdu::encode_format_change(open.initial_format)),
             AudioInputEvent::Open {
@@ -296,7 +303,8 @@ impl AudioInput {
             tracing::warn!(
                 target: "rdp_audin",
                 new_format,
-                "Format Change PDU ignored: it names no format in the client's list"
+                "Format Change PDU ignored: it names no format in the client's list, or one \
+                 a packet holds more than a second of"
             );
             return Vec::new();
         };
@@ -666,5 +674,88 @@ mod tests {
         assert!(input.process(&encode_format_change(1)).is_empty());
         assert!(input.process(&encode_format_change(u32::MAX)).is_empty());
         assert_eq!(input.push(&[7]).len(), 2);
+    }
+
+    /// A packet longer than one second of its format would hold pushed samples for that long
+    /// before sending any; an Open or a Format Change asking for one is ignored, so a server
+    /// cannot make the helper hold samples without bound.
+    #[test]
+    fn a_packet_longer_than_a_second_is_ignored() {
+        let formats = [pcm(1, 8000, 16), pcm(1, 4000, 16)];
+        let mut input = negotiated(&[WAVE_FORMAT_PCM], &formats);
+        assert!(input.process(&server_open(8001, 0, &formats[0])).is_empty());
+        assert!(
+            input
+                .process(&server_open(u32::MAX, 0, &formats[0]))
+                .is_empty()
+        );
+        assert_eq!(input.process(&server_open(8000, 0, &formats[0])).len(), 2);
+        input.open_reply(0).unwrap();
+        // 8000 frames are two seconds of the 4 kHz format.
+        assert!(input.process(&encode_format_change(1)).is_empty());
+        assert_eq!(input.push(&[0; 8000]).len(), 2);
+    }
+
+    /// An Open while recording starts the recording again in the format it names, dropping the
+    /// partial packet; nothing is sent until the host answers it.
+    #[test]
+    fn an_open_while_recording_starts_again() {
+        let formats = [pcm(1, 8000, 16), pcm(2, 8000, 16)];
+        let mut input = negotiated(&[WAVE_FORMAT_PCM], &formats);
+        input.process(&server_open(2, 0, &formats[0]));
+        input.open_reply(0).unwrap();
+        assert!(input.push(&[1]).is_empty());
+        assert_eq!(
+            input.process(&server_open(1, 1, &formats[1])),
+            [
+                AudioInputEvent::Send(encode_format_change(1)),
+                AudioInputEvent::Open {
+                    format: formats[1].clone(),
+                    capture_format: formats[1].clone(),
+                    frames_per_packet: 1,
+                },
+            ]
+        );
+        assert!(input.push(&[2, 3]).is_empty());
+        input.open_reply(0).unwrap();
+        assert_eq!(
+            input.push(&[4, 5]),
+            [
+                pdu::encode_incoming_data(),
+                pdu::encode_data(&pcm::encode(16, &[4, 5]).unwrap())
+            ]
+        );
+    }
+
+    proptest::proptest! {
+        /// However the host splits its pushes, the Data PDUs carry the samples in order, each
+        /// exactly `FramesPerPacket` frames, and each after an Incoming Data PDU.
+        #[test]
+        fn packets_are_exact_whatever_the_push_sizes(
+            channels in 1u16..=2,
+            frames_per_packet in 1u32..=8,
+            cuts in proptest::collection::vec(0usize..=20, 0..12),
+        ) {
+            let mut input = recording(pcm(channels, 8000, 16), frames_per_packet);
+            let total: usize = cuts.iter().sum();
+            let samples: Vec<i16> = (0..total).map(|n| n as i16).collect();
+            let mut out = Vec::new();
+            let mut at = 0;
+            for cut in cuts {
+                out.extend(input.push(&samples[at..at + cut]));
+                at += cut;
+            }
+            let packet = frames_per_packet as usize * usize::from(channels);
+            let expected: Vec<Vec<u8>> = samples
+                .chunks_exact(packet)
+                .flat_map(|p| {
+                    [
+                        pdu::encode_incoming_data(),
+                        pdu::encode_data(&pcm::encode(16, p).unwrap()),
+                    ]
+                })
+                .collect();
+            proptest::prop_assert_eq!(out, expected);
+        }
     }
 }

@@ -1253,15 +1253,19 @@ Good! I found KDC proxy support. Now let me compile comprehensive information ab
 
 ---
 
-### 7b.2 RDPEAI / Microphone Input (DVC channel: "RDPAI-AUDIN")
+### 7b.2 RDPEAI / Microphone Input (DVC channel: "AUDIO_INPUT")
 
-- [ ] **O — RDPEAI DVC setup.** Dynamic channel name `RDPAI-AUDIN`. Server opens if client advertises drdynvc support + channel capability. *ironrdp: NO IMPLEMENTATION.* Spec: MS-RDPEAI (Microphone redirection).
+*Corrected 2026-10-08 (#401) against `[MS-RDPEAI]` v17.0; the earlier text named the channel
+`RDPAI-AUDIN` and had the client list formats for the server to pick. Built as
+`justrdp::audin` — see `docs/map/territory/audio-input.md`.*
 
-- [ ] **O — AUDIN format negotiation.** Parallel to RDPSND but inverted: CLIENT lists formats it can CAPTURE (input=mic). Server selects one. CapabilitiesAdvertise (client) → CapabilitiesConfirm (server). *MS-RDPEAI §2.2.*
+- [x] **O — RDPEAI DVC setup.** Dynamic channel name `AUDIO_INPUT` (2.1); the server opens it, and the first PDU is the server's Version PDU (3.1.5.1).
 
-- [ ] **O — Audio capture format (TS_AUDIO_FORMATS_STRUCT).** Client advertises mic capture formats (usually PCM mono/stereo, 16-bit, 16kHz–44kHz). Server chooses one. Identical WAVEFORMATEX model as RDPSND.
+- [x] **O — AUDIN format negotiation.** The **server** sends its Sound Formats PDU; the client answers with a subset, after an Incoming Data PDU (3.2.5.1.4–3.2.5.1.5). The server picks one by index in the Open PDU's `initialFormat`. Same `AUDIO_FORMAT` (WAVEFORMATEX) model as RDPSND.
 
-- [ ] **O — Mic frame transmission.** Client sends TS_AUDIO_FRAME PDU with captured audio bytes (typically 20–40ms chunks). Timestamps optional (server MAY request via config flags).
+- [x] **O — Open.** The Open PDU carries `FramesPerPacket`, `initialFormat` and a suggested capture format; the client confirms with a Format Change PDU, then an Open Reply carrying an `HRESULT` (3.2.5.1.6–3.2.5.1.8).
+
+- [x] **O — Mic frame transmission.** An Incoming Data PDU (0x05) then a Data PDU (0x06) of `FramesPerPacket` frames in the current format (3.2.5.2). There is no timestamp field.
 
 - [ ] **O — Lossy-UDP audio (AUDIO_PLAYBACK_LOSSY over multitransport).** RDPSND audio MAY be sent via lossy UDP tunnel (MS-RDPEMT) if client advertises multitransport + client & server both support it. *Reduces latency; trades quality (packet loss).* **Separate channel flow; not a codec variant.** Packets may be reordered/dropped; client must detect gaps and insert comfort noise or silence.
 
