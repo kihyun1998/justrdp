@@ -262,7 +262,8 @@ was checked against.
   not cold starts as such. The lane now seeds from committed fixtures where one exists,
   which is a **derivation, not a second corpus**: `.github/scripts/seed_fuzz_corpus.py`
   splits the fixture at run time rather than duplicating ~900 KB into `fuzz/`.
-- **One VM is one server.** The WS2022 box advertises a fixed cap set; paths it does
+- **One VM is one server, and there are two.** The audio input VM (#404) drives only the audio
+  input tests; see its bullet among the VM-configuration dependencies. The WS2022 box advertises a fixed cap set; paths it does
   not advertise have never been exercised against anything.
 - **A test can pass on pixels another test's session painted, and only a working teardown
   exposes it.** `progressive_assembles`' live-framebuffer floor (≥ 1/8 of the screen
@@ -330,6 +331,37 @@ was checked against.
   **going ahead without that check was the maintainer's call (2026-10-08)**. The role was
   installed on a snapshot and the VM was reverted to it, so the suite still runs against the
   administration-mode server, whose licensing short-circuits with `STATUS_VALID_CLIENT`.
+- **A second VM, for audio input: Windows 11 Enterprise evaluation at `192.168.136.163`**
+  (#400, #404). The main VM cannot open `AUDIO_INPUT`; this one does out of the box. Tests reach
+  it through `with_vm_session_on(Target::AudioInput, …)`: its own address, its own lock (a
+  different VM is a different Windows session, so the two suites run side by side) and the same
+  `JUSTRDP_TEST_*` credentials. **That shape was the maintainer's call (2026-10-08)**, shown the
+  alternative of the address in an environment variable. Its configuration, none of it in the
+  repo:
+  - Remote Desktop on, and `rdptest` in *Remote Desktop Users*: without it NLA passes and the
+    Early User Authorization Result is `0x5`, ACCESS_DENIED.
+  - For `rdptest` (per-user settings): taskbar alignment **Left** and **Widgets off**.
+    `start_menu_run` clicks the bottom-left corner, where a centred taskbar puts the weather
+    widget.
+  - The evaluation **expires around 2027-01**; after that a connect fails in TCP or the session,
+    not in the client. The `#[ignore]` reasons say so.
+
+  What the harness does differently there, each measured on it:
+  - **It signs out with `logoff`, not `shutdown /l /f`.** Windows 11's Start search offers a
+    command with arguments as a "Run command" result that Enter does not run; a bare command
+    runs. `Target::sign_out` holds the difference.
+  - **It never leaves a terminal open.** Windows Terminal repaints continually, about 120 frames
+    a second while a PowerShell window is up, so `await_desktop` never sees the desktop go quiet
+    and both the test and the teardown time out, leaving a session the next run reattaches to.
+    The audio input test opens the Run dialog from the Start menu (`run`, a bare command) and
+    starts PowerShell hidden from it.
+  - **Every connect to it adds `PERF_DISABLE_CURSORSETTINGS`** (`[MS-RDPBCGR]`
+    2.2.1.11.1.1.1, "Disable cursor blinking"), a blinking caret being the other thing that
+    keeps the desktop from settling; it did not stop the terminal. A reattached session keeps
+    the settings of the logon that created it.
+  - **The Shutdown Request PDU is denied** here as on Server, so a session left open is
+    recovered by signing out from inside it: a connect, a click on whatever window repaints,
+    then the teardown.
 - **Driving a desktop by synthesised keystrokes is open-loop, and the acknowledgement
   the harness needs is the one it already receives.** Every VM test that has to make
   something happen *inside* Windows — sign out, launch an app, run `tsdiscon` — types

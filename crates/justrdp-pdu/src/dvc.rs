@@ -317,6 +317,22 @@ mod tests {
         );
     }
 
+    proptest! {
+        /// Every PDU a host message is fragmented into rides one SVC chunk: a DVC PDU split
+        /// across two chunks is what Windows 11 refuses (`ERRINFO_VCDECODINGERROR`) or drops
+        /// (#404).
+        #[test]
+        fn every_fragment_fits_one_svc_chunk(
+            len in 0usize..12_000,
+            channel_id in prop_oneof![Just(1u32), Just(0x1234), Just(0x0102_0304)],
+        ) {
+            let message = vec![0x5Au8; len];
+            for pdu in encode_data(channel_id, &message) {
+                prop_assert_eq!(crate::svc::encode_chunks(&pdu).len(), 1, "{} bytes", pdu.len());
+            }
+        }
+    }
+
     #[test]
     fn large_data_fragments_into_data_first_plus_data() {
         let message = vec![9u8; MAX_DATA_CHUNK * 2 + 10];

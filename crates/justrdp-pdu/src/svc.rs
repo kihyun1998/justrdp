@@ -1,15 +1,15 @@
 //! Static virtual channel framing (MS-RDPBCGR 2.2.6): every SVC message rides MCS send-data
-//! on the channel's MCS ID, prefixed with a `CHANNEL_PDU_HEADER` and split into chunks of at
-//! most [`CHANNEL_CHUNK_LENGTH`] bytes (header included). Chunk *reassembly* is stateful and
+//! on the channel's MCS ID, split into chunks of at most [`CHANNEL_CHUNK_LENGTH`] data bytes,
+//! each prefixed with an 8-byte `CHANNEL_PDU_HEADER`. Chunk *reassembly* is stateful and
 //! lives in the session machine (the fast-path fragment precedent); this module owns the pure
 //! header codec and the outbound chunking.
 
 use crate::cursor::ReadCursor;
 use crate::error::DecodeError;
 
-/// The default maximum size of one SVC chunk **including** the 8-byte header
-/// (MS-RDPBCGR 2.2.6.1 — clients/servers may negotiate more via the Virtual Channel capset;
-/// justrdp advertises exactly this default).
+/// The default maximum size of one SVC chunk's `virtualChannelData`, **not counting** the
+/// 8-byte header (MS-RDPBCGR 2.2.6.1 — clients/servers may negotiate more via the Virtual
+/// Channel capset; justrdp advertises exactly this default).
 pub const CHANNEL_CHUNK_LENGTH: usize = 1600;
 
 /// This chunk is the first of its message (MS-RDPBCGR 2.2.6.1.1).
@@ -52,7 +52,7 @@ impl<'a> ChannelChunk<'a> {
 
 /// Split `message` into SVC chunk payloads (header + data each), FIRST/LAST flags set per
 /// chunk and SHOW_PROTOCOL on none. Each returned payload is ready to be wrapped in an MCS Send
-/// Data Request and is at most [`CHANNEL_CHUNK_LENGTH`] bytes long.
+/// Data Request and holds at most [`CHANNEL_CHUNK_LENGTH`] data bytes after its header.
 pub fn encode_chunks(message: &[u8]) -> Vec<Vec<u8>> {
     chunk_message(message, false)
 }
@@ -64,9 +64,8 @@ pub fn encode_chunks_show_protocol(message: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn chunk_message(message: &[u8], show: bool) -> Vec<Vec<u8>> {
-    const DATA_PER_CHUNK: usize = CHANNEL_CHUNK_LENGTH - 8;
     let total = message.len() as u32;
-    let mut chunks: Vec<&[u8]> = message.chunks(DATA_PER_CHUNK).collect();
+    let mut chunks: Vec<&[u8]> = message.chunks(CHANNEL_CHUNK_LENGTH).collect();
     if chunks.is_empty() {
         chunks.push(&[]); // a zero-length message is still one (FIRST|LAST) chunk
     }
@@ -127,8 +126,11 @@ mod tests {
     fn large_message_chunks_at_the_channel_chunk_length() {
         let message = vec![7u8; 4000];
         let chunks = encode_chunks(&message);
-        assert_eq!(chunks.len(), 3); // 1592 + 1592 + 816 data bytes
-        assert!(chunks.iter().all(|c| c.len() <= CHANNEL_CHUNK_LENGTH));
+        assert_eq!(chunks.len(), 3); // 1600 + 1600 + 800 data bytes
+        // `virtualChannelData` is at most CHANNEL_CHUNK_LENGTH bytes, the 8-byte header aside
+        // (MS-RDPBCGR 2.2.6.1).
+        let data: Vec<usize> = chunks.iter().map(|c| c.len() - 8).collect();
+        assert_eq!(data, [1600, 1600, 800]);
         let decoded: Vec<ChannelChunk> = chunks
             .iter()
             .map(|c| ChannelChunk::decode(c).unwrap())

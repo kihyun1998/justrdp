@@ -3119,6 +3119,549 @@ mod tests {
         .await;
     }
 
+    /// What [`record_a_tone_pushed_as_audio_input`] saw.
+    #[derive(Debug, Default)]
+    struct AudioInputRun {
+        /// The id the server gave `AUDIO_INPUT`, if it opened it.
+        channel: Option<u32>,
+        /// Every server PDU on the channel, decoded, in order.
+        server_pdus: Vec<justrdp_pdu::audin::ServerPdu>,
+        /// What the helper answered the server's list with.
+        negotiated: Vec<justrdp_pdu::audin::AudioFormat>,
+        /// The Data PDUs sent, by length.
+        data_lengths: Vec<usize>,
+        /// `open=…;record=…;save=…;close=…`, the MCI return codes the session's script wrote.
+        mci_codes: Option<String>,
+        /// The WAV the session recorded, as it wrote it to the host's drive.
+        wav: Option<Vec<u8>>,
+    }
+
+    /// The tone the host pushes, in hertz.
+    const TONE_HZ: f64 = 440.0;
+
+    /// Connect to the audio input VM with `AUDIO_INPUT` registered and a host drive holding a
+    /// script that records five seconds with winmm MCI, saves the WAV to that drive, and writes
+    /// MCI's return codes beside it. While the server records, the host pushes a 440 Hz tone
+    /// through `AudioInput` in real time, ten milliseconds at a time.
+    async fn record_a_tone_pushed_as_audio_input(audio_capture_flag: bool) -> AudioInputRun {
+        use drive_host::{Host, HostDrive, at};
+        use justrdp::audin::{AudioInput, AudioInputConfig, AudioInputEvent};
+        use justrdp::rdpdr::{
+            self, DeviceRedirection, DeviceRedirectionOutput, Drive, VolumeInformation,
+        };
+        use justrdp_pdu::audin::{CHANNEL_NAME, ServerPdu};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const SCRIPT: &str = "Add-Type -Name M -Namespace W -MemberDefinition \
+            '[DllImport(\"winmm.dll\", CharSet=CharSet.Unicode)] public static extern int \
+            mciSendString(string c, System.Text.StringBuilder r, int l, System.IntPtr h);'\r\n\
+            function mci($c) { [W.M]::mciSendString($c, $null, 0, [IntPtr]::Zero) }\r\n\
+            $wav = \"$env:TEMP\\justrdp-audin.wav\"\r\n\
+            $codes = @('open=' + (mci 'open new type waveaudio alias cap'))\r\n\
+            $codes += 'record=' + (mci 'record cap')\r\n\
+            Start-Sleep -Seconds 5\r\n\
+            $codes += 'save=' + (mci \"save cap $wav\")\r\n\
+            $codes += 'close=' + (mci 'close cap')\r\n\
+            if (Test-Path $wav) { Copy-Item $wav \\\\tsclient\\justrdp\\cap.wav }\r\n\
+            [IO.File]::WriteAllText('\\\\tsclient\\justrdp\\codes.txt', ($codes -join ';'))\r\n";
+        const RUN: &str =
+            "powershell -WindowStyle Hidden -ep bypass -f \\\\tsclient\\justrdp\\rec.ps1";
+
+        with_vm_session_on(vm::Target::AudioInput, |vm| async move {
+            let mut config = legacy_graphics_config();
+            config.channels = vec![
+                rdpdr::channel_def(),
+                gcc::ChannelDef::new("rdpsnd", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
+                gcc::ChannelDef::new("drdynvc", gcc::CHANNEL_OPTION_INITIALIZED).unwrap(),
+            ];
+            if audio_capture_flag {
+                config.client_info.flags =
+                    config.client_info.flags | client_info::ClientInfoFlags::AUDIO_CAPTURE;
+            }
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let drive_channel = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "rdpdr")
+                .expect("the VM grants rdpdr")
+                .id;
+            let mut session_config = session_config_from(&outcome, session_capabilities);
+            session_config.dynamic_channels = vec![CHANNEL_NAME.to_string()];
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (commands_tx, mut commands) = tokio::sync::mpsc::channel(4096);
+            let cancel = CancellationToken::new();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let drive_ready = Arc::new(AtomicUsize::new(0));
+            let run = Arc::new(Mutex::new(AudioInputRun::default()));
+            let input = Arc::new(Mutex::new(
+                AudioInput::new(AudioInputConfig::default()).expect("PCM is encodable"),
+            ));
+            // The format and channel the pusher pushes in, once recording.
+            let recording = Arc::new(Mutex::new(None::<(u32, u16, u32)>));
+            let host = Arc::new(Mutex::new(Host::default()));
+            host.lock().unwrap().drives.insert(
+                1,
+                HostDrive {
+                    read_only: false,
+                    tree: HashMap::from([
+                        (Vec::new(), at(0, true)),
+                        (vec!["rec.ps1".to_string()], at(SCRIPT.len() as u64, false)),
+                    ]),
+                    contents: HashMap::from([(
+                        vec!["rec.ps1".to_string()],
+                        SCRIPT.as_bytes().to_vec(),
+                    )]),
+                },
+            );
+
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            {
+                let commands_tx = commands_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(events) = input_rx.recv().await {
+                        if commands_tx
+                            .send(SessionCommand::Input(events))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            // The host's capture device: once recording, a 440 Hz tone, ten milliseconds of it
+            // every ten milliseconds.
+            let pusher = {
+                let (commands_tx, cancel, input, recording, run) = (
+                    commands_tx.clone(),
+                    cancel.clone(),
+                    input.clone(),
+                    recording.clone(),
+                    run.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_millis(10));
+                    let mut frame = 0u64;
+                    while !cancel.is_cancelled() {
+                        tick.tick().await;
+                        let Some((channel_id, channels, rate)) = *recording.lock().unwrap() else {
+                            continue;
+                        };
+                        let frames_per_tick = u64::from(rate / 100);
+                        let samples: Vec<i16> = (frame..frame + frames_per_tick)
+                            .flat_map(|n| {
+                                let t = n as f64 / f64::from(rate);
+                                let s = (8000.0 * (2.0 * std::f64::consts::PI * TONE_HZ * t).sin())
+                                    as i16;
+                                std::iter::repeat_n(s, usize::from(channels))
+                            })
+                            .collect();
+                        frame += frames_per_tick;
+                        let messages = input.lock().unwrap().push(&samples);
+                        for data in messages {
+                            if data.first() == Some(&justrdp_pdu::audin::MSG_SNDIN_DATA) {
+                                run.lock().unwrap().data_lengths.push(data.len());
+                            }
+                            if commands_tx
+                                .send(SessionCommand::DynamicChannelData { channel_id, data })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                })
+            };
+
+            let driver = {
+                let (frames, cancel, drive_ready, host) = (
+                    frames.clone(),
+                    cancel.clone(),
+                    drive_ready.clone(),
+                    host.clone(),
+                );
+                tokio::spawn(async move {
+                    let result = async {
+                        vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                        let start = tokio::time::Instant::now();
+                        while drive_ready.load(Ordering::SeqCst) == 0 {
+                            if start.elapsed() > Duration::from_secs(30) {
+                                return Err("the drive never became ready".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        // Windows 11's Start search runs no command with arguments, and a
+                        // terminal repaints continually, so the desktop would never settle
+                        // again: open the Run dialog and start PowerShell from it, hidden.
+                        vm::start_menu_run(&input_tx, &frames, desktop, "run").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        for unit in RUN.encode_utf16() {
+                            input_tx
+                                .send(vec![
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: false,
+                                    },
+                                    InputEvent::Unicode {
+                                        code_unit: unit,
+                                        release: true,
+                                    },
+                                ])
+                                .await
+                                .map_err(|_| "the session closed".to_string())?;
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        let enter = {
+                            let key = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
+                            vec![key.press(), key.release()]
+                        };
+                        input_tx
+                            .send(enter)
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+                        let codes = vec!["codes.txt".to_string()];
+                        let start = tokio::time::Instant::now();
+                        loop {
+                            // The script creates the file before it writes it.
+                            if host.lock().unwrap().drives[&1]
+                                .contents
+                                .get(&codes)
+                                .is_some_and(|c| c.windows(6).any(|w| w == b"close="))
+                            {
+                                return Ok(());
+                            }
+                            if start.elapsed() > Duration::from_secs(90) {
+                                return Err("the script wrote no codes.txt within 90 s".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                    }
+                    .await;
+                    cancel.cancel();
+                    result
+                })
+            };
+
+            let frames_in_sink = frames.clone();
+            let (run_in, input_in, recording_in, host_in, drive_ready_in) = (
+                run.clone(),
+                input.clone(),
+                recording.clone(),
+                host.clone(),
+                drive_ready.clone(),
+            );
+            let mut redirection = DeviceRedirection::new(
+                "justrdp-test",
+                vec![Drive {
+                    device_id: 1,
+                    name: "justrdp".to_string(),
+                }],
+                0x5EED_A0D1,
+            )
+            .expect("the drive is valid");
+            let volume = VolumeInformation {
+                label: "justrdp".to_string(),
+                serial_number: 0xA0D1_5EED,
+                creation_time: 134_116_992_000_000_000,
+                total_units: 1 << 20,
+                available_units: 1 << 19,
+                sectors_per_unit: 8,
+                bytes_per_sector: 512,
+                file_system: "NTFS".to_string(),
+                file_system_attributes: 0x0000_0007,
+                max_component_length: 255,
+            };
+            let ended = tokio::time::timeout(
+                Duration::from_secs(300),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |event| match event {
+                        SessionEvent::DynamicChannelOpened { name, channel_id }
+                            if name == CHANNEL_NAME =>
+                        {
+                            eprintln!("AUDIO_INPUT opened as channel {channel_id}");
+                            run_in.lock().unwrap().channel = Some(channel_id);
+                        }
+                        SessionEvent::DynamicChannelData { channel_id, data } => {
+                            if let Ok(pdu) = ServerPdu::decode(&data) {
+                                eprintln!("AUDIO_INPUT server PDU: {pdu:?}");
+                                run_in.lock().unwrap().server_pdus.push(pdu);
+                            }
+                            let send = |data| {
+                                commands_tx
+                                    .try_send(SessionCommand::DynamicChannelData {
+                                        channel_id,
+                                        data,
+                                    })
+                                    .expect("the command queue has room")
+                            };
+                            let events = input_in.lock().unwrap().process(&data);
+                            for event in events {
+                                match event {
+                                    AudioInputEvent::Send(data) => send(data),
+                                    AudioInputEvent::Negotiated(formats) => {
+                                        run_in.lock().unwrap().negotiated = formats;
+                                    }
+                                    AudioInputEvent::Open { format, .. } => {
+                                        let reply = input_in
+                                            .lock()
+                                            .unwrap()
+                                            .open_reply(0)
+                                            .expect("an Open waits for this answer");
+                                        send(reply);
+                                        *recording_in.lock().unwrap() = Some((
+                                            channel_id,
+                                            format.channels,
+                                            format.samples_per_sec,
+                                        ));
+                                    }
+                                    AudioInputEvent::FormatChanged(format) => {
+                                        *recording_in.lock().unwrap() = Some((
+                                            channel_id,
+                                            format.channels,
+                                            format.samples_per_sec,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        SessionEvent::ChannelData { channel, data } if channel == drive_channel => {
+                            for output in redirection.process(&data) {
+                                let answer = match output {
+                                    DeviceRedirectionOutput::Send(data) => Some(data),
+                                    DeviceRedirectionOutput::DriveAccepted { .. } => {
+                                        drive_ready_in.fetch_add(1, Ordering::SeqCst);
+                                        None
+                                    }
+                                    DeviceRedirectionOutput::DriveRequest {
+                                        completion_id,
+                                        device_id,
+                                        request,
+                                    } => Some(
+                                        host_in
+                                            .lock()
+                                            .unwrap()
+                                            .answer(
+                                                &mut redirection,
+                                                completion_id,
+                                                device_id,
+                                                request,
+                                                &volume,
+                                            )
+                                            .expect("the request waits for this answer"),
+                                    ),
+                                    DeviceRedirectionOutput::FileClosed {
+                                        file_id, delete, ..
+                                    } => {
+                                        host_in.lock().unwrap().closed(file_id, delete);
+                                        None
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(data) = answer {
+                                    commands_tx
+                                        .try_send(SessionCommand::ChannelData {
+                                            channel: drive_channel,
+                                            data,
+                                        })
+                                        .expect("the command queue has room");
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    &mut commands,
+                    &cancel,
+                ),
+            )
+            .await;
+            let driven = driver.await.expect("the driver task");
+            pusher.abort();
+            ended
+                .expect("the session ended within 300 s")
+                .expect("the session ran without a protocol failure");
+            let mut run = std::mem::take(&mut *run.lock().unwrap());
+            let host = host.lock().unwrap();
+            let file = |name: &str| {
+                host.drives[&1]
+                    .contents
+                    .get(&vec![name.to_string()])
+                    .cloned()
+            };
+            run.mci_codes = file("codes.txt").map(|c| String::from_utf8_lossy(&c).into_owned());
+            run.wav = file("cap.wav");
+            if let Err(why) = driven {
+                eprintln!("the desktop was not driven to the end: {why}");
+            }
+            run
+        })
+        .await
+    }
+
+    /// A WAV file's PCM samples as `f64`, mono (the first channel), and its sample rate.
+    fn wav_mono(wav: &[u8]) -> (Vec<f64>, u32) {
+        let mut at = 12;
+        let (mut channels, mut rate, mut bits, mut data) = (0usize, 0u32, 0u16, &[][..]);
+        while at + 8 <= wav.len() {
+            let id = &wav[at..at + 4];
+            let len = u32::from_le_bytes(wav[at + 4..at + 8].try_into().unwrap()) as usize;
+            let body = &wav[at + 8..(at + 8 + len).min(wav.len())];
+            if id == b"fmt " {
+                channels = usize::from(u16::from_le_bytes([body[2], body[3]]));
+                rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
+                bits = u16::from_le_bytes([body[14], body[15]]);
+            } else if id == b"data" {
+                data = body;
+            }
+            at += 8 + len + (len & 1);
+        }
+        let samples = match bits {
+            8 => data
+                .iter()
+                .map(|&b| f64::from(b) - 128.0)
+                .collect::<Vec<_>>(),
+            16 => data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| f64::from(i16::from_le_bytes(*s)))
+                .collect(),
+            other => panic!("a WAV of {other}-bit samples"),
+        };
+        (
+            samples.iter().step_by(channels.max(1)).copied().collect(),
+            rate,
+        )
+    }
+
+    /// The power of `samples` at `hz` (Goertzel).
+    fn power_at(samples: &[f64], rate: u32, hz: f64) -> f64 {
+        let coeff = 2.0 * (2.0 * std::f64::consts::PI * hz / f64::from(rate)).cos();
+        let (mut s1, mut s2) = (0.0, 0.0);
+        for &x in samples {
+            let s = x + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+        s1 * s1 + s2 * s2 - coeff * s1 * s2
+    }
+
+    /// Real-VM acceptance for #404: without `INFO_AUDIOCAPTURE` the server opens no
+    /// `AUDIO_INPUT` channel, and the session has no capture device for MCI to record from.
+    #[tokio::test]
+    #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation,                 expires around 2027-01) and JUSTRDP_TEST_* env vars"]
+    async fn without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm() {
+        let run = record_a_tone_pushed_as_audio_input(false).await;
+        assert_eq!(run.channel, None, "the server opened no AUDIO_INPUT");
+        let codes = run.mci_codes.expect("the script wrote MCI's return codes");
+        assert!(
+            codes.contains("record=328"),
+            "MCI found no capture device (328, MCIERR_WAVE_INPUTSUNSUITABLE): {codes}"
+        );
+    }
+
+    /// The tone check the audio input VM test makes, on WAVs built here: MCI's default 11,025 Hz
+    /// 8-bit mono holding the tone passes, and silence or another tone does not.
+    #[test]
+    fn the_tone_check_finds_440_hz_in_an_8_bit_wav_and_nothing_else() {
+        fn wav(hz: f64, amplitude: f64) -> Vec<u8> {
+            let rate = 11_025u32;
+            let data: Vec<u8> = (0..rate * 2)
+                .map(|n| {
+                    let t = f64::from(n) / f64::from(rate);
+                    (128.0 + amplitude * (2.0 * std::f64::consts::PI * hz * t).sin()) as u8
+                })
+                .collect();
+            let mut out = b"RIFF".to_vec();
+            out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+            out.extend_from_slice(b"WAVEfmt ");
+            out.extend_from_slice(&16u32.to_le_bytes());
+            for v in [1u16, 1] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&rate.to_le_bytes());
+            out.extend_from_slice(&rate.to_le_bytes());
+            for v in [1u16, 8] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(b"data");
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&data);
+            out
+        }
+        let holds_tone = |wav: &[u8]| {
+            let (samples, rate) = wav_mono(wav);
+            assert_eq!(rate, 11_025);
+            let tone = power_at(&samples, rate, TONE_HZ);
+            let off = [250.0, 330.0, 620.0, 880.0, 1000.0]
+                .map(|hz| power_at(&samples, rate, hz))
+                .into_iter()
+                .fold(0.0, f64::max);
+            tone > 20.0 * off
+        };
+        assert!(holds_tone(&wav(TONE_HZ, 30.0)));
+        assert!(!holds_tone(&wav(TONE_HZ, 0.0)));
+        assert!(!holds_tone(&wav(620.0, 30.0)));
+    }
+
+    /// Real-VM acceptance for #404: the server opens `AUDIO_INPUT` when the session records,
+    /// the helper negotiates PCM and answers its Open, and a 440 Hz tone the host pushes is what
+    /// the session's recording holds, read back over drive redirection.
+    #[tokio::test]
+    #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
+                expires around 2027-01) and JUSTRDP_TEST_* env vars"]
+    async fn a_tone_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm() {
+        let run = record_a_tone_pushed_as_audio_input(true).await;
+        assert!(run.channel.is_some(), "the server opened AUDIO_INPUT");
+        let codes = run.mci_codes.expect("the script wrote MCI's return codes");
+        assert!(
+            !codes.contains("record=328"),
+            "MCI found no capture device (328, MCIERR_WAVE_INPUTSUNSUITABLE): the VM has no \
+             audio input redirection; see verification-harness.md"
+        );
+        assert!(
+            !codes.contains("record=322"),
+            "MCI could not open the capture device (322, MCIERR_WAVE_INPUTSINUSE): the server \
+             made a device but never connected it; see verification-harness.md"
+        );
+        assert_eq!(codes, "open=0;record=0;save=0;close=0");
+        assert!(
+            !run.data_lengths.is_empty(),
+            "the host's samples left as Data PDUs"
+        );
+        let wav = run.wav.expect("the recording reached the host's drive");
+        let (samples, rate) = wav_mono(&wav);
+        let tone = power_at(&samples, rate, TONE_HZ);
+        let off = [250.0, 330.0, 620.0, 880.0, 1000.0]
+            .map(|hz| power_at(&samples, rate, hz))
+            .into_iter()
+            .fold(0.0, f64::max);
+        eprintln!(
+            "recorded {} samples at {rate} Hz; power at {TONE_HZ} Hz {tone:.3e}, most elsewhere \
+             {off:.3e}",
+            samples.len()
+        );
+        assert!(
+            tone > 20.0 * off,
+            "the recording holds the pushed 440 Hz tone and little else"
+        );
+    }
+
     /// Real-VM acceptance for #388: a host that lists only A-law has the server send A-law, and
     /// the sound reaches the host decoded to i16.
     #[tokio::test]
@@ -7835,8 +8378,63 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::task::Poll;
 
-        /// The test VM. Deliberately private: see the module docs.
+        /// The test VM, Windows Server 2019. Deliberately private: see the module docs.
         const VM_ADDR: &str = "192.168.136.136:3389";
+
+        /// The audio input VM, a Windows 11 Enterprise evaluation (#400): the main VM opens no
+        /// `AUDIO_INPUT` channel. The evaluation expires around 2027-01, after which connects to
+        /// it fail in TCP or in the session rather than in anything the client does.
+        const AUDIO_INPUT_VM_ADDR: &str = "192.168.136.163:3389";
+
+        /// Which VM a test drives. Each is its own Windows session, so each has its own lock.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(super) enum Target {
+            /// [`VM_ADDR`], which every test drives unless it names another.
+            Main,
+            /// [`AUDIO_INPUT_VM_ADDR`].
+            AudioInput,
+        }
+
+        impl Target {
+            fn addr(self) -> &'static str {
+                match self {
+                    Target::Main => VM_ADDR,
+                    Target::AudioInput => AUDIO_INPUT_VM_ADDR,
+                }
+            }
+
+            fn lock(self) -> &'static tokio::sync::Mutex<()> {
+                match self {
+                    Target::Main => &VM_SESSION,
+                    Target::AudioInput => &AUDIO_INPUT_VM_SESSION,
+                }
+            }
+
+            /// The command the teardown types into the Start menu to sign the session out.
+            /// Windows 11's search runs a bare command but only offers one with arguments as a
+            /// "Run command" result that Enter does not run (measured, #404), so that VM signs
+            /// out with `logoff`.
+            fn sign_out(self) -> &'static str {
+                match self {
+                    Target::Main => SIGN_OUT,
+                    Target::AudioInput => "logoff",
+                }
+            }
+
+            /// `performanceFlags` bits every connect to this VM adds to the test's own.
+            fn performance_flags(self) -> u32 {
+                match self {
+                    Target::Main => 0,
+                    Target::AudioInput => PERF_DISABLE_CURSORSETTINGS,
+                }
+            }
+        }
+
+        /// `PERF_DISABLE_CURSORSETTINGS`, "Disable cursor blinking" (`[MS-RDPBCGR]`
+        /// 2.2.1.11.1.1.1). Windows 11's terminal blinks its text cursor about twice a second,
+        /// which repaints a tile each time, so [`await_desktop`] never sees the desktop go quiet
+        /// (measured on the audio input VM, #404).
+        const PERF_DISABLE_CURSORSETTINGS: u32 = 0x0000_0040;
 
         /// All real-VM tests drive the same Windows session, so they must not overlap: a
         /// concurrent logon with the same account takes the session over and kicks the other
@@ -7849,6 +8447,9 @@ mod tests {
         /// *order* tests acquired it in — and an order-dependent suite is what the teardown
         /// below exists to abolish.
         static VM_SESSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        /// [`VM_SESSION`] for [`AUDIO_INPUT_VM_ADDR`].
+        static AUDIO_INPUT_VM_SESSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
         /// Credentials from the environment, so none is committed to the repo.
         fn credentials() -> Credentials {
@@ -7864,14 +8465,17 @@ mod tests {
         /// A claim on the test VM, handed to the body of [`with_vm_session`]. Holding one means
         /// the lock is held and the desktop will be tidied afterwards.
         pub(super) struct Vm {
-            _seal: (),
+            target: Target,
         }
 
         impl Vm {
             /// The VM's address — for a test that must interpose something (a proxy) in front
             /// of it. An address alone reaches no session; the credentials stay in here.
             pub(super) fn addr(&self) -> SocketAddr {
-                VM_ADDR.parse().expect("the VM address is a literal")
+                self.target
+                    .addr()
+                    .parse()
+                    .expect("the VM address is a literal")
             }
 
             /// Connect and require session-active.
@@ -7907,9 +8511,10 @@ mod tests {
             async fn try_connect_through(
                 &self,
                 addr: SocketAddr,
-                config: ConnectConfig,
+                mut config: ConnectConfig,
                 on_stage: impl FnMut(&str),
             ) -> Result<ConnectOutcome, ConnectFailure> {
+                config.client_info.performance_flags |= self.target.performance_flags();
                 connect_danger(addr, config, credentials(), on_stage).await
             }
         }
@@ -8255,9 +8860,18 @@ mod tests {
             F: FnOnce(Vm) -> Fut,
             Fut: Future<Output = T>,
         {
-            let _guard = VM_SESSION.lock().await;
-            let outcome = catch_panic(body(Vm { _seal: () })).await;
-            let tidy = catch_panic(tidy_session()).await;
+            with_vm_session_on(Target::Main, body).await
+        }
+
+        /// [`with_vm_session`] against `target`.
+        pub(super) async fn with_vm_session_on<F, Fut, T>(target: Target, body: F) -> T
+        where
+            F: FnOnce(Vm) -> Fut,
+            Fut: Future<Output = T>,
+        {
+            let _guard = target.lock().lock().await;
+            let outcome = catch_panic(body(Vm { target })).await;
+            let tidy = catch_panic(tidy_session(target)).await;
             match (outcome, tidy) {
                 // The body's verdict wins: a teardown failure must never mask it, but it must
                 // still be visible, because the next test is about to inherit the mess.
@@ -8291,9 +8905,9 @@ mod tests {
         /// does cost is that everything after session-active now starts from a shell that is
         /// still coming up, which is what [`start_menu_run`] exists to survive (#198).
         ///
-        /// The command is [`SIGN_OUT`]; why it is no longer `shutdown /l /f` is recorded there.
-        async fn tidy_session() -> () {
-            let vm = Vm { _seal: () };
+        /// The command is the target's [`Target::sign_out`]: [`SIGN_OUT`] on the main VM.
+        async fn tidy_session(target: Target) -> () {
+            let vm = Vm { target };
             let config = legacy_graphics_config();
             let capabilities = config.capabilities.clone();
             let Ok(outcome) = vm.try_connect_through(vm.addr(), config, |_| {}).await else {
@@ -8313,7 +8927,7 @@ mod tests {
             let frames_in_sink = frames.clone();
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(32);
             let driver = tokio::spawn(async move {
-                if let Err(why) = start_menu_run(&tx, &frames, desktop, SIGN_OUT).await {
+                if let Err(why) = start_menu_run(&tx, &frames, desktop, target.sign_out()).await {
                     // Say it here rather than only failing below: this is the sentence that
                     // distinguishes "the sign-out was refused" from "the sign-out was never
                     // typed", and #182's whole cost was not being able to tell those apart.
@@ -8795,7 +9409,7 @@ mod tests {
             .await
         }
     }
-    use vm::{start_menu_run, with_vm_session};
+    use vm::{start_menu_run, with_vm_session, with_vm_session_on};
 
     /// Cancel-safety (issue #8): cancelling the token ends `run_session_with_commands`
     /// promptly and cleanly even while the server is silent and a refused resize command is
