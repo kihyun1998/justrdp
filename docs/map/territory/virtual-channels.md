@@ -135,7 +135,9 @@ glossary, which is vocabulary rather than a decision.
     It cannot reach a core channel, since a send needs a host endpoint, and with one host name
     it is harmless. #270 measured this server reusing an id within 40 ms, for refused channels.
     Revisit when a slice runs several host channels at once (audio input, #12). Shown:
-    per-binding generation handles now, or a follow-up issue.
+    per-binding generation handles now, or a follow-up issue. Audio input reached that trigger
+    with #404, whose tests open one host dynamic channel; the measurement and the handles are
+    #408 (the maintainer's call, 2026-10-08).
   - **A server Close is not answered.** `[MS-RDPEDYC]` 3.2.5.2 makes the reply a MAY; FreeRDP
     (`dvcchannel_send_close`) and IronRDP (`process_close`) both send one. The host cannot send
     it either, since the binding is gone when `DynamicChannelClosed` arrives. This predates #385
@@ -730,6 +732,9 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   design-model bullet for when that changes.
 - SVC compression (`VirtualChannelCapabilitySet`'s compression flags) is not
   implemented.
+- **The server's `VCChunkSize` is decoded and not used**: chunks always carry 1,600 data bytes,
+  the size `[MS-RDPBCGR]` 2.2.7.1.10 says the server's value MUST be at least, so a larger
+  value only goes unused. Recorded rather than filed at the maintainer's call (2026-10-08).
 - **A host dynamic channel has no host-set message cap and no drop path** (#385): a message over
   the manager's fixed 4 MiB ends the session as a transport error (ADR-0014), where a host static
   channel's is skipped and reported (`ChannelMessageDropped`, #323). Audio blocks are far below
