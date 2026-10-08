@@ -29,8 +29,8 @@ pub const CMD_DATA_FIRST_COMPRESSED: u8 = 0x06;
 pub const CMD_DATA_COMPRESSED: u8 = 0x07;
 
 /// The largest data block carried by a single Data / Data First PDU; longer messages are
-/// fragmented (MS-RDPEDYC 3.1.5.1.2). With the worst-case 6-byte DVC header this stays within
-/// one 1600-byte SVC chunk.
+/// fragmented (MS-RDPEDYC 3.1.5.1.2). With the worst-case 9-byte DVC header (a Data First with a
+/// 4-byte channel id and a 4-byte length) a PDU stays within one SVC chunk's 1600 data bytes.
 pub const MAX_DATA_CHUNK: usize = 1590;
 
 /// The capabilities version justrdp answers with, capped at the server's offer: 2, the highest
@@ -330,6 +330,17 @@ mod tests {
             for pdu in encode_data(channel_id, &message) {
                 prop_assert_eq!(crate::svc::encode_chunks(&pdu).len(), 1, "{} bytes", pdu.len());
             }
+        }
+    }
+
+    /// The worst-case header: a 4-byte channel id and a Data First whose length needs 4 bytes.
+    #[test]
+    fn the_widest_data_first_still_fits_one_svc_chunk() {
+        let message = vec![0x5Au8; 70_000];
+        let pdus = encode_data(0x0102_0304, &message);
+        assert_eq!(pdus[0].len(), 1 + 4 + 4 + MAX_DATA_CHUNK);
+        for pdu in &pdus {
+            assert_eq!(crate::svc::encode_chunks(pdu).len(), 1);
         }
     }
 

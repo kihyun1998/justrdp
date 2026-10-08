@@ -355,10 +355,10 @@ was checked against.
     and both the test and the teardown time out, leaving a session the next run reattaches to.
     The audio input test opens the Run dialog from the Start menu (`run`, a bare command) and
     starts PowerShell hidden from it.
-  - **Every connect to it adds `PERF_DISABLE_CURSORSETTINGS`** (`[MS-RDPBCGR]`
-    2.2.1.11.1.1.1, "Disable cursor blinking"), a blinking caret being the other thing that
-    keeps the desktop from settling; it did not stop the terminal. A reattached session keeps
-    the settings of the logon that created it.
+  - **No `performanceFlags` of its own.** `PERF_DISABLE_CURSORSETTINGS` (`[MS-RDPBCGR]`
+    2.2.1.11.1.1.1, "Disable cursor blinking") did not stop the terminal's repaints, and with no
+    terminal open the audio input test passes without it (measured, #404). A reattached session
+    keeps the settings of the logon that created it.
   - **The Shutdown Request PDU is denied** here as on Server, so a session left open is
     recovered by signing out from inside it: a connect, a click on whatever window repaints,
     then the teardown.

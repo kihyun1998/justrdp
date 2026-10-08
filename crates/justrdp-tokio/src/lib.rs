@@ -3300,9 +3300,7 @@ mod tests {
                             }
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }
-                        // Windows 11's Start search runs no command with arguments, and a
-                        // terminal repaints continually, so the desktop would never settle
-                        // again: open the Run dialog and start PowerShell from it, hidden.
+                        // The Run dialog, and PowerShell hidden from it.
                         vm::start_menu_run(&input_tx, &frames, desktop, "run").await?;
                         vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
                         for unit in RUN.encode_utf16() {
@@ -3399,7 +3397,6 @@ mod tests {
                         }
                         SessionEvent::DynamicChannelData { channel_id, data } => {
                             if let Ok(pdu) = ServerPdu::decode(&data) {
-                                eprintln!("AUDIO_INPUT server PDU: {pdu:?}");
                                 run_in.lock().unwrap().server_pdus.push(pdu);
                             }
                             let send = |data| {
@@ -3522,6 +3519,7 @@ mod tests {
             let len = u32::from_le_bytes(wav[at + 4..at + 8].try_into().unwrap()) as usize;
             let body = &wav[at + 8..(at + 8 + len).min(wav.len())];
             if id == b"fmt " {
+                assert!(body.len() >= 16, "a WAV fmt chunk of {} bytes", body.len());
                 channels = usize::from(u16::from_le_bytes([body[2], body[3]]));
                 rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
                 bits = u16::from_le_bytes([body[14], body[15]]);
@@ -3549,6 +3547,18 @@ mod tests {
         )
     }
 
+    /// Whether `wav` holds [`TONE_HZ`] at more than 20 times the power of any of five other
+    /// frequencies, with the WAV's samples, rate and the two powers for the record.
+    fn holds_tone(wav: &[u8]) -> (bool, usize, u32, f64, f64) {
+        let (samples, rate) = wav_mono(wav);
+        let tone = power_at(&samples, rate, TONE_HZ);
+        let off = [250.0, 330.0, 620.0, 880.0, 1000.0]
+            .map(|hz| power_at(&samples, rate, hz))
+            .into_iter()
+            .fold(0.0, f64::max);
+        (tone > 20.0 * off, samples.len(), rate, tone, off)
+    }
+
     /// The power of `samples` at `hz` (Goertzel).
     fn power_at(samples: &[f64], rate: u32, hz: f64) -> f64 {
         let coeff = 2.0 * (2.0 * std::f64::consts::PI * hz / f64::from(rate)).cos();
@@ -3564,7 +3574,8 @@ mod tests {
     /// Real-VM acceptance for #404: without `INFO_AUDIOCAPTURE` the server opens no
     /// `AUDIO_INPUT` channel, and the session has no capture device for MCI to record from.
     #[tokio::test]
-    #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation,                 expires around 2027-01) and JUSTRDP_TEST_* env vars"]
+    #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
+                expires around 2027-01) and JUSTRDP_TEST_* env vars"]
     async fn without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm() {
         let run = record_a_tone_pushed_as_audio_input(false).await;
         assert_eq!(run.channel, None, "the server opened no AUDIO_INPUT");
@@ -3604,19 +3615,9 @@ mod tests {
             out.extend_from_slice(&data);
             out
         }
-        let holds_tone = |wav: &[u8]| {
-            let (samples, rate) = wav_mono(wav);
-            assert_eq!(rate, 11_025);
-            let tone = power_at(&samples, rate, TONE_HZ);
-            let off = [250.0, 330.0, 620.0, 880.0, 1000.0]
-                .map(|hz| power_at(&samples, rate, hz))
-                .into_iter()
-                .fold(0.0, f64::max);
-            tone > 20.0 * off
-        };
-        assert!(holds_tone(&wav(TONE_HZ, 30.0)));
-        assert!(!holds_tone(&wav(TONE_HZ, 0.0)));
-        assert!(!holds_tone(&wav(620.0, 30.0)));
+        assert!(holds_tone(&wav(TONE_HZ, 30.0)).0);
+        assert!(!holds_tone(&wav(TONE_HZ, 0.0)).0);
+        assert!(!holds_tone(&wav(620.0, 30.0)).0);
     }
 
     /// Real-VM acceptance for #404: the server opens `AUDIO_INPUT` when the session records,
@@ -3640,24 +3641,39 @@ mod tests {
              made a device but never connected it; see verification-harness.md"
         );
         assert_eq!(codes, "open=0;record=0;save=0;close=0");
+        use justrdp_pdu::audin::ServerPdu;
         assert!(
-            !run.data_lengths.is_empty(),
-            "the host's samples left as Data PDUs"
+            run.server_pdus.contains(&ServerPdu::Version(2)),
+            "the server speaks version 2: {:?}",
+            run.server_pdus.first()
+        );
+        assert!(
+            run.server_pdus
+                .iter()
+                .any(|p| matches!(p, ServerPdu::Formats(f) if f.contains(&run.negotiated[0]))),
+            "the PCM format the helper answered with is in the server's list"
+        );
+        assert!(
+            run.server_pdus
+                .iter()
+                .any(|p| matches!(p, ServerPdu::Open(o) if o.frames_per_packet > 0)),
+            "the server asked to record"
+        );
+        assert!(
+            run.data_lengths
+                .iter()
+                .all(|&len| len > justrdp_pdu::dvc::MAX_DATA_CHUNK),
+            "every Data PDU spans more than one drdynvc fragment: {:?}",
+            run.data_lengths.first()
         );
         let wav = run.wav.expect("the recording reached the host's drive");
-        let (samples, rate) = wav_mono(&wav);
-        let tone = power_at(&samples, rate, TONE_HZ);
-        let off = [250.0, 330.0, 620.0, 880.0, 1000.0]
-            .map(|hz| power_at(&samples, rate, hz))
-            .into_iter()
-            .fold(0.0, f64::max);
+        let (holds, samples, rate, tone, off) = holds_tone(&wav);
         eprintln!(
-            "recorded {} samples at {rate} Hz; power at {TONE_HZ} Hz {tone:.3e}, most elsewhere \
-             {off:.3e}",
-            samples.len()
+            "recorded {samples} samples at {rate} Hz; power at {TONE_HZ} Hz {tone:.3e}, most \
+             elsewhere {off:.3e}"
         );
         assert!(
-            tone > 20.0 * off,
+            holds,
             "the recording holds the pushed 440 Hz tone and little else"
         );
     }
@@ -8024,9 +8040,10 @@ mod tests {
 
     /// The real-VM harness (issue #182) — **the only way a test reaches the test VM**.
     ///
-    /// Every `#[ignore]`d VM test runs its body inside [`with_vm_session`], which owns the three
-    /// things a session needs and exports none of them: the VM's address, the credentials, and
-    /// the process-wide serialisation lock. A test that tried to call [`connect_danger`] itself
+    /// Every `#[ignore]`d VM test runs its body inside [`with_vm_session`], or
+    /// [`with_vm_session_on`] for a VM other than the main one, which owns the three things a
+    /// session needs and exports none of them: each VM's address, the credentials, and each VM's
+    /// process-wide serialisation lock. A test that tried to call [`connect_danger`] itself
     /// would have no server to name and no account to name it with, so "go through the harness"
     /// is enforced by construction rather than by review.
     ///
@@ -8381,9 +8398,7 @@ mod tests {
         /// The test VM, Windows Server 2019. Deliberately private: see the module docs.
         const VM_ADDR: &str = "192.168.136.136:3389";
 
-        /// The audio input VM, a Windows 11 Enterprise evaluation (#400): the main VM opens no
-        /// `AUDIO_INPUT` channel. The evaluation expires around 2027-01, after which connects to
-        /// it fail in TCP or in the session rather than in anything the client does.
+        /// The audio input VM, a Windows 11 Enterprise evaluation.
         const AUDIO_INPUT_VM_ADDR: &str = "192.168.136.163:3389";
 
         /// Which VM a test drives. Each is its own Windows session, so each has its own lock.
@@ -8411,32 +8426,16 @@ mod tests {
             }
 
             /// The command the teardown types into the Start menu to sign the session out.
-            /// Windows 11's search runs a bare command but only offers one with arguments as a
-            /// "Run command" result that Enter does not run (measured, #404), so that VM signs
-            /// out with `logoff`.
             fn sign_out(self) -> &'static str {
                 match self {
                     Target::Main => SIGN_OUT,
                     Target::AudioInput => "logoff",
                 }
             }
-
-            /// `performanceFlags` bits every connect to this VM adds to the test's own.
-            fn performance_flags(self) -> u32 {
-                match self {
-                    Target::Main => 0,
-                    Target::AudioInput => PERF_DISABLE_CURSORSETTINGS,
-                }
-            }
         }
 
-        /// `PERF_DISABLE_CURSORSETTINGS`, "Disable cursor blinking" (`[MS-RDPBCGR]`
-        /// 2.2.1.11.1.1.1). Windows 11's terminal blinks its text cursor about twice a second,
-        /// which repaints a tile each time, so [`await_desktop`] never sees the desktop go quiet
-        /// (measured on the audio input VM, #404).
-        const PERF_DISABLE_CURSORSETTINGS: u32 = 0x0000_0040;
-
-        /// All real-VM tests drive the same Windows session, so they must not overlap: a
+        /// All real-VM tests on the main VM drive the same Windows session, so they must not
+        /// overlap: a
         /// concurrent logon with the same account takes the session over and kicks the other
         /// test mid-run.
         ///
@@ -8511,10 +8510,9 @@ mod tests {
             async fn try_connect_through(
                 &self,
                 addr: SocketAddr,
-                mut config: ConnectConfig,
+                config: ConnectConfig,
                 on_stage: impl FnMut(&str),
             ) -> Result<ConnectOutcome, ConnectFailure> {
-                config.client_info.performance_flags |= self.target.performance_flags();
                 connect_danger(addr, config, credentials(), on_stage).await
             }
         }
