@@ -178,8 +178,9 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
 - **Windows 11 discards every A-law Data PDU of exactly `FramesPerPacket` × `nBlockAlign`
   bytes**, 882, which is the spec's frame rule: the recording is empty. Packets of 440 and 442
   frames record; alternating 441 and 442 loses each 441 alone. Why is not visible from the
-  wire. PCM at the capture format's rate is unaffected; a format at another rate, such as
-  ADPCM at 22.05 kHz (#403), could show whether the size or the rate decides it.
+  wire. PCM at the capture format's rate is unaffected. Whether the size or the rate decides
+  it is open: ADPCM cannot show it, since a block format has no packet of `FramesPerPacket` ×
+  `nBlockAlign` bytes, and no other 8-bit format is offered.
 - **Windows 11 loses part of every ADPCM packet** (#403, 2026-10-12). It offers MS-ADPCM and
   IMA-ADPCM each at 44.1 kHz stereo (`nBlockAlign` 2048), 22.05 kHz stereo (1024), 44.1 kHz
   mono (1024), 11.025 kHz stereo (512), 22.05 kHz mono (512), 8 kHz stereo (512), 11.025 kHz
