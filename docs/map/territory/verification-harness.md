@@ -362,6 +362,9 @@ was checked against.
   - **The Shutdown Request PDU is denied** here as on Server, so a session left open is
     recovered by signing out from inside it: a connect, a click on whatever window repaints,
     then the teardown.
+  - **The tone pusher keeps real time by a running count**: each 10 ms tick it pushes up to
+    `ticks × rate ÷ 100` frames. 22,050 frames are no whole number of hundredths, and pushing
+    `rate ÷ 100` a tick fell 50 frames a second behind at A-law's rate (#402).
 - **Driving a desktop by synthesised keystrokes is open-loop, and the acknowledgement
   the harness needs is the one it already receives.** Every VM test that has to make
   something happen *inside* Windows — sign out, launch an app, run `tsdiscon` — types

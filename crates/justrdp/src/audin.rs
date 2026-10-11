@@ -10,9 +10,9 @@
 //! encodes, copied as the server sent it, so the client list is always a subset of the server's
 //! (3.2.5.1.5). Malformed, unknown and out-of-sequence messages are ignored, as 3.1.5 requires.
 
-use justrdp_codecs::pcm;
+use justrdp_codecs::{g711, pcm};
 use justrdp_pdu::audin::{self as pdu, AudioFormat, ServerPdu};
-use justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM;
+use justrdp_pdu::rdpsnd::{WAVE_FORMAT_ALAW, WAVE_FORMAT_PCM};
 
 /// The `HRESULT` severity bit, set on an error code (`[MS-ERREF]` 2.1).
 const HRESULT_SEVERITY_ERROR: u32 = 0x8000_0000;
@@ -21,24 +21,27 @@ const HRESULT_SEVERITY_ERROR: u32 = 0x8000_0000;
 pub const CLIENT_VERSION: u32 = 0x0000_0002;
 
 /// The `wFormatTag`s the core encodes.
-pub const ENCODABLE_FORMAT_TAGS: &[u16] = &[WAVE_FORMAT_PCM];
+pub const ENCODABLE_FORMAT_TAGS: &[u16] = &[WAVE_FORMAT_PCM, WAVE_FORMAT_ALAW];
 
 /// How samples of one client format encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Encoder {
     /// Linear PCM at this many bits.
     Pcm(u16),
+    /// G.711 A-law.
+    Alaw,
 }
 
 impl Encoder {
     /// The encoder for `format`, or `None` when the core does not encode it. PCM at 8 or 16 bits
-    /// needs at least one channel and a block of exactly one frame.
+    /// and A-law at 8 need at least one channel and a block of exactly one frame.
     fn for_format(format: &AudioFormat) -> Option<Self> {
         let one_frame = format.channels > 0
             && u32::from(format.block_align)
                 == u32::from(format.channels) * u32::from(format.bits_per_sample / 8);
         match (format.format_tag, format.bits_per_sample) {
             (WAVE_FORMAT_PCM, bits @ (8 | 16)) if one_frame => Some(Encoder::Pcm(bits)),
+            (WAVE_FORMAT_ALAW, 8) if one_frame => Some(Encoder::Alaw),
             _ => None,
         }
     }
@@ -49,6 +52,7 @@ impl Encoder {
             Encoder::Pcm(bits) => {
                 pcm::encode(bits, samples).expect("the depth was checked at negotiation")
             }
+            Encoder::Alaw => g711::encode_alaw(samples),
         }
     }
 }
@@ -119,7 +123,8 @@ pub enum AudioInputEvent {
         format: AudioFormat,
         /// The format the server suggests capturing from the device in (2.2.2.3).
         capture_format: AudioFormat,
-        /// The frames each Data PDU carries.
+        /// The Open PDU's `FramesPerPacket`, counted in `capture_format`: each Data PDU lasts
+        /// that many of its frames.
         frames_per_packet: u32,
     },
     /// The server switched to another format from the client's list. Samples the helper held
@@ -149,7 +154,10 @@ struct Recording {
     format_no: usize,
     /// The Open PDU's `FramesPerPacket`.
     frames_per_packet: u32,
-    /// The samples one Data PDU carries: `FramesPerPacket` frames of the format's channels.
+    /// The `nSamplesPerSec` of the Open PDU's capture format.
+    capture_rate: u32,
+    /// The samples one Data PDU carries: as many frames as last `FramesPerPacket` frames of the
+    /// capture format, of the format's channels.
     packet_samples: usize,
 }
 
@@ -249,28 +257,49 @@ impl AudioInput {
         ]
     }
 
-    /// The recording that `format_no` and `frames_per_packet` name, or `None` when the index is
-    /// past the client's list, or a packet would hold no frames or more than one second of the
-    /// format.
-    fn recording(&self, format_no: u32, frames_per_packet: u32) -> Option<Recording> {
+    /// The recording that `format_no`, `frames_per_packet` and `capture_rate` name, or `None`
+    /// when the index is past the client's list, `frames_per_packet` is zero, or a packet would
+    /// hold more than one second of the format. A packet lasts `frames_per_packet` frames at
+    /// `capture_rate`, and at least one frame; with no `capture_rate` it holds
+    /// `frames_per_packet` frames.
+    fn recording(
+        &self,
+        format_no: u32,
+        frames_per_packet: u32,
+        capture_rate: u32,
+    ) -> Option<Recording> {
         let format_no = usize::try_from(format_no).ok()?;
         let (format, _) = self.client_formats.get(format_no)?;
-        if frames_per_packet > format.samples_per_sec {
+        if frames_per_packet == 0 {
             return None;
         }
-        let packet_samples = usize::try_from(frames_per_packet)
+        let packet_frames = match capture_rate {
+            0 => u64::from(frames_per_packet),
+            rate => (u64::from(frames_per_packet) * u64::from(format.samples_per_sec)
+                / u64::from(rate))
+            .max(1),
+        };
+        if packet_frames > u64::from(format.samples_per_sec) {
+            return None;
+        }
+        let packet_samples = usize::try_from(packet_frames)
             .ok()?
             .checked_mul(usize::from(format.channels))?;
         (packet_samples > 0).then_some(Recording {
             format_no,
             frames_per_packet,
+            capture_rate,
             packet_samples,
         })
     }
 
     /// Confirm an Open PDU's initial format and hand the request to the host.
     fn open(&mut self, open: pdu::Open) -> Vec<AudioInputEvent> {
-        let Some(recording) = self.recording(open.initial_format, open.frames_per_packet) else {
+        let Some(recording) = self.recording(
+            open.initial_format,
+            open.frames_per_packet,
+            open.capture_format.samples_per_sec,
+        ) else {
             tracing::warn!(
                 target: "rdp_audin",
                 initial_format = open.initial_format,
@@ -293,7 +322,9 @@ impl AudioInput {
 
     /// Confirm a Format Change PDU, dropping the partial packet held for the old format.
     fn format_change(&mut self, current: Recording, new_format: u32) -> Vec<AudioInputEvent> {
-        let Some(recording) = self.recording(new_format, current.frames_per_packet) else {
+        let Some(recording) =
+            self.recording(new_format, current.frames_per_packet, current.capture_rate)
+        else {
             tracing::warn!(
                 target: "rdp_audin",
                 new_format,
@@ -327,8 +358,9 @@ impl AudioInput {
 
     /// Take captured samples, interleaved, in the format of the last [`AudioInputEvent::Open`]
     /// or [`AudioInputEvent::FormatChanged`], in pieces of any length. Returns the messages to
-    /// send: an Incoming Data PDU and a Data PDU for every `FramesPerPacket` frames now held
-    /// (3.2.5.2). Samples pushed while not recording are dropped.
+    /// send: an Incoming Data PDU and a Data PDU for every packet now held (3.2.5.2), a packet
+    /// lasting `FramesPerPacket` frames of the Open's capture format. Samples pushed while not
+    /// recording are dropped.
     pub fn push(&mut self, samples: &[i16]) -> Vec<Vec<u8>> {
         let Stage::Recording(recording) = self.stage else {
             return Vec::new();
@@ -355,9 +387,12 @@ mod tests {
         MSG_SNDIN_DATA, MSG_SNDIN_DATA_INCOMING, MSG_SNDIN_FORMATCHANGE, MSG_SNDIN_FORMATS,
         MSG_SNDIN_OPEN, MSG_SNDIN_VERSION, encode_format_change, encode_formats,
     };
-    use justrdp_pdu::rdpsnd::{WAVE_FORMAT_ADPCM, WAVE_FORMAT_ALAW};
+    use justrdp_pdu::rdpsnd::WAVE_FORMAT_ADPCM;
 
     const E_FAIL: u32 = 0x8000_4005;
+
+    /// `WAVE_FORMAT_GSM610`, which the core does not encode.
+    const WAVE_FORMAT_GSM610: u16 = 0x0031;
 
     fn format(format_tag: u16, channels: u16, rate: u32, bits: u16) -> AudioFormat {
         let block_align = channels * bits / 8;
@@ -420,11 +455,11 @@ mod tests {
     fn a_format_tag_the_core_cannot_encode_or_listed_twice_is_refused() {
         assert_eq!(
             AudioInput::new(AudioInputConfig {
-                format_tags: vec![WAVE_FORMAT_ALAW]
+                format_tags: vec![WAVE_FORMAT_GSM610]
             })
             .err(),
             Some(AudioInputConfigError::UnencodableFormat {
-                format_tag: WAVE_FORMAT_ALAW
+                format_tag: WAVE_FORMAT_GSM610
             })
         );
         assert_eq!(
@@ -552,8 +587,78 @@ mod tests {
         assert_eq!(input.push(&[15, 16, 17, 18]).len(), 2);
     }
 
-    /// 8-bit PCM packets hold one byte per sample: the spec's `nChannels × 2 × FramesPerPacket`
-    /// (2.2.2.3) describes 16-bit samples.
+    /// A host listing A-law answers with the server's 8-bit A-law formats of one-frame blocks,
+    /// such as the Windows 11 server's one, 22.05 kHz stereo (#404), and pushes A-law bytes.
+    #[test]
+    fn a_host_listing_alaw_negotiates_and_encodes_it() {
+        let alaw = format(WAVE_FORMAT_ALAW, 2, 22050, 8);
+        let alaw_16 = format(WAVE_FORMAT_ALAW, 2, 22050, 16);
+        let mut alaw_wide_block = alaw.clone();
+        alaw_wide_block.block_align = 4;
+        let mut input = negotiated(
+            &[WAVE_FORMAT_ALAW],
+            &[pcm(2, 44100, 16), alaw_16, alaw_wide_block, alaw.clone()],
+        );
+        assert_eq!(
+            input.process(&server_open(4, 0, &pcm(2, 44100, 16)))[1],
+            AudioInputEvent::Open {
+                format: alaw,
+                capture_format: pcm(2, 44100, 16),
+                frames_per_packet: 4,
+            }
+        );
+        input.open_reply(0).unwrap();
+        let samples = [0, -1, 32767, -32768];
+        assert_eq!(
+            input.push(&samples),
+            [
+                pdu::encode_incoming_data(),
+                pdu::encode_data(&g711::encode_alaw(&samples)),
+            ]
+        );
+    }
+
+    /// A packet lasts as long as `FramesPerPacket` frames of the Open's capture format: the
+    /// Windows 11 server asks for 441 frames with a 44.1 kHz capture format, and records A-law at
+    /// 22.05 kHz only in packets of about 10 ms (#402), so 220 frames make one.
+    #[test]
+    fn a_packet_lasts_frames_per_packet_frames_of_the_capture_format() {
+        let alaw = format(WAVE_FORMAT_ALAW, 2, 22050, 8);
+        let mut input = negotiated(&[WAVE_FORMAT_ALAW], std::slice::from_ref(&alaw));
+        input.process(&server_open(441, 0, &pcm(2, 44100, 16)));
+        input.open_reply(0).unwrap();
+        let samples: Vec<i16> = (0..880).collect();
+        assert!(input.push(&samples[..438]).is_empty());
+        assert_eq!(
+            input.push(&samples[438..]),
+            [
+                pdu::encode_incoming_data(),
+                pdu::encode_data(&g711::encode_alaw(&samples[..440])),
+                pdu::encode_incoming_data(),
+                pdu::encode_data(&g711::encode_alaw(&samples[440..])),
+            ]
+        );
+    }
+
+    /// A capture format of no rate gives no time to measure a packet in, so it holds
+    /// `FramesPerPacket` frames; one too short for a whole frame holds one.
+    #[test]
+    fn a_packet_holds_frames_per_packet_frames_without_a_capture_rate_and_at_least_one() {
+        let mut no_rate = pcm(1, 8000, 16);
+        no_rate.samples_per_sec = 0;
+        let mut input = negotiated(&[WAVE_FORMAT_PCM], &[pcm(1, 8000, 16)]);
+        input.process(&server_open(3, 0, &no_rate));
+        input.open_reply(0).unwrap();
+        assert!(input.push(&[1, 2]).is_empty());
+        assert_eq!(input.push(&[3]).len(), 2);
+
+        let mut input = negotiated(&[WAVE_FORMAT_PCM], &[pcm(1, 8000, 16)]);
+        input.process(&server_open(1, 0, &pcm(1, 44100, 16)));
+        input.open_reply(0).unwrap();
+        assert_eq!(input.push(&[1]).len(), 2);
+    }
+
+    /// 8-bit PCM packets hold one byte per sample.
     #[test]
     fn eight_bit_packets_hold_one_byte_a_sample() {
         let mut input = recording(pcm(1, 8000, 8), 4);
@@ -611,11 +716,13 @@ mod tests {
                 AudioInputEvent::FormatChanged(formats[1].clone()),
             ]
         );
-        // Two frames of two channels now make a packet, and the held sample is gone.
-        assert!(input.push(&[2, 3, 4]).is_empty());
+        // A packet still lasts two 8 kHz frames, now four frames of two channels, and the held
+        // sample is gone.
+        let samples: Vec<i16> = (2..10).collect();
+        assert!(input.push(&samples[..7]).is_empty());
         assert_eq!(
-            input.push(&[5])[1],
-            pdu::encode_data(&pcm::encode(16, &[2, 3, 4, 5]).unwrap())
+            input.push(&samples[7..])[1],
+            pdu::encode_data(&pcm::encode(16, &samples).unwrap())
         );
     }
 
@@ -667,23 +774,26 @@ mod tests {
         assert_eq!(input.push(&[7]).len(), 2);
     }
 
-    /// A packet longer than one second of its format would hold pushed samples for that long
-    /// before sending any; an Open or a Format Change asking for one is ignored, so a server
-    /// cannot make the helper hold samples without bound.
+    /// A packet longer than one second would hold pushed samples for that long before sending
+    /// any; an Open asking for one is ignored, so a server cannot make the helper hold samples
+    /// without bound. A Format Change keeps the packet's length in time.
     #[test]
     fn a_packet_longer_than_a_second_is_ignored() {
-        let formats = [pcm(1, 8000, 16), pcm(1, 4000, 16)];
-        let mut input = negotiated(&[WAVE_FORMAT_PCM], &formats);
-        assert!(input.process(&server_open(8001, 0, &formats[0])).is_empty());
+        let format = pcm(1, 8000, 16);
+        let mut input = negotiated(&[WAVE_FORMAT_PCM], std::slice::from_ref(&format));
+        assert!(input.process(&server_open(8001, 0, &format)).is_empty());
+        assert!(input.process(&server_open(u32::MAX, 0, &format)).is_empty());
+        // 8000 frames of a 4 kHz capture format are two seconds.
         assert!(
             input
-                .process(&server_open(u32::MAX, 0, &formats[0]))
+                .process(&server_open(8000, 0, &pcm(1, 4000, 16)))
                 .is_empty()
         );
-        assert_eq!(input.process(&server_open(8000, 0, &formats[0])).len(), 2);
+        let mut no_rate = format.clone();
+        no_rate.samples_per_sec = 0;
+        assert!(input.process(&server_open(8001, 0, &no_rate)).is_empty());
+        assert_eq!(input.process(&server_open(8000, 0, &format)).len(), 2);
         input.open_reply(0).unwrap();
-        // 8000 frames are two seconds of the 4 kHz format.
-        assert!(input.process(&encode_format_change(1)).is_empty());
         assert_eq!(input.push(&[0; 8000]).len(), 2);
     }
 

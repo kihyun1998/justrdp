@@ -1265,7 +1265,7 @@ Good! I found KDC proxy support. Now let me compile comprehensive information ab
 
 - [x] **O — Open.** The Open PDU carries `FramesPerPacket`, `initialFormat` and a suggested capture format; the client confirms with a Format Change PDU, then an Open Reply carrying an `HRESULT` (3.2.5.1.6–3.2.5.1.8).
 
-- [x] **O — Mic frame transmission.** An Incoming Data PDU (0x05) then a Data PDU (0x06) of `FramesPerPacket` frames in the current format (3.2.5.2). There is no timestamp field.
+- [x] **O — Mic frame transmission.** An Incoming Data PDU (0x05) then a Data PDU (0x06) in the current format, lasting `FramesPerPacket` frames of the Open's capture format (3.2.5.2; #402 measured Windows 11 losing A-law under either reading of 2.2.2.3). There is no timestamp field.
 
 - [ ] **O — Lossy-UDP audio (AUDIO_PLAYBACK_LOSSY over multitransport).** RDPSND audio MAY be sent via lossy UDP tunnel (MS-RDPEMT) if client advertises multitransport + client & server both support it. *Reduces latency; trades quality (packet loss).* **Separate channel flow; not a codec variant.** Packets may be reordered/dropped; client must detect gaps and insert comfort noise or silence.
 

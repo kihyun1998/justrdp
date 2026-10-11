@@ -32,7 +32,7 @@ const FORMATS_FIXED_SIZE: usize = 9;
 /// The Open PDU's request to start recording (2.2.2.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Open {
-    /// `FramesPerPacket`: the audio frames each Data PDU carries.
+    /// `FramesPerPacket`: the length of each Data PDU, in audio frames (2.2.2.3).
     pub frames_per_packet: u32,
     /// `initialFormat`: the index, in the client's format list, of the format to encode in.
     pub initial_format: u32,

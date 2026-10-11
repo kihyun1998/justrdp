@@ -5,7 +5,8 @@
 The audio input channel (`[MS-RDPEAI]`): the server opens the dynamic channel `AUDIO_INPUT`,
 the two sides exchange versions and agree a list of formats, the server asks the client to
 record, and the client sends what it captures as Data PDUs. `justrdp-pdu::audin` holds the
-PDUs, `justrdp-codecs::pcm::encode` turns signed 16-bit samples into linear PCM, and
+PDUs, `justrdp-codecs::pcm::encode` turns signed 16-bit samples into linear PCM and
+`justrdp-codecs::g711::encode_alaw` into A-law (#402), and
 `justrdp::audin::AudioInput` is a sans-IO helper the host drives over the host dynamic channel
 seam (ADR-0018), as it drives the audio output helper. Epic #12; #401 builds PCM and proves it
 against the spec, and #404 proves it against a real server, the Windows 11 VM
@@ -27,14 +28,15 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
 - **The host pushes samples; the helper cuts packets.** After the Open, the host hands
   interleaved i16 samples of any length to `AudioInput::push`, at the current format's rate
   and channel count, and the helper returns an Incoming Data PDU and a Data PDU for every
-  `FramesPerPacket` frames it holds (3.2.5.2). Resampling and the device are the host's. That
+  packet it holds (3.2.5.2), a packet lasting `FramesPerPacket` frames of the capture format
+  (below). Resampling and the device are the host's. That
   split was the maintainer's call in #12's grilling (2026-10-07), shown the alternatives of the
   host handing exact packets or already-encoded bytes. FreeRDP's channel code sends whatever
   its device delivers and leaves the frame count to the device.
 - **The host names format tags, not formats**, as on audio output: the helper answers the
   server's list with every server format of the host's tags that the core encodes, in the
   host's order of tags and the server's within a tag, copied as sent. For PCM that is 8 or 16
-  bits, at least one channel, and a block of exactly one frame. The `initialFormat` and
+  bits, for A-law 8 (#402); for both, at least one channel and a block of exactly one frame. The `initialFormat` and
   `NewFormat` indices count in that client list (3.1.1).
 - **The order of the client's messages is fixed by the spec.** An Incoming Data PDU goes
   before the Sound Formats PDU (3.2.5.1.4) and before every Data PDU (3.2.5.2.1); a Format
@@ -54,27 +56,43 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   `WAVEFORMAT_EXTENSIBLE` in the spec's example, reaches the host as the server sent it; the
   helper neither decodes the extensible part nor checks its `cbSize` of 22 (2.2.2.3), since it
   is a suggestion the samples are not encoded in.
-- **A Format Change drops the partial packet.** It cannot go short, since every Data PDU holds
-  `FramesPerPacket` frames, and everything after the confirmation is in the new format
+- **A Format Change drops the partial packet.** It cannot go short, since every Data PDU holds a
+  whole packet, and everything after the confirmation is in the new format
   (3.2.5.3.2). The host learns the new format from `AudioInputEvent::FormatChanged`.
 - **Everything the spec says to ignore is ignored** (3.1.5), unlike the audio output helper,
   whose malformed PDUs are `DecodeError`s: a malformed or unknown PDU, a second Version PDU,
   formats before the version, an Open anywhere but after the formats or a failed Open, a Format
   Change anywhere but while recording, and an index past the client's list. A `FramesPerPacket` of zero would ask for empty packets, so its Open is
   ignored too. **Derivation**, from 3.1.5.
+- **A packet lasts `FramesPerPacket` frames of the Open's capture format** (#402): it holds
+  `FramesPerPacket` × the format's `nSamplesPerSec` ÷ the capture format's `nSamplesPerSec`
+  frames, rounded down and at least one, or `FramesPerPacket` frames when the capture format
+  has no rate. A Format Change keeps that length in time. For PCM at the capture format's rate,
+  as Windows 11 picks it, that is `FramesPerPacket` frames; for its A-law at 22.05 kHz against
+  a 44.1 kHz capture format, 220 frames, 10 ms. **That rule was the maintainer's call
+  (2026-10-08)**, shown the measurements below and the alternatives of a fixed 10 ms packet and
+  of leaving A-law out of the helper. It departs from the letter of 2.2.2.3, whose two MUSTs, a
+  Data PDU of `FramesPerPacket` frames and one of `nChannels × 2 × FramesPerPacket` bytes, both
+  fail for A-law on Windows 11 (Reference behaviour); for 16-bit PCM at the capture rate the
+  three agree. It replaces #401's derivation that the frame count binds.
 - **A packet holds at most one second of its format.** The helper holds pushed samples until
   a packet fills, so a `FramesPerPacket` the server sets near `u32::MAX` would hold them without
   bound: at 44.1 kHz stereo 16-bit, 176 KB a second, about 15 GB a day, and an allocation
-  failure after about 3.4 hours on a 32-bit host (#401's review). An Open or a Format Change
-  whose `FramesPerPacket` exceeds the format's `nSamplesPerSec` is ignored. The spec's example
+  failure after about 3.4 hours on a 32-bit host (#401's review). An Open whose packet would
+  hold more frames than the format's `nSamplesPerSec` is ignored; a Format Change keeps the
+  packet's length in time, so it cannot lengthen one. The spec's example
   asks for 2205 frames at 44.1 kHz, 50 ms. **Derivation**: a one-second packet is already far
   from real-time capture, and FreeRDP refuses only `INT32_MAX` and above.
 - **The version is 2**, as FreeRDP 3.31 advertises; version 2 only adds that the server may
   send Format Change PDUs for AAC (3.3.5.3.1), and the helper takes every Format Change. The
   server's version is answered whatever it is, as 3.2.5.1.2 requires; FreeRDP answers nothing
   when the server's is higher. **Derivation.**
-- **8-bit PCM packets hold one byte a sample.** The Open PDU's `nChannels × 2 ×
-  FramesPerPacket` (2.2.2.3) describes 16-bit samples; the frame count is what binds.
+- **8-bit PCM and A-law packets hold one byte a sample.**
+- **A-law is checked against an independent encoder** (#402): every one of the 65,536 16-bit
+  samples is compared with CPython 3.12's `audioop.lin2alaw`, kept in the test as the 256 runs
+  of samples it maps to one code, and each sample decodes through the owned decoder to within
+  half its step. `audioop` is the oracle the A-law decoder already uses (#388, [Audio
+  output](audio-output.md)); FreeRDP encodes no A-law for audio input.
 
 ## Code
 
@@ -82,11 +100,13 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   `encode_formats`, `encode_open_reply`, `encode_incoming_data`, `encode_data`,
   `encode_format_change`
 - `crates/justrdp-codecs/src/pcm.rs` — `encode`
+- `crates/justrdp-codecs/src/g711.rs` — `i16_to_alaw`, `encode_alaw`
 - `crates/justrdp/src/audin.rs` — `AudioInput`, `AudioInputConfig`, `AudioInputConfigError`,
   `AudioInputEvent`, `CLIENT_VERSION`, `ENCODABLE_FORMAT_TAGS`
 - `crates/justrdp/src/advertise.rs` — `HONOURED_CLIENT_INFO_FLAGS`, which holds
   `AUDIO_CAPTURE` since #401
 - `crates/justrdp-tokio/src/lib.rs` — `a_tone_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm`,
+  `a_tone_pushed_in_alaw_is_what_the_session_records_on_the_real_vm`,
   `without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm`,
   `record_a_tone_pushed_as_audio_input`
 - `fuzz/fuzz_targets/audin.rs` — the PDU parser and the helper over split input, the host's
@@ -119,6 +139,36 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   (`without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm`). So the flag is
   what gives a session a microphone, and a host that sets it and registers no `AUDIO_INPUT`
   offers one the server cannot open.
+- **A host listing only A-law gets the server's one A-law format**, 22,050 Hz stereo 8-bit,
+  `nBlockAlign` 2, `nAvgBytesPerSec` 44,100, and the same Open: `FramesPerPacket` 441 and a
+  44.1 kHz capture format. Pushed in packets of 220 frames, the tone is what the session
+  records (`a_tone_pushed_in_alaw_is_what_the_session_records_on_the_real_vm`).
+- **Windows 11 records audio input only from short packets, whatever the codec** (#402). Traced
+  by pushing deterministic noise and correlating each 10 ms of the recording with it, which
+  maps every output stretch to the input it came from to within 0.09 ms:
+
+  | Data PDU | PCM 44.1 kHz | A-law 22.05 kHz |
+  |---|---|---|
+  | 5 ms | lossless | a few lost packets |
+  | 10 ms | lossless (441 frames, the helper's) | lossless (220 frames, the helper's) |
+  | 15 ms | — | lossless |
+  | 20 ms | a few lost 10 ms stretches | 441 frames: all discarded; 440: a few lost stretches; 442: lossless |
+  | 21–25 ms | — | lossless |
+  | 30 ms | a few lost packets | a few lost packets |
+  | 35 ms | — | a few lost 5 ms stretches |
+  | 38–60 ms | 40 ms: 30 ms kept, 10 ms dropped, from every packet | 30 ms kept from every packet |
+
+  PCM's 40 ms packets and A-law's lose the same stretches at the same input times, so the limit
+  is the server's and not the codec's. Pushing 3% slower or faster moves nothing, so it is not
+  a buffer filling. The spec's byte rule gives A-law 40 ms packets and loses a quarter of them.
+- **Windows 11 discards every A-law Data PDU of exactly `FramesPerPacket` × `nBlockAlign`
+  bytes**, 882, which is the spec's frame rule: the recording is empty. Packets of 440 and 442
+  frames record; alternating 441 and 442 loses each 441 alone. Why is not visible from the
+  wire. PCM at the capture format's rate is unaffected; a format at another rate, such as
+  ADPCM at 22.05 kHz (#403), could show whether the size or the rate decides it.
+- **A tone cannot measure a loss.** A dropped stretch shows in a tone's phase only modulo one
+  period, 2.27 ms at 440 Hz: the 10 ms drops above first read as 0.78 ms ones and a 452 Hz
+  pitch. The noise correlation has no period to hide one in.
 - **These Data PDUs found a static channel defect**: each DVC fragment has to ride one SVC
   chunk, and until #404 an SVC chunk carried 1,592 data bytes where `[MS-RDPBCGR]` 2.2.6.1
   allows 1,600, so a 1,594-byte fragment straddled two chunks and Windows 11 ended the session
@@ -157,7 +207,10 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   `pub(crate)`: the type is `[MS-RDPEA]`'s, now shared by two channels. Moving it to a neutral
   module waits for a third user; that was the maintainer's call (2026-10-08), shown the
   alternative of a `wave` module in this change.
-- **PCM only.** A-law (#402) and MS-ADPCM and IMA-ADPCM (#403) are all in the Windows 11
-  server's list; AAC waits on #21's decoder-backend question; GSM 6.10 is not encoded.
+- **PCM and A-law.** MS-ADPCM and IMA-ADPCM (#403) are in the Windows 11 server's list; their
+  packets are whole blocks, which the packet rule above does not yet say how to meet. AAC waits
+  on #21's decoder-backend question; GSM 6.10 is not encoded.
+- **8-bit PCM is unmeasured.** Windows 11 offers none, and at the capture rate its packet is
+  `FramesPerPacket` × `nBlockAlign` bytes, the size it discards for A-law.
 - **One server.** Only a Windows 11 client SKU has been measured; a Server SKU with the RD
   Session Host role did not open the channel for FreeRDP or mstsc (#400).

@@ -3142,8 +3142,12 @@ mod tests {
     /// Connect to the audio input VM with `AUDIO_INPUT` registered and a host drive holding a
     /// script that records five seconds with winmm MCI, saves the WAV to that drive, and writes
     /// MCI's return codes beside it. While the server records, the host pushes a 440 Hz tone
-    /// through `AudioInput` in real time, ten milliseconds at a time.
-    async fn record_a_tone_pushed_as_audio_input(audio_capture_flag: bool) -> AudioInputRun {
+    /// through `AudioInput` in real time, ten milliseconds at a time, in the formats of
+    /// `format_tags` the server offers.
+    async fn record_a_tone_pushed_as_audio_input(
+        audio_capture_flag: bool,
+        format_tags: &[u16],
+    ) -> AudioInputRun {
         use drive_host::{Host, HostDrive, at};
         use justrdp::audin::{AudioInput, AudioInputConfig, AudioInputEvent};
         use justrdp::rdpdr::{
@@ -3169,6 +3173,7 @@ mod tests {
         const RUN: &str =
             "powershell -WindowStyle Hidden -ep bypass -f \\\\tsclient\\justrdp\\rec.ps1";
 
+        let format_tags = format_tags.to_vec();
         with_vm_session_on(vm::Target::AudioInput, |vm| async move {
             let mut config = legacy_graphics_config();
             config.channels = vec![
@@ -3202,7 +3207,7 @@ mod tests {
             let drive_ready = Arc::new(AtomicUsize::new(0));
             let run = Arc::new(Mutex::new(AudioInputRun::default()));
             let input = Arc::new(Mutex::new(
-                AudioInput::new(AudioInputConfig::default()).expect("PCM is encodable"),
+                AudioInput::new(AudioInputConfig { format_tags }).expect("the tags are encodable"),
             ));
             // The format and channel the pusher pushes in, once recording.
             let recording = Arc::new(Mutex::new(None::<(u32, u16, u32)>));
@@ -3250,14 +3255,17 @@ mod tests {
                 );
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(Duration::from_millis(10));
-                    let mut frame = 0u64;
+                    let (mut frame, mut ticks) = (0u64, 0u64);
                     while !cancel.is_cancelled() {
                         tick.tick().await;
                         let Some((channel_id, channels, rate)) = *recording.lock().unwrap() else {
                             continue;
                         };
-                        let frames_per_tick = u64::from(rate / 100);
-                        let samples: Vec<i16> = (frame..frame + frames_per_tick)
+                        // A tick is a hundredth of a second, and 22,050 frames are not a whole
+                        // number of hundredths.
+                        ticks += 1;
+                        let until = ticks * u64::from(rate) / 100;
+                        let samples: Vec<i16> = (frame..until)
                             .flat_map(|n| {
                                 let t = n as f64 / f64::from(rate);
                                 let s = (8000.0 * (2.0 * std::f64::consts::PI * TONE_HZ * t).sin())
@@ -3265,7 +3273,7 @@ mod tests {
                                 std::iter::repeat_n(s, usize::from(channels))
                             })
                             .collect();
-                        frame += frames_per_tick;
+                        frame = until;
                         let messages = input.lock().unwrap().push(&samples);
                         for data in messages {
                             if data.first() == Some(&justrdp_pdu::audin::MSG_SNDIN_DATA) {
@@ -3577,7 +3585,9 @@ mod tests {
     #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
                 expires around 2027-01) and JUSTRDP_TEST_* env vars"]
     async fn without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm() {
-        let run = record_a_tone_pushed_as_audio_input(false).await;
+        let run =
+            record_a_tone_pushed_as_audio_input(false, &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM])
+                .await;
         assert_eq!(run.channel, None, "the server opened no AUDIO_INPUT");
         let codes = run.mci_codes.expect("the script wrote MCI's return codes");
         assert!(
@@ -3627,7 +3637,9 @@ mod tests {
     #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
                 expires around 2027-01) and JUSTRDP_TEST_* env vars"]
     async fn a_tone_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm() {
-        let run = record_a_tone_pushed_as_audio_input(true).await;
+        let run =
+            record_a_tone_pushed_as_audio_input(true, &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM])
+                .await;
         assert!(run.channel.is_some(), "the server opened AUDIO_INPUT");
         let codes = run.mci_codes.expect("the script wrote MCI's return codes");
         assert!(
@@ -3664,6 +3676,64 @@ mod tests {
                 .iter()
                 .all(|&len| len > justrdp_pdu::dvc::MAX_DATA_CHUNK),
             "every Data PDU spans more than one drdynvc fragment: {:?}",
+            run.data_lengths.first()
+        );
+        let wav = run.wav.expect("the recording reached the host's drive");
+        let (holds, samples, rate, tone, off) = holds_tone(&wav);
+        eprintln!(
+            "recorded {samples} samples at {rate} Hz; power at {TONE_HZ} Hz {tone:.3e}, most \
+             elsewhere {off:.3e}"
+        );
+        assert!(
+            holds,
+            "the recording holds the pushed 440 Hz tone and little else"
+        );
+    }
+
+    /// Real-VM acceptance for #402: a host that lists only A-law answers with the server's one
+    /// A-law format, 22.05 kHz stereo 8-bit, and a 440 Hz tone it pushes in A-law is what the
+    /// session's recording holds.
+    #[tokio::test]
+    #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
+                expires around 2027-01) and JUSTRDP_TEST_* env vars"]
+    async fn a_tone_pushed_in_alaw_is_what_the_session_records_on_the_real_vm() {
+        use justrdp_pdu::audin::ServerPdu;
+        use justrdp_pdu::rdpsnd::WAVE_FORMAT_ALAW;
+        let run = record_a_tone_pushed_as_audio_input(true, &[WAVE_FORMAT_ALAW]).await;
+        assert!(run.channel.is_some(), "the server opened AUDIO_INPUT");
+        let codes = run.mci_codes.expect("the script wrote MCI's return codes");
+        assert_eq!(codes, "open=0;record=0;save=0;close=0");
+        let [alaw] = run.negotiated.as_slice() else {
+            panic!("one A-law format answered: {:?}", run.negotiated);
+        };
+        eprintln!("negotiated {alaw:?}");
+        assert_eq!(
+            (
+                alaw.format_tag,
+                alaw.channels,
+                alaw.samples_per_sec,
+                alaw.bits_per_sample
+            ),
+            (WAVE_FORMAT_ALAW, 2, 22_050, 8)
+        );
+        let Some(ServerPdu::Open(open)) = run
+            .server_pdus
+            .iter()
+            .find(|p| matches!(p, ServerPdu::Open(_)))
+        else {
+            panic!("the server asked to record");
+        };
+        eprintln!(
+            "Open: FramesPerPacket {}, initialFormat {}, capture format {:?}",
+            open.frames_per_packet, open.initial_format, open.capture_format
+        );
+        let frames = u64::from(open.frames_per_packet) * 22_050
+            / u64::from(open.capture_format.samples_per_sec);
+        let packet = 1 + frames as usize * 2;
+        assert!(
+            !run.data_lengths.is_empty() && run.data_lengths.iter().all(|&len| len == packet),
+            "every Data PDU holds as many stereo frames as last FramesPerPacket frames of the \
+             capture format, one byte a sample: {:?}",
             run.data_lengths.first()
         );
         let wav = run.wav.expect("the recording reached the host's drive");
