@@ -87,6 +87,16 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   send Format Change PDUs for AAC (3.3.5.3.1), and the helper takes every Format Change. The
   server's version is answered whatever it is, as 3.2.5.1.2 requires; FreeRDP answers nothing
   when the server's is higher. **Derivation.**
+- **The ADPCM encoders follow ffmpeg where FreeRDP and ffmpeg part** (#403). An encoder
+  carries each channel's step from one block into the next, as both do. An IMA block's header
+  holds the block's first frame, as ffmpeg's does and as the decoder reads it (#389); FreeRDP
+  writes the previous block's last sample there and encodes one frame fewer, so each of its
+  blocks repeats a sample. MS-ADPCM uses the format's first coefficient pair in every block,
+  as both do, and rounds an error to the nearest step with halves away from zero, as ffmpeg
+  does; FreeRDP never rounds a negative error away from zero, a bias, and differs in 2,532 of
+  the 20,000 oracle cases, all of them those. A header's step is capped at `i16::MAX`, which
+  only a first pair that predicts past the samples' range can reach. **Derivation**, from the
+  two encoders and the decoders.
 - **8-bit PCM and A-law packets hold one byte a sample.**
 - **A-law is checked against an independent encoder** (#402): every one of the 65,536 16-bit
   samples is compared with CPython 3.12's `audioop.lin2alaw`, kept in the test as the 256 runs
@@ -101,6 +111,10 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   `encode_format_change`
 - `crates/justrdp-codecs/src/pcm.rs` — `encode`
 - `crates/justrdp-codecs/src/g711.rs` — `i16_to_alaw`, `encode_alaw`
+- `crates/justrdp-codecs/src/adpcm.rs` — `MsAdpcmEncoder`, `ImaAdpcmEncoder`,
+  `MsAdpcm::encoder`, `ImaAdpcm::encoder`, `samples_per_block`, and the quantiser oracle tests
+  (#403); the helper does not use them
+- `crates/justrdp-codecs/tests/fixtures/adpcm/` — the encoder oracles' cases and their README
 - `crates/justrdp/src/audin.rs` — `AudioInput`, `AudioInputConfig`, `AudioInputConfigError`,
   `AudioInputEvent`, `CLIENT_VERSION`, `ENCODABLE_FORMAT_TAGS`
 - `crates/justrdp/src/advertise.rs` — `HONOURED_CLIENT_INFO_FLAGS`, which holds
@@ -123,9 +137,9 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
 
 - **The channel opens when the session starts recording**, not at logon: the server sends its
   Create Request for `AUDIO_INPUT` as winmm MCI `record` runs, then Version 2, a Sound Formats
-  PDU of **30 formats** (AAC `0xA106` ×8 first, PCM 44.1 kHz stereo 16-bit ×1, MS-ADPCM ×9
-  and IMA-ADPCM ×9 at 44.1, 22.05, 11.025 and 8 kHz, A-law 22.05 kHz stereo ×1, GSM 6.10 ×4;
-  no µ-law), and, to a client answering with PCM alone, an Open PDU with `FramesPerPacket`
+  PDU of **30 formats** (AAC `0xA106` ×8 first, PCM 44.1 kHz stereo 16-bit ×1, MS-ADPCM ×8
+  and IMA-ADPCM ×8, A-law 22.05 kHz stereo ×1, GSM 6.10 ×4; no µ-law; counted in #403, where
+  #404 had read nine ADPCM formats of each), and, to a client answering with PCM alone, an Open PDU with `FramesPerPacket`
   441 (10 ms), `initialFormat` 0 and a `WAVEFORMAT_EXTENSIBLE` capture format at 44.1 kHz
   stereo 16-bit (`cbSize` 22). FreeRDP 3.31 saw the same (#400).
 - **A pushed tone is what the session records**: with the host pushing a 440 Hz sine ten
@@ -166,6 +180,16 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   frames record; alternating 441 and 442 loses each 441 alone. Why is not visible from the
   wire. PCM at the capture format's rate is unaffected; a format at another rate, such as
   ADPCM at 22.05 kHz (#403), could show whether the size or the rate decides it.
+- **Windows 11 loses part of every ADPCM packet** (#403, 2026-10-12). It offers MS-ADPCM and
+  IMA-ADPCM each at 44.1 kHz stereo (`nBlockAlign` 2048), 22.05 kHz stereo (1024), 44.1 kHz
+  mono (1024), 11.025 kHz stereo (512), 22.05 kHz mono (512), 8 kHz stereo (512), 11.025 kHz
+  mono (256) and 8 kHz mono (256), MS-ADPCM with the seven standard coefficient pairs, and every
+  block lasts 45 to 63 ms. To a client answering with all eight it opens the 22.05 kHz mono one
+  with `FramesPerPacket` 441 and the same 44.1 kHz capture format. A Data PDU of one block,
+  45.9 ms, keeps 30 ms and loses about 16, a third of the audio, for both codecs; the
+  recording is otherwise the pushed signal (correlation 0.9). A block split over two or four
+  Data PDUs records nothing, and more blocks to a PDU only lengthen it, so no packet the client
+  can send records whole.
 - **A tone cannot measure a loss.** A dropped stretch shows in a tone's phase only modulo one
   period, 2.27 ms at 440 Hz: the 10 ms drops above first read as 0.78 ms ones and a 452 Hz
   pitch. The noise correlation has no period to hide one in.
@@ -207,9 +231,14 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   `pub(crate)`: the type is `[MS-RDPEA]`'s, now shared by two channels. Moving it to a neutral
   module waits for a third user; that was the maintainer's call (2026-10-08), shown the
   alternative of a `wave` module in this change.
-- **PCM and A-law.** MS-ADPCM and IMA-ADPCM (#403) are in the Windows 11 server's list; their
-  packets are whole blocks, which the packet rule above does not yet say how to meet. AAC waits
-  on #21's decoder-backend question; GSM 6.10 is not encoded.
+- **PCM and A-law only.** `justrdp-codecs` encodes MS-ADPCM and IMA-ADPCM (#403), checked
+  against FreeRDP's, ffmpeg's and CPython's encoders, but the helper does not offer them,
+  because Windows 11 loses a third of every packet (Reference behaviour). **That was the
+  maintainer's call (2026-10-12)**, shown that measurement and the alternatives of offering
+  them with the loss documented and of dropping the encoders as well. A server that records
+  ADPCM whole would bring them back: their tags into `ENCODABLE_FORMAT_TAGS`, packets of whole
+  blocks, and a live proof. AAC waits on #21's decoder-backend question; GSM 6.10 is not
+  encoded.
 - **8-bit PCM is unmeasured.** Windows 11 offers none, and at the capture rate its packet is
   `FramesPerPacket` × `nBlockAlign` bytes, the size it discards for A-law.
 - **One server.** Only a Windows 11 client SKU has been measured; a Server SKU with the RD

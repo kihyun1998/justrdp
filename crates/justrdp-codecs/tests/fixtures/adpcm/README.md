@@ -30,3 +30,24 @@ starting state, the header sample prepended), and it matches every sample.
 
 MS-ADPCM has no second oracle here. FreeRDP ignores the format's coefficient table and uses the
 seven standard pairs; WS2022 sends exactly those, so the two agree on these cases.
+
+## Encoder oracles (#403)
+
+`src/adpcm.rs`'s tests read three more files, each made outside the repository:
+
+| File | What it holds | Made by |
+|---|---|---|
+| `ima_quantizer_freerdp.bin` | 20,000 records of 9 bytes: an IMA state (last sample `i16`, step index `u8`), a sample `i16`, then the nibble `u8` and the state after it | FreeRDP's `dsp_encode_ima_adpcm_sample` |
+| `ms_quantizer_freerdp_ffmpeg.bin` | 20,000 records of 23 bytes: an MS-ADPCM state (standard pair index `u8`, `sample1` `i16`, `sample2` `i16`, step `u16`), a sample `i16`, then for FreeRDP and then for ffmpeg the nibble `u8`, `sample1` `i16` and step `i32` after it | FreeRDP's `freerdp_dsp_encode_ms_adpcm_sample` and ffmpeg's `adpcm_ms_compress_sample` |
+| `ima_blocks_audioop.bin` | 24 records of 2,543 bytes: a starting step index `u8`, 1,017 mono samples `i16`, and the 508-byte block body | CPython 3.12's `audioop.lin2adpcm` on samples 1 to 1,016 from the state (sample 0, step index), nibbles swapped to the WAV block's low-first order |
+
+The two C functions were copied verbatim from FreeRDP `libfreerdp/codec/dsp.c` at commit
+`87baff6c80e16087c146937bca81d2bdb788e236` and ffmpeg `libavcodec/adpcmenc.c` and
+`adpcm_data.c` at commit `f4012774b92996fe22effafaf65625247ce7f4ad`, with their tables, behind
+a shim of types and macros, compiled with clang 21, and run on cases from a fixed splitmix64
+seed: half of the samples anywhere in range, half within a few steps of the prediction. The
+harness is not in the repository; these files are its output.
+
+ffmpeg's IMA encoder is not an oracle: outside trellis mode its `adpcm_ima_compress_sample`
+quantises with `4 × |error| ÷ step` and reconstructs with a Yamaha difference table, not with
+the decoder's shifted step sums, so its state can part from a decoder's.
