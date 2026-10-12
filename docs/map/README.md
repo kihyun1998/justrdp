@@ -11,8 +11,8 @@ The layer that answers two questions no other artifact in this repo can:
    `## Governing decisions` (the ADR that decided them). A blank
    `## Governing decisions` is not an omission — it is the answer.
 
-The ADRs are indexed by the day a decision was contested, `docs/plan.md` by the
-build order, the issues by the work that shipped. None of them is indexed by
+The ADRs are indexed by the day a decision was contested, the issues by the
+work that shipped. None of them is indexed by
 **territory**, and none survives its event. That is the gap this fills.
 
 ## Reading protocol
@@ -69,8 +69,8 @@ a recurrence test.
 - **The map does not track what is not built.** `## Known holes / open` names the
   gaps per territory; the **live roster of unbuilt work is the tracker** — the
   `epic`-labelled issues (decided 2026-08-10, when the two homes were found to
-  disagree). `docs/plan.md` §22–§23 (~294 lines, 16% of that file) is the *audit that
-  produced them*, kept as a dated snapshot and deliberately not updated as work lands.
+  disagree). The build plan's completeness audit that produced them was retired on
+  2026-10-12, once every item it listed had an issue (#420–#430 filed the last ones).
 
 ## Measurements (M1–M5, taken 2026-08-10)
 
@@ -179,6 +179,5 @@ ls docs/map/territory/ docs/map/invariant/                                     #
 connect sequence, the session loop, the logon notifications, the graphics path, input,
 channels, the wire layer, the adapter, verification and the supply chain. Unbuilt protocol areas
 (clipboard, audio, redirection, drawing orders, RD Gateway, H.264, multi-monitor…)
-have **no territory** — they live as `epic` issues in the tracker (the roster), with
-`docs/plan.md` §22–§23 as the audit snapshot behind them, and a territory appears when
-the first slice lands.
+have **no territory** — they live as `epic` issues in the tracker (the roster), and a
+territory appears when the first slice lands.

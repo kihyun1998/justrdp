@@ -1,5 +1,5 @@
 //! BER (Basic Encoding Rules, X.690) primitives — the encoding T.125 uses for the MCS
-//! Connect-Initial / Connect-Response PDUs (plan.md §3 Layer 1). Only the shapes those two PDUs
+//! Connect-Initial / Connect-Response PDUs. Only the shapes those two PDUs
 //! need: APPLICATION and SEQUENCE constructed tags, INTEGER, BOOLEAN, ENUMERATED, and
 //! OCTET STRING, with the definite short/long length forms.
 //!

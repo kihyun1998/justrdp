@@ -1,14 +1,14 @@
 //! T.124 GCC Conference Create user data — the client/server settings blocks carried inside the
-//! MCS Connect-Initial / Connect-Response (MS-RDPBCGR 2.2.1.3 / 2.2.1.4, plan.md §5 Layer 3).
+//! MCS Connect-Initial / Connect-Response (MS-RDPBCGR 2.2.1.3 / 2.2.1.4).
 //!
 //! The client sends Core (0xC001), Security (0xC002), and Network (0xC003) blocks; the server
 //! answers with its own Core (0x0C01), Network (0x0C03), and Security (0x0C02) blocks (plus
 //! optional Message Channel / Multitransport blocks). Block bodies are little-endian RDP
 //! structures; the T.124 wrapper around them is ALIGNED PER ([`crate::per`]).
 //!
-//! **The anti-hardcode invariant (plan.md §0):** every policy-bearing field — most critically
-//! `earlyCapabilityFlags`, the EGFX gate — is a plain struct field filled by the caller. This
-//! module only serializes; it never decides a flag.
+//! **The anti-hardcode invariant (ADR-0017, ADR-0016):** every policy-bearing field — most
+//! critically `earlyCapabilityFlags`, the EGFX gate — is a plain struct field filled by the caller.
+//! This module only serializes; it never decides a flag.
 
 use crate::cursor::ReadCursor;
 use crate::error::DecodeError;
@@ -16,8 +16,8 @@ use crate::nego::SecurityProtocol;
 use crate::per;
 
 /// `earlyCapabilityFlags` in the Client Core Data (MS-RDPBCGR 2.2.1.3.2). A dependency-free
-/// bitflag newtype (decision 6), mirroring [`SecurityProtocol`]'s shape. All twelve flags are
-/// caller-set; justrdp never adds or strips one (plan.md §0 — the EGFX gate trap that motivated
+/// bitflag newtype (ADR-0001 Amendment), mirroring [`SecurityProtocol`]'s shape. All twelve flags
+/// are caller-set; justrdp never adds or strips one (ADR-0017 — the EGFX gate trap that motivated
 /// this project), and refuses one it cannot honour (#357).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientEarlyCapabilityFlags(u16);
@@ -216,7 +216,7 @@ pub struct ClientCoreData {
     pub high_color_depth: u16,
     /// `supportedColorDepths` bits (`SUPPORTED_COLOR_DEPTH_*`).
     pub supported_color_depths: u16,
-    /// **`earlyCapabilityFlags` — fully caller-controlled, all twelve flags** (plan.md §0).
+    /// **`earlyCapabilityFlags` — fully caller-controlled, all twelve flags** (ADR-0016).
     pub early_capability_flags: ClientEarlyCapabilityFlags,
     /// `clientDigProductId` (informational, usually empty).
     pub dig_product_id: String,
@@ -255,10 +255,10 @@ impl Default for ClientCoreData {
     /// A sensible host-facing starting point that **advertises every early-capability flag
     /// justrdp can actually honour** — Set Error Info ([`ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU`]),
     /// the EGFX gate ([`ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL`]), and channel-join
-    /// skip ([`ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN`]) — per the "advertise
-    /// everything we can handle" rule (plan.md §0, §5b).
+    /// skip ([`ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN`]) — each one a flag
+    /// the core can honour (ADR-0016).
     ///
-    /// This is a **default, not a hardcode** (plan.md §0): every field, including
+    /// This is a **default, not a hardcode** (ADR-0016): every field, including
     /// `early_capability_flags`, may be overridden — set, cleared, or extended — and the encoder
     /// passes whatever bits remain through verbatim (see `early_capability_flags_pass_through_verbatim`);
     /// `justrdp`'s connect layer refuses a bit it cannot honour rather than sending it (#357).
@@ -881,7 +881,7 @@ mod tests {
                 .contains(ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU)
         );
 
-        // It is a default, not a hardcode: the caller can still clear it (plan.md §0).
+        // It is a default, not a hardcode: the caller can still clear it (ADR-0016).
         let leaner = ClientCoreData {
             early_capability_flags: ClientEarlyCapabilityFlags::empty(),
             ..ClientCoreData::default()

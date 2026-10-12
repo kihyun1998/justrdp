@@ -39,8 +39,16 @@ read as the adapter growing a third of its size.
   `run_session`, `run_session_with_input`, `run_session_with_commands`.
 - **Cancellation is a token, not a drop** — `tokio-util`'s `CancellationToken` lets
   a resize or teardown race the select loop safely.
-- **Each connect stage is a tracing span** (plan.md §11d) — a no-op without a
-  subscriber, so observability does not compromise portability.
+- **Each connect stage is a tracing span** — a no-op without a subscriber, so observability
+  does not compromise portability. Core records use `rdp_<area>` targets
+  (`rdp_finalization`, `rdp_drdynvc`, …), so `RUST_LOG=rdp_drdynvc=debug` isolates one area.
+- **Only the read is raced; every write runs to completion.** The session runners'
+  `tokio::select!` races `stream.read` against the input/command receivers, and the writes
+  happen inside the winning arm's body, never as a raced future. A read is cancel-safe: a
+  cancelled read has consumed nothing. A write is not: cancelling a partial `write_all` and
+  retrying duplicates the bytes already sent, which desynchronises the stream (the same trap
+  IronRDP's `Framed::write_all` documents). A new arm that awaits a write *as the raced
+  future* reintroduces it.
 - **The VM-dependent tests live here and are `#[ignore]`d**, which is why the
   coverage job excludes this crate.
 - **Every write goes out through `write_frame`, which flushes** (#325). The connect driver, the
@@ -95,7 +103,8 @@ read as the adapter growing a third of its size.
 
 ## Known holes / open
 
-- **Reconnect is not implemented** — no auto-reconnect loop (plan.md §23), so a
-  transient network drop ends the session.
+- **Reconnect is not implemented** — no auto-reconnect loop, so a transient network drop
+  ends the session. The cookie half shipped in #306; when and how often to reconnect is the
+  host's reconnect strategy (CLAUDE.md, "the host owns").
 - Multi-transport / UDP (epic #16) would add a second transport under this loop;
   nothing here anticipates it.

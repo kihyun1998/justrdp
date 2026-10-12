@@ -1,9 +1,9 @@
-//! `ReadCursor` — a zero-copy, position-tracking reader over a byte slice (plan.md §2). Every
+//! `ReadCursor` — a zero-copy, position-tracking reader over a byte slice. Every
 //! read is length-checked and returns [`DecodeError::NotEnoughBytes`] on underflow rather than
 //! panicking, so partial frames surface as the sans-IO "wait for more bytes" signal. Little-endian
 //! is the default (RDP's wire default); big-endian variants carry the `_be` suffix.
 //!
-//! Read-side only for now; `WriteCursor` and the object-safe `Encode`/`Decode` traits (plan.md §2)
+//! Read-side only for now; `WriteCursor` and the object-safe `Encode`/`Decode` traits
 //! arrive when an encoding path needs them.
 
 use crate::error::DecodeError;

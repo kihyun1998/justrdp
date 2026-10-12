@@ -9,7 +9,7 @@ Step 1 → `reference` + `map` · Step 2 → `boundary` · Step 3 → `implement
 test-trust self-loop · Step 4 → `proof` · Step 5 → `verify` · Step 6 → `sweep` +
 `search` · Step 7 → `gate`. **The live graph is the `thegraph` skill itself** — this
 repo keeps no copy of it; [`thegraph.md`](thegraph.md) holds only the outside sources
-this project is built against. This project is young (0.1.0, plan-driven), so most
+this project is built against. This project is young (0.1.0), so most
 entries are **decision anchors** — the concrete reason a rule exists here — rather
 than "a step was skipped and it cost us" incidents; add the latter as they occur.
 
@@ -32,6 +32,13 @@ Read this before starting so the graph does not read as abstractions.
   to a real server; the tolerance a server actually needs (caps it violates) is
   spec-unwritten and lives in FreeRDP/IronRDP source — #101 / ADR-0009 (tolerant
   negotiation posture) is the standing form of this.
+- **"The function exists" is not "it decodes this server" (#169).** The bootstrap plan read
+  `ironrdp-graphics` 0.8's Progressive decoder as near-complete (`TileState`,
+  `decode_first`/`decode_upgrade`, `reconstruct_to_rgba`, a `SurfaceTiles` grid) and concluded
+  the work was plumbing. Present and correct are different properties: it decoded 2 of 52
+  real payloads, seven divergences from FreeRDP spanned its parse, entropy, first pass and
+  transform (ADR-0011's amendments), and the epic ended up self-owning the codec. A source
+  sweep answers "does the function exist"; only a real capture answers "does it decode".
 - **Derive, don't copy (ADR-0003).** IronRDP code is re-derived from spec, and
   correctness is proven by differential test, not structural similarity — which is
   also what lets the `ironrdp-graphics` dependency be *dropped* once the oracle passes.
@@ -261,13 +268,13 @@ Read this before starting so the graph does not read as abstractions.
   **0x24** to this VM on a **clean** desktop — nothing open, nothing unsaved — and **0x25,
   Shutdown Denied**, comes back and the session stays up. The direction dies as a teardown
   mechanism in five minutes rather than after a day of implementing it.
-  Two things worth keeping beyond the number. **`docs/plan.md` had already guessed it** —
-  §V.3's slice reads *"assert the server replies with Shutdown Denied (typical)"*, written
-  long before — so the ledger Step 1 makes you open contained the answer to the question the
-  issue said was open, and reading it first is what made the probe a confirmation rather than
-  a discovery. And **the direction is still worth doing, just not for this**: the probe turns
-  §6b's unwritten slice from speculative into pre-measured, which is the difference between
-  killing an idea and relocating it.
+  Two things worth keeping beyond the number. **The build plan of the time had already
+  guessed it** — its verification section read *"assert the server replies with Shutdown
+  Denied (typical)"*, written long before — so the ledger Step 1 makes you open contained the
+  answer to the question the issue said was open, and reading it first is what made the probe
+  a confirmation rather than a discovery. And **the direction is still worth doing, just not
+  for this**: the probe turned the unwritten Shutdown Request slice (#228) from speculative
+  into pre-measured, which is the difference between killing an idea and relocating it.
 - **The premise was already false before the work started — and so was the issue's (#198).**
   Two of them, in opposite directions, and both had to be measured rather than reasoned about.
   *Its Definition of Done was already met*: #198 was filed at 11 of 12 passing and asks for

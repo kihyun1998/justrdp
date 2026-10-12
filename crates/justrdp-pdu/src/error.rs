@@ -1,4 +1,4 @@
-//! Typed decode errors for the wire layer (plan.md §2). Kept deliberately small — variants are
+//! Typed decode errors for the wire layer. Kept deliberately small — variants are
 //! added as PDUs that need them are implemented, not speculatively.
 
 /// An error raised while decoding bytes into a typed PDU.

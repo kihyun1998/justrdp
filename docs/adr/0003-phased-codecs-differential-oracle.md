@@ -27,7 +27,7 @@ This creates a tempo tension: if we depend on `ironrdp-graphics` for codecs, we 
 
 - **Codec independence achieved without an upfront cliff.** Rewriting each codec is a 1–2 week task per codec in isolation, not a 4-week "get all decoders right before you can see anything" up-front commitment. Each codec becomes a discrete slice that can be reviewed, tested, and merged independently.
 
-- **Correctness is automated, not debugged blind.** The oracle (ironrdp-* as dev-dependencies, pulled in only for tests) is the backbone of the §21 verification harness (plan.md). Feeding identical bytes to our codec and ironrdp's, comparing output, and asserting identity removes the manual pixel-inspection debugging loop that otherwise eats time in codec development.
+- **Correctness is automated, not debugged blind.** The oracle (ironrdp-* as dev-dependencies, pulled in only for tests) is the backbone of the verification harness (`docs/map/territory/verification-harness.md`). Feeding identical bytes to our codec and ironrdp's, comparing output, and asserting identity removes the manual pixel-inspection debugging loop that otherwise eats time in codec development.
 
 - **"Reference = copy = vendoring" is explicitly avoided.** We re-derive the codec logic from the MS-RDP spec, not copy ironrdp's code, and we prove correctness via differential testing, not by structural similarity. This keeps us honest about understanding the protocol.
 
@@ -41,7 +41,7 @@ This creates a tempo tension: if we depend on `ironrdp-graphics` for codecs, we 
 
 - **(B) Hand-write all codecs from spec on day one with no oracle.** Rejected: weeks of "image is corrupted" debugging with no reference to check against. Leads to abandoned half-finished codecs, context-switch cost, and risk of shipping incorrect output. No clear incentive to do this phase upfront when the oracle makes the work risk-free later.
 
-- **(C) Use a separate "oracle" repository.** Rejected: complicates the test harness. The oracle is the `ironrdp-*` crates themselves, pulled as dev-dependencies in `justrdp-codecs/Cargo.toml`. No separate repo needed; the test lives in `justrdp-codecs/tests/oracle.rs` and is the backbone of the verification harness (plan.md §21).
+- **(C) Use a separate "oracle" repository.** Rejected: complicates the test harness. The oracle is the `ironrdp-*` crates themselves, pulled as dev-dependencies in `justrdp-codecs/Cargo.toml`. No separate repo needed; the test lives in `justrdp-codecs/tests/oracle.rs` and is the backbone of the verification harness.
 
 - **(D) Rely only on manual interop testing (servers + mstsc/FreeRDP capture).** Rejected: catches feature-level bugs but misses bit-exact alignment. If our YCbCr→RGB has a rounding error that manifests as a 1-pixel hue shift only on 10% of tiles, manual testing will not catch it; the oracle will.
 

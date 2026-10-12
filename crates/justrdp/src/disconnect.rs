@@ -1,4 +1,4 @@
-//! Typed disconnect classification (issue #42, plan.md §6/§9c/§10) — make every session end
+//! Typed disconnect classification (issue #42) — make every session end
 //! attributable. The session machine records the server's last word ([`ServerDisconnectCause`])
 //! as it arrives; when the transport closes, the adapter surfaces a single
 //! [`DisconnectReason`] as the session's terminal value, and [`DisconnectClass`] tells the
@@ -30,7 +30,7 @@ pub enum DisconnectReason {
     LocalClosed,
 }
 
-/// The host-reaction bucket for a disconnect (plan.md §9c).
+/// The host-reaction bucket for a disconnect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectClass {
     /// Credentials must be re-entered (re-auth flow).

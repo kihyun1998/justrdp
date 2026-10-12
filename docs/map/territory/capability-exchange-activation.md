@@ -85,7 +85,8 @@ Deactivation–Reactivation, which is how a resize actually happens.
   PDU, but it promises Client Info fields the encoder does not write.
 - **The defaults advertise NSCodec over Set Surface Bits, with a Multifragment Update set**
   (#150). Adding them to `default_client_capabilities` was the maintainer's call, made on
-  plan.md §5a's *"advertise everything we can handle"* and shown against an opt-in-only option;
+  the build plan's *"advertise everything we can handle"* (since superseded by ADR-0016) and
+  shown against an opt-in-only option;
   it was made **before** two measurements it could not have seen. The Multifragment set then
   went in as a derivation: without it this server sent Set Error Info `0x112F` and closed the
   session before any surface bits, so a default without it would end every 32-bpp legacy
@@ -243,9 +244,9 @@ checked, identically on both legs.
 
 ## Known holes / open
 
-- **Client-initiated resize via Deactivation–Reactivation is only half-built** —
-  plan.md §23 records the inbound request handler as missing ("ironrdp-displaycontrol
-  does push, not pull").
+- **Client-initiated resize via Deactivation–Reactivation is only half-built** — the
+  inbound request handler is missing (IronRDP's `ironrdp-displaycontrol` pushes and does not
+  pull); multi-monitor and DPI resize are epic #27.
 - Order capabilities are parsed but drawing orders are not implemented (epic #22),
   so `OrderCapabilitySet` advertises a surface nothing consumes yet.
 - ADR-0009's tolerance is **not yet exercised for drawing orders**, stated in the

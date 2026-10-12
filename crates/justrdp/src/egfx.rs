@@ -1,6 +1,6 @@
 //! The EGFX Graphics Pipeline processor (MS-RDPEGFX) — the [`DvcProcessor`] for the
 //! `Microsoft::Windows::RDS::Graphics` dynamic channel, the production graphics path this
-//! project exists to unlock (the ironrdp 0x0100 gate-flag story, plan.md §0).
+//! project exists to unlock (the ironrdp 0x0100 gate-flag story, ADR-0017).
 //!
 //! justrdp **owns the surface model** (ADR-0002): the off-screen surface store, the bitmap
 //! cache, the blit/fill/cache ops, and the dirty-region batching live here. Every codec on this

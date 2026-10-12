@@ -79,8 +79,8 @@ behavioural question no spec section answers, and it is unrecorded.
 
 ## Known holes / open
 
-- **CRL / OCSP revocation is deliberately out of scope** (ADR-0005, plan.md open
-  question 7) — a certificate revoked after issuance is accepted.
+- **CRL / OCSP revocation is deliberately out of scope** (ADR-0005; tracked
+  for a future decision in epic #425) — a certificate revoked after issuance is accepted.
 - **RD Gateway certificates** are out of scope in the same record (epic #23).
 - **Pin-store schema versioning** is unspecified: `FilePinStore` writes a format
   nothing versions, so a later format change has no migration path.

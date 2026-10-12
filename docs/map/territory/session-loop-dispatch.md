@@ -101,6 +101,18 @@ such as FreeRDP's, whose `update_send_play_sound` exists) is what they are for. 
 reaches a client through audio output (#11). Keeping `SOUND_FLAG_BEEPS` advertised on that
 evidence was the maintainer's call, recorded in ADR-0016.
 
+**Shutdown Request: this VM refuses it, even on a clean desktop** (#198 probed, #228 built).
+`PDUTYPE2_SHUTDOWN_REQUEST` (36) goes out and `PDUTYPE2_SHUTDOWN_DENIED` (37) comes back. Both
+are bodyless: the Share Data header *is* the PDU. The refusal comes with no open application
+and no unsaved work, and the session stays up for the full 30 s observation. So the PDU is not
+a way to end a session; anything that needs the session *gone* signs out from inside it (see
+[Verification harness](verification-harness.md) for `shutdown /l /f`). **FreeRDP's client never
+sends one**: only its server side names the request, and `rdp_recv_server_shutdown_denied_pdu`
+is a bare `return TRUE`. IronRDP's `ActiveStage::graceful_shutdown` is therefore the only
+send-side reference. **The MCS Disconnect Provider Ultimatum that follows a grant is
+deliberately not written**: this VM never grants, so it would be machinery with no server to
+prove it against.
+
 ## Cross-cutting invariants
 
 - [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
@@ -146,5 +158,7 @@ evidence was the maintainer's call, recorded in ADR-0016.
 - Drawing orders (epic #22), clipboard (#10), audio (#11/#12), device redirection
   (#13) all dispatch through here and none exist — the dispatch table is a small
   fraction of the protocol's surface.
-- Auto-reconnect on transient disconnect (plan.md §23) is unbuilt: `classify`
-  distinguishes the cases, and nothing acts on the distinction.
+- Auto-reconnect on transient disconnect is unbuilt: `classify`
+  distinguishes the cases, and nothing acts on the distinction. When to reconnect is the
+  host's reconnect strategy; the cookie it needs shipped in #306.
+- Refresh Rect, Suppress Output, IME Status and Status Info have no arm: epic #426.

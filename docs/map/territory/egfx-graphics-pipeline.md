@@ -26,9 +26,18 @@ acknowledge frames. It is server→client only, and it is reachable only if
 - [ADR-0015](../../adr/0015-host-chosen-egfx-capabilities.md) — the host picks which honoured
   versions and which cache are advertised (`EgfxConfig`); the core derives each version's flags
   and refuses a version it cannot honour (#273).
+- [ADR-0019](../../adr/0019-avc-decode-behind-a-host-supplied-decoder.md) — H.264 is decoded
+  behind a host-supplied decoder, never owned; until that seam exists (#21) AVC is never
+  advertised, which is why 10.1 is not offered (#296).
 
 ## Design model
 
+- **The two surface commands name codecs from two different enums; do not conflate them.**
+  `WireToSurface1` carries a `Codec1Type` (`CODECID_UNCOMPRESSED`, `CODECID_CAVIDEO`,
+  `CODECID_CLEARCODEC`, `CODECID_PLANAR`, `CODECID_ALPHA` and the AVC ids); `WireToSurface2`
+  carries a `Codec2Type`, whose only value is `CODECID_CAPROGRESSIVE` (0x0009)
+  (`[MS-RDPEGFX]` 2.2.2.1 / 2.2.2.2; constants in `justrdp-pdu/src/egfx.rs`). The measured
+  server's desktop codec is Progressive, over `WireToSurface2`.
 - **The advertised ladder is the host's narrowing of what the core can honour** (#273).
   `HONOURED_VERSIONS` is the ceiling and the default; `EgfxConfig::versions` picks from it and is
   refused outside it. The host never sets a flag, because which flag a version may carry is a
@@ -154,7 +163,13 @@ acknowledge frames. It is server→client only, and it is reachable only if
   Sized against the real server rather than against the type: the busiest of 89 measured frames
   painted **4 096 000 bytes — exactly one 1280x800 desktop**, and every `destPtsCount` and
   `fillRectCount` observed was **1**. The ceiling therefore sits ~64x above observed traffic,
-  which is the evidence that it bounds an attack and not a server (`docs/plan.md` §0).
+  which is the evidence that it bounds an attack and not a server. Measured in #268
+  (2026-08-31, two live 1280x800 sessions): 2 748 `CACHE_TO_SURFACE`, 33 `SOLID_FILL` and 10
+  `SURFACE_TO_SURFACE` PDUs. **Up to 266 PDUs share one message**, so several frames genuinely
+  share a message here, and a test helper that wraps one PDU per message cannot tell a
+  per-frame reset from a per-message one; only a multi-frame blob can. **0 draws arrived
+  outside a `StartFrame` bracket**, so the per-message reset guards a case this server does
+  not produce. It is not dead code.
 
 - **The destination surface bounds a bitmap's size, not its position** (#376, the
   maintainer's call). A `destRect` wider or taller than its surface is **skipped** with an
@@ -489,5 +504,4 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   64x32** and nothing else. Any claim here about multi-point behaviour is derived from the
   spec and from our own tests, never observed; and per
   [capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)
-  even that is one box at one resolution with `connectionType` unrecorded for the run
-  (`docs/plan.md` §0).
+  even that is one box at one resolution with `connectionType` unrecorded for the run (#268).

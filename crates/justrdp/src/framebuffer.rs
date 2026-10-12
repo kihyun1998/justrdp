@@ -1,7 +1,7 @@
 //! The client-side framebuffer: an RGBA8888, top-down pixel buffer at the negotiated desktop
 //! size (stride = width × 4). Decoded bitmap rectangles are blitted in; each blit yields the
 //! [`FrameUpdate`] the host's frame sink receives. Mirrors the decode-complete reference
-//! model of ironrdp-session's image buffer (plan.md §7).
+//! model of ironrdp-session's image buffer.
 
 /// One rectangle of the framebuffer that changed: position and size only. The pixels live in
 /// the retained [`Framebuffer`] (ADR-0010) — the host reads them by borrow via
@@ -111,7 +111,7 @@ impl Framebuffer {
         Ok(fb)
     }
 
-    /// Rebuild at a new size (Deactivation–Reactivation, the resize trap of plan.md §0).
+    /// Rebuild at a new size (Deactivation–Reactivation, the resize path).
     /// Existing content is discarded — the server repaints after reactivation.
     ///
     /// Fallible in place rather than split into a validating step and an infallible apply

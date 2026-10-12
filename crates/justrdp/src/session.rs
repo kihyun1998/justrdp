@@ -1,14 +1,14 @@
 //! The sans-IO session state machine (ADR-0001): after the connect machine reaches
 //! `session-active`, this machine consumes raw socket bytes and produces [`SessionOutput`]s —
 //! decoded [`FrameUpdate`]s for the host's frame sink, and the occasional outbound frame
-//! (Deactivation–Reactivation re-runs capability exchange in-session, plan.md §0's resize
-//! trap). Implemented so far: slow-path *and* fast-path output graphics (bitmap + palette
-//! updates, with fast-path fragment reassembly — slice-6) and outbound keyboard/mouse input
-//! (slice-7), and slow-path pointer updates. Orders are a later slice: an order update falls
-//! to the dispatch's catch-all with its cursor unread — **skipped, not decoded** (the phrase
-//! here said "decoded-and-skipped" until #252, and neither half was true of it). The
-//! robustness policy is unchanged (plan.md §11c: unknown-but-well-formed never kills the
-//! session, malformed input does); what changed is the claim about *how* it is unknown.
+//! (Deactivation–Reactivation re-runs capability exchange in-session — a resize
+//! takes this path). Implemented so far: slow-path *and* fast-path output graphics (bitmap +
+//! palette updates, with fast-path fragment reassembly — slice-6) and outbound keyboard/mouse input
+//! (slice-7), and slow-path pointer updates. Orders are a later slice: an order update falls to the
+//! dispatch's catch-all with its cursor unread — **skipped, not decoded** (the phrase here said
+//! "decoded-and-skipped" until #252, and neither half was true of it). The robustness policy is
+//! unchanged (ADR-0009: unknown-but-well-formed never kills the session, malformed input does);
+//! what changed is the claim about *how* it is unknown.
 
 use crate::cursor::{CursorEvent, CursorImage};
 use crate::disconnect::{DisconnectReason, ServerDisconnectCause};
@@ -41,7 +41,7 @@ pub struct SessionConfig {
     pub share_id: u32,
     /// The negotiated desktop size — the framebuffer's initial dimensions.
     pub desktop_size: (u16, u16),
-    /// The Confirm Active capability sets (caller-owned, verbatim — plan.md §0).
+    /// The Confirm Active capability sets (caller-owned, verbatim — ADR-0016).
     pub capabilities: Vec<CapabilitySet>,
     /// The server's `inputFlags` from its Demand Active Input capability set
     /// ([`crate::ActivationResult::server_capabilities`]). Selects the input transport:
@@ -371,7 +371,7 @@ impl core::fmt::Display for ChannelSendError {
 impl core::error::Error for ChannelSendError {}
 
 /// Why the session failed. Malformed server data is fatal (likely protocol desync,
-/// plan.md §11c); everything else never reaches this type.
+/// ADR-0009); everything else never reaches this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     /// A malformed PDU.
@@ -1199,9 +1199,11 @@ impl SessionStateMachine {
     ) -> Result<Painted, SessionError> {
         // Bound the wire-declared dimensions BEFORE the decoders allocate width × height
         // buffers: a tiny malicious PDU declaring 65535×65535 would otherwise force a
-        // multi-gigabyte allocation (OOM abort, not a typed error — plan.md §11c; same
-        // class as the capped TSRequest read, gate #3). Legitimate rectangles never exceed
-        // the negotiated desktop plus the legacy 4-pixel alignment padding.
+        // multi-gigabyte allocation (OOM abort, not a typed error —
+        // `docs/map/invariant/decoder-dimension-overflow-32bit.md`; same class as the capped
+        // TSRequest read, gate #3).
+        // Legitimate rectangles never exceed the negotiated desktop plus the legacy 4-pixel
+        // alignment padding.
         let max_w = self.framebuffer.width().saturating_add(3);
         let max_h = self.framebuffer.height().saturating_add(3);
         if rect.width > max_w || rect.height > max_h {
@@ -1250,8 +1252,8 @@ impl SessionStateMachine {
         )))
     }
 
-    /// A Demand Active mid-session: the Deactivation–Reactivation sequence (plan.md §0 —
-    /// most commonly a resize). Confirm with the caller's capabilities (new size patched into
+    /// A Demand Active mid-session: the Deactivation–Reactivation sequence (most
+    /// commonly a resize). Confirm with the caller's capabilities (new size patched into
     /// the Bitmap set), pipeline the finalization batch, rebuild the framebuffer.
     fn on_demand_active(
         &mut self,
@@ -1326,7 +1328,7 @@ impl SessionStateMachine {
         Ok(())
     }
 
-    /// Encode host input events into complete outbound wire frames (plan.md §6a). The
+    /// Encode host input events into complete outbound wire frames. The
     /// transport is chosen from what the server's Input capability set advertised: fast-path
     /// input PDUs when `INPUT_FLAG_FASTPATH_INPUT`/`INPUT2` was set, the slow-path Input
     /// Event PDU otherwise. Batches over a single PDU's event bound are split automatically
@@ -1551,11 +1553,11 @@ impl SessionStateMachine {
     ///
     /// What it is *not* is session control. The server decides, and may refuse — Windows Server
     /// 2022 refuses **unconditionally**, measured against the test VM with nothing open and
-    /// nothing unsaved (issue #228, `docs/plan.md` §0). A refusal arrives as
-    /// [`SessionOutput::ShutdownDenied`]; a grant arrives as the session ending, which the
-    /// adapter already classifies through [`Self::disconnect_reason`]. So a host that needs the
-    /// session *gone* cannot rely on this, and one that wants to ask politely — and to know it
-    /// was refused rather than ignored — now can.
+    /// nothing unsaved (issue #228, `docs/map/territory/session-loop-dispatch.md`). A refusal
+    /// arrives as [`SessionOutput::ShutdownDenied`]; a grant arrives as the session ending, which
+    /// the adapter already classifies through [`Self::disconnect_reason`]. So a host that needs the
+    /// session *gone* cannot rely on this, and one that wants to ask politely — and to know it was
+    /// refused rather than ignored — now can.
     ///
     /// Valid whenever the session is live; there is no capability to negotiate first.
     pub fn request_shutdown(&self) -> Vec<Vec<u8>> {
@@ -2764,7 +2766,7 @@ mod tests {
     #[test]
     fn cached_pointer_misuse_is_a_typed_error() {
         // Index beyond the advertised cache size (default capset: 20 entries): protocol
-        // violation, fatal per plan.md §11c.
+        // violation, fatal per ADR-0009.
         let mut sm = SessionStateMachine::new(config(), Vec::new())
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
         assert!(matches!(

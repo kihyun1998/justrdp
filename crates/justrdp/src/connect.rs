@@ -15,7 +15,7 @@ use justrdp_pdu::nego::{NegFailureCode, NegRequest, NegResponse, SecurityProtoco
 use justrdp_pdu::{finalization, gcc, license, mcs, share, tpkt, x224};
 
 /// Everything the connect sequence needs from the caller, fixed at construction. The GCC fields
-/// — most critically `core.early_capability_flags`, the EGFX gate (plan.md §0) — reach the wire
+/// — most critically `core.early_capability_flags`, the EGFX gate (ADR-0017) — reach the wire
 /// **verbatim**: the machine fills in only `core.server_selected_protocol` (the negotiated
 /// protocol, a wire fact, not policy). What the core cannot honour is refused, not sent: see
 /// [`crate::advertise`].
@@ -35,7 +35,7 @@ pub struct ConnectConfig {
     /// the I/O channel as soon as the channel join completes.
     pub client_info: ClientInfoConfig,
     /// The capability sets to send in Confirm Active, **verbatim** — the same anti-hardcode
-    /// contract as `core.early_capability_flags` (plan.md §0). The machine touches exactly one
+    /// contract as `core.early_capability_flags` (ADR-0016). The machine touches exactly one
     /// thing: the Bitmap set's desktop size is overwritten with the server-negotiated size from
     /// Demand Active (a wire fact, like `serverSelectedProtocol`). Start from
     /// [`capability::default_client_capabilities`] and edit as needed, within what
@@ -77,9 +77,10 @@ pub struct LicenseEntropy {
 /// Caller-supplied fields of the Client Info PDU. Every field reaches the wire verbatim.
 ///
 /// There is deliberately **no password field**: the sans-IO machine never holds secrets
-/// (plan.md decision 10). Under NLA the session logs on with the CredSSP-delegated
-/// credentials, so the wire's password field is sent empty; a future autologon-over-plain-SSL
-/// feature would have to thread a password at the adapter boundary instead.
+/// (ADR-0002; `docs/map/territory/nla-credssp.md`). Under NLA the session logs on with the
+/// CredSSP-delegated credentials, so the wire's password field is sent empty; a future
+/// autologon-over-plain-SSL feature would have to thread a password at the adapter boundary
+/// instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientInfoConfig {
     /// `INFO_*` flags (e.g. AUTOLOGON, MOUSE, LOGON_NOTIFY) — caller policy, within
@@ -155,14 +156,14 @@ pub enum Action {
     WriteBytes(Vec<u8>),
     /// The X.224 negotiation selected `selected`; the adapter must now upgrade the socket to TLS
     /// (rustls handshake) and hand the server's leaf certificate back via
-    /// [`Event::TlsEstablished`]. The TLS records themselves never enter this machine (plan.md
-    /// §3 — the handshake runs outside the connect state machine).
+    /// [`Event::TlsEstablished`]. The TLS records themselves never enter this machine (ADR-0002
+    /// — the handshake runs in the adapter, outside the connect state machine).
     StartTls { selected: SecurityProtocol },
     /// The TLS upgrade is complete and the server's `subjectPublicKey` has been extracted; the
     /// adapter must now run the CredSSP token exchange (NLA), binding `pubKeyAuth` to
     /// `server_public_key`, and signal completion via [`Event::NlaComplete`]. The CredSSP
     /// records (`TSRequest`s) never enter this machine — `sspi` owns CredSSP and the adapter
-    /// drives the loop (plan.md decision 10), exactly as the TLS handshake stays in the adapter.
+    /// drives the loop (ADR-0002), exactly as the TLS handshake stays in the adapter.
     StartNla {
         /// The protocol the server chose in the X.224 Connection Confirm.
         selected: SecurityProtocol,
@@ -173,8 +174,8 @@ pub enum Action {
     },
     /// HYBRID_EX only: the CredSSP exchange finished and the server will now send the 4-byte
     /// Early User Authorization Result PDU. The adapter must read it and deliver it via
-    /// [`Event::EarlyUserAuthResult`]. (Failing to consume it desyncs capability exchange —
-    /// plan.md §0.)
+    /// [`Event::EarlyUserAuthResult`]. (Failing to consume it desyncs capability exchange;
+    /// see `docs/map/territory/nla-credssp.md`.)
     AwaitEarlyUserAuth,
     /// The MCS connect sequence completed: GCC settings exchanged, user attached, channels
     /// joined (or the join legitimately skipped). A **milestone, not the end**: the machine
@@ -563,7 +564,7 @@ impl ConnectStateMachine {
     /// Authentication finished: enter the MCS/GCC half of capability exchange. Builds the
     /// Connect-Initial from the caller's config — the only field the machine touches is
     /// `serverSelectedProtocol`, which echoes the negotiated protocol (a wire fact). Every
-    /// `earlyCapabilityFlags` bit is the caller's, verbatim (plan.md §0).
+    /// `earlyCapabilityFlags` bit is the caller's, verbatim (ADR-0016).
     fn start_mcs(&mut self, selected: SecurityProtocol) -> Vec<Action> {
         self.stage = Stage::GccExchange { selected };
         let mut core = self.config.core.clone();
@@ -827,7 +828,7 @@ impl ConnectStateMachine {
             domain: self.config.client_info.domain.clone(),
             username: self.config.client_info.username.clone(),
             // Never a secret here: NLA delegates the real credentials via CredSSP
-            // (plan.md decision 10 — no secrets in the sans-IO machine).
+            // (ADR-0002 — no secrets in the sans-IO machine).
             password: String::new(),
             alternate_shell: self.config.client_info.alternate_shell.clone(),
             work_dir: self.config.client_info.work_dir.clone(),
@@ -999,8 +1000,9 @@ impl ConnectStateMachine {
                 if license_crypto::mac_data(&keys.mac_salt, &plain) != new_license.mac {
                     return Err(ConnectError::LicenseMacMismatch);
                 }
-                // Persistent license caching is optional (MS-RDPELE) and backlog (plan.md §3):
-                // the grant is integrity-verified and discarded.
+                // Persistent license caching is optional (MS-RDPELE) and not built
+                // (`docs/map/territory/licensing.md`): the grant is integrity-verified and
+                // discarded.
                 self.stage = Stage::CapabilityExchange { selected };
                 Ok(Vec::new())
             }
@@ -1060,7 +1062,7 @@ impl ConnectStateMachine {
             // Demand Active.
             share::PDU_TYPE_DEACTIVATE_ALL => Ok(Vec::new()),
             // A data PDU before Demand Active (e.g. an early Set Error Info): skip, per the
-            // robustness policy (plan.md §11c — unknown-but-well-formed input never kills the
+            // robustness policy (ADR-0009 — unknown-but-well-formed input never kills the
             // connect; malformed input does).
             share::PDU_TYPE_DATA => Ok(Vec::new()),
             share::PDU_TYPE_DEMAND_ACTIVE => {
@@ -1964,7 +1966,7 @@ pub(crate) mod tests {
         assert_eq!(info.credentials.domain.as_deref(), Some("WORKGROUP"));
         assert_eq!(
             info.credentials.password, "",
-            "no secret enters the sans-IO machine (plan.md decision 10)"
+            "no secret enters the sans-IO machine (ADR-0002)"
         );
         let tz = info
             .extra_info

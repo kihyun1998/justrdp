@@ -117,7 +117,8 @@ advisory by the maintainer's call, made when no justrdp stimulus had produced a 
 
 - **No table has ever been verified against a reference implementation.** They are
   the repo's clearest instance of "derived once, never checked".
-- IME / dead keys / Unicode input are unbuilt (plan.md §18); the Unicode path is a
+- IME / dead keys / Unicode input are unbuilt; composing them is host input-device
+  semantics (CLAUDE.md, "the host owns"), and the IME Status PDU is epic #426. The Unicode path is a
   different PDU shape, not a table row.
 - Multitouch and pen (epic #15), relative-mouse mode (a GCC early flag exists,
   `RELATIVE_MOUSE_INPUT`) are not implemented.

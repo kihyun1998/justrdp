@@ -8,8 +8,9 @@ The core is a **sans-IO state machine**: connect sequence and session loop are p
 deliberately leaves out: the TLS handshake, the CredSSP token loop, per-stage timeouts, the
 session runner.
 
-Before implementing, read `GLOSSARY.md` (ubiquitous language), `docs/adr/` (why each decision
-was made; ADR-0017 is why justrdp exists) and `docs/plan.md` (build plan §2–§23).
+Before implementing, read `GLOSSARY.md` (ubiquitous language) and `docs/adr/` (why each decision
+was made; ADR-0017 is why justrdp exists). Unbuilt work lives only in the tracker, as `epic`
+issues.
 
 ## Workflow — `thegraph`
 
@@ -34,7 +35,7 @@ was made; ADR-0017 is why justrdp exists) and `docs/plan.md` (build plan §2–�
 
 Open [`docs/map/README.md`](docs/map/README.md) before a design is fixed. Each territory's
 `## Blast radius` says what moves when you touch it; `invariant/` holds facts that cross
-territories. ADRs are indexed by the day a decision was argued and `plan.md` by build order, so
+territories. ADRs are indexed by the day a decision was argued and issues by the work, so
 neither answers "what moves with this".
 
 ## Boundary invariant (the identity)

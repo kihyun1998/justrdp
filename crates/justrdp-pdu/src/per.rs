@@ -1,5 +1,5 @@
 //! ALIGNED PER (Packed Encoding Rules, X.691) primitives — the encoding T.125 MCS domain PDUs
-//! and the T.124 GCC Conference Create wrappers use (plan.md §3 Layer 1). Only the shapes RDP
+//! and the T.124 GCC Conference Create wrappers use. Only the shapes RDP
 //! needs are implemented: the 1/2-byte length determinant, constrained u16 (offset from a base),
 //! the length-prefixed unconstrained u32, single-byte CHOICE/ENUMERATED, OBJECT IDENTIFIER,
 //! OCTET STRING with a minimum, and the packed NumericString.

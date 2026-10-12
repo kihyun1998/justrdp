@@ -1,4 +1,4 @@
-//! Server-certificate trust policies for the TLS upgrade (issue #36, plan.md §22).
+//! Server-certificate trust policies for the TLS upgrade (issue #36, ADR-0005).
 //!
 //! slice-2 shipped a deliberately permissive verifier (accept-any) so the connect sequence could
 //! be built before validation existed. This module replaces it with a caller-chosen
@@ -32,8 +32,8 @@ pub enum TrustPolicy {
     /// Trust-On-First-Use: pin the server's `subjectPublicKey` per host in the given
     /// [`PinStore`]. The first connect to a host stores its key; every later connect compares —
     /// an unchanged key connects, a changed one fails the handshake with an error naming the
-    /// host and both SHA-256 fingerprints (and the old pin is **not** overwritten). plan.md §22
-    /// recommends this for single-server scenarios, where no CA chain exists to validate.
+    /// host and both SHA-256 fingerprints (and the old pin is **not** overwritten). Meant
+    /// for single-server scenarios, where no CA chain exists to validate (ADR-0005).
     Tofu(Arc<dyn PinStore>),
     /// Accept **any** certificate, with no validation of any kind — the connection is open to
     /// man-in-the-middle interception. Lab and test use only; never reachable via `Default`.

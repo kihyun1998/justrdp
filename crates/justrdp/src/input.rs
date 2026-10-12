@@ -1,5 +1,5 @@
-//! Host input helpers: OS key identifiers → RDP **set-1 scancodes** (plan.md §6a bullet 6 —
-//! this mapping is owned here, not borrowed from another stack).
+//! Host input helpers: OS key identifiers → RDP **set-1 scancodes** (this mapping
+//! is owned here, not borrowed from another stack).
 //!
 //! RDP keyboard events carry IBM PC/AT *set-1 make codes* plus an `E0`/`E1` prefix flag —
 //! key **positions**, not characters. Shift does not change a scancode; the server's own

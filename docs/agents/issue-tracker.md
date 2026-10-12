@@ -19,7 +19,7 @@ Infer the repo from `git remote -v` — `gh` does this automatically when run in
 gh issue list --label P0        # start here. Also pinned, so they head the tracker's front page
 gh issue list --label P1        # next, the moment a P0's named successor is unblocked
 gh issue list --label P2        # after — each has an open predecessor
-gh issue list --label P3        # the ungrilled backlog pool, ordered by docs/plan.md §9's MVP cut
+gh issue list --label P3        # the ungrilled backlog pool, unordered: the grill picks the next one
 ```
 
 **The rungs are defined by dependency, not by taste** — which is what keeps them re-derivable

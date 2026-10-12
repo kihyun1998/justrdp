@@ -1,9 +1,9 @@
 //! The legacy cryptography MS-RDPELE licensing mandates: MD5/SHA-1 key derivation, RC4 message
-//! encryption, and raw (textbook) RSA for the premaster secret. Hand-rolled because plan.md
-//! decision 6 keeps the RDP-protocol crates dependency-free, and ADR-0002 reserves external
-//! crypto dependencies for the *security-critical* layers (TLS/NLA) — which licensing is not:
-//! it rides **inside** the already-authenticated TLS session, and its algorithms are frozen by
-//! the spec (MS-RDPELE 5.1).
+//! encryption, and raw (textbook) RSA for the premaster secret. Hand-rolled because the
+//! RDP-protocol crates stay dependency-free (the ADR-0001 Amendment's tree rule), and ADR-0002
+//! reserves external crypto dependencies for the *security-critical* layers (TLS/NLA) — which
+//! licensing is not: it rides **inside** the already-authenticated TLS session, and its algorithms
+//! are frozen by the spec (MS-RDPELE 5.1).
 //!
 //! **Not general-purpose cryptography.** MD5/SHA-1/RC4/unpadded RSA are broken primitives by
 //! modern standards; they exist here solely because the licensing wire format requires them.

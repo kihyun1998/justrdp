@@ -33,7 +33,12 @@ deciding the exchange itself.
   `HYBRID_EX` → TLS + CredSSP + a 4-byte Early User Authorization Result read by
   the adapter before the MCS phase.
 - The machine emits `Action::StartTls { selected }` and never sees a TLS record —
-  the handshake belongs to the adapter (plan.md §3, decision 10).
+  the handshake belongs to the adapter (ADR-0002; [TLS transport security](tls-transport-security.md)).
+- **NLA is mandatory: there is no TLS-only path.** Even when the server selects
+  `PROTOCOL_SSL`, `Event::TlsEstablished` leads to `Action::StartNla`. The target set when the
+  build was scoped (2026-06-08) is a modern Windows Server with NLA enforced, and the test VM
+  refuses a TLS-only connect (`HYBRID_REQUIRED_BY_SERVER`). Standard RDP Security (RC4) is not
+  supported at all.
 
 ## Code
 

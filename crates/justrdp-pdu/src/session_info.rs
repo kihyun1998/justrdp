@@ -841,7 +841,7 @@ mod tests {
     /// Which `errorNotificationType` values make `errorNotificationData` a session ID.
     ///
     /// **The expected values come from `[MS-RDPBCGR]` 2.2.10.1.1.4.1.1, not from the code.** This
-    /// test used to assert a classification derived from plan.md and IronRDP — four
+    /// test used to assert a classification derived from the build plan and IronRDP — four
     /// "offer-shaped" types — and the code shared the same model, so the two confirmed each other
     /// and mutations that broke the code reddened it. The spec says otherwise: every one of the
     /// seven `LOGON_MSG_*` values reads *"The session identifier is specified by the

@@ -93,8 +93,8 @@ Recorded so the next pass does not read these as settled by it:
   sequence the live path cannot produce; every non-fatal verdict would have falsified both. #272
   inherits that obligation.
 - **Two records carried a premise this enumeration falsified** — that Microsoft's suite tolerates a
-  nonexistent cache slot. `egfx-graphics-pipeline.md` and `docs/plan.md` are corrected in the same
-  change. #268's skip decision survives on its other ground, a resource ceiling that is ours
+  nonexistent cache slot. `egfx-graphics-pipeline.md` and the build plan (since retired) were
+  corrected in the same change. #268's skip decision survives on its other ground, a resource ceiling that is ours
   (ADR-0009, 2026-08-31 amendment).
 - **Three surfaces called such an error "fatal for the channel"** — `justrdp_codecs::color`'s
   `to_rgba` rationale, `bitmap-codecs.md`, and ADR-0012's consumption-site paragraph. It was always
