@@ -10,7 +10,7 @@ PDUs, `justrdp-codecs::pcm::encode` turns signed 16-bit samples into linear PCM 
 `justrdp::audin::AudioInput` is a sans-IO helper the host drives over the host dynamic channel
 seam (ADR-0018), as it drives the audio output helper. Epic #12; #401 builds PCM and proves it
 against the spec, and #404 proves it against a real server, the Windows 11 VM
-(`192.168.136.163`), by recording a tone the host pushes.
+(`192.168.136.163`), by recording a signal the host pushes.
 
 ## Governing decisions
 
@@ -119,10 +119,12 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   `AudioInputEvent`, `CLIENT_VERSION`, `ENCODABLE_FORMAT_TAGS`
 - `crates/justrdp/src/advertise.rs` — `HONOURED_CLIENT_INFO_FLAGS`, which holds
   `AUDIO_CAPTURE` since #401
-- `crates/justrdp-tokio/src/lib.rs` — `a_tone_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm`,
-  `a_tone_pushed_in_alaw_is_what_the_session_records_on_the_real_vm`,
+- `crates/justrdp-tokio/src/lib.rs` — `a_signal_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm`,
+  `a_signal_pushed_in_alaw_is_what_the_session_records_on_the_real_vm`,
+  `the_signal_check_finds_the_pushed_signal_whole_and_nothing_else`, `holds_pushed_signal`,
+  `pushed_sample`,
   `without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm`,
-  `record_a_tone_pushed_as_audio_input`
+  `record_a_signal_pushed_as_audio_input`
 - `fuzz/fuzz_targets/audin.rs` — the PDU parser and the helper over split input, the host's
   side played, seeded by `.github/scripts/seed_fuzz_corpus.py` with a session that reaches
   recording
@@ -142,12 +144,12 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   #404 had read nine ADPCM formats of each), and, to a client answering with PCM alone, an Open PDU with `FramesPerPacket`
   441 (10 ms), `initialFormat` 0 and a `WAVEFORMAT_EXTENSIBLE` capture format at 44.1 kHz
   stereo 16-bit (`cbSize` 22). FreeRDP 3.31 saw the same (#400).
-- **A pushed tone is what the session records**: with the host pushing a 440 Hz sine ten
-  milliseconds at a time, each packet a 1,765-byte Data PDU sent as a Data First and a Data
-  PDU, the WAV MCI saves (11,025 Hz 8-bit mono) read back over `rdpdr` holds 440 Hz at about
-  10^5 times the power of any of five other frequencies
-  (`a_tone_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm`). Pushing 620 Hz
-  instead turns it red.
+- **A pushed signal is what the session records**: with the host pushing ten milliseconds at
+  a time, each packet a 1,765-byte Data PDU sent as a Data First and a Data PDU, the WAV MCI
+  saves (11,025 Hz 8-bit mono) read back over `rdpdr` holds what was pushed
+  (`a_signal_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm`). Until #411
+  the signal was a 440 Hz tone, which held at about 10^5 times the power of five other
+  frequencies; it is now deterministic noise, mapped window by window (below).
 - **Without `INFO_AUDIOCAPTURE` the server opens no `AUDIO_INPUT` and the session has no
   capture device**: MCI `record` returns 328, `MCIERR_WAVE_INPUTSUNSUITABLE`
   (`without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm`). So the flag is
@@ -155,8 +157,8 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   offers one the server cannot open.
 - **A host listing only A-law gets the server's one A-law format**, 22,050 Hz stereo 8-bit,
   `nBlockAlign` 2, `nAvgBytesPerSec` 44,100, and the same Open: `FramesPerPacket` 441 and a
-  44.1 kHz capture format. Pushed in packets of 220 frames, the tone is what the session
-  records (`a_tone_pushed_in_alaw_is_what_the_session_records_on_the_real_vm`).
+  44.1 kHz capture format. Pushed in packets of 220 frames, the signal is what the session
+  records, whole (`a_signal_pushed_in_alaw_is_what_the_session_records_on_the_real_vm`).
 - **Windows 11 records audio input only from short packets, whatever the codec** (#402). Traced
   by pushing deterministic noise and correlating each 10 ms of the recording with it, which
   maps every output stretch to the input it came from to within 0.09 ms:
@@ -194,6 +196,29 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
 - **A tone cannot measure a loss.** A dropped stretch shows in a tone's phase only modulo one
   period, 2.27 ms at 440 Hz: the 10 ms drops above first read as 0.78 ms ones and a 452 Hz
   pitch. The noise correlation has no period to hide one in.
+- **So the live tests map the recording to what was pushed** (#411, `holds_pushed_signal`;
+  **the maintainer's call, 2026-10-12**, shown the alternative of pushing the tone and the
+  noise together and keeping both checks). The host pushes a hash of each frame's index,
+  averaged over four frames, on every channel; the check averages it down to the recording's
+  rate, finds where the recording's first hundredth of a second came from, and then requires
+  every later hundredth to match the signal at that same offset with a correlation of at least
+  0.5 (clean runs measure 0.70 for PCM and 0.83 for A-law), over at least 4.5 of MCI's 5
+  seconds. It sees any stretch dropped or repeated after the recording starts, to one sample
+  of the recording (0.09 ms); a failure says where the stretch came from instead. It does not
+  see what is lost before MCI starts recording, a change of level, or a loss smaller than one
+  recorded sample. Dropping five whole 440 Hz periods a second, which a tone's power cannot
+  see, and the 2.2.2.3 byte rule for A-law both turn it red.
+- **Windows 11 drops audio input that arrives in bursts, and some PCM it receives on time**
+  (#411). With the harness's first pusher, a tokio interval that on Windows ticks to a 15.6 ms
+  quantum and now and then missed two or three ticks, packets arrived in bursts of three or four
+  and half the PCM and A-law runs lost 10 to 40 ms; paced by its own thread to each 10 ms
+  deadline, A-law recorded whole in 6 runs of 6. PCM still loses whole packets in about two runs
+  of five (13 of 34), though every packet is written to the socket the moment it is pushed, no
+  read took more than 2 ms to process, and TCP retransmitted no more than the idle host does.
+  Pushing 0.5 % slower or faster, single-fragment 5 ms packets (5 of 6 lost), and four vCPUs
+  for the VM (8 of 16) did not remove it. Why Windows drops them is not visible from the wire.
+  A host should deliver captured audio steadily: the helper keeps no clock and sends what it
+  is given when it is given it.
 - **These Data PDUs found a static channel defect**: each DVC fragment has to ride one SVC
   chunk, and until #404 an SVC chunk carried 1,592 data bytes where `[MS-RDPBCGR]` 2.2.6.1
   allows 1,600, so a 1,594-byte fragment straddled two chunks and Windows 11 ended the session
@@ -240,6 +265,9 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   ADPCM whole would bring them back: their tags into `ENCODABLE_FORMAT_TAGS`, packets of whole
   blocks, and a live proof. AAC waits on #21's decoder-backend question; GSM 6.10 is not
   encoded.
+- **PCM audio input loses packets on Windows 11** in about two runs of five, by the server
+  (Reference behaviour); the cause is #416, and the PCM live test
+  says it fails that often.
 - **8-bit PCM is unmeasured.** Windows 11 offers none, and at the capture rate its packet is
   `FramesPerPacket` × `nBlockAlign` bytes, the size it discards for A-law.
 - **One server.** Only a Windows 11 client SKU has been measured; a Server SKU with the RD

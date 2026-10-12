@@ -3119,7 +3119,7 @@ mod tests {
         .await;
     }
 
-    /// What [`record_a_tone_pushed_as_audio_input`] saw.
+    /// What [`record_a_signal_pushed_as_audio_input`] saw.
     #[derive(Debug, Default)]
     struct AudioInputRun {
         /// The id the server gave `AUDIO_INPUT`, if it opened it.
@@ -3128,23 +3128,25 @@ mod tests {
         server_pdus: Vec<justrdp_pdu::audin::ServerPdu>,
         /// What the helper answered the server's list with.
         negotiated: Vec<justrdp_pdu::audin::AudioFormat>,
+        /// The format the server opened recording in.
+        format: Option<justrdp_pdu::audin::AudioFormat>,
         /// The Data PDUs sent, by length.
         data_lengths: Vec<usize>,
+        /// When, in seconds since recording started, the pusher woke more than 15 ms after a
+        /// tick was due, and by how many milliseconds.
+        late_pushes: Vec<(f64, f64)>,
         /// `open=…;record=…;save=…;close=…`, the MCI return codes the session's script wrote.
         mci_codes: Option<String>,
         /// The WAV the session recorded, as it wrote it to the host's drive.
         wav: Option<Vec<u8>>,
     }
 
-    /// The tone the host pushes, in hertz.
-    const TONE_HZ: f64 = 440.0;
-
     /// Connect to the audio input VM with `AUDIO_INPUT` registered and a host drive holding a
     /// script that records five seconds with winmm MCI, saves the WAV to that drive, and writes
-    /// MCI's return codes beside it. While the server records, the host pushes a 440 Hz tone
-    /// through `AudioInput` in real time, ten milliseconds at a time, in the formats of
-    /// `format_tags` the server offers.
-    async fn record_a_tone_pushed_as_audio_input(
+    /// MCI's return codes beside it. While the server records, the host pushes
+    /// [`pushed_sample`]'s signal through `AudioInput` in real time, ten milliseconds at a time,
+    /// in the formats of `format_tags` the server offers.
+    async fn record_a_signal_pushed_as_audio_input(
         audio_capture_flag: bool,
         format_tags: &[u16],
     ) -> AudioInputRun {
@@ -3243,8 +3245,9 @@ mod tests {
                 });
             }
 
-            // The host's capture device: once recording, a 440 Hz tone, ten milliseconds of it
-            // every ten milliseconds.
+            // The host's capture device: once recording, the pushed signal, ten milliseconds of
+            // it every ten milliseconds, on a thread of its own that sleeps to each tick's
+            // deadline.
             let pusher = {
                 let (commands_tx, cancel, input, recording, run) = (
                     commands_tx.clone(),
@@ -3253,24 +3256,34 @@ mod tests {
                     recording.clone(),
                     run.clone(),
                 );
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(Duration::from_millis(10));
-                    let (mut frame, mut ticks) = (0u64, 0u64);
+                std::thread::spawn(move || {
+                    let start = std::time::Instant::now();
+                    let (mut frame, mut ticks, mut beat) = (0u64, 0u64, 0u32);
+                    let mut recording_since = None;
                     while !cancel.is_cancelled() {
-                        tick.tick().await;
+                        beat += 1;
+                        let due = start + Duration::from_millis(10) * beat;
+                        std::thread::sleep(
+                            due.saturating_duration_since(std::time::Instant::now()),
+                        );
                         let Some((channel_id, channels, rate)) = *recording.lock().unwrap() else {
                             continue;
                         };
+                        let since = *recording_since.get_or_insert(due);
+                        let late = due.elapsed();
+                        if late > Duration::from_millis(15) {
+                            run.lock()
+                                .unwrap()
+                                .late_pushes
+                                .push(((due - since).as_secs_f64(), late.as_secs_f64() * 1000.0));
+                        }
                         // A tick is a hundredth of a second, and 22,050 frames are not a whole
                         // number of hundredths.
                         ticks += 1;
                         let until = ticks * u64::from(rate) / 100;
                         let samples: Vec<i16> = (frame..until)
                             .flat_map(|n| {
-                                let t = n as f64 / f64::from(rate);
-                                let s = (8000.0 * (2.0 * std::f64::consts::PI * TONE_HZ * t).sin())
-                                    as i16;
-                                std::iter::repeat_n(s, usize::from(channels))
+                                std::iter::repeat_n(pushed_sample(n), usize::from(channels))
                             })
                             .collect();
                         frame = until;
@@ -3280,8 +3293,10 @@ mod tests {
                                 run.lock().unwrap().data_lengths.push(data.len());
                             }
                             if commands_tx
-                                .send(SessionCommand::DynamicChannelData { channel_id, data })
-                                .await
+                                .blocking_send(SessionCommand::DynamicChannelData {
+                                    channel_id,
+                                    data,
+                                })
                                 .is_err()
                             {
                                 return;
@@ -3423,6 +3438,7 @@ mod tests {
                                         run_in.lock().unwrap().negotiated = formats;
                                     }
                                     AudioInputEvent::Open { format, .. } => {
+                                        run_in.lock().unwrap().format = Some(format.clone());
                                         let reply = input_in
                                             .lock()
                                             .unwrap()
@@ -3496,7 +3512,7 @@ mod tests {
             )
             .await;
             let driven = driver.await.expect("the driver task");
-            pusher.abort();
+            pusher.join().expect("the pusher thread");
             ended
                 .expect("the session ended within 300 s")
                 .expect("the session ran without a protocol failure");
@@ -3555,28 +3571,101 @@ mod tests {
         )
     }
 
-    /// Whether `wav` holds [`TONE_HZ`] at more than 20 times the power of any of five other
-    /// frequencies, with the WAV's samples, rate and the two powers for the record.
-    fn holds_tone(wav: &[u8]) -> (bool, usize, u32, f64, f64) {
-        let (samples, rate) = wav_mono(wav);
-        let tone = power_at(&samples, rate, TONE_HZ);
-        let off = [250.0, 330.0, 620.0, 880.0, 1000.0]
-            .map(|hz| power_at(&samples, rate, hz))
-            .into_iter()
-            .fold(0.0, f64::max);
-        (tone > 20.0 * off, samples.len(), rate, tone, off)
+    /// The signal the host pushes, frame `n` of it: a hash of the frame index averaged over four
+    /// frames, the same on every channel. Every stretch of it is unlike every other, so where a
+    /// stretch of the recording came from is a correlation away.
+    fn pushed_sample(n: u64) -> i16 {
+        fn hashed(m: u64) -> f64 {
+            let mut z = m.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            f64::from((z >> 48) as u16 as i16) / 32768.0
+        }
+        let mean = (0..4).map(|k| hashed(n.wrapping_sub(k))).sum::<f64>() / 4.0;
+        (16_000.0 * mean) as i16
     }
 
-    /// The power of `samples` at `hz` (Goertzel).
-    fn power_at(samples: &[f64], rate: u32, hz: f64) -> f64 {
-        let coeff = 2.0 * (2.0 * std::f64::consts::PI * hz / f64::from(rate)).cos();
-        let (mut s1, mut s2) = (0.0, 0.0);
-        for &x in samples {
-            let s = x + coeff * s1 - s2;
-            s2 = s1;
-            s1 = s;
+    /// The pushed signal at `rate` as a recording at `recorded_rate` would hold it, for
+    /// `seconds`: each recorded sample the mean of the pushed frames it spans.
+    fn pushed_signal(rate: u32, recorded_rate: u32, seconds: u32) -> Vec<f64> {
+        let per = u64::from(rate / recorded_rate);
+        (0..u64::from(recorded_rate * seconds))
+            .map(|i| {
+                (0..per)
+                    .map(|k| f64::from(pushed_sample(i * per + k)))
+                    .sum::<f64>()
+                    / per as f64
+            })
+            .collect()
+    }
+
+    /// What [`holds_pushed_signal`] found: how much of the recording it mapped, and the weakest
+    /// match of any window.
+    #[derive(Debug)]
+    struct SignalMatch {
+        seconds: f64,
+        worst_correlation: f64,
+    }
+
+    /// Whether `wav` is the signal pushed at `rate`, whole: every hundredth of a second of it
+    /// matches the pushed signal at the same offset as the first, nothing dropped or repeated
+    /// after the recording starts, for at least 4.5 of MCI's 5 seconds.
+    fn holds_pushed_signal(wav: &[u8], rate: u32) -> Result<SignalMatch, String> {
+        /// The weakest correlation a window of the pushed signal keeps through the server's
+        /// resampling and MCI's 8 bits; the measured runs never fell below 0.7.
+        const MATCH: f64 = 0.5;
+        let (recorded, recorded_rate) = wav_mono(wav);
+        if recorded_rate == 0 || !rate.is_multiple_of(recorded_rate) {
+            return Err(format!(
+                "a recording at {recorded_rate} Hz of a signal pushed at {rate} Hz"
+            ));
         }
-        s1 * s1 + s2 * s2 - coeff * s1 * s2
+        let seconds = recorded.len() as f64 / f64::from(recorded_rate);
+        if seconds < 4.5 {
+            return Err(format!("{seconds:.2} s recorded"));
+        }
+        let window = (recorded_rate / 100) as usize;
+        let pushed = pushed_signal(rate, recorded_rate, 20);
+        let correlation = |at: usize, lag: usize| {
+            let (a, b) = (&recorded[at..at + window], &pushed[lag..lag + window]);
+            let mean = a.iter().sum::<f64>() / window as f64;
+            let a: Vec<f64> = a.iter().map(|v| v - mean).collect();
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let norms = a.iter().map(|x| x * x).sum::<f64>() * b.iter().map(|y| y * y).sum::<f64>();
+            if norms > 0.0 { dot / norms.sqrt() } else { 0.0 }
+        };
+        let best = |at: usize, from: usize, to: usize| {
+            (from..=to.min(pushed.len() - window))
+                .map(|lag| (lag, correlation(at, lag)))
+                .fold((from, f64::MIN), |b, c| if c.1 > b.1 { c } else { b })
+        };
+        let (start, first) = best(0, 0, 8 * recorded_rate as usize);
+        if first < MATCH {
+            return Err(format!(
+                "the recording's start matches the pushed signal at {first:.2} at best"
+            ));
+        }
+        let mut worst_correlation = first;
+        for w in 1..recorded.len() / window {
+            let (at, expected) = (w * window, start + w * window);
+            let found = correlation(at, expected);
+            if found < MATCH {
+                let reach = recorded_rate as usize / 10;
+                let (lag, c) = best(at, expected.saturating_sub(reach), expected + reach);
+                return Err(format!(
+                    "at {:.3} s the recording matches the pushed signal at {found:.2}; its best \
+                     match, {c:.2}, is {:+.2} ms from where it should be",
+                    at as f64 / f64::from(recorded_rate),
+                    (lag as f64 - expected as f64) * 1000.0 / f64::from(recorded_rate)
+                ));
+            }
+            worst_correlation = worst_correlation.min(found);
+        }
+        Ok(SignalMatch {
+            seconds,
+            worst_correlation,
+        })
     }
 
     /// Real-VM acceptance for #404: without `INFO_AUDIOCAPTURE` the server opens no
@@ -3586,7 +3675,7 @@ mod tests {
                 expires around 2027-01) and JUSTRDP_TEST_* env vars"]
     async fn without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm() {
         let run =
-            record_a_tone_pushed_as_audio_input(false, &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM])
+            record_a_signal_pushed_as_audio_input(false, &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM])
                 .await;
         assert_eq!(run.channel, None, "the server opened no AUDIO_INPUT");
         let codes = run.mci_codes.expect("the script wrote MCI's return codes");
@@ -3596,17 +3685,16 @@ mod tests {
         );
     }
 
-    /// The tone check the audio input VM test makes, on WAVs built here: MCI's default 11,025 Hz
-    /// 8-bit mono holding the tone passes, and silence or another tone does not.
+    /// The signal check the audio input VM tests make, on WAVs built here as MCI saves them,
+    /// 11,025 Hz 8-bit mono, from a signal pushed at 22,050 Hz: the signal from a late start
+    /// passes, and a dropped hundredth of a second, a drop of five whole 440 Hz periods (which a
+    /// tone's power cannot see), a repeated stretch, a short recording and silence do not.
     #[test]
-    fn the_tone_check_finds_440_hz_in_an_8_bit_wav_and_nothing_else() {
-        fn wav(hz: f64, amplitude: f64) -> Vec<u8> {
-            let rate = 11_025u32;
-            let data: Vec<u8> = (0..rate * 2)
-                .map(|n| {
-                    let t = f64::from(n) / f64::from(rate);
-                    (128.0 + amplitude * (2.0 * std::f64::consts::PI * hz * t).sin()) as u8
-                })
+    fn the_signal_check_finds_the_pushed_signal_whole_and_nothing_else() {
+        fn wav(samples: &[f64]) -> Vec<u8> {
+            let data: Vec<u8> = samples
+                .iter()
+                .map(|&v| (128.0 + v / 256.0).round().clamp(0.0, 255.0) as u8)
                 .collect();
             let mut out = b"RIFF".to_vec();
             out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
@@ -3615,8 +3703,9 @@ mod tests {
             for v in [1u16, 1] {
                 out.extend_from_slice(&v.to_le_bytes());
             }
-            out.extend_from_slice(&rate.to_le_bytes());
-            out.extend_from_slice(&rate.to_le_bytes());
+            for v in [11_025u32, 11_025] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
             for v in [1u16, 8] {
                 out.extend_from_slice(&v.to_le_bytes());
             }
@@ -3625,20 +3714,36 @@ mod tests {
             out.extend_from_slice(&data);
             out
         }
-        assert!(holds_tone(&wav(TONE_HZ, 30.0)).0);
-        assert!(!holds_tone(&wav(TONE_HZ, 0.0)).0);
-        assert!(!holds_tone(&wav(620.0, 30.0)).0);
+        let pushed = pushed_signal(22_050, 11_025, 8);
+        // MCI starts recording a little after the host starts pushing.
+        let recorded = &pushed[37..37 + 5 * 11_025];
+        let found = holds_pushed_signal(&wav(recorded), 22_050).unwrap();
+        assert_eq!(found.seconds, 5.0);
+        assert!(found.worst_correlation > 0.9, "{found:?}");
+
+        let dropped = [&recorded[..20_000], &recorded[20_110..]].concat();
+        assert!(holds_pushed_signal(&wav(&dropped), 22_050).is_err());
+        // Five periods of 440 Hz are 125.3 samples at 11,025 Hz.
+        let periods = [&recorded[..20_000], &recorded[20_125..]].concat();
+        assert!(holds_pushed_signal(&wav(&periods), 22_050).is_err());
+        let repeated = [&recorded[..20_000], &recorded[19_890..]].concat();
+        assert!(holds_pushed_signal(&wav(&repeated), 22_050).is_err());
+        assert!(holds_pushed_signal(&wav(&recorded[..4 * 11_025]), 22_050).is_err());
+        assert!(holds_pushed_signal(&wav(&vec![0.0; 5 * 11_025]), 22_050).is_err());
     }
 
     /// Real-VM acceptance for #404: the server opens `AUDIO_INPUT` when the session records,
-    /// the helper negotiates PCM and answers its Open, and a 440 Hz tone the host pushes is what
-    /// the session's recording holds, read back over drive redirection.
+    /// the helper negotiates PCM and answers its Open, and the signal the host pushes is what the
+    /// session's recording holds, whole, read back over drive redirection. Known to fail in
+    /// about two runs of five: Windows 11 drops whole PCM packets that reach it on time
+    /// (`docs/map/territory/audio-input.md`).
     #[tokio::test]
     #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
-                expires around 2027-01) and JUSTRDP_TEST_* env vars"]
-    async fn a_tone_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm() {
+                expires around 2027-01) and JUSTRDP_TEST_* env vars; fails in about two runs of \
+                five, Windows dropping PCM packets"]
+    async fn a_signal_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm() {
         let run =
-            record_a_tone_pushed_as_audio_input(true, &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM])
+            record_a_signal_pushed_as_audio_input(true, &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM])
                 .await;
         assert!(run.channel.is_some(), "the server opened AUDIO_INPUT");
         let codes = run.mci_codes.expect("the script wrote MCI's return codes");
@@ -3679,27 +3784,34 @@ mod tests {
             run.data_lengths.first()
         );
         let wav = run.wav.expect("the recording reached the host's drive");
-        let (holds, samples, rate, tone, off) = holds_tone(&wav);
+        let rate = run
+            .format
+            .expect("the server opened recording")
+            .samples_per_sec;
+        let found = holds_pushed_signal(&wav, rate).unwrap_or_else(|reason| {
+            panic!(
+                "the recording is the pushed signal, nothing dropped or repeated: {reason}; the \
+                 pusher woke late (s since recording, ms) at {:?}",
+                run.late_pushes
+            )
+        });
         eprintln!(
-            "recorded {samples} samples at {rate} Hz; power at {TONE_HZ} Hz {tone:.3e}, most \
-             elsewhere {off:.3e}"
-        );
-        assert!(
-            holds,
-            "the recording holds the pushed 440 Hz tone and little else"
+            "the recording is {:.2} s of the pushed signal, each 10 ms matching it at {:.2} or \
+             better",
+            found.seconds, found.worst_correlation
         );
     }
 
     /// Real-VM acceptance for #402: a host that lists only A-law answers with the server's one
-    /// A-law format, 22.05 kHz stereo 8-bit, and a 440 Hz tone it pushes in A-law is what the
-    /// session's recording holds.
+    /// A-law format, 22.05 kHz stereo 8-bit, and the signal it pushes in A-law is what the
+    /// session's recording holds, whole.
     #[tokio::test]
     #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
                 expires around 2027-01) and JUSTRDP_TEST_* env vars"]
-    async fn a_tone_pushed_in_alaw_is_what_the_session_records_on_the_real_vm() {
+    async fn a_signal_pushed_in_alaw_is_what_the_session_records_on_the_real_vm() {
         use justrdp_pdu::audin::ServerPdu;
         use justrdp_pdu::rdpsnd::WAVE_FORMAT_ALAW;
-        let run = record_a_tone_pushed_as_audio_input(true, &[WAVE_FORMAT_ALAW]).await;
+        let run = record_a_signal_pushed_as_audio_input(true, &[WAVE_FORMAT_ALAW]).await;
         assert!(run.channel.is_some(), "the server opened AUDIO_INPUT");
         let codes = run.mci_codes.expect("the script wrote MCI's return codes");
         assert_eq!(codes, "open=0;record=0;save=0;close=0");
@@ -3737,14 +3849,21 @@ mod tests {
             run.data_lengths.first()
         );
         let wav = run.wav.expect("the recording reached the host's drive");
-        let (holds, samples, rate, tone, off) = holds_tone(&wav);
+        let rate = run
+            .format
+            .expect("the server opened recording")
+            .samples_per_sec;
+        let found = holds_pushed_signal(&wav, rate).unwrap_or_else(|reason| {
+            panic!(
+                "the recording is the pushed signal, nothing dropped or repeated: {reason}; the \
+                 pusher woke late (s since recording, ms) at {:?}",
+                run.late_pushes
+            )
+        });
         eprintln!(
-            "recorded {samples} samples at {rate} Hz; power at {TONE_HZ} Hz {tone:.3e}, most \
-             elsewhere {off:.3e}"
-        );
-        assert!(
-            holds,
-            "the recording holds the pushed 440 Hz tone and little else"
+            "the recording is {:.2} s of the pushed signal, each 10 ms matching it at {:.2} or \
+             better",
+            found.seconds, found.worst_correlation
         );
     }
 
